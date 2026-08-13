@@ -40,10 +40,28 @@ pub struct OptStats {
     pub removed_insts: usize,
     /// entfernte, unerreichbare Basisbloecke
     pub removed_blocks: usize,
+    /// aufgeloeste `load`s (mem2reg + lokale Speicherweiterleitung)
+    pub promoted_loads: usize,
+    /// fortgepflanzte Kopien / algebraische Identitaeten
+    pub copies: usize,
+    /// entfernte gemeinsame Teilausdruecke
+    pub cse: usize,
+    /// verschmolzene bzw. ueberbrueckte Bloecke
+    pub merged_blocks: usize,
+    /// eingebettete Aufrufe (inline.rs)
+    pub inlined: usize,
+    /// entfernte, beweisbar immer erfuellte Bereichspruefungen
+    pub removed_checks: usize,
 }
 
 pub fn optimize(m: &mut Module) -> OptStats {
     let mut st = OptStats::default();
+    // Erst je Funktion aufraeumen, damit die Groessenheuristik des Inliners
+    // auf bereits vereinfachten Rumpfen arbeitet.
+    for f in m.funcs.iter_mut() {
+        optimize_func(f, &mut st);
+    }
+    st.inlined += crate::inline::inline_module(m);
     for f in m.funcs.iter_mut() {
         optimize_func(f, &mut st);
     }
@@ -56,13 +74,212 @@ fn optimize_func(f: &mut Func, st: &mut OptStats) {
         round += 1;
         let mut changed = false;
         changed |= fold_constants(f, st);
+        let p = crate::mem2reg::promote_single_store(f) + crate::mem2reg::forward_local_loads(f);
+        let ds = crate::mem2reg::remove_dead_stores(f);
+        st.removed_insts += ds;
+        changed |= ds > 0;
+        st.promoted_loads += p;
+        changed |= p > 0;
+        let c = crate::mem2reg::copy_propagate(f);
+        st.copies += c;
+        changed |= c > 0;
+        let e = cse(f);
+        st.cse += e;
+        changed |= e > 0;
+        let r = remove_redundant_checks(f);
+        st.removed_checks += r;
+        changed |= r > 0;
         changed |= simplify_terminators(f);
+        let mb = crate::mem2reg::merge_blocks(f);
+        st.merged_blocks += mb;
+        changed |= mb > 0;
         changed |= remove_unreachable_blocks(f, st);
         changed |= remove_dead_insts(f, st);
         if !changed || round >= MAX_ROUNDS {
             break;
         }
     }
+}
+
+// ------------------------------------------- gemeinsame Teilausdruecke (CSE) ---
+
+/// Schluessel eines reinen, wiederverwendbaren Ausdrucks.
+#[derive(PartialEq, Eq, Hash, Clone)]
+enum Key {
+    Const(u8, i128),
+    Bin(u8, u8, Val, Val),
+    Cmp(u8, u8, Val, Val),
+    Un(u8, u8, Val),
+    Cast(u8, u8, Val),
+    PtrAdd(Val, Val),
+}
+
+/// Kennzahl eines FIR-Typs (fir::FTy leitet `Hash` nicht ab).
+fn tyk(t: FTy) -> u8 {
+    match t {
+        FTy::I8 => 1,
+        FTy::I16 => 2,
+        FTy::I32 => 3,
+        FTy::I64 => 4,
+        FTy::U8 => 5,
+        FTy::U16 => 6,
+        FTy::U32 => 7,
+        FTy::U64 => 8,
+        FTy::Bool => 9,
+        FTy::Ptr => 10,
+        FTy::Void => 11,
+    }
+}
+
+fn bink(o: BinOp) -> u8 {
+    match o {
+        BinOp::Add => 1,
+        BinOp::Sub => 2,
+        BinOp::Mul => 3,
+        BinOp::Div => 4,
+        BinOp::Rem => 5,
+        BinOp::And => 6,
+        BinOp::Or => 7,
+        BinOp::Xor => 8,
+        BinOp::Shl => 9,
+        BinOp::Shr => 10,
+    }
+}
+
+fn cmpk(o: CmpOp) -> u8 {
+    match o {
+        CmpOp::Eq => 1,
+        CmpOp::Ne => 2,
+        CmpOp::Lt => 3,
+        CmpOp::Le => 4,
+        CmpOp::Gt => 5,
+        CmpOp::Ge => 6,
+    }
+}
+
+fn unk(o: UnOp) -> u8 {
+    match o {
+        UnOp::Neg => 1,
+        UnOp::Not => 2,
+    }
+}
+
+fn key_of(i: &crate::fir::Inst) -> Option<Key> {
+    match &i.op {
+        Op::Const(c) => Some(Key::Const(tyk(i.ty), *c)),
+        Op::Bin(o, a, b) => Some(Key::Bin(tyk(i.ty), bink(*o), *a, *b)),
+        Op::Cmp { op, ty, a, b } => Some(Key::Cmp(tyk(*ty), cmpk(*op), *a, *b)),
+        Op::Un(o, a) => Some(Key::Un(tyk(i.ty), unk(*o), *a)),
+        Op::Cast { src, from } => Some(Key::Cast(tyk(i.ty), tyk(*from), *src)),
+        Op::PtrAdd { base, off } => Some(Key::PtrAdd(*base, *off)),
+        // `load` haengt vom Speicher ab, `alloca` liefert je Instruktion eine
+        // eigene Adresse, `select`/`barrier`/`secure_zero` sind unantastbar.
+        _ => None,
+    }
+}
+
+/// Entfernt mehrfach berechnete reine Ausdruecke entlang des Dominatorbaums:
+/// ein Ausdruck darf nur durch einen Wert ersetzt werden, dessen Definition
+/// die Verwendung dominiert.
+fn cse(f: &mut Func) -> usize {
+    if f.blocks.len() > 512 || f.blocks.iter().enumerate().any(|(i, b)| b.id as usize != i) {
+        return 0;
+    }
+    let dom = crate::mem2reg::dominators(f);
+    let n = f.blocks.len();
+    let mut avail: HashMap<Key, Vec<(usize, Val)>> = HashMap::new();
+    let mut map: HashMap<Val, Val> = HashMap::new();
+    for bi in 0..n {
+        for ii in 0..f.blocks[bi].insts.len() {
+            let inst = &f.blocks[bi].insts[ii];
+            let d = match inst.dst {
+                Some(d) => d,
+                None => continue,
+            };
+            if f.is_secret(d) {
+                continue;
+            }
+            let k = match key_of(inst) {
+                Some(k) => k,
+                None => continue,
+            };
+            let e = avail.entry(k).or_default();
+            let mut hit = None;
+            for &(ob, ov) in e.iter() {
+                // Dominanz: gleicher Block (frueher) oder dominierender Block
+                if (ob == bi || dom[bi][ob]) && !f.is_secret(ov) {
+                    hit = Some(ov);
+                    break;
+                }
+            }
+            match hit {
+                Some(ov) => {
+                    map.insert(d, ov);
+                }
+                None => e.push((bi, d)),
+            }
+        }
+    }
+    if map.is_empty() {
+        return 0;
+    }
+    let cnt = map.len();
+    crate::mem2reg::replace_uses(f, &map);
+    cnt
+}
+
+// ------------------------------------------------------- Bereichspruefungen ---
+
+/// Entfernt beweisbar immer erfuellte Bereichspruefungen: ein `brcond` auf
+/// `i < n`, das von einem dominierenden `brcond` mit derselben Bedingung
+/// bereits als wahr (bzw. falsch) entschieden wurde, wird zum unbedingten
+/// Sprung. Damit verschwindet die doppelte Pruefung, die beim Zugriff auf ein
+/// Feld innerhalb einer bereits gepruefte Schleife entsteht.
+/// Liefert die Anzahl entfernter Pruefungen.
+fn remove_redundant_checks(f: &mut Func) -> usize {
+    if f.blocks.len() > 512 || f.blocks.iter().enumerate().any(|(i, b)| b.id as usize != i) {
+        return 0;
+    }
+    let preds = crate::mem2reg::preds(f);
+    let n = f.blocks.len();
+    // Wissen wird ausschliesslich entlang von Ketten mit GENAU EINEM Vorgaenger
+    // fortgeschrieben. Eine solche Kette kann keinen Zyklus enthalten (ein
+    // wiederbetretener Block haette einen zweiten Vorgaenger), also ist der
+    // Wert der Bedingung auf dem tatsaechlich gelaufenen Weg unveraendert.
+    let mut known: Vec<HashMap<Val, bool>> = vec![HashMap::new(); n];
+    for bi in 0..n {
+        let mut cur = bi;
+        let mut facts: HashMap<Val, bool> = HashMap::new();
+        for _ in 0..64 {
+            if preds[cur].len() != 1 {
+                break;
+            }
+            let p = preds[cur][0];
+            if p == cur {
+                break;
+            }
+            if let Term::BrCond { cond, then_bb, else_bb } = f.blocks[p].term {
+                if (then_bb as usize == cur) != (else_bb as usize == cur) {
+                    facts.entry(cond).or_insert(then_bb as usize == cur);
+                }
+            }
+            cur = p;
+        }
+        known[bi] = facts;
+    }
+    let mut removed = 0usize;
+    for bi in 0..n {
+        if let Term::BrCond { cond, then_bb, else_bb } = f.blocks[bi].term {
+            if f.is_secret(cond) {
+                continue; // SPEC §9.2: geheime Bedingungen bleiben unberuehrt
+            }
+            if let Some(&v) = known[bi].get(&cond) {
+                f.blocks[bi].term = Term::Br(if v { then_bb } else { else_bb });
+                removed += 1;
+            }
+        }
+    }
+    removed
 }
 
 // ---------------------------------------------------------------- Faltung ---
@@ -520,13 +737,16 @@ mod tests {
         m.funcs.push(f);
         let st = optimize(&mut m);
         let f = &m.funcs[0];
-        assert_eq!(st.removed_blocks, 1);
-        assert_eq!(f.blocks.len(), blocks_before - 1);
+        // 3 < 4 ist wahr: der else-Zweig faellt weg, der then-Zweig wird in
+        // bb0 verschmolzen — uebrig bleibt EIN Block mit `ret 1`.
+        assert_eq!(st.removed_blocks, 2);
+        assert!(f.blocks.len() < blocks_before);
+        assert_eq!(f.blocks.len(), 1);
         // Block-Ids bleiben lueckenlos und passen zu ihrer Position
         for (i, b) in f.blocks.iter().enumerate() {
             assert_eq!(b.id, i as u32);
         }
-        assert!(matches!(f.blocks[0].term, Term::Br(1)));
+        assert!(matches!(f.blocks[0].term, Term::Ret(Some(_))));
         assert_eq!(consts_in(f), vec![1]);
     }
 
@@ -550,8 +770,11 @@ mod tests {
         m.funcs.push(f);
         let st = optimize(&mut m);
         let f = &m.funcs[0];
-        // entfernt wird nur die unbenutzte Konstante 99
-        assert_eq!(st.removed_insts, 1);
+        // Entfernt werden: die unbenutzte Konstante 99, dazu (neu in Runde 2)
+        // die tote lokale Zelle — der `load` wird auf den gespeicherten Wert
+        // weitergeleitet, danach liest niemand mehr aus der `alloca`.
+        // Syscall und Call MUESSEN stehen bleiben.
+        assert!(st.removed_insts >= 1);
         let kinds: Vec<&str> = f.blocks[0]
             .insts
             .iter()
@@ -565,7 +788,8 @@ mod tests {
                 _ => "?",
             })
             .collect();
-        assert_eq!(kinds, vec!["alloca", "const", "store", "const", "const", "syscall", "call", "load"]);
+        assert_eq!(kinds, vec!["const", "const", "const", "syscall", "call"]);
+        assert!(matches!(f.blocks[0].term, Term::Ret(Some(v)) if v == 1 + 0));
     }
 
     #[test]

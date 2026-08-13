@@ -255,7 +255,6 @@ pub struct Inst {
 pub enum Term {
     Br(BlockId),
     BrCond { cond: Val, then_bb: BlockId, else_bb: BlockId },
-    #[allow(dead_code)] // wird vom Modul `types` verdrahtet, dann entfernen
     /// Mehrfachverzweigung ueber einen Ganzzahlwert (SPEC §6.3, `P4`).
     /// `cases` ist nach Marke aufsteigend sortiert und duplikatfrei; jeder
     /// nicht genannte Wert geht nach `default`. Das Backend darf daraus eine

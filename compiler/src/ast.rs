@@ -116,6 +116,8 @@ pub enum ExprKind {
     StructLit(String, Vec<(String, Expr, Span)>, Span),
     /// `[1, 2, 3]`
     ArrayLit(Vec<Expr>),
+    /// Wiederholungsliteral `[wert; N]`; `N` ist ein konstanter Ausdruck.
+    ArrayRepeat(Box<Expr>, Box<Expr>),
 }
 
 #[derive(Clone, Debug)]
@@ -154,6 +156,18 @@ pub enum Stmt {
         value: Option<Expr>,
         span: Span,
     },
+    /// `for name in start..end { }` (halboffener Bereich, aufsteigend).
+    For {
+        name: String,
+        start: Expr,
+        end: Expr,
+        body: Block,
+        /// Position des Schleifennamens (fuer Fehlermeldungen)
+        name_span: Span,
+        span: Span,
+    },
+    Break(Span),
+    Continue(Span),
     Expr(Expr),
     Block(Block),
     /// Nur vom Parser bei Fehlerwiederherstellung erzeugt; wird ignoriert.
@@ -169,6 +183,9 @@ impl Stmt {
             | Stmt::If { span, .. }
             | Stmt::While { span, .. }
             | Stmt::Return { span, .. }
+            | Stmt::For { span, .. }
+            | Stmt::Break(span)
+            | Stmt::Continue(span)
             | Stmt::Error(span) => *span,
             Stmt::Expr(e) => e.span,
             Stmt::Block(b) => b.span,
@@ -183,6 +200,9 @@ impl Stmt {
             Stmt::Assign { .. } => "assign",
             Stmt::If { .. } => "if",
             Stmt::While { .. } => "while",
+            Stmt::For { .. } => "for",
+            Stmt::Break(_) => "break",
+            Stmt::Continue(_) => "continue",
             Stmt::Return { .. } => "return",
             Stmt::Expr(_) => "expr",
             Stmt::Block(_) => "block",
@@ -222,9 +242,22 @@ pub struct ConstDecl {
     pub span: Span,
 }
 
+/// `import pfad.modul` — Pfadteile ohne Endung, relativ zur Wurzeldatei.
+#[derive(Clone, Debug)]
+pub struct ImportDecl {
+    pub path: Vec<String>,
+    /// Name, unter dem das Modul im Quelltext angesprochen wird (letzter Teil).
+    pub alias: String,
+    pub span: Span,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Program {
     pub profile: Option<(String, Span)>,
+    /// `import`-Deklarationen dieser Datei (Modulsystem, `modules.rs`).
+    pub imports: Vec<ImportDecl>,
+    /// `export { a, b }` — leer heisst: alles ist sichtbar.
+    pub exports: Vec<(String, Span)>,
     pub funcs: Vec<FnDecl>,
     pub structs: Vec<StructDecl>,
     pub consts: Vec<ConstDecl>,

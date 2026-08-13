@@ -4,17 +4,28 @@
 //!           -> x86_64-Assembler -> `as` -> `ld` -> ausfuehrbare Datei.
 //! `as` und `ld` werden AUSSCHLIESSLICH als Assembler/Linker benutzt.
 
+mod abi;
 mod ast;
 mod codegen_switch;
 mod codegen_x86;
 mod config;
 mod diag;
+mod dwarf;
 mod fir;
+mod inline;
 mod lexer;
 mod lower;
+mod lower_match;
+mod modules;
+mod mono;
+mod mem2reg;
 mod opt;
 mod parser;
+mod regalloc;
 mod sema;
+mod sema_generic;
+mod sema_match;
+mod strings;
 mod types;
 
 use std::path::{Path, PathBuf};
@@ -58,6 +69,7 @@ fn usage() -> String {
          --emit=tokens      Tokenstrom (Fehlersuche)\n  \
          --emit=ast         AST als Debug-Text (Fehlersuche)\n  \
          --no-opt           Optimierer abschalten\n  \
+         --strlit=<lit>     zeichenkettenliteral entschluesseln (\"..\", b\"..\", u\"..\")\n  \
          --stats            Groesse der FIR ausgeben (Instruktionen/Bloecke)\n  \
          --keep-asm         erzeugte .s-Datei behalten\n  \
          --version          Version ausgeben\n  \
@@ -90,6 +102,20 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                 std::process::exit(0);
             }
             "--no-opt" => optimize = false,
+            _ if a.starts_with("--strlit=") => {
+                // Modul str: Literalpfad (Bytes/Str/Str16, Maskierungen, WTF-16)
+                // ohne Quelldatei nachpruefbar machen.
+                match strings::strlit_report(&a["--strlit=".len()..]) {
+                    Ok(rep) => {
+                        print!("{}", rep);
+                        std::process::exit(0);
+                    }
+                    Err(e) => {
+                        eprintln!("error: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
             "--keep-asm" => keep_asm = true,
             "--stats" => stats = true,
             "-o" => {
@@ -151,31 +177,50 @@ fn main() {
 
 fn run(opts: &Options) -> i32 {
     let path = &opts.input;
-    let src = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: kann '{}' nicht lesen: {}", path.display(), e);
+    // --- Module aufloesen (Wurzeldatei + alle 'import'-Module) ---
+    let files = match modules::resolve(path) {
+        Ok(f) => f,
+        Err(d) => {
+            // Fehler der Modulaufloesung im ueblichen Format ausgeben.
+            let src = std::fs::read_to_string(path).unwrap_or_default();
+            let mut dg = diag::Diags::new(&path.display().to_string(), &src);
+            dg.report(d);
+            return report(&dg);
+        }
+    };
+    let root = match files.first() {
+        Some(f) => f,
+        None => {
+            eprintln!("error: keine Quelldatei");
             return 2;
         }
     };
-    let name = path.display().to_string();
-    let mut dg = diag::Diags::new(&name, &src);
+    let mut dg = diag::Diags::new(&root.path.display().to_string(), &root.src);
+    for f in files.iter().skip(1) {
+        dg.add_file(&f.path.display().to_string(), &f.src);
+    }
+    // Zeilentabelle fuer .debug_line: anweisungsgenau nur ohne Optimierer.
+    dwarf::reset(
+        files.iter().map(|f| f.path.display().to_string()).collect(),
+        !opts.optimize,
+    );
 
-    // --- Lexer ---
-    let toks = lexer::lex(&src, &mut dg);
     if opts.emit == Emit::Tokens {
+        let toks = lexer::lex(&root.src, &mut dg);
         for t in &toks {
             println!("{:>4}:{:<4} {:?}", t.span.line, t.span.col, t.kind);
         }
         dg.print();
         return if dg.has_errors() { 1 } else { 0 };
     }
-    if dg.has_errors() {
-        return report(&dg);
-    }
 
-    // --- Parser ---
-    let prog = parser::parse(&toks, &mut dg);
+    // --- Lexer + Parser je Modul, danach zusammenfuehren ---
+    let mut prog = match modules::build_program(&files, &mut dg) {
+        Some(p) => p,
+        None => return report(&dg),
+    };
+    // --- Monomorphisierung generischer Vorlagen (Modul types) ---
+    mono::expand(&mut prog, &mut dg);
     if opts.emit == Emit::Ast && !dg.has_errors() {
         println!("{:#?}", prog);
         println!("\n// Anweisungsuebersicht (Zeile:Spalte Art)");
