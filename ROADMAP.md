@@ -1,13 +1,32 @@
 # Firn — Fahrplan
 
-**Stand:** 2026-08-13 · **Bezug:** `SPEC.md` · Zeitangaben = Arbeitsaufwand einer
-Person mit KI-Unterstützung, nicht Kalenderzeit.
+**Stand:** 2026-08-13 (v0.2) · **Bezug:** `SPEC.md`, `ABNAHME.md`,
+`../karstos-browser/FIRN-ANFORDERUNGEN.md`, `../karstos-browser/PLAN-FIRN.md`
+Zeitangaben = Arbeitsaufwand einer Person mit KI-Unterstützung, nicht Kalenderzeit.
+
+---
+
+## Was sich gegenüber v0.1 geändert hat
+
+Firn ist seit der Browser-Entscheidung (**B1**: jede Zeile ausführbarer Code der
+Karstos-Browser-Engine ist Firn) **kritischer Pfad Nummer 1** des gesamten
+Ökosystems. Das ändert den Fahrplan an drei Stellen:
+
+* **Neue Pflichtteile:** Opt-in-GC, WTF-16-Zeichenketten, Constant-Time-Primitive,
+  Abwicklung für JS, Kompilierzeit-Codegenerierung, Debugger, Paketverwaltung.
+* **Neues Leistungsziel:** ≤ 2× Rust auf Mikrobenchmarks. Das verschiebt Arbeit
+  vom Sprachumfang in den Optimierer.
+* **Gestrichen:** aarch64- und WASM-Backend haben keinen Termin mehr
+  (`FIRN-ANFORDERUNGEN.md` §11 braucht beides nicht). Das entlastet spürbar.
+
+**Zwei Härtetests entscheiden alles** und sind deshalb vorgezogen:
+HTML5-Tokenizer (100 % html5lib, ≤ 2× Referenz) und DOM-Prototyp mit Zyklen
+(24 h ohne Speicherwachstum). Fallen sie durch, wird nicht der Browser
+repariert, sondern Firn.
 
 ---
 
 ## Wie realistisch ist das?
-
-Zum Vergleich, ohne Schönfärberei:
 
 | Sprache | Erster Compiler | Version 1.0 / stabil | Dauer |
 |---|---|---|---|
@@ -18,84 +37,111 @@ Zum Vergleich, ohne Schönfärberei:
 
 Firn wird nicht schneller fertig, nur weil KI mitschreibt. KI beschleunigt das
 Tippen, nicht die Entwurfsentscheidungen und nicht das Finden der Fehler, die
-erst auftauchen, wenn 50.000 Zeilen echter Code in der Sprache geschrieben sind.
-Was KI wirklich ändert: Die frühen Phasen (Parser, Typprüfer, Codegen für eine
-Teilmenge) schrumpfen von Monaten auf Tage. Die späten Phasen (Selbst-Hosting,
-Optimierer, Stabilität, Ökosystem) schrumpfen kaum.
+erst bei 50.000 Zeilen echtem Code auftauchen. Die frühen Phasen (Parser,
+Typprüfer, Codegen für eine Teilmenge) schrumpfen von Monaten auf Tage. Die
+späten Phasen (Selbst-Hosting, Optimierer auf ≤ 2× Rust, GC im Dauerlauf,
+Stabilität) schrumpfen kaum.
 
 **Ehrliche Erwartung:** *Nutzbar für kleine Karstos-Systemprogramme* in 6–12
-Monaten. *Ein selbst-hostender Compiler* in 1–2 Jahren. *Der karst-Kernel in
-Firn statt Rust* eher 3–5 Jahre — und nur, wenn das Projekt durchgehalten wird.
+Monaten. *Selbst-hostender Compiler* in 1–2 Jahren. *Abnahme nach
+`FIRN-ANFORDERUNGEN.md` §13 bestanden* — also bereit für die erste
+Browser-Bibliothek — realistisch **2–4 Jahre**. `PLAN-FIRN.md` veranschlagt für
+Phase F0 allein 27 Personenmonate.
 
 ---
 
-## Phase 0 — Spezifikation ✔ (fertig)
+## Phase 0 — Spezifikation ✔
 
-* `SPEC.md`: Profile, Speichermodell (Ownership + zweitklassige Referenzen),
-  Fehlerbehandlung, `comptime`, Backend-Strategie, Bootstrap-Stufen, Grammatik.
-* Entscheidung gegen LLVM im Bootstrap-Pfad, Entscheidung gegen GC — beide
-  begründet und mit benanntem Preis.
+* `SPEC.md` v0.1: Profile, Besitzmodell, Fehlerbehandlung, `comptime`,
+  Backend-Strategie, Bootstrap, Grammatik.
+* `SPEC.md` v0.2: Speichermodell in drei Stufen mit **Opt-in-GC**, Vererbung für
+  `gc class`, WTF-16, Constant-Time, Abwicklung, Leistungsziel, Rückverfolgung.
+* `ABNAHME.md`: die sechs Prüfpunkte aus `FIRN-ANFORDERUNGEN.md` §13 als
+  abhakbare Liste.
 
-## Phase 1 — `firnc0`: Prototyp in Rust *(diese Runde)*
+## Phase 1 — `firnc0`: Prototyp in Rust ✔
 
-**Ziel:** Die Teilmenge aus SPEC §12 wirklich bis zum laufenden Binary.
+Teilmenge aus `SPEC.md` §14, wirklich bis zum laufenden Binary.
+Lexer, Parser, Typprüfer, FIR, Konstantenfaltung + DCE, x86_64-Codegen ohne
+LLVM, `syscall`, 75 Testprogramme × 2 Durchläufe + 15 Negativtests, alle grün.
+**Ergebnis:** kompilierbare Sprache, noch kein Werkzeug.
 
-* Lexer, rekursiv absteigender Parser, gute Fehlermeldungen (Zeile/Spalte/Auszug)
-* Typprüfer für Ganzzahlen fester Breite, `bool`, Zeiger, Structs, Arrays
-* FIR (eigene IR, Basisblöcke) + Konstantenfaltung + Entfernen toten Codes
-* x86_64-Codegen ohne LLVM → Assembler für `as`/`ld`
-* `syscall(...)` eingebaut → Ausgabe ohne libc
-* ≥ 40 `.fi`-Testprogramme, `test.sh` baut und fährt alles
-* **Aufwand:** 1–2 Wochen · **Ergebnis:** kompilierbare Sprache, kein Werkzeug
+## Phase 2 — v0.2: Sprachkern für Browser-Code `← hier stehen wir`
 
-## Phase 2 — v0.2: benutzbar für kleine Programme
+Was der Browser vom *Sprachkern* verlangt, ohne Laufzeit und ohne Bibliothek.
 
-* Zeichenketten (`[]u8` + Länge), `for`-Schleife, `break`/`continue`
-* Aufzählungen mit Nutzdaten, `match` mit Erschöpfungsprüfung
-* Fehlerunionen `!T`, `try`, `catch`, `errdefer`
-* `defer`, `drop`, Move-Prüfer (§3 der Spezifikation — das Herzstück)
-* Referenztypen `&T` / `inout T` mit Zweitklassigkeitsprüfung
-* Bessere Registerzuteilung (Lebendigkeitsanalyse statt naiv)
-* **Aufwand:** 4–8 Wochen
+* **Summentypen + `match`** mit Vollständigkeitsprüfung, Sprungtabellen (`L4`, `P4`)
+* **Generics** durch Monomorphisierung (`L5`)
+* **Zeichenketten**: `Bytes`, `Str` (UTF-8), **`Str16` (WTF-16)**, `Atom`,
+  korrekt gerundetes `strtod`, kürzeste Double-Ausgabe (`Z1`–`Z6`)
+* **Optimierer**: Inlining, echte Registerzuteilung, DCE, Bereichsprüfungen
+  entfernen — mit **gemessenem** Vergleich gegen Rust (`P1`–`P3`, `P5`, `P9`)
+* **`secret[T]` + `#[constant_time]`**, `secure_zero`, `u128` (`C1`–`C3`, `C5`)
+* **Speichermodell**: `Rc[T]`/`Weak[T]`, `Gc[T]`/`GcWeak[T]`, `gc class`,
+  `#[no_gc]` (`S1`–`S3`, `S7`)
+* `break`/`continue`, `for`, `defer`, `drop`, Move-Prüfer, Referenztypen
+* **Härtetest 1**: HTML5-Tokenizer gegen html5lib
+* **Härtetest 2**: DOM-Prototyp mit Zyklen im Dauerlauf
+* Testrunner mit maschinenlesbarer Ausgabe (`W2`)
+* **Aufwand:** Monate, nicht Wochen. Das ist der eigentliche Brocken.
 
-## Phase 3 — v0.3: Module und `comptime`
+## Phase 3 — v0.3: Module, `comptime`, Standardbibliothek
 
 * Modulsystem, `import`, `export`-Listen, getrennte Übersetzung
-* `comptime`-Auswertung im Compiler (Interpreter über FIR)
-* Generics durch Monomorphisierung
-* Minimale Standardbibliothek: `Arena`, `Vec[T]`, `Str`, `io`
+* `comptime`-Auswertung (Interpreter über FIR), `interface` statisch + dynamisch
+* **Kompilierzeit-Codegenerierung** (`G1`–`G4`): Bauskripte, perfektes Hashing,
+  komprimierte Tries — Abnahme: Unicode-Tabelle aus der UCD
+* Standardbibliothek `B1`–`B11`: Sammlungen, E/A, Zeit, Formatierung, Sortieren,
+  Zufall (CSPRNG getrennt vom schnellen Generator)
+* Nebenläufigkeit `N1`–`N4`: Fäden, Atomics, Mutex/Condvar/RwLock/Kanäle,
+  `#[sendable]`/`#[shareable]`
+* **Paketverwaltung + reproduzierbarer Bau** (`W1`)
+* **DWARF-Grundlagen + Debugger** (`W3`) — ohne ihn wird jede folgende Aufgabe
+  dreimal so lang
 * **Stufe 1 beginnt:** Lexer und Parser werden in Firn neu geschrieben
-* **Aufwand:** 2–4 Monate
+* **Aufwand:** 3–6 Monate
 
 ## Phase 4 — v0.4/0.5: Selbst-Hosting
 
-* Der gesamte Compiler in Firn: `firnc1` übersetzt `firnc2`, `firnc2` übersetzt
-  sich selbst, Ergebnis bit-identisch (Fixpunkt)
-* Rust wird zum Bootstrap-Archiv; `firnc0` eingefroren
-* aarch64-Backend (Raspberry Pi, ARM-Server)
-* Debug-Informationen (DWARF-Grundlagen), damit `gdb` benutzbar wird
-* **Aufwand:** 6–12 Monate · **Das ist der Punkt, an dem Firn eine echte Sprache ist**
+* `firnc1` übersetzt `firnc2`, `firnc2` übersetzt sich selbst, Ergebnis
+  bit-identisch (Fixpunkt) → `L1` und `ABNAHME.md` Punkt 1 erfüllt
+* Rust wird Bootstrap-Archiv, `firnc0` eingefroren
+* **Abwicklung/`throw`** (`L8`) mit Tabellen in zwei Phasen
+* Inkrementeller GC mit Dreifarbenmarkierung (`S5`), Pausenzeiten messbar (`S6`)
+* Profiler mit Flamegraphs (`W4`), Fuzzing-Anbindung (`W5`)
+* **Aufwand:** 6–12 Monate · **Ab hier ist Firn eine echte Sprache**
 
-## Phase 5 — v0.6: WASM und Web
+## Phase 5 — Abnahme nach `FIRN-ANFORDERUNGEN.md` §13
 
-* wasm32-Backend aus FIR (Stackifier für strukturierten Kontrollfluss)
-* Minimale DOM-Anbindung, damit Frontend ohne JavaScript möglich ist
-* **Aufwand:** 2–4 Monate
+Alle sechs Punkte aus `ABNAHME.md` grün. Erst danach darf im Browser-Projekt
+Block 1 starten. **Das ist das eigentliche Ziel dieses Fahrplans.**
 
-## Phase 6 — v0.7+: Karstos in Firn
+## Phase 6 — Laufzeit auf Karstos (`R1`–`R6`)
+
+* Firn-Laufzeit portiert: Speicher, Fäden, Datei, Zeit, E/A
+* Trennung Laufzeit ↔ Plattformschicht, Kreuzcompiler nach Karstos im CI
+* Firns eigene Testsuite läuft **auf Karstos** durch (`R6`)
+* Läuft parallel zur Karstos-Kernel-Arbeit (K1–K10)
+
+## Phase 7 — Karstos-Kernelmodule in Firn
 
 * Kernel-Profil gegen echten karst-Code prüfen (ABI, Inline-Assembler, MMIO)
-* Erstes Karstos-Modul in Firn (Kandidat: ein Treiber, klein und isoliert)
-* Danach schrittweise Ersetzung — kein „großer Neuschrieb"
-* **Aufwand:** Jahre, parallel zur Karstos-Entwicklung
+* Erstes Karstos-Modul in Firn (Kandidat: ein kleiner, isolierter Treiber)
+* Danach schrittweise Ersetzung — **kein großer Neuschrieb**
 
-## Phase 7 — v1.0: Stabilität
+## Phase 8 — v1.0: Stabilität
 
 * Sprachstabilitätsversprechen, Rückwärtskompatibilität
-* Optimierer (GVN, Inlining, Schleifenoptimierung), optionales LLVM-Backend
-  für Anwendungscode als Vergleichsmaßstab
-* Paketverwaltung, Dokumentationswerkzeug, Formatierer
-* **Zeitpunkt:** frühestens in mehreren Jahren
+* SIMD (`L16`), Schleifenoptimierung, optionales LLVM-Backend als Vergleichsmaß
+* Formatierer, Linter, Abdeckungsmessung, Übersetzungs-Zwischenspeicher
+* **Frühestens in mehreren Jahren**
+
+## Ohne Termin (bewusst gestrichen)
+
+* **aarch64-Backend** — erst wenn Karstos auf ARM zielt
+* **WASM-Backend** — für den Browser nicht nötig; „Firn statt JavaScript im
+  Browser" bleibt ein Fernziel, blockiert aber nichts
+* **JIT**, dynamische Bibliotheken, C++-Interop — dauerhaft ausgeschlossen
 
 ---
 
@@ -103,21 +149,28 @@ Firn statt Rust* eher 3–5 Jahre — und nur, wenn das Projekt durchgehalten wi
 
 Offen benannt, damit es nicht überrascht:
 
-1. **Durchhalten.** Der gefährlichste Punkt ist Phase 3/4 — der Reiz ist weg,
+1. **Der Optimierer erreicht ≤ 2× Rust nicht.** Das ist das größte Einzelrisiko.
+   Ein Tokenizer läuft über jedes Zeichen jeder Seite; 10× zu langsam heißt
+   Browser 10× zu langsam, und das lässt sich später nicht herausoptimieren.
+   Gegenmittel: früh und ehrlich messen (`Phase 2`), nicht am Ende.
+2. **Der GC trägt den DOM nicht.** Konservatives Stack-Scanning schließt einen
+   kompaktierenden Sammler aus; Fragmentierung im 24-h-Dauerlauf ist ein reales
+   Risiko. Gegenmittel: Härtetest 2 früh, Größenklassen-Allokator.
+3. **Durchhalten.** Der gefährlichste Punkt ist Phase 3/4 — der Reiz ist weg,
    die Arbeit wird zäh (Fehlermeldungen, Randfälle, Regressionen).
-2. **Codegen-Qualität.** Eigener Codegen ohne LLVM heißt auf Jahre 2–5x
-   langsamerer Code. Für den Kernel egal, für Anwendungen irgendwann nicht.
-3. **Selbstbezug.** Ein Compiler, der sich selbst übersetzt, verbirgt Fehler
-   hervorragend. Gegenmittel: Fixpunkt-Prüfung und eine Testsuite, die von
-   Anfang an ernst genommen wird.
-4. **Zwei Baustellen gleichzeitig.** Karstos *und* Firn parallel ist viel. Firn
-   darf Karstos nicht ausbremsen — deshalb bleibt Rust im Kernel, bis Firn
+4. **Selbstbezug.** Ein Compiler, der sich selbst übersetzt, verbirgt Fehler
+   hervorragend. Gegenmittel: Fixpunkt-Prüfung und eine ernst genommene
+   Testsuite.
+5. **Drei Baustellen gleichzeitig.** Karstos, Firn *und* der Browser ist viel.
+   Firn darf Karstos nicht ausbremsen — deshalb bleibt Rust im Kernel, bis Firn
    nachweislich besser passt.
+6. **Zielkonflikt Optimierer ↔ Krypto.** §9 der Spezifikation löst ihn auf dem
+   Papier. Ob er in der Umsetzung hält, zeigt erst die Assembler-Inspektion.
 
 ---
 
 ## Nächster konkreter Schritt
 
-Phase 1 abschließen und `test.sh` grün bekommen. Danach entscheiden, ob zuerst
-der Move-Prüfer (Phase 2, Sprachkern) oder das Modulsystem (Phase 3,
-Benutzbarkeit) kommt.
+Phase 2 abarbeiten, in dieser Reihenfolge (nach `FIRN-ANFORDERUNGEN.md` §12):
+**Speichermodell → Optimierer/Messung → Zeichenketten → Testrunner →
+restlicher Sprachkern.** Constant-Time wird dabei mitgebaut, nicht nachgerüstet.
