@@ -5,6 +5,7 @@
 //! `as` und `ld` werden AUSSCHLIESSLICH als Assembler/Linker benutzt.
 
 mod ast;
+mod codegen_switch;
 mod codegen_x86;
 mod config;
 mod diag;
