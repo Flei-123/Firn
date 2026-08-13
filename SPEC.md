@@ -568,7 +568,10 @@ ausdrücklich als „noch nicht" geführt.
   (`--emit=fir`), Konstantenfaltung und Entfernen toten Codes, beides mit
   Vorher/Nachher-Test.
 * **x86_64-Codegen ohne LLVM**: Assemblerausgabe für `as`/`ld`, System-V-ABI,
-  eigene Registerzuteilung.
+  eigene Registerbelegung — *ehrlich benannt:* das ist **keine** Registerzuteilung
+  im Sinne von Lebendigkeitsanalyse/Graphfärbung. Stufe 0 gibt jedem FIR-Wert
+  einen eigenen Stack-Slot und rechnet in `rax`/`rcx`/`rdx` (reines Spilling).
+  Korrekt, aber langsam. Echte Registerzuteilung ist Phase 2 (ROADMAP).
 * Testsuite mit ≥ 40 `.fi`-Programmen: übersetzen, ausführen, Rückgabewert und
   Ausgabe gegen Erwartung prüfen; dazu Negativtests für Fehlermeldungen.
 

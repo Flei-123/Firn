@@ -1,0 +1,67 @@
+# Gauntlet-Log — firn
+**Ziel:** Baue "firnc0" — den Stufe-0-Prototyp-Compiler für die Programmiersprache FIRN (Dateiendung .fi), geschrieben in RUST, der eine bewusst KLEINE Teilmenge der Sprache WIRKLICH zu ausführbarem x86_64-Maschinencode übersetzt.
+
+WICHTIG ZUERST LESEN: Im Projektordner liegen bereits SPEC.md (vollständige Sprachspezifikation) und ROADMAP.md. LEST BEIDE, bevor ihr irgendetwas baut. SPEC.md §10.1 enthält die EBNF-Grammatik der zu implementierenden Teilmenge, §11 die ABI-/Zahlenregeln, §12 den VERBINDLICHEN Umfang ("Was der Prototyp implementiert"). SPEC.md und ROADMAP.md dürfen inhaltlich NICHT umgeschrieben werden — nur ergänzt werden, falls die Implementierung bewusst abweicht (dann muss die Abweichung dort dokumentiert werden). Der Code muss sich nach der SPEC richten, nicht umgekehrt.
+
+ZIELVERZEICHNIS-AUFBAU (bitte genau so):
+  SPEC.md, ROADMAP.md            (existieren bereits)
+  README.md                      (Build-Anleitung, echter Beispiel-Output, ehrliche "kann noch nicht"-Liste)
+  compiler/Cargo.toml            (Crate-Name: firnc; Binary: firnc)
+  compiler/src/config.rs         (LANG_NAME="Firn", LANG_NAME_LOWER="firn", FILE_EXT="fi" — NUR HIER, nirgends sonst hartkodiert; Umbenennen der Sprache = 3 Konstanten ändern)
+  compiler/src/main.rs, lexer.rs, ast.rs, parser.rs, diag.rs, types.rs, sema.rs, fir.rs, opt.rs, codegen_x86.rs
+  docs/FIR.md                    (die eigene IR dokumentiert: Instruktionen, Typen, Textformat, Invarianten)
+  tests/                         (mind. 40 .fi-Programme + Erwartungen)
+  examples/                      (hello.fi, fib.fi, bubblesort.fi, structs.fi)
+  test.sh                        (baut alles, fährt alle Tests, meldet am Ende klar PASS/FAIL mit Zählung)
+
+WAS GEBAUT WERDEN MUSS:
+
+1) LEXER + PARSER: handgeschrieben, rekursiv absteigend, KEIN Parser-Generator, keine externen Crates für Parsing. Cargo.toml möglichst OHNE Abhängigkeiten (std reicht). AST als eigene Datenstruktur. Fehlermeldungen müssen enthalten: Dateiname, Zeile, Spalte, die betroffene Quelltextzeile und eine Markierung (^^^) darunter, plus eine verständliche Meldung. Beispielformat:
+   error: erwartet ')' nach Argumentliste
+     --> tests/neg/bad_call.fi:7:22
+      |
+    7 |     let x = add(1, 2 ;
+      |                      ^ hier
+   Mehrere Fehler sollen gemeldet werden können (Fehlerwiederherstellung), nicht nur der erste — mindestens beim Parser auf Anweisungsebene.
+
+2) TYPPRÜFER (sema.rs): i8/i16/i32/i64, u8/u16/u32/u64, usize, isize, bool, Zeiger *T und *mut T, Structs mit Feldzugriff, Arrays fester Größe mit Index, Funktionen mit Parametern/Rückgabe. KEINE impliziten Umwandlungen — nur explizites `as`. Untypisierte Ganzzahl-Literale werden aus dem Kontext abgeleitet; ist der Typ nicht eindeutig, klare Fehlermeldung. Prüfungen: unbekannte Namen, falsche Argumentanzahl/-typen, fehlendes return, Zuweisung an `let`, Index auf Nicht-Array, Feldzugriff auf Nicht-Struct, Dereferenzieren von Nicht-Zeigern, Bedingung nicht bool. Struct-Layout: Deklarationsreihenfolge, natürliche Ausrichtung, Offsets/Größe berechnet und im Test nachprüfbar.
+
+3) EIGENE IR "FIR" (fir.rs): typisiert, in Funktionen mit Basisblöcken (jeder Block genau ein Terminator: br / brcond / ret), Werte als SSA-artige Ids, klar dokumentiert in docs/FIR.md. Textausgabe über `firnc --emit=fir datei.fi` (menschenlesbar, stabil genug für Tests). Lowering AST->FIR: Kontrollfluss (if/else/while) wird zu Basisblöcken, Kurzschlussauswertung von && und || wird korrekt zu Verzweigungen aufgelöst, lvalues (Variable/Feld/Index/Deref) zu Adressberechnung + load/store.
+
+4) OPTIMIERUNG (opt.rs): mindestens Konstantenfaltung UND Entfernen toten Codes (unerreichbare Blöcke + unbenutzte reine Instruktionen). Beweisbar wirksam: `--emit=fir` vor und nach der Optimierung (`--emit=fir-raw` / `--emit=fir-opt` oder `--no-opt`), und mindestens 3 Tests, die die Anzahl der Instruktionen vorher/nachher vergleichen bzw. prüfen, dass eine gefaltete Konstante wirklich im Dump steht. Optimierung darf das Ergebnis NIE ändern — dafür laufen alle Testprogramme sowohl mit als auch ohne Optimierung und müssen dasselbe liefern.
+
+5) X86_64-CODEGEN (codegen_x86.rs) — EIGEN, OHNE LLVM, OHNE Cranelift, OHNE gcc als Codegenerator: Ausgabe ist GNU-Assembler-Text (AT&T oder Intel-Syntax mit .intel_syntax noprefix), der mit `as` assembliert und mit `ld` gelinkt wird. gcc/as/ld dürfen NUR als Assembler/Linker benutzt werden, niemals um C zu kompilieren. Registerzuteilung darf naiv sein (z. B. Stack-Slots + rax/rcx als Arbeitsregister), MUSS aber korrekt sein. System-V-AMD64-Aufrufkonvention einhalten: Argumente in rdi, rsi, rdx, rcx, r8, r9; Rückgabe in rax; rbx, rbp, r12-r15 callee-saved; Stack an der Aufrufstelle 16-Byte-ausgerichtet (das ist der häufigste Fehler — bitte testen). Korrekte Behandlung der Operandengrößen (8/16/32/64 Bit), vorzeichenbehaftete vs. vorzeichenlose Division (idiv/div), Verschiebungen mit cl, korrekte Vorzeichen-/Nullerweiterung bei `as`. Rekursion muss funktionieren. Erzeugte Binaries laufen freistehend ohne libc (_start als Einstiegspunkt, Rückgabewert von main() geht in exit-Syscall).
+
+6) SPRACHUMFANG (siehe SPEC §12): Funktionen mit Parametern und Rückgabewert, lokale Variablen (let/var), Zuweisung, if/else, while, Arithmetik (+ - * / %), Bitoperationen (& | ^ << >>), Vergleiche, && und || kurzschließend, unäres - und !, Structs mit Feldzugriff (auch verschachtelt), Arrays fester Größe mit Index (auch Arrays von Structs), Zeiger: Adresse-von & und Dereferenzierung *, Zuweisung durch Zeiger, Rekursion, `as`-Umwandlungen, const-Deklarationen, und das eingebaute `syscall(nr, a1..a6)` (Argumente nach rax, rdi, rsi, rdx, r10, r8, r9), damit Ausgabe ohne libc möglich ist.
+
+7) TESTSUITE: mindestens 40 .fi-Testprogramme unter tests/, jedes mit einer maschinenlesbaren Erwartung (z. B. Kommentar in der ersten Zeile: `// expect_exit: 42` bzw. `// expect_out: Hallo Welt`). test.sh muss: den Compiler bauen (cargo build --release), JEDES Testprogramm übersetzen, assemblieren, linken, AUSFÜHREN und Exit-Code bzw. Standardausgabe gegen die Erwartung prüfen — einmal mit Optimierung, einmal mit --no-opt. Zusätzlich mindestens 8 NEGATIVTESTS unter tests/neg/ mit absichtlich kaputten Programmen: der Compiler muss mit Fehlercode != 0 abbrechen UND die erwartete Fehlermeldung samt Zeile/Spalte ausgeben (Erwartung z. B. `// expect_error: 7:22 erwartet ')'`) — er darf NICHT abstürzen (kein Rust-Panic, kein unwrap-Absturz). Am Ende gibt test.sh eine klare Bilanz aus: "PASS 48/48" oder "FAIL 3/48" mit Auflistung der gescheiterten Tests, und setzt den Exit-Code entsprechend.
+   Beispielprogramme in examples/: hello.fi (Hallo-Welt über write-Syscall, wirklich sichtbare Ausgabe), fib.fi (Fibonacci rekursiv), bubblesort.fi (Bubblesort auf einem Array, Ergebnis prüfbar), structs.fi (Structs mit verschachtelten Feldern und Array von Structs).
+
+8) README.md: Build-Anleitung (Voraussetzungen: rustc/cargo, binutils as+ld), Schnellstart, ECHTER kopierter Beispiel-Output (tatsächlich ausgeführt, nicht erfunden — inkl. der realen test.sh-Bilanz), kurze Sprachtour, Verweis auf SPEC.md/FIR.md, und eine EHRLICHE Liste "Was Firn noch NICHT kann" (Module, comptime, Generics, enums/match, Fehlerunionen, defer/drop, Move-Prüfer, Referenztypen, Strings, Gleitkomma, Standardbibliothek, aarch64, WASM, LLVM-Backend).
+
+HARTE REGELN:
+- KEINE todo!(), unimplemented!(), panic!("not implemented") in den geforderten Pfaden. Was nicht implementiert ist, meldet einen sauberen Compilerfehler ("Feature X wird in Stufe 0 nicht unterstützt") statt abzustürzen.
+- `cargo build --release` MUSS mit NULL Warnungen durchlaufen. Keine #![allow(...)]-Sammelunterdrückung, um Warnungen zu verstecken.
+- Keine externen Crates (std genügt). Kein LLVM, kein Cranelift, kein C-Compiler als Backend.
+- Der Sprachname darf ausschließlich in config.rs stehen.
+- Lieber WENIGER Sprachumfang, der WIRKLICH LÄUFT, als mehr, der behauptet wird. Wenn etwas nicht fertig wird: aus der Testsuite nehmen, in README ehrlich als "nicht implementiert" führen — NICHT faken, NICHT den Test so umschreiben, dass er trivial besteht.
+- Selbst verifizieren: bevor ihr fertig meldet, wirklich `bash test.sh` laufen lassen und das echte Ergebnis in README schreiben.
+**Messlatte:** Der Compiler MUSS wirklich bauen und die Testsuite MUSS real durchlaufen — jedes Testprogramm wird kompiliert, ausgeführt und sein Ergebnis geprüft. Die Jury führt selbst `cargo build --release` und `bash test.sh` aus und glaubt KEINE Behauptung aus dem README ohne eigenen Nachweis.
+
+Streng bewertet:
+(a) LAUFEN die erzeugten Binaries tatsächlich und liefern korrekte Ergebnisse? Stichprobe: mindestens 5 Testprogramme selbst übersetzen, ausführen, Exit-Code/Ausgabe prüfen. examples/hello.fi muss wirklich sichtbaren Text ausgeben, fib.fi das richtige Ergebnis liefern, bubblesort.fi wirklich sortieren. Ein Compiler, der nur Assembler-Text ausspuckt der nicht assembliert oder segfaultet, ist ein Totalausfall.
+(b) Ist der Codegen WIRKLICH eigener x86_64-Code ohne LLVM/Cranelift/gcc-Backend? Prüfen: Cargo.toml auf Abhängigkeiten, Quelltext auf Aufrufe an externe Codegeneratoren, erzeugter .s-Text auf Plausibilität (echte Registerzuteilung, echte Prologe/Epiloge, System-V-Konvention). gcc/as/ld dürfen nur assemblieren/linken. Wird C erzeugt und mit gcc übersetzt: Totalausfall.
+(c) Sind die FEHLERMELDUNGEN brauchbar? Selbst absichtlich kaputte .fi-Programme schreiben (Syntaxfehler, Typfehler, unbekannte Variable, falsche Argumentanzahl) und den Compiler darauf loslassen: Muss Zeile, Spalte, Quelltextausschnitt und eine verständliche Meldung liefern und mit Exit-Code != 0 sauber abbrechen — KEIN Rust-Panic, kein unwrap-Absturz, keine Endlosschleife. Ein Compiler, der bei kaputter Eingabe panickt, verliert massiv Punkte.
+(d) Ist die IR ECHT und die Optimierung NACHWEISBAR wirksam? `--emit=fir` muss eine plausible, dokumentierte IR ausgeben (Basisblöcke, Terminatoren, typisierte Werte), docs/FIR.md muss zur tatsächlichen Ausgabe passen. Konstantenfaltung und Entfernen toten Codes müssen im Vorher/Nachher-Dump sichtbar sein — selbst nachprüfen mit einem eigenen kleinen Testprogramm. Eine "IR", die nur ein anderer Name für den AST ist, zählt nicht.
+(e) Deckt sich SPEC.md mit dem, was IMPLEMENTIERT ist? Stichproben aus SPEC §12 nehmen und prüfen, ob es wirklich geht. Ist die README-Liste der Nicht-Fähigkeiten ehrlich, oder werden Lücken verschwiegen? Behauptet das README etwas, das nicht stimmt: massiver Abzug.
+(f) SAUBERKEIT: keine todo!()/unimplemented!() in den geforderten Pfaden (grep), NULL Compilerwarnungen bei `cargo build --release` (selbst ausführen und Ausgabe prüfen), keine Sammelunterdrückung von Warnungen per #![allow], keine externen Crates.
+(g) TESTSUITE-EHRLICHKEIT: Sind es wirklich >= 40 substanzielle Testprogramme, oder 40 Varianten von "return 0"? Prüfen ob test.sh wirklich ausführt und vergleicht — oder nur "compiled ok" meldet. Ein test.sh, das Fehler verschluckt (fehlendes set -e, ignorierte Exit-Codes, || true) ist Betrug und muss hart bestraft werden. Prüfen, ob die Tests auch mit --no-opt dasselbe Ergebnis liefern.
+
+Behauptungen ohne laufenden Code = massiver Punktabzug. Ein kleiner, ehrlich funktionierender Compiler ist deutlich besser bewertet als ein großer, der nicht läuft. Bewertet wird, was die Jury selbst zum Laufen bringt, nicht was im README steht.
+**Bester Score:** 86/100 (Runde 1)
+**Agenten:** 8 · **Dauer:** 3282s
+**Runden-Snapshots:** je Runde ein Git-Commit + Tag (gauntlet-r<N>-score<S>). Bester Stand: Branch `gauntlet-best` (Runde 1) — Wechsel mit `git checkout gauntlet-best`, zurueck mit `git checkout -`.
+**Runde 0 — Architektur**: 4 Module (frontend, sema, lowering, opt)
+**Runde 1** — Score 86/100 (Ziel 85)
+  Maengel: • Laufzeitnachweis durch mich nicht reproduzierbar: Ausfuehrung von compiler/target/release/firnc und cargo ist in meiner Umgebung blockiert; Beleg sind nur die Artefakte in .test-work/ (75 ELF-Binaries x opt/noopt, leere .cerr) — kein selbst gemessener Exit-Code von fib.fi (89) oder bubblesort.fi (1)  • SPEC.md:571 und README behaupten 'eigene Registerzuteilung'; codegen_x86.rs:74-102 vergibt jedem SSA-Wert einen 8-Byte-Stack-Slot und rechnet nur in rax/rcx/rdx — es findet KEINE Registerzuteilung statt, nur Spilling. Overclaim gegenueber dem Selbstkommentar in codegen_x86.rs:7 ('bewusst naiv')  • Rahmengroesse = 8 Byte pro SSA-Wert ohne Obergrenze (codegen_x86.rs:78-81, 'sub rsp, FRAME'), keine Stack-Probe: eine Funktion mit sehr vielen Werten erzeugt einen beliebig grossen Rahmen und kann ohne Diagnose in den Guard-Page laufen  • codegen_x86.rs:86 ueberspringt per 'continue' stillschweigend Bloecke ausserhalb des Eintrittsblocks, die alloca enthalten; das fuehrt in Zeile 329 nur zu 'interner Fehler: alloca ohne Platz' — eine Fehlermeldung ganz ohne Zeile/Spalte/Quelltextausschnitt  • Optimierer bleibt an der Oberflaeche: .opt-work/fold_arith.opt.fir behaelt store.i32/load.i32 auf einem alloca, das nur einmal geschrieben und einmal gelesen wird; .opt-work/dead_branch.opt.fir behaelt einen leeren bb0 mit 'br bb1' — weder mem2reg/Copy-Propagation noch Blockverschmelzung
+✅ Ziel erreicht in Runde 1 (86 ≥ 85).
