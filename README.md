@@ -13,8 +13,10 @@ freistehendes Linux-Binary ohne libc.
 * **Kein Parser-Generator.** Handgeschriebener Lexer und rekursiv absteigender
   Parser mit Fehlerwiederherstellung.
 
-Der verbindliche Umfang steht in [SPEC.md §12](SPEC.md) (Abweichungen der
-Umsetzung in §12.1), die IR ist in [docs/FIR.md](docs/FIR.md) dokumentiert.
+Der verbindliche Umfang steht in [SPEC.md §14](SPEC.md) (Abweichungen der
+Umsetzung in §14.1), die IR ist in [docs/FIR.md](docs/FIR.md) dokumentiert.
+Wie man alles baut, startet und **selbst nachmisst**: [RUN.md](RUN.md).
+Der Abnahmestand mit echten Zahlen: [ABNAHME.md](ABNAHME.md).
 
 ---
 
@@ -61,32 +63,47 @@ Exit: 89
 bash test.sh
 ```
 
-Echtes Ergebnis dieses Baustands (Auszug, ungekürzt am Ende):
+Echtes Ergebnis dieses Baustands (Auszug; selbst gemessen am 13.08.2026 nach der
+Zusammenführung von Runde 2):
 
 ```
 == 1. Compiler bauen ==
 == 2. Modul-Tests des Compilers ==
    cargo test: ok
 == 3. Positivtests (jeweils mit und ohne Optimierer) ==
-   75 Programme x 2 Durchlaeufe
+   114 Programme x 2 Durchlaeufe
 == 4. Negativtests (Fehlermeldungen) ==
 == 5. Nachweis des Optimierers ==
-   PASS 18/18 (Optimierer-Nachweis)
+   PASS 41/41 (Optimierer-Nachweis)
 
-PASS 166/166
+PASS 259/259
 ```
 
-`test.sh` baut den Compiler, lässt `cargo test` laufen (65 Modultests),
+`test.sh` baut den Compiler, lässt `cargo test` laufen (111 Modultests),
 übersetzt **jedes** Programm aus `tests/`, `tests/opt/` und `examples/`
 **zweimal** (mit Optimierer und mit `--no-opt`), assembliert, linkt, **führt
 aus** und vergleicht Exit-Code bzw. Standardausgabe mit der Erwartung in Zeile 1
-(`// expect_exit: N` / `// expect_out: TEXT`). Danach prüft es die 15
+(`// expect_exit: N` / `// expect_out: TEXT`). Danach prüft es die 30
 Negativtests in `tests/neg/` (Compiler muss mit Exit ≠ 0 abbrechen, die
 erwartete Meldung samt `Zeile:Spalte` und Markierung ausgeben und darf **nicht**
 paniken) und den Optimierernachweis (`test_opt.sh`).
 
-Bestand: 65 Testprogramme in `tests/`, 6 Optimierer-Programme in `tests/opt/`,
-4 Beispiele in `examples/`, 15 Negativtests in `tests/neg/`.
+Bestand: 97 Testprogramme in `tests/`, 13 Optimierer-Programme in `tests/opt/`,
+4 Beispiele in `examples/`, 30 Negativtests in `tests/neg/`. Die 166 Tests aus
+Runde 1 sind alle noch da und bestehen weiter — es wurde kein Test entfernt oder
+abgeschwächt (`tests/001…065`, `tests/opt/`, `tests/neg/`).
+
+Dieselbe Suite maschinenlesbar (CI):
+
+```sh
+cargo build --release --manifest-path tools/testrunner/Cargo.toml
+./tools/testrunner/target/release/testrunner --format=json | python3 -m json.tool | head
+# {"suite":"firn","total":256,"passed":256,"failed":0,"rate":1.0, "cases":[...]}
+```
+
+Der Testrunner läuft ohne `test.sh` und zählt jedes Programm einzeln in beiden
+Betriebsarten; er enthält den Optimierernachweis (`test_opt.sh`, 41 Prüfungen)
+nicht, daher 256 statt 259.
 
 ## Kommandozeile
 
@@ -228,64 +245,361 @@ ausgerichtet. Ansehen mit `--emit=asm` oder `--keep-asm`.
 
 ## Was Firn (Stufe 0) noch NICHT kann — ehrliche Liste
 
-Nicht implementiert, weder im Compiler noch als Sprachmittel:
+Stand **nach Runde 2** (13.08.2026, zusammengeführt). Was Runde 2 geliefert hat,
+steht weiter unten je Modul; hier steht nur, was **nicht** da ist. Jeder Punkt
+ist überprüfbar: der Compiler meldet dafür einen Fehler mit Zeile/Spalte, er
+stürzt nicht ab und tut nicht so, als könne er es.
 
-* **Module/Imports** (`import`), **Sichtbarkeit/`export`**
-* **`comptime`**, **Generics**, **Interfaces**
-* **`enum` und `match`**, **Fehlerunionen `!T`**, **Optionals**
+Von den neun Zielen dieser Runde sind **1–5 und 9 umgesetzt und gemessen**;
+**6 (Constant-Time), 7 (GC/DOM) und 8 (HTML5-Tokenizer) wurden nicht gebaut**:
+
+* **`secret[T]`, `select`, `secure_zero`, `barrier`, `u128`, `mul_wide`,
+  `#[constant_time]`** (SPEC §9) — **nicht umgesetzt.** Im Optimierer und in
+  der FIR liegen die Schutzvorkehrungen bereit (`fir::Func::secret`,
+  `constant_time`; mem2reg/DCE/CSE/Inlining lassen solche Werte in Ruhe, mit
+  Rust-Modultests belegt), aber es gibt **keine Sprachsyntax und keine
+  Typprüfung** dafür. `fn f(a: secret[u8])` meldet
+  `'secret[T]' ist in Stufe 0 nicht umgesetzt`
+  (`tests/neg/int_secret_nicht_umgesetzt.fi`).
+* **`Rc[T]`, `Weak[T]`, `Gc[T]`, `gc class`, Mark-Sweep, DOM-Prototyp**
+  (SPEC §3.4/§3.5) — **nicht umgesetzt.** Kein GC, kein Dauerlauf, keine
+  RSS-Messung. `let x: Gc[i32]` meldet `'Gc[T]' ist in Stufe 0 nicht umgesetzt`
+  (`tests/neg/int_gc_nicht_umgesetzt.fi`). ABNAHME.md Punkt 2 bleibt deshalb
+  offen.
+* **HTML5-Tokenizer in Firn** — **nicht geschrieben.** `testdata/html5lib-tokenizer/`
+  (6.810 Fälle) liegt bereit, es gibt **keinen** Tokenizer und **keinen**
+  Harness. Bestandene Fälle: **0 von 6.810 (0,0 %)**. ABNAHME.md Punkt 3 bleibt
+  offen. Die Vorarbeiten dafür (`enum`/`match` mit Sprungtabelle, `Str16`,
+  `Atom`, Aggregate an Funktionsgrenzen, Registerzuteilung) sind da.
+* **`comptime`**, **Interfaces**, **Fehlerunionen `!T`**, **Optionals**,
+  **Abwicklung/`throw`** (SPEC §5.3)
 * **`defer`**, **`drop`**, **Move-Prüfer**, **Arenen/Allokatoren**
 * **Referenztypen `&T` / `inout T` als geprüfte Typen** — Stufe 0 hat nur
   Rohzeiger `*T`/`*mut T`; `mut` an Zeigern wird geparst, aber nicht geprüft
-* **Zeichenketten** als Typ (nur `[u8; N]`), **keine String-/Zeichenliterale**
-* **Gleitkomma** (`f32`/`f64`), **Vektortypen**
-* **Standardbibliothek**, **Allokation**, **Panik-Handler**, Laufzeitprüfungen
+* **Gleitkommatyp** (`f32`/`f64`) in der Sprache — `strtod`/`dtoa` in
+  `lib/num/` rechnen auf `u64`-Bitmustern (SPEC §14.1.str S2)
+* **String-/Zeichenliterale im Quelltext** — der Literalpfad ist im Compiler
+  fertig (`compiler/src/strings.rs`, prüfbar über `firnc '--strlit=u"a\uD800"'`),
+  aber **nicht an den Lexer angebunden** (SPEC §14.1.str S1)
+* **Globale Variablen** (nur `const`), **Panik-Handler**, Laufzeitprüfungen
   (Überlauf, Division durch null, Indexgrenzen sind ungeprüft)
+* **Paketverwaltung** (`W1`) — es gibt ein Modulsystem, aber keine Registry,
+  keine Sperrdatei, keinen reproduzierbaren Zwei-Rechner-Bau
 * **aarch64**, **WASM**, **LLVM-Backend**, Selbst-Hosting (Stufen 1–3 der
-  ROADMAP)
-* Optimierung über **Konstantenfaltung und Entfernen toten Codes** hinaus
-  (kein Inlining, kein mem2reg/SSA, keine Registerzuteilung mit Lebendigkeit)
+  ROADMAP; Bestandsaufnahme in `docs/SELBSTHOSTING.md`)
 
-### Bekannte Schwächen des Codegenerators (von der Jury gefunden, nicht behoben)
+### Bekannte Schwächen, die Runde 2 NICHT behoben hat
 
-* **Kein Stack-Probing, keine Rahmen-Obergrenze.** Der Prolog reserviert
-  8 Byte je FIR-Wert (`sub rsp, FRAME`) ohne Prüfung. Eine Funktion mit sehr
-  vielen Werten erzeugt einen beliebig großen Rahmen und kann ohne Diagnose
-  über die Guard-Page hinauslaufen. Für die Testsuite unkritisch, für
-  Kernel-Code später zwingend zu beheben.
-* **Rein slot-basierte Registerbelegung.** Jeder FIR-Wert bekommt einen
-  Stack-Slot; gerechnet wird in `rax`/`rcx`/`rdx`. Das ist korrekt, aber
-  langsam — es ist Spilling, keine Registerzuteilung. Steht so auch in
-  SPEC.md §12.
-* **Optimierer bleibt an der Oberfläche.** Nach Konstantenfaltung und DCE
-  bleiben `store`/`load` auf Allokationen stehen, die nur einmal geschrieben
-  und gelesen werden (kein mem2reg), und leere Blöcke mit reinem `br` werden
-  nicht verschmolzen. Wirksam ist die Optimierung trotzdem nachweisbar
-  (siehe `test_opt.sh`), aber sie ersetzt keinen echten Optimierer.
+* **Kein Stack-Probing, keine Rahmen-Obergrenze.** Der Prolog reserviert den
+  Rahmen ohne Prüfung; eine Funktion mit sehr vielen lebendigen Werten kann
+  ohne Diagnose über die Guard-Page hinauslaufen.
+* **Anweisungsgenaue Debug-Zeilen nur mit `--no-opt`.** Mit Optimierer bleibt
+  die Zeile der `fn`-Deklaration, weil die FIR keine Quellpositionen trägt
+  (SPEC §14.1 Punkt 16).
+* **Leistungsziel ≤ 2× Rust verfehlt** — gemessener Median **2,8×–3,4×**
+  (Spanne 1,6×–6,0×), siehe unten.
 
-Weitere Einschränkungen der Umsetzung, die in SPEC.md §12.1 festgehalten sind:
+### Was Runde 1 bemängelt hat und jetzt behoben ist
 
-* höchstens **6 Funktionsparameter** (nur Registerargumente)
-* **Structs/Arrays nicht an Funktionsgrenzen** — nur per Zeiger
-* **kein Vorgabetyp für Literale**: `let x = 5` ist ein Fehler
-* **kein `break`/`continue`**, kein `for`
-* **kein Wiederholungsliteral `[0; N]`** — Arrays werden elementweise
-  initialisiert
-* **globale Variablen** gibt es nicht (nur `const`)
-* `extern fn` wird erkannt und mit klarem Fehler abgelehnt
-* `profile` wird geprüft, hat aber keine Wirkung
+* mem2reg, Blockverschmelzung, Copy-Propagation, CSE und Inlining gibt es
+  (`compiler/src/mem2reg.rs`, `inline.rs`, `opt.rs`; `tests/opt/`, 41 Prüfungen
+  in `test_opt.sh`).
+* Die slot-basierte Belegung ist durch eine **echte Registerzuteilung**
+  (linear scan mit Lebendigkeitsintervallen, `compiler/src/regalloc.rs`)
+  ersetzt; Faktor gegenüber `--no-opt` im Median **~10×**.
+* Höchstens 6 Parameter, keine Aggregate an Funktionsgrenzen, kein
+  `break`/`continue`/`for`, kein `[wert; N]`, kein Modulsystem: alles
+  aufgehoben, einzeln in SPEC.md §14.1 vermerkt (Punkte 1, 9, 11, 13, 15).
 
 ## Verzeichnisse
 
 ```
+RUN.md                   wie man alles baut, startet und nachmisst
 SPEC.md, ROADMAP.md      Sprachspezifikation und Fahrplan (Vertrag)
+ABNAHME.md               die sechs Abnahmepunkte mit echten Messwerten
 docs/FIR.md              die eigene IR: Instruktionen, Typen, Invarianten
-compiler/src/            config.rs main.rs lexer.rs ast.rs parser.rs diag.rs
-                         types.rs sema.rs fir.rs lower.rs opt.rs codegen_x86.rs
-tests/                   65 Programme + tests/opt (6) + tests/neg (15)
+docs/DEBUGGER.md         .debug_line + wörtlich kopierte gdb-Sitzung
+docs/SELBSTHOSTING.md    was heute schon in Firn geschrieben werden könnte
+compiler/src/            24 Module: config.rs main.rs lexer.rs ast.rs parser.rs
+                         diag.rs types.rs sema.rs sema_match.rs sema_generic.rs
+                         mono.rs modules.rs abi.rs fir.rs lower.rs lower_match.rs
+                         opt.rs mem2reg.rs inline.rs regalloc.rs dwarf.rs
+                         strings.rs codegen_x86.rs codegen_switch.rs
+lib/str/, lib/num/       Firn-Bibliothek: Bytes/Str/Str16/Atom, strtod/dtoa
+tests/                   97 Programme + tests/opt (13) + tests/neg (30)
 examples/                hello.fi fib.fi bubblesort.fi structs.fi
+bench/                   6 Mikrobenchmarks, doppelt (Firn + Rust), run.sh
+tools/testrunner/        Testrunner mit --format=json (CI)
+tools/strlib/            Einbinder für lib/*.fi (erzeugt tests/300…308)
+tools/dtoa_vectors/      100.000-Doubles-Rundlauf gegen Rust als Messlatte
+testdata/                html5lib-Tokenizer-Suite (6.810 Fälle, ungenutzt)
 test.sh                  gesamte Testsuite (baut, führt aus, vergleicht)
 test_opt.sh              Vorher/Nachher-Nachweis des Optimierers
 ```
 
 Der Sprachname steht ausschließlich in `compiler/src/config.rs`
 (`LANG_NAME`, `LANG_NAME_LOWER`, `FILE_EXT`) — Umbenennen = drei Konstanten.
+
+## Summentypen, Musterabgleich und Generics (Modul `types`, Runde 2)
+
+Umgesetzt sind `enum` mit Nutzdaten, `match` mit Vollständigkeitsprüfung zur
+Übersetzungszeit, Sprungtabellen im Codegenerator und Generics per
+Monomorphisierung. Die bewussten Einschränkungen stehen in `SPEC.md` §14.1
+unter `14.1.types` (T1–T8) — insbesondere: `match` ist eine **Anweisung**,
+Aufzählungen liegen nicht dem Wert nach in Structs, und generisch sind nur
+Funktionen und Structs.
+
+```firn
+enum Wert { Nichts, Zahl(i32), Paar(i32, i32) }
+
+fn main() -> i32 {
+    let w = Wert::Paar(7, 35)
+    var s: i32 = 0
+    match w {
+        Wert::Nichts   => { s = 0 as i32 }
+        Wert::Zahl(x)  => { s = x }
+        Wert::Paar(x, y) => { s = x + y }
+    }
+    match s {
+        0        => { s = 1 as i32 }
+        1..10    => { s = 2 as i32 }
+        10..=99  => { s = 3 as i32 }
+        _        => { s = 4 as i32 }
+    }
+    return s
+}
+```
+
+* **Layout einer Aufzählung:** `__tag: u32` bei Offset 0, Nutzdaten ab
+  `round_up(4, ausrichtung)`, Varianten überlagern sich (echte Vereinigung).
+  Nachweis: `cargo test --release --manifest-path compiler/Cargo.toml
+  sema_match::tests::layout_tag_und_nutzdaten`.
+* **Vollständigkeit ist ein Fehler, kein Hinweis.** `tests/neg/match_*.fi`
+  belegt: fehlende Variante (mit Namen), fehlender `_`-Fall bei Ganzzahlen,
+  unbekannte Variante, unerreichbarer Fall — jeweils mit Zeile:Spalte.
+* **Sprungtabelle:** ab 8 Marken und ≥ 40 % Dichte erzeugt
+  `compiler/src/codegen_switch.rs` eine `.rodata`-Tabelle mit
+  `jmp qword ptr [rdx + rax*8]` statt einer Vergleichskette.
+  Selbst nachprüfen:
+
+  ```bash
+  compiler/target/release/firnc --emit=asm -o /tmp/zm.s tests/230_zustandsmaschine.fi
+  grep -c "jmp qword ptr" /tmp/zm.s     # 1  (Zustandsmaschine mit 32 Zuständen)
+  grep -c "^	cmp"        /tmp/zm.s     # 0  (keine Vergleichskette)
+  ```
+
+  Automatisch geprüft von
+  `codegen_switch::tests::sprungtabelle_bei_30_zustaenden`.
+* **Generics:** `fn f[T: Int](..)`, `struct Vec[T] { .. }`, Aufruf `f[i32](..)`,
+  Typ `Vec[i32]`, Literal `Vec[i32]{ .. }`. Monomorphisierung erzeugt Namen
+  nach dem Vertrag `name__T1_T2` (z. B. `vec_push__i32`, `Map__u32_i32`).
+  Beispiele: `tests/210_generic_fn.fi`, `tests/211_generic_struct.fi` (Vec[T]),
+  `tests/212_generic_map.fi` (Hash-Abbildung `Map[K, V]`, offene Adressierung).
+  Nicht erfüllte Anforderungen, falsche Anzahl Typargumente und generische
+  Namen ohne `[..]` sind Fehler mit Zeile:Spalte (`tests/neg/generic_*.fi`).
+
+Testprogramme dieses Moduls: `tests/200_enum_basic.fi`,
+`tests/201_enum_payload.fi`, `tests/202_match_int_range.fi`,
+`tests/203_match_nested.fi`, `tests/204_match_bool.fi`,
+`tests/210..212_generic_*.fi`, `tests/230_zustandsmaschine.fi`;
+Negativtests `tests/neg/match_*.fi`, `tests/neg/generic_*.fi`.
+Alle laufen mit **und** ohne `--no-opt` mit demselben Ergebnis.
+
+
+## Zeichenketten und Zahlen ↔ Text (Modul `str`, Runde 2)
+
+Umgesetzt ist SPEC §8 (`Z1`–`Z6`) — die vier getrennten Typen, WTF-16 **ohne
+jede Prüfung**, korrekt gerundetes `strtod` und kürzeste Double-Ausgabe mit
+Rückwandlungsgarantie. Die Bibliothek liegt in `lib/str/` und `lib/num/` und
+ist in **Firn** geschrieben; im Compiler steckt nur der Literalpfad
+(`compiler/src/strings.rs`).
+
+| Typ | Inhalt | geprüft? | Datei |
+|---|---|---|---|
+| `Bytes` | rohe Oktette | nein | `lib/str/bytes.fi` |
+| `Str` | UTF-8 | ja, an der Grenze (`bytes_is_str`) | `lib/str/bytes.fi` |
+| `Str16` | `u16`-Codeeinheiten (WTF-16) | **nichts** | `lib/str/str16.fi` |
+| `Atom` | `u32`, interniert | — | `lib/str/atom.fi` |
+
+Layout wie in SPEC §8.1 festgelegt: `{ ptr, len, cap }`, `len`/`cap` in
+Elementen. Umwandlungen sind ausdrücklich und ihre Fehlbarkeit steht im
+Ergebnis (`lib/str/utf8.fi`): `str16_to_utf8` → `bool`,
+`str16_to_utf8_lossy` → U+FFFD, `str16_to_wtf8`/`wtf8_to_str16` → verlustfrei.
+
+### Ungepaarte Surrogate — selbst nachprüfen
+
+```bash
+compiler/target/release/firnc -o /tmp/t300 tests/300_str16_surrogate.fi && /tmp/t300
+# 3 97 55296 98 0 0 5 97 239 191 189 98 5 97 237 160 128 98 1 55296
+#   |  |     |  |  |  |                  |                    |  ^ nach WTF-8-Rundlauf wieder 0xD800
+#   |  |     |  |  |  ^ to_utf8_lossy: 'a' EF BF BD 'b'        ^ WTF-8: 'a' ED A0 80 'b'
+#   |  |     |  ^ to_utf8() liefert false und ein LEERES Ziel
+#   |  ^ das einzelne 0xD800 (55296) bleibt erhalten
+#   ^ Länge 3
+```
+
+Der Literalpfad im Compiler ist ohne Quelldatei prüfbar:
+
+```bash
+compiler/target/release/firnc '--strlit=u"a\uD800"'   # Str16: 0061 D800, to_utf8 nichts
+compiler/target/release/firnc '--strlit="a\uD800"'    # Fehler: ungepaartes Surrogat in Str
+compiler/target/release/firnc '--strlit=b"AB\xff"'    # Bytes: 41 42 FF
+```
+
+Der API-Vertrag mit dem Modul `tok` (`str16_new`, `str16_push`, `str16_len`,
+`str16_at`, `atom_intern`) steht in `tests/308_str16_api.fi`. `str16_new()`
+liefert ein Aggregat als Rückgabewert; wer ohne auskommen muss, nimmt
+`str16_init(&s)`.
+
+### `strtod` / `dtoa`
+
+Beide liegen in `lib/num/` und rechnen in **exakter Großzahlarithmetik**
+(`lib/num/bignum.fi`): `strtod` skaliert den Bruch `D · 10^exp` so, dass der
+Quotient genau 53 bit hat, und rundet aus dem Rest zur nächsten — bei genau
+halbem Abstand zur geraden — Mantisse. `dtoa` ist Dragon4 im freien Format
+(Ryū/Grisu-Klasse: dieselbe Ziffernfolge, anderer Weg) mit
+ECMAScript-Schreibweise.
+
+**Die Sprache hat noch keinen Gleitkommatyp** — beide arbeiten deshalb auf dem
+`u64`-**Bitmuster** des `binary64`. Das ist keine Abkürzung (die Rechnung ist
+ohnehin ganzzahlig), aber eine ehrlich geführte Abweichung: SPEC §14.1.str S2.
+
+Gemessen am 13.08.2026 (dieser Rechner, `cargo build --release`):
+
+| Prüfung | Befehl | Ergebnis |
+|---|---|---|
+| 26 `strtod`-Härtefälle (0.1, 1e23, 5e-324, 9007199254740993, 2.2250738585072011e-308, …) | `tests/304_strtod_hardcases.fi` | **26/26 bitgenau** |
+| 28 `dtoa`-Härtefälle inkl. ±0, ±Infinity, NaN | `tests/305_dtoa_hardcases.fi` | **28/28 wie ECMAScript** |
+| 100.000 Zufalls-Doubles: f64 → Text → f64 | `bash tools/dtoa_vectors/run.sh 100000 12345` | **100.000/100.000 bitgleich** |
+| dieselben 100.000 gegen Rusts kürzeste Darstellung | dito, Schritt 4 | **100.000/100.000 identisch**, 13,9 s |
+
+`tools/dtoa_vectors/gen.rs` ist **Messlatte, nicht Abhängigkeit**: der Compiler
+selbst hat weiterhin keine einzige fremde Kiste.
+
+### Wie die Testprogramme entstehen
+
+Stufe 0 hat kein Modulsystem und keine Zeichenkettenliterale. `tools/strlib/expand.py`
+löst `//#include lib/...` und `//#str name text` auf und erzeugt daraus die
+eigenständigen Programme `tests/300..307_*.fi`, `tests/neg/str*.fi` und
+`tools/dtoa_vectors/dtoa_stream.fi`. Die erzeugten Dateien liegen im Baum,
+`test.sh` braucht das Werkzeug also nicht:
+
+```bash
+python3 tools/strlib/expand.py --check   # sind die erzeugten Dateien aktuell?
+python3 tools/strlib/expand.py --all     # neu erzeugen
+```
+
+### Was fehlt (ehrlich)
+
+* Zeichenkettenliterale sind im Compiler fertig, aber **nicht im Lexer
+  verdrahtet** — in `.fi`-Quelltext gibt es sie noch nicht (SPEC §14.1.str S1).
+* Kein `f64` in der Sprache (S2), kein eigener `Wtf8`-Typ (S5), kein `Rope`
+  (S6), Atomnummern erst zur Laufzeit statt zur Bauzeit (S7).
+
+## Optimierer, Registerzuteilung und Leistung (Modul `opt`, Runde 2)
+
+Dateien: `compiler/src/opt.rs` (Steuerung, Faltung, DCE, CSE, Bereichsprüfungen),
+`compiler/src/mem2reg.rs` (Speicher→Wert, Kopierfortpflanzung,
+Blockverschmelzung), `compiler/src/inline.rs` (Inlining),
+`compiler/src/regalloc.rs` (Registerzuteilung + registerbewusste Emission),
+`tests/opt/**`, `test_opt.sh`, `bench/**`.
+
+### Was der Optimierer jetzt tut
+
+| Durchgang | Wirkung | selbst nachprüfen |
+|---|---|---|
+| Konstantenfaltung | wie Runde 1, unverändert | `tests/opt/fold_*.fi` |
+| **mem2reg** | `alloca`, die **einmal** geschrieben wird und deren `store` alle `load`s **dominiert**, verschwindet | `tests/opt/mem2reg_single_store.fi`: `load.i32` 3 → 0 |
+| **tote Speicherung** | `alloca`, aus der nie gelesen wird, samt aller `store`s | `tests/opt/dead_store.fi`: `store.i32` 3 → 0, `alloca` 1 → 0 |
+| lokale Speicherweiterleitung | `store p,v; … ; load p` → `v` (blockintern, konservativ bei Aufruf/Store) | `mem2reg::tests::load_nach_store_*` |
+| Kopierfortpflanzung | Identitäts-`cast`, `x+0`, `x*1`, `x*0`, `ptradd p,0`, … | `mem2reg::tests::algebraische_identitaeten` |
+| **CSE** entlang des Dominatorbaums | gleicher reiner Ausdruck wird einmal berechnet | `tests/opt/cse_common.fi`: `mul.i32` 2 → 1 |
+| **Blockverschmelzung** + Sprungfädelung | leere `br`-Blöcke weg, Ketten verschmolzen | `tests/opt/block_merge.fi`: 8 Blöcke → 1 |
+| **Inlining** mit Größenheuristik | ≤ 40 Instruktionen, ≤ 8 Blöcke, keine Rekursion, nicht in/aus `#[constant_time]` | `tests/opt/inline_call.fi`: `call @quadrat` 1 → 0 |
+| **wiederholte Bedingungen** | `brcond` auf einer schon entschiedenen Bedingung → `br` | `tests/opt/redundant_check.fi`: `brcond` 3 → 2 |
+| **Registerzuteilung** (linear scan) | Lebendigkeitsintervalle, gewichtete Auslagerung, callee-saved korrekt gesichert | `tests/opt/regalloc_loop.fi`, siehe unten |
+
+`Op::Select`, `Op::Barrier`, `Op::SecureZero` und jeder Wert aus `f.secret`
+werden von **keinem** Durchgang verändert, ersetzt oder entfernt; ein `select`
+wird nie zu einer Verzweigung (SPEC §9.2). Dafür gibt es eigene Tests
+(`mem2reg::tests::secret_werte_bleiben_unangetastet`,
+`select_bleibt_select`, `regalloc::tests::select_bleibt_cmov_auch_mit_registern`).
+
+### Registerzuteilung — der Nachweis
+
+```
+firnc --emit=asm -o /tmp/ra.s tests/opt/regalloc_loop.fi
+sed -n '/^\.Lsumme__bb2:/,/^\.Lsumme__bb3:/p' /tmp/ra.s
+```
+
+```
+.Lsumme__bb2:
+    mov r11d, r10d
+    mov r15d, r9d
+    add r11d, r15d
+    mov r10, r11
+    mov r11d, r9d
+    add r11d, 1
+    mov r9, r11
+    jmp .Lsumme__bb1
+```
+
+Kein einziger `[rbp-…]`-Zugriff im Schleifenrumpf; Zähler und Summe liegen in
+`r9`/`r10`. `bash test_opt.sh` prüft genau das automatisch (und dass jedes
+benutzte callee-saved Register gesichert **und** zurückgeholt wird).
+
+Verfahren: Lebendigkeitsanalyse je Block (`live_in`/`live_out`), daraus ein
+Intervall je Wert, **linear scan** mit aktiver Liste; reicht der Vorrat nicht,
+räumt das aktive Intervall mit dem kleinsten Gewicht (Verwendungen ×
+Schleifentiefe) das Register. Vergeben werden `rbx`, `r12`–`r15` (callee-saved,
+über Aufrufe hinweg) und `r8`–`r11` (nur für Intervalle, die keinen
+`call`/`syscall` einschließen). `rax`, `rcx`, `rdx`, `rsi`, `rdi` bleiben
+Arbeitsregister. Zusätzlich hält der Zuteiler nicht entkommende `alloca`-Zellen
+(≤ 8 Byte, einheitliche Zugriffsbreite) dauerhaft in einem Register — das
+ersetzt die Phi-Knoten, die FIR nicht hat (SPEC §14.1.opt O3).
+
+### Leistung gegen Rust — ehrlich gemessen, Ziel **verfehlt**
+
+`bash bench/run.sh` (6 Mikrobenchmarks, jeder **doppelt**: `bench/firn/*.fi`
+und `bench/rust/*.rs` mit `rustc -O` und `black_box`; beide geben ihr Ergebnis
+aus, und die Messung bricht ab, wenn die Ausgaben nicht übereinstimmen).
+Median aus 7 Läufen, AMD EPYC 7571, rustc 1.99.0-nightly, 13.08.2026:
+
+| Benchmark | Firn | Firn `--no-opt` | Rust `-O` | Faktor Firn/Rust |
+|---|---:|---:|---:|---:|
+| fib (rekursiv) | 0,049 s | 0,143 s | 0,031 s | **1,57×** |
+| sieve (5 Mio.) | 0,117 s | 1,115 s | 0,029 s | **4,08×** |
+| matmul 240³ | 0,122 s | 2,061 s | 0,025 s | **4,95×** |
+| bytecount 16 MiB | 0,509 s | 5,244 s | 0,181 s | **2,81×** |
+| bubblesort 6000 | 0,102 s | 1,304 s | 0,038 s | **2,68×** |
+| statemachine 8 MiB | 0,225 s | 1,247 s | 0,083 s | **2,70×** |
+
+**Nachmessung bei der Zusammenführung** (`BENCH_RUNS=5 bash bench/run.sh`,
+derselbe Rechner, 13.08.2026 abends, geteilte Maschine): fib **1,57×**,
+sieve **3,97×**, matmul **6,04×**, bytecount **1,77×**, bubblesort **5,19×**,
+statemachine **2,76×** → **Median 3,36×**. Die Streuung zwischen zwei Läufen
+derselben Suite ist also erheblich (2,8×–3,4× im Median); wer nachmisst, bekommt
+eine Zahl in dieser Spanne, nicht exakt die Tabelle oben. Die jeweils letzte
+Messung steht immer in `bench/RESULTS.md`.
+
+**Median 2,75×–3,36× langsamer als Rust `-O`** (Einzelwerte 1,57× – 6,04×). Das
+Leistungsziel aus SPEC §10.3 (`P1`, ≤ 2×) ist damit **nicht erreicht** — die
+Zahl steht so auch in `ABNAHME.md` und `SPEC.md` §14.1.opt O4. Der Optimierer
+selbst bringt gegenüber `--no-opt` im Median **9,9×**. Der verbleibende Abstand
+liegt vor allem dort, wo LLVM vektorisiert (Sieb, Matrixmultiplikation): Firn
+erzeugt ausschließlich skalaren Code, SIMD (`L16`) ist offen.
+
+Die Rohtabelle schreibt jeder Lauf nach `bench/RESULTS.md`.
+
+### Was der Optimierer NICHT tut (ehrlich)
+
+* **Keine Schleifenoptimierung**: kein Entrollen, kein Hochziehen invarianter
+  Berechnungen, keine Induktionsvariablen, keine Vektorisierung.
+* **Kein Intervallsplitting** in der Registerzuteilung: ein Wert liegt entweder
+  ganz in einem Register oder ganz im Stack. Bei hohem Registerdruck kostet das.
+* **Kein globales PRE/GVN** — CSE arbeitet nur entlang des Dominatorbaums und
+  fasst `load` nie zusammen (Speicher gilt als undurchsichtig).
+* **Keine Ausrichtung/Anordnung von Blöcken**, keine Sprungvorhersage-Heuristik.
+* Bereichsprüfungen kann Stufe 0 gar nicht entfernen, weil sie gar keine
+  erzeugt (SPEC §14.1 Punkt 3); der Durchgang entfernt stattdessen beweisbar
+  wiederholte Bedingungen (SPEC §14.1.opt O5).

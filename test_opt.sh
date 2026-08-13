@@ -7,6 +7,13 @@
 #   (b) die erwartete gefaltete Konstante steht im Opt-Dump,
 #   (c) ein Block, der im Raw-Dump noch da ist (erkennbar an einer eindeutigen
 #       Marke), ist im Opt-Dump verschwunden und die Blockzahl sinkt.
+# Runde 2 zusaetzlich:
+#   (d) Mustertabelle: eine FIR-Zeile, die im Raw-Dump mindestens n-mal
+#       vorkommt, darf im Opt-Dump hoechstens m-mal vorkommen (mem2reg,
+#       tote Speicherung, Inlining, CSE, Bereichspruefung, Blockverschmelzung).
+#   (e) Assembler-Nachweis der Registerzuteilung: der heisse Schleifenblock
+#       enthaelt KEINEN Stackzugriff, benutzt callee-saved Register und
+#       sichert/restauriert sie ordnungsgemaess.
 # Zusaetzlich laufen die Modul-Tests aus opt.rs (cargo test opt::).
 #
 # Kein '|| true', keine geschluckten Exit-Codes: set -euo pipefail.
@@ -24,7 +31,7 @@ echo "== baue Compiler =="
 cargo build --release --manifest-path compiler/Cargo.toml
 
 echo "== Modul-Tests des Optimierers =="
-cargo test --manifest-path compiler/Cargo.toml opt:: -- --nocapture
+cargo test --manifest-path compiler/Cargo.toml --release -- opt:: mem2reg:: inline:: regalloc::
 
 rm -rf "$WORK"
 mkdir -p "$WORK"
@@ -109,6 +116,87 @@ while IFS='|' read -r FILE WANT MARK; do
         fi
     fi
 done <<< "$CASES"
+
+
+# ------------------------------------------------------------------ (d) ---
+# Muster | raw_min | opt_max
+PATTERNS="
+tests/opt/mem2reg_single_store.fi|load.i32|1|0
+tests/opt/dead_store.fi|store.i32|1|0
+tests/opt/dead_store.fi|alloca|1|0
+tests/opt/inline_call.fi|call.i32 @quadrat|1|0
+tests/opt/cse_common.fi|mul.i32|2|1
+tests/opt/redundant_check.fi|brcond|3|2
+tests/opt/block_merge.fi|bb|8|1
+"
+
+echo "== Mustertabelle (mem2reg, tote Speicherung, Inlining, CSE, Pruefungen) =="
+while IFS='|' read -r FILE PAT RMIN OMAX; do
+    [ -n "$FILE" ] || continue
+    base=$(basename "$FILE" .fi)
+    raw="$WORK/$base.raw.fir"
+    opt="$WORK/$base.opt.fir"
+    "$FIRNC" --emit=fir-raw "$FILE" > "$raw"
+    "$FIRNC" --emit=fir-opt "$FILE" > "$opt"
+    n_raw=$(grep -cF "$PAT" "$raw" || true)
+    n_opt=$(grep -cF "$PAT" "$opt" || true)
+    if [ "$n_raw" -ge "$RMIN" ] && [ "$n_opt" -le "$OMAX" ]; then
+        ok "$FILE: '$PAT' $n_raw -> $n_opt (erlaubt: >= $RMIN -> <= $OMAX)"
+    else
+        bad "$FILE: '$PAT' $n_raw -> $n_opt (erwartet >= $RMIN -> <= $OMAX)"
+    fi
+done <<< "$PATTERNS"
+
+# ------------------------------------------------------------------ (e) ---
+echo "== Registerzuteilung im Assembler =="
+ASM="$WORK/regalloc_loop.s"
+"$FIRNC" --emit=asm -o "$ASM" tests/opt/regalloc_loop.fi
+BODY=$(awk '/^\.Lsumme__bb2:/{f=1;next} /^\.Lsumme__bb3:/{f=0} f' "$ASM")
+if [ -z "$BODY" ]; then
+    bad "regalloc: Schleifenblock .Lsumme__bb2 nicht gefunden"
+else
+    if echo "$BODY" | grep -q '\[rbp-'; then
+        bad "regalloc: Schleifenrumpf greift noch auf den Stack zu"
+        echo "$BODY" | sed 's/^/        /'
+    else
+        ok "regalloc: Schleifenrumpf ohne einen einzigen Stackzugriff"
+    fi
+    if echo "$BODY" | grep -qE '\b(rbx|r8|r9|r10|r11|r12|r13|r14|r15)\b'; then
+        ok "regalloc: Schleifenrumpf rechnet in Registern"
+    else
+        bad "regalloc: keine zugeteilten Register im Schleifenrumpf"
+    fi
+fi
+# callee-saved Register muessen gesichert UND zurueckgeholt werden
+for R in rbx r12 r13 r14 r15; do
+    SAVE=$(grep -cE "mov qword ptr \[rbp-[0-9]+\], $R\$" "$ASM" || true)
+    LOAD=$(grep -cE "mov $R, qword ptr \[rbp-[0-9]+\]\$" "$ASM" || true)
+    if [ "$SAVE" -ne 0 ] || [ "$LOAD" -ne 0 ]; then
+        if [ "$SAVE" -ge 1 ] && [ "$LOAD" -ge 1 ]; then
+            ok "regalloc: $R wird gesichert ($SAVE) und zurueckgeholt ($LOAD)"
+        else
+            bad "regalloc: $R unausgeglichen gesichert/zurueckgeholt ($SAVE/$LOAD)"
+        fi
+    fi
+done
+
+# Optimierung darf das Ergebnis nie aendern: jedes Optimierertestprogramm
+# einmal mit und einmal ohne Optimierer ausfuehren und vergleichen.
+echo "== gleiches Ergebnis mit und ohne Optimierer =="
+for FILE in tests/opt/*.fi; do
+    base=$(basename "$FILE" .fi)
+    "$FIRNC" -o "$WORK/$base.opt.bin" "$FILE"
+    "$FIRNC" --no-opt -o "$WORK/$base.noopt.bin" "$FILE"
+    set +e
+    "$WORK/$base.opt.bin" > "$WORK/$base.opt.out"; A=$?
+    "$WORK/$base.noopt.bin" > "$WORK/$base.noopt.out"; B=$?
+    set -e
+    if [ "$A" = "$B" ] && cmp -s "$WORK/$base.opt.out" "$WORK/$base.noopt.out"; then
+        ok "$FILE: identisches Ergebnis (Exit $A)"
+    else
+        bad "$FILE: Optimierer aendert das Ergebnis ($A vs $B)"
+    fi
+done
 
 TOTAL=$((PASS + FAIL))
 echo

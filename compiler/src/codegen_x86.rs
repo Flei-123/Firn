@@ -18,6 +18,7 @@
 //!   erhaelt das. Damit ist der Stack an JEDER Aufrufstelle 16-ausgerichtet.
 
 use crate::config;
+use crate::dwarf;
 use crate::fir::{BinOp, Block, CmpOp, FTy, Func, Inst, Module, Op, Term, UnOp, Val};
 use std::fmt::Write as _;
 
@@ -132,6 +133,11 @@ pub fn emit(m: &Module) -> Result<String, String> {
         config::VERSION
     ));
     e.raw(".intel_syntax noprefix");
+    // Quelldateien fuer .debug_line (dwarf.rs); leer = keine Debuginfo.
+    let files = dwarf::file_directives();
+    if !files.is_empty() {
+        e.out.push_str(&files);
+    }
     e.raw(".text");
     e.raw(".globl _start");
     e.raw("_start:");
@@ -155,26 +161,35 @@ pub fn emit(m: &Module) -> Result<String, String> {
 }
 
 fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
-    if f.params.len() > ARG_REGS.len() {
-        return Err(format!(
-            "Funktion '{}' hat {} Parameter; Stufe 0 unterstuetzt hoechstens {} (nur Registerargumente)",
-            f.name,
-            f.params.len(),
-            ARG_REGS.len()
-        ));
+    // HOOK opt: Registerzuteilung (compiler/src/regalloc.rs). Liefert der
+    // registerbewusste Pfad `None`, uebernimmt der Grundpfad darunter.
+    if let Some(r) = crate::regalloc::emit_func_ra(e, f) {
+        return r;
     }
     let fr = layout(f);
     e.raw("");
     e.raw(&format!(".globl {}", label(&f.name)));
     e.raw(&format!("{}:", label(&f.name)));
+    if let Some((file, line)) = dwarf::fn_line(&f.name) {
+        e.line(&format!(".loc {} {} 0", file + 1, line));
+    }
     e.line("push rbp");
     e.line("mov rbp, rsp");
     if fr.size > 0 {
         e.line(&format!("sub rsp, {}", fr.size));
     }
-    // Parameter aus ihren Registern in die Slots %0..%(n-1) sichern.
+    // Parameter in ihre Slots sichern: die ersten sechs Ganzzahlwoerter kommen
+    // aus den Argumentregistern, alle weiteren vom Stapel des Aufrufers
+    // (System V: [rbp+16], [rbp+24], ... — davor liegen die gesicherte
+    // Ruecksprungadresse und das gesicherte rbp).
     for (i, _t) in f.params.iter().enumerate() {
-        e.line(&format!("mov qword ptr [rbp-{}], {}", fr.slot[i], ARG_REGS[i]));
+        if i < ARG_REGS.len() {
+            e.line(&format!("mov qword ptr [rbp-{}], {}", fr.slot[i], ARG_REGS[i]));
+        } else {
+            let off = 16 + 8 * (i - ARG_REGS.len()) as u64;
+            e.line(&format!("mov rax, qword ptr [rbp+{}]", off));
+            e.line(&format!("mov qword ptr [rbp-{}], rax", fr.slot[i]));
+        }
     }
 
     for b in &f.blocks {
@@ -185,7 +200,11 @@ fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
 }
 
 fn emit_block(e: &mut Emitter, f: &Func, fr: &Frame, b: &Block) -> Result<(), String> {
-    for i in &b.insts {
+    for (idx, i) in b.insts.iter().enumerate() {
+        // Anweisungsgenaue Quellzeile (nur ohne Optimierer, siehe dwarf.rs)
+        if let Some((file, line)) = dwarf::line_at(&f.name, b.id, idx as u32) {
+            e.line(&format!(".loc {} {} 0", file + 1, line));
+        }
         emit_inst(e, f, fr, i)?;
     }
     match &b.term {
@@ -365,18 +384,28 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
             store_dst(e, fr, d, "rax");
         }
         Op::Call { name, args } => {
-            if args.len() > ARG_REGS.len() {
-                return Err(format!(
-                    "Aufruf von '{}' mit {} Argumenten; Stufe 0 unterstuetzt hoechstens {}",
-                    name,
-                    args.len(),
-                    ARG_REGS.len()
-                ));
+            // Stapelargumente ab dem siebten Wort: sie liegen unmittelbar vor
+            // dem `call` bei [rsp+8k]. Die 16-Byte-Ausrichtung bleibt erhalten
+            // (ungerade Wortzahl bekommt ein Fuellwort).
+            let stack_args = args.len().saturating_sub(ARG_REGS.len());
+            let mut adjust = 8 * stack_args as u64;
+            if stack_args % 2 == 1 {
+                adjust += 8;
             }
-            for (k, a) in args.iter().enumerate() {
+            if adjust > 0 {
+                e.line(&format!("sub rsp, {}", adjust));
+                for (k, a) in args.iter().skip(ARG_REGS.len()).enumerate() {
+                    load_full(e, fr, "rax", *a);
+                    e.line(&format!("mov qword ptr [rsp+{}], rax", 8 * k));
+                }
+            }
+            for (k, a) in args.iter().take(ARG_REGS.len()).enumerate() {
                 load_full(e, fr, ARG_REGS[k], *a);
             }
             e.line(&format!("call {}", label(name)));
+            if adjust > 0 {
+                e.line(&format!("add rsp, {}", adjust));
+            }
             if let Some(d) = i.dst {
                 store_dst(e, fr, d, "rax");
             }
@@ -521,7 +550,8 @@ mod tests {
         let s = emit(&simple_module()).expect("codegen");
         assert!(s.contains("_start:"));
         assert!(s.contains("push rbp"));
-        assert!(s.contains("mov rax, 42"));
+        // Je nach Registerzuteilung 'mov rax, 42' oder 'mov eax, 42'.
+        assert!(s.contains("mov rax, 42") || s.contains("mov eax, 42"), "{}", s);
         assert!(s.contains("mov eax, 60"));
     }
 
@@ -537,15 +567,30 @@ mod tests {
         assert!(fr.size >= 12);
     }
 
+    /// Mehr als sechs Parameter: die weiteren liegen auf dem Stapel des
+    /// Aufrufers, die 16-Byte-Ausrichtung bleibt erhalten (abi.rs, SPEC §13).
     #[test]
-    fn zu_viele_parameter_sind_ein_fehler_kein_absturz() {
-        let f = Func::new("f", vec![FTy::I64; 7], FTy::I64);
+    fn stapelargumente_ab_dem_siebten_wort() {
         let mut m = Module::new();
+        let mut f = Func::new("f", vec![FTy::I64; 8], FTy::I64);
+        let p7 = f.param_val(7);
+        f.set_term(0, Term::Ret(Some(p7)));
         m.funcs.push(f);
         let mut g = Func::new("main", vec![], FTy::I32);
-        let c = g.push(0, FTy::I32, Op::Const(0));
-        g.set_term(0, Term::Ret(Some(c)));
+        let mut args = Vec::new();
+        for k in 0..8 {
+            args.push(g.push(0, FTy::I64, Op::Const(k as i128)));
+        }
+        let r = g.push(0, FTy::I64, Op::Call { name: "f".to_string(), args });
+        let rc = g.push(0, FTy::I32, Op::Cast { src: r, from: FTy::I64 });
+        g.set_term(0, Term::Ret(Some(rc)));
         m.funcs.push(g);
-        assert!(emit(&m).is_err());
+        let asm = emit(&m).expect("codegen");
+        assert!(asm.contains("mov rax, qword ptr [rbp+16]"), "{}", asm);
+        assert!(asm.contains("mov rax, qword ptr [rbp+24]"), "{}", asm);
+        assert!(asm.contains("sub rsp, 16"), "{}", asm);
+        assert!(asm.contains("mov qword ptr [rsp+0], rax"), "{}", asm);
+        assert!(asm.contains("mov qword ptr [rsp+8], rax"), "{}", asm);
+        assert!(asm.contains("add rsp, 16"), "{}", asm);
     }
 }

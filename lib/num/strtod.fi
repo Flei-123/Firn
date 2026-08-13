@@ -1,0 +1,284 @@
+// lib/num/strtod.fi — Text -> IEEE-754-Doppelgenauigkeit, KORREKT GERUNDET
+// (SPEC §8.4, Anforderung Z5).
+//
+// Stufe 0 kennt (noch) keinen Gleitkommatyp; `strtod` liefert deshalb das
+// BITMUSTER des Doubles als `u64`. Das ist keine Abkuerzung: die gesamte
+// Rechnung laeuft ohnehin in Ganzzahlarithmetik, und `dtoa` arbeitet auf
+// demselben Bitmuster. Sobald die Sprache `f64` hat, kommt eine duenne Huelle
+// darueber (siehe ABNAHME.md, Abschnitt str).
+//
+// Verfahren: exakte Grosszahlarithmetik. Der Wert wird als Bruch
+// num/den = D * 10^exp dargestellt, so skaliert, dass der Quotient genau
+// 53 bit hat, und aus dem Rest wird zum naechsten Double gerundet — bei genau
+// halbem Abstand zur GERADEN Mantisse. Das Ergebnis ist damit fuer JEDE
+// Eingabe das korrekt gerundete, auch fuer 2.2250738585072011e-308,
+// 9007199254740993 oder 5e-324.
+//
+// Erkannte Form:  [+-] ziffern [ . ziffern ] [ (e|E) [+-] ziffern ]
+// Bewusst nicht erkannt (Aufgabe der aufrufenden Schicht): "Infinity", "NaN",
+// Hexadezimalgleitkomma, fuehrender Leerraum.
+//
+// Einbinden:  //#include lib/num/strtod.fi  (braucht alloc.fi, bignum.fi)
+
+const D_INF_BITS: u64 = 0x7FF0000000000000
+const D_SIGN_BIT: u64 = 0x8000000000000000
+const D_TWO52: u64 = 4503599627370496
+const D_TWO53: u64 = 9007199254740992
+const D_MAXDIG: usize = 780          // signifikante Ziffern, danach Klebebit
+const STRTOD_WS_BYTES: usize = 6 * 512 * 4
+
+fn is_digit(c: u8) -> bool {
+    return c >= 48 as u8 && c <= 57 as u8
+}
+
+fn u64_bitlen(v: u64) -> usize {
+    var x: u64 = v
+    var n: usize = 0
+    while x != 0 {
+        x = x >> 1
+        n = n + 1
+    }
+    return n
+}
+
+// Quotient von 2^s * num0 / den0; der Rest bleibt in `numw`, der skalierte
+// Nenner in `denw` (beides braucht die Rundung danach).
+fn strtod_quot(num0: *mut Bn, den0: *mut Bn, numw: *mut Bn, denw: *mut Bn, tmp: *mut Bn, s: i64) -> u64 {
+    bn_copy(numw, num0)
+    bn_copy(denw, den0)
+    if s >= 0 {
+        bn_shl(numw, s as usize)
+    } else {
+        bn_shl(denw, (0 - s) as usize)
+    }
+    return bn_div_q(numw, denw, tmp)
+}
+
+// Text -> Bitmuster. `consumed` erhaelt die Zahl der verbrauchten Zeichen
+// (0 = keine gueltige Zahl). `ws` braucht STRTOD_WS_BYTES Bytes.
+fn strtod(p: *mut u8, len: usize, ws: *mut u8, consumed: *mut usize) -> u64 {
+    *consumed = 0
+    var d: Bn = Bn{ d: 0 as *mut u8, n: 0, cap: 0, }
+    var num0: Bn = Bn{ d: 0 as *mut u8, n: 0, cap: 0, }
+    var den0: Bn = Bn{ d: 0 as *mut u8, n: 0, cap: 0, }
+    var numw: Bn = Bn{ d: 0 as *mut u8, n: 0, cap: 0, }
+    var denw: Bn = Bn{ d: 0 as *mut u8, n: 0, cap: 0, }
+    var tmp: Bn = Bn{ d: 0 as *mut u8, n: 0, cap: 0, }
+    let stride: usize = BN_LIMBS * 4
+    bn_init(&d, ws, BN_LIMBS)
+    bn_init(&num0, (ws as usize + stride) as *mut u8, BN_LIMBS)
+    bn_init(&den0, (ws as usize + stride * 2) as *mut u8, BN_LIMBS)
+    bn_init(&numw, (ws as usize + stride * 3) as *mut u8, BN_LIMBS)
+    bn_init(&denw, (ws as usize + stride * 4) as *mut u8, BN_LIMBS)
+    bn_init(&tmp, (ws as usize + stride * 5) as *mut u8, BN_LIMBS)
+
+    var i: usize = 0
+    var neg: bool = false
+    if i < len {
+        let c0: u8 = ld8(p, i)
+        if c0 == 43 as u8 {
+            i = i + 1
+        } else if c0 == 45 as u8 {
+            neg = true
+            i = i + 1
+        }
+    }
+    var nsig: usize = 0
+    var exp: i64 = 0
+    var sticky: bool = false
+    var any: bool = false
+    var stop: bool = false
+
+    // --- Vorkommastellen ---
+    while i < len && !stop {
+        let c: u8 = ld8(p, i)
+        if is_digit(c) {
+            any = true
+            let dig: u32 = (c - 48 as u8) as u32
+            if bn_is_zero(&d) && dig == 0 as u32 {
+                stop = false
+            } else if nsig < D_MAXDIG {
+                bn_mul_small(&d, 10 as u32)
+                bn_add_small(&d, dig)
+                nsig = nsig + 1
+            } else {
+                exp = exp + 1
+                if dig != 0 as u32 {
+                    sticky = true
+                }
+            }
+            i = i + 1
+        } else {
+            stop = true
+        }
+    }
+
+    // --- Nachkommastellen ---
+    if i < len {
+        if ld8(p, i) == 46 as u8 {
+            var j: usize = i + 1
+            var fany: bool = false
+            stop = false
+            while j < len && !stop {
+                let c: u8 = ld8(p, j)
+                if is_digit(c) {
+                    fany = true
+                    let dig: u32 = (c - 48 as u8) as u32
+                    if bn_is_zero(&d) && dig == 0 as u32 {
+                        exp = exp - 1
+                    } else if nsig < D_MAXDIG {
+                        bn_mul_small(&d, 10 as u32)
+                        bn_add_small(&d, dig)
+                        nsig = nsig + 1
+                        exp = exp - 1
+                    } else {
+                        if dig != 0 as u32 {
+                            sticky = true
+                        }
+                    }
+                    j = j + 1
+                } else {
+                    stop = true
+                }
+            }
+            if any || fany {
+                any = true
+                i = j
+            }
+        }
+    }
+
+    if !any {
+        return 0
+    }
+
+    // --- Exponent ---
+    if i < len {
+        let ec: u8 = ld8(p, i)
+        if ec == 101 as u8 || ec == 69 as u8 {
+            var j: usize = i + 1
+            var eneg: bool = false
+            if j < len {
+                let sc: u8 = ld8(p, j)
+                if sc == 43 as u8 {
+                    j = j + 1
+                } else if sc == 45 as u8 {
+                    eneg = true
+                    j = j + 1
+                }
+            }
+            var eany: bool = false
+            var ev: i64 = 0
+            stop = false
+            while j < len && !stop {
+                let c: u8 = ld8(p, j)
+                if is_digit(c) {
+                    eany = true
+                    if ev < 1000000 {
+                        ev = ev * 10 + (c - 48 as u8) as i64
+                    }
+                    j = j + 1
+                } else {
+                    stop = true
+                }
+            }
+            if eany {
+                if eneg {
+                    exp = exp - ev
+                } else {
+                    exp = exp + ev
+                }
+                i = j
+            }
+        }
+    }
+    *consumed = i
+
+    var sign: u64 = 0
+    if neg {
+        sign = D_SIGN_BIT
+    }
+
+    // Abgeschnittene Ziffern: ein Klebebit unter der letzten Stelle sorgt
+    // dafuer, dass aus einem exakten Halbschritt keine falsche Rundung wird.
+    if sticky {
+        bn_mul_small(&d, 10 as u32)
+        bn_add_small(&d, 1 as u32)
+        exp = exp - 1
+    }
+    if bn_is_zero(&d) {
+        return sign
+    }
+
+    // Grobbereich: 10^(mag-1) <= |wert| < 10^mag
+    let mag: i64 = exp + nsig as i64
+    if mag - 1 >= 309 {
+        return sign + D_INF_BITS
+    }
+    if mag <= -400 {
+        return sign
+    }
+
+    bn_copy(&num0, &d)
+    bn_set_u64(&den0, 1)
+    if exp > 0 {
+        bn_mul_pow10(&num0, exp as usize)
+    } else if exp < 0 {
+        bn_mul_pow10(&den0, (0 - exp) as usize)
+    }
+
+    // Skalieren, bis der Quotient genau 53 bit hat.
+    var s: i64 = 53 - (bn_bitlen(&num0) as i64 - bn_bitlen(&den0) as i64)
+    var q: u64 = 0
+    var done: bool = false
+    var iter: usize = 0
+    while !done && iter < 6 {
+        q = strtod_quot(&num0, &den0, &numw, &denw, &tmp, s)
+        let qb: i64 = u64_bitlen(q) as i64
+        if qb == 53 {
+            done = true
+        } else {
+            s = s + (53 - qb)
+        }
+        iter = iter + 1
+    }
+    var e2: i64 = 0 - s
+    if e2 < -1074 {
+        s = 1074
+        e2 = -1074
+        q = strtod_quot(&num0, &den0, &numw, &denw, &tmp, s)
+    }
+
+    // Runden: Rest (numw) gegen die Haelfte des Nenners (denw).
+    bn_shl(&numw, 1)
+    let cv: i32 = bn_cmp(&numw, &denw)
+    var up: bool = false
+    if cv > 0 {
+        up = true
+    } else if cv == 0 {
+        if q % 2 == 1 {
+            up = true
+        }
+    }
+    if up {
+        q = q + 1
+        if q == D_TWO53 {
+            q = D_TWO52
+            e2 = e2 + 1
+        }
+    }
+    if e2 > 971 {
+        return sign + D_INF_BITS
+    }
+    if q == 0 {
+        return sign
+    }
+    var bits: u64 = 0
+    if q >= D_TWO52 {
+        let biased: u64 = (e2 + 1075) as u64
+        bits = (biased << 52) + (q - D_TWO52)
+    } else {
+        bits = q
+    }
+    return sign + bits
+}

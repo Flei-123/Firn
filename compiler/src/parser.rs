@@ -12,9 +12,10 @@
 //! Semikolon ist optional: ein Zeilenwechsel beendet eine Anweisung.
 
 use crate::ast::{
-    Block, ConstDecl, Expr, ExprKind, BinOp, FnDecl, Param, Program, Stmt, StructDecl, TypeExpr,
-    UnOp,
+    Block, ConstDecl, Expr, ExprKind, BinOp, FnDecl, ImportDecl, Param, Program, Stmt, StructDecl,
+    TypeExpr, UnOp,
 };
+use std::collections::HashSet;
 use crate::diag::{Diags, Span};
 use crate::lexer::{TokKind, Token};
 
@@ -22,19 +23,26 @@ use crate::lexer::{TokKind, Token};
 /// einen sauberen Fehler statt eines Stapelueberlaufs.
 const MAX_DEPTH: u32 = 200;
 
-struct Parser<'a> {
-    toks: &'a [Token],
-    pos: usize,
-    dg: &'a mut Diags,
-    next_id: u32,
-    depth: u32,
+pub(crate) struct Parser<'a> {
+    pub(crate) toks: &'a [Token],
+    pub(crate) pos: usize,
+    pub(crate) dg: &'a mut Diags,
+    pub(crate) next_id: u32,
+    pub(crate) depth: u32,
     /// Innerhalb der aktuellen Anweisung wurde bereits ein Fehler gemeldet.
-    recovering: bool,
+    pub(crate) recovering: bool,
     /// `ident {` ist in Bedingungen KEIN Struct-Literal, sondern Name + Block.
-    no_struct_lit: bool,
+    pub(crate) no_struct_lit: bool,
     /// Klammertiefe: innerhalb von `(...)`, `[...]`, `{...}` eines Ausdrucks
     /// darf ein Ausdruck ueber Zeilen laufen, ausserhalb nicht.
-    paren_depth: u32,
+    pub(crate) paren_depth: u32,
+    /// Nummer der Quelldatei (Modulsystem, `modules.rs`).
+    pub(crate) file: u32,
+    /// Bekannte Modulnamen aus `import`: nur damit ist `alias.name` ein
+    /// qualifizierter Name und kein Feldzugriff.
+    pub(crate) modules: HashSet<String>,
+    /// Verschachtelungstiefe der Schleifen — `break`/`continue` brauchen sie.
+    pub(crate) loop_depth: u32,
 }
 
 fn starts_stmt(k: &TokKind) -> bool {
@@ -48,20 +56,31 @@ fn starts_stmt(k: &TokKind) -> bool {
             | TokKind::KwFn
             | TokKind::KwStruct
             | TokKind::KwConst
+            | TokKind::KwFor
+            | TokKind::KwBreak
+            | TokKind::KwContinue
+            | TokKind::KwMatch
     )
 }
 
 fn starts_item(k: &TokKind) -> bool {
     matches!(
         k,
-        TokKind::KwFn | TokKind::KwStruct | TokKind::KwConst | TokKind::KwProfile | TokKind::KwExtern
+        TokKind::KwFn
+            | TokKind::KwStruct
+            | TokKind::KwConst
+            | TokKind::KwProfile
+            | TokKind::KwExtern
+            | TokKind::KwImport
+            | TokKind::KwExport
+            | TokKind::KwEnum
     )
 }
 
 impl<'a> Parser<'a> {
     // ---------------------------------------------------------------- Grundlagen
 
-    fn kind(&self) -> &TokKind {
+    pub(crate) fn kind(&self) -> &TokKind {
         // Der Strom endet immer mit Eof; der Index wird nie darueber hinaus erhoeht.
         match self.toks.get(self.pos) {
             Some(t) => &t.kind,
@@ -69,21 +88,21 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn span(&self) -> Span {
+    pub(crate) fn span(&self) -> Span {
         match self.toks.get(self.pos) {
             Some(t) => t.span,
             None => match self.toks.last() {
                 Some(t) => t.span,
-                None => Span::new(1, 1, 1),
+                None => Span::in_file(self.file, 1, 1, 1),
             },
         }
     }
 
-    fn at(&self, k: &TokKind) -> bool {
+    pub(crate) fn at(&self, k: &TokKind) -> bool {
         self.kind() == k
     }
 
-    fn at_eof(&self) -> bool {
+    pub(crate) fn at_eof(&self) -> bool {
         matches!(self.kind(), TokKind::Eof)
     }
 
@@ -105,7 +124,7 @@ impl<'a> Parser<'a> {
         self.paren_depth > 0 || !self.at_line_start()
     }
 
-    fn bump(&mut self) -> Span {
+    pub(crate) fn bump(&mut self) -> Span {
         let s = self.span();
         if !self.at_eof() {
             self.pos += 1;
@@ -113,7 +132,7 @@ impl<'a> Parser<'a> {
         s
     }
 
-    fn eat(&mut self, k: &TokKind) -> bool {
+    pub(crate) fn eat(&mut self, k: &TokKind) -> bool {
         if self.at(k) {
             self.bump();
             true
@@ -122,14 +141,14 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn error_here(&mut self, msg: impl Into<String>) {
+    pub(crate) fn error_here(&mut self, msg: impl Into<String>) {
         let sp = self.span();
         self.dg.error(sp, msg);
         self.recovering = true;
     }
 
     /// Erwartet ein bestimmtes Token; sonst Fehler am STOERENDEN Token.
-    fn expect(&mut self, k: TokKind, ctx: &str) -> bool {
+    pub(crate) fn expect(&mut self, k: TokKind, ctx: &str) -> bool {
         if self.eat(&k) {
             return true;
         }
@@ -145,7 +164,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Wie `expect`, meldet aber nichts, wenn die Anweisung schon kaputt ist.
-    fn close(&mut self, k: TokKind, ctx: &str) -> bool {
+    pub(crate) fn close(&mut self, k: TokKind, ctx: &str) -> bool {
         if self.eat(&k) {
             return true;
         }
@@ -161,7 +180,7 @@ impl<'a> Parser<'a> {
         false
     }
 
-    fn ident(&mut self, ctx: &str) -> Option<(String, Span)> {
+    pub(crate) fn ident(&mut self, ctx: &str) -> Option<(String, Span)> {
         if let TokKind::Ident(name) = self.kind() {
             let name = name.clone();
             let sp = self.bump();
@@ -177,7 +196,24 @@ impl<'a> Parser<'a> {
         None
     }
 
-    fn mk(&mut self, span: Span, kind: ExprKind) -> Expr {
+    /// Qualifizierter Name `modul.name`: nur wenn `modul` per `import`
+    /// bekannt ist, wird der Punkt als Modulzugriff gelesen — sonst bleibt es
+    /// ein Feldzugriff. Der Name wird als "modul.name" weitergereicht;
+    /// `modules.rs` loest ihn beim Zusammenfuehren auf.
+    pub(crate) fn qualify(&mut self, name: String, sp: Span) -> (String, Span) {
+        if !self.modules.contains(&name) || !self.at(&TokKind::Dot) {
+            return (name, sp);
+        }
+        let member = match self.toks.get(self.pos + 1).map(|t| t.kind.clone()) {
+            Some(TokKind::Ident(m)) => m,
+            _ => return (name, sp),
+        };
+        self.bump(); // '.'
+        let msp = self.bump(); // name
+        (format!("{}.{}", name, member), Parser::join(sp, msp))
+    }
+
+    pub(crate) fn mk(&mut self, span: Span, kind: ExprKind) -> Expr {
         let id = self.next_id;
         self.next_id += 1;
         Expr { id, span, kind }
@@ -188,7 +224,7 @@ impl<'a> Parser<'a> {
         self.mk(span, ExprKind::Int(0))
     }
 
-    fn join(a: Span, b: Span) -> Span {
+    pub(crate) fn join(a: Span, b: Span) -> Span {
         if a.line == b.line && b.col + b.len > a.col {
             Span::new(a.line, a.col, b.col + b.len - a.col)
         } else {
@@ -196,7 +232,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn too_deep(&mut self) -> bool {
+    pub(crate) fn too_deep(&mut self) -> bool {
         if self.depth < MAX_DEPTH {
             return false;
         }
@@ -232,7 +268,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Bis zum naechsten Element auf oberster Ebene vorruecken.
-    fn sync_item(&mut self) {
+    pub(crate) fn sync_item(&mut self) {
         while !self.at_eof() && !starts_item(self.kind()) {
             self.bump();
         }
@@ -240,7 +276,8 @@ impl<'a> Parser<'a> {
 
     // ------------------------------------------------------------------ Typen
 
-    fn parse_type(&mut self) -> Option<TypeExpr> {
+    /// Siehe `nicht_umgesetzter_typ` am Dateiende.
+    pub(crate) fn parse_type(&mut self) -> Option<TypeExpr> {
         if self.too_deep() {
             return None;
         }
@@ -290,6 +327,25 @@ impl<'a> Parser<'a> {
             }
             TokKind::Ident(name) => {
                 let sp = self.bump();
+                // Integration: Typkonstruktoren, die die SPEC beschreibt, die
+                // Stufe 0 aber NICHT umsetzt, melden hier einen klaren Fehler
+                // statt eines ratlosen Syntaxfehlers (SPEC §14 "Nicht enthalten").
+                if self.kind() == &TokKind::LBracket {
+                    if let Some(grund) = nicht_umgesetzter_typ(&name) {
+                        self.dg.error_note(
+                            sp,
+                            format!("'{}[T]' ist in Stufe 0 nicht umgesetzt", name),
+                            grund,
+                        );
+                        self.recovering = true;
+                        return None;
+                    }
+                }
+                // HOOK types: generischer Typ `Vec[i32]` (sema_generic.rs)
+                if let Some(t) = crate::sema_generic::hook_generic_type(self, &name, sp) {
+                    return Some(t);
+                }
+                let (name, sp) = self.qualify(name, sp);
                 Some(TypeExpr::Named(name, sp))
             }
             other => {
@@ -303,7 +359,7 @@ impl<'a> Parser<'a> {
 
     // ------------------------------------------------------------- Ausdruecke
 
-    fn expr(&mut self) -> Expr {
+    pub(crate) fn expr(&mut self) -> Expr {
         if self.too_deep() {
             let sp = self.span();
             return self.broken_expr(sp);
@@ -324,7 +380,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Ausdruck in Klammern/Argumenten: Struct-Literale sind dort erlaubt.
-    fn nested_expr(&mut self) -> Expr {
+    pub(crate) fn nested_expr(&mut self) -> Expr {
         let saved = self.no_struct_lit;
         self.no_struct_lit = false;
         self.paren_depth += 1;
@@ -482,6 +538,11 @@ impl<'a> Parser<'a> {
                     }
                 }
                 TokKind::LBracket => {
+                    // HOOK types: generischer Aufruf `foo[i32](..)` (sema_generic.rs)
+                    if let Some(g) = crate::sema_generic::hook_generic_call(self, &e) {
+                        e = g;
+                        continue;
+                    }
                     let start = self.bump();
                     let idx = self.nested_expr();
                     let end = self.span();
@@ -526,7 +587,7 @@ impl<'a> Parser<'a> {
 
     /// Argumentliste nach bereits verbrauchtem '('. Liefert Argumente und die
     /// Position der schliessenden Klammer (bzw. des stoerenden Tokens).
-    fn call_args(&mut self, ctx: &str) -> (Vec<Expr>, Span) {
+    pub(crate) fn call_args(&mut self, ctx: &str) -> (Vec<Expr>, Span) {
         let mut args = Vec::new();
         loop {
             if self.at(&TokKind::RParen) || self.at_eof() {
@@ -550,7 +611,11 @@ impl<'a> Parser<'a> {
         (args, end)
     }
 
-    fn primary(&mut self) -> Expr {
+    pub(crate) fn primary(&mut self) -> Expr {
+        // HOOK types: `Enum::Variante(..)` und `Vec[i32]{..}` (sema_match.rs)
+        if let Some(e) = crate::sema_match::hook_primary(self) {
+            return e;
+        }
         match self.kind().clone() {
             TokKind::Int(v) => {
                 let sp = self.bump();
@@ -573,6 +638,27 @@ impl<'a> Parser<'a> {
             TokKind::LBracket => {
                 let start = self.bump();
                 let mut elems = Vec::new();
+                // `[wert; N]` — Wiederholungsliteral
+                if !self.at(&TokKind::RBracket) && !self.at_eof() {
+                    let first = self.nested_expr();
+                    if self.at(&TokKind::Semi) && !self.recovering {
+                        self.bump();
+                        let count = self.nested_expr();
+                        let end = self.span();
+                        self.close(TokKind::RBracket, "nach der laenge des wiederholungsliterals");
+                        let sp = Parser::join(start, end);
+                        return self
+                            .mk(sp, ExprKind::ArrayRepeat(Box::new(first), Box::new(count)));
+                    }
+                    let done = self.recovering || !self.eat(&TokKind::Comma);
+                    elems.push(first);
+                    if done {
+                        let end = self.span();
+                        self.close(TokKind::RBracket, "nach den elementen des arrayliterals");
+                        let sp = Parser::join(start, end);
+                        return self.mk(sp, ExprKind::ArrayLit(elems));
+                    }
+                }
                 loop {
                     if self.at(&TokKind::RBracket) || self.at_eof() {
                         break;
@@ -604,6 +690,7 @@ impl<'a> Parser<'a> {
             }
             TokKind::Ident(name) => {
                 let sp = self.bump();
+                let (name, sp) = self.qualify(name, sp);
                 if self.at(&TokKind::LBrace) && !self.no_struct_lit {
                     return self.struct_lit(name, sp);
                 }
@@ -623,7 +710,7 @@ impl<'a> Parser<'a> {
     }
 
     /// `Name{ feld: wert, ... }` — '{' steht noch an.
-    fn struct_lit(&mut self, name: String, name_span: Span) -> Expr {
+    pub(crate) fn struct_lit(&mut self, name: String, name_span: Span) -> Expr {
         self.bump(); // '{'
         let mut fields = Vec::new();
         loop {
@@ -658,7 +745,7 @@ impl<'a> Parser<'a> {
 
     // ------------------------------------------------------------ Anweisungen
 
-    fn block(&mut self, ctx: &str) -> Block {
+    pub(crate) fn block(&mut self, ctx: &str) -> Block {
         let start = self.span();
         if self.too_deep() {
             return Block { stmts: Vec::new(), span: start };
@@ -703,7 +790,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Anweisungsende: ';' oder Zeilenwechsel oder '}'.
-    fn end_stmt(&mut self) {
+    pub(crate) fn end_stmt(&mut self) {
         if self.recovering {
             self.recovering = false;
             self.sync_stmt();
@@ -737,10 +824,16 @@ impl<'a> Parser<'a> {
     }
 
     fn stmt_inner(&mut self, start: Span) -> Stmt {
+        // HOOK types: `match`-Anweisung (sema_match.rs)
+        if let Some(s) = crate::sema_match::hook_stmt(self) {
+            return s;
+        }
         match self.kind().clone() {
             TokKind::KwLet | TokKind::KwVar => self.let_stmt(),
             TokKind::KwIf => self.if_stmt(),
             TokKind::KwWhile => self.while_stmt(),
+            TokKind::KwFor => self.for_stmt(),
+            TokKind::KwBreak | TokKind::KwContinue => self.jump_stmt(),
             TokKind::KwReturn => self.return_stmt(),
             TokKind::LBrace => Stmt::Block(self.block("am anfang eines blocks")),
             TokKind::KwFn | TokKind::KwStruct | TokKind::KwConst | TokKind::KwExtern => {
@@ -849,8 +942,64 @@ impl<'a> Parser<'a> {
                 return Stmt::Error(start);
             }
         }
+        self.loop_depth += 1;
         let body = self.block("nach der bedingung von 'while'");
+        self.loop_depth -= 1;
         Stmt::While { cond, body, span: start }
+    }
+
+    /// `for name in start..end { }` — halboffener, aufsteigender Bereich.
+    fn for_stmt(&mut self) -> Stmt {
+        let start = self.bump(); // 'for'
+        let (name, name_span) = match self.ident("nach 'for'") {
+            Some(x) => x,
+            None => {
+                self.recovering = false;
+                self.sync_stmt();
+                return Stmt::Error(start);
+            }
+        };
+        if !self.expect(TokKind::KwIn, "nach dem schleifennamen") {
+            self.recovering = false;
+            self.sync_stmt();
+            return Stmt::Error(start);
+        }
+        let from = self.cond_expr();
+        if !self.expect(TokKind::DotDot, "zwischen anfang und ende des bereichs") {
+            self.recovering = false;
+            self.sync_stmt();
+            return Stmt::Error(start);
+        }
+        let to = self.cond_expr();
+        if self.recovering {
+            self.recovering = false;
+            if !self.at(&TokKind::LBrace) {
+                self.sync_stmt();
+                return Stmt::Error(start);
+            }
+        }
+        self.loop_depth += 1;
+        let body = self.block("nach dem bereich von 'for'");
+        self.loop_depth -= 1;
+        Stmt::For { name, start: from, end: to, body, name_span, span: start }
+    }
+
+    /// `break` / `continue`
+    fn jump_stmt(&mut self) -> Stmt {
+        let is_break = self.at(&TokKind::KwBreak);
+        let word = if is_break { "break" } else { "continue" };
+        let sp = self.bump();
+        if self.loop_depth == 0 {
+            self.dg
+                .error(sp, format!("'{}' steht ausserhalb einer schleife", word));
+            self.recovering = true;
+        }
+        self.end_stmt();
+        if is_break {
+            Stmt::Break(sp)
+        } else {
+            Stmt::Continue(sp)
+        }
     }
 
     fn return_stmt(&mut self) -> Stmt {
@@ -880,7 +1029,7 @@ impl<'a> Parser<'a> {
 
     // ---------------------------------------------------------------- Elemente
 
-    fn params(&mut self) -> Vec<Param> {
+    pub(crate) fn params(&mut self) -> Vec<Param> {
         let mut out = Vec::new();
         loop {
             if self.at(&TokKind::RParen) || self.at_eof() {
@@ -1052,6 +1201,69 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `import pfad.modul`
+    fn import_decl(&mut self, prog: &mut Program) {
+        let start = self.bump(); // 'import'
+        let mut path: Vec<String> = Vec::new();
+        loop {
+            match self.ident("in einem modulpfad nach 'import'") {
+                Some((n, _)) => path.push(n),
+                None => {
+                    self.recovering = false;
+                    self.sync_item();
+                    return;
+                }
+            }
+            if !self.eat(&TokKind::Dot) {
+                break;
+            }
+        }
+        let alias = match path.last() {
+            Some(a) => a.clone(),
+            None => {
+                self.recovering = false;
+                self.sync_item();
+                return;
+            }
+        };
+        if prog.imports.iter().any(|i| i.alias == alias) {
+            self.dg
+                .error(start, format!("modul '{}' wird mehrfach eingebunden", alias));
+        }
+        self.modules.insert(alias.clone());
+        prog.imports.push(ImportDecl { path, alias, span: start });
+        self.end_stmt();
+        self.recovering = false;
+    }
+
+    /// `export { a, b }`
+    fn export_decl(&mut self, prog: &mut Program) {
+        self.bump(); // 'export'
+        if !self.expect(TokKind::LBrace, "nach 'export'") {
+            self.recovering = false;
+            self.sync_item();
+            return;
+        }
+        loop {
+            if self.at(&TokKind::RBrace) || self.at_eof() {
+                break;
+            }
+            let before = self.pos;
+            match self.ident("in der export-liste") {
+                Some((n, sp)) => prog.exports.push((n, sp)),
+                None => break,
+            }
+            if !self.eat(&TokKind::Comma) {
+                break;
+            }
+            if self.pos == before {
+                self.bump();
+            }
+        }
+        self.close(TokKind::RBrace, "am ende der export-liste");
+        self.recovering = false;
+    }
+
     fn profile_decl(&mut self, prog: &mut Program) {
         let start = self.bump(); // 'profile'
         match self.ident("nach 'profile'") {
@@ -1082,14 +1294,23 @@ impl<'a> Parser<'a> {
                 break;
             }
             let before = self.pos;
+            // HOOK types: enum-Deklaration und generische Vorlagen (sema_match.rs)
+            if crate::sema_match::hook_item(self) {
+                if self.pos == before {
+                    self.bump();
+                }
+                continue;
+            }
             match self.kind() {
                 TokKind::KwFn | TokKind::KwExtern => self.fn_decl(&mut prog),
                 TokKind::KwStruct => self.struct_decl(&mut prog),
                 TokKind::KwConst => self.const_decl(&mut prog),
                 TokKind::KwProfile => self.profile_decl(&mut prog),
+                TokKind::KwImport => self.import_decl(&mut prog),
+                TokKind::KwExport => self.export_decl(&mut prog),
                 other => {
                     let msg = format!(
-                        "erwartet 'fn', 'struct', 'const' oder 'profile' auf oberster ebene, gefunden '{}'",
+                        "erwartet 'fn', 'struct', 'const', 'import', 'export' oder 'profile' auf oberster ebene, gefunden '{}'",
                         other.text()
                     );
                     self.error_here(msg);
@@ -1107,15 +1328,36 @@ impl<'a> Parser<'a> {
 }
 
 pub fn parse(toks: &[Token], dg: &mut Diags) -> Program {
+    reset_hooks();
+    parse_module(toks, dg, 0, 0)
+}
+
+/// Setzt die Registrierungen der Nachbarmodule fuer EINE Uebersetzung zurueck.
+/// Bei mehreren Dateien ruft `modules.rs` das genau einmal auf — sonst
+/// verloere jede Datei die Aufzaehlungen der vorherigen.
+pub fn reset_hooks() {
+    // HOOK types: Registrierungen dieser Uebersetzung zuruecksetzen (sema_match.rs)
+    crate::sema_match::hook_reset();
+}
+
+/// Wie `parse`, aber fuer eine Datei der Quelltextkarte: `file` ist ihre
+/// Nummer, `base_id` die erste noch freie `ExprId`. `Program::expr_count` ist
+/// danach die erste hinter dieser Datei freie Id (absolut) — `modules.rs`
+/// reiht die Dateien so ohne Ueberschneidung aneinander.
+pub fn parse_module(toks: &[Token], dg: &mut Diags, file: u32, base_id: u32) -> Program {
+    crate::sema_generic::hook_prescan(toks);
     let mut p = Parser {
         toks,
         pos: 0,
         dg,
-        next_id: 0,
+        next_id: base_id,
         depth: 0,
         recovering: false,
         no_struct_lit: false,
         paren_depth: 0,
+        file,
+        modules: HashSet::new(),
+        loop_depth: 0,
     };
     p.program()
 }
@@ -1189,6 +1431,7 @@ mod tests {
                 let es: Vec<String> = e.iter().map(dump).collect();
                 format!("[{}]", es.join(","))
             }
+            ExprKind::ArrayRepeat(v, n) => format!("[{}; {}]", dump(v), dump(n)),
         }
     }
 
@@ -1358,5 +1601,17 @@ mod tests {
             },
             other => panic!("{:?}", other),
         }
+    }
+}
+
+/// Typkonstruktoren, die `SPEC.md` beschreibt, die Stufe 0 aber nicht umsetzt.
+/// Sie bekommen einen eigenen, klaren Fehler statt eines Syntaxfehlers —
+/// `SPEC.md` §14 fuehrt sie unter "Nicht enthalten".
+fn nicht_umgesetzter_typ(name: &str) -> Option<&'static str> {
+    match name {
+        "secret" => Some("secret[T] und die Constant-Time-Primitive (SPEC §9) sind nicht umgesetzt; siehe ABNAHME.md"),
+        "Gc" | "GcWeak" => Some("der Gc-Heap (SPEC §3.5) ist nicht umgesetzt; siehe ABNAHME.md"),
+        "Rc" | "Arc" | "Weak" => Some("Rc/Arc/Weak (SPEC §3.4) sind nicht umgesetzt; siehe ABNAHME.md"),
+        _ => None,
     }
 }

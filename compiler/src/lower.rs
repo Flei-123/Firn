@@ -18,6 +18,8 @@ use crate::diag::{Diags, Span};
 use crate::fir::{
     BinOp as FBin, BlockId, CmpOp, FTy, Func, Inst, Module, Op, Term, UnOp as FUn, Val,
 };
+use crate::abi::{self, ArgClass};
+use crate::dwarf;
 use crate::sema::TypeInfo;
 use crate::types::Type;
 
@@ -49,28 +51,37 @@ fn is_agg(t: &Type) -> bool {
     matches!(t, Type::Array(..) | Type::Struct(_))
 }
 
-struct Local {
-    slot: Val,
+pub(crate) struct Local {
+    pub(crate) slot: Val,
 }
 
-struct Lower<'a> {
-    info: &'a TypeInfo,
-    dg: &'a mut Diags,
-    f: Func,
-    cur: BlockId,
-    scopes: Vec<HashMap<String, Local>>,
-    depth: u32,
+pub(crate) struct Lower<'a> {
+    pub(crate) info: &'a TypeInfo,
+    pub(crate) dg: &'a mut Diags,
+    pub(crate) f: Func,
+    pub(crate) cur: BlockId,
+    pub(crate) scopes: Vec<HashMap<String, Local>>,
+    pub(crate) depth: u32,
+    /// Name der Funktion (Schluessel der Zeilentabelle in `dwarf.rs`).
+    pub(crate) fname: String,
+    /// Ziele von `break` / `continue` je Schleife (aeusserste zuerst).
+    pub(crate) loops: Vec<(BlockId, BlockId)>,
+    /// Versteckter Rueckgabezeiger (`sret`), falls die Funktion ein Aggregat
+    /// ueber 8 Byte liefert (siehe `abi.rs`).
+    pub(crate) sret: Option<Val>,
+    /// Quellzeile, die der naechsten erzeugten Instruktion zugeordnet wird.
+    pub(crate) pending_line: Option<(u32, u32)>,
 }
 
 impl<'a> Lower<'a> {
-    fn err<T>(&mut self, span: Span, msg: impl Into<String>) -> Option<T> {
+    pub(crate) fn err<T>(&mut self, span: Span, msg: impl Into<String>) -> Option<T> {
         self.dg.error(span, msg);
         None
     }
 
     /// Interner Fehler: nur erreichbar, wenn die Typpruefung ihre Zusicherung
     /// verletzt. Wird als normale Diagnose gemeldet, nie als Panik.
-    fn ice<T>(&mut self, span: Span, what: &str) -> Option<T> {
+    pub(crate) fn ice<T>(&mut self, span: Span, what: &str) -> Option<T> {
         self.dg.error(
             span,
             format!("interner fehler beim uebersetzen nach FIR: {}", what),
@@ -80,11 +91,11 @@ impl<'a> Lower<'a> {
 
     // ---- Hilfen -------------------------------------------------------
 
-    fn ty_of(&self, e: &Expr) -> Type {
+    pub(crate) fn ty_of(&self, e: &Expr) -> Type {
         self.info.expr_ty(e.id).clone()
     }
 
-    fn fty_of(&mut self, e: &Expr) -> Option<FTy> {
+    pub(crate) fn fty_of(&mut self, e: &Expr) -> Option<FTy> {
         let t = self.ty_of(e);
         match scalar_fty(&t) {
             Some(f) => Some(f),
@@ -92,35 +103,97 @@ impl<'a> Lower<'a> {
         }
     }
 
-    fn size_align(&self, t: &Type) -> (u64, u64) {
+    pub(crate) fn size_align(&self, t: &Type) -> (u64, u64) {
         (
             self.info.tcx.size_of(t).max(1),
             self.info.tcx.align_of(t).max(1),
         )
     }
 
-    fn push(&mut self, ty: FTy, op: Op) -> Val {
+    pub(crate) fn push(&mut self, ty: FTy, op: Op) -> Val {
+        self.note_here();
         self.f.push(self.cur, ty, op)
     }
 
-    fn push_void(&mut self, ty: FTy, op: Op) {
+    pub(crate) fn push_void(&mut self, ty: FTy, op: Op) {
+        self.note_here();
         self.f.push_void(self.cur, ty, op)
     }
 
-    fn konst(&mut self, ty: FTy, v: i128) -> Val {
+    /// Ordnet der naechsten Instruktion die Quellzeile der laufenden Anweisung
+    /// zu (fuer `.debug_line`, siehe `dwarf.rs`).
+    fn note_here(&mut self) {
+        if let Some((file, line)) = self.pending_line.take() {
+            let idx = self.f.blocks[self.cur as usize].insts.len() as u32;
+            dwarf::note(&self.fname, self.cur, idx, file, line);
+        }
+    }
+
+    /// `alloca` im Eintrittsblock. Die Einfuegestelle verschiebt die Vermerke
+    /// der Zeilentabelle, deshalb laeuft jede Alloca ueber diese Huelle.
+    pub(crate) fn alloca(&mut self, size: u64, align: u64) -> Val {
+        let at = self.f.blocks[0]
+            .insts
+            .iter()
+            .take_while(|i| matches!(i.op, Op::Alloca { .. }))
+            .count() as u32;
+        let v = self.f.alloca(size, align);
+        dwarf::shift_after_insert(&self.fname, 0, at);
+        v
+    }
+
+    /// Laedt ein Aggregat als `n` 8-Byte-Woerter (System-V-INTEGER-Klasse).
+    /// Ist die Groesse kein Vielfaches von 8, wird ueber einen aufgefuellten
+    /// Zwischenpuffer gelesen — sonst laege der letzte `load` teilweise
+    /// hinter dem Objekt.
+    fn load_words(&mut self, addr: Val, size: u64, n: usize) -> Option<Vec<Val>> {
+        let src = if size % 8 != 0 {
+            let t = self.alloca(n as u64 * 8, 8);
+            self.push_void(FTy::Void, Op::CopyMem { dst: t, src: addr, size });
+            t
+        } else {
+            addr
+        };
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let a = self.ptradd_const(src, i as u64 * 8);
+            out.push(self.load(FTy::I64, a));
+        }
+        Some(out)
+    }
+
+    /// Gegenstueck zu `load_words`: schreibt die Woerter an `dst`.
+    fn store_words(&mut self, dst: Val, size: u64, words: &[Val]) -> Option<()> {
+        if size % 8 != 0 {
+            let t = self.alloca(words.len() as u64 * 8, 8);
+            for (i, w) in words.iter().enumerate() {
+                let a = self.ptradd_const(t, i as u64 * 8);
+                self.store(FTy::I64, a, *w);
+            }
+            self.push_void(FTy::Void, Op::CopyMem { dst, src: t, size });
+        } else {
+            for (i, w) in words.iter().enumerate() {
+                let a = self.ptradd_const(dst, i as u64 * 8);
+                self.store(FTy::I64, a, *w);
+            }
+        }
+        Some(())
+    }
+
+    pub(crate) fn konst(&mut self, ty: FTy, v: i128) -> Val {
         self.push(ty, Op::Const(v))
     }
 
-    fn load(&mut self, ty: FTy, addr: Val) -> Val {
+    pub(crate) fn load(&mut self, ty: FTy, addr: Val) -> Val {
         self.push(ty, Op::Load { addr })
     }
 
-    fn store(&mut self, ty: FTy, addr: Val, val: Val) {
+    pub(crate) fn store(&mut self, ty: FTy, addr: Val, val: Val) {
         self.push_void(ty, Op::Store { addr, val })
     }
 
     /// `base + off` Bytes; konstante 0 wird weggelassen.
-    fn ptradd_const(&mut self, base: Val, off: u64) -> Val {
+    pub(crate) fn ptradd_const(&mut self, base: Val, off: u64) -> Val {
         if off == 0 {
             return base;
         }
@@ -128,33 +201,33 @@ impl<'a> Lower<'a> {
         self.push(FTy::Ptr, Op::PtrAdd { base, off: o })
     }
 
-    fn new_block(&mut self) -> BlockId {
+    pub(crate) fn new_block(&mut self) -> BlockId {
         self.f.add_block()
     }
 
-    fn set_term(&mut self, t: Term) {
+    pub(crate) fn set_term(&mut self, t: Term) {
         let b = self.cur;
         self.f.set_term(b, t);
     }
 
-    fn terminated(&self) -> bool {
+    pub(crate) fn terminated(&self) -> bool {
         self.f.is_terminated(self.cur)
     }
 
-    fn enter(&mut self) {
+    pub(crate) fn enter(&mut self) {
         self.scopes.push(HashMap::new());
     }
-    fn leave(&mut self) {
+    pub(crate) fn leave(&mut self) {
         self.scopes.pop();
     }
 
-    fn declare(&mut self, name: &str, slot: Val) {
+    pub(crate) fn declare(&mut self, name: &str, slot: Val) {
         if let Some(s) = self.scopes.last_mut() {
             s.insert(name.to_string(), Local { slot });
         }
     }
 
-    fn lookup(&self, name: &str) -> Option<Val> {
+    pub(crate) fn lookup(&self, name: &str) -> Option<Val> {
         for s in self.scopes.iter().rev() {
             if let Some(l) = s.get(name) {
                 return Some(l.slot);
@@ -165,7 +238,7 @@ impl<'a> Lower<'a> {
 
     // ---- Ausdruecke: Adresse (lvalue / Aggregat) -----------------------
 
-    fn lower_addr(&mut self, e: &Expr) -> Option<Val> {
+    pub(crate) fn lower_addr(&mut self, e: &Expr) -> Option<Val> {
         if self.depth > MAX_DEPTH {
             return self.err(e.span, "ausdruck zu tief verschachtelt");
         }
@@ -224,11 +297,30 @@ impl<'a> Lower<'a> {
                 let off = self.push(FTy::U64, Op::Bin(FBin::Mul, iv64, sz));
                 Some(self.push(FTy::Ptr, Op::PtrAdd { base: baddr, off }))
             }
-            ExprKind::StructLit(..) | ExprKind::ArrayLit(_) => {
+            ExprKind::StructLit(..) | ExprKind::ArrayLit(_) | ExprKind::ArrayRepeat(..) => {
                 let t = self.ty_of(e);
                 let (size, align) = self.size_align(&t);
-                let slot = self.f.alloca(size, align);
+                let slot = self.alloca(size, align);
                 self.write_into(slot, e)?;
+                Some(slot)
+            }
+            // HOOK types: `Enum::Variante(..)` liefert ein Aggregat (lower_match.rs)
+            ExprKind::Call(name, args, _) if crate::lower_match::is_ctor(name) => {
+                crate::lower_match::lower_ctor_addr(self, e, name, args)
+            }
+            // Ein Aufruf, der ein Aggregat liefert, schreibt in einen
+            // Zwischenspeicher; dessen Adresse ist das Ergebnis (siehe abi.rs).
+            ExprKind::Call(name, args, span) => {
+                let t = self.ty_of(e);
+                if !is_agg(&t) {
+                    return self.err(e.span, "dieser ausdruck hat keine adresse");
+                }
+                let (size, align) = self.size_align(&t);
+                let slot = self.alloca(size, align);
+                let name = name.clone();
+                let args = args.clone();
+                let span = *span;
+                self.lower_call(&name, &args, Some(slot), span)?;
                 Some(slot)
             }
             _ => self.err(e.span, "dieser ausdruck hat keine adresse"),
@@ -237,7 +329,7 @@ impl<'a> Lower<'a> {
 
     /// Schreibt den Wert von `e` an die Adresse `addr` (skalar: `store`,
     /// Literal: feld-/elementweise, sonstiges Aggregat: `copymem`).
-    fn write_into(&mut self, addr: Val, e: &Expr) -> Option<()> {
+    pub(crate) fn write_into(&mut self, addr: Val, e: &Expr) -> Option<()> {
         if self.depth > MAX_DEPTH {
             return self.err(e.span, "ausdruck zu tief verschachtelt");
         }
@@ -277,6 +369,25 @@ impl<'a> Lower<'a> {
                 }
                 Some(())
             }
+            ExprKind::ArrayRepeat(val, _) => {
+                let (et, n) = match &t {
+                    Type::Array(el, n) => ((**el).clone(), *n),
+                    _ => return self.ice(e.span, "wiederholungsliteral ohne array-typ"),
+                };
+                self.lower_repeat(addr, val, &et, n)
+            }
+            // HOOK types: `Enum::Variante(..)` schreibt direkt ins Ziel (lower_match.rs)
+            ExprKind::Call(name, args, _) if crate::lower_match::is_ctor(name) => {
+                crate::lower_match::write_ctor_into(self, e, name, args, addr)
+            }
+            // `x = f()` mit Aggregatergebnis schreibt direkt ins Ziel.
+            ExprKind::Call(name, args, span) if is_agg(&t) => {
+                let name = name.clone();
+                let args = args.clone();
+                let span = *span;
+                self.lower_call(&name, &args, Some(addr), span)?;
+                Some(())
+            }
             _ if is_agg(&t) => {
                 let src = self.lower_addr(e)?;
                 let size = self.info.tcx.size_of(&t);
@@ -294,7 +405,7 @@ impl<'a> Lower<'a> {
 
     // ---- Ausdruecke: Wert ---------------------------------------------
 
-    fn lower_expr(&mut self, e: &Expr) -> Option<Val> {
+    pub(crate) fn lower_expr(&mut self, e: &Expr) -> Option<Val> {
         if self.depth > MAX_DEPTH {
             return self.err(e.span, "ausdruck zu tief verschachtelt");
         }
@@ -336,6 +447,10 @@ impl<'a> Lower<'a> {
                 let ft = self.fty_of(e)?;
                 Some(self.load(ft, addr))
             }
+            // HOOK types: Aufzaehlungswerte sind Aggregate, kein Aufruf (lower_match.rs)
+            ExprKind::Call(name, _, span) if crate::lower_match::is_types_call(name) => {
+                self.err(*span, "ein aufzaehlungswert ist ein aggregat und kein skalarer wert")
+            }
             ExprKind::Call(name, args, span) => {
                 let ft = self.fty_of(e)?;
                 if ft == FTy::Void {
@@ -344,8 +459,10 @@ impl<'a> Lower<'a> {
                         "aufruf ohne rueckgabewert kann nicht als wert benutzt werden",
                     );
                 }
-                let a = self.lower_args(args)?;
-                Some(self.push(ft, Op::Call { name: name.clone(), args: a }))
+                match self.lower_call(name, args, None, *span)? {
+                    Some(v) => Some(v),
+                    None => self.ice(*span, "aufruf ohne wert an einer wertstelle"),
+                }
             }
             ExprKind::Syscall(args) => {
                 let a = self.lower_syscall_args(args)?;
@@ -368,7 +485,7 @@ impl<'a> Lower<'a> {
                 }
                 Some(self.push(to, Op::Cast { src, from }))
             }
-            ExprKind::StructLit(..) | ExprKind::ArrayLit(_) => {
+            ExprKind::StructLit(..) | ExprKind::ArrayLit(_) | ExprKind::ArrayRepeat(..) => {
                 self.ice(e.span, "literal eines aggregats als wert")
             }
         }
@@ -444,7 +561,7 @@ impl<'a> Lower<'a> {
     /// `&&` / `||` kurzschliessend: Ergebnis-Slot + Verzweigung, keine
     /// arithmetische Ersatzoperation.
     fn lower_shortcircuit(&mut self, op: ast::BinOp, a: &Expr, b: &Expr) -> Option<Val> {
-        let slot = self.f.alloca(1, 1);
+        let slot = self.alloca(1, 1);
         let av = self.lower_expr(a)?;
         self.store(FTy::Bool, slot, av);
         let rhs_bb = self.new_block();
@@ -464,19 +581,148 @@ impl<'a> Lower<'a> {
         Some(self.load(FTy::Bool, slot))
     }
 
-    fn lower_args(&mut self, args: &[Expr]) -> Option<Vec<Val>> {
-        let mut out = Vec::with_capacity(args.len());
+    /// Ein Aufruf nach der Aufrufkonvention aus `abi.rs`.
+    ///
+    /// `dest` ist die Zieladresse, wenn die Funktion ein Aggregat liefert.
+    /// Rueckgabe: `Some(Some(v))` = skalarer Wert, `Some(None)` = kein Wert
+    /// bzw. Ergebnis liegt in `dest`, `None` = Fehler (bereits gemeldet).
+    fn lower_call(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        dest: Option<Val>,
+        span: Span,
+    ) -> Option<Option<Val>> {
+        let sig = match self.info.fns.get(name) {
+            Some(s) => s.clone(),
+            None => return self.ice(span, "unbekannte funktion im lowering"),
+        };
+        let ret_agg = is_agg(&sig.ret);
+        let sret = abi::ret_needs_sret(&sig.ret, &self.info.tcx);
+        let mut vals: Vec<Val> = Vec::new();
+        // Zieladresse fuer Aggregatrueckgaben
+        let target = if ret_agg {
+            match dest {
+                Some(d) => Some(d),
+                None => {
+                    let (size, align) = self.size_align(&sig.ret);
+                    Some(self.alloca(size, align))
+                }
+            }
+        } else {
+            None
+        };
+        if sret {
+            if let Some(t) = target {
+                vals.push(t);
+            }
+        }
         for a in args {
             let t = self.ty_of(a);
-            if is_agg(&t) {
-                return self.err(
-                    a.span,
-                    "aggregate als argument werden in stufe 0 nicht unterstuetzt",
-                );
+            if !is_agg(&t) {
+                vals.push(self.lower_expr(a)?);
+                continue;
             }
-            out.push(self.lower_expr(a)?);
+            let (size, align) = self.size_align(&t);
+            match abi::classify(&t, &self.info.tcx) {
+                ArgClass::Integer(n) => {
+                    let addr = self.lower_addr(a)?;
+                    let mut ws = self.load_words(addr, size, n as usize)?;
+                    vals.append(&mut ws);
+                }
+                // MEMORY: versteckter Zeiger auf eine Kopie des Aufrufers
+                _ => {
+                    let tmp = self.alloca(size, align);
+                    self.write_into(tmp, a)?;
+                    vals.push(tmp);
+                }
+            }
         }
-        Some(out)
+        let op = Op::Call { name: name.to_string(), args: vals };
+        if ret_agg {
+            let d = match target {
+                Some(d) => d,
+                None => return self.ice(span, "aggregatrueckgabe ohne ziel"),
+            };
+            let size = self.info.tcx.size_of(&sig.ret);
+            if sret {
+                let _ = self.push(FTy::Ptr, op);
+            } else {
+                let w = self.push(FTy::I64, op);
+                self.store_words(d, size, &[w])?;
+            }
+            return Some(None);
+        }
+        match scalar_fty(&sig.ret) {
+            Some(FTy::Void) | None => {
+                self.push_void(FTy::Void, op);
+                Some(None)
+            }
+            Some(ft) => Some(Some(self.push(ft, op))),
+        }
+    }
+
+    /// `[wert; N]` an die Adresse `addr` schreiben. Der Wert wird GENAU EINMAL
+    /// ausgewertet und dann vervielfaeltigt.
+    fn lower_repeat(&mut self, addr: Val, val: &Expr, et: &Type, n: u64) -> Option<()> {
+        let esz = self.info.tcx.size_of(et).max(1);
+        let scalar = !is_agg(et);
+        // Wert einmal auswerten
+        let (sv, saddr) = if scalar {
+            let ft = match scalar_fty(et) {
+                Some(f) => f,
+                None => return self.ice(val.span, "element ohne skalaren typ"),
+            };
+            (Some((ft, self.lower_expr(val)?)), None)
+        } else {
+            (None, Some(self.lower_addr(val)?))
+        };
+        // Kleine Laengen ohne Schleife
+        if n <= 8 {
+            for i in 0..n {
+                let ea = self.ptradd_const(addr, esz * i);
+                match (sv, saddr) {
+                    (Some((ft, v)), _) => self.store(ft, ea, v),
+                    (None, Some(src)) => {
+                        self.push_void(FTy::Void, Op::CopyMem { dst: ea, src, size: esz })
+                    }
+                    _ => return self.ice(val.span, "wiederholungsliteral ohne wert"),
+                }
+            }
+            return Some(());
+        }
+        // Grosse Laengen als Schleife: i = 0; while i < n { .. ; i = i + 1 }
+        let islot = self.alloca(8, 8);
+        let zero = self.konst(FTy::U64, 0);
+        self.store(FTy::U64, islot, zero);
+        let head = self.new_block();
+        let body = self.new_block();
+        let end = self.new_block();
+        self.set_term(Term::Br(head));
+
+        self.cur = head;
+        let iv = self.load(FTy::U64, islot);
+        let nv = self.konst(FTy::U64, n as i128);
+        let c = self.push(FTy::Bool, Op::Cmp { op: CmpOp::Lt, ty: FTy::U64, a: iv, b: nv });
+        self.set_term(Term::BrCond { cond: c, then_bb: body, else_bb: end });
+
+        self.cur = body;
+        let iv2 = self.load(FTy::U64, islot);
+        let szv = self.konst(FTy::U64, esz as i128);
+        let off = self.push(FTy::U64, Op::Bin(FBin::Mul, iv2, szv));
+        let ea = self.push(FTy::Ptr, Op::PtrAdd { base: addr, off });
+        match (sv, saddr) {
+            (Some((ft, v)), _) => self.store(ft, ea, v),
+            (None, Some(src)) => self.push_void(FTy::Void, Op::CopyMem { dst: ea, src, size: esz }),
+            _ => return self.ice(val.span, "wiederholungsliteral ohne wert"),
+        }
+        let one = self.konst(FTy::U64, 1);
+        let inc = self.push(FTy::U64, Op::Bin(FBin::Add, iv2, one));
+        self.store(FTy::U64, islot, inc);
+        self.set_term(Term::Br(head));
+
+        self.cur = end;
+        Some(())
     }
 
     /// Alle Syscall-Argumente auf `i64` erweitern (signed: vorzeichen-,
@@ -500,7 +746,7 @@ impl<'a> Lower<'a> {
 
     // ---- Anweisungen ---------------------------------------------------
 
-    fn lower_block(&mut self, b: &ast::Block) -> Option<()> {
+    pub(crate) fn lower_block(&mut self, b: &ast::Block) -> Option<()> {
         if self.depth > MAX_DEPTH {
             return self.err(b.span, "block zu tief verschachtelt");
         }
@@ -519,6 +765,10 @@ impl<'a> Lower<'a> {
     }
 
     fn lower_stmt(&mut self, s: &Stmt) -> Option<()> {
+        let sp = s.span();
+        if !sp.is_none() {
+            self.pending_line = Some((sp.file, sp.line));
+        }
         match s {
             Stmt::Error(_) => Some(()),
             Stmt::Let { name, init, span, .. } => {
@@ -527,7 +777,7 @@ impl<'a> Lower<'a> {
                     return self.err(*span, "eine variable kann keinen wert ohne typ haben");
                 }
                 let (size, align) = self.size_align(&t);
-                let slot = self.f.alloca(size, align);
+                let slot = self.alloca(size, align);
                 self.write_into(slot, init)?;
                 self.declare(name, slot);
                 Some(())
@@ -543,13 +793,27 @@ impl<'a> Lower<'a> {
                     Some(v) => {
                         let t = self.ty_of(v);
                         if is_agg(&t) {
-                            return self.err(
-                                *span,
-                                "rueckgabe eines aggregats wird in stufe 0 nicht unterstuetzt",
-                            );
+                            // Aggregatrueckgabe nach abi.rs: ueber den
+                            // versteckten Zeiger oder in einem Wort in rax.
+                            let size = self.info.tcx.size_of(&t);
+                            match self.sret {
+                                Some(dst) => {
+                                    self.write_into(dst, v)?;
+                                    self.set_term(Term::Ret(Some(dst)));
+                                }
+                                None => {
+                                    let addr = self.lower_addr(v)?;
+                                    let w = self.load_words(addr, size, 1)?;
+                                    match w.first() {
+                                        Some(w0) => self.set_term(Term::Ret(Some(*w0))),
+                                        None => return self.ice(*span, "rueckgabe ohne wort"),
+                                    }
+                                }
+                            }
+                        } else {
+                            let rv = self.lower_expr(v)?;
+                            self.set_term(Term::Ret(Some(rv)));
                         }
-                        let rv = self.lower_expr(v)?;
-                        self.set_term(Term::Ret(Some(rv)));
                     }
                     None => self.set_term(Term::Ret(None)),
                 }
@@ -561,21 +825,47 @@ impl<'a> Lower<'a> {
             }
             Stmt::If { cond, then, els, .. } => self.lower_if(cond, then, els.as_deref()),
             Stmt::While { cond, body, .. } => self.lower_while(cond, body),
+            Stmt::For { name, start, end, body, .. } => {
+                self.lower_for(name, start, end, body)
+            }
+            Stmt::Break(span) => {
+                let target = match self.loops.last() {
+                    Some((brk, _)) => *brk,
+                    None => return self.ice(*span, "'break' ausserhalb einer schleife"),
+                };
+                self.set_term(Term::Br(target));
+                let dead = self.new_block();
+                self.cur = dead;
+                Some(())
+            }
+            Stmt::Continue(span) => {
+                let target = match self.loops.last() {
+                    Some((_, cont)) => *cont,
+                    None => return self.ice(*span, "'continue' ausserhalb einer schleife"),
+                };
+                self.set_term(Term::Br(target));
+                let dead = self.new_block();
+                self.cur = dead;
+                Some(())
+            }
         }
     }
 
     fn lower_expr_stmt(&mut self, e: &Expr) -> Option<()> {
         match &e.kind {
-            ExprKind::Call(name, args, _) => {
+            // HOOK types: `match` und Aufzaehlungskonstruktoren (lower_match.rs)
+            ExprKind::Call(name, args, _) if crate::lower_match::is_types_call(name) => {
+                crate::lower_match::lower_types_stmt(self, e, name, args)
+            }
+            ExprKind::Call(name, args, span) => {
                 let t = self.ty_of(e);
-                let a = self.lower_args(args)?;
-                let op = Op::Call { name: name.clone(), args: a };
-                match scalar_fty(&t) {
-                    Some(FTy::Void) | None => self.push_void(FTy::Void, op),
-                    Some(ft) => {
-                        let _ = self.push(ft, op);
-                    }
-                }
+                let dest = if is_agg(&t) {
+                    let (size, align) = self.size_align(&t);
+                    Some(self.alloca(size, align))
+                } else {
+                    None
+                };
+                self.lower_call(name, args, dest, *span)?;
                 Some(())
             }
             ExprKind::Syscall(args) => {
@@ -626,10 +916,71 @@ impl<'a> Lower<'a> {
         self.set_term(Term::BrCond { cond: c, then_bb: body_bb, else_bb: end_bb });
 
         self.cur = body_bb;
-        self.lower_block(body)?;
+        self.loops.push((end_bb, head_bb));
+        let r = self.lower_block(body);
+        self.loops.pop();
+        r?;
         if !self.terminated() {
             self.set_term(Term::Br(head_bb));
         }
+
+        self.cur = end_bb;
+        Some(())
+    }
+
+    /// `for i in a..b { }` — entzuckert zu Zaehlschleife mit eigenem
+    /// Fortschaltblock, damit `continue` den Zaehler erhoeht.
+    fn lower_for(
+        &mut self,
+        name: &str,
+        start: &Expr,
+        end: &Expr,
+        body: &ast::Block,
+    ) -> Option<()> {
+        let ty = self.ty_of(start);
+        let ft = match scalar_fty(&ty) {
+            Some(f) if f != FTy::Void => f,
+            _ => return self.ice(start.span, "bereich von 'for' ohne ganzzahltyp"),
+        };
+        let bytes = ft.bytes().max(1);
+        let islot = self.alloca(bytes, bytes);
+        let sv = self.lower_expr(start)?;
+        self.store(ft, islot, sv);
+        // Die Obergrenze wird EINMAL ausgewertet.
+        let eslot = self.alloca(bytes, bytes);
+        let ev = self.lower_expr(end)?;
+        self.store(ft, eslot, ev);
+
+        let head_bb = self.new_block();
+        let body_bb = self.new_block();
+        let step_bb = self.new_block();
+        let end_bb = self.new_block();
+        self.set_term(Term::Br(head_bb));
+
+        self.cur = head_bb;
+        let iv = self.load(ft, islot);
+        let lim = self.load(ft, eslot);
+        let c = self.push(FTy::Bool, Op::Cmp { op: CmpOp::Lt, ty: ft, a: iv, b: lim });
+        self.set_term(Term::BrCond { cond: c, then_bb: body_bb, else_bb: end_bb });
+
+        self.cur = body_bb;
+        self.enter();
+        self.declare(name, islot);
+        self.loops.push((end_bb, step_bb));
+        let r = self.lower_block(body);
+        self.loops.pop();
+        self.leave();
+        r?;
+        if !self.terminated() {
+            self.set_term(Term::Br(step_bb));
+        }
+
+        self.cur = step_bb;
+        let iv2 = self.load(ft, islot);
+        let one = self.konst(ft, 1);
+        let inc = self.push(ft, Op::Bin(FBin::Add, iv2, one));
+        self.store(ft, islot, inc);
+        self.set_term(Term::Br(head_bb));
 
         self.cur = end_bb;
         Some(())
@@ -654,6 +1005,16 @@ impl<'a> Lower<'a> {
     }
 }
 
+/// Wie ein Quellparameter die Funktionsgrenze ueberquert (siehe `abi.rs`).
+enum ParamKind {
+    /// skalar: genau ein FIR-Parameter
+    Scalar(FTy),
+    /// Aggregat in `n` Ganzzahlwoertern
+    Words(usize),
+    /// Aggregat ueber Speicher: ein Zeiger auf die Kopie des Aufrufers
+    Ref,
+}
+
 fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
     let sig = match info.fns.get(&d.name) {
         Some(s) => s.clone(),
@@ -665,32 +1026,61 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
             return None;
         }
     };
-    let mut pf = Vec::with_capacity(sig.params.len());
+
+    // --- Aufrufkonvention aus abi.rs in FIR-Parameter uebersetzen ---
+    let sret = abi::ret_needs_sret(&sig.ret, &info.tcx);
+    let mut pf: Vec<FTy> = Vec::new();
+    if sret {
+        pf.push(FTy::Ptr); // versteckter Rueckgabezeiger in rdi
+    }
+    let mut kinds: Vec<ParamKind> = Vec::with_capacity(sig.params.len());
     for (i, p) in sig.params.iter().enumerate() {
         let span = d.params.get(i).map(|p| p.span).unwrap_or(d.span);
+        if is_agg(p) {
+            match abi::classify(p, &info.tcx) {
+                ArgClass::Integer(n) => {
+                    for _ in 0..n {
+                        pf.push(FTy::I64);
+                    }
+                    kinds.push(ParamKind::Words(n as usize));
+                }
+                _ => {
+                    pf.push(FTy::Ptr);
+                    kinds.push(ParamKind::Ref);
+                }
+            }
+            continue;
+        }
         match scalar_fty(p) {
             Some(FTy::Void) | None => {
-                dg.error(
-                    span,
-                    "parameter dieses typs werden in stufe 0 nicht unterstuetzt (nur skalare typen)",
-                );
+                dg.error(span, "ein parameter dieses typs ist nicht uebersetzbar");
                 return None;
             }
-            Some(f) => pf.push(f),
+            Some(f) => {
+                pf.push(f);
+                kinds.push(ParamKind::Scalar(f));
+            }
         }
     }
-    let rf = match scalar_fty(&sig.ret) {
-        Some(f) => f,
-        None => {
-            dg.error(
-                d.span,
-                "rueckgabetypen dieser art werden in stufe 0 nicht unterstuetzt (nur skalare typen)",
-            );
-            return None;
+    let rf = if is_agg(&sig.ret) {
+        // Aggregat: entweder Zeiger (sret) oder ein Wort in rax
+        if sret {
+            FTy::Ptr
+        } else {
+            FTy::I64
+        }
+    } else {
+        match scalar_fty(&sig.ret) {
+            Some(f) => f,
+            None => {
+                dg.error(d.span, "ein rueckgabetyp dieser art ist nicht uebersetzbar");
+                return None;
+            }
         }
     };
 
     let f = Func::new(&d.name, pf.clone(), rf);
+    dwarf::set_fn(&d.name, d.span.file, d.span.line);
     let mut lo = Lower {
         info,
         dg,
@@ -698,18 +1088,60 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
         cur: 0,
         scopes: Vec::new(),
         depth: 0,
+        fname: d.name.clone(),
+        loops: Vec::new(),
+        sret: None,
+        pending_line: None,
     };
+    let mut next = 0usize;
+    if sret {
+        lo.sret = Some(lo.f.param_val(0));
+        next = 1;
+    }
     lo.enter();
     // Parameter bekommen einen Slot und werden im Eintrittsblock gesichert.
     for (i, p) in d.params.iter().enumerate() {
-        let ft = match pf.get(i) {
-            Some(f) => *f,
+        let ty = match sig.params.get(i) {
+            Some(t) => t.clone(),
             None => break,
         };
-        let slot = lo.f.alloca(ft.bytes().max(1), ft.bytes().max(1));
-        let pv = lo.f.param_val(i);
-        lo.store(ft, slot, pv);
-        lo.declare(&p.name, slot);
+        match kinds.get(i) {
+            Some(ParamKind::Scalar(ft)) => {
+                let ft = *ft;
+                let slot = lo.alloca(ft.bytes().max(1), ft.bytes().max(1));
+                let pv = lo.f.param_val(next);
+                next += 1;
+                lo.store(ft, slot, pv);
+                lo.declare(&p.name, slot);
+            }
+            Some(ParamKind::Words(n)) => {
+                let n = *n;
+                let (size, align) = lo.size_align(&ty);
+                // Der Slot wird auf volle Woerter aufgefuellt, damit die
+                // Stores der Woerter vollstaendig im Objekt liegen.
+                let slot = lo.alloca(size.max(n as u64 * 8), align.max(8));
+                let ws: Vec<Val> = (0..n)
+                    .map(|k| {
+                        let v = lo.f.param_val(next + k);
+                        v
+                    })
+                    .collect();
+                next += n;
+                for (k, w) in ws.iter().enumerate() {
+                    let a = lo.ptradd_const(slot, k as u64 * 8);
+                    lo.store(FTy::I64, a, *w);
+                }
+                lo.declare(&p.name, slot);
+            }
+            Some(ParamKind::Ref) => {
+                // Der Aufrufer hat bereits eine Kopie angelegt; ihre Adresse
+                // ist der Slot des Parameters.
+                let pv = lo.f.param_val(next);
+                next += 1;
+                lo.declare(&p.name, pv);
+            }
+            None => break,
+        }
     }
     let ok = lo.lower_block(&d.body).is_some();
     lo.leave();

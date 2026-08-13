@@ -58,23 +58,23 @@ enum Mutability {
 }
 
 #[derive(Clone, Debug)]
-struct VarInfo {
-    ty: Type,
-    mutable: bool,
+pub(crate) struct VarInfo {
+    pub(crate) ty: Type,
+    pub(crate) mutable: bool,
 }
 
 /// Hoechste Verschachtelungstiefe von Ausdruecken (Schutz vor Stapelueberlauf).
 const MAX_DEPTH: u32 = 200;
 
-struct Checker<'a> {
-    dg: &'a mut Diags,
-    tcx: TypeCtx,
-    fns: HashMap<String, FnSig>,
-    consts: HashMap<String, (Type, i128)>,
-    expr_types: Vec<Type>,
-    scopes: Vec<HashMap<String, VarInfo>>,
-    ret: Type,
-    depth: u32,
+pub(crate) struct Checker<'a> {
+    pub(crate) dg: &'a mut Diags,
+    pub(crate) tcx: TypeCtx,
+    pub(crate) fns: HashMap<String, FnSig>,
+    pub(crate) consts: HashMap<String, (Type, i128)>,
+    pub(crate) expr_types: Vec<Type>,
+    pub(crate) scopes: Vec<HashMap<String, VarInfo>>,
+    pub(crate) ret: Type,
+    pub(crate) depth: u32,
 }
 
 pub fn check(prog: &Program, dg: &mut Diags) -> Option<TypeInfo> {
@@ -112,7 +112,11 @@ pub fn check(prog: &Program, dg: &mut Diags) -> Option<TypeInfo> {
 impl<'a> Checker<'a> {
     fn run(&mut self, prog: &Program) {
         self.check_profile(prog);
+        // HOOK types: Aufzaehlungsnamen anmelden (sema_match.rs)
+        crate::sema_match::declare_enums(self);
         self.collect_structs(prog);
+        // HOOK types: Aufzaehlungen auslegen (sema_match.rs)
+        crate::sema_match::layout_enums(self, prog);
         self.collect_fns(prog);
         self.check_consts(prog);
         for f in &prog.funcs {
@@ -245,42 +249,16 @@ impl<'a> Checker<'a> {
                         format!("parameter '{}' ist bereits deklariert", p.name),
                     );
                 }
-                if !ty.is_error() && !self.is_scalar(&ty) {
-                    self.dg.error(
-                        p.ty.span(),
-                        "structs/arrays an funktionsgrenzen werden in stufe 0 nicht unterstuetzt, uebergib einen zeiger",
-                    );
+                if matches!(ty, Type::Void) {
+                    self.dg.error(p.ty.span(), "ein parameter kann nicht den typ '()' haben");
                     params.push(Type::Error);
                     continue;
                 }
                 params.push(ty);
             }
-            if f.params.len() > 6 {
-                self.dg.error_note(
-                    f.span,
-                    format!(
-                        "funktion '{}' hat {} parameter; stufe 0 unterstuetzt hoechstens 6",
-                        f.name,
-                        f.params.len()
-                    ),
-                    "system-v uebergibt hoechstens 6 ganzzahlargumente in registern; \
-                     stapelargumente kommen in v0.2",
-                );
-            }
             let ret = match &f.ret {
                 None => Type::Void,
-                Some(te) => {
-                    let t = self.resolve_ty(te);
-                    if !t.is_error() && !self.is_scalar(&t) {
-                        self.dg.error(
-                            te.span(),
-                            "structs/arrays an funktionsgrenzen werden in stufe 0 nicht unterstuetzt, uebergib einen zeiger",
-                        );
-                        Type::Error
-                    } else {
-                        t
-                    }
-                }
+                Some(te) => self.resolve_ty(te),
             };
             if self.fns.contains_key(&f.name) {
                 self.dg.error(
@@ -395,7 +373,7 @@ impl<'a> Checker<'a> {
 
     // -------------------------------------------------------------- Bereiche
 
-    fn declare_var(&mut self, name: &str, ty: Type, mutable: bool, span: Span) {
+    pub(crate) fn declare_var(&mut self, name: &str, ty: Type, mutable: bool, span: Span) {
         if let Some(top) = self.scopes.last() {
             if top.contains_key(name) {
                 self.dg.error(
@@ -409,7 +387,7 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn lookup_var(&self, name: &str) -> Option<&VarInfo> {
+    pub(crate) fn lookup_var(&self, name: &str) -> Option<&VarInfo> {
         for s in self.scopes.iter().rev() {
             if let Some(v) = s.get(name) {
                 return Some(v);
@@ -420,7 +398,7 @@ impl<'a> Checker<'a> {
 
     // ----------------------------------------------------------- Anweisungen
 
-    fn check_block(&mut self, b: &Block, reuse_scope: bool) {
+    pub(crate) fn check_block(&mut self, b: &Block, reuse_scope: bool) {
         if !reuse_scope {
             self.scopes.push(HashMap::new());
         }
@@ -505,6 +483,34 @@ impl<'a> Checker<'a> {
             Stmt::While { cond, body, .. } => {
                 self.check_cond(cond, "while");
                 self.check_block(body, false);
+            }
+            Stmt::Break(_) | Stmt::Continue(_) => {
+                // Die Lage in einer Schleife prueft bereits der Parser.
+            }
+            Stmt::For { name, start, end, body, name_span, .. } => {
+                let want = self.probe(start).or_else(|| self.probe(end));
+                let st = self.expr(start, want.as_ref());
+                let et = self.expr(end, want.as_ref().or(Some(&st)));
+                let ty = if st.is_error() || et.is_error() {
+                    Type::Error
+                } else if !st.is_concrete_int() || !et.is_concrete_int() || st != et {
+                    self.dg.error_note(
+                        start.span,
+                        format!(
+                            "der bereich von 'for' braucht zwei werte desselben ganzzahltyps, gefunden {} und {}",
+                            self.tcx.name_of(&st),
+                            self.tcx.name_of(&et)
+                        ),
+                        "schreibe z. B. 'for i in 0 as usize..n'",
+                    );
+                    Type::Error
+                } else {
+                    st
+                };
+                self.scopes.push(HashMap::new());
+                self.declare_var(name, ty, false, *name_span);
+                self.check_block(body, true);
+                self.scopes.pop();
             }
             Stmt::Return { value, span } => {
                 let want = self.ret.clone();
@@ -706,7 +712,7 @@ impl<'a> Checker<'a> {
 
     // ------------------------------------------------------------- Ausdruecke
 
-    fn record(&mut self, id: ExprId, ty: Type) {
+    pub(crate) fn record(&mut self, id: ExprId, ty: Type) {
         if let Some(slot) = self.expr_types.get_mut(id as usize) {
             *slot = ty;
         }
@@ -715,11 +721,11 @@ impl<'a> Checker<'a> {
     /// Gibt allen Teilausdruecken einen konkreten Typ, ohne inhaltlich zu
     /// pruefen — benutzt nach einem bereits gemeldeten Fehler, damit keine
     /// Folgefehlerlawine ("typ des literals ...") entsteht.
-    fn type_out_expr(&mut self, e: &Expr) {
+    pub(crate) fn type_out_expr(&mut self, e: &Expr) {
         self.expr(e, Some(&Type::I64));
     }
 
-    fn expr(&mut self, e: &Expr, hint: Option<&Type>) -> Type {
+    pub(crate) fn expr(&mut self, e: &Expr, hint: Option<&Type>) -> Type {
         if self.depth >= MAX_DEPTH {
             self.dg.error(
                 e.span,
@@ -854,6 +860,63 @@ impl<'a> Checker<'a> {
                 dst
             }
             ExprKind::StructLit(name, fields, nspan) => self.struct_lit(name, fields, *nspan),
+            ExprKind::ArrayRepeat(val, count) => {
+                let ct = self.expr(count, Some(&Type::Usize));
+                let n = if ct.is_error() || !ct.is_concrete_int() {
+                    if !ct.is_error() {
+                        self.dg.error(
+                            count.span,
+                            format!(
+                                "die laenge eines wiederholungsliterals muss eine ganzzahl sein, gefunden {}",
+                                self.tcx.name_of(&ct)
+                            ),
+                        );
+                    }
+                    0
+                } else {
+                    match self.eval_const(count) {
+                        Ok(v) if v > 0 => v as u64,
+                        Ok(_) => {
+                            self.dg.error(
+                                count.span,
+                                "die laenge eines wiederholungsliterals muss groesser als null sein",
+                            );
+                            0
+                        }
+                        Err((sp, msg)) => {
+                            self.dg.error(sp, msg);
+                            0
+                        }
+                    }
+                };
+                let elem_hint = match hint {
+                    Some(Type::Array(et, _)) => Some((**et).clone()),
+                    _ => None,
+                };
+                let vt = self.expr(val, elem_hint.as_ref());
+                if n == 0 || vt.is_error() {
+                    return Type::Error;
+                }
+                if let Some(Type::Array(et, want_n)) = hint {
+                    if !assignable(&vt, et) {
+                        self.dg.error(
+                            val.span,
+                            format!(
+                                "element hat typ {}, erwartet {}",
+                                self.tcx.name_of(&vt),
+                                self.tcx.name_of(et)
+                            ),
+                        );
+                    }
+                    if *want_n != n {
+                        self.dg.error(
+                            count.span,
+                            format!("erwartet werden {} elemente, das literal hat {}", want_n, n),
+                        );
+                    }
+                }
+                Type::Array(Box::new(vt), n)
+            }
             ExprKind::ArrayLit(elems) => match hint {
                 Some(Type::Array(et, n)) => {
                     if elems.len() as u64 != *n {
@@ -1077,6 +1140,10 @@ impl<'a> Checker<'a> {
     }
 
     fn call(&mut self, name: &str, args: &[Expr], nspan: Span, espan: Span) -> Type {
+        // HOOK types: `Enum::Variante(..)` und `match` (sema_match.rs)
+        if let Some(t) = crate::sema_match::hook_call(self, name, args, nspan, espan) {
+            return t;
+        }
         let sig = match self.fns.get(name) {
             Some(s) => s.clone(),
             None => {
@@ -1255,6 +1322,7 @@ impl<'a> Checker<'a> {
             ExprKind::Syscall(_) => Some(Type::I64),
             ExprKind::Cast(_, te) => self.resolve_ty_quiet(te),
             ExprKind::StructLit(name, _, _) => self.tcx.lookup(name).map(Type::Struct),
+            ExprKind::ArrayRepeat(..) => None,
             ExprKind::ArrayLit(els) => {
                 let first = els.first()?;
                 let et = self.probe_d(first, d + 1)?;
@@ -1265,7 +1333,7 @@ impl<'a> Checker<'a> {
 
     // ------------------------------------------------------------------ Typen
 
-    fn resolve_ty(&mut self, te: &TypeExpr) -> Type {
+    pub(crate) fn resolve_ty(&mut self, te: &TypeExpr) -> Type {
         self.resolve_ty_d(te, 0)
     }
 
@@ -1321,10 +1389,6 @@ impl<'a> Checker<'a> {
                 .resolve_ty_quiet(elem)
                 .map(|t| Type::Array(Box::new(t), *len)),
         }
-    }
-
-    fn is_scalar(&self, t: &Type) -> bool {
-        t.is_concrete_int() || *t == Type::Bool || t.is_ptr()
     }
 
     // ------------------------------------------------------- Konstantenwerte
@@ -1584,8 +1648,31 @@ fn stmt_returns(s: &Stmt) -> bool {
             Some(e) => block_returns(then) && stmt_returns(e),
             None => false,
         },
-        // Ohne 'break' verlaesst eine 'while true'-Schleife den Rumpf nie.
-        Stmt::While { cond, .. } => matches!(cond.kind, ExprKind::Bool(true)),
+        // Eine 'while true'-Schleife OHNE 'break' verlaesst den Rumpf nie.
+        Stmt::While { cond, body, .. } => {
+            matches!(cond.kind, ExprKind::Bool(true)) && !block_breaks(body)
+        }
+        // HOOK types: ein vollstaendiges 'match', dessen Faelle alle
+        // zurueckkehren, kehrt selbst zurueck (sema_match.rs).
+        Stmt::Expr(e) => crate::sema_match::match_returns(e),
+        _ => false,
+    }
+}
+
+/// Enthaelt der Block ein `break`, das DIESE Schleife verlaesst (also keines
+/// aus einer inneren Schleife)?
+fn block_breaks(b: &Block) -> bool {
+    b.stmts.iter().any(stmt_breaks)
+}
+
+fn stmt_breaks(s: &Stmt) -> bool {
+    match s {
+        Stmt::Break(_) => true,
+        Stmt::Block(b) => block_breaks(b),
+        Stmt::If { then, els, .. } => {
+            block_breaks(then) || els.as_deref().map(stmt_breaks).unwrap_or(false)
+        }
+        // 'break' in einer inneren Schleife verlaesst nur diese.
         _ => false,
     }
 }
@@ -1658,6 +1745,8 @@ mod tests {
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(ret), span: sp() }])],
             structs: Vec::new(),
             consts: Vec::new(),
+            imports: Vec::new(),
+            exports: Vec::new(),
             expr_count: b.next,
         }
     }
@@ -1688,6 +1777,8 @@ mod tests {
         };
         let prog = Program {
             profile: None,
+            imports: Vec::new(),
+            exports: Vec::new(),
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(ret), span: sp() }])],
             structs: vec![sd],
             consts: Vec::new(),
@@ -1738,6 +1829,8 @@ mod tests {
         };
         let prog = Program {
             profile: None,
+            imports: Vec::new(),
+            exports: Vec::new(),
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(ret), span: sp() }])],
             structs: vec![sd],
             consts: Vec::new(),
@@ -1776,6 +1869,8 @@ mod tests {
         };
         let prog = Program {
             profile: None,
+            imports: Vec::new(),
+            exports: Vec::new(),
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(ret), span: sp() }])],
             structs: vec![outer, inner],
             consts: Vec::new(),
@@ -1806,6 +1901,8 @@ mod tests {
         };
         let prog = Program {
             profile: None,
+            imports: Vec::new(),
+            exports: Vec::new(),
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(ret), span: sp() }])],
             structs: vec![a, bs],
             consts: Vec::new(),
@@ -1837,6 +1934,8 @@ mod tests {
             ])],
             structs: Vec::new(),
             consts: Vec::new(),
+            imports: Vec::new(),
+            exports: Vec::new(),
             expr_count: b.next,
         };
         let (info, out) = run(prog, "");
@@ -1855,6 +1954,8 @@ mod tests {
         let ret = b.int(0);
         let prog = Program {
             profile: None,
+            imports: Vec::new(),
+            exports: Vec::new(),
             funcs: vec![main_fn(vec![
                 Stmt::Let {
                     name: "x".to_string(),
@@ -1898,6 +1999,8 @@ mod tests {
         };
         let prog = Program {
             profile: None,
+            imports: Vec::new(),
+            exports: Vec::new(),
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(call), span: sp() }]), f],
             structs: Vec::new(),
             consts: Vec::new(),
@@ -1910,6 +2013,8 @@ mod tests {
     fn missing_return_is_error() {
         let prog = Program {
             profile: None,
+            imports: Vec::new(),
+            exports: Vec::new(),
             funcs: vec![main_fn(Vec::new())],
             structs: Vec::new(),
             consts: Vec::new(),
@@ -1927,6 +2032,8 @@ mod tests {
         let ret = b.int(0);
         let prog = Program {
             profile: None,
+            imports: Vec::new(),
+            exports: Vec::new(),
             funcs: vec![main_fn(vec![
                 Stmt::Let {
                     name: "x".to_string(),
@@ -1954,6 +2061,8 @@ mod tests {
         let ix = b.e(ExprKind::Index(Box::new(base), Box::new(idx)));
         let prog = Program {
             profile: None,
+            imports: Vec::new(),
+            exports: Vec::new(),
             funcs: vec![main_fn(vec![
                 Stmt::Let {
                     name: "x".to_string(),
@@ -1979,6 +2088,8 @@ mod tests {
         let f = b.e(ExprKind::Field(Box::new(base), "y".to_string(), sp()));
         let prog = Program {
             profile: None,
+            imports: Vec::new(),
+            exports: Vec::new(),
             funcs: vec![main_fn(vec![
                 Stmt::Let {
                     name: "x".to_string(),
@@ -2004,6 +2115,8 @@ mod tests {
         let d = b.e(ExprKind::Unary(UnOp::Deref, Box::new(base)));
         let prog = Program {
             profile: None,
+            imports: Vec::new(),
+            exports: Vec::new(),
             funcs: vec![main_fn(vec![
                 Stmt::Let {
                     name: "x".to_string(),
@@ -2028,6 +2141,8 @@ mod tests {
         let ret = b.int(0);
         let prog = Program {
             profile: None,
+            imports: Vec::new(),
+            exports: Vec::new(),
             funcs: vec![main_fn(vec![
                 Stmt::If { cond: c, then: blk(Vec::new()), els: None, span: sp() },
                 Stmt::Return { value: Some(ret), span: sp() },
@@ -2049,6 +2164,8 @@ mod tests {
         let sum = b.e(ExprKind::Binary(BinOp::Add, Box::new(x), Box::new(y)));
         let prog = Program {
             profile: None,
+            imports: Vec::new(),
+            exports: Vec::new(),
             funcs: vec![main_fn(vec![
                 Stmt::Let { name: "x".into(), mutable: false, ty: Some(named("i32")), init: ia, span: sp() },
                 Stmt::Let { name: "y".into(), mutable: false, ty: Some(named("i64")), init: ib, span: sp() },
@@ -2062,7 +2179,9 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_parameter_is_error() {
+    /// Runde 2: Aggregate an Funktionsgrenzen sind ERLAUBT (SPEC §14.1 Punkt 1
+    /// gestrichen). Der Typpruefer nimmt sie an, `abi.rs` klassifiziert sie.
+    fn aggregate_parameter_ist_erlaubt() {
         let mut b = B::new();
         let ret = b.int(0);
         let f = FnDecl {
@@ -2078,12 +2197,21 @@ mod tests {
         };
         let prog = Program {
             profile: None,
+            imports: Vec::new(),
+            exports: Vec::new(),
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(ret), span: sp() }]), f],
             structs: Vec::new(),
             consts: Vec::new(),
             expr_count: b.next,
         };
-        expect_err(prog, "an funktionsgrenzen werden in stufe 0 nicht unterstuetzt");
+        let (info, out) = run(prog, "");
+        let info = info.unwrap_or_else(|| panic!("aggregat-parameter abgelehnt:\n{}", out));
+        let sig = info.fns.get("f").expect("signatur von f");
+        assert_eq!(sig.params[0], Type::Array(Box::new(Type::I32), 4));
+        assert_eq!(
+            crate::abi::classify(&sig.params[0], &info.tcx),
+            crate::abi::ArgClass::Integer(2)
+        );
     }
 
     #[test]
@@ -2109,6 +2237,8 @@ mod tests {
         };
         let prog = Program {
             profile: None,
+            imports: Vec::new(),
+            exports: Vec::new(),
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(c), span: sp() }])],
             structs: vec![sd],
             consts: Vec::new(),
@@ -2137,6 +2267,8 @@ mod tests {
         };
         let prog = Program {
             profile: None,
+            imports: Vec::new(),
+            exports: Vec::new(),
             funcs: vec![main_fn(vec![
                 Stmt::Let { name: "p".into(), mutable: false, ty: Some(named("P")), init: s, span: sp() },
                 Stmt::Return { value: Some(ret), span: sp() },
@@ -2157,6 +2289,8 @@ mod tests {
         let k = b.id("K");
         let prog = Program {
             profile: None,
+            imports: Vec::new(),
+            exports: Vec::new(),
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(k), span: sp() }])],
             structs: Vec::new(),
             consts: vec![ConstDecl {
@@ -2181,6 +2315,8 @@ mod tests {
         let ret = b.int(0);
         let prog = Program {
             profile: None,
+            imports: Vec::new(),
+            exports: Vec::new(),
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(ret), span: sp() }])],
             structs: Vec::new(),
             consts: vec![ConstDecl {
@@ -2208,6 +2344,8 @@ mod tests {
         let ret = b.int(0);
         let prog = Program {
             profile: None,
+            imports: Vec::new(),
+            exports: Vec::new(),
             funcs: vec![main_fn(vec![
                 Stmt::Let { name: "b".into(), mutable: true, ty: Some(named("u8")), init, span: sp() },
                 Stmt::Expr(sc),
@@ -2247,6 +2385,8 @@ mod tests {
         let iinit = b.int(0);
         let prog = Program {
             profile: None,
+            imports: Vec::new(),
+            exports: Vec::new(),
             funcs: vec![main_fn(vec![
                 Stmt::Let {
                     name: "a".into(),

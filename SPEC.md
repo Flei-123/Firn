@@ -795,8 +795,11 @@ absichtlich noch nicht enthalten.
 
 ```ebnf
 program     = { item } ;
-item        = fn_decl | struct_decl | const_decl | profile_decl ;
+item        = fn_decl | struct_decl | const_decl | profile_decl
+            | import_decl | export_decl ;          (* Runde 2 *)
 profile_decl= "profile" ident ;
+import_decl = "import" ident { "." ident } ;       (* Runde 2 *)
+export_decl = "export" "{" [ ident { "," ident } ] "}" ;   (* Runde 2 *)
 fn_decl     = [ "extern" ] "fn" ident "(" [ params ] ")" [ "->" type ] block ;
 params      = param { "," param } [ "," ] ;
 param       = ident ":" type ;
@@ -810,7 +813,10 @@ type        = "i8"|"i16"|"i32"|"i64"|"u8"|"u16"|"u32"|"u64"|"usize"|"isize"|"boo
 
 block       = "{" { stmt } "}" ;
 stmt        = let_stmt | var_stmt | assign | if_stmt | while_stmt
+            | for_stmt | jump_stmt                 (* Runde 2 *)
             | return_stmt | expr_stmt | block ;
+for_stmt    = "for" ident "in" expr ".." expr block ;      (* Runde 2 *)
+jump_stmt   = "break" | "continue" ;                       (* Runde 2 *)
 let_stmt    = "let" ident [ ":" type ] "=" expr ;
 var_stmt    = "var" ident [ ":" type ] "=" expr ;
 assign      = lvalue "=" expr ;
@@ -827,10 +833,12 @@ add_expr    = mul_expr { ( "+"|"-"|"|"|"^" ) mul_expr } ;
 mul_expr    = unary   { ( "*"|"/"|"%"|"&"|"<<"|">>" ) unary } ;
 unary       = ( "-" | "!" | "&" | "*" ) unary | postfix ;
 postfix     = primary { "." ident | "[" expr "]" | "(" [ args ] ")" | "as" type } ;
-primary     = int_lit | bool_lit | ident | "(" expr ")" | struct_lit | array_lit
-            | "syscall" "(" args ")" ;
+primary     = int_lit | bool_lit | qualified | "(" expr ")" | struct_lit
+            | array_lit | "syscall" "(" args ")" ;
+qualified   = ident [ "." ident ]                  (* modul.name, Runde 2 *) ;
 struct_lit  = ident "{" { ident ":" expr "," } "}" ;
-array_lit   = "[" [ expr { "," expr } ] "]" ;
+array_lit   = "[" [ expr { "," expr } ] "]"
+            | "[" expr ";" expr "]" ;              (* Wiederholung, Runde 2 *)
 ```
 
 ---
@@ -888,26 +896,47 @@ in diesem Dokument ist Zukunft und wird im README als „noch nicht" geführt.
   (reines Spilling). Korrekt, aber langsam. Echte Registerzuteilung ist `P3`.
 * Testsuite mit ≥ 40 `.fi`-Programmen plus Negativtests.
 
-**Nicht enthalten (Stufe 0):** Module/Imports, `comptime`, Generics,
-`interface`, `enum`/`match`, Fehlerunionen `!T`, `defer`/`drop`, Move-Prüfer,
-Referenztypen `&T`/`inout T` als geprüfte Typen (nur Rohzeiger), Arenen,
-**`Rc[T]`, `Gc[T]`, der gesamte GC**, `gc class` und Vererbung, Abwicklung/
-`throw`, Gleitkomma, `u128`, **alle Zeichenkettentypen** (nur Byte-Arrays),
-`secret`/Constant-Time, Standardbibliothek, Nebenläufigkeit, DWARF,
-Paketverwaltung, aarch64, WASM, LLVM-Backend, Optimierung über
-Konstantenfaltung/DCE hinaus.
+**Nicht enthalten (Stufe 0), Stand nach Runde 2:** `comptime`, `interface`,
+Fehlerunionen `!T`, `defer`/`drop`, Move-Prüfer, Referenztypen `&T`/`inout T`
+als geprüfte Typen (nur Rohzeiger), Arenen, **`Rc[T]`, `Gc[T]`, der gesamte
+GC**, `gc class` und Vererbung, Abwicklung/`throw`, Gleitkomma als Sprachtyp,
+`u128`, **`secret`/Constant-Time (§9)**, Standardbibliothek, Nebenläufigkeit,
+Paketverwaltung, aarch64, WASM, LLVM-Backend.
+Diese Typkonstruktoren melden einen eigenen Fehler mit Zeile/Spalte statt eines
+Syntaxfehlers (`secret[T]`, `Gc[T]`, `GcWeak[T]`, `Rc[T]`, `Weak[T]`, `Arc[T]`;
+Nachweis: `tests/neg/int_secret_nicht_umgesetzt.fi`,
+`tests/neg/int_gc_nicht_umgesetzt.fi`).
+
+**Runde 2 hat aus dieser Liste gestrichen** (jeweils einzeln in §14.1 belegt):
+Module/Imports und `export` (Punkt 15), Generics per Monomorphisierung
+(§14.1.types), `enum`/`match` mit Vollständigkeitsprüfung (§14.1.types),
+die Zeichenkettentypen `Bytes`/`Str`/`Str16`/`Atom` als Bibliothek in Firn
+(§14.1.str), `.debug_line` für `gdb` (Punkt 16) sowie Optimierung weit über
+Konstantenfaltung/DCE hinaus: mem2reg, CSE, Inlining, Blockverschmelzung und
+**echte Registerzuteilung** (§14.1.opt). Der oben unter „x86_64-Codegen"
+genannte Satz „reines Spilling, keine Registerzuteilung" gilt seit Runde 2
+nur noch für `--no-opt`.
 
 ### 14.1 Nachtrag: bewusste Abweichungen der Stufe-0-Umsetzung (`firnc0`)
 
 Hält fest, wo die Umsetzung enger ist als der Text oben — damit Spezifikation und
 Code nicht auseinanderlaufen.
 
-1. **Aggregate an Funktionsgrenzen.** Parameter und Rückgabewerte dürfen nur
-   *skalar* sein (Ganzzahl, `bool`, Zeiger) oder — beim Rückgabetyp — fehlen.
-   Structs und Arrays werden per Zeiger übergeben. Grund: die
-   System-V-Klassifikation zusammengesetzter Typen (INTEGER/SSE/MEMORY) ist
-   umfangreich und fehleranfällig. Der Compiler meldet dafür einen sauberen
-   Fehler, keinen Absturz.
+1. ~~**Aggregate an Funktionsgrenzen.**~~ **Gestrichen in Runde 2** (Modul
+   `kern`): Structs und Arrays sind als Parameter und als Rückgabewert erlaubt.
+   Die System-V-Klassifikation steht in `compiler/src/abi.rs`
+   (`ArgClass::{Integer, Memory, Sse}`, `classify`) und ist die einzige Wahrheit
+   über die Aufrufkonvention. Nachweis: `tests/100_agg_param_8.fi` bis
+   `tests/105_agg_wertsemantik.fi`.
+   **Zwei bewusste Abweichungen von System V bleiben** und sind hier
+   festgehalten (siehe auch Punkt 15):
+   * Aggregate der MEMORY-Klasse (> 16 Byte) werden als *versteckter Zeiger auf
+     eine Kopie des Aufrufers* übergeben statt als Stapelkopie.
+   * Rückgaben von Aggregaten laufen bereits **ab 9 Byte** über den versteckten
+     Zeiger in `rdi` (System V nutzt für 9–16 Byte `rax:rdx`); bis 8 Byte
+     liefert `rax` das Wort.
+   Beides ist für sich geschlossen (Aufrufer und Aufgerufener folgen derselben
+   Regel), aber **nicht** binärkompatibel zu C für diese Fälle.
 2. **Typlose Literale.** Es gibt **keinen** Vorgabetyp. `let x = 5` ist ein
    Fehler, `let x: i32 = 5` und `let x = 5 as i32` sind richtig. Kontext liefern:
    Typannotation, Zieltyp einer Zuweisung, Parametertyp, Rückgabetyp, `as`, der
@@ -923,18 +952,177 @@ Code nicht auseinanderlaufen.
 7. **`extern fn`** wird syntaktisch erkannt, aber mit klarem Fehler abgelehnt.
 8. **Rückgabewert des Programms.** `fn main() -> i32`; `_start` ruft `main` und
    übergibt das Ergebnis an `exit` (Exit-Code = Wert & 0xFF).
-9. **Höchstens 6 Funktionsparameter** (nur Registerargumente). Mehr meldet einen
-   sauberen Fehler mit Zeile/Spalte.
+9. ~~**Höchstens 6 Funktionsparameter.**~~ **Gestrichen in Runde 2** (Modul
+   `kern`): Argumente ab dem siebten INTEGER-Wort werden vor dem `call` bei
+   `[rsp+8k]` abgelegt, die 16-Byte-Ausrichtung bleibt erhalten; der
+   Aufgerufene liest sie bei `[rbp+16+8k]`. Nachweis:
+   `tests/108_stapelargumente.fi` und der Codegen-Test
+   `stapelargumente_ab_dem_siebten_wort`.
 10. **Parameter sind unveränderlich** (wie `let`-Bindungen).
-11. **Kein Wiederholungsliteral `[wert; N]`** — Arrays werden elementweise
-    initialisiert.
+11. ~~**Kein Wiederholungsliteral `[wert; N]`.**~~ **Gestrichen in Runde 2**
+    (Modul `kern`): `[wert; N]` gibt es, `N` ist ein konstanter Ausdruck. Der
+    Wert wird genau einmal ausgewertet; bis 8 Elemente entrollt das Lowering,
+    darüber entsteht eine Schleife. Nachweis:
+    `tests/109_wiederholungsliteral.fi`.
 12. **`as` bindet stärker als die unären Operatoren.** `&s.a as u64` bedeutet
     `&(s.a as u64)`; gemeint ist `(&s.a) as u64`.
-13. **Kein `break`/`continue`** — Schleifen werden über eine Bedingungsvariable
-    verlassen.
+13. ~~**Kein `break`/`continue`.**~~ **Gestrichen in Runde 2** (Modul `kern`):
+    `break`, `continue` und `for i in a..b` gibt es; die Entzuckerung findet
+    ausschließlich im Lowering statt (`continue` springt in einer `for`-Schleife
+    auf den Fortschaltblock, nicht auf den Kopf). Außerhalb einer Schleife ist
+    `break`/`continue` ein Fehler mit Zeile/Spalte. Nachweis:
+    `tests/106_for_schleife.fi`, `tests/107_break_continue.fi`,
+    `tests/neg/kern_break_ausserhalb.fi`.
 14. **Assembler-Ausgabe** ist Intel-Syntax mit `.intel_syntax noprefix`. `as` und
     `ld` werden ausschließlich als Assembler bzw. Linker aufgerufen, nie ein
     C-Compiler.
+15. **Modulsystem (Runde 2, Modul `kern`).** `import pfad.modul`,
+    `export { a, b }` und `modul.name` gibt es; mehrere `.fi`-Dateien werden zu
+    **einem** Binary übersetzt. Umgesetzt ist *Gesamtprogramm-Übersetzung mit
+    getrennten Namensräumen* (Namen der Nicht-Wurzelmodule heißen intern
+    `modul__name`), **nicht** getrennte Objektdateien mit Schnittstellendateien.
+    Es gibt keine Paketverwaltung (`W1`, ABNAHME Punkt 5 bleibt offen).
+16. **Zeilennummern für den Debugger (Runde 2, Modul `kern`).** Der Compiler
+    schreibt `.file`/`.loc`-Direktiven; `as` erzeugt daraus `.debug_line`.
+    Anweisungsgenaue Zeilen gibt es **nur ohne Optimierer** (`--no-opt`), weil
+    die FIR keine Quellpositionen trägt und der Optimierer Instruktionen
+    entfernt und Blöcke neu nummeriert. Mit Optimierer bleibt die Zeile der
+    `fn`-Deklaration. Variablen zeigt `gdb` noch nicht (kein `.debug_info` für
+    lokale Namen).
+
+#### 14.1.types — Summentypen, Musterabgleich, Generics (Runde 2, Modul `types`)
+
+Mit Runde 2 setzt `firnc0` §6.3 (`L4`) und Generics (`L5`) um: `enum` mit
+Nutzdaten, `match` mit **Vollständigkeitsprüfung zur Übersetzungszeit**
+(fehlender Fall = Fehler mit Zeile/Spalte und Nennung der Variante),
+Sprungtabellen im Codegenerator und Monomorphisierung. Bewusst enger als der
+Text oben ist dabei Folgendes:
+
+T1. **`match` ist eine Anweisung, kein Ausdruck.** `let x = match e { .. }`
+    wird nicht unterstützt; jeder Fall hat einen Block als Rumpf. Grund: der
+    Ergebniswert eines Musterabgleichs verlangt eine Zusammenführung von
+    Werten (φ) im Lowering, die Stufe 0 nicht kennt. Zuweisung im Rumpf ist
+    der Ersatz.
+T2. **Eine Aufzählung darf nicht dem Wert nach in einem `struct` liegen.**
+    `struct S { a: E }` meldet einen Fehler mit Hinweis auf `*mut E`. Grund:
+    das Struct-Layout steht fest, bevor die Aufzählungen ausgelegt werden.
+    Aufzählung in Aufzählung ist dagegen erlaubt (verschachtelte Muster).
+T3. **Keine generischen Aufzählungen** (`enum Option[T]`). Generisch sind nur
+    Funktionen und Structs.
+T4. **Kein `match` im Rumpf einer generischen Vorlage.** Die Fallrümpfe liegen
+    außerhalb des AST und würden je Ausprägung nicht ersetzt; der Compiler
+    meldet das als Fehler statt still falschen Code zu erzeugen.
+T5. **Keine Alternativmuster** (`A | B`) und keine Wächter (`if`) im Muster.
+T6. **Aufzählungen und generische Vorlagen sind dateilokal.** `modul.E::V`
+    wird nicht aufgelöst; eine Aufzählung wird in der Datei benutzt, in der
+    sie steht (mehrere Dateien in einer Übersetzung sind erlaubt, solange die
+    Aufzählung nicht über die Dateigrenze angesprochen wird).
+T7. **Anforderungen an Typparameter** sind auf `Any`, `Int` und `Scalar`
+    beschränkt (kein Schnittstellensystem, §6.2 bleibt offen).
+T8. **Bereichsmuster** gelten nur für Ganzzahlen und sind auf ganzzahlige
+    Grenzen beschränkt (`1..4`, `4..=9`, `-5..=-1`).
+
+Speicherlayout einer Aufzählung (verbindlich, Grundlage für `tok` und die
+Fehlersuche): `__tag: u32` bei Offset 0, danach die Nutzdaten ab
+`round_up(4, payload_align)`; die Nutzdatenbereiche verschiedener Varianten
+**überlagern** sich, Größe und Ausrichtung ergeben sich aus der größten
+Variante (mindestens 4). Namensschema der Monomorphisierung: `name__T1_T2`.
+
+#### 14.1.str — Zeichenketten und Zahlen ↔ Text (Runde 2, Modul `str`)
+
+Mit Runde 2 sind §8.1–§8.4 umgesetzt: `Bytes`/`Str`/`Str16`/`Atom` mit dem in
+§8.1 festgelegten Layout, WTF-16 **ohne jede Prüfung**, WTF-8 als verlustfreie
+Brücke, korrekt gerundetes `strtod` und kürzeste Ausgabe mit
+Rückwandlungsgarantie. Bewusst enger als der Text oben ist Folgendes:
+
+S1. **Zeichenkettenliterale sind im Compiler vorhanden, aber noch nicht im
+    Lexer verdrahtet.** `compiler/src/strings.rs` entschlüsselt `"..."`
+    (UTF-8, geprüft), `b"..."` (`Bytes`) und `u"..."` (`Str16`) samt aller
+    Maskierungen einschließlich `\uXXXX` **mit ungepaarten Surrogaten**;
+    `firnc --strlit=<literal>` zeigt das Ergebnis. In `.fi`-Quelltext gibt es
+    weiterhin **keine** Zeichenkettenliterale — der Aufruf von
+    `strings::lex_string_literal` im Lexer ist eine Zeile und gehört dem Modul
+    `kern`. Bis dahin erzeugt `tools/strlib/expand.py` (`//#str name text`)
+    die Oktettfolgen für Testprogramme.
+S2. **Kein Gleitkommatyp in der Sprache.** `strtod` liefert und `dtoa`
+    verbraucht das **Bitmuster** eines `binary64` als `u64`. Die Rechnung ist
+    ohnehin vollständig ganzzahlig (exakte Großzahlarithmetik); sobald `f64`
+    existiert, kommt nur eine dünne Hülle darüber. Rundung und Sonderwerte
+    (`±0`, `±Infinity`, `NaN`) entsprechen IEEE-754 bzw. ECMAScript.
+S3. **`Bytes`/`Str`/`Str16`/`Atom` sind Bibliothekstypen** (`lib/str/*.fi`),
+    keine eingebauten Typen. Das Layout aus §8.1 ist eingehalten; die Trennung
+    erzwingt der Typprüfer, weil es verschiedene `struct`-Typen sind
+    (Negativtests `tests/neg/str_bytes_ist_kein_text.fi`,
+    `tests/neg/str16_ist_kein_bytes.fi`). `Str` ist `Bytes` mit geprüftem
+    Inhalt (`bytes_is_str`), kein eigener Typ — die Umdeutung von `Bytes` zu
+    `Str` ist damit noch nicht compilergeprüft.
+S4. **Die API ist zeigerbasiert.** Weil §14.1 Punkt 1 (keine Aggregate an
+    Funktionsgrenzen), Punkt 5 (keine globalen Variablen) und das fehlende
+    `inout`/`&` gelten, heißt der Konstruktor `str16_init(s: *mut Str16)`
+    statt `str16_new() -> Str16`, und `atom_intern` bekommt die Tabelle als
+    ersten Parameter. Die Namen `str16_push`, `str16_len`, `str16_at`,
+    `atom_intern` sind wie vereinbart unverändert.
+S5. **Kein eigener `Wtf8`-Typ.** WTF-8 ist eine `Bytes`-Darstellung mit den
+    Funktionen `str16_to_wtf8` / `wtf8_to_str16`.
+S6. **Kein `Rope`** (§8.5 ist ein SOLL ohne Termin).
+S7. **Atome bekommen ihre Nummern zur Laufzeit**, in der Reihenfolge des
+    Internierens (§8.3 sieht feste Nummern zur Bauzeit vor). Wer feste kleine
+    Nummern braucht, interniert seine Namen beim Start in fester Reihenfolge.
+S8. **`strtod` erkennt keine Sonderformen**: kein `Infinity`, kein `NaN`, kein
+    Hexadezimalgleitkomma, kein führender Leerraum. Solche Eingaben liefern
+    „nichts verbraucht" (`consumed == 0`).
+S9. **Über 780 signifikante Ziffern hinaus** wird ein Klebebit gesetzt statt
+    weiterzurechnen. Das Ergebnis bleibt korrekt gerundet (abgeschnittene
+    Ziffern können eine exakte Mitte nur verlassen, nie erzeugen).
+
+#### 14.1.opt — Optimierer und Registerzuteilung (Runde 2, Modul `opt`)
+
+O1. ~~**Keine Registerzuteilung, jeder Wert im Stack-Slot.**~~ **Gestrichen in
+    Runde 2** (Modul `opt`, Anforderung `P3`): `compiler/src/regalloc.rs`
+    enthaelt eine echte Zuteilung — Lebendigkeitsanalyse je Basisblock,
+    daraus ein Intervall je Wert, danach **linear scan** mit aktiver Liste und
+    gewichteter Auslagerung (Verwendungen x Schleifentiefe). Vergeben werden
+    `rbx`, `r12`–`r15` (callee-saved, in Prolog/Epilog gesichert) sowie
+    `r8`–`r11` fuer Intervalle, die keinen `call`/`syscall` einschliessen.
+    Der Satz in §14 („jedem FIR-Wert einen eigenen Stack-Slot … reines
+    Spilling") beschreibt ab Runde 2 nur noch den **Grundpfad**, der weiter
+    existiert und benutzt wird, wenn `emit_func_ra` nicht zustaendig ist
+    (siehe O2). Nachweis: `tests/opt/regalloc_loop.fi` — der Schleifenrumpf
+    im erzeugten Assembler enthaelt **keinen einzigen** Stackzugriff
+    (`bash test_opt.sh` prueft das).
+O2. **Zwei Codegen-Pfade.** Der registerbewusste Pfad uebernimmt nur, was er
+    vollstaendig beherrscht. Er gibt ab an den Grundpfad bei: mehr als sechs
+    Parametern oder Argumenten (Stapelargumente, §14.1 Punkt 9), unbekannter
+    Blocknummerierung und **eingeschalteten anweisungsgenauen Debugzeilen**
+    (`--no-opt`, §14.1 Punkt 16). Damit gilt: `--no-opt` erzeugt Code des
+    Grundpfades, ohne `--no-opt` Code des Registerpfades. Beide Pfade liefern
+    fuer jedes Testprogramm dasselbe Ergebnis — genau das prueft `test.sh`.
+O3. **Zellen im Register statt Phi-Knoten.** FIR hat keine Phi-Knoten (§8.1),
+    deshalb kann `mem2reg` nur `alloca`s aufloesen, in die **genau einmal**
+    geschrieben wird und deren `store` alle `load`s dominiert. Mehrfach
+    geschriebene Zellen (Schleifenzaehler!) loest stattdessen der
+    Registerzuteiler auf: eine nicht entkommende `alloca` bis 8 Byte mit
+    einheitlicher Zugriffsbreite lebt ueber die ganze Funktion in einem
+    Register. Das ist funktional gleichwertig, aber lokaler als echtes SSA.
+O4. **Leistungsziel §10.3 (`P1`, ≤ 2x Rust) noch nicht erreicht.** Gemessen am
+    13.08.2026 mit `bash bench/run.sh` (6 Mikrobenchmarks, je doppelt in Firn
+    und in Rust `-O`, Median aus 7 Laeufen): **Median 2,75x**, Spanne 1,57x
+    (Fibonacci) bis 4,95x (Matrixmultiplikation). Die Zahlen stehen in
+    `bench/RESULTS.md`, `README.md` und `ABNAHME.md` — nicht geschoent. Der
+    Abstand entsteht vor allem dort, wo LLVM vektorisiert (Sieb, Matmul);
+    Firn erzeugt ausschliesslich skalaren Code (kein SIMD, `L16` offen).
+O5. **Bereichspruefungen (`P5`).** Die Sprache erzeugt in Stufe 0 gar keine
+    Bereichspruefungen (§14.1 Punkt 3). Der vorhandene Durchgang entfernt
+    stattdessen **beweisbar wiederholte Bedingungen**: ein `brcond`, dessen
+    Bedingung auf dem Weg dorthin schon entschieden wurde (Kette von
+    Bloecken mit genau einem Vorgaenger), wird zum unbedingten Sprung.
+    Nachweis: `tests/opt/redundant_check.fi`.
+O6. **Inlining ueber Modulgrenzen** ergibt sich daraus, dass das Modulsystem
+    (§14.1 Punkt 15) alle Dateien in EIN `fir::Module` uebersetzt; ein
+    importierter Aufruf ist fuer den Durchgang nicht von einem lokalen zu
+    unterscheiden. Rekursion (auch indirekt) wird nie eingebettet,
+    `#[constant_time]`-Funktionen und Funktionen mit `secret`-Werten bleiben
+    aussen vor.
 
 ---
 
