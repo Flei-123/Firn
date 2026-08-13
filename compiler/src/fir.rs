@@ -165,6 +165,17 @@ pub enum Op {
     Syscall { args: Vec<Val> },
     /// Blockweise Kopie (Structs/Arrays); kein Ergebniswert
     CopyMem { dst: Val, src: Val, size: u64 },
+    #[allow(dead_code)] // wird vom Modul `ct` verdrahtet, dann entfernen
+    /// Datenunabhaengige Auswahl (SPEC §9.3): `cond ? a : b`, im Backend `cmov`.
+    /// KEIN Durchgang darf daraus eine Verzweigung machen (SPEC §9.2).
+    Select { cond: Val, a: Val, b: Val },
+    #[allow(dead_code)] // wird vom Modul `ct` verdrahtet, dann entfernen
+    /// Undurchsichtige Sperre (`barrier(inout x)`): liefert den Wert unveraendert
+    /// zurueck, gilt aber fuer jeden Durchgang als undurchschaubar.
+    Barrier { val: Val },
+    #[allow(dead_code)] // wird vom Modul `ct` verdrahtet, dann entfernen
+    /// `secure_zero(inout buf)`: nullt `size` Bytes ab `addr`. Gilt NIE als tot.
+    SecureZero { addr: Val, size: Val },
 }
 
 impl Op {
@@ -179,8 +190,14 @@ impl Op {
             | Op::Cast { .. }
             | Op::PtrAdd { .. }
             | Op::Load { .. }
-            | Op::Alloca { .. } => true,
-            Op::Store { .. } | Op::Call { .. } | Op::Syscall { .. } | Op::CopyMem { .. } => false,
+            | Op::Alloca { .. }
+            | Op::Select { .. } => true,
+            Op::Store { .. }
+            | Op::Call { .. }
+            | Op::Syscall { .. }
+            | Op::CopyMem { .. }
+            | Op::Barrier { .. }
+            | Op::SecureZero { .. } => false,
         }
     }
 
@@ -212,6 +229,16 @@ impl Op {
                 out.push(*dst);
                 out.push(*src);
             }
+            Op::Select { cond, a, b } => {
+                out.push(*cond);
+                out.push(*a);
+                out.push(*b);
+            }
+            Op::Barrier { val } => out.push(*val),
+            Op::SecureZero { addr, size } => {
+                out.push(*addr);
+                out.push(*size);
+            }
         }
     }
 
@@ -228,6 +255,12 @@ pub struct Inst {
 pub enum Term {
     Br(BlockId),
     BrCond { cond: Val, then_bb: BlockId, else_bb: BlockId },
+    #[allow(dead_code)] // wird vom Modul `types` verdrahtet, dann entfernen
+    /// Mehrfachverzweigung ueber einen Ganzzahlwert (SPEC §6.3, `P4`).
+    /// `cases` ist nach Marke aufsteigend sortiert und duplikatfrei; jeder
+    /// nicht genannte Wert geht nach `default`. Das Backend darf daraus eine
+    /// Sprungtabelle machen, muss aber nicht.
+    Switch { val: Val, ty: FTy, cases: Vec<(i128, BlockId)>, default: BlockId },
     Ret(Option<Val>),
     /// Nur waehrend des Aufbaus; darf am Ende des Lowerings nicht mehr
     /// vorkommen (Invariante: jeder Block hat einen echten Terminator).
@@ -239,6 +272,11 @@ impl Term {
         match self {
             Term::Br(b) => vec![*b],
             Term::BrCond { then_bb, else_bb, .. } => vec![*then_bb, *else_bb],
+            Term::Switch { cases, default, .. } => {
+                let mut v: Vec<BlockId> = cases.iter().map(|(_, b)| *b).collect();
+                v.push(*default);
+                v
+            }
             Term::Ret(_) | Term::Unset => vec![],
         }
     }
@@ -259,6 +297,13 @@ pub struct Func {
     pub blocks: Vec<Block>,
     /// Typ jedes jemals vergebenen Wertes, indiziert mit der Val-Id.
     pub val_types: Vec<FTy>,
+    /// Werte, die aus `secret[T]` stammen (SPEC §9.2). Der Optimierer und der
+    /// Codegenerator behandeln sie gesondert: keine Verzweigung, kein
+    /// datenabhaengiger Zugriff, kein Entfernen von Schreibvorgaengen.
+    pub secret: std::collections::HashSet<Val>,
+    /// `#[constant_time]`: der Codegenerator bricht ab, wenn ein bedingter
+    /// Sprung von einem `secret`-Wert abhaengt.
+    pub constant_time: bool,
 }
 
 impl Func {
@@ -272,6 +317,8 @@ impl Func {
             ret,
             blocks: vec![Block { id: 0, insts: Vec::new(), term: Term::Unset }],
             val_types,
+            secret: std::collections::HashSet::new(),
+            constant_time: false,
         }
     }
 
@@ -326,6 +373,16 @@ impl Func {
 
     pub fn is_terminated(&self, b: BlockId) -> bool {
         !matches!(self.blocks[b as usize].term, Term::Unset)
+    }
+
+    /// Markiert einen Wert als geheim (SPEC §9.1).
+    #[allow(dead_code)] // wird vom Modul `ct` verdrahtet, dann entfernen
+    pub fn set_secret(&mut self, v: Val) {
+        self.secret.insert(v);
+    }
+
+    pub fn is_secret(&self, v: Val) -> bool {
+        self.secret.contains(&v)
     }
 
     pub fn val_ty(&self, v: Val) -> FTy {
@@ -405,6 +462,9 @@ fn fmt_inst(i: &Inst) -> String {
         Op::Call { name, args } => format!("call.{} @{}({})", t, name, vlist(args)),
         Op::Syscall { args } => format!("syscall.{} {}", t, vlist(args)),
         Op::CopyMem { dst, src, size } => format!("copymem %{}, %{}, size={}", dst, src, size),
+        Op::Select { cond, a, b } => format!("select.{} %{}, %{}, %{}", t, cond, a, b),
+        Op::Barrier { val } => format!("barrier.{} %{}", t, val),
+        Op::SecureZero { addr, size } => format!("secure_zero %{}, %{}", addr, size),
     };
     format!("{}{}", head, body)
 }
@@ -414,6 +474,11 @@ fn fmt_term(t: &Term) -> String {
         Term::Br(b) => format!("br bb{}", b),
         Term::BrCond { cond, then_bb, else_bb } => {
             format!("brcond %{}, bb{}, bb{}", cond, then_bb, else_bb)
+        }
+        Term::Switch { val, ty, cases, default } => {
+            let arms: Vec<String> =
+                cases.iter().map(|(k, b)| format!("{} => bb{}", k, b)).collect();
+            format!("switch.{} %{} [{}] default bb{}", ty.name(), val, arms.join(", "), default)
         }
         Term::Ret(Some(v)) => format!("ret %{}", v),
         Term::Ret(None) => "ret".to_string(),
