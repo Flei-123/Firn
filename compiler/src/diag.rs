@@ -13,8 +13,11 @@
 
 /// Quelltextposition. `line`/`col` sind 1-basiert, `col` und `len` zaehlen
 /// ZEICHEN (nicht Bytes), damit die Markierung unter UTF-8 stimmt.
+/// `file` ist die Nummer der Quelldatei in der Quelltextkarte der `Diags`
+/// (0 = Wurzeldatei). Programme aus einer einzigen Datei benutzen immer 0.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Span {
+    pub file: u32,
     pub line: u32,
     pub col: u32,
     pub len: u32,
@@ -23,6 +26,16 @@ pub struct Span {
 impl Span {
     pub fn new(line: u32, col: u32, len: u32) -> Span {
         Span {
+            file: 0,
+            line,
+            col,
+            len: if len == 0 { 1 } else { len },
+        }
+    }
+    /// Position in einer bestimmten Quelldatei (Modulsystem, `modules.rs`).
+    pub fn in_file(file: u32, line: u32, col: u32, len: u32) -> Span {
+        Span {
+            file,
             line,
             col,
             len: if len == 0 { 1 } else { len },
@@ -31,6 +44,7 @@ impl Span {
     /// Platzhalterposition fuer Diagnosen ohne echten Ort.
     pub fn none() -> Span {
         Span {
+            file: 0,
             line: 0,
             col: 0,
             len: 1,
@@ -49,10 +63,16 @@ pub struct Diag {
     pub note: Option<String>,
 }
 
-/// Sammelt Diagnosen fuer EINE Uebersetzungseinheit.
-pub struct Diags {
-    file: String,
+/// Eine Quelldatei in der Quelltextkarte.
+struct SourceFileEntry {
+    name: String,
     lines: Vec<String>,
+}
+
+/// Sammelt Diagnosen fuer eine Uebersetzung. Seit dem Modulsystem kann eine
+/// Uebersetzung aus mehreren Dateien bestehen; `Span::file` waehlt die Datei.
+pub struct Diags {
+    files: Vec<SourceFileEntry>,
     items: Vec<Diag>,
     /// Obergrenze, damit kaputte Eingaben keine Fehlerlawine erzeugen.
     max: usize,
@@ -76,12 +96,34 @@ fn expand_tabs(s: &str) -> String {
 
 impl Diags {
     pub fn new(file: &str, src: &str) -> Diags {
-        Diags {
-            file: file.to_string(),
-            lines: src.split('\n').map(|l| l.trim_end_matches('\r').to_string()).collect(),
+        let mut d = Diags {
+            files: Vec::new(),
             items: Vec::new(),
             max: 40,
-        }
+        };
+        d.add_file(file, src);
+        d
+    }
+
+    /// Nimmt eine weitere Quelldatei in die Karte auf und liefert ihre Nummer.
+    pub fn add_file(&mut self, file: &str, src: &str) -> u32 {
+        let id = self.files.len() as u32;
+        self.files.push(SourceFileEntry {
+            name: file.to_string(),
+            lines: src
+                .split('\n')
+                .map(|l| l.trim_end_matches('\r').to_string())
+                .collect(),
+        });
+        id
+    }
+
+    /// Name der Quelldatei mit der Nummer `file`.
+    pub fn file_name(&self, file: u32) -> &str {
+        self.files
+            .get(file as usize)
+            .map(|f| f.name.as_str())
+            .unwrap_or("<unbekannt>")
     }
 
     /// Fehler mit Standardmarkierung ("hier").
@@ -102,6 +144,11 @@ impl Diags {
             label: "hier".to_string(),
             note: Some(note.into()),
         });
+    }
+
+    /// Nimmt eine anderswo gebaute Diagnose auf (z. B. aus der Modulaufloesung).
+    pub fn report(&mut self, d: Diag) {
+        self.push(d);
     }
 
     fn push(&mut self, d: Diag) {
@@ -128,15 +175,18 @@ impl Diags {
         self.items.len() >= self.max
     }
     pub fn file(&self) -> &str {
-        &self.file
+        self.file_name(0)
     }
 
-    /// Die Quelltextzeile (1-basiert) ohne Zeilenende, oder "".
-    pub fn source_line(&self, line: u32) -> &str {
+    /// Die Quelltextzeile (1-basiert) einer Datei der Karte, ohne Zeilenende.
+    pub fn source_line_in(&self, file: u32, line: u32) -> &str {
         if line == 0 {
             return "";
         }
-        self.lines.get((line - 1) as usize).map(|s| s.as_str()).unwrap_or("")
+        match self.files.get(file as usize) {
+            Some(f) => f.lines.get((line - 1) as usize).map(|s| s.as_str()).unwrap_or(""),
+            None => "",
+        }
     }
 
     /// Alle gesammelten Diagnosen als Text.
@@ -154,8 +204,9 @@ impl Diags {
     fn render_one(&self, d: &Diag) -> String {
         let mut out = String::new();
         out.push_str(&format!("error: {}\n", d.msg));
+        let fname = self.file_name(d.span.file);
         if d.span.is_none() {
-            out.push_str(&format!("  --> {}\n", self.file));
+            out.push_str(&format!("  --> {}\n", fname));
             if let Some(n) = &d.note {
                 out.push_str(&format!("  hinweis: {}\n", n));
             }
@@ -166,10 +217,10 @@ impl Diags {
         let pad = " ".repeat(w + 1);
         out.push_str(&format!(
             "{}--> {}:{}:{}\n",
-            pad, self.file, d.span.line, d.span.col
+            pad, fname, d.span.line, d.span.col
         ));
         out.push_str(&format!("{} |\n", pad));
-        let raw = self.source_line(d.span.line);
+        let raw = self.source_line_in(d.span.file, d.span.line);
         let shown = expand_tabs(raw);
         out.push_str(&format!("{:>w$} | {}\n", nstr, shown, w = w + 1));
         // Spaltenversatz unter Beruecksichtigung expandierter Tabulatoren.

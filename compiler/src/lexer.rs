@@ -29,6 +29,15 @@ pub enum TokKind {
     KwFalse,
     KwSyscall,
     KwExtern,
+    KwBreak,
+    KwContinue,
+    KwFor,
+    KwIn,
+    KwImport,
+    KwExport,
+    /// Summentypen (SPEC §6.3) — verdrahtet vom Modul `types`.
+    KwEnum,
+    KwMatch,
     // Satzzeichen
     LParen,
     RParen,
@@ -40,6 +49,7 @@ pub enum TokKind {
     Colon,
     Semi,
     Dot,
+    DotDot,  // ..
     Arrow,   // ->
     Assign,  // =
     Plus,
@@ -86,6 +96,14 @@ impl TokKind {
             TokKind::KwFalse => "false".into(),
             TokKind::KwSyscall => "syscall".into(),
             TokKind::KwExtern => "extern".into(),
+            TokKind::KwBreak => "break".into(),
+            TokKind::KwContinue => "continue".into(),
+            TokKind::KwFor => "for".into(),
+            TokKind::KwIn => "in".into(),
+            TokKind::KwImport => "import".into(),
+            TokKind::KwExport => "export".into(),
+            TokKind::KwEnum => "enum".into(),
+            TokKind::KwMatch => "match".into(),
             TokKind::LParen => "(".into(),
             TokKind::RParen => ")".into(),
             TokKind::LBrace => "{".into(),
@@ -96,6 +114,7 @@ impl TokKind {
             TokKind::Colon => ":".into(),
             TokKind::Semi => ";".into(),
             TokKind::Dot => ".".into(),
+            TokKind::DotDot => "..".into(),
             TokKind::Arrow => "->".into(),
             TokKind::Assign => "=".into(),
             TokKind::Plus => "+".into(),
@@ -147,6 +166,14 @@ fn keyword(word: &str) -> Option<TokKind> {
         "false" => TokKind::KwFalse,
         "syscall" => TokKind::KwSyscall,
         "extern" => TokKind::KwExtern,
+        "break" => TokKind::KwBreak,
+        "continue" => TokKind::KwContinue,
+        "for" => TokKind::KwFor,
+        "in" => TokKind::KwIn,
+        "import" => TokKind::KwImport,
+        "export" => TokKind::KwExport,
+        "enum" => TokKind::KwEnum,
+        "match" => TokKind::KwMatch,
         _ => return None,
     })
 }
@@ -161,6 +188,8 @@ fn is_ident_cont(c: char) -> bool {
 struct Lexer<'a> {
     chars: Vec<char>,
     pos: usize,
+    /// Nummer der Quelldatei in der Karte der `Diags` (Modulsystem).
+    file: u32,
     line: u32,
     col: u32,
     dg: &'a mut Diags,
@@ -187,7 +216,11 @@ impl<'a> Lexer<'a> {
         Some(c)
     }
     fn push(&mut self, kind: TokKind, line: u32, col: u32, len: u32) {
-        self.out.push(Token { kind, span: Span::new(line, col, len) });
+        self.out.push(Token { kind, span: Span::in_file(self.file, line, col, len) });
+    }
+
+    fn sp(&self, line: u32, col: u32, len: u32) -> Span {
+        Span::in_file(self.file, line, col, len)
     }
 
     /// Whitespace und Kommentare ueberspringen. Meldet nicht geschlossene
@@ -215,7 +248,7 @@ impl<'a> Lexer<'a> {
                         match self.peek() {
                             None => {
                                 self.dg.error(
-                                    Span::new(sl, sc, 2),
+                                    self.sp(sl, sc, 2),
                                     "blockkommentar wird nicht geschlossen ('*/' fehlt)",
                                 );
                                 break;
@@ -282,7 +315,7 @@ impl<'a> Lexer<'a> {
         let len = ncols.max(1);
         if let Some((c, bl, bc)) = bad_digit {
             self.dg.error(
-                Span::new(bl, bc, 1),
+                self.sp(bl, bc, 1),
                 format!("ungueltiges zeichen '{}' in einem ganzzahlliteral zur basis {}", c, radix),
             );
             self.push(TokKind::Int(0), line, col, len);
@@ -290,7 +323,7 @@ impl<'a> Lexer<'a> {
         }
         if digits.is_empty() {
             self.dg.error(
-                Span::new(line, col, len),
+                self.sp(line, col, len),
                 format!("ganzzahlliteral ohne ziffern (basis {})", radix),
             );
             self.push(TokKind::Int(0), line, col, len);
@@ -306,7 +339,7 @@ impl<'a> Lexer<'a> {
                 Some(v) if v <= u64::MAX as i128 => val = v,
                 _ => {
                     self.dg.error(
-                        Span::new(line, col, len),
+                        self.sp(line, col, len),
                         "ganzzahlliteral ist zu gross (mehr als 64 bit)",
                     );
                     self.push(TokKind::Int(0), line, col, len);
@@ -343,6 +376,7 @@ impl<'a> Lexer<'a> {
         let n = self.peek2();
         let (kind, width) = match (c, n) {
             ('-', Some('>')) => (TokKind::Arrow, 2),
+            ('.', Some('.')) => (TokKind::DotDot, 2),
             ('<', Some('<')) => (TokKind::Shl, 2),
             ('>', Some('>')) => (TokKind::Shr, 2),
             ('&', Some('&')) => (TokKind::AndAnd, 2),
@@ -396,7 +430,7 @@ impl<'a> Lexer<'a> {
             } else if !self.punct() {
                 let (line, col) = (self.line, self.col);
                 self.dg.error(
-                    Span::new(line, col, 1),
+                    self.sp(line, col, 1),
                     format!("unbekanntes zeichen '{}' im quelltext", c),
                 );
                 // Weiterlexen: das stoerende Zeichen wird uebersprungen.
@@ -409,9 +443,15 @@ impl<'a> Lexer<'a> {
 }
 
 pub fn lex(src: &str, dg: &mut Diags) -> Vec<Token> {
+    lex_file(src, 0, dg)
+}
+
+/// Wie `lex`, aber fuer eine bestimmte Quelldatei der Karte (Modulsystem).
+pub fn lex_file(src: &str, file: u32, dg: &mut Diags) -> Vec<Token> {
     let mut lx = Lexer {
         chars: src.chars().collect(),
         pos: 0,
+        file,
         line: 1,
         col: 1,
         dg,

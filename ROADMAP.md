@@ -85,6 +85,25 @@ Was der Browser vom *Sprachkern* verlangt, ohne Laufzeit und ohne Bibliothek.
 * Testrunner mit maschinenlesbarer Ausgabe (`W2`)
 * **Aufwand:** Monate, nicht Wochen. Das ist der eigentliche Brocken.
 
+**Zwischenstand 13.08.2026 (Runde 2 zusammengeführt), ehrlich:**
+
+| Punkt der Liste oben | Stand |
+|---|---|
+| Summentypen + `match` + Sprungtabellen | **fertig und geprüft** |
+| Generics (Monomorphisierung) | **fertig und geprüft** |
+| Zeichenketten `Bytes`/`Str`/`Str16`/`Atom`, `strtod`, kürzeste Ausgabe | **fertig** (ohne Stringliterale im Lexer) |
+| Optimierer + gemessener Rust-Vergleich | **fertig, Ziel verfehlt**: Median 2,8×–3,4× statt ≤ 2× |
+| `secret[T]`, `#[constant_time]`, `u128` | **nicht begonnen** |
+| `Rc`/`Gc`/`gc class`/`#[no_gc]` | **nicht begonnen** |
+| `break`/`continue`, `for` | fertig; `defer`, `drop`, Move-Prüfer, Referenztypen: nicht begonnen |
+| Härtetest 1 (HTML5-Tokenizer) | **nicht begonnen — 0 von 6.810 Fällen** |
+| Härtetest 2 (DOM-Dauerlauf) | **nicht begonnen** |
+| Testrunner mit maschinenlesbarer Ausgabe (`W2`) | **fertig** (`tools/testrunner`, JSON) |
+
+Vorgezogen aus Phase 3, weil ohne sie kein Tokenizer schreibbar ist:
+**Modulsystem** (`import`/`export`) und `.debug_line` für `gdb`.
+Zahlen und Befehle stehen in `ABNAHME.md`, die Reproduktion in `RUN.md`.
+
 ## Phase 3 — v0.3: Module, `comptime`, Standardbibliothek
 
 * Modulsystem, `import`, `export`-Listen, getrennte Übersetzung
