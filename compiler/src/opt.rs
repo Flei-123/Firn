@@ -228,6 +228,17 @@ fn simplify_terminators(f: &mut Func) -> bool {
                 b.term = Term::Br(if c != 0 { then_bb } else { else_bb });
                 changed = true;
             }
+        } else if let Term::Switch { val, cases, default, .. } = &b.term {
+            // Konstante Marke: direkt zum passenden Zweig springen.
+            if let Some(&c) = consts.get(val) {
+                let t = cases.iter().find(|(k, _)| *k == c).map(|(_, t)| *t).unwrap_or(*default);
+                b.term = Term::Br(t);
+                changed = true;
+            } else if cases.iter().all(|(_, t)| *t == *default) {
+                let d = *default;
+                b.term = Term::Br(d);
+                changed = true;
+            }
         }
     }
     changed
@@ -253,6 +264,9 @@ fn collect_uses(f: &Func, blocks: &[usize]) -> HashSet<Val> {
             }
             Term::Ret(Some(v)) => {
                 used.insert(*v);
+            }
+            Term::Switch { val, .. } => {
+                used.insert(*val);
             }
             Term::Br(_) | Term::Ret(None) | Term::Unset => {}
         }
@@ -323,6 +337,12 @@ fn remove_unreachable_blocks(f: &mut Func, st: &mut OptStats) -> bool {
             Term::BrCond { cond, then_bb, else_bb } => {
                 Term::BrCond { cond: *cond, then_bb: new_id[then_bb], else_bb: new_id[else_bb] }
             }
+            Term::Switch { val, ty, cases, default } => Term::Switch {
+                val: *val,
+                ty: *ty,
+                cases: cases.iter().map(|(k, t)| (*k, new_id[t])).collect(),
+                default: new_id[default],
+            },
             other => other.clone(),
         };
     }

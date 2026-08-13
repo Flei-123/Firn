@@ -22,12 +22,12 @@ use crate::fir::{BinOp, Block, CmpOp, FTy, Func, Inst, Module, Op, Term, UnOp, V
 use std::fmt::Write as _;
 
 /// Argumentregister der System-V-AMD64-Aufrufkonvention.
-const ARG_REGS: [&str; 6] = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
+pub(crate) const ARG_REGS: [&str; 6] = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
 /// Argumentregister des Linux-Syscall-ABI (nach der Nummer in rax).
 const SYS_REGS: [&str; 6] = ["rdi", "rsi", "rdx", "r10", "r8", "r9"];
 
 /// Registername in der Breite `bits` (nur fuer rax/rcx/rdx noetig).
-fn reg(name: &str, bits: u32) -> &'static str {
+pub(crate) fn reg(name: &str, bits: u32) -> &'static str {
     match (name, bits) {
         ("rax", 8) => "al",
         ("rax", 16) => "ax",
@@ -45,7 +45,7 @@ fn reg(name: &str, bits: u32) -> &'static str {
 }
 
 /// Groessenwort fuer Speicheroperanden.
-fn size_word(bits: u32) -> &'static str {
+pub(crate) fn size_word(bits: u32) -> &'static str {
     match bits {
         8 => "byte ptr",
         16 => "word ptr",
@@ -63,12 +63,12 @@ fn align_up(x: u64, a: u64) -> u64 {
 }
 
 /// Rahmenaufteilung einer Funktion.
-struct Frame {
+pub(crate) struct Frame {
     /// Slot-Offset je Wert-Id (Adresse = rbp - off).
-    slot: Vec<u64>,
+    pub(crate) slot: Vec<u64>,
     /// Offset des Speichers je `alloca`-Wert (Adresse = rbp - off).
-    alloca_off: Vec<Option<u64>>,
-    size: u64,
+    pub(crate) alloca_off: Vec<Option<u64>>,
+    pub(crate) size: u64,
 }
 
 fn layout(f: &Func) -> Frame {
@@ -101,15 +101,15 @@ fn layout(f: &Func) -> Frame {
     Frame { slot, alloca_off, size: align_up(cursor, 16) }
 }
 
-struct Emitter {
-    out: String,
+pub(crate) struct Emitter {
+    pub(crate) out: String,
 }
 
 impl Emitter {
-    fn line(&mut self, s: &str) {
+    pub(crate) fn line(&mut self, s: &str) {
         let _ = writeln!(self.out, "    {}", s);
     }
-    fn raw(&mut self, s: &str) {
+    pub(crate) fn raw(&mut self, s: &str) {
         let _ = writeln!(self.out, "{}", s);
     }
 }
@@ -120,7 +120,7 @@ fn label(name: &str) -> String {
     name.to_string()
 }
 
-fn block_label(fname: &str, b: u32) -> String {
+pub(crate) fn block_label(fname: &str, b: u32) -> String {
     format!(".L{}__bb{}", fname, b)
 }
 
@@ -190,7 +190,16 @@ fn emit_block(e: &mut Emitter, f: &Func, fr: &Frame, b: &Block) -> Result<(), St
     }
     match &b.term {
         Term::Br(t) => e.line(&format!("jmp {}", block_label(&f.name, *t))),
+        Term::Switch { .. } => crate::codegen_switch::emit_switch(e, f, fr, &b.term)?,
         Term::BrCond { cond, then_bb, else_bb } => {
+            // SPEC §9.2: in `#[constant_time]`-Funktionen darf kein bedingter
+            // Sprung von einem geheimen Wert abhaengen — harter Abbruch.
+            if f.constant_time && f.is_secret(*cond) {
+                return Err(format!(
+                    "#[constant_time]: bedingter Sprung in '{}' haengt von einem secret-Wert (%{}) ab",
+                    f.name, cond
+                ));
+            }
             if f.val_ty(*cond) != FTy::Bool {
                 return Err(format!(
                     "interner Fehler: Bedingung %{} in '{}' ist {}, erwartet bool",
@@ -225,12 +234,12 @@ fn emit_block(e: &mut Emitter, f: &Func, fr: &Frame, b: &Block) -> Result<(), St
 }
 
 /// Laedt den kompletten 8-Byte-Slot eines Wertes in ein Register.
-fn load_full(e: &mut Emitter, fr: &Frame, r: &str, v: Val) {
+pub(crate) fn load_full(e: &mut Emitter, fr: &Frame, r: &str, v: Val) {
     e.line(&format!("mov {}, qword ptr [rbp-{}]", r, fr.slot[v as usize]));
 }
 
 /// Laedt einen Wert vorzeichen-/nullerweitert auf `to_bits` (32 oder 64).
-fn load_ext(e: &mut Emitter, fr: &Frame, r: &str, v: Val, ty: FTy, to_bits: u32) {
+pub(crate) fn load_ext(e: &mut Emitter, fr: &Frame, r: &str, v: Val, ty: FTy, to_bits: u32) {
     let off = fr.slot[v as usize];
     let bits = ty.bits().max(8);
     if bits >= to_bits {
@@ -250,7 +259,7 @@ fn load_ext(e: &mut Emitter, fr: &Frame, r: &str, v: Val, ty: FTy, to_bits: u32)
 }
 
 /// Schreibt rax (voll) in den Slot des Zielwertes.
-fn store_dst(e: &mut Emitter, fr: &Frame, d: Val, r: &str) {
+pub(crate) fn store_dst(e: &mut Emitter, fr: &Frame, d: Val, r: &str) {
     e.line(&format!("mov qword ptr [rbp-{}], {}", fr.slot[d as usize], r));
 }
 
@@ -387,6 +396,31 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
             if let Some(d) = i.dst {
                 store_dst(e, fr, d, "rax");
             }
+        }
+        Op::Select { cond, a, b } => {
+            // Datenunabhaengige Auswahl: `cmov`, niemals ein Sprung (SPEC §9.2).
+            let d = i.dst.ok_or("interner Fehler: select ohne Ziel")?;
+            load_full(e, fr, "rdx", *cond);
+            load_full(e, fr, "rax", *b);
+            load_full(e, fr, "rcx", *a);
+            e.line("test dl, dl");
+            e.line("cmovnz rax, rcx");
+            store_dst(e, fr, d, "rax");
+        }
+        Op::Barrier { val } => {
+            // Undurchsichtig: der Wert geht durch ein leeres asm-Nadeloehr.
+            let d = i.dst.ok_or("interner Fehler: barrier ohne Ziel")?;
+            load_full(e, fr, "rax", *val);
+            e.raw("    # barrier: undurchsichtig fuer jeden Optimierungsdurchgang");
+            store_dst(e, fr, d, "rax");
+        }
+        Op::SecureZero { addr, size } => {
+            // Byteweises Nullen; darf nie entfernt werden (SPEC §9.3 C3).
+            load_full(e, fr, "rdi", *addr);
+            load_full(e, fr, "rcx", *size);
+            e.line("xor eax, eax");
+            e.line("cld");
+            e.line("rep stosb");
         }
         Op::CopyMem { dst, src, size } => {
             load_full(e, fr, "rdi", *dst);
