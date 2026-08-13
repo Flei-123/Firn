@@ -37,6 +37,7 @@ struct Options {
     emit: Emit,
     optimize: bool,
     keep_asm: bool,
+    stats: bool,
 }
 
 fn usage() -> String {
@@ -56,6 +57,7 @@ fn usage() -> String {
          --emit=tokens      Tokenstrom (Fehlersuche)\n  \
          --emit=ast         AST als Debug-Text (Fehlersuche)\n  \
          --no-opt           Optimierer abschalten\n  \
+         --stats            Groesse der FIR ausgeben (Instruktionen/Bloecke)\n  \
          --keep-asm         erzeugte .s-Datei behalten\n  \
          --version          Version ausgeben\n  \
          -h, --help         diese Hilfe\n",
@@ -73,6 +75,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut emit = Emit::Exe;
     let mut optimize = true;
     let mut keep_asm = false;
+    let mut stats = false;
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -87,6 +90,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             }
             "--no-opt" => optimize = false,
             "--keep-asm" => keep_asm = true,
+            "--stats" => stats = true,
             "-o" => {
                 i += 1;
                 match args.get(i) {
@@ -122,7 +126,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         i += 1;
     }
     match input {
-        Some(input) => Ok(Options { input, output, emit, optimize, keep_asm }),
+        Some(input) => Ok(Options { input, output, emit, optimize, keep_asm, stats }),
         None => Err(format!("keine Eingabedatei angegeben (.{})", config::FILE_EXT)),
     }
 }
@@ -166,51 +170,64 @@ fn run(opts: &Options) -> i32 {
         return if dg.has_errors() { 1 } else { 0 };
     }
     if dg.has_errors() {
-        dg.print();
-        return 1;
+        return report(&dg);
     }
 
     // --- Parser ---
     let prog = parser::parse(&toks, &mut dg);
     if opts.emit == Emit::Ast && !dg.has_errors() {
         println!("{:#?}", prog);
+        println!("\n// Anweisungsuebersicht (Zeile:Spalte Art)");
+        for f in &prog.funcs {
+            println!("fn {}:", f.name);
+            for s in &f.body.stmts {
+                let sp = s.span();
+                println!("  {}:{} {}", sp.line, sp.col, s.kind_name());
+            }
+        }
         return 0;
     }
     if dg.has_errors() {
-        dg.print();
-        return 1;
+        return report(&dg);
     }
 
     // --- Typpruefer ---
     let info = match sema::check(&prog, &mut dg) {
         Some(i) => i,
         None => {
-            dg.print();
             if !dg.has_errors() {
                 eprintln!("error: interner Fehler im Typpruefer ohne Meldung");
+                return 1;
             }
-            return 1;
+            return report(&dg);
         }
     };
     if dg.has_errors() {
-        dg.print();
-        return 1;
+        return report(&dg);
     }
 
     // --- Lowering nach FIR ---
     let mut module = match lower::lower(&prog, &info, &mut dg) {
         Some(m) => m,
         None => {
-            dg.print();
             if !dg.has_errors() {
                 eprintln!("error: interner Fehler beim Lowering ohne Meldung");
+                return 1;
             }
-            return 1;
+            return report(&dg);
         }
     };
     if dg.has_errors() {
-        dg.print();
-        return 1;
+        return report(&dg);
+    }
+
+    if opts.stats {
+        eprintln!(
+            "fir (roh):  {} Funktionen, {} Bloecke, {} Instruktionen",
+            module.funcs.len(),
+            module.block_count(),
+            module.inst_count()
+        );
     }
 
     if opts.emit == Emit::FirRaw {
@@ -221,12 +238,21 @@ fn run(opts: &Options) -> i32 {
     // --- Optimierer ---
     if opts.optimize {
         let st = opt::optimize(&mut module);
-        if std::env::var("FIRNC_OPT_STATS").is_ok() {
+        if std::env::var(format!("{}_OPT_STATS", config::compiler_name().to_uppercase())).is_ok() {
             eprintln!(
                 "opt: {} Konstanten gefaltet, {} Instruktionen entfernt, {} Bloecke entfernt",
                 st.folded, st.removed_insts, st.removed_blocks
             );
         }
+    }
+
+    if opts.stats {
+        eprintln!(
+            "fir (opt):  {} Funktionen, {} Bloecke, {} Instruktionen",
+            module.funcs.len(),
+            module.block_count(),
+            module.inst_count()
+        );
     }
 
     if opts.emit == Emit::FirOpt {
@@ -235,7 +261,13 @@ fn run(opts: &Options) -> i32 {
     }
 
     // --- Codegen ---
-    let asm = codegen_x86::emit(&module);
+    let asm = match codegen_x86::emit(&module) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            return 1;
+        }
+    };
 
     let out = opts.output.clone().unwrap_or_else(|| default_output(path));
     if opts.emit == Emit::Asm {
@@ -261,6 +293,19 @@ fn run(opts: &Options) -> i32 {
         let _ = std::fs::remove_file(&asm_path);
     }
     0
+}
+
+/// Gibt alle gesammelten Fehler aus und liefert den Exit-Code.
+fn report(dg: &diag::Diags) -> i32 {
+    dg.print();
+    if dg.is_full() {
+        eprintln!(
+            "hinweis: weitere Fehler in '{}' wurden unterdrueckt ({} angezeigt)",
+            dg.file(),
+            dg.count()
+        );
+    }
+    1
 }
 
 fn default_output(input: &Path) -> PathBuf {

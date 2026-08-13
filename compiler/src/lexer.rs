@@ -128,9 +128,372 @@ pub struct Token {
     pub span: Span,
 }
 
-/// STUB — wird von Modul "frontend" implementiert.
+/// Schluesselwort oder Bezeichner.
+fn keyword(word: &str) -> Option<TokKind> {
+    Some(match word {
+        "fn" => TokKind::KwFn,
+        "let" => TokKind::KwLet,
+        "var" => TokKind::KwVar,
+        "if" => TokKind::KwIf,
+        "else" => TokKind::KwElse,
+        "while" => TokKind::KwWhile,
+        "return" => TokKind::KwReturn,
+        "struct" => TokKind::KwStruct,
+        "const" => TokKind::KwConst,
+        "profile" => TokKind::KwProfile,
+        "as" => TokKind::KwAs,
+        "mut" => TokKind::KwMut,
+        "true" => TokKind::KwTrue,
+        "false" => TokKind::KwFalse,
+        "syscall" => TokKind::KwSyscall,
+        "extern" => TokKind::KwExtern,
+        _ => return None,
+    })
+}
+
+fn is_ident_start(c: char) -> bool {
+    c == '_' || c.is_ascii_alphabetic()
+}
+fn is_ident_cont(c: char) -> bool {
+    c == '_' || c.is_ascii_alphanumeric()
+}
+
+struct Lexer<'a> {
+    chars: Vec<char>,
+    pos: usize,
+    line: u32,
+    col: u32,
+    dg: &'a mut Diags,
+    out: Vec<Token>,
+}
+
+impl<'a> Lexer<'a> {
+    fn peek(&self) -> Option<char> {
+        self.chars.get(self.pos).copied()
+    }
+    fn peek2(&self) -> Option<char> {
+        self.chars.get(self.pos + 1).copied()
+    }
+    /// Ein Zeichen weiter; fuehrt Zeile/Spalte nach.
+    fn bump(&mut self) -> Option<char> {
+        let c = self.chars.get(self.pos).copied()?;
+        self.pos += 1;
+        if c == '\n' {
+            self.line += 1;
+            self.col = 1;
+        } else {
+            self.col += 1;
+        }
+        Some(c)
+    }
+    fn push(&mut self, kind: TokKind, line: u32, col: u32, len: u32) {
+        self.out.push(Token { kind, span: Span::new(line, col, len) });
+    }
+
+    /// Whitespace und Kommentare ueberspringen. Meldet nicht geschlossene
+    /// Blockkommentare, lext danach aber weiter.
+    fn skip_trivia(&mut self) {
+        loop {
+            match self.peek() {
+                Some(c) if c.is_whitespace() => {
+                    self.bump();
+                }
+                Some('/') if self.peek2() == Some('/') => {
+                    while let Some(c) = self.peek() {
+                        if c == '\n' {
+                            break;
+                        }
+                        self.bump();
+                    }
+                }
+                Some('/') if self.peek2() == Some('*') => {
+                    let (sl, sc) = (self.line, self.col);
+                    self.bump();
+                    self.bump();
+                    let mut depth = 1usize;
+                    while depth > 0 {
+                        match self.peek() {
+                            None => {
+                                self.dg.error(
+                                    Span::new(sl, sc, 2),
+                                    "blockkommentar wird nicht geschlossen ('*/' fehlt)",
+                                );
+                                break;
+                            }
+                            Some('/') if self.peek2() == Some('*') => {
+                                self.bump();
+                                self.bump();
+                                depth += 1;
+                            }
+                            Some('*') if self.peek2() == Some('/') => {
+                                self.bump();
+                                self.bump();
+                                depth -= 1;
+                            }
+                            Some(_) => {
+                                self.bump();
+                            }
+                        }
+                    }
+                }
+                _ => return,
+            }
+        }
+    }
+
+    /// Zahl ab der aktuellen Position (Dezimal, 0x, 0b, '_' als Trenner).
+    fn number(&mut self) {
+        let (line, col) = (self.line, self.col);
+        let mut ncols = 0u32;
+        let mut digits = String::new();
+        let mut radix = 10u32;
+        // Praefix erkennen
+        if self.peek() == Some('0') {
+            match self.peek2() {
+                Some('x') | Some('X') => radix = 16,
+                Some('b') | Some('B') => radix = 2,
+                _ => {}
+            }
+            if radix != 10 {
+                self.bump();
+                self.bump();
+                ncols += 2;
+            }
+        }
+        let mut bad_digit: Option<(char, u32, u32)> = None;
+        while let Some(c) = self.peek() {
+            if c == '_' {
+                self.bump();
+                ncols += 1;
+                continue;
+            }
+            if c.is_ascii_alphanumeric() {
+                if c.is_digit(radix) {
+                    digits.push(c);
+                } else if bad_digit.is_none() {
+                    bad_digit = Some((c, self.line, self.col));
+                }
+                self.bump();
+                ncols += 1;
+                continue;
+            }
+            break;
+        }
+        let len = ncols.max(1);
+        if let Some((c, bl, bc)) = bad_digit {
+            self.dg.error(
+                Span::new(bl, bc, 1),
+                format!("ungueltiges zeichen '{}' in einem ganzzahlliteral zur basis {}", c, radix),
+            );
+            self.push(TokKind::Int(0), line, col, len);
+            return;
+        }
+        if digits.is_empty() {
+            self.dg.error(
+                Span::new(line, col, len),
+                format!("ganzzahlliteral ohne ziffern (basis {})", radix),
+            );
+            self.push(TokKind::Int(0), line, col, len);
+            return;
+        }
+        let mut val: i128 = 0;
+        for ch in digits.chars() {
+            let d = match ch.to_digit(radix) {
+                Some(d) => d as i128,
+                None => 0,
+            };
+            match val.checked_mul(radix as i128).and_then(|v| v.checked_add(d)) {
+                Some(v) if v <= u64::MAX as i128 => val = v,
+                _ => {
+                    self.dg.error(
+                        Span::new(line, col, len),
+                        "ganzzahlliteral ist zu gross (mehr als 64 bit)",
+                    );
+                    self.push(TokKind::Int(0), line, col, len);
+                    return;
+                }
+            }
+        }
+        self.push(TokKind::Int(val), line, col, len);
+    }
+
+    fn ident(&mut self) {
+        let (line, col) = (self.line, self.col);
+        let mut s = String::new();
+        while let Some(c) = self.peek() {
+            if is_ident_cont(c) {
+                s.push(c);
+                self.bump();
+            } else {
+                break;
+            }
+        }
+        let len = s.chars().count() as u32;
+        let kind = keyword(&s).unwrap_or(TokKind::Ident(s));
+        self.push(kind, line, col, len);
+    }
+
+    /// Ein Operator/Satzzeichen. Gibt false zurueck, wenn das Zeichen unbekannt ist.
+    fn punct(&mut self) -> bool {
+        let (line, col) = (self.line, self.col);
+        let c = match self.peek() {
+            Some(c) => c,
+            None => return true,
+        };
+        let n = self.peek2();
+        let (kind, width) = match (c, n) {
+            ('-', Some('>')) => (TokKind::Arrow, 2),
+            ('<', Some('<')) => (TokKind::Shl, 2),
+            ('>', Some('>')) => (TokKind::Shr, 2),
+            ('&', Some('&')) => (TokKind::AndAnd, 2),
+            ('|', Some('|')) => (TokKind::OrOr, 2),
+            ('=', Some('=')) => (TokKind::EqEq, 2),
+            ('!', Some('=')) => (TokKind::NotEq, 2),
+            ('<', Some('=')) => (TokKind::Le, 2),
+            ('>', Some('=')) => (TokKind::Ge, 2),
+            ('(', _) => (TokKind::LParen, 1),
+            (')', _) => (TokKind::RParen, 1),
+            ('{', _) => (TokKind::LBrace, 1),
+            ('}', _) => (TokKind::RBrace, 1),
+            ('[', _) => (TokKind::LBracket, 1),
+            (']', _) => (TokKind::RBracket, 1),
+            (',', _) => (TokKind::Comma, 1),
+            (':', _) => (TokKind::Colon, 1),
+            (';', _) => (TokKind::Semi, 1),
+            ('.', _) => (TokKind::Dot, 1),
+            ('=', _) => (TokKind::Assign, 1),
+            ('+', _) => (TokKind::Plus, 1),
+            ('-', _) => (TokKind::Minus, 1),
+            ('*', _) => (TokKind::Star, 1),
+            ('/', _) => (TokKind::Slash, 1),
+            ('%', _) => (TokKind::Percent, 1),
+            ('&', _) => (TokKind::Amp, 1),
+            ('|', _) => (TokKind::Pipe, 1),
+            ('^', _) => (TokKind::Caret, 1),
+            ('!', _) => (TokKind::Not, 1),
+            ('<', _) => (TokKind::Lt, 1),
+            ('>', _) => (TokKind::Gt, 1),
+            _ => return false,
+        };
+        for _ in 0..width {
+            self.bump();
+        }
+        self.push(kind, line, col, width);
+        true
+    }
+
+    fn run(&mut self) {
+        loop {
+            self.skip_trivia();
+            let c = match self.peek() {
+                Some(c) => c,
+                None => break,
+            };
+            if c.is_ascii_digit() {
+                self.number();
+            } else if is_ident_start(c) {
+                self.ident();
+            } else if !self.punct() {
+                let (line, col) = (self.line, self.col);
+                self.dg.error(
+                    Span::new(line, col, 1),
+                    format!("unbekanntes zeichen '{}' im quelltext", c),
+                );
+                // Weiterlexen: das stoerende Zeichen wird uebersprungen.
+                self.bump();
+            }
+        }
+        let (line, col) = (self.line, self.col);
+        self.push(TokKind::Eof, line.max(1), col.max(1), 1);
+    }
+}
+
 pub fn lex(src: &str, dg: &mut Diags) -> Vec<Token> {
-    let _ = src;
-    dg.error(Span::none(), "Lexer ist in diesem Baustand noch nicht implementiert");
-    vec![Token { kind: TokKind::Eof, span: Span::new(1, 1, 1) }]
+    let mut lx = Lexer {
+        chars: src.chars().collect(),
+        pos: 0,
+        line: 1,
+        col: 1,
+        dg,
+        out: Vec::new(),
+    };
+    lx.run();
+    lx.out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kinds(src: &str) -> (Vec<TokKind>, usize) {
+        let mut dg = Diags::new("test", src);
+        let toks = lex(src, &mut dg);
+        (toks.into_iter().map(|t| t.kind).collect(), dg.count())
+    }
+
+    #[test]
+    fn zahlen_und_trenner() {
+        let (k, n) = kinds("1_000 0xFF 0b1010 0");
+        assert_eq!(n, 0);
+        assert_eq!(
+            k,
+            vec![
+                TokKind::Int(1000),
+                TokKind::Int(255),
+                TokKind::Int(10),
+                TokKind::Int(0),
+                TokKind::Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn operatoren_maximal_lang() {
+        let (k, n) = kinds("<< <= < >> >= > && & || | == = != ! ->");
+        assert_eq!(n, 0);
+        assert_eq!(k[0], TokKind::Shl);
+        assert_eq!(k[1], TokKind::Le);
+        assert_eq!(k[2], TokKind::Lt);
+        assert_eq!(k[3], TokKind::Shr);
+        assert_eq!(k[4], TokKind::Ge);
+        assert_eq!(k[5], TokKind::Gt);
+        assert_eq!(k[6], TokKind::AndAnd);
+        assert_eq!(k[14], TokKind::Arrow);
+    }
+
+    #[test]
+    fn kommentare_verschachtelt() {
+        let (k, n) = kinds("1 /* a /* b */ c */ 2 // weg\n3");
+        assert_eq!(n, 0);
+        assert_eq!(k, vec![TokKind::Int(1), TokKind::Int(2), TokKind::Int(3), TokKind::Eof]);
+    }
+
+    #[test]
+    fn positionen_sind_zeichenbasiert() {
+        let src = "let a\n  bb = 1";
+        let mut dg = Diags::new("test", src);
+        let toks = lex(src, &mut dg);
+        assert_eq!((toks[1].span.line, toks[1].span.col, toks[1].span.len), (1, 5, 1));
+        assert_eq!((toks[2].span.line, toks[2].span.col, toks[2].span.len), (2, 3, 2));
+    }
+
+    #[test]
+    fn fehler_dann_weiterlexen() {
+        let (k, n) = kinds("1 § 2");
+        assert_eq!(n, 1);
+        assert_eq!(k, vec![TokKind::Int(1), TokKind::Int(2), TokKind::Eof]);
+    }
+
+    #[test]
+    fn offener_blockkommentar_meldet_und_endet() {
+        let (k, n) = kinds("1 /* offen");
+        assert_eq!(n, 1);
+        assert_eq!(k, vec![TokKind::Int(1), TokKind::Eof]);
+    }
+
+    #[test]
+    fn zu_grosse_zahl() {
+        let (_, n) = kinds("99999999999999999999999999");
+        assert_eq!(n, 1);
+    }
 }

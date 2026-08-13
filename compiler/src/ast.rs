@@ -160,6 +160,37 @@ pub enum Stmt {
     Error(Span),
 }
 
+impl Stmt {
+    /// Quellposition der Anweisung (benutzt von `--emit=ast`).
+    pub fn span(&self) -> Span {
+        match self {
+            Stmt::Let { span, .. }
+            | Stmt::Assign { span, .. }
+            | Stmt::If { span, .. }
+            | Stmt::While { span, .. }
+            | Stmt::Return { span, .. }
+            | Stmt::Error(span) => *span,
+            Stmt::Expr(e) => e.span,
+            Stmt::Block(b) => b.span,
+        }
+    }
+
+    /// Kurzname der Anweisungsart (fuer die Uebersicht in `--emit=ast`).
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Stmt::Let { mutable: false, .. } => "let",
+            Stmt::Let { mutable: true, .. } => "var",
+            Stmt::Assign { .. } => "assign",
+            Stmt::If { .. } => "if",
+            Stmt::While { .. } => "while",
+            Stmt::Return { .. } => "return",
+            Stmt::Expr(_) => "expr",
+            Stmt::Block(_) => "block",
+            Stmt::Error(_) => "<fehlerhaft>",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Param {
     pub name: String,
