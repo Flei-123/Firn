@@ -94,16 +94,6 @@ impl Diags {
         });
     }
 
-    /// Fehler mit eigener Beschriftung unter der Markierung.
-    pub fn error_label(&mut self, span: Span, msg: impl Into<String>, label: impl Into<String>) {
-        self.push(Diag {
-            msg: msg.into(),
-            span,
-            label: label.into(),
-            note: None,
-        });
-    }
-
     /// Fehler mit zusaetzlicher Erklaerungszeile ("hinweis: ...").
     pub fn error_note(&mut self, span: Span, msg: impl Into<String>, note: impl Into<String>) {
         self.push(Diag {
@@ -139,9 +129,6 @@ impl Diags {
     }
     pub fn file(&self) -> &str {
         &self.file
-    }
-    pub fn items(&self) -> &[Diag] {
-        &self.items
     }
 
     /// Die Quelltextzeile (1-basiert) ohne Zeilenende, oder "".

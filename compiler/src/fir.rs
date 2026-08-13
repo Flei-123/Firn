@@ -215,45 +215,6 @@ impl Op {
         }
     }
 
-    /// Ersetzt jede Verwendung von `from` durch `to`.
-    pub fn replace_use(&mut self, from: Val, to: Val) {
-        let r = |v: &mut Val| {
-            if *v == from {
-                *v = to;
-            }
-        };
-        match self {
-            Op::Const(_) | Op::Alloca { .. } => {}
-            Op::Bin(_, a, b) => {
-                r(a);
-                r(b);
-            }
-            Op::Cmp { a, b, .. } => {
-                r(a);
-                r(b);
-            }
-            Op::Un(_, a) => r(a),
-            Op::Cast { src, .. } => r(src),
-            Op::Load { addr } => r(addr),
-            Op::Store { addr, val } => {
-                r(addr);
-                r(val);
-            }
-            Op::PtrAdd { base, off } => {
-                r(base);
-                r(off);
-            }
-            Op::Call { args, .. } | Op::Syscall { args } => {
-                for a in args.iter_mut() {
-                    r(a);
-                }
-            }
-            Op::CopyMem { dst, src, .. } => {
-                r(dst);
-                r(src);
-            }
-        }
-    }
 }
 
 #[derive(Clone, Debug)]

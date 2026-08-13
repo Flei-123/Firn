@@ -642,3 +642,22 @@ korrigiert).
 8. **Rueckgabewert des Programms.** `fn main() -> i32` ist der Einstiegspunkt;
    `_start` ruft `main` auf und uebergibt das Ergebnis an den `exit`-Syscall
    (Exit-Code = Wert & 0xFF, wie unter Linux ueblich).
+9. **Hoechstens 6 Funktionsparameter.** Argumente werden ausschliesslich in den
+   System-V-Registern `rdi, rsi, rdx, rcx, r8, r9` uebergeben; Stapelargumente
+   sind nicht umgesetzt. Mehr als 6 Parameter melden einen sauberen Fehler
+   (mit Zeile/Spalte), keinen Absturz. Stapelargumente kommen in v0.2.
+10. **Parameter sind unveraenderlich.** Ein Parameter verhaelt sich wie eine
+    `let`-Bindung; `p = ...` im Rumpf ist ein Fehler. Wer eine veraenderliche
+    Kopie braucht, legt sie mit `var` an. (§10.1 sagt dazu nichts; so ist es
+    umgesetzt.)
+11. **Kein Wiederholungsliteral `[wert; N]`.** §10.1 kennt nur
+    `array_lit = "[" [ expr { "," expr } ] "]"`; ein Array wird also elementweise
+    initialisiert (siehe `tests/059_sieve.fi`). Die Kurzform kommt spaeter.
+12. **`as` bindet staerker als die unaeren Operatoren** (`as` ist laut §10.1 ein
+    Postfix-Operator). `&s.a as u64` bedeutet daher `&(s.a as u64)` und ist ein
+    Fehler; gemeint ist `(&s.a) as u64`.
+13. **Kein `break`/`continue`** (in §10.1 nicht vorgesehen): Schleifen werden
+    ueber eine Bedingungsvariable verlassen (siehe `tests/057_*.fi`).
+14. **Assembler-Ausgabe** ist Intel-Syntax mit `.intel_syntax noprefix`; §12
+    laesst beide Syntaxformen zu. `as` und `ld` werden ausschliesslich als
+    Assembler bzw. Linker aufgerufen, nie ein C-Compiler.

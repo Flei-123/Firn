@@ -1,16 +1,517 @@
-//! x86_64-Codegenerator: FIR -> GNU-Assembler-Text (AT&T-Syntax) fuer `as`/`ld`.
-//! Kein LLVM, kein Cranelift, kein C.
+//! x86_64-Codegenerator: FIR -> GNU-Assembler-Text (Intel-Syntax) fuer `as`/`ld`.
+//! Kein LLVM, kein Cranelift, kein C — jede Instruktion wird hier selbst gewaehlt.
 //!
 //! SCHNITTSTELLE (fest):
-//!   `pub fn emit(m: &fir::Module) -> String`
-//! Erzeugt ein vollstaendiges Assemblermodul inklusive `_start`, das `main`
-//! aufruft und dessen Rueckgabewert an den `exit`-Syscall gibt (freistehend,
-//! ohne libc). System-V-AMD64-ABI, 16-Byte-Stackausrichtung an jeder Aufrufstelle.
+//!   `pub fn emit(m: &fir::Module) -> Result<String, String>`
+//!
+//! Modell der Registerzuteilung (bewusst naiv, aber korrekt):
+//!   * Jeder FIR-Wert `%n` bekommt einen eigenen 8-Byte-Stack-Slot im Rahmen.
+//!   * Gerechnet wird ausschliesslich in den Arbeitsregistern rax/rcx (rdx fuer
+//!     Division/Rest, rdi/rsi/rcx zusaetzlich fuer `copymem`).
+//!   * Damit sind rbx, rbp, r12-r15 (callee-saved) nie angetastet; alle
+//!     benutzten Register sind caller-saved, ueber einen `call` hinweg lebt
+//!     kein Wert in einem Register.
+//!
+//! Rahmen (System-V-AMD64):
+//!   Bei Eintritt gilt rsp % 16 == 8 (die Ruecksprungadresse liegt oben).
+//!   `push rbp` macht rsp 16-ausgerichtet, `sub rsp, FRAME` mit FRAME % 16 == 0
+//!   erhaelt das. Damit ist der Stack an JEDER Aufrufstelle 16-ausgerichtet.
 
-use crate::fir::Module;
+use crate::config;
+use crate::fir::{BinOp, Block, CmpOp, FTy, Func, Inst, Module, Op, Term, UnOp, Val};
+use std::fmt::Write as _;
 
-/// STUB — wird von Modul "codegen" implementiert.
-pub fn emit(m: &Module) -> String {
-    let _ = m;
-    String::from("# Codegen ist in diesem Baustand noch nicht implementiert\n")
+/// Argumentregister der System-V-AMD64-Aufrufkonvention.
+const ARG_REGS: [&str; 6] = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
+/// Argumentregister des Linux-Syscall-ABI (nach der Nummer in rax).
+const SYS_REGS: [&str; 6] = ["rdi", "rsi", "rdx", "r10", "r8", "r9"];
+
+/// Registername in der Breite `bits` (nur fuer rax/rcx/rdx noetig).
+fn reg(name: &str, bits: u32) -> &'static str {
+    match (name, bits) {
+        ("rax", 8) => "al",
+        ("rax", 16) => "ax",
+        ("rax", 32) => "eax",
+        ("rax", _) => "rax",
+        ("rcx", 8) => "cl",
+        ("rcx", 16) => "cx",
+        ("rcx", 32) => "ecx",
+        ("rcx", _) => "rcx",
+        ("rdx", 8) => "dl",
+        ("rdx", 16) => "dx",
+        ("rdx", 32) => "edx",
+        (_, _) => "rdx",
+    }
+}
+
+/// Groessenwort fuer Speicheroperanden.
+fn size_word(bits: u32) -> &'static str {
+    match bits {
+        8 => "byte ptr",
+        16 => "word ptr",
+        32 => "dword ptr",
+        _ => "qword ptr",
+    }
+}
+
+fn align_up(x: u64, a: u64) -> u64 {
+    if a <= 1 {
+        x
+    } else {
+        (x + a - 1) / a * a
+    }
+}
+
+/// Rahmenaufteilung einer Funktion.
+struct Frame {
+    /// Slot-Offset je Wert-Id (Adresse = rbp - off).
+    slot: Vec<u64>,
+    /// Offset des Speichers je `alloca`-Wert (Adresse = rbp - off).
+    alloca_off: Vec<Option<u64>>,
+    size: u64,
+}
+
+fn layout(f: &Func) -> Frame {
+    let n = f.val_types.len();
+    let mut slot = vec![0u64; n];
+    let mut cursor = 0u64;
+    for s in slot.iter_mut() {
+        cursor += 8;
+        *s = cursor;
+    }
+    let mut alloca_off: Vec<Option<u64>> = vec![None; n];
+    for b in &f.blocks {
+        // Invariante von FIR: alle `alloca` stehen im Eintrittsblock. Alles
+        // andere waere ein variabel grosser Rahmen — den kann Stufe 0 nicht.
+        if b.id != f.entry() && b.insts.iter().any(|i| matches!(i.op, Op::Alloca { .. })) {
+            continue;
+        }
+        for i in &b.insts {
+            if let Op::Alloca { size, align } = i.op {
+                if let Some(d) = i.dst {
+                    // Adresse = rbp - cursor; cursor auf `align` bringen, damit
+                    // die Adresse ausgerichtet ist (rbp ist 16-ausgerichtet).
+                    let a = if align == 0 { 1 } else { align.min(16) };
+                    cursor = align_up(cursor + size.max(1), a);
+                    alloca_off[d as usize] = Some(cursor);
+                }
+            }
+        }
+    }
+    Frame { slot, alloca_off, size: align_up(cursor, 16) }
+}
+
+struct Emitter {
+    out: String,
+}
+
+impl Emitter {
+    fn line(&mut self, s: &str) {
+        let _ = writeln!(self.out, "    {}", s);
+    }
+    fn raw(&mut self, s: &str) {
+        let _ = writeln!(self.out, "{}", s);
+    }
+}
+
+/// Sanitisiert einen Funktionsnamen zu einem Assembler-Label.
+/// Bezeichner der Sprache sind [A-Za-z_][A-Za-z0-9_]*, also bereits gueltig.
+fn label(name: &str) -> String {
+    name.to_string()
+}
+
+fn block_label(fname: &str, b: u32) -> String {
+    format!(".L{}__bb{}", fname, b)
+}
+
+pub fn emit(m: &Module) -> Result<String, String> {
+    let mut e = Emitter { out: String::new() };
+    e.raw(&format!(
+        "# erzeugt von {} {} — eigener x86_64-Codegenerator (kein LLVM)",
+        config::compiler_name(),
+        config::VERSION
+    ));
+    e.raw(".intel_syntax noprefix");
+    e.raw(".text");
+    e.raw(".globl _start");
+    e.raw("_start:");
+    e.line("xor rbp, rbp");
+    e.line("and rsp, -16");
+    e.line(&format!("call {}", label("main")));
+    e.line("mov edi, eax");
+    e.line("mov eax, 60");
+    e.line("syscall");
+    e.line("hlt");
+
+    if !m.funcs.iter().any(|f| f.name == "main") {
+        return Err("kein Einstiegspunkt: 'fn main() -> i32' fehlt".to_string());
+    }
+
+    for f in &m.funcs {
+        emit_func(&mut e, f)?;
+    }
+    e.raw(".section .note.GNU-stack,\"\",@progbits");
+    Ok(e.out)
+}
+
+fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
+    if f.params.len() > ARG_REGS.len() {
+        return Err(format!(
+            "Funktion '{}' hat {} Parameter; Stufe 0 unterstuetzt hoechstens {} (nur Registerargumente)",
+            f.name,
+            f.params.len(),
+            ARG_REGS.len()
+        ));
+    }
+    let fr = layout(f);
+    e.raw("");
+    e.raw(&format!(".globl {}", label(&f.name)));
+    e.raw(&format!("{}:", label(&f.name)));
+    e.line("push rbp");
+    e.line("mov rbp, rsp");
+    if fr.size > 0 {
+        e.line(&format!("sub rsp, {}", fr.size));
+    }
+    // Parameter aus ihren Registern in die Slots %0..%(n-1) sichern.
+    for (i, _t) in f.params.iter().enumerate() {
+        e.line(&format!("mov qword ptr [rbp-{}], {}", fr.slot[i], ARG_REGS[i]));
+    }
+
+    for b in &f.blocks {
+        e.raw(&format!("{}:", block_label(&f.name, b.id)));
+        emit_block(e, f, &fr, b)?;
+    }
+    Ok(())
+}
+
+fn emit_block(e: &mut Emitter, f: &Func, fr: &Frame, b: &Block) -> Result<(), String> {
+    for i in &b.insts {
+        emit_inst(e, f, fr, i)?;
+    }
+    match &b.term {
+        Term::Br(t) => e.line(&format!("jmp {}", block_label(&f.name, *t))),
+        Term::BrCond { cond, then_bb, else_bb } => {
+            if f.val_ty(*cond) != FTy::Bool {
+                return Err(format!(
+                    "interner Fehler: Bedingung %{} in '{}' ist {}, erwartet bool",
+                    cond,
+                    f.name,
+                    f.val_ty(*cond).name()
+                ));
+            }
+            e.line(&format!("mov al, byte ptr [rbp-{}]", fr.slot[*cond as usize]));
+            e.line("test al, al");
+            e.line(&format!("jnz {}", block_label(&f.name, *then_bb)));
+            e.line(&format!("jmp {}", block_label(&f.name, *else_bb)));
+        }
+        Term::Ret(v) => {
+            if let Some(v) = v {
+                e.line(&format!("mov rax, qword ptr [rbp-{}]", fr.slot[*v as usize]));
+            } else {
+                e.line("xor eax, eax");
+            }
+            e.line("mov rsp, rbp");
+            e.line("pop rbp");
+            e.line("ret");
+        }
+        Term::Unset => {
+            return Err(format!(
+                "interner Fehler: Block bb{} in '{}' hat keinen Terminator",
+                b.id, f.name
+            ))
+        }
+    }
+    Ok(())
+}
+
+/// Laedt den kompletten 8-Byte-Slot eines Wertes in ein Register.
+fn load_full(e: &mut Emitter, fr: &Frame, r: &str, v: Val) {
+    e.line(&format!("mov {}, qword ptr [rbp-{}]", r, fr.slot[v as usize]));
+}
+
+/// Laedt einen Wert vorzeichen-/nullerweitert auf `to_bits` (32 oder 64).
+fn load_ext(e: &mut Emitter, fr: &Frame, r: &str, v: Val, ty: FTy, to_bits: u32) {
+    let off = fr.slot[v as usize];
+    let bits = ty.bits().max(8);
+    if bits >= to_bits {
+        // Bereits mindestens so breit: die unteren `to_bits` Bits genuegen.
+        e.line(&format!("mov {}, {} [rbp-{}]", reg(r, to_bits), size_word(to_bits), off));
+        return;
+    }
+    match (ty.signed(), bits) {
+        (true, 8) => e.line(&format!("movsx {}, byte ptr [rbp-{}]", reg(r, to_bits), off)),
+        (true, 16) => e.line(&format!("movsx {}, word ptr [rbp-{}]", reg(r, to_bits), off)),
+        (true, _) => e.line(&format!("movsxd {}, dword ptr [rbp-{}]", reg(r, to_bits), off)),
+        (false, 8) => e.line(&format!("movzx {}, byte ptr [rbp-{}]", reg(r, to_bits.min(32)), off)),
+        (false, 16) => e.line(&format!("movzx {}, word ptr [rbp-{}]", reg(r, to_bits.min(32)), off)),
+        // 32 Bit vorzeichenlos: `mov e_x` nullt die oberen 32 Bit automatisch.
+        (false, _) => e.line(&format!("mov {}, dword ptr [rbp-{}]", reg(r, 32), off)),
+    }
+}
+
+/// Schreibt rax (voll) in den Slot des Zielwertes.
+fn store_dst(e: &mut Emitter, fr: &Frame, d: Val, r: &str) {
+    e.line(&format!("mov qword ptr [rbp-{}], {}", fr.slot[d as usize], r));
+}
+
+fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), String> {
+    let ty = i.ty;
+    match &i.op {
+        Op::Const(c) => {
+            let d = i.dst.ok_or("interner Fehler: const ohne Ziel")?;
+            let bits = ty.truncate(*c) as i64;
+            if bits == 0 {
+                e.line("xor eax, eax");
+            } else {
+                e.line(&format!("mov rax, {}", bits));
+            }
+            store_dst(e, fr, d, "rax");
+        }
+        Op::Bin(op, a, b) => {
+            let d = i.dst.ok_or("interner Fehler: Binaeroperation ohne Ziel")?;
+            emit_bin(e, fr, *op, ty, *a, *b, d)?;
+        }
+        Op::Cmp { op, ty: oty, a, b } => {
+            let d = i.dst.ok_or("interner Fehler: Vergleich ohne Ziel")?;
+            let bits = oty.bits().max(8);
+            load_full(e, fr, "rax", *a);
+            load_full(e, fr, "rcx", *b);
+            e.line(&format!("cmp {}, {}", reg("rax", bits), reg("rcx", bits)));
+            let signed = oty.signed();
+            let cc = match (op, signed) {
+                (CmpOp::Eq, _) => "sete",
+                (CmpOp::Ne, _) => "setne",
+                (CmpOp::Lt, true) => "setl",
+                (CmpOp::Lt, false) => "setb",
+                (CmpOp::Le, true) => "setle",
+                (CmpOp::Le, false) => "setbe",
+                (CmpOp::Gt, true) => "setg",
+                (CmpOp::Gt, false) => "seta",
+                (CmpOp::Ge, true) => "setge",
+                (CmpOp::Ge, false) => "setae",
+            };
+            e.line(&format!("{} al", cc));
+            e.line("movzx eax, al");
+            store_dst(e, fr, d, "rax");
+        }
+        Op::Un(op, a) => {
+            let d = i.dst.ok_or("interner Fehler: Unaeroperation ohne Ziel")?;
+            let bits = if ty.bits() > 32 { 64 } else { 32 };
+            load_full(e, fr, "rax", *a);
+            match op {
+                UnOp::Neg => e.line(&format!("neg {}", reg("rax", bits))),
+                UnOp::Not => {
+                    if ty == FTy::Bool {
+                        e.line("xor eax, 1");
+                    } else {
+                        e.line(&format!("not {}", reg("rax", bits)));
+                    }
+                }
+            }
+            store_dst(e, fr, d, "rax");
+        }
+        Op::Cast { src, from } => {
+            let d = i.dst.ok_or("interner Fehler: Umwandlung ohne Ziel")?;
+            if ty == FTy::Bool {
+                // Sicherheitsnetz: bool enthaelt nur 0/1.
+                let bits = from.bits().max(8);
+                load_full(e, fr, "rax", *src);
+                e.line(&format!("test {}, {}", reg("rax", bits), reg("rax", bits)));
+                e.line("setne al");
+                e.line("movzx eax, al");
+            } else {
+                load_ext(e, fr, "rax", *src, *from, 64);
+            }
+            store_dst(e, fr, d, "rax");
+        }
+        Op::Alloca { .. } => {
+            let d = i.dst.ok_or("interner Fehler: alloca ohne Ziel")?;
+            let off = fr.alloca_off[d as usize].ok_or("interner Fehler: alloca ohne Platz")?;
+            e.line(&format!("lea rax, [rbp-{}]", off));
+            store_dst(e, fr, d, "rax");
+        }
+        Op::Load { addr } => {
+            let d = i.dst.ok_or("interner Fehler: load ohne Ziel")?;
+            load_full(e, fr, "rcx", *addr);
+            let bits = ty.bits().max(8);
+            match bits {
+                8 => e.line("movzx eax, byte ptr [rcx]"),
+                16 => e.line("movzx eax, word ptr [rcx]"),
+                32 => e.line("mov eax, dword ptr [rcx]"),
+                _ => e.line("mov rax, qword ptr [rcx]"),
+            }
+            store_dst(e, fr, d, "rax");
+        }
+        Op::Store { addr, val } => {
+            load_full(e, fr, "rcx", *addr);
+            load_full(e, fr, "rax", *val);
+            let bits = ty.bits().max(8);
+            e.line(&format!("mov {} [rcx], {}", size_word(bits), reg("rax", bits)));
+        }
+        Op::PtrAdd { base, off } => {
+            let d = i.dst.ok_or("interner Fehler: ptradd ohne Ziel")?;
+            load_full(e, fr, "rax", *base);
+            load_full(e, fr, "rcx", *off);
+            e.line("add rax, rcx");
+            store_dst(e, fr, d, "rax");
+        }
+        Op::Call { name, args } => {
+            if args.len() > ARG_REGS.len() {
+                return Err(format!(
+                    "Aufruf von '{}' mit {} Argumenten; Stufe 0 unterstuetzt hoechstens {}",
+                    name,
+                    args.len(),
+                    ARG_REGS.len()
+                ));
+            }
+            for (k, a) in args.iter().enumerate() {
+                load_full(e, fr, ARG_REGS[k], *a);
+            }
+            e.line(&format!("call {}", label(name)));
+            if let Some(d) = i.dst {
+                store_dst(e, fr, d, "rax");
+            }
+        }
+        Op::Syscall { args } => {
+            if args.is_empty() {
+                return Err("interner Fehler: syscall ohne Nummer".to_string());
+            }
+            if args.len() > 7 {
+                return Err("syscall mit mehr als 6 Argumenten".to_string());
+            }
+            for (k, a) in args.iter().skip(1).enumerate() {
+                load_full(e, fr, SYS_REGS[k], *a);
+            }
+            load_full(e, fr, "rax", args[0]);
+            e.line("syscall");
+            if let Some(d) = i.dst {
+                store_dst(e, fr, d, "rax");
+            }
+        }
+        Op::CopyMem { dst, src, size } => {
+            load_full(e, fr, "rdi", *dst);
+            load_full(e, fr, "rsi", *src);
+            e.line(&format!("mov rcx, {}", size));
+            e.line("cld");
+            e.line("rep movsb");
+        }
+    }
+    let _ = f;
+    Ok(())
+}
+
+fn emit_bin(
+    e: &mut Emitter,
+    fr: &Frame,
+    op: BinOp,
+    ty: FTy,
+    a: Val,
+    b: Val,
+    d: Val,
+) -> Result<(), String> {
+    let wide = ty.bits() > 32;
+    let bits = if wide { 64 } else { 32 };
+    match op {
+        BinOp::Add | BinOp::Sub | BinOp::And | BinOp::Or | BinOp::Xor | BinOp::Mul => {
+            // Die niederwertigen Bits sind bei diesen Operationen unabhaengig
+            // von der Breite; deshalb wird in 32/64 Bit gerechnet und beim
+            // Lesen auf die Typbreite zurechtgeschnitten.
+            load_full(e, fr, "rax", a);
+            load_full(e, fr, "rcx", b);
+            let m = match op {
+                BinOp::Add => "add",
+                BinOp::Sub => "sub",
+                BinOp::And => "and",
+                BinOp::Or => "or",
+                BinOp::Xor => "xor",
+                _ => "imul",
+            };
+            e.line(&format!("{} {}, {}", m, reg("rax", bits), reg("rcx", bits)));
+            store_dst(e, fr, d, "rax");
+        }
+        BinOp::Div | BinOp::Rem => {
+            // Operanden exakt auf die Rechenbreite bringen (obere Bits im Slot
+            // sind nicht garantiert), dann idiv/div passend zum Vorzeichen.
+            load_ext(e, fr, "rax", a, ty, bits);
+            load_ext(e, fr, "rcx", b, ty, bits);
+            if ty.signed() {
+                if wide {
+                    e.line("cqo");
+                    e.line("idiv rcx");
+                } else {
+                    e.line("cdq");
+                    e.line("idiv ecx");
+                }
+            } else {
+                e.line("xor edx, edx");
+                if wide {
+                    e.line("div rcx");
+                } else {
+                    e.line("div ecx");
+                }
+            }
+            let res = if op == BinOp::Div { "rax" } else { "rdx" };
+            store_dst(e, fr, d, res);
+        }
+        BinOp::Shl | BinOp::Shr => {
+            // Linker Operand exakt erweitern, damit `shr`/`sar` auch bei
+            // 8/16-Bit-Typen die richtigen Bits nachziehen.
+            load_ext(e, fr, "rax", a, ty, bits);
+            load_full(e, fr, "rcx", b);
+            let m = match (op, ty.signed()) {
+                (BinOp::Shl, _) => "shl",
+                (_, true) => "sar",
+                (_, false) => "shr",
+            };
+            e.line(&format!("{} {}, cl", m, reg("rax", bits)));
+            store_dst(e, fr, d, "rax");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fir::{Func, Module, Op, Term};
+
+    fn simple_module() -> Module {
+        let mut f = Func::new("main", vec![], FTy::I32);
+        let c = f.push(0, FTy::I32, Op::Const(42));
+        f.set_term(0, Term::Ret(Some(c)));
+        Module { funcs: vec![f] }
+    }
+
+    #[test]
+    fn erzeugt_start_und_prolog() {
+        let s = emit(&simple_module()).expect("codegen");
+        assert!(s.contains("_start:"));
+        assert!(s.contains("push rbp"));
+        assert!(s.contains("mov rax, 42"));
+        assert!(s.contains("mov eax, 60"));
+    }
+
+    #[test]
+    fn rahmen_ist_16_ausgerichtet() {
+        let mut f = Func::new("main", vec![], FTy::I32);
+        let p = f.alloca(12, 4);
+        let c = f.push(0, FTy::I32, Op::Const(1));
+        f.push_void(0, FTy::I32, Op::Store { addr: p, val: c });
+        f.set_term(0, Term::Ret(Some(c)));
+        let fr = layout(&f);
+        assert_eq!(fr.size % 16, 0);
+        assert!(fr.size >= 12);
+    }
+
+    #[test]
+    fn zu_viele_parameter_sind_ein_fehler_kein_absturz() {
+        let f = Func::new("f", vec![FTy::I64; 7], FTy::I64);
+        let mut m = Module::new();
+        m.funcs.push(f);
+        let mut g = Func::new("main", vec![], FTy::I32);
+        let c = g.push(0, FTy::I32, Op::Const(0));
+        g.set_term(0, Term::Ret(Some(c)));
+        m.funcs.push(g);
+        assert!(emit(&m).is_err());
+    }
 }
