@@ -245,6 +245,23 @@ Nicht implementiert, weder im Compiler noch als Sprachmittel:
 * Optimierung über **Konstantenfaltung und Entfernen toten Codes** hinaus
   (kein Inlining, kein mem2reg/SSA, keine Registerzuteilung mit Lebendigkeit)
 
+### Bekannte Schwächen des Codegenerators (von der Jury gefunden, nicht behoben)
+
+* **Kein Stack-Probing, keine Rahmen-Obergrenze.** Der Prolog reserviert
+  8 Byte je FIR-Wert (`sub rsp, FRAME`) ohne Prüfung. Eine Funktion mit sehr
+  vielen Werten erzeugt einen beliebig großen Rahmen und kann ohne Diagnose
+  über die Guard-Page hinauslaufen. Für die Testsuite unkritisch, für
+  Kernel-Code später zwingend zu beheben.
+* **Rein slot-basierte Registerbelegung.** Jeder FIR-Wert bekommt einen
+  Stack-Slot; gerechnet wird in `rax`/`rcx`/`rdx`. Das ist korrekt, aber
+  langsam — es ist Spilling, keine Registerzuteilung. Steht so auch in
+  SPEC.md §12.
+* **Optimierer bleibt an der Oberfläche.** Nach Konstantenfaltung und DCE
+  bleiben `store`/`load` auf Allokationen stehen, die nur einmal geschrieben
+  und gelesen werden (kein mem2reg), und leere Blöcke mit reinem `br` werden
+  nicht verschmolzen. Wirksam ist die Optimierung trotzdem nachweisbar
+  (siehe `test_opt.sh`), aber sie ersetzt keinen echten Optimierer.
+
 Weitere Einschränkungen der Umsetzung, die in SPEC.md §12.1 festgehalten sind:
 
 * höchstens **6 Funktionsparameter** (nur Registerargumente)
