@@ -750,3 +750,32 @@ fn main() -> i32 {
 aus SPEC §3.3 (*der Wert muss an eine verbrauchende Funktion übergeben werden*)
 kommt mit dem Move-Prüfer. `#[must_consume]` verspricht hier bewusst nicht mehr,
 als es hält.
+
+## Symbol-Namensschema (DESIGNZIELE.md §4)
+
+Erzeugte Linker-Symbole tragen einen reservierten Präfix mit Schemaversion und
+haben Platz für eine spätere ABI-Version:
+
+```text
+_F0.add              Element der Wurzeldatei
+_F0.helfer__quadrat  Element eines Moduls
+_F0.add.v3           mit ABI-Version (später, #[abi_stable(3)])
+main                 der Einstiegspunkt, unverändert
+```
+
+`SYMBOL_SCHEMA = 0` steckt in jedem Symbol: Ändert sich das Schema, meldet der
+Linker einen fehlenden Namen, statt zwei unverträgliche Übersetzungsstände still
+zusammenzubinden. Firn-Bezeichner dürfen keinen Punkt enthalten — Nutzercode kann
+den Präfix also nicht treffen.
+
+Wichtig ist die **Trennung**: *interner Name* (Typprüfer, IR, Fehlermeldungen)
+und *Linker-Symbol* sind zwei verschiedene Dinge. Aus dem einen wird das andere
+an genau einer Stelle: `codegen_x86::label` → `modules::symbol`.
+
+```
+$ bash tools/symbole/run.sh
+OK: Symbolschema gehalten (_F0.-Praefix, 'main' nackt, Module kollisionsfrei).
+```
+
+Der Nachweis baut ein Programm aus zwei Modulen, die beide eine Funktion `hilf`
+enthalten, führt es aus und prüft an der echten Symboltabelle (`nm`).

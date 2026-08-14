@@ -126,6 +126,52 @@ fn module_name(f: &SourceFile) -> String {
         .unwrap_or_else(|| format!("m{}", f.id))
 }
 
+/// **Version des Symbol-Namensschemas** (DESIGNZIELE.md §4, Fundamentpunkt).
+///
+/// Sie steht in **jedem** erzeugten Linker-Symbol. Aendert sich das Schema,
+/// aendern sich alle Symbole — dann meldet der Linker einen fehlenden Namen,
+/// statt zwei unvertraegliche Uebersetzungsstaende still zusammenzubinden.
+pub const SYMBOL_SCHEMA: u32 = 0;
+
+/// Reservierter Praefix erzeugter Symbole. Firn-Bezeichner koennen ihn nicht
+/// erzeugen (sie duerfen keinen Punkt enthalten), deshalb kann Nutzercode nie
+/// versehentlich ein erzeugtes Symbol treffen.
+pub const SYMBOL_PREFIX: &str = "_F";
+
+/// Der Einstiegspunkt behaelt seinen nackten Namen: `_start` ruft ihn, und das
+/// ist eine Verabredung mit dem Linker, keine Firn-Angelegenheit.
+pub const ENTRY_SYMBOL: &str = "main";
+
+/// Linker-Name eines Elements aus seinem **internen** Namen.
+///
+/// Der interne Name entsteht in `mangle` (Wurzeldatei: unveraendert, Modul:
+/// `modul__name`) und ist das, womit Typpruefer und IR arbeiten. Erst der
+/// Codegenerator macht daraus ein Symbol:
+///
+/// ```text
+/// _F0.add             Element der Wurzeldatei
+/// _F0.helfer__quadrat Element eines Moduls
+/// _F0.add.v3          mit ABI-Version (spaeter, #[abi_stable(3)])
+/// main                der Einstiegspunkt, unveraendert
+/// ```
+///
+/// **Warum jetzt schon?** `DESIGNZIELE.md` §4: Gibt Firn heute `main` und `add`
+/// als nackte Symbole aus und braucht spaeter versionierte, ist das ein Bruch
+/// fuer alles, was bereits gebaut wurde. Der Platz fuer die Version kostet
+/// heute nichts und macht ein stabiles ABI (`#[abi_stable]`) spaeter zu einer
+/// Erweiterung statt zu einem Schnitt. Die Trennung *interner Name* <->
+/// *Linker-Symbol* ist dabei der eigentliche Gewinn: Fehlermeldungen zeigen
+/// weiter den Quelltextnamen.
+pub fn symbol(interner_name: &str, abi_version: Option<u32>) -> String {
+    if interner_name == ENTRY_SYMBOL {
+        return interner_name.to_string();
+    }
+    match abi_version {
+        Some(v) => format!("{}{}.{}.v{}", SYMBOL_PREFIX, SYMBOL_SCHEMA, interner_name, v),
+        None => format!("{}{}.{}", SYMBOL_PREFIX, SYMBOL_SCHEMA, interner_name),
+    }
+}
+
 fn mangle(module: &str, name: &str) -> String {
     if module.is_empty() {
         name.to_string()
@@ -460,5 +506,15 @@ mod tests {
     fn namen_werden_je_modul_verschieden() {
         assert_eq!(mangle("", "main"), "main");
         assert_eq!(mangle("helfer", "quadrat"), "helfer__quadrat");
+        assert_eq!(mangle("", "quadrat"), "quadrat");
+        // Linker-Symbole: reservierter Praefix + Schemaversion (DESIGNZIELE 4)
+        assert_eq!(symbol("quadrat", None), "_F0.quadrat");
+        assert_eq!(symbol("helfer__quadrat", None), "_F0.helfer__quadrat");
+        // Platz fuer die ABI-Version ist da.
+        assert_eq!(symbol("helfer__quadrat", Some(3)), "_F0.helfer__quadrat.v3");
+        // Der Einstiegspunkt behaelt seinen nackten Namen.
+        assert_eq!(symbol("main", None), "main");
+        // Nutzercode kann den Praefix nicht erzeugen: Bezeichner haben keine Punkte.
+        assert!(symbol("a", None).starts_with(SYMBOL_PREFIX));
     }
 }

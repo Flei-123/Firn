@@ -42,7 +42,7 @@
 //! …), fuehren dazu, dass `emit_func_ra` `None` liefert und `codegen_x86.rs`
 //! seinen bewaehrten Grundpfad benutzt.
 
-use crate::codegen_x86::{block_label, size_word, Emitter, Frame, ARG_REGS};
+use crate::codegen_x86::{block_label, label, size_word, Emitter, Frame, ARG_REGS};
 use crate::fir::{BinOp, Block, CmpOp, FTy, Func, Inst, Op, Term, UnOp, Val};
 use std::collections::HashMap;
 
@@ -858,8 +858,9 @@ fn supported(f: &Func) -> bool {
 fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
     let ra = Ra { f, a };
     e.raw("");
-    e.raw(&format!(".globl {}", f.name));
-    e.raw(&format!("{}:", f.name));
+    // Linker-Symbol ueber die eine Stelle (codegen_x86::label -> modules::symbol)
+    e.raw(&format!(".globl {}", label(&f.name)));
+    e.raw(&format!("{}:", label(&f.name)));
     // Zeile der `fn`-Deklaration fuer den Debugger (dwarf.rs).
     if let Some((file, line)) = crate::dwarf::fn_line(&f.name) {
         e.line(&format!(".loc {} {} 0", file + 1, line));
@@ -1249,7 +1250,7 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
             for (k, arg) in spaeter {
                 ra.load_full(e, ARG_REGS[k], arg);
             }
-            e.line(&format!("call {}", name));
+            e.line(&format!("call {}", label(name)));
             if let Some(d) = i.dst {
                 ra.store_dst(e, d, "rax");
             }

@@ -115,10 +115,14 @@ impl Emitter {
     }
 }
 
-/// Sanitisiert einen Funktionsnamen zu einem Assembler-Label.
-/// Bezeichner der Sprache sind [A-Za-z_][A-Za-z0-9_]*, also bereits gueltig.
-fn label(name: &str) -> String {
-    name.to_string()
+/// Linker-Symbol eines Funktionsnamens.
+///
+/// **Einzige** Stelle, an der aus einem internen Namen ein Symbol wird — das
+/// Schema selbst steht in `modules.rs` (`SYMBOL_SCHEMA`, DESIGNZIELE.md §4).
+/// Interne Blocklabels (`block_label`) gehen bewusst NICHT hier durch: sie sind
+/// dateilokal (`.L…`) und erscheinen nie in der Symboltabelle.
+pub(crate) fn label(name: &str) -> String {
+    crate::modules::symbol(name, None)
 }
 
 pub(crate) fn block_label(fname: &str, b: u32) -> String {
