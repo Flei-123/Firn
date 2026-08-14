@@ -571,6 +571,62 @@ erreichbar.** Der nächste Schritt gehört dem Tokenizer und einem fairen
 Messaufbau — nicht dem Optimierer. Das ist die eigentliche Erkenntnis dieser
 Runde, und sie ist mehr wert als die 16 % Instruktionen.
 
+## Tokenizer-Tempo: von 7,0× auf 5,0× — und was das gekostet hat (Runde 6)
+
+Nachdem die Messung gezeigt hatte, dass der Abstand **ausgeführte Arbeit** ist
+und nicht Codegen-Qualität (818 gegen 110 Instruktionen je Byte), ging diese
+Runde genau dort hin. Drei Eingriffe, jeder einzeln gemessen:
+
+**1. Schneller Pfad hochgezogen** (`lib/html/mem.fi`). `cp_reserve` und
+`buf_reserve` waren zusammen **33 % aller Instruktionen** — nicht das Wachsen,
+sondern die Prüfung „ist noch Platz?", die je Zeichen als Funktionsaufruf
+anfiel. Mit 71 Instruktionen und 14 Blöcken ist die volle Funktion zu groß zum
+Einbetten. Jetzt steht in `cp_push`/`buf_push` nur der Vergleich (24
+Instruktionen, 3 Blöcke → einbettbar), das Wachsen ist `cp_wachse`/`buf_wachse`.
+
+**2. Fairer Messaufbau** (`lib/html/tokenize_bench.fi`). Der bisherige Treiber
+schrieb je Auftrag html5lib-JSON, html5ever zählt nur Token — gemessen **14,7 %
+der Instruktionen** für eine Ausgabe, die die Gegenseite gar nicht erzeugt.
+Die Messfassung zählt ebenfalls nur. **Nicht** herausgerechnet wird die
+UTF-32-Dekodierung (28 %), obwohl html5ever sie nicht braucht: das ist ein
+echter Nachteil von Firns Aufbau, keine Unfairness der Messung.
+
+**3. `cmp` und bedingter Sprung verschmolzen** (`compiler/src/regalloc.rs`).
+Ein Vergleich kostete **sieben** Instruktionen: `cmp`, `setcc al`,
+`movzx eax, al`, Kopie ins Zielregister, `test`, `jnz`, `jmp` — der bool-Wert
+wurde erzeugt, gespeichert und sofort wieder auf null geprüft. Jetzt sind es
+drei. Bedingung: der Vergleich ist die **letzte** Instruktion des Blocks (sonst
+könnte etwas dazwischen die Flags ändern), sein Ergebnis wird **genau einmal**
+gelesen, und es ist kein `secret`-Wert. `dekodiere` schrumpfte dadurch von 583
+auf 503 Instruktionen.
+
+### Ergebnis, mit callgrind gemessen (Korpus `realweb`)
+
+| Stand | Instruktionen | gegen html5ever |
+|---|---:|---:|
+| vor dieser Runde (mit JSON) | 4.033.688.605 | 7,46× |
+| schneller Pfad in `mem.fi` | 3.931.183.909 | 7,27× |
+| fairer Aufbau + `cmp`/`jcc` | **2.655.479.880** | **4,91×** |
+
+Nach der Uhr (bester von drei Läufen):
+
+| Korpus | vorher | nachher | Ziel |
+|---|---:|---:|---:|
+| `html5lib` (pathologisch) | 2,70× | **1,98×** | ≤ 2,00× |
+| `realweb` (echte Seiten) | 7,02× | **4,99×** | ≤ 2,00× |
+
+**Ehrlich:** Auf `html5lib` ist das Ziel erreicht, auf `realweb` nicht — und
+`realweb` ist der Fall, der für einen Browser zählt. Der Wert 1,98× liegt
+außerdem so knapp an der Grenze, dass er im Rauschen der Uhr liegt; belastbar
+ist die Instruktionszahl. Die Quote blieb unverändert bei **6.810/6.810**.
+
+**Was als Nächstes bleibt:** `dekodiere` ist mit 28 % der größte verbliebene
+Posten und braucht 225 Instruktionen je Byte — für eine UTF-8-Dekodierung
+absurd viel. Der Grund steht im Assembler: die eingebettete Bereichsprüfung von
+`buf_at` erzeugt je Zugriff eine eigene Verzweigung, und `dekodiere` greift bis
+zu fünfmal je Zeichen zu. Ohne Bereichsprüfungs-Elimination über Schleifen
+hinweg (`bce` kann das noch nicht) bleibt das stehen.
+
 ## Speichermodell: Opt-in-Tracing-GC und der DOM-Dauerlauf (Runde 4)
 
 Die wichtigste offene Designfrage aus `DESIGNZIELE.md` ist entschieden **und
