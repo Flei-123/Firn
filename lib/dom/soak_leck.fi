@@ -1,0 +1,368 @@
+// lib/dom/soak_leck.fi — GEGENPROBE zum Dauerlauf: derselbe DOM-Zyklensatz,
+// aber mit ZAEHLVERWEISEN statt `Gc[T]`.
+//
+// Diese Fassung MUSS lecken. Sie ist der Beweis, dass die Messung in
+// tools/dom_soak/run.sh ueberhaupt etwas misst: bleibt sie gruen, ist das
+// Messverfahren kaputt und run.sh bricht ab. Ein Dauerlauf, der nur die
+// gewuenschte Fassung prueft, ist keine Messung, sondern eine Behauptung.
+//
+// Selbst enthalten: eigener Zaehlverweis-Halde ueber mmap(2), KEIN `import`
+// von lib/rc und KEINE gc-Klasse — damit die Sammler-Laufzeit gar nicht erst
+// eingezogen wird (compiler/src/modules.rs zieht sie nur bei `gc class`).
+// Verglichen werden so wirklich zwei Speichermodelle.
+//
+// Der Zaehler ist KORREKT: azyklischer Muell wird sehr wohl freigegeben (die
+// Sammlung im Satz hat keinen Rueckverweis und verschwindet jedes Mal). Nur
+// die Zyklen bleiben — genau der Fall, an dem Gecko den Zyklensammler
+// nachruesten musste und den DESIGNZIELE/SPEC §3.5 als Grund fuer den
+// Tracing-GC nennen.
+//
+// Objektaufbau (64 Byte):
+//   [0]  Zaehler        [8]  eltern         [16] erstes_kind
+//   [24] naechstes      [32] listener/ziel  [40] wrapper/knoten
+//   [48] wurzel         [56] Freiliste-Verkettung
+
+import mess
+
+const BUDGET_MS: i64 = 600000  // SOAK_BUDGET_MS
+const ZYKLEN_MAX: i64 = 100000000  // SOAK_ZYKLEN_MAX
+const STICHPROBE: i64 = 1000  // SOAK_STICHPROBE
+
+const SYS_MMAP: i64 = 9
+const PROT_RW: i64 = 3
+const MAP_PRIVATE_ANON: i64 = 34
+
+const OBJ_BYTES: u64 = 64
+const CHUNK_BYTES: u64 = 1048576
+
+// Zustandsblock der Halde
+const H_CHUNKS: u64 = 0
+const H_BUMP: u64 = 8
+const H_ENDE: u64 = 16
+const H_FREI: u64 = 24
+const H_LEBENDE: u64 = 32
+const H_BYTES: u64 = 40
+
+// Objektfelder
+const F_ZAEHLER: u64 = 0
+const F_ELTERN: u64 = 8
+const F_KIND: u64 = 16
+const F_NAECHST: u64 = 24
+const F_LISTENER: u64 = 32
+const F_WRAPPER: u64 = 40
+const F_WURZEL: u64 = 48
+const F_FREI: u64 = 56
+
+fn lk_ld(a: u64) -> u64 {
+    return *(a as *mut u64)
+}
+
+fn lk_st(a: u64, v: u64) {
+    *(a as *mut u64) = v
+}
+
+// Ohne feste Adresse, ohne MAP_FIXED; ein Fehlschlag ist sichtbar (0).
+fn lk_mmap(n: u64) -> u64 {
+    let len: u64 = (n + 4095) / 4096 * 4096
+    let r: i64 = syscall(SYS_MMAP, 0, len as i64, PROT_RW, MAP_PRIVATE_ANON, -1, 0)
+    if r < 0 && r > -4096 {
+        return 0
+    }
+    if r == 0 {
+        return 0
+    }
+    return r as u64
+}
+
+fn lk_heap_neu() -> u64 {
+    return lk_mmap(64)
+}
+
+fn lk_chunk_neu(h: u64) -> bool {
+    let c: u64 = lk_mmap(CHUNK_BYTES)
+    if c == 0 {
+        return false
+    }
+    lk_st(c, lk_ld(h + H_CHUNKS))
+    lk_st(h + H_CHUNKS, c)
+    lk_st(h + H_BUMP, c + 64)
+    lk_st(h + H_ENDE, c + CHUNK_BYTES)
+    lk_st(h + H_BYTES, lk_ld(h + H_BYTES) + CHUNK_BYTES)
+    return true
+}
+
+// Neues Objekt mit Zaehler 1 (die Referenz des Aufrufers). 0 = Speicher aus.
+fn lk_alloc(h: u64) -> u64 {
+    var o: u64 = lk_ld(h + H_FREI)
+    if o != 0 {
+        lk_st(h + H_FREI, lk_ld(o + F_FREI))
+    } else {
+        if lk_ld(h + H_BUMP) + OBJ_BYTES > lk_ld(h + H_ENDE) {
+            if !lk_chunk_neu(h) {
+                return 0
+            }
+        }
+        o = lk_ld(h + H_BUMP)
+        lk_st(h + H_BUMP, o + OBJ_BYTES)
+    }
+    var i: u64 = 0
+    while i < OBJ_BYTES {
+        lk_st(o + i, 0)
+        i = i + 8
+    }
+    lk_st(o + F_ZAEHLER, 1)
+    lk_st(h + H_LEBENDE, lk_ld(h + H_LEBENDE) + 1)
+    return o
+}
+
+fn lk_halten(o: u64) {
+    if o == 0 {
+        return
+    }
+    lk_st(o + F_ZAEHLER, lk_ld(o + F_ZAEHLER) + 1)
+}
+
+// Zaehler herunter; bei 0 die gehaltenen Verweise loslassen und den Block
+// zurueckgeben. Genau das erreicht einen Zyklus NIE.
+fn lk_lassen(h: u64, o: u64) {
+    if o == 0 {
+        return
+    }
+    let z: u64 = lk_ld(o + F_ZAEHLER)
+    if z > 1 {
+        lk_st(o + F_ZAEHLER, z - 1)
+        return
+    }
+    lk_st(o + F_ZAEHLER, 0)
+    let a: u64 = lk_ld(o + F_ELTERN)
+    let b: u64 = lk_ld(o + F_KIND)
+    let c: u64 = lk_ld(o + F_NAECHST)
+    let d: u64 = lk_ld(o + F_LISTENER)
+    let e: u64 = lk_ld(o + F_WRAPPER)
+    let f: u64 = lk_ld(o + F_WURZEL)
+    lk_st(o + F_ELTERN, 0)
+    lk_st(o + F_KIND, 0)
+    lk_st(o + F_NAECHST, 0)
+    lk_st(o + F_LISTENER, 0)
+    lk_st(o + F_WRAPPER, 0)
+    lk_st(o + F_WURZEL, 0)
+    lk_lassen(h, a)
+    lk_lassen(h, b)
+    lk_lassen(h, c)
+    lk_lassen(h, d)
+    lk_lassen(h, e)
+    lk_lassen(h, f)
+    lk_st(o + F_FREI, lk_ld(h + H_FREI))
+    lk_st(h + H_FREI, o)
+    lk_st(h + H_LEBENDE, lk_ld(h + H_LEBENDE) - 1)
+}
+
+// Starke Zuweisung: erst halten, dann schreiben, dann das Alte loslassen.
+fn lk_setz(h: u64, o: u64, feld: u64, wert: u64) {
+    let alt: u64 = lk_ld(o + feld)
+    lk_halten(wert)
+    lk_st(o + feld, wert)
+    lk_lassen(h, alt)
+}
+
+// Ein vollstaendiger Zyklensatz, Aufbau identisch zu dom.dom_zyklus_bauen():
+// 1 Wurzel + 3 Kinder (mit starkem Elternverweis) + Listener + Sammlung +
+// Wrapper. Liefert die Zahl der angelegten Objekte, 0 bei Speichermangel.
+fn lk_satz_bauen(h: u64) -> u64 {
+    let wurzel: u64 = lk_alloc(h)
+    if wurzel == 0 {
+        return 0
+    }
+    var letztes: u64 = 0
+    var i: u64 = 0
+    while i < 3 {
+        let k: u64 = lk_alloc(h)
+        if k == 0 {
+            lk_lassen(h, wurzel)
+            return 0
+        }
+        lk_setz(h, k, F_ELTERN, wurzel)
+        if letztes == 0 {
+            lk_setz(h, wurzel, F_KIND, k)
+        } else {
+            lk_setz(h, letztes, F_NAECHST, k)
+        }
+        letztes = k
+        lk_lassen(h, k)
+        i = i + 1
+    }
+    let l: u64 = lk_alloc(h)
+    if l == 0 {
+        lk_lassen(h, wurzel)
+        return 0
+    }
+    lk_setz(h, l, F_LISTENER, wurzel)
+    lk_setz(h, wurzel, F_LISTENER, l)
+    lk_lassen(h, l)
+
+    let s: u64 = lk_alloc(h)
+    if s == 0 {
+        lk_lassen(h, wurzel)
+        return 0
+    }
+    lk_setz(h, s, F_WURZEL, wurzel)
+    // Die Sammlung hat KEINEN Rueckverweis — sie verschwindet gleich wieder.
+    lk_lassen(h, s)
+
+    let w: u64 = lk_alloc(h)
+    if w == 0 {
+        lk_lassen(h, wurzel)
+        return 0
+    }
+    lk_setz(h, w, F_WRAPPER, wurzel)
+    lk_setz(h, wurzel, F_WRAPPER, w)
+    lk_lassen(h, w)
+
+    // Die letzte lokale Referenz auf die Wurzel wird abgegeben. Ein
+    // Tracing-Sammler wuerde den ganzen Satz jetzt einsammeln; der Zaehler
+    // kann es nicht: Kind haelt Eltern, Eltern halten Kind.
+    lk_lassen(h, wurzel)
+    return 7
+}
+
+// Kopfzeile 1 des Protokolls
+fn t_kopf1() {
+    var t: [u8; 33] = [
+        35, 32, 102, 105, 114, 110, 45, 100, 111, 109, 45, 115, 111, 97, 107,
+        32, 118, 49, 32, 118, 97, 114, 105, 97, 110, 116, 101, 61, 108, 101,
+        99, 107, 10,
+    ]
+    let p: u64 = (&t) as u64
+    mess.mess_schreib(p, 33)
+}
+// Kopfzeile 2: die Spaltennamen
+fn t_kopf2() {
+    var t: [u8; 76] = [
+        35, 32, 115, 112, 97, 108, 116, 101, 110, 58, 32, 116, 95, 109, 115,
+        9, 122, 121, 107, 108, 101, 110, 9, 114, 115, 115, 95, 107, 105, 98,
+        9, 108, 101, 98, 101, 110, 100, 101, 9, 115, 97, 109, 109, 101, 108,
+        108, 97, 101, 117, 102, 101, 9, 104, 101, 97, 112, 95, 98, 121, 116,
+        101, 115, 9, 112, 97, 117, 115, 101, 95, 109, 97, 120, 95, 110, 115,
+        10,
+    ]
+    let p: u64 = (&t) as u64
+    mess.mess_schreib(p, 76)
+}
+// Schlusszeile, Teil 1
+fn t_fertig() {
+    var t: [u8; 16] = [
+        35, 32, 102, 101, 114, 116, 105, 103, 32, 122, 121, 107, 108, 101, 110,
+        61,
+    ]
+    let p: u64 = (&t) as u64
+    mess.mess_schreib(p, 16)
+}
+// Schlusszeile, Teil 2
+fn t_tms() {
+    var t: [u8; 6] = [
+        32, 116, 95, 109, 115, 61,
+    ]
+    let p: u64 = (&t) as u64
+    mess.mess_schreib(p, 6)
+}
+// Schlusszeile, Teil 3
+fn t_laeufe() {
+    var t: [u8; 14] = [
+        32, 115, 97, 109, 109, 101, 108, 108, 97, 101, 117, 102, 101, 61,
+    ]
+    let p: u64 = (&t) as u64
+    mess.mess_schreib(p, 14)
+}
+// Schlusszeile, Teil 4
+fn t_rss() {
+    var t: [u8; 9] = [
+        32, 114, 115, 115, 95, 107, 105, 98, 61,
+    ]
+    let p: u64 = (&t) as u64
+    mess.mess_schreib(p, 9)
+}
+// Fehlerzeile
+fn t_fehler() {
+    var t: [u8; 14] = [
+        35, 32, 102, 101, 104, 108, 101, 114, 32, 99, 111, 100, 101, 61,
+    ]
+    let p: u64 = (&t) as u64
+    mess.mess_schreib(p, 14)
+}
+
+// Eine Datenzeile des Protokolls. Die Spalte `sammellaeufe` ist hier immer 0 —
+// diese Fassung hat keinen Sammler. `rss_kib` ist NIE 0: genau daran wird das
+// Leck sichtbar.
+fn zeile(t_ms: u64, zyklen: u64, rss: u64, lebende: u64, laeufe: u64, heap: u64, pause: u64) {
+    mess.mess_u64(t_ms)
+    mess.mess_tab()
+    mess.mess_u64(zyklen)
+    mess.mess_tab()
+    mess.mess_u64(rss)
+    mess.mess_tab()
+    mess.mess_u64(lebende)
+    mess.mess_tab()
+    mess.mess_u64(laeufe)
+    mess.mess_tab()
+    mess.mess_u64(heap)
+    mess.mess_tab()
+    mess.mess_u64(pause)
+    mess.mess_nl()
+}
+
+fn fehler(code: u64) -> i32 {
+    t_fehler()
+    mess.mess_u64(code)
+    mess.mess_nl()
+    return code as i32
+}
+
+fn main() -> i32 {
+    let h: u64 = lk_heap_neu()
+    if h == 0 {
+        return fehler(2)
+    }
+    t_kopf1()
+    t_kopf2()
+    let rss0: u64 = mess.mess_rss_kib()
+    if rss0 == 0 {
+        return fehler(3)
+    }
+    let t0: u64 = mess.mess_jetzt_ms()
+    zeile(0, 0, rss0, lk_ld(h + H_LEBENDE), 0, lk_ld(h + H_BYTES), 0)
+
+    var zyklen: u64 = 0
+    var seit: i64 = 0
+    var t: u64 = 0
+    var laufen: bool = true
+    while laufen {
+        let n: u64 = lk_satz_bauen(h)
+        if n != 7 {
+            return fehler(4)
+        }
+        zyklen = zyklen + 1
+        seit = seit + 1
+        if seit >= STICHPROBE {
+            seit = 0
+            t = mess.mess_jetzt_ms() - t0
+            let rss: u64 = mess.mess_rss_kib()
+            if rss == 0 {
+                return fehler(5)
+            }
+            zeile(t, zyklen, rss, lk_ld(h + H_LEBENDE), 0, lk_ld(h + H_BYTES), 0)
+            if t >= BUDGET_MS as u64 || zyklen >= ZYKLEN_MAX as u64 {
+                laufen = false
+            }
+        }
+    }
+    t_fertig()
+    mess.mess_u64(zyklen)
+    t_tms()
+    mess.mess_u64(t)
+    t_laeufe()
+    mess.mess_u64(0)
+    t_rss()
+    mess.mess_u64(mess.mess_rss_kib())
+    mess.mess_nl()
+    return 0
+}
