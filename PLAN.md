@@ -472,3 +472,296 @@ Registerzuteilung und Codegen ohne Aenderung.
 4. SPEC.md wird nicht umgeschrieben; Abweichungen kommen nach §14.1.
 5. Keine geschoenten Zahlen. Ein nicht unterstuetzter Fall ist ein
    **Fehlschlag** — der Harness filtert nichts.
+
+---
+
+# PLAN — Runde 4 (Haertetest 2): Speichermodell SPEC §3 + DOM-Prototyp mit Zyklen
+
+Ziel dieser Runde ist **Abnahmepunkt 2** aus `ABNAHME.md`: das Speichermodell aus
+`SPEC.md` §3 wirklich bauen (`Rc`/`Weak`, Opt-in-Tracing-GC, `#[no_gc]`) und mit
+einem **DOM-Prototypen in Firn** belegen, dass zyklische Objektgraphen ohne Leck
+getragen werden — gemessen, nicht behauptet.
+
+Reihenfolge der Wichtigkeit, wenn die Zeit knapp wird:
+**GC-Kern > `#[no_gc]` > DOM-Prototyp + Dauerlauf + Negativtest > `Rc`.**
+Ein ehrlich gemessener Zehnminutenlauf schlaegt einen behaupteten 24-Stunden-Lauf.
+Was nicht fertig wird, kommt als offener Punkt nach `SPEC.md` §14.1 — niemals als
+Behauptung in `README.md`.
+
+## 0. Was der Lead vor dieser Runde gebaut hat — steht, laeuft, nicht neu bauen
+
+Zustand vor der Runde selbst gemessen: `bash test.sh` **PASS 485/485**, Exit 0,
+`cargo build --release` **null Warnungen**, `cargo test --release` 122/122.
+
+Neu im Baum (Skelett dieser Runde, schon gruen):
+
+| Datei | Inhalt |
+|---|---|
+| `compiler/src/gc.rs` | **neu, leer bis auf den Vertrag.** Drei Abfragen, die andere Module benutzen duerfen: `ist_gc_alloc_aufruf(name) -> bool`, `ist_gc_zeiger(&Type) -> bool`. Liefern in der Skelettfassung `false`. Modul `gckern` fuellt die Datei. |
+| `compiler/src/nogc.rs` | **neu, arbeitsfaehig.** Traegt `hat_no_gc(&FnDecl)` und `hook_check(ck, prog)`: laeuft ueber alle `#[no_gc]`-Funktionen, prueft **Regel 2** (Aufruf einer Funktion ohne `#[no_gc]`) vollstaendig und **Regel 1/3** ueber die zwei Abfragen aus `gc.rs`. Modul `nogc` haertet die Datei. |
+| `compiler/src/sema.rs` | genau **eine** Zeile eingefuegt: `// HOOK nogc` + `crate::nogc::hook_check(self, prog)` in `Checker::run`, nach `add_items_inner`, vor `check_main`. |
+| `compiler/src/main.rs` | `mod gc;` und `mod nogc;` eingetragen. |
+| `lib/gc/`, `lib/rc/`, `lib/dom/`, `tools/dom_soak/`, `docs/berichte/` | leere Verzeichnisse fuer die Module dieser Runde. |
+
+**Damit muss kein Modul mehr `sema.rs` oder `main.rs` anfassen, um seinen Hook
+zu bekommen** — das war der Zweck des Skeletts.
+
+## 1. Dateieigentum in Runde 4 — zwei Module fassen NIE dieselbe Datei an
+
+| Modul | Darf schreiben | Darf **nicht** anfassen |
+|---|---|---|
+| **gckern** | `compiler/src/gc.rs`, `compiler/src/gc_lower.rs` (neu), `lib/gc/*.fi`, und als **einziges Modul** die bestehenden Compilerdateien `parser.rs`, `lexer.rs`, `ast.rs`, `sema.rs`, `sema_generic.rs`, `types.rs`, `layout.rs`, `lower.rs`, `lower_errors.rs`, `errors.rs`, `mono.rs`, `modules.rs`, `abi.rs`, `codegen_x86.rs`, `fir.rs`, `opt.rs`, `mem2reg.rs`, `regalloc.rs`, `main.rs`; `tests/50*_gc_*.fi` … `tests/53*_gc_*.fi`, `tests/neg/gc_*.fi`; `docs/GC.md`, `docs/berichte/gckern.md` | `compiler/src/nogc.rs`, `compiler/src/attrs.rs`, `lib/rc/`, `lib/dom/`, `tools/`, `test.sh`, `SPEC.md`, `ABNAHME.md`, `README.md` |
+| **nogc** | `compiler/src/nogc.rs`, `compiler/src/attrs.rs`, `lib/html/*.fi`, `tests/54*_no_gc_*.fi`, `tests/neg/nogc_*.fi`, `docs/berichte/nogc.md` | alle anderen Compilerdateien (Hook steht bereits), `lib/gc/`, `lib/dom/`, `test.sh`, Dokumente |
+| **rclib** | `lib/rc/*`, `tests/modules/rc.fi`, `tests/55*_rc_*.fi`, `tests/neg/rc_*.fi`, `docs/RC.md`, `docs/berichte/rclib.md` | Compilerquellen, `lib/dom/`, `lib/gc/`, `test.sh`, Dokumente |
+| **dom** | `lib/dom/*.fi`, `tests/modules/dom.fi` (Symlink), `tests/56*_dom_*.fi`, `docs/berichte/dom.md` | Compilerquellen, `lib/rc/`, `lib/gc/`, `tools/`, `test.sh`, Dokumente |
+| **mess** | `tools/dom_soak/*`, `test.sh` (nur **Anhaengen** von Abschnitt 10), `ABNAHME.md`, `README.md`, `SPEC.md` §14.1, `RUN.md`, `PLAN.md`, `docs/berichte/mess.md` | jede Quelldatei in `compiler/`, `lib/` |
+
+Neue `tests/*.fi` werden von `test.sh` automatisch eingesammelt — dafuer muss
+niemand `test.sh` anfassen. **Nur `mess`** darf `test.sh` erweitern, und nur
+durch Anhaengen eines neuen Abschnitts; bestehende Abschnitte bleiben
+byte-identisch.
+
+## 2. Die Sprachoberflaeche des GC — verbindlicher Vertrag
+
+`gckern` setzt genau das um, `dom` schreibt genau dagegen. Abweichungen nur mit
+Eintrag in `SPEC.md` §14.1 (durch `mess`, nach Bericht des Moduls).
+
+### 2.1 Deklaration
+
+```firn
+gc class Node {
+    eltern:      GcWeak[Node],
+    erstes_kind: Gc[Node],
+    naechstes:   Gc[Node],
+    kennung:     u32,
+}
+
+gc class Element extends Node {
+    tag:   u32,
+    attrs: Gc[Attribut],
+}
+```
+
+* `gc class` ist die einzige Art, GC-verwaltete Werte zu deklarieren. Ein
+  `gc class`-Wert lebt **nur** auf dem GC-Heap: kein Wert auf dem Stapel, kein
+  Feld eines `struct`, kein Rueckgabetyp — jeder Versuch ist ein Compilerfehler
+  mit Zeile/Spalte.
+* Erlaubte Feldtypen: skalare Typen (Ganzzahlen, `bool`, `*T`/`*mut T`),
+  `Gc[T]`, `GcWeak[T]` und Arrays davon (`[u8; 32]`). Alles andere ist ein
+  Compilerfehler. `GcVec`/`GcMap` aus SPEC §3.5.2 sind **nicht** Teil dieser
+  Runde (Eintrag §14.1); Listen baut `dom` aus `Gc`-Feldern.
+* `extends`: eine Basis, Basisfelder liegen **vorne** (Praefixlayout), damit die
+  Aufwaertsumwandlung kostenlos ist. Feldnamen der Basis duerfen nicht erneut
+  vergeben werden. Keine Mehrfachvererbung. `virtual`/`override` sind **nicht**
+  Teil dieser Runde (§14.1) — die Sprache kennt in Stufe 0 keine Methoden.
+
+### 2.2 Ausdruecke
+
+| Form | Typ | Bedeutung |
+|---|---|---|
+| `gc Name{ f: v, … }` | `AllocError!Gc[Name]` | Allokation auf dem GC-Heap. **Alle** Felder muessen angegeben werden. Bei Erschoepfung: erst Sammellauf, dann `AllocError::OutOfMemory`. Ergebnis ist `#[must_consume]` (kommt von der Fehlerunion) — Verwerfen ist Compilerfehler. |
+| `gc_null[Name]()` | `Gc[Name]` | Nullwert |
+| `weak_null[Name]()` | `GcWeak[Name]` | Nullwert |
+| `weak(g)` | `GcWeak[T]` | schwacher Verweis auf `g: Gc[T]`; haelt nicht am Leben |
+| `stark(w)` | `Gc[T]` | Aufwertung; **Nullwert**, wenn das Ziel eingesammelt wurde |
+| `g.feld` | Feldtyp | Lesen mit implizitem Deref, auch geerbte Felder |
+| `g.feld = v` | — | Schreiben; die Einfuegebarriere sitzt genau hier |
+| `g.as?[Element]` | `Gc[Element]` | geprueft abwaerts; Nullwert, wenn die Typkennung nicht in der Ahnenkette liegt. (`?Gc[T]` aus SPEC §4.4 ist in Stufe 0 der nullbare `Gc[T]` — §14.1) |
+| `g == h`, `g != h` | `bool` | Identitaetsvergleich, auch gegen `gc_null[T]()` |
+| `Gc[Element]` → `Gc[Node]` bei `let`/Zuweisung/Argument/`return` | — | kostenlose Aufwaertsumwandlung |
+
+`AllocError { OutOfMemory }` wird von der GC-Laufzeit programmweit deklariert
+(Fehlermengennamen sind programmweit, siehe `tests/414_modul_fehler.fi`) und ist
+in jedem Programm verfuegbar, das den GC benutzt. `rclib` benutzt **dieselbe**
+Menge; solange `gckern` sie noch nicht bereitstellt, deklariert `rclib` sie
+selbst in seinem Modul und `mess` traegt am Ende ein, welche der beiden
+Fassungen im Baum steht.
+
+### 2.3 Sammler-Schnittstelle (`gc.stats()` in Stufe-0-Form, §14.1)
+
+Aufrufbar ohne `import`, vom Compiler bereitgestellt:
+
+| Aufruf | Typ | Bedeutung |
+|---|---|---|
+| `gc_init()` | `bool` | einmal als Erstes in `main`: Heap anlegen, Stapelboden merken. `false` = `mmap` fehlgeschlagen — der Aufrufer **muss** sichtbar scheitern. |
+| `gc_collect()` | `u64` | erzwingt einen Sammellauf, liefert die Pausenzeit in ns |
+| `gc_collections()` | `u64` | Anzahl Sammellaeufe |
+| `gc_live_objects()` | `u64` | lebende Objekte nach dem letzten Lauf, **gezaehlt** |
+| `gc_heap_bytes()` | `u64` | vom Sammler beim Betriebssystem geholte Bytes |
+| `gc_live_bytes()` | `u64` | belegte Bytes der lebenden Objekte |
+| `gc_pause_ns_last()`, `gc_pause_ns_max()`, `gc_pause_ns_total()` | `u64` | Pausenzeiten, echt gemessen (`clock_gettime`) |
+
+Zusagen, die `gckern` einhaelt (SPEC §3.5.3):
+Mark-Sweep, **praezise** Heap-Verfolgung ueber compilergenerierte `trace`-Tabellen
+aus dem Feldlayout; **konservativer** Stapel- **und Register**-Scan (Register
+werden vor dem Lauf auf den Stapel gerettet, sonst waere die Zusage falsch);
+**kein Kompaktieren**; Groessenklassen-Allokator gegen Fragmentierung; Sammlung
+**nur** an `gc Name{…}`-Stellen und bei `gc_collect()`; ein Heap pro Faden;
+kein `MAP_FIXED`, keine feste Adresse, `mmap`-Fehler sichtbar.
+Inkrementelles Sammeln (`S5`) und Finalisierer (`S4`) sind **nicht** Teil dieser
+Runde und werden in §14.1 als offen gefuehrt.
+
+Empfohlener Weg fuer die Laufzeit, damit es keine Modulpfad-Probleme gibt: die
+Sammler-Laufzeit steht als **lesbares Firn** in `lib/gc/gc.fi` und wird vom
+Compiler per `include_str!` eingebettet und als zusaetzliches Modul eingezogen,
+sobald ein `gc class` im Programm vorkommt. Der Zustand des Sammlers liegt in
+einem vom Codegenerator angelegten Datenblock; ein Intrinsic liefert dessen
+Adresse (Stufe 0 hat keine globalen Variablen). Ein Programm braucht **kein**
+`import` und keine zusaetzliche Kommandozeilenoption.
+
+### 2.4 `#[no_gc]` (Modul `nogc`)
+
+Verboten in einer `#[no_gc]`-Funktion, transitiv, Fehler mit Zeile/Spalte:
+(i) GC-Allokation bzw. Aufruf einer Sammler-Funktion, (ii) Aufruf einer
+Funktion ohne `#[no_gc]`, (iii) Schreiben in ein `Gc[T]`/`GcWeak[T]`-Feld.
+`attrs.rs`: `no_gc` auf `umgesetzt: true` und den Test
+`nur_must_consume_ist_umgesetzt` mitziehen (`vec!["must_consume", "no_gc"]`).
+Nachweis: der vorhandene HTML5-Tokenizer in `lib/html/` wird mit `#[no_gc]`
+markiert und uebersetzt weiter — die Quote in `tools/tokenizer/run.sh` darf
+sich **nicht** verschlechtern (6.810/6.810 bzw. 6.809/6.810).
+
+## 3. Der DOM-Prototyp (Modul `dom`) — Vertrag
+
+`lib/dom/dom.fi` ist **eine** Moduldatei ohne eigene `import`-Zeilen (Importe
+werden relativ zur Wurzeldatei aufgeloest; ein Symlink `tests/modules/dom.fi`
+macht dasselbe Modul fuer `tests/*.fi` erreichbar, ohne den Code zu doppeln).
+Wurzelprogramme liegen daneben und binden es mit `import dom` ein.
+
+Diese Zyklenarten **muessen** wirklich vorkommen — ein Baum ohne Rueckverweise
+zaehlt nicht:
+
+1. `gc class Node` mit **Elternverweis UND Kinderliste**; mindestens eine
+   Variante mit **starkem** Elternverweis (`Gc[Node]`), damit der Zyklus echt
+   ist und nicht durch `GcWeak` wegdefiniert wird.
+2. `gc class Element extends Node` mit Attributen (Atom-Kennung → Text).
+3. **Listener als eigene Objekte**, die ihren Knoten halten, waehrend der Knoten
+   den Listener haelt (Zyklus ueber zwei Objekte).
+4. eine **live `HTMLCollection`**-artige Struktur, die ihren Wurzelknoten haelt.
+5. ein **Observer ueber `GcWeak`**, der sein Ziel nicht am Leben haelt, mit Test,
+   dass das Ziel wirklich eingesammelt wird und `stark(w)` danach den Nullwert
+   liefert.
+6. ein simulierter **JS-Wrapper**: Wrapper haelt Knoten, Knoten haelt Wrapper.
+
+Pflichtfunktionen im Modul `dom` (Namen fest, `mess` und die Tests haengen dran):
+
+```
+fn dom_zyklus_bauen() -> AllocError!u64      // baut EINEN vollstaendigen Zyklus-Satz
+                                             // (1..4 und 6), liefert die Zahl der
+                                             // dabei angelegten Objekte
+fn dom_zyklus_verwerfen()                    // laesst den letzten Satz unerreichbar werden
+fn dom_selbsttest() -> i32                   // 0 = alle Zyklenarten geprueft, sonst Fehlercode
+```
+
+## 4. Dauerlauf und Messung (Modul `mess`, Programme von `dom`)
+
+`dom` liefert zwei **Wurzelprogramme** mit identischem Aufbau:
+`lib/dom/soak_gc.fi` (GC-Fassung, darf **nicht** lecken) und
+`lib/dom/soak_leck.fi` (absichtlich leckende Fassung: Zyklus ueber Zaehlverweise
+statt `Gc`, selbst enthalten, **ohne** `import` von `lib/rc`).
+
+Beide enthalten diese drei Zeilen woertlich, damit `tools/dom_soak/run.sh` sie
+mit `sed` in eine Arbeitskopie umstellen kann:
+
+```firn
+const BUDGET_MS: i64 = 600000  // SOAK_BUDGET_MS
+const ZYKLEN_MAX: i64 = 100000000  // SOAK_ZYKLEN_MAX
+const STICHPROBE: i64 = 1000  // SOAK_STICHPROBE
+```
+
+Ausgabeprotokoll auf der Standardausgabe (TSV, verbindlich):
+
+```
+# firn-dom-soak v1 variante=gc
+# spalten: t_ms  zyklen  rss_kib  lebende  sammellaeufe  heap_bytes  pause_max_ns
+0       0       1234    0       0       0       0
+150     1000    1560    412     3       262144  180000
+…
+# fertig zyklen=123456 t_ms=600001 sammellaeufe=987 rss_kib=1560
+```
+
+* Eine Datenzeile je `STICHPROBE` Zyklen, Felder mit Tabulator getrennt.
+* `rss_kib` kommt aus `/proc/self/statm` (Feld 2 × Seitengroesse), `lebende`,
+  `sammellaeufe`, `heap_bytes`, `pause_max_ns` aus den `gc_*`-Aufrufen. Die
+  Leckfassung darf `0` in den GC-Spalten schreiben, `rss_kib` aber **nie**.
+* Abbruch, wenn `t_ms >= BUDGET_MS` oder `zyklen >= ZYKLEN_MAX`. Exit 0 nur bei
+  vollstaendigem Lauf; jeder Fehler (auch `mmap`) endet mit Exit != 0 und einer
+  Zeile `# fehler …`.
+
+`tools/dom_soak/run.sh` (Modul `mess`):
+1. baut beide Programme in **allen drei Baustufen** (`opt`, `--no-opt`,
+   `--opt-level=dev-fast`) und prueft, dass der Kurzlauf ueberall dasselbe
+   Ergebnis liefert;
+2. faehrt die GC-Fassung mit `SOAK_SEK` (Standard 600 s, in `test.sh` deutlich
+   kuerzer) und mindestens 100.000 Zyklen;
+3. faehrt die Leckfassung im **gleichen** Aufbau;
+4. wertet aus: Aufwaermphase = erstes Viertel der Stichproben, danach Vergleich
+   der Mediane des zweiten und des letzten Viertels fuer `rss_kib` und
+   `lebende`. **Urteil:** GC-Fassung `PASS`, wenn kein monotoner Anstieg
+   (Schwelle in der Datei dokumentiert, z. B. < 5 % und keine durchgehend
+   steigende Folge); Leckfassung muss **anschlagen** — bleibt sie gruen, endet
+   `run.sh` mit Exit != 0 und der Meldung, dass die Messung nichts taugt;
+5. schreibt die Messreihe als Tabelle nach `tools/dom_soak/messung-*.tsv` und
+   eine Zusammenfassung auf die Standardausgabe;
+6. Exit 0 nur, wenn (4) fuer beide Fassungen das erwartete Urteil liefert.
+
+`mess` traegt danach in `ABNAHME.md` Punkt 2 die **echten** Werte ein: Laufzeit,
+Zyklenzahl, RSS-Verlauf, Sammellaeufe, lebende Objekte, dazu ausdruecklich den
+Satz, dass der 24-Stunden-Lauf aus der Abnahme **noch aussteht**, und was nicht
+gebaut wurde (inkrementelles Sammeln, `virtual`, `GcVec`/`GcMap`,
+Finalisierer).
+
+## 5. `Rc[T]`/`Weak[T]` (Modul `rclib`) — Vertrag
+
+Reines Firn, keine Compileraenderung. Implementierung genau einmal im Baum:
+`tests/modules/rc.fi` (Modul `rc`), erreichbar aus `tests/*.fi` per
+`import modules.rc`; `lib/rc/rc.fi` ist ein **Symlink** darauf, damit der
+Bibliothekspfad existiert, ohne Code zu doppeln.
+
+* `Rc[T]` ist **immer unveraenderlich** — keine Innenveraenderlichkeit, kein
+  `RefCell`-Aequivalent. Lesende Zugriffsfunktion, keine schreibende.
+* Fehlbare Allokation: `rc_neu[T](inout alloc, wert) -> AllocError!Rc[T]`
+  (Stufe 0 kennt keine Methoden — `Rc[T].neu` aus SPEC §3.4 wird als Funktion
+  geschrieben, Eintrag §14.1).
+* `weak_von`/`aufwerten` fuer `Weak[T]`, `rc_klonen`, `rc_freigeben`.
+* `Arc[T]` (atomarer Zaehler) darf entfallen, wenn die Zeit knapp ist — dann
+  ehrlich in §14.1.
+* **Pflichttest:** ein `Rc`-Zyklus **leckt** und das wird sichtbar gemacht
+  (Test, der belegt, dass der Zaehler nie 0 wird und der Speicher gehalten
+  bleibt) plus ein Satz in `docs/RC.md`, dass das so gewollt ist.
+
+## 6. Reihenfolge und Abhaengigkeiten
+
+* `gckern` legt sofort los und ist der kritische Pfad. Es liefert **zuerst** die
+  Sprachoberflaeche aus §2 in kleinster tragfaehiger Form (Deklaration,
+  Allokation, Feldzugriff, Sammellauf, Statistik) und **erst danach** `extends`
+  und `as?`.
+* `nogc` ist unabhaengig: Regel 2 laesst sich vollstaendig ohne `gckern` bauen
+  und testen; Regeln 1 und 3 werden ueber die zwei Abfragen aus `gc.rs` scharf,
+  sobald `gckern` sie fuellt. Die `lib/html/`-Markierung geht sofort.
+* `rclib` ist vollstaendig unabhaengig — die Rueckfallposition der Runde.
+* `dom` schreibt gegen §2 und prueft laufend gegen den jeweils gebauten Stand.
+  Wenn `gckern` in Teilen nicht fertig wird, liefert `dom` trotzdem den
+  Selbsttest, die Leckfassung und den Bericht — und schreibt ehrlich, was nicht
+  uebersetzt.
+* `mess` baut `run.sh` gegen das Protokoll aus §4 und kann es lange vor `dom`
+  fertig haben (Probe mit einer selbst geschriebenen TSV-Datei). Die Zahlen in
+  `ABNAHME.md`/`README.md` werden **zuletzt** selbst gemessen.
+
+## 7. Nicht verhandelbar
+
+1. `bash test.sh` bleibt gruen, alle Abschnitte, 485 Tests als Untergrenze.
+   Kein Test wird entfernt, umgeschrieben oder abgeschwaecht.
+2. `cargo build --release` **ohne Warnungen**; keine externen Kisten; kein
+   `#![allow(...)]`, kein `#[allow(dead_code)]` auf nicht verdrahteten Feldern,
+   kein `todo!()`/`unimplemented!()`. Nicht Umgesetztes meldet einen sauberen
+   Compilerfehler mit Zeile/Spalte.
+3. Jedes neue `tests/*.fi` laeuft in drei Baustufen mit demselben Ergebnis.
+4. Keine feste Speicheradresse, kein `MAP_FIXED`; fehlgeschlagenes `mmap`
+   scheitert sichtbar.
+5. `SPEC.md` wird nicht umgeschrieben — Abweichungen kommen nach §14.1.
+6. Jedes Modul schreibt seinen Bericht nach `docs/berichte/<modul>.md`:
+   was gebaut, was gemessen (echte Ausgaben), was offen. `mess` faltet das in
+   `ABNAHME.md` und `README.md` zusammen.
+7. Ein GC, der im Test nicht nachweislich sammelt, ist wertlos. Jeder
+   GC-Testfall belegt seine Behauptung mit `gc_collections()` und
+   `gc_live_objects()`.
