@@ -50,6 +50,8 @@ struct Options {
     optimize: bool,
     keep_asm: bool,
     stats: bool,
+    /// Baustufe und einzeln abgeschaltete Durchgaenge (DESIGNZIELE.md §5)
+    optcfg: opt::OptConfig,
 }
 
 fn usage() -> String {
@@ -68,7 +70,11 @@ fn usage() -> String {
          --emit=fir-opt     FIR nach dem Optimierer\n  \
          --emit=tokens      Tokenstrom (Fehlersuche)\n  \
          --emit=ast         AST als Debug-Text (Fehlersuche)\n  \
-         --no-opt           Optimierer abschalten\n  \
+         --no-opt           Optimierer abschalten (= --opt-level=dev)\n  \
+         --opt-level=<stufe> dev | dev-fast | release-safe | release-fast\n  \
+                              ('dev-fast' = nur debugerhaltende Durchgaenge)\n  \
+         --no-pass=<name>   einzelnen Optimierungsdurchgang abschalten\n  \
+         --list-passes      Durchgangsregister mit Etiketten ausgeben\n  \
          --strlit=<lit>     zeichenkettenliteral entschluesseln (\"..\", b\"..\", u\"..\")\n  \
          --stats            Groesse der FIR ausgeben (Instruktionen/Bloecke)\n  \
          --keep-asm         erzeugte .s-Datei behalten\n  \
@@ -89,6 +95,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut optimize = true;
     let mut keep_asm = false;
     let mut stats = false;
+    let mut optcfg = opt::OptConfig::default();
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -101,7 +108,39 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                 println!("{} {}", config::compiler_name(), config::VERSION);
                 std::process::exit(0);
             }
-            "--no-opt" => optimize = false,
+            "--no-opt" => {
+                optimize = false;
+                optcfg.level = opt::Level::Dev;
+            }
+            "--list-passes" => {
+                print!("{}", opt::passes_text());
+                std::process::exit(0);
+            }
+            _ if a.starts_with("--opt-level=") => {
+                let v = &a["--opt-level=".len()..];
+                match opt::Level::from_str(v) {
+                    Some(l) => {
+                        optcfg.level = l;
+                        optimize = l != opt::Level::Dev;
+                    }
+                    None => {
+                        return Err(format!(
+                            "unbekannte Baustufe '{}' (erlaubt: dev, dev-fast, release-safe, release-fast)",
+                            v
+                        ))
+                    }
+                }
+            }
+            _ if a.starts_with("--no-pass=") => {
+                let v = &a["--no-pass=".len()..];
+                if !opt::OptConfig::is_known(v) {
+                    return Err(format!(
+                        "unbekannter Optimierungsdurchgang '{}' — '--list-passes' zeigt alle",
+                        v
+                    ));
+                }
+                optcfg.disabled.push(v.to_string());
+            }
             _ if a.starts_with("--strlit=") => {
                 // Modul str: Literalpfad (Bytes/Str/Str16, Maskierungen, WTF-16)
                 // ohne Quelldatei nachpruefbar machen.
@@ -153,7 +192,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         i += 1;
     }
     match input {
-        Some(input) => Ok(Options { input, output, emit, optimize, keep_asm, stats }),
+        Some(input) => Ok(Options { input, output, emit, optimize, keep_asm, stats, optcfg }),
         None => Err(format!("keine Eingabedatei angegeben (.{})", config::FILE_EXT)),
     }
 }
@@ -283,7 +322,7 @@ fn run(opts: &Options) -> i32 {
 
     // --- Optimierer ---
     if opts.optimize {
-        let st = opt::optimize(&mut module);
+        let st = opt::optimize_with(&mut module, &opts.optcfg);
         if std::env::var(format!("{}_OPT_STATS", config::compiler_name().to_uppercase())).is_ok() {
             eprintln!(
                 "opt: {} Konstanten gefaltet, {} Instruktionen entfernt, {} Bloecke entfernt",

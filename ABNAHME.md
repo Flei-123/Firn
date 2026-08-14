@@ -2,7 +2,8 @@
 
 **Maßgeblich:** `../karstos-browser/FIRN-ANFORDERUNGEN.md` §13
 **Stand dieser Datei:** 2026-08-13, **nach der Zusammenführung von Runde 2**
-**Gesamtergebnis: 0 von 6 bestanden**, 2 teilweise (Punkte 4 und 5), 4 offen.
+**Gesamtergebnis: 0 von 6 bestanden**, 3 teilweise, 3 offen.
+**Stand 14.08.2026:** `test.sh` **380/380** (97 Programme × 3 Stufen opt/noopt/dev-fast, 30 Negativtests, 41 Optimierer-Nachweise, Ergebnisort-Nachweis).
 
 Alle Zahlen in dieser Datei wurden bei der Zusammenführung **selbst ausgeführt**,
 nicht von den Teilmodulen übernommen. Reproduktion: `RUN.md`.
@@ -304,3 +305,27 @@ bleiben stehen" ist dabei **schärfer** geworden, nicht schwächer.
 * Zwei Codegen-Pfade: bei mehr als sechs Parametern/Argumenten und bei
   anweisungsgenauen Debugzeilen (`--no-opt`) übernimmt der Grundpfad aus
   Runde 1 (SPEC §14.1.opt O2).
+
+---
+
+## Fundamentarbeit aus DESIGNZIELE.md (Nachtrag 14.08.2026)
+
+Nicht Teil der sechs Abnahmepunkte, aber Voraussetzung dafür, dass sie später
+überhaupt erreichbar bleiben (`DESIGNZIELE.md` §10):
+
+| Fundamentpunkt | Stand | Nachweis |
+|---|---|---|
+| Durchgangsregister mit Etikett *debugerhaltend* | **`[x]`** | `firnc --list-passes` — 9 Durchgänge, genau einer (`inline`) nicht debugerhaltend |
+| Baustufen `--opt-level=dev/dev-fast/release-safe/release-fast` | **`[x]`** | `bash tools/baustufen/run.sh 3` → **dev-fast 2,06×**, dev 10,54× gegenüber release-fast |
+| Ergebnisort-Garantie für Aggregatrückgaben | **`[x]`** | `bash tools/ergebnisort/run.sh` → 1-MB-Struktur, `baue` hat 224 Byte Rahmen, keine Bulk-Kopie |
+| Ergebnisort für Struct-/Arrayliterale und `init` | **`[~]`** | Literale schreiben bereits feldweise ins Ziel (`lower.rs: write_into`); als Garantie in SPEC festgeschrieben, `init` gibt es noch nicht |
+| Feldzugriff vom Speicherort trennen (Vorbedingung SoA) | **`[ ]`** | noch fest „Basis + Versatz" |
+| Prüfphasen wiedereintrittsfähig (Vorbedingung `comptime emit`) | **`[ ]`** | einmaliger Durchlauf |
+| `!T` + `#[must_consume]` | **`[ ]`** | Phase 2 |
+| Symbol-Namensschema mit Versionsplatz | **`[ ]`** | Phase 3, mit der Paketverwaltung |
+
+**Nebenbefund:** Die neue Stufe `--dev-fast` hat beim ersten Durchlauf einen
+echten Codegenerator-Fehler aufgedeckt (Argumentregister 5/6 wurden im Prolog
+überschrieben, `tests/024_six_args.fi` lieferte 13 statt 21). Er war in 259
+grünen Tests unsichtbar, weil die betroffene Funktion in den Release-Stufen
+immer eingebettet wurde. Behoben; Regressionstest `tests/025_argreg_shuffle.fi`.

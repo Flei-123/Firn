@@ -5,13 +5,16 @@
 #   1. Compiler bauen (cargo build --release) — Warnungen werden gemeldet.
 #   2. Modul-Tests des Compilers (cargo test --release).
 #   3. Jedes Programm in tests/, tests/opt/ und examples/ wird ZWEIMAL
-#      uebersetzt (mit Optimierer und mit --no-opt), assembliert, gelinkt,
+#      uebersetzt (--opt-level=release-fast, --no-opt und --opt-level=dev-fast),
+#      assembliert, gelinkt,
 #      AUSGEFUEHRT und Exit-Code bzw. Standardausgabe gegen die Erwartung
 #      in Zeile 1 geprueft (// expect_exit: N  bzw.  // expect_out: TEXT).
 #   4. Jedes Programm in tests/neg/ muss mit Exit-Code != 0 abbrechen und die
 #      erwartete Meldung mit Zeile:Spalte ausgeben (// expect_error: Z:S TEXT).
 #      Ein Rust-Panic gilt als Fehlschlag.
 #   5. Nachweis des Optimierers (test_opt.sh: FIR vorher/nachher).
+#   6. Nachweis der Ergebnisort-Garantie (tools/ergebnisort/run.sh:
+#      Rahmengroessen im erzeugten Assembler).
 #
 # Kein '|| true', kein Verschlucken von Exit-Codes: set -euo pipefail.
 set -euo pipefail
@@ -38,13 +41,14 @@ echo "   cargo test: ok"
 rm -rf "$WORK"
 mkdir -p "$WORK"
 
-run_case() {          # $1 = Datei, $2 = "opt" | "noopt"
+run_case() {          # $1 = Datei, $2 = "opt" | "noopt" | "devfast"
     local file="$1" mode="$2"
     local base ext bin flags hdr exp out rc
     base=$(basename "$file" .fi)
     bin="$WORK/${base}.${mode}"
     flags=""
-    [ "$mode" = "noopt" ] && flags="--no-opt"
+    [ "$mode" = "noopt" ]   && flags="--no-opt"
+    [ "$mode" = "devfast" ] && flags="--opt-level=dev-fast"
 
     if ! "$FIRNC" $flags -o "$bin" "$file" >"$WORK/$base.$mode.cerr" 2>&1; then
         bad "$file [$mode]: uebersetzen fehlgeschlagen"
@@ -93,9 +97,10 @@ for f in $PROGS; do
     printf '  %-40s' "$f"
     run_case "$f" opt
     run_case "$f" noopt
-    echo "  [opt+noopt]"
+    run_case "$f" devfast
+    echo "  [opt+noopt+devfast]"
 done
-echo "   $NPROG Programme x 2 Durchlaeufe"
+echo "   $NPROG Programme x 3 Durchlaeufe (opt / noopt / dev-fast)"
 
 echo "== 4. Negativtests (Fehlermeldungen) =="
 for f in tests/neg/*.fi; do
@@ -160,6 +165,16 @@ if [ "$OPTRC" -eq 0 ]; then
 else
     bad "test_opt.sh schlug fehl (siehe .test-work/opt.log)"
     tail -20 "$WORK/opt.log" | sed 's/^/   /'
+fi
+
+echo "== 6. Nachweis der Ergebnisort-Garantie (SPEC.md 13.1) =="
+bash tools/ergebnisort/run.sh > "$WORK/ergebnisort.log" 2>&1 && EORC=0 || EORC=$?
+if [ "$EORC" -eq 0 ]; then
+    ok
+    tail -1 "$WORK/ergebnisort.log" | sed 's/^/   /'
+else
+    bad "tools/ergebnisort/run.sh schlug fehl (siehe .test-work/ergebnisort.log)"
+    tail -20 "$WORK/ergebnisort.log" | sed 's/^/   /'
 fi
 
 TOTAL=$((PASS + FAIL))
