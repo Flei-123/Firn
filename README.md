@@ -17,6 +17,8 @@ Der verbindliche Umfang steht in [SPEC.md §14](SPEC.md) (Abweichungen der
 Umsetzung in §14.1), die IR ist in [docs/FIR.md](docs/FIR.md) dokumentiert.
 Wie man alles baut, startet und **selbst nachmisst**: [RUN.md](RUN.md).
 Der Abnahmestand mit echten Zahlen: [ABNAHME.md](ABNAHME.md).
+Die Fundamententscheidungen — was jetzt ins Fundament muss, damit es später
+noch möglich ist, und was warten kann: [DESIGNZIELE.md](DESIGNZIELE.md).
 
 ---
 
@@ -316,6 +318,9 @@ Von den neun Zielen dieser Runde sind **1–5 und 9 umgesetzt und gemessen**;
 ```
 RUN.md                   wie man alles baut, startet und nachmisst
 SPEC.md, ROADMAP.md      Sprachspezifikation und Fahrplan (Vertrag)
+DESIGNZIELE.md           10 Fundamententscheidungen (async-Farben, fehlbare
+                         Allokation, Capabilities, ABI, Debug-Bau, In-Place-
+                         Init, comptime/Reflexion, SoA-Layout, Hot Reload)
 ABNAHME.md               die sechs Abnahmepunkte mit echten Messwerten
 docs/FIR.md              die eigene IR: Instruktionen, Typen, Invarianten
 docs/DEBUGGER.md         .debug_line + wörtlich kopierte gdb-Sitzung
