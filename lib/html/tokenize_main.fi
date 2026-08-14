@@ -1,0 +1,104 @@
+// lib/html/tokenize_main.fi — Treiber des HTML5-Tokenizers (Wurzeldatei).
+//
+// Liest von der Standardeingabe einen Strom von AUFTRAEGEN und schreibt je
+// Auftrag EINE Zeile html5lib-JSON auf die Standardausgabe.
+//
+// Auftragsformat (little-endian, siehe tools/tokenizer/PROTOKOLL.md):
+//     u32  startzustand   0=Data 1=PLAINTEXT 2=RCDATA 3=RAWTEXT 4=ScriptData 5=CDATA
+//     u32  len_lasttag    Laenge des lastStartTag in Bytes (WTF-8)
+//     u8[] lasttag
+//     u32  len_input      Laenge der Eingabe in Bytes (WTF-8)
+//     u8[] input
+// Ende des Stroms = Ende der Eingabe.
+//
+// Ausgabe je Auftrag:
+//     [ ... ]                     Tokenliste (html5lib-JSON, reines ASCII)
+//     ["NICHT-UNTERSTUETZT"]      der Tokenizer hat einen Zustand erreicht,
+//                                 den er noch nicht kennt -> der Harness zaehlt
+//                                 den Fall als FEHLSCHLAG (nie als uebersprungen)
+//
+// Uebersetzen:  firnc -o build/tokenize lib/html/tokenize_main.fi
+import mem
+import tokens
+import tokenizer
+
+// Liest ein u32 (little-endian) aus dem Eingabepuffer.
+fn lies_u32(b: *mut mem.Buf, off: usize) -> u32 {
+    var v: u32 = 0
+    var i: usize = 0
+    while i < 4 {
+        v = v | ((mem.buf_at(b, off + i) as u32) << (8 * i as u32))
+        i = i + 1
+    }
+    return v
+}
+
+// WTF-8 -> Codepunkte. Ungepaarte Surrogate (ED A0 80 …) bleiben erhalten.
+// Zeilenenden werden nach HTML-Standard normalisiert (\r\n und \r -> \n).
+fn dekodiere(b: *mut mem.Buf, off: usize, len: usize, out: *mut mem.CpBuf) {
+    mem.cp_clear(out)
+    var i: usize = 0
+    while i < len {
+        let c0: u32 = mem.buf_at(b, off + i) as u32
+        var cp: u32 = c0
+        var breite: usize = 1
+        if c0 >= 0xF0 as u32 {
+            breite = 4
+            cp = ((c0 & 0x07 as u32) << 18) |
+                ((mem.buf_at(b, off + i + 1) as u32 & 0x3F as u32) << 12) |
+                ((mem.buf_at(b, off + i + 2) as u32 & 0x3F as u32) << 6) |
+                (mem.buf_at(b, off + i + 3) as u32 & 0x3F as u32)
+        } else if c0 >= 0xE0 as u32 {
+            breite = 3
+            cp = ((c0 & 0x0F as u32) << 12) |
+                ((mem.buf_at(b, off + i + 1) as u32 & 0x3F as u32) << 6) |
+                (mem.buf_at(b, off + i + 2) as u32 & 0x3F as u32)
+        } else if c0 >= 0xC0 as u32 {
+            breite = 2
+            cp = ((c0 & 0x1F as u32) << 6) |
+                (mem.buf_at(b, off + i + 1) as u32 & 0x3F as u32)
+        }
+        i = i + breite
+        if cp == 13 as u32 {
+            // \r bzw. \r\n -> \n
+            cp = 10 as u32
+            if i < len && mem.buf_at(b, off + i) as u32 == 10 as u32 {
+                i = i + 1
+            }
+        }
+        mem.cp_push(out, cp)
+    }
+}
+
+fn main() -> i32 {
+    var ein: mem.Buf = mem.buf_neu()
+    mem.read_all_stdin(&ein)
+
+    var s: tokens.Sink = tokens.sink_neu()
+    tokens.sink_init(&s)
+
+    var text: mem.CpBuf = mem.cp_neu()
+    var lasttag: mem.CpBuf = mem.cp_neu()
+
+    let gesamt: usize = mem.buf_len(&ein)
+    var off: usize = 0
+    while off + 12 <= gesamt {
+        let zustand: u32 = lies_u32(&ein, off)
+        let ltlen: usize = lies_u32(&ein, off + 4) as usize
+        dekodiere(&ein, off + 8, ltlen, &lasttag)
+        let inlen: usize = lies_u32(&ein, off + 8 + ltlen) as usize
+        dekodiere(&ein, off + 12 + ltlen, inlen, &text)
+        off = off + 12 + ltlen + inlen
+
+        tokens.sink_set_last_start_tag_cp(&s, &lasttag)
+        tokens.sink_begin(&s)
+        let ok: bool = tokenizer.tokenize(&text, zustand, &s)
+        if ok {
+            tokens.sink_end(&s)
+        } else {
+            tokens.sink_abort(&s)
+        }
+    }
+    tokens.sink_flush_out(&s)
+    return 0
+}

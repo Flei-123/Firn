@@ -19,6 +19,9 @@
 #      (tools/schichten/run.sh, Vorbedingung fuer SoA).
 #   8. Symbol-Namensschema: reservierter Praefix, Platz fuer die
 #      ABI-Version, Module kollisionsfrei (tools/symbole/run.sh).
+#   9. HTML5-Tokenizer (lib/html/, in Firn) gegen die offizielle
+#      html5lib-Testsuite: exakte Quote aus 6.810 Faellen, Schranke in
+#      tools/tokenizer/mindestquote.txt (tools/tokenizer/run.sh).
 #
 # Kein '|| true', kein Verschlucken von Exit-Codes: set -euo pipefail.
 set -euo pipefail
@@ -199,6 +202,16 @@ if [ "$SYRC" -eq 0 ]; then
 else
     bad "tools/symbole/run.sh schlug fehl (siehe .test-work/symbole.log)"
     tail -20 "$WORK/symbole.log" | sed 's/^/   /'
+fi
+
+echo "== 9. HTML5-Tokenizer gegen html5lib (tools/tokenizer/run.sh) =="
+bash tools/tokenizer/run.sh --schnell > "$WORK/tokenizer.log" 2>&1 && TKRC=0 || TKRC=$?
+if [ "$TKRC" -eq 0 ]; then
+    ok
+    grep -E '^GESAMT' "$WORK/tokenizer.log" | sed 's/^/   /'
+else
+    bad "tools/tokenizer/run.sh schlug fehl (siehe .test-work/tokenizer.log)"
+    tail -20 "$WORK/tokenizer.log" | sed 's/^/   /'
 fi
 
 TOTAL=$((PASS + FAIL))
