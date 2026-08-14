@@ -694,3 +694,59 @@ wird, dass deren direkte Aufrufe ausschließlich als `// ABI-Wortkopie`
 gekennzeichnete Aggregatübergaben sind, und dass im Lowering kein Feld-Versatz
 mehr von Hand in eine Adresse gerechnet wird. Eine absichtlich eingebaute
 Verletzung wird mit Datei und Zeile gemeldet (gegengeprüft).
+
+## Attribute (SPEC.md §14.2)
+
+Firn hat ein **Attributregister** — `compiler/src/attrs.rs` ist die einzige
+Wahrheit darüber, welche Attribute es gibt, wohin sie gehören und ob Stufe 0 sie
+umsetzt:
+
+```
+$ firnc --list-attrs
+NAME            ZIEL         ARGS  STUFE 0     ZWECK
+must_consume    fn, struct   0     umgesetzt   Ergebnis darf nicht verworfen werden
+no_gc           fn           0     Fehler      kein Sammellauf in diesem Aufrufbaum
+constant_time   fn           0     Fehler      kein Sprung auf Geheimnisdaten
+...
+```
+
+**Die wichtigste Eigenschaft: nichts wird still ignoriert.** Ein bekanntes, aber
+noch nicht umgesetztes Attribut ist ein Übersetzungsfehler mit Zeile, Spalte und
+Hinweis auf den geplanten Zweck. Ein wirkungslos danebenstehendes
+`#[constant_time]` wäre der gefährlichste Fehler, den diese Sprache haben kann.
+
+Vier Fehlerarten, alle mit Quelltextausschnitt:
+
+```
+error: unbekanntes attribut 'must_consum'
+  --> datei.fi:3:1
+   = hinweis: meintest du 'must_consume'? '--list-attrs' zeigt alle
+
+error: attribut 'constant_time' ist in Stufe 0 nicht umgesetzt
+   = hinweis: geplant: kein Sprung auf Geheimnisdaten, im Codegen geprueft (SPEC 9.2)
+
+error: attribut 'packed' gehoert nicht vor eine funktion
+error: attribut 'align' erwartet 1 argument(e), gefunden 2
+```
+
+### `#[must_consume]`
+
+Vor `fn` oder `struct`. Das Ergebnis darf nicht als Anweisung verworfen werden:
+
+```firn
+#[must_consume]
+struct Wache { fd: i32 }
+
+fn oeffne(fd: i32) -> Wache { return Wache{ fd: fd, } }
+
+fn main() -> i32 {
+    oeffne(7)        // error: das ergebnis darf nicht verworfen werden
+    return 0
+}
+```
+
+**Ehrlicher Umfang:** Geprüft wird die ohne Move-Prüfer entscheidbare Teilmenge —
+*ein Aufrufergebnis darf nicht als Anweisung verworfen werden*. Die volle Form
+aus SPEC §3.3 (*der Wert muss an eine verbrauchende Funktion übergeben werden*)
+kommt mit dem Move-Prüfer. `#[must_consume]` verspricht hier bewusst nicht mehr,
+als es hält.

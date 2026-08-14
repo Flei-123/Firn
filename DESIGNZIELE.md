@@ -247,7 +247,16 @@ GC-Allokation kann ein Tab, der zu viel will, nur den ganzen Browser töten.
 * **Die Fehlerunion `!T` muss im Sprachkern sitzen** (`SPEC.md` §5.1) —
   ist bereits so vorgesehen, aber in Stufe 0 noch nicht gebaut.
 * **`#[must_consume]` muss existieren**, sonst kann man `AllocError!T` still
-  fallen lassen.
+  fallen lassen. **Erledigt am 14.08.2026**: Firn hat jetzt ein
+  Attributsystem (`compiler/src/attrs.rs`, `firnc --list-attrs`) und
+  `#[must_consume]` vor `fn` und `struct`. Geprüft wird die ohne Move-Prüfer
+  entscheidbare Teilmenge — *ein Aufrufergebnis darf nicht als Anweisung
+  verworfen werden*; die volle Form folgt mit dem Move-Prüfer.
+  Wichtiger Nebeneffekt: **kein bekanntes Attribut wird still ignoriert.**
+  `#[constant_time]`, `#[no_gc]` und die übrigen zehn sind im Register
+  eingetragen und werden mit einer klaren Meldung samt Zeile, Spalte und
+  geplantem Zweck abgelehnt, statt wirkungslos dazustehen — ein übergangenes
+  `#[constant_time]` wäre die gefährlichste Fehlerart dieser Sprache.
 * **Die Standardbibliothek darf niemals eine unfehlbare Allokationsfunktion
   bekommen.** Das ist eine Regel für Phase 3 und die einzige Stelle, an der
   Disziplin wichtiger ist als Technik: Wenn `Vec.push(x)` ohne `try` je
@@ -1113,7 +1122,7 @@ Dingen, die später obendrauf kommen.
 | # | Thema | Was JETZT ins Fundament muss | Was später kommt | Stufe | Phase |
 |---|---|---|---|---|---|
 | 1 | **Funktionsfarben / `Io`** | **Kein `async`-Schlüsselwort einführen.** Codegen darf keine Stapelstetigkeit annehmen (Stapelwechsel muss möglich bleiben) | `Io`-Schnittstelle, `Future`, `Io.Threaded`, `Io.Evented` | **FUNDAMENT** (billig) | 3–4 |
-| 2 | **Fehlbare Allokation** | `!T` + `#[must_consume]` im Sprachkern. **Regel: keine unfehlbare Allokationsfunktion, nie** | `Allocator`-Schnittstelle, Sammlungen, fehlbare GC-Allokation | **FUNDAMENT** (unumkehrbar) | 2–3 |
+| 2 | **Fehlbare Allokation** | `#[must_consume]` **erledigt 14.08.2026** (Attributsystem + Prüfung); `!T` fehlt noch. **Regel: keine unfehlbare Allokationsfunktion, nie** | `!T`, `Allocator`-Schnittstelle, Sammlungen, fehlbare GC-Allokation | **FUNDAMENT** (unumkehrbar) | 2–3 |
 | 3 | **Capability-Module** | **Regel: keine Ambient-Autorität in der Bibliothek.** Modulsystem muss eine *Paket*grenze kennen | Deklaration in `firn.toml`, Prüfung, Bauskript-Sandbox | **FUNDAMENT** (als Regel) | 3 |
 | 4 | **Stabiles ABI** | Nur ein **Symbol-Namensschema mit Versionsplatz**. `SPEC.md` muss sagen: Standardlayout ist *instabil* | `#[abi_stable]`, `#[frozen]`, resiliente Aufrufe | nachrüstbar | 3 → 7/8 |
 | 5 | **Debug-Bau-Geschwindigkeit** | **erledigt 14.08.2026:** Register `PASSES` mit Etiketten, `--list-passes`, `--no-pass=`, `--opt-level=`; gemessen **2,06×** | die verbotenen Durchgänge existieren noch gar nicht; `--release-safe` = `--release-fast`, solange es keine Laufzeitprüfungen gibt | **FUNDAMENT** ✔ | erledigt / 3 |
@@ -1185,8 +1194,10 @@ Konkret und überprüfbar, in dieser Reihenfolge:
    *Deutlich billiger als befürchtet.*
 2. ~~**Feldzugriff vom Speicherort trennen** (Punkt 8)~~ — **erledigt**,
    `compiler/src/layout.rs` + Wächter.
-3. **`!T` + `#[must_consume]`** (Punkt 2) — steht ohnehin auf dem Plan für
-   Phase 2.
+3. **`!T`** (Punkt 2) — `#[must_consume]` ist **erledigt**, die Fehlerunion
+   selbst steht noch aus. Sie kann auf die vorhandene Aufzählungsmaschinerie
+   aufsetzen (`E!T` als zweivariantige getaggte Union), das macht sie deutlich
+   billiger als befürchtet.
 4. ~~**Durchgangsregister mit Etiketten** (Punkt 5)~~ — **erledigt**,
    `--list-passes` / `--no-pass=` / `--opt-level=`, gemessen 2,06×.
 5. **Wiedereintrittsfähige Prüfphasen** (Punkt 7) — beim Bau des Modulsystems

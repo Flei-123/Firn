@@ -6,6 +6,7 @@
 
 mod abi;
 mod ast;
+mod attrs;
 mod codegen_switch;
 mod codegen_x86;
 mod config;
@@ -76,6 +77,7 @@ fn usage() -> String {
                               ('dev-fast' = nur debugerhaltende Durchgaenge)\n  \
          --no-pass=<name>   einzelnen Optimierungsdurchgang abschalten\n  \
          --list-passes      Durchgangsregister mit Etiketten ausgeben\n  \
+         --list-attrs       bekannte Attribute und ihren Stand ausgeben\n  \
          --strlit=<lit>     zeichenkettenliteral entschluesseln (\"..\", b\"..\", u\"..\")\n  \
          --stats            Groesse der FIR ausgeben (Instruktionen/Bloecke)\n  \
          --keep-asm         erzeugte .s-Datei behalten\n  \
@@ -115,6 +117,10 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             }
             "--list-passes" => {
                 print!("{}", opt::passes_text());
+                std::process::exit(0);
+            }
+            "--list-attrs" => {
+                print!("{}", attrs::attrs_text());
                 std::process::exit(0);
             }
             _ if a.starts_with("--opt-level=") => {

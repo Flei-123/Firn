@@ -952,6 +952,32 @@ Konstantenfaltung/DCE hinaus: mem2reg, CSE, Inlining, Blockverschmelzung und
 genannte Satz „reines Spilling, keine Registerzuteilung" gilt seit Runde 2
 nur noch für `--no-opt`.
 
+### 14.2 Attribute
+
+Die Spezifikation stützt sich an vielen Stellen auf Attribute (`#[must_consume]`,
+`#[no_gc]`, `#[constant_time]`, `#[unwinds]`, `#[packed]`, `#[align(n)]`,
+`#[layout(soa)]`, `#[no_move]`, `#[abi_stable]`, `#[frozen]`, `#[hot]`). Sie
+entstehen zu sehr verschiedenen Zeitpunkten. Damit daraus kein Wildwuchs wird,
+gilt:
+
+* **Ein Register.** `compiler/src/attrs.rs` ist die einzige Wahrheit darüber,
+  welche Attribute es gibt, wohin sie gehören, wie viele Argumente sie nehmen
+  und ob Stufe 0 sie umsetzt. `firnc --list-attrs` gibt das Register aus.
+* **Nie stillschweigend ignorieren.** Ein bekanntes, aber nicht umgesetztes
+  Attribut ist ein **Übersetzungsfehler** mit Zeile, Spalte und Hinweis auf den
+  geplanten Zweck. Ein übergangenes `#[constant_time]` wäre der gefährlichste
+  Fehler, den diese Sprache haben kann (§9.2).
+* **Unbekannte Attribute** liefern einen Vorschlag, wenn es ein Tippfehler ist.
+* **Falsches Ziel** (z. B. `#[packed]` vor einer Funktion) ist ein Fehler.
+
+In Stufe 0 umgesetzt ist genau eines: **`#[must_consume]`**, vor `fn` und vor
+`struct`. Geprüft wird die Teilmenge, die ohne Move-Prüfer entscheidbar ist —
+*das Ergebnis eines Aufrufs darf nicht als Anweisung verworfen werden*. Die
+volle Form aus §3.3 (*der Wert muss an eine verbrauchende Funktion übergeben
+werden*) kommt mit dem Move-Prüfer in ROADMAP Phase 2. Diese Einschränkung ist
+im Compiler dokumentiert und hier ausdrücklich benannt, damit `#[must_consume]`
+nicht mehr verspricht, als es hält.
+
 ### 14.1 Nachtrag: bewusste Abweichungen der Stufe-0-Umsetzung (`firnc0`)
 
 Hält fest, wo die Umsetzung enger ist als der Text oben — damit Spezifikation und

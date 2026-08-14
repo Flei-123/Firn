@@ -1256,6 +1256,7 @@ mod tests {
             ret: None,
             body: blk(vec![Stmt::Return { value: Some(sum), span: Span::new(1, 1, 1) }]),
             span: Span::new(1, 1, 1),
+            attrs: Vec::new(),
         };
         let prog = Program { funcs: vec![f], expr_count: b.next, ..Default::default() };
         let info = info_of(
@@ -1293,6 +1294,7 @@ mod tests {
                 },
             ]),
             span: Span::none(),
+            attrs: Vec::new(),
         };
         let prog = Program { funcs: vec![f], expr_count: b.next, ..Default::default() };
         let info = info_of(
@@ -1358,6 +1360,7 @@ mod tests {
                 Stmt::Return { value: Some(rs), span: Span::none() },
             ]),
             span: Span::none(),
+            attrs: Vec::new(),
         };
 
         // --- fn main() -> i32 ---
@@ -1406,6 +1409,7 @@ mod tests {
                 Stmt::Return { value: Some(zero), span: Span::none() },
             ]),
             span: Span::none(),
+            attrs: Vec::new(),
         };
 
         let prog = Program { funcs: vec![summe, mainf], expr_count: b.next, ..Default::default() };
@@ -1477,6 +1481,7 @@ mod tests {
                 Stmt::Return { value: Some(ix), span: Span::none() },
             ]),
             span: Span::none(),
+            attrs: Vec::new(),
         };
         let prog = Program { funcs: vec![f], expr_count: b.next, ..Default::default() };
         let info = info_of(

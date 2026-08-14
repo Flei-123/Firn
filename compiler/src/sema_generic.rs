@@ -336,7 +336,7 @@ impl<'a> Parser<'a> {
         }
         let body = self.block("am anfang des funktionsrumpfes");
         self.recovering = false;
-        Some(FnDecl { name, params, ret, body, span: start })
+        Some(FnDecl { name, params, ret, body, span: start, attrs: Vec::new() })
     }
 
     fn generic_struct_template(&mut self) {
@@ -391,7 +391,8 @@ impl<'a> Parser<'a> {
         self.close(TokKind::RBrace, "am ende der strukturdeklaration");
         self.recovering = false;
         REG.with(|r| r.borrow_mut().in_template -= 1);
-        let decl = StructDecl { name: name.clone(), fields, span: Parser::join(start, end) };
+        let decl =
+            StructDecl { name: name.clone(), fields, span: Parser::join(start, end), attrs: Vec::new() };
         let doppelt = REG.with(|r| {
             let mut reg = r.borrow_mut();
             if reg.structs.contains_key(&name) {
