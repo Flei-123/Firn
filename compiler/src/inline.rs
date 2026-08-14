@@ -35,8 +35,18 @@ use std::collections::{HashMap, HashSet};
 
 const MAX_CALLEE_INSTS: usize = 40;
 const MAX_CALLEE_BLOCKS: usize = 8;
-const MAX_CALLER_INSTS: usize = 4000;
-const MAX_INLINES: usize = 400;
+/// Obergrenze fuer den AUFRUFER. Sie schuetzt Uebersetzungszeit und
+/// Codegroesse — aber sie darf nicht die heisseste Funktion des Programms
+/// aussperren.
+///
+/// GEMESSEN (14.08.2026): der HTML5-Tokenizer `tokenizer__tokenize` hat 4.139
+/// FIR-Instruktionen. Mit der alten Grenze von 4.000 bekam ausgerechnet die
+/// Funktion, die jedes Zeichen jeder Seite anfasst, KEINE einzige Einbettung —
+/// obwohl `sink_emit_char` mit 18 Instruktionen und einem Block weit unter
+/// jeder Callee-Grenze liegt. Eine grosse Funktion ist nicht automatisch kalt;
+/// bei einer Zustandsmaschine ist das Gegenteil der Fall.
+const MAX_CALLER_INSTS: usize = 24000;
+const MAX_INLINES: usize = 2000;
 
 /// Kann `from` ueber Aufrufe `to` erreichen?
 fn reaches(m: &Module, from: &str, to: &str) -> bool {
