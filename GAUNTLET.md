@@ -1,67 +1,77 @@
 # Gauntlet-Log — firn
-**Ziel:** Baue "firnc0" — den Stufe-0-Prototyp-Compiler für die Programmiersprache FIRN (Dateiendung .fi), geschrieben in RUST, der eine bewusst KLEINE Teilmenge der Sprache WIRKLICH zu ausführbarem x86_64-Maschinencode übersetzt.
+**Ziel:** HÄRTETEST 1 für die Sprache Firn: einen HTML5-Tokenizer IN FIRN schreiben und gegen die offizielle html5lib-Testsuite messen. Dazu die Fehlerunionen als Sprachmittel bauen, weil ein Tokenizer ohne Fehlerbehandlung nicht ehrlich ist.
 
-WICHTIG ZUERST LESEN: Im Projektordner liegen bereits SPEC.md (vollständige Sprachspezifikation) und ROADMAP.md. LEST BEIDE, bevor ihr irgendetwas baut. SPEC.md §10.1 enthält die EBNF-Grammatik der zu implementierenden Teilmenge, §11 die ABI-/Zahlenregeln, §12 den VERBINDLICHEN Umfang ("Was der Prototyp implementiert"). SPEC.md und ROADMAP.md dürfen inhaltlich NICHT umgeschrieben werden — nur ergänzt werden, falls die Implementierung bewusst abweicht (dann muss die Abweichung dort dokumentiert werden). Der Code muss sich nach der SPEC richten, nicht umgekehrt.
+=== AUSGANGSLAGE — ZUERST LESEN ===
+Der Compiler firnc läuft und ist reif genug für diese Aufgabe. `bash test.sh` meldet aktuell **PASS 393/393**, `cargo build --release --manifest-path compiler/Cargo.toml` läuft mit NULL Warnungen. Lest, bevor ihr etwas anfasst:
+- README.md — was die Sprache HEUTE kann, mit echten Beispielen. Besonders: Sprachtour, Zeichenketten, Attribute, Baustufen.
+- SPEC.md — §5.1 Fehlerunionen (das Ziel), §8 Zeichenketten, §14 was Stufe 0 kann, §14.1/§14.2 die bewussten Einschränkungen.
+- ABNAHME.md — die sechs Abnahmepunkte. Punkt 3 (Tokenizer) steht bei **0 von 6.810 (0,0 %)**. Diese Runde soll daraus eine echte Zahl machen.
+- DESIGNZIELE.md §2 (fehlbare Allokation) und §10 (welche Fundamente stehen).
+- docs/FIR.md, docs/SELBSTHOSTING.md.
+NUR LESEN: ../karstos-browser/TODO-FIRN.md Block 0 (Aufgabe 0.8), ../karstos-browser/FIRN-ANFORDERUNGEN.md §13 Punkt 3.
 
-ZIELVERZEICHNIS-AUFBAU (bitte genau so):
-  SPEC.md, ROADMAP.md            (existieren bereits)
-  README.md                      (Build-Anleitung, echter Beispiel-Output, ehrliche "kann noch nicht"-Liste)
-  compiler/Cargo.toml            (Crate-Name: firnc; Binary: firnc)
-  compiler/src/config.rs         (LANG_NAME="Firn", LANG_NAME_LOWER="firn", FILE_EXT="fi" — NUR HIER, nirgends sonst hartkodiert; Umbenennen der Sprache = 3 Konstanten ändern)
-  compiler/src/main.rs, lexer.rs, ast.rs, parser.rs, diag.rs, types.rs, sema.rs, fir.rs, opt.rs, codegen_x86.rs
-  docs/FIR.md                    (die eigene IR dokumentiert: Instruktionen, Typen, Textformat, Invarianten)
-  tests/                         (mind. 40 .fi-Programme + Erwartungen)
-  examples/                      (hello.fi, fib.fi, bubblesort.fi, structs.fi)
-  test.sh                        (baut alles, fährt alle Tests, meldet am Ende klar PASS/FAIL mit Zählung)
+VORHANDEN und benutzbar — nicht neu bauen:
+- **Modulsystem**: `import pfad.modul`, `export { … }`, mehrere .fi-Dateien zu einem Binary.
+- **enum + match** mit Vollständigkeitsprüfung und echter Sprungtabelle (`tests/230_zustandsmaschine.fi` hat 32 Zustände). GENAU DAS BRAUCHT DER TOKENIZER.
+- **Generics** per Monomorphisierung, `Vec[T]`, `Map[K,V]`.
+- **Zeichenketten**: `Bytes`, `Str` (UTF-8), `Str16` (WTF-16, hält ungepaarte Surrogate), `Atom` (interniert). Bibliothek unter `lib/str/`, Zahlen unter `lib/num/`.
+- **Attribute**: `compiler/src/attrs.rs`, `firnc --list-attrs`. `#[must_consume]` ist umgesetzt.
+- **Testdaten**: `testdata/html5lib-tokenizer/` — 14 `.test`-Dateien, **6.810 Testfälle**, Zählbefehl in `testdata/README.md`.
+- **Referenz**: `cargo add html5ever` funktioniert (geprüft). Nur in einem getrennten `bench/`-Unterordner als Messlatte, NIEMALS als Abhängigkeit des Compilers.
 
-WAS GEBAUT WERDEN MUSS:
+=== AUFGABE 1: FEHLERUNIONEN `E!T` (SPEC §5.1) ===
+Baut sie in einem EIGENEN Modul (z. B. `compiler/src/errors.rs` + `compiler/src/lower_errors.rs`), analog zu `sema_match.rs`/`lower_match.rs`. Das Hook-Muster ist im Parser bereits vorhanden (`// HOOK types`) — macht es genauso.
+**Empfohlener Weg, spart euch die halbe Arbeit:** Stellt `E!T` als zweivariantige getaggte Union dar, genau wie `enum` es schon tut — ein Struct in `types::TypeCtx` mit `__err: u32` (0 = Erfolg) und `__val: T`, plus Seitentabelle wie `enum_by_struct`. Dann funktionieren Aggregatrückgabe, System-V-ABI, Registerzuteilung und Codegen SOFORT, ohne dass ihr sie anfasst.
+Umfang:
+  1) `error IoError { NotFound, Permission, Closed }` — Fehlermenge, Codes ab 1.
+  2) Typsyntax `IoError!Buf` als **Rückgabetyp** und als Typ lokaler Variablen.
+  3) Implizite Umwandlung bei `return`: `return wert` ergibt Erfolg, `return IoError::NotFound` ergibt Fehler. Kein `ok(...)`-Zeremoniell.
+  4) `try ausdruck` — bei Fehler sofort mit demselben Code aus der Funktion zurück, sonst der Wert. Nur in Funktionen erlaubt, die selbst eine passende Fehlerunion liefern; sonst klarer Fehler mit Zeile/Spalte.
+  5) `ausdruck catch ersatzwert` — Ersatzwert bei Fehler. Wenn ihr noch `catch |e| { … }` schafft: gern, aber Punkt 4 und 5 zuerst.
+  6) Ein `!T`-Wert ist implizit `#[must_consume]`: als Anweisung verworfen = Fehler (die Prüfung dafür gibt es schon in `sema.rs`, `check_discard`).
+  7) `defer { … }` und `errdefer { … }` wenn Zeit bleibt — sonst weglassen und in SPEC §14.1 als offen vermerken.
+Mindestens 15 Testprogramme unter `tests/` plus 6 Negativtests (`try` außerhalb einer Fehlerfunktion, verworfenes `!T`, unbekannte Fehlervariante, Typfehler beim `catch`-Ersatzwert, doppelte Fehlervariante, Fehlermenge stimmt nicht überein).
 
-1) LEXER + PARSER: handgeschrieben, rekursiv absteigend, KEIN Parser-Generator, keine externen Crates für Parsing. Cargo.toml möglichst OHNE Abhängigkeiten (std reicht). AST als eigene Datenstruktur. Fehlermeldungen müssen enthalten: Dateiname, Zeile, Spalte, die betroffene Quelltextzeile und eine Markierung (^^^) darunter, plus eine verständliche Meldung. Beispielformat:
-   error: erwartet ')' nach Argumentliste
-     --> tests/neg/bad_call.fi:7:22
-      |
-    7 |     let x = add(1, 2 ;
-      |                      ^ hier
-   Mehrere Fehler sollen gemeldet werden können (Fehlerwiederherstellung), nicht nur der erste — mindestens beim Parser auf Anweisungsebene.
+=== AUFGABE 2: HTML5-TOKENIZER IN FIRN (der eigentliche Härtetest) ===
+Ein Tokenizer nach dem WHATWG-HTML-Standard, **geschrieben in Firn** (`.fi`), unter `lib/html/`. Der Testtreiber darf Rust oder Python sein (Werkbank, kein Produkt) — der Tokenizer selbst muss Firn sein.
+- Zustände als `enum` + `match` mit Sprungtabelle. Fangt mit den Kernzuständen an: Data, TagOpen, EndTagOpen, TagName, BeforeAttributeName, AttributeName, AfterAttributeName, BeforeAttributeValue, AttributeValue(Double/Single/Unquoted), AfterAttributeValueQuoted, SelfClosingStartTag, BogusComment, MarkupDeclarationOpen, CommentStart, Comment, CommentEnd, Doctype-Zustände, RCDATA, RAWTEXT, ScriptData, CharacterReference.
+- Ausgabe: Token-Strom (DOCTYPE, StartTag mit Attributen und self-closing-Flag, EndTag, Comment, Character, EOF) im html5lib-JSON-Format, damit der Vergleich maschinell läuft.
+- **ACHTUNG beim Harness** — hier wird oft geschummelt, tut es nicht: `"doubleEscaped": true` heißt, `input` UND `output` müssen zusätzlich \uXXXX-entschlüsselt werden. Einige Dateien nutzen den Schlüssel `"xmlViolationTests"` statt `"tests"`. `initialStates` und `lastStartTag` müssen beachtet werden. Fälle, die ihr nicht unterstützt, zählen als **FEHLSCHLAG**, niemals als Erfolg und niemals als „übersprungen".
+- **Ergebnis: exakte Zahl bestandener von 6.810**, aufgeschlüsselt pro `.test`-Datei, in `ABNAHME.md` und `README.md`. Eine ehrliche Quote wie „2.145 / 6.810 (31,5 %) — umgesetzt sind die Zustände X, Y, Z, nicht umgesetzt A, B" ist das GEWÜNSCHTE Ergebnis. Eine geschönte Zahl ist wertlos.
+- **Geschwindigkeit**: Durchsatz in MB/s auf einem Eingabekorpus, daneben `html5ever` auf demselben Korpus, Faktor ehrlich ausweisen. Zielwert laut Abnahme ist ≤ 2×; wird er verfehlt, wird der echte Faktor dokumentiert.
+- Skript `tools/tokenizer/run.sh`, das alles baut, fährt und die Bilanz ausgibt. Einbinden als neuer Abschnitt in `test.sh`.
 
-2) TYPPRÜFER (sema.rs): i8/i16/i32/i64, u8/u16/u32/u64, usize, isize, bool, Zeiger *T und *mut T, Structs mit Feldzugriff, Arrays fester Größe mit Index, Funktionen mit Parametern/Rückgabe. KEINE impliziten Umwandlungen — nur explizites `as`. Untypisierte Ganzzahl-Literale werden aus dem Kontext abgeleitet; ist der Typ nicht eindeutig, klare Fehlermeldung. Prüfungen: unbekannte Namen, falsche Argumentanzahl/-typen, fehlendes return, Zuweisung an `let`, Index auf Nicht-Array, Feldzugriff auf Nicht-Struct, Dereferenzieren von Nicht-Zeigern, Bedingung nicht bool. Struct-Layout: Deklarationsreihenfolge, natürliche Ausrichtung, Offsets/Größe berechnet und im Test nachprüfbar.
+=== HARTE REGELN ===
+- **Nichts Bestehendes kaputtmachen.** `bash test.sh` muss weiter grün sein, inklusive der acht vorhandenen Abschnitte: 393 Tests, Optimierer-Nachweis, Ergebnisort-Garantie, Architekturwächter Feldzugriff↔Speicherort, Symbolschema. Tests entfernen oder abschwächen, um grün zu werden, ist Betrug.
+- **NULL Compilerwarnungen** bei `cargo build --release`. Keine `#![allow(...)]`-Sammelunterdrückung.
+- Keine externen Crates im Compiler. Kein LLVM, kein Cranelift, kein C-Compiler als Backend.
+- Keine `todo!()`/`unimplemented!()` in den geforderten Pfaden. Nicht Umgesetztes meldet einen sauberen Compilerfehler mit Zeile/Spalte.
+- Alle Testprogramme laufen weiterhin in DREI Baustufen (`opt`, `--no-opt`, `--opt-level=dev-fast`) und liefern überall dasselbe.
+- **SPEC.md ist der Vertrag** und wird nicht umgeschrieben, um sich dem Code anzupassen — Abweichungen kommen nach §14.1.
+- **ABNAHME.md am Ende mit den echten Zahlen aktualisieren**, besonders Punkt 3.
+- Vor der Fertigmeldung SELBST `bash test.sh` und `bash tools/tokenizer/run.sh` laufen lassen und die echten Ausgaben in die Dokumente schreiben.
+- Lieber Aufgabe 1 vollständig und Aufgabe 2 mit ehrlichen 30 % als beides halb und behauptet.
+**Messlatte:** Die Jury führt SELBST aus: `cargo build --release --manifest-path compiler/Cargo.toml`, `bash test.sh`, `bash tools/tokenizer/run.sh`. Keine Zahl aus README.md oder ABNAHME.md zählt ohne eigene Reproduktion.
 
-3) EIGENE IR "FIR" (fir.rs): typisiert, in Funktionen mit Basisblöcken (jeder Block genau ein Terminator: br / brcond / ret), Werte als SSA-artige Ids, klar dokumentiert in docs/FIR.md. Textausgabe über `firnc --emit=fir datei.fi` (menschenlesbar, stabil genug für Tests). Lowering AST->FIR: Kontrollfluss (if/else/while) wird zu Basisblöcken, Kurzschlussauswertung von && und || wird korrekt zu Verzweigungen aufgelöst, lvalues (Variable/Feld/Index/Deref) zu Adressberechnung + load/store.
+(a) TOKENIZER-QUOTE: Die Jury lässt den Harness selbst laufen und vergleicht mit der behaupteten Zahl. Gefordert ist eine exakte Quote aus **6.810** Fällen, aufgeschlüsselt pro .test-Datei. Prüfen — hier wird am ehesten geschummelt: Werden nicht unterstützte Fälle als FEHLSCHLAG gezählt oder heimlich übersprungen? Wird `doubleEscaped` wirklich behandelt? Werden `xmlViolationTests` mitgezählt? Werden `initialStates` und `lastStartTag` beachtet? Ein Harness, der Fälle stillschweigend filtert, ist Betrug und muss hart bestraft werden. Eine ehrliche 30-%-Quote schlägt eine unreproduzierbare 80-%-Quote deutlich.
 
-4) OPTIMIERUNG (opt.rs): mindestens Konstantenfaltung UND Entfernen toten Codes (unerreichbare Blöcke + unbenutzte reine Instruktionen). Beweisbar wirksam: `--emit=fir` vor und nach der Optimierung (`--emit=fir-raw` / `--emit=fir-opt` oder `--no-opt`), und mindestens 3 Tests, die die Anzahl der Instruktionen vorher/nachher vergleichen bzw. prüfen, dass eine gefaltete Konstante wirklich im Dump steht. Optimierung darf das Ergebnis NIE ändern — dafür laufen alle Testprogramme sowohl mit als auch ohne Optimierung und müssen dasselbe liefern.
+(b) TOKENIZER IST FIRN: Der Tokenizer muss in `.fi` geschrieben sein. Steckt die eigentliche Zustandsmaschine in Rust oder Python, ist der Punkt null. Prüfen: Zeilenzahl der `.fi`-Dateien gegen die des Harness; wo liegt die Logik wirklich?
 
-5) X86_64-CODEGEN (codegen_x86.rs) — EIGEN, OHNE LLVM, OHNE Cranelift, OHNE gcc als Codegenerator: Ausgabe ist GNU-Assembler-Text (AT&T oder Intel-Syntax mit .intel_syntax noprefix), der mit `as` assembliert und mit `ld` gelinkt wird. gcc/as/ld dürfen NUR als Assembler/Linker benutzt werden, niemals um C zu kompilieren. Registerzuteilung darf naiv sein (z. B. Stack-Slots + rax/rcx als Arbeitsregister), MUSS aber korrekt sein. System-V-AMD64-Aufrufkonvention einhalten: Argumente in rdi, rsi, rdx, rcx, r8, r9; Rückgabe in rax; rbx, rbp, r12-r15 callee-saved; Stack an der Aufrufstelle 16-Byte-ausgerichtet (das ist der häufigste Fehler — bitte testen). Korrekte Behandlung der Operandengrößen (8/16/32/64 Bit), vorzeichenbehaftete vs. vorzeichenlose Division (idiv/div), Verschiebungen mit cl, korrekte Vorzeichen-/Nullerweiterung bei `as`. Rekursion muss funktionieren. Erzeugte Binaries laufen freistehend ohne libc (_start als Einstiegspunkt, Rückgabewert von main() geht in exit-Syscall).
+(c) FEHLERUNIONEN: Selbst Programme mit `error`, `E!T`, `try` und `catch` schreiben und übersetzen. Funktioniert die implizite Umwandlung bei `return`? Reicht `try` den Fehler wirklich nach oben durch (Exit-Code prüfen)? Liefert `catch` den Ersatzwert? Ist ein verworfenes `!T` ein Fehler? Melden die Negativfälle Zeile und Spalte, ohne dass der Compiler abstürzt (kein Rust-Panic)?
 
-6) SPRACHUMFANG (siehe SPEC §12): Funktionen mit Parametern und Rückgabewert, lokale Variablen (let/var), Zuweisung, if/else, while, Arithmetik (+ - * / %), Bitoperationen (& | ^ << >>), Vergleiche, && und || kurzschließend, unäres - und !, Structs mit Feldzugriff (auch verschachtelt), Arrays fester Größe mit Index (auch Arrays von Structs), Zeiger: Adresse-von & und Dereferenzierung *, Zuweisung durch Zeiger, Rekursion, `as`-Umwandlungen, const-Deklarationen, und das eingebaute `syscall(nr, a1..a6)` (Argumente nach rax, rdi, rsi, rdx, r10, r8, r9), damit Ausgabe ohne libc möglich ist.
+(d) KEINE REGRESSION: Laufen die 393 Tests aus dem Ausgangsstand weiter durch, in allen drei Baustufen? Sind die vier Architekturnachweise (Optimierer, Ergebnisort, Feldzugriff↔Speicherort, Symbolschema) noch grün? Wurden Tests entfernt, umgeschrieben oder abgeschwächt? `git log` und `git diff` gegen den Ausgangsstand ansehen. Abgeschwächte Tests sind ein schwerer Mangel.
 
-7) TESTSUITE: mindestens 40 .fi-Testprogramme unter tests/, jedes mit einer maschinenlesbaren Erwartung (z. B. Kommentar in der ersten Zeile: `// expect_exit: 42` bzw. `// expect_out: Hallo Welt`). test.sh muss: den Compiler bauen (cargo build --release), JEDES Testprogramm übersetzen, assemblieren, linken, AUSFÜHREN und Exit-Code bzw. Standardausgabe gegen die Erwartung prüfen — einmal mit Optimierung, einmal mit --no-opt. Zusätzlich mindestens 8 NEGATIVTESTS unter tests/neg/ mit absichtlich kaputten Programmen: der Compiler muss mit Fehlercode != 0 abbrechen UND die erwartete Fehlermeldung samt Zeile/Spalte ausgeben (Erwartung z. B. `// expect_error: 7:22 erwartet ')'`) — er darf NICHT abstürzen (kein Rust-Panic, kein unwrap-Absturz). Am Ende gibt test.sh eine klare Bilanz aus: "PASS 48/48" oder "FAIL 3/48" mit Auflistung der gescheiterten Tests, und setzt den Exit-Code entsprechend.
-   Beispielprogramme in examples/: hello.fi (Hallo-Welt über write-Syscall, wirklich sichtbare Ausgabe), fib.fi (Fibonacci rekursiv), bubblesort.fi (Bubblesort auf einem Array, Ergebnis prüfbar), structs.fi (Structs mit verschachtelten Feldern und Array von Structs).
+(e) GESCHWINDIGKEIT: Ist der Vergleich gegen html5ever ehrlich gemessen und dokumentiert, auch bei Verfehlung? Selbst nachmessen. Wird derselbe Eingabekorpus benutzt? Wurde html5ever mit `--release` gebaut? Ein dokumentiertes „6× langsamer" ist ein gutes Ergebnis dieser Kategorie; ein fehlender oder frisierter Vergleich ist ein schlechtes.
 
-8) README.md: Build-Anleitung (Voraussetzungen: rustc/cargo, binutils as+ld), Schnellstart, ECHTER kopierter Beispiel-Output (tatsächlich ausgeführt, nicht erfunden — inkl. der realen test.sh-Bilanz), kurze Sprachtour, Verweis auf SPEC.md/FIR.md, und eine EHRLICHE Liste "Was Firn noch NICHT kann" (Module, comptime, Generics, enums/match, Fehlerunionen, defer/drop, Move-Prüfer, Referenztypen, Strings, Gleitkomma, Standardbibliothek, aarch64, WASM, LLVM-Backend).
+(f) SAUBERKEIT: `cargo build --release` selbst ausführen und auf NULL Warnungen prüfen. `grep` auf `todo!()`/`unimplemented!()`. Cargo.toml des Compilers auf externe Crates. Keine `#![allow]`-Sammelunterdrückung.
 
-HARTE REGELN:
-- KEINE todo!(), unimplemented!(), panic!("not implemented") in den geforderten Pfaden. Was nicht implementiert ist, meldet einen sauberen Compilerfehler ("Feature X wird in Stufe 0 nicht unterstützt") statt abzustürzen.
-- `cargo build --release` MUSS mit NULL Warnungen durchlaufen. Keine #![allow(...)]-Sammelunterdrückung, um Warnungen zu verstecken.
-- Keine externen Crates (std genügt). Kein LLVM, kein Cranelift, kein C-Compiler als Backend.
-- Der Sprachname darf ausschließlich in config.rs stehen.
-- Lieber WENIGER Sprachumfang, der WIRKLICH LÄUFT, als mehr, der behauptet wird. Wenn etwas nicht fertig wird: aus der Testsuite nehmen, in README ehrlich als "nicht implementiert" führen — NICHT faken, NICHT den Test so umschreiben, dass er trivial besteht.
-- Selbst verifizieren: bevor ihr fertig meldet, wirklich `bash test.sh` laufen lassen und das echte Ergebnis in README schreiben.
-**Messlatte:** Der Compiler MUSS wirklich bauen und die Testsuite MUSS real durchlaufen — jedes Testprogramm wird kompiliert, ausgeführt und sein Ergebnis geprüft. Die Jury führt selbst `cargo build --release` und `bash test.sh` aus und glaubt KEINE Behauptung aus dem README ohne eigenen Nachweis.
+(g) EHRLICHKEIT DER DOKUMENTE: Deckt sich SPEC.md mit dem Implementierten? Wurde SPEC.md umgeschrieben, statt Abweichungen in §14.1 zu vermerken — massiver Abzug. Ist ABNAHME.md Punkt 3 mit der ECHTEN Quote aktualisiert? Behauptet README etwas, das die Jury nicht reproduzieren kann — massiver Abzug.
 
-Streng bewertet:
-(a) LAUFEN die erzeugten Binaries tatsächlich und liefern korrekte Ergebnisse? Stichprobe: mindestens 5 Testprogramme selbst übersetzen, ausführen, Exit-Code/Ausgabe prüfen. examples/hello.fi muss wirklich sichtbaren Text ausgeben, fib.fi das richtige Ergebnis liefern, bubblesort.fi wirklich sortieren. Ein Compiler, der nur Assembler-Text ausspuckt der nicht assembliert oder segfaultet, ist ein Totalausfall.
-(b) Ist der Codegen WIRKLICH eigener x86_64-Code ohne LLVM/Cranelift/gcc-Backend? Prüfen: Cargo.toml auf Abhängigkeiten, Quelltext auf Aufrufe an externe Codegeneratoren, erzeugter .s-Text auf Plausibilität (echte Registerzuteilung, echte Prologe/Epiloge, System-V-Konvention). gcc/as/ld dürfen nur assemblieren/linken. Wird C erzeugt und mit gcc übersetzt: Totalausfall.
-(c) Sind die FEHLERMELDUNGEN brauchbar? Selbst absichtlich kaputte .fi-Programme schreiben (Syntaxfehler, Typfehler, unbekannte Variable, falsche Argumentanzahl) und den Compiler darauf loslassen: Muss Zeile, Spalte, Quelltextausschnitt und eine verständliche Meldung liefern und mit Exit-Code != 0 sauber abbrechen — KEIN Rust-Panic, kein unwrap-Absturz, keine Endlosschleife. Ein Compiler, der bei kaputter Eingabe panickt, verliert massiv Punkte.
-(d) Ist die IR ECHT und die Optimierung NACHWEISBAR wirksam? `--emit=fir` muss eine plausible, dokumentierte IR ausgeben (Basisblöcke, Terminatoren, typisierte Werte), docs/FIR.md muss zur tatsächlichen Ausgabe passen. Konstantenfaltung und Entfernen toten Codes müssen im Vorher/Nachher-Dump sichtbar sein — selbst nachprüfen mit einem eigenen kleinen Testprogramm. Eine "IR", die nur ein anderer Name für den AST ist, zählt nicht.
-(e) Deckt sich SPEC.md mit dem, was IMPLEMENTIERT ist? Stichproben aus SPEC §12 nehmen und prüfen, ob es wirklich geht. Ist die README-Liste der Nicht-Fähigkeiten ehrlich, oder werden Lücken verschwiegen? Behauptet das README etwas, das nicht stimmt: massiver Abzug.
-(f) SAUBERKEIT: keine todo!()/unimplemented!() in den geforderten Pfaden (grep), NULL Compilerwarnungen bei `cargo build --release` (selbst ausführen und Ausgabe prüfen), keine Sammelunterdrückung von Warnungen per #![allow], keine externen Crates.
-(g) TESTSUITE-EHRLICHKEIT: Sind es wirklich >= 40 substanzielle Testprogramme, oder 40 Varianten von "return 0"? Prüfen ob test.sh wirklich ausführt und vergleicht — oder nur "compiled ok" meldet. Ein test.sh, das Fehler verschluckt (fehlendes set -e, ignorierte Exit-Codes, || true) ist Betrug und muss hart bestraft werden. Prüfen, ob die Tests auch mit --no-opt dasselbe Ergebnis liefern.
-
-Behauptungen ohne laufenden Code = massiver Punktabzug. Ein kleiner, ehrlich funktionierender Compiler ist deutlich besser bewertet als ein großer, der nicht läuft. Bewertet wird, was die Jury selbst zum Laufen bringt, nicht was im README steht.
+GRUNDREGEL: Bewertet wird ausschließlich, was die Jury selbst zum Laufen bringt und selbst nachmisst. Ein kleinerer, ehrlich gemessener Fortschritt wird deutlich besser bewertet als ein großer mit Behauptungen. Ehrlich als offen geführte Lücken kosten wenig; behauptete Fähigkeiten, die nicht funktionieren, kosten sehr viel.
 **Bester Score:** 86/100 (Runde 1)
-**Agenten:** 8 · **Dauer:** 3282s
+**Agenten:** 13 · **Dauer:** 6820s
 **Runden-Snapshots:** je Runde ein Git-Commit + Tag (gauntlet-r<N>-score<S>). Bester Stand: Branch `gauntlet-best` (Runde 1) — Wechsel mit `git checkout gauntlet-best`, zurueck mit `git checkout -`.
-**Runde 0 — Architektur**: 4 Module (frontend, sema, lowering, opt)
-**Runde 1** — Score 86/100 (Ziel 85)
-  Maengel: • Laufzeitnachweis durch mich nicht reproduzierbar: Ausfuehrung von compiler/target/release/firnc und cargo ist in meiner Umgebung blockiert; Beleg sind nur die Artefakte in .test-work/ (75 ELF-Binaries x opt/noopt, leere .cerr) — kein selbst gemessener Exit-Code von fib.fi (89) oder bubblesort.fi (1)  • SPEC.md:571 und README behaupten 'eigene Registerzuteilung'; codegen_x86.rs:74-102 vergibt jedem SSA-Wert einen 8-Byte-Stack-Slot und rechnet nur in rax/rcx/rdx — es findet KEINE Registerzuteilung statt, nur Spilling. Overclaim gegenueber dem Selbstkommentar in codegen_x86.rs:7 ('bewusst naiv')  • Rahmengroesse = 8 Byte pro SSA-Wert ohne Obergrenze (codegen_x86.rs:78-81, 'sub rsp, FRAME'), keine Stack-Probe: eine Funktion mit sehr vielen Werten erzeugt einen beliebig grossen Rahmen und kann ohne Diagnose in den Guard-Page laufen  • codegen_x86.rs:86 ueberspringt per 'continue' stillschweigend Bloecke ausserhalb des Eintrittsblocks, die alloca enthalten; das fuehrt in Zeile 329 nur zu 'interner Fehler: alloca ohne Platz' — eine Fehlermeldung ganz ohne Zeile/Spalte/Quelltextausschnitt  • Optimierer bleibt an der Oberflaeche: .opt-work/fold_arith.opt.fir behaelt store.i32/load.i32 auf einem alloca, das nur einmal geschrieben und einmal gelesen wird; .opt-work/dead_branch.opt.fir behaelt einen leeren bb0 mit 'br bb1' — weder mem2reg/Copy-Propagation noch Blockverschmelzung
-✅ Ziel erreicht in Runde 1 (86 ≥ 85).
+**Runde 0 — Architektur**: 3 Module (teil-1, teil-2, teil-3) — bestehendes Projekt
+**Runde 1** — Score 86/100 (Ziel 88)
+  Maengel: • Der Tokenizer erzeugt KEINE Parse-Fehler-Codes; harness.py:60 wirft 'ParseError' aus Erwartung UND Ist-Ausgabe heraus. Die 6807/6810 sind damit nur Token-Konformitaet, nicht html5lib-Konformitaet — ehrlich vermerkt (ABNAHME.md:114-116), aber die Quote ist optimistischer als eine strenge Auswertung.  • lib/html/entities.fi:41-102: die Namenstabelle liegt an der FESTEN Adresse 0x600000000000 per mmap(MAP_FIXED_NOREPLACE). Auf Kerneln < 4.17 wird das Flag ignoriert (fremde Mappings werden ueberschrieben); ist die Adresse belegt und die Kennung passt nicht, liefert tabelle() 0 und nachschlagen() gibt still 0 zurueck -> alle benannten Referenzen fallen stumm auf '&' zurueck statt zu scheitern.  • ABNAHME.md:208-210 ('Keine Regression … PASS 259/259, 114 Programme, 30 Negativtests') widerspricht README.md:89 (PASS 468/468, 139 Programme, 46 Negativtests) und PLAN.md:356 (Ausgangsstand 393/393). Punkt g der Messlatte verlangt eine aktuelle Regressionszahl im Abnahmedokument.  • tools/tokenizer/korpus.py:29-31 filtert fuer den Durchsatzkorpus alle Faelle mit doubleEscaped oder initialStates heraus und haengt den Rest 4 MB lang aneinander. Gemessen wird also ein Korpus aus Pathologie-Schnipseln, nicht HTML; die 2,79x sind fuer echte Seiten nicht aussagekraeftig (steht so nicht in README/ABNAHME).  • compiler/src/fir.rs:168,172,176,378 und abi.rs:32 tragen #[allow(dead_code)] mit dem Kommentar 'wird vom Modul ct verdrahtet' — die Null-Warnungs-Aussage stuetzt sich teilweise auf Unterdrueckung nicht verdrahteter Felder (fir::Func::secret/constant_time, ohne Frontend nicht ausloesbar; ABNAHME.md:201 raeumt das ein).
+**Runde 2** — Score n/a/100 (Ziel 88)
