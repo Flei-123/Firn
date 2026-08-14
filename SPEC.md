@@ -885,6 +885,25 @@ array_lit   = "[" [ expr { "," expr } ] "]"
 * `syscall(nr, a1, …, a6)` ist eingebaut und bildet direkt auf `syscall` ab
   (`rax, rdi, rsi, rdx, r10, r8, r9`).
 
+### 13.1 Ergebnisort — eine Garantie, keine Optimierung
+
+Bei `let x: T = ausdruck`, `return ausdruck` und Feldzuweisung kennt der
+erzeugende Ausdruck die **Zieladresse** und schreibt direkt dorthin. Es entsteht
+**kein** Zwischenwert auf dem Stapel, der anschließend kopiert wird.
+
+Das gilt als **Sprachgarantie**, nicht als Optimiererleistung — sie hält also
+auch in `--dev` und `--dev-fast`. Der Grund ist praktisch: `let b: [u8; 8<<20] =
+…` darf nicht erst 8 MB Stapel belegen. Genau daran scheitert Rust
+(`Box::new([0u8; 8*1024*1024])` läuft über den Stapel), weshalb Rust-for-Linux
+die Bibliothek `pin-init` nachbauen musste.
+
+**Stand der Umsetzung (14.08.2026):** Für **Aggregatrückgaben** ist das bereits
+so — `abi::ret_needs_sret()` klassifiziert Rückgaben über 16 Byte als `MEMORY`
+mit verstecktem Zeiger in `rdi`, und das Lowering reicht die Zieladresse durch
+(`compiler/src/lower.rs:604`). **Noch offen:** dieselbe Garantie für Struct- und
+Arrayliterale sowie für den geplanten `init`-Ausdruck. Ausführlich in
+`DESIGNZIELE.md` §6.
+
 ---
 
 ## 14. Was `firnc0` (Stufe 0) implementiert — verbindlich
