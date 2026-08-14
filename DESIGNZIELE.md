@@ -868,8 +868,23 @@ steht in `firn.toml` und ist sichtbar.
 
 * **Die Übersetzungsphasen müssen wiedereintrittsfähig sein.** Wenn
   Namensauflösung und Typprüfung als einmaliger Durchlauf über einen festen
-  AST gebaut werden, ist `emit` später nicht nachrüstbar. Der Compiler muss
-  „prüfe diese neu entstandene Funktion" können.
+  AST gebaut werden, ist `emit` später nicht nachrüstbar.
+  **Erledigt am 14.08.2026** (`compiler/src/sema.rs`): `Checker::add_items`
+  prüft **zusätzliche** Deklarationen mit dem bereits aufgebauten Zustand —
+  dieselbe Namenstabelle, dieselbe Typtabelle, dieselben Diagnosen. Die
+  Ausdruckstypen-Tabelle wächst mit den neuen Ausdrucks-Ids mit; die
+  Ganzprogramm-Prüfung (`main` vorhanden und richtig) läuft weiterhin genau
+  einmal und nicht je Nachtrag.
+* **Drei Tests belegen es**, weil eine Fähigkeit ohne Erzeuger sonst nur eine
+  Behauptung wäre: (a) eine Funktion, die es beim ersten Durchlauf noch nicht
+  gab, ruft eine Funktion aus dem ersten Durchlauf auf und wird korrekt
+  getypt; (b) ein Nachtrag mit unbekanntem Namen liefert **denselben** Fehler
+  wie im ersten Durchlauf — ein Nachtrag ist keine Hintertür; (c) ein Nachtrag,
+  der `main` ein zweites Mal deklariert, wird als doppelte Deklaration erkannt.
+* **Ehrlicher Umfang:** Nachträge dürfen Structs, Funktionen und Konstanten
+  enthalten. Aufzählungen werden nur im ersten Durchlauf ausgelegt, weil ihre
+  Anmeldung im Parser passiert — nachträglich erzeugte `enum`s kommen mit
+  `comptime` selbst.
 * **FIR muss interpretierbar bleiben** — also keine Instruktion, die nur im
   Codegenerator Sinn ergibt. Das ist heute erfüllt und muss so bleiben.
 * Firn hat heute Monomorphisierung (`mono.rs`, `sema_generic.rs`) — die halbe
@@ -1150,7 +1165,7 @@ Dingen, die später obendrauf kommen.
 | 4 | **Stabiles ABI** | **erledigt 14.08.2026:** Symbolschema `_F0.…` mit Versionsplatz (`modules.rs`), Nachweis `tools/symbole/run.sh` | `#[abi_stable]`, `#[frozen]`, resiliente Aufrufe | Vorleistung ✔, Rest nachrüstbar | erledigt → 7/8 |
 | 5 | **Debug-Bau-Geschwindigkeit** | **erledigt 14.08.2026:** Register `PASSES` mit Etiketten, `--list-passes`, `--no-pass=`, `--opt-level=`; gemessen **2,06×** | die verbotenen Durchgänge existieren noch gar nicht; `--release-safe` = `--release-fast`, solange es keine Laufzeitprüfungen gibt | **FUNDAMENT** ✔ | erledigt / 3 |
 | 6 | **In-Place-Initialisierung** | **Ergebnisort als Garantie festschreiben** — für Aggregatrückgaben bereits umgesetzt (`lower.rs:604`, nachgeprüft), fehlt für Literale und `init` | `init`-Ausdruck mit Teilaufräumung, `#[no_move]` | **FUNDAMENT** (teuer, aber jetzt am billigsten) | 2 → 3 |
-| 7 | **Comptime + Reflexion** | **Prüfphasen wiedereintrittsfähig** (neu erzeugte Elemente nachträglich prüfbar). FIR bleibt interpretierbar | `comptime`-Interpreter, `reflect.*`, `emit`, Bauskripte | **FUNDAMENT** (Architektur) | 2 → 3 |
+| 7 | **Comptime + Reflexion** | **erledigt 14.08.2026:** `Checker::add_items` + 3 Tests; FIR bleibt interpretierbar | `comptime`-Interpreter, `reflect.*`, `emit`, Bauskripte | **FUNDAMENT** ✔ | erledigt / 3 |
 | 8 | **Datenlayout / SoA** | **erledigt 14.08.2026:** `layout.rs` mit vier Zugängen, Architekturwächter `tools/schichten/run.sh` in `test.sh` | `SoaVec[T]`, `#[layout(soa)]`, `#[bitfeld]`, `#[klein(N)]` | **FUNDAMENT** ✔ | erledigt / 3-4 |
 | 9 | **Hot Reload** | **nichts** — nur nicht ausschließen | Stufe B (Daten neu laden), evtl. `#[hot]` | nachrüstbar | 4 / kein Termin |
 | — | *(bereits entschieden)* Opt-in-GC, WTF-16, Constant-Time, Abwicklung | siehe `SPEC.md` §3, §8, §9, §5.3 | — | **FUNDAMENT** | 2–4 |
@@ -1167,8 +1182,8 @@ nichts, weil sie Architekturentscheidungen sind und keine Merkmale:
    (Punkt 3 — reine Disziplin, aber unumkehrbar)
 4. **Optimierungsdurchgänge einzeln schaltbar, mit Etikett, Zeileninfo
    erhaltend.** (Punkt 5 — heute billig, später ein Umbau jedes Durchgangs)
-5. **Prüfphasen wiedereintrittsfähig, FIR interpretierbar.**
-   (Punkt 7 — Architektur, keine Funktion)
+5. ~~**Prüfphasen wiedereintrittsfähig, FIR interpretierbar.**~~
+   (Punkt 7 — **erledigt am 14.08.2026**)
 6. ~~**Feldzugriff vom Speicherort getrennt** (Punkt 8) **und Ergebnisort als
    Garantie** (Punkt 6).~~ **Beides erledigt am 14.08.2026.** Der Ergebnisort
    war für Aggregatrückgaben bereits vorhanden und ist jetzt als Garantie
@@ -1223,8 +1238,8 @@ Konkret und überprüfbar, in dieser Reihenfolge:
    billiger als befürchtet.
 4. ~~**Durchgangsregister mit Etiketten** (Punkt 5)~~ — **erledigt**,
    `--list-passes` / `--no-pass=` / `--opt-level=`, gemessen 2,06×.
-5. **Wiedereintrittsfähige Prüfphasen** (Punkt 7) — beim Bau des Modulsystems
-   berücksichtigen.
+5. ~~**Wiedereintrittsfähige Prüfphasen** (Punkt 7)~~ — **erledigt**,
+   `Checker::add_items` mit drei Tests.
 6. ~~**Symbol-Namensschema mit Versionsplatz** (Punkt 4)~~ — **erledigt**,
    `modules::symbol`, Nachweis `tools/symbole/run.sh`.
 
