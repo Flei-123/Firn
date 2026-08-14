@@ -1201,6 +1201,64 @@ O6. **Inlining ueber Modulgrenzen** ergibt sich daraus, dass das Modulsystem
     `#[constant_time]`-Funktionen und Funktionen mit `secret`-Werten bleiben
     aussen vor.
 
+#### 14.1.fehlerunionen — Fehlerunionen `E!T` (Runde 3, Modul `fehlerunionen`)
+
+Mit Runde 3 ist §5.1 als Sprachmittel umgesetzt: `error`-Deklaration,
+Typsyntax `E!T` (Rückgabetyp, Variablentyp, Feldtyp, Parametertyp), implizite
+Umwandlung bei `return`, `try`, `catch` und `catch |e| ersatz`. Ein `!T`-Wert
+ist implizit `#[must_consume]`.
+
+**Darstellung (verbindlich).** Eine Fehlerunion ist ein Struct in
+`types::TypeCtx` mit `__err: u32` bei Offset 0 (`0` = Erfolg, Fehlercodes ab
+`1` in Deklarationsreihenfolge der Fehlermenge) und `__val: T` bei
+`round_up(4, align(T))`; der reine Fehlerwert `E` ist der Struct `{ __err: u32 }`.
+Damit gelten Aggregat-ABI (§14.1 Punkt 1), Registerzuteilung und Codegen
+unverändert. Seitentabellen und Prüfung stehen in `compiler/src/errors.rs`,
+das Lowering in `compiler/src/lower_errors.rs`.
+
+Bewusst enger als der Text in §5.1 ist Folgendes:
+
+F1. **Die Fehlermenge wird nicht abgeleitet.** `E!T` muss vollständig
+    hingeschrieben werden; ein `!T` ohne Fehlermenge (§5.1 „die Fehlermenge
+    darf weggelassen und vom Compiler abgeleitet werden") ist nicht umgesetzt
+    und meldet einen Syntaxfehler mit Zeile und Spalte.
+F2. **Fehlermengennamen sind programmweit**, nicht je Modul — wie
+    Aufzählungsnamen (§14.1.types). `LeseFehler::Ende` gilt in jeder Datei,
+    `modul.LeseFehler::Ende` gibt es nicht. Nachweis:
+    `tests/414_modul_fehler.fi`.
+F3. **`try` verlangt dieselbe Fehlermenge.** Es gibt keine Vereinigung oder
+    Verbreiterung von Fehlermengen und kein Umschlüsseln beim Durchreichen;
+    unterschiedliche Mengen sind ein Fehler mit Zeile und Spalte
+    (`tests/neg/err_falsche_menge.fi`).
+F4. **`catch |e| …` bindet an einen Ausdruck, nicht an einen Block.** Der
+    Fehlerwert `e` hat den Typ der Fehlermenge und wird mit `==`/`!=`
+    untersucht (`tests/419_catch_bindung.fi`); `match e { … }` auf einem
+    Fehlerwert ist **nicht** umgesetzt und meldet einen sauberen Fehler.
+    Auch der Schreibweise nach ist `catch` damit enger als das Beispiel in
+    §5.1, das einen Block mit `return` darin zeigt.
+F5. **`defer` und `errdefer` gibt es nicht.** Beides ist offen; das Beispiel in
+    §5.1 (`errdefer close(fd)`) ist damit noch nicht schreibbar.
+F6. **Kein Erfolgstyp `()`.** `E!()` ist nicht schreibbar (Stufe 0 kennt `()`
+    nicht als Typsyntax); eine Funktion ohne Nutzergebnis liefert z. B.
+    `E!i32`.
+F7. **Wo implizit umgewandelt wird**, ist abschließend aufgezählt: `return`,
+    `let x: E!T = …`, Zuweisung, Feld eines Struct-Literals und Argument eines
+    Aufrufs. In Array-Literalen und in Vergleichen wird **nicht** umgewandelt.
+F8. **Im Fehlerfall ist `__val` unbestimmt.** Definiert ist nur `__err`; wer
+    den Erfolgswert im Fehlerfall liest (nur über eine eigene Struct-Sicht
+    möglich), liest Füllwerte.
+F9. **`catch` bindet schwächer als jeder Operator.** `a catch b * 2` ist
+    `a catch (b * 2)`, `(a catch b) * 2` braucht Klammern. `try` bindet so
+    stark wie ein unärer Operator: `try f() + 1` ist `(try f()) + 1`.
+F10. **Fehlerunion über einem Struct-Erfolgstyp taugt nicht als Feldtyp eines
+    Structs.** Wenn `sema::collect_structs` die Feldtypen auflöst, stehen die
+    Struct-Layouts noch nicht fest — die Fehlerunion bekäme eine falsche Größe.
+    Statt eines stillen Fehl-Layouts gibt es einen Fehler mit Zeile und Spalte
+    (`tests/neg/err_union_in_struct.fi`). Mit skalarem Erfolgstyp
+    (`E!i32`, `E!*mut u8`) ist der Feldtyp erlaubt (`tests/408_union_feld.fi`),
+    als Rückgabe-, Variablen- und Parametertyp jeder Erfolgstyp.
+
+
 ---
 
 ## 15. Offene Fragen

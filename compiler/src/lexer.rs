@@ -38,6 +38,10 @@ pub enum TokKind {
     /// Summentypen (SPEC §6.3) — verdrahtet vom Modul `types`.
     KwEnum,
     KwMatch,
+    /// Fehlerunionen (SPEC §5.1) — verdrahtet vom Modul `fehlerunionen`.
+    KwError,
+    KwTry,
+    KwCatch,
     // Satzzeichen
     LParen,
     RParen,
@@ -105,6 +109,9 @@ impl TokKind {
             TokKind::KwExport => "export".into(),
             TokKind::KwEnum => "enum".into(),
             TokKind::KwMatch => "match".into(),
+            TokKind::KwError => "error".into(),
+            TokKind::KwTry => "try".into(),
+            TokKind::KwCatch => "catch".into(),
             TokKind::LParen => "(".into(),
             TokKind::RParen => ")".into(),
             TokKind::LBrace => "{".into(),
@@ -176,6 +183,9 @@ fn keyword(word: &str) -> Option<TokKind> {
         "export" => TokKind::KwExport,
         "enum" => TokKind::KwEnum,
         "match" => TokKind::KwMatch,
+        "error" => TokKind::KwError,
+        "try" => TokKind::KwTry,
+        "catch" => TokKind::KwCatch,
         _ => return None,
     })
 }

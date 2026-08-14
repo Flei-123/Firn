@@ -1,0 +1,112 @@
+// lib/html/entities_probe.fi — Pruefstand fuer lib/html/entities.fi (in Firn).
+//
+// Ein winziger Treiber, der NUR den Zeichenreferenz-Teil des Tokenizers fahren
+// kann: Zeichen werden ausgegeben, '&' geht an `entities.char_ref`. Damit laesst
+// sich das Modul `entities` unabhaengig vom Rest der Zustandsmaschine gegen die
+// offiziellen Erwartungen messen:
+//
+//     firnc -o build/entities_probe lib/html/entities_probe.fi
+//     python3 tools/tokenizer/pruefe_entities.py
+//
+// Ein- und Ausgabeformat sind dieselben wie beim echten Treiber
+// (tools/tokenizer/PROTOKOLL.md); `startzustand` wird als "im Attributwert"
+// gedeutet: 0 = Zeichenstrom (Data), 1 = Attributwert.
+import mem
+import tokens
+import entities
+
+fn lies_u32(b: *mut mem.Buf, off: usize) -> u32 {
+    var v: u32 = 0
+    var i: usize = 0
+    while i < 4 {
+        v = v | ((mem.buf_at(b, off + i) as u32) << (8 * i as u32))
+        i = i + 1
+    }
+    return v
+}
+
+// WTF-8 -> Codepunkte (wie lib/html/tokenize_main.fi, ohne Zeilenendenumbau,
+// weil der Pruefstand die Eingabe unveraendert sehen soll).
+fn dekodiere(b: *mut mem.Buf, off: usize, len: usize, out: *mut mem.CpBuf) {
+    mem.cp_clear(out)
+    var i: usize = 0
+    while i < len {
+        let c0: u32 = mem.buf_at(b, off + i) as u32
+        var cp: u32 = c0
+        var breite: usize = 1
+        if c0 >= 0xF0 as u32 {
+            breite = 4
+            cp = ((c0 & 0x07 as u32) << 18) |
+                ((mem.buf_at(b, off + i + 1) as u32 & 0x3F as u32) << 12) |
+                ((mem.buf_at(b, off + i + 2) as u32 & 0x3F as u32) << 6) |
+                (mem.buf_at(b, off + i + 3) as u32 & 0x3F as u32)
+        } else if c0 >= 0xE0 as u32 {
+            breite = 3
+            cp = ((c0 & 0x0F as u32) << 12) |
+                ((mem.buf_at(b, off + i + 1) as u32 & 0x3F as u32) << 6) |
+                (mem.buf_at(b, off + i + 2) as u32 & 0x3F as u32)
+        } else if c0 >= 0xC0 as u32 {
+            breite = 2
+            cp = ((c0 & 0x1F as u32) << 6) |
+                (mem.buf_at(b, off + i + 1) as u32 & 0x3F as u32)
+        }
+        i = i + breite
+        mem.cp_push(out, cp)
+    }
+}
+
+// Zeichenstrom: alles ausser '&' unveraendert, '&' an das Modul `entities`.
+fn fahre(text: *mut mem.CpBuf, in_attr: bool, s: *mut tokens.Sink) {
+    let n: usize = mem.cp_len(text)
+    var pos: usize = 0
+    while pos < n {
+        let c: u32 = mem.cp_at(text, pos)
+        pos = pos + 1
+        if c == 38 as u32 {
+            pos = entities.char_ref(text, pos, in_attr, s)
+        } else if in_attr {
+            tokens.tok_attr_value_push(s, c)
+        } else {
+            tokens.sink_emit_char(s, c)
+        }
+    }
+}
+
+fn main() -> i32 {
+    var ein: mem.Buf = mem.buf_neu()
+    mem.read_all_stdin(&ein)
+
+    var s: tokens.Sink = tokens.sink_neu()
+    tokens.sink_init(&s)
+
+    var text: mem.CpBuf = mem.cp_neu()
+    var lasttag: mem.CpBuf = mem.cp_neu()
+
+    let gesamt: usize = mem.buf_len(&ein)
+    var off: usize = 0
+    while off + 12 <= gesamt {
+        let art: u32 = lies_u32(&ein, off)
+        let ltlen: usize = lies_u32(&ein, off + 4) as usize
+        dekodiere(&ein, off + 8, ltlen, &lasttag)
+        let inlen: usize = lies_u32(&ein, off + 8 + ltlen) as usize
+        dekodiere(&ein, off + 12 + ltlen, inlen, &text)
+        off = off + 12 + ltlen + inlen
+
+        tokens.sink_begin(&s)
+        if art == 1 as u32 {
+            // Attributwert: als StartTag "x" mit einem Attribut "a" ausgeben.
+            tokens.tok_start_tag(&s)
+            tokens.tok_name_push(&s, 120 as u32)
+            tokens.tok_attr_start(&s)
+            tokens.tok_attr_name_push(&s, 97 as u32)
+            fahre(&text, true, &s)
+            tokens.tok_attr_finish(&s)
+            tokens.tok_emit(&s)
+        } else {
+            fahre(&text, false, &s)
+        }
+        tokens.sink_end(&s)
+    }
+    tokens.sink_flush_out(&s)
+    return 0
+}

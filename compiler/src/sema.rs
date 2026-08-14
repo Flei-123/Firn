@@ -118,6 +118,8 @@ impl<'a> Checker<'a> {
         self.check_profile(prog);
         // HOOK types: Aufzaehlungsnamen anmelden (sema_match.rs)
         crate::sema_match::declare_enums(self);
+        // HOOK fehlerunionen: Fehlermengen anmelden (errors.rs)
+        crate::errors::declare_error_sets(self);
         self.add_items_inner(prog, true);
         // Ganzprogramm-Pruefung: laeuft genau einmal, nicht je Nachtrag.
         self.check_main(prog);
@@ -304,6 +306,8 @@ impl<'a> Checker<'a> {
     // --------------------------------------------------------------- Structs
 
     fn collect_structs(&mut self, prog: &Program) {
+        // HOOK fehlerunionen: Layoutphase melden (errors.rs)
+        crate::errors::hook_struct_phase(true);
         // 1. alle Namen anlegen (erlaubt gegenseitige Zeigerverweise)
         let mut idx_of: Vec<usize> = Vec::with_capacity(prog.structs.len());
         for s in &prog.structs {
@@ -395,6 +399,8 @@ impl<'a> Checker<'a> {
             }
             self.tcx.set_fields(idx, fields);
         }
+        // HOOK fehlerunionen: Layoutphase beendet (errors.rs)
+        crate::errors::hook_struct_phase(false);
     }
 
     // ------------------------------------------------------------- Funktionen
@@ -583,6 +589,8 @@ impl<'a> Checker<'a> {
             Stmt::Let { name, mutable, ty, init, span } => {
                 let declared = ty.as_ref().map(|te| self.resolve_ty(te));
                 let t = match &declared {
+                    // HOOK fehlerunionen: implizite Umwandlung (errors.rs)
+                    Some(d) if crate::errors::hook_coerce(self, init, d) => d.clone(),
                     Some(d) => {
                         let got = self.expr(init, Some(d));
                         if !assignable(&got, d) {
@@ -622,6 +630,10 @@ impl<'a> Checker<'a> {
                 };
                 if let Mutability::Fixed(reason) = mutability {
                     self.dg.error_note(*span, reason, "benutze 'var' statt 'let'");
+                }
+                // HOOK fehlerunionen: implizite Umwandlung (errors.rs)
+                if crate::errors::hook_coerce(self, value, &ty) {
+                    return;
                 }
                 let got = self.expr(value, Some(&ty));
                 if !assignable(&got, &ty) {
@@ -695,6 +707,10 @@ impl<'a> Checker<'a> {
                                 e.span,
                                 "diese funktion hat keinen rueckgabetyp, 'return' darf keinen wert haben",
                             );
+                            return;
+                        }
+                        // HOOK fehlerunionen: implizite Umwandlung (errors.rs)
+                        if crate::errors::hook_coerce(self, e, &want) {
                             return;
                         }
                         let got = self.expr(e, Some(&want));
@@ -966,7 +982,13 @@ impl<'a> Checker<'a> {
                 let bt = self.expr(base, None);
                 self.index_type(&bt, idx, base.span)
             }
-            ExprKind::Call(name, args, nspan) => self.call(name, args, *nspan, e.span),
+            ExprKind::Call(name, args, nspan) => {
+                // HOOK fehlerunionen: `try`, `catch`, `Fehlermenge::Variante` (errors.rs)
+                if let Some(t) = crate::errors::hook_call(self, e.id, name, args, *nspan, e.span) {
+                    return t;
+                }
+                self.call(name, args, *nspan, e.span)
+            }
             ExprKind::Syscall(args) => {
                 if args.is_empty() || args.len() > 7 {
                     self.dg.error_note(
@@ -1192,6 +1214,10 @@ impl<'a> Checker<'a> {
     }
 
     fn binary(&mut self, e: &Expr, op: BinOp, l: &Expr, r: &Expr, hint: Option<&Type>) -> Type {
+        // HOOK fehlerunionen: Vergleich zweier Fehlerwerte (errors.rs)
+        if let Some(t) = crate::errors::hook_binary(self, op, l, r, e.span) {
+            return t;
+        }
         if op.is_logic() {
             let lt = self.expr(l, Some(&Type::Bool));
             let rt = self.expr(r, Some(&Type::Bool));
@@ -1338,6 +1364,10 @@ impl<'a> Checker<'a> {
         for (i, a) in args.iter().enumerate() {
             match sig.params.get(i) {
                 Some(p) => {
+                    // HOOK fehlerunionen: implizite Umwandlung (errors.rs)
+                    if crate::errors::hook_coerce(self, a, p) {
+                        continue;
+                    }
                     let t = self.expr(a, Some(p));
                     if !assignable(&t, p) {
                         self.dg.error(
@@ -1387,6 +1417,10 @@ impl<'a> Checker<'a> {
                             *fspan,
                             format!("feld '{}' ist mehrfach angegeben", fname),
                         );
+                    }
+                    // HOOK fehlerunionen: implizite Umwandlung (errors.rs)
+                    if crate::errors::hook_coerce(self, fexpr, ft) {
+                        continue;
                     }
                     let t = self.expr(fexpr, Some(ft));
                     if !assignable(&t, ft) {
@@ -1480,7 +1514,15 @@ impl<'a> Checker<'a> {
                 Some(Type::Array(el, _)) => Some((*el).clone()),
                 _ => None,
             },
-            ExprKind::Call(name, _, _) => self.fns.get(name).map(|s| s.ret.clone()),
+            ExprKind::Call(name, args, _) => {
+                // HOOK fehlerunionen: `try a`/`a catch b` liefern den
+                // Erfolgstyp der Fehlerunion (errors.rs)
+                if crate::errors::is_result_call(name) {
+                    let inner = args.first().and_then(|a| self.probe_d(a, d + 1))?;
+                    return crate::errors::success_type(&inner);
+                }
+                self.fns.get(name).map(|s| s.ret.clone())
+            }
             ExprKind::Syscall(_) => Some(Type::I64),
             ExprKind::Cast(_, te) => self.resolve_ty_quiet(te),
             ExprKind::StructLit(name, _, _) => self.tcx.lookup(name).map(Type::Struct),
@@ -1504,6 +1546,10 @@ impl<'a> Checker<'a> {
             self.dg
                 .error(te.span(), "typ ist zu tief verschachtelt (mehr als 200 ebenen)");
             return Type::Error;
+        }
+        // HOOK fehlerunionen: Fehlerunion `E!T` (errors.rs)
+        if let Some(t) = crate::errors::hook_resolve_ty(self, te) {
+            return t;
         }
         match te {
             TypeExpr::Named(name, span) => match prim_type(name) {

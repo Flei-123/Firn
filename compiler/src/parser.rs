@@ -77,6 +77,7 @@ fn starts_item(k: &TokKind) -> bool {
             | TokKind::KwImport
             | TokKind::KwExport
             | TokKind::KwEnum
+            | TokKind::KwError
     )
 }
 
@@ -344,6 +345,10 @@ impl<'a> Parser<'a> {
                         return None;
                     }
                 }
+                // HOOK fehlerunionen: Fehlerunion `E!T` (errors.rs)
+                if let Some(t) = crate::errors::hook_type(self, &name, sp) {
+                    return Some(t);
+                }
                 // HOOK types: generischer Typ `Vec[i32]` (sema_generic.rs)
                 if let Some(t) = crate::sema_generic::hook_generic_type(self, &name, sp) {
                     return Some(t);
@@ -369,6 +374,8 @@ impl<'a> Parser<'a> {
         }
         self.depth += 1;
         let e = self.or_expr();
+        // HOOK fehlerunionen: `ausdruck catch ersatzwert` (errors.rs)
+        let e = crate::errors::hook_catch(self, e);
         self.depth -= 1;
         e
     }
@@ -393,7 +400,7 @@ impl<'a> Parser<'a> {
         e
     }
 
-    fn or_expr(&mut self) -> Expr {
+    pub(crate) fn or_expr(&mut self) -> Expr {
         let mut lhs = self.and_expr();
         while self.at(&TokKind::OrOr) && self.cont() {
             self.bump();
@@ -498,7 +505,7 @@ impl<'a> Parser<'a> {
         lhs
     }
 
-    fn unary(&mut self) -> Expr {
+    pub(crate) fn unary(&mut self) -> Expr {
         let op = match self.kind() {
             TokKind::Minus => Some(UnOp::Neg),
             TokKind::Not => Some(UnOp::Not),
@@ -615,6 +622,10 @@ impl<'a> Parser<'a> {
     }
 
     pub(crate) fn primary(&mut self) -> Expr {
+        // HOOK fehlerunionen: `try ausdruck` (errors.rs)
+        if let Some(e) = crate::errors::hook_primary(self) {
+            return e;
+        }
         // HOOK types: `Enum::Variante(..)` und `Vec[i32]{..}` (sema_match.rs)
         if let Some(e) = crate::sema_match::hook_primary(self) {
             return e;
@@ -1383,6 +1394,13 @@ impl<'a> Parser<'a> {
                 }
                 continue;
             }
+            // HOOK fehlerunionen: `error`-Deklaration (errors.rs)
+            if crate::errors::hook_item(self) {
+                if self.pos == before {
+                    self.bump();
+                }
+                continue;
+            }
             // HOOK types: enum-Deklaration und generische Vorlagen (sema_match.rs)
             if crate::sema_match::hook_item(self) {
                 if self.pos == before {
@@ -1427,6 +1445,8 @@ pub fn parse(toks: &[Token], dg: &mut Diags) -> Program {
 pub fn reset_hooks() {
     // HOOK types: Registrierungen dieser Uebersetzung zuruecksetzen (sema_match.rs)
     crate::sema_match::hook_reset();
+    // HOOK fehlerunionen: dasselbe fuer Fehlermengen/Fehlerunionen (errors.rs)
+    crate::errors::hook_reset();
 }
 
 /// Wie `parse`, aber fuer eine Datei der Quelltextkarte: `file` ist ihre
