@@ -156,7 +156,7 @@ impl<'a> Lower<'a> {
         };
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
-            let a = self.ptradd_const(src, i as u64 * 8);
+            let a = self.ptradd_const(src, i as u64 * 8); // ABI-Wortkopie
             out.push(self.load(FTy::I64, a));
         }
         Some(out)
@@ -167,13 +167,13 @@ impl<'a> Lower<'a> {
         if size % 8 != 0 {
             let t = self.alloca(words.len() as u64 * 8, 8);
             for (i, w) in words.iter().enumerate() {
-                let a = self.ptradd_const(t, i as u64 * 8);
+                let a = self.ptradd_const(t, i as u64 * 8); // ABI-Wortkopie
                 self.store(FTy::I64, a, *w);
             }
             self.push_void(FTy::Void, Op::CopyMem { dst, src: t, size });
         } else {
             for (i, w) in words.iter().enumerate() {
-                let a = self.ptradd_const(dst, i as u64 * 8);
+                let a = self.ptradd_const(dst, i as u64 * 8); // ABI-Wortkopie
                 self.store(FTy::I64, a, *w);
             }
         }
@@ -193,6 +193,12 @@ impl<'a> Lower<'a> {
     }
 
     /// `base + off` Bytes; konstante 0 wird weggelassen.
+    /// Rohe Adressrechnung `base + off`.
+    ///
+    /// **Nicht fuer Feldzugriffe benutzen** — dafuer gibt es `layout.rs`
+    /// (`field_addr`, `field_addr_at`, `elem_addr`, `elem_addr_const`).
+    /// Direkte Aufrufe sind nur fuer ABI-Wortkopien erlaubt und mit
+    /// `// ABI-Wortkopie` gekennzeichnet; `tools/schichten/run.sh` prueft das.
     pub(crate) fn ptradd_const(&mut self, base: Val, off: u64) -> Val {
         if off == 0 {
             return base;
@@ -272,11 +278,8 @@ impl<'a> Lower<'a> {
                     },
                     _ => return self.ice(*fspan, "feldzugriff auf nicht-struct"),
                 };
-                let off = match self.info.tcx.structs.get(sidx).and_then(|s| s.field(fname)) {
-                    Some(f) => f.offset,
-                    None => return self.ice(*fspan, "unbekanntes feld im lowering"),
-                };
-                Some(self.ptradd_const(baddr, off))
+                // Schicht Feldzugriff <-> Speicherort (layout.rs, DESIGNZIELE 8)
+                self.field_addr(baddr, sidx, fname, *fspan)
             }
             ExprKind::Index(base, idx) => {
                 let bt = self.ty_of(base);
@@ -288,14 +291,8 @@ impl<'a> Lower<'a> {
                 let esz = self.info.tcx.size_of(&elem).max(1);
                 let iv = self.lower_expr(idx)?;
                 let ift = self.fty_of(idx)?;
-                let iv64 = if ift == FTy::U64 {
-                    iv
-                } else {
-                    self.push(FTy::U64, Op::Cast { src: iv, from: ift })
-                };
-                let sz = self.konst(FTy::U64, esz as i128);
-                let off = self.push(FTy::U64, Op::Bin(FBin::Mul, iv64, sz));
-                Some(self.push(FTy::Ptr, Op::PtrAdd { base: baddr, off }))
+                // Schicht Feldzugriff <-> Speicherort (layout.rs, DESIGNZIELE 8)
+                Some(self.elem_addr(baddr, esz, iv, ift))
             }
             ExprKind::StructLit(..) | ExprKind::ArrayLit(_) | ExprKind::ArrayRepeat(..) => {
                 let t = self.ty_of(e);
@@ -348,11 +345,8 @@ impl<'a> Lower<'a> {
                     _ => return self.ice(*span, "struct-literal ohne struct-typ"),
                 };
                 for (fname, fexpr, fspan) in fields {
-                    let off = match self.info.tcx.structs.get(sidx).and_then(|s| s.field(fname)) {
-                        Some(f) => f.offset,
-                        None => return self.ice(*fspan, "unbekanntes feld im lowering"),
-                    };
-                    let fa = self.ptradd_const(addr, off);
+                    // Schicht Feldzugriff <-> Speicherort (layout.rs, DESIGNZIELE 8)
+                    let fa = self.field_addr(addr, sidx, fname, *fspan)?;
                     self.write_into(fa, fexpr)?;
                 }
                 Some(())
@@ -364,7 +358,7 @@ impl<'a> Lower<'a> {
                 };
                 let esz = self.info.tcx.size_of(&et).max(1);
                 for (i, el) in elems.iter().enumerate() {
-                    let ea = self.ptradd_const(addr, esz * i as u64);
+                    let ea = self.elem_addr_const(addr, esz, i as u64);
                     self.write_into(ea, el)?;
                 }
                 Some(())
@@ -680,7 +674,7 @@ impl<'a> Lower<'a> {
         // Kleine Laengen ohne Schleife
         if n <= 8 {
             for i in 0..n {
-                let ea = self.ptradd_const(addr, esz * i);
+                let ea = self.elem_addr_const(addr, esz, i);
                 match (sv, saddr) {
                     (Some((ft, v)), _) => self.store(ft, ea, v),
                     (None, Some(src)) => {
@@ -708,9 +702,8 @@ impl<'a> Lower<'a> {
 
         self.cur = body;
         let iv2 = self.load(FTy::U64, islot);
-        let szv = self.konst(FTy::U64, esz as i128);
-        let off = self.push(FTy::U64, Op::Bin(FBin::Mul, iv2, szv));
-        let ea = self.push(FTy::Ptr, Op::PtrAdd { base: addr, off });
+        // Schicht Feldzugriff <-> Speicherort (layout.rs, DESIGNZIELE 8)
+        let ea = self.elem_addr(addr, esz, iv2, FTy::U64);
         match (sv, saddr) {
             (Some((ft, v)), _) => self.store(ft, ea, v),
             (None, Some(src)) => self.push_void(FTy::Void, Op::CopyMem { dst: ea, src, size: esz }),
@@ -1128,7 +1121,7 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
                     .collect();
                 next += n;
                 for (k, w) in ws.iter().enumerate() {
-                    let a = lo.ptradd_const(slot, k as u64 * 8);
+                    let a = lo.ptradd_const(slot, k as u64 * 8); // ABI-Wortkopie
                     lo.store(FTy::I64, a, *w);
                 }
                 lo.declare(&p.name, slot);

@@ -15,6 +15,8 @@
 #   5. Nachweis des Optimierers (test_opt.sh: FIR vorher/nachher).
 #   6. Nachweis der Ergebnisort-Garantie (tools/ergebnisort/run.sh:
 #      Rahmengroessen im erzeugten Assembler).
+#   7. Architekturpruefung: Feldzugriff ist vom Speicherort getrennt
+#      (tools/schichten/run.sh, Vorbedingung fuer SoA).
 #
 # Kein '|| true', kein Verschlucken von Exit-Codes: set -euo pipefail.
 set -euo pipefail
@@ -175,6 +177,16 @@ if [ "$EORC" -eq 0 ]; then
 else
     bad "tools/ergebnisort/run.sh schlug fehl (siehe .test-work/ergebnisort.log)"
     tail -20 "$WORK/ergebnisort.log" | sed 's/^/   /'
+fi
+
+echo "== 7. Architektur: Feldzugriff <-> Speicherort getrennt =="
+bash tools/schichten/run.sh > "$WORK/schichten.log" 2>&1 && SCRC=0 || SCRC=$?
+if [ "$SCRC" -eq 0 ]; then
+    ok
+    tail -1 "$WORK/schichten.log" | sed 's/^/   /'
+else
+    bad "tools/schichten/run.sh schlug fehl (siehe .test-work/schichten.log)"
+    tail -20 "$WORK/schichten.log" | sed 's/^/   /'
 fi
 
 TOTAL=$((PASS + FAIL))
