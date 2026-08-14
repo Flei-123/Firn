@@ -986,8 +986,9 @@ Code nicht auseinanderlaufen.
 1. ~~**Aggregate an Funktionsgrenzen.**~~ **Gestrichen in Runde 2** (Modul
    `kern`): Structs und Arrays sind als Parameter und als Rückgabewert erlaubt.
    Die System-V-Klassifikation steht in `compiler/src/abi.rs`
-   (`ArgClass::{Integer, Memory, Sse}`, `classify`) und ist die einzige Wahrheit
-   über die Aufrufkonvention. Nachweis: `tests/100_agg_param_8.fi` bis
+   (`ArgClass::{Integer, Memory}`, `classify`) und ist die einzige Wahrheit
+   über die Aufrufkonvention. Die Klasse `Sse` fehlt dort bewusst, solange es
+   keine Gleitkommatypen gibt (siehe Punkt 20). Nachweis: `tests/100_agg_param_8.fi` bis
    `tests/105_agg_wertsemantik.fi`.
    **Zwei bewusste Abweichungen von System V bleiben** und sind hier
    festgehalten (siehe auch Punkt 15):
@@ -1066,6 +1067,32 @@ Code nicht auseinanderlaufen.
     stimmen, der angezeigte **Dateiname** ist jedoch der der Wurzeldatei. Die
     Quelltextkarte führt zwar Dateinummern, die Diagnose wählt daraus aber noch
     nicht die richtige Datei aus. Offen.
+
+19. **Constant-Time-Primitive: nur die drei Bausteine, kein `secret[T]`
+    (Runde 4).** Aus §9 sind umgesetzt: `select(bedingung, a, b)` (wird `cmov`,
+    nie ein Sprung), `barrier(x)` (undurchsichtige Sperre) und
+    `secure_zero(zeiger, anzahl_bytes)` (überlebt jeden Durchgang,
+    `rep stosb`). Sie stehen in `compiler/src/ct.rs` und gelten auf skalaren
+    Typen (Ganzzahl, `bool`, Zeiger). **Nicht** umgesetzt sind der
+    Typqualifizierer `secret[T]`, die Ausbreitung der Markierung durch
+    Ausdrücke, `declassify` und damit auch die Wirkung von `#[constant_time]`:
+    das Attribut bleibt in `attrs.rs` als *nicht umgesetzt* geführt und meldet
+    einen sauberen Fehler (`tests/neg/attr_nicht_umgesetzt.fi`). Die Prüfung im
+    Codegenerator (bedingter Sprung auf einem `secret`-Wert bricht ab) ist
+    vorhanden, bekommt aber erst mit `secret[T]` Futter. Abweichung in der
+    Schreibweise: §9 schreibt `barrier(inout x)` und `secure_zero(inout buf)`;
+    Stufe 0 kennt kein `inout`, deshalb nimmt `barrier` den Wert und liefert
+    ihn zurück, und `secure_zero` nimmt Zeiger und Byteanzahl. Eine eigene
+    Funktion gleichen Namens verdeckt das Primitiv. Nachweis:
+    `tests/430_ct_select.fi` bis `tests/433_ct_secure_zero.fi`, fünf
+    Negativtests `tests/neg/ct_*.fi` und vier Codegen-Nachweise in
+    `compiler/src/ct.rs`.
+
+20. **Keine Gleitkommatypen (Runde 4 bestätigt).** `f32`/`f64` gibt es nicht;
+    deshalb führt `abi.rs` auch keine SSE-Klasse. Sie kommt zusammen mit den
+    Typen — dann erzwingt die Vollständigkeitsprüfung des Compilers, dass jede
+    Fallunterscheidung sie behandelt. Eine Variante ohne Erzeuger wäre toter
+    Code, der nur mit einem Unterdrückungsattribut warnungsfrei bliebe.
 
 #### 14.1.types — Summentypen, Musterabgleich, Generics (Runde 2, Modul `types`)
 

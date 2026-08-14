@@ -770,7 +770,7 @@ mod tests {
         let mut f = Func::new("t", vec![], FTy::I32);
         let slot = f.alloca(4, 4);
         let c = f.push(0, FTy::I32, Op::Const(9));
-        f.set_secret(c);
+        f.secret.insert(c);
         f.push_void(0, FTy::I32, Op::Store { addr: slot, val: c });
         let l = f.push(0, FTy::I32, Op::Load { addr: slot });
         f.set_term(0, Term::Ret(Some(l)));

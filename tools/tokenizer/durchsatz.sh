@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
-# Durchsatz des Firn-Tokenizers auf einem Eingabekorpus, danach — wenn
-# vorhanden — html5ever (cargo --release) auf DEMSELBEN Korpus.
+# Durchsatz des Firn-Tokenizers auf ZWEI Eingabekorpora, danach — wenn
+# vorhanden — html5ever (cargo --release) auf DENSELBEN Korpora.
 #
-# Der Korpus entsteht aus den Eingaben der html5lib-Faelle, vielfach
-# aneinandergehaengt (tools/tokenizer/korpus.py), damit die Messung nicht vom
-# Prozessstart dominiert wird.
+#   Korpus A "html5lib": die Eingaben der html5lib-Faelle, vielfach
+#       aneinandergehaengt. ABSICHTLICH PATHOLOGISCH (fast nur Grenzfaelle,
+#       sehr viele Zustandswechsel je Byte, kaum lange Textlaeufe) — ein Wert
+#       fuer den schlechtesten Fall. Begruendung in tools/tokenizer/korpus.py.
+#   Korpus B "realweb": acht gespeicherte echte Seiten aus testdata/realweb/
+#       (Wikipedia, WHATWG-Standard, W3C, rustdoc, Hacker News), ~4,6 MB,
+#       unveraendert wie ausgeliefert. Das ist der Alltagsfall.
+#
+# Beide Korpora erzeugt tools/tokenizer/korpus.py; beide Seiten (Firn und
+# html5ever) bekommen exakt dieselben Bytes.
 #
 # Gemessen wird DREIMAL, ausgewiesen wird der beste Lauf je Seite (die
 # Schwankung zwischen Laeufen liegt bei ~30 %). Der Faktor wird ausgerechnet
@@ -23,11 +30,6 @@ LAEUFE="${2:-3}"
 WORK=".tokenizer-work"
 mkdir -p "$WORK"
 
-if [ ! -f "$WORK/korpus.html" ]; then
-    python3 tools/tokenizer/korpus.py "$WORK/korpus.html" "$WORK/korpus.auftrag"
-fi
-GROESSE=$(stat -c%s "$WORK/korpus.html")
-
 # beste (kleinste) Zeit aus $LAEUFE Laeufen
 beste_zeit() {
     local best=""
@@ -42,22 +44,42 @@ beste_zeit() {
     echo "$best"
 }
 
-TF=$(beste_zeit sh -c "\"$BIN\" < \"$WORK/korpus.auftrag\" > \"$WORK/korpus.out\"")
-if grep -q 'NICHT-UNTERSTUETZT' "$WORK/korpus.out"; then
-    echo "   ACHTUNG: der Tokenizer hat den Korpus NICHT vollstaendig verarbeitet"
-    echo "            (Zustand nicht umgesetzt) — die MB/s sind daher kein"
-    echo "            vergleichbarer Wert und werden nur nachrichtlich gezeigt."
-fi
-awk -v t="$TF" -v n="$GROESSE" -v l="$LAEUFE" \
-    'BEGIN{printf "   Firn      : %8.2f MB/s  (%.3f s fuer %.2f MB, bester von %d)\n", n/t/1048576, t, n/1048576, l}'
+messe_korpus() {
+    local quelle="$1" beschreibung="$2"
+    local html="$WORK/korpus.$quelle.html"
+    local auftrag="$WORK/korpus.$quelle.auftrag"
+    local aus="$WORK/korpus.$quelle.out"
 
-if [ -x bench/tokenizer/target/release/html5ever_bench ]; then
-    TR=$(beste_zeit bench/tokenizer/target/release/html5ever_bench "$WORK/korpus.html")
-    awk -v t="$TR" -v n="$GROESSE" -v l="$LAEUFE" \
-        'BEGIN{printf "   html5ever : %8.2f MB/s  (%.3f s, bester von %d)\n", n/t/1048576, t, l}'
-    awk -v a="$TF" -v b="$TR" \
-        'BEGIN{printf "   Faktor    : %.2fx langsamer als html5ever (Abnahmeziel <= 2.00x)\n", a/b}'
-else
-    echo "   html5ever : nicht gebaut — bauen mit"
-    echo "               cargo build --release --manifest-path bench/tokenizer/Cargo.toml"
-fi
+    echo "   -- Korpus '$quelle' ($beschreibung)"
+    if [ ! -f "$html" ] || [ ! -f "$auftrag" ]; then
+        python3 tools/tokenizer/korpus.py "$html" "$auftrag" --quelle "$quelle"
+    fi
+    local groesse
+    groesse=$(stat -c%s "$html")
+
+    local tf
+    tf=$(beste_zeit sh -c "\"$BIN\" < \"$auftrag\" > \"$aus\"")
+    if grep -q 'NICHT-UNTERSTUETZT' "$aus"; then
+        echo "      ACHTUNG: der Tokenizer hat den Korpus NICHT vollstaendig verarbeitet"
+        echo "               (Zustand nicht umgesetzt) — die MB/s sind daher kein"
+        echo "               vergleichbarer Wert und werden nur nachrichtlich gezeigt."
+    fi
+    awk -v t="$tf" -v n="$groesse" -v l="$LAEUFE" \
+        'BEGIN{printf "      Firn      : %8.2f MB/s  (%.3f s fuer %.2f MB, bester von %d)\n", n/t/1048576, t, n/1048576, l}'
+
+    if [ -x bench/tokenizer/target/release/html5ever_bench ]; then
+        local tr
+        tr=$(beste_zeit bench/tokenizer/target/release/html5ever_bench "$html")
+        awk -v t="$tr" -v n="$groesse" -v l="$LAEUFE" \
+            'BEGIN{printf "      html5ever : %8.2f MB/s  (%.3f s, bester von %d)\n", n/t/1048576, t, l}'
+        awk -v a="$tf" -v b="$tr" \
+            'BEGIN{printf "      Faktor    : %.2fx langsamer als html5ever (Abnahmeziel <= 2.00x)\n", a/b}'
+    else
+        echo "      html5ever : nicht gebaut — bauen mit"
+        echo "                  cargo build --release --manifest-path bench/tokenizer/Cargo.toml"
+    fi
+}
+
+messe_korpus html5lib "Grenzfaelle der Testsuite, absichtlich pathologisch"
+echo
+messe_korpus realweb  "acht echte Seiten aus testdata/realweb/"
