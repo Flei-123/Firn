@@ -182,14 +182,14 @@ def main():
 
     gesamt = len(faelle)
     bestanden = sum(1 for x in ok_je_fall if x)
-    print("Datei                          bestanden /  gesamt   Quote")
+    print("Datei                          bestanden /  gesamt    Quote")
     print("-" * 62)
     for name in sorted(je_datei):
         p_, g_ = je_datei[name]
-        print("%-30s %6d / %6d   %5.1f %%" % (name, p_, g_, 100.0 * p_ / g_))
+        print("%-30s %6d / %6d   %6.2f %%" % (name, p_, g_, 100.0 * p_ / g_))
     print("-" * 62)
     print(
-        "%-30s %6d / %6d   %5.1f %%"
+        "%-30s %6d / %6d   %6.2f %%"
         % ("GESAMT", bestanden, gesamt, 100.0 * bestanden / gesamt)
     )
 

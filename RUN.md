@@ -1,6 +1,6 @@
 # RUN.md — bauen, starten, selbst nachmessen
 
-Alles hier ist **so ausgeführt worden**, wie es dasteht (13.08.2026, AMD EPYC
+Alles hier ist **so ausgeführt worden**, wie es dasteht (14.08.2026, AMD EPYC
 7571, Linux x86_64, rustc 1.99.0-nightly, binutils `as`/`ld`). Nur relative
 Pfade, alles innerhalb dieses Ordners.
 
@@ -50,10 +50,11 @@ compiler/target/release/firnc -o /tmp/mod tests/110_module.fi
 bash test.sh
 ```
 
-Gemessenes Ergebnis dieses Stands: **PASS 259/259**
-(114 Programme × 2 Durchläufe mit *und* ohne `--no-opt`, 30 Negativtests,
-41 Prüfungen des Optimierernachweises, 111 Rust-Modultests).
-Laufzeit ca. 1 Minute.
+Gemessenes Ergebnis dieses Stands: **PASS 468/468**
+(139 Programme × 3 Baustufen `opt` / `--no-opt` / `--opt-level=dev-fast`,
+46 Negativtests, 41 Prüfungen des Optimierernachweises, 118 Rust-Modultests,
+Ergebnisort-Garantie, Architekturwächter, Symbolschema und der
+HTML5-Tokenizer gegen html5lib). Laufzeit ca. 4 Minuten.
 
 Maschinenlesbar (CI, Ziel 9 / ABNAHME Punkt 4 A):
 
@@ -61,10 +62,11 @@ Maschinenlesbar (CI, Ziel 9 / ABNAHME Punkt 4 A):
 cargo build --release --manifest-path tools/testrunner/Cargo.toml
 ./tools/testrunner/target/release/testrunner --format=json > /tmp/firn.json
 python3 -c "import json;d=json.load(open('/tmp/firn.json'));print(d['total'],d['passed'],d['failed'],d['rate'])"
-# 256 256 0 1.0
+# 324 324 0 1.0
 ```
 
-(256 statt 259: der Runner enthält den Optimierernachweis `test_opt.sh` nicht.)
+(324 statt 468: der Runner enthält weder den Optimierernachweis `test_opt.sh`
+noch die Abschnitte 6–9 von `test.sh`.)
 
 ## 4. Die Nachweise einzeln — das, was die Jury prüft
 
@@ -81,6 +83,53 @@ python3 -c "import json;d=json.load(open('/tmp/firn.json'));print(d['total'],d['
 | **Erzeugte Str-Tests sind aktuell** | `python3 tools/strlib/expand.py --check` | `expand.py: 0 veraltete Dateien` |
 | **Sauberkeit** | `grep -rn "todo!\|unimplemented!" compiler/src` | keine Treffer |
 
+
+## 4a. HTML5-Tokenizer und Fehlerunionen (Runde 3)
+
+```sh
+bash tools/tokenizer/run.sh
+```
+
+Baut den Tokenizer aus `lib/html/*.fi` in **drei** Baustufen, fährt alle
+**6.810** html5lib-Fälle, prüft, dass alle drei Baustufen dieselbe Bilanz
+liefern, und misst den Durchsatz gegen html5ever. Gemessenes Ergebnis
+(14.08.2026):
+
+```
+GESAMT                           6807 /   6810    99.96 %
+xmlViolation.test                   1 /      4    25.00 %
+   noopt: 6807 — gleich
+   devfast: 6807 — gleich
+   Firn      :     4.08 MB/s  (0.999 s fuer 4.08 MB, bester von 3)
+   html5ever :    10.97 MB/s  (0.372 s, bester von 3)
+   Faktor    : 2.69x langsamer als html5ever (Abnahmeziel <= 2.00x)
+```
+
+Ein zweiter vollständiger Lauf derselben Zeile ergab `2.87x`
+(3,56 gegen 10,19 MB/s). Die Bilanz 6807/6810 war in beiden Läufen und in
+allen drei Baustufen identisch, der Durchsatz schwankt um ~30 %.
+
+Die Messlatte html5ever muss dafür einmal gebaut werden (eigenes Cargo-Projekt,
+**keine** Abhängigkeit des Compilers):
+
+```sh
+cargo build --release --manifest-path bench/tokenizer/Cargo.toml
+```
+
+Ohne sie läuft `run.sh` weiter und weist die fehlende Messlatte aus.
+
+Einzelne Nachweise:
+
+| Was | Befehl | Gemessenes Ergebnis |
+|---|---|---|
+| **Tokenizer ist Firn** | `wc -l lib/html/*.fi tools/tokenizer/harness.py` | 7.464 Zeilen `.fi` gegen 227 Zeilen Harness; die Zustandsmaschine steht in `lib/html/tokenizer.fi` |
+| **Sprungtabelle über 73 Zustände** | `firnc --emit=asm -o /tmp/tok.s lib/html/tokenize_main.fi && grep -c "jmp qword ptr" /tmp/tok.s` | `1` — indirekter Sprung über `.Ltbl_tokenizer__tokenize_0` |
+| **Zeichenreferenzen einzeln** | `python3 tools/tokenizer/pruefe_entities.py` | `bestanden: 4657 / 4657` |
+| **Fehlerunion: `catch` liefert Ersatz** | `firnc -o /tmp/e tests/403_catch_ersatz.fi && /tmp/e; echo $?` | `0` |
+| **Fehlerunion: `try` reicht durch** | `firnc -o /tmp/e tests/401_try_kette.fi && /tmp/e; echo $?` | der in Zeile 1 als `// expect_exit:` eingetragene Wert |
+| **Verworfenes `!T` ist ein Fehler** | `firnc -o /tmp/e tests/neg/err_verworfen.fi` | `error: das ergebnis darf nicht verworfen werden: der typ 'E!i32' ist mit #[must_consume] gekennzeichnet` mit Zeile:Spalte |
+| **`try` außerhalb einer Fehlerfunktion** | `firnc -o /tmp/e tests/neg/err_try_ausserhalb.fi` | `error: 'try' ist nur in einer funktion mit fehlerunions-rueckgabetyp erlaubt, diese liefert i32` mit `8:13` |
+
 ## 5. Was NICHT läuft, weil es nicht gebaut wurde
 
 Ehrlich und vollständig (ausführlich in `ABNAHME.md`):
@@ -90,10 +139,14 @@ Ehrlich und vollständig (ausführlich in `ABNAHME.md`):
   meldet `'secret[T]' ist in Stufe 0 nicht umgesetzt` mit Zeile/Spalte.
 * **GC, `Rc`/`Gc`, DOM-Prototyp, RSS-Dauerlauf** — nicht umgesetzt. Prüfbar:
   `tests/neg/int_gc_nicht_umgesetzt.fi`.
-* **HTML5-Tokenizer** — nicht geschrieben. Bestandene html5lib-Fälle:
-  **0 von 6.810**. Es gibt keinen Harness; nichts wird stillschweigend
-  übersprungen. Die Testdaten liegen in `testdata/html5lib-tokenizer/`
-  (Zählbefehl in `testdata/README.md`).
+* **HTML5-Tokenizer: gebaut, aber nicht vollständig.** Bestandene
+  html5lib-Fälle: **6.807 von 6.810 (99,96 %)** — die drei
+  `xmlViolationTests` mit XML-Anpassung schlagen fehl und werden als
+  Fehlschlag gezählt. Die `errors`-Einträge der Suite (Parse-Fehlercodes)
+  werden **nicht** verglichen. Geschwindigkeitsziel ≤ 2× **verfehlt**: 2,69×
+  html5ever (zweiter Lauf 2,87×). Siehe Abschnitt 4a.
+* **`defer` / `errdefer`, abgeleitete Fehlermenge `!T`, `catch |e| { Block }`**
+  — nicht umgesetzt, siehe `SPEC.md` §14.1.fehlerunionen F1–F10.
 * **Selbst-Hosting, Paketverwaltung, `comptime`/UCD-Tabelle** — offen,
   siehe `docs/SELBSTHOSTING.md` und `ABNAHME.md` Punkte 1, 5, 6.
 
@@ -102,5 +155,5 @@ Ehrlich und vollständig (ausführlich in `ABNAHME.md`):
 Alle Arbeitsverzeichnisse sind wegwerfbar und stehen in `.gitignore`:
 
 ```sh
-rm -rf .test-work .opt-work .strwork .dtoa-work .testrunner-work bench/.work
+rm -rf .test-work .opt-work .strwork .dtoa-work .testrunner-work .tokenizer-work bench/.work
 ```
