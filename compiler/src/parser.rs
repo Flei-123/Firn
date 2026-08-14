@@ -12,8 +12,8 @@
 //! Semikolon ist optional: ein Zeilenwechsel beendet eine Anweisung.
 
 use crate::ast::{
-    Block, ConstDecl, Expr, ExprKind, BinOp, FnDecl, ImportDecl, Param, Program, Stmt, StructDecl,
-    TypeExpr, UnOp,
+    Attr, Block, ConstDecl, Expr, ExprKind, BinOp, FnDecl, ImportDecl, Param, Program, Stmt,
+    StructDecl, TypeExpr, UnOp,
 };
 use std::collections::HashSet;
 use crate::diag::{Diags, Span};
@@ -43,6 +43,9 @@ pub(crate) struct Parser<'a> {
     pub(crate) modules: HashSet<String>,
     /// Verschachtelungstiefe der Schleifen — `break`/`continue` brauchen sie.
     pub(crate) loop_depth: u32,
+    /// Attribute, die unmittelbar vor der naechsten Deklaration standen
+    /// (`attrs.rs`). Werden von `fn_decl`/`struct_decl` uebernommen.
+    pub(crate) pending_attrs: Vec<crate::ast::Attr>,
 }
 
 fn starts_stmt(k: &TokKind) -> bool {
@@ -1113,7 +1116,8 @@ impl<'a> Parser<'a> {
         let body = self.block("am anfang des funktionsrumpfes");
         self.recovering = false;
         if !is_extern {
-            prog.funcs.push(FnDecl { name, params, ret, body, span: start });
+            let attrs = std::mem::take(&mut self.pending_attrs);
+            prog.funcs.push(FnDecl { name, params, ret, body, span: start, attrs });
         }
     }
 
@@ -1161,7 +1165,8 @@ impl<'a> Parser<'a> {
             return;
         }
         self.recovering = false;
-        prog.structs.push(StructDecl { name, fields, span: start });
+        let attrs = std::mem::take(&mut self.pending_attrs);
+        prog.structs.push(StructDecl { name, fields, span: start, attrs });
     }
 
     fn const_decl(&mut self, prog: &mut Program) {
@@ -1283,6 +1288,74 @@ impl<'a> Parser<'a> {
         self.recovering = false;
     }
 
+    /// `#[name]` oder `#[name(arg, ...)]`, beliebig oft hintereinander.
+    ///
+    /// Der Parser prueft hier NUR die Form. Ob es den Namen gibt, wohin er
+    /// gehoert und ob er in Stufe 0 etwas tut, entscheidet `sema.rs` anhand
+    /// des Registers in `attrs.rs` — mit Zeile, Spalte und Vorschlag.
+    fn attributes(&mut self) -> Vec<Attr> {
+        let mut out = Vec::new();
+        while self.at(&TokKind::Hash) {
+            let start = self.bump(); // '#'
+            if !self.expect(TokKind::LBracket, "nach '#'") {
+                self.recovering = false;
+                self.sync_item();
+                return out;
+            }
+            let name = match self.ident("als attributname nach '#['") {
+                Some((n, _)) => n,
+                None => {
+                    self.recovering = false;
+                    self.sync_item();
+                    return out;
+                }
+            };
+            let mut args = Vec::new();
+            if self.eat(&TokKind::LParen) {
+                loop {
+                    if self.at(&TokKind::RParen) || self.at_eof() {
+                        break;
+                    }
+                    match self.kind() {
+                        TokKind::Ident(t) => {
+                            args.push(t.clone());
+                            self.bump();
+                        }
+                        TokKind::Int(v) => {
+                            args.push(v.to_string());
+                            self.bump();
+                        }
+                        other => {
+                            let msg = format!(
+                                "erwartet einen namen oder eine zahl als attributargument, gefunden '{}'",
+                                other.text()
+                            );
+                            self.error_here(msg);
+                            self.recovering = false;
+                            self.sync_item();
+                            return out;
+                        }
+                    }
+                    if !self.eat(&TokKind::Comma) {
+                        break;
+                    }
+                }
+                if !self.expect(TokKind::RParen, "nach den attributargumenten") {
+                    self.recovering = false;
+                    self.sync_item();
+                    return out;
+                }
+            }
+            if !self.expect(TokKind::RBracket, "nach dem attribut") {
+                self.recovering = false;
+                self.sync_item();
+                return out;
+            }
+            out.push(Attr { name, args, span: start });
+        }
+        out
+    }
+
     fn program(&mut self) -> Program {
         let mut prog = Program::default();
         loop {
@@ -1294,6 +1367,22 @@ impl<'a> Parser<'a> {
                 break;
             }
             let before = self.pos;
+            // Attribute gehoeren zur naechsten Deklaration (attrs.rs).
+            if self.at(&TokKind::Hash) {
+                self.pending_attrs = self.attributes();
+                while self.eat(&TokKind::Semi) {}
+                if self.at_eof() {
+                    if !self.pending_attrs.is_empty() {
+                        let sp = self.pending_attrs[0].span;
+                        self.dg.error(sp, "attribut ohne deklaration dahinter".to_string());
+                    }
+                    break;
+                }
+                if self.pos == before {
+                    self.bump();
+                }
+                continue;
+            }
             // HOOK types: enum-Deklaration und generische Vorlagen (sema_match.rs)
             if crate::sema_match::hook_item(self) {
                 if self.pos == before {
@@ -1358,6 +1447,7 @@ pub fn parse_module(toks: &[Token], dg: &mut Diags, file: u32, base_id: u32) -> 
         file,
         modules: HashSet::new(),
         loop_depth: 0,
+        pending_attrs: Vec::new(),
     };
     p.program()
 }

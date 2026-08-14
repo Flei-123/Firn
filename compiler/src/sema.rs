@@ -75,6 +75,9 @@ pub(crate) struct Checker<'a> {
     pub(crate) scopes: Vec<HashMap<String, VarInfo>>,
     pub(crate) ret: Type,
     pub(crate) depth: u32,
+    /// Funktionen mit `#[must_consume]` — ihr Ergebnis darf nicht als
+    /// Anweisung verworfen werden (attrs.rs).
+    pub(crate) must_consume_fns: HashSet<String>,
 }
 
 pub fn check(prog: &Program, dg: &mut Diags) -> Option<TypeInfo> {
@@ -87,6 +90,7 @@ pub fn check(prog: &Program, dg: &mut Diags) -> Option<TypeInfo> {
         scopes: Vec::new(),
         ret: Type::Void,
         depth: 0,
+        must_consume_fns: HashSet::new(),
     };
     ck.run(prog);
     if ck.dg.has_errors() {
@@ -118,11 +122,134 @@ impl<'a> Checker<'a> {
         // HOOK types: Aufzaehlungen auslegen (sema_match.rs)
         crate::sema_match::layout_enums(self, prog);
         self.collect_fns(prog);
+        // Attribute pruefen und anwenden (attrs.rs)
+        self.check_attrs(prog);
         self.check_consts(prog);
         for f in &prog.funcs {
             self.check_fn(f);
         }
         self.check_main(prog);
+    }
+
+    /// Wird hier ein Wert weggeworfen, der nicht weggeworfen werden darf?
+    ///
+    /// **Umfang in Stufe 0, ehrlich benannt:** Geprueft wird der Fall
+    /// „Ergebnis eines Aufrufs wird als Anweisung verworfen". Die volle Form
+    /// aus SPEC §3.3 — *der Wert muss an eine verbrauchende Funktion
+    /// uebergeben werden* — braucht den Move-Pruefer und kommt mit ihm
+    /// (ROADMAP Phase 2). Was hier geprueft wird, ist die Teilmenge, die ohne
+    /// Move-Verfolgung entscheidbar ist.
+    fn check_discard(&mut self, e: &Expr, t: &Type) {
+        let name = match &e.kind {
+            ExprKind::Call(n, _, _) => n.clone(),
+            _ => return,
+        };
+        let grund = if self.must_consume_fns.contains(&name) {
+            format!("'{}' ist mit #[must_consume] gekennzeichnet", name)
+        } else if let Type::Struct(i) = t {
+            match self.tcx.structs.get(*i) {
+                Some(d) if d.must_consume => {
+                    format!("der typ '{}' ist mit #[must_consume] gekennzeichnet", d.name)
+                }
+                _ => return,
+            }
+        } else {
+            return;
+        };
+        self.dg.error_note(
+            e.span,
+            format!("das ergebnis darf nicht verworfen werden: {}", grund),
+            "binde es an eine variable oder uebergib es weiter".to_string(),
+        );
+    }
+
+    // ------------------------------------------------------------- Attribute
+
+    /// Prueft alle Attribute gegen das Register in `attrs.rs` und wendet die
+    /// an, die in Stufe 0 wirklich etwas tun.
+    ///
+    /// Drei Fehlerarten, alle mit Zeile und Spalte:
+    ///  * **unbekannt** — mit Vorschlag, falls es ein Tippfehler ist
+    ///  * **falsches Ziel** — z. B. `#[packed]` vor einer Funktion
+    ///  * **bekannt, aber in Stufe 0 nicht umgesetzt** — ausdrueckliche
+    ///    Ablehnung statt stillem Ignorieren. Ein uebergangenes
+    ///    `#[constant_time]` waere der gefaehrlichste Fehler dieser Sprache.
+    fn check_attrs(&mut self, prog: &Program) {
+        for f in &prog.funcs {
+            let attrs = f.attrs.clone();
+            for a in &attrs {
+                if self.check_one_attr(a, true) && a.name == "must_consume" {
+                    self.must_consume_fns.insert(f.name.clone());
+                }
+            }
+        }
+        for sd in &prog.structs {
+            let attrs = sd.attrs.clone();
+            for a in &attrs {
+                if self.check_one_attr(a, false) && a.name == "must_consume" {
+                    if let Some(i) = self.tcx.lookup(&sd.name) {
+                        if let Some(def) = self.tcx.structs.get_mut(i) {
+                            def.must_consume = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// `true` = Attribut ist gueltig UND in Stufe 0 umgesetzt.
+    fn check_one_attr(&mut self, a: &crate::ast::Attr, auf_funktion: bool) -> bool {
+        let info = match crate::attrs::suche(&a.name) {
+            Some(i) => i,
+            None => {
+                let msg = format!("unbekanntes attribut '{}'", a.name);
+                match crate::attrs::vorschlag(&a.name) {
+                    Some(v) => self.dg.error_note(
+                        a.span,
+                        msg,
+                        format!("meintest du '{}'? '--list-attrs' zeigt alle", v),
+                    ),
+                    None => self.dg.error_note(
+                        a.span,
+                        msg,
+                        "'--list-attrs' zeigt alle bekannten attribute".to_string(),
+                    ),
+                }
+                return false;
+            }
+        };
+        if !crate::attrs::passt(info, auf_funktion) {
+            self.dg.error(
+                a.span,
+                format!(
+                    "attribut '{}' gehoert nicht vor {}",
+                    a.name,
+                    if auf_funktion { "eine funktion" } else { "einen struct" }
+                ),
+            );
+            return false;
+        }
+        if a.args.len() != info.args {
+            self.dg.error(
+                a.span,
+                format!(
+                    "attribut '{}' erwartet {} argument(e), gefunden {}",
+                    a.name,
+                    info.args,
+                    a.args.len()
+                ),
+            );
+            return false;
+        }
+        if !info.umgesetzt {
+            self.dg.error_note(
+                a.span,
+                format!("attribut '{}' ist in Stufe 0 nicht umgesetzt", a.name),
+                format!("geplant: {}", info.was),
+            );
+            return false;
+        }
+        true
     }
 
     // ---------------------------------------------------------------- Profil
@@ -416,7 +543,7 @@ impl<'a> Checker<'a> {
             Stmt::Block(b) => self.check_block(b, false),
             Stmt::Expr(e) => {
                 let t = self.expr(e, None);
-                let _ = t;
+                self.check_discard(e, &t);
             }
             Stmt::Let { name, mutable, ty, init, span } => {
                 let declared = ty.as_ref().map(|te| self.resolve_ty(te));
@@ -1728,7 +1855,7 @@ mod tests {
             params: Vec::new(),
             ret: Some(named("i32")),
             body: blk(body),
-            span: sp(),
+            span: sp(), attrs: Vec::new(),
         }
     }
 
@@ -1773,7 +1900,7 @@ mod tests {
                 .iter()
                 .map(|(n, t)| (n.to_string(), named(t), sp()))
                 .collect(),
-            span: sp(),
+            span: sp(), attrs: Vec::new(),
         };
         let prog = Program {
             profile: None,
@@ -1826,6 +1953,7 @@ mod tests {
                 ),
             ],
             span: sp(),
+            attrs: Vec::new(),
         };
         let prog = Program {
             profile: None,
@@ -1856,7 +1984,7 @@ mod tests {
                 ("x".to_string(), named("u8"), sp()),
                 ("y".to_string(), named("u32"), sp()),
             ],
-            span: sp(),
+            span: sp(), attrs: Vec::new(),
         };
         // Aeusserer Struct steht VOR dem inneren -> topologische Reihenfolge noetig.
         let outer = StructDecl {
@@ -1865,7 +1993,7 @@ mod tests {
                 ("a".to_string(), named("u8"), sp()),
                 ("i".to_string(), named("Inner"), sp()),
             ],
-            span: sp(),
+            span: sp(), attrs: Vec::new(),
         };
         let prog = Program {
             profile: None,
@@ -1892,12 +2020,12 @@ mod tests {
         let a = StructDecl {
             name: "A".to_string(),
             fields: vec![("b".to_string(), named("B"), sp())],
-            span: sp(),
+            span: sp(), attrs: Vec::new(),
         };
         let bs = StructDecl {
             name: "B".to_string(),
             fields: vec![("a".to_string(), named("A"), sp())],
-            span: sp(),
+            span: sp(), attrs: Vec::new(),
         };
         let prog = Program {
             profile: None,
@@ -1996,6 +2124,7 @@ mod tests {
             ret: Some(named("i32")),
             body: blk(vec![Stmt::Return { value: Some(fret), span: sp() }]),
             span: sp(),
+            attrs: Vec::new(),
         };
         let prog = Program {
             profile: None,
@@ -2194,6 +2323,7 @@ mod tests {
             ret: None,
             body: blk(Vec::new()),
             span: sp(),
+            attrs: Vec::new(),
         };
         let prog = Program {
             profile: None,
@@ -2233,7 +2363,7 @@ mod tests {
         let sd = StructDecl {
             name: "P".to_string(),
             fields: vec![("x".to_string(), named("i32"), sp())],
-            span: sp(),
+            span: sp(), attrs: Vec::new(),
         };
         let prog = Program {
             profile: None,
@@ -2263,7 +2393,7 @@ mod tests {
                 ("x".to_string(), named("i32"), sp()),
                 ("y".to_string(), named("i32"), sp()),
             ],
-            span: sp(),
+            span: sp(), attrs: Vec::new(),
         };
         let prog = Program {
             profile: None,

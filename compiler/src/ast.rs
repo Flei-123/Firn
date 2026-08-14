@@ -218,6 +218,15 @@ pub struct Param {
     pub span: Span,
 }
 
+/// Ein Attribut `#[name]` bzw. `#[name(arg)]` vor einer Deklaration.
+/// Gueltige Namen stehen in `attrs.rs` — dort und nur dort.
+#[derive(Clone, Debug)]
+pub struct Attr {
+    pub name: String,
+    pub args: Vec<String>,
+    pub span: Span,
+}
+
 #[derive(Clone, Debug)]
 pub struct FnDecl {
     pub name: String,
@@ -225,6 +234,7 @@ pub struct FnDecl {
     pub ret: Option<TypeExpr>,
     pub body: Block,
     pub span: Span,
+    pub attrs: Vec<Attr>,
 }
 
 #[derive(Clone, Debug)]
@@ -232,6 +242,7 @@ pub struct StructDecl {
     pub name: String,
     pub fields: Vec<(String, TypeExpr, Span)>,
     pub span: Span,
+    pub attrs: Vec<Attr>,
 }
 
 #[derive(Clone, Debug)]

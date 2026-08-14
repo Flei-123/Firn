@@ -696,6 +696,7 @@ pub(crate) fn layout_enums(ck: &mut Checker, prog: &crate::ast::Program) {
                 fields,
                 size,
                 align,
+                            must_consume: false,
             };
         }
         REG.with(|r| {
