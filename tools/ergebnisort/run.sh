@@ -21,9 +21,11 @@ trap 'rm -f "$ASM"' EXIT
 MB=1048576
 "$FIRNC" --emit=asm -o "$ASM" "$SRC"
 
+# Linker-Symbol: 'main' behaelt seinen nackten Namen, alles andere traegt das
+# Schema aus modules.rs (_F<schema>.<name>, DESIGNZIELE 4).
 rahmen() {   # $1 = Funktionsname -> Byte-Zahl aus 'sub rsp, N'
-    awk -v f="$1:" '
-        $0 == f            { inf = 1; next }
+    awk -v n="$1" '
+        $0 == n":" || $0 ~ "^_F[0-9]+\\." n ":" { inf = 1; next }
         inf && /sub rsp,/  { gsub(/,/, "", $3); print $3; exit }
     ' "$ASM"
 }
