@@ -957,12 +957,23 @@ for f in baum2.spalte(.flags) { … }
 
 ### Konsequenz für den Compiler HEUTE
 
-* **Der Typprüfer muss Feldzugriff von Speicherort trennen können.** Solange
-  `a.b` fest „Basisadresse plus Versatz" bedeutet, ist SoA nicht nachrüstbar.
-  Nötig ist eine Zwischenschicht: „Feldzugriff auf einen Wert der Art X" mit
-  einer Berechnungsvorschrift, die für AoS ein Versatz und für SoA eine
-  Spaltenadresse ist. **Das ist eine Änderung im Lowering, die man heute für
-  einen Zehntel der späteren Kosten haben kann.**
+* **Feldzugriff muss vom Speicherort getrennt sein.** Solange `a.b` fest
+  „Basisadresse plus Versatz" bedeutet, ist SoA nicht nachrüstbar.
+  **Erledigt am 14.08.2026** (`compiler/src/layout.rs`): Jeder Feld- und
+  Elementzugriff des Lowerings geht durch **vier** Zugänge —
+  `field_addr` (benanntes Feld), `field_addr_at` (bekannter Versatz, für
+  Aufzählungs-Nutzdaten), `elem_addr_const` und `elem_addr`. Umgestellt wurden
+  alle Stellen in `lower.rs` und `lower_match.rs`. Eine zweite Anordnung
+  einzuführen heißt jetzt: **in diesem einen Modul** eine Fallunterscheidung
+  ergänzen.
+* **Und die Regel wird erzwungen, nicht nur aufgeschrieben.**
+  `tools/schichten/run.sh` (Abschnitt 7 von `test.sh`) prüft, dass
+  `Op::PtrAdd` außerhalb von `layout.rs` nur in der einen Hilfsfunktion
+  `ptradd_const` gebaut wird, dass deren direkte Aufrufe ausschließlich als
+  `// ABI-Wortkopie` gekennzeichnete Aggregatübergaben sind (kein Feldzugriff),
+  und dass im Lowering kein Feld-Versatz mehr von Hand in eine Adresse
+  gerechnet wird. **Gegengeprüft:** eine absichtlich eingebaute Verletzung wird
+  erkannt und meldet Datei und Zeile.
 * **Layoutberechnung muss zentral sein**, nicht über Codegenerator und Sema
   verteilt. Heute liegt sie in `types.rs`/`abi.rs` — das ist die richtige Stelle
   und muss so bleiben.
@@ -970,9 +981,11 @@ for f in baum2.spalte(.flags) { … }
 
 ### Priorität und Phase
 
-**Fundament: die Trennung Feldzugriff ↔ Speicherort im Lowering** (Phase 2/3).
+**Fundament: die Trennung Feldzugriff ↔ Speicherort im Lowering** —
+**erledigt am 14.08.2026**, samt Architekturwächter in der Testsuite.
 Umsetzung `SoaVec[T]` und `#[layout(soa)]`: **Phase 3/4**, wenn der Rasterizer
-und der Layout-Baum entstehen und man messen kann.
+und der Layout-Baum entstehen und man messen kann. Dann ist es eine Erweiterung
+von `layout.rs` und eines Sammlungstyps — kein Umbau des Lowerings.
 
 ---
 
@@ -1106,7 +1119,7 @@ Dingen, die später obendrauf kommen.
 | 5 | **Debug-Bau-Geschwindigkeit** | **erledigt 14.08.2026:** Register `PASSES` mit Etiketten, `--list-passes`, `--no-pass=`, `--opt-level=`; gemessen **2,06×** | die verbotenen Durchgänge existieren noch gar nicht; `--release-safe` = `--release-fast`, solange es keine Laufzeitprüfungen gibt | **FUNDAMENT** ✔ | erledigt / 3 |
 | 6 | **In-Place-Initialisierung** | **Ergebnisort als Garantie festschreiben** — für Aggregatrückgaben bereits umgesetzt (`lower.rs:604`, nachgeprüft), fehlt für Literale und `init` | `init`-Ausdruck mit Teilaufräumung, `#[no_move]` | **FUNDAMENT** (teuer, aber jetzt am billigsten) | 2 → 3 |
 | 7 | **Comptime + Reflexion** | **Prüfphasen wiedereintrittsfähig** (neu erzeugte Elemente nachträglich prüfbar). FIR bleibt interpretierbar | `comptime`-Interpreter, `reflect.*`, `emit`, Bauskripte | **FUNDAMENT** (Architektur) | 2 → 3 |
-| 8 | **Datenlayout / SoA** | **Feldzugriff vom Speicherort trennen** im Lowering. Layoutberechnung an einer Stelle | `SoaVec[T]`, `#[layout(soa)]`, `#[bitfeld]`, `#[klein(N)]` | **FUNDAMENT** (Lowering) | 2/3 → 3/4 |
+| 8 | **Datenlayout / SoA** | **erledigt 14.08.2026:** `layout.rs` mit vier Zugängen, Architekturwächter `tools/schichten/run.sh` in `test.sh` | `SoaVec[T]`, `#[layout(soa)]`, `#[bitfeld]`, `#[klein(N)]` | **FUNDAMENT** ✔ | erledigt / 3-4 |
 | 9 | **Hot Reload** | **nichts** — nur nicht ausschließen | Stufe B (Daten neu laden), evtl. `#[hot]` | nachrüstbar | 4 / kein Termin |
 | — | *(bereits entschieden)* Opt-in-GC, WTF-16, Constant-Time, Abwicklung | siehe `SPEC.md` §3, §8, §9, §5.3 | — | **FUNDAMENT** | 2–4 |
 
@@ -1124,11 +1137,14 @@ nichts, weil sie Architekturentscheidungen sind und keine Merkmale:
    erhaltend.** (Punkt 5 — heute billig, später ein Umbau jedes Durchgangs)
 5. **Prüfphasen wiedereintrittsfähig, FIR interpretierbar.**
    (Punkt 7 — Architektur, keine Funktion)
-6. **Feldzugriff vom Speicherort getrennt** (Punkt 8) **und Ergebnisort als
-   Garantie** (Punkt 6). Der Ergebnisort ist für Aggregatrückgaben schon da
-   (nachgeprüft); **die Feldzugriffs-Trennung ist damit die einzige wirklich
-   teure Fundamentarbeit** — und genau deshalb muss sie jetzt passieren, solange
-   `lower.rs` 1.505 Zeilen hat und nicht 15.000.
+6. ~~**Feldzugriff vom Speicherort getrennt** (Punkt 8) **und Ergebnisort als
+   Garantie** (Punkt 6).~~ **Beides erledigt am 14.08.2026.** Der Ergebnisort
+   war für Aggregatrückgaben bereits vorhanden und ist jetzt als Garantie
+   festgeschrieben und mit `tools/ergebnisort/run.sh` abgesichert; die
+   Feldzugriffs-Trennung sitzt in `compiler/src/layout.rs` und wird von
+   `tools/schichten/run.sh` erzwungen. Es hat sich gelohnt, das zu tun, solange
+   `lower.rs` 1.500 Zeilen hat und nicht 15.000 — der Umbau waren rund
+   30 Zeilen.
 
 **Vier Dinge können warten** — sie sind additiv:
 
@@ -1167,12 +1183,12 @@ Konkret und überprüfbar, in dieser Reihenfolge:
    nachgeprüft 14.08.2026). Zu tun: als **Garantie** in `SPEC.md` aufnehmen, auf
    Struct-/Arrayliterale und `init` ausdehnen, und den 8-MB-Test bauen.
    *Deutlich billiger als befürchtet.*
-2. **Feldzugriff vom Speicherort trennen** (Punkt 8) — Zwischenschicht im
-   Lowering statt „Basis plus Versatz".
+2. ~~**Feldzugriff vom Speicherort trennen** (Punkt 8)~~ — **erledigt**,
+   `compiler/src/layout.rs` + Wächter.
 3. **`!T` + `#[must_consume]`** (Punkt 2) — steht ohnehin auf dem Plan für
    Phase 2.
-4. **Durchgangsregister mit Etiketten** (Punkt 5) — jeder Optimierungsdurchgang
-   bekommt Name, Schalter und die Angabe, ob er debugerhaltend ist.
+4. ~~**Durchgangsregister mit Etiketten** (Punkt 5)~~ — **erledigt**,
+   `--list-passes` / `--no-pass=` / `--opt-level=`, gemessen 2,06×.
 5. **Wiedereintrittsfähige Prüfphasen** (Punkt 7) — beim Bau des Modulsystems
    berücksichtigen.
 6. **Symbol-Namensschema mit Versionsplatz** (Punkt 4) — mit dem Modulsystem.
