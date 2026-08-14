@@ -1,0 +1,164 @@
+// lib/dom/soak_gc.fi — Dauerlauf des DOM-Prototyps mit dem Opt-in-Tracing-GC.
+//
+// ABNAHMEPUNKT 2 (FIRN-ANFORDERUNGEN.md §13): "DOM-Prototyp mit Eltern-/
+// Kind-Rueckverweisen und Listener-Zyklen, der im Dauerlauf nicht leckt."
+// Dieses Programm baut in einer Schleife immer neue vollstaendige Zyklensaetze
+// (lib/dom/dom.fi) und laesst sie unerreichbar werden. Ein Zaehlverweis wuerde
+// dabei JEDEN Satz behalten; der Sammler muss den Verbrauch flach halten.
+//
+// Die Gegenprobe ist lib/dom/soak_leck.fi: derselbe Aufbau, aber mit
+// Zaehlverweisen statt `Gc[T]`. Sie MUSS lecken — sonst misst die Messung
+// nichts. Ausgewertet wird beides von tools/dom_soak/run.sh.
+//
+// Ausgabeprotokoll: TSV auf der Standardausgabe, eine Datenzeile je
+// STICHPROBE Zyklen. Die drei Konstanten stehen woertlich so da, damit
+// run.sh sie mit sed in eine Arbeitskopie umstellen kann.
+
+import dom
+import mess
+
+const BUDGET_MS: i64 = 600000  // SOAK_BUDGET_MS
+const ZYKLEN_MAX: i64 = 100000000  // SOAK_ZYKLEN_MAX
+const STICHPROBE: i64 = 1000  // SOAK_STICHPROBE
+
+// Kopfzeile 1 des Protokolls
+fn t_kopf1() {
+    var t: [u8; 31] = [
+        35, 32, 102, 105, 114, 110, 45, 100, 111, 109, 45, 115, 111, 97, 107,
+        32, 118, 49, 32, 118, 97, 114, 105, 97, 110, 116, 101, 61, 103, 99,
+        10,
+    ]
+    let p: u64 = (&t) as u64
+    mess.mess_schreib(p, 31)
+}
+// Kopfzeile 2: die Spaltennamen
+fn t_kopf2() {
+    var t: [u8; 76] = [
+        35, 32, 115, 112, 97, 108, 116, 101, 110, 58, 32, 116, 95, 109, 115,
+        9, 122, 121, 107, 108, 101, 110, 9, 114, 115, 115, 95, 107, 105, 98,
+        9, 108, 101, 98, 101, 110, 100, 101, 9, 115, 97, 109, 109, 101, 108,
+        108, 97, 101, 117, 102, 101, 9, 104, 101, 97, 112, 95, 98, 121, 116,
+        101, 115, 9, 112, 97, 117, 115, 101, 95, 109, 97, 120, 95, 110, 115,
+        10,
+    ]
+    let p: u64 = (&t) as u64
+    mess.mess_schreib(p, 76)
+}
+// Schlusszeile, Teil 1
+fn t_fertig() {
+    var t: [u8; 16] = [
+        35, 32, 102, 101, 114, 116, 105, 103, 32, 122, 121, 107, 108, 101, 110,
+        61,
+    ]
+    let p: u64 = (&t) as u64
+    mess.mess_schreib(p, 16)
+}
+// Schlusszeile, Teil 2
+fn t_tms() {
+    var t: [u8; 6] = [
+        32, 116, 95, 109, 115, 61,
+    ]
+    let p: u64 = (&t) as u64
+    mess.mess_schreib(p, 6)
+}
+// Schlusszeile, Teil 3
+fn t_laeufe() {
+    var t: [u8; 14] = [
+        32, 115, 97, 109, 109, 101, 108, 108, 97, 101, 117, 102, 101, 61,
+    ]
+    let p: u64 = (&t) as u64
+    mess.mess_schreib(p, 14)
+}
+// Schlusszeile, Teil 4
+fn t_rss() {
+    var t: [u8; 9] = [
+        32, 114, 115, 115, 95, 107, 105, 98, 61,
+    ]
+    let p: u64 = (&t) as u64
+    mess.mess_schreib(p, 9)
+}
+// Fehlerzeile
+fn t_fehler() {
+    var t: [u8; 14] = [
+        35, 32, 102, 101, 104, 108, 101, 114, 32, 99, 111, 100, 101, 61,
+    ]
+    let p: u64 = (&t) as u64
+    mess.mess_schreib(p, 14)
+}
+
+// Eine Datenzeile des Protokolls.
+fn zeile(t_ms: u64, zyklen: u64, rss: u64, lebende: u64, laeufe: u64, heap: u64, pause: u64) {
+    mess.mess_u64(t_ms)
+    mess.mess_tab()
+    mess.mess_u64(zyklen)
+    mess.mess_tab()
+    mess.mess_u64(rss)
+    mess.mess_tab()
+    mess.mess_u64(lebende)
+    mess.mess_tab()
+    mess.mess_u64(laeufe)
+    mess.mess_tab()
+    mess.mess_u64(heap)
+    mess.mess_tab()
+    mess.mess_u64(pause)
+    mess.mess_nl()
+}
+
+fn fehler(code: u64) -> i32 {
+    t_fehler()
+    mess.mess_u64(code)
+    mess.mess_nl()
+    return code as i32
+}
+
+fn main() -> i32 {
+    if !gc_init() {
+        return fehler(2)
+    }
+    t_kopf1()
+    t_kopf2()
+    let rss0: u64 = mess.mess_rss_kib()
+    if rss0 == 0 {
+        return fehler(3)
+    }
+    let t0: u64 = mess.mess_jetzt_ms()
+    zeile(0, 0, rss0, gc_live_objects(), gc_collections(), gc_heap_bytes(), gc_pause_ns_max())
+
+    var zyklen: u64 = 0
+    var seit: i64 = 0
+    var t: u64 = 0
+    var laufen: bool = true
+    while laufen {
+        let n: u64 = dom.dom_zyklus_bauen() catch 0
+        if n != dom.DOM_OBJEKTE_JE_SATZ {
+            return fehler(4)
+        }
+        zyklen = zyklen + 1
+        seit = seit + 1
+        if seit >= STICHPROBE {
+            seit = 0
+            // Alte Zeiger in aufgegebenen Rahmen ueberschreiben: der
+            // Stapelscan ist konservativ (SPEC §3.5.3).
+            dom.dom_zyklus_verwerfen()
+            t = mess.mess_jetzt_ms() - t0
+            let rss: u64 = mess.mess_rss_kib()
+            if rss == 0 {
+                return fehler(5)
+            }
+            zeile(t, zyklen, rss, gc_live_objects(), gc_collections(), gc_heap_bytes(), gc_pause_ns_max())
+            if t >= BUDGET_MS as u64 || zyklen >= ZYKLEN_MAX as u64 {
+                laufen = false
+            }
+        }
+    }
+    t_fertig()
+    mess.mess_u64(zyklen)
+    t_tms()
+    mess.mess_u64(t)
+    t_laeufe()
+    mess.mess_u64(gc_collections())
+    t_rss()
+    mess.mess_u64(mess.mess_rss_kib())
+    mess.mess_nl()
+    return 0
+}

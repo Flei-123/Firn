@@ -270,8 +270,8 @@ Punkt ist überprüfbar: der Compiler meldet dafür einen Fehler mit Zeile/Spalt
 er stürzt nicht ab und tut nicht so, als könne er es.
 
 Runde 3 hat **Fehlerunionen `E!T`** (SPEC §5.1) und den **HTML5-Tokenizer in
-Firn** gebaut; **Constant-Time (§9) und GC/DOM (§3.4/§3.5) sind weiterhin nicht
-gebaut**:
+Firn** gebaut, Runde 4 den **Opt-in-Tracing-GC samt DOM-Prototyp und Dauerlauf**
+(SPEC §3.5) sowie die drei **Constant-Time-Primitive**. Was weiterhin fehlt:
 
 * **`secret[T]`, `u128`, `mul_wide`, `declassify`, `#[constant_time]`**
   (SPEC §9) — **nicht umgesetzt.** `fn f(a: secret[u8])` meldet
@@ -288,11 +288,21 @@ gebaut**:
   Typprüfung auf Geheimnisdaten; die Sperren in FIR und Optimierer
   (`fir::Func::secret`, `constant_time`, mem2reg/DCE/CSE/Inlining) sind
   vorhanden, bekommen aber erst mit `secret[T]` Futter (SPEC §14.1 Punkt 19).
-* **`Rc[T]`, `Weak[T]`, `Gc[T]`, `gc class`, Mark-Sweep, DOM-Prototyp**
-  (SPEC §3.4/§3.5) — **nicht umgesetzt.** Kein GC, kein Dauerlauf, keine
-  RSS-Messung. `let x: Gc[i32]` meldet `'Gc[T]' ist in Stufe 0 nicht umgesetzt`
-  (`tests/neg/int_gc_nicht_umgesetzt.fi`). ABNAHME.md Punkt 2 bleibt deshalb
-  offen.
+* **`Gc[T]`, `gc class`, Mark-Sweep, DOM-Prototyp (SPEC §3.5) — seit Runde 4
+  GEBAUT und gemessen.** Was jetzt geht: `gc class` mit Einfachvererbung und
+  Präfixlayout, `Gc[T]`/`GcWeak[T]`, geprüftes `x.as?[C]`, fehlbare Allokation
+  `AllocError!Gc[C]`, Einfügebarriere, `#[no_gc]` transitiv, Messwerte
+  (`gc_pause_ns_max` & Co.). Dauerlauf: **100.000.000 Zyklensätze =
+  700.000.000 DOM-Objekte bei konstant 1.364 KiB RSS**; die
+  Zählverweis-Gegenprobe mit identischem Objektgraphen braucht nach 2.000.000
+  Zyklen **750.080 KiB** (Faktor 550). Abschnitt „Speichermodell" weiter unten,
+  Bericht `docs/berichte/dom.md`.
+  **Offen bleibt:** der 24-Stunden-Lauf aus ABNAHME.md Punkt 2, Fragmentierung
+  bei wechselnden Objektgrößen, **inkrementelles Sammeln** (längste Pause
+  3,54 ms — für 16-ms-Bilder zu viel), Finalisierer, `GcVec`/`GcMap`,
+  `virtual`. `Rc[T]`/`Weak[T]` gibt es als **Firn-Modul** (`tests/modules/rc.fi`),
+  nicht als Sprachtyp; `Arc[T]` fehlt ganz. `Gc[modul.Klasse]` lässt sich nicht
+  schreiben.
 * **HTML5-Tokenizer:** gebaut und gemessen — **6.810 von 6.810 (100,00 %)**
   Tokenstrom-Vergleich und **6.809 von 6.810 (99,99 %)** mit Vergleich der
   Parse-Fehlercodes (`--mit-fehlern`); die XML-Anpassung der
@@ -494,6 +504,58 @@ Ehrlich benannt:
   Programm zweimal und verlangt verschiedene Adressen).
 * Alle drei Baustufen (`opt`, `--no-opt`, `dev-fast`) liefern dieselbe Bilanz;
   `run.sh` bricht ab, wenn nicht.
+
+## Speichermodell: Opt-in-Tracing-GC und der DOM-Dauerlauf (Runde 4)
+
+Die wichtigste offene Designfrage aus `DESIGNZIELE.md` ist entschieden **und
+belegt**: ein **Opt-in**-Tracing-GC. Opt-in heißt, dass Tokenizer, Rasterizer
+und Krypto ihn nicht bezahlen — `#[no_gc]` macht das zu einer geprüften Zusage
+statt zu einer Absichtserklärung.
+
+```firn
+gc class Node {
+    eltern: Gc[Node],        // stark, in BEIDE Richtungen — echter Zyklus
+    erstes_kind: Gc[Node],
+    listener: Gc[Listener],
+}
+gc class Element extends Node { attr_zahl: u32 }
+
+fn baue() -> AllocError!Gc[Element] {
+    let e = try gc Element{ … }     // Allokation darf fehlschlagen
+    return e
+}
+```
+
+Selbst nachprüfen:
+
+```
+$ bash tools/dom_soak/run.sh                    # Standard: 600 s je Fassung
+$ SOAK_SEK=12 SOAK_ZYKLEN=400000 bash tools/dom_soak/run.sh    # kurz
+```
+
+Der Lauf baut fortlaufend **echte DOM-Zyklen** (Eltern↔Kind, Knoten↔Listener,
+Knoten↔JS-Wrapper, live Sammlung, schwacher Observer) und misst den **echten
+Speicherverbrauch des Prozesses** aus `/proc/self/statm` — nicht die
+Selbstauskunft der Laufzeit.
+
+| | GC-Fassung | Zählverweis-Gegenprobe |
+|---|---|---|
+| Zyklensätze | 100.000.000 | 2.000.000 |
+| DOM-Objekte | 700.000.000 | 14.000.000 |
+| **RSS am Ende** | **1.364 KiB** | **750.080 KiB** |
+| RSS-Verlauf | konstant über 1.001 Stichproben | linear steigend |
+| lebende Objekte | 8–12 | 12.000.000 |
+
+Die Gegenprobe (`lib/dom/soak_leck.fi`) läuft **bei jedem Testlauf mit** und
+**muss** lecken; bleibt sie grün, bricht `run.sh` ab. Eine Messung, die ein Leck
+gar nicht anzeigen kann, ist keine Messung. Ihr Zähler ist korrekt — sie gibt
+die eine Struktur ohne Rückverweis jedes Mal frei und scheitert ausschließlich
+an den Zyklen.
+
+**Ehrlich dazu:** der 24-Stunden-Lauf aus der Abnahme steht aus, Fragmentierung
+bei wechselnden Objektgrößen ist ungeprüft, und der konservative Stapelscan hat
+einen messbaren Preis — eine alte Zeigerkopie in einem **lebenden** Rahmen hält
+ihr Objekt am Leben. `docs/berichte/dom.md` beschreibt beides mit Messwerten.
 
 ## Verzeichnisse
 

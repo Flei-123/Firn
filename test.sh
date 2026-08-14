@@ -22,6 +22,10 @@
 #   9. HTML5-Tokenizer (lib/html/, in Firn) gegen die offizielle
 #      html5lib-Testsuite: exakte Quote aus 6.810 Faellen, Schranke in
 #      tools/tokenizer/mindestquote.txt (tools/tokenizer/run.sh).
+#  10. DOM-Dauerlauf (tools/dom_soak/run.sh): der DOM-Prototyp in Firn baut
+#      fortlaufend echte Zyklen (Eltern/Kind, Listener, JS-Wrapper) und darf
+#      dabei nicht wachsen; die absichtlich leckende Gegenprobe mit
+#      Zaehlverweisen MUSS anschlagen, sonst gilt die Messung als kaputt.
 #
 # Kein '|| true', kein Verschlucken von Exit-Codes: set -euo pipefail.
 set -euo pipefail
@@ -212,6 +216,20 @@ if [ "$TKRC" -eq 0 ]; then
 else
     bad "tools/tokenizer/run.sh schlug fehl (siehe .test-work/tokenizer.log)"
     tail -20 "$WORK/tokenizer.log" | sed 's/^/   /'
+fi
+
+echo "== 10. DOM-Dauerlauf: Zyklen ohne Leck (tools/dom_soak/run.sh) =="
+# Kurzfassung: 12 s je Variante. Der lange Lauf steht in ABNAHME.md Punkt 2;
+# hier geht es darum, dass die Zusage bei JEDER Aenderung nachgeprueft wird.
+SOAK_SEK=${SOAK_SEK:-12} SOAK_ZYKLEN=${SOAK_ZYKLEN:-400000} \
+  SOAK_STICHPROBE=${SOAK_STICHPROBE:-10000} SOAK_MIN_ZYKLEN=${SOAK_MIN_ZYKLEN:-100000} \
+  bash tools/dom_soak/run.sh > "$WORK/dom_soak.log" 2>&1 && DSRC=0 || DSRC=$?
+if [ "$DSRC" -eq 0 ]; then
+    ok
+    grep -E 'BESTANDEN|Gegenprobe schlaegt an' "$WORK/dom_soak.log" | sed 's/^/   /'
+else
+    bad "tools/dom_soak/run.sh schlug fehl (siehe .test-work/dom_soak.log)"
+    tail -20 "$WORK/dom_soak.log" | sed 's/^/   /'
 fi
 
 TOTAL=$((PASS + FAIL))
