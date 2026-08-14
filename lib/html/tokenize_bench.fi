@@ -1,0 +1,137 @@
+// lib/html/tokenize_bench.fi — Messfassung des Tokenizer-Treibers.
+//
+// GRUND: `tokenize_main.fi` schreibt je Auftrag eine Zeile html5lib-JSON.
+// Der Vergleichspartner `html5ever` in `bench/tokenizer/` zaehlt nur Token.
+// Gemessen mit callgrind (Korpus `realweb`, 14.08.2026) gingen dadurch
+// **14,7 % aller Instruktionen** in eine Ausgabe, die die Gegenseite gar nicht
+// erzeugt (`out_json_cp` 7,93 %, `out_json_cpbuf` 4,22 %, `out_wort` 2,55 %).
+// Ein Faktor, der solche Arbeit einrechnet, misst nicht den Tokenizer.
+//
+// Dieses Programm liest DIESELBEN Auftraege, laesst DENSELBEN Tokenizer laufen
+// und gibt am Ende nur die Zahl der Token aus. Damit ist der Vergleich fair.
+//
+// Was hier NICHT weggelassen wird, obwohl es verlockend waere:
+//   * die Dekodierung nach UTF-32 (`dekodiere`, 28 % der Instruktionen) — sie
+//     gehoert zum Aufbau des Tokenizers und wird deshalb mitgemessen. Dass
+//     html5ever sie nicht braucht, ist ein echter Nachteil von Firns Fassung
+//     und keine Unfairness des Messaufbaus.
+//   * die Positions- und Fehlerbuchhaltung (`eingabe_pruefen`, 16,7 %) — auch
+//     html5ever meldet Parse-Fehler.
+//
+// Uebersetzen:  firnc -o .tokenizer-work/tokenize_bench lib/html/tokenize_bench.fi
+import mem
+import tokens
+import tokenizer
+
+#[no_gc]
+fn lies_u32(b: *mut mem.Buf, off: usize) -> u32 {
+    var v: u32 = 0
+    var i: usize = 0
+    while i < 4 {
+        v = v | ((mem.buf_at(b, off + i) as u32) << (8 * i as u32))
+        i = i + 1
+    }
+    return v
+}
+
+// WTF-8 -> Codepunkte, wortgleich mit tokenize_main.fi.
+#[no_gc]
+fn dekodiere(b: *mut mem.Buf, off: usize, len: usize, out: *mut mem.CpBuf) {
+    mem.cp_clear(out)
+    var i: usize = 0
+    while i < len {
+        let c0: u32 = mem.buf_at(b, off + i) as u32
+        var cp: u32 = c0
+        var breite: usize = 1
+        if c0 >= 0xF0 as u32 {
+            breite = 4
+            cp = ((c0 & 0x07 as u32) << 18) |
+                ((mem.buf_at(b, off + i + 1) as u32 & 0x3F as u32) << 12) |
+                ((mem.buf_at(b, off + i + 2) as u32 & 0x3F as u32) << 6) |
+                (mem.buf_at(b, off + i + 3) as u32 & 0x3F as u32)
+        } else if c0 >= 0xE0 as u32 {
+            breite = 3
+            cp = ((c0 & 0x0F as u32) << 12) |
+                ((mem.buf_at(b, off + i + 1) as u32 & 0x3F as u32) << 6) |
+                (mem.buf_at(b, off + i + 2) as u32 & 0x3F as u32)
+        } else if c0 >= 0xC0 as u32 {
+            breite = 2
+            cp = ((c0 & 0x1F as u32) << 6) |
+                (mem.buf_at(b, off + i + 1) as u32 & 0x3F as u32)
+        }
+        i = i + breite
+        if cp == 13 as u32 {
+            cp = 10 as u32
+            if i < len && mem.buf_at(b, off + i) as u32 == 10 as u32 {
+                i = i + 1
+            }
+        }
+        mem.cp_push(out, cp)
+    }
+}
+
+// Dezimalzahl + Zeilenumbruch auf die Standardausgabe.
+#[no_gc]
+fn schreib_zahl(v: u64) {
+    var d: [u8; 24] = [0 as u8; 24]
+    var n: usize = 0
+    var x: u64 = v
+    if x == 0 {
+        d[0] = 48 as u8
+        n = 1
+    }
+    while x > 0 {
+        d[n] = (x % 10) as u8 + 48 as u8
+        x = x / 10
+        n = n + 1
+    }
+    var aus: [u8; 26] = [0 as u8; 26]
+    var i: usize = 0
+    while i < n {
+        aus[i] = d[n - 1 - i]
+        i = i + 1
+    }
+    aus[n] = 10 as u8
+    let p: u64 = (&aus[0]) as u64
+    syscall(1, 1, p as i64, (n + 1) as i64, 0, 0, 0)
+}
+
+#[no_gc]
+fn main() -> i32 {
+    var ein: mem.Buf = mem.buf_neu()
+    mem.read_all_stdin(&ein)
+
+    var s: tokens.Sink = tokens.sink_neu()
+    tokens.sink_init(&s)
+    tokens.sink_set_zaehlmodus(&s, true)
+
+    var text: mem.CpBuf = mem.cp_neu()
+    var lasttag: mem.CpBuf = mem.cp_neu()
+
+    let gesamt: usize = mem.buf_len(&ein)
+    var off: usize = 0
+    var auftraege: u64 = 0
+    while off + 16 <= gesamt {
+        let zustand: u32 = lies_u32(&ein, off)
+        let flaggen: u32 = lies_u32(&ein, off + 4)
+        let ltlen: usize = lies_u32(&ein, off + 8) as usize
+        dekodiere(&ein, off + 12, ltlen, &lasttag)
+        let inlen: usize = lies_u32(&ein, off + 12 + ltlen) as usize
+        dekodiere(&ein, off + 16 + ltlen, inlen, &text)
+        off = off + 16 + ltlen + inlen
+
+        tokens.sink_set_xml_modus(&s, (flaggen & 1 as u32) != 0 as u32)
+        tokens.sink_set_last_start_tag_cp(&s, &lasttag)
+        tokens.sink_begin(&s)
+        let ok: bool = tokenizer.tokenize(&text, zustand, &s)
+        if ok {
+            tokens.sink_end(&s)
+        } else {
+            tokens.sink_abort(&s)
+        }
+        auftraege = auftraege + 1
+    }
+    schreib_zahl(tokens.sink_tokenzahl(&s))
+    schreib_zahl(auftraege)
+    return 0
+}

@@ -735,6 +735,37 @@ fn rn(name: &str, bits: u32) -> String {
 struct Ra<'a> {
     f: &'a Func,
     a: &'a Alloc,
+    /// Wie oft wird jeder Wert als Operand gelesen? Gebraucht fuer die
+    /// Verschmelzung von `cmp` und bedingtem Sprung: nur wenn das
+    /// Vergleichsergebnis GENAU EINMAL gelesen wird (naemlich vom Terminator),
+    /// darf das `setcc` entfallen.
+    gelesen: Vec<u32>,
+}
+
+/// Zaehlt je Wert, wie oft er als Operand vorkommt (Instruktionen + Terminatoren).
+fn zaehle_lesezugriffe(f: &Func) -> Vec<u32> {
+    let mut n = vec![0u32; f.val_types.len()];
+    let mut buf = Vec::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            buf.clear();
+            i.op.uses(&mut buf);
+            for v in buf.iter() {
+                if let Some(c) = n.get_mut(*v as usize) {
+                    *c += 1;
+                }
+            }
+        }
+        match &b.term {
+            Term::Ret(Some(v)) | Term::BrCond { cond: v, .. } | Term::Switch { val: v, .. } => {
+                if let Some(c) = n.get_mut(*v as usize) {
+                    *c += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    n
 }
 
 impl<'a> Ra<'a> {
@@ -856,7 +887,7 @@ fn supported(f: &Func) -> bool {
 }
 
 fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
-    let ra = Ra { f, a };
+    let ra = Ra { f, a, gelesen: zaehle_lesezugriffe(f) };
     e.raw("");
     // Linker-Symbol ueber die eine Stelle (codegen_x86::label -> modules::symbol)
     e.raw(&format!(".globl {}", label(&f.name)));
@@ -955,8 +986,38 @@ fn epilogue(e: &mut Emitter, a: &Alloc) {
 }
 
 fn emit_block(e: &mut Emitter, ra: &Ra, b: &Block) -> Result<(), String> {
-    for i in &b.insts {
+    // VERSCHMELZUNG `cmp` + bedingter Sprung.
+    //
+    // Ohne sie kostet jeder Vergleich sieben Instruktionen: `cmp`, `setcc al`,
+    // `movzx eax, al`, eine Kopie ins Zielregister, `test`, `jnz`, `jmp`. Der
+    // bool-Wert wird also erzeugt, gespeichert und sofort wieder auf null
+    // geprueft. Mit Verschmelzung sind es drei: `cmp`, `jcc`, `jmp`.
+    //
+    // Gemessen an `lib/html/mem.fi`: die eingebettete Bereichspruefung von
+    // `buf_at` erzeugt genau dieses Muster, und `dekodiere` durchlaeuft sie bis
+    // zu fuenfmal je Zeichen.
+    //
+    // Bedingungen (alle noetig):
+    //   * die LETZTE Instruktion des Blocks ist der Vergleich — nur dann kann
+    //     zwischen `cmp` und Sprung nichts die Flags veraendern,
+    //   * ihr Ergebnis ist die Sprungbedingung,
+    //   * es wird GENAU EINMAL gelesen (sonst wird der bool-Wert gebraucht),
+    //   * kein `secret`-Wert (SPEC §9.2).
+    let verschmelzbar = match (&b.term, b.insts.last()) {
+        (Term::BrCond { cond, .. }, Some(letzte)) => {
+            matches!(letzte.op, Op::Cmp { .. })
+                && letzte.dst == Some(*cond)
+                && ra.gelesen.get(*cond as usize).copied().unwrap_or(2) == 1
+                && !ra.f.is_secret(*cond)
+        }
+        _ => false,
+    };
+    let n = if verschmelzbar { b.insts.len() - 1 } else { b.insts.len() };
+    for i in &b.insts[..n] {
         emit_inst(e, ra, i)?;
+    }
+    if verschmelzbar {
+        return emit_cmp_br(e, ra, b);
     }
     let f = ra.f;
     match &b.term {
@@ -1012,6 +1073,45 @@ fn emit_block(e: &mut Emitter, ra: &Ra, b: &Block) -> Result<(), String> {
             ))
         }
     }
+    Ok(())
+}
+
+/// `cmp` und bedingter Sprung in einem: der Vergleich der letzten Instruktion
+/// des Blocks setzt die Flags, der Terminator liest sie unmittelbar.
+fn emit_cmp_br(e: &mut Emitter, ra: &Ra, b: &Block) -> Result<(), String> {
+    let f = ra.f;
+    let letzte = b.insts.last().ok_or("interner Fehler: leerer Block bei cmp+jcc")?;
+    let (op, oty, a, bb) = match &letzte.op {
+        Op::Cmp { op, ty, a, b } => (*op, *ty, *a, *b),
+        _ => return Err("interner Fehler: cmp+jcc ohne Vergleich".to_string()),
+    };
+    let (then_bb, else_bb) = match &b.term {
+        Term::BrCond { then_bb, else_bb, .. } => (*then_bb, *else_bb),
+        _ => return Err("interner Fehler: cmp+jcc ohne brcond".to_string()),
+    };
+    let bits = oty.bits().max(8);
+    let oa = ra.opnd_w(a, bits);
+    let ob = ra.opnd_w(bb, bits);
+    if ra.a.imm(a).is_some() || (oa.contains('[') && ob.contains('[')) {
+        ra.load_full(e, "rax", a);
+        e.line(&format!("cmp {}, {}", rn("rax", bits), ob));
+    } else {
+        e.line(&format!("cmp {}, {}", oa, ob));
+    }
+    let jcc = match (op, oty.signed()) {
+        (CmpOp::Eq, _) => "je",
+        (CmpOp::Ne, _) => "jne",
+        (CmpOp::Lt, true) => "jl",
+        (CmpOp::Lt, false) => "jb",
+        (CmpOp::Le, true) => "jle",
+        (CmpOp::Le, false) => "jbe",
+        (CmpOp::Gt, true) => "jg",
+        (CmpOp::Gt, false) => "ja",
+        (CmpOp::Ge, true) => "jge",
+        (CmpOp::Ge, false) => "jae",
+    };
+    e.line(&format!("{} {}", jcc, block_label(&f.name, then_bb)));
+    e.line(&format!("jmp {}", block_label(&f.name, else_bb)));
     Ok(())
 }
 
