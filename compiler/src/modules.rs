@@ -76,7 +76,34 @@ pub fn resolve(root: &Path) -> Result<Vec<SourceFile>, Diag> {
         }
         out.push(SourceFile { id, path, src });
     }
+    // HOOK gc: die Sammler-Laufzeit wird automatisch eingezogen, sobald
+    // irgendwo ein `gc class` steht (gc.rs, SPEC 3.5) — kein `import`, keine
+    // zusaetzliche Kommandozeilenoption.
+    if let Some(f) = gc_laufzeit(&out) {
+        out.push(f);
+    }
     Ok(out)
+}
+
+/// Pfad der eingezogenen GC-Laufzeit (Modulname bleibt leer: ihre Namen sind
+/// programmweit, genau wie die Fehlermengennamen).
+pub(crate) fn gc_laufzeit(files: &[SourceFile]) -> Option<SourceFile> {
+    let mut braucht = false;
+    let mut hat_allocerror = false;
+    for f in files {
+        let mut dg = Diags::new("<gc-suche>", &f.src);
+        let toks = lexer::lex_file(&f.src, f.id, &mut dg);
+        braucht |= crate::gc::quelle_braucht_gc(&toks);
+        hat_allocerror |= crate::gc::quelle_hat_allocerror(&toks);
+    }
+    if !braucht {
+        return None;
+    }
+    Some(SourceFile {
+        id: files.len() as u32,
+        path: PathBuf::from(crate::gc::LAUFZEIT_PFAD),
+        src: crate::gc::laufzeit_quelle(!hat_allocerror),
+    })
 }
 
 /// Sucht `import a.b`-Deklarationen, ohne die Datei vollstaendig zu parsen.
@@ -118,6 +145,11 @@ fn scan_imports(src: &str, file: u32) -> Vec<(Vec<String>, Span)> {
 /// leeren Modulnamen (ihre Namen bleiben unveraendert, `main` heisst `main`).
 fn module_name(f: &SourceFile) -> String {
     if f.id == 0 {
+        return String::new();
+    }
+    // Die GC-Laufzeit liegt im Wurzelnamensraum: `gc_init()` heisst in jedem
+    // Modul `gc_init()`, ohne `import` und ohne Modulpraefix.
+    if f.path == Path::new(crate::gc::LAUFZEIT_PFAD) {
         return String::new();
     }
     f.path

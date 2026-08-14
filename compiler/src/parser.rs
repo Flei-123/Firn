@@ -334,7 +334,13 @@ impl<'a> Parser<'a> {
                 // Integration: Typkonstruktoren, die die SPEC beschreibt, die
                 // Stufe 0 aber NICHT umsetzt, melden hier einen klaren Fehler
                 // statt eines ratlosen Syntaxfehlers (SPEC §14 "Nicht enthalten").
-                if self.kind() == &TokKind::LBracket {
+                // HOOK gc: `Gc[C]` und `GcWeak[C]` (gc.rs)
+                if let Some(t) = crate::gc::hook_type(self, &name, sp) {
+                    return Some(t);
+                }
+                if self.kind() == &TokKind::LBracket
+                    && !crate::sema_generic::is_generic_struct(&name)
+                {
                     if let Some(grund) = nicht_umgesetzter_typ(&name) {
                         self.dg.error_note(
                             sp,
@@ -539,6 +545,11 @@ impl<'a> Parser<'a> {
             match self.kind() {
                 TokKind::Dot => {
                     self.bump();
+                    // HOOK gc: gepruefte Abwaertsumwandlung `x.as?[C]` (gc.rs)
+                    if let Some(g) = crate::gc::hook_postfix(self, &e) {
+                        e = g;
+                        continue;
+                    }
                     match self.ident("nach '.' beim feldzugriff") {
                         Some((name, sp)) => {
                             let full = Parser::join(e.span, sp);
@@ -628,6 +639,10 @@ impl<'a> Parser<'a> {
         }
         // HOOK types: `Enum::Variante(..)` und `Vec[i32]{..}` (sema_match.rs)
         if let Some(e) = crate::sema_match::hook_primary(self) {
+            return e;
+        }
+        // HOOK gc: `gc C{…}`, `gc_null[C]()`, `weak_null[C]()` (gc.rs)
+        if let Some(e) = crate::gc::hook_primary(self) {
             return e;
         }
         match self.kind().clone() {
@@ -1401,6 +1416,13 @@ impl<'a> Parser<'a> {
                 }
                 continue;
             }
+            // HOOK gc: `gc class Name { … }` (gc.rs, SPEC 3.5.1)
+            if crate::gc::hook_item(self) {
+                if self.pos == before {
+                    self.bump();
+                }
+                continue;
+            }
             // HOOK types: enum-Deklaration und generische Vorlagen (sema_match.rs)
             if crate::sema_match::hook_item(self) {
                 if self.pos == before {
@@ -1447,6 +1469,8 @@ pub fn reset_hooks() {
     crate::sema_match::hook_reset();
     // HOOK fehlerunionen: dasselbe fuer Fehlermengen/Fehlerunionen (errors.rs)
     crate::errors::hook_reset();
+    // HOOK gc: dasselbe fuer die gc-Klassen (gc.rs)
+    crate::gc::hook_reset();
 }
 
 /// Wie `parse`, aber fuer eine Datei der Quelltextkarte: `file` ist ihre
@@ -1720,7 +1744,6 @@ mod tests {
 fn nicht_umgesetzter_typ(name: &str) -> Option<&'static str> {
     match name {
         "secret" => Some("secret[T] und die Constant-Time-Primitive (SPEC §9) sind nicht umgesetzt; siehe ABNAHME.md"),
-        "Gc" | "GcWeak" => Some("der Gc-Heap (SPEC §3.5) ist nicht umgesetzt; siehe ABNAHME.md"),
         "Rc" | "Arc" | "Weak" => Some("Rc/Arc/Weak (SPEC §3.4) sind nicht umgesetzt; siehe ABNAHME.md"),
         _ => None,
     }

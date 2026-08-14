@@ -1105,6 +1105,11 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
             }
             ra.store_dst(e, d, "rax");
         }
+        Op::GcAddr { regs } => {
+            let d = i.dst.ok_or("interner Fehler: gc_state ohne Ziel")?;
+            crate::codegen_x86::emit_gc_addr(e, *regs);
+            ra.store_dst(e, d, "rax");
+        }
         Op::Alloca { .. } => {
             let d = i.dst.ok_or("interner Fehler: alloca ohne Ziel")?;
             if ra.a.cell(d).is_some() || ra.a.frame_addr.contains_key(&d) {
