@@ -10,6 +10,7 @@ mod attrs;
 mod codegen_switch;
 mod codegen_x86;
 mod config;
+mod ct;
 mod diag;
 mod dwarf;
 mod errors;

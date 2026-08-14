@@ -73,7 +73,7 @@ Zusammenführung von Runde 3):
 == 2. Modul-Tests des Compilers ==
    cargo test: ok
 == 3. Positivtests (jeweils mit und ohne Optimierer) ==
-   139 Programme x 3 Durchlaeufe (opt / noopt / dev-fast)
+   143 Programme x 3 Durchlaeufe (opt / noopt / dev-fast)
 == 4. Negativtests (Fehlermeldungen) ==
 == 5. Nachweis des Optimierers ==
    PASS 41/41 (Optimierer-Nachweis)
@@ -84,25 +84,31 @@ Zusammenführung von Runde 3):
 == 8. Symbol-Namensschema (DESIGNZIELE 4) ==
    OK: Symbolschema gehalten (_F0.-Praefix, 'main' nackt, Module kollisionsfrei).
 == 9. HTML5-Tokenizer gegen html5lib (tools/tokenizer/run.sh) ==
-   GESAMT                           6807 /   6810    99.96 %
+   GESAMT                      6810 /  6810 100.00 %    6809 /  6810  99.99 %
+   GESAMT                      6810 /  6810 100.00 %    6809 /  6810  99.99 %
+   GESAMT                      6807 /  6810  99.96 %    6807 /  6810  99.96 %
 
-PASS 468/468
+PASS 485/485
 ```
 
-`test.sh` baut den Compiler, lässt `cargo test` laufen (118 Modultests),
+(Die drei `GESAMT`-Zeilen sind der Hauptlauf, derselbe Lauf mit gewähltem
+`--mit-fehlern` und die Gegenprobe `--ohne-xml-modus`; die linke Spalte ist der
+Tokenstrom-Vergleich, die rechte zusätzlich mit den Parse-Fehlercodes.)
+
+`test.sh` baut den Compiler, lässt `cargo test` laufen (122 Modultests),
 übersetzt **jedes** Programm aus `tests/`, `tests/opt/` und `examples/`
 **dreimal** (`opt`, `--no-opt`, `--opt-level=dev-fast`; alle drei müssen
 dasselbe liefern), assembliert, linkt, **führt aus** und vergleicht Exit-Code
 bzw. Standardausgabe mit der Erwartung in Zeile 1
-(`// expect_exit: N` / `// expect_out: TEXT`). Danach prüft es die 46
+(`// expect_exit: N` / `// expect_out: TEXT`). Danach prüft es die 51
 Negativtests in `tests/neg/` (Compiler muss mit Exit ≠ 0 abbrechen, die
 erwartete Meldung samt `Zeile:Spalte` und Markierung ausgeben und darf **nicht**
 paniken), den Optimierernachweis (`test_opt.sh`), die Ergebnisort-Garantie, den
 Architekturwächter, das Symbolschema und zuletzt den HTML5-Tokenizer gegen die
 html5lib-Suite.
 
-Bestand: 122 Testprogramme in `tests/`, 13 Optimierer-Programme in `tests/opt/`,
-4 Beispiele in `examples/`, 46 Negativtests in `tests/neg/`. Die Tests aus
+Bestand: 126 Testprogramme in `tests/`, 13 Optimierer-Programme in `tests/opt/`,
+4 Beispiele in `examples/`, 51 Negativtests in `tests/neg/`. Die Tests aus
 Runde 1 und 2 sind alle noch da und bestehen weiter — es wurde kein Test
 entfernt oder abgeschwächt (`tests/001…065`, `tests/opt/`, `tests/neg/`).
 
@@ -111,12 +117,12 @@ Dieselbe Suite maschinenlesbar (CI):
 ```sh
 cargo build --release --manifest-path tools/testrunner/Cargo.toml
 ./tools/testrunner/target/release/testrunner --format=json | python3 -m json.tool | head
-# {"suite":"firn","total":324,"passed":324,"failed":0,"rate":1.0, "cases":[...]}
+# {"suite":"firn","total":337,"passed":337,"failed":0,"rate":1.0, "cases":[...]}
 ```
 
 Der Testrunner läuft ohne `test.sh` und zählt jedes Programm einzeln in beiden
 Betriebsarten; er enthält den Optimierernachweis (`test_opt.sh`, 41 Prüfungen)
-nicht und auch nicht die Abschnitte 6–9, daher 324 statt 468.
+nicht und auch nicht die Abschnitte 6–9, daher 337 statt 485.
 
 ## Kommandozeile
 
@@ -267,24 +273,32 @@ Runde 3 hat **Fehlerunionen `E!T`** (SPEC §5.1) und den **HTML5-Tokenizer in
 Firn** gebaut; **Constant-Time (§9) und GC/DOM (§3.4/§3.5) sind weiterhin nicht
 gebaut**:
 
-* **`secret[T]`, `select`, `secure_zero`, `barrier`, `u128`, `mul_wide`,
-  `#[constant_time]`** (SPEC §9) — **nicht umgesetzt.** Im Optimierer und in
-  der FIR liegen die Schutzvorkehrungen bereit (`fir::Func::secret`,
-  `constant_time`; mem2reg/DCE/CSE/Inlining lassen solche Werte in Ruhe, mit
-  Rust-Modultests belegt), aber es gibt **keine Sprachsyntax und keine
-  Typprüfung** dafür. `fn f(a: secret[u8])` meldet
+* **`secret[T]`, `u128`, `mul_wide`, `declassify`, `#[constant_time]`**
+  (SPEC §9) — **nicht umgesetzt.** `fn f(a: secret[u8])` meldet
   `'secret[T]' ist in Stufe 0 nicht umgesetzt`
-  (`tests/neg/int_secret_nicht_umgesetzt.fi`).
+  (`tests/neg/int_secret_nicht_umgesetzt.fi`), `#[constant_time]` meldet
+  `attribut 'constant_time' ist in Stufe 0 nicht umgesetzt`
+  (`tests/neg/attr_nicht_umgesetzt.fi`). **Umgesetzt sind seit Runde 4 die drei
+  Primitive** `select(bedingung, a, b)` (wird `cmov`, nie ein bedingter
+  Sprung), `barrier(x)` (undurchsichtige Sperre) und
+  `secure_zero(zeiger, anzahl_bytes)` (überlebt jeden Optimierungsdurchgang,
+  wird `rep stosb`) — `compiler/src/ct.rs`, Nachweise `tests/430_ct_select.fi`
+  bis `tests/433_ct_secure_zero.fi`, fünf Negativtests `tests/neg/ct_*.fi` und
+  vier Codegen-Tests in `ct.rs`. Ohne `secret[T]` sind das Bausteine ohne
+  Typprüfung auf Geheimnisdaten; die Sperren in FIR und Optimierer
+  (`fir::Func::secret`, `constant_time`, mem2reg/DCE/CSE/Inlining) sind
+  vorhanden, bekommen aber erst mit `secret[T]` Futter (SPEC §14.1 Punkt 19).
 * **`Rc[T]`, `Weak[T]`, `Gc[T]`, `gc class`, Mark-Sweep, DOM-Prototyp**
   (SPEC §3.4/§3.5) — **nicht umgesetzt.** Kein GC, kein Dauerlauf, keine
   RSS-Messung. `let x: Gc[i32]` meldet `'Gc[T]' ist in Stufe 0 nicht umgesetzt`
   (`tests/neg/int_gc_nicht_umgesetzt.fi`). ABNAHME.md Punkt 2 bleibt deshalb
   offen.
-* **HTML5-Tokenizer:** gebaut und gemessen — **6.807 von 6.810 (99,96 %)**,
-  aber **nicht 100 %** und **nicht ≤ 2×** (2,69× html5ever). Offen sind die
-  XML-Anpassung (`xmlViolationTests`, 3 Fälle) und die Parse-Fehlercodes
-  (`errors`-Einträge der Suite werden **nicht** verglichen). Abschnitt
-  „HTML5-Tokenizer" weiter unten, Zahlen in ABNAHME.md Punkt 3.
+* **HTML5-Tokenizer:** gebaut und gemessen — **6.810 von 6.810 (100,00 %)**
+  Tokenstrom-Vergleich und **6.809 von 6.810 (99,99 %)** mit Vergleich der
+  Parse-Fehlercodes (`--mit-fehlern`); die XML-Anpassung der
+  `xmlViolationTests` ist als optionaler Modus umgesetzt. Offen bleibt das
+  Geschwindigkeitsziel ≤ 2×. Abschnitt „HTML5-Tokenizer" weiter unten, Zahlen
+  in ABNAHME.md Punkt 3.
 * **`comptime`**, **Interfaces**, **Optionals**,
   **Abwicklung/`throw`** (SPEC §5.3). Fehlerunionen `E!T` gibt es seit Runde 3,
   aber ohne abgeleitete Fehlermenge, ohne `defer`/`errdefer` und mit
@@ -374,7 +388,7 @@ kein `E!()`) stehen in `SPEC.md` §14.1.fehlerunionen als F1–F10 und in
 ## HTML5-Tokenizer in Firn gegen html5lib (Runde 3)
 
 Der Tokenizer nach WHATWG §13.2.5 ist **in Firn** geschrieben
-(`lib/html/*.fi`, 7.464 Zeilen, davon 4.663 Zeilen erzeugte Namenstabelle für
+(`lib/html/*.fi`, 8.647 Zeilen, davon 4.663 Zeilen erzeugte Namenstabelle für
 Zeichenreferenzen). Die Zustandsmaschine ist ein `enum` mit **73 Zuständen**
 plus `match`; der Codegenerator macht daraus eine echte Sprungtabelle —
 selbst nachprüfbar:
@@ -385,7 +399,7 @@ grep -n "jmp qword ptr" /tmp/tok.s     # 11005:    jmp qword ptr [rdx + rax*8]
 ```
 
 Der Harness ist eine **Werkbank** (Python, `tools/tokenizer/harness.py`,
-227 Zeilen) und enthält keine Tokenizer-Logik: er schickt Aufträge über stdin
+295 Zeilen) und enthält keine Tokenizer-Logik: er schickt Aufträge über stdin
 (Protokoll in `tools/tokenizer/PROTOKOLL.md`) und vergleicht die Antwortzeile.
 
 ```sh
@@ -395,29 +409,89 @@ bash tools/tokenizer/run.sh
 Echte Ausgabe (14.08.2026, selbst ausgeführt):
 
 ```
-GESAMT                           6807 /   6810    99.96 %
-xmlViolation.test                   1 /      4    25.00 %
-   Firn      :     4.08 MB/s  (0.999 s fuer 4.08 MB, bester von 3)
-   html5ever :    10.97 MB/s  (0.372 s, bester von 3)
-   Faktor    : 2.69x langsamer als html5ever (Abnahmeziel <= 2.00x)
+Datei                       ohne Fehlercodes     mit Fehlercodes
+xmlViolation.test              4 /     4 100.00 %       3 /     4  75.00 %
+GESAMT                      6810 /  6810 100.00 %    6809 /  6810  99.99 %
 ```
 
-Ein zweiter vollständiger Lauf ergab `2.87x`. Die Bilanz 6807/6810 war in
-beiden Läufen identisch.
+**Durchsatz auf ZWEI Korpora** (`bash tools/tokenizer/durchsatz.sh`, echte
+Ausgabe vom 14.08.2026, bester von je 3 Läufen):
+
+```
+   -- Korpus 'html5lib' (Grenzfaelle der Testsuite, absichtlich pathologisch)
+      Firn      :     4.59 MB/s  (0.889 s fuer 4.08 MB, bester von 3)
+      html5ever :    11.22 MB/s  (0.363 s, bester von 3)
+      Faktor    : 2.45x langsamer als html5ever (Abnahmeziel <= 2.00x)
+
+   -- Korpus 'realweb' (acht echte Seiten aus testdata/realweb/)
+      Firn      :     7.44 MB/s  (0.632 s fuer 4.70 MB, bester von 3)
+      html5ever :    42.60 MB/s  (0.110 s, bester von 3)
+      Faktor    : 5.72x langsamer als html5ever (Abnahmeziel <= 2.00x)
+```
+
+Warum zwei Korpora: der Korpus aus den html5lib-Eingaben ist **absichtlich
+pathologisch** (fast nur Grenzfälle, sehr viele Zustandswechsel je Byte, kaum
+lange Textläufe) und misst den schlechtesten Fall — das ist in
+`tools/tokenizer/korpus.py` so dokumentiert. Korpus `realweb` sind acht am
+14.08.2026 gespeicherte echte Seiten (Wikipedia ×3, WHATWG-HTML-Standard, W3C,
+rustdoc, Hacker News; 4,70 MB, `testdata/realweb/MANIFEST.md` nennt jede URL).
+Genau dort ist html5ever am stärksten: lange Textläufe sind sein bester Fall,
+während der Firn-Tokenizer weiter Codepunkt für Codepunkt arbeitet und
+zusätzlich html5lib-JSON schreibt.
+
+Die Bilanz war in allen Läufen identisch. Beide Korpora bekommen auf beiden
+Seiten byteweise dieselbe Eingabe.
+
+**Testdaten unverändert — nachprüfbar:** `bash tools/tokenizer/verifiziere_testdaten.sh`
+vergleicht die sha256-Summen der 14 `.test`-Dateien mit dem festgeschriebenen
+Satz (`tools/tokenizer/testdaten.sha256`, Upstream-Commit
+`224991ec10db04f056a89eed8b0bd8695fd2950e` von html5lib-tests) und zählt die
+6.810 Fälle nach. `run.sh` fährt das als Schritt 0 mit; mit `--gegen-upstream`
+lädt das Skript die Dateien dieses Commits erneut von GitHub und vergleicht
+direkt.
 
 Ehrlich benannt:
 
-* **Nicht 100 %**: die drei `xmlViolationTests` „Non-XML character",
-  „Non-XML space" und „Double hyphen in comment" verlangen die XML-Anpassung,
-  die nicht umgesetzt ist. Sie zählen als **Fehlschlag**, nicht als
-  „übersprungen".
-* **Nicht ≤ 2×**: gemessen **2,69×** bzw. in einem zweiten Lauf **2,87×**
-  langsamer als html5ever (`--release`, `opt-level=3`) auf demselben
-  4,08-MB-Korpus. Die Messung schwankt um ~30 %; 2,6×–3,1× sind
-  reproduzierbar — die eigene Zahl der Jury kann in dieser Spanne liegen.
+* **Die XML-Anpassung ist ein optionaler Modus, kein Sonderweg**: die vier
+  `xmlViolationTests` verlangen die Anpassungen aus „Coercing an HTML DOM into
+  an infoset". Der Treiber schaltet sie über eine Auftragsflagge zu (Bit 0,
+  `tools/tokenizer/PROTOKOLL.md`), der Harness setzt sie ausschließlich für die
+  Fälle unter dem Schlüssel `xmlViolationTests`. Gegenprobe (fährt `run.sh`
+  selbst mit): `python3 tools/tokenizer/harness.py <binary> --ohne-xml-modus`
+  ergibt `6807 / 6810 (99,96 %)` — der reine HTML-Pfad ist also unverändert.
+  Es wird nichts gefiltert und nichts übersprungen.
+* **Nicht ≤ 2× — auf keinem der beiden Korpora.** Drei vollständige Messungen
+  am 14.08.2026 (bester Lauf je Seite, html5ever mit `--release`,
+  `opt-level=3`, derselbe Rechner, dieselben Bytes):
+  Korpus `html5lib` **2,25× / 2,45× / 2,79×**, Korpus `realweb`
+  **5,72× / 7,72× / 7,84×**; eine vierte Messung ergab **2,32×** bzw.
+  **7,35×**, eine fünfte (Nacharbeit Runde 4) **3,09×** bzw. **6,39×**,
+  zwei weitere bei der Zusammenführung **2,59×** bzw. **6,90×** und
+  **2,42×** bzw. **8,31×** — die Extremwerte liegen jeweils über der zuvor
+  notierten Spanne; sie lautet deshalb **2,25×–3,09×** (`html5lib`) und
+  **5,72×–8,31×** (`realweb`) und nicht der günstigste Lauf.
+  Die Messung schwankt um ~30 %; die eigene Zahl
+  der Jury kann in diesen Spannen liegen. Der schlechtere Wert auf echten
+  Seiten ist kein Ausreißer, sondern der ehrlichere: dort spielt html5ever
+  seine Stärke bei langen Textläufen aus.
 * **Die `errors`-Einträge der Suite (Parse-Fehlercodes mit Zeile/Spalte)
-  werden nicht verglichen** — der Tokenizer meldet keine Fehlercodes. Offene
-  Lücke, keine bestandene Prüfung.
+  werden verglichen** — Schalter `--mit-fehlern`, in `run.sh` Schritt 2a. Der
+  Tokenizer führt Zeile und Spalte selbst mit und gibt hinter dem Tokenstrom
+  (durch Tabulator getrennt) eine zweite JSON-Liste aus, z. B.
+  `[{"code":"eof-in-tag","line":1,"col":6}]`; die Codenamen stehen in
+  `lib/html/fehler_codes.fi` (WHATWG §13.2 „Parse errors"). Ergebnis
+  **6.809 / 6.810 (99,99 %)**. Der eine Fehlschlag ist `xmlViolation.test #0`:
+  dort steht `U+FFFF` in der Eingabe, der Tokenizer meldet dafür korrekt
+  `noncharacter-in-input-stream`, die Datei `xmlViolation.test` führt aber gar
+  keine `errors`-Listen und erwartet die leere Liste. Der Fall wird **als
+  Fehlschlag gezählt**, nicht ausgenommen.
+* **Die Namenstabelle der Zeichenreferenzen liegt an keiner festen Adresse**:
+  `mmap` ohne `MAP_FIXED`, der Zeiger wird im `tokens.Sink` durchgereicht.
+  Schlägt `mmap` fehl, liefert `entities.tabelle()` 0, `char_ref` meldet
+  `REF_UNMOEGLICH` und der Tokenizer setzt `nicht_unterstuetzt` — der Fall
+  zählt als Fehlschlag statt still falsch tokenisiert zu werden. Nachweis in
+  Firn: `lib/html/entities_ausfall.fi` (Schritt 1c in `run.sh`, startet das
+  Programm zweimal und verlangt verschiedene Adressen).
 * Alle drei Baustufen (`opt`, `--no-opt`, `dev-fast`) liefern dieselbe Bilanz;
   `run.sh` bricht ab, wenn nicht.
 
@@ -436,14 +510,16 @@ ABNAHME.md               die sechs Abnahmepunkte mit echten Messwerten
 docs/FIR.md              die eigene IR: Instruktionen, Typen, Invarianten
 docs/DEBUGGER.md         .debug_line + wörtlich kopierte gdb-Sitzung
 docs/SELBSTHOSTING.md    was heute schon in Firn geschrieben werden könnte
-compiler/src/            24 Module: config.rs main.rs lexer.rs ast.rs parser.rs
+compiler/src/            29 Module: config.rs main.rs lexer.rs ast.rs parser.rs
                          diag.rs types.rs sema.rs sema_match.rs sema_generic.rs
-                         mono.rs modules.rs abi.rs fir.rs lower.rs lower_match.rs
-                         opt.rs mem2reg.rs inline.rs regalloc.rs dwarf.rs
+                         errors.rs attrs.rs mono.rs modules.rs abi.rs fir.rs
+                         layout.rs lower.rs lower_match.rs lower_errors.rs
+                         ct.rs opt.rs mem2reg.rs inline.rs regalloc.rs dwarf.rs
                          strings.rs codegen_x86.rs codegen_switch.rs
 lib/str/, lib/num/       Firn-Bibliothek: Bytes/Str/Str16/Atom, strtod/dtoa
-lib/html/                HTML5-Tokenizer IN FIRN (7.464 Zeilen .fi)
-tools/tokenizer/         Werkbank: Harness gegen html5lib, Durchsatzmessung
+lib/html/                HTML5-Tokenizer IN FIRN (8.647 Zeilen .fi)
+tools/tokenizer/         Werkbank: Harness gegen html5lib, Durchsatzmessung,
+                         verifiziere_testdaten.sh (sha256 der 14 .test-Dateien)
 bench/tokenizer/         html5ever als Messlatte (eigenes Cargo-Projekt)
 tests/                   122 Programme + tests/opt (13) + tests/neg (46)
 examples/                hello.fi fib.fi bubblesort.fi structs.fi
@@ -451,7 +527,8 @@ bench/                   6 Mikrobenchmarks, doppelt (Firn + Rust), run.sh
 tools/testrunner/        Testrunner mit --format=json (CI)
 tools/strlib/            Einbinder für lib/*.fi (erzeugt tests/300…308)
 tools/dtoa_vectors/      100.000-Doubles-Rundlauf gegen Rust als Messlatte
-testdata/                html5lib-Tokenizer-Suite (6.810 Faelle, 6.807 bestanden)
+testdata/html5lib-tokenizer/  Tokenizer-Suite, unveraendert (6.810 Faelle)
+testdata/realweb/        8 gespeicherte echte Seiten (~4,7 MB) — Messkorpus B
 test.sh                  gesamte Testsuite (baut, führt aus, vergleicht)
 test_opt.sh              Vorher/Nachher-Nachweis des Optimierers
 ```

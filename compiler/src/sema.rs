@@ -1332,6 +1332,10 @@ impl<'a> Checker<'a> {
         if let Some(t) = crate::sema_match::hook_call(self, name, args, nspan, espan) {
             return t;
         }
+        // HOOK constant-time: select/barrier/secure_zero (ct.rs, SPEC §9.2/§9.3)
+        if let Some(t) = crate::ct::hook_call(self, name, args, nspan, espan) {
+            return t;
+        }
         let sig = match self.fns.get(name) {
             Some(s) => s.clone(),
             None => {
