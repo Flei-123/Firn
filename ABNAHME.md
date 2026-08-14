@@ -320,7 +320,7 @@ Nicht Teil der sechs Abnahmepunkte, aber Voraussetzung dafür, dass sie später
 | Ergebnisort-Garantie für Aggregatrückgaben | **`[x]`** | `bash tools/ergebnisort/run.sh` → 1-MB-Struktur, `baue` hat 224 Byte Rahmen, keine Bulk-Kopie |
 | Ergebnisort für Struct-/Arrayliterale und `init` | **`[~]`** | Literale schreiben bereits feldweise ins Ziel (`lower.rs: write_into`); als Garantie in SPEC festgeschrieben, `init` gibt es noch nicht |
 | Feldzugriff vom Speicherort trennen (Vorbedingung SoA) | **`[x]`** | `compiler/src/layout.rs` (4 Zugaenge); `bash tools/schichten/run.sh` erzwingt es, Gegenprobe mit absichtlicher Verletzung schlaegt an |
-| Prüfphasen wiedereintrittsfähig (Vorbedingung `comptime emit`) | **`[ ]`** | einmaliger Durchlauf |
+| Pruefphasen wiedereintrittsfaehig (Vorbedingung `comptime emit`) | **`[x]`** | `Checker::add_items` (`sema.rs`); 3 Tests: Nachtrag greift auf Erstlauf zu, unbekannter Name faellt auf, doppeltes `main` faellt auf |
 | `!T` + `#[must_consume]` | **`[~]`** | `#[must_consume]` erledigt (`firnc --list-attrs`, `tests/130_must_consume.fi`, 5 Negativtests); `!T` steht noch aus |
 | Symbol-Namensschema mit Versionsplatz | **`[x]`** | `modules::symbol` (`_F0.<name>`, Platz fuer `.v<n>`); `bash tools/symbole/run.sh` prueft an der echten Symboltabelle |
 
@@ -329,3 +329,25 @@ echten Codegenerator-Fehler aufgedeckt (Argumentregister 5/6 wurden im Prolog
 überschrieben, `tests/024_six_args.fi` lieferte 13 statt 21). Er war in 259
 grünen Tests unsichtbar, weil die betroffene Funktion in den Release-Stufen
 immer eingebettet wurde. Behoben; Regressionstest `tests/025_argreg_shuffle.fi`.
+
+### Fundament-Bilanz (Stand 14.08.2026)
+
+Sechs Fundamentpunkte aus `DESIGNZIELE.md` §10.4 — **alle sechs erledigt**:
+
+| # | Fundamentpunkt | Nachweis |
+|---|---|---|
+| 1 | Durchgangsregister mit Etikett *debugerhaltend* + vier Baustufen | `firnc --list-passes`; `tools/baustufen/run.sh` → **dev-fast 2,06×** |
+| 2 | Ergebnisort-Garantie | `tools/ergebnisort/run.sh` → 1-MB-Struktur, `baue` 224 B Rahmen |
+| 3 | Feldzugriff vom Speicherort getrennt | `compiler/src/layout.rs`; `tools/schichten/run.sh` |
+| 4 | `#[must_consume]` + Attributsystem | `firnc --list-attrs`; `tests/130_*`, 5 Negativtests |
+| 5 | Symbol-Namensschema mit Versionsplatz | `modules::symbol`; `tools/symbole/run.sh` |
+| 6 | Pruefphasen wiedereintrittsfaehig | `Checker::add_items`; 3 Tests in `sema.rs` |
+
+**Was das heisst:** Die Entwurfsentscheidungen aus `DESIGNZIELE.md`, die spaeter
+*unmoeglich* geworden waeren, sind getroffen und durch Tests festgehalten. Alles
+Weitere (`!T`, GC, `comptime`, SoA, stabiles ABI, Hot Reload) ist ab jetzt
+**additiv** — es erweitert vorhandene Zugaenge, statt Bestehendes aufzureissen.
+
+**Nicht verwechseln:** Fundament fertig heisst **nicht** Abnahme bestanden. Die
+sechs Punkte aus `FIRN-ANFORDERUNGEN.md` §13 stehen weiter bei **0 von 6**
+(siehe oben). Das Fundament macht sie erreichbar, nicht erreicht.
