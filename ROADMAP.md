@@ -256,9 +256,36 @@ Offen benannt, damit es nicht überrascht:
 
 ## Nächster konkreter Schritt
 
-Phase 2 abarbeiten, in dieser Reihenfolge (nach `FIRN-ANFORDERUNGEN.md` §12):
-**Fundamentarbeit (`DESIGNZIELE.md` §10.4) → Speichermodell → Optimierer/
-Messung → Zeichenketten → Testrunner → restlicher Sprachkern.**
+**Stand 14.08.2026.** Aus der Reihenfolge nach `FIRN-ANFORDERUNGEN.md` §12
+(**Fundamentarbeit → Speichermodell → Optimierer/Messung → Sprachkern →
+`comptime` → Paketverwaltung → Selbst-Hosting**) sind erledigt:
+
+* **Fundamentarbeit** (`DESIGNZIELE.md` §10.4) — alle sechs Punkte, siehe
+  `ABNAHME.md`.
+* **Speichermodell** — Opt-in-Tracing-GC gebaut **und im Dauerlauf belegt**:
+  100.000.000 DOM-Zyklensätze (700 Mio. Objekte) bei konstant 1.364 KiB RSS,
+  Zählverweis-Gegenprobe leckt auf 750.080 KiB. `docs/berichte/dom.md`.
+  Offen bleibt der 24-Stunden-Lauf und Fragmentierung bei wechselnden
+  Objektgrößen.
+* **Härtetest 1** (HTML5-Tokenizer): Quote erreicht (6.810/6.810), **Tempo
+  verfehlt** (5,7×–8,3× auf echten Seiten statt ≤ 2×).
+* **Härtetest 2** (DOM-Dauerlauf): bestanden, siehe oben.
+
+**Als Nächstes, in dieser Reihenfolge:**
+
+1. **Optimierer auf das Tempoziel** — das ist der einzige *gemessen verfehlte*
+   Zielwert. Ansatzpunkte in der Reihenfolge ihres erwarteten Nutzens:
+   Bereichsprüfungen entfernen, echte Registerzuteilung über Blockgrenzen,
+   Sprungtabellen im Tokenizer-Kern, Inlining über Modulgrenzen.
+   Ohne ≤ 2× trägt die Sprache keine Browser-Engine.
+2. **Inkrementelles Sammeln** (`S5`) — 3,54 ms längste Pause ist bei 16 ms
+   Bildabstand zu viel.
+3. **Restlicher Sprachkern**: `defer`, `drop`, Move-Prüfer, Referenztypen
+   `&T`/`inout T`, `for`, Gleitkomma, Zeichenkettenliterale.
+4. **`comptime` + Reflexion** — Vorbedingung (wiedereintrittsfähige Prüfphasen)
+   steht seit der Fundamentarbeit.
+5. **Paketverwaltung**, dann **Selbst-Hosting** in drei Stufen.
+
 Constant-Time wird dabei mitgebaut, nicht nachgerüstet. Die Fundamentarbeit
-steht bewusst **vor** allem anderen: sie ist heute billig und später nicht
-mehr bezahlbar.
+stand bewusst **vor** allem anderen: sie war billig und wäre später nicht mehr
+bezahlbar gewesen.
