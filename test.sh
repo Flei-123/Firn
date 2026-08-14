@@ -17,6 +17,8 @@
 #      Rahmengroessen im erzeugten Assembler).
 #   7. Architekturpruefung: Feldzugriff ist vom Speicherort getrennt
 #      (tools/schichten/run.sh, Vorbedingung fuer SoA).
+#   8. Symbol-Namensschema: reservierter Praefix, Platz fuer die
+#      ABI-Version, Module kollisionsfrei (tools/symbole/run.sh).
 #
 # Kein '|| true', kein Verschlucken von Exit-Codes: set -euo pipefail.
 set -euo pipefail
@@ -187,6 +189,16 @@ if [ "$SCRC" -eq 0 ]; then
 else
     bad "tools/schichten/run.sh schlug fehl (siehe .test-work/schichten.log)"
     tail -20 "$WORK/schichten.log" | sed 's/^/   /'
+fi
+
+echo "== 8. Symbol-Namensschema (DESIGNZIELE 4) =="
+bash tools/symbole/run.sh > "$WORK/symbole.log" 2>&1 && SYRC=0 || SYRC=$?
+if [ "$SYRC" -eq 0 ]; then
+    ok
+    tail -1 "$WORK/symbole.log" | sed 's/^/   /'
+else
+    bad "tools/symbole/run.sh schlug fehl (siehe .test-work/symbole.log)"
+    tail -20 "$WORK/symbole.log" | sed 's/^/   /'
 fi
 
 TOTAL=$((PASS + FAIL))

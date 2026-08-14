@@ -474,10 +474,33 @@ Regeln:
 ### Konsequenz für den Compiler HEUTE
 
 * **Das Symbolschema muss von Anfang an Platz für Versionen haben.** Wenn Firn
-  heute `main` und `add` als nackte Symbole ausgibt und später `_F1_add@v2`
-  braucht, ist das ein Bruch. Ein einfaches, dokumentiertes Namensschema
-  (Modulpfad + Name + Signaturkürzel) sollte in **Phase 3** mit dem Modulsystem
-  kommen — das ist billig und macht später alles möglich.
+  heute `main` und `add` als nackte Symbole ausgibt und später versionierte
+  braucht, ist das ein Bruch für alles bereits Gebaute.
+  **Erledigt am 14.08.2026** (`compiler/src/modules.rs`):
+
+  ```text
+  _F0.add              Element der Wurzeldatei
+  _F0.helfer__quadrat  Element eines Moduls
+  _F0.add.v3           mit ABI-Version (später, #[abi_stable(3)])
+  main                 der Einstiegspunkt, unverändert
+  ```
+
+  `SYMBOL_SCHEMA = 0` steht in **jedem** erzeugten Symbol: ändert sich das
+  Schema, meldet der Linker einen fehlenden Namen, statt zwei unverträgliche
+  Übersetzungsstände still zusammenzubinden. Der Präfix ist reserviert —
+  Firn-Bezeichner dürfen keinen Punkt enthalten, Nutzercode kann ihn also nicht
+  erzeugen.
+* **Der eigentliche Gewinn ist die Trennung.** *Interner Name* (Typprüfer, IR,
+  Fehlermeldungen) und *Linker-Symbol* sind jetzt zwei Dinge; aus dem einen wird
+  das andere an **genau einer** Stelle (`codegen_x86::label` →
+  `modules::symbol`). Ein erster Versuch, das direkt in die Namensauflösung zu
+  bauen, ließ prompt `_F0.Str16` in Typfehlermeldungen auftauchen — genau
+  deshalb gehört das Schema in den Codegenerator und nirgendwo sonst hin.
+* **Nachgewiesen:** `tools/symbole/run.sh` (Abschnitt 8 von `test.sh`) baut ein
+  Programm mit zwei Modulen, die dieselbe Funktion `hilf` enthalten, führt es
+  aus und prüft an der echten Symboltabelle (`nm`): beide Symbole existieren
+  getrennt, `main` ist nackt, und **kein** Firn-Symbol steht ohne Schemapräfix
+  da.
 * **`SPEC.md` §13 muss festhalten, dass das Standardlayout ausdrücklich
   *instabil* ist.** Sonst verlässt sich Code darauf und man kann es nie ändern.
 * Sonst: nichts. Das ist ein Punkt, den man wirklich später bauen kann.
@@ -1124,7 +1147,7 @@ Dingen, die später obendrauf kommen.
 | 1 | **Funktionsfarben / `Io`** | **Kein `async`-Schlüsselwort einführen.** Codegen darf keine Stapelstetigkeit annehmen (Stapelwechsel muss möglich bleiben) | `Io`-Schnittstelle, `Future`, `Io.Threaded`, `Io.Evented` | **FUNDAMENT** (billig) | 3–4 |
 | 2 | **Fehlbare Allokation** | `#[must_consume]` **erledigt 14.08.2026** (Attributsystem + Prüfung); `!T` fehlt noch. **Regel: keine unfehlbare Allokationsfunktion, nie** | `!T`, `Allocator`-Schnittstelle, Sammlungen, fehlbare GC-Allokation | **FUNDAMENT** (unumkehrbar) | 2–3 |
 | 3 | **Capability-Module** | **Regel: keine Ambient-Autorität in der Bibliothek.** Modulsystem muss eine *Paket*grenze kennen | Deklaration in `firn.toml`, Prüfung, Bauskript-Sandbox | **FUNDAMENT** (als Regel) | 3 |
-| 4 | **Stabiles ABI** | Nur ein **Symbol-Namensschema mit Versionsplatz**. `SPEC.md` muss sagen: Standardlayout ist *instabil* | `#[abi_stable]`, `#[frozen]`, resiliente Aufrufe | nachrüstbar | 3 → 7/8 |
+| 4 | **Stabiles ABI** | **erledigt 14.08.2026:** Symbolschema `_F0.…` mit Versionsplatz (`modules.rs`), Nachweis `tools/symbole/run.sh` | `#[abi_stable]`, `#[frozen]`, resiliente Aufrufe | Vorleistung ✔, Rest nachrüstbar | erledigt → 7/8 |
 | 5 | **Debug-Bau-Geschwindigkeit** | **erledigt 14.08.2026:** Register `PASSES` mit Etiketten, `--list-passes`, `--no-pass=`, `--opt-level=`; gemessen **2,06×** | die verbotenen Durchgänge existieren noch gar nicht; `--release-safe` = `--release-fast`, solange es keine Laufzeitprüfungen gibt | **FUNDAMENT** ✔ | erledigt / 3 |
 | 6 | **In-Place-Initialisierung** | **Ergebnisort als Garantie festschreiben** — für Aggregatrückgaben bereits umgesetzt (`lower.rs:604`, nachgeprüft), fehlt für Literale und `init` | `init`-Ausdruck mit Teilaufräumung, `#[no_move]` | **FUNDAMENT** (teuer, aber jetzt am billigsten) | 2 → 3 |
 | 7 | **Comptime + Reflexion** | **Prüfphasen wiedereintrittsfähig** (neu erzeugte Elemente nachträglich prüfbar). FIR bleibt interpretierbar | `comptime`-Interpreter, `reflect.*`, `emit`, Bauskripte | **FUNDAMENT** (Architektur) | 2 → 3 |
@@ -1202,7 +1225,8 @@ Konkret und überprüfbar, in dieser Reihenfolge:
    `--list-passes` / `--no-pass=` / `--opt-level=`, gemessen 2,06×.
 5. **Wiedereintrittsfähige Prüfphasen** (Punkt 7) — beim Bau des Modulsystems
    berücksichtigen.
-6. **Symbol-Namensschema mit Versionsplatz** (Punkt 4) — mit dem Modulsystem.
+6. ~~**Symbol-Namensschema mit Versionsplatz** (Punkt 4)~~ — **erledigt**,
+   `modules::symbol`, Nachweis `tools/symbole/run.sh`.
 
 ---
 
