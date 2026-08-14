@@ -57,19 +57,19 @@ Legende: `[ ]` offen · `[~]` teilweise, mit Zahl · `[x]` bestanden und gemesse
 
 ---
 
-### 2. `[ ]` Speichermodell entschieden **und prototypisch belegt**
+### 2. `[~]` Speichermodell entschieden **und prototypisch belegt**
 
 | | |
 |---|---|
 | **Anforderung** | `S1`–`S3`, `S7` · `TODO-FIRN.md` 0.9 · `SPEC.md` §3 |
 | **Kriterium** | DOM-Prototyp mit Eltern-/Kind-Zyklen **und** Listener-Zyklen läuft **24 h** ohne Speicherwachstum |
-| **Messbefehl** | `./bench/dom_soak.sh --hours 24` (existiert noch nicht); Messgröße RSS über die Zeit, Toleranz: kein monotoner Anstieg nach der Aufwärmphase |
+| **Messbefehl** | `bash tools/dom_soak/run.sh` (Umgebung: `SOAK_SEK`, `SOAK_ZYKLEN`, `SOAK_STICHPROBE`); Messgröße RSS aus `/proc/self/statm` über die Zeit, Toleranz: kein monotoner Anstieg nach der Aufwärmphase |
 | **Stand Entscheidung** | **`[x]` getroffen und begründet** — Opt-in-Tracing-GC in drei Stufen, `SPEC.md` §3.2/§3.5. Alternativen (Arena+Indizes, Refcount+Weak) mit Begründung verworfen |
-| **Stand Beleg** | **`[ ]` nicht belegt.** Kein GC implementiert, kein Prototyp, keine Messung |
-| **Stand nach Runde 2 (13.08.2026)** | **unverändert offen — der GC wurde in Runde 2 bewusst NICHT begonnen.** Es gibt kein `Rc[T]`/`Weak[T]`, kein `Gc[T]`, kein `gc class`, keinen Mark-Sweep, keinen DOM-Prototyp, keinen Dauerlauf und keine RSS-Tabelle. Die Runde hat stattdessen Sprachkern, `match`, Generics, Zeichenketten, Optimierer und Werkzeuge gebaut (Ziele 1–5 und 9). **Verschoben, nicht verschwiegen.** `Gc[i32]`/`Rc[i32]` im Quelltext melden `'Gc[T]' ist in Stufe 0 nicht umgesetzt` mit Zeile/Spalte (`tests/neg/int_gc_nicht_umgesetzt.fi`) — der Compiler tut nicht so, als gäbe es sie |
-| **Teilpunkte** | `S1` deterministisch als Standard: entworfen, in Stufe 0 nur Rohzeiger · `S2` GC-Heap: nur entworfen · `S3` schwache Verweise: nur entworfen · `S4` Finalisierer: nur entworfen · `S5` inkrementell: geplant v0.5 · `S6` Pausenzeiten messbar: geplant · `S7` `Rc`/`Arc`: nur entworfen |
+| **Stand Beleg (14.08.2026, selbst gemessen)** | **`[~]` prototypisch belegt, 24-h-Lauf steht aus.** Der GC ist gebaut (`compiler/src/gc.rs`, Laufzeit `lib/gc/gc.fi` in Firn), der DOM-Prototyp ebenfalls (`lib/dom/dom.fi`, 6 Zyklenarten). **Dauerlauf: 100.000.000 Zyklensätze = 700.000.000 Objekte in 116,5 s, RSS konstant 1.364 KiB von der ersten bis zur letzten von 1.001 Stichproben, 47.300 Sammelläufe, längste Pause 3,54 ms.** Gegenprobe mit Zählverweis (identischer Objektgraph, `lib/dom/soak_leck.fi`): **750.080 KiB nach 2.000.000 Zyklen, 12.000.000 lebende Objekte — Faktor 550.** Rohdaten: `tools/dom_soak/langlauf/*.tsv`, Bericht: `docs/berichte/dom.md` |
+| **Teilpunkte** | `S1` deterministisch als Standard: Stufe 0 hat Rohzeiger, kein Move-Prüfer · `S2` GC-Heap: **`[x]` Mark-Sweep, präzise Heap-Verfolgung über compilergenerierte Typtabelle, konservativer Stapel-/Registerscan, kein Kompaktieren** · `S3` schwache Verweise: **`[x]` `GcWeak[T]`, negativ getestet** · `S4` Finalisierer: **offen** · `S5` inkrementell: **offen** — die längste Pause (3,54 ms) ist für 16-ms-Bilder bereits zu viel · `S6` Pausenzeiten messbar: **`[x]` `gc_pause_ns_last/max/total`, im Protokoll mitgeschrieben** · `S7` `Rc`/`Weak`: **`[x]` als reines Firn-Modul (`tests/modules/rc.fi`), Zyklen lecken absichtlich und sichtbar (`tests/552_rc_zyklus_leck.fi`); `Arc[T]` offen** |
+| **Was fehlt bis `[x]`** | (a) der **24-Stunden-Lauf**, (b) **Fragmentierung bei wechselnden Objektgrößen** — der Dauerlauf benutzt immer denselben Satz, das ist der freundliche Fall, (c) inkrementelles Sammeln, Finalisierer, `GcVec`/`GcMap`, `virtual` |
 | **Aufwand laut TODO-FIRN** | 0.1 = 2 PM (Entscheidung + Prototyp), 0.9 = 2 PM (Dauerlauf) |
-| **Risiko** | Konservatives Stack-Scanning schließt einen kompaktierenden Sammler aus → Fragmentierung im Dauerlauf ist das eigentliche Risiko dieses Punktes |
+| **Risiko** | Konservatives Stack-Scanning schließt einen kompaktierenden Sammler aus → Fragmentierung im Dauerlauf bleibt das eigentliche Risiko. Nachweisbar außerdem: **eine alte Zeigerkopie in einem lebenden Rahmen hält ihr Objekt am Leben** (`docs/berichte/dom.md`, Abschnitt „Die unbequeme Stelle") |
 
 ---
 
@@ -298,7 +298,7 @@ drei Läufe und nicht der günstigste Einzelwert.
 | # | Punkt | Stand nach Runde 3 (14.08.2026, selbst gemessen) |
 |---|---|---|
 | 1 | Selbst-Hosting in drei Stufen | `[ ]` nicht begonnen; Bestandsaufnahme in `docs/SELBSTHOSTING.md` |
-| 2 | Speichermodell entschieden **und belegt** | `[~]` Entscheidung getroffen, **Beleg fehlt: kein GC, kein DOM-Prototyp, keine RSS-Messung — in dieser Runde bewusst verschoben** |
+| 2 | Speichermodell entschieden **und belegt** | `[~]` Entscheidung getroffen **und prototypisch belegt**: GC gebaut, DOM-Prototyp mit 6 Zyklenarten, **100 Mio. Zyklensätze / 700 Mio. Objekte bei konstant 1.364 KiB RSS**, Gegenprobe mit Zählverweis leckt auf 750.080 KiB (Faktor 550). **Offen: der 24-h-Lauf und Fragmentierung bei wechselnden Objektgrößen** |
 | 3 | Tokenizer 100 % html5lib **und** ≤ 2× | `[~]` **6.810 von 6.810 Fällen (100,00 %)** im Tokenstrom-Vergleich und **6.809 von 6.810 (99,99 %)** mit Vergleich der Parse-Fehlercodes (`--mit-fehlern`), Tokenizer in Firn (`lib/html/*.fi`), XML-Anpassung als optionaler Modus (Gegenprobe `--ohne-xml-modus`: 6.807); Geschwindigkeit **2,25×–3,09× (Korpus `html5lib`) bzw. 5,72×–8,31× (Korpus `realweb`, echte Seiten) — Ziel ≤ 2× auf beiden verfehlt** |
 | 4 | Testrunner **und** Debugger | `[~]` JSON-Runner erfüllt (**256/256, rate 1.0**), `.debug_line` in `gdb` belegt; Variablen und „echter Fehler gefunden" fehlen |
 | 5 | Paketverwaltung reproduzierbar | `[~]` Modulsystem vorhanden, **Paketverwaltung nicht** |

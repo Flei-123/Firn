@@ -931,16 +931,19 @@ in diesem Dokument ist Zukunft und wird im README als „noch nicht" geführt.
   (reines Spilling). Korrekt, aber langsam. Echte Registerzuteilung ist `P3`.
 * Testsuite mit ≥ 40 `.fi`-Programmen plus Negativtests.
 
-**Nicht enthalten (Stufe 0), Stand nach Runde 2:** `comptime`, `interface`,
-Fehlerunionen `!T`, `defer`/`drop`, Move-Prüfer, Referenztypen `&T`/`inout T`
-als geprüfte Typen (nur Rohzeiger), Arenen, **`Rc[T]`, `Gc[T]`, der gesamte
-GC**, `gc class` und Vererbung, Abwicklung/`throw`, Gleitkomma als Sprachtyp,
-`u128`, **`secret`/Constant-Time (§9)**, Standardbibliothek, Nebenläufigkeit,
-Paketverwaltung, aarch64, WASM, LLVM-Backend.
-Diese Typkonstruktoren melden einen eigenen Fehler mit Zeile/Spalte statt eines
-Syntaxfehlers (`secret[T]`, `Gc[T]`, `GcWeak[T]`, `Rc[T]`, `Weak[T]`, `Arc[T]`;
-Nachweis: `tests/neg/int_secret_nicht_umgesetzt.fi`,
+**Nicht enthalten (Stufe 0), Stand nach Runde 3:** `comptime`, `interface`,
+`defer`/`drop`, Move-Prüfer, Referenztypen `&T`/`inout T` als geprüfte Typen
+(nur Rohzeiger), Arenen, Abwicklung/`throw`, Gleitkomma als Sprachtyp, `u128`,
+`Arc[T]`, Standardbibliothek, Nebenläufigkeit, Paketverwaltung, aarch64, WASM,
+LLVM-Backend. Nicht umgesetzte Typkonstruktoren melden einen eigenen Fehler mit
+Zeile/Spalte statt eines Syntaxfehlers (`Rc[T]`, `Weak[T]`, `Arc[T]`; Nachweis:
 `tests/neg/int_gc_nicht_umgesetzt.fi`).
+
+**Runde 3 hat aus dieser Liste gestrichen:** Fehlerunionen `E!T` mit `try`/
+`catch` (§14.1.fehler), `secret`/Constant-Time-Primitive (§9, `compiler/src/ct.rs`)
+sowie den **gesamten Opt-in-Tracing-GC**: `gc class` mit Einfachvererbung,
+`Gc[T]`, `GcWeak[T]`, fehlbare Allokation `AllocError!Gc[T]`, `#[no_gc]` und
+`Rc`/`Weak` als reines Firn-Modul (§14.1.gc).
 
 **Runde 2 hat aus dieser Liste gestrichen** (jeweils einzeln in §14.1 belegt):
 Module/Imports und `export` (Punkt 15), Generics per Monomorphisierung
@@ -1131,6 +1134,65 @@ Fehlersuche): `__tag: u32` bei Offset 0, danach die Nutzdaten ab
 `round_up(4, payload_align)`; die Nutzdatenbereiche verschiedener Varianten
 **überlagern** sich, Größe und Ausrichtung ergeben sich aus der größten
 Variante (mindestens 4). Namensschema der Monomorphisierung: `name__T1_T2`.
+
+#### 14.1.gc — Opt-in-Tracing-GC, `gc class`, DOM-Prototyp (Runde 3)
+
+Umgesetzt und mit laufendem Code belegt:
+
+* **`gc class Name [extends Basis] { … }`** mit Präfixlayout — die geerbten
+  Felder liegen vorn, deshalb ist die Aufwärtsumwandlung `Gc[Element]` →
+  `Gc[Node]` kostenlos. Abwärts nur geprüft: `x.as?[Element]` liefert den
+  Nullwert, wenn der Typ nicht passt.
+* **`Gc[T]`** als erstklassiger starker Zeiger (Feldzugriff ohne
+  `(*p).feld`), **`GcWeak[T]`** als schwacher Verweis mit `weak(g)`/`stark(w)`,
+  Nullwerte `gc_null[T]()`/`weak_null[T]()`.
+* **Allokation ist fehlbar**: `gc C{…}` hat den Typ `AllocError!Gc[C]`
+  (DESIGNZIELE §2). Bei erschöpftem Heap wird **erst gesammelt, dann
+  gescheitert** — nachgewiesen in `tests/535_gc_fehlbare_allokation.fi` mit
+  einer Obergrenze von 256 KiB.
+* **Mark-Sweep**, anhaltend, Sammlung nur an Allokationsstellen und bei
+  `gc_collect()`. **Präzise** Heap-Verfolgung über eine compilergenerierte
+  Typtabelle (Feldoffsets je Klasse, getrennt nach stark und schwach),
+  **konservativer** Scan von Stapel **und** Registern. Kein Kompaktieren,
+  Größenklassen-Allokator, `mmap` ohne feste Adresse.
+* **Einfügebarriere** beim Schreiben eines `Gc`-Zeigers in ein Feld
+  (`gc_barriers()` zählt sie mit).
+* **`#[no_gc]`** transitiv geprüft: verboten sind GC-Allokation, Aufruf einer
+  nicht markierten Funktion und das Schreiben in ein `Gc`/`GcWeak`-Feld. Der
+  HTML5-Tokenizer in `lib/html/` ist so markiert.
+* **Messwerte zur Laufzeit**: `gc_collections`, `gc_live_objects`,
+  `gc_live_bytes`, `gc_heap_bytes`, `gc_pause_ns_last/max/total`,
+  `gc_barriers`, `gc_set_max_bytes`.
+* **`Rc[T]`/`Weak[T]`** als reines Firn-Modul (`tests/modules/rc.fi`), immer
+  unveränderlich, fehlbare Allokation, `#[must_consume]`. Zyklen lecken dort
+  **absichtlich** und werden sichtbar gemacht (`tests/552_rc_zyklus_leck.fi`),
+  statt sie wegzuerklären.
+
+**Belegt am DOM** (`lib/dom/dom.fi`, `tests/560_dom_zyklen.fi`,
+`tools/dom_soak/run.sh`): sechs Zyklenarten — Eltern↔Kind beide stark,
+`Element extends Node` mit Attributen, Knoten↔Listener, Sammlung→Wurzel,
+Observer über `GcWeak`, Knoten↔JS-Wrapper. Dauerlauf **100.000.000
+Zyklensätze = 700.000.000 Objekte bei konstant 1.364 KiB RSS**; die
+Zählverweis-Gegenprobe mit identischem Graphen braucht nach 2.000.000 Zyklen
+**750.080 KiB**. Bericht: `docs/berichte/dom.md`.
+
+**Ehrliche Grenzen dieser Umsetzung:**
+
+* **Keine Finalisierer**, **kein inkrementelles Sammeln**, keine `GcVec`/`GcMap`,
+  kein `virtual`. Die längste gemessene Pause ist **3,54 ms** — für einen
+  Browser mit 16-ms-Bildabstand bereits zu viel.
+* **Ein Faden.** Der Zustandsblock ist fadenlokal gedacht; Stufe 0 hat nur einen.
+* **Der konservative Scan hat einen Preis, der sich messen lässt:** eine alte
+  Zeigerkopie in einem **lebenden** Stapelrahmen hält ihr Objekt am Leben. Wer
+  einen Sammellauf im selben Rumpf prüft, in dem er das Objekt erzeugt hat,
+  misst deshalb nicht, was er zu messen glaubt. Die Laufzeit überschreibt den
+  toten Stapelbereich unter dem eigenen Rahmen (`__gc_scrub_tief`); für den
+  lebenden Rahmen gibt es keine Abhilfe außer präzisen Stapelkarten.
+* **`Gc[modul.Klasse]` ist nicht schreibbar** — ein `gc class` aus einem anderen
+  Modul kann in einer Typangabe nicht benannt werden. Wurzelprogramme reichen
+  deshalb nur Zahlen über die Modulgrenze (siehe `lib/dom/soak_gc.fi`).
+* **Fragmentierung** bei wechselnden Objektgrößen ist ungeprüft; der Dauerlauf
+  benutzt immer denselben Satz.
 
 #### 14.1.str — Zeichenketten und Zahlen ↔ Text (Runde 2, Modul `str`)
 
