@@ -13,6 +13,7 @@ mod diag;
 mod dwarf;
 mod fir;
 mod inline;
+mod layout;
 mod lexer;
 mod lower;
 mod lower_match;

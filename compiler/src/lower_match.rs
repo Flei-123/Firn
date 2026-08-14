@@ -92,7 +92,8 @@ pub(crate) fn write_ctor_into(
             Some(o) => *o,
             None => return lo.ice(a.span, "nutzdatenfeld ohne offset"),
         };
-        let ad = lo.ptradd_const(addr, off);
+        // Schicht Feldzugriff <-> Speicherort (layout.rs, DESIGNZIELE 8)
+        let ad = lo.field_addr_at(addr, off);
         lo.write_into(ad, a)?;
     }
     Some(())
@@ -349,7 +350,8 @@ fn emit_tests(
                     Some(t) => t.clone(),
                     None => return lo.ice(*span, "nutzdatenfeld ohne typ"),
                 };
-                let addr = lo.ptradd_const(base_addr, off);
+                // Schicht Feldzugriff <-> Speicherort (layout.rs)
+                let addr = lo.field_addr_at(base_addr, off);
                 emit_sub_test(lo, addr, sub, &fty, fail)?;
             }
             Some(())
@@ -438,7 +440,8 @@ fn emit_sub_test(
                     Some(t) => t.clone(),
                     None => return lo.ice(*span, "nutzdatenfeld ohne typ"),
                 };
-                let sa = lo.ptradd_const(addr, off);
+                // Schicht Feldzugriff <-> Speicherort (layout.rs)
+                let sa = lo.field_addr_at(addr, off);
                 emit_sub_test(lo, sa, sub, &ft, fail)?;
             }
             Some(())
@@ -475,7 +478,8 @@ fn bind_pattern(lo: &mut Lower, addr: Val, pat: &Pattern, ty: &Type, def: Option
                     Some(t) => t.clone(),
                     None => continue,
                 };
-                let sa = lo.ptradd_const(addr, off);
+                // Schicht Feldzugriff <-> Speicherort (layout.rs)
+                let sa = lo.field_addr_at(addr, off);
                 bind_pattern(lo, sa, sub, &ft, None);
             }
         }

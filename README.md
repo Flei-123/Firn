@@ -319,6 +319,7 @@ Von den neun Zielen dieser Runde sind **1–5 und 9 umgesetzt und gemessen**;
 RUN.md                   wie man alles baut, startet und nachmisst
 SPEC.md, ROADMAP.md      Sprachspezifikation und Fahrplan (Vertrag)
 tools/baustufen/         misst dev / dev-fast / release gegeneinander
+tools/schichten/         Architekturwaechter: Feldzugriff <-> Speicherort
 tools/ergebnisort/       prueft die Ergebnisort-Garantie am Assembler
 DESIGNZIELE.md           10 Fundamententscheidungen (async-Farben, fehlbare
                          Allokation, Capabilities, ABI, Debug-Bau, In-Place-
@@ -661,3 +662,35 @@ OK: Ergebnisort-Garantie gehalten (baue 224 B, main 1048816 B, keine Bulk-Kopie)
 ```
 
 Die Struktur ist 1 MB groß; `baue` hat trotzdem nur 224 Byte Rahmen.
+
+## Architekturschicht: Feldzugriff ≠ Speicherort (DESIGNZIELE.md §8)
+
+`a.b` bedeutet in Firn **nicht** fest „Basisadresse plus Versatz". Jeder Feld-
+und Elementzugriff des Lowerings geht durch `compiler/src/layout.rs`:
+
+| Zugang | wofür |
+|---|---|
+| `field_addr(base, sidx, name, span)` | benanntes Struct-Feld |
+| `field_addr_at(base, offset)` | bekannter Versatz (Nutzdaten einer `enum`-Variante) |
+| `elem_addr_const(base, esz, i)` | Element mit konstantem Index (Literale) |
+| `elem_addr(base, esz, i, ty)` | Element mit berechnetem Index |
+
+Grund: Die geplante SoA-Anordnung (`SoaVec[T]`, für Rasterizer und Layout-Baum)
+hat den zusammenhängenden Wert physisch gar nicht — dort ist die Adresse
+`spalte_f + i · größe(f)`. Eine zweite Anordnung einzuführen heißt jetzt, **in
+diesem einen Modul** eine Fallunterscheidung zu ergänzen, statt dreißig
+Aufrufstellen zu suchen.
+
+Die Regel wird **erzwungen**, nicht nur aufgeschrieben:
+
+```
+$ bash tools/schichten/run.sh
+OK: Feldzugriff und Speicherort getrennt (4 Zugaenge in layout.rs, keine Umgehung).
+```
+
+Der Wächter läuft als Abschnitt 7 in `test.sh` und prüft, dass `Op::PtrAdd`
+außerhalb von `layout.rs` nur in der einen Hilfsfunktion `ptradd_const` gebaut
+wird, dass deren direkte Aufrufe ausschließlich als `// ABI-Wortkopie`
+gekennzeichnete Aggregatübergaben sind, und dass im Lowering kein Feld-Versatz
+mehr von Hand in eine Adresse gerechnet wird. Eine absichtlich eingebaute
+Verletzung wird mit Datei und Zeile gemeldet (gegengeprüft).
