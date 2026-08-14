@@ -346,6 +346,13 @@ impl Func {
         v
     }
 
+    /// Neuer Wert ohne Instruktion — nur fuer Modultests, die einen Rumpf von
+    /// Hand aufbauen (`licm.rs`, `regalloc.rs`).
+    #[cfg(test)]
+    pub fn new_val_pub(&mut self, ty: FTy) -> Val {
+        self.new_val(ty)
+    }
+
     /// Haengt eine wertliefernde Instruktion an das Ende von `b` an.
     pub fn push(&mut self, b: BlockId, ty: FTy, op: Op) -> Val {
         let v = self.new_val(ty);

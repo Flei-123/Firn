@@ -198,6 +198,36 @@ for FILE in tests/opt/*.fi; do
     fi
 done
 
+# ------------------------------------------------------------------ (g) ---
+# LICM: schleifeninvariante Rechnung wandert in den Vorkopf. Der Nachweis
+# vergleicht ZWEI Bloecke desselben FIR-Dumps — die Instruktion verschwindet
+# nicht, sie zieht um. Eine reine Zaehlung ueber die ganze Funktion wuerde das
+# gar nicht bemerken.
+echo "== LICM: schleifeninvariante Rechnung im Vorkopf =="
+LIC="$WORK/licm_hoist.opt.fir"
+"$FIRNC" --emit=fir-opt tests/opt/licm_hoist.fi > "$LIC"
+RAW="$WORK/licm_hoist.raw.fir"
+"$FIRNC" --emit=fir-raw tests/opt/licm_hoist.fi > "$RAW"
+rumpf_roh=$(awk '/^bb2:/{f=1;next} /^bb3:/{f=0} f' "$RAW" | grep -c 'mul\.u64' || true)
+rumpf_opt=$(awk '/^bb2:/{f=1;next} /^bb3:/{f=0} f' "$LIC" | grep -c 'mul\.u64' || true)
+vorkopf_opt=$(awk '/^bb0:/{f=1;next} /^bb1:/{f=0} f' "$LIC" | grep -c 'mul\.u64' || true)
+if [ "$rumpf_roh" -ge 1 ]; then
+    ok "licm: unoptimiert steht die Multiplikation im Schleifenrumpf ($rumpf_roh)"
+else
+    bad "licm: der Testfall hat unoptimiert gar keine Multiplikation im Rumpf"
+fi
+if [ "$rumpf_opt" -eq 0 ]; then
+    ok "licm: nach der Optimierung steht keine mehr im Rumpf"
+else
+    bad "licm: es steht noch eine Multiplikation im Schleifenrumpf ($rumpf_opt)"
+    awk '/^bb2:/{f=1;next} /^bb3:/{f=0} f' "$LIC" | sed 's/^/        /'
+fi
+if [ "$vorkopf_opt" -ge 1 ]; then
+    ok "licm: sie steht jetzt im Vorkopf ($vorkopf_opt)"
+else
+    bad "licm: im Vorkopf ist keine Multiplikation angekommen"
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then
