@@ -118,9 +118,45 @@ impl<'a> Checker<'a> {
         self.check_profile(prog);
         // HOOK types: Aufzaehlungsnamen anmelden (sema_match.rs)
         crate::sema_match::declare_enums(self);
+        self.add_items_inner(prog, true);
+        // Ganzprogramm-Pruefung: laeuft genau einmal, nicht je Nachtrag.
+        self.check_main(prog);
+    }
+
+    /// **Wiedereintritt in die Pruefphasen** (DESIGNZIELE.md §7, Fundamentpunkt
+    /// aus §10.4).
+    ///
+    /// Prueft ZUSAETZLICHE Deklarationen mit dem bereits aufgebauten Zustand —
+    /// dieselbe Namenstabelle, dieselbe Typtabelle, dieselben Diagnosen. Damit
+    /// ist die Frage „kann der Compiler eine gerade erst entstandene Funktion
+    /// noch pruefen?" mit **ja** beantwortet.
+    ///
+    /// Gebraucht wird das von `comptime`/`emit` (SPEC §6.4): dort entstehen
+    /// Elemente *waehrend* der Uebersetzung — Web-IDL-Bindungen,
+    /// CSS-Eigenschaftstabellen, Unicode-Tabellen. Ein Typpruefer, der als
+    /// einmaliger Durchlauf ueber einen festen AST gebaut ist, kann das
+    /// nachtraeglich nicht mehr lernen; deshalb sitzt die Faehigkeit hier, bevor
+    /// es einen Erzeuger dafuer gibt.
+    ///
+    /// **Ehrlicher Umfang:** Nachtraege duerfen Structs, Funktionen und
+    /// Konstanten enthalten. Aufzaehlungen werden nur im ersten Durchlauf
+    /// ausgelegt (`layout_enums`), weil ihre Anmeldung im Parser passiert;
+    /// nachtraeglich erzeugte `enum`s kommen mit `comptime` selbst.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn add_items(&mut self, prog: &Program) {
+        self.add_items_inner(prog, false);
+    }
+
+    fn add_items_inner(&mut self, prog: &Program, layout_enums: bool) {
+        // Nachtraege bringen eigene Ausdrucks-Ids mit; die Tabelle waechst mit.
+        if prog.expr_count as usize > self.expr_types.len() {
+            self.expr_types.resize(prog.expr_count as usize, Type::Error);
+        }
         self.collect_structs(prog);
-        // HOOK types: Aufzaehlungen auslegen (sema_match.rs)
-        crate::sema_match::layout_enums(self, prog);
+        if layout_enums {
+            // HOOK types: Aufzaehlungen auslegen (sema_match.rs)
+            crate::sema_match::layout_enums(self, prog);
+        }
         self.collect_fns(prog);
         // Attribute pruefen und anwenden (attrs.rs)
         self.check_attrs(prog);
@@ -128,7 +164,6 @@ impl<'a> Checker<'a> {
         for f in &prog.funcs {
             self.check_fn(f);
         }
-        self.check_main(prog);
     }
 
     /// Wird hier ein Wert weggeworfen, der nicht weggeworfen werden darf?
@@ -1838,6 +1873,135 @@ mod tests {
         fn id(&mut self, n: &str) -> Expr {
             self.e(ExprKind::Ident(n.to_string()))
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Wiedereintritt in die Pruefphasen (DESIGNZIELE.md §7)
+    // ------------------------------------------------------------------
+
+    /// Baut einen Pruefer im Zustand *nach* dem ersten Durchlauf.
+    fn checker_nach_erstem_lauf<'d>(
+        dg: &'d mut Diags,
+        erstes: &Program,
+    ) -> Checker<'d> {
+        let mut ck = Checker {
+            dg,
+            tcx: TypeCtx::new(),
+            fns: HashMap::new(),
+            consts: HashMap::new(),
+            expr_types: vec![Type::Error; erstes.expr_count as usize],
+            scopes: Vec::new(),
+            ret: Type::Void,
+            depth: 0,
+            must_consume_fns: HashSet::new(),
+        };
+        ck.run(erstes);
+        ck
+    }
+
+    #[test]
+    fn pruefphasen_nehmen_nachtraeglich_erzeugte_elemente_an() {
+        // Erster Durchlauf: nur `main` und `basis`.
+        let mut b = B::new();
+        let ret_basis = b.int(7);
+        let basis = FnDecl {
+            name: "basis".to_string(),
+            params: Vec::new(),
+            ret: Some(named("i32")),
+            body: blk(vec![Stmt::Return { value: Some(ret_basis), span: sp() }]),
+            span: sp(),
+            attrs: Vec::new(),
+        };
+        let ret_main = b.int(0);
+        let erstes = Program {
+            funcs: vec![basis, main_fn(vec![Stmt::Return { value: Some(ret_main), span: sp() }])],
+            expr_count: b.next,
+            ..Default::default()
+        };
+
+        let mut dg = Diags::new("test.fi", "");
+        let mut ck = checker_nach_erstem_lauf(&mut dg, &erstes);
+        assert!(!ck.dg.has_errors(), "erster Durchlauf muss fehlerfrei sein");
+        assert!(ck.fns.contains_key("basis"));
+        assert!(!ck.fns.contains_key("spaeter"));
+
+        // Zweiter Durchlauf: eine Funktion, die es beim ersten Mal noch nicht
+        // gab und die auf eine Funktion des ersten Durchlaufs zugreift.
+        // Genau das muss `comptime emit` spaeter tun.
+        let ruf = b.e(ExprKind::Call("basis".to_string(), Vec::new(), sp()));
+        let nachtrag = Program {
+            funcs: vec![FnDecl {
+                name: "spaeter".to_string(),
+                params: Vec::new(),
+                ret: Some(named("i32")),
+                body: blk(vec![Stmt::Return { value: Some(ruf), span: sp() }]),
+                span: sp(),
+                attrs: Vec::new(),
+            }],
+            expr_count: b.next,
+            ..Default::default()
+        };
+        ck.add_items(&nachtrag);
+
+        assert!(!ck.dg.has_errors(), "Nachtrag muss fehlerfrei durchlaufen");
+        assert!(ck.fns.contains_key("spaeter"), "die neue Funktion fehlt");
+        // Der Aufruf hat wirklich einen Typ bekommen — die Tabelle ist mitgewachsen.
+        assert_eq!(ck.expr_types.len(), b.next as usize);
+        assert_eq!(ck.fns["spaeter"].ret, Type::I32);
+    }
+
+    #[test]
+    fn nachtrag_wird_genauso_streng_geprueft() {
+        let mut b = B::new();
+        let ret_main = b.int(0);
+        let erstes = Program {
+            funcs: vec![main_fn(vec![Stmt::Return { value: Some(ret_main), span: sp() }])],
+            expr_count: b.next,
+            ..Default::default()
+        };
+        let mut dg = Diags::new("test.fi", "");
+        let mut ck = checker_nach_erstem_lauf(&mut dg, &erstes);
+        assert!(!ck.dg.has_errors());
+
+        // Nachtrag ruft etwas auf, das es nicht gibt -> derselbe Fehler wie im
+        // ersten Durchlauf. Ein Nachtrag darf keine Hintertuer sein.
+        let ruf = b.e(ExprKind::Call("gibt_es_nicht".to_string(), Vec::new(), sp()));
+        let nachtrag = Program {
+            funcs: vec![FnDecl {
+                name: "kaputt".to_string(),
+                params: Vec::new(),
+                ret: Some(named("i32")),
+                body: blk(vec![Stmt::Return { value: Some(ruf), span: sp() }]),
+                span: sp(),
+                attrs: Vec::new(),
+            }],
+            expr_count: b.next,
+            ..Default::default()
+        };
+        ck.add_items(&nachtrag);
+        assert!(ck.dg.has_errors(), "unbekannter Name im Nachtrag muss auffallen");
+    }
+
+    #[test]
+    fn nachtrag_meldet_doppelte_deklaration() {
+        let mut b = B::new();
+        let ret_main = b.int(0);
+        let erstes = Program {
+            funcs: vec![main_fn(vec![Stmt::Return { value: Some(ret_main), span: sp() }])],
+            expr_count: b.next,
+            ..Default::default()
+        };
+        let mut dg = Diags::new("test.fi", "");
+        let mut ck = checker_nach_erstem_lauf(&mut dg, &erstes);
+
+        let ret2 = b.int(1);
+        let nachtrag = Program {
+            funcs: vec![main_fn(vec![Stmt::Return { value: Some(ret2), span: sp() }])],
+            expr_count: b.next,
+            ..Default::default()
+        };
+        ck.add_items(&nachtrag);
+        assert!(ck.dg.has_errors(), "'main' zweimal muss ein Fehler sein");
     }
 
     fn named(n: &str) -> TypeExpr {

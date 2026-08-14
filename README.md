@@ -779,3 +779,23 @@ OK: Symbolschema gehalten (_F0.-Praefix, 'main' nackt, Module kollisionsfrei).
 
 Der Nachweis baut ein Programm aus zwei Modulen, die beide eine Funktion `hilf`
 enthalten, führt es aus und prüft an der echten Symboltabelle (`nm`).
+
+## Wiedereintritt in die Prüfphasen (DESIGNZIELE.md §7)
+
+`Checker::add_items` prüft **zusätzliche** Deklarationen mit dem bereits
+aufgebauten Zustand — dieselbe Namenstabelle, dieselbe Typtabelle, dieselben
+Diagnosen. Die Ausdruckstypen-Tabelle wächst mit; die Ganzprogramm-Prüfung
+(`main` vorhanden und richtig) läuft weiterhin genau einmal.
+
+Gebraucht wird das von `comptime`/`emit`: dort entstehen Elemente *während* der
+Übersetzung — Web-IDL-Bindungen, CSS-Tabellen, Unicode-Daten. Ein Typprüfer, der
+als einmaliger Durchlauf über einen festen AST gebaut ist, kann das nachträglich
+nicht mehr lernen. Deshalb sitzt die Fähigkeit da, bevor es einen Erzeuger gibt —
+und ist mit drei Tests belegt statt behauptet:
+
+* eine erst später entstandene Funktion ruft eine aus dem ersten Durchlauf auf
+  und wird korrekt getypt
+* ein Nachtrag mit unbekanntem Namen liefert **denselben** Fehler wie im ersten
+  Durchlauf — ein Nachtrag ist keine Hintertür
+* ein Nachtrag, der `main` erneut deklariert, wird als doppelte Deklaration
+  erkannt
