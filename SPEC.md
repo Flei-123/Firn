@@ -4,6 +4,14 @@
 **Autor:** Justin (GitHub: Flei123) · **Zielsysteme:** Karstos / karst-Kernel **und
 die Karstos-Browser-Engine**, x86_64
 
+> **Ergänzendes Dokument.** `DESIGNZIELE.md` behandelt zehn bekannte
+> Schwachstellen heutiger Sprachen (Funktionsfarben, fehlbare Allokation,
+> Capability-Module, stabiles ABI, Debug-Bau-Geschwindigkeit,
+> In-Place-Initialisierung, comptime/Reflexion, Datenlayout/SoA, Hot Reload) und
+> trennt, was **jetzt** ins Fundament muss von dem, was nachrüstbar ist. Wo es
+> dieser Spezifikation widerspricht, gewinnt `DESIGNZIELE.md` und §7 bzw. §15
+> werden korrigiert — das ist bereits geschehen.
+
 > **Umbenennbarkeit.** Sprachname und Dateiendung stehen an *genau einer* Stelle im
 > Compiler: `compiler/src/config.rs` (`LANG_NAME`, `FILE_EXT`, `LANG_NAME_LOWER`).
 > Jede Fehlermeldung, jeder Hilfetext und jede Dateisuche liest von dort. Ein
@@ -350,7 +358,7 @@ sieht nie eine Vtable.
 | Implizite Umwandlungen (auch verlustfreie) | `u8 → u32` schreibt man `as u32` |
 | Ausnahmen als *normaler* Fehlerweg | `L7`: Parser erzeugen dauernd erwartbare Fehler; Ausnahmen dafür sind Gift für die Geschwindigkeit. §5.3 ist die eng gezogene Ausnahme für JS |
 | Makros mit eigener Syntax | `comptime` und Bauskripte reichen (`FIRN-ANFORDERUNGEN.md` §11: „kein turingvollständiges Makrosystem") |
-| `async`/`await` in der Sprache | §7 |
+| `async`/`await` **als Sprachfarbe** | §7 — ersetzt durch `Io` als Parameter (`DESIGNZIELE.md` §1) |
 | Überladen von Funktionsnamen | erschwert Fehlermeldungen und Selbst-Hosting |
 | Automatische Dereferenzierung | `p.*.feld`, nicht `p.feld`. Ausnahme: `Gc[T]` wird automatisch dereferenziert, weil `node.*.children.*` unlesbar wäre — das ist bewusst und steht hier |
 | Vorprozessor | `comptime if` ersetzt `#ifdef` |
@@ -494,11 +502,19 @@ HTML-Entities, Unicode-Tabellen aus der UCD, CLDR-Daten.
   deshalb auf Arena-Daten und `Arc[T]`-Stilwerten, nicht auf DOM-Knoten. Diese
   Einschränkung ist eine Folge der GC-Entscheidung und steht hier, damit sie
   beim Layout-Entwurf bekannt ist, nicht erst beim Debuggen.
-* **Kein `async`/`await` im Compiler.** Zustandsmaschinen-Transformation zieht
-  eine Laufzeit in die Sprache. Stattdessen Fäden/Tasks als Bibliothek und eine
-  Ereignisschleife; `N6` bleibt damit auf **SOLL**-Niveau bewusst unerfüllt.
-  Wird das für `Promise` und Generatoren zu unbequem, ist das der erste
-  Kandidat für eine Revision — dann aber begründet und hier dokumentiert.
+* **Kein `async`/`await` als Sprachfarbe** (revidiert 14.08.2026, ausführlich
+  begründet in `DESIGNZIELE.md` §1). Eine `async`-Markierung färbt jeden
+  Aufrufer und zerreißt das Ökosystem — in Rust gibt es deshalb zwei
+  inkompatible E/A-Welten. Firn übernimmt stattdessen **Zigs Modell aus 0.16**:
+  **`Io` wird als Parameter übergeben**, genau wie der `Allocator`.
+  `io.async(f, …)` drückt *Unabhängigkeit* aus und ist unfehlbar;
+  `io.concurrent(…)` fordert echte Gleichzeitigkeit und darf scheitern.
+  `Future[T]` ist `#[must_consume]`, Abbruch (`cancel`) gehört zum Vertrag.
+  Damit ist `N6` **erfüllt, ohne den Compiler anzufassen** — es gibt keine
+  Zustandsmaschinen-Transformation und kein `async`-Schlüsselwort. Umsetzung:
+  `Io.Threaded`, `Io.SingleThread` (deterministisch, erfüllt `N7`), später
+  `Io.Evented` mit stapelvollen Koroutinen. Preis: ein Stapel je Koroutine, und
+  `Io` muss durchgereicht werden.
 * **Strukturierte Nebenläufigkeit** als Bibliotheksmuster über `#[must_consume]`.
 * **Deterministischer Einzelfadenmodus** für reproduzierbare Reftests (`N7`).
 
@@ -1132,9 +1148,9 @@ O6. **Inlining ueber Modulgrenzen** ergibt sich daraus, dass das Modulsystem
    einen kompaktierenden Sammler dauerhaft aus. Wenn Fragmentierung im
    Dauerlauf zum Problem wird, ist das die Stelle, an der nachgebessert werden
    muss — und es wird teuer. Entscheidung vertagt bis nach dem 24-h-Test.
-2. **`async`/Koroutinen** (`N6`, SOLL). Zurzeit bewusst nicht in der Sprache.
-   Wenn `Promise` und Generatoren in der JS-Engine ohne sie zu unbequem werden,
-   ist das der erste Revisionskandidat.
+2. ~~**`async`/Koroutinen**~~ — **entschieden am 14.08.2026**: `Io` als
+   Parameter statt Sprachfarbe (§7, `DESIGNZIELE.md` §1). Offen bleibt nur die
+   Größe der Koroutinen-Stapel und ob sie wachsen dürfen.
 3. **Seile** (`Z3`, SOLL) — ab wann lohnt der Aufwand?
 4. **SIMD** (`L16`, SOLL) — als eingebaute Vektortypen oder nur über
    Inline-Assembler?

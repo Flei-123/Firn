@@ -1,6 +1,6 @@
 # Firn — Fahrplan
 
-**Stand:** 2026-08-13 (v0.2) · **Bezug:** `SPEC.md`, `ABNAHME.md`,
+**Stand:** 2026-08-14 (v0.2) · **Bezug:** `SPEC.md`, `DESIGNZIELE.md`, `ABNAHME.md`,
 `../karstos-browser/FIRN-ANFORDERUNGEN.md`, `../karstos-browser/PLAN-FIRN.md`
 Zeitangaben = Arbeitsaufwand einer Person mit KI-Unterstützung, nicht Kalenderzeit.
 
@@ -23,6 +23,28 @@ Karstos-Browser-Engine ist Firn) **kritischer Pfad Nummer 1** des gesamten
 HTML5-Tokenizer (100 % html5lib, ≤ 2× Referenz) und DOM-Prototyp mit Zyklen
 (24 h ohne Speicherwachstum). Fallen sie durch, wird nicht der Browser
 repariert, sondern Firn.
+
+---
+
+## Fundamentarbeit aus DESIGNZIELE.md (neu, 14.08.2026)
+
+`DESIGNZIELE.md` prüft zehn bekannte Schwachstellen heutiger Sprachen und trennt,
+was **jetzt** ins Fundament muss (später unmöglich) von dem, was **additiv**
+nachrüstbar ist. Sechs Punkte betreffen den Compiler direkt und sind unten in die
+Phasen eingearbeitet:
+
+| Fundamentpunkt | Warum jetzt | Phase |
+|---|---|---|
+| **Kein `async`-Schlüsselwort**, Codegen ohne Annahme über Stapelstetigkeit | Farbe wäre später nicht mehr zu entfernen; `Io` als Parameter braucht Stapelwechsel | 2 (Regel), 3–4 (Umsetzung) |
+| **`!T` + `#[must_consume]`**, Regel „jede Allokation ist fehlbar" | Rust-for-Linux belegt: nicht nachrüstbar | 2 → 3 |
+| **Ergebnisort-Operand in FIR und Lowering** | Teuerste Fundamentarbeit — jetzt hat das Lowering ~2.000 Zeilen, später 20.000 | **2** |
+| **Feldzugriff vom Speicherort trennen** (Vorbedingung für SoA) | Solange `a.b` fest „Basis + Versatz" heißt, ist SoA tot | 2/3 |
+| **Optimierungsdurchgänge einzeln schaltbar, mit Etikett „debugerhaltend"** | sonst ist die `--dev-fast`-Stufe später ein Umbau jedes Durchgangs | 2 → 3 |
+| **Prüfphasen wiedereintrittsfähig**, FIR interpretierbar | Vorbedingung für `comptime`/`emit` | 2 → 3 |
+
+Nachrüstbar und deshalb **nicht** eingeplant: stabiles ABI (nur ein
+Symbol-Namensschema als Vorleistung in Phase 3), Hot Reload (kein Termin, siehe
+`DESIGNZIELE.md` §9 — die ehrliche Einschätzung lautet: lohnt sich nicht).
 
 ---
 
@@ -83,6 +105,19 @@ Was der Browser vom *Sprachkern* verlangt, ohne Laufzeit und ohne Bibliothek.
 * **Härtetest 1**: HTML5-Tokenizer gegen html5lib
 * **Härtetest 2**: DOM-Prototyp mit Zyklen im Dauerlauf
 * Testrunner mit maschinenlesbarer Ausgabe (`W2`)
+* **Fundamentarbeit aus `DESIGNZIELE.md`** — vor allem anderen:
+  * **Ergebnisort** (`DESIGNZIELE.md` §6): Aggregatrückgabe schreibt direkt ans
+    Ziel, Zielort-Operand in FIR. Zuerst prüfen, was `compiler/src/abi.rs` heute
+    tut
+  * **Feldzugriff ↔ Speicherort trennen** (§8): Zwischenschicht im Lowering
+    statt fest verdrahtetem „Basis + Versatz"
+  * **Durchgangsregister** (§5): jeder Optimierungsdurchgang bekommt Name,
+    Schalter und Etikett *debugerhaltend ja/nein*; Zeileninfo überlebt jeden
+    Durchgang
+  * **Prüfphasen wiedereintrittsfähig** (§7): „prüfe diese neu entstandene
+    Funktion" muss möglich sein
+  * **Regel festschreiben**: kein `async`-Schlüsselwort, keine unfehlbare
+    Allokationsfunktion, keine Ambient-Autorität in der Bibliothek
 * **Aufwand:** Monate, nicht Wochen. Das ist der eigentliche Brocken.
 
 **Zwischenstand 13.08.2026 (Runde 2 zusammengeführt), ehrlich:**
@@ -118,6 +153,22 @@ Zahlen und Befehle stehen in `ABNAHME.md`, die Reproduktion in `RUN.md`.
 * **DWARF-Grundlagen + Debugger** (`W3`) — ohne ihn wird jede folgende Aufgabe
   dreimal so lang
 * **Stufe 1 beginnt:** Lexer und Parser werden in Firn neu geschrieben
+* Aus `DESIGNZIELE.md`:
+  * **`Io` als Parameter** statt `async` (§1): `Io`-Schnittstelle, `Future[T]`
+    als `#[must_consume]`, `io.async`/`io.concurrent`, `Io.Threaded` und
+    `Io.SingleThread` (letzteres erfüllt `N7`)
+  * **Fehlbare Allokation durchgängig** (§2): `Allocator` als Parameter,
+    `try v.push(inout a, x)`, `reserve` + `push_within_capacity` für heiße Pfade
+  * **Capability-Deklaration in `firn.toml`** (§3) + Bauskript-Sandbox ohne Netz
+  * **Symbol-Namensschema mit Versionsplatz** (§4) — billige Vorleistung für ein
+    späteres stabiles ABI
+  * **Vier Baustufen** `--dev` / `--dev-fast` / `--release-safe` /
+    `--release-fast` (§5); Ziel für `--dev-fast`: höchstens 2–3× langsamer als
+    Release, nicht 30×
+  * **`init`-Ausdruck** mit Teilaufräumung, `#[no_move]` (§6)
+  * **`comptime`-Interpreter über FIR + `reflect.*` + `emit`** (§7) — Vorbedingung
+    für Abnahmepunkt 6 (UCD-Tabelle) und jede Web-IDL-Bindung
+  * **`SoaVec[T]` / `#[layout(soa)]`**, `#[bitfeld]`, `#[klein(N)]` (§8)
 * **Aufwand:** 3–6 Monate
 
 ## Phase 4 — v0.4/0.5: Selbst-Hosting
@@ -128,6 +179,9 @@ Zahlen und Befehle stehen in `ABNAHME.md`, die Reproduktion in `RUN.md`.
 * **Abwicklung/`throw`** (`L8`) mit Tabellen in zwei Phasen
 * Inkrementeller GC mit Dreifarbenmarkierung (`S5`), Pausenzeiten messbar (`S6`)
 * Profiler mit Flamegraphs (`W4`), Fuzzing-Anbindung (`W5`)
+* `Io.Evented` mit stapelvollen Koroutinen (`DESIGNZIELE.md` §1)
+* Hot Reload **Stufe B** — Daten neu laden statt Code (§9); kostenlos,
+  löst geschätzt 80 % des Iterationsbedarfs ohne jede Sprachänderung
 * **Aufwand:** 6–12 Monate · **Ab hier ist Firn eine echte Sprache**
 
 ## Phase 5 — Abnahme nach `FIRN-ANFORDERUNGEN.md` §13
@@ -161,6 +215,13 @@ Block 1 starten. **Das ist das eigentliche Ziel dieses Fahrplans.**
 * **WASM-Backend** — für den Browser nicht nötig; „Firn statt JavaScript im
   Browser" bleibt ein Fernziel, blockiert aber nichts
 * **JIT**, dynamische Bibliotheken, C++-Interop — dauerhaft ausgeschlossen
+* **Hot Reload Stufe C** (echter Codeaustausch) — `DESIGNZIELE.md` §9:
+  kollidiert mit statischem Linken (`R5`) und Inlining über Modulgrenzen
+  (`P1`). Ehrliche Einschätzung: lohnt sich nicht. Die Tür bleibt über
+  `#[hot]` offen, mehr nicht
+* **Stabiles ABI** (`#[abi_stable]`, `#[frozen]`) — erst wenn Karstos
+  austauschbare Systemkomponenten braucht, Phase 7/8. IPC ist bis dahin
+  der bessere Weg
 
 ---
 
@@ -183,7 +244,12 @@ Offen benannt, damit es nicht überrascht:
 5. **Drei Baustellen gleichzeitig.** Karstos, Firn *und* der Browser ist viel.
    Firn darf Karstos nicht ausbremsen — deshalb bleibt Rust im Kernel, bis Firn
    nachweislich besser passt.
-6. **Zielkonflikt Optimierer ↔ Krypto.** §9 der Spezifikation löst ihn auf dem
+6. **Verbaute Fundamente.** Wird die Fundamentarbeit aus `DESIGNZIELE.md`
+   §10 übersprungen, sind SoA-Layout, `comptime`-`emit` und die
+   `--dev-fast`-Stufe später nur noch mit einem Umbau des gesamten
+   Lowerings erreichbar. Gegenmittel: Phase 2 damit beginnen, nicht damit
+   enden.
+7. **Zielkonflikt Optimierer ↔ Krypto.** §9 der Spezifikation löst ihn auf dem
    Papier. Ob er in der Umsetzung hält, zeigt erst die Assembler-Inspektion.
 
 ---
@@ -191,5 +257,8 @@ Offen benannt, damit es nicht überrascht:
 ## Nächster konkreter Schritt
 
 Phase 2 abarbeiten, in dieser Reihenfolge (nach `FIRN-ANFORDERUNGEN.md` §12):
-**Speichermodell → Optimierer/Messung → Zeichenketten → Testrunner →
-restlicher Sprachkern.** Constant-Time wird dabei mitgebaut, nicht nachgerüstet.
+**Fundamentarbeit (`DESIGNZIELE.md` §10.4) → Speichermodell → Optimierer/
+Messung → Zeichenketten → Testrunner → restlicher Sprachkern.**
+Constant-Time wird dabei mitgebaut, nicht nachgerüstet. Die Fundamentarbeit
+steht bewusst **vor** allem anderen: sie ist heute billig und später nicht
+mehr bezahlbar.
