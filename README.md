@@ -318,6 +318,8 @@ Von den neun Zielen dieser Runde sind **1–5 und 9 umgesetzt und gemessen**;
 ```
 RUN.md                   wie man alles baut, startet und nachmisst
 SPEC.md, ROADMAP.md      Sprachspezifikation und Fahrplan (Vertrag)
+tools/baustufen/         misst dev / dev-fast / release gegeneinander
+tools/ergebnisort/       prueft die Ergebnisort-Garantie am Assembler
 DESIGNZIELE.md           10 Fundamententscheidungen (async-Farben, fehlbare
                          Allokation, Capabilities, ABI, Debug-Bau, In-Place-
                          Init, comptime/Reflexion, SoA-Layout, Hot Reload)
@@ -608,3 +610,54 @@ Die Rohtabelle schreibt jeder Lauf nach `bench/RESULTS.md`.
 * Bereichsprüfungen kann Stufe 0 gar nicht entfernen, weil sie gar keine
   erzeugt (SPEC §14.1 Punkt 3); der Durchgang entfernt stattdessen beweisbar
   wiederholte Bedingungen (SPEC §14.1.opt O5).
+
+## Baustufen (DESIGNZIELE.md §5)
+
+Statt eines Alles-oder-Nichts-Schalters gibt es vier Stufen. `--list-passes`
+zeigt, welcher Durchgang in welcher Stufe läuft und ob er **debugerhaltend** ist.
+
+```
+firnc --opt-level=dev          # gar keine Optimierung (= --no-opt)
+firnc --opt-level=dev-fast     # nur debugerhaltende Durchgänge
+firnc --opt-level=release-safe # alle Durchgänge
+firnc --opt-level=release-fast # alle Durchgänge (heute identisch zu -safe)
+firnc --no-pass=inline datei.fi
+```
+
+Gemessen mit `bash tools/baustufen/run.sh 3` (Median über sechs Benchmarks):
+
+* **`dev-fast`: 2,06× langsamer als `release-fast`**
+* `dev`: 10,54× langsamer — dieselbe Größenordnung wie Rusts Debug-Builds
+
+Von neun Durchgängen ist genau einer nicht debugerhaltend: `inline`.
+`--release-safe` ist derzeit identisch mit `--release-fast`, weil es noch keine
+Laufzeitprüfungen gibt, die man behalten könnte.
+
+### Ein Fehler, den erst diese Stufe gefunden hat
+
+Der `dev-fast`-Durchlauf über die Testsuite deckte sofort einen echten
+Codegenerator-Fehler auf, den **259 grüne Tests** nicht gefunden hatten:
+`r8` und `r9` sind zugleich Argumentregister 5 und 6 **und** Arbeitsregister der
+Registerzuteilung. Der Prolog setzte sie der Reihe nach um und überschrieb dabei
+die noch ungelesenen Argumente 5 und 6 — `tests/024_six_args.fi` lieferte ohne
+Einbettung **13 statt 21**. Unsichtbar war das, weil die betroffene Funktion in
+den Release-Stufen immer eingebettet wurde.
+
+Behoben durch eine parallele Registerumsetzung (`regalloc.rs:
+parallele_reg_bewegungen`), die Zyklen über `rax` auflöst; dieselbe Fehlerklasse
+bestand an der Aufrufstelle und beim `syscall` und ist dort mitbehoben.
+Regressionstest: `tests/025_argreg_shuffle.fi`.
+
+## Ergebnisort-Garantie (SPEC.md §13.1)
+
+`let g = baue(…)` übergibt die Adresse von `g` an `baue`; ein großes Aggregat
+entsteht **genau einmal**, direkt am Ziel — nicht erst auf dem Stapel der
+erzeugenden Funktion. Nachweis am erzeugten Assembler:
+
+```
+$ bash tools/ergebnisort/run.sh
+Rahmen baue: 224 Byte   Rahmen main: 1048816 Byte   rep-movs: 0
+OK: Ergebnisort-Garantie gehalten (baue 224 B, main 1048816 B, keine Bulk-Kopie).
+```
+
+Die Struktur ist 1 MB groß; `baue` hat trotzdem nur 224 Byte Rahmen.

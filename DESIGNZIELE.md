@@ -556,8 +556,25 @@ kein Gefühl — und es wird als Test gefahren (`gdb`-Sitzung, Werte vergleichen
 * **Prüfungen bleiben an.** `--dev-fast` bleibt dadurch langsamer als
   `--release-fast`; das ist gewollt.
 * **Erwartungsdämpfer:** `--dev-fast` wird nicht Release-Geschwindigkeit
-  erreichen. Ziel ist Faktor **2–3× langsamer als Release**, nicht 30×. Das
-  reicht, um einen Browser oder ein Spiel bedienbar zu debuggen.
+  erreichen. Ziel war Faktor **2–3× langsamer als Release**, nicht 30×.
+
+**Gemessen am 14.08.2026** (`bash tools/baustufen/run.sh 3`, Median über die
+sechs Mikrobenchmarks, AMD EPYC 7571):
+
+| Benchmark | `dev` | `dev-fast` | `release-fast` | dev-fast/rel | dev/rel |
+|---|---:|---:|---:|---:|---:|
+| bubblesort | 1,408 s | 0,261 s | 0,111 s | **2,35×** | 12,67× |
+| bytecount | 5,466 s | 0,926 s | 0,506 s | **1,83×** | 10,80× |
+| fib | 0,147 s | 0,047 s | 0,048 s | **0,98×** | 3,06× |
+| matmul | 2,057 s | 0,302 s | 0,132 s | **2,29×** | 15,61× |
+| sieve | 1,237 s | 0,291 s | 0,120 s | **2,41×** | 10,28× |
+| statemachine | 1,265 s | 0,311 s | 0,238 s | **1,30×** | 5,31× |
+
+**Median `dev-fast`: 2,06× langsamer als `release-fast`** — Ziel erreicht.
+Zum Vergleich: **`dev` liegt bei 10,54×**, also im Bereich von Rusts
+Debug-Builds. Der gesamte Unterschied zwischen 10,5× und 2,1× kommt aus
+Durchgängen, die das Debugbild **nicht** zerstören. Genau das ist die These
+dieses Abschnitts, und sie hält einer Messung stand.
 
 ### Konsequenz für den Compiler HEUTE
 
@@ -566,6 +583,22 @@ kein Gefühl — und es wird als Test gefahren (`gdb`-Sitzung, Werte vergleichen
   festen Kette verdrahtet werden, ist diese Stufe später nicht mehr baubar.
   **Das ist die einzige echte Fundamentanforderung dieses Punktes — und sie
   kostet heute fast nichts.**
+  **Umgesetzt am 14.08.2026** (`compiler/src/opt.rs`): Register `PASSES` mit
+  Name, Bereich, Etikett und Beschreibung; `--list-passes` gibt es aus,
+  `--no-pass=<name>` schaltet einzeln ab, `--opt-level=` wählt die Stufe.
+  Von den neun Durchgängen ist genau einer **nicht** debugerhaltend: `inline`.
+* **Nebenbefund — und das stärkste Argument für diese Stufe:** Der neue
+  `dev-fast`-Durchlauf über die Testsuite hat sofort einen **echten
+  Codegenerator-Fehler** aufgedeckt, den 259 grüne Tests nicht gefunden hatten.
+  `r8`/`r9` sind zugleich Argumentregister 5/6 **und** Arbeitsregister der
+  Zuteilung (`TEMP_REGS`); der Prolog setzte sie der Reihe nach um und zerstörte
+  dabei die noch ungelesenen Argumente 5 und 6. `tests/024_six_args.fi` lieferte
+  ohne Einbettung **13 statt 21**. Sichtbar wurde das nur, weil `--dev-fast`
+  nicht einbettet — mit Einbettung verschwand die fehlerhafte Funktion immer.
+  Behoben durch eine parallele Registerumsetzung
+  (`regalloc.rs: parallele_reg_bewegungen`), die Zyklen über `rax` bricht;
+  dieselbe Fehlerklasse bestand an der Aufrufstelle und beim `syscall` und ist
+  dort mitbehoben. Regressionstest: `tests/025_argreg_shuffle.fi`.
 * **Zeileninformation muss jeden Durchgang überleben.** Firn hat bereits
   `.debug_line` (`docs/DEBUGGER.md`); die Durchgänge müssen die Zuordnung
   mitführen, statt sie zu verlieren. Nachrüsten heißt jeden Durchgang anfassen.
@@ -574,8 +607,12 @@ kein Gefühl — und es wird als Test gefahren (`gdb`-Sitzung, Werte vergleichen
 ### Priorität und Phase
 
 **Fundament: die Durchgangsarchitektur** (einzeln schaltbar, mit Etikett,
-Zeileninfo erhaltend) — **Phase 2/3**, jetzt billig.
-Umsetzung der vier Stufen: **Phase 3**.
+Zeileninfo erhaltend) — **erledigt am 14.08.2026**.
+Die vier Stufen sind als Schalter vorhanden und gemessen. Offen bleibt, die
+verbotenen Durchgänge aus der Liste (aggressives Einbetten, Abrollen,
+Variablenzusammenlegung) überhaupt erst zu bauen — es gibt sie noch nicht. Und
+`--release-safe` ist heute identisch mit `--release-fast`, weil es noch keine
+Laufzeitprüfungen gibt. **Phase 3.**
 
 ---
 
@@ -1066,7 +1103,7 @@ Dingen, die später obendrauf kommen.
 | 2 | **Fehlbare Allokation** | `!T` + `#[must_consume]` im Sprachkern. **Regel: keine unfehlbare Allokationsfunktion, nie** | `Allocator`-Schnittstelle, Sammlungen, fehlbare GC-Allokation | **FUNDAMENT** (unumkehrbar) | 2–3 |
 | 3 | **Capability-Module** | **Regel: keine Ambient-Autorität in der Bibliothek.** Modulsystem muss eine *Paket*grenze kennen | Deklaration in `firn.toml`, Prüfung, Bauskript-Sandbox | **FUNDAMENT** (als Regel) | 3 |
 | 4 | **Stabiles ABI** | Nur ein **Symbol-Namensschema mit Versionsplatz**. `SPEC.md` muss sagen: Standardlayout ist *instabil* | `#[abi_stable]`, `#[frozen]`, resiliente Aufrufe | nachrüstbar | 3 → 7/8 |
-| 5 | **Debug-Bau-Geschwindigkeit** | **Optimierungsdurchgänge einzeln schaltbar + Etikett „debugerhaltend"**. Zeileninfo überlebt jeden Durchgang | vier Baustufen `--dev` … `--release-fast` | **FUNDAMENT** (billig) | 2 → 3 |
+| 5 | **Debug-Bau-Geschwindigkeit** | **erledigt 14.08.2026:** Register `PASSES` mit Etiketten, `--list-passes`, `--no-pass=`, `--opt-level=`; gemessen **2,06×** | die verbotenen Durchgänge existieren noch gar nicht; `--release-safe` = `--release-fast`, solange es keine Laufzeitprüfungen gibt | **FUNDAMENT** ✔ | erledigt / 3 |
 | 6 | **In-Place-Initialisierung** | **Ergebnisort als Garantie festschreiben** — für Aggregatrückgaben bereits umgesetzt (`lower.rs:604`, nachgeprüft), fehlt für Literale und `init` | `init`-Ausdruck mit Teilaufräumung, `#[no_move]` | **FUNDAMENT** (teuer, aber jetzt am billigsten) | 2 → 3 |
 | 7 | **Comptime + Reflexion** | **Prüfphasen wiedereintrittsfähig** (neu erzeugte Elemente nachträglich prüfbar). FIR bleibt interpretierbar | `comptime`-Interpreter, `reflect.*`, `emit`, Bauskripte | **FUNDAMENT** (Architektur) | 2 → 3 |
 | 8 | **Datenlayout / SoA** | **Feldzugriff vom Speicherort trennen** im Lowering. Layoutberechnung an einer Stelle | `SoaVec[T]`, `#[layout(soa)]`, `#[bitfeld]`, `#[klein(N)]` | **FUNDAMENT** (Lowering) | 2/3 → 3/4 |
