@@ -173,6 +173,11 @@ pub enum Op {
     Barrier { val: Val },
     /// `secure_zero(inout buf)`: nullt `size` Bytes ab `addr`. Gilt NIE als tot.
     SecureZero { addr: Val, size: Val },
+    /// Adresse des Zustandsblocks des Sammlers (SPEC §3.5, `gc.rs`).
+    /// `regs = true`: vorher die callee-saved Register in den Block retten —
+    /// erst dadurch ist der KONSERVATIVE Registerscan ehrlich (SPEC §3.5.3).
+    /// Ohne `gc class` im Programm entsteht diese Instruktion nie.
+    GcAddr { regs: bool },
 }
 
 impl Op {
@@ -189,6 +194,9 @@ impl Op {
             | Op::Load { .. }
             | Op::Alloca { .. }
             | Op::Select { .. } => true,
+            // Der Zustandsblock ist immer da; das Retten der Register
+            // schreibt aber Speicher und darf nicht wegfallen.
+            Op::GcAddr { regs } => !*regs,
             Op::Store { .. }
             | Op::Call { .. }
             | Op::Syscall { .. }
@@ -201,7 +209,7 @@ impl Op {
     /// Alle gelesenen Werte.
     pub fn uses(&self, out: &mut Vec<Val>) {
         match self {
-            Op::Const(_) | Op::Alloca { .. } => {}
+            Op::Const(_) | Op::Alloca { .. } | Op::GcAddr { .. } => {}
             Op::Bin(_, a, b) => {
                 out.push(*a);
                 out.push(*b);
@@ -463,6 +471,13 @@ fn fmt_inst(i: &Inst) -> String {
         Op::Select { cond, a, b } => format!("select.{} %{}, %{}, %{}", t, cond, a, b),
         Op::Barrier { val } => format!("barrier.{} %{}", t, val),
         Op::SecureZero { addr, size } => format!("secure_zero %{}, %{}", addr, size),
+        Op::GcAddr { regs } => {
+            if *regs {
+                "gc_state.ptr regs=1".to_string()
+            } else {
+                "gc_state.ptr".to_string()
+            }
+        }
     };
     format!("{}{}", head, body)
 }

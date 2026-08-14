@@ -596,7 +596,7 @@ impl<'a> Lower<'a> {
     /// `dest` ist die Zieladresse, wenn die Funktion ein Aggregat liefert.
     /// Rueckgabe: `Some(Some(v))` = skalarer Wert, `Some(None)` = kein Wert
     /// bzw. Ergebnis liegt in `dest`, `None` = Fehler (bereits gemeldet).
-    fn lower_call(
+    pub(crate) fn lower_call(
         &mut self,
         name: &str,
         args: &[Expr],
@@ -607,6 +607,16 @@ impl<'a> Lower<'a> {
         if crate::ct::is_ct_call(name) && !self.info.fns.contains_key(name) {
             return crate::ct::lower_ct_call(self, name, args, span);
         }
+        // HOOK gc: Allokation `gc C{…}`, Sammler-Intrinsics, `x.as?[C]`
+        // (gc_lower.rs, SPEC 3.5)
+        if let Some(r) = crate::gc_lower::hook_call(self, name, args, dest, span) {
+            return r;
+        }
+        // HOOK gc: `weak`/`stark` sind Laufzeitfunktionen (gc_lower.rs)
+        let name: &str = match crate::gc_lower::echter_name(name) {
+            Some(n) if !self.info.fns.contains_key(name) => n,
+            _ => name,
+        };
         let sig = match self.info.fns.get(name) {
             Some(s) => s.clone(),
             None => return self.ice(span, "unbekannte funktion im lowering"),
@@ -805,7 +815,10 @@ impl<'a> Lower<'a> {
             }
             Stmt::Assign { target, value, .. } => {
                 let addr = self.lower_addr(target)?;
-                self.write_into(addr, value)
+                self.write_into(addr, value)?;
+                // HOOK gc: Einfuegebarriere beim Schreiben eines Gc-Zeigers in
+                // den Heap (gc_lower.rs, SPEC 3.5.3)
+                crate::gc_lower::hook_assign(self, target)
             }
             Stmt::Expr(e) => self.lower_expr_stmt(e),
             Stmt::Block(b) => self.lower_block(b),

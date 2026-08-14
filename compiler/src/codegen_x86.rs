@@ -160,8 +160,30 @@ pub fn emit(m: &Module) -> Result<String, String> {
     for f in &m.funcs {
         emit_func(&mut e, f)?;
     }
+    // HOOK gc: Typtabelle (.rodata) und Zustandsblock (.data) des Sammlers —
+    // nur, wenn das Programm ueberhaupt ein `gc class` enthaelt (gc.rs).
+    if crate::gc::hat_klassen() {
+        e.raw(&crate::gc::typtabelle_asm());
+    }
     e.raw(".section .note.GNU-stack,\"\",@progbits");
     Ok(e.out)
+}
+
+/// `Op::GcAddr` — Adresse des Zustandsblocks des Sammlers in `rax`.
+///
+/// Mit `regs` werden vorher die callee-saved Register in den Block gerettet.
+/// Ohne diesen Schritt waere die Zusage „KONSERVATIVER Stapel- UND
+/// Registerscan" (SPEC §3.5.3) falsch: die Registerzuteilung (`regalloc.rs`)
+/// haelt Werte ueber Aufrufe hinweg in `rbx`/`r12`–`r15`.
+pub(crate) fn emit_gc_addr(e: &mut Emitter, regs: bool) {
+    e.line(&format!("lea rax, [rip + {}]", crate::gc::STATE_LABEL));
+    if !regs {
+        return;
+    }
+    let off = crate::gc::REG_SAVE_OFF;
+    for (i, r) in ["rbx", "rbp", "r12", "r13", "r14", "r15"].iter().enumerate() {
+        e.line(&format!("mov qword ptr [rax+{}], {}", off + 8 * i as u64, r));
+    }
 }
 
 fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
@@ -354,6 +376,11 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
             } else {
                 load_ext(e, fr, "rax", *src, *from, 64);
             }
+            store_dst(e, fr, d, "rax");
+        }
+        Op::GcAddr { regs } => {
+            let d = i.dst.ok_or("interner Fehler: gc_state ohne Ziel")?;
+            emit_gc_addr(e, *regs);
             store_dst(e, fr, d, "rax");
         }
         Op::Alloca { .. } => {
