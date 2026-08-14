@@ -603,6 +603,10 @@ impl<'a> Lower<'a> {
         dest: Option<Val>,
         span: Span,
     ) -> Option<Option<Val>> {
+        // HOOK constant-time: select/barrier/secure_zero (ct.rs, SPEC §9.2/§9.3)
+        if crate::ct::is_ct_call(name) && !self.info.fns.contains_key(name) {
+            return crate::ct::lower_ct_call(self, name, args, span);
+        }
         let sig = match self.info.fns.get(name) {
             Some(s) => s.clone(),
             None => return self.ice(span, "unbekannte funktion im lowering"),

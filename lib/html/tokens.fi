@@ -16,6 +16,7 @@
 // Der Tokenstrom eines Falles ist ein JSON-Array dieser Tokens; EOF erzeugt
 // KEIN Token (html5lib fuehrt EOF nicht in `output`).
 import mem
+import fehler_codes
 
 export {
     Attr, Sink,
@@ -27,7 +28,10 @@ export {
     tok_set_force_quirks, tok_set_self_closing,
     tok_attr_start, tok_attr_name_push, tok_attr_value_push, tok_attr_finish,
     tok_emit, tok_is_appropriate_end_tag,
-    sink_set_last_start_tag_cp,
+    sink_set_last_start_tag_cp, sink_set_xml_modus,
+    sink_fehler, sink_fehler_bei, sink_fehler_anzahl,
+    tok_attr_war_doppelt, tok_ist_endtag, tok_hat_attribute, tok_ist_self_closing,
+    sink_entities, sink_set_entities, sink_entities_versucht, sink_set_entities_versucht,
 }
 
 // Tokenarten des aktuellen Tokens.
@@ -63,6 +67,16 @@ struct Sink {
     nattr: usize,
     letzter_starttag: mem.CpBuf,
     marke: usize,          // Stand des Ausgabepuffers beim Fallbeginn
+    xml_modus: bool,       // XML-Anpassung ("Coercing an HTML DOM into an infoset")
+    fehler: mem.CpBuf,     // Parse-Fehler des Falles: Dreiergruppen (code, zeile, spalte)
+    p_gescannt: usize,     // Positionscache: bis hierhin sind Zeilen gezaehlt
+    p_zeile: u32,          // Zeile von `p_gescannt` (1-basiert)
+    p_zeilenstart: usize,  // Index des ersten Zeichens dieser Zeile
+    p_einheiten: u32,      // UTF-16-Codeeinheiten vom Zeilenanfang bis p_gescannt
+    p_nur_bmp: bool,       // enthaelt die Zeile bis hierhin nur BMP-Zeichen?
+    letztes_doppelt: bool, // hat `tok_attr_finish` ein doppeltes Attribut erkannt?
+    ent_tab: *mut u8,      // Namenstabelle der Zeichenreferenzen (lib/html/entities.fi)
+    ent_versucht: bool,    // wurde der Aufbau der Tabelle schon versucht?
 }
 
 fn attr_ptr(s: *mut Sink, i: usize) -> *mut Attr {
@@ -89,6 +103,16 @@ fn sink_neu() -> Sink {
         nattr: 0,
         letzter_starttag: mem.cp_neu(),
         marke: 0,
+        xml_modus: false,
+        fehler: mem.cp_neu(),
+        p_gescannt: 0,
+        p_zeile: 1,
+        p_zeilenstart: 0,
+        p_einheiten: 0,
+        p_nur_bmp: true,
+        letztes_doppelt: false,
+        ent_tab: 0 as *mut u8,
+        ent_versucht: false,
     }
 }
 
@@ -108,6 +132,16 @@ fn sink_init(s: *mut Sink) {
     (*s).force_quirks = false
     (*s).self_closing = false
     (*s).nattr = 0
+    (*s).xml_modus = false
+    mem.cp_init(&(*s).fehler)
+    (*s).p_gescannt = 0
+    (*s).p_zeile = 1
+    (*s).p_zeilenstart = 0
+    (*s).p_einheiten = 0
+    (*s).p_nur_bmp = true
+    (*s).letztes_doppelt = false
+    (*s).ent_tab = 0 as *mut u8
+    (*s).ent_versucht = false
     (*s).attrs = mem.heap_alloc(MAX_ATTRS * 56) as *mut Attr
     var i: usize = 0
     while i < MAX_ATTRS {
@@ -135,6 +169,7 @@ fn sink_free(s: *mut Sink) {
     mem.cp_free(&(*s).pubid)
     mem.cp_free(&(*s).sysid)
     mem.cp_free(&(*s).letzter_starttag)
+    mem.cp_free(&(*s).fehler)
 }
 
 // --------------------------------------------------------------- JSON-Hilfen
@@ -187,6 +222,79 @@ fn out_json_cpbuf(s: *mut Sink, c: *mut mem.CpBuf) {
     out_ascii(s, 34 as u32)
 }
 
+// ------------------------------------------------- XML-Anpassung (optional)
+//
+// Nur aktiv, wenn `xml_modus` gesetzt ist (Auftragsflagge Bit 0, siehe
+// tools/tokenizer/PROTOKOLL.md). Umgesetzt sind die Anpassungen aus dem
+// Abschnitt "Coercing an HTML DOM into an infoset" des HTML-Standards, soweit
+// sie den Tokenstrom betreffen:
+//   * Zeichen, die XML 1.0 nicht kennt (C0-Steuerzeichen ausser TAB/LF,
+//     ungepaarte Surrogate, Nichtzeichen U+FFFE/U+FFFF je Ebene), werden durch
+//     U+FFFD ersetzt — in Text, Attributwerten und Kommentaren.
+//   * U+000C (FORM FEED) wird zu U+0020 (SPACE) statt zu U+FFFD.
+//   * In Kommentaren wird zwischen zwei aufeinanderfolgende U+002D ein
+//     U+0020 eingefuegt; endet der Kommentar auf U+002D, folgt ein U+0020.
+// Element-, Attribut- und DOCTYPE-Namen bleiben unangetastet: deren Anpassung
+// betrifft den DOM-Aufbau, nicht den Tokenstrom.
+fn xml_cp(cp: u32) -> u32 {
+    if cp == 12 as u32 {
+        return 32 as u32              // FORM FEED -> SPACE
+    }
+    if cp < 32 as u32 && cp != 9 as u32 && cp != 10 as u32 {
+        return 0xFFFD as u32
+    }
+    if cp >= 0xD800 as u32 && cp <= 0xDFFF as u32 {
+        return 0xFFFD as u32
+    }
+    if (cp & 0xFFFF as u32) >= 0xFFFE as u32 {
+        return 0xFFFD as u32
+    }
+    return cp
+}
+
+// Text und Attributwerte: im XML-Modus zeichenweise angepasst.
+fn out_json_cpbuf_text(s: *mut Sink, c: *mut mem.CpBuf) {
+    if !(*s).xml_modus {
+        out_json_cpbuf(s, c)
+        return
+    }
+    out_ascii(s, 34 as u32)
+    var i: usize = 0
+    while i < mem.cp_len(c) {
+        out_json_cp(s, xml_cp(mem.cp_at(c, i)))
+        i = i + 1
+    }
+    out_ascii(s, 34 as u32)
+}
+
+// Kommentartext: zusaetzlich die Bindestrich-Anpassung.
+fn out_json_comment(s: *mut Sink, c: *mut mem.CpBuf) {
+    if !(*s).xml_modus {
+        out_json_cpbuf(s, c)
+        return
+    }
+    out_ascii(s, 34 as u32)
+    var vorher_strich: bool = false
+    var i: usize = 0
+    while i < mem.cp_len(c) {
+        let cp: u32 = xml_cp(mem.cp_at(c, i))
+        if cp == 45 as u32 {
+            if vorher_strich {
+                out_json_cp(s, 32 as u32)
+            }
+            vorher_strich = true
+        } else {
+            vorher_strich = false
+        }
+        out_json_cp(s, cp)
+        i = i + 1
+    }
+    if vorher_strich {
+        out_json_cp(s, 32 as u32)
+    }
+    out_ascii(s, 34 as u32)
+}
+
 fn out_null(s: *mut Sink) {
     out_ascii(s, 110 as u32)          // n
     out_ascii(s, 117 as u32)          // u
@@ -233,11 +341,173 @@ fn komma_wenn_noetig(s: *mut Sink) {
     }
 }
 
+// ------------------------------------------------------- Parse-Fehler
+
+// Ein Parse-Fehler des Falles: WHATWG-Codename (Konstante aus
+// lib/html/fehler_codes.fi) mit Zeile und Spalte des ausloesenden Zeichens
+// (beide 1-basiert, Spalte in Codepunkten der bereits normalisierten Eingabe).
+fn sink_fehler(s: *mut Sink, code: u32, zeile: u32, spalte: u32) {
+    mem.cp_push(&(*s).fehler, code)
+    mem.cp_push(&(*s).fehler, zeile)
+    mem.cp_push(&(*s).fehler, spalte)
+}
+
+// Breite eines Codepunktes in UTF-16-Codeeinheiten. html5lib-tests zaehlen
+// Spalten in Codeeinheiten, nicht in Codepunkten.
+fn einheiten(cp: u32) -> u32 {
+    if cp > 0xFFFF as u32 {
+        return 2
+    }
+    return 1
+}
+
+// Meldet einen Parse-Fehler am Zeichen mit dem Index `idx` der Eingabe
+// (`idx == cp_len(input)` steht fuer EOF). Zeile und Spalte werden aus einem
+// mitlaufenden Cache bestimmt: der Vorwaertslauf ueber die Eingabe kostet
+// insgesamt O(n), ein Rueckwaertssprung ueber eine Zeilengrenze hinweg laesst
+// den Zaehler neu anlaufen.
+fn sink_fehler_bei(s: *mut Sink, code: u32, input: *mut mem.CpBuf, idx: usize) {
+    if idx < (*s).p_zeilenstart {
+        (*s).p_gescannt = 0
+        (*s).p_zeile = 1
+        (*s).p_zeilenstart = 0
+        (*s).p_einheiten = 0
+        (*s).p_nur_bmp = true
+    }
+    while (*s).p_gescannt < idx {
+        let cp: u32 = mem.cp_at(input, (*s).p_gescannt)
+        if cp == 10 as u32 {
+            (*s).p_zeile = (*s).p_zeile + 1 as u32
+            (*s).p_zeilenstart = (*s).p_gescannt + 1
+            (*s).p_einheiten = 0
+            (*s).p_nur_bmp = true
+        } else {
+            (*s).p_einheiten = (*s).p_einheiten + einheiten(cp)
+            if cp > 0xFFFF as u32 {
+                (*s).p_nur_bmp = false
+            }
+        }
+        (*s).p_gescannt = (*s).p_gescannt + 1
+    }
+    var spalte: u32 = (*s).p_einheiten + 1 as u32
+    if idx < (*s).p_gescannt {
+        // Rueckwaertsblick innerhalb derselben Zeile.
+        if (*s).p_nur_bmp {
+            spalte = (idx - (*s).p_zeilenstart) as u32 + 1 as u32
+        } else {
+            var e: u32 = 0
+            var k: usize = (*s).p_zeilenstart
+            while k < idx {
+                e = e + einheiten(mem.cp_at(input, k))
+                k = k + 1
+            }
+            spalte = e + 1 as u32
+        }
+    }
+    sink_fehler(s, code, (*s).p_zeile, spalte)
+}
+
+// Anzahl der bisher fuer diesen Fall gemeldeten Parse-Fehler.
+fn sink_fehler_anzahl(s: *mut Sink) -> usize {
+    return mem.cp_len(&(*s).fehler) / 3
+}
+
+// Schreibt den Codenamen als JSON-Zeichenkette (Stuecke aus fehler_codes).
+fn out_fehlername(s: *mut Sink, code: u32) {
+    out_ascii(s, 34 as u32)
+    var i: usize = 0
+    var laeuft: bool = true
+    while laeuft && i < fehler_codes.STUECKE_MAX {
+        let st: u64 = fehler_codes.name_chunk(code, i)
+        if st == 0 as u64 {
+            laeuft = false
+        } else {
+            var k: usize = 0
+            while k < 8 && laeuft {
+                let b: u32 = ((st >> (8 * k as u64)) & 0xFF as u64) as u32
+                if b == 0 as u32 {
+                    laeuft = false
+                } else {
+                    out_ascii(s, b)
+                    k = k + 1
+                }
+            }
+            i = i + 1
+        }
+    }
+    out_ascii(s, 34 as u32)
+}
+
+// Die Fehlerliste des Falles im html5lib-Format:
+//   [{"code":"eof-in-tag","line":1,"col":5}, ...]
+fn out_fehlerliste(s: *mut Sink) {
+    out_ascii(s, 91 as u32)           // [
+    var i: usize = 0
+    let n: usize = mem.cp_len(&(*s).fehler)
+    while i + 2 < n {
+        if i > 0 {
+            out_ascii(s, 44 as u32)   // ,
+        }
+        out_ascii(s, 123 as u32)      // {
+        // "code":
+        out_wort(s, 99 as u32, 111 as u32, 100 as u32, 101 as u32, 0 as u32, 0 as u32,
+            0 as u32, 0 as u32, 0 as u32)
+        out_ascii(s, 58 as u32)
+        out_fehlername(s, mem.cp_at(&(*s).fehler, i))
+        out_ascii(s, 44 as u32)
+        // "line":
+        out_wort(s, 108 as u32, 105 as u32, 110 as u32, 101 as u32, 0 as u32, 0 as u32,
+            0 as u32, 0 as u32, 0 as u32)
+        out_ascii(s, 58 as u32)
+        mem.buf_push_dec(&(*s).out, mem.cp_at(&(*s).fehler, i + 1) as u64)
+        out_ascii(s, 44 as u32)
+        // "col":
+        out_wort(s, 99 as u32, 111 as u32, 108 as u32, 0 as u32, 0 as u32, 0 as u32,
+            0 as u32, 0 as u32, 0 as u32)
+        out_ascii(s, 58 as u32)
+        mem.buf_push_dec(&(*s).out, mem.cp_at(&(*s).fehler, i + 2) as u64)
+        out_ascii(s, 125 as u32)      // }
+        i = i + 3
+    }
+    out_ascii(s, 93 as u32)           // ]
+}
+
+// --------------------------------------------- Tabelle der Zeichenreferenzen
+
+// Die Namenstabelle der Zeichenreferenzen liegt an einer BELIEBIGEN Adresse
+// (mmap ohne MAP_FIXED). Weil Stufe 0 keine globalen Veraenderlichen kennt,
+// wird der Zeiger hier im Sink gehalten und so durch den Tokenizer gereicht.
+// `ent_versucht` unterscheidet "noch nicht gebaut" von "Aufbau gescheitert";
+// ein gescheiterter Aufbau fuehrt zu ["NICHT-UNTERSTUETZT"], nie zu stillem
+// Falschtokenisieren.
+fn sink_entities(s: *mut Sink) -> *mut u8 {
+    return (*s).ent_tab
+}
+
+fn sink_set_entities(s: *mut Sink, p: *mut u8) {
+    (*s).ent_tab = p
+}
+
+fn sink_entities_versucht(s: *mut Sink) -> bool {
+    return (*s).ent_versucht
+}
+
+fn sink_set_entities_versucht(s: *mut Sink, v: bool) {
+    (*s).ent_versucht = v
+}
+
 // ----------------------------------------------------------- Fall-Rahmen
 
 // Beginnt die Tokenliste eines Testfalls.
 fn sink_begin(s: *mut Sink) {
     mem.cp_clear(&(*s).chars)
+    mem.cp_clear(&(*s).fehler)
+    (*s).p_gescannt = 0
+    (*s).p_zeile = 1
+    (*s).p_zeilenstart = 0
+    (*s).p_einheiten = 0
+    (*s).p_nur_bmp = true
+    (*s).letztes_doppelt = false
     (*s).erstes = true
     (*s).art = TOK_NONE
     (*s).nattr = 0
@@ -275,13 +545,19 @@ fn sink_abort(s: *mut Sink) {
     out_ascii(s, 84 as u32)
     out_ascii(s, 34 as u32)
     out_ascii(s, 93 as u32)           // ]
+    out_ascii(s, 9 as u32)            // Tab: Trenner zum Fehlerfeld
+    out_ascii(s, 91 as u32)           // [
+    out_ascii(s, 93 as u32)           // ]
     out_ascii(s, 10 as u32)
+    mem.cp_clear(&(*s).fehler)
 }
 
 // Schliesst die Tokenliste ab (Zeichen werden vorher zusammengefasst).
 fn sink_end(s: *mut Sink) {
     sink_flush_chars(s)
     out_ascii(s, 93 as u32)           // ]
+    out_ascii(s, 9 as u32)            // Tab: Trenner zum Fehlerfeld
+    out_fehlerliste(s)
     out_ascii(s, 10 as u32)           // \n
     if mem.buf_len(&(*s).out) > 65536 {
         mem.buf_flush(&(*s).out, 1)
@@ -294,6 +570,11 @@ fn sink_flush_out(s: *mut Sink) {
 
 fn sink_set_last_start_tag_cp(s: *mut Sink, c: *mut mem.CpBuf) {
     mem.cp_copy_from(&(*s).letzter_starttag, c)
+}
+
+// Schaltet die XML-Anpassung fuer die folgenden Faelle an oder aus.
+fn sink_set_xml_modus(s: *mut Sink, v: bool) {
+    (*s).xml_modus = v
 }
 
 // --------------------------------------------------------------- Zeichen
@@ -312,7 +593,7 @@ fn sink_flush_chars(s: *mut Sink) {
     out_wort(s, 67 as u32, 104 as u32, 97 as u32, 114 as u32, 97 as u32, 99 as u32, 116 as u32,
         101 as u32, 114 as u32)
     out_ascii(s, 44 as u32)
-    out_json_cpbuf(s, &(*s).chars)
+    out_json_cpbuf_text(s, &(*s).chars)
     out_ascii(s, 93 as u32)
     mem.cp_clear(&(*s).chars)
 }
@@ -407,6 +688,7 @@ fn tok_attr_value_push(s: *mut Sink, cp: u32) {
 
 // Doppelte Attributnamen: das spaetere Vorkommen wird verworfen (HTML-Standard).
 fn tok_attr_finish(s: *mut Sink) {
+    (*s).letztes_doppelt = false
     if (*s).nattr < 2 {
         return
     }
@@ -416,10 +698,30 @@ fn tok_attr_finish(s: *mut Sink) {
         let b: *mut Attr = attr_ptr(s, i)
         if !(*b).doppelt && mem.cp_eq_cp(&(*a).name, &(*b).name) {
             (*a).doppelt = true
+            (*s).letztes_doppelt = true
             return
         }
         i = i + 1
     }
+}
+
+// Hat der letzte `tok_attr_finish` einen doppelten Attributnamen erkannt?
+fn tok_attr_war_doppelt(s: *mut Sink) -> bool {
+    return (*s).letztes_doppelt
+}
+
+// Merkmale des aktuellen Tokens (fuer end-tag-with-attributes und
+// end-tag-with-trailing-solidus).
+fn tok_ist_endtag(s: *mut Sink) -> bool {
+    return (*s).art == TOK_END
+}
+
+fn tok_hat_attribute(s: *mut Sink) -> bool {
+    return (*s).nattr > 0
+}
+
+fn tok_ist_self_closing(s: *mut Sink) -> bool {
+    return (*s).self_closing
 }
 
 // Der aktuelle EndTag passt zum zuletzt ausgegebenen StartTag?
@@ -455,7 +757,7 @@ fn tok_emit(s: *mut Sink) {
                 }
                 out_json_cpbuf(s, &(*a).name)
                 out_ascii(s, 58 as u32)
-                out_json_cpbuf(s, &(*a).value)
+                out_json_cpbuf_text(s, &(*a).value)
             }
             i = i + 1
         }
@@ -476,7 +778,7 @@ fn tok_emit(s: *mut Sink) {
         out_wort(s, 67 as u32, 111 as u32, 109 as u32, 109 as u32, 101 as u32, 110 as u32, 116 as u32,
             0 as u32, 0 as u32)
         out_ascii(s, 44 as u32)
-        out_json_cpbuf(s, &(*s).daten)
+        out_json_comment(s, &(*s).daten)
     } else {
         // "DOCTYPE"
         out_wort(s, 68 as u32, 79 as u32, 67 as u32, 84 as u32, 89 as u32, 80 as u32, 69 as u32,

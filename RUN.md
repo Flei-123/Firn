@@ -50,11 +50,12 @@ compiler/target/release/firnc -o /tmp/mod tests/110_module.fi
 bash test.sh
 ```
 
-Gemessenes Ergebnis dieses Stands: **PASS 468/468**
-(139 Programme × 3 Baustufen `opt` / `--no-opt` / `--opt-level=dev-fast`,
-46 Negativtests, 41 Prüfungen des Optimierernachweises, 118 Rust-Modultests,
-Ergebnisort-Garantie, Architekturwächter, Symbolschema und der
-HTML5-Tokenizer gegen html5lib). Laufzeit ca. 4 Minuten.
+Gemessenes Ergebnis dieses Stands: **PASS 485/485**
+(143 Programme × 3 Baustufen `opt` / `--no-opt` / `--opt-level=dev-fast` = 429,
+51 Negativtests, dazu je ein Abschnittsnachweis für Optimierer (`test_opt.sh`,
+seinerseits 41 Prüfungen), Ergebnisort-Garantie, Architekturwächter,
+Symbolschema und HTML5-Tokenizer gegen html5lib; ausserdem 122 Rust-
+Modultests, die nicht einzeln in PASS zählen). Laufzeit ca. 4 Minuten.
 
 Maschinenlesbar (CI, Ziel 9 / ABNAHME Punkt 4 A):
 
@@ -62,10 +63,10 @@ Maschinenlesbar (CI, Ziel 9 / ABNAHME Punkt 4 A):
 cargo build --release --manifest-path tools/testrunner/Cargo.toml
 ./tools/testrunner/target/release/testrunner --format=json > /tmp/firn.json
 python3 -c "import json;d=json.load(open('/tmp/firn.json'));print(d['total'],d['passed'],d['failed'],d['rate'])"
-# 324 324 0 1.0
+# 337 337 0 1.0
 ```
 
-(324 statt 468: der Runner enthält weder den Optimierernachweis `test_opt.sh`
+(337 statt 485: der Runner enthält weder den Optimierernachweis `test_opt.sh`
 noch die Abschnitte 6–9 von `test.sh`.)
 
 ## 4. Die Nachweise einzeln — das, was die Jury prüft
@@ -92,22 +93,50 @@ bash tools/tokenizer/run.sh
 
 Baut den Tokenizer aus `lib/html/*.fi` in **drei** Baustufen, fährt alle
 **6.810** html5lib-Fälle, prüft, dass alle drei Baustufen dieselbe Bilanz
-liefern, und misst den Durchsatz gegen html5ever. Gemessenes Ergebnis
-(14.08.2026):
+liefern, und misst den Durchsatz gegen html5ever. Es werden **zwei** Quoten
+ausgewiesen: nur Tokenstrom (linke Spalte) und zusätzlich mit Vergleich der
+Parse-Fehlercodes (rechte Spalte, `harness.py --mit-fehlern`). Gemessenes
+Ergebnis (14.08.2026):
 
 ```
+GESAMT                      6810 /  6810 100.00 %    6809 /  6810  99.99 %
+   noopt: 6810 ohne / 6809 mit Fehlercodes — gleich
+   devfast: 6810 ohne / 6809 mit Fehlercodes — gleich
+   -- Korpus 'html5lib' (Grenzfaelle der Testsuite, absichtlich pathologisch)
+      Firn      :     4.59 MB/s  (0.889 s fuer 4.08 MB, bester von 3)
+      html5ever :    11.22 MB/s  (0.363 s, bester von 3)
+      Faktor    : 2.45x langsamer als html5ever (Abnahmeziel <= 2.00x)
+   -- Korpus 'realweb' (acht echte Seiten aus testdata/realweb/)
+      Firn      :     7.44 MB/s  (0.632 s fuer 4.70 MB, bester von 3)
+      html5ever :    42.60 MB/s  (0.110 s, bester von 3)
+      Faktor    : 5.72x langsamer als html5ever (Abnahmeziel <= 2.00x)
+```
+
+Gemessen wird auf **zwei** Korpora: `html5lib` (die Eingaben der Testsuite,
+absichtlich pathologisch — fast nur Grenzfälle, schlechtester Fall) und
+`realweb` (acht gespeicherte echte Seiten, `testdata/realweb/MANIFEST.md`).
+Zwei weitere vollständige Läufe ergaben 2,25× / 2,79× (html5lib) und
+7,72× / 7,84× (realweb), ein fünfter 3,09× bzw. 6,39×; Spanne also
+2,25×–3,09× (html5lib) und 5,72×–8,31× (realweb). Die Bilanz war in allen Läufen und in allen drei
+Baustufen identisch, der Durchsatz schwankt um ~30 %.
+
+Schritt 0 von `run.sh` beweist, dass die Erwartungen nicht angefasst wurden:
+
+```sh
+bash tools/tokenizer/verifiziere_testdaten.sh              # sha256 gegen den Repo-Satz
+bash tools/tokenizer/verifiziere_testdaten.sh --gegen-upstream   # zusätzlich gegen GitHub
+```
+
+Schritt 2b von `run.sh` ist die **Gegenprobe ohne XML-Anpassung**:
+
+```
+python3 tools/tokenizer/harness.py .tokenizer-work/tokenize --ohne-xml-modus
 GESAMT                           6807 /   6810    99.96 %
-xmlViolation.test                   1 /      4    25.00 %
-   noopt: 6807 — gleich
-   devfast: 6807 — gleich
-   Firn      :     4.08 MB/s  (0.999 s fuer 4.08 MB, bester von 3)
-   html5ever :    10.97 MB/s  (0.372 s, bester von 3)
-   Faktor    : 2.69x langsamer als html5ever (Abnahmeziel <= 2.00x)
 ```
 
-Ein zweiter vollständiger Lauf derselben Zeile ergab `2.87x`
-(3,56 gegen 10,19 MB/s). Die Bilanz 6807/6810 war in beiden Läufen und in
-allen drei Baustufen identisch, der Durchsatz schwankt um ~30 %.
+Die XML-Anpassung (`xmlViolationTests`) ist ein optionaler Modus des Treibers
+(Auftragsflagge Bit 0, `tools/tokenizer/PROTOKOLL.md`); der Harness setzt sie
+nur für die vier Fälle aus `xmlViolation.test`, der HTML-Pfad bleibt gleich.
 
 Die Messlatte html5ever muss dafür einmal gebaut werden (eigenes Cargo-Projekt,
 **keine** Abhängigkeit des Compilers):
@@ -122,7 +151,7 @@ Einzelne Nachweise:
 
 | Was | Befehl | Gemessenes Ergebnis |
 |---|---|---|
-| **Tokenizer ist Firn** | `wc -l lib/html/*.fi tools/tokenizer/harness.py` | 7.464 Zeilen `.fi` gegen 227 Zeilen Harness; die Zustandsmaschine steht in `lib/html/tokenizer.fi` |
+| **Tokenizer ist Firn** | `wc -l lib/html/*.fi tools/tokenizer/harness.py` | 8.647 Zeilen `.fi` gegen 295 Zeilen Harness; die Zustandsmaschine steht in `lib/html/tokenizer.fi` (1.516 Zeilen) |
 | **Sprungtabelle über 73 Zustände** | `firnc --emit=asm -o /tmp/tok.s lib/html/tokenize_main.fi && grep -c "jmp qword ptr" /tmp/tok.s` | `1` — indirekter Sprung über `.Ltbl_tokenizer__tokenize_0` |
 | **Zeichenreferenzen einzeln** | `python3 tools/tokenizer/pruefe_entities.py` | `bestanden: 4657 / 4657` |
 | **Fehlerunion: `catch` liefert Ersatz** | `firnc -o /tmp/e tests/403_catch_ersatz.fi && /tmp/e; echo $?` | `0` |
@@ -134,17 +163,28 @@ Einzelne Nachweise:
 
 Ehrlich und vollständig (ausführlich in `ABNAHME.md`):
 
-* **Constant-Time (`secret[T]`, `select`, `secure_zero`, `u128`)** — nicht
-  umgesetzt. Prüfbar: `firnc -o /tmp/x tests/neg/int_secret_nicht_umgesetzt.fi`
-  meldet `'secret[T]' ist in Stufe 0 nicht umgesetzt` mit Zeile/Spalte.
+* **Constant-Time — teilweise umgesetzt, Punkt bleibt offen.** Gebaut sind die
+  drei Primitive (`compiler/src/ct.rs`): `select(b, a, c)` → `cmov` ohne
+  bedingten Sprung, `barrier(x)`, `secure_zero(p, n)` (überlebt den
+  Optimierer). Nachweis: `tests/430_ct_select.fi` … `tests/433_ct_secure_zero.fi`
+  in drei Baustufen, `tests/neg/ct_*.fi` (5 Negativtests).
+  **Nicht** umgesetzt: `secret[T]`, Ausbreitung der Markierung, `declassify`,
+  `u128`, `mul_wide`, Wirkung von `#[constant_time]`. Ohne `secret[T]` gibt es
+  keine Typprüfung auf Geheimnisdaten. Prüfbar:
+  `firnc -o /tmp/x tests/neg/int_secret_nicht_umgesetzt.fi` meldet
+  `'secret[T]' ist in Stufe 0 nicht umgesetzt` mit Zeile/Spalte.
+  Siehe `ABNAHME.md` Punkt 6.
 * **GC, `Rc`/`Gc`, DOM-Prototyp, RSS-Dauerlauf** — nicht umgesetzt. Prüfbar:
   `tests/neg/int_gc_nicht_umgesetzt.fi`.
-* **HTML5-Tokenizer: gebaut, aber nicht vollständig.** Bestandene
-  html5lib-Fälle: **6.807 von 6.810 (99,96 %)** — die drei
-  `xmlViolationTests` mit XML-Anpassung schlagen fehl und werden als
-  Fehlschlag gezählt. Die `errors`-Einträge der Suite (Parse-Fehlercodes)
-  werden **nicht** verglichen. Geschwindigkeitsziel ≤ 2× **verfehlt**: 2,69×
-  html5ever (zweiter Lauf 2,87×). Siehe Abschnitt 4a.
+* **HTML5-Tokenizer: gebaut.** Bestandene html5lib-Fälle:
+  **6.810 von 6.810 (100,00 %)** im Tokenstrom-Vergleich und
+  **6.809 von 6.810 (99,99 %)**, wenn zusätzlich die `errors`-Einträge der
+  Suite (Parse-Fehlercode, `line`, `col`) verglichen werden
+  (`harness.py --mit-fehlern`, Schritt 2a von `run.sh`). Der eine Fehlschlag
+  ist `xmlViolation.test #0`. Die XML-Anpassung der vier `xmlViolationTests`
+  ist als optionaler Modus umgesetzt (Gegenprobe `--ohne-xml-modus`: 6.807).
+  Geschwindigkeitsziel ≤ 2× **verfehlt**: Spanne 2,25×–3,09× (Korpus
+  `html5lib`) und 5,72×–8,31× (Korpus `realweb`). Siehe Abschnitt 4a.
 * **`defer` / `errdefer`, abgeleitete Fehlermenge `!T`, `catch |e| { Block }`**
   — nicht umgesetzt, siehe `SPEC.md` §14.1.fehlerunionen F1–F10.
 * **Selbst-Hosting, Paketverwaltung, `comptime`/UCD-Tabelle** — offen,

@@ -26,6 +26,7 @@
 import mem
 import tokens
 import entities
+import fehler_codes
 
 export { State, tokenize, EOF, ZST_DATA, ZST_PLAINTEXT, ZST_RCDATA, ZST_RAWTEXT, ZST_SCRIPT, ZST_CDATA }
 
@@ -134,12 +135,55 @@ fn klein(c: u32) -> u32 {
     return c
 }
 
-// Ein NULL-Zeichen wird in Text durch U+FFFD ersetzt (Parse-Fehler).
-fn null_ersatz(c: u32) -> u32 {
+// Ein NULL-Zeichen wird in Text durch U+FFFD ersetzt und als Parse-Fehler
+// `unexpected-null-character` gemeldet (WHATWG-HTML §13.2.5).
+fn null_ersatz(c: u32, s: *mut tokens.Sink, input: *mut mem.CpBuf, idx: usize) -> u32 {
     if c == 0 as u32 {
+        tokens.sink_fehler_bei(s, fehler_codes.F_UNEXPECTED_NULL_CHARACTER, input, idx)
         return 0xFFFD as u32
     }
     return c
+}
+
+// Fehler des Eingabestroms (WHATWG-HTML §13.2.3.5 "preprocessing"): jedes
+// Zeichen wird GENAU EINMAL geprueft, auch wenn es spaeter erneut betrachtet
+// wird ("reconsume").
+fn eingabe_pruefen(s: *mut tokens.Sink, input: *mut mem.CpBuf, idx: usize, c: u32) {
+    if c == 0 as u32 {
+        return
+    }
+    if c == 9 as u32 || c == 10 as u32 || c == 12 as u32 || c == 13 as u32 {
+        return
+    }
+    if c < 0x20 as u32 || (c >= 0x7F as u32 && c <= 0x9F as u32) {
+        tokens.sink_fehler_bei(s, fehler_codes.F_CONTROL_CHARACTER_IN_INPUT_STREAM, input, idx)
+        return
+    }
+    if c >= 0xD800 as u32 && c <= 0xDFFF as u32 {
+        tokens.sink_fehler_bei(s, fehler_codes.F_SURROGATE_IN_INPUT_STREAM, input, idx)
+        return
+    }
+    if c >= 0xFDD0 as u32 && c <= 0xFDEF as u32 {
+        tokens.sink_fehler_bei(s, fehler_codes.F_NONCHARACTER_IN_INPUT_STREAM, input, idx)
+        return
+    }
+    let unten: u32 = c & 0xFFFF as u32
+    if unten == 0xFFFE as u32 || unten == 0xFFFF as u32 {
+        tokens.sink_fehler_bei(s, fehler_codes.F_NONCHARACTER_IN_INPUT_STREAM, input, idx)
+    }
+}
+
+// Ein Endtag darf weder Attribute noch einen Schraegstrich tragen.
+fn endtag_pruefen(s: *mut tokens.Sink, input: *mut mem.CpBuf, idx: usize) {
+    if !tokens.tok_ist_endtag(s) {
+        return
+    }
+    if tokens.tok_hat_attribute(s) {
+        tokens.sink_fehler_bei(s, fehler_codes.F_END_TAG_WITH_ATTRIBUTES, input, idx)
+    }
+    if tokens.tok_ist_self_closing(s) {
+        tokens.sink_fehler_bei(s, fehler_codes.F_END_TAG_WITH_TRAILING_SOLIDUS, input, idx)
+    }
 }
 
 // Ein Zeichen zurueckgeben ("reconsume"); am Ende der Eingabe passiert nichts.
@@ -260,11 +304,21 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
     mem.cp_init(&tmp)
     var ok: bool = true
     var laeuft: bool = true
+    // Index des gerade betrachteten Zeichens (n = EOF) und die Grenze, bis zu
+    // der die Fehler des Eingabestroms schon gemeldet wurden.
+    var idx: usize = n
+    var gemeldet_bis: usize = 0
     while laeuft {
         var c: u32 = EOF
+        idx = n
         if pos < n {
             c = mem.cp_at(input, pos)
+            idx = pos
             pos = pos + 1
+            if idx >= gemeldet_bis {
+                gemeldet_bis = idx + 1
+                eingabe_pruefen(s, input, idx, c)
+            }
         }
         match state {
             State::Data => {
@@ -283,6 +337,9 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                 } else {
                     // Data state: U+0000 wird NICHT ersetzt (Parse-Fehler,
                     // aber das Zeichen selbst wird ausgegeben).
+                    if c == 0 as u32 {
+                        tokens.sink_fehler_bei(s, fehler_codes.F_UNEXPECTED_NULL_CHARACTER, input, idx)
+                    }
                     tokens.sink_emit_char(s, c)
                 }
             }
@@ -290,7 +347,7 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                 if c == EOF {
                     state = State::Fertig
                 } else {
-                    tokens.sink_emit_char(s, null_ersatz(c))
+                    tokens.sink_emit_char(s, null_ersatz(c, s, input, idx))
                 }
             }
             State::Rcdata => {
@@ -307,7 +364,7 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                         pos = np
                     }
                 } else {
-                    tokens.sink_emit_char(s, null_ersatz(c))
+                    tokens.sink_emit_char(s, null_ersatz(c, s, input, idx))
                 }
             }
             State::Rawtext => {
@@ -316,7 +373,7 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                 } else if c == 60 as u32 {
                     state = State::RawtextLessThanSign
                 } else {
-                    tokens.sink_emit_char(s, null_ersatz(c))
+                    tokens.sink_emit_char(s, null_ersatz(c, s, input, idx))
                 }
             }
             State::ScriptData => {
@@ -325,11 +382,12 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                 } else if c == 60 as u32 {
                     state = State::ScriptDataLessThanSign
                 } else {
-                    tokens.sink_emit_char(s, null_ersatz(c))
+                    tokens.sink_emit_char(s, null_ersatz(c, s, input, idx))
                 }
             }
             State::CdataSection => {
                 if c == EOF {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_EOF_IN_CDATA, input, idx)
                     state = State::Fertig
                 } else if c == 93 as u32 {           // ']'
                     state = State::CdataSectionBracket
@@ -368,10 +426,16 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                     pos = pos - 1
                     state = State::TagName
                 } else if c == 63 as u32 {           // '?'
+                    tokens.sink_fehler_bei(s, fehler_codes.F_UNEXPECTED_QUESTION_MARK_INSTEAD_OF_TAG_NAME, input, idx)
                     tokens.tok_comment(s)
                     pos = pos - 1
                     state = State::BogusComment
+                } else if c == EOF {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_EOF_BEFORE_TAG_NAME, input, idx)
+                    tokens.sink_emit_char(s, 60 as u32)
+                    state = State::Fertig
                 } else {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_INVALID_FIRST_CHARACTER_OF_TAG_NAME, input, idx)
                     tokens.sink_emit_char(s, 60 as u32)
                     pos = zurueck(pos, c)
                     state = State::Data
@@ -383,12 +447,15 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                     pos = pos - 1
                     state = State::TagName
                 } else if c == 62 as u32 {           // '>'
+                    tokens.sink_fehler_bei(s, fehler_codes.F_MISSING_END_TAG_NAME, input, idx)
                     state = State::Data
                 } else if c == EOF {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_EOF_BEFORE_TAG_NAME, input, idx)
                     tokens.sink_emit_char(s, 60 as u32)
                     tokens.sink_emit_char(s, 47 as u32)
                     state = State::Fertig
                 } else {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_INVALID_FIRST_CHARACTER_OF_TAG_NAME, input, idx)
                     tokens.tok_comment(s)
                     pos = pos - 1
                     state = State::BogusComment
@@ -396,16 +463,18 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
             }
             State::TagName => {
                 if c == EOF {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_EOF_IN_TAG, input, idx)
                     state = State::Fertig
                 } else if ist_space(c) {
                     state = State::BeforeAttributeName
                 } else if c == 47 as u32 {
                     state = State::SelfClosingStartTag
                 } else if c == 62 as u32 {
+                    endtag_pruefen(s, input, idx)
                     tokens.tok_emit(s)
                     state = State::Data
                 } else {
-                    tokens.tok_name_push(s, klein(null_ersatz(c)))
+                    tokens.tok_name_push(s, klein(null_ersatz(c, s, input, idx)))
                 }
             }
 
@@ -438,6 +507,7 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                 } else if c == 47 as u32 && tokens.tok_is_appropriate_end_tag(s) {
                     state = State::SelfClosingStartTag
                 } else if c == 62 as u32 && tokens.tok_is_appropriate_end_tag(s) {
+                    endtag_pruefen(s, input, idx)
                     tokens.tok_emit(s)
                     state = State::Data
                 } else if ist_ascii_alpha(c) {
@@ -481,6 +551,7 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                 } else if c == 47 as u32 && tokens.tok_is_appropriate_end_tag(s) {
                     state = State::SelfClosingStartTag
                 } else if c == 62 as u32 && tokens.tok_is_appropriate_end_tag(s) {
+                    endtag_pruefen(s, input, idx)
                     tokens.tok_emit(s)
                     state = State::Data
                 } else if ist_ascii_alpha(c) {
@@ -528,6 +599,7 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                 } else if c == 47 as u32 && tokens.tok_is_appropriate_end_tag(s) {
                     state = State::SelfClosingStartTag
                 } else if c == 62 as u32 && tokens.tok_is_appropriate_end_tag(s) {
+                    endtag_pruefen(s, input, idx)
                     tokens.tok_emit(s)
                     state = State::Data
                 } else if ist_ascii_alpha(c) {
@@ -561,6 +633,7 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
             }
             State::ScriptDataEscaped => {
                 if c == EOF {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_EOF_IN_SCRIPT_HTML_COMMENT_LIKE_TEXT, input, idx)
                     state = State::Fertig
                 } else if c == 45 as u32 {
                     tokens.sink_emit_char(s, 45 as u32)
@@ -568,11 +641,12 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                 } else if c == 60 as u32 {
                     state = State::ScriptDataEscapedLessThanSign
                 } else {
-                    tokens.sink_emit_char(s, null_ersatz(c))
+                    tokens.sink_emit_char(s, null_ersatz(c, s, input, idx))
                 }
             }
             State::ScriptDataEscapedDash => {
                 if c == EOF {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_EOF_IN_SCRIPT_HTML_COMMENT_LIKE_TEXT, input, idx)
                     state = State::Fertig
                 } else if c == 45 as u32 {
                     tokens.sink_emit_char(s, 45 as u32)
@@ -580,12 +654,13 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                 } else if c == 60 as u32 {
                     state = State::ScriptDataEscapedLessThanSign
                 } else {
-                    tokens.sink_emit_char(s, null_ersatz(c))
+                    tokens.sink_emit_char(s, null_ersatz(c, s, input, idx))
                     state = State::ScriptDataEscaped
                 }
             }
             State::ScriptDataEscapedDashDash => {
                 if c == EOF {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_EOF_IN_SCRIPT_HTML_COMMENT_LIKE_TEXT, input, idx)
                     state = State::Fertig
                 } else if c == 45 as u32 {
                     tokens.sink_emit_char(s, 45 as u32)
@@ -595,7 +670,7 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                     tokens.sink_emit_char(s, 62 as u32)
                     state = State::ScriptData
                 } else {
-                    tokens.sink_emit_char(s, null_ersatz(c))
+                    tokens.sink_emit_char(s, null_ersatz(c, s, input, idx))
                     state = State::ScriptDataEscaped
                 }
             }
@@ -632,6 +707,7 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                 } else if c == 47 as u32 && tokens.tok_is_appropriate_end_tag(s) {
                     state = State::SelfClosingStartTag
                 } else if c == 62 as u32 && tokens.tok_is_appropriate_end_tag(s) {
+                    endtag_pruefen(s, input, idx)
                     tokens.tok_emit(s)
                     state = State::Data
                 } else if ist_ascii_alpha(c) {
@@ -663,6 +739,7 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
             }
             State::ScriptDataDoubleEscaped => {
                 if c == EOF {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_EOF_IN_SCRIPT_HTML_COMMENT_LIKE_TEXT, input, idx)
                     state = State::Fertig
                 } else if c == 45 as u32 {
                     tokens.sink_emit_char(s, 45 as u32)
@@ -671,11 +748,12 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                     tokens.sink_emit_char(s, 60 as u32)
                     state = State::ScriptDataDoubleEscapedLessThanSign
                 } else {
-                    tokens.sink_emit_char(s, null_ersatz(c))
+                    tokens.sink_emit_char(s, null_ersatz(c, s, input, idx))
                 }
             }
             State::ScriptDataDoubleEscapedDash => {
                 if c == EOF {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_EOF_IN_SCRIPT_HTML_COMMENT_LIKE_TEXT, input, idx)
                     state = State::Fertig
                 } else if c == 45 as u32 {
                     tokens.sink_emit_char(s, 45 as u32)
@@ -684,12 +762,13 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                     tokens.sink_emit_char(s, 60 as u32)
                     state = State::ScriptDataDoubleEscapedLessThanSign
                 } else {
-                    tokens.sink_emit_char(s, null_ersatz(c))
+                    tokens.sink_emit_char(s, null_ersatz(c, s, input, idx))
                     state = State::ScriptDataDoubleEscaped
                 }
             }
             State::ScriptDataDoubleEscapedDashDash => {
                 if c == EOF {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_EOF_IN_SCRIPT_HTML_COMMENT_LIKE_TEXT, input, idx)
                     state = State::Fertig
                 } else if c == 45 as u32 {
                     tokens.sink_emit_char(s, 45 as u32)
@@ -700,7 +779,7 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                     tokens.sink_emit_char(s, 62 as u32)
                     state = State::ScriptData
                 } else {
-                    tokens.sink_emit_char(s, null_ersatz(c))
+                    tokens.sink_emit_char(s, null_ersatz(c, s, input, idx))
                     state = State::ScriptDataDoubleEscaped
                 }
             }
@@ -739,6 +818,7 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                     pos = zurueck(pos, c)
                     state = State::AfterAttributeName
                 } else if c == 61 as u32 {           // '=' : Parse-Fehler
+                    tokens.sink_fehler_bei(s, fehler_codes.F_UNEXPECTED_EQUALS_SIGN_BEFORE_ATTRIBUTE_NAME, input, idx)
                     tokens.tok_attr_start(s)
                     tokens.tok_attr_name_push(s, c)
                     state = State::AttributeName
@@ -751,13 +831,22 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
             State::AttributeName => {
                 if ist_space(c) || c == 47 as u32 || c == 62 as u32 || c == EOF {
                     tokens.tok_attr_finish(s)
+                    if tokens.tok_attr_war_doppelt(s) {
+                        tokens.sink_fehler_bei(s, fehler_codes.F_DUPLICATE_ATTRIBUTE, input, idx)
+                    }
                     pos = zurueck(pos, c)
                     state = State::AfterAttributeName
                 } else if c == 61 as u32 {
                     tokens.tok_attr_finish(s)
+                    if tokens.tok_attr_war_doppelt(s) {
+                        tokens.sink_fehler_bei(s, fehler_codes.F_DUPLICATE_ATTRIBUTE, input, idx)
+                    }
                     state = State::BeforeAttributeValue
                 } else {
-                    tokens.tok_attr_name_push(s, klein(null_ersatz(c)))
+                    if c == 34 as u32 || c == 39 as u32 || c == 60 as u32 {
+                        tokens.sink_fehler_bei(s, fehler_codes.F_UNEXPECTED_CHARACTER_IN_ATTRIBUTE_NAME, input, idx)
+                    }
+                    tokens.tok_attr_name_push(s, klein(null_ersatz(c, s, input, idx)))
                 }
             }
             State::AfterAttributeName => {
@@ -768,9 +857,11 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                 } else if c == 61 as u32 {
                     state = State::BeforeAttributeValue
                 } else if c == 62 as u32 {
+                    endtag_pruefen(s, input, idx)
                     tokens.tok_emit(s)
                     state = State::Data
                 } else if c == EOF {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_EOF_IN_TAG, input, idx)
                     state = State::Fertig
                 } else {
                     tokens.tok_attr_start(s)
@@ -786,6 +877,8 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                 } else if c == 39 as u32 {
                     state = State::AttributeValueSingle
                 } else if c == 62 as u32 {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_MISSING_ATTRIBUTE_VALUE, input, idx)
+                    endtag_pruefen(s, input, idx)
                     tokens.tok_emit(s)
                     state = State::Data
                 } else {
@@ -795,6 +888,7 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
             }
             State::AttributeValueDouble => {
                 if c == EOF {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_EOF_IN_TAG, input, idx)
                     state = State::Fertig
                 } else if c == 34 as u32 {
                     tokens.tok_attr_finish(s)
@@ -808,11 +902,12 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                         pos = np
                     }
                 } else {
-                    tokens.tok_attr_value_push(s, null_ersatz(c))
+                    tokens.tok_attr_value_push(s, null_ersatz(c, s, input, idx))
                 }
             }
             State::AttributeValueSingle => {
                 if c == EOF {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_EOF_IN_TAG, input, idx)
                     state = State::Fertig
                 } else if c == 39 as u32 {
                     tokens.tok_attr_finish(s)
@@ -826,17 +921,19 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                         pos = np
                     }
                 } else {
-                    tokens.tok_attr_value_push(s, null_ersatz(c))
+                    tokens.tok_attr_value_push(s, null_ersatz(c, s, input, idx))
                 }
             }
             State::AttributeValueUnquoted => {
                 if c == EOF {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_EOF_IN_TAG, input, idx)
                     state = State::Fertig
                 } else if ist_space(c) {
                     tokens.tok_attr_finish(s)
                     state = State::BeforeAttributeName
                 } else if c == 62 as u32 {
                     tokens.tok_attr_finish(s)
+                    endtag_pruefen(s, input, idx)
                     tokens.tok_emit(s)
                     state = State::Data
                 } else if c == 38 as u32 {
@@ -848,7 +945,11 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                         pos = np
                     }
                 } else {
-                    tokens.tok_attr_value_push(s, null_ersatz(c))
+                    if c == 34 as u32 || c == 39 as u32 || c == 60 as u32 ||
+                       c == 61 as u32 || c == 96 as u32 {
+                        tokens.sink_fehler_bei(s, fehler_codes.F_UNEXPECTED_CHARACTER_IN_UNQUOTED_ATTRIBUTE_VALUE, input, idx)
+                    }
+                    tokens.tok_attr_value_push(s, null_ersatz(c, s, input, idx))
                 }
             }
             State::AfterAttributeValueQuoted => {
@@ -857,11 +958,14 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                 } else if c == 47 as u32 {
                     state = State::SelfClosingStartTag
                 } else if c == 62 as u32 {
+                    endtag_pruefen(s, input, idx)
                     tokens.tok_emit(s)
                     state = State::Data
                 } else if c == EOF {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_EOF_IN_TAG, input, idx)
                     state = State::Fertig
                 } else {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_MISSING_WHITESPACE_BETWEEN_ATTRIBUTES, input, idx)
                     pos = pos - 1
                     state = State::BeforeAttributeName
                 }
@@ -869,11 +973,14 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
             State::SelfClosingStartTag => {
                 if c == 62 as u32 {
                     tokens.tok_set_self_closing(s, true)
+                    endtag_pruefen(s, input, idx)
                     tokens.tok_emit(s)
                     state = State::Data
                 } else if c == EOF {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_EOF_IN_TAG, input, idx)
                     state = State::Fertig
                 } else {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_UNEXPECTED_SOLIDUS_IN_TAG, input, idx)
                     pos = pos - 1
                     state = State::BeforeAttributeName
                 }
@@ -888,7 +995,7 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                     tokens.tok_emit(s)
                     state = State::Data
                 } else {
-                    tokens.tok_comment_push(s, null_ersatz(c))
+                    tokens.tok_comment_push(s, null_ersatz(c, s, input, idx))
                 }
             }
             State::MarkupDeclarationOpen => {
@@ -906,6 +1013,7 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                     // "[CDATA[" (Verhalten von html5lib ausserhalb von
                     // Fremdinhalten).
                     pos = pos + 7
+                    tokens.sink_fehler_bei(s, fehler_codes.F_CDATA_IN_HTML_CONTENT, input, pos - 1)
                     tokens.tok_comment(s)
                     tokens.tok_comment_push(s, 91 as u32)
                     tokens.tok_comment_push(s, 67 as u32)
@@ -916,6 +1024,7 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                     tokens.tok_comment_push(s, 91 as u32)
                     state = State::BogusComment
                 } else {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_INCORRECTLY_OPENED_COMMENT, input, pos)
                     tokens.tok_comment(s)
                     state = State::BogusComment
                 }
@@ -924,6 +1033,7 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                 if c == 45 as u32 {
                     state = State::CommentStartDash
                 } else if c == 62 as u32 {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_ABRUPT_CLOSING_OF_EMPTY_COMMENT, input, idx)
                     tokens.tok_emit(s)
                     state = State::Data
                 } else {
@@ -935,9 +1045,11 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                 if c == 45 as u32 {
                     state = State::CommentEnd
                 } else if c == 62 as u32 {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_ABRUPT_CLOSING_OF_EMPTY_COMMENT, input, idx)
                     tokens.tok_emit(s)
                     state = State::Data
                 } else if c == EOF {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_EOF_IN_COMMENT, input, idx)
                     tokens.tok_emit(s)
                     state = State::Fertig
                 } else {
@@ -948,6 +1060,7 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
             }
             State::Comment => {
                 if c == EOF {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_EOF_IN_COMMENT, input, idx)
                     tokens.tok_emit(s)
                     state = State::Fertig
                 } else if c == 60 as u32 {
@@ -956,7 +1069,7 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                 } else if c == 45 as u32 {
                     state = State::CommentEndDash
                 } else {
-                    tokens.tok_comment_push(s, null_ersatz(c))
+                    tokens.tok_comment_push(s, null_ersatz(c, s, input, idx))
                 }
             }
             State::CommentLessThanSign => {
@@ -989,6 +1102,9 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
             State::CommentLessThanSignBangDashDash => {
                 // '>' und EOF fuehren regulaer weiter, alles andere ist ein
                 // Parse-Fehler — in beiden Faellen wird zurueckgegeben.
+                if c != 62 as u32 && c != EOF {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_NESTED_COMMENT, input, idx)
+                }
                 pos = zurueck(pos, c)
                 state = State::CommentEnd
             }
@@ -996,6 +1112,7 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                 if c == 45 as u32 {
                     state = State::CommentEnd
                 } else if c == EOF {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_EOF_IN_COMMENT, input, idx)
                     tokens.tok_emit(s)
                     state = State::Fertig
                 } else {
@@ -1013,6 +1130,7 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                 } else if c == 45 as u32 {
                     tokens.tok_comment_push(s, 45 as u32)
                 } else if c == EOF {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_EOF_IN_COMMENT, input, idx)
                     tokens.tok_emit(s)
                     state = State::Fertig
                 } else {
@@ -1029,9 +1147,11 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                     tokens.tok_comment_push(s, 33 as u32)
                     state = State::CommentEndDash
                 } else if c == 62 as u32 {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_INCORRECTLY_CLOSED_COMMENT, input, idx)
                     tokens.tok_emit(s)
                     state = State::Data
                 } else if c == EOF {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_EOF_IN_COMMENT, input, idx)
                     tokens.tok_emit(s)
                     state = State::Fertig
                 } else {
@@ -1048,11 +1168,19 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                 if ist_space(c) {
                     state = State::BeforeDoctypeName
                 } else if c == EOF {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_EOF_IN_DOCTYPE, input, idx)
                     tokens.tok_doctype(s)
                     tokens.tok_set_force_quirks(s, true)
                     tokens.tok_emit(s)
                     state = State::Fertig
+                } else if c == 62 as u32 {
+                    // '>' geht ohne Fehler in den Zustand "before DOCTYPE name"
+                    // (WHATWG-HTML §13.2.5.53).
+                    pos = pos - 1
+                    state = State::BeforeDoctypeName
                 } else {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_MISSING_WHITESPACE_BEFORE_DOCTYPE_NAME,
+                        input, idx)
                     pos = pos - 1
                     state = State::BeforeDoctypeName
                 }
@@ -1061,18 +1189,20 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                 if ist_space(c) {
                     // ueberspringen
                 } else if c == 62 as u32 {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_MISSING_DOCTYPE_NAME, input, idx)
                     tokens.tok_doctype(s)
                     tokens.tok_set_force_quirks(s, true)
                     tokens.tok_emit(s)
                     state = State::Data
                 } else if c == EOF {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_EOF_IN_DOCTYPE, input, idx)
                     tokens.tok_doctype(s)
                     tokens.tok_set_force_quirks(s, true)
                     tokens.tok_emit(s)
                     state = State::Fertig
                 } else {
                     tokens.tok_doctype(s)
-                    tokens.tok_doctype_name_push(s, klein(null_ersatz(c)))
+                    tokens.tok_doctype_name_push(s, klein(null_ersatz(c, s, input, idx)))
                     state = State::DoctypeName
                 }
             }
@@ -1083,11 +1213,12 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                     tokens.tok_emit(s)
                     state = State::Data
                 } else if c == EOF {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_EOF_IN_DOCTYPE, input, idx)
                     tokens.tok_set_force_quirks(s, true)
                     tokens.tok_emit(s)
                     state = State::Fertig
                 } else {
-                    tokens.tok_doctype_name_push(s, klein(null_ersatz(c)))
+                    tokens.tok_doctype_name_push(s, klein(null_ersatz(c, s, input, idx)))
                 }
             }
             State::AfterDoctypeName => {
@@ -1097,6 +1228,7 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                     tokens.tok_emit(s)
                     state = State::Data
                 } else if c == EOF {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_EOF_IN_DOCTYPE, input, idx)
                     tokens.tok_set_force_quirks(s, true)
                     tokens.tok_emit(s)
                     state = State::Fertig
@@ -1109,6 +1241,7 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                         pos = pos + 6
                         state = State::AfterDoctypeSystemKeyword
                     } else {
+                        tokens.sink_fehler_bei(s, fehler_codes.F_INVALID_CHARACTER_SEQUENCE_AFTER_DOCTYPE_NAME, input, idx)
                         tokens.tok_set_force_quirks(s, true)
                         state = State::BogusDoctype
                     }
@@ -1118,20 +1251,25 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                 if ist_space(c) {
                     state = State::BeforeDoctypePublicIdentifier
                 } else if c == 34 as u32 {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_MISSING_WHITESPACE_AFTER_DOCTYPE_PUBLIC_KEYWORD, input, idx)
                     tokens.tok_pubid_start(s)
                     state = State::DoctypePublicIdentifierDouble
                 } else if c == 39 as u32 {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_MISSING_WHITESPACE_AFTER_DOCTYPE_PUBLIC_KEYWORD, input, idx)
                     tokens.tok_pubid_start(s)
                     state = State::DoctypePublicIdentifierSingle
                 } else if c == 62 as u32 {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_MISSING_DOCTYPE_PUBLIC_IDENTIFIER, input, idx)
                     tokens.tok_set_force_quirks(s, true)
                     tokens.tok_emit(s)
                     state = State::Data
                 } else if c == EOF {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_EOF_IN_DOCTYPE, input, idx)
                     tokens.tok_set_force_quirks(s, true)
                     tokens.tok_emit(s)
                     state = State::Fertig
                 } else {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_MISSING_QUOTE_BEFORE_DOCTYPE_PUBLIC_IDENTIFIER, input, idx)
                     tokens.tok_set_force_quirks(s, true)
                     pos = pos - 1
                     state = State::BogusDoctype
@@ -1147,14 +1285,17 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                     tokens.tok_pubid_start(s)
                     state = State::DoctypePublicIdentifierSingle
                 } else if c == 62 as u32 {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_MISSING_DOCTYPE_PUBLIC_IDENTIFIER, input, idx)
                     tokens.tok_set_force_quirks(s, true)
                     tokens.tok_emit(s)
                     state = State::Data
                 } else if c == EOF {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_EOF_IN_DOCTYPE, input, idx)
                     tokens.tok_set_force_quirks(s, true)
                     tokens.tok_emit(s)
                     state = State::Fertig
                 } else {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_MISSING_QUOTE_BEFORE_DOCTYPE_PUBLIC_IDENTIFIER, input, idx)
                     tokens.tok_set_force_quirks(s, true)
                     pos = pos - 1
                     state = State::BogusDoctype
@@ -1164,30 +1305,34 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                 if c == 34 as u32 {
                     state = State::AfterDoctypePublicIdentifier
                 } else if c == 62 as u32 {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_ABRUPT_DOCTYPE_PUBLIC_IDENTIFIER, input, idx)
                     tokens.tok_set_force_quirks(s, true)
                     tokens.tok_emit(s)
                     state = State::Data
                 } else if c == EOF {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_EOF_IN_DOCTYPE, input, idx)
                     tokens.tok_set_force_quirks(s, true)
                     tokens.tok_emit(s)
                     state = State::Fertig
                 } else {
-                    tokens.tok_pubid_push(s, null_ersatz(c))
+                    tokens.tok_pubid_push(s, null_ersatz(c, s, input, idx))
                 }
             }
             State::DoctypePublicIdentifierSingle => {
                 if c == 39 as u32 {
                     state = State::AfterDoctypePublicIdentifier
                 } else if c == 62 as u32 {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_ABRUPT_DOCTYPE_PUBLIC_IDENTIFIER, input, idx)
                     tokens.tok_set_force_quirks(s, true)
                     tokens.tok_emit(s)
                     state = State::Data
                 } else if c == EOF {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_EOF_IN_DOCTYPE, input, idx)
                     tokens.tok_set_force_quirks(s, true)
                     tokens.tok_emit(s)
                     state = State::Fertig
                 } else {
-                    tokens.tok_pubid_push(s, null_ersatz(c))
+                    tokens.tok_pubid_push(s, null_ersatz(c, s, input, idx))
                 }
             }
             State::AfterDoctypePublicIdentifier => {
@@ -1197,16 +1342,20 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                     tokens.tok_emit(s)
                     state = State::Data
                 } else if c == 34 as u32 {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_MISSING_WHITESPACE_BETWEEN_DOCTYPE_PUBLIC_AND_SYSTEM_IDENTIFIERS, input, idx)
                     tokens.tok_sysid_start(s)
                     state = State::DoctypeSystemIdentifierDouble
                 } else if c == 39 as u32 {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_MISSING_WHITESPACE_BETWEEN_DOCTYPE_PUBLIC_AND_SYSTEM_IDENTIFIERS, input, idx)
                     tokens.tok_sysid_start(s)
                     state = State::DoctypeSystemIdentifierSingle
                 } else if c == EOF {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_EOF_IN_DOCTYPE, input, idx)
                     tokens.tok_set_force_quirks(s, true)
                     tokens.tok_emit(s)
                     state = State::Fertig
                 } else {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_MISSING_QUOTE_BEFORE_DOCTYPE_SYSTEM_IDENTIFIER, input, idx)
                     tokens.tok_set_force_quirks(s, true)
                     pos = pos - 1
                     state = State::BogusDoctype
@@ -1225,10 +1374,12 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                     tokens.tok_sysid_start(s)
                     state = State::DoctypeSystemIdentifierSingle
                 } else if c == EOF {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_EOF_IN_DOCTYPE, input, idx)
                     tokens.tok_set_force_quirks(s, true)
                     tokens.tok_emit(s)
                     state = State::Fertig
                 } else {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_MISSING_QUOTE_BEFORE_DOCTYPE_SYSTEM_IDENTIFIER, input, idx)
                     tokens.tok_set_force_quirks(s, true)
                     pos = pos - 1
                     state = State::BogusDoctype
@@ -1238,20 +1389,25 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                 if ist_space(c) {
                     state = State::BeforeDoctypeSystemIdentifier
                 } else if c == 34 as u32 {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_MISSING_WHITESPACE_AFTER_DOCTYPE_SYSTEM_KEYWORD, input, idx)
                     tokens.tok_sysid_start(s)
                     state = State::DoctypeSystemIdentifierDouble
                 } else if c == 39 as u32 {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_MISSING_WHITESPACE_AFTER_DOCTYPE_SYSTEM_KEYWORD, input, idx)
                     tokens.tok_sysid_start(s)
                     state = State::DoctypeSystemIdentifierSingle
                 } else if c == 62 as u32 {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_MISSING_DOCTYPE_SYSTEM_IDENTIFIER, input, idx)
                     tokens.tok_set_force_quirks(s, true)
                     tokens.tok_emit(s)
                     state = State::Data
                 } else if c == EOF {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_EOF_IN_DOCTYPE, input, idx)
                     tokens.tok_set_force_quirks(s, true)
                     tokens.tok_emit(s)
                     state = State::Fertig
                 } else {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_MISSING_QUOTE_BEFORE_DOCTYPE_SYSTEM_IDENTIFIER, input, idx)
                     tokens.tok_set_force_quirks(s, true)
                     pos = pos - 1
                     state = State::BogusDoctype
@@ -1267,14 +1423,17 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                     tokens.tok_sysid_start(s)
                     state = State::DoctypeSystemIdentifierSingle
                 } else if c == 62 as u32 {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_MISSING_DOCTYPE_SYSTEM_IDENTIFIER, input, idx)
                     tokens.tok_set_force_quirks(s, true)
                     tokens.tok_emit(s)
                     state = State::Data
                 } else if c == EOF {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_EOF_IN_DOCTYPE, input, idx)
                     tokens.tok_set_force_quirks(s, true)
                     tokens.tok_emit(s)
                     state = State::Fertig
                 } else {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_MISSING_QUOTE_BEFORE_DOCTYPE_SYSTEM_IDENTIFIER, input, idx)
                     tokens.tok_set_force_quirks(s, true)
                     pos = pos - 1
                     state = State::BogusDoctype
@@ -1284,30 +1443,34 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                 if c == 34 as u32 {
                     state = State::AfterDoctypeSystemIdentifier
                 } else if c == 62 as u32 {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_ABRUPT_DOCTYPE_SYSTEM_IDENTIFIER, input, idx)
                     tokens.tok_set_force_quirks(s, true)
                     tokens.tok_emit(s)
                     state = State::Data
                 } else if c == EOF {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_EOF_IN_DOCTYPE, input, idx)
                     tokens.tok_set_force_quirks(s, true)
                     tokens.tok_emit(s)
                     state = State::Fertig
                 } else {
-                    tokens.tok_sysid_push(s, null_ersatz(c))
+                    tokens.tok_sysid_push(s, null_ersatz(c, s, input, idx))
                 }
             }
             State::DoctypeSystemIdentifierSingle => {
                 if c == 39 as u32 {
                     state = State::AfterDoctypeSystemIdentifier
                 } else if c == 62 as u32 {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_ABRUPT_DOCTYPE_SYSTEM_IDENTIFIER, input, idx)
                     tokens.tok_set_force_quirks(s, true)
                     tokens.tok_emit(s)
                     state = State::Data
                 } else if c == EOF {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_EOF_IN_DOCTYPE, input, idx)
                     tokens.tok_set_force_quirks(s, true)
                     tokens.tok_emit(s)
                     state = State::Fertig
                 } else {
-                    tokens.tok_sysid_push(s, null_ersatz(c))
+                    tokens.tok_sysid_push(s, null_ersatz(c, s, input, idx))
                 }
             }
             State::AfterDoctypeSystemIdentifier => {
@@ -1317,10 +1480,12 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                     tokens.tok_emit(s)
                     state = State::Data
                 } else if c == EOF {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_EOF_IN_DOCTYPE, input, idx)
                     tokens.tok_set_force_quirks(s, true)
                     tokens.tok_emit(s)
                     state = State::Fertig
                 } else {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_UNEXPECTED_CHARACTER_AFTER_DOCTYPE_SYSTEM_IDENTIFIER, input, idx)
                     pos = pos - 1
                     state = State::BogusDoctype
                 }
@@ -1332,6 +1497,8 @@ fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bo
                 } else if c == EOF {
                     tokens.tok_emit(s)
                     state = State::Fertig
+                } else if c == 0 as u32 {
+                    tokens.sink_fehler_bei(s, fehler_codes.F_UNEXPECTED_NULL_CHARACTER, input, idx)
                 }
                 // alles andere wird verworfen
             }

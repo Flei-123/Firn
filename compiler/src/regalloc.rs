@@ -1490,7 +1490,7 @@ mod tests {
     fn secret_werte_bekommen_kein_register() {
         let mut f = Func::new("main", vec![], FTy::I32);
         let c = f.push(0, FTy::I32, Op::Const(5));
-        f.set_secret(c);
+        f.secret.insert(c);
         let d = f.push(0, FTy::I32, Op::Bin(BinOp::Add, c, c));
         f.set_term(0, Term::Ret(Some(d)));
         let a = allocate(&f);

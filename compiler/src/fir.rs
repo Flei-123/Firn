@@ -165,15 +165,12 @@ pub enum Op {
     Syscall { args: Vec<Val> },
     /// Blockweise Kopie (Structs/Arrays); kein Ergebniswert
     CopyMem { dst: Val, src: Val, size: u64 },
-    #[allow(dead_code)] // wird vom Modul `ct` verdrahtet, dann entfernen
     /// Datenunabhaengige Auswahl (SPEC §9.3): `cond ? a : b`, im Backend `cmov`.
     /// KEIN Durchgang darf daraus eine Verzweigung machen (SPEC §9.2).
     Select { cond: Val, a: Val, b: Val },
-    #[allow(dead_code)] // wird vom Modul `ct` verdrahtet, dann entfernen
     /// Undurchsichtige Sperre (`barrier(inout x)`): liefert den Wert unveraendert
     /// zurueck, gilt aber fuer jeden Durchgang als undurchschaubar.
     Barrier { val: Val },
-    #[allow(dead_code)] // wird vom Modul `ct` verdrahtet, dann entfernen
     /// `secure_zero(inout buf)`: nullt `size` Bytes ab `addr`. Gilt NIE als tot.
     SecureZero { addr: Val, size: Val },
 }
@@ -375,10 +372,12 @@ impl Func {
     }
 
     /// Markiert einen Wert als geheim (SPEC §9.1).
-    #[allow(dead_code)] // wird vom Modul `ct` verdrahtet, dann entfernen
-    pub fn set_secret(&mut self, v: Val) {
-        self.secret.insert(v);
-    }
+    ///
+    /// Es gibt bewusst KEINE Hilfsmethode dafuer, solange das Frontend keine
+    /// `secret`-Werte erzeugen kann (`secret[T]` ist nicht umgesetzt, SPEC
+    /// §14.1): eine Methode, die nur Tests aufrufen, waere toter Code. Die
+    /// Menge `secret` ist oeffentlich; Tests schreiben direkt hinein, und alle
+    /// Durchgaenge lesen sie ueber `is_secret`.
 
     pub fn is_secret(&self, v: Val) -> bool {
         self.secret.contains(&v)

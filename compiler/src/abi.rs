@@ -27,10 +27,11 @@ pub enum ArgClass {
     Integer(u8),
     /// Ueber Speicher (Stufe 0: versteckter Zeiger auf eine Kopie).
     Memory,
-    /// Gleitkomma. Stufe 0 kennt keine Gleitkommatypen; die Variante gehoert
-    /// zur vereinbarten Schnittstelle und wird von `classify` nie geliefert.
-    #[allow(dead_code)] // Teil der vereinbarten Schnittstelle (PLAN §3.1)
-    Sse,
+    // Eine Klasse `Sse` (SSE/SSEUP nach System V) gibt es hier bewusst NICHT:
+    // Stufe 0 kennt keine Gleitkommatypen, `classify` koennte sie nie liefern,
+    // und eine Variante, die niemand erzeugt, waere toter Code mit
+    // Unterdrueckungsattribut. Sie kommt zusammen mit `f32`/`f64` — dann
+    // erzwingt der Compiler selbst, dass jede Fallunterscheidung sie behandelt.
 }
 
 /// Groesse der groessten Struktur, die noch in Registern uebergeben wird.
