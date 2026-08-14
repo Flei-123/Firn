@@ -243,6 +243,7 @@ fn remap_op(op: &Op, mv: &dyn Fn(Val) -> Val) -> Op {
         Op::Select { cond, a, b } => Op::Select { cond: mv(*cond), a: mv(*a), b: mv(*b) },
         Op::Barrier { val } => Op::Barrier { val: mv(*val) },
         Op::SecureZero { addr, size } => Op::SecureZero { addr: mv(*addr), size: mv(*size) },
+        Op::GcAddr { regs } => Op::GcAddr { regs: *regs },
     }
 }
 

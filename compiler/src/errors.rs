@@ -482,6 +482,17 @@ pub(crate) fn hook_resolve_ty(ck: &mut Checker, te: &TypeExpr) -> Option<Type> {
     Some(get_or_create_union(ck, &set, &val_ty))
 }
 
+/// Fehlerunion `set!val_ty` anlegen oder wiederverwenden — fuer Module, die
+/// eine Fehlerunion erzeugen, ohne dass sie im Quelltext steht (`gc.rs`:
+/// `gc C{…}` liefert `AllocError!Gc[C]`). `None`, wenn es die Fehlermenge
+/// nicht gibt.
+pub(crate) fn union_type(ck: &mut Checker, set: &str, val_ty: &Type) -> Option<Type> {
+    if set_index(set).is_none() {
+        return None;
+    }
+    Some(get_or_create_union(ck, set, val_ty))
+}
+
 fn get_or_create_union(ck: &mut Checker, set: &str, val_ty: &Type) -> Type {
     let name = format!("{}!{}", set, ck.tcx.name_of(val_ty));
     if let Some(idx) = ck.tcx.lookup(&name) {

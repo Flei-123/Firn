@@ -1,0 +1,793 @@
+// lib/gc/gc.fi — Laufzeit des Opt-in-Tracing-GC (SPEC §3.5).
+//
+// Diese Datei wird vom Compiler per `include_str!` eingebettet und automatisch
+// als zusaetzliches Modul eingezogen, sobald im Programm ein `gc class`
+// vorkommt (`compiler/src/gc.rs`, `compiler/src/modules.rs`). Sie braucht
+// KEIN `import` und keine Kommandozeilenoption; ihre Namen liegen im
+// Wurzelnamensraum.
+//
+// Verfahren (SPEC §3.5.3, keine Abweichung):
+//   * Mark-Sweep, anhaltend, Sammlung NUR an Allokationsstellen und bei
+//     gc_collect().
+//   * PRAEZISE Heap-Verfolgung ueber die compilergenerierte Typtabelle
+//     (Feldoffsets je Klasse, aus dem Feldlayout erzeugt).
+//   * KONSERVATIVER Scan von Stapel UND Registern. Die callee-saved Register
+//     werden vor dem Scan vom Codegenerator in den Zustandsblock gerettet
+//     (`__gc_save_regs`), sonst waere die Zusage falsch.
+//   * KEIN Kompaktieren (Adressen bleiben gueltig — Voraussetzung fuer den
+//     konservativen Scan), Groessenklassen-Allokator gegen Fragmentierung.
+//   * Ein Heap je Faden (SPEC §7): der Zustandsblock ist fadenlokal gedacht;
+//     Stufe 0 hat nur einen Faden.
+//   * mmap OHNE feste Adresse, ohne MAP_FIXED; ein fehlgeschlagenes mmap ist
+//     sichtbar (gc_init() -> false bzw. AllocError::OutOfMemory).
+//
+// Aufbau eines Blocks (16 Byte Kopf, danach die Nutzdaten):
+//   [0..4)   u32 Typkennung (0 = frei)
+//   [4..8)   u32 Marke (0 weiss, 1 grau, 2 schwarz)
+//   [8..16)  u64 Seriennummer (fuer GcWeak; 0 = frei)
+//   [16..)   Nutzdaten — das ist die Adresse, die `Gc[T]` traegt.
+//
+// Aufbau eines Chunks (64 Byte Kopf):
+//   [0]  naechster Chunk   [8]  Groesse in Bytes   [16] Blockgroesse
+//   [24] Anzahl Bloecke    [32] Datenanfang (64)   [40] Groessenklasse
+
+const SYS_WRITE: i64 = 1
+const SYS_OPEN: i64 = 2
+const SYS_CLOSE: i64 = 3
+const SYS_MMAP: i64 = 9
+const SYS_MUNMAP: i64 = 11
+const SYS_READ: i64 = 0
+const SYS_EXIT_GROUP: i64 = 231
+const SYS_CLOCK_GETTIME: i64 = 228
+const PROT_RW: i64 = 3
+const MAP_PRIVATE_ANON: i64 = 34
+const CLOCK_MONOTONIC: i64 = 1
+
+// Zustandsblock: Offsets in Bytes (siehe compiler/src/gc.rs).
+const S_TABELLE: u64 = 0
+const S_INIT: u64 = 8
+const S_CHUNKS: u64 = 16
+const S_BODEN: u64 = 24
+const S_LAEUFE: u64 = 32
+const S_LEBENDE: u64 = 40
+const S_HEAP: u64 = 48
+const S_LEBBYTES: u64 = 56
+const S_PAUSE_LAST: u64 = 64
+const S_PAUSE_MAX: u64 = 72
+const S_PAUSE_TOTAL: u64 = 80
+const S_SEIT: u64 = 88
+const S_GRENZE: u64 = 96
+const S_SERIE: u64 = 104
+const S_MSTACK: u64 = 112
+const S_MKAP: u64 = 120
+const S_MLEN: u64 = 128
+const S_UEBERLAUF: u64 = 136
+const S_BARRIEREN: u64 = 144
+const S_ZEIT: u64 = 152
+const S_FREI: u64 = 168
+const S_GESAMT: u64 = 296
+const S_BLOCKGROESSE: u64 = 304
+const S_MAXHEAP: u64 = 312
+
+const KOPF: u64 = 16
+const CHUNK_KOPF: u64 = 64
+const CHUNK_BYTES: u64 = 262144
+const KLASSEN: u64 = 13
+const MARK_BYTES: u64 = 1048576
+const MIN_GRENZE: u64 = 1048576
+const WEAK_XOR: u64 = 6510615555426900570
+
+// ---------------------------------------------------------------- Speicher
+
+fn __gc_ld64(a: u64) -> u64 {
+    return *(a as *mut u64)
+}
+
+fn __gc_st64(a: u64, v: u64) {
+    *(a as *mut u64) = v
+}
+
+fn __gc_ld32(a: u64) -> u32 {
+    return *(a as *mut u32)
+}
+
+fn __gc_st32(a: u64, v: u32) {
+    *(a as *mut u32) = v
+}
+
+// n Bytes vom Betriebssystem, nullinitialisiert. 0 = fehlgeschlagen.
+// OHNE feste Adresse, ohne MAP_FIXED.
+fn __gc_mmap(n: u64) -> u64 {
+    let len: u64 = (n + 4095) / 4096 * 4096
+    let r: i64 = syscall(SYS_MMAP, 0, len as i64, PROT_RW, MAP_PRIVATE_ANON, -1, 0)
+    if r < 0 && r > -4096 {
+        return 0
+    }
+    if r == 0 {
+        return 0
+    }
+    return r as u64
+}
+
+fn __gc_munmap(p: u64, n: u64) {
+    let len: u64 = (n + 4095) / 4096 * 4096
+    syscall(SYS_MUNMAP, p as i64, len as i64, 0, 0, 0, 0)
+}
+
+fn __gc_jetzt_ns() -> u64 {
+    let st: u64 = __gc_state() as u64
+    let puf: u64 = st + S_ZEIT
+    __gc_st64(puf, 0)
+    __gc_st64(puf + 8, 0)
+    syscall(SYS_CLOCK_GETTIME, CLOCK_MONOTONIC, puf as i64, 0, 0, 0, 0)
+    return __gc_ld64(puf) * 1000000000 + __gc_ld64(puf + 8)
+}
+
+// Sichtbares Scheitern statt stiller Falschantwort.
+fn __gc_abbruch(code: i64) {
+    var m: [u8; 48] = [
+        102, 105, 114, 110, 45, 103, 99, 58, 32, 103, 99, 95, 105, 110, 105,
+        116, 40, 41, 32, 119, 117, 114, 100, 101, 32, 110, 105, 99, 104, 116,
+        32, 97, 117, 102, 103, 101, 114, 117, 102, 101, 110, 10, 0, 0, 0, 0, 0, 0,
+    ]
+    let p: u64 = (&m) as u64
+    syscall(SYS_WRITE, 2, p as i64, 42, 0, 0, 0)
+    syscall(SYS_EXIT_GROUP, code, 0, 0, 0, 0, 0)
+}
+
+// ------------------------------------------------------- Stapelboden ermitteln
+
+// Feld 28 aus /proc/self/stat ist die Startadresse des Stapels. Damit ist der
+// Stapelboden EXAKT bekannt, unabhaengig davon, wo gc_init() gerufen wird.
+fn __gc_stapel_boden() -> u64 {
+    var pfad: [u8; 24] = [
+        47, 112, 114, 111, 99, 47, 115, 101, 108, 102, 47, 115, 116, 97, 116,
+        0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ]
+    let puffer: u64 = __gc_mmap(8192)
+    if puffer == 0 {
+        return 0
+    }
+    let pp: u64 = (&pfad) as u64
+    let fd: i64 = syscall(SYS_OPEN, pp as i64, 0, 0, 0, 0, 0)
+    if fd < 0 {
+        __gc_munmap(puffer, 8192)
+        return 0
+    }
+    let n: i64 = syscall(SYS_READ, fd, puffer as i64, 8000, 0, 0, 0)
+    syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+    if n <= 0 {
+        __gc_munmap(puffer, 8192)
+        return 0
+    }
+    let len: u64 = n as u64
+    // Der Kommandoname steht in Klammern und darf Leerzeichen enthalten:
+    // hinter der LETZTEN ')' beginnt Feld 3.
+    var klammer: u64 = 0
+    var i: u64 = 0
+    while i < len {
+        if *((puffer + i) as *mut u8) == 41 {
+            klammer = i
+        }
+        i = i + 1
+    }
+    if klammer == 0 {
+        __gc_munmap(puffer, 8192)
+        return 0
+    }
+    // Feld 28 = das 26. Feld hinter der Klammer.
+    var pos: u64 = klammer + 1
+    var feld: u64 = 0
+    var wert: u64 = 0
+    while feld < 26 {
+        while pos < len && *((puffer + pos) as *mut u8) == 32 {
+            pos = pos + 1
+        }
+        wert = 0
+        var stellen: u64 = 0
+        while pos < len {
+            let c: u8 = *((puffer + pos) as *mut u8)
+            if c < 48 || c > 57 {
+                break
+            }
+            wert = wert * 10 + (c as u64 - 48)
+            stellen = stellen + 1
+            pos = pos + 1
+        }
+        // Nichtnumerische Felder ueberspringen
+        while pos < len && *((puffer + pos) as *mut u8) != 32 {
+            pos = pos + 1
+        }
+        if stellen == 0 {
+            wert = 0
+        }
+        feld = feld + 1
+    }
+    __gc_munmap(puffer, 8192)
+    return wert
+}
+
+// ------------------------------------------------------------ Groessenklassen
+
+fn __gc_klassen_bytes(k: u64) -> u64 {
+    if k == 0 {
+        return 32
+    }
+    if k == 1 {
+        return 48
+    }
+    if k == 2 {
+        return 64
+    }
+    if k == 3 {
+        return 96
+    }
+    if k == 4 {
+        return 128
+    }
+    if k == 5 {
+        return 192
+    }
+    if k == 6 {
+        return 256
+    }
+    if k == 7 {
+        return 384
+    }
+    if k == 8 {
+        return 512
+    }
+    if k == 9 {
+        return 768
+    }
+    if k == 10 {
+        return 1024
+    }
+    if k == 11 {
+        return 2048
+    }
+    return 4096
+}
+
+fn __gc_klasse_fuer(size: u64) -> u64 {
+    var k: u64 = 0
+    while k < KLASSEN {
+        if size <= __gc_klassen_bytes(k) {
+            return k
+        }
+        k = k + 1
+    }
+    return KLASSEN
+}
+
+// ----------------------------------------------------------------- Chunks
+
+fn __gc_chunk_neu(klasse: u64, nutz: u64) -> u64 {
+    let st: u64 = __gc_state() as u64
+    var block: u64 = 0
+    var gesamt: u64 = 0
+    if klasse < KLASSEN {
+        block = KOPF + __gc_klassen_bytes(klasse)
+        gesamt = CHUNK_BYTES
+    } else {
+        block = KOPF + (nutz + 15) / 16 * 16
+        gesamt = CHUNK_KOPF + block
+    }
+    // Speichergrenze je Heap (Grundlage fuer eine Grenze je Tab, S6).
+    let max: u64 = __gc_ld64(st + S_MAXHEAP)
+    if max != 0 && __gc_ld64(st + S_HEAP) + gesamt > max {
+        return 0
+    }
+    let p: u64 = __gc_mmap(gesamt)
+    if p == 0 {
+        return 0
+    }
+    let echt: u64 = (gesamt + 4095) / 4096 * 4096
+    let anzahl: u64 = (echt - CHUNK_KOPF) / block
+    __gc_st64(p, __gc_ld64(st + S_CHUNKS))
+    __gc_st64(p + 8, echt)
+    __gc_st64(p + 16, block)
+    __gc_st64(p + 24, anzahl)
+    __gc_st64(p + 32, CHUNK_KOPF)
+    __gc_st64(p + 40, klasse)
+    __gc_st64(st + S_CHUNKS, p)
+    __gc_st64(st + S_HEAP, __gc_ld64(st + S_HEAP) + echt)
+    // Alle Bloecke in die Freiliste der Klasse
+    if klasse < KLASSEN {
+        let kopf: u64 = st + S_FREI + klasse * 8
+        var i: u64 = 0
+        while i < anzahl {
+            let b: u64 = p + CHUNK_KOPF + i * block
+            __gc_st64(b + KOPF, __gc_ld64(kopf))
+            __gc_st64(kopf, b)
+            i = i + 1
+        }
+    }
+    return p
+}
+
+// Zu welchem Block gehoert die Adresse? 0 = keine Heapadresse.
+// Innenzeiger sind ausdruecklich erlaubt (konservativer Scan).
+fn __gc_block_von(a: u64) -> u64 {
+    let st: u64 = __gc_state() as u64
+    var c: u64 = __gc_ld64(st + S_CHUNKS)
+    while c != 0 {
+        let daten: u64 = c + CHUNK_KOPF
+        let block: u64 = __gc_ld64(c + 16)
+        let anzahl: u64 = __gc_ld64(c + 24)
+        let ende: u64 = daten + block * anzahl
+        if a >= daten && a < ende {
+            let idx: u64 = (a - daten) / block
+            return daten + idx * block
+        }
+        c = __gc_ld64(c)
+    }
+    return 0
+}
+
+// ------------------------------------------------------------- Markierung
+
+fn __gc_mark_push(obj: u64) {
+    let st: u64 = __gc_state() as u64
+    let len: u64 = __gc_ld64(st + S_MLEN)
+    let kap: u64 = __gc_ld64(st + S_MKAP)
+    if len >= kap {
+        __gc_st64(st + S_UEBERLAUF, 1)
+        return
+    }
+    __gc_st64(__gc_ld64(st + S_MSTACK) + len * 8, obj)
+    __gc_st64(st + S_MLEN, len + 1)
+}
+
+// Kandidat (auch Innenzeiger) markieren.
+fn __gc_mark(a: u64) {
+    if a == 0 {
+        return
+    }
+    let b: u64 = __gc_block_von(a)
+    if b == 0 {
+        return
+    }
+    if __gc_ld32(b) == 0 {
+        return
+    }
+    if __gc_ld32(b + 4) != 0 {
+        return
+    }
+    __gc_st32(b + 4, 1)
+    __gc_mark_push(b + KOPF)
+}
+
+// Praezise Verfolgung eines Objekts ueber die compilergenerierte Typtabelle.
+fn __gc_trace(obj: u64) {
+    let st: u64 = __gc_state() as u64
+    let b: u64 = obj - KOPF
+    __gc_st32(b + 4, 2)
+    let tid: u64 = __gc_ld32(b) as u64
+    let tab: u64 = __gc_ld64(st + S_TABELLE)
+    if tid == 0 || tid > __gc_ld64(tab) {
+        return
+    }
+    let eintrag: u64 = tab + 8 + (tid - 1) * 64
+    let n: u64 = __gc_ld64(eintrag + 16)
+    let offs: u64 = __gc_ld64(eintrag + 24)
+    var i: u64 = 0
+    while i < n {
+        let kind: u64 = __gc_ld64(obj + __gc_ld64(offs + i * 8))
+        if kind != 0 {
+            __gc_mark(kind)
+        }
+        i = i + 1
+    }
+}
+
+fn __gc_drain() {
+    let st: u64 = __gc_state() as u64
+    while __gc_ld64(st + S_MLEN) > 0 {
+        let len: u64 = __gc_ld64(st + S_MLEN) - 1
+        __gc_st64(st + S_MLEN, len)
+        let obj: u64 = __gc_ld64(__gc_ld64(st + S_MSTACK) + len * 8)
+        __gc_trace(obj)
+    }
+}
+
+// Nach einem Ueberlauf des Markstapels: alle grauen Bloecke im Heap suchen und
+// nachtragen. Damit ist die Markierung auch ohne unbegrenzten Stapel
+// vollstaendig.
+fn __gc_nachtragen() {
+    let st: u64 = __gc_state() as u64
+    var weiter: bool = true
+    while weiter {
+        weiter = false
+        if __gc_ld64(st + S_UEBERLAUF) == 0 {
+            return
+        }
+        __gc_st64(st + S_UEBERLAUF, 0)
+        var c: u64 = __gc_ld64(st + S_CHUNKS)
+        while c != 0 {
+            let daten: u64 = c + CHUNK_KOPF
+            let block: u64 = __gc_ld64(c + 16)
+            let anzahl: u64 = __gc_ld64(c + 24)
+            var i: u64 = 0
+            while i < anzahl {
+                let b: u64 = daten + i * block
+                if __gc_ld32(b) != 0 && __gc_ld32(b + 4) == 1 {
+                    __gc_trace(b + KOPF)
+                    __gc_drain()
+                    weiter = true
+                }
+                i = i + 1
+            }
+            c = __gc_ld64(c)
+        }
+    }
+}
+
+// Konservativer Scan eines Speicherbereichs (Stapel bzw. Registerrettung).
+fn __gc_scan(lo: u64, hi: u64) {
+    var a: u64 = (lo + 7) / 8 * 8
+    while a + 8 <= hi {
+        __gc_mark(__gc_ld64(a))
+        a = a + 8
+    }
+}
+
+// -------------------------------------------------------------------- Sweep
+
+fn __gc_sweep() {
+    let st: u64 = __gc_state() as u64
+    var k: u64 = 0
+    while k < KLASSEN {
+        __gc_st64(st + S_FREI + k * 8, 0)
+        k = k + 1
+    }
+    var lebende: u64 = 0
+    var lebbytes: u64 = 0
+    var vorher: u64 = 0
+    var c: u64 = __gc_ld64(st + S_CHUNKS)
+    while c != 0 {
+        let naechster: u64 = __gc_ld64(c)
+        let daten: u64 = c + CHUNK_KOPF
+        let block: u64 = __gc_ld64(c + 16)
+        let anzahl: u64 = __gc_ld64(c + 24)
+        let klasse: u64 = __gc_ld64(c + 40)
+        var tot: u64 = 0
+        var i: u64 = 0
+        while i < anzahl {
+            let b: u64 = daten + i * block
+            if __gc_ld32(b) != 0 && __gc_ld32(b + 4) != 0 {
+                __gc_st32(b + 4, 0)
+                lebende = lebende + 1
+                lebbytes = lebbytes + block
+            } else {
+                if __gc_ld32(b) != 0 {
+                    __gc_st32(b, 0)
+                    __gc_st64(b + 8, 0)
+                }
+                tot = tot + 1
+                if klasse < KLASSEN {
+                    let kopf: u64 = st + S_FREI + klasse * 8
+                    __gc_st64(b + KOPF, __gc_ld64(kopf))
+                    __gc_st64(kopf, b)
+                }
+            }
+            i = i + 1
+        }
+        // Grosse Objekte bekommen einen eigenen Chunk; ist er leer, geht er
+        // zurueck ans Betriebssystem (kein Kompaktieren noetig).
+        if klasse >= KLASSEN && tot == anzahl {
+            let bytes: u64 = __gc_ld64(c + 8)
+            if vorher == 0 {
+                __gc_st64(st + S_CHUNKS, naechster)
+            } else {
+                __gc_st64(vorher, naechster)
+            }
+            __gc_st64(st + S_HEAP, __gc_ld64(st + S_HEAP) - bytes)
+            __gc_munmap(c, bytes)
+        } else {
+            vorher = c
+        }
+        c = naechster
+    }
+    __gc_st64(st + S_LEBENDE, lebende)
+    __gc_st64(st + S_LEBBYTES, lebbytes)
+}
+
+// ---------------------------------------------------------------- Sammellauf
+
+// Toten Stapelbereich unter dem aktuellen Rahmen nullen.
+//
+// WARUM: der Stapelscan ist KONSERVATIV. In den Rahmen bereits
+// zurueckgekehrter Aufrufe stehen noch alte Zeiger; die Rahmen des Sammlers
+// legen sich daneben und erben in nicht beschriebenen Zellen deren Inhalt.
+// Ohne dieses Nullen haelt ein einzelner Zufallswert ein laengst unerreichbares
+// Objekt am Leben — nachweisbar an einem GcWeak-Ziel, das nicht eingesammelt
+// wird. Das ist der ehrliche Preis des konservativen Scans; hier wird er
+// bezahlt, statt ihn zu verschweigen.
+// Der Selbstaufruf ist Absicht: eine rekursive Funktion wird NIE eingebettet
+// (inline.rs), und nur so liegen die genullten Rahmen wirklich UNTERHALB des
+// Aufrufers — eingebettet waeren sie Teil seines eigenen Rahmens und wuerden
+// gar nichts saeubern.
+fn __gc_scrub_tief(n: u64) {
+    var puffer: [u64; 512] = [0; 512]
+    let p: u64 = (&puffer) as u64
+    var i: u64 = 0
+    while i < 512 {
+        __gc_st64(p + i * 8, 0)
+        i = i + 1
+    }
+    if n > 0 {
+        __gc_scrub_tief(n - 1)
+    }
+}
+
+fn __gc_scrub() {
+    __gc_scrub_tief(3)
+}
+
+fn __gc_collect_now() -> u64 {
+    let st: u64 = __gc_state() as u64
+    if __gc_ld64(st + S_INIT) == 0 {
+        return 0
+    }
+    let t0: u64 = __gc_jetzt_ns()
+    __gc_st64(st + S_MLEN, 0)
+    __gc_st64(st + S_UEBERLAUF, 0)
+    // Wurzeln 1: die callee-saved Register (vom Codegenerator gerettet).
+    let regs: u64 = __gc_save_regs() as u64
+    __gc_scan(regs, regs + 48)
+    // Wurzeln 2: der Stapel, konservativ, von hier bis zum Stapelboden.
+    var anker: u64 = 0
+    let sp: u64 = (&anker) as u64
+    anker = 0
+    __gc_scan(sp, __gc_ld64(st + S_BODEN))
+    __gc_drain()
+    __gc_nachtragen()
+    __gc_sweep()
+    let t1: u64 = __gc_jetzt_ns()
+    var dauer: u64 = 0
+    if t1 > t0 {
+        dauer = t1 - t0
+    }
+    __gc_st64(st + S_LAEUFE, __gc_ld64(st + S_LAEUFE) + 1)
+    __gc_st64(st + S_PAUSE_LAST, dauer)
+    if dauer > __gc_ld64(st + S_PAUSE_MAX) {
+        __gc_st64(st + S_PAUSE_MAX, dauer)
+    }
+    __gc_st64(st + S_PAUSE_TOTAL, __gc_ld64(st + S_PAUSE_TOTAL) + dauer)
+    __gc_st64(st + S_SEIT, 0)
+    // Naechster Sammellauf, wenn seither so viel alloziert wurde wie lebt
+    // (mindestens MIN_GRENZE) — das haelt den Verbrauch beschraenkt.
+    var grenze: u64 = __gc_ld64(st + S_LEBBYTES)
+    if grenze < MIN_GRENZE {
+        grenze = MIN_GRENZE
+    }
+    __gc_st64(st + S_GRENZE, grenze)
+    return dauer
+}
+
+// -------------------------------------------------------------- Allokation
+
+// Liefert die Nutzdatenadresse (= der Wert eines `Gc[T]`) oder 0.
+// Bei Erschoepfung: ERST ein Sammellauf, DANN das Scheitern.
+fn __gc_alloc_raw(tid: u64, size: u64) -> *mut u8 {
+    let st: u64 = __gc_state() as u64
+    if __gc_ld64(st + S_INIT) == 0 {
+        __gc_abbruch(70)
+        return 0 as *mut u8
+    }
+    let klasse: u64 = __gc_klasse_fuer(size)
+    if __gc_ld64(st + S_SEIT) >= __gc_ld64(st + S_GRENZE) {
+        __gc_scrub()
+        __gc_collect_now()
+    }
+    var b: u64 = __gc_hole_block(klasse, size)
+    if b == 0 {
+        // Erst sammeln, dann scheitern (DESIGNZIELE §2).
+        __gc_scrub()
+        __gc_collect_now()
+        b = __gc_hole_block(klasse, size)
+    }
+    if b == 0 {
+        return 0 as *mut u8
+    }
+    let serie: u64 = __gc_ld64(st + S_SERIE) + 1
+    __gc_st64(st + S_SERIE, serie)
+    __gc_st32(b, tid as u32)
+    __gc_st32(b + 4, 0)
+    __gc_st64(b + 8, serie)
+    // Nutzdaten nullen: ein halb gefuelltes Objekt muss jederzeit verfolgbar
+    // sein (eine Feldinitialisierung kann selbst wieder allozieren).
+    let obj: u64 = b + KOPF
+    var i: u64 = 0
+    while i < size {
+        __gc_st64(obj + i, 0)
+        i = i + 8
+    }
+    let block: u64 = __gc_ld64(st + S_BLOCKGROESSE)
+    __gc_st64(st + S_SEIT, __gc_ld64(st + S_SEIT) + block)
+    __gc_st64(st + S_GESAMT, __gc_ld64(st + S_GESAMT) + block)
+    return obj as *mut u8
+}
+
+fn __gc_hole_block(klasse: u64, size: u64) -> u64 {
+    let st: u64 = __gc_state() as u64
+    if klasse >= KLASSEN {
+        let c: u64 = __gc_chunk_neu(klasse, size)
+        if c == 0 {
+            return 0
+        }
+        __gc_st64(st + S_BLOCKGROESSE, __gc_ld64(c + 16))
+        return c + CHUNK_KOPF
+    }
+    let kopf: u64 = st + S_FREI + klasse * 8
+    var b: u64 = __gc_ld64(kopf)
+    if b == 0 {
+        if __gc_chunk_neu(klasse, size) == 0 {
+            return 0
+        }
+        b = __gc_ld64(kopf)
+        if b == 0 {
+            return 0
+        }
+    }
+    __gc_st64(kopf, __gc_ld64(b + KOPF))
+    __gc_st64(st + S_BLOCKGROESSE, KOPF + __gc_klassen_bytes(klasse))
+    return b
+}
+
+// ------------------------------------------------------------ Schwache Verweise
+
+struct GcWeakRaw {
+    __p: u64,
+    __s: u64,
+}
+
+// `weak(g)`: Zeiger VERSCHLEIERT ablegen, damit der konservative Stapelscan ihn
+// nicht als starke Wurzel liest, dazu die Seriennummer des Zielblocks.
+fn __gc_weak_raw(p: *mut u8) -> GcWeakRaw {
+    let a: u64 = p as u64
+    if a == 0 {
+        return GcWeakRaw{ __p: 0, __s: 0 }
+    }
+    return GcWeakRaw{ __p: a ^ WEAK_XOR, __s: __gc_ld64(a - KOPF + 8) }
+}
+
+// `stark(w)`: Aufwertung. Nullwert, wenn das Ziel eingesammelt wurde — die
+// Seriennummer schuetzt gegen einen inzwischen wiederverwendeten Block.
+fn __gc_strong_raw(w: GcWeakRaw) -> *mut u8 {
+    if w.__p == 0 {
+        return 0 as *mut u8
+    }
+    let a: u64 = w.__p ^ WEAK_XOR
+    let b: u64 = __gc_block_von(a)
+    if b == 0 {
+        return 0 as *mut u8
+    }
+    if b + KOPF != a {
+        return 0 as *mut u8
+    }
+    if __gc_ld32(b) == 0 {
+        return 0 as *mut u8
+    }
+    if __gc_ld64(b + 8) != w.__s {
+        return 0 as *mut u8
+    }
+    return a as *mut u8
+}
+
+// ------------------------------------------------- Gepruefte Abwaertsumwandlung
+
+fn __gc_as_raw(p: *mut u8, ziel: u64) -> *mut u8 {
+    let a: u64 = p as u64
+    if a == 0 {
+        return 0 as *mut u8
+    }
+    let st: u64 = __gc_state() as u64
+    let tab: u64 = __gc_ld64(st + S_TABELLE)
+    var tid: u64 = __gc_ld32(a - KOPF) as u64
+    var tiefe: u64 = 0
+    while tid != 0 && tiefe < 64 {
+        if tid == ziel {
+            return p
+        }
+        if tid > __gc_ld64(tab) {
+            return 0 as *mut u8
+        }
+        tid = __gc_ld64(tab + 8 + (tid - 1) * 64 + 8)
+        tiefe = tiefe + 1
+    }
+    return 0 as *mut u8
+}
+
+// ------------------------------------------------------------ Einfuegebarriere
+
+// Die Einfuegebarriere sitzt an genau dieser Stelle: dem Schreiben eines
+// Gc-Zeigers in ein Heapfeld. Der Sammler dieser Stufe haelt an (Mark-Sweep,
+// nicht inkrementell), deshalb muss hier nichts gefaerbt werden; gezaehlt wird
+// trotzdem, damit der Weg nachweisbar durchlaufen wird (gc_barriers()).
+fn __gc_barrier(feld: *mut u8, wert: *mut u8) {
+    let st: u64 = __gc_state() as u64
+    if (feld as u64) == 0 && (wert as u64) == 0 {
+        return
+    }
+    __gc_st64(st + S_BARRIEREN, __gc_ld64(st + S_BARRIEREN) + 1)
+}
+
+// ------------------------------------------------------------- Schnittstelle
+
+// Einmal als Erstes in main: Heap vorbereiten, Stapelboden merken.
+// false = mmap bzw. Stapelboden fehlgeschlagen; der Aufrufer MUSS dann
+// sichtbar scheitern.
+fn gc_init() -> bool {
+    let st: u64 = __gc_state() as u64
+    if __gc_ld64(st + S_INIT) != 0 {
+        return true
+    }
+    let boden: u64 = __gc_stapel_boden()
+    if boden == 0 {
+        return false
+    }
+    let ms: u64 = __gc_mmap(MARK_BYTES)
+    if ms == 0 {
+        return false
+    }
+    __gc_st64(st + S_BODEN, boden)
+    __gc_st64(st + S_MSTACK, ms)
+    __gc_st64(st + S_MKAP, MARK_BYTES / 8)
+    __gc_st64(st + S_MLEN, 0)
+    __gc_st64(st + S_GRENZE, MIN_GRENZE)
+    __gc_st64(st + S_INIT, 1)
+    return true
+}
+
+// Obergrenze des Heaps in Bytes; 0 = unbegrenzt. Wird die Grenze erreicht,
+// sammelt der Sammler erst und meldet dann AllocError::OutOfMemory.
+fn gc_set_max_bytes(n: u64) {
+    __gc_st64(__gc_state() as u64 + S_MAXHEAP, n)
+}
+
+fn gc_max_bytes() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_MAXHEAP)
+}
+
+fn gc_collect() -> u64 {
+    __gc_scrub()
+    return __gc_collect_now()
+}
+
+fn gc_collections() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_LAEUFE)
+}
+
+fn gc_live_objects() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_LEBENDE)
+}
+
+fn gc_heap_bytes() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_HEAP)
+}
+
+fn gc_live_bytes() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_LEBBYTES)
+}
+
+fn gc_pause_ns_last() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_PAUSE_LAST)
+}
+
+fn gc_pause_ns_max() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_PAUSE_MAX)
+}
+
+fn gc_pause_ns_total() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_PAUSE_TOTAL)
+}
+
+fn gc_barriers() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_BARRIEREN)
+}
+
+fn gc_total_bytes() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_GESAMT)
+}

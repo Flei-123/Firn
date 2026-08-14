@@ -118,7 +118,7 @@ pub(crate) fn replace_uses(f: &mut Func, map: &HashMap<Val, Val>) -> usize {
                 continue; // SPEC §9.2: Operanden bleiben, wie sie sind
             }
             match &mut i.op {
-                Op::Const(_) | Op::Alloca { .. } => {}
+                Op::Const(_) | Op::Alloca { .. } | Op::GcAddr { .. } => {}
                 Op::Bin(_, a, b2) => {
                     rep(a, &mut n);
                     rep(b2, &mut n);

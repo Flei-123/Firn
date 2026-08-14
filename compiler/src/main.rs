@@ -16,6 +16,7 @@ mod dwarf;
 mod errors;
 mod fir;
 mod gc;
+mod gc_lower;
 mod inline;
 mod layout;
 mod lexer;

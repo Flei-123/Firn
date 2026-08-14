@@ -67,7 +67,7 @@ pub const ATTRS: &[AttrInfo] = &[
         name: "no_gc",
         ziel: Ziel::Funktion,
         args: 0,
-        umgesetzt: false,
+        umgesetzt: true,
         was: "kein Sammellauf in diesem Aufrufbaum (SPEC 3.5.4)",
     },
     AttrInfo {
@@ -218,8 +218,21 @@ mod tests {
     fn nur_must_consume_ist_umgesetzt() {
         // Wird ein weiteres Attribut umgesetzt, MUSS dieser Test angepasst
         // werden — das erzwingt, dass README und SPEC mitgezogen werden.
+        // Stand Runde „Haertetest 2": zusaetzlich #[no_gc] (SPEC 3.5.4,
+        // geprueft in nogc.rs, Testprogramme tests/54x_no_gc_*.fi und
+        // tests/neg/nogc_*.fi).
         let u: Vec<&str> = ATTRS.iter().filter(|a| a.umgesetzt).map(|a| a.name).collect();
-        assert_eq!(u, vec!["must_consume"]);
+        assert_eq!(u, vec!["must_consume", "no_gc"]);
+    }
+
+    #[test]
+    fn nicht_umgesetzte_attribute_melden_weiter_einen_fehler() {
+        // Gegenprobe zu tests/neg/attr_nicht_umgesetzt.fi: die uebrigen
+        // Attribute bleiben abgelehnt, nichts wird still ignoriert.
+        for name in ["constant_time", "unwinds", "packed", "align", "layout", "no_move", "hot"] {
+            let a = suche(name).expect(name);
+            assert!(!a.umgesetzt, "{} gilt unerwartet als umgesetzt", name);
+        }
     }
 
     #[test]

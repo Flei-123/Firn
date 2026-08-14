@@ -69,6 +69,7 @@ pub enum TokKind {
     AndAnd,  // &&
     OrOr,    // ||
     Not,     // !
+    Question, // ? (gepruefte Abwaertsumwandlung `x.as?[T]`)
     Hash,    // # (Attribute)
     EqEq,
     NotEq,
@@ -134,6 +135,7 @@ impl TokKind {
             TokKind::Pipe => "|".into(),
             TokKind::Caret => "^".into(),
             TokKind::Hash => "#".into(),
+            TokKind::Question => "?".into(),
             TokKind::Shl => "<<".into(),
             TokKind::Shr => ">>".into(),
             TokKind::AndAnd => "&&".into(),
@@ -418,6 +420,7 @@ impl<'a> Lexer<'a> {
             ('^', _) => (TokKind::Caret, 1),
             ('#', _) => (TokKind::Hash, 1),
             ('!', _) => (TokKind::Not, 1),
+            ('?', _) => (TokKind::Question, 1),
             ('<', _) => (TokKind::Lt, 1),
             ('>', _) => (TokKind::Gt, 1),
             _ => return false,

@@ -120,6 +120,9 @@ impl<'a> Checker<'a> {
         crate::sema_match::declare_enums(self);
         // HOOK fehlerunionen: Fehlermengen anmelden (errors.rs)
         crate::errors::declare_error_sets(self);
+        // HOOK gc: `gc class` als Struct mit Praefixlayout anmelden, Typkennung
+        // und Ahnenkette berechnen (gc.rs, SPEC 3.5.1)
+        crate::gc::declare_classes(self);
         self.add_items_inner(prog, true);
         // HOOK nogc: `#[no_gc]` transitiv pruefen (nogc.rs, SPEC 3.5.4).
         // Laeuft NACH der Typpruefung, weil Regel 3 (Schreiben in ein
@@ -163,6 +166,10 @@ impl<'a> Checker<'a> {
             // HOOK types: Aufzaehlungen auslegen (sema_match.rs)
             crate::sema_match::layout_enums(self, prog);
         }
+        // HOOK gc: Feldlayout der gc-Klassen (gc.rs). Erst hier sind die
+        // Structs und Aufzaehlungen des Programms bekannt — ein Structfeld in
+        // einer gc-Klasse bekommt so die richtige Meldung.
+        crate::gc::layout_classes(self);
         self.collect_fns(prog);
         // Attribute pruefen und anwenden (attrs.rs)
         self.check_attrs(prog);
@@ -785,6 +792,16 @@ impl<'a> Checker<'a> {
                 }
             }
             ExprKind::Field(base, name, nspan) => {
+                // HOOK gc: Schreiben DURCH einen `Gc[T]` hindurch (gc.rs).
+                // `let a: Gc[Knoten]` bindet den GRIFF unveraenderlich — das
+                // Objekt am anderen Ende bleibt schreibbar, genau wie bei
+                // `let p: *mut T` und `(*p).feld = …`.
+                if let Some(bt) = self.probe(base).filter(crate::gc::ist_gc_ptr) {
+                    let _ = self.expr(base, None);
+                    let ty = self.field_type(&bt, name, *nspan, base.span);
+                    self.record(e.id, ty.clone());
+                    return Some((ty, Mutability::Mutable));
+                }
                 let (bt, m) = self.lvalue(base)?;
                 let ty = self.field_type(&bt, name, *nspan, base.span);
                 self.record(e.id, ty.clone());
@@ -827,6 +844,11 @@ impl<'a> Checker<'a> {
     }
 
     fn field_type(&mut self, base: &Type, name: &str, nspan: Span, bspan: Span) -> Type {
+        // HOOK gc: Feldzugriff durch `Gc[T]` hindurch (gc.rs, SPEC 3.5.1). Ein
+        // Gc-Zeiger wird gefolgt, ohne `(*p).feld` — er ist erstklassig.
+        if let Some(i) = crate::gc::hook_field_base(base) {
+            return self.field_type(&Type::Struct(i), name, nspan, bspan);
+        }
         match base {
             Type::Struct(i) => match self.tcx.structs.get(*i).and_then(|s| s.field(name)) {
                 Some(f) => f.ty.clone(),
@@ -1246,7 +1268,8 @@ impl<'a> Checker<'a> {
             if lt.is_error() || rt.is_error() {
                 return Type::Bool;
             }
-            let same = compatible(&lt, &rt);
+            // HOOK gc: Identitaetsvergleich zweier verwandter Gc-Zeiger (gc.rs)
+            let same = compatible(&lt, &rt) || crate::gc::ist_verwandt(&lt, &rt);
             if !same {
                 self.dg.error(
                     e.span,
@@ -1338,6 +1361,11 @@ impl<'a> Checker<'a> {
         }
         // HOOK constant-time: select/barrier/secure_zero (ct.rs, SPEC §9.2/§9.3)
         if let Some(t) = crate::ct::hook_call(self, name, args, nspan, espan) {
+            return t;
+        }
+        // HOOK gc: `gc C{…}`, `weak(g)`, `stark(w)`, `x.as?[C]` und die
+        // Sammler-Intrinsics (gc.rs, SPEC 3.5)
+        if let Some(t) = crate::gc::hook_call(self, name, args, nspan, espan) {
             return t;
         }
         let sig = match self.fns.get(name) {
@@ -1509,15 +1537,17 @@ impl<'a> Checker<'a> {
                     self.probe_d(l, d + 1).or_else(|| self.probe_d(r, d + 1))
                 }
             }
-            ExprKind::Field(base, name, _) => match self.probe_d(base, d + 1) {
-                Some(Type::Struct(i)) => self
-                    .tcx
-                    .structs
-                    .get(i)
+            ExprKind::Field(base, name, _) => {
+                let bt = self.probe_d(base, d + 1)?;
+                // HOOK gc: Feldzugriff durch `Gc[T]` hindurch (gc.rs)
+                let idx = match bt {
+                    Type::Struct(i) => Some(i),
+                    ref t => crate::gc::hook_field_base(t),
+                };
+                idx.and_then(|i| self.tcx.structs.get(i))
                     .and_then(|s| s.field(name))
-                    .map(|f| f.ty.clone()),
-                _ => None,
-            },
+                    .map(|f| f.ty.clone())
+            }
             ExprKind::Index(base, _) => match self.probe_d(base, d + 1) {
                 Some(Type::Array(el, _)) => Some((*el).clone()),
                 _ => None,
@@ -1528,6 +1558,12 @@ impl<'a> Checker<'a> {
                 if crate::errors::is_result_call(name) {
                     let inner = args.first().and_then(|a| self.probe_d(a, d + 1))?;
                     return crate::errors::success_type(&inner);
+                }
+                // HOOK gc: Typ von `weak(g)`, `stark(w)` und `x.as?[C]` OHNE
+                // Pruefung, damit ein Literal daneben seinen Typ bekommt (gc.rs)
+                let arg0 = args.first().and_then(|a| self.probe_d(a, d + 1));
+                if let Some(t) = crate::gc::probe_typ(name, arg0.as_ref()) {
+                    return Some(t);
                 }
                 self.fns.get(name).map(|s| s.ret.clone())
             }
@@ -1557,6 +1593,11 @@ impl<'a> Checker<'a> {
         }
         // HOOK fehlerunionen: Fehlerunion `E!T` (errors.rs)
         if let Some(t) = crate::errors::hook_resolve_ty(self, te) {
+            return t;
+        }
+        // HOOK gc: `Gc[C]`, `GcWeak[C]` und der verbotene Gebrauch eines
+        // `gc class`-Namens als gewoehnlicher Wert (gc.rs)
+        if let Some(t) = crate::gc::hook_resolve_ty(self, te) {
             return t;
         }
         match te {
@@ -1796,6 +1837,12 @@ fn cast_kind(t: &Type) -> bool {
 /// hat keinen Mutabilitaetspruefer fuer Zeigerziele).
 fn assignable(got: &Type, want: &Type) -> bool {
     if got.is_error() || want.is_error() {
+        return true;
+    }
+    // HOOK gc: kostenlose Aufwaertsumwandlung `Gc[Abgeleitet]` -> `Gc[Basis]`
+    // (gc.rs, SPEC 4.4). NUR diese Richtung; abwaerts geht ausschliesslich
+    // ueber das gepruefte `x.as?[C]`.
+    if crate::gc::ist_aufwaerts(got, want) {
         return true;
     }
     compatible(got, want)
