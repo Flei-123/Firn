@@ -52,6 +52,8 @@ pub struct OptStats {
     pub inlined: usize,
     /// entfernte, beweisbar immer erfuellte Bereichspruefungen
     pub removed_checks: usize,
+    /// schleifeninvariante Instruktionen, die in den Vorkopf gewandert sind
+    pub hoisted: usize,
 }
 
 // ------------------------------------------------ Durchgangsregister ---
@@ -138,6 +140,12 @@ pub const PASSES: &[PassInfo] = &[
         scope: Scope::Func,
         debug_preserving: true,
         what: "gemeinsame Teilausdruecke zusammenfassen",
+    },
+    PassInfo {
+        name: "licm",
+        scope: Scope::Func,
+        debug_preserving: true,
+        what: "schleifeninvariante Berechnungen in den Vorkopf ziehen",
     },
     PassInfo {
         name: "bce",
@@ -283,6 +291,11 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig) {
             let e = cse(f);
             st.cse += e;
             changed |= e > 0;
+        }
+        if cfg.runs("licm") {
+            let h = crate::licm::hoist_loop_invariants(f);
+            st.hoisted += h;
+            changed |= h > 0;
         }
         if cfg.runs("bce") {
             let r = remove_redundant_checks(f);

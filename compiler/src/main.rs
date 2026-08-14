@@ -20,6 +20,7 @@ mod gc_lower;
 mod inline;
 mod layout;
 mod lexer;
+mod licm;
 mod lower;
 mod lower_errors;
 mod lower_match;

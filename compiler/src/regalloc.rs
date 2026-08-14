@@ -1158,15 +1158,22 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
                         "[rcx]".to_string()
                     }
                 };
+                // DIREKT ins Zielregister laden, statt ueber rax und dann zu
+                // kopieren. `mov r9, qword ptr [r9]` ist korrekt: die
+                // Instruktion liest die Adresse, bevor sie das Ziel schreibt.
+                // Das spart je Speicherzugriff eine Instruktion — im
+                // Schleifenrumpf von matmul waren das zwei von 24.
+                let zr = match ra.a.loc(d) {
+                    Loc::Reg(r) => r,
+                    Loc::Slot(_) => "rax",
+                };
                 match bits {
-                    8 => e.line(&format!("movzx eax, byte ptr {}", mem)),
-                    16 => e.line(&format!("movzx eax, word ptr {}", mem)),
-                    32 => e.line(&format!("mov eax, dword ptr {}", mem)),
-                    _ => e.line(&format!("mov rax, qword ptr {}", mem)),
+                    8 => e.line(&format!("movzx {}, byte ptr {}", rn(zr, 32), mem)),
+                    16 => e.line(&format!("movzx {}, word ptr {}", rn(zr, 32), mem)),
+                    32 => e.line(&format!("mov {}, dword ptr {}", rn(zr, 32), mem)),
+                    _ => e.line(&format!("mov {}, qword ptr {}", zr, mem)),
                 }
-                // Zielregister direkt beschreiben, wenn moeglich
-                if let Loc::Reg(r) = ra.a.loc(d) {
-                    e.line(&format!("mov {}, rax", r));
+                if zr != "rax" {
                     return Ok(());
                 }
             }
@@ -1201,37 +1208,61 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
         }
         Op::PtrAdd { base, off } => {
             let d = i.dst.ok_or("interner Fehler: ptradd ohne Ziel")?;
-            // Zielregister nur dann direkt beschreiben, wenn dort nicht der
-            // noch benoetigte Offset-Operand liegt.
-            let dst_reg = match (ra.a.loc(d), ra.a.loc(*off)) {
-                (Loc::Reg(r), Loc::Reg(o)) if r == o => "rax",
-                (Loc::Reg(r), _) => r,
-                (Loc::Slot(_), _) => "rax",
+            // `lea` liest BEIDE Operanden, bevor es das Ziel schreibt — eine
+            // Kollision zwischen Ziel- und Offsetregister ist dort also
+            // unschaedlich. Nur der `mov`+`add`-Weg braucht den Umweg ueber
+            // rax; deshalb wird das Ziel hier optimistisch gewaehlt und nur in
+            // den beiden `add`-Zweigen zurueckgenommen.
+            let dreg = match ra.a.loc(d) {
+                Loc::Reg(r) => r,
+                Loc::Slot(_) => "rax",
             };
+            let reg_von = |v: Val| match (ra.a.imm(v), ra.a.loc(v)) {
+                (None, Loc::Reg(r)) => Some(r),
+                _ => None,
+            };
+            let off_reg = reg_von(*off);
+            let base_reg = reg_von(*base);
+            let mut ziel = dreg;
             if let Some(boff) = ra.a.frame_addr.get(base).copied() {
                 // Adresse = rbp - boff + off  -> ein einziges `lea`
-                match (ra.a.imm(*off), ra.a.loc(*off)) {
+                match (ra.a.imm(*off), off_reg) {
                     (Some(k), _) => {
                         let delta = k - boff as i64;
                         if delta >= 0 {
-                            e.line(&format!("lea {}, [rbp+{}]", dst_reg, delta));
+                            e.line(&format!("lea {}, [rbp+{}]", ziel, delta));
                         } else {
-                            e.line(&format!("lea {}, [rbp-{}]", dst_reg, -delta));
+                            e.line(&format!("lea {}, [rbp-{}]", ziel, -delta));
                         }
                     }
-                    (None, Loc::Reg(r)) => {
-                        e.line(&format!("lea {}, [rbp+{}-{}]", dst_reg, r, boff))
-                    }
-                    (None, Loc::Slot(_)) => {
+                    (None, Some(r)) => e.line(&format!("lea {}, [rbp+{}-{}]", ziel, r, boff)),
+                    (None, None) => {
                         e.line(&format!("mov rcx, {}", ra.opnd(*off)));
-                        e.line(&format!("lea {}, [rbp+rcx-{}]", dst_reg, boff));
+                        e.line(&format!("lea {}, [rbp+rcx-{}]", ziel, boff));
+                    }
+                }
+            } else if let (Some(x), Some(k)) = (base_reg, ra.a.imm(*off)) {
+                lea_summe(e, ziel, x, k);
+            } else if let (Some(x), Some(y)) = (base_reg, off_reg) {
+                e.line(&format!("lea {}, [{}+{}]", ziel, x, y));
+            } else if ziel != "rax" {
+                // Basis liegt im Rahmen oder ist eine Konstante: einmal nach
+                // rax holen, dann mit EINEM `lea` ins Ziel.
+                ra.load_full(e, "rax", *base);
+                match (ra.a.imm(*off), off_reg) {
+                    (Some(k), _) => lea_summe(e, ziel, "rax", k),
+                    (None, Some(y)) => e.line(&format!("lea {}, [rax+{}]", ziel, y)),
+                    (None, None) => {
+                        e.line(&format!("add rax, {}", ra.opnd(*off)));
+                        ziel = "rax";
                     }
                 }
             } else {
-                ra.load_full(e, dst_reg, *base);
-                e.line(&format!("add {}, {}", dst_reg, ra.opnd(*off)));
+                ra.load_full(e, "rax", *base);
+                e.line(&format!("add rax, {}", ra.opnd(*off)));
+                ziel = "rax";
             }
-            if dst_reg == "rax" {
+            if ziel == "rax" {
                 ra.store_dst(e, d, "rax");
             }
         }
@@ -1321,6 +1352,60 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
     Ok(())
 }
 
+/// `lea ziel, [basis + versatz]` — die Adressrechnung des Prozessors als
+/// Rechenwerk. Der Gewinn ist keine Kosmetik: `mov d, a` + `add d, b` sind zwei
+/// Instruktionen und zerstoeren `d`, `lea d, [a+b]` ist eine und liest nur.
+/// Damit faellt in Adressrechnungen (`basis + i*breite`) das halbe
+/// Registergeschiebe weg — in `bench/firn/matmul.fi` waren 14 der 27
+/// Instruktionen der inneren Schleife reine Registerkopien.
+///
+/// **Nur 64 Bit.** Bei 32-Bit-Zielen nullt `add eax, ecx` die oberen 32 Bit,
+/// `lea rax, [rcx+rdx]` nicht — der Unterschied ist sichtbar, sobald der Wert
+/// als 64-Bit-Wert weitergereicht wird. Deshalb bleibt der schmale Fall beim
+/// alten Weg.
+///
+/// **Flags.** `lea` setzt keine, `add` schon. Das ist hier gefahrlos: in FIR ist
+/// jeder Vergleich ein eigener `Op::Cmp`, der sein `cmp`/`setcc` unmittelbar
+/// hintereinander erzeugt. Kein `setcc`, `jcc` oder `cmov` liest jemals die
+/// Flags einer FIR-Rechenoperation.
+/// Genau ein Operand liegt in einem Register, der andere im Rahmen (kein
+/// Sofortwert)? Dann lohnt der Weg ueber rax mit abschliessendem `lea`.
+fn add_ueber_rax(ra: &Ra, a: Val, b: Val) -> bool {
+    let ist_reg = |v: Val| ra.a.imm(v).is_none() && matches!(ra.a.loc(v), Loc::Reg(_));
+    let ist_rahmen = |v: Val| ra.a.imm(v).is_none() && matches!(ra.a.loc(v), Loc::Slot(_));
+    (ist_reg(a) && ist_rahmen(b)) || (ist_rahmen(a) && ist_reg(b))
+}
+
+/// Laesst sich `d = a op b` als ein einziges `lea` schreiben?
+///
+/// Nur 64 Bit (siehe `lea_summe`), nur mit Zielregister, und nur wenn die
+/// Operanden wirklich als Adressteile taugen: Register + Register,
+/// Register + Sofortwert, Sofortwert + Register. Bei `sub` zusaetzlich
+/// `k != i64::MIN`, weil `-k` sonst ueberlaeuft.
+fn lea_moeglich(ra: &Ra, op: BinOp, ty: FTy, a: Val, b: Val, d: Val) -> bool {
+    if ty.bits() <= 32 || !matches!(ra.a.loc(d), Loc::Reg(_)) {
+        return false;
+    }
+    let ist_reg = |v: Val| ra.a.imm(v).is_none() && matches!(ra.a.loc(v), Loc::Reg(_));
+    match op {
+        BinOp::Add => {
+            (ist_reg(a) && ist_reg(b))
+                || (ist_reg(a) && ra.a.imm(b).is_some())
+                || (ra.a.imm(a).is_some() && ist_reg(b))
+        }
+        BinOp::Sub => ist_reg(a) && matches!(ra.a.imm(b), Some(k) if k != i64::MIN),
+        _ => false,
+    }
+}
+
+fn lea_summe(e: &mut Emitter, ziel: &str, basis: &str, versatz: i64) {
+    if versatz >= 0 {
+        e.line(&format!("lea {}, [{}+{}]", ziel, basis, versatz));
+    } else {
+        e.line(&format!("lea {}, [{}-{}]", ziel, basis, -(versatz as i128) as i64));
+    }
+}
+
 fn emit_bin(
     e: &mut Emitter,
     ra: &Ra,
@@ -1354,6 +1439,61 @@ fn emit_bin(
             if dst_reg == "rax" {
                 ra.store_dst(e, d, "rax");
             }
+        }
+        // `lea` statt `mov`+`add`: eine Instruktion, kein zerstoertes Ziel,
+        // und es funktioniert auch dann, wenn der zweite Operand bereits im
+        // Zielregister liegt — dort fiel der alte Weg auf den rax-Umweg mit
+        // DREI Instruktionen zurueck.
+        //
+        // Die Bedingung prueft den lea-Fall VOLLSTAENDIG. Es gibt hier
+        // absichtlich keinen Ersatzpfad: alles andere faellt in den Zweig
+        // darunter, der seinen eigenen Schutz mitbringt (steht der zweite
+        // Operand im Zielregister, muss ueber rax gerechnet werden). Ein
+        // Ersatzpfad ohne diesen Schutz hat beim ersten Versuch
+        // `mov r9, [rbp-8]` + `add r9, r9` erzeugt — matmul lief in einen
+        // Speicherzugriffsfehler. Der Fehler ist der Grund fuer diese Form.
+        BinOp::Add | BinOp::Sub if lea_moeglich(ra, op, ty, a, b, d) => {
+            let dr = match ra.a.loc(d) {
+                Loc::Reg(r) => r,
+                Loc::Slot(_) => unreachable!("lea_moeglich verlangt ein Zielregister"),
+            };
+            let reg_von = |v: Val| match (ra.a.imm(v), ra.a.loc(v)) {
+                (None, Loc::Reg(r)) => Some(r),
+                _ => None,
+            };
+            match op {
+                BinOp::Add => match (reg_von(a), reg_von(b), ra.a.imm(a), ra.a.imm(b)) {
+                    (Some(x), Some(y), _, _) => e.line(&format!("lea {}, [{}+{}]", dr, x, y)),
+                    (Some(x), None, _, Some(k)) => lea_summe(e, dr, x, k),
+                    (None, Some(y), Some(k), _) => lea_summe(e, dr, y, k),
+                    _ => unreachable!("lea_moeglich hat den Fall zugesichert"),
+                },
+                _ => match (reg_von(a), ra.a.imm(b)) {
+                    (Some(x), Some(k)) => lea_summe(e, dr, x, -k),
+                    _ => unreachable!("lea_moeglich hat den Fall zugesichert"),
+                },
+            }
+        }
+        // Ein Operand liegt im Rahmen, der andere in einem Register — der mit
+        // Abstand haeufigste Fall in Adressrechnungen (`basis + versatz`, wobei
+        // die Basis ein Parameter im Rahmen ist). Einmal nach rax holen, dann
+        // EIN `lea` ins Ziel. Der allgemeine Zweig darunter braucht hier drei
+        // Instruktionen, weil das Ziel mit dem Registeroperanden zusammenfaellt
+        // und er deshalb ueber rax rechnen und zurueckkopieren muss.
+        BinOp::Add if wide && matches!(ra.a.loc(d), Loc::Reg(_)) && add_ueber_rax(ra, a, b) => {
+            let dr = match ra.a.loc(d) {
+                Loc::Reg(r) => r,
+                Loc::Slot(_) => unreachable!("durch die Bedingung ausgeschlossen"),
+            };
+            let ist_reg = |v: Val| ra.a.imm(v).is_none() && matches!(ra.a.loc(v), Loc::Reg(_));
+            // `+` ist kommutativ: der Registeroperand wird zum Indexteil.
+            let (aus_rahmen, im_reg) = if ist_reg(b) { (a, b) } else { (b, a) };
+            let y = match ra.a.loc(im_reg) {
+                Loc::Reg(r) => r,
+                Loc::Slot(_) => unreachable!("add_ueber_rax hat ein Register zugesichert"),
+            };
+            ra.load_full(e, "rax", aus_rahmen);
+            e.line(&format!("lea {}, [rax+{}]", dr, y));
         }
         BinOp::Add | BinOp::Sub | BinOp::And | BinOp::Or | BinOp::Xor | BinOp::Mul => {
             let m = match op {
