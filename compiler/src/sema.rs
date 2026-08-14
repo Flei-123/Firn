@@ -121,6 +121,10 @@ impl<'a> Checker<'a> {
         // HOOK fehlerunionen: Fehlermengen anmelden (errors.rs)
         crate::errors::declare_error_sets(self);
         self.add_items_inner(prog, true);
+        // HOOK nogc: `#[no_gc]` transitiv pruefen (nogc.rs, SPEC 3.5.4).
+        // Laeuft NACH der Typpruefung, weil Regel 3 (Schreiben in ein
+        // Gc[T]-Feld) die Typtabelle braucht.
+        crate::nogc::hook_check(self, prog);
         // Ganzprogramm-Pruefung: laeuft genau einmal, nicht je Nachtrag.
         self.check_main(prog);
     }
