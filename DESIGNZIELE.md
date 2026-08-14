@@ -665,12 +665,27 @@ fn neuer_puffer(alloc: inout Allocator, n: usize) -> AllocError!Gross {
 
 ### Konsequenz für den Compiler HEUTE
 
-* **Aggregat-Rückgabe muss von Anfang an über den versteckten Zeiger laufen**,
-  nicht über eine Kopie. Firn hat Aggregate an Funktionsgrenzen seit der letzten
-  Runde (`compiler/src/abi.rs`, SPEC §14.1 Punkt 1 gestrichen). **Jetzt ist der
-  richtige Moment zu prüfen, ob dort schon direkt am Ziel geschrieben wird** —
-  wenn ja, ist der Grundstein gelegt; wenn nein, ist es später ein Umbau des
-  gesamten Lowerings.
+* **Aggregat-Rückgabe muss über den versteckten Zeiger laufen, nicht über eine
+  Kopie.** **Nachgeprüft am 14.08.2026 — das ist bereits so:**
+  `compiler/src/abi.rs:66 ret_needs_sret()` klassifiziert Rückgaben über 16 Byte
+  als `MEMORY` und übergibt den versteckten Zeiger in `rdi`; und
+  `compiler/src/lower.rs:604` reicht die **Zieladresse** durch:
+
+  ```rust
+  let target = if ret_agg {
+      match dest {
+          Some(d) => Some(d),                         // <- direkt ans Ziel
+          None    => Some(self.alloca(size, align)),  // nur ohne Ziel ein Zwischenwert
+      }
+  } else { None };
+  ```
+
+  Damit ist die Ergebnisort-Semantik für Aggregatrückgaben **schon vorhanden**,
+  ohne dass sie je als Sprachgarantie ausgesprochen wurde. Der Grundstein liegt.
+* **Was noch fehlt:** (a) die Garantie in `SPEC.md` **festschreiben**, damit sie
+  nicht versehentlich verlorengeht; (b) sie auf Struct- und Arrayliterale sowie
+  auf `init`-Ausdrücke ausdehnen; (c) ein Test, der belegt, dass ein 8-MB-Array
+  **nicht** über den Stapel geht (`--emit=asm` prüfen: kein `sub rsp, 8388608`).
 * **Die IR muss einen Zielort-Operanden kennen können.** In FIR ist das ein
   zusätzlicher Operand an `call` und an Aggregatkonstruktion. Später
   nachzurüsten heißt, jeden Lowering-Pfad anzufassen.
@@ -678,9 +693,11 @@ fn neuer_puffer(alloc: inout Allocator, n: usize) -> AllocError!Gross {
 
 ### Priorität und Phase
 
-**FUNDAMENT.** Ergebnisort im Lowering und in der IR: **Phase 2**
-(jetzt, solange das Lowering klein ist). `init`-Ausdruck mit Teilaufräumung und
-`#[no_move]`: **Phase 3**, zusammen mit `drop` und dem Move-Prüfer.
+**FUNDAMENT — aber zur Hälfte schon erledigt.** Ergebnisort für
+Aggregatrückgaben: **vorhanden** (nachgeprüft). Als Garantie in `SPEC.md`
+festschreiben und auf Literale ausdehnen: **Phase 2**. `init`-Ausdruck mit
+Teilaufräumung und `#[no_move]`: **Phase 3**, zusammen mit `drop` und dem
+Move-Prüfer.
 
 ---
 
@@ -757,7 +774,7 @@ fn erzeuge_getter[comptime T: type]() {
 **(c) Bauskripte** (`SPEC.md` §6.4) bleiben für das, was `comptime` nicht kann:
 externe Dateien lesen (UCD, CLDR, `.idl`, HTML-Entities). Sie laufen in der
 Sandbox aus §3 — **kein Netz, Schreibrechte nur im Ausgabeverzeichnis**.
-F�r große Tabellen liefert die Bibliothek perfektes Hashing und komprimierte
+Für große Tabellen liefert die Bibliothek perfektes Hashing und komprimierte
 Tries (`G4`).
 
 **Grenze, bewusst gezogen:** `comptime` darf **keine** E/A. Kein Dateizugriff,
@@ -1050,7 +1067,7 @@ Dingen, die später obendrauf kommen.
 | 3 | **Capability-Module** | **Regel: keine Ambient-Autorität in der Bibliothek.** Modulsystem muss eine *Paket*grenze kennen | Deklaration in `firn.toml`, Prüfung, Bauskript-Sandbox | **FUNDAMENT** (als Regel) | 3 |
 | 4 | **Stabiles ABI** | Nur ein **Symbol-Namensschema mit Versionsplatz**. `SPEC.md` muss sagen: Standardlayout ist *instabil* | `#[abi_stable]`, `#[frozen]`, resiliente Aufrufe | nachrüstbar | 3 → 7/8 |
 | 5 | **Debug-Bau-Geschwindigkeit** | **Optimierungsdurchgänge einzeln schaltbar + Etikett „debugerhaltend"**. Zeileninfo überlebt jeden Durchgang | vier Baustufen `--dev` … `--release-fast` | **FUNDAMENT** (billig) | 2 → 3 |
-| 6 | **In-Place-Initialisierung** | **Ergebnisort-Operand in FIR und im Lowering.** Aggregatrückgabe schreibt direkt ans Ziel | `init`-Ausdruck mit Teilaufräumung, `#[no_move]` | **FUNDAMENT** (teuer, aber jetzt am billigsten) | 2 → 3 |
+| 6 | **In-Place-Initialisierung** | **Ergebnisort als Garantie festschreiben** — für Aggregatrückgaben bereits umgesetzt (`lower.rs:604`, nachgeprüft), fehlt für Literale und `init` | `init`-Ausdruck mit Teilaufräumung, `#[no_move]` | **FUNDAMENT** (teuer, aber jetzt am billigsten) | 2 → 3 |
 | 7 | **Comptime + Reflexion** | **Prüfphasen wiedereintrittsfähig** (neu erzeugte Elemente nachträglich prüfbar). FIR bleibt interpretierbar | `comptime`-Interpreter, `reflect.*`, `emit`, Bauskripte | **FUNDAMENT** (Architektur) | 2 → 3 |
 | 8 | **Datenlayout / SoA** | **Feldzugriff vom Speicherort trennen** im Lowering. Layoutberechnung an einer Stelle | `SoaVec[T]`, `#[layout(soa)]`, `#[bitfeld]`, `#[klein(N)]` | **FUNDAMENT** (Lowering) | 2/3 → 3/4 |
 | 9 | **Hot Reload** | **nichts** — nur nicht ausschließen | Stufe B (Daten neu laden), evtl. `#[hot]` | nachrüstbar | 4 / kein Termin |
@@ -1070,10 +1087,11 @@ nichts, weil sie Architekturentscheidungen sind und keine Merkmale:
    erhaltend.** (Punkt 5 — heute billig, später ein Umbau jedes Durchgangs)
 5. **Prüfphasen wiedereintrittsfähig, FIR interpretierbar.**
    (Punkt 7 — Architektur, keine Funktion)
-6. **Feldzugriff vom Speicherort getrennt, Ergebnisort in der IR.**
-   (Punkte 6 und 8 — **das ist die einzige teure Fundamentarbeit**, und genau
-   deshalb muss sie jetzt passieren, solange das Lowering ~2.000 Zeilen hat und
-   nicht 20.000)
+6. **Feldzugriff vom Speicherort getrennt** (Punkt 8) **und Ergebnisort als
+   Garantie** (Punkt 6). Der Ergebnisort ist für Aggregatrückgaben schon da
+   (nachgeprüft); **die Feldzugriffs-Trennung ist damit die einzige wirklich
+   teure Fundamentarbeit** — und genau deshalb muss sie jetzt passieren, solange
+   `lower.rs` 1.505 Zeilen hat und nicht 15.000.
 
 **Vier Dinge können warten** — sie sind additiv:
 
@@ -1107,9 +1125,11 @@ Wo diese Ziele sich gegenseitig weh tun — vollständig, damit später niemand
 
 Konkret und überprüfbar, in dieser Reihenfolge:
 
-1. **Ergebnisort im Lowering und in FIR** (Punkt 6) — prüfen, ob die
-   Aggregatrückgabe in `abi.rs` schon direkt ans Ziel schreibt; wenn nicht,
-   umbauen. *Teuerste und dringendste Fundamentarbeit.*
+1. **Ergebnisort festschreiben und ausweiten** (Punkt 6) — die
+   Aggregatrückgabe schreibt bereits direkt ans Ziel (`lower.rs:604`,
+   nachgeprüft 14.08.2026). Zu tun: als **Garantie** in `SPEC.md` aufnehmen, auf
+   Struct-/Arrayliterale und `init` ausdehnen, und den 8-MB-Test bauen.
+   *Deutlich billiger als befürchtet.*
 2. **Feldzugriff vom Speicherort trennen** (Punkt 8) — Zwischenschicht im
    Lowering statt „Basis plus Versatz".
 3. **`!T` + `#[must_consume]`** (Punkt 2) — steht ohnehin auf dem Plan für
