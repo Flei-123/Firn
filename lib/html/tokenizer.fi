@@ -1,0 +1,350 @@
+// lib/html/tokenizer.fi — HTML5-Tokenizer (WHATWG-Standard, §13.2.5) in Firn.
+//
+// GERUEST-STAND (vom Lead gelegt): Data, TagOpen, EndTagOpen, TagName,
+// BeforeAttributeName, AttributeName, AfterAttributeName, BeforeAttributeValue,
+// AttributeValue(Double/Single/Unquoted), AfterAttributeValueQuoted,
+// SelfClosingStartTag, BogusComment und PLAINTEXT.
+// Alles Weitere (Kommentare, DOCTYPE, RCDATA/RAWTEXT/ScriptData,
+// CharacterReference) traegt Modul `tokenizer-kern` bzw. `entities` nach.
+//
+// EHRLICHKEIT: ein Zustand, den dieser Tokenizer nicht kennt, setzt
+// `nicht_unterstuetzt` und BRICHT den Fall ab. Der Harness zaehlt den Fall
+// dann als FEHLSCHLAG — niemals als uebersprungen (siehe tools/tokenizer/run.sh).
+import mem
+import tokens
+
+export { State, tokenize, EOF, ZST_DATA, ZST_PLAINTEXT, ZST_RCDATA, ZST_RAWTEXT, ZST_SCRIPT, ZST_CDATA }
+
+// Codes der Startzustaende im Auftragsprotokoll (tools/tokenizer/PROTOKOLL.md).
+const ZST_DATA: u32 = 0
+const ZST_PLAINTEXT: u32 = 1
+const ZST_RCDATA: u32 = 2
+const ZST_RAWTEXT: u32 = 3
+const ZST_SCRIPT: u32 = 4
+const ZST_CDATA: u32 = 5
+
+// Ende der Eingabe.
+const EOF: u32 = 0xFFFFFFFF
+
+enum State {
+    Data,
+    Plaintext,
+    Rcdata,
+    Rawtext,
+    ScriptData,
+    CdataSection,
+    TagOpen,
+    EndTagOpen,
+    TagName,
+    BeforeAttributeName,
+    AttributeName,
+    AfterAttributeName,
+    BeforeAttributeValue,
+    AttributeValueDouble,
+    AttributeValueSingle,
+    AttributeValueUnquoted,
+    AfterAttributeValueQuoted,
+    SelfClosingStartTag,
+    BogusComment,
+    MarkupDeclarationOpen,
+    Fertig,
+    NichtUnterstuetzt,
+}
+
+fn ist_space(c: u32) -> bool {
+    return c == 9 as u32 || c == 10 as u32 || c == 12 as u32 || c == 32 as u32
+}
+
+fn ist_ascii_alpha(c: u32) -> bool {
+    return (c >= 65 as u32 && c <= 90 as u32) || (c >= 97 as u32 && c <= 122 as u32)
+}
+
+fn klein(c: u32) -> u32 {
+    if c >= 65 as u32 && c <= 90 as u32 {
+        return c + 32 as u32
+    }
+    return c
+}
+
+// Ein NULL-Zeichen wird in Text durch U+FFFD ersetzt (Parse-Fehler).
+fn null_ersatz(c: u32) -> u32 {
+    if c == 0 as u32 {
+        return 0xFFFD as u32
+    }
+    return c
+}
+
+// Tokenisiert `input` (Codepunkte) ab dem Startzustand `startzustand`.
+// Liefert false, wenn ein noch nicht umgesetzter Zustand erreicht wurde;
+// der Fall gilt dann als FEHLSCHLAG.
+fn tokenize(input: *mut mem.CpBuf, startzustand: u32, s: *mut tokens.Sink) -> bool {
+    var pos: usize = 0
+    let n: usize = mem.cp_len(input)
+    var state: State = State::Data
+    if startzustand == ZST_PLAINTEXT {
+        state = State::Plaintext
+    } else if startzustand == ZST_RCDATA {
+        state = State::Rcdata
+    } else if startzustand == ZST_RAWTEXT {
+        state = State::Rawtext
+    } else if startzustand == ZST_SCRIPT {
+        state = State::ScriptData
+    } else if startzustand == ZST_CDATA {
+        state = State::CdataSection
+    }
+    var ok: bool = true
+    var laeuft: bool = true
+    while laeuft {
+        var c: u32 = EOF
+        if pos < n {
+            c = mem.cp_at(input, pos)
+            pos = pos + 1
+        }
+        match state {
+            State::Data => {
+                if c == EOF {
+                    state = State::Fertig
+                } else if c == 60 as u32 {           // '<'
+                    state = State::TagOpen
+                } else {
+                    tokens.sink_emit_char(s, null_ersatz(c))
+                }
+            }
+            State::Plaintext => {
+                if c == EOF {
+                    state = State::Fertig
+                } else {
+                    tokens.sink_emit_char(s, null_ersatz(c))
+                }
+            }
+            State::TagOpen => {
+                if c == 33 as u32 {                  // '!'
+                    state = State::MarkupDeclarationOpen
+                } else if c == 47 as u32 {           // '/'
+                    state = State::EndTagOpen
+                } else if ist_ascii_alpha(c) {
+                    tokens.tok_start_tag(s)
+                    pos = pos - 1
+                    state = State::TagName
+                } else if c == 63 as u32 {           // '?'
+                    tokens.tok_comment(s)
+                    pos = pos - 1
+                    state = State::BogusComment
+                } else {
+                    tokens.sink_emit_char(s, 60 as u32)
+                    if c != EOF {
+                        pos = pos - 1
+                    }
+                    state = State::Data
+                }
+            }
+            State::EndTagOpen => {
+                if ist_ascii_alpha(c) {
+                    tokens.tok_end_tag(s)
+                    pos = pos - 1
+                    state = State::TagName
+                } else if c == 62 as u32 {           // '>'
+                    state = State::Data
+                } else if c == EOF {
+                    tokens.sink_emit_char(s, 60 as u32)
+                    tokens.sink_emit_char(s, 47 as u32)
+                    state = State::Fertig
+                } else {
+                    tokens.tok_comment(s)
+                    pos = pos - 1
+                    state = State::BogusComment
+                }
+            }
+            State::TagName => {
+                if c == EOF {
+                    state = State::Fertig
+                } else if ist_space(c) {
+                    state = State::BeforeAttributeName
+                } else if c == 47 as u32 {
+                    state = State::SelfClosingStartTag
+                } else if c == 62 as u32 {
+                    tokens.tok_emit(s)
+                    state = State::Data
+                } else {
+                    tokens.tok_name_push(s, klein(null_ersatz(c)))
+                }
+            }
+            State::BeforeAttributeName => {
+                if ist_space(c) {
+                    // ueberspringen
+                } else if c == 47 as u32 || c == 62 as u32 || c == EOF {
+                    if c != EOF {
+                        pos = pos - 1
+                    }
+                    state = State::AfterAttributeName
+                } else if c == 61 as u32 {           // '=' : Parse-Fehler
+                    tokens.tok_attr_start(s)
+                    tokens.tok_attr_name_push(s, c)
+                    state = State::AttributeName
+                } else {
+                    tokens.tok_attr_start(s)
+                    pos = pos - 1
+                    state = State::AttributeName
+                }
+            }
+            State::AttributeName => {
+                if ist_space(c) || c == 47 as u32 || c == 62 as u32 || c == EOF {
+                    tokens.tok_attr_finish(s)
+                    if c != EOF {
+                        pos = pos - 1
+                    }
+                    state = State::AfterAttributeName
+                } else if c == 61 as u32 {
+                    tokens.tok_attr_finish(s)
+                    state = State::BeforeAttributeValue
+                } else {
+                    tokens.tok_attr_name_push(s, klein(null_ersatz(c)))
+                }
+            }
+            State::AfterAttributeName => {
+                if ist_space(c) {
+                    // ueberspringen
+                } else if c == 47 as u32 {
+                    state = State::SelfClosingStartTag
+                } else if c == 61 as u32 {
+                    state = State::BeforeAttributeValue
+                } else if c == 62 as u32 {
+                    tokens.tok_emit(s)
+                    state = State::Data
+                } else if c == EOF {
+                    state = State::Fertig
+                } else {
+                    tokens.tok_attr_start(s)
+                    pos = pos - 1
+                    state = State::AttributeName
+                }
+            }
+            State::BeforeAttributeValue => {
+                if ist_space(c) {
+                    // ueberspringen
+                } else if c == 34 as u32 {
+                    state = State::AttributeValueDouble
+                } else if c == 39 as u32 {
+                    state = State::AttributeValueSingle
+                } else if c == 62 as u32 {
+                    tokens.tok_emit(s)
+                    state = State::Data
+                } else {
+                    if c != EOF {
+                        pos = pos - 1
+                    }
+                    state = State::AttributeValueUnquoted
+                }
+            }
+            State::AttributeValueDouble => {
+                if c == EOF {
+                    state = State::Fertig
+                } else if c == 34 as u32 {
+                    tokens.tok_attr_finish(s)
+                    state = State::AfterAttributeValueQuoted
+                } else if c == 38 as u32 {           // '&' — Modul `entities`
+                    ok = false
+                    state = State::NichtUnterstuetzt
+                } else {
+                    tokens.tok_attr_value_push(s, null_ersatz(c))
+                }
+            }
+            State::AttributeValueSingle => {
+                if c == EOF {
+                    state = State::Fertig
+                } else if c == 39 as u32 {
+                    tokens.tok_attr_finish(s)
+                    state = State::AfterAttributeValueQuoted
+                } else if c == 38 as u32 {
+                    ok = false
+                    state = State::NichtUnterstuetzt
+                } else {
+                    tokens.tok_attr_value_push(s, null_ersatz(c))
+                }
+            }
+            State::AttributeValueUnquoted => {
+                if c == EOF {
+                    state = State::Fertig
+                } else if ist_space(c) {
+                    tokens.tok_attr_finish(s)
+                    state = State::BeforeAttributeName
+                } else if c == 62 as u32 {
+                    tokens.tok_attr_finish(s)
+                    tokens.tok_emit(s)
+                    state = State::Data
+                } else if c == 38 as u32 {
+                    ok = false
+                    state = State::NichtUnterstuetzt
+                } else {
+                    tokens.tok_attr_value_push(s, null_ersatz(c))
+                }
+            }
+            State::AfterAttributeValueQuoted => {
+                if ist_space(c) {
+                    state = State::BeforeAttributeName
+                } else if c == 47 as u32 {
+                    state = State::SelfClosingStartTag
+                } else if c == 62 as u32 {
+                    tokens.tok_emit(s)
+                    state = State::Data
+                } else if c == EOF {
+                    state = State::Fertig
+                } else {
+                    pos = pos - 1
+                    state = State::BeforeAttributeName
+                }
+            }
+            State::SelfClosingStartTag => {
+                if c == 62 as u32 {
+                    tokens.tok_set_self_closing(s, true)
+                    tokens.tok_emit(s)
+                    state = State::Data
+                } else if c == EOF {
+                    state = State::Fertig
+                } else {
+                    pos = pos - 1
+                    state = State::BeforeAttributeName
+                }
+            }
+            State::BogusComment => {
+                if c == EOF {
+                    tokens.tok_emit(s)
+                    state = State::Fertig
+                } else if c == 62 as u32 {
+                    tokens.tok_emit(s)
+                    state = State::Data
+                } else {
+                    tokens.tok_comment_push(s, null_ersatz(c))
+                }
+            }
+            State::MarkupDeclarationOpen => {
+                // Kommentare, DOCTYPE und CDATA: Modul `tokenizer-kern`.
+                ok = false
+                state = State::NichtUnterstuetzt
+            }
+            State::Rcdata => {
+                ok = false
+                state = State::NichtUnterstuetzt
+            }
+            State::Rawtext => {
+                ok = false
+                state = State::NichtUnterstuetzt
+            }
+            State::ScriptData => {
+                ok = false
+                state = State::NichtUnterstuetzt
+            }
+            State::CdataSection => {
+                ok = false
+                state = State::NichtUnterstuetzt
+            }
+            State::NichtUnterstuetzt => {
+                laeuft = false
+            }
+            State::Fertig => {
+                laeuft = false
+            }
+        }
+    }
+    return ok
+}

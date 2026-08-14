@@ -1051,6 +1051,22 @@ Code nicht auseinanderlaufen.
     `fn`-Deklaration. Variablen zeigt `gdb` noch nicht (kein `.debug_info` für
     lokale Namen).
 
+17. **Aufzählungsnamen sind programmweit, nicht je Modul (Runde 3).** `enum`
+    wird in der Registrierung von `sema_match` unter seinem nackten Namen
+    geführt. Ein `enum` in einem importierten Modul ist deshalb als
+    `Ampel::Rot` anzusprechen, **nicht** als `zustand.Ampel::Rot`; zwei Module
+    dürfen keine gleichnamige Aufzählung deklarieren. Nachweis:
+    `tests/231_modul_match.fi`. (Runde 3 hat an derselben Stelle einen echten
+    Fehler behoben: die Rumpfblöcke der `match`-Fälle liegen in der
+    Registrierung und wurden vom Modulsystem nicht umgeschrieben — `match` in
+    einem importierten Modul war unbenutzbar. `compiler/src/modules.rs`
+    besucht sie jetzt über `sema_match::take_match`/`put_match`.)
+
+18. **Fehlermeldungen in importierten Modulen (Runde 3).** Zeile und Spalte
+    stimmen, der angezeigte **Dateiname** ist jedoch der der Wurzeldatei. Die
+    Quelltextkarte führt zwar Dateinummern, die Diagnose wählt daraus aber noch
+    nicht die richtige Datei aus. Offen.
+
 #### 14.1.types — Summentypen, Musterabgleich, Generics (Runde 2, Modul `types`)
 
 Mit Runde 2 setzt `firnc0` §6.3 (`L4`) und Generics (`L5`) um: `enum` mit

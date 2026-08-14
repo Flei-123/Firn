@@ -369,6 +369,19 @@ impl<'a, 'b> Renamer<'a, 'b> {
         None
     }
 
+    /// Namen, die ein Muster bindet, sind im Rumpf des Falles lokal.
+    fn declare_pattern(&mut self, p: &crate::sema_match::Pattern) {
+        match p {
+            crate::sema_match::Pattern::Bind(n, _) => self.declare(n),
+            crate::sema_match::Pattern::Variant { subs, .. } => {
+                for s in subs {
+                    self.declare_pattern(s);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn ty(&mut self, t: &mut TypeExpr) {
         match t {
             TypeExpr::Named(name, span) => {
@@ -452,6 +465,26 @@ impl<'a, 'b> Renamer<'a, 'b> {
                 self.expr(i);
             }
             ExprKind::Call(name, args, nspan) => {
+                // HOOK types: die Rumpfbloecke eines `match` liegen in der
+                // Registrierung von `sema_match`, nicht im AST. Ohne diesen
+                // Zweig blieben Namen darin unumgeschrieben — `match` in einem
+                // importierten Modul waere unbenutzbar.
+                if let Some(idx) = name
+                    .strip_prefix(crate::sema_match::MATCH_PREFIX)
+                    .and_then(|s| s.parse::<usize>().ok())
+                {
+                    if let Some(mut info) = crate::sema_match::take_match(idx) {
+                        self.expr(&mut info.subject);
+                        for arm in info.arms.iter_mut() {
+                            self.push_scope();
+                            self.declare_pattern(&arm.pat);
+                            self.block(&mut arm.body);
+                            self.pop_scope();
+                        }
+                        crate::sema_match::put_match(idx, info);
+                    }
+                    return;
+                }
                 if let Some(n) = self.resolve(name, *nspan, false) {
                     *name = n;
                 }

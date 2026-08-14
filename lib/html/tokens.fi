@@ -1,0 +1,507 @@
+// lib/html/tokens.fi — Token-Modell und html5lib-JSON-Ausgabe (in Firn).
+//
+// VERTRAG (wird von lib/html/tokenizer.fi benutzt, siehe PLAN.md §4):
+// Die Zustandsmaschine baut genau EIN "aktuelles Token" im `Sink` auf und
+// gibt es dann frei. Zeichen werden gesammelt und beim naechsten Nicht-
+// Zeichen-Token bzw. am Ende zu EINEM Character-Token zusammengefasst — genau
+// so, wie die html5lib-Erwartungen es verlangen.
+//
+// Ausgabeformat (html5lib tokenizer JSON), ASCII-only, alle Zeichen ausserhalb
+// 0x20..0x7E als \uXXXX (Codepunkte > 0xFFFF als Ersatzpaar):
+//   ["Character","abc"]
+//   ["StartTag","div",{"a":"b"}]        bzw. [... ,true] bei self-closing
+//   ["EndTag","div"]
+//   ["Comment","text"]
+//   ["DOCTYPE","html",null,null,true]
+// Der Tokenstrom eines Falles ist ein JSON-Array dieser Tokens; EOF erzeugt
+// KEIN Token (html5lib fuehrt EOF nicht in `output`).
+import mem
+
+export {
+    Attr, Sink,
+    sink_neu, sink_init, sink_free, sink_begin, sink_end, sink_abort, sink_flush_out,
+    sink_emit_char, sink_flush_chars,
+    tok_start, tok_start_tag, tok_end_tag, tok_comment, tok_doctype,
+    tok_name_push, tok_comment_push, tok_doctype_name_push,
+    tok_pubid_start, tok_pubid_push, tok_sysid_start, tok_sysid_push,
+    tok_set_force_quirks, tok_set_self_closing,
+    tok_attr_start, tok_attr_name_push, tok_attr_value_push, tok_attr_finish,
+    tok_emit, tok_is_appropriate_end_tag,
+    sink_set_last_start_tag_cp,
+}
+
+// Tokenarten des aktuellen Tokens.
+const TOK_NONE: u32 = 0
+const TOK_START: u32 = 1
+const TOK_END: u32 = 2
+const TOK_COMMENT: u32 = 3
+const TOK_DOCTYPE: u32 = 4
+
+const MAX_ATTRS: usize = 256
+
+struct Attr {
+    name: mem.CpBuf,
+    value: mem.CpBuf,
+    doppelt: bool,
+}
+
+struct Sink {
+    out: mem.Buf,          // JSON-Ausgabe (gepuffert)
+    chars: mem.CpBuf,      // gesammelte Zeichen
+    erstes: bool,          // noch kein Token im aktuellen Array?
+    art: u32,              // aktuelles Token
+    name: mem.CpBuf,
+    daten: mem.CpBuf,      // Kommentartext
+    pubid: mem.CpBuf,
+    sysid: mem.CpBuf,
+    hat_pubid: bool,
+    hat_sysid: bool,
+    hat_name: bool,
+    force_quirks: bool,
+    self_closing: bool,
+    attrs: *mut Attr,
+    nattr: usize,
+    letzter_starttag: mem.CpBuf,
+    marke: usize,          // Stand des Ausgabepuffers beim Fallbeginn
+}
+
+fn attr_ptr(s: *mut Sink, i: usize) -> *mut Attr {
+    return ((*s).attrs as usize + i * 56) as *mut Attr
+}
+
+// Ein leerer Sink (Stufe 0 hat keine Konstruktoren); danach `sink_init`.
+fn sink_neu() -> Sink {
+    return Sink{
+        out: mem.buf_neu(),
+        chars: mem.cp_neu(),
+        erstes: true,
+        art: TOK_NONE,
+        name: mem.cp_neu(),
+        daten: mem.cp_neu(),
+        pubid: mem.cp_neu(),
+        sysid: mem.cp_neu(),
+        hat_pubid: false,
+        hat_sysid: false,
+        hat_name: false,
+        force_quirks: false,
+        self_closing: false,
+        attrs: 0 as *mut Attr,
+        nattr: 0,
+        letzter_starttag: mem.cp_neu(),
+        marke: 0,
+    }
+}
+
+fn sink_init(s: *mut Sink) {
+    mem.buf_init(&(*s).out)
+    mem.cp_init(&(*s).chars)
+    mem.cp_init(&(*s).name)
+    mem.cp_init(&(*s).daten)
+    mem.cp_init(&(*s).pubid)
+    mem.cp_init(&(*s).sysid)
+    mem.cp_init(&(*s).letzter_starttag)
+    (*s).erstes = true
+    (*s).art = TOK_NONE
+    (*s).hat_pubid = false
+    (*s).hat_sysid = false
+    (*s).hat_name = false
+    (*s).force_quirks = false
+    (*s).self_closing = false
+    (*s).nattr = 0
+    (*s).attrs = mem.heap_alloc(MAX_ATTRS * 56) as *mut Attr
+    var i: usize = 0
+    while i < MAX_ATTRS {
+        let a: *mut Attr = attr_ptr(s, i)
+        mem.cp_init(&(*a).name)
+        mem.cp_init(&(*a).value)
+        (*a).doppelt = false
+        i = i + 1
+    }
+}
+
+fn sink_free(s: *mut Sink) {
+    var i: usize = 0
+    while i < MAX_ATTRS {
+        let a: *mut Attr = attr_ptr(s, i)
+        mem.cp_free(&(*a).name)
+        mem.cp_free(&(*a).value)
+        i = i + 1
+    }
+    mem.heap_free((*s).attrs as *mut u8, MAX_ATTRS * 56)
+    mem.buf_free(&(*s).out)
+    mem.cp_free(&(*s).chars)
+    mem.cp_free(&(*s).name)
+    mem.cp_free(&(*s).daten)
+    mem.cp_free(&(*s).pubid)
+    mem.cp_free(&(*s).sysid)
+    mem.cp_free(&(*s).letzter_starttag)
+}
+
+// --------------------------------------------------------------- JSON-Hilfen
+
+fn out_ascii(s: *mut Sink, c: u32) {
+    mem.buf_push(&(*s).out, c as u8)
+}
+
+fn hex_ziffer(v: u32) -> u8 {
+    if v < 10 as u32 {
+        return (48 as u32 + v) as u8
+    }
+    return (87 as u32 + v) as u8      // 'a' = 97 = 87 + 10
+}
+
+fn out_u16_escape(s: *mut Sink, v: u32) {
+    out_ascii(s, 92 as u32)           // '\'
+    out_ascii(s, 117 as u32)          // 'u'
+    mem.buf_push(&(*s).out, hex_ziffer((v >> 12) & 15 as u32))
+    mem.buf_push(&(*s).out, hex_ziffer((v >> 8) & 15 as u32))
+    mem.buf_push(&(*s).out, hex_ziffer((v >> 4) & 15 as u32))
+    mem.buf_push(&(*s).out, hex_ziffer(v & 15 as u32))
+}
+
+// Ein Codepunkt als JSON-Zeichen. Alles ausserhalb des druckbaren ASCII wird
+// als \uXXXX geschrieben; damit ist die Ausgabe reines ASCII und Python liest
+// auch ungepaarte Surrogate zurueck.
+fn out_json_cp(s: *mut Sink, cp: u32) {
+    if cp == 34 as u32 || cp == 92 as u32 {
+        out_ascii(s, 92 as u32)
+        out_ascii(s, cp)
+    } else if cp >= 32 as u32 && cp < 127 as u32 {
+        out_ascii(s, cp)
+    } else if cp <= 0xFFFF as u32 {
+        out_u16_escape(s, cp)
+    } else {
+        let v: u32 = cp - 0x10000 as u32
+        out_u16_escape(s, 0xD800 as u32 + (v >> 10))
+        out_u16_escape(s, 0xDC00 as u32 + (v & 0x3FF as u32))
+    }
+}
+
+fn out_json_cpbuf(s: *mut Sink, c: *mut mem.CpBuf) {
+    out_ascii(s, 34 as u32)
+    var i: usize = 0
+    while i < mem.cp_len(c) {
+        out_json_cp(s, mem.cp_at(c, i))
+        i = i + 1
+    }
+    out_ascii(s, 34 as u32)
+}
+
+fn out_null(s: *mut Sink) {
+    out_ascii(s, 110 as u32)          // n
+    out_ascii(s, 117 as u32)          // u
+    out_ascii(s, 108 as u32)          // l
+    out_ascii(s, 108 as u32)          // l
+}
+
+fn out_bool(s: *mut Sink, v: bool) {
+    if v {
+        out_ascii(s, 116 as u32)      // true
+        out_ascii(s, 114 as u32)
+        out_ascii(s, 117 as u32)
+        out_ascii(s, 101 as u32)
+    } else {
+        out_ascii(s, 102 as u32)      // false
+        out_ascii(s, 97 as u32)
+        out_ascii(s, 108 as u32)
+        out_ascii(s, 115 as u32)
+        out_ascii(s, 101 as u32)
+    }
+}
+
+// Ein Bezeichnerwort in Anfuehrungszeichen; 0 beendet das Wort.
+// (Stufe 0 hat keine Zeichenkettenliterale — SPEC §14.1.str S1.)
+fn out_wort(s: *mut Sink, a: u32, b: u32, c: u32, d: u32, e: u32, f: u32, g: u32, h: u32, i: u32) {
+    out_ascii(s, 34 as u32)
+    if a != 0 as u32 { out_ascii(s, a) }
+    if b != 0 as u32 { out_ascii(s, b) }
+    if c != 0 as u32 { out_ascii(s, c) }
+    if d != 0 as u32 { out_ascii(s, d) }
+    if e != 0 as u32 { out_ascii(s, e) }
+    if f != 0 as u32 { out_ascii(s, f) }
+    if g != 0 as u32 { out_ascii(s, g) }
+    if h != 0 as u32 { out_ascii(s, h) }
+    if i != 0 as u32 { out_ascii(s, i) }
+    out_ascii(s, 34 as u32)
+}
+
+fn komma_wenn_noetig(s: *mut Sink) {
+    if (*s).erstes {
+        (*s).erstes = false
+    } else {
+        out_ascii(s, 44 as u32)
+    }
+}
+
+// ----------------------------------------------------------- Fall-Rahmen
+
+// Beginnt die Tokenliste eines Testfalls.
+fn sink_begin(s: *mut Sink) {
+    mem.cp_clear(&(*s).chars)
+    (*s).erstes = true
+    (*s).art = TOK_NONE
+    (*s).nattr = 0
+    (*s).marke = mem.buf_len(&(*s).out)
+    out_ascii(s, 91 as u32)           // [
+}
+
+// Der Fall konnte nicht zu Ende tokenisiert werden: die bisherige Ausgabe
+// dieses Falles wird verworfen und durch die Marke ["NICHT-UNTERSTUETZT"]
+// ersetzt. Der Harness zaehlt so etwas als FEHLSCHLAG.
+fn sink_abort(s: *mut Sink) {
+    mem.buf_set_len(&(*s).out, (*s).marke)
+    mem.cp_clear(&(*s).chars)
+    (*s).art = TOK_NONE
+    out_ascii(s, 91 as u32)           // [
+    // "NICHT-UNTERSTUETZT"
+    out_ascii(s, 34 as u32)
+    out_ascii(s, 78 as u32)
+    out_ascii(s, 73 as u32)
+    out_ascii(s, 67 as u32)
+    out_ascii(s, 72 as u32)
+    out_ascii(s, 84 as u32)
+    out_ascii(s, 45 as u32)
+    out_ascii(s, 85 as u32)
+    out_ascii(s, 78 as u32)
+    out_ascii(s, 84 as u32)
+    out_ascii(s, 69 as u32)
+    out_ascii(s, 82 as u32)
+    out_ascii(s, 83 as u32)
+    out_ascii(s, 84 as u32)
+    out_ascii(s, 85 as u32)
+    out_ascii(s, 69 as u32)
+    out_ascii(s, 84 as u32)
+    out_ascii(s, 90 as u32)
+    out_ascii(s, 84 as u32)
+    out_ascii(s, 34 as u32)
+    out_ascii(s, 93 as u32)           // ]
+    out_ascii(s, 10 as u32)
+}
+
+// Schliesst die Tokenliste ab (Zeichen werden vorher zusammengefasst).
+fn sink_end(s: *mut Sink) {
+    sink_flush_chars(s)
+    out_ascii(s, 93 as u32)           // ]
+    out_ascii(s, 10 as u32)           // \n
+    if mem.buf_len(&(*s).out) > 65536 {
+        mem.buf_flush(&(*s).out, 1)
+    }
+}
+
+fn sink_flush_out(s: *mut Sink) {
+    mem.buf_flush(&(*s).out, 1)
+}
+
+fn sink_set_last_start_tag_cp(s: *mut Sink, c: *mut mem.CpBuf) {
+    mem.cp_copy_from(&(*s).letzter_starttag, c)
+}
+
+// --------------------------------------------------------------- Zeichen
+
+fn sink_emit_char(s: *mut Sink, cp: u32) {
+    mem.cp_push(&(*s).chars, cp)
+}
+
+fn sink_flush_chars(s: *mut Sink) {
+    if mem.cp_len(&(*s).chars) == 0 {
+        return
+    }
+    komma_wenn_noetig(s)
+    out_ascii(s, 91 as u32)
+    // "Character"
+    out_wort(s, 67 as u32, 104 as u32, 97 as u32, 114 as u32, 97 as u32, 99 as u32, 116 as u32,
+        101 as u32, 114 as u32)
+    out_ascii(s, 44 as u32)
+    out_json_cpbuf(s, &(*s).chars)
+    out_ascii(s, 93 as u32)
+    mem.cp_clear(&(*s).chars)
+}
+
+// ------------------------------------------------------- aktuelles Token
+
+fn tok_start(s: *mut Sink, art: u32) {
+    (*s).art = art
+    mem.cp_clear(&(*s).name)
+    mem.cp_clear(&(*s).daten)
+    mem.cp_clear(&(*s).pubid)
+    mem.cp_clear(&(*s).sysid)
+    (*s).hat_pubid = false
+    (*s).hat_sysid = false
+    (*s).hat_name = false
+    (*s).force_quirks = false
+    (*s).self_closing = false
+    (*s).nattr = 0
+}
+
+fn tok_start_tag(s: *mut Sink)  { tok_start(s, TOK_START) }
+fn tok_end_tag(s: *mut Sink)    { tok_start(s, TOK_END) }
+fn tok_comment(s: *mut Sink)    { tok_start(s, TOK_COMMENT) }
+fn tok_doctype(s: *mut Sink)    { tok_start(s, TOK_DOCTYPE) }
+
+fn tok_name_push(s: *mut Sink, cp: u32) {
+    mem.cp_push(&(*s).name, cp)
+}
+
+fn tok_comment_push(s: *mut Sink, cp: u32) {
+    mem.cp_push(&(*s).daten, cp)
+}
+
+fn tok_doctype_name_push(s: *mut Sink, cp: u32) {
+    (*s).hat_name = true
+    mem.cp_push(&(*s).name, cp)
+}
+
+fn tok_pubid_start(s: *mut Sink) {
+    (*s).hat_pubid = true
+    mem.cp_clear(&(*s).pubid)
+}
+
+fn tok_pubid_push(s: *mut Sink, cp: u32) {
+    mem.cp_push(&(*s).pubid, cp)
+}
+
+fn tok_sysid_start(s: *mut Sink) {
+    (*s).hat_sysid = true
+    mem.cp_clear(&(*s).sysid)
+}
+
+fn tok_sysid_push(s: *mut Sink, cp: u32) {
+    mem.cp_push(&(*s).sysid, cp)
+}
+
+fn tok_set_force_quirks(s: *mut Sink, v: bool) {
+    (*s).force_quirks = v
+}
+
+fn tok_set_self_closing(s: *mut Sink, v: bool) {
+    (*s).self_closing = v
+}
+
+// Neues Attribut anlegen; Name und Wert sind zunaechst leer.
+fn tok_attr_start(s: *mut Sink) {
+    if (*s).nattr >= MAX_ATTRS {
+        return
+    }
+    let a: *mut Attr = attr_ptr(s, (*s).nattr)
+    mem.cp_clear(&(*a).name)
+    mem.cp_clear(&(*a).value)
+    (*a).doppelt = false
+    (*s).nattr = (*s).nattr + 1
+}
+
+fn tok_attr_name_push(s: *mut Sink, cp: u32) {
+    if (*s).nattr == 0 {
+        return
+    }
+    let a: *mut Attr = attr_ptr(s, (*s).nattr - 1)
+    mem.cp_push(&(*a).name, cp)
+}
+
+fn tok_attr_value_push(s: *mut Sink, cp: u32) {
+    if (*s).nattr == 0 {
+        return
+    }
+    let a: *mut Attr = attr_ptr(s, (*s).nattr - 1)
+    mem.cp_push(&(*a).value, cp)
+}
+
+// Doppelte Attributnamen: das spaetere Vorkommen wird verworfen (HTML-Standard).
+fn tok_attr_finish(s: *mut Sink) {
+    if (*s).nattr < 2 {
+        return
+    }
+    let a: *mut Attr = attr_ptr(s, (*s).nattr - 1)
+    var i: usize = 0
+    while i + 1 < (*s).nattr {
+        let b: *mut Attr = attr_ptr(s, i)
+        if !(*b).doppelt && mem.cp_eq_cp(&(*a).name, &(*b).name) {
+            (*a).doppelt = true
+            return
+        }
+        i = i + 1
+    }
+}
+
+// Der aktuelle EndTag passt zum zuletzt ausgegebenen StartTag?
+fn tok_is_appropriate_end_tag(s: *mut Sink) -> bool {
+    return mem.cp_eq_cp(&(*s).name, &(*s).letzter_starttag)
+}
+
+// Gibt das aktuelle Token aus.
+fn tok_emit(s: *mut Sink) {
+    sink_flush_chars(s)
+    if (*s).art == TOK_NONE {
+        return
+    }
+    komma_wenn_noetig(s)
+    out_ascii(s, 91 as u32)           // [
+    if (*s).art == TOK_START {
+        // "StartTag"
+        out_wort(s, 83 as u32, 116 as u32, 97 as u32, 114 as u32, 116 as u32, 84 as u32, 97 as u32,
+            103 as u32, 0 as u32)
+        out_ascii(s, 44 as u32)
+        out_json_cpbuf(s, &(*s).name)
+        out_ascii(s, 44 as u32)
+        out_ascii(s, 123 as u32)      // {
+        var i: usize = 0
+        var erstes_attr: bool = true
+        while i < (*s).nattr {
+            let a: *mut Attr = attr_ptr(s, i)
+            if !(*a).doppelt {
+                if erstes_attr {
+                    erstes_attr = false
+                } else {
+                    out_ascii(s, 44 as u32)
+                }
+                out_json_cpbuf(s, &(*a).name)
+                out_ascii(s, 58 as u32)
+                out_json_cpbuf(s, &(*a).value)
+            }
+            i = i + 1
+        }
+        out_ascii(s, 125 as u32)      // }
+        if (*s).self_closing {
+            out_ascii(s, 44 as u32)
+            out_bool(s, true)
+        }
+        mem.cp_copy_from(&(*s).letzter_starttag, &(*s).name)
+    } else if (*s).art == TOK_END {
+        // "EndTag"
+        out_wort(s, 69 as u32, 110 as u32, 100 as u32, 84 as u32, 97 as u32, 103 as u32, 0 as u32,
+            0 as u32, 0 as u32)
+        out_ascii(s, 44 as u32)
+        out_json_cpbuf(s, &(*s).name)
+    } else if (*s).art == TOK_COMMENT {
+        // "Comment"
+        out_wort(s, 67 as u32, 111 as u32, 109 as u32, 109 as u32, 101 as u32, 110 as u32, 116 as u32,
+            0 as u32, 0 as u32)
+        out_ascii(s, 44 as u32)
+        out_json_cpbuf(s, &(*s).daten)
+    } else {
+        // "DOCTYPE"
+        out_wort(s, 68 as u32, 79 as u32, 67 as u32, 84 as u32, 89 as u32, 80 as u32, 69 as u32,
+            0 as u32, 0 as u32)
+        out_ascii(s, 44 as u32)
+        if (*s).hat_name {
+            out_json_cpbuf(s, &(*s).name)
+        } else {
+            out_null(s)
+        }
+        out_ascii(s, 44 as u32)
+        if (*s).hat_pubid {
+            out_json_cpbuf(s, &(*s).pubid)
+        } else {
+            out_null(s)
+        }
+        out_ascii(s, 44 as u32)
+        if (*s).hat_sysid {
+            out_json_cpbuf(s, &(*s).sysid)
+        } else {
+            out_null(s)
+        }
+        out_ascii(s, 44 as u32)
+        out_bool(s, !(*s).force_quirks)
+    }
+    out_ascii(s, 93 as u32)           // ]
+    (*s).art = TOK_NONE
+}
