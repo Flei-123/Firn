@@ -3,7 +3,7 @@
 **Maßgeblich:** `../karstos-browser/FIRN-ANFORDERUNGEN.md` §13
 **Stand dieser Datei:** 2026-08-13, **nach der Zusammenführung von Runde 2**
 **Gesamtergebnis: 0 von 6 bestanden**, 3 teilweise, 3 offen.
-**Stand 14.08.2026:** `test.sh` **381/381** (98 Programme × 3 Stufen opt/noopt/dev-fast, 30 Negativtests, 41 Optimierer-Nachweise, Ergebnisort- und Architekturnachweis).
+**Stand 14.08.2026:** `test.sh` **389/389** (98 Programme × 3 Stufen opt/noopt/dev-fast, 30 Negativtests, 41 Optimierer-Nachweise, Ergebnisort- und Architekturnachweis).
 
 Alle Zahlen in dieser Datei wurden bei der Zusammenführung **selbst ausgeführt**,
 nicht von den Teilmodulen übernommen. Reproduktion: `RUN.md`.
@@ -321,7 +321,7 @@ Nicht Teil der sechs Abnahmepunkte, aber Voraussetzung dafür, dass sie später
 | Ergebnisort für Struct-/Arrayliterale und `init` | **`[~]`** | Literale schreiben bereits feldweise ins Ziel (`lower.rs: write_into`); als Garantie in SPEC festgeschrieben, `init` gibt es noch nicht |
 | Feldzugriff vom Speicherort trennen (Vorbedingung SoA) | **`[x]`** | `compiler/src/layout.rs` (4 Zugaenge); `bash tools/schichten/run.sh` erzwingt es, Gegenprobe mit absichtlicher Verletzung schlaegt an |
 | Prüfphasen wiedereintrittsfähig (Vorbedingung `comptime emit`) | **`[ ]`** | einmaliger Durchlauf |
-| `!T` + `#[must_consume]` | **`[ ]`** | Phase 2 |
+| `!T` + `#[must_consume]` | **`[~]`** | `#[must_consume]` erledigt (`firnc --list-attrs`, `tests/130_must_consume.fi`, 5 Negativtests); `!T` steht noch aus |
 | Symbol-Namensschema mit Versionsplatz | **`[ ]`** | Phase 3, mit der Paketverwaltung |
 
 **Nebenbefund:** Die neue Stufe `--dev-fast` hat beim ersten Durchlauf einen

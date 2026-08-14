@@ -83,6 +83,9 @@ pub struct StructDef {
     pub fields: Vec<Field>,
     pub size: u64,
     pub align: u64,
+    /// `#[must_consume]` (attrs.rs): ein Wert dieses Typs darf nicht
+    /// stillschweigend verworfen werden.
+    pub must_consume: bool,
 }
 
 impl StructDef {
@@ -115,6 +118,7 @@ impl TypeCtx {
             fields: Vec::new(),
             size: 0,
             align: 1,
+            must_consume: false,
         });
         self.by_name.insert(name.to_string(), idx);
         idx
