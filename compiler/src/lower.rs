@@ -255,6 +255,10 @@ impl<'a> Lower<'a> {
     }
 
     fn lower_addr_inner(&mut self, e: &Expr) -> Option<Val> {
+        // HOOK fehlerunionen: `try`/`catch`/Fehlerwert als Aggregat (lower_errors.rs)
+        if let Some(r) = crate::lower_errors::hook_addr(self, e) {
+            return r;
+        }
         match &e.kind {
             ExprKind::Ident(name) => match self.lookup(name) {
                 Some(slot) => Some(slot),
@@ -337,6 +341,10 @@ impl<'a> Lower<'a> {
     }
 
     fn write_into_inner(&mut self, addr: Val, e: &Expr) -> Option<()> {
+        // HOOK fehlerunionen: implizite Umwandlung / `try` / `catch` (lower_errors.rs)
+        if let Some(r) = crate::lower_errors::hook_write_into(self, addr, e) {
+            return r;
+        }
         let t = self.ty_of(e);
         match &e.kind {
             ExprKind::StructLit(_, fields, span) => {
@@ -410,6 +418,10 @@ impl<'a> Lower<'a> {
     }
 
     fn lower_expr_inner(&mut self, e: &Expr) -> Option<Val> {
+        // HOOK fehlerunionen: skalares Ergebnis von `try`/`catch` (lower_errors.rs)
+        if let Some(r) = crate::lower_errors::hook_value(self, e) {
+            return r;
+        }
         let t = self.ty_of(e);
         if is_agg(&t) {
             return self.ice(e.span, "aggregat als wert (nur adressen erlaubt)");
@@ -508,6 +520,10 @@ impl<'a> Lower<'a> {
 
     fn lower_binary(&mut self, e: &Expr, op: ast::BinOp, a: &Expr, b: &Expr) -> Option<Val> {
         use ast::BinOp as B;
+        // HOOK fehlerunionen: Vergleich zweier Fehlerwerte (lower_errors.rs)
+        if let Some(r) = crate::lower_errors::hook_binary(self, op, a, b) {
+            return r;
+        }
         if op.is_logic() {
             return self.lower_shortcircuit(op, a, b);
         }
@@ -612,7 +628,11 @@ impl<'a> Lower<'a> {
             }
         }
         for a in args {
-            let t = self.ty_of(a);
+            // HOOK fehlerunionen: implizite Umwandlung eines Arguments (lower_errors.rs)
+            let t = match crate::lower_errors::hook_arg_type(a) {
+                Some(t) => t,
+                None => self.ty_of(a),
+            };
             if !is_agg(&t) {
                 vals.push(self.lower_expr(a)?);
                 continue;
@@ -765,6 +785,10 @@ impl<'a> Lower<'a> {
         match s {
             Stmt::Error(_) => Some(()),
             Stmt::Let { name, init, span, .. } => {
+                // HOOK fehlerunionen: implizite Umwandlung bei 'let' (lower_errors.rs)
+                if let Some(r) = crate::lower_errors::hook_let(self, name, init) {
+                    return r;
+                }
                 let t = self.ty_of(init);
                 if matches!(t, Type::Void) {
                     return self.err(*span, "eine variable kann keinen wert ohne typ haben");
@@ -785,7 +809,10 @@ impl<'a> Lower<'a> {
                 match value {
                     Some(v) => {
                         let t = self.ty_of(v);
-                        if is_agg(&t) {
+                        // HOOK fehlerunionen: implizite Umwandlung (lower_errors.rs)
+                        if let Some(r) = crate::lower_errors::hook_return(self, v) {
+                            r?;
+                        } else if is_agg(&t) {
                             // Aggregatrueckgabe nach abi.rs: ueber den
                             // versteckten Zeiger oder in einem Wort in rax.
                             let size = self.info.tcx.size_of(&t);
@@ -845,6 +872,10 @@ impl<'a> Lower<'a> {
     }
 
     fn lower_expr_stmt(&mut self, e: &Expr) -> Option<()> {
+        // HOOK fehlerunionen: `try`/`catch`/Fehlerwert als Anweisung (lower_errors.rs)
+        if let Some(r) = crate::lower_errors::hook_stmt(self, e) {
+            return r;
+        }
         match &e.kind {
             // HOOK types: `match` und Aufzaehlungskonstruktoren (lower_match.rs)
             ExprKind::Call(name, args, _) if crate::lower_match::is_types_call(name) => {

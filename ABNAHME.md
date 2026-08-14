@@ -1,9 +1,13 @@
 # ABNAHME.md — Ist Firn bereit für die Browser-Engine?
 
 **Maßgeblich:** `../karstos-browser/FIRN-ANFORDERUNGEN.md` §13
-**Stand dieser Datei:** 2026-08-13, **nach der Zusammenführung von Runde 2**
-**Gesamtergebnis: 0 von 6 bestanden**, 3 teilweise, 3 offen.
-**Stand 14.08.2026:** `test.sh` **393/393** (98 Programme × 3 Stufen opt/noopt/dev-fast, 30 Negativtests, 41 Optimierer-Nachweise, Ergebnisort- und Architekturnachweis).
+**Stand dieser Datei:** 2026-08-14, **nach der Zusammenführung von Runde 3**
+**Gesamtergebnis: 0 von 6 bestanden**, 4 teilweise, 2 offen.
+**Stand 14.08.2026 (selbst ausgeführt):** `bash test.sh` → **PASS 468/468**
+(Abschnitte 1–9, darunter Optimierer-Nachweis, Ergebnisort-Garantie,
+Architekturwächter Feldzugriff↔Speicherort, Symbolschema und neu der
+HTML5-Tokenizer). `bash tools/tokenizer/run.sh` → **6.807 / 6.810 (99,96 %)**,
+Durchsatzfaktor **2,7×–2,9× langsamer als html5ever** (zwei eigene Läufe: 2,69× und 2,87×).
 
 Alle Zahlen in dieser Datei wurden bei der Zusammenführung **selbst ausgeführt**,
 nicht von den Teilmodulen übernommen. Reproduktion: `RUN.md`.
@@ -55,7 +59,7 @@ Legende: `[ ]` offen · `[~]` teilweise, mit Zahl · `[x]` bestanden und gemesse
 
 ---
 
-### 3. `[ ]` HTML5-Tokenizer: **100 % `html5lib-tests/tokenizer/` UND ≤ 2× Referenz**
+### 3. `[~]` HTML5-Tokenizer: **100 % `html5lib-tests/tokenizer/` UND ≤ 2× Referenz**
 
 | | |
 |---|---|
@@ -68,6 +72,63 @@ Legende: `[ ]` offen · `[~]` teilweise, mit Zahl · `[x]` bestanden und gemesse
 | **Was jetzt vorhanden ist** | Die Vorbedingungen aus ROADMAP Phase 2: `enum`/`match` mit Sprungtabelle (`tests/230_zustandsmaschine.fi`, 32 Zustände), `Str16`/`Bytes`/`Atom` (`lib/str/`), Aggregate an Funktionsgrenzen, Modulsystem, echte Registerzuteilung. Der Tokenizer selbst ist die nächste Aufgabe, nicht mehr blockiert |
 | **Kriterium B** | nicht gemessen (kein Tokenizer). Der allgemeine Abstand zu Rust liegt laut `bench/RESULTS.md` bei Median **2,8×–3,4×**; die alte Begründung „Stufe 0 legt jeden Wert auf den Stack" ist seit der Registerzuteilung überholt |
 | **Aufwand laut TODO-FIRN** | 3 PM |
+
+#### Stand nach Runde 3 (14.08.2026) — erstmals eine echte Zahl
+
+**Kriterium A: `[~]` 6.807 von 6.810 Fällen (99,96 %).** Der Tokenizer ist in
+Firn geschrieben (`lib/html/*.fi`, **7.464 Zeilen**, davon 4.663 erzeugte
+Namenstabelle für Zeichenreferenzen); der Harness ist eine Werkbank in Python
+(`tools/tokenizer/harness.py`, 227 Zeilen) **ohne jede Tokenizer-Logik**.
+Selbst ausgeführt bei der Zusammenführung, `bash tools/tokenizer/run.sh`:
+
+| Datei | bestanden / gesamt | Quote |
+|---|---|---|
+| contentModelFlags.test | 14 / 14 | 100,00 % |
+| domjs.test | 43 / 43 | 100,00 % |
+| entities.test | 80 / 80 | 100,00 % |
+| escapeFlag.test | 5 / 5 | 100,00 % |
+| namedEntities.test | 4210 / 4210 | 100,00 % |
+| numericEntities.test | 336 / 336 | 100,00 % |
+| pendingSpecChanges.test | 1 / 1 | 100,00 % |
+| test1.test | 69 / 69 | 100,00 % |
+| test2.test | 45 / 45 | 100,00 % |
+| test3.test | 1590 / 1590 | 100,00 % |
+| test4.test | 85 / 85 | 100,00 % |
+| unicodeChars.test | 323 / 323 | 100,00 % |
+| unicodeCharsProblematic.test | 5 / 5 | 100,00 % |
+| **xmlViolation.test** | **1 / 4** | **25,00 %** |
+| **GESAMT** | **6807 / 6810** | **99,96 %** |
+
+Die drei Fehlschläge sind die `xmlViolationTests` „Non-XML character",
+„Non-XML space" und „Double hyphen in comment". Sie verlangen die
+XML-Anpassung (`U+FFFF` → `U+FFFD`, `U+000C` → Leerzeichen, `--` → `- -` im
+Kommentar), die **nicht** im WHATWG-Tokenizer steht; sie sind **nicht**
+umgesetzt und zählen als **Fehlschlag** — nicht als „übersprungen".
+
+Ehrlichkeit des Harness (nachprüfbar in `tools/tokenizer/harness.py`):
+`doubleEscaped` entschlüsselt `input` **und** `output`; Dateien mit dem
+Schlüssel `xmlViolationTests` werden mitgezählt (deshalb 6.810, nicht 6.806);
+`initialStates` und `lastStartTag` werden beachtet (ein Fall gilt nur als
+bestanden, wenn er in **jedem** seiner Startzustände stimmt); die Antwort
+`["NICHT-UNTERSTUETZT"]` ist ein Fehlschlag; es gibt keinen Filter und kein
+Überspringen. **Nicht verglichen werden die `errors`-Einträge** (Codes der
+Parse-Fehler mit Zeile/Spalte) — der Tokenizer meldet keine Fehlercodes. Das
+ist eine offene Lücke, keine bestandene Prüfung.
+
+**Kriterium B: `[ ] verfehlt — 2,69×** statt ≤ 2×. Selbst gemessen mit
+`bash tools/tokenizer/durchsatz.sh` auf demselben 4,08-MB-Korpus
+(`.tokenizer-work/korpus.html`, aus den html5lib-Eingaben erzeugt), bester von
+je drei Läufen: **Firn 4,08 MB/s (0,999 s)** gegen **html5ever 10,97 MB/s
+(0,372 s)** → **Faktor 2,69×**. html5ever ist mit `--release`, `opt-level=3`
+gebaut (`bench/tokenizer/`, eigenes Cargo-Projekt, **keine** Abhängigkeit des
+Compilers). Die Firn-Zeit enthält zusätzlich das Schreiben des
+html5lib-JSON — der Faktor ist für Firn eher zu schlecht als zu gut gerechnet.
+Ein zweiter vollständiger Lauf ergab 3,56 MB/s gegen 10,19 MB/s, also
+**2,87×**. Die Messung schwankt zwischen Läufen um ~30 %; Werte zwischen
+2,6× und 3,1× sind reproduzierbar — deshalb wird die Spanne genannt und nicht
+der günstigste Einzelwert.
+
+**Damit bleibt Punkt 3 offen** (`[~]`): A fast, B verfehlt.
 
 ---
 
@@ -114,16 +175,16 @@ Legende: `[ ]` offen · `[~]` teilweise, mit Zahl · `[x]` bestanden und gemesse
 
 ## Zusammenfassung
 
-| # | Punkt | Stand nach Runde 2 (13.08.2026, selbst gemessen) |
+| # | Punkt | Stand nach Runde 3 (14.08.2026, selbst gemessen) |
 |---|---|---|
 | 1 | Selbst-Hosting in drei Stufen | `[ ]` nicht begonnen; Bestandsaufnahme in `docs/SELBSTHOSTING.md` |
 | 2 | Speichermodell entschieden **und belegt** | `[~]` Entscheidung getroffen, **Beleg fehlt: kein GC, kein DOM-Prototyp, keine RSS-Messung — in dieser Runde bewusst verschoben** |
-| 3 | Tokenizer 100 % html5lib **und** ≤ 2× | `[ ]` **0 von 6.810 Fällen (0,0 %)** — kein Tokenizer, kein Harness |
+| 3 | Tokenizer 100 % html5lib **und** ≤ 2× | `[~]` **6.807 von 6.810 Fällen (99,96 %)**, Tokenizer in Firn (`lib/html/*.fi`); Geschwindigkeit **2,7×–2,9× html5ever — Ziel ≤ 2× verfehlt**. Offen: XML-Anpassung (3 Fälle) und die `errors`-Codes |
 | 4 | Testrunner **und** Debugger | `[~]` JSON-Runner erfüllt (**256/256, rate 1.0**), `.debug_line` in `gdb` belegt; Variablen und „echter Fehler gefunden" fehlen |
 | 5 | Paketverwaltung reproduzierbar | `[~]` Modulsystem vorhanden, **Paketverwaltung nicht** |
 | 6 | Kompilierzeit-Codegen erzeugt UCD-Tabelle | `[ ]` kein `comptime`, kein Bauskript |
 
-**Gesamt: 0 von 6 bestanden, 3 angefangen** (2, 4, 5).
+**Gesamt: 0 von 6 bestanden, 4 angefangen** (2, 3, 4, 5).
 
 ### Die neun Ziele dieser Runde — was wirklich fertig wurde
 
@@ -139,7 +200,7 @@ Jury selbst ausführen kann; `RUN.md` führt sie in einer Liste.
 | 5 | Optimierer + ehrliche Messung | **`[~]`** | Registerzuteilung, mem2reg, Inlining, CSE, Blockverschmelzung real (`test_opt.sh`: 41/41). **Leistungsziel ≤ 2× verfehlt:** `BENCH_RUNS=5 bash bench/run.sh` → fib 1,57×, sieve 3,97×, matmul 6,04×, bytecount 1,77×, bubblesort 5,19×, statemachine 2,76×, **Median 3,36×** (ein früherer Lauf derselben Suite: Median 2,80×). Gewinn gegenüber `--no-opt`: Median ~10× |
 | 6 | Constant-Time (`secret[T]`, `select`, `secure_zero`, `u128`) | **`[ ]` nicht gebaut** | Es gibt **keine** Syntax und **keine** Typprüfung. `fn f(a: secret[u8])` → `'secret[T]' ist in Stufe 0 nicht umgesetzt` (`tests/neg/int_secret_nicht_umgesetzt.fi`). Vorhanden sind nur die Schutzvorkehrungen in FIR/Optimierer (`fir::Func::secret`, `constant_time`), die ohne Frontend niemand auslösen kann. **Kein Punkt beansprucht** |
 | 7 | GC + DOM-Prototyp mit Zyklen | **`[ ]` nicht gebaut** | siehe Punkt 2 oben — verschoben, nichts vorgetäuscht |
-| 8 | HTML5-Tokenizer in Firn | **`[ ]` nicht gebaut** | **0 / 6.810 (0,0 %)** — siehe Punkt 3 oben |
+| 8 | HTML5-Tokenizer in Firn | **`[~]` gebaut, gemessen** | **6.807 / 6.810 (99,96 %)**, `bash tools/tokenizer/run.sh`; Faktor **2,7×–2,9×** gegen html5ever — siehe Punkt 3 oben |
 | 9 | Werkzeuge: JSON-Testrunner, Modulauflösung, DWARF, Selbsthosting-Plan | **`[~]`** | JSON-Runner **256/256**; Modulauflösung ja, Paketverwaltung nein; `.debug_line` in `gdb` belegt (`docs/DEBUGGER.md`); `docs/SELBSTHOSTING.md` |
 
 ### Keine Regression (Punkt g der Messlatte)

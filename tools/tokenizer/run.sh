@@ -36,6 +36,11 @@ if [ "$SCHNELL" -eq 0 ]; then
 fi
 
 echo
+echo "== 1b. Modulnachweis Zeichenreferenzen (lib/html/entities.fi) =="
+"$FIRNC" -o "$WORK/entities_probe" lib/html/entities_probe.fi
+python3 tools/tokenizer/pruefe_entities.py "$WORK/entities_probe"
+
+echo
 echo "== 2. html5lib-Testsuite (testdata/html5lib-tokenizer, 6.810 Faelle) =="
 python3 tools/tokenizer/harness.py "$WORK/tokenize" \
         --json "$WORK/bilanz.json" --zeige 10 | tee "$WORK/bilanz.txt"
