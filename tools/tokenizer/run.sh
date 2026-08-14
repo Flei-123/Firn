@@ -34,6 +34,9 @@ echo
 
 echo "== 1. Tokenizer uebersetzen (Firn) =="
 "$FIRNC" -o "$WORK/tokenize" lib/html/tokenize_main.fi
+# Messfassung: zaehlt nur Token (fairer Vergleich mit html5ever, das ebenfalls
+# nur zaehlt). Siehe Kopf von tools/tokenizer/durchsatz.sh.
+"$FIRNC" -o "$WORK/tokenize_bench" lib/html/tokenize_bench.fi
 echo "   opt      : $WORK/tokenize"
 if [ "$SCHNELL" -eq 0 ]; then
     "$FIRNC" --no-opt -o "$WORK/tokenize.noopt" lib/html/tokenize_main.fi

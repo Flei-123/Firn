@@ -17,15 +17,31 @@
 # Schwankung zwischen Laeufen liegt bei ~30 %). Der Faktor wird ausgerechnet
 # und ausgegeben, auch wenn er das Abnahmeziel (<= 2x) verfehlt.
 #
-# Ehrlich benannt: der Firn-Treiber schreibt zusaetzlich das html5lib-JSON auf
-# die Ausgabe, html5ever zaehlt nur Token. Die gemessene Firn-Zeit enthaelt
-# also Arbeit, die html5ever nicht leistet — der Faktor ist damit fuer Firn
-# eher zu SCHLECHT als zu gut gerechnet.
+# FAIRER VERGLEICH (seit 14.08.2026): gemessen wird `tokenize_bench`, das nur
+# Token ZAEHLT — genau wie html5ever. Der urspruengliche Treiber schrieb
+# zusaetzlich html5lib-JSON; gemessen mit callgrind waren das **14,7 % aller
+# Instruktionen** (`out_json_cp` 7,93 %, `out_json_cpbuf` 4,22 %, `out_wort`
+# 2,55 %). Ein Faktor, der solche Arbeit einrechnet, misst nicht den Tokenizer.
+# Steht `tokenize_bench` nicht bereit, faellt das Skript auf den JSON-Treiber
+# zurueck und sagt das an.
+#
+# NICHT herausgerechnet wird die Dekodierung nach UTF-32 (`dekodiere`, 28 % der
+# Instruktionen), obwohl html5ever sie nicht braucht: das ist ein echter
+# Nachteil von Firns Aufbau und keine Unfairness des Messaufbaus.
 #
 # Aufruf:  bash tools/tokenizer/durchsatz.sh [tokenizer-binary] [laeufe]
 set -euo pipefail
 cd "$(dirname "$0")/../.."
-BIN="${1:-.tokenizer-work/tokenize}"
+BIN="${1:-}"
+if [ -z "$BIN" ]; then
+    if [ -x .tokenizer-work/tokenize_bench ]; then
+        BIN=.tokenizer-work/tokenize_bench
+    else
+        BIN=.tokenizer-work/tokenize
+        echo "   HINWEIS: tokenize_bench fehlt — gemessen wird der JSON-Treiber."
+        echo "            Bauen mit: firnc -o .tokenizer-work/tokenize_bench lib/html/tokenize_bench.fi"
+    fi
+fi
 LAEUFE="${2:-3}"
 WORK=".tokenizer-work"
 mkdir -p "$WORK"
