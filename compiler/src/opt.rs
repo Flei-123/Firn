@@ -54,47 +54,253 @@ pub struct OptStats {
     pub removed_checks: usize,
 }
 
+// ------------------------------------------------ Durchgangsregister ---
+//
+// DESIGNZIELE.md §5 und §10.4 Punkt 4: Jeder Optimierungsdurchgang hat einen
+// NAMEN, einen SCHALTER und ein ETIKETT `debugerhaltend ja/nein`. Nur so laesst
+// sich spaeter die Baustufe `--dev-fast` bauen (schnell, aber debuggbar), ohne
+// jeden Durchgang anzufassen. Das Register ist die einzige Wahrheit darueber,
+// welche Durchgaenge es gibt — `--list-passes` gibt es aus.
+
+/// Baustufe. `DevFast` ist die Voreinstellung (DESIGNZIELE.md §5).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Level {
+    /// gar keine Optimierung (`--no-opt`) — nur zur Compilerfehlersuche
+    Dev,
+    /// nur debugerhaltende Durchgaenge — der Alltagsmodus
+    DevFast,
+    /// alle Durchgaenge (Pruefungen bleiben an, sobald es welche gibt)
+    ReleaseSafe,
+    /// alle Durchgaenge
+    ReleaseFast,
+}
+
+impl Level {
+    pub fn from_str(s: &str) -> Option<Level> {
+        match s {
+            "dev" => Some(Level::Dev),
+            "dev-fast" => Some(Level::DevFast),
+            "release-safe" => Some(Level::ReleaseSafe),
+            "release-fast" => Some(Level::ReleaseFast),
+            _ => None,
+        }
+    }
+    /// Laeuft in dieser Stufe auch nicht-debugerhaltendes?
+    fn allows_all(self) -> bool {
+        matches!(self, Level::ReleaseSafe | Level::ReleaseFast)
+    }
+}
+
+/// Wirkungsbereich eines Durchgangs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Scope {
+    /// arbeitet auf einer einzelnen Funktion, laeuft in der Fixpunktschleife
+    Func,
+    /// arbeitet auf dem ganzen Modul, laeuft einmal
+    Module,
+}
+
+/// Beschreibung eines Durchgangs.
+pub struct PassInfo {
+    /// Schaltername fuer `--no-pass=<name>`
+    pub name: &'static str,
+    pub scope: Scope,
+    /// **Etikett.** `true` = jede benannte Variable zeigt an jedem Haltepunkt
+    /// weiterhin ihren korrekten Wert; der Aufrufstapel bleibt lesbar.
+    /// `false` = der Durchgang zerstoert das Debugbild und laeuft nur in den
+    /// Release-Stufen.
+    pub debug_preserving: bool,
+    pub what: &'static str,
+}
+
+/// Alle Durchgaenge. Reihenfolge = Ausfuehrungsreihenfolge innerhalb einer Runde.
+pub const PASSES: &[PassInfo] = &[
+    PassInfo {
+        name: "fold",
+        scope: Scope::Func,
+        debug_preserving: true,
+        what: "Konstantenfaltung (Bin/Cmp/Un/Cast mit konstanten Operanden)",
+    },
+    PassInfo {
+        name: "mem2reg",
+        scope: Scope::Func,
+        debug_preserving: true,
+        what: "Stapelfaecher zu Werten, Weiterleitung lokaler loads, tote stores",
+    },
+    PassInfo {
+        name: "copyprop",
+        scope: Scope::Func,
+        debug_preserving: true,
+        what: "Kopien fortpflanzen, algebraische Identitaeten",
+    },
+    PassInfo {
+        name: "cse",
+        scope: Scope::Func,
+        debug_preserving: true,
+        what: "gemeinsame Teilausdruecke zusammenfassen",
+    },
+    PassInfo {
+        name: "bce",
+        scope: Scope::Func,
+        debug_preserving: true,
+        what: "beweisbar immer erfuellte Bereichspruefungen entfernen",
+    },
+    PassInfo {
+        name: "simplify-term",
+        scope: Scope::Func,
+        debug_preserving: true,
+        what: "brcond mit konstanter Bedingung zu br vereinfachen",
+    },
+    PassInfo {
+        name: "merge-blocks",
+        scope: Scope::Func,
+        debug_preserving: true,
+        what: "leere und einfach verkettete Basisbloecke verschmelzen",
+    },
+    PassInfo {
+        name: "dce",
+        scope: Scope::Func,
+        debug_preserving: true,
+        what: "unerreichbare Bloecke und unbenutzte reine Instruktionen entfernen",
+    },
+    PassInfo {
+        name: "inline",
+        scope: Scope::Module,
+        debug_preserving: false,
+        what: "Aufrufe einbetten (Groessenheuristik) — macht den Aufrufstapel unlesbar",
+    },
+];
+
+/// Was in einem Lauf ausgefuehrt werden soll.
+#[derive(Clone, Debug)]
+pub struct OptConfig {
+    pub level: Level,
+    /// einzeln abgeschaltete Durchgaenge (`--no-pass=<name>`)
+    pub disabled: Vec<String>,
+}
+
+impl Default for OptConfig {
+    fn default() -> Self {
+        OptConfig { level: Level::ReleaseFast, disabled: Vec::new() }
+    }
+}
+
+impl OptConfig {
+    /// Laeuft dieser Durchgang?
+    pub fn runs(&self, name: &str) -> bool {
+        if self.level == Level::Dev {
+            return false;
+        }
+        if self.disabled.iter().any(|d| d == name) {
+            return false;
+        }
+        match PASSES.iter().find(|p| p.name == name) {
+            Some(p) => p.debug_preserving || self.level.allows_all(),
+            // Unbekannter Name kann nicht vorkommen (nur interne Aufrufer),
+            // wird aber konservativ ausgefuehrt statt still uebersprungen.
+            None => true,
+        }
+    }
+    /// Gibt es diesen Durchgangsnamen ueberhaupt?
+    pub fn is_known(name: &str) -> bool {
+        PASSES.iter().any(|p| p.name == name)
+    }
+}
+
+/// Register als Text (fuer `--list-passes`).
+pub fn passes_text() -> String {
+    let mut out = String::from(
+        "Optimierungsdurchgaenge (Reihenfolge = Ausfuehrungsreihenfolge)\n\nNAME            BEREICH  DEBUGERHALTEND  BESCHREIBUNG\n",
+    );
+    for p in PASSES {
+        out.push_str(&format!(
+            "{:<15} {:<8} {:<15} {}\n",
+            p.name,
+            match p.scope {
+                Scope::Func => "Funktion",
+                Scope::Module => "Modul",
+            },
+            if p.debug_preserving { "ja" } else { "NEIN" },
+            p.what
+        ));
+    }
+    out.push_str(
+        "\nBaustufen: --opt-level=dev | dev-fast | release-safe | release-fast\n'dev-fast' fuehrt nur die debugerhaltenden Durchgaenge aus.\nEinzeln abschalten: --no-pass=<name> (mehrfach erlaubt).\n",
+    );
+    out
+}
+
+// ------------------------------------------------------- Ausfuehrung ---
+
+/// Volle Optimierung (`Level::ReleaseFast`) — Kurzform fuer die Modultests.
+#[cfg(test)]
 pub fn optimize(m: &mut Module) -> OptStats {
+    optimize_with(m, &OptConfig::default())
+}
+
+pub fn optimize_with(m: &mut Module, cfg: &OptConfig) -> OptStats {
     let mut st = OptStats::default();
+    if cfg.level == Level::Dev {
+        return st;
+    }
     // Erst je Funktion aufraeumen, damit die Groessenheuristik des Inliners
     // auf bereits vereinfachten Rumpfen arbeitet.
     for f in m.funcs.iter_mut() {
-        optimize_func(f, &mut st);
+        optimize_func(f, &mut st, cfg);
     }
-    st.inlined += crate::inline::inline_module(m);
-    for f in m.funcs.iter_mut() {
-        optimize_func(f, &mut st);
+    if cfg.runs("inline") {
+        st.inlined += crate::inline::inline_module(m);
+        for f in m.funcs.iter_mut() {
+            optimize_func(f, &mut st, cfg);
+        }
     }
     st
 }
 
-fn optimize_func(f: &mut Func, st: &mut OptStats) {
+fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig) {
     let mut round = 0;
     loop {
         round += 1;
         let mut changed = false;
-        changed |= fold_constants(f, st);
-        let p = crate::mem2reg::promote_single_store(f) + crate::mem2reg::forward_local_loads(f);
-        let ds = crate::mem2reg::remove_dead_stores(f);
-        st.removed_insts += ds;
-        changed |= ds > 0;
-        st.promoted_loads += p;
-        changed |= p > 0;
-        let c = crate::mem2reg::copy_propagate(f);
-        st.copies += c;
-        changed |= c > 0;
-        let e = cse(f);
-        st.cse += e;
-        changed |= e > 0;
-        let r = remove_redundant_checks(f);
-        st.removed_checks += r;
-        changed |= r > 0;
-        changed |= simplify_terminators(f);
-        let mb = crate::mem2reg::merge_blocks(f);
-        st.merged_blocks += mb;
-        changed |= mb > 0;
-        changed |= remove_unreachable_blocks(f, st);
-        changed |= remove_dead_insts(f, st);
+        if cfg.runs("fold") {
+            changed |= fold_constants(f, st);
+        }
+        if cfg.runs("mem2reg") {
+            let p =
+                crate::mem2reg::promote_single_store(f) + crate::mem2reg::forward_local_loads(f);
+            let ds = crate::mem2reg::remove_dead_stores(f);
+            st.removed_insts += ds;
+            changed |= ds > 0;
+            st.promoted_loads += p;
+            changed |= p > 0;
+        }
+        if cfg.runs("copyprop") {
+            let c = crate::mem2reg::copy_propagate(f);
+            st.copies += c;
+            changed |= c > 0;
+        }
+        if cfg.runs("cse") {
+            let e = cse(f);
+            st.cse += e;
+            changed |= e > 0;
+        }
+        if cfg.runs("bce") {
+            let r = remove_redundant_checks(f);
+            st.removed_checks += r;
+            changed |= r > 0;
+        }
+        if cfg.runs("simplify-term") {
+            changed |= simplify_terminators(f);
+        }
+        if cfg.runs("merge-blocks") {
+            let mb = crate::mem2reg::merge_blocks(f);
+            st.merged_blocks += mb;
+            changed |= mb > 0;
+        }
+        if cfg.runs("dce") {
+            changed |= remove_unreachable_blocks(f, st);
+            changed |= remove_dead_insts(f, st);
+        }
         if !changed || round >= MAX_ROUNDS {
             break;
         }

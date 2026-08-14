@@ -872,14 +872,76 @@ fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
     for (r, off) in &a.saved {
         e.line(&format!("mov qword ptr [rbp-{}], {}", off, r));
     }
+    // Parameter aus den Argumentregistern in ihre Heimat bringen.
+    // ACHTUNG: `r8`/`r9` sind zugleich Argumentregister 5/6 UND moegliche
+    // Heimat frueherer Parameter. Deshalb erst alle Slot-Ziele (die
+    // ueberschreiben kein Register), dann die Register-Ziele PARALLEL.
+    let mut prolog_moves: Vec<(String, String)> = Vec::new();
     for (i, _t) in f.params.iter().enumerate() {
-        ra.store_dst(e, i as Val, ARG_REGS[i]);
+        match ra.a.loc(i as Val) {
+            Loc::Slot(off) => {
+                e.line(&format!("mov qword ptr [rbp-{}], {}", off, ARG_REGS[i]))
+            }
+            Loc::Reg(dst) => prolog_moves.push((dst.to_string(), ARG_REGS[i].to_string())),
+        }
     }
+    parallele_reg_bewegungen(e, &prolog_moves);
     for b in &f.blocks {
         e.raw(&format!("{}:", block_label(&f.name, b.id)));
         emit_block(e, &ra, b)?;
     }
     Ok(())
+}
+
+/// Ist `s` ein 64-Bit-Maschinenregistername (und damit ein Operand, dessen
+/// Inhalt durch andere Registerbewegungen zerstoert werden kann)?
+fn ist_reg64(s: &str) -> bool {
+    matches!(
+        s,
+        "rax" | "rbx" | "rcx" | "rdx" | "rsi" | "rdi" | "rbp" | "rsp"
+            | "r8" | "r9" | "r10" | "r11" | "r12" | "r13" | "r14" | "r15"
+    )
+}
+
+/// Emittiert eine **parallele** Registerumsetzung: alle Paare `(ziel, quelle)`
+/// gelten GLEICHZEITIG, ein Ziel darf also zugleich Quelle eines anderen Paares
+/// sein.
+///
+/// Notwendig, weil `r8`/`r9` sowohl Argumentregister 5 und 6 als auch
+/// Arbeitsregister der Zuteilung sind (`TEMP_REGS`). Naiv der Reihe nach
+/// umgesetzt, ueberschreibt der fuenfte Parameter sonst ein Argument, das der
+/// sechste noch braucht — genau dieser Fehler liess `tests/024_six_args.fi`
+/// ohne Einbettung 13 statt 21 liefern.
+///
+/// Verfahren: solange ein Ziel existiert, das von keinem offenen Paar mehr als
+/// Quelle gebraucht wird, wird dieses Paar sofort ausgegeben. Bleiben nur noch
+/// Zyklen uebrig, wird einer ueber `rax` aufgebrochen — `rax` ist nie Heimat
+/// eines Wertes (weder in `CALLEE_SAVED` noch in `TEMP_REGS`).
+fn parallele_reg_bewegungen(e: &mut Emitter, paare: &[(String, String)]) {
+    let mut offen: Vec<(String, String)> =
+        paare.iter().filter(|(z, q)| z != q).cloned().collect();
+    while !offen.is_empty() {
+        if let Some(i) = offen
+            .iter()
+            .position(|(z, _)| !offen.iter().any(|(_, q)| q == z))
+        {
+            let (z, q) = offen.remove(i);
+            e.line(&format!("mov {}, {}", z, q));
+            continue;
+        }
+        // Nur noch Zyklen: den alten Inhalt des Ziels nach rax retten, damit
+        // das Ziel frei wird; alle Quellen, die darauf zeigten, lesen ab jetzt
+        // aus rax.
+        let (z, q) = offen[0].clone();
+        e.line(&format!("mov rax, {}", z));
+        for (_, quelle) in offen.iter_mut() {
+            if *quelle == z {
+                *quelle = "rax".to_string();
+            }
+        }
+        e.line(&format!("mov {}, {}", z, q));
+        offen.remove(0);
+    }
 }
 
 fn epilogue(e: &mut Emitter, a: &Alloc) {
@@ -1168,11 +1230,24 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
             }
         }
         Op::Call { name, args } => {
-            // Argumente: erst alles nach rax/Stackslot-frei in die Zielregister.
-            // Die Zuteilung vergibt keine Argumentregister, deshalb kann hier
-            // kein noch benoetigter Wert ueberschrieben werden.
+            // Argumente in die Argumentregister. Die Zuteilung vergibt `r8`
+            // und `r9` sehr wohl als Heimat (`TEMP_REGS`), deshalb muessen die
+            // Register-zu-Register-Bewegungen PARALLEL geschehen; Operanden aus
+            // Speicher oder Sofortkonstanten lesen kein Register und kommen
+            // danach.
+            let mut reg_moves: Vec<(String, String)> = Vec::new();
+            let mut spaeter: Vec<(usize, Val)> = Vec::new();
             for (k, arg) in args.iter().enumerate() {
-                ra.load_full(e, ARG_REGS[k], *arg);
+                let o = ra.opnd(*arg);
+                if ist_reg64(&o) {
+                    reg_moves.push((ARG_REGS[k].to_string(), o));
+                } else {
+                    spaeter.push((k, *arg));
+                }
+            }
+            parallele_reg_bewegungen(e, &reg_moves);
+            for (k, arg) in spaeter {
+                ra.load_full(e, ARG_REGS[k], arg);
             }
             e.line(&format!("call {}", name));
             if let Some(d) = i.dst {
@@ -1184,8 +1259,21 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
             if args.is_empty() {
                 return Err("interner Fehler: syscall ohne Nummer".to_string());
             }
+            // Gleiche Fehlerklasse wie beim Aufruf: `r10`, `r8` und `r9`
+            // sind zugleich Arbeitsregister der Zuteilung.
+            let mut sys_moves: Vec<(String, String)> = Vec::new();
+            let mut sys_spaeter: Vec<(usize, Val)> = Vec::new();
             for (k, arg) in args.iter().skip(1).enumerate() {
-                ra.load_full(e, SYS_REGS[k], *arg);
+                let o = ra.opnd(*arg);
+                if ist_reg64(&o) {
+                    sys_moves.push((SYS_REGS[k].to_string(), o));
+                } else {
+                    sys_spaeter.push((k, *arg));
+                }
+            }
+            parallele_reg_bewegungen(e, &sys_moves);
+            for (k, arg) in sys_spaeter {
+                ra.load_full(e, SYS_REGS[k], arg);
             }
             ra.load_full(e, "rax", args[0]);
             e.line("syscall");
