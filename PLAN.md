@@ -348,3 +348,127 @@ Halbfertiges wird NICHT als fertig gemeldet.
 7. Selbst messen, bevor „fertig" gemeldet wird: Testsuite laufen lassen,
    Benchmarks wirklich messen, Harness wirklich fahren. **Echte Zahlen** in
    `README.md` und `ABNAHME.md`.
+
+---
+
+# PLAN — Runde 3 (Haertetest 1): Fehlerunionen `E!T` + HTML5-Tokenizer in Firn
+
+Stand beim Start: `bash test.sh` **PASS 393/393**, `cargo build --release`
+ohne Warnungen. Ziel dieser Runde:
+
+1. **Fehlerunionen `E!T`** als Sprachmittel (SPEC §5.1) — `error`, `try`,
+   `catch`, implizite Umwandlung bei `return`, `!T` ist `#[must_consume]`.
+2. **HTML5-Tokenizer in Firn** unter `lib/html/`, gemessen an der offiziellen
+   html5lib-Testsuite (**6.810 Faelle**), mit ehrlicher Quote je `.test`-Datei
+   und ehrlichem Geschwindigkeitsvergleich gegen `html5ever`.
+
+## 0. Was der Lead vor dieser Runde bereits gebaut hat — steht, laeuft, nicht neu bauen
+
+Nachgemessen mit `bash test.sh` → **PASS 397/397** und
+`bash tools/tokenizer/run.sh --schnell` → **2.854 / 6.810 (41,9 %)**.
+
+| Datei | Inhalt | Zustand |
+|---|---|---|
+| `lib/html/mem.fi` | mmap-Heap, `Buf` (u8-Vektor), `CpBuf` (u32-Vektor), `read_all_stdin`, `write_all` | fertig, Vertrag |
+| `lib/html/tokens.fi` | Token-Modell (`Sink`, `Attr`), Verschmelzen der `Character`-Token, doppelte Attribute, **html5lib-JSON-Ausgabe in Firn** (ASCII, `\uXXXX`) | fertig, Vertrag |
+| `lib/html/tokenizer.fi` | `enum State` + `match`; umgesetzt: Data, PLAINTEXT, TagOpen, EndTagOpen, TagName, BeforeAttributeName, AttributeName, AfterAttributeName, BeforeAttributeValue, AttributeValue×3, AfterAttributeValueQuoted, SelfClosingStartTag, BogusComment | **Geruest — hier wird gebaut** |
+| `lib/html/tokenize_main.fi` | Wurzeldatei: Auftragsprotokoll lesen, WTF-8 dekodieren, `\r\n`→`\n`, Zeile je Auftrag schreiben | fertig |
+| `tools/tokenizer/harness.py` | Werkbank: `doubleEscaped`, `xmlViolationTests`, `initialStates`, `lastStartTag`, Bilanz je Datei, JSON-Bericht | fertig |
+| `tools/tokenizer/run.sh` | baut, faehrt drei Baustufen gegen dieselbe Bilanz, misst Durchsatz, prueft Regressionsschranke | fertig |
+| `tools/tokenizer/durchsatz.sh`, `korpus.py` | 4-MB-Korpus + MB/s; ruft `bench/tokenizer/…/html5ever_bench`, wenn gebaut | Firn-Seite fertig, Referenzseite offen |
+| `tools/tokenizer/PROTOKOLL.md` | Vertrag Firn ↔ Harness | fertig |
+| `test.sh` Abschnitt 9 | Tokenizer-Lauf als Teil der Suite, Schranke `tools/tokenizer/mindestquote.txt` | fertig |
+| `compiler/src/modules.rs` + `sema_match.rs` | **Fehlerbehebung:** `match`-Rumpfbloecke liegen in der Registrierung, nicht im AST — das Modulsystem hat Namen darin bisher nicht umgeschrieben. `match` in einem importierten Modul war unbenutzbar. Nachweis: `tests/231_modul_match.fi` + `tests/modules/zustand.fi` | erledigt |
+
+**Bekannte Grenzen (ehrlich, gehoeren nach SPEC §14.1, nicht wegdiskutieren):**
+* Aufzaehlungsnamen sind programmweit, nicht je Modul: `Ampel::Rot`, nicht
+  `zustand.Ampel::Rot`.
+* Fehlermeldungen in importierten Modulen zeigen Zeile/Spalte, aber den
+  Dateinamen der Wurzeldatei (Modul `fehlerunionen` darf das mitnehmen, wenn
+  Zeit bleibt — sonst als offen vermerken).
+* `lib/html/mem.fi` dopplet rund 80 Zeilen aus `lib/str/alloc.fi`, weil
+  `lib/str` ueber `//#include` und nicht ueber `import` eingebunden wird.
+
+## 1. Dateieigentum in Runde 3 — zwei Module fassen NIE dieselbe Datei an
+
+| Modul | Darf schreiben | Darf nur lesen |
+|---|---|---|
+| **fehlerunionen** | `compiler/src/errors.rs` (neu), `compiler/src/lower_errors.rs` (neu), Hook-Zeilen in `parser.rs`, `ast.rs`, `lexer.rs`, `sema.rs`, `lower.rs`, `types.rs`, `attrs.rs`; `tests/4??_*.fi`, `tests/neg/err_*.fi`; `SPEC.md` §14.1, `docs/FEHLERUNIONEN.md` | alles andere |
+| **tokenizer-kern** | `lib/html/tokenizer.fi` | `lib/html/mem.fi`, `tokens.fi` |
+| **tokenizer-text** | `lib/html/entities.fi` (neu), `lib/html/entities_data.fi` (erzeugt), `tools/tokenizer/gen_entities.py` (neu) | `lib/html/mem.fi` |
+| **tokenizer-tokens** | `lib/html/tokens.fi`, `lib/html/tokenize_main.fi`, `lib/html/mem.fi` | — |
+| **harness-bench** | `tools/tokenizer/harness.py`, `run.sh`, `durchsatz.sh`, `korpus.py`, `mindestquote.txt`, `bench/tokenizer/**` (neu), `bench/RESULTS.md`, `ABNAHME.md`, `README.md` | alles andere |
+
+`test.sh` fasst **niemand** an ausser dem Lead bei der Zusammenfuehrung.
+`tools/tokenizer/mindestquote.txt` schreibt nur **harness-bench** — und nur
+nach oben, nie nach unten.
+
+## 2. Schnittstellen — exakt, damit ohne Absprache gebaut werden kann
+
+### 2.1 `mem` (fest, aendert nur `tokenizer-tokens`)
+```
+heap_alloc(n: usize) -> *mut u8      heap_free(p: *mut u8, n: usize)
+mem_copy(dst, src, n)                write_all(fd: i64, p: *mut u8, n: usize)
+Buf   : buf_neu() -> Buf, buf_init/free/clear/reserve/push/len/at/ptr/
+        buf_set_len, buf_push_dec, buf_flush(b, fd), read_all_stdin(b)
+CpBuf : cp_neu() -> CpBuf, cp_init/free/clear/push/len/at/set/truncate,
+        cp_copy_from(dst, src), cp_eq_cp(a, b), cp_eq_ascii_lower(a, b)
+```
+
+### 2.2 `tokens` (fest, aendert nur `tokenizer-tokens`)
+```
+sink_neu() -> Sink        sink_init(s)     sink_free(s)
+sink_begin(s)             sink_end(s)      sink_abort(s)   sink_flush_out(s)
+sink_emit_char(s, cp)     sink_flush_chars(s)
+tok_start_tag(s) tok_end_tag(s) tok_comment(s) tok_doctype(s)
+tok_name_push(s, cp)      tok_comment_push(s, cp)  tok_doctype_name_push(s, cp)
+tok_pubid_start(s) tok_pubid_push(s, cp)  tok_sysid_start(s) tok_sysid_push(s, cp)
+tok_set_force_quirks(s, b)                tok_set_self_closing(s, b)
+tok_attr_start(s) tok_attr_name_push(s, cp) tok_attr_value_push(s, cp) tok_attr_finish(s)
+tok_emit(s)               tok_is_appropriate_end_tag(s) -> bool
+sink_set_last_start_tag_cp(s, cpbuf)
+```
+Wer eine Funktion braucht, die es nicht gibt (z. B. Zugriff auf den aktuellen
+Tagnamen fuer RCDATA), meldet sie bei `tokenizer-tokens` an — **niemand baut
+sie sich selbst in `tokenizer.fi` nach.**
+
+### 2.3 `entities` (Modul `tokenizer-text` liefert, `tokenizer-kern` ruft)
+```
+// Verarbeitet eine Zeichenreferenz. `pos` zeigt hinter das '&'.
+// `in_attr` = true im Attributwert (Sonderregel des Standards).
+// Rueckgabe: neue Position in der Eingabe.
+// Die erzeugten Codepunkte werden ueber `out` angehaengt:
+//   out == 0  -> tokens.sink_emit_char,  sonst tokens.tok_attr_value_push
+fn char_ref(input: *mut mem.CpBuf, pos: usize, in_attr: bool,
+            s: *mut tokens.Sink, in_attribut: bool) -> usize
+```
+Die Namenstabelle wird von `tools/tokenizer/gen_entities.py` aus
+`python3 -c "import html.entities"` (offizielle WHATWG-Liste der
+Standardbibliothek) nach `lib/html/entities_data.fi` erzeugt — **nicht** aus
+den Testdaten abgeleitet. Der Erzeuger liegt im Baum und ist wiederholbar.
+
+### 2.4 Fehlerunionen (Modul `fehlerunionen`)
+Empfohlener Weg laut Aufgabenstellung: `E!T` als zweivariantige getaggte Union
+im `TypeCtx` (`__err: u32`, `0` = Erfolg, `__val: T`) plus Seitentabelle wie
+`enum_by_struct`. Damit funktionieren Aggregatrueckgabe, System-V-ABI,
+Registerzuteilung und Codegen ohne Aenderung.
+
+## 3. Reihenfolge, Abhaengigkeiten
+
+* `fehlerunionen` ist von allem anderen unabhaengig (nur Compiler + `tests/`).
+* `tokenizer-kern` kann sofort loslegen; solange `entities` fehlt, ruft es
+  weiter `sink_abort` fuer `&`.
+* `tokenizer-text` kann sofort loslegen (eigene Dateien).
+* `harness-bench` kann sofort loslegen; die Zahlen fuer `ABNAHME.md`/`README.md`
+  werden **zuletzt** selbst gemessen und nur dann eingetragen.
+
+## 4. Nicht verhandelbar
+
+1. `bash test.sh` bleibt gruen — alle neun Abschnitte. Kein Test wird
+   entfernt, umgeschrieben oder abgeschwaecht.
+2. `cargo build --release` ohne Warnungen, keine externen Kisten im Compiler,
+   kein `#![allow(...)]`, kein `todo!()`/`unimplemented!()`.
+3. Jeder neue `tests/*.fi` laeuft in drei Baustufen mit demselben Ergebnis.
+4. SPEC.md wird nicht umgeschrieben; Abweichungen kommen nach §14.1.
+5. Keine geschoenten Zahlen. Ein nicht unterstuetzter Fall ist ein
+   **Fehlschlag** — der Harness filtert nichts.

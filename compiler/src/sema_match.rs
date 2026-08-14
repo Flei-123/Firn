@@ -174,6 +174,24 @@ pub(crate) fn match_info(idx: usize) -> Option<MatchInfo> {
     REG.with(|r| r.borrow().matches.get(idx).cloned())
 }
 
+/// `// HOOK types` fuer das Modulsystem (`modules.rs`): die Rumpfbloecke der
+/// `match`-Faelle liegen NICHT im AST, sondern in dieser Registrierung. Damit
+/// das Modulsystem die Namen darin genauso umschreiben kann wie im uebrigen
+/// AST, wird ein Eintrag herausgenommen und nach der Umschrift zurueckgelegt.
+pub(crate) fn take_match(idx: usize) -> Option<MatchInfo> {
+    REG.with(|r| r.borrow().matches.get(idx).cloned())
+}
+
+/// Gegenstueck zu `take_match`.
+pub(crate) fn put_match(idx: usize, m: MatchInfo) {
+    REG.with(|r| {
+        let mut reg = r.borrow_mut();
+        if let Some(slot) = reg.matches.get_mut(idx) {
+            *slot = m;
+        }
+    })
+}
+
 fn match_index_of(name: &str) -> Option<usize> {
     name.strip_prefix(MATCH_PREFIX).and_then(|s| s.parse::<usize>().ok())
 }
