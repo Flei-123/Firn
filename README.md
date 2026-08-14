@@ -505,6 +505,72 @@ Ehrlich benannt:
 * Alle drei Baustufen (`opt`, `--no-opt`, `dev-fast`) liefern dieselbe Bilanz;
   `run.sh` bricht ab, wenn nicht.
 
+## Optimierer-Runde 5: LICM, `lea` — und was der Tokenizer wirklich bremst
+
+**Neuer Durchgang `licm`** (`compiler/src/licm.rs`): schleifeninvariante
+Berechnungen wandern in den Vorkopf. In `bench/firn/matmul.fi` stand `r * n` in
+jeder Iteration der innersten Schleife — 240 × 240 × 3 Mal je Lauf.
+
+```
+$ firnc --list-passes | grep licm
+licm            Funktion ja    schleifeninvariante Berechnungen in den Vorkopf ziehen
+```
+
+**`lea` statt `mov`+`add`** im Codegenerator: Adressrechnungen brauchen eine
+Instruktion statt zwei bis drei, und der Fall „zweiter Operand liegt schon im
+Zielregister" braucht keinen Umweg über `rax` mehr. In der inneren Schleife von
+`matmul` waren **14 der 27 Instruktionen reine Registerkopien**; jetzt sind es
+21 Instruktionen insgesamt.
+
+**Inline-Grenze für den Aufrufer** von 4.000 auf 24.000 FIR-Instruktionen: die
+heißeste Funktion des ganzen Projekts — `tokenizer__tokenize` mit 4.139
+Instruktionen — bekam vorher **keine einzige Einbettung**, obwohl
+`sink_emit_char` mit 18 Instruktionen weit unter jeder Grenze liegt. Eine große
+Funktion ist nicht automatisch kalt; bei einer Zustandsmaschine ist das
+Gegenteil der Fall.
+
+### Gemessen — und zwar deterministisch
+
+Auf dieser Maschine schwankt die Wanduhrzeit derselben Binary um bis zu **40 %**
+zwischen Läufen. Damit ist eine Codegen-Änderung von 5 % nicht bewertbar: beim
+ersten Versuch erschien dieselbe Verbesserung einmal als −18 % und einmal als
++6 %. Seitdem misst `bench/instr.sh` die **ausgeführten Instruktionen** mit
+`valgrind --tool=callgrind` — auf die Instruktion genau reproduzierbar.
+
+| Programm | vorher | nachher | Änderung |
+|---|---:|---:|---:|
+| matmul | 1.668.312.681 | 1.376.734.921 | **−17,48 %** |
+| bubblesort | 811.682.925 | 667.321.089 | **−17,79 %** |
+| bytecount | 2.579.216.109 | 2.148.310.351 | **−16,71 %** |
+| sieve | 825.458.961 | 708.292.727 | **−14,19 %** |
+| statemachine | 1.847.172.267 | 1.721.343.055 | **−6,81 %** |
+| fib | 338.351.740 | 338.353.992 | ±0,00 % |
+
+`fib` ist reine Rekursion — dort gibt es für beide Durchgänge nichts zu holen.
+
+### Der Tokenizer wird davon NICHT schneller — hier ist der Beweis
+
+| Korpus `realweb`, 4.931.819 Bytes | Instruktionen | je Byte |
+|---|---:|---:|
+| Firn-Tokenizer | 4.033.688.605 | **818** |
+| html5ever | 540.567.170 | **110** |
+
+Das Verhältnis **7,46×** deckt sich fast genau mit dem Zeitfaktor **7,04×**.
+Damit ist belegt, woran der Abstand **nicht** liegt: nicht an der Qualität des
+erzeugten Codes. Firn führt siebeneinhalb Mal so viel Arbeit aus, und daran
+würde auch ein perfekter Codegenerator nichts ändern.
+
+Die Ursachen liegen im Tokenizer, nicht im Compiler: er dekodiert die Eingabe
+erst vollständig nach UTF-32 (`mem.CpBuf`, vier Byte je Zeichen) und
+tokenisiert dann diesen Puffer, er hat keinen Bulk-Pfad für Textläufe (html5ever
+springt zum nächsten `<`/`&` und gibt alles dazwischen als einen Block aus), und
+er schreibt zusätzlich das html5lib-JSON, das html5ever nicht schreibt.
+
+**Deshalb ist das Abnahmeziel „≤ 2× Referenz" mit Compilerarbeit allein nicht
+erreichbar.** Der nächste Schritt gehört dem Tokenizer und einem fairen
+Messaufbau — nicht dem Optimierer. Das ist die eigentliche Erkenntnis dieser
+Runde, und sie ist mehr wert als die 16 % Instruktionen.
+
 ## Speichermodell: Opt-in-Tracing-GC und der DOM-Dauerlauf (Runde 4)
 
 Die wichtigste offene Designfrage aus `DESIGNZIELE.md` ist entschieden **und
