@@ -1194,6 +1194,25 @@ Zählverweis-Gegenprobe mit identischem Graphen braucht nach 2.000.000 Zyklen
 * **Fragmentierung** bei wechselnden Objektgrößen ist ungeprüft; der Dauerlauf
   benutzt immer denselben Satz.
 
+#### 14.1.module — zwei Grenzen des Modulsystems behoben (Runde 17)
+
+**Importpfade werden zuerst relativ zur importierenden Datei gesucht**, erst
+danach relativ zur Wurzeldatei. Vorher galt nur die zweite Regel, und damit
+konnte eine Bibliothek keine andere einbinden. Der Rückfall auf die Wurzel
+bleibt, damit bestehender Quelltext unverändert übersetzt.
+
+**Generische Vorlagen aus Modulen sind benutzbar.** Die Vorabsuche nach
+Vorlagen lief je Datei unmittelbar vor deren Parsen; die Wurzeldatei wird
+zuerst geparst und kannte die Vorlagen der Module deshalb nicht.
+`modules::build_program` lext jetzt erst alle Dateien und scannt sie vorab.
+
+Nachweis für beides: `tests/630_modulkette.fi`.
+
+**Offen (`docs/SELBSTHOSTING.md` §7, B2):** eine generische Vorlage sieht nur
+die Namen der **Wurzeldatei**, nicht die ihrer eigenen Moduldatei — selbst eine
+Hilfsfunktion zwölf Zeilen darüber meldet *unbekannte funktion*. Solange das
+gilt, kann ein Modul keine generische Sammlung anbieten, die intern arbeitet.
+
 #### 14.1.sizeof — `size_of[T]()` (Runde 16)
 
 `size_of[T]()` liefert die Größe eines Typs in **Bytes**, ermittelt zur
