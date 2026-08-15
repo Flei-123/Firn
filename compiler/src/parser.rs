@@ -62,6 +62,7 @@ fn starts_stmt(k: &TokKind) -> bool {
             | TokKind::KwFor
             | TokKind::KwBreak
             | TokKind::KwContinue
+            | TokKind::KwDefer
             | TokKind::KwMatch
     )
 }
@@ -887,6 +888,20 @@ impl<'a> Parser<'a> {
         s
     }
 
+    /// `defer <anweisung>` — die Anweisung laeuft beim Verlassen des
+    /// umschliessenden Blocks (SPEC §5.1). Erlaubt ist sowohl ein Block
+    /// (`defer { … }`) als auch eine einzelne Anweisung (`defer close(fd)`).
+    fn defer_stmt(&mut self) -> Stmt {
+        let start = self.bump();
+        if self.at_eof() {
+            self.error_here("nach 'defer' fehlt die aufgeschobene anweisung".to_string());
+            return Stmt::Error(start);
+        }
+        let inner = self.stmt();
+        let sp = Parser::join(start, inner.span());
+        Stmt::Defer(Box::new(inner), sp)
+    }
+
     fn stmt_inner(&mut self, start: Span) -> Stmt {
         // HOOK types: `match`-Anweisung (sema_match.rs)
         if let Some(s) = crate::sema_match::hook_stmt(self) {
@@ -898,6 +913,7 @@ impl<'a> Parser<'a> {
             TokKind::KwWhile => self.while_stmt(),
             TokKind::KwFor => self.for_stmt(),
             TokKind::KwBreak | TokKind::KwContinue => self.jump_stmt(),
+            TokKind::KwDefer => self.defer_stmt(),
             TokKind::KwReturn => self.return_stmt(),
             TokKind::LBrace => Stmt::Block(self.block("am anfang eines blocks")),
             TokKind::KwFn | TokKind::KwStruct | TokKind::KwConst | TokKind::KwExtern => {

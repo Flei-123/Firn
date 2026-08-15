@@ -932,7 +932,7 @@ in diesem Dokument ist Zukunft und wird im README als „noch nicht" geführt.
 * Testsuite mit ≥ 40 `.fi`-Programmen plus Negativtests.
 
 **Nicht enthalten (Stufe 0), Stand nach Runde 3:** `comptime`, `interface`,
-`defer`/`drop`, Move-Prüfer, Referenztypen `&T`/`inout T` als geprüfte Typen
+`errdefer`/`drop`, Move-Prüfer, Referenztypen `&T`/`inout T` als geprüfte Typen
 (nur Rohzeiger), Arenen, Abwicklung/`throw`, Gleitkomma als Sprachtyp, `u128`,
 `Arc[T]`, Standardbibliothek, Nebenläufigkeit, Paketverwaltung, aarch64, WASM,
 LLVM-Backend. Nicht umgesetzte Typkonstruktoren melden einen eigenen Fehler mit
@@ -1339,8 +1339,33 @@ F4. **`catch |e| …` bindet an einen Ausdruck, nicht an einen Block.** Der
     Fehlerwert ist **nicht** umgesetzt und meldet einen sauberen Fehler.
     Auch der Schreibweise nach ist `catch` damit enger als das Beispiel in
     §5.1, das einen Block mit `return` darin zeigt.
-F5. **`defer` und `errdefer` gibt es nicht.** Beides ist offen; das Beispiel in
-    §5.1 (`errdefer close(fd)`) ist damit noch nicht schreibbar.
+F5. **`defer` gibt es seit Runde 9, `errdefer` noch nicht.**
+
+    `defer <anweisung>` schiebt die Anweisung bis zum Verlassen des
+    umschliessenden Blocks auf. Erlaubt ist ein Block (`defer { … }`) oder eine
+    einzelne Anweisung (`defer close(fd)`). Ausgefuehrt wird in **umgekehrter
+    Reihenfolge** der Vereinbarung, und zwar bei jedem Verlassen: am Blockende,
+    bei `return`, bei `break` und bei `continue`.
+
+    * **`return` raeumt alle Ebenen ab**, innerste zuerst — der Rueckgabewert
+      ist zu diesem Zeitpunkt bereits berechnet (`lower::ret_term`).
+    * **`break`/`continue` raeumen genau die Ebenen ab, die INNERHALB der
+      Schleife vereinbart wurden** (`lower::loops` merkt sich dafuer die Tiefe
+      des `defer`-Stapels beim Betreten der Schleife).
+    * **Auswertungszeitpunkt: wie Zig, nicht wie Go.** Der Rumpf wird erst beim
+      Verlassen ausgewertet, mit den Werten von *dann*. Go wertet die Argumente
+      sofort aus und legt sie in versteckten Kopien ab; das widerspricht dem
+      Grundsatz „nichts Verstecktes" (§2). Nachweis:
+      `tests/580_defer.fi`, Abschnitt 3.
+    * **Ein Sprung aus dem Rumpf heraus ist ein Fehler** (`return`, `break`,
+      `continue`) — er wuerde die Reihenfolge der uebrigen aufgeschobenen
+      Anweisungen zerreissen. Negativtests `tests/neg/defer_return.fi`,
+      `tests/neg/defer_break.fi`. Innerhalb einer Schleife, die im `defer`
+      selbst beginnt, sind `break`/`continue` erlaubt.
+
+    **`errdefer` ist offen**; das Beispiel in §5.1 (`errdefer close(fd)`) ist
+    damit noch nicht schreibbar. Es braucht die Unterscheidung „verlassen auf
+    dem Fehlerpfad" und gehoert zu `try`/`catch` (§5.1).
 F6. **Kein Erfolgstyp `()`.** `E!()` ist nicht schreibbar (Stufe 0 kennt `()`
     nicht als Typsyntax); eine Funktion ohne Nutzergebnis liefert z. B.
     `E!i32`.
