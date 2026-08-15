@@ -1233,3 +1233,67 @@ benannt und nicht mehr vage:
 3. Gleitkomma im Codegenerator
 
 Erst danach kann `firnc1` sich selbst übersetzen.
+
+
+---
+
+## 20. Runde 30: `defer`, Gleitkomma und Stapelargumente
+
+Drei Lücken zu, und zwar die letzten, die nicht an Generics hängen.
+
+| | Runde 29 | Runde 30 |
+|---|---:|---:|
+| gleiches Verhalten wie `firnc0` | 113 | **121** |
+| wegen `defer` ausgeschlossen | 1 | **0** |
+| wegen Codegenerator ausgeschlossen | 5 | **0** |
+| abweichend · fehlerhaft | 0 · 0 | **0** · **0** |
+
+### `defer` im Lowering
+
+Ein Stapel je **Blockebene**. Beim Verlassen eines Blocks laufen dessen eigene
+rückwärts; bei `return` laufen **alle** Ebenen der Funktion; bei `break` und
+`continue` nur die, die **innerhalb** der Schleife vereinbart wurden — dafür
+merkt sich jede Schleife die Stapeltiefe beim Betreten.
+
+Der Stapel bleibt beim vorzeitigen Ablaufen **unverändert**: der Block räumt
+seine eigene Ebene selbst ab. Was danach noch erzeugt wird, landet im
+unerreichbaren Block hinter dem Sprung — doppelt ausgeführt wird nichts.
+
+`tests/720_defer_kern.fi` schreibt die Reihenfolge in einen Puffer, statt nur
+Aufrufe zu zählen. Dabei fiel eine Eigenschaft auf, die ich falsch erwartet
+hatte: **das Argument einer aufgeschobenen Anweisung wird erst beim Ablaufen
+ausgewertet**, nicht bei der Vereinbarung. `defer merke(s, 49 + i)` schreibt
+also den *späteren* Wert von `i`. Beide Compiler sind sich einig — der Test
+steht jetzt mit dieser Einsicht da statt mit meiner Vermutung.
+
+### Gleitkomma im Codegenerator
+
+`xmm0`/`xmm1`, `addsd`/`subsd`/`mulsd`/`divsd`, `cvtsi2sd` und `cvttsd2si`.
+Eine eigene Klassifikation an der Funktionsgrenze gibt es **nicht**: Stufe 0
+übergibt `f64` in Ganzzahlregistern (SPEC §14.1, bewusste Abweichung von
+System V), und genau das tut dieser Codegenerator auch.
+
+Der Vergleich mit `comisd` setzt die Flaggen wie ein *unsigned*-Vergleich, und
+**NaN setzt zusätzlich PF**. Nach IEEE-754 ist jeder Vergleich mit NaN falsch —
+außer `!=`, das wahr sein muss. Also: bei `!=` wird PF **dazugeodert**, bei
+allen anderen wird mit `setnp` **weggeundet**. `tests/590_f64.fi` prüft genau
+diese Fälle (NaN gegen sich selbst, `<`, `>`, `>=`, Unendlich, minus null) und
+läuft jetzt vollständig durch den Firn-Compiler.
+
+### Stapelargumente
+
+Mehr als sechs Argumente gehen nach System V über den Stapel, in **umgekehrter**
+Reihenfolge. `rsp` muss beim `call` 16-ausgerichtet sein — bei ungerader Zahl
+von Stapelargumenten liegt deshalb ein Füllwort davor. Die aufgerufene Funktion
+findet sie bei `[rbp+16]`, `[rbp+24]`, …
+
+### Was jetzt noch fehlt
+
+**Nur noch Generics.** Von 121 vergleichbaren Programmen fällt keines mehr an
+`defer`, Gleitkomma oder der Aufrufkonvention. Die 60 Dateien unter „nicht
+Kernsprache" hängen an `enum`/`match`, Fehlerunionen, `gc class`, Attributen,
+`comptime` — und an **generischen Vorlagen**, ohne die `firnc1` seine eigenen
+Quellen nicht lesen kann (`Vec[T]`, `Map[K,V]`).
+
+Damit ist der Weg zum Fixpunkt auf **einen** Punkt zusammengeschrumpft:
+Generics im Parser und in der Monomorphisierung von `firnc1`.
