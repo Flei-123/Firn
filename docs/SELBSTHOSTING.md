@@ -64,7 +64,7 @@ Sortiert nach „blockiert am meisten zuerst". `[ ]` = fehlt,
 | 8 | **Methoden / `impl`** | `[ ]` | Kosmetik, ersetzbar durch freie Funktionen mit erstem Parameter |
 | 9 | **Schnittstellen / dynamischer Versand** | `[ ]` | Für Stufe 1 **nicht** nötig |
 | 10 | **Fehlerbehandlung** (`Result`, `?`) | `[ ]` | Ersetzbar durch Summentyp + `match`, sobald 6 steht |
-| 11 | **Prozessstart** (`fork`/`execve`-Hülle) | `[~]` Aufrufargumente seit Runde 21 (`fn main(start: u64)`), `fork`/`execve` fehlen | `firnc` ruft `as` und `ld` auf |
+| 11 | **Prozessstart** (`fork`/`execve`-Hülle) | **`[x]`** seit Runde 28 (`rt.lauf`, `tests/700_prozessstart.fi`) | `firnc` ruft `as` und `ld` auf |
 | 12 | **Dateizugriff** (`open`/`read`/`write`) | **`[x]`** `lies_datei`, `lies_stdin`, `schreib_alles` in `lib/rt/` | Quelle lesen, `.s` schreiben |
 | 13 | **Veränderliche globale Zustände** | `[ ]` (nur `const`) | Umgehbar: Kontext-Struct durchreichen — der Rust-Code tut das schon fast überall |
 | 14 | **Aggregate an Funktionsgrenzen** | `[x]` seit Runde 2 | Strukturen als Parameter/Rückgabe |
@@ -1112,3 +1112,59 @@ wird zu `rep movsb`.
 **Der Weg zum Fixpunkt (SPEC §11, Stufe 2/3) ist damit erstmals sichtbar:**
 Modulsystem, Prozessstart, dann `firnc1` auf sich selbst. Was heute schon gilt:
 **109 Programme, die kein Rust angefasst hat.**
+
+
+---
+
+## 18. Runde 28: Prozessstart — Punkt 11 ist zu
+
+`firnc1` ruft `as` und `ld` jetzt **selbst** auf. Damit ist der letzte Punkt
+der Liste in §4 erledigt, für den es keinen Umweg gab.
+
+```console
+$ ./.firnc1 quelle.fi -o programm
+$ ./programm
+```
+
+Dazwischen liegt kein Skript mehr: `bin/firnc1.fi` schreibt `programm.s`,
+startet `/usr/bin/as` und `/usr/bin/ld` über `fork`/`execve` und wartet mit
+`wait4` auf den Endestatus.
+
+### Die eine Zeile, die man nicht vergessen darf
+
+```firn
+if kind == 0 {
+    syscall(SYS_EXECVE, pfad as i64, argv as i64, 0, 0, 0, 0)
+    beende(127)          // <- ohne das laeuft der Compiler zweimal
+}
+```
+
+Kommt `execve` zurück, ist es **fehlgeschlagen** — und dann läuft das Kind im
+Programm des Elternteils weiter. Ohne das `beende` würde bei einem fehlenden
+`as` der ganze Compiler ein zweites Mal ablaufen. `tests/700_prozessstart.fi`
+prüft genau diesen Fall mit einem Pfad, den es nicht gibt.
+
+Dazu kam `rt.schreib_datei` (`open` mit `O_WRONLY|O_CREAT|O_TRUNC`, Rechte
+0755) — der Compiler muss seine Ausgabe ja irgendwo hinlegen.
+
+### Was der Nachweis jetzt wirklich zeigt
+
+`tools/selbst_vergleich.sh` ruft **kein Werkzeug mehr selbst auf**. Es startet
+`firnc1`, und alles Weitere passiert in Firn:
+
+| | |
+|---|---:|
+| **gleiches Verhalten wie `firnc0`** | **109** |
+| abweichend · fehlerhaft | **0** · **0** |
+
+### Stand der Liste in §4
+
+Von den achtzehn Punkten sind offen: **4** (`Str` mit Verkettung), **5**
+(Textformatierung, teilweise), **8** (Methoden), **9** (Schnittstellen),
+**10** (`Result`/`?`), **13** (veränderliche globale Zustände) und **18**
+(`comptime`-Codeerzeugung). Keiner davon steht dem Fixpunkt im Weg — sie sind
+Bequemlichkeit oder gehören zu Erweiterungen, die `firnc1` nicht liest.
+
+**Was dem Fixpunkt im Weg steht, ist etwas anderes:** `firnc1` liest genau
+**eine** Datei. Der Compiler selbst besteht aus vierzehn. Das Modulsystem ist
+der nächste und vorletzte Schritt.
