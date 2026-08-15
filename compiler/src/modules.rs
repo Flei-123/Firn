@@ -2,7 +2,8 @@
 //! zusammengefuehrt und zu EINEM Binary uebersetzt.
 //!
 //! Syntax (SPEC §12):
-//!   * `import pfad.modul` — bindet `pfad/modul.<endung>` relativ zum
+//!   * `import pfad.modul` — bindet `pfad/modul.<endung>` relativ zur
+//!     IMPORTIERENDEN Datei ein, ersatzweise relativ zum
 //!     Verzeichnis der Wurzeldatei ein. Angesprochen wird das Modul unter dem
 //!     letzten Pfadteil.
 //!   * `export { a, b }` — Sichtbarkeitsliste je Modul. Fehlt sie, ist alles
@@ -55,7 +56,7 @@ pub fn resolve(root: &Path) -> Result<Vec<SourceFile>, Diag> {
                     span,
                     label: "hier".to_string(),
                     note: Some(format!(
-                        "der modulpfad wird relativ zu '{}' aufgeloest",
+                        "der modulpfad wird zuerst relativ zur importierenden datei gesucht, dann relativ zu '{}'",
                         if base.as_os_str().is_empty() {
                             ".".to_string()
                         } else {
@@ -66,12 +67,34 @@ pub fn resolve(root: &Path) -> Result<Vec<SourceFile>, Diag> {
             }
         };
         let id = out.len() as u32;
+        // IMPORTPFAD: zuerst relativ zur DATEI, die den Import schreibt —
+        // erst danach relativ zur Wurzeldatei.
+        //
+        // Vorher galt nur die zweite Regel. Damit konnte eine Bibliothek keine
+        // andere einbinden: `lib/rt/vec.fi` mit `import rt` suchte `rt.fi`
+        // neben dem HAUPTPROGRAMM statt neben sich selbst
+        // (docs/SELBSTHOSTING.md §7, Blocker B3).
+        //
+        // Der Rueckfall auf die Wurzel bleibt, damit bestehende Programme
+        // unveraendert weiterlaufen: `tests/*.fi` binden `modules.mathe` ein,
+        // und dort sind beide Wege derselbe.
+        let eigenes = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
         for (parts, ispan) in scan_imports(&src, id) {
-            let mut p = base.clone();
+            let mut p = eigenes.clone();
             for part in &parts {
                 p.push(part);
             }
             p.set_extension(config::FILE_EXT);
+            if !p.exists() {
+                let mut q = base.clone();
+                for part in &parts {
+                    q.push(part);
+                }
+                q.set_extension(config::FILE_EXT);
+                if q.exists() {
+                    p = q;
+                }
+            }
             queue.push((p, ispan));
         }
         out.push(SourceFile { id, path, src });
@@ -226,14 +249,27 @@ struct ModuleInfo {
 pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
     let mut progs: Vec<Program> = Vec::new();
     let mut base_id = 0u32;
+
+    // ZUERST ALLE DATEIEN LEXEN, DANN PARSEN.
+    //
+    // Grund: die Vorabsuche nach generischen Vorlagen
+    // (`sema_generic::hook_prescan`) lief bisher je Datei UNMITTELBAR vor
+    // deren Parsen. Die Wurzeldatei wird zuerst geparst — sie kannte die
+    // Vorlagen der Module also noch nicht, und `var v: Vec[i32]` mit `Vec`
+    // aus einem Modul scheiterte am Parser
+    // (docs/SELBSTHOSTING.md §7, Blocker B1).
+    //
+    // Der Reset der Hooks gehoert deshalb hierher, EINMAL fuer die ganze
+    // Uebersetzung, und danach werden alle Dateien vorab gescannt.
+    parser::reset_hooks();
+    let mut alle: Vec<Vec<lexer::Token>> = Vec::new();
     for f in files {
         let toks = lexer::lex_file(&f.src, f.id, dg);
-        let p = if f.id == 0 {
-            // Einzeldateifall und Wurzeldatei: die feste Schnittstelle
-            parser::parse(&toks, dg)
-        } else {
-            parser::parse_module(&toks, dg, f.id, base_id)
-        };
+        crate::sema_generic::hook_prescan(&toks);
+        alle.push(toks);
+    }
+    for (i, f) in files.iter().enumerate() {
+        let p = parser::parse_module(&alle[i], dg, f.id, base_id);
         base_id = p.expr_count;
         progs.push(p);
     }
