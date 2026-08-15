@@ -69,9 +69,10 @@ pub(crate) struct Lower<'a> {
     /// fuehrt genau die aufgeschobenen Anweisungen aus, die INNERHALB der
     /// Schleife vereinbart wurden.
     pub(crate) loops: Vec<(BlockId, BlockId, usize)>,
-    /// Aufgeschobene Anweisungen (`defer`) je Blockebene, in der Reihenfolge
-    /// ihrer Vereinbarung. Ausgefuehrt wird rueckwaerts (SPEC §5.1).
-    pub(crate) defers: Vec<Vec<Stmt>>,
+    /// Aufgeschobene Anweisungen je Blockebene, in der Reihenfolge ihrer
+    /// Vereinbarung; ausgefuehrt wird rueckwaerts (SPEC §5.1). Das `bool` ist
+    /// `true` bei `errdefer`: dann laeuft die Anweisung NUR auf dem Fehlerpfad.
+    pub(crate) defers: Vec<Vec<(Stmt, bool)>>,
     /// Versteckter Rueckgabezeiger (`sret`), falls die Funktion ein Aggregat
     /// ueber 8 Byte liefert (siehe `abi.rs`).
     pub(crate) sret: Option<Val>,
@@ -801,7 +802,11 @@ impl<'a> Lower<'a> {
         // im unerreichbaren Block hinter dem Sprung und faellt der
         // Codebereinigung zum Opfer. Doppelt ausgefuehrt wird also nichts.
         let liste = self.defers.pop().unwrap_or_default();
-        for d in liste.iter().rev() {
+        for (d, nur_fehler) in liste.iter().rev() {
+            // `errdefer` laeuft NICHT beim gewoehnlichen Verlassen.
+            if *nur_fehler {
+                continue;
+            }
             if self.lower_stmt(d).is_none() {
                 r = None;
             }
@@ -818,7 +823,14 @@ impl<'a> Lower<'a> {
     /// Absicht und entspricht Zig und C++: ein `defer` sieht den fertigen Wert
     /// und kann ihn nicht mehr ersetzen.
     pub(crate) fn ret_term(&mut self, v: Option<Val>) {
-        self.lower_defers_bis(0);
+        self.lower_defers_bis(0, false);
+        self.set_term(Term::Ret(v));
+    }
+
+    /// Ruecksprung auf dem FEHLERPFAD: hier laufen zusaetzlich die
+    /// `errdefer`-Anweisungen (SPEC §5.1).
+    pub(crate) fn ret_term_fehler(&mut self, v: Option<Val>) {
+        self.lower_defers_bis(0, true);
         self.set_term(Term::Ret(v));
     }
 
@@ -828,19 +840,27 @@ impl<'a> Lower<'a> {
     /// Der Stapel bleibt dabei UNVERAENDERT: `lower_block` raeumt seine eigene
     /// Ebene ab. Wird nach einem `return` weiter unten noch einmal aufgeraeumt,
     /// geschieht das in einem unerreichbaren Block.
-    pub(crate) fn lower_defers_bis(&mut self, tiefe: usize) -> Option<()> {
+    pub(crate) fn lower_defers_bis(&mut self, tiefe: usize, mit_fehler: bool) -> Option<()> {
         let mut r = Some(());
         let mut i = self.defers.len();
         while i > tiefe {
             i -= 1;
             let liste = self.defers[i].clone();
-            for d in liste.iter().rev() {
+            for (d, nur_fehler) in liste.iter().rev() {
+                if *nur_fehler && !mit_fehler {
+                    continue;
+                }
                 if self.lower_stmt(d).is_none() {
                     r = None;
                 }
             }
         }
         r
+    }
+
+    /// Gibt es in dieser Funktion ueberhaupt ein aktives `errdefer`?
+    pub(crate) fn hat_errdefer(&self) -> bool {
+        self.defers.iter().any(|l| l.iter().any(|(_, nur_fehler)| *nur_fehler))
     }
 
     fn lower_stmt(&mut self, s: &Stmt) -> Option<()> {
@@ -878,6 +898,20 @@ impl<'a> Lower<'a> {
                 match value {
                     Some(v) => {
                         let t = self.ty_of(v);
+                        // EHRLICHE GRENZE (SPEC §14.1 F5): wird eine FERTIGE
+                        // Fehlerunion zurueckgegeben — also weder
+                        // `return E::Variante` noch ein Erfolgswert, der erst
+                        // umgewandelt wird —, dann steht erst zur Laufzeit fest,
+                        // ob das der Fehlerpfad ist. Stufe 0 entscheidet das
+                        // nicht; statt `errdefer` still zu uebergehen, wird der
+                        // Fall abgelehnt. Bei einer Umwandlung ist `t` der
+                        // QUELLtyp und diese Bedingung greift nicht.
+                        if self.hat_errdefer() && crate::errors::union_of(&t).is_some() {
+                            return self.err(
+                                *span,
+                                "'errdefer' und die weitergabe einer fertigen fehlerunion vertragen sich in stufe 0 nicht: hier steht erst zur laufzeit fest, ob der fehlerpfad genommen wird — schreibe 'return try …' oder gib den fehler mit 'return E::Variante' zurueck",
+                            );
+                        }
                         // HOOK fehlerunionen: implizite Umwandlung (lower_errors.rs)
                         if let Some(r) = crate::lower_errors::hook_return(self, v) {
                             r?;
@@ -913,10 +947,10 @@ impl<'a> Lower<'a> {
                 Some(())
             }
             // Nur vormerken — ausgefuehrt wird beim Verlassen des Blocks.
-            Stmt::Defer(inner, span) => {
+            Stmt::Defer(inner, nur_fehler, span) => {
                 match self.defers.last_mut() {
                     Some(liste) => {
-                        liste.push((**inner).clone());
+                        liste.push(((**inner).clone(), *nur_fehler));
                         Some(())
                     }
                     None => self.ice(*span, "'defer' ausserhalb eines blocks"),
@@ -933,7 +967,7 @@ impl<'a> Lower<'a> {
                     None => return self.ice(*span, "'break' ausserhalb einer schleife"),
                 };
                 // Erst aufraeumen, dann springen.
-                self.lower_defers_bis(tiefe);
+                self.lower_defers_bis(tiefe, false);
                 self.set_term(Term::Br(target));
                 let dead = self.new_block();
                 self.cur = dead;
@@ -944,7 +978,7 @@ impl<'a> Lower<'a> {
                     Some((_, cont, t)) => (*cont, *t),
                     None => return self.ice(*span, "'continue' ausserhalb einer schleife"),
                 };
-                self.lower_defers_bis(tiefe);
+                self.lower_defers_bis(tiefe, false);
                 self.set_term(Term::Br(target));
                 let dead = self.new_block();
                 self.cur = dead;

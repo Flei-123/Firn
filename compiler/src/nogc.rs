@@ -169,7 +169,7 @@ impl<'a> Pruefer<'a> {
         match s {
             // Der aufgeschobene Rumpf laeuft im selben Rahmen und unterliegt
             // denselben Regeln.
-            Stmt::Defer(inner, _) => self.pruefe_stmt(inner),
+            Stmt::Defer(inner, _, _) => self.pruefe_stmt(inner),
             Stmt::Let { init, .. } => self.pruefe_expr(init),
             Stmt::Assign { target, value, span } => {
                 self.pruefe_schreibziel(target, *span);
