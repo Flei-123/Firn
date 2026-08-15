@@ -71,6 +71,9 @@ pub(crate) struct Checker<'a> {
     pub(crate) tcx: TypeCtx,
     pub(crate) fns: HashMap<String, FnSig>,
     pub(crate) consts: HashMap<String, (Type, i128)>,
+    /// Das Programm des laufenden Durchgangs — gebraucht von `comptime`, das
+    /// zur Uebersetzungszeit ganze Funktionen ausfuehrt (`comptime.rs`).
+    pub(crate) prog: Option<*const Program>,
     pub(crate) expr_types: Vec<Type>,
     pub(crate) scopes: Vec<HashMap<String, VarInfo>>,
     pub(crate) ret: Type,
@@ -86,6 +89,7 @@ pub fn check(prog: &Program, dg: &mut Diags) -> Option<TypeInfo> {
         tcx: TypeCtx::new(),
         fns: HashMap::new(),
         consts: HashMap::new(),
+        prog: None,
         expr_types: vec![Type::Error; prog.expr_count as usize],
         scopes: Vec::new(),
         ret: Type::Void,
@@ -115,6 +119,12 @@ pub fn check(prog: &Program, dg: &mut Diags) -> Option<TypeInfo> {
 
 impl<'a> Checker<'a> {
     fn run(&mut self, prog: &Program) {
+        // SICHERHEIT: der Zeiger zeigt auf das Programm, das `check` als
+        // Referenz uebergeben bekommen hat; der Checker lebt ausschliesslich
+        // innerhalb dieses Aufrufs. Ein Feld mit Lebensdauer waere sauberer,
+        // haette aber `check` und jeden Aufrufer mit einer weiteren Lifetime
+        // belastet.
+        self.prog = Some(prog as *const Program);
         self.check_profile(prog);
         // HOOK types: Aufzaehlungsnamen anmelden (sema_match.rs)
         crate::sema_match::declare_enums(self);
@@ -157,6 +167,7 @@ impl<'a> Checker<'a> {
     }
 
     fn add_items_inner(&mut self, prog: &Program, layout_enums: bool) {
+        self.prog = Some(prog as *const Program);
         // Nachtraege bringen eigene Ausdrucks-Ids mit; die Tabelle waechst mit.
         if prog.expr_count as usize > self.expr_types.len() {
             self.expr_types.resize(prog.expr_count as usize, Type::Error);
@@ -1823,7 +1834,26 @@ impl<'a> Checker<'a> {
                 }
                 Ok(wrap(v, &dst))
             }
-            _ => nope("konstanter ausdruck muss zur uebersetzungszeit auswertbar sein (nur literale, konstanten und operatoren)"),
+            // COMPTIME: ein Aufruf wird zur Uebersetzungszeit AUSGEFUEHRT —
+            // mit Schleifen, Verzweigungen und Rekursion (comptime.rs).
+            // Damit sind Tabellengroessen und Kennzahlen berechenbar, statt sie
+            // von Hand auszurechnen und als Literal hinzuschreiben.
+            ExprKind::Call(name, args, _) => {
+                let mut werte = Vec::with_capacity(args.len());
+                for a in args {
+                    werte.push(self.eval_const_d(a, d + 1)?);
+                }
+                let prog = match self.prog {
+                    // SICHER: gesetzt in `run`/`add_items_inner`, gilt fuer die
+                    // Dauer dieses Durchgangs.
+                    Some(p) => unsafe { &*p },
+                    None => return nope("comptime: das programm steht hier nicht zur verfuegung"),
+                };
+                let mut lauf =
+                    crate::comptime::Ausfuehrung::neu(prog, &self.consts, &self.expr_types);
+                lauf.ruf_auf(name, &werte, e.span, 0)
+            }
+            _ => nope("konstanter ausdruck muss zur uebersetzungszeit auswertbar sein (nur literale, konstanten, operatoren und aufrufe)"),
         }
     }
 }
@@ -1852,6 +1882,12 @@ fn prim_type(name: &str) -> Option<Type> {
         "f64" => Type::F64,
         _ => return None,
     })
+}
+
+/// Wert auf die Breite/Signiertheit des Zieltyps zurechtschneiden — auch fuer
+/// den `comptime`-Interpreter (`comptime.rs`).
+pub(crate) fn comptime_wrap(v: i128, t: &Type) -> i128 {
+    wrap(v, t)
 }
 
 /// Wert auf die Breite/Signiertheit des Zieltyps zurechtschneiden.
@@ -2054,6 +2090,7 @@ mod tests {
             ret: Type::Void,
             depth: 0,
             must_consume_fns: HashSet::new(),
+            prog: None,
         };
         ck.run(erstes);
         ck
