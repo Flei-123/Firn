@@ -859,9 +859,46 @@ error: comptime: mehr als 2000000 schritte — endlosschleife?
 davon braucht einen Speicher zur Übersetzungszeit. Der Versuch wird gemeldet,
 nicht still falsch übersetzt.
 
-**Was zu Abnahmepunkt 6 fehlt:** `emit` — erzeugter *Quelltext*, den derselbe
-Lauf weiterverarbeitet. Die Vorbedingung steht seit der Fundamentarbeit
-(wiedereintrittsfähige Prüfphasen); es fehlt die Verbindung dazwischen.
+### `emit` — erzeugter Quelltext (Runde 13)
+
+```firn
+comptime {
+    emit_roh("fn tab_gross(c: i64) -> i64 {\n")
+    for c in 97..123 {
+        emit_roh("    if c == ")
+        emit_zahl(c)
+        emit_roh(" { return ")
+        emit_zahl(gross(c))
+        emit_roh(" }\n")
+    }
+    emit_roh("    return c\n}\n")
+}
+
+fn main() -> i32 {
+    return tab_gross(97) as i32   // 65 — die Funktion gab es im Quelltext nie
+}
+```
+
+Der Text wird im **selben Lauf** gelext, geparst und ans Programm angehängt.
+`firnc --emit=comptime` zeigt, was der Compiler dabei vor sich hat:
+
+```
+fn tab_gross(c: i64) -> i64 {
+    if c == 97 { return 65 }
+    …
+```
+
+Genau so entstehen in einem Browser die Unicode-Tabellen, die CSS-Eigenschaften
+und die Web-IDL-Bindungen.
+
+**Ein Kniff:** `emit_roh` braucht keine Zeichenketten im Interpreter — der
+Parser hat `"abc"` schon in ein Array aus Oktetten verwandelt, der Interpreter
+liest es zurück.
+
+**Was zu Abnahmepunkt 6 noch fehlt:** ein **Datenzugriff zur Übersetzungszeit**.
+Die Abnahme verlangt die Tabelle *aus der UCD*; `comptime` kann heute nur aus
+Regeln erzeugen, die im Quelltext stehen. Das ist die letzte Lücke — und sie
+wird nicht überstrichen.
 
 ## Gleitkomma `f64` (Runde 11)
 

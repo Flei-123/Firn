@@ -324,6 +324,9 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
         merged.funcs.append(&mut p.funcs);
         merged.structs.append(&mut p.structs);
         merged.consts.append(&mut p.consts);
+        // `comptime { … }`-Bloecke gehoeren zum zusammengefuehrten Programm —
+        // sonst laufen sie nie (SPEC §6.4).
+        merged.comptime_bloecke.append(&mut p.comptime_bloecke);
     }
     if dg.has_errors() {
         return None;

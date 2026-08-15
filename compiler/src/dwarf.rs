@@ -56,6 +56,18 @@ pub fn reset(files: Vec<String>, statements: bool) {
     });
 }
 
+/// Haengt eine weitere Quelldatei an — gebraucht fuer den von `comptime`
+/// erzeugten Quelltext, der erst nach `reset` entsteht. Die Reihenfolge muss
+/// mit `Diags::add_file` uebereinstimmen, sonst zeigen die `.loc`-Direktiven
+/// auf eine Nummer, die `as` nicht kennt.
+pub fn add_file(name: &str) {
+    with(|t| {
+        if !t.files.is_empty() {
+            t.files.push(name.to_string());
+        }
+    });
+}
+
 /// Quelldateien in der Reihenfolge ihrer Nummern; leer = keine Debuginfo.
 pub fn files() -> Vec<String> {
     with(|t| t.files.clone())
