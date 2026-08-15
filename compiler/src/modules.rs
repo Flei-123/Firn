@@ -483,7 +483,7 @@ impl<'a, 'b> Renamer<'a, 'b> {
     fn expr(&mut self, e: &mut Expr) {
         let span = e.span;
         match &mut e.kind {
-            ExprKind::Int(_) | ExprKind::Bool(_) => {}
+            ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) => {}
             ExprKind::Ident(name) => {
                 if let Some(n) = self.resolve(name, span, true) {
                     *name = n;

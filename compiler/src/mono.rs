@@ -314,7 +314,7 @@ fn subst_stmt(s: &mut Stmt, map: &HashMap<String, TypeExpr>, queue: &mut Vec<(St
 fn subst_expr(e: &mut Expr, map: &HashMap<String, TypeExpr>, queue: &mut Vec<(String, Instantiation)>) {
     let sp = e.span;
     match &mut e.kind {
-        ExprKind::Int(_) | ExprKind::Bool(_) => {}
+        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) => {}
         ExprKind::Ident(_) => {}
         ExprKind::Unary(_, i) => subst_expr(i, map, queue),
         ExprKind::Binary(_, a, b) => {
@@ -406,7 +406,7 @@ fn renumber_expr(e: &mut Expr, next: &mut u32) {
     e.id = *next;
     *next += 1;
     match &mut e.kind {
-        ExprKind::Int(_) | ExprKind::Bool(_) | ExprKind::Ident(_) => {}
+        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Ident(_) => {}
         ExprKind::Unary(_, i) => renumber_expr(i, next),
         ExprKind::Binary(_, a, b) => {
             renumber_expr(a, next);
@@ -526,7 +526,7 @@ fn check_bare_stmt(s: &Stmt, out: &mut Vec<(Span, String)>) {
 
 fn check_bare_expr(e: &Expr, out: &mut Vec<(Span, String)>) {
     match &e.kind {
-        ExprKind::Int(_) | ExprKind::Bool(_) | ExprKind::Ident(_) => {}
+        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Ident(_) => {}
         ExprKind::Unary(_, i) => check_bare_expr(i, out),
         ExprKind::Binary(_, a, b) => {
             check_bare_expr(a, out);

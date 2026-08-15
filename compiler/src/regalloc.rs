@@ -857,6 +857,14 @@ fn supported(f: &Func) -> bool {
     if debug_lines_active(f) {
         return false;
     }
+    // GLEITKOMMA: dieser Zuteiler kennt nur die Ganzzahlregister. `f64` lebt
+    // in den SSE-Registern und braucht eine zweite Registerklasse mit eigenen
+    // Intervallen. Solange die fehlt, geht eine Funktion mit `f64` ueber den
+    // Grundpfad in `codegen_x86.rs` — korrekt, aber ohne Registerzuteilung.
+    // Ehrlich benannt in SPEC §14.1.f64.
+    if f.val_types.iter().any(|t| *t == FTy::F64) {
+        return false;
+    }
     if f.params.len() > ARG_REGS.len() {
         return false;
     }

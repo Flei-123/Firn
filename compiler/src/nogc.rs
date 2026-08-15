@@ -270,7 +270,7 @@ impl<'a> Pruefer<'a> {
                 self.pruefe_expr(v);
                 self.pruefe_expr(n);
             }
-            ExprKind::Int(_) | ExprKind::Bool(_) | ExprKind::Ident(_) => {}
+            ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Ident(_) => {}
         }
     }
 

@@ -327,6 +327,48 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
         }
         Op::Cmp { op, ty: oty, a, b } => {
             let d = i.dst.ok_or("interner Fehler: Vergleich ohne Ziel")?;
+            // GLEITKOMMA: `ucomisd` setzt die Flags wie ein VORZEICHENLOSER
+            // Vergleich (CF/ZF), deshalb `setb`/`seta` statt `setl`/`setg`.
+            // Bei NaN wird PF gesetzt und ZF/CF ebenfalls — dadurch ist jeder
+            // Vergleich ausser `!=` falsch, genau wie IEEE-754 es verlangt.
+            if *oty == FTy::F64 {
+                // `ucomisd` setzt bei NaN ZF=PF=CF=1 — der ungeordnete Fall
+                // sieht also aus wie „kleiner oder gleich". IEEE-754 verlangt
+                // aber, dass JEDER Ordnungsvergleich mit NaN falsch ist.
+                //
+                // `seta`/`setae` pruefen `CF=0 [und ZF=0]` und sind damit von
+                // sich aus richtig. Fuer `<` und `<=` werden deshalb die
+                // OPERANDEN VERTAUSCHT (`a < b` wird zu `b > a`), statt
+                // hinterher am Paritaetsflag herumzurechnen.
+                let tausch = matches!(op, CmpOp::Lt | CmpOp::Le);
+                let (erst, zweit) = if tausch { (*b, *a) } else { (*a, *b) };
+                load_full(e, fr, "rax", erst);
+                e.line("movq xmm0, rax");
+                load_full(e, fr, "rax", zweit);
+                e.line("movq xmm1, rax");
+                e.line("ucomisd xmm0, xmm1");
+                let cc = match op {
+                    CmpOp::Eq => "sete",
+                    CmpOp::Ne => "setne",
+                    CmpOp::Lt | CmpOp::Gt => "seta",
+                    CmpOp::Le | CmpOp::Ge => "setae",
+                };
+                e.line(&format!("{} al", cc));
+                if matches!(op, CmpOp::Eq) {
+                    // NaN == NaN: ZF ist gesetzt, PF aber auch. `setnp`
+                    // blendet den ungeordneten Fall aus.
+                    e.line("setnp cl");
+                    e.line("and al, cl");
+                }
+                if matches!(op, CmpOp::Ne) {
+                    // Spiegelbildlich: bei NaN ist `!=` wahr.
+                    e.line("setp cl");
+                    e.line("or al, cl");
+                }
+                e.line("movzx eax, al");
+                store_dst(e, fr, d, "rax");
+                return Ok(());
+            }
             let bits = oty.bits().max(8);
             load_full(e, fr, "rax", *a);
             load_full(e, fr, "rcx", *b);
@@ -350,6 +392,19 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
         }
         Op::Un(op, a) => {
             let d = i.dst.ok_or("interner Fehler: Unaeroperation ohne Ziel")?;
+            // GLEITKOMMA: das Vorzeichen ist EIN Bit. `neg` wuerde das ganze
+            // Bitmuster als Zweierkomplement behandeln — falsch. Gekippt wird
+            // deshalb nur Bit 63.
+            if ty == FTy::F64 {
+                if !matches!(op, UnOp::Neg) {
+                    return Err("interner Fehler: '!' ist fuer f64 nicht definiert".to_string());
+                }
+                load_full(e, fr, "rax", *a);
+                e.line("mov rcx, -9223372036854775808");
+                e.line("xor rax, rcx");
+                store_dst(e, fr, d, "rax");
+                return Ok(());
+            }
             let bits = if ty.bits() > 32 { 64 } else { 32 };
             load_full(e, fr, "rax", *a);
             match op {
@@ -366,6 +421,26 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
         }
         Op::Cast { src, from } => {
             let d = i.dst.ok_or("interner Fehler: Umwandlung ohne Ziel")?;
+            // GLEITKOMMA-UMWANDLUNGEN
+            if ty == FTy::F64 && *from != FTy::F64 {
+                // Ganzzahl -> f64. Vorzeichenbehaftet mit `cvtsi2sd`;
+                // vorzeichenlose 64-Bit-Werte ueber 2^63 kann diese Instruktion
+                // nicht, deshalb wird der Wert vorher auf 64 Bit gebracht und
+                // der Sonderfall ehrlich benannt (SPEC §14.1.f64).
+                load_ext(e, fr, "rax", *src, *from, 64);
+                e.line("cvtsi2sd xmm0, rax");
+                e.line("movq rax, xmm0");
+                store_dst(e, fr, d, "rax");
+                return Ok(());
+            }
+            if *from == FTy::F64 && ty != FTy::F64 {
+                // f64 -> Ganzzahl, abschneidend (Richtung null), wie in C.
+                load_full(e, fr, "rax", *src);
+                e.line("movq xmm0, rax");
+                e.line("cvttsd2si rax, xmm0");
+                store_dst(e, fr, d, "rax");
+                return Ok(());
+            }
             if ty == FTy::Bool {
                 // Sicherheitsnetz: bool enthaelt nur 0/1.
                 let bits = from.bits().max(8);
@@ -505,6 +580,32 @@ fn emit_bin(
 ) -> Result<(), String> {
     let wide = ty.bits() > 32;
     let bits = if wide { 64 } else { 32 };
+    // GLEITKOMMA laeuft ueber die SSE-Einheit. Gerechnet wird in xmm0/xmm1,
+    // gelesen und geschrieben wird ueber rax — ein `f64` liegt im Rahmen als
+    // gewoehnliches 64-Bit-Wort (sein Bitmuster), deshalb braucht es hier
+    // keinen eigenen Speicherpfad.
+    if ty == FTy::F64 {
+        let m = match op {
+            BinOp::Add => "addsd",
+            BinOp::Sub => "subsd",
+            BinOp::Mul => "mulsd",
+            BinOp::Div => "divsd",
+            _ => {
+                return Err(format!(
+                    "interner Fehler: operator '{:?}' ist fuer f64 nicht definiert",
+                    op
+                ))
+            }
+        };
+        load_full(e, fr, "rax", a);
+        e.line("movq xmm0, rax");
+        load_full(e, fr, "rax", b);
+        e.line("movq xmm1, rax");
+        e.line(&format!("{} xmm0, xmm1", m));
+        e.line("movq rax, xmm0");
+        store_dst(e, fr, d, "rax");
+        return Ok(());
+    }
     match op {
         BinOp::Add | BinOp::Sub | BinOp::And | BinOp::Or | BinOp::Xor | BinOp::Mul => {
             // Die niederwertigen Bits sind bei diesen Operationen unabhaengig

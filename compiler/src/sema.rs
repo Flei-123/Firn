@@ -967,6 +967,10 @@ impl<'a> Checker<'a> {
 
     fn expr_inner(&mut self, e: &Expr, hint: Option<&Type>) -> Type {
         match &e.kind {
+            // Anders als Ganzzahlliterale sind Gleitkommaliterale NICHT typlos:
+            // es gibt in Stufe 0 nur `f64`. Sobald `f32` dazukommt, wird das
+            // hier zur Ableitung aus dem Zusammenhang (SPEC §8.6).
+            ExprKind::Float(_) => Type::F64,
             ExprKind::Int(v) => match hint {
                 Some(t) if t.is_concrete_int() => {
                     if !lit_fits(*v, t) {
@@ -1302,7 +1306,11 @@ impl<'a> Checker<'a> {
                 return Type::Bool;
             }
             let eq_only = matches!(op, BinOp::Eq | BinOp::Ne);
-            let ok = lt.is_concrete_int() || (eq_only && (lt == Type::Bool || lt.is_ptr()));
+            // `f64` vergleicht sich mit allen sechs Operatoren. NaN verhaelt
+            // sich dabei nach IEEE-754: jeder Vergleich ausser `!=` ist falsch.
+            let ok = lt.is_concrete_int()
+                || lt == Type::F64
+                || (eq_only && (lt == Type::Bool || lt.is_ptr()));
             if !ok {
                 self.dg.error(
                     e.span,
@@ -1357,6 +1365,35 @@ impl<'a> Checker<'a> {
         let rt = self.expr(r, want.as_ref());
         if lt.is_error() || rt.is_error() {
             return Type::Error;
+        }
+        // GLEITKOMMA: `+ - * /` sind erlaubt, `%` und die Bitoperationen nicht.
+        // `%` waere `fmod` und braucht eine Bibliotheksfunktion; die
+        // Bitoperationen haetten auf einem Bitmuster keine sinnvolle Bedeutung
+        // (wer sie braucht, wandelt ausdruecklich in `u64` um).
+        if lt == Type::F64 || rt == Type::F64 {
+            let erlaubt = matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div);
+            if !erlaubt {
+                self.dg.error_note(
+                    e.span,
+                    format!("operator '{}' ist fuer f64 nicht definiert", op.text()),
+                    "erlaubt sind '+', '-', '*', '/' und die vergleiche; fuer den rest wandle ausdruecklich um",
+                );
+                return Type::Error;
+            }
+            if lt != rt {
+                self.dg.error_note(
+                    e.span,
+                    format!(
+                        "operator '{}' erwartet zwei operanden desselben typs, gefunden {} und {}",
+                        op.text(),
+                        self.tcx.name_of(&lt),
+                        self.tcx.name_of(&rt)
+                    ),
+                    "es gibt keine implizite umwandlung, benutze 'as f64'",
+                );
+                return Type::Error;
+            }
+            return Type::F64;
         }
         if !lt.is_concrete_int() || !rt.is_concrete_int() || lt != rt {
             self.dg.error_note(
@@ -1531,6 +1568,7 @@ impl<'a> Checker<'a> {
         }
         match &e.kind {
             ExprKind::Int(_) => None,
+            ExprKind::Float(_) => Some(Type::F64),
             ExprKind::Bool(_) => Some(Type::Bool),
             ExprKind::Ident(n) => {
                 if let Some(v) = self.lookup_var(n) {
@@ -1811,6 +1849,7 @@ fn prim_type(name: &str) -> Option<Type> {
         "usize" => Type::Usize,
         "isize" => Type::Isize,
         "bool" => Type::Bool,
+        "f64" => Type::F64,
         _ => return None,
     })
 }
@@ -1849,7 +1888,7 @@ fn lit_fits(v: i128, t: &Type) -> bool {
 
 /// Darf dieser Typ an einer `as`-Umwandlung teilnehmen?
 fn cast_kind(t: &Type) -> bool {
-    t.is_concrete_int() || *t == Type::Bool || t.is_ptr()
+    t.is_concrete_int() || *t == Type::Bool || t.is_ptr() || *t == Type::F64
 }
 
 /// Zuweisungsvertraeglichkeit — es gibt KEINE impliziten Umwandlungen. Einzige

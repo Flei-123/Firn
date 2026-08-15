@@ -30,6 +30,7 @@ const MAX_DEPTH: u32 = 200;
 /// (nach der Typpruefung eigentlich unmoegliche) unaufgeloeste Typen.
 fn scalar_fty(t: &Type) -> Option<FTy> {
     Some(match t {
+        Type::F64 => FTy::F64,
         Type::I8 => FTy::I8,
         Type::I16 => FTy::I16,
         Type::I32 => FTy::I32,
@@ -438,6 +439,9 @@ impl<'a> Lower<'a> {
                 let ft = self.fty_of(e)?;
                 Some(self.konst(ft, *v))
             }
+            // Das BITMUSTER wandert als Konstante ins FIR — dort gibt es keine
+            // Gleitkommaliterale, nur Bitmuster (fir::FTy::F64).
+            ExprKind::Float(bits) => Some(self.konst(FTy::F64, *bits as i128)),
             ExprKind::Bool(b) => Some(self.konst(FTy::Bool, if *b { 1 } else { 0 })),
             ExprKind::Ident(name) => {
                 if let Some(slot) = self.lookup(name) {
