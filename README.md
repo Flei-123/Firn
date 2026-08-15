@@ -627,6 +627,63 @@ absurd viel. Der Grund steht im Assembler: die eingebettete Bereichsprüfung von
 zu fünfmal je Zeichen zu. Ohne Bereichsprüfungs-Elimination über Schleifen
 hinweg (`bce` kann das noch nicht) bleibt das stehen.
 
+## Wo der Tokenizer jetzt wirklich steht (Runde 7, Messbefund)
+
+`dekodiere` war mit 28 % der größte Posten. Die naheliegende Erklärung —
+`mem.buf_at` lädt je Zugriff `(*b).ptr` und `(*b).len` neu, und der Optimierer
+darf das ohne Aliasanalyse nicht zusammenfassen — habe ich geprüft, indem beide
+Werte einmal vor die Schleife gezogen wurden (`byte_bei`, in beiden Treibern).
+
+**Ergebnis: die Erklärung stimmte nur zum kleineren Teil.** `dekodiere` selbst
+wurde von 1.110 auf 814 Mio. Instruktionen kleiner (−27 %), der Gesamtlauf aber
+nur von 2.655 auf 2.631 Mio. (−0,9 %). Die These war also richtig, aber der
+Posten war kleiner als die erste Rechnung nahelegte. Das steht hier, weil eine
+widerlegte Vermutung genauso zum Ergebnis gehört wie eine bestätigte.
+
+### Der eigentliche Grund, im Assembler nachgesehen
+
+Ein einziger Byte-Zugriff in `dekodiere`:
+
+```asm
+mov rax, qword ptr [rbp-1672]    ; basis  — liegt im Rahmen, nicht im Register
+add rax, qword ptr [rbp-216]     ; + index
+mov qword ptr [rbp-1304], rax    ; Adresse in einen Slot
+mov rcx, qword ptr [rbp-1304]    ; und sofort wieder heraus
+movzx eax, byte ptr [rcx]        ; das eigentliche Laden
+mov qword ptr [rbp-1312], rax    ; Ergebnis in einen Slot
+movzx eax, byte ptr [rbp-1312]   ; und sofort wieder heraus
+mov qword ptr [rbp-1320], rax    ; noch einmal
+mov eax, dword ptr [rbp-1320]    ; und noch einmal
+mov dword ptr [rbp-2488], eax
+```
+
+**Zehn Instruktionen für einen Byte-Load, davon acht reines Stack-Geschiebe.**
+In der ganzen Funktion sind **170 von 469 Instruktionen Stackzugriffe**.
+
+Die Ursache ist nicht Faulheit des Registerzuteilers — er ist ein echter Linear
+Scan mit Lebendigkeitsintervallen und Schleifengewichten. Sie ist schlichter:
+in `dekodiere` sind neun langlebige Werte gleichzeitig am Leben (vier Parameter,
+`basis`, `ges` und die Zellen `i`, `cp`, `breite`), und es gibt elf Register.
+Für die kurzlebigen Zwischenwerte bleibt keins übrig — also bekommt **jeder
+einen eigenen Stack-Slot**, auch wenn er nur eine Instruktion später gelesen
+wird.
+
+### Was daraus folgt
+
+Der richtige Fix ist, dass ein Wert, der im selben Block erzeugt und **genau
+einmal** gelesen wird, überhaupt keinen Ort braucht: er bleibt im
+Arbeitsregister und wird direkt weiterverwendet. Die Zählung dafür gibt es seit
+der `cmp`/`jcc`-Verschmelzung bereits (`zaehle_lesezugriffe`).
+
+Die Falle dabei ist real und der Grund, warum hier Schluss ist statt eines
+schnellen Einbaus: die nächste Instruktion darf `rax` nicht überschreiben,
+**bevor** sie den durchgereichten Wert liest. Bei `d = x + durchgereicht` mit
+`x` im Rahmen lädt der Codegenerator zuerst `x` nach `rax` — und der
+durchgereichte Wert wäre weg. Ein Durchreichen ohne diesen Nachweis erzeugt
+stillen Falschcode; genau so ist in dieser Sitzung schon einmal
+`mov r9, [rbp-8]` + `add r9, r9` entstanden. Das wird sauber gebaut oder gar
+nicht.
+
 ## Speichermodell: Opt-in-Tracing-GC und der DOM-Dauerlauf (Runde 4)
 
 Die wichtigste offene Designfrage aus `DESIGNZIELE.md` ist entschieden **und
