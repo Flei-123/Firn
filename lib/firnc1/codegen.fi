@@ -18,9 +18,17 @@
 // erweitert (vorzeichen- bzw. nullerweitert) — deshalb muss nach jeder
 // Rechnung `normalisiere` laufen.
 //
-// NICHT DABEI: Gleitkomma (braucht die SSE-Register und eine eigene
-// Klassifikation), mehr als sechs Argumente je Aufruf, und alles, was das
-// Lowering ohnehin nicht erzeugt.
+// GLEITKOMMA laeuft ueber `xmm0`/`xmm1`. Ein `f64`-Wert liegt im Rahmen wie
+// jeder andere — als acht Oktette; nur die Rechnung geht durch die
+// SSE-Befehle. Eine eigene Klassifikation an der Funktionsgrenze gibt es
+// NICHT: Stufe 0 uebergibt `f64` in Ganzzahlregistern (SPEC §14.1, bewusste
+// Abweichung von System V), und genau das tut dieser Codegenerator auch.
+//
+// MEHR ALS SECHS ARGUMENTE gehen nach System V ueber den Stapel, in
+// UMGEKEHRTER Reihenfolge. Beim Aufruf muss `rsp` 16-ausgerichtet sein — bei
+// ungerader Zahl von Stapelargumenten wird deshalb ein Fuellwort davor
+// gelegt. Die aufgerufene Funktion findet sie bei `[rbp+16]`, `[rbp+24]`, …;
+// davor liegen die gesicherte Ruecksprungadresse und das gesicherte `rbp`.
 
 import rt
 import vec
@@ -282,7 +290,88 @@ fn ist_vorz(ty: u32) -> bool {
     return ty == fir.T_I8 || ty == fir.T_I16 || ty == fir.T_I32 || ty == fir.T_I64
 }
 
+// `movsd xmm<n>, qword ptr [rbp-<off>]`
+fn lade_xmm(c: *mut Cg, n: u32, v: u32) {
+    ein(c)
+    var m: [u8; 9] = "movsd xmm"
+    w(c, (&m[0]) as u64, 9)
+    zahl(c, n as u64)
+    var s: [u8; 17] = ", qword ptr [rbp-"
+    w(c, (&s[0]) as u64, 17)
+    zahl(c, slot_von(c, v))
+    var e: [u8; 1] = "]"
+    w(c, (&e[0]) as u64, 1)
+    nl(c)
+}
+
+fn speichere_xmm(c: *mut Cg, off: u64, n: u32) {
+    ein(c)
+    var m: [u8; 21] = "movsd qword ptr [rbp-"
+    w(c, (&m[0]) as u64, 21)
+    zahl(c, off)
+    var s: [u8; 6] = "], xmm"
+    w(c, (&s[0]) as u64, 6)
+    zahl(c, n as u64)
+    nl(c)
+}
+
+fn emit_bin_f64(c: *mut Cg, op: u32, a: u32, b: u32, dst: u32) {
+    if op > 3 {
+        // `%` und die Bitoperationen sind fuer f64 nicht definiert — der
+        // Typpruefer laesst sie gar nicht durch.
+        (*c).ungeeignet = true
+        return
+    }
+    lade_xmm(c, 0, a)
+    lade_xmm(c, 1, b)
+    ein(c)
+    var tab: [u8; 23] = "addsd|subsd|mulsd|divsd"
+    stueck(c, (&tab[0]) as u64, 23, op)
+    var r: [u8; 11] = " xmm0, xmm1"
+    w(c, (&r[0]) as u64, 11)
+    nl(c)
+    speichere_xmm(c, slot_von(c, dst), 0)
+}
+
+// Vergleich zweier `f64`. `comisd` setzt die Flaggen wie ein
+// UNSIGNED-Vergleich; NaN setzt zusaetzlich PF. Nach IEEE-754 ist jeder
+// Vergleich mit NaN falsch — ausser `!=`, das wahr sein muss.
+fn emit_cmp_f64(c: *mut Cg, op: u32, a: u32, b: u32, dst: u32) {
+    lade_xmm(c, 0, a)
+    lade_xmm(c, 1, b)
+    var cm: [u8; 17] = "comisd xmm0, xmm1"
+    roh(c, (&cm[0]) as u64, 17)
+    ein(c)
+    var set: [u8; 3] = "set"
+    w(c, (&set[0]) as u64, 3)
+    var namen: [u8; 14] = "e|ne|b|be|a|ae"
+    stueck(c, (&namen[0]) as u64, 14, op)
+    var al: [u8; 3] = " al"
+    w(c, (&al[0]) as u64, 3)
+    nl(c)
+    // NaN: PF ist gesetzt. Bei `==` muss das Ergebnis dann 0 sein, bei `!=`
+    // muss es 1 sein, bei den vier Ordnungsvergleichen 0.
+    if op == 1 {
+        var sp: [u8; 7] = "setp cl"
+        roh(c, (&sp[0]) as u64, 7)
+        var o: [u8; 9] = "or al, cl"
+        roh(c, (&o[0]) as u64, 9)
+    } else {
+        var snp: [u8; 8] = "setnp cl"
+        roh(c, (&snp[0]) as u64, 8)
+        var an: [u8; 10] = "and al, cl"
+        roh(c, (&an[0]) as u64, 10)
+    }
+    var mz: [u8; 13] = "movzx rax, al"
+    roh(c, (&mz[0]) as u64, 13)
+    speichere_slot(c, slot_von(c, dst), R_AX)
+}
+
 fn emit_bin(c: *mut Cg, ty: u32, op: u32, a: u32, b: u32, dst: u32) {
+    if ty == fir.T_F64 {
+        emit_bin_f64(c, op, a, b, dst)
+        return
+    }
     lade_wert(c, R_AX, a)
     lade_wert(c, R_CX, b)
         if op == 0 {
@@ -345,6 +434,10 @@ fn emit_bin(c: *mut Cg, ty: u32, op: u32, a: u32, b: u32, dst: u32) {
 }
 
 fn emit_cmp(c: *mut Cg, ty: u32, op: u32, a: u32, b: u32, dst: u32) {
+    if ty == fir.T_F64 {
+        emit_cmp_f64(c, op, a, b, dst)
+        return
+    }
     lade_wert(c, R_AX, a)
     lade_wert(c, R_CX, b)
     var cm: [u8; 3] = "cmp"
@@ -495,12 +588,42 @@ fn emit_ptradd(c: *mut Cg, basis: u32, off: u32, dst: u32) {
 }
 
 fn emit_cast(c: *mut Cg, von: u32, nach: u32, src: u32, dst: u32) {
+    if von == fir.T_F64 && nach == fir.T_F64 {
+        lade_wert(c, R_AX, src)
+        speichere_slot(c, slot_von(c, dst), R_AX)
+        return
+    }
+    if nach == fir.T_F64 {
+        // Ganzzahl -> f64. `cvtsi2sd` rechnet VORZEICHENBEHAFTET; der Wert
+        // liegt im Rahmen bereits passend erweitert, also stimmt das auch
+        // fuer vorzeichenlose Typen bis 2^63.
+        lade_wert(c, R_AX, src)
+        var cv: [u8; 18] = "cvtsi2sd xmm0, rax"
+        roh(c, (&cv[0]) as u64, 18)
+        speichere_xmm(c, slot_von(c, dst), 0)
+        return
+    }
+    if von == fir.T_F64 {
+        // f64 -> Ganzzahl, abschneidend Richtung null (wie in C).
+        lade_xmm(c, 0, src)
+        var cv2: [u8; 19] = "cvttsd2si rax, xmm0"
+        roh(c, (&cv2[0]) as u64, 19)
+        normalisiere(c, R_AX, nach)
+        speichere_slot(c, slot_von(c, dst), R_AX)
+        return
+    }
     lade_wert(c, R_AX, src)
     normalisiere(c, R_AX, nach)
     speichere_slot(c, slot_von(c, dst), R_AX)
 }
 
 fn emit_un(c: *mut Cg, ty: u32, op: u32, a: u32, dst: u32) {
+    if ty == fir.T_F64 {
+        // Das Lowering erzeugt fuer `-x` bei f64 kein `neg` (es schreibt
+        // `0.0 - x`), aber falls doch: das Vorzeichenbit umlegen.
+        (*c).ungeeignet = true
+        return
+    }
     lade_wert(c, R_AX, a)
     if op == 0 {
         var n: [u8; 3] = "neg"
@@ -527,12 +650,32 @@ fn argreg(c: *mut Cg, k: u32) {
 fn emit_call(c: *mut Cg, f: *mut fir.Fir, i: u32, fnr: u32) {
     let aoff: u32 = fir.i_aoff_von(f, i)
     let alen: u32 = fir.i_alen_von(f, i)
+    // Stapelargumente: rueckwaerts auflegen, davor bei Bedarf ein Fuellwort.
+    var stapel: u32 = 0
     if alen > 6 {
-        (*c).ungeeignet = true
-        return
+        stapel = alen - 6
+    }
+    var fuell: u32 = 0
+    if stapel % 2 == 1 {
+        fuell = 1
+        var sp: [u8; 10] = "sub rsp, 8"
+        roh(c, (&sp[0]) as u64, 10)
+    }
+    if stapel > 0 {
+        var j: u32 = alen
+        while j > 6 {
+            j = j - 1
+            ein(c)
+            var m: [u8; 20] = "push qword ptr [rbp-"
+            w(c, (&m[0]) as u64, 20)
+            zahl(c, slot_von(c, fir.arg_bei(f, aoff + j)))
+            var e: [u8; 1] = "]"
+            w(c, (&e[0]) as u64, 1)
+            nl(c)
+        }
     }
     var k: u32 = 0
-    while k < alen {
+    while k < 6 && k < alen {
         ein(c)
         var m: [u8; 4] = "mov "
         w(c, (&m[0]) as u64, 4)
@@ -550,6 +693,13 @@ fn emit_call(c: *mut Cg, f: *mut fir.Fir, i: u32, fnr: u32) {
     w(c, (&cl[0]) as u64, 5)
     sym(c, fir.i_a_von(f, i))
     nl(c)
+    if stapel + fuell > 0 {
+        ein(c)
+        var ad: [u8; 9] = "add rsp, "
+        w(c, (&ad[0]) as u64, 9)
+        zahl(c, (stapel + fuell) as u64 * 8)
+        nl(c)
+    }
     let dst: u32 = fir.i_dst_von(f, i)
     if dst != fir.KEIN {
         normalisiere(c, R_AX, fir.i_ty_von(f, i))
@@ -607,10 +757,6 @@ fn emit_inst(c: *mut Cg, fnr: u32, i: u32) {
     let art: u32 = fir.i_art_von(f, i)
     let ty: u32 = fir.i_ty_von(f, i)
     let dst: u32 = fir.i_dst_von(f, i)
-    if ty == fir.T_F64 {
-        (*c).ungeeignet = true
-        return
-    }
         if art == fir.O_CONST {
         emit_const(c, ty, fir.i_zahl_von(f, i), dst)
         return
@@ -731,20 +877,28 @@ fn cg_lauf(c: *mut Cg) {
         }
         // Parameter aus den Argumentregistern in ihre Plaetze sichern.
         let plen: u32 = fir.f_plen_von(f, fi)
-        if plen > 6 {
-            (*c).ungeeignet = true
-            return
-        }
         var k: u32 = 0
         while k < plen {
-            ein(c)
-            var m: [u8; 19] = "mov qword ptr [rbp-"
-            w(c, (&m[0]) as u64, 19)
-            zahl(c, slot_von(c, k))
-            var s: [u8; 3] = "], "
-            w(c, (&s[0]) as u64, 3)
-            argreg(c, k)
-            nl(c)
+            if k < 6 {
+                ein(c)
+                var m: [u8; 19] = "mov qword ptr [rbp-"
+                w(c, (&m[0]) as u64, 19)
+                zahl(c, slot_von(c, k))
+                var s: [u8; 3] = "], "
+                w(c, (&s[0]) as u64, 3)
+                argreg(c, k)
+                nl(c)
+            } else {
+                // Vom Stapel des Aufrufers: [rbp+16], [rbp+24], …
+                ein(c)
+                var m2: [u8; 24] = "mov rax, qword ptr [rbp+"
+                w(c, (&m2[0]) as u64, 24)
+                zahl(c, 16 + (k - 6) as u64 * 8)
+                var e2: [u8; 1] = "]"
+                w(c, (&e2[0]) as u64, 1)
+                nl(c)
+                speichere_slot(c, slot_von(c, k), R_AX)
+            }
             k = k + 1
         }
         var bb: u32 = 0
