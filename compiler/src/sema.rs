@@ -600,11 +600,12 @@ impl<'a> Checker<'a> {
             // und `continue` wuerden die Reihenfolge der uebrigen
             // aufgeschobenen Anweisungen zerreissen und den Rueckgabewert
             // ueberschreiben. Zig verbietet es aus demselben Grund.
-            Stmt::Defer(inner, span) => {
+            Stmt::Defer(inner, nur_fehler, span) => {
+                let art = if *nur_fehler { "errdefer" } else { "defer" };
                 if let Some((bad, wort)) = crate::sema::defer_sprung(inner) {
                     self.dg.error_note(
                         bad,
-                        format!("'{}' ist in einem 'defer' nicht erlaubt", wort),
+                        format!("'{}' ist in einem '{}' nicht erlaubt", wort, art),
                         "der aufgeschobene rumpf muss normal enden; sonst waere unbestimmt, was mit den uebrigen aufgeschobenen anweisungen geschieht",
                     );
                     let _ = span;
@@ -2829,7 +2830,7 @@ pub(crate) fn defer_sprung(s: &Stmt) -> Option<(Span, &'static str)> {
         Stmt::Break(span) => Some((*span, "break")),
         Stmt::Continue(span) => Some((*span, "continue")),
         Stmt::Block(b) => b.stmts.iter().find_map(defer_sprung),
-        Stmt::Defer(inner, _) => defer_sprung(inner),
+        Stmt::Defer(inner, _, _) => defer_sprung(inner),
         Stmt::If { then, els, .. } => then
             .stmts
             .iter()
@@ -2850,7 +2851,7 @@ fn defer_return_only(s: &Stmt) -> Option<(Span, &'static str)> {
     match s {
         Stmt::Return { span, .. } => Some((*span, "return")),
         Stmt::Block(b) => b.stmts.iter().find_map(defer_return_only),
-        Stmt::Defer(inner, _) => defer_return_only(inner),
+        Stmt::Defer(inner, _, _) => defer_return_only(inner),
         Stmt::If { then, els, .. } => then
             .stmts
             .iter()

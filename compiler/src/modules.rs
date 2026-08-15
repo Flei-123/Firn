@@ -438,7 +438,7 @@ impl<'a, 'b> Renamer<'a, 'b> {
         match s {
             // `defer` ist nur eine Huelle: der Inhalt wird wie jede andere
             // Anweisung umgeschrieben.
-            Stmt::Defer(inner, _) => self.stmt(inner),
+            Stmt::Defer(inner, _, _) => self.stmt(inner),
             Stmt::Let { name, ty, init, .. } => {
                 if let Some(t) = ty.as_mut() {
                     self.ty(t);

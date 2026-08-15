@@ -797,8 +797,32 @@ fn lies(pfad: *mut u8) -> i32 {
        unbestimmt, was mit den uebrigen aufgeschobenen anweisungen geschieht
   ```
 
-**Noch nicht da: `errdefer`** — es braucht die Unterscheidung „verlassen auf dem
-Fehlerpfad" und gehört zu `try`/`catch`.
+### `errdefer` (Runde 10)
+
+```firn
+fn arbeit(x: i32) -> E!i32 {
+    defer aufraeumen()        // immer
+    errdefer zuruecknehmen()  // nur auf dem Fehlerpfad
+    let w: i32 = try kann_schiefgehen(x)
+    return w + 1
+}
+```
+
+Beide teilen sich **eine** Liste je Blockebene und laufen in gemeinsamer
+umgekehrter Reihenfolge — steht das `errdefer` hinter dem `defer`, läuft es
+zuerst. Fehlerpfad ist die Weitergabe durch `try` und ein `return E::Variante`;
+ein gewöhnlicher Rückgabewert ist es nicht, auch wenn die Funktion eine
+Fehlerunion liefert.
+
+**Ehrliche Grenze:** wird eine *fertige* Fehlerunion weitergereicht
+(`return u`), steht erst zur Laufzeit fest, ob es der Fehlerpfad ist. Stufe 0
+**lehnt das ab**, statt `errdefer` still zu übergehen:
+
+```
+error: 'errdefer' und die weitergabe einer fertigen fehlerunion vertragen sich
+       in stufe 0 nicht: … schreibe 'return try …' oder gib den fehler mit
+       'return E::Variante' zurueck
+```
 
 Nachweise: `tests/580_defer.fi` (fünf Abschnitte, alle drei Baustufen),
 `tests/neg/defer_return.fi`, `tests/neg/defer_break.fi`.

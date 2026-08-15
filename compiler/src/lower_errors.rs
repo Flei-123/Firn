@@ -301,10 +301,17 @@ fn scalar_fty(t: &Type) -> Option<FTy> {
 
 /// `return` mit impliziter Umwandlung in die Fehlerunion der Funktion.
 fn do_return(lo: &mut Lower, v: &Expr, c: &crate::errors::CoerceInfo) -> Option<()> {
+    // `return E::Variante` ist der Fehlerpfad, `return wert` der Erfolgspfad —
+    // der Typpruefer hat das bereits entschieden (`CoerceKind`).
+    let fehlerpfad = matches!(c.kind, CoerceKind::FromError);
     match lo.sret {
         Some(dst) => {
             write_union(lo, dst, v, c)?;
-            lo.ret_term(Some(dst));
+            if fehlerpfad {
+                lo.ret_term_fehler(Some(dst));
+            } else {
+                lo.ret_term(Some(dst));
+            }
         }
         None => {
             // Bis 8 Byte liegt die Fehlerunion in einem Wort in `rax`
@@ -315,7 +322,11 @@ fn do_return(lo: &mut Lower, v: &Expr, c: &crate::errors::CoerceInfo) -> Option<
             lo.store(FTy::I64, slot, zero);
             write_union(lo, slot, v, c)?;
             let w = lo.load(FTy::I64, slot);
-            lo.ret_term(Some(w));
+            if fehlerpfad {
+                lo.ret_term_fehler(Some(w));
+            } else {
+                lo.ret_term(Some(w));
+            }
         }
     }
     Some(())
@@ -323,10 +334,11 @@ fn do_return(lo: &mut Lower, v: &Expr, c: &crate::errors::CoerceInfo) -> Option<
 
 /// Verlaesst die Funktion mit dem Fehlercode `code` (`try`).
 fn return_error(lo: &mut Lower, code: Val) -> Option<()> {
+    // FEHLERPFAD: hier laufen auch die `errdefer`-Anweisungen.
     match lo.sret {
         Some(dst) => {
             lo.store(FTy::U32, dst, code);
-            lo.ret_term(Some(dst));
+            lo.ret_term_fehler(Some(dst));
         }
         None => {
             let slot = lo.alloca(8, 8);
@@ -334,7 +346,7 @@ fn return_error(lo: &mut Lower, code: Val) -> Option<()> {
             lo.store(FTy::I64, slot, zero);
             lo.store(FTy::U32, slot, code);
             let w = lo.load(FTy::I64, slot);
-            lo.ret_term(Some(w));
+            lo.ret_term_fehler(Some(w));
         }
     }
     Some(())
