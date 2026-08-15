@@ -1,0 +1,337 @@
+// lib/firnc1/typen.fi — SPEICHERLAYOUT UND AUFRUFKONVENTION, IN FIRN.
+//
+// Fuenfter Teil von Stufe 1: die Portierung von `compiler/src/types.rs` und
+// `compiler/src/abi.rs`. `docs/SELBSTHOSTING.md` §3 nennt beide als die
+// Dateien, die schon heute vollstaendig in Firn schreibbar waeren — sie
+// rechnen nur auf Typ und Groesse, ohne Heap und ohne Text.
+//
+// WARUM DAS DER RICHTIGE NAECHSTE SCHRITT IST: Layout und Aufrufkonvention
+// sind die Stellen, an denen ein Compiler STILL falsch wird. Ein Feldversatz
+// daneben, ein Aggregat in Registern statt im Speicher — das Programm laeuft,
+// nur eben falsch. Zwei unabhaengige Umsetzungen gegeneinander zu stellen ist
+// hier mehr wert als jeder ausgedachte Testfall.
+//
+// REGELN (SPEC §11, §13):
+//   * Structlayout: Deklarationsreihenfolge, natuerliche Ausrichtung, KEIN
+//     Umsortieren. Die Groesse wird auf die Ausrichtung des Structs aufgerundet.
+//   * System V AMD64: Skalare -> ein Ganzzahlwort. Aggregate bis 16 Byte ->
+//     ein oder zwei Woerter. Darueber -> Speicher.
+//   * Rueckgabe ueber den versteckten Zeiger, sobald ein Aggregat groesser als
+//     8 Byte ist (SPEC §14.1 — bewusste Abweichung von System V, das 9..16
+//     Byte in `rax:rdx` zurueckgibt).
+
+import rt
+import vec
+import intern
+import ast
+
+export { Typen, typen_neu, typen_frei, typen_aufloesen,
+         K_I8, K_I16, K_I32, K_I64, K_U8, K_U16, K_U32, K_U64,
+         K_USIZE, K_ISIZE, K_BOOL, K_F64, K_PTR, K_ARR, K_STRUCT, K_VOID, K_FEHLER,
+         ty_art, ty_a, ty_n, groesse_von, ausrichtung_von, aufrunden,
+         klasse_von, braucht_sret, ist_aggregat,
+         st_anzahl, st_name, st_groesse, st_ausrichtung, st_foff, st_flen,
+         sf_name, sf_typ, sf_versatz, typ_der_wurzel, ret_typ_der_funktion,
+         param_typ_aufgeloest, KLASSE_MEM }
+
+const K_I8: u32 = 0
+const K_I16: u32 = 1
+const K_I32: u32 = 2
+const K_I64: u32 = 3
+const K_U8: u32 = 4
+const K_U16: u32 = 5
+const K_U32: u32 = 6
+const K_U64: u32 = 7
+const K_USIZE: u32 = 8
+const K_ISIZE: u32 = 9
+const K_BOOL: u32 = 10
+const K_F64: u32 = 11
+const K_PTR: u32 = 12
+const K_ARR: u32 = 13
+const K_STRUCT: u32 = 14
+const K_VOID: u32 = 15
+const K_FEHLER: u32 = 16
+
+// Groesste Struktur, die noch in Registern uebergeben wird.
+const MAX_REGISTER_AGGREGAT: u64 = 16
+// Rueckgabe von `klasse_von` fuer die Speicherklasse.
+const KLASSE_MEM: u32 = 255
+
+struct Typen {
+    // aufgeloeste Typen
+    art: Vec[u32],
+    a: Vec[u32],      // Ptr/Array: innerer Typ · Struct: Nummer im Structfeld
+    n: Vec[u64],      // Ptr: mut(0/1) · Array: Laenge
+    // Structs
+    s_name: Vec[u32],
+    s_groesse: Vec[u64],
+    s_ausricht: Vec[u64],
+    s_foff: Vec[u32],
+    s_flen: Vec[u32],
+    // Felder aller Structs hintereinander
+    f_name: Vec[u32],
+    f_typ: Vec[u32],
+    f_versatz: Vec[u64],
+    // je Funktion: aufgeloeste Parametertypen und Rueckgabetyp
+    fn_poff: Vec[u32],
+    fn_plen: Vec[u32],
+    fn_ptyp: Vec[u32],
+    fn_ret: Vec[u32],
+}
+
+fn typen_neu() -> Typen {
+    return Typen{
+        art: vec_neu[u32](), a: vec_neu[u32](), n: vec_neu[u64](),
+        s_name: vec_neu[u32](), s_groesse: vec_neu[u64](), s_ausricht: vec_neu[u64](),
+        s_foff: vec_neu[u32](), s_flen: vec_neu[u32](),
+        f_name: vec_neu[u32](), f_typ: vec_neu[u32](), f_versatz: vec_neu[u64](),
+        fn_poff: vec_neu[u32](), fn_plen: vec_neu[u32](), fn_ptyp: vec_neu[u32](),
+        fn_ret: vec_neu[u32](),
+    }
+}
+
+fn typen_frei(t: *mut Typen) {
+    vec_frei[u32](&(*t).art)
+    vec_frei[u32](&(*t).a)
+    vec_frei[u64](&(*t).n)
+    vec_frei[u32](&(*t).s_name)
+    vec_frei[u64](&(*t).s_groesse)
+    vec_frei[u64](&(*t).s_ausricht)
+    vec_frei[u32](&(*t).s_foff)
+    vec_frei[u32](&(*t).s_flen)
+    vec_frei[u32](&(*t).f_name)
+    vec_frei[u32](&(*t).f_typ)
+    vec_frei[u64](&(*t).f_versatz)
+    vec_frei[u32](&(*t).fn_poff)
+    vec_frei[u32](&(*t).fn_plen)
+    vec_frei[u32](&(*t).fn_ptyp)
+    vec_frei[u32](&(*t).fn_ret)
+}
+
+fn ty_art(t: *mut Typen, i: u32) -> u32 { return vec_at[u32](&(*t).art, i as usize) }
+fn ty_a(t: *mut Typen, i: u32) -> u32 { return vec_at[u32](&(*t).a, i as usize) }
+fn ty_n(t: *mut Typen, i: u32) -> u64 { return vec_at[u64](&(*t).n, i as usize) }
+
+fn st_anzahl(t: *mut Typen) -> usize { return vec_len[u32](&(*t).s_name) }
+fn st_name(t: *mut Typen, i: usize) -> u32 { return vec_at[u32](&(*t).s_name, i) }
+fn st_groesse(t: *mut Typen, i: usize) -> u64 { return vec_at[u64](&(*t).s_groesse, i) }
+fn st_ausrichtung(t: *mut Typen, i: usize) -> u64 { return vec_at[u64](&(*t).s_ausricht, i) }
+fn st_foff(t: *mut Typen, i: usize) -> u32 { return vec_at[u32](&(*t).s_foff, i) }
+fn st_flen(t: *mut Typen, i: usize) -> u32 { return vec_at[u32](&(*t).s_flen, i) }
+fn sf_name(t: *mut Typen, i: u32) -> u32 { return vec_at[u32](&(*t).f_name, i as usize) }
+fn sf_typ(t: *mut Typen, i: u32) -> u32 { return vec_at[u32](&(*t).f_typ, i as usize) }
+fn sf_versatz(t: *mut Typen, i: u32) -> u64 { return vec_at[u64](&(*t).f_versatz, i as usize) }
+
+fn ret_typ_der_funktion(t: *mut Typen, i: usize) -> u32 { return vec_at[u32](&(*t).fn_ret, i) }
+fn param_typ_aufgeloest(t: *mut Typen, fi: usize, k: u32) -> u32 {
+    return vec_at[u32](&(*t).fn_ptyp, vec_at[u32](&(*t).fn_poff, fi) as usize + k as usize)
+}
+
+fn neuer_typ(t: *mut Typen, art: u32, a: u32, n: u64) -> u32 {
+    let i: u32 = vec_len[u32](&(*t).art) as u32
+    vec_push[u32](&(*t).art, art)
+    vec_push[u32](&(*t).a, a)
+    vec_push[u64](&(*t).n, n)
+    return i
+}
+
+// ------------------------------------------------------- Groesse/Ausrichtung
+
+fn aufrunden(wert: u64, auf: u64) -> u64 {
+    if auf == 0 {
+        return wert
+    }
+    let rest: u64 = wert % auf
+    if rest == 0 {
+        return wert
+    }
+    return wert + auf - rest
+}
+
+fn groesse_von(t: *mut Typen, i: u32) -> u64 {
+    let k: u32 = ty_art(t, i)
+    if k == K_I8 || k == K_U8 || k == K_BOOL { return 1 }
+    if k == K_I16 || k == K_U16 { return 2 }
+    if k == K_I32 || k == K_U32 { return 4 }
+    if k == K_I64 || k == K_U64 || k == K_USIZE || k == K_ISIZE { return 8 }
+    if k == K_F64 { return 8 }
+    if k == K_PTR { return 8 }
+    if k == K_ARR { return groesse_von(t, ty_a(t, i)) * ty_n(t, i) }
+    if k == K_STRUCT { return st_groesse(t, ty_a(t, i) as usize) }
+    return 0
+}
+
+fn ausrichtung_von(t: *mut Typen, i: u32) -> u64 {
+    let k: u32 = ty_art(t, i)
+    if k == K_ARR { return ausrichtung_von(t, ty_a(t, i)) }
+    if k == K_STRUCT { return st_ausrichtung(t, ty_a(t, i) as usize) }
+    if k == K_VOID || k == K_FEHLER { return 1 }
+    let g: u64 = groesse_von(t, i)
+    if g < 1 { return 1 }
+    return g
+}
+
+// ------------------------------------------------------- Aufrufkonvention
+
+fn ist_aggregat(t: *mut Typen, i: u32) -> bool {
+    let k: u32 = ty_art(t, i)
+    return k == K_ARR || k == K_STRUCT
+}
+
+// Anzahl der Ganzzahlwoerter, oder KLASSE_MEM fuer die Speicherklasse.
+fn klasse_von(t: *mut Typen, i: u32) -> u32 {
+    let k: u32 = ty_art(t, i)
+    if k == K_VOID || k == K_FEHLER {
+        return 0
+    }
+    if ist_aggregat(t, i) {
+        let g: u64 = groesse_von(t, i)
+        if g == 0 {
+            return 0
+        }
+        if g > MAX_REGISTER_AGGREGAT {
+            return KLASSE_MEM
+        }
+        return ((g + 7) / 8) as u32
+    }
+    return 1
+}
+
+fn braucht_sret(t: *mut Typen, i: u32) -> bool {
+    return ist_aggregat(t, i) && groesse_von(t, i) > 8
+}
+
+// ------------------------------------------------------------- Aufloesung
+
+// Nummer eines Grundtyps, oder -1.
+fn grundtyp(it: *mut intern.Interner, nr: u32) -> i32 {
+    var tab: [u8; 50] = "i8|i16|i32|i64|u8|u16|u32|u64|usize|isize|bool|f64"
+    let p: u64 = intern.intern_zeiger(it, nr)
+    let n: usize = intern.intern_laenge(it, nr)
+    var i: usize = 0
+    var k: i32 = 0
+    var start: usize = 0
+    while i <= 50 {
+        var ende: bool = i == 50
+        if !ende {
+            ende = tab[i] == 124 as u8
+        }
+        if ende {
+            if i - start == n {
+                if rt.mem_eq((&tab[start]) as u64, p, n) {
+                    return k
+                }
+            }
+            k = k + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// Findet den Structindex zu einem Namen; -1, wenn es ihn hier nicht gibt.
+fn struct_index(t: *mut Typen, name: u32) -> i32 {
+    var i: usize = 0
+    while i < st_anzahl(t) {
+        if st_name(t, i) == name {
+            return i as i32
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// Loest einen Typausdruck des Baums in einen konkreten Typ auf.
+//
+// EIN NAME, DEN ES HIER NICHT GIBT (etwa `rt.Buf` aus einem anderen Modul),
+// wird zu K_FEHLER mit Groesse 0 und Ausrichtung 1 — genau wie in
+// `compiler/src/layout_kanon.rs`. Beide Umsetzungen tun dasselbe, damit der
+// Vergleich exakt bleibt, statt an einer kuenstlichen Unsicherheit zu
+// scheitern.
+fn aufloesen(t: *mut Typen, b: *mut ast.Baum, it: *mut intern.Interner, te: u32) -> u32 {
+    if te == ast.NICHTS {
+        return neuer_typ(t, K_VOID, 0, 0)
+    }
+    let a: u32 = ast.t_art(b, te)
+    if a == ast.T_PTR {
+        let inner: u32 = aufloesen(t, b, it, ast.t_a(b, te))
+        return neuer_typ(t, K_PTR, inner, ast.t_b(b, te))
+    }
+    if a == ast.T_ARR {
+        let elem: u32 = aufloesen(t, b, it, ast.t_a(b, te))
+        return neuer_typ(t, K_ARR, elem, ast.t_b(b, te))
+    }
+    let nr: u32 = ast.t_a(b, te)
+    let g: i32 = grundtyp(it, nr)
+    if g >= 0 {
+        return neuer_typ(t, g as u32, 0, 0)
+    }
+    let si: i32 = struct_index(t, nr)
+    if si >= 0 {
+        return neuer_typ(t, K_STRUCT, si as u32, 0)
+    }
+    return neuer_typ(t, K_FEHLER, 0, 0)
+}
+
+fn typ_der_wurzel(t: *mut Typen, b: *mut ast.Baum, it: *mut intern.Interner, te: u32) -> u32 {
+    return aufloesen(t, b, it, te)
+}
+
+// Legt Layout und Aufrufkonvention fuer das ganze Programm an.
+fn typen_aufloesen(t: *mut Typen, b: *mut ast.Baum, it: *mut intern.Interner) {
+    // 1. Structs anmelden — erst danach kann ein Feld auf einen von ihnen
+    //    zeigen. Reihenfolge zaehlt: ein Struct darf einen FRUEHER
+    //    deklarierten enthalten, und dessen Layout muss dann schon stehen.
+    var i: usize = 0
+    while i < ast.struktur_anzahl(b) {
+        vec_push[u32](&(*t).s_name, ast.struktur_name(b, i))
+        vec_push[u64](&(*t).s_groesse, 0)
+        vec_push[u64](&(*t).s_ausricht, 1)
+        vec_push[u32](&(*t).s_foff, 0)
+        vec_push[u32](&(*t).s_flen, 0)
+        i = i + 1
+    }
+    // 2. Felder aufloesen und Versaetze rechnen.
+    i = 0
+    while i < ast.struktur_anzahl(b) {
+        let off: u32 = vec_len[u32](&(*t).f_name) as u32
+        var versatz: u64 = 0
+        var max_a: u64 = 1
+        var k: u32 = 0
+        while k < ast.struktur_flen(b, i) {
+            let fi: u32 = ast.struktur_foff(b, i) + k
+            let ty: u32 = aufloesen(t, b, it, ast.feld_typ(b, fi))
+            var au: u64 = ausrichtung_von(t, ty)
+            if au < 1 { au = 1 }
+            let gr: u64 = groesse_von(t, ty)
+            if au > max_a { max_a = au }
+            versatz = aufrunden(versatz, au)
+            vec_push[u32](&(*t).f_name, ast.feld_name(b, fi))
+            vec_push[u32](&(*t).f_typ, ty)
+            vec_push[u64](&(*t).f_versatz, versatz)
+            versatz = versatz + gr
+            k = k + 1
+        }
+        vec_setzen[u32](&(*t).s_foff, i, off)
+        vec_setzen[u32](&(*t).s_flen, i, ast.struktur_flen(b, i))
+        vec_setzen[u64](&(*t).s_groesse, i, aufrunden(versatz, max_a))
+        vec_setzen[u64](&(*t).s_ausricht, i, max_a)
+        i = i + 1
+    }
+    // 3. Funktionssignaturen.
+    i = 0
+    while i < ast.fn_anzahl(b) {
+        let poff: u32 = vec_len[u32](&(*t).fn_ptyp) as u32
+        var k: u32 = 0
+        while k < ast.fn_plen(b, i) {
+            let ty: u32 = aufloesen(t, b, it, ast.param_typ(b, ast.fn_poff(b, i) + k))
+            vec_push[u32](&(*t).fn_ptyp, ty)
+            k = k + 1
+        }
+        vec_push[u32](&(*t).fn_poff, poff)
+        vec_push[u32](&(*t).fn_plen, ast.fn_plen(b, i))
+        vec_push[u32](&(*t).fn_ret, aufloesen(t, b, it, ast.fn_ret(b, i)))
+        i = i + 1
+    }
+}
