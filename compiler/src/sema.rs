@@ -592,6 +592,25 @@ impl<'a> Checker<'a> {
     fn check_stmt(&mut self, s: &Stmt) {
         match s {
             Stmt::Error(_) => {}
+            // `defer <anweisung>` (SPEC §5.1). Der Rumpf wird ganz normal
+            // geprueft — er sieht dieselben Namen wie an der Stelle, an der er
+            // steht, und laeuft im selben Rahmen.
+            //
+            // VERBOTEN ist ein Sprung aus dem Rumpf heraus: `return`, `break`
+            // und `continue` wuerden die Reihenfolge der uebrigen
+            // aufgeschobenen Anweisungen zerreissen und den Rueckgabewert
+            // ueberschreiben. Zig verbietet es aus demselben Grund.
+            Stmt::Defer(inner, span) => {
+                if let Some((bad, wort)) = crate::sema::defer_sprung(inner) {
+                    self.dg.error_note(
+                        bad,
+                        format!("'{}' ist in einem 'defer' nicht erlaubt", wort),
+                        "der aufgeschobene rumpf muss normal enden; sonst waere unbestimmt, was mit den uebrigen aufgeschobenen anweisungen geschieht",
+                    );
+                    let _ = span;
+                }
+                self.check_stmt(inner);
+            }
             Stmt::Block(b) => self.check_block(b, false),
             Stmt::Expr(e) => {
                 let t = self.expr(e, None);
@@ -2798,5 +2817,48 @@ mod tests {
             expr_count: b.next,
         };
         expect_err(prog, "index muss vom typ usize sein");
+    }
+}
+
+/// Findet einen Sprung (`return`/`break`/`continue`), der aus einem
+/// `defer`-Rumpf HERAUSfuehrt. Sprunge innerhalb einer Schleife, die im Rumpf
+/// selbst beginnt, sind erlaubt — sie verlassen den Rumpf nicht.
+pub(crate) fn defer_sprung(s: &Stmt) -> Option<(Span, &'static str)> {
+    match s {
+        Stmt::Return { span, .. } => Some((*span, "return")),
+        Stmt::Break(span) => Some((*span, "break")),
+        Stmt::Continue(span) => Some((*span, "continue")),
+        Stmt::Block(b) => b.stmts.iter().find_map(defer_sprung),
+        Stmt::Defer(inner, _) => defer_sprung(inner),
+        Stmt::If { then, els, .. } => then
+            .stmts
+            .iter()
+            .find_map(defer_sprung)
+            .or_else(|| els.as_deref().and_then(defer_sprung)),
+        // In `while`/`for` duerfen `break`/`continue` stehen: sie gehoeren zu
+        // dieser Schleife und verlassen den Rumpf nicht. Ein `return` schon.
+        Stmt::While { body, .. } | Stmt::For { body, .. } => {
+            body.stmts.iter().find_map(defer_return_only)
+        }
+        _ => None,
+    }
+}
+
+/// Wie `defer_sprung`, aber nur `return` — fuer Rumpfe innerhalb einer
+/// Schleife, die im `defer` selbst beginnt.
+fn defer_return_only(s: &Stmt) -> Option<(Span, &'static str)> {
+    match s {
+        Stmt::Return { span, .. } => Some((*span, "return")),
+        Stmt::Block(b) => b.stmts.iter().find_map(defer_return_only),
+        Stmt::Defer(inner, _) => defer_return_only(inner),
+        Stmt::If { then, els, .. } => then
+            .stmts
+            .iter()
+            .find_map(defer_return_only)
+            .or_else(|| els.as_deref().and_then(defer_return_only)),
+        Stmt::While { body, .. } | Stmt::For { body, .. } => {
+            body.stmts.iter().find_map(defer_return_only)
+        }
+        _ => None,
     }
 }

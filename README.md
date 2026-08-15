@@ -759,6 +759,50 @@ Meldungen und Pfade ist das gleichgültig, für große Tabellen wäre es das nic
 einer 63-stelligen Zahlenreihe wurde
 `"FEHLER: tabelle() lieferte 0, obwohl mmap moeglich sein sollte\n"`.
 
+## `defer` (Runde 9)
+
+```firn
+fn lies(pfad: *mut u8) -> i32 {
+    let fd: i32 = oeffne(pfad)
+    defer schliesse(fd)          // laeuft bei JEDEM Verlassen
+    if fd < 0 {
+        return -1                 // auch hier
+    }
+    return verarbeite(fd)
+}
+```
+
+* **Umgekehrte Reihenfolge** der Vereinbarung, wie bei `drop`.
+* **`return` raeumt alle Ebenen ab**, innerste zuerst. Der Rückgabewert ist
+  vorher berechnet — ein `defer` sieht ihn, kann ihn aber nicht ersetzen.
+* **`break`/`continue` raeumen genau die Ebenen ab, die innerhalb der Schleife
+  vereinbart wurden.** Dafür merkt sich `lower::loops` die Tiefe des
+  `defer`-Stapels beim Betreten der Schleife.
+* **Auswertung erst beim Verlassen — wie Zig, nicht wie Go.** Go wertet die
+  Argumente sofort aus und legt sie in versteckten Kopien ab; das widerspricht
+  „nichts Verstecktes". In Firn gilt:
+
+  ```firn
+  var i: i32 = 5
+  defer merke(i)    // merkt 9, nicht 5
+  i = 9
+  ```
+
+* **Ein Sprung aus dem Rumpf heraus ist ein Fehler:**
+
+  ```
+  error: 'return' ist in einem 'defer' nicht erlaubt
+    --> datei.fi:6:9
+     = hinweis: der aufgeschobene rumpf muss normal enden; sonst waere
+       unbestimmt, was mit den uebrigen aufgeschobenen anweisungen geschieht
+  ```
+
+**Noch nicht da: `errdefer`** — es braucht die Unterscheidung „verlassen auf dem
+Fehlerpfad" und gehört zu `try`/`catch`.
+
+Nachweise: `tests/580_defer.fi` (fünf Abschnitte, alle drei Baustufen),
+`tests/neg/defer_return.fi`, `tests/neg/defer_break.fi`.
+
 ## Speichermodell: Opt-in-Tracing-GC und der DOM-Dauerlauf (Runde 4)
 
 Die wichtigste offene Designfrage aus `DESIGNZIELE.md` ist entschieden **und
