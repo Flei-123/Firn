@@ -762,3 +762,108 @@ Läuft mit und ohne Optimierer, und beide Layoutausgaben stimmen überein.
 Dafür stehen jetzt alle Bausteine bereit: `Map[K,V]` für die Bereichsketten,
 der `Interner` für die Namen, `diag` für die Meldungen und `typen` für die
 Typen selbst.
+
+
+---
+
+## 14. Runde 24: der Typprüfer in Firn
+
+`lib/firnc1/sema.fi` ist der sechste Teil von Stufe 1 und der bisher größte.
+Damit ist die Kette **Text → Token → Baum → Typen** vollständig in Firn
+geschrieben.
+
+### Was genau geprüft wird
+
+`firnc0` gibt eine Zusicherung: nach der Prüfung hat **jeder** Ausdruck einen
+konkreten Typ — nie `UntypedInt`, nie `Error`. Genau diese Zusicherung ist der
+Maßstab. `--emit=typen` druckt den kanonischen Baum aus Runde 22 mit dem Typ an
+jedem Ausdruck:
+
+```text
+(let summe i32 (bin + (id a :i32) (int 1 :i32) :i32))
+```
+
+Die `1` ist hier `i32`, obwohl nirgends `i32` danebensteht. Das ist der Kern:
+
+### Bidirektional, und die Reihenfolge ist Vertrag
+
+Ein Ganzzahlliteral hat in Firn **keinen eigenen Typ**. Er kommt entweder aus
+dem Kontext oder aus dem anderen Operanden. Dafür gibt es zwei Wege durch
+denselben Baum:
+
+* `probe` ermittelt den Typ **ohne** zu melden und ohne die Tabelle zu
+  beschreiben — damit `a + 1` den Typ des Literals aus `a` gewinnt;
+* `ausdruck` prüft wirklich und trägt den Typ ein.
+
+Die Reihenfolge ist festgelegt: **erst der bereits typisierte Operand, dann der
+Kontexthinweis.** Andernfalls meldet `let x: i64 = a + 1` (mit `a: i32`) einen
+verwirrenden Operandenfehler statt des echten Fehlers an der Zuweisung.
+
+### Ergebnis
+
+`tools/sema_vergleich.sh`, Abschnitt 14 in `test.sh`:
+
+| | |
+|---|---:|
+| Dateien mit identischer Typtabelle | **113** |
+| dabei verglichene Ausdrücke | **24.529** |
+| abweichend | 1 (`1e308`, bekannt aus Runde 20 — ein *Lexer*fall) |
+| nicht Kernsprache | 36 |
+| `comptime`-Auswertung nötig | 1 |
+| übersprungen (`firnc0` prüft die Datei nicht einzeln) | 168 |
+
+24.529 Ausdrücke, jeder mit demselben Typ wie in `firnc0`. Die 168
+übersprungenen Dateien binden fast alle ein Modul ein — einzeln betrachtet sind
+deren Namen unbekannt, und dann prüft auch `firnc0` nicht.
+
+### `tests/680_typableitung.fi`
+
+Der neue Test fährt die Ecken ab, die das Korpus nicht hatte: der Typ aus dem
+anderen Operanden, der linke Operand einer Verschiebung, Argumenttyp als
+Hinweis, Index immer `usize`, verschachtelte Struct-Literale, Zeiger auf
+Zeiger, `for`-Bereich mit zwei Grenzen, Schatten in einem inneren Block, und
+ein Wiederholungsliteral, dessen Länge aus einem konstanten Ausdruck kommt.
+
+Dabei fiel eine Grenze von Stufe 0 auf, die vorher nirgends stand: **die Länge
+im Arraytyp muss ein Literal sein** (`[u8; 12]`), im Wiederholungsliteral darf
+dagegen ein konstanter Ausdruck stehen (`[0 as u8; FLAECHE]`).
+
+### Was NICHT portiert ist — benannt, nicht verschwiegen
+
+* **Sämtliche Fehlermeldungen.** Die Firn-Fassung *zählt* Fehler, sie
+  beschreibt sie nicht. Der Vergleich läuft nur über Quellen, die `firnc0`
+  fehlerfrei prüft; dort ist die Zahl null, und was zählt, sind die Typen.
+  Für einen echten Compiler ist das zu wenig — `diag` steht bereit, die
+  Meldungstexte fehlen.
+* **Erreichbarkeitsanalyse** (`return` am Ende jedes Pfades),
+  **Veränderlichkeitsprüfung** (`let` gegen `var`) und die
+  **Rekursionsprüfung** für Structs.
+* **`comptime`-Auswertung** konstanter Ausdrücke: ein Aufruf in einem `const`
+  wird von `firnc0` zur Übersetzungszeit ausgeführt. Solche Dateien liefern
+  Rückgabewert 4 und werden gesondert gezählt.
+* Die **Intrinsics für konstante Laufzeit** (`select`, `barrier`,
+  `secure_zero`) sind gewöhnliche Bezeichner, kein Schlüsselwort — sie lassen
+  sich nur am Namen erkennen. Wer eine eigene Funktion `select` schreibt, fällt
+  dadurch aus dem Vergleich heraus; das ist die vorsichtige Richtung.
+
+### Ein Zwischenfall, der hierher gehört
+
+Beim Anlegen der Symlinks in `lib/firnc1/` hat ein falsch geschriebener
+`ln -sf`-Aufruf vier echte Dateien durch Verweise auf sich selbst ersetzt.
+`ast.fi` und `typen.fi` kamen aus dem Git zurück, `sema.fi` und `druck.fi`
+waren noch nicht eingecheckt und mussten neu geschrieben werden. Lehre, ohne
+Beschönigung: **vor jedem Sammelbefehl auf Verzeichnisse committen.** Der
+Verlust hat eine halbe Runde gekostet.
+
+### Stand
+
+| Teil | Stand |
+|---|---|
+| `lexer` · `diag` · `ast` + `parser` · `types` + `abi` | ✅ |
+| `sema` | ✅ Kern: Namen, Bereiche, Typen — ohne Meldungstexte |
+| `config` | `[ ]` (braucht `Str`) |
+| `fir`, `lower`, `codegen_x86` | `[ ]` |
+
+**Nächster Schritt:** `fir` und `lower` — vom geprüften Baum zur
+Zwischendarstellung. Der Maßstab liegt schon bereit: `firnc0 --emit=fir-raw`
+druckt die FIR vor jeder Optimierung.
