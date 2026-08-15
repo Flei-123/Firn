@@ -27,9 +27,13 @@ import intern
 import lexer
 import ast
 
-export { Parser, par_neu, par_frei, par_lauf, par_fehler, par_baum, par_nicht_kern }
+export { Parser, par_neu, par_neu_modul, par_frei, par_lauf, par_fehler, par_baum,
+         par_nicht_kern, par_baum_uebernehmen }
 
 // Token-Arten aus lexer.fi (dieselbe Reihenfolge wie compiler/src/lexer.rs)
+// "kein Wert"
+const KEIN: u32 = 4294967295
+
 const A_INT: u32 = 0
 const A_IDENT: u32 = 1
 const A_FLOAT: u32 = 2
@@ -131,6 +135,14 @@ struct Parser {
     pos: usize,
     n: usize,
     baum: ast.Baum,
+    // MODULSYSTEM. Ist `alias` gesetzt, gehoert diese Datei nicht zur Wurzel:
+    // jeder Name, den sie SELBST oben deklariert, bekommt `alias__` davor.
+    // Damit liegen alle Dateien in EINEM Baum, ohne dass sich zwei Funktionen
+    // gleichen Namens in die Quere kommen. `firnc0` macht dasselbe in
+    // `modules.rs`, nur nach dem Parsen statt waehrend.
+    alias: u32,
+    eigene: Vec[u32],    // oben deklarierte Namen dieser Datei
+    fremd: u64,          // gemeinsamer Baum (0 = eigener)
     module: Vec[u32],    // Namensnummern der Modul-Aliasse (fuer `modul.name`)
     kladde: rt.Buf,      // baut qualifizierte Namen zusammen
     klammern: usize,     // offene Klammern (fuer `weiter()`)
@@ -143,6 +155,7 @@ fn par_neu(lx: u64) -> Parser {
     var p: Parser = Parser{
         lx: lx, pos: 0, n: 0,
         baum: ast.baum_neu(),
+        alias: KEIN, eigene: vec_neu[u32](), fremd: 0,
         module: vec_neu[u32](),
         kladde: rt.buf_neu(),
         klammern: 0, kein_slit: 0, fehler: 0, nicht_kern: false,
@@ -151,14 +164,36 @@ fn par_neu(lx: u64) -> Parser {
     return p
 }
 
+// Wie `par_neu`, aber in einen GEMEINSAMEN Baum und mit Modul-Alias.
+// `alias == KEIN` heisst Wurzeldatei (keine Umbenennung).
+fn par_neu_modul(lx: u64, baum: u64, alias: u32) -> Parser {
+    var p: Parser = par_neu(lx)
+    p.fremd = baum
+    p.alias = alias
+    return p
+}
+
+fn par_baum_uebernehmen(p: *mut Parser) -> *mut ast.Baum {
+    return par_baum(p)
+}
+
 fn par_frei(p: *mut Parser) {
-    ast.baum_frei(&(*p).baum)
+    // Ein GEMEINSAMER Baum gehoert dem Aufrufer.
+    if (*p).fremd == 0 {
+        ast.baum_frei(&(*p).baum)
+    }
     vec_frei[u32](&(*p).module)
+    vec_frei[u32](&(*p).eigene)
     rt.buf_frei(&(*p).kladde)
 }
 
 fn par_fehler(p: *mut Parser) -> usize { return (*p).fehler }
-fn par_baum(p: *mut Parser) -> *mut ast.Baum { return &(*p).baum }
+fn par_baum(p: *mut Parser) -> *mut ast.Baum {
+    if (*p).fremd != 0 {
+        return (*p).fremd as *mut ast.Baum
+    }
+    return &(*p).baum
+}
 fn par_nicht_kern(p: *mut Parser) -> bool { return (*p).nicht_kern }
 
 fn lx(p: *mut Parser) -> *mut lexer.Lexer { return (*p).lx as *mut lexer.Lexer }
@@ -241,14 +276,53 @@ fn erwarte(p: *mut Parser, a: u32) -> bool {
 
 // -------------------------------------------------------------------- Namen
 
-// Baut `modul.name` und traegt es in den Interner ein.
-fn qualifiziere(p: *mut Parser, modul: u32, name: u32) -> u32 {
+// Setzt zwei Namen mit einem Trenner zusammen und traegt das Ergebnis ein.
+fn verbinde(p: *mut Parser, a: u32, trenner: u64, tn: usize, b: u32) -> u32 {
     let it: *mut intern.Interner = lexer.lex_namen(lx(p))
     rt.buf_leeren(&(*p).kladde)
-    rt.buf_push_bytes(&(*p).kladde, intern.intern_zeiger(it, modul), intern.intern_laenge(it, modul))
-    rt.buf_push(&(*p).kladde, 46 as u8)
-    rt.buf_push_bytes(&(*p).kladde, intern.intern_zeiger(it, name), intern.intern_laenge(it, name))
+    rt.buf_push_bytes(&(*p).kladde, intern.intern_zeiger(it, a), intern.intern_laenge(it, a))
+    rt.buf_push_bytes(&(*p).kladde, trenner, tn)
+    rt.buf_push_bytes(&(*p).kladde, intern.intern_zeiger(it, b), intern.intern_laenge(it, b))
     return intern.intern_nummer(it, rt.buf_ptr(&(*p).kladde), rt.buf_len(&(*p).kladde)) as u32
+}
+
+// Ist `nr` ein Name, den DIESE Datei oben deklariert?
+fn ist_eigen(p: *mut Parser, nr: u32) -> bool {
+    var i: usize = 0
+    while i < vec_len[u32](&(*p).eigene) {
+        if vec_at[u32](&(*p).eigene, i) == nr {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// Umbenennung eines Namens dieser Datei: `alias__name`. In der Wurzeldatei
+// bleibt alles, wie es ist.
+fn umbenannt(p: *mut Parser, nr: u32) -> u32 {
+    if (*p).alias == KEIN {
+        return nr
+    }
+    if !ist_eigen(p, nr) {
+        return nr
+    }
+    var tr: [u8; 2] = "__"
+    return verbinde(p, (*p).alias, (&tr[0]) as u64, 2, nr)
+}
+
+// Baut `modul.name` und traegt es in den Interner ein.
+// `modul.name` wird zum EINEN Namen `modul.name` (Wurzelbetrieb, damit der
+// Vergleich mit `firnc0 --emit=ast-kanon` stimmt) bzw. zu `modul__name`,
+// sobald wirklich mehrere Dateien uebersetzt werden. Beides ist derselbe
+// Gedanke: aus zwei Teilen wird ein eindeutiger Name.
+fn qualifiziere(p: *mut Parser, modul: u32, name: u32) -> u32 {
+    if (*p).fremd != 0 {
+        var tr: [u8; 2] = "__"
+        return verbinde(p, modul, (&tr[0]) as u64, 2, name)
+    }
+    var pt: [u8; 1] = "."
+    return verbinde(p, modul, (&pt[0]) as u64, 1, name)
 }
 
 fn ist_modul(p: *mut Parser, nr: u32) -> bool {
@@ -266,13 +340,13 @@ fn ist_modul(p: *mut Parser, nr: u32) -> bool {
 // `modul.mitglied` daraus.
 fn vielleicht_qualifiziert(p: *mut Parser, nr: u32) -> u32 {
     if !ist_modul(p, nr) {
-        return nr
+        return umbenannt(p, nr)
     }
     if !ist(p, A_DOT) {
-        return nr
+        return umbenannt(p, nr)
     }
     if art(p, 1) != A_IDENT {
-        return nr
+        return umbenannt(p, nr)
     }
     let m: u32 = nummer(p, 1)
     weiter_bump(p)
@@ -293,7 +367,7 @@ fn typ(p: *mut Parser) -> u32 {
         if inner == ast.NICHTS {
             return ast.NICHTS
         }
-        return ast.typ_neu(&(*p).baum, ast.T_PTR, inner, m)
+        return ast.typ_neu(par_baum(p), ast.T_PTR, inner, m)
     }
     if ist(p, A_LBRACKET) {
         weiter_bump(p)
@@ -313,7 +387,7 @@ fn typ(p: *mut Parser) -> u32 {
         if !erwarte(p, A_RBRACKET) {
             return ast.NICHTS
         }
-        return ast.typ_neu(&(*p).baum, ast.T_ARR, elem, laen)
+        return ast.typ_neu(par_baum(p), ast.T_ARR, elem, laen)
     }
     if ist(p, A_IDENT) {
         let nr: u32 = nummer(p, 0)
@@ -326,7 +400,7 @@ fn typ(p: *mut Parser) -> u32 {
             return ast.NICHTS
         }
         let q: u32 = vielleicht_qualifiziert(p, nr)
-        return ast.typ_neu(&(*p).baum, ast.T_NAME, q, 0)
+        return ast.typ_neu(par_baum(p), ast.T_NAME, q, 0)
     }
     meckern(p)
     return ast.NICHTS
@@ -362,7 +436,7 @@ fn oder_ausdruck(p: *mut Parser) -> u32 {
     while ist(p, A_OROR) && weiter(p) {
         weiter_bump(p)
         let rechts: u32 = und_ausdruck(p)
-        links = ast.ausdruck_neu(&(*p).baum, ast.E_BIN, B_LOR, links, rechts, 0)
+        links = ast.ausdruck_neu(par_baum(p), ast.E_BIN, B_LOR, links, rechts, 0)
     }
     return links
 }
@@ -372,7 +446,7 @@ fn und_ausdruck(p: *mut Parser) -> u32 {
     while ist(p, A_ANDAND) && weiter(p) {
         weiter_bump(p)
         let rechts: u32 = vgl_ausdruck(p)
-        links = ast.ausdruck_neu(&(*p).baum, ast.E_BIN, B_LAND, links, rechts, 0)
+        links = ast.ausdruck_neu(par_baum(p), ast.E_BIN, B_LAND, links, rechts, 0)
     }
     return links
 }
@@ -397,13 +471,13 @@ fn vgl_ausdruck(p: *mut Parser) -> u32 {
     }
     weiter_bump(p)
     let rechts: u32 = add_ausdruck(p)
-    var e: u32 = ast.ausdruck_neu(&(*p).baum, ast.E_BIN, op as u32, links, rechts, 0)
+    var e: u32 = ast.ausdruck_neu(par_baum(p), ast.E_BIN, op as u32, links, rechts, 0)
     while vgl_op(art(p, 0)) >= 0 && weiter(p) {
         meckern(p)
         let op2: i32 = vgl_op(art(p, 0))
         weiter_bump(p)
         let r2: u32 = add_ausdruck(p)
-        e = ast.ausdruck_neu(&(*p).baum, ast.E_BIN, op2 as u32, e, r2, 0)
+        e = ast.ausdruck_neu(par_baum(p), ast.E_BIN, op2 as u32, e, r2, 0)
     }
     return e
 }
@@ -422,7 +496,7 @@ fn add_ausdruck(p: *mut Parser) -> u32 {
         let op: i32 = add_op(art(p, 0))
         weiter_bump(p)
         let rechts: u32 = mul_ausdruck(p)
-        links = ast.ausdruck_neu(&(*p).baum, ast.E_BIN, op as u32, links, rechts, 0)
+        links = ast.ausdruck_neu(par_baum(p), ast.E_BIN, op as u32, links, rechts, 0)
     }
     return links
 }
@@ -443,7 +517,7 @@ fn mul_ausdruck(p: *mut Parser) -> u32 {
         let op: i32 = mul_op(art(p, 0))
         weiter_bump(p)
         let rechts: u32 = un_ausdruck(p)
-        links = ast.ausdruck_neu(&(*p).baum, ast.E_BIN, op as u32, links, rechts, 0)
+        links = ast.ausdruck_neu(par_baum(p), ast.E_BIN, op as u32, links, rechts, 0)
     }
     return links
 }
@@ -460,7 +534,7 @@ fn un_ausdruck(p: *mut Parser) -> u32 {
     }
     weiter_bump(p)
     let inner: u32 = un_ausdruck(p)
-    return ast.ausdruck_neu(&(*p).baum, ast.E_UN, op as u32, inner, 0, 0)
+    return ast.ausdruck_neu(par_baum(p), ast.E_UN, op as u32, inner, 0, 0)
 }
 
 // Hilfsliste erst SAMMELN, dann am Stueck in `kinder` legen.
@@ -471,10 +545,10 @@ fn un_ausdruck(p: *mut Parser) -> u32 {
 // `f(a, g(b))` wurde `f(a, b, g(b))`. Kinderlisten muessen zusammenhaengend
 // sein, also wird die innere Liste zuerst fertig.
 fn liste_ablegen(p: *mut Parser, tmp: *mut Vec[u32]) -> u32 {
-    let off: u32 = ast.kind_anfang(&(*p).baum)
+    let off: u32 = ast.kind_anfang(par_baum(p))
     var i: usize = 0
     while i < vec_len[u32](tmp) {
-        ast.kind_dazu(&(*p).baum, vec_at[u32](tmp, i))
+        ast.kind_dazu(par_baum(p), vec_at[u32](tmp, i))
         i = i + 1
     }
     return off
@@ -518,30 +592,30 @@ fn nach_ausdruck(p: *mut Parser) -> u32 {
             }
             let nr: u32 = nummer(p, 0)
             weiter_bump(p)
-            e = ast.ausdruck_neu(&(*p).baum, ast.E_FELD, e, nr, 0, 0)
+            e = ast.ausdruck_neu(par_baum(p), ast.E_FELD, e, nr, 0, 0)
         } else if a == A_LBRACKET {
             weiter_bump(p)
             let idx: u32 = innen_ausdruck(p)
             erwarte(p, A_RBRACKET)
-            e = ast.ausdruck_neu(&(*p).baum, ast.E_IDX, e, idx, 0, 0)
+            e = ast.ausdruck_neu(par_baum(p), ast.E_IDX, e, idx, 0, 0)
         } else if a == A_LPAREN {
             // Nur direkte Funktionsnamen koennen aufgerufen werden (Stufe 0).
-            if ast.e_art(&(*p).baum, e) != ast.E_ID {
+            if ast.e_art(par_baum(p), e) != ast.E_ID {
                 meckern(p)
                 return e
             }
-            let name: u32 = ast.e_a(&(*p).baum, e)
+            let name: u32 = ast.e_a(par_baum(p), e)
             weiter_bump(p)
             let off: u32 = ruf_argumente(p)
-            let laen: u32 = ast.kind_anzahl(&(*p).baum) - off
-            e = ast.ausdruck_neu(&(*p).baum, ast.E_RUF, name, off, laen, 0)
+            let laen: u32 = ast.kind_anzahl(par_baum(p)) - off
+            e = ast.ausdruck_neu(par_baum(p), ast.E_RUF, name, off, laen, 0)
         } else if a == A_KWAS {
             weiter_bump(p)
             let t: u32 = typ(p)
             if t == ast.NICHTS {
                 return e
             }
-            e = ast.ausdruck_neu(&(*p).baum, ast.E_AS, e, t, 0, 0)
+            e = ast.ausdruck_neu(par_baum(p), ast.E_AS, e, t, 0, 0)
         } else {
             return e
         }
@@ -581,7 +655,7 @@ fn struct_literal(p: *mut Parser, name: u32) -> u32 {
     let laen: u32 = vec_len[u32](&tmp) as u32 / 2
     let off: u32 = liste_ablegen(p, &tmp)
     vec_frei[u32](&tmp)
-    return ast.ausdruck_neu(&(*p).baum, ast.E_SLIT, name, off, laen, 0)
+    return ast.ausdruck_neu(par_baum(p), ast.E_SLIT, name, off, laen, 0)
 }
 
 // Ein Zeichenkettenliteral wird zu einem ARRAY-LITERAL aus Ganzzahlen —
@@ -594,7 +668,7 @@ fn text_literal(p: *mut Parser) -> u32 {
     weiter_bump(p)
     if n == 0 {
         meckern(p)
-        return ast.ausdruck_neu(&(*p).baum, ast.E_INT, 0, 0, 0, 0)
+        return ast.ausdruck_neu(par_baum(p), ast.E_INT, 0, 0, 0, 0)
     }
     var tmp: Vec[u32] = vec_neu[u32]()
     var i: usize = 0
@@ -605,12 +679,12 @@ fn text_literal(p: *mut Parser) -> u32 {
         } else {
             w = lexer.lex_lit_byte(lx(p), k, i) as u64
         }
-        vec_push[u32](&tmp, ast.ausdruck_neu(&(*p).baum, ast.E_INT, 0, 0, 0, w))
+        vec_push[u32](&tmp, ast.ausdruck_neu(par_baum(p), ast.E_INT, 0, 0, 0, w))
         i = i + 1
     }
     let off: u32 = liste_ablegen(p, &tmp)
     vec_frei[u32](&tmp)
-    return ast.ausdruck_neu(&(*p).baum, ast.E_ALIT, 0, off, n as u32, 0)
+    return ast.ausdruck_neu(par_baum(p), ast.E_ALIT, 0, off, n as u32, 0)
 }
 
 fn grund_ausdruck(p: *mut Parser) -> u32 {
@@ -618,23 +692,23 @@ fn grund_ausdruck(p: *mut Parser) -> u32 {
     if a == A_INT {
         let v: u64 = zahl(p)
         weiter_bump(p)
-        return ast.ausdruck_neu(&(*p).baum, ast.E_INT, 0, 0, 0, v)
+        return ast.ausdruck_neu(par_baum(p), ast.E_INT, 0, 0, 0, v)
     }
     if a == A_FLOAT {
         let v: u64 = zahl(p)
         weiter_bump(p)
-        return ast.ausdruck_neu(&(*p).baum, ast.E_FLOAT, 0, 0, 0, v)
+        return ast.ausdruck_neu(par_baum(p), ast.E_FLOAT, 0, 0, 0, v)
     }
     if a == A_STR {
         return text_literal(p)
     }
     if a == A_KWTRUE {
         weiter_bump(p)
-        return ast.ausdruck_neu(&(*p).baum, ast.E_BOOL, 1, 0, 0, 0)
+        return ast.ausdruck_neu(par_baum(p), ast.E_BOOL, 1, 0, 0, 0)
     }
     if a == A_KWFALSE {
         weiter_bump(p)
-        return ast.ausdruck_neu(&(*p).baum, ast.E_BOOL, 0, 0, 0, 0)
+        return ast.ausdruck_neu(par_baum(p), ast.E_BOOL, 0, 0, 0, 0)
     }
     if a == A_LPAREN {
         weiter_bump(p)
@@ -653,7 +727,7 @@ fn grund_ausdruck(p: *mut Parser) -> u32 {
                 let anzahl: u32 = innen_ausdruck(p)
                 erwarte(p, A_RBRACKET)
                 vec_frei[u32](&tmp)
-                return ast.ausdruck_neu(&(*p).baum, ast.E_AWDH, erstes, anzahl, 0, 0)
+                return ast.ausdruck_neu(par_baum(p), ast.E_AWDH, erstes, anzahl, 0, 0)
             }
             vec_push[u32](&tmp, erstes)
             if !friss(p, A_COMMA) {
@@ -681,14 +755,14 @@ fn grund_ausdruck(p: *mut Parser) -> u32 {
         let laen: u32 = vec_len[u32](&tmp) as u32
         let off: u32 = liste_ablegen(p, &tmp)
         vec_frei[u32](&tmp)
-        return ast.ausdruck_neu(&(*p).baum, ast.E_ALIT, 0, off, laen, 0)
+        return ast.ausdruck_neu(par_baum(p), ast.E_ALIT, 0, off, laen, 0)
     }
     if a == A_KWSYSCALL {
         weiter_bump(p)
         erwarte(p, A_LPAREN)
         let off: u32 = ruf_argumente(p)
-        let laen: u32 = ast.kind_anzahl(&(*p).baum) - off
-        return ast.ausdruck_neu(&(*p).baum, ast.E_SYSCALL, 0, off, laen, 0)
+        let laen: u32 = ast.kind_anzahl(par_baum(p)) - off
+        return ast.ausdruck_neu(par_baum(p), ast.E_SYSCALL, 0, off, laen, 0)
     }
     if a == A_IDENT {
         let nr: u32 = nummer(p, 0)
@@ -698,17 +772,17 @@ fn grund_ausdruck(p: *mut Parser) -> u32 {
         if ist(p, A_COLON) && art(p, 1) == A_COLON {
             (*p).nicht_kern = true
             meckern(p)
-            return ast.ausdruck_neu(&(*p).baum, ast.E_INT, 0, 0, 0, 0)
+            return ast.ausdruck_neu(par_baum(p), ast.E_INT, 0, 0, 0, 0)
         }
         let q: u32 = vielleicht_qualifiziert(p, nr)
         if ist(p, A_LBRACE) && (*p).kein_slit == 0 {
             return struct_literal(p, q)
         }
-        return ast.ausdruck_neu(&(*p).baum, ast.E_ID, q, 0, 0, 0)
+        return ast.ausdruck_neu(par_baum(p), ast.E_ID, q, 0, 0, 0)
     }
     meckern(p)
     weiter_bump(p)
-    return ast.ausdruck_neu(&(*p).baum, ast.E_INT, 0, 0, 0, 0)
+    return ast.ausdruck_neu(par_baum(p), ast.E_INT, 0, 0, 0, 0)
 }
 
 // -------------------------------------------------------------- Anweisungen
@@ -728,7 +802,7 @@ fn ende_anweisung(p: *mut Parser) {
 
 fn block(p: *mut Parser) -> u32 {
     if !erwarte(p, A_LBRACE) {
-        return ast.block_neu(&(*p).baum, 0, 0)
+        return ast.block_neu(par_baum(p), 0, 0)
     }
     // Die Anweisungsnummern werden zuerst gesammelt und erst am Ende in
     // `sliste` gelegt — verschachtelte Bloecke wuerden sonst dazwischenfunken.
@@ -755,15 +829,15 @@ fn block(p: *mut Parser) -> u32 {
         }
     }
     friss(p, A_RBRACE)
-    let off: u32 = vec_len[u32](&(*p).baum.sliste) as u32
+    let off: u32 = vec_len[u32](&(*par_baum(p)).sliste) as u32
     var i: usize = 0
     while i < vec_len[u32](&eigene) {
-        vec_push[u32](&(*p).baum.sliste, vec_at[u32](&eigene, i))
+        vec_push[u32](&(*par_baum(p)).sliste, vec_at[u32](&eigene, i))
         i = i + 1
     }
     let laen: u32 = vec_len[u32](&eigene) as u32
     vec_frei[u32](&eigene)
-    return ast.block_neu(&(*p).baum, off, laen)
+    return ast.block_neu(par_baum(p), off, laen)
 }
 
 fn let_anweisung(p: *mut Parser) -> u32 {
@@ -774,7 +848,7 @@ fn let_anweisung(p: *mut Parser) -> u32 {
     weiter_bump(p)
     if !ist(p, A_IDENT) {
         meckern(p)
-        return ast.anweisung_neu(&(*p).baum, ast.S_BREAK, 0, 0, 0, 0)
+        return ast.anweisung_neu(par_baum(p), ast.S_BREAK, 0, 0, 0, 0)
     }
     let name: u32 = nummer(p, 0)
     weiter_bump(p)
@@ -782,15 +856,15 @@ fn let_anweisung(p: *mut Parser) -> u32 {
     if friss(p, A_COLON) {
         t = typ(p)
         if t == ast.NICHTS {
-            return ast.anweisung_neu(&(*p).baum, ast.S_BREAK, 0, 0, 0, 0)
+            return ast.anweisung_neu(par_baum(p), ast.S_BREAK, 0, 0, 0, 0)
         }
     }
     if !erwarte(p, A_ASSIGN) {
-        return ast.anweisung_neu(&(*p).baum, ast.S_BREAK, 0, 0, 0, 0)
+        return ast.anweisung_neu(par_baum(p), ast.S_BREAK, 0, 0, 0, 0)
     }
     let init: u32 = ausdruck(p)
     ende_anweisung(p)
-    return ast.anweisung_neu(&(*p).baum, art_s, name, t, init, 0)
+    return ast.anweisung_neu(par_baum(p), art_s, name, t, init, 0)
 }
 
 fn if_anweisung(p: *mut Parser) -> u32 {
@@ -804,37 +878,37 @@ fn if_anweisung(p: *mut Parser) -> u32 {
             sonst = anweisung(p)
         } else {
             let b: u32 = block(p)
-            sonst = ast.anweisung_neu(&(*p).baum, ast.S_BLOCK, b, 0, 0, 0)
+            sonst = ast.anweisung_neu(par_baum(p), ast.S_BLOCK, b, 0, 0, 0)
         }
     }
-    return ast.anweisung_neu(&(*p).baum, ast.S_IF, bed, dann, sonst, 0)
+    return ast.anweisung_neu(par_baum(p), ast.S_IF, bed, dann, sonst, 0)
 }
 
 fn while_anweisung(p: *mut Parser) -> u32 {
     weiter_bump(p)
     let bed: u32 = bed_ausdruck(p)
     let rumpf: u32 = block(p)
-    return ast.anweisung_neu(&(*p).baum, ast.S_WHILE, bed, rumpf, 0, 0)
+    return ast.anweisung_neu(par_baum(p), ast.S_WHILE, bed, rumpf, 0, 0)
 }
 
 fn for_anweisung(p: *mut Parser) -> u32 {
     weiter_bump(p)
     if !ist(p, A_IDENT) {
         meckern(p)
-        return ast.anweisung_neu(&(*p).baum, ast.S_BREAK, 0, 0, 0, 0)
+        return ast.anweisung_neu(par_baum(p), ast.S_BREAK, 0, 0, 0, 0)
     }
     let name: u32 = nummer(p, 0)
     weiter_bump(p)
     if !erwarte(p, A_KWIN) {
-        return ast.anweisung_neu(&(*p).baum, ast.S_BREAK, 0, 0, 0, 0)
+        return ast.anweisung_neu(par_baum(p), ast.S_BREAK, 0, 0, 0, 0)
     }
     let von: u32 = bed_ausdruck(p)
     if !erwarte(p, A_DOTDOT) {
-        return ast.anweisung_neu(&(*p).baum, ast.S_BREAK, 0, 0, 0, 0)
+        return ast.anweisung_neu(par_baum(p), ast.S_BREAK, 0, 0, 0, 0)
     }
     let bis: u32 = bed_ausdruck(p)
     let rumpf: u32 = block(p)
-    return ast.anweisung_neu(&(*p).baum, ast.S_FOR, name, von, bis, rumpf)
+    return ast.anweisung_neu(par_baum(p), ast.S_FOR, name, von, bis, rumpf)
 }
 
 fn return_anweisung(p: *mut Parser) -> u32 {
@@ -848,7 +922,7 @@ fn return_anweisung(p: *mut Parser) -> u32 {
         wert = ausdruck(p)
     }
     ende_anweisung(p)
-    return ast.anweisung_neu(&(*p).baum, ast.S_RET, wert, 0, 0, 0)
+    return ast.anweisung_neu(par_baum(p), ast.S_RET, wert, 0, 0, 0)
 }
 
 fn anweisung(p: *mut Parser) -> u32 {
@@ -868,12 +942,12 @@ fn anweisung(p: *mut Parser) -> u32 {
     if a == A_KWBREAK {
         weiter_bump(p)
         ende_anweisung(p)
-        return ast.anweisung_neu(&(*p).baum, ast.S_BREAK, 0, 0, 0, 0)
+        return ast.anweisung_neu(par_baum(p), ast.S_BREAK, 0, 0, 0, 0)
     }
     if a == A_KWCONTINUE {
         weiter_bump(p)
         ende_anweisung(p)
-        return ast.anweisung_neu(&(*p).baum, ast.S_CONT, 0, 0, 0, 0)
+        return ast.anweisung_neu(par_baum(p), ast.S_CONT, 0, 0, 0, 0)
     }
     if a == A_KWDEFER || a == A_KWERRDEFER {
         var art_s: u32 = ast.S_DEFER
@@ -882,35 +956,35 @@ fn anweisung(p: *mut Parser) -> u32 {
         }
         weiter_bump(p)
         let inner: u32 = anweisung(p)
-        return ast.anweisung_neu(&(*p).baum, art_s, inner, 0, 0, 0)
+        return ast.anweisung_neu(par_baum(p), art_s, inner, 0, 0, 0)
     }
     if a == A_KWRETURN {
         return return_anweisung(p)
     }
     if a == A_LBRACE {
         let b: u32 = block(p)
-        return ast.anweisung_neu(&(*p).baum, ast.S_BLOCK, b, 0, 0, 0)
+        return ast.anweisung_neu(par_baum(p), ast.S_BLOCK, b, 0, 0, 0)
     }
     if a == A_KWMATCH || a == A_KWTRY || a == A_KWCATCH {
         (*p).nicht_kern = true
         meckern(p)
-        return ast.anweisung_neu(&(*p).baum, ast.S_BREAK, 0, 0, 0, 0)
+        return ast.anweisung_neu(par_baum(p), ast.S_BREAK, 0, 0, 0, 0)
     }
     let e: u32 = ausdruck(p)
     if ist(p, A_ASSIGN) {
         weiter_bump(p)
         let v: u32 = ausdruck(p)
         ende_anweisung(p)
-        return ast.anweisung_neu(&(*p).baum, ast.S_ZUW, e, v, 0, 0)
+        return ast.anweisung_neu(par_baum(p), ast.S_ZUW, e, v, 0, 0)
     }
     ende_anweisung(p)
-    return ast.anweisung_neu(&(*p).baum, ast.S_EXPR, e, 0, 0, 0)
+    return ast.anweisung_neu(par_baum(p), ast.S_EXPR, e, 0, 0, 0)
 }
 
 // -------------------------------------------------------------- Deklarationen
 
 fn parameterliste(p: *mut Parser) -> u32 {
-    let off: u32 = vec_len[u32](&(*p).baum.pa_name) as u32
+    let off: u32 = vec_len[u32](&(*par_baum(p)).pa_name) as u32
     while true {
         if ist(p, A_RPAREN) || am_ende(p) {
             break
@@ -929,7 +1003,7 @@ fn parameterliste(p: *mut Parser) -> u32 {
         if t == ast.NICHTS {
             break
         }
-        ast.param_dazu(&(*p).baum, name, t)
+        ast.param_dazu(par_baum(p), name, t)
         if !friss(p, A_COMMA) {
             break
         }
@@ -946,7 +1020,7 @@ fn fn_deklaration(p: *mut Parser) {
         meckern(p)
         return
     }
-    let name: u32 = nummer(p, 0)
+    let name: u32 = umbenannt(p, nummer(p, 0))
     weiter_bump(p)
     // Eine Typparameterliste waere eine generische Vorlage.
     if ist(p, A_LBRACKET) {
@@ -959,7 +1033,7 @@ fn fn_deklaration(p: *mut Parser) {
     }
     let poff: u32 = parameterliste(p)
     erwarte(p, A_RPAREN)
-    let plen: u32 = vec_len[u32](&(*p).baum.pa_name) as u32 - poff
+    let plen: u32 = vec_len[u32](&(*par_baum(p)).pa_name) as u32 - poff
     var ret: u32 = ast.NICHTS
     if friss(p, A_ARROW) {
         ret = typ(p)
@@ -968,7 +1042,7 @@ fn fn_deklaration(p: *mut Parser) {
         }
     }
     let rumpf: u32 = block(p)
-    ast.fn_dazu(&(*p).baum, name, poff, plen, ret, rumpf)
+    ast.fn_dazu(par_baum(p), name, poff, plen, ret, rumpf)
 }
 
 fn struct_deklaration(p: *mut Parser) {
@@ -977,7 +1051,7 @@ fn struct_deklaration(p: *mut Parser) {
         meckern(p)
         return
     }
-    let name: u32 = nummer(p, 0)
+    let name: u32 = umbenannt(p, nummer(p, 0))
     weiter_bump(p)
     if ist(p, A_LBRACKET) {
         (*p).nicht_kern = true
@@ -987,7 +1061,7 @@ fn struct_deklaration(p: *mut Parser) {
     if !erwarte(p, A_LBRACE) {
         return
     }
-    let off: u32 = vec_len[u32](&(*p).baum.fd_name) as u32
+    let off: u32 = vec_len[u32](&(*par_baum(p)).fd_name) as u32
     while true {
         while friss(p, A_COMMA) || friss(p, A_SEMI) {}
         if ist(p, A_RBRACE) || am_ende(p) {
@@ -1007,14 +1081,14 @@ fn struct_deklaration(p: *mut Parser) {
         if t == ast.NICHTS {
             break
         }
-        ast.feld_dazu(&(*p).baum, fname, t)
+        ast.feld_dazu(par_baum(p), fname, t)
         if (*p).pos == vor {
             weiter_bump(p)
         }
     }
     erwarte(p, A_RBRACE)
-    let laen: u32 = vec_len[u32](&(*p).baum.fd_name) as u32 - off
-    ast.struktur_dazu(&(*p).baum, name, off, laen)
+    let laen: u32 = vec_len[u32](&(*par_baum(p)).fd_name) as u32 - off
+    ast.struktur_dazu(par_baum(p), name, off, laen)
 }
 
 fn const_deklaration(p: *mut Parser) {
@@ -1023,7 +1097,7 @@ fn const_deklaration(p: *mut Parser) {
         meckern(p)
         return
     }
-    let name: u32 = nummer(p, 0)
+    let name: u32 = umbenannt(p, nummer(p, 0))
     weiter_bump(p)
     if !erwarte(p, A_COLON) {
         return
@@ -1037,7 +1111,7 @@ fn const_deklaration(p: *mut Parser) {
     }
     let w: u32 = ausdruck(p)
     ende_anweisung(p)
-    ast.konst_dazu(&(*p).baum, name, t, w)
+    ast.konst_dazu(par_baum(p), name, t, w)
 }
 
 fn import_deklaration(p: *mut Parser) {
@@ -1059,7 +1133,7 @@ fn import_deklaration(p: *mut Parser) {
         weiter_bump(p)
     }
     let pfad: u32 = intern.intern_nummer(it, rt.buf_ptr(&(*p).kladde), rt.buf_len(&(*p).kladde)) as u32
-    ast.imp_dazu(&(*p).baum, pfad, letzter)
+    ast.imp_dazu(par_baum(p), pfad, letzter)
     vec_push[u32](&(*p).module, letzter)
     ende_anweisung(p)
 }
@@ -1078,7 +1152,7 @@ fn export_deklaration(p: *mut Parser) {
             meckern(p)
             break
         }
-        ast.exp_dazu(&(*p).baum, nummer(p, 0))
+        ast.exp_dazu(par_baum(p), nummer(p, 0))
         weiter_bump(p)
     }
     erwarte(p, A_RBRACE)
@@ -1090,7 +1164,7 @@ fn profile_deklaration(p: *mut Parser) {
         meckern(p)
         return
     }
-    ast.profil_setzen(&(*p).baum, nummer(p, 0))
+    ast.profil_setzen(par_baum(p), nummer(p, 0))
     weiter_bump(p)
     ende_anweisung(p)
 }
@@ -1206,8 +1280,28 @@ fn erweiterungen_suchen(p: *mut Parser) {
     }
 }
 
+// Sammelt die Namen, die diese Datei auf oberster Ebene deklariert. Nur die
+// werden umbenannt — eine Verwendung aus einem anderen Modul steht ohnehin
+// qualifiziert da.
+fn eigene_suchen(p: *mut Parser) {
+    if (*p).alias == KEIN {
+        return
+    }
+    var i: usize = 0
+    while i + 1 < (*p).n {
+        let a: u32 = lexer.lex_art(lx(p), i)
+        if a == A_KWFN || a == A_KWSTRUCT || a == A_KWCONST {
+            if lexer.lex_art(lx(p), i + 1) == A_IDENT {
+                vec_push[u32](&(*p).eigene, lexer.lex_nr(lx(p), i + 1))
+            }
+        }
+        i = i + 1
+    }
+}
+
 fn par_lauf(p: *mut Parser) {
     erweiterungen_suchen(p)
+    eigene_suchen(p)
     if (*p).nicht_kern {
         return
     }
