@@ -1,0 +1,364 @@
+// lib/rt/rt.fi — Laufzeitkern in Firn.
+//
+// ZWECK: `docs/SELBSTHOSTING.md` §4 nennt drei Punkte, die den Weg zu Stufe 1
+// am stärksten blockieren:
+//
+//   1. Heap-Allokator          — ohne ihn kein `Vec`, kein AST, keine Tabelle
+//   5. Textformatierung        — jede Diagnose, der gesamte Assemblertext
+//  12. Dateizugriff            — Quelle lesen, `.s` schreiben
+//
+// Alle drei stehen hier. Sie existierten vorher DREIFACH und leicht
+// verschieden — in `lib/html/mem.fi`, `lib/str/alloc.fi` und `lib/gc/gc.fi`.
+// Diese Datei ist die gemeinsame Fassung; die bestehenden Module bleiben
+// vorerst, wo sie sind (ihr Umbau wäre ein eigener Schritt mit eigenem Risiko
+// und ist in `docs/SELBSTHOSTING.md` als offen geführt).
+//
+// KEINE libc. Alles geht direkt über `syscall`.
+
+export {
+    Buf,
+    heap_alloc, heap_free, mem_copy, mem_set, mem_eq,
+    buf_neu, buf_frei, buf_leeren, buf_reserve, buf_push, buf_push_bytes,
+    buf_len, buf_at, buf_ptr, buf_set_len,
+    buf_push_dez_u64, buf_push_dez_i64, buf_push_hex_u64,
+    schreib_alles, lies_datei, lies_stdin, beende,
+    ld8, st8, ld16, st16, ld32, st32, ld64, st64,
+}
+
+const SYS_READ: i64 = 0
+const SYS_WRITE: i64 = 1
+const SYS_OPEN: i64 = 2
+const SYS_CLOSE: i64 = 3
+const SYS_MMAP: i64 = 9
+const SYS_MUNMAP: i64 = 11
+const SYS_EXIT_GROUP: i64 = 231
+
+const PROT_RW: i64 = 3
+const MAP_PRIVATE_ANON: i64 = 34
+const SEITE: usize = 4096
+
+// --------------------------------------------------------------- Rohzugriffe
+
+fn ld8(p: u64, i: usize) -> u8 {
+    return *((p + i as u64) as *mut u8)
+}
+
+fn st8(p: u64, i: usize, v: u8) {
+    *((p + i as u64) as *mut u8) = v
+}
+
+fn ld16(p: u64, i: usize) -> u16 {
+    return *((p + i as u64 * 2) as *mut u16)
+}
+
+fn st16(p: u64, i: usize, v: u16) {
+    *((p + i as u64 * 2) as *mut u16) = v
+}
+
+fn ld32(p: u64, i: usize) -> u32 {
+    return *((p + i as u64 * 4) as *mut u32)
+}
+
+fn st32(p: u64, i: usize, v: u32) {
+    *((p + i as u64 * 4) as *mut u32) = v
+}
+
+fn ld64(p: u64, i: usize) -> u64 {
+    return *((p + i as u64 * 8) as *mut u64)
+}
+
+fn st64(p: u64, i: usize, v: u64) {
+    *((p + i as u64 * 8) as *mut u64) = v
+}
+
+// ------------------------------------------------------------------ Speicher
+
+fn seiten_auf(n: usize) -> usize {
+    return (n + SEITE - 1) / SEITE * SEITE
+}
+
+// n Bytes vom Betriebssystem, nullinitialisiert. 0 = fehlgeschlagen.
+//
+// OHNE feste Adresse, ohne MAP_FIXED — ein Allokator, der sich die Adresse
+// aussucht, kollidiert frueher oder spaeter mit etwas anderem.
+fn heap_alloc(n: usize) -> u64 {
+    if n == 0 {
+        return 0
+    }
+    let len: usize = seiten_auf(n)
+    let r: i64 = syscall(SYS_MMAP, 0, len as i64, PROT_RW, MAP_PRIVATE_ANON, -1, 0)
+    // mmap meldet Fehler als -1 .. -4095
+    if r < 0 && r > 0 - 4096 {
+        return 0
+    }
+    if r == 0 {
+        return 0
+    }
+    return r as u64
+}
+
+fn heap_free(p: u64, n: usize) {
+    if p == 0 {
+        return
+    }
+    syscall(SYS_MUNMAP, p as i64, seiten_auf(n) as i64, 0, 0, 0, 0)
+}
+
+fn mem_copy(ziel: u64, quelle: u64, n: usize) {
+    // Wortweise, solange es geht — das ist der haeufige Fall bei Puffern.
+    var i: usize = 0
+    while i + 8 <= n {
+        st64(ziel, i / 8, ld64(quelle, i / 8))
+        i = i + 8
+    }
+    while i < n {
+        st8(ziel, i, ld8(quelle, i))
+        i = i + 1
+    }
+}
+
+fn mem_set(ziel: u64, wert: u8, n: usize) {
+    var i: usize = 0
+    while i < n {
+        st8(ziel, i, wert)
+        i = i + 1
+    }
+}
+
+fn mem_eq(a: u64, b: u64, n: usize) -> bool {
+    var i: usize = 0
+    while i < n {
+        if ld8(a, i) != ld8(b, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// -------------------------------------------------------------------- Puffer
+
+// Wachsendes Byte-Feld — die Grundlage fuer alles, was in Stufe 1 `Vec` heisst.
+struct Buf {
+    ptr: u64,
+    len: usize,
+    kap: usize,
+}
+
+fn buf_neu() -> Buf {
+    return Buf{ ptr: 0, len: 0, kap: 0 }
+}
+
+fn buf_frei(b: *mut Buf) {
+    heap_free((*b).ptr, (*b).kap)
+    (*b).ptr = 0
+    (*b).len = 0
+    (*b).kap = 0
+}
+
+fn buf_leeren(b: *mut Buf) {
+    (*b).len = 0
+}
+
+fn buf_len(b: *mut Buf) -> usize {
+    return (*b).len
+}
+
+fn buf_ptr(b: *mut Buf) -> u64 {
+    return (*b).ptr
+}
+
+fn buf_set_len(b: *mut Buf, n: usize) {
+    if n <= (*b).kap {
+        (*b).len = n
+    }
+}
+
+fn buf_at(b: *mut Buf, i: usize) -> u8 {
+    if i >= (*b).len {
+        return 0 as u8
+    }
+    return ld8((*b).ptr, i)
+}
+
+// Wachsen verdoppelt — das haelt die Zahl der Kopien logarithmisch.
+fn buf_wachse(b: *mut Buf, noetig: usize) {
+    var kap: usize = (*b).kap
+    if kap == 0 {
+        kap = 64
+    }
+    while kap < noetig {
+        kap = kap * 2
+    }
+    let neu: u64 = heap_alloc(kap)
+    if neu == 0 {
+        return
+    }
+    if (*b).len > 0 {
+        mem_copy(neu, (*b).ptr, (*b).len)
+    }
+    heap_free((*b).ptr, (*b).kap)
+    (*b).ptr = neu
+    (*b).kap = kap
+}
+
+fn buf_reserve(b: *mut Buf, noetig: usize) {
+    if (*b).kap >= noetig {
+        return
+    }
+    buf_wachse(b, noetig)
+}
+
+// SCHNELLER PFAD OBEN: nur der Vergleich steht hier, das Wachsen ist eine
+// eigene Funktion. So bleibt `buf_push` klein genug zum Einbetten — gemessen
+// in Runde 6 waren die Kapazitaetspruefungen sonst 33 % aller Instruktionen
+// des Tokenizers.
+fn buf_push(b: *mut Buf, v: u8) {
+    if (*b).len >= (*b).kap {
+        buf_wachse(b, (*b).len + 1)
+    }
+    if (*b).len < (*b).kap {
+        st8((*b).ptr, (*b).len, v)
+        (*b).len = (*b).len + 1
+    }
+}
+
+fn buf_push_bytes(b: *mut Buf, p: u64, n: usize) {
+    buf_reserve(b, (*b).len + n)
+    if (*b).len + n > (*b).kap {
+        return
+    }
+    mem_copy((*b).ptr + (*b).len as u64, p, n)
+    (*b).len = (*b).len + n
+}
+
+// -------------------------------------------------------------- Zahl -> Text
+
+fn buf_push_dez_u64(b: *mut Buf, v: u64) {
+    if v == 0 {
+        buf_push(b, 48 as u8)
+        return
+    }
+    var d: [u8; 20] = [0 as u8; 20]
+    var n: usize = 0
+    var x: u64 = v
+    while x > 0 {
+        d[n] = (x % 10) as u8 + 48 as u8
+        x = x / 10
+        n = n + 1
+    }
+    while n > 0 {
+        n = n - 1
+        buf_push(b, d[n])
+    }
+}
+
+fn buf_push_dez_i64(b: *mut Buf, v: i64) {
+    if v < 0 {
+        buf_push(b, 45 as u8)
+        // Vorsicht am Rand: `-(i64::MIN)` passt nicht in i64, der Umweg ueber
+        // u64 schon.
+        buf_push_dez_u64(b, (0 - (v + 1)) as u64 + 1)
+        return
+    }
+    buf_push_dez_u64(b, v as u64)
+}
+
+fn buf_push_hex_u64(b: *mut Buf, v: u64, mindest: usize) {
+    var d: [u8; 16] = [0 as u8; 16]
+    var n: usize = 0
+    var x: u64 = v
+    while x > 0 {
+        let z: u64 = x & 15
+        if z < 10 {
+            d[n] = z as u8 + 48 as u8
+        } else {
+            d[n] = z as u8 + 87 as u8
+        }
+        x = x >> 4
+        n = n + 1
+    }
+    while n < mindest {
+        d[n] = 48 as u8
+        n = n + 1
+    }
+    if n == 0 {
+        buf_push(b, 48 as u8)
+        return
+    }
+    while n > 0 {
+        n = n - 1
+        buf_push(b, d[n])
+    }
+}
+
+// ------------------------------------------------------------- Ein-/Ausgabe
+
+// Schreibt vollstaendig — ein `write` darf weniger schreiben als verlangt.
+fn schreib_alles(fd: i64, p: u64, n: usize) -> bool {
+    var geschrieben: usize = 0
+    while geschrieben < n {
+        let r: i64 = syscall(
+            SYS_WRITE,
+            fd,
+            (p + geschrieben as u64) as i64,
+            (n - geschrieben) as i64,
+            0,
+            0,
+            0,
+        )
+        if r <= 0 {
+            return false
+        }
+        geschrieben = geschrieben + r as usize
+    }
+    return true
+}
+
+// Liest einen Dateideskriptor bis zum Ende in den Puffer.
+fn lies_fd(fd: i64, aus: *mut Buf) -> bool {
+    var laeuft: bool = true
+    while laeuft {
+        buf_reserve(aus, buf_len(aus) + 65536)
+        if buf_len(aus) + 65536 > (*aus).kap {
+            return false
+        }
+        let r: i64 = syscall(
+            SYS_READ,
+            fd,
+            (buf_ptr(aus) + buf_len(aus) as u64) as i64,
+            65536,
+            0,
+            0,
+            0,
+        )
+        if r < 0 {
+            return false
+        }
+        if r == 0 {
+            laeuft = false
+        } else {
+            (*aus).len = (*aus).len + r as usize
+        }
+    }
+    return true
+}
+
+fn lies_stdin(aus: *mut Buf) -> bool {
+    return lies_fd(0, aus)
+}
+
+// Liest eine ganze Datei. `pfad` zeigt auf eine mit Null abgeschlossene Folge.
+fn lies_datei(pfad: u64, aus: *mut Buf) -> bool {
+    let fd: i64 = syscall(SYS_OPEN, pfad as i64, 0, 0, 0, 0, 0)
+    if fd < 0 {
+        return false
+    }
+    let ok: bool = lies_fd(fd, aus)
+    syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+    return ok
+}
+
+fn beende(code: i64) {
+    syscall(SYS_EXIT_GROUP, code, 0, 0, 0, 0, 0)
+}

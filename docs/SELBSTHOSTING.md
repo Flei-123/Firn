@@ -54,18 +54,18 @@ Sortiert nach „blockiert am meisten zuerst". `[ ]` = fehlt,
 
 | # | Merkmal | Stand | Warum der Compiler es braucht |
 |---|---|---|---|
-| 1 | **Heap-Allokator** (`mmap`-basiert, `alloc`/`free`) | `[ ]` | Ohne ihn gibt es kein `Vec`, keinen AST, keine Symboltabelle |
-| 2 | **`Vec[T]`** (wachsendes Feld) | `[~]` Generics stehen, Sammlung fehlt | Tokenstrom, Anweisungslisten, Blocklisten — überall |
+| 1 | **Heap-Allokator** (`mmap`-basiert, `alloc`/`free`) | **`[x]`** `lib/rt/rt.fi` (Runde 15) | Ohne ihn gibt es kein `Vec`, keinen AST, keine Symboltabelle |
+| 2 | **`Vec[T]`** (wachsendes Feld) | `[~]` Generics stehen; `rt.Buf` ist die Byte-Fassung (wächst durch Verdopplung), die typisierte fehlt | Tokenstrom, Anweisungslisten, Blocklisten — überall |
 | 3 | **Hash-Abbildung `Map[K,V]`** | `[~]` | Namenstabellen (`fns`, `consts`, Bereiche) |
 | 4 | **Zeichenketten** `Str`/`Bytes` mit Verkettung | `[~]` Modul `str` dieser Runde | Bezeichner, Fehlermeldungen, Assemblertext |
-| 5 | **Textformatierung** (`format`-Ersatz) | `[ ]` | Jede Diagnose und der gesamte Assembler-Ausdruck |
+| 5 | **Textformatierung** (`format`-Ersatz) | **`[~]`** `buf_push_dez_u64/i64`, `buf_push_hex_u64` in `lib/rt/` | Jede Diagnose und der gesamte Assembler-Ausdruck |
 | 6 | **Summentypen + `match`** | `[~]` Modul `types` dieser Runde | `TokKind`, `ExprKind`, `Op`, `Term` sind alle Summentypen |
 | 7 | **Rekursive Datentypen** (`Box`-Ersatz) | `[ ]` | `Expr` enthält `Expr`; heute nur über Zeiger + Allokator |
 | 8 | **Methoden / `impl`** | `[ ]` | Kosmetik, ersetzbar durch freie Funktionen mit erstem Parameter |
 | 9 | **Schnittstellen / dynamischer Versand** | `[ ]` | Für Stufe 1 **nicht** nötig |
 | 10 | **Fehlerbehandlung** (`Result`, `?`) | `[ ]` | Ersetzbar durch Summentyp + `match`, sobald 6 steht |
 | 11 | **Prozessstart** (`fork`/`execve`-Hülle) | `[ ]` | `firnc` ruft `as` und `ld` auf |
-| 12 | **Dateizugriff** (`open`/`read`/`write`) | `[ ]` als Bibliothek | Quelle lesen, `.s` schreiben |
+| 12 | **Dateizugriff** (`open`/`read`/`write`) | **`[x]`** `lies_datei`, `lies_stdin`, `schreib_alles` in `lib/rt/` | Quelle lesen, `.s` schreiben |
 | 13 | **Veränderliche globale Zustände** | `[ ]` (nur `const`) | Umgehbar: Kontext-Struct durchreichen — der Rust-Code tut das schon fast überall |
 | 14 | **Aggregate an Funktionsgrenzen** | `[x]` seit Runde 2 | Strukturen als Parameter/Rückgabe |
 | 15 | **mehr als 6 Parameter** | `[x]` seit Runde 2 | `emit_inst(e, f, fr, i, …)` |
@@ -127,3 +127,38 @@ sind der ganze Unterschied zwischen „geht nicht" und „geht".
 Firn-Bibliotheken, beide mit eigenen Testprogrammen unter `tests/`. Erst danach
 lohnt sich der erste Compilerteil in Firn — und der ist der **Lexer**, weil er
 die kleinste Schnittstelle hat (Text hinein, Tokenfeld hinaus).
+
+---
+
+## 6. Was Runde 15 geliefert hat — `lib/rt/`
+
+Die drei Punkte, die oben am stärksten blockierten (1, 5, 12), stehen jetzt als
+**eine** Bibliothek in Firn: `lib/rt/rt.fi`.
+
+| Bereich | Funktionen |
+|---|---|
+| Speicher | `heap_alloc`, `heap_free`, `mem_copy`, `mem_set`, `mem_eq` |
+| Puffer | `Buf` mit `buf_push`, `buf_push_bytes`, `buf_reserve`, `buf_at`, `buf_len` |
+| Zahl → Text | `buf_push_dez_u64`, `buf_push_dez_i64`, `buf_push_hex_u64` |
+| Ein-/Ausgabe | `lies_datei`, `lies_stdin`, `schreib_alles`, `beende` |
+| Rohzugriff | `ld8`/`st8` … `ld64`/`st64` |
+
+Nachweis: `tests/610_rt.fi` — Allokation, 5.000 Byte durch mehrere
+Verdopplungen, Formatierung in Dezimal und Hex, eine Datei lesen und wieder
+ausgeben; in allen drei Baustufen.
+
+**Warum das zählt:** ein Compiler muss seine Quelle lesen, Text aufbauen und
+`.s` schreiben. Genau diese drei Dinge kann Firn jetzt ohne Rust und ohne libc.
+
+**Ehrlich dazu:**
+
+* Der Allokator gibt Speicher **seitenweise** an das Betriebssystem zurück und
+  hat keine Freiliste für kleine Blöcke. Für einen Compilerlauf ist das in
+  Ordnung (Arena-artig), für einen Dauerläufer nicht.
+* Diese Bibliothek **ersetzt die vorhandenen noch nicht**. `lib/html/mem.fi`,
+  `lib/str/alloc.fi` und `lib/gc/gc.fi` haben weiterhin ihre eigenen,
+  leicht verschiedenen Fassungen. Das Zusammenführen ist ein eigener Schritt
+  mit eigenem Risiko — es steht aus, und diese Zeile bleibt hier stehen, bis
+  es erledigt ist.
+* `Vec[T]` (typisiert, generisch) fehlt weiterhin. `rt.Buf` ist die
+  Byte-Fassung davon.
