@@ -284,6 +284,16 @@ else
     tail -20 "$WORK/fir_vergleich.log" | sed 's/^/   /'
 fi
 
+echo "== 16. Der Compiler in Firn uebersetzt, das Ergebnis laeuft (tools/selbst_vergleich.sh) =="
+bash tools/selbst_vergleich.sh > "$WORK/selbst_vergleich.log" 2>&1 && SBRC=0 || SBRC=$?
+if [ "$SBRC" -eq 0 ]; then
+    ok
+    grep -E '^(GLEICHES|ABWEICHEND|FEHLERHAFT|CODEGEN)' "$WORK/selbst_vergleich.log" | sed 's/^/   /'
+else
+    bad "tools/selbst_vergleich.sh schlug fehl (siehe .test-work/selbst_vergleich.log)"
+    tail -20 "$WORK/selbst_vergleich.log" | sed 's/^/   /'
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then
