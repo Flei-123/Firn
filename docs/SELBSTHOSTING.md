@@ -64,7 +64,7 @@ Sortiert nach „blockiert am meisten zuerst". `[ ]` = fehlt,
 | 8 | **Methoden / `impl`** | `[ ]` | Kosmetik, ersetzbar durch freie Funktionen mit erstem Parameter |
 | 9 | **Schnittstellen / dynamischer Versand** | `[ ]` | Für Stufe 1 **nicht** nötig |
 | 10 | **Fehlerbehandlung** (`Result`, `?`) | `[ ]` | Ersetzbar durch Summentyp + `match`, sobald 6 steht |
-| 11 | **Prozessstart** (`fork`/`execve`-Hülle) | `[ ]` | `firnc` ruft `as` und `ld` auf |
+| 11 | **Prozessstart** (`fork`/`execve`-Hülle) | `[~]` Aufrufargumente seit Runde 21 (`fn main(start: u64)`), `fork`/`execve` fehlen | `firnc` ruft `as` und `ld` auf |
 | 12 | **Dateizugriff** (`open`/`read`/`write`) | **`[x]`** `lies_datei`, `lies_stdin`, `schreib_alles` in `lib/rt/` | Quelle lesen, `.s` schreiben |
 | 13 | **Veränderliche globale Zustände** | `[ ]` (nur `const`) | Umgehbar: Kontext-Struct durchreichen — der Rust-Code tut das schon fast überall |
 | 14 | **Aggregate an Funktionsgrenzen** | `[x]` seit Runde 2 | Strukturen als Parameter/Rückgabe |
@@ -454,3 +454,104 @@ die Zeile bleibt in `tools/lex_vergleich.sh` stehen, bis sie da ist.
 `firnc1` als eigenständiges Programm fehlt Punkt 11 (`fork`/`execve`), weil
 `firnc` `as` und `ld` aufruft. Das ist der einzige Punkt der Liste, für den es
 keinen Umweg gibt.
+
+
+---
+
+## 11. Runde 21: `diag` in Firn — und der Beweis über die Fehlerausgabe
+
+`lib/firnc1/diag.fi` ist der zweite Compilerteil in Firn. Der Lexer **zählt**
+Fehler jetzt nicht mehr, er **meldet** sie — mit Datei, Zeile, Spalte,
+Quelltextzeile und Markierung, im verbindlichen Format aus `diag.rs`:
+
+```text
+error: in einem zeichenkettenliteral: \u{...} ist nicht abgeschlossen
+  --> tests/lexneg/u_escape.fi:3:23
+   |
+ 3 |     var b: [u8; 4] = "\u{}"
+   |                       ^ hier
+4 Fehler gefunden
+```
+
+### Der Vergleich prüft jetzt beide Ströme
+
+`tools/lex_vergleich.sh` vergleicht nicht mehr nur den Tokenstrom, sondern auch
+die **Fehlerausgabe** — Oktett für Oktett gegen `firnc0 --emit=tokens`.
+
+| | |
+|---|---:|
+| Dateien gleich (beide Ströme) | **306** |
+| davon mit Diagnosen | **10** |
+| verglichene Token | **216.489** |
+| abweichend | 1 (`1e308`, benannt) |
+| übersprungen (Modulbruchstück) | 2 |
+
+Die zehn Fälle in `tests/lexneg/` decken jede Meldung ab, die der Lexer
+erzeugen kann: unbekanntes Zeichen, Zahl zu groß, ungültige Ziffer zur Basis,
+offener Blockkommentar, offenes Literal, unbekannte Maskierung, `\x` ohne
+zwei Ziffern, `\u{...}` in allen vier Fehlerformen, ungepaartes Surrogat,
+`\u` in `b"..."`, Nicht-ASCII in `b"..."`, `\xFF` in `"..."` und leerer
+Exponent.
+
+### Was dafür an der Sprache fehlte: Aufrufargumente
+
+Eine Diagnose enthält den **Dateinamen** — also muss das Programm ihn
+entgegennehmen können. Firn konnte das nicht. Jetzt gibt es eine zweite
+erlaubte Form des Einstiegspunkts:
+
+```firn
+fn main(start: u64) -> i32
+```
+
+Beim Prozessstart zeigt `rsp` auf `[argc][argv0]..[argvN][0][envp..]`;
+`_start` legt diesen Zeiger nach `rdi`, also in den ersten Parameter. Ein
+Programm mit `fn main() -> i32` merkt davon nichts — es liest `rdi` nie.
+`lib/rt/rt.fi` bekommt dazu `arg_anzahl`, `arg_zeiger` und `c_laenge`; die
+argv-Zeichenketten sind nullabgeschlossen und damit genau das, was
+`lies_datei` erwartet. Nachweis: `tests/660_argumente.fi`.
+
+Das ist der erste Teil von Punkt 11 der Liste. `fork`/`execve` fehlen weiter —
+ohne sie kann `firnc1` `as` und `ld` nicht aufrufen.
+
+### Wie `diag` gebaut ist
+
+Dieselbe Form wie im Lexer: **Struktur der Felder**. Eine Diagnose besteht aus
+vier Zahlen (Datei, Zeile, Spalte, Länge) in `Vec[u32]` und drei Textstücken
+(Meldung, Markierungstext, Hinweis) als Versatz/Länge in **einem** Puffer.
+
+Zwei Dinge, die beim Nachbauen wichtig waren und die man leicht übersieht:
+
+* **Der Markierungsversatz zählt Zeichen, nicht Oktette** — und ein Tabulator
+  zählt als vier. Ohne beides steht das Dach hinter einem Umlaut oder hinter
+  einem Tabulator an der falschen Stelle.
+* **Doppelte Meldungen an derselben Stelle werden unterdrückt.** Ohne das
+  erzeugt die Fehlerwiederherstellung Reihen identischer Zeilen — und der
+  Vergleich mit `firnc0` fällt sofort um.
+
+Firn hat keine Textverkettung (Punkt 4 der Liste). Die Meldungen entstehen
+deshalb in einem `rt.Buf`: **der Puffer ist die Verkettung.** Zahlen kommen
+über `buf_push_dez_u64`, ein Zeichen der Quelle wird oktettweise kopiert, und
+für `U+{:04X}` steht eine eigene kleine Hexausgabe daneben.
+
+### Ehrliche Grenzen
+
+* `diag` kann bisher nur, was der Lexer braucht: `error` und `error_note` mit
+  der Markierung „hier". Frei wählbare Markierungstexte, mehrere Markierungen
+  je Diagnose und Farbausgabe gibt es nicht — `diag.rs` hat sie auch nicht.
+* Die Obergrenze von 40 Meldungen ist übernommen, aber nicht geprüft: kein
+  Testfall im Korpus erzeugt so viele Lexfehler.
+* `config` ist **nicht** portiert. Es sind drei Konstanten und eine Funktion;
+  ohne Textverkettung wäre `compiler_name()` mehr Aufwand als Nutzen. Der
+  Punkt bleibt offen, bis `Str` steht.
+
+### Stand
+
+| Teil | Stand |
+|---|---|
+| `lexer` | ✅ in Firn, gegen `firnc0` geprüft |
+| `diag` | ✅ in Firn, Fehlerausgabe gegen `firnc0` geprüft |
+| `config` | `[ ]` (braucht `Str`) |
+| `ast`, `parser`, … | `[ ]` |
+
+**Nächster Schritt:** der Parser. Er braucht einen AST — und damit zum ersten
+Mal rekursive Datenstrukturen über `Vec`-Indizes, genau wie in §2.4 geplant.
