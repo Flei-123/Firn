@@ -933,7 +933,7 @@ in diesem Dokument ist Zukunft und wird im README als „noch nicht" geführt.
 
 **Nicht enthalten (Stufe 0), Stand nach Runde 3:** `comptime`, `interface`,
 `drop`, Move-Prüfer, Referenztypen `&T`/`inout T` als geprüfte Typen
-(nur Rohzeiger), Arenen, Abwicklung/`throw`, Gleitkomma als Sprachtyp, `u128`,
+(nur Rohzeiger), Arenen, Abwicklung/`throw`, `f32`, `u128`,
 `Arc[T]`, Standardbibliothek, Nebenläufigkeit, Paketverwaltung, aarch64, WASM,
 LLVM-Backend. Nicht umgesetzte Typkonstruktoren melden einen eigenen Fehler mit
 Zeile/Spalte statt eines Syntaxfehlers (`Rc[T]`, `Weak[T]`, `Arc[T]`; Nachweis:
@@ -1193,6 +1193,56 @@ Zählverweis-Gegenprobe mit identischem Graphen braucht nach 2.000.000 Zyklen
   deshalb nur Zahlen über die Modulgrenze (siehe `lib/dom/soak_gc.fi`).
 * **Fragmentierung** bei wechselnden Objektgrößen ist ungeprüft; der Dauerlauf
   benutzt immer denselben Satz.
+
+#### 14.1.f64 — Gleitkomma (Runde 11)
+
+`f64` ist seit Runde 11 ein Sprachtyp: Literale (`1.5`, `1e3`, `1_000.25`,
+`1.5e-1`), die Grundrechenarten `+ - * /`, alle sechs Vergleiche, das
+Vorzeichen `-x` und die Umwandlungen `ganzzahl as f64` / `f64 as ganzzahl`
+(abschneidend Richtung null, wie in C). Nachweis: `tests/590_f64.fi` mit 29
+Prüfungen in allen drei Baustufen, darunter NaN, Unendlich und negative Null.
+
+**IEEE-754 wird eingehalten, auch im unbequemen Fall.** `ucomisd` setzt bei NaN
+`ZF=PF=CF=1` — der ungeordnete Fall sieht damit aus wie „kleiner oder gleich",
+und `nan < 1.0` lieferte im ersten Versuch **wahr**. Richtig ist falsch. Gelöst
+wird das nicht mit Nachrechnen am Paritätsflag, sondern durch **Vertauschen der
+Operanden**: `a < b` wird als `b > a` mit `seta` erzeugt, und `seta`/`setae`
+sind von sich aus ungeordnet-sicher. Nur `==` und `!=` brauchen zusätzlich
+`setnp`/`setp`.
+
+**Bewusst weggelassen, mit Begründung:**
+
+* **Kein `f32`.** Deshalb sind Gleitkommaliterale NICHT typlos — `1.5` ist
+  immer `f64`. Sobald `f32` dazukommt, wird daraus eine Ableitung aus dem
+  Zusammenhang.
+* **Kein `%`** (das wäre `fmod` und braucht eine Bibliotheksfunktion) und
+  **keine Bitoperationen** auf `f64` — auf einem Bitmuster haben sie keine
+  sinnvolle Bedeutung. Wer sie braucht, wandelt ausdrücklich in `u64` um.
+  Negativtest: `tests/neg/f64_kein_modulo.fi`.
+* **Keine implizite Umwandlung**, auch nicht zwischen `i64` und `f64`
+  (`tests/neg/f64_keine_implizite_umwandlung.fi`).
+* **Keine Konstantenfaltung.** Der Wert einer `Op::Const` mit `FTy::F64` ist
+  ein **Bitmuster**; die Faltung in `opt.rs` rechnet ganzzahlig und würde aus
+  `1.5 + 1.5` stillen Unsinn machen. Sie ist deshalb für jede Instruktion
+  gesperrt, an der ein `f64` beteiligt ist. Rundungstreue Faltung kommt mit
+  `comptime`.
+
+**Zwei ehrliche Einschränkungen der Umsetzung:**
+
+F1. **Keine Registerzuteilung für `f64`.** Der Linear Scan in `regalloc.rs`
+    kennt nur die Ganzzahlregister; `f64` lebt in den SSE-Registern und
+    bräuchte eine zweite Registerklasse mit eigenen Intervallen. Solange die
+    fehlt, geht **jede Funktion, in der ein `f64` vorkommt, über den
+    Grundpfad** in `codegen_x86.rs` — korrekt, aber ohne Registerzuteilung und
+    damit deutlich langsamer. Gerechnet wird in `xmm0`/`xmm1`, gelesen und
+    geschrieben über `rax`.
+
+F2. **Eigenes ABI statt System-V.** Ein `f64` wird als Bitmuster in den
+    GANZZAHL-Registern übergeben und zurückgegeben, nicht in `xmm0`–`xmm7`.
+    Innerhalb von Firn ist das durchgängig und korrekt; für Aufrufe fremder
+    Bibliotheken wäre es falsch. Firn ruft heute nichts Fremdes auf (kein
+    libc), und die Angleichung gehört zu F1 — beides braucht dieselbe
+    SSE-Registerklasse.
 
 #### 14.1.str — Zeichenketten und Zahlen ↔ Text (Runde 2, Modul `str`)
 

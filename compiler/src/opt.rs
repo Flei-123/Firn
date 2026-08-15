@@ -336,6 +336,7 @@ enum Key {
 /// Kennzahl eines FIR-Typs (fir::FTy leitet `Hash` nicht ab).
 fn tyk(t: FTy) -> u8 {
     match t {
+        FTy::F64 => 12,
         FTy::I8 => 1,
         FTy::I16 => 2,
         FTy::I32 => 3,
@@ -529,6 +530,14 @@ fn fold_constants(f: &mut Func, st: &mut OptStats) -> bool {
                 Some(d) => d,
                 None => continue,
             };
+            // GLEITKOMMA WIRD NIE GEFALTET. Der Wert einer `Op::Const` mit
+            // `FTy::F64` ist ein BITMUSTER; die Faltung hier rechnet
+            // ganzzahlig und wuerde aus `1.5 + 1.5` stillen Unsinn machen.
+            // Faltung von Gleitkomma braucht eine eigene, rundungstreue
+            // Auswertung — die kommt mit `comptime` (SPEC §8.6).
+            if ty == FTy::F64 || op_hat_f64(&op, f) {
+                continue;
+            }
             let folded = match op {
                 Op::Bin(bop, a, b) => match (consts.get(&a), consts.get(&b)) {
                     (Some(&x), Some(&y)) => fold_bin(ty, bop, x, y),
@@ -1077,5 +1086,17 @@ mod tests {
         optimize(&mut m);
         assert_eq!(m.funcs[0].inst_count(), 1);
         assert_eq!(consts_in(&m.funcs[0]), vec![-11]);
+    }
+}
+
+/// Faellt bei dieser Instruktion irgendwo ein `f64` an? Fuer die
+/// Konstantenfaltung ist das ein Ausschlusskriterium (siehe `fold_constants`).
+fn op_hat_f64(op: &Op, f: &Func) -> bool {
+    match op {
+        Op::Cmp { ty, .. } => *ty == FTy::F64,
+        Op::Cast { from, .. } => *from == FTy::F64,
+        Op::Bin(_, a, b) => f.val_ty(*a) == FTy::F64 || f.val_ty(*b) == FTy::F64,
+        Op::Un(_, a) => f.val_ty(*a) == FTy::F64,
+        _ => false,
     }
 }

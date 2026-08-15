@@ -26,6 +26,9 @@ pub enum FTy {
     U32,
     U64,
     Bool,
+    /// IEEE-754 binary64. Der Wert einer `Op::Const` ist das BITMUSTER als
+    /// u64 — FIR kennt keine Gleitkommaliterale, nur Bitmuster.
+    F64,
     /// Zeiger (immer 64 Bit, untypisiert in FIR)
     Ptr,
     /// kein Wert
@@ -38,7 +41,7 @@ impl FTy {
             FTy::I8 | FTy::U8 | FTy::Bool => 8,
             FTy::I16 | FTy::U16 => 16,
             FTy::I32 | FTy::U32 => 32,
-            FTy::I64 | FTy::U64 | FTy::Ptr => 64,
+            FTy::I64 | FTy::U64 | FTy::Ptr | FTy::F64 => 64,
             FTy::Void => 0,
         }
     }
@@ -59,6 +62,7 @@ impl FTy {
             FTy::U32 => "u32",
             FTy::U64 => "u64",
             FTy::Bool => "bool",
+            FTy::F64 => "f64",
             FTy::Ptr => "ptr",
             FTy::Void => "void",
         }

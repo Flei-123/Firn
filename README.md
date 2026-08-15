@@ -827,6 +827,43 @@ error: 'errdefer' und die weitergabe einer fertigen fehlerunion vertragen sich
 Nachweise: `tests/580_defer.fi` (fünf Abschnitte, alle drei Baustufen),
 `tests/neg/defer_return.fi`, `tests/neg/defer_break.fi`.
 
+## Gleitkomma `f64` (Runde 11)
+
+```firn
+fn flaeche(r: f64) -> f64 {
+    return 3.14159265358979 * r * r
+}
+
+let x: f64 = 1.5e-1
+let n: i64 = (2.99 as i64)      // 2 — abschneidend Richtung null
+```
+
+Literale (`1.5`, `1e3`, `1_000.25`), `+ - * /`, alle sechs Vergleiche, `-x`,
+Umwandlungen in beide Richtungen. **29 Prüfungen** in `tests/590_f64.fi`,
+in allen drei Baustufen — darunter NaN, Unendlich und negative Null.
+
+**Der Fehler, den IEEE-754 verlangt:** `ucomisd` setzt bei NaN `ZF=PF=CF=1`.
+Der ungeordnete Fall sieht damit aus wie „kleiner oder gleich", und im ersten
+Versuch lieferte `nan < 1.0` **wahr**. Gelöst nicht durch Nachrechnen am
+Paritätsflag, sondern durch **Vertauschen der Operanden**: `a < b` wird als
+`b > a` mit `seta` erzeugt — und `seta`/`setae` sind von sich aus
+ungeordnet-sicher.
+
+**Zwei Einschränkungen, klar benannt:**
+
+* **Keine Registerzuteilung für `f64`** — der Linear Scan kennt nur die
+  Ganzzahlregister. Jede Funktion mit `f64` geht über den Grundpfad: korrekt,
+  aber ohne Registerzuteilung und damit langsam.
+* **Eigenes ABI** — `f64` wird als Bitmuster in Ganzzahlregistern übergeben,
+  nicht in `xmm0`–`xmm7`. Innerhalb von Firn durchgängig; für fremde
+  Bibliotheken wäre es falsch. Firn ruft heute nichts Fremdes auf.
+
+Beides gehört zusammen und braucht dieselbe SSE-Registerklasse.
+
+**Kein `f32`** — deshalb sind Gleitkommaliterale nicht typlos: `1.5` ist immer
+`f64`. Kein `%` (wäre `fmod`), keine Bitoperationen auf Gleitkomma, keine
+implizite Umwandlung.
+
 ## Speichermodell: Opt-in-Tracing-GC und der DOM-Dauerlauf (Runde 4)
 
 Die wichtigste offene Designfrage aus `DESIGNZIELE.md` ist entschieden **und
