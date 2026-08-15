@@ -111,6 +111,52 @@ pub(crate) fn fn_template(name: &str) -> Option<FnTemplate> {
     REG.with(|r| r.borrow().fns.get(name).cloned())
 }
 
+/// Namen aller generischen Vorlagen, die in Datei `file` deklariert wurden.
+///
+/// Gebraucht von `modules.rs`: die Vorlagen liegen NICHT in `Program::funcs`,
+/// sondern hier — das Modul-Umschreiben erreichte sie deshalb nie, und eine
+/// Vorlage sah nur die Namen der Wurzeldatei
+/// (docs/SELBSTHOSTING.md §7, Blocker B2).
+pub(crate) fn fn_vorlagen_der_datei(file: u32) -> Vec<String> {
+    REG.with(|r| {
+        r.borrow()
+            .fns
+            .iter()
+            .filter(|(_, t)| t.decl.span.file == file)
+            .map(|(n, _)| n.clone())
+            .collect()
+    })
+}
+
+pub(crate) fn struct_vorlagen_der_datei(file: u32) -> Vec<String> {
+    REG.with(|r| {
+        r.borrow()
+            .structs
+            .iter()
+            .filter(|(_, t)| t.decl.span.file == file)
+            .map(|(n, _)| n.clone())
+            .collect()
+    })
+}
+
+/// Aendert eine Funktionsvorlage an Ort und Stelle.
+pub(crate) fn mit_fn_vorlage<F: FnOnce(&mut crate::ast::FnDecl)>(name: &str, f: F) {
+    REG.with(|r| {
+        if let Some(t) = r.borrow_mut().fns.get_mut(name) {
+            f(&mut t.decl);
+        }
+    });
+}
+
+/// Aendert eine Structvorlage an Ort und Stelle.
+pub(crate) fn mit_struct_vorlage<F: FnOnce(&mut crate::ast::StructDecl)>(name: &str, f: F) {
+    REG.with(|r| {
+        if let Some(t) = r.borrow_mut().structs.get_mut(name) {
+            f(&mut t.decl);
+        }
+    });
+}
+
 pub(crate) fn struct_template(name: &str) -> Option<StructTemplate> {
     REG.with(|r| r.borrow().structs.get(name).cloned())
 }
