@@ -555,3 +555,119 @@ für `U+{:04X}` steht eine eigene kleine Hexausgabe daneben.
 
 **Nächster Schritt:** der Parser. Er braucht einen AST — und damit zum ersten
 Mal rekursive Datenstrukturen über `Vec`-Indizes, genau wie in §2.4 geplant.
+
+
+---
+
+## 12. Runde 22: der Parser der Kernsprache in Firn
+
+`lib/firnc1/ast.fi` und `lib/firnc1/parser.fi` sind der dritte und vierte Teil
+von Stufe 1. Damit ist die Kette **Text → Token → Baum** vollständig in Firn
+geschrieben.
+
+### Der Baum liegt in `Vec`, nicht in Zeigern
+
+§2.4 sagt seit der ersten Fassung, wie der AST gebaut sein muss: rekursive
+Bäume über `Vec`-Indizes. `ast.Baum` hält dreiunddreißig `Vec` mit festen
+Plätzen je Knotenart:
+
+| | |
+|---|---|
+| Ausdruck | `e_art` · `e_a` · `e_b` · `e_c` · `e_zahl` |
+| Anweisung | `s_art` · `s_a` · `s_b` · `s_c` · `s_d` |
+| Typ | `t_art` · `t_a` · `t_b` |
+| Block | `b_off` · `b_len` → Bereich in `sliste` |
+
+Kinderlisten veränderlicher Länge (Aufrufargumente, Arrayelemente,
+Structfelder) liegen hintereinander in **einem** `Vec`; der Knoten merkt sich
+Versatz und Anzahl. Kein Allokator je Knoten, keine Freigabereihenfolge, kein
+Zerstörer — `baum_frei` gibt alles in einem Zug frei.
+
+### Der Fehler, der genau daraus entstand
+
+Der naheliegende Weg — jedes Argument sofort an `kinder` anhängen — ist
+**falsch**, sobald ein Argument selbst einen Aufruf enthält: dessen Argumente
+landen dann mitten in der äußeren Liste. Aus
+
+```firn
+rt.buf_push_bytes(b, intern.intern_zeiger(it, nr), intern.intern_laenge(it, nr))
+```
+
+wurde ein Aufruf mit **sieben** Argumenten statt drei. Der Vergleich mit
+`firnc0` hat das in der ersten Runde gefunden, an genau der Datei, die den
+Vergleich selbst druckt. Die Kinderliste wird jetzt erst gesammelt und dann am
+Stück abgelegt.
+
+### Der Maßstab: `--emit=ast-kanon`
+
+`--emit=ast` ist Rusts `{:#?}` — an `Box`, `Some`/`None` und Feldnamen
+gebunden. Ein Parser in einer anderen Sprache kann das nicht nachbauen, ohne
+Rusts Debug-Ausgabe nachzuäffen; dann prüft der Vergleich die Formatierung
+statt den Baum. `compiler/src/ast_kanon.rs` erzeugt deshalb eine
+**sprachneutrale** geklammerte Form:
+
+```text
+(fn u64_nach_f64 ((param m u64)) f64 (blk (ret (as (id m) f64))))
+```
+
+Gedruckt wird **nur die Wurzeldatei**, vor dem Zusammenführen der Module und
+vor der Monomorphisierung — der Parser in Firn sieht ebenfalls genau eine
+Datei.
+
+### Ergebnis
+
+`tools/parser_vergleich.sh`, Abschnitt 12 in `test.sh`:
+
+| | |
+|---|---:|
+| Bäume gleich | **166** |
+| abweichend | 1 (`1e308`, bekannt aus Runde 20 — ein **Lexer**fall) |
+| nicht Kernsprache | 109 |
+| übersprungen (`firnc0` kommt selbst nicht durch) | 36 |
+
+### Was der Parser NICHT kann — gezählt, nicht übergangen
+
+Alles, was seinen Baum außerhalb von `Program` hält: `enum`/`match`,
+Fehlerunionen (`E!T`, `try`, `catch`), generische Vorlagen, `gc class`,
+Attribute, `comptime`. Eine Vorabsuche im Tokenstrom erkennt diese Dateien am
+Muster (`::`, `?`, `IDENT !`, `fn name[`, der Bezeichner `gc`) und meldet
+Rückgabewert 3 — sie zählen als **109 „nicht Kern"** und verschwinden nicht
+still in einer Erfolgszahl.
+
+Ebenfalls nicht portiert: die **Fehlerwiederherstellung**. `firnc0` sammelt bis
+zu vierzig Meldungen und liest weiter; dieser Parser meldet die erste und hört
+auf. Für den Vergleich ohne Belang — er läuft nur über Quellen, die `firnc0`
+fehlerfrei liest —, für einen echten Compiler nicht.
+
+Und: **Quellpositionen stehen nicht in der kanonischen Form.** Sie gehören zum
+Baum, aber ihre Zusammensetzung (`Parser::join` über Teilausdrücke) ist eine
+eigene Verabredung. Der Baum stimmt; ob jede Spanne stimmt, ist noch nicht
+geprüft.
+
+### Eine Regel, die man leicht übersieht
+
+Ein Operator am **Zeilenanfang** setzt den Ausdruck nicht fort, solange keine
+Klammer offen ist. Deshalb ist
+
+```firn
+a
+- b
+```
+
+zwei Anweisungen und keine Subtraktion. Dieselbe Regel hatte mich beim
+Schreiben von `diag.fi` schon einmal erwischt (Runde 21, mehrzeilige
+`&&`-Bedingung); im Parser steht sie jetzt als `weiter()`.
+
+### Stand
+
+| Teil | Stand |
+|---|---|
+| `lexer` | ✅ in Firn, gegen `firnc0` geprüft |
+| `diag` | ✅ in Firn, Fehlerausgabe geprüft |
+| `ast` + `parser` | ✅ Kernsprache, 166 Bäume gleich |
+| `config` | `[ ]` (braucht `Str`) |
+| `types`, `sema`, `fir`, `lower`, `codegen` | `[ ]` |
+
+**Nächster Schritt:** `types` und `abi` — §3 nennt sie als die Dateien, die
+schon heute vollständig in Firn schreibbar wären (reine Fallunterscheidung auf
+Typ und Größe). Danach wird es ernst: `sema`.
