@@ -284,7 +284,12 @@ fn run(opts: &Options) -> i32 {
     // angehaengt — danach sieht der Typpruefer keinen Unterschied zu von Hand
     // geschriebenem Quelltext. Genau das verlangt Abnahmepunkt 6 fuer die
     // Unicode-, Web-IDL- und CSS-Tabellen eines Browsers.
-    let erzeugt = comptime::fuehre_bloecke_aus(&prog, &mut dg);
+    let basis = root
+        .path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let erzeugt = comptime::fuehre_bloecke_aus(&prog, &mut dg, &basis);
     if !erzeugt.is_empty() && !dg.has_errors() {
         let datei = dg.add_file("<comptime>", &erzeugt);
         // Dieselbe Datei muss auch die Zeilentabelle kennen, sonst erzeugt der

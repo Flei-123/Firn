@@ -69,6 +69,11 @@ pub(crate) struct Ausfuehrung<'a> {
     schritte: u64,
     /// Von `emit_*` aufgebauter Quelltext.
     pub(crate) ausgabe: String,
+    /// Verzeichnis der Wurzelquelldatei — der EINZIGE Ort, aus dem
+    /// `datei_*` lesen darf.
+    basis: std::path::PathBuf,
+    /// Einmal gelesene Dateien; eine Tabelle wird Byte fuer Byte abgefragt.
+    dateien: HashMap<String, Vec<u8>>,
 }
 
 impl<'a> Ausfuehrung<'a> {
@@ -77,7 +82,15 @@ impl<'a> Ausfuehrung<'a> {
         consts: &'a HashMap<String, (Type, i128)>,
         expr_types: &'a [Type],
     ) -> Ausfuehrung<'a> {
-        Ausfuehrung { prog, consts, expr_types, schritte: 0, ausgabe: String::new() }
+        Ausfuehrung {
+            prog,
+            consts,
+            expr_types,
+            schritte: 0,
+            ausgabe: String::new(),
+            basis: std::path::PathBuf::from("."),
+            dateien: HashMap::new(),
+        }
     }
 
     /// Ruft `name` mit bereits ausgewerteten Argumenten auf.
@@ -275,6 +288,50 @@ impl<'a> Ausfuehrung<'a> {
         }
     }
 
+    /// Liest eine Datendatei — EINMAL, danach aus dem Zwischenspeicher.
+    ///
+    /// SICHERHEIT (DESIGNZIELE §3): Uebersetzungszeit-Dateizugriff ist ein
+    /// Einfallstor fuer Lieferketten-Angriffe — eine eingebundene Bibliothek
+    /// koennte sonst beim Bauen `/etc/passwd` lesen und in den erzeugten Code
+    /// schreiben. Deshalb gilt hier eine harte Regel:
+    ///
+    ///   * nur RELATIV zur Wurzelquelldatei,
+    ///   * kein `..` an irgendeiner Stelle,
+    ///   * kein absoluter Pfad, kein Laufwerks- oder Wurzelpraefix.
+    ///
+    /// Das ist bewusst enger als noetig. Wenn Firn ein Modulsystem mit
+    /// Faehigkeiten bekommt (DESIGNZIELE §3), wird daraus eine Erlaubnis, die
+    /// ein Modul ausdruecklich anfordern muss.
+    fn lies_datei(&mut self, pfad: &str, span: Span) -> Result<&Vec<u8>, Fehler> {
+        if !self.dateien.contains_key(pfad) {
+            if pfad.is_empty() {
+                return Err((span, "comptime: leerer dateiname".to_string()));
+            }
+            let p = std::path::Path::new(pfad);
+            if p.is_absolute() || pfad.starts_with('/') || pfad.starts_with('\\') {
+                return Err((
+                    span,
+                    format!("comptime: '{}' ist ein absoluter pfad — erlaubt sind nur pfade relativ zur quelldatei", pfad),
+                ));
+            }
+            if p.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+                return Err((
+                    span,
+                    format!("comptime: '{}' enthaelt '..' — der zugriff bleibt im verzeichnis der quelldatei", pfad),
+                ));
+            }
+            let voll = self.basis.join(p);
+            let inhalt = std::fs::read(&voll).map_err(|e| {
+                (
+                    span,
+                    format!("comptime: '{}' ist nicht lesbar: {}", voll.display(), e),
+                )
+            })?;
+            self.dateien.insert(pfad.to_string(), inhalt);
+        }
+        Ok(&self.dateien[pfad])
+    }
+
     fn expr(
         &mut self,
         e: &Expr,
@@ -333,6 +390,30 @@ impl<'a> Ausfuehrung<'a> {
                     let text = literal_text(args, e.span)?;
                     self.ausgabe.push_str(&text);
                     return Ok(0);
+                }
+                // DATENZUGRIFF ZUR UEBERSETZUNGSZEIT (SPEC §6.4).
+                //
+                // Genau dafuer verlangt Abnahmepunkt 6 die Unicode-Tabelle
+                // „aus der UCD": eine Datendatei wird gelesen und daraus
+                // entsteht Quelltext. Die Datei wird byteweise abgefragt —
+                // damit braucht der Interpreter weder Zeichenketten noch
+                // Arrays.
+                if name == "datei_groesse" {
+                    let pfad = literal_text(args, e.span)?;
+                    let inhalt = self.lies_datei(&pfad, e.span)?;
+                    return Ok(inhalt.len() as i128);
+                }
+                if name == "datei_byte" {
+                    if args.len() != 2 {
+                        return nein("'datei_byte' erwartet pfad und index");
+                    }
+                    let pfad = literal_text(&args[..1], e.span)?;
+                    let idx = self.expr(&args[1], umg, tiefe)?;
+                    let inhalt = self.lies_datei(&pfad, e.span)?;
+                    if idx < 0 || idx >= inhalt.len() as i128 {
+                        return Ok(-1);
+                    }
+                    return Ok(inhalt[idx as usize] as i128);
                 }
                 if name == "emit_zahl" {
                     if args.len() != 1 {
@@ -438,7 +519,11 @@ fn literal_text(args: &[Expr], span: Span) -> Result<String, Fehler> {
 /// Der Lauf findet VOR der Typpruefung statt: die Bloecke duerfen deshalb keine
 /// programmweiten Konstanten benutzen, wohl aber jede Funktion des Programms
 /// aufrufen. Ehrlich benannt in SPEC §14.1.comptime.
-pub(crate) fn fuehre_bloecke_aus(prog: &Program, dg: &mut crate::diag::Diags) -> String {
+pub(crate) fn fuehre_bloecke_aus(
+    prog: &Program,
+    dg: &mut crate::diag::Diags,
+    basis: &std::path::Path,
+) -> String {
     if prog.comptime_bloecke.is_empty() {
         return String::new();
     }
@@ -447,6 +532,7 @@ pub(crate) fn fuehre_bloecke_aus(prog: &Program, dg: &mut crate::diag::Diags) ->
     let mut gesamt = String::new();
     for (b, _span) in &prog.comptime_bloecke {
         let mut lauf = Ausfuehrung::neu(prog, &leer_consts, &leer_typen);
+        lauf.basis = basis.to_path_buf();
         let mut umg: Vec<HashMap<String, i128>> = vec![HashMap::new()];
         match lauf.block(b, &mut umg, 0) {
             Ok(_) => gesamt.push_str(&lauf.ausgabe),

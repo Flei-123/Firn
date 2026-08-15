@@ -1256,11 +1256,27 @@ aufrufen. Der erzeugte Text bekommt eine eigene Dateinummer (`<comptime>`) in
 Diagnosen *und* in der Zeilentabelle — fehlt Letzteres, erzeugt der
 Codegenerator `.loc`-Direktiven mit einer Nummer, die `as` nicht kennt.
 
-**Was zu Abnahmepunkt 6 weiterhin fehlt:** ein **Datenzugriff zur
-Übersetzungszeit**. Die Abnahme verlangt eine Unicode-Tabelle *aus der UCD*;
-`comptime` kann heute nur aus Regeln erzeugen, die im Quelltext stehen, nicht
-aus einer Datei lesen. Das ist die letzte Lücke dieses Punktes und bewusst
-nicht überstrichen.
+**Datenzugriff zur Übersetzungszeit (Runde 14).** `datei_groesse("pfad")` und
+`datei_byte("pfad", i)` lesen eine Datendatei, während der Compiler läuft.
+Byteweise — damit braucht der Interpreter weder Zeichenketten noch Arrays.
+`tests/602_comptime_ucd.fi` liest eine Datei im Format von `UnicodeData.txt`
+(semikolongetrennte Felder, Codepunkt in Feld 0, Großschreibung in Feld 12) und
+erzeugt daraus die Nachschlagefunktion `ucd_gross`.
+
+**SICHERHEIT — und zwar von Anfang an.** Dateizugriff zur Übersetzungszeit ist
+ein Einfallstor für Lieferketten-Angriffe: eine eingebundene Bibliothek könnte
+sonst beim Bauen `/etc/passwd` lesen und den Inhalt in den erzeugten Code
+schreiben. Deshalb gilt:
+
+* nur **relativ zur Wurzelquelldatei**,
+* **kein `..`** an irgendeiner Stelle des Pfades,
+* **kein absoluter Pfad**.
+
+Beides wird abgewiesen, mit Meldung und Quellposition
+(`tests/neg/comptime_datei_absolut.fi`, `comptime_datei_eltern.fi`). Das ist
+bewusst enger als nötig; wenn Firn das Fähigkeitenmodell aus `DESIGNZIELE.md`
+§3 bekommt, wird daraus eine Erlaubnis, die ein Modul ausdrücklich anfordern
+muss.
 
 #### 14.1.f64 — Gleitkomma (Runde 11)
 
