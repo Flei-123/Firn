@@ -867,3 +867,95 @@ Verlust hat eine halbe Runde gekostet.
 **Nächster Schritt:** `fir` und `lower` — vom geprüften Baum zur
 Zwischendarstellung. Der Maßstab liegt schon bereit: `firnc0 --emit=fir-raw`
 druckt die FIR vor jeder Optimierung.
+
+
+---
+
+## 15. Runde 25: `fir` und `lower` — die Zwischendarstellung in Firn
+
+`lib/firnc1/fir.fi` und `lib/firnc1/lower.fi` sind der siebte und achte Teil
+von Stufe 1. Damit reicht die Kette in Firn von **Text bis zur
+Zwischendarstellung**: Token → Baum → Typen → **FIR**.
+
+### Der schärfste Vergleich der ganzen Reihe
+
+`firnc0 --emit=fir-raw` druckt die FIR **direkt nach dem Lowering**, vor jeder
+Optimierung. Verglichen wird der Text Oktett für Oktett — und der enthält
+alles, worauf es ankommt: Wertnummern, Blocknummern, Reihenfolge der
+Instruktionen, Terminatoren. Zwei Wertnummern in anderer Reihenfolge, ein Block
+zu viel oder zu wenig, und der Text stimmt nicht mehr.
+
+| | |
+|---|---:|
+| Dateien mit identischer FIR | **66** |
+| verglichene Instruktionen | **2.129** |
+| abweichend | 1 (`1e308`, bekannt aus Runde 20) |
+| Aggregate oder `defer` (nicht portiert) | 48 |
+| nicht Kernsprache | 35 |
+| übersprungen (`firnc0` übersetzt nicht einzeln) | 172 |
+
+### Zwei Dinge, die man nicht raten kann
+
+**Die Wertnummern folgen dem Anlegen, die gedruckte Reihenfolge nicht.** Jede
+`alloca` wandert an den Anfang des Eintrittsblocks, ihre Nummer bleibt aber
+dort, wo sie entstanden ist. Deshalb steht in `main`
+
+```text
+%0 = alloca.ptr size=4 align=4
+%2 = alloca.ptr size=4 align=4
+%1 = const.i32 0
+```
+
+— `%1` ist zwischen den beiden Allocas entstanden und wird trotzdem danach
+gedruckt. Wer die Allocas einfach vorn erzeugt, bekommt andere Nummern.
+
+**Nach `return`, `break` und `continue` beginnt ein neuer, unerreichbarer
+Block.** Er bleibt im Text stehen (`bb7`, `bb8` …); die Codebereinigung
+entfernt ihn erst später. Wer ihn weglässt, bekommt einen anderen Text.
+
+### Drei Fehler, die der Vergleich sofort gefunden hat
+
+* **Argumentlisten schoben sich ineinander.** `zwei(zwei(1,2), zwei(3,4))` —
+  die Argumente des inneren Aufrufs landeten mitten in der Liste des äußeren.
+  Derselbe Fehler wie beim Parser in Runde 22, an derselben Ursache: eine
+  gemeinsame Kinderliste, in die während des Sammelns geschrieben wird.
+  Wieder gilt: erst sammeln, dann am Stück ablegen.
+* **Ein Aufruf ohne Rückgabewert darf keinen Wert definieren.** `call.void`
+  steht ohne `%n =` da; wer trotzdem eine Nummer vergibt, verschiebt alle
+  folgenden.
+* **`const.u64 18446744073709551615` wurde zu `const.u64 -1`.** Im Rust-Compiler
+  steht dort ein `i128`, der den Wert druckt, wie er ist. Vorzeichen gehört nur
+  zu vorzeichenbehafteten Typen.
+
+### Was NICHT portiert ist — gezählt, nicht übergangen
+
+* **Aggregate**: Structs und Arrays als Wert, als Argument, als Rückgabe, ihre
+  Literale. Das hängt an der Aufrufkonvention (Wörter gegen Speicher, `sret`)
+  und an `write_into` — ein eigener Schritt. **48 Dateien** fallen dadurch
+  heraus, und das ist mit Abstand der größte offene Posten.
+* **`defer` und `errdefer`**: sie brauchen einen Stapel je Blockebene und
+  müssen bei `return`, `break` und `continue` in der richtigen Tiefe ablaufen.
+* Die Zeilentabelle für `.debug_line` (`dwarf.rs`) — sie ändert den FIR-Text
+  nicht, gehört aber zum Lowering.
+
+### `tests/690_lowering_kern.fi`
+
+Fährt die Formen ab, an denen Nummerierung und Blockbildung hängen:
+verschachtelte Aufrufe, Aufruf ohne Rückgabewert, Kurzschluss mit `&&`/`||`,
+`while` mit `break` und `continue`, `for` mit `continue` (der Fortschaltblock
+muss trotzdem laufen), Verschiebung mit ungleich breitem rechten Operanden, der
+größte `u64`-Wert und Zeiger auf Zeiger.
+
+### Stand
+
+| Teil | Stand |
+|---|---|
+| `lexer` · `diag` · `ast` + `parser` · `types` + `abi` · `sema` | ✅ |
+| `fir` | ✅ Struktur und Textform |
+| `lower` | ✅ skalarer Kern · `[ ]` Aggregate, `defer` |
+| `config` | `[ ]` (braucht `Str`) |
+| `codegen_x86` | `[ ]` |
+
+**Nächster Schritt:** Aggregate im Lowering — das schließt die 48 Dateien auf
+und ist die Voraussetzung dafür, dass `firnc1` sich selbst übersetzen könnte.
+Danach bleibt der Codegenerator.
