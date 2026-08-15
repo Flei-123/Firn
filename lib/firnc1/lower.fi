@@ -1,0 +1,701 @@
+// lib/firnc1/lower.fi — VOM GEPRUEFTEN BAUM ZUR FIR, IN FIRN.
+//
+// Achter Teil von Stufe 1: die Portierung von `compiler/src/lower.rs`.
+//
+// UMFANG: der SKALARE Kern. Was ein Aggregat als Wert bewegt — Structs und
+// Arrays in Variablen, als Argument, als Rueckgabe, ihre Literale — ist NICHT
+// dabei; ebenso wenig `defer`. Solche Dateien werden gezaehlt, nicht
+// uebergangen. Der Grund fuer den Schnitt: Aggregate haengen an der
+// Aufrufkonvention (`abi.fi`) und an `write_into`, und beides ist ein eigener
+// Schritt. Skalare decken den Rumpf des Compilers ab — Zaehler, Zeiger,
+// Vergleiche, Schleifen, Aufrufe.
+//
+// ZWEI DINGE, DIE MAN NICHT RATEN KANN und die deshalb genau nachgebaut sind:
+//
+//  1. Die WERTNUMMERN folgen der Reihenfolge des ANLEGENS, die gedruckte
+//     Reihenfolge aber nicht: jede `alloca` wandert an den Anfang des
+//     Eintrittsblocks. `%0 = alloca` und `%2 = alloca` koennen deshalb
+//     untereinander stehen, obwohl `%1` dazwischen entstanden ist.
+//  2. Nach `return`, `break` und `continue` wird ein NEUER, unerreichbarer
+//     Block geoeffnet. Er bleibt im Text stehen (bb7, bb8 …) — die
+//     Codebereinigung entfernt ihn erst spaeter. Wer ihn weglaesst, bekommt
+//     einen anderen Text.
+
+import rt
+import vec
+import intern
+import ast
+import typen
+import sema
+import fir
+
+export { Lower, low_neu, low_frei, low_lauf, low_fehler, low_fir, low_ungeeignet }
+
+const KEIN: u32 = 4294967295
+
+struct Lower {
+    b: u64              // Baum
+    it: u64             // Interner
+    sm: u64             // Sema
+    f: fir.Fir
+    fi: u32             // laufende Funktion
+    cur: u32            // laufender Block
+    v_name: Vec[u32]    // Bereiche: Name -> Platz
+    v_slot: Vec[u32]
+    b_grenze: Vec[u32]
+    l_break: Vec[u32]   // Schleifenziele
+    l_cont: Vec[u32]
+    sret: u32
+    fehler: usize
+    ungeeignet: bool    // Aggregat oder `defer` gefunden
+}
+
+fn low_neu(b: u64, it: u64, sm: u64) -> Lower {
+    return Lower{
+        b: b, it: it, sm: sm,
+        f: fir.fir_neu(),
+        fi: 0, cur: 0,
+        v_name: vec_neu[u32](), v_slot: vec_neu[u32](), b_grenze: vec_neu[u32](),
+        l_break: vec_neu[u32](), l_cont: vec_neu[u32](),
+        sret: KEIN, fehler: 0, ungeeignet: false,
+    }
+}
+
+fn low_frei(l: *mut Lower) {
+    fir.fir_frei(&(*l).f)
+    vec_frei[u32](&(*l).v_name)
+    vec_frei[u32](&(*l).v_slot)
+    vec_frei[u32](&(*l).b_grenze)
+    vec_frei[u32](&(*l).l_break)
+    vec_frei[u32](&(*l).l_cont)
+}
+
+fn low_fehler(l: *mut Lower) -> usize { return (*l).fehler }
+fn low_ungeeignet(l: *mut Lower) -> bool { return (*l).ungeeignet }
+fn low_fir(l: *mut Lower) -> *mut fir.Fir { return &(*l).f }
+
+fn baum(l: *mut Lower) -> *mut ast.Baum { return (*l).b as *mut ast.Baum }
+fn sm(l: *mut Lower) -> *mut sema.Sema { return (*l).sm as *mut sema.Sema }
+fn tf(l: *mut Lower) -> *mut typen.Typen { return sema.sema_typen(sm(l)) }
+
+fn aufgeben(l: *mut Lower) {
+    (*l).ungeeignet = true
+}
+
+// ------------------------------------------------- Typen: Quelle -> FIR
+
+fn ist_aggregat(l: *mut Lower, t: u32) -> bool {
+    let k: u32 = typen.ty_art(tf(l), t)
+    return k == typen.K_ARR || k == typen.K_STRUCT
+}
+
+// FIR-Typ eines skalaren Quelltyps; fir.KEIN bei einem Aggregat.
+fn fty(l: *mut Lower, t: u32) -> u32 {
+    let k: u32 = typen.ty_art(tf(l), t)
+    if k == typen.K_I8 { return fir.T_I8 }
+    if k == typen.K_I16 { return fir.T_I16 }
+    if k == typen.K_I32 { return fir.T_I32 }
+    if k == typen.K_I64 { return fir.T_I64 }
+    if k == typen.K_ISIZE { return fir.T_I64 }
+    if k == typen.K_U8 { return fir.T_U8 }
+    if k == typen.K_U16 { return fir.T_U16 }
+    if k == typen.K_U32 { return fir.T_U32 }
+    if k == typen.K_U64 { return fir.T_U64 }
+    if k == typen.K_USIZE { return fir.T_U64 }
+    if k == typen.K_BOOL { return fir.T_BOOL }
+    if k == typen.K_F64 { return fir.T_F64 }
+    if k == typen.K_PTR { return fir.T_PTR }
+    if k == typen.K_VOID { return fir.T_VOID }
+    return fir.KEIN
+}
+
+fn e_fty(l: *mut Lower, e: u32) -> u32 {
+    return fty(l, sema.sema_typ(sm(l), e))
+}
+
+// ------------------------------------------------------------- Bausteine
+
+fn push(l: *mut Lower, art: u32, ty: u32, a: u32, b: u32, c: u32, z: u64, aoff: u32, alen: u32) -> u32 {
+    return fir.inst_dazu(&(*l).f, (*l).fi, (*l).cur, art, ty, a, b, c, z, aoff, alen)
+}
+
+fn push_void(l: *mut Lower, art: u32, ty: u32, a: u32, b: u32, c: u32, z: u64, aoff: u32, alen: u32) {
+    fir.inst_void_dazu(&(*l).f, (*l).fi, (*l).cur, art, ty, a, b, c, z, aoff, alen)
+}
+
+fn konst(l: *mut Lower, ty: u32, v: u64) -> u32 {
+    return push(l, fir.O_CONST, ty, 0, 0, 0, v, 0, 0)
+}
+
+fn lade(l: *mut Lower, ty: u32, adr: u32) -> u32 {
+    return push(l, fir.O_LOAD, ty, adr, 0, 0, 0, 0, 0)
+}
+
+fn speichere(l: *mut Lower, ty: u32, adr: u32, wert: u32) {
+    push_void(l, fir.O_STORE, ty, adr, wert, 0, 0, 0, 0)
+}
+
+fn alloca(l: *mut Lower, groesse: u64, ausricht: u64) -> u32 {
+    return fir.alloca_dazu(&(*l).f, (*l).fi, groesse, ausricht)
+}
+
+fn neuer_block(l: *mut Lower) -> u32 {
+    return fir.block_neu(&(*l).f, (*l).fi)
+}
+
+fn term(l: *mut Lower, art: u32, t1: u32, t2: u32, t3: u32) {
+    fir.term_setzen(&(*l).f, (*l).fi, (*l).cur, art, t1, t2, t3)
+}
+
+fn terminiert(l: *mut Lower) -> bool {
+    return fir.ist_terminiert(&(*l).f, (*l).fi, (*l).cur)
+}
+
+// ------------------------------------------------------------- Bereiche
+
+fn bereich_auf(l: *mut Lower) {
+    vec_push[u32](&(*l).b_grenze, vec_len[u32](&(*l).v_name) as u32)
+}
+
+fn bereich_zu(l: *mut Lower) {
+    let g: u32 = vec_letztes[u32](&(*l).b_grenze)
+    vec_pop[u32](&(*l).b_grenze)
+    while vec_len[u32](&(*l).v_name) > g as usize {
+        vec_pop[u32](&(*l).v_name)
+        vec_pop[u32](&(*l).v_slot)
+    }
+}
+
+fn anlegen(l: *mut Lower, name: u32, slot: u32) {
+    vec_push[u32](&(*l).v_name, name)
+    vec_push[u32](&(*l).v_slot, slot)
+}
+
+fn suchen(l: *mut Lower, name: u32) -> u32 {
+    var i: usize = vec_len[u32](&(*l).v_name)
+    while i > 0 {
+        i = i - 1
+        if vec_at[u32](&(*l).v_name, i) == name {
+            return vec_at[u32](&(*l).v_slot, i)
+        }
+    }
+    return KEIN
+}
+
+// --------------------------------------------------------------- Adressen
+
+// Adresse eines zuweisbaren Ausdrucks.
+fn adresse(l: *mut Lower, e: u32) -> u32 {
+    let b: *mut ast.Baum = baum(l)
+    let a: u32 = ast.e_art(b, e)
+    if a == ast.E_ID {
+        let slot: u32 = suchen(l, ast.e_a(b, e))
+        if slot != KEIN {
+            return slot
+        }
+        aufgeben(l)
+        return 0
+    }
+    if a == ast.E_UN && ast.e_a(b, e) == 3 {
+        return wert(l, ast.e_b(b, e))
+    }
+    if a == ast.E_FELD {
+        let basis: u32 = adresse(l, ast.e_a(b, e))
+        let bt: u32 = sema.sema_typ(sm(l), ast.e_a(b, e))
+        if typen.ty_art(tf(l), bt) != typen.K_STRUCT {
+            aufgeben(l)
+            return 0
+        }
+        let si: usize = typen.ty_a(tf(l), bt) as usize
+        var k: u32 = 0
+        var versatz: u64 = 0
+        while k < typen.st_flen(tf(l), si) {
+            let fnr: u32 = typen.st_foff(tf(l), si) + k
+            if typen.sf_name(tf(l), fnr) == ast.e_b(b, e) {
+                versatz = typen.sf_versatz(tf(l), fnr)
+            }
+            k = k + 1
+        }
+        return ptradd_konst(l, basis, versatz)
+    }
+    if a == ast.E_IDX {
+        let basis: u32 = adresse(l, ast.e_a(b, e))
+        let bt: u32 = sema.sema_typ(sm(l), ast.e_a(b, e))
+        if typen.ty_art(tf(l), bt) != typen.K_ARR {
+            aufgeben(l)
+            return 0
+        }
+        let gr: u64 = typen.groesse_von(tf(l), typen.ty_a(tf(l), bt))
+        let iv: u32 = wert(l, ast.e_b(b, e))
+        return elem_adresse(l, basis, iv, gr)
+    }
+    aufgeben(l)
+    return 0
+}
+
+fn ptradd_konst(l: *mut Lower, basis: u32, off: u64) -> u32 {
+    if off == 0 {
+        return basis
+    }
+    let o: u32 = konst(l, fir.T_I64, off)
+    return push(l, fir.O_PTRADD, fir.T_PTR, basis, o, 0, 0, 0, 0)
+}
+
+fn elem_adresse(l: *mut Lower, basis: u32, idx: u32, gr: u64) -> u32 {
+    let g: u32 = konst(l, fir.T_U64, gr)
+    let off: u32 = push(l, fir.O_BIN, fir.T_U64, idx, g, 2, 0, 0, 0)
+    return push(l, fir.O_PTRADD, fir.T_PTR, basis, off, 0, 0, 0, 0)
+}
+
+// ------------------------------------------------------------- Ausdruecke
+
+fn wert(l: *mut Lower, e: u32) -> u32 {
+    let b: *mut ast.Baum = baum(l)
+    let t: u32 = sema.sema_typ(sm(l), e)
+    if ist_aggregat(l, t) {
+        aufgeben(l)
+        return 0
+    }
+    let a: u32 = ast.e_art(b, e)
+    let ft: u32 = e_fty(l, e)
+
+    if a == ast.E_INT {
+        return konst(l, ft, ast.e_zahl(b, e))
+    }
+    if a == ast.E_FLOAT {
+        return konst(l, fir.T_F64, ast.e_zahl(b, e))
+    }
+    if a == ast.E_BOOL {
+        return konst(l, fir.T_BOOL, ast.e_a(b, e) as u64)
+    }
+    if a == ast.E_ID {
+        let slot: u32 = suchen(l, ast.e_a(b, e))
+        if slot != KEIN {
+            return lade(l, ft, slot)
+        }
+        // Konstante: der Wert steht schon im Typpruefer.
+        return konst(l, ft, sema_konst(l, ast.e_a(b, e)))
+    }
+    if a == ast.E_UN {
+        let op: u32 = ast.e_a(b, e)
+        if op == 2 {
+            return adresse(l, ast.e_b(b, e))
+        }
+        if op == 3 {
+            let adr: u32 = wert(l, ast.e_b(b, e))
+            return lade(l, ft, adr)
+        }
+        let v: u32 = wert(l, ast.e_b(b, e))
+        var un: u32 = 0
+        if op == 1 {
+            un = 1
+        }
+        return push(l, fir.O_UN, ft, v, 0, un, 0, 0, 0)
+    }
+    if a == ast.E_BIN {
+        return binaer(l, e)
+    }
+    if a == ast.E_FELD || a == ast.E_IDX {
+        let adr: u32 = adresse(l, e)
+        return lade(l, ft, adr)
+    }
+    if a == ast.E_RUF {
+        return ruf(l, e, ft)
+    }
+    if a == ast.E_SYSCALL {
+        var tmp: Vec[u32] = vec_neu[u32]()
+        var k: u32 = 0
+        while k < ast.e_c(b, e) {
+            vec_push[u32](&tmp, wert(l, ast.kind_at(b, ast.e_b(b, e) + k)))
+            k = k + 1
+        }
+        let off: u32 = args_ablegen(l, &tmp)
+        vec_frei[u32](&tmp)
+        return push(l, fir.O_SYSCALL, fir.T_I64, 0, 0, 0, 0, off, ast.e_c(b, e))
+    }
+    if a == ast.E_AS {
+        let von: u32 = e_fty(l, ast.e_a(b, e))
+        let nach: u32 = ft
+        let src: u32 = wert(l, ast.e_a(b, e))
+        if von == nach {
+            return src
+        }
+        if nach == fir.T_BOOL {
+            let z: u32 = konst(l, von, 0)
+            return push(l, fir.O_CMP, fir.T_BOOL, src, z, 1, von as u64, 0, 0)
+        }
+        return push(l, fir.O_CAST, nach, src, 0, von, 0, 0, 0)
+    }
+    aufgeben(l)
+    return 0
+}
+
+// Wert einer Konstanten aus dem Typpruefer.
+fn sema_konst(l: *mut Lower, name: u32) -> u64 {
+    return sema.sema_konst_wert(sm(l), name)
+}
+
+fn binaer(l: *mut Lower, e: u32) -> u32 {
+    let b: *mut ast.Baum = baum(l)
+    let op: u32 = ast.e_a(b, e)
+    let li: u32 = ast.e_b(b, e)
+    let re: u32 = ast.e_c(b, e)
+
+    if op == 16 || op == 17 {
+        return kurzschluss(l, op, li, re)
+    }
+    if op >= 10 && op <= 15 {
+        let ty: u32 = e_fty(l, li)
+        let av: u32 = wert(l, li)
+        let bv: u32 = wert(l, re)
+        return push(l, fir.O_CMP, fir.T_BOOL, av, bv, op - 10, ty as u64, 0, 0)
+    }
+    let ft: u32 = e_fty(l, e)
+    // Reihenfolge wie `ast::BinOp`: add sub mul div rem and or xor shl shr
+    let bop: u32 = op
+    let av: u32 = wert(l, li)
+    var bv: u32 = wert(l, re)
+    if op == 8 || op == 9 {
+        let bt: u32 = e_fty(l, re)
+        if bt != ft {
+            bv = push(l, fir.O_CAST, ft, bv, 0, bt, 0, 0, 0)
+        }
+    }
+    return push(l, fir.O_BIN, ft, av, bv, bop, 0, 0, 0)
+}
+
+// `&&` / `||` kurzschliessend: Ergebnisplatz + Verzweigung.
+fn kurzschluss(l: *mut Lower, op: u32, li: u32, re: u32) -> u32 {
+    let slot: u32 = alloca(l, 1, 1)
+    let av: u32 = wert(l, li)
+    speichere(l, fir.T_BOOL, slot, av)
+    let rhs: u32 = neuer_block(l)
+    let join: u32 = neuer_block(l)
+    var dann: u32 = rhs
+    var sonst: u32 = join
+    if op == 17 {
+        dann = join
+        sonst = rhs
+    }
+    term(l, fir.TERM_BRCOND, av, dann, sonst)
+    (*l).cur = rhs
+    let bv: u32 = wert(l, re)
+    speichere(l, fir.T_BOOL, slot, bv)
+    if !terminiert(l) {
+        term(l, fir.TERM_BR, join, 0, 0)
+    }
+    (*l).cur = join
+    return lade(l, fir.T_BOOL, slot)
+}
+
+// Die Argumente muessen ZUSAMMENHAENGEND liegen. Ein Argument, das selbst
+// einen Aufruf enthaelt, legt sonst seine eigenen Argumente MITTEN in die
+// aeussere Liste — derselbe Fehler wie beim Parser (Runde 22). Also erst
+// sammeln, dann am Stueck ablegen.
+fn args_ablegen(l: *mut Lower, tmp: *mut Vec[u32]) -> u32 {
+    let off: u32 = fir.arg_anfang(&(*l).f)
+    var i: usize = 0
+    while i < vec_len[u32](tmp) {
+        fir.arg_dazu(&(*l).f, vec_at[u32](tmp, i))
+        i = i + 1
+    }
+    return off
+}
+
+fn ruf(l: *mut Lower, e: u32, ft: u32) -> u32 {
+    let b: *mut ast.Baum = baum(l)
+    let name: u32 = ast.e_a(b, e)
+    var tmp: Vec[u32] = vec_neu[u32]()
+    var k: u32 = 0
+    while k < ast.e_c(b, e) {
+        let arg: u32 = ast.kind_at(b, ast.e_b(b, e) + k)
+        if ist_aggregat(l, sema.sema_typ(sm(l), arg)) {
+            aufgeben(l)
+            vec_frei[u32](&tmp)
+            return 0
+        }
+        vec_push[u32](&tmp, wert(l, arg))
+        k = k + 1
+    }
+    let off: u32 = args_ablegen(l, &tmp)
+    vec_frei[u32](&tmp)
+    // Ein Aufruf OHNE Rueckgabewert definiert keinen Wert — sonst stimmt die
+    // Nummernfolge nicht mehr.
+    if ft == fir.T_VOID {
+        push_void(l, fir.O_CALL, ft, name, 0, 0, 0, off, ast.e_c(b, e))
+        return 0
+    }
+    return push(l, fir.O_CALL, ft, name, 0, 0, 0, off, ast.e_c(b, e))
+}
+
+// ------------------------------------------------------------- Anweisungen
+
+fn anweisung(l: *mut Lower, i: u32) {
+    if (*l).ungeeignet {
+        return
+    }
+    let b: *mut ast.Baum = baum(l)
+    let a: u32 = ast.s_art(b, i)
+
+    if a == ast.S_LET || a == ast.S_VAR {
+        let init: u32 = ast.s_c(b, i)
+        let t: u32 = sema.sema_typ(sm(l), init)
+        if ist_aggregat(l, t) {
+            aufgeben(l)
+            return
+        }
+        let ft: u32 = fty(l, t)
+        if ft == fir.KEIN || ft == fir.T_VOID {
+            aufgeben(l)
+            return
+        }
+        var gr: u64 = typen.groesse_von(tf(l), t)
+        if gr < 1 { gr = 1 }
+        var au: u64 = typen.ausrichtung_von(tf(l), t)
+        if au < 1 { au = 1 }
+        let slot: u32 = alloca(l, gr, au)
+        let v: u32 = wert(l, init)
+        speichere(l, ft, slot, v)
+        anlegen(l, ast.s_a(b, i), slot)
+        return
+    }
+    if a == ast.S_ZUW {
+        let ziel: u32 = ast.s_a(b, i)
+        let t: u32 = sema.sema_typ(sm(l), ziel)
+        if ist_aggregat(l, t) {
+            aufgeben(l)
+            return
+        }
+        let adr: u32 = adresse(l, ziel)
+        let v: u32 = wert(l, ast.s_b(b, i))
+        speichere(l, fty(l, t), adr, v)
+        return
+    }
+    if a == ast.S_EXPR {
+        let e: u32 = ast.s_a(b, i)
+        let ea: u32 = ast.e_art(b, e)
+        if ea == ast.E_RUF {
+            let t: u32 = sema.sema_typ(sm(l), e)
+            if ist_aggregat(l, t) {
+                aufgeben(l)
+                return
+            }
+            ruf(l, e, fty(l, t))
+            return
+        }
+        if ea == ast.E_SYSCALL {
+            wert(l, e)
+            return
+        }
+        wert(l, e)
+        return
+    }
+    if a == ast.S_BLOCK {
+        block(l, ast.s_a(b, i))
+        return
+    }
+    if a == ast.S_RET {
+        let wv: u32 = ast.s_a(b, i)
+        if wv == ast.NICHTS {
+            term(l, fir.TERM_RET, KEIN, 0, 0)
+        } else {
+            let t: u32 = sema.sema_typ(sm(l), wv)
+            if ist_aggregat(l, t) {
+                aufgeben(l)
+                return
+            }
+            let v: u32 = wert(l, wv)
+            term(l, fir.TERM_RET, v, 0, 0)
+        }
+        // Alles danach ist unerreichbar: neuen Block oeffnen, damit die
+        // Zusicherung "ein Terminator je Block" gilt.
+        (*l).cur = neuer_block(l)
+        return
+    }
+    if a == ast.S_IF {
+        let c: u32 = wert(l, ast.s_a(b, i))
+        let dann: u32 = neuer_block(l)
+        let sonst: u32 = neuer_block(l)
+        let join: u32 = neuer_block(l)
+        term(l, fir.TERM_BRCOND, c, dann, sonst)
+        (*l).cur = dann
+        block(l, ast.s_b(b, i))
+        if !terminiert(l) {
+            term(l, fir.TERM_BR, join, 0, 0)
+        }
+        (*l).cur = sonst
+        if ast.s_c(b, i) != ast.NICHTS {
+            anweisung(l, ast.s_c(b, i))
+        }
+        if !terminiert(l) {
+            term(l, fir.TERM_BR, join, 0, 0)
+        }
+        (*l).cur = join
+        return
+    }
+    if a == ast.S_WHILE {
+        let kopf: u32 = neuer_block(l)
+        let rumpf: u32 = neuer_block(l)
+        let ende: u32 = neuer_block(l)
+        term(l, fir.TERM_BR, kopf, 0, 0)
+        (*l).cur = kopf
+        let c: u32 = wert(l, ast.s_a(b, i))
+        term(l, fir.TERM_BRCOND, c, rumpf, ende)
+        (*l).cur = rumpf
+        vec_push[u32](&(*l).l_break, ende)
+        vec_push[u32](&(*l).l_cont, kopf)
+        block(l, ast.s_b(b, i))
+        vec_pop[u32](&(*l).l_break)
+        vec_pop[u32](&(*l).l_cont)
+        if !terminiert(l) {
+            term(l, fir.TERM_BR, kopf, 0, 0)
+        }
+        (*l).cur = ende
+        return
+    }
+    if a == ast.S_FOR {
+        let t: u32 = sema.sema_typ(sm(l), ast.s_b(b, i))
+        let ft: u32 = fty(l, t)
+        if ft == fir.KEIN || ft == fir.T_VOID {
+            aufgeben(l)
+            return
+        }
+        var bytes: u64 = fir.fty_bytes(ft)
+        if bytes < 1 { bytes = 1 }
+        let islot: u32 = alloca(l, bytes, bytes)
+        let sv: u32 = wert(l, ast.s_b(b, i))
+        speichere(l, ft, islot, sv)
+        // Die Obergrenze wird EINMAL ausgewertet.
+        let eslot: u32 = alloca(l, bytes, bytes)
+        let ev: u32 = wert(l, ast.s_c(b, i))
+        speichere(l, ft, eslot, ev)
+
+        let kopf: u32 = neuer_block(l)
+        let rumpf: u32 = neuer_block(l)
+        let schritt: u32 = neuer_block(l)
+        let ende: u32 = neuer_block(l)
+        term(l, fir.TERM_BR, kopf, 0, 0)
+
+        (*l).cur = kopf
+        let iv: u32 = lade(l, ft, islot)
+        let lim: u32 = lade(l, ft, eslot)
+        let c: u32 = push(l, fir.O_CMP, fir.T_BOOL, iv, lim, 2, ft as u64, 0, 0)
+        term(l, fir.TERM_BRCOND, c, rumpf, ende)
+
+        (*l).cur = rumpf
+        bereich_auf(l)
+        anlegen(l, ast.s_a(b, i), islot)
+        vec_push[u32](&(*l).l_break, ende)
+        vec_push[u32](&(*l).l_cont, schritt)
+        block(l, ast.s_d(b, i))
+        vec_pop[u32](&(*l).l_break)
+        vec_pop[u32](&(*l).l_cont)
+        bereich_zu(l)
+        if !terminiert(l) {
+            term(l, fir.TERM_BR, schritt, 0, 0)
+        }
+
+        (*l).cur = schritt
+        let iv2: u32 = lade(l, ft, islot)
+        let eins: u32 = konst(l, ft, 1)
+        let inc: u32 = push(l, fir.O_BIN, ft, iv2, eins, 0, 0, 0, 0)
+        speichere(l, ft, islot, inc)
+        term(l, fir.TERM_BR, kopf, 0, 0)
+
+        (*l).cur = ende
+        return
+    }
+    if a == ast.S_BREAK {
+        term(l, fir.TERM_BR, vec_letztes[u32](&(*l).l_break), 0, 0)
+        (*l).cur = neuer_block(l)
+        return
+    }
+    if a == ast.S_CONT {
+        term(l, fir.TERM_BR, vec_letztes[u32](&(*l).l_cont), 0, 0)
+        (*l).cur = neuer_block(l)
+        return
+    }
+    // `defer` und `errdefer` sind nicht portiert.
+    aufgeben(l)
+}
+
+fn block(l: *mut Lower, bi: u32) {
+    let b: *mut ast.Baum = baum(l)
+    bereich_auf(l)
+    var k: u32 = 0
+    while k < ast.b_len(b, bi) {
+        anweisung(l, ast.sliste_at(b, ast.b_off(b, bi) + k))
+        k = k + 1
+    }
+    bereich_zu(l)
+}
+
+// ------------------------------------------------------------------- Lauf
+
+fn low_lauf(l: *mut Lower) {
+    let b: *mut ast.Baum = baum(l)
+    var i: usize = 0
+    while i < ast.fn_anzahl(b) {
+        // Signatur: nur skalare Parameter und Rueckgabe.
+        let rt2: u32 = typen.ret_typ_der_funktion(tf(l), i)
+        if ist_aggregat(l, rt2) {
+            aufgeben(l)
+            return
+        }
+        let rf: u32 = fty(l, rt2)
+        if rf == fir.KEIN {
+            aufgeben(l)
+            return
+        }
+        let poff: u32 = vec_len[u32](&(*l).f.p_typ) as u32
+        var k: u32 = 0
+        while k < ast.fn_plen(b, i) {
+            let pt: u32 = typen.param_typ_aufgeloest(tf(l), i, k)
+            if ist_aggregat(l, pt) {
+                aufgeben(l)
+                return
+            }
+            let pf: u32 = fty(l, pt)
+            if pf == fir.KEIN || pf == fir.T_VOID {
+                aufgeben(l)
+                return
+            }
+            vec_push[u32](&(*l).f.p_typ, pf)
+            k = k + 1
+        }
+        (*l).fi = fir.fn_neu(&(*l).f, ast.fn_name(b, i), rf, poff, ast.fn_plen(b, i))
+        (*l).cur = 0
+        bereich_auf(l)
+        // Parameter bekommen einen Platz und werden im Eintrittsblock gesichert.
+        k = 0
+        while k < ast.fn_plen(b, i) {
+            let pf: u32 = vec_at[u32](&(*l).f.p_typ, (poff + k) as usize)
+            var by: u64 = fir.fty_bytes(pf)
+            if by < 1 { by = 1 }
+            let slot: u32 = alloca(l, by, by)
+            speichere(l, pf, slot, fir.param_wert(&(*l).f, (*l).fi, k))
+            anlegen(l, ast.param_name(b, ast.fn_poff(b, i) + k), slot)
+            k = k + 1
+        }
+        block(l, ast.fn_rumpf(b, i))
+        bereich_zu(l)
+        if (*l).ungeeignet {
+            return
+        }
+        // Offene (unerreichbare) Bloecke abschliessen.
+        var bb: u32 = 0
+        while bb < fir.block_anzahl(&(*l).f, (*l).fi) {
+            if !fir.ist_terminiert(&(*l).f, (*l).fi, bb) {
+                (*l).cur = bb
+                if rf == fir.T_VOID {
+                    term(l, fir.TERM_RET, KEIN, 0, 0)
+                } else {
+                    let v: u32 = konst(l, rf, 0)
+                    term(l, fir.TERM_RET, v, 0, 0)
+                }
+            }
+            bb = bb + 1
+        }
+        i = i + 1
+    }
+}
