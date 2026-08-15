@@ -12,7 +12,7 @@
 #
 # Rueckgabewerte von `.firdump`:
 #   0 Ausgabe · 1 Fehler · 3 keine Kernsprache · 4 comptime noetig ·
-#   5 Aggregate oder `defer` (im Lowering noch nicht portiert)
+#   5 `defer`/`errdefer` (im Lowering noch nicht portiert)
 #
 # GETESTET WIRD NUR, was `firnc0` auch EINZELN uebersetzen kann: `--emit=fir-raw`
 # laeuft sonst ueber das zusammengefuehrte Modulprogramm, der Firn-Weg aber
@@ -35,7 +35,7 @@ ungleich=0
 bekannt=0
 nichtkern=0
 comptime=0
-aggregat=0
+defer_zahl=0
 uebersprungen=0
 instruktionen=0
 erste=""
@@ -54,7 +54,7 @@ while IFS= read -r f; do
     case "$rc" in
         3) nichtkern=$((nichtkern+1)); continue;;
         4) comptime=$((comptime+1)); continue;;
-        5) aggregat=$((aggregat+1)); continue;;
+        5) defer_zahl=$((defer_zahl+1)); continue;;
     esac
     if [ "$rc" -eq 0 ] && cmp -s /tmp/firv_a.txt /tmp/firv_b.txt; then
         gleich=$((gleich+1))
@@ -73,7 +73,7 @@ done < <(find tests lib bin bench -name '*.fi' -not -type l | sort)
 echo "GLEICH:        $gleich"
 echo "UNGLEICH:      $ungleich   (bekannt und benannt: $bekannt)"
 echo "INSTRUKTIONEN: $instruktionen  (Wertnummern und Bloecke eingeschlossen)"
-echo "AGGREGAT/DEFER: $aggregat  (im Lowering noch nicht portiert)"
+echo "DEFER:         $defer_zahl  (im Lowering noch nicht portiert)"
 echo "NICHT KERN:    $nichtkern"
 echo "COMPTIME:      $comptime"
 echo "UEBERSPRUNGEN: $uebersprungen  (firnc0 uebersetzt die Datei nicht einzeln)"

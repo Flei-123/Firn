@@ -278,7 +278,7 @@ echo "== 15. Lowering in Firn gegen Rust (tools/fir_vergleich.sh) =="
 bash tools/fir_vergleich.sh > "$WORK/fir_vergleich.log" 2>&1 && FVRC=0 || FVRC=$?
 if [ "$FVRC" -eq 0 ]; then
     ok
-    grep -E '^(GLEICH|UNGLEICH|INSTRUKTIONEN|AGGREGAT)' "$WORK/fir_vergleich.log" | sed 's/^/   /'
+    grep -E '^(GLEICH|UNGLEICH|INSTRUKTIONEN|DEFER)' "$WORK/fir_vergleich.log" | sed 's/^/   /'
 else
     bad "tools/fir_vergleich.sh schlug fehl (siehe .test-work/fir_vergleich.log)"
     tail -20 "$WORK/fir_vergleich.log" | sed 's/^/   /'
