@@ -232,6 +232,18 @@ else
     tail -20 "$WORK/dom_soak.log" | sed 's/^/   /'
 fi
 
+echo "== 11. Lexer in Firn gegen Lexer in Rust (tools/lex_vergleich.sh) =="
+# Der erste Teil von Stufe 1: `lib/firnc1/lexer.fi` erzeugt denselben
+# Tokenstrom wie `firnc0 --emit=tokens`, ueber das ganze Quellkorpus.
+bash tools/lex_vergleich.sh > "$WORK/lex_vergleich.log" 2>&1 && LXRC=0 || LXRC=$?
+if [ "$LXRC" -eq 0 ]; then
+    ok
+    grep -E '^(GLEICH|UNGLEICH|TOKEN|GLEITKOMMA)' "$WORK/lex_vergleich.log" | sed 's/^/   /'
+else
+    bad "tools/lex_vergleich.sh schlug fehl (siehe .test-work/lex_vergleich.log)"
+    tail -20 "$WORK/lex_vergleich.log" | sed 's/^/   /'
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then

@@ -656,6 +656,47 @@ fn fold_cast(to: FTy, from: FTy, a: i128) -> Option<i128> {
     if to == FTy::Bool && from != FTy::Bool {
         return None;
     }
+    // GLEITKOMMA IST KEINE BITOPERATION.
+    //
+    // Bis Runde 20 fiel `f64` unter dieselbe Zeile wie jede Ganzzahl. Fuer
+    // `u64 -> f64` ist das falsch: aus der Konstante 100 wurde ein `const.f64`
+    // mit dem BITMUSTER 100 (also 5e-322), nicht mit dem Wert 100.0.
+    // Aufgefallen ist es erst, als der in Firn geschriebene Lexer `10.0`
+    // uebersetzte und `firnc0` danebenstand — beide Tokenstroeme mussten
+    // gleich sein, und sie waren es nicht. Der Weg ohne Optimierer war die
+    // ganze Zeit richtig (`cvtsi2sd`); nur die Faltung log.
+    if to == FTy::F64 || from == FTy::F64 {
+        if to == FTy::F64 && from == FTy::F64 {
+            return Some(a);
+        }
+        if to == FTy::F64 {
+            let x = from.truncate(a);
+            let f = if from.signed() { x as f64 } else { (x as u128) as f64 };
+            return Some(f.to_bits() as i128);
+        }
+        // f64 -> Ganzzahl: abschneidend Richtung null, wie `cvttsd2si`.
+        // Ausserhalb des Zielbereichs, bei NaN und bei Unendlich liefert die
+        // Instruktion einen Sonderwert — dann wird NICHT gefaltet, sondern dem
+        // Backend ueberlassen.
+        let f = f64::from_bits((a as u128) as u64);
+        if !f.is_finite() {
+            return None;
+        }
+        let t = f.trunc();
+        let bits = to.bits();
+        if bits == 0 || bits > 64 {
+            return None;
+        }
+        let (lo, hi): (f64, f64) = if to.signed() {
+            (-(2f64.powi(bits as i32 - 1)), 2f64.powi(bits as i32 - 1))
+        } else {
+            (0.0, 2f64.powi(bits as i32))
+        };
+        if t < lo || t >= hi {
+            return None;
+        }
+        return Some(to.truncate(t as i128));
+    }
     Some(to.truncate(from.truncate(a)))
 }
 
