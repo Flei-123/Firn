@@ -471,7 +471,18 @@ impl<'a> Checker<'a> {
                 );
             }
             Some(sig) => {
-                let bad = !sig.params.is_empty() || sig.ret != Type::I32;
+                // ZWEI erlaubte Formen:
+                //   fn main() -> i32
+                //   fn main(start: u64) -> i32
+                // Die zweite bekommt den STARTBLOCK des Prozesses
+                // ([argc][argv..][0][envp..]); `_start` legt `rsp` dafuer nach
+                // `rdi` (codegen_x86.rs). Ohne sie kann ein in Firn
+                // geschriebenes Programm seine Aufrufargumente nicht lesen —
+                // und `firnc1` braucht einen Dateinamen.
+                let params_ok = sig.params.is_empty()
+                    || (sig.params.len() == 1
+                        && matches!(sig.params[0], Type::U64 | Type::Usize));
+                let bad = !params_ok || sig.ret != Type::I32;
                 if bad {
                     let span = prog
                         .funcs
@@ -481,8 +492,8 @@ impl<'a> Checker<'a> {
                         .unwrap_or_else(Span::none);
                     self.dg.error_note(
                         span,
-                        "'main' muss ohne parameter deklariert sein und 'i32' zurueckgeben",
-                        "erwartet wird 'fn main() -> i32'",
+                        "'main' muss ohne parameter oder mit genau einem 'u64' deklariert sein und 'i32' zurueckgeben",
+                        "erwartet wird 'fn main() -> i32' oder 'fn main(start: u64) -> i32' (startblock: argc, argv, envp)",
                     );
                 }
             }

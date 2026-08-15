@@ -146,6 +146,14 @@ pub fn emit(m: &Module) -> Result<String, String> {
     e.raw(".globl _start");
     e.raw("_start:");
     e.line("xor rbp, rbp");
+    // STARTBLOCK AN `main`: beim Prozessstart zeigt `rsp` auf
+    //   [argc][argv0]..[argvN][0][envp0]..[0][auxv..]
+    // Dieser Zeiger geht in `rdi` — also in den ERSTEN Parameter von `main`.
+    // Ein Programm mit `fn main() -> i32` merkt davon nichts (es liest `rdi`
+    // nie); eines mit `fn main(start: u64) -> i32` kommt damit an seine
+    // Aufrufargumente. Ohne das kann `firnc1` keinen Dateinamen entgegennehmen
+    // (docs/SELBSTHOSTING.md §2, Punkt 3).
+    e.line("mov rdi, rsp");
     e.line("and rsp, -16");
     e.line(&format!("call {}", label("main")));
     e.line("mov edi, eax");

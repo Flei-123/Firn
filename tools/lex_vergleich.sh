@@ -6,9 +6,12 @@
 # `firnc0 --emit=tokens` ist eine unabhaengige Umsetzung in einer anderen
 # Sprache — stimmen beide Ausgaben ueberein, ist das eine echte Gegenprobe.
 #
-# UEBERSPRUNGEN werden nur Dateien, die `firnc0` selbst nicht fehlerfrei lext
-# (Negativtests) — dort ist die Fehlerausgabe der Massstab, nicht der
-# Tokenstrom, und die Diagnosen gehoeren zum Modul `diag`, nicht zum Lexer.
+# Verglichen werden BEIDE Stroeme:
+#   * Standardausgabe = der Tokenstrom          (lib/firnc1/lexer.fi)
+#   * Fehlerausgabe   = die Diagnosen mit Zeile, Spalte, Quelltextzeile und
+#                       Markierung              (lib/firnc1/diag.fi)
+# Deshalb bekommt `lexdump` den DATEINAMEN als Aufrufargument: er steht in
+# jeder Diagnose.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -25,36 +28,44 @@ fi
 #
 #   tests/590_f64.fi  ->  das Literal `1e308`. Der Lexer in Firn rechnet
 #   Gleitkommaliterale ausserhalb des schnellen Pfades von Clinger
-#   (|Exponent| > 22, Mantisse passt nicht in 2^53) schrittweise und liegt
+#   (|Exponent| > 22 und Mantisse passt nicht in 2^53) schrittweise und liegt
 #   dort um bis zu ein ULP daneben. Korrekt waere Eisel-Lemire mit
-#   128-Bit-Arithmetik; die fehlt noch. Betrifft im ganzen Korpus GENAU EIN
-#   Literal von 211.126 Token.
+#   128-Bit-Arithmetik; die fehlt noch.
 BEKANNT="tests/590_f64.fi"
 
 gleich=0
 ungleich=0
 unerwartet=0
 bekannt=0
+mit_fehler=0
 uebersprungen=0
 tokens=0
 langsam=0
 erste=""
 
 while IFS= read -r f; do
-    if ! "$FIRNC" --emit=tokens "$f" > /tmp/lexv_a.txt 2>/tmp/lexv_e.txt; then
+    "$FIRNC" --emit=tokens "$f" > /tmp/lexv_a.txt 2>/tmp/lexv_ae.txt
+    # Modulbruchstuecke (`tests/modules/*.fi`) lassen sich nicht einzeln
+    # uebersetzen: `firnc0` bricht schon in der Modulaufloesung ab, VOR dem
+    # Lexer. Das ist keine Lexerfrage — solche Dateien werden gezaehlt und
+    # uebersprungen.
+    if grep -q "nicht lesen:" /tmp/lexv_ae.txt; then
         uebersprungen=$((uebersprungen+1))
         continue
     fi
-    if grep -q '^error:' /tmp/lexv_e.txt; then
-        uebersprungen=$((uebersprungen+1))
-        continue
+    "$DUMP" "$f" > /tmp/lexv_b.txt 2>/tmp/lexv_be.txt
+    # Zaehlwerte stehen nur dann auf der Fehlerausgabe, wenn es KEINE
+    # Diagnosen gab — sonst gehoert der ganze Strom den Meldungen.
+    if grep -q '^; tokens ' /tmp/lexv_be.txt; then
+        t=$(awk '{print $3}' /tmp/lexv_be.txt)
+        g=$(awk '{print $5}' /tmp/lexv_be.txt)
+        tokens=$((tokens + ${t:-0}))
+        langsam=$((langsam + ${g:-0}))
+        : > /tmp/lexv_be.txt
+    else
+        mit_fehler=$((mit_fehler+1))
     fi
-    "$DUMP" < "$f" > /tmp/lexv_b.txt 2>/tmp/lexv_s.txt
-    t=$(awk '{print $3}' /tmp/lexv_s.txt)
-    g=$(awk '{print $5}' /tmp/lexv_s.txt)
-    tokens=$((tokens + ${t:-0}))
-    langsam=$((langsam + ${g:-0}))
-    if cmp -s /tmp/lexv_a.txt /tmp/lexv_b.txt; then
+    if cmp -s /tmp/lexv_a.txt /tmp/lexv_b.txt && cmp -s /tmp/lexv_ae.txt /tmp/lexv_be.txt; then
         gleich=$((gleich+1))
     else
         ungleich=$((ungleich+1))
@@ -69,14 +80,16 @@ done < <(find tests lib bin bench -name '*.fi' -not -type l | sort)
 
 echo "GLEICH:        $gleich"
 echo "UNGLEICH:      $ungleich   (bekannt und benannt: $bekannt)"
-echo "UEBERSPRUNGEN: $uebersprungen  (firnc0 meldet dort selbst einen Fehler)"
+echo "MIT DIAGNOSEN: $mit_fehler  (Fehlerausgabe ebenfalls verglichen)"
+echo "UEBERSPRUNGEN: $uebersprungen  (Modulbruchstueck, nicht einzeln uebersetzbar)"
 echo "TOKEN GESAMT:  $tokens"
 echo "GLEITKOMMA ausserhalb des schnellen Pfades: $langsam"
 if [ "$unerwartet" -gt 0 ]; then
     echo "erste unerwartete Abweichung: $erste"
-    "$FIRNC" --emit=tokens "$erste" > /tmp/lexv_a.txt 2>/dev/null
-    "$DUMP" < "$erste" > /tmp/lexv_b.txt 2>/dev/null
-    diff /tmp/lexv_a.txt /tmp/lexv_b.txt | head -20
+    "$FIRNC" --emit=tokens "$erste" > /tmp/lexv_a.txt 2>/tmp/lexv_ae.txt
+    "$DUMP" "$erste" > /tmp/lexv_b.txt 2>/tmp/lexv_be.txt
+    diff /tmp/lexv_a.txt /tmp/lexv_b.txt | head -12
+    diff /tmp/lexv_ae.txt /tmp/lexv_be.txt | head -20
     exit 1
 fi
 exit 0
