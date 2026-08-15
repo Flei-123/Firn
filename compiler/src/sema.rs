@@ -1431,6 +1431,10 @@ impl<'a> Checker<'a> {
         if let Some(t) = crate::ct::hook_call(self, name, args, nspan, espan) {
             return t;
         }
+        // HOOK sizeof: `size_of[T]()` (sizeof.rs)
+        if let Some(t) = crate::sizeof::hook_call(self, name, args, nspan) {
+            return t;
+        }
         // HOOK gc: `gc C{…}`, `weak(g)`, `stark(w)`, `x.as?[C]` und die
         // Sammler-Intrinsics (gc.rs, SPEC 3.5)
         if let Some(t) = crate::gc::hook_call(self, name, args, nspan, espan) {
@@ -1627,6 +1631,11 @@ impl<'a> Checker<'a> {
                 if crate::errors::is_result_call(name) {
                     let inner = args.first().and_then(|a| self.probe_d(a, d + 1))?;
                     return crate::errors::success_type(&inner);
+                }
+                // HOOK sizeof: `size_of[T]()` ist immer `usize` — ohne das
+                // bekommt ein Literal daneben keinen Typ (`size_of[u8]() != 1`)
+                if crate::sizeof::wert(name).is_some() || name.starts_with("size_of$") {
+                    return Some(Type::Usize);
                 }
                 // HOOK gc: Typ von `weak(g)`, `stark(w)` und `x.as?[C]` OHNE
                 // Pruefung, damit ein Literal daneben seinen Typ bekommt (gc.rs)

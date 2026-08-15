@@ -643,6 +643,10 @@ impl<'a> Parser<'a> {
         if let Some(e) = crate::sema_match::hook_primary(self) {
             return e;
         }
+        // HOOK sizeof: `size_of[T]()` (sizeof.rs)
+        if let Some(e) = crate::sizeof::hook_primary(self) {
+            return e;
+        }
         // HOOK gc: `gc C{…}`, `gc_null[C]()`, `weak_null[C]()` (gc.rs)
         if let Some(e) = crate::gc::hook_primary(self) {
             return e;
@@ -1533,6 +1537,8 @@ pub fn reset_hooks() {
     crate::sema_match::hook_reset();
     // HOOK fehlerunionen: dasselbe fuer Fehlermengen/Fehlerunionen (errors.rs)
     crate::errors::hook_reset();
+    // HOOK sizeof: Groessentabelle dieser Uebersetzung leeren (sizeof.rs)
+    crate::sizeof::hook_reset();
     // HOOK gc: dasselbe fuer die gc-Klassen (gc.rs)
     crate::gc::hook_reset();
 }

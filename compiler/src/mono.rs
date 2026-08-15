@@ -259,6 +259,15 @@ fn subst_call_name(
     map: &HashMap<String, TypeExpr>,
     queue: &mut Vec<(String, Instantiation)>,
 ) -> String {
+    // `size_of[T]()` innerhalb einer generischen Vorlage: der Typparameter
+    // steckt im AUFRUFNAMEN (`size_of$T`, siehe sizeof.rs) und muss hier mit
+    // ersetzt werden — sonst meldet der Typpruefer "unbekannter typ 'T'",
+    // sobald die Vorlage ausgepraegt wird.
+    if let Some(param) = n.strip_prefix("size_of$") {
+        if let Some(TypeExpr::Named(konkret, _)) = map.get(param) {
+            return format!("size_of${}", konkret);
+        }
+    }
     match subst_name(n, sp, map, queue, true) {
         Some(TypeExpr::Named(neu, _)) => neu,
         _ => n.to_string(),

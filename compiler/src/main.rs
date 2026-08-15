@@ -33,6 +33,7 @@ mod opt;
 mod parser;
 mod regalloc;
 mod sema;
+mod sizeof;
 mod sema_generic;
 mod sema_match;
 mod strings;
