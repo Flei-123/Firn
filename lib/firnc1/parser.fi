@@ -28,9 +28,11 @@ import lexer
 import ast
 import mono
 import muster
+import fehler
 
 export { Parser, par_neu, par_neu_modul, par_frei, par_lauf, par_fehler, par_baum,
-         par_nicht_kern, par_baum_uebernehmen, par_gen_setzen, par_mu_setzen }
+         par_nicht_kern, par_baum_uebernehmen, par_gen_setzen, par_mu_setzen,
+         par_fe_setzen }
 
 // Token-Arten aus lexer.fi (dieselbe Reihenfolge wie compiler/src/lexer.rs)
 // "kein Wert"
@@ -161,6 +163,10 @@ struct Parser {
     // ueber alle Dateien einer Uebersetzung hinweg dieselbe sein muss.
     // 0 = kein Register, dann sind `enum`/`match` nicht portiert.
     mu: u64,
+    // Registrierung der Fehlermengen/-unionen (Runde 33). Dieselbe Bauart
+    // wie `mu`: eine Ablage fuer alle Dateien der Uebersetzung.
+    // 0 = kein Register, dann sind `error`/`try`/`catch` nicht portiert.
+    feh: u64,
     tpoff: u32,          // Anfang der laufenden Typparameterliste
     // Namensnummer von `size_of`, oder -1. `size_of` ist KEIN Schluesselwort
     // (sizeof.rs) — es laesst sich nur am Namen erkennen.
@@ -179,7 +185,7 @@ fn par_neu(lx: u64) -> Parser {
         module: vec_neu[u32](),
         kladde: rt.buf_neu(),
         klammern: 0, kein_slit: 0, fehler: 0, nicht_kern: false,
-        gen: 0, mu: 0, tpoff: 0, sonr: -1,
+        gen: 0, mu: 0, feh: 0, tpoff: 0, sonr: -1,
         lokal: vec_neu[u32](), lgrenze: vec_neu[u32](),
     }
     p.n = lexer.lex_anzahl(lx as *mut lexer.Lexer)
@@ -201,10 +207,15 @@ fn par_gen_setzen(p: *mut Parser, g: u64) { (*p).gen = g }
 // Register der Aufzaehlungen/Musterabgleiche anmelden. Ebenfalls VOR `par_lauf`.
 fn par_mu_setzen(p: *mut Parser, m: u64) { (*p).mu = m }
 
+// Registrierung der Fehlerunionen anmelden. Ebenfalls VOR `par_lauf`.
+fn par_fe_setzen(p: *mut Parser, f: u64) { (*p).feh = f }
+
 fn gn(p: *mut Parser) -> *mut mono.Gen { return (*p).gen as *mut mono.Gen }
 fn hat_gen(p: *mut Parser) -> bool { return (*p).gen != 0 }
 fn mn(p: *mut Parser) -> *mut muster.Mus { return (*p).mu as *mut muster.Mus }
 fn hat_mu(p: *mut Parser) -> bool { return (*p).mu != 0 }
+fn fh(p: *mut Parser) -> *mut fehler.Fehler { return (*p).feh as *mut fehler.Fehler }
+fn hat_fe(p: *mut Parser) -> bool { return (*p).feh != 0 }
 
 fn par_baum_uebernehmen(p: *mut Parser) -> *mut ast.Baum {
     return par_baum(p)
@@ -566,6 +577,27 @@ fn typ(p: *mut Parser) -> u32 {
     if ist(p, A_IDENT) {
         let nr: u32 = nummer(p, 0)
         weiter_bump(p)
+        // `E!T` — eine Fehlerunion (errors.rs::hook_type). Der Parser legt
+        // die Angabe in die Registrierung und einen Platzhalter `__eu#<n>`
+        // in den Baum; aufgeloest wird er erst im Typpruefer. Die
+        // Reihenfolge zaehlt: `!` steht VOR dem `[` der Generics, genau
+        // wie in Stufe 0 (`hook_type` vor `hook_generic_type`).
+        if hat_fe(p) && ist(p, A_NOT) {
+            weiter_bump(p)
+            let inner: u32 = typ(p)
+            if inner == ast.NICHTS {
+                return ast.NICHTS
+            }
+            let pi: u32 = fehler.fehler_pending_dazu(fh(p), nr, inner)
+            let it: *mut intern.Interner = lexer.lex_namen(lx(p))
+            rt.buf_leeren(&(*p).kladde)
+            var eu: [u8; 5] = "__eu#"
+            rt.buf_push_bytes(&(*p).kladde, (&eu[0]) as u64, 5)
+            rt.buf_push_dez_u64(&(*p).kladde, pi as u64)
+            let pn: u32 = intern.intern_nummer(it, rt.buf_ptr(&(*p).kladde),
+                                               rt.buf_len(&(*p).kladde)) as u32
+            return ast.typ_neu(par_baum(p), ast.T_NAME, pn, 0)
+        }
         // Ein `[` hinter einem Typnamen ist eine generische Auspraegung.
         if ist(p, A_LBRACKET) {
             var generisch: bool = false
@@ -597,7 +629,54 @@ fn typ(p: *mut Parser) -> u32 {
 // --------------------------------------------------------------- Ausdruecke
 
 fn ausdruck(p: *mut Parser) -> u32 {
-    return oder_ausdruck(p)
+    var e: u32 = oder_ausdruck(p)
+    // `ausdruck catch ersatz` bzw. `ausdruck catch |f| ersatz` — bindet
+    // SCHWAECHER als jeder Operator und ist linksassoziativ; der Ersatz
+    // ist ein Oder-Ausdruck (errors.rs::hook_catch). Im Baum steht ein
+    // Aufruf `__catch#` mit zwei Argumenten; die Bindung liegt in der
+    // Registrierung.
+    if hat_fe(p) {
+        while ist(p, A_KWCATCH) {
+            weiter_bump(p)
+            var bind: u32 = KEIN
+            if ist(p, A_PIPE) {
+                weiter_bump(p)
+                if !ist(p, A_IDENT) {
+                    meckern(p)
+                    return e
+                }
+                bind = nummer(p, 0)
+                weiter_bump(p)
+                if !erwarte(p, A_PIPE) {
+                    return e
+                }
+            }
+            // Die Bindung ist ein LOKALER Name — nur im Ersatz sichtbar
+            // und von der Modul-Umbenennung ausgenommen (wie die Bindung
+            // eines Musters, Runde 32).
+            if bind != KEIN {
+                lok_auf(p)
+                lok_dazu(p, bind)
+            }
+            let rhs: u32 = oder_ausdruck(p)
+            if bind != KEIN {
+                lok_zu(p)
+            }
+            var tmp: Vec[u32] = vec_neu[u32]()
+            vec_push[u32](&tmp, e)
+            vec_push[u32](&tmp, rhs)
+            let off: u32 = liste_ablegen(p, &tmp)
+            vec_frei[u32](&tmp)
+            var cn: [u8; 8] = "__catch#"
+            let it: *mut intern.Interner = lexer.lex_namen(lx(p))
+            let name: u32 = intern.intern_nummer(it, (&cn[0]) as u64, 8) as u32
+            e = ast.ausdruck_neu(par_baum(p), ast.E_RUF, name, off, 2, 0)
+            if bind != KEIN {
+                fehler.fehler_cb_setzen(fh(p), e, bind)
+            }
+        }
+    }
+    return e
 }
 
 // Ausdruck ohne Struct-Literal auf oberster Ebene (Bedingungen).
@@ -927,6 +1006,18 @@ fn size_of_ausdruck(p: *mut Parser) -> u32 {
 
 fn grund_ausdruck(p: *mut Parser) -> u32 {
     let a: u32 = art(p, 0)
+    // `try ausdruck` — der Operand ist ein UNAERER Ausdruck, der Aufruf
+    // heisst `__try#` (errors.rs::hook_primary, TRY_NAME).
+    if a == A_KWTRY && hat_fe(p) {
+        weiter_bump(p)
+        let inner: u32 = un_ausdruck(p)
+        let off: u32 = ast.kind_anfang(par_baum(p))
+        ast.kind_dazu(par_baum(p), inner)
+        var tn: [u8; 6] = "__try#"
+        let it: *mut intern.Interner = lexer.lex_namen(lx(p))
+        let name: u32 = intern.intern_nummer(it, (&tn[0]) as u64, 6) as u32
+        return ast.ausdruck_neu(par_baum(p), ast.E_RUF, name, off, 1, 0)
+    }
     if a == A_INT {
         let v: u64 = zahl(p)
         weiter_bump(p)
@@ -1271,8 +1362,9 @@ fn anweisung(p: *mut Parser) -> u32 {
         }
         return match_anweisung(p)
     }
-    if a == A_KWTRY || a == A_KWCATCH {
-        (*p).nicht_kern = true
+    if a == A_KWCATCH {
+        // `catch` steht nie am Anfang einer Anweisung — ein gewoehnlicher
+        // Syntaxfehler, wie in Stufe 0. (`try` faellt in den Ausdrucksweg.)
         meckern(p)
         return ast.anweisung_neu(par_baum(p), ast.S_BREAK, 0, 0, 0, 0)
     }
@@ -1646,6 +1738,56 @@ fn enum_deklaration(p: *mut Parser) {
     }
 }
 
+// `error Name { A, B, C }` — eine Fehlermenge (errors.rs::errors_decl).
+// KEINE Umbenennung des Namens: Fehlermengen gelten programmweit, genau wie
+// Aufzaehlungsnamen (SPEC §14.1). Codes ab 1 in Deklarationsreihenfolge.
+fn error_deklaration(p: *mut Parser) {
+    weiter_bump(p)
+    if !ist(p, A_IDENT) {
+        meckern(p)
+        return
+    }
+    let name: u32 = nummer(p, 0)
+    weiter_bump(p)
+    if !erwarte(p, A_LBRACE) {
+        return
+    }
+    let mi: u32 = fehler.fehler_menge_dazu(fh(p), name)
+    if mi == KEIN {
+        // fehlermenge ist bereits deklariert
+        meckern(p)
+    }
+    var n: u32 = 0
+    while true {
+        while friss(p, A_COMMA) {}
+        if ist(p, A_RBRACE) || am_ende(p) {
+            break
+        }
+        let vor: usize = (*p).pos
+        if !ist(p, A_IDENT) {
+            meckern(p)
+            break
+        }
+        let vn: u32 = nummer(p, 0)
+        weiter_bump(p)
+        // Doppelt deklarierte Variante ist ein Fehler (wie in Stufe 0).
+        if mi != KEIN {
+            if !fehler.fehler_variante_dazu(fh(p), mi, vn) {
+                meckern(p)
+            }
+        }
+        n = n + 1
+        if (*p).pos == vor {
+            weiter_bump(p)
+        }
+    }
+    erwarte(p, A_RBRACE)
+    if n == 0 {
+        // Eine Fehlermenge ohne Variante ist ein Fehler (wie in Stufe 0).
+        meckern(p)
+    }
+}
+
 // Ganzzahl in einem Muster, optional mit Vorzeichen.
 fn muster_ganzzahl(p: *mut Parser, gut: *mut bool) -> i64 {
     var neg: bool = false
@@ -1926,11 +2068,22 @@ fn erweiterungen_suchen(p: *mut Parser) {
                 return
             }
         }
-        if a == A_KWERROR || a == A_KWTRY {
+        if a == A_KWERROR || a == A_KWTRY || a == A_KWCATCH {
+            // Gehoert zur Kernsprache, SOBALD die Fehler-Registrierung
+            // angemeldet ist — derselbe Uebergang wie bei `enum`/`match`
+            // (Runde 32).
+            if !hat_fe(p) {
+                (*p).nicht_kern = true
+                return
+            }
+        }
+        if a == A_KWERRDEFER {
+            // `errdefer` laeuft nur auf dem Fehlerpfad — den kennt diese
+            // Stufe noch nicht (eigene Runde, eine Datei im Korpus).
             (*p).nicht_kern = true
             return
         }
-        if a == A_KWCATCH || a == A_KWCOMPTIME || a == A_HASH || a == A_QUESTION {
+        if a == A_KWCOMPTIME || a == A_HASH || a == A_QUESTION {
             (*p).nicht_kern = true
             return
         }
@@ -1961,8 +2114,11 @@ fn erweiterungen_suchen(p: *mut Parser) {
                 return
             }
             if i + 1 < (*p).n && lexer.lex_art(lx(p), i + 1) == A_NOT {
-                (*p).nicht_kern = true
-                return
+                // `E!T` — die Fehlerunion baut auf IDENT `!` auf.
+                if !hat_fe(p) {
+                    (*p).nicht_kern = true
+                    return
+                }
             }
             if i > 0 && i + 1 < (*p).n && !hat_gen(p) {
                 let vorher: u32 = lexer.lex_art(lx(p), i - 1)
@@ -2034,6 +2190,8 @@ fn par_lauf(p: *mut Parser) {
             struct_deklaration(p)
         } else if a == A_KWENUM && hat_mu(p) {
             enum_deklaration(p)
+        } else if a == A_KWERROR && hat_fe(p) {
+            error_deklaration(p)
         } else if a == A_KWCONST {
             const_deklaration(p)
         } else if a == A_KWPROFILE {
