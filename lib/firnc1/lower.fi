@@ -40,8 +40,10 @@ import ast
 import typen
 import sema
 import fir
+import muster
 
-export { Lower, low_neu, low_frei, low_lauf, low_fehler, low_fir, low_ungeeignet }
+export { Lower, low_neu, low_frei, low_lauf, low_fehler, low_fir, low_ungeeignet,
+         low_mu_setzen }
 
 const KEIN: u32 = 4294967295
 
@@ -62,6 +64,7 @@ struct Lower {
     d_err: Vec[u32]     // 1 = `errdefer`
     d_grenze: Vec[u32]  // Grenzen je Blockebene
     sret: u32
+    mu: u64             // Register der Aufzaehlungen/Musterabgleiche (0 = keins)
     fehler: usize
     ungeeignet: bool    // Aggregat oder `defer` gefunden
 }
@@ -74,7 +77,7 @@ fn low_neu(b: u64, it: u64, sm: u64) -> Lower {
         v_name: vec_neu[u32](), v_slot: vec_neu[u32](), b_grenze: vec_neu[u32](),
         l_break: vec_neu[u32](), l_cont: vec_neu[u32](), l_tiefe: vec_neu[u32](),
         d_stmt: vec_neu[u32](), d_err: vec_neu[u32](), d_grenze: vec_neu[u32](),
-        sret: KEIN, fehler: 0, ungeeignet: false,
+        sret: KEIN, mu: 0, fehler: 0, ungeeignet: false,
     }
 }
 
@@ -92,6 +95,12 @@ fn low_frei(l: *mut Lower) {
 }
 
 fn low_fehler(l: *mut Lower) -> usize { return (*l).fehler }
+
+// Das Muster-Register anmelden. MUSS vor `low_lauf` stehen.
+fn low_mu_setzen(l: *mut Lower, m: u64) { (*l).mu = m }
+
+fn mul(l: *mut Lower) -> *mut muster.Mus { return (*l).mu as *mut muster.Mus }
+fn hat_mu(l: *mut Lower) -> bool { return (*l).mu != 0 }
 fn low_ungeeignet(l: *mut Lower) -> bool { return (*l).ungeeignet }
 fn low_fir(l: *mut Lower) -> *mut fir.Fir { return &(*l).f }
 
@@ -315,6 +324,15 @@ fn adresse(l: *mut Lower, e: u32) -> u32 {
         return slot
     }
     if a == ast.E_RUF {
+        // HOOK enum (lower_match.rs): der Konstruktor legt den Wert selbst an.
+        if hat_mu(l) && ast.e_zahl(b, e) == 0 {
+            if muster.mus_ist_ctorname(namen(l), ast.e_a(b, e)) {
+                let t: u32 = sema.sema_typ(sm(l), e)
+                let slot: u32 = alloca(l, q_groesse(l, t), q_ausricht(l, t))
+                ctor_schreiben(l, e, slot)
+                return slot
+            }
+        }
         // Ein Aufruf, der ein Aggregat liefert, schreibt in einen
         // Zwischenspeicher; dessen Adresse ist das Ergebnis (SPEC §14.1).
         let t: u32 = sema.sema_typ(sm(l), e)
@@ -365,6 +383,13 @@ fn schreib_nach(l: *mut Lower, adr: u32, e: u32) {
     if a == ast.E_AWDH {
         wiederhole(l, adr, ast.e_a(b, e), typen.ty_a(tf(l), t), typen.ty_n(tf(l), t))
         return
+    }
+    if a == ast.E_RUF && hat_mu(l) && ast.e_zahl(b, e) == 0 {
+        // HOOK enum (lower_match.rs): der Konstruktor schreibt direkt ins Ziel.
+        if muster.mus_ist_ctorname(namen(l), ast.e_a(b, e)) {
+            ctor_schreiben(l, e, adr)
+            return
+        }
     }
     if a == ast.E_RUF && ist_aggregat(l, t) {
         ruf_mit_ziel(l, e, adr)
@@ -832,6 +857,21 @@ fn anweisung(l: *mut Lower, i: u32) {
     if a == ast.S_EXPR {
         let e: u32 = ast.s_a(b, i)
         let ea: u32 = ast.e_art(b, e)
+        if ea == ast.E_RUF && hat_mu(l) && ast.e_zahl(b, e) == 0 {
+            // HOOK enum/match (lower_match.rs::lower_types_stmt).
+            let nm: u32 = ast.e_a(b, e)
+            if muster.mus_ist_matchname(namen(l), nm) {
+                match_lower(l, muster.mus_match_nummer(namen(l), nm))
+                return
+            }
+            if muster.mus_ist_ctorname(namen(l), nm) {
+                // Der Wert wird verworfen, braucht aber einen Platz.
+                let t: u32 = sema.sema_typ(sm(l), e)
+                let slot: u32 = alloca(l, q_groesse(l, t), q_ausricht(l, t))
+                ctor_schreiben(l, e, slot)
+                return
+            }
+        }
         if ea == ast.E_RUF {
             let t: u32 = sema.sema_typ(sm(l), e)
             if ist_aggregat(l, t) {
@@ -1023,6 +1063,518 @@ fn block(l: *mut Lower, bi: u32) {
     // damit die Namen des Blocks noch sichtbar sind.
     defer_ebene_zu(l)
     bereich_zu(l)
+}
+
+// ------------------------------------------- enum/match (lower_match.rs)
+//
+// Portierung des Lowerings von `match` und Aufzaehlungskonstruktoren.
+// Ergebnis ist ein `switch` ueber die Variantennummer (bzw. den
+// Ganzzahlwert); Untermuster werden als Kette von Vergleichen HINTER dem
+// Sprung geprueft. Die Reihenfolge der erzeugten Instruktionen und Bloecke
+// ist Vertrag — `tools/fir_vergleich.sh` vergleicht Oktett fuer Oktett.
+
+// Bereichsmuster bis zu dieser Weite werden in einzelne Sprungmarken
+// aufgeloest; breitere werden als Vergleich geprueft (MAX_RANGE_KEYS).
+const MAX_BEREICH_MARKEN: i64 = 256
+
+// Schreibt `Enum::Variante(a, b)` unmittelbar an die Adresse `adr`.
+fn ctor_schreiben(l: *mut Lower, e: u32, adr: u32) {
+    let b: *mut ast.Baum = baum(l)
+    let m: *mut muster.Mus = mul(l)
+    let t: u32 = sema.sema_typ(sm(l), e)
+    if typen.ty_art(tf(l), t) != typen.K_STRUCT {
+        (*l).fehler = (*l).fehler + 1
+        return
+    }
+    let ei: u32 = muster.mus_enum_bei_struct(m, typen.ty_a(tf(l), t))
+    if ei == KEIN {
+        (*l).fehler = (*l).fehler + 1
+        return
+    }
+    // Variantenname aus dem Aufrufnamen (hinter dem ersten `::`).
+    let it: *mut intern.Interner = namen(l)
+    let zp: u64 = intern.intern_zeiger(it, ast.e_a(b, e))
+    let zn: usize = intern.intern_laenge(it, ast.e_a(b, e))
+    var vname: u32 = KEIN
+    var i: usize = 0
+    while i + 1 < zn {
+        if rt.ld8(zp, i) == 58 as u8 && rt.ld8(zp, i + 1) == 58 as u8 {
+            vname = intern.intern_nummer(it, zp + (i + 2) as u64, zn - i - 2) as u32
+            break
+        }
+        i = i + 1
+    }
+    let vi: u32 = muster.mus_variante_finden(m, ei, vname)
+    if vi == KEIN {
+        (*l).fehler = (*l).fehler + 1
+        return
+    }
+    // Zuerst die Variantennummer, dann die Nutzdatenfelder.
+    let tk: u32 = konst(l, fir.T_U32, muster.mus_v_tag(m, vi) as u64)
+    speichere(l, fir.T_U32, adr, tk)
+    let roff: u32 = muster.mus_v_roff(m, vi)
+    let anz: u32 = ast.e_c(b, e)
+    var k: u32 = 0
+    while k < anz {
+        let off: u64 = muster.mus_rf_off(m, roff + k)
+        let ad: u32 = ptradd_konst(l, adr, off)
+        schreib_nach(l, ad, ast.kind_at(b, ast.e_b(b, e) + k))
+        k = k + 1
+    }
+}
+
+// Was ein Fall zum Schluessel beitraegt (ArmPlan in lower_match.rs):
+// pl_hat = 0 heisst "kommt fuer JEDEN Schluessel in Frage", pl_test = 1
+// heisst "nach dem Schluessel sind noch Vergleiche noetig". Die Marken eines
+// Falls liegen flach in `pk`.
+fn plan_arm(l: *mut Lower, pat: u32, sj_ei: u32,
+            pl_hat: *mut Vec[u32], pl_test: *mut Vec[u32],
+            pl_off: *mut Vec[u32], pl_len: *mut Vec[u32], pk: *mut Vec[i64]) {
+    let m: *mut muster.Mus = mul(l)
+    let a: u32 = muster.mus_mu_art(m, pat)
+    vec_push[u32](pl_off, vec_len[i64](pk) as u32)
+    if a == muster.MU_WILD || a == muster.MU_BIND {
+        vec_push[u32](pl_hat, 0)
+        vec_push[u32](pl_test, 0)
+        vec_push[u32](pl_len, 0)
+        return
+    }
+    if a == muster.MU_INT {
+        vec_push[u32](pl_hat, 1)
+        vec_push[u32](pl_test, 0)
+        vec_push[i64](pk, muster.mus_mu_lo(m, pat))
+        vec_push[u32](pl_len, 1)
+        return
+    }
+    if a == muster.MU_BOOL {
+        vec_push[u32](pl_hat, 1)
+        vec_push[u32](pl_test, 0)
+        vec_push[i64](pk, muster.mus_mu_a(m, pat) as i64)
+        vec_push[u32](pl_len, 1)
+        return
+    }
+    if a == muster.MU_BEREICH {
+        let lo: i64 = muster.mus_mu_lo(m, pat)
+        var last: i64 = muster.mus_mu_hi(m, pat)
+        if muster.mus_mu_a(m, pat) == 0 {
+            last = last - 1
+        }
+        let weite: i64 = last - lo + 1
+        if weite > 0 && weite <= MAX_BEREICH_MARKEN {
+            vec_push[u32](pl_hat, 1)
+            vec_push[u32](pl_test, 0)
+            var v: i64 = lo
+            var n: u32 = 0
+            while v <= last {
+                vec_push[i64](pk, v)
+                n = n + 1
+                v = v + 1
+            }
+            vec_push[u32](pl_len, n)
+        } else {
+            vec_push[u32](pl_hat, 0)
+            vec_push[u32](pl_test, 1)
+            vec_push[u32](pl_len, 0)
+        }
+        return
+    }
+    // MU_VARIANT: der Schluessel ist die Variantennummer; Restpruefung, wenn
+    // ein Untermuster nicht unanfechtbar ist.
+    let vi: u32 = muster.mus_variante_finden(m, sj_ei, muster.mus_mu_b(m, pat))
+    var tag: i64 = 0 - 1
+    if vi != KEIN {
+        tag = muster.mus_v_tag(m, vi) as i64
+    }
+    vec_push[u32](pl_hat, 1)
+    vec_push[i64](pk, tag)
+    vec_push[u32](pl_len, 1)
+    var test: u32 = 0
+    let soff: u32 = muster.mus_mu_soff(m, pat)
+    let slen: u32 = muster.mus_mu_slen(m, pat)
+    var k: u32 = 0
+    while k < slen {
+        if !muster.mus_unanfechtbar(m, muster.mus_mu_kind(m, soff + k)) {
+            test = 1
+        }
+        k = k + 1
+    }
+    vec_push[u32](pl_test, test)
+}
+
+// Faelle, die fuer `key` (bzw. fuer die Auffangkette) in Frage kommen —
+// Quelltextreihenfolge; nach dem ersten Fall ohne Restpruefung ist Schluss.
+fn kandidaten(l: *mut Lower, pl_hat: *mut Vec[u32], pl_test: *mut Vec[u32],
+              pl_off: *mut Vec[u32], pl_len: *mut Vec[u32], pk: *mut Vec[i64],
+              alen: u32, hat_key: bool, key: i64, aus: *mut Vec[u32]) {
+    var i: u32 = 0
+    while i < alen {
+        var passt: bool = false
+        if vec_at[u32](pl_hat, i as usize) == 0 {
+            passt = true
+        } else if hat_key {
+            let off: u32 = vec_at[u32](pl_off, i as usize)
+            let len: u32 = vec_at[u32](pl_len, i as usize)
+            var k: u32 = 0
+            while k < len {
+                if vec_at[i64](pk, (off + k) as usize) == key {
+                    passt = true
+                }
+                k = k + 1
+            }
+        }
+        if passt {
+            vec_push[u32](aus, i)
+            if vec_at[u32](pl_test, i as usize) == 0 {
+                return
+            }
+        }
+        i = i + 1
+    }
+}
+
+// Restpruefung EINES Untermusters an der Adresse `adr`. Bei Erfolg faellt
+// der Ablauf durch, bei Misserfolg geht es nach `fail`.
+fn unter_test(l: *mut Lower, adr: u32, pat: u32, ty: u32, fail: u32) {
+    let m: *mut muster.Mus = mul(l)
+    let a: u32 = muster.mus_mu_art(m, pat)
+    if a == muster.MU_WILD || a == muster.MU_BIND {
+        return
+    }
+    if a == muster.MU_INT {
+        let ft: u32 = fty(l, ty)
+        let av: u32 = lade(l, ft, adr)
+        let bv: u32 = konst(l, ft, muster.mus_mu_lo(m, pat) as u64)
+        let c: u32 = push(l, fir.O_CMP, fir.T_BOOL, av, bv, 0, ft as u64, 0, 0)
+        let nb: u32 = neuer_block(l)
+        term(l, fir.TERM_BRCOND, c, nb, fail)
+        (*l).cur = nb
+        return
+    }
+    if a == muster.MU_BOOL {
+        let av: u32 = lade(l, fir.T_BOOL, adr)
+        let bv: u32 = konst(l, fir.T_BOOL, muster.mus_mu_a(m, pat) as u64)
+        let c: u32 = push(l, fir.O_CMP, fir.T_BOOL, av, bv, 0, fir.T_BOOL as u64, 0, 0)
+        let nb: u32 = neuer_block(l)
+        term(l, fir.TERM_BRCOND, c, nb, fail)
+        (*l).cur = nb
+        return
+    }
+    if a == muster.MU_BEREICH {
+        let ft: u32 = fty(l, ty)
+        var last: i64 = muster.mus_mu_hi(m, pat)
+        if muster.mus_mu_a(m, pat) == 0 {
+            last = last - 1
+        }
+        let av: u32 = lade(l, ft, adr)
+        let k1: u32 = konst(l, ft, muster.mus_mu_lo(m, pat) as u64)
+        let c1: u32 = push(l, fir.O_CMP, fir.T_BOOL, av, k1, 5, ft as u64, 0, 0)
+        let nb: u32 = neuer_block(l)
+        term(l, fir.TERM_BRCOND, c1, nb, fail)
+        (*l).cur = nb
+        let k2: u32 = konst(l, ft, last as u64)
+        let c2: u32 = push(l, fir.O_CMP, fir.T_BOOL, av, k2, 3, ft as u64, 0, 0)
+        let nb2: u32 = neuer_block(l)
+        term(l, fir.TERM_BRCOND, c2, nb2, fail)
+        (*l).cur = nb2
+        return
+    }
+    // MU_VARIANT: erst die Variantennummer, dann die Untermuster.
+    if typen.ty_art(tf(l), ty) != typen.K_STRUCT {
+        (*l).fehler = (*l).fehler + 1
+        return
+    }
+    let ei: u32 = muster.mus_enum_bei_struct(m, typen.ty_a(tf(l), ty))
+    if ei == KEIN {
+        (*l).fehler = (*l).fehler + 1
+        return
+    }
+    let vi: u32 = muster.mus_variante_finden(m, ei, muster.mus_mu_b(m, pat))
+    if vi == KEIN {
+        (*l).fehler = (*l).fehler + 1
+        return
+    }
+    let av: u32 = lade(l, fir.T_U32, adr)
+    let bv: u32 = konst(l, fir.T_U32, muster.mus_v_tag(m, vi) as u64)
+    let c: u32 = push(l, fir.O_CMP, fir.T_BOOL, av, bv, 0, fir.T_U32 as u64, 0, 0)
+    let nb: u32 = neuer_block(l)
+    term(l, fir.TERM_BRCOND, c, nb, fail)
+    (*l).cur = nb
+    let soff: u32 = muster.mus_mu_soff(m, pat)
+    let slen: u32 = muster.mus_mu_slen(m, pat)
+    let roff: u32 = muster.mus_v_roff(m, vi)
+    var k: u32 = 0
+    while k < slen {
+        let sub: u32 = muster.mus_mu_kind(m, soff + k)
+        if !muster.mus_unanfechtbar(m, sub) {
+            let off: u64 = muster.mus_rf_off(m, roff + k)
+            let ft: u32 = muster.mus_rf_typ(m, roff + k)
+            let sa: u32 = ptradd_konst(l, adr, off)
+            unter_test(l, sa, sub, ft, fail)
+        }
+        k = k + 1
+    }
+}
+
+// Restpruefungen eines Musters auf oberster Ebene (emit_tests).
+fn muster_tests(l: *mut Lower, basis: u32, pat: u32, sj_ei: u32,
+                schl: u32, kft: u32, fail: u32) {
+    let m: *mut muster.Mus = mul(l)
+    let a: u32 = muster.mus_mu_art(m, pat)
+    if a == muster.MU_WILD || a == muster.MU_BIND || a == muster.MU_INT {
+        return
+    }
+    if a == muster.MU_BOOL {
+        return
+    }
+    if a == muster.MU_BEREICH {
+        var last: i64 = muster.mus_mu_hi(m, pat)
+        if muster.mus_mu_a(m, pat) == 0 {
+            last = last - 1
+        }
+        // Schluessel direkt vergleichen (kein load — er liegt schon vor).
+        let k1: u32 = konst(l, kft, muster.mus_mu_lo(m, pat) as u64)
+        let c1: u32 = push(l, fir.O_CMP, fir.T_BOOL, schl, k1, 5, kft as u64, 0, 0)
+        let nb: u32 = neuer_block(l)
+        term(l, fir.TERM_BRCOND, c1, nb, fail)
+        (*l).cur = nb
+        let k2: u32 = konst(l, kft, last as u64)
+        let c2: u32 = push(l, fir.O_CMP, fir.T_BOOL, schl, k2, 3, kft as u64, 0, 0)
+        let nb2: u32 = neuer_block(l)
+        term(l, fir.TERM_BRCOND, c2, nb2, fail)
+        (*l).cur = nb2
+        return
+    }
+    // MU_VARIANT: der Schluessel (Variantennummer) ist schon geprueft; hier
+    // nur die Untermuster, die nicht unanfechtbar sind.
+    let vi: u32 = muster.mus_variante_finden(m, sj_ei, muster.mus_mu_b(m, pat))
+    if vi == KEIN {
+        (*l).fehler = (*l).fehler + 1
+        return
+    }
+    let soff: u32 = muster.mus_mu_soff(m, pat)
+    let slen: u32 = muster.mus_mu_slen(m, pat)
+    let roff: u32 = muster.mus_v_roff(m, vi)
+    var k: u32 = 0
+    while k < slen {
+        let sub: u32 = muster.mus_mu_kind(m, soff + k)
+        if !muster.mus_unanfechtbar(m, sub) {
+            let off: u64 = muster.mus_rf_off(m, roff + k)
+            let ft: u32 = muster.mus_rf_typ(m, roff + k)
+            let sa: u32 = ptradd_konst(l, basis, off)
+            unter_test(l, sa, sub, ft, fail)
+        }
+        k = k + 1
+    }
+}
+
+// Die Pruefkette eines Schluessels (emit_chain): probiert die Kandidaten in
+// Quelltextreihenfolge; der letzte Ausweg ist `fallthrough`.
+fn kette(l: *mut Lower, mi: u32, cands: *mut Vec[u32],
+         pl_test: *mut Vec[u32], basis: u32, schl: u32, kft: u32,
+         sj_ei: u32, koerper: *mut Vec[u32], fallthrough: u32) -> u32 {
+    let m: *mut muster.Mus = mul(l)
+    let entry: u32 = neuer_block(l)
+    (*l).cur = entry
+    var ci: usize = 0
+    while ci < vec_len[u32](cands) {
+        let ai: u32 = vec_at[u32](cands, ci)
+        let koerper_bb: u32 = vec_at[u32](koerper, ai as usize)
+        if vec_at[u32](pl_test, ai as usize) == 0 {
+            term(l, fir.TERM_BR, koerper_bb, 0, 0)
+            return entry
+        }
+        let fail: u32 = neuer_block(l)
+        let aoff: u32 = muster.mus_m_aoff(m, mi)
+        muster_tests(l, basis, muster.mus_a_pat(m, aoff + ai), sj_ei, schl, kft, fail)
+        term(l, fir.TERM_BR, koerper_bb, 0, 0)
+        (*l).cur = fail
+        ci = ci + 1
+    }
+    term(l, fir.TERM_BR, fallthrough, 0, 0)
+    return entry
+}
+
+// Bindungen eines Musters: jede Bindung ist die ADRESSE des getroffenen
+// Werts (Aufzaehlungswerte liegen im Speicher).
+fn muster_binden(l: *mut Lower, adr: u32, pat: u32, ty: u32, sj_ei: u32) {
+    let m: *mut muster.Mus = mul(l)
+    let a: u32 = muster.mus_mu_art(m, pat)
+    if a == muster.MU_BIND {
+        anlegen(l, muster.mus_mu_a(m, pat), adr)
+        return
+    }
+    if a == muster.MU_VARIANT {
+        var ei: u32 = sj_ei
+        if ei == KEIN {
+            if typen.ty_art(tf(l), ty) == typen.K_STRUCT {
+                ei = muster.mus_enum_bei_struct(m, typen.ty_a(tf(l), ty))
+            }
+        }
+        if ei == KEIN {
+            return
+        }
+        let vi: u32 = muster.mus_variante_finden(m, ei, muster.mus_mu_b(m, pat))
+        if vi == KEIN {
+            return
+        }
+        let soff: u32 = muster.mus_mu_soff(m, pat)
+        let slen: u32 = muster.mus_mu_slen(m, pat)
+        let roff: u32 = muster.mus_v_roff(m, vi)
+        var k: u32 = 0
+        while k < slen {
+            let off: u64 = muster.mus_rf_off(m, roff + k)
+            let ft: u32 = muster.mus_rf_typ(m, roff + k)
+            let sa: u32 = ptradd_konst(l, adr, off)
+            muster_binden(l, sa, muster.mus_mu_kind(m, soff + k), ft, KEIN)
+            k = k + 1
+        }
+        return
+    }
+}
+
+// Das `match` mit der Nummer `mi` lowern (lower_match in lower_match.rs).
+fn match_lower(l: *mut Lower, mi: u32) {
+    let m: *mut muster.Mus = mul(l)
+    let b: *mut ast.Baum = baum(l)
+    if mi as usize >= muster.mus_match_anzahl(m) {
+        (*l).fehler = (*l).fehler + 1
+        return
+    }
+    let subj: u32 = muster.mus_m_subj(m, mi)
+    let sty: u32 = sema.sema_typ(sm(l), subj)
+    var sj_ei: u32 = KEIN
+    if typen.ty_art(tf(l), sty) == typen.K_STRUCT {
+        sj_ei = muster.mus_enum_bei_struct(m, typen.ty_a(tf(l), sty))
+    }
+
+    // Schluesselwert und Adresse des Subjekts bestimmen. Eine Aufzaehlung
+    // liegt im Speicher: Schluessel ist die geladene Variantennummer (u32).
+    // Sonst ist der Wert selbst der Schluessel, und die Adresse ist ein
+    // Zwischenplatz fuer moegliche Bindungen.
+    var basis: u32 = 0
+    var schl: u32 = 0
+    var kft: u32 = fir.T_U32
+    if sj_ei != KEIN {
+        basis = adresse(l, subj)
+        schl = lade(l, fir.T_U32, basis)
+    } else {
+        kft = e_fty(l, subj)
+        let v: u32 = wert(l, subj)
+        basis = alloca(l, q_groesse(l, sty), q_ausricht(l, sty))
+        speichere(l, kft, basis, v)
+        schl = v
+    }
+    let start: u32 = (*l).cur
+
+    let aoff: u32 = muster.mus_m_aoff(m, mi)
+    let alen: u32 = muster.mus_m_alen(m, mi)
+
+    var pl_hat: Vec[u32] = vec_neu[u32]()
+    var pl_test: Vec[u32] = vec_neu[u32]()
+    var pl_off: Vec[u32] = vec_neu[u32]()
+    var pl_len: Vec[u32] = vec_neu[u32]()
+    var pk: Vec[i64] = vec_neu[i64]()
+    var koerper: Vec[u32] = vec_neu[u32]()
+    defer vec_frei[u32](&pl_hat)
+    defer vec_frei[u32](&pl_test)
+    defer vec_frei[u32](&pl_off)
+    defer vec_frei[u32](&pl_len)
+    defer vec_frei[i64](&pk)
+    defer vec_frei[u32](&koerper)
+
+    var ai: u32 = 0
+    while ai < alen {
+        plan_arm(l, muster.mus_a_pat(m, aoff + ai), sj_ei,
+                 &pl_hat, &pl_test, &pl_off, &pl_len, &pk)
+        vec_push[u32](&koerper, neuer_block(l))
+        ai = ai + 1
+    }
+    let join: u32 = neuer_block(l)
+
+    // Schluessel einsammeln: aufsteigend, duplikatfrei.
+    var keys: Vec[i64] = vec_neu[i64]()
+    defer vec_frei[i64](&keys)
+    ai = 0
+    while ai < alen {
+        if vec_at[u32](&pl_hat, ai as usize) != 0 {
+            let off: u32 = vec_at[u32](&pl_off, ai as usize)
+            let len: u32 = vec_at[u32](&pl_len, ai as usize)
+            var k: u32 = 0
+            while k < len {
+                let key: i64 = vec_at[i64](&pk, (off + k) as usize)
+                var da: bool = false
+                var x: usize = 0
+                while x < vec_len[i64](&keys) {
+                    if vec_at[i64](&keys, x) == key {
+                        da = true
+                    }
+                    x = x + 1
+                }
+                if !da {
+                    vec_push[i64](&keys, key)
+                }
+                k = k + 1
+            }
+        }
+        ai = ai + 1
+    }
+    // Aufsteigend sortieren (die Liste ist kurz — Einfuegesortierung).
+    var i1: usize = 1
+    while i1 < vec_len[i64](&keys) {
+        let v: i64 = vec_at[i64](&keys, i1)
+        var j: usize = i1
+        while j > 0 {
+            if vec_at[i64](&keys, j - 1) <= v {
+                break
+            }
+            vec_setzen[i64](&keys, j, vec_at[i64](&keys, j - 1))
+            j = j - 1
+        }
+        vec_setzen[i64](&keys, j, v)
+        i1 = i1 + 1
+    }
+
+    // Auffangkette ZUERST (ihre Blocknummern kommen vor den Schluesselketten),
+    // dann je Schluessel die Kandidatenkette.
+    var cands: Vec[u32] = vec_neu[u32]()
+    defer vec_frei[u32](&cands)
+    kandidaten(l, &pl_hat, &pl_test, &pl_off, &pl_len, &pk, alen, false, 0, &cands)
+    let auffang_bb: u32 = kette(l, mi, &cands, &pl_test, basis, schl, kft,
+                                sj_ei, &koerper, join)
+
+    let sw_off: u32 = fir.sw_anfang(&(*l).f)
+    var sw_len: u32 = 0
+    var ki: usize = 0
+    while ki < vec_len[i64](&keys) {
+        let key: i64 = vec_at[i64](&keys, ki)
+        vec_leeren[u32](&cands)
+        kandidaten(l, &pl_hat, &pl_test, &pl_off, &pl_len, &pk, alen, true, key, &cands)
+        let bb: u32 = kette(l, mi, &cands, &pl_test, basis, schl, kft,
+                            sj_ei, &koerper, auffang_bb)
+        fir.sw_dazu(&(*l).f, key, bb)
+        sw_len = sw_len + 1
+        ki = ki + 1
+    }
+    if sw_len == 0 {
+        fir.term_setzen(&(*l).f, (*l).fi, start, fir.TERM_BR, auffang_bb, 0, 0)
+    } else {
+        fir.term_switch(&(*l).f, (*l).fi, start, schl, kft, auffang_bb, sw_off, sw_len)
+    }
+
+    // Rumpf jedes Falls.
+    ai = 0
+    while ai < alen {
+        (*l).cur = vec_at[u32](&koerper, ai as usize)
+        bereich_auf(l)
+        muster_binden(l, basis, muster.mus_a_pat(m, aoff + ai), sty, sj_ei)
+        block(l, muster.mus_a_block(m, aoff + ai))
+        bereich_zu(l)
+        if !terminiert(l) {
+            term(l, fir.TERM_BR, join, 0, 0)
+        }
+        ai = ai + 1
+    }
+    (*l).cur = join
 }
 
 // ------------------------------------------------------------------- Lauf

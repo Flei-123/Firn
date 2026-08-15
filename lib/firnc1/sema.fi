@@ -31,9 +31,11 @@ import vec
 import intern
 import ast
 import typen
+import muster
 
 export { Sema, sema_neu, sema_frei, sema_lauf, sema_fehler, sema_typ,
-         sema_typen, sema_typ_anzahl, sema_braucht_comptime, sema_konst_wert }
+         sema_typen, sema_typ_anzahl, sema_braucht_comptime, sema_konst_wert,
+         sema_mu_setzen }
 
 const KEIN: u32 = 4294967295
 
@@ -55,6 +57,7 @@ struct Sema {
     t_fehler: u32,
     t_f64: u32,
     ret: u32,            // Rueckgabetyp der laufenden Funktion
+    mu: u64,             // Register der Aufzaehlungen/Musterabgleiche (0 = keins)
     fehler: usize,
     ct_noetig: bool,     // eine Konstante braucht Auswertung zur Uebersetzungszeit
 }
@@ -67,7 +70,7 @@ fn sema_neu(b: u64, it: u64) -> Sema {
         v_name: vec_neu[u32](), v_typ: vec_neu[u32](), b_grenze: vec_neu[u32](),
         k_name: vec_neu[u32](), k_typ: vec_neu[u32](), k_wert: vec_neu[u64](),
         t_bool: 0, t_i64: 0, t_usize: 0, t_void: 0, t_fehler: 0, t_f64: 0,
-        ret: 0, fehler: 0, ct_noetig: false,
+        ret: 0, mu: 0, fehler: 0, ct_noetig: false,
     }
 }
 
@@ -83,6 +86,12 @@ fn sema_frei(s: *mut Sema) {
 }
 
 fn sema_fehler(s: *mut Sema) -> usize { return (*s).fehler }
+
+// Das Muster-Register anmelden. MUSS vor `sema_lauf` stehen.
+fn sema_mu_setzen(s: *mut Sema, m: u64) { (*s).mu = m }
+
+fn mu(s: *mut Sema) -> *mut muster.Mus { return (*s).mu as *mut muster.Mus }
+fn hat_mu(s: *mut Sema) -> bool { return (*s).mu != 0 }
 fn sema_braucht_comptime(s: *mut Sema) -> bool { return (*s).ct_noetig }
 fn sema_typen(s: *mut Sema) -> *mut typen.Typen { return &(*s).ty }
 fn sema_typ_anzahl(s: *mut Sema) -> usize { return vec_len[u32](&(*s).etyp) }
@@ -709,6 +718,18 @@ fn ruf(s: *mut Sema, e: u32) -> u32 {
     let name: u32 = ast.e_a(b, e)
     let off: u32 = ast.e_b(b, e)
     let anz: u32 = ast.e_c(b, e)
+    // HOOK enum/match (sema_match.rs): `__match#N` ist der Musterabgleich,
+    // `Enum::Variante(..)` der Konstruktor. Beides steht nicht in der
+    // Funktionsliste.
+    if hat_mu(s) {
+        if muster.mus_ist_matchname(namen(s), name) {
+            match_pruefen(s, muster.mus_match_nummer(namen(s), name))
+            return (*s).t_void
+        }
+        if muster.mus_ist_ctorname(namen(s), name) {
+            return ctor_pruefen(s, name, e)
+        }
+    }
     let f: u32 = fn_suchen(s, name)
     if f == KEIN {
         var k: u32 = 0
@@ -939,6 +960,337 @@ fn ausdruck_inner(s: *mut Sema, e: u32, hinweis: u32) -> u32 {
     return (*s).t_fehler
 }
 
+// ------------------------------------------------- enum/match (sema_match.rs)
+//
+// Portierung der Typpruefung fuer Aufzaehlungen und Musterabgleich.
+// Wie ueberall in dieser Datei: Fehler werden GEZAEHLT, nicht beschrieben.
+
+// Subjekt-Arten des Musterabgleichs (Subject in sema_match.rs).
+const SJ_BAD: u32 = 0
+const SJ_ENUM: u32 = 1
+const SJ_BOOL: u32 = 2
+const SJ_INT: u32 = 3
+
+// `Enum::Variante(args..)` pruefen. Liefert den Aufzaehlungstyp.
+fn ctor_pruefen(s: *mut Sema, name: u32, e: u32) -> u32 {
+    let b: *mut ast.Baum = baum(s)
+    let off: u32 = ast.e_b(b, e)
+    let anz: u32 = ast.e_c(b, e)
+    // Den Namen an der ersten Doppelpunktsstelle teilen.
+    let it: *mut intern.Interner = namen(s)
+    let zp: u64 = intern.intern_zeiger(it, name)
+    let zn: usize = intern.intern_laenge(it, name)
+    var ename: u32 = KEIN
+    var vname: u32 = KEIN
+    var i: usize = 0
+    while i + 1 < zn {
+        if rt.ld8(zp, i) == 58 as u8 && rt.ld8(zp, i + 1) == 58 as u8 {
+            ename = intern.intern_nummer(it, zp, i) as u32
+            vname = intern.intern_nummer(it, zp + (i + 2) as u64, zn - i - 2) as u32
+            break
+        }
+        i = i + 1
+    }
+    let ei: u32 = muster.mus_enum_finden(mu(s), ename)
+    if ei == KEIN {
+        // unbekannte aufzaehlung
+        var k: u32 = 0
+        while k < anz {
+            austypen(s, ast.kind_at(b, off + k))
+            k = k + 1
+        }
+        meckern(s)
+        return (*s).t_fehler
+    }
+    let vi: u32 = muster.mus_variante_finden(mu(s), ei, vname)
+    if vi == KEIN {
+        // aufzaehlung hat diese variante nicht
+        var k2: u32 = 0
+        while k2 < anz {
+            austypen(s, ast.kind_at(b, off + k2))
+            k2 = k2 + 1
+        }
+        meckern(s)
+        return (*s).t_fehler
+    }
+    let roff: u32 = muster.mus_v_roff(mu(s), vi)
+    let flen: u32 = muster.mus_v_tlen(mu(s), vi)
+    if anz != flen {
+        meckern(s)
+    }
+    var k3: u32 = 0
+    while k3 < anz {
+        let arg: u32 = ast.kind_at(b, off + k3)
+        if k3 < flen {
+            let want: u32 = muster.mus_rf_typ(mu(s), roff + k3)
+            let got: u32 = ausdruck(s, arg, want)
+            if !typen.vertraeglich(tafel(s), got, want) {
+                meckern(s)
+            }
+        } else {
+            austypen(s, arg)
+        }
+        k3 = k3 + 1
+    }
+    return typen.neuer_typ(tafel(s), typen.K_STRUCT, muster.mus_e_sidx(mu(s), ei), 0)
+}
+
+// Passt der Musterwert in den Typ? (fits in sema_match.rs)
+fn passt_in(s: *mut Sema, v: i64, t: u32) -> bool {
+    let bits: u32 = typen.bits_von(tafel(s), t)
+    if bits == 0 {
+        return true
+    }
+    if typen.ist_vorzeichen(tafel(s), t) {
+        if bits >= 64 {
+            return true
+        }
+        let lo: i64 = 0 - (1 << (bits - 1) as i64)
+        let hi: i64 = (1 << (bits - 1) as i64) - 1
+        return v >= lo && v <= hi
+    }
+    if v < 0 {
+        return false
+    }
+    if bits >= 64 {
+        // GRENZE: `u64`-Marken jenseits von `i64::MAX` lassen sich hier nicht
+        // niederschreiben (Stufe 0 rechnet mit i128) — siehe muster.fi.
+        return true
+    }
+    return (v as u64) < (1 << bits as i64) as u64
+}
+
+// Prueft ein Muster gegen den erwarteten Typ und legt seine Bindungen an.
+fn muster_pruefen(s: *mut Sema, pat: u32, ty: u32, sj_art: u32, sj_ei: u32,
+                  top: bool) {
+    let m: *mut muster.Mus = mu(s)
+    let a: u32 = muster.mus_mu_art(m, pat)
+    if a == muster.MU_WILD {
+        return
+    }
+    if a == muster.MU_BIND {
+        var_anlegen(s, muster.mus_mu_a(m, pat), ty)
+        return
+    }
+    if a == muster.MU_BOOL {
+        if !ist_bool(s, ty) && !ist_fehler(s, ty) {
+            meckern(s)
+        }
+        return
+    }
+    if a == muster.MU_INT {
+        if !ist_int(s, ty) && !ist_fehler(s, ty) {
+            meckern(s)
+            return
+        }
+        if !ist_fehler(s, ty) {
+            if !passt_in(s, muster.mus_mu_lo(m, pat), ty) {
+                meckern(s)
+            }
+        }
+        return
+    }
+    if a == muster.MU_BEREICH {
+        if !ist_int(s, ty) && !ist_fehler(s, ty) {
+            meckern(s)
+            return
+        }
+        if !ist_fehler(s, ty) {
+            if !passt_in(s, muster.mus_mu_lo(m, pat), ty) {
+                meckern(s)
+                return
+            }
+            if !passt_in(s, muster.mus_mu_hi(m, pat), ty) {
+                meckern(s)
+            }
+        }
+        return
+    }
+    // MU_VARIANT
+    let ename: u32 = muster.mus_mu_a(m, pat)
+    var ei: u32 = KEIN
+    if ename != ast.NICHTS {
+        ei = muster.mus_enum_finden(m, ename)
+        if ei == KEIN {
+            meckern(s)
+            return
+        }
+    } else {
+        // Ohne Namen: die Aufzaehlung kommt aus dem erwarteten Typ.
+        if typen.ty_art(tafel(s), ty) == typen.K_STRUCT {
+            ei = muster.mus_enum_bei_struct(m, typen.ty_a(tafel(s), ty))
+        }
+        if ei == KEIN {
+            return
+        }
+    }
+    let want: u32 = typen.neuer_typ(tafel(s), typen.K_STRUCT, muster.mus_e_sidx(m, ei), 0)
+    if !ist_fehler(s, ty) {
+        if !typen.typ_gleich(tafel(s), ty, want) {
+            meckern(s)
+            return
+        }
+    }
+    if top {
+        if sj_art == SJ_ENUM && sj_ei != ei {
+            meckern(s)
+            return
+        }
+    }
+    let vi: u32 = muster.mus_variante_finden(m, ei, muster.mus_mu_b(m, pat))
+    if vi == KEIN {
+        meckern(s)
+        return
+    }
+    let soff: u32 = muster.mus_mu_soff(m, pat)
+    let slen: u32 = muster.mus_mu_slen(m, pat)
+    let roff: u32 = muster.mus_v_roff(m, vi)
+    let flen: u32 = muster.mus_v_tlen(m, vi)
+    if slen != flen {
+        meckern(s)
+    }
+    var k: u32 = 0
+    while k < slen {
+        if k < flen {
+            let ft: u32 = muster.mus_rf_typ(m, roff + k)
+            muster_pruefen(s, muster.mus_mu_kind(m, soff + k), ft, sj_art, sj_ei, false)
+        }
+        k = k + 1
+    }
+}
+
+// Das `match` mit der Nummer `mi` pruefen (check_match in sema_match.rs).
+fn match_pruefen(s: *mut Sema, mi: u32) {
+    let m: *mut muster.Mus = mu(s)
+    if mi as usize >= muster.mus_match_anzahl(m) {
+        meckern(s)
+        return
+    }
+    let subj: u32 = muster.mus_m_subj(m, mi)
+    let sty: u32 = ausdruck(s, subj, KEIN)
+    // Das Subjekt klassifizieren: Aufzaehlung, bool, Ganzzahl — sonst Fehler.
+    var sj_art: u32 = SJ_BAD
+    var sj_ei: u32 = KEIN
+    if ist_fehler(s, sty) {
+        sj_art = SJ_BAD
+    } else if typen.ty_art(tafel(s), sty) == typen.K_STRUCT {
+        let ei: u32 = muster.mus_enum_bei_struct(m, typen.ty_a(tafel(s), sty))
+        if ei == KEIN {
+            // 'match' auf einem gewoehnlichen Struct: Fehler.
+            meckern(s)
+            sj_art = SJ_BAD
+        } else {
+            sj_art = SJ_ENUM
+            sj_ei = ei
+        }
+    } else if ist_bool(s, sty) {
+        sj_art = SJ_BOOL
+    } else if ist_int(s, sty) {
+        sj_art = SJ_INT
+    } else {
+        meckern(s)
+        sj_art = SJ_BAD
+    }
+    // Der erwartete Typ der Muster.
+    var mty: u32 = sty
+    if sj_art == SJ_ENUM {
+        mty = typen.neuer_typ(tafel(s), typen.K_STRUCT, muster.mus_e_sidx(m, sj_ei), 0)
+    } else if sj_art == SJ_BOOL {
+        mty = (*s).t_bool
+    }
+    // 1. Je Fall: eigener Bereich, Muster pruefen, Rumpf pruefen.
+    let aoff: u32 = muster.mus_m_aoff(m, mi)
+    let alen: u32 = muster.mus_m_alen(m, mi)
+    var ai: u32 = 0
+    while ai < alen {
+        bereich_auf(s)
+        muster_pruefen(s, muster.mus_a_pat(m, aoff + ai), mty, sj_art, sj_ei, true)
+        block(s, muster.mus_a_block(m, aoff + ai), true)
+        bereich_zu(s)
+        ai = ai + 1
+    }
+    // 2. Unerreichbarkeit: nach einem immer zutreffenden Fall kommt nichts.
+    var auffang: bool = false
+    ai = 0
+    while ai < alen {
+        if auffang {
+            meckern(s)
+            break
+        }
+        if muster.mus_unanfechtbar(m, muster.mus_a_pat(m, aoff + ai)) {
+            auffang = true
+        }
+        ai = ai + 1
+    }
+    // 3. VOLLSTAENDIGKEIT — ein fehlender Fall ist ein FEHLER (SPEC §6.3).
+    if sj_art == SJ_BAD {
+        return
+    }
+    if auffang {
+        return
+    }
+    if sj_art == SJ_INT {
+        // Ohne Auffangfall ist ein Ganzzahl-match nie vollstaendig.
+        meckern(s)
+        return
+    }
+    if sj_art == SJ_BOOL {
+        var hat_w: bool = false
+        var hat_f: bool = false
+        ai = 0
+        while ai < alen {
+            let pat: u32 = muster.mus_a_pat(m, aoff + ai)
+            if muster.mus_mu_art(m, pat) == muster.MU_BOOL {
+                if muster.mus_mu_a(m, pat) == 1 {
+                    hat_w = true
+                } else {
+                    hat_f = true
+                }
+            }
+            ai = ai + 1
+        }
+        if !hat_w || !hat_f {
+            meckern(s)
+        }
+        return
+    }
+    // SJ_ENUM: jede Variante muss einen Fall haben, dessen Untermuster alle
+    // unanfechtbar sind.
+    let voff: u32 = muster.mus_e_voff(m, sj_ei)
+    let vlen: u32 = muster.mus_e_vlen(m, sj_ei)
+    var v: u32 = 0
+    while v < vlen {
+        let vname: u32 = muster.mus_v_name(m, voff + v)
+        var abgedeckt: bool = false
+        ai = 0
+        while ai < alen {
+            let pat: u32 = muster.mus_a_pat(m, aoff + ai)
+            if muster.mus_mu_art(m, pat) == muster.MU_VARIANT {
+                if muster.mus_mu_b(m, pat) == vname {
+                    var alle_un: bool = true
+                    let soff: u32 = muster.mus_mu_soff(m, pat)
+                    let slen: u32 = muster.mus_mu_slen(m, pat)
+                    var k: u32 = 0
+                    while k < slen {
+                        if !muster.mus_unanfechtbar(m, muster.mus_mu_kind(m, soff + k)) {
+                            alle_un = false
+                        }
+                        k = k + 1
+                    }
+                    if alle_un {
+                        abgedeckt = true
+                    }
+                }
+            }
+            ai = ai + 1
+        }
+        if !abgedeckt {
+            meckern(s)
+        }
+        v = v + 1
+    }
+}
+
 // ------------------------------------------------------------- Anweisungen
 
 fn bedingung(s: *mut Sema, e: u32) {
@@ -1078,9 +1430,26 @@ fn block(s: *mut Sema, bi: u32, bereich_schon_offen: bool) {
 
 fn sema_lauf(s: *mut Sema) {
     let b: *mut ast.Baum = baum(s)
+    // 0. Aufzaehlungen: NAMEN anmelden, damit Structs und Signaturen sie
+    //    benennen koennen (vor dem Structlayout — genau wie `declare_enums`
+    //    vor `collect_structs` in Stufe 0).
+    if hat_mu(s) {
+        muster.mus_anmelden(mu(s), tafel(s))
+    }
     // 1. Structlayout und Funktionssignaturen — dieselbe Rechnung wie in
     //    `typen.fi`, hier einmal fuer alles.
     typen.typen_aufloesen(tafel(s), b, namen(s))
+    // 1b. Aufzaehlungen: LAYOUTS eintragen — nach dem Structlayout der
+    //    Handstructschreibungen, vor jedem Gebrauch (`layout_enums` in
+    //    Stufe 0). Fehler daraus zaehlen mit.
+    if hat_mu(s) {
+        let mf: u32 = muster.mus_layout(mu(s), tafel(s), b, namen(s))
+        var mk: u32 = 0
+        while mk < mf {
+            meckern(s)
+            mk = mk + 1
+        }
+    }
 
     // 2. Grundtypen anlegen, damit sie nicht bei jedem Zugriff neu entstehen.
     (*s).t_bool = typen.neuer_typ(tafel(s), typen.K_BOOL, 0, 0)

@@ -27,9 +27,10 @@ import intern
 import lexer
 import ast
 import mono
+import muster
 
 export { Parser, par_neu, par_neu_modul, par_frei, par_lauf, par_fehler, par_baum,
-         par_nicht_kern, par_baum_uebernehmen, par_gen_setzen }
+         par_nicht_kern, par_baum_uebernehmen, par_gen_setzen, par_mu_setzen }
 
 // Token-Arten aus lexer.fi (dieselbe Reihenfolge wie compiler/src/lexer.rs)
 // "kein Wert"
@@ -155,6 +156,11 @@ struct Parser {
     // Wurzeldatei benutzt `Vec[i32]`, deklariert ist `Vec[T]` in einem Modul.
     // 0 = kein Register, dann sind Generics eine nicht portierte Erweiterung.
     gen: u64,
+    // Register der Aufzaehlungen und Musterabgleiche (Runde 32). Dieselbe
+    // Bauart wie `gen`: die Ablage liegt ausserhalb des Parsers, weil sie
+    // ueber alle Dateien einer Uebersetzung hinweg dieselbe sein muss.
+    // 0 = kein Register, dann sind `enum`/`match` nicht portiert.
+    mu: u64,
     tpoff: u32,          // Anfang der laufenden Typparameterliste
     // Namensnummer von `size_of`, oder -1. `size_of` ist KEIN Schluesselwort
     // (sizeof.rs) — es laesst sich nur am Namen erkennen.
@@ -173,7 +179,7 @@ fn par_neu(lx: u64) -> Parser {
         module: vec_neu[u32](),
         kladde: rt.buf_neu(),
         klammern: 0, kein_slit: 0, fehler: 0, nicht_kern: false,
-        gen: 0, tpoff: 0, sonr: -1,
+        gen: 0, mu: 0, tpoff: 0, sonr: -1,
         lokal: vec_neu[u32](), lgrenze: vec_neu[u32](),
     }
     p.n = lexer.lex_anzahl(lx as *mut lexer.Lexer)
@@ -192,8 +198,13 @@ fn par_neu_modul(lx: u64, baum: u64, alias: u32) -> Parser {
 // Register der generischen Vorlagen anmelden. MUSS vor `par_lauf` stehen.
 fn par_gen_setzen(p: *mut Parser, g: u64) { (*p).gen = g }
 
+// Register der Aufzaehlungen/Musterabgleiche anmelden. Ebenfalls VOR `par_lauf`.
+fn par_mu_setzen(p: *mut Parser, m: u64) { (*p).mu = m }
+
 fn gn(p: *mut Parser) -> *mut mono.Gen { return (*p).gen as *mut mono.Gen }
 fn hat_gen(p: *mut Parser) -> bool { return (*p).gen != 0 }
+fn mn(p: *mut Parser) -> *mut muster.Mus { return (*p).mu as *mut muster.Mus }
+fn hat_mu(p: *mut Parser) -> bool { return (*p).mu != 0 }
 
 fn par_baum_uebernehmen(p: *mut Parser) -> *mut ast.Baum {
     return par_baum(p)
@@ -1021,11 +1032,36 @@ fn grund_ausdruck(p: *mut Parser) -> u32 {
             meckern(p)
             return ast.ausdruck_neu(par_baum(p), ast.E_INT, 0, 0, 0, 0)
         }
-        // `Enum::Variante` gehoert zu den nicht portierten Erweiterungen.
+        // `Enum::Variante(..)` — der Aufzaehlungskonstruktor. Erkannt an der
+        // FORM (`IDENT :: IDENT`), nicht an einem Register — genau wie
+        // `sema_match.rs::hook_primary`. `::` sind ZWEI Doppelpunkttoken;
+        // ein eigenes Token gibt es nicht.
         if ist(p, A_COLON) && art(p, 1) == A_COLON {
-            (*p).nicht_kern = true
-            meckern(p)
-            return ast.ausdruck_neu(par_baum(p), ast.E_INT, 0, 0, 0, 0)
+            if !hat_mu(p) {
+                (*p).nicht_kern = true
+                meckern(p)
+                return ast.ausdruck_neu(par_baum(p), ast.E_INT, 0, 0, 0, 0)
+            }
+            weiter_bump(p)
+            weiter_bump(p)
+            if !ist(p, A_IDENT) {
+                meckern(p)
+                return ast.ausdruck_neu(par_baum(p), ast.E_INT, 0, 0, 0, 0)
+            }
+            let vn: u32 = nummer(p, 0)
+            weiter_bump(p)
+            // Der vollstaendige Name `Enum::Variante` wird EIN Name. KEINE
+            // Umbenennung: Aufzaehlungsnamen gelten programmweit (SPEC §14.1).
+            var dp: [u8; 2] = "::"
+            let full: u32 = verbinde(p, nr, (&dp[0]) as u64, 2, vn)
+            var aoff: u32 = 0
+            var alen: u32 = 0
+            if ist(p, A_LPAREN) {
+                weiter_bump(p)
+                aoff = ruf_argumente(p)
+                alen = ast.kind_anzahl(par_baum(p)) - aoff
+            }
+            return ast.ausdruck_neu(par_baum(p), ast.E_RUF, full, aoff, alen, 0)
         }
         // Steht `(` an, ist das ein AUFRUFNAME — den verdeckt eine lokale
         // Variable nicht (`Renamer::resolve`, is_value = false).
@@ -1227,7 +1263,15 @@ fn anweisung(p: *mut Parser) -> u32 {
         let b: u32 = block(p)
         return ast.anweisung_neu(par_baum(p), ast.S_BLOCK, b, 0, 0, 0)
     }
-    if a == A_KWMATCH || a == A_KWTRY || a == A_KWCATCH {
+    if a == A_KWMATCH {
+        if !hat_mu(p) {
+            (*p).nicht_kern = true
+            meckern(p)
+            return ast.anweisung_neu(par_baum(p), ast.S_BREAK, 0, 0, 0, 0)
+        }
+        return match_anweisung(p)
+    }
+    if a == A_KWTRY || a == A_KWCATCH {
         (*p).nicht_kern = true
         meckern(p)
         return ast.anweisung_neu(par_baum(p), ast.S_BREAK, 0, 0, 0, 0)
@@ -1528,6 +1572,288 @@ fn profile_deklaration(p: *mut Parser) {
     ende_anweisung(p)
 }
 
+// ------------------------------------------------------ enum und match
+//
+// Portierung der Parser-Hooks aus `sema_match.rs`. Die FAELLE eines `match`
+// stehen NICHT im Baum, sondern im Muster-Register (`muster.fi`); im Baum
+// bleibt ein Aufruf `__match#<nummer>` ohne Argumente. So kann auch eine
+// generische Vorlage die Faelle je Auspraegung ersetzen — und
+// `--emit=ast-kanon` druckt genau das, was Stufe 0 druckt.
+
+// `::` sind zwei unmittelbar aufeinanderfolgende Doppelpunkttoken.
+fn doppelpunkt(p: *mut Parser, k: usize) -> bool {
+    return art(p, k) == A_COLON && art(p, k + 1) == A_COLON
+}
+
+// `enum Name { A, B(i32), C(Punkt, bool) }`
+fn enum_deklaration(p: *mut Parser) {
+    weiter_bump(p)
+    if !ist(p, A_IDENT) {
+        meckern(p)
+        return
+    }
+    // KEINE Umbenennung: Aufzaehlungsnamen gelten programmweit (SPEC §14.1).
+    let name: u32 = nummer(p, 0)
+    weiter_bump(p)
+    if !erwarte(p, A_LBRACE) {
+        return
+    }
+    let ei: u32 = muster.mus_enum_dazu(mn(p), name)
+    while true {
+        while friss(p, A_COMMA) {}
+        if ist(p, A_RBRACE) || am_ende(p) {
+            break
+        }
+        let vor: usize = (*p).pos
+        if !ist(p, A_IDENT) {
+            meckern(p)
+            break
+        }
+        let vname: u32 = nummer(p, 0)
+        weiter_bump(p)
+        let toff: u32 = muster.mus_vt_anfang(mn(p))
+        var tlen: u32 = 0
+        if friss(p, A_LPAREN) {
+            while true {
+                if ist(p, A_RPAREN) || am_ende(p) {
+                    break
+                }
+                let vor2: usize = (*p).pos
+                let t: u32 = typ(p)
+                if t == ast.NICHTS {
+                    break
+                }
+                muster.mus_vt_dazu(mn(p), t)
+                tlen = tlen + 1
+                if !friss(p, A_COMMA) {
+                    break
+                }
+                if (*p).pos == vor2 {
+                    weiter_bump(p)
+                }
+            }
+            erwarte(p, A_RPAREN)
+        }
+        muster.mus_variante_dazu(mn(p), ei, vname, toff, tlen)
+        if (*p).pos == vor {
+            weiter_bump(p)
+        }
+    }
+    erwarte(p, A_RBRACE)
+    if muster.mus_e_vlen(mn(p), ei) == 0 {
+        // Eine Aufzaehlung ohne Variante ist ein Fehler (wie in Stufe 0).
+        meckern(p)
+    }
+}
+
+// Ganzzahl in einem Muster, optional mit Vorzeichen.
+fn muster_ganzzahl(p: *mut Parser, gut: *mut bool) -> i64 {
+    var neg: bool = false
+    if friss(p, A_MINUS) {
+        neg = true
+    }
+    if !ist(p, A_INT) {
+        meckern(p)
+        *gut = false
+        return 0
+    }
+    let v: u64 = zahl(p)
+    weiter_bump(p)
+    if neg {
+        return 0 - (v as i64)
+    }
+    return v as i64
+}
+
+// Ein Muster (SPEC §6.3). Bindungen werden sofort als lokale Namen
+// angemeldet — der Rumpf des Falls wird danach geparst und muss sie sehen.
+fn muster(p: *mut Parser, tiefe: u32) -> u32 {
+    if tiefe > 32 {
+        meckern(p)
+        return ast.NICHTS
+    }
+    let a: u32 = art(p, 0)
+    if a == A_KWTRUE {
+        weiter_bump(p)
+        return muster.mus_mu_dazu(mn(p), muster.MU_BOOL, 1, 0, 0, 0, 0, 0)
+    }
+    if a == A_KWFALSE {
+        weiter_bump(p)
+        return muster.mus_mu_dazu(mn(p), muster.MU_BOOL, 0, 0, 0, 0, 0, 0)
+    }
+    if a == A_INT || a == A_MINUS {
+        var gut: bool = true
+        let lo: i64 = muster_ganzzahl(p, &gut)
+        if !gut {
+            return ast.NICHTS
+        }
+        if ist(p, A_DOTDOT) {
+            weiter_bump(p)
+            var inkl: u32 = 0
+            if friss(p, A_ASSIGN) {
+                inkl = 1
+            }
+            let hi: i64 = muster_ganzzahl(p, &gut)
+            if !gut {
+                return ast.NICHTS
+            }
+            // Ein leerer Bereich ist ein Fehler (wie in Stufe 0).
+            if inkl == 1 {
+                if hi < lo {
+                    meckern(p)
+                    return ast.NICHTS
+                }
+            } else {
+                if hi <= lo {
+                    meckern(p)
+                    return ast.NICHTS
+                }
+            }
+            return muster.mus_mu_dazu(mn(p), muster.MU_BEREICH, inkl, 0, lo, hi, 0, 0)
+        }
+        return muster.mus_mu_dazu(mn(p), muster.MU_INT, 0, 0, lo, 0, 0, 0)
+    }
+    if a == A_IDENT {
+        let nr: u32 = nummer(p, 0)
+        weiter_bump(p)
+        let it: *mut intern.Interner = lexer.lex_namen(lx(p))
+        var us: [u8; 1] = "_"
+        if intern.intern_gleich(it, nr, (&us[0]) as u64, 1) {
+            return muster.mus_mu_dazu(mn(p), muster.MU_WILD, 0, 0, 0, 0, 0, 0)
+        }
+        if doppelpunkt(p, 0) {
+            weiter_bump(p)
+            weiter_bump(p)
+            return varianten_muster(p, nr, tiefe)
+        }
+        // Bindung des ganzen Wertes
+        lok_dazu(p, nr)
+        return muster.mus_mu_dazu(mn(p), muster.MU_BIND, nr, 0, 0, 0, 0, 0)
+    }
+    if doppelpunkt(p, 0) {
+        // `::Variante` — der Aufzaehlungsname fehlt und wird aus dem
+        // Subjekttyp bestimmt.
+        weiter_bump(p)
+        weiter_bump(p)
+        return varianten_muster(p, ast.NICHTS, tiefe)
+    }
+    meckern(p)
+    return ast.NICHTS
+}
+
+// `Variante(untermuster, ..)` — der Variantenname steht noch an.
+fn varianten_muster(p: *mut Parser, ename: u32, tiefe: u32) -> u32 {
+    if !ist(p, A_IDENT) {
+        meckern(p)
+        return ast.NICHTS
+    }
+    let vname: u32 = nummer(p, 0)
+    weiter_bump(p)
+    var soff: u32 = 0
+    var slen: u32 = 0
+    if friss(p, A_LPAREN) {
+        var tmp: Vec[u32] = vec_neu[u32]()
+        while true {
+            if ist(p, A_RPAREN) || am_ende(p) {
+                break
+            }
+            let vor: usize = (*p).pos
+            let sub: u32 = muster(p, tiefe + 1)
+            if sub == ast.NICHTS {
+                break
+            }
+            vec_push[u32](&tmp, sub)
+            if !friss(p, A_COMMA) {
+                break
+            }
+            if (*p).pos == vor {
+                weiter_bump(p)
+            }
+        }
+        erwarte(p, A_RPAREN)
+        // Erst SAMMELN, dann am Stueck ablegen — die inneren Muster haben
+        // ihre eigenen Kinder bereits abgelegt.
+        soff = muster.mus_kinder_anfang(mn(p))
+        var i: usize = 0
+        while i < vec_len[u32](&tmp) {
+            muster.mus_kind_dazu(mn(p), vec_at[u32](&tmp, i))
+            i = i + 1
+        }
+        slen = vec_len[u32](&tmp) as u32
+        vec_frei[u32](&tmp)
+    }
+    return muster.mus_mu_dazu(mn(p), muster.MU_VARIANT, ename, vname, 0, 0, soff, slen)
+}
+
+// `match subjekt { muster => { .. } .. }` als Anweisung. Wird zum Aufruf
+// `__match#<nummer>` ohne Argumente; die Faelle liegen im Muster-Register.
+fn match_anweisung(p: *mut Parser) -> u32 {
+    weiter_bump(p)
+    // `match` in einer generischen Vorlage wird nicht unterstuetzt — die
+    // Faelle liegen im Register, eine Vorlage koennte sie nicht je
+    // Auspraegung ersetzen (Fehler auch in Stufe 0).
+    if hat_gen(p) {
+        if mono.gen_in_vorlage(gn(p)) {
+            (*p).nicht_kern = true
+            meckern(p)
+        }
+    }
+    // Im Subjekt ist kein Structliteral auf oberster Ebene erlaubt —
+    // `match X { .. }` liesse sich sonst nicht vom Block unterscheiden.
+    let subj: u32 = bed_ausdruck(p)
+    if !erwarte(p, A_LBRACE) {
+        return ast.anweisung_neu(par_baum(p), ast.S_BREAK, 0, 0, 0, 0)
+    }
+    let mi: u32 = muster.mus_match_dazu(mn(p), subj)
+    while true {
+        while friss(p, A_COMMA) || friss(p, A_SEMI) {}
+        if ist(p, A_RBRACE) || am_ende(p) {
+            break
+        }
+        let vor: usize = (*p).pos
+        // Die Bindungen des Musters sind im Rumpf sichtbar — und nur dort.
+        lok_auf(p)
+        let pat: u32 = muster(p, 0)
+        if pat == ast.NICHTS {
+            lok_zu(p)
+            break
+        }
+        // `=>` sind zwei Token: `=` und `>`.
+        if !(ist(p, A_ASSIGN) && art(p, 1) == A_GT) {
+            meckern(p)
+            lok_zu(p)
+            break
+        }
+        weiter_bump(p)
+        weiter_bump(p)
+        if !ist(p, A_LBRACE) {
+            meckern(p)
+            lok_zu(p)
+            break
+        }
+        let rumpf: u32 = block(p)
+        lok_zu(p)
+        muster.mus_arm_dazu(mn(p), mi, pat, rumpf)
+        if (*p).pos == vor {
+            weiter_bump(p)
+        }
+    }
+    erwarte(p, A_RBRACE)
+    if muster.mus_m_alen(mn(p), mi) == 0 {
+        meckern(p)
+    }
+    // Der Aufrufname traegt die Nummer: `__match#<mi>`.
+    let it: *mut intern.Interner = lexer.lex_namen(lx(p))
+    rt.buf_leeren(&(*p).kladde)
+    var pfx: [u8; 8] = "__match#"
+    rt.buf_push_bytes(&(*p).kladde, (&pfx[0]) as u64, 8)
+    rt.buf_push_dez_u64(&(*p).kladde, mi as u64)
+    let name: u32 = intern.intern_nummer(it, rt.buf_ptr(&(*p).kladde),
+                                         rt.buf_len(&(*p).kladde)) as u32
+    let e: u32 = ast.ausdruck_neu(par_baum(p), ast.E_RUF, name, 0, 0, 0)
+    return ast.anweisung_neu(par_baum(p), ast.S_EXPR, e, 0, 0, 0)
+}
+
 // Vorabsuche: alle `import`-Aliasse einsammeln, damit `modul.name` von der
 // ERSTEN Zeile an erkannt wird. `firnc0` macht dasselbe.
 fn module_vorab(p: *mut Parser) {
@@ -1591,7 +1917,16 @@ fn erweiterungen_suchen(p: *mut Parser) {
     var i: usize = 0
     while i < (*p).n {
         let a: u32 = lexer.lex_art(lx(p), i)
-        if a == A_KWENUM || a == A_KWMATCH || a == A_KWERROR || a == A_KWTRY {
+        if a == A_KWENUM || a == A_KWMATCH {
+            // Gehoert zur Kernsprache, SOBALD das Muster-Register angemeldet
+            // ist — derselbe Uebergang wie bei den generischen Vorlagen
+            // (Runde 31).
+            if !hat_mu(p) {
+                (*p).nicht_kern = true
+                return
+            }
+        }
+        if a == A_KWERROR || a == A_KWTRY {
             (*p).nicht_kern = true
             return
         }
@@ -1601,8 +1936,10 @@ fn erweiterungen_suchen(p: *mut Parser) {
         }
         if a == A_COLON && i + 1 < (*p).n {
             if lexer.lex_art(lx(p), i + 1) == A_COLON {
-                (*p).nicht_kern = true
-                return
+                if !hat_mu(p) {
+                    (*p).nicht_kern = true
+                    return
+                }
             }
         }
         if a == A_IDENT {
@@ -1695,6 +2032,8 @@ fn par_lauf(p: *mut Parser) {
             fn_deklaration(p)
         } else if a == A_KWSTRUCT {
             struct_deklaration(p)
+        } else if a == A_KWENUM && hat_mu(p) {
+            enum_deklaration(p)
         } else if a == A_KWCONST {
             const_deklaration(p)
         } else if a == A_KWPROFILE {
