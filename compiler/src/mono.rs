@@ -273,7 +273,7 @@ fn subst_block(b: &mut Block, map: &HashMap<String, TypeExpr>, queue: &mut Vec<(
 
 fn subst_stmt(s: &mut Stmt, map: &HashMap<String, TypeExpr>, queue: &mut Vec<(String, Instantiation)>) {
     match s {
-        Stmt::Defer(inner, _) => subst_stmt(inner, map, queue),
+        Stmt::Defer(inner, _, _) => subst_stmt(inner, map, queue),
         Stmt::Let { ty, init, .. } => {
             if let Some(t) = ty.as_mut() {
                 *t = subst_ty(t, map, queue);
@@ -369,7 +369,7 @@ fn renumber_block(b: &mut Block, next: &mut u32) {
 
 fn renumber_stmt(s: &mut Stmt, next: &mut u32) {
     match s {
-        Stmt::Defer(inner, _) => renumber_stmt(inner, next),
+        Stmt::Defer(inner, _, _) => renumber_stmt(inner, next),
         Stmt::Let { init, .. } => renumber_expr(init, next),
         Stmt::Assign { target, value, .. } => {
             renumber_expr(target, next);
@@ -486,7 +486,7 @@ fn check_bare_block(b: &Block, out: &mut Vec<(Span, String)>) {
 
 fn check_bare_stmt(s: &Stmt, out: &mut Vec<(Span, String)>) {
     match s {
-        Stmt::Defer(inner, _) => check_bare_stmt(inner, out),
+        Stmt::Defer(inner, _, _) => check_bare_stmt(inner, out),
         Stmt::Let { ty, init, .. } => {
             if let Some(t) = ty {
                 check_bare_ty(t, out);

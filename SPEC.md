@@ -932,7 +932,7 @@ in diesem Dokument ist Zukunft und wird im README als „noch nicht" geführt.
 * Testsuite mit ≥ 40 `.fi`-Programmen plus Negativtests.
 
 **Nicht enthalten (Stufe 0), Stand nach Runde 3:** `comptime`, `interface`,
-`errdefer`/`drop`, Move-Prüfer, Referenztypen `&T`/`inout T` als geprüfte Typen
+`drop`, Move-Prüfer, Referenztypen `&T`/`inout T` als geprüfte Typen
 (nur Rohzeiger), Arenen, Abwicklung/`throw`, Gleitkomma als Sprachtyp, `u128`,
 `Arc[T]`, Standardbibliothek, Nebenläufigkeit, Paketverwaltung, aarch64, WASM,
 LLVM-Backend. Nicht umgesetzte Typkonstruktoren melden einen eigenen Fehler mit
@@ -1363,9 +1363,26 @@ F5. **`defer` gibt es seit Runde 9, `errdefer` noch nicht.**
       `tests/neg/defer_break.fi`. Innerhalb einer Schleife, die im `defer`
       selbst beginnt, sind `break`/`continue` erlaubt.
 
-    **`errdefer` ist offen**; das Beispiel in §5.1 (`errdefer close(fd)`) ist
-    damit noch nicht schreibbar. Es braucht die Unterscheidung „verlassen auf
-    dem Fehlerpfad" und gehoert zu `try`/`catch` (§5.1).
+    **`errdefer` gibt es seit Runde 10.** Es laeuft nur, wenn die Funktion ueber
+    einen Fehler verlassen wird. `defer` und `errdefer` teilen sich EINE Liste
+    je Blockebene und laufen in gemeinsamer umgekehrter Reihenfolge — steht das
+    `errdefer` hinter dem `defer`, laeuft es also zuerst.
+
+    Als Fehlerpfad gilt:
+    * die Weitergabe durch **`try`** (`lower_errors::return_error`),
+    * ein **`return E::Variante`** — der Typpruefer meldet das als
+      `CoerceKind::FromError`.
+
+    Nicht als Fehlerpfad gilt ein gewoehnlicher Rueckgabewert, auch wenn die
+    Funktion eine Fehlerunion liefert.
+
+    **Ehrliche Grenze:** wird eine FERTIGE Fehlerunion weitergereicht
+    (`let u: E!i32 = f()` … `return u`), steht erst zur Laufzeit fest, ob der
+    Fehlerpfad genommen wird. Stufe 0 entscheidet das nicht und **lehnt den
+    Fall ab**, statt `errdefer` still zu uebergehen — mit Hinweis auf
+    `return try …`. Nachweis: `tests/neg/errdefer_union_weitergabe.fi`.
+    Die Laufzeitunterscheidung (zwei Aufraeumpfade hinter einer Verzweigung auf
+    den Fehlercode) ist moeglich und kommt, wenn sie gebraucht wird.
 F6. **Kein Erfolgstyp `()`.** `E!()` ist nicht schreibbar (Stufe 0 kennt `()`
     nicht als Typsyntax); eine Funktion ohne Nutzergebnis liefert z. B.
     `E!i32`.
