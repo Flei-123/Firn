@@ -1539,3 +1539,101 @@ Von den 51 Dateien, die Runde 31 außerhalb der Kernsprache zählte, sind 9
 Fixpunkt dazukam, und der Fixpunkt steht danach weiter. Der Rest ist
 benannt: Fehlerunionen (20), `gc`/`rc` (14), konstante Laufzeit (4),
 `errdefer` (1), `comptime` (2).
+
+## 23. Runde 33: Fehlerunionen — `error`, `try`, `catch`, `E!T`
+
+`firnc1` liest jetzt Fehlerunionen — mit derselben Architektur wie Stufe 0
+(`errors.rs`/`lower_errors.rs`): eine Registrierung ausserhalb des Baums
+(`lib/firnc1/fehler.fi`), im Baum stehen Aufrufe `__try#` und `__catch#`,
+und die Typangabe `E!T` wandert als Platzhalter `__eu#<nummer>` durch den
+Baum, bis die Typaufloesung sie gegen die Registrierung aufloest. Die Union
+selbst ist ein gewoehnlicher Struct `{ __err: u32, __val: T }` im
+Typkontext — Aggregatrueckgabe, ABI und Codegen tragen sie unveraendert;
+neu war nur die Senkung von `try`/`catch`/Umwandlung.
+
+| | Runde 32 | Runde 33 |
+|---|---:|---:|
+| gleiches Verhalten wie `firnc0` (selbst) | 140 | **165** |
+| abweichend · fehlerhaft | 0 · 0 | **0** · **0** |
+| nicht Kernsprache (selbst) | 42 | **17** |
+| Parser oktettgleich (`--emit=ast-kanon`) | 183 | **216** |
+| Typen gleich (`--emit=typen`) | 123 | **142** (26 025 Ausdruecke) |
+| FIR oktettgleich (`--emit=fir-raw`) | 123 | **142** (40 591 Instruktionen) |
+| Fixpunkt (Stufe 2 == Stufe 3) | 173 103 Zeilen | **188 839 Zeilen, zeichengleich** |
+
+`test.sh`: **628/628**. Die Messlatte der Runde waren die zwanzig Dateien
+`tests/400`–`419` — erreicht, und fuenf mehr: `tests/550`–`554` (die
+`rc`-Dateien) waren nur deshalb „nicht Kern", weil sie Fehlerunionen
+benutzen (`AllocError!…`); sie sind mitgewandert. Die elf Negativtests
+`tests/neg/err_*` brechen bei `firnc1` einzeln gemessen alle mit `rc=1` ab —
+die Suite prueft Negativtests nur gegen `firnc0`.
+
+### Drei Stellen, an denen man das nicht raten kann
+
+1. **Die Typangabe `E!T` geht durch einen Importzyklus.** `typen.fi` loest
+   Typausdruecke auf, aber die Bedeutung des Platzhalters `__eu#<n>` kennt
+   nur `fehler.fi` — und `fehler.fi` braucht `typen.fi`, um die Union als
+   Struct anzulegen. Firn kennt keine Funktionszeiger, also tragen die
+   Typen einen Zeiger auf die Registrierung (`typen_fehler_setzen`) und
+   `aufloesen` ruft `fehler.fehler_typ` direkt — `typen.fi` und
+   `fehler.fi` einander importierend. Dass `modules.rs` Zyklen aufloest,
+   steht nirgends; es ist an einem Gegenstueck in `/tmp` gemessen, nicht
+   geraten.
+2. **Der Zeitpunkt der Union entscheidet ueber den Structindex.** In Stufe
+   0 entsteht eine Union erst bei der Aufloesung (`get_or_create_union`),
+   NACH allen Structs des Baums. Diese Stufe haelt die Reihenfolge mit zwei
+   getrennten Wegen: FehlerMENGEN werden vorgemerkert (sie zaehlen zu
+   `eoff`, wie die Aufzaehlungen), Unionen werden angehaengt
+   (`typen_struct_anhaengen` zaehlt NICHT an `eoff`) und tragen ihr Layout
+   sofort mit. Wer das verwechselt, bekommt andere Structindizes — und der
+   Typen-Vergleich bricht. Dieselbe Stelle erklaert die Schutzweiche in
+   `groesse_anfordern`: eine Union liegt HINTER dem Zustandsvektor der
+   Structphase, ihr Layout steht aber schon — also gilt „jenseits des
+   Vektors = fertig".
+3. **Die implizite Umwandlung steckt an fuenf Stellen, nicht an einer.**
+   `return`, `let`, Zuweisung, Argument und Structfeld bekommen je denselben
+   Hook (`coerce_pruefen`, Vorbild `hook_coerce`): Erfolgswert wird
+   `__err = 0` plus Wert, Fehlervariante wird `__err = code`. Vergisst man
+   das ARGUMENT, kompiliert `nimm(7)` fuer `fn nimm(r: E!i32)` still
+   falsch — der Aufrufer uebergibt ein Skalar, die Callee-Seite erwartet
+   das Aggregat. Und weil die umgewandelte Form ihren eigenen Ausdruck
+   noch einmal schreibt, braucht es die BUSY-Markierung aus Stufe 0,
+   sonst laeuft die Senkung endlos im Kreis.
+
+### Ehrliche Grenzen
+
+* **`errdefer` bleibt draussen — jetzt ausdruecklich.** `tests/581`
+  verbindet `errdefer` mit Fehlerunionen; bisher hielt es das `error`-
+  Schluesselwort fern. `ret_term_fehler` in Stufe 0 laesst auf dem
+  Fehlerpfad zusaetzlich die `errdefer`-Anweisungen laufen — das ist eine
+  eigene Runde. Deshalb meldet die Vorabsuche `errdefer` jetzt von sich
+  aus als „nicht Kern"; ohne die Marke waere `581` still mit falschem
+  Verhalten kompiliert worden.
+* **`--emit=layout` vergleicht die Fehlerunion-Dateien nicht** — derselbe
+  Stand wie bei den Aufzaehlungen: `layout_kanon.rs` loest `__eu#<n>`
+  nicht auf und druckt `?`; `bin/layoutdump.fi` meldet das Register
+  deshalb bewusst NICHT an, und die Dateien zaehlen dort als „nicht Kern".
+* **`tests/130_must_consume.fi` bleibt „nicht Kern"** — es braucht die
+  Attributsyntax `#[must_consume]` (`attrs.rs`), nicht die Fehlerunionen.
+  Was die Runde dafuer mitbringt: ein `E!T`-Wert ist implizit
+  must_consume, und das Verwerfen ist ein Fehler (`sema.fi`, Vorbild
+  `check_discard`) — einzeln gemessen an `tests/neg/err_verworfen.fi`
+  (`rc=1`).
+* **`E!T` in generischen Vorlagen** ist nicht durchdacht, nur benannt: der
+  Platzhalter verweist auf den Typknoten, wie er GESCHRIEBEN steht — eine
+  Ersetzung von `T` je Auspraegung sieht ihn nicht. Kein Programm im
+  Korpus tut das.
+* **Der Fixpunkt bleibt vorerst „trivial":** die Quellen von `firnc1`
+  benutzen Fehlerunionen selbst noch nicht — die neuen Pfade werden beim
+  Selbstuebersetzen mituebersetzt (Stufe 2 == Stufe 3 beweist das), aber
+  nicht durchlaufen.
+
+### Was das heisst
+
+Von den 42 Dateien ausserhalb der Kernsprache sind 25 uebergesiedelt —
+uebrig bleiben `gc` (9), konstante Laufzeit (4), `comptime` (2),
+`errdefer` (1) und die Attribute (1). Die fuenf `rc`-Dateien sind voll-
+staendig mitgewandert: sie waren nur ueber ihre Fehlerunionen an die
+Erweiterungen gebunden. Die Kernsprache kann jetzt Fehler — der naechste
+ehrliche Schritt ist `gc`, der groesste verbleibende Block.
+
