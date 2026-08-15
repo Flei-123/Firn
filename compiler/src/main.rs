@@ -6,6 +6,7 @@
 
 mod abi;
 mod ast;
+mod ast_kanon;
 mod attrs;
 mod codegen_switch;
 mod codegen_x86;
@@ -47,6 +48,7 @@ enum Emit {
     Exe,
     Asm,
     Tokens,
+    AstKanon,
     Ast,
     /// FIR nach dem Lowering (unoptimiert)
     FirRaw,
@@ -83,6 +85,7 @@ fn usage() -> String {
          --emit=fir-opt     FIR nach dem Optimierer\n  \
          --emit=comptime    nur den von comptime erzeugten Quelltext\n  \
          --emit=tokens      Tokenstrom (Fehlersuche)\n  \
+         --emit=ast-kanon   AST in kanonischer, sprachneutraler Form\n  \
          --emit=ast         AST als Debug-Text (Fehlersuche)\n  \
          --no-opt           Optimierer abschalten (= --opt-level=dev)\n  \
          --opt-level=<stufe> dev | dev-fast | release-safe | release-fast\n  \
@@ -193,6 +196,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                         "fir-opt" => Emit::FirOpt,
                         "comptime" => Emit::Comptime,
                         "tokens" => Emit::Tokens,
+                        "ast-kanon" => Emit::AstKanon,
                         "ast" => Emit::Ast,
                         other => return Err(format!("unbekanntes Ausgabeziel '{}'", other)),
                     };
@@ -263,6 +267,21 @@ fn run(opts: &Options) -> i32 {
         files.iter().map(|f| f.path.display().to_string()).collect(),
         !opts.optimize,
     );
+
+    if opts.emit == Emit::AstKanon {
+        // NUR die Wurzeldatei, VOR dem Zusammenfuehren der Module und vor der
+        // Monomorphisierung: der Parser in Firn sieht ebenfalls genau eine
+        // Datei. Alles andere waere kein Vergleich, sondern ein Vergleich mit
+        // etwas anderem.
+        let toks = lexer::lex(&root.src, &mut dg);
+        let prog = parser::parse(&toks, &mut dg);
+        if dg.has_errors() {
+            dg.print();
+            return 1;
+        }
+        print!("{}", ast_kanon::render(&prog));
+        return 0;
+    }
 
     if opts.emit == Emit::Tokens {
         let toks = lexer::lex(&root.src, &mut dg);

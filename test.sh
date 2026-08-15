@@ -244,6 +244,16 @@ else
     tail -20 "$WORK/lex_vergleich.log" | sed 's/^/   /'
 fi
 
+echo "== 12. Parser in Firn gegen Parser in Rust (tools/parser_vergleich.sh) =="
+bash tools/parser_vergleich.sh > "$WORK/parser_vergleich.log" 2>&1 && PVRC=0 || PVRC=$?
+if [ "$PVRC" -eq 0 ]; then
+    ok
+    grep -E '^(GLEICH|UNGLEICH|NICHT KERN)' "$WORK/parser_vergleich.log" | sed 's/^/   /'
+else
+    bad "tools/parser_vergleich.sh schlug fehl (siehe .test-work/parser_vergleich.log)"
+    tail -20 "$WORK/parser_vergleich.log" | sed 's/^/   /'
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then
