@@ -1222,11 +1222,45 @@ GC-Allokation. Alles davon braucht einen Speicher zur Übersetzungszeit; der
 kommt mit `emit`. Ein Versuch wird gemeldet, nicht still falsch übersetzt
 (`tests/neg/comptime_zeiger.fi`).
 
-**Was zu Abnahmepunkt 6 noch fehlt:** `emit` — also erzeugter *Quelltext*, den
-der Compiler im selben Lauf weiterverarbeitet. Die Vorbedingung dafür steht
-seit der Fundamentarbeit (`sema::Checker::add_items`, wiedereintrittsfähige
-Prüfphasen); es fehlt die Verbindung „Interpreter erzeugt Deklarationen und
-reicht sie an den Prüfer".
+**`emit` gibt es seit Runde 13.** Ein `comptime { … }`-Block auf oberster Ebene
+baut mit `emit_roh("…")` und `emit_zahl(x)` **Firn-Quelltext** auf, der im
+selben Lauf gelext, geparst und ans Programm angehängt wird — danach sieht der
+Typprüfer keinen Unterschied zu von Hand geschriebenem Code.
+
+```firn
+comptime {
+    emit_roh("fn tab_gross(c: i64) -> i64 {\n")
+    for c in 97..123 {
+        emit_roh("    if c == ")
+        emit_zahl(c)
+        emit_roh(" { return ")
+        emit_zahl(gross(c))
+        emit_roh(" }\n")
+    }
+    emit_roh("    return c\n}\n")
+}
+```
+
+`firnc --emit=comptime` gibt den erzeugten Quelltext aus, statt weiterzubauen —
+so lässt sich prüfen, was der Compiler wirklich vor sich hat.
+
+**Wie `emit_roh` ohne Zeichenketten im Interpreter auskommt:** der Parser hat
+`"abc"` bereits in ein Array-Literal aus Oktetten verwandelt (§14.1.str); der
+Interpreter liest es zurück. Damit braucht `comptime` keine
+Zeichenkettenunterstützung, um Text zu erzeugen.
+
+**Reihenfolge im Übersetzungslauf:** die Blöcke laufen **vor** der Typprüfung,
+direkt nach dem Zusammenführen der Module. Sie dürfen deshalb **keine
+programmweiten Konstanten** benutzen, wohl aber jede Funktion des Programms
+aufrufen. Der erzeugte Text bekommt eine eigene Dateinummer (`<comptime>`) in
+Diagnosen *und* in der Zeilentabelle — fehlt Letzteres, erzeugt der
+Codegenerator `.loc`-Direktiven mit einer Nummer, die `as` nicht kennt.
+
+**Was zu Abnahmepunkt 6 weiterhin fehlt:** ein **Datenzugriff zur
+Übersetzungszeit**. Die Abnahme verlangt eine Unicode-Tabelle *aus der UCD*;
+`comptime` kann heute nur aus Regeln erzeugen, die im Quelltext stehen, nicht
+aus einer Datei lesen. Das ist die letzte Lücke dieses Punktes und bewusst
+nicht überstrichen.
 
 #### 14.1.f64 — Gleitkomma (Runde 11)
 

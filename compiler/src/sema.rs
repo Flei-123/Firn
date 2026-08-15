@@ -2236,6 +2236,7 @@ mod tests {
             imports: Vec::new(),
             exports: Vec::new(),
             expr_count: b.next,
+            comptime_bloecke: Vec::new(),
         }
     }
 
@@ -2270,6 +2271,7 @@ mod tests {
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(ret), span: sp() }])],
             structs: vec![sd],
             consts: Vec::new(),
+            comptime_bloecke: Vec::new(),
             expr_count: b.next,
         };
         let (info, out) = run(prog, "");
@@ -2323,6 +2325,7 @@ mod tests {
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(ret), span: sp() }])],
             structs: vec![sd],
             consts: Vec::new(),
+            comptime_bloecke: Vec::new(),
             expr_count: b.next,
         };
         let (info, out) = run(prog, "");
@@ -2363,6 +2366,7 @@ mod tests {
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(ret), span: sp() }])],
             structs: vec![outer, inner],
             consts: Vec::new(),
+            comptime_bloecke: Vec::new(),
             expr_count: b.next,
         };
         let (info, out) = run(prog, "");
@@ -2395,6 +2399,7 @@ mod tests {
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(ret), span: sp() }])],
             structs: vec![a, bs],
             consts: Vec::new(),
+            comptime_bloecke: Vec::new(),
             expr_count: b.next,
         };
         expect_err(prog, "enthaelt sich selbst");
@@ -2426,6 +2431,7 @@ mod tests {
             imports: Vec::new(),
             exports: Vec::new(),
             expr_count: b.next,
+            comptime_bloecke: Vec::new(),
         };
         let (info, out) = run(prog, "");
         let info = info.unwrap_or_else(|| panic!("unerwarteter fehler:\n{}", out));
@@ -2457,6 +2463,7 @@ mod tests {
             ])],
             structs: Vec::new(),
             consts: Vec::new(),
+            comptime_bloecke: Vec::new(),
             expr_count: b.next,
         };
         expect_err(prog, "typ des ganzzahlliterals ist nicht ableitbar");
@@ -2494,6 +2501,7 @@ mod tests {
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(call), span: sp() }]), f],
             structs: Vec::new(),
             consts: Vec::new(),
+            comptime_bloecke: Vec::new(),
             expr_count: b.next,
         };
         expect_err(prog, "erwartet 2 argument(e), gefunden 1");
@@ -2508,6 +2516,7 @@ mod tests {
             funcs: vec![main_fn(Vec::new())],
             structs: Vec::new(),
             consts: Vec::new(),
+            comptime_bloecke: Vec::new(),
             expr_count: 0,
         };
         expect_err(prog, "erreicht das ende ohne 'return'");
@@ -2537,6 +2546,7 @@ mod tests {
             ])],
             structs: Vec::new(),
             consts: Vec::new(),
+            comptime_bloecke: Vec::new(),
             expr_count: b.next,
         };
         expect_err(prog, "mit 'let' gebunden");
@@ -2565,6 +2575,7 @@ mod tests {
             ])],
             structs: Vec::new(),
             consts: Vec::new(),
+            comptime_bloecke: Vec::new(),
             expr_count: b.next,
         };
         expect_err(prog, "index auf nicht-array-typ i32");
@@ -2592,6 +2603,7 @@ mod tests {
             ])],
             structs: Vec::new(),
             consts: Vec::new(),
+            comptime_bloecke: Vec::new(),
             expr_count: b.next,
         };
         expect_err(prog, "feldzugriff auf nicht-struct-typ i32");
@@ -2619,6 +2631,7 @@ mod tests {
             ])],
             structs: Vec::new(),
             consts: Vec::new(),
+            comptime_bloecke: Vec::new(),
             expr_count: b.next,
         };
         expect_err(prog, "dereferenzierung erwartet einen zeiger");
@@ -2639,6 +2652,7 @@ mod tests {
             ])],
             structs: Vec::new(),
             consts: Vec::new(),
+            comptime_bloecke: Vec::new(),
             expr_count: b.next,
         };
         expect_err(prog, "wahrheitswert vom typ bool erwartet");
@@ -2663,6 +2677,7 @@ mod tests {
             ])],
             structs: Vec::new(),
             consts: Vec::new(),
+            comptime_bloecke: Vec::new(),
             expr_count: b.next,
         };
         expect_err(prog, "desselben ganzzahltyps, gefunden i32 und i64");
@@ -2693,6 +2708,7 @@ mod tests {
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(ret), span: sp() }]), f],
             structs: Vec::new(),
             consts: Vec::new(),
+            comptime_bloecke: Vec::new(),
             expr_count: b.next,
         };
         let (info, out) = run(prog, "");
@@ -2733,6 +2749,7 @@ mod tests {
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(c), span: sp() }])],
             structs: vec![sd],
             consts: Vec::new(),
+            comptime_bloecke: Vec::new(),
             expr_count: b.next,
         };
         expect_err(prog, "umwandlung von P nach i32 ist nicht erlaubt");
@@ -2766,6 +2783,7 @@ mod tests {
             ])],
             structs: vec![sd],
             consts: Vec::new(),
+            comptime_bloecke: Vec::new(),
             expr_count: b.next,
         };
         expect_err(prog, "fehlt das feld 'y'");
@@ -2791,6 +2809,7 @@ mod tests {
                 span: sp(),
             }],
             expr_count: b.next,
+            comptime_bloecke: Vec::new(),
         };
         let (info, out) = run(prog, "");
         let info = info.unwrap_or_else(|| panic!("fehler:\n{}", out));
@@ -2817,6 +2836,7 @@ mod tests {
                 span: sp(),
             }],
             expr_count: b.next,
+            comptime_bloecke: Vec::new(),
         };
         expect_err(prog, "division durch null");
     }
@@ -2844,6 +2864,7 @@ mod tests {
             ])],
             structs: Vec::new(),
             consts: Vec::new(),
+            comptime_bloecke: Vec::new(),
             expr_count: b.next,
         };
         let (info, out) = run(prog, "");
@@ -2891,6 +2912,7 @@ mod tests {
             ])],
             structs: Vec::new(),
             consts: Vec::new(),
+            comptime_bloecke: Vec::new(),
             expr_count: b.next,
         };
         expect_err(prog, "index muss vom typ usize sein");

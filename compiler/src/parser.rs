@@ -1489,6 +1489,12 @@ impl<'a> Parser<'a> {
                 continue;
             }
             match self.kind() {
+                TokKind::KwComptime => {
+                    let start = self.bump();
+                    let b = self.block("nach 'comptime'");
+                    let sp = Parser::join(start, b.span);
+                    prog.comptime_bloecke.push((b, sp));
+                }
                 TokKind::KwFn | TokKind::KwExtern => self.fn_decl(&mut prog),
                 TokKind::KwStruct => self.struct_decl(&mut prog),
                 TokKind::KwConst => self.const_decl(&mut prog),
@@ -1497,7 +1503,7 @@ impl<'a> Parser<'a> {
                 TokKind::KwExport => self.export_decl(&mut prog),
                 other => {
                     let msg = format!(
-                        "erwartet 'fn', 'struct', 'const', 'import', 'export' oder 'profile' auf oberster ebene, gefunden '{}'",
+                        "erwartet 'fn', 'struct', 'const', 'comptime', 'import', 'export' oder 'profile' auf oberster ebene, gefunden '{}'",
                         other.text()
                     );
                     self.error_here(msg);
