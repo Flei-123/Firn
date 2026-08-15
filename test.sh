@@ -294,6 +294,16 @@ else
     tail -20 "$WORK/selbst_vergleich.log" | sed 's/^/   /'
 fi
 
+echo "== 17. Der Fixpunkt: Firn uebersetzt sich selbst (tools/fixpunkt.sh) =="
+bash tools/fixpunkt.sh > "$WORK/fixpunkt.log" 2>&1 && FPRC=0 || FPRC=$?
+if [ "$FPRC" -eq 0 ]; then
+    ok
+    grep -E '^(STUFE|FIXPUNKT|KORPUS)' "$WORK/fixpunkt.log" | sed 's/^/   /'
+else
+    bad "tools/fixpunkt.sh schlug fehl (siehe .test-work/fixpunkt.log)"
+    tail -20 "$WORK/fixpunkt.log" | sed 's/^/   /'
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then

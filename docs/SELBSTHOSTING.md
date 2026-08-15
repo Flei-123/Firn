@@ -1,9 +1,12 @@
 # Selbst-Hosting: Plan und ehrlicher Stand
 
 **Anforderung:** `L1` · `SPEC.md` §11 (Bootstrap-Plan) · `ABNAHME.md` Punkt 1
-**Stand:** Stufe 0 (`firnc0`, in Rust) läuft. Stufe 1 ist **nicht begonnen**.
-Diese Datei sagt, *was heute schon in Firn schreibbar wäre* und *was konkret
-fehlt* — mit Liste, nicht mit Gefühl.
+**Stand (Runde 31): der Fixpunkt steht.** `firnc1` — der Compiler, geschrieben
+in Firn — übersetzt **sich selbst**, und das Ergebnis ist ein Fixpunkt:
+Stufe 2 (von `firnc1` erzeugt) und Stufe 3 (von Stufe 2 erzeugt) sind
+**zeichengleich**. Nachweis: `tools/fixpunkt.sh`, Abschnitt 17 von `test.sh`.
+Der Verlauf dorthin steht unten, Runde für Runde, mit Messwerten statt
+Behauptungen — §21 ist der Schlussstein.
 
 ---
 
@@ -1297,3 +1300,148 @@ Quellen nicht lesen kann (`Vec[T]`, `Map[K,V]`).
 
 Damit ist der Weg zum Fixpunkt auf **einen** Punkt zusammengeschrumpft:
 Generics im Parser und in der Monomorphisierung von `firnc1`.
+
+
+---
+
+## 21. Runde 31: Generics — und der Fixpunkt
+
+**`firnc1` übersetzt sich selbst.** Das Ergebnis ist ein Fixpunkt im engen
+Sinn: Stufe 2 und Stufe 3 sind Oktett für Oktett dieselbe Datei.
+
+```
+Stufe 1   firnc0 (Rust)  übersetzt  bin/firnc1.fi  ->  .firnc1     888 ms
+Stufe 2   .firnc1        übersetzt  bin/firnc1.fi  ->  .firnc2    2070 ms
+Stufe 3   .firnc2        übersetzt  bin/firnc1.fi  ->  .firnc3
+
+.firnc2.s == .firnc3.s     147 220 Zeilen Assembler, zeichengleich
+.firnc2   == .firnc3       792 240 Oktette, binärgleich
+```
+
+Stufe 1 wird **nicht** mitverglichen und muss es auch nicht: `firnc0` hat eine
+Registerzuteilung, `lib/firnc1/codegen.fi` nicht. Verglichen wird, was ab
+Stufe 2 stabil bleibt — und genau dort hängt das Ergebnis nicht mehr am
+Rust-Compiler.
+
+| | Runde 30 | Runde 31 |
+|---|---:|---:|
+| gleiches Verhalten wie `firnc0` | 121 | **131** |
+| abweichend · fehlerhaft | 0 · 0 | **0** · **0** |
+| wegen Generics ausgeschlossen | 9 | **0** |
+| `firnc1` übersetzt sich selbst | nein | **ja, als Fixpunkt** |
+
+`test.sh`: **628/628**, davon Abschnitt 17 der Fixpunkt. Laufzeit ~3 min.
+
+### Monomorphisierung, nicht Typlöschung
+
+`lib/firnc1/mono.fi` (853 Zeilen) ist die Portierung von `sema_generic.rs`
+(Erfassung, Namensschema) und `mono.rs` (Ausprägung). Für **jede benutzte
+Typkombination** entsteht eine eigene, vollständig konkrete Funktion bzw. ein
+eigener Struct; der Typprüfer sieht danach nur noch gewöhnlichen Code.
+Namensschema wie in Stufe 0: `vec_push__i32`, `Vec__ptrmut_u8`.
+
+Vier Dinge, die man dabei nicht raten kann:
+
+* **Die Vorlagen dürfen nicht in die Deklarationslisten des Baums.** Sonst
+  stolpert der Typprüfer über `T`, und `--emit=ast-kanon` druckte sie —
+  was `firnc0` nicht tut. Ihre *Knoten* stehen sehr wohl im Baum; `mono.fi`
+  merkt sich nur die Einstiegspunkte.
+* **Im Rumpf einer Vorlage sind Ausprägungen abstrakt.** `Vec[T]` innerhalb
+  von `vec_neu[T]` ist noch keine Arbeit, sondern eine Vorschrift. Erst beim
+  Nachbauen wird aus `Vec__T` ein `Vec__i32` — und *dann* kommt es auf den
+  Arbeitsstapel.
+* **Beim Nachbauen müssen Kinder-, Parameter-, Feld- und Anweisungslisten
+  lückenlos liegen.** Also erst fertig bauen, sammeln, dann am Stück ablegen.
+  Dieselbe Lehre wie im Parser (aus `f(a, g(b))` wurde dort einmal
+  `f(a, b, g(b))`).
+* **`size_of[T]()` ist kein Aufruf.** Der Typtext wandert in den Aufrufnamen
+  (`size_of$i32`), der Typknoten zusätzlich nach `e_zahl`; aufgelöst wird
+  beides erst im Typprüfer, der die Structtafel kennt. Ohne die Ersetzung
+  *beider* Stellen meldet er „unbekannter typ 'T'".
+
+Beim Selbstübersetzen entstehen daraus: **13 Funktionsvorlagen, 1
+Structvorlage, 31 gemeldete Ausprägungen, 28 wirklich erzeugte** (die
+Differenz sind die abstrakten, die nur in Vorlagenrümpfen stehen).
+
+### Drei Fehler, die erst das Selbstübersetzen gefunden hat
+
+Alle drei lagen **vor** dieser Runde im Code und wurden von 624 Tests nicht
+berührt. Ein Compiler, der sich selbst übersetzt, ist der schärfere Test.
+
+1. **`parser__lx` — ein Parameter, der umbenannt wurde.** Die Umbenennung eines
+   Moduls (`alias__name`) traf jeden Bezeichner, der oben deklariert ist —
+   auch dann, wenn ihn ein **Parameter verdeckt**. `parser.fi` hat eine
+   Funktion `lx(p)` *und* einen Parameter `lx` in `par_neu(lx: u64)`; der
+   Parameter hieß danach `parser__lx` und war weg. `modules.rs::Renamer` führt
+   dafür eine Liste lokaler Namen — `parser.fi` tut das jetzt auch, mit
+   Bereichen für Funktion, Block und `for`. Verdeckt werden **nur Werte**: ein
+   Aufruf `lx(p)` meint weiter die Funktion (`is_value = false`), ein Typname
+   ohnehin.
+2. **Vorwärtsverweise zwischen Structs ergaben still die Größe 0.**
+   `struct A { b: B }` **vor** `struct B` rechnete mit `groesse_von(B) = 0`,
+   ohne Meldung — das Programm lief und rechnete falsch (`tests/fwd`-Fall:
+   `firnc0` gab 0, `firnc1` gab 2). Aufgefallen ist es an der
+   Monomorphisierung: `Vec__u32` entsteht **nach** allen handgeschriebenen
+   Structs, wird aber von `lexer.Lexer` als Feld benutzt. `typen.fi` rechnet
+   das Layout jetzt **abhängigkeitsgetrieben** (`struct_layout` mit
+   `zustand`-Markierung); über Zeiger wird nicht abgestiegen, damit
+   `struct Knoten { naechster: *mut Knoten }` möglich bleibt.
+3. **`import` galt nur für die Wurzeldatei.** Ein Modul durfte kein Modul
+   einbinden. `tests/640_vec_modul.fi` scheiterte still daran, dass
+   `modules/vec.fi` sein eigenes `rt` nicht bekam. `bin/firnc1.fi` hält jetzt
+   eine **Warteschlange** über den ganzen Einbindungsgraphen (Breitensuche wie
+   `modules.rs::resolve`), mit Pfad-Dedup — damit sind auch die in Runde 29
+   benannten Grenzen weg: kein Doppeltparsen, kein endloser Zyklus, und
+   gesucht wird **zuerst neben der importierenden Datei**, dann neben der
+   Wurzeldatei.
+
+### Warum der Parser ein Register braucht
+
+`vec_push[i32](&v, 3)` und `feld[i]` sind bis auf den Namen dieselbe Form. Der
+Parser entscheidet **am Namen**, ob ein `[` eine Typargumentliste ist oder eine
+Indizierung — also muss vor dem Parsen der ersten Datei feststehen, welche
+Namen generisch sind. Deshalb läuft über **alle** Dateien zuerst eine
+Vorabsuche nach `fn IDENT [` und `struct IDENT [` (`gen_vorab`), und erst
+danach wird geparst. `firnc0` macht es seit Blocker B1 genauso
+(`build_program`: erst alle lexen, dann alle parsen).
+
+Der Preis ist ein zweites Lexen jeder Modulquelle. Das ist billiger als alle
+Lexer gleichzeitig offen zu halten — und es macht die Reihenfolge der
+`import`-Zeilen bedeutungslos.
+
+### `tests/730_generik_kern.fi`
+
+Der Test zur Runde, und er prüft genau das, was schiefging: eine Vorlage aus
+einem **Modul**, mit `i32`/`u8`/`i64` ausgeprägt; eine Vorlage, die eine
+Vorlage ruft — einmal mit demselben Typ, einmal mit einem festen anderen
+(`groesse[u8]()` innerhalb von `laenge_von[T]`); `size_of[T]()` im
+Vorlagenrumpf; ein Parameter `lx`, der die Funktion `lx` desselben Moduls
+verdeckt; ein Struct mit **Vorwärtsverweis** (geprüft wird das *Layout*, nicht
+nur dass es übersetzt); Ausprägungen als Feld eines eigenen Structs; und ein
+Modul, das ein Modul **neben sich** einbindet und dessen Konstante aus einem
+Vorlagenrumpf heraus benutzt.
+
+### Ehrliche Grenzen
+
+* **Die Einzeldatei-Werkzeuge kennen keine Generics.** `.astdump`,
+  `.semadump`, `.firdump`, `.layoutdump` melden bei einer generischen Datei
+  weiter „keine Kernsprache" (Rückgabewert 3). Das ist kein Verlust am
+  Vergleich: `firnc0 --emit=ast-kanon` scheitert an denselben Dateien selbst,
+  weil auch sein Parser das Register erst über den Modulweg bekommt — solche
+  Dateien zählen dort als *übersprungen*.
+* **`export` wird weiter nicht durchgesetzt.**
+* **Pfad-Dedup vergleicht Zeichenketten, nicht kanonisierte Pfade.** Wer
+  dieselbe Datei über zwei verschiedene Pfade einbindet, bekommt sie zweimal.
+  `firnc0` kanonisiert dafür.
+* **51 Dateien im Korpus bleiben außerhalb der Kernsprache** — und keine davon
+  wegen Generics: `enum`/`match` (10), Fehlerunionen (20), `gc`/`rc` (14),
+  Intrinsics für konstante Laufzeit (4), `errdefer` (1), `comptime` (2). Das
+  ist Stufe 1, nicht Stufe 0.
+
+### Was das jetzt heißt
+
+`SPEC.md` §11 verlangt für Stufe 3 den Fixpunkt. Der steht — für die
+Teilmenge, in der `firnc1` geschrieben ist. Der nächste ehrliche Schritt ist
+nicht „mehr Bootstrap", sondern der **Sprachumfang**: solange `firnc1` kein
+`enum`/`match` und keine Fehlerunionen liest, kann es `firnc0` nicht ersetzen,
+sondern nur sich selbst tragen.

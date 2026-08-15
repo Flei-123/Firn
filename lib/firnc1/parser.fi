@@ -26,9 +26,10 @@ import vec
 import intern
 import lexer
 import ast
+import mono
 
 export { Parser, par_neu, par_neu_modul, par_frei, par_lauf, par_fehler, par_baum,
-         par_nicht_kern, par_baum_uebernehmen }
+         par_nicht_kern, par_baum_uebernehmen, par_gen_setzen }
 
 // Token-Arten aus lexer.fi (dieselbe Reihenfolge wie compiler/src/lexer.rs)
 // "kein Wert"
@@ -149,6 +150,19 @@ struct Parser {
     kein_slit: usize,    // > 0: kein Struct-Literal auf oberster Ebene
     fehler: usize,
     nicht_kern: bool,    // Datei benutzt eine nicht portierte Erweiterung
+    // GENERISCHE VORLAGEN. Die Ablage liegt AUSSERHALB des Parsers, weil sie
+    // ueber alle Dateien einer Uebersetzung hinweg dieselbe sein muss: eine
+    // Wurzeldatei benutzt `Vec[i32]`, deklariert ist `Vec[T]` in einem Modul.
+    // 0 = kein Register, dann sind Generics eine nicht portierte Erweiterung.
+    gen: u64,
+    tpoff: u32,          // Anfang der laufenden Typparameterliste
+    // Namensnummer von `size_of`, oder -1. `size_of` ist KEIN Schluesselwort
+    // (sizeof.rs) — es laesst sich nur am Namen erkennen.
+    sonr: i64,
+    // LOKALE NAMEN, als Stapel von Bereichen. Ein Parameter oder eine lokale
+    // Variable VERDECKT einen gleichnamigen Namen derselben Datei.
+    lokal: Vec[u32],
+    lgrenze: Vec[u32],
 }
 
 fn par_neu(lx: u64) -> Parser {
@@ -159,6 +173,8 @@ fn par_neu(lx: u64) -> Parser {
         module: vec_neu[u32](),
         kladde: rt.buf_neu(),
         klammern: 0, kein_slit: 0, fehler: 0, nicht_kern: false,
+        gen: 0, tpoff: 0, sonr: -1,
+        lokal: vec_neu[u32](), lgrenze: vec_neu[u32](),
     }
     p.n = lexer.lex_anzahl(lx as *mut lexer.Lexer)
     return p
@@ -173,6 +189,12 @@ fn par_neu_modul(lx: u64, baum: u64, alias: u32) -> Parser {
     return p
 }
 
+// Register der generischen Vorlagen anmelden. MUSS vor `par_lauf` stehen.
+fn par_gen_setzen(p: *mut Parser, g: u64) { (*p).gen = g }
+
+fn gn(p: *mut Parser) -> *mut mono.Gen { return (*p).gen as *mut mono.Gen }
+fn hat_gen(p: *mut Parser) -> bool { return (*p).gen != 0 }
+
 fn par_baum_uebernehmen(p: *mut Parser) -> *mut ast.Baum {
     return par_baum(p)
 }
@@ -185,6 +207,8 @@ fn par_frei(p: *mut Parser) {
     vec_frei[u32](&(*p).module)
     vec_frei[u32](&(*p).eigene)
     rt.buf_frei(&(*p).kladde)
+    vec_frei[u32](&(*p).lokal)
+    vec_frei[u32](&(*p).lgrenze)
 }
 
 fn par_fehler(p: *mut Parser) -> usize { return (*p).fehler }
@@ -300,6 +324,44 @@ fn ist_eigen(p: *mut Parser, nr: u32) -> bool {
 
 // Umbenennung eines Namens dieser Datei: `alias__name`. In der Wurzeldatei
 // bleibt alles, wie es ist.
+// ------------------------------------------------------------ Lokale Namen
+//
+// `fn par_neu(lx: u64)` in einer Datei, die auch `fn lx(..)` hat: `lx` im
+// Rumpf ist der PARAMETER. Ohne diese Liste bekam er beim Umbenennen
+// `parser__` davor und war weg — gefunden erst beim Selbstuebersetzen in
+// Runde 31, weil vorher kein Modul einen Parameter so nannte wie eine seiner
+// eigenen Funktionen. `modules.rs::Renamer` haelt dieselbe Liste.
+//
+// NUR WERTE werden verdeckt. Ein Aufruf `lx(p)` meint weiterhin die
+// Funktion (`Renamer::resolve` mit `is_value = false`), und ein TYPNAME
+// ohnehin.
+fn lok_auf(p: *mut Parser) {
+    vec_push[u32](&(*p).lgrenze, vec_len[u32](&(*p).lokal) as u32)
+}
+
+fn lok_zu(p: *mut Parser) {
+    if vec_len[u32](&(*p).lgrenze) == 0 {
+        return
+    }
+    let g: u32 = vec_pop[u32](&(*p).lgrenze)
+    while vec_len[u32](&(*p).lokal) > g as usize {
+        vec_pop[u32](&(*p).lokal)
+    }
+}
+
+fn lok_dazu(p: *mut Parser, nr: u32) { vec_push[u32](&(*p).lokal, nr) }
+
+fn ist_lokal(p: *mut Parser, nr: u32) -> bool {
+    var i: usize = 0
+    while i < vec_len[u32](&(*p).lokal) {
+        if vec_at[u32](&(*p).lokal, i) == nr {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
 fn umbenannt(p: *mut Parser, nr: u32) -> u32 {
     if (*p).alias == KEIN {
         return nr
@@ -338,20 +400,121 @@ fn ist_modul(p: *mut Parser, nr: u32) -> bool {
 
 // `name` steht schon; wenn es ein Modulname mit `.` dahinter ist, wird
 // `modul.mitglied` daraus.
-fn vielleicht_qualifiziert(p: *mut Parser, nr: u32) -> u32 {
+fn umbenannt_wert(p: *mut Parser, nr: u32, wert: bool) -> u32 {
+    if wert {
+        if ist_lokal(p, nr) {
+            return nr
+        }
+    }
+    return umbenannt(p, nr)
+}
+
+fn vielleicht_qualifiziert(p: *mut Parser, nr: u32, wert: bool) -> u32 {
     if !ist_modul(p, nr) {
-        return umbenannt(p, nr)
+        return umbenannt_wert(p, nr, wert)
     }
     if !ist(p, A_DOT) {
-        return umbenannt(p, nr)
+        return umbenannt_wert(p, nr, wert)
     }
     if art(p, 1) != A_IDENT {
-        return umbenannt(p, nr)
+        return umbenannt_wert(p, nr, wert)
     }
     let m: u32 = nummer(p, 1)
     weiter_bump(p)
     weiter_bump(p)
     return qualifiziere(p, nr, m)
+}
+
+// ---------------------------------------------------------- Generisches
+//
+// `[T, U: Int]` an der DEKLARATION, `[i32, u8]` an der VERWENDUNG. Eckige
+// Klammern statt spitzer, damit `<` eindeutig Vergleich bleibt (SPEC §12).
+
+// Typparameterliste einer Vorlage. Die Parameter landen im Register, hier
+// steht nur, ob es geklappt hat.
+fn typparameterliste(p: *mut Parser) -> bool {
+    if !erwarte(p, A_LBRACKET) {
+        return false
+    }
+    let off: u32 = mono.gen_tp_anfang(gn(p))
+    (*p).tpoff = off
+    while true {
+        if ist(p, A_RBRACKET) || am_ende(p) {
+            break
+        }
+        let vor: usize = (*p).pos
+        if !ist(p, A_IDENT) {
+            meckern(p)
+            return false
+        }
+        let name: u32 = nummer(p, 0)
+        weiter_bump(p)
+        var schranke: u32 = 0
+        if friss(p, A_COLON) {
+            if !ist(p, A_IDENT) {
+                meckern(p)
+                return false
+            }
+            let s: u32 = mono.gen_schranke(gn(p), nummer(p, 0))
+            if s == KEIN {
+                meckern(p)
+                return false
+            }
+            schranke = s
+            weiter_bump(p)
+        }
+        if mono.gen_tp_doppelt(gn(p), off, name) {
+            meckern(p)
+            return false
+        }
+        mono.gen_tp_dazu(gn(p), name, schranke)
+        if !friss(p, A_COMMA) {
+            break
+        }
+        if (*p).pos == vor {
+            weiter_bump(p)
+        }
+    }
+    if !erwarte(p, A_RBRACKET) {
+        return false
+    }
+    if mono.gen_tp_anfang(gn(p)) == off {
+        meckern(p)
+        return false
+    }
+    return true
+}
+
+// Typargumente an einer Verwendungsstelle: `[i32, *mut u8]`.
+fn typargumente(p: *mut Parser, aus: *mut Vec[u32]) -> bool {
+    if !erwarte(p, A_LBRACKET) {
+        return false
+    }
+    while true {
+        if ist(p, A_RBRACKET) || am_ende(p) {
+            break
+        }
+        let vor: usize = (*p).pos
+        let t: u32 = typ(p)
+        if t == ast.NICHTS {
+            return false
+        }
+        vec_push[u32](aus, t)
+        if !friss(p, A_COMMA) {
+            break
+        }
+        if (*p).pos == vor {
+            weiter_bump(p)
+        }
+    }
+    if !erwarte(p, A_RBRACKET) {
+        return false
+    }
+    if vec_len[u32](aus) == 0 {
+        meckern(p)
+        return false
+    }
+    return true
 }
 
 // -------------------------------------------------------------------- Typen
@@ -392,14 +555,28 @@ fn typ(p: *mut Parser) -> u32 {
     if ist(p, A_IDENT) {
         let nr: u32 = nummer(p, 0)
         weiter_bump(p)
-        // Ein `[` hinter einem Typnamen waere eine generische Ausprägung —
-        // die gehoert zu den nicht portierten Erweiterungen.
+        // Ein `[` hinter einem Typnamen ist eine generische Auspraegung.
         if ist(p, A_LBRACKET) {
-            (*p).nicht_kern = true
-            meckern(p)
-            return ast.NICHTS
+            var generisch: bool = false
+            if hat_gen(p) {
+                generisch = mono.gen_ist_struct(gn(p), nr)
+            }
+            if !generisch {
+                (*p).nicht_kern = true
+                meckern(p)
+                return ast.NICHTS
+            }
+            var targs: Vec[u32] = vec_neu[u32]()
+            let ok: bool = typargumente(p, &targs)
+            if !ok {
+                vec_frei[u32](&targs)
+                return ast.NICHTS
+            }
+            let m: u32 = mono.gen_auspraegung(gn(p), nr, &targs, false)
+            vec_frei[u32](&targs)
+            return ast.typ_neu(par_baum(p), ast.T_NAME, m, 0)
         }
-        let q: u32 = vielleicht_qualifiziert(p, nr)
+        let q: u32 = vielleicht_qualifiziert(p, nr, false)
         return ast.typ_neu(par_baum(p), ast.T_NAME, q, 0)
     }
     meckern(p)
@@ -594,10 +771,35 @@ fn nach_ausdruck(p: *mut Parser) -> u32 {
             weiter_bump(p)
             e = ast.ausdruck_neu(par_baum(p), ast.E_FELD, e, nr, 0, 0)
         } else if a == A_LBRACKET {
-            weiter_bump(p)
-            let idx: u32 = innen_ausdruck(p)
-            erwarte(p, A_RBRACKET)
-            e = ast.ausdruck_neu(par_baum(p), ast.E_IDX, e, idx, 0, 0)
+            // `summe[i32](a, b)` — Aufruf einer generischen Vorlage. Das ist
+            // die einzige Stelle, an der `[` nach einem Ausdruck NICHT
+            // Indizierung heisst; entschieden wird am NAMEN.
+            var vorlage: bool = false
+            if hat_gen(p) && ast.e_art(par_baum(p), e) == ast.E_ID {
+                vorlage = mono.gen_ist_fn(gn(p), ast.e_a(par_baum(p), e))
+            }
+            if vorlage {
+                let basis: u32 = ast.e_a(par_baum(p), e)
+                var targs: Vec[u32] = vec_neu[u32]()
+                let ok: bool = typargumente(p, &targs)
+                if !ok {
+                    vec_frei[u32](&targs)
+                    return e
+                }
+                let m: u32 = mono.gen_auspraegung(gn(p), basis, &targs, true)
+                vec_frei[u32](&targs)
+                if !erwarte(p, A_LPAREN) {
+                    return e
+                }
+                let off: u32 = ruf_argumente(p)
+                let laen: u32 = ast.kind_anzahl(par_baum(p)) - off
+                e = ast.ausdruck_neu(par_baum(p), ast.E_RUF, m, off, laen, 0)
+            } else {
+                weiter_bump(p)
+                let idx: u32 = innen_ausdruck(p)
+                erwarte(p, A_RBRACKET)
+                e = ast.ausdruck_neu(par_baum(p), ast.E_IDX, e, idx, 0, 0)
+            }
         } else if a == A_LPAREN {
             // Nur direkte Funktionsnamen koennen aufgerufen werden (Stufe 0).
             if ast.e_art(par_baum(p), e) != ast.E_ID {
@@ -687,6 +889,31 @@ fn text_literal(p: *mut Parser) -> u32 {
     return ast.ausdruck_neu(par_baum(p), ast.E_ALIT, 0, off, n as u32, 0)
 }
 
+// `size_of[Typname]()` — `size_of` ist gelesen, `[` steht an.
+//
+// BEWUSST NUR EIN TYPNAME, kein voller Typausdruck: genau wie `sizeof.rs`.
+fn size_of_ausdruck(p: *mut Parser) -> u32 {
+    weiter_bump(p)
+    if !ist(p, A_IDENT) {
+        meckern(p)
+        return ast.ausdruck_neu(par_baum(p), ast.E_INT, 0, 0, 0, 0)
+    }
+    let tn: u32 = nummer(p, 0)
+    weiter_bump(p)
+    if !erwarte(p, A_RBRACKET) {
+        return ast.ausdruck_neu(par_baum(p), ast.E_INT, 0, 0, 0, 0)
+    }
+    if !erwarte(p, A_LPAREN) {
+        return ast.ausdruck_neu(par_baum(p), ast.E_INT, 0, 0, 0, 0)
+    }
+    if !erwarte(p, A_RPAREN) {
+        return ast.ausdruck_neu(par_baum(p), ast.E_INT, 0, 0, 0, 0)
+    }
+    let t: u32 = ast.typ_neu(par_baum(p), ast.T_NAME, tn, 0)
+    let name: u32 = mono.gen_size_of_name(gn(p), t)
+    return ast.ausdruck_neu(par_baum(p), ast.E_RUF, name, 0, 0, (t as u64) + 1)
+}
+
 fn grund_ausdruck(p: *mut Parser) -> u32 {
     let a: u32 = art(p, 0)
     if a == A_INT {
@@ -767,14 +994,42 @@ fn grund_ausdruck(p: *mut Parser) -> u32 {
     if a == A_IDENT {
         let nr: u32 = nummer(p, 0)
         weiter_bump(p)
-        // `Enum::Variante` und generische Aufrufe gehoeren zu den nicht
-        // portierten Erweiterungen.
+        // `size_of[T]()` — der Typtext wandert in den AUFRUFNAMEN
+        // (`size_of$i32`, sizeof.rs), der Typknoten zusaetzlich nach
+        // `e_zahl`; aufgeloest wird beides erst im Typpruefer, der die
+        // Structtafel kennt.
+        if (*p).sonr >= 0 && nr as i64 == (*p).sonr && ist(p, A_LBRACKET) {
+            return size_of_ausdruck(p)
+        }
+        // `Vec[i32]{ ... }` — Literal einer generischen Struktur.
+        var gstruct: bool = false
+        if hat_gen(p) && ist(p, A_LBRACKET) {
+            gstruct = mono.gen_ist_struct(gn(p), nr)
+        }
+        if gstruct {
+            var targs: Vec[u32] = vec_neu[u32]()
+            let ok: bool = typargumente(p, &targs)
+            if !ok {
+                vec_frei[u32](&targs)
+                return ast.ausdruck_neu(par_baum(p), ast.E_INT, 0, 0, 0, 0)
+            }
+            let m: u32 = mono.gen_auspraegung(gn(p), nr, &targs, false)
+            vec_frei[u32](&targs)
+            if ist(p, A_LBRACE) && (*p).kein_slit == 0 {
+                return struct_literal(p, m)
+            }
+            meckern(p)
+            return ast.ausdruck_neu(par_baum(p), ast.E_INT, 0, 0, 0, 0)
+        }
+        // `Enum::Variante` gehoert zu den nicht portierten Erweiterungen.
         if ist(p, A_COLON) && art(p, 1) == A_COLON {
             (*p).nicht_kern = true
             meckern(p)
             return ast.ausdruck_neu(par_baum(p), ast.E_INT, 0, 0, 0, 0)
         }
-        let q: u32 = vielleicht_qualifiziert(p, nr)
+        // Steht `(` an, ist das ein AUFRUFNAME — den verdeckt eine lokale
+        // Variable nicht (`Renamer::resolve`, is_value = false).
+        let q: u32 = vielleicht_qualifiziert(p, nr, !ist(p, A_LPAREN))
         if ist(p, A_LBRACE) && (*p).kein_slit == 0 {
             return struct_literal(p, q)
         }
@@ -804,6 +1059,7 @@ fn block(p: *mut Parser) -> u32 {
     if !erwarte(p, A_LBRACE) {
         return ast.block_neu(par_baum(p), 0, 0)
     }
+    lok_auf(p)
     // Die Anweisungsnummern werden zuerst gesammelt und erst am Ende in
     // `sliste` gelegt — verschachtelte Bloecke wuerden sonst dazwischenfunken.
     var eigene: Vec[u32] = vec_neu[u32]()
@@ -837,6 +1093,7 @@ fn block(p: *mut Parser) -> u32 {
     }
     let laen: u32 = vec_len[u32](&eigene) as u32
     vec_frei[u32](&eigene)
+    lok_zu(p)
     return ast.block_neu(par_baum(p), off, laen)
 }
 
@@ -864,6 +1121,8 @@ fn let_anweisung(p: *mut Parser) -> u32 {
     }
     let init: u32 = ausdruck(p)
     ende_anweisung(p)
+    // ERST JETZT sichtbar: `let x = x + 1` meint rechts das aeussere `x`.
+    lok_dazu(p, name)
     return ast.anweisung_neu(par_baum(p), art_s, name, t, init, 0)
 }
 
@@ -907,7 +1166,10 @@ fn for_anweisung(p: *mut Parser) -> u32 {
         return ast.anweisung_neu(par_baum(p), ast.S_BREAK, 0, 0, 0, 0)
     }
     let bis: u32 = bed_ausdruck(p)
+    lok_auf(p)
+    lok_dazu(p, name)
     let rumpf: u32 = block(p)
+    lok_zu(p)
     return ast.anweisung_neu(par_baum(p), ast.S_FOR, name, von, bis, rumpf)
 }
 
@@ -1004,6 +1266,7 @@ fn parameterliste(p: *mut Parser) -> u32 {
             break
         }
         ast.param_dazu(par_baum(p), name, t)
+        lok_dazu(p, name)
         if !friss(p, A_COMMA) {
             break
         }
@@ -1014,23 +1277,112 @@ fn parameterliste(p: *mut Parser) -> u32 {
     return off
 }
 
+// `fn name[T: Int](..) -> R { .. }`
+//
+// DER NAME BLEIBT UNVERAENDERT, auch in einem Modul: generische Namen gelten
+// programmweit und werden unqualifiziert benutzt (`vec_push[i32](..)`).
+// Deshalb nimmt `eigene_suchen` sie auch nicht in die Umbenennungsliste auf.
+//
+// Die Vorlage geht NICHT in die Funktionsliste des Baums — sonst stolperte
+// der Typpruefer ueber `T` und `--emit=ast-kanon` druckte sie, was `firnc0`
+// nicht tut. Ihre Knoten stehen sehr wohl im Baum; gemerkt werden nur die
+// Einstiegspunkte.
+fn fn_vorlage(p: *mut Parser, name: u32) {
+    if !typparameterliste(p) {
+        return
+    }
+    let toff: u32 = (*p).tpoff
+    let tlen: u32 = mono.gen_tp_anfang(gn(p)) - toff
+    if !erwarte(p, A_LPAREN) {
+        return
+    }
+    // Waehrend des Rumpfes sind alle Auspraegungen ABSTRAKT: `Vec[T]` ist
+    // noch keine Arbeit, sondern eine Vorschrift.
+    mono.gen_tiefe_auf(gn(p))
+    lok_auf(p)
+    let poff: u32 = parameterliste(p)
+    erwarte(p, A_RPAREN)
+    let plen: u32 = ast.param_anfang(par_baum(p)) - poff
+    var ret: u32 = ast.NICHTS
+    if friss(p, A_ARROW) {
+        ret = typ(p)
+        if ret == ast.NICHTS {
+            lok_zu(p)
+            mono.gen_tiefe_zu(gn(p))
+            return
+        }
+    }
+    let rumpf: u32 = block(p)
+    lok_zu(p)
+    mono.gen_tiefe_zu(gn(p))
+    mono.gen_fn_vorlage(gn(p), name, toff, tlen, poff, plen, ret, rumpf)
+}
+
+// `struct Name[T] { feld: T, .. }`
+fn struct_vorlage(p: *mut Parser, name: u32) {
+    if !typparameterliste(p) {
+        return
+    }
+    let toff: u32 = (*p).tpoff
+    let tlen: u32 = mono.gen_tp_anfang(gn(p)) - toff
+    if !erwarte(p, A_LBRACE) {
+        return
+    }
+    mono.gen_tiefe_auf(gn(p))
+    let off: u32 = ast.feld_anfang(par_baum(p))
+    while true {
+        while friss(p, A_COMMA) || friss(p, A_SEMI) {}
+        if ist(p, A_RBRACE) || am_ende(p) {
+            break
+        }
+        let vor: usize = (*p).pos
+        if !ist(p, A_IDENT) {
+            meckern(p)
+            break
+        }
+        let fname: u32 = nummer(p, 0)
+        weiter_bump(p)
+        if !erwarte(p, A_COLON) {
+            break
+        }
+        let t: u32 = typ(p)
+        if t == ast.NICHTS {
+            break
+        }
+        ast.feld_dazu(par_baum(p), fname, t)
+        if (*p).pos == vor {
+            weiter_bump(p)
+        }
+    }
+    erwarte(p, A_RBRACE)
+    mono.gen_tiefe_zu(gn(p))
+    let flen: u32 = ast.feld_anfang(par_baum(p)) - off
+    mono.gen_struct_vorlage(gn(p), name, toff, tlen, off, flen)
+}
+
 fn fn_deklaration(p: *mut Parser) {
     weiter_bump(p)
     if !ist(p, A_IDENT) {
         meckern(p)
         return
     }
-    let name: u32 = umbenannt(p, nummer(p, 0))
+    let roh: u32 = nummer(p, 0)
     weiter_bump(p)
-    // Eine Typparameterliste waere eine generische Vorlage.
+    // Eine Typparameterliste macht daraus eine generische VORLAGE.
     if ist(p, A_LBRACKET) {
-        (*p).nicht_kern = true
-        meckern(p)
+        if !hat_gen(p) {
+            (*p).nicht_kern = true
+            meckern(p)
+            return
+        }
+        fn_vorlage(p, roh)
         return
     }
+    let name: u32 = umbenannt(p, roh)
     if !erwarte(p, A_LPAREN) {
         return
     }
+    lok_auf(p)
     let poff: u32 = parameterliste(p)
     erwarte(p, A_RPAREN)
     let plen: u32 = vec_len[u32](&(*par_baum(p)).pa_name) as u32 - poff
@@ -1038,10 +1390,12 @@ fn fn_deklaration(p: *mut Parser) {
     if friss(p, A_ARROW) {
         ret = typ(p)
         if ret == ast.NICHTS {
+            lok_zu(p)
             return
         }
     }
     let rumpf: u32 = block(p)
+    lok_zu(p)
     ast.fn_dazu(par_baum(p), name, poff, plen, ret, rumpf)
 }
 
@@ -1051,13 +1405,18 @@ fn struct_deklaration(p: *mut Parser) {
         meckern(p)
         return
     }
-    let name: u32 = umbenannt(p, nummer(p, 0))
+    let roh: u32 = nummer(p, 0)
     weiter_bump(p)
     if ist(p, A_LBRACKET) {
-        (*p).nicht_kern = true
-        meckern(p)
+        if !hat_gen(p) {
+            (*p).nicht_kern = true
+            meckern(p)
+            return
+        }
+        struct_vorlage(p, roh)
         return
     }
+    let name: u32 = umbenannt(p, roh)
     if !erwarte(p, A_LBRACE) {
         return
     }
@@ -1208,7 +1567,9 @@ fn module_vorab(p: *mut Parser) {
 //   enum · match · error · try · catch · comptime · '#'   Schluesselwoerter
 //   '?'                                                    `x.as?[C]`
 //   '::'                                                   `Enum::Variante`
-//   IDENT '['  nach 'fn'/'struct'                          generische Vorlage
+//   IDENT '['  nach 'fn'/'struct'   generische Vorlage — NUR NOCH DANN eine
+//                                   Erweiterung, wenn kein Vorlagenregister
+//                                   angemeldet ist (Runde 31)
 //   IDENT '!'                                              Fehlerunion `E!T`
 //   der Bezeichner `gc`                                    `gc class`, `gc C{}`
 fn erweiterungen_suchen(p: *mut Parser) {
@@ -1266,7 +1627,7 @@ fn erweiterungen_suchen(p: *mut Parser) {
                 (*p).nicht_kern = true
                 return
             }
-            if i > 0 && i + 1 < (*p).n {
+            if i > 0 && i + 1 < (*p).n && !hat_gen(p) {
                 let vorher: u32 = lexer.lex_art(lx(p), i - 1)
                 if vorher == A_KWFN || vorher == A_KWSTRUCT {
                     if lexer.lex_art(lx(p), i + 1) == A_LBRACKET {
@@ -1292,7 +1653,17 @@ fn eigene_suchen(p: *mut Parser) {
         let a: u32 = lexer.lex_art(lx(p), i)
         if a == A_KWFN || a == A_KWSTRUCT || a == A_KWCONST {
             if lexer.lex_art(lx(p), i + 1) == A_IDENT {
-                vec_push[u32](&(*p).eigene, lexer.lex_nr(lx(p), i + 1))
+                // Eine generische Vorlage behaelt ihren Namen: generische
+                // Namen gelten PROGRAMMWEIT und werden unqualifiziert
+                // benutzt. Wer sie umbenennt, macht `vec_push[i32](..)` in
+                // der Wurzeldatei unauffindbar.
+                var generisch: bool = false
+                if a != A_KWCONST && i + 2 < (*p).n {
+                    generisch = lexer.lex_art(lx(p), i + 2) == A_LBRACKET
+                }
+                if !generisch {
+                    vec_push[u32](&(*p).eigene, lexer.lex_nr(lx(p), i + 1))
+                }
             }
         }
         i = i + 1
@@ -1300,6 +1671,10 @@ fn eigene_suchen(p: *mut Parser) {
 }
 
 fn par_lauf(p: *mut Parser) {
+    if hat_gen(p) {
+        var so: [u8; 7] = "size_of"
+        (*p).sonr = intern.intern_finde(lexer.lex_namen(lx(p)), (&so[0]) as u64, 7)
+    }
     erweiterungen_suchen(p)
     eigene_suchen(p)
     if (*p).nicht_kern {
