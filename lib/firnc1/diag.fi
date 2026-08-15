@@ -1,0 +1,357 @@
+// lib/firnc1/diag.fi — DIAGNOSEN, GESCHRIEBEN IN FIRN.
+//
+// Zweiter Teil von Stufe 1 (docs/SELBSTHOSTING.md §2). Das Ausgabeformat ist
+// VERBINDLICH — die Negativtests haengen daran:
+//
+//     error: erwartet ')' nach Argumentliste
+//       --> tests/neg/bad_call.fi:7:22
+//        |
+//      7 |     let x = add(1, 2 ;
+//        |                      ^ hier
+//        = hinweis: ...
+//
+// Nachgewiesen wird das nicht durch Hinsehen, sondern durch `tools/lex_vergleich.sh`:
+// fuer jede Quelle mit einem Lexfehler muss die FEHLERAUSGABE dieses Moduls
+// Oktett fuer Oktett mit der von `firnc0 --emit=tokens` uebereinstimmen.
+//
+// AUFBAU: wie im Lexer Struktur der Felder statt Feld der Strukturen. Eine
+// Diagnose besteht aus vier Zahlen (Datei, Zeile, Spalte, Laenge) und drei
+// Textstuecken (Meldung, Markierungstext, Hinweis); die Zahlen liegen in
+// `Vec[u32]`, die Texte hintereinander in EINEM Puffer mit Versatz und Laenge.
+
+import rt
+import vec
+
+export { Diags, diag_neu, diag_frei, diag_datei, diag_dateiname,
+         diag_fehler, diag_fehler_hinweis, diag_anzahl, diag_hat_fehler,
+         diag_voll, diag_render, diag_quellzeile }
+
+const TABBREITE: usize = 4
+// Obergrenze, damit kaputte Eingaben keine Fehlerlawine erzeugen.
+const HOECHSTZAHL: usize = 40
+// Steht fuer "kein Hinweis" — eine echte Laenge wird das nie.
+const KEIN: u32 = 4294967295
+
+struct Diags {
+    // --- Quelltextkarte
+    dnamen: rt.Buf,        // Dateinamen hintereinander
+    dname_off: Vec[u32],
+    dname_len: Vec[u32],
+    dquelle: Vec[u64],     // Zeiger auf den Quelltext je Datei
+    dquelle_len: Vec[u64],
+    // --- gesammelte Diagnosen
+    d_datei: Vec[u32],
+    d_zeile: Vec[u32],
+    d_spalte: Vec[u32],
+    d_laenge: Vec[u32],
+    txt: rt.Buf,           // Meldung, Markierung und Hinweis hintereinander
+    d_msg_off: Vec[u32],
+    d_msg_len: Vec[u32],
+    d_mark_off: Vec[u32],
+    d_mark_len: Vec[u32],
+    d_hin_off: Vec[u32],
+    d_hin_len: Vec[u32],   // KEIN = kein Hinweis
+}
+
+fn diag_neu() -> Diags {
+    return Diags{
+        dnamen: rt.buf_neu(),
+        dname_off: vec_neu[u32](), dname_len: vec_neu[u32](),
+        dquelle: vec_neu[u64](), dquelle_len: vec_neu[u64](),
+        d_datei: vec_neu[u32](), d_zeile: vec_neu[u32](),
+        d_spalte: vec_neu[u32](), d_laenge: vec_neu[u32](),
+        txt: rt.buf_neu(),
+        d_msg_off: vec_neu[u32](), d_msg_len: vec_neu[u32](),
+        d_mark_off: vec_neu[u32](), d_mark_len: vec_neu[u32](),
+        d_hin_off: vec_neu[u32](), d_hin_len: vec_neu[u32](),
+    }
+}
+
+fn diag_frei(d: *mut Diags) {
+    rt.buf_frei(&(*d).dnamen)
+    vec_frei[u32](&(*d).dname_off)
+    vec_frei[u32](&(*d).dname_len)
+    vec_frei[u64](&(*d).dquelle)
+    vec_frei[u64](&(*d).dquelle_len)
+    vec_frei[u32](&(*d).d_datei)
+    vec_frei[u32](&(*d).d_zeile)
+    vec_frei[u32](&(*d).d_spalte)
+    vec_frei[u32](&(*d).d_laenge)
+    rt.buf_frei(&(*d).txt)
+    vec_frei[u32](&(*d).d_msg_off)
+    vec_frei[u32](&(*d).d_msg_len)
+    vec_frei[u32](&(*d).d_mark_off)
+    vec_frei[u32](&(*d).d_mark_len)
+    vec_frei[u32](&(*d).d_hin_off)
+    vec_frei[u32](&(*d).d_hin_len)
+}
+
+// Nimmt eine Quelldatei in die Karte auf und liefert ihre Nummer.
+fn diag_datei(d: *mut Diags, name: u64, name_n: usize, quelle: u64, quelle_n: usize) -> u32 {
+    let nr: u32 = vec_len[u32](&(*d).dname_off) as u32
+    vec_push[u32](&(*d).dname_off, rt.buf_len(&(*d).dnamen) as u32)
+    rt.buf_push_bytes(&(*d).dnamen, name, name_n)
+    vec_push[u32](&(*d).dname_len, name_n as u32)
+    vec_push[u64](&(*d).dquelle, quelle)
+    vec_push[u64](&(*d).dquelle_len, quelle_n as u64)
+    return nr
+}
+
+fn diag_anzahl(d: *mut Diags) -> usize { return vec_len[u32](&(*d).d_zeile) }
+fn diag_hat_fehler(d: *mut Diags) -> bool { return diag_anzahl(d) > 0 }
+fn diag_voll(d: *mut Diags) -> bool { return diag_anzahl(d) >= HOECHSTZAHL }
+
+fn diag_dateiname(d: *mut Diags, nr: u32, aus: *mut rt.Buf) {
+    if nr as usize >= vec_len[u32](&(*d).dname_off) {
+        var unb: [u8; 11] = "<unbekannt>"
+        rt.buf_push_bytes(aus, (&unb[0]) as u64, 11)
+        return
+    }
+    let p: u64 = rt.buf_ptr(&(*d).dnamen) + vec_at[u32](&(*d).dname_off, nr as usize) as u64
+    rt.buf_push_bytes(aus, p, vec_at[u32](&(*d).dname_len, nr as usize) as usize)
+}
+
+// Vergleicht zwei Textstuecke im Meldungspuffer bzw. gegen einen Zeiger.
+fn txt_gleich(d: *mut Diags, off: u32, laen: u32, p: u64, n: usize) -> bool {
+    if laen as usize != n {
+        return false
+    }
+    return rt.mem_eq(rt.buf_ptr(&(*d).txt) + off as u64, p, n)
+}
+
+// Doppelte Meldungen an derselben Stelle unterdruecken
+// (Fehlerwiederherstellung erzeugt sie sonst reihenweise).
+fn schon_da(d: *mut Diags, datei: u32, zeile: u32, spalte: u32, laenge: u32,
+            msg: u64, msg_n: usize) -> bool {
+    var i: usize = 0
+    while i < diag_anzahl(d) {
+        var gleich: bool = vec_at[u32](&(*d).d_datei, i) == datei
+        gleich = gleich && vec_at[u32](&(*d).d_zeile, i) == zeile
+        gleich = gleich && vec_at[u32](&(*d).d_spalte, i) == spalte
+        gleich = gleich && vec_at[u32](&(*d).d_laenge, i) == laenge
+        if gleich {
+            if txt_gleich(d, vec_at[u32](&(*d).d_msg_off, i), vec_at[u32](&(*d).d_msg_len, i), msg, msg_n) {
+                return true
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn ablegen(d: *mut Diags, datei: u32, zeile: u32, spalte: u32, laenge: u32,
+           msg: u64, msg_n: usize, hin: u64, hin_n: usize, hat_hin: bool) {
+    if schon_da(d, datei, zeile, spalte, laenge, msg, msg_n) {
+        return
+    }
+    if diag_voll(d) {
+        return
+    }
+    vec_push[u32](&(*d).d_datei, datei)
+    vec_push[u32](&(*d).d_zeile, zeile)
+    vec_push[u32](&(*d).d_spalte, spalte)
+    var ln: u32 = laenge
+    if ln == 0 { ln = 1 }
+    vec_push[u32](&(*d).d_laenge, ln)
+
+    vec_push[u32](&(*d).d_msg_off, rt.buf_len(&(*d).txt) as u32)
+    rt.buf_push_bytes(&(*d).txt, msg, msg_n)
+    vec_push[u32](&(*d).d_msg_len, msg_n as u32)
+
+    // Markierungstext ist bei `error`/`error_note` immer "hier".
+    var hier: [u8; 4] = "hier"
+    vec_push[u32](&(*d).d_mark_off, rt.buf_len(&(*d).txt) as u32)
+    rt.buf_push_bytes(&(*d).txt, (&hier[0]) as u64, 4)
+    vec_push[u32](&(*d).d_mark_len, 4)
+
+    vec_push[u32](&(*d).d_hin_off, rt.buf_len(&(*d).txt) as u32)
+    if hat_hin {
+        rt.buf_push_bytes(&(*d).txt, hin, hin_n)
+        vec_push[u32](&(*d).d_hin_len, hin_n as u32)
+    } else {
+        vec_push[u32](&(*d).d_hin_len, KEIN)
+    }
+}
+
+fn diag_fehler(d: *mut Diags, datei: u32, zeile: u32, spalte: u32, laenge: u32,
+               msg: u64, msg_n: usize) {
+    ablegen(d, datei, zeile, spalte, laenge, msg, msg_n, 0, 0, false)
+}
+
+fn diag_fehler_hinweis(d: *mut Diags, datei: u32, zeile: u32, spalte: u32, laenge: u32,
+                       msg: u64, msg_n: usize, hin: u64, hin_n: usize) {
+    ablegen(d, datei, zeile, spalte, laenge, msg, msg_n, hin, hin_n, true)
+}
+
+// Anfang und Laenge der Quelltextzeile `zeile` (1-basiert), ohne Zeilenende
+// und ohne ein abschliessendes CR. Rueckgabe gepackt: (anfang << 32) | laenge.
+// Bei ungueltiger Zeile: 0.
+fn diag_quellzeile(d: *mut Diags, datei: u32, zeile: u32) -> u64 {
+    if zeile == 0 || datei as usize >= vec_len[u64](&(*d).dquelle) {
+        return 0
+    }
+    let q: u64 = vec_at[u64](&(*d).dquelle, datei as usize)
+    let n: usize = vec_at[u64](&(*d).dquelle_len, datei as usize) as usize
+    var nr: u32 = 1
+    var anfang: usize = 0
+    var i: usize = 0
+    while i <= n {
+        if i == n || rt.ld8(q, i) == 10 as u8 {
+            if nr == zeile {
+                var ende: usize = i
+                if ende > anfang {
+                    if rt.ld8(q, ende - 1) == 13 as u8 {
+                        ende = ende - 1
+                    }
+                }
+                return ((anfang as u64) << 32) | ((ende - anfang) as u64)
+            }
+            nr = nr + 1
+            anfang = i + 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn stellen(v: u64) -> usize {
+    var s: usize = 1
+    var t: u64 = v
+    while t >= 10 {
+        t = t / 10
+        s = s + 1
+    }
+    return s
+}
+
+fn wiederhole(b: *mut rt.Buf, c: u8, n: usize) {
+    var i: usize = 0
+    while i < n {
+        rt.buf_push(b, c)
+        i = i + 1
+    }
+}
+
+fn txt_stueck(d: *mut Diags, b: *mut rt.Buf, off: u32, laen: u32) {
+    rt.buf_push_bytes(b, rt.buf_ptr(&(*d).txt) + off as u64, laen as usize)
+}
+
+// Eine Diagnose in der verbindlichen Form.
+fn render_eine(d: *mut Diags, b: *mut rt.Buf, i: usize) {
+    var s_err: [u8; 7] = "error: "
+    rt.buf_push_bytes(b, (&s_err[0]) as u64, 7)
+    txt_stueck(d, b, vec_at[u32](&(*d).d_msg_off, i), vec_at[u32](&(*d).d_msg_len, i))
+    rt.buf_push(b, 10 as u8)
+
+    let datei: u32 = vec_at[u32](&(*d).d_datei, i)
+    let zeile: u32 = vec_at[u32](&(*d).d_zeile, i)
+    let spalte: u32 = vec_at[u32](&(*d).d_spalte, i)
+    let laenge: u32 = vec_at[u32](&(*d).d_laenge, i)
+    let hin_len: u32 = vec_at[u32](&(*d).d_hin_len, i)
+
+    // Ohne echten Ort: nur Dateiname und ggf. Hinweis.
+    if zeile == 0 {
+        var s_pf: [u8; 6] = "  --> "
+        rt.buf_push_bytes(b, (&s_pf[0]) as u64, 6)
+        diag_dateiname(d, datei, b)
+        rt.buf_push(b, 10 as u8)
+        if hin_len != KEIN {
+            var s_h1: [u8; 11] = "  hinweis: "
+            rt.buf_push_bytes(b, (&s_h1[0]) as u64, 11)
+            txt_stueck(d, b, vec_at[u32](&(*d).d_hin_off, i), hin_len)
+            rt.buf_push(b, 10 as u8)
+        }
+        return
+    }
+
+    let w: usize = stellen(zeile as u64)
+    // pad = w + 1 Leerzeichen
+    wiederhole(b, 32 as u8, w + 1)
+    var s_pf2: [u8; 4] = "--> "
+    rt.buf_push_bytes(b, (&s_pf2[0]) as u64, 4)
+    diag_dateiname(d, datei, b)
+    rt.buf_push(b, 58 as u8)
+    rt.buf_push_dez_u64(b, zeile as u64)
+    rt.buf_push(b, 58 as u8)
+    rt.buf_push_dez_u64(b, spalte as u64)
+    rt.buf_push(b, 10 as u8)
+
+    wiederhole(b, 32 as u8, w + 1)
+    var s_bar: [u8; 2] = " |"
+    rt.buf_push_bytes(b, (&s_bar[0]) as u64, 2)
+    rt.buf_push(b, 10 as u8)
+
+    // " 7 | <quelltext mit expandierten tabulatoren>"
+    rt.buf_push(b, 32 as u8)
+    rt.buf_push_dez_u64(b, zeile as u64)
+    var s_bar2: [u8; 3] = " | "
+    rt.buf_push_bytes(b, (&s_bar2[0]) as u64, 3)
+    let zl: u64 = diag_quellzeile(d, datei, zeile)
+    let za: usize = (zl >> 32) as usize
+    let zn: usize = (zl & 4294967295) as usize
+    let q: u64 = vec_at[u64](&(*d).dquelle, datei as usize)
+    var k: usize = 0
+    while k < zn {
+        let c: u8 = rt.ld8(q, za + k)
+        if c == 9 as u8 {
+            wiederhole(b, 32 as u8, TABBREITE)
+        } else {
+            rt.buf_push(b, c)
+        }
+        k = k + 1
+    }
+    rt.buf_push(b, 10 as u8)
+
+    // Markierungszeile. Der Versatz zaehlt ZEICHEN, nicht Oktette — und ein
+    // Tabulator zaehlt als TABBREITE. Ohne beides steht das Dach unter einem
+    // Umlaut oder hinter einem Tabulator an der falschen Stelle.
+    wiederhole(b, 32 as u8, w + 1)
+    rt.buf_push_bytes(b, (&s_bar2[0]) as u64, 3)
+    var sicht: usize = 0
+    var zeichen: usize = 0
+    var j: usize = 0
+    while j < zn {
+        if zeichen + 1 >= spalte as usize {
+            break
+        }
+        let c: u8 = rt.ld8(q, za + j)
+        if (c & 192 as u8) != 128 as u8 {
+            if c == 9 as u8 {
+                sicht = sicht + TABBREITE
+            } else {
+                sicht = sicht + 1
+            }
+            zeichen = zeichen + 1
+        }
+        j = j + 1
+    }
+    wiederhole(b, 32 as u8, sicht)
+    var dach: usize = laenge as usize
+    if dach < 1 { dach = 1 }
+    wiederhole(b, 94 as u8, dach)
+    rt.buf_push(b, 32 as u8)
+    txt_stueck(d, b, vec_at[u32](&(*d).d_mark_off, i), vec_at[u32](&(*d).d_mark_len, i))
+    rt.buf_push(b, 10 as u8)
+
+    if hin_len != KEIN {
+        wiederhole(b, 32 as u8, w + 1)
+        var s_h2: [u8; 12] = " = hinweis: "
+        rt.buf_push_bytes(b, (&s_h2[0]) as u64, 11)
+        txt_stueck(d, b, vec_at[u32](&(*d).d_hin_off, i), hin_len)
+        rt.buf_push(b, 10 as u8)
+    }
+}
+
+fn diag_render(d: *mut Diags, b: *mut rt.Buf) {
+    var i: usize = 0
+    while i < diag_anzahl(d) {
+        render_eine(d, b, i)
+        i = i + 1
+    }
+    if diag_anzahl(d) > 1 {
+        rt.buf_push_dez_u64(b, diag_anzahl(d) as u64)
+        var s_ende: [u8; 16] = " Fehler gefunden"
+        rt.buf_push_bytes(b, (&s_ende[0]) as u64, 16)
+        rt.buf_push(b, 10 as u8)
+    }
+}
