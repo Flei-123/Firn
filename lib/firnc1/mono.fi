@@ -1,0 +1,853 @@
+// lib/firnc1/mono.fi — GENERISCHE VORLAGEN UND IHRE MONOMORPHISIERUNG, IN FIRN.
+//
+// Portierung von `compiler/src/sema_generic.rs` (Erfassung, Namensschema)
+// und `compiler/src/mono.rs` (Ausprägung). Der letzte Schritt vor dem
+// Fixpunkt: `lexer.fi`, `parser.fi` und `sema.fi` benutzen `Vec[T]` und
+// `Map[K,V]`, und ohne Generics kann `firnc1` seine eigenen Quellen nicht
+// lesen.
+//
+// VERFAHREN: keine Typlöschung, keine Wörterbücher — für jede benutzte
+// Typkombination entsteht eine eigene, vollständig konkrete Funktion bzw. ein
+// eigener Struct. Der Typprüfer sieht danach nur noch gewöhnlichen Code.
+//
+// NAMENSSCHEMA (Vertrag, wie in `sema_generic.rs`):
+//
+//     name__T1_T2      z. B.  vec_push__i32, Vec__ptrmut_u8, Map__u32_i64
+//
+// WO DIE VORLAGEN LIEGEN: nicht in den Deklarationslisten von `ast.Baum` —
+// sonst würde der Typprüfer über `T` stolpern und `--emit=ast-kanon` würde sie
+// drucken, was `firnc0` nicht tut. Ihre Knoten stehen sehr wohl im Baum
+// (Parameter, Rumpf, Felder); gemerkt werden hier nur die Einstiegspunkte.
+//
+// EINE REGEL, DIE MAN NICHT RATEN KANN: beim Nachbauen eines Teilbaums müssen
+// Kinder-, Parameter-, Feld- und Anweisungslisten LÜCKENLOS liegen. Also erst
+// die Kinder fertig bauen, sammeln, und dann am Stück ablegen — genau der
+// Fehler, der im Parser aus `f(a, g(b))` ein `f(a, b, g(b))` gemacht hat.
+
+import rt
+import vec
+import intern
+import lexer
+import ast
+import typen
+
+export { Gen, gen_neu, gen_frei, gen_vorab, gen_ist_fn, gen_ist_struct,
+         gen_tiefe_auf, gen_tiefe_zu, gen_in_vorlage,
+         gen_schranke, gen_tp_anfang, gen_tp_dazu, gen_tp_doppelt,
+         gen_fn_vorlage, gen_struct_vorlage, gen_auspraegung,
+         gen_size_of_name, gen_lauf, gen_fehler,
+         gen_fn_anzahl, gen_struct_anzahl, gen_inst_anzahl, gen_erzeugt }
+
+const KEIN: u32 = 4294967295
+
+// Anforderungen an einen Typparameter (`T: Int`).
+const SCHRANKE_ANY: u32 = 0
+const SCHRANKE_INT: u32 = 1
+const SCHRANKE_SCALAR: u32 = 2
+
+// Obergrenze gegen unendliche Auspraegungsketten (`Vec[Vec[Vec[..]]]`).
+const MAX_AUSPRAEGUNGEN: usize = 4096
+
+struct Gen {
+    b: u64,                 // *mut ast.Baum
+    it: u64,                // *mut intern.Interner
+
+    // Vorabsuche: welche Namen sind ueberhaupt generisch? Additiv ueber alle
+    // Dateien, damit eine Vorlage auch VOR ihrer Deklaration benutzbar ist.
+    gfn: Vec[u32],
+    gst: Vec[u32],
+
+    // Typparameter aller Vorlagen, hintereinander.
+    tp_name: Vec[u32],
+    tp_schranke: Vec[u32],
+
+    // Funktionsvorlagen
+    fv_name: Vec[u32], fv_toff: Vec[u32], fv_tlen: Vec[u32],
+    fv_poff: Vec[u32], fv_plen: Vec[u32], fv_ret: Vec[u32], fv_rumpf: Vec[u32],
+
+    // Structvorlagen
+    sv_name: Vec[u32], sv_toff: Vec[u32], sv_tlen: Vec[u32],
+    sv_foff: Vec[u32], sv_flen: Vec[u32],
+
+    // Auspraegungen (`Vec[i32]`, `summe[u8]`)
+    iv_name: Vec[u32],      // ausgeschriebener Name (`Vec__i32`)
+    iv_basis: Vec[u32],
+    iv_aoff: Vec[u32], iv_alen: Vec[u32],
+    iv_abstrakt: Vec[u32],  // in einer Vorlage aufgeschrieben (enthaelt `T`)
+    iv_isfn: Vec[u32],
+    iargs: Vec[u32],        // Typknoten der Typargumente
+
+    // Arbeitsvorrat und schon Erledigtes
+    stapel: Vec[u32],
+    fertig: Vec[u32],
+
+    // Bindung Typparameter -> Typknoten waehrend EINER Auspraegung
+    bd_name: Vec[u32], bd_typ: Vec[u32],
+
+    tiefe: usize,           // > 0: der Rumpf einer Vorlage wird geparst
+    erzeugt: usize,         // wie viele Auspraegungen wirklich entstanden
+    fehler: usize,
+    kladde: rt.Buf,
+}
+
+fn gen_neu(b: u64, it: u64) -> Gen {
+    return Gen{
+        b: b, it: it,
+        gfn: vec_neu[u32](), gst: vec_neu[u32](),
+        tp_name: vec_neu[u32](), tp_schranke: vec_neu[u32](),
+        fv_name: vec_neu[u32](), fv_toff: vec_neu[u32](), fv_tlen: vec_neu[u32](),
+        fv_poff: vec_neu[u32](), fv_plen: vec_neu[u32](), fv_ret: vec_neu[u32](),
+        fv_rumpf: vec_neu[u32](),
+        sv_name: vec_neu[u32](), sv_toff: vec_neu[u32](), sv_tlen: vec_neu[u32](),
+        sv_foff: vec_neu[u32](), sv_flen: vec_neu[u32](),
+        iv_name: vec_neu[u32](), iv_basis: vec_neu[u32](),
+        iv_aoff: vec_neu[u32](), iv_alen: vec_neu[u32](),
+        iv_abstrakt: vec_neu[u32](), iv_isfn: vec_neu[u32](),
+        iargs: vec_neu[u32](),
+        stapel: vec_neu[u32](), fertig: vec_neu[u32](),
+        bd_name: vec_neu[u32](), bd_typ: vec_neu[u32](),
+        tiefe: 0, erzeugt: 0, fehler: 0,
+        kladde: rt.buf_neu(),
+    }
+}
+
+fn gen_frei(g: *mut Gen) {
+    vec_frei[u32](&(*g).gfn)
+    vec_frei[u32](&(*g).gst)
+    vec_frei[u32](&(*g).tp_name)
+    vec_frei[u32](&(*g).tp_schranke)
+    vec_frei[u32](&(*g).fv_name)
+    vec_frei[u32](&(*g).fv_toff)
+    vec_frei[u32](&(*g).fv_tlen)
+    vec_frei[u32](&(*g).fv_poff)
+    vec_frei[u32](&(*g).fv_plen)
+    vec_frei[u32](&(*g).fv_ret)
+    vec_frei[u32](&(*g).fv_rumpf)
+    vec_frei[u32](&(*g).sv_name)
+    vec_frei[u32](&(*g).sv_toff)
+    vec_frei[u32](&(*g).sv_tlen)
+    vec_frei[u32](&(*g).sv_foff)
+    vec_frei[u32](&(*g).sv_flen)
+    vec_frei[u32](&(*g).iv_name)
+    vec_frei[u32](&(*g).iv_basis)
+    vec_frei[u32](&(*g).iv_aoff)
+    vec_frei[u32](&(*g).iv_alen)
+    vec_frei[u32](&(*g).iv_abstrakt)
+    vec_frei[u32](&(*g).iv_isfn)
+    vec_frei[u32](&(*g).iargs)
+    vec_frei[u32](&(*g).stapel)
+    vec_frei[u32](&(*g).fertig)
+    vec_frei[u32](&(*g).bd_name)
+    vec_frei[u32](&(*g).bd_typ)
+    rt.buf_frei(&(*g).kladde)
+}
+
+fn gbaum(g: *mut Gen) -> *mut ast.Baum { return (*g).b as *mut ast.Baum }
+fn gnamen(g: *mut Gen) -> *mut intern.Interner { return (*g).it as *mut intern.Interner }
+
+fn gen_fehler(g: *mut Gen) -> usize { return (*g).fehler }
+fn gen_fn_anzahl(g: *mut Gen) -> usize { return vec_len[u32](&(*g).fv_name) }
+fn gen_struct_anzahl(g: *mut Gen) -> usize { return vec_len[u32](&(*g).sv_name) }
+fn gen_inst_anzahl(g: *mut Gen) -> usize { return vec_len[u32](&(*g).iv_name) }
+fn gen_erzeugt(g: *mut Gen) -> usize { return (*g).erzeugt }
+
+fn gen_tiefe_auf(g: *mut Gen) { (*g).tiefe = (*g).tiefe + 1 }
+fn gen_tiefe_zu(g: *mut Gen) { (*g).tiefe = (*g).tiefe - 1 }
+fn gen_in_vorlage(g: *mut Gen) -> bool { return (*g).tiefe > 0 }
+
+// ------------------------------------------------------------- Vorabsuche
+//
+// `fn IDENT [` und `struct IDENT [` im TOKENSTROM. Die Namen aller Dateien
+// muessen zusammenkommen, BEVOR die erste Datei geparst wird — sonst sieht
+// die Wurzeldatei die Vorlagen ihrer Module nicht (Blocker B1, Runde 17).
+
+fn gen_vorab(g: *mut Gen, lxp: u64) {
+    let l: *mut lexer.Lexer = lxp as *mut lexer.Lexer
+    let n: usize = lexer.lex_anzahl(l)
+    var i: usize = 0
+    while i + 2 < n {
+        let a: u32 = lexer.lex_art(l, i)
+        var ist_fn: bool = a == 4
+        var ist_st: bool = a == 11
+        if !ist_fn {
+            if !ist_st {
+                i = i + 1
+                continue
+            }
+        }
+        if lexer.lex_art(l, i + 1) != 1 {
+            i = i + 1
+            continue
+        }
+        if lexer.lex_art(l, i + 2) != 38 {
+            i = i + 1
+            continue
+        }
+        let nr: u32 = lexer.lex_nr(l, i + 1)
+        if ist_fn {
+            if !gen_ist_fn(g, nr) {
+                vec_push[u32](&(*g).gfn, nr)
+            }
+        } else {
+            if !gen_ist_struct(g, nr) {
+                vec_push[u32](&(*g).gst, nr)
+            }
+        }
+        i = i + 1
+    }
+}
+
+fn gen_ist_fn(g: *mut Gen, nr: u32) -> bool {
+    var i: usize = 0
+    while i < vec_len[u32](&(*g).gfn) {
+        if vec_at[u32](&(*g).gfn, i) == nr {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn gen_ist_struct(g: *mut Gen, nr: u32) -> bool {
+    var i: usize = 0
+    while i < vec_len[u32](&(*g).gst) {
+        if vec_at[u32](&(*g).gst, i) == nr {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// ------------------------------------------------------- Typparameterliste
+
+// Name einer Anforderung -> Schrankennummer. KEIN heisst: unbekannt.
+fn gen_schranke(g: *mut Gen, nr: u32) -> u32 {
+    let it: *mut intern.Interner = gnamen(g)
+    var w1: [u8; 3] = "Any"
+    var w2: [u8; 3] = "Int"
+    var w3: [u8; 6] = "Scalar"
+    if intern.intern_gleich(it, nr, (&w1[0]) as u64, 3) {
+        return SCHRANKE_ANY
+    }
+    if intern.intern_gleich(it, nr, (&w2[0]) as u64, 3) {
+        return SCHRANKE_INT
+    }
+    if intern.intern_gleich(it, nr, (&w3[0]) as u64, 6) {
+        return SCHRANKE_SCALAR
+    }
+    return KEIN
+}
+
+fn gen_tp_anfang(g: *mut Gen) -> u32 { return vec_len[u32](&(*g).tp_name) as u32 }
+
+fn gen_tp_dazu(g: *mut Gen, name: u32, schranke: u32) {
+    vec_push[u32](&(*g).tp_name, name)
+    vec_push[u32](&(*g).tp_schranke, schranke)
+}
+
+// Steht der Name schon in der laufenden Typparameterliste?
+fn gen_tp_doppelt(g: *mut Gen, off: u32, name: u32) -> bool {
+    var i: usize = off as usize
+    while i < vec_len[u32](&(*g).tp_name) {
+        if vec_at[u32](&(*g).tp_name, i) == name {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// --------------------------------------------------------------- Vorlagen
+
+fn gen_fn_vorlage(g: *mut Gen, name: u32, toff: u32, tlen: u32,
+                  poff: u32, plen: u32, ret: u32, rumpf: u32) {
+    if fn_vorlage_finden(g, name) != KEIN {
+        (*g).fehler = (*g).fehler + 1
+        return
+    }
+    vec_push[u32](&(*g).fv_name, name)
+    vec_push[u32](&(*g).fv_toff, toff)
+    vec_push[u32](&(*g).fv_tlen, tlen)
+    vec_push[u32](&(*g).fv_poff, poff)
+    vec_push[u32](&(*g).fv_plen, plen)
+    vec_push[u32](&(*g).fv_ret, ret)
+    vec_push[u32](&(*g).fv_rumpf, rumpf)
+}
+
+fn gen_struct_vorlage(g: *mut Gen, name: u32, toff: u32, tlen: u32,
+                      foff: u32, flen: u32) {
+    if struct_vorlage_finden(g, name) != KEIN {
+        (*g).fehler = (*g).fehler + 1
+        return
+    }
+    vec_push[u32](&(*g).sv_name, name)
+    vec_push[u32](&(*g).sv_toff, toff)
+    vec_push[u32](&(*g).sv_tlen, tlen)
+    vec_push[u32](&(*g).sv_foff, foff)
+    vec_push[u32](&(*g).sv_flen, flen)
+}
+
+fn fn_vorlage_finden(g: *mut Gen, name: u32) -> u32 {
+    var i: usize = 0
+    while i < vec_len[u32](&(*g).fv_name) {
+        if vec_at[u32](&(*g).fv_name, i) == name {
+            return i as u32
+        }
+        i = i + 1
+    }
+    return KEIN
+}
+
+fn struct_vorlage_finden(g: *mut Gen, name: u32) -> u32 {
+    var i: usize = 0
+    while i < vec_len[u32](&(*g).sv_name) {
+        if vec_at[u32](&(*g).sv_name, i) == name {
+            return i as u32
+        }
+        i = i + 1
+    }
+    return KEIN
+}
+
+// ---------------------------------------------------------- Namensschema
+
+// Textform eines Typs fuer `name__T1_T2`.
+fn tag_bauen(g: *mut Gen, aus: *mut rt.Buf, t: u32) {
+    let b: *mut ast.Baum = gbaum(g)
+    let it: *mut intern.Interner = gnamen(g)
+    let a: u32 = ast.t_art(b, t)
+    if a == ast.T_NAME {
+        let nr: u32 = ast.t_a(b, t)
+        rt.buf_push_bytes(aus, intern.intern_zeiger(it, nr), intern.intern_laenge(it, nr))
+        return
+    }
+    if a == ast.T_PTR {
+        if ast.t_b(b, t) != 0 {
+            var m: [u8; 7] = "ptrmut_"
+            rt.buf_push_bytes(aus, (&m[0]) as u64, 7)
+        } else {
+            var k: [u8; 4] = "ptr_"
+            rt.buf_push_bytes(aus, (&k[0]) as u64, 4)
+        }
+        tag_bauen(g, aus, ast.t_a(b, t))
+        return
+    }
+    var ar: [u8; 3] = "arr"
+    rt.buf_push_bytes(aus, (&ar[0]) as u64, 3)
+    rt.buf_push_dez_u64(aus, ast.t_b(b, t))
+    rt.buf_push(aus, 95 as u8)
+    tag_bauen(g, aus, ast.t_a(b, t))
+}
+
+// `basis__tag1_tag2`. Die Typknoten stehen ab `aoff` in `iargs`.
+fn ausschreiben(g: *mut Gen, basis: u32, aoff: u32, alen: u32) -> u32 {
+    let it: *mut intern.Interner = gnamen(g)
+    rt.buf_leeren(&(*g).kladde)
+    rt.buf_push_bytes(&(*g).kladde, intern.intern_zeiger(it, basis),
+                      intern.intern_laenge(it, basis))
+    var us: [u8; 2] = "__"
+    rt.buf_push_bytes(&(*g).kladde, (&us[0]) as u64, 2)
+    var k: u32 = 0
+    while k < alen {
+        if k > 0 {
+            rt.buf_push(&(*g).kladde, 95 as u8)
+        }
+        tag_bauen(g, &(*g).kladde, vec_at[u32](&(*g).iargs, (aoff + k) as usize))
+        k = k + 1
+    }
+    return intern.intern_nummer(it, rt.buf_ptr(&(*g).kladde),
+                                rt.buf_len(&(*g).kladde)) as u32
+}
+
+// `size_of$i32` — der Typtext steckt im AUFRUFNAMEN, wie in `sizeof.rs`.
+fn gen_size_of_name(g: *mut Gen, t: u32) -> u32 {
+    let it: *mut intern.Interner = gnamen(g)
+    rt.buf_leeren(&(*g).kladde)
+    var vor: [u8; 8] = "size_of$"
+    rt.buf_push_bytes(&(*g).kladde, (&vor[0]) as u64, 8)
+    tag_bauen(g, &(*g).kladde, t)
+    return intern.intern_nummer(it, rt.buf_ptr(&(*g).kladde),
+                                rt.buf_len(&(*g).kladde)) as u32
+}
+
+// ------------------------------------------------------------ Auspraegungen
+
+fn inst_finden(g: *mut Gen, name: u32) -> u32 {
+    var i: usize = 0
+    while i < vec_len[u32](&(*g).iv_name) {
+        if vec_at[u32](&(*g).iv_name, i) == name {
+            return i as u32
+        }
+        i = i + 1
+    }
+    return KEIN
+}
+
+// Meldet eine Verwendung an und liefert den ausgeschriebenen Namen.
+// `arbeit` heisst: sie ist waehrend der Ausbreitung entstanden und muss noch
+// abgearbeitet werden.
+fn anmelden(g: *mut Gen, basis: u32, args: *mut Vec[u32], isfn: bool,
+            arbeit: bool) -> u32 {
+    let aoff: u32 = vec_len[u32](&(*g).iargs) as u32
+    var k: usize = 0
+    while k < vec_len[u32](args) {
+        vec_push[u32](&(*g).iargs, vec_at[u32](args, k))
+        k = k + 1
+    }
+    let alen: u32 = vec_len[u32](args) as u32
+    let name: u32 = ausschreiben(g, basis, aoff, alen)
+    let alt: u32 = inst_finden(g, name)
+    if alt != KEIN {
+        if arbeit {
+            vec_push[u32](&(*g).stapel, alt)
+        }
+        return name
+    }
+    let neu: u32 = vec_len[u32](&(*g).iv_name) as u32
+    vec_push[u32](&(*g).iv_name, name)
+    vec_push[u32](&(*g).iv_basis, basis)
+    vec_push[u32](&(*g).iv_aoff, aoff)
+    vec_push[u32](&(*g).iv_alen, alen)
+    var abs: u32 = 0
+    if (*g).tiefe > 0 {
+        abs = 1
+    }
+    if arbeit {
+        abs = 0
+    }
+    vec_push[u32](&(*g).iv_abstrakt, abs)
+    var f: u32 = 0
+    if isfn {
+        f = 1
+    }
+    vec_push[u32](&(*g).iv_isfn, f)
+    if arbeit {
+        vec_push[u32](&(*g).stapel, neu)
+    }
+    return name
+}
+
+// Aufruf aus dem Parser.
+fn gen_auspraegung(g: *mut Gen, basis: u32, args: *mut Vec[u32], isfn: bool) -> u32 {
+    return anmelden(g, basis, args, isfn, false)
+}
+
+// ------------------------------------------------------------- Bindung
+
+fn bindung_finden(g: *mut Gen, nr: u32) -> u32 {
+    var i: usize = 0
+    while i < vec_len[u32](&(*g).bd_name) {
+        if vec_at[u32](&(*g).bd_name, i) == nr {
+            return vec_at[u32](&(*g).bd_typ, i)
+        }
+        i = i + 1
+    }
+    return KEIN
+}
+
+// Erfuellt der Typ die Anforderung? (mono.rs::satisfies)
+fn erfuellt(g: *mut Gen, t: u32, schranke: u32) -> bool {
+    if schranke == SCHRANKE_ANY {
+        return true
+    }
+    let b: *mut ast.Baum = gbaum(g)
+    let a: u32 = ast.t_art(b, t)
+    if a == ast.T_ARR {
+        return false
+    }
+    if a == ast.T_PTR {
+        return schranke == SCHRANKE_SCALAR
+    }
+    let k: i32 = typen.grundtyp(gnamen(g), ast.t_a(b, t))
+    if k < 0 {
+        return false
+    }
+    let ku: u32 = k as u32
+    if ku == typen.K_F64 {
+        return false
+    }
+    if ku == typen.K_BOOL {
+        return schranke == SCHRANKE_SCALAR
+    }
+    return true
+}
+
+// Bindet die Typparameter [toff, toff+tlen) an die Argumente [aoff, aoff+alen).
+fn binden(g: *mut Gen, toff: u32, tlen: u32, aoff: u32, alen: u32) -> bool {
+    vec_leeren[u32](&(*g).bd_name)
+    vec_leeren[u32](&(*g).bd_typ)
+    if tlen != alen {
+        (*g).fehler = (*g).fehler + 1
+        return false
+    }
+    var k: u32 = 0
+    while k < tlen {
+        let arg: u32 = vec_at[u32](&(*g).iargs, (aoff + k) as usize)
+        if !erfuellt(g, arg, vec_at[u32](&(*g).tp_schranke, (toff + k) as usize)) {
+            (*g).fehler = (*g).fehler + 1
+            return false
+        }
+        vec_push[u32](&(*g).bd_name, vec_at[u32](&(*g).tp_name, (toff + k) as usize))
+        vec_push[u32](&(*g).bd_typ, arg)
+        k = k + 1
+    }
+    return true
+}
+
+// ------------------------------------------------------------ Ersetzung
+//
+// Ein Typknoten ist unveraenderlich; bleibt er gleich, wird er WEITERBENUTZT
+// statt kopiert. Das spart nicht nur Platz, es macht auch den Vergleich
+// stabil.
+
+fn subst_typ(g: *mut Gen, t: u32) -> u32 {
+    if t == ast.NICHTS {
+        return t
+    }
+    let b: *mut ast.Baum = gbaum(g)
+    let a: u32 = ast.t_art(b, t)
+    if a == ast.T_PTR {
+        let inn: u32 = subst_typ(g, ast.t_a(b, t))
+        if inn == ast.t_a(b, t) {
+            return t
+        }
+        return ast.typ_neu(b, ast.T_PTR, inn, ast.t_b(b, t))
+    }
+    if a == ast.T_ARR {
+        let el: u32 = subst_typ(g, ast.t_a(b, t))
+        if el == ast.t_a(b, t) {
+            return t
+        }
+        return ast.typ_neu(b, ast.T_ARR, el, ast.t_b(b, t))
+    }
+    let nr: u32 = ast.t_a(b, t)
+    let gebunden: u32 = bindung_finden(g, nr)
+    if gebunden != KEIN {
+        return gebunden
+    }
+    let neu: u32 = inst_umschreiben(g, nr)
+    if neu == nr {
+        return t
+    }
+    return ast.typ_neu(b, ast.T_NAME, neu, 0)
+}
+
+// `Vec__T` -> `Vec__i32` (und meldet die neue Auspraegung an). Ist der Name
+// keine Auspraegung, bleibt er, wie er ist.
+fn inst_umschreiben(g: *mut Gen, nr: u32) -> u32 {
+    let ii: u32 = inst_finden(g, nr)
+    if ii == KEIN {
+        return nr
+    }
+    let aoff: u32 = vec_at[u32](&(*g).iv_aoff, ii as usize)
+    let alen: u32 = vec_at[u32](&(*g).iv_alen, ii as usize)
+    let basis: u32 = vec_at[u32](&(*g).iv_basis, ii as usize)
+    var isfn: bool = vec_at[u32](&(*g).iv_isfn, ii as usize) != 0
+    var tmp: Vec[u32] = vec_neu[u32]()
+    var k: u32 = 0
+    while k < alen {
+        vec_push[u32](&tmp, subst_typ(g, vec_at[u32](&(*g).iargs, (aoff + k) as usize)))
+        k = k + 1
+    }
+    let name: u32 = anmelden(g, basis, &tmp, isfn, true)
+    vec_frei[u32](&tmp)
+    return name
+}
+
+// --------------------------------------------------- Teilbaum nachbauen
+
+fn kopiere_block(g: *mut Gen, blk: u32) -> u32 {
+    let b: *mut ast.Baum = gbaum(g)
+    let off: u32 = ast.b_off(b, blk)
+    let laen: u32 = ast.b_len(b, blk)
+    var tmp: Vec[u32] = vec_neu[u32]()
+    var k: u32 = 0
+    while k < laen {
+        vec_push[u32](&tmp, kopiere_anweisung(g, ast.sliste_at(b, off + k)))
+        k = k + 1
+    }
+    let neu: u32 = ast.sliste_anfang(b)
+    var i: usize = 0
+    while i < vec_len[u32](&tmp) {
+        ast.sliste_dazu(b, vec_at[u32](&tmp, i))
+        i = i + 1
+    }
+    vec_frei[u32](&tmp)
+    return ast.block_neu(b, neu, laen)
+}
+
+fn kopiere_anweisung(g: *mut Gen, s: u32) -> u32 {
+    let b: *mut ast.Baum = gbaum(g)
+    let a: u32 = ast.s_art(b, s)
+    if a == ast.S_LET || a == ast.S_VAR {
+        let t: u32 = subst_typ(g, ast.s_b(b, s))
+        let init: u32 = kopiere_ausdruck(g, ast.s_c(b, s))
+        return ast.anweisung_neu(b, a, ast.s_a(b, s), t, init, 0)
+    }
+    if a == ast.S_ZUW {
+        let ziel: u32 = kopiere_ausdruck(g, ast.s_a(b, s))
+        let wert: u32 = kopiere_ausdruck(g, ast.s_b(b, s))
+        return ast.anweisung_neu(b, a, ziel, wert, 0, 0)
+    }
+    if a == ast.S_IF {
+        let bed: u32 = kopiere_ausdruck(g, ast.s_a(b, s))
+        let dann: u32 = kopiere_block(g, ast.s_b(b, s))
+        var sonst: u32 = ast.NICHTS
+        if ast.s_c(b, s) != ast.NICHTS {
+            sonst = kopiere_anweisung(g, ast.s_c(b, s))
+        }
+        return ast.anweisung_neu(b, a, bed, dann, sonst, 0)
+    }
+    if a == ast.S_WHILE {
+        let bed: u32 = kopiere_ausdruck(g, ast.s_a(b, s))
+        let rumpf: u32 = kopiere_block(g, ast.s_b(b, s))
+        return ast.anweisung_neu(b, a, bed, rumpf, 0, 0)
+    }
+    if a == ast.S_FOR {
+        let von: u32 = kopiere_ausdruck(g, ast.s_b(b, s))
+        let bis: u32 = kopiere_ausdruck(g, ast.s_c(b, s))
+        let rumpf: u32 = kopiere_block(g, ast.s_d(b, s))
+        return ast.anweisung_neu(b, a, ast.s_a(b, s), von, bis, rumpf)
+    }
+    if a == ast.S_RET {
+        var w: u32 = ast.NICHTS
+        if ast.s_a(b, s) != ast.NICHTS {
+            w = kopiere_ausdruck(g, ast.s_a(b, s))
+        }
+        return ast.anweisung_neu(b, a, w, 0, 0, 0)
+    }
+    if a == ast.S_DEFER || a == ast.S_ERRDEFER {
+        let inner: u32 = kopiere_anweisung(g, ast.s_a(b, s))
+        return ast.anweisung_neu(b, a, inner, 0, 0, 0)
+    }
+    if a == ast.S_EXPR {
+        let e: u32 = kopiere_ausdruck(g, ast.s_a(b, s))
+        return ast.anweisung_neu(b, a, e, 0, 0, 0)
+    }
+    if a == ast.S_BLOCK {
+        let blk: u32 = kopiere_block(g, ast.s_a(b, s))
+        return ast.anweisung_neu(b, a, blk, 0, 0, 0)
+    }
+    // S_BREAK, S_CONT
+    return ast.anweisung_neu(b, a, 0, 0, 0, 0)
+}
+
+// Kinderliste [off, off+anz) kopieren und LUECKENLOS neu ablegen.
+fn kopiere_kinder(g: *mut Gen, off: u32, anz: u32) -> u32 {
+    let b: *mut ast.Baum = gbaum(g)
+    var tmp: Vec[u32] = vec_neu[u32]()
+    var k: u32 = 0
+    while k < anz {
+        vec_push[u32](&tmp, kopiere_ausdruck(g, ast.kind_at(b, off + k)))
+        k = k + 1
+    }
+    let neu: u32 = ast.kind_anfang(b)
+    var i: usize = 0
+    while i < vec_len[u32](&tmp) {
+        ast.kind_dazu(b, vec_at[u32](&tmp, i))
+        i = i + 1
+    }
+    vec_frei[u32](&tmp)
+    return neu
+}
+
+// Structliteral: die Liste sind PAARE (Feldname, Wert).
+fn kopiere_felder(g: *mut Gen, off: u32, anz: u32) -> u32 {
+    let b: *mut ast.Baum = gbaum(g)
+    var tmp: Vec[u32] = vec_neu[u32]()
+    var k: u32 = 0
+    while k < anz {
+        vec_push[u32](&tmp, ast.kind_at(b, off + k * 2))
+        vec_push[u32](&tmp, kopiere_ausdruck(g, ast.kind_at(b, off + k * 2 + 1)))
+        k = k + 1
+    }
+    let neu: u32 = ast.kind_anfang(b)
+    var i: usize = 0
+    while i < vec_len[u32](&tmp) {
+        ast.kind_dazu(b, vec_at[u32](&tmp, i))
+        i = i + 1
+    }
+    vec_frei[u32](&tmp)
+    return neu
+}
+
+fn kopiere_ausdruck(g: *mut Gen, e: u32) -> u32 {
+    let b: *mut ast.Baum = gbaum(g)
+    let a: u32 = ast.e_art(b, e)
+    if a == ast.E_INT || a == ast.E_FLOAT {
+        return ast.ausdruck_neu(b, a, 0, 0, 0, ast.e_zahl(b, e))
+    }
+    if a == ast.E_BOOL || a == ast.E_ID {
+        return ast.ausdruck_neu(b, a, ast.e_a(b, e), 0, 0, 0)
+    }
+    if a == ast.E_UN {
+        let inn: u32 = kopiere_ausdruck(g, ast.e_b(b, e))
+        return ast.ausdruck_neu(b, a, ast.e_a(b, e), inn, 0, 0)
+    }
+    if a == ast.E_BIN {
+        let li: u32 = kopiere_ausdruck(g, ast.e_b(b, e))
+        let re: u32 = kopiere_ausdruck(g, ast.e_c(b, e))
+        return ast.ausdruck_neu(b, a, ast.e_a(b, e), li, re, 0)
+    }
+    if a == ast.E_FELD {
+        let basis: u32 = kopiere_ausdruck(g, ast.e_a(b, e))
+        return ast.ausdruck_neu(b, a, basis, ast.e_b(b, e), 0, 0)
+    }
+    if a == ast.E_IDX {
+        let basis: u32 = kopiere_ausdruck(g, ast.e_a(b, e))
+        let idx: u32 = kopiere_ausdruck(g, ast.e_b(b, e))
+        return ast.ausdruck_neu(b, a, basis, idx, 0, 0)
+    }
+    if a == ast.E_AS {
+        let inn: u32 = kopiere_ausdruck(g, ast.e_a(b, e))
+        let t: u32 = subst_typ(g, ast.e_b(b, e))
+        return ast.ausdruck_neu(b, a, inn, t, 0, 0)
+    }
+    if a == ast.E_RUF {
+        // `size_of[T]()`: der Typ steckt in `e_zahl` (Knoten + 1) UND im
+        // Namen. Beides muss ersetzt werden, sonst meldet der Typpruefer
+        // "unbekannter typ 'T'" (mono.rs::subst_call_name).
+        let z: u64 = ast.e_zahl(b, e)
+        if z != 0 {
+            let t2: u32 = subst_typ(g, (z - 1) as u32)
+            let n2: u32 = gen_size_of_name(g, t2)
+            return ast.ausdruck_neu(b, a, n2, 0, 0, (t2 as u64) + 1)
+        }
+        let name: u32 = inst_umschreiben(g, ast.e_a(b, e))
+        let off: u32 = kopiere_kinder(g, ast.e_b(b, e), ast.e_c(b, e))
+        return ast.ausdruck_neu(b, a, name, off, ast.e_c(b, e), 0)
+    }
+    if a == ast.E_SYSCALL {
+        let off: u32 = kopiere_kinder(g, ast.e_b(b, e), ast.e_c(b, e))
+        return ast.ausdruck_neu(b, a, 0, off, ast.e_c(b, e), 0)
+    }
+    if a == ast.E_SLIT {
+        let name: u32 = inst_umschreiben(g, ast.e_a(b, e))
+        let off: u32 = kopiere_felder(g, ast.e_b(b, e), ast.e_c(b, e))
+        return ast.ausdruck_neu(b, a, name, off, ast.e_c(b, e), 0)
+    }
+    if a == ast.E_ALIT {
+        let off: u32 = kopiere_kinder(g, ast.e_b(b, e), ast.e_c(b, e))
+        return ast.ausdruck_neu(b, a, 0, off, ast.e_c(b, e), 0)
+    }
+    // E_AWDH
+    let wert: u32 = kopiere_ausdruck(g, ast.e_a(b, e))
+    let anz: u32 = kopiere_ausdruck(g, ast.e_b(b, e))
+    return ast.ausdruck_neu(b, a, wert, anz, 0, 0)
+}
+
+// ------------------------------------------------------------ Ausbreitung
+
+fn schon_fertig(g: *mut Gen, name: u32) -> bool {
+    var i: usize = 0
+    while i < vec_len[u32](&(*g).fertig) {
+        if vec_at[u32](&(*g).fertig, i) == name {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn fn_auspraegen(g: *mut Gen, ii: u32) {
+    let b: *mut ast.Baum = gbaum(g)
+    let basis: u32 = vec_at[u32](&(*g).iv_basis, ii as usize)
+    let name: u32 = vec_at[u32](&(*g).iv_name, ii as usize)
+    let vi: u32 = fn_vorlage_finden(g, basis)
+    if vi == KEIN {
+        (*g).fehler = (*g).fehler + 1
+        return
+    }
+    let ok: bool = binden(g, vec_at[u32](&(*g).fv_toff, vi as usize),
+                          vec_at[u32](&(*g).fv_tlen, vi as usize),
+                          vec_at[u32](&(*g).iv_aoff, ii as usize),
+                          vec_at[u32](&(*g).iv_alen, ii as usize))
+    if !ok {
+        return
+    }
+    // Die Parameter muessen LUECKENLOS liegen — `subst_typ` legt nur
+    // Typknoten an, also darf hier ohne Zwischenspeicher gearbeitet werden.
+    let alt_off: u32 = vec_at[u32](&(*g).fv_poff, vi as usize)
+    let plen: u32 = vec_at[u32](&(*g).fv_plen, vi as usize)
+    let neu_off: u32 = ast.param_anfang(b)
+    var k: u32 = 0
+    while k < plen {
+        let pn: u32 = ast.param_name(b, alt_off + k)
+        let pt: u32 = subst_typ(g, ast.param_typ(b, alt_off + k))
+        ast.param_dazu(b, pn, pt)
+        k = k + 1
+    }
+    var ret: u32 = ast.NICHTS
+    if vec_at[u32](&(*g).fv_ret, vi as usize) != ast.NICHTS {
+        ret = subst_typ(g, vec_at[u32](&(*g).fv_ret, vi as usize))
+    }
+    let rumpf: u32 = kopiere_block(g, vec_at[u32](&(*g).fv_rumpf, vi as usize))
+    ast.fn_dazu(b, name, neu_off, plen, ret, rumpf)
+    (*g).erzeugt = (*g).erzeugt + 1
+}
+
+fn struct_auspraegen(g: *mut Gen, ii: u32) {
+    let b: *mut ast.Baum = gbaum(g)
+    let basis: u32 = vec_at[u32](&(*g).iv_basis, ii as usize)
+    let name: u32 = vec_at[u32](&(*g).iv_name, ii as usize)
+    let vi: u32 = struct_vorlage_finden(g, basis)
+    if vi == KEIN {
+        (*g).fehler = (*g).fehler + 1
+        return
+    }
+    let ok: bool = binden(g, vec_at[u32](&(*g).sv_toff, vi as usize),
+                          vec_at[u32](&(*g).sv_tlen, vi as usize),
+                          vec_at[u32](&(*g).iv_aoff, ii as usize),
+                          vec_at[u32](&(*g).iv_alen, ii as usize))
+    if !ok {
+        return
+    }
+    let alt_off: u32 = vec_at[u32](&(*g).sv_foff, vi as usize)
+    let flen: u32 = vec_at[u32](&(*g).sv_flen, vi as usize)
+    let neu_off: u32 = ast.feld_anfang(b)
+    var k: u32 = 0
+    while k < flen {
+        let fname: u32 = ast.feld_name(b, alt_off + k)
+        let ft: u32 = subst_typ(g, ast.feld_typ(b, alt_off + k))
+        ast.feld_dazu(b, fname, ft)
+        k = k + 1
+    }
+    ast.struktur_dazu(b, name, neu_off, flen)
+    (*g).erzeugt = (*g).erzeugt + 1
+}
+
+// Alle konkreten Verwendungen ausbreiten, bis nichts mehr entsteht.
+//
+// REIHENFOLGE WIE IN `mono.rs`: die beim Parsen gefundenen Verwendungen
+// kommen UMGEKEHRT auf den Stapel, damit sie in der Reihenfolge ihres
+// Auftretens abgearbeitet werden; was dabei neu entsteht, wird sofort danach
+// erledigt.
+fn gen_lauf(g: *mut Gen) {
+    var i: usize = vec_len[u32](&(*g).iv_name)
+    while i > 0 {
+        i = i - 1
+        if vec_at[u32](&(*g).iv_abstrakt, i) == 0 {
+            vec_push[u32](&(*g).stapel, i as u32)
+        }
+    }
+    var zahl: usize = 0
+    while vec_len[u32](&(*g).stapel) > 0 {
+        let ii: u32 = vec_pop[u32](&(*g).stapel)
+        let name: u32 = vec_at[u32](&(*g).iv_name, ii as usize)
+        if schon_fertig(g, name) {
+            continue
+        }
+        vec_push[u32](&(*g).fertig, name)
+        zahl = zahl + 1
+        if zahl > MAX_AUSPRAEGUNGEN {
+            (*g).fehler = (*g).fehler + 1
+            return
+        }
+        if vec_at[u32](&(*g).iv_isfn, ii as usize) != 0 {
+            fn_auspraegen(g, ii)
+        } else {
+            struct_auspraegen(g, ii)
+        }
+    }
+}

@@ -21,6 +21,7 @@ import vec
 import intern
 import lexer
 import ast
+import mono
 import parser
 import typen
 import sema
@@ -69,6 +70,124 @@ fn modulpfad(aus: *mut rt.Buf, verz: *mut rt.Buf, l: *mut lexer.Lexer,
     rt.buf_push_bytes(aus, (&e[0]) as u64, 4)
 }
 
+// ------------------------------------------------------------ Modulliste
+//
+// Die Warteschlange aller Dateien dieser Uebersetzung. Index 0 ist IMMER die
+// Wurzeldatei — damit ein Modul, das die Wurzel wieder einbindet, sie nicht
+// ein zweites Mal einzieht (`modules.rs::resolve` haelt es genauso).
+//
+// Alle Pfade liegen hintereinander in EINEM Puffer, je mit einer Null
+// abgeschlossen, weil `open` sie so braucht. DESHALB darf ein Zeiger aus
+// `ml_zeiger` nicht ueber ein `ml_dazu` hinweg benutzt werden: der Puffer
+// waechst und liegt danach woanders.
+struct Modulliste {
+    text: rt.Buf,
+    off: Vec[u32],
+    laen: Vec[u32],
+    alias: Vec[u32],
+}
+
+fn ml_neu() -> Modulliste {
+    return Modulliste{
+        text: rt.buf_neu(),
+        off: vec_neu[u32](), laen: vec_neu[u32](), alias: vec_neu[u32](),
+    }
+}
+
+fn ml_frei(m: *mut Modulliste) {
+    rt.buf_frei(&(*m).text)
+    vec_frei[u32](&(*m).off)
+    vec_frei[u32](&(*m).laen)
+    vec_frei[u32](&(*m).alias)
+}
+
+fn ml_anzahl(m: *mut Modulliste) -> usize { return vec_len[u32](&(*m).off) }
+fn ml_alias(m: *mut Modulliste, i: usize) -> u32 { return vec_at[u32](&(*m).alias, i) }
+fn ml_laenge(m: *mut Modulliste, i: usize) -> usize {
+    return vec_at[u32](&(*m).laen, i) as usize
+}
+fn ml_zeiger(m: *mut Modulliste, i: usize) -> u64 {
+    return rt.buf_ptr(&(*m).text) + vec_at[u32](&(*m).off, i) as u64
+}
+
+fn ml_kennt(m: *mut Modulliste, p: u64, n: usize) -> bool {
+    var i: usize = 0
+    while i < ml_anzahl(m) {
+        if ml_laenge(m, i) == n {
+            if rt.mem_eq(ml_zeiger(m, i), p, n) {
+                return true
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn ml_dazu(m: *mut Modulliste, p: u64, n: usize, alias: u32) {
+    vec_push[u32](&(*m).off, rt.buf_len(&(*m).text) as u32)
+    vec_push[u32](&(*m).laen, n as u32)
+    vec_push[u32](&(*m).alias, alias)
+    rt.buf_push_bytes(&(*m).text, p, n)
+    rt.buf_push(&(*m).text, 0 as u8)
+}
+
+// Alle `import`-Zeilen eines Tokenstroms aufloesen und die noch unbekannten
+// Dateien hinten anhaengen. So wird die Liste zur BREITENSUCHE ueber den
+// ganzen Einbindungsgraphen: ein Modul darf ein Modul einbinden, ohne dass
+// die Wurzeldatei davon wissen muss.
+//
+// Vor Runde 31 wurden nur die `import`-Zeilen der WURZELDATEI gelesen. Das
+// fiel lange nicht auf, weil `bin/firnc1.fi` seine Abhaengigkeiten ohnehin
+// alle aufzaehlt — `tests/640_vec_modul.fi` dagegen scheiterte still daran,
+// dass `modules/vec.fi` sein eigenes `rt` nicht bekam.
+fn imports_sammeln(l: *mut lexer.Lexer, verz: *mut rt.Buf, wurzelverz: *mut rt.Buf,
+                   ml: *mut Modulliste) -> i32 {
+    var pfad: rt.Buf = rt.buf_neu()
+    defer rt.buf_frei(&pfad)
+    var probe: rt.Buf = rt.buf_neu()
+    defer rt.buf_frei(&probe)
+    var i: usize = 0
+    while i + 1 < lexer.lex_anzahl(l) {
+        if lexer.lex_art(l, i) != 27 {
+            i = i + 1
+            continue
+        }
+        // Pfadteile einsammeln: IDENT (DOT IDENT)*
+        var j: usize = i + 1
+        var alias: u32 = 0
+        while j < lexer.lex_anzahl(l) {
+            if lexer.lex_art(l, j) != 1 {
+                break
+            }
+            alias = lexer.lex_nr(l, j)
+            j = j + 1
+            if j >= lexer.lex_anzahl(l) {
+                break
+            }
+            if lexer.lex_art(l, j) != 43 {
+                break
+            }
+            j = j + 1
+        }
+        // ZUERST neben der importierenden Datei, dann neben der Wurzeldatei.
+        modulpfad(&pfad, verz, l, i + 1, j)
+        rt.buf_leeren(&probe)
+        if !rt.lies_datei(rt.buf_ptr(&pfad), &probe) {
+            modulpfad(&pfad, wurzelverz, l, i + 1, j)
+            rt.buf_leeren(&probe)
+            if !rt.lies_datei(rt.buf_ptr(&pfad), &probe) {
+                return 2
+            }
+        }
+        let n: usize = rt.buf_len(&pfad) - 1
+        if !ml_kennt(ml, rt.buf_ptr(&pfad), n) {
+            ml_dazu(ml, rt.buf_ptr(&pfad), n, alias)
+        }
+        i = j
+    }
+    return 0
+}
+
 fn main(start: u64) -> i32 {
     var quelle: rt.Buf = rt.buf_neu()
     defer rt.buf_frei(&quelle)
@@ -108,71 +227,115 @@ fn main(start: u64) -> i32 {
     defer rt.buf_frei(&verz)
     verzeichnis(&verz, name, name_n)
 
+    // --- generische Vorlagen: erst wissen, WELCHE Namen generisch sind,
+    // dann parsen. Vorher ist `Vec[i32]` nicht von einer Indizierung zu
+    // unterscheiden.
+    var g: mono.Gen = mono.gen_neu(baum as u64, it as u64)
+    defer mono.gen_frei(&g)
+
+    var ml: Modulliste = ml_neu()
+    defer ml_frei(&ml)
+    ml_dazu(&ml, name, name_n, 4294967295)
+
     var mquelle: rt.Buf = rt.buf_neu()
     defer rt.buf_frei(&mquelle)
     var mpfad: rt.Buf = rt.buf_neu()
     defer rt.buf_frei(&mpfad)
+    var mverz: rt.Buf = rt.buf_neu()
+    defer rt.buf_frei(&mverz)
 
-    var i: usize = 0
-    while i + 1 < lexer.lex_anzahl(&l) {
-        if lexer.lex_art(&l, i) != 27 {
-            i = i + 1
-            continue
-        }
-        // Pfadteile einsammeln: IDENT (DOT IDENT)*
-        var j: usize = i + 1
-        var alias: u32 = 0
-        while j < lexer.lex_anzahl(&l) {
-            if lexer.lex_art(&l, j) != 1 {
-                break
-            }
-            alias = lexer.lex_nr(&l, j)
-            j = j + 1
-            if j >= lexer.lex_anzahl(&l) {
-                break
-            }
-            if lexer.lex_art(&l, j) != 43 {
-                break
-            }
-            j = j + 1
-        }
-        modulpfad(&mpfad, &verz, &l, i + 1, j)
+    // --- ERSTER DURCHGANG: Warteschlange aufbauen und die generischen Namen
+    // einsammeln. Beides muss VOR dem Parsen der ersten Datei feststehen.
+    // Der Preis ist ein zweites Lexen jeder Modulquelle; das ist billiger
+    // als alle Lexer gleichzeitig offen zu halten, und es macht die
+    // Reihenfolge der `import`-Zeilen bedeutungslos.
+    mono.gen_vorab(&g, (&l) as u64)
+    let wrc: i32 = imports_sammeln(&l, &verz, &verz, &ml)
+    if wrc != 0 {
+        return wrc
+    }
+    var mi: usize = 1
+    while mi < ml_anzahl(&ml) {
+        rt.buf_leeren(&mpfad)
+        rt.buf_push_bytes(&mpfad, ml_zeiger(&ml, mi), ml_laenge(&ml, mi))
+        rt.buf_push(&mpfad, 0 as u8)
         rt.buf_leeren(&mquelle)
         if !rt.lies_datei(rt.buf_ptr(&mpfad), &mquelle) {
             return 2
         }
-        var ml: lexer.Lexer = lexer.lex_neu(rt.buf_ptr(&mquelle), rt.buf_len(&mquelle),
+        var vl: lexer.Lexer = lexer.lex_neu(rt.buf_ptr(&mquelle), rt.buf_len(&mquelle),
                                             (&kwtxt[0]) as u64, 172,
                                             rt.buf_ptr(&mpfad), rt.buf_len(&mpfad) - 1)
-        lexer.lex_namen_setzen(&ml, it as u64)
-        lexer.lex_lauf(&ml)
-        if lexer.lex_fehler(&ml) > 0 {
-            lexer.lex_frei(&ml)
+        lexer.lex_namen_setzen(&vl, it as u64)
+        lexer.lex_lauf(&vl)
+        if lexer.lex_fehler(&vl) > 0 {
+            lexer.lex_frei(&vl)
             return 1
         }
-        var mp: parser.Parser = parser.par_neu_modul((&ml) as u64, baum as u64, alias)
+        mono.gen_vorab(&g, (&vl) as u64)
+        rt.buf_leeren(&mverz)
+        verzeichnis(&mverz, rt.buf_ptr(&mpfad), rt.buf_len(&mpfad) - 1)
+        let irc: i32 = imports_sammeln(&vl, &mverz, &verz, &ml)
+        lexer.lex_frei(&vl)
+        if irc != 0 {
+            return irc
+        }
+        mi = mi + 1
+    }
+
+    // --- ZWEITER DURCHGANG: die Module uebersetzen.
+    mi = 1
+    while mi < ml_anzahl(&ml) {
+        rt.buf_leeren(&mpfad)
+        rt.buf_push_bytes(&mpfad, ml_zeiger(&ml, mi), ml_laenge(&ml, mi))
+        rt.buf_push(&mpfad, 0 as u8)
+        let alias: u32 = ml_alias(&ml, mi)
+        rt.buf_leeren(&mquelle)
+        if !rt.lies_datei(rt.buf_ptr(&mpfad), &mquelle) {
+            return 2
+        }
+        var mlx: lexer.Lexer = lexer.lex_neu(rt.buf_ptr(&mquelle), rt.buf_len(&mquelle),
+                                             (&kwtxt[0]) as u64, 172,
+                                             rt.buf_ptr(&mpfad), rt.buf_len(&mpfad) - 1)
+        lexer.lex_namen_setzen(&mlx, it as u64)
+        lexer.lex_lauf(&mlx)
+        if lexer.lex_fehler(&mlx) > 0 {
+            lexer.lex_frei(&mlx)
+            return 1
+        }
+        var mp: parser.Parser = parser.par_neu_modul((&mlx) as u64, baum as u64, alias)
+        parser.par_gen_setzen(&mp, (&g) as u64)
         parser.par_lauf(&mp)
         let schlecht: bool = parser.par_nicht_kern(&mp)
         let fehl: usize = parser.par_fehler(&mp)
         parser.par_frei(&mp)
-        lexer.lex_frei(&ml)
+        lexer.lex_frei(&mlx)
         if schlecht {
             return 3
         }
         if fehl > 0 {
             return 1
         }
-        i = j
+        mi = mi + 1
     }
 
     // --- die Wurzeldatei zuletzt: ihre Namen bleiben unveraendert.
     var p: parser.Parser = parser.par_neu_modul((&l) as u64, baum as u64, 4294967295)
     defer parser.par_frei(&p)
+    parser.par_gen_setzen(&p, (&g) as u64)
     parser.par_lauf(&p)
     if parser.par_nicht_kern(&p) {
         return 3
     }
     if parser.par_fehler(&p) > 0 {
+        return 1
+    }
+
+    // --- Monomorphisierung: jede benutzte Typkombination wird eine eigene,
+    // vollstaendig konkrete Funktion bzw. ein eigener Struct. Danach sieht
+    // der Typpruefer nur noch gewoehnlichen Code.
+    mono.gen_lauf(&g)
+    if mono.gen_fehler(&g) > 0 {
         return 1
     }
 
