@@ -827,6 +827,42 @@ error: 'errdefer' und die weitergabe einer fertigen fehlerunion vertragen sich
 Nachweise: `tests/580_defer.fi` (fünf Abschnitte, alle drei Baustufen),
 `tests/neg/defer_return.fi`, `tests/neg/defer_break.fi`.
 
+## `comptime` — Funktionen laufen zur Übersetzungszeit (Runde 12)
+
+```firn
+fn fakultaet(n: i64) -> i64 {
+    var r: i64 = 1
+    var i: i64 = 2
+    while i <= n { r = r * i; i = i + 1 }
+    return r
+}
+
+const FAK10: i64 = fakultaet(10)     // 3628800 — vom Compiler ausgerechnet
+const GROESSE: usize = fakultaet(5) as usize
+var feld: [u8; 120] = [0 as u8; 120] // GROESSE taugt als Array-Länge
+```
+
+Schleifen, Verzweigungen, lokale Variablen, **Rekursion** (`fib(20)` im Test).
+Das ist der erste Schritt zu Abnahmepunkt 6: die 697 Web-IDL-Dateien, die
+HTML-Entitäten, die CSS-Tabellen und die Unicode-Daten eines Browsers sind
+**erzeugter Code**.
+
+**Grenzen, die eingehalten werden:** höchstens 2.000.000 Anweisungen und 64
+verschachtelte Aufrufe — ein `comptime` darf den Compiler nicht aufhängen:
+
+```
+error: comptime: mehr als 2000000 schritte — endlosschleife?
+  --> datei.fi:5:5
+```
+
+**Noch nicht möglich:** Zeiger, Arrays, Structs, `syscall`, Gleitkomma. Alles
+davon braucht einen Speicher zur Übersetzungszeit. Der Versuch wird gemeldet,
+nicht still falsch übersetzt.
+
+**Was zu Abnahmepunkt 6 fehlt:** `emit` — erzeugter *Quelltext*, den derselbe
+Lauf weiterverarbeitet. Die Vorbedingung steht seit der Fundamentarbeit
+(wiedereintrittsfähige Prüfphasen); es fehlt die Verbindung dazwischen.
+
 ## Gleitkomma `f64` (Runde 11)
 
 ```firn

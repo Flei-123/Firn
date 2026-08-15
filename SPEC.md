@@ -931,7 +931,7 @@ in diesem Dokument ist Zukunft und wird im README als „noch nicht" geführt.
   (reines Spilling). Korrekt, aber langsam. Echte Registerzuteilung ist `P3`.
 * Testsuite mit ≥ 40 `.fi`-Programmen plus Negativtests.
 
-**Nicht enthalten (Stufe 0), Stand nach Runde 3:** `comptime`, `interface`,
+**Nicht enthalten (Stufe 0), Stand nach Runde 3:** `interface`,
 `drop`, Move-Prüfer, Referenztypen `&T`/`inout T` als geprüfte Typen
 (nur Rohzeiger), Arenen, Abwicklung/`throw`, `f32`, `u128`,
 `Arc[T]`, Standardbibliothek, Nebenläufigkeit, Paketverwaltung, aarch64, WASM,
@@ -1193,6 +1193,40 @@ Zählverweis-Gegenprobe mit identischem Graphen braucht nach 2.000.000 Zyklen
   deshalb nur Zahlen über die Modulgrenze (siehe `lib/dom/soak_gc.fi`).
 * **Fragmentierung** bei wechselnden Objektgrößen ist ungeprüft; der Dauerlauf
   benutzt immer denselben Satz.
+
+#### 14.1.comptime — Auswertung zur Übersetzungszeit (Runde 12)
+
+`compiler/src/comptime.rs` führt **eigene Funktionen zur Übersetzungszeit
+aus** — mit Schleifen, Verzweigungen, lokalen Variablen und Rekursion. Der
+Einstieg ist jede Stelle, an der ein konstanter Ausdruck erwartet wird:
+
+```firn
+fn fakultaet(n: i64) -> i64 { … }
+
+const FAK10: i64 = fakultaet(10)      // 3628800, zur Übersetzungszeit
+var feld: [u8; 120] = …               // Ergebnisse taugen als Array-Länge
+```
+
+**Umfang:** Ganzzahlen und `bool`; `let`/`var`, Zuweisung an lokale Variablen,
+`if`/`else`, `while`, `for`, `break`, `continue`, `return`, Blöcke; alle
+Operatoren mit Kurzschluss bei `&&`/`||`, Umwandlungen mit korrektem
+Zurechtschneiden, Aufrufe (auch rekursiv).
+
+**Grenzen, die eingehalten werden:** höchstens 2.000.000 ausgeführte
+Anweisungen und 64 verschachtelte Aufrufe. Beides endet mit einer Meldung samt
+Quellposition — ein `comptime` darf den Compiler nicht aufhängen
+(`tests/neg/comptime_endlos.fi`).
+
+**Nicht möglich:** Zeiger, Arrays, Structs, `syscall`, Gleitkomma,
+GC-Allokation. Alles davon braucht einen Speicher zur Übersetzungszeit; der
+kommt mit `emit`. Ein Versuch wird gemeldet, nicht still falsch übersetzt
+(`tests/neg/comptime_zeiger.fi`).
+
+**Was zu Abnahmepunkt 6 noch fehlt:** `emit` — also erzeugter *Quelltext*, den
+der Compiler im selben Lauf weiterverarbeitet. Die Vorbedingung dafür steht
+seit der Fundamentarbeit (`sema::Checker::add_items`, wiedereintrittsfähige
+Prüfphasen); es fehlt die Verbindung „Interpreter erzeugt Deklarationen und
+reicht sie an den Prüfer".
 
 #### 14.1.f64 — Gleitkomma (Runde 11)
 
