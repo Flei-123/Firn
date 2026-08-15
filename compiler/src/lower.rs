@@ -64,8 +64,14 @@ pub(crate) struct Lower<'a> {
     pub(crate) depth: u32,
     /// Name der Funktion (Schluessel der Zeilentabelle in `dwarf.rs`).
     pub(crate) fname: String,
-    /// Ziele von `break` / `continue` je Schleife (aeusserste zuerst).
-    pub(crate) loops: Vec<(BlockId, BlockId)>,
+    /// Ziele von `break` / `continue` je Schleife (aeusserste zuerst), dazu
+    /// die Tiefe des `defer`-Stapels beim Betreten der Schleife: ein `break`
+    /// fuehrt genau die aufgeschobenen Anweisungen aus, die INNERHALB der
+    /// Schleife vereinbart wurden.
+    pub(crate) loops: Vec<(BlockId, BlockId, usize)>,
+    /// Aufgeschobene Anweisungen (`defer`) je Blockebene, in der Reihenfolge
+    /// ihrer Vereinbarung. Ausgefuehrt wird rueckwaerts (SPEC §5.1).
+    pub(crate) defers: Vec<Vec<Stmt>>,
     /// Versteckter Rueckgabezeiger (`sret`), falls die Funktion ein Aggregat
     /// ueber 8 Byte liefert (siehe `abi.rs`).
     pub(crate) sret: Option<Val>,
@@ -779,6 +785,7 @@ impl<'a> Lower<'a> {
         }
         self.depth += 1;
         self.enter();
+        self.defers.push(Vec::new());
         let mut r = Some(());
         for s in &b.stmts {
             if r.is_none() {
@@ -786,8 +793,53 @@ impl<'a> Lower<'a> {
             }
             r = self.lower_stmt(s);
         }
+        // Aufgeschobene Anweisungen dieser Ebene, rueckwaerts. Sie laufen VOR
+        // `leave()`, damit die Namen des Blocks noch sichtbar sind.
+        //
+        // Wurde der Block ueber `return`/`break`/`continue` verlassen, sind sie
+        // dort bereits ausgefuehrt worden; was hier noch erzeugt wird, landet
+        // im unerreichbaren Block hinter dem Sprung und faellt der
+        // Codebereinigung zum Opfer. Doppelt ausgefuehrt wird also nichts.
+        let liste = self.defers.pop().unwrap_or_default();
+        for d in liste.iter().rev() {
+            if self.lower_stmt(d).is_none() {
+                r = None;
+            }
+        }
         self.leave();
         self.depth -= 1;
+        r
+    }
+
+    /// Ruecksprung MIT Aufraeumen: fuehrt alle aufgeschobenen Anweisungen der
+    /// Funktion aus und setzt danach den Terminator.
+    ///
+    /// Der Rueckgabewert ist zu diesem Zeitpunkt bereits berechnet — das ist
+    /// Absicht und entspricht Zig und C++: ein `defer` sieht den fertigen Wert
+    /// und kann ihn nicht mehr ersetzen.
+    pub(crate) fn ret_term(&mut self, v: Option<Val>) {
+        self.lower_defers_bis(0);
+        self.set_term(Term::Ret(v));
+    }
+
+    /// Fuehrt die aufgeschobenen Anweisungen aller Ebenen oberhalb von `tiefe`
+    /// aus — innerste Ebene zuerst, innerhalb einer Ebene rueckwaerts.
+    ///
+    /// Der Stapel bleibt dabei UNVERAENDERT: `lower_block` raeumt seine eigene
+    /// Ebene ab. Wird nach einem `return` weiter unten noch einmal aufgeraeumt,
+    /// geschieht das in einem unerreichbaren Block.
+    pub(crate) fn lower_defers_bis(&mut self, tiefe: usize) -> Option<()> {
+        let mut r = Some(());
+        let mut i = self.defers.len();
+        while i > tiefe {
+            i -= 1;
+            let liste = self.defers[i].clone();
+            for d in liste.iter().rev() {
+                if self.lower_stmt(d).is_none() {
+                    r = None;
+                }
+            }
+        }
         r
     }
 
@@ -836,23 +888,23 @@ impl<'a> Lower<'a> {
                             match self.sret {
                                 Some(dst) => {
                                     self.write_into(dst, v)?;
-                                    self.set_term(Term::Ret(Some(dst)));
+                                    self.ret_term(Some(dst));
                                 }
                                 None => {
                                     let addr = self.lower_addr(v)?;
                                     let w = self.load_words(addr, size, 1)?;
                                     match w.first() {
-                                        Some(w0) => self.set_term(Term::Ret(Some(*w0))),
+                                        Some(w0) => self.ret_term(Some(*w0)),
                                         None => return self.ice(*span, "rueckgabe ohne wort"),
                                     }
                                 }
                             }
                         } else {
                             let rv = self.lower_expr(v)?;
-                            self.set_term(Term::Ret(Some(rv)));
+                            self.ret_term(Some(rv));
                         }
                     }
-                    None => self.set_term(Term::Ret(None)),
+                    None => self.ret_term(None),
                 }
                 // Alles danach ist unerreichbar: neuen Block oeffnen, damit die
                 // Invariante "ein Terminator je Block" gilt.
@@ -860,26 +912,39 @@ impl<'a> Lower<'a> {
                 self.cur = dead;
                 Some(())
             }
+            // Nur vormerken — ausgefuehrt wird beim Verlassen des Blocks.
+            Stmt::Defer(inner, span) => {
+                match self.defers.last_mut() {
+                    Some(liste) => {
+                        liste.push((**inner).clone());
+                        Some(())
+                    }
+                    None => self.ice(*span, "'defer' ausserhalb eines blocks"),
+                }
+            }
             Stmt::If { cond, then, els, .. } => self.lower_if(cond, then, els.as_deref()),
             Stmt::While { cond, body, .. } => self.lower_while(cond, body),
             Stmt::For { name, start, end, body, .. } => {
                 self.lower_for(name, start, end, body)
             }
             Stmt::Break(span) => {
-                let target = match self.loops.last() {
-                    Some((brk, _)) => *brk,
+                let (target, tiefe) = match self.loops.last() {
+                    Some((brk, _, t)) => (*brk, *t),
                     None => return self.ice(*span, "'break' ausserhalb einer schleife"),
                 };
+                // Erst aufraeumen, dann springen.
+                self.lower_defers_bis(tiefe);
                 self.set_term(Term::Br(target));
                 let dead = self.new_block();
                 self.cur = dead;
                 Some(())
             }
             Stmt::Continue(span) => {
-                let target = match self.loops.last() {
-                    Some((_, cont)) => *cont,
+                let (target, tiefe) = match self.loops.last() {
+                    Some((_, cont, t)) => (*cont, *t),
                     None => return self.ice(*span, "'continue' ausserhalb einer schleife"),
                 };
+                self.lower_defers_bis(tiefe);
                 self.set_term(Term::Br(target));
                 let dead = self.new_block();
                 self.cur = dead;
@@ -957,7 +1022,7 @@ impl<'a> Lower<'a> {
         self.set_term(Term::BrCond { cond: c, then_bb: body_bb, else_bb: end_bb });
 
         self.cur = body_bb;
-        self.loops.push((end_bb, head_bb));
+        self.loops.push((end_bb, head_bb, self.defers.len()));
         let r = self.lower_block(body);
         self.loops.pop();
         r?;
@@ -1007,7 +1072,7 @@ impl<'a> Lower<'a> {
         self.cur = body_bb;
         self.enter();
         self.declare(name, islot);
-        self.loops.push((end_bb, step_bb));
+        self.loops.push((end_bb, step_bb, self.defers.len()));
         let r = self.lower_block(body);
         self.loops.pop();
         self.leave();
@@ -1131,6 +1196,7 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
         depth: 0,
         fname: d.name.clone(),
         loops: Vec::new(),
+            defers: Vec::new(),
         sret: None,
         pending_line: None,
     };

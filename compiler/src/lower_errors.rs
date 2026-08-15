@@ -304,7 +304,7 @@ fn do_return(lo: &mut Lower, v: &Expr, c: &crate::errors::CoerceInfo) -> Option<
     match lo.sret {
         Some(dst) => {
             write_union(lo, dst, v, c)?;
-            lo.set_term(Term::Ret(Some(dst)));
+            lo.ret_term(Some(dst));
         }
         None => {
             // Bis 8 Byte liegt die Fehlerunion in einem Wort in `rax`
@@ -315,7 +315,7 @@ fn do_return(lo: &mut Lower, v: &Expr, c: &crate::errors::CoerceInfo) -> Option<
             lo.store(FTy::I64, slot, zero);
             write_union(lo, slot, v, c)?;
             let w = lo.load(FTy::I64, slot);
-            lo.set_term(Term::Ret(Some(w)));
+            lo.ret_term(Some(w));
         }
     }
     Some(())
@@ -326,7 +326,7 @@ fn return_error(lo: &mut Lower, code: Val) -> Option<()> {
     match lo.sret {
         Some(dst) => {
             lo.store(FTy::U32, dst, code);
-            lo.set_term(Term::Ret(Some(dst)));
+            lo.ret_term(Some(dst));
         }
         None => {
             let slot = lo.alloca(8, 8);
@@ -334,7 +334,7 @@ fn return_error(lo: &mut Lower, code: Val) -> Option<()> {
             lo.store(FTy::I64, slot, zero);
             lo.store(FTy::U32, slot, code);
             let w = lo.load(FTy::I64, slot);
-            lo.set_term(Term::Ret(Some(w)));
+            lo.ret_term(Some(w));
         }
     }
     Some(())

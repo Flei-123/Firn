@@ -168,6 +168,9 @@ pub enum Stmt {
     },
     Break(Span),
     Continue(Span),
+    /// `defer <anweisung>` — laeuft beim Verlassen des umschliessenden Blocks,
+    /// in umgekehrter Reihenfolge der Vereinbarung (SPEC §5.1).
+    Defer(Box<Stmt>, Span),
     Expr(Expr),
     Block(Block),
     /// Nur vom Parser bei Fehlerwiederherstellung erzeugt; wird ignoriert.
@@ -186,6 +189,7 @@ impl Stmt {
             | Stmt::For { span, .. }
             | Stmt::Break(span)
             | Stmt::Continue(span)
+            | Stmt::Defer(_, span)
             | Stmt::Error(span) => *span,
             Stmt::Expr(e) => e.span,
             Stmt::Block(b) => b.span,
@@ -202,6 +206,7 @@ impl Stmt {
             Stmt::While { .. } => "while",
             Stmt::For { .. } => "for",
             Stmt::Break(_) => "break",
+            Stmt::Defer(..) => "defer",
             Stmt::Continue(_) => "continue",
             Stmt::Return { .. } => "return",
             Stmt::Expr(_) => "expr",
