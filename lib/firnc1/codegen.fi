@@ -1,0 +1,771 @@
+// lib/firnc1/codegen.fi — VON DER FIR ZU x86-64, IN FIRN.
+//
+// Neunter Teil von Stufe 1 und der letzte vor dem Fixpunkt. Damit uebersetzt
+// die Firn-Fassung ein Programm von vorne bis hinten: Text -> Token -> Baum ->
+// Typen -> FIR -> Assembler.
+//
+// BEWUSST OHNE REGISTERZUTEILUNG. `firnc0` hat dafuer `regalloc.rs` mit
+// Lebendigkeitsanalyse und Verschmelzung; hier bekommt JEDER FIR-Wert einen
+// eigenen Platz im Rahmen, und jede Instruktion laedt ihre Operanden, rechnet
+// und schreibt zurueck. Das ist langsamer Code — aber richtiger, und er ist in
+// einem Nachmittag nachvollziehbar. Der Vergleich laeuft deshalb auch NICHT
+// ueber den Assemblertext, sondern ueber das VERHALTEN: uebersetzen,
+// assemblieren, linken, laufen lassen, Rueckgabewert und Ausgabe vergleichen.
+// Fuer einen Codegenerator ist das ohnehin der ehrlichere Massstab.
+//
+// RAHMEN: `[rbp - 8*(v+1)]` ist der Platz des Wertes `%v`. Dahinter liegen die
+// Bereiche der `alloca`s. Ein Wert liegt IMMER als volle 64 Bit da, passend
+// erweitert (vorzeichen- bzw. nullerweitert) — deshalb muss nach jeder
+// Rechnung `normalisiere` laufen.
+//
+// NICHT DABEI: Gleitkomma (braucht die SSE-Register und eine eigene
+// Klassifikation), mehr als sechs Argumente je Aufruf, und alles, was das
+// Lowering ohnehin nicht erzeugt.
+
+import rt
+import vec
+import intern
+import fir
+
+export { Cg, cg_neu, cg_frei, cg_lauf, cg_ungeeignet, cg_text }
+
+const KEIN: u32 = 4294967295
+
+struct Cg {
+    f: u64              // Zeiger auf die Fir
+    it: u64             // Interner
+    aus: rt.Buf
+    slot: Vec[u64]      // Versatz je Wert (positiv, von rbp abzuziehen)
+    aslot: Vec[u64]     // Versatz des alloca-Bereichs je Wert, 0 = keiner
+    rahmen: u64
+    ungeeignet: bool
+}
+
+fn cg_neu(f: u64, it: u64) -> Cg {
+    return Cg{
+        f: f, it: it,
+        aus: rt.buf_neu(),
+        slot: vec_neu[u64](), aslot: vec_neu[u64](),
+        rahmen: 0, ungeeignet: false,
+    }
+}
+
+fn cg_frei(c: *mut Cg) {
+    rt.buf_frei(&(*c).aus)
+    vec_frei[u64](&(*c).slot)
+    vec_frei[u64](&(*c).aslot)
+}
+
+fn cg_ungeeignet(c: *mut Cg) -> bool { return (*c).ungeeignet }
+fn cg_text(c: *mut Cg) -> *mut rt.Buf { return &(*c).aus }
+fn ff(c: *mut Cg) -> *mut fir.Fir { return (*c).f as *mut fir.Fir }
+fn it(c: *mut Cg) -> *mut intern.Interner { return (*c).it as *mut intern.Interner }
+
+// ------------------------------------------------------------- Textausgabe
+
+fn t(c: *mut Cg, p: u64, n: usize) {
+    rt.buf_push_bytes(&(*c).aus, p, n)
+}
+
+fn nl(c: *mut Cg) {
+    rt.buf_push(&(*c).aus, 10 as u8)
+}
+
+fn zahl(c: *mut Cg, v: u64) {
+    rt.buf_push_dez_u64(&(*c).aus, v)
+}
+
+fn izahl(c: *mut Cg, v: i64) {
+    rt.buf_push_dez_i64(&(*c).aus, v)
+}
+
+// Symbolname einer Funktion: `_F1.` davor, damit nichts mit dem
+// Betriebssystem oder mit `firnc0` kollidiert.
+fn sym(c: *mut Cg, nr: u32) {
+    var p: [u8; 4] = "_F1."
+    t(c, (&p[0]) as u64, 4)
+    rt.buf_push_bytes(&(*c).aus, intern.intern_zeiger(it(c), nr), intern.intern_laenge(it(c), nr))
+}
+
+fn blocklabel(c: *mut Cg, fnr: u32, bb: u32) {
+    var p: [u8; 2] = ".L"
+    t(c, (&p[0]) as u64, 2)
+    sym(c, fnr)
+    var q: [u8; 4] = "__bb"
+    t(c, (&q[0]) as u64, 4)
+    zahl(c, bb as u64)
+}
+
+// ---------------------------------------------------------- Registernamen
+// 0=rax 1=rcx 2=rdx 3=rsi 4=rdi 5=r8 6=r9 7=r10 8=rbp 9=rsp
+const R_AX: u32 = 0
+const R_CX: u32 = 1
+const R_DX: u32 = 2
+
+fn reg64(c: *mut Cg, r: u32) {
+    var tab: [u8; 29] = "rax|rcx|rdx|rsi|rdi|r8|r9|r10"
+    stueck(c, (&tab[0]) as u64, 29, r)
+}
+
+// Teilstueck `nr` aus einer mit '|' getrennten Tafel schreiben.
+fn stueck(c: *mut Cg, p: u64, n: usize, nr: u32) {
+    var i: usize = 0
+    var k: u32 = 0
+    var start: usize = 0
+    while i <= n {
+        var ende: bool = i == n
+        if !ende {
+            ende = rt.ld8(p, i) == 124 as u8
+        }
+        if ende {
+            if k == nr {
+                t(c, p + start as u64, i - start)
+                return
+            }
+            k = k + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+}
+
+// Registername in der Breite `bits` (8/16/32/64) fuer rax/rcx/rdx.
+fn regb(c: *mut Cg, r: u32, bits: u32) {
+    var t8: [u8; 8] = "al|cl|dl"
+    var t16: [u8; 8] = "ax|cx|dx"
+    var t32: [u8; 11] = "eax|ecx|edx"
+        if bits == 8 {
+        stueck(c, (&t8[0]) as u64, 8, r)
+        return
+    }
+        if bits == 16 {
+        stueck(c, (&t16[0]) as u64, 8, r)
+        return
+    }
+        if bits == 32 {
+        stueck(c, (&t32[0]) as u64, 11, r)
+        return
+    }
+    reg64(c, r)
+}
+
+fn wortgroesse(c: *mut Cg, bits: u32) {
+    var b: [u8; 5] = "byte "
+    var w: [u8; 5] = "word "
+    var d: [u8; 6] = "dword "
+    var q: [u8; 6] = "qword "
+        if bits == 8 {
+        t(c, (&b[0]) as u64, 5)
+        return
+    }
+        if bits == 16 {
+        t(c, (&w[0]) as u64, 5)
+        return
+    }
+        if bits == 32 {
+        t(c, (&d[0]) as u64, 6)
+        return
+    }
+    t(c, (&q[0]) as u64, 6)
+}
+
+// `  ` am Zeilenanfang
+fn ein(c: *mut Cg) {
+    var s: [u8; 4] = "    "
+    t(c, (&s[0]) as u64, 4)
+}
+
+fn w(c: *mut Cg, p: u64, n: usize) {
+    t(c, p, n)
+}
+
+// `mov <reg>, qword ptr [rbp-<off>]`
+fn lade_slot(c: *mut Cg, r: u32, off: u64) {
+    ein(c)
+    var m: [u8; 4] = "mov "
+    w(c, (&m[0]) as u64, 4)
+    reg64(c, r)
+    var s: [u8; 17] = ", qword ptr [rbp-"
+    w(c, (&s[0]) as u64, 17)
+    zahl(c, off)
+    var e: [u8; 1] = "]"
+    w(c, (&e[0]) as u64, 1)
+    nl(c)
+}
+
+fn speichere_slot(c: *mut Cg, off: u64, r: u32) {
+    ein(c)
+    var m: [u8; 19] = "mov qword ptr [rbp-"
+    w(c, (&m[0]) as u64, 19)
+    zahl(c, off)
+    var s: [u8; 3] = "], "
+    w(c, (&s[0]) as u64, 3)
+    reg64(c, r)
+    nl(c)
+}
+
+fn slot_von(c: *mut Cg, v: u32) -> u64 {
+    return vec_at[u64](&(*c).slot, v as usize)
+}
+
+fn lade_wert(c: *mut Cg, r: u32, v: u32) {
+    lade_slot(c, r, slot_von(c, v))
+}
+
+// Ein Wert liegt IMMER als volle 64 Bit im Rahmen, passend erweitert.
+// Nach jeder Rechnung muss das wiederhergestellt werden.
+fn normalisiere(c: *mut Cg, r: u32, ty: u32) {
+    let bits: u32 = fir.fty_bits(ty)
+    if bits >= 64 || bits == 0 {
+        return
+    }
+    let vorz: bool = ty == fir.T_I8 || ty == fir.T_I16 || ty == fir.T_I32
+    if bits == 32 && !vorz {
+        // `movzx r64, r/m32` gibt es nicht — ein `mov exx, exx` nullt die
+        // oberen 32 Bit von selbst.
+        ein(c)
+        var m: [u8; 4] = "mov "
+        w(c, (&m[0]) as u64, 4)
+        regb(c, r, 32)
+        var k: [u8; 2] = ", "
+        w(c, (&k[0]) as u64, 2)
+        regb(c, r, 32)
+        nl(c)
+        return
+    }
+    ein(c)
+    if vorz {
+        var m2: [u8; 6] = "movsx "
+        w(c, (&m2[0]) as u64, 6)
+    } else {
+        var m3: [u8; 6] = "movzx "
+        w(c, (&m3[0]) as u64, 6)
+    }
+    reg64(c, r)
+    var k2: [u8; 2] = ", "
+    w(c, (&k2[0]) as u64, 2)
+    regb(c, r, bits)
+    nl(c)
+}
+
+// Ein einfacher Befehl mit zwei Registeroperanden: `<op> <a>, <b>`
+fn op2(c: *mut Cg, name: u64, n: usize, a: u32, b: u32) {
+    ein(c)
+    w(c, name, n)
+    var s: [u8; 1] = " "
+    w(c, (&s[0]) as u64, 1)
+    reg64(c, a)
+    var k: [u8; 2] = ", "
+    w(c, (&k[0]) as u64, 2)
+    reg64(c, b)
+    nl(c)
+}
+
+fn op1(c: *mut Cg, name: u64, n: usize, a: u32) {
+    ein(c)
+    w(c, name, n)
+    var s: [u8; 1] = " "
+    w(c, (&s[0]) as u64, 1)
+    reg64(c, a)
+    nl(c)
+}
+
+fn roh(c: *mut Cg, p: u64, n: usize) {
+    ein(c)
+    w(c, p, n)
+    nl(c)
+}
+
+// ------------------------------------------------------------ Instruktionen
+
+fn ist_vorz(ty: u32) -> bool {
+    return ty == fir.T_I8 || ty == fir.T_I16 || ty == fir.T_I32 || ty == fir.T_I64
+}
+
+fn emit_bin(c: *mut Cg, ty: u32, op: u32, a: u32, b: u32, dst: u32) {
+    lade_wert(c, R_AX, a)
+    lade_wert(c, R_CX, b)
+        if op == 0 {
+        var n: [u8; 3] = "add"
+        op2(c, (&n[0]) as u64, 3, R_AX, R_CX)
+    }
+        else if op == 1 {
+        var n: [u8; 3] = "sub"
+        op2(c, (&n[0]) as u64, 3, R_AX, R_CX)
+    }
+        else if op == 2 {
+        var n: [u8; 4] = "imul"
+        op2(c, (&n[0]) as u64, 4, R_AX, R_CX)
+    }
+    else if op == 3 || op == 4 {
+        // Division und Rest: `idiv`/`div` teilen rdx:rax.
+        if ist_vorz(ty) {
+            var q: [u8; 3] = "cqo"
+            roh(c, (&q[0]) as u64, 3)
+            var d: [u8; 4] = "idiv"
+            op1(c, (&d[0]) as u64, 4, R_CX)
+        } else {
+            var z: [u8; 12] = "xor edx, edx"
+            roh(c, (&z[0]) as u64, 12)
+            var d2: [u8; 3] = "div"
+            op1(c, (&d2[0]) as u64, 3, R_CX)
+        }
+        if op == 4 {
+            var m: [u8; 12] = "mov rax, rdx"
+            roh(c, (&m[0]) as u64, 12)
+        }
+    }
+        else if op == 5 {
+        var n: [u8; 3] = "and"
+        op2(c, (&n[0]) as u64, 3, R_AX, R_CX)
+    }
+        else if op == 6 {
+        var n: [u8; 2] = "or"
+        op2(c, (&n[0]) as u64, 2, R_AX, R_CX)
+    }
+        else if op == 7 {
+        var n: [u8; 3] = "xor"
+        op2(c, (&n[0]) as u64, 3, R_AX, R_CX)
+    }
+    else if op == 8 {
+        var n: [u8; 11] = "shl rax, cl"
+        roh(c, (&n[0]) as u64, 11)
+    }
+    else {
+        if ist_vorz(ty) {
+            var n: [u8; 11] = "sar rax, cl"
+            roh(c, (&n[0]) as u64, 11)
+        } else {
+            var n2: [u8; 11] = "shr rax, cl"
+            roh(c, (&n2[0]) as u64, 11)
+        }
+    }
+    normalisiere(c, R_AX, ty)
+    speichere_slot(c, slot_von(c, dst), R_AX)
+}
+
+fn emit_cmp(c: *mut Cg, ty: u32, op: u32, a: u32, b: u32, dst: u32) {
+    lade_wert(c, R_AX, a)
+    lade_wert(c, R_CX, b)
+    var cm: [u8; 3] = "cmp"
+    op2(c, (&cm[0]) as u64, 3, R_AX, R_CX)
+    ein(c)
+    var set: [u8; 3] = "set"
+    w(c, (&set[0]) as u64, 3)
+    // eq ne lt le gt ge — mit oder ohne Vorzeichen
+    var vz: [u8; 14] = "e|ne|l|le|g|ge"
+    var oz: [u8; 14] = "e|ne|b|be|a|ae"
+    if ist_vorz(ty) {
+        stueck(c, (&vz[0]) as u64, 14, op)
+    } else {
+        stueck(c, (&oz[0]) as u64, 14, op)
+    }
+    var al: [u8; 3] = " al"
+    w(c, (&al[0]) as u64, 3)
+    nl(c)
+    var mz: [u8; 13] = "movzx rax, al"
+    roh(c, (&mz[0]) as u64, 13)
+    speichere_slot(c, slot_von(c, dst), R_AX)
+}
+
+fn emit_const(c: *mut Cg, ty: u32, roh_wert: u64, dst: u32) {
+    ein(c)
+    var m: [u8; 7] = "movabs "
+    w(c, (&m[0]) as u64, 7)
+    reg64(c, R_AX)
+    var k: [u8; 2] = ", "
+    w(c, (&k[0]) as u64, 2)
+    if ist_vorz(ty) {
+        izahl(c, roh_wert as i64)
+    } else {
+        zahl(c, roh_wert)
+    }
+    nl(c)
+    speichere_slot(c, slot_von(c, dst), R_AX)
+}
+
+// Zugriff auf den Speicher: `mov <reg>, <groesse> ptr [rax]` und umgekehrt.
+fn emit_load(c: *mut Cg, ty: u32, adr: u32, dst: u32) {
+    lade_wert(c, R_AX, adr)
+    let bits: u32 = fir.fty_bits(ty)
+    ein(c)
+    if bits >= 64 {
+        var m: [u8; 24] = "mov rax, qword ptr [rax]"
+        w(c, (&m[0]) as u64, 24)
+    } else {
+        if ist_vorz(ty) {
+            var m2: [u8; 6] = "movsx "
+            w(c, (&m2[0]) as u64, 6)
+        } else {
+            var m3: [u8; 6] = "movzx "
+            w(c, (&m3[0]) as u64, 6)
+        }
+        if bits == 32 && !ist_vorz(ty) {
+            // wieder der Sonderfall: `mov eax, dword ptr [rax]`
+            rt.buf_set_len(&(*c).aus, rt.buf_len(&(*c).aus) - 6)
+            var m4: [u8; 4] = "mov "
+            w(c, (&m4[0]) as u64, 4)
+            regb(c, R_AX, 32)
+        } else {
+            reg64(c, R_AX)
+        }
+        var k: [u8; 2] = ", "
+        w(c, (&k[0]) as u64, 2)
+        wortgroesse(c, bits)
+        var p: [u8; 9] = "ptr [rax]"
+        w(c, (&p[0]) as u64, 9)
+    }
+    nl(c)
+    speichere_slot(c, slot_von(c, dst), R_AX)
+}
+
+fn emit_store(c: *mut Cg, ty: u32, adr: u32, val: u32) {
+    lade_wert(c, R_AX, adr)
+    lade_wert(c, R_CX, val)
+    let bits: u32 = fir.fty_bits(ty)
+    ein(c)
+    var m: [u8; 4] = "mov "
+    w(c, (&m[0]) as u64, 4)
+    wortgroesse(c, bits)
+    var p: [u8; 11] = "ptr [rax], "
+    w(c, (&p[0]) as u64, 11)
+    regb(c, R_CX, bits)
+    nl(c)
+}
+
+// ------------------------------------------------------- Rahmen und Bloecke
+
+fn aufrunden(v: u64, auf: u64) -> u64 {
+    let r: u64 = v % auf
+    if r == 0 { return v }
+    return v + auf - r
+}
+
+// Legt fuer jeden Wert einen Platz an und danach die Bereiche der `alloca`s.
+fn rahmen_bauen(c: *mut Cg, fnr: u32) {
+    let f: *mut fir.Fir = ff(c)
+    let n: u32 = fir.wert_anzahl(f, fnr)
+    vec_leeren[u64](&(*c).slot)
+    vec_leeren[u64](&(*c).aslot)
+    var cursor: u64 = 0
+    var v: u32 = 0
+    while v < n {
+        cursor = cursor + 8
+        vec_push[u64](&(*c).slot, cursor)
+        vec_push[u64](&(*c).aslot, 0)
+        v = v + 1
+    }
+    // Nur der Eintrittsblock enthaelt `alloca` — das ist eine Zusicherung der
+    // FIR und wird hier ausgenutzt.
+    let bb0: u32 = 0
+    var k: u32 = 0
+    while k < fir.inst_anzahl(f, fnr, bb0) {
+        let i: u32 = fir.inst_bei(f, fnr, bb0, k)
+        if fir.i_art_von(f, i) == fir.O_ALLOCA {
+            var au: u64 = fir.i_alen_von(f, i) as u64
+            if au == 0 { au = 1 }
+            if au > 16 { au = 16 }
+            var gr: u64 = fir.i_zahl_von(f, i)
+            if gr < 1 { gr = 1 }
+            cursor = aufrunden(cursor + gr, au)
+            vec_setzen[u64](&(*c).aslot, fir.i_dst_von(f, i) as usize, cursor)
+        }
+        k = k + 1
+    }
+    (*c).rahmen = aufrunden(cursor, 16)
+}
+
+fn emit_alloca(c: *mut Cg, dst: u32) {
+    ein(c)
+    var m: [u8; 14] = "lea rax, [rbp-"
+    w(c, (&m[0]) as u64, 14)
+    zahl(c, vec_at[u64](&(*c).aslot, dst as usize))
+    var e: [u8; 1] = "]"
+    w(c, (&e[0]) as u64, 1)
+    nl(c)
+    speichere_slot(c, slot_von(c, dst), R_AX)
+}
+
+fn emit_ptradd(c: *mut Cg, basis: u32, off: u32, dst: u32) {
+    lade_wert(c, R_AX, basis)
+    lade_wert(c, R_CX, off)
+    var a: [u8; 3] = "add"
+    op2(c, (&a[0]) as u64, 3, R_AX, R_CX)
+    speichere_slot(c, slot_von(c, dst), R_AX)
+}
+
+fn emit_cast(c: *mut Cg, von: u32, nach: u32, src: u32, dst: u32) {
+    lade_wert(c, R_AX, src)
+    normalisiere(c, R_AX, nach)
+    speichere_slot(c, slot_von(c, dst), R_AX)
+}
+
+fn emit_un(c: *mut Cg, ty: u32, op: u32, a: u32, dst: u32) {
+    lade_wert(c, R_AX, a)
+    if op == 0 {
+        var n: [u8; 3] = "neg"
+        op1(c, (&n[0]) as u64, 3, R_AX)
+    } else {
+        if ty == fir.T_BOOL {
+            var x: [u8; 10] = "xor eax, 1"
+            roh(c, (&x[0]) as u64, 10)
+        } else {
+            var n2: [u8; 3] = "not"
+            op1(c, (&n2[0]) as u64, 3, R_AX)
+        }
+    }
+    normalisiere(c, R_AX, ty)
+    speichere_slot(c, slot_von(c, dst), R_AX)
+}
+
+// Aufrufregister nach System V.
+fn argreg(c: *mut Cg, k: u32) {
+    var tab: [u8; 21] = "rdi|rsi|rdx|rcx|r8|r9"
+    stueck(c, (&tab[0]) as u64, 21, k)
+}
+
+fn emit_call(c: *mut Cg, f: *mut fir.Fir, i: u32, fnr: u32) {
+    let aoff: u32 = fir.i_aoff_von(f, i)
+    let alen: u32 = fir.i_alen_von(f, i)
+    if alen > 6 {
+        (*c).ungeeignet = true
+        return
+    }
+    var k: u32 = 0
+    while k < alen {
+        ein(c)
+        var m: [u8; 4] = "mov "
+        w(c, (&m[0]) as u64, 4)
+        argreg(c, k)
+        var s: [u8; 17] = ", qword ptr [rbp-"
+        w(c, (&s[0]) as u64, 17)
+        zahl(c, slot_von(c, fir.arg_bei(f, aoff + k)))
+        var e: [u8; 1] = "]"
+        w(c, (&e[0]) as u64, 1)
+        nl(c)
+        k = k + 1
+    }
+    ein(c)
+    var cl: [u8; 5] = "call "
+    w(c, (&cl[0]) as u64, 5)
+    sym(c, fir.i_a_von(f, i))
+    nl(c)
+    let dst: u32 = fir.i_dst_von(f, i)
+    if dst != fir.KEIN {
+        normalisiere(c, R_AX, fir.i_ty_von(f, i))
+        speichere_slot(c, slot_von(c, dst), R_AX)
+    }
+}
+
+fn emit_syscall(c: *mut Cg, f: *mut fir.Fir, i: u32) {
+    let aoff: u32 = fir.i_aoff_von(f, i)
+    let alen: u32 = fir.i_alen_von(f, i)
+    if alen > 7 {
+        (*c).ungeeignet = true
+        return
+    }
+    // rax = Nummer, danach rdi rsi rdx r10 r8 r9
+    var tab: [u8; 25] = "rax|rdi|rsi|rdx|r10|r8|r9"
+    var k: u32 = 0
+    while k < alen {
+        ein(c)
+        var m: [u8; 4] = "mov "
+        w(c, (&m[0]) as u64, 4)
+        stueck(c, (&tab[0]) as u64, 25, k)
+        var s: [u8; 17] = ", qword ptr [rbp-"
+        w(c, (&s[0]) as u64, 17)
+        zahl(c, slot_von(c, fir.arg_bei(f, aoff + k)))
+        var e: [u8; 1] = "]"
+        w(c, (&e[0]) as u64, 1)
+        nl(c)
+        k = k + 1
+    }
+    var sc: [u8; 7] = "syscall"
+    roh(c, (&sc[0]) as u64, 7)
+    let dst: u32 = fir.i_dst_von(f, i)
+    if dst != fir.KEIN {
+        speichere_slot(c, slot_von(c, dst), R_AX)
+    }
+}
+
+fn emit_copymem(c: *mut Cg, ziel: u32, quelle: u32, groesse: u64) {
+    lade_slot(c, 4, slot_von(c, ziel))
+    lade_slot(c, 3, slot_von(c, quelle))
+    ein(c)
+    var m: [u8; 9] = "mov rcx, "
+    w(c, (&m[0]) as u64, 9)
+    zahl(c, groesse)
+    nl(c)
+    var r: [u8; 9] = "rep movsb"
+    roh(c, (&r[0]) as u64, 9)
+}
+
+// ------------------------------------------------------------------- Lauf
+
+fn emit_inst(c: *mut Cg, fnr: u32, i: u32) {
+    let f: *mut fir.Fir = ff(c)
+    let art: u32 = fir.i_art_von(f, i)
+    let ty: u32 = fir.i_ty_von(f, i)
+    let dst: u32 = fir.i_dst_von(f, i)
+    if ty == fir.T_F64 {
+        (*c).ungeeignet = true
+        return
+    }
+        if art == fir.O_CONST {
+        emit_const(c, ty, fir.i_zahl_von(f, i), dst)
+        return
+    }
+        if art == fir.O_BIN {
+        emit_bin(c, ty, fir.i_c_von(f, i), fir.i_a_von(f, i), fir.i_b_von(f, i), dst)
+        return
+    }
+    if art == fir.O_CMP {
+        emit_cmp(c, fir.i_zahl_von(f, i) as u32, fir.i_c_von(f, i), fir.i_a_von(f, i), fir.i_b_von(f, i), dst)
+        return
+    }
+        if art == fir.O_UN {
+        emit_un(c, ty, fir.i_c_von(f, i), fir.i_a_von(f, i), dst)
+        return
+    }
+        if art == fir.O_CAST {
+        emit_cast(c, fir.i_c_von(f, i), ty, fir.i_a_von(f, i), dst)
+        return
+    }
+        if art == fir.O_ALLOCA {
+        emit_alloca(c, dst)
+        return
+    }
+        if art == fir.O_LOAD {
+        emit_load(c, ty, fir.i_a_von(f, i), dst)
+        return
+    }
+        if art == fir.O_STORE {
+        emit_store(c, ty, fir.i_a_von(f, i), fir.i_b_von(f, i))
+        return
+    }
+        if art == fir.O_PTRADD {
+        emit_ptradd(c, fir.i_a_von(f, i), fir.i_b_von(f, i), dst)
+        return
+    }
+        if art == fir.O_CALL {
+        emit_call(c, f, i, fnr)
+        return
+    }
+        if art == fir.O_SYSCALL {
+        emit_syscall(c, f, i)
+        return
+    }
+    if art == fir.O_COPYMEM {
+        emit_copymem(c, fir.i_a_von(f, i), fir.i_b_von(f, i), fir.i_zahl_von(f, i))
+        return
+    }
+    (*c).ungeeignet = true
+}
+
+fn emit_term(c: *mut Cg, fnr: u32, bb: u32) {
+    let f: *mut fir.Fir = ff(c)
+    let art: u32 = fir.b_term_von(f, fnr, bb)
+    if art == fir.TERM_BR {
+        ein(c)
+        var j: [u8; 4] = "jmp "
+        w(c, (&j[0]) as u64, 4)
+        blocklabel(c, fir.f_name_von(f, fnr), fir.b_t1_von(f, fnr, bb))
+        nl(c)
+        return
+    }
+    if art == fir.TERM_BRCOND {
+        lade_wert(c, R_AX, fir.b_t1_von(f, fnr, bb))
+        var tst: [u8; 11] = "test eax, 1"
+        roh(c, (&tst[0]) as u64, 11)
+        ein(c)
+        var jn: [u8; 4] = "jne "
+        w(c, (&jn[0]) as u64, 4)
+        blocklabel(c, fir.f_name_von(f, fnr), fir.b_t2_von(f, fnr, bb))
+        nl(c)
+        ein(c)
+        var jm: [u8; 4] = "jmp "
+        w(c, (&jm[0]) as u64, 4)
+        blocklabel(c, fir.f_name_von(f, fnr), fir.b_t3_von(f, fnr, bb))
+        nl(c)
+        return
+    }
+    let v: u32 = fir.b_t1_von(f, fnr, bb)
+    if v != fir.KEIN {
+        lade_wert(c, R_AX, v)
+    }
+    var lv: [u8; 5] = "leave"
+    roh(c, (&lv[0]) as u64, 5)
+    var rt2: [u8; 3] = "ret"
+    roh(c, (&rt2[0]) as u64, 3)
+}
+
+fn cg_lauf(c: *mut Cg) {
+    let f: *mut fir.Fir = ff(c)
+    var kopf: [u8; 29] = ".intel_syntax noprefix\n.text\n"
+    t(c, (&kopf[0]) as u64, 29)
+    var st: [u8; 91] = ".globl _start\n_start:\n    xor rbp, rbp\n    mov rdi, rsp\n    and rsp, -16\n    call _F1.main\n"
+    t(c, (&st[0]) as u64, 91)
+    var st2: [u8; 53] = "    mov edi, eax\n    mov eax, 60\n    syscall\n    hlt\n"
+    t(c, (&st2[0]) as u64, 53)
+
+    var fi: u32 = 0
+    while fi < fir.fn_anzahl(f) as u32 {
+        rahmen_bauen(c, fi)
+        nl(c)
+        var g: [u8; 7] = ".globl "
+        t(c, (&g[0]) as u64, 7)
+        sym(c, fir.f_name_von(f, fi))
+        nl(c)
+        sym(c, fir.f_name_von(f, fi))
+        var dp: [u8; 1] = ":"
+        t(c, (&dp[0]) as u64, 1)
+        nl(c)
+        var pr: [u8; 30] = "    push rbp\n    mov rbp, rsp\n"
+        t(c, (&pr[0]) as u64, 30)
+        if (*c).rahmen > 0 {
+            ein(c)
+            var sb: [u8; 9] = "sub rsp, "
+            w(c, (&sb[0]) as u64, 9)
+            zahl(c, (*c).rahmen)
+            nl(c)
+        }
+        // Parameter aus den Argumentregistern in ihre Plaetze sichern.
+        let plen: u32 = fir.f_plen_von(f, fi)
+        if plen > 6 {
+            (*c).ungeeignet = true
+            return
+        }
+        var k: u32 = 0
+        while k < plen {
+            ein(c)
+            var m: [u8; 19] = "mov qword ptr [rbp-"
+            w(c, (&m[0]) as u64, 19)
+            zahl(c, slot_von(c, k))
+            var s: [u8; 3] = "], "
+            w(c, (&s[0]) as u64, 3)
+            argreg(c, k)
+            nl(c)
+            k = k + 1
+        }
+        var bb: u32 = 0
+        while bb < fir.block_anzahl(f, fi) {
+            blocklabel(c, fir.f_name_von(f, fi), bb)
+            var dp2: [u8; 1] = ":"
+            t(c, (&dp2[0]) as u64, 1)
+            nl(c)
+            var n: u32 = 0
+            while n < fir.inst_anzahl(f, fi, bb) {
+                emit_inst(c, fi, fir.inst_bei(f, fi, bb, n))
+                if (*c).ungeeignet {
+                    return
+                }
+                n = n + 1
+            }
+            emit_term(c, fi, bb)
+            bb = bb + 1
+        }
+        fi = fi + 1
+    }
+    var gnu: [u8; 38] = ".section .note.GNU-stack,\"\",@progbits\n"
+    t(c, (&gnu[0]) as u64, 38)
+}

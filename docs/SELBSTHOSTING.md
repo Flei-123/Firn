@@ -1032,3 +1032,83 @@ bei `return`, `break` und `continue` in der richtigen Tiefe ablaufen (SPEC
 **Nächster Schritt:** der Codegenerator. Von der FIR zu x86-64-Assembler — und
 damit zum ersten Mal ein Programm, das `firnc1` von vorne bis hinten selbst
 übersetzt hat.
+
+
+---
+
+## 17. Runde 27: der Codegenerator — der erste Lauf von vorne bis hinten
+
+`lib/firnc1/codegen.fi` erzeugt x86-64-Assembler aus der FIR, und
+`bin/firnc1.fi` hängt die ganze Kette aneinander:
+
+```text
+Text → Token → Baum → Typen → FIR → Assembler
+```
+
+**109 Testprogramme wurden vollständig vom Firn-Compiler übersetzt,
+assembliert, gelinkt, ausgeführt — und verhalten sich genau wie die von
+`firnc0` erzeugten.** Gleicher Rückgabewert, gleiche Ausgabe, null
+Abweichungen.
+
+### Bewusst ohne Registerzuteilung
+
+`firnc0` hat dafür `regalloc.rs` mit Lebendigkeitsanalyse und Verschmelzung.
+`codegen.fi` hat das nicht: **jeder FIR-Wert bekommt einen Platz im Rahmen**,
+und jede Instruktion lädt ihre Operanden, rechnet und schreibt zurück. Der
+erzeugte Code ist deutlich langsamer — aber er ist richtig, und er passt in
+einen Nachmittag.
+
+Das ändert den Maßstab, und zwar zum Besseren: **verglichen wird nicht der
+Assemblertext, sondern das Verhalten.** Zwei Codegeneratoren mit
+unterschiedlicher Registerzuteilung *können* keinen gleichen Text erzeugen —
+und sie müssen es auch nicht. Für einen Codegenerator ist „das Programm tut
+dasselbe" ohnehin die ehrlichere Frage als „die Zeichen stimmen überein".
+
+### Rahmen und Aufrufkonvention
+
+`[rbp - 8*(v+1)]` ist der Platz des Wertes `%v`; dahinter liegen die Bereiche
+der `alloca`s. Ein Wert liegt **immer als volle 64 Bit** da, passend
+vorzeichen- oder nullerweitert — deshalb läuft nach jeder Rechnung eine
+Normalisierung. Der Sonderfall dabei: `movzx r64, r/m32` gibt es nicht, ein
+`mov exx, exx` nullt die oberen 32 Bit von selbst.
+
+Argumente gehen nach System V in `rdi, rsi, rdx, rcx, r8, r9`; ein Syscall
+nimmt die Nummer in `rax` und danach `rdi, rsi, rdx, r10, r8, r9`. `copymem`
+wird zu `rep movsb`.
+
+### Ergebnis
+
+`tools/selbst_vergleich.sh`, Abschnitt 16 in `test.sh`:
+
+| | |
+|---|---:|
+| **gleiches Verhalten** | **109** |
+| abweichend | **0** |
+| fehlerhaft | **0** |
+| nicht Kernsprache | 35 |
+| `defer` | 1 |
+| Codegenerator fehlt (Gleitkomma, > 6 Argumente) | 5 |
+| übersprungen (`firnc0` übersetzt nicht einzeln) | 38 |
+
+### Was noch fehlt
+
+* **Gleitkomma.** Es braucht die SSE-Register und eine eigene Klassifikation;
+  `firnc0` behandelt `f64` in Stufe 0 ohnehin abweichend von System V
+  (SPEC §14.1). Fünf Dateien fallen dadurch heraus.
+* **Mehr als sechs Argumente** je Aufruf — die weiteren gehen über den Stapel.
+* **`fork`/`execve`** (Punkt 11): `as` und `ld` ruft noch das Skript auf, nicht
+  `firnc1`. Ohne das gibt es kein eigenständiges `firnc1`-Programm.
+* **Das Modulsystem**: `firnc1` liest genau eine Datei. Für den Fixpunkt müsste
+  es `import` auflösen — und der Compiler selbst besteht aus vielen Dateien.
+
+### Stand der Kette
+
+| Teil | Stand |
+|---|---|
+| `lexer` · `diag` · `ast` + `parser` · `types` + `abi` · `sema` · `fir` · `lower` | ✅ |
+| `codegen_x86` | ✅ ohne Registerzuteilung und ohne Gleitkomma |
+| `config` · Modulsystem · `fork`/`execve` | `[ ]` |
+
+**Der Weg zum Fixpunkt (SPEC §11, Stufe 2/3) ist damit erstmals sichtbar:**
+Modulsystem, Prozessstart, dann `firnc1` auf sich selbst. Was heute schon gilt:
+**109 Programme, die kein Rust angefasst hat.**
