@@ -1208,10 +1208,17 @@ zuerst geparst und kannte die Vorlagen der Module deshalb nicht.
 
 Nachweis für beides: `tests/630_modulkette.fi`.
 
-**Offen (`docs/SELBSTHOSTING.md` §7, B2):** eine generische Vorlage sieht nur
-die Namen der **Wurzeldatei**, nicht die ihrer eigenen Moduldatei — selbst eine
-Hilfsfunktion zwölf Zeilen darüber meldet *unbekannte funktion*. Solange das
-gilt, kann ein Modul keine generische Sammlung anbieten, die intern arbeitet.
+**Generische Vorlagen sehen die Namen ihrer eigenen Moduldatei** (Runde 18).
+Sie liegen nicht in `Program::funcs`, sondern in `sema_generic::REG`; das
+Modul-Umschreiben erreichte sie deshalb nie. `modules::build_program` schickt
+jetzt auch die Vorlagen der jeweiligen Datei durch denselben `Renamer` — ihr
+**Name** bleibt unangetastet, weil die Ausprägung ihn unter dem ursprünglichen
+Namen sucht und generische Namen programmweit gelten.
+
+Damit ist eine generische Sammlung als Bibliothek schreibbar:
+`lib/rt/vec.fi` bindet `rt` ein, ruft `rt.heap_alloc` aus dem Rumpf einer
+Vorlage, und die Wurzeldatei schreibt `var v: Vec[i32] = vec_neu[i32]()`
+(`tests/640_vec_modul.fi`).
 
 #### 14.1.sizeof — `size_of[T]()` (Runde 16)
 

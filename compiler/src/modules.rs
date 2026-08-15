@@ -353,6 +353,40 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
                 r.ty(t);
             }
         }
+        // GENERISCHE VORLAGEN DIESER DATEI mit umschreiben.
+        //
+        // Sie liegen nicht in `Program::funcs`, sondern in
+        // `sema_generic::REG` — das Umschreiben oben erreichte sie deshalb
+        // nie, und eine Vorlage aus einem Modul sah nur die Namen der
+        // WURZELDATEI. Selbst eine Hilfsfunktion in derselben Datei meldete
+        // "unbekannte funktion" (docs/SELBSTHOSTING.md §7, Blocker B2).
+        //
+        // Der NAME der Vorlage bleibt unangetastet: die Auspraegung sucht ihn
+        // spaeter unter dem urspruenglichen Namen (`mono::expand_fn` ueber
+        // `Instantiation::base`), und generische Namen gelten programmweit.
+        let datei_id = files[idx].id;
+        for name in crate::sema_generic::fn_vorlagen_der_datei(datei_id) {
+            crate::sema_generic::mit_fn_vorlage(&name, |decl| {
+                r.locals.clear();
+                r.push_scope();
+                for prm in decl.params.iter_mut() {
+                    r.ty(&mut prm.ty);
+                    r.declare(&prm.name);
+                }
+                if let Some(t) = decl.ret.as_mut() {
+                    r.ty(t);
+                }
+                r.block(&mut decl.body);
+                r.pop_scope();
+            });
+        }
+        for name in crate::sema_generic::struct_vorlagen_der_datei(datei_id) {
+            crate::sema_generic::mit_struct_vorlage(&name, |decl| {
+                for (_, t, _) in decl.fields.iter_mut() {
+                    r.ty(t);
+                }
+            });
+        }
         for c in p.consts.iter_mut() {
             r.ty(&mut c.ty);
             r.expr(&mut c.value);
