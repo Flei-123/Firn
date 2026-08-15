@@ -41,9 +41,10 @@ import typen
 import sema
 import fir
 import muster
+import fehler
 
 export { Lower, low_neu, low_frei, low_lauf, low_fehler, low_fir, low_ungeeignet,
-         low_mu_setzen }
+         low_mu_setzen, low_fe_setzen }
 
 const KEIN: u32 = 4294967295
 
@@ -65,6 +66,7 @@ struct Lower {
     d_grenze: Vec[u32]  // Grenzen je Blockebene
     sret: u32
     mu: u64             // Register der Aufzaehlungen/Musterabgleiche (0 = keins)
+    feh: u64            // Register der Fehlermengen/-unionen (0 = keins)
     fehler: usize
     ungeeignet: bool    // Aggregat oder `defer` gefunden
 }
@@ -77,7 +79,7 @@ fn low_neu(b: u64, it: u64, sm: u64) -> Lower {
         v_name: vec_neu[u32](), v_slot: vec_neu[u32](), b_grenze: vec_neu[u32](),
         l_break: vec_neu[u32](), l_cont: vec_neu[u32](), l_tiefe: vec_neu[u32](),
         d_stmt: vec_neu[u32](), d_err: vec_neu[u32](), d_grenze: vec_neu[u32](),
-        sret: KEIN, mu: 0, fehler: 0, ungeeignet: false,
+        sret: KEIN, mu: 0, feh: 0, fehler: 0, ungeeignet: false,
     }
 }
 
@@ -101,6 +103,12 @@ fn low_mu_setzen(l: *mut Lower, m: u64) { (*l).mu = m }
 
 fn mul(l: *mut Lower) -> *mut muster.Mus { return (*l).mu as *mut muster.Mus }
 fn hat_mu(l: *mut Lower) -> bool { return (*l).mu != 0 }
+
+// Das Fehler-Register anmelden. MUSS vor `low_lauf` stehen.
+fn low_fe_setzen(l: *mut Lower, f: u64) { (*l).feh = f }
+
+fn fel(l: *mut Lower) -> *mut fehler.Fehler { return (*l).feh as *mut fehler.Fehler }
+fn hat_fe(l: *mut Lower) -> bool { return (*l).feh != 0 }
 fn low_ungeeignet(l: *mut Lower) -> bool { return (*l).ungeeignet }
 fn low_fir(l: *mut Lower) -> *mut fir.Fir { return &(*l).f }
 
@@ -265,6 +273,21 @@ fn suchen(l: *mut Lower, name: u32) -> u32 {
 fn adresse(l: *mut Lower, e: u32) -> u32 {
     let b: *mut ast.Baum = baum(l)
     let a: u32 = ast.e_art(b, e)
+    // HOOK fehlerunionen (lower_errors.rs::hook_addr): ein Ausdruck mit
+    // vorgemerkter Umwandlung liegt als fertige Union im Speicher.
+    if hat_fe(l) {
+        let cu: u32 = fehler.fehler_coerce_offen(fel(l), e)
+        if cu != KEIN {
+            let us: usize = fehler.fehler_u_sidx(fel(l), cu) as usize
+            var g: u64 = typen.st_groesse(tf(l), us)
+            if g < 1 { g = 1 }
+            var al: u64 = typen.st_ausrichtung(tf(l), us)
+            if al < 1 { al = 1 }
+            let slot: u32 = alloca(l, g, al)
+            union_schreiben(l, slot, e, cu)
+            return slot
+        }
+    }
     if a == ast.E_ID {
         let slot: u32 = suchen(l, ast.e_a(b, e))
         if slot != KEIN {
@@ -324,6 +347,21 @@ fn adresse(l: *mut Lower, e: u32) -> u32 {
         return slot
     }
     if a == ast.E_RUF {
+        // HOOK fehlerunionen (lower_errors.rs::hook_addr): `try`, `catch`
+        // und der reine Fehlerwert legen ihren Platz selbst an.
+        if hat_fe(l) && ast.e_zahl(b, e) == 0 {
+            let nm: u32 = ast.e_a(b, e)
+            if fehler.fehler_ist_tryname(namen(l), nm) {
+                return try_adresse(l, e)
+            }
+            if fehler.fehler_ist_catchname(namen(l), nm) {
+                return catch_slot(l, e)
+            }
+            let cc: i64 = fehler.fehler_ctor_code((*l).feh, namen(l), nm)
+            if cc >= 0 {
+                return ctor_adresse(l, e, cc as u64)
+            }
+        }
         // HOOK enum (lower_match.rs): der Konstruktor legt den Wert selbst an.
         if hat_mu(l) && ast.e_zahl(b, e) == 0 {
             if muster.mus_ist_ctorname(namen(l), ast.e_a(b, e)) {
@@ -357,6 +395,39 @@ fn schreib_nach(l: *mut Lower, adr: u32, e: u32) {
     let b: *mut ast.Baum = baum(l)
     let a: u32 = ast.e_art(b, e)
     let t: u32 = sema.sema_typ(sm(l), e)
+
+    // HOOK fehlerunionen (lower_errors.rs::hook_write_into): die implizite
+    // Umwandlung, der reine Fehlerwert und `try`/`catch` schreiben selbst.
+    if hat_fe(l) {
+        let cu: u32 = fehler.fehler_coerce_offen(fel(l), e)
+        if cu != KEIN {
+            union_schreiben(l, adr, e, cu)
+            return
+        }
+        if a == ast.E_RUF && ast.e_zahl(b, e) == 0 {
+            let nm: u32 = ast.e_a(b, e)
+            let cc: i64 = fehler.fehler_ctor_code((*l).feh, namen(l), nm)
+            if cc >= 0 {
+                let cv: u32 = konst(l, fir.T_U32, cc as u64)
+                speichere(l, fir.T_U32, adr, cv)
+                return
+            }
+            var ist_erg: bool = fehler.fehler_ist_tryname(namen(l), nm)
+            if !ist_erg {
+                ist_erg = fehler.fehler_ist_catchname(namen(l), nm)
+            }
+            if ist_erg {
+                var src: u32 = 0
+                if fehler.fehler_ist_tryname(namen(l), nm) {
+                    src = try_adresse(l, e)
+                } else {
+                    src = catch_slot(l, e)
+                }
+                kopie_wert(l, adr, src, t)
+                return
+            }
+        }
+    }
 
     if a == ast.E_SLIT {
         let si: usize = typen.ty_a(tf(l), t) as usize
@@ -575,6 +646,19 @@ fn wert(l: *mut Lower, e: u32) -> u32 {
         return lade(l, ft, adr)
     }
     if a == ast.E_RUF {
+        // HOOK fehlerunionen (lower_errors.rs::hook_value): das SKALARE
+        // Ergebnis von `try`/`catch` (Aggregate laufen ueber `adresse`).
+        if hat_fe(l) && ast.e_zahl(b, e) == 0 {
+            let nm: u32 = ast.e_a(b, e)
+            if fehler.fehler_ist_tryname(namen(l), nm) {
+                let sa: u32 = try_adresse(l, e)
+                return lade(l, ft, sa)
+            }
+            if fehler.fehler_ist_catchname(namen(l), nm) {
+                let sa: u32 = catch_slot(l, e)
+                return lade(l, ft, sa)
+            }
+        }
         return ruf(l, e, ft)
     }
     if a == ast.E_SYSCALL {
@@ -629,6 +713,22 @@ fn binaer(l: *mut Lower, e: u32) -> u32 {
         return kurzschluss(l, op, li, re)
     }
     if op >= 10 && op <= 15 {
+        // HOOK fehlerunionen (lower_errors.rs::hook_binary): zwei Fehlerwerte
+        // vergleichen heisst ihre Codes vergleichen (u32 am Anfang).
+        if hat_fe(l) && (op == 10 || op == 11) {
+            let lty: u32 = sema.sema_typ(sm(l), li)
+            let rty: u32 = sema.sema_typ(sm(l), re)
+            if fehler.fehler_set_von_typ(fel(l), tf(l), lty) != KEIN {
+                if fehler.fehler_set_von_typ(fel(l), tf(l), rty) != KEIN {
+                    let aa: u32 = adresse(l, li)
+                    let av: u32 = lade(l, fir.T_U32, aa)
+                    let ba: u32 = adresse(l, re)
+                    let bv: u32 = lade(l, fir.T_U32, ba)
+                    return push(l, fir.O_CMP, fir.T_BOOL, av, bv, op - 10,
+                                fir.T_U32 as u64, 0, 0)
+                }
+            }
+        }
         let ty: u32 = e_fty(l, li)
         let av: u32 = wert(l, li)
         let bv: u32 = wert(l, re)
@@ -758,7 +858,15 @@ fn ruf_voll(l: *mut Lower, e: u32, ziel: u32) -> u32 {
     var k: u32 = 0
     while k < ast.e_c(b, e) {
         let arg: u32 = ast.kind_at(b, ast.e_b(b, e) + k)
-        let at: u32 = sema.sema_typ(sm(l), arg)
+        var at: u32 = sema.sema_typ(sm(l), arg)
+        // HOOK fehlerunionen (lower_errors.rs::hook_arg_type): ein implizit
+        // umgewandeltes Argument ueberquert die Grenze als Aggregat.
+        if hat_fe(l) {
+            let cu: u32 = fehler.fehler_coerce_offen(fel(l), arg)
+            if cu != KEIN {
+                at = fehler.fehler_union_typ(fel(l), tf(l), cu)
+            }
+        }
         if !ist_aggregat(l, at) {
             vec_push[u32](&tmp, wert(l, arg))
             k = k + 1
@@ -836,6 +944,22 @@ fn anweisung(l: *mut Lower, i: u32) {
 
     if a == ast.S_LET || a == ast.S_VAR {
         let init: u32 = ast.s_c(b, i)
+        // HOOK fehlerunionen (lower_errors.rs::hook_let): die implizite
+        // Umwandlung schreibt die Union selbst in den neuen Platz.
+        if hat_fe(l) {
+            let cu: u32 = fehler.fehler_coerce_offen(fel(l), init)
+            if cu != KEIN {
+                let us: usize = fehler.fehler_u_sidx(fel(l), cu) as usize
+                var g: u64 = typen.st_groesse(tf(l), us)
+                if g < 1 { g = 1 }
+                var al: u64 = typen.st_ausrichtung(tf(l), us)
+                if al < 1 { al = 1 }
+                let slot: u32 = alloca(l, g, al)
+                union_schreiben(l, slot, init, cu)
+                anlegen(l, ast.s_a(b, i), slot)
+                return
+            }
+        }
         let t: u32 = sema.sema_typ(sm(l), init)
         if !ist_aggregat(l, t) {
             let ft: u32 = fty(l, t)
@@ -857,6 +981,28 @@ fn anweisung(l: *mut Lower, i: u32) {
     if a == ast.S_EXPR {
         let e: u32 = ast.s_a(b, i)
         let ea: u32 = ast.e_art(b, e)
+        // HOOK fehlerunionen (lower_errors.rs::hook_stmt): `try`/`catch`/
+        // Fehlerwert als Anweisung — der Wert wird verworfen, der Weg zu
+        // ihm bleibt.
+        if ea == ast.E_RUF && hat_fe(l) && ast.e_zahl(b, e) == 0 {
+            let nm: u32 = ast.e_a(b, e)
+            if fehler.fehler_ist_tryname(namen(l), nm) {
+                try_adresse(l, e)
+                return
+            }
+            if fehler.fehler_ist_catchname(namen(l), nm) {
+                catch_slot(l, e)
+                return
+            }
+            let cc: i64 = fehler.fehler_ctor_code((*l).feh, namen(l), nm)
+            if cc >= 0 {
+                let t: u32 = sema.sema_typ(sm(l), e)
+                let slot: u32 = alloca(l, q_groesse(l, t), q_ausricht(l, t))
+                let cv: u32 = konst(l, fir.T_U32, cc as u64)
+                speichere(l, fir.T_U32, slot, cv)
+                return
+            }
+        }
         if ea == ast.E_RUF && hat_mu(l) && ast.e_zahl(b, e) == 0 {
             // HOOK enum/match (lower_match.rs::lower_types_stmt).
             let nm: u32 = ast.e_a(b, e)
@@ -900,6 +1046,17 @@ fn anweisung(l: *mut Lower, i: u32) {
             defer_bis(l, 0)
             term(l, fir.TERM_RET, KEIN, 0, 0)
         } else {
+            // HOOK fehlerunionen (lower_errors.rs::hook_return): die
+            // implizite Umwandlung bei 'return'.
+            var umgewandelt: bool = false
+            if hat_fe(l) {
+                let cu: u32 = fehler.fehler_coerce_offen(fel(l), wv)
+                if cu != KEIN {
+                    fehler_return(l, wv, cu)
+                    umgewandelt = true
+                }
+            }
+            if !umgewandelt {
             let t: u32 = sema.sema_typ(sm(l), wv)
             if ist_aggregat(l, t) {
                 // Aggregatrueckgabe nach `abi`: ueber den versteckten Zeiger
@@ -922,6 +1079,7 @@ fn anweisung(l: *mut Lower, i: u32) {
                 let v: u32 = wert(l, wv)
                 defer_bis(l, 0)
                 term(l, fir.TERM_RET, v, 0, 0)
+            }
             }
         }
         // Alles danach ist unerreichbar: neuen Block oeffnen, damit die
@@ -1578,6 +1736,194 @@ fn match_lower(l: *mut Lower, mi: u32) {
 }
 
 // ------------------------------------------------------------------- Lauf
+
+// -------------------------------------- fehlerunionen (lower_errors.rs)
+//
+// Portierung des Lowerings von `try`, `catch`, `Menge::Variante` und der
+// impliziten Umwandlung. Eine Fehlerunion ist ein gewoehnlicher Struct
+// (`{ __err: u32, __val: T }`, 0 = Erfolg) — es braucht keine neue
+// FIR-Instruktion, nur load/store, einen Vergleich und eine Verzweigung.
+// Die Reihenfolge der erzeugten Instruktionen und Bloecke ist Vertrag,
+// `tools/fir_vergleich.sh` vergleicht Oktett fuer Oktett.
+//
+// EHRLICHE GRENZE: `ret_term_fehler` in Stufe 0 laesst auf dem Fehlerpfad
+// zusaetzlich die `errdefer`-Anweisungen laufen. Die kennt diese Stufe noch
+// nicht — Dateien mit `errdefer` zaehlen als nicht Kern (eigene Runde) —,
+// deshalb laufen hier beide Ruecksprungwege ueber `defer_bis`.
+
+// Schreibt die Fehlerunion an `addr` — Erfolgswert oder Fehlercode
+// (`write_union`). BUSY verhindert, dass der Rohwert-Zugriff erneut in
+// die Umwandlung laeuft.
+fn union_schreiben(l: *mut Lower, addr: u32, e: u32, cu: u32) {
+    fehler.fehler_busy_auf(fel(l), e)
+    let art: u32 = fehler.fehler_coerce_art(fel(l), e)
+    if art == fehler.FEHLER_AUS_WERT {
+        let zero: u32 = konst(l, fir.T_U32, 0)
+        speichere(l, fir.T_U32, addr, zero)
+        let va: u32 = ptradd_konst(l, addr, fehler.fehler_u_voff(fel(l), cu))
+        schreib_nach(l, va, e)
+    } else {
+        let code: u32 = fehlercode(l, e)
+        speichere(l, fir.T_U32, addr, code)
+    }
+    fehler.fehler_busy_zu(fel(l), e)
+}
+
+// Fehlercode eines Ausdrucks vom Typ einer Fehlermenge (`error_code`):
+// bei einer Variante die Konstante, sonst der geladene Code.
+fn fehlercode(l: *mut Lower, e: u32) -> u32 {
+    let b: *mut ast.Baum = baum(l)
+    if ast.e_art(b, e) == ast.E_RUF && ast.e_zahl(b, e) == 0 {
+        let cc: i64 = fehler.fehler_ctor_code((*l).feh, namen(l), ast.e_a(b, e))
+        if cc >= 0 {
+            return konst(l, fir.T_U32, cc as u64)
+        }
+    }
+    let a: u32 = adresse(l, e)
+    return lade(l, fir.T_U32, a)
+}
+
+// `Menge::Variante` als Wert: ein Platz mit dem Code (`ctor_addr`).
+fn ctor_adresse(l: *mut Lower, e: u32, code: u64) -> u32 {
+    let t: u32 = sema.sema_typ(sm(l), e)
+    let slot: u32 = alloca(l, q_groesse(l, t), q_ausricht(l, t))
+    let c: u32 = konst(l, fir.T_U32, code)
+    speichere(l, fir.T_U32, slot, c)
+    return slot
+}
+
+// Kopiert einen Wert vom Typ `t` von `src` nach `dst` (`copy_value`).
+fn kopie_wert(l: *mut Lower, dst: u32, src: u32, t: u32) {
+    if ist_aggregat(l, t) {
+        copymem(l, dst, src, typen.groesse_von(tf(l), t))
+        return
+    }
+    // Wie `scalar_fty` in lower_errors.rs: f64 ist dort ABSICHTLICH nicht
+    // im Muster — kein Programm im Korpus hat `E!f64`; hier dasselbe.
+    if typen.ty_art(tf(l), t) == typen.K_F64 {
+        return
+    }
+    let ft: u32 = fty(l, t)
+    if ft == fir.KEIN || ft == fir.T_VOID {
+        return
+    }
+    let v: u32 = lade(l, ft, src)
+    speichere(l, ft, dst, v)
+}
+
+// `return` mit impliziter Umwandlung in die Fehlerunion der Funktion
+// (`do_return`).
+fn fehler_return(l: *mut Lower, v: u32, cu: u32) {
+    if (*l).sret != KEIN {
+        union_schreiben(l, (*l).sret, v, cu)
+        defer_bis(l, 0)
+        term(l, fir.TERM_RET, (*l).sret, 0, 0)
+        return
+    }
+    // Bis 8 Byte liegt die Fehlerunion in einem Wort in `rax` (abi). Der
+    // Zwischenspeicher wird genullt, damit die Fuellbytes in jeder
+    // Baustufe denselben Wert haben.
+    let slot: u32 = alloca(l, 8, 8)
+    let zero: u32 = konst(l, fir.T_I64, 0)
+    speichere(l, fir.T_I64, slot, zero)
+    union_schreiben(l, slot, v, cu)
+    let w: u32 = lade(l, fir.T_I64, slot)
+    defer_bis(l, 0)
+    term(l, fir.TERM_RET, w, 0, 0)
+}
+
+// Verlaesst die Funktion mit dem Fehlercode `code` (`return_error`) —
+// der Fehlerpfad von `try`.
+fn fehler_verlassen(l: *mut Lower, code: u32) {
+    if (*l).sret != KEIN {
+        speichere(l, fir.T_U32, (*l).sret, code)
+        defer_bis(l, 0)
+        term(l, fir.TERM_RET, (*l).sret, 0, 0)
+        return
+    }
+    let slot: u32 = alloca(l, 8, 8)
+    let zero: u32 = konst(l, fir.T_I64, 0)
+    speichere(l, fir.T_I64, slot, zero)
+    speichere(l, fir.T_U32, slot, code)
+    let w: u32 = lade(l, fir.T_I64, slot)
+    defer_bis(l, 0)
+    term(l, fir.TERM_RET, w, 0, 0)
+}
+
+// `try a` — liefert die Adresse des Erfolgswertes; im Fehlerfall wird die
+// Funktion mit demselben Code verlassen (`try_value_addr`).
+fn try_adresse(l: *mut Lower, e: u32) -> u32 {
+    let b: *mut ast.Baum = baum(l)
+    let u: u32 = fehler.fehler_try(fel(l), e)
+    if u == KEIN {
+        aufgeben(l)
+        return 0
+    }
+    let arg: u32 = ast.kind_at(b, ast.e_b(b, e))
+    let src: u32 = adresse(l, arg)
+    let code: u32 = lade(l, fir.T_U32, src)
+    let zero: u32 = konst(l, fir.T_U32, 0)
+    let bad: u32 = push(l, fir.O_CMP, fir.T_BOOL, code, zero, 1,
+                        fir.T_U32 as u64, 0, 0)
+    let fail: u32 = neuer_block(l)
+    let cont: u32 = neuer_block(l)
+    term(l, fir.TERM_BRCOND, bad, fail, cont)
+    (*l).cur = fail
+    fehler_verlassen(l, code)
+    (*l).cur = cont
+    return ptradd_konst(l, src, fehler.fehler_u_voff(fel(l), u))
+}
+
+// `a catch b` — liefert die Adresse des Ergebnisses (Erfolgswert oder
+// Ersatz) in einem eigenen Platz (`catch_slot`).
+fn catch_slot(l: *mut Lower, e: u32) -> u32 {
+    let b: *mut ast.Baum = baum(l)
+    let u: u32 = fehler.fehler_catch(fel(l), e)
+    if u == KEIN {
+        aufgeben(l)
+        return 0
+    }
+    let lhs: u32 = ast.kind_at(b, ast.e_b(b, e))
+    let rhs: u32 = ast.kind_at(b, ast.e_b(b, e) + 1)
+    let vt: u32 = fehler.fehler_u_valty(fel(l), u)
+    let slot: u32 = alloca(l, q_groesse(l, vt), q_ausricht(l, vt))
+    let src: u32 = adresse(l, lhs)
+    let code: u32 = lade(l, fir.T_U32, src)
+    let zero: u32 = konst(l, fir.T_U32, 0)
+    let good: u32 = push(l, fir.O_CMP, fir.T_BOOL, code, zero, 0,
+                         fir.T_U32 as u64, 0, 0)
+    let ok_bb: u32 = neuer_block(l)
+    let alt_bb: u32 = neuer_block(l)
+    let join: u32 = neuer_block(l)
+    term(l, fir.TERM_BRCOND, good, ok_bb, alt_bb)
+
+    (*l).cur = ok_bb
+    let va: u32 = ptradd_konst(l, src, fehler.fehler_u_voff(fel(l), u))
+    kopie_wert(l, slot, va, vt)
+    if !terminiert(l) {
+        term(l, fir.TERM_BR, join, 0, 0)
+    }
+
+    (*l).cur = alt_bb
+    // `catch |f| ...`: der Fehlerwert liegt im Ersatz als Variable.
+    let bind: u32 = fehler.fehler_cb(fel(l), e)
+    if bind != KEIN {
+        bereich_auf(l)
+        let eslot: u32 = alloca(l, 4, 4)
+        speichere(l, fir.T_U32, eslot, code)
+        anlegen(l, bind, eslot)
+    }
+    schreib_nach(l, slot, rhs)
+    if bind != KEIN {
+        bereich_zu(l)
+    }
+    if !terminiert(l) {
+        term(l, fir.TERM_BR, join, 0, 0)
+    }
+
+    (*l).cur = join
+    return slot
+}
 
 fn low_lauf(l: *mut Lower) {
     let b: *mut ast.Baum = baum(l)

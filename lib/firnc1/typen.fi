@@ -24,6 +24,7 @@ import rt
 import vec
 import intern
 import ast
+import fehler
 
 export { Typen, typen_neu, typen_frei, typen_aufloesen,
          K_I8, K_I16, K_I32, K_I64, K_U8, K_U16, K_U32, K_U64,
@@ -35,7 +36,8 @@ export { Typen, typen_neu, typen_frei, typen_aufloesen,
          param_typ_aufgeloest, KLASSE_MEM,
          neuer_typ, aufloesen, typ_gleich, vertraeglich, ist_ganzzahl, ist_zeiger,
          ist_vorzeichen, bits_von, name_von, struct_index, grundtyp, st_feld_typ,
-         typen_struct_vormerken, typen_struct_festlegen }
+         typen_struct_vormerken, typen_struct_festlegen,
+         typen_struct_anhaengen, typen_fehler_setzen }
 
 const K_I8: u32 = 0
 const K_I16: u32 = 1
@@ -80,6 +82,13 @@ struct Typen {
     // Baum-Structs — genau wie in Stufe 0 (`declare_enums` vor
     // `collect_structs`).
     eoff: u32,
+    // Registrierung der Fehlerunionen (Runde 33, `fehler.fi`), 0 = keine.
+    // Ueber sie loest `aufloesen` die Platzhalter `__eu#<n>` auf und meldet
+    // die Structphase. Ein Zeiger statt eines Imports in die Gegenrichtung
+    // waere sauberer; Firn kennt keine Funktionszeiger, also ruft diese
+    // Datei `fehler.fi` direkt — der Importzyklus ist erlaubt (gemessen:
+    // modules.rs loest ihn auf wie jeden anderen).
+    feh: u64,
     // je Funktion: aufgeloeste Parametertypen und Rueckgabetyp
     fn_poff: Vec[u32],
     fn_plen: Vec[u32],
@@ -93,7 +102,7 @@ fn typen_neu() -> Typen {
         s_name: vec_neu[u32](), s_groesse: vec_neu[u64](), s_ausricht: vec_neu[u64](),
         s_foff: vec_neu[u32](), s_flen: vec_neu[u32](),
         f_name: vec_neu[u32](), f_typ: vec_neu[u32](), f_versatz: vec_neu[u64](),
-        eoff: 0,
+        eoff: 0, feh: 0,
         fn_poff: vec_neu[u32](), fn_plen: vec_neu[u32](), fn_ptyp: vec_neu[u32](),
         fn_ret: vec_neu[u32](),
     }
@@ -266,6 +275,26 @@ fn typen_struct_vormerken(t: *mut Typen, name: u32) -> u32 {
     return i
 }
 
+// Registrierung der Fehlerunionen anmelden (Runde 33). MUSS vor
+// `typen_aufloesen` stehen; 0 laesst die Aufloesung von `E!T` aus (dann ist
+// sie wie bisher ein unbekannter Typ — `layoutdump` faehrt bewusst so,
+// weil der Massstab `layout_kanon.rs` Fehlerunionen als `?` druckt).
+fn typen_fehler_setzen(t: *mut Typen, f: u64) { (*t).feh = f }
+
+// Wie `typen_struct_vormerken`, aber OHNE an `eoff` zu zaehlen: die
+// Fehlerunionen entstehen NACH den Structs des Baums (Stufe 0 legt sie im
+// Typkontext ebenfalls erst bei der Aufloesung an — `get_or_create_union`
+// in errors.rs) und haben ihr Layout sofort dabei.
+fn typen_struct_anhaengen(t: *mut Typen, name: u32) -> u32 {
+    let i: u32 = vec_len[u32](&(*t).s_name) as u32
+    vec_push[u32](&(*t).s_name, name)
+    vec_push[u64](&(*t).s_groesse, 0)
+    vec_push[u64](&(*t).s_ausricht, 1)
+    vec_push[u32](&(*t).s_foff, 0)
+    vec_push[u32](&(*t).s_flen, 0)
+    return i
+}
+
 // Traegt fertige Felder, Groesse und Ausrichtung fuer einen vorgemerkten
 // Struct ein, OHNE ueber den Baum zu gehen (das Enum-Layout wird in
 // `muster.fi` gerechnet, nicht hier). Die Feldlisten werden lueckenlos
@@ -312,6 +341,14 @@ fn aufloesen(t: *mut Typen, b: *mut ast.Baum, it: *mut intern.Interner, te: u32)
     let g: i32 = grundtyp(it, nr)
     if g >= 0 {
         return neuer_typ(t, g as u32, 0, 0)
+    }
+    if (*t).feh != 0 {
+        // HOOK fehlerunionen: die Typangabe `E!T` steht als Platzhalter
+        // `__eu#<n>` im Baum (`hook_resolve_ty` in errors.rs).
+        let pi: i64 = fehler.fehler_platzhalter(it, nr)
+        if pi >= 0 {
+            return fehler.fehler_typ((*t).feh, t, b, it, pi as u32)
+        }
     }
     let si: i32 = struct_index(t, nr)
     if si >= 0 {
@@ -399,6 +436,11 @@ fn groesse_anfordern(t: *mut Typen, b: *mut ast.Baum, it: *mut intern.Interner,
         if s < (*t).eoff {
             return
         }
+        if s >= vec_len[u32](zustand) as u32 {
+            // Eine FEHLERUNION (Runde 33): sie wird fertig ausgelegt
+            // angelegt, NACHDEM der Zustandsvektor hier schon steht.
+            return
+        }
         struct_layout(t, b, it, s - (*t).eoff, s, zustand)
     }
 }
@@ -421,6 +463,12 @@ fn typen_aufloesen(t: *mut Typen, b: *mut ast.Baum, it: *mut intern.Interner) {
     //    Deklarationsreihenfolge (siehe `struct_layout`). Der Zustandsvektor
     //    deckt ALLE Eintraege ab; vorgemerkte (Aufzaehlungen) gelten als
     //    fertig, ihr Layout kommt von `muster.fi`.
+    if (*t).feh != 0 {
+        // HOOK fehlerunionen: die Layoutphase melden — in ihr kann eine
+        // Union ueber einem Struct nicht ausgelegt werden
+        // (`hook_struct_phase` in errors.rs, gemeldet in collect_structs).
+        fehler.fehler_structphase((*t).feh, true)
+    }
     var zustand: Vec[u32] = vec_neu[u32]()
     i = 0
     while i < st_anzahl(t) {
@@ -437,6 +485,11 @@ fn typen_aufloesen(t: *mut Typen, b: *mut ast.Baum, it: *mut intern.Interner) {
         i = i + 1
     }
     vec_frei[u32](&zustand)
+    if (*t).feh != 0 {
+        // HOOK fehlerunionen: Layoutphase beendet — ab hier darf der
+        // Erfolgstyp einer Union ein Struct sein (Signaturen, Rumpf).
+        fehler.fehler_structphase((*t).feh, false)
+    }
     // 3. Funktionssignaturen.
     i = 0
     while i < ast.fn_anzahl(b) {
