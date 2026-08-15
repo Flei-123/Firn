@@ -9,9 +9,10 @@
 # Ausgabe.
 #
 # Ablauf je Datei:
-#   1. `.firnc1 datei.fi > datei.s`   (Firn: lexen, parsen, pruefen, lowern, codegen)
-#   2. `as` und `ld`                  (Punkt 11 der Liste fehlt noch: fork/execve)
-#   3. laufen lassen, Rueckgabewert und Standardausgabe vergleichen
+#   1. `.firnc1 datei.fi -o ziel`  — und zwar ALLES davon in Firn: lexen,
+#      parsen, pruefen, lowern, Code erzeugen, `as` und `ld` ueber
+#      `fork`/`execve` aufrufen. Das Skript ruft KEIN Werkzeug selbst auf.
+#   2. laufen lassen, Rueckgabewert und Standardausgabe vergleichen
 #
 # Rueckgabewerte von `.firnc1`: 3 = keine Kernsprache · 4 = comptime ·
 # 5 = `defer` · 6 = der Codegenerator kann diese FIR nicht (Gleitkomma,
@@ -51,7 +52,8 @@ while IFS= read -r f; do
         uebersprungen=$((uebersprungen+1))
         continue
     fi
-    "$FC1" "$f" > "$WORK/a.s" 2>/dev/null
+    rm -f "$WORK/a.bin" "$WORK/a.bin.s" "$WORK/a.bin.o"
+    "$FC1" "$f" -o "$WORK/a.bin" >/dev/null 2>&1
     rc=$?
     case "$rc" in
         3) nichtkern=$((nichtkern+1)); continue;;
@@ -64,14 +66,9 @@ while IFS= read -r f; do
         [ -z "$erste" ] && erste="$f (firnc1 rc=$rc)"
         continue
     fi
-    if ! as --64 -o "$WORK/a.o" "$WORK/a.s" 2>"$WORK/as.log"; then
+    if [ ! -x "$WORK/a.bin" ]; then
         fehlerhaft=$((fehlerhaft+1))
-        [ -z "$erste" ] && erste="$f (as: $(head -1 "$WORK/as.log"))"
-        continue
-    fi
-    if ! ld -o "$WORK/a.bin" "$WORK/a.o" 2>"$WORK/ld.log"; then
-        fehlerhaft=$((fehlerhaft+1))
-        [ -z "$erste" ] && erste="$f (ld)"
+        [ -z "$erste" ] && erste="$f (keine ausfuehrbare datei)"
         continue
     fi
     timeout 20 "$WORK/ref" > "$WORK/ref.out" 2>/dev/null
