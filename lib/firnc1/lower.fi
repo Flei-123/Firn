@@ -2,13 +2,20 @@
 //
 // Achter Teil von Stufe 1: die Portierung von `compiler/src/lower.rs`.
 //
-// UMFANG: der SKALARE Kern. Was ein Aggregat als Wert bewegt — Structs und
-// Arrays in Variablen, als Argument, als Rueckgabe, ihre Literale — ist NICHT
-// dabei; ebenso wenig `defer`. Solche Dateien werden gezaehlt, nicht
-// uebergangen. Der Grund fuer den Schnitt: Aggregate haengen an der
-// Aufrufkonvention (`abi.fi`) und an `write_into`, und beides ist ein eigener
-// Schritt. Skalare decken den Rumpf des Compilers ab — Zaehler, Zeiger,
-// Vergleiche, Schleifen, Aufrufe.
+// UMFANG: der skalare Kern UND die Aggregate — Structs und Arrays in
+// Variablen, als Argument, als Rueckgabe, ihre Literale. Nicht dabei ist
+// `defer`/`errdefer`; solche Dateien werden gezaehlt, nicht uebergangen.
+//
+// AGGREGATE BEWEGEN SICH NIE ALS WERT, sondern immer ueber ADRESSEN. Es gibt
+// genau zwei Wege: `schreib_nach(adr, e)` legt einen Ausdruck an einer Adresse
+// ab, `adresse(e)` besorgt die Adresse eines vorhandenen Aggregats. Ein
+// Struct-Literal wird feldweise geschrieben, ein fremdes Aggregat mit
+// `copymem` kopiert.
+//
+// AN DER FUNKTIONSGRENZE entscheidet `abi` (SPEC §13, §14.1):
+//   bis 16 Byte   -> ein oder zwei GANZZAHLWOERTER
+//   darueber      -> ein versteckter Zeiger auf eine Kopie des Aufrufers
+//   Rueckgabe > 8 -> versteckter Zeiger in `rdi` (`sret`)
 //
 // ZWEI DINGE, DIE MAN NICHT RATEN KANN und die deshalb genau nachgebaut sind:
 //
@@ -200,37 +207,204 @@ fn adresse(l: *mut Lower, e: u32) -> u32 {
         return wert(l, ast.e_b(b, e))
     }
     if a == ast.E_FELD {
-        let basis: u32 = adresse(l, ast.e_a(b, e))
         let bt: u32 = sema.sema_typ(sm(l), ast.e_a(b, e))
-        if typen.ty_art(tf(l), bt) != typen.K_STRUCT {
+        var si: usize = 0
+        var basis: u32 = 0
+        if typen.ty_art(tf(l), bt) == typen.K_STRUCT {
+            si = typen.ty_a(tf(l), bt) as usize
+            basis = adresse(l, ast.e_a(b, e))
+        } else if typen.ty_art(tf(l), bt) == typen.K_PTR {
+            // `p.f` auf einem Zeiger auf Struct: automatisch dereferenzieren.
+            let inner: u32 = typen.ty_a(tf(l), bt)
+            if typen.ty_art(tf(l), inner) != typen.K_STRUCT {
+                aufgeben(l)
+                return 0
+            }
+            si = typen.ty_a(tf(l), inner) as usize
+            basis = wert(l, ast.e_a(b, e))
+        } else {
             aufgeben(l)
             return 0
         }
-        let si: usize = typen.ty_a(tf(l), bt) as usize
-        var k: u32 = 0
-        var versatz: u64 = 0
-        while k < typen.st_flen(tf(l), si) {
-            let fnr: u32 = typen.st_foff(tf(l), si) + k
-            if typen.sf_name(tf(l), fnr) == ast.e_b(b, e) {
-                versatz = typen.sf_versatz(tf(l), fnr)
-            }
-            k = k + 1
-        }
-        return ptradd_konst(l, basis, versatz)
+        return ptradd_konst(l, basis, feld_versatz(l, si, ast.e_b(b, e)))
     }
     if a == ast.E_IDX {
-        let basis: u32 = adresse(l, ast.e_a(b, e))
         let bt: u32 = sema.sema_typ(sm(l), ast.e_a(b, e))
-        if typen.ty_art(tf(l), bt) != typen.K_ARR {
+        var elem: u32 = 0
+        var basis: u32 = 0
+        if typen.ty_art(tf(l), bt) == typen.K_ARR {
+            elem = typen.ty_a(tf(l), bt)
+            basis = adresse(l, ast.e_a(b, e))
+        } else if typen.ty_art(tf(l), bt) == typen.K_PTR {
+            elem = typen.ty_a(tf(l), bt)
+            basis = wert(l, ast.e_a(b, e))
+        } else {
             aufgeben(l)
             return 0
         }
-        let gr: u64 = typen.groesse_von(tf(l), typen.ty_a(tf(l), bt))
+        let gr: u64 = q_groesse(l, elem)
+        let ift: u32 = e_fty(l, ast.e_b(b, e))
         let iv: u32 = wert(l, ast.e_b(b, e))
-        return elem_adresse(l, basis, iv, gr)
+        return elem_adresse(l, basis, iv, ift, gr)
+    }
+    if a == ast.E_SLIT || a == ast.E_ALIT || a == ast.E_AWDH {
+        let t: u32 = sema.sema_typ(sm(l), e)
+        let slot: u32 = alloca(l, q_groesse(l, t), q_ausricht(l, t))
+        schreib_nach(l, slot, e)
+        return slot
+    }
+    if a == ast.E_RUF {
+        // Ein Aufruf, der ein Aggregat liefert, schreibt in einen
+        // Zwischenspeicher; dessen Adresse ist das Ergebnis (SPEC §14.1).
+        let t: u32 = sema.sema_typ(sm(l), e)
+        if !ist_aggregat(l, t) {
+            aufgeben(l)
+            return 0
+        }
+        let slot: u32 = alloca(l, q_groesse(l, t), q_ausricht(l, t))
+        ruf_mit_ziel(l, e, slot)
+        return slot
     }
     aufgeben(l)
     return 0
+}
+
+// -------------------------------------------------- Ablegen an eine Adresse
+
+fn schreib_nach(l: *mut Lower, adr: u32, e: u32) {
+    if (*l).ungeeignet {
+        return
+    }
+    let b: *mut ast.Baum = baum(l)
+    let a: u32 = ast.e_art(b, e)
+    let t: u32 = sema.sema_typ(sm(l), e)
+
+    if a == ast.E_SLIT {
+        let si: usize = typen.ty_a(tf(l), t) as usize
+        var k: u32 = 0
+        while k < ast.e_c(b, e) {
+            let fname: u32 = ast.kind_at(b, ast.e_b(b, e) + k * 2)
+            let fexpr: u32 = ast.kind_at(b, ast.e_b(b, e) + k * 2 + 1)
+            let fa: u32 = ptradd_konst(l, adr, feld_versatz(l, si, fname))
+            schreib_nach(l, fa, fexpr)
+            k = k + 1
+        }
+        return
+    }
+    if a == ast.E_ALIT {
+        let esz: u64 = q_groesse(l, typen.ty_a(tf(l), t))
+        var k: u32 = 0
+        while k < ast.e_c(b, e) {
+            let ea: u32 = elem_adresse_konst(l, adr, esz, k as u64)
+            schreib_nach(l, ea, ast.kind_at(b, ast.e_b(b, e) + k))
+            k = k + 1
+        }
+        return
+    }
+    if a == ast.E_AWDH {
+        wiederhole(l, adr, ast.e_a(b, e), typen.ty_a(tf(l), t), typen.ty_n(tf(l), t))
+        return
+    }
+    if a == ast.E_RUF && ist_aggregat(l, t) {
+        ruf_mit_ziel(l, e, adr)
+        return
+    }
+    if ist_aggregat(l, t) {
+        let src: u32 = adresse(l, e)
+        copymem(l, adr, src, typen.groesse_von(tf(l), t))
+        return
+    }
+    let ft: u32 = fty(l, t)
+    let v: u32 = wert(l, e)
+    speichere(l, ft, adr, v)
+}
+
+// `[wert; N]` an `adr` schreiben. Der Wert wird GENAU EINMAL ausgewertet und
+// dann vervielfaeltigt — bis acht Elemente ausgerollt, darueber als Schleife.
+fn wiederhole(l: *mut Lower, adr: u32, val: u32, et: u32, n: u64) {
+    let esz: u64 = q_groesse(l, et)
+    let skalar: bool = !ist_aggregat(l, et)
+    var sv: u32 = 0
+    var sft: u32 = 0
+    var saddr: u32 = 0
+    if skalar {
+        sft = fty(l, et)
+        sv = wert(l, val)
+    } else {
+        saddr = adresse(l, val)
+    }
+    if n <= 8 {
+        var i: u64 = 0
+        while i < n {
+            let ea: u32 = elem_adresse_konst(l, adr, esz, i)
+            if skalar {
+                speichere(l, sft, ea, sv)
+            } else {
+                copymem(l, ea, saddr, esz)
+            }
+            i = i + 1
+        }
+        return
+    }
+    let islot: u32 = alloca(l, 8, 8)
+    let null: u32 = konst(l, fir.T_U64, 0)
+    speichere(l, fir.T_U64, islot, null)
+    let kopf: u32 = neuer_block(l)
+    let rumpf: u32 = neuer_block(l)
+    let ende: u32 = neuer_block(l)
+    term(l, fir.TERM_BR, kopf, 0, 0)
+
+    (*l).cur = kopf
+    let iv: u32 = lade(l, fir.T_U64, islot)
+    let nv: u32 = konst(l, fir.T_U64, n)
+    let c: u32 = push(l, fir.O_CMP, fir.T_BOOL, iv, nv, 2, fir.T_U64 as u64, 0, 0)
+    term(l, fir.TERM_BRCOND, c, rumpf, ende)
+
+    (*l).cur = rumpf
+    let iv2: u32 = lade(l, fir.T_U64, islot)
+    let ea: u32 = elem_adresse(l, adr, iv2, fir.T_U64, esz)
+    if skalar {
+        speichere(l, sft, ea, sv)
+    } else {
+        copymem(l, ea, saddr, esz)
+    }
+    // Der schon geladene Index wird WIEDERVERWENDET — ein zweiter `load`
+    // waere eine Instruktion zu viel und verschoebe alle Wertnummern.
+    let eins: u32 = konst(l, fir.T_U64, 1)
+    let inc: u32 = push(l, fir.O_BIN, fir.T_U64, iv2, eins, 0, 0, 0, 0)
+    speichere(l, fir.T_U64, islot, inc)
+    term(l, fir.TERM_BR, kopf, 0, 0)
+
+    (*l).cur = ende
+}
+
+fn q_groesse(l: *mut Lower, t: u32) -> u64 {
+    var g: u64 = typen.groesse_von(tf(l), t)
+    if g < 1 { g = 1 }
+    return g
+}
+
+fn q_ausricht(l: *mut Lower, t: u32) -> u64 {
+    var a: u64 = typen.ausrichtung_von(tf(l), t)
+    if a < 1 { a = 1 }
+    return a
+}
+
+// Versatz eines Feldes im Struct `si`.
+fn feld_versatz(l: *mut Lower, si: usize, fname: u32) -> u64 {
+    var k: u32 = 0
+    while k < typen.st_flen(tf(l), si) {
+        let fnr: u32 = typen.st_foff(tf(l), si) + k
+        if typen.sf_name(tf(l), fnr) == fname {
+            return typen.sf_versatz(tf(l), fnr)
+        }
+        k = k + 1
+    }
+    return 0
+}
+
+fn feld_typ_von(l: *mut Lower, si: usize, fname: u32) -> u32 {
+    return typen.st_feld_typ(tf(l), si, fname)
 }
 
 fn ptradd_konst(l: *mut Lower, basis: u32, off: u64) -> u32 {
@@ -241,10 +415,25 @@ fn ptradd_konst(l: *mut Lower, basis: u32, off: u64) -> u32 {
     return push(l, fir.O_PTRADD, fir.T_PTR, basis, o, 0, 0, 0, 0)
 }
 
-fn elem_adresse(l: *mut Lower, basis: u32, idx: u32, gr: u64) -> u32 {
+// Adresse eines Elements mit BERECHNETEM Index. Der Index wird zuerst auf
+// `u64` gebracht — genau in dieser Reihenfolge, sonst stimmen die Wertnummern
+// nicht (layout.rs::elem_addr).
+fn elem_adresse(l: *mut Lower, basis: u32, idx: u32, ift: u32, gr: u64) -> u32 {
+    var idx64: u32 = idx
+    if ift != fir.T_U64 {
+        idx64 = push(l, fir.O_CAST, fir.T_U64, idx, 0, ift, 0, 0, 0)
+    }
     let g: u32 = konst(l, fir.T_U64, gr)
-    let off: u32 = push(l, fir.O_BIN, fir.T_U64, idx, g, 2, 0, 0, 0)
+    let off: u32 = push(l, fir.O_BIN, fir.T_U64, idx64, g, 2, 0, 0, 0)
     return push(l, fir.O_PTRADD, fir.T_PTR, basis, off, 0, 0, 0, 0)
+}
+
+fn elem_adresse_konst(l: *mut Lower, basis: u32, gr: u64, i: u64) -> u32 {
+    return ptradd_konst(l, basis, gr * i)
+}
+
+fn copymem(l: *mut Lower, ziel: u32, quelle: u32, groesse: u64) {
+    push_void(l, fir.O_COPYMEM, fir.T_VOID, ziel, quelle, 0, groesse, 0, 0)
 }
 
 // ------------------------------------------------------------- Ausdruecke
@@ -303,10 +492,19 @@ fn wert(l: *mut Lower, e: u32) -> u32 {
         return ruf(l, e, ft)
     }
     if a == ast.E_SYSCALL {
+        // JEDES Argument geht als `i64` in den Syscall — was nicht schon i64
+        // ist, wird umgewandelt. Auch Zeiger; sonst fehlt genau ein `cast`.
         var tmp: Vec[u32] = vec_neu[u32]()
         var k: u32 = 0
         while k < ast.e_c(b, e) {
-            vec_push[u32](&tmp, wert(l, ast.kind_at(b, ast.e_b(b, e) + k)))
+            let arg: u32 = ast.kind_at(b, ast.e_b(b, e) + k)
+            let aft: u32 = e_fty(l, arg)
+            let v: u32 = wert(l, arg)
+            if aft == fir.T_I64 {
+                vec_push[u32](&tmp, v)
+            } else {
+                vec_push[u32](&tmp, push(l, fir.O_CAST, fir.T_I64, v, 0, aft, 0, 0, 0))
+            }
             k = k + 1
         }
         let off: u32 = args_ablegen(l, &tmp)
@@ -388,6 +586,48 @@ fn kurzschluss(l: *mut Lower, op: u32, li: u32, re: u32) -> u32 {
     return lade(l, fir.T_BOOL, slot)
 }
 
+// Klasse eines Typs an der Funktionsgrenze: Anzahl der Ganzzahlwoerter,
+// oder `fir.KEIN` fuer die Speicherklasse.
+fn abi_klasse(l: *mut Lower, t: u32) -> u32 {
+    let k: u32 = typen.klasse_von(tf(l), t)
+    if k == typen.KLASSE_MEM {
+        return fir.KEIN
+    }
+    return k
+}
+
+fn abi_sret(l: *mut Lower, t: u32) -> bool {
+    return typen.braucht_sret(tf(l), t)
+}
+
+// Laedt ein Aggregat als `n` Ganzzahlwoerter. Ist die Groesse kein Vielfaches
+// von acht, laeuft es ueber einen aufgefuellten Zwischenpuffer — sonst laege
+// der letzte `load` teilweise HINTER dem Objekt.
+fn woerter_laden(l: *mut Lower, adr: u32, groesse: u64, n: u32, aus: *mut Vec[u32]) {
+    var quelle: u32 = adr
+    if groesse % 8 != 0 {
+        let t: u32 = alloca(l, n as u64 * 8, 8)
+        copymem(l, t, adr, groesse)
+        quelle = t
+    }
+    var i: u32 = 0
+    while i < n {
+        let a: u32 = ptradd_konst(l, quelle, i as u64 * 8)
+        vec_push[u32](aus, lade(l, fir.T_I64, a))
+        i = i + 1
+    }
+}
+
+fn woerter_speichern(l: *mut Lower, ziel: u32, groesse: u64, w: u32) {
+    if groesse % 8 != 0 {
+        let t: u32 = alloca(l, 8, 8)
+        speichere(l, fir.T_I64, t, w)
+        copymem(l, ziel, t, groesse)
+        return
+    }
+    speichere(l, fir.T_I64, ziel, w)
+}
+
 // Die Argumente muessen ZUSAMMENHAENGEND liegen. Ein Argument, das selbst
 // einen Aufruf enthaelt, legt sonst seine eigenen Argumente MITTEN in die
 // aeussere Liste — derselbe Fehler wie beim Parser (Runde 22). Also erst
@@ -402,30 +642,95 @@ fn args_ablegen(l: *mut Lower, tmp: *mut Vec[u32]) -> u32 {
     return off
 }
 
-fn ruf(l: *mut Lower, e: u32, ft: u32) -> u32 {
+// Ein Aufruf nach der Aufrufkonvention. `ziel` ist die Zieladresse, wenn die
+// Funktion ein Aggregat liefert (sonst `fir.KEIN`). Rueckgabe: der skalare
+// Wert, oder 0.
+fn ruf_voll(l: *mut Lower, e: u32, ziel: u32) -> u32 {
     let b: *mut ast.Baum = baum(l)
     let name: u32 = ast.e_a(b, e)
+    let fnr: u32 = fn_nummer(l, name)
+    if fnr == KEIN {
+        aufgeben(l)
+        return 0
+    }
+    let rt2: u32 = typen.ret_typ_der_funktion(tf(l), fnr as usize)
+    let ret_agg: bool = ist_aggregat(l, rt2)
+    let sret: bool = abi_sret(l, rt2)
+
     var tmp: Vec[u32] = vec_neu[u32]()
+    var target: u32 = fir.KEIN
+    if ret_agg {
+        if ziel != fir.KEIN {
+            target = ziel
+        } else {
+            target = alloca(l, q_groesse(l, rt2), q_ausricht(l, rt2))
+        }
+    }
+    if sret {
+        vec_push[u32](&tmp, target)
+    }
     var k: u32 = 0
     while k < ast.e_c(b, e) {
         let arg: u32 = ast.kind_at(b, ast.e_b(b, e) + k)
-        if ist_aggregat(l, sema.sema_typ(sm(l), arg)) {
-            aufgeben(l)
-            vec_frei[u32](&tmp)
-            return 0
+        let at: u32 = sema.sema_typ(sm(l), arg)
+        if !ist_aggregat(l, at) {
+            vec_push[u32](&tmp, wert(l, arg))
+            k = k + 1
+            continue
         }
-        vec_push[u32](&tmp, wert(l, arg))
+        let gr: u64 = q_groesse(l, at)
+        let kl: u32 = abi_klasse(l, at)
+        if kl != fir.KEIN {
+            let adr: u32 = adresse(l, arg)
+            woerter_laden(l, adr, gr, kl, &tmp)
+        } else {
+            // Speicherklasse: versteckter Zeiger auf eine Kopie des Aufrufers.
+            let t: u32 = alloca(l, gr, q_ausricht(l, at))
+            schreib_nach(l, t, arg)
+            vec_push[u32](&tmp, t)
+        }
         k = k + 1
     }
+    let anz: u32 = vec_len[u32](&tmp) as u32
     let off: u32 = args_ablegen(l, &tmp)
     vec_frei[u32](&tmp)
-    // Ein Aufruf OHNE Rueckgabewert definiert keinen Wert — sonst stimmt die
-    // Nummernfolge nicht mehr.
-    if ft == fir.T_VOID {
-        push_void(l, fir.O_CALL, ft, name, 0, 0, 0, off, ast.e_c(b, e))
+
+    if ret_agg {
+        let gr: u64 = typen.groesse_von(tf(l), rt2)
+        if sret {
+            push(l, fir.O_CALL, fir.T_PTR, name, 0, 0, 0, off, anz)
+        } else {
+            let w: u32 = push(l, fir.O_CALL, fir.T_I64, name, 0, 0, 0, off, anz)
+            woerter_speichern(l, target, gr, w)
+        }
         return 0
     }
-    return push(l, fir.O_CALL, ft, name, 0, 0, 0, off, ast.e_c(b, e))
+    let ft: u32 = fty(l, rt2)
+    if ft == fir.T_VOID {
+        push_void(l, fir.O_CALL, ft, name, 0, 0, 0, off, anz)
+        return 0
+    }
+    return push(l, fir.O_CALL, ft, name, 0, 0, 0, off, anz)
+}
+
+fn ruf_mit_ziel(l: *mut Lower, e: u32, ziel: u32) {
+    ruf_voll(l, e, ziel)
+}
+
+fn ruf(l: *mut Lower, e: u32, ft: u32) -> u32 {
+    return ruf_voll(l, e, fir.KEIN)
+}
+
+fn fn_nummer(l: *mut Lower, name: u32) -> u32 {
+    let b: *mut ast.Baum = baum(l)
+    var i: usize = 0
+    while i < ast.fn_anzahl(b) {
+        if ast.fn_name(b, i) == name {
+            return i as u32
+        }
+        i = i + 1
+    }
+    return KEIN
 }
 
 // ------------------------------------------------------------- Anweisungen
@@ -440,35 +745,21 @@ fn anweisung(l: *mut Lower, i: u32) {
     if a == ast.S_LET || a == ast.S_VAR {
         let init: u32 = ast.s_c(b, i)
         let t: u32 = sema.sema_typ(sm(l), init)
-        if ist_aggregat(l, t) {
-            aufgeben(l)
-            return
+        if !ist_aggregat(l, t) {
+            let ft: u32 = fty(l, t)
+            if ft == fir.KEIN || ft == fir.T_VOID {
+                aufgeben(l)
+                return
+            }
         }
-        let ft: u32 = fty(l, t)
-        if ft == fir.KEIN || ft == fir.T_VOID {
-            aufgeben(l)
-            return
-        }
-        var gr: u64 = typen.groesse_von(tf(l), t)
-        if gr < 1 { gr = 1 }
-        var au: u64 = typen.ausrichtung_von(tf(l), t)
-        if au < 1 { au = 1 }
-        let slot: u32 = alloca(l, gr, au)
-        let v: u32 = wert(l, init)
-        speichere(l, ft, slot, v)
+        let slot: u32 = alloca(l, q_groesse(l, t), q_ausricht(l, t))
+        schreib_nach(l, slot, init)
         anlegen(l, ast.s_a(b, i), slot)
         return
     }
     if a == ast.S_ZUW {
-        let ziel: u32 = ast.s_a(b, i)
-        let t: u32 = sema.sema_typ(sm(l), ziel)
-        if ist_aggregat(l, t) {
-            aufgeben(l)
-            return
-        }
-        let adr: u32 = adresse(l, ziel)
-        let v: u32 = wert(l, ast.s_b(b, i))
-        speichere(l, fty(l, t), adr, v)
+        let adr: u32 = adresse(l, ast.s_a(b, i))
+        schreib_nach(l, adr, ast.s_b(b, i))
         return
     }
     if a == ast.S_EXPR {
@@ -477,7 +768,9 @@ fn anweisung(l: *mut Lower, i: u32) {
         if ea == ast.E_RUF {
             let t: u32 = sema.sema_typ(sm(l), e)
             if ist_aggregat(l, t) {
-                aufgeben(l)
+                // Das Ergebnis wird verworfen, braucht aber einen Platz.
+                let slot: u32 = alloca(l, q_groesse(l, t), q_ausricht(l, t))
+                ruf_mit_ziel(l, e, slot)
                 return
             }
             ruf(l, e, fty(l, t))
@@ -501,11 +794,24 @@ fn anweisung(l: *mut Lower, i: u32) {
         } else {
             let t: u32 = sema.sema_typ(sm(l), wv)
             if ist_aggregat(l, t) {
-                aufgeben(l)
-                return
+                // Aggregatrueckgabe nach `abi`: ueber den versteckten Zeiger
+                // oder in EINEM Wort.
+                let gr: u64 = typen.groesse_von(tf(l), t)
+                if (*l).sret != KEIN {
+                    schreib_nach(l, (*l).sret, wv)
+                    term(l, fir.TERM_RET, (*l).sret, 0, 0)
+                } else {
+                    let adr: u32 = adresse(l, wv)
+                    var w: Vec[u32] = vec_neu[u32]()
+                    woerter_laden(l, adr, gr, 1, &w)
+                    let w0: u32 = vec_at[u32](&w, 0)
+                    vec_frei[u32](&w)
+                    term(l, fir.TERM_RET, w0, 0, 0)
+                }
+            } else {
+                let v: u32 = wert(l, wv)
+                term(l, fir.TERM_RET, v, 0, 0)
             }
-            let v: u32 = wert(l, wv)
-            term(l, fir.TERM_RET, v, 0, 0)
         }
         // Alles danach ist unerreichbar: neuen Block oeffnen, damit die
         // Zusicherung "ein Terminator je Block" gilt.
@@ -615,7 +921,9 @@ fn anweisung(l: *mut Lower, i: u32) {
         (*l).cur = neuer_block(l)
         return
     }
-    // `defer` und `errdefer` sind nicht portiert.
+    // `defer` und `errdefer` sind nicht portiert: sie brauchen einen Stapel je
+    // Blockebene und muessen bei `return`, `break` und `continue` in der
+    // richtigen Tiefe ablaufen (SPEC §5.1).
     aufgeben(l)
 }
 
@@ -636,47 +944,113 @@ fn low_lauf(l: *mut Lower) {
     let b: *mut ast.Baum = baum(l)
     var i: usize = 0
     while i < ast.fn_anzahl(b) {
-        // Signatur: nur skalare Parameter und Rueckgabe.
         let rt2: u32 = typen.ret_typ_der_funktion(tf(l), i)
-        if ist_aggregat(l, rt2) {
-            aufgeben(l)
-            return
+        let ret_agg: bool = ist_aggregat(l, rt2)
+        let sret: bool = abi_sret(l, rt2)
+        // FIR-Rueckgabetyp: Aggregat ueber den versteckten Zeiger, sonst ein
+        // Wort in `rax`.
+        var rf: u32 = 0
+        if ret_agg {
+            if sret {
+                rf = fir.T_PTR
+            } else {
+                rf = fir.T_I64
+            }
+        } else {
+            rf = fty(l, rt2)
+            if rf == fir.KEIN {
+                aufgeben(l)
+                return
+            }
         }
-        let rf: u32 = fty(l, rt2)
-        if rf == fir.KEIN {
-            aufgeben(l)
-            return
-        }
+        // FIR-Parameter aus der Aufrufkonvention.
         let poff: u32 = vec_len[u32](&(*l).f.p_typ) as u32
+        if sret {
+            vec_push[u32](&(*l).f.p_typ, fir.T_PTR)
+        }
+        // Art je Quellparameter: >=0 Anzahl Woerter · KEIN Zeiger · sonst skalar
+        var art: Vec[u32] = vec_neu[u32]()
         var k: u32 = 0
         while k < ast.fn_plen(b, i) {
             let pt: u32 = typen.param_typ_aufgeloest(tf(l), i, k)
             if ist_aggregat(l, pt) {
-                aufgeben(l)
-                return
+                let kl: u32 = abi_klasse(l, pt)
+                if kl != fir.KEIN {
+                    var w: u32 = 0
+                    while w < kl {
+                        vec_push[u32](&(*l).f.p_typ, fir.T_I64)
+                        w = w + 1
+                    }
+                    vec_push[u32](&art, kl)
+                } else {
+                    vec_push[u32](&(*l).f.p_typ, fir.T_PTR)
+                    vec_push[u32](&art, KEIN)
+                }
+            } else {
+                let pf: u32 = fty(l, pt)
+                if pf == fir.KEIN || pf == fir.T_VOID {
+                    aufgeben(l)
+                    vec_frei[u32](&art)
+                    return
+                }
+                vec_push[u32](&(*l).f.p_typ, pf)
+                vec_push[u32](&art, KEIN - 1)
             }
-            let pf: u32 = fty(l, pt)
-            if pf == fir.KEIN || pf == fir.T_VOID {
-                aufgeben(l)
-                return
-            }
-            vec_push[u32](&(*l).f.p_typ, pf)
             k = k + 1
         }
-        (*l).fi = fir.fn_neu(&(*l).f, ast.fn_name(b, i), rf, poff, ast.fn_plen(b, i))
+        let plen: u32 = vec_len[u32](&(*l).f.p_typ) as u32 - poff
+        (*l).fi = fir.fn_neu(&(*l).f, ast.fn_name(b, i), rf, poff, plen)
         (*l).cur = 0
+        (*l).sret = KEIN
+        var naechster: u32 = 0
+        if sret {
+            (*l).sret = fir.param_wert(&(*l).f, (*l).fi, 0)
+            naechster = 1
+        }
         bereich_auf(l)
         // Parameter bekommen einen Platz und werden im Eintrittsblock gesichert.
         k = 0
         while k < ast.fn_plen(b, i) {
-            let pf: u32 = vec_at[u32](&(*l).f.p_typ, (poff + k) as usize)
-            var by: u64 = fir.fty_bytes(pf)
-            if by < 1 { by = 1 }
-            let slot: u32 = alloca(l, by, by)
-            speichere(l, pf, slot, fir.param_wert(&(*l).f, (*l).fi, k))
-            anlegen(l, ast.param_name(b, ast.fn_poff(b, i) + k), slot)
+            let pt: u32 = typen.param_typ_aufgeloest(tf(l), i, k)
+            let ak: u32 = vec_at[u32](&art, k as usize)
+            let pname: u32 = ast.param_name(b, ast.fn_poff(b, i) + k)
+            if ak == KEIN - 1 {
+                let pf: u32 = vec_at[u32](&(*l).f.p_typ, (poff + naechster) as usize)
+                var by: u64 = fir.fty_bytes(pf)
+                if by < 1 { by = 1 }
+                let slot: u32 = alloca(l, by, by)
+                speichere(l, pf, slot, fir.param_wert(&(*l).f, (*l).fi, naechster))
+                naechster = naechster + 1
+                anlegen(l, pname, slot)
+            } else if ak == KEIN {
+                // Der Aufrufer hat bereits eine Kopie angelegt; ihre Adresse
+                // IST der Platz des Parameters.
+                anlegen(l, pname, fir.param_wert(&(*l).f, (*l).fi, naechster))
+                naechster = naechster + 1
+            } else {
+                // Der Platz wird auf volle Woerter aufgefuellt, damit die
+                // Stores vollstaendig im Objekt liegen.
+                var gr: u64 = q_groesse(l, pt)
+                if gr < ak as u64 * 8 {
+                    gr = ak as u64 * 8
+                }
+                var au: u64 = q_ausricht(l, pt)
+                if au < 8 {
+                    au = 8
+                }
+                let slot: u32 = alloca(l, gr, au)
+                var w: u32 = 0
+                while w < ak {
+                    let a2: u32 = ptradd_konst(l, slot, w as u64 * 8)
+                    speichere(l, fir.T_I64, a2, fir.param_wert(&(*l).f, (*l).fi, naechster + w))
+                    w = w + 1
+                }
+                naechster = naechster + ak
+                anlegen(l, pname, slot)
+            }
             k = k + 1
         }
+        vec_frei[u32](&art)
         block(l, ast.fn_rumpf(b, i))
         bereich_zu(l)
         if (*l).ungeeignet {

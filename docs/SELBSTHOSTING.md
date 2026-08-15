@@ -959,3 +959,76 @@ größte `u64`-Wert und Zeiger auf Zeiger.
 **Nächster Schritt:** Aggregate im Lowering — das schließt die 48 Dateien auf
 und ist die Voraussetzung dafür, dass `firnc1` sich selbst übersetzen könnte.
 Danach bleibt der Codegenerator.
+
+
+---
+
+## 16. Runde 26: Aggregate im Lowering
+
+Der größte offene Posten aus Runde 25 ist zu. `lib/firnc1/lower.fi` übersetzt
+jetzt auch Structs und Arrays — als Variable, als Argument, als Rückgabe und
+als Literal.
+
+| | Runde 25 | Runde 26 |
+|---|---:|---:|
+| Dateien mit identischer FIR | 66 | **113** |
+| verglichene Instruktionen | 2.129 | **36.217** |
+| wegen Aggregaten ausgeschlossen | 48 | **0** |
+| wegen `defer` ausgeschlossen | — | 1 |
+
+Von 2.129 auf 36.217 verglichene Instruktionen: nicht weil mehr Dateien
+dazukamen, sondern weil die *großen* dazukamen — der HTML5-Tokenizer, der
+DOM-Dauerlauf, die Vergleichswerkzeuge selbst.
+
+### Aggregate bewegen sich nie als Wert
+
+Es gibt genau zwei Wege, und beide arbeiten mit **Adressen**:
+
+* `schreib_nach(adr, e)` legt einen Ausdruck an einer Adresse ab. Ein
+  Struct-Literal wird **feldweise** geschrieben, ein Array-Literal
+  **elementweise**, ein fremdes Aggregat mit `copymem` kopiert.
+* `adresse(e)` besorgt die Adresse eines vorhandenen Aggregats. Für ein
+  Literal oder einen Aufruf entsteht dabei ein Zwischenplatz.
+
+### An der Funktionsgrenze entscheidet `abi`
+
+| Größe | Weg |
+|---|---|
+| bis 16 Byte | ein oder zwei **Ganzzahlwörter** |
+| darüber | versteckter **Zeiger auf eine Kopie** des Aufrufers |
+| Rückgabe über 8 Byte | versteckter Zeiger in `rdi` (`sret`) |
+
+Beim Laden in Wörter steckt eine Falle, die `types.rs` schon benennt und die
+hier nachgebaut werden musste: **ist die Größe kein Vielfaches von acht, läuft
+es über einen aufgefüllten Zwischenpuffer** — sonst läge der letzte `load`
+teilweise *hinter* dem Objekt.
+
+### Drei Abweichungen, die der Vergleich gefunden hat
+
+* **Syscall-Argumente**: *jedes* geht als `i64` hinein, auch ein Zeiger. Mir
+  fehlte genau ein `cast.ptr.i64` — und damit verschoben sich alle folgenden
+  Wertnummern.
+* **Das Wiederholungsliteral als Schleife** lädt den Index **einmal** und
+  benutzt ihn für die Elementadresse *und* für das Hochzählen. Ein zweiter
+  `load` ist eine Instruktion zu viel.
+* Die Elementadresse bringt den Index **zuerst** auf `u64` und rechnet erst
+  danach — die Reihenfolge steht in `layout.rs` und ist Vertrag.
+
+### Was noch fehlt
+
+**`defer` und `errdefer`.** Sie brauchen einen Stapel je Blockebene und müssen
+bei `return`, `break` und `continue` in der richtigen Tiefe ablaufen (SPEC
+§5.1). Genau **eine** Datei im vergleichbaren Korpus fällt dadurch heraus.
+
+### Stand
+
+| Teil | Stand |
+|---|---|
+| `lexer` · `diag` · `ast` + `parser` · `types` + `abi` · `sema` · `fir` | ✅ |
+| `lower` | ✅ Skalare **und** Aggregate · `[ ]` `defer` |
+| `config` | `[ ]` (braucht `Str`) |
+| `codegen_x86` | `[ ]` ← der letzte große Schritt |
+
+**Nächster Schritt:** der Codegenerator. Von der FIR zu x86-64-Assembler — und
+damit zum ersten Mal ein Programm, das `firnc1` von vorne bis hinten selbst
+übersetzt hat.
