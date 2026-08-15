@@ -59,8 +59,8 @@ Sortiert nach „blockiert am meisten zuerst". `[ ]` = fehlt,
 | 3 | **Hash-Abbildung `Map[K,V]`** | **`[x]`** `lib/rt/map.fi` + `lib/rt/intern.fi` (Runde 19) | Namenstabellen (`fns`, `consts`, Bereiche) |
 | 4 | **Zeichenketten** `Str`/`Bytes` mit Verkettung | `[~]` `rt.Buf` + `intern.Interner` (Runde 19); es fehlt ein `Str`-Typ mit Verkettungsoperator | Bezeichner, Fehlermeldungen, Assemblertext |
 | 5 | **Textformatierung** (`format`-Ersatz) | **`[~]`** `buf_push_dez_u64/i64`, `buf_push_hex_u64` in `lib/rt/` | Jede Diagnose und der gesamte Assembler-Ausdruck |
-| 6 | **Summentypen + `match`** | `[~]` Modul `types` dieser Runde | `TokKind`, `ExprKind`, `Op`, `Term` sind alle Summentypen |
-| 7 | **Rekursive Datentypen** (`Box`-Ersatz) | `[ ]` | `Expr` enthält `Expr`; heute nur über Zeiger + Allokator |
+| 6 | **Summentypen + `match`** | **`[x]`** ohne Typparameter (`tests/201_enum_payload.fi`); `enum Name[T]` fehlt (Runde 20 geprueft) | `TokKind`, `ExprKind`, `Op`, `Term` sind alle Summentypen |
+| 7 | **Rekursive Datentypen** (`Box`-Ersatz) | **`[x]`** über `*mut` auf den eigenen Typ, in Runde 20 nachgeprüft | `Expr` enthält `Expr`; heute nur über Zeiger + Allokator |
 | 8 | **Methoden / `impl`** | `[ ]` | Kosmetik, ersetzbar durch freie Funktionen mit erstem Parameter |
 | 9 | **Schnittstellen / dynamischer Versand** | `[ ]` | Für Stufe 1 **nicht** nötig |
 | 10 | **Fehlerbehandlung** (`Result`, `?`) | `[ ]` | Ersetzbar durch Summentyp + `match`, sobald 6 steht |
@@ -334,3 +334,123 @@ Nummer als `Map`-Schlüssel) — beide in allen drei Baustufen.
 
 **Nächste Blocker:** Summentypen mit Nutzlast + `match` (Punkt 6) und
 rekursive Datentypen (Punkt 7) — zusammen sind sie der AST.
+
+
+---
+
+## 10. Runde 20: der Lexer von Firn, geschrieben in Firn
+
+**Stufe 1 hat angefangen.** `lib/firnc1/lexer.fi` ist der erste Compilerteil in
+Firn — 1.009 Zeilen auf `rt`, `Vec[T]` und `Interner`. §2 nennt den Lexer als
+richtigen Anfang, weil er die kleinste Schnittstelle hat: Text hinein,
+Tokenfeld hinaus.
+
+### Der Maßstab kommt von außen
+
+Ein Lexer lässt sich nicht gegen sich selbst prüfen. `bin/lexdump.fi` schreibt
+den Tokenstrom in **genau** dem Format von `firnc0 --emit=tokens`;
+`tools/lex_vergleich.sh` lässt beide über `tests/`, `lib/`, `bin/` und
+`bench/` laufen und vergleicht Oktett für Oktett.
+
+| | |
+|---|---:|
+| Dateien Oktett-gleich | **294** |
+| Dateien abweichend | 1 (benannt, siehe unten) |
+| übersprungen (`firnc0` meldet dort selbst einen Fehler) | 2 |
+| verglichene Token | **211.405** |
+
+Das läuft als Abschnitt 11 in `test.sh` bei jeder Änderung mit.
+
+### Was das gefunden hat: ein echter Fehler in Stufe 0
+
+Der in Firn geschriebene Lexer las `10.0` und bekam ein anderes Bitmuster als
+`firnc0` — aber **nur mit Optimierer**. Ursache: `f64` ist 64 Bit breit und
+gilt im FIR als vorzeichenlos. Zwei Stellen haben daraus geschlossen,
+`u64 -> f64` sei eine reine Umdeutung desselben Bitmusters:
+
+* `mem2reg.rs` strich die Umwandlung **ersatzlos**,
+* `opt.rs::fold_cast` faltete sie zu einer reinen Bitoperation.
+
+Aus `100 as f64` wurde damit das Bitmuster 100 — also `5e-322` statt `100.0`.
+Es ist genau umgekehrt: von allen Umwandlungen ist die zwischen Ganzzahl und
+Gleitkomma die **einzige**, die die Bits wirklich ändert (`cvtsi2sd`). Der Weg
+ohne Optimierer war die ganze Zeit richtig.
+
+Beide Stellen sind behoben; `fold_cast` rechnet die Umwandlung jetzt **echt**
+(und faltet auch `f64 -> Ganzzahl`, außer bei NaN, Unendlich und außerhalb des
+Zielbereichs). Rückfalltest: `tests/591_f64_umwandlung.fi`, der wie jeder
+Positivtest mit **und** ohne Optimierer läuft.
+
+Das ist der eigentliche Ertrag dieser Runde. Ein Bootstrap ist keine
+Fleißaufgabe — er ist ein **Prüfstand**, weil zwei unabhängige Umsetzungen
+gegeneinander stehen. Der Fehler lag seit Runde 14 im Baum und ist durch 590
+Tests gerutscht.
+
+### Wie der Lexer gebaut ist
+
+* **Struktur der Felder statt Feld der Strukturen.** `Vec[T]` verlangt
+  `T: Scalar`, ein Token ist ein Verbund — also liegen Art, Zeile, Spalte,
+  Länge, Zahlwert und Nummer in sechs gleich langen `Vec`. Der Parser liest
+  fast immer nur die Art, und die liegt so dicht beieinander.
+* **Zeichen gegen Oktette.** `firnc0` arbeitet auf `Vec<char>`, Spalten zählen
+  Zeichen. Der Firn-Lexer arbeitet auf Oktetten und zählt eine Spalte nur beim
+  **führenden** Oktett eines UTF-8-Zeichens. Ohne das verschieben sich alle
+  Spalten hinter einem Umlaut in derselben Zeile — und genau das prüft der
+  Vergleich mit, weil `tests/570_zeichenkettenliterale.fi` Umlaute enthält.
+* **Worttafeln statt globaler Zustand.** Firn hat keine veränderlichen
+  globalen Zustände (Punkt 13). Die Schlüsselwort- und Namenstabellen entstehen
+  deshalb aus **einem** Literal, das an `|` zerlegt wird.
+* Bezeichner gehen durch den `Interner` aus Runde 19; Zeichenkettenliterale
+  werden vollständig entschlüsselt, samt `\x`, `\u{...}`, Surrogatpaaren in
+  `Str` und ungepaarten Surrogaten in `Str16`.
+
+### Die eine Abweichung — benannt, nicht weggeräumt
+
+`tests/590_f64.fi`, das Literal **`1e308`**. Der Firn-Lexer nutzt den schnellen
+Pfad von Clinger: passt die Mantisse in 2^53 und liegt der Zehnerexponent
+zwischen -22 und 22, dann ist eine einzige Multiplikation in binary64 korrekt
+gerundet. Die Erweiterung nach oben (Überschuss in die Mantisse ziehen) deckt
+Exponenten bis 37 ab. Darüber wird schrittweise multipliziert, und das liegt um
+**ein ULP** daneben.
+
+Gemessen: von 211.405 Token im Korpus braucht **genau eines** den langsamen
+Pfad. Korrekt wäre Eisel-Lemire mit 128-Bit-Arithmetik — die fehlt noch, und
+die Zeile bleibt in `tools/lex_vergleich.sh` stehen, bis sie da ist.
+
+### Weitere ehrliche Grenzen
+
+* **Diagnosen sind nicht portiert.** Der Firn-Lexer zählt Fehler, er meldet
+  sie nicht mit Zeile und Text. Das ist das Modul `diag` und ein eigener
+  Schritt. Deshalb überspringt der Vergleich die zwei Dateien, bei denen
+  `firnc0` selbst einen Fehler meldet.
+* **Unicode-Leerraum** (U+00A0, U+2028 …) gilt in `firnc0` als Leerraum, im
+  Firn-Lexer nicht. Im ganzen Korpus kommt keiner vor; der Unterschied ist
+  benannt, nicht behoben.
+* Der Lexer erzeugt noch **keinen** AST — der Parser ist der nächste Schritt.
+
+### Nebenbefunde zur Liste in §4
+
+* Punkt 6 (**Summentypen**) ist ohne Typparameter **vollständig da** —
+  `enum Wert { Nichts, Zahl(i32), Paar(i32, i32) }` mit Bindung im Muster
+  läuft seit Runde 2. Was fehlt, ist `enum Name[T]`: der Parser kennt keine
+  Typparameterliste hinter einem Aufzählungsnamen (`Option[T]`, `Result[T,E]`).
+* Punkt 7 (**rekursive Datentypen**) läuft über `*mut` auf den eigenen Typ:
+  `enum Ausdruck { Zahl(i64), Plus(*mut Ausdruck, *mut Ausdruck) }` übersetzt
+  und rechnet. Ein `Box`-Typ mit eigener Freigabe fehlt — die Bäume des
+  Compilers werden ohnehin über `Vec`-Indizes gebaut (§2.4).
+
+### Stand der Liste
+
+| Punkt | Stand |
+|---|---|
+| 1 Heap-Allokator · 2 `Vec[T]` · 3 `Map[K,V]` | ✅ |
+| 6 Summentypen + `match` | ✅ (ohne Typparameter) |
+| 7 rekursive Datentypen | ✅ (über Zeiger) |
+| 12 Dateizugriff | ✅ |
+| 4 `Str`/`Bytes` · 5 Textformatierung | `[~]` |
+| 8 Methoden · 9 Schnittstellen · 10 `Result`/`?` · 11 `fork`/`execve` · 13 globale Zustände | `[ ]` |
+
+**Nächster Schritt:** `config` und `diag` in Firn — und danach der Parser. Für
+`firnc1` als eigenständiges Programm fehlt Punkt 11 (`fork`/`execve`), weil
+`firnc` `as` und `ld` aufruft. Das ist der einzige Punkt der Liste, für den es
+keinen Umweg gibt.

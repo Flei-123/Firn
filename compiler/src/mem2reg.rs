@@ -400,11 +400,27 @@ pub(crate) fn copy_propagate(f: &mut Func) -> usize {
                 Op::Cast { src, from } => {
                     // Gleiche Breite UND gleiches Vorzeichen: reine Umdeutung
                     // desselben Bitmusters (z. B. `usize` <-> `*mut T`).
-                    if *from == i.ty
-                        || (from.bits() == i.ty.bits()
-                            && from.signed() == i.ty.signed()
-                            && *from != crate::fir::FTy::Bool
-                            && i.ty != crate::fir::FTy::Bool)
+                    //
+                    // `f64` DARF HIER NICHT MITSPIELEN. Es ist 64 Bit breit und
+                    // gilt als vorzeichenlos — nach der Regel oben sah
+                    // `u64 -> f64` also wie eine reine Umdeutung aus, und die
+                    // Umwandlung verschwand ersatzlos. Aus `100 as f64` wurde
+                    // damit das Bitmuster 100 statt des Wertes 100.0. Es ist
+                    // aber genau umgekehrt: von allen Umwandlungen ist die
+                    // zwischen Ganzzahl und Gleitkomma die einzige, die die
+                    // Bits WIRKLICH aendert (`cvtsi2sd`).
+                    //
+                    // Gefunden beim Vergleich des in Firn geschriebenen Lexers
+                    // gegen `firnc0` (Runde 20): `10.0` ergab zwei verschiedene
+                    // Tokenstroeme, je nachdem ob der Optimierer lief.
+                    let gleitwechsel = (*from == crate::fir::FTy::F64)
+                        != (i.ty == crate::fir::FTy::F64);
+                    if !gleitwechsel
+                        && (*from == i.ty
+                            || (from.bits() == i.ty.bits()
+                                && from.signed() == i.ty.signed()
+                                && *from != crate::fir::FTy::Bool
+                                && i.ty != crate::fir::FTy::Bool))
                     {
                         Some(*src)
                     } else {
