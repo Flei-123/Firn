@@ -2,9 +2,14 @@
 //
 // Achter Teil von Stufe 1: die Portierung von `compiler/src/lower.rs`.
 //
-// UMFANG: der skalare Kern UND die Aggregate — Structs und Arrays in
-// Variablen, als Argument, als Rueckgabe, ihre Literale. Nicht dabei ist
-// `defer`/`errdefer`; solche Dateien werden gezaehlt, nicht uebergangen.
+// UMFANG: der skalare Kern, die Aggregate UND `defer`/`errdefer`.
+//
+// AUFGESCHOBENE ANWEISUNGEN (SPEC §5.1) sind ein Stapel je BLOCKEBENE. Beim
+// Verlassen eines Blocks laufen seine eigenen rueckwaerts; bei `return`
+// laufen ALLE Ebenen der Funktion, bei `break`/`continue` nur die, die
+// INNERHALB der Schleife vereinbart wurden. `errdefer` laeuft ausschliesslich
+// auf dem Fehlerpfad — den kennt die Kernsprache nicht, also laeuft es hier
+// nie. Es wird trotzdem vermerkt, damit die Reihenfolge stimmt.
 //
 // AGGREGATE BEWEGEN SICH NIE ALS WERT, sondern immer ueber ADRESSEN. Es gibt
 // genau zwei Wege: `schreib_nach(adr, e)` legt einen Ausdruck an einer Adresse
@@ -52,6 +57,10 @@ struct Lower {
     b_grenze: Vec[u32]
     l_break: Vec[u32]   // Schleifenziele
     l_cont: Vec[u32]
+    l_tiefe: Vec[u32]   // Stapeltiefe der aufgeschobenen Anweisungen je Schleife
+    d_stmt: Vec[u32]    // aufgeschobene Anweisungen, in Reihenfolge der Vereinbarung
+    d_err: Vec[u32]     // 1 = `errdefer`
+    d_grenze: Vec[u32]  // Grenzen je Blockebene
     sret: u32
     fehler: usize
     ungeeignet: bool    // Aggregat oder `defer` gefunden
@@ -63,7 +72,8 @@ fn low_neu(b: u64, it: u64, sm: u64) -> Lower {
         f: fir.fir_neu(),
         fi: 0, cur: 0,
         v_name: vec_neu[u32](), v_slot: vec_neu[u32](), b_grenze: vec_neu[u32](),
-        l_break: vec_neu[u32](), l_cont: vec_neu[u32](),
+        l_break: vec_neu[u32](), l_cont: vec_neu[u32](), l_tiefe: vec_neu[u32](),
+        d_stmt: vec_neu[u32](), d_err: vec_neu[u32](), d_grenze: vec_neu[u32](),
         sret: KEIN, fehler: 0, ungeeignet: false,
     }
 }
@@ -75,6 +85,10 @@ fn low_frei(l: *mut Lower) {
     vec_frei[u32](&(*l).b_grenze)
     vec_frei[u32](&(*l).l_break)
     vec_frei[u32](&(*l).l_cont)
+    vec_frei[u32](&(*l).l_tiefe)
+    vec_frei[u32](&(*l).d_stmt)
+    vec_frei[u32](&(*l).d_err)
+    vec_frei[u32](&(*l).d_grenze)
 }
 
 fn low_fehler(l: *mut Lower) -> usize { return (*l).fehler }
@@ -176,6 +190,52 @@ fn bereich_zu(l: *mut Lower) {
 fn anlegen(l: *mut Lower, name: u32, slot: u32) {
     vec_push[u32](&(*l).v_name, name)
     vec_push[u32](&(*l).v_slot, slot)
+}
+
+// ------------------------------------------- Aufgeschobene Anweisungen
+
+fn defer_ebene_auf(l: *mut Lower) {
+    vec_push[u32](&(*l).d_grenze, vec_len[u32](&(*l).d_stmt) as u32)
+}
+
+// Fuehrt die eigenen aufgeschobenen Anweisungen dieser Ebene aus (rueckwaerts)
+// und raeumt die Ebene ab.
+fn defer_ebene_zu(l: *mut Lower) {
+    let g: u32 = vec_letztes[u32](&(*l).d_grenze)
+    vec_pop[u32](&(*l).d_grenze)
+    var i: usize = vec_len[u32](&(*l).d_stmt)
+    while i > g as usize {
+        i = i - 1
+        // `errdefer` laeuft NICHT beim gewoehnlichen Verlassen.
+        if vec_at[u32](&(*l).d_err, i) == 0 {
+            anweisung(l, vec_at[u32](&(*l).d_stmt, i))
+        }
+    }
+    while vec_len[u32](&(*l).d_stmt) > g as usize {
+        vec_pop[u32](&(*l).d_stmt)
+        vec_pop[u32](&(*l).d_err)
+    }
+}
+
+// Fuehrt alle aufgeschobenen Anweisungen OBERHALB von `tiefe` aus — innerste
+// Ebene zuerst, innerhalb einer Ebene rueckwaerts. Der Stapel bleibt dabei
+// UNVERAENDERT: `defer_ebene_zu` raeumt seine eigene Ebene ab. Was danach
+// noch erzeugt wird, landet im unerreichbaren Block hinter dem Sprung.
+fn defer_bis(l: *mut Lower, tiefe: u32) {
+    var e: usize = vec_len[u32](&(*l).d_grenze)
+    var ende: usize = vec_len[u32](&(*l).d_stmt)
+    while e > tiefe as usize {
+        e = e - 1
+        let g: u32 = vec_at[u32](&(*l).d_grenze, e)
+        var i: usize = ende
+        while i > g as usize {
+            i = i - 1
+            if vec_at[u32](&(*l).d_err, i) == 0 {
+                anweisung(l, vec_at[u32](&(*l).d_stmt, i))
+            }
+        }
+        ende = g as usize
+    }
 }
 
 fn suchen(l: *mut Lower, name: u32) -> u32 {
@@ -790,6 +850,7 @@ fn anweisung(l: *mut Lower, i: u32) {
     if a == ast.S_RET {
         let wv: u32 = ast.s_a(b, i)
         if wv == ast.NICHTS {
+            defer_bis(l, 0)
             term(l, fir.TERM_RET, KEIN, 0, 0)
         } else {
             let t: u32 = sema.sema_typ(sm(l), wv)
@@ -799,6 +860,7 @@ fn anweisung(l: *mut Lower, i: u32) {
                 let gr: u64 = typen.groesse_von(tf(l), t)
                 if (*l).sret != KEIN {
                     schreib_nach(l, (*l).sret, wv)
+                    defer_bis(l, 0)
                     term(l, fir.TERM_RET, (*l).sret, 0, 0)
                 } else {
                     let adr: u32 = adresse(l, wv)
@@ -806,10 +868,12 @@ fn anweisung(l: *mut Lower, i: u32) {
                     woerter_laden(l, adr, gr, 1, &w)
                     let w0: u32 = vec_at[u32](&w, 0)
                     vec_frei[u32](&w)
+                    defer_bis(l, 0)
                     term(l, fir.TERM_RET, w0, 0, 0)
                 }
             } else {
                 let v: u32 = wert(l, wv)
+                defer_bis(l, 0)
                 term(l, fir.TERM_RET, v, 0, 0)
             }
         }
@@ -850,9 +914,11 @@ fn anweisung(l: *mut Lower, i: u32) {
         (*l).cur = rumpf
         vec_push[u32](&(*l).l_break, ende)
         vec_push[u32](&(*l).l_cont, kopf)
+        vec_push[u32](&(*l).l_tiefe, vec_len[u32](&(*l).d_grenze) as u32)
         block(l, ast.s_b(b, i))
         vec_pop[u32](&(*l).l_break)
         vec_pop[u32](&(*l).l_cont)
+        vec_pop[u32](&(*l).l_tiefe)
         if !terminiert(l) {
             term(l, fir.TERM_BR, kopf, 0, 0)
         }
@@ -893,9 +959,11 @@ fn anweisung(l: *mut Lower, i: u32) {
         anlegen(l, ast.s_a(b, i), islot)
         vec_push[u32](&(*l).l_break, ende)
         vec_push[u32](&(*l).l_cont, schritt)
+        vec_push[u32](&(*l).l_tiefe, vec_len[u32](&(*l).d_grenze) as u32)
         block(l, ast.s_d(b, i))
         vec_pop[u32](&(*l).l_break)
         vec_pop[u32](&(*l).l_cont)
+        vec_pop[u32](&(*l).l_tiefe)
         bereich_zu(l)
         if !terminiert(l) {
             term(l, fir.TERM_BR, schritt, 0, 0)
@@ -912,29 +980,41 @@ fn anweisung(l: *mut Lower, i: u32) {
         return
     }
     if a == ast.S_BREAK {
+        defer_bis(l, vec_letztes[u32](&(*l).l_tiefe))
         term(l, fir.TERM_BR, vec_letztes[u32](&(*l).l_break), 0, 0)
         (*l).cur = neuer_block(l)
         return
     }
     if a == ast.S_CONT {
+        defer_bis(l, vec_letztes[u32](&(*l).l_tiefe))
         term(l, fir.TERM_BR, vec_letztes[u32](&(*l).l_cont), 0, 0)
         (*l).cur = neuer_block(l)
         return
     }
-    // `defer` und `errdefer` sind nicht portiert: sie brauchen einen Stapel je
-    // Blockebene und muessen bei `return`, `break` und `continue` in der
-    // richtigen Tiefe ablaufen (SPEC §5.1).
-    aufgeben(l)
+    if a == ast.S_DEFER || a == ast.S_ERRDEFER {
+        // Nur VORMERKEN — ausgefuehrt wird beim Verlassen des Blocks.
+        vec_push[u32](&(*l).d_stmt, ast.s_a(b, i))
+        if a == ast.S_ERRDEFER {
+            vec_push[u32](&(*l).d_err, 1)
+        } else {
+            vec_push[u32](&(*l).d_err, 0)
+        }
+        return
+    }
 }
 
 fn block(l: *mut Lower, bi: u32) {
     let b: *mut ast.Baum = baum(l)
     bereich_auf(l)
+    defer_ebene_auf(l)
     var k: u32 = 0
     while k < ast.b_len(b, bi) {
         anweisung(l, ast.sliste_at(b, ast.b_off(b, bi) + k))
         k = k + 1
     }
+    // Die aufgeschobenen Anweisungen laufen VOR dem Schliessen des Bereichs,
+    // damit die Namen des Blocks noch sichtbar sind.
+    defer_ebene_zu(l)
     bereich_zu(l)
 }
 
