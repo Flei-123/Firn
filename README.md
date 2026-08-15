@@ -675,14 +675,43 @@ einmal** gelesen wird, überhaupt keinen Ort braucht: er bleibt im
 Arbeitsregister und wird direkt weiterverwendet. Die Zählung dafür gibt es seit
 der `cmp`/`jcc`-Verschmelzung bereits (`zaehle_lesezugriffe`).
 
-Die Falle dabei ist real und der Grund, warum hier Schluss ist statt eines
-schnellen Einbaus: die nächste Instruktion darf `rax` nicht überschreiben,
-**bevor** sie den durchgereichten Wert liest. Bei `d = x + durchgereicht` mit
-`x` im Rahmen lädt der Codegenerator zuerst `x` nach `rax` — und der
-durchgereichte Wert wäre weg. Ein Durchreichen ohne diesen Nachweis erzeugt
-stillen Falschcode; genau so ist in dieser Sitzung schon einmal
-`mov r9, [rbp-8]` + `add r9, r9` entstanden. Das wird sauber gebaut oder gar
-nicht.
+Die Falle dabei ist real: die nächste Instruktion darf `rax` nicht
+überschreiben, **bevor** sie den durchgereichten Wert liest. Bei
+`d = x + durchgereicht` mit `x` im Rahmen lädt der Codegenerator zuerst `x`
+nach `rax` — und der durchgereichte Wert wäre weg.
+
+### Der Versuch — gebaut, gemessen, verworfen
+
+Statt über `rax` habe ich es über ein **eigenes Register** gebaut: `r11` als
+`DURCHREICH_REG`, das niemand sonst anfassen darf. Damit ist die Falle
+umgangen, und im Assembler war der Effekt sichtbar — die Stackzugriffe in
+`dekodiere` gingen von **170 auf 158** zurück:
+
+```asm
+mov rax, qword ptr [rbp-1672]
+add rax, qword ptr [rbp-216]
+mov r11, rax                    ; statt: mov [rbp-1304], rax
+mov rcx, r11                    ; statt: mov rcx, [rbp-1304]
+movzx eax, byte ptr [rcx]
+```
+
+**Und es war trotzdem langsamer.** Gemessen:
+
+| | Instruktionen | Zeit (bester von 4) |
+|---|---:|---:|
+| ohne Durchreichen | 2.630.820.292 | 0,491 s |
+| mit `r11` reserviert | 2.631.818.983 | 0,520 s |
+
+Die Instruktionszahl ist praktisch identisch (+0,04 %), die Zeit **rund 6 %
+schlechter**. Der Grund liegt auf der Hand, sobald man ihn sieht: `r11` für das
+Durchreichen zu reservieren nimmt dem Linear Scan **eines von elf Registern**.
+Was an kurzlebigen Werten gespart wird, geben die langlebigen an anderer Stelle
+wieder aus — und deren Zugriffe liegen in der Schleife.
+
+Die Änderung ist deshalb **zurückgenommen**. Sie steht hier, weil ein
+negatives Ergebnis genauso zum Fortschritt gehört: der nächste Versuch muss
+ohne Registerreservierung auskommen, also die Zuteilung selbst verbessern
+(kurzlebige Intervalle bevorzugt bedienen), statt ihr ein Register wegzunehmen.
 
 ## Speichermodell: Opt-in-Tracing-GC und der DOM-Dauerlauf (Runde 4)
 
