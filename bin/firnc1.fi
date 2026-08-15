@@ -28,6 +28,47 @@ import fir
 import lower
 import codegen
 
+// ------------------------------------------------------------ Modulsystem
+//
+// `import a.b` sucht `a/b.fi` ZUERST neben der importierenden Datei, dann
+// neben der Wurzeldatei — dieselbe Regel wie in `firnc0` (Blocker B3,
+// Runde 17). Alle Dateien landen in EINEM Baum und teilen sich EINE
+// Namenstafel; die Umbenennung mit `alias__` macht der Parser.
+
+// Verzeichnisteil eines Pfades, einschliesslich des Schraegstrichs.
+fn verzeichnis(b: *mut rt.Buf, pfad: u64, n: usize) {
+    var letzter: i64 = -1
+    var i: usize = 0
+    while i < n {
+        if rt.ld8(pfad, i) == 47 as u8 {
+            letzter = i as i64
+        }
+        i = i + 1
+    }
+    if letzter >= 0 {
+        rt.buf_push_bytes(b, pfad, letzter as usize + 1)
+    }
+}
+
+// Baut `<verz><teil1>/<teil2>....fi\0` in `aus`.
+fn modulpfad(aus: *mut rt.Buf, verz: *mut rt.Buf, l: *mut lexer.Lexer,
+             von: usize, bis: usize) {
+    rt.buf_leeren(aus)
+    rt.buf_push_bytes(aus, rt.buf_ptr(verz), rt.buf_len(verz))
+    var i: usize = von
+    while i < bis {
+        if lexer.lex_art(l, i) == 1 {
+            let nr: u32 = lexer.lex_nr(l, i)
+            rt.buf_push_bytes(aus, lexer.lex_name_zeiger(l, nr), lexer.lex_name_laenge(l, nr))
+        } else {
+            rt.buf_push(aus, 47 as u8)
+        }
+        i = i + 1
+    }
+    var e: [u8; 4] = ".fi\0"
+    rt.buf_push_bytes(aus, (&e[0]) as u64, 4)
+}
+
 fn main(start: u64) -> i32 {
     var quelle: rt.Buf = rt.buf_neu()
     defer rt.buf_frei(&quelle)
@@ -55,7 +96,77 @@ fn main(start: u64) -> i32 {
     if lexer.lex_fehler(&l) > 0 {
         return 1
     }
-    var p: parser.Parser = parser.par_neu((&l) as u64)
+    let it: *mut intern.Interner = lexer.lex_namen(&l)
+    var baum_s: ast.Baum = ast.baum_neu()
+    defer ast.baum_frei(&baum_s)
+    let baum: *mut ast.Baum = &baum_s
+
+    // --- eingebundene Module suchen und ZUERST uebersetzen: eine Konstante
+    // darf eine aus einem anderen Modul benutzen, also muessen die
+    // Abhaengigkeiten vorher im Baum stehen.
+    var verz: rt.Buf = rt.buf_neu()
+    defer rt.buf_frei(&verz)
+    verzeichnis(&verz, name, name_n)
+
+    var mquelle: rt.Buf = rt.buf_neu()
+    defer rt.buf_frei(&mquelle)
+    var mpfad: rt.Buf = rt.buf_neu()
+    defer rt.buf_frei(&mpfad)
+
+    var i: usize = 0
+    while i + 1 < lexer.lex_anzahl(&l) {
+        if lexer.lex_art(&l, i) != 27 {
+            i = i + 1
+            continue
+        }
+        // Pfadteile einsammeln: IDENT (DOT IDENT)*
+        var j: usize = i + 1
+        var alias: u32 = 0
+        while j < lexer.lex_anzahl(&l) {
+            if lexer.lex_art(&l, j) != 1 {
+                break
+            }
+            alias = lexer.lex_nr(&l, j)
+            j = j + 1
+            if j >= lexer.lex_anzahl(&l) {
+                break
+            }
+            if lexer.lex_art(&l, j) != 43 {
+                break
+            }
+            j = j + 1
+        }
+        modulpfad(&mpfad, &verz, &l, i + 1, j)
+        rt.buf_leeren(&mquelle)
+        if !rt.lies_datei(rt.buf_ptr(&mpfad), &mquelle) {
+            return 2
+        }
+        var ml: lexer.Lexer = lexer.lex_neu(rt.buf_ptr(&mquelle), rt.buf_len(&mquelle),
+                                            (&kwtxt[0]) as u64, 172,
+                                            rt.buf_ptr(&mpfad), rt.buf_len(&mpfad) - 1)
+        lexer.lex_namen_setzen(&ml, it as u64)
+        lexer.lex_lauf(&ml)
+        if lexer.lex_fehler(&ml) > 0 {
+            lexer.lex_frei(&ml)
+            return 1
+        }
+        var mp: parser.Parser = parser.par_neu_modul((&ml) as u64, baum as u64, alias)
+        parser.par_lauf(&mp)
+        let schlecht: bool = parser.par_nicht_kern(&mp)
+        let fehl: usize = parser.par_fehler(&mp)
+        parser.par_frei(&mp)
+        lexer.lex_frei(&ml)
+        if schlecht {
+            return 3
+        }
+        if fehl > 0 {
+            return 1
+        }
+        i = j
+    }
+
+    // --- die Wurzeldatei zuletzt: ihre Namen bleiben unveraendert.
+    var p: parser.Parser = parser.par_neu_modul((&l) as u64, baum as u64, 4294967295)
     defer parser.par_frei(&p)
     parser.par_lauf(&p)
     if parser.par_nicht_kern(&p) {
@@ -64,8 +175,6 @@ fn main(start: u64) -> i32 {
     if parser.par_fehler(&p) > 0 {
         return 1
     }
-    let baum: *mut ast.Baum = parser.par_baum(&p)
-    let it: *mut intern.Interner = lexer.lex_namen(&l)
 
     var sm: sema.Sema = sema.sema_neu(baum as u64, it as u64)
     defer sema.sema_frei(&sm)

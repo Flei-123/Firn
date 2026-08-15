@@ -1168,3 +1168,68 @@ Bequemlichkeit oder gehören zu Erweiterungen, die `firnc1` nicht liest.
 **Was dem Fixpunkt im Weg steht, ist etwas anderes:** `firnc1` liest genau
 **eine** Datei. Der Compiler selbst besteht aus vierzehn. Das Modulsystem ist
 der nächste und vorletzte Schritt.
+
+
+---
+
+## 19. Runde 29: das Modulsystem — `firnc1` liest mehr als eine Datei
+
+`firnc1` löst `import` jetzt selbst auf. Damit übersetzt der in Firn
+geschriebene Compiler auch Programme aus mehreren Dateien — einschließlich
+`tests/610_rt.fi`, das den **Laufzeitkern `lib/rt/rt.fi` selbst einbindet**.
+
+| | Runde 28 | Runde 29 |
+|---|---:|---:|
+| gleiches Verhalten wie `firnc0` | 109 | **113** |
+| abweichend · fehlerhaft | 0 · 0 | **0** · **0** |
+
+### Ein Baum, eine Namenstafel, Umbenennung beim Parsen
+
+`firnc0` führt die Dateien nach dem Parsen zusammen und schreibt die Namen mit
+einem `Renamer` um (`modules.rs`). `firnc1` macht dasselbe **während** des
+Parsens, und das passt besser zu seinem Aufbau:
+
+* **Eine** Namenstafel für alle Dateien. Der Lexer bekommt dafür einen
+  Zeiger auf eine gemeinsame `Interner` — ohne das meinte dieselbe Nummer in
+  zwei Dateien zwei verschiedene Wörter.
+* **Ein** Baum. Der Parser schreibt in einen fremden `ast.Baum`, statt einen
+  eigenen anzulegen; damit entfällt jedes Zusammenführen von Indizes.
+* **Umbenennung mit Alias.** Eine Vorabsuche sammelt die Namen, die eine Datei
+  auf oberster Ebene deklariert; genau die bekommen `alias__` davor. Ein
+  qualifizierter Zugriff `modul.name` wird zu demselben `modul__name`.
+
+Die Wurzeldatei wird **zuletzt** geparst und **nicht** umbenannt. Die Module
+davor: eine Konstante darf eine aus einem anderen Modul benutzen, also müssen
+die Abhängigkeiten vorher im Baum stehen.
+
+### `tests/710_modul_kern.fi`
+
+Drei Ebenen, und der Name `wert` steht in **allen dreien** — in der
+Wurzeldatei, in `kern/mittel.fi` und in `kern/tief.fi`. Ohne Umbenennung würde
+eine Fassung die andere verdecken. Dazu eine Konstante und ein `struct` aus
+einem fremden Modul (als Wert übergeben) und eine Kette über zwei Ebenen
+(`mittel` bindet `tief` ein).
+
+### Ehrliche Grenzen
+
+* **Kein Zyklenschutz und keine Wiederverwendung.** Bindet dieselbe Datei
+  zweimal ein, wird sie zweimal geparst; ein Zyklus läuft ins Endlose.
+  `firnc0` hat dafür eine `seen`-Menge — hier fehlt sie noch.
+* **`export` wird gelesen, aber nicht durchgesetzt.** Ein Modul kann alles
+  sehen, was ein anderes deklariert.
+* Die Suche geht nur eine Ebene: **relativ zur Wurzeldatei**. `firnc0` sucht
+  zuerst neben der importierenden Datei (Blocker B3 aus Runde 17) — für die
+  Testprogramme ist beides dasselbe, für `lib/rt/vec.fi` nicht.
+
+### Was jetzt noch zwischen hier und dem Fixpunkt liegt
+
+`firnc1` kann mehrere Dateien lesen — aber **nicht seine eigenen**: `lexer.fi`,
+`parser.fi` und `sema.fi` benutzen generische Sammlungen (`Vec[T]`, `Map[K,V]`)
+und `defer`. Beides liest der Kernparser nicht. Der Weg dorthin ist damit klar
+benannt und nicht mehr vage:
+
+1. **Generics** im Parser und in der Monomorphisierung von `firnc1`
+2. **`defer`** im Lowering
+3. Gleitkomma im Codegenerator
+
+Erst danach kann `firnc1` sich selbst übersetzen.
