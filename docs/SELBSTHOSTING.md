@@ -671,3 +671,94 @@ Schreiben von `diag.fi` schon einmal erwischt (Runde 21, mehrzeilige
 **Nächster Schritt:** `types` und `abi` — §3 nennt sie als die Dateien, die
 schon heute vollständig in Firn schreibbar wären (reine Fallunterscheidung auf
 Typ und Größe). Danach wird es ernst: `sema`.
+
+
+---
+
+## 13. Runde 23: `types` und `abi` in Firn — Layout und Aufrufkonvention
+
+§3 nennt `types.rs` und `abi.rs` seit der ersten Fassung als die Dateien, die
+**heute schon vollständig in Firn schreibbar** wären: sie rechnen nur auf Typ
+und Größe, ohne Heap und ohne Text. `lib/firnc1/typen.fi` löst das ein.
+
+### Warum ausgerechnet die zwei als Nächstes
+
+Layout und Aufrufkonvention sind die Stellen, an denen ein Compiler **still
+falsch** wird. Ein Feldversatz daneben, ein Aggregat in Registern statt im
+Speicher — das Programm läuft, nur eben falsch, und der Fehler zeigt sich
+irgendwo ganz anders. Zwei unabhängige Umsetzungen gegeneinander zu stellen
+findet hier mehr als jeder ausgedachte Testfall.
+
+### Der Maßstab: `--emit=layout`
+
+`compiler/src/layout_kanon.rs` druckt je Struct Größe, Ausrichtung und **jeden
+Feldversatz**, je Funktion die System-V-Klasse jedes Arguments und des
+Rückgabewertes samt `sret`:
+
+```text
+(struct Loecher groesse 32 ausrichtung 8 (feld a versatz 0 …) (feld b versatz 8 …) …)
+(fn summe_gross (arg Gross groesse 24 klasse mem) (ret i64 groesse 8 klasse int1 sret 0))
+```
+
+Aufgelöst wird nur die Wurzeldatei. Ein Name, den es dort nicht gibt (etwa
+`rt.Buf` aus einem anderen Modul), wird auf **beiden** Seiten zu `?` mit Größe
+0 und Ausrichtung 1 — sonst würde der Vergleich an einer künstlichen
+Unsicherheit scheitern statt an einem echten Unterschied.
+
+### Ergebnis
+
+`tools/typen_vergleich.sh`, Abschnitt 13 in `test.sh`:
+
+| | |
+|---|---:|
+| Layouts gleich | **169** |
+| abweichend | **0** |
+| davon mit echten Structs | 35 |
+
+Null Abweichungen im ersten Lauf. Das ist ungewöhnlich und hat einen Grund:
+die Regeln sind kurz und stehen ausgeschrieben in SPEC §11 und §13 — anders
+als beim Parser, wo hundert kleine Verabredungen zusammenkommen.
+
+### `tests/670_layout_abi.fi` — die Formen, die das Korpus nicht hatte
+
+Das vorhandene Korpus prüft Layout nur nebenbei. Der neue Test prüft es
+**gegeneinander**:
+
+* **Feldversätze zur Laufzeit nachgerechnet**, über Adressdifferenzen statt
+  über eine Tabelle im Kopf. Damit hängt nicht nur die Rechnung, sondern der
+  *erzeugte Code* an denselben Zahlen.
+* **Alle drei ABI-Grenzen**: bis 8 Byte (ein Wort), 9..16 Byte (zwei Wörter —
+  Rückgabe aber schon über den versteckten Zeiger, SPEC §14.1), über 16 Byte
+  (Speicher).
+* Struct im Struct, Array im Struct, Löcher durch Ausrichtung, neun Wörter
+  Argumente (die letzten laufen über den Stapel), und Kopiersemantik bei
+  Wertübergabe.
+
+Läuft mit und ohne Optimierer, und beide Layoutausgaben stimmen überein.
+
+### Ehrliche Grenzen
+
+* `typen.fi` löst nur auf, was die **Kernsprache** kennt. `enum`-Layout
+  (Marke + überlagerte Varianten), Fehlerunionen und `gc class` fehlen — sie
+  gehören zu den 109 Dateien, die der Parser ohnehin nicht liest.
+* Es gibt **keine Typprüfung**. Was hier steht, ist Layout und ABI, nicht
+  `sema`: keine Zuweisbarkeit, keine Literalableitung, keine Fehlermeldungen
+  zu Typen. Das ist der nächste und mit Abstand größte Brocken.
+* Die Klasse `Sse` fehlt genau wie in `abi.rs` — Stufe 0 übergibt auch `f64`
+  in Ganzzahlregistern. Das ist eine bekannte Abweichung von System V und
+  steht so in SPEC §14.1.
+
+### Stand
+
+| Teil | Stand |
+|---|---|
+| `lexer` · `diag` · `ast` + `parser` | ✅ in Firn, gegen `firnc0` geprüft |
+| `types` + `abi` | ✅ in Firn, 169 Layouts gleich |
+| `config` | `[ ]` (braucht `Str`) |
+| `sema` | `[ ]` ← der nächste und größte Schritt |
+| `fir`, `lower`, `codegen_x86` | `[ ]` |
+
+**Nächster Schritt:** `sema` — Namensauflösung, Typprüfung, Literalableitung.
+Dafür stehen jetzt alle Bausteine bereit: `Map[K,V]` für die Bereichsketten,
+der `Interner` für die Namen, `diag` für die Meldungen und `typen` für die
+Typen selbst.

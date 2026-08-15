@@ -7,6 +7,7 @@
 mod abi;
 mod ast;
 mod ast_kanon;
+mod layout_kanon;
 mod attrs;
 mod codegen_switch;
 mod codegen_x86;
@@ -49,6 +50,7 @@ enum Emit {
     Asm,
     Tokens,
     AstKanon,
+    LayoutKanon,
     Ast,
     /// FIR nach dem Lowering (unoptimiert)
     FirRaw,
@@ -86,6 +88,7 @@ fn usage() -> String {
          --emit=comptime    nur den von comptime erzeugten Quelltext\n  \
          --emit=tokens      Tokenstrom (Fehlersuche)\n  \
          --emit=ast-kanon   AST in kanonischer, sprachneutraler Form\n  \
+         --emit=layout      Speicherlayout und Aufrufkonvention (kanonisch)\n  \
          --emit=ast         AST als Debug-Text (Fehlersuche)\n  \
          --no-opt           Optimierer abschalten (= --opt-level=dev)\n  \
          --opt-level=<stufe> dev | dev-fast | release-safe | release-fast\n  \
@@ -197,6 +200,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                         "comptime" => Emit::Comptime,
                         "tokens" => Emit::Tokens,
                         "ast-kanon" => Emit::AstKanon,
+                        "layout" => Emit::LayoutKanon,
                         "ast" => Emit::Ast,
                         other => return Err(format!("unbekanntes Ausgabeziel '{}'", other)),
                     };
@@ -267,6 +271,17 @@ fn run(opts: &Options) -> i32 {
         files.iter().map(|f| f.path.display().to_string()).collect(),
         !opts.optimize,
     );
+
+    if opts.emit == Emit::LayoutKanon {
+        let toks = lexer::lex(&root.src, &mut dg);
+        let prog = parser::parse(&toks, &mut dg);
+        if dg.has_errors() {
+            dg.print();
+            return 1;
+        }
+        print!("{}", layout_kanon::render(&prog));
+        return 0;
+    }
 
     if opts.emit == Emit::AstKanon {
         // NUR die Wurzeldatei, VOR dem Zusammenfuehren der Module und vor der
