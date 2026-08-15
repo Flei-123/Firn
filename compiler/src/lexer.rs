@@ -12,6 +12,11 @@ pub enum TokKind {
     // Literale und Namen
     Int(i128),
     Ident(String),
+    /// Gleitkommaliteral (`1.5`, `2e10`, `1_000.25`) als **Bitmuster** eines
+    /// IEEE-754 binary64. Kein `f64`, weil `TokKind` `Eq` ableitet und
+    /// Gleitkomma keine Aequivalenzrelation hat (NaN != NaN) — und weil FIR
+    /// ohnehin nur das Bitmuster kennt.
+    Float(u64),
     /// Zeichenkettenliteral: `"..."`, `b"..."` oder `u"..."`.
     /// Der Inhalt ist bereits entschluesselt (`compiler/src/strings.rs`).
     Str(crate::strings::LitKind, crate::strings::LitValue),
@@ -90,6 +95,7 @@ impl TokKind {
     pub fn text(&self) -> String {
         match self {
             TokKind::Int(v) => format!("{}", v),
+            TokKind::Float(bits) => format!("{}", f64::from_bits(*bits)),
             TokKind::Ident(s) => s.clone(),
             TokKind::Str(k, v) => format!("{}\"…\" ({} elemente)", k.prefix(), v.len()),
             TokKind::KwFn => "fn".into(),
@@ -299,6 +305,69 @@ impl<'a> Lexer<'a> {
     }
 
     /// Zahl ab der aktuellen Position (Dezimal, 0x, 0b, '_' als Trenner).
+    /// Rest eines Gleitkommaliterals ab dem Punkt bzw. dem Exponenten.
+    /// `vorne` sind die bereits gelesenen Vorkommaziffern (ohne `_`).
+    fn float_rest(&mut self, line: u32, col: u32, mut ncols: u32, vorne: String) {
+        let mut text = vorne;
+        if self.peek() == Some('.') {
+            text.push('.');
+            self.bump();
+            ncols += 1;
+            while let Some(c) = self.peek() {
+                if c == '_' {
+                    self.bump();
+                    ncols += 1;
+                    continue;
+                }
+                if !c.is_ascii_digit() {
+                    break;
+                }
+                text.push(c);
+                self.bump();
+                ncols += 1;
+            }
+        }
+        if matches!(self.peek(), Some('e') | Some('E')) {
+            text.push('e');
+            self.bump();
+            ncols += 1;
+            if matches!(self.peek(), Some('+') | Some('-')) {
+                if let Some(c) = self.peek() {
+                    text.push(c);
+                }
+                self.bump();
+                ncols += 1;
+            }
+            let mut ziffern = 0;
+            while let Some(c) = self.peek() {
+                if c == '_' {
+                    self.bump();
+                    ncols += 1;
+                    continue;
+                }
+                if !c.is_ascii_digit() {
+                    break;
+                }
+                text.push(c);
+                ziffern += 1;
+                self.bump();
+                ncols += 1;
+            }
+            if ziffern == 0 {
+                self.dg.error(
+                    self.sp(line, col, ncols.max(1)),
+                    "gleitkommaliteral: nach 'e' fehlen die ziffern des exponenten",
+                );
+                self.push(TokKind::Float(0), line, col, ncols.max(1));
+                return;
+            }
+        }
+        // `parse::<f64>` rundet korrekt (Rust nutzt dafuer denselben Algorithmus
+        // wie `strtod`); ein Ueberlauf liefert `inf`, das ist gewollt.
+        let v: f64 = text.parse().unwrap_or(0.0);
+        self.push(TokKind::Float(v.to_bits()), line, col, ncols.max(1));
+    }
+
     fn number(&mut self) {
         let (line, col) = (self.line, self.col);
         let mut ncols = 0u32;
@@ -325,6 +394,17 @@ impl<'a> Lexer<'a> {
                 continue;
             }
             if c.is_ascii_alphanumeric() {
+                // GLEITKOMMA-EXPONENT: bei Basis 10 beendet ein `e`/`E` mit
+                // folgender Ziffer oder Vorzeichen die Ganzzahl — sonst wuerde
+                // es hier als ungueltige Ziffer gemeldet, bevor die
+                // Gleitkommapruefung ueberhaupt drankommt (`1e3`).
+                if radix == 10
+                    && (c == 'e' || c == 'E')
+                    && (self.peek2().map(|n| n.is_ascii_digit()) == Some(true)
+                        || matches!(self.peek2(), Some('+') | Some('-')))
+                {
+                    break;
+                }
                 if c.is_digit(radix) {
                     digits.push(c);
                 } else if bad_digit.is_none() {
@@ -335,6 +415,18 @@ impl<'a> Lexer<'a> {
                 continue;
             }
             break;
+        }
+        // GLEITKOMMA (nur zur Basis 10): ein Punkt zaehlt nur dann dazu, wenn
+        // eine ZIFFER folgt — `0..10` bleibt der Bereich einer `for`-Schleife
+        // und wird nicht als `0.` gelesen.
+        if radix == 10 && bad_digit.is_none() && !digits.is_empty() {
+            let punkt = self.peek() == Some('.') && self.peek2().map(|c| c.is_ascii_digit()) == Some(true);
+            let expo = matches!(self.peek(), Some('e') | Some('E'))
+                && (self.peek2().map(|c| c.is_ascii_digit()) == Some(true)
+                    || matches!(self.peek2(), Some('+') | Some('-')));
+            if punkt || expo {
+                return self.float_rest(line, col, ncols, digits);
+            }
         }
         let len = ncols.max(1);
         if let Some((c, bl, bc)) = bad_digit {

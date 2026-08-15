@@ -652,6 +652,10 @@ impl<'a> Parser<'a> {
                 let sp = self.bump();
                 self.mk(sp, ExprKind::Int(v))
             }
+            TokKind::Float(bits) => {
+                let sp = self.bump();
+                self.mk(sp, ExprKind::Float(bits))
+            }
             // ZEICHENKETTENLITERAL -> Array-Literal.
             //
             // `"abc"` wird zu `[97, 98, 99]`, `u"abc"` zu den UTF-16-
@@ -1587,6 +1591,7 @@ mod tests {
     fn dump(e: &Expr) -> String {
         match &e.kind {
             ExprKind::Int(v) => format!("{}", v),
+            ExprKind::Float(bits) => format!("{}", f64::from_bits(*bits)),
             ExprKind::Bool(b) => format!("{}", b),
             ExprKind::Ident(n) => n.clone(),
             ExprKind::Unary(op, a) => format!(

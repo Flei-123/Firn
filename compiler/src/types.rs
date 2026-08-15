@@ -18,6 +18,8 @@ pub enum Type {
     Usize,
     Isize,
     Bool,
+    /// IEEE-754 binary64 (SPEC §8.6).
+    F64,
     /// Zeiger; `mutable` = `*mut T`.
     Ptr { mutable: bool, inner: Box<Type> },
     Array(Box<Type>, u64),
@@ -152,6 +154,7 @@ impl TypeCtx {
             Type::I16 | Type::U16 => 2,
             Type::I32 | Type::U32 => 4,
             Type::I64 | Type::U64 | Type::Usize | Type::Isize | Type::UntypedInt => 8,
+            Type::F64 => 8,
             Type::Ptr { .. } => 8,
             Type::Array(e, n) => self.size_of(e) * *n,
             Type::Struct(i) => self.structs.get(*i).map(|s| s.size).unwrap_or(0),
@@ -193,6 +196,7 @@ impl TypeCtx {
             Type::Usize => "usize".into(),
             Type::Isize => "isize".into(),
             Type::Bool => "bool".into(),
+            Type::F64 => "f64".into(),
             // Ein Zeiger auf eine gc-Klasse heisst im Quelltext `Gc[C]`
             // (der Struct traegt intern den Namen "gc C", siehe gc.rs).
             Type::Ptr { inner, .. } if self.gc_klassenname(inner).is_some() => {

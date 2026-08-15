@@ -97,6 +97,8 @@ pub struct Expr {
 
 #[derive(Clone, Debug)]
 pub enum ExprKind {
+    /// Gleitkommaliteral als Bitmuster eines IEEE-754 binary64.
+    Float(u64),
     Int(i128),
     Bool(bool),
     Ident(String),
