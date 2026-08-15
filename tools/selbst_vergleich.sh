@@ -40,14 +40,9 @@ fehlerhaft=0
 erste=""
 
 while IFS= read -r f; do
-    # Nur Dateien, die `firnc0` EINZELN uebersetzen kann — sonst waeren es
-    # zwei verschiedene Eingaben. `--emit=typen` ist die schaerfere Probe: es
-    # laeuft ohne das Modulsystem und scheitert genau dann, wenn die Datei
-    # Namen aus einem anderen Modul braucht.
-    if ! "$FIRNC" --emit=typen "$f" >/dev/null 2>&1; then
-        uebersprungen=$((uebersprungen+1))
-        continue
-    fi
+    # Nur Dateien, die `firnc0` uebersetzen kann — sonst waeren es zwei
+    # verschiedene Eingaben. Seit Runde 29 zaehlen auch Dateien mit `import`
+    # dazu: `firnc1` loest sie selbst auf.
     if ! "$FIRNC" "$f" -o "$WORK/ref" 2>/dev/null; then
         uebersprungen=$((uebersprungen+1))
         continue
