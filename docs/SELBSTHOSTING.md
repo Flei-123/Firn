@@ -55,7 +55,7 @@ Sortiert nach „blockiert am meisten zuerst". `[ ]` = fehlt,
 | # | Merkmal | Stand | Warum der Compiler es braucht |
 |---|---|---|---|
 | 1 | **Heap-Allokator** (`mmap`-basiert, `alloc`/`free`) | **`[x]`** `lib/rt/rt.fi` (Runde 15) | Ohne ihn gibt es kein `Vec`, keinen AST, keine Symboltabelle |
-| 2 | **`Vec[T]`** (wachsendes Feld) | **`[~]`** funktioniert (Runde 16, `tests/620_vec_heap.fi`), aber **nicht über Modulgrenzen** — siehe §7 | Tokenstrom, Anweisungslisten, Blocklisten — überall |
+| 2 | **`Vec[T]`** (wachsendes Feld) | **`[x]`** als Bibliothek `lib/rt/vec.fi` (Runde 18, `tests/640_vec_modul.fi`) | Tokenstrom, Anweisungslisten, Blocklisten — überall |
 | 3 | **Hash-Abbildung `Map[K,V]`** | `[~]` | Namenstabellen (`fns`, `consts`, Bereiche) |
 | 4 | **Zeichenketten** `Str`/`Bytes` mit Verkettung | `[~]` Modul `str` dieser Runde | Bezeichner, Fehlermeldungen, Assemblertext |
 | 5 | **Textformatierung** (`format`-Ersatz) | **`[~]`** `buf_push_dez_u64/i64`, `buf_push_hex_u64` in `lib/rt/` | Jede Diagnose und der gesamte Assembler-Ausdruck |
@@ -184,48 +184,47 @@ anderem:
 | # | Blocker | Stand |
 |---|---|---|
 | B1 | Generische Vorlage aus einem Modul nicht benutzbar | **behoben (Runde 17)** |
-| B2 | Generische Vorlage sieht die Funktionen ihrer eigenen Datei nicht | **offen — und größer als gedacht** |
+| B2 | Generische Vorlage sieht die Namen ihrer eigenen Moduldatei nicht | **behoben (Runde 18)** |
 | B3 | Importe werden relativ zur Wurzeldatei aufgelöst | **behoben (Runde 17)** |
 
 ### B3 — behoben
 
 `modules::resolve` sucht einen Importpfad jetzt **zuerst relativ zur Datei, die
 den Import schreibt**, und erst danach relativ zur Wurzel. Der Rückfall bleibt,
-damit bestehende Programme unverändert laufen. Nachweis:
-`tests/630_modulkette.fi` → `tests/kette/mittel.fi` → `tests/kette/tief.fi`.
+damit bestehende Programme unverändert laufen.
 
 ### B1 — behoben
 
 Die Vorabsuche nach generischen Vorlagen (`sema_generic::hook_prescan`) lief je
 Datei **unmittelbar vor deren Parsen**. Die Wurzeldatei wird zuerst geparst —
-sie kannte die Vorlagen der Module also noch nicht, und `var v: GenPaar[i32]`
-scheiterte am Parser. `modules::build_program` lext jetzt **erst alle Dateien
-und scannt sie vorab**, dann wird geparst. Nachweis: dieselbe Testdatei.
+sie kannte die Vorlagen der Module also noch nicht.
+`modules::build_program` lext jetzt **erst alle Dateien und scannt sie vorab**,
+dann wird geparst.
 
-### B2 — offen, und der Befund ist schärfer als gedacht
+### B2 — behoben
 
-Ursprünglich sah es aus wie „eine Vorlage sieht keine Modulaufrufe". Der
-Versuch, in `lib/rt/vec.fi` eine Hilfsfunktion **derselben Datei** zu rufen,
-zeigt mehr:
+Die Ursache war handfester als vermutet: **generische Vorlagen liegen nicht in
+`Program::funcs`**, sondern in `sema_generic::REG`. Das Modul-Umschreiben in
+`modules::build_program` läuft über `Program::funcs` — es erreichte die
+Vorlagen also nie. Eine Vorlage sah dadurch nur die Namen der Wurzeldatei;
+selbst eine Hilfsfunktion in derselben Moduldatei meldete *unbekannte
+funktion*.
 
-```
-error: unbekannte funktion 'v_free'
-   --> lib/rt/vec.fi:72:5
-```
+`build_program` schickt jetzt **auch die Vorlagen der jeweiligen Datei** durch
+denselben `Renamer`. Der **Name** der Vorlage bleibt dabei unangetastet: die
+Ausprägung sucht ihn später unter dem ursprünglichen Namen
+(`mono::expand_fn` über `Instantiation::base`), und generische Namen gelten
+programmweit.
 
-`v_free` steht zwölf Zeilen darüber, in derselben Datei. **Eine generische
-Vorlage sieht offenbar nur die Namen der WURZELDATEI, nicht die ihrer eigenen
-Moduldatei.** In `tests/620_vec_heap.fi` funktioniert derselbe Aufbau, weil
-dort alles in der Wurzel steht.
+### Was damit möglich wurde
 
-Vermutete Ursache: die Ausprägung wird aus einer Kopie erzeugt, die vor dem
-Modul-Umschreiben in `modules::build_program` entstanden ist — die Namen
-tragen dann noch nicht das `_F0.<modul>__`-Präfix.
+`lib/rt/vec.fi` ist die erste echte **generische Sammlung als Bibliothek**:
+sie bindet `rt` aus ihrem eigenen Verzeichnis ein (B3), ruft
+`rt.heap_alloc`/`rt.mem_copy` aus dem Rumpf einer Vorlage (B2), und die
+Wurzeldatei schreibt `var v: Vec[i32] = vec_neu[i32]()` (B1). Die Doppelung der
+Speicherfunktionen ist wieder verschwunden.
 
-**Folge:** `lib/rt/vec.fi` ist im Baum, aber **nicht benutzbar**. Es enthält
-seine drei Speicherfunktionen deshalb doppelt (aus `lib/rt/rt.fi` kopiert) —
-und selbst das reicht nicht, solange B2 steht. Der laufende Nachweis für
-`Vec[T]` bleibt `tests/620_vec_heap.fi` in der Wurzeldatei.
+Nachweis: `tests/640_vec_modul.fi` (1.000 `i32`, 300 `u8`, 100 `u64`, `pop`,
+`setzen`, Zugriff jenseits des Endes) in allen drei Baustufen.
 
-**Nächster Schritt:** B2 beheben, dann `lib/rt/vec.fi` auf `import rt`
-umstellen und die Doppelung entfernen. Erst danach ist `lib/std/` schreibbar.
+**Damit ist `lib/std/` schreibbar** — der nächste Schritt auf der Liste in §2.
