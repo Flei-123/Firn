@@ -51,6 +51,7 @@ enum Emit {
     Tokens,
     AstKanon,
     LayoutKanon,
+    TypenKanon,
     Ast,
     /// FIR nach dem Lowering (unoptimiert)
     FirRaw,
@@ -89,6 +90,7 @@ fn usage() -> String {
          --emit=tokens      Tokenstrom (Fehlersuche)\n  \
          --emit=ast-kanon   AST in kanonischer, sprachneutraler Form\n  \
          --emit=layout      Speicherlayout und Aufrufkonvention (kanonisch)\n  \
+         --emit=typen       AST mit dem Typ an jedem Ausdruck (kanonisch)\n  \
          --emit=ast         AST als Debug-Text (Fehlersuche)\n  \
          --no-opt           Optimierer abschalten (= --opt-level=dev)\n  \
          --opt-level=<stufe> dev | dev-fast | release-safe | release-fast\n  \
@@ -201,6 +203,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                         "tokens" => Emit::Tokens,
                         "ast-kanon" => Emit::AstKanon,
                         "layout" => Emit::LayoutKanon,
+                        "typen" => Emit::TypenKanon,
                         "ast" => Emit::Ast,
                         other => return Err(format!("unbekanntes Ausgabeziel '{}'", other)),
                     };
@@ -271,6 +274,26 @@ fn run(opts: &Options) -> i32 {
         files.iter().map(|f| f.path.display().to_string()).collect(),
         !opts.optimize,
     );
+
+    if opts.emit == Emit::TypenKanon {
+        let toks = lexer::lex(&root.src, &mut dg);
+        let prog = parser::parse(&toks, &mut dg);
+        if dg.has_errors() {
+            dg.print();
+            return 1;
+        }
+        match sema::check(&prog, &mut dg) {
+            Some(info) => {
+                print!("{}", ast_kanon::render_typed(&prog, &info));
+                0
+            }
+            None => {
+                dg.print();
+                1
+            }
+        };
+        return if dg.has_errors() { 1 } else { 0 };
+    }
 
     if opts.emit == Emit::LayoutKanon {
         let toks = lexer::lex(&root.src, &mut dg);
