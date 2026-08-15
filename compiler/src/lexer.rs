@@ -12,6 +12,9 @@ pub enum TokKind {
     // Literale und Namen
     Int(i128),
     Ident(String),
+    /// Zeichenkettenliteral: `"..."`, `b"..."` oder `u"..."`.
+    /// Der Inhalt ist bereits entschluesselt (`compiler/src/strings.rs`).
+    Str(crate::strings::LitKind, crate::strings::LitValue),
     // Schluesselwoerter
     KwFn,
     KwLet,
@@ -86,6 +89,7 @@ impl TokKind {
         match self {
             TokKind::Int(v) => format!("{}", v),
             TokKind::Ident(s) => s.clone(),
+            TokKind::Str(k, v) => format!("{}\"…\" ({} elemente)", k.prefix(), v.len()),
             TokKind::KwFn => "fn".into(),
             TokKind::KwLet => "let".into(),
             TokKind::KwVar => "var".into(),
@@ -432,6 +436,47 @@ impl<'a> Lexer<'a> {
         true
     }
 
+    /// Zeichenkettenliteral lexen. `false`, wenn an dieser Stelle keines steht.
+    ///
+    /// Die eigentliche Entschluesselung — Maskierungen, `\\uXXXX` samt
+    /// ungepaarter Surrogate, UTF-8-Pruefung — macht `strings.rs`. Hier wird sie
+    /// nur angebunden; genau diese Anbindung fehlte bis Runde 8 (SPEC §14.1.str,
+    /// Punkt S1).
+    ///
+    /// WICHTIG: der Aufruf steht VOR der Bezeichnererkennung, sonst frisst
+    /// `is_ident_start` das `b` bzw. `u` von `b"..."` und `u"..."`.
+    fn string_literal(&mut self) -> bool {
+        let (line, col) = (self.line, self.col);
+        let (kind, res, verbraucht) =
+            match crate::strings::lex_string_literal(&self.chars, self.pos) {
+                Some(x) => x,
+                None => return false,
+            };
+        for _ in 0..verbraucht {
+            self.bump();
+        }
+        match res {
+            Ok(val) => self.push(TokKind::Str(kind, val), line, col, verbraucht as u32),
+            Err(e) => {
+                // Die Spalte des Fehlers liegt `e.off` Zeichen hinter dem Anfang.
+                self.dg.error(
+                    self.sp(line, col + e.off, 1),
+                    format!("in einem zeichenkettenliteral: {}", e.msg),
+                );
+                // Weiterlexen mit einem leeren Literal, damit Folgefehler
+                // nicht auf eine kaputte Tokenfolge zurueckgehen.
+                let leer = match kind {
+                    crate::strings::LitKind::Str16 => {
+                        crate::strings::LitValue::Units(Vec::new())
+                    }
+                    _ => crate::strings::LitValue::Octets(Vec::new()),
+                };
+                self.push(TokKind::Str(kind, leer), line, col, verbraucht as u32);
+            }
+        }
+        true
+    }
+
     fn run(&mut self) {
         loop {
             self.skip_trivia();
@@ -439,6 +484,9 @@ impl<'a> Lexer<'a> {
                 Some(c) => c,
                 None => break,
             };
+            if self.string_literal() {
+                continue;
+            }
             if c.is_ascii_digit() {
                 self.number();
             } else if is_ident_start(c) {

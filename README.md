@@ -713,6 +713,52 @@ negatives Ergebnis genauso zum Fortschritt gehört: der nächste Versuch muss
 ohne Registerreservierung auskommen, also die Zuteilung selbst verbessern
 (kurzlebige Intervalle bevorzugt bedienen), statt ihr ein Register wegzunehmen.
 
+## Zeichenkettenliterale (Runde 8) — Sprachkern statt Optimierung
+
+Bis hierhin musste jeder Text in Firn als Oktettliste geschrieben werden. So
+sah eine Fehlermeldung in der GC-Laufzeit aus:
+
+```firn
+var m: [u8; 48] = [
+    102, 105, 114, 110, 45, 103, 99, 58, 32, 103, 99, 95, 105, 110, 105,
+    116, 40, 41, 32, 119, 117, 114, 100, 101, 32, 110, 105, 99, 104, 116,
+    32, 97, 117, 102, 103, 101, 114, 117, 102, 101, 110, 10, 0, 0, 0, 0, 0, 0,
+]
+```
+
+Und so sieht sie jetzt aus:
+
+```firn
+var m: [u8; 42] = "firn-gc: gc_init() wurde nicht aufgerufen\n"
+```
+
+**Drei Formen**, alle mit vollständigen Maskierungen (`\n`, `\t`, `\\`, `\0`,
+`\xNN`, `\uXXXX`, `\u{...}`):
+
+| Form | Typ | Inhalt |
+|---|---|---|
+| `"…"` | `[u8; N]` | UTF-8, **geprüft** |
+| `b"…"` | `[u8; N]` | rohe Oktette, ungeprüft |
+| `u"…"` | `[u16; N]` | WTF-16, ungeprüft |
+
+**WTF-16 hält ungepaarte Surrogate** — `u"a\uD800b"` ist gültig und ergibt
+`[97, 55296, 98]`. Das ist keine Nachlässigkeit, sondern Pflicht: eine Sprache,
+die nur wohlgeformtes Unicode zulässt, kann JavaScript nicht umsetzen
+(`FIRN-ANFORDERUNGEN.md` §2). Nachweis in `tests/570_zeichenkettenliterale.fi`.
+
+**Wie es gebaut ist — und warum so klein:** Die Entschlüsselung lag seit
+Runde 2 fertig in `compiler/src/strings.rs`, sie war nur nie an den Lexer
+angebunden. Der Parser wandelt ein Literal unmittelbar in ein **Array-Literal**
+um; Typprüfer, Lowering und Codegenerator sehen nie ein Literal und mussten
+nicht angefasst werden. Der Preis steht in `SPEC.md` §14.1.str S8: die Daten
+landen als Folge einzelner Speicherbefehle im Rahmen, nicht in `.rodata`. Für
+Meldungen und Pfade ist das gleichgültig, für große Tabellen wäre es das nicht.
+
+**Sofort eingelöst:** die handgeschriebenen Oktettlisten in `lib/gc/gc.fi`,
+`lib/dom/mess.fi` und `lib/html/entities_ausfall.fi` sind verschwunden — aus
+einer 63-stelligen Zahlenreihe wurde
+`"FEHLER: tabelle() lieferte 0, obwohl mmap moeglich sein sollte\n"`.
+
 ## Speichermodell: Opt-in-Tracing-GC und der DOM-Dauerlauf (Runde 4)
 
 Die wichtigste offene Designfrage aus `DESIGNZIELE.md` ist entschieden **und
