@@ -895,10 +895,46 @@ und die Web-IDL-Bindungen.
 Parser hat `"abc"` schon in ein Array aus Oktetten verwandelt, der Interpreter
 liest es zurück.
 
-**Was zu Abnahmepunkt 6 noch fehlt:** ein **Datenzugriff zur Übersetzungszeit**.
-Die Abnahme verlangt die Tabelle *aus der UCD*; `comptime` kann heute nur aus
-Regeln erzeugen, die im Quelltext stehen. Das ist die letzte Lücke — und sie
-wird nicht überstrichen.
+### Daten lesen, während der Compiler läuft (Runde 14)
+
+```firn
+comptime {
+    let n: i64 = datei_groesse("daten/gross_klein.txt")
+    // … Datei byteweise parsen, Zeile für Zeile Code erzeugen …
+}
+```
+
+`tests/602_comptime_ucd.fi` liest eine Datei im Format von `UnicodeData.txt` —
+semikolongetrennte Felder, Codepunkt in Feld 0, Großschreibung in Feld 12 — und
+erzeugt daraus:
+
+```
+fn ucd_gross(c: i64) -> i64 {
+    if c == 97 { return 65 }
+    if c == 228 { return 196 }
+    if c == 255 { return 376 }
+    return c
+}
+const UCD_ZEILEN: i64 = 5
+```
+
+**Das ist Abnahmepunkt 6.** Was noch fehlt, ist die Bewährung an der *echten*
+UCD (1,9 MB, alle Kategorien) und ein Bauskript, das sie holt.
+
+**Sicherheit von Anfang an:** Dateizugriff zur Übersetzungszeit ist ein
+Einfallstor für Lieferketten-Angriffe — eine eingebundene Bibliothek könnte
+sonst beim Bauen `/etc/passwd` lesen und in den erzeugten Code schreiben.
+Deshalb: nur relativ zur Quelldatei, kein `..`, kein absoluter Pfad.
+
+```
+error: comptime: '/etc/passwd' ist ein absoluter pfad — erlaubt sind nur
+       pfade relativ zur quelldatei
+error: comptime: '../geheim.txt' enthaelt '..' — der zugriff bleibt im
+       verzeichnis der quelldatei
+```
+
+Das ist enger als nötig. Bekommt Firn das Fähigkeitenmodell aus
+`DESIGNZIELE.md` §3, wird daraus eine Erlaubnis, die ein Modul anfordern muss.
 
 ## Gleitkomma `f64` (Runde 11)
 
