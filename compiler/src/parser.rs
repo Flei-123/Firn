@@ -650,6 +650,41 @@ impl<'a> Parser<'a> {
                 let sp = self.bump();
                 self.mk(sp, ExprKind::Int(v))
             }
+            // ZEICHENKETTENLITERAL -> Array-Literal.
+            //
+            // `"abc"` wird zu `[97, 98, 99]`, `u"abc"` zu den UTF-16-
+            // Codeeinheiten. Damit ist der Typ `[u8; N]` bzw. `[u16; N]`, und
+            // alles Weitere — Typpruefung, Lowering, Codegenerierung — ist
+            // schon da. Der Preis ist ehrlich benannt (SPEC §14.1.str, S8):
+            // die Daten landen als Folge einzelner Speicherbefehle im Rahmen,
+            // nicht in `.rodata`. Fuer den Quelltext ist der Gewinn trotzdem
+            // gross: `var m: [u8; 12] = "firn-gc: …"` statt einer von Hand
+            // ausgerechneten Oktettliste.
+            TokKind::Str(_, val) => {
+                let sp = self.bump();
+                let mut elems: Vec<Expr> = Vec::new();
+                match val {
+                    crate::strings::LitValue::Octets(v) => {
+                        for b in v {
+                            elems.push(self.mk(sp, ExprKind::Int(b as i128)));
+                        }
+                    }
+                    crate::strings::LitValue::Units(v) => {
+                        for u in v {
+                            elems.push(self.mk(sp, ExprKind::Int(u as i128)));
+                        }
+                    }
+                }
+                if elems.is_empty() {
+                    self.dg.error_note(
+                        sp,
+                        "leeres zeichenkettenliteral".to_string(),
+                        "ein array braucht mindestens ein element; schreibe ein feld der gewuenschten laenge, z. B. '[0 as u8; 8]'",
+                    );
+                    return self.broken_expr(sp);
+                }
+                self.mk(sp, ExprKind::ArrayLit(elems))
+            }
             TokKind::KwTrue => {
                 let sp = self.bump();
                 self.mk(sp, ExprKind::Bool(true))

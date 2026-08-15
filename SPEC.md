@@ -1201,15 +1201,29 @@ Mit Runde 2 sind §8.1–§8.4 umgesetzt: `Bytes`/`Str`/`Str16`/`Atom` mit dem i
 Brücke, korrekt gerundetes `strtod` und kürzeste Ausgabe mit
 Rückwandlungsgarantie. Bewusst enger als der Text oben ist Folgendes:
 
-S1. **Zeichenkettenliterale sind im Compiler vorhanden, aber noch nicht im
-    Lexer verdrahtet.** `compiler/src/strings.rs` entschlüsselt `"..."`
-    (UTF-8, geprüft), `b"..."` (`Bytes`) und `u"..."` (`Str16`) samt aller
-    Maskierungen einschließlich `\uXXXX` **mit ungepaarten Surrogaten**;
-    `firnc --strlit=<literal>` zeigt das Ergebnis. In `.fi`-Quelltext gibt es
-    weiterhin **keine** Zeichenkettenliterale — der Aufruf von
-    `strings::lex_string_literal` im Lexer ist eine Zeile und gehört dem Modul
-    `kern`. Bis dahin erzeugt `tools/strlib/expand.py` (`//#str name text`)
-    die Oktettfolgen für Testprogramme.
+S1. **Zeichenkettenliterale sind seit Runde 8 im Quelltext benutzbar.**
+    `compiler/src/strings.rs` entschlüsselt `"..."` (UTF-8, geprüft),
+    `b"..."` (rohe Oktette) und `u"..."` (WTF-16) samt aller Maskierungen
+    einschließlich `\uXXXX` und `\u{...}` **mit ungepaarten Surrogaten**;
+    `firnc --strlit=<literal>` zeigt das Ergebnis. Der Lexer ruft das jetzt
+    auf (`lexer::string_literal`, VOR der Bezeichnererkennung — sonst
+    verschluckt `is_ident_start` das `b` bzw. `u` des Präfixes).
+
+    **Ein Literal ist ein ARRAY-Literal**, kein eigener Typ: `"abc"` hat den
+    Typ `[u8; 3]`, `u"abc"` den Typ `[u16; 3]`. Damit gelten alle Regeln für
+    Arrays — insbesondere die Längenprüfung: `var a: [u8; 5] = "abc"` meldet
+    *array-literal hat 3 elemente, erwartet werden 5*. Der Parser wandelt das
+    Literal unmittelbar in `ExprKind::ArrayLit` um; Typprüfer, Lowering und
+    Codegenerator sehen es nie.
+
+S8. **Literale liegen im Rahmen, nicht in `.rodata`.** Aus S1 folgt: die Daten
+    entstehen als Folge einzelner Speicherbefehle beim Betreten des Blocks.
+    Für Meldungen und Pfade ist das gleichgültig, für eine 4-KiB-Tabelle wäre
+    es das nicht. Eine echte `.rodata`-Sektion mit `Str`/`Str16` als
+    Bibliothekstyp (Zeiger + Länge) kommt mit der Standardbibliothek;
+    `LitValue::asm_data()` erzeugt die Assemblerdaten dafür bereits.
+    Ebenfalls offen: `Str`/`Bytes`/`Str16` als **Typ** eines Literals — heute
+    ist das Ergebnis ein Array, das man von Hand in einen dieser Typen füllt.
 S2. **Kein Gleitkommatyp in der Sprache.** `strtod` liefert und `dtoa`
     verbraucht das **Bitmuster** eines `binary64` als `u64`. Die Rechnung ist
     ohnehin vollständig ganzzahlig (exakte Großzahlarithmetik); sobald `f64`
