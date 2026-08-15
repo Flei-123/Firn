@@ -1445,3 +1445,97 @@ Teilmenge, in der `firnc1` geschrieben ist. Der nächste ehrliche Schritt ist
 nicht „mehr Bootstrap", sondern der **Sprachumfang**: solange `firnc1` kein
 `enum`/`match` und keine Fehlerunionen liest, kann es `firnc0` nicht ersetzen,
 sondern nur sich selbst tragen.
+
+
+---
+
+## 22. Runde 32: `enum` und `match` — der erste Sprachumfang nach dem Fixpunkt
+
+`firnc1` liest jetzt Aufzählungen und den Musterabgleich — mit derselben
+Architektur wie Stufe 0 (`sema_match.rs`): die Fälle eines `match` liegen
+**nicht** im Syntaxbaum, sondern in einer Registrierung; im Baum steht nur
+ein Aufruf `__match#<nummer>` ohne Argumente. Das Layout einer Aufzählung
+wird als Struct mit den Feldern `__tag` und `__v<tag>_<i>` in den Typkontext
+eingetragen, die Offsets in `muster.fi` gerechnet, nicht von `typen.fi`.
+
+| | Runde 31 | Runde 32 |
+|---|---:|---:|
+| gleiches Verhalten wie `firnc0` (selbst) | 131 | **140** |
+| abweichend · fehlerhaft | 0 · 0 | **0** · **0** |
+| nicht Kernsprache (selbst) | 51 | **42** |
+| Parser oktettgleich (`--emit=ast-kanon`) | 169 | **183** |
+| Typen gleich (`--emit=typen`) | 115 | **123** |
+| FIR oktettgleich (`--emit=fir-raw`) | 115 | **123** (37 845 Instruktionen) |
+| Fixpunkt (Stufe 2 == Stufe 3) | 147 220 Zeilen | **173 103 Zeilen, zeichengleich** |
+
+`test.sh`: **628/628**. Die Messlatte der Runde: `tests/200`–`206`, `230`,
+`231` laufen durch `firnc1` mit identischem Verhalten — erreicht, genau die
+neun mehr. Die vier Negativtests (`match_int_ohne_auffang`,
+`match_missing_variant`, `match_unbekannte_variante`, `match_unerreichbar`)
+brechen mit `rc=1` ab — einzeln gemessen; die Suite prüft Negativtests nur
+gegen `firnc0`.
+
+### Drei Stellen, an denen man das nicht raten kann
+
+1. **Die `__match#`-Nummern der Wurzeldatei müssen die kleinen bleiben.**
+   `firnc0` parst die Wurzel zuerst, `firnc1` die Module zuerst (Konstanten
+   dürfen modulübergreifend sein). `tests/231_modul_match.fi` hat zwei
+   `match` im Modul und eines in der Wurzel — `--emit=ast-kanon` zeigt in
+   der Wurzel `__match#0`. Der Vergleich läuft nur über die Einzeldatei-
+   Werkzeuge, und die parsen genau eine Datei — dort stimmt die Nummer.
+   Im vollen Lauf sind die Nummern intern und müssen nur eindeutig sein.
+   Beides steht so, und beides ist gemessen.
+2. **Die Bindung im Muster ist eine ADRESSE, kein Wert.** `Wert::Zahl(x)`
+   bindet `x` an die Adresse des Nutzdatenfelds im Speicher der Aufzählung.
+   Das Lowering erzeugt dafür die `ptradd`-Kette VOR dem Rumpf des Falls —
+   bei zwei Bindungen zwei `ptradd`, dann erst der Rumpf. Wer die
+   Reihenfolge vertauscht, bekommt andere Wertnummern und der FIR-Vergleich
+   bricht. (Genau daneben lag ein erster Entwurf: im Nicht-Aufzählungs-Fall
+   wurde der Schlüsselwert nie gesetzt — der Switch verzweigte auf `%0`.)
+3. **Das Layout verlangt zwei getrennte Eingriffe in `typen.fi`.** Die
+   Aufzählungsnamen müssen VOR dem Structlayout angemeldet sein (sonst kennt
+   `fn dauer(a: Ampel)` den Typ nicht), die Layouts erst NACHHER eingetragen
+   werden (eine Aufzählung darf ein Struct dem Wert nach enthalten, nicht
+   umgekehrt). Dazwischen steht `typen_aufloesen` — also bekam `Typen` eine
+   Vormerkung (`typen_struct_vormerken`, zählt in `eoff`) und ein nachträgliches
+   Festlegen (`typen_struct_festlegen`), das die fertigen Felder lückenlos
+   anhängt. Der Index im Typkontext und der Index im Baum sind seither
+   NICHT mehr dieselbe Zahl; `struct_layout` bekommt beide.
+
+### Portiert, mit Absicht einfacher
+
+* **Kein Sprungtabelle.** `codegen_switch.rs` baut ab acht dichten Marken
+  eine Tabelle in `.rodata`; `lib/firnc1/codegen.fi` erzeugt immer die
+  Vergleichskette. Verhaltensgleich — der Maßstab dieser Stufe ist das
+  Verhalten, nicht der Assemblertext.
+* **`u64`-Marken jenseits von `i64::MAX` lassen sich nicht niederschreiben.**
+  Stufe 0 rechnet Musterwerte in `i128`; diese Stufe in `i64`. Kein
+  Programm im Korpus hat eine solche Marke; es steht in `muster.fi` und hier.
+* **Fehler werden gezählt, nicht beschrieben** — wie überall in Stufe 1.
+  Die Vollständigkeitsprüfung (`check_exhaustive`) IST portiert: ein
+  fehlender Fall ist ein Fehler, kein Warnhinweis.
+
+### Ehrliche Grenzen
+
+* **`--emit=layout` vergleicht die enum/match-Dateien weiter nicht.** Der
+  Maßstab (`layout_kanon.rs`) kennt Aufzählungen nicht und druckt ihre Namen
+  als `?`; `bin/layoutdump.fi` meldet das Muster-Register deshalb bewusst
+  NICHT an, und die Dateien zählen dort als „nicht Kern" (gezählt, nicht
+  übergeben: es sind 9 Programmdateien plus `tests/modules/zustand.fi`).
+* **`match` in generischen Vorlagen** ist wie in Stufe 0 ein Fehler; hier
+  zählt die Datei zusätzlich als „nicht Kern" (Vorab-Suche).
+* **Enum dem Wert nach als Structfeld** bleibt ein Fehler (Zeiger geht);
+  enum-in-enum dem Wert nach geht, mit Toposort und Zyklus als Fehler.
+* **Der Fixpunkt bleibt vorerst „trivial":** die Quellen von `firnc1`
+  benutzen `enum`/`match` selbst noch nicht — die neuen Pfade werden beim
+  Selbstübersetzen zwar mitübersetzt (Stufe 2 == Stufe 3 beweist ihre
+  Übersetzbarkeit), aber nicht durchlaufen. Ehrlich so, und jetzt möglich:
+  nach dieser Runde KÖNNEN die Quellen es.
+
+### Was das heißt
+
+Von den 51 Dateien, die Runde 31 außerhalb der Kernsprache zählte, sind 9
+übersiedelt — `enum`/`match` ist der erste Sprachumfang, der NACH dem
+Fixpunkt dazukam, und der Fixpunkt steht danach weiter. Der Rest ist
+benannt: Fehlerunionen (20), `gc`/`rc` (14), konstante Laufzeit (4),
+`errdefer` (1), `comptime` (2).
