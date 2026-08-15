@@ -1553,15 +1553,15 @@ neu war nur die Senkung von `try`/`catch`/Umwandlung.
 
 | | Runde 32 | Runde 33 |
 |---|---:|---:|
-| gleiches Verhalten wie `firnc0` (selbst) | 140 | **165** |
+| gleiches Verhalten wie `firnc0` (selbst) | 140 | **166** |
 | abweichend · fehlerhaft | 0 · 0 | **0** · **0** |
 | nicht Kernsprache (selbst) | 42 | **17** |
-| Parser oktettgleich (`--emit=ast-kanon`) | 183 | **216** |
+| Parser oktettgleich (`--emit=ast-kanon`) | 183 | **217** |
 | Typen gleich (`--emit=typen`) | 123 | **142** (26 025 Ausdruecke) |
 | FIR oktettgleich (`--emit=fir-raw`) | 123 | **142** (40 591 Instruktionen) |
 | Fixpunkt (Stufe 2 == Stufe 3) | 173 103 Zeilen | **188 839 Zeilen, zeichengleich** |
 
-`test.sh`: **628/628**. Die Messlatte der Runde waren die zwanzig Dateien
+`test.sh`: **631/631**. Die Messlatte der Runde waren die zwanzig Dateien
 `tests/400`–`419` — erreicht, und fuenf mehr: `tests/550`–`554` (die
 `rc`-Dateien) waren nur deshalb „nicht Kern", weil sie Fehlerunionen
 benutzen (`AllocError!…`); sie sind mitgewandert. Die elf Negativtests
@@ -1627,6 +1627,11 @@ die Suite prueft Negativtests nur gegen `firnc0`.
   benutzen Fehlerunionen selbst noch nicht — die neuen Pfade werden beim
   Selbstuebersetzen mituebersetzt (Stufe 2 == Stufe 3 beweist das), aber
   nicht durchlaufen.
+
+Neuer Dauer-Test: `tests/740_fehlerunion_kern.fi` — Fehlermenge und Union
+aus einem Modul (`tests/modules/kern/mittel.fi`), `try` ueber zwei Ebenen
+durch die Modulgrenze, `catch |e|` mit Fehlervergleich, Umwandlung bei
+`return`/`let`/Zuweisung/Argument, Union als Structfeld.
 
 ### Was das heisst
 
