@@ -1194,6 +1194,36 @@ Zählverweis-Gegenprobe mit identischem Graphen braucht nach 2.000.000 Zyklen
 * **Fragmentierung** bei wechselnden Objektgrößen ist ungeprüft; der Dauerlauf
   benutzt immer denselben Satz.
 
+#### 14.1.sizeof — `size_of[T]()` (Runde 16)
+
+`size_of[T]()` liefert die Größe eines Typs in **Bytes**, ermittelt zur
+Übersetzungszeit. Zur Laufzeit bleibt davon nichts übrig: der Typprüfer rechnet
+die Größe aus dem Layout aus (`TypeCtx::size_of`), das Lowering setzt eine
+Konstante ein.
+
+```firn
+let n: usize = size_of[i32]()       // 4
+let m: usize = size_of[Punkt]()     // gerechnetes Struct-Layout, nicht die Feldsumme
+var feld: [u8; 16] = [0 as u8; 16]  // taugt als Array-Länge
+```
+
+Gebaut wie `gc_null[C]()`: der Parser erkennt die Form und verpackt sie als
+Aufruf mit einem reservierten Namen (`size_of$…`), in dem der Typname steckt.
+`size_of` ist damit **kein Schlüsselwort** und kollidiert mit keinem
+Bezeichner.
+
+**Innerhalb generischer Vorlagen** wird der Typparameter im Namen mit ersetzt
+(`mono::subst_call_name`) — ohne das meldet der Typprüfer *unbekannter typ 'T'*,
+sobald die Vorlage ausgeprägt wird.
+
+**Grenzen:** nur ein **Typname** als Argument, kein zusammengesetzter
+Typausdruck (`size_of[*mut u8]` geht nicht — wer das braucht, gibt dem Typ
+einen Namen). `size_of[void]` ist ein Fehler.
+
+**Wozu:** ohne die Elementgröße lässt sich die Adresse des `i`-ten Elements
+nicht ausrechnen, und damit gibt es kein wachsendes `Vec[T]`
+(`docs/SELBSTHOSTING.md` §4, Punkt 2).
+
 #### 14.1.comptime — Auswertung zur Übersetzungszeit (Runde 12)
 
 `compiler/src/comptime.rs` führt **eigene Funktionen zur Übersetzungszeit

@@ -55,7 +55,7 @@ Sortiert nach „blockiert am meisten zuerst". `[ ]` = fehlt,
 | # | Merkmal | Stand | Warum der Compiler es braucht |
 |---|---|---|---|
 | 1 | **Heap-Allokator** (`mmap`-basiert, `alloc`/`free`) | **`[x]`** `lib/rt/rt.fi` (Runde 15) | Ohne ihn gibt es kein `Vec`, keinen AST, keine Symboltabelle |
-| 2 | **`Vec[T]`** (wachsendes Feld) | `[~]` Generics stehen; `rt.Buf` ist die Byte-Fassung (wächst durch Verdopplung), die typisierte fehlt | Tokenstrom, Anweisungslisten, Blocklisten — überall |
+| 2 | **`Vec[T]`** (wachsendes Feld) | **`[~]`** funktioniert (Runde 16, `tests/620_vec_heap.fi`), aber **nicht über Modulgrenzen** — siehe §7 | Tokenstrom, Anweisungslisten, Blocklisten — überall |
 | 3 | **Hash-Abbildung `Map[K,V]`** | `[~]` | Namenstabellen (`fns`, `consts`, Bereiche) |
 | 4 | **Zeichenketten** `Str`/`Bytes` mit Verkettung | `[~]` Modul `str` dieser Runde | Bezeichner, Fehlermeldungen, Assemblertext |
 | 5 | **Textformatierung** (`format`-Ersatz) | **`[~]`** `buf_push_dez_u64/i64`, `buf_push_hex_u64` in `lib/rt/` | Jede Diagnose und der gesamte Assembler-Ausdruck |
@@ -162,3 +162,37 @@ ausgeben; in allen drei Baustufen.
   es erledigt ist.
 * `Vec[T]` (typisiert, generisch) fehlt weiterhin. `rt.Buf` ist die
   Byte-Fassung davon.
+
+---
+
+## 7. Runde 16: `size_of[T]()`, `Vec[T]` — und drei Blocker, die dabei sichtbar wurden
+
+**Gebaut:** `size_of[T]()` liefert die Größe eines Typs in Bytes zur
+Übersetzungszeit (`compiler/src/sizeof.rs`, `tests/611_size_of.fi`). Damit
+läuft ein **wachsendes** `Vec[T]` auf dem Heap: `tests/620_vec_heap.fi` legt
+1.000 `i32`, 300 `u8` und 100 `u64` an — drei Ausprägungen, drei
+Elementgrößen, alle drei Baustufen.
+
+Zur Laufzeit bleibt von `size_of` nichts übrig: der Typprüfer rechnet die
+Größe aus, das Lowering setzt eine Konstante ein.
+
+**Drei Blocker, die beim Bau von `lib/rt/vec.fi` sichtbar wurden.** Sie sind
+der eigentliche Ertrag dieser Runde — ohne sie lässt sich keine
+Bibliothekssammlung schreiben, und der Compiler in Stufe 1 besteht aus nichts
+anderem:
+
+| # | Blocker | Wirkung |
+|---|---|---|
+| B1 | **`modul.Typ[T]` ist nicht schreibbar** | `var v: vec.Vec[i32]` scheitert am Parser (`erwartet '=' … gefunden '['`). Eine generische Sammlung lässt sich damit nicht aus einem Modul benutzen. |
+| B2 | **Eine generische Vorlage sieht keine Modulaufrufe** | `rt.heap_alloc(…)` im Rumpf einer Vorlage meldet *unbekannte funktion*. Vermutlich hält `sema_generic::REG` die Vorlagen als eigene Kopien, die das Modul-Umschreiben in `modules.rs` nicht erreicht. |
+| B3 | **Importe werden relativ zur WURZELDATEI aufgelöst** | Eine Bibliothek kann keine andere importieren: `lib/rt/vec.fi` mit `import rt` sucht `rt.fi` neben dem Hauptprogramm, nicht neben sich selbst. |
+
+`lib/rt/vec.fi` liegt deshalb im Baum, ist aber **nicht benutzbar**, solange B1
+bis B3 offen sind — der Nachweis läuft in `tests/620_vec_heap.fi` mit
+derselben Umsetzung in der Wurzeldatei. Das ist ehrlich unschön und steht
+genau deshalb hier.
+
+**Reihenfolge für die nächste Runde:** B3 ist am billigsten (Importpfad relativ
+zur Moduldatei auflösen), B1 braucht Parser und Namensauflösung, B2 den
+Abgleich zwischen Modul-Umschreiben und Vorlagenspeicher. Erst danach ist
+`lib/std/` überhaupt schreibbar.
