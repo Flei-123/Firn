@@ -264,6 +264,16 @@ else
     tail -20 "$WORK/typen_vergleich.log" | sed 's/^/   /'
 fi
 
+echo "== 14. Typpruefer in Firn gegen Rust (tools/sema_vergleich.sh) =="
+bash tools/sema_vergleich.sh > "$WORK/sema_vergleich.log" 2>&1 && SVRC=0 || SVRC=$?
+if [ "$SVRC" -eq 0 ]; then
+    ok
+    grep -E '^(GLEICH|UNGLEICH|AUSDRUECKE|NICHT KERN)' "$WORK/sema_vergleich.log" | sed 's/^/   /'
+else
+    bad "tools/sema_vergleich.sh schlug fehl (siehe .test-work/sema_vergleich.log)"
+    tail -20 "$WORK/sema_vergleich.log" | sed 's/^/   /'
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then
