@@ -254,6 +254,16 @@ else
     tail -20 "$WORK/parser_vergleich.log" | sed 's/^/   /'
 fi
 
+echo "== 13. Layout und ABI in Firn gegen Rust (tools/typen_vergleich.sh) =="
+bash tools/typen_vergleich.sh > "$WORK/typen_vergleich.log" 2>&1 && TVRC=0 || TVRC=$?
+if [ "$TVRC" -eq 0 ]; then
+    ok
+    grep -E '^(GLEICH|UNGLEICH|MIT STRUCTS)' "$WORK/typen_vergleich.log" | sed 's/^/   /'
+else
+    bad "tools/typen_vergleich.sh schlug fehl (siehe .test-work/typen_vergleich.log)"
+    tail -20 "$WORK/typen_vergleich.log" | sed 's/^/   /'
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then
