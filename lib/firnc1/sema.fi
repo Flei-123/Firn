@@ -32,10 +32,11 @@ import intern
 import ast
 import typen
 import muster
+import fehler
 
 export { Sema, sema_neu, sema_frei, sema_lauf, sema_fehler, sema_typ,
          sema_typen, sema_typ_anzahl, sema_braucht_comptime, sema_konst_wert,
-         sema_mu_setzen }
+         sema_mu_setzen, sema_fe_setzen }
 
 const KEIN: u32 = 4294967295
 
@@ -58,6 +59,7 @@ struct Sema {
     t_f64: u32,
     ret: u32,            // Rueckgabetyp der laufenden Funktion
     mu: u64,             // Register der Aufzaehlungen/Musterabgleiche (0 = keins)
+    feh: u64,            // Register der Fehlermengen/-unionen (0 = keins)
     fehler: usize,
     ct_noetig: bool,     // eine Konstante braucht Auswertung zur Uebersetzungszeit
 }
@@ -70,7 +72,7 @@ fn sema_neu(b: u64, it: u64) -> Sema {
         v_name: vec_neu[u32](), v_typ: vec_neu[u32](), b_grenze: vec_neu[u32](),
         k_name: vec_neu[u32](), k_typ: vec_neu[u32](), k_wert: vec_neu[u64](),
         t_bool: 0, t_i64: 0, t_usize: 0, t_void: 0, t_fehler: 0, t_f64: 0,
-        ret: 0, mu: 0, fehler: 0, ct_noetig: false,
+        ret: 0, mu: 0, feh: 0, fehler: 0, ct_noetig: false,
     }
 }
 
@@ -92,6 +94,12 @@ fn sema_mu_setzen(s: *mut Sema, m: u64) { (*s).mu = m }
 
 fn mu(s: *mut Sema) -> *mut muster.Mus { return (*s).mu as *mut muster.Mus }
 fn hat_mu(s: *mut Sema) -> bool { return (*s).mu != 0 }
+
+// Das Fehler-Register anmelden. MUSS vor `sema_lauf` stehen.
+fn sema_fe_setzen(s: *mut Sema, f: u64) { (*s).feh = f }
+
+fn fe(s: *mut Sema) -> *mut fehler.Fehler { return (*s).feh as *mut fehler.Fehler }
+fn hat_fe(s: *mut Sema) -> bool { return (*s).feh != 0 }
 fn sema_braucht_comptime(s: *mut Sema) -> bool { return (*s).ct_noetig }
 fn sema_typen(s: *mut Sema) -> *mut typen.Typen { return &(*s).ty }
 fn sema_typ_anzahl(s: *mut Sema) -> usize { return vec_len[u32](&(*s).etyp) }
@@ -286,6 +294,24 @@ fn probe_t(s: *mut Sema, e: u32, d: u32) -> u32 {
     if a == ast.E_RUF {
         if ast.e_zahl(b, e) != 0 {
             return (*s).t_usize
+        }
+        // HOOK fehlerunionen: `try a`/`a catch b` liefern den Erfolgstyp
+        // der Fehlerunion (errors.rs::success_type ueber probe_d).
+        if hat_fe(s) {
+            if fehler.fehler_ist_ergebnisname(namen(s), ast.e_a(b, e)) {
+                if ast.e_c(b, e) == 0 {
+                    return KEIN
+                }
+                let inner: u32 = probe_t(s, ast.kind_at(b, ast.e_b(b, e)), d + 1)
+                if inner == KEIN {
+                    return KEIN
+                }
+                let u: u32 = fehler.fehler_union_von_typ(fe(s), tafel(s), inner)
+                if u == KEIN {
+                    return KEIN
+                }
+                return fehler.fehler_u_valty(fe(s), u)
+            }
         }
         let f: u32 = fn_suchen(s, ast.e_a(b, e))
         if f == KEIN {
@@ -606,6 +632,23 @@ fn binaer(s: *mut Sema, e: u32, hinweis: u32) -> u32 {
 
     // Vergleich
     if op >= 10 && op <= 15 {
+        // HOOK fehlerunionen: `e == E::NotFound` vergleicht zwei Fehlerwerte
+        // derselben Menge (errors.rs::hook_binary).
+        if hat_fe(s) && (op == 10 || op == 11) {
+            if fehler_ruhig_set(s, l) != KEIN || fehler_ruhig_set(s, r) != KEIN {
+                let lt2: u32 = ausdruck(s, l, KEIN)
+                let rt2: u32 = ausdruck(s, r, KEIN)
+                let ls: u32 = fehler.fehler_set_von_typ(fe(s), tafel(s), lt2)
+                let rs: u32 = fehler.fehler_set_von_typ(fe(s), tafel(s), rt2)
+                if ls != KEIN && rs != KEIN && ls == rs {
+                    return (*s).t_bool
+                }
+                if !ist_fehler(s, lt2) && !ist_fehler(s, rt2) {
+                    meckern(s)
+                }
+                return (*s).t_bool
+            }
+        }
         var want: u32 = probe(s, l)
         if want == KEIN {
             want = probe(s, r)
@@ -718,6 +761,26 @@ fn ruf(s: *mut Sema, e: u32) -> u32 {
     let name: u32 = ast.e_a(b, e)
     let off: u32 = ast.e_b(b, e)
     let anz: u32 = ast.e_c(b, e)
+    // HOOK fehlerunionen (errors.rs::hook_call): `__try#`, `__catch#` und
+    // `Fehlermenge::Variante`. Steht VOR dem enum/match-Hook, weil es in
+    // Stufe 0 auch zuerst drankommt; eine Menge und eine Aufzaehlung
+    // desselben Namens gibt es nicht (die Anmeldung meldet den Konflikt).
+    if hat_fe(s) {
+        if fehler.fehler_ist_tryname(namen(s), name) {
+            return try_pruefen(s, e)
+        }
+        if fehler.fehler_ist_catchname(namen(s), name) {
+            return catch_pruefen(s, e)
+        }
+        var en: u32 = KEIN
+        var vn: u32 = KEIN
+        fehler.fehler_name_teilen((*s).feh, namen(s), name, &en, &vn)
+        if en != KEIN {
+            if fehler.fehler_menge_finden(fe(s), en) != KEIN {
+                return fehler_ctor_pruefen(s, en, e)
+            }
+        }
+    }
     // HOOK enum/match (sema_match.rs): `__match#N` ist der Musterabgleich,
     // `Enum::Variante(..)` der Konstruktor. Beides steht nicht in der
     // Funktionsliste.
@@ -749,6 +812,12 @@ fn ruf(s: *mut Sema, e: u32) -> u32 {
         let arg: u32 = ast.kind_at(b, off + k)
         if k < plen {
             let pt: u32 = typen.param_typ_aufgeloest(tafel(s), f as usize, k)
+            // HOOK fehlerunionen: implizite Umwandlung eines Arguments
+            // (errors.rs::hook_coerce in `call`).
+            if hat_fe(s) && coerce_pruefen(s, arg, pt) {
+                k = k + 1
+                continue
+            }
             let t: u32 = ausdruck(s, arg, pt)
             if !typen.vertraeglich(tafel(s), t, pt) {
                 meckern(s)
@@ -785,9 +854,16 @@ fn struct_literal(s: *mut Sema, e: u32) -> u32 {
             austypen(s, fexpr)
             meckern(s)
         } else {
-            let t: u32 = ausdruck(s, fexpr, ft)
-            if !typen.vertraeglich(tafel(s), t, ft) {
-                meckern(s)
+            // HOOK fehlerunionen: implizite Umwandlung eines Feldwerts.
+            var umgewandelt: bool = false
+            if hat_fe(s) {
+                umgewandelt = coerce_pruefen(s, fexpr, ft)
+            }
+            if !umgewandelt {
+                let t: u32 = ausdruck(s, fexpr, ft)
+                if !typen.vertraeglich(tafel(s), t, ft) {
+                    meckern(s)
+                }
             }
         }
         k = k + 1
@@ -1293,6 +1369,160 @@ fn match_pruefen(s: *mut Sema, mi: u32) {
 
 // ------------------------------------------------------------- Anweisungen
 
+// -------------------------------------- fehlerunionen (errors.rs)
+//
+// Portierung der Typpruefung fuer `try`, `catch`, `Menge::Variante` und die
+// implizite Umwandlung. Wie ueberall in dieser Datei: Fehler werden
+// GEZAEHLT, nicht beschrieben.
+
+// `try a` (check_try in errors.rs). Liefert den Erfolgstyp der Union.
+fn try_pruefen(s: *mut Sema, e: u32) -> u32 {
+    let b: *mut ast.Baum = baum(s)
+    let arg: u32 = ast.kind_at(b, ast.e_b(b, e))
+    let got: u32 = ausdruck(s, arg, KEIN)
+    let u: u32 = fehler.fehler_union_von_typ(fe(s), tafel(s), got)
+    if u == KEIN {
+        // 'try' erwartet einen wert einer fehlerunion
+        if !ist_fehler(s, got) {
+            meckern(s)
+        }
+        return (*s).t_fehler
+    }
+    let val: u32 = fehler.fehler_u_valty(fe(s), u)
+    let ru: u32 = fehler.fehler_union_von_typ(fe(s), tafel(s), (*s).ret)
+    if ru == KEIN {
+        // 'try' ausserhalb einer funktion mit fehlerunions-rueckgabetyp
+        meckern(s)
+        return val
+    }
+    if fehler.fehler_u_set(fe(s), ru) != fehler.fehler_u_set(fe(s), u) {
+        // beide fehlermengen muessen dieselbe sein
+        meckern(s)
+        return val
+    }
+    fehler.fehler_try_setzen(fe(s), e, u)
+    return val
+}
+
+// `a catch b` (check_catch in errors.rs). Liefert den Erfolgstyp der Union.
+fn catch_pruefen(s: *mut Sema, e: u32) -> u32 {
+    let b: *mut ast.Baum = baum(s)
+    let off: u32 = ast.e_b(b, e)
+    let lhs: u32 = ast.kind_at(b, off)
+    let rhs: u32 = ast.kind_at(b, off + 1)
+    let got: u32 = ausdruck(s, lhs, KEIN)
+    let u: u32 = fehler.fehler_union_von_typ(fe(s), tafel(s), got)
+    if u == KEIN {
+        // 'catch' erwartet links einen wert einer fehlerunion
+        if !ist_fehler(s, got) {
+            meckern(s)
+        }
+        austypen(s, rhs)
+        return (*s).t_fehler
+    }
+    let want: u32 = fehler.fehler_u_valty(fe(s), u)
+    // `catch |f| ersatz`: der Fehlerwert ist im Ersatz sichtbar — mit dem
+    // Typ der MENGE (dem reinen Fehlerwert).
+    let bind: u32 = fehler.fehler_cb(fe(s), e)
+    if bind != KEIN {
+        bereich_auf(s)
+        let st: u32 = fehler.fehler_set_typ(fe(s), tafel(s),
+                                            fehler.fehler_u_set(fe(s), u))
+        var_anlegen(s, bind, st)
+    }
+    let rt: u32 = ausdruck(s, rhs, want)
+    if bind != KEIN {
+        bereich_zu(s)
+    }
+    if !ist_fehler(s, rt) && !typen.vertraeglich(tafel(s), rt, want) {
+        meckern(s)
+    }
+    fehler.fehler_catch_setzen(fe(s), e, u)
+    return want
+}
+
+// `Menge::Variante` — der reine Fehlerwert (der Konstruktor-Ast von
+// errors.rs::hook_call). Die Menge existiert; das hat der Aufrufer geprueft.
+fn fehler_ctor_pruefen(s: *mut Sema, en: u32, e: u32) -> u32 {
+    let b: *mut ast.Baum = baum(s)
+    let off: u32 = ast.e_b(b, e)
+    let anz: u32 = ast.e_c(b, e)
+    var k: u32 = 0
+    while k < anz {
+        austypen(s, ast.kind_at(b, off + k))
+        k = k + 1
+    }
+    if anz > 0 {
+        // die fehlervariante traegt keine nutzdaten
+        meckern(s)
+    }
+    if fehler.fehler_ctor_code((*s).feh, namen(s), ast.e_a(b, e)) < 0 {
+        // unbekannte variante
+        meckern(s)
+        return (*s).t_fehler
+    }
+    return fehler.fehler_set_typ(fe(s), tafel(s),
+                                 fehler.fehler_menge_finden(fe(s), en))
+}
+
+// Implizite Umwandlung in eine Fehlerunion an `return`/`let`/Zuweisung/
+// Argument/Feld (hook_coerce in errors.rs). Liefert false, wenn `want`
+// keine Fehlerunion ist — dann laeuft die gewoehnliche Pruefung.
+fn coerce_pruefen(s: *mut Sema, e: u32, want: u32) -> bool {
+    let u: u32 = fehler.fehler_union_von_typ(fe(s), tafel(s), want)
+    if u == KEIN {
+        return false
+    }
+    let uv: u32 = fehler.fehler_u_valty(fe(s), u)
+    let got: u32 = ausdruck(s, e, uv)
+    if ist_fehler(s, got) {
+        return true
+    }
+    if typen.typ_gleich(tafel(s), got, want) {
+        // schon eine Fehlerunion — nichts umzuwandeln
+        return true
+    }
+    let sm: u32 = fehler.fehler_set_von_typ(fe(s), tafel(s), got)
+    if sm != KEIN {
+        if sm == fehler.fehler_u_set(fe(s), u) {
+            fehler.fehler_coerce_setzen(fe(s), e, fehler.FEHLER_AUS_FEHLER, u)
+            return true
+        }
+        // fehlerwert einer anderen menge
+        meckern(s)
+        return true
+    }
+    if typen.vertraeglich(tafel(s), got, uv) {
+        fehler.fehler_coerce_setzen(fe(s), e, fehler.FEHLER_AUS_WERT, u)
+        return true
+    }
+    meckern(s)
+    return true
+}
+
+// Ist der Ausdruck ERKENNBAR ein Fehlerwert (`quiet_set` in errors.rs):
+// eine Variante `E::V` oder eine Variable vom Typ einer Fehlermenge.
+fn fehler_ruhig_set(s: *mut Sema, e: u32) -> u32 {
+    let b: *mut ast.Baum = baum(s)
+    let a: u32 = ast.e_art(b, e)
+    if a == ast.E_RUF {
+        var en: u32 = KEIN
+        var vn: u32 = KEIN
+        fehler.fehler_name_teilen((*s).feh, namen(s), ast.e_a(b, e), &en, &vn)
+        if en != KEIN {
+            return fehler.fehler_menge_finden(fe(s), en)
+        }
+        return KEIN
+    }
+    if a == ast.E_ID {
+        let v: u32 = var_suchen(s, ast.e_a(b, e))
+        if v != KEIN {
+            return fehler.fehler_set_von_typ(fe(s), tafel(s), v)
+        }
+    }
+    return KEIN
+}
+
 fn bedingung(s: *mut Sema, e: u32) {
     let t: u32 = ausdruck(s, e, (*s).t_bool)
     if !ist_fehler(s, t) && !ist_bool(s, t) {
@@ -1309,9 +1539,16 @@ fn anweisung(s: *mut Sema, i: u32) {
         var t: u32 = 0
         if te != ast.NICHTS {
             let d: u32 = ast_typ(s, te)
-            let got: u32 = ausdruck(s, ast.s_c(b, i), d)
-            if !typen.vertraeglich(tafel(s), got, d) {
-                meckern(s)
+            // HOOK fehlerunionen: implizite Umwandlung bei 'let'.
+            var umgewandelt: bool = false
+            if hat_fe(s) {
+                umgewandelt = coerce_pruefen(s, ast.s_c(b, i), d)
+            }
+            if !umgewandelt {
+                let got: u32 = ausdruck(s, ast.s_c(b, i), d)
+                if !typen.vertraeglich(tafel(s), got, d) {
+                    meckern(s)
+                }
             }
             t = d
         } else {
@@ -1330,6 +1567,10 @@ fn anweisung(s: *mut Sema, i: u32) {
         let t: u32 = lwert(s, ast.s_a(b, i))
         if t == KEIN {
             ausdruck(s, ast.s_b(b, i), (*s).t_i64)
+            return
+        }
+        // HOOK fehlerunionen: implizite Umwandlung bei der Zuweisung.
+        if hat_fe(s) && coerce_pruefen(s, ast.s_b(b, i), t) {
             return
         }
         let got: u32 = ausdruck(s, ast.s_b(b, i), t)
@@ -1390,6 +1631,11 @@ fn anweisung(s: *mut Sema, i: u32) {
             meckern(s)
             return
         }
+        // HOOK fehlerunionen: implizite Umwandlung bei 'return'
+        // (errors.rs::hook_coerce in check_stmt).
+        if hat_fe(s) && coerce_pruefen(s, ast.s_a(b, i), w) {
+            return
+        }
         let got: u32 = ausdruck(s, ast.s_a(b, i), w)
         if !typen.vertraeglich(tafel(s), got, w) {
             meckern(s)
@@ -1401,7 +1647,16 @@ fn anweisung(s: *mut Sema, i: u32) {
         return
     }
     if a == ast.S_EXPR {
-        ausdruck(s, ast.s_a(b, i), KEIN)
+        let e2: u32 = ast.s_a(b, i)
+        let et: u32 = ausdruck(s, e2, KEIN)
+        // HOOK fehlerunionen: ein `E!T`-Wert ist implizit #[must_consume] —
+        // das Ergebnis eines Aufrufs darf nicht verworfen werden
+        // (sema.rs::check_discard, SPEC §5.1).
+        if hat_fe(s) && ast.e_art(b, e2) == ast.E_RUF {
+            if fehler.fehler_union_von_typ(fe(s), tafel(s), et) != KEIN {
+                meckern(s)
+            }
+        }
         return
     }
     if a == ast.S_BLOCK {
@@ -1436,9 +1691,27 @@ fn sema_lauf(s: *mut Sema) {
     if hat_mu(s) {
         muster.mus_anmelden(mu(s), tafel(s))
     }
+    // 0b. Fehlermengen: NAMEN anmelden — nach den Aufzaehlungen, vor den
+    //    Structs des Baums, genau wie `declare_error_sets` in Stufe 0. Die
+    //    Typaufloesung bekommt das Register, damit sie `__eu#<n>`-Platzhalter
+    //    aufloesen kann.
+    var fe_bisher: usize = 0
+    if hat_fe(s) {
+        fehler.fehler_anmelden((*s).feh, tafel(s), namen(s))
+        typen.typen_fehler_setzen(tafel(s), (*s).feh)
+    }
     // 1. Structlayout und Funktionssignaturen — dieselbe Rechnung wie in
     //    `typen.fi`, hier einmal fuer alles.
     typen.typen_aufloesen(tafel(s), b, namen(s))
+    if hat_fe(s) {
+        // Fehler aus der Registrierung mitzaehlen (doppelte Mengen,
+        // unbekannte Mengen, Unionen als verbotener Feldtyp).
+        let fj: usize = fehler.fehler_fehler(fe(s))
+        while fe_bisher < fj {
+            meckern(s)
+            fe_bisher = fe_bisher + 1
+        }
+    }
     // 1b. Aufzaehlungen: LAYOUTS eintragen — nach dem Structlayout der
     //    Handstructschreibungen, vor jedem Gebrauch (`layout_enums` in
     //    Stufe 0). Fehler daraus zaehlen mit.
@@ -1504,4 +1777,13 @@ fn sema_lauf(s: *mut Sema) {
         i = i + 1
     }
     bereich_zu(s)
+    if hat_fe(s) {
+        // Unionen, die erst in einem RUMPF aufgeloest wurden (etwa
+        // `let r: E!i32 = ...`), koennen dort noch Fehler gezaehlt haben.
+        let fj: usize = fehler.fehler_fehler(fe(s))
+        while fe_bisher < fj {
+            meckern(s)
+            fe_bisher = fe_bisher + 1
+        }
+    }
 }

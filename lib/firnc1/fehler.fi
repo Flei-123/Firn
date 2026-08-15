@@ -1,0 +1,581 @@
+// lib/firnc1/fehler.fi — FEHLERUNIONEN `E!T`: DIE REGISTRIERUNG, IN FIRN.
+//
+// Dreizehnter Teil von Stufe 1: die Portierung des Datenmodells von
+// `compiler/src/errors.rs`. Derselbe Aufbau wie `muster.fi` (Runde 32): die
+// Registrierung liegt AUSSERHALB des Baums, weil sie ueber alle Dateien
+// einer Uebersetzung hinweg dieselbe sein muss (Fehlermengennamen gelten
+// programmweit, SPEC §14.1) — und weil der Baum flach bleibt: `try x` und
+// `x catch y` stehen im Baum als Aufruf `__try#` bzw. `__catch#`, genau wie
+// Stufe 0 sie in `--emit=ast-kanon` druckt.
+//
+// SPEICHERLAYOUT (verbindlich, SPEC §5.1):
+//   error IoError { NotFound, Permission, Closed }   // Codes 1, 2, 3
+//   IoError      -> struct { __err: u32 }              (nur der Code)
+//   IoError!i32  -> struct { __err: u32, __val: i32 }  (0 = Erfolg)
+//
+// Damit ist eine Fehlerunion ein GEWOEHNLICHER Struct im Typkontext;
+// Aggregatrueckgabe und Codegen tragen sie unveraendert. Die Seitentabellen
+// hier spielen dieselbe Rolle wie `enum_by_struct` in Stufe 0.
+//
+// DIE TYPANGABE `E!T` kennt der Parser noch nicht als Typ — er legt einen
+// Platzhalter `__eu#<nummer>` in den Baum (das `#` kann nie in einem
+// Bezeichner aus dem Quelltext stehen) und die Angabe selbst in `p_set`/
+// `p_te`. Aufgeloest wird sie erst in `typen.aufloesen`, das ueber
+// `fehler_platzhalter`/`fehler_typ` hierher rueckfragt — derselbe
+// Uebergabepunkt wie `hook_resolve_ty` in Stufe 0.
+//
+// WAEHREND DER STRUCTPHASE (die Layouts der Baum-Structs stehen noch nicht
+// fest) kann eine Union ueber einem Struct nicht ausgelegt werden; Stufe 0
+// lehnt sie dort als Feldtyp ab. `fehler_structphase` meldet das Fenster,
+// `fehler_typ` zaehlt den Fehler.
+
+import rt
+import vec
+import intern
+import ast
+import typen
+
+export { Fehler, fehler_neu, fehler_frei, fehler_fehler,
+         fehler_menge_dazu, fehler_variante_dazu, fehler_menge_finden,
+         fehler_menge_anzahl, fehler_pending_dazu, fehler_platzhalter,
+         fehler_typ, fehler_anmelden, fehler_structphase,
+         fehler_ist_tryname, fehler_ist_catchname, fehler_ist_ergebnisname,
+         fehler_cb_setzen, fehler_cb,
+         fehler_try_setzen, fehler_try,
+         fehler_catch_setzen, fehler_catch,
+         fehler_coerce_setzen, fehler_coerce_offen, fehler_coerce_art,
+         fehler_busy_auf, fehler_busy_zu,
+         fehler_union_von_typ, fehler_set_von_typ,
+         fehler_u_set, fehler_u_valty, fehler_u_voff, fehler_u_sidx,
+         fehler_union_typ, fehler_set_typ,
+         fehler_ctor_code, fehler_name_teilen,
+         FEHLER_AUS_WERT, FEHLER_AUS_FEHLER }
+
+const KEIN: u32 = 4294967295
+
+// Umwandlungsarten (CoerceKind in errors.rs)
+const FEHLER_AUS_WERT: u32 = 1    // `return wert` — Erfolg, __err = 0
+const FEHLER_AUS_FEHLER: u32 = 2  // `return E::Variante` — Fehler, __err = code
+
+struct Fehler {
+    // Fehlermengen
+    s_name: Vec[u32],
+    s_sidx: Vec[u32],       // Structindex in typen.Typen
+    s_voff: Vec[u32], s_vlen: Vec[u32],
+    v_name: Vec[u32],       // Varianten aller Mengen, hintereinander
+
+    // ausstehende `E!T`-Typangaben (zwischen Parser und Typaufloesung)
+    p_set: Vec[u32],        // Mengenname (Nummer im Interner)
+    p_te: Vec[u32],         // innerer Typknoten (Baum)
+
+    // konkrete Fehlerunionen
+    u_set: Vec[u32],        // Mengenindex
+    u_sidx: Vec[u32],       // Structindex in typen.Typen
+    u_valty: Vec[u32],      // aufgeloester Erfolgstyp
+    u_voff: Vec[u64],       // Versatz von __val
+
+    // je Ausdruck (die Listen wachsen auf Anfrage, 0 = nichts eingetragen)
+    x_try: Vec[u32],        // Union + 1
+    x_catch: Vec[u32],      // Union + 1
+    x_coart: Vec[u32],      // FEHLER_AUS_* oder 0
+    x_couni: Vec[u32],      // Union
+    x_busy: Vec[u32],       // 1 = die Umwandlung laeuft gerade (BUSY in Stufe 0)
+
+    // `catch |e| ...`: Name der Bindung je catch-Ausdruck (spaerlich)
+    cb_aus: Vec[u32],
+    cb_name: Vec[u32],
+
+    kladde: rt.Buf,
+    fehler: usize,
+    in_structs: bool,       // die Structphase laeuft (hook_struct_phase)
+}
+
+fn fehler_neu() -> Fehler {
+    return Fehler{
+        s_name: vec_neu[u32](), s_sidx: vec_neu[u32](),
+        s_voff: vec_neu[u32](), s_vlen: vec_neu[u32](),
+        v_name: vec_neu[u32](),
+        p_set: vec_neu[u32](), p_te: vec_neu[u32](),
+        u_set: vec_neu[u32](), u_sidx: vec_neu[u32](),
+        u_valty: vec_neu[u32](), u_voff: vec_neu[u64](),
+        x_try: vec_neu[u32](), x_catch: vec_neu[u32](),
+        x_coart: vec_neu[u32](), x_couni: vec_neu[u32](), x_busy: vec_neu[u32](),
+        cb_aus: vec_neu[u32](), cb_name: vec_neu[u32](),
+        kladde: rt.buf_neu(),
+        fehler: 0, in_structs: false,
+    }
+}
+
+fn fehler_frei(f: *mut Fehler) {
+    vec_frei[u32](&(*f).s_name)
+    vec_frei[u32](&(*f).s_sidx)
+    vec_frei[u32](&(*f).s_voff)
+    vec_frei[u32](&(*f).s_vlen)
+    vec_frei[u32](&(*f).v_name)
+    vec_frei[u32](&(*f).p_set)
+    vec_frei[u32](&(*f).p_te)
+    vec_frei[u32](&(*f).u_set)
+    vec_frei[u32](&(*f).u_sidx)
+    vec_frei[u32](&(*f).u_valty)
+    vec_frei[u64](&(*f).u_voff)
+    vec_frei[u32](&(*f).x_try)
+    vec_frei[u32](&(*f).x_catch)
+    vec_frei[u32](&(*f).x_coart)
+    vec_frei[u32](&(*f).x_couni)
+    vec_frei[u32](&(*f).x_busy)
+    vec_frei[u32](&(*f).cb_aus)
+    vec_frei[u32](&(*f).cb_name)
+    rt.buf_frei(&(*f).kladde)
+}
+
+fn fehler_fehler(f: *mut Fehler) -> usize { return (*f).fehler }
+
+// --------------------------------------------------------------- Mengen
+
+fn fehler_menge_finden(f: *mut Fehler, name: u32) -> u32 {
+    var i: usize = 0
+    while i < vec_len[u32](&(*f).s_name) {
+        if vec_at[u32](&(*f).s_name, i) == name {
+            return i as u32
+        }
+        i = i + 1
+    }
+    return KEIN
+}
+
+fn fehler_menge_anzahl(f: *mut Fehler) -> usize { return vec_len[u32](&(*f).s_name) }
+
+// Neue Fehlermenge. KEIN, wenn es den Namen schon gibt — der Aufrufer
+// (Parser) meldet den Fehler, weil er ihn zu seiner eigenen Zaehlung geben
+// will (Stufe 0: `errors_decl` meldet ueber die Parser-Diagnose).
+fn fehler_menge_dazu(f: *mut Fehler, name: u32) -> u32 {
+    if fehler_menge_finden(f, name) != KEIN {
+        return KEIN
+    }
+    let i: u32 = vec_len[u32](&(*f).s_name) as u32
+    vec_push[u32](&(*f).s_name, name)
+    vec_push[u32](&(*f).s_sidx, KEIN)
+    vec_push[u32](&(*f).s_voff, vec_len[u32](&(*f).v_name) as u32)
+    vec_push[u32](&(*f).s_vlen, 0)
+    return i
+}
+
+// Neue Variante. false, wenn es sie in dieser Menge schon gibt.
+fn fehler_variante_dazu(f: *mut Fehler, si: u32, name: u32) -> bool {
+    let voff: u32 = vec_at[u32](&(*f).s_voff, si as usize)
+    let vlen: u32 = vec_at[u32](&(*f).s_vlen, si as usize)
+    var k: u32 = 0
+    while k < vlen {
+        if vec_at[u32](&(*f).v_name, (voff + k) as usize) == name {
+            return false
+        }
+        k = k + 1
+    }
+    vec_push[u32](&(*f).v_name, name)
+    vec_setzen[u32](&(*f).s_vlen, si as usize, vlen + 1)
+    return true
+}
+
+// Code einer Variante (ab 1, Deklarationsreihenfolge), 0 wenn unbekannt.
+fn varianten_code(f: *mut Fehler, si: u32, name: u32) -> u32 {
+    let voff: u32 = vec_at[u32](&(*f).s_voff, si as usize)
+    let vlen: u32 = vec_at[u32](&(*f).s_vlen, si as usize)
+    var k: u32 = 0
+    while k < vlen {
+        if vec_at[u32](&(*f).v_name, (voff + k) as usize) == name {
+            return k + 1
+        }
+        k = k + 1
+    }
+    return 0
+}
+
+// ------------------------------------------------- ausstehende Typangaben
+
+fn fehler_pending_dazu(f: *mut Fehler, set: u32, te: u32) -> u32 {
+    let i: u32 = vec_len[u32](&(*f).p_set) as u32
+    vec_push[u32](&(*f).p_set, set)
+    vec_push[u32](&(*f).p_te, te)
+    return i
+}
+
+// Ist `name` ein Platzhalter `__eu#<nummer>`? Liefert die Nummer, sonst -1.
+fn fehler_platzhalter(it: *mut intern.Interner, name: u32) -> i64 {
+    let p: u64 = intern.intern_zeiger(it, name)
+    let n: usize = intern.intern_laenge(it, name)
+    if n < 6 {
+        return -1
+    }
+    var pfx: [u8; 5] = "__eu#"
+    if !rt.mem_eq(p, (&pfx[0]) as u64, 5) {
+        return -1
+    }
+    var v: i64 = 0
+    var i: usize = 5
+    while i < n {
+        let z: u8 = rt.ld8(p, i)
+        if z < 48 as u8 || z > 57 as u8 {
+            return -1
+        }
+        v = v * 10 + (z - 48 as u8) as i64
+        i = i + 1
+    }
+    return v
+}
+
+// Enthaelt der aufgeloeste Typ einen Struct DEM WERT NACH? (Zeiger
+// unterbrechen — `contains_struct` in errors.rs.)
+fn enthaelt_struct(t: *mut typen.Typen, ty: u32) -> bool {
+    let k: u32 = typen.ty_art(t, ty)
+    if k == typen.K_STRUCT {
+        return true
+    }
+    if k == typen.K_ARR {
+        return enthaelt_struct(t, typen.ty_a(t, ty))
+    }
+    return false
+}
+
+// Union zu einem Structindex, oder KEIN (`union_by_struct` in Stufe 0).
+fn fehler_union_bei_struct(f: *mut Fehler, sidx: u32) -> u32 {
+    var i: usize = 0
+    while i < vec_len[u32](&(*f).u_sidx) {
+        if vec_at[u32](&(*f).u_sidx, i) == sidx {
+            return i as u32
+        }
+        i = i + 1
+    }
+    return KEIN
+}
+
+// Menge zu einem Structindex, oder KEIN (`set_by_struct` in Stufe 0).
+fn fehler_set_bei_struct(f: *mut Fehler, sidx: u32) -> u32 {
+    var i: usize = 0
+    while i < vec_len[u32](&(*f).s_sidx) {
+        if vec_at[u32](&(*f).s_sidx, i) == sidx {
+            return i as u32
+        }
+        i = i + 1
+    }
+    return KEIN
+}
+
+// Fehlerunion zu einem aufgeloesten Typ (`union_of` in Stufe 0).
+fn fehler_union_von_typ(f: *mut Fehler, t: *mut typen.Typen, ty: u32) -> u32 {
+    if typen.ty_art(t, ty) != typen.K_STRUCT {
+        return KEIN
+    }
+    return fehler_union_bei_struct(f, typen.ty_a(t, ty))
+}
+
+// Fehlermenge zu einem aufgeloesten Typ (`set_name_of` in Stufe 0).
+fn fehler_set_von_typ(f: *mut Fehler, t: *mut typen.Typen, ty: u32) -> u32 {
+    if typen.ty_art(t, ty) != typen.K_STRUCT {
+        return KEIN
+    }
+    return fehler_set_bei_struct(f, typen.ty_a(t, ty))
+}
+
+// Legt die Union `sm!val_ty` als Struct im Typkontext an — oder findet sie
+// wieder. Der Name ist `<menge>!<name des erfolgstyps>`, genau die Form aus
+// `TypeCtx::name_of`; weil `!` nie in einem Quelltext-Bezeichner steht,
+// kollidiert er mit nichts. (`get_or_create_union` in errors.rs.)
+fn fehler_union_bauen(f: *mut Fehler, t: *mut typen.Typen,
+                      it: *mut intern.Interner, sm: u32, val_ty: u32) -> u32 {
+    rt.buf_leeren(&(*f).kladde)
+    let sn: u32 = vec_at[u32](&(*f).s_name, sm as usize)
+    rt.buf_push_bytes(&(*f).kladde, intern.intern_zeiger(it, sn),
+                      intern.intern_laenge(it, sn))
+    rt.buf_push(&(*f).kladde, 33 as u8)
+    typen.name_von(t, it, &(*f).kladde, val_ty)
+    let nr: u32 = intern.intern_nummer(it, rt.buf_ptr(&(*f).kladde),
+                                       rt.buf_len(&(*f).kladde)) as u32
+    let vorhanden: i32 = typen.struct_index(t, nr)
+    if vorhanden >= 0 {
+        return typen.neuer_typ(t, typen.K_STRUCT, vorhanden as u32, 0)
+    }
+    let idx: u32 = typen.typen_struct_anhaengen(t, nr)
+    // Das Layout ist das eines gewoehnlichen Structs: __err @ 0 (u32), __val
+    // dahinter mit natuerlicher Ausrichtung; die Ausrichtung des Ganzen ist
+    // mindestens 4 (die des Codes).
+    var va: u64 = typen.ausrichtung_von(t, val_ty)
+    if va < 1 { va = 1 }
+    let voff: u64 = typen.aufrunden(4, va)
+    var ausricht: u64 = va
+    if ausricht < 4 { ausricht = 4 }
+    let groesse: u64 = typen.aufrunden(voff + typen.groesse_von(t, val_ty), ausricht)
+    var namen: Vec[u32] = vec_neu[u32]()
+    var typen_v: Vec[u32] = vec_neu[u32]()
+    var vers: Vec[u64] = vec_neu[u64]()
+    var en: [u8; 5] = "__err"
+    var vn: [u8; 5] = "__val"
+    vec_push[u32](&namen, intern.intern_nummer(it, (&en[0]) as u64, 5) as u32)
+    vec_push[u32](&typen_v, typen.neuer_typ(t, typen.K_U32, 0, 0))
+    vec_push[u64](&vers, 0)
+    vec_push[u32](&namen, intern.intern_nummer(it, (&vn[0]) as u64, 5) as u32)
+    vec_push[u32](&typen_v, val_ty)
+    vec_push[u64](&vers, voff)
+    typen.typen_struct_festlegen(t, idx, groesse, ausricht, &namen, &typen_v, &vers)
+    vec_frei[u32](&namen)
+    vec_frei[u32](&typen_v)
+    vec_frei[u64](&vers)
+    vec_push[u32](&(*f).u_set, sm)
+    vec_push[u32](&(*f).u_sidx, idx)
+    vec_push[u32](&(*f).u_valty, val_ty)
+    vec_push[u64](&(*f).u_voff, voff)
+    return typen.neuer_typ(t, typen.K_STRUCT, idx, 0)
+}
+
+// HOOK in `typen.aufloesen`: loest eine Platzhalter-Typangabe `E!T` auf
+// (`hook_resolve_ty` in errors.rs). Fehler werden hier gezaehlt; `sema`
+// uebernimmt sie in seine eigene Zaehlung.
+fn fehler_typ(feh: u64, t: *mut typen.Typen, b: *mut ast.Baum,
+              it: *mut intern.Interner, pi: u32) -> u32 {
+    let f: *mut Fehler = feh as *mut Fehler
+    let set: u32 = vec_at[u32](&(*f).p_set, pi as usize)
+    let te: u32 = vec_at[u32](&(*f).p_te, pi as usize)
+    let sm: u32 = fehler_menge_finden(f, set)
+    if sm == KEIN {
+        // unbekannte fehlermenge
+        (*f).fehler = (*f).fehler + 1
+        return typen.neuer_typ(t, typen.K_FEHLER, 0, 0)
+    }
+    let val_ty: u32 = typen.aufloesen(t, b, it, te)
+    if typen.ty_art(t, val_ty) == typen.K_FEHLER {
+        return val_ty
+    }
+    if typen.ty_art(t, val_ty) == typen.K_VOID {
+        // der erfolgstyp einer fehlerunion kann nicht '()' sein
+        (*f).fehler = (*f).fehler + 1
+        return typen.neuer_typ(t, typen.K_FEHLER, 0, 0)
+    }
+    if (*f).in_structs && enthaelt_struct(t, val_ty) {
+        // Waehrend der Structphase stehen die Struct-Layouts noch nicht
+        // fest — ein klarer Fehler statt eines stillen Fehl-Layouts
+        // (SPEC §14.1.fehlerunionen F10).
+        (*f).fehler = (*f).fehler + 1
+        return typen.neuer_typ(t, typen.K_FEHLER, 0, 0)
+    }
+    return fehler_union_bauen(f, t, it, sm, val_ty)
+}
+
+// Meldet jede Fehlermenge als Struct `{ __err: u32 }` an
+// (`declare_error_sets` in errors.rs). Muss VOR `typen.typen_aufloesen`
+// laufen, NACH `muster.mus_anmelden` — dieselbe Reihenfolge wie Stufe 0
+// (`declare_enums`, dann `declare_error_sets`, dann `collect_structs`).
+fn fehler_anmelden(feh: u64, t: *mut typen.Typen, it: *mut intern.Interner) {
+    let f: *mut Fehler = feh as *mut Fehler
+    var en: [u8; 5] = "__err"
+    let enr: u32 = intern.intern_nummer(it, (&en[0]) as u64, 5) as u32
+    let t_u32: u32 = typen.neuer_typ(t, typen.K_U32, 0, 0)
+    var i: usize = 0
+    while i < vec_len[u32](&(*f).s_name) {
+        let name: u32 = vec_at[u32](&(*f).s_name, i)
+        if typen.struct_index(t, name) >= 0 {
+            // typ ist bereits deklariert
+            (*f).fehler = (*f).fehler + 1
+        }
+        let idx: u32 = typen.typen_struct_vormerken(t, name)
+        vec_setzen[u32](&(*f).s_sidx, i, idx)
+        var namen: Vec[u32] = vec_neu[u32]()
+        var typen_v: Vec[u32] = vec_neu[u32]()
+        var vers: Vec[u64] = vec_neu[u64]()
+        vec_push[u32](&namen, enr)
+        vec_push[u32](&typen_v, t_u32)
+        vec_push[u64](&vers, 0)
+        typen.typen_struct_festlegen(t, idx, 4, 4, &namen, &typen_v, &vers)
+        vec_frei[u32](&namen)
+        vec_frei[u32](&typen_v)
+        vec_frei[u64](&vers)
+        i = i + 1
+    }
+}
+
+// Meldet den Beginn/das Ende der Structphase (`hook_struct_phase`).
+fn fehler_structphase(feh: u64, aktiv: bool) {
+    let f: *mut Fehler = feh as *mut Fehler
+    (*f).in_structs = aktiv
+}
+
+// ------------------------------------------------------ Namen der Aufrufe
+
+fn hat_praefix(it: *mut intern.Interner, name: u32, pfx: *mut u8, n: usize) -> bool {
+    if intern.intern_laenge(it, name) != n {
+        return false
+    }
+    return rt.mem_eq(intern.intern_zeiger(it, name), pfx as u64, n)
+}
+
+// `__try#` — der interne Name eines `try`-Ausdrucks (TRY_NAME in errors.rs).
+fn fehler_ist_tryname(it: *mut intern.Interner, name: u32) -> bool {
+    var pfx: [u8; 6] = "__try#"
+    return hat_praefix(it, name, &pfx[0], 6)
+}
+
+// `__catch#` — der interne Name eines `catch`-Ausdrucks (CATCH_NAME).
+fn fehler_ist_catchname(it: *mut intern.Interner, name: u32) -> bool {
+    var pfx: [u8; 8] = "__catch#"
+    return hat_praefix(it, name, &pfx[0], 8)
+}
+
+fn fehler_ist_ergebnisname(it: *mut intern.Interner, name: u32) -> bool {
+    return fehler_ist_tryname(it, name) || fehler_ist_catchname(it, name)
+}
+
+// Teilt `Menge::Variante` an der ERSTEN Doppelpunktsstelle. `en`/`vn` sind
+// Nummern im Interner; KEIN, wenn es keinen Doppelpunkt gibt.
+fn fehler_name_teilen(feh: u64, it: *mut intern.Interner, name: u32,
+                      en: *mut u32, vn: *mut u32) {
+    let p: u64 = intern.intern_zeiger(it, name)
+    let n: usize = intern.intern_laenge(it, name)
+    var i: usize = 0
+    while i + 1 < n {
+        if rt.ld8(p, i) == 58 as u8 && rt.ld8(p, i + 1) == 58 as u8 {
+            *en = intern.intern_nummer(it, p, i) as u32
+            *vn = intern.intern_nummer(it, p + (i + 2) as u64, n - i - 2) as u32
+            return
+        }
+        i = i + 1
+    }
+    *en = KEIN
+    *vn = KEIN
+}
+
+// Code von `Menge::Variante` (ab 1); -1, wenn das kein Fehlerwert ist.
+fn fehler_ctor_code(feh: u64, it: *mut intern.Interner, name: u32) -> i64 {
+    let f: *mut Fehler = feh as *mut Fehler
+    var en: u32 = KEIN
+    var vn: u32 = KEIN
+    fehler_name_teilen(feh, it, name, &en, &vn)
+    if en == KEIN {
+        return -1
+    }
+    let sm: u32 = fehler_menge_finden(f, en)
+    if sm == KEIN {
+        return -1
+    }
+    let c: u32 = varianten_code(f, sm, vn)
+    if c == 0 {
+        return -1
+    }
+    return c as i64
+}
+
+// ------------------------------------------------------ je Ausdruck
+
+// Laesst die Ausdruckslisten bis einschliesslich `e` wachsen.
+fn slot(f: *mut Fehler, e: u32) {
+    while vec_len[u32](&(*f).x_try) <= e as usize {
+        vec_push[u32](&(*f).x_try, 0)
+        vec_push[u32](&(*f).x_catch, 0)
+        vec_push[u32](&(*f).x_coart, 0)
+        vec_push[u32](&(*f).x_couni, 0)
+        vec_push[u32](&(*f).x_busy, 0)
+    }
+}
+
+fn fehler_try_setzen(f: *mut Fehler, e: u32, u: u32) {
+    slot(f, e)
+    vec_setzen[u32](&(*f).x_try, e as usize, u + 1)
+}
+
+// Die Union des `try`-Ausdrucks e, oder KEIN (`try_of` in errors.rs).
+fn fehler_try(f: *mut Fehler, e: u32) -> u32 {
+    if e as usize >= vec_len[u32](&(*f).x_try) {
+        return KEIN
+    }
+    let v: u32 = vec_at[u32](&(*f).x_try, e as usize)
+    if v == 0 {
+        return KEIN
+    }
+    return v - 1
+}
+
+fn fehler_catch_setzen(f: *mut Fehler, e: u32, u: u32) {
+    slot(f, e)
+    vec_setzen[u32](&(*f).x_catch, e as usize, u + 1)
+}
+
+fn fehler_catch(f: *mut Fehler, e: u32) -> u32 {
+    if e as usize >= vec_len[u32](&(*f).x_catch) {
+        return KEIN
+    }
+    let v: u32 = vec_at[u32](&(*f).x_catch, e as usize)
+    if v == 0 {
+        return KEIN
+    }
+    return v - 1
+}
+
+fn fehler_coerce_setzen(f: *mut Fehler, e: u32, art: u32, u: u32) {
+    slot(f, e)
+    vec_setzen[u32](&(*f).x_coart, e as usize, art)
+    vec_setzen[u32](&(*f).x_couni, e as usize, u)
+}
+
+// Die an einem Ausdruck vorgemerkte Umwandlung, sofern sie nicht gerade
+// selbst erzeugt wird (`pending_coerce` mit BUSY in lower_errors.rs).
+fn fehler_coerce_offen(f: *mut Fehler, e: u32) -> u32 {
+    if e as usize >= vec_len[u32](&(*f).x_coart) {
+        return KEIN
+    }
+    if vec_at[u32](&(*f).x_coart, e as usize) == 0 {
+        return KEIN
+    }
+    if vec_at[u32](&(*f).x_busy, e as usize) != 0 {
+        return KEIN
+    }
+    return vec_at[u32](&(*f).x_couni, e as usize)
+}
+
+fn fehler_coerce_art(f: *mut Fehler, e: u32) -> u32 {
+    if e as usize >= vec_len[u32](&(*f).x_coart) {
+        return 0
+    }
+    return vec_at[u32](&(*f).x_coart, e as usize)
+}
+
+fn fehler_busy_auf(f: *mut Fehler, e: u32) {
+    slot(f, e)
+    vec_setzen[u32](&(*f).x_busy, e as usize, 1)
+}
+
+fn fehler_busy_zu(f: *mut Fehler, e: u32) {
+    slot(f, e)
+    vec_setzen[u32](&(*f).x_busy, e as usize, 0)
+}
+
+// `catch |e| ...`: Name der Bindung je Ausdruck (`catch_bind` in errors.rs).
+fn fehler_cb_setzen(f: *mut Fehler, e: u32, name: u32) {
+    vec_push[u32](&(*f).cb_aus, e)
+    vec_push[u32](&(*f).cb_name, name)
+}
+
+fn fehler_cb(f: *mut Fehler, e: u32) -> u32 {
+    var i: usize = 0
+    while i < vec_len[u32](&(*f).cb_aus) {
+        if vec_at[u32](&(*f).cb_aus, i) == e {
+            return vec_at[u32](&(*f).cb_name, i)
+        }
+        i = i + 1
+    }
+    return KEIN
+}
+
+// ------------------------------------------------------------- Union lesen
+
+fn fehler_u_set(f: *mut Fehler, u: u32) -> u32 { return vec_at[u32](&(*f).u_set, u as usize) }
+fn fehler_u_sidx(f: *mut Fehler, u: u32) -> u32 { return vec_at[u32](&(*f).u_sidx, u as usize) }
+fn fehler_u_valty(f: *mut Fehler, u: u32) -> u32 { return vec_at[u32](&(*f).u_valty, u as usize) }
+fn fehler_u_voff(f: *mut Fehler, u: u32) -> u64 { return vec_at[u64](&(*f).u_voff, u as usize) }
+
+// Aufgeloester Typ einer Union bzw. einer Menge (frischer Eintrag in der
+// Typtafel — verglichen wird strukturell, `typ_gleich`).
+fn fehler_union_typ(f: *mut Fehler, t: *mut typen.Typen, u: u32) -> u32 {
+    return typen.neuer_typ(t, typen.K_STRUCT, fehler_u_sidx(f, u), 0)
+}
+
+fn fehler_set_typ(f: *mut Fehler, t: *mut typen.Typen, sm: u32) -> u32 {
+    return typen.neuer_typ(t, typen.K_STRUCT,
+                           vec_at[u32](&(*f).s_sidx, sm as usize), 0)
+}
