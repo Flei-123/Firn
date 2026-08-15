@@ -51,6 +51,8 @@ enum Emit {
     FirRaw,
     /// FIR nach dem Optimierer
     FirOpt,
+    /// nur den von `comptime` erzeugten Quelltext ausgeben
+    Comptime,
 }
 
 struct Options {
@@ -78,6 +80,7 @@ fn usage() -> String {
          --emit=fir         FIR-Textform (nach Optimierung, sofern aktiv)\n  \
          --emit=fir-raw     FIR direkt nach dem Lowering, ohne Optimierung\n  \
          --emit=fir-opt     FIR nach dem Optimierer\n  \
+         --emit=comptime    nur den von comptime erzeugten Quelltext\n  \
          --emit=tokens      Tokenstrom (Fehlersuche)\n  \
          --emit=ast         AST als Debug-Text (Fehlersuche)\n  \
          --no-opt           Optimierer abschalten (= --opt-level=dev)\n  \
@@ -187,6 +190,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                         "fir" => Emit::FirOpt,
                         "fir-raw" => Emit::FirRaw,
                         "fir-opt" => Emit::FirOpt,
+                        "comptime" => Emit::Comptime,
                         "tokens" => Emit::Tokens,
                         "ast" => Emit::Ast,
                         other => return Err(format!("unbekanntes Ausgabeziel '{}'", other)),
@@ -273,6 +277,41 @@ fn run(opts: &Options) -> i32 {
         Some(p) => p,
         None => return report(&dg),
     };
+    // --- comptime: erzeugten Quelltext im SELBEN Lauf uebersetzen (SPEC §6.4)
+    //
+    // Die `comptime { … }`-Bloecke laufen VOR der Typpruefung. Was sie per
+    // `emit_*` schreiben, wird hier gelext, geparst und ans Programm
+    // angehaengt — danach sieht der Typpruefer keinen Unterschied zu von Hand
+    // geschriebenem Quelltext. Genau das verlangt Abnahmepunkt 6 fuer die
+    // Unicode-, Web-IDL- und CSS-Tabellen eines Browsers.
+    let erzeugt = comptime::fuehre_bloecke_aus(&prog, &mut dg);
+    if !erzeugt.is_empty() && !dg.has_errors() {
+        let datei = dg.add_file("<comptime>", &erzeugt);
+        // Dieselbe Datei muss auch die Zeilentabelle kennen, sonst erzeugt der
+        // Codegenerator `.loc`-Direktiven mit einer Nummer, die `as` nicht
+        // kennt ("unassigned file number").
+        dwarf::add_file("<comptime>");
+        let toks = lexer::lex_file(&erzeugt, datei, &mut dg);
+        let mut zusatz = parser::parse(&toks, &mut dg);
+        // Die Ausdrucks-Ids des Zusatzes beginnen bei 0 und muessen hinter
+        // die des Hauptprogramms wandern.
+        let mut naechste = prog.expr_count;
+        for f in zusatz.funcs.iter_mut() {
+            crate::mono::renumber_block(&mut f.body, &mut naechste);
+        }
+        for c in zusatz.consts.iter_mut() {
+            crate::mono::renumber_expr(&mut c.value, &mut naechste);
+        }
+        prog.expr_count = naechste;
+        prog.funcs.extend(zusatz.funcs);
+        prog.structs.extend(zusatz.structs);
+        prog.consts.extend(zusatz.consts);
+        if opts.emit == Emit::Comptime {
+            print!("{}", erzeugt);
+            return if dg.has_errors() { report(&dg) } else { 0 };
+        }
+    }
+
     // --- Monomorphisierung generischer Vorlagen (Modul types) ---
     mono::expand(&mut prog, &mut dg);
     if opts.emit == Emit::Ast && !dg.has_errors() {

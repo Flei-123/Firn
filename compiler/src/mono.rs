@@ -361,7 +361,7 @@ fn subst_expr(e: &mut Expr, map: &HashMap<String, TypeExpr>, queue: &mut Vec<(St
 
 // ------------------------------------------------------------ Neunummerierung
 
-fn renumber_block(b: &mut Block, next: &mut u32) {
+pub(crate) fn renumber_block(b: &mut Block, next: &mut u32) {
     for s in b.stmts.iter_mut() {
         renumber_stmt(s, next);
     }
@@ -402,7 +402,7 @@ fn renumber_stmt(s: &mut Stmt, next: &mut u32) {
     }
 }
 
-fn renumber_expr(e: &mut Expr, next: &mut u32) {
+pub(crate) fn renumber_expr(e: &mut Expr, next: &mut u32) {
     e.id = *next;
     *next += 1;
     match &mut e.kind {

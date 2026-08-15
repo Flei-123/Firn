@@ -399,6 +399,7 @@ mod tests {
             structs: Vec::new(),
             consts: Vec::new(),
             expr_count,
+            comptime_bloecke: Vec::new(),
         }
     }
 

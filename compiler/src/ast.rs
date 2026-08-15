@@ -282,6 +282,10 @@ pub struct Program {
     pub funcs: Vec<FnDecl>,
     pub structs: Vec<StructDecl>,
     pub consts: Vec<ConstDecl>,
+    /// `comptime { … }` auf oberster Ebene: laeuft VOR der Typpruefung und
+    /// kann per `emit_*` Quelltext erzeugen, den derselbe Lauf uebersetzt
+    /// (SPEC §6.4).
+    pub comptime_bloecke: Vec<(Block, Span)>,
     /// Anzahl vergebener ExprIds (= Groesse der Typtabelle).
     pub expr_count: u32,
 }

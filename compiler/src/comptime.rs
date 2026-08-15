@@ -67,6 +67,8 @@ pub(crate) struct Ausfuehrung<'a> {
     /// Typ jedes Ausdrucks (für die Breite bei Umwandlungen).
     expr_types: &'a [Type],
     schritte: u64,
+    /// Von `emit_*` aufgebauter Quelltext.
+    pub(crate) ausgabe: String,
 }
 
 impl<'a> Ausfuehrung<'a> {
@@ -75,7 +77,7 @@ impl<'a> Ausfuehrung<'a> {
         consts: &'a HashMap<String, (Type, i128)>,
         expr_types: &'a [Type],
     ) -> Ausfuehrung<'a> {
-        Ausfuehrung { prog, consts, expr_types, schritte: 0 }
+        Ausfuehrung { prog, consts, expr_types, schritte: 0, ausgabe: String::new() }
     }
 
     /// Ruft `name` mit bereits ausgewerteten Argumenten auf.
@@ -325,6 +327,21 @@ impl<'a> Ausfuehrung<'a> {
                 Ok(crate::sema::comptime_wrap(v, &ziel))
             }
             ExprKind::Call(name, args, _) => {
+                // EMIT: die einzigen Nebenwirkungen, die ein `comptime` haben
+                // darf — sie schreiben in den Quelltextpuffer (SPEC §6.4).
+                if name == "emit_roh" {
+                    let text = literal_text(args, e.span)?;
+                    self.ausgabe.push_str(&text);
+                    return Ok(0);
+                }
+                if name == "emit_zahl" {
+                    if args.len() != 1 {
+                        return nein("'emit_zahl' erwartet genau ein argument");
+                    }
+                    let v = self.expr(&args[0], umg, tiefe)?;
+                    self.ausgabe.push_str(&v.to_string());
+                    return Ok(v);
+                }
                 let mut werte = Vec::with_capacity(args.len());
                 for a in args {
                     werte.push(self.expr(a, umg, tiefe)?);
@@ -380,4 +397,61 @@ fn rechne(op: BinOp, a: i128, b: i128, span: Span) -> Result<i128, Fehler> {
         BinOp::LAnd => bit(a != 0 && b != 0),
         BinOp::LOr => bit(a != 0 || b != 0),
     })
+}
+
+/// Der Text eines Zeichenkettenliterals. Der Parser hat `"abc"` bereits in ein
+/// Array-Literal aus Oktetten verwandelt (SPEC §14.1.str) — hier wird es
+/// zurueckgelesen. Damit braucht `emit_roh` keine Zeichenkettenunterstuetzung
+/// im Interpreter.
+fn literal_text(args: &[Expr], span: Span) -> Result<String, Fehler> {
+    if args.len() != 1 {
+        return Err((span, "comptime: 'emit_roh' erwartet genau ein argument".to_string()));
+    }
+    let elems = match &args[0].kind {
+        ExprKind::ArrayLit(v) => v,
+        _ => {
+            return Err((
+                args[0].span,
+                "comptime: 'emit_roh' erwartet ein zeichenkettenliteral".to_string(),
+            ))
+        }
+    };
+    let mut bytes = Vec::with_capacity(elems.len());
+    for el in elems {
+        match &el.kind {
+            ExprKind::Int(v) if (0..256).contains(v) => bytes.push(*v as u8),
+            _ => {
+                return Err((
+                    args[0].span,
+                    "comptime: 'emit_roh' erwartet ein zeichenkettenliteral".to_string(),
+                ))
+            }
+        }
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| (args[0].span, "comptime: 'emit_roh' braucht gueltiges UTF-8".to_string()))
+}
+
+/// Fuehrt alle `comptime { … }`-Bloecke des Programms aus und liefert den dabei
+/// erzeugten Quelltext.
+///
+/// Der Lauf findet VOR der Typpruefung statt: die Bloecke duerfen deshalb keine
+/// programmweiten Konstanten benutzen, wohl aber jede Funktion des Programms
+/// aufrufen. Ehrlich benannt in SPEC §14.1.comptime.
+pub(crate) fn fuehre_bloecke_aus(prog: &Program, dg: &mut crate::diag::Diags) -> String {
+    if prog.comptime_bloecke.is_empty() {
+        return String::new();
+    }
+    let leer_consts: HashMap<String, (Type, i128)> = HashMap::new();
+    let leer_typen: Vec<Type> = Vec::new();
+    let mut gesamt = String::new();
+    for (b, _span) in &prog.comptime_bloecke {
+        let mut lauf = Ausfuehrung::neu(prog, &leer_consts, &leer_typen);
+        let mut umg: Vec<HashMap<String, i128>> = vec![HashMap::new()];
+        match lauf.block(b, &mut umg, 0) {
+            Ok(_) => gesamt.push_str(&lauf.ausgabe),
+            Err((span, msg)) => dg.error(span, msg),
+        }
+    }
+    gesamt
 }
