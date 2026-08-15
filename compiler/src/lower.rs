@@ -618,6 +618,11 @@ impl<'a> Lower<'a> {
         if crate::ct::is_ct_call(name) && !self.info.fns.contains_key(name) {
             return crate::ct::lower_ct_call(self, name, args, span);
         }
+        // HOOK sizeof: `size_of[T]()` ist eine Konstante — zur Laufzeit
+        // bleibt davon nichts uebrig (sizeof.rs)
+        if let Some(g) = crate::sizeof::wert(name) {
+            return Some(Some(self.konst(FTy::U64, g)));
+        }
         // HOOK gc: Allokation `gc C{…}`, Sammler-Intrinsics, `x.as?[C]`
         // (gc_lower.rs, SPEC 3.5)
         if let Some(r) = crate::gc_lower::hook_call(self, name, args, dest, span) {
