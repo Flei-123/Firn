@@ -8,8 +8,8 @@
 // Verlassen eines Blocks laufen seine eigenen rueckwaerts; bei `return`
 // laufen ALLE Ebenen der Funktion, bei `break`/`continue` nur die, die
 // INNERHALB der Schleife vereinbart wurden. `errdefer` laeuft ausschliesslich
-// auf dem Fehlerpfad — den kennt die Kernsprache nicht, also laeuft es hier
-// nie. Es wird trotzdem vermerkt, damit die Reihenfolge stimmt.
+// auf dem FEHLERPFAD (`return E::Variante`, `try`) — seit Runde 36 ueber
+// `defer_bis_fehler` (`ret_term_fehler` in Stufe 0, SPEC §5.1).
 //
 // AGGREGATE BEWEGEN SICH NIE ALS WERT, sondern immer ueber ADRESSEN. Es gibt
 // genau zwei Wege: `schreib_nach(adr, e)` legt einen Ausdruck an einer Adresse
@@ -246,7 +246,7 @@ fn defer_ebene_zu(l: *mut Lower) {
 // Ebene zuerst, innerhalb einer Ebene rueckwaerts. Der Stapel bleibt dabei
 // UNVERAENDERT: `defer_ebene_zu` raeumt seine eigene Ebene ab. Was danach
 // noch erzeugt wird, landet im unerreichbaren Block hinter dem Sprung.
-fn defer_bis(l: *mut Lower, tiefe: u32) {
+fn defer_bis_mf(l: *mut Lower, tiefe: u32, mit_fehler: bool) {
     var e: usize = vec_len[u32](&(*l).d_grenze)
     var ende: usize = vec_len[u32](&(*l).d_stmt)
     while e > tiefe as usize {
@@ -255,12 +255,36 @@ fn defer_bis(l: *mut Lower, tiefe: u32) {
         var i: usize = ende
         while i > g as usize {
             i = i - 1
-            if vec_at[u32](&(*l).d_err, i) == 0 {
+            // `errdefer` laeuft NUR auf dem Fehlerpfad (SPEC §5.1) —
+            // `lower_defers_bis(tiefe, mit_fehler)` in Stufe 0.
+            if vec_at[u32](&(*l).d_err, i) == 0 || mit_fehler {
                 anweisung(l, vec_at[u32](&(*l).d_stmt, i))
             }
         }
         ende = g as usize
     }
+}
+
+fn defer_bis(l: *mut Lower, tiefe: u32) {
+    defer_bis_mf(l, tiefe, false)
+}
+
+// Ruecksprung auf dem FEHLERPFAD: zusaetzlich laufen die `errdefer`-
+// Anweisungen (`ret_term_fehler`, Runde 36).
+fn defer_bis_fehler(l: *mut Lower) {
+    defer_bis_mf(l, 0, true)
+}
+
+// Gibt es in dieser Funktion ein aktives `errdefer`? (`hat_errdefer`)
+fn hat_errdefer(l: *mut Lower) -> bool {
+    var i: usize = 0
+    while i < vec_len[u32](&(*l).d_err) {
+        if vec_at[u32](&(*l).d_err, i) == 1 {
+            return true
+        }
+        i = i + 1
+    }
+    return false
 }
 
 fn suchen(l: *mut Lower, name: u32) -> u32 {
@@ -1246,6 +1270,19 @@ fn anweisung(l: *mut Lower, i: u32) {
             defer_bis(l, 0)
             term(l, fir.TERM_RET, KEIN, 0, 0)
         } else {
+            // EHRLICHE GRENZE (SPEC §14.1 F5, lower.rs): eine FERTIGE
+            // Fehlerunion zurueckgeben, waehrend ein `errdefer` aktiv ist —
+            // erst zur Laufzeit stuende fest, ob das der Fehlerpfad ist.
+            // Abgelehnt statt still uebergangen. Bei einer Umwandlung
+            // (`return E::Variante`, `return wert`) ist der Typ von `wv` der
+            // QUELLtyp und diese Bedingung greift nicht.
+            if hat_fe(l) && hat_errdefer(l) {
+                let rt0: u32 = sema.sema_typ(sm(l), wv)
+                if fehler.fehler_union_von_typ(fel(l), tf(l), rt0) != KEIN {
+                    (*l).fehler = (*l).fehler + 1
+                    return
+                }
+            }
             // HOOK fehlerunionen (lower_errors.rs::hook_return): die
             // implizite Umwandlung bei 'return'.
             var umgewandelt: bool = false
@@ -1946,10 +1983,9 @@ fn match_lower(l: *mut Lower, mi: u32) {
 // Die Reihenfolge der erzeugten Instruktionen und Bloecke ist Vertrag,
 // `tools/fir_vergleich.sh` vergleicht Oktett fuer Oktett.
 //
-// EHRLICHE GRENZE: `ret_term_fehler` in Stufe 0 laesst auf dem Fehlerpfad
-// zusaetzlich die `errdefer`-Anweisungen laufen. Die kennt diese Stufe noch
-// nicht — Dateien mit `errdefer` zaehlen als nicht Kern (eigene Runde) —,
-// deshalb laufen hier beide Ruecksprungwege ueber `defer_bis`.
+// RUNDE 36: `ret_term_fehler` ist portiert — der Fehlerpfad
+// (`return E::Variante`, `try`) laesst zusaetzlich die `errdefer`-
+// Anweisungen laufen (`defer_bis_fehler`).
 
 // Schreibt die Fehlerunion an `addr` — Erfolgswert oder Fehlercode
 // (`write_union`). BUSY verhindert, dass der Rohwert-Zugriff erneut in
@@ -2014,9 +2050,16 @@ fn kopie_wert(l: *mut Lower, dst: u32, src: u32, t: u32) {
 // `return` mit impliziter Umwandlung in die Fehlerunion der Funktion
 // (`do_return`).
 fn fehler_return(l: *mut Lower, v: u32, cu: u32) {
+    // `return E::Variante` ist der Fehlerpfad, `return wert` der
+    // Erfolgspfad — der Typpruefer hat das entschieden (`coerce_art`).
+    let fehlerpfad: bool = fehler.fehler_coerce_art(fel(l), v) == fehler.FEHLER_AUS_FEHLER
     if (*l).sret != KEIN {
         union_schreiben(l, (*l).sret, v, cu)
-        defer_bis(l, 0)
+        if fehlerpfad {
+            defer_bis_fehler(l)
+        } else {
+            defer_bis(l, 0)
+        }
         term(l, fir.TERM_RET, (*l).sret, 0, 0)
         return
     }
@@ -2028,16 +2071,20 @@ fn fehler_return(l: *mut Lower, v: u32, cu: u32) {
     speichere(l, fir.T_I64, slot, zero)
     union_schreiben(l, slot, v, cu)
     let w: u32 = lade(l, fir.T_I64, slot)
-    defer_bis(l, 0)
+    if fehlerpfad {
+        defer_bis_fehler(l)
+    } else {
+        defer_bis(l, 0)
+    }
     term(l, fir.TERM_RET, w, 0, 0)
 }
 
 // Verlaesst die Funktion mit dem Fehlercode `code` (`return_error`) —
-// der Fehlerpfad von `try`.
+// IMMER der Fehlerpfad: hier laufen auch die `errdefer`-Anweisungen.
 fn fehler_verlassen(l: *mut Lower, code: u32) {
     if (*l).sret != KEIN {
         speichere(l, fir.T_U32, (*l).sret, code)
-        defer_bis(l, 0)
+        defer_bis_fehler(l)
         term(l, fir.TERM_RET, (*l).sret, 0, 0)
         return
     }
@@ -2046,7 +2093,7 @@ fn fehler_verlassen(l: *mut Lower, code: u32) {
     speichere(l, fir.T_I64, slot, zero)
     speichere(l, fir.T_U32, slot, code)
     let w: u32 = lade(l, fir.T_I64, slot)
-    defer_bis(l, 0)
+    defer_bis_fehler(l)
     term(l, fir.TERM_RET, w, 0, 0)
 }
 
