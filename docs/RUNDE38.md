@@ -234,3 +234,18 @@ Verbesserung; unterhalb von 8 MiB gilt exakt das Stufe-2-Verhalten.
 
 Messlatte: test.sh **640/640**, selbst_vergleich **186/0/0**, Fixpunkt
 **zeichengleich (284207)**, 19 gc/rc-Tests ok, 6 gc-Negativtests rc!=0.
+
+## Stufe 5 — Finalisierer und Arc[T]: benannte Restarbeit
+
+Bewusst NICHT begonnen, beide sind groesser als eine Reststufe:
+
+- **Finalisierer**: brauchen eine Semantik-Entscheidung (wann erlaubt,
+  Resurrektion ja/nein, Reihenfolge, Faden). Ohne SPEC-Grundlage waere jede
+  Umsetzung ein Ratespiel; der konservative Scan und die Paritaets-Marken
+  dieser Runde sind damit vertraeglich (Finalisierbare Objekte wuerden einen
+  Zyklus laenger leben — dieselbe Maschinerie wie Floating Garbage).
+- **Arc[T]**: ein zweiter Verweis-Typ neben Rc[T] mit atomaren Zaehlern —
+  sinnvoll erst, wenn es Faden gibt (SPEC §7 ist Stufe 0 einfaedelig). Atomik
+  ohne Faden zu bauen waere toter Aufwand.
+
+Beide bleiben als Restarbeit benannt, nicht angeflickt.
