@@ -1720,3 +1720,47 @@ Programme bei 0 abweichend und 0 fehlerhaft, Fixpunkt zeichengleich
 firnc0 ab. Damit steht die GANZE Kernsprache in firnc1: der Compiler in
 Firn uebersetzt jedes Kernsprachen-Programm so wie der Rust-Compiler —
 und sich selbst.
+
+## 27. Runde 37: der Optimierer-Angriff — html5lib unter der 2x-Marke
+
+Drei Optimierungen im Rust-Compiler (firnc1 enthaelt bewusst keinen
+Optimierer; der fir-Vergleich laeuft auf `--emit=fir-raw` VOR jeder
+Optimierung, deshalb gab es nichts zu spiegeln): Sprung-Fallthrough und
+cmp direkt ins Zielregister (977a2ad), Registerpools rsi/rdi/rdx im
+linear scan (ef4e530), Inliner-Korrektheit mit Rekursionsverbot und
+Shift-Sofortform (bf13ed4). Tokenizer-Messreihe: html5lib 1,94x ->
+1,69x (Ziel <=2x erreicht), realweb 4,82x -> 4,34x (Zwischenziel <=3x
+verfehlt). Naechster Hebel: Intervall-Splitting + Coalescing im
+Registerallokator (7 391 statische reg->reg-movs, 445 Store/Reload-Paare).
+
+## 28. Runde 38: der Sammler lernt zwei Dinge — Rueckgabe und Scheiben
+
+Stufe 2: komplett leere Chunks JEDER Groessenklasse gehen jetzt ans OS
+zurueck (mit Zwei-Sweep-Hysterese gegen munmap/mmap-Pendeln), und eine
+Grenzen-Kappe (4 MiB) sorgt dafuer, dass nach einer Grossobjekt-Phase nie
+wieder "stille" Heaps ohne Sammlung entstehen. Phasen-Test: RSS-Ende
+24 124 KiB (nie fallend) -> 2 112 KiB, Verhalten der Sammlung unveraendert.
+Stufe 3: hybrid inkrementelles Sammeln ab 8 MiB Heap — Markieren in
+Scheiben von 512 Objekten, Fegen in 2-Chunks-Scheiben, Dijkstra-
+Einfuegebarriere, Weiss-Paritaet statt Marken-Reset. Pausen damit
+heap-groessen-unabhaengig um 0,5 ms; unter 8 MiB bleibt der atomare
+Pfad (Durchsatz kostet der Phasen-Check 8,7 %, Vorgabe war ±10 %).
+Wichtiger Nebenbefund (RUNDE38.md): der Optimierer kann ein letztes
+Null-Setzen als tot entfernen — Unerreichbarkeit gehoert in eine
+Hilfsfunktion, der Scrubber genullt zurueckgekehrte Rahmen.
+Finalisierer und Arc[T] sind benannte Restarbeit (Semantik- bzw.
+Faden-Entscheidung noetig); der 30-Minuten-Dauerlauf laeuft nach.
+
+## 29. Runde 39: `import std.*` und `f"..."` — Komfort kommt in die Sprache
+
+Modul-Suchpfad in BEIDEN Compilern identisch: neben der importierenden
+Datei, neben der Wurzeldatei, `$FIRNLIB`, `<exe>/../lib`
+(Installationslayout). Darauf steht `lib/std/` — die Fassade im
+C#-Stil ueber den bewaehrten Bausteinen (io, math, str, vec, map, num,
+mem), Kern-Test tests/790_std_kern.fi. Die String-Interpolation
+`f"x = {x}"` zerlegt der Parser ZUR UEBERSETZUNGSZEIT in eine Kette auf
+den Fmt-Builder (keine Varargs, kein Laufzeit-Parsen, keine
+Verlangsamung), gebaut in firnc0 UND firnc1; Anzeige ist die von i64 —
+die ehrlich benannte Grenze der Kernfassung. Kern-Test
+tests/791_interpolation_kern.fi, drei Negativtests brechen auf beiden
+Seiten ab. Verifiziert aus einem /tmp-Projekt per FIRNLIB.
