@@ -1772,15 +1772,36 @@ fn emit_bin(
             ra.store_dst(e, d, res);
         }
         BinOp::Shl | BinOp::Shr => {
-            ra.load_ext(e, "rax", a, ty, bits);
-            ra.load_full(e, "rcx", b);
             let m = match (op, ty.signed()) {
                 (BinOp::Shl, _) => "shl",
                 (_, true) => "sar",
                 (_, false) => "shr",
             };
-            e.line(&format!("{} {}, cl", m, rn("rax", bits)));
-            ra.store_dst(e, d, "rax");
+            if let Some(k) = ra.a.imm(b) {
+                // konstanter Abstand: Sofortform, kein rcx-Aufbau.
+                // Maske wie die CPU (32 Bit: 5 Bit, 64 Bit: 6 Bit); die FIR
+                // laesst Weiten >= Bitbreite gar nicht erst durch den
+                // Optimierer, aber die Maske haelt den Assembler-Text im
+                // imm8-Rahmen.
+                let k = k & if bits == 64 { 63 } else { 31 };
+                // direkt im Zielregister schieben, wenn es eines hat
+                match ra.a.loc(d) {
+                    Loc::Reg(dr) => {
+                        ra.load_ext(e, dr, a, ty, bits);
+                        e.line(&format!("{} {}, {}", m, rn(dr, bits), k));
+                    }
+                    Loc::Slot(_) => {
+                        ra.load_ext(e, "rax", a, ty, bits);
+                        e.line(&format!("{} {}, {}", m, rn("rax", bits), k));
+                        ra.store_dst(e, d, "rax");
+                    }
+                }
+            } else {
+                ra.load_ext(e, "rax", a, ty, bits);
+                ra.load_full(e, "rcx", b);
+                e.line(&format!("{} {}, cl", m, rn("rax", bits)));
+                ra.store_dst(e, d, "rax");
+            }
         }
     }
     Ok(())
