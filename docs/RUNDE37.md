@@ -82,3 +82,26 @@ laeuft auf `--emit=fir-raw`, also VOR jeder Optimierung — Aenderungen an
 Der Fixpunkt bleibt zeichengleich, weil der Quelltext von firnc1 unangetastet
 bleibt. Es gibt daher in dieser Runde nichts zu spiegeln; geprueft ueber
 selbst_vergleich (186/0/0) und fixpunkt.sh in jedem Testlauf.
+
+
+## Endzahlen (Commit bf13ed4)
+
+| Korpus | Runde-36-Baseline | Runde 37 | Bewertung |
+|---|---|---|---|
+| html5lib | 1,94× | **1,69×** | Ziel ≤2× erreicht |
+| realweb | 4,82× | **4,34×** | Zwischenziel ≤3× verfehlt |
+
+Gesamt gesund: **test.sh 640/640**, selbst_vergleich 186/0/0,
+Fixpunkt 284207 Zeilen zeichengleich. Drei Commits: 977a2ad (Fallthrough +
+cmp→Zielregister), ef4e530 (Registerpools), bf13ed4 (Inline-Korrektheit +
+Shift-Sofortform).
+
+## Naechster Hebel (Prioritaet fuer Runde 38)
+
+1. **Regalloc: Intervall-Splitting + Coalescing** (7391 statische reg→reg-movs,
+   445 Store/Reload-Paare; danach vertraegt der Compiler groessere Funktionen
+   und das aggressive Inlining von `eingabe_pruefen` & Co. wird moeglich —
+   das ist der dokumentierte Pfad zu ≤3×).
+2. Register-Deskriptor im Emissionspfad (Store→Reload-Muster direkt streichen).
+3. GC-Runde: `520_gc_weak` rahmenlayout-robust machen (Stapel-Scrub im
+   Testpfad), sonst bleibt jede Inline-Verbesserung ein Roulette.
