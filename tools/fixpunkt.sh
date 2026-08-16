@@ -33,7 +33,10 @@ if [ ! -x "$FIRNC" ]; then
 fi
 
 # --- Stufe 1 ---------------------------------------------------------------
-if [ ! -x ./.firnc1 ]; then
+# Neu bauen, wenn .firnc1 fehlt ODER eine Quelldatei juenger ist — ein
+# veraltetes .firnc1 misst sonst den Stand von gestern (Runde 35).
+if [ ! -x ./.firnc1 ] || [ -n "$(find bin lib/firnc1 -name '*.fi' -newer ./.firnc1 -print -quit)" ]; then
+    rm -f ./.firnc1
     "$FIRNC" "$QUELLE" -o ./.firnc1 || { echo "Stufe 1 schlug fehl"; exit 1; }
 fi
 
