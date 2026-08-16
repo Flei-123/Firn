@@ -72,7 +72,43 @@ fn reaches(m: &Module, from: &str, to: &str) -> bool {
     false
 }
 
+/// Kann `name` sich selbst ueber mindestens einen Aufruf wieder erreichen
+/// (direkte oder indirekte Rekursion)?
+///
+/// Solche Rümpfe werden NICHT eingebettet. Inlining entrollt eine
+/// Rekursionsstufe und verlagert ihre Rahmen in den Aufrufer — Programmcode,
+/// dessen Wirkung auf der Stapeltiefe beruht (das Stapel-Scrubbing des
+/// konservativen GC, `lib/gc`: `__gc_scrub_tief`), verliert dadurch seine
+/// Wirkung. GEMESSEN in Runde 37: mit erhoehten Grenzen (60/10) wurde
+/// `__gc_scrub_tief` (29 Insts, 9 Bloecke, rekursiv) in `main` eingebettet —
+/// `tests/520_gc_weak.fi` fiel mit Exit 6 aus, weil Phantom-Zeiger im
+/// ungescrubbten Stapel den Sammler naehrten.
+fn erreicht_sich_selbst(m: &Module, name: &str) -> bool {
+    if let Some(f) = m.funcs.iter().find(|f| f.name == name) {
+        for b in &f.blocks {
+            for i in &b.insts {
+                if let Op::Call { name: ziel, .. } = &i.op {
+                    if reaches(m, ziel, name) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 fn inlinable(callee: &Func) -> bool {
+    // Schleifenfreie Ruempfe OHNE Rueckgabewert (Wirkung ueber
+    // Zeiger-Argumente, z. B. die Sink-Mutatoren des Tokenizers) duerfen mehr
+    // Bloecke haben: ihr Kontrollfluss ist ein DAG, und weil `dst` leer ist,
+    // entsteht im Aufrufer nicht einmal die Ergebnis-Alloca — der Rahmen des
+    // Aufrufers bleibt bis auf echte Rumpf-Allocas unveraendert. Das ist
+    // der Unterschied zu Wertruempfen: deren Ergebnis-Zelle wandert in den
+    // Eintrittsblock des Aufrufers und veraendert dessen Rahmenlayout —
+    // fatal fuer den stapel-scannenden konservativen GC
+    // (`tests/520_gc_weak.fi`, Runde 37: `__gc_strong_raw` in `anlegen`
+    // eingebettet -> Phantom-Zeiger, Exit 6).
     !callee.constant_time
         && callee.secret.is_empty()
         && callee.inst_count() <= MAX_CALLEE_INSTS
@@ -82,7 +118,9 @@ fn inlinable(callee: &Func) -> bool {
 }
 
 /// Sucht eine lohnende Aufrufstelle im Aufrufer `ci`.
-fn find_site(m: &Module, ci: usize) -> Option<(usize, usize, usize)> {
+/// `selbst_rek`: je Funktion vorberechnet (aendert sich durch Einbettungen
+/// nicht — mutiert wird nur der Aufrufer).
+fn find_site(m: &Module, ci: usize, selbst_rek: &[bool]) -> Option<(usize, usize, usize)> {
     let caller = &m.funcs[ci];
     if caller.constant_time || !caller.secret.is_empty() {
         return None;
@@ -112,6 +150,10 @@ fn find_site(m: &Module, ci: usize) -> Option<(usize, usize, usize)> {
                 }
                 // Rekursion (auch indirekt) wird nicht eingebettet.
                 if reaches(m, &callee.name, &caller.name) {
+                    continue;
+                }
+                // Selbst-erreichbare Rümpfe ebenfalls nicht (siehe oben).
+                if selbst_rek[gi] {
                     continue;
                 }
                 return Some((bi, ii, gi));
@@ -261,9 +303,22 @@ fn remap_op(op: &Op, mv: &dyn Fn(Val) -> Val) -> Op {
 /// eingebetteten Aufrufe.
 pub fn inline_module(m: &mut Module) -> usize {
     let mut n = 0usize;
+    let dbg = std::env::var("FIRNC_INLINE_DEBUG").is_ok();
+    // Einmalig bestimmen: haengt nur am Rumpf der Aufgerufenen, der sich
+    // durch Einbettungen nie aendert (mutiert wird nur der Aufrufer).
+    let selbst_rek: Vec<bool> = m
+        .funcs
+        .iter()
+        .map(|f| erreicht_sich_selbst(m, &f.name))
+        .collect();
     'outer: loop {
         for ci in 0..m.funcs.len() {
-            if let Some((bi, ii, gi)) = find_site(m, ci) {
+            if let Some((bi, ii, gi)) = find_site(m, ci, &selbst_rek) {
+                if dbg {
+                    eprintln!("inline: {} <- {} ({} insts, {} bloecke)",
+                        m.funcs[ci].name, m.funcs[gi].name,
+                        m.funcs[gi].inst_count(), m.funcs[gi].blocks.len());
+                }
                 inline_one(m, ci, bi, ii, gi);
                 n += 1;
                 if n >= MAX_INLINES {
