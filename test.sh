@@ -35,6 +35,10 @@ ROOT=$(pwd)
 FIRNC="$ROOT/compiler/target/release/firnc"
 WORK="$ROOT/.test-work"
 
+# Modul-Suchpfad (Runde 39): `import std.*` loest ueber $FIRNLIB nach
+# <repo>/lib auf — egal, aus welchem Verzeichnis ein Testprojekt ruft.
+export FIRNLIB="$ROOT/lib"
+
 PASS=0
 FAIL=0
 FAILED=""
