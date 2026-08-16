@@ -1700,3 +1700,23 @@ gc/nogc-Negativtests brechen wie firnc0 ab. Neu: `tests/770_gc_kern.fi`
 (gc-Klasse nur im Modul, Zyklus unter Wurzel) und `docs/RUNDE34.md`.
 
 Uebrig bleiben: konstante Laufzeit (4), `errdefer` (1), `must_consume` (1).
+
+## 26. Runde 36: ct-Intrinsics, `errdefer`, `must_consume` — die Kernsprache ist vollstaendig
+
+Die letzten drei Bloecke sind portiert. `select(bedingung, a, b)`
+(datenunabhaengige Auswahl, cmov statt Spruenge, beide Zweige exakt
+derselbe skalare Typ), `secure_zero(zeiger, anzahl)` (Nullung mit
+volatile-Store-Semantik, darf nie wegoptimiert werden, SPEC §9.3) und
+die ct-Barriere — jeweils mit eigener Erkennung in der Sema VOR dem
+Funktions-Lookup, damit eine eigene Funktion gleichen Namens gewinnt.
+`errdefer` laeuft nur auf dem Fehlerweg (Fertige-Union-Ablehnung wie
+Stufe 0), `#[must_consume]` an Funktionen und Structs meldet verworfene
+Ergebnisse. Details in `docs/RUNDE36.md`, Kern-Test
+`tests/780_ct_kern.fi`.
+
+Messwerte: `test.sh` 640/640, `selbst_vergleich` 186 verhaltensgleiche
+Programme bei 0 abweichend und 0 fehlerhaft, Fixpunkt zeichengleich
+(284 207 Zeilen Assembler). Alle acht Negativtests der Runde brechen wie
+firnc0 ab. Damit steht die GANZE Kernsprache in firnc1: der Compiler in
+Firn uebersetzt jedes Kernsprachen-Programm so wie der Rust-Compiler —
+und sich selbst.
