@@ -2,10 +2,12 @@
 //! zusammengefuehrt und zu EINEM Binary uebersetzt.
 //!
 //! Syntax (SPEC §12):
-//!   * `import pfad.modul` — bindet `pfad/modul.<endung>` relativ zur
-//!     IMPORTIERENDEN Datei ein, ersatzweise relativ zum
-//!     Verzeichnis der Wurzeldatei ein. Angesprochen wird das Modul unter dem
-//!     letzten Pfadteil.
+//!   * `import pfad.modul` — bindet `pfad/modul.<endung>` ein. Gesucht wird
+//!     in dieser Reihenfolge: (1) relativ zur IMPORTIERENDEN Datei,
+//!     (2) relativ zum Verzeichnis der Wurzeldatei, (3) in `$FIRNLIB`,
+//!     (4) in `<Verzeichnis des Compiler-Binarys>/../lib`
+//!     (Installationsfallback; `firnc1` liest dafuer `/proc/self/exe`).
+//!     Angesprochen wird das Modul unter dem letzten Pfadteil.
 //!   * `export { a, b }` — Sichtbarkeitsliste je Modul. Fehlt sie, ist alles
 //!     sichtbar.
 //!   * `modul.name` — Zugriff auf ein Element eines eingebundenen Moduls.
@@ -35,6 +37,45 @@ pub struct SourceFile {
     pub src: String,
 }
 
+/// Baut `<basis>/<teil1>/<teil2>....<endung>` — den Pfad, den ein
+/// `import teil1.teil2` in einem Suchverzeichnis meint.
+fn modul_pfad(basis: &Path, parts: &[String]) -> PathBuf {
+    let mut p = basis.to_path_buf();
+    for part in parts {
+        p.push(part);
+    }
+    p.set_extension(config::FILE_EXT);
+    p
+}
+
+/// `$FIRNLIB` als Suchverzeichnis: gesetzt und nicht leer, sonst nichts.
+/// Reine Funktion, damit die Regel testbar bleibt.
+fn firnlib_pfad(wert: Option<&str>) -> Option<PathBuf> {
+    match wert {
+        Some(v) if !v.is_empty() => Some(PathBuf::from(v)),
+        _ => None,
+    }
+}
+
+/// Zusaetzliche Suchverzeichnisse fuer `import`, in dieser Reihenfolge:
+/// erst `$FIRNLIB`, dann `<Verzeichnis des Compiler-Binarys>/../lib`
+/// (Installationslayout `bin/firnc` + `lib/`). Beide kommen NACH den
+/// beiden bisherigen Orten (importierende Datei, Wurzeldatei), damit
+/// bestehende Aufloesungen unveraendert bleiben. `firnc1` haelt in
+/// `bin/firnc1.fi` (`imports_sammeln`) dieselbe Reihenfolge ein.
+fn zusaetzliche_suchpfade() -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    if let Some(p) = firnlib_pfad(std::env::var("FIRNLIB").ok().as_deref()) {
+        out.push(p);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            out.push(dir.join("..").join("lib"));
+        }
+    }
+    out
+}
+
 /// Findet die Wurzeldatei und alle ueber `import` erreichbaren Module.
 /// Die Wurzeldatei hat immer die Nummer 0.
 pub fn resolve(root: &Path) -> Result<Vec<SourceFile>, Diag> {
@@ -56,7 +97,7 @@ pub fn resolve(root: &Path) -> Result<Vec<SourceFile>, Diag> {
                     span,
                     label: "hier".to_string(),
                     note: Some(format!(
-                        "der modulpfad wird zuerst relativ zur importierenden datei gesucht, dann relativ zu '{}'",
+                        "gesucht wird relativ zur importierenden datei, relativ zu '{}', dann in $FIRNLIB und in <verzeichnis des compiler-binarys>/../lib",
                         if base.as_os_str().is_empty() {
                             ".".to_string()
                         } else {
@@ -79,20 +120,24 @@ pub fn resolve(root: &Path) -> Result<Vec<SourceFile>, Diag> {
         // unveraendert weiterlaufen: `tests/*.fi` binden `modules.mathe` ein,
         // und dort sind beide Wege derselbe.
         let eigenes = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        let zusaetze = zusaetzliche_suchpfade();
         for (parts, ispan) in scan_imports(&src, id) {
-            let mut p = eigenes.clone();
-            for part in &parts {
-                p.push(part);
-            }
-            p.set_extension(config::FILE_EXT);
+            // (1) neben der importierenden Datei, (2) neben der Wurzeldatei,
+            // (3) $FIRNLIB, (4) <exe>/../lib — der erste Treffer zaehlt.
+            let mut p = modul_pfad(&eigenes, &parts);
             if !p.exists() {
-                let mut q = base.clone();
-                for part in &parts {
-                    q.push(part);
-                }
-                q.set_extension(config::FILE_EXT);
+                let q = modul_pfad(&base, &parts);
                 if q.exists() {
                     p = q;
+                }
+            }
+            if !p.exists() {
+                for z in &zusaetze {
+                    let q = modul_pfad(z, &parts);
+                    if q.exists() {
+                        p = q;
+                        break;
+                    }
                 }
             }
             queue.push((p, ispan));
@@ -641,6 +686,22 @@ mod tests {
         assert_eq!(found.len(), 2);
         assert_eq!(found[0].0, vec!["std".to_string(), "io".to_string()]);
         assert_eq!(found[1].0, vec!["helfer".to_string()]);
+    }
+
+    #[test]
+    fn suchpfade_und_modulpfad() {
+        // modul_pfad: teile werden zu <basis>/a/b.fi.
+        assert_eq!(
+            modul_pfad(Path::new("x"), &["std".to_string(), "math".to_string()]),
+            PathBuf::from("x/std/math.fi")
+        );
+        // FIRNLIB: leer oder ungesetzt heisst "kein zusaetzlicher pfad".
+        assert_eq!(firnlib_pfad(None), None);
+        assert_eq!(firnlib_pfad(Some("")), None);
+        assert_eq!(
+            firnlib_pfad(Some("/opt/firn/lib")),
+            Some(PathBuf::from("/opt/firn/lib"))
+        );
     }
 
     #[test]

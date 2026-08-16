@@ -46,6 +46,11 @@ pub(crate) struct Parser<'a> {
     /// Attribute, die unmittelbar vor der naechsten Deklaration standen
     /// (`attrs.rs`). Werden von `fn_decl`/`struct_decl` uebernommen.
     pub(crate) pending_attrs: Vec<crate::ast::Attr>,
+    /// Versteckte `var _fseg<N>` der String-Interpolation (Runde 39): sie
+    /// werden VOR die naechste Anweisung gehoben (`block` leert die Liste).
+    pub(crate) hoist: Vec<Stmt>,
+    /// > 0: eine Interpolation laeuft bereits — Schachtelung ist noch nicht.
+    pub(crate) interp_depth: u32,
 }
 
 fn starts_stmt(k: &TokKind) -> bool {
@@ -660,6 +665,11 @@ impl<'a> Parser<'a> {
                 let sp = self.bump();
                 self.mk(sp, ExprKind::Float(bits))
             }
+            TokKind::FStr(roh) => {
+                let sp = self.bump();
+                let roh = roh.clone();
+                self.interpolation(sp, &roh)
+            }
             // ZEICHENKETTENLITERAL -> Array-Literal.
             //
             // `"abc"` wird zu `[97, 98, 99]`, `u"abc"` zu den UTF-16-
@@ -852,6 +862,11 @@ impl<'a> Parser<'a> {
             }
             let before = self.pos;
             let s = self.stmt();
+            // Versteckte Textsegmente der Interpolation stehen VOR der
+            // Anweisung, die ihre Interpolation enthaelt.
+            if !self.hoist.is_empty() {
+                stmts.append(&mut self.hoist);
+            }
             stmts.push(s);
             if self.pos == before {
                 self.bump();
@@ -1547,6 +1562,232 @@ pub fn reset_hooks() {
 /// Nummer, `base_id` die erste noch freie `ExprId`. `Program::expr_count` ist
 /// danach die erste hinter dieser Datei freie Id (absolut) — `modules.rs`
 /// reiht die Dateien so ohne Ueberschneidung aneinander.
+impl<'a> Parser<'a> {
+    /// `f"..."` — die String-Interpolation (Runde 39).
+    ///
+    /// Der Parser zerlegt den Rumpf ZUR UEBERSETSUNGZEIT in eine Kette von
+    /// Aufrufen auf den Fmt-Builder aus `std.io` — keine Varargs, kein
+    /// Laufzeit-Parsen. Aus `f"x = {x}!"` wird:
+    ///
+    /// ```text
+    /// io.fmt_text(io.fmt_zahl(io.fmt_text(io.fmt_neu(), &_fseg0[0], 6),
+    ///                         (x) as i64),
+    ///             &_fseg1[0], 1)
+    /// ```
+    ///
+    /// Die Textsegmente koennen nicht flach adressiert werden (ein nacktes
+    /// Array-Literal hat an dieser Stelle keinen ableitbaren Typ) — sie
+    /// werden als versteckte `let _fseg<N>: [u8; N]` vor die umgebende
+    /// Anweisung gehoben (`block` leert `self.hoist`). Wer `f"..."`
+    /// schreibt, braucht `import std.io` — sonst meldet die Aufloesung
+    /// `io` als nicht eingebunden, genau wie bei handgeschriebenem `io.`.
+    fn interpolation(&mut self, sp: Span, roh: &str) -> Expr {
+        if self.interp_depth > 0 {
+            self.dg.error(
+                sp,
+                "geschachtelte interpolation: ein f\"...\" im ausdruck eines f\"...\" ist noch nicht".to_string(),
+            );
+            return self.broken_expr(sp);
+        }
+        let zeichen: Vec<char> = roh.chars().collect();
+        let mut kette = self.mk(sp, ExprKind::Call("io.fmt_neu".to_string(), Vec::new(), sp));
+        let mut i: usize = 0;
+        let mut text_von: usize = 0;
+        let mut kaputt = false;
+        while i < zeichen.len() {
+            let c = zeichen[i];
+            if c == '}' {
+                self.dg.error(
+                    sp,
+                    "unbalancierte klammer in einer interpolation: '}' ohne '{'".to_string(),
+                );
+                kaputt = true;
+                break;
+            }
+            if c == '\\' {
+                // Maskierung gehoert dem Textsegment — der Klammer-Scan
+                // darf ein \" nicht als Literalende missdeuten (hier sind
+                // die Anfuehrungszeichen schon weg); '{')}' kommt maskiert
+                // in der Kernfassung nicht vor (docs/RUNDE39.md).
+                i += 2;
+                continue;
+            }
+            if c != '{' {
+                i += 1;
+                continue;
+            }
+            // Textsegment vor der Klammer abschliessen.
+            if i > text_von {
+                kette = self.interp_text(kette, sp, &zeichen[text_von..i], text_von);
+            }
+            // Das schliessende '}' suchen; Schachtelung von '{' ist ein Fehler.
+            let mut j = i + 1;
+            let mut zu = false;
+            while j < zeichen.len() {
+                if zeichen[j] == '{' {
+                    self.dg.error(
+                        sp,
+                        "unbalancierte klammer in einer interpolation: '{' im ausdruck".to_string(),
+                    );
+                    kaputt = true;
+                    break;
+                }
+                if zeichen[j] == '}' {
+                    zu = true;
+                    break;
+                }
+                j += 1;
+            }
+            if kaputt {
+                break;
+            }
+            if !zu {
+                self.dg.error(
+                    sp,
+                    "unbalancierte klammer in einer interpolation: '{' ohne '}'".to_string(),
+                );
+                kaputt = true;
+                break;
+            }
+            kette = self.interp_ausdruck(kette, sp, &zeichen[i + 1..j], i + 1);
+            i = j + 1;
+            text_von = i;
+        }
+        if !kaputt && text_von < zeichen.len() {
+            kette = self.interp_text(kette, sp, &zeichen[text_von..], text_von);
+        }
+        kette
+    }
+
+    /// Ein Textsegment: entschluesseln, als verstecktes `let _fseg<N>`
+    /// anmelden und `io.fmt_text(kette, &name[0] as u64, N)` an die Kette.
+    fn interp_text(&mut self, kette: Expr, sp: Span, roh: &[char], von: usize) -> Expr {
+        let bytes = match crate::strings::decode_literal(crate::strings::LitKind::Str, roh) {
+            Ok(crate::strings::LitValue::Octets(v)) => v,
+            Ok(_) => Vec::new(),
+            Err(e) => {
+                self.dg.error(
+                    self.spanned(sp.line, sp.col + 2 + von as u32 + e.off, 1),
+                    format!("in einem textsegment einer interpolation: {}", e.msg),
+                );
+                return kette;
+            }
+        };
+        if bytes.is_empty() {
+            return kette;
+        }
+        let n = bytes.len();
+        let name = format!("_fseg{}", self.next_id);
+        let elems: Vec<Expr> = bytes
+            .iter()
+            .map(|b| self.mk(sp, ExprKind::Int(*b as i128)))
+            .collect();
+        let init = self.mk(sp, ExprKind::ArrayLit(elems));
+        self.hoist.push(Stmt::Let {
+            name: name.clone(),
+            mutable: false,
+            ty: Some(TypeExpr::Array {
+                elem: Box::new(TypeExpr::Named("u8".to_string(), sp)),
+                len: n as u64,
+                span: sp,
+            }),
+            init,
+            span: sp,
+        });
+        let ident = self.mk(sp, ExprKind::Ident(name));
+        let null = self.mk(sp, ExprKind::Int(0));
+        let idx = self.mk(sp, ExprKind::Index(Box::new(ident), Box::new(null)));
+        let adr = self.mk(sp, ExprKind::Unary(UnOp::AddrOf, Box::new(idx)));
+        let ptr = self.mk(
+            sp,
+            ExprKind::Cast(Box::new(adr), TypeExpr::Named("u64".to_string(), sp)),
+        );
+        let laen = self.mk(sp, ExprKind::Int(n as i128));
+        self.mk(
+            sp,
+            ExprKind::Call("io.fmt_text".to_string(), vec![kette, ptr, laen], sp),
+        )
+    }
+
+    /// Ein Ausdruckssegment: das Fragment mit aufgefuellten Positionen
+    /// neu lexen, EINEN Ausdruck daraus parsen und als
+    /// `io.fmt_zahl(kette, (ausdruck) as i64)` an die Kette haengen.
+    fn interp_ausdruck(&mut self, kette: Expr, sp: Span, roh: &[char], von: usize) -> Expr {
+        // Positionen stimmen, wenn das Fragment an seiner echten Stelle
+        // steht: Zeilen und Spalten vorweg auffuellen (Zeichenketten sind
+        // einzeilig, darum reicht EINE Zeile).
+        let mut quelle = String::new();
+        for _ in 1..sp.line {
+            quelle.push('\n');
+        }
+        for _ in 0..sp.col + 1 + von as u32 {
+            quelle.push(' ');
+        }
+        quelle.extend(roh.iter());
+        let toks = crate::lexer::lex_file(&quelle, self.file, self.dg);
+        let ausdruck = ein_ausdruck(&toks, self.dg, self.file, &self.modules, &mut self.next_id);
+        match ausdruck {
+            Some(e) => {
+                let cast = self.mk(
+                    sp,
+                    ExprKind::Cast(Box::new(e), TypeExpr::Named("i64".to_string(), sp)),
+                );
+                self.mk(
+                    sp,
+                    ExprKind::Call("io.fmt_zahl".to_string(), vec![kette, cast], sp),
+                )
+            }
+            None => kette,
+        }
+    }
+
+    /// Hilfe fuer die Fehlermeldung oben: Span aus Einzelteilen.
+    fn spanned(&self, line: u32, col: u32, len: u32) -> Span {
+        Span { line, col, len, file: self.file }
+    }
+}
+
+/// Parst genau EINEN Ausdruck aus einem Interpolationssegment.
+///
+/// Der Unter-Parser teilt sich Diagnosen und Modulkenntnis mit dem
+/// aufrufenden Parser; die `ExprId`s laufen ueber `next_id` nahtlos weiter.
+/// `interp_depth = 1` sperrt die Schachtelung: ein `f"..."` im Fragment
+/// wird ein sauberer Fehler statt stiller Hoist-Lecks.
+fn ein_ausdruck(
+    toks: &[Token],
+    dg: &mut Diags,
+    file: u32,
+    modules: &HashSet<String>,
+    next_id: &mut u32,
+) -> Option<Expr> {
+    let mut p = Parser {
+        toks,
+        pos: 0,
+        dg,
+        next_id: *next_id,
+        depth: 1,
+        recovering: false,
+        no_struct_lit: false,
+        paren_depth: 0,
+        file,
+        modules: modules.clone(),
+        loop_depth: 0,
+        pending_attrs: Vec::new(),
+        hoist: Vec::new(),
+        interp_depth: 1,
+    };
+    let e = p.nested_expr();
+    *next_id = p.next_id;
+    if p.dg.count() > 0 {
+        return None;
+    }
+    if !p.at_eof() {
+        p.error_here("erwartet genau einen ausdruck in einer interpolation");
+        return None;
+    }
+    Some(e)
+}
+
 pub fn parse_module(toks: &[Token], dg: &mut Diags, file: u32, base_id: u32) -> Program {
     crate::sema_generic::hook_prescan(toks);
     let mut p = Parser {
@@ -1562,8 +1803,19 @@ pub fn parse_module(toks: &[Token], dg: &mut Diags, file: u32, base_id: u32) -> 
         modules: HashSet::new(),
         loop_depth: 0,
         pending_attrs: Vec::new(),
+        hoist: Vec::new(),
+        interp_depth: 0,
     };
-    p.program()
+    let prog = p.program();
+    if !p.hoist.is_empty() {
+        // f"..." auf ITEM-Ebene (z. B. in einer `const`): es gibt keine
+        // Anweisung, vor die die Textsegmente gehoben werden koennten.
+        p.dg.error(
+            Span::none(),
+            "interpolation f\"...\" ausserhalb einer anweisung (etwa in einer const) ist nicht sagbar".to_string(),
+        );
+    }
+    prog
 }
 
 #[cfg(test)]
