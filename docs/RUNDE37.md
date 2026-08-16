@@ -31,7 +31,47 @@ also der Hebel, nicht (nur) die Zuteilung.
 | 0 | Baseline (97ec31a) | 1,94× | 4,82× | — |
 | A | Inline-Grenzen 40/8 → 60/10 | 2,04× | 4,87× | **VERWORFEN**: kein Gewinn, bricht `520_gc_weak [opt]` (Exit 6) + selbst_vergleich (firnc1: 127 bei bubblesort) — latenter inline.rs-Fehler bei groesseren Bloecken. Ruecknahme. |
 | B | Sprung-Fallthrough (Br/BrCond/cmp+jcc, Ziel==naechster Block) + `cmp` direkt ins Zielregister | 1,76× | 4,64× | ✅ 640/640, Commit 977a2ad |
-| C | Registerpools rsi/rdi (ohne call/memop) + rdx (ohne call/div/select) im linear scan | 1,71× | 4,42× | in Verifikation |
+| C | Registerpools rsi/rdi (ohne call/memop) + rdx (ohne call/div/select) im linear scan | 1,71× | 4,42× | ✅ 640/640, Commit ef4e530 |
+| D | Inline-Grenzen 60/32 + DAG-Ausnahme | 1,50× | 3,69×…8,20× | **VERWORFEN** (siehe unten) |
+| E | Shift mit konstantem Abstand als Sofortform (`shl $k`), direkt im Zielregister | 1,71× | 4,36× | ✅ (im Rauschen; Ir −0,003 %) |
+
+## Der Inline-Lehrstueckpfad (D)
+
+Mehrere Grenzvarianten wurden durchgemessen; die Erkenntnisse sind wichtiger
+als die verworfene Aenderung:
+
+* **`__gc_scrub_tief` ist rekursiv und scrubbt den Stapel ueber die
+  RekursionsTIEFE.** Inlining entrollt eine Stufe und verlagert den
+  4-KiB-Puffer in den Aufrufer-Rahmen — das Scrubben verliert seine Wirkung,
+  `520_gc_weak` fiel mit Exit 6 aus, selbst_vergleich mit firnc1 rc=127.
+  → **Behalten: selbst-erreichbare (rekursive) Ruempfe werden nie
+  eingebettet** (`erreicht_sich_selbst` in inline.rs, vorberechnet).
+* **`520_gc_weak` ist rahmenlayout-fragil** (konservativer Stapel-Scan ohne
+  Scrub zwischen `anlegen` und `gc_collect`): schon das Einbetten von
+  `__gc_strong_raw` (Wertrumpf → Ergebnis-Alloca im Caller) kippte den Test.
+  → Empfehlung an die GC-Runde: Stapel-Scrub im Testpfad robust machen.
+* **`eingabe_pruefen` (49 Insts/29 Bloecke) einzubetten sprengt `tokenize`
+  ueber die Regalloc-Sicherheitsgrenze** (nv×nb ≈ 8M → reines Stack-Modell)
+  → 7,7×. Aggressiveres Inlining braucht ZUERST einen Regalloc, der grosse
+  Funktionen verkraftet (Intervall-Splitting; die 8M-Grenze ist ein
+  Sicherheitsnetz, keine Loesung).
+* Nebenbefund: `hat_schleife` per Nummerntest (`ziel <= id`) erkannte nach
+  `merge-blocks` falsche Schleifen (Join `bb14→bb12`) — ersetzt durch echten
+  Zyklentest; Eigenschaften werden jetzt einmal vorberechnet statt pro Scan
+  (Endlos-Uebersetzungszeit behoben).
+
+## Staendig sichtbare Muster im erzeugten Code (Karte fuer Runde 38+)
+
+* **445×** statisch `mov [rbp-X], rA` gefolgt von `mov rA, [rbp-X]`
+  (Spill-Store mit sofortigem Reload desselben Werts) — ein
+  Register-Deskriptor-Cache im RA-Emissionspfad wuerde sie streichen.
+* **7391×** reg→reg-`mov` statisch: die SSA-Form schreibt jede Instruktion in
+  "ihr" Register, der Verbraucher movt weiter — klassisches **Coalescing**
+  (Use bekommt das Register des einzigen Produzenten) ist der naechste grosse
+  Hebel, zusammen mit Intervall-Splitting.
+* Strukturell: `dekodiere` (31 % Ir) ist ein eigener UTF-8→UTF-32-Durchgang,
+  den html5ever nicht braucht; `eingabe_pruefen` kostet als Aufruf ~108
+  Ir/Zeichen. Das ist Architektur des Benchmarks, nicht Optimierer-Versagen.
 
 ## Firn-Seite (firnc1)
 
