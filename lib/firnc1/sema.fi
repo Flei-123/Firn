@@ -33,10 +33,12 @@ import ast
 import typen
 import muster
 import fehler
+import gc
+import nogc
 
 export { Sema, sema_neu, sema_frei, sema_lauf, sema_fehler, sema_typ,
          sema_typen, sema_typ_anzahl, sema_braucht_comptime, sema_konst_wert,
-         sema_mu_setzen, sema_fe_setzen }
+         sema_mu_setzen, sema_fe_setzen, sema_gc_setzen, sema_baum }
 
 const KEIN: u32 = 4294967295
 
@@ -60,6 +62,7 @@ struct Sema {
     ret: u32,            // Rueckgabetyp der laufenden Funktion
     mu: u64,             // Register der Aufzaehlungen/Musterabgleiche (0 = keins)
     feh: u64,            // Register der Fehlermengen/-unionen (0 = keins)
+    gc: u64,             // Registrierung der gc-Klassen (Runde 34; 0 = keine)
     fehler: usize,
     ct_noetig: bool,     // eine Konstante braucht Auswertung zur Uebersetzungszeit
 }
@@ -72,7 +75,7 @@ fn sema_neu(b: u64, it: u64) -> Sema {
         v_name: vec_neu[u32](), v_typ: vec_neu[u32](), b_grenze: vec_neu[u32](),
         k_name: vec_neu[u32](), k_typ: vec_neu[u32](), k_wert: vec_neu[u64](),
         t_bool: 0, t_i64: 0, t_usize: 0, t_void: 0, t_fehler: 0, t_f64: 0,
-        ret: 0, mu: 0, feh: 0, fehler: 0, ct_noetig: false,
+        ret: 0, mu: 0, feh: 0, gc: 0, fehler: 0, ct_noetig: false,
     }
 }
 
@@ -100,6 +103,15 @@ fn sema_fe_setzen(s: *mut Sema, f: u64) { (*s).feh = f }
 
 fn fe(s: *mut Sema) -> *mut fehler.Fehler { return (*s).feh as *mut fehler.Fehler }
 fn hat_fe(s: *mut Sema) -> bool { return (*s).feh != 0 }
+
+// Die gc-Registrierung anmelden (Runde 34). MUSS vor `sema_lauf` stehen.
+fn sema_gc_setzen(s: *mut Sema, g: u64) { (*s).gc = g }
+
+fn gcp(s: *mut Sema) -> *mut gc.Gc { return (*s).gc as *mut gc.Gc }
+fn hat_gc(s: *mut Sema) -> bool { return (*s).gc != 0 }
+
+// Der Baum hinter diesem Lauf (fuer `nogc.fi`).
+fn sema_baum(s: *mut Sema) -> *mut ast.Baum { return (*s).b as *mut ast.Baum }
 fn sema_braucht_comptime(s: *mut Sema) -> bool { return (*s).ct_noetig }
 fn sema_typen(s: *mut Sema) -> *mut typen.Typen { return &(*s).ty }
 fn sema_typ_anzahl(s: *mut Sema) -> usize { return vec_len[u32](&(*s).etyp) }
@@ -276,6 +288,14 @@ fn probe_t(s: *mut Sema, e: u32, d: u32) -> u32 {
         if bt == KEIN {
             return KEIN
         }
+        // HOOK gc: Feldzugriff durch `Gc[T]` hindurch, ohne zu melden
+        // (sema.rs::probe_d ueber gc::hook_field_base).
+        if hat_gc(s) {
+            let si: u32 = gc.gc_feld_basis(gcp(s), tafel(s), bt)
+            if si != KEIN {
+                return typen.st_feld_typ(tafel(s), si as usize, ast.e_b(b, e))
+            }
+        }
         if typen.ty_art(tafel(s), bt) != typen.K_STRUCT {
             return KEIN
         }
@@ -311,6 +331,19 @@ fn probe_t(s: *mut Sema, e: u32, d: u32) -> u32 {
                     return KEIN
                 }
                 return fehler.fehler_u_valty(fe(s), u)
+            }
+        }
+        if hat_gc(s) {
+            // HOOK gc (gc.rs::probe_typ): `weak`/`stark`/`x.as?[C]` OHNE
+            // Pruefung — damit ein Ganzzahlliteral daneben seinen Typ
+            // bekommt.
+            var argt: u32 = KEIN
+            if ast.e_c(b, e) > 0 {
+                argt = probe_t(s, ast.kind_at(b, ast.e_b(b, e)), d + 1)
+            }
+            let pt: u32 = gc.gc_probe_typ(gcp(s), tafel(s), namen(s), ast.e_a(b, e), argt)
+            if pt != KEIN {
+                return pt
             }
         }
         let f: u32 = fn_suchen(s, ast.e_a(b, e))
@@ -478,6 +511,15 @@ fn austypen(s: *mut Sema, e: u32) {
 }
 
 fn feld_typ(s: *mut Sema, bt: u32, name: u32) -> u32 {
+    // HOOK gc: Feldzugriff durch `Gc[T]` hindurch (gc.rs::hook_field_base).
+    // Ein Gc-Zeiger wird gefolgt, ohne `(*p).feld` — er ist erstklassig.
+    if hat_gc(s) {
+        let si: u32 = gc.gc_feld_basis(gcp(s), tafel(s), bt)
+        if si != KEIN {
+            let st: u32 = typen.neuer_typ(tafel(s), typen.K_STRUCT, si, 0)
+            return feld_typ(s, st, name)
+        }
+    }
     if typen.ty_art(tafel(s), bt) == typen.K_STRUCT {
         let ft: u32 = typen.st_feld_typ(tafel(s), typen.ty_a(tafel(s), bt) as usize, name)
         if ft == KEIN {
@@ -658,7 +700,12 @@ fn binaer(s: *mut Sema, e: u32, hinweis: u32) -> u32 {
         if ist_fehler(s, lt) || ist_fehler(s, rt) {
             return (*s).t_bool
         }
-        if !typen.vertraeglich(tafel(s), lt, rt) {
+        // HOOK gc: Identitaetsvergleich zweier verwandter Gc-Zeiger (gc.rs).
+        var gleiche: bool = typen.vertraeglich(tafel(s), lt, rt)
+        if !gleiche && hat_gc(s) {
+            gleiche = gc.gc_ist_verwandt((*s).gc, tafel(s), lt, rt)
+        }
+        if !gleiche {
             meckern(s)
             return (*s).t_bool
         }
@@ -740,6 +787,186 @@ fn binaer(s: *mut Sema, e: u32, hinweis: u32) -> u32 {
     return lt
 }
 
+// ------------------------------------------------- gc (gc.rs)
+//
+// `gc C{...}` liefert `AllocError!Gc[C]` (check_neu in Stufe 0). Der
+// Aufrufname traegt die Klasse ("gc C"), das einzige Argument ist das
+// Structliteral mit den Anfangswerten.
+
+fn gc_neu_pruefen(s: *mut Sema, e: u32) -> u32 {
+    let b: *mut ast.Baum = baum(s)
+    let name: u32 = ast.e_a(b, e)
+    var slit: u32 = KEIN
+    if ast.e_c(b, e) == 1 {
+        let a0: u32 = ast.kind_at(b, ast.e_b(b, e))
+        if ast.e_art(b, a0) == ast.E_SLIT {
+            slit = a0
+        }
+    }
+    let ki_i: i64 = gc.gc_klasse_aus_neu(gcp(s), namen(s), name)
+    if ki_i < 0 {
+        // unbekannte gc-klasse
+        if slit != KEIN {
+            var k: u32 = 0
+            while k < ast.e_c(b, slit) {
+                austypen(s, ast.kind_at(b, ast.e_b(b, slit) + k * 2 + 1))
+                k = k + 1
+            }
+        }
+        meckern(s)
+        return (*s).t_fehler
+    }
+    let ki: u32 = ki_i as u32
+    let sidx: u32 = gc.gc_sidx(gcp(s), ki)
+    if slit != KEIN {
+        let off: u32 = ast.e_b(b, slit)
+        let anz: u32 = ast.e_c(b, slit)
+        var k: u32 = 0
+        while k < anz {
+            let fname: u32 = ast.kind_at(b, off + k * 2)
+            let fexpr: u32 = ast.kind_at(b, off + k * 2 + 1)
+            // doppelt angegeben?
+            var j: u32 = 0
+            while j < k {
+                if ast.kind_at(b, off + j * 2) == fname {
+                    meckern(s)
+                }
+                j = j + 1
+            }
+            let want: u32 = typen.st_feld_typ(tafel(s), sidx as usize, fname)
+            if want == KEIN {
+                austypen(s, fexpr)
+                meckern(s)
+            } else {
+                let got: u32 = ausdruck(s, fexpr, want)
+                if !ist_fehler(s, got) && !typen.vertraeglich(tafel(s), got, want) {
+                    meckern(s)
+                }
+            }
+            k = k + 1
+        }
+        // Bei einer gc-Allokation muessen ALLE Felder angegeben werden.
+        if anz != typen.st_flen(tafel(s), sidx as usize) {
+            meckern(s)
+        }
+    }
+    // Die fehlbare Allokation: AllocError!Gc[C] (DESIGNZIELE §2). Die Menge
+    // kommt mit der automatisch eingezogenen Laufzeit (lib/gc/gc.fi).
+    if !hat_fe(s) {
+        meckern(s)
+        return (*s).t_fehler
+    }
+    var ae: [u8; 10] = "AllocError"
+    let aen: u32 = intern.intern_nummer(namen(s), (&ae[0]) as u64, 10) as u32
+    let sm: u32 = fehler.fehler_menge_finden(fe(s), aen)
+    if sm == KEIN {
+        meckern(s)
+        return (*s).t_fehler
+    }
+    let st: u32 = typen.neuer_typ(tafel(s), typen.K_STRUCT, sidx, 0)
+    let val: u32 = typen.neuer_typ(tafel(s), typen.K_PTR, st, 1)
+    let ut: u32 = fehler.fehler_union_bauen(fe(s), tafel(s), namen(s), sm, val)
+    let ui: u32 = fehler.fehler_union_von_typ(fe(s), tafel(s), ut)
+    if ui != KEIN {
+        gc.gc_union_setzen(gcp(s), ki, ui)
+    }
+    // Der Literal-Knoten selbst traegt den Union-Typ (Stufe 0: `record`).
+    if slit != KEIN {
+        merke(s, slit, ut)
+    }
+    return ut
+}
+
+// `x.as?[C]` — die gepruefte Abwaertsumwandlung (check_as in Stufe 0).
+fn gc_as_pruefen(s: *mut Sema, e: u32) -> u32 {
+    let b: *mut ast.Baum = baum(s)
+    let name: u32 = ast.e_a(b, e)
+    let zi: i64 = gc.gc_klasse_aus_as(gcp(s), namen(s), name)
+    if zi < 0 {
+        var k: u32 = 0
+        while k < ast.e_c(b, e) {
+            austypen(s, ast.kind_at(b, ast.e_b(b, e) + k))
+            k = k + 1
+        }
+        meckern(s)
+        return (*s).t_fehler
+    }
+    let ziel: u32 = zi as u32
+    if ast.e_c(b, e) == 0 {
+        meckern(s)
+        return (*s).t_fehler
+    }
+    let arg: u32 = ast.kind_at(b, ast.e_b(b, e))
+    let at: u32 = ausdruck(s, arg, KEIN)
+    if ist_fehler(s, at) {
+        return (*s).t_fehler
+    }
+    var quelle: u32 = KEIN
+    if typen.ty_art(tafel(s), at) == typen.K_PTR {
+        let inner: u32 = typen.ty_a(tafel(s), at)
+        if typen.ty_art(tafel(s), inner) == typen.K_STRUCT {
+            quelle = gc.gc_klasse_von_struct(gcp(s), typen.ty_a(tafel(s), inner))
+        }
+    }
+    if quelle == KEIN {
+        // '.as?[C]' erwartet einen Gc[T]
+        meckern(s)
+        return (*s).t_fehler
+    }
+    if quelle != ziel && !gc.gc_ist_nachfahre(gcp(s), ziel, quelle) && !gc.gc_ist_nachfahre(gcp(s), quelle, ziel) {
+        // die beiden Klassen sind nicht verwandt
+        meckern(s)
+        return (*s).t_fehler
+    }
+    let st: u32 = typen.neuer_typ(tafel(s), typen.K_STRUCT, gc.gc_sidx(gcp(s), ziel), 0)
+    return typen.neuer_typ(tafel(s), typen.K_PTR, st, 1)
+}
+
+// `weak(g)` und `stark(w)` (der Rest von hook_call in Stufe 0).
+fn gc_schwach_pruefen(s: *mut Sema, e: u32, ist_weak: bool) -> u32 {
+    let b: *mut ast.Baum = baum(s)
+    if ast.e_c(b, e) != 1 {
+        var k: u32 = 0
+        while k < ast.e_c(b, e) {
+            austypen(s, ast.kind_at(b, ast.e_b(b, e) + k))
+            k = k + 1
+        }
+        meckern(s)
+        return (*s).t_fehler
+    }
+    let arg: u32 = ast.kind_at(b, ast.e_b(b, e))
+    let at: u32 = ausdruck(s, arg, KEIN)
+    if ist_fehler(s, at) {
+        return (*s).t_fehler
+    }
+    if ist_weak {
+        var ki: u32 = KEIN
+        if typen.ty_art(tafel(s), at) == typen.K_PTR {
+            let inner: u32 = typen.ty_a(tafel(s), at)
+            if typen.ty_art(tafel(s), inner) == typen.K_STRUCT {
+                ki = gc.gc_klasse_von_struct(gcp(s), typen.ty_a(tafel(s), inner))
+            }
+        }
+        if ki == KEIN {
+            // 'weak' erwartet einen Gc[T]
+            meckern(s)
+            return (*s).t_fehler
+        }
+        return typen.neuer_typ(tafel(s), typen.K_STRUCT, gc.gc_widx(gcp(s), ki), 0)
+    }
+    var ki: u32 = KEIN
+    if typen.ty_art(tafel(s), at) == typen.K_STRUCT {
+        ki = gc.gc_klasse_von_weak(gcp(s), typen.ty_a(tafel(s), at))
+    }
+    if ki == KEIN {
+        // 'stark' erwartet einen GcWeak[T]
+        meckern(s)
+        return (*s).t_fehler
+    }
+    let st: u32 = typen.neuer_typ(tafel(s), typen.K_STRUCT, gc.gc_sidx(gcp(s), ki), 0)
+    return typen.neuer_typ(tafel(s), typen.K_PTR, st, 1)
+}
+
 fn ruf(s: *mut Sema, e: u32) -> u32 {
     let b: *mut ast.Baum = baum(s)
     // `size_of[T]()` — kein gewoehnlicher Aufruf, sondern eine Groesse zur
@@ -791,6 +1018,49 @@ fn ruf(s: *mut Sema, e: u32) -> u32 {
         }
         if muster.mus_ist_ctorname(namen(s), name) {
             return ctor_pruefen(s, name, e)
+        }
+    }
+    // HOOK gc (gc.rs::hook_call): `gc C{...}`, die beiden Intrinsics,
+    // `x.as?[C]`, `weak(g)` und `stark(w)`. Steht vor der Funktionssuche —
+    // ausser `weak`/`stark`: eine gleichnamige EIGENE Funktion gewinnt
+    // (in Stufe 0: `ck.fns.contains_key(name)`).
+    if hat_gc(s) {
+        if gc.gc_hat_neu_praefix(namen(s), name) {
+            return gc_neu_pruefen(s, e)
+        }
+        if gc.gc_zustandsname(namen(s), name) != 0 {
+            var k: u32 = 0
+            while k < anz {
+                austypen(s, ast.kind_at(b, off + k))
+                k = k + 1
+            }
+            let u8t: u32 = typen.neuer_typ(tafel(s), typen.K_U8, 0, 0)
+            return typen.neuer_typ(tafel(s), typen.K_PTR, u8t, 1)
+        }
+        if gc.gc_hat_as_praefix(namen(s), name) {
+            return gc_as_pruefen(s, e)
+        }
+        if (gc.gc_ist_weak_name(namen(s), name) || gc.gc_ist_stark_name(namen(s), name)) && fn_suchen(s, name) == KEIN {
+            return gc_schwach_pruefen(s, e, gc.gc_ist_weak_name(namen(s), name))
+        }
+        // `barrier(x)` (ct.rs): die undurchsichtige Sperre — Verhalten ist
+        // die Identitaet, geprueft wird nur die Skalaritaet. Eine eigene
+        // Funktion namens `barrier` gewinnt (ct.rs::hook_call).
+        var bw: [u8; 7] = "barrier"
+        if intern.intern_gleich(namen(s), name, (&bw[0]) as u64, 7) && fn_suchen(s, name) == KEIN {
+            if anz != 1 {
+                meckern(s)
+                return (*s).t_fehler
+            }
+            let at: u32 = ausdruck(s, ast.kind_at(b, off), KEIN)
+            if ist_fehler(s, at) {
+                return (*s).t_fehler
+            }
+            if !ist_int(s, at) && !ist_bool(s, at) && !typen.ist_zeiger(tafel(s), at) {
+                meckern(s)
+                return (*s).t_fehler
+            }
+            return at
         }
     }
     let f: u32 = fn_suchen(s, name)
@@ -1700,6 +1970,15 @@ fn sema_lauf(s: *mut Sema) {
         fehler.fehler_anmelden((*s).feh, tafel(s), namen(s))
         typen.typen_fehler_setzen(tafel(s), (*s).feh)
     }
+    // 0c. gc-Klassen: als Structs anmelden — NACH den Fehlermengen, VOR den
+    //    Structs des Baums, genau wie `declare_classes` in Stufe 0. Die
+    //    Typaufloesung bekommt das Register, damit sie `__gc#p:`/`__gc#w:`-
+    //    Platzhalter aufloesen kann (derselbe Uebergabepunkt wie `__eu#<n>`).
+    var gc_bisher: usize = 0
+    if hat_gc(s) {
+        gc.gc_anmelden((*s).gc, tafel(s), namen(s))
+        typen.typen_gc_setzen(tafel(s), (*s).gc)
+    }
     // 1. Structlayout und Funktionssignaturen — dieselbe Rechnung wie in
     //    `typen.fi`, hier einmal fuer alles.
     typen.typen_aufloesen(tafel(s), b, namen(s))
@@ -1721,6 +2000,17 @@ fn sema_lauf(s: *mut Sema) {
         while mk < mf {
             meckern(s)
             mk = mk + 1
+        }
+    }
+    // 1c. gc-Klassen: Feldlayout festlegen — erst hier sind die Structs des
+    //    Programms bekannt (`layout_classes` in Stufe 0). Fehler daraus
+    //    (unbekannte Basis, Ringe, verbotene Feldtypen) zaehlen mit.
+    if hat_gc(s) {
+        gc.gc_layout((*s).gc, tafel(s), b, namen(s))
+        let gj: usize = gc.gc_fehler(gcp(s))
+        while gc_bisher < gj {
+            meckern(s)
+            gc_bisher = gc_bisher + 1
         }
     }
 
@@ -1784,6 +2074,28 @@ fn sema_lauf(s: *mut Sema) {
         while fe_bisher < fj {
             meckern(s)
             fe_bisher = fe_bisher + 1
+        }
+    }
+    if hat_gc(s) {
+        // gc-Typfehler, die erst in einem RUMPF auftraten (unbekannte
+        // Klasse in `Gc[...]`, Klassenname als Werttyp).
+        let gj: usize = gc.gc_fehler(gcp(s))
+        while gc_bisher < gj {
+            meckern(s)
+            gc_bisher = gc_bisher + 1
+        }
+        // 6. `#[no_gc]` transitiv pruefen (nogc.rs). Laeuft NACH der
+        //    Typpruefung, weil Regel 3 (Schreiben in ein Gc[T]-Feld) die
+        //    Typtabelle braucht.
+        var mu2: u64 = 0
+        if hat_mu(s) {
+            mu2 = (*s).mu
+        }
+        let nf: usize = nogc.nogc_pruefen(s as u64, mu2, (*s).gc, (*s).it)
+        var nk: usize = 0
+        while nk < nf {
+            meckern(s)
+            nk = nk + 1
         }
     }
 }

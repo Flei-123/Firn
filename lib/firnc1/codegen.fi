@@ -34,8 +34,9 @@ import rt
 import vec
 import intern
 import fir
+import gc
 
-export { Cg, cg_neu, cg_frei, cg_lauf, cg_ungeeignet, cg_text }
+export { Cg, cg_neu, cg_frei, cg_lauf, cg_ungeeignet, cg_text, cg_gc_setzen }
 
 const KEIN: u32 = 4294967295
 
@@ -47,6 +48,7 @@ struct Cg {
     aslot: Vec[u64]     // Versatz des alloca-Bereichs je Wert, 0 = keiner
     rahmen: u64
     ungeeignet: bool
+    gcr: u64            // gc-Registrierung (Runde 34), 0 = keine Klassen
 }
 
 fn cg_neu(f: u64, it: u64) -> Cg {
@@ -54,8 +56,19 @@ fn cg_neu(f: u64, it: u64) -> Cg {
         f: f, it: it,
         aus: rt.buf_neu(),
         slot: vec_neu[u64](), aslot: vec_neu[u64](),
-        rahmen: 0, ungeeignet: false,
+        rahmen: 0, ungeeignet: false, gcr: 0,
     }
+}
+
+// Die gc-Registrierung anmelden (Runde 34): sie traegt Groesse, Typkennung
+// und Feldoffsets jeder Klasse — daraus entsteht die Typtabelle des Sammlers.
+fn cg_gc_setzen(c: *mut Cg, g: u64) { (*c).gcr = g }
+fn gcg(c: *mut Cg) -> *mut gc.Gc { return (*c).gcr as *mut gc.Gc }
+fn hat_gc(c: *mut Cg) -> bool {
+    if (*c).gcr == 0 {
+        return false
+    }
+    return gc.gc_hat_klassen(gcg(c))
 }
 
 fn cg_frei(c: *mut Cg) {
@@ -752,6 +765,161 @@ fn emit_copymem(c: *mut Cg, ziel: u32, quelle: u32, groesse: u64) {
 
 // ------------------------------------------------------------------- Lauf
 
+// `Op::GcAddr` — Adresse des Zustandsblocks des Sammlers in `rax`.
+// Mit regs=1 werden vorher die callee-saved Register in den Block gerettet
+// (Offset 3968, gc.rs REG_SAVE_OFF), sonst waere die Zusage "konservativer
+// Stapel- UND Registerscan" (SPEC 3.5.3) falsch. Diese Stufe hat keine
+// Registerzuteilung; die Rettung ist trotzdem dieselbe — sie kostet sechs
+// `mov` und haelt den Vertrag wortgleich.
+fn emit_gcaddr(c: *mut Cg, regs: u64, dst: u32) {
+    ein(c)
+    var m: [u8; 31] = "lea rax, [rip + .L__gc_zustand]"
+    w(c, (&m[0]) as u64, 31)
+    nl(c)
+    if regs == 1 {
+        var tab: [u8; 23] = "rbx|rbp|r12|r13|r14|r15"
+        var k: u32 = 0
+        while k < 6 {
+            ein(c)
+            var mv: [u8; 19] = "mov qword ptr [rax+"
+            w(c, (&mv[0]) as u64, 19)
+            zahl(c, 3968 + k as u64 * 8)
+            var mm: [u8; 3] = "], "
+            w(c, (&mm[0]) as u64, 3)
+            stueck(c, (&tab[0]) as u64, 23, k)
+            nl(c)
+            k = k + 1
+        }
+    }
+    speichere_slot(c, slot_von(c, dst), R_AX)
+}
+
+// Die compilergenerierte Typtabelle des Sammlers (`.rodata`) und der
+// Zustandsblock (`.data`) — das Format steht in gc.rs (`typtabelle_asm`)
+// und ist verbindlich, weil die Laufzeit es liest:
+//   wort 0: n_typen;  eintrag(tid) = tabelle + 8 + (tid-1)*64
+//   +0 groesse · +8 basis-tid · +16 n stark · +24 offsetliste ·
+//   +32 n schwach · +40 offsetliste · +48 tid · +56 reserviert
+fn gc_tabelle(c: *mut Cg) {
+    let g: *mut gc.Gc = gcg(c)
+    var sec: [u8; 16] = ".section .rodata"
+    t(c, (&sec[0]) as u64, 16)
+    nl(c)
+    var al: [u8; 8] = ".align 8"
+    t(c, (&al[0]) as u64, 8)
+    nl(c)
+    var lab: [u8; 18] = ".L__gc_typtabelle:"
+    t(c, (&lab[0]) as u64, 18)
+    nl(c)
+    ein(c)
+    var q: [u8; 6] = ".quad "
+    w(c, (&q[0]) as u64, 6)
+    zahl(c, gc.gc_anzahl(g) as u64)
+    nl(c)
+    var i: u32 = 0
+    while i < gc.gc_anzahl(g) as u32 {
+        ein(c)
+        w(c, (&q[0]) as u64, 6)
+        zahl(c, gc.gc_size(g, i))
+        nl(c)
+        ein(c)
+        w(c, (&q[0]) as u64, 6)
+        zahl(c, gc.gc_basis_tid(g, i))
+        nl(c)
+        ein(c)
+        w(c, (&q[0]) as u64, 6)
+        zahl(c, gc.gc_stark_anzahl(g, i) as u64)
+        nl(c)
+        ein(c)
+        w(c, (&q[0]) as u64, 6)
+        var ls: [u8; 19] = ".L__gc_typtabelle.s"
+        w(c, (&ls[0]) as u64, 19)
+        zahl(c, gc.gc_tid(g, i))
+        nl(c)
+        ein(c)
+        w(c, (&q[0]) as u64, 6)
+        zahl(c, gc.gc_schwach_anzahl(g, i) as u64)
+        nl(c)
+        ein(c)
+        w(c, (&q[0]) as u64, 6)
+        var lw: [u8; 19] = ".L__gc_typtabelle.w"
+        w(c, (&lw[0]) as u64, 19)
+        zahl(c, gc.gc_tid(g, i))
+        nl(c)
+        ein(c)
+        w(c, (&q[0]) as u64, 6)
+        zahl(c, gc.gc_tid(g, i))
+        nl(c)
+        ein(c)
+        w(c, (&q[0]) as u64, 6)
+        zahl(c, 0)
+        nl(c)
+        i = i + 1
+    }
+    i = 0
+    while i < gc.gc_anzahl(g) as u32 {
+        var ls2: [u8; 19] = ".L__gc_typtabelle.s"
+        t(c, (&ls2[0]) as u64, 19)
+        zahl(c, gc.gc_tid(g, i))
+        var dp: [u8; 1] = ":"
+        t(c, (&dp[0]) as u64, 1)
+        nl(c)
+        var j: u32 = 0
+        while j < gc.gc_stark_anzahl(g, i) {
+            ein(c)
+            w(c, (&q[0]) as u64, 6)
+            zahl(c, gc.gc_stark_off(g, i, j))
+            nl(c)
+            j = j + 1
+        }
+        ein(c)
+        w(c, (&q[0]) as u64, 6)
+        zahl(c, 0)
+        nl(c)
+        var lw2: [u8; 19] = ".L__gc_typtabelle.w"
+        t(c, (&lw2[0]) as u64, 19)
+        zahl(c, gc.gc_tid(g, i))
+        t(c, (&dp[0]) as u64, 1)
+        nl(c)
+        j = 0
+        while j < gc.gc_schwach_anzahl(g, i) {
+            ein(c)
+            w(c, (&q[0]) as u64, 6)
+            zahl(c, gc.gc_schwach_off(g, i, j))
+            nl(c)
+            j = j + 1
+        }
+        ein(c)
+        w(c, (&q[0]) as u64, 6)
+        zahl(c, 0)
+        nl(c)
+        i = i + 1
+    }
+    // Zustandsblock: beschreibbar, wort 0 zeigt auf die Typtabelle.
+    var sd: [u8; 14] = ".section .data"
+    t(c, (&sd[0]) as u64, 14)
+    nl(c)
+    var a16: [u8; 9] = ".align 16"
+    t(c, (&a16[0]) as u64, 9)
+    nl(c)
+    var zl: [u8; 15] = ".L__gc_zustand:"
+    t(c, (&zl[0]) as u64, 15)
+    nl(c)
+    ein(c)
+    w(c, (&q[0]) as u64, 6)
+    var lt: [u8; 17] = ".L__gc_typtabelle"
+    w(c, (&lt[0]) as u64, 17)
+    nl(c)
+    ein(c)
+    var zz: [u8; 6] = ".zero "
+    w(c, (&zz[0]) as u64, 6)
+    zahl(c, 4088)
+    nl(c)
+    var st: [u8; 14] = ".section .text"
+    t(c, (&st[0]) as u64, 14)
+    nl(c)
+}
+
 fn emit_inst(c: *mut Cg, fnr: u32, i: u32) {
     let f: *mut fir.Fir = ff(c)
     let art: u32 = fir.i_art_von(f, i)
@@ -803,6 +971,10 @@ fn emit_inst(c: *mut Cg, fnr: u32, i: u32) {
     }
     if art == fir.O_COPYMEM {
         emit_copymem(c, fir.i_a_von(f, i), fir.i_b_von(f, i), fir.i_zahl_von(f, i))
+        return
+    }
+    if art == fir.O_GCADDR {
+        emit_gcaddr(c, fir.i_zahl_von(f, i), dst)
         return
     }
     (*c).ungeeignet = true
@@ -959,6 +1131,11 @@ fn cg_lauf(c: *mut Cg) {
             bb = bb + 1
         }
         fi = fi + 1
+    }
+    // HOOK gc: Typtabelle (.rodata) und Zustandsblock (.data) des Sammlers —
+    // nur, wenn das Programm ueberhaupt ein `gc class` enthaelt (gc.rs).
+    if hat_gc(c) {
+        gc_tabelle(c)
     }
     var gnu: [u8; 38] = ".section .note.GNU-stack,\"\",@progbits\n"
     t(c, (&gnu[0]) as u64, 38)
