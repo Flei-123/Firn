@@ -1642,3 +1642,34 @@ staendig mitgewandert: sie waren nur ueber ihre Fehlerunionen an die
 Erweiterungen gebunden. Die Kernsprache kann jetzt Fehler — der naechste
 ehrliche Schritt ist `gc`, der groesste verbleibende Block.
 
+
+## 24. Runde 35: `comptime` — der Compiler fuehrt Code zur Uebersetzungszeit aus
+
+Parallel zu Runde 34 in einem eigenen git-Worktree gebaut (Branch
+`r35-comptime`), weil comptime der isolierteste Restblock war; der Merge
+lief fast-forward ohne einen Konflikt.
+
+`lib/firnc1/zeit.fi` (689 Zeilen) ist ein echter Interpreter nach dem
+Vorbild von `compiler/src/comptime.rs`: die comptime-Bloecke der
+Wurzeldatei werden zur Uebersetzungszeit ausgefuehrt, ihr erzeugter
+Quelltext wird ueber dieselbe Lex/Parse-Maschinerie als Modul ohne Alias
+in denselben Baum gehaengt — noch vor der Monomorphisierung, mit
+demselben Interner. Der Parser liest `comptime { }` und weicht die
+Vorabsuche dafuer auf; der Treiber `bin/firnc1.fi` verdrahtet den Lauf
+zwischen Wurzelparser und `mono.gen_lauf`.
+
+Ehrliche Grenzen, benannt statt verschwiegen: comptime in importierten
+Modulen meldet `sema_braucht_comptime` weiter (nur die Wurzeldatei laeuft),
+und Konstanten, die zur Uebersetzungszeit ausgewertet werden muessten,
+aber nicht koennen, bleiben ein separater bekannter Fall.
+
+Messwerte nach dem Merge: `test.sh` 634/634, `selbst_vergleich` 169
+verhaltensgleiche Programme (vorher 166) bei 0 abweichend und 0
+fehlerhaft, Fixpunkt steht — Stufe 2 == Stufe 3, zeichengleich, 210 324
+Zeilen Assembler. Beide Zieldateien (601, 602 — darunter die
+UCD-Tabellen-Erzeugung, der haerteste comptime-Fall im Korpus) laufen
+identisch zu `firnc0`. Neu: `tests/760_comptime_kern.fi` und
+`docs/RUNDE35.md`.
+
+Uebrig bleiben: `gc` (9), konstante Laufzeit (4), `errdefer` (1) und die
+Attribute (1).
