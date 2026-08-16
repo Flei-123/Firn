@@ -87,3 +87,69 @@ sichtbar. Die Aussage ist durch die kurze Laufzeit begrenzt; der 30-Minuten-
 Dauerlauf (Stufe 4) ist der haertere Nachweis.
 
 Messartefakte: `tools/gc_mess/pause.tsv`, `tools/gc_mess/frag.tsv`.
+
+## Stufe 2 — Fragmentierung: leere Chunks gehen ans OS
+
+### Befund (Vorher, gemessen mit dem neuen Phasen-Test `frag2.fi`)
+
+`frag2.fi` faehrt einen Phasen-Workload: 300 Runden nur grosse Objekte
+(Klasse 2048, 24 Stapel im Ring), dann 300 Runden nur kleine (Klasse 48).
+Ergebnis mit dem alten Sweep:
+
+| Metrik | Vorher |
+|---|---|
+| RSS Phase A max | 20284 KiB |
+| RSS Phase B max | 24124 KiB (**steigt weiter**) |
+| RSS nach Schluss-`gc_collect()` | 24124 KiB (**faellt nie**) |
+
+Zwei getrennte Ursachen, beide in `lib/gc/gc.fi`:
+
+1. **Leere Klassen-Chunks gingen nie ans OS.** `__gc_sweep` gab nur
+   Grossobjekt-Chunks (`klasse >= KLASSEN`) per `munmap` zurueck; die
+   256-KiB-Klassen-Chunks blieben fuer immer gemappt, selbst komplett leere.
+2. **Die Sammel-Grenze war nach oben offen.** Nach dem letzten Lauf der
+   Gross-Phase war `GRENZE = lebbytes` ~ 9,5 MiB; die Klein-Phase alloziert
+   nur 3,8 MiB gesamt — es lief NIE wieder eine Sammlung, die toten Chunks
+   der Gross-Phase wurden nicht einmal mehr besucht. (gemessen: 300 Runden,
+   0 Sammellaeufe in Phase B)
+
+### Aenderung (nur `lib/gc/gc.fi`)
+
+- `__gc_sweep`: komplett leere Chunks JEDER Klasse werden ans OS
+  zurueckgegeben. Die Freilisten-Segmentabschneidung laeuft ueber den vor
+  dem Chunk gemerkten Listenkopf in O(1) — kein zweiter Durchgang.
+- **Hysterese** (Chunk-Kopf Offset 48, neu belegt und dokumentiert): ein
+  Chunk wird erst zurueckgegeben, wenn er zwei Sweeps in Folge leer war.
+  Ohne sie pendelt der Phasen-Test zwischen munmap/mmap — gemessen
+  +46 % Laufzeit (118 -> 176 ms); mit ihr: 123 ms, also churfrei.
+- **Grenzen-Kappe**: `MAX_GRENZE = 4 MiB` deckelt den Abstand zwischen zwei
+  Sammlungen. Der Speicherueberhang ueber der Lebendmenge ist damit immer
+  < 4 MiB, egal wie gross der Heap einmal war. Workloads mit kleinem Heap
+  (DOM-Soak ~ 1,3 MiB) merken davon nichts (`MIN_GRENZE` wirkt wie bisher).
+
+### Nachher (gleiche Tests, gleiche Maschine)
+
+| Metrik | Vorher | Nachher |
+|---|---|---|
+| frag: RSS Ende | 3140 KiB | 2624 KiB |
+| frag: Laufzeit | 63 ms | 58 ms |
+| frag2: Phase A max | 20284 KiB | 14400 KiB |
+| frag2: Phase B max | 24124 KiB | 16448 KiB |
+| frag2: RSS Ende | 24124 KiB | **2112 KiB** |
+| frag2: Laufzeit | 120 ms | 115 ms |
+
+Die RSS-Kurve in Phase B faellt jetzt MITTEN IM LAUF von selbst
+(16448 -> 13632 -> 2112 KiB ab Runde ~150), statt auf dem Maximum der
+Gross-Phase sitzen zu bleiben. `lebende` bleibt exakt 1200 (frag) bzw.
+4856 (frag2-Ring) — Verhalten der Sammlung unveraendert, nur die
+Speicherrueckgabe ist neu.
+
+Messlatte: test.sh **640/640**, selbst_vergleich **186/0/0**, Fixpunkt
+**zeichengleich (284207 Zeilen)**, 19 gc/rc-Tests ok, 6 gc-Negativtests
+rc!=0.
+
+Verbleibende Designgrenze (ehrlich benannt): Objekte, die ueber viele
+Chunks verstreut leben, halten diese Chunks — ohne Kompaktieren (durch den
+konservativen Scan untersagt) ist das nicht loesbar. Die Verstreuzahl haelt
+sich aber in Grenzen, weil Allokationen chunk-weise aus der Freiliste
+kommen.
