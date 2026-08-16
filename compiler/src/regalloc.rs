@@ -43,7 +43,7 @@
 //! seinen bewaehrten Grundpfad benutzt.
 
 use crate::codegen_x86::{block_label, label, size_word, Emitter, Frame, ARG_REGS};
-use crate::fir::{BinOp, Block, CmpOp, FTy, Func, Inst, Op, Term, UnOp, Val};
+use crate::fir::{BinOp, Block, BlockId, CmpOp, FTy, Func, Inst, Op, Term, UnOp, Val};
 use std::collections::HashMap;
 
 /// Ort eines Wertes nach der Zuteilung.
@@ -926,9 +926,12 @@ fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
         }
     }
     parallele_reg_bewegungen(e, &prolog_moves);
-    for b in &f.blocks {
+    for (bi, b) in f.blocks.iter().enumerate() {
         e.raw(&format!("{}:", block_label(&f.name, b.id)));
-        emit_block(e, &ra, b)?;
+        // Fallthrough: steht das Sprungziel unmittelbar dahinter, faellt der
+        // Sprung weg (spart pro BrCond mit else==naechster Block ein `jmp`).
+        let next = f.blocks.get(bi + 1).map(|nb| nb.id);
+        emit_block(e, &ra, b, next)?;
     }
     Ok(())
 }
@@ -993,7 +996,7 @@ fn epilogue(e: &mut Emitter, a: &Alloc) {
     e.line("ret");
 }
 
-fn emit_block(e: &mut Emitter, ra: &Ra, b: &Block) -> Result<(), String> {
+fn emit_block(e: &mut Emitter, ra: &Ra, b: &Block, next: Option<BlockId>) -> Result<(), String> {
     // VERSCHMELZUNG `cmp` + bedingter Sprung.
     //
     // Ohne sie kostet jeder Vergleich sieben Instruktionen: `cmp`, `setcc al`,
@@ -1025,11 +1028,15 @@ fn emit_block(e: &mut Emitter, ra: &Ra, b: &Block) -> Result<(), String> {
         emit_inst(e, ra, i)?;
     }
     if verschmelzbar {
-        return emit_cmp_br(e, ra, b);
+        return emit_cmp_br(e, ra, b, next);
     }
     let f = ra.f;
     match &b.term {
-        Term::Br(t) => e.line(&format!("jmp {}", block_label(&f.name, *t))),
+        Term::Br(t) => {
+            if next != Some(*t) {
+                e.line(&format!("jmp {}", block_label(&f.name, *t)));
+            }
+        }
         Term::Switch { val, .. } => {
             // `codegen_switch.rs` (Modul `types`) erwartet den Wert im Rahmen.
             let off = match ra.a.frame.slot.get(*val as usize) {
@@ -1063,8 +1070,14 @@ fn emit_block(e: &mut Emitter, ra: &Ra, b: &Block) -> Result<(), String> {
             } else {
                 e.line(&format!("test {}, {}", o, o));
             }
-            e.line(&format!("jnz {}", block_label(&f.name, *then_bb)));
-            e.line(&format!("jmp {}", block_label(&f.name, *else_bb)));
+            if next == Some(*else_bb) {
+                e.line(&format!("jnz {}", block_label(&f.name, *then_bb)));
+            } else if next == Some(*then_bb) {
+                e.line(&format!("jz {}", block_label(&f.name, *else_bb)));
+            } else {
+                e.line(&format!("jnz {}", block_label(&f.name, *then_bb)));
+                e.line(&format!("jmp {}", block_label(&f.name, *else_bb)));
+            }
         }
         Term::Ret(v) => {
             if let Some(v) = v {
@@ -1086,7 +1099,7 @@ fn emit_block(e: &mut Emitter, ra: &Ra, b: &Block) -> Result<(), String> {
 
 /// `cmp` und bedingter Sprung in einem: der Vergleich der letzten Instruktion
 /// des Blocks setzt die Flags, der Terminator liest sie unmittelbar.
-fn emit_cmp_br(e: &mut Emitter, ra: &Ra, b: &Block) -> Result<(), String> {
+fn emit_cmp_br(e: &mut Emitter, ra: &Ra, b: &Block, next: Option<BlockId>) -> Result<(), String> {
     let f = ra.f;
     let letzte = b.insts.last().ok_or("interner Fehler: leerer Block bei cmp+jcc")?;
     let (op, oty, a, bb) = match &letzte.op {
@@ -1118,9 +1131,32 @@ fn emit_cmp_br(e: &mut Emitter, ra: &Ra, b: &Block) -> Result<(), String> {
         (CmpOp::Ge, true) => "jge",
         (CmpOp::Ge, false) => "jae",
     };
-    e.line(&format!("{} {}", jcc, block_label(&f.name, then_bb)));
-    e.line(&format!("jmp {}", block_label(&f.name, else_bb)));
+    if next == Some(else_bb) {
+        e.line(&format!("{} {}", jcc, block_label(&f.name, then_bb)));
+    } else if next == Some(then_bb) {
+        e.line(&format!("{} {}", jcc_invers(jcc), block_label(&f.name, else_bb)));
+    } else {
+        e.line(&format!("{} {}", jcc, block_label(&f.name, then_bb)));
+        e.line(&format!("jmp {}", block_label(&f.name, else_bb)));
+    }
     Ok(())
+}
+
+/// Der Gegensprung (Fallthrough-Optimierung: Ziel und Fallthrough tauschen).
+fn jcc_invers(jcc: &str) -> &'static str {
+    match jcc {
+        "je" => "jne",
+        "jne" => "je",
+        "jl" => "jge",
+        "jge" => "jl",
+        "jb" => "jae",
+        "jae" => "jb",
+        "jle" => "jg",
+        "jg" => "jle",
+        "jbe" => "ja",
+        "ja" => "jbe",
+        _ => unreachable!("unbekannter Sprung {}", jcc),
+    }
 }
 
 fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
@@ -1181,8 +1217,15 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
                 (CmpOp::Ge, false) => "setae",
             };
             e.line(&format!("{} al", cc));
-            e.line("movzx eax, al");
-            ra.store_dst(e, d, "rax");
+            // direkt ins Zielregister breit machen — `rax` wird nie vergeben,
+            // darum ist `al` hier immer frei.
+            match ra.a.loc(d) {
+                Loc::Reg(dr) => e.line(&format!("movzx {}, al", rn(dr, 32))),
+                Loc::Slot(_) => {
+                    e.line("movzx eax, al");
+                    ra.store_dst(e, d, "rax");
+                }
+            }
         }
         Op::Un(op, x) => {
             let d = i.dst.ok_or("interner Fehler: Unaeroperation ohne Ziel")?;
