@@ -61,6 +61,12 @@ const CALLEE_SAVED: [&str; 5] = ["rbx", "r12", "r13", "r14", "r15"];
 /// einschliessen: dann kann weder der Aufruf selbst noch der Aufbau seiner
 /// Argumentliste (rdi, rsi, rdx, rcx, r8, r9, r10) den Wert zerstoeren.
 const TEMP_REGS: [&str; 4] = ["r11", "r10", "r9", "r8"];
+/// Argumentregister, die frei werden, solange das Intervall keinen
+/// `call`/`syscall` und kein `copymem`/`secure_zero` kreuzt (siehe `Iv`).
+const ARG_SPARE: [&str; 2] = ["rsi", "rdi"];
+/// `rdx` wird zusaetzlich von `div`/`rem`/`select` als Arbeitsregister
+/// benutzt — nur Intervalle, die all das nicht kreuzen, duerfen es tragen.
+const DIV_SPARE: [&str; 1] = ["rdx"];
 
 fn align_up(x: u64, a: u64) -> u64 {
     if a <= 1 {
@@ -429,6 +435,10 @@ struct Iv {
     end: usize,
     weight: u64,
     crosses_call: bool,
+    /// kreuzt `copymem`/`secure_zero` (sie schreiben `rdi`, `rsi`, `rcx`)
+    crosses_memop: bool,
+    /// kreuzt `div`/`rem`/`select` (sie schreiben `rdx` bzw. `rcx`)
+    crosses_divsel: bool,
 }
 
 /// Schleifentiefe je Block (Naeherung: Rueckwaertskante u->v mit v <= u
@@ -492,10 +502,21 @@ pub fn allocate(f: &Func) -> Alloc {
 
     // Aufrufpositionen (fuer `crosses_call`)
     let mut call_pos: Vec<usize> = Vec::new();
+    let mut memop_pos: Vec<usize> = Vec::new();
+    let mut divsel_pos: Vec<usize> = Vec::new();
     for (bi, b) in f.blocks.iter().enumerate() {
         for (ii, i) in b.insts.iter().enumerate() {
             if matches!(i.op, Op::Call { .. } | Op::Syscall { .. }) {
                 call_pos.push(live.pos[bi][ii]);
+            }
+            if matches!(i.op, Op::CopyMem { .. } | Op::SecureZero { .. }) {
+                memop_pos.push(live.pos[bi][ii]);
+            }
+            if matches!(
+                i.op,
+                Op::Bin(BinOp::Div | BinOp::Rem, _, _) | Op::Select { .. }
+            ) {
+                divsel_pos.push(live.pos[bi][ii]);
             }
         }
     }
@@ -572,7 +593,17 @@ pub fn allocate(f: &Func) -> Alloc {
         // Register bekommen; ihr Inhalt liegt weiterhin im Rahmen.
         let (s, e) = (start[v], end[v]);
         let cc = call_pos.iter().any(|&p| s <= p && p <= e);
-        ivs.push(Iv { val: v as Val, start: s, end: e, weight: weight[v], crosses_call: cc });
+        let cm = memop_pos.iter().any(|&p| s <= p && p <= e);
+        let cd = divsel_pos.iter().any(|&p| s <= p && p <= e);
+        ivs.push(Iv {
+            val: v as Val,
+            start: s,
+            end: e,
+            weight: weight[v],
+            crosses_call: cc,
+            crosses_memop: cm,
+            crosses_divsel: cd,
+        });
     }
     for (&c, _) in cells.iter() {
         let cv = c as usize;
@@ -584,6 +615,8 @@ pub fn allocate(f: &Func) -> Alloc {
         let s = 0usize;
         let e = end[cv];
         let cc = call_pos.iter().any(|&p| s <= p && p <= e);
+        let cm = memop_pos.iter().any(|&p| s <= p && p <= e);
+        let cd = divsel_pos.iter().any(|&p| s <= p && p <= e);
         // Zellen sind fast immer die heissesten Werte: Gewicht verdoppeln.
         ivs.push(Iv {
             val: c,
@@ -591,36 +624,84 @@ pub fn allocate(f: &Func) -> Alloc {
             end: e,
             weight: weight[cv].saturating_mul(2).max(1),
             crosses_call: cc,
+            crosses_memop: cm,
+            crosses_divsel: cd,
         });
     }
     ivs.sort_by_key(|i| (i.start, i.end, i.val));
 
     // ---- eigentlicher linear scan ----
+    //
+    // Vier Pools, vom beschraenktesten zum freiesten Register. `passt` prueft,
+    // ob ein Register die Kreuzungen eines Intervalls vertraegt.
+    fn passt(iv: &Iv, r: &str) -> bool {
+        if CALLEE_SAVED.contains(&r) {
+            return true;
+        }
+        if iv.crosses_call {
+            return false;
+        }
+        if TEMP_REGS.contains(&r) {
+            return true;
+        }
+        if ARG_SPARE.contains(&r) {
+            return !iv.crosses_memop;
+        }
+        if DIV_SPARE.contains(&r) {
+            return !iv.crosses_memop && !iv.crosses_divsel;
+        }
+        false
+    }
     let mut free_saved: Vec<&'static str> = CALLEE_SAVED.to_vec();
     let mut free_temp: Vec<&'static str> = TEMP_REGS.to_vec();
+    let mut free_arg: Vec<&'static str> = ARG_SPARE.to_vec();
+    let mut free_div: Vec<&'static str> = DIV_SPARE.to_vec();
     let mut active: Vec<(Iv, &'static str)> = Vec::new();
     let mut assign: HashMap<Val, &'static str> = HashMap::new();
     let mut used_saved: Vec<&'static str> = Vec::new();
+
+    let freigeben = |r: &'static str,
+                     free_saved: &mut Vec<&'static str>,
+                     free_temp: &mut Vec<&'static str>,
+                     free_arg: &mut Vec<&'static str>,
+                     free_div: &mut Vec<&'static str>| {
+        if TEMP_REGS.contains(&r) {
+            free_temp.push(r);
+        } else if ARG_SPARE.contains(&r) {
+            free_arg.push(r);
+        } else if DIV_SPARE.contains(&r) {
+            free_div.push(r);
+        } else {
+            free_saved.push(r);
+        }
+    };
 
     for iv in ivs.iter().copied() {
         // abgelaufene Intervalle freigeben
         let mut k = 0;
         while k < active.len() {
             if active[k].0.end <= iv.start {
-                let (a, r) = active.remove(k);
-                if TEMP_REGS.contains(&r) {
-                    free_temp.push(r);
-                } else {
-                    free_saved.push(r);
-                }
-                let _ = a;
+                let (_, r) = active.remove(k);
+                freigeben(r, &mut free_saved, &mut free_temp, &mut free_arg, &mut free_div);
             } else {
                 k += 1;
             }
         }
-        let want_temp = !iv.crosses_call;
-        let pick = if want_temp && !free_temp.is_empty() {
-            free_temp.pop()
+        // erst die beschraenkten Pools fuellen, callee-saved zuletzt (kostet
+        // Prolog/Epilog) — ausser das Intervall kreuzt einen Aufruf, dann
+        // kommen nur callee-saved in Frage.
+        let pick = if !iv.crosses_call {
+            if !free_temp.is_empty() {
+                free_temp.pop()
+            } else if !iv.crosses_memop && !iv.crosses_divsel && !free_div.is_empty() {
+                free_div.pop()
+            } else if !iv.crosses_memop && !free_arg.is_empty() {
+                free_arg.pop()
+            } else if !free_saved.is_empty() {
+                free_saved.pop()
+            } else {
+                None
+            }
         } else if !free_saved.is_empty() {
             free_saved.pop()
         } else {
@@ -640,7 +721,7 @@ pub fn allocate(f: &Func) -> Alloc {
                 // gleichem Gewicht entscheidet das spaetere Ende.
                 let mut worst: Option<usize> = None;
                 for (k, (a, r)) in active.iter().enumerate() {
-                    if iv.crosses_call && TEMP_REGS.contains(r) {
+                    if !passt(&iv, r) {
                         continue; // dieses Register hilft uns nicht
                     }
                     let better = match worst {
