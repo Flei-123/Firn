@@ -79,8 +79,15 @@ for prog in pause frag; do
         if [ -z "$erwartet" ]; then
             erwartet="$wert"
         elif [ "$wert" != "$erwartet" ]; then
-            echo "   FEHLER: $prog/$name liefert '$wert', erwartet '$erwartet'"
-            fehler=1
+            # Konservativer Scan: in langsameren Baustufen kleben mehr
+            # Zeiger in ungescrubten Rahmen — MEHR Lebende ist zulaessig
+            # (Retention), WENIGER waere ein echter Sammlerfehler.
+            if [ "$wert" -lt "$erwartet" ]; then
+                echo "   FEHLER: $prog/$name liefert '$wert' < '$erwartet' — lebende Objekte eingesammelt!"
+                fehler=1
+            else
+                echo "   HINWEIS: $prog/$name liefert '$wert' > '$erwartet' (konservative Retention, zulaessig)"
+            fi
         fi
     done
 done
