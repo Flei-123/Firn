@@ -30,6 +30,7 @@
 // Aufbau eines Chunks (64 Byte Kopf):
 //   [0]  naechster Chunk   [8]  Groesse in Bytes   [16] Blockgroesse
 //   [24] Anzahl Bloecke    [32] Datenanfang (64)   [40] Groessenklasse
+//   [48] Leer-Hysterese    (1 = war beim letzten Sweep schon leer)
 
 const SYS_WRITE: i64 = 1
 const SYS_OPEN: i64 = 2
@@ -75,6 +76,10 @@ const CHUNK_BYTES: u64 = 262144
 const KLASSEN: u64 = 13
 const MARK_BYTES: u64 = 1048576
 const MIN_GRENZE: u64 = 1048576
+// Maximaler Abstand zwischen zwei Sammellaeufen (in frisch allozierten
+// Bytes): der Speicherueberhang ueber der Lebendmenge bleibt so immer
+// kleiner als dieser Betrag — egal, wie gross der Heap einmal war.
+const MAX_GRENZE: u64 = 4194304
 const WEAK_XOR: u64 = 6510615555426900570
 
 // ---------------------------------------------------------------- Speicher
@@ -446,6 +451,12 @@ fn __gc_sweep() {
         let klasse: u64 = __gc_ld64(c + 40)
         var tot: u64 = 0
         var i: u64 = 0
+        // Listenkopf VOR diesem Chunk merken: die toten Bloecke werden
+        // sofort eingehangen; wird der Chunk hinterher ans OS gegeben,
+        // schneidet ein einziger Ruecksprung des Kopfes sein (zusammen-
+        // haengendes) Segment wieder ab — kein zweiter Durchgang noetig.
+        let kopf_addr: u64 = st + S_FREI + klasse * 8
+        let alt_kopf: u64 = __gc_ld64(kopf_addr)
         while i < anzahl {
             let b: u64 = daten + i * block
             if __gc_ld32(b) != 0 && __gc_ld32(b + 4) != 0 {
@@ -459,16 +470,37 @@ fn __gc_sweep() {
                 }
                 tot = tot + 1
                 if klasse < KLASSEN {
-                    let kopf: u64 = st + S_FREI + klasse * 8
-                    __gc_st64(b + KOPF, __gc_ld64(kopf))
-                    __gc_st64(kopf, b)
+                    __gc_st64(b + KOPF, __gc_ld64(kopf_addr))
+                    __gc_st64(kopf_addr, b)
                 }
             }
             i = i + 1
         }
-        // Grosse Objekte bekommen einen eigenen Chunk; ist er leer, geht er
-        // zurueck ans Betriebssystem (kein Kompaktieren noetig).
-        if klasse >= KLASSEN && tot == anzahl {
+        // Hysterese: ein leerer Chunk wird erst zurueckgegeben, wenn er
+        // ZWEI Sweeps in Folge leer war (Marke im Chunk-Kopf, Offset 48).
+        // Sonst pendelt ein phasenweiser Workload zwischen munmap und mmap
+        // — gemessen +46 % Laufzeit im Phasen-Fragmentierungstest.
+        var weg: u64 = 0
+        if tot == anzahl {
+            if __gc_ld64(c + 48) != 0 {
+                weg = 1
+            } else {
+                __gc_st64(c + 48, 1)
+            }
+        } else {
+            __gc_st64(c + 48, 0)
+        }
+        if weg == 1 {
+            // Komplett leerer Chunk geht ans Betriebssystem zurueck — fuer
+            // JEDE Groessenklasse, nicht nur fuer grosse Objekte. Sonst
+            // bleibt ein Phasen-Workload (erst viele grosse, dann nur noch
+            // kleine Objekte) fuer immer auf dem hohen RSS der ersten Phase
+            // sitzen: genau die Fragmentierung, die der Klassen-Allokator
+            // verhindern soll. Grosse Objekte bekamen das schon (kein
+            // Kompaktieren noetig).
+            if klasse < KLASSEN {
+                __gc_st64(kopf_addr, alt_kopf)
+            }
             let bytes: u64 = __gc_ld64(c + 8)
             if vorher == 0 {
                 __gc_st64(st + S_CHUNKS, naechster)
@@ -551,9 +583,16 @@ fn __gc_collect_now() -> u64 {
     __gc_st64(st + S_SEIT, 0)
     // Naechster Sammellauf, wenn seither so viel alloziert wurde wie lebt
     // (mindestens MIN_GRENZE) — das haelt den Verbrauch beschraenkt.
+    // Nach oben gekappt (MAX_GRENZE): bricht die Lebendmenge gerade massiv
+    // ein (Phasenwechsel), war die alte Grenze riesig und es wurde NIE
+    // wieder gesammelt — die toten Chunks der alten Phase blieben gemappt
+    // (gemessen im Phasen-Test: 300 Runden, 3,8 MiB Allokation, 0 Laeufe).
     var grenze: u64 = __gc_ld64(st + S_LEBBYTES)
     if grenze < MIN_GRENZE {
         grenze = MIN_GRENZE
+    }
+    if grenze > MAX_GRENZE {
+        grenze = MAX_GRENZE
     }
     __gc_st64(st + S_GRENZE, grenze)
     return dauer
