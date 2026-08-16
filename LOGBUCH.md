@@ -30,3 +30,19 @@ Messwerte: test.sh 640/640, selbst 180->185 gleich / 0 abweichend / 0 fehlerhaft
 Fixpunkt 284207 Zeilen zeichengleich. Negativtests ct_select_*, ct_secure_zero_kein_zeiger,
 errdefer_union_weitergabe, attr_must_consume_* brechen wie firnc0 ab (rc=1).
 Verbleibend ehrlich benannt: 600_comptime.fi (rc=4, COMPTIME 1) — Kernsprache sonst vollstaendig.
+
+## Runde 37+38+39 (16.08.2026) — drei parallele Tracks, gemergt
+R37 Optimierer (Hauptrepo, Commits 977a2ad/ef4e530/bf13ed4): html5lib 1,94x->1,69x (Ziel <=2x
+erreicht), realweb 4,82x->4,34x. firnc1 hat bewusst keinen Optimierer — fir-Vergleich auf --emit=fir-raw,
+nichts zu spiegeln. Naechster Hebel: Intervall-Splitting+Coalescing (7391 reg->reg-movs).
+R38 GC (Worktree r38-gc, f498740/5ab519f/47ab946): leere Chunks aller Klassen ans OS (Hysterese),
+Grenzen-Kappe 4 MiB (frag2 RSS-Ende 24124->2112 KiB), hybrid inkrementell ab 8 MiB (Pausen ~0,5 ms
+heap-unabhaengig, Durchsatz -8,7% innerhalb Vorgabe). NEBENBEFUND: Optimierer entfernt letztes
+Null-Setzen als tot — Unerreichbarkeit in Hilfsfunktion sterben lassen (Scrubber). Finalisierer/Arc[T]
+benannte Restarbeit. 30-Min-Dauerlauf nachgeholt (laeuft).
+R39 std+Interpolation (Worktree r39-std, ebc3c1e/e4fc9bd/ed0faf7): Suchpfad $FIRNLIB + <exe>/../lib
+in beiden Compilern, lib/std-Fassade (io/math/str/vec/map/num/mem), f"..." zur Uebersetzungszeit in
+Fmt-Kette zerlegt (keine Varargs), 790/791 Kern-Tests, 3 Negativtests. Live aus /tmp verifiziert.
+WERKZEUG-FIX (wieder dieselbe Falle): lex/parser/typen/fir/sema_vergleich bauten ihre Dump-Binaries
+nur "wenn fehlend" — veraltete Dumps nach R39 liessen die Vergleiche fehlschlagen. Jetzt Neubau bei
+juengeren Quellen (wie fixpunkt.sh seit R35). fixpunkt.sh exportiert jetzt auch FIRNLIB.

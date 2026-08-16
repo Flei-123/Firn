@@ -24,6 +24,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
+export FIRNLIB="$(pwd)/lib"
 FIRNC=compiler/target/release/firnc
 QUELLE=bin/firnc1.fi
 
