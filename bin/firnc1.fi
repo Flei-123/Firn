@@ -36,10 +36,12 @@ import codegen
 
 // ------------------------------------------------------------ Modulsystem
 //
-// `import a.b` sucht `a/b.fi` ZUERST neben der importierenden Datei, dann
-// neben der Wurzeldatei — dieselbe Regel wie in `firnc0` (Blocker B3,
-// Runde 17). Alle Dateien landen in EINEM Baum und teilen sich EINE
-// Namenstafel; die Umbenennung mit `alias__` macht der Parser.
+// `import a.b` sucht `a/b.fi` in dieser Reihenfolge: (1) neben der
+// importierenden Datei, (2) neben der Wurzeldatei, (3) in `$FIRNLIB`,
+// (4) in `<Verzeichnis des laufenden Compiler-Binarys>/../lib` —
+// dieselbe Regel wie in `firnc0` (`modules.rs::resolve`). Alle Dateien
+// landen in EINEM Baum und teilen sich EINE Namenstafel; die Umbenennung
+// mit `alias__` macht der Parser.
 
 // Verzeichnisteil eines Pfades, einschliesslich des Schraegstrichs.
 fn verzeichnis(b: *mut rt.Buf, pfad: u64, n: usize) {
@@ -73,6 +75,66 @@ fn modulpfad(aus: *mut rt.Buf, verz: *mut rt.Buf, l: *mut lexer.Lexer,
     }
     var e: [u8; 4] = ".fi\0"
     rt.buf_push_bytes(aus, (&e[0]) as u64, 4)
+}
+
+// Umgebungsvariable im Startblock suchen. Hinter `argv` liegt `envp`:
+//     [argc][argv0]..[argvN][0][envp0]..[0][auxv..]
+// Rueckgabe: Zeiger auf den WERT hinter `NAME=`, 0 wenn nicht gesetzt.
+fn umgebung(start: u64, name: u64, name_n: usize) -> u64 {
+    if start == 0 {
+        return 0
+    }
+    var i: usize = 1 + rt.arg_anzahl(start) + 1
+    while true {
+        let p: u64 = rt.ld64(start, i)
+        if p == 0 {
+            break
+        }
+        var j: usize = 0
+        var gleich: bool = true
+        while j < name_n {
+            if rt.ld8(p, j) != rt.ld8(name, j) {
+                gleich = false
+                break
+            }
+            j = j + 1
+        }
+        if gleich && rt.ld8(p, name_n) == 61 as u8 {
+            return p + name_n as u64 + 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// Installationsfallback: Verzeichnis des laufenden Compiler-Binarys,
+// gefolgt von `../lib/`. `firnc0` liest dafuer `current_exe`; hier geht
+// es ueber `/proc/self/exe`. Bleibt der Aufruf erfolglos, ist der Puffer
+// leer und der Schritt wird uebersprungen.
+fn exe_suchpfad(aus: *mut rt.Buf) {
+    rt.buf_leeren(aus)
+    var selbst: [u8; 15] = "/proc/self/exe\0"
+    var ziel: [u8; 1024] = [0 as u8; 1024]
+    let sp: u64 = (&selbst[0]) as u64
+    let zp: u64 = (&ziel[0]) as u64
+    let n: i64 = syscall(89, sp as i64, zp as i64, 1023, 0, 0, 0)
+    if n <= 0 {
+        return
+    }
+    var letzter: i64 = -1
+    var i: usize = 0
+    while i < n as usize {
+        if ziel[i] == 47 as u8 {
+            letzter = i as i64
+        }
+        i = i + 1
+    }
+    if letzter < 0 {
+        return
+    }
+    rt.buf_push_bytes(aus, zp, letzter as usize + 1)
+    var rest: [u8; 8] = "../lib/\0"
+    rt.buf_push_bytes(aus, (&rest[0]) as u64, 7)
 }
 
 // ------------------------------------------------------------ Modulliste
@@ -146,6 +208,7 @@ fn ml_dazu(m: *mut Modulliste, p: u64, n: usize, alias: u32) {
 // alle aufzaehlt — `tests/640_vec_modul.fi` dagegen scheiterte still daran,
 // dass `modules/vec.fi` sein eigenes `rt` nicht bekam.
 fn imports_sammeln(l: *mut lexer.Lexer, verz: *mut rt.Buf, wurzelverz: *mut rt.Buf,
+                   firnlib: *mut rt.Buf, exelib: *mut rt.Buf,
                    ml: *mut Modulliste) -> i32 {
     var pfad: rt.Buf = rt.buf_neu()
     defer rt.buf_frei(&pfad)
@@ -174,15 +237,41 @@ fn imports_sammeln(l: *mut lexer.Lexer, verz: *mut rt.Buf, wurzelverz: *mut rt.B
             }
             j = j + 1
         }
-        // ZUERST neben der importierenden Datei, dann neben der Wurzeldatei.
+        // (1) neben der importierenden Datei, (2) neben der Wurzeldatei,
+        // (3) $FIRNLIB, (4) <exe>/../lib — derselbe Ablauf wie in
+        // `modules.rs::resolve`. Leere Puffer (Variable nicht gesetzt,
+        // readlink erfolglos) ueberspringen ihren Schritt. Der Treffer
+        // steht im Rueckgabewert, NICHT in der Pufferlaenge: eine leere
+        // Datei ist ein gueltiges Modul.
+        var gefunden: bool = false
         modulpfad(&pfad, verz, l, i + 1, j)
         rt.buf_leeren(&probe)
-        if !rt.lies_datei(rt.buf_ptr(&pfad), &probe) {
+        if rt.lies_datei(rt.buf_ptr(&pfad), &probe) {
+            gefunden = true
+        }
+        if !gefunden {
             modulpfad(&pfad, wurzelverz, l, i + 1, j)
             rt.buf_leeren(&probe)
-            if !rt.lies_datei(rt.buf_ptr(&pfad), &probe) {
-                return 2
+            if rt.lies_datei(rt.buf_ptr(&pfad), &probe) {
+                gefunden = true
             }
+        }
+        if !gefunden && rt.buf_len(firnlib) > 0 {
+            modulpfad(&pfad, firnlib, l, i + 1, j)
+            rt.buf_leeren(&probe)
+            if rt.lies_datei(rt.buf_ptr(&pfad), &probe) {
+                gefunden = true
+            }
+        }
+        if !gefunden && rt.buf_len(exelib) > 0 {
+            modulpfad(&pfad, exelib, l, i + 1, j)
+            rt.buf_leeren(&probe)
+            if rt.lies_datei(rt.buf_ptr(&pfad), &probe) {
+                gefunden = true
+            }
+        }
+        if !gefunden {
+            return 2
         }
         let n: usize = rt.buf_len(&pfad) - 1
         if !ml_kennt(ml, rt.buf_ptr(&pfad), n) {
@@ -231,6 +320,25 @@ fn main(start: u64) -> i32 {
     var verz: rt.Buf = rt.buf_neu()
     defer rt.buf_frei(&verz)
     verzeichnis(&verz, name, name_n)
+
+    // --- Zusaetzliche Modul-Suchpfade: $FIRNLIB (mit Schraegstrich
+    // abgeschlossen, `modulpfad` haengt die Teile direkt an) und
+    // `<exe>/../lib/`. Beide bleiben leer, wenn es sie nicht gibt.
+    var firnlib: rt.Buf = rt.buf_neu()
+    defer rt.buf_frei(&firnlib)
+    var flname: [u8; 7] = "FIRNLIB"
+    let flwert: u64 = umgebung(start, (&flname[0]) as u64, 7)
+    if flwert != 0 {
+        rt.buf_push_bytes(&firnlib, flwert, rt.c_laenge(flwert))
+        if rt.buf_len(&firnlib) > 0 {
+            if rt.buf_at(&firnlib, rt.buf_len(&firnlib) - 1) != 47 as u8 {
+                rt.buf_push(&firnlib, 47 as u8)
+            }
+        }
+    }
+    var exelib: rt.Buf = rt.buf_neu()
+    defer rt.buf_frei(&exelib)
+    exe_suchpfad(&exelib)
 
     // --- generische Vorlagen: erst wissen, WELCHE Namen generisch sind,
     // dann parsen. Vorher ist `Vec[i32]` nicht von einer Indizierung zu
@@ -288,7 +396,7 @@ fn main(start: u64) -> i32 {
     // als alle Lexer gleichzeitig offen zu halten, und es macht die
     // Reihenfolge der `import`-Zeilen bedeutungslos.
     mono.gen_vorab(&g, (&l) as u64)
-    let wrc: i32 = imports_sammeln(&l, &verz, &verz, &ml)
+    let wrc: i32 = imports_sammeln(&l, &verz, &verz, &firnlib, &exelib, &ml)
     if wrc != 0 {
         return wrc
     }
@@ -314,7 +422,7 @@ fn main(start: u64) -> i32 {
         gc_scan = gc_scan | gc.gc_quelle_scan((&vl) as u64, gc_nr, class_nr, ae_nr)
         rt.buf_leeren(&mverz)
         verzeichnis(&mverz, rt.buf_ptr(&mpfad), rt.buf_len(&mpfad) - 1)
-        let irc: i32 = imports_sammeln(&vl, &mverz, &verz, &ml)
+        let irc: i32 = imports_sammeln(&vl, &mverz, &verz, &firnlib, &exelib, &ml)
         lexer.lex_frei(&vl)
         if irc != 0 {
             return irc
