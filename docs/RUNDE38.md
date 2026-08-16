@@ -153,3 +153,84 @@ Chunks verstreut leben, halten diese Chunks — ohne Kompaktieren (durch den
 konservativen Scan untersagt) ist das nicht loesbar. Die Verstreuzahl haelt
 sich aber in Grenzen, weil Allokationen chunk-weise aus der Freiliste
 kommen.
+
+## Stufe 3 — Inkrementelles Sammeln (hybrid)
+
+### Verfahren
+
+`lib/gc/gc.fi` fuehrt jetzt einen dreiphasigen Zyklus (neue Zustandsfelder
+ab Offset 320 im Zustandsblock — Platz war vorhanden, **keine
+Compiler-Aenderung noetig**):
+
+- **Phase 0 (Ruhe)**: wie bisher. Grenze erreicht → Zyklus.
+- **Phase 1 (Markieren)**: Wurzelscan (Register + Stapel) bleibt atomar
+  (konservativer Scan kann nicht unterbrochen werden — der Stapel aendert
+  sich), das Verfolgen laeuft in Scheiben von 512 Objekten pro Allokation.
+- **Phase 2 (Fegen)**: der Sweep laeuft in Scheiben von 2 Chunks pro
+  Allokation (Merker im Zustandsblock); Freilisten-Segmentabschneidung und
+  Leer-Hysterese aus Stufe 2 gelten pro Chunk unveraendert.
+
+Korrektheit ohne Kompaktieren und ohne erneuten Stapelscan:
+
+- **Einfuegebarriere aktiviert** (Dijkstra): `__gc_barrier` faerbt das Ziel
+  eines Gc-Schreibzugriffs grau, solange ein Zyklus laeuft — bisher zaehlte
+  sie nur. Weisse Ziele hinter schwarzen Containern koennen so nicht
+  unsichtbar werden.
+- **Waehrend eines Zyklus allokierte Objekte sind grau** und kommen auf den
+  Markstapel (der Stapel wird nicht erneut gescannt; ein nur stapellebendes
+  Objekt duerfte sonst gefegt werden, bevor es je angeschlossen wurde).
+- **Weiss-Paritaet** (`S_PAR`, 0/2): der Sweep setzt keine Marken mehr
+  zurueck; am Zyklusende kippt die Paritaet und alle Ueberlebenden sind auf
+  einen Schlag wieder weiss. Damit gibt es keinen Marken-Reset-Durchlauf
+  und keine Altmarken im naechsten Zyklus.
+- **Erschoepfungs-Fallback**: findet die Allokation mitten im Zyklus keinen
+  Block, wird der Rest des Zyklus atomar zu Ende gebracht, bevor
+  OutOfMemory gemeldet wird (DESIGNZIELE §2 bleibt).
+
+### Messungen (diese Maschine, Lastvorbehalt: parallel laufende Runden)
+
+Pausen nach Scheibentyp (Diagnose-Felder `S_PMAX_*`, `gc_pause_max_typ`),
+DOM-Workload, inkrementeller Pfad erzwungen (`INKR_AB` testweise 1 MiB):
+
+| Scheibe | laengste Pause |
+|---|---|
+| Zyklus-Start (Wurzelscan) | 0,15 ms |
+| Markieren (512 Objekte) | 0,01–0,02 ms |
+| Fegen (2 Chunks) | 0,44–0,52 ms |
+| Termination | 0,01 ms |
+
+Die Pausen sind **heap-groessen-unabhaengig** begrenzt: Start haengt von
+der Stapeltiefe ab, Mark/Fegen von den (konstanten) Scheibengroessen —
+nicht mehr vom Heap. Genau das war das Ziel.
+
+Durchsatz DOM-Workload (5 s-Laeufe, Median von 5, verschachtelt):
+
+| Variante | Zyklen (Median) | laengste Pause |
+|---|---|---|
+| Stufe 2 (atomar) | 7 786 000 | 0,44 ms |
+| Hybrid | 7 110 000 (**−8,7 %**) | 0,46 ms |
+| inkrementell erzwungen | 6 533 000 | **0,47 ms** |
+
+### Der Hybrid und warum
+
+Rein inkrementell (ab dem ersten Zyklus) kostete −13 bis −26 % Durchsatz
+bei Heaps, deren Vollzyklus ohnehin unter einer Millisekunde liegt — reiner
+Verlust. Deshalb schaltet der Sammler erst ab `INKR_AB = 8 MiB` Heap auf
+den inkrementellen Zyklus um; darunter laeuft der atomare Pfad aus Stufe 2
+unveraendert (seine Pause waechst linear: ~0,5 ms je 1,3 MiB — bei 8 MiB
+waeren das ~3 ms, ab dort greifen die Scheiben).
+
+Der DOM-Soak-Workload (Heap ~1,3 MiB) laeuft also atomar: Pausen wie in
+Stufe 2, Durchsatz-Einfluss nur durch den Phasen-Check je Allokation
+(gemessen −8,7 %, innerhalb der ±10%-Vorgabe). Grosse Heaps bekommen
+Pausen um 0,5 ms, unabhaengig von der Heapgroesse.
+
+Ehrliche Nebenwirkung, gemessen am Phasen-Test (Peak ~20 MiB, liegt ueber
+der Schwelle): `rss_ende` 14912 KiB statt 2112 KiB in Stufe 2 — Floating
+Garbage (grau allokierte Objekte leben einen Zyklus laenger) und die
+Leer-Hysterese verzoegert die Rueckgabe im inkrementellen Pfad. Gegen den
+Zustand vor dieser Runde (24124 KiB, nie fallend) bleibt es eine deutliche
+Verbesserung; unterhalb von 8 MiB gilt exakt das Stufe-2-Verhalten.
+
+Messlatte: test.sh **640/640**, selbst_vergleich **186/0/0**, Fixpunkt
+**zeichengleich (284207)**, 19 gc/rc-Tests ok, 6 gc-Negativtests rc!=0.
