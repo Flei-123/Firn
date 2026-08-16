@@ -1673,3 +1673,30 @@ identisch zu `firnc0`. Neu: `tests/760_comptime_kern.fi` und
 
 Uebrig bleiben: `gc` (9), konstante Laufzeit (4), `errdefer` (1) und die
 Attribute (1).
+
+## 25. Runde 34: `gc class` — der groesste Block der Kernsprache
+
+`gc class`, `Gc[T]`, `GcWeak[T]`, `weak`/`stark`, `x.as?[C]` und der
+transitive `#[no_gc]`-Pruefer sind portiert (Vorbild `gc.rs`/`nogc.rs`).
+Die Registrierung liegt in `lib/firnc1/gc.fi`, der nogc-Pruefer in
+`lib/firnc1/nogc.fi`; die Laufzeit `lib/gc/gc.fi` — selbst in Firn
+geschrieben — wird als eingebetteter Quelltext (`gctext.fi`) automatisch
+eingezogen, sobald irgendwo im Importgraphen `gc class` steht, und liegt
+im Wurzelnamensraum: `gc_init()` heisst in jedem Modul `gc_init()`.
+
+Der Fund der Runde (wieder einer, den 600+ Tests nicht fanden): der
+GC-Scan im Treiber suchte `gc`/`class`/`AllocError` per `intern_finde` —
+Nummern, die nur existieren, wenn die Wurzeldatei die Woerter enthaelt.
+Stand `gc class` nur in einem Modul (560 -> modules/dom.fi), lief der
+Scan mit -1 und fand nichts: keine Laufzeit, keine AllocError-Menge,
+stiller Sema-Fehler. `main.rs` nutzt an derselben Stelle `intern_nummer`
+— jetzt hier auch.
+
+Messwerte: `selbst_vergleich` 169 -> 179 verhaltensgleiche Programme
+(alle neun gc-Dateien, darunter 510 Zyklus und 560 DOM-Zyklen mit echter
+Aufloesung), 0 abweichend, 0 fehlerhaft. Fixpunkt steht: Stufe 2 ==
+Stufe 3, zeichengleich, 279 201 Zeilen Assembler. Alle sechs
+gc/nogc-Negativtests brechen wie firnc0 ab. Neu: `tests/770_gc_kern.fi`
+(gc-Klasse nur im Modul, Zyklus unter Wurzel) und `docs/RUNDE34.md`.
+
+Uebrig bleiben: konstante Laufzeit (4), `errdefer` (1), `must_consume` (1).
