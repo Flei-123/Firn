@@ -20,6 +20,9 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
+# Modul-Suchpfad (Runde 39): std-Fassade fuer beide Seiten des Vergleichs.
+export FIRNLIB="$(pwd)/lib"
+
 FIRNC=compiler/target/release/firnc
 FC1=${FIRNC1:-./.firnc1}
 WORK=.selbst-work

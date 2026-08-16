@@ -34,6 +34,10 @@ TARGETS = [
     ("tools/strlib/src/307_bignum.fi", "tests/307_bignum.fi"),
     ("tools/strlib/src/308_str16_api.fi", "tests/308_str16_api.fi"),
     ("tools/strlib/src/dtoa_stream.fi", "tools/dtoa_vectors/dtoa_stream.fi"),
+    # std-Fassade (Runde 39): lib/str und lib/num sind Einbindungs-
+    # Bibliotheken; die Fassade wird als EIN Modul textuell zusammengesetzt.
+    ("tools/strlib/src/std_str.fi", "lib/std/str.fi"),
+    ("tools/strlib/src/std_num.fi", "lib/std/num.fi"),
     ("tools/strlib/src/neg/str_bytes_ist_kein_text.fi", "tests/neg/str_bytes_ist_kein_text.fi"),
     ("tools/strlib/src/neg/str16_ist_kein_bytes.fi", "tests/neg/str16_ist_kein_bytes.fi"),
 ]
