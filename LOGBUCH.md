@@ -10,3 +10,14 @@ Werkzeug-Fix: fixpunkt.sh baut .firnc1 neu, wenn Quellen juenger (veraltetes Bin
 mit 166 statt 169 "bestaetigt" — Fund erst durch Abweichung Worktree/Hauptrepo aufgefallen).
 Gelernt: Worktree-Parallelisierung funktioniert fuer isolierte Bloecke; Worker ohne Commit = Arbeit weg
 (Runde-34-Worker ans Limit gelaufen, nichts committet — neu beauftragt mit Commit-Regel).
+
+## Runde 34 (16.08.2026) — gc class / Gc[T] / #[no_gc] in firnc1, Commits 6b406cf + folgend
+Der Worker lief ans Limit ohne Abschluss, aber mit unfertiger Arbeit im Baum (diesmal: 10 geaenderte
+Dateien + gc.fi 854Z, gctext.fi 323Z, nogc.fi 341Z — gerettet und selbst zu Ende gefuehrt).
+FUND am Korpus: GC-Scan im Treiber nutzte intern_finde — Nummern existieren nur, wenn die WURZEL
+die Woerter enthaelt; stand `gc class` nur im Modul (560 -> modules/dom.fi), scannte er mit -1 und
+fand nichts (stiller Sema-Fehler). main.rs nutzt intern_nummer — jetzt hier auch. Aufgespuert ueber
+Bisektion mit Mini-Modulen + Instrumentierung (exit-Codes 101+, dann Zaehler-Prints in fehler.fi).
+Messwerte: test.sh 637/637, selbst 169->180 (alle 9 gc-Dateien + 770_kern), 0 abweichend, Fixpunkt
+279201 Zeilen zeichengleich. 6 gc/nogc-Negativtests brechen wie firnc0 ab.
+Verbleibend: konstante Laufzeit (4), errdefer (1), must_consume (1) — Runde 36.
