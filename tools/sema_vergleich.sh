@@ -20,7 +20,8 @@ cd "$(dirname "$0")/.."
 FIRNC=compiler/target/release/firnc
 DUMP=${SEMADUMP:-./.semadump}
 
-if [ ! -x "$DUMP" ]; then
+if [ ! -x "$DUMP" ] || [ -n "$(find bin lib/firnc1 -name '*.fi' -newer "$DUMP" -print -quit)" ]; then
+    rm -f "$DUMP"
     "$FIRNC" bin/semadump.fi -o "$DUMP" || exit 1
 fi
 

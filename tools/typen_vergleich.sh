@@ -17,7 +17,9 @@ cd "$(dirname "$0")/.."
 FIRNC=compiler/target/release/firnc
 DUMP=${LAYOUTDUMP:-./.layoutdump}
 
-if [ ! -x "$DUMP" ]; then
+# Neu bauen, wenn das Dump-Binary fehlt ODER Quellen juenger sind
+if [ ! -x "$DUMP" ] || [ -n "$(find bin lib/firnc1 -name '*.fi' -newer "$DUMP" -print -quit)" ]; then
+    rm -f "$DUMP"
     "$FIRNC" bin/layoutdump.fi -o "$DUMP" || exit 1
 fi
 
