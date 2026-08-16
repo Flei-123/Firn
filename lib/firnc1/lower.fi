@@ -42,9 +42,10 @@ import sema
 import fir
 import muster
 import fehler
+import gc
 
 export { Lower, low_neu, low_frei, low_lauf, low_fehler, low_fir, low_ungeeignet,
-         low_mu_setzen, low_fe_setzen }
+         low_mu_setzen, low_fe_setzen, low_gc_setzen }
 
 const KEIN: u32 = 4294967295
 
@@ -67,6 +68,7 @@ struct Lower {
     sret: u32
     mu: u64             // Register der Aufzaehlungen/Musterabgleiche (0 = keins)
     feh: u64            // Register der Fehlermengen/-unionen (0 = keins)
+    gcr: u64            // Registrierung der gc-Klassen (Runde 34; 0 = keine)
     fehler: usize
     ungeeignet: bool    // Aggregat oder `defer` gefunden
 }
@@ -79,7 +81,7 @@ fn low_neu(b: u64, it: u64, sm: u64) -> Lower {
         v_name: vec_neu[u32](), v_slot: vec_neu[u32](), b_grenze: vec_neu[u32](),
         l_break: vec_neu[u32](), l_cont: vec_neu[u32](), l_tiefe: vec_neu[u32](),
         d_stmt: vec_neu[u32](), d_err: vec_neu[u32](), d_grenze: vec_neu[u32](),
-        sret: KEIN, mu: 0, feh: 0, fehler: 0, ungeeignet: false,
+        sret: KEIN, mu: 0, feh: 0, gcr: 0, fehler: 0, ungeeignet: false,
     }
 }
 
@@ -107,8 +109,13 @@ fn hat_mu(l: *mut Lower) -> bool { return (*l).mu != 0 }
 // Das Fehler-Register anmelden. MUSS vor `low_lauf` stehen.
 fn low_fe_setzen(l: *mut Lower, f: u64) { (*l).feh = f }
 
+// Die gc-Registrierung anmelden (Runde 34). MUSS vor `low_lauf` stehen.
+fn low_gc_setzen(l: *mut Lower, g: u64) { (*l).gcr = g }
+
 fn fel(l: *mut Lower) -> *mut fehler.Fehler { return (*l).feh as *mut fehler.Fehler }
 fn hat_fe(l: *mut Lower) -> bool { return (*l).feh != 0 }
+fn gcl(l: *mut Lower) -> *mut gc.Gc { return (*l).gcr as *mut gc.Gc }
+fn hat_gc(l: *mut Lower) -> bool { return (*l).gcr != 0 }
 fn low_ungeeignet(l: *mut Lower) -> bool { return (*l).ungeeignet }
 fn low_fir(l: *mut Lower) -> *mut fir.Fir { return &(*l).f }
 
@@ -828,12 +835,200 @@ fn args_ablegen(l: *mut Lower, tmp: *mut Vec[u32]) -> u32 {
     return off
 }
 
+// ------------------------------------------------- gc (gc_lower.rs, Runde 34)
+//
+// `gc C{ ... }` — Aufruf der Laufzeit (`__gc_alloc_raw`), danach die
+// Fehlerunion `AllocError!Gc[C]` an `ziel` bauen und die Felder schreiben.
+// Der Sammellauf steckt in `__gc_alloc_raw`: ERST sammeln, DANN
+// `AllocError::OutOfMemory` (DESIGNZIELE §2).
+fn gc_alloc_senken(l: *mut Lower, e: u32, ziel: u32) {
+    let b: *mut ast.Baum = baum(l)
+    let ki_i: i64 = gc.gc_klasse_aus_neu(gcl(l), namen(l), ast.e_a(b, e))
+    if ki_i < 0 {
+        aufgeben(l)
+        return
+    }
+    let ki: u32 = ki_i as u32
+    let sidx: u32 = gc.gc_sidx(gcl(l), ki)
+    // Lage von `__val` in der Fehlerunion.
+    let ui: u32 = gc.gc_union(gcl(l), ki)
+    if ui == 0 {
+        aufgeben(l)
+        return
+    }
+    let voff: u64 = fehler.fehler_u_voff(fel(l), ui - 1)
+    var ae: [u8; 10] = "AllocError"
+    let aen: u32 = intern.intern_nummer(namen(l), (&ae[0]) as u64, 10) as u32
+    let sm2: u32 = fehler.fehler_menge_finden(fel(l), aen)
+    var om: [u8; 11] = "OutOfMemory"
+    let omn: u32 = intern.intern_nummer(namen(l), (&om[0]) as u64, 11) as u32
+    let code: u32 = fehler.fehler_code_von(fel(l), sm2, omn)
+    if code == 0 {
+        aufgeben(l)
+        return
+    }
+    var ar: [u8; 14] = "__gc_alloc_raw"
+    let arn: u32 = intern.intern_nummer(namen(l), (&ar[0]) as u64, 14) as u32
+
+    let tidv: u32 = konst(l, fir.T_U64, gc.gc_tid(gcl(l), ki))
+    let sizev: u32 = konst(l, fir.T_U64, gc.gc_size(gcl(l), ki))
+    var tmp: Vec[u32] = vec_neu[u32]()
+    vec_push[u32](&tmp, tidv)
+    vec_push[u32](&tmp, sizev)
+    let aoff: u32 = args_ablegen(l, &tmp)
+    vec_frei[u32](&tmp)
+    let p: u32 = push(l, fir.O_CALL, fir.T_PTR, arn, 0, 0, 0, aoff, 2)
+    let null: u32 = konst(l, fir.T_PTR, 0)
+    // 1 = ungleich (Reihenfolge wie `ast::BinOp`: eq ne lt le gt ge)
+    let ok: u32 = push(l, fir.O_CMP, fir.T_BOOL, p, null, 1, fir.T_PTR as u64, 0, 0)
+    let ok_bb: u32 = neuer_block(l)
+    let fail_bb: u32 = neuer_block(l)
+    let join: u32 = neuer_block(l)
+    term(l, fir.TERM_BRCOND, ok, ok_bb, fail_bb)
+
+    // Fehlerfall: erst hat die Laufzeit gesammelt, dann ist wirklich Schluss.
+    (*l).cur = fail_bb
+    let cv: u32 = konst(l, fir.T_U32, code as u64)
+    speichere(l, fir.T_U32, ziel, cv)
+    let va1: u32 = ptradd_konst(l, ziel, voff)
+    let z0: u32 = konst(l, fir.T_PTR, 0)
+    speichere(l, fir.T_PTR, va1, z0)
+    term(l, fir.TERM_BR, join, 0, 0)
+
+    // Erfolgsfall: Fehlerunion fuellen (damit der Zeiger sofort eine Wurzel
+    // auf dem Stapel hat), dann die Felder schreiben.
+    (*l).cur = ok_bb
+    let z32: u32 = konst(l, fir.T_U32, 0)
+    speichere(l, fir.T_U32, ziel, z32)
+    let va2: u32 = ptradd_konst(l, ziel, voff)
+    speichere(l, fir.T_PTR, va2, p)
+    if ast.e_c(b, e) == 1 {
+        let slit: u32 = ast.kind_at(b, ast.e_b(b, e))
+        if ast.e_art(b, slit) == ast.E_SLIT {
+            let off: u32 = ast.e_b(b, slit)
+            let anz: u32 = ast.e_c(b, slit)
+            var k: u32 = 0
+            while k < anz {
+                let fname: u32 = ast.kind_at(b, off + k * 2)
+                let fexpr: u32 = ast.kind_at(b, off + k * 2 + 1)
+                let fa: u32 = ptradd_konst(l, p, feld_versatz(l, sidx as usize, fname))
+                schreib_nach(l, fa, fexpr)
+                k = k + 1
+            }
+        }
+    }
+    if !terminiert(l) {
+        term(l, fir.TERM_BR, join, 0, 0)
+    }
+    (*l).cur = join
+}
+
+// Die Einfuegebarriere (hook_assign in gc_lower.rs): NACH dem Schreiben
+// eines `Gc[T]`-Zeigers in ein Heapfeld. Nur Schreibzugriffe IN den Heap
+// brauchen sie; eine oertliche Veraenderliche liegt auf dem Stapel.
+fn gc_barriere(l: *mut Lower, ziel: u32) {
+    let b: *mut ast.Baum = baum(l)
+    let t: u32 = sema.sema_typ(sm(l), ziel)
+    if !gc.gc_ist_gc_ptr(gcl(l), tf(l), t) {
+        return
+    }
+    var ins_heap: bool = false
+    let a: u32 = ast.e_art(b, ziel)
+    if a == ast.E_FELD {
+        let bt: u32 = sema.sema_typ(sm(l), ast.e_a(b, ziel))
+        if gc.gc_ist_gc_ptr(gcl(l), tf(l), bt) {
+            ins_heap = true
+        }
+        if typen.ty_art(tf(l), bt) == typen.K_PTR {
+            ins_heap = true
+        }
+    }
+    if a == ast.E_IDX {
+        let bt: u32 = sema.sema_typ(sm(l), ast.e_a(b, ziel))
+        if typen.ty_art(tf(l), bt) == typen.K_PTR {
+            ins_heap = true
+        }
+    }
+    if a == ast.E_UN && ast.e_a(b, ziel) == 3 {
+        ins_heap = true
+    }
+    if !ins_heap {
+        return
+    }
+    var bn: [u8; 12] = "__gc_barrier"
+    let bnn: u32 = intern.intern_nummer(namen(l), (&bn[0]) as u64, 12) as u32
+    let adr: u32 = adresse(l, ziel)
+    let val: u32 = lade(l, fir.T_PTR, adr)
+    var tmp: Vec[u32] = vec_neu[u32]()
+    vec_push[u32](&tmp, adr)
+    vec_push[u32](&tmp, val)
+    let aoff: u32 = args_ablegen(l, &tmp)
+    vec_frei[u32](&tmp)
+    push_void(l, fir.O_CALL, fir.T_VOID, bnn, 0, 0, 0, aoff, 2)
+}
+
 // Ein Aufruf nach der Aufrufkonvention. `ziel` ist die Zieladresse, wenn die
 // Funktion ein Aggregat liefert (sonst `fir.KEIN`). Rueckgabe: der skalare
 // Wert, oder 0.
 fn ruf_voll(l: *mut Lower, e: u32, ziel: u32) -> u32 {
     let b: *mut ast.Baum = baum(l)
-    let name: u32 = ast.e_a(b, e)
+    var name: u32 = ast.e_a(b, e)
+    // HOOK gc (gc_lower.rs::hook_call): Allokation, Intrinsics, `as?` — und
+    // `weak`/`stark` sind Laufzeitfunktionen (`echter_name`).
+    if hat_gc(l) && ast.e_zahl(b, e) == 0 {
+        if gc.gc_hat_neu_praefix(namen(l), name) {
+            var z: u32 = ziel
+            if z == fir.KEIN {
+                let t: u32 = sema.sema_typ(sm(l), e)
+                z = alloca(l, q_groesse(l, t), q_ausricht(l, t))
+            }
+            gc_alloc_senken(l, e, z)
+            return 0
+        }
+        let zn: u32 = gc.gc_zustandsname(namen(l), name)
+        if zn != 0 {
+            var regs: u64 = 0
+            if zn == 2 {
+                regs = 1
+            }
+            return push(l, fir.O_GCADDR, fir.T_PTR, 0, 0, 0, regs, 0, 0)
+        }
+        if gc.gc_hat_as_praefix(namen(l), name) {
+            let ki_i: i64 = gc.gc_klasse_aus_as(gcl(l), namen(l), name)
+            if ki_i < 0 {
+                aufgeben(l)
+                return 0
+            }
+            let arg: u32 = ast.kind_at(b, ast.e_b(b, e))
+            let pv: u32 = wert(l, arg)
+            let tidv: u32 = konst(l, fir.T_U64, gc.gc_tid(gcl(l), ki_i as u32))
+            var an: [u8; 11] = "__gc_as_raw"
+            let ann: u32 = intern.intern_nummer(namen(l), (&an[0]) as u64, 11) as u32
+            var tmp: Vec[u32] = vec_neu[u32]()
+            vec_push[u32](&tmp, pv)
+            vec_push[u32](&tmp, tidv)
+            let aoff: u32 = args_ablegen(l, &tmp)
+            vec_frei[u32](&tmp)
+            return push(l, fir.O_CALL, fir.T_PTR, ann, 0, 0, 0, aoff, 2)
+        }
+        // `barrier(x)` (ct.rs): undurchsichtig fuer den Optimierer — den
+        // hat diese Stufe nicht, also bleibt die Identitaet.
+        var bw: [u8; 7] = "barrier"
+        if intern.intern_gleich(namen(l), name, (&bw[0]) as u64, 7) && fn_nummer(l, name) == KEIN {
+            return wert(l, ast.kind_at(b, ast.e_b(b, e)))
+        }
+        // `weak`/`stark` — eine gleichnamige EIGENE Funktion gewinnt.
+        if fn_nummer(l, name) == KEIN {
+            if gc.gc_ist_weak_name(namen(l), name) {
+                var wn: [u8; 13] = "__gc_weak_raw"
+                name = intern.intern_nummer(namen(l), (&wn[0]) as u64, 13) as u32
+            }
+            if gc.gc_ist_stark_name(namen(l), name) {
+                var sn2: [u8; 15] = "__gc_strong_raw"
+                name = intern.intern_nummer(namen(l), (&sn2[0]) as u64, 15) as u32
+            }
+        }
+    }
     let fnr: u32 = fn_nummer(l, name)
     if fnr == KEIN {
         aufgeben(l)
@@ -976,6 +1171,11 @@ fn anweisung(l: *mut Lower, i: u32) {
     if a == ast.S_ZUW {
         let adr: u32 = adresse(l, ast.s_a(b, i))
         schreib_nach(l, adr, ast.s_b(b, i))
+        // HOOK gc (gc_lower.rs::hook_assign): die Einfuegebarriere NACH dem
+        // Schreiben eines Gc-Zeigers in ein Heapfeld.
+        if hat_gc(l) {
+            gc_barriere(l, ast.s_a(b, i))
+        }
         return
     }
     if a == ast.S_EXPR {

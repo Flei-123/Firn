@@ -1,0 +1,341 @@
+// lib/firnc1/nogc.fi — die `#[no_gc]`-Zusage fuer heisse Pfade, transitiv
+// geprueft (SPEC 3.5.4). Fuenfzehnter Teil von Stufe 1: die Portierung von
+// `compiler/src/nogc.rs` (Runde 34).
+//
+// In einer `#[no_gc]`-Funktion sind verboten:
+//  1. GC-Allokation (und jeder Aufruf, der einen Sammellauf ausloesen kann),
+//  2. Aufruf einer Funktion OHNE `#[no_gc]`,
+//  3. Schreiben eines `Gc[T]`/`GcWeak[T]`-Zeigers in ein Feld oder ein
+//     Feldelement (Einfuegebarriere).
+//
+// Weil jede aufgerufene Funktion selbst `#[no_gc]` tragen muss, gilt die
+// Zusage fuer den ganzen Aufrufbaum — auch ueber Modulgrenzen hinweg (die
+// Namen sind dann schon zu `modul__name` umgeschrieben, der Pruefer sieht
+// den flachen Baum). Die GC-Abfragen (1 und 3) kommen aus `gc.fi` — genau
+// die zwei Vertragsfunktionen, deren Signaturen in Stufe 0 festgelegt sind.
+//
+// Umfang, ehrlich benannt (wie Stufe 0):
+//  * Geprueft werden alle Aufrufe im Rumpf, EINSCHLIESSLICH der Rumpfbloecke
+//    von `match`-Faellen — die liegen nicht im Baum, sondern in der
+//    Registrierung von `muster.fi`.
+//  * Compilerinterne Aufrufnamen (`__match#N`, `__try#`, `__catch#`,
+//    `Enum::Variante`) sind keine Funktionsaufrufe; ihre Argumente werden
+//    trotzdem durchsucht.
+//  * Aufrufe eines Namens, den es gar nicht gibt, meldet die Typpruefung
+//    selbst — hier gibt es dafuer keinen zweiten Fehler.
+
+import rt
+import vec
+import intern
+import ast
+import typen
+import muster
+import gc
+import sema
+
+export { nogc_pruefen }
+
+const KEIN: u32 = 4294967295
+
+// Hoechste Schachtelung von `match`-Faellen, in die hineingesehen wird
+// (zweite Sicherung gegen eine Rekursionsexplosion, wie in Stufe 0).
+const MAX_TIEFE: u32 = 256
+
+struct Pruefer {
+    sm: u64,            // der Typpruefer (Typtabelle der Ausdruecke)
+    mu: u64,            // Muster-Registrierung
+    gcr: u64,           // GC-Registrierung
+    it: u64,            // Interner
+    m_name: Vec[u32],   // Funktionsname ->
+    m_flag: Vec[u32],   // 1 = traegt `#[no_gc]`
+    fehler: usize,
+    tiefe: u32,         // Schachtelungstiefe der `match`-Rumpfbloecke
+}
+
+fn namen(p: *mut Pruefer) -> *mut intern.Interner { return (*p).it as *mut intern.Interner }
+fn gcr(p: *mut Pruefer) -> *mut gc.Gc { return (*p).gcr as *mut gc.Gc }
+fn tafel(p: *mut Pruefer) -> *mut typen.Typen {
+    return sema.sema_typen((*p).sm as *mut sema.Sema)
+}
+fn mul(p: *mut Pruefer) -> *mut muster.Mus { return (*p).mu as *mut muster.Mus }
+
+// 0 = unbekannt (meldet die Typpruefung selbst), 1 = markiert, 2 = kalt.
+fn markierung(p: *mut Pruefer, name: u32) -> u32 {
+    var i: usize = 0
+    while i < vec_len[u32](&(*p).m_name) {
+        if vec_at[u32](&(*p).m_name, i) == name {
+            if vec_at[u32](&(*p).m_flag, i) == 1 {
+                return 1
+            }
+            return 2
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// Compilerintern erzeugter Aufrufname: enthaelt `#` oder `::`, kann also
+// nie aus einem Bezeichner des Quelltextes entstehen.
+fn ist_interner_name(it: *mut intern.Interner, nr: u32) -> bool {
+    let p: u64 = intern.intern_zeiger(it, nr)
+    let n: usize = intern.intern_laenge(it, nr)
+    var i: usize = 0
+    while i < n {
+        let b: u8 = rt.ld8(p, i)
+        if b == 35 as u8 {
+            return true
+        }
+        if b == 58 as u8 && i + 1 < n && rt.ld8(p, i + 1) == 58 as u8 {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// Der eigentliche Durchlauf. Rueckgabe: Zahl der Verstoesse.
+fn nogc_pruefen(sm: u64, mu: u64, gcr2: u64, it: u64) -> usize {
+    var p: Pruefer = Pruefer{
+        sm: sm, mu: mu, gcr: gcr2, it: it,
+        m_name: vec_neu[u32](), m_flag: vec_neu[u32](),
+        fehler: 0, tiefe: 0,
+    }
+    let b: *mut ast.Baum = sema.sema_baum(p.sm as *mut sema.Sema)
+    // Die Markierungen einsammeln. Bei doppelt deklarierten Namen (eigener
+    // Fehler der Typpruefung) zaehlt die strengere Angabe: markiert bleibt
+    // markiert.
+    var i: usize = 0
+    while i < ast.fn_anzahl(b) {
+        let nm: u32 = ast.fn_name(b, i)
+        let fl: u32 = ast.fn_nogc(b, i)
+        var j: usize = 0
+        var getroffen: bool = false
+        while j < vec_len[u32](&p.m_name) {
+            if vec_at[u32](&p.m_name, j) == nm {
+                if fl == 1 {
+                    vec_setzen[u32](&p.m_flag, j, 1)
+                }
+                getroffen = true
+            }
+            j = j + 1
+        }
+        if !getroffen {
+            vec_push[u32](&p.m_name, nm)
+            vec_push[u32](&p.m_flag, fl)
+        }
+        i = i + 1
+    }
+    var eine: bool = false
+    i = 0
+    while i < vec_len[u32](&p.m_flag) {
+        if vec_at[u32](&p.m_flag, i) == 1 {
+            eine = true
+        }
+        i = i + 1
+    }
+    if eine {
+        i = 0
+        while i < ast.fn_anzahl(b) {
+            if ast.fn_nogc(b, i) == 1 {
+                pruefe_block(&p, b, ast.fn_rumpf(b, i))
+            }
+            i = i + 1
+        }
+    }
+    let aus: usize = p.fehler
+    vec_frei[u32](&p.m_name)
+    vec_frei[u32](&p.m_flag)
+    return aus
+}
+
+fn pruefe_block(p: *mut Pruefer, b: *mut ast.Baum, bi: u32) {
+    var k: u32 = 0
+    while k < ast.b_len(b, bi) {
+        pruefe_stmt(p, b, ast.sliste_at(b, ast.b_off(b, bi) + k))
+        k = k + 1
+    }
+}
+
+fn pruefe_stmt(p: *mut Pruefer, b: *mut ast.Baum, i: u32) {
+    let a: u32 = ast.s_art(b, i)
+    if a == ast.S_LET || a == ast.S_VAR {
+        pruefe_expr(p, b, ast.s_c(b, i))
+        return
+    }
+    if a == ast.S_ZUW {
+        pruefe_schreibziel(p, b, ast.s_a(b, i))
+        pruefe_expr(p, b, ast.s_a(b, i))
+        pruefe_expr(p, b, ast.s_b(b, i))
+        return
+    }
+    if a == ast.S_IF {
+        pruefe_expr(p, b, ast.s_a(b, i))
+        pruefe_block(p, b, ast.s_b(b, i))
+        if ast.s_c(b, i) != ast.NICHTS {
+            pruefe_stmt(p, b, ast.s_c(b, i))
+        }
+        return
+    }
+    if a == ast.S_WHILE {
+        pruefe_expr(p, b, ast.s_a(b, i))
+        pruefe_block(p, b, ast.s_b(b, i))
+        return
+    }
+    if a == ast.S_FOR {
+        pruefe_expr(p, b, ast.s_b(b, i))
+        pruefe_expr(p, b, ast.s_c(b, i))
+        pruefe_block(p, b, ast.s_d(b, i))
+        return
+    }
+    if a == ast.S_RET {
+        if ast.s_a(b, i) != ast.NICHTS {
+            pruefe_expr(p, b, ast.s_a(b, i))
+        }
+        return
+    }
+    if a == ast.S_EXPR {
+        pruefe_expr(p, b, ast.s_a(b, i))
+        return
+    }
+    if a == ast.S_BLOCK {
+        pruefe_block(p, b, ast.s_a(b, i))
+        return
+    }
+    if a == ast.S_DEFER || a == ast.S_ERRDEFER {
+        // Der aufgeschobene Rumpf laeuft im selben Rahmen und unterliegt
+        // denselben Regeln.
+        pruefe_stmt(p, b, ast.s_a(b, i))
+        return
+    }
+    // S_BREAK / S_CONT: keine Aufrufe.
+}
+
+// Regel 3: Schreiben eines GC-Zeigers in ein Feld (oder in ein Feldelement).
+// Eine reine Zuweisung an eine oertliche Veraenderliche liegt auf dem
+// Stapel, braucht keine Einfuegebarriere und ist erlaubt.
+fn pruefe_schreibziel(p: *mut Pruefer, b: *mut ast.Baum, ziel: u32) {
+    let ty: u32 = sema.sema_typ((*p).sm as *mut sema.Sema, ziel)
+    if !gc.gc_ist_gc_zeiger(gcr(p), tafel(p), ty) {
+        return
+    }
+    let a: u32 = ast.e_art(b, ziel)
+    if a == ast.E_FELD {
+        (*p).fehler = (*p).fehler + 1
+        return
+    }
+    if a == ast.E_IDX {
+        // `lokales_feld[i]` liegt auf dem Stapel — erlaubt.
+        if ast.e_art(b, ast.e_a(b, ziel)) == ast.E_ID {
+            return
+        }
+        (*p).fehler = (*p).fehler + 1
+        return
+    }
+    if a == ast.E_UN && ast.e_a(b, ziel) == 3 {
+        (*p).fehler = (*p).fehler + 1
+        return
+    }
+}
+
+fn pruefe_expr(p: *mut Pruefer, b: *mut ast.Baum, e: u32) {
+    let a: u32 = ast.e_art(b, e)
+    if a == ast.E_RUF {
+        let name: u32 = ast.e_a(b, e)
+        pruefe_aufruf(p, name)
+        var k: u32 = 0
+        while k < ast.e_c(b, e) {
+            pruefe_expr(p, b, ast.kind_at(b, ast.e_b(b, e) + k))
+            k = k + 1
+        }
+        pruefe_match_faelle(p, name)
+        return
+    }
+    if a == ast.E_UN {
+        pruefe_expr(p, b, ast.e_b(b, e))
+        return
+    }
+    if a == ast.E_BIN {
+        pruefe_expr(p, b, ast.e_b(b, e))
+        pruefe_expr(p, b, ast.e_c(b, e))
+        return
+    }
+    if a == ast.E_FELD {
+        pruefe_expr(p, b, ast.e_a(b, e))
+        return
+    }
+    if a == ast.E_IDX {
+        pruefe_expr(p, b, ast.e_a(b, e))
+        pruefe_expr(p, b, ast.e_b(b, e))
+        return
+    }
+    if a == ast.E_SYSCALL || a == ast.E_ALIT {
+        var k: u32 = 0
+        while k < ast.e_c(b, e) {
+            pruefe_expr(p, b, ast.kind_at(b, ast.e_b(b, e) + k))
+            k = k + 1
+        }
+        return
+    }
+    if a == ast.E_AS {
+        pruefe_expr(p, b, ast.e_a(b, e))
+        return
+    }
+    if a == ast.E_SLIT {
+        var k: u32 = 0
+        while k < ast.e_c(b, e) {
+            pruefe_expr(p, b, ast.kind_at(b, ast.e_b(b, e) + k * 2 + 1))
+            k = k + 1
+        }
+        return
+    }
+    if a == ast.E_AWDH {
+        pruefe_expr(p, b, ast.e_a(b, e))
+        pruefe_expr(p, b, ast.e_b(b, e))
+        return
+    }
+    // E_INT / E_FLOAT / E_BOOL / E_ID: Blaetter.
+}
+
+fn pruefe_aufruf(p: *mut Pruefer, name: u32) {
+    // Regel 1: GC-Allokation — kann einen Sammellauf ausloesen.
+    if gc.gc_ist_alloc_aufruf(gcr(p), namen(p), name) {
+        (*p).fehler = (*p).fehler + 1
+        return
+    }
+    if ist_interner_name(namen(p), name) {
+        return
+    }
+    // Regel 2: Aufruf ohne #[no_gc] — bricht die Kette.
+    if markierung(p, name) == 2 {
+        (*p).fehler = (*p).fehler + 1
+        return
+    }
+}
+
+// `match` steht als Aufruf `__match#N` im Baum; die Rumpfbloecke der Faelle
+// liegen in der Registrierung von `muster.fi`. Ohne diesen Abstieg waere
+// jede Zustandsmaschine ein blinder Fleck (tests/541, tests/neg/nogc_match_fall).
+fn pruefe_match_faelle(p: *mut Pruefer, name: u32) {
+    if (*p).mu == 0 {
+        return
+    }
+    if !muster.mus_ist_matchname(namen(p), name) {
+        return
+    }
+    let mi: u32 = muster.mus_match_nummer(namen(p), name)
+    let m: *mut muster.Mus = mul(p)
+    let b: *mut ast.Baum = sema.sema_baum((*p).sm as *mut sema.Sema)
+    if (*p).tiefe >= MAX_TIEFE {
+        return
+    }
+    (*p).tiefe = (*p).tiefe + 1
+    pruefe_expr(p, b, muster.mus_m_subj(m, mi))
+    let aoff: u32 = muster.mus_m_aoff(m, mi)
+    let alen: u32 = muster.mus_m_alen(m, mi)
+    var k: u32 = 0
+    while k < alen {
+        pruefe_block(p, b, muster.mus_a_block(m, aoff + k))
+        k = k + 1
+    }
+    (*p).tiefe = (*p).tiefe - 1
+}

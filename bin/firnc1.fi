@@ -25,6 +25,8 @@ import mono
 import muster
 import fehler
 import zeit
+import gc
+import gctext
 import parser
 import typen
 import sema
@@ -246,6 +248,11 @@ fn main(start: u64) -> i32 {
     var fe: fehler.Fehler = fehler.fehler_neu()
     defer fehler.fehler_frei(&fe)
 
+    // gc-Klassen: EINE Registrierung fuer alle Dateien dieser Uebersetzung
+    // (Runde 34 — Klassennamen gelten programmweit, wie die Aufzaehlungen).
+    var gcreg: gc.Gc = gc.gc_neu()
+    defer gc.gc_frei(&gcreg)
+
     var ml: Modulliste = ml_neu()
     defer ml_frei(&ml)
     ml_dazu(&ml, name, name_n, 4294967295)
@@ -256,6 +263,19 @@ fn main(start: u64) -> i32 {
     defer rt.buf_frei(&mpfad)
     var mverz: rt.Buf = rt.buf_neu()
     defer rt.buf_frei(&mverz)
+
+    // --- GC-SUCHE am Tokenstrom (quelle_braucht_gc / quelle_hat_allocerror
+    // in gc.rs): steht irgendwo `gc class`, wird die Sammler-Laufzeit
+    // (lib/gc/gc.fi, eingebettet in gctext.fi) als zusaetzliches Modul
+    // eingezogen; deklariert das Programm `AllocError` selbst, faellt die
+    // mitgelieferte Fehlermenge weg.
+    var sgc: [u8; 2] = "gc"
+    var scl: [u8; 5] = "class"
+    var sae: [u8; 10] = "AllocError"
+    let gc_nr: i64 = intern.intern_finde(it, (&sgc[0]) as u64, 2)
+    let class_nr: i64 = intern.intern_finde(it, (&scl[0]) as u64, 5)
+    let ae_nr: i64 = intern.intern_finde(it, (&sae[0]) as u64, 10)
+    var gc_scan: u32 = gc.gc_quelle_scan((&l) as u64, gc_nr, class_nr, ae_nr)
 
     // --- ERSTER DURCHGANG: Warteschlange aufbauen und die generischen Namen
     // einsammeln. Beides muss VOR dem Parsen der ersten Datei feststehen.
@@ -286,6 +306,7 @@ fn main(start: u64) -> i32 {
             return 1
         }
         mono.gen_vorab(&g, (&vl) as u64)
+        gc_scan = gc_scan | gc.gc_quelle_scan((&vl) as u64, gc_nr, class_nr, ae_nr)
         rt.buf_leeren(&mverz)
         verzeichnis(&mverz, rt.buf_ptr(&mpfad), rt.buf_len(&mpfad) - 1)
         let irc: i32 = imports_sammeln(&vl, &mverz, &verz, &ml)
@@ -320,6 +341,7 @@ fn main(start: u64) -> i32 {
         parser.par_gen_setzen(&mp, (&g) as u64)
         parser.par_mu_setzen(&mp, (&mu) as u64)
         parser.par_fe_setzen(&mp, (&fe) as u64)
+        parser.par_gc_setzen(&mp, (&gcreg) as u64)
         parser.par_zeit_setzen(&mp)
         parser.par_lauf(&mp)
         let schlecht: bool = parser.par_nicht_kern(&mp)
@@ -341,6 +363,7 @@ fn main(start: u64) -> i32 {
     parser.par_gen_setzen(&p, (&g) as u64)
     parser.par_mu_setzen(&p, (&mu) as u64)
     parser.par_fe_setzen(&p, (&fe) as u64)
+    parser.par_gc_setzen(&p, (&gcreg) as u64)
     parser.par_zeit_setzen(&p)
     parser.par_lauf(&p)
     if parser.par_nicht_kern(&p) {
@@ -348,6 +371,46 @@ fn main(start: u64) -> i32 {
     }
     if parser.par_fehler(&p) > 0 {
         return 1
+    }
+
+    // --- die Sammler-Laufzeit automatisch einziehen, sobald irgendwo ein
+    // `gc class` steht (Runde 34; HOOK gc in modules.rs, SPEC 3.5). Sie
+    // liegt im WURZELNAMENSRAUM: `gc_init()` heisst in jedem Modul
+    // `gc_init()`, ohne `import` und ohne Modulpraefix.
+    if gc_scan & 1 != 0 {
+        var gq: rt.Buf = rt.buf_neu()
+        defer rt.buf_frei(&gq)
+        if gc_scan & 2 == 0 {
+            var aed: [u8; 33] = "error AllocError { OutOfMemory }\n"
+            rt.buf_push_bytes(&gq, (&aed[0]) as u64, 33)
+        }
+        gctext.gctext_schreiben(&gq)
+        var gpn: [u8; 12] = "lib/gc/gc.fi"
+        var gl: lexer.Lexer = lexer.lex_neu(rt.buf_ptr(&gq), rt.buf_len(&gq),
+                                            (&kwtxt[0]) as u64, 172,
+                                            (&gpn[0]) as u64, 12)
+        lexer.lex_namen_setzen(&gl, it as u64)
+        lexer.lex_lauf(&gl)
+        if lexer.lex_fehler(&gl) > 0 {
+            lexer.lex_frei(&gl)
+            return 1
+        }
+        var gp: parser.Parser = parser.par_neu_modul((&gl) as u64, baum as u64, 4294967295)
+        parser.par_gen_setzen(&gp, (&g) as u64)
+        parser.par_mu_setzen(&gp, (&mu) as u64)
+        parser.par_fe_setzen(&gp, (&fe) as u64)
+        parser.par_gc_setzen(&gp, (&gcreg) as u64)
+        parser.par_lauf(&gp)
+        let gschlecht: bool = parser.par_nicht_kern(&gp)
+        let gfehl: usize = parser.par_fehler(&gp)
+        parser.par_frei(&gp)
+        lexer.lex_frei(&gl)
+        if gschlecht {
+            return 3
+        }
+        if gfehl > 0 {
+            return 1
+        }
     }
 
     // --- comptime: die Bloecke der Wurzeldatei laufen VOR der Typpruefung.
@@ -380,6 +443,7 @@ fn main(start: u64) -> i32 {
             parser.par_gen_setzen(&ctp, (&g) as u64)
             parser.par_mu_setzen(&ctp, (&mu) as u64)
             parser.par_fe_setzen(&ctp, (&fe) as u64)
+            parser.par_gc_setzen(&ctp, (&gcreg) as u64)
             parser.par_lauf(&ctp)
             let ctschlecht: bool = parser.par_nicht_kern(&ctp)
             let ctfehl: usize = parser.par_fehler(&ctp)
@@ -409,6 +473,7 @@ fn main(start: u64) -> i32 {
     defer sema.sema_frei(&sm)
     sema.sema_mu_setzen(&sm, (&mu) as u64)
     sema.sema_fe_setzen(&sm, (&fe) as u64)
+    sema.sema_gc_setzen(&sm, (&gcreg) as u64)
     sema.sema_lauf(&sm)
     if sema.sema_braucht_comptime(&sm) {
         return 4
@@ -421,6 +486,7 @@ fn main(start: u64) -> i32 {
     defer lower.low_frei(&lo)
     lower.low_mu_setzen(&lo, (&mu) as u64)
     lower.low_fe_setzen(&lo, (&fe) as u64)
+    lower.low_gc_setzen(&lo, (&gcreg) as u64)
     lower.low_lauf(&lo)
     if lower.low_ungeeignet(&lo) {
         return 5
@@ -431,6 +497,7 @@ fn main(start: u64) -> i32 {
 
     var cg: codegen.Cg = codegen.cg_neu(lower.low_fir(&lo) as u64, it as u64)
     defer codegen.cg_frei(&cg)
+    codegen.cg_gc_setzen(&cg, (&gcreg) as u64)
     codegen.cg_lauf(&cg)
     if codegen.cg_ungeeignet(&cg) {
         return 6
