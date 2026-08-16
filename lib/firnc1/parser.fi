@@ -29,10 +29,11 @@ import ast
 import mono
 import muster
 import fehler
+import gc
 
 export { Parser, par_neu, par_neu_modul, par_frei, par_lauf, par_fehler, par_baum,
          par_nicht_kern, par_baum_uebernehmen, par_gen_setzen, par_mu_setzen,
-         par_fe_setzen, par_zeit_setzen }
+         par_fe_setzen, par_zeit_setzen, par_gc_setzen }
 
 // Token-Arten aus lexer.fi (dieselbe Reihenfolge wie compiler/src/lexer.rs)
 // "kein Wert"
@@ -173,6 +174,13 @@ struct Parser {
     // hierher, weil `erweiterungen_suchen` vor dem Parsen wissen muss, ob das
     // Schluesselwort Kernsprache ist (derselbe Uebergang wie Runde 31-33).
     zeit: bool,
+    // RUNDE 34: Registrierung der gc-Klassen (`gc.fi`). Dieselbe Bauart wie
+    // `mu`/`feh`: eine Ablage fuer alle Dateien der Uebersetzung, weil
+    // Klassennamen programmweit gelten. 0 = kein Register, dann sind
+    // `gc class`, `Gc[T]`, `x.as?[C]` und `#[no_gc]` nicht portiert.
+    gcr: u64,
+    // Das Attribut `#[no_gc]` vor der naechsten Funktionsdeklaration.
+    nogc_anstehend: u32,
     tpoff: u32,          // Anfang der laufenden Typparameterliste
     // Namensnummer von `size_of`, oder -1. `size_of` ist KEIN Schluesselwort
     // (sizeof.rs) — es laesst sich nur am Namen erkennen.
@@ -191,7 +199,7 @@ fn par_neu(lx: u64) -> Parser {
         module: vec_neu[u32](),
         kladde: rt.buf_neu(),
         klammern: 0, kein_slit: 0, fehler: 0, nicht_kern: false,
-        gen: 0, mu: 0, feh: 0, zeit: false, tpoff: 0, sonr: -1,
+        gen: 0, mu: 0, feh: 0, zeit: false, gcr: 0, nogc_anstehend: 0, tpoff: 0, sonr: -1,
         lokal: vec_neu[u32](), lgrenze: vec_neu[u32](),
     }
     p.n = lexer.lex_anzahl(lx as *mut lexer.Lexer)
@@ -226,6 +234,11 @@ fn hat_fe(p: *mut Parser) -> bool { return (*p).feh != 0 }
 // RUNDE 35: `comptime`-Bloecke anmelden.
 fn par_zeit_setzen(p: *mut Parser) { (*p).zeit = true }
 fn hat_zeit(p: *mut Parser) -> bool { return (*p).zeit }
+
+// RUNDE 34: die gc-Registrierung anmelden. Ebenfalls VOR `par_lauf`.
+fn par_gc_setzen(p: *mut Parser, g: u64) { (*p).gcr = g }
+fn gr(p: *mut Parser) -> *mut gc.Gc { return (*p).gcr as *mut gc.Gc }
+fn hat_gc(p: *mut Parser) -> bool { return (*p).gcr != 0 }
 
 fn par_baum_uebernehmen(p: *mut Parser) -> *mut ast.Baum {
     return par_baum(p)
@@ -587,6 +600,47 @@ fn typ(p: *mut Parser) -> u32 {
     if ist(p, A_IDENT) {
         let nr: u32 = nummer(p, 0)
         weiter_bump(p)
+        // RUNDE 34 (gc.rs::hook_type): `Gc[C]` und `GcWeak[C]`. Der Name
+        // steht als Platzhalter `__gc#p:C` / `__gc#w:C` im Baum; aufgeloest
+        // wird er erst in der Typaufloesung. Klassennamen gelten
+        // programmweit — KEINE Modul-Umbenennung.
+        if hat_gc(p) && ist(p, A_LBRACKET) {
+            var art_nr: u32 = 0
+            var g1: [u8; 2] = "Gc"
+            var g2: [u8; 6] = "GcWeak"
+            let it2: *mut intern.Interner = lexer.lex_namen(lx(p))
+            if intern.intern_gleich(it2, nr, (&g1[0]) as u64, 2) {
+                art_nr = 1
+            }
+            if intern.intern_gleich(it2, nr, (&g2[0]) as u64, 6) {
+                art_nr = 2
+            }
+            if art_nr != 0 {
+                weiter_bump(p)
+                if !ist(p, A_IDENT) {
+                    meckern(p)
+                    return ast.NICHTS
+                }
+                let kn: u32 = nummer(p, 0)
+                weiter_bump(p)
+                if !erwarte(p, A_RBRACKET) {
+                    return ast.NICHTS
+                }
+                rt.buf_leeren(&(*p).kladde)
+                if art_nr == 1 {
+                    var px1: [u8; 7] = "__gc#p:"
+                    rt.buf_push_bytes(&(*p).kladde, (&px1[0]) as u64, 7)
+                } else {
+                    var px2: [u8; 7] = "__gc#w:"
+                    rt.buf_push_bytes(&(*p).kladde, (&px2[0]) as u64, 7)
+                }
+                rt.buf_push_bytes(&(*p).kladde, intern.intern_zeiger(it2, kn),
+                                  intern.intern_laenge(it2, kn))
+                let pn: u32 = intern.intern_nummer(it2, rt.buf_ptr(&(*p).kladde),
+                                                   rt.buf_len(&(*p).kladde)) as u32
+                return ast.typ_neu(par_baum(p), ast.T_NAME, pn, 0)
+            }
+        }
         // `E!T` — eine Fehlerunion (errors.rs::hook_type). Der Parser legt
         // die Angabe in die Registrierung und einen Platzhalter `__eu#<n>`
         // in den Baum; aufgeloest wird er erst im Typpruefer. Die
@@ -863,6 +917,38 @@ fn nach_ausdruck(p: *mut Parser) -> u32 {
         let a: u32 = art(p, 0)
         if a == A_DOT {
             weiter_bump(p)
+            // RUNDE 34 (gc.rs::hook_postfix): `x.as?[C]` — die gepruefte
+            // Abwaertsumwandlung. Im Baum ein Aufruf `__gc#as:C`.
+            if hat_gc(p) && ist(p, A_KWAS) && art(p, 1) == A_QUESTION {
+                weiter_bump(p)
+                weiter_bump(p)
+                if !erwarte(p, A_LBRACKET) {
+                    return e
+                }
+                if !ist(p, A_IDENT) {
+                    meckern(p)
+                    return e
+                }
+                let kn: u32 = nummer(p, 0)
+                weiter_bump(p)
+                if !erwarte(p, A_RBRACKET) {
+                    return e
+                }
+                let it4: *mut intern.Interner = lexer.lex_namen(lx(p))
+                rt.buf_leeren(&(*p).kladde)
+                var px5: [u8; 8] = "__gc#as:"
+                rt.buf_push_bytes(&(*p).kladde, (&px5[0]) as u64, 8)
+                rt.buf_push_bytes(&(*p).kladde, intern.intern_zeiger(it4, kn),
+                                  intern.intern_laenge(it4, kn))
+                let an: u32 = intern.intern_nummer(it4, rt.buf_ptr(&(*p).kladde),
+                                                   rt.buf_len(&(*p).kladde)) as u32
+                var tmp4: Vec[u32] = vec_neu[u32]()
+                vec_push[u32](&tmp4, e)
+                let off4: u32 = liste_ablegen(p, &tmp4)
+                vec_frei[u32](&tmp4)
+                e = ast.ausdruck_neu(par_baum(p), ast.E_RUF, an, off4, 1, 0)
+                continue
+            }
             if !ist(p, A_IDENT) {
                 meckern(p)
                 return e
@@ -1106,6 +1192,91 @@ fn grund_ausdruck(p: *mut Parser) -> u32 {
     if a == A_IDENT {
         let nr: u32 = nummer(p, 0)
         weiter_bump(p)
+        // RUNDE 34 (gc.rs::hook_primary): `gc C{ ... }`, `gc_null[C]()` und
+        // `weak_null[C]()`.
+        if hat_gc(p) {
+            let it3: *mut intern.Interner = lexer.lex_namen(lx(p))
+            var gw2: [u8; 2] = "gc"
+            if intern.intern_gleich(it3, nr, (&gw2[0]) as u64, 2) {
+                if ist(p, A_IDENT) && art(p, 1) == A_LBRACE {
+                    var cw2: [u8; 5] = "class"
+                    if !intern.intern_gleich(it3, nummer(p, 0), (&cw2[0]) as u64, 5) {
+                        let kn: u32 = nummer(p, 0)
+                        weiter_bump(p)
+                        // "gc C" — mit Leerzeichen, kann nie ein Bezeichner
+                        // des Quelltextes sein.
+                        var tr2: [u8; 1] = " "
+                        let voll: u32 = verbinde(p, nr, (&tr2[0]) as u64, 1, kn)
+                        // kein_slit gilt hier nicht: die Klammer gehoert zur
+                        // Allokation, nicht zur Kontrollstruktur.
+                        let lit: u32 = struct_literal(p, voll)
+                        var tmp2: Vec[u32] = vec_neu[u32]()
+                        vec_push[u32](&tmp2, lit)
+                        let off2: u32 = liste_ablegen(p, &tmp2)
+                        vec_frei[u32](&tmp2)
+                        return ast.ausdruck_neu(par_baum(p), ast.E_RUF, voll, off2, 1, 0)
+                    }
+                }
+            }
+            var gn1: [u8; 7] = "gc_null"
+            var gn2: [u8; 9] = "weak_null"
+            let ist_gnull: bool = intern.intern_gleich(it3, nr, (&gn1[0]) as u64, 7)
+            let ist_wnull: bool = intern.intern_gleich(it3, nr, (&gn2[0]) as u64, 9)
+            if (ist_gnull || ist_wnull) && ist(p, A_LBRACKET) {
+                weiter_bump(p)
+                if !ist(p, A_IDENT) {
+                    meckern(p)
+                    return ast.ausdruck_neu(par_baum(p), ast.E_INT, 0, 0, 0, 0)
+                }
+                let kn: u32 = nummer(p, 0)
+                weiter_bump(p)
+                if !erwarte(p, A_RBRACKET) {
+                    return ast.ausdruck_neu(par_baum(p), ast.E_INT, 0, 0, 0, 0)
+                }
+                if !erwarte(p, A_LPAREN) {
+                    return ast.ausdruck_neu(par_baum(p), ast.E_INT, 0, 0, 0, 0)
+                }
+                if !erwarte(p, A_RPAREN) {
+                    return ast.ausdruck_neu(par_baum(p), ast.E_INT, 0, 0, 0, 0)
+                }
+                if ist_gnull {
+                    // `0 as Gc[C]` — der Nullwert ist der Nullzeiger.
+                    rt.buf_leeren(&(*p).kladde)
+                    var px3: [u8; 7] = "__gc#p:"
+                    rt.buf_push_bytes(&(*p).kladde, (&px3[0]) as u64, 7)
+                    rt.buf_push_bytes(&(*p).kladde, intern.intern_zeiger(it3, kn),
+                                      intern.intern_laenge(it3, kn))
+                    let tn: u32 = intern.intern_nummer(it3, rt.buf_ptr(&(*p).kladde),
+                                                       rt.buf_len(&(*p).kladde)) as u32
+                    let tn2: u32 = ast.typ_neu(par_baum(p), ast.T_NAME, tn, 0)
+                    let null: u32 = ast.ausdruck_neu(par_baum(p), ast.E_INT, 0, 0, 0, 0)
+                    return ast.ausdruck_neu(par_baum(p), ast.E_AS, null, tn2, 0, 0)
+                }
+                // `GcWeak[C]{ __p: 0, __s: 0 }` — der leere schwache Verweis.
+                rt.buf_leeren(&(*p).kladde)
+                var px4: [u8; 7] = "GcWeak["
+                rt.buf_push_bytes(&(*p).kladde, (&px4[0]) as u64, 7)
+                rt.buf_push_bytes(&(*p).kladde, intern.intern_zeiger(it3, kn),
+                                  intern.intern_laenge(it3, kn))
+                rt.buf_push(&(*p).kladde, 93 as u8)
+                let wn: u32 = intern.intern_nummer(it3, rt.buf_ptr(&(*p).kladde),
+                                                   rt.buf_len(&(*p).kladde)) as u32
+                var wp2: [u8; 3] = "__p"
+                var ws2: [u8; 3] = "__s"
+                let wp_n: u32 = intern.intern_nummer(it3, (&wp2[0]) as u64, 3) as u32
+                let ws_n: u32 = intern.intern_nummer(it3, (&ws2[0]) as u64, 3) as u32
+                let n1: u32 = ast.ausdruck_neu(par_baum(p), ast.E_INT, 0, 0, 0, 0)
+                let n2: u32 = ast.ausdruck_neu(par_baum(p), ast.E_INT, 0, 0, 0, 0)
+                var tmp3: Vec[u32] = vec_neu[u32]()
+                vec_push[u32](&tmp3, wp_n)
+                vec_push[u32](&tmp3, n1)
+                vec_push[u32](&tmp3, ws_n)
+                vec_push[u32](&tmp3, n2)
+                let off3: u32 = liste_ablegen(p, &tmp3)
+                vec_frei[u32](&tmp3)
+                return ast.ausdruck_neu(par_baum(p), ast.E_SLIT, wn, off3, 2, 0)
+            }
+        }
         // `size_of[T]()` — der Typtext wandert in den AUFRUFNAMEN
         // (`size_of$i32`, sizeof.rs), der Typknoten zusaetzlich nach
         // `e_zahl`; aufgeloest wird beides erst im Typpruefer, der die
@@ -1542,7 +1713,8 @@ fn fn_deklaration(p: *mut Parser) {
     }
     let rumpf: u32 = block(p)
     lok_zu(p)
-    ast.fn_dazu(par_baum(p), name, poff, plen, ret, rumpf)
+    ast.fn_dazu(par_baum(p), name, poff, plen, ret, rumpf, (*p).nogc_anstehend)
+    (*p).nogc_anstehend = 0
 }
 
 fn struct_deklaration(p: *mut Parser) {
@@ -2101,9 +2273,32 @@ fn erweiterungen_suchen(p: *mut Parser) {
                 return
             }
         }
-        if a == A_HASH || a == A_QUESTION {
-            (*p).nicht_kern = true
-            return
+        if a == A_HASH {
+            // RUNDE 34: `#[no_gc]` gehoert zur Kernsprache, sobald die
+            // gc-Registrierung angemeldet ist — jedes ANDERE Attribut
+            // (`#[must_consume]`, ...) bleibt eine nicht portierte
+            // Erweiterung, wie bisher.
+            var ok_attr: bool = false
+            if hat_gc(p) && i + 3 < (*p).n {
+                if lexer.lex_art(lx(p), i + 1) == A_LBRACKET && lexer.lex_art(lx(p), i + 3) == A_RBRACKET {
+                    if lexer.lex_art(lx(p), i + 2) == A_IDENT {
+                        var an: [u8; 5] = "no_gc"
+                        ok_attr = intern.intern_gleich(lexer.lex_namen(lx(p)),
+                                lexer.lex_nr(lx(p), i + 2), (&an[0]) as u64, 5)
+                    }
+                }
+            }
+            if !ok_attr {
+                (*p).nicht_kern = true
+                return
+            }
+        }
+        if a == A_QUESTION {
+            // RUNDE 34: `?` gehoert nur zu `x.as?[C]` — Kern mit Registrierung.
+            if !hat_gc(p) {
+                (*p).nicht_kern = true
+                return
+            }
         }
         if a == A_COLON && i + 1 < (*p).n {
             if lexer.lex_art(lx(p), i + 1) == A_COLON {
@@ -2116,16 +2311,31 @@ fn erweiterungen_suchen(p: *mut Parser) {
         if a == A_IDENT {
             let nr: i64 = lexer.lex_nr(lx(p), i) as i64
             if gc_nr >= 0 && nr == gc_nr {
-                (*p).nicht_kern = true
-                return
+                // RUNDE 34: `gc`/`gc class`/`gc C{}` gehoeren zur Kernsprache,
+                // sobald die gc-Registrierung angemeldet ist (derselbe
+                // Uebergang wie Runde 31-33, 35).
+                if !hat_gc(p) {
+                    (*p).nicht_kern = true
+                    return
+                }
             }
             if ct1_nr >= 0 && nr == ct1_nr {
                 (*p).nicht_kern = true
                 return
             }
             if ct2_nr >= 0 && nr == ct2_nr {
-                (*p).nicht_kern = true
-                return
+                // RUNDE 34: `barrier(x)` ist die undurchsichtige Sperre aus
+                // ct.rs — fuer das Verhalten (und diese Stufe hat keinen
+                // Optimierer) ist sie die Identitaet. Sie gehoert zur
+                // Kernsprache, sobald die gc-Registrierung angemeldet ist:
+                // die braucht sie (tests/modules/dom.fi), und nur der
+                // richtige Compiler meldet sie an — die Dump-Werkzeuge
+                // bleiben bei "nicht kern", weil ihre Stufe-0-Seite das
+                // Undurchsichtige (`Op::Barrier`) druckt.
+                if !hat_gc(p) {
+                    (*p).nicht_kern = true
+                    return
+                }
             }
             if ct3_nr >= 0 && nr == ct3_nr {
                 (*p).nicht_kern = true
@@ -2192,6 +2402,127 @@ fn comptime_deklaration(p: *mut Parser) {
     ast.ct_dazu(par_baum(p), b)
 }
 
+// RUNDE 34: Steht an dieser Stelle `gc class`? (hook_item in gc.rs)
+fn ist_gc_class(p: *mut Parser) -> bool {
+    if !ist(p, A_IDENT) {
+        return false
+    }
+    var gw: [u8; 2] = "gc"
+    let it: *mut intern.Interner = lexer.lex_namen(lx(p))
+    if !intern.intern_gleich(it, nummer(p, 0), (&gw[0]) as u64, 2) {
+        return false
+    }
+    if art(p, 1) != A_IDENT {
+        return false
+    }
+    var cw: [u8; 5] = "class"
+    return intern.intern_gleich(it, nummer(p, 1), (&cw[0]) as u64, 5)
+}
+
+// `#[no_gc]` — das einzige Attribut dieser Stufe. Eine Klammer mit
+// Argumenten ist ein Fehler (`no_gc` erwartet 0 Argumente, attrs.rs).
+fn attribut(p: *mut Parser) {
+    weiter_bump(p)
+    if !erwarte(p, A_LBRACKET) {
+        return
+    }
+    if !ist(p, A_IDENT) {
+        meckern(p)
+        return
+    }
+    var an: [u8; 5] = "no_gc"
+    let it: *mut intern.Interner = lexer.lex_namen(lx(p))
+    if !intern.intern_gleich(it, nummer(p, 0), (&an[0]) as u64, 5) {
+        meckern(p)
+        return
+    }
+    weiter_bump(p)
+    if ist(p, A_LPAREN) {
+        meckern(p)
+        return
+    }
+    if !erwarte(p, A_RBRACKET) {
+        return
+    }
+    (*p).nogc_anstehend = 1
+}
+
+// `gc class Name [extends Basis] { feld: Typ, ... }` (gc_class_decl in
+// gc.rs). Die Klasse geht in die Registrierung (`gc.fi`), NICHT in den
+// Baum — Klassennamen gelten programmweit und werden nicht umbenannt.
+fn gc_class_deklaration(p: *mut Parser) {
+    weiter_bump(p)
+    weiter_bump(p)
+    if !ist(p, A_IDENT) {
+        meckern(p)
+        return
+    }
+    let name: u32 = nummer(p, 0)
+    weiter_bump(p)
+    var basis: u32 = 0
+    if ist(p, A_IDENT) {
+        var ew: [u8; 7] = "extends"
+        let it: *mut intern.Interner = lexer.lex_namen(lx(p))
+        if intern.intern_gleich(it, nummer(p, 0), (&ew[0]) as u64, 7) {
+            weiter_bump(p)
+            if !ist(p, A_IDENT) {
+                meckern(p)
+                return
+            }
+            basis = nummer(p, 0)
+            weiter_bump(p)
+            if ist(p, A_COMMA) {
+                // mehrfachvererbung ist nicht erlaubt (SPEC 4.4)
+                meckern(p)
+                return
+            }
+        }
+    }
+    if !erwarte(p, A_LBRACE) {
+        return
+    }
+    let ki: u32 = gc.gc_klasse_dazu(gr(p), name)
+    if ki == KEIN {
+        // 'gc class ...' ist bereits deklariert
+        meckern(p)
+        return
+    }
+    if basis != 0 {
+        gc.gc_basis_setzen(gr(p), ki, basis)
+    }
+    while true {
+        while friss(p, A_COMMA) {}
+        if ist(p, A_RBRACE) || am_ende(p) {
+            break
+        }
+        let vor: usize = (*p).pos
+        if !ist(p, A_IDENT) {
+            meckern(p)
+            break
+        }
+        let fname: u32 = nummer(p, 0)
+        weiter_bump(p)
+        if !erwarte(p, A_COLON) {
+            break
+        }
+        let ft: u32 = typ(p)
+        if ft == ast.NICHTS {
+            break
+        }
+        if !gc.gc_feld_dazu(gr(p), ki, fname, ft) {
+            // feld ist bereits deklariert
+            meckern(p)
+        }
+        if !friss(p, A_COMMA) {
+            break
+        }
+        if (*p).pos == vor {
+            weiter_bump(p)
+        }
+    }
+    erwarte(p, A_RBRACE)
+}
+
 fn par_lauf(p: *mut Parser) {
     if hat_gen(p) {
         var so: [u8; 7] = "size_of"
@@ -2213,7 +2544,18 @@ fn par_lauf(p: *mut Parser) {
         }
         let vor: usize = (*p).pos
         let a: u32 = art(p, 0)
-        if a == A_KWFN {
+        // `#[no_gc]` gehoert vor eine FUNKTION (attrs.rs, Ziel::Funktion).
+        if (*p).nogc_anstehend == 1 && a != A_KWFN && a != A_HASH {
+            meckern(p)
+            (*p).nogc_anstehend = 0
+        }
+        if a == A_HASH && hat_gc(p) {
+            // `#[no_gc]` vor einer Funktion (Runde 34, SPEC 3.5.4). Andere
+            // Attribute faengt die Vorabsuche als nicht-Kern ab.
+            attribut(p)
+        } else if a == A_IDENT && hat_gc(p) && ist_gc_class(p) {
+            gc_class_deklaration(p)
+        } else if a == A_KWFN {
             fn_deklaration(p)
         } else if a == A_KWSTRUCT {
             struct_deklaration(p)
