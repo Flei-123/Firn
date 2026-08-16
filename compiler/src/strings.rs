@@ -115,6 +115,55 @@ fn data_line(dir: &str, it: impl Iterator<Item = u64>) -> String {
     out
 }
 
+/// Erkennt `f"..."` — die String-Interpolation (Runde 39).
+///
+/// Der Rumpf bleibt ROH (Klammern und Maskierungen unangetastet): das
+/// Zerlegen in Text- und Ausdruckssegmente macht der Parser
+/// (`parser.rs::interpolation`), das Entschluesseln der Textsegmente laeuft
+/// danach ueber [`decode_literal`] wie bei jedem anderen Literal.
+/// Rueckgabe wie bei [`lex_string_literal`]: `(Inhalt-oder-Fehler,
+/// verbrauchte Zeichen)`, `None`, wenn hier kein `f"` steht.
+pub fn lex_fstring_literal(src: &[char], pos: usize) -> Option<(Result<String, LitError>, usize)> {
+    if src.get(pos) != Some(&'f') || src.get(pos + 1) != Some(&'"') {
+        return None;
+    }
+    // Rumpf bis zum unmaskierten Anfuehrungszeichen — dieselbe Schleife wie
+    // bei `lex_string_literal`, nur ohne Entschluesselung.
+    let mut body: Vec<char> = Vec::new();
+    let mut i = pos + 2;
+    let mut closed = false;
+    while let Some(&c) = src.get(i) {
+        if c == '\\' {
+            body.push(c);
+            i += 1;
+            match src.get(i) {
+                Some(&n) if n != '\n' => {
+                    body.push(n);
+                    i += 1;
+                }
+                _ => break,
+            }
+            continue;
+        }
+        if c == '"' {
+            closed = true;
+            i += 1;
+            break;
+        }
+        if c == '\n' {
+            break;
+        }
+        body.push(c);
+        i += 1;
+    }
+    let used = i - pos;
+    if !closed {
+        let e = LitError::new(body.len() + 2, "zeichenkettenliteral ohne abschliessendes \"");
+        return Some((Err(e), used));
+    }
+    Some((Ok(body.into_iter().collect()), used))
+}
+
 /// Fehler beim Entschluesseln eines Literals.
 ///
 /// `off` ist der Abstand in **Zeichen** vom oeffnenden Anfuehrungszeichen;

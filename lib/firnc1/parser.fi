@@ -108,6 +108,7 @@ const A_LE: u32 = 65
 const A_GT: u32 = 66
 const A_GE: u32 = 67
 const A_EOF: u32 = 68
+const A_FSTR: u32 = 69
 
 // Binaeroperatoren — dieselbe Reihenfolge wie `ast::BinOp`.
 const B_ADD: u32 = 0
@@ -192,6 +193,11 @@ struct Parser {
     // Variable VERDECKT einen gleichnamigen Namen derselben Datei.
     lokal: Vec[u32],
     lgrenze: Vec[u32],
+    // RUNDE 39, Interpolation: die versteckten `let _fsegK_N` der
+    // Textsegmente — `block` hebt sie vor die naechste Anweisung.
+    hoist: Vec[u32],
+    // > 0: eine Interpolation laeuft bereits — Schachtelung ist noch nicht.
+    interp: u32,
 }
 
 fn par_neu(lx: u64) -> Parser {
@@ -204,6 +210,7 @@ fn par_neu(lx: u64) -> Parser {
         klammern: 0, kein_slit: 0, fehler: 0, nicht_kern: false,
         gen: 0, mu: 0, feh: 0, zeit: false, gcr: 0, nogc_anstehend: 0, mc_anstehend: 0, tpoff: 0, sonr: -1,
         lokal: vec_neu[u32](), lgrenze: vec_neu[u32](),
+        hoist: vec_neu[u32](), interp: 0,
     }
     p.n = lexer.lex_anzahl(lx as *mut lexer.Lexer)
     return p
@@ -257,6 +264,7 @@ fn par_frei(p: *mut Parser) {
     rt.buf_frei(&(*p).kladde)
     vec_frei[u32](&(*p).lokal)
     vec_frei[u32](&(*p).lgrenze)
+    vec_frei[u32](&(*p).hoist)
 }
 
 fn par_fehler(p: *mut Parser) -> usize { return (*p).fehler }
@@ -1051,24 +1059,20 @@ fn struct_literal(p: *mut Parser, name: u32) -> u32 {
 
 // Ein Zeichenkettenliteral wird zu einem ARRAY-LITERAL aus Ganzzahlen —
 // genauso wie in `firnc0`. Damit ist der Typ `[u8; N]` bzw. `[u16; N]`, und
-// Typpruefer und Lowering brauchen nichts Eigenes.
-fn text_literal(p: *mut Parser) -> u32 {
-    let k: usize = nummer(p, 0) as usize
-    let la: u32 = lexer.lex_lit_art(lx(p), k)
-    let n: usize = lexer.lex_lit_len(lx(p), k)
-    weiter_bump(p)
-    if n == 0 {
-        meckern(p)
-        return ast.ausdruck_neu(par_baum(p), ast.E_INT, 0, 0, 0, 0)
-    }
+// Typpruefer und Lowering brauchen nichts Eigenes. Der Aufbau liest aus dem
+// uebergebenen Lexer, damit ihn die Interpolation fuer ihre Textsegmente
+// wiederverwendet (Runde 39).
+fn alit_aus_lit(p: *mut Parser, lx2: *mut lexer.Lexer, k: usize) -> u32 {
+    let la: u32 = lexer.lex_lit_art(lx2, k)
+    let n: usize = lexer.lex_lit_len(lx2, k)
     var tmp: Vec[u32] = vec_neu[u32]()
     var i: usize = 0
     while i < n {
         var w: u64 = 0
         if la == 2 {
-            w = lexer.lex_lit_einheit(lx(p), k, i) as u64
+            w = lexer.lex_lit_einheit(lx2, k, i) as u64
         } else {
-            w = lexer.lex_lit_byte(lx(p), k, i) as u64
+            w = lexer.lex_lit_byte(lx2, k, i) as u64
         }
         vec_push[u32](&tmp, ast.ausdruck_neu(par_baum(p), ast.E_INT, 0, 0, 0, w))
         i = i + 1
@@ -1076,6 +1080,231 @@ fn text_literal(p: *mut Parser) -> u32 {
     let off: u32 = liste_ablegen(p, &tmp)
     vec_frei[u32](&tmp)
     return ast.ausdruck_neu(par_baum(p), ast.E_ALIT, 0, off, n as u32, 0)
+}
+
+fn text_literal(p: *mut Parser) -> u32 {
+    let k: usize = nummer(p, 0) as usize
+    let n: usize = lexer.lex_lit_len(lx(p), k)
+    weiter_bump(p)
+    if n == 0 {
+        meckern(p)
+        return ast.ausdruck_neu(par_baum(p), ast.E_INT, 0, 0, 0, 0)
+    }
+    return alit_aus_lit(p, lx(p), k)
+}
+
+// ------------------------------------------------------------ Interpolation
+//
+// `f"..."` (Runde 39): der Parser zerlegt den Rumpf ZUR UeBERSETZUNGSZEIT
+// in eine Aufrufkette auf den Fmt-Builder aus `std.io` — keine Varargs,
+// kein Laufzeit-Parsen. Dieselbe Uebersetzung wie in firnc0
+// (`parser.rs::interpolation`): aus `f"x = {x}!"` wird
+// `io.fmt_text(io.fmt_zahl(io.fmt_text(io.fmt_neu(), &_fseg0_0[0], 6),
+//                       (x) as i64), &_fseg0_1[0], 1)`.
+// Die Textsegmente werden als versteckte `let _fsegK_N: [u8; N]` vor die
+// umgebende Anweisung gehoben (`block` leert `hoist`). Wer `f"..."`
+// schreibt, braucht `import std.io`.
+
+// Name eines versteckten Textsegments: `_fseg<knotenstand>`. `firnc0`
+// nummeriert mit seiner `ExprId` (`_fseg{next_id}`); der Knotenstand des
+// gemeinsamen Baums ist hier dieselbe Zahl — so bleiben die kanonischen
+// Baeume beider Compiler zeichengleich (tools/parser_vergleich.sh).
+fn interp_seg_name(p: *mut Parser, stand: usize) -> u32 {
+    var b: rt.Buf = rt.buf_neu()
+    defer rt.buf_frei(&b)
+    var t: [u8; 5] = "_fseg"
+    rt.buf_push_bytes(&b, (&t[0]) as u64, 5)
+    rt.buf_push_dez_u64(&b, stand as u64)
+    let it: *mut intern.Interner = lexer.lex_namen(lx(p))
+    return intern.intern_nummer(it, rt.buf_ptr(&b), rt.buf_len(&b)) as u32
+}
+
+// Ein Textsegment: `"` + Rumpf + `"` neu lexen (die Entschluesselung ist
+// so per Bauart dieselbe wie bei einem handgeschriebenen Literal), als
+// verstecktes `let _fsegK_N: [u8; N]` anmelden und
+// `io.fmt_text(kette, &name[0] as u64, N)` an die Kette haengen.
+fn interp_text(p: *mut Parser, kette: u32, io_nr: u32, k: usize, von: usize, bis: usize) -> u32 {
+    var quelle: rt.Buf = rt.buf_neu()
+    defer rt.buf_frei(&quelle)
+    rt.buf_push(&quelle, 34 as u8)
+    var i: usize = von
+    while i < bis {
+        rt.buf_push(&quelle, lexer.lex_lit_byte(lx(p), k, i))
+        i = i + 1
+    }
+    rt.buf_push(&quelle, 34 as u8)
+    var dname: [u8; 9] = "<segment>"
+    var l2: lexer.Lexer = lexer.lex_neu(rt.buf_ptr(&quelle), rt.buf_len(&quelle),
+        lexer.lex_kw_ptr(lx(p)), lexer.lex_kw_len(lx(p)), (&dname[0]) as u64, 9)
+    lexer.lex_namen_setzen(&l2, lexer.lex_namen(lx(p)) as u64)
+    lexer.lex_lauf(&l2)
+    if lexer.lex_fehler(&l2) > 0 {
+        meckern(p)
+        lexer.lex_frei(&l2)
+        return kette
+    }
+    let stand: usize = vec_len[u32](&(*par_baum(p)).e_art)
+    let alit: u32 = alit_aus_lit(p, (&l2) as *mut lexer.Lexer, 0)
+    lexer.lex_frei(&l2)
+    let elen: u32 = ast.e_c(par_baum(p), alit)
+    if elen == 0 {
+        return kette
+    }
+    let it: *mut intern.Interner = lexer.lex_namen(lx(p))
+    let seg_name: u32 = interp_seg_name(p, stand)
+    var u8t: [u8; 2] = "u8"
+    let u8nr: u32 = intern.intern_nummer(it, (&u8t[0]) as u64, 2) as u32
+    let u8typ: u32 = ast.typ_neu(par_baum(p), ast.T_NAME, u8nr, 0)
+    let arrtyp: u32 = ast.typ_neu(par_baum(p), ast.T_ARR, u8typ, elen as u64)
+    let var_s: u32 = ast.anweisung_neu(par_baum(p), ast.S_LET, seg_name, arrtyp, alit, 0)
+    vec_push[u32](&(*p).hoist, var_s)
+    let id: u32 = ast.ausdruck_neu(par_baum(p), ast.E_ID, seg_name, 0, 0, 0)
+    let null: u32 = ast.ausdruck_neu(par_baum(p), ast.E_INT, 0, 0, 0, 0)
+    let idx: u32 = ast.ausdruck_neu(par_baum(p), ast.E_IDX, id, null, 0, 0)
+    let adr: u32 = ast.ausdruck_neu(par_baum(p), ast.E_UN, U_ADDR, idx, 0, 0)
+    var u64t: [u8; 3] = "u64"
+    let u64nr: u32 = intern.intern_nummer(it, (&u64t[0]) as u64, 3) as u32
+    let u64typ: u32 = ast.typ_neu(par_baum(p), ast.T_NAME, u64nr, 0)
+    let ptr: u32 = ast.ausdruck_neu(par_baum(p), ast.E_AS, adr, u64typ, 0, 0)
+    let laen: u32 = ast.ausdruck_neu(par_baum(p), ast.E_INT, 0, 0, 0, elen as u64)
+    var ft: [u8; 8] = "fmt_text"
+    let text_nr: u32 = qualifiziere(p, io_nr, intern.intern_nummer(it, (&ft[0]) as u64, 8) as u32)
+    let aoff: u32 = ast.kind_anfang(par_baum(p))
+    ast.kind_dazu(par_baum(p), kette)
+    ast.kind_dazu(par_baum(p), ptr)
+    ast.kind_dazu(par_baum(p), laen)
+    return ast.ausdruck_neu(par_baum(p), ast.E_RUF, text_nr, aoff, 3, 0)
+}
+
+// Ein Ausdruckssegment: das Fragment neu lexen, mit einer Parser-Kopie
+// EINEN Ausdruck daraus parsen (derselbe Baum, dieselben Register, dieselbe
+// Namenstafel, dieselben lokalen Namen) und als
+// `io.fmt_zahl(kette, (ausdruck) as i64)` an die Kette haengen.
+fn interp_ausdruck(p: *mut Parser, kette: u32, io_nr: u32, k: usize, von: usize, bis: usize) -> u32 {
+    var quelle: rt.Buf = rt.buf_neu()
+    defer rt.buf_frei(&quelle)
+    var i: usize = von
+    while i < bis {
+        rt.buf_push(&quelle, lexer.lex_lit_byte(lx(p), k, i))
+        i = i + 1
+    }
+    var dname: [u8; 10] = "<ausdruck>"
+    var l2: lexer.Lexer = lexer.lex_neu(rt.buf_ptr(&quelle), rt.buf_len(&quelle),
+        lexer.lex_kw_ptr(lx(p)), lexer.lex_kw_len(lx(p)), (&dname[0]) as u64, 10)
+    lexer.lex_namen_setzen(&l2, lexer.lex_namen(lx(p)) as u64)
+    lexer.lex_lauf(&l2)
+    if lexer.lex_fehler(&l2) > 0 {
+        meckern(p)
+        lexer.lex_frei(&l2)
+        return kette
+    }
+    // Die Kopie teilt alles, was Ausdruecke brauchen (Baum, Register,
+    // Module, lokale Namen); `interp = 1` sperrt die Schachtelung.
+    // Der Baum wird UEBER `fremd` geteilt: im Wurzelbetrieb (fremd == 0,
+    // die Dump-Werkzeuge) zeigt `par_baum` sonst auf die BAUM-KOPIE der
+    // Kopie — die Ausdrucksknoten laenden im Stapelrahmen und waeren nach
+    // der Rueckkehr tot (Segfault in astdump auf `f"{x}"`).
+    var sub: Parser = (*p)
+    sub.fremd = par_baum(p) as u64
+    sub.lx = (&l2) as u64
+    sub.pos = 0
+    sub.n = lexer.lex_anzahl(&l2)
+    sub.klammern = 0
+    sub.kein_slit = 0
+    sub.interp = 1
+    let e: u32 = innen_ausdruck(&sub)
+    (*p).fehler = sub.fehler
+    if sub.nicht_kern {
+        (*p).nicht_kern = true
+    }
+    let voll: bool = ist(&sub, A_EOF)
+    lexer.lex_frei(&l2)
+    if !voll {
+        meckern(p)
+        return kette
+    }
+    let it: *mut intern.Interner = lexer.lex_namen(lx(p))
+    var i64t: [u8; 3] = "i64"
+    let i64nr: u32 = intern.intern_nummer(it, (&i64t[0]) as u64, 3) as u32
+    let i64typ: u32 = ast.typ_neu(par_baum(p), ast.T_NAME, i64nr, 0)
+    let cast: u32 = ast.ausdruck_neu(par_baum(p), ast.E_AS, e, i64typ, 0, 0)
+    var fz: [u8; 8] = "fmt_zahl"
+    let zahl_nr: u32 = qualifiziere(p, io_nr, intern.intern_nummer(it, (&fz[0]) as u64, 8) as u32)
+    let aoff: u32 = ast.kind_anfang(par_baum(p))
+    ast.kind_dazu(par_baum(p), kette)
+    ast.kind_dazu(par_baum(p), cast)
+    return ast.ausdruck_neu(par_baum(p), ast.E_RUF, zahl_nr, aoff, 2, 0)
+}
+
+fn interpolation(p: *mut Parser) -> u32 {
+    let k: usize = nummer(p, 0) as usize
+    let n: usize = lexer.lex_lit_len(lx(p), k)
+    let it: *mut intern.Interner = lexer.lex_namen(lx(p))
+    if (*p).interp > 0 {
+        // Ein f"..." im Ausdruck eines f"..." — noch nicht (Runde 39).
+        meckern(p)
+        weiter_bump(p)
+        return ast.ausdruck_neu(par_baum(p), ast.E_INT, 0, 0, 0, 0)
+    }
+    var io_t: [u8; 2] = "io"
+    let io_nr: u32 = intern.intern_nummer(it, (&io_t[0]) as u64, 2) as u32
+    if !ist_modul(p, io_nr) {
+        // Ohne `import std.io` gibt es die Bausteine nicht — derselbe
+        // Stand wie bei einem handgeschriebenen `io.` ohne Import.
+        meckern(p)
+    }
+    var fn_t: [u8; 7] = "fmt_neu"
+    let neu_nr: u32 = qualifiziere(p, io_nr, intern.intern_nummer(it, (&fn_t[0]) as u64, 7) as u32)
+    var kette: u32 = ast.ausdruck_neu(par_baum(p), ast.E_RUF, neu_nr, ast.kind_anfang(par_baum(p)), 0, 0)
+    var i: usize = 0
+    var text_von: usize = 0
+    while i < n {
+        let b: u32 = lexer.lex_lit_byte(lx(p), k, i) as u32
+        if b == 125 {
+            // '}' ohne '{'
+            meckern(p)
+            break
+        }
+        if b == 92 {
+            // Maskierung gehoert dem Textsegment
+            i = i + 2
+            continue
+        }
+        if b != 123 {
+            i = i + 1
+            continue
+        }
+        if i > text_von {
+            kette = interp_text(p, kette, io_nr, k, text_von, i)
+        }
+        var j: usize = i + 1
+        var zu: bool = false
+        while j < n {
+            let b2: u32 = lexer.lex_lit_byte(lx(p), k, j) as u32
+            if b2 == 123 {
+                // '{' im Ausdruck — Kernfassung: keine Schachtelung
+                meckern(p)
+                break
+            }
+            if b2 == 125 {
+                zu = true
+                break
+            }
+            j = j + 1
+        }
+        if !zu {
+            meckern(p)
+            break
+        }
+        kette = interp_ausdruck(p, kette, io_nr, k, i + 1, j)
+        i = j + 1
+        text_von = i
+    }
+    if text_von < n {
+        kette = interp_text(p, kette, io_nr, k, text_von, n)
+    }
+    weiter_bump(p)
+    return kette
 }
 
 // `size_of[Typname]()` — `size_of` ist gelesen, `[` steht an.
@@ -1129,6 +1358,9 @@ fn grund_ausdruck(p: *mut Parser) -> u32 {
     }
     if a == A_STR {
         return text_literal(p)
+    }
+    if a == A_FSTR {
+        return interpolation(p)
     }
     if a == A_KWTRUE {
         weiter_bump(p)
@@ -1390,6 +1622,14 @@ fn block(p: *mut Parser) -> u32 {
         }
         let vor: usize = (*p).pos
         let s: u32 = anweisung(p)
+        // Versteckte Textsegmente der Interpolation stehen VOR der
+        // Anweisung, die ihre Interpolation enthaelt (Runde 39).
+        var hi: usize = 0
+        while hi < vec_len[u32](&(*p).hoist) {
+            vec_push[u32](&eigene, vec_at[u32](&(*p).hoist, hi))
+            hi = hi + 1
+        }
+        vec_leeren[u32](&(*p).hoist)
         vec_push[u32](&eigene, s)
         if (*p).pos == vor {
             weiter_bump(p)
@@ -2629,5 +2869,10 @@ fn par_lauf(p: *mut Parser) {
         if (*p).pos == vor {
             weiter_bump(p)
         }
+    }
+    if vec_len[u32](&(*p).hoist) > 0 {
+        // f"..." auf ITEM-Ebene (z. B. in einer `const`): es gibt keine
+        // Anweisung, vor die die Textsegmente gehoben werden koennten.
+        meckern(p)
     }
 }
