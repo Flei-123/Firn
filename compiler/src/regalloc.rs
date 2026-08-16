@@ -923,7 +923,217 @@ pub(crate) fn emit_func_ra(e: &mut Emitter, f: &Func) -> Option<Result<(), Strin
         return None;
     }
     let a = allocate(f);
-    Some(emit_with(e, f, &a))
+    // Die Funktion wird zunaechst in einen eigenen Puffer emittiert; danach
+    // streicht der Register-Deskriptor-Nachpass Spill-Stores mit sofortigem
+    // Reload desselben Werts (445x statisch im Tokenizer-Workload, Runde 37).
+    let mut tmp = Emitter { out: String::new() };
+    match emit_with(&mut tmp, f, &a) {
+        Ok(()) => {
+            let nv = f.val_types.len();
+            e.out.push_str(&deskriptor_peephole(&tmp.out, nv));
+            Some(Ok(()))
+        }
+        Err(err) => Some(Err(err)),
+    }
+}
+
+// ------------------------------------------------- Register-Deskriptor ---
+//
+// Nachpass ueber den fertig emittierten Assembler EINER Funktion. Die
+// Zuteilung schreibt Werte ohne Register in ihren Stack-Slot (`store_dst`)
+// und laedt sie bei der naechsten Verwendung wieder (`load_full`) — steht der
+// Wert aber noch unveraendert in dem Register, aus dem er gespeichert wurde,
+// ist der Reload umsonst: entweder ganz (gleiches Register) oder als
+// Speicherzugriff (andere Zielregister: `mov rB, rA` statt `mov rB, [rbp-X]`).
+//
+// Verfolgt werden ausschliesslich **Wert-Slots**: ihre Offsets liegen bei
+// `8..=nv*8` (layout() vergibt sie zuerst). `alloca`-Plaetze und
+// Sicherungs-Slots liegen dahinter und werden nie getrackt — Schreiben ueber
+// Zeiger (`Op::Store`/`CopyMem`/`SecureZero`) kann sie treffen, Wert-Slots
+// dagegen nie (ihre Adresse existiert im Programm nicht).
+//
+// Invalidierung (konservativ, Sicherheit vor Gewinn):
+//  * Blockgrenzen (Label) und Rueckwaerts-/Sprungzeilen setzen den Zustand
+//    zurueck — der Folgeblock kann von anderswo mit fremdem Zustand kommen.
+//  * `call` loescht alle caller-saved Register aus dem Deskriptor,
+//    `syscall` rax/rcx/r11, `rep movsb/stosb` rdi/rsi/rcx, `div/idiv`
+//    rax/rdx, `cqo/cdq` rdx, `setcc` al (= rax).
+//  * Jede andere Instruktion, die ein getracktes Register als Zieloperanden
+//    schreibt (mov/lea/add/.../cmov), invalidiert genau dieses Register.
+fn deskriptor_peephole(asm: &str, nv: usize) -> String {
+    /// 64-Bit-Stammregister eines Register-Namens beliebiger Breite.
+    fn stamm(r: &str) -> &str {
+        match r {
+            "al" | "ax" | "eax" | "rax" => "rax",
+            "bl" | "bx" | "ebx" | "rbx" => "rbx",
+            "cl" | "cx" | "ecx" | "rcx" => "rcx",
+            "dl" | "dx" | "edx" | "rdx" => "rdx",
+            "sil" | "si" | "esi" | "rsi" => "rsi",
+            "dil" | "di" | "edi" | "rdi" => "rdi",
+            "bpl" | "bp" | "ebp" | "rbp" => "rbp",
+            _ => {
+                let b = r.as_bytes();
+                if b.len() >= 3 && b[0] == b'r' && matches!(b[b.len() - 1], b'd' | b'w' | b'b')
+                    && r[1..r.len() - 1].chars().all(|c| c.is_ascii_digit())
+                {
+                    &r[..r.len() - 1]
+                } else {
+                    r
+                }
+            }
+        }
+    }
+    let max_slot = nv as u64 * 8;
+    let mut out = String::with_capacity(asm.len());
+    // slot_off -> Register mit demselben Inhalt
+    let mut sync: HashMap<u64, String> = HashMap::new();
+    // Register -> slot_off (Umkehrung)
+    let mut holds: HashMap<String, u64> = HashMap::new();
+    let kill_reg = |r: &str, sync: &mut HashMap<u64, String>, holds: &mut HashMap<String, u64>| {
+        if let Some(off) = holds.remove(r) {
+            if sync.get(&off).map(|s| s.as_str()) == Some(r) {
+                sync.remove(&off);
+            }
+        }
+    };
+    for zeile in asm.lines() {
+        let t = zeile.trim_start();
+        if !zeile.starts_with("    ") || t.is_empty() {
+            // Label, Direktiven, Kommentare am Zeilenanfang. Ein Label ist
+            // eine Blockgrenze: der Zustand des Vorgaengers gilt nicht.
+            if t.ends_with(':') && !t.starts_with('.') {
+                sync.clear();
+                holds.clear();
+            } else if t.starts_with(".L") && t.ends_with(':') {
+                sync.clear();
+                holds.clear();
+            }
+            out.push_str(zeile);
+            out.push('\n');
+            continue;
+        }
+        let mut teile = t.splitn(2, ' ');
+        let mn = teile.next().unwrap_or("");
+        let ops = teile.next().unwrap_or("").trim();
+        // Zielenformen, die wir tracken/ersetzen.
+        if let Some(rest) = t.strip_prefix("mov qword ptr [rbp-") {
+            if let Some(kl) = rest.find(']') {
+                let off: u64 = rest[..kl].parse().unwrap_or(0);
+                let q = rest[kl + 1..].trim_start_matches(',').trim();
+                if off >= 8 && off <= max_slot && ist_reg64(q) {
+                    let q = stamm(q).to_string();
+                    kill_reg(&q, &mut sync, &mut holds);
+                    sync.insert(off, q.clone());
+                    holds.insert(q, off);
+                    out.push_str(zeile);
+                    out.push('\n');
+                    continue;
+                }
+            }
+        }
+        if t.strip_prefix("mov r").is_some() {
+            // `mov rX, qword ptr [rbp-off]` — der Reload.
+            if let Some(kl) = ops.find(", qword ptr [rbp-") {
+                let ziel = &ops[..kl];
+                if ist_reg64(ziel) {
+                    if let Some(ende) = ops[kl + 17..].find(']') {
+                        let off: u64 = ops[kl + 17..kl + 17 + ende].parse().unwrap_or(0);
+                        if off >= 8 && off <= max_slot {
+                            let z = stamm(ziel).to_string();
+                            if let Some(r2) = sync.get(&off).cloned() {
+                                if r2 != z {
+                                    out.push_str(&format!("    mov {}, {}\n", z, r2));
+                                }
+                                // r2 == z: Reload entfaellt ganz.
+                                kill_reg(&z, &mut sync, &mut holds);
+                                sync.insert(off, z.clone());
+                                holds.insert(z, off);
+                                continue;
+                            }
+                            kill_reg(&z, &mut sync, &mut holds);
+                            sync.insert(off, z.clone());
+                            holds.insert(z, off);
+                            out.push_str(zeile);
+                            out.push('\n');
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        // Spruenge/Ruecksprung: Zustand des Folgeblocks unbekannt.
+        if mn.starts_with('j') || mn == "ret" {
+            sync.clear();
+            holds.clear();
+            out.push_str(zeile);
+            out.push('\n');
+            continue;
+        }
+        if mn == "call" {
+            for r in ["rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11"] {
+                kill_reg(r, &mut sync, &mut holds);
+            }
+            out.push_str(zeile);
+            out.push('\n');
+            continue;
+        }
+        if mn == "syscall" {
+            for r in ["rax", "rcx", "r11"] {
+                kill_reg(r, &mut sync, &mut holds);
+            }
+            out.push_str(zeile);
+            out.push('\n');
+            continue;
+        }
+        if mn == "rep" {
+            for r in ["rdi", "rsi", "rcx"] {
+                kill_reg(r, &mut sync, &mut holds);
+            }
+            out.push_str(zeile);
+            out.push('\n');
+            continue;
+        }
+        if mn == "div" || mn == "idiv" {
+            kill_reg("rax", &mut sync, &mut holds);
+            kill_reg("rdx", &mut sync, &mut holds);
+            out.push_str(zeile);
+            out.push('\n');
+            continue;
+        }
+        if mn == "cqo" || mn == "cdq" {
+            kill_reg("rdx", &mut sync, &mut holds);
+            out.push_str(zeile);
+            out.push('\n');
+            continue;
+        }
+        if mn.starts_with("set") {
+            kill_reg("rax", &mut sync, &mut holds); // Ziel ist im RA-Pfad immer `al`
+            out.push_str(zeile);
+            out.push('\n');
+            continue;
+        }
+        // Instruktionen, die ihr erstes Operandenregister schreiben.
+        if matches!(
+            mn,
+            "mov" | "movzx" | "movsx" | "movsxd" | "lea" | "add" | "sub" | "and" | "or" | "xor"
+                | "imul" | "shl" | "sar" | "shr" | "neg" | "not" | "pop"
+        ) || mn.starts_with("cmov")
+        {
+            let ziel = ops.split(',').next().unwrap_or("").trim();
+            // ACHTUNG: der Zielname kann schmal sein (`xor eax, eax` nullt
+            // ganz rax) — die Pruefung muss auf das STAMMREGISTER gehen,
+            // sonst ueberlebt ein veralteter Deskriptor-Eintrag (Runde 40:
+            // liess tests/305_dtoa_hardcases falsch rechnen).
+            let z = stamm(ziel);
+            if !ziel.contains('[') && ist_reg64(z) {
+                let z = z.to_string();
+                kill_reg(&z, &mut sync, &mut holds);
+            }
+        }
+        out.push_str(zeile);
+        out.push('\n');
+    }
+    out
 }
 
 /// Sind anweisungsgenaue Debugzeilen aktiv (`--no-opt`, siehe `dwarf.rs`)?
