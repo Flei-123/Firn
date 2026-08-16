@@ -21,3 +21,12 @@ Bisektion mit Mini-Modulen + Instrumentierung (exit-Codes 101+, dann Zaehler-Pri
 Messwerte: test.sh 637/637, selbst 169->180 (alle 9 gc-Dateien + 770_kern), 0 abweichend, Fixpunkt
 279201 Zeilen zeichengleich. 6 gc/nogc-Negativtests brechen wie firnc0 ab.
 Verbleibend: konstante Laufzeit (4), errdefer (1), must_consume (1) — Runde 36.
+
+RUNDE 36 (16.08.2026, Commits 6ef2616 + 3144601 + 2e7d8a8): die letzten drei Kernbloecke.
+#[must_consume] (attrs.rs-Vorbild, check_discard in sema.fi), errdefer (defer_bis_fehler /
+ret_term_fehler, Union-Weitergabe abgelehnt), ct-Intrinsics select + secure_zero (ct.rs-Vorbild;
+Parser-Kernregistrierung wie barrier, cmov-Codegen, secure_zero unweggoptimierbar).
+Messwerte: test.sh 640/640, selbst 180->185 gleich / 0 abweichend / 0 fehlerhaft / NICHT KERN 0,
+Fixpunkt 284207 Zeilen zeichengleich. Negativtests ct_select_*, ct_secure_zero_kein_zeiger,
+errdefer_union_weitergabe, attr_must_consume_* brechen wie firnc0 ab (rc=1).
+Verbleibend ehrlich benannt: 600_comptime.fi (rc=4, COMPTIME 1) — Kernsprache sonst vollstaendig.
