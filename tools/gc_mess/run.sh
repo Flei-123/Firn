@@ -30,7 +30,7 @@ fi
 rm -rf "$ARBEIT"
 mkdir -p "$ARBEIT"
 cp lib/dom/dom.fi lib/dom/mess.fi "$ARBEIT/"
-cp tools/gc_mess/pause.fi tools/gc_mess/frag.fi "$ARBEIT/"
+cp tools/gc_mess/pause.fi tools/gc_mess/frag.fi tools/gc_mess/frag2.fi "$ARBEIT/"
 
 echo "== GC-Messung (Runde 38) =="
 
@@ -109,6 +109,29 @@ sed -e "s|^const RUNDEN: u64 = .*$|const RUNDEN: u64 = $RUNDEN  // GCM_RUNDEN|" 
     echo "FEHLER: Bau des Fragmentierungstests"; head -5 "$ARBEIT/bau3.err"; exit 1; }
 "$ARBEIT/frag_lauf" > "$AUS/frag.tsv"
 grep '^#' "$AUS/frag.tsv"
+
+# ------------------------------------------------ 3b. Phasen-Fragmentierung
+echo
+echo "-- 3b. Phasen-Fragmentierung (gross -> klein) --"
+"$FIRNC" "$ARBEIT/frag2.fi" -o "$ARBEIT/frag2_lauf" 2>"$ARBEIT/bau4.err" || {
+    echo "FEHLER: Bau des Phasen-Tests"; head -5 "$ARBEIT/bau4.err"; exit 1; }
+"$ARBEIT/frag2_lauf" > "$AUS/frag2.tsv"
+grep '^#' "$AUS/frag2.tsv"
+python3 - "$AUS/frag2.tsv" <<'PYEOF2'
+import sys
+a_max = b_max = ende = None
+for z in open(sys.argv[1]):
+    z = z.strip()
+    if z.startswith('# rss_phase_a_max_kib='):
+        a_max = int(z.split('=')[1])
+    if z.startswith('# rss_phase_b_max_kib='):
+        b_max = int(z.split('=')[1])
+    if z.startswith('# rss_ende_kib='):
+        ende = int(z.split('=')[1])
+print(f'   Phase A max {a_max} KiB, Phase B max {b_max} KiB, Ende {ende} KiB')
+if ende is not None and a_max and ende > a_max * 0.5:
+    print('   HINWEIS: RSS-Ende ueber 50 % des Phase-A-Maximums — Rueckgabe pruefen')
+PYEOF2
 
 # ------------------------------------------------------------ 4. Auswertung
 echo
