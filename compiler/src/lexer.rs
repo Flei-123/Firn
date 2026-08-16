@@ -20,6 +20,9 @@ pub enum TokKind {
     /// Zeichenkettenliteral: `"..."`, `b"..."` oder `u"..."`.
     /// Der Inhalt ist bereits entschluesselt (`compiler/src/strings.rs`).
     Str(crate::strings::LitKind, crate::strings::LitValue),
+    /// `f"..."` — String-Interpolation (Runde 39). Der Inhalt ist der ROHE
+    /// Rumpf; das Zerlegen in Text- und Ausdruckssegmente macht der Parser.
+    FStr(String),
     // Schluesselwoerter
     KwFn,
     KwLet,
@@ -99,6 +102,7 @@ impl TokKind {
             TokKind::Float(bits) => format!("{}", f64::from_bits(*bits)),
             TokKind::Ident(s) => s.clone(),
             TokKind::Str(k, v) => format!("{}\"…\" ({} elemente)", k.prefix(), v.len()),
+            TokKind::FStr(_) => "f\"…\" (interpolation)".into(),
             TokKind::KwFn => "fn".into(),
             TokKind::KwLet => "let".into(),
             TokKind::KwVar => "var".into(),
@@ -548,6 +552,24 @@ impl<'a> Lexer<'a> {
     /// `is_ident_start` das `b` bzw. `u` von `b"..."` und `u"..."`.
     fn string_literal(&mut self) -> bool {
         let (line, col) = (self.line, self.col);
+        // ZUERST die Interpolation: `f"` ist sonst Bezeichner + Literal.
+        if let Some((res, verbraucht)) = crate::strings::lex_fstring_literal(&self.chars, self.pos) {
+            for _ in 0..verbraucht {
+                self.bump();
+            }
+            match res {
+                Ok(roh) => self.push(TokKind::FStr(roh), line, col, verbraucht as u32),
+                Err(e) => {
+                    self.dg.error(
+                        self.sp(line, col + e.off, 1),
+                        format!("in einem zeichenkettenliteral: {}", e.msg),
+                    );
+                    // Weiterlexen mit leerem Rumpf — wie bei den anderen Literalen.
+                    self.push(TokKind::FStr(String::new()), line, col, verbraucht as u32);
+                }
+            }
+            return true;
+        }
         let (kind, res, verbraucht) =
             match crate::strings::lex_string_literal(&self.chars, self.pos) {
                 Some(x) => x,
