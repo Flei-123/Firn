@@ -181,6 +181,9 @@ struct Parser {
     gcr: u64,
     // Das Attribut `#[no_gc]` vor der naechsten Funktionsdeklaration.
     nogc_anstehend: u32,
+    // Das Attribut `#[must_consume]` vor der naechsten fn-/struct-Deklaration
+    // (Runde 36, attrs.rs — Ziel::Beides).
+    mc_anstehend: u32,
     tpoff: u32,          // Anfang der laufenden Typparameterliste
     // Namensnummer von `size_of`, oder -1. `size_of` ist KEIN Schluesselwort
     // (sizeof.rs) — es laesst sich nur am Namen erkennen.
@@ -199,7 +202,7 @@ fn par_neu(lx: u64) -> Parser {
         module: vec_neu[u32](),
         kladde: rt.buf_neu(),
         klammern: 0, kein_slit: 0, fehler: 0, nicht_kern: false,
-        gen: 0, mu: 0, feh: 0, zeit: false, gcr: 0, nogc_anstehend: 0, tpoff: 0, sonr: -1,
+        gen: 0, mu: 0, feh: 0, zeit: false, gcr: 0, nogc_anstehend: 0, mc_anstehend: 0, tpoff: 0, sonr: -1,
         lokal: vec_neu[u32](), lgrenze: vec_neu[u32](),
     }
     p.n = lexer.lex_anzahl(lx as *mut lexer.Lexer)
@@ -1713,8 +1716,9 @@ fn fn_deklaration(p: *mut Parser) {
     }
     let rumpf: u32 = block(p)
     lok_zu(p)
-    ast.fn_dazu(par_baum(p), name, poff, plen, ret, rumpf, (*p).nogc_anstehend)
+    ast.fn_dazu(par_baum(p), name, poff, plen, ret, rumpf, (*p).nogc_anstehend, (*p).mc_anstehend)
     (*p).nogc_anstehend = 0
+    (*p).mc_anstehend = 0
 }
 
 fn struct_deklaration(p: *mut Parser) {
@@ -1765,7 +1769,8 @@ fn struct_deklaration(p: *mut Parser) {
     }
     erwarte(p, A_RBRACE)
     let laen: u32 = vec_len[u32](&(*par_baum(p)).fd_name) as u32 - off
-    ast.struktur_dazu(par_baum(p), name, off, laen)
+    ast.struktur_dazu(par_baum(p), name, off, laen, (*p).mc_anstehend)
+    (*p).mc_anstehend = 0
 }
 
 fn const_deklaration(p: *mut Parser) {
@@ -2283,8 +2288,12 @@ fn erweiterungen_suchen(p: *mut Parser) {
                 if lexer.lex_art(lx(p), i + 1) == A_LBRACKET && lexer.lex_art(lx(p), i + 3) == A_RBRACKET {
                     if lexer.lex_art(lx(p), i + 2) == A_IDENT {
                         var an: [u8; 5] = "no_gc"
+                        var mc: [u8; 12] = "must_consume"
+                        // Runde 36: beide umgesetzten Attribute (attrs.rs).
                         ok_attr = intern.intern_gleich(lexer.lex_namen(lx(p)),
-                                lexer.lex_nr(lx(p), i + 2), (&an[0]) as u64, 5)
+                                lexer.lex_nr(lx(p), i + 2), (&an[0]) as u64, 5) ||
+                                intern.intern_gleich(lexer.lex_namen(lx(p)),
+                                lexer.lex_nr(lx(p), i + 2), (&mc[0]) as u64, 12)
                     }
                 }
             }
@@ -2419,8 +2428,10 @@ fn ist_gc_class(p: *mut Parser) -> bool {
     return intern.intern_gleich(it, nummer(p, 1), (&cw[0]) as u64, 5)
 }
 
-// `#[no_gc]` — das einzige Attribut dieser Stufe. Eine Klammer mit
-// Argumenten ist ein Fehler (`no_gc` erwartet 0 Argumente, attrs.rs).
+// `#[no_gc]` und `#[must_consume]` — die beiden umgesetzten Attribute
+// (attrs.rs: genau diese zwei stehen auf `umgesetzt: true`). Eine Klammer
+// mit Argumenten ist ein Fehler (beide erwarten 0 Argumente, attrs.rs);
+// jeder andere Name wird von der Vorabsuche schon als nicht-Kern abgefangen.
 fn attribut(p: *mut Parser) {
     weiter_bump(p)
     if !erwarte(p, A_LBRACKET) {
@@ -2431,8 +2442,11 @@ fn attribut(p: *mut Parser) {
         return
     }
     var an: [u8; 5] = "no_gc"
+    var mc: [u8; 12] = "must_consume"
     let it: *mut intern.Interner = lexer.lex_namen(lx(p))
-    if !intern.intern_gleich(it, nummer(p, 0), (&an[0]) as u64, 5) {
+    let ist_nogc: bool = intern.intern_gleich(it, nummer(p, 0), (&an[0]) as u64, 5)
+    let ist_mc: bool = intern.intern_gleich(it, nummer(p, 0), (&mc[0]) as u64, 12)
+    if !ist_nogc && !ist_mc {
         meckern(p)
         return
     }
@@ -2444,7 +2458,11 @@ fn attribut(p: *mut Parser) {
     if !erwarte(p, A_RBRACKET) {
         return
     }
-    (*p).nogc_anstehend = 1
+    if ist_mc {
+        (*p).mc_anstehend = 1
+    } else {
+        (*p).nogc_anstehend = 1
+    }
 }
 
 // `gc class Name [extends Basis] { feld: Typ, ... }` (gc_class_decl in
@@ -2544,13 +2562,19 @@ fn par_lauf(p: *mut Parser) {
         }
         let vor: usize = (*p).pos
         let a: u32 = art(p, 0)
-        // `#[no_gc]` gehoert vor eine FUNKTION (attrs.rs, Ziel::Funktion).
+        // `#[no_gc]` gehoert vor eine FUNKTION (attrs.rs, Ziel::Funktion),
+        // `#[must_consume]` vor beides (attrs.rs, Ziel::Beides) — Runde 36.
         if (*p).nogc_anstehend == 1 && a != A_KWFN && a != A_HASH {
             meckern(p)
             (*p).nogc_anstehend = 0
         }
+        if (*p).mc_anstehend == 1 && a != A_KWFN && a != A_KWSTRUCT && a != A_HASH {
+            meckern(p)
+            (*p).mc_anstehend = 0
+        }
         if a == A_HASH && hat_gc(p) {
-            // `#[no_gc]` vor einer Funktion (Runde 34, SPEC 3.5.4). Andere
+            // `#[no_gc]` vor einer Funktion (Runde 34, SPEC 3.5.4),
+            // `#[must_consume]` vor Funktion oder Struct (Runde 36). Andere
             // Attribute faengt die Vorabsuche als nicht-Kern ab.
             attribut(p)
         } else if a == A_IDENT && hat_gc(p) && ist_gc_class(p) {
