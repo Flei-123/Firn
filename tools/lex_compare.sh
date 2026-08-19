@@ -39,17 +39,17 @@ fi
 #   (|exponent| > 22 and the mantissa does not fit into 2^53) step by step and is
 #   off by up to one ULP there. Correct would be Eisel-Lemire with
 #   128-bit arithmetic; that is still missing.
-BEKANNT="tests/590_f64.fi"
+KNOWN="tests/590_f64.fi"
 
-gleich=0
-ungleich=0
-unerwartet=0
-bekannt=0
-mit_fehler=0
-uebersprungen=0
+same=0
+different=0
+unexpected=0
+known=0
+with_diag=0
+skipped=0
 tokens=0
-langsam=0
-erste=""
+slow=0
+first=""
 
 while IFS= read -r f; do
     "$FIRNC" --emit=tokens "$f" > "$TMPD"/lexv_a.txt 2>"$TMPD"/lexv_ae.txt
@@ -58,7 +58,7 @@ while IFS= read -r f; do
     # lexer. That is no question of the lexer -- such files are counted and
     # skipped.
     if grep -q "cannot read" "$TMPD"/lexv_ae.txt; then
-        uebersprungen=$((uebersprungen+1))
+        skipped=$((skipped+1))
         continue
     fi
     "$DUMP" "$f" > "$TMPD"/lexv_b.txt 2>"$TMPD"/lexv_be.txt
@@ -68,34 +68,34 @@ while IFS= read -r f; do
         t=$(awk '{print $3}' "$TMPD"/lexv_be.txt)
         g=$(awk '{print $5}' "$TMPD"/lexv_be.txt)
         tokens=$((tokens + ${t:-0}))
-        langsam=$((langsam + ${g:-0}))
+        slow=$((slow + ${g:-0}))
         : > "$TMPD"/lexv_be.txt
     else
-        mit_fehler=$((mit_fehler+1))
+        with_diag=$((with_diag+1))
     fi
     if cmp -s "$TMPD"/lexv_a.txt "$TMPD"/lexv_b.txt && cmp -s "$TMPD"/lexv_ae.txt "$TMPD"/lexv_be.txt; then
-        gleich=$((gleich+1))
+        same=$((same+1))
     else
-        ungleich=$((ungleich+1))
-        if echo "$BEKANNT" | tr ' ' '\n' | grep -qxF "$f"; then
-            bekannt=$((bekannt+1))
+        different=$((different+1))
+        if echo "$KNOWN" | tr ' ' '\n' | grep -qxF "$f"; then
+            known=$((known+1))
         else
-            unerwartet=$((unerwartet+1))
-            [ -z "$erste" ] && erste="$f"
+            unexpected=$((unexpected+1))
+            [ -z "$first" ] && first="$f"
         fi
     fi
 done < <(find tests lib bin bench -name '*.fi' -not -type l | sort)
 
-echo "GLEICH:        $gleich"
-echo "UNGLEICH:      $ungleich   (bekannt und benannt: $bekannt)"
-echo "MIT DIAGNOSEN: $mit_fehler  (Fehlerausgabe ebenfalls verglichen)"
-echo "UEBERSPRUNGEN: $uebersprungen  (Modulbruchstueck, nicht einzeln uebersetzbar)"
-echo "TOKEN GESAMT:  $tokens"
-echo "GLEITKOMMA ausserhalb des schnellen Pfades: $langsam"
-if [ "$unerwartet" -gt 0 ]; then
-    echo "erste unerwartete Abweichung: $erste"
-    "$FIRNC" --emit=tokens "$erste" > "$TMPD"/lexv_a.txt 2>"$TMPD"/lexv_ae.txt
-    "$DUMP" "$erste" > "$TMPD"/lexv_b.txt 2>"$TMPD"/lexv_be.txt
+echo "SAME:          $same"
+echo "DIFFERENT:     $different   (known and named: $known)"
+echo "WITH DIAGNOSTICS: $with_diag  (the error output is compared as well)"
+echo "SKIPPED:       $skipped  (module fragment, not compilable on its own)"
+echo "TOKENS TOTAL:  $tokens"
+echo "FLOATING POINT outside the fast path: $slow"
+if [ "$unexpected" -gt 0 ]; then
+    echo "first unexpected deviation: $first"
+    "$FIRNC" --emit=tokens "$first" > "$TMPD"/lexv_a.txt 2>"$TMPD"/lexv_ae.txt
+    "$DUMP" "$first" > "$TMPD"/lexv_b.txt 2>"$TMPD"/lexv_be.txt
     diff "$TMPD"/lexv_a.txt "$TMPD"/lexv_b.txt | head -12
     diff "$TMPD"/lexv_ae.txt "$TMPD"/lexv_be.txt | head -20
     exit 1

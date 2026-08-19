@@ -32,10 +32,10 @@ trap 'rm -rf "$TMPD"' EXIT
 
 export FIRNLIB="$(pwd)/lib"
 FIRNC=compiler/target/release/firnc
-QUELLE=bin/firnc1.fi
+SOURCE=bin/firnc1.fi
 
 if [ ! -x "$FIRNC" ]; then
-    echo "firnc0 fehlt: $FIRNC"
+    echo "firnc0 is missing: $FIRNC"
     exit 1
 fi
 
@@ -44,59 +44,59 @@ fi
 # outdated .firnc1 otherwise measures yesterday's state (round 35).
 if [ ! -x ./.firnc1 ] || [ -n "$(find bin lib/firnc1 -name '*.fi' -newer ./.firnc1 -print -quit)" ]; then
     rm -f ./.firnc1
-    "$FIRNC" "$QUELLE" -o ./.firnc1 || { echo "Stufe 1 schlug fehl"; exit 1; }
+    "$FIRNC" "$SOURCE" -o ./.firnc1 || { echo "stage 1 failed"; exit 1; }
 fi
 
 # --- stage 2 ---------------------------------------------------------------
 rm -f .firnc2 .firnc2.s .firnc2.o
 t0=$(date +%s%N)
-./.firnc1 "$QUELLE" -o ./.firnc2
+./.firnc1 "$SOURCE" -o ./.firnc2
 rc2=$?
 t1=$(date +%s%N)
 if [ "$rc2" -ne 0 ]; then
-    echo "STUFE 2 SCHLUG FEHL (rc=$rc2)"
-    echo "  3 = keine Kernsprache · 4 = comptime · 5 = defer · 6 = Codegenerator"
+    echo "STAGE 2 FAILED (rc=$rc2)"
+    echo "  3 = not core language * 4 = comptime * 5 = defer * 6 = code generator"
     exit 1
 fi
 if [ ! -x ./.firnc2 ]; then
-    echo "STUFE 2: keine ausfuehrbare Datei"
+    echo "STAGE 2: no executable file"
     exit 1
 fi
 
 # --- stage 3 ---------------------------------------------------------------
 rm -f .firnc3 .firnc3.s .firnc3.o
 t2=$(date +%s%N)
-./.firnc2 "$QUELLE" -o ./.firnc3
+./.firnc2 "$SOURCE" -o ./.firnc3
 rc3=$?
 t3=$(date +%s%N)
 if [ "$rc3" -ne 0 ]; then
-    echo "STUFE 3 SCHLUG FEHL (rc=$rc3)"
+    echo "STAGE 3 FAILED (rc=$rc3)"
     exit 1
 fi
 
-echo "STUFE 2: $(( (t1 - t0) / 1000000 )) ms   $(wc -c < .firnc2) Oktette"
-echo "STUFE 3: $(( (t3 - t2) / 1000000 )) ms   $(wc -c < .firnc3) Oktette"
+echo "STAGE 2: $(( (t1 - t0) / 1000000 )) ms   $(wc -c < .firnc2) octets"
+echo "STAGE 3: $(( (t3 - t2) / 1000000 )) ms   $(wc -c < .firnc3) octets"
 
 # --- the comparison --------------------------------------------------------
 if ! cmp -s .firnc2.s .firnc3.s; then
-    echo "KEIN FIXPUNKT: die Assemblertexte von Stufe 2 und 3 unterscheiden sich"
+    echo "NO FIXPOINT: the assembly texts of stage 2 and 3 differ"
     diff <(head -400 .firnc2.s) <(head -400 .firnc3.s) | head -20
     exit 1
 fi
 if ! cmp -s .firnc2 .firnc3; then
-    echo "KEIN FIXPUNKT: die Binaerdateien unterscheiden sich (bei gleichem .s)"
+    echo "NO FIXPOINT: the binaries differ (with the same .s)"
     exit 1
 fi
-zeilen=$(wc -l < .firnc2.s)
-echo "FIXPUNKT:  Stufe 2 == Stufe 3, zeichengleich ($zeilen Zeilen Assembler)"
+lines=$(wc -l < .firnc2.s)
+echo "FIXPOINT:  stage 2 == stage 3, character-identical ($lines lines of assembly)"
 
 # --- the self-compiled compiler over the whole corpus ----------------------
-FIRNC1=./.firnc2 bash tools/self_compare.sh > "$TMPD"/fixpunkt_korpus.txt 2>&1
+FIRNC1=./.firnc2 bash tools/self_compare.sh > "$TMPD"/fixpoint_corpus.txt 2>&1
 krc=$?
-sed 's/^/  /' "$TMPD"/fixpunkt_korpus.txt
+sed 's/^/  /' "$TMPD"/fixpoint_corpus.txt
 if [ "$krc" -ne 0 ]; then
-    echo "STUFE 2 verhaelt sich am Korpus NICHT wie Stufe 1"
+    echo "STAGE 2 does NOT behave like stage 1 on the corpus"
     exit 1
 fi
-echo "KORPUS:    .firnc2 verhaelt sich wie firnc0"
+echo "CORPUS:    .firnc2 behaves like firnc0"
 exit 0
