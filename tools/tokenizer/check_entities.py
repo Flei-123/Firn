@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""Pruefstand fuer lib/html/entities.fi (Zeichenreferenzen) — Werkbank.
+"""Test bench for lib/html/entities.fi (character references) -- a workbench.
 
-Dieses Skript enthaelt KEINE Tokenizer-Logik. Es baut aus den offiziellen
-html5lib-Testdaten alle Faelle heraus, die sich allein mit dem
-Zeichenreferenz-Teil entscheiden lassen (Data state, kein '<' in der Eingabe,
-Erwartung besteht nur aus Character-Token), faehrt sie durch den in Firn
-geschriebenen Pruefstand lib/html/entities_probe.fi und vergleicht.
+This script contains NO tokenizer logic. Out of the official html5lib test
+data it takes all the cases that can be decided with the character reference
+part alone (Data state, no '<' in the input, the expectation consists only of
+character tokens), drives them through the test bench written in Firn,
+lib/html/entities_probe.fi, and compares.
 
-Faelle, die dieser enge Ausschnitt nicht abdeckt, werden hier NICHT gezaehlt —
-die verbindliche Gesamtzahl liefert allein tools/tokenizer/harness.py ueber
-alle 6.810 Faelle. Dieses Skript ist ein Modulnachweis, keine Bilanz.
+Cases that this narrow section does not cover are NOT counted here --
+the binding total is given by tools/tokenizer/harness.py alone, over
+all 6,810 cases. This script is a module proof, not a balance.
 
-Aufruf:  python3 tools/tokenizer/check_entities.py [binary]
+Usage:  python3 tools/tokenizer/check_entities.py [binary]
 """
 
 import glob
@@ -24,79 +24,79 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 TESTDIR = os.path.join(ROOT, "testdata", "html5lib-tokenizer")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from harness import unescape, unescape_token, normalisiere  # noqa: E402
+from harness import unescape, unescape_token, normalise  # noqa: E402
 
 
-def faelle():
-    """Alle Faelle, die reine Zeichenreferenz-Faelle im Data state sind."""
-    raus = []
-    for pfad in sorted(glob.glob(os.path.join(TESTDIR, "*.test"))):
-        with open(pfad, encoding="utf-8") as fh:
-            daten = json.load(fh)
-        liste = daten.get("tests")
-        if liste is None:
-            liste = daten.get("xmlViolationTests", [])
-        for i, t in enumerate(liste):
-            ein = t["input"]
-            erwartet = t["output"]
+def cases():
+    """All cases that are pure character reference cases in the Data state."""
+    out = []
+    for path in sorted(glob.glob(os.path.join(TESTDIR, "*.test"))):
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        lst = data.get("tests")
+        if lst is None:
+            lst = data.get("xmlViolationTests", [])
+        for i, t in enumerate(lst):
+            inp = t["input"]
+            expected = t["output"]
             if t.get("doubleEscaped"):
-                ein = unescape(ein)
-                erwartet = unescape_token(erwartet)
+                inp = unescape(inp)
+                expected = unescape_token(expected)
             states = t.get("initialStates") or ["Data state"]
             if states != ["Data state"]:
                 continue
-            if "<" in ein or "\0" in ein or "\r" in ein or "&" not in ein:
+            if "<" in inp or "\0" in inp or "\r" in inp or "&" not in inp:
                 continue
-            erwartet = normalisiere(erwartet)
-            if any(tok[0] != "Character" for tok in erwartet):
+            expected = normalise(expected)
+            if any(tok[0] != "Character" for tok in expected):
                 continue
-            raus.append((os.path.basename(pfad), i, t.get("description", ""),
-                         ein, erwartet))
-    return raus
+            out.append((os.path.basename(path), i, t.get("description", ""),
+                         inp, expected))
+    return out
 
 
 def main():
     binary = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
         ROOT, ".tokenizer-work", "entities_probe")
     if not os.path.exists(binary):
-        print("nicht gebaut: " + binary)
+        print("not built: " + binary)
         return 2
-    liste = faelle()
-    roh = bytearray()
-    for _, _, _, ein, _ in liste:
-        b = ein.encode("utf-8", "surrogatepass")
+    lst = cases()
+    raw = bytearray()
+    for _, _, _, inp, _ in lst:
+        b = inp.encode("utf-8", "surrogatepass")
         # state, flags, len_lasttag, len_input (see PROTOKOLL.md)
-        roh += struct.pack("<I", 0) + struct.pack("<I", 0) + struct.pack("<I", 0)
-        roh += struct.pack("<I", len(b)) + b
-    p = subprocess.run([binary], input=bytes(roh), stdout=subprocess.PIPE)
-    zeilen = p.stdout.decode("ascii", "replace").splitlines()
-    if len(zeilen) != len(liste):
-        print("FEHLER: %d Antworten fuer %d Faelle" % (len(zeilen), len(liste)))
+        raw += struct.pack("<I", 0) + struct.pack("<I", 0) + struct.pack("<I", 0)
+        raw += struct.pack("<I", len(b)) + b
+    p = subprocess.run([binary], input=bytes(raw), stdout=subprocess.PIPE)
+    lines = p.stdout.decode("ascii", "replace").splitlines()
+    if len(lines) != len(lst):
+        print("ERROR: %d answers for %d cases" % (len(lines), len(lst)))
         return 1
 
-    gut = 0
-    schlecht = []
-    for (datei, i, beschr, ein, erwartet), zeile in zip(liste, zeilen):
+    good = 0
+    bad = []
+    for (file, i, desc, inp, expected), line in zip(lst, lines):
         try:
             # Answer line: token stream TAB list of parse errors (PROTOKOLL.md).
             # The test bench only compares the token stream.
-            ist = normalisiere(json.loads(zeile.split("\t")[0]))
+            got = normalise(json.loads(line.split("\t")[0]))
         except ValueError:
-            ist = ["<kaputte antwort>"]
-        if ist == erwartet:
-            gut += 1
+            got = ["<broken answer>"]
+        if got == expected:
+            good += 1
         else:
-            schlecht.append((datei, i, beschr, ein, erwartet, ist))
+            bad.append((file, i, desc, inp, expected, got))
 
-    print("Zeichenreferenzen (lib/html/entities.fi), reine Data-state-Faelle")
-    print("  bestanden: %d / %d" % (gut, len(liste)))
-    for datei, i, beschr, ein, erwartet, ist in schlecht[:20]:
-        print("  FEHL %s #%d %s" % (datei, i, beschr))
-        print("       ein=%r" % ein)
-        print("       soll=%s" % json.dumps(erwartet))
-        print("       ist =%s" % json.dumps(ist))
-    if schlecht:
-        print("  ... %d Fehlschlaege" % len(schlecht))
+    print("character references (lib/html/entities.fi), pure Data state cases")
+    print("  passed: %d / %d" % (good, len(lst)))
+    for file, i, desc, inp, expected, got in bad[:20]:
+        print("  FAIL %s #%d %s" % (file, i, desc))
+        print("       in  =%r" % inp)
+        print("       want=%s" % json.dumps(expected))
+        print("       got =%s" % json.dumps(got))
+    if bad:
+        print("  ... %d failures" % len(bad))
         return 1
     return 0
 
