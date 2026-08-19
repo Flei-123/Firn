@@ -177,6 +177,12 @@ pub enum Op {
     Barrier { val: Val },
     /// `secure_zero(inout buf)`: nullt `size` Bytes ab `addr`. Gilt NIE als tot.
     SecureZero { addr: Val, size: Val },
+    /// **Runde 47** — atomares Lesen-Addieren-Schreiben (`atomar.rs`):
+    /// `[addr] += val` als EINE Maschineninstruktion (`lock xadd`), Ergebnis
+    /// ist der ALTE Wert. Immer 64 Bit. Grundlage des Zaehlers von `Arc[T]`
+    /// (SPEC §3.4). Niemals rein, niemals zusammenlegbar, nie ueber einen
+    /// anderen Speicherzugriff hinweg verschiebbar.
+    AtomicAdd { addr: Val, val: Val },
     /// Adresse des Zustandsblocks des Sammlers (SPEC §3.5, `gc.rs`).
     /// `regs = true`: vorher die callee-saved Register in den Block retten —
     /// erst dadurch ist der KONSERVATIVE Registerscan ehrlich (SPEC §3.5.3).
@@ -206,6 +212,7 @@ impl Op {
             | Op::Syscall { .. }
             | Op::CopyMem { .. }
             | Op::Barrier { .. }
+            | Op::AtomicAdd { .. }
             | Op::SecureZero { .. } => false,
         }
     }
@@ -244,6 +251,10 @@ impl Op {
                 out.push(*b);
             }
             Op::Barrier { val } => out.push(*val),
+            Op::AtomicAdd { addr, val } => {
+                out.push(*addr);
+                out.push(*val);
+            }
             Op::SecureZero { addr, size } => {
                 out.push(*addr);
                 out.push(*size);
@@ -482,6 +493,7 @@ fn fmt_inst(i: &Inst) -> String {
         Op::Select { cond, a, b } => format!("select.{} %{}, %{}, %{}", t, cond, a, b),
         Op::Barrier { val } => format!("barrier.{} %{}", t, val),
         Op::SecureZero { addr, size } => format!("secure_zero %{}, %{}", addr, size),
+        Op::AtomicAdd { addr, val } => format!("atomadd.{} %{}, %{}", t, addr, val),
         Op::GcAddr { regs } => {
             if *regs {
                 "gc_state.ptr regs=1".to_string()

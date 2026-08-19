@@ -1443,6 +1443,10 @@ impl<'a> Checker<'a> {
             return t;
         }
         // HOOK constant-time: select/barrier/secure_zero (ct.rs, SPEC §9.2/§9.3)
+        // HOOK atomar: das atomare Primitiv (atomar.rs, Runde 47)
+        if let Some(t) = crate::atomar::hook_call(self, name, args, nspan, espan) {
+            return t;
+        }
         if let Some(t) = crate::ct::hook_call(self, name, args, nspan, espan) {
             return t;
         }
