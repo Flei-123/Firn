@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
-"""Einbinder fuer die Firn-Bibliothek des Moduls `str`.
+"""Includer for the Firn library of the module `str`.
 
-Stufe 0 hat (noch) kein Modulsystem: `firnc` uebersetzt genau EINE Datei.
-Damit `lib/str/*.fi` und `lib/num/*.fi` trotzdem nur einmal existieren und
-nicht in jede Testdatei kopiert werden muessen, loest dieses Werkzeug Zeilen
-der Form
+Stage 0 has no module system (yet): `firnc` compiles exactly ONE file.
+So that `lib/str/*.fi` and `lib/num/*.fi` still exist only once and do not
+have to be copied into every test file, this tool resolves lines of the form
 
     //#include lib/str/str16.fi
 
-rekursiv auf (jede Datei hoechstens einmal) und schreibt das Ergebnis als
-eigenstaendiges .fi-Programm. Die erzeugten Dateien in tests/ sind Teil des
-Baums, damit `test.sh` sie ohne Zusatzwerkzeug uebersetzen kann.
+recursively (every file at most once) and writes the result as a
+standalone .fi program. The generated files in tests/ are part of the
+tree so that `test.sh` can compile them without an extra tool.
 
-Aufruf:  tools/strlib/expand.py <quelle.fi> <ziel.fi>
-         tools/strlib/expand.py --all      (alle Testquellen neu erzeugen)
-         tools/strlib/expand.py --check    (erzeugte Dateien sind aktuell?)
+Usage:  tools/strlib/expand.py <source.fi> <target.fi>
+        tools/strlib/expand.py --all      (regenerate all test sources)
+        tools/strlib/expand.py --check    (are the generated files current?)
 """
 
 import os

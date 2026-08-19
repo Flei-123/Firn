@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Erzeugt lib/html/error_codes.fi — die Namenstabelle der WHATWG-Parse-Fehler.
+"""Produces lib/html/error_codes.fi -- the name table of the WHATWG parse errors.
 
-Stufe 0 kennt keine Zeichenkettenliterale (SPEC §14.1.str S1). Die Codenamen
-werden deshalb als Folge von u64-Stuecken (je 8 ASCII-Bytes, little-endian,
-0 = Ende) in einer erzeugten Firn-Datei abgelegt.
+Stage 0 has no string literals (SPEC 14.1.str S1). The code names are
+therefore stored as a sequence of u64 pieces (8 ASCII bytes each,
+little-endian, 0 = end) in a generated Firn file.
 
-Die Liste stammt aus dem WHATWG-HTML-Standard §13.2 ("parse errors") und deckt
-alle Codes ab, die in testdata/html5lib-tokenizer/*.test vorkommen.
+The list comes from the WHATWG HTML standard 13.2 ("parse errors") and covers
+all codes that occur in testdata/html5lib-tokenizer/*.test.
 
-Aufruf:  python3 tools/tokenizer/gen_errors.py
+Usage:  python3 tools/tokenizer/gen_errors.py
 """
 import os
 
@@ -99,13 +99,13 @@ def main():
     z.append("//   STUECKE_MAX                     hoechste Stueckzahl eines Namens")
     z.append("")
     export = ["ANZAHL", "STUECKE_MAX", "name_chunk"] + [konstante(c) for c in CODES]
-    zeile = "export {"
+    line = "export {"
     for e in export:
-        if len(zeile) + len(e) + 2 > 92:
-            z.append(zeile)
-            zeile = "   "
-        zeile += " " + e + ","
-    z.append(zeile)
+        if len(line) + len(e) + 2 > 92:
+            z.append(line)
+            line = "   "
+        line += " " + e + ","
+    z.append(line)
     z.append("}")
     z.append("")
     z.append("const ANZAHL: u32 = %d" % len(CODES))
@@ -128,7 +128,7 @@ def main():
     z.append("")
     with open(ZIEL, "w", encoding="utf-8") as fh:
         fh.write("\n".join(z))
-    print("geschrieben: %s (%d Codes, hoechstens %d Stuecke)"
+    print("written: %s (%d codes, at most %d pieces)"
           % (os.path.relpath(ZIEL, ROOT), len(CODES), max_st))
 
 
