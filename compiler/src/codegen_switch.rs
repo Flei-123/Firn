@@ -13,8 +13,45 @@
 //!
 //! Beide Verfahren sind verhaltensgleich; der Optimierer aendert daran nichts.
 
-use crate::codegen_x86::{block_label, load_ext, load_full, reg, Emitter, Frame};
+use crate::codegen_x86::{block_label, load_ext, reg, Emitter, Frame};
 use crate::fir::{FTy, Func, Term};
+
+/// Woher kommt der Wert, ueber den verzweigt wird?
+///
+/// **Runde 51.** Vorher konnte `emit_switch` den Wert nur aus dem Rahmen
+/// lesen. Der Registerpfad (`regalloc.rs`) musste ihn deshalb erst dorthin
+/// schreiben, obwohl er in einem Register lag:
+///
+/// ```text
+/// mov %r12d,%r9d          ; Zustand in ein Arbeitsregister
+/// mov %r9,%rax
+/// mov %rax,-0x260(%rbp)   ; nur fuer emit_switch in den Rahmen
+/// mov -0x260(%rbp),%eax   ; und sofort wieder heraus
+/// cmp $0x48,%eax
+/// ```
+///
+/// Im Tokenizer ist das der Zustandsversand je Zeichen: 5.109.380 Durchlaeufe
+/// mal zwei ueberfluessige Speicherzugriffe.
+pub(crate) enum Wertquelle<'a> {
+    /// Grundpfad: der Wert liegt in seinem Rahmenfach.
+    Rahmen(&'a Frame),
+    /// Registerpfad: der Aufrufer laedt den Wert selbst nach `rax`,
+    /// erweitert auf die uebergebene Breite.
+    ///
+    /// **Zusicherung des Aufrufers:** die Funktion emittiert IMMER mindestens
+    /// einen Schreibzugriff auf `eax`/`rax`. Das ist die Grundlage dafuer,
+    /// dass die Tabelle unten auf `mov eax, eax` verzichten darf.
+    Geladen(&'a dyn Fn(&mut Emitter, u32)),
+}
+
+/// Breite, in der der Wert verglichen und indiziert wird.
+pub(crate) fn switch_bits(ty: FTy) -> u32 {
+    if ty.bits() > 32 {
+        64
+    } else {
+        32
+    }
+}
 
 /// ab so vielen Faellen lohnt eine Tabelle
 pub(crate) const MIN_TABLE_CASES: usize = 8;
@@ -27,7 +64,7 @@ const MAX_TABLE_ENTRIES: i128 = 65536;
 pub(crate) fn emit_switch(
     e: &mut Emitter,
     f: &Func,
-    fr: &Frame,
+    q: Wertquelle,
     term: &Term,
 ) -> Result<(), String> {
     let (val, ty, cases, default) = match term {
@@ -48,9 +85,11 @@ pub(crate) fn emit_switch(
         e.line(&format!("jmp {}", block_label(&f.name, default)));
         return Ok(());
     }
-    let bits = if ty.bits() > 32 { 64 } else { 32 };
-    load_ext(e, fr, "rax", val, ty, bits);
-    let _ = load_full;
+    let bits = switch_bits(ty);
+    match q {
+        Wertquelle::Rahmen(fr) => load_ext(e, fr, "rax", val, ty, bits),
+        Wertquelle::Geladen(lade) => lade(e, bits),
+    }
 
     if let Some((min, max)) = table_range(cases) {
         emit_table(e, f, cases, default, min, max, bits);
@@ -102,10 +141,13 @@ fn emit_table(
         }
         e.line(&format!("cmp eax, {}", (weite - 1) as i64));
         e.line(&format!("ja {}", dflt));
-        // 32-Bit-Operationen nullen die oberen 32 Bit von rax bereits.
-        if min == 0 {
-            e.line("mov eax, eax");
-        }
+        // KEIN `mov eax, eax` (Runde 51): auf x86-64 nullt JEDER Schreibzugriff
+        // auf ein 32-Bit-Register die oberen 32 Bit. Bis hierher ist rax
+        // garantiert genau so beschrieben worden — entweder von `load_ext`
+        // (jeder seiner Zweige schreibt `eax`: `mov`, `movzx`, `movsx`,
+        // `movsxd`), von der Zusicherung in `Wertquelle::Geladen`, oder vom
+        // `sub eax, min` unmittelbar darueber. Der Index in rax ist damit
+        // bereits nullerweitert.
     } else {
         if min != 0 {
             e.line(&format!("mov rcx, {}", min as i64));
