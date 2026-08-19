@@ -78,19 +78,19 @@ use crate::types::{Type, TypeCtx};
 
 /// Praefix des noch nicht aufgeloesten Methodenaufrufs im AST.
 /// Das Leerzeichen macht ihn unerreichbar fuer den Quelltext.
-pub(crate) const P_RUF: &str = "methode ";
+pub(crate) const P_CALL: &str = "method ";
 /// Trenner im Namen der Methodenfunktion: `Typ__methode`.
-pub(crate) const TRENNER: &str = "__";
+pub(crate) const SEP: &str = "__";
 
 /// Ist das ein noch nicht aufgeloester Methodenaufruf? Liefert den
 /// Methodennamen.
-pub(crate) fn methodenname(name: &str) -> Option<&str> {
-    name.strip_prefix(P_RUF)
+pub(crate) fn method_name(name: &str) -> Option<&str> {
+    name.strip_prefix(P_CALL)
 }
 
 /// Name der Funktion hinter `Typ.methode`.
-pub(crate) fn fn_name(typ: &str, methode: &str) -> String {
-    format!("{}{}{}", typ, TRENNER, methode)
+pub(crate) fn fn_name(ty: &str, method: &str) -> String {
+    format!("{}{}{}", ty, SEP, method)
 }
 
 // ------------------------------------------------------------------- Parser
@@ -129,18 +129,18 @@ pub(crate) fn hook_item(p: &mut Parser, prog: &mut Program) -> bool {
     }
 }
 
-fn impl_decl(p: &mut Parser, prog: &mut Program, fuer: bool) {
+fn impl_decl(p: &mut Parser, prog: &mut Program, is_for: bool) {
     let start = p.bump(); // 'impl'
     if !p.pending_attrs.is_empty() {
         let sp = p.pending_attrs[0].span;
         p.dg.error_note(
             sp,
-            "vor 'impl' ist kein attribut erlaubt".to_string(),
-            "schreibe das attribut vor die einzelne methode".to_string(),
+            "no attribute is allowed before 'impl'".to_string(),
+            "write the attribute before the individual method".to_string(),
         );
         p.pending_attrs.clear();
     }
-    let (erster, esp) = match p.ident("nach 'impl'") {
+    let (first, esp) = match p.ident("after 'impl'") {
         Some(x) => x,
         None => {
             p.recovering = false;
@@ -151,9 +151,9 @@ fn impl_decl(p: &mut Parser, prog: &mut Program, fuer: bool) {
     // HOOK iface: `impl Schnittstelle for Typ` (iface.rs, Runde 46). Der
     // Block legt DIESELBEN Funktionen an wie `impl Typ` — die Schnittstelle
     // sagt nur zusaetzlich, was darin stehen MUSS.
-    let (typ, tsp) = if fuer {
+    let (ty, tsp) = if is_for {
         p.bump(); // 'for'
-        match p.ident("nach 'for' in 'impl … for …'") {
+        match p.ident("after 'for' in 'impl … for …'") {
             Some(x) => x,
             None => {
                 p.recovering = false;
@@ -162,12 +162,12 @@ fn impl_decl(p: &mut Parser, prog: &mut Program, fuer: bool) {
             }
         }
     } else {
-        (erster.clone(), esp)
+        (first.clone(), esp)
     };
-    if fuer {
-        crate::iface::merke_umsetzung(erster, typ.clone(), esp);
+    if is_for {
+        crate::iface::remember_impl(first, ty.clone(), esp);
     }
-    if !p.expect(TokKind::LBrace, "nach dem typnamen in 'impl'") {
+    if !p.expect(TokKind::LBrace, "after the type name in 'impl'") {
         p.recovering = false;
         p.sync_item();
         return;
@@ -183,7 +183,7 @@ fn impl_decl(p: &mut Parser, prog: &mut Program, fuer: bool) {
         let before = p.pos;
         if !p.at(&TokKind::KwFn) {
             p.error_here(format!(
-                "erwartet 'fn' in einem impl-block, gefunden '{}'",
+                "expected 'fn' in an impl block, found '{}'",
                 p.kind().text()
             ));
             p.recovering = false;
@@ -192,7 +192,7 @@ fn impl_decl(p: &mut Parser, prog: &mut Program, fuer: bool) {
         // Eine kaputte Methode bricht den GANZEN Block ab. Sonst folgt auf
         // die eigentliche Meldung eine Kaskade aus Folgefehlern, und die
         // erste — die einzige, die etwas erklaert — geht darin unter.
-        if !methode(p, prog, &typ, tsp) {
+        if !method(p, prog, &ty, tsp) {
             p.recovering = false;
             p.sync_item();
             return;
@@ -201,16 +201,16 @@ fn impl_decl(p: &mut Parser, prog: &mut Program, fuer: bool) {
             p.bump();
         }
     }
-    p.close(TokKind::RBrace, "am ende des impl-blocks");
+    p.close(TokKind::RBrace, "at the end of the impl block");
     p.recovering = false;
     let _ = start;
 }
 
 /// Eine Methode: `fn name(<empfaenger>[, param…]) [-> T] { … }`.
 /// `false` = abgebrochen, der umgebende `impl`-Block wird verworfen.
-fn methode(p: &mut Parser, prog: &mut Program, typ: &str, tsp: Span) -> bool {
+fn method(p: &mut Parser, prog: &mut Program, ty: &str, tsp: Span) -> bool {
     let start = p.bump(); // 'fn'
-    let name = match p.ident("nach 'fn' in einem impl-block") {
+    let name = match p.ident("after 'fn' in an impl block") {
         Some((n, _)) => n,
         None => {
             p.recovering = false;
@@ -219,17 +219,17 @@ fn methode(p: &mut Parser, prog: &mut Program, typ: &str, tsp: Span) -> bool {
         }
     };
     if p.at(&TokKind::LBracket) {
-        p.error_here("eine methode kann in dieser stufe nicht generisch sein");
+        p.error_here("a method cannot be generic in this stage");
         p.recovering = false;
         p.sync_item();
         return false;
     }
-    if !p.expect(TokKind::LParen, "nach dem methodennamen") {
+    if !p.expect(TokKind::LParen, "after the method name") {
         p.recovering = false;
         p.sync_item();
         return false;
     }
-    let selbst = match selbst_param(p, typ, tsp) {
+    let slf = match self_param(p, ty, tsp) {
         Some(x) => x,
         None => {
             p.recovering = false;
@@ -237,11 +237,11 @@ fn methode(p: &mut Parser, prog: &mut Program, typ: &str, tsp: Span) -> bool {
             return false;
         }
     };
-    let mut params = vec![selbst];
+    let mut params = vec![slf];
     if p.eat(&TokKind::Comma) {
         params.extend(p.params());
     }
-    p.close(TokKind::RParen, "nach der parameterliste");
+    p.close(TokKind::RParen, "after the parameter list");
     p.recovering = false;
     let ret = if p.eat(&TokKind::Arrow) {
         match p.parse_type() {
@@ -257,18 +257,18 @@ fn methode(p: &mut Parser, prog: &mut Program, typ: &str, tsp: Span) -> bool {
     };
     if !p.at(&TokKind::LBrace) {
         p.error_here(format!(
-            "erwartet '{{' am anfang des methodenrumpfes, gefunden '{}'",
+            "expected '{{' at the start of the method body, found '{}'",
             p.kind().text()
         ));
         p.recovering = false;
         p.sync_item();
         return false;
     }
-    let body = p.block("am anfang des methodenrumpfes");
+    let body = p.block("at the start of the method body");
     p.recovering = false;
     let attrs = std::mem::take(&mut p.pending_attrs);
     prog.funcs.push(FnDecl {
-        name: fn_name(typ, &name),
+        name: fn_name(ty, &name),
         params,
         ret,
         body,
@@ -288,20 +288,20 @@ fn methode(p: &mut Parser, prog: &mut Program, typ: &str, tsp: Span) -> bool {
 /// muss `gc class K` VOR dem `impl`-Block stehen (docs/RUNDE46.md §9).
 /// Der interne Name wird von `modules.rs` nicht umbenannt — richtig so:
 /// Klassennamen gelten programmweit.
-fn selbst_param(p: &mut Parser, typ: &str, tsp: Span) -> Option<Param> {
-    let klasse = crate::gc::ist_klasse(typ);
-    let tname = if klasse {
-        format!("gc {}", typ)
+fn self_param(p: &mut Parser, ty: &str, tsp: Span) -> Option<Param> {
+    let class = crate::gc::is_class(ty);
+    let tname = if class {
+        format!("gc {}", ty)
     } else {
-        typ.to_string()
+        ty.to_string()
     };
     if matches!(p.kind(), TokKind::Ident(n) if n == "self") {
         let sp = p.bump();
-        if klasse {
+        if class {
             p.dg.error_note(
                 sp,
-                format!("'{}' ist eine gc-klasse: der empfaenger kann keine kopie sein", typ),
-                "ein 'gc class'-wert lebt nur auf dem GC-Heap: schreibe '*self' oder '*mut self'"
+                format!("'{}' is a gc class: the receiver cannot be a copy", ty),
+                "a 'gc class' value lives only on the GC heap: write '*self' or '*mut self'"
                     .to_string(),
             );
             return None;
@@ -314,7 +314,7 @@ fn selbst_param(p: &mut Parser, typ: &str, tsp: Span) -> Option<Param> {
     }
     if p.at(&TokKind::Star) {
         let star = p.span();
-        if let Some((mutable, sp)) = zeiger_self(p) {
+        if let Some((mutable, sp)) = ptr_self(p) {
             return Some(Param {
                 name: "self".to_string(),
                 ty: TypeExpr::Ptr {
@@ -327,24 +327,24 @@ fn selbst_param(p: &mut Parser, typ: &str, tsp: Span) -> Option<Param> {
         }
     }
     p.error_here(
-        "der erste parameter einer methode ist der empfaenger: 'self', '*self' oder '*mut self'",
+        "the first parameter of a method is the receiver: 'self', '*self' or '*mut self'",
     );
     None
 }
 
 /// Verbraucht `*self` bzw. `*mut self` und liefert (veraenderlich, Position
 /// von `self`). Steht danach kein `self`, wird nichts verbraucht.
-pub(crate) fn zeiger_self(p: &mut Parser) -> Option<(bool, Span)> {
-    let mit_mut = matches!(p.toks.get(p.pos + 1).map(|t| &t.kind), Some(TokKind::KwMut));
-    let idx = if mit_mut { p.pos + 2 } else { p.pos + 1 };
+pub(crate) fn ptr_self(p: &mut Parser) -> Option<(bool, Span)> {
+    let with_mut = matches!(p.toks.get(p.pos + 1).map(|t| &t.kind), Some(TokKind::KwMut));
+    let idx = if with_mut { p.pos + 2 } else { p.pos + 1 };
     if !matches!(p.toks.get(idx).map(|t| &t.kind), Some(TokKind::Ident(n)) if n == "self") {
         return None;
     }
     p.bump(); // '*'
-    if mit_mut {
+    if with_mut {
         p.bump(); // 'mut'
     }
-    Some((mit_mut, p.bump())) // 'self'
+    Some((with_mut, p.bump())) // 'self'
 }
 
 /// `// HOOK impl` in `parser.rs::postfix` — `x.m(args)`.
@@ -353,7 +353,7 @@ pub(crate) fn zeiger_self(p: &mut Parser) -> Option<(bool, Span)> {
 /// Methodenaufruf und kein Feldzugriff. Ein qualifizierter Modulzugriff
 /// (`modul.funktion(..)`) kommt hier nie an: den hat `Parser::qualify` in
 /// `primary` schon zu EINEM Namen gemacht.
-pub(crate) fn hook_methodenaufruf(
+pub(crate) fn hook_method_call(
     p: &mut Parser,
     base: &Expr,
     name: &str,
@@ -368,19 +368,19 @@ pub(crate) fn hook_methodenaufruf(
         return None;
     }
     p.bump(); // '('
-    let (args, end) = p.call_args("nach der argumentliste eines methodenaufrufs");
-    let mut alle = Vec::with_capacity(args.len() + 1);
-    alle.push(base.clone());
-    alle.extend(args);
+    let (args, end) = p.call_args("after the argument list of a method call");
+    let mut all = Vec::with_capacity(args.len() + 1);
+    all.push(base.clone());
+    all.extend(args);
     let span = Parser::join(base.span, end);
-    Some(p.mk(span, ExprKind::Call(format!("{}{}", P_RUF, name), alle, nsp)))
+    Some(p.mk(span, ExprKind::Call(format!("{}{}", P_CALL, name), all, nsp)))
 }
 
 // -------------------------------------------------------------- Typpruefung
 
 /// Struktur hinter einem Empfaengertyp: `(Index, liegt schon als Zeiger vor)`.
 /// Nur fuer die Frage „ist das ein `dyn I`?" — sonst gilt `empfaenger_praefix`.
-fn empfaenger_struktur(tcx: &TypeCtx, t: &Type) -> Option<(usize, bool)> {
+fn receiver_structure(tcx: &TypeCtx, t: &Type) -> Option<(usize, bool)> {
     match t {
         Type::Struct(i) if tcx.structs.get(*i).is_some() => Some((*i, false)),
         Type::Ptr { inner, .. } => match &**inner {
@@ -398,13 +398,13 @@ fn empfaenger_struktur(tcx: &TypeCtx, t: &Type) -> Option<(usize, bool)> {
 /// `i32__kleiner` an). Ein typloses Ganzzahlliteral gehoert ausdruecklich
 /// nicht dazu: `1.m()` haette keinen festen Typ, und welcher `impl`-Block
 /// gemeint waere, koennte niemand sagen.
-fn empfaenger_praefix(tcx: &TypeCtx, t: &Type) -> Option<(String, bool)> {
+fn receiver_prefix(tcx: &TypeCtx, t: &Type) -> Option<(String, bool)> {
     fn name(tcx: &TypeCtx, t: &Type) -> Option<String> {
         match t {
             Type::Struct(i) if tcx.structs.get(*i).is_some() => {
-                Some(crate::iface::methodenpraefix(tcx, *i))
+                Some(crate::iface::method_prefix(tcx, *i))
             }
-            other => crate::iface::grundtyp_name(other).map(|s| s.to_string()),
+            other => crate::iface::base_ty_name(other).map(|s| s.to_string()),
         }
     }
     match t {
@@ -415,37 +415,37 @@ fn empfaenger_praefix(tcx: &TypeCtx, t: &Type) -> Option<(String, bool)> {
 
 /// Schnittstelle hinter einem Empfaengertyp, wenn es ein `dyn I` ist.
 /// (Runde 46; auch `sema::probe` fragt hier.)
-pub(crate) fn dyn_schnittstelle(tcx: &TypeCtx, t: &Type) -> Option<String> {
-    let (i, _) = empfaenger_struktur(tcx, t)?;
+pub(crate) fn dyn_interface(tcx: &TypeCtx, t: &Type) -> Option<String> {
+    let (i, _) = receiver_structure(tcx, t)?;
     let name = &tcx.structs.get(i)?.name;
-    crate::iface::schnittstelle_von(name).map(|s| s.to_string())
+    crate::iface::interface_of(name).map(|s| s.to_string())
 }
 
 /// Aufloesung: Zielfunktion und ob der Empfaenger als ADRESSE uebergeben
 /// wird. EINE Stelle, drei Benutzer — `sema::probe` (Typhinweis),
 /// `sema::call` (Pruefung) und `lower::lower_call` (Aufruf) rechnen alle
 /// hiermit, damit sie nicht auseinanderlaufen koennen.
-pub(crate) fn ziel_von(
+pub(crate) fn target_of(
     tcx: &TypeCtx,
     fns: &HashMap<String, FnSig>,
-    methode: &str,
-    empf: &Type,
+    method: &str,
+    recv: &Type,
 ) -> Option<(String, bool)> {
-    let (praefix, ist_zeiger) = empfaenger_praefix(tcx, empf)?;
-    let voll = fn_name(&praefix, methode);
-    let sig = fns.get(&voll)?;
-    let will_zeiger = sig.params.first().map(|t| t.is_ptr()).unwrap_or(false);
-    Some((voll, will_zeiger && !ist_zeiger))
+    let (prefix, is_ptr) = receiver_prefix(tcx, recv)?;
+    let full = fn_name(&prefix, method);
+    let sig = fns.get(&full)?;
+    let will_ptr = sig.params.first().map(|t| t.is_ptr()).unwrap_or(false);
+    Some((full, will_ptr && !is_ptr))
 }
 
 /// Dasselbe fuer das Lowering, das die fertige `TypeInfo` hat.
-pub(crate) fn ziel(info: &TypeInfo, methode: &str, empf: &Type) -> Option<(String, bool)> {
-    ziel_von(&info.tcx, &info.fns, methode, empf)
+pub(crate) fn target(info: &TypeInfo, method: &str, recv: &Type) -> Option<(String, bool)> {
+    target_of(&info.tcx, &info.fns, method, recv)
 }
 
 /// Kann von diesem Ausdruck eine Adresse genommen werden?
 /// Dieselbe Menge, die `&x` erlaubt und die `lower::lower_addr` beherrscht.
-fn ist_platz(e: &Expr) -> bool {
+fn is_slot(e: &Expr) -> bool {
     match &e.kind {
         ExprKind::Ident(_) | ExprKind::Field(..) | ExprKind::Index(..) => true,
         ExprKind::Unary(op, _) => matches!(op, UnOp::Deref),
@@ -454,12 +454,12 @@ fn ist_platz(e: &Expr) -> bool {
 }
 
 /// Alle Methoden eines Typs, alphabetisch — fuer die Fehlermeldung.
-fn methoden_von(ck: &Checker, praefix: &str) -> Vec<String> {
-    let praefix = format!("{}{}", praefix, TRENNER);
+fn methods_of(ck: &Checker, prefix: &str) -> Vec<String> {
+    let prefix = format!("{}{}", prefix, SEP);
     let mut out: Vec<String> = ck
         .fns
         .keys()
-        .filter_map(|k| k.strip_prefix(&praefix).map(|s| s.to_string()))
+        .filter_map(|k| k.strip_prefix(&prefix).map(|s| s.to_string()))
         .filter(|s| !s.is_empty())
         .collect();
     out.sort();
@@ -475,20 +475,20 @@ pub(crate) fn hook_call(
     nspan: Span,
     espan: Span,
 ) -> Option<Type> {
-    let methode = methodenname(name)?.to_string();
+    let method = method_name(name)?.to_string();
     // Der Parser legt den Empfaenger immer als erstes Argument ab.
-    let empf = match args.first() {
+    let recv = match args.first() {
         Some(e) => e,
         None => return Some(Type::Error),
     };
-    let et = ck.expr(empf, None);
+    let et = ck.expr(recv, None);
     if et.is_error() {
         for a in &args[1..] {
             ck.type_out_expr(a);
         }
         return Some(Type::Error);
     }
-    let (praefix, ist_zeiger) = match empfaenger_praefix(&ck.tcx, &et) {
+    let (prefix, is_ptr) = match receiver_prefix(&ck.tcx, &et) {
         Some(x) => x,
         None => {
             for a in &args[1..] {
@@ -497,11 +497,11 @@ pub(crate) fn hook_call(
             ck.dg.error_note(
                 nspan,
                 format!(
-                    "methode '{}' auf einem wert vom typ {} — dieser typ kann keine methoden haben",
-                    methode,
+                    "method '{}' on a value of type {} — this type cannot have methods",
+                    method,
                     ck.tcx.name_of(&et)
                 ),
-                "eine methode wird mit 'impl Typ { fn … }' fuer einen struct- oder grundtyp vereinbart"
+                "a method is declared with 'impl Type { fn … }' for a struct or primitive type"
                     .to_string(),
             );
             return Some(Type::Error);
@@ -510,80 +510,80 @@ pub(crate) fn hook_call(
     // HOOK iface: `f.m(args)` auf einem `dyn I` — DYNAMISCHER VERSAND. Welche
     // Funktion laeuft, steht erst zur Laufzeit in der Methodentafel; geprueft
     // wird gegen die Schnittstelle (iface.rs, Runde 46).
-    if let Some((sidx, _)) = empfaenger_struktur(&ck.tcx, &et) {
+    if let Some((sidx, _)) = receiver_structure(&ck.tcx, &et) {
         let sname = ck.tcx.structs[sidx].name.clone();
-        if let Some(iname) = crate::iface::schnittstelle_von(&sname) {
+        if let Some(iname) = crate::iface::interface_of(&sname) {
             let iname = iname.to_string();
-            return Some(crate::iface::hook_methode(
-                ck, &iname, &methode, args, &et, ist_zeiger, nspan, espan,
+            return Some(crate::iface::hook_method(
+                ck, &iname, &method, args, &et, is_ptr, nspan, espan,
             ));
         }
     }
-    let sname = praefix.clone();
-    let voll = fn_name(&praefix, &methode);
-    let sig = match ck.fns.get(&voll) {
+    let sname = prefix.clone();
+    let full = fn_name(&prefix, &method);
+    let sig = match ck.fns.get(&full) {
         Some(s) => s.clone(),
         None => {
             for a in &args[1..] {
                 ck.type_out_expr(a);
             }
-            let vorhanden = methoden_von(ck, &praefix);
-            let note = if vorhanden.is_empty() {
-                format!("fuer '{}' ist kein 'impl'-block vereinbart", sname)
+            let present = methods_of(ck, &prefix);
+            let note = if present.is_empty() {
+                format!("no 'impl' block is declared for '{}'", sname)
             } else {
-                format!("'{}' hat: {}", sname, vorhanden.join(", "))
+                format!("'{}' has: {}", sname, present.join(", "))
             };
             ck.dg.error_note(
                 nspan,
-                format!("typ '{}' hat keine methode '{}'", sname, methode),
+                format!("type '{}' has no method '{}'", sname, method),
                 note,
             );
             return Some(Type::Error);
         }
     };
-    let anzeige = format!("{}.{}", praefix, methode);
+    let display = format!("{}.{}", prefix, method);
     // Empfaenger anpassen — die einzige Automatik am Aufrufort.
     match sig.params.first() {
-        Some(t) if t.is_ptr() && !ist_zeiger => {
-            if !ist_platz(empf) {
+        Some(t) if t.is_ptr() && !is_ptr => {
+            if !is_slot(recv) {
                 ck.dg.error_note(
-                    empf.span,
+                    recv.span,
                     format!(
-                        "der empfaenger von '{}' braucht eine adresse, dieser ausdruck hat keine",
-                        anzeige
+                        "the receiver of '{}' needs an address, this expression has none",
+                        display
                     ),
-                    "binde ihn an eine variable und rufe die methode darauf auf".to_string(),
+                    "bind it to a variable and call the method on it".to_string(),
                 );
             }
         }
-        Some(t) if !t.is_ptr() && ist_zeiger => {
+        Some(t) if !t.is_ptr() && is_ptr => {
             ck.dg.error_note(
-                empf.span,
+                recv.span,
                 format!(
-                    "'{}' erwartet den empfaenger als wert, gefunden {}",
-                    anzeige,
+                    "'{}' expects the receiver as a value, found {}",
+                    display,
                     ck.tcx.name_of(&et)
                 ),
-                format!("schreibe (*x).{}(…), wenn die kopie gemeint ist", methode),
+                format!("write (*x).{}(…) if the copy is meant", method),
             );
         }
         _ => {}
     }
     // Die uebrigen Argumente — gezaehlt wird OHNE den Empfaenger.
-    let erwartet = sig.params.len().saturating_sub(1);
-    let gefunden = args.len().saturating_sub(1);
-    if gefunden != erwartet {
+    let expected = sig.params.len().saturating_sub(1);
+    let found = args.len().saturating_sub(1);
+    if found != expected {
         ck.dg.error(
             espan,
             format!(
-                "methode '{}' erwartet {} argument(e), gefunden {}",
-                anzeige, erwartet, gefunden
+                "method '{}' expects {} argument(s), found {}",
+                display, expected, found
             ),
         );
     }
     for (i, a) in args[1..].iter().enumerate() {
         match sig.params.get(i + 1) {
-            Some(p) => ck.pruefe_argument(&anzeige, i + 1, a, p),
+            Some(p) => ck.check_argument(&display, i + 1, a, p),
             None => ck.type_out_expr(a),
         }
     }

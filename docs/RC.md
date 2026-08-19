@@ -26,9 +26,9 @@ Ein Wert, viele Leser, keine Aenderung, Freigabe beim letzten Leser.
 |---|---|
 | `tests/modules/rc.fi` | **die eine Implementierung** (Modul `rc`) |
 | `lib/rc/rc.fi` | Symlink auf genau diese Datei — der Bibliothekspfad existiert, ohne Code zu doppeln |
-| `lib/rc/teile/*.fi` | die Rumpfe der Testprogramme |
-| `lib/rc/erzeuge_tests.sh` | setzt Rumpf + Implementierung zu `tests/55*_rc_*.fi` und `tests/neg/rc_*.fi` zusammen |
-| `tests/550_rc_grund.fi` … `554`, `tests/neg/rc_*.fi` | die erzeugten Testprogramme |
+| `lib/rc/parts/*.fi` | die Rumpfe der Testprogramme |
+| `lib/rc/gen_tests.sh` | setzt Rumpf + Implementierung zu `tests/55*_rc_*.fi` und `tests/neg/rc_*.fi` zusammen |
+| `tests/550_rc_basic.fi` … `554`, `tests/neg/rc_*.fi` | die erzeugten Testprogramme |
 
 **Warum zusammenkopiert und nicht `import modules.rc`?** Stufe 0 loest
 generische Vorlagen nicht ueber Modulgrenzen auf. Beide Formen scheitern
@@ -46,7 +46,7 @@ Dieselbe Loesung benutzt `lib/str` bereits seit Runde 2
 woertlich in die Testprogramme eingesetzt. Erzeugen mit
 
 ```
-bash lib/rc/erzeuge_tests.sh
+bash lib/rc/gen_tests.sh
 ```
 
 ---
@@ -80,7 +80,7 @@ struct RcHeap { … }                        // Halde fester Kapazitaet
 Blocklayout: 32 Byte Kopf (`stark`, `schwach`, `klasse`, Freilisten-Verkettung),
 danach der Wert. Acht Groessenklassen 64 … 8192 Byte mit je einer Freiliste;
 groessere Nutzlasten sind `AllocError::OutOfMemory` (belegt in
-`tests/553_rc_fehlbar.fi`).
+`tests/553_rc_fallible.fi`).
 
 ### Beispiel
 
@@ -122,12 +122,12 @@ Wer teilen **und** aendern will, nimmt `Gc[T]` (SPEC §3.5) oder einen Lock.
 Compilerfehler:
 
 ```
-tests/neg/rc_verworfen.fi:393:5
+tests/neg/rc_discarded.fi:393:5
 error: das ergebnis darf nicht verworfen werden: der typ 'AllocError!bool'
        ist mit #[must_consume] gekennzeichnet
 ```
 
-`tests/553_rc_fehlbar.fi` belegt: Halde mit einer Seite → 64 Bloecke, die 65.
+`tests/553_rc_fallible.fi` belegt: Halde mit einer Seite → 64 Bloecke, die 65.
 Allokation meldet `AllocError::OutOfMemory`, der Ausgabeverweis bleibt leer;
 nach einer Freigabe gelingt die naechste Allokation wieder; eine zu grosse
 Nutzlast scheitert ebenfalls sauber; `try` reicht den Fehler durch die
@@ -144,7 +144,7 @@ Zaehlung gibt sofort frei, es gibt nichts nachzuholen.
 Halten sich zwei Werte gegenseitig stark, faellt kein Zaehler je auf 0. Der
 Speicher bleibt bis zum Programmende gehalten.
 
-`tests/552_rc_zyklus_leck.fi` macht das sichtbar statt es zu verstecken.
+`tests/552_rc_cycle_leak.fi` macht das sichtbar statt es zu verstecken.
 Gemessene Ausgabe (in allen drei Baustufen gleich):
 
 ```
@@ -202,6 +202,6 @@ aufgezaehlt und sind **nicht** in der SPEC wegretuschiert.
 | A2 | `rc_neu(…)` statt `Rc[T].neu(…)` | Stufe 0 kennt keine Methoden |
 | A3 | `h: *mut RcHeap` statt `inout alloc` | Stufe 0 kennt kein `inout` |
 | A4 | Rueckgabe `AllocError!bool` + Ausgabezeiger statt `AllocError!Rc[T]` | Die Monomorphisierung setzt Typargumente in der Nutzlast einer Fehlerunion nicht ein: `fn f[T](..) -> AllocError!Zaehlverweis[T]` meldet „unbekannter typ 'Zaehlverweis__T'". Die Allokation bleibt vollstaendig fehlbar und `#[must_consume]`. |
-| A5 | `Arc[T]` ist seit **Runde 47** gebaut: `lib/rc/arc.fi`, Typen `Atomverweis[T]`/`AtomSchwachverweis[T]`, Zaehler wirklich atomar (`__atomar_addieren` -> `lock xadd`, `compiler/src/atomar.rs`) | Nachweis `tools/atomar/run.sh` und `tests/830`-`833`. Ehrlich benannt bleibt: `aufwerten_atomar` braucht fuer echte Nebenlaeufigkeit einen Vergleichs-Tausch, den Runde 47 nicht baut, und Faeden hat Stufe 0 weiterhin keine (SPEC §7). Siehe `docs/RUNDE47.md`. |
+| A5 | `Arc[T]` ist seit **Runde 47** gebaut: `lib/rc/arc.fi`, Typen `Atomverweis[T]`/`AtomSchwachverweis[T]`, Zaehler wirklich atomar (`__atomar_addieren` -> `lock xadd`, `compiler/src/atomic.rs`) | Nachweis `tools/atomic/run.sh` und `tests/830`-`833`. Ehrlich benannt bleibt: `aufwerten_atomar` braucht fuer echte Nebenlaeufigkeit einen Vergleichs-Tausch, den Runde 47 nicht baut, und Faeden hat Stufe 0 weiterhin keine (SPEC §7). Siehe `docs/RUNDE47.md`. |
 | A6 | Keine Destruktoren: in einem Wert gespeicherte Verweise muessen von Hand geloest werden | `drop` (SPEC §3.3) ist in Stufe 0 nicht gebaut. Betrifft nur Werte, die selbst Verweise enthalten. |
 | A7 | Halde mit fester Kapazitaet, kein Nachwachsen | macht die Allokation ehrlich fehlbar und ist die Grundlage fuer Speichergrenzen pro Auftrag |

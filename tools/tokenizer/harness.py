@@ -47,7 +47,7 @@ STATES = {
     "CDATA section state": 5,
 }
 
-# Auftragsflaggen (Bit 0 = XML-Anpassung), siehe tools/tokenizer/PROTOKOLL.md.
+# Auftragsflaggen (Bit 0 = XML-Anpassung), siehe tools/tokenizer/LOG.md.
 FLAG_XML = 1
 
 

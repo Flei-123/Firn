@@ -177,25 +177,25 @@ pub enum Op {
     Barrier { val: Val },
     /// `secure_zero(inout buf)`: nullt `size` Bytes ab `addr`. Gilt NIE als tot.
     SecureZero { addr: Val, size: Val },
-    /// **Runde 47** — atomares Lesen-Addieren-Schreiben (`atomar.rs`):
+    /// **Runde 47** — atomares Lesen-Addieren-Schreiben (`atomic.rs`):
     /// `[addr] += val` als EINE Maschineninstruktion (`lock xadd`), Ergebnis
     /// ist der ALTE Wert. Immer 64 Bit. Grundlage des Zaehlers von `Arc[T]`
     /// (SPEC §3.4). Niemals rein, niemals zusammenlegbar, nie ueber einen
     /// anderen Speicherzugriff hinweg verschiebbar.
     AtomicAdd { addr: Val, val: Val },
-    /// **Runde 49** — atomarer Vergleichs-Tausch (`faden.rs`): steht in
+    /// **Runde 49** — atomarer Vergleichs-Tausch (`thread.rs`): steht in
     /// `[addr]` der Wert `erw`, wird `neu` hineingeschrieben. Ergebnis ist
     /// IMMER der vorgefundene Wert; der Tausch fand statt, wenn er gleich
     /// `erw` ist. Eine Maschineninstruktion (`lock cmpxchg`). Damit lassen
     /// sich Sperren bauen — mit `lock xadd` allein geht das nicht, weil der
     /// Uebergang „frei -> belegt" bedingt sein muss.
-    AtomicCas { addr: Val, erw: Val, neu: Val },
-    /// **Runde 49** — einen Faden erzeugen (`faden.rs`, `clone(2)`).
+    AtomicCas { addr: Val, erw: Val, new: Val },
+    /// **Runde 49** — einen Faden erzeugen (`thread.rs`, `clone(2)`).
     /// Ergebnis ist die Fadenkennung (> 0) bzw. ein negativer Fehlerwert.
     /// Das Kind kehrt aus dem Systemaufruf mit EIGENEM `rsp` zurueck; deshalb
     /// ist das eine Instruktionsfolge und kein `syscall`-Aufruf.
-    ThreadSpawn { arg: Val, stapel: Val, ctid: Val },
-    /// **Runde 49** — Adresse des eigenen Fadenblocks (`fs:0`, `faden.rs`).
+    ThreadSpawn { arg: Val, stack: Val, ctid: Val },
+    /// **Runde 49** — Adresse des eigenen Fadenblocks (`fs:0`, `thread.rs`).
     /// Ohne `arch_prctl(ARCH_SET_FS)` ist das Ergebnis unbrauchbar; die
     /// Laufzeit setzt die Basis, bevor sie den Wert je liest.
     ThreadSelf,
@@ -204,13 +204,13 @@ pub enum Op {
     CallIndirect { target: Val, args: Vec<Val> },
     /// Adresse einer Methodentafel (`iface.rs`, Runde 46). `tafel` ist der
     /// Schluessel `<Schnittstelle>.<Typ>`; das Label steht in `.rodata`.
-    VtabAddr { tafel: String },
+    VtabAddr { table: String },
     /// Adresse des Zustandsblocks des Sammlers (SPEC §3.5, `gc.rs`).
     /// `regs = true`: vorher die callee-saved Register in den Block retten —
     /// erst dadurch ist der KONSERVATIVE Registerscan ehrlich (SPEC §3.5.3).
     /// Ohne `gc class` im Programm entsteht diese Instruktion nie.
     GcAddr { regs: bool },
-    /// **Runde 52** — Inline-Assembler (`kern.rs`, SPEC §2 `profile kernel`).
+    /// **Runde 52** — Inline-Assembler (`core.rs`, SPEC §2 `profile kernel`).
     ///
     /// IMMER `volatile`: diese Instruktion darf **nie** entfernt, dupliziert,
     /// zusammengelegt oder ueber einen anderen Speicherzugriff hinweg
@@ -223,17 +223,17 @@ pub enum Op {
     /// (dann ist der Instruktionstyp `u64`, sonst `void`). `clobber` nennt
     /// zusaetzlich zerstoerte Register bzw. `memory`.
     Asm {
-        vorlage: String,
-        aus: Option<String>,
-        ein_regs: Vec<String>,
-        ein: Vec<Val>,
+        template: String,
+        out: Option<String>,
+        in_regs: Vec<String>,
+        ins: Vec<Val>,
         clobber: Vec<String>,
     },
-    /// **Runde 52** — MMIO-Lesezugriff (`kern.rs`). Wie `Op::Load`, aber
+    /// **Runde 52** — MMIO-Lesezugriff (`core.rs`). Wie `Op::Load`, aber
     /// **volatile**: kein Durchgang darf zwei Zugriffe zusammenlegen, einen
     /// entfernen oder ihn verschieben. Die Breite steckt im Instruktionstyp.
     MmioLoad { addr: Val },
-    /// **Runde 52** — MMIO-Schreibzugriff (`kern.rs`). Wie `Op::Store`, aber
+    /// **Runde 52** — MMIO-Schreibzugriff (`core.rs`). Wie `Op::Store`, aber
     /// **volatile** (siehe `MmioLoad`).
     MmioStore { addr: Val, val: Val },
 }
@@ -327,21 +327,21 @@ impl Op {
                 out.push(*addr);
                 out.push(*val);
             }
-            Op::AtomicCas { addr, erw, neu } => {
+            Op::AtomicCas { addr, erw, new } => {
                 out.push(*addr);
                 out.push(*erw);
-                out.push(*neu);
+                out.push(*new);
             }
-            Op::ThreadSpawn { arg, stapel, ctid } => {
+            Op::ThreadSpawn { arg, stack, ctid } => {
                 out.push(*arg);
-                out.push(*stapel);
+                out.push(*stack);
                 out.push(*ctid);
             }
             Op::SecureZero { addr, size } => {
                 out.push(*addr);
                 out.push(*size);
             }
-            Op::Asm { ein, .. } => out.extend_from_slice(ein),
+            Op::Asm { ins, .. } => out.extend_from_slice(ins),
             Op::MmioLoad { addr } => out.push(*addr),
             Op::MmioStore { addr, val } => {
                 out.push(*addr);
@@ -600,22 +600,22 @@ fn fmt_inst(i: &Inst) -> String {
         Op::CallIndirect { target, args } => {
             format!("calli.{} %{}({})", t, target, vlist(args))
         }
-        Op::VtabAddr { tafel } => format!("vtab.ptr @{}", tafel),
+        Op::VtabAddr { table } => format!("vtab.ptr @{}", table),
         Op::Syscall { args } => format!("syscall.{} {}", t, vlist(args)),
         Op::CopyMem { dst, src, size } => format!("copymem %{}, %{}, size={}", dst, src, size),
         Op::Select { cond, a, b } => format!("select.{} %{}, %{}, %{}", t, cond, a, b),
         Op::Barrier { val } => format!("barrier.{} %{}", t, val),
         Op::SecureZero { addr, size } => format!("secure_zero %{}, %{}", addr, size),
         Op::AtomicAdd { addr, val } => format!("atomadd.{} %{}, %{}", t, addr, val),
-        Op::Asm { vorlage, aus, ein_regs, ein, clobber } => {
-            let mut o = format!("asm.{} \"{}\"", t, asm_escape(vorlage));
-            if let Some(r) = aus {
+        Op::Asm { template, out, in_regs, ins, clobber } => {
+            let mut o = format!("asm.{} \"{}\"", t, asm_escape(template));
+            if let Some(r) = out {
                 o.push_str(&format!(" out={}", r));
             }
-            if !ein.is_empty() {
-                let ps: Vec<String> = ein_regs
+            if !ins.is_empty() {
+                let ps: Vec<String> = in_regs
                     .iter()
-                    .zip(ein.iter())
+                    .zip(ins.iter())
                     .map(|(r, v)| format!("{} %{}", r, v))
                     .collect();
                 o.push_str(&format!(" in=[{}]", ps.join(", ")));
@@ -627,13 +627,13 @@ fn fmt_inst(i: &Inst) -> String {
         }
         Op::MmioLoad { addr } => format!("mmio_load.{} %{}", t, addr),
         Op::MmioStore { addr, val } => format!("mmio_store.{} %{}, %{}", t, val, addr),
-        Op::AtomicCas { addr, erw, neu } => {
-            format!("atomcas.{} %{}, %{}, %{}", t, addr, erw, neu)
+        Op::AtomicCas { addr, erw, new } => {
+            format!("atomcas.{} %{}, %{}, %{}", t, addr, erw, new)
         }
-        Op::ThreadSpawn { arg, stapel, ctid } => {
-            format!("spawn.{} %{}, %{}, %{}", t, arg, stapel, ctid)
+        Op::ThreadSpawn { arg, stack, ctid } => {
+            format!("spawn.{} %{}, %{}, %{}", t, arg, stack, ctid)
         }
-        Op::ThreadSelf => format!("fadenselbst.{}", t),
+        Op::ThreadSelf => format!("threadself.{}", t),
         Op::GcAddr { regs } => {
             if *regs {
                 "gc_state.ptr regs=1".to_string()

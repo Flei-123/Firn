@@ -12,7 +12,7 @@ die offizielle Namenstabelle mit **2.231** Eintraegen.
 | `lib/html/entities_data.fi` | **erzeugte** Namenstabelle als u64-Woerter (Firn, ~4.660 Zeilen) |
 | `tools/tokenizer/gen_entities.py` | Erzeuger der Tabelle aus `html.entities.html5` |
 | `lib/html/entities_probe.fi` | Pruefstand: fahre nur den Zeichenreferenz-Teil (Firn) |
-| `tools/tokenizer/pruefe_entities.py` | Werkbank: Pruefstand gegen die html5lib-Daten |
+| `tools/tokenizer/check_entities.py` | Werkbank: Pruefstand gegen die html5lib-Daten |
 
 ## Schnittstelle (Vertrag mit `lib/html/tokenizer.fi`, PLAN.md §2.3)
 
@@ -84,7 +84,7 @@ python3 tools/tokenizer/gen_entities.py
 
 ```
 compiler/target/release/firnc -o .tokenizer-work/entities_probe lib/html/entities_probe.fi
-python3 tools/tokenizer/pruefe_entities.py
+python3 tools/tokenizer/check_entities.py
 ```
 
 Der Pruefstand nimmt aus den offiziellen html5lib-Daten alle Faelle, die sich

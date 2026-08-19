@@ -83,12 +83,12 @@ fn reaches(m: &Module, from: &str, to: &str) -> bool {
 /// `__gc_scrub_tief` (29 Insts, 9 Bloecke, rekursiv) in `main` eingebettet —
 /// `tests/520_gc_weak.fi` fiel mit Exit 6 aus, weil Phantom-Zeiger im
 /// ungescrubbten Stapel den Sammler naehrten.
-fn erreicht_sich_selbst(m: &Module, name: &str) -> bool {
+fn reaches_itself_self(m: &Module, name: &str) -> bool {
     if let Some(f) = m.funcs.iter().find(|f| f.name == name) {
         for b in &f.blocks {
             for i in &b.insts {
-                if let Op::Call { name: ziel, .. } = &i.op {
-                    if reaches(m, ziel, name) {
+                if let Op::Call { name: target, .. } = &i.op {
+                    if reaches(m, target, name) {
                         return true;
                     }
                 }
@@ -120,7 +120,7 @@ fn inlinable(callee: &Func) -> bool {
 /// Sucht eine lohnende Aufrufstelle im Aufrufer `ci`.
 /// `selbst_rek`: je Funktion vorberechnet (aendert sich durch Einbettungen
 /// nicht — mutiert wird nur der Aufrufer).
-fn find_site(m: &Module, ci: usize, selbst_rek: &[bool]) -> Option<(usize, usize, usize)> {
+fn find_site(m: &Module, ci: usize, self_rec: &[bool]) -> Option<(usize, usize, usize)> {
     let caller = &m.funcs[ci];
     if caller.constant_time || !caller.secret.is_empty() {
         return None;
@@ -153,7 +153,7 @@ fn find_site(m: &Module, ci: usize, selbst_rek: &[bool]) -> Option<(usize, usize
                     continue;
                 }
                 // Selbst-erreichbare Rümpfe ebenfalls nicht (siehe oben).
-                if selbst_rek[gi] {
+                if self_rec[gi] {
                     continue;
                 }
                 return Some((bi, ii, gi));
@@ -292,7 +292,7 @@ fn remap_op(op: &Op, mv: &dyn Fn(Val) -> Val) -> Op {
             target: mv(*target),
             args: args.iter().map(|a| mv(*a)).collect(),
         },
-        Op::VtabAddr { tafel } => Op::VtabAddr { tafel: tafel.clone() },
+        Op::VtabAddr { table } => Op::VtabAddr { table: table.clone() },
         Op::Syscall { args } => Op::Syscall { args: args.iter().map(|a| mv(*a)).collect() },
         Op::CopyMem { dst, src, size } => {
             Op::CopyMem { dst: mv(*dst), src: mv(*src), size: *size }
@@ -301,19 +301,19 @@ fn remap_op(op: &Op, mv: &dyn Fn(Val) -> Val) -> Op {
         Op::Barrier { val } => Op::Barrier { val: mv(*val) },
         Op::SecureZero { addr, size } => Op::SecureZero { addr: mv(*addr), size: mv(*size) },
         Op::AtomicAdd { addr, val } => Op::AtomicAdd { addr: mv(*addr), val: mv(*val) },
-        Op::AtomicCas { addr, erw, neu } => {
-            Op::AtomicCas { addr: mv(*addr), erw: mv(*erw), neu: mv(*neu) }
+        Op::AtomicCas { addr, erw, new } => {
+            Op::AtomicCas { addr: mv(*addr), erw: mv(*erw), new: mv(*new) }
         }
-        Op::ThreadSpawn { arg, stapel, ctid } => {
-            Op::ThreadSpawn { arg: mv(*arg), stapel: mv(*stapel), ctid: mv(*ctid) }
+        Op::ThreadSpawn { arg, stack, ctid } => {
+            Op::ThreadSpawn { arg: mv(*arg), stack: mv(*stack), ctid: mv(*ctid) }
         }
         Op::ThreadSelf => Op::ThreadSelf,
         Op::GcAddr { regs } => Op::GcAddr { regs: *regs },
-        Op::Asm { vorlage, aus, ein_regs, ein, clobber } => Op::Asm {
-            vorlage: vorlage.clone(),
-            aus: aus.clone(),
-            ein_regs: ein_regs.clone(),
-            ein: ein.iter().map(|a| mv(*a)).collect(),
+        Op::Asm { template, out, in_regs, ins, clobber } => Op::Asm {
+            template: template.clone(),
+            out: out.clone(),
+            in_regs: in_regs.clone(),
+            ins: ins.iter().map(|a| mv(*a)).collect(),
             clobber: clobber.clone(),
         },
         Op::MmioLoad { addr } => Op::MmioLoad { addr: mv(*addr) },
@@ -328,16 +328,16 @@ pub fn inline_module(m: &mut Module) -> usize {
     let dbg = std::env::var("FIRNC_INLINE_DEBUG").is_ok();
     // Einmalig bestimmen: haengt nur am Rumpf der Aufgerufenen, der sich
     // durch Einbettungen nie aendert (mutiert wird nur der Aufrufer).
-    let selbst_rek: Vec<bool> = m
+    let self_rec: Vec<bool> = m
         .funcs
         .iter()
-        .map(|f| erreicht_sich_selbst(m, &f.name))
+        .map(|f| reaches_itself_self(m, &f.name))
         .collect();
     'outer: loop {
         for ci in 0..m.funcs.len() {
-            if let Some((bi, ii, gi)) = find_site(m, ci, &selbst_rek) {
+            if let Some((bi, ii, gi)) = find_site(m, ci, &self_rec) {
                 if dbg {
-                    eprintln!("inline: {} <- {} ({} insts, {} bloecke)",
+                    eprintln!("inline: {} <- {} ({} insts, {} blocks)",
                         m.funcs[ci].name, m.funcs[gi].name,
                         m.funcs[gi].inst_count(), m.funcs[gi].blocks.len());
                 }
@@ -367,7 +367,7 @@ mod tests {
     }
 
     #[test]
-    fn kleiner_aufruf_wird_eingebettet_und_gefaltet() {
+    fn less_call_becomes_embedded_and_folded() {
         let mut m = Module::new();
         m.funcs.push(add_fn());
         let mut f = Func::new("main", vec![], FTy::I32);
@@ -390,9 +390,9 @@ mod tests {
     }
 
     #[test]
-    fn rekursion_wird_nicht_eingebettet() {
+    fn recursion_becomes_not_embedded() {
         let mut m = Module::new();
-        let mut f = Func::new("fak", vec![FTy::I32], FTy::I32);
+        let mut f = Func::new("fact", vec![FTy::I32], FTy::I32);
         let one = f.push(0, FTy::I32, Op::Const(1));
         let c = f.push(0, FTy::Bool, Op::Cmp { op: CmpOp::Le, ty: FTy::I32, a: 0, b: one });
         let bt = f.add_block();
@@ -400,7 +400,7 @@ mod tests {
         f.set_term(0, Term::BrCond { cond: c, then_bb: bt, else_bb: be });
         f.set_term(bt, Term::Ret(Some(one)));
         let sub = f.push(be, FTy::I32, Op::Bin(BinOp::Sub, 0, one));
-        let rc = f.push(be, FTy::I32, Op::Call { name: "fak".into(), args: vec![sub] });
+        let rc = f.push(be, FTy::I32, Op::Call { name: "fact".into(), args: vec![sub] });
         let mu = f.push(be, FTy::I32, Op::Bin(BinOp::Mul, 0, rc));
         f.set_term(be, Term::Ret(Some(mu)));
         m.funcs.push(f);
@@ -408,7 +408,7 @@ mod tests {
     }
 
     #[test]
-    fn mehrere_rueckgaben_bleiben_korrekt() {
+    fn several_rets_stay_correct() {
         // fn max(a,b) { if a<b { return b } return a }
         let mut g = Func::new("max", vec![FTy::I32, FTy::I32], FTy::I32);
         let c = g.push(0, FTy::Bool, Op::Cmp { op: CmpOp::Lt, ty: FTy::I32, a: 0, b: 1 });
@@ -432,7 +432,7 @@ mod tests {
     }
 
     #[test]
-    fn constant_time_funktionen_bleiben_getrennt() {
+    fn constant_time_funcs_stay_separate() {
         let mut m = Module::new();
         let mut g = add_fn();
         g.constant_time = true;

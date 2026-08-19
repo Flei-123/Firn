@@ -21,19 +21,19 @@
 #      ABI-Version, Module kollisionsfrei (tools/symbole/run.sh).
 #   8b. Das atomare Primitiv `__atomar_addieren` erzeugt wirklich ein
 #      `lock xadd` — in drei Baustufen und in beiden Compilern, mit
-#      Gegenprobe (tools/atomar/run.sh, Runde 47).
+#      Gegenprobe (tools/atomic/run.sh, Runde 47).
 #   8c. Schnittstellenschranken versenden STATISCH: kein indirekter Aufruf,
 #      keine Methodentafel — Gegenprobe mit `dyn I`, beide Compiler
-#      (tools/schranken/run.sh, Runde 50).
+#      (tools/bounds/run.sh, Runde 50).
 #   9. HTML5-Tokenizer (lib/html/, in Firn) gegen die offizielle
 #      html5lib-Testsuite: exakte Quote aus 6.810 Faellen, Schranke in
 #      tools/tokenizer/mindestquote.txt (tools/tokenizer/run.sh).
 #   9b. HTML-Baumkonstruktion und DOM-Kern (lib/browser/, in Firn) gegen
 #      die eigenen Faelle aus dem WHATWG-Standard, gegen echte Seiten und
 #      im Dauerlauf mit Gegenprobe (tools/html/run.sh, docs/RUNDE54.md).
-#  18. Paket- und Projektsystem (tools/pakete/run.sh): Manifest, Such-
+#  18. Paket- und Projektsystem (tools/packages/run.sh): Manifest, Such-
 #      reihenfolge, Sichtbarkeit, Bau-Treiber — in BEIDEN Uebersetzern.
-#  19. Freistehendes Uebersetzen (tools/freistehend/run.sh, Runde 52):
+#  19. Freistehendes Uebersetzen (tools/freestanding/run.sh, Runde 52):
 #      `profile kernel`, Inline-Assembler, MMIO, `#[interrupt]` — das
 #      Kernel-Beispiel wird zu einer ELF-Objektdatei OHNE undefinierte
 #      Symbole, in BEIDEN Compilern, und gegen ein Linkerskript gebunden.
@@ -227,25 +227,25 @@ else
     tail -20 "$WORK/symbole.log" | sed 's/^/   /'
 fi
 
-echo "== 8b. Atomares Primitiv: 'lock xadd' (tools/atomar/run.sh, RUNDE 47) =="
-bash tools/atomar/run.sh > "$WORK/atomar.log" 2>&1 && ATRC=0 || ATRC=$?
+echo "== 8b. Atomares Primitiv: 'lock xadd' (tools/atomic/run.sh, RUNDE 47) =="
+bash tools/atomic/run.sh > "$WORK/atomar.log" 2>&1 && ATRC=0 || ATRC=$?
 if [ "$ATRC" -eq 0 ]; then
     ok
     tail -1 "$WORK/atomar.log" | sed 's/^/   /'
 else
-    bad "tools/atomar/run.sh schlug fehl (siehe .test-work/atomar.log)"
+    bad "tools/atomic/run.sh schlug fehl (siehe .test-work/atomar.log)"
     tail -20 "$WORK/atomar.log" | sed 's/^/   /'
 fi
 
 echo "== 8c. Schranken: statischer Versand ohne indirekten Aufruf (RUNDE 50) =="
 # `fn f[T: I]` ruft die Schnittstellenmethode DIREKT — belegt am erzeugten
 # Assembler und an der FIR, mit `dyn I` als Gegenprobe, in beiden Compilern.
-SCHRANKEN_MESSEN=${SCHRANKEN_MESSEN:-0} bash tools/schranken/run.sh > "$WORK/schranken.log" 2>&1 && SKRC=0 || SKRC=$?
+SCHRANKEN_MESSEN=${SCHRANKEN_MESSEN:-0} bash tools/bounds/run.sh > "$WORK/schranken.log" 2>&1 && SKRC=0 || SKRC=$?
 if [ "$SKRC" -eq 0 ]; then
     ok
     tail -1 "$WORK/schranken.log" | sed 's/^/   /'
 else
-    bad "tools/schranken/run.sh schlug fehl (siehe .test-work/schranken.log)"
+    bad "tools/bounds/run.sh schlug fehl (siehe .test-work/schranken.log)"
     tail -20 "$WORK/schranken.log" | sed 's/^/   /'
 fi
 
@@ -287,116 +287,129 @@ else
     tail -20 "$WORK/dom_soak.log" | sed 's/^/   /'
 fi
 
-echo "== 11. Lexer in Firn gegen Lexer in Rust (tools/lex_vergleich.sh) =="
+echo "== 11. Lexer in Firn gegen Lexer in Rust (tools/lex_compare.sh) =="
 # Der erste Teil von Stufe 1: `lib/firnc1/lexer.fi` erzeugt denselben
 # Tokenstrom wie `firnc0 --emit=tokens`, ueber das ganze Quellkorpus.
-bash tools/lex_vergleich.sh > "$WORK/lex_vergleich.log" 2>&1 && LXRC=0 || LXRC=$?
+bash tools/lex_compare.sh > "$WORK/lex_vergleich.log" 2>&1 && LXRC=0 || LXRC=$?
 if [ "$LXRC" -eq 0 ]; then
     ok
     grep -E '^(GLEICH|UNGLEICH|TOKEN|GLEITKOMMA)' "$WORK/lex_vergleich.log" | sed 's/^/   /'
 else
-    bad "tools/lex_vergleich.sh schlug fehl (siehe .test-work/lex_vergleich.log)"
+    bad "tools/lex_compare.sh schlug fehl (siehe .test-work/lex_vergleich.log)"
     tail -20 "$WORK/lex_vergleich.log" | sed 's/^/   /'
 fi
 
-echo "== 12. Parser in Firn gegen Parser in Rust (tools/parser_vergleich.sh) =="
-bash tools/parser_vergleich.sh > "$WORK/parser_vergleich.log" 2>&1 && PVRC=0 || PVRC=$?
+echo "== 12. Parser in Firn gegen Parser in Rust (tools/parser_compare.sh) =="
+bash tools/parser_compare.sh > "$WORK/parser_vergleich.log" 2>&1 && PVRC=0 || PVRC=$?
 if [ "$PVRC" -eq 0 ]; then
     ok
     grep -E '^(GLEICH|UNGLEICH|NICHT KERN)' "$WORK/parser_vergleich.log" | sed 's/^/   /'
 else
-    bad "tools/parser_vergleich.sh schlug fehl (siehe .test-work/parser_vergleich.log)"
+    bad "tools/parser_compare.sh schlug fehl (siehe .test-work/parser_vergleich.log)"
     tail -20 "$WORK/parser_vergleich.log" | sed 's/^/   /'
 fi
 
-echo "== 13. Layout und ABI in Firn gegen Rust (tools/typen_vergleich.sh) =="
-bash tools/typen_vergleich.sh > "$WORK/typen_vergleich.log" 2>&1 && TVRC=0 || TVRC=$?
+echo "== 13. Layout und ABI in Firn gegen Rust (tools/types_compare.sh) =="
+bash tools/types_compare.sh > "$WORK/typen_vergleich.log" 2>&1 && TVRC=0 || TVRC=$?
 if [ "$TVRC" -eq 0 ]; then
     ok
     grep -E '^(GLEICH|UNGLEICH|MIT STRUCTS)' "$WORK/typen_vergleich.log" | sed 's/^/   /'
 else
-    bad "tools/typen_vergleich.sh schlug fehl (siehe .test-work/typen_vergleich.log)"
+    bad "tools/types_compare.sh schlug fehl (siehe .test-work/typen_vergleich.log)"
     tail -20 "$WORK/typen_vergleich.log" | sed 's/^/   /'
 fi
 
-echo "== 14. Typpruefer in Firn gegen Rust (tools/sema_vergleich.sh) =="
-bash tools/sema_vergleich.sh > "$WORK/sema_vergleich.log" 2>&1 && SVRC=0 || SVRC=$?
+echo "== 14. Typpruefer in Firn gegen Rust (tools/sema_compare.sh) =="
+bash tools/sema_compare.sh > "$WORK/sema_vergleich.log" 2>&1 && SVRC=0 || SVRC=$?
 if [ "$SVRC" -eq 0 ]; then
     ok
     grep -E '^(GLEICH|UNGLEICH|AUSDRUECKE|NICHT KERN)' "$WORK/sema_vergleich.log" | sed 's/^/   /'
 else
-    bad "tools/sema_vergleich.sh schlug fehl (siehe .test-work/sema_vergleich.log)"
+    bad "tools/sema_compare.sh schlug fehl (siehe .test-work/sema_vergleich.log)"
     tail -20 "$WORK/sema_vergleich.log" | sed 's/^/   /'
 fi
 
-echo "== 15. Lowering in Firn gegen Rust (tools/fir_vergleich.sh) =="
-bash tools/fir_vergleich.sh > "$WORK/fir_vergleich.log" 2>&1 && FVRC=0 || FVRC=$?
+echo "== 15. Lowering in Firn gegen Rust (tools/fir_compare.sh) =="
+bash tools/fir_compare.sh > "$WORK/fir_vergleich.log" 2>&1 && FVRC=0 || FVRC=$?
 if [ "$FVRC" -eq 0 ]; then
     ok
     grep -E '^(GLEICH|UNGLEICH|INSTRUKTIONEN|DEFER)' "$WORK/fir_vergleich.log" | sed 's/^/   /'
 else
-    bad "tools/fir_vergleich.sh schlug fehl (siehe .test-work/fir_vergleich.log)"
+    bad "tools/fir_compare.sh schlug fehl (siehe .test-work/fir_vergleich.log)"
     tail -20 "$WORK/fir_vergleich.log" | sed 's/^/   /'
 fi
 
-echo "== 16. Der Compiler in Firn uebersetzt, das Ergebnis laeuft (tools/selbst_vergleich.sh) =="
-bash tools/selbst_vergleich.sh > "$WORK/selbst_vergleich.log" 2>&1 && SBRC=0 || SBRC=$?
+echo "== 16. Der Compiler in Firn uebersetzt, das Ergebnis laeuft (tools/self_compare.sh) =="
+bash tools/self_compare.sh > "$WORK/selbst_vergleich.log" 2>&1 && SBRC=0 || SBRC=$?
 if [ "$SBRC" -eq 0 ]; then
     ok
     grep -E '^(GLEICHES|ABWEICHEND|FEHLERHAFT|CODEGEN)' "$WORK/selbst_vergleich.log" | sed 's/^/   /'
 else
-    bad "tools/selbst_vergleich.sh schlug fehl (siehe .test-work/selbst_vergleich.log)"
+    bad "tools/self_compare.sh schlug fehl (siehe .test-work/selbst_vergleich.log)"
     tail -20 "$WORK/selbst_vergleich.log" | sed 's/^/   /'
 fi
 
-echo "== 17. Der Fixpunkt: Firn uebersetzt sich selbst (tools/fixpunkt.sh) =="
-bash tools/fixpunkt.sh > "$WORK/fixpunkt.log" 2>&1 && FPRC=0 || FPRC=$?
+echo "== 17. Der Fixpunkt: Firn uebersetzt sich selbst (tools/fixpoint.sh) =="
+bash tools/fixpoint.sh > "$WORK/fixpunkt.log" 2>&1 && FPRC=0 || FPRC=$?
 if [ "$FPRC" -eq 0 ]; then
     ok
     grep -E '^(STUFE|FIXPUNKT|KORPUS)' "$WORK/fixpunkt.log" | sed 's/^/   /'
 else
-    bad "tools/fixpunkt.sh schlug fehl (siehe .test-work/fixpunkt.log)"
+    bad "tools/fixpoint.sh schlug fehl (siehe .test-work/fixpunkt.log)"
     tail -20 "$WORK/fixpunkt.log" | sed 's/^/   /'
 fi
 
-echo "== 20. Nebenlaeufigkeit: Faeden, Mutex, atomare Primitive (tools/faden/run.sh) =="
+echo "== 20. Nebenlaeufigkeit: Faeden, Mutex, atomare Primitive (tools/thread/run.sh) =="
 # Runde 49. clone(2)/exit(2), `lock cmpxchg`, Fadenspeicher ueber `fs:0` —
 # in drei Baustufen und BEIDEN Compilern, mit Gegenproben, die anschlagen
-# muessen. Der Dauerlauf (tools/faden/stress.sh) laeuft nicht hier, sondern
+# muessen. Der Dauerlauf (tools/thread/stress.sh) laeuft nicht hier, sondern
 # einzeln: er braucht Minuten.
-bash tools/faden/run.sh > "$WORK/faden.log" 2>&1 && FDRC=0 || FDRC=$?
+bash tools/thread/run.sh > "$WORK/faden.log" 2>&1 && FDRC=0 || FDRC=$?
 if [ "$FDRC" -eq 0 ]; then
     ok
     tail -1 "$WORK/faden.log" | sed 's/^/   /'
 else
-    bad "tools/faden/run.sh schlug fehl (siehe .test-work/faden.log)"
+    bad "tools/thread/run.sh schlug fehl (siehe .test-work/faden.log)"
     grep FAIL "$WORK/faden.log" | head -10 | sed 's/^/   /'
 fi
 
-echo "== 19. Freistehend: profile kernel, Inline-Asm, MMIO, iretq (tools/freistehend/run.sh) =="
+echo "== 19. Freistehend: profile kernel, Inline-Asm, MMIO, iretq (tools/freestanding/run.sh) =="
 # Runde 52. Das Kernel-Beispiel wird von BEIDEN Compilern zu einer
 # ELF-Objektdatei uebersetzt, die KEINEN undefinierten Namen hat, keinen
 # syscall enthaelt und sich gegen ein Linkerskript binden laesst.
-bash tools/freistehend/run.sh > "$WORK/freistehend.log" 2>&1 && FSRC=0 || FSRC=$?
+bash tools/freestanding/run.sh > "$WORK/freistehend.log" 2>&1 && FSRC=0 || FSRC=$?
 if [ "$FSRC" -eq 0 ]; then
     ok
     tail -1 "$WORK/freistehend.log" | sed 's/^/   /'
 else
-    bad "tools/freistehend/run.sh schlug fehl (siehe .test-work/freistehend.log)"
+    bad "tools/freestanding/run.sh schlug fehl (siehe .test-work/freistehend.log)"
     grep FAIL "$WORK/freistehend.log" | head -10 | sed 's/^/   /'
 fi
 
-echo "== 18. Paket- und Projektsystem (tools/pakete/run.sh) =="
+echo "== 18. Paket- und Projektsystem (tools/packages/run.sh) =="
 # Manifest `firn.paket`, Suchreihenfolge, Sichtbarkeit auf Modulebene und der
 # Bau-Treiber `--paket` — jeder Fall durch BEIDE Uebersetzer, Meldungen
 # Oktett fuer Oktett verglichen.
-bash tools/pakete/run.sh > "$WORK/pakete.log" 2>&1 && PKRC=0 || PKRC=$?
+bash tools/packages/run.sh > "$WORK/pakete.log" 2>&1 && PKRC=0 || PKRC=$?
 if [ "$PKRC" -eq 0 ]; then
     ok
     grep -E '^PAKETE' "$WORK/pakete.log" | sed 's/^/   /'
 else
-    bad "tools/pakete/run.sh schlug fehl (siehe .test-work/pakete.log)"
+    bad "tools/packages/run.sh schlug fehl (siehe .test-work/pakete.log)"
     tail -20 "$WORK/pakete.log" | sed 's/^/   /'
+fi
+
+echo "== 21. Englisch-Umstellung: keine deutschen Bezeichner mehr (tools/englisch/pruefe.sh) =="
+# Etappe A (Runde 55): jeder Bezeichner in compiler/src, lib, bin, tools,
+# tests und demos wird gegen die Morphemtabelle gehalten. Ein Treffer heisst,
+# dass ein deutscher Name uebersehen wurde.
+bash tools/englisch/pruefe.sh > "$WORK/englisch.log" 2>&1 && ENRC=0 || ENRC=$?
+if [ "$ENRC" -eq 0 ]; then
+    ok
+    tail -1 "$WORK/englisch.log" | sed 's/^/   /'
+else
+    bad "tools/englisch/pruefe.sh meldet deutsche Bezeichner (siehe .test-work/englisch.log)"
+    tail -20 "$WORK/englisch.log" | sed 's/^/   /'
 fi
 
 TOTAL=$((PASS + FAIL))

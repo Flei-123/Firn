@@ -26,10 +26,10 @@ pub fn expand(prog: &mut Program, dg: &mut Diags) {
     // Auspraegung kommen nur monomorphisierte Funktionen dazu; eine
     // Schnittstelle wird fuer die nie umgesetzt (`impl I for Vec__i32` kann
     // man nicht schreiben), deshalb reicht die Aufnahme von jetzt.
-    let fnamen: HashSet<String> = prog.funcs.iter().map(|f| f.name.clone()).collect();
+    let fnames: HashSet<String> = prog.funcs.iter().map(|f| f.name.clone()).collect();
     let mut queue: Vec<(String, Instantiation)> = sema_generic::instantiations()
         .into_iter()
-        .filter(|(_, i)| !i.abstrakt)
+        .filter(|(_, i)| !i.is_abstract)
         .collect();
     queue.reverse();
     let mut done: HashSet<String> = HashSet::new();
@@ -44,14 +44,14 @@ pub fn expand(prog: &mut Program, dg: &mut Diags) {
         if count > MAX_INSTANCES {
             dg.error(
                 inst.span,
-                "monomorphisierung: zu viele auspraegungen (rekursive generische verwendung?)",
+                "monomorphization: too many instantiations (recursive generic use?)",
             );
             break;
         }
         if inst.is_fn {
-            expand_fn(prog, dg, &fnamen, &mangled, &inst, &mut queue, &mut next_id);
+            expand_fn(prog, dg, &fnames, &mangled, &inst, &mut queue, &mut next_id);
         } else {
-            expand_struct(prog, dg, &fnamen, &mangled, &inst, &mut queue);
+            expand_struct(prog, dg, &fnames, &mangled, &inst, &mut queue);
         }
     }
     prog.expr_count = next_id;
@@ -64,17 +64,17 @@ pub fn expand(prog: &mut Program, dg: &mut Diags) {
 
 fn bind_params(
     dg: &mut Diags,
-    fnamen: &HashSet<String>,
+    fnames: &HashSet<String>,
     params: &[sema_generic::TyParam],
     inst: &Instantiation,
-    was: &str,
+    what: &str,
 ) -> Option<HashMap<String, TypeExpr>> {
     if params.len() != inst.args.len() {
         dg.error(
             inst.span,
             format!(
-                "{} '{}' erwartet {} typargument(e), gefunden {}",
-                was,
+                "{} '{}' expects {} type argument(s), found {}",
+                what,
                 inst.base,
                 params.len(),
                 inst.args.len()
@@ -88,7 +88,7 @@ fn bind_params(
         // eine Kaskade aus Folgemeldungen zu demselben Typargument sagt
         // nichts Neues.
         for b in &p.bounds {
-            if !schranke_ok(dg, fnamen, a, b, &p.name, inst) {
+            if !bound_ok(dg, fnames, a, b, &p.name, inst) {
                 return None;
             }
         }
@@ -102,17 +102,17 @@ fn bind_params(
 /// Die drei eingebauten Schranken entscheidet `satisfies` allein aus der
 /// Typform. Eine SCHNITTSTELLENSCHRANKE geht nach `iface.rs`: nur dort steht,
 /// welche Umsetzungen es gibt und welche Methode fehlt.
-fn schranke_ok(
+fn bound_ok(
     dg: &mut Diags,
-    fnamen: &HashSet<String>,
+    fnames: &HashSet<String>,
     arg: &TypeExpr,
     b: &Bound,
     pname: &str,
     inst: &Instantiation,
 ) -> bool {
     if let Bound::Iface(i) = b {
-        return crate::iface::schranke_pruefen(
-            dg, fnamen, arg, i, pname, &inst.base, inst.span,
+        return crate::iface::bound_check(
+            dg, fnames, arg, i, pname, &inst.base, inst.span,
         );
     }
     if satisfies(arg, b) {
@@ -121,16 +121,16 @@ fn schranke_ok(
     dg.error_note(
         inst.span,
         format!(
-            "typargument '{}' erfuellt die schranke '{}' des typparameters '{}' von '{}' nicht",
+            "type argument '{}' does not satisfy the bound '{}' of the type parameter '{}' of '{}'",
             sema_generic::type_tag(arg),
             b.name(),
             pname,
             inst.base
         ),
         match b {
-            Bound::Int => "erlaubt sind i8..i64, u8..u64, usize, isize",
-            Bound::Scalar => "erlaubt sind ganzzahlen, bool und zeiger",
-            _ => "kein typ erfuellt diese schranke",
+            Bound::Int => "allowed are i8..i64, u8..u64, usize, isize",
+            Bound::Scalar => "allowed are integers, bool and pointers",
+            _ => "no type satisfies this bound",
         },
     );
     false
@@ -139,7 +139,7 @@ fn schranke_ok(
 fn expand_fn(
     prog: &mut Program,
     dg: &mut Diags,
-    fnamen: &HashSet<String>,
+    fnames: &HashSet<String>,
     mangled: &str,
     inst: &Instantiation,
     queue: &mut Vec<(String, Instantiation)>,
@@ -150,12 +150,12 @@ fn expand_fn(
         None => {
             dg.error(
                 inst.span,
-                format!("unbekannte generische funktion '{}'", inst.base),
+                format!("unknown generic function '{}'", inst.base),
             );
             return;
         }
     };
-    let map = match bind_params(dg, fnamen, &tpl.params, inst, "generische funktion") {
+    let map = match bind_params(dg, fnames, &tpl.params, inst, "generic function") {
         Some(m) => m,
         None => return,
     };
@@ -175,7 +175,7 @@ fn expand_fn(
 fn expand_struct(
     prog: &mut Program,
     dg: &mut Diags,
-    fnamen: &HashSet<String>,
+    fnames: &HashSet<String>,
     mangled: &str,
     inst: &Instantiation,
     queue: &mut Vec<(String, Instantiation)>,
@@ -185,12 +185,12 @@ fn expand_struct(
         None => {
             dg.error(
                 inst.span,
-                format!("unbekannter generischer struct '{}'", inst.base),
+                format!("unknown generic struct '{}'", inst.base),
             );
             return;
         }
     };
-    let map = match bind_params(dg, fnamen, &tpl.params, inst, "generischer struct") {
+    let map = match bind_params(dg, fnames, &tpl.params, inst, "generic struct") {
         Some(m) => m,
         None => return,
     };
@@ -271,10 +271,10 @@ fn subst_name(
         // Ersetzt wird nur, wenn das Argument ein NAME ist: `Gc[*mut u8]`
         // gibt es nicht, der Parser laesst dort ohnehin nur einen
         // Bezeichner zu.
-        for pfx in [crate::gc::P_TYP_PUB, crate::gc::P_WTYP_PUB] {
+        for pfx in [crate::gc::P_TY_PUB, crate::gc::P_WTYP_PUB] {
             if let Some(rest) = n.strip_prefix(pfx) {
-                if let Some(TypeExpr::Named(konkret, _)) = map.get(rest) {
-                    return Some(TypeExpr::Named(format!("{}{}", pfx, konkret), sp));
+                if let Some(TypeExpr::Named(concrete, _)) = map.get(rest) {
+                    return Some(TypeExpr::Named(format!("{}{}", pfx, concrete), sp));
                 }
                 return None;
             }
@@ -282,18 +282,18 @@ fn subst_name(
     }
     let inst = instantiation(n)?;
     let args: Vec<TypeExpr> = inst.args.iter().map(|a| subst_ty(a, map, queue)).collect();
-    let neu = mangle(&inst.base, &args);
+    let new = mangle(&inst.base, &args);
     queue.push((
-        neu.clone(),
+        new.clone(),
         Instantiation {
             base: inst.base.clone(),
             args,
             span: sp,
-            abstrakt: false,
+            is_abstract: false,
             is_fn: inst.is_fn,
         },
     ));
-    Some(TypeExpr::Named(neu, sp))
+    Some(TypeExpr::Named(new, sp))
 }
 
 fn with_span(t: &TypeExpr, sp: Span) -> TypeExpr {
@@ -321,15 +321,15 @@ fn subst_call_name(
 ) -> String {
     // `size_of[T]()` innerhalb einer generischen Vorlage: der Typparameter
     // steckt im AUFRUFNAMEN (`size_of$T`, siehe sizeof.rs) und muss hier mit
-    // ersetzt werden — sonst meldet der Typpruefer "unbekannter typ 'T'",
+    // ersetzt werden — sonst meldet der Typpruefer "unknown type 'T'",
     // sobald die Vorlage ausgepraegt wird.
     if let Some(param) = n.strip_prefix("size_of$") {
-        if let Some(TypeExpr::Named(konkret, _)) = map.get(param) {
-            return format!("size_of${}", konkret);
+        if let Some(TypeExpr::Named(concrete, _)) = map.get(param) {
+            return format!("size_of${}", concrete);
         }
     }
     match subst_name(n, sp, map, queue, true) {
-        Some(TypeExpr::Named(neu, _)) => neu,
+        Some(TypeExpr::Named(new, _)) => new,
         _ => n.to_string(),
     }
 }
@@ -512,22 +512,22 @@ pub(crate) fn renumber_expr(e: &mut Expr, next: &mut u32) {
 // --------------------------------------------------- generische Namen ohne []
 
 fn check_bare_uses(prog: &Program, dg: &mut Diags) {
-    let mut fehler: Vec<(Span, String)> = Vec::new();
+    let mut err: Vec<(Span, String)> = Vec::new();
     for f in &prog.funcs {
         for p in &f.params {
-            check_bare_ty(&p.ty, &mut fehler);
+            check_bare_ty(&p.ty, &mut err);
         }
         if let Some(r) = &f.ret {
-            check_bare_ty(r, &mut fehler);
+            check_bare_ty(r, &mut err);
         }
-        check_bare_block(&f.body, &mut fehler);
+        check_bare_block(&f.body, &mut err);
     }
     for s in &prog.structs {
         for (_, te, _) in &s.fields {
-            check_bare_ty(te, &mut fehler);
+            check_bare_ty(te, &mut err);
         }
     }
-    for (sp, msg) in fehler {
+    for (sp, msg) in err {
         dg.error(sp, msg);
     }
 }
@@ -538,7 +538,7 @@ fn check_bare_ty(te: &TypeExpr, out: &mut Vec<(Span, String)>) {
             if is_generic_struct(n) {
                 out.push((
                     *sp,
-                    format!("generischer struct '{}' braucht typargumente, z. B. '{}[i32]'", n, n),
+                    format!("generic struct '{}' needs type arguments, e.g. '{}[i32]'", n, n),
                 ));
             }
         }
@@ -611,7 +611,7 @@ fn check_bare_expr(e: &Expr, out: &mut Vec<(Span, String)>) {
                 out.push((
                     *nspan,
                     format!(
-                        "generische funktion '{}' braucht typargumente, z. B. '{}[i32](..)'",
+                        "generic function '{}' needs type arguments, e.g. '{}[i32](..)'",
                         name, name
                     ),
                 ));
@@ -633,7 +633,7 @@ fn check_bare_expr(e: &Expr, out: &mut Vec<(Span, String)>) {
             if is_generic_struct(name) {
                 out.push((
                     *nspan,
-                    format!("generischer struct '{}' braucht typargumente, z. B. '{}[i32]'", name, name),
+                    format!("generic struct '{}' needs type arguments, e.g. '{}[i32]'", name, name),
                 ));
             }
             for (_, fe, _) in fields {

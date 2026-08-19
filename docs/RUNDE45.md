@@ -77,12 +77,12 @@ Mehr Automatik gibt es nicht:
 
 * **Kein automatisches Dereferenzieren.** Will die Methode eine Kopie und
   liegt ein Zeiger vor, ist das ein Fehler mit Vorschlag: `(*z).erstes()`.
-  (`tests/neg/impl_empfaenger_ist_zeiger.fi`)
+  (`tests/neg/impl_receiver_is_ptr.fi`)
 * **Keine stille Zwischengröße.** `p.verschoben(1).summe()` ist ein Fehler,
   wenn `summe` einen Zeiger will: das Ergebnis eines Aufrufs hat keine
   Adresse. Erst binden, dann rufen. Ein stiller Zwischenwert wäre die
   gefährlichere Wahl — Änderungen daran kämen nirgends an.
-  (`tests/neg/impl_empfaenger_ohne_adresse.fi`)
+  (`tests/neg/impl_receiver_without_address.fi`)
 * **Keine Kette über mehrere Ebenen**, kein `**p`, kein Weg über Felder.
 
 ### Ehrlich benannt: `*self` und `*mut self` prüfen heute dasselbe
@@ -135,7 +135,7 @@ Methoden und freie Funktionen liegen in **einem** Namensraum, aber unter
 * `m(x)` findet nie eine Methode.
 * `x.m()` findet nie eine freie Funktion — auch dann nicht, wenn deren erster
   Parameter genau der passende Zeiger ist
-  (`tests/neg/impl_freie_funktion_ist_keine_methode.fi`).
+  (`tests/neg/impl_free_func_is_no_method.fi`).
 * Beide dürfen deshalb gleich heißen. `tests/810` und `tests/modules/geo.fi`
   führen das vor: `summe(a, b)` und `Punkt.summe()`, `einheit()` und
   `Rechteck.einheit()` stehen nebeneinander. In `lib/str/std_impl.fi`
@@ -262,8 +262,8 @@ nachweislich verhaltensgleich — es gibt keine zweite Umsetzung, die
 auseinanderlaufen könnte. Die freien Funktionen bleiben unverändert
 erreichbar und werden von der Bibliothek selbst weiter benutzt.
 
-`tests/812_impl_std_kern.fi` rechnet beide Wege **nebeneinander** aus
-(`kern.finde(welt) != str.finde(kern, welt)` → Rückgabe 12) und gibt am Ende
+`tests/812_impl_std_core.fi` rechnet beide Wege **nebeneinander** aus
+(`core.finde(welt) != str.finde(kern, welt)` → Rückgabe 12) und gibt am Ende
 eine Zeile aus, die `firnc0` und der selbst übersetzte `firnc1` zeichengleich
 erzeugen müssen.
 
@@ -271,7 +271,7 @@ erzeugen müssen.
 
 ## 9. Testabdeckung
 
-**`tests/810_impl_kern.fi`** — 21 geprüfte Punkte, jeder mit eigenem
+**`tests/810_impl_core.fi`** — 21 geprüfte Punkte, jeder mit eigenem
 Rückgabewert: die drei Empfänger; Adressnahme bei Wert-Empfängern; Empfänger,
 der schon ein Zeiger ist; `(*z)` für die ausdrückliche Kopie;
 Aggregatrückgabe und Bindung davor; Methode ruft Methode; Aggregat als
@@ -279,26 +279,26 @@ Argument; Empfänger als **Feld** (`r.ecke.summe()`), als **Arrayelement**
 (`feld[i].setze(..)`) und geschachtelt (`r.eckensumme()` ruft
 `(*self).ecke.summe()`); freie Funktion und Methode gleichen Namens.
 
-**`tests/811_impl_modul_kern.fi`** mit **`tests/modules/geo.fi`** — 12 Punkte
+**`tests/811_impl_module_core.fi`** mit **`tests/modules/geo.fi`** — 12 Punkte
 über die Modulgrenze: Methode ohne Modulpräfix, schreibende Methode, die
 ihrerseits eine Methode ruft, zweiter `impl`-Block für denselben Typ, freie
 Funktion `einheit()` neben `Rechteck.einheit()`, Empfänger über einen Zeiger.
 
-**`tests/812_impl_std_kern.fi`** — 24 Punkte auf `std.str`, siehe oben.
+**`tests/812_impl_std_core.fi`** — 24 Punkte auf `std.str`, siehe oben.
 
 **`tests/neg/impl_*.fi`** — acht Negativtests, jeder mit Position, Meldung
 und Fehlerzahl:
 
 | Datei | Meldung |
 |---|---|
-| `impl_keine_methode.fi` | `typ 'Punkt' hat keine methode 'differenz'` (Hinweis nennt die vorhandenen) |
-| `impl_freie_funktion_ist_keine_methode.fi` | dieselbe Meldung für `p.punkt_summe()` |
-| `impl_empfaenger_ohne_adresse.fi` | `der empfaenger von 'Punkt.summe' braucht eine adresse, dieser ausdruck hat keine` |
-| `impl_empfaenger_ist_zeiger.fi` | `'Punkt.erstes' erwartet den empfaenger als wert, gefunden *mut Punkt` |
-| `impl_kein_struct.fi` | `methode 'summe' auf einem wert vom typ i32 — methoden gibt es nur fuer struct-typen` |
-| `impl_argument_typ.fi` | `argument 1 von 'Punkt.setze_x' hat typ bool, erwartet i32` |
+| `impl_no_method.fi` | `typ 'Punkt' hat keine methode 'differenz'` (Hinweis nennt die vorhandenen) |
+| `impl_free_func_is_no_method.fi` | dieselbe Meldung für `p.punkt_summe()` |
+| `impl_receiver_without_address.fi` | `der empfaenger von 'Punkt.summe' braucht eine adresse, dieser ausdruck hat keine` |
+| `impl_receiver_is_ptr.fi` | `'Punkt.erstes' erwartet den empfaenger als wert, gefunden *mut Punkt` |
+| `impl_no_struct.fi` | `methode 'summe' auf einem wert vom typ i32 — methoden gibt es nur fuer struct-typen` |
+| `impl_argument_ty.fi` | `argument 1 von 'Punkt.setze_x' hat typ bool, erwartet i32` |
 | `impl_argumentzahl.fi` | `methode 'Punkt.setze_x' erwartet 1 argument(e), gefunden 2` |
-| `impl_ohne_empfaenger.fi` | `der erste parameter einer methode ist der empfaenger: 'self', '*self' oder '*mut self'` |
+| `impl_without_receiver.fi` | `der erste parameter einer methode ist der empfaenger: 'self', '*self' oder '*mut self'` |
 
 Alle acht werden auch von `firnc1` abgelehnt (Exit 1). Jeder von ihnen meldet
 **genau einen** Fehler: eine kaputte Methode bricht den ganzen `impl`-Block
@@ -312,7 +312,7 @@ untergeht.
 * **Zugeordnete Funktionen ohne `self` (`Typ::neu(..)`).** Teil 4 der
   Aufgabe, „nur wenn Zeit bleibt". Sie sind nicht gebaut, und zwar sichtbar:
   eine Methode ohne Empfänger ist ein Fehler mit klarer Ansage
-  (`impl_ohne_empfaenger.fi`) statt eines ratlosen Syntaxfehlers. Der Aufruf
+  (`impl_without_receiver.fi`) statt eines ratlosen Syntaxfehlers. Der Aufruf
   bräuchte zusätzlich `Typ::name` als Ausdrucksform; `::` ist im Tokenisierer
   heute kein eigenes Zeichen (`Enum::Variante` wird als zwei `:` gelesen).
 * **Generische Typen.** `impl Vec[T]` gibt es nicht. Eine Ausprägung heißt
@@ -344,12 +344,12 @@ Hilfsbinärdateien (`.firnc1`, `.astdump`, …).
 | Prüfung | Basis `f48e51c` | jetzt |
 |---|---|---|
 | `bash ./test.sh` | 673/673 | **690/690** |
-| `tools/selbst_vergleich.sh` | 196 gleich / 0 abweichend / 0 fehlerhaft | **199 / 0 / 0** |
-| `tools/fixpunkt.sh` | Stufe 2 == Stufe 3, 309 468 Zeilen | **Stufe 2 == Stufe 3, 315 088 Zeilen** |
-| Parser (`parser_vergleich.sh`) | 236 gleich, 1 bekannt ungleich | 248 gleich, 1 bekannt ungleich |
-| Layout/ABI (`typen_vergleich.sh`) | 186 gleich, 0 ungleich | 198 gleich, 0 ungleich |
-| Typprüfer (`sema_vergleich.sh`) | 145 gleich, 1 bekannt | 146 gleich, 1 bekannt |
-| Lowering (`fir_vergleich.sh`) | 144 gleich, 1 bekannt | 145 gleich, 1 bekannt |
+| `tools/self_compare.sh` | 196 gleich / 0 abweichend / 0 fehlerhaft | **199 / 0 / 0** |
+| `tools/fixpoint.sh` | Stufe 2 == Stufe 3, 309 468 Zeilen | **Stufe 2 == Stufe 3, 315 088 Zeilen** |
+| Parser (`parser_compare.sh`) | 236 gleich, 1 bekannt ungleich | 248 gleich, 1 bekannt ungleich |
+| Layout/ABI (`types_compare.sh`) | 186 gleich, 0 ungleich | 198 gleich, 0 ungleich |
+| Typprüfer (`sema_compare.sh`) | 145 gleich, 1 bekannt | 146 gleich, 1 bekannt |
+| Lowering (`fir_compare.sh`) | 144 gleich, 1 bekannt | 145 gleich, 1 bekannt |
 
 Die eine bekannte Abweichung ist unverändert `tests/590_f64.fi` (Literal
 `1e308`, Rundungsfall aus Runde 20 — kein Parserfehler).

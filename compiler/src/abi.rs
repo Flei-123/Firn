@@ -81,7 +81,7 @@ mod tests {
     }
 
     #[test]
-    fn skalare_belegen_ein_wort() {
+    fn scalars_occupy_in_word() {
         let tcx = TypeCtx::new();
         for t in [Type::I8, Type::U64, Type::Bool, Type::ptr(Type::I32, true)] {
             assert_eq!(classify(&t, &tcx), ArgClass::Integer(1), "{:?}", t);
@@ -90,7 +90,7 @@ mod tests {
     }
 
     #[test]
-    fn kleine_structs_in_registern() {
+    fn small_structs_in_registers() {
         let (tcx, s) = ctx_with(vec![("a".into(), Type::I32), ("b".into(), Type::I32)]);
         assert_eq!(tcx.size_of(&s), 8);
         assert_eq!(classify(&s, &tcx), ArgClass::Integer(1));
@@ -103,7 +103,7 @@ mod tests {
     }
 
     #[test]
-    fn grosse_structs_ueber_speicher() {
+    fn big_structs_over_memory() {
         let (tcx, s) = ctx_with(vec![
             ("a".into(), Type::I64),
             ("b".into(), Type::I64),
@@ -115,7 +115,7 @@ mod tests {
     }
 
     #[test]
-    fn arrays_zaehlen_wie_structs() {
+    fn arrays_count_how_structs() {
         let tcx = TypeCtx::new();
         let a = Type::Array(Box::new(Type::U8), 12);
         assert_eq!(classify(&a, &tcx), ArgClass::Integer(2));

@@ -71,26 +71,26 @@ pub(crate) fn write_ctor_into(
     let t = lo.ty_of(e);
     let sidx = match &t {
         Type::Struct(i) => *i,
-        _ => return lo.ice(e.span, "aufzaehlungskonstruktor ohne aufzaehlungstyp"),
+        _ => return lo.ice(e.span, "enum constructor without enum type"),
     };
     let def = match enum_by_struct(sidx) {
         Some(d) => d,
-        None => return lo.ice(e.span, "aufzaehlungskonstruktor ohne aufzaehlung"),
+        None => return lo.ice(e.span, "enum constructor without enum"),
     };
     let vname = match name.split_once("::") {
         Some((_, v)) => v.to_string(),
-        None => return lo.ice(e.span, "aufzaehlungskonstruktor ohne variantennamen"),
+        None => return lo.ice(e.span, "enum constructor without variant name"),
     };
     let v = match def.variant(&vname) {
         Some(v) => v.clone(),
-        None => return lo.ice(e.span, "unbekannte variante im lowering"),
+        None => return lo.ice(e.span, "unknown variant in lowering"),
     };
-    let tag = lo.konst(FTy::U32, v.tag);
+    let tag = lo.constant(FTy::U32, v.tag);
     lo.store(FTy::U32, addr, tag);
     for (i, a) in args.iter().enumerate() {
         let off = match v.offsets.get(i) {
             Some(o) => *o,
-            None => return lo.ice(a.span, "nutzdatenfeld ohne offset"),
+            None => return lo.ice(a.span, "payload field without offset"),
         };
         // Schicht Feldzugriff <-> Speicherort (layout.rs, DESIGNZIELE 8)
         let ad = lo.field_addr_at(addr, off);
@@ -131,8 +131,8 @@ fn plan_arm(pat: &Pattern, subject_enum: Option<&EnumDef>) -> ArmPlan {
         }
         Pattern::Range { lo, hi, inclusive, .. } => {
             let last = if *inclusive { *hi } else { *hi - 1 };
-            let weite = last - *lo + 1;
-            if weite > 0 && weite <= MAX_RANGE_KEYS {
+            let extent = last - *lo + 1;
+            if extent > 0 && extent <= MAX_RANGE_KEYS {
                 ArmPlan {
                     keys: Some((*lo..=last).collect()),
                     needs_test: false,
@@ -157,7 +157,7 @@ fn plan_arm(pat: &Pattern, subject_enum: Option<&EnumDef>) -> ArmPlan {
 fn lower_match(lo: &mut Lower, idx: usize, span: Span) -> Option<()> {
     let mi: MatchInfo = match match_info(idx) {
         Some(m) => m,
-        None => return lo.ice(span, "unbekannter musterabgleich"),
+        None => return lo.ice(span, "unknown pattern match"),
     };
     let sty = lo.ty_of(&mi.subject);
     let def = match &sty {
@@ -175,7 +175,7 @@ fn lower_match(lo: &mut Lower, idx: usize, span: Span) -> Option<()> {
         None => {
             let ft = match scalar_fty(&sty) {
                 Some(f) if f != FTy::Ptr => f,
-                _ => return lo.ice(mi.subject.span, "'match' auf einem nicht unterstuetzten typ"),
+                _ => return lo.ice(mi.subject.span, "'match' on an unsupported type"),
             };
             let v = lo.lower_expr(&mi.subject)?;
             let (size, align) = lo.size_align(&sty);
@@ -241,12 +241,12 @@ fn lower_match(lo: &mut Lower, idx: usize, span: Span) -> Option<()> {
 fn candidates(plans: &[ArmPlan], key: Option<i128>) -> Vec<usize> {
     let mut out = Vec::new();
     for (i, p) in plans.iter().enumerate() {
-        let passt = match (&p.keys, key) {
+        let fits = match (&p.keys, key) {
             (None, _) => true,
             (Some(ks), Some(k)) => ks.contains(&k),
             (Some(_), None) => false,
         };
-        if !passt {
+        if !fits {
             continue;
         }
         out.push(i);
@@ -313,14 +313,14 @@ fn emit_tests(
         Pattern::Range { lo: rlo, hi, inclusive, .. } => {
             let last = if *inclusive { *hi } else { *hi - 1 };
             let c1 = {
-                let k = lo.konst(key_fty, *rlo);
+                let k = lo.constant(key_fty, *rlo);
                 lo.push(FTy::Bool, Op::Cmp { op: CmpOp::Ge, ty: key_fty, a: key, b: k })
             };
             let next = lo.new_block();
             lo.set_term(Term::BrCond { cond: c1, then_bb: next, else_bb: fail });
             lo.cur = next;
             let c2 = {
-                let k = lo.konst(key_fty, last);
+                let k = lo.constant(key_fty, last);
                 lo.push(FTy::Bool, Op::Cmp { op: CmpOp::Le, ty: key_fty, a: key, b: k })
             };
             let next2 = lo.new_block();
@@ -331,11 +331,11 @@ fn emit_tests(
         Pattern::Variant { vname, subs, span, .. } => {
             let d = match def {
                 Some(d) => d.clone(),
-                None => return lo.ice(*span, "variantenmuster ohne aufzaehlung"),
+                None => return lo.ice(*span, "variant pattern without enum"),
             };
             let v = match d.variant(vname) {
                 Some(v) => v.clone(),
-                None => return lo.ice(*span, "unbekannte variante im lowering"),
+                None => return lo.ice(*span, "unknown variant in lowering"),
             };
             let _ = ty;
             for (i, sub) in subs.iter().enumerate() {
@@ -344,11 +344,11 @@ fn emit_tests(
                 }
                 let off = match v.offsets.get(i) {
                     Some(o) => *o,
-                    None => return lo.ice(*span, "nutzdatenfeld ohne offset"),
+                    None => return lo.ice(*span, "payload field without offset"),
                 };
                 let fty = match v.fields.get(i) {
                     Some(t) => t.clone(),
-                    None => return lo.ice(*span, "nutzdatenfeld ohne typ"),
+                    None => return lo.ice(*span, "payload field without type"),
                 };
                 // Schicht Feldzugriff <-> Speicherort (layout.rs)
                 let addr = lo.field_addr_at(base_addr, off);
@@ -371,10 +371,10 @@ fn emit_sub_test(
         Pattern::Int(v, span) => {
             let ft = match scalar_fty(ty) {
                 Some(f) => f,
-                None => return lo.ice(*span, "zahlenmuster auf nicht skalarem feld"),
+                None => return lo.ice(*span, "number pattern on a non-scalar field"),
             };
             let a = lo.load(ft, addr);
-            let b = lo.konst(ft, *v);
+            let b = lo.constant(ft, *v);
             let c = lo.push(FTy::Bool, Op::Cmp { op: CmpOp::Eq, ty: ft, a, b });
             let next = lo.new_block();
             lo.set_term(Term::BrCond { cond: c, then_bb: next, else_bb: fail });
@@ -383,7 +383,7 @@ fn emit_sub_test(
         }
         Pattern::Bool(v, _) => {
             let a = lo.load(FTy::Bool, addr);
-            let b = lo.konst(FTy::Bool, if *v { 1 } else { 0 });
+            let b = lo.constant(FTy::Bool, if *v { 1 } else { 0 });
             let c = lo.push(FTy::Bool, Op::Cmp { op: CmpOp::Eq, ty: FTy::Bool, a, b });
             let next = lo.new_block();
             lo.set_term(Term::BrCond { cond: c, then_bb: next, else_bb: fail });
@@ -393,16 +393,16 @@ fn emit_sub_test(
         Pattern::Range { lo: rlo, hi, inclusive, span } => {
             let ft = match scalar_fty(ty) {
                 Some(f) => f,
-                None => return lo.ice(*span, "bereichsmuster auf nicht skalarem feld"),
+                None => return lo.ice(*span, "range pattern on a non-scalar field"),
             };
             let last = if *inclusive { *hi } else { *hi - 1 };
             let a = lo.load(ft, addr);
-            let k1 = lo.konst(ft, *rlo);
+            let k1 = lo.constant(ft, *rlo);
             let c1 = lo.push(FTy::Bool, Op::Cmp { op: CmpOp::Ge, ty: ft, a, b: k1 });
             let next = lo.new_block();
             lo.set_term(Term::BrCond { cond: c1, then_bb: next, else_bb: fail });
             lo.cur = next;
-            let k2 = lo.konst(ft, last);
+            let k2 = lo.constant(ft, last);
             let c2 = lo.push(FTy::Bool, Op::Cmp { op: CmpOp::Le, ty: ft, a, b: k2 });
             let next2 = lo.new_block();
             lo.set_term(Term::BrCond { cond: c2, then_bb: next2, else_bb: fail });
@@ -412,18 +412,18 @@ fn emit_sub_test(
         Pattern::Variant { vname, subs, span, .. } => {
             let sidx = match ty {
                 Type::Struct(i) => *i,
-                _ => return lo.ice(*span, "variantenmuster auf nicht-aufzaehlung"),
+                _ => return lo.ice(*span, "variant pattern on a non-enum"),
             };
             let d = match enum_by_struct(sidx) {
                 Some(d) => d,
-                None => return lo.ice(*span, "variantenmuster auf nicht-aufzaehlung"),
+                None => return lo.ice(*span, "variant pattern on a non-enum"),
             };
             let v = match d.variant(vname) {
                 Some(v) => v.clone(),
-                None => return lo.ice(*span, "unbekannte variante im lowering"),
+                None => return lo.ice(*span, "unknown variant in lowering"),
             };
             let a = lo.load(FTy::U32, addr);
-            let b = lo.konst(FTy::U32, v.tag);
+            let b = lo.constant(FTy::U32, v.tag);
             let c = lo.push(FTy::Bool, Op::Cmp { op: CmpOp::Eq, ty: FTy::U32, a, b });
             let next = lo.new_block();
             lo.set_term(Term::BrCond { cond: c, then_bb: next, else_bb: fail });
@@ -434,11 +434,11 @@ fn emit_sub_test(
                 }
                 let off = match v.offsets.get(i) {
                     Some(o) => *o,
-                    None => return lo.ice(*span, "nutzdatenfeld ohne offset"),
+                    None => return lo.ice(*span, "payload field without offset"),
                 };
                 let ft = match v.fields.get(i) {
                     Some(t) => t.clone(),
-                    None => return lo.ice(*span, "nutzdatenfeld ohne typ"),
+                    None => return lo.ice(*span, "payload field without type"),
                 };
                 // Schicht Feldzugriff <-> Speicherort (layout.rs)
                 let sa = lo.field_addr_at(addr, off);

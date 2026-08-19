@@ -1,0 +1,156 @@
+// expect_exit: 0
+// RUNDE 49 — VARIANTE B: FREILISTEN JE FADEN.
+//
+// Die Allokation kann auf zwei Wegen laufen (docs/RUNDE49.md §5):
+//   A  jede Allokation nimmt die GC-Sperre (Voreinstellung)
+//   B  jeder Faden holt sich unter der Sperre einen SCHWUNG Bloecke in seine
+//      eigene Freiliste und bedient sich daraus ohne Sperre
+//
+// Dieser Test verlangt, dass B dasselbe Ergebnis liefert wie A — im SELBEN
+// Prozess und mit bitgleichem Code, umgeschaltet mit `gc_set_lokal`. Genau
+// so wird in docs/RUNDE49.md auch gemessen; ein Messwert von zwei
+// verschiedenen Binaries waere durch das Codelayout verfaelscht.
+//
+// Zusaetzlich geprueft:
+//   * die lokalen Listen werden wirklich benutzt (gc_lokal_nachfuellungen())
+//   * ein Faden, der endet, gibt seine Liste zurueck — sonst waeren die
+//     Bloecke weder frei noch belegt und der Heap wuechse mit jeder Runde
+
+gc class Cell {
+    next: Gc[Cell],
+    value: u64,
+}
+
+const CHAIN: u64 = 250
+const GARBAGE: u64 = 4000
+
+fn chain_build(kind: u64) -> AllocError!Gc[Cell] {
+    var header: Gc[Cell] = gc_null[Cell]()
+    var i: u64 = 0
+    while i < CHAIN {
+        let n: Gc[Cell] = try gc Cell{ next: header, value: kind * 1000 + i }
+        header = n
+        var m: u64 = 0
+        while m < GARBAGE / CHAIN {
+            let dead: Gc[Cell] = try gc Cell{ next: gc_null[Cell](), value: 0 }
+            if dead.value != 0 {
+                return header
+            }
+            m = m + 1
+        }
+        i = i + 1
+    }
+    return header
+}
+
+fn chain_check(header: Gc[Cell], kind: u64) -> u64 {
+    var p: Gc[Cell] = header
+    var i: u64 = CHAIN
+    while i > 0 {
+        i = i - 1
+        if p == gc_null[Cell]() {
+            return 1
+        }
+        if p.value != kind * 1000 + i {
+            return 2
+        }
+        p = p.next
+    }
+    return 0
+}
+
+fn work(kind: u64) -> AllocError!u64 {
+    let header: Gc[Cell] = try chain_build(kind)
+    gc_collect()
+    if chain_check(header, kind) != 0 {
+        return 900
+    }
+    return kind
+}
+
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    let _unused: u64 = arg
+    let r: AllocError!u64 = work(kind)
+    return r catch 800
+}
+
+// Ein ganzer Satz Faeden. Liefert die Summe der Ergebnisse.
+fn set(n: u64) -> u64 {
+    var h: [u64; 4] = [0; 4]
+    var i: u64 = 0
+    while i < n {
+        h[i as usize] = thread_start(i + 1, 0)
+        if h[i as usize] == 0 {
+            return 0
+        }
+        i = i + 1
+    }
+    var s: u64 = 0
+    i = 0
+    while i < n {
+        let r: u64 = thread_wait(h[i as usize])
+        if r >= 800 {
+            return 0
+        }
+        s = s + r
+        i = i + 1
+    }
+    return s
+}
+
+fn main() -> i32 {
+    if !gc_init() {
+        return 90
+    }
+    if !thread_init() {
+        return 91
+    }
+
+    // --- A: alles unter der GC-Sperre ---------------------------------------
+    if gc_local() != 0 {
+        return 1
+    }
+    if set(4) != 10 {
+        return 2
+    }
+    if gc_local_refills() != 0 {
+        return 3
+    }
+    let heap_a: u64 = gc_heap_bytes()
+
+    // --- B: Freilisten je Faden ---------------------------------------------
+    gc_set_local(1)
+    if gc_local() != 1 {
+        return 4
+    }
+    if set(4) != 10 {
+        return 5
+    }
+    if gc_local_refills() == 0 {
+        return 6
+    }
+
+    // Noch zwei Saetze: gaeben die endenden Faeden ihre Listen nicht zurueck,
+    // wuechse der Heap mit jedem Satz weiter.
+    if set(4) != 10 {
+        return 7
+    }
+    if set(4) != 10 {
+        return 8
+    }
+    gc_collect()
+    let heap_b: u64 = gc_heap_bytes()
+    if heap_b > heap_a * 3 + 4194304 {
+        return 9
+    }
+
+    // --- zurueck auf A: derselbe Weg muss weiter stimmen ---------------------
+    gc_set_local(0)
+    if set(4) != 10 {
+        return 10
+    }
+    if thread_count() != 1 {
+        return 11
+    }
+    return 0
+}

@@ -1,7 +1,7 @@
 # Runde 37 — Optimierer-Angriff auf das ≤2×-Ziel
 
 Ausgangslage (Commit 97ec31a, Runde 36): Tokenizer-Workload gegen html5ever
-(`tools/tokenizer/durchsatz.sh`, bester von 3 bzw. 7 Laeufen):
+(`tools/tokenizer/throughput.sh`, bester von 3 bzw. 7 Laeufen):
 
 | Korpus | Firn MB/s | html5ever MB/s | Faktor |
 |---|---|---|---|

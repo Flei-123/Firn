@@ -8,7 +8,7 @@
 //!     bench/tokenizer/target/release/html5ever_bench .tokenizer-work/korpus.html
 //!
 //! Ausgabe: eine Zeile `tokens=<n> bytes=<n> sekunden=<x.xxx>`.
-//! `tools/tokenizer/durchsatz.sh` ruft das Binary automatisch auf, sobald es
+//! `tools/tokenizer/throughput.sh` ruft das Binary automatisch auf, sobald es
 //! gebaut ist, und stellt die MB/s neben die des Firn-Tokenizers.
 //!
 //! Vergleichbarkeit — ehrlich benannt:
@@ -30,25 +30,25 @@ use html5ever::tokenizer::{
 };
 
 /// Zaehlt Token — das Gegenstueck zur Ausgabesenke des Firn-Tokenizers.
-struct Zaehler {
+struct Counter {
     tokens: u64,
-    zeichen: u64,
+    chars: u64,
 }
 
-impl TokenSink for Zaehler {
+impl TokenSink for Counter {
     type Handle = ();
 
     fn process_token(&mut self, token: Token, _line: u64) -> TokenSinkResult<()> {
         self.tokens += 1;
         if let Token::CharacterTokens(ref s) = token {
-            self.zeichen += s.len() as u64;
+            self.chars += s.len() as u64;
         }
         TokenSinkResult::Continue
     }
 }
 
 fn main() {
-    let pfad = match std::env::args().nth(1) {
+    let path = match std::env::args().nth(1) {
         Some(p) => p,
         None => {
             eprintln!("aufruf: html5ever_bench <datei.html>");
@@ -56,44 +56,44 @@ fn main() {
         }
     };
 
-    let mut roh = ByteTendril::new();
-    let mut datei = match std::fs::File::open(&pfad) {
+    let mut raw = ByteTendril::new();
+    let mut file = match std::fs::File::open(&path) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("{}: {}", pfad, e);
+            eprintln!("{}: {}", path, e);
             std::process::exit(2);
         }
     };
-    if let Err(e) = datei.read_to_tendril(&mut roh) {
-        eprintln!("{}: {}", pfad, e);
+    if let Err(e) = file.read_to_tendril(&mut raw) {
+        eprintln!("{}: {}", path, e);
         std::process::exit(2);
     }
-    let bytes = roh.len();
-    let text: StrTendril = match roh.try_reinterpret() {
+    let bytes = raw.len();
+    let text: StrTendril = match raw.try_reinterpret() {
         Ok(t) => t,
         Err(_) => {
-            eprintln!("{}: kein gueltiges UTF-8", pfad);
+            eprintln!("{}: kein gueltiges UTF-8", path);
             std::process::exit(2);
         }
     };
 
     let start = Instant::now();
-    let sink = Zaehler {
+    let sink = Counter {
         tokens: 0,
-        zeichen: 0,
+        chars: 0,
     };
     let mut tok = Tokenizer::new(sink, TokenizerOpts::default());
     let mut queue = BufferQueue::default();
     queue.push_back(text);
     let _ = tok.feed(&mut queue);
     tok.end();
-    let dauer = start.elapsed();
+    let duration = start.elapsed();
 
     println!(
         "tokens={} zeichen={} bytes={} sekunden={:.6}",
         tok.sink.tokens,
-        tok.sink.zeichen,
+        tok.sink.chars,
         bytes,
-        dauer.as_secs_f64()
+        duration.as_secs_f64()
     );
 }

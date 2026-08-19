@@ -123,15 +123,15 @@ impl Diags {
         self.files
             .get(file as usize)
             .map(|f| f.name.as_str())
-            .unwrap_or("<unbekannt>")
+            .unwrap_or("<unknown>")
     }
 
-    /// Fehler mit Standardmarkierung ("hier").
+    /// Fehler mit Standardmarkierung ("here").
     pub fn error(&mut self, span: Span, msg: impl Into<String>) {
         self.push(Diag {
             msg: msg.into(),
             span,
-            label: "hier".to_string(),
+            label: "here".to_string(),
             note: None,
         });
     }
@@ -141,7 +141,7 @@ impl Diags {
         self.push(Diag {
             msg: msg.into(),
             span,
-            label: "hier".to_string(),
+            label: "here".to_string(),
             note: Some(note.into()),
         });
     }
@@ -196,7 +196,7 @@ impl Diags {
             out.push_str(&self.render_one(d));
         }
         if self.items.len() > 1 {
-            out.push_str(&format!("{} Fehler gefunden\n", self.items.len()));
+            out.push_str(&format!("{} errors found\n", self.items.len()));
         }
         out
     }
@@ -208,7 +208,7 @@ impl Diags {
         if d.span.is_none() {
             out.push_str(&format!("  --> {}\n", fname));
             if let Some(n) = &d.note {
-                out.push_str(&format!("  hinweis: {}\n", n));
+                out.push_str(&format!("  note: {}\n", n));
             }
             return out;
         }
@@ -240,7 +240,7 @@ impl Diags {
             d.label
         ));
         if let Some(n) = &d.note {
-            out.push_str(&format!("{} = hinweis: {}\n", pad, n));
+            out.push_str(&format!("{} = note: {}\n", pad, n));
         }
         out
     }

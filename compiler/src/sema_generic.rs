@@ -97,7 +97,7 @@ pub(crate) struct Instantiation {
     pub(crate) args: Vec<TypeExpr>,
     pub(crate) span: Span,
     /// innerhalb einer Vorlage aufgeschrieben (enthaelt evtl. Typparameter)
-    pub(crate) abstrakt: bool,
+    pub(crate) is_abstract: bool,
     pub(crate) is_fn: bool,
 }
 
@@ -131,7 +131,7 @@ pub(crate) fn fn_template(name: &str) -> Option<FnTemplate> {
 /// sondern hier — das Modul-Umschreiben erreichte sie deshalb nie, und eine
 /// Vorlage sah nur die Namen der Wurzeldatei
 /// (docs/SELBSTHOSTING.md §7, Blocker B2).
-pub(crate) fn fn_vorlagen_der_datei(file: u32) -> Vec<String> {
+pub(crate) fn fn_templates_the_file(file: u32) -> Vec<String> {
     REG.with(|r| {
         r.borrow()
             .fns
@@ -142,7 +142,7 @@ pub(crate) fn fn_vorlagen_der_datei(file: u32) -> Vec<String> {
     })
 }
 
-pub(crate) fn struct_vorlagen_der_datei(file: u32) -> Vec<String> {
+pub(crate) fn struct_templates_the_file(file: u32) -> Vec<String> {
     REG.with(|r| {
         r.borrow()
             .structs
@@ -154,7 +154,7 @@ pub(crate) fn struct_vorlagen_der_datei(file: u32) -> Vec<String> {
 }
 
 /// Aendert eine Funktionsvorlage an Ort und Stelle.
-pub(crate) fn mit_fn_vorlage<F: FnOnce(&mut crate::ast::FnDecl)>(name: &str, f: F) {
+pub(crate) fn with_fn_template<F: FnOnce(&mut crate::ast::FnDecl)>(name: &str, f: F) {
     REG.with(|r| {
         if let Some(t) = r.borrow_mut().fns.get_mut(name) {
             f(&mut t.decl);
@@ -163,7 +163,7 @@ pub(crate) fn mit_fn_vorlage<F: FnOnce(&mut crate::ast::FnDecl)>(name: &str, f: 
 }
 
 /// Aendert eine Structvorlage an Ort und Stelle.
-pub(crate) fn mit_struct_vorlage<F: FnOnce(&mut crate::ast::StructDecl)>(name: &str, f: F) {
+pub(crate) fn with_struct_template<F: FnOnce(&mut crate::ast::StructDecl)>(name: &str, f: F) {
     REG.with(|r| {
         if let Some(t) = r.borrow_mut().structs.get_mut(name) {
             f(&mut t.decl);
@@ -244,7 +244,7 @@ pub(crate) fn mangle(base: &str, args: &[TypeExpr]) -> String {
 impl<'a> Parser<'a> {
     /// `[T, U: Int]` — Typparameterliste einer Vorlage.
     fn generic_params(&mut self) -> Option<Vec<TyParam>> {
-        if !self.expect(TokKind::LBracket, "am anfang der typparameterliste") {
+        if !self.expect(TokKind::LBracket, "at the start of the type parameter list") {
             return None;
         }
         let mut out: Vec<TyParam> = Vec::new();
@@ -253,19 +253,19 @@ impl<'a> Parser<'a> {
                 break;
             }
             let before = self.pos;
-            let (name, span) = self.ident("fuer einen typparameter")?;
+            let (name, span) = self.ident("for a type parameter")?;
             // `T: A + B + C` — die Schranken stehen mit `+` hintereinander und
             // gelten ALLE gleichzeitig (Runde 50).
             let mut bounds: Vec<Bound> = Vec::new();
             if self.eat(&TokKind::Colon) {
                 loop {
-                    let (bname, bspan) = self.ident("fuer eine schranke am typparameter")?;
+                    let (bname, bspan) = self.ident("for a bound on the type parameter")?;
                     let b = Bound::parse(&bname);
                     if bounds.contains(&b) {
                         self.dg.error_note(
                             bspan,
-                            format!("die schranke '{}' steht zweimal an '{}'", bname, name),
-                            "jede schranke wird hoechstens einmal genannt",
+                            format!("the bound '{}' appears twice on '{}'", bname, name),
+                            "each bound is named at most once",
                         );
                     } else {
                         bounds.push(b);
@@ -277,7 +277,7 @@ impl<'a> Parser<'a> {
             }
             if out.iter().any(|p| p.name == name) {
                 self.dg
-                    .error(span, format!("typparameter '{}' ist bereits deklariert", name));
+                    .error(span, format!("type parameter '{}' is already declared", name));
             } else {
                 let _ = span;
                 out.push(TyParam { name, bounds });
@@ -289,9 +289,9 @@ impl<'a> Parser<'a> {
                 self.bump();
             }
         }
-        self.close(TokKind::RBracket, "nach der typparameterliste");
+        self.close(TokKind::RBracket, "after the type parameter list");
         if out.is_empty() {
-            self.error_here("eine typparameterliste braucht mindestens einen parameter");
+            self.error_here("a type parameter list needs at least one parameter");
             self.recovering = false;
             return None;
         }
@@ -300,7 +300,7 @@ impl<'a> Parser<'a> {
 
     /// `[i32, u8]` — Typargumente an einer Verwendungsstelle.
     fn generic_args(&mut self) -> Option<Vec<TypeExpr>> {
-        if !self.expect(TokKind::LBracket, "am anfang der typargumente") {
+        if !self.expect(TokKind::LBracket, "at the start of the type arguments") {
             return None;
         }
         let mut out = Vec::new();
@@ -317,9 +317,9 @@ impl<'a> Parser<'a> {
                 self.bump();
             }
         }
-        self.close(TokKind::RBracket, "nach den typargumenten");
+        self.close(TokKind::RBracket, "after the type arguments");
         if out.is_empty() {
-            self.error_here("es fehlen die typargumente");
+            self.error_here("the type arguments are missing");
             self.recovering = false;
             return None;
         }
@@ -329,7 +329,7 @@ impl<'a> Parser<'a> {
     fn generic_fn_template(&mut self) {
         let start = self.span();
         self.bump(); // 'fn'
-        let (name, nspan) = match self.ident("nach 'fn'") {
+        let (name, nspan) = match self.ident("after 'fn'") {
             Some(x) => x,
             None => {
                 self.recovering = false;
@@ -352,7 +352,7 @@ impl<'a> Parser<'a> {
             Some(d) => d,
             None => return,
         };
-        let doppelt = REG.with(|r| {
+        let duplicate = REG.with(|r| {
             let mut reg = r.borrow_mut();
             if reg.fns.contains_key(&name) {
                 return true;
@@ -363,22 +363,22 @@ impl<'a> Parser<'a> {
             }
             false
         });
-        if doppelt {
+        if duplicate {
             self.dg.error(
                 nspan,
-                format!("generische funktion '{}' ist bereits deklariert", name),
+                format!("generic function '{}' is already declared", name),
             );
         }
     }
 
     fn rest_of_fn(&mut self, name: String, start: Span) -> Option<FnDecl> {
-        if !self.expect(TokKind::LParen, "nach dem funktionsnamen") {
+        if !self.expect(TokKind::LParen, "after the function name") {
             self.recovering = false;
             self.sync_item();
             return None;
         }
         let params = self.params();
-        self.close(TokKind::RParen, "nach der parameterliste");
+        self.close(TokKind::RParen, "after the parameter list");
         self.recovering = false;
         let ret = if self.eat(&TokKind::Arrow) {
             match self.parse_type() {
@@ -394,14 +394,14 @@ impl<'a> Parser<'a> {
         };
         if !self.at(&TokKind::LBrace) {
             self.error_here(format!(
-                "erwartet '{{' am anfang des funktionsrumpfes, gefunden '{}'",
+                "expected '{{' at the start of the function body, found '{}'",
                 self.kind().text()
             ));
             self.recovering = false;
             self.sync_item();
             return None;
         }
-        let body = self.block("am anfang des funktionsrumpfes");
+        let body = self.block("at the start of the function body");
         self.recovering = false;
         Some(FnDecl { name, params, ret, body, span: start, attrs: Vec::new() })
     }
@@ -409,7 +409,7 @@ impl<'a> Parser<'a> {
     fn generic_struct_template(&mut self) {
         let start = self.span();
         self.bump(); // 'struct'
-        let (name, nspan) = match self.ident("nach 'struct'") {
+        let (name, nspan) = match self.ident("after 'struct'") {
             Some(x) => x,
             None => {
                 self.recovering = false;
@@ -425,7 +425,7 @@ impl<'a> Parser<'a> {
                 return;
             }
         };
-        if !self.expect(TokKind::LBrace, "nach dem strukturnamen") {
+        if !self.expect(TokKind::LBrace, "after the structure name") {
             self.recovering = false;
             self.sync_item();
             return;
@@ -438,11 +438,11 @@ impl<'a> Parser<'a> {
                 break;
             }
             let before = self.pos;
-            let (fname, fspan) = match self.ident("fuer ein feld") {
+            let (fname, fspan) = match self.ident("for a field") {
                 Some(x) => x,
                 None => break,
             };
-            if !self.expect(TokKind::Colon, "nach dem feldnamen") {
+            if !self.expect(TokKind::Colon, "after the field name") {
                 break;
             }
             let ty = match self.parse_type() {
@@ -455,12 +455,12 @@ impl<'a> Parser<'a> {
             }
         }
         let end = self.span();
-        self.close(TokKind::RBrace, "am ende der strukturdeklaration");
+        self.close(TokKind::RBrace, "at the end of the structure declaration");
         self.recovering = false;
         REG.with(|r| r.borrow_mut().in_template -= 1);
         let decl =
             StructDecl { name: name.clone(), fields, span: Parser::join(start, end), attrs: Vec::new() };
-        let doppelt = REG.with(|r| {
+        let duplicate = REG.with(|r| {
             let mut reg = r.borrow_mut();
             if reg.structs.contains_key(&name) {
                 return true;
@@ -472,20 +472,20 @@ impl<'a> Parser<'a> {
             }
             false
         });
-        if doppelt {
+        if duplicate {
             self.dg.error(
                 nspan,
-                format!("generischer struct '{}' ist bereits deklariert", name),
+                format!("generic struct '{}' is already declared", name),
             );
         }
     }
 
     fn note_inst(&mut self, base: &str, args: Vec<TypeExpr>, span: Span, is_fn: bool) -> String {
         let mangled = mangle(base, &args);
-        let abstrakt = REG.with(|r| r.borrow().in_template > 0);
+        let is_abstract = REG.with(|r| r.borrow().in_template > 0);
         record_inst(
             &mangled,
-            Instantiation { base: base.to_string(), args, span, abstrakt, is_fn },
+            Instantiation { base: base.to_string(), args, span, is_abstract, is_fn },
         );
         mangled
     }
@@ -576,7 +576,7 @@ pub(crate) fn hook_generic_call(p: &mut Parser, base: &Expr) -> Option<Expr> {
     let mangled = p.note_inst(&name, args, base.span, true);
     if !p.at(&TokKind::LParen) {
         p.error_here(format!(
-            "erwartet '(' nach den typargumenten von '{}', gefunden '{}'",
+            "expected '(' after the type arguments of '{}', found '{}'",
             name,
             p.kind().text()
         ));
@@ -584,7 +584,7 @@ pub(crate) fn hook_generic_call(p: &mut Parser, base: &Expr) -> Option<Expr> {
         return None;
     }
     p.bump();
-    let (cargs, end) = p.call_args("nach der argumentliste");
+    let (cargs, end) = p.call_args("after the argument list");
     let span = Parser::join(base.span, end);
     Some(p.mk(span, ExprKind::Call(mangled, cargs, base.span)))
 }
@@ -606,7 +606,7 @@ pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
         return Some(p.struct_lit(mangled, sp));
     }
     p.error_here(format!(
-        "erwartet '{{' nach '{}[..]', gefunden '{}'",
+        "expected '{{' after '{}[..]', found '{}'",
         name,
         p.kind().text()
     ));

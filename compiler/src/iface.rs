@@ -54,12 +54,12 @@
 //! beides durchsucht der Sammler konservativ (SPEC §3.5.3), und beim
 //! Sammellauf rettet `Op::GcAddr { regs: true }` die Register vorher in den
 //! Zustandsblock. Damit haelt ein Schnittstellenwert sein Objekt am Leben,
-//! auch wenn es sonst keine Wurzel mehr gibt (`tests/823_iface_gc_kern.fi`).
+//! auch wenn es sonst keine Wurzel mehr gibt (`tests/823_iface_gc_core.fi`).
 //!
 //! Die **eine** Stelle, an der das nicht traegt, ist der Heap: dort verfolgt
 //! der Sammler PRAEZISE anhand des Feldlayouts und wuerde den Datenzeiger in
 //! einem `dyn I`-Feld nicht kennen. Deshalb ist `dyn I` als Feld einer
-//! `gc class` ein Fehler (`iface_dyn_in_gc_klasse.fi`) — ein Loch in einer
+//! `gc class` ein Fehler (`iface_dyn_in_gc_class.fi`) — ein Loch in einer
 //! Zusage waere schlimmer als eine fehlende Bequemlichkeit.
 
 use std::cell::RefCell;
@@ -76,47 +76,47 @@ use crate::types::{Type, TypeCtx};
 /// Das Leerzeichen macht ihn unerreichbar fuer den Quelltext.
 pub(crate) const P_DYN: &str = "dyn ";
 /// Praefix der Methodentafeln im Assembler (dateilokal, `.L`).
-const TAFEL_LABEL: &str = ".L__iface.";
+const TABLE_LABEL: &str = ".L__iface.";
 /// Versatz des Datenzeigers im Schnittstellenwert.
-pub(crate) const OFF_DATEN: u64 = 0;
+pub(crate) const OFF_DATA: u64 = 0;
 /// Versatz der Methodentafel im Schnittstellenwert.
-pub(crate) const OFF_TAFEL: u64 = 8;
+pub(crate) const OFF_TABLE: u64 = 8;
 
 // ---------------------------------------------------------------- Datenmodell
 
 #[derive(Clone, Debug)]
-struct Methode {
+struct Method {
     name: String,
     /// Parameter OHNE den Empfaenger.
     params: Vec<TypeExpr>,
     ret: Option<TypeExpr>,
     /// `*mut self` statt `*self` — heute Absicht, kein Zwang (impls.rs).
-    veraenderlich: bool,
+    mutable: bool,
     span: Span,
     /// nach `hook_check_impls`: aufgeloeste Typen
-    ptypen: Vec<Type>,
+    ptypes: Vec<Type>,
     rtyp: Type,
     /// Typen bereits aufgeloest (Nachtraege aus `comptime` melden sonst doppelt)
-    aufgeloest: bool,
+    resolved: bool,
     /// Die Signatur nennt `Self` (Runde 50). Dann haengen `ptypen`/`rtyp` am
     /// umsetzenden Typ und werden ERST JE UMSETZUNG aufgeloest; global
     /// bleiben sie leer, und ueber `dyn I` ist die Methode nicht aufrufbar.
-    hat_self: bool,
+    has_self: bool,
 }
 
 #[derive(Clone, Debug)]
-struct Schnittstelle {
+struct Interface {
     name: String,
-    methoden: Vec<Methode>,
+    methods: Vec<Method>,
     /// Index des Structs `"dyn I"` in `TypeCtx`, `usize::MAX` bis zur Anmeldung
     struct_idx: usize,
 }
 
 #[derive(Clone, Debug)]
-struct Umsetzung {
+struct Impl {
     iface: String,
     /// Typname, wie er im Quelltext steht (VOR der Modulumbenennung).
-    typ: String,
+    ty: String,
     span: Span,
     /// nach der Pruefung: Index des Structs, `usize::MAX` = nicht aufgeloest
     struct_idx: usize,
@@ -124,17 +124,17 @@ struct Umsetzung {
     /// (`T__m`) — also der ENDGUELTIGE Name nach der Modulumbenennung, ohne
     /// das interne `"gc "` einer Klasse. Der Codegenerator hat die Typtabelle
     /// nicht mehr; deshalb steht er hier.
-    praefix: String,
+    prefix: String,
     /// nach der Pruefung: `true`, wenn die Umsetzung vollstaendig ist
     ok: bool,
     /// schon geprueft (Nachtraege aus `comptime` melden sonst doppelt)
-    geprueft: bool,
+    checked: bool,
 }
 
 #[derive(Default)]
 struct Registry {
-    ifaces: Vec<Schnittstelle>,
-    impls: Vec<Umsetzung>,
+    ifaces: Vec<Interface>,
+    impls: Vec<Impl>,
 }
 
 thread_local! {
@@ -151,13 +151,13 @@ fn iface_index(name: &str) -> Option<usize> {
 }
 
 /// Gibt es ueberhaupt eine Schnittstelle in dieser Uebersetzung?
-pub(crate) fn hat_schnittstellen() -> bool {
+pub(crate) fn has_interfaces() -> bool {
     REG.with(|r| !r.borrow().ifaces.is_empty())
 }
 
 /// Ist `sname` der interne Name eines Schnittstellenwertes? Liefert den
 /// Schnittstellennamen.
-pub(crate) fn schnittstelle_von(sname: &str) -> Option<&str> {
+pub(crate) fn interface_of(sname: &str) -> Option<&str> {
     sname.strip_prefix(P_DYN)
 }
 
@@ -167,7 +167,7 @@ fn dyn_name(iface: &str) -> String {
 }
 
 /// Ist dieser Typ ein Schnittstellenwert?
-pub(crate) fn ist_dyn(tcx: &TypeCtx, t: &Type) -> bool {
+pub(crate) fn is_dyn(tcx: &TypeCtx, t: &Type) -> bool {
     match t {
         Type::Struct(i) => tcx
             .structs
@@ -179,8 +179,8 @@ pub(crate) fn ist_dyn(tcx: &TypeCtx, t: &Type) -> bool {
 }
 
 /// Schluessel der Methodentafel: `<Schnittstelle>.<Typ>`.
-fn tafelschluessel(iface: &str, typname: &str) -> String {
-    format!("{}.{}", iface, typname)
+fn table_key(iface: &str, ty_name: &str) -> String {
+    format!("{}.{}", iface, ty_name)
 }
 
 /// Der eingebaute Typ hinter einem Namen — `None`, wenn es keiner ist.
@@ -189,7 +189,7 @@ fn tafelschluessel(iface: &str, typname: &str) -> String {
 /// (`impl Ord for i32`). Ohne das haette `vec_sortiere[T: Ord]` nur Structs
 /// sortieren koennen, und die Standardbibliothek haette den fest verdrahteten
 /// Vergleich behalten muessen.
-pub(crate) fn grundtyp_von_name(n: &str) -> Option<Type> {
+pub(crate) fn base_ty_of_name(n: &str) -> Option<Type> {
     Some(match n {
         "i8" => Type::I8,
         "i16" => Type::I16,
@@ -208,7 +208,7 @@ pub(crate) fn grundtyp_von_name(n: &str) -> Option<Type> {
 }
 
 /// Name eines Grundtyps fuer das Methodennamensschema (`i32__kleiner`).
-pub(crate) fn grundtyp_name(t: &Type) -> Option<&'static str> {
+pub(crate) fn base_ty_name(t: &Type) -> Option<&'static str> {
     Some(match t {
         Type::I8 => "i8",
         Type::I16 => "i16",
@@ -233,19 +233,19 @@ pub(crate) fn grundtyp_name(t: &Type) -> Option<&'static str> {
 /// Vorlagen. Der Grund ist derselbe: der Typ `i32` gehoert keinem Modul.
 /// Wuerde die Methode zu `vec__i32__kleiner`, suchte die Aufloesung weiter
 /// `i32__kleiner` und faende nichts.
-pub(crate) fn ist_grundtyp_methode(name: &str) -> bool {
-    match name.split_once(crate::impls::TRENNER) {
-        Some((kopf, rest)) => !rest.is_empty() && grundtyp_von_name(kopf).is_some(),
+pub(crate) fn is_base_ty_method(name: &str) -> bool {
+    match name.split_once(crate::impls::SEP) {
+        Some((header, rest)) => !rest.is_empty() && base_ty_of_name(header).is_some(),
         None => false,
     }
 }
 
 /// Nennt dieser Typausdruck `Self`?
-fn nennt_self(te: &TypeExpr) -> bool {
+fn names_self(te: &TypeExpr) -> bool {
     match te {
         TypeExpr::Named(n, _) => n == "Self",
-        TypeExpr::Ptr { inner, .. } => nennt_self(inner),
-        TypeExpr::Array { elem, .. } => nennt_self(elem),
+        TypeExpr::Ptr { inner, .. } => names_self(inner),
+        TypeExpr::Array { elem, .. } => names_self(elem),
     }
 }
 
@@ -275,8 +275,8 @@ fn te_text(te: &TypeExpr) -> String {
 /// Signatur einer Schnittstellenmethode aus dem UNAUFGELOESTEN Kopf.
 /// (`signatur` weiter unten macht dasselbe mit aufgeloesten Typen; hier ist
 /// noch kein Typpruefer gelaufen.)
-fn kopf_signatur(m: &Methode) -> String {
-    let mut s = String::from(if m.veraenderlich { "*mut self" } else { "*self" });
+fn header_signature(m: &Method) -> String {
+    let mut s = String::from(if m.mutable { "*mut self" } else { "*self" });
     for t in &m.params {
         s.push_str(", ");
         s.push_str(&te_text(t));
@@ -294,52 +294,52 @@ fn kopf_signatur(m: &Methode) -> String {
 /// geschrieben wurde; das Typargument traegt dagegen schon den Namen nach der
 /// Modulumbenennung. Deshalb dieselben drei Schritte wie in `typ_struct`:
 /// gleich, `gc <Name>`, oder auf `__<Name>` endend (Typ aus einem Modul).
-fn umsetzung_da(iface: &str, typname: &str) -> bool {
+fn impl_da(iface: &str, ty_name: &str) -> bool {
     REG.with(|r| {
         r.borrow().impls.iter().any(|u| {
             if u.iface != iface {
                 return false;
             }
-            if u.typ == typname || typname == format!("gc {}", u.typ) {
+            if u.ty == ty_name || ty_name == format!("gc {}", u.ty) {
                 return true;
             }
             // Die Endungsregel gilt NUR fuer benannte Typen aus einem Modul.
             // Fuer einen Grundtyp waere sie falsch: `Vec__i32` endet auf
             // `__i32`, ist aber der Struct `Vec[i32]` und nicht `i32`.
-            grundtyp_von_name(&u.typ).is_none()
-                && typname.ends_with(&format!("__{}", u.typ))
+            base_ty_of_name(&u.ty).is_none()
+                && ty_name.ends_with(&format!("__{}", u.ty))
         })
     })
 }
 
 /// `// HOOK iface` in `mono.rs::schranke_ok` — `T: I` bei der Auspraegung.
 /// `true` = die Schranke ist erfuellt.
-pub(crate) fn schranke_pruefen(
+pub(crate) fn bound_check(
     dg: &mut Diags,
-    fnamen: &HashSet<String>,
+    fnames: &HashSet<String>,
     arg: &TypeExpr,
     iface: &str,
     pname: &str,
-    basis: &str,
+    base: &str,
     span: Span,
 ) -> bool {
     let ii = match iface_index(iface) {
         Some(i) => i,
         None => {
-            let bekannt: Vec<String> =
+            let known: Vec<String> =
                 REG.with(|r| r.borrow().ifaces.iter().map(|s| s.name.clone()).collect());
-            let note = if bekannt.is_empty() {
-                "in dieser uebersetzung ist keine schnittstelle vereinbart; \
-                 eingebaut sind nur Any, Int und Scalar"
+            let note = if known.is_empty() {
+                "no interface is declared in this compilation; \
+                 built in are only Any, Int and Scalar"
                     .to_string()
             } else {
-                format!("bekannt sind: {} (eingebaut: Any, Int, Scalar)", bekannt.join(", "))
+                format!("known are: {} (built in: Any, Int, Scalar)", known.join(", "))
             };
             dg.error_note(
                 span,
                 format!(
-                    "unbekannte schnittstelle '{}' als schranke am typparameter '{}' von '{}'",
-                    iface, pname, basis
+                    "unknown interface '{}' as bound on the type parameter '{}' of '{}'",
+                    iface, pname, base
                 ),
                 note,
             );
@@ -348,61 +348,61 @@ pub(crate) fn schranke_pruefen(
     };
     // Eine Schnittstelle wird von einem BENANNTEN Typ umgesetzt. Ein Zeiger
     // oder ein Feld hat keinen Namen, unter dem eine Umsetzung stehen koennte.
-    let typname = match arg {
+    let ty_name = match arg {
         TypeExpr::Named(n, _) => n.clone(),
         _ => {
             dg.error_note(
                 span,
                 format!(
-                    "typargument '{}' erfuellt die schranke '{}' des typparameters '{}' von '{}' nicht",
-                    te_text(arg), iface, pname, basis
+                    "type argument '{}' does not satisfy the bound '{}' of the type parameter '{}' of '{}'",
+                    te_text(arg), iface, pname, base
                 ),
                 format!(
-                    "eine schnittstelle wird mit 'impl {} for <typ>' umgesetzt; \
-                     ein zeiger- oder feldtyp hat keinen namen, unter dem das stehen koennte",
+                    "an interface is implemented with 'impl {} for <type>'; \
+                     a pointer or field type has no name under which that could stand",
                     iface
                 ),
             );
             return false;
         }
     };
-    if umsetzung_da(iface, &typname) {
+    if impl_da(iface, &ty_name) {
         return true;
     }
     // Kein `impl I for T`. Jetzt die nuetzliche Meldung: welche Methoden der
     // Schnittstelle hat der Typ ueberhaupt schon?
-    let methoden = REG.with(|r| r.borrow().ifaces[ii].methoden.clone());
-    let mut fehlen: Vec<String> = Vec::new();
-    for m in &methoden {
-        let voll = format!("{}{}{}", typname, crate::impls::TRENNER, m.name);
-        if !fnamen.contains(&voll) {
-            fehlen.push(kopf_signatur(m));
+    let methods = REG.with(|r| r.borrow().ifaces[ii].methods.clone());
+    let mut missing: Vec<String> = Vec::new();
+    for m in &methods {
+        let full = format!("{}{}{}", ty_name, crate::impls::SEP, m.name);
+        if !fnames.contains(&full) {
+            missing.push(header_signature(m));
         }
     }
-    let note = if methoden.is_empty() {
-        format!("'{}' hat keine methode; es fehlt nur 'impl {} for {}'", iface, iface, typname)
-    } else if fehlen.is_empty() {
+    let note = if methods.is_empty() {
+        format!("'{}' has no method; only 'impl {} for {}' is missing", iface, iface, ty_name)
+    } else if missing.is_empty() {
         format!(
-            "'{}' hat alle methoden von '{}'; es fehlt der block 'impl {} for {} {{ … }}'",
-            typname, iface, iface, typname
+            "'{}' has all methods of '{}'; the block 'impl {} for {} {{ … }}' is missing",
+            ty_name, iface, iface, ty_name
         )
     } else {
         format!(
-            "es fehlt {} in 'impl {} for {} {{ … }}'",
-            fehlen
+            "{} is missing in 'impl {} for {} {{ … }}'",
+            missing
                 .iter()
                 .map(|x| format!("'{}'", x))
                 .collect::<Vec<_>>()
-                .join(" und "),
+                .join(" and "),
             iface,
-            typname
+            ty_name
         )
     };
     dg.error_note(
         span,
         format!(
-            "typ '{}' setzt die schnittstelle '{}' nicht um — schranke am typparameter '{}' von '{}'",
-            typname, iface, pname, basis
+            "type '{}' does not implement the interface '{}' — bound on the type parameter '{}' of '{}'",
+            ty_name, iface, pname, base
         ),
         note,
     );
@@ -437,12 +437,12 @@ fn interface_decl(p: &mut Parser) {
         let sp = p.pending_attrs[0].span;
         p.dg.error_note(
             sp,
-            "vor 'interface' ist kein attribut erlaubt".to_string(),
-            "attribute an schnittstellen gibt es in dieser stufe nicht".to_string(),
+            "no attribute is allowed before 'interface'".to_string(),
+            "attributes on interfaces do not exist in this stage".to_string(),
         );
         p.pending_attrs.clear();
     }
-    let (name, nsp) = match p.ident("nach 'interface'") {
+    let (name, nsp) = match p.ident("after 'interface'") {
         Some(x) => x,
         None => {
             p.recovering = false;
@@ -450,12 +450,12 @@ fn interface_decl(p: &mut Parser) {
             return;
         }
     };
-    if !p.expect(TokKind::LBrace, "nach dem namen der schnittstelle") {
+    if !p.expect(TokKind::LBrace, "after the name of the interface") {
         p.recovering = false;
         p.sync_item();
         return;
     }
-    let mut methoden: Vec<Methode> = Vec::new();
+    let mut methods: Vec<Method> = Vec::new();
     loop {
         while p.eat(&TokKind::Semi) {}
         if p.at(&TokKind::RBrace) || p.at_eof() {
@@ -467,7 +467,7 @@ fn interface_decl(p: &mut Parser) {
         let before = p.pos;
         if !p.at(&TokKind::KwFn) {
             p.error_here(format!(
-                "erwartet 'fn' in einer schnittstelle, gefunden '{}'",
+                "expected 'fn' in an interface, found '{}'",
                 p.kind().text()
             ));
             p.recovering = false;
@@ -477,18 +477,18 @@ fn interface_decl(p: &mut Parser) {
         // Eine kaputte Methode bricht die GANZE Schnittstelle ab — dieselbe
         // Regel wie im `impl`-Block (impls.rs): die erste Meldung ist die
         // einzige, die etwas erklaert.
-        match methodenkopf(p, &name) {
+        match method_head(p, &name) {
             Some(m) => {
-                if methoden.iter().any(|x| x.name == m.name) {
+                if methods.iter().any(|x| x.name == m.name) {
                     p.dg.error(
                         m.span,
                         format!(
-                            "die schnittstelle '{}' hat die methode '{}' bereits",
+                            "the interface '{}' already has the method '{}'",
                             name, m.name
                         ),
                     );
                 }
-                methoden.push(m);
+                methods.push(m);
             }
             None => {
                 p.recovering = false;
@@ -500,19 +500,19 @@ fn interface_decl(p: &mut Parser) {
             p.bump();
         }
     }
-    p.close(TokKind::RBrace, "am ende der schnittstelle");
+    p.close(TokKind::RBrace, "at the end of the interface");
     p.recovering = false;
     if iface_index(&name).is_some() {
         p.dg.error(
             nsp,
-            format!("die schnittstelle '{}' ist bereits deklariert", name),
+            format!("the interface '{}' is already declared", name),
         );
         return;
     }
     REG.with(|r| {
-        r.borrow_mut().ifaces.push(Schnittstelle {
+        r.borrow_mut().ifaces.push(Interface {
             name,
-            methoden,
+            methods,
             struct_idx: usize::MAX,
         })
     });
@@ -520,28 +520,28 @@ fn interface_decl(p: &mut Parser) {
 
 /// Eine Methode der Schnittstelle: `fn name(<empfaenger>[, param…]) [-> T]`
 /// — ohne Rumpf.
-fn methodenkopf(p: &mut Parser, iface: &str) -> Option<Methode> {
+fn method_head(p: &mut Parser, iface: &str) -> Option<Method> {
     p.bump(); // 'fn'
-    let (name, nsp) = match p.ident("nach 'fn' in einer schnittstelle") {
+    let (name, nsp) = match p.ident("after 'fn' in an interface") {
         Some(x) => x,
         None => return None,
     };
     if p.at(&TokKind::LBracket) {
-        p.error_here("eine schnittstellenmethode kann in dieser stufe nicht generisch sein");
+        p.error_here("an interface method cannot be generic in this stage");
         return None;
     }
-    if !p.expect(TokKind::LParen, "nach dem methodennamen") {
+    if !p.expect(TokKind::LParen, "after the method name") {
         return None;
     }
     // DER EMPFAENGER MUSS EIN ZEIGER SEIN. Ueber die Methodentafel steht nur
     // der Datenzeiger zur Verfuegung — eine Kopie des Wertes koennte der
     // Aufrufer gar nicht bilden, er kennt den konkreten Typ nicht.
-    let veraenderlich = if p.at(&TokKind::Star) {
-        match crate::impls::zeiger_self(p) {
+    let mutable = if p.at(&TokKind::Star) {
+        match crate::impls::ptr_self(p) {
             Some((m, _)) => m,
             None => {
                 p.error_here(format!(
-                    "der empfaenger einer schnittstellenmethode ist '*self' oder '*mut self' ('{}.{}')",
+                    "the receiver of an interface method is '*self' or '*mut self' ('{}.{}')",
                     iface, name
                 ));
                 return None;
@@ -549,7 +549,7 @@ fn methodenkopf(p: &mut Parser, iface: &str) -> Option<Methode> {
         }
     } else {
         p.error_here(format!(
-            "der empfaenger einer schnittstellenmethode ist '*self' oder '*mut self' ('{}.{}')",
+            "the receiver of an interface method is '*self' or '*mut self' ('{}.{}')",
             iface, name
         ));
         return None;
@@ -558,7 +558,7 @@ fn methodenkopf(p: &mut Parser, iface: &str) -> Option<Methode> {
     if p.eat(&TokKind::Comma) {
         params = p.params().into_iter().map(|x| x.ty).collect();
     }
-    p.close(TokKind::RParen, "nach der parameterliste");
+    p.close(TokKind::RParen, "after the parameter list");
     p.recovering = false;
     let ret = if p.eat(&TokKind::Arrow) {
         match p.parse_type() {
@@ -570,7 +570,7 @@ fn methodenkopf(p: &mut Parser, iface: &str) -> Option<Methode> {
     };
     if p.at(&TokKind::LBrace) {
         p.error_here(format!(
-            "eine schnittstellenmethode hat keinen rumpf ('{}.{}')",
+            "an interface method has no body ('{}.{}')",
             iface, name
         ));
         return None;
@@ -579,18 +579,18 @@ fn methodenkopf(p: &mut Parser, iface: &str) -> Option<Methode> {
     // laesst sich eine Ordnung aufschreiben — `fn kleiner(*self, b: *Self)`.
     // Ohne `Self` muesste in der Schnittstelle ein KONKRETER Typ stehen, und
     // eine allgemeine `Ord` waere unmoeglich.
-    let hat_self =
-        params.iter().any(nennt_self) || ret.as_ref().map(nennt_self).unwrap_or(false);
-    Some(Methode {
+    let has_self =
+        params.iter().any(names_self) || ret.as_ref().map(names_self).unwrap_or(false);
+    Some(Method {
         name,
         params,
         ret,
-        veraenderlich,
+        mutable,
         span: nsp,
-        ptypen: Vec::new(),
+        ptypes: Vec::new(),
         rtyp: Type::Void,
-        aufgeloest: false,
-        hat_self,
+        resolved: false,
+        has_self,
     })
 }
 
@@ -611,16 +611,16 @@ pub(crate) fn hook_type(p: &mut Parser, name: &str, sp: Span) -> Option<TypeExpr
 }
 
 /// `// HOOK iface` in `impls.rs::impl_decl` — `impl I for T { … }` anmelden.
-pub(crate) fn merke_umsetzung(iface: String, typ: String, span: Span) {
+pub(crate) fn remember_impl(iface: String, ty: String, span: Span) {
     REG.with(|r| {
-        r.borrow_mut().impls.push(Umsetzung {
+        r.borrow_mut().impls.push(Impl {
             iface,
-            typ,
+            ty,
             span,
             struct_idx: usize::MAX,
-            praefix: String::new(),
+            prefix: String::new(),
             ok: false,
-            geprueft: false,
+            checked: false,
         })
     });
 }
@@ -635,20 +635,20 @@ pub(crate) fn merke_umsetzung(iface: String, typ: String, span: Span) {
 pub(crate) fn declare_interfaces(ck: &mut Checker) {
     let n = REG.with(|r| r.borrow().ifaces.len());
     for i in 0..n {
-        let (name, fertig) = REG.with(|r| {
+        let (name, done) = REG.with(|r| {
             let reg = r.borrow();
             let s = &reg.ifaces[i];
             (s.name.clone(), s.struct_idx != usize::MAX)
         });
-        if fertig {
+        if done {
             continue;
         }
         let sidx = ck.tcx.declare(&dyn_name(&name));
         ck.tcx.set_fields(
             sidx,
             vec![
-                ("daten".to_string(), Type::ptr(Type::U8, true)),
-                ("tafel".to_string(), Type::ptr(Type::U8, true)),
+                ("data".to_string(), Type::ptr(Type::U8, true)),
+                ("table".to_string(), Type::ptr(Type::U8, true)),
             ],
         );
         REG.with(|r| r.borrow_mut().ifaces[i].struct_idx = sidx);
@@ -661,21 +661,21 @@ pub(crate) fn hook_resolve_ty(ck: &mut Checker, te: &TypeExpr) -> Option<Type> {
         TypeExpr::Named(n, s) => (n.as_str(), *s),
         _ => return None,
     };
-    let iface = schnittstelle_von(name)?;
+    let iface = interface_of(name)?;
     if ck.tcx.lookup(name).is_some() {
         return None; // die gewoehnliche Aufloesung findet den Struct
     }
     ck.dg.error_note(
         span,
-        format!("unbekannte schnittstelle '{}'", iface),
-        format!("eine schnittstelle wird mit 'interface {} {{ … }}' vereinbart", iface),
+        format!("unknown interface '{}'", iface),
+        format!("an interface is declared with 'interface {} {{ … }}'", iface),
     );
     Some(Type::Error)
 }
 
 /// Der Name, unter dem die Methoden eines Typs stehen: `T__m`.
 /// Fuer eine `gc class` ist das der Klassenname OHNE das interne `"gc "`.
-pub(crate) fn methodenpraefix(tcx: &TypeCtx, idx: usize) -> String {
+pub(crate) fn method_prefix(tcx: &TypeCtx, idx: usize) -> String {
     match tcx.structs.get(idx) {
         Some(s) => s.name.strip_prefix("gc ").unwrap_or(&s.name).to_string(),
         None => String::new(),
@@ -685,12 +685,12 @@ pub(crate) fn methodenpraefix(tcx: &TypeCtx, idx: usize) -> String {
 /// Vergleich zweier Typen an einer Signaturgrenze — dieselbe Regel wie
 /// `sema::compatible`: Zeiger werden OHNE die Veraenderlichkeit verglichen
 /// (`*T` und `*mut T` sind in dieser Sprache fuereinander einsetzbar).
-fn passt(a: &Type, b: &Type) -> bool {
+fn fits(a: &Type, b: &Type) -> bool {
     if a.is_error() || b.is_error() {
         return true;
     }
     match (a, b) {
-        (Type::Ptr { inner: x, .. }, Type::Ptr { inner: y, .. }) => passt(x, y),
+        (Type::Ptr { inner: x, .. }, Type::Ptr { inner: y, .. }) => fits(x, y),
         _ => a == b,
     }
 }
@@ -704,7 +704,7 @@ fn passt(a: &Type, b: &Type) -> bool {
 /// GENAU EIN Struct, dessen Name auf `__<Name>` endet (das ist der Fall
 /// „Typ in einem Modul"). Mehrere Treffer sind ein Fehler — raten waere die
 /// gefaehrlichere Wahl.
-fn typ_struct(ck: &Checker, name: &str) -> Result<usize, bool> {
+fn ty_struct(ck: &Checker, name: &str) -> Result<usize, bool> {
     if let Some(i) = ck.tcx.lookup(name) {
         return Ok(i);
     }
@@ -712,7 +712,7 @@ fn typ_struct(ck: &Checker, name: &str) -> Result<usize, bool> {
         return Ok(i);
     }
     let suffix = format!("__{}", name);
-    let treffer: Vec<usize> = ck
+    let hit: Vec<usize> = ck
         .tcx
         .structs
         .iter()
@@ -720,8 +720,8 @@ fn typ_struct(ck: &Checker, name: &str) -> Result<usize, bool> {
         .filter(|(_, s)| s.name.ends_with(&suffix))
         .map(|(i, _)| i)
         .collect();
-    match treffer.len() {
-        1 => Ok(treffer[0]),
+    match hit.len() {
+        1 => Ok(hit[0]),
         0 => Err(false),
         _ => Err(true),
     }
@@ -731,9 +731,9 @@ fn typ_struct(ck: &Checker, name: &str) -> Result<usize, bool> {
 ///
 /// Die Typen werden ausdruecklich uebergeben: bei einer Signatur mit `Self`
 /// stehen sie nicht in der Schnittstelle, sondern haengen an der Umsetzung.
-fn signatur(ck: &Checker, m: &Methode, ptypen: &[Type], rtyp: &Type) -> String {
-    let mut s = String::from(if m.veraenderlich { "*mut self" } else { "*self" });
-    for t in ptypen {
+fn signature(ck: &Checker, m: &Method, ptypes: &[Type], rtyp: &Type) -> String {
+    let mut s = String::from(if m.mutable { "*mut self" } else { "*self" });
+    for t in ptypes {
         s.push_str(", ");
         s.push_str(&ck.tcx.name_of(t));
     }
@@ -744,14 +744,14 @@ fn signatur(ck: &Checker, m: &Methode, ptypen: &[Type], rtyp: &Type) -> String {
 }
 
 /// Loest einen Typ der Schnittstelle auf und setzt dabei `Self` ein.
-fn resolve_mit_self(ck: &mut Checker, te: &TypeExpr, selbst: &Type) -> Type {
+fn resolve_with_self(ck: &mut Checker, te: &TypeExpr, slf: &Type) -> Type {
     match te {
-        TypeExpr::Named(n, _) if n == "Self" => selbst.clone(),
+        TypeExpr::Named(n, _) if n == "Self" => slf.clone(),
         TypeExpr::Ptr { mutable, inner, .. } => {
-            Type::ptr(resolve_mit_self(ck, inner, selbst), *mutable)
+            Type::ptr(resolve_with_self(ck, inner, slf), *mutable)
         }
         TypeExpr::Array { elem, len, .. } => {
-            Type::Array(Box::new(resolve_mit_self(ck, elem, selbst)), *len)
+            Type::Array(Box::new(resolve_with_self(ck, elem, slf)), *len)
         }
         _ => ck.resolve_ty(te),
     }
@@ -763,14 +763,14 @@ pub(crate) fn hook_check_impls(ck: &mut Checker) {
     // 1. Typen der Schnittstellenmethoden aufloesen (einmal je Methode).
     let n = REG.with(|r| r.borrow().ifaces.len());
     for i in 0..n {
-        let anz = REG.with(|r| r.borrow().ifaces[i].methoden.len());
-        for k in 0..anz {
-            let (fertig, params, ret, hat_self) = REG.with(|r| {
+        let cnt = REG.with(|r| r.borrow().ifaces[i].methods.len());
+        for k in 0..cnt {
+            let (done, params, ret, has_self) = REG.with(|r| {
                 let reg = r.borrow();
-                let m = &reg.ifaces[i].methoden[k];
-                (m.aufgeloest, m.params.clone(), m.ret.clone(), m.hat_self)
+                let m = &reg.ifaces[i].methods[k];
+                (m.resolved, m.params.clone(), m.ret.clone(), m.has_self)
             });
-            if fertig {
+            if done {
                 continue;
             }
             // Eine Signatur mit `Self` hat GLOBAL keine Typen — sie bekommt
@@ -778,8 +778,8 @@ pub(crate) fn hook_check_impls(ck: &mut Checker) {
             // hiesse, `Self` als gewoehnlichen Typnamen zu suchen, und das
             // waere eine Fehlermeldung ueber einen Typ, den niemand
             // deklarieren wollte.
-            if hat_self {
-                REG.with(|r| r.borrow_mut().ifaces[i].methoden[k].aufgeloest = true);
+            if has_self {
+                REG.with(|r| r.borrow_mut().ifaces[i].methods[k].resolved = true);
                 continue;
             }
             let pt: Vec<Type> = params.iter().map(|t| ck.resolve_ty(t)).collect();
@@ -789,46 +789,46 @@ pub(crate) fn hook_check_impls(ck: &mut Checker) {
             };
             REG.with(|r| {
                 let mut reg = r.borrow_mut();
-                let m = &mut reg.ifaces[i].methoden[k];
-                m.ptypen = pt;
+                let m = &mut reg.ifaces[i].methods[k];
+                m.ptypes = pt;
                 m.rtyp = rt;
-                m.aufgeloest = true;
+                m.resolved = true;
             });
         }
     }
     // 2. Jede Umsetzung pruefen.
-    let anz = REG.with(|r| r.borrow().impls.len());
-    for u in 0..anz {
-        let (iface, typ, span, geprueft) = REG.with(|r| {
+    let cnt = REG.with(|r| r.borrow().impls.len());
+    for u in 0..cnt {
+        let (iface, ty, span, checked) = REG.with(|r| {
             let reg = r.borrow();
             let x = &reg.impls[u];
-            (x.iface.clone(), x.typ.clone(), x.span, x.geprueft)
+            (x.iface.clone(), x.ty.clone(), x.span, x.checked)
         });
-        if geprueft {
+        if checked {
             continue;
         }
-        REG.with(|r| r.borrow_mut().impls[u].geprueft = true);
-        pruefe_umsetzung(ck, u, &iface, &typ, span);
+        REG.with(|r| r.borrow_mut().impls[u].checked = true);
+        check_impl(ck, u, &iface, &ty, span);
     }
     // 3. Kein Schnittstellenwert im Heap: der Sammler verfolgt dort PRAEZISE
     //    (SPEC §3.5.3) und kennt den Datenzeiger in einem `dyn I` nicht.
-    pruefe_gc_felder(ck);
+    check_gc_fields(ck);
 }
 
-fn pruefe_umsetzung(ck: &mut Checker, u: usize, iface: &str, typ: &str, span: Span) {
+fn check_impl(ck: &mut Checker, u: usize, iface: &str, ty: &str, span: Span) {
     let ii = match iface_index(iface) {
         Some(i) => i,
         None => {
-            let bekannt: Vec<String> =
+            let known: Vec<String> =
                 REG.with(|r| r.borrow().ifaces.iter().map(|s| s.name.clone()).collect());
-            let note = if bekannt.is_empty() {
-                "in dieser uebersetzung ist keine schnittstelle vereinbart".to_string()
+            let note = if known.is_empty() {
+                "no interface is declared in this compilation".to_string()
             } else {
-                format!("bekannt sind: {}", bekannt.join(", "))
+                format!("known are: {}", known.join(", "))
             };
             ck.dg.error_note(
                 span,
-                format!("unbekannte schnittstelle '{}'", iface),
+                format!("unknown interface '{}'", iface),
                 note,
             );
             return;
@@ -844,55 +844,55 @@ fn pruefe_umsetzung(ck: &mut Checker, u: usize, iface: &str, typ: &str, span: Sp
     // Endungssuche in `typ_struct` (drittes Feld: „genau ein Struct, dessen
     // Name auf `__<Name>` endet") wuerde sonst `Vec__i32` finden — der ist
     // `Vec[i32]` und nicht `i32`.
-    if let Some(t) = grundtyp_von_name(typ) {
-        return pruefe_umsetzung_am(ck, u, iface, ii, typ, span, usize::MAX, t);
+    if let Some(t) = base_ty_of_name(ty) {
+        return check_impl_am(ck, u, iface, ii, ty, span, usize::MAX, t);
     }
-    let (sidx, selbst_typ) = match typ_struct(ck, typ) {
+    let (sidx, self_ty) = match ty_struct(ck, ty) {
         Ok(i) => (i, Type::Struct(i)),
         Err(true) => {
             ck.dg.error_note(
                 span,
-                format!("der typ '{}' ist mehrdeutig", typ),
-                "mehrere module deklarieren einen typ dieses namens".to_string(),
+                format!("the type '{}' is ambiguous", ty),
+                "several modules declare a type of this name".to_string(),
             );
             return;
         }
         Err(false) => {
-            ck.dg.error(span, format!("unbekannter typ '{}'", typ));
+            ck.dg.error(span, format!("unknown type '{}'", ty));
             return;
         }
     };
-    pruefe_umsetzung_am(ck, u, iface, ii, typ, span, sidx, selbst_typ)
+    check_impl_am(ck, u, iface, ii, ty, span, sidx, self_ty)
 }
 
 /// Der zweite Teil: die Umsetzung gegen einen BEKANNTEN Traeger pruefen.
 /// `sidx == usize::MAX` heisst „Grundtyp" — dann gibt es keinen Struct und
 /// damit weder Methodentafel noch `as dyn I`.
-fn pruefe_umsetzung_am(
+fn check_impl_am(
     ck: &mut Checker,
     u: usize,
     iface: &str,
     ii: usize,
-    typ: &str,
+    ty: &str,
     span: Span,
     sidx: usize,
-    selbst_typ: Type,
+    self_ty: Type,
 ) {
     if sidx != usize::MAX && ck.tcx.structs[sidx].name.starts_with(P_DYN) {
         ck.dg.error_note(
             span,
-            format!("'{}' ist eine schnittstelle und kein typ", typ),
-            "eine schnittstelle setzt keine schnittstelle um".to_string(),
+            format!("'{}' is an interface and not a type", ty),
+            "an interface does not implement an interface".to_string(),
         );
         return;
     }
-    let praefix = if sidx == usize::MAX {
-        typ.to_string()
+    let prefix = if sidx == usize::MAX {
+        ty.to_string()
     } else {
-        methodenpraefix(&ck.tcx, sidx)
+        method_prefix(&ck.tcx, sidx)
     };
-    let anzeige = if sidx == usize::MAX {
-        typ.to_string()
+    let display = if sidx == usize::MAX {
+        ty.to_string()
     } else {
         ck.tcx.structs[sidx].name.clone()
     };
@@ -900,140 +900,140 @@ fn pruefe_umsetzung_am(
     // aufgeloesten Traegers, damit `impl I for T` und `impl I for modul.T`
     // als dasselbe erkannt werden und Grundtypen mitzaehlen. (Ein leerer
     // Praefix heisst: jene Umsetzung war schon fehlerhaft.)
-    let doppelt = REG.with(|r| {
+    let duplicate = REG.with(|r| {
         r.borrow()
             .impls
             .iter()
             .take(u)
-            .any(|x| x.iface == iface && !x.praefix.is_empty() && x.praefix == praefix)
+            .any(|x| x.iface == iface && !x.prefix.is_empty() && x.prefix == prefix)
     });
-    if doppelt {
+    if duplicate {
         ck.dg.error(
             span,
-            format!("'{}' setzt die schnittstelle '{}' bereits um", typ, iface),
+            format!("'{}' already implements the interface '{}'", ty, iface),
         );
         return;
     }
     REG.with(|r| {
         let mut reg = r.borrow_mut();
         reg.impls[u].struct_idx = sidx;
-        reg.impls[u].praefix = praefix.clone();
+        reg.impls[u].prefix = prefix.clone();
     });
-    let methoden = REG.with(|r| r.borrow().ifaces[ii].methoden.clone());
-    let mut vollstaendig = true;
-    for m in &methoden {
+    let methods = REG.with(|r| r.borrow().ifaces[ii].methods.clone());
+    let mut complete = true;
+    for m in &methods {
         // Bei `Self` haengen die Typen an DIESER Umsetzung, nicht an der
         // Schnittstelle — deshalb hier aufgeloest und nicht in Schritt 1.
-        let (ptypen, rtyp): (Vec<Type>, Type) = if m.hat_self {
+        let (ptypes, rtyp): (Vec<Type>, Type) = if m.has_self {
             (
                 m.params
                     .iter()
-                    .map(|t| resolve_mit_self(ck, t, &selbst_typ))
+                    .map(|t| resolve_with_self(ck, t, &self_ty))
                     .collect(),
                 match &m.ret {
-                    Some(t) => resolve_mit_self(ck, t, &selbst_typ),
+                    Some(t) => resolve_with_self(ck, t, &self_ty),
                     None => Type::Void,
                 },
             )
         } else {
-            (m.ptypen.clone(), m.rtyp.clone())
+            (m.ptypes.clone(), m.rtyp.clone())
         };
-        let voll = format!("{}{}{}", praefix, crate::impls::TRENNER, m.name);
-        let sig = match ck.fns.get(&voll) {
+        let full = format!("{}{}{}", prefix, crate::impls::SEP, m.name);
+        let sig = match ck.fns.get(&full) {
             Some(s) => s.clone(),
             None => {
-                vollstaendig = false;
+                complete = false;
                 ck.dg.error_note(
                     span,
                     format!(
-                        "'{}' setzt die methode '{}.{}' nicht um",
-                        anzeige, iface, m.name
+                        "'{}' does not implement the method '{}.{}'",
+                        display, iface, m.name
                     ),
-                    format!("erwartet wird '{}' im block", signatur(ck, m, &ptypen, &rtyp)),
+                    format!("'{}' is expected in the block", signature(ck, m, &ptypes, &rtyp)),
                 );
                 continue;
             }
         };
         // Empfaenger: ein Zeiger auf GENAU diesen Typ.
-        let empf_ok = match sig.params.first() {
-            Some(Type::Ptr { inner, .. }) => **inner == selbst_typ,
+        let recv_ok = match sig.params.first() {
+            Some(Type::Ptr { inner, .. }) => **inner == self_ty,
             _ => false,
         };
-        if !empf_ok {
-            vollstaendig = false;
+        if !recv_ok {
+            complete = false;
             ck.dg.error_note(
                 span,
                 format!(
-                    "der empfaenger von '{}.{}' passt nicht zu '{}'",
-                    anzeige, m.name, iface
+                    "the receiver of '{}.{}' does not fit '{}'",
+                    display, m.name, iface
                 ),
-                format!("erwartet wird '{}' im block", signatur(ck, m, &ptypen, &rtyp)),
+                format!("'{}' is expected in the block", signature(ck, m, &ptypes, &rtyp)),
             );
             continue;
         }
-        if sig.params.len() != ptypen.len() + 1 {
-            vollstaendig = false;
+        if sig.params.len() != ptypes.len() + 1 {
+            complete = false;
             ck.dg.error_note(
                 span,
                 format!(
-                    "'{}.{}' hat {} parameter, die schnittstelle '{}' verlangt {}",
-                    anzeige,
+                    "'{}.{}' has {} parameters, the interface '{}' requires {}",
+                    display,
                     m.name,
                     sig.params.len() - 1,
                     iface,
-                    ptypen.len()
+                    ptypes.len()
                 ),
-                format!("erwartet wird '{}' im block", signatur(ck, m, &ptypen, &rtyp)),
+                format!("'{}' is expected in the block", signature(ck, m, &ptypes, &rtyp)),
             );
             continue;
         }
-        let mut passend = true;
-        for (k, erwartet) in ptypen.iter().enumerate() {
-            let ist = &sig.params[k + 1];
-            if !passt(ist, erwartet) {
-                passend = false;
+        let mut matching = true;
+        for (k, expected) in ptypes.iter().enumerate() {
+            let actual = &sig.params[k + 1];
+            if !fits(actual, expected) {
+                matching = false;
                 ck.dg.error_note(
                     span,
                     format!(
-                        "parameter {} von '{}.{}' hat typ {}, die schnittstelle '{}' verlangt {}",
+                        "parameter {} of '{}.{}' has type {}, the interface '{}' requires {}",
                         k + 1,
-                        anzeige,
+                        display,
                         m.name,
-                        ck.tcx.name_of(ist),
+                        ck.tcx.name_of(actual),
                         iface,
-                        ck.tcx.name_of(erwartet)
+                        ck.tcx.name_of(expected)
                     ),
-                    format!("erwartet wird '{}' im block", signatur(ck, m, &ptypen, &rtyp)),
+                    format!("'{}' is expected in the block", signature(ck, m, &ptypes, &rtyp)),
                 );
                 break;
             }
         }
-        if !passend {
-            vollstaendig = false;
+        if !matching {
+            complete = false;
             continue;
         }
-        if !passt(&sig.ret, &rtyp) {
-            vollstaendig = false;
+        if !fits(&sig.ret, &rtyp) {
+            complete = false;
             ck.dg.error_note(
                 span,
                 format!(
-                    "'{}.{}' liefert {}, die schnittstelle '{}' verlangt {}",
-                    anzeige,
+                    "'{}.{}' returns {}, the interface '{}' requires {}",
+                    display,
                     m.name,
                     ck.tcx.name_of(&sig.ret),
                     iface,
                     ck.tcx.name_of(&rtyp)
                 ),
-                format!("erwartet wird '{}' im block", signatur(ck, m, &ptypen, &rtyp)),
+                format!("'{}' is expected in the block", signature(ck, m, &ptypes, &rtyp)),
             );
         }
     }
-    REG.with(|r| r.borrow_mut().impls[u].ok = vollstaendig);
+    REG.with(|r| r.borrow_mut().impls[u].ok = complete);
 }
 
 /// Enthaelt `t` DEM WERT NACH einen Schnittstellenwert?
-fn enthaelt_dyn(tcx: &TypeCtx, t: &Type, tiefe: u32) -> bool {
-    if tiefe > 32 {
+fn contains_dyn(tcx: &TypeCtx, t: &Type, depth: u32) -> bool {
+    if depth > 32 {
         return false;
     }
     match t {
@@ -1042,39 +1042,39 @@ fn enthaelt_dyn(tcx: &TypeCtx, t: &Type, tiefe: u32) -> bool {
             Some(s) => s
                 .fields
                 .iter()
-                .any(|f| enthaelt_dyn(tcx, &f.ty, tiefe + 1)),
+                .any(|f| contains_dyn(tcx, &f.ty, depth + 1)),
             None => false,
         },
-        Type::Array(e, _) => enthaelt_dyn(tcx, e, tiefe + 1),
+        Type::Array(e, _) => contains_dyn(tcx, e, depth + 1),
         _ => false,
     }
 }
 
 /// `dyn I` im Heap waere ein Loch in der Sammlerzusage (siehe Kopf der Datei).
-fn pruefe_gc_felder(ck: &mut Checker) {
-    if !hat_schnittstellen() {
+fn check_gc_fields(ck: &mut Checker) {
+    if !has_interfaces() {
         return;
     }
-    let mut befunde: Vec<(String, String)> = Vec::new();
+    let mut findings: Vec<(String, String)> = Vec::new();
     for s in ck.tcx.structs.iter() {
-        let klasse = match s.name.strip_prefix("gc ") {
+        let class = match s.name.strip_prefix("gc ") {
             Some(k) => k,
             None => continue,
         };
         for f in &s.fields {
-            if enthaelt_dyn(&ck.tcx, &f.ty, 0) {
-                befunde.push((klasse.to_string(), f.name.clone()));
+            if contains_dyn(&ck.tcx, &f.ty, 0) {
+                findings.push((class.to_string(), f.name.clone()));
             }
         }
     }
-    for (klasse, feld) in befunde {
+    for (class, field) in findings {
         ck.dg.error_note(
             Span::none(),
             format!(
-                "feld '{}' der gc-klasse '{}' enthaelt einen schnittstellenwert",
-                feld, klasse
+                "field '{}' of the gc class '{}' contains an interface value",
+                field, class
             ),
-            "der sammler verfolgt den heap praezise und kennt den zeiger hinter 'dyn' nicht (SPEC 3.5.3)".to_string(),
+            "the collector traces the heap precisely and does not know the pointer behind 'dyn' (SPEC 3.5.3)".to_string(),
         );
     }
 }
@@ -1095,19 +1095,19 @@ pub(crate) fn hook_cast(ck: &mut Checker, span: Span, src: &Type, dst: &Type) ->
         .tcx
         .structs
         .get(sidx)
-        .and_then(|s| schnittstelle_von(&s.name))?
+        .and_then(|s| interface_of(&s.name))?
         .to_string();
-    let quelle = match src {
+    let source = match src {
         Type::Ptr { inner, .. } => match &**inner {
             Type::Struct(j) => *j,
             _ => {
                 ck.dg.error_note(
                     span,
                     format!(
-                        "ein schnittstellenwert entsteht aus einem zeiger auf einen struct, gefunden {}",
+                        "an interface value is made from a pointer to a struct, found {}",
                         ck.tcx.name_of(src)
                     ),
-                    format!("schreibe '(&x) as dyn {}'", iface),
+                    format!("write '(&x) as dyn {}'", iface),
                 );
                 return Some(Type::Error);
             }
@@ -1116,41 +1116,41 @@ pub(crate) fn hook_cast(ck: &mut Checker, span: Span, src: &Type, dst: &Type) ->
             ck.dg.error_note(
                 span,
                 format!(
-                    "ein schnittstellenwert entsteht aus einem zeiger, gefunden {}",
+                    "an interface value is made from a pointer, found {}",
                     ck.tcx.name_of(src)
                 ),
-                format!("schreibe '(&x) as dyn {}'", iface),
+                format!("write '(&x) as dyn {}'", iface),
             );
             return Some(Type::Error);
         }
     };
-    if umsetzung_ok(&iface, quelle) {
+    if impl_ok(&iface, source) {
         return Some(dst.clone());
     }
-    let name = ck.tcx.name_of(&Type::Struct(quelle));
-    let bekannt = REG.with(|r| {
+    let name = ck.tcx.name_of(&Type::Struct(source));
+    let known = REG.with(|r| {
         r.borrow()
             .impls
             .iter()
             .filter(|x| x.iface == iface && x.struct_idx != usize::MAX)
-            .map(|x| x.typ.clone())
+            .map(|x| x.ty.clone())
             .collect::<Vec<_>>()
     });
-    let note = if bekannt.is_empty() {
-        format!("kein typ setzt '{}' um", iface)
+    let note = if known.is_empty() {
+        format!("no type implements '{}'", iface)
     } else {
-        format!("'{}' setzen um: {}", iface, bekannt.join(", "))
+        format!("'{}' implement: {}", iface, known.join(", "))
     };
     ck.dg.error_note(
         span,
-        format!("'{}' setzt die schnittstelle '{}' nicht um", name, iface),
+        format!("'{}' does not implement the interface '{}'", name, iface),
         note,
     );
     Some(Type::Error)
 }
 
 /// Setzt der Struct `sidx` die Schnittstelle `iface` vollstaendig um?
-fn umsetzung_ok(iface: &str, sidx: usize) -> bool {
+fn impl_ok(iface: &str, sidx: usize) -> bool {
     REG.with(|r| {
         r.borrow()
             .impls
@@ -1160,25 +1160,25 @@ fn umsetzung_ok(iface: &str, sidx: usize) -> bool {
 }
 
 /// Nummer der Methode in der Schnittstelle (= Platz in der Methodentafel).
-pub(crate) fn slot_von(iface: &str, methode: &str) -> Option<usize> {
+pub(crate) fn slot_of(iface: &str, method: &str) -> Option<usize> {
     let i = iface_index(iface)?;
     REG.with(|r| {
         r.borrow().ifaces[i]
-            .methoden
+            .methods
             .iter()
-            .position(|m| m.name == methode)
+            .position(|m| m.name == method)
     })
 }
 
 /// Rueckgabetyp einer Schnittstellenmethode — auch fuer `sema::probe`, damit
 /// ein Literal daneben seinen Typ bekommt (`f.flaeche() != 42`).
-pub(crate) fn ret_von(iface: &str, methode: &str) -> Option<Type> {
+pub(crate) fn ret_of(iface: &str, method: &str) -> Option<Type> {
     let i = iface_index(iface)?;
     REG.with(|r| {
         r.borrow().ifaces[i]
-            .methoden
+            .methods
             .iter()
-            .find(|m| m.name == methode)
+            .find(|m| m.name == method)
             .map(|m| m.rtyp.clone())
     })
 }
@@ -1188,26 +1188,26 @@ pub(crate) fn ret_von(iface: &str, methode: &str) -> Option<Type> {
 /// Der Empfaenger ist ein WERT (der fette Zeiger selbst). Ein `*dyn I` wird
 /// bewusst nicht angenommen: `(*z).m(…)` sagt dasselbe und macht sichtbar,
 /// dass zwei Woerter gelesen werden.
-pub(crate) fn hook_methode(
+pub(crate) fn hook_method(
     ck: &mut Checker,
     iface: &str,
-    methode: &str,
+    method: &str,
     args: &[Expr],
     et: &Type,
-    ist_zeiger: bool,
+    is_ptr: bool,
     nspan: Span,
     espan: Span,
 ) -> Type {
-    let anzeige = format!("dyn {}.{}", iface, methode);
+    let display = format!("dyn {}.{}", iface, method);
     let ii = match iface_index(iface) {
         Some(i) => i,
         None => return Type::Error,
     };
     let m = match REG.with(|r| {
         r.borrow().ifaces[ii]
-            .methoden
+            .methods
             .iter()
-            .find(|m| m.name == methode)
+            .find(|m| m.name == method)
             .cloned()
     }) {
         Some(m) => m,
@@ -1215,21 +1215,21 @@ pub(crate) fn hook_methode(
             for a in &args[1..] {
                 ck.type_out_expr(a);
             }
-            let vorhanden: Vec<String> = REG.with(|r| {
+            let present: Vec<String> = REG.with(|r| {
                 r.borrow().ifaces[ii]
-                    .methoden
+                    .methods
                     .iter()
                     .map(|m| m.name.clone())
                     .collect()
             });
-            let note = if vorhanden.is_empty() {
-                format!("die schnittstelle '{}' hat keine methoden", iface)
+            let note = if present.is_empty() {
+                format!("the interface '{}' has no methods", iface)
             } else {
-                format!("'{}' hat: {}", iface, vorhanden.join(", "))
+                format!("'{}' has: {}", iface, present.join(", "))
             };
             ck.dg.error_note(
                 nspan,
-                format!("die schnittstelle '{}' hat keine methode '{}'", iface, methode),
+                format!("the interface '{}' has no method '{}'", iface, method),
                 note,
             );
             return Type::Error;
@@ -1239,50 +1239,50 @@ pub(crate) fn hook_methode(
     // ueber `dyn I` nicht — welcher Typ dahintersteckt, steht erst zur
     // Laufzeit fest, und `*Self` waere fuer jeden ein anderer Typ. Solche
     // Methoden gibt es nur STATISCH, ueber eine Schranke.
-    if m.hat_self {
+    if m.has_self {
         for a in &args[1..] {
             ck.type_out_expr(a);
         }
         ck.dg.error_note(
             nspan,
             format!(
-                "'{}.{}' nennt 'Self' und ist deshalb nicht ueber 'dyn {}' aufrufbar",
-                iface, methode, iface
+                "'{}.{}' mentions 'Self' and is therefore not callable via 'dyn {}'",
+                iface, method, iface
             ),
             format!(
-                "rufe sie ueber eine schranke auf: 'fn f[T: {}](x: *T)' — dort steht der typ fest",
+                "call it via a bound: 'fn f[T: {}](x: *T)' — there the type is fixed",
                 iface
             ),
         );
         return Type::Error;
     }
-    if ist_zeiger {
-        if let Some(empf) = args.first() {
+    if is_ptr {
+        if let Some(recv) = args.first() {
             ck.dg.error_note(
-                empf.span,
+                recv.span,
                 format!(
-                    "'{}' erwartet den schnittstellenwert selbst, gefunden {}",
-                    anzeige,
+                    "'{}' expects the interface value itself, found {}",
+                    display,
                     ck.tcx.name_of(et)
                 ),
-                format!("schreibe (*x).{}(…)", methode),
+                format!("write (*x).{}(…)", method),
             );
         }
     }
-    let erwartet = m.ptypen.len();
-    let gefunden = args.len().saturating_sub(1);
-    if gefunden != erwartet {
+    let expected = m.ptypes.len();
+    let found = args.len().saturating_sub(1);
+    if found != expected {
         ck.dg.error(
             espan,
             format!(
-                "methode '{}' erwartet {} argument(e), gefunden {}",
-                anzeige, erwartet, gefunden
+                "method '{}' expects {} argument(s), found {}",
+                display, expected, found
             ),
         );
     }
     for (i, a) in args[1..].iter().enumerate() {
-        match m.ptypen.get(i) {
-            Some(p) => ck.pruefe_argument(&anzeige, i + 1, a, p),
+        match m.ptypes.get(i) {
+            Some(p) => ck.check_argument(&display, i + 1, a, p),
             None => ck.type_out_expr(a),
         }
     }
@@ -1293,13 +1293,13 @@ pub(crate) fn hook_methode(
 
 /// Methodentafel einer Umsetzung — der Schluessel fuer `Op::VtabAddr`.
 /// `None`, wenn dieser Typ die Schnittstelle nicht (vollstaendig) umsetzt.
-pub(crate) fn tafel_von(iface: &str, sidx: usize) -> Option<String> {
+pub(crate) fn table_of(iface: &str, sidx: usize) -> Option<String> {
     REG.with(|r| {
         r.borrow()
             .impls
             .iter()
             .find(|x| x.iface == iface && x.struct_idx == sidx && x.ok)
-            .map(|x| tafelschluessel(iface, &x.praefix))
+            .map(|x| table_key(iface, &x.prefix))
     })
 }
 
@@ -1312,33 +1312,33 @@ pub(crate) fn tafel_von(iface: &str, sidx: usize) -> Option<String> {
 /// Deklaration, nicht an den Aufrufstellen; eine Tafel, die nur manchmal
 /// entsteht, waere die Sorte Zustand, die man beim Fehlersuchen nicht sehen
 /// will.
-pub(crate) fn tafeln_asm() -> String {
+pub(crate) fn tables_asm() -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
-    let tafeln: Vec<(String, Vec<String>)> = REG.with(|r| {
+    let tables: Vec<(String, Vec<String>)> = REG.with(|r| {
         let reg = r.borrow();
         reg.impls
             .iter()
             .filter(|u| u.ok && u.struct_idx != usize::MAX)
             .filter_map(|u| {
                 let ii = reg.ifaces.iter().position(|s| s.name == u.iface)?;
-                let ziele: Vec<String> = reg.ifaces[ii]
-                    .methoden
+                let targets: Vec<String> = reg.ifaces[ii]
+                    .methods
                     .iter()
-                    .map(|m| format!("{}{}{}", u.praefix, crate::impls::TRENNER, m.name))
+                    .map(|m| format!("{}{}{}", u.prefix, crate::impls::SEP, m.name))
                     .collect();
-                Some((tafelschluessel(&u.iface, &u.praefix), ziele))
+                Some((table_key(&u.iface, &u.prefix), targets))
             })
             .collect()
     });
-    if tafeln.is_empty() {
+    if tables.is_empty() {
         return out;
     }
     let _ = writeln!(out, ".section .rodata");
     let _ = writeln!(out, ".align 8");
-    for (schluessel, ziele) in tafeln {
-        let _ = writeln!(out, "{}{}:", TAFEL_LABEL, schluessel);
-        for z in ziele {
+    for (key, targets) in tables {
+        let _ = writeln!(out, "{}{}:", TABLE_LABEL, key);
+        for z in targets {
             let _ = writeln!(out, "    .quad {}", crate::codegen_x86::label(&z));
         }
     }
@@ -1349,13 +1349,13 @@ pub(crate) fn tafeln_asm() -> String {
 /// zaehlt als erster Parameter (ein Zeiger), danach die Parameter aus der
 /// Deklaration. Damit sieht der Aufruf fuer `lower_call` genauso aus wie
 /// jeder andere.
-fn methoden_sig(iface: &str, methode: &str) -> Option<crate::sema::FnSig> {
+fn methods_sig(iface: &str, method: &str) -> Option<crate::sema::FnSig> {
     let i = iface_index(iface)?;
     REG.with(|r| {
         let reg = r.borrow();
-        let m = reg.ifaces[i].methoden.iter().find(|m| m.name == methode)?;
+        let m = reg.ifaces[i].methods.iter().find(|m| m.name == method)?;
         let mut params = vec![Type::ptr(Type::U8, true)];
-        params.extend(m.ptypen.iter().cloned());
+        params.extend(m.ptypes.iter().cloned());
         Some(crate::sema::FnSig { params, ret: m.rtyp.clone() })
     })
 }
@@ -1372,30 +1372,30 @@ fn methoden_sig(iface: &str, methode: &str) -> Option<crate::sema::FnSig> {
 ///
 /// Drei Ladebefehle je Aufruf — das ist der Preis des dynamischen Versands,
 /// und er steht hier sichtbar (SPEC §1, Leitsatz 1: nichts versteckt).
-pub(crate) fn lower_versand(
+pub(crate) fn lower_dispatch(
     lo: &mut crate::lower::Lower,
     iface: &str,
-    methode: &str,
-    empf: &Expr,
+    method: &str,
+    recv: &Expr,
     span: Span,
 ) -> Option<(crate::fir::Val, crate::fir::Val, crate::sema::FnSig)> {
     use crate::fir::{FTy, Op};
-    let slot = match slot_von(iface, methode) {
+    let slot = match slot_of(iface, method) {
         Some(s) => s,
-        None => return lo.ice(span, "unbekannte schnittstellenmethode im lowering"),
+        None => return lo.ice(span, "unknown interface method in lowering"),
     };
-    let sig = match methoden_sig(iface, methode) {
+    let sig = match methods_sig(iface, method) {
         Some(s) => s,
-        None => return lo.ice(span, "schnittstellenmethode ohne signatur im lowering"),
+        None => return lo.ice(span, "interface method without signature in lowering"),
     };
-    let basis = lo.lower_addr(empf)?;
-    let dadr = lo.field_addr_at(basis, OFF_DATEN);
-    let daten = lo.load(FTy::Ptr, dadr);
-    let tadr = lo.field_addr_at(basis, OFF_TAFEL);
-    let tafel = lo.load(FTy::Ptr, tadr);
-    let eadr = lo.field_addr_at(tafel, 8 * slot as u64);
-    let ziel = lo.load(FTy::Ptr, eadr);
-    Some((ziel, daten, sig))
+    let base = lo.lower_addr(recv)?;
+    let dadr = lo.field_addr_at(base, OFF_DATA);
+    let data = lo.load(FTy::Ptr, dadr);
+    let tadr = lo.field_addr_at(base, OFF_TABLE);
+    let table = lo.load(FTy::Ptr, tadr);
+    let eadr = lo.field_addr_at(table, 8 * slot as u64);
+    let target = lo.load(FTy::Ptr, eadr);
+    Some((target, data, sig))
 }
 
 /// `// HOOK iface` in `lower::write_into_inner` — `p as dyn I`.
@@ -1414,33 +1414,33 @@ pub(crate) fn lower_cast_into(
     use crate::fir::{FTy, Op};
     let sidx = match t {
         Type::Struct(i) => *i,
-        _ => return lo.ice(span, "schnittstellenwert ohne struct-typ"),
+        _ => return lo.ice(span, "interface value without struct type"),
     };
-    let iface = match lo.info.tcx.structs.get(sidx).and_then(|s| schnittstelle_von(&s.name)) {
+    let iface = match lo.info.tcx.structs.get(sidx).and_then(|s| interface_of(&s.name)) {
         Some(i) => i.to_string(),
-        None => return lo.ice(span, "umwandlung in einen nicht-schnittstellentyp"),
+        None => return lo.ice(span, "conversion into a non-interface type"),
     };
-    let quelle = match lo.ty_of(inner) {
+    let source = match lo.ty_of(inner) {
         Type::Ptr { inner, .. } => match *inner {
             Type::Struct(j) => j,
-            _ => return lo.ice(span, "schnittstellenwert aus einem zeiger ohne struct"),
+            _ => return lo.ice(span, "interface value from a pointer without struct"),
         },
-        _ => return lo.ice(span, "schnittstellenwert aus einem nicht-zeiger"),
+        _ => return lo.ice(span, "interface value from a non-pointer"),
     };
-    let schluessel = match tafel_von(&iface, quelle) {
+    let key = match table_of(&iface, source) {
         Some(k) => k,
-        None => return lo.ice(span, "umsetzung ohne methodentafel im lowering"),
+        None => return lo.ice(span, "implementation without method table in lowering"),
     };
     let pv = lo.lower_expr(inner)?;
-    let dadr = lo.field_addr_at(addr, OFF_DATEN);
+    let dadr = lo.field_addr_at(addr, OFF_DATA);
     lo.store(FTy::Ptr, dadr, pv);
-    let tv = lo.push(FTy::Ptr, Op::VtabAddr { tafel: schluessel });
-    let tadr = lo.field_addr_at(addr, OFF_TAFEL);
+    let tv = lo.push(FTy::Ptr, Op::VtabAddr { table: key });
+    let tadr = lo.field_addr_at(addr, OFF_TABLE);
     lo.store(FTy::Ptr, tadr, tv);
     Some(())
 }
 
 /// Assemblername einer Methodentafel.
-pub(crate) fn tafel_label(schluessel: &str) -> String {
-    format!("{}{}", TAFEL_LABEL, schluessel)
+pub(crate) fn table_label(key: &str) -> String {
+    format!("{}{}", TABLE_LABEL, key)
 }

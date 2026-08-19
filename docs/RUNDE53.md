@@ -12,8 +12,8 @@ Ergebnis vorweg, alles selbst gemessen:
 | | Basis `cc1710f` | Runde 53 |
 |---|---|---|
 | `test.sh` | 751/751 | **763/763** |
-| `tools/selbst_vergleich.sh` | 213 / 0 / 0 | **217 / 0 / 0** |
-| `tools/fixpunkt.sh` | zeichengleich, 427 401 Zeilen | **zeichengleich, 470 042 Zeilen** |
+| `tools/self_compare.sh` | 213 / 0 / 0 | **217 / 0 / 0** |
+| `tools/fixpoint.sh` | zeichengleich, 427 401 Zeilen | **zeichengleich, 470 042 Zeilen** |
 | längste Unterbrechung, **Rechenzeit**, Median aus 7 Läufen | 476 711 ns | **496 501 ns** |
 | Unterbrechungen über 1,02 ms (Rechenzeit) | 1 von 307 089 | **0 von 538 936** |
 | DOM-Dauerlauf, RSS | flach | **flach (1644 → 1644 KiB)** |
@@ -75,7 +75,7 @@ Block wieder und macht bei `fortschritt` weiter. Die Vollständigkeit hängt als
 nicht am Stapel.
 
 Ob die Stückelung wirklich nötig ist, wurde **gemessen** statt behauptet
-(`aufbau.fi`, ein Knoten mit 120 000 Kindern in einer `GcVec`, Rechenzeit,
+(`build.fi`, ein Knoten mit 120 000 Kindern in einer `GcVec`, Rechenzeit,
 Median aus 3 Läufen):
 
 | `SLOT_SCHEIBE` | längste Unterbrechung (Rechenzeit) | Objekte in 3 s |
@@ -301,7 +301,7 @@ mit erhaltener Geschwisterreihenfolge.
 Attributtabelle + Puffer + `Str` (3), drei Kinder (3), Kinderliste + Puffer (2),
 Listener + Listenerliste + Puffer (3), Sammlung (1), Wrapper (1).
 
-**Die Gegenprobe wurde mitgezogen.** `lib/dom/soak_leck.fi` bildet den Satz
+**Die Gegenprobe wurde mitgezogen.** `lib/dom/soak_leak.fi` bildet den Satz
 Objekt für Objekt nach — 128-Byte-Objekt mit generischen Verweisspalten,
 Kinderliste und ihr Puffer als eigene Objekte, 14 je Satz, davon lecken 13
 (frei wird die Sammlung, die als einzige keinen Rückverweis hat). Sonst wären
@@ -330,8 +330,8 @@ Werkzeug (Runde 44).
 
 ## 6. Messung: sind die Pausen schlechter geworden?
 
-`tools/gc_mess/r53_pausen.sh` (neu). Drei Fälle, **dasselbe** Messprogramm
-(`aufbau.fi`, 120 000 lebende Knoten, `AB_SCHWELLE = 0` also immer
+`tools/gc_meas/r53_pauses.sh` (neu). Drei Fälle, **dasselbe** Messprogramm
+(`build.fi`, 120 000 lebende Knoten, `AB_SCHWELLE = 0` also immer
 inkrementell):
 
 * **A BASIS** — Baum bei `cc1710f`, eigener Compiler, alter DOM
@@ -412,7 +412,7 @@ dem Parsen; der Preis ist ein zusätzliches Lexen, genau wie bei den Modulen.
 Fall, den es nicht gibt, und blieb ohne Barriere grün. Erst die Gegenprobe hat
 das gezeigt. Ein Test, dessen Gegenprobe nicht anschlägt, ist kein Test.
 
-**Die erste Pausenmessung maß den falschen Pfad.** `aufbau.fi` hat
+**Die erste Pausenmessung maß den falschen Pfad.** `build.fi` hat
 `AB_SCHWELLE = 8388608` voreingestellt, also atomare Vollzyklen unterhalb von
 8 MiB Halde. Gemessen kamen 11,6 ms heraus — das sind die drei
 Stop-the-World-Läufe der Aufbauphase aus Runde 44, nicht die inkrementellen
@@ -479,5 +479,5 @@ Scheiben. Die Zahl stimmte, sie beantwortete nur eine andere Frage.
 | `tools/gen_gctext.sh`, `lib/firnc1/gctext.fi` | Laufzeit als Daten, jetzt mit zwei Längen |
 | `bin/firnc1.fi` | Vorabscan der Laufzeit-Vorlagen |
 | `tests/840`–`843` | Grundlagen, der inkrementelle Fall, Zusammenspiel |
-| `lib/dom/dom.fi`, `soak_leck.fi` | der DOM auf Sammlungen, Gegenprobe mitgezogen |
-| `tools/gc_mess/r53_pausen.sh` | die Pausenmessung dieser Runde |
+| `lib/dom/dom.fi`, `soak_leak.fi` | der DOM auf Sammlungen, Gegenprobe mitgezogen |
+| `tools/gc_meas/r53_pauses.sh` | die Pausenmessung dieser Runde |

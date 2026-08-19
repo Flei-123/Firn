@@ -27,7 +27,7 @@ Gewinn gilt also fuer jedes Firn-Programm, nicht nur fuer den Messlauf.
 
 ## 0. Was hier „Faktor" heisst — und warum das ein anderer Wert ist als in Runde 43
 
-Runde 43 hat den Faktor mit `tools/tokenizer/durchsatz.sh` bestimmt, also mit
+Runde 43 hat den Faktor mit `tools/tokenizer/throughput.sh` bestimmt, also mit
 der **Wanduhr** (1,54× realweb). Diese Runde rechnet ihn aus
 **Instruktionszahlen**:
 
@@ -55,7 +55,7 @@ dieser Maschine zwischen 2,58× und 2,85× **fuer dieselbe Binary**
 auf derselben Maschine; Wanduhrwerte werden deshalb **gar nicht** als Beleg
 angefuehrt.
 
-**Neues Werkzeug: `tools/tokenizer/muster.py`.** `profil.py` (Runde 43)
+**Neues Werkzeug: `tools/tokenizer/patterns.py`.** `profil.py` (Runde 43)
 beantwortet „welche FUNKTION kostet?". Die neue Datei beantwortet die Frage
 daneben — „welche FORM von Code kostet?": sie verbindet `objdump` mit der
 instruktionsgenauen callgrind-Ausgabe (`--dump-instr=yes`) und gewichtet
@@ -65,7 +65,7 @@ Instruktions**muster** mit ihren echten Ausfuehrungszahlen. Aufruf:
 objdump -d --no-show-raw-insn .tokenizer-work/tokenize_bench > dis.txt
 valgrind --tool=callgrind --dump-instr=yes --cache-sim=no --branch-sim=no \
          --callgrind-out-file=cg.out .tokenizer-work/tokenize_bench < auftrag
-python3 tools/tokenizer/muster.py dis.txt cg.out
+python3 tools/tokenizer/patterns.py dis.txt cg.out
 ```
 
 Dazu im Arbeitsverzeichnis (nicht eingecheckt) `.r51/messe.sh`, das callgrind
@@ -124,7 +124,7 @@ html5lib 8.511 / 1.
 
 ---
 
-## 3. H1 — Sprungfaedelung durch Bool-Zellen (`compiler/src/faedeln.rs`, neu)
+## 3. H1 — Sprungfaedelung durch Bool-Zellen (`compiler/src/threading.rs`, neu)
 
 **Beobachtung.** 17,13 % aller Instruktionen steckten in Ketten der Form
 
@@ -181,7 +181,7 @@ Lebensdaueranalyse des Verteilers. Zusaetzlich abgesichert:
 * `store` und `alloca` bleiben stehen; erst der bestehende Durchgang fuer tote
   Speicherungen entfernt sie. Der Durchgang ist damit debugerhaltend.
 
-Acht Modultests in `faedeln.rs` decken das ab, darunter „Aufruf zwischen
+Acht Modultests in `threading.rs` decken das ab, darunter „Aufruf zwischen
 `store` und Sprung blockiert", „fremder `store` dazwischen blockiert",
 „Zelle, deren Zeiger entkommt", „`constant_time`", „geheimer Wert" und
 „zweiter Lauf aendert nichts mehr" (Fixpunkt).
@@ -400,18 +400,18 @@ Uebersetzer. **Benannt, nicht angefasst.**
 
 `lib/firnc1` hat **keinen Optimierer und keine Registerzuteilung** — jeder
 Wert liegt dort im Rahmen (so steht es im Kopf von
-`tools/selbst_vergleich.sh`). Alle sieben Aenderungen dieser Runde liegen
+`tools/self_compare.sh`). Alle sieben Aenderungen dieser Runde liegen
 genau in diesen beiden Teilen und haben in firnc1 kein Gegenstueck; es gibt
 dort nichts zu spiegeln. Die geforderte Gleichheit wird deshalb dort
 nachgewiesen, wo sie in diesem Aufbau nachweisbar ist:
 
-* `tools/selbst_vergleich.sh` — **214 gleiches Verhalten, 0 abweichend,
+* `tools/self_compare.sh` — **214 gleiches Verhalten, 0 abweichend,
   0 fehlerhaft**: jedes Testprogramm, von firnc1 uebersetzt, liefert denselben
   Rueckgabewert und dieselbe Ausgabe wie von firnc0 uebersetzt.
-* `tools/fixpunkt.sh` — Stufe 2 == Stufe 3, **zeichengleich, 427.401 Zeilen**:
+* `tools/fixpoint.sh` — Stufe 2 == Stufe 3, **zeichengleich, 427.401 Zeilen**:
   der von firnc0 uebersetzte Compiler erzeugt denselben Assembler wie der von
   sich selbst uebersetzte.
-* `tools/fir_vergleich.sh` — 42.472 FIR-Instruktionen gleich (1 bekannte,
+* `tools/fir_compare.sh` — 42.472 FIR-Instruktionen gleich (1 bekannte,
   benannte Abweichung wie vor der Runde).
 
 Neue FIR-Opcodes waren nicht noetig; der Nummernbereich 40–49 bleibt frei.
@@ -452,9 +452,9 @@ unveraendert benannt: **zu wenige Register** (§13.2).
 | Pruefung | Ergebnis | Basis |
 |---|---|---|
 | `bash ./test.sh` | **PASS 754/754** | 751/751 (+3 durch `tests/332_adressierung.fi` in drei Baustufen) |
-| `cargo test --release` (Modultests) | **169/169** | 155 (+8 `faedeln.rs`, +6 `regalloc.rs`) |
-| `bash tools/selbst_vergleich.sh` | **214 gleich, 0 abweichend, 0 fehlerhaft**, CODEGEN FEHLT 0 | 213/0/0 (+1 neue Testdatei) |
-| `bash tools/fixpunkt.sh` | **Stufe 2 == Stufe 3, zeichengleich, 427.401 Zeilen** | 427.401 |
+| `cargo test --release` (Modultests) | **169/169** | 155 (+8 `threading.rs`, +6 `regalloc.rs`) |
+| `bash tools/self_compare.sh` | **214 gleich, 0 abweichend, 0 fehlerhaft**, CODEGEN FEHLT 0 | 213/0/0 (+1 neue Testdatei) |
+| `bash tools/fixpoint.sh` | **Stufe 2 == Stufe 3, zeichengleich, 427.401 Zeilen** | 427.401 |
 | `bash tools/tokenizer/run.sh` | **6810/6810 = 100,00 %**, mit Fehlern **6809/6810** | unveraendert |
 | Lexer/Parser/Layout/Sema/FIR-Vergleich | unveraendert (je 1 bekannte, benannte Abweichung; Layout 0) | unveraendert |
 | DOM-Dauerlauf, Pakete, atomares Primitiv | bestanden | unveraendert |
@@ -464,7 +464,7 @@ Rundenvorgabe). Alle Zwischendateien lagen unter `.r51/` bzw.
 `.tokenizer-work/` im eigenen Worktree — kein `/tmp` (Falle (b)). Wanduhrwerte
 werden nirgends als Beleg angefuehrt (Falle (c)).
 
-Zustand des Messlaufs am Ende, mit `tools/tokenizer/muster.py`:
+Zustand des Messlaufs am Ende, mit `tools/tokenizer/patterns.py`:
 
 ```
 Rahmenverwaltung (callee-saved sichern/holen)   36.414.390 Ir   5,21%    932 Stellen

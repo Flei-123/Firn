@@ -26,10 +26,10 @@ use crate::types::Type;
 
 /// Aufrufname, den die Laufzeit wirklich traegt. `weak`/`stark` sind keine
 /// Funktionen des Quelltextes; sie werden hier auf die Laufzeit abgebildet.
-pub(crate) fn echter_name(name: &str) -> Option<&'static str> {
+pub(crate) fn real_name(name: &str) -> Option<&'static str> {
     match name {
         "weak" => Some(gc::FN_WEAK),
-        "stark" => Some(gc::FN_STARK),
+        "strong" => Some(gc::FN_STRONG),
         _ => None,
     }
 }
@@ -43,17 +43,17 @@ pub(crate) fn hook_call(
     dest: Option<Val>,
     span: crate::diag::Span,
 ) -> Option<Option<Option<Val>>> {
-    if let Some(klasse) = gc::klasse_aus_neu(name) {
-        let felder: Vec<(String, Expr, crate::diag::Span)> = match args.first().map(|a| &a.kind) {
+    if let Some(class) = gc::class_out_new(name) {
+        let fields: Vec<(String, Expr, crate::diag::Span)> = match args.first().map(|a| &a.kind) {
             Some(ExprKind::StructLit(_, f, _)) => f.clone(),
             _ => Vec::new(),
         };
         let d = match dest {
             Some(d) => d,
-            None => return Some(lo.ice(span, "gc-allokation ohne ziel")),
+            None => return Some(lo.ice(span, "gc allocation without target")),
         };
-        let klasse = klasse.to_string();
-        return Some(match alloc_und_init(lo, d, &klasse, &felder, span) {
+        let class = class.to_string();
+        return Some(match alloc_and_init(lo, d, &class, &fields, span) {
             Some(()) => Some(None),
             None => None,
         });
@@ -62,12 +62,12 @@ pub(crate) fn hook_call(
         let regs = name == gc::INTR_REGS;
         return Some(Some(Some(lo.push(FTy::Ptr, Op::GcAddr { regs }))));
     }
-    let klasse = gc::klasse_aus_as(name)?;
-    let (tid, _, _) = gc::klasse_info(klasse)?;
+    let class = gc::class_out_as(name)?;
+    let (tid, _, _) = gc::class_info(class)?;
     let arg = args.first()?;
     Some((|| {
         let p = lo.lower_expr(arg)?;
-        let t = lo.konst(FTy::U64, tid as i128);
+        let t = lo.constant(FTy::U64, tid as i128);
         Some(Some(lo.push(
             FTy::Ptr,
             Op::Call { name: gc::FN_AS.to_string(), args: vec![p, t] },
@@ -75,34 +75,34 @@ pub(crate) fn hook_call(
     })())
 }
 
-fn alloc_und_init(
+fn alloc_and_init(
     lo: &mut Lower,
     dest: Val,
-    klasse: &str,
-    felder: &[(String, Expr, crate::diag::Span)],
+    class: &str,
+    fields: &[(String, Expr, crate::diag::Span)],
     span: crate::diag::Span,
 ) -> Option<()> {
-    let (tid, size, sidx) = match gc::klasse_info(klasse) {
+    let (tid, size, sidx) = match gc::class_info(class) {
         Some(x) => x,
-        None => return lo.ice(span, "gc-allokation ohne klasse"),
+        None => return lo.ice(span, "gc allocation without class"),
     };
     // Lage von `__err`/`__val` in der Fehlerunion.
-    let union = match gc::union_idx(klasse).and_then(crate::errors::union_by_struct) {
+    let union = match gc::union_idx(class).and_then(crate::errors::union_by_struct) {
         Some(u) => u,
-        None => return lo.ice(span, "gc-allokation ohne fehlerunion"),
+        None => return lo.ice(span, "gc allocation without error union"),
     };
     let code = match crate::errors::variant_code(gc::ERR_SET, "OutOfMemory") {
         Some(c) => c,
-        None => return lo.ice(span, "AllocError::OutOfMemory fehlt"),
+        None => return lo.ice(span, "AllocError::OutOfMemory is missing"),
     };
 
-    let tidv = lo.konst(FTy::U64, tid as i128);
-    let sizev = lo.konst(FTy::U64, size as i128);
+    let tidv = lo.constant(FTy::U64, tid as i128);
+    let sizev = lo.constant(FTy::U64, size as i128);
     let p = lo.push(
         FTy::Ptr,
         Op::Call { name: gc::FN_ALLOC.to_string(), args: vec![tidv, sizev] },
     );
-    let null = lo.konst(FTy::Ptr, 0);
+    let null = lo.constant(FTy::Ptr, 0);
     let ok = lo.push(FTy::Bool, Op::Cmp { op: CmpOp::Ne, ty: FTy::Ptr, a: p, b: null });
     let ok_bb = lo.new_block();
     let fail_bb = lo.new_block();
@@ -111,17 +111,17 @@ fn alloc_und_init(
 
     // Fehlerfall: erst hat die Laufzeit gesammelt, dann ist wirklich Schluss.
     lo.cur = fail_bb;
-    let c = lo.konst(FTy::U32, code);
+    let c = lo.constant(FTy::U32, code);
     lo.store(FTy::U32, dest, c);
     let va = lo.field_addr_at(dest, union.val_off);
-    let z = lo.konst(FTy::Ptr, 0);
+    let z = lo.constant(FTy::Ptr, 0);
     lo.store(FTy::Ptr, va, z);
     lo.set_term(crate::fir::Term::Br(join));
 
     // Erfolgsfall: Fehlerunion fuellen (damit der Zeiger sofort eine Wurzel
     // auf dem Stapel hat), dann die Felder schreiben.
     lo.cur = ok_bb;
-    let zero = lo.konst(FTy::U32, 0);
+    let zero = lo.constant(FTy::U32, 0);
     lo.store(FTy::U32, dest, zero);
     let va = lo.field_addr_at(dest, union.val_off);
     lo.store(FTy::Ptr, va, p);
@@ -129,10 +129,10 @@ fn alloc_und_init(
         Some(d) => d.fields.iter().map(|f| (f.name.clone(), f.offset)).collect(),
         None => Vec::new(),
     };
-    for (fname, fexpr, fspan) in felder {
+    for (fname, fexpr, fspan) in fields {
         let off = match decl.iter().find(|(n, _)| n == fname) {
             Some((_, o)) => *o,
-            None => return lo.ice(*fspan, "unbekanntes feld in der gc-allokation"),
+            None => return lo.ice(*fspan, "unknown field in the gc allocation"),
         };
         let fa = lo.ptradd_const(p, off);
         lo.write_into(fa, fexpr)?;
@@ -148,14 +148,14 @@ fn alloc_und_init(
 /// Wird NACH dem Schreiben gerufen; `target` ist das beschriebene Feld.
 pub(crate) fn hook_assign(lo: &mut Lower, target: &Expr) -> Option<()> {
     let t = lo.ty_of(target);
-    if !gc::ist_gc_ptr(&t) {
+    if !gc::is_gc_ptr(&t) {
         return Some(());
     }
     // Nur Schreibzugriffe IN den Heap brauchen die Barriere; eine oertliche
     // Veraenderliche liegt auf dem Stapel.
     let ins_heap = match &target.kind {
-        ExprKind::Field(base, _, _) => gc::ist_gc_ptr(&lo.ty_of(base)) || ist_zeiger(&lo.ty_of(base)),
-        ExprKind::Index(base, _) => ist_zeiger(&lo.ty_of(base)),
+        ExprKind::Field(base, _, _) => gc::is_gc_ptr(&lo.ty_of(base)) || is_ptr(&lo.ty_of(base)),
+        ExprKind::Index(base, _) => is_ptr(&lo.ty_of(base)),
         ExprKind::Unary(crate::ast::UnOp::Deref, _) => true,
         _ => false,
     };
@@ -171,6 +171,6 @@ pub(crate) fn hook_assign(lo: &mut Lower, target: &Expr) -> Option<()> {
     Some(())
 }
 
-fn ist_zeiger(t: &Type) -> bool {
+fn is_ptr(t: &Type) -> bool {
     matches!(t, Type::Ptr { .. })
 }

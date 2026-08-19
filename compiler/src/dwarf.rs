@@ -148,7 +148,7 @@ mod tests {
     /// Die Tabelle ist globaler Zustand — deshalb EIN Test, der beides prueft
     /// (parallele Tests wuerden sich sonst gegenseitig zuruecksetzen).
     #[test]
-    fn vermerke_verschieben_sich_und_lassen_sich_abschalten() {
+    fn notes_move_itself_and_let_itself_disable() {
         reset(vec!["a.fi".to_string()], true);
         set_fn("f", 0, 3);
         note("f", 0, 2, 0, 10);
