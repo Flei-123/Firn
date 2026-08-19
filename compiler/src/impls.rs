@@ -78,7 +78,7 @@ use crate::types::{Type, TypeCtx};
 
 /// Praefix des noch nicht aufgeloesten Methodenaufrufs im AST.
 /// Das Leerzeichen macht ihn unerreichbar fuer den Quelltext.
-pub(crate) const P_RUF: &str = "methode ";
+pub(crate) const P_RUF: &str = "method ";
 /// Trenner im Namen der Methodenfunktion: `Typ__methode`.
 pub(crate) const TRENNER: &str = "__";
 
@@ -135,12 +135,12 @@ fn impl_decl(p: &mut Parser, prog: &mut Program, is_for: bool) {
         let sp = p.pending_attrs[0].span;
         p.dg.error_note(
             sp,
-            "vor 'impl' ist kein attribut erlaubt".to_string(),
-            "schreibe das attribut vor die einzelne methode".to_string(),
+            "no attribute is allowed before 'impl'".to_string(),
+            "write the attribute before the individual method".to_string(),
         );
         p.pending_attrs.clear();
     }
-    let (first, esp) = match p.ident("nach 'impl'") {
+    let (first, esp) = match p.ident("after 'impl'") {
         Some(x) => x,
         None => {
             p.recovering = false;
@@ -153,7 +153,7 @@ fn impl_decl(p: &mut Parser, prog: &mut Program, is_for: bool) {
     // sagt nur zusaetzlich, was darin stehen MUSS.
     let (ty, tsp) = if is_for {
         p.bump(); // 'for'
-        match p.ident("nach 'for' in 'impl … for …'") {
+        match p.ident("after 'for' in 'impl … for …'") {
             Some(x) => x,
             None => {
                 p.recovering = false;
@@ -167,7 +167,7 @@ fn impl_decl(p: &mut Parser, prog: &mut Program, is_for: bool) {
     if is_for {
         crate::iface::remember_impl(first, ty.clone(), esp);
     }
-    if !p.expect(TokKind::LBrace, "nach dem typnamen in 'impl'") {
+    if !p.expect(TokKind::LBrace, "after the type name in 'impl'") {
         p.recovering = false;
         p.sync_item();
         return;
@@ -183,7 +183,7 @@ fn impl_decl(p: &mut Parser, prog: &mut Program, is_for: bool) {
         let before = p.pos;
         if !p.at(&TokKind::KwFn) {
             p.error_here(format!(
-                "erwartet 'fn' in einem impl-block, gefunden '{}'",
+                "expected 'fn' in an impl block, found '{}'",
                 p.kind().text()
             ));
             p.recovering = false;
@@ -201,7 +201,7 @@ fn impl_decl(p: &mut Parser, prog: &mut Program, is_for: bool) {
             p.bump();
         }
     }
-    p.close(TokKind::RBrace, "am ende des impl-blocks");
+    p.close(TokKind::RBrace, "at the end of the impl block");
     p.recovering = false;
     let _ = start;
 }
@@ -210,7 +210,7 @@ fn impl_decl(p: &mut Parser, prog: &mut Program, is_for: bool) {
 /// `false` = abgebrochen, der umgebende `impl`-Block wird verworfen.
 fn method(p: &mut Parser, prog: &mut Program, ty: &str, tsp: Span) -> bool {
     let start = p.bump(); // 'fn'
-    let name = match p.ident("nach 'fn' in einem impl-block") {
+    let name = match p.ident("after 'fn' in an impl block") {
         Some((n, _)) => n,
         None => {
             p.recovering = false;
@@ -219,12 +219,12 @@ fn method(p: &mut Parser, prog: &mut Program, ty: &str, tsp: Span) -> bool {
         }
     };
     if p.at(&TokKind::LBracket) {
-        p.error_here("eine methode kann in dieser stufe nicht generisch sein");
+        p.error_here("a method cannot be generic in this stage");
         p.recovering = false;
         p.sync_item();
         return false;
     }
-    if !p.expect(TokKind::LParen, "nach dem methodennamen") {
+    if !p.expect(TokKind::LParen, "after the method name") {
         p.recovering = false;
         p.sync_item();
         return false;
@@ -241,7 +241,7 @@ fn method(p: &mut Parser, prog: &mut Program, ty: &str, tsp: Span) -> bool {
     if p.eat(&TokKind::Comma) {
         params.extend(p.params());
     }
-    p.close(TokKind::RParen, "nach der parameterliste");
+    p.close(TokKind::RParen, "after the parameter list");
     p.recovering = false;
     let ret = if p.eat(&TokKind::Arrow) {
         match p.parse_type() {
@@ -257,14 +257,14 @@ fn method(p: &mut Parser, prog: &mut Program, ty: &str, tsp: Span) -> bool {
     };
     if !p.at(&TokKind::LBrace) {
         p.error_here(format!(
-            "erwartet '{{' am anfang des methodenrumpfes, gefunden '{}'",
+            "expected '{{' at the start of the method body, found '{}'",
             p.kind().text()
         ));
         p.recovering = false;
         p.sync_item();
         return false;
     }
-    let body = p.block("am anfang des methodenrumpfes");
+    let body = p.block("at the start of the method body");
     p.recovering = false;
     let attrs = std::mem::take(&mut p.pending_attrs);
     prog.funcs.push(FnDecl {
@@ -300,8 +300,8 @@ fn self_param(p: &mut Parser, ty: &str, tsp: Span) -> Option<Param> {
         if class {
             p.dg.error_note(
                 sp,
-                format!("'{}' ist eine gc-klasse: der empfaenger kann keine kopie sein", ty),
-                "ein 'gc class'-wert lebt nur auf dem GC-Heap: schreibe '*self' oder '*mut self'"
+                format!("'{}' is a gc class: the receiver cannot be a copy", ty),
+                "a 'gc class' value lives only on the GC heap: write '*self' or '*mut self'"
                     .to_string(),
             );
             return None;
@@ -327,7 +327,7 @@ fn self_param(p: &mut Parser, ty: &str, tsp: Span) -> Option<Param> {
         }
     }
     p.error_here(
-        "der erste parameter einer methode ist der empfaenger: 'self', '*self' oder '*mut self'",
+        "the first parameter of a method is the receiver: 'self', '*self' or '*mut self'",
     );
     None
 }
@@ -368,7 +368,7 @@ pub(crate) fn hook_method_call(
         return None;
     }
     p.bump(); // '('
-    let (args, end) = p.call_args("nach der argumentliste eines methodenaufrufs");
+    let (args, end) = p.call_args("after the argument list of a method call");
     let mut all = Vec::with_capacity(args.len() + 1);
     all.push(base.clone());
     all.extend(args);
@@ -497,11 +497,11 @@ pub(crate) fn hook_call(
             ck.dg.error_note(
                 nspan,
                 format!(
-                    "methode '{}' auf einem wert vom typ {} — dieser typ kann keine methoden haben",
+                    "method '{}' on a value of type {} — this type cannot have methods",
                     method,
                     ck.tcx.name_of(&et)
                 ),
-                "eine methode wird mit 'impl Typ { fn … }' fuer einen struct- oder grundtyp vereinbart"
+                "a method is declared with 'impl Type { fn … }' for a struct or primitive type"
                     .to_string(),
             );
             return Some(Type::Error);
@@ -529,13 +529,13 @@ pub(crate) fn hook_call(
             }
             let present = methods_of(ck, &prefix);
             let note = if present.is_empty() {
-                format!("fuer '{}' ist kein 'impl'-block vereinbart", sname)
+                format!("no 'impl' block is declared for '{}'", sname)
             } else {
-                format!("'{}' hat: {}", sname, present.join(", "))
+                format!("'{}' has: {}", sname, present.join(", "))
             };
             ck.dg.error_note(
                 nspan,
-                format!("typ '{}' hat keine methode '{}'", sname, method),
+                format!("type '{}' has no method '{}'", sname, method),
                 note,
             );
             return Some(Type::Error);
@@ -549,10 +549,10 @@ pub(crate) fn hook_call(
                 ck.dg.error_note(
                     recv.span,
                     format!(
-                        "der empfaenger von '{}' braucht eine adresse, dieser ausdruck hat keine",
+                        "the receiver of '{}' needs an address, this expression has none",
                         display
                     ),
-                    "binde ihn an eine variable und rufe die methode darauf auf".to_string(),
+                    "bind it to a variable and call the method on it".to_string(),
                 );
             }
         }
@@ -560,11 +560,11 @@ pub(crate) fn hook_call(
             ck.dg.error_note(
                 recv.span,
                 format!(
-                    "'{}' erwartet den empfaenger als wert, gefunden {}",
+                    "'{}' expects the receiver as a value, found {}",
                     display,
                     ck.tcx.name_of(&et)
                 ),
-                format!("schreibe (*x).{}(…), wenn die kopie gemeint ist", method),
+                format!("write (*x).{}(…) if the copy is meant", method),
             );
         }
         _ => {}
@@ -576,7 +576,7 @@ pub(crate) fn hook_call(
         ck.dg.error(
             espan,
             format!(
-                "methode '{}' erwartet {} argument(e), gefunden {}",
+                "method '{}' expects {} argument(s), found {}",
                 display, expected, found
             ),
         );

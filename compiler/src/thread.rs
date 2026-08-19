@@ -109,8 +109,8 @@ pub(crate) fn hook_call(
                 }
                 ck.dg.error_note(
                     espan,
-                    format!("'{}' erwartet keine argumente, gefunden {}", SELBST, args.len()),
-                    "die form ist __faden_selbst() -> *mut u8",
+                    format!("'{}' expects no arguments, found {}", SELBST, args.len()),
+                    "the form is __thread_self() -> *mut u8",
                 );
                 return Some(Type::Error);
             }
@@ -124,11 +124,11 @@ pub(crate) fn hook_call(
                 ck.dg.error_note(
                     espan,
                     format!(
-                        "'{}' erwartet genau drei argumente (argument, stapel, tidwort), gefunden {}",
+                        "'{}' expects exactly three arguments (argument, stack, tid word), found {}",
                         START,
                         args.len()
                     ),
-                    "die form ist __faden_starten(arg: u64, stapel: u64, ctid: *mut u8) -> i64",
+                    "the form is __thread_start(arg: u64, stack: u64, ctid: *mut u8) -> i64",
                 );
                 return Some(Type::Error);
             }
@@ -138,7 +138,7 @@ pub(crate) fn hook_call(
             if !at.is_error() && !fits_as_u64(&at) {
                 ck.dg.error(
                     args[0].span,
-                    format!("'{}' erwartet als argument einen u64, gefunden {}", START, ck.tcx.name_of(&at)),
+                    format!("'{}' expects a u64 as argument, found {}", START, ck.tcx.name_of(&at)),
                 );
                 return Some(Type::Error);
             }
@@ -146,11 +146,11 @@ pub(crate) fn hook_call(
                 ck.dg.error_note(
                     args[1].span,
                     format!(
-                        "'{}' erwartet als stapel einen u64, gefunden {}",
+                        "'{}' expects a u64 as stack, found {}",
                         START,
                         ck.tcx.name_of(&st)
                     ),
-                    "der stapel ist die OBERE adresse des fadenstapels (er waechst nach unten)",
+                    "the stack is the UPPER address of the thread stack (it grows downwards)",
                 );
                 return Some(Type::Error);
             }
@@ -158,11 +158,11 @@ pub(crate) fn hook_call(
                 ck.dg.error_note(
                     args[2].span,
                     format!(
-                        "'{}' erwartet als drittes argument einen zeiger auf das tidwort, gefunden {}",
+                        "'{}' expects a pointer to the tid word as third argument, found {}",
                         START,
                         ck.tcx.name_of(&ct)
                     ),
-                    "der kern schreibt dort die fadenkennung hin und nullt sie beim fadenende",
+                    "the kernel writes the thread id there and zeroes it when the thread ends",
                 );
                 return Some(Type::Error);
             }
@@ -177,11 +177,11 @@ pub(crate) fn hook_call(
                 ck.dg.error_note(
                     espan,
                     format!(
-                        "'{}' erwartet genau drei argumente (zeiger, erwartet, neu), gefunden {}",
+                        "'{}' expects exactly three arguments (pointer, expected, new), found {}",
                         CAS,
                         args.len()
                     ),
-                    "die form ist __atomar_tauschen(p: *mut u64, erwartet: u64, neu: u64) -> u64",
+                    "the form is __atomic_swap(p: *mut u64, expected: u64, new: u64) -> u64",
                 );
                 return Some(Type::Error);
             }
@@ -192,11 +192,11 @@ pub(crate) fn hook_call(
                 ck.dg.error_note(
                     args[0].span,
                     format!(
-                        "'{}' erwartet als erstes argument einen *mut u64, gefunden {}",
+                        "'{}' expects a *mut u64 as first argument, found {}",
                         CAS,
                         ck.tcx.name_of(&pt)
                     ),
-                    "atomar getauscht wird genau ein 64-bit-wort",
+                    "exactly one 64-bit word is swapped atomically",
                 );
                 return Some(Type::Error);
             }
@@ -204,7 +204,7 @@ pub(crate) fn hook_call(
                 if !t.is_error() && !fits_as_u64(t) {
                     ck.dg.error(
                         args[i].span,
-                        format!("'{}' erwartet einen u64, gefunden {}", CAS, ck.tcx.name_of(t)),
+                        format!("'{}' expects a u64, found {}", CAS, ck.tcx.name_of(t)),
                     );
                     return Some(Type::Error);
                 }
@@ -242,7 +242,7 @@ pub(crate) fn lower_thread_call(
         SELBST => Some(Some(lo.push(FTy::Ptr, Op::ThreadSelf))),
         START => {
             if args.len() != 3 {
-                return lo.ice(span, "faden-primitiv mit falscher stellenzahl");
+                return lo.ice(span, "thread primitive with wrong arity");
             }
             let a = lo.lower_expr(&args[0])?;
             let s = lo.lower_expr(&args[1])?;
@@ -251,7 +251,7 @@ pub(crate) fn lower_thread_call(
         }
         _ => {
             if args.len() != 3 {
-                return lo.ice(span, "atomar-tausch mit falscher stellenzahl");
+                return lo.ice(span, "atomic swap with wrong arity");
             }
             let p = lo.lower_expr(&args[0])?;
             let e = lo.lower_expr(&args[1])?;

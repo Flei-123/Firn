@@ -69,17 +69,17 @@ pub(crate) fn emit_switch(
 ) -> Result<(), String> {
     let (val, ty, cases, default) = match term {
         Term::Switch { val, ty, cases, default } => (*val, *ty, cases, *default),
-        _ => return Err("interner Fehler: emit_switch ohne switch".to_string()),
+        _ => return Err("internal error: emit_switch without switch".to_string()),
     };
     // SPEC §9.1: ueber einen geheimen Wert darf nicht verzweigt werden.
     if f.constant_time && f.is_secret(val) {
         return Err(format!(
-            "#[constant_time]: switch in '{}' haengt von einem secret-Wert (%{}) ab",
+            "#[constant_time]: switch in '{}' depends on a secret value (%{})",
             f.name, val
         ));
     }
     if ty == FTy::Void {
-        return Err("interner Fehler: switch ueber void".to_string());
+        return Err("internal error: switch over void".to_string());
     }
     if cases.is_empty() {
         e.line(&format!("jmp {}", block_label(&f.name, default)));
@@ -211,7 +211,7 @@ mod tests {
         assert!(asm.contains("je .Lmain__bb1"), "{}", asm);
         assert!(asm.contains("je .Lmain__bb2"), "{}", asm);
         assert!(asm.contains("jmp .Lmain__bb3"), "{}", asm);
-        assert!(!asm.contains("jmp qword ptr"), "unerwartete Tabelle:\n{}", asm);
+        assert!(!asm.contains("jmp qword ptr"), "unexpected table:\n{}", asm);
     }
 
     /// Viele dichte Marken: Sprungtabelle in `.rodata` mit indirektem Sprung.
@@ -265,7 +265,7 @@ mod tests {
     #[test]
     fn jump_table_at_30_states() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/230_zustandsmaschine.fi");
-        let src = std::fs::read_to_string(path).expect("testprogramm fehlt");
+        let src = std::fs::read_to_string(path).expect("test program missing");
         let mut dg = crate::diag::Diags::new(path, &src);
         let toks = crate::lexer::lex(&src, &mut dg);
         let mut prog = crate::parser::parse(&toks, &mut dg);
@@ -275,12 +275,12 @@ mod tests {
         assert!(!dg.has_errors(), "{}", dg.render());
         crate::opt::optimize(&mut m);
         let asm = emit(&m).expect("codegen");
-        assert!(asm.contains("jmp qword ptr ["), "keine sprungtabelle:\n{}", asm);
-        assert!(asm.contains(".section .rodata"), "tabelle nicht in .rodata:\n{}", asm);
+        assert!(asm.contains("jmp qword ptr ["), "no jump table:\n{}", asm);
+        assert!(asm.contains(".section .rodata"), "table not in .rodata:\n{}", asm);
         let entries = asm.matches(".quad .Lmain__bb").count();
-        assert!(entries >= 32, "nur {} tabelleneintraege", entries);
+        assert!(entries >= 32, "only {} table entries", entries);
         let compare = asm.lines().filter(|l| l.trim().starts_with("cmp ")).count();
-        assert!(compare <= 4, "{} vergleiche statt tabelle:\n{}", compare, asm);
+        assert!(compare <= 4, "{} comparisons instead of table:\n{}", compare, asm);
     }
 
     /// `select` muss ein `cmov` werden — niemals ein Sprung (SPEC §9.2).
@@ -297,7 +297,7 @@ mod tests {
         let body = asm.split("main:").nth(1).unwrap();
         for line in body.lines() {
             let l = line.trim();
-            assert!(!(l.starts_with('j') && !l.starts_with("jmp")), "bedingter Sprung: {}", l);
+            assert!(!(l.starts_with('j') && !l.starts_with("jmp")), "conditional jump: {}", l);
         }
     }
 }

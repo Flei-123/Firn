@@ -92,38 +92,38 @@ struct Options {
 fn usage() -> String {
     let c = config::compiler_name();
     format!(
-        "{name} {ver} — Compiler fuer {lang} (.{ext})\n\
+        "{name} {ver} — compiler for {lang} (.{ext})\n\
          \n\
-         Aufruf: {c} [OPTIONEN] datei.{ext}\n\
+         Usage: {c} [OPTIONS] file.{ext}\n\
          \n\
-         Optionen:\n  \
-         -o <pfad>          Ausgabedatei (Standard: Eingabename ohne Endung)\n  \
-         --package <verz>     Projekt aus <verz>/firn.package uebersetzen\n  \
-         --package-info <verz> Manifest von <verz> lesen und berichten\n  \
-         --emit=exe         ausfuehrbare Datei erzeugen (Standard, ruft as/ld)\n  \
-         --emit=asm         x86_64-Assembler auf die Ausgabe schreiben\n  \
-         --emit=fir         FIR-Textform (nach Optimierung, sofern aktiv)\n  \
-         --emit=fir-raw     FIR direkt nach dem Lowering, ohne Optimierung\n  \
-         --emit=fir-opt     FIR nach dem Optimierer\n  \
-         --emit=comptime    nur den von comptime erzeugten Quelltext\n  \
-         --emit=tokens      Tokenstrom (Fehlersuche)\n  \
-         --emit=ast-kanon   AST in kanonischer, sprachneutraler Form\n  \
-         --emit=layout      Speicherlayout und Aufrufkonvention (kanonisch)\n  \
-         --emit=typen       AST mit dem Typ an jedem Ausdruck (kanonisch)\n  \
-         --emit=ast         AST als Debug-Text (Fehlersuche)\n  \
-         -c, --objekt       nur assemblieren: ELF-Objektdatei, kein ld\n  \
-         --profile=<name>   kernel | app (SPEC 2), erzwingt das Profil\n  \
-         --no-opt           Optimierer abschalten (= --opt-level=dev)\n  \
-         --opt-level=<stufe> dev | dev-fast | release-safe | release-fast\n  \
-                              ('dev-fast' = nur debugerhaltende Durchgaenge)\n  \
-         --no-pass=<name>   einzelnen Optimierungsdurchgang abschalten\n  \
-         --list-passes      Durchgangsregister mit Etiketten ausgeben\n  \
-         --list-attrs       bekannte Attribute und ihren Stand ausgeben\n  \
-         --strlit=<lit>     zeichenkettenliteral entschluesseln (\"..\", b\"..\", u\"..\")\n  \
-         --stats            Groesse der FIR ausgeben (Instruktionen/Bloecke)\n  \
-         --keep-asm         erzeugte .s-Datei behalten\n  \
-         --version          Version ausgeben\n  \
-         -h, --help         diese Hilfe\n",
+         Options:\n  \
+         -o <path>          output file (default: input name without extension)\n  \
+         --package <dir>      compile the project from <dir>/firn.package\n  \
+         --package-info <dir> read the manifest of <dir> and report\n  \
+         --emit=exe         produce an executable (default, calls as/ld)\n  \
+         --emit=asm         write x86_64 assembler to the output\n  \
+         --emit=fir         FIR text form (after optimization, if active)\n  \
+         --emit=fir-raw     FIR right after lowering, without optimization\n  \
+         --emit=fir-opt     FIR after the optimizer\n  \
+         --emit=comptime    only the source text produced by comptime\n  \
+         --emit=tokens      token stream (troubleshooting)\n  \
+         --emit=ast-canon   AST in canonical, language neutral form\n  \
+         --emit=layout      memory layout and calling convention (canonical)\n  \
+         --emit=types       AST with the type at every expression (canonical)\n  \
+         --emit=ast         AST as debug text (troubleshooting)\n  \
+         -c, --object       only assemble: ELF object file, no ld\n  \
+         --profile=<name>   kernel | app (SPEC 2), forces the profile\n  \
+         --no-opt           switch off the optimizer (= --opt-level=dev)\n  \
+         --opt-level=<lvl>  dev | dev-fast | release-safe | release-fast\n  \
+                              (\'dev-fast\' = only debug preserving passes)\n  \
+         --no-pass=<name>   switch off a single optimization pass\n  \
+         --list-passes      print the pass register with its labels\n  \
+         --list-attrs       print the known attributes and their state\n  \
+         --strlit=<lit>     decode a string literal (\"..\", b\"..\", u\"..\")\n  \
+         --stats            print the size of the FIR (instructions/blocks)\n  \
+         --keep-asm         keep the generated .s file\n  \
+         --version          print the version\n  \
+         -h, --help         this help\n",
         name = c,
         c = c,
         ver = config::VERSION,
@@ -176,7 +176,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                     }
                     None => {
                         return Err(format!(
-                            "unbekannte Baustufe '{}' (erlaubt: dev, dev-fast, release-safe, release-fast)",
+                            "unknown build level '{}' (allowed: dev, dev-fast, release-safe, release-fast)",
                             v
                         ))
                     }
@@ -186,7 +186,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                 let v = &a["--no-pass=".len()..];
                 if !opt::OptConfig::is_known(v) {
                     return Err(format!(
-                        "unbekannter Optimierungsdurchgang '{}' — '--list-passes' zeigt alle",
+                        "unknown optimization pass '{}' — '--list-passes' shows all",
                         v
                     ));
                 }
@@ -218,7 +218,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                 i += 1;
                 match args.get(i) {
                     Some(p) => output = Some(PathBuf::from(p)),
-                    None => return Err("-o erwartet einen Pfad".to_string()),
+                    None => return Err("-o expects a path".to_string()),
                 }
             }
             // Runde 48: der Bau-Treiber. Beide Optionen nehmen ihr
@@ -228,14 +228,14 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                 i += 1;
                 match args.get(i) {
                     Some(p) => package = Some(p.clone()),
-                    None => return Err("--package erwartet ein Verzeichnis".to_string()),
+                    None => return Err("--package expects a directory".to_string()),
                 }
             }
             "--package-info" => {
                 i += 1;
                 match args.get(i) {
                     Some(p) => package_info = Some(p.clone()),
-                    None => return Err("--package-info erwartet ein Verzeichnis".to_string()),
+                    None => return Err("--package-info expects a directory".to_string()),
                 }
             }
             _ => {
@@ -252,25 +252,25 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                         "layout" => Emit::LayoutCanon,
                         "types" => Emit::TypesCanon,
                         "ast" => Emit::Ast,
-                        other => return Err(format!("unbekanntes Ausgabeziel '{}'", other)),
+                        other => return Err(format!("unknown output target '{}'", other)),
                     };
                 } else if let Some(p) = a.strip_prefix("-o") {
                     if !p.is_empty() {
                         output = Some(PathBuf::from(p));
                     }
                 } else if a.starts_with('-') {
-                    return Err(format!("unbekannte Option '{}'", a));
+                    return Err(format!("unknown option '{}'", a));
                 } else if input.is_none() {
                     input = Some(PathBuf::from(a));
                 } else {
-                    return Err("mehr als eine Eingabedatei angegeben".to_string());
+                    return Err("more than one input file given".to_string());
                 }
             }
         }
         i += 1;
     }
     if input.is_none() && package.is_none() && package_info.is_none() {
-        return Err(format!("keine Eingabedatei angegeben (.{})", config::FILE_EXT));
+        return Err(format!("no input file given (.{})", config::FILE_EXT));
     }
     Ok(Options {
         input,
@@ -296,7 +296,7 @@ fn main() {
         Ok(o) => o,
         Err(e) => {
             eprintln!("error: {}", e);
-            eprintln!("hinweis: '{} --help' zeigt die Optionen", config::compiler_name());
+            eprintln!("note: '{} --help' shows the options", config::compiler_name());
             std::process::exit(2);
         }
     };
@@ -311,7 +311,7 @@ fn run(opts: &Options) -> i32 {
     // ZEICHENGLEICH schreiben muss und dort keine `--help`-Nachbemerkung
     // hat (Runde 48).
     if opts.package.is_some() && opts.input.is_some() {
-        eprint!("error: --package und eine eingabedatei schliessen einander aus\n");
+        eprint!("error: --package and an input file are mutually exclusive\n");
         return 2;
     }
     // --- `--package-info`: Manifest lesen, pruefen, berichten (Runde 48) ---
@@ -342,7 +342,7 @@ fn run(opts: &Options) -> i32 {
             let m = &w.packages[0].manifest;
             if m.start.is_empty() {
                 eprintln!(
-                    "error: {}: das manifest hat keinen einstiegspunkt ('start <pfad>')",
+                    "error: {}: the manifest has no entry point ('start <path>')",
                     w.packages[0].manifestpfad
                 );
                 return 2;
@@ -355,7 +355,7 @@ fn run(opts: &Options) -> i32 {
             let p = match &opts.input {
                 Some(p) => p.clone(),
                 None => {
-                    eprintln!("error: keine Eingabedatei angegeben (.{})", config::FILE_EXT);
+                    eprintln!("error: no input file given (.{})", config::FILE_EXT);
                     return 2;
                 }
             };
@@ -388,7 +388,7 @@ fn run(opts: &Options) -> i32 {
     let root = match files.first() {
         Some(f) => f,
         None => {
-            eprintln!("error: keine Quelldatei");
+            eprintln!("error: no source file");
             return 2;
         }
     };
@@ -506,7 +506,7 @@ fn run(opts: &Options) -> i32 {
     mono::expand(&mut prog, &mut dg);
     if opts.emit == Emit::Ast && !dg.has_errors() {
         println!("{:#?}", prog);
-        println!("\n// Anweisungsuebersicht (Zeile:Spalte Art)");
+        println!("\n// statement overview (line:column kind)");
         for f in &prog.funcs {
             println!("fn {}:", f.name);
             for s in &f.body.stmts {
@@ -525,7 +525,7 @@ fn run(opts: &Options) -> i32 {
         Some(i) => i,
         None => {
             if !dg.has_errors() {
-                eprintln!("error: interner Fehler im Typpruefer ohne Meldung");
+                eprintln!("error: internal error in the type checker without message");
                 return 1;
             }
             return report(&dg);
@@ -540,7 +540,7 @@ fn run(opts: &Options) -> i32 {
         Some(m) => m,
         None => {
             if !dg.has_errors() {
-                eprintln!("error: interner Fehler beim Lowering ohne Meldung");
+                eprintln!("error: internal error during lowering without message");
                 return 1;
             }
             return report(&dg);
@@ -552,16 +552,16 @@ fn run(opts: &Options) -> i32 {
 
     if opts.stats {
         eprintln!(
-            "profil:     {}{}",
+            "profile:    {}{}",
             prof::name(),
             if core::block_count() > 0 {
-                format!("  ({} asm-bloecke)", core::block_count())
+                format!("  ({} asm blocks)", core::block_count())
             } else {
                 String::new()
             }
         );
         eprintln!(
-            "fir (roh):  {} Funktionen, {} Bloecke, {} Instruktionen",
+            "fir (raw):  {} functions, {} blocks, {} instructions",
             module.funcs.len(),
             module.block_count(),
             module.inst_count()
@@ -578,7 +578,7 @@ fn run(opts: &Options) -> i32 {
         let st = opt::optimize_with(&mut module, &opts.optcfg);
         if std::env::var(format!("{}_OPT_STATS", config::compiler_name().to_uppercase())).is_ok() {
             eprintln!(
-                "opt: {} Konstanten gefaltet, {} Instruktionen entfernt, {} Bloecke entfernt",
+                "opt: {} constants folded, {} instructions removed, {} blocks removed",
                 st.folded, st.removed_insts, st.removed_blocks
             );
         }
@@ -586,7 +586,7 @@ fn run(opts: &Options) -> i32 {
 
     if opts.stats {
         eprintln!(
-            "fir (opt):  {} Funktionen, {} Bloecke, {} Instruktionen",
+            "fir (opt):  {} functions, {} blocks, {} instructions",
             module.funcs.len(),
             module.block_count(),
             module.inst_count()
@@ -614,7 +614,7 @@ fn run(opts: &Options) -> i32 {
         .unwrap_or_else(|| default_output(path));
     if opts.emit == Emit::Asm {
         if let Err(e) = std::fs::write(&out, asm.as_bytes()) {
-            eprintln!("error: kann '{}' nicht schreiben: {}", out.display(), e);
+            eprintln!("error: cannot write '{}': {}", out.display(), e);
             return 2;
         }
         return 0;
@@ -628,7 +628,7 @@ fn run(opts: &Options) -> i32 {
     let object = opts.only_object || prof::is_kernel();
     let asm_path = out.with_extension("s");
     if let Err(e) = std::fs::write(&asm_path, asm.as_bytes()) {
-        eprintln!("error: kann '{}' nicht schreiben: {}", asm_path.display(), e);
+        eprintln!("error: cannot write '{}': {}", asm_path.display(), e);
         return 2;
     }
     if object {
@@ -662,7 +662,7 @@ fn report(dg: &diag::Diags) -> i32 {
     dg.print();
     if dg.is_full() {
         eprintln!(
-            "hinweis: weitere Fehler in '{}' wurden unterdrueckt ({} angezeigt)",
+            "note: further errors in '{}' were suppressed ({} shown)",
             dg.file(),
             dg.count()
         );
@@ -685,11 +685,11 @@ fn assemble(asm: &Path, obj: &Path) -> Result<(), i32> {
     match st {
         Ok(s) if s.success() => Ok(()),
         Ok(s) => {
-            eprintln!("error: 'as' schlug fehl ({})", s);
+            eprintln!("error: 'as' failed ({})", s);
             Err(3)
         }
         Err(e) => {
-            eprintln!("error: 'as' nicht ausfuehrbar: {} (binutils installiert?)", e);
+            eprintln!("error: cannot run 'as': {} (binutils installed?)", e);
             Err(3)
         }
     }
@@ -700,11 +700,11 @@ fn assemble_and_link(asm: &Path, obj: &Path, out: &Path) -> Result<(), i32> {
     match st {
         Ok(s) if s.success() => {}
         Ok(s) => {
-            eprintln!("error: 'as' schlug fehl ({})", s);
+            eprintln!("error: 'as' failed ({})", s);
             return Err(3);
         }
         Err(e) => {
-            eprintln!("error: 'as' nicht ausfuehrbar: {} (binutils installiert?)", e);
+            eprintln!("error: cannot run 'as': {} (binutils installed?)", e);
             return Err(3);
         }
     }
@@ -712,11 +712,11 @@ fn assemble_and_link(asm: &Path, obj: &Path, out: &Path) -> Result<(), i32> {
     match st {
         Ok(s) if s.success() => Ok(()),
         Ok(s) => {
-            eprintln!("error: 'ld' schlug fehl ({})", s);
+            eprintln!("error: 'ld' failed ({})", s);
             Err(3)
         }
         Err(e) => {
-            eprintln!("error: 'ld' nicht ausfuehrbar: {} (binutils installiert?)", e);
+            eprintln!("error: cannot run 'ld': {} (binutils installed?)", e);
             Err(3)
         }
     }

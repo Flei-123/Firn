@@ -49,7 +49,7 @@ impl Lower<'_> {
     ) -> Option<Val> {
         let off = match self.info.tcx.structs.get(sidx).and_then(|s| s.field(fname)) {
             Some(f) => f.offset,
-            None => return self.ice(span, "unbekanntes feld im lowering"),
+            None => return self.ice(span, "unknown field in lowering"),
         };
         Some(self.field_addr_at(base, off))
     }

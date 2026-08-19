@@ -158,7 +158,7 @@ pub fn lex_fstring_literal(src: &[char], pos: usize) -> Option<(Result<String, L
     }
     let used = i - pos;
     if !closed {
-        let e = LitError::new(body.len() + 2, "zeichenkettenliteral ohne abschliessendes \"");
+        let e = LitError::new(body.len() + 2, "string literal without a closing \"");
         return Some((Err(e), used));
     }
     Some((Ok(body.into_iter().collect()), used))
@@ -229,7 +229,7 @@ pub fn lex_string_literal(
         let off = (quote_at - pos) + 1 + body.len();
         return Some((
             kind,
-            Err(LitError::new(off, "zeichenkettenliteral ohne abschliessendes \"")),
+            Err(LitError::new(off, "string literal without a closing \"")),
             used,
         ));
     }
@@ -253,8 +253,8 @@ pub fn decode_literal(kind: LitKind, body: &[char]) -> Result<LitValue, LitError
                         return Err(LitError::new(
                             i - 1,
                             format!(
-                                "zeichen '{}' ist in einem Bytes-literal nicht erlaubt, \
-                                 schreibe die oktette als \\xNN",
+                                "character '{}' is not allowed in a Bytes literal, \
+                                 write the octets as \\xNN",
                                 c
                             ),
                         ));
@@ -271,7 +271,7 @@ pub fn decode_literal(kind: LitKind, body: &[char]) -> Result<LitValue, LitError
         i += 1;
         let e = match body.get(i) {
             Some(&e) => e,
-            None => return Err(LitError::new(start, "maskierung am ende des literals")),
+            None => return Err(LitError::new(start, "escape at the end of the literal")),
         };
         i += 1;
         let simple = match e {
@@ -295,7 +295,7 @@ pub fn decode_literal(kind: LitKind, body: &[char]) -> Result<LitValue, LitError
         match e {
             'x' => {
                 let v = hex_fixed(body, i, 2).ok_or_else(|| {
-                    LitError::new(start, "\\x erwartet genau zwei hexadezimalziffern")
+                    LitError::new(start, "\\x expects exactly two hexadecimal digits")
                 })?;
                 i += 2;
                 match kind {
@@ -304,8 +304,8 @@ pub fn decode_literal(kind: LitKind, body: &[char]) -> Result<LitValue, LitError
                         if v > 0x7F {
                             return Err(LitError::new(
                                 start,
-                                "\\xNN ueber 0x7F ergibt kein gueltiges UTF-8, \
-                                 schreibe \\u{...}",
+                                "\\xNN above 0x7F does not yield valid UTF-8, \
+                                 write \\u{...}",
                             ));
                         }
                         octets.push(v as u8);
@@ -323,25 +323,25 @@ pub fn decode_literal(kind: LitKind, body: &[char]) -> Result<LitValue, LitError
                             break;
                         }
                         let h = d.to_digit(16).ok_or_else(|| {
-                            LitError::new(start, "\\u{...} erwartet hexadezimalziffern")
+                            LitError::new(start, "\\u{...} expects hexadecimal digits")
                         })?;
                         val = val * 16 + h;
                         if val > 0x10FFFF {
                             return Err(LitError::new(
                                 start,
-                                "codepunkt ueber U+10FFFF ist nicht darstellbar",
+                                "code point above U+10FFFF is not representable",
                             ));
                         }
                         n += 1;
                         j += 1;
                     }
                     if n == 0 || body.get(j) != Some(&'}') {
-                        return Err(LitError::new(start, "\\u{...} ist nicht abgeschlossen"));
+                        return Err(LitError::new(start, "\\u{...} is not terminated"));
                     }
                     (val, j + 1 - i)
                 } else {
                     let v = hex_fixed(body, i, 4).ok_or_else(|| {
-                        LitError::new(start, "\\u erwartet genau vier hexadezimalziffern")
+                        LitError::new(start, "\\u expects exactly four hexadecimal digits")
                     })?;
                     (v, 4)
                 };
@@ -350,7 +350,7 @@ pub fn decode_literal(kind: LitKind, body: &[char]) -> Result<LitValue, LitError
                     LitKind::Bytes => {
                         return Err(LitError::new(
                             start,
-                            "\\u ist in einem Bytes-literal nicht erlaubt (Bytes ist kein text)",
+                            "\\u is not allowed in a Bytes literal (Bytes is not text)",
                         ))
                     }
                     LitKind::Str16 => {
@@ -372,8 +372,8 @@ pub fn decode_literal(kind: LitKind, body: &[char]) -> Result<LitValue, LitError
                                 return Err(LitError::new(
                                     start,
                                     format!(
-                                        "ungepaartes surrogat U+{:04X} in einem Str-literal; \
-                                         Str ist geprueftes UTF-8 — benutze u\"...\" (Str16)",
+                                        "unpaired surrogate U+{:04X} in a Str literal; \
+                                         Str is checked UTF-8 — use u\"...\" (Str16)",
                                         cp
                                     ),
                                 ));
@@ -382,8 +382,8 @@ pub fn decode_literal(kind: LitKind, body: &[char]) -> Result<LitValue, LitError
                             return Err(LitError::new(
                                 start,
                                 format!(
-                                    "ungepaartes surrogat U+{:04X} in einem Str-literal; \
-                                     Str ist geprueftes UTF-8 — benutze u\"...\" (Str16)",
+                                    "unpaired surrogate U+{:04X} in a Str literal; \
+                                     Str is checked UTF-8 — use u\"...\" (Str16)",
                                     cp
                                 ),
                             ));
@@ -396,7 +396,7 @@ pub fn decode_literal(kind: LitKind, body: &[char]) -> Result<LitValue, LitError
             other => {
                 return Err(LitError::new(
                     start,
-                    format!("unbekannte maskierung '\\{}'", other),
+                    format!("unknown escape '\\{}'", other),
                 ))
             }
         }
@@ -706,24 +706,24 @@ pub fn strlit_report(lit: &str) -> Result<String, String> {
         Some(t) => t,
         None => {
             return Err(format!(
-                "kein zeichenkettenliteral: erwartet \"...\", b\"...\" oder u\"...\", gefunden {}",
+                "not a string literal: expected \"...\", b\"...\" or u\"...\", found {}",
                 lit
             ))
         }
     };
     let val = match res {
         Ok(v) => v,
-        Err(e) => return Err(format!("spalte {}: {}", e.off + 1, e.msg)),
+        Err(e) => return Err(format!("column {}: {}", e.off + 1, e.msg)),
     };
     let mut out = String::new();
     out.push_str(&format!(
-        "typ       {}\npraefix   {}\"\nzeichen   {}\nelemente  {}\nleer      {}\n\
-         layout    ptr@{} len@{} cap@{} groesse {}\n",
+        "type      {}\nprefix    {}\"\nchars     {}\nelements  {}\nempty     {}\n\
+         layout    ptr@{} len@{} cap@{} size {}\n",
         kind.type_name(),
         kind.prefix(),
         used,
         val.len(),
-        if val.is_empty() { "ja" } else { "nein" },
+        if val.is_empty() { "ja" } else { "no" },
         SLICE_PTR_OFF,
         SLICE_LEN_OFF,
         SLICE_CAP_OFF,
@@ -731,17 +731,17 @@ pub fn strlit_report(lit: &str) -> Result<String, String> {
     ));
     match &val {
         LitValue::Octets(v) => {
-            out.push_str("oktette   ");
+            out.push_str("octets    ");
             out.push_str(&hex_list(v.iter().map(|b| *b as u32), 2));
             out.push('\n');
-            out.push_str(&format!("utf8_ok   {}\n", if is_valid_utf8(v) { "ja" } else { "nein" }));
+            out.push_str(&format!("utf8_ok   {}\n", if is_valid_utf8(v) { "ja" } else { "no" }));
             let units = utf8_to_utf16(v);
-            out.push_str("als_str16 ");
+            out.push_str("as_str16 ");
             out.push_str(&hex_list(units.iter().map(|u| *u as u32), 4));
             out.push('\n');
         }
         LitValue::Units(v) => {
-            out.push_str("einheiten ");
+            out.push_str("units ");
             out.push_str(&hex_list(v.iter().map(|u| *u as u32), 4));
             out.push('\n');
             match to_utf8(v) {
@@ -750,7 +750,7 @@ pub fn strlit_report(lit: &str) -> Result<String, String> {
                     out.push_str(&hex_list(b.iter().map(|x| *x as u32), 2));
                     out.push('\n');
                 }
-                None => out.push_str("to_utf8   nichts (ungepaartes surrogat)\n"),
+                None => out.push_str("to_utf8   nothing (unpaired surrogate)\n"),
             }
             let lossy = to_utf8_lossy(v);
             out.push_str("to_lossy  ");
@@ -775,10 +775,10 @@ pub fn strlit_report(lit: &str) -> Result<String, String> {
     let id = atoms.intern(&key);
     let back = atoms.text(id).map(|t| t.to_vec()).unwrap_or_default();
     out.push_str(&format!(
-        "atom      {} (tabelle {} eintraege, leer {}, wtf8 {})\n",
+        "atom      {} (table {} entries, empty {}, wtf8 {})\n",
         id,
         atoms.len(),
-        if atoms.is_empty() { "ja" } else { "nein" },
+        if atoms.is_empty() { "ja" } else { "no" },
         hex_list(back.iter().map(|b| *b as u32), 2)
     ));
     out.push_str(&format!("asm\n{}", val.asm_data()));
@@ -788,7 +788,7 @@ pub fn strlit_report(lit: &str) -> Result<String, String> {
 fn hex_list(it: impl Iterator<Item = u32>, w: usize) -> String {
     let v: Vec<String> = it.map(|x| format!("{:01$X}", x, w)).collect();
     if v.is_empty() {
-        "(leer)".to_string()
+        "(empty)".to_string()
     } else {
         v.join(" ")
     }
@@ -804,7 +804,7 @@ mod tests {
 
     fn dec(kind: LitKind, s: &str) -> LitValue {
         let body: Vec<char> = s.chars().collect();
-        decode_literal(kind, &body).expect("literal sollte gueltig sein")
+        decode_literal(kind, &body).expect("literal should be valid")
     }
     fn err(kind: LitKind, s: &str) -> String {
         let body: Vec<char> = s.chars().collect();
@@ -826,8 +826,8 @@ mod tests {
 
     #[test]
     fn str_rejects_unpaired_surrogate_ab() {
-        assert!(err(LitKind::Str, "\\uD800").contains("ungepaartes surrogat U+D800"));
-        assert!(err(LitKind::Str, "\\uDC00x").contains("ungepaartes surrogat U+DC00"));
+        assert!(err(LitKind::Str, "\\uD800").contains("unpaired surrogate U+D800"));
+        assert!(err(LitKind::Str, "\\uDC00x").contains("unpaired surrogate U+DC00"));
     }
 
     #[test]
@@ -838,9 +838,9 @@ mod tests {
             LitValue::Units(u) => u,
             LitValue::Octets(_) => Vec::new(), // Str16 liefert immer Einheiten
         };
-        assert!(!u.is_empty(), "Str16 muss Einheiten liefern");
-        assert_eq!(to_utf8(&u), None, "to_utf8 muss scheitern");
-        assert_eq!(to_utf8_lossy(&u), vec![0x61, 0xEF, 0xBF, 0xBD, 0x62], "U+FFFD erwartet");
+        assert!(!u.is_empty(), "Str16 must yield units");
+        assert_eq!(to_utf8(&u), None, "to_utf8 must fail");
+        assert_eq!(to_utf8_lossy(&u), vec![0x61, 0xEF, 0xBF, 0xBD, 0x62], "U+FFFD expected");
         // WTF-8 ist verlustfrei
         assert_eq!(from_wtf8(&to_wtf8(&u)), u);
     }
@@ -857,31 +857,31 @@ mod tests {
     #[test]
     fn bytes_is_no_text() {
         assert_eq!(dec(LitKind::Bytes, "AB\\xff"), LitValue::Octets(vec![65, 66, 255]));
-        assert!(err(LitKind::Bytes, "\\u0041").contains("Bytes ist kein text"));
-        assert!(err(LitKind::Bytes, "ä").contains("nicht erlaubt"));
+        assert!(err(LitKind::Bytes, "\\u0041").contains("Bytes is not text"));
+        assert!(err(LitKind::Bytes, "ä").contains("not allowed"));
     }
 
     #[test]
     fn maskings() {
         assert_eq!(dec(LitKind::Str, "\\n\\r\\t\\0\\\\\\\""), LitValue::Octets(vec![10, 13, 9, 0, 92, 34]));
-        assert!(err(LitKind::Str, "\\q").contains("unbekannte maskierung"));
-        assert!(err(LitKind::Str, "\\u12").contains("vier hexadezimalziffern"));
-        assert!(err(LitKind::Str, "\\u{").contains("nicht abgeschlossen"));
+        assert!(err(LitKind::Str, "\\q").contains("unknown escape"));
+        assert!(err(LitKind::Str, "\\u12").contains("four hexadecimal digits"));
+        assert!(err(LitKind::Str, "\\u{").contains("not terminated"));
         assert!(err(LitKind::Str, "\\u{110000}").contains("U+10FFFF"));
-        assert!(err(LitKind::Str, "\\xff").contains("kein gueltiges UTF-8"));
+        assert!(err(LitKind::Str, "\\xff").contains("does not yield valid UTF-8"));
     }
 
     #[test]
     fn lexer_hook() {
         let src: Vec<char> = r#"u"a\uD800" rest"#.chars().collect();
-        let (kind, res, used) = lex_string_literal(&src, 0).expect("literal erwartet");
+        let (kind, res, used) = lex_string_literal(&src, 0).expect("literal expected");
         assert_eq!(kind, LitKind::Str16);
         assert_eq!(used, 10);
         assert_eq!(res.unwrap(), LitValue::Units(vec![0x61, 0xD800]));
 
         let src: Vec<char> = r#""abc"#.chars().collect();
-        let (_, res, _) = lex_string_literal(&src, 0).expect("literal erwartet");
-        assert!(res.unwrap_err().msg.contains("ohne abschliessendes"));
+        let (_, res, _) = lex_string_literal(&src, 0).expect("literal expected");
+        assert!(res.unwrap_err().msg.contains("without a closing"));
 
         assert!(lex_string_literal(&"abc".chars().collect::<Vec<_>>(), 0).is_none());
         // Spalte des Fehlers zeigt auf die Maskierung im Quelltext.
@@ -903,7 +903,7 @@ mod tests {
         let mut t = AtomTable::new();
         let div = t.intern(b"div");
         assert_eq!(div, t.intern(b"div"));
-        assert!(div < 64, "haeufige atome haben kleine nummern");
+        assert!(div < 64, "frequent atoms have small numbers");
         assert_ne!(div, t.intern(b"span"));
         let new = t.intern(b"karstos");
         assert_eq!(t.text(new), Some(&b"karstos"[..]));
@@ -919,7 +919,7 @@ mod tests {
     fn report_shows_surrogate() {
         let r = strlit_report(r#"u"\uD800""#).unwrap();
         assert!(r.contains("D800"), "{}", r);
-        assert!(r.contains("to_utf8   nichts"), "{}", r);
+        assert!(r.contains("to_utf8   nothing"), "{}", r);
         assert!(r.contains("EF BF BD"), "{}", r);
         assert!(r.contains("wtf8_rt   bitgleich"), "{}", r);
         assert!(strlit_report("42").is_err());

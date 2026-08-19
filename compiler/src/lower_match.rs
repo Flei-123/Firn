@@ -71,26 +71,26 @@ pub(crate) fn write_ctor_into(
     let t = lo.ty_of(e);
     let sidx = match &t {
         Type::Struct(i) => *i,
-        _ => return lo.ice(e.span, "aufzaehlungskonstruktor ohne aufzaehlungstyp"),
+        _ => return lo.ice(e.span, "enum constructor without enum type"),
     };
     let def = match enum_by_struct(sidx) {
         Some(d) => d,
-        None => return lo.ice(e.span, "aufzaehlungskonstruktor ohne aufzaehlung"),
+        None => return lo.ice(e.span, "enum constructor without enum"),
     };
     let vname = match name.split_once("::") {
         Some((_, v)) => v.to_string(),
-        None => return lo.ice(e.span, "aufzaehlungskonstruktor ohne variantennamen"),
+        None => return lo.ice(e.span, "enum constructor without variant name"),
     };
     let v = match def.variant(&vname) {
         Some(v) => v.clone(),
-        None => return lo.ice(e.span, "unbekannte variante im lowering"),
+        None => return lo.ice(e.span, "unknown variant in lowering"),
     };
     let tag = lo.constant(FTy::U32, v.tag);
     lo.store(FTy::U32, addr, tag);
     for (i, a) in args.iter().enumerate() {
         let off = match v.offsets.get(i) {
             Some(o) => *o,
-            None => return lo.ice(a.span, "nutzdatenfeld ohne offset"),
+            None => return lo.ice(a.span, "payload field without offset"),
         };
         // Schicht Feldzugriff <-> Speicherort (layout.rs, DESIGNZIELE 8)
         let ad = lo.field_addr_at(addr, off);
@@ -157,7 +157,7 @@ fn plan_arm(pat: &Pattern, subject_enum: Option<&EnumDef>) -> ArmPlan {
 fn lower_match(lo: &mut Lower, idx: usize, span: Span) -> Option<()> {
     let mi: MatchInfo = match match_info(idx) {
         Some(m) => m,
-        None => return lo.ice(span, "unbekannter musterabgleich"),
+        None => return lo.ice(span, "unknown pattern match"),
     };
     let sty = lo.ty_of(&mi.subject);
     let def = match &sty {
@@ -175,7 +175,7 @@ fn lower_match(lo: &mut Lower, idx: usize, span: Span) -> Option<()> {
         None => {
             let ft = match scalar_fty(&sty) {
                 Some(f) if f != FTy::Ptr => f,
-                _ => return lo.ice(mi.subject.span, "'match' auf einem nicht unterstuetzten typ"),
+                _ => return lo.ice(mi.subject.span, "'match' on an unsupported type"),
             };
             let v = lo.lower_expr(&mi.subject)?;
             let (size, align) = lo.size_align(&sty);
@@ -331,11 +331,11 @@ fn emit_tests(
         Pattern::Variant { vname, subs, span, .. } => {
             let d = match def {
                 Some(d) => d.clone(),
-                None => return lo.ice(*span, "variantenmuster ohne aufzaehlung"),
+                None => return lo.ice(*span, "variant pattern without enum"),
             };
             let v = match d.variant(vname) {
                 Some(v) => v.clone(),
-                None => return lo.ice(*span, "unbekannte variante im lowering"),
+                None => return lo.ice(*span, "unknown variant in lowering"),
             };
             let _ = ty;
             for (i, sub) in subs.iter().enumerate() {
@@ -344,11 +344,11 @@ fn emit_tests(
                 }
                 let off = match v.offsets.get(i) {
                     Some(o) => *o,
-                    None => return lo.ice(*span, "nutzdatenfeld ohne offset"),
+                    None => return lo.ice(*span, "payload field without offset"),
                 };
                 let fty = match v.fields.get(i) {
                     Some(t) => t.clone(),
-                    None => return lo.ice(*span, "nutzdatenfeld ohne typ"),
+                    None => return lo.ice(*span, "payload field without type"),
                 };
                 // Schicht Feldzugriff <-> Speicherort (layout.rs)
                 let addr = lo.field_addr_at(base_addr, off);
@@ -371,7 +371,7 @@ fn emit_sub_test(
         Pattern::Int(v, span) => {
             let ft = match scalar_fty(ty) {
                 Some(f) => f,
-                None => return lo.ice(*span, "zahlenmuster auf nicht skalarem feld"),
+                None => return lo.ice(*span, "number pattern on a non-scalar field"),
             };
             let a = lo.load(ft, addr);
             let b = lo.constant(ft, *v);
@@ -393,7 +393,7 @@ fn emit_sub_test(
         Pattern::Range { lo: rlo, hi, inclusive, span } => {
             let ft = match scalar_fty(ty) {
                 Some(f) => f,
-                None => return lo.ice(*span, "bereichsmuster auf nicht skalarem feld"),
+                None => return lo.ice(*span, "range pattern on a non-scalar field"),
             };
             let last = if *inclusive { *hi } else { *hi - 1 };
             let a = lo.load(ft, addr);
@@ -412,15 +412,15 @@ fn emit_sub_test(
         Pattern::Variant { vname, subs, span, .. } => {
             let sidx = match ty {
                 Type::Struct(i) => *i,
-                _ => return lo.ice(*span, "variantenmuster auf nicht-aufzaehlung"),
+                _ => return lo.ice(*span, "variant pattern on a non-enum"),
             };
             let d = match enum_by_struct(sidx) {
                 Some(d) => d,
-                None => return lo.ice(*span, "variantenmuster auf nicht-aufzaehlung"),
+                None => return lo.ice(*span, "variant pattern on a non-enum"),
             };
             let v = match d.variant(vname) {
                 Some(v) => v.clone(),
-                None => return lo.ice(*span, "unbekannte variante im lowering"),
+                None => return lo.ice(*span, "unknown variant in lowering"),
             };
             let a = lo.load(FTy::U32, addr);
             let b = lo.constant(FTy::U32, v.tag);
@@ -434,11 +434,11 @@ fn emit_sub_test(
                 }
                 let off = match v.offsets.get(i) {
                     Some(o) => *o,
-                    None => return lo.ice(*span, "nutzdatenfeld ohne offset"),
+                    None => return lo.ice(*span, "payload field without offset"),
                 };
                 let ft = match v.fields.get(i) {
                     Some(t) => t.clone(),
-                    None => return lo.ice(*span, "nutzdatenfeld ohne typ"),
+                    None => return lo.ice(*span, "payload field without type"),
                 };
                 // Schicht Feldzugriff <-> Speicherort (layout.rs)
                 let sa = lo.field_addr_at(addr, off);

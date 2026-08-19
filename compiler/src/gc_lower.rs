@@ -50,7 +50,7 @@ pub(crate) fn hook_call(
         };
         let d = match dest {
             Some(d) => d,
-            None => return Some(lo.ice(span, "gc-allokation ohne ziel")),
+            None => return Some(lo.ice(span, "gc allocation without target")),
         };
         let class = class.to_string();
         return Some(match alloc_and_init(lo, d, &class, &fields, span) {
@@ -84,16 +84,16 @@ fn alloc_and_init(
 ) -> Option<()> {
     let (tid, size, sidx) = match gc::class_info(class) {
         Some(x) => x,
-        None => return lo.ice(span, "gc-allokation ohne klasse"),
+        None => return lo.ice(span, "gc allocation without class"),
     };
     // Lage von `__err`/`__val` in der Fehlerunion.
     let union = match gc::union_idx(class).and_then(crate::errors::union_by_struct) {
         Some(u) => u,
-        None => return lo.ice(span, "gc-allokation ohne fehlerunion"),
+        None => return lo.ice(span, "gc allocation without error union"),
     };
     let code = match crate::errors::variant_code(gc::ERR_SET, "OutOfMemory") {
         Some(c) => c,
-        None => return lo.ice(span, "AllocError::OutOfMemory fehlt"),
+        None => return lo.ice(span, "AllocError::OutOfMemory is missing"),
     };
 
     let tidv = lo.constant(FTy::U64, tid as i128);
@@ -132,7 +132,7 @@ fn alloc_and_init(
     for (fname, fexpr, fspan) in fields {
         let off = match decl.iter().find(|(n, _)| n == fname) {
             Some((_, o)) => *o,
-            None => return lo.ice(*fspan, "unbekanntes feld in der gc-allokation"),
+            None => return lo.ice(*fspan, "unknown field in the gc allocation"),
         };
         let fa = lo.ptradd_const(p, off);
         lo.write_into(fa, fexpr)?;

@@ -53,7 +53,7 @@ fn ty_of(id: ExprId) -> Option<String> {
 
 pub fn render(p: &Program) -> String {
     let mut o = String::new();
-    o.push_str("(programm\n");
+    o.push_str("(program\n");
     if let Some((n, _)) = &p.profile {
         o.push_str(&format!("  (profile {})\n", n));
     }
@@ -69,7 +69,7 @@ pub fn render(p: &Program) -> String {
     for s in &p.structs {
         let mut f = String::new();
         for (n, t, _) in &s.fields {
-            f.push_str(&format!(" (feld {} {})", n, ty(t)));
+            f.push_str(&format!(" (field {} {})", n, ty(t)));
         }
         o.push_str(&format!("  (struct {}{})\n", s.name, f));
     }
@@ -92,7 +92,7 @@ fn ty(t: &TypeExpr) -> String {
     match t {
         TypeExpr::Named(n, _) => n.clone(),
         TypeExpr::Ptr { mutable, inner, .. } => {
-            format!("(ptr {} {})", if *mutable { "mut" } else { "konst" }, ty(inner))
+            format!("(ptr {} {})", if *mutable { "mut" } else { "const" }, ty(inner))
         }
         TypeExpr::Array { elem, len, .. } => format!("(arr {} {})", len, ty(elem)),
     }
@@ -149,7 +149,7 @@ fn st(s: &Stmt) -> String {
         ),
         Stmt::Expr(e) => format!("(expr {})", ex(e)),
         Stmt::Block(b) => format!("(block {})", blk(b)),
-        Stmt::Error(_) => "(fehler)".to_string(),
+        Stmt::Error(_) => "(error)".to_string(),
     }
 }
 
@@ -182,10 +182,10 @@ fn ex_core(e: &Expr) -> String {
             ex(a)
         ),
         ExprKind::Binary(op, a, b) => format!("(bin {} {} {})", op.text(), ex(a), ex(b)),
-        ExprKind::Field(b, n, _) => format!("(feld {} {})", ex(b), n),
+        ExprKind::Field(b, n, _) => format!("(field {} {})", ex(b), n),
         ExprKind::Index(b, i) => format!("(idx {} {})", ex(b), ex(i)),
         ExprKind::Call(n, args, _) => {
-            let mut o = format!("(ruf {}", n);
+            let mut o = format!("(call {}", n);
             for a in args {
                 o.push(' ');
                 o.push_str(&ex(a));

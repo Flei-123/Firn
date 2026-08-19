@@ -217,18 +217,18 @@ fn str_lit(p: &mut Parser, whatfor: &str) -> Option<(String, Span)> {
             match String::from_utf8(v) {
                 Ok(s) => Some((s, sp)),
                 Err(_) => {
-                    p.error_here(format!("{} muss gueltiges UTF-8 sein", whatfor));
+                    p.error_here(format!("{} must be valid UTF-8", whatfor));
                     None
                 }
             }
         }
         TokKind::Str(_, LitValue::Units(_)) => {
-            p.error_here(format!("{} darf kein u\"…\"-literal sein", whatfor));
+            p.error_here(format!("{} must not be a u\"…\" literal", whatfor));
             None
         }
         _ => {
             p.error_here(format!(
-                "erwartet ein zeichenkettenliteral {}, gefunden '{}'",
+                "expected a string literal {}, found '{}'",
                 whatfor,
                 p.kind().text()
             ));
@@ -254,7 +254,7 @@ pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
     }
     let start = p.bump(); // 'asm'
     p.bump(); // '('
-    let (template, vspan) = str_lit(p, "als vorlage von 'asm'")?;
+    let (template, vspan) = str_lit(p, "as template of 'asm'")?;
 
     let mut out: Option<String> = None;
     let mut in_regs: Vec<String> = Vec::new();
@@ -283,20 +283,20 @@ pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
             }
             other => {
                 p.error_here(format!(
-                    "erwartet 'in', 'out' oder 'clobber' in einem asm-block, gefunden '{}'",
+                    "expected 'in', 'out' or 'clobber' in an asm block, found '{}'",
                     other.text()
                 ));
                 break;
             }
         };
-        if !p.expect(TokKind::LParen, "nach dem operandenwort eines asm-blocks") {
+        if !p.expect(TokKind::LParen, "after the operand word of an asm block") {
             break;
         }
-        let (reg, rspan) = match str_lit(p, "als registername in einem asm-block") {
+        let (reg, rspan) = match str_lit(p, "as register name in an asm block") {
             Some(x) => x,
             None => break,
         };
-        if !p.close(TokKind::RParen, "nach dem registernamen eines asm-blocks") {
+        if !p.close(TokKind::RParen, "after the register name of an asm block") {
             break;
         }
         match kind {
@@ -308,7 +308,7 @@ pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
                 if out.is_some() {
                     p.dg.error(
                         rspan,
-                        "ein asm-block hat hoechstens ein 'out'-register".to_string(),
+                        "an asm block has at most one 'out' register".to_string(),
                     );
                 }
                 out = Some(reg);
@@ -320,7 +320,7 @@ pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
         }
     }
     let end = p.span();
-    p.close(TokKind::RParen, "nach den operanden des asm-blocks");
+    p.close(TokKind::RParen, "after the operands of the asm block");
     let span = Parser::join(start, end);
     let nr = register(AsmBlock {
         template,
@@ -345,18 +345,18 @@ fn check_reg(ck: &mut Checker, reg: &str, span: Span, wo: &str) -> bool {
     if GESPERRT.contains(&reg) {
         ck.dg.error_note(
             span,
-            format!("register '{}' ist im asm-block nicht erlaubt ({})", reg, wo),
-            "erlaubt sind nur die caller-saved register rax rcx rdx rsi rdi r8..r11 \
-             (samt ihren schmalen namen); rbx, rbp, rsp und r12-r15 tragen den rahmen \
-             bzw. sind callee-saved",
+            format!("register '{}' is not allowed in the asm block ({})", reg, wo),
+            "allowed are only the caller-saved registers rax rcx rdx rsi rdi r8..r11 \
+             (including their narrow names); rbx, rbp, rsp and r12-r15 carry the frame \
+             or are callee-saved",
         );
         return false;
     }
     ck.dg.error_note(
         span,
-        format!("unbekannter registername '{}' im asm-block ({})", reg, wo),
-        "erlaubt sind rax rcx rdx rsi rdi r8..r11 samt schmalen namen \
-         (eax/ax/al, r8d/r8w/r8b, …); in der clobber-liste zusaetzlich 'memory'",
+        format!("unknown register name '{}' in the asm block ({})", reg, wo),
+        "allowed are rax rcx rdx rsi rdi r8..r11 including narrow names \
+         (eax/ax/al, r8d/r8w/r8b, …); in the clobber list additionally 'memory'",
     );
     false
 }
@@ -389,7 +389,7 @@ fn check_asm(ck: &mut Checker, nr: usize, args: &[Expr], espan: Span) -> Type {
         Some(b) => b,
         None => {
             ck.dg
-                .error(espan, "interner fehler: unbekannter asm-block".to_string());
+                .error(espan, "internal error: unknown asm block".to_string());
             return Type::Error;
         }
     };
@@ -419,11 +419,11 @@ fn check_asm(ck: &mut Checker, nr: usize, args: &[Expr], espan: Span) -> Type {
             ck.dg.error_note(
                 a.span,
                 format!(
-                    "der eingabeoperand fuer '{}' hat den typ {}, das passt in kein register",
+                    "the input operand for '{}' has type {}, that does not fit into a register",
                     reg,
                     ck.tcx.name_of(&t)
                 ),
-                "erlaubt sind ganzzahl-, bool- und zeigertypen",
+                "allowed are integer, bool and pointer types",
             );
             good = false;
         }
@@ -452,11 +452,11 @@ fn check_mmio_read(
         ck.dg.error_note(
             nspan,
             format!(
-                "'{}' erwartet genau ein argument (die adresse), gefunden {}",
+                "'{}' expects exactly one argument (the address), found {}",
                 name,
                 args.len()
             ),
-            "die form ist __mmio_read<breite>(p: *mut T) -> T",
+            "the form is __mmio_read<width>(p: *mut T) -> T",
         );
         return Type::Error;
     }
@@ -466,7 +466,7 @@ fn check_mmio_read(
         ck.dg.error(
             args[0].span,
             format!(
-                "'{}' erwartet einen zeiger, gefunden {}",
+                "'{}' expects a pointer, found {}",
                 name,
                 ck.tcx.name_of(&pt)
             ),
@@ -490,11 +490,11 @@ fn check_mmio_write(
         ck.dg.error_note(
             nspan,
             format!(
-                "'{}' erwartet genau zwei argumente (adresse, wert), gefunden {}",
+                "'{}' expects exactly two arguments (address, value), found {}",
                 name,
                 args.len()
             ),
-            "die form ist __mmio_write<breite>(p: *mut T, wert: T)",
+            "the form is __mmio_write<width>(p: *mut T, value: T)",
         );
         return Type::Error;
     }
@@ -504,7 +504,7 @@ fn check_mmio_write(
         ck.dg.error(
             args[0].span,
             format!(
-                "'{}' erwartet als erstes argument einen zeiger, gefunden {}",
+                "'{}' expects a pointer as first argument, found {}",
                 name,
                 ck.tcx.name_of(&pt)
             ),
@@ -516,7 +516,7 @@ fn check_mmio_write(
         ck.dg.error(
             args[1].span,
             format!(
-                "'{}' schreibt {}, gefunden {}",
+                "'{}' writes {}, found {}",
                 name,
                 ck.tcx.name_of(&zt),
                 ck.tcx.name_of(&wt)
@@ -545,7 +545,7 @@ pub(crate) fn lower_hook(
     }
     if let Some(w) = mmio_width(name, false) {
         if args.len() != 1 {
-            return Some(lw.ice(span, "mmio-lesen mit falscher stellenzahl"));
+            return Some(lw.ice(span, "mmio read with wrong arity"));
         }
         let a = match lw.lower_expr(&args[0]) {
             Some(v) => v,
@@ -555,7 +555,7 @@ pub(crate) fn lower_hook(
     }
     if let Some(w) = mmio_width(name, true) {
         if args.len() != 2 {
-            return Some(lw.ice(span, "mmio-schreiben mit falscher stellenzahl"));
+            return Some(lw.ice(span, "mmio write with wrong arity"));
         }
         let (a, v) = match (lw.lower_expr(&args[0]), lw.lower_expr(&args[1])) {
             (Some(a), Some(v)) => (a, v),
@@ -575,7 +575,7 @@ fn lower_asm(
 ) -> Option<Option<Val>> {
     let b = match block_at(nr) {
         Some(b) => b,
-        None => return lw.ice(span, "unbekannter asm-block im lowering"),
+        None => return lw.ice(span, "unknown asm block in lowering"),
     };
     // Eingabewerte in Quellreihenfolge auswerten, danach auf 64 Bit bringen:
     // in ein Register geht immer das ganze Wort.
@@ -626,33 +626,33 @@ pub(crate) fn check_interrupts(ck: &mut Checker, prog: &crate::ast::Program) {
             ck.dg.error_note(
                 f.span,
                 format!(
-                    "'{}' ist mit #[interrupt] gekennzeichnet, das gibt es nur im profil 'kernel'",
+                    "'{}' is marked with #[interrupt], which exists only in profile 'kernel'",
                     f.name
                 ),
-                "schreibe 'profile kernel' in die erste zeile oder uebersetze mit --profile=kernel",
+                "write 'profile kernel' in the first line or compile with --profile=kernel",
             );
         }
         if !f.params.is_empty() {
             ck.dg.error_note(
                 f.span,
                 format!(
-                    "eine #[interrupt]-funktion hat keine parameter, '{}' hat {}",
+                    "an #[interrupt] function has no parameters, '{}' has {}",
                     f.name,
                     f.params.len()
                 ),
-                "der prozessor legt den unterbrechungsrahmen selbst auf den stapel; \
-                 es gibt keine argumente",
+                "the processor puts the interrupt frame on the stack itself; \
+                 there are no arguments",
             );
         }
         if f.ret.is_some() {
             ck.dg.error_note(
                 f.span,
                 format!(
-                    "eine #[interrupt]-funktion liefert keinen wert, '{}' hat einen rueckgabetyp",
+                    "an #[interrupt] function yields no value, '{}' has a return type",
                     f.name
                 ),
-                "sie endet mit 'iretq', nicht mit 'ret' — es gibt niemanden, der einen \
-                 wert entgegennehmen koennte",
+                "it ends with 'iretq', not with 'ret' — there is nobody who could \
+                 accept a value",
             );
         }
     }
@@ -714,9 +714,9 @@ fn visit_expr(ck: &mut Checker, e: &Expr, names: &[String]) {
             if names.iter().any(|x| x == n) {
                 ck.dg.error_note(
                     *nspan,
-                    format!("'{}' ist ein interrupt-einsprungpunkt und kann nicht aufgerufen werden", n),
-                    "sie endet mit 'iretq' und erwartet den unterbrechungsrahmen des \
-                     prozessors auf dem stapel; nur die IDT darf auf sie zeigen",
+                    format!("'{}' is an interrupt entry point and cannot be called", n),
+                    "it ends with 'iretq' and expects the interrupt frame of the \
+                     processor on the stack; only the IDT may point to it",
                 );
             }
             for a in args {
@@ -762,7 +762,7 @@ mod tests {
     fn build(src: &str) -> (String, String) {
         reset();
         crate::prof::reset();
-        let mut dg = crate::diag::Diags::new("kern_test", src);
+        let mut dg = crate::diag::Diags::new("core_test", src);
         let toks = crate::lexer::lex(src, &mut dg);
         let mut prog = crate::parser::parse(&toks, &mut dg);
         crate::mono::expand(&mut prog, &mut dg);
@@ -786,7 +786,7 @@ mod tests {
         let (asm, _) = build(
             "profile kernel\nfn f() { let _x: u64 = asm(\"rdtsc\", out(\"rax\"), clobber(\"rdx\")) }\n",
         );
-        assert!(asm.contains("rdtsc"), "asm-block verschwunden:\n{}", asm);
+        assert!(asm.contains("rdtsc"), "asm block vanished:\n{}", asm);
     }
 
     #[test]
@@ -794,7 +794,7 @@ mod tests {
         let (asm, _) = build(
             "profile kernel\nfn f() { asm(\"cli\")\n asm(\"cli\") }\n",
         );
-        assert_eq!(asm.matches("cli").count(), 2, "CSE hat zugeschlagen:\n{}", asm);
+        assert_eq!(asm.matches("cli").count(), 2, "CSE struck:\n{}", asm);
     }
 
     #[test]
@@ -805,7 +805,7 @@ mod tests {
         assert_eq!(
             asm.matches("dword ptr [rcx]").count(),
             2,
-            "zwei MMIO-Lasten wurden zu einer:\n{}",
+            "two MMIO loads became one:\n{}",
             asm
         );
     }
@@ -822,7 +822,7 @@ mod tests {
         let (_, err) = build(
             "profile kernel\n#[interrupt]\nfn ih() { asm(\"nop\") }\nfn f() { ih() }\n",
         );
-        assert!(err.contains("interrupt-einsprungpunkt"), "{}", err);
+        assert!(err.contains("interrupt entry point"), "{}", err);
     }
 
     #[test]

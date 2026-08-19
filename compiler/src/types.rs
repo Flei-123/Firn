@@ -218,9 +218,9 @@ impl TypeCtx {
                 .get(*i)
                 .map(|s| s.name.clone())
                 .unwrap_or_else(|| "<struct>".into()),
-            Type::UntypedInt => "{ganzzahl}".into(),
+            Type::UntypedInt => "{integer}".into(),
             Type::Void => "()".into(),
-            Type::Error => "<fehler>".into(),
+            Type::Error => "<error>".into(),
         }
     }
 }
