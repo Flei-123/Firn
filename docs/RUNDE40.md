@@ -212,3 +212,46 @@ Punkt des GC — vor Finalisierern und `Arc[T]`.
 werden kann (unbegrenzte Arbeitsmenge je Scheibe? Nachmarkierung am
 Zyklusende?), und die Scheibengröße an ein echtes Zeitbudget koppeln statt an
 eine Objektzahl.
+
+## Nachtrag (Runde 41, Vorarbeit) — die 19 ms waren nicht der Sammler
+
+Die Diagnose des GC war unvollständig: der **volle Stop-the-World-Lauf**
+(`__gc_collect_now`) buchte seine Dauer nur in `S_PAUSE_MAX`, aber in **keine**
+Scheibenklasse. Dadurch war das globale Maximum (11,8 ms) größer als jedes
+Typmaximum (3,6 ms) und niemand konnte sehen, woher es kam. Behoben: der
+volle Lauf ist jetzt **Typ 4**, dazu ein Zähler `gc_volle_laeufe()`.
+
+Damit gemessen (`pause_gross.fi`, 120 000 lebende Knoten, 13 MiB Heap):
+
+| Lauf | Sammelläufe | davon volle | längste Scheibe (Typ 0–3) | Typ 4 |
+|---|---|---|---|---|
+| 30 s | 434 | 3 | 1,89 ms | 11,23 ms |
+| 120 s | ~1600 | **3** | 3,39 ms | 11,93 ms |
+| 600 s (ruhig) | 7 967 | **3** | 3,12 ms | 11,67 ms |
+
+**Es bleiben immer genau drei volle Läufe** — alle in der Aufbauphase, solange
+der Heap noch unter `INKR_AB` (8 MiB) liegt. Im Dauerbetrieb läuft
+**ausschließlich** der inkrementelle Pfad. Der Markstapel läuft nie über
+(`ueberlaeufe = 0`), das teure Nachtragen kommt also gar nicht vor.
+
+Pausen im ruhigen 10-Minuten-Lauf (längste Scheibe je Zyklus):
+
+| Klasse | Anzahl | kumuliert |
+|---|---|---|
+| ≤ 500 µs | 3 356 | 42,1 % |
+| ≤ 1 ms | 4 484 | **98,4 %** |
+| ≤ 2 ms | 98 | 99,7 % |
+| ≤ 4 ms | 26 | 100 % |
+| > 4 ms | 0 | — |
+
+**Korrektur zum Abschnitt B2:** die dort berichteten 19,34 ms und die 0,15 %
+über 4 ms stammen aus einem Lauf, der **gleichzeitig mit `test.sh` und
+callgrind** auf derselben Maschine lief. Ohne Fremdlast liegt nichts über
+4 ms. Lehre: Pausenmessungen nur auf einer ruhigen Maschine, und Fremdlast
+im Protokoll vermerken.
+
+**Nicht belegt:** kleinere Markierscheiben (`SCHEIBE_TRACE` 512 → 128) zeigten
+keinen sauberen Gewinn (Typ-1-Maximum 1,07 ms → 1,87 ms — im Rauschen der
+Einzelmaxima). Zurückgesetzt auf 512. Vorher fehlt das Werkzeug: ein
+Histogramm der **einzelnen Scheiben** statt nur der längsten Scheibe je
+Zyklus. Das ist die erste Aufgabe der Runde 41.
