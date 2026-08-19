@@ -633,7 +633,7 @@ fn fmt_inst(i: &Inst) -> String {
         Op::ThreadSpawn { arg, stack, ctid } => {
             format!("spawn.{} %{}, %{}, %{}", t, arg, stack, ctid)
         }
-        Op::ThreadSelf => format!("fadenselbst.{}", t),
+        Op::ThreadSelf => format!("threadself.{}", t),
         Op::GcAddr { regs } => {
             if *regs {
                 "gc_state.ptr regs=1".to_string()

@@ -1026,7 +1026,7 @@ Code nicht auseinanderlaufen.
    `#[allow_fp]` — und erzeugt eine freistehende **ELF-Objektdatei** (`-c`,
    kein `ld`, kein `_start`, kein libc-Kontakt). Dazu kamen Inline-Assembler
    (`asm("…", in("dx") p, out("rax"), clobber("memory"))`), MMIO
-   (`__mmio_lesen/schreiben8|16|32|64`) und Interrupt-Einsprungpunkte
+   (`__mmio_read/schreiben8|16|32|64`) und Interrupt-Einsprungpunkte
    (`#[interrupt]`, rettet 14 Register und schließt mit `iretq`). Nachweis:
    `demos/kernel/core.fi` bootet in QEMU, mit **beiden** Compilern
    (`tools/freestanding/run.sh`). Im App-Profil bleibt alles wie zuvor: ein
