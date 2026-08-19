@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Benchmark-Suite: Firn gegen Rust (rustc -O), gleicher Rechner, Median.
-# Aufruf:  bash bench/run.sh          (5 Laeufe je Programm)
+# Benchmark suite: Firn against Rust (rustc -O), same machine, median.
+# Usage:  bash bench/run.sh          (5 runs per program)
 #          BENCH_RUNS=9 bash bench/run.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."

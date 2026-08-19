@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
-# bench/instr.sh — A/B-Vergleich zweier firnc-Staende ueber die AUSGEFUEHRTEN
-# INSTRUKTIONEN statt ueber die Uhr.
+# bench/instr.sh -- A/B comparison of two firnc builds over the EXECUTED
+# INSTRUCTIONS instead of over the clock.
 #
-# WARUM: auf dieser Maschine schwankt die Wanduhrzeit derselben Binary um bis
-# zu 40 % zwischen Laeufen — gemessen, nicht vermutet. Damit laesst sich eine
-# Codegen-Aenderung von 5 % nicht bewerten; beim ersten Versuch erschien
-# dieselbe Verbesserung einmal als -18 % und einmal als +6 %.
+# WHY: on this machine the wall-clock time of the same binary fluctuates by up
+# to 40 % between runs -- measured, not assumed. That makes it impossible to
+# judge a 5 % codegen change; on the first attempt the very same improvement
+# showed up once as -18 % and once as +6 %.
 #
-# `valgrind --tool=callgrind` zaehlt die tatsaechlich ausgefuehrten
-# Instruktionen. Das Ergebnis ist auf die Instruktion genau reproduzierbar.
+# `valgrind --tool=callgrind` counts the instructions actually executed. The
+# result is reproducible down to the single instruction.
 #
-# EHRLICHE GRENZE: die Instruktionszahl ist NICHT die Laufzeit. Sie sagt nichts
-# ueber Cache-Fehlgriffe, Sprungvorhersage oder Abhaengigkeitsketten; ein `lea`
-# und ein `div` zaehlen beide als eine Instruktion. Sie ist die richtige Metrik
-# fuer die Frage „erzeugt der Compiler weniger Arbeit?" — und nur dafuer wird
-# sie hier benutzt. Fuer das Endergebnis bleibt die Uhr zustaendig
+# HONEST LIMIT: the instruction count is NOT the run time. It says nothing
+# about cache misses, branch prediction or dependency chains; an `lea` and a
+# `div` both count as one instruction. It is the right metric for the question
+# "does the compiler emit less work?" -- and it is used here for that alone.
+# The clock stays responsible for the final result
 # (`bench/run.sh`, `bench/ab.sh`).
 #
-# Aufruf:  bash bench/instr.sh <firnc-alt> <firnc-neu> [programm ...]
+# Usage:  bash bench/instr.sh <firnc-old> <firnc-new> [program ...]
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -34,7 +34,7 @@ else
     for f in bench/firn/*.fi; do QUELLEN+=("$f"); done
 fi
 
-# Instruktionen eines Programms zaehlen. Leere Ausgabe = fehlgeschlagen.
+# Count the instructions of one program. Empty output = failed.
 zaehle() {
     local bin="$1" tag="$2"
     if ! timeout 900 valgrind --tool=callgrind \
