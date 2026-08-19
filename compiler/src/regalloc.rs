@@ -1019,71 +1019,152 @@ struct Ra<'a> {
     /// Vergleichsergebnis GENAU EINMAL gelesen wird (naemlich vom Terminator),
     /// darf das `setcc` entfallen.
     gelesen: Vec<u32>,
-    /// Adressen `base + k`, deren einzige Verwendung der UNMITTELBAR folgende
-    /// Speicherzugriff ist: ptradd -> (Basisregister, Versatz).
-    versatz: HashMap<Val, (&'static str, i64)>,
+    /// Adressen, deren einzige Verwendung der UNMITTELBAR folgende
+    /// Speicherzugriff ist — sie wandern vollstaendig in dessen Operanden.
+    versatz: HashMap<Val, Adresse>,
+    /// Instruktionen (Skalierung `shl`/`mul`), die dabei ganz entfallen.
+    uebersprungen: std::collections::HashSet<Val>,
+    /// Instruktionen, von denen nur noch das FUELLEN ihres Registers uebrig
+    /// bleibt: Wert -> Quellwert. Der Rest der Rechnung steckt im
+    /// Speicheroperanden des folgenden Zugriffs.
+    vorlader: HashMap<Val, Val>,
 }
 
-/// Adressrechnungen, die in den Versatz des Speicherzugriffs wandern duerfen.
+/// Ein Speicheroperand, den der Prozessor selbst ausrechnet:
+/// `[basis + index*faktor + versatz]` (x86-64 SIB-Adressierung).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Adresse {
+    basis: &'static str,
+    /// Indexregister mit Faktor 1, 2, 4 oder 8
+    index: Option<(&'static str, i64)>,
+    versatz: i64,
+}
+
+impl Adresse {
+    fn text(&self) -> String {
+        let mut s = String::from("[");
+        s.push_str(self.basis);
+        if let Some((r, f)) = self.index {
+            s.push('+');
+            s.push_str(r);
+            if f != 1 {
+                s.push('*');
+                s.push_str(&f.to_string());
+            }
+        }
+        if self.versatz > 0 {
+            s.push('+');
+            s.push_str(&self.versatz.to_string());
+        } else if self.versatz < 0 {
+            s.push('-');
+            s.push_str(&(-self.versatz).to_string());
+        }
+        s.push(']');
+        s
+    }
+}
+
+/// Adressrechnungen, die vollstaendig in den Speicherzugriff wandern duerfen.
 ///
-/// Erzeugt wird heute
+/// Erzeugt wurde bis Runde 43
 ///     lea r9, [r8+168]
 ///     mov r9, qword ptr [r9]
 /// obwohl x86-64 den Versatz selbst kann:
 ///     mov r9, qword ptr [r8+168]
 ///
-/// Die Bedingungen sind absichtlich eng — jede Lockerung verlaengert die
-/// Lebensspanne der BASIS, und genau diese Klasse hat in Runde 40/41 den
-/// Miscompile erzeugt (docs/RUNDE41.md):
-///  * `ptradd` mit Sofortkonstante 0 <= k <= i32::MAX,
-///  * das Ergebnis wird GENAU EINMAL gelesen (Terminatoren mitgezaehlt),
-///  * dieser eine Leser ist die UNMITTELBAR folgende Instruktion desselben
-///    Blocks und ein `load`/`store` ueber genau diese Adresse,
-///  * die Basis liegt in einem Register und ist keine Rahmenadresse.
+/// **Runde 51** nimmt die beiden anderen Bestandteile der x86-Adressierung
+/// dazu — Indexregister und Faktor. Gemessen im Tokenizer (realweb,
+/// instruktionsgenaues callgrind) stand vor dieser Runde:
 ///
-/// Damit verschiebt sich der Lesezeitpunkt der Basis um GENAU eine
-/// Instruktion. Dazwischen liegt nichts; die einzigen Register, die an der
-/// neuen Stelle geschrieben werden, sind das Ziel des Zugriffs (das seine
-/// Adresse zuerst liest) und die Heimat des uebersprungenen `ptradd`, die gar
-/// nicht mehr beschrieben wird. Ein noch gebrauchter Wert kann also nicht
-/// verloren gehen.
+/// | Muster                                   |          Ir | Anteil |
+/// |------------------------------------------|------------:|-------:|
+/// | `shl k` + `lea (b,i,1)` + Zugriff        |  28.840.310 |  3,93 % |
+/// | `lea (b,i,1)` + Zugriff                  |  16.231.553 |  2,21 % |
+/// | `lea off(b)` + Zugriff                   |  14.432.184 |  1,97 % |
 ///
+/// Also wird aus
+///     mov  r8, qword ptr [rbp-416]
+///     shl  r8, 2
+///     lea  r8, [r9+r8]
+///     mov  r8d, dword ptr [r8]
+/// jetzt
+///     mov  r8, qword ptr [rbp-416]
+///     mov  r8d, dword ptr [r9+r8*4]
+///
+/// **Die Bedingungen sind absichtlich eng**, denn jede Lockerung verlaengert
+/// die Lebensspanne der Basis — genau die Klasse, die in Runde 40/41 den
+/// Miscompile erzeugt hat (docs/RUNDE41.md). Gefaltet wird nur, wenn
+///
+///  * die adressbildende Instruktion `ptradd` oder ein **64-Bit**-`add` ist
+///    (bei 32 Bit wuerde die Adressierung den Ueberlauf NICHT abschneiden),
+///  * ihr Ergebnis GENAU EINMAL gelesen wird (Terminatoren mitgezaehlt),
+///  * dieser eine Leser die UNMITTELBAR folgende Instruktion desselben
+///    Blocks ist und ein `load`/`store` ueber genau diese Adresse,
+///  * Basis (und ggf. Index) in einem Register liegen und weder Rahmen-
+///    adresse noch befoerderte Zelle noch Zellen-Alias sind,
+///  * fuer den Faktor: die Skalierung ist ein **64-Bit**-`shl` mit 0..3 bzw.
+///    `mul` mit 1/2/4/8, steht UNMITTELBAR vor der Adressbildung und ihr
+///    Ergebnis wird ebenfalls genau einmal gelesen,
+///  * kein Wert der Kette ist `secret` (SPEC §9.2: kein datenabhaengiger
+///    Zugriff).
+///
+/// Damit verschiebt sich der Lesezeitpunkt von Basis und Index um genau die
+/// ein bis zwei Instruktionen, die dabei **ganz entfallen** — dazwischen
+/// liegt danach nichts mehr, insbesondere kein `call`. Die einzigen Register,
+/// die an der neuen Stelle geschrieben werden, sind das Ziel des Zugriffs
+/// (das seine Adresse zuerst liest — `mov r8d, dword ptr [r9+r8*4]` ist
+/// korrekt) und die Heimat der uebersprungenen Instruktionen, die gar nicht
+/// mehr beschrieben wird.
+///
+/// Liefert `(Adressen je Wert, uebersprungene Skalierungen)`.
 /// Abschaltbar mit FIRN_NO_FALTUNG=1 (Fehlersuche).
-fn faltbare_versaetze(
+fn faltbare_adressen(
     f: &Func,
     a: &Alloc,
     gelesen: &[u32],
-) -> HashMap<Val, (&'static str, i64)> {
-    let mut aus: HashMap<Val, (&'static str, i64)> = HashMap::new();
+) -> (HashMap<Val, Adresse>, std::collections::HashSet<Val>, HashMap<Val, Val>) {
+    use std::collections::HashSet;
+    let mut aus: HashMap<Val, Adresse> = HashMap::new();
+    let mut weg: HashSet<Val> = HashSet::new();
+    let mut vor: HashMap<Val, Val> = HashMap::new();
     if std::env::var_os("FIRN_NO_FALTUNG").is_some() {
-        return aus;
+        return (aus, weg, vor);
     }
+    // Liegt der Wert schlicht in einem Register — ohne Sonderbehandlung?
+    let reines_reg = |v: Val| -> Option<&'static str> {
+        if a.imm(v).is_some() || a.cell(v).is_some() || f.is_secret(v) {
+            return None;
+        }
+        if a.alias.contains_key(&v) || a.frame_addr.contains_key(&v) {
+            return None;
+        }
+        match a.ort(v) {
+            Loc::Reg(r) => Some(r),
+            Loc::Slot(_) => None,
+        }
+    };
     for b in &f.blocks {
         for (idx, i) in b.insts.iter().enumerate() {
-            let (d, base, off) = match (i.dst, &i.op) {
-                (Some(d), Op::PtrAdd { base, off }) => (d, *base, *off),
+            let d = match i.dst {
+                Some(d) => d,
+                None => continue,
+            };
+            // (1) adressbildende Instruktion
+            let (base, off) = match &i.op {
+                Op::PtrAdd { base, off } => (*base, *off),
+                // Ein `add` bildet nur dann eine Adresse, wenn es in voller
+                // Breite rechnet. Bei 32 Bit schneidet FIR das Ergebnis ab,
+                // die Adressierung taete das nicht.
+                Op::Bin(BinOp::Add, x, y) if i.ty.bits() == 64 => (*x, *y),
                 _ => continue,
             };
-            if gelesen.get(d as usize).copied() != Some(1) {
+            if gelesen.get(d as usize).copied() != Some(1) || f.is_secret(d) {
                 continue;
             }
-            if a.alias.contains_key(&d) || a.alias.contains_key(&base) {
+            if a.alias.contains_key(&d) || a.frame_addr.contains_key(&d) || a.cell(d).is_some() {
                 continue;
             }
-            if a.frame_addr.contains_key(&d) || a.frame_addr.contains_key(&base) {
-                continue;
-            }
-            if a.cell(d).is_some() || a.cell(base).is_some() {
-                continue;
-            }
-            let k = match a.imm(off) {
-                Some(k) if k >= 0 && k <= i32::MAX as i64 => k,
-                _ => continue,
-            };
-            let br = match a.ort(base) {
-                Loc::Reg(r) => r,
-                Loc::Slot(_) => continue,
-            };
+            // (2) der EINE Leser ist der unmittelbar folgende Zugriff
             let n = match b.insts.get(idx + 1) {
                 Some(n) => n,
                 None => continue,
@@ -1096,10 +1177,113 @@ fn faltbare_versaetze(
             if !passt {
                 continue;
             }
-            aus.insert(d, (br, k));
+            // Register, die der folgende Zugriff selbst noch LESEN muss —
+            // sie duerfen nicht als Vorlade-Ziel dienen.
+            let wert_reg: Option<&'static str> = match &n.op {
+                Op::Store { val, .. } => match a.ort(*val) {
+                    Loc::Reg(r) => Some(r),
+                    _ => None,
+                },
+                _ => None,
+            };
+            // Die Basis liegt entweder schon in einem Register — oder sie
+            // wird in das Register der Adressrechnung geladen, das sonst
+            // ungenutzt bliebe (Fall C, Runde 51):
+            //     mov rax, qword ptr [rbp-8]      statt   mov rax, [rbp-8]
+            //     mov r9, qword ptr [rax+8]               lea r9, [rax+8]
+            //                                             mov r9, [r9]
+            let basis_darf_gelesen = |v: Val| -> bool {
+                !f.is_secret(v)
+                    && a.cell(v).is_none()
+                    && !a.alias.contains_key(&v)
+                    && !a.frame_addr.contains_key(&v)
+                    && a.imm(v).is_none()
+            };
+            let (br, basis_vorladen) = match reines_reg(base) {
+                Some(r) => (r, false),
+                None => match (a.loc(d), basis_darf_gelesen(base)) {
+                    (Loc::Reg(dr), true) if Some(dr) != wert_reg => (dr, true),
+                    _ => continue,
+                },
+            };
+            // (3a) konstanter Versatz
+            if let Some(k) = a.imm(off) {
+                if (0..=i32::MAX as i64).contains(&k) && !f.is_secret(off) {
+                    aus.insert(d, Adresse { basis: br, index: None, versatz: k });
+                    if basis_vorladen {
+                        vor.insert(d, base);
+                    }
+                }
+                continue;
+            }
+            // (3b) Index mit Faktor: die Skalierung steht unmittelbar davor
+            if gelesen.get(off as usize).copied() == Some(1) && idx > 0 {
+                let p = &b.insts[idx - 1];
+                let skal = if p.dst == Some(off) && p.ty.bits() == 64 {
+                    match &p.op {
+                        Op::Bin(BinOp::Shl, xi, ki) => match a.imm(*ki) {
+                            Some(k) if (0..=3).contains(&k) => Some((*xi, 1i64 << k)),
+                            _ => None,
+                        },
+                        Op::Bin(BinOp::Mul, xi, ki) => match a.imm(*ki) {
+                            Some(k) if [1, 2, 4, 8].contains(&k) => Some((*xi, k)),
+                            _ => None,
+                        },
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                if let Some((xi, fak)) = skal {
+                    if !f.is_secret(off) && !a.alias.contains_key(&off) && a.cell(off).is_none() {
+                        // Fall A: der Index liegt selbst in einem Register —
+                        // die Skalierung entfaellt ersatzlos.
+                        if let Some(ir) = reines_reg(xi) {
+                            if !basis_vorladen || ir != br {
+                                aus.insert(
+                                    d,
+                                    Adresse { basis: br, index: Some((ir, fak)), versatz: 0 },
+                                );
+                                weg.insert(off);
+                                if basis_vorladen {
+                                    vor.insert(d, base);
+                                }
+                                continue;
+                            }
+                        }
+                        // Fall B: der Index liegt im Rahmen, aber die
+                        // Skalierung hat ein Registerheim. Dann wird dorthin
+                        // der UNSKALIERTE Wert geladen und der Faktor der
+                        // Adressierung ueberlassen — eine Instruktion statt
+                        // zwei.
+                        if let (Loc::Reg(ir), true) = (a.loc(off), basis_darf_gelesen(xi)) {
+                            if ir != br && Some(ir) != wert_reg {
+                                aus.insert(
+                                    d,
+                                    Adresse { basis: br, index: Some((ir, fak)), versatz: 0 },
+                                );
+                                vor.insert(off, xi);
+                                if basis_vorladen {
+                                    vor.insert(d, base);
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            // (3c) Index direkt aus einem Register (Faktor 1)
+            if let Some(ir) = reines_reg(off) {
+                if !basis_vorladen || ir != br {
+                    aus.insert(d, Adresse { basis: br, index: Some((ir, 1)), versatz: 0 });
+                    if basis_vorladen {
+                        vor.insert(d, base);
+                    }
+                }
+            }
         }
     }
-    aus
+    (aus, weg, vor)
 }
 
 /// Zaehlt je Wert, wie oft er als Operand vorkommt (Instruktionen + Terminatoren).
@@ -1262,15 +1446,53 @@ fn deskriptor_peephole(asm: &str, nv: usize) -> String {
             }
         }
     }
+    /// Bitbreite eines Registernamens.
+    fn breite_von(r: &str) -> u32 {
+        match r {
+            "al" | "bl" | "cl" | "dl" | "sil" | "dil" | "bpl" => 8,
+            "ax" | "bx" | "cx" | "dx" | "si" | "di" | "bp" => 16,
+            "eax" | "ebx" | "ecx" | "edx" | "esi" | "edi" | "ebp" => 32,
+            _ => {
+                let b = r.as_bytes();
+                if b.len() >= 3 && b[0] == b'r' && r[1..r.len() - 1].chars().all(|c| c.is_ascii_digit())
+                {
+                    match b[b.len() - 1] {
+                        b'b' => 8,
+                        b'w' => 16,
+                        b'd' => 32,
+                        _ => 64,
+                    }
+                } else {
+                    64
+                }
+            }
+        }
+    }
     let max_slot = nv as u64 * 8;
     let mut out = String::with_capacity(asm.len());
-    // slot_off -> Register mit demselben Inhalt
-    let mut sync: HashMap<u64, String> = HashMap::new();
+    // slot_off -> (Register mit demselben Inhalt, Breite der Speicherung)
+    let mut sync: HashMap<u64, (String, u32)> = HashMap::new();
     // Register -> slot_off (Umkehrung)
     let mut holds: HashMap<String, u64> = HashMap::new();
-    let kill_reg = |r: &str, sync: &mut HashMap<u64, String>, holds: &mut HashMap<String, u64>| {
+    // NULLERWEITERUNG (Runde 51). `nullab[r] = k` heisst: alle Bits ab k
+    // sind in `r` garantiert null. Ohne Eintrag ist nichts bekannt.
+    //
+    // Grundlage ist eine Eigenschaft von x86-64, die im ganzen Nachpass
+    // gilt: JEDER Schreibzugriff auf ein 32-Bit-Register nullt die oberen
+    // 32 Bit des 64-Bit-Registers. Ein `movzx r32, byte ptr [..]` sagt
+    // sogar, dass alles ab Bit 8 null ist.
+    //
+    // Erst damit darf ein schmaler Reload gestrichen werden: `mov [X], r8d`
+    // gefolgt von `mov r8d, [X]` laedt genau die Bits zurueck, die schon in
+    // r8 stehen — aber nur, wenn r8 oben ohnehin schon null ist. Genau diese
+    // Bedingung fehlte in Runde 43, weshalb der Fall dort zurueckgestellt
+    // wurde (docs/RUNDE43.md §6).
+    let mut nullab: HashMap<String, u32> = HashMap::new();
+    let kill_reg = |r: &str,
+                    sync: &mut HashMap<u64, (String, u32)>,
+                    holds: &mut HashMap<String, u64>| {
         if let Some(off) = holds.remove(r) {
-            if sync.get(&off).map(|s| s.as_str()) == Some(r) {
+            if sync.get(&off).map(|s| s.0.as_str()) == Some(r) {
                 sync.remove(&off);
             }
         }
@@ -1283,9 +1505,11 @@ fn deskriptor_peephole(asm: &str, nv: usize) -> String {
             if t.ends_with(':') && !t.starts_with('.') {
                 sync.clear();
                 holds.clear();
+                nullab.clear();
             } else if t.starts_with(".L") && t.ends_with(':') {
                 sync.clear();
                 holds.clear();
+                nullab.clear();
             }
             out.push_str(zeile);
             out.push('\n');
@@ -1295,47 +1519,114 @@ fn deskriptor_peephole(asm: &str, nv: usize) -> String {
         let mn = teile.next().unwrap_or("");
         let ops = teile.next().unwrap_or("").trim();
         // Zielenformen, die wir tracken/ersetzen.
-        if let Some(rest) = t.strip_prefix("mov qword ptr [rbp-") {
+        // Speichern in ein WERT-Fach, in JEDER Breite (Runde 51: vorher nur
+        // `qword`). `off <= max_slot` grenzt auf die Wert-Faecher ein —
+        // `alloca`-Plaetze liegen dahinter und koennen ueber Zeiger
+        // beschrieben werden.
+        let stbreite = if t.starts_with("mov qword ptr [rbp-") {
+            Some(64)
+        } else if t.starts_with("mov dword ptr [rbp-") {
+            Some(32)
+        } else if t.starts_with("mov word ptr [rbp-") {
+            Some(16)
+        } else if t.starts_with("mov byte ptr [rbp-") {
+            Some(8)
+        } else {
+            None
+        };
+        if let Some(bw) = stbreite {
+            let rest = &t[t.find("[rbp-").unwrap() + 5..];
             if let Some(kl) = rest.find(']') {
                 let off: u64 = rest[..kl].parse().unwrap_or(0);
                 let q = rest[kl + 1..].trim_start_matches(',').trim();
-                if off >= 8 && off <= max_slot && ist_reg64(q) {
+                if off >= 8 && off <= max_slot && breite_von(q) == bw && ist_reg64(stamm(q)) {
                     let q = stamm(q).to_string();
                     kill_reg(&q, &mut sync, &mut holds);
-                    sync.insert(off, q.clone());
+                    sync.insert(off, (q.clone(), bw));
                     holds.insert(q, off);
                     out.push_str(zeile);
                     out.push('\n');
                     continue;
                 }
+                // Sofortkonstante o.ae.: das Fach hat einen neuen Inhalt,
+                // der in keinem Register steht.
+                if off >= 8 && off <= max_slot {
+                    if let Some((r, _)) = sync.remove(&off) {
+                        holds.remove(&r);
+                    }
+                }
             }
         }
-        if t.strip_prefix("mov r").is_some() {
-            // `mov rX, qword ptr [rbp-off]` — der Reload.
-            if let Some(kl) = ops.find(", qword ptr [rbp-") {
-                let ziel = &ops[..kl];
-                if ist_reg64(ziel) {
-                    if let Some(ende) = ops[kl + 17..].find(']') {
-                        let off: u64 = ops[kl + 17..kl + 17 + ende].parse().unwrap_or(0);
-                        if off >= 8 && off <= max_slot {
-                            let z = stamm(ziel).to_string();
-                            if let Some(r2) = sync.get(&off).cloned() {
-                                if r2 != z {
-                                    out.push_str(&format!("    mov {}, {}\n", z, r2));
-                                }
-                                // r2 == z: Reload entfaellt ganz.
+        // Reload aus einem Wert-Fach. Vier Formen, jede mit ihrer eigenen
+        // Bedingung:
+        //   mov  rY,  qword ptr [X]   braucht Speicherbreite 64
+        //   mov  rYd, dword ptr [X]   braucht >= 32 und nullab[rY] <= 32
+        //   movzx rYd, byte ptr [X]   braucht >=  8 und nullab[rY] <=  8
+        //   movzx rYd, word ptr [X]   braucht >= 16 und nullab[rY] <= 16
+        // `movsx`/`movsxd` bleiben aussen vor: Vorzeichenerweiterung laesst
+        // sich aus `nullab` nicht belegen.
+        let rlform = if mn == "mov" {
+            if let Some(k) = ops.find(", qword ptr [rbp-") {
+                Some((k, 17usize, 64u32, 64u32))
+            } else {
+                ops.find(", dword ptr [rbp-").map(|k| (k, 17usize, 32u32, 32u32))
+            }
+        } else if mn == "movzx" {
+            if let Some(k) = ops.find(", byte ptr [rbp-") {
+                Some((k, 16usize, 8u32, 8u32))
+            } else {
+                ops.find(", word ptr [rbp-").map(|k| (k, 16usize, 16u32, 16u32))
+            }
+        } else {
+            None
+        };
+        if let Some((kl, vor, mindest, ndbits)) = rlform {
+            let ziel = &ops[..kl];
+            let zb = breite_von(ziel);
+            // Zielbreite muss zur Ladeform passen: qword -> 64, sonst 32.
+            let passt_ziel = if mindest == 64 { zb == 64 } else { zb == 32 };
+            if passt_ziel && ist_reg64(stamm(ziel)) {
+                if let Some(ende) = ops[kl + vor..].find(']') {
+                    let off: u64 = ops[kl + vor..kl + vor + ende].parse().unwrap_or(0);
+                    if off >= 8 && off <= max_slot {
+                        let z = stamm(ziel).to_string();
+                        let treffer = match sync.get(&off) {
+                            Some((r2, bw)) if *bw >= mindest => Some(r2.clone()),
+                            _ => None,
+                        };
+                        if let Some(r2) = treffer {
+                            let selbe = r2 == z;
+                            let schon_null = nullab.get(&z).copied().unwrap_or(64) <= ndbits;
+                            if selbe && (mindest == 64 || schon_null) {
+                                // Der Wert steht bereits genau so im Register.
                                 kill_reg(&z, &mut sync, &mut holds);
-                                sync.insert(off, z.clone());
-                                holds.insert(z, off);
+                                sync.insert(off, (z.clone(), mindest));
+                                holds.insert(z.clone(), off);
+                                if mindest < 64 {
+                                    nullab.insert(z, ndbits);
+                                }
                                 continue;
                             }
-                            kill_reg(&z, &mut sync, &mut holds);
-                            sync.insert(off, z.clone());
-                            holds.insert(z, off);
-                            out.push_str(zeile);
-                            out.push('\n');
-                            continue;
+                            if !selbe && mindest == 64 {
+                                out.push_str(&format!("    mov {}, {}\n", z, r2));
+                                kill_reg(&z, &mut sync, &mut holds);
+                                sync.insert(off, (z.clone(), 64));
+                                holds.insert(z.clone(), off);
+                                nullab.remove(&z);
+                                continue;
+                            }
                         }
+                        kill_reg(&z, &mut sync, &mut holds);
+                        sync.insert(off, (z.clone(), mindest));
+                        holds.insert(z.clone(), off);
+                        if mindest < 64 {
+                            nullab.insert(z, ndbits);
+                        } else {
+                            nullab.remove(&z);
+                        }
+                        out.push_str(zeile);
+                        out.push('\n');
+                        continue;
                     }
                 }
             }
@@ -1344,6 +1635,7 @@ fn deskriptor_peephole(asm: &str, nv: usize) -> String {
         if mn.starts_with('j') || mn == "ret" {
             sync.clear();
             holds.clear();
+            nullab.clear();
             out.push_str(zeile);
             out.push('\n');
             continue;
@@ -1351,6 +1643,7 @@ fn deskriptor_peephole(asm: &str, nv: usize) -> String {
         if mn == "call" {
             for r in ["rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11"] {
                 kill_reg(r, &mut sync, &mut holds);
+                nullab.remove(r);
             }
             out.push_str(zeile);
             out.push('\n');
@@ -1359,6 +1652,7 @@ fn deskriptor_peephole(asm: &str, nv: usize) -> String {
         if mn == "syscall" {
             for r in ["rax", "rcx", "r11"] {
                 kill_reg(r, &mut sync, &mut holds);
+                nullab.remove(r);
             }
             out.push_str(zeile);
             out.push('\n');
@@ -1367,6 +1661,7 @@ fn deskriptor_peephole(asm: &str, nv: usize) -> String {
         if mn == "rep" {
             for r in ["rdi", "rsi", "rcx"] {
                 kill_reg(r, &mut sync, &mut holds);
+                nullab.remove(r);
             }
             out.push_str(zeile);
             out.push('\n');
@@ -1375,18 +1670,22 @@ fn deskriptor_peephole(asm: &str, nv: usize) -> String {
         if mn == "div" || mn == "idiv" {
             kill_reg("rax", &mut sync, &mut holds);
             kill_reg("rdx", &mut sync, &mut holds);
+            nullab.remove("rax");
+            nullab.remove("rdx");
             out.push_str(zeile);
             out.push('\n');
             continue;
         }
         if mn == "cqo" || mn == "cdq" {
             kill_reg("rdx", &mut sync, &mut holds);
+            nullab.remove("rdx");
             out.push_str(zeile);
             out.push('\n');
             continue;
         }
         if mn.starts_with("set") {
             kill_reg("rax", &mut sync, &mut holds); // Ziel ist im RA-Pfad immer `al`
+            nullab.remove("rax"); // `setcc al` laesst die oberen Bits stehen
             out.push_str(zeile);
             out.push('\n');
             continue;
@@ -1405,8 +1704,32 @@ fn deskriptor_peephole(asm: &str, nv: usize) -> String {
             // liess tests/305_dtoa_hardcases falsch rechnen).
             let z = stamm(ziel);
             if !ziel.contains('[') && ist_reg64(z) {
-                let z = z.to_string();
-                kill_reg(&z, &mut sync, &mut holds);
+                let zs = z.to_string();
+                kill_reg(&zs, &mut sync, &mut holds);
+                // Nullerweiterung fortschreiben (Runde 51). Ein Schreibzugriff
+                // auf ein 32-Bit-Register nullt die oberen 32 Bit; `movzx`
+                // aus einer 8-/16-Bit-Quelle sagt sogar mehr. Alles andere
+                // macht den Inhalt oben unbekannt.
+                let bw = breite_von(ziel);
+                if mn == "movzx" {
+                    let q = ops.rsplit(',').next().unwrap_or("").trim();
+                    let von = if q.starts_with("byte ptr") {
+                        8
+                    } else if q.starts_with("word ptr") {
+                        16
+                    } else {
+                        breite_von(q)
+                    };
+                    if bw >= 32 && (von == 8 || von == 16) {
+                        nullab.insert(zs, von);
+                    } else {
+                        nullab.remove(&zs);
+                    }
+                } else if bw == 32 {
+                    nullab.insert(zs, 32);
+                } else {
+                    nullab.remove(&zs);
+                }
             }
         }
         out.push_str(zeile);
@@ -1474,8 +1797,8 @@ fn unsupported_grund(f: &Func) -> Option<String> {
 
 fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
     let gelesen = zaehle_lesezugriffe(f);
-    let versatz = faltbare_versaetze(f, a, &gelesen);
-    let ra = Ra { f, a, gelesen, versatz };
+    let (versatz, uebersprungen, vorlader) = faltbare_adressen(f, a, &gelesen);
+    let ra = Ra { f, a, gelesen, versatz, uebersprungen, vorlader };
     e.raw("");
     // Linker-Symbol ueber die eine Stelle (codegen_x86::label -> modules::symbol)
     e.raw(&format!(".globl {}", label(&f.name)));
@@ -1522,14 +1845,90 @@ fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
             Loc::Reg(dst) => e.line(&format!("mov {}, qword ptr [rbp+{}]", dst, von)),
         }
     }
-    for (bi, b) in f.blocks.iter().enumerate() {
+    // Runde 51: die Bloecke werden nicht mehr in ihrer FIR-Reihenfolge
+    // ausgegeben, sondern entlang von Spuren (siehe `emissionsreihenfolge`).
+    let ordnung = emissionsreihenfolge(f);
+    for (k, &bi) in ordnung.iter().enumerate() {
+        let b = &f.blocks[bi];
         e.raw(&format!("{}:", block_label(&f.name, b.id)));
         // Fallthrough: steht das Sprungziel unmittelbar dahinter, faellt der
         // Sprung weg (spart pro BrCond mit else==naechster Block ein `jmp`).
-        let next = f.blocks.get(bi + 1).map(|nb| nb.id);
+        let next = ordnung.get(k + 1).map(|&j| f.blocks[j].id);
         emit_block(e, &ra, b, next)?;
     }
     Ok(())
+}
+
+/// **Blocklayout entlang von Spuren** (Runde 51).
+///
+/// Bisher wurden die Bloecke in ihrer FIR-Nummerierung ausgegeben. Wo weder
+/// `then` noch `else` zufaellig der naechste Block war, standen hinter dem
+/// bedingten Sprung noch ein `jmp` — im Tokenizer an 641 Stellen, gemessen
+/// **28.414.304 von 775.569.867 Instruktionen (3,66 %)** allein fuer diese
+/// unbedingten Spruenge:
+///
+/// ```text
+/// cmp  -0x18(%rbp),%r8
+/// jae  40dbd4          ; then
+/// jmp  40dbe0          ; else — haette Fallthrough sein koennen
+/// ```
+///
+/// Das Verfahren ist die uebliche gierige Spurbildung: ab `bb0` wird dem
+/// bevorzugten Nachfolger gefolgt, solange der noch frei ist; reisst die Spur
+/// ab, geht es beim kleinsten noch nicht platzierten Block weiter. Bevorzugt
+/// wird der `else`-Zweig — `emit_block` dreht die Bedingung selbst um, wenn
+/// stattdessen `then` folgt, es geht also kein Fall verloren.
+///
+/// **Warum das nichts kaputt machen kann.** Die Reihenfolge betrifft
+/// ausschliesslich die AUSGABE. Jeder Block hat einen expliziten Terminator,
+/// und `emit_block` laesst einen Sprung nur dann weg, wenn sein Ziel wirklich
+/// unmittelbar folgt (`next`). Lebendigkeitsanalyse, Intervalle und
+/// Registerwahl arbeiten weiter auf der FIR-Reihenfolge und werden hier nicht
+/// angefasst — ein Wert liegt nach wie vor ueber seine ganze Lebensdauer am
+/// selben Ort.
+///
+/// Abschaltbar mit `FIRN_NO_LAYOUT=1` (Fehlersuche).
+fn emissionsreihenfolge(f: &Func) -> Vec<usize> {
+    let n = f.blocks.len();
+    if std::env::var_os("FIRN_NO_LAYOUT").is_some() {
+        return (0..n).collect();
+    }
+    let mut platziert = vec![false; n];
+    let mut aus: Vec<usize> = Vec::with_capacity(n);
+    let mut frei = 0usize;
+    let mut b = 0usize;
+    while aus.len() < n {
+        // Spur legen, solange der bevorzugte Nachfolger noch frei ist.
+        loop {
+            platziert[b] = true;
+            aus.push(b);
+            let w = match &f.blocks[b].term {
+                Term::Br(t) => Some(*t as usize),
+                Term::BrCond { then_bb, else_bb, .. } => {
+                    let el = *else_bb as usize;
+                    if el < n && !platziert[el] {
+                        Some(el)
+                    } else {
+                        Some(*then_bb as usize)
+                    }
+                }
+                Term::Switch { default, .. } => Some(*default as usize),
+                Term::Ret(_) | Term::Unset => None,
+            };
+            match w {
+                Some(t) if t < n && !platziert[t] => b = t,
+                _ => break,
+            }
+        }
+        while frei < n && platziert[frei] {
+            frei += 1;
+        }
+        if frei >= n {
+            break;
+        }
+        b = frei;
+    }
+    aus
 }
 
 /// Ist `s` ein 64-Bit-Maschinenregistername (und damit ein Operand, dessen
@@ -1633,17 +2032,31 @@ fn emit_block(e: &mut Emitter, ra: &Ra, b: &Block, next: Option<BlockId>) -> Res
                 e.line(&format!("jmp {}", block_label(&f.name, *t)));
             }
         }
-        Term::Switch { val, .. } => {
-            // `codegen_switch.rs` (Modul `types`) erwartet den Wert im Rahmen.
-            let off = match ra.a.frame.slot.get(*val as usize) {
-                Some(o) => *o,
-                None => return Err("interner Fehler: switch ohne Slot".to_string()),
-            };
-            if let Loc::Reg(_) = ra.a.loc(*val) {
-                ra.load_full(e, "rax", *val);
-                e.line(&format!("mov qword ptr [rbp-{}], rax", off));
+        Term::Switch { val, ty, .. } => {
+            // Runde 51: der Wert wandert DIREKT von seinem Ort nach rax.
+            // Vorher schrieb dieser Pfad ihn erst in sein Rahmenfach, weil
+            // `emit_switch` ihn nur von dort lesen konnte — zwei Speicher-
+            // zugriffe je Zustandswechsel im Tokenizer (10,2 Mio Ir auf
+            // realweb).
+            //
+            // Zusicherung an `Wertquelle::Geladen`: `Ra::load_ext` emittiert
+            // hier IMMER einen Schreibzugriff auf `eax`/`rax`. Der einzige
+            // Zweig, der nichts emittieren wuerde, ist „Quelle ist bereits
+            // das Zielregister" — und `rax` wird nie vergeben (siehe
+            // CALLEE_SAVED / TEMP_REGS / ARG_SPARE / DIV_SPARE). Zur
+            // Sicherheit wird genau das hier geprueft.
+            let (v, vty) = (*val, *ty);
+            if matches!(ra.a.ort(v), Loc::Reg("rax")) {
+                return Err("interner Fehler: switch-Wert liegt in rax".to_string());
             }
-            crate::codegen_switch::emit_switch(e, f, &ra.a.frame, &b.term)?;
+            crate::codegen_switch::emit_switch(
+                e,
+                f,
+                crate::codegen_switch::Wertquelle::Geladen(&|e2: &mut Emitter, bits: u32| {
+                    ra.load_ext(e2, "rax", v, vty, bits);
+                }),
+                &b.term,
+            )?;
         }
         Term::BrCond { cond, then_bb, else_bb } => {
             if f.constant_time && f.is_secret(*cond) {
@@ -1679,7 +2092,12 @@ fn emit_block(e: &mut Emitter, ra: &Ra, b: &Block, next: Option<BlockId>) -> Res
             if let Some(v) = v {
                 ra.load_full(e, "rax", *v);
             } else {
-                e.line("xor eax, eax");
+                // Runde 51: KEIN `xor eax, eax` mehr. Eine Funktion mit
+                // Rueckgabetyp `void` hat keinen Ergebniswert; System V
+                // laesst `rax` in diesem Fall undefiniert, und in FIR liest
+                // niemand das Ergebnis eines void-Aufrufs (`Op::Call` ohne
+                // `dst`). Gemessen im Tokenizer: 4.229.623 Aufrufe, also
+                // ebenso viele Instruktionen fuer nichts.
             }
             epilogue(e, ra.a);
         }
@@ -1784,6 +2202,18 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
         }
         Op::Bin(op, x, y) => {
             let d = i.dst.ok_or("interner Fehler: Binaeroperation ohne Ziel")?;
+            // Runde 51: Adressrechnung, die im folgenden Speicherzugriff steht
+            // (`add` als Adressbildung, `shl`/`mul` als Skalierung des Index).
+            if let Some(src) = ra.vorlader.get(&d).copied() {
+                // Vom Rechnen bleibt nur, das Register zu fuellen.
+                if let Loc::Reg(r) = ra.a.loc(d) {
+                    ra.load_full(e, r, src);
+                    return Ok(());
+                }
+            }
+            if ra.versatz.contains_key(&d) || ra.uebersprungen.contains(&d) {
+                return Ok(()); // wird nirgends sonst gelesen
+            }
             emit_bin(e, ra, *op, ty, *x, *y, d)?;
         }
         Op::Cmp { op, ty: oty, a, b } => {
@@ -1903,7 +2333,7 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
                 }
             } else {
                 let mem = match (ra.versatz.get(addr), ra.a.frame_addr.get(addr), ra.a.ort(*addr)) {
-                    (Some((r, k)), _, _) => format!("[{}+{}]", r, k),
+                    (Some(adr), _, _) => adr.text(),
                     (None, Some(off), _) => format!("[rbp-{}]", off),
                     (None, None, Loc::Reg(r)) => format!("[{}]", r),
                     (None, None, Loc::Slot(_)) => {
@@ -1943,7 +2373,7 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
                 }
             } else {
                 let mem = match (ra.versatz.get(addr), ra.a.frame_addr.get(addr), ra.a.ort(*addr)) {
-                    (Some((r, k)), _, _) => format!("[{}+{}]", r, k),
+                    (Some(adr), _, _) => adr.text(),
                     (None, Some(off), _) => format!("[rbp-{}]", off),
                     (None, None, Loc::Reg(r)) => format!("[{}]", r),
                     (None, None, Loc::Slot(_)) => {
@@ -1962,6 +2392,12 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
         }
         Op::PtrAdd { base, off } => {
             let d = i.dst.ok_or("interner Fehler: ptradd ohne Ziel")?;
+            if let Some(src) = ra.vorlader.get(&d).copied() {
+                if let Loc::Reg(r) = ra.a.loc(d) {
+                    ra.load_full(e, r, src);
+                    return Ok(());
+                }
+            }
             if ra.versatz.contains_key(&d) {
                 // Der Versatz steht im folgenden Speicherzugriff; die Adresse
                 // selbst wird nirgends sonst gelesen und braucht kein `lea`.
@@ -2550,4 +2986,128 @@ mod tests {
         assert!(e.out.contains("mov qword ptr [rsp+8], rax"), "{}", e.out);
         assert!(e.out.contains("add rsp, 16"), "{}", e.out);
     }
+    // ---------------------------------------------------------- Runde 51 ---
+
+    /// `[basis + index*4]` statt `shl` + `lea` + Zugriff.
+    #[test]
+    fn adressrechnung_wandert_in_den_speicheroperanden() {
+        let mut f = Func::new("main", vec![FTy::Ptr, FTy::U64], FTy::U64);
+        let vier = f.push(0, FTy::U64, Op::Const(4));
+        let sk = f.push(0, FTy::U64, Op::Bin(BinOp::Mul, 1, vier));
+        let ad = f.push(0, FTy::U64, Op::Bin(BinOp::Add, 0, sk));
+        let w = f.push(0, FTy::U32, Op::Load { addr: ad });
+        let c = f.push(0, FTy::U64, Op::Cast { src: w, from: FTy::U32 });
+        f.set_term(0, Term::Ret(Some(c)));
+        let asm = emit(&Module { funcs: vec![f] }).expect("codegen");
+        let rumpf = asm.split("main:").nth(1).unwrap();
+        assert!(
+            rumpf.lines().any(|l| l.contains("dword ptr [") && l.contains("*4]")),
+            "kein skalierter Speicheroperand:\n{}",
+            asm
+        );
+        assert!(!rumpf.contains("shl "), "Skalierung blieb stehen:\n{}", asm);
+        assert!(!rumpf.contains("lea "), "Adressrechnung blieb stehen:\n{}", asm);
+    }
+
+    /// Wird dieselbe Adresse ZWEIMAL gelesen, darf sie nicht in den
+    /// Speicheroperanden wandern — sonst lebt die Basis laenger, als der
+    /// Verteiler weiss (die Fehlerklasse aus Runde 40/41).
+    #[test]
+    fn zweimal_gelesene_adresse_wird_nicht_gefaltet() {
+        let mut f = Func::new("main", vec![FTy::Ptr, FTy::U64], FTy::U64);
+        let ad = f.push(0, FTy::U64, Op::Bin(BinOp::Add, 0, 1));
+        let a = f.push(0, FTy::U64, Op::Load { addr: ad });
+        let b = f.push(0, FTy::U64, Op::Load { addr: ad });
+        let sum = f.push(0, FTy::U64, Op::Bin(BinOp::Add, a, b));
+        f.set_term(0, Term::Ret(Some(sum)));
+        let asm = emit(&Module { funcs: vec![f] }).expect("codegen");
+        let rumpf = asm.split("main:").nth(1).unwrap();
+        assert!(
+            rumpf.contains("lea ") || rumpf.lines().filter(|l| l.contains("add ")).count() > 0,
+            "Adresse muesste einmal ausgerechnet werden:\n{}",
+            asm
+        );
+    }
+
+    /// Ein 32-Bit-`add` darf NICHT zur Adressierung werden: dort schneidet
+    /// FIR das Ergebnis ab, die Adressierung taete es nicht.
+    #[test]
+    fn schmales_add_wird_nicht_zur_adresse() {
+        let mut f = Func::new("main", vec![FTy::Ptr, FTy::U32], FTy::U32);
+        let ad = f.push(0, FTy::U32, Op::Bin(BinOp::Add, 0, 1));
+        let w = f.push(0, FTy::U32, Op::Load { addr: ad });
+        f.set_term(0, Term::Ret(Some(w)));
+        let asm = emit(&Module { funcs: vec![f] }).expect("codegen");
+        let rumpf = asm.split("main:").nth(1).unwrap();
+        assert!(
+            rumpf.contains("add e") || rumpf.contains("lea "),
+            "32-Bit-Addition muss eine eigene Instruktion bleiben:\n{}",
+            asm
+        );
+    }
+
+    /// Der Wert eines `switch` kommt aus seinem Register, nicht ueber den
+    /// Rahmen — und der Index braucht kein `mov eax, eax`.
+    #[test]
+    fn switch_liest_den_wert_ohne_umweg_ueber_den_rahmen() {
+        let mut f = Func::new("main", vec![FTy::U32], FTy::I32);
+        let mut cases = Vec::new();
+        for i in 0..12i128 {
+            let b = f.add_block();
+            let c = f.push(b, FTy::I32, Op::Const(i));
+            f.set_term(b, Term::Ret(Some(c)));
+            cases.push((i, b));
+        }
+        let bd = f.add_block();
+        let cd = f.push(bd, FTy::I32, Op::Const(99));
+        f.set_term(bd, Term::Ret(Some(cd)));
+        f.set_term(0, Term::Switch { val: 0, ty: FTy::U32, cases, default: bd });
+        let asm = emit(&Module { funcs: vec![f] }).expect("codegen");
+        assert!(asm.contains("jmp qword ptr [rdx + rax*8]"), "{}", asm);
+        assert!(!asm.contains("mov eax, eax"), "ueberfluessige Nullerweiterung:\n{}", asm);
+        let rumpf = asm.split("main:").nth(1).unwrap();
+        // Der Wert wird nicht erst in sein Rahmenfach geschrieben.
+        assert!(
+            !rumpf.lines().any(|l| l.trim().starts_with("mov qword ptr [rbp-") && l.contains(", rax")),
+            "switch-Wert ging ueber den Rahmen:\n{}",
+            asm
+        );
+    }
+
+    /// Blocklayout: hinter einem bedingten Sprung darf kein unbedingter mehr
+    /// stehen, wenn eine der beiden Kanten Fallthrough sein kann.
+    #[test]
+    fn blocklayout_macht_aus_dem_zweiten_sprung_einen_fallthrough() {
+        let f = loop_func();
+        let asm = emit(&Module { funcs: vec![f] }).expect("codegen");
+        let zeilen: Vec<&str> = asm.lines().map(|l| l.trim()).collect();
+        for (i, z) in zeilen.iter().enumerate() {
+            let bedingt = z.starts_with('j') && !z.starts_with("jmp");
+            if bedingt {
+                if let Some(n) = zeilen.get(i + 1) {
+                    assert!(
+                        !n.starts_with("jmp "),
+                        "unbedingter Sprung hinter bedingtem:\n{}",
+                        asm
+                    );
+                }
+            }
+        }
+    }
+
+    /// Eine `void`-Funktion setzt `rax` nicht mehr auf null.
+    #[test]
+    fn void_rueckgabe_ohne_xor() {
+        let mut leer = Func::new("leer", vec![], FTy::Void);
+        leer.set_term(0, Term::Ret(None));
+        let mut m = Func::new("main", vec![], FTy::I32);
+        let n = m.push(0, FTy::I32, Op::Const(7));
+        m.set_term(0, Term::Ret(Some(n)));
+        let asm = emit(&Module { funcs: vec![leer, m] }).expect("codegen");
+        let rumpf = asm.split("_F0.leer:").nth(1).unwrap();
+        let rumpf = rumpf.split("main:").next().unwrap();
+        assert!(!rumpf.contains("xor eax, eax"), "{}", asm);
+        assert!(rumpf.contains("ret"), "{}", asm);
+    }
+
 }
