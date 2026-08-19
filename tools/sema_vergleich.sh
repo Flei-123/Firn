@@ -16,6 +16,12 @@
 # — fast alle davon binden ein Modul ein, dessen Namen einzeln unbekannt sind.
 set -uo pipefail
 cd "$(dirname "$0")/.."
+# Eigenes Temp-Verzeichnis je Lauf: zwei gleichzeitige Laeufe (z. B. Haupt-
+# repo und ein Worktree) benutzten sonst DIESELBEN /tmp-Dateien und
+# ueberschrieben sich gegenseitig die Vergleichsausgaben — das sah wie ein
+# echter Unterschied aus (Runde 41).
+TMPD=$(mktemp -d)
+trap 'rm -rf "$TMPD"' EXIT
 
 FIRNC=compiler/target/release/firnc
 DUMP=${SEMADUMP:-./.semadump}
@@ -40,11 +46,11 @@ ausdruecke=0
 erste=""
 
 while IFS= read -r f; do
-    if ! "$FIRNC" --emit=typen "$f" > /tmp/semv_a.txt 2>/dev/null; then
+    if ! "$FIRNC" --emit=typen "$f" > "$TMPD"/semv_a.txt 2>/dev/null; then
         uebersprungen=$((uebersprungen+1))
         continue
     fi
-    "$DUMP" "$f" > /tmp/semv_b.txt 2>/dev/null
+    "$DUMP" "$f" > "$TMPD"/semv_b.txt 2>/dev/null
     rc=$?
     if [ "$rc" -eq 3 ]; then
         nichtkern=$((nichtkern+1))
@@ -54,10 +60,10 @@ while IFS= read -r f; do
         comptime=$((comptime+1))
         continue
     fi
-    if [ "$rc" -eq 0 ] && cmp -s /tmp/semv_a.txt /tmp/semv_b.txt; then
+    if [ "$rc" -eq 0 ] && cmp -s "$TMPD"/semv_a.txt "$TMPD"/semv_b.txt; then
         gleich=$((gleich+1))
         # Jede " :" ist ein typisierter Ausdruck.
-        n=$(grep -o ' :' /tmp/semv_a.txt | wc -l)
+        n=$(grep -o ' :' "$TMPD"/semv_a.txt | wc -l)
         ausdruecke=$((ausdruecke + n))
         continue
     fi

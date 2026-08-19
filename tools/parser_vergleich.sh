@@ -14,6 +14,12 @@
 #      `comptime`) — solche Dateien werden GEZAEHLT, nicht uebergangen.
 set -uo pipefail
 cd "$(dirname "$0")/.."
+# Eigenes Temp-Verzeichnis je Lauf: zwei gleichzeitige Laeufe (z. B. Haupt-
+# repo und ein Worktree) benutzten sonst DIESELBEN /tmp-Dateien und
+# ueberschrieben sich gegenseitig die Vergleichsausgaben — das sah wie ein
+# echter Unterschied aus (Runde 41).
+TMPD=$(mktemp -d)
+trap 'rm -rf "$TMPD"' EXIT
 
 FIRNC=compiler/target/release/firnc
 DUMP=${ASTDUMP:-./.astdump}
@@ -38,18 +44,18 @@ uebersprungen=0
 erste=""
 
 while IFS= read -r f; do
-    if ! "$FIRNC" --emit=ast-kanon "$f" > /tmp/parv_a.txt 2>/dev/null; then
+    if ! "$FIRNC" --emit=ast-kanon "$f" > "$TMPD"/parv_a.txt 2>/dev/null; then
         # firnc0 kommt selbst nicht durch (Modulbruchstueck, Negativtest).
         uebersprungen=$((uebersprungen+1))
         continue
     fi
-    "$DUMP" "$f" > /tmp/parv_b.txt 2>/dev/null
+    "$DUMP" "$f" > "$TMPD"/parv_b.txt 2>/dev/null
     rc=$?
     if [ "$rc" -eq 3 ]; then
         nichtkern=$((nichtkern+1))
         continue
     fi
-    if [ "$rc" -eq 0 ] && cmp -s /tmp/parv_a.txt /tmp/parv_b.txt; then
+    if [ "$rc" -eq 0 ] && cmp -s "$TMPD"/parv_a.txt "$TMPD"/parv_b.txt; then
         gleich=$((gleich+1))
         continue
     fi
@@ -68,9 +74,9 @@ echo "UEBERSPRUNGEN: $uebersprungen  (firnc0 kommt selbst nicht durch)"
 if [ -n "$erste" ]; then
     echo "erste unerwartete Abweichung: $erste"
     ff=${erste%% *}
-    "$FIRNC" --emit=ast-kanon "$ff" > /tmp/parv_a.txt 2>/dev/null
-    "$DUMP" "$ff" > /tmp/parv_b.txt 2>/dev/null
-    diff /tmp/parv_a.txt /tmp/parv_b.txt | head -10
+    "$FIRNC" --emit=ast-kanon "$ff" > "$TMPD"/parv_a.txt 2>/dev/null
+    "$DUMP" "$ff" > "$TMPD"/parv_b.txt 2>/dev/null
+    diff "$TMPD"/parv_a.txt "$TMPD"/parv_b.txt | head -10
     exit 1
 fi
 exit 0

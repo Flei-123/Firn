@@ -23,6 +23,12 @@
 # Compiler, der nur sich selbst uebersetzen kann, waere kein Compiler.
 set -uo pipefail
 cd "$(dirname "$0")/.."
+# Eigenes Temp-Verzeichnis je Lauf: zwei gleichzeitige Laeufe (z. B. Haupt-
+# repo und ein Worktree) benutzten sonst DIESELBEN /tmp-Dateien und
+# ueberschrieben sich gegenseitig die Vergleichsausgaben — das sah wie ein
+# echter Unterschied aus (Runde 41).
+TMPD=$(mktemp -d)
+trap 'rm -rf "$TMPD"' EXIT
 
 export FIRNLIB="$(pwd)/lib"
 FIRNC=compiler/target/release/firnc
@@ -85,9 +91,9 @@ zeilen=$(wc -l < .firnc2.s)
 echo "FIXPUNKT:  Stufe 2 == Stufe 3, zeichengleich ($zeilen Zeilen Assembler)"
 
 # --- der selbst uebersetzte Compiler am ganzen Korpus ----------------------
-FIRNC1=./.firnc2 bash tools/selbst_vergleich.sh > /tmp/fixpunkt_korpus.txt 2>&1
+FIRNC1=./.firnc2 bash tools/selbst_vergleich.sh > "$TMPD"/fixpunkt_korpus.txt 2>&1
 krc=$?
-sed 's/^/  /' /tmp/fixpunkt_korpus.txt
+sed 's/^/  /' "$TMPD"/fixpunkt_korpus.txt
 if [ "$krc" -ne 0 ]; then
     echo "STUFE 2 verhaelt sich am Korpus NICHT wie Stufe 1"
     exit 1
