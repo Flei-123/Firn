@@ -1,33 +1,33 @@
-//! x86_64-Codegenerator: FIR -> GNU-Assembler-Text (Intel-Syntax) fuer `as`/`ld`.
-//! Kein LLVM, kein Cranelift, kein C — jede Instruktion wird hier selbst gewaehlt.
+//! x86_64 code generator: FIR -> GNU assembler text (Intel syntax) for `as`/`ld`.
+//! No LLVM, no Cranelift, no C — every instruction gets chosen here by hand.
 //!
-//! SCHNITTSTELLE (fest):
+//! INTERFACE (fixed):
 //!   `pub fn emit(m: &fir::Module) -> Result<String, String>`
 //!
-//! Modell der Registerzuteilung (bewusst naiv, aber korrekt):
-//!   * Jeder FIR-Wert `%n` bekommt einen eigenen 8-Byte-Stack-Slot im Rahmen.
-//!   * Gerechnet wird ausschliesslich in den Arbeitsregistern rax/rcx (rdx fuer
-//!     Division/Rest, rdi/rsi/rcx zusaetzlich fuer `copymem`).
-//!   * Damit sind rbx, rbp, r12-r15 (callee-saved) nie angetastet; alle
-//!     benutzten Register sind caller-saved, ueber einen `call` hinweg lebt
-//!     kein Wert in einem Register.
+//! Model of the register allocation (deliberately naive, yet correct):
+//!   * Every FIR value `%n` gets its own 8-byte stack slot at the frame.
+//!   * Computing happens exclusively at the scratch registers rax/rcx (rdx for
+//!     division/remainder, rdi/rsi/rcx additionally for `copymem`).
+//!   * Thereby rbx, rbp, r12-r15 (callee-saved) stay untouched; every register
+//!     used is caller-saved, and across a `call` no value lives within a
+//!     register.
 //!
-//! Rahmen (System-V-AMD64):
-//!   Bei Eintritt gilt rsp % 16 == 8 (die Ruecksprungadresse liegt oben).
-//!   `push rbp` macht rsp 16-ausgerichtet, `sub rsp, FRAME` mit FRAME % 16 == 0
-//!   erhaelt das. Damit ist der Stack an JEDER Aufrufstelle 16-ausgerichtet.
+//! Frame (System V AMD64):
+//!   At entry rsp % 16 == 8 holds (the return address sits on top).
+//!   `push rbp` makes rsp 16-aligned, `sub rsp, FRAME` with FRAME % 16 == 0
+//!   keeps it. The stack is thereby 16-aligned at EVERY call site.
 
 use crate::config;
 use crate::dwarf;
 use crate::fir::{BinOp, Block, CmpOp, FTy, Func, Inst, Module, Op, Term, UnOp, Val};
 use std::fmt::Write as _;
 
-/// Argumentregister der System-V-AMD64-Aufrufkonvention.
+/// Argument registers of the System V AMD64 calling convention.
 pub(crate) const ARG_REGS: [&str; 6] = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
-/// Argumentregister des Linux-Syscall-ABI (nach der Nummer in rax).
+/// Argument registers of the Linux syscall ABI (after the number at rax).
 const SYS_REGS: [&str; 6] = ["rdi", "rsi", "rdx", "r10", "r8", "r9"];
 
-/// Registername in der Breite `bits` (nur fuer rax/rcx/rdx noetig).
+/// Register label at the width `bits` (needed for rax/rcx/rdx only).
 pub(crate) fn reg(name: &str, bits: u32) -> &'static str {
     match (name, bits) {
         ("rax", 8) => "al",
@@ -45,7 +45,7 @@ pub(crate) fn reg(name: &str, bits: u32) -> &'static str {
     }
 }
 
-/// Groessenwort fuer Speicheroperanden.
+/// Size word for memory operands.
 pub(crate) fn size_word(bits: u32) -> &'static str {
     match bits {
         8 => "byte ptr",
@@ -55,8 +55,8 @@ pub(crate) fn size_word(bits: u32) -> &'static str {
     }
 }
 
-/// Register, die eine `#[interrupt]`-Funktion rettet — alle Universalregister
-/// ausser `rsp` (der Prozessor) und `rbp` (der gewoehnliche Prolog).
+/// Registers that one `#[interrupt]` function rescues — every general purpose
+/// register except `rsp` (the processor) and `rbp` (the ordinary prologue).
 pub(crate) const INT_SAVE: &[&str] = &[
     "rax", "rcx", "rdx", "rbx", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12",
     "r13", "r14", "r15",
@@ -70,11 +70,11 @@ fn align_up(x: u64, a: u64) -> u64 {
     }
 }
 
-/// Rahmenaufteilung einer Funktion.
+/// Frame partition of a function.
 pub(crate) struct Frame {
-    /// Slot-Offset je Wert-Id (Adresse = rbp - off).
+    /// slot offset per value id (address = rbp - off).
     pub(crate) slot: Vec<u64>,
-    /// Offset des Speichers je `alloca`-Wert (Adresse = rbp - off).
+    /// offset of the storage per `alloca` value (address = rbp - off).
     pub(crate) alloca_off: Vec<Option<u64>>,
     pub(crate) size: u64,
 }
@@ -89,16 +89,16 @@ fn layout(f: &Func) -> Frame {
     }
     let mut alloca_off: Vec<Option<u64>> = vec![None; n];
     for b in &f.blocks {
-        // Invariante von FIR: alle `alloca` stehen im Eintrittsblock. Alles
-        // andere waere ein variabel grosser Rahmen — den kann Stufe 0 nicht.
+        // Invariant of FIR: all `alloca` stand at the entry block. Anything
+        // else would be a frame of variable size — stage 0 cannot do that.
         if b.id != f.entry() && b.insts.iter().any(|i| matches!(i.op, Op::Alloca { .. })) {
             continue;
         }
         for i in &b.insts {
             if let Op::Alloca { size, align } = i.op {
                 if let Some(d) = i.dst {
-                    // Adresse = rbp - cursor; cursor auf `align` bringen, damit
-                    // die Adresse ausgerichtet ist (rbp ist 16-ausgerichtet).
+                    // address = rbp - cursor; bring cursor to `align`, so that
+                    // the address is aligned (rbp is 16-aligned).
                     let a = if align == 0 { 1 } else { align.min(16) };
                     cursor = align_up(cursor + size.max(1), a);
                     alloca_off[d as usize] = Some(cursor);
@@ -122,12 +122,12 @@ impl Emitter {
     }
 }
 
-/// Linker-Symbol eines Funktionsnamens.
+/// Linker symbol of a function label.
 ///
-/// **Einzige** Stelle, an der aus einem internen Namen ein Symbol wird — das
-/// Schema selbst steht in `modules.rs` (`SYMBOL_SCHEMA`, DESIGNZIELE.md §4).
-/// Interne Blocklabels (`block_label`) gehen bewusst NICHT hier durch: sie sind
-/// dateilokal (`.L…`) und erscheinen nie in der Symboltabelle.
+/// **The only** spot at which some internal label becomes a symbol — the
+/// scheme itself stands at `modules.rs` (`SYMBOL_SCHEMA`, DESIGNZIELE.md §4).
+/// Internal block labels (`block_label`) deliberately do NOT pass through
+/// here: they are file local (`.L…`) and never show up at the symbol table.
 pub(crate) fn label(name: &str) -> String {
     crate::modules::symbol(name, None)
 }
@@ -144,28 +144,28 @@ pub fn emit(m: &Module) -> Result<String, String> {
         config::VERSION
     ));
     e.raw(".intel_syntax noprefix");
-    // Quelldateien fuer .debug_line (dwarf.rs); leer = keine Debuginfo.
+    // Source files for .debug_line (dwarf.rs); empty = no debug info.
     let files = dwarf::file_directives();
     if !files.is_empty() {
         e.out.push_str(&files);
     }
     e.raw(".text");
-    // RUNDE 52 (SPEC §2): im Profil `kernel` gibt es KEINEN Einstiegspunkt und
-    // keinen Laufzeitvorspann. Das Ergebnis ist eine Objektdatei, die ein
-    // Bootlader bzw. ein Linkerskript einbindet — `_start`, das Aufsetzen von
-    // `rsp` und der `exit`-Systemaufruf waeren dort falsch.
+    // ROUND 52 (SPEC §2): under the profile `kernel` there is NO entry point and
+    // no runtime prologue. The result is one object file that a boot loader or
+    // a linker script pulls into place — `_start`, the setup of `rsp` and the
+    // `exit` system call would be wrong there.
     let freestanding = crate::prof::is_kernel();
     if !freestanding {
     e.raw(".globl _start");
     e.raw("_start:");
     e.line("xor rbp, rbp");
-    // STARTBLOCK AN `main`: beim Prozessstart zeigt `rsp` auf
+    // START BLOCK AT `main`: at process start `rsp` points to
     //   [argc][argv0]..[argvN][0][envp0]..[0][auxv..]
-    // Dieser Zeiger geht in `rdi` — also in den ERSTEN Parameter von `main`.
-    // Ein Programm mit `fn main() -> i32` merkt davon nichts (es liest `rdi`
-    // nie); eines mit `fn main(start: u64) -> i32` kommt damit an seine
-    // Aufrufargumente. Ohne das kann `firnc1` keinen Dateinamen entgegennehmen
-    // (docs/SELBSTHOSTING.md §2, Punkt 3).
+    // That pointer goes to `rdi` — that is, to the FIRST parameter of `main`.
+    // A program with `fn main() -> i32` notices nothing of it (it never reads
+    // `rdi`); one with `fn main(start: u64) -> i32` reaches its call arguments
+    // that way. Without it `firnc1` can accept no filename
+    // (docs/SELBSTHOSTING.md §2, point 3).
     e.line("mov rdi, rsp");
     e.line("and rsp, -16");
     e.line(&format!("call {}", label("main")));
@@ -182,15 +182,15 @@ pub fn emit(m: &Module) -> Result<String, String> {
     for f in &m.funcs {
         emit_func(&mut e, f)?;
     }
-    // HOOK gc: Typtabelle (.rodata) und Zustandsblock (.data) des Sammlers —
-    // nur, wenn das Programm ueberhaupt ein `gc class` enthaelt (gc.rs).
-    // Runde 49: auch ein Programm OHNE `gc class`, das Faeden benutzt, braucht
-    // den Zustandsblock — die Fadentafel und die Sperren liegen darin.
+    // HOOK gc: type table (.rodata) and state block (.data) of the collector —
+    // only when the program holds a `gc class` at all (gc.rs).
+    // Round 49: a program WITHOUT `gc class` that uses threads needs the state
+    // block as well — the thread table and the locks sit within it.
     if crate::gc::has_classes() || crate::gc::runtime_active() {
         e.raw(&crate::gc::ty_table_asm());
     }
-    // HOOK iface: die Methodentafeln (.rodata) — nur, wenn das Programm
-    // ueberhaupt eine Schnittstelle umsetzt (iface.rs, Runde 46).
+    // HOOK iface: the method tables (.rodata) — only when the program
+    // implements some interface at all (iface.rs, round 46).
     if crate::iface::has_interfaces() {
         e.raw(&crate::iface::tables_asm());
     }
@@ -198,12 +198,12 @@ pub fn emit(m: &Module) -> Result<String, String> {
     Ok(e.out)
 }
 
-/// `Op::GcAddr` — Adresse des Zustandsblocks des Sammlers in `rax`.
+/// `Op::GcAddr` — address of the state block of the collector at `rax`.
 ///
-/// Mit `regs` werden vorher die callee-saved Register in den Block gerettet.
-/// Ohne diesen Schritt waere die Zusage „KONSERVATIVER Stapel- UND
-/// Registerscan" (SPEC §3.5.3) falsch: die Registerzuteilung (`regalloc.rs`)
-/// haelt Werte ueber Aufrufe hinweg in `rbx`/`r12`–`r15`.
+/// With `regs` the callee-saved registers get rescued into the block first.
+/// Without that step the promise "CONSERVATIVE stack AND register scan"
+/// (SPEC §3.5.3) would be false: the register allocation (`regalloc.rs`)
+/// keeps values across calls at `rbx`/`r12`–`r15`.
 pub(crate) fn emit_gc_addr(e: &mut Emitter, regs: bool) {
     e.line(&format!("lea rax, [rip + {}]", crate::gc::STATE_LABEL));
     if !regs {
@@ -216,8 +216,8 @@ pub(crate) fn emit_gc_addr(e: &mut Emitter, regs: bool) {
 }
 
 fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
-    // HOOK opt: Registerzuteilung (compiler/src/regalloc.rs). Liefert der
-    // registerbewusste Pfad `None`, uebernimmt der Grundpfad darunter.
+    // HOOK opt: register allocation (compiler/src/regalloc.rs). Once the
+    // register aware path yields `None`, the base path below takes over.
     if let Some(r) = crate::regalloc::emit_func_ra(e, f) {
         return r;
     }
@@ -228,10 +228,10 @@ fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
     if let Some((file, line)) = dwarf::fn_line(&f.name) {
         e.line(&format!(".loc {} {} 0", file + 1, line));
     }
-    // RUNDE 52 (SPEC §2): `#[interrupt]` — eigene Aufrufkonvention. Der
-    // Prozessor hat beim Einsprung NICHTS gerettet ausser dem
-    // Unterbrechungsrahmen (ss:rsp, rflags, cs:rip); alles andere gehoert
-    // dem unterbrochenen Faden und muss hier hin und zurueck.
+    // ROUND 52 (SPEC §2): `#[interrupt]` — a calling convention of its own. At
+    // entry the processor has rescued NOTHING except the interrupt frame
+    // (ss:rsp, rflags, cs:rip); everything else belongs to the interrupted
+    // thread and must travel here and back.
     if f.interrupt {
         e.raw("    # interrupt: save all general purpose registers");
         for r in INT_SAVE {
@@ -243,10 +243,10 @@ fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
     if fr.size > 0 {
         e.line(&format!("sub rsp, {}", fr.size));
     }
-    // Parameter in ihre Slots sichern: die ersten sechs Ganzzahlwoerter kommen
-    // aus den Argumentregistern, alle weiteren vom Stapel des Aufrufers
-    // (System V: [rbp+16], [rbp+24], ... — davor liegen die gesicherte
-    // Ruecksprungadresse und das gesicherte rbp).
+    // Save the parameters into their slots: the first six integer words come
+    // out of the argument registers, all further ones off the stack of the
+    // caller (System V: [rbp+16], [rbp+24], ... — ahead of those sit the saved
+    // return address and the saved rbp).
     for (i, _t) in f.params.iter().enumerate() {
         if i < ARG_REGS.len() {
             e.line(&format!("mov qword ptr [rbp-{}], {}", fr.slot[i], ARG_REGS[i]));
@@ -266,7 +266,7 @@ fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
 
 fn emit_block(e: &mut Emitter, f: &Func, fr: &Frame, b: &Block) -> Result<(), String> {
     for (idx, i) in b.insts.iter().enumerate() {
-        // Anweisungsgenaue Quellzeile (nur ohne Optimierer, siehe dwarf.rs)
+        // Instruction exact source line (only without the optimizer, see dwarf.rs)
         if let Some((file, line)) = dwarf::line_at(&f.name, b.id, idx as u32) {
             e.line(&format!(".loc {} {} 0", file + 1, line));
         }
@@ -281,8 +281,8 @@ fn emit_block(e: &mut Emitter, f: &Func, fr: &Frame, b: &Block) -> Result<(), St
             &b.term,
         )?,
         Term::BrCond { cond, then_bb, else_bb } => {
-            // SPEC §9.2: in `#[constant_time]`-Funktionen darf kein bedingter
-            // Sprung von einem geheimen Wert abhaengen — harter Abbruch.
+            // SPEC §9.2: within `#[constant_time]` functions no conditional jump may
+            // depend on a secret value — hard abort.
             if f.constant_time && f.is_secret(*cond) {
                 return Err(format!(
                     "#[constant_time]: conditional jump in '{}' depends on a secret value (%{})",
@@ -306,24 +306,24 @@ fn emit_block(e: &mut Emitter, f: &Func, fr: &Frame, b: &Block) -> Result<(), St
             if let Some(v) = v {
                 e.line(&format!("mov rax, qword ptr [rbp-{}]", fr.slot[*v as usize]));
             } else {
-                // Runde 51: KEIN `xor eax, eax` mehr. Eine Funktion mit
-                // Rueckgabetyp `void` hat keinen Ergebniswert; System V
-                // laesst `rax` in diesem Fall undefiniert, und in FIR liest
-                // niemand das Ergebnis eines void-Aufrufs (`Op::Call` ohne
-                // `dst`). Gemessen im Tokenizer: 4.229.623 Aufrufe, also
-                // ebenso viele Instruktionen fuer nichts.
+                // Round 51: NO `xor eax, eax` any more. A function with
+                // return type `void` has no result value; System V
+                // leaves `rax` undefined for that case, and within FIR
+                // nobody reads the result of a void call (`Op::Call` without
+                // `dst`). Measured at the tokenizer: 4.229.623 calls, so
+                // just as many instructions for nothing.
                 //
-                // Merge R51+R52: die Bedingung `!f.interrupt` aus Runde 52
-                // entfaellt damit von selbst — sie diente nur dazu, den
-                // Unterbrechungsbehandlern das rax-Nullen zu ersparen.
-                // Jetzt nullt es niemand mehr, das ist strikt staerker.
+                // Merge R51+R52: the condition `!f.interrupt` of round 52
+                // thereby falls away by itself — it served only to spare the
+                // interrupt handlers the zeroing of rax.
+                // Now nobody zeroes it any more, which is strictly stronger.
             }
             e.line("mov rsp, rbp");
             e.line("pop rbp");
             if f.interrupt {
-                // Rueckwaerts wiederherstellen, dann `iretq`: nur diese
-                // Instruktion stellt rflags, cs und rsp des unterbrochenen
-                // Fadens wieder her — `ret` wuerde den Rahmen verwuersteln.
+                // Restore backwards, then `iretq`: that instruction alone
+                // restores rflags, cs and rsp of the interrupted thread —
+                // `ret` would mangle the frame.
                 for r in INT_SAVE.iter().rev() {
                     e.line(&format!("pop {}", r));
                 }
@@ -342,17 +342,17 @@ fn emit_block(e: &mut Emitter, f: &Func, fr: &Frame, b: &Block) -> Result<(), St
     Ok(())
 }
 
-/// Laedt den kompletten 8-Byte-Slot eines Wertes in ein Register.
+/// Loads the complete 8-byte slot of a value into a register.
 pub(crate) fn load_full(e: &mut Emitter, fr: &Frame, r: &str, v: Val) {
     e.line(&format!("mov {}, qword ptr [rbp-{}]", r, fr.slot[v as usize]));
 }
 
-/// Laedt einen Wert vorzeichen-/nullerweitert auf `to_bits` (32 oder 64).
+/// Loads a value sign/zero extended to `to_bits` (32 or 64).
 pub(crate) fn load_ext(e: &mut Emitter, fr: &Frame, r: &str, v: Val, ty: FTy, to_bits: u32) {
     let off = fr.slot[v as usize];
     let bits = ty.bits().max(8);
     if bits >= to_bits {
-        // Bereits mindestens so breit: die unteren `to_bits` Bits genuegen.
+        // Wide enough already: the lower `to_bits` bits suffice.
         e.line(&format!("mov {}, {} [rbp-{}]", reg(r, to_bits), size_word(to_bits), off));
         return;
     }
@@ -362,12 +362,12 @@ pub(crate) fn load_ext(e: &mut Emitter, fr: &Frame, r: &str, v: Val, ty: FTy, to
         (true, _) => e.line(&format!("movsxd {}, dword ptr [rbp-{}]", reg(r, to_bits), off)),
         (false, 8) => e.line(&format!("movzx {}, byte ptr [rbp-{}]", reg(r, to_bits.min(32)), off)),
         (false, 16) => e.line(&format!("movzx {}, word ptr [rbp-{}]", reg(r, to_bits.min(32)), off)),
-        // 32 Bit vorzeichenlos: `mov e_x` nullt die oberen 32 Bit automatisch.
+        // 32 bits unsigned: `mov e_x` zeroes the upper 32 bits automatically.
         (false, _) => e.line(&format!("mov {}, dword ptr [rbp-{}]", reg(r, 32), off)),
     }
 }
 
-/// Schreibt rax (voll) in den Slot des Zielwertes.
+/// Writes rax (full) into the slot of the target value.
 pub(crate) fn store_dst(e: &mut Emitter, fr: &Frame, d: Val, r: &str) {
     e.line(&format!("mov qword ptr [rbp-{}], {}", fr.slot[d as usize], r));
 }
@@ -391,19 +391,19 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
         }
         Op::Cmp { op, ty: oty, a, b } => {
             let d = i.dst.ok_or("internal error: comparison without target")?;
-            // GLEITKOMMA: `ucomisd` setzt die Flags wie ein VORZEICHENLOSER
-            // Vergleich (CF/ZF), deshalb `setb`/`seta` statt `setl`/`setg`.
-            // Bei NaN wird PF gesetzt und ZF/CF ebenfalls — dadurch ist jeder
-            // Vergleich ausser `!=` falsch, genau wie IEEE-754 es verlangt.
+            // FLOATING POINT: `ucomisd` sets the flags like one UNSIGNED
+            // comparison (CF/ZF), hence `setb`/`seta` rather than `setl`/`setg`.
+            // For NaN, PF gets set and ZF/CF as well — thereby every comparison
+            // except `!=` is false, exactly as IEEE-754 demands.
             if *oty == FTy::F64 {
-                // `ucomisd` setzt bei NaN ZF=PF=CF=1 — der ungeordnete Fall
-                // sieht also aus wie „kleiner oder gleich". IEEE-754 verlangt
-                // aber, dass JEDER Ordnungsvergleich mit NaN falsch ist.
+                // For NaN `ucomisd` sets ZF=PF=CF=1 — the unordered case
+                // therefore looks like "less or equal". IEEE-754 demands,
+                // though, that EVERY ordering comparison with NaN be false.
                 //
-                // `seta`/`setae` pruefen `CF=0 [und ZF=0]` und sind damit von
-                // sich aus richtig. Fuer `<` und `<=` werden deshalb die
-                // OPERANDEN VERTAUSCHT (`a < b` wird zu `b > a`), statt
-                // hinterher am Paritaetsflag herumzurechnen.
+                // `seta`/`setae` check `CF=0 [and ZF=0]` and are therefore
+                // right by themselves. For `<` and `<=` the OPERANDS GET
+                // SWAPPED (`a < b` becomes `b > a`) rather than computing
+                // on the parity flag afterwards.
                 let swap = matches!(op, CmpOp::Lt | CmpOp::Le);
                 let (first, second) = if swap { (*b, *a) } else { (*a, *b) };
                 load_full(e, fr, "rax", first);
@@ -419,13 +419,13 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
                 };
                 e.line(&format!("{} al", cc));
                 if matches!(op, CmpOp::Eq) {
-                    // NaN == NaN: ZF ist gesetzt, PF aber auch. `setnp`
-                    // blendet den ungeordneten Fall aus.
+                    // NaN == NaN: ZF is set, yet PF is too. `setnp`
+                    // masks the unordered case out.
                     e.line("setnp cl");
                     e.line("and al, cl");
                 }
                 if matches!(op, CmpOp::Ne) {
-                    // Spiegelbildlich: bei NaN ist `!=` wahr.
+                    // Mirror image: for NaN `!=` is true.
                     e.line("setp cl");
                     e.line("or al, cl");
                 }
@@ -456,9 +456,9 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
         }
         Op::Un(op, a) => {
             let d = i.dst.ok_or("internal error: unary operation without target")?;
-            // GLEITKOMMA: das Vorzeichen ist EIN Bit. `neg` wuerde das ganze
-            // Bitmuster als Zweierkomplement behandeln — falsch. Gekippt wird
-            // deshalb nur Bit 63.
+            // FLOATING POINT: the sign is ONE bit. `neg` would treat the whole
+            // bit pattern as two's complement — wrong. Flipped gets bit 63
+            // alone therefore.
             if ty == FTy::F64 {
                 if !matches!(op, UnOp::Neg) {
                     return Err("internal error: '!' is not defined for f64".to_string());
@@ -485,12 +485,12 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
         }
         Op::Cast { src, from } => {
             let d = i.dst.ok_or("internal error: conversion without target")?;
-            // GLEITKOMMA-UMWANDLUNGEN
+            // FLOATING POINT CONVERSIONS
             if ty == FTy::F64 && *from != FTy::F64 {
-                // Ganzzahl -> f64. Vorzeichenbehaftet mit `cvtsi2sd`;
-                // vorzeichenlose 64-Bit-Werte ueber 2^63 kann diese Instruktion
-                // nicht, deshalb wird der Wert vorher auf 64 Bit gebracht und
-                // der Sonderfall ehrlich benannt (SPEC §14.1.f64).
+                // Integer -> f64. Signed with `cvtsi2sd`; unsigned 64-bit
+                // values above 2^63 are beyond this instruction, so the value
+                // gets brought to 64 bits beforehand and the special case is
+                // stated honestly (SPEC §14.1.f64).
                 load_ext(e, fr, "rax", *src, *from, 64);
                 e.line("cvtsi2sd xmm0, rax");
                 e.line("movq rax, xmm0");
@@ -498,7 +498,7 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
                 return Ok(());
             }
             if *from == FTy::F64 && ty != FTy::F64 {
-                // f64 -> Ganzzahl, abschneidend (Richtung null), wie in C.
+                // f64 -> integer, cutting (towards zero), as within C.
                 load_full(e, fr, "rax", *src);
                 e.line("movq xmm0, rax");
                 e.line("cvttsd2si rax, xmm0");
@@ -506,7 +506,7 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
                 return Ok(());
             }
             if ty == FTy::Bool {
-                // Sicherheitsnetz: bool enthaelt nur 0/1.
+                // Safety net: bool holds 0/1 only.
                 let bits = from.bits().max(8);
                 load_full(e, fr, "rax", *src);
                 e.line(&format!("test {}, {}", reg("rax", bits), reg("rax", bits)));
@@ -554,9 +554,9 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
             store_dst(e, fr, d, "rax");
         }
         Op::Call { name, args } => {
-            // Stapelargumente ab dem siebten Wort: sie liegen unmittelbar vor
-            // dem `call` bei [rsp+8k]. Die 16-Byte-Ausrichtung bleibt erhalten
-            // (ungerade Wortzahl bekommt ein Fuellwort).
+            // Stack arguments from the seventh word on: they sit immediately ahead
+            // of the `call` at [rsp+8k]. The 16-byte alignment survives (one odd
+            // count of words gets a padding word).
             let stack_args = args.len().saturating_sub(ARG_REGS.len());
             let mut adjust = 8 * stack_args as u64;
             if stack_args % 2 == 1 {
@@ -580,9 +580,9 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
                 store_dst(e, fr, d, "rax");
             }
         }
-        // Dynamischer Versand (iface.rs, Runde 46): wie `Op::Call`, nur steht
-        // das Ziel in einem Register. `rax` ist im Grundpfad reines
-        // Arbeitsregister und kein Argumentregister — es wird ZULETZT geladen.
+        // Dynamic dispatch (iface.rs, round 46): like `Op::Call`, only the target
+        // sits within a register. `rax` is pure scratch register at the base path
+        // and no argument register — it gets loaded LAST.
         Op::CallIndirect { target, args } => {
             let stack_args = args.len().saturating_sub(ARG_REGS.len());
             let mut adjust = 8 * stack_args as u64;
@@ -633,7 +633,7 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
             }
         }
         Op::Select { cond, a, b } => {
-            // Datenunabhaengige Auswahl: `cmov`, niemals ein Sprung (SPEC §9.2).
+            // Data independent choice: `cmov`, never a jump (SPEC §9.2).
             let d = i.dst.ok_or("internal error: select without target")?;
             load_full(e, fr, "rdx", *cond);
             load_full(e, fr, "rax", *b);
@@ -643,14 +643,14 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
             store_dst(e, fr, d, "rax");
         }
         Op::Barrier { val } => {
-            // Undurchsichtig: der Wert geht durch ein leeres asm-Nadeloehr.
+            // Opaque: the value passes through one empty asm needle eye.
             let d = i.dst.ok_or("internal error: barrier without target")?;
             load_full(e, fr, "rax", *val);
             e.raw("    # barrier: opaque to every optimization pass");
             store_dst(e, fr, d, "rax");
         }
         Op::SecureZero { addr, size } => {
-            // Byteweises Nullen; darf nie entfernt werden (SPEC §9.3 C3).
+            // Zeroing byte by byte; must never be removed (SPEC §9.3 C3).
             load_full(e, fr, "rdi", *addr);
             load_full(e, fr, "rcx", *size);
             e.line("xor eax, eax");
@@ -658,15 +658,15 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
             e.line("rep stosb");
         }
         Op::AtomicAdd { addr, val } => {
-            // Runde 47 (atomic.rs): `lock xadd` — eine Instruktion, Ergebnis
-            // ist der ALTE Wert.
+            // Round 47 (atomic.rs): `lock xadd` — one instruction, the result
+            // is the OLD value.
             let d = i.dst.ok_or("internal error: atomadd without target")?;
             load_full(e, fr, "rcx", *addr);
             load_full(e, fr, "rax", *val);
             e.line("lock xadd qword ptr [rcx], rax");
             store_dst(e, fr, d, "rax");
         }
-        // Runde 49 (thread.rs): Vergleichs-Tausch, Fadenerzeugung, Selbstzeiger.
+        // Round 49 (thread.rs): compare-and-swap, thread creation, self pointer.
         Op::AtomicCas { addr, erw, new } => {
             let d = i.dst.ok_or("internal error: atomcas without target")?;
             load_full(e, fr, "rcx", *addr);
@@ -695,8 +695,8 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
             e.line("cld");
             e.line("rep movsb");
         }
-        // RUNDE 52 (core.rs, SPEC §2): Inline-Assembler. IMMER volatile —
-        // die Zeilen stehen genau einmal und genau hier.
+        // ROUND 52 (core.rs, SPEC §2): inline assembler. ALWAYS volatile —
+        // the lines stand exactly once and exactly here.
         Op::Asm { template, out, in_regs, ins, clobber } => {
             e.raw("    # asm (volatile): must be neither removed nor moved");
             for (r, v) in in_regs.iter().zip(ins.iter()) {
@@ -717,7 +717,7 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
                 e.raw(&format!("    # asm clobber: {}", clobber.join(", ")));
             }
         }
-        // RUNDE 52: MMIO — genau EIN Speicherzugriff je Quellzeile.
+        // ROUND 52: MMIO — exactly ONE memory access per source line.
         Op::MmioLoad { addr } => {
             let d = i.dst.ok_or("internal error: mmio_load without target")?;
             load_full(e, fr, "rcx", *addr);
@@ -755,10 +755,10 @@ fn emit_bin(
 ) -> Result<(), String> {
     let wide = ty.bits() > 32;
     let bits = if wide { 64 } else { 32 };
-    // GLEITKOMMA laeuft ueber die SSE-Einheit. Gerechnet wird in xmm0/xmm1,
-    // gelesen und geschrieben wird ueber rax — ein `f64` liegt im Rahmen als
-    // gewoehnliches 64-Bit-Wort (sein Bitmuster), deshalb braucht es hier
-    // keinen eigenen Speicherpfad.
+    // FLOATING POINT runs over the SSE unit. Computing happens at xmm0/xmm1,
+    // reading and writing happens through rax — one `f64` sits at the frame
+    // as ordinary 64-bit word (its bit pattern), which is why no separate
+    // memory path is needed here.
     if ty == FTy::F64 {
         let m = match op {
             BinOp::Add => "addsd",
@@ -783,9 +783,9 @@ fn emit_bin(
     }
     match op {
         BinOp::Add | BinOp::Sub | BinOp::And | BinOp::Or | BinOp::Xor | BinOp::Mul => {
-            // Die niederwertigen Bits sind bei diesen Operationen unabhaengig
-            // von der Breite; deshalb wird in 32/64 Bit gerechnet und beim
-            // Lesen auf die Typbreite zurechtgeschnitten.
+            // The low order bits are independent of the width for these
+            // operations; that is why computing happens at 32/64 bits and the
+            // result gets cut to the type width while reading.
             load_full(e, fr, "rax", a);
             load_full(e, fr, "rcx", b);
             let m = match op {
@@ -800,8 +800,8 @@ fn emit_bin(
             store_dst(e, fr, d, "rax");
         }
         BinOp::Div | BinOp::Rem => {
-            // Operanden exakt auf die Rechenbreite bringen (obere Bits im Slot
-            // sind nicht garantiert), dann idiv/div passend zum Vorzeichen.
+            // Bring the operands exactly to the computing width (upper bits at the
+            // slot are not guaranteed), then idiv/div to match the sign.
             load_ext(e, fr, "rax", a, ty, bits);
             load_ext(e, fr, "rcx", b, ty, bits);
             if ty.signed() {
@@ -824,8 +824,8 @@ fn emit_bin(
             store_dst(e, fr, d, res);
         }
         BinOp::Shl | BinOp::Shr => {
-            // Linker Operand exakt erweitern, damit `shr`/`sar` auch bei
-            // 8/16-Bit-Typen die richtigen Bits nachziehen.
+            // Widen the left operand exactly, so that `shr`/`sar` pull the right
+            // bits along for 8/16-bit types too.
             load_ext(e, fr, "rax", a, ty, bits);
             load_full(e, fr, "rcx", b);
             let m = match (op, ty.signed()) {
@@ -857,7 +857,7 @@ mod tests {
         let s = emit(&simple_module()).expect("codegen");
         assert!(s.contains("_start:"));
         assert!(s.contains("push rbp"));
-        // Je nach Registerzuteilung 'mov rax, 42' oder 'mov eax, 42'.
+        // Depending on the register allocation 'mov rax, 42' or 'mov eax, 42'.
         assert!(s.contains("mov rax, 42") || s.contains("mov eax, 42"), "{}", s);
         assert!(s.contains("mov eax, 60"));
     }
@@ -874,8 +874,8 @@ mod tests {
         assert!(fr.size >= 12);
     }
 
-    /// Mehr als sechs Parameter: die weiteren liegen auf dem Stapel des
-    /// Aufrufers, die 16-Byte-Ausrichtung bleibt erhalten (abi.rs, SPEC §13).
+    /// More than six parameters: the further ones sit on the stack of the
+    /// caller, the 16-byte alignment survives (abi.rs, SPEC §13).
     #[test]
     fn stack_args_ab_the_seventh_word() {
         let mut m = Module::new();
@@ -893,9 +893,9 @@ mod tests {
         g.set_term(0, Term::Ret(Some(rc)));
         m.funcs.push(g);
         let asm = emit(&m).expect("codegen");
-        // Seit Runde 43 uebernimmt der Registerpfad auch diesen Fall; die
-        // Aufrufkonvention ist in BEIDEN Pfaden dieselbe, deshalb prueft der
-        // Test nur noch sie und nicht mehr den erzeugenden Pfad.
+        // Since round 43 the register path covers this case as well; the calling
+        // convention is the same at BOTH paths, which is why the test checks it
+        // alone and no longer the producing path.
         assert!(asm.contains("qword ptr [rbp+16]"), "{}", asm);
         assert!(asm.contains("qword ptr [rbp+24]"), "{}", asm);
         assert!(asm.contains("sub rsp, 16"), "{}", asm);
