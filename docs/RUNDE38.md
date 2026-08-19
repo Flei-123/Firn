@@ -1,11 +1,11 @@
 # Runde 38 — GC: Pausen, Fragmentierung, Dauerlauf
 
-Revier dieser Runde: `lib/gc/gc.fi`, `lib/rc/`, Messwerkzeuge `tools/gc_mess/`.
+Revier dieser Runde: `lib/gc/gc.fi`, `lib/rc/`, Messwerkzeuge `tools/gc_meas/`.
 Compiler-Quellen wurden nicht angefasst. Basis: Runde 36 (Commit 97ec31a).
 
 ## Stufe 1 — Messwerkzeuge und Vorher-Zahlen (ohne GC-Aenderung)
 
-Neu: `tools/gc_mess/` mit `run.sh`, `pause.fi`, `frag.fi`.
+Neu: `tools/gc_meas/` mit `run.sh`, `pause.fi`, `frag.fi`.
 
 - **pause.fi**: DOM-artiger Dauer-Workload, sortiert jede Sammellauf-Pause
   (`gc_pause_ns_last`) in neun Klassen (Histogramm) und meldet Maximum und
@@ -13,7 +13,7 @@ Neu: `tools/gc_mess/` mit `run.sh`, `pause.fi`, `frag.fi`.
 - **frag.fi**: sechs Groessenklassen (48 bis 2048 Bytes Nutzdaten), pro Runde
   ein frischer Stapel genau einer Klasse, der Stapel derselben Klasse aus der
   vorherigen Runde wird fallen gelassen. Lebend: konstant sechs Stapel.
-  Gemessen wird der echte RSS aus `/proc/self/statm` (via `lib/dom/mess.fi`).
+  Gemessen wird der echte RSS aus `/proc/self/statm` (via `lib/dom/meas.fi`).
 - **run.sh**: baut beide in drei Baustufen (release-fast, no-opt, dev-fast),
   prueft im Kurzlauf, dass die Zaehler baustufenunabhaengig uebereinstimmen
   (sonst waere die Messung wertlos), dann der eigentliche Lauf in release-fast
@@ -46,7 +46,7 @@ Folge fuer alle GC-Messungen (und ehrlich fuer Nutzer der Laufzeit):
 Hilfsfunktion sterben lassen (zurueckgekehrter Rahmen wird vom Scrubber
 genullt) oder die Wurzel als rohen Wert echt ueberschreiben** — niemals sich
 auf ein letztes Null-Setzen in derselben Funktion verlassen.
-`tests/510_gc_zyklus_wird_aufgeloest.fi` macht es genau so (Zyklus in
+`tests/510_gc_cycle_becomes_resolved.fi` macht es genau so (Zyklus in
 `zyklus()` angelegt, nur `u32` kommt zurueck) — der Test beweist, dass der
 Sammler selbst korrekt einsammelt.
 
@@ -86,7 +86,7 @@ bleibt dann 200+ Runden konstant — auf dieser Dauer keine Fragmentierung
 sichtbar. Die Aussage ist durch die kurze Laufzeit begrenzt; der 30-Minuten-
 Dauerlauf (Stufe 4) ist der haertere Nachweis.
 
-Messartefakte: `tools/gc_mess/pause.tsv`, `tools/gc_mess/frag.tsv`.
+Messartefakte: `tools/gc_meas/pause.tsv`, `tools/gc_meas/frag.tsv`.
 
 ## Stufe 2 — Fragmentierung: leere Chunks gehen ans OS
 

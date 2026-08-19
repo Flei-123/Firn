@@ -1,0 +1,703 @@
+// lib/firnc1/types.fi — SPEICHERLAYOUT UND AUFRUFKONVENTION, IN FIRN.
+//
+// Fuenfter Teil von Stufe 1: die Portierung von `compiler/src/types.rs` und
+// `compiler/src/abi.rs`. `docs/SELBSTHOSTING.md` §3 nennt beide als die
+// Dateien, die schon heute vollstaendig in Firn schreibbar waeren — sie
+// rechnen nur auf Typ und Groesse, ohne Heap und ohne Text.
+//
+// WARUM DAS DER RICHTIGE NAECHSTE SCHRITT IST: Layout und Aufrufkonvention
+// sind die Stellen, an denen ein Compiler STILL falsch wird. Ein Feldversatz
+// daneben, ein Aggregat in Registern statt im Speicher — das Programm laeuft,
+// nur eben falsch. Zwei unabhaengige Umsetzungen gegeneinander zu stellen ist
+// hier mehr wert als jeder ausgedachte Testfall.
+//
+// REGELN (SPEC §11, §13):
+//   * Structlayout: Deklarationsreihenfolge, natuerliche Ausrichtung, KEIN
+//     Umsortieren. Die Groesse wird auf die Ausrichtung des Structs aufgerundet.
+//   * System V AMD64: Skalare -> ein Ganzzahlwort. Aggregate bis 16 Byte ->
+//     ein oder zwei Woerter. Darueber -> Speicher.
+//   * Rueckgabe ueber den versteckten Zeiger, sobald ein Aggregat groesser als
+//     8 Byte ist (SPEC §14.1 — bewusste Abweichung von System V, das 9..16
+//     Byte in `rax:rdx` zurueckgibt).
+
+import rt
+import vec
+import intern
+import ast
+import err
+import gc
+
+export { Types, types_new, types_free, types_resolve,
+         K_I8, K_I16, K_I32, K_I64, K_U8, K_U16, K_U32, K_U64,
+         K_USIZE, K_ISIZE, K_BOOL, K_F64, K_PTR, K_ARR, K_STRUCT, K_VOID, K_ERROR,
+         ty_kind, ty_a, ty_n, size_of, alignment_of, round_up,
+         class_of, needs_sret, is_aggregate,
+         st_count, st_name, st_size, st_alignment, st_foff, st_flen,
+         sf_name, sf_ty, sf_offset, ty_the_root, ret_ty_the_func,
+         param_ty_resolved, CLASS_MEM,
+         new_ty, resolve, ty_equal, compatible, is_int, is_ptr,
+         is_sign, bits_of, name_of, struct_index, base_ty,
+         base_ty_name, st_field_ty,
+         types_struct_reserve, types_struct_define,
+         types_struct_append, types_error_set, types_gc_set }
+
+const K_I8: u32 = 0
+const K_I16: u32 = 1
+const K_I32: u32 = 2
+const K_I64: u32 = 3
+const K_U8: u32 = 4
+const K_U16: u32 = 5
+const K_U32: u32 = 6
+const K_U64: u32 = 7
+const K_USIZE: u32 = 8
+const K_ISIZE: u32 = 9
+const K_BOOL: u32 = 10
+const K_F64: u32 = 11
+const K_PTR: u32 = 12
+const K_ARR: u32 = 13
+const K_STRUCT: u32 = 14
+const K_VOID: u32 = 15
+const K_ERROR: u32 = 16
+
+// Groesste Struktur, die noch in Registern uebergeben wird.
+const MAX_REGISTER_AGGREGATE: u64 = 16
+// Rueckgabe von `klasse_von` fuer die Speicherklasse.
+const CLASS_MEM: u32 = 255
+
+struct Types {
+    // aufgeloeste Typen
+    kind: Vec[u32],
+    a: Vec[u32],      // Ptr/Array: innerer Typ · Struct: Nummer im Structfeld
+    n: Vec[u64],      // Ptr: mut(0/1) · Array: Laenge
+    // Structs
+    s_name: Vec[u32],
+    s_size: Vec[u64],
+    s_align: Vec[u64],
+    s_foff: Vec[u32],
+    s_flen: Vec[u32],
+    // Felder aller Structs hintereinander
+    f_name: Vec[u32],
+    f_ty: Vec[u32],
+    f_offset: Vec[u64],
+    // Zahl der Structeintraege, die NICHT aus dem Baum stammen (Runde 32:
+    // Aufzaehlungen, von `pattern.fi` vorgemerkt). Sie stehen VOR den
+    // Baum-Structs — genau wie in Stufe 0 (`declare_enums` vor
+    // `collect_structs`).
+    eoff: u32,
+    // Registrierung der gc-Klassen (Runde 34, `gc.fi`), 0 = keine.
+    // Ueber sie loest `aufloesen` die Platzhalter `__gc#p:`/`__gc#w:` auf
+    // und `vertraeglich` erlaubt die kostenlose Aufwaertsumwandlung
+    // (derselbe Importzyklus wie bei `err.fi`).
+    gc: u64,
+    // Registrierung der Fehlerunionen (Runde 33, `err.fi`), 0 = keine.
+    // Ueber sie loest `aufloesen` die Platzhalter `__eu#<n>` auf und meldet
+    // die Structphase. Ein Zeiger statt eines Imports in die Gegenrichtung
+    // waere sauberer; Firn kennt keine Funktionszeiger, also ruft diese
+    // Datei `err.fi` direkt — der Importzyklus ist erlaubt (gemessen:
+    // modules.rs loest ihn auf wie jeden anderen).
+    feh: u64,
+    // je Funktion: aufgeloeste Parametertypen und Rueckgabetyp
+    fn_poff: Vec[u32],
+    fn_plen: Vec[u32],
+    fn_ptyp: Vec[u32],
+    fn_ret: Vec[u32],
+}
+
+fn types_new() -> Types {
+    return Types{
+        kind: vec_new[u32](), a: vec_new[u32](), n: vec_new[u64](),
+        s_name: vec_new[u32](), s_size: vec_new[u64](), s_align: vec_new[u64](),
+        s_foff: vec_new[u32](), s_flen: vec_new[u32](),
+        f_name: vec_new[u32](), f_ty: vec_new[u32](), f_offset: vec_new[u64](),
+        eoff: 0, gc: 0, feh: 0,
+        fn_poff: vec_new[u32](), fn_plen: vec_new[u32](), fn_ptyp: vec_new[u32](),
+        fn_ret: vec_new[u32](),
+    }
+}
+
+fn types_free(t: *mut Types) {
+    vec_free[u32](&(*t).kind)
+    vec_free[u32](&(*t).a)
+    vec_free[u64](&(*t).n)
+    vec_free[u32](&(*t).s_name)
+    vec_free[u64](&(*t).s_size)
+    vec_free[u64](&(*t).s_align)
+    vec_free[u32](&(*t).s_foff)
+    vec_free[u32](&(*t).s_flen)
+    vec_free[u32](&(*t).f_name)
+    vec_free[u32](&(*t).f_ty)
+    vec_free[u64](&(*t).f_offset)
+    vec_free[u32](&(*t).fn_poff)
+    vec_free[u32](&(*t).fn_plen)
+    vec_free[u32](&(*t).fn_ptyp)
+    vec_free[u32](&(*t).fn_ret)
+}
+
+fn ty_kind(t: *mut Types, i: u32) -> u32 { return vec_at[u32](&(*t).kind, i as usize) }
+fn ty_a(t: *mut Types, i: u32) -> u32 { return vec_at[u32](&(*t).a, i as usize) }
+fn ty_n(t: *mut Types, i: u32) -> u64 { return vec_at[u64](&(*t).n, i as usize) }
+
+fn st_count(t: *mut Types) -> usize { return vec_len[u32](&(*t).s_name) }
+fn st_name(t: *mut Types, i: usize) -> u32 { return vec_at[u32](&(*t).s_name, i) }
+fn st_size(t: *mut Types, i: usize) -> u64 { return vec_at[u64](&(*t).s_size, i) }
+fn st_alignment(t: *mut Types, i: usize) -> u64 { return vec_at[u64](&(*t).s_align, i) }
+fn st_foff(t: *mut Types, i: usize) -> u32 { return vec_at[u32](&(*t).s_foff, i) }
+fn st_flen(t: *mut Types, i: usize) -> u32 { return vec_at[u32](&(*t).s_flen, i) }
+fn sf_name(t: *mut Types, i: u32) -> u32 { return vec_at[u32](&(*t).f_name, i as usize) }
+fn sf_ty(t: *mut Types, i: u32) -> u32 { return vec_at[u32](&(*t).f_ty, i as usize) }
+fn sf_offset(t: *mut Types, i: u32) -> u64 { return vec_at[u64](&(*t).f_offset, i as usize) }
+
+fn ret_ty_the_func(t: *mut Types, i: usize) -> u32 { return vec_at[u32](&(*t).fn_ret, i) }
+fn param_ty_resolved(t: *mut Types, fi: usize, k: u32) -> u32 {
+    return vec_at[u32](&(*t).fn_ptyp, vec_at[u32](&(*t).fn_poff, fi) as usize + k as usize)
+}
+
+fn new_ty(t: *mut Types, kind: u32, a: u32, n: u64) -> u32 {
+    let i: u32 = vec_len[u32](&(*t).kind) as u32
+    vec_push[u32](&(*t).kind, kind)
+    vec_push[u32](&(*t).a, a)
+    vec_push[u64](&(*t).n, n)
+    return i
+}
+
+// ------------------------------------------------------- Groesse/Ausrichtung
+
+fn round_up(value: u64, on: u64) -> u64 {
+    if on == 0 {
+        return value
+    }
+    let rest: u64 = value % on
+    if rest == 0 {
+        return value
+    }
+    return value + on - rest
+}
+
+fn size_of(t: *mut Types, i: u32) -> u64 {
+    let k: u32 = ty_kind(t, i)
+    if k == K_I8 || k == K_U8 || k == K_BOOL { return 1 }
+    if k == K_I16 || k == K_U16 { return 2 }
+    if k == K_I32 || k == K_U32 { return 4 }
+    if k == K_I64 || k == K_U64 || k == K_USIZE || k == K_ISIZE { return 8 }
+    if k == K_F64 { return 8 }
+    if k == K_PTR { return 8 }
+    if k == K_ARR { return size_of(t, ty_a(t, i)) * ty_n(t, i) }
+    if k == K_STRUCT { return st_size(t, ty_a(t, i) as usize) }
+    return 0
+}
+
+fn alignment_of(t: *mut Types, i: u32) -> u64 {
+    let k: u32 = ty_kind(t, i)
+    if k == K_ARR { return alignment_of(t, ty_a(t, i)) }
+    if k == K_STRUCT { return st_alignment(t, ty_a(t, i) as usize) }
+    if k == K_VOID || k == K_ERROR { return 1 }
+    let g: u64 = size_of(t, i)
+    if g < 1 { return 1 }
+    return g
+}
+
+// ------------------------------------------------------- Aufrufkonvention
+
+fn is_aggregate(t: *mut Types, i: u32) -> bool {
+    let k: u32 = ty_kind(t, i)
+    return k == K_ARR || k == K_STRUCT
+}
+
+// Anzahl der Ganzzahlwoerter, oder KLASSE_MEM fuer die Speicherklasse.
+fn class_of(t: *mut Types, i: u32) -> u32 {
+    let k: u32 = ty_kind(t, i)
+    if k == K_VOID || k == K_ERROR {
+        return 0
+    }
+    if is_aggregate(t, i) {
+        let g: u64 = size_of(t, i)
+        if g == 0 {
+            return 0
+        }
+        if g > MAX_REGISTER_AGGREGATE {
+            return CLASS_MEM
+        }
+        return ((g + 7) / 8) as u32
+    }
+    return 1
+}
+
+fn needs_sret(t: *mut Types, i: u32) -> bool {
+    return is_aggregate(t, i) && size_of(t, i) > 8
+}
+
+// ------------------------------------------------------------- Aufloesung
+
+// Nummer eines Grundtyps, oder -1.
+fn base_ty(it: *mut intern.Interner, nr: u32) -> i32 {
+    var tab: [u8; 50] = "i8|i16|i32|i64|u8|u16|u32|u64|usize|isize|bool|f64"
+    let p: u64 = intern.intern_ptr(it, nr)
+    let n: usize = intern.intern_length(it, nr)
+    var i: usize = 0
+    var k: i32 = 0
+    var start: usize = 0
+    while i <= 50 {
+        var end: bool = i == 50
+        if !end {
+            end = tab[i] == 124 as u8
+        }
+        if end {
+            if i - start == n {
+                if rt.mem_eq((&tab[start]) as u64, p, n) {
+                    return k
+                }
+            }
+            k = k + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// Die Umkehrung von `grundtyp`: der NAME einer Typart als Nummer im
+// Interner. 4294967295, wenn `k` kein Grundtyp ist (Zeiger, Feld, Struct,
+// void, Fehler).
+//
+// RUNDE 50: gebraucht, seit ein Grundtyp Methoden haben kann
+// (`impl Ord for i32` legt `i32__kleiner` an). Der Empfaengertyp eines
+// Methodenaufrufs muss dafuer wieder zu einem Namen werden.
+fn base_ty_name(it: *mut intern.Interner, k: u32) -> u32 {
+    var tab: [u8; 50] = "i8|i16|i32|i64|u8|u16|u32|u64|usize|isize|bool|f64"
+    var idx: usize = 0
+    var nr: u32 = 0
+    var start: usize = 0
+    while idx <= 50 {
+        var end: bool = idx == 50
+        if !end {
+            end = tab[idx] == 124 as u8
+        }
+        if end {
+            if nr == k {
+                return intern.intern_number(it, (&tab[start]) as u64, idx - start) as u32
+            }
+            nr = nr + 1
+            start = idx + 1
+        }
+        idx = idx + 1
+    }
+    return 4294967295
+}
+
+// Findet den Structindex zu einem Namen; -1, wenn es ihn hier nicht gibt.
+fn struct_index(t: *mut Types, name: u32) -> i32 {
+    var i: usize = 0
+    while i < st_count(t) {
+        if st_name(t, i) == name {
+            return i as i32
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// Meldet einen Struct-NAMEN ohne Felder an (Runde 32: Aufzaehlungen aus
+// `pattern.fi`). Der Eintrag steht leer da — Groesse 0, Ausrichtung 1 —, bis
+// `typen_struct_festlegen` ihn fuellt. Muss VOR `typen_aufloesen` gerufen
+// werden; die so angemeldeten Eintraege stehen VOR den Structs des Baums.
+fn types_struct_reserve(t: *mut Types, name: u32) -> u32 {
+    let i: u32 = vec_len[u32](&(*t).s_name) as u32
+    vec_push[u32](&(*t).s_name, name)
+    vec_push[u64](&(*t).s_size, 0)
+    vec_push[u64](&(*t).s_align, 1)
+    vec_push[u32](&(*t).s_foff, 0)
+    vec_push[u32](&(*t).s_flen, 0)
+    (*t).eoff = (*t).eoff + 1
+    return i
+}
+
+// Registrierung der Fehlerunionen anmelden (Runde 33). MUSS vor
+// `typen_aufloesen` stehen; 0 laesst die Aufloesung von `E!T` aus (dann ist
+// sie wie bisher ein unbekannter Typ — `layoutdump` faehrt bewusst so,
+// weil der Massstab `layout_canon.rs` Fehlerunionen als `?` druckt).
+fn types_error_set(t: *mut Types, f: u64) { (*t).feh = f }
+
+// Registrierung der gc-Klassen anmelden (Runde 34). MUSS vor
+// `typen_aufloesen` stehen; 0 laesst die GC-Typnamen unaufgeloest (die
+// Dump-Werkzeuge fahren bewusst so — ihre Vergleichsseite in Stufe 0
+// kennt die Platzhalter nicht).
+fn types_gc_set(t: *mut Types, g: u64) { (*t).gc = g }
+
+// Wie `typen_struct_vormerken`, aber OHNE an `eoff` zu zaehlen: die
+// Fehlerunionen entstehen NACH den Structs des Baums (Stufe 0 legt sie im
+// Typkontext ebenfalls erst bei der Aufloesung an — `get_or_create_union`
+// in errors.rs) und haben ihr Layout sofort dabei.
+fn types_struct_append(t: *mut Types, name: u32) -> u32 {
+    let i: u32 = vec_len[u32](&(*t).s_name) as u32
+    vec_push[u32](&(*t).s_name, name)
+    vec_push[u64](&(*t).s_size, 0)
+    vec_push[u64](&(*t).s_align, 1)
+    vec_push[u32](&(*t).s_foff, 0)
+    vec_push[u32](&(*t).s_flen, 0)
+    return i
+}
+
+// Traegt fertige Felder, Groesse und Ausrichtung fuer einen vorgemerkten
+// Struct ein, OHNE ueber den Baum zu gehen (das Enum-Layout wird in
+// `pattern.fi` gerechnet, nicht hier). Die Feldlisten werden lueckenlos
+// angehaengt.
+fn types_struct_define(t: *mut Types, idx: u32, size: u64, align: u64,
+                          names: *mut Vec[u32], types: *mut Vec[u32],
+                          offset: *mut Vec[u64]) {
+    let off: u32 = vec_len[u32](&(*t).f_name) as u32
+    let len: u32 = vec_len[u32](names) as u32
+    var k: u32 = 0
+    while k < len {
+        vec_push[u32](&(*t).f_name, vec_at[u32](names, k as usize))
+        vec_push[u32](&(*t).f_ty, vec_at[u32](types, k as usize))
+        vec_push[u64](&(*t).f_offset, vec_at[u64](offset, k as usize))
+        k = k + 1
+    }
+    vec_set[u32](&(*t).s_foff, idx as usize, off)
+    vec_set[u32](&(*t).s_flen, idx as usize, len)
+    vec_set[u64](&(*t).s_size, idx as usize, size)
+    vec_set[u64](&(*t).s_align, idx as usize, align)
+}
+
+// Loest einen Typausdruck des Baums in einen konkreten Typ auf.
+//
+// EIN NAME, DEN ES HIER NICHT GIBT (etwa `rt.Buf` aus einem anderen Modul),
+// wird zu K_FEHLER mit Groesse 0 und Ausrichtung 1 — genau wie in
+// `compiler/src/layout_canon.rs`. Beide Umsetzungen tun dasselbe, damit der
+// Vergleich exakt bleibt, statt an einer kuenstlichen Unsicherheit zu
+// scheitern.
+fn resolve(t: *mut Types, b: *mut ast.Tree, it: *mut intern.Interner, te: u32) -> u32 {
+    if te == ast.NOTHING {
+        return new_ty(t, K_VOID, 0, 0)
+    }
+    let a: u32 = ast.t_kind(b, te)
+    if a == ast.T_PTR {
+        let inner: u32 = resolve(t, b, it, ast.t_a(b, te))
+        return new_ty(t, K_PTR, inner, ast.t_b(b, te))
+    }
+    if a == ast.T_ARR {
+        let elem: u32 = resolve(t, b, it, ast.t_a(b, te))
+        return new_ty(t, K_ARR, elem, ast.t_b(b, te))
+    }
+    let nr: u32 = ast.t_a(b, te)
+    let g: i32 = base_ty(it, nr)
+    if g >= 0 {
+        return new_ty(t, g as u32, 0, 0)
+    }
+    if (*t).feh != 0 {
+        // HOOK fehlerunionen: die Typangabe `E!T` steht als Platzhalter
+        // `__eu#<n>` im Baum (`hook_resolve_ty` in errors.rs).
+        let pi: i64 = err.error_placeholder(it, nr)
+        if pi >= 0 {
+            return err.error_ty((*t).feh, t, b, it, pi as u32)
+        }
+    }
+    if (*t).gc != 0 {
+        // HOOK gc: `Gc[C]`, `GcWeak[C]` und der verbotene Gebrauch eines
+        // Klassennamens als gewoehnlicher Typ (`hook_resolve_ty` in gc.rs).
+        let gt: u32 = gc.gc_ty_hook((*t).gc, t, it, nr)
+        if gt != 4294967295 {
+            return gt
+        }
+    }
+    let si: i32 = struct_index(t, nr)
+    if si >= 0 {
+        return new_ty(t, K_STRUCT, si as u32, 0)
+    }
+    return new_ty(t, K_ERROR, 0, 0)
+}
+
+fn ty_the_root(t: *mut Types, b: *mut ast.Tree, it: *mut intern.Interner, te: u32) -> u32 {
+    return resolve(t, b, it, te)
+}
+
+// Layout EINES Structs. Enthaelt ein Feld einen anderen Struct, wird DESSEN
+// Layout zuerst gerechnet — auch wenn er weiter unten steht.
+//
+// WARUM NICHT EINFACH DER REIHE NACH (bis Runde 31): `struct A { b: B }` vor
+// `struct B` ergab fuer `b` die Groesse 0, und zwar STILL. Das Programm lief
+// und rechnete falsch. Aufgefallen ist es erst bei der Monomorphisierung:
+// die Auspraegung `Vec__u32` entsteht NACH allen handgeschriebenen Structs,
+// wird aber von `lexer.Lexer` als Feld benutzt.
+//
+// `zustand`: 0 = offen · 1 = in Arbeit · 2 = fertig. Ueber Zeiger wird NICHT
+// abgestiegen (ein Zeiger ist acht Oktette gross, egal worauf er zeigt) —
+// genau deshalb bleibt `struct Knoten { naechster: *mut Knoten }` moeglich.
+fn struct_layout(t: *mut Types, b: *mut ast.Tree, it: *mut intern.Interner,
+                 ai: u32, si: u32, state: *mut Vec[u32]) {
+    if vec_at[u32](state, si as usize) != 0 {
+        return
+    }
+    vec_set[u32](state, si as usize, 1)
+    // 2a. Feldtypen aufloesen und alles anfordern, was eine Groesse braucht.
+    //     Die Felder duerfen erst DANACH abgelegt werden: sie muessen
+    //     LUECKENLOS liegen, und ein Zwischenschritt schoebe fremde Felder
+    //     dazwischen.
+    var types_the_fields: Vec[u32] = vec_new[u32]()
+    var k: u32 = 0
+    while k < ast.structure_flen(b, ai as usize) {
+        let fi: u32 = ast.structure_foff(b, ai as usize) + k
+        let ty: u32 = resolve(t, b, it, ast.field_ty(b, fi))
+        vec_push[u32](&types_the_fields, ty)
+        size_request(t, b, it, ty, state)
+        k = k + 1
+    }
+    // 2b. Versaetze rechnen.
+    let off: u32 = vec_len[u32](&(*t).f_name) as u32
+    var offset: u64 = 0
+    var max_a: u64 = 1
+    k = 0
+    while k < ast.structure_flen(b, ai as usize) {
+        let fi: u32 = ast.structure_foff(b, ai as usize) + k
+        let ty: u32 = vec_at[u32](&types_the_fields, k as usize)
+        var au: u64 = alignment_of(t, ty)
+        if au < 1 { au = 1 }
+        let gr: u64 = size_of(t, ty)
+        if au > max_a { max_a = au }
+        offset = round_up(offset, au)
+        vec_push[u32](&(*t).f_name, ast.field_name(b, fi))
+        vec_push[u32](&(*t).f_ty, ty)
+        vec_push[u64](&(*t).f_offset, offset)
+        offset = offset + gr
+        k = k + 1
+    }
+    vec_free[u32](&types_the_fields)
+    vec_set[u32](&(*t).s_foff, si as usize, off)
+    vec_set[u32](&(*t).s_flen, si as usize, ast.structure_flen(b, ai as usize))
+    vec_set[u64](&(*t).s_size, si as usize, round_up(offset, max_a))
+    vec_set[u64](&(*t).s_align, si as usize, max_a)
+    vec_set[u32](state, si as usize, 2)
+}
+
+// Sorgt dafuer, dass die Groesse dieses Typs feststeht.
+fn size_request(t: *mut Types, b: *mut ast.Tree, it: *mut intern.Interner,
+                     ty: u32, state: *mut Vec[u32]) {
+    let a: u32 = ty_kind(t, ty)
+    if a == K_ARR {
+        size_request(t, b, it, ty_a(t, ty), state)
+        return
+    }
+    if a == K_STRUCT {
+        let s: u32 = ty_a(t, ty)
+        // Ein VORGEMERKTER Eintrag (eine Aufzaehlung) hat kein Gegenstueck im
+        // Baum — sein Layout traegt `pattern.fi` ein. Ein Struct, das eine
+        // Aufzaehlung dem Wert nach enthaelt, rechnet hier mit Groesse 0
+        // weiter; der Fehler wird dort gemeldet, nicht still benutzt.
+        if s < (*t).eoff {
+            return
+        }
+        if s >= vec_len[u32](state) as u32 {
+            // Eine FEHLERUNION (Runde 33): sie wird fertig ausgelegt
+            // angelegt, NACHDEM der Zustandsvektor hier schon steht.
+            return
+        }
+        struct_layout(t, b, it, s - (*t).eoff, s, state)
+    }
+}
+
+// Legt Layout und Aufrufkonvention fuer das ganze Programm an.
+fn types_resolve(t: *mut Types, b: *mut ast.Tree, it: *mut intern.Interner) {
+    // 1. Structs anmelden — erst danach kann ein Feld auf einen von ihnen
+    //    zeigen. Reihenfolge zaehlt: ein Struct darf einen FRUEHER
+    //    deklarierten enthalten, und dessen Layout muss dann schon stehen.
+    var i: usize = 0
+    while i < ast.structure_count(b) {
+        vec_push[u32](&(*t).s_name, ast.structure_name(b, i))
+        vec_push[u64](&(*t).s_size, 0)
+        vec_push[u64](&(*t).s_align, 1)
+        vec_push[u32](&(*t).s_foff, 0)
+        vec_push[u32](&(*t).s_flen, 0)
+        i = i + 1
+    }
+    // 2. Felder aufloesen und Versaetze rechnen — UNABHAENGIG von der
+    //    Deklarationsreihenfolge (siehe `struct_layout`). Der Zustandsvektor
+    //    deckt ALLE Eintraege ab; vorgemerkte (Aufzaehlungen) gelten als
+    //    fertig, ihr Layout kommt von `pattern.fi`.
+    if (*t).feh != 0 {
+        // HOOK fehlerunionen: die Layoutphase melden — in ihr kann eine
+        // Union ueber einem Struct nicht ausgelegt werden
+        // (`hook_struct_phase` in errors.rs, gemeldet in collect_structs).
+        err.error_structphase((*t).feh, true)
+    }
+    var state: Vec[u32] = vec_new[u32]()
+    i = 0
+    while i < st_count(t) {
+        var z: u32 = 0
+        if (i as u32) < (*t).eoff {
+            z = 2
+        }
+        vec_push[u32](&state, z)
+        i = i + 1
+    }
+    i = 0
+    while i < ast.structure_count(b) {
+        struct_layout(t, b, it, i as u32, i as u32 + (*t).eoff, &state)
+        i = i + 1
+    }
+    vec_free[u32](&state)
+    if (*t).feh != 0 {
+        // HOOK fehlerunionen: Layoutphase beendet — ab hier darf der
+        // Erfolgstyp einer Union ein Struct sein (Signaturen, Rumpf).
+        err.error_structphase((*t).feh, false)
+    }
+    // 3. Funktionssignaturen.
+    i = 0
+    while i < ast.fn_count(b) {
+        let poff: u32 = vec_len[u32](&(*t).fn_ptyp) as u32
+        var k: u32 = 0
+        while k < ast.fn_plen(b, i) {
+            let ty: u32 = resolve(t, b, it, ast.param_ty(b, ast.fn_poff(b, i) + k))
+            vec_push[u32](&(*t).fn_ptyp, ty)
+            k = k + 1
+        }
+        vec_push[u32](&(*t).fn_poff, poff)
+        vec_push[u32](&(*t).fn_plen, ast.fn_plen(b, i))
+        vec_push[u32](&(*t).fn_ret, resolve(t, b, it, ast.fn_ret(b, i)))
+        i = i + 1
+    }
+}
+
+// ------------------------------------------------- Fragen an einen Typ
+//
+// Ab hier steht, was `sema` braucht: Vergleichbarkeit, Ganzzahligkeit,
+// Vorzeichen, Breite und der lesbare Name. In `compiler/src/types.rs` sind
+// das die Methoden von `Type` und `TypeCtx::name_of`.
+
+fn is_int(t: *mut Types, i: u32) -> bool {
+    let k: u32 = ty_kind(t, i)
+    return k <= K_ISIZE
+}
+
+fn is_ptr(t: *mut Types, i: u32) -> bool {
+    return ty_kind(t, i) == K_PTR
+}
+
+fn is_sign(t: *mut Types, i: u32) -> bool {
+    let k: u32 = ty_kind(t, i)
+    return k == K_I8 || k == K_I16 || k == K_I32 || k == K_I64 || k == K_ISIZE
+}
+
+fn bits_of(t: *mut Types, i: u32) -> u32 {
+    let k: u32 = ty_kind(t, i)
+    if k == K_I8 || k == K_U8 || k == K_BOOL { return 8 }
+    if k == K_I16 || k == K_U16 { return 16 }
+    if k == K_I32 || k == K_U32 { return 32 }
+    if k == K_I64 || k == K_U64 || k == K_USIZE || k == K_ISIZE { return 64 }
+    if k == K_PTR { return 64 }
+    return 0
+}
+
+// Strukturelle Gleichheit zweier Typen. Zwei Eintraege in der Tafel koennen
+// denselben Typ meinen — verglichen wird also der INHALT, nicht der Index.
+fn ty_equal(t: *mut Types, a: u32, b: u32) -> bool {
+    if a == b {
+        return true
+    }
+    let ka: u32 = ty_kind(t, a)
+    if ka != ty_kind(t, b) {
+        return false
+    }
+    if ka == K_PTR {
+        // Die `mut`-Kennzeichnung zaehlt NICHT — Stufe 0 hat keinen
+        // Mutabilitaetspruefer fuer Zeigerziele (sema.rs, `compatible`).
+        return ty_equal(t, ty_a(t, a), ty_a(t, b))
+    }
+    if ka == K_ARR {
+        if ty_n(t, a) != ty_n(t, b) {
+            return false
+        }
+        return ty_equal(t, ty_a(t, a), ty_a(t, b))
+    }
+    if ka == K_STRUCT {
+        return ty_a(t, a) == ty_a(t, b)
+    }
+    return true
+}
+
+// Zuweisungsvertraeglichkeit: KEINE impliziten Umwandlungen. Ein Fehlertyp ist
+// mit allem vertraeglich, damit nach einem gemeldeten Fehler keine Lawine
+// folgt.
+fn compatible(t: *mut Types, a: u32, b: u32) -> bool {
+    if ty_kind(t, a) == K_ERROR || ty_kind(t, b) == K_ERROR {
+        return true
+    }
+    if (*t).gc != 0 {
+        // HOOK gc: kostenlose Aufwaertsumwandlung `Gc[Abgeleitet]` ->
+        // `Gc[Basis]` (gc.rs, SPEC 4.4). NUR diese Richtung; abwaerts geht
+        // ausschliesslich ueber das gepruefte `x.as?[C]`.
+        if gc.gc_is_upward((*t).gc, t, a, b) {
+            return true
+        }
+    }
+    return ty_equal(t, a, b)
+}
+
+fn st_field_ty(t: *mut Types, si: usize, field_name: u32) -> u32 {
+    var k: u32 = 0
+    while k < st_flen(t, si) {
+        let fi: u32 = st_foff(t, si) + k
+        if sf_name(t, fi) == field_name {
+            return sf_ty(t, fi)
+        }
+        k = k + 1
+    }
+    return 4294967295
+}
+
+// Lesbarer Name eines Typs — genau die Form aus `TypeCtx::name_of`:
+// `*mut i32`, `[i32; 3]`, `()` fuer void, `<fehler>` fuer den Fehlertyp.
+fn name_of(t: *mut Types, it: *mut intern.Interner, b: *mut rt.Buf, i: u32) {
+    let k: u32 = ty_kind(t, i)
+    if k == K_PTR {
+        rt.buf_push(b, 42 as u8)
+        if ty_n(t, i) == 1 {
+            var m: [u8; 4] = "mut "
+            rt.buf_push_bytes(b, (&m[0]) as u64, 4)
+        }
+        name_of(t, it, b, ty_a(t, i))
+        return
+    }
+    if k == K_ARR {
+        rt.buf_push(b, 91 as u8)
+        name_of(t, it, b, ty_a(t, i))
+        var s: [u8; 2] = "; "
+        rt.buf_push_bytes(b, (&s[0]) as u64, 2)
+        rt.buf_push_dec_u64(b, ty_n(t, i))
+        rt.buf_push(b, 93 as u8)
+        return
+    }
+    if k == K_STRUCT {
+        let nr: u32 = st_name(t, ty_a(t, i) as usize)
+        rt.buf_push_bytes(b, intern.intern_ptr(it, nr), intern.intern_length(it, nr))
+        return
+    }
+    if k == K_VOID {
+        var v: [u8; 2] = "()"
+        rt.buf_push_bytes(b, (&v[0]) as u64, 2)
+        return
+    }
+    if k == K_ERROR {
+        var f: [u8; 7] = "<error>"
+        rt.buf_push_bytes(b, (&f[0]) as u64, 7)
+        return
+    }
+    var tab: [u8; 50] = "i8|i16|i32|i64|u8|u16|u32|u64|usize|isize|bool|f64"
+    var idx: usize = 0
+    var nr2: u32 = 0
+    var start: usize = 0
+    while idx <= 50 {
+        var end: bool = idx == 50
+        if !end {
+            end = tab[idx] == 124 as u8
+        }
+        if end {
+            if nr2 == k {
+                rt.buf_push_bytes(b, (&tab[start]) as u64, idx - start)
+                return
+            }
+            nr2 = nr2 + 1
+            start = idx + 1
+        }
+        idx = idx + 1
+    }
+}

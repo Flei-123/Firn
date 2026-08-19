@@ -1,7 +1,7 @@
 # Runde 40 — Regalloc-Angriff auf realweb, GC-Dauerlauf ehrlich gemacht
 
 Basis: Merge-Commit `415e8b4` (Runden 37+38+39). Revier: `compiler/src/regalloc.rs`
-und `tools/gc_mess/`. Zwei getrennte Stränge, beide in dieser Datei.
+und `tools/gc_meas/`. Zwei getrennte Stränge, beide in dieser Datei.
 
 ## Strang A — Registerzuteilung
 
@@ -48,7 +48,7 @@ Fixpunkt 289 096 Zeilen zeichengleich.
 
 ## Strang B — der GC-Dauerlauf maß den falschen Pfad
 
-Der 30-Minuten-Dauerlauf aus Runde 38 (`tools/gc_mess/pause.fi`) lief sauber
+Der 30-Minuten-Dauerlauf aus Runde 38 (`tools/gc_meas/pause.fi`) lief sauber
 durch, aber die ehrliche Auswertung zeigt:
 
 - 30,0 min, 1 394 549 Sammelläufe, 2 948 276 000 Zyklen, 0 übersehene
@@ -65,7 +65,7 @@ ein — er wurde in diesem Lauf also **kein einziges Mal benutzt**. Der Lauf
 belegt die Stabilität des nicht-inkrementellen Pfades, über die in Runde 38
 beworbenen „~0,5 ms, heap-unabhängig" sagt er nichts.
 
-### B1 — neuer Lauf mit großer lebender Menge (`tools/gc_mess/pause_gross.fi`)
+### B1 — neuer Lauf mit großer lebender Menge (`tools/gc_meas/pause_big.fi`)
 
 Hält absichtlich viel am Leben: eine Wurzel mit `KINDER` (Standard 120 000)
 Textknoten als Geschwisterkette, gehalten an einer Rahmenzelle von `main`,
@@ -175,8 +175,8 @@ mit Instruktionszählung belegen, nie mit der Uhr.
 
 ## Strang B2 — der 30-Minuten-Dauerlauf MIT großer lebender Menge
 
-Nachgeholt mit `pause_gross.fi` (120 000 lebende Knoten, Heap 13 MiB,
-1800 s). Rohdaten: `tools/gc_mess/dauer30_gross.tsv`.
+Nachgeholt mit `pause_big.fi` (120 000 lebende Knoten, Heap 13 MiB,
+1800 s). Rohdaten: `tools/gc_meas/duration30_big.tsv`.
 
 - 23 840 Sammelläufe, 202 453 000 Zyklen, 3 übersehene Mehrfach-Sammlungen
 - RSS über die ganze Zeit 12,9–13,9 MiB, Ende 12,89 MiB — **kein Drift**,
@@ -221,7 +221,7 @@ Scheibenklasse. Dadurch war das globale Maximum (11,8 ms) größer als jedes
 Typmaximum (3,6 ms) und niemand konnte sehen, woher es kam. Behoben: der
 volle Lauf ist jetzt **Typ 4**, dazu ein Zähler `gc_volle_laeufe()`.
 
-Damit gemessen (`pause_gross.fi`, 120 000 lebende Knoten, 13 MiB Heap):
+Damit gemessen (`pause_big.fi`, 120 000 lebende Knoten, 13 MiB Heap):
 
 | Lauf | Sammelläufe | davon volle | längste Scheibe (Typ 0–3) | Typ 4 |
 |---|---|---|---|---|

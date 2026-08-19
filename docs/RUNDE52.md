@@ -18,9 +18,9 @@ Datei. Diese Runde macht die Deklaration wahr.
 | | Basis `cc1710f` | Runde 52 |
 |---|---|---|
 | `bash ./test.sh` | 751/751 | **782/782** |
-| `bash tools/selbst_vergleich.sh` | 213 / 0 abweichend / 0 fehlerhaft | **218 / 0 / 0** |
-| `bash tools/fixpunkt.sh` | zeichengleich, 427 401 Zeilen | **zeichengleich, 448 038 Zeilen** |
-| `bash tools/freistehend/run.sh` | — | **41 / 41** |
+| `bash tools/self_compare.sh` | 213 / 0 abweichend / 0 fehlerhaft | **218 / 0 / 0** |
+| `bash tools/fixpoint.sh` | zeichengleich, 427 401 Zeilen | **zeichengleich, 448 038 Zeilen** |
+| `bash tools/freestanding/run.sh` | — | **41 / 41** |
 | Kernel-Beispiel in QEMU gebootet | — | **ja, mit beiden Compilern** |
 
 ---
@@ -85,7 +85,7 @@ Fünf Entscheidungen, jede mit Preis:
 
 1. **`asm` ist kein Schlüsselwort.** Der Parser erkennt die Form nur, wenn auf
    den Bezeichner `asm` unmittelbar `(` und ein Zeichenkettenliteral folgen.
-   Damit ändert sich der Tokenstrom nicht (`tools/lex_vergleich.sh` bleibt
+   Damit ändert sich der Tokenstrom nicht (`tools/lex_compare.sh` bleibt
    unberührt) und `asm` bleibt als Name benutzbar. *Preis:* wer eine Funktion
    `asm(s: [u8; N])` schreibt und sie mit einem Literal aufruft, bekommt den
    Assembler statt seiner Funktion.
@@ -128,29 +128,29 @@ Nachgewiesen wird das an drei Stellen, und zwar **gemessen**, nicht behauptet:
   Compilern. `851` liefert 0 statt 7, wenn der Block wegfällt; `852` liefert 2
   statt 3, wenn zwei wörtlich gleiche Blöcke zusammengelegt werden; `853`
   liefert 10 oder 18 statt 14, wenn MMIO-Zugriffe zusammengelegt werden.
-* `tools/freistehend/volatile.fi` steht ganz in **einer** Funktion und ruft
+* `tools/freestanding/volatile.fi` steht ganz in **einer** Funktion und ruft
   nichts — Einbetten kann die Zahlen also nicht verschieben. Gezählt wird in
   der FIR **nach** dem Optimierer (`--emit=fir`): `asm.void "pause"` = 3,
   `asm.u64 "rdtsc"` = 1, `mmio_load.u32` = 2, `mmio_store.u32` = 1, in jeder
   Baustufe.
-* Sechs Rust-Modultests in `compiler/src/kern.rs`.
+* Sechs Rust-Modultests in `compiler/src/core.rs`.
 
 ### 3.2 Was Einbetten darf
 
 `--opt-level=release-fast` bettet `out8`/`in8` in ihre Aufrufer ein; danach
 steht `out dx, al` zehnmal statt einmal im Assembler. Das ist **richtig**:
 Einbetten verdoppelt den Block samt Aufruf, es entfernt und verschmilzt ihn
-nicht. `tools/freistehend/run.sh` prüft deshalb `cli` und `hlt` exakt (sie
+nicht. `tools/freestanding/run.sh` prüft deshalb `cli` und `hlt` exakt (sie
 stehen in `kern_start`, das niemand ruft) und `out`/`in` nur auf „mindestens
 einmal"; die exakte Zählung macht `volatile.fi`.
 
 ## 4. MMIO
 
 ```firn
-__mmio_lesen8(p)      __mmio_schreiben8(p, w)
-__mmio_lesen16(p)     __mmio_schreiben16(p, w)
-__mmio_lesen32(p)     __mmio_schreiben32(p, w)
-__mmio_lesen64(p)     __mmio_schreiben64(p, w)
+__mmio_read8(p)      __mmio_write8(p, w)
+__mmio_read16(p)     __mmio_write16(p, w)
+__mmio_read32(p)     __mmio_write32(p, w)
+__mmio_read64(p)     __mmio_write64(p, w)
 ```
 
 Acht eingebaute Namen mit reserviertem `__`-Präfix (wie `__atomar_addieren`,
@@ -186,13 +186,13 @@ und den Stapel zerlegen; nur die IDT darf auf sie zeigen).
 
 ## 6. Der Nachweis: ein Kernel, der wirklich bootet
 
-`beispiele/kernel/kern.fi` — 130 Zeilen Firn: serieller Port COM1 über
+`demos/kernel/core.fi` — 130 Zeilen Firn: serieller Port COM1 über
 `in`/`out`, VGA-Textpuffer bei `0xB8000` über MMIO, ein Interrupt-Einsprung.
-`beispiele/kernel/start.s` (60 Zeilen, das einzige Nicht-Firn) trägt den
-Multiboot-Kopf und den Weg in den Langen Modus; `beispiele/kernel/linker.ld`
+`demos/kernel/start.s` (60 Zeilen, das einzige Nicht-Firn) trägt den
+Multiboot-Kopf und den Weg in den Langen Modus; `demos/kernel/linker.ld`
 bindet bei 1 MiB.
 
-`bash tools/freistehend/run.sh` — **41 Prüfungen, 41 bestanden.** Auszug:
+`bash tools/freestanding/run.sh` — **41 Prüfungen, 41 bestanden.** Auszug:
 
 ```
 == 2. Es ist eine OBJEKTdatei, und sie ist freistehend ==
@@ -218,7 +218,7 @@ bindet bei 1 MiB.
 Von Hand nachvollziehbar:
 
 ```sh
-$ compiler/target/release/firnc -o /tmp/kern0.o beispiele/kernel/kern.fi
+$ compiler/target/release/firnc -o /tmp/kern0.o demos/kernel/core.fi
 $ file /tmp/kern0.o
 /tmp/kern0.o: ELF 64-bit LSB relocatable, x86-64, version 1 (SYSV), with debug_info, not stripped
 $ nm /tmp/kern0.o
@@ -244,8 +244,8 @@ $ objdump -d /tmp/kern0.o | grep -c syscall
 Und der Boot:
 
 ```sh
-$ as --64 -o /tmp/start.o beispiele/kernel/start.s
-$ ld -n -T beispiele/kernel/linker.ld --defsym=KERN_START=_F0.kern_start \
+$ as --64 -o /tmp/start.o demos/kernel/start.s
+$ ld -n -T demos/kernel/linker.ld --defsym=KERN_START=_F0.kern_start \
      -o /tmp/kern0.elf /tmp/start.o /tmp/kern0.o
 $ objcopy -O elf32-i386 /tmp/kern0.elf /tmp/kern0.mb   # QEMUs Multiboot nimmt nur ELF32
 $ qemu-system-x86_64 -kernel /tmp/kern0.mb -serial stdio -display none -no-reboot
@@ -253,14 +253,14 @@ FIRN: profile kernel ist
 freistehend.
 ```
 
-Dasselbe mit `./.firnc1 beispiele/kernel/kern.fi -o /tmp/kern1.o` und
+Dasselbe mit `./.firnc1 demos/kernel/core.fi -o /tmp/kern1.o` und
 `--defsym=KERN_START=_F1.kern_start`: dieselbe Ausgabe.
 
 ## 7. Beide Compiler
 
 | | `firnc0` (Rust) | `firnc1` (Firn) |
 |---|---|---|
-| `asm(…)` mit `in`/`out`/`clobber` | `compiler/src/kern.rs` | `lib/firnc1/{kern,parser,sema,lower,codegen}.fi` |
+| `asm(…)` mit `in`/`out`/`clobber` | `compiler/src/core.rs` | `lib/firnc1/{kern,parser,sema,lower,codegen}.fi` |
 | MMIO ×8 | ✓ | ✓ |
 | `#[interrupt]` → `iretq` | ✓ | ✓ |
 | `-c` / `--objekt` | ✓ | ✓ |
@@ -277,7 +277,7 @@ O_MMIOLD  = 51   mmio_load.<ty> %adr
 O_MMIOST  = 52   mmio_store.<ty> %wert, %adr
 ```
 
-Die Textform ist **Vertrag**: `tools/fir_vergleich.sh` vergleicht
+Die Textform ist **Vertrag**: `tools/fir_compare.sh` vergleicht
 `firnc0 --emit=fir-raw` Oktett für Oktett mit `bin/firdump.fi`. Für
 `tests/850`–`854` ist sie gleich.
 
@@ -292,7 +292,7 @@ auf beiden Seiten denselben Text.
 
 ```
 $ rm -f .firnc1 .firnc2 .firnc3
-$ bash tools/fixpunkt.sh
+$ bash tools/fixpoint.sh
 STUFE 2: 2760 ms   2581456 Oktette
 STUFE 3: 8004 ms   2581456 Oktette
 FIXPUNKT:  Stufe 2 == Stufe 3, zeichengleich (448038 Zeilen Assembler)
@@ -306,7 +306,7 @@ FIXPUNKT:  Stufe 2 == Stufe 3, zeichengleich (448038 Zeilen Assembler)
   UEBERSPRUNGEN:      18
 KORPUS:    .firnc2 verhaelt sich wie firnc0
 
-$ bash tools/freistehend/run.sh
+$ bash tools/freestanding/run.sh
 FREISTEHEND: 41 bestanden, 0 fehlgeschlagen
 ```
 
@@ -338,7 +338,7 @@ Ehrlich und vollständig:
 
 1. **Globale, veränderliche Daten.** SPEC §14, Punkt 5: es gibt nur `const`.
    Ohne sie kann ein Kernel keine IDT, keine GDT und keinen Tick-Zähler
-   halten. `beispiele/kernel/kern.fi` weicht deshalb aus und zählt im
+   halten. `demos/kernel/core.fi` weicht deshalb aus und zählt im
    Bildspeicher. **Das ist der größte Blocker**, größer als alles andere in
    dieser Liste, und er gehört nicht dieser Runde (Revier: Profil,
    Ausgabeformat, Inline-Asm, MMIO, Interrupt-ABI).
@@ -387,18 +387,18 @@ Ehrlich und vollständig:
 ## 10. Geänderte Dateien
 
 ```
-compiler/src/kern.rs            neu   Inline-Assembler, MMIO, #[interrupt]
-compiler/src/profil.rs          neu   Profilauflösung und -durchsetzung
+compiler/src/core.rs            neu   Inline-Assembler, MMIO, #[interrupt]
+compiler/src/prof.rs          neu   Profilauflösung und -durchsetzung
 compiler/src/fir.rs                   Op::Asm/MmioLoad/MmioStore, Func.interrupt
 compiler/src/{opt,mem2reg,licm,inline,regalloc}.rs   volatile-Schutz
 compiler/src/codegen_x86.rs           kein _start im Kernel-Profil, iretq-Epilog
 compiler/src/main.rs                  -c/--objekt, --profile=
 compiler/src/{sema,lower,parser,modules,attrs}.rs    Hooks
-lib/firnc1/kern.fi              neu   Registertabelle, MMIO-Namen, asm-Nummern
+lib/firnc1/core.fi              neu   Registertabelle, MMIO-Namen, asm-Nummern
 lib/firnc1/{ast,parser,sema,lower,fir,codegen}.fi    dieselbe Sprache in Firn
 bin/firnc1.fi                         -c/--objekt, --profile=
-beispiele/kernel/{kern.fi,start.s,linker.ld}   neu   der Nachweis
-tools/freistehend/{run.sh,volatile.fi}         neu   41 Prüfungen
+demos/kernel/{core.fi,start.s,linker.ld}   neu   der Nachweis
+tools/freestanding/{run.sh,volatile.fi}         neu   41 Prüfungen
 tests/85{0,1,2,3,4}_*.fi                       neu   laufende Programme
 tests/neg/frei_*.fi (15)                       neu   jede Verbotsmeldung
 test.sh                               Abschnitt 19

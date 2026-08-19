@@ -6,7 +6,7 @@
 in denselben Baum geparst, bevor die Monomorphisierung laeuft.
 
 ## Gebaut
-- `lib/firnc1/zeit.fi` (689 Z.): Registrierung der comptime-Bloecke + Interpreter
+- `lib/firnc1/time.fi` (689 Z.): Registrierung der comptime-Bloecke + Interpreter
   (Ausdruecke, Anweisungen, Schleifen, Aufrufe auf comptime-fn), Ausgabe in rt.Buf.
 - `ast.fi`: `ct_block`-Sammelliste in der Wurzeldatei.
 - `parser.fi`: liest `comptime { }`, Vorabsuche weicht auf (Bloecke ohne Namensbindung),
@@ -23,7 +23,7 @@ in denselben Baum geparst, bevor die Monomorphisierung laeuft.
 
 ## Messwerte (Worktree-Checkout, Branch r35-comptime)
 - test.sh: 634/634 (vorher 631)
-- tools/selbst_vergleich.sh: 169 verhaltensgleich (vorher 166), 0 abweichend, 0 fehlerhaft
+- tools/self_compare.sh: 169 verhaltensgleich (vorher 166), 0 abweichend, 0 fehlerhaft
 - Fixpunkt: Stufe 2 == Stufe 3, zeichengleich, 210324 Zeilen Assembler
-- Neu: tests/760_comptime_kern.fi (comptime-Kernsprache)
+- Neu: tests/760_comptime_core.fi (comptime-Kernsprache)
 - Zieldateien 601/602 (u. a. UCD-Tabellen-Erzeugung) laufen identisch zu firnc0

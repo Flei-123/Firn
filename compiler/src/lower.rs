@@ -92,7 +92,7 @@ impl<'a> Lower<'a> {
     pub(crate) fn ice<T>(&mut self, span: Span, what: &str) -> Option<T> {
         self.dg.error(
             span,
-            format!("interner fehler beim uebersetzen nach FIR: {}", what),
+            format!("internal error while lowering to FIR: {}", what),
         );
         None
     }
@@ -107,7 +107,7 @@ impl<'a> Lower<'a> {
         let t = self.ty_of(e);
         match scalar_fty(&t) {
             Some(f) => Some(f),
-            None => self.ice(e.span, "ausdruck hat keinen skalaren typ"),
+            None => self.ice(e.span, "expression has no scalar type"),
         }
     }
 
@@ -188,7 +188,7 @@ impl<'a> Lower<'a> {
         Some(())
     }
 
-    pub(crate) fn konst(&mut self, ty: FTy, v: i128) -> Val {
+    pub(crate) fn constant(&mut self, ty: FTy, v: i128) -> Val {
         self.push(ty, Op::Const(v))
     }
 
@@ -211,7 +211,7 @@ impl<'a> Lower<'a> {
         if off == 0 {
             return base;
         }
-        let o = self.konst(FTy::I64, off as i128);
+        let o = self.constant(FTy::I64, off as i128);
         self.push(FTy::Ptr, Op::PtrAdd { base, off: o })
     }
 
@@ -254,7 +254,7 @@ impl<'a> Lower<'a> {
 
     pub(crate) fn lower_addr(&mut self, e: &Expr) -> Option<Val> {
         if self.depth > MAX_DEPTH {
-            return self.err(e.span, "ausdruck zu tief verschachtelt");
+            return self.err(e.span, "expression nested too deeply");
         }
         self.depth += 1;
         let r = self.lower_addr_inner(e);
@@ -272,9 +272,9 @@ impl<'a> Lower<'a> {
                 Some(slot) => Some(slot),
                 None => {
                     if self.info.consts.contains_key(name) {
-                        self.err(e.span, "eine konstante hat keine adresse")
+                        self.err(e.span, "a constant has no address")
                     } else {
-                        self.ice(e.span, "unbekannter name im lowering")
+                        self.ice(e.span, "unknown name in lowering")
                     }
                 }
             },
@@ -286,9 +286,9 @@ impl<'a> Lower<'a> {
                     // `p.f` auf einem Zeiger auf Struct: automatisch dereferenzieren
                     Type::Ptr { inner, .. } => match **inner {
                         Type::Struct(i) => (i, self.lower_expr(base)?),
-                        _ => return self.ice(*fspan, "feldzugriff auf nicht-struct"),
+                        _ => return self.ice(*fspan, "field access on a non-struct"),
                     },
-                    _ => return self.ice(*fspan, "feldzugriff auf nicht-struct"),
+                    _ => return self.ice(*fspan, "field access on a non-struct"),
                 };
                 // Schicht Feldzugriff <-> Speicherort (layout.rs, DESIGNZIELE 8)
                 self.field_addr(baddr, sidx, fname, *fspan)
@@ -298,7 +298,7 @@ impl<'a> Lower<'a> {
                 let (elem, baddr) = match &bt {
                     Type::Array(el, _) => ((**el).clone(), self.lower_addr(base)?),
                     Type::Ptr { inner, .. } => ((**inner).clone(), self.lower_expr(base)?),
-                    _ => return self.ice(e.span, "index auf nicht-indizierbarem typ"),
+                    _ => return self.ice(e.span, "index on a non-indexable type"),
                 };
                 let esz = self.info.tcx.size_of(&elem).max(1);
                 let iv = self.lower_expr(idx)?;
@@ -315,7 +315,7 @@ impl<'a> Lower<'a> {
             }
             // HOOK iface: `((&x) as dyn I).m()` — der Schnittstellenwert
             // bekommt einen Zwischenplatz, dessen Adresse hier steht (iface.rs)
-            ExprKind::Cast(..) if crate::iface::ist_dyn(&self.info.tcx, &self.ty_of(e)) => {
+            ExprKind::Cast(..) if crate::iface::is_dyn(&self.info.tcx, &self.ty_of(e)) => {
                 let t = self.ty_of(e);
                 let (size, align) = self.size_align(&t);
                 let slot = self.alloca(size, align);
@@ -331,7 +331,7 @@ impl<'a> Lower<'a> {
             ExprKind::Call(name, args, span) => {
                 let t = self.ty_of(e);
                 if !is_agg(&t) {
-                    return self.err(e.span, "dieser ausdruck hat keine adresse");
+                    return self.err(e.span, "this expression has no address");
                 }
                 let (size, align) = self.size_align(&t);
                 let slot = self.alloca(size, align);
@@ -341,7 +341,7 @@ impl<'a> Lower<'a> {
                 self.lower_call(&name, &args, Some(slot), span)?;
                 Some(slot)
             }
-            _ => self.err(e.span, "dieser ausdruck hat keine adresse"),
+            _ => self.err(e.span, "this expression has no address"),
         }
     }
 
@@ -349,7 +349,7 @@ impl<'a> Lower<'a> {
     /// Literal: feld-/elementweise, sonstiges Aggregat: `copymem`).
     pub(crate) fn write_into(&mut self, addr: Val, e: &Expr) -> Option<()> {
         if self.depth > MAX_DEPTH {
-            return self.err(e.span, "ausdruck zu tief verschachtelt");
+            return self.err(e.span, "expression nested too deeply");
         }
         self.depth += 1;
         let r = self.write_into_inner(addr, e);
@@ -367,7 +367,7 @@ impl<'a> Lower<'a> {
             ExprKind::StructLit(_, fields, span) => {
                 let sidx = match t {
                     Type::Struct(i) => i,
-                    _ => return self.ice(*span, "struct-literal ohne struct-typ"),
+                    _ => return self.ice(*span, "struct literal without struct type"),
                 };
                 for (fname, fexpr, fspan) in fields {
                     // Schicht Feldzugriff <-> Speicherort (layout.rs, DESIGNZIELE 8)
@@ -379,7 +379,7 @@ impl<'a> Lower<'a> {
             ExprKind::ArrayLit(elems) => {
                 let et = match &t {
                     Type::Array(el, _) => (**el).clone(),
-                    _ => return self.ice(e.span, "array-literal ohne array-typ"),
+                    _ => return self.ice(e.span, "array literal without array type"),
                 };
                 let esz = self.info.tcx.size_of(&et).max(1);
                 for (i, el) in elems.iter().enumerate() {
@@ -391,13 +391,13 @@ impl<'a> Lower<'a> {
             ExprKind::ArrayRepeat(val, _) => {
                 let (et, n) = match &t {
                     Type::Array(el, n) => ((**el).clone(), *n),
-                    _ => return self.ice(e.span, "wiederholungsliteral ohne array-typ"),
+                    _ => return self.ice(e.span, "repetition literal without array type"),
                 };
                 self.lower_repeat(addr, val, &et, n)
             }
             // HOOK iface: `p as dyn I` — Datenzeiger und Methodentafel
             // (iface.rs, Runde 46)
-            ExprKind::Cast(inner, _) if crate::iface::ist_dyn(&self.info.tcx, &t) => {
+            ExprKind::Cast(inner, _) if crate::iface::is_dyn(&self.info.tcx, &t) => {
                 let inner = (**inner).clone();
                 crate::iface::lower_cast_into(self, addr, &inner, &t, e.span)
             }
@@ -432,7 +432,7 @@ impl<'a> Lower<'a> {
 
     pub(crate) fn lower_expr(&mut self, e: &Expr) -> Option<Val> {
         if self.depth > MAX_DEPTH {
-            return self.err(e.span, "ausdruck zu tief verschachtelt");
+            return self.err(e.span, "expression nested too deeply");
         }
         self.depth += 1;
         let r = self.lower_expr_inner(e);
@@ -447,17 +447,17 @@ impl<'a> Lower<'a> {
         }
         let t = self.ty_of(e);
         if is_agg(&t) {
-            return self.ice(e.span, "aggregat als wert (nur adressen erlaubt)");
+            return self.ice(e.span, "aggregate as value (only addresses allowed)");
         }
         match &e.kind {
             ExprKind::Int(v) => {
                 let ft = self.fty_of(e)?;
-                Some(self.konst(ft, *v))
+                Some(self.constant(ft, *v))
             }
             // Das BITMUSTER wandert als Konstante ins FIR — dort gibt es keine
             // Gleitkommaliterale, nur Bitmuster (fir::FTy::F64).
-            ExprKind::Float(bits) => Some(self.konst(FTy::F64, *bits as i128)),
-            ExprKind::Bool(b) => Some(self.konst(FTy::Bool, if *b { 1 } else { 0 })),
+            ExprKind::Float(bits) => Some(self.constant(FTy::F64, *bits as i128)),
+            ExprKind::Bool(b) => Some(self.constant(FTy::Bool, if *b { 1 } else { 0 })),
             ExprKind::Ident(name) => {
                 if let Some(slot) = self.lookup(name) {
                     let ft = self.fty_of(e)?;
@@ -465,11 +465,11 @@ impl<'a> Lower<'a> {
                 } else if let Some((ct, cv)) = self.info.consts.get(name).cloned() {
                     let ft = match scalar_fty(&ct) {
                         Some(f) => f,
-                        None => return self.ice(e.span, "konstante mit nicht-skalarem typ"),
+                        None => return self.ice(e.span, "constant with a non-scalar type"),
                     };
-                    Some(self.konst(ft, cv))
+                    Some(self.constant(ft, cv))
                 } else {
-                    self.ice(e.span, "unbekannter name im lowering")
+                    self.ice(e.span, "unknown name in lowering")
                 }
             }
             ExprKind::Unary(op, inner) => self.lower_unary(e, *op, inner),
@@ -481,19 +481,19 @@ impl<'a> Lower<'a> {
             }
             // HOOK types: Aufzaehlungswerte sind Aggregate, kein Aufruf (lower_match.rs)
             ExprKind::Call(name, _, span) if crate::lower_match::is_types_call(name) => {
-                self.err(*span, "ein aufzaehlungswert ist ein aggregat und kein skalarer wert")
+                self.err(*span, "an enum value is an aggregate and not a scalar value")
             }
             ExprKind::Call(name, args, span) => {
                 let ft = self.fty_of(e)?;
                 if ft == FTy::Void {
                     return self.err(
                         *span,
-                        "aufruf ohne rueckgabewert kann nicht als wert benutzt werden",
+                        "call without return value cannot be used as a value",
                     );
                 }
                 match self.lower_call(name, args, None, *span)? {
                     Some(v) => Some(v),
-                    None => self.ice(*span, "aufruf ohne wert an einer wertstelle"),
+                    None => self.ice(*span, "call without value in a value position"),
                 }
             }
             ExprKind::Syscall(args) => {
@@ -509,7 +509,7 @@ impl<'a> Lower<'a> {
                 }
                 if to == FTy::Bool {
                     // `x as bool` ist definiert als `x != 0` (0/1, nie 2).
-                    let z = self.konst(from, 0);
+                    let z = self.constant(from, 0);
                     return Some(self.push(
                         FTy::Bool,
                         Op::Cmp { op: CmpOp::Ne, ty: from, a: src, b: z },
@@ -518,7 +518,7 @@ impl<'a> Lower<'a> {
                 Some(self.push(to, Op::Cast { src, from }))
             }
             ExprKind::StructLit(..) | ExprKind::ArrayLit(_) | ExprKind::ArrayRepeat(..) => {
-                self.ice(e.span, "literal eines aggregats als wert")
+                self.ice(e.span, "literal of an aggregate as a value")
             }
         }
     }
@@ -551,7 +551,7 @@ impl<'a> Lower<'a> {
             return r;
         }
         if op.is_logic() {
-            return self.lower_shortcircuit(op, a, b);
+            return self.lower_short_circuit(op, a, b);
         }
         if op.is_cmp() {
             let ty = self.fty_of(a)?;
@@ -579,7 +579,7 @@ impl<'a> Lower<'a> {
             B::Xor => FBin::Xor,
             B::Shl => FBin::Shl,
             B::Shr => FBin::Shr,
-            _ => return self.ice(e.span, "unbekannter binaeroperator"),
+            _ => return self.ice(e.span, "unknown binary operator"),
         };
         let av = self.lower_expr(a)?;
         let mut bv = self.lower_expr(b)?;
@@ -596,7 +596,7 @@ impl<'a> Lower<'a> {
 
     /// `&&` / `||` kurzschliessend: Ergebnis-Slot + Verzweigung, keine
     /// arithmetische Ersatzoperation.
-    fn lower_shortcircuit(&mut self, op: ast::BinOp, a: &Expr, b: &Expr) -> Option<Val> {
+    fn lower_short_circuit(&mut self, op: ast::BinOp, a: &Expr, b: &Expr) -> Option<Val> {
         let slot = self.alloca(1, 1);
         let av = self.lower_expr(a)?;
         self.store(FTy::Bool, slot, av);
@@ -630,24 +630,24 @@ impl<'a> Lower<'a> {
         span: Span,
     ) -> Option<Option<Val>> {
         // HOOK constant-time: select/barrier/secure_zero (ct.rs, SPEC §9.2/§9.3)
-        // HOOK faden: die drei Faden-Primitive (faden.rs, Runde 49)
-        if crate::faden::ist_faden_call(name) && !self.info.fns.contains_key(name) {
-            return crate::faden::lower_faden_call(self, name, args, span);
+        // HOOK faden: die drei Faden-Primitive (thread.rs, Runde 49)
+        if crate::thread::is_thread_call(name) && !self.info.fns.contains_key(name) {
+            return crate::thread::lower_thread_call(self, name, args, span);
         }
-        // HOOK atomar: das atomare Primitiv (atomar.rs, Runde 47)
-        if crate::atomar::is_atomar_call(name) && !self.info.fns.contains_key(name) {
-            return crate::atomar::lower_atomar_call(self, name, args, span);
+        // HOOK atomar: das atomare Primitiv (atomic.rs, Runde 47)
+        if crate::atomic::is_atomic_call(name) && !self.info.fns.contains_key(name) {
+            return crate::atomic::lower_atomic_call(self, name, args, span);
         }
         if crate::ct::is_ct_call(name) && !self.info.fns.contains_key(name) {
             return crate::ct::lower_ct_call(self, name, args, span);
         }
         // HOOK sizeof: `size_of[T]()` ist eine Konstante — zur Laufzeit
         // bleibt davon nichts uebrig (sizeof.rs)
-        if let Some(g) = crate::sizeof::wert(name) {
-            return Some(Some(self.konst(FTy::U64, g)));
+        if let Some(g) = crate::sizeof::value(name) {
+            return Some(Some(self.constant(FTy::U64, g)));
         }
-        // HOOK kern: Inline-Assembler und MMIO (kern.rs, Runde 52)
-        if let Some(r) = crate::kern::lower_hook(self, name, args, span) {
+        // HOOK kern: Inline-Assembler und MMIO (core.rs, Runde 52)
+        if let Some(r) = crate::core::lower_hook(self, name, args, span) {
             return r;
         }
         // HOOK gc: Allokation `gc C{…}`, Sammler-Intrinsics, `x.as?[C]`
@@ -656,7 +656,7 @@ impl<'a> Lower<'a> {
             return r;
         }
         // HOOK gc: `weak`/`stark` sind Laufzeitfunktionen (gc_lower.rs)
-        let name: &str = match crate::gc_lower::echter_name(name) {
+        let name: &str = match crate::gc_lower::real_name(name) {
             Some(n) if !self.info.fns.contains_key(name) => n,
             _ => name,
         };
@@ -665,46 +665,46 @@ impl<'a> Lower<'a> {
         // Methodennamen, genau wie in `sema` (impls.rs, Runde 45). Verlangt
         // die Methode einen Zeiger und liegt der Empfaenger als Wert vor,
         // wird seine ADRESSE uebergeben.
-        let aufgeloest;
-        let mut empfaenger_adresse = false;
+        let resolved;
+        let mut receiver_address = false;
         // HOOK iface: `f.m(a)` auf einem `dyn I` — der dynamische Versand
         // (iface.rs, Runde 46). `versand` traegt das AUFRUFZIEL (aus der
         // Methodentafel) und den Datenzeiger; alles andere — Aggregate,
         // versteckter Rueckgabezeiger, Stapelargumente — laeuft danach durch
         // genau denselben Code wie ein gewoehnlicher Aufruf.
-        let mut versand: Option<(Val, Val)> = None;
+        let mut dispatch: Option<(Val, Val)> = None;
         let mut dyn_sig: Option<crate::sema::FnSig> = None;
-        if let Some(m) = crate::impls::methodenname(name) {
+        if let Some(m) = crate::impls::method_name(name) {
             let et = match args.first() {
                 Some(e) => self.ty_of(e),
-                None => return self.ice(span, "methodenaufruf ohne empfaenger"),
+                None => return self.ice(span, "method call without receiver"),
             };
-            if let Some(iname) = crate::impls::dyn_schnittstelle(&self.info.tcx, &et) {
-                let empf = match args.first() {
+            if let Some(iname) = crate::impls::dyn_interface(&self.info.tcx, &et) {
+                let recv = match args.first() {
                     Some(e) => e,
-                    None => return self.ice(span, "methodenaufruf ohne empfaenger"),
+                    None => return self.ice(span, "method call without receiver"),
                 };
-                let (ziel, daten, sig) =
-                    crate::iface::lower_versand(self, &iname, m, empf, span)?;
-                versand = Some((ziel, daten));
+                let (target, data, sig) =
+                    crate::iface::lower_dispatch(self, &iname, m, recv, span)?;
+                dispatch = Some((target, data));
                 dyn_sig = Some(sig);
             }
         }
-        let name: &str = match crate::impls::methodenname(name) {
+        let name: &str = match crate::impls::method_name(name) {
             None => name,
-            Some(_) if versand.is_some() => name,
+            Some(_) if dispatch.is_some() => name,
             Some(m) => {
                 let et = match args.first() {
                     Some(e) => self.ty_of(e),
-                    None => return self.ice(span, "methodenaufruf ohne empfaenger"),
+                    None => return self.ice(span, "method call without receiver"),
                 };
-                match crate::impls::ziel(&self.info, m, &et) {
-                    Some((voll, adr)) => {
-                        aufgeloest = voll;
-                        empfaenger_adresse = adr;
-                        &aufgeloest
+                match crate::impls::target(&self.info, m, &et) {
+                    Some((full, addr)) => {
+                        resolved = full;
+                        receiver_address = addr;
+                        &resolved
                     }
-                    None => return self.ice(span, "unbekannte methode im lowering"),
+                    None => return self.ice(span, "unknown method in lowering"),
                 }
             }
         };
@@ -712,7 +712,7 @@ impl<'a> Lower<'a> {
             Some(s) => s,
             None => match self.info.fns.get(name) {
                 Some(s) => s.clone(),
-                None => return self.ice(span, "unbekannte funktion im lowering"),
+                None => return self.ice(span, "unknown function in lowering"),
             },
         };
         let ret_agg = is_agg(&sig.ret);
@@ -739,15 +739,15 @@ impl<'a> Lower<'a> {
             // HOOK iface: der Empfaenger ist der Datenzeiger aus dem fetten
             // Zeiger — er wurde oben schon gelesen (iface.rs)
             if i == 0 {
-                if let Some((_, daten)) = versand {
-                    vals.push(daten);
+                if let Some((_, data)) = dispatch {
+                    vals.push(data);
                     continue;
                 }
             }
             // HOOK impl: der Empfaenger geht als Adresse hinein (impls.rs)
-            if i == 0 && empfaenger_adresse {
-                let adr = self.lower_addr(a)?;
-                vals.push(adr);
+            if i == 0 && receiver_address {
+                let addr = self.lower_addr(a)?;
+                vals.push(addr);
                 continue;
             }
             // HOOK fehlerunionen: implizite Umwandlung eines Arguments (lower_errors.rs)
@@ -774,14 +774,14 @@ impl<'a> Lower<'a> {
                 }
             }
         }
-        let op = match versand {
-            Some((ziel, _)) => Op::CallIndirect { target: ziel, args: vals },
+        let op = match dispatch {
+            Some((target, _)) => Op::CallIndirect { target: target, args: vals },
             None => Op::Call { name: name.to_string(), args: vals },
         };
         if ret_agg {
             let d = match target {
                 Some(d) => d,
-                None => return self.ice(span, "aggregatrueckgabe ohne ziel"),
+                None => return self.ice(span, "aggregate return without target"),
             };
             let size = self.info.tcx.size_of(&sig.ret);
             if sret {
@@ -810,7 +810,7 @@ impl<'a> Lower<'a> {
         let (sv, saddr) = if scalar {
             let ft = match scalar_fty(et) {
                 Some(f) => f,
-                None => return self.ice(val.span, "element ohne skalaren typ"),
+                None => return self.ice(val.span, "element without scalar type"),
             };
             (Some((ft, self.lower_expr(val)?)), None)
         } else {
@@ -825,14 +825,14 @@ impl<'a> Lower<'a> {
                     (None, Some(src)) => {
                         self.push_void(FTy::Void, Op::CopyMem { dst: ea, src, size: esz })
                     }
-                    _ => return self.ice(val.span, "wiederholungsliteral ohne wert"),
+                    _ => return self.ice(val.span, "repetition literal without value"),
                 }
             }
             return Some(());
         }
         // Grosse Laengen als Schleife: i = 0; while i < n { .. ; i = i + 1 }
         let islot = self.alloca(8, 8);
-        let zero = self.konst(FTy::U64, 0);
+        let zero = self.constant(FTy::U64, 0);
         self.store(FTy::U64, islot, zero);
         let head = self.new_block();
         let body = self.new_block();
@@ -841,7 +841,7 @@ impl<'a> Lower<'a> {
 
         self.cur = head;
         let iv = self.load(FTy::U64, islot);
-        let nv = self.konst(FTy::U64, n as i128);
+        let nv = self.constant(FTy::U64, n as i128);
         let c = self.push(FTy::Bool, Op::Cmp { op: CmpOp::Lt, ty: FTy::U64, a: iv, b: nv });
         self.set_term(Term::BrCond { cond: c, then_bb: body, else_bb: end });
 
@@ -852,9 +852,9 @@ impl<'a> Lower<'a> {
         match (sv, saddr) {
             (Some((ft, v)), _) => self.store(ft, ea, v),
             (None, Some(src)) => self.push_void(FTy::Void, Op::CopyMem { dst: ea, src, size: esz }),
-            _ => return self.ice(val.span, "wiederholungsliteral ohne wert"),
+            _ => return self.ice(val.span, "repetition literal without value"),
         }
-        let one = self.konst(FTy::U64, 1);
+        let one = self.constant(FTy::U64, 1);
         let inc = self.push(FTy::U64, Op::Bin(FBin::Add, iv2, one));
         self.store(FTy::U64, islot, inc);
         self.set_term(Term::Br(head));
@@ -886,7 +886,7 @@ impl<'a> Lower<'a> {
 
     pub(crate) fn lower_block(&mut self, b: &ast::Block) -> Option<()> {
         if self.depth > MAX_DEPTH {
-            return self.err(b.span, "block zu tief verschachtelt");
+            return self.err(b.span, "block nested too deeply");
         }
         self.depth += 1;
         self.enter();
@@ -905,10 +905,10 @@ impl<'a> Lower<'a> {
         // dort bereits ausgefuehrt worden; was hier noch erzeugt wird, landet
         // im unerreichbaren Block hinter dem Sprung und faellt der
         // Codebereinigung zum Opfer. Doppelt ausgefuehrt wird also nichts.
-        let liste = self.defers.pop().unwrap_or_default();
-        for (d, nur_fehler) in liste.iter().rev() {
+        let list = self.defers.pop().unwrap_or_default();
+        for (d, only_error) in list.iter().rev() {
             // `errdefer` laeuft NICHT beim gewoehnlichen Verlassen.
-            if *nur_fehler {
+            if *only_error {
                 continue;
             }
             if self.lower_stmt(d).is_none() {
@@ -927,14 +927,14 @@ impl<'a> Lower<'a> {
     /// Absicht und entspricht Zig und C++: ein `defer` sieht den fertigen Wert
     /// und kann ihn nicht mehr ersetzen.
     pub(crate) fn ret_term(&mut self, v: Option<Val>) {
-        self.lower_defers_bis(0, false);
+        self.lower_defers_to(0, false);
         self.set_term(Term::Ret(v));
     }
 
     /// Ruecksprung auf dem FEHLERPFAD: hier laufen zusaetzlich die
     /// `errdefer`-Anweisungen (SPEC §5.1).
-    pub(crate) fn ret_term_fehler(&mut self, v: Option<Val>) {
-        self.lower_defers_bis(0, true);
+    pub(crate) fn ret_term_error(&mut self, v: Option<Val>) {
+        self.lower_defers_to(0, true);
         self.set_term(Term::Ret(v));
     }
 
@@ -944,14 +944,14 @@ impl<'a> Lower<'a> {
     /// Der Stapel bleibt dabei UNVERAENDERT: `lower_block` raeumt seine eigene
     /// Ebene ab. Wird nach einem `return` weiter unten noch einmal aufgeraeumt,
     /// geschieht das in einem unerreichbaren Block.
-    pub(crate) fn lower_defers_bis(&mut self, tiefe: usize, mit_fehler: bool) -> Option<()> {
+    pub(crate) fn lower_defers_to(&mut self, depth: usize, with_error: bool) -> Option<()> {
         let mut r = Some(());
         let mut i = self.defers.len();
-        while i > tiefe {
+        while i > depth {
             i -= 1;
-            let liste = self.defers[i].clone();
-            for (d, nur_fehler) in liste.iter().rev() {
-                if *nur_fehler && !mit_fehler {
+            let list = self.defers[i].clone();
+            for (d, only_error) in list.iter().rev() {
+                if *only_error && !with_error {
                     continue;
                 }
                 if self.lower_stmt(d).is_none() {
@@ -963,8 +963,8 @@ impl<'a> Lower<'a> {
     }
 
     /// Gibt es in dieser Funktion ueberhaupt ein aktives `errdefer`?
-    pub(crate) fn hat_errdefer(&self) -> bool {
-        self.defers.iter().any(|l| l.iter().any(|(_, nur_fehler)| *nur_fehler))
+    pub(crate) fn has_errdefer(&self) -> bool {
+        self.defers.iter().any(|l| l.iter().any(|(_, only_error)| *only_error))
     }
 
     fn lower_stmt(&mut self, s: &Stmt) -> Option<()> {
@@ -981,7 +981,7 @@ impl<'a> Lower<'a> {
                 }
                 let t = self.ty_of(init);
                 if matches!(t, Type::Void) {
-                    return self.err(*span, "eine variable kann keinen wert ohne typ haben");
+                    return self.err(*span, "a variable cannot have a value without a type");
                 }
                 let (size, align) = self.size_align(&t);
                 let slot = self.alloca(size, align);
@@ -1010,10 +1010,10 @@ impl<'a> Lower<'a> {
                         // nicht; statt `errdefer` still zu uebergehen, wird der
                         // Fall abgelehnt. Bei einer Umwandlung ist `t` der
                         // QUELLtyp und diese Bedingung greift nicht.
-                        if self.hat_errdefer() && crate::errors::union_of(&t).is_some() {
+                        if self.has_errdefer() && crate::errors::union_of(&t).is_some() {
                             return self.err(
                                 *span,
-                                "'errdefer' und die weitergabe einer fertigen fehlerunion vertragen sich in stufe 0 nicht: hier steht erst zur laufzeit fest, ob der fehlerpfad genommen wird — schreibe 'return try …' oder gib den fehler mit 'return E::Variante' zurueck",
+                                "'errdefer' and passing on a finished error union do not go together in stage 0: here it is only known at run time whether the error path is taken — write 'return try …' or return the error with 'return E::Variant'",
                             );
                         }
                         // HOOK fehlerunionen: implizite Umwandlung (lower_errors.rs)
@@ -1033,7 +1033,7 @@ impl<'a> Lower<'a> {
                                     let w = self.load_words(addr, size, 1)?;
                                     match w.first() {
                                         Some(w0) => self.ret_term(Some(*w0)),
-                                        None => return self.ice(*span, "rueckgabe ohne wort"),
+                                        None => return self.ice(*span, "return without word"),
                                     }
                                 }
                             }
@@ -1051,13 +1051,13 @@ impl<'a> Lower<'a> {
                 Some(())
             }
             // Nur vormerken — ausgefuehrt wird beim Verlassen des Blocks.
-            Stmt::Defer(inner, nur_fehler, span) => {
+            Stmt::Defer(inner, only_error, span) => {
                 match self.defers.last_mut() {
-                    Some(liste) => {
-                        liste.push(((**inner).clone(), *nur_fehler));
+                    Some(list) => {
+                        list.push(((**inner).clone(), *only_error));
                         Some(())
                     }
-                    None => self.ice(*span, "'defer' ausserhalb eines blocks"),
+                    None => self.ice(*span, "'defer' outside a block"),
                 }
             }
             Stmt::If { cond, then, els, .. } => self.lower_if(cond, then, els.as_deref()),
@@ -1066,23 +1066,23 @@ impl<'a> Lower<'a> {
                 self.lower_for(name, start, end, body)
             }
             Stmt::Break(span) => {
-                let (target, tiefe) = match self.loops.last() {
+                let (target, depth) = match self.loops.last() {
                     Some((brk, _, t)) => (*brk, *t),
-                    None => return self.ice(*span, "'break' ausserhalb einer schleife"),
+                    None => return self.ice(*span, "'break' outside a loop"),
                 };
                 // Erst aufraeumen, dann springen.
-                self.lower_defers_bis(tiefe, false);
+                self.lower_defers_to(depth, false);
                 self.set_term(Term::Br(target));
                 let dead = self.new_block();
                 self.cur = dead;
                 Some(())
             }
             Stmt::Continue(span) => {
-                let (target, tiefe) = match self.loops.last() {
+                let (target, depth) = match self.loops.last() {
                     Some((_, cont, t)) => (*cont, *t),
-                    None => return self.ice(*span, "'continue' ausserhalb einer schleife"),
+                    None => return self.ice(*span, "'continue' outside a loop"),
                 };
-                self.lower_defers_bis(tiefe, false);
+                self.lower_defers_to(depth, false);
                 self.set_term(Term::Br(target));
                 let dead = self.new_block();
                 self.cur = dead;
@@ -1184,7 +1184,7 @@ impl<'a> Lower<'a> {
         let ty = self.ty_of(start);
         let ft = match scalar_fty(&ty) {
             Some(f) if f != FTy::Void => f,
-            _ => return self.ice(start.span, "bereich von 'for' ohne ganzzahltyp"),
+            _ => return self.ice(start.span, "range of 'for' without integer type"),
         };
         let bytes = ft.bytes().max(1);
         let islot = self.alloca(bytes, bytes);
@@ -1221,7 +1221,7 @@ impl<'a> Lower<'a> {
 
         self.cur = step_bb;
         let iv2 = self.load(ft, islot);
-        let one = self.konst(ft, 1);
+        let one = self.constant(ft, 1);
         let inc = self.push(ft, Op::Bin(FBin::Add, iv2, one));
         self.store(ft, islot, inc);
         self.set_term(Term::Br(head_bb));
@@ -1265,7 +1265,7 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
         None => {
             dg.error(
                 d.span,
-                format!("interner fehler beim uebersetzen nach FIR: signatur von '{}' fehlt", d.name),
+                format!("internal error while lowering to FIR: signature of '{}' is missing", d.name),
             );
             return None;
         }
@@ -1297,7 +1297,7 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
         }
         match scalar_fty(p) {
             Some(FTy::Void) | None => {
-                dg.error(span, "ein parameter dieses typs ist nicht uebersetzbar");
+                dg.error(span, "a parameter of this type is not compilable");
                 return None;
             }
             Some(f) => {
@@ -1317,7 +1317,7 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
         match scalar_fty(&sig.ret) {
             Some(f) => f,
             None => {
-                dg.error(d.span, "ein rueckgabetyp dieser art ist nicht uebersetzbar");
+                dg.error(d.span, "a return type of this kind is not compilable");
                 return None;
             }
         }
@@ -1325,8 +1325,8 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
 
     let mut f = Func::new(&d.name, pf.clone(), rf);
     // HOOK kern: `#[interrupt]` — eigene Aufrufkonvention im Codegenerator
-    // (kern.rs/codegen_x86.rs, Runde 52).
-    f.interrupt = crate::kern::hat_interrupt(d);
+    // (core.rs/codegen_x86.rs, Runde 52).
+    f.interrupt = crate::core::has_interrupt(d);
     dwarf::set_fn(&d.name, d.span.file, d.span.line);
     let mut lo = Lower {
         info,
@@ -1419,7 +1419,7 @@ pub fn lower(prog: &Program, info: &TypeInfo, dg: &mut Diags) -> Option<Module> 
                 dg.error(
                     Span::none(),
                     format!(
-                        "interner fehler beim uebersetzen nach FIR: block bb{} in '{}' ohne terminator",
+                        "internal error while lowering to FIR: block bb{} in '{}' without terminator",
                         b.id, f.name
                     ),
                 );
@@ -1429,7 +1429,7 @@ pub fn lower(prog: &Program, info: &TypeInfo, dg: &mut Diags) -> Option<Module> 
                 dg.error(
                     Span::none(),
                     format!(
-                        "interner fehler beim uebersetzen nach FIR: alloca ausserhalb des eintrittsblocks in '{}'",
+                        "internal error while lowering to FIR: alloca outside the entry block in '{}'",
                         f.name
                     ),
                 );
@@ -1495,12 +1495,12 @@ mod tests {
         let mut dg = Diags::new("test", "");
         let m = lower(prog, info, &mut dg);
         assert!(!dg.has_errors(), "{}", dg.render());
-        assert!(m.is_some(), "lowering lieferte kein modul");
+        assert!(m.is_some(), "lowering yielded no module");
         m.unwrap_or_default()
     }
 
     #[test]
-    fn einfaches_return() {
+    fn simple_return() {
         let mut b = B::new();
         let a = b.int(2, Type::I32);
         let c = b.int(3, Type::I32);
@@ -1527,7 +1527,7 @@ mod tests {
     }
 
     #[test]
-    fn kurzschluss_erzeugt_verzweigung() {
+    fn short_circuit_generated_branch() {
         let mut b = B::new();
         let x = b.id("p", Type::Bool);
         let y = b.id("q", Type::Bool);
@@ -1570,7 +1570,7 @@ mod tests {
 
     /// Baut den AST des Beispielprogramms aus `docs/FIR.md` (siehe dort den
     /// Quelltext) und liefert Programm + Typinformation.
-    fn doku_programm() -> (Program, TypeInfo) {
+    fn doc_program() -> (Program, TypeInfo) {
         let mut tcx = TypeCtx::new();
         let pi = tcx.declare("Point");
         tcx.set_fields(pi, vec![("x".into(), Type::I32), ("y".into(), Type::I32)]);
@@ -1593,8 +1593,8 @@ mod tests {
         let one = b.int(1, i32t.clone());
         let inc = b.bin(ast::BinOp::Add, vi2, one, i32t.clone());
         let rs = b.id("s", i32t.clone());
-        let summe = ast::FnDecl {
-            name: "summe".into(),
+        let sum_decl = ast::FnDecl {
+            name: "sum".into(),
             params: vec![ast::Param {
                 name: "n".into(),
                 ty: ast::TypeExpr::Named("i32".into(), Span::none()),
@@ -1632,7 +1632,7 @@ mod tests {
         let p1 = b.id("p", pt.clone());
         let py = b.e(ExprKind::Field(Box::new(p1), "y".into(), Span::none()), i32t.clone());
         let lim = b.id("LIMIT", i32t.clone());
-        let call = b.e(ExprKind::Call("summe".into(), vec![lim], Span::none()), i32t.clone());
+        let call = b.e(ExprKind::Call("sum".into(), vec![lim], Span::none()), i32t.clone());
         let p2 = b.id("p", pt.clone());
         let px = b.e(ExprKind::Field(Box::new(p2), "x".into(), Span::none()), i32t.clone());
         let z0 = b.int(0, i32t.clone());
@@ -1667,12 +1667,12 @@ mod tests {
             attrs: Vec::new(),
         };
 
-        let prog = Program { funcs: vec![summe, mainf], expr_count: b.next, ..Default::default() };
+        let prog = Program { funcs: vec![sum_decl, mainf], expr_count: b.next, ..Default::default() };
         let mut info = info_of(
             &b,
             tcx,
             vec![
-                ("summe", FnSig { params: vec![Type::I32], ret: Type::I32 }),
+                ("sum", FnSig { params: vec![Type::I32], ret: Type::I32 }),
                 ("main", FnSig { params: vec![], ret: Type::I32 }),
             ],
         );
@@ -1683,8 +1683,8 @@ mod tests {
     /// Der in `docs/FIR.md` abgedruckte Dump muss dem entsprechen, was das
     /// Lowering wirklich erzeugt.
     #[test]
-    fn doku_beispiel_stimmt() {
-        let (prog, info) = doku_programm();
+    fn doc_example_matches() {
+        let (prog, info) = doc_program();
         let m = run(&prog, &info);
         let got = m.to_text();
         if std::env::var(format!("{}_DUMP_DOC", crate::config::compiler_name().to_uppercase())).is_ok() {
@@ -1708,12 +1708,12 @@ mod tests {
                 want.push('\n');
             }
         }
-        assert!(!want.is_empty(), "kein ```firdump-Block in docs/FIR.md gefunden");
+        assert!(!want.is_empty(), "no ```firdump block found in docs/FIR.md");
         assert_eq!(want, got);
     }
 
     #[test]
-    fn while_und_index() {
+    fn while_and_index() {
         let mut b = B::new();
         let arr_ty = Type::Array(Box::new(Type::I32), 4);
         let lit_elems: Vec<Expr> = (0..4).map(|i| b.int(i, Type::I32)).collect();

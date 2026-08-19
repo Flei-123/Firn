@@ -235,7 +235,7 @@ das Lowering wirklich erzeugt):
 
 ```firdump
 ; FIR v0
-fn @summe(%0: i32) -> i32 {
+fn @sum(%0: i32) -> i32 {
 bb0:
   %1 = alloca.ptr size=4 align=4
   %2 = alloca.ptr size=4 align=4
@@ -281,7 +281,7 @@ bb0:
   %5 = const.i64 4
   %6 = ptradd.ptr %0, %5
   %7 = const.i32 10
-  %8 = call.i32 @summe(%7)
+  %8 = call.i32 @sum(%7)
   store.i32 %8, %6
   %10 = load.i32 %0
   %11 = const.i32 0
@@ -321,7 +321,7 @@ bb7:
 
 Zeile für Zeile das Wichtigste:
 
-* `@summe` hat einen Parameter: `%0` ist der übergebene Wert, `%1` sein
+* `@sum` hat einen Parameter: `%0` ist der übergebene Wert, `%1` sein
   Stack-Slot. Die drei `alloca` (`%1` Parameter, `%2` = `s`, `%4` = `i`) stehen
   wie vorgeschrieben vorn im Eintrittsblock — dass `%3` (die Konstante `0`)
   eine kleinere Id hat als `%4`, ist Folge von Invariante 2.

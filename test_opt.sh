@@ -124,7 +124,7 @@ PATTERNS="
 tests/opt/mem2reg_single_store.fi|load.i32|1|0
 tests/opt/dead_store.fi|store.i32|1|0
 tests/opt/dead_store.fi|alloca|1|0
-tests/opt/inline_call.fi|call.i32 @quadrat|1|0
+tests/opt/inline_call.fi|call.i32 @square|1|0
 tests/opt/cse_common.fi|mul.i32|2|1
 tests/opt/redundant_check.fi|brcond|3|2
 tests/opt/block_merge.fi|bb|8|1
@@ -151,9 +151,9 @@ done <<< "$PATTERNS"
 echo "== Registerzuteilung im Assembler =="
 ASM="$WORK/regalloc_loop.s"
 "$FIRNC" --emit=asm -o "$ASM" tests/opt/regalloc_loop.fi
-BODY=$(awk '/^\.Lsumme__bb2:/{f=1;next} /^\.Lsumme__bb3:/{f=0} f' "$ASM")
+BODY=$(awk '/^\.Lsum__bb2:/{f=1;next} /^\.Lsum__bb3:/{f=0} f' "$ASM")
 if [ -z "$BODY" ]; then
-    bad "regalloc: Schleifenblock .Lsumme__bb2 nicht gefunden"
+    bad "regalloc: Schleifenblock .Lsum__bb2 nicht gefunden"
 else
     if echo "$BODY" | grep -q '\[rbp-'; then
         bad "regalloc: Schleifenrumpf greift noch auf den Stack zu"

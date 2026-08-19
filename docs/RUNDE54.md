@@ -9,7 +9,7 @@ Ergebnis vorweg, alles selbst gemessen (Zahlen in §7):
 | | Basis (`cc1710f`) | Runde 54 |
 |---|---|---|
 | `bash ./test.sh` | 751 / 751 | **761 / 761** |
-| `bash tools/selbst_vergleich.sh` | 213 gleich / 0 abweichend / 0 fehlerhaft | **216 / 0 / 0** |
+| `bash tools/self_compare.sh` | 213 gleich / 0 abweichend / 0 fehlerhaft | **216 / 0 / 0** |
 | eigene Baumfälle (WHATWG, von Hand) | — | **150 / 150** (in allen drei Baustufen) |
 | davon von html5lib 1.1 bestätigt | — | **149 / 150** (1× folgt html5lib einer älteren Fassung) |
 | echte Seiten aus `testdata/realweb/` | — | **8 / 8 baumgleich zu html5lib**, Zeile für Zeile |
@@ -26,15 +26,15 @@ Ergebnis vorweg, alles selbst gemessen (Zahlen in §7):
 Vier neue Module unter `lib/browser/` und ein Werkzeugordner `tools/html/`:
 
 ```
-lib/browser/knoten.fi       DOM-Kern: Knotenarten, Baum, Attribute, Ketten
+lib/browser/node.fi       DOM-Kern: Knotenarten, Baum, Attribute, Ketten
 lib/browser/tag.fi          erzeugt — die feste Namenstabelle (124 Namen)
-lib/browser/namen.fi        Atomtabelle (Element-/Attributnamen -> u32)
-lib/browser/tokenstrom.fi   Leser des binären Tokenprotokolls
-lib/browser/baum.fi         die Baumkonstruktion (22 Einfügemodi)
-lib/browser/schreiben.fi    Ausgabe im html5lib-Format
-lib/browser/treiber.fi      Tokenizer + Baumaufbau zu einem Weg verbunden
+lib/browser/names.fi        Atomtabelle (Element-/Attributnamen -> u32)
+lib/browser/token_stream.fi   Leser des binären Tokenprotokolls
+lib/browser/tree.fi         die Baumkonstruktion (22 Einfügemodi)
+lib/browser/write.fi    Ausgabe im html5lib-Format
+lib/browser/driver.fi      Tokenizer + Baumaufbau zu einem Weg verbunden
 lib/browser/parse_main.fi   Treiberprogramm (stdin -> stdout)
-lib/browser/soak_baum.fi    Dauerlauf mit Gegenprobe
+lib/browser/soak_tree.fi    Dauerlauf mit Gegenprobe
 ```
 
 Am Tokenizer (`lib/html/`) wurde **additiv** ergänzt, was der Baumaufbau
@@ -44,7 +44,7 @@ braucht — begründet in §5.
 
 ## 2. Die Datenstrukturen
 
-### 2.1 Knoten (`lib/browser/knoten.fi`)
+### 2.1 Knoten (`lib/browser/node.fi`)
 
 ```firn
 gc class Knoten {
@@ -72,13 +72,13 @@ Zählverweis gibt hier **nichts** frei. Der Nachweis steht in §4.
 ### 2.2 Namen sind Atome
 
 Element- und Attributnamen sind `u32`-Kennungen in eine Tabelle
-(`lib/browser/namen.fi`, SPEC §8.3 `Z4`). Der Grund ist nicht Sparsamkeit,
+(`lib/browser/names.fi`, SPEC §8.3 `Z4`). Der Grund ist nicht Sparsamkeit,
 sondern Machbarkeit: die WHATWG-Baumkonstruktion besteht zu großen Teilen aus
 Fragen der Form *„ist der Name des aktuellen Knotens einer aus dieser Liste von
 40 Namen"*. Mit Zeichenketten wäre jede davon ein Haufen `memcmp`.
 
 Die **124 Namen, die der Standard beim Namen nennt**, haben eine feste Kennung
-(`lib/browser/tag.fi`, erzeugt von `tools/html/gen_namen.py`) — `tag.M_DIV`
+(`lib/browser/tag.fi`, erzeugt von `tools/html/gen_names.py`) — `tag.M_DIV`
 ist damit eine Übersetzungszeitkonstante. Alles darüber hinaus (eigene
 Elementnamen, beliebige Attributnamen) bekommt beim ersten Auftreten eine
 Kennung > 124. Die Ablage ist WTF-8, nicht UTF-8: ein Tagname darf ungepaarte
@@ -205,7 +205,7 @@ Baum, sondern an der Aufrufstelle auffällt.
 ## 4. Der GC-Nachweis
 
 Ein DOM-Baum ist genau die Zyklenart, an der ein Zählverweis scheitert.
-`tools/html/gc_baum.sh` fährt `lib/browser/soak_baum.fi`: in einer Schleife
+`tools/html/gc_tree.sh` fährt `lib/browser/soak_tree.fi`: in einer Schleife
 wird aus einem echten HTML-Stück (446 Byte, mit DOCTYPE, Rohtext, Tabelle,
 verschachtelter Formatierung, Attributen, Kommentar, Auswahlliste) ein
 vollständiger Baum gebaut, geprüft und wieder losgelassen.
@@ -232,7 +232,7 @@ festgehalten.
 RSS erste Stichprobe: 7000 KiB, letzte: 48756 KiB, Zuwachs: 41756 KiB
 ```
 
-**+41 756 KiB in 4000 Runden.** Bleibt die Gegenprobe flach, bricht `gc_baum.sh`
+**+41 756 KiB in 4000 Runden.** Bleibt die Gegenprobe flach, bricht `gc_tree.sh`
 ab — eine Messung, die ein Leck nicht anzeigen kann, wäre schlimmer als keine.
 
 Zwei Dinge waren dafür nötig und stehen im Code:
@@ -253,7 +253,7 @@ Seit der Trennung in `baum_puffer_init` (einmal) und `baum_init` (je Dokument)
 ist der Zuwachs 0. Der Fall steht hier, weil er zeigt, was der Sammler *nicht*
 tut: manueller Speicher bleibt manuell.
 
-Die Struktur derselben Aussage prüft `tests/901_dom_baum_gc.fi` ohne Werkzeuge:
+Die Struktur derselben Aussage prüft `tests/901_dom_tree_gc.fi` ohne Werkzeuge:
 ein Baum aus 4680 Elementen, Rückverweise geprüft, überlebt einen Sammellauf
 solange er erreichbar ist, und ist danach fort.
 
@@ -284,7 +284,7 @@ Umgesetzt wurde beides mit zwei **additiven** Ergänzungen in `lib/html/`:
    zusätzliches Wort**; der Wert wird nur beim Ausgeben eines Tokens in einem
    Register übergeben.
 
-`lib/browser/treiber.fi` tokenisiert danach den **Rest** der Eingabe ab der
+`lib/browser/driver.fi` tokenisiert danach den **Rest** der Eingabe ab der
 gemerkten Position erneut, mit dem neuen Startzustand. Der Preis ist ehrlich:
 **O(k·n) statt O(n)**, wobei *k* die Zahl der Umschaltungen ist. Auf den acht
 echten Seiten ist das tragbar; der saubere Weg wäre ein **fortsetzbarer
@@ -356,7 +356,7 @@ const A_DIV: u32 = namen_tab.M_DIV
 ```
 
 Ein `const` kann nicht aus einem anderen Modul initialisiert werden. Folge:
-`baum.fi` schreibt an rund 600 Stellen `tag.M_DIV` statt eines kurzen Alias.
+`tree.fi` schreibt an rund 600 Stellen `tag.M_DIV` statt eines kurzen Alias.
 (Deshalb heißt das Modul `tag` und nicht `namen_tab`.)
 
 *Gebraucht:* qualifizierte Namen in konstanten Ausdrücken.
@@ -370,8 +370,8 @@ var a: [u8; _] = "abc"                   // error: erwartet ganzzahlige laenge
 ```
 
 Jedes Literal ist ein Array-Literal mit fester Länge, und die zählt der Mensch.
-In dieser Runde wurden die Längen deshalb von `tools/html/gen_namen.py` und vom
-Erzeuger für `tests/902_baum_konstruktion.fi` ausgerechnet — was für erzeugte
+In dieser Runde wurden die Längen deshalb von `tools/html/gen_names.py` und vom
+Erzeuger für `tests/902_tree_construction.fi` ausgerechnet — was für erzeugte
 Dateien in Ordnung ist, für handgeschriebenen Code aber eine Fehlerquelle
 bleibt (dreimal darauf hereingefallen).
 
@@ -415,10 +415,10 @@ Modul). `lib/firnc1/gc.fi::gc_quelle_scan` sucht am Tokenstrom nach `gc class`,
 `error AllocError` und `fn __gc_finalisiere` — keins davon steht dann in der
 Datei. Folge: `bin/astdump.fi` meldet für `gc_null[Kette]()` einen
 **Syntaxfehler (rc=1)** statt „nicht Kernsprache" (rc=3), und
-`tools/parser_vergleich.sh` zählt eine unerwartete Abweichung.
+`tools/parser_compare.sh` zählt eine unerwartete Abweichung.
 
 Nicht repariert — `lib/firnc1` ist in dieser Runde fremdes Revier. Im Test
-umgangen: `tests/900_dom_kern.fi` hat eine Funktion mit einem `Gc[…]` in der
+umgangen: `tests/900_dom_core.fi` hat eine Funktion mit einem `Gc[…]` in der
 **Signatur**, und daran erkennt der Parser den Fall bereits. Für die
 Compiler-Runden: `gc_quelle_scan` sollte auch `Gc[`/`GcWeak[`/`gc_null[` im
 Tokenstrom sehen.
@@ -437,7 +437,7 @@ einer erneuten Tokenisierung.
 
 ### 7.1 Baumkonstruktion
 
-`tools/html/faelle/*.dat` — **150 Fälle, alle bestanden**:
+`tools/html/cases/*.dat` — **150 Fälle, alle bestanden**:
 
 | Datei | bestanden | gesamt |
 |---|---|---|
@@ -463,7 +463,7 @@ auf keinem Branch).
 Also wurden **150 eigene Fälle von Hand aus dem WHATWG-Standard geschrieben** —
 Eingabe *und* erwarteter Baum, je Fall aus der Regel abgeleitet, die er prüfen
 soll. Das Format ist trotzdem **genau das `.dat`-Format von html5lib**: liegen
-die Originaldaten eines Tages vor, läuft `tools/html/harness_baum.py` ohne
+die Originaldaten eines Tages vor, läuft `tools/html/harness_tree.py` ohne
 Änderung dagegen.
 
 Von Hand heißt auch: fehleranfällig. Deshalb gibt es `tools/html/orakel.py` —
@@ -509,10 +509,10 @@ vor dem Lauf):
 | Prüfung | Ergebnis |
 |---|---|
 | `bash ./test.sh` | **PASS 761/761** (Basis 751/751; +9 durch drei neue Programme × drei Baustufen, +1 durch Abschnitt 9b) |
-| `bash tools/selbst_vergleich.sh` | **GLEICHES VERHALTEN 216, ABWEICHEND 0, FEHLERHAFT 0** (Basis 213/0/0) |
+| `bash tools/self_compare.sh` | **GLEICHES VERHALTEN 216, ABWEICHEND 0, FEHLERHAFT 0** (Basis 213/0/0) |
 | `bash tools/html/run.sh` | 150/150 in drei Baustufen, 8/8 Seiten byte-gleich, Dauerlauf bestanden |
 | `bash tools/tokenizer/run.sh` | 6810/6810 bzw. 6809/6810 mit Fehlercodes — unverändert |
-| `tools/fixpunkt.sh` (in `test.sh`) | Stufe 2 == Stufe 3, zeichengleich |
+| `tools/fixpoint.sh` (in `test.sh`) | Stufe 2 == Stufe 3, zeichengleich |
 
 `tools/html/orakel.py` getrennt gefahren: `faelle/` 150 geprüft, 0 unerwartete
 Abweichungen (1 vermerkte); `luecken/` 10 geprüft, 0 unerwartete Abweichungen

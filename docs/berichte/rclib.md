@@ -9,14 +9,14 @@ Compileraenderung**, keine Datei ausserhalb des eigenen Bestands angefasst.
 |---|---|
 | `tests/modules/rc.fi` | **die eine Implementierung** (Modul `rc`): Halde ueber `mmap`, Groessenklassen mit Freilisten, `Zaehlverweis[T]` (= `Rc[T]`), `Schwachverweis[T]` (= `Weak[T]`), fehlbare Allokation `AllocError!bool` |
 | `lib/rc/rc.fi` | Symlink auf `tests/modules/rc.fi` (Bibliothekspfad ohne Codedopplung) |
-| `lib/rc/teile/*.fi` | Rumpfe der Testprogramme |
-| `lib/rc/erzeuge_tests.sh` | erzeugt die Testprogramme aus Rumpf + Implementierung |
-| `tests/550_rc_grund.fi` | anlegen/lesen/klonen/freigeben, Zaehlerstaende, Blockwiederverwendung, zweite Auspraegung der Vorlage |
+| `lib/rc/parts/*.fi` | Rumpfe der Testprogramme |
+| `lib/rc/gen_tests.sh` | erzeugt die Testprogramme aus Rumpf + Implementierung |
+| `tests/550_rc_basic.fi` | anlegen/lesen/klonen/freigeben, Zaehlerstaende, Blockwiederverwendung, zweite Auspraegung der Vorlage |
 | `tests/551_rc_weak.fi` | `weak_von`/`aufwerten`/`weak_freigeben`, Aufwertung nach dem Tod liefert **sichtbar leer**, Block wird erst mit dem letzten schwachen Verweis frei |
-| `tests/552_rc_zyklus_leck.fi` | **Pflichtnachweis: der Rc-Zyklus LECKT** (Ausgabe `1 1 2 128 200 12800 198 1 0`) |
-| `tests/553_rc_fehlbar.fi` | fehlbare Allokation: `OutOfMemory` bei voller Halde, bei zu grosser Nutzlast, `try`-Kette, Wiederaufnahme nach Freigabe |
+| `tests/552_rc_cycle_leak.fi` | **Pflichtnachweis: der Rc-Zyklus LECKT** (Ausgabe `1 1 2 128 200 12800 198 1 0`) |
+| `tests/553_rc_fallible.fi` | fehlbare Allokation: `OutOfMemory` bei voller Halde, bei zu grosser Nutzlast, `try`-Kette, Wiederaufnahme nach Freigabe |
 | `tests/554_rc_dauerlauf.fi` | 20.000 Runden ohne Zyklus: `20000 0 0 192 1` — kein Wachstum, alles frei |
-| `tests/neg/rc_verworfen.fi` | verworfenes `AllocError!bool` = Compilerfehler mit Zeile/Spalte |
+| `tests/neg/rc_discarded.fi` | verworfenes `AllocError!bool` = Compilerfehler mit Zeile/Spalte |
 | `tests/neg/rc_unveraenderlich.fi` | Schreibversuch durch `Rc` = Compilerfehler mit Zeile/Spalte |
 | `docs/RC.md` | Handbuch, Beispiel, Leck-Erklaerung, vollstaendige Abweichungsliste |
 
@@ -26,17 +26,17 @@ Alle Programme in **drei** Baustufen (`opt`, `--no-opt`, `--opt-level=dev-fast`)
 jeweils dasselbe Ergebnis:
 
 ```
-tests/550_rc_grund.fi     [opt|noopt|dev-fast] exit=0
+tests/550_rc_basic.fi     [opt|noopt|dev-fast] exit=0
 tests/551_rc_weak.fi      [opt|noopt|dev-fast] exit=0
-tests/552_rc_zyklus_leck.fi [opt|noopt|dev-fast] exit=0  out=1 1 2 128 200 12800 198 1 0
-tests/553_rc_fehlbar.fi   [opt|noopt|dev-fast] exit=0
+tests/552_rc_cycle_leak.fi [opt|noopt|dev-fast] exit=0  out=1 1 2 128 200 12800 198 1 0
+tests/553_rc_fallible.fi   [opt|noopt|dev-fast] exit=0
 tests/554_rc_dauerlauf.fi [opt|noopt|dev-fast] exit=0  out=20000 0 0 192 1
 ```
 
 Negativtests (echte Compilerausgabe):
 
 ```
-tests/neg/rc_verworfen.fi:393:5
+tests/neg/rc_discarded.fi:393:5
 error: das ergebnis darf nicht verworfen werden: der typ 'AllocError!bool'
        ist mit #[must_consume] gekennzeichnet
 
@@ -112,7 +112,7 @@ Verweises: Aufwertung sichtbar leer, am Ende **0** belegte Bloecke.
    uebersetzen (`hook_generic_call` verlangt einen `Ident`, das Modulsystem
    liefert dort einen `Field`-Ausdruck). Deshalb dasselbe Verfahren wie bei
    `lib/str` (`tools/strlib/expand.py`): eine Quelle im Baum,
-   `bash lib/rc/erzeuge_tests.sh` setzt die Programme zusammen. `import
+   `bash lib/rc/gen_tests.sh` setzt die Programme zusammen. `import
    modules.rc` funktioniert damit **nicht** — das ist die ehrliche Lage.
 
 ## 4. Fuer Modul `mess`: die Doppelung der Fehlermenge
@@ -127,7 +127,7 @@ Menge programmweit bereitstellt, gibt es zwei Moeglichkeiten:
   Fassungen koennen stehen bleiben.
 * Sollte die Laufzeit doch in jedes Programm eingezogen werden, genuegt es,
   die eine `error`-Zeile in `tests/modules/rc.fi` zu loeschen und
-  `bash lib/rc/erzeuge_tests.sh` erneut laufen zu lassen. Kein weiterer
+  `bash lib/rc/gen_tests.sh` erneut laufen zu lassen. Kein weiterer
   Eingriff noetig.
 
 Geprueft wurde gegen den Stand des Compilers zu Beginn der Runde; ein `Gc`-

@@ -135,7 +135,7 @@ GESAMT                           6807 /   6810    99.96 %
 ```
 
 Die XML-Anpassung (`xmlViolationTests`) ist ein optionaler Modus des Treibers
-(Auftragsflagge Bit 0, `tools/tokenizer/PROTOKOLL.md`); der Harness setzt sie
+(Auftragsflagge Bit 0, `tools/tokenizer/LOG.md`); der Harness setzt sie
 nur für die vier Fälle aus `xmlViolation.test`, der HTML-Pfad bleibt gleich.
 
 Die Messlatte html5ever muss dafür einmal gebaut werden (eigenes Cargo-Projekt,
@@ -153,16 +153,16 @@ Einzelne Nachweise:
 |---|---|---|
 | **Tokenizer ist Firn** | `wc -l lib/html/*.fi tools/tokenizer/harness.py` | 8.647 Zeilen `.fi` gegen 295 Zeilen Harness; die Zustandsmaschine steht in `lib/html/tokenizer.fi` (1.516 Zeilen) |
 | **Sprungtabelle über 73 Zustände** | `firnc --emit=asm -o /tmp/tok.s lib/html/tokenize_main.fi && grep -c "jmp qword ptr" /tmp/tok.s` | `1` — indirekter Sprung über `.Ltbl_tokenizer__tokenize_0` |
-| **Zeichenreferenzen einzeln** | `python3 tools/tokenizer/pruefe_entities.py` | `bestanden: 4657 / 4657` |
-| **Fehlerunion: `catch` liefert Ersatz** | `firnc -o /tmp/e tests/403_catch_ersatz.fi && /tmp/e; echo $?` | `0` |
-| **Fehlerunion: `try` reicht durch** | `firnc -o /tmp/e tests/401_try_kette.fi && /tmp/e; echo $?` | der in Zeile 1 als `// expect_exit:` eingetragene Wert |
-| **Verworfenes `!T` ist ein Fehler** | `firnc -o /tmp/e tests/neg/err_verworfen.fi` | `error: das ergebnis darf nicht verworfen werden: der typ 'E!i32' ist mit #[must_consume] gekennzeichnet` mit Zeile:Spalte |
-| **`try` außerhalb einer Fehlerfunktion** | `firnc -o /tmp/e tests/neg/err_try_ausserhalb.fi` | `error: 'try' ist nur in einer funktion mit fehlerunions-rueckgabetyp erlaubt, diese liefert i32` mit `8:13` |
+| **Zeichenreferenzen einzeln** | `python3 tools/tokenizer/check_entities.py` | `bestanden: 4657 / 4657` |
+| **Fehlerunion: `catch` liefert Ersatz** | `firnc -o /tmp/e tests/403_catch_replacement.fi && /tmp/e; echo $?` | `0` |
+| **Fehlerunion: `try` reicht durch** | `firnc -o /tmp/e tests/401_try_chain.fi && /tmp/e; echo $?` | der in Zeile 1 als `// expect_exit:` eingetragene Wert |
+| **Verworfenes `!T` ist ein Fehler** | `firnc -o /tmp/e tests/neg/err_discarded.fi` | `error: das ergebnis darf nicht verworfen werden: der typ 'E!i32' ist mit #[must_consume] gekennzeichnet` mit Zeile:Spalte |
+| **`try` außerhalb einer Fehlerfunktion** | `firnc -o /tmp/e tests/neg/err_try_outside.fi` | `error: 'try' ist nur in einer funktion mit fehlerunions-rueckgabetyp erlaubt, diese liefert i32` mit `8:13` |
 
 ## 4b. Freistehend übersetzen: `profile kernel` (Runde 52)
 
 ```sh
-bash tools/freistehend/run.sh
+bash tools/freestanding/run.sh
 ```
 
 Gemessenes Ergebnis (19.08.2026): **41 bestanden, 0 fehlgeschlagen** — darunter
@@ -170,14 +170,14 @@ ein echter QEMU-Boot des Kernel-Beispiels mit **beiden** Compilern.
 
 | Was | Befehl | Gemessenes Ergebnis |
 |---|---|---|
-| **ELF-Objekt statt Binary** | `firnc -o /tmp/k.o beispiele/kernel/kern.fi && readelf -h /tmp/k.o \| grep Type` | `REL (Relocatable file)` — kein `ld`, kein `_start` |
+| **ELF-Objekt statt Binary** | `firnc -o /tmp/k.o demos/kernel/core.fi && readelf -h /tmp/k.o \| grep Type` | `REL (Relocatable file)` — kein `ld`, kein `_start` |
 | **Keine undefinierten Symbole** | `nm -u /tmp/k.o` | leer |
 | **Kein Systemaufruf im Code** | `objdump -d /tmp/k.o \| grep -c syscall` | `0` |
-| **Bootet** | `ld -n -T beispiele/kernel/linker.ld --defsym=KERN_START=_F0.kern_start -o /tmp/k.elf /tmp/start.o /tmp/k.o && objcopy -O elf32-i386 /tmp/k.elf /tmp/k.mb && qemu-system-x86_64 -kernel /tmp/k.mb -serial stdio -display none` | `FIRN: profile kernel ist` / `freistehend.` |
-| **`syscall` im Kernel-Profil** | `firnc -o /tmp/x tests/neg/frei_syscall_im_kernel.fi` | `error: 'syscall' gibt es im profil 'kernel' nicht` mit Zeile:Spalte |
-| **Gleitkomma ohne `#[allow_fp]`** | `firnc -o /tmp/x tests/neg/frei_gleitkomma_ohne_allow_fp.fi` | `error: gleitkomma (der typ f64) ist im profil 'kernel' nur mit #[allow_fp] erlaubt` |
-| **`#[interrupt]` ist nicht aufrufbar** | `firnc -o /tmp/x tests/neg/frei_interrupt_aufruf.fi` | `error: 'ih' ist ein interrupt-einsprungpunkt und kann nicht aufgerufen werden` |
-| **volatile hält** | `firnc --emit=fir tools/freistehend/volatile.fi \| grep -c 'asm.void "pause"'` | `3` — drei wörtlich gleiche Blöcke, kein CSE |
+| **Bootet** | `ld -n -T demos/kernel/linker.ld --defsym=KERN_START=_F0.kern_start -o /tmp/k.elf /tmp/start.o /tmp/k.o && objcopy -O elf32-i386 /tmp/k.elf /tmp/k.mb && qemu-system-x86_64 -kernel /tmp/k.mb -serial stdio -display none` | `FIRN: profile kernel ist` / `freistehend.` |
+| **`syscall` im Kernel-Profil** | `firnc -o /tmp/x tests/neg/free_syscall_in_kernel.fi` | `error: 'syscall' gibt es im profil 'kernel' nicht` mit Zeile:Spalte |
+| **Gleitkomma ohne `#[allow_fp]`** | `firnc -o /tmp/x tests/neg/free_float_without_allow_fp.fi` | `error: gleitkomma (der typ f64) ist im profil 'kernel' nur mit #[allow_fp] erlaubt` |
+| **`#[interrupt]` ist nicht aufrufbar** | `firnc -o /tmp/x tests/neg/free_interrupt_call.fi` | `error: 'ih' ist ein interrupt-einsprungpunkt und kann nicht aufgerufen werden` |
+| **volatile hält** | `firnc --emit=fir tools/freestanding/volatile.fi \| grep -c 'asm.void "pause"'` | `3` — drei wörtlich gleiche Blöcke, kein CSE |
 
 Ausführlich in `docs/RUNDE52.md`.
 
@@ -193,11 +193,11 @@ Ehrlich und vollständig (ausführlich in `ABNAHME.md`):
   **Nicht** umgesetzt: `secret[T]`, Ausbreitung der Markierung, `declassify`,
   `u128`, `mul_wide`, Wirkung von `#[constant_time]`. Ohne `secret[T]` gibt es
   keine Typprüfung auf Geheimnisdaten. Prüfbar:
-  `firnc -o /tmp/x tests/neg/int_secret_nicht_umgesetzt.fi` meldet
+  `firnc -o /tmp/x tests/neg/int_secret_not_implemented.fi` meldet
   `'secret[T]' ist in Stufe 0 nicht umgesetzt` mit Zeile/Spalte.
   Siehe `ABNAHME.md` Punkt 6.
 * **GC, `Rc`/`Gc`, DOM-Prototyp, RSS-Dauerlauf** — nicht umgesetzt. Prüfbar:
-  `tests/neg/int_gc_nicht_umgesetzt.fi`.
+  `tests/neg/int_gc_not_implemented.fi`.
 * **HTML5-Tokenizer: gebaut.** Bestandene html5lib-Fälle:
   **6.810 von 6.810 (100,00 %)** im Tokenstrom-Vergleich und
   **6.809 von 6.810 (99,99 %)**, wenn zusätzlich die `errors`-Einträge der

@@ -276,9 +276,9 @@ Firn** gebaut, Runde 4 den **Opt-in-Tracing-GC samt DOM-Prototyp und Dauerlauf**
 * **`secret[T]`, `u128`, `mul_wide`, `declassify`, `#[constant_time]`**
   (SPEC §9) — **nicht umgesetzt.** `fn f(a: secret[u8])` meldet
   `'secret[T]' ist in Stufe 0 nicht umgesetzt`
-  (`tests/neg/int_secret_nicht_umgesetzt.fi`), `#[constant_time]` meldet
+  (`tests/neg/int_secret_not_implemented.fi`), `#[constant_time]` meldet
   `attribut 'constant_time' ist in Stufe 0 nicht umgesetzt`
-  (`tests/neg/attr_nicht_umgesetzt.fi`). **Umgesetzt sind seit Runde 4 die drei
+  (`tests/neg/attr_not_implemented.fi`). **Umgesetzt sind seit Runde 4 die drei
   Primitive** `select(bedingung, a, b)` (wird `cmov`, nie ein bedingter
   Sprung), `barrier(x)` (undurchsichtige Sperre) und
   `secure_zero(zeiger, anzahl_bytes)` (überlebt jeden Optimierungsdurchgang,
@@ -396,7 +396,7 @@ Nachweise: `tests/400…419_*.fi` (20 Programme, alle in drei Baustufen) und
 `tests/neg/err_*.fi` (11 Negativtests). Beispiel:
 
 ```
-$ ./compiler/target/release/firnc -o /tmp/n tests/neg/err_try_ausserhalb.fi
+$ ./compiler/target/release/firnc -o /tmp/n tests/neg/err_try_outside.fi
 error: 'try' ist nur in einer funktion mit fehlerunions-rueckgabetyp erlaubt, diese liefert i32
 ```
 
@@ -420,7 +420,7 @@ grep -n "jmp qword ptr" /tmp/tok.s     # 11005:    jmp qword ptr [rdx + rax*8]
 
 Der Harness ist eine **Werkbank** (Python, `tools/tokenizer/harness.py`,
 295 Zeilen) und enthält keine Tokenizer-Logik: er schickt Aufträge über stdin
-(Protokoll in `tools/tokenizer/PROTOKOLL.md`) und vergleicht die Antwortzeile.
+(Protokoll in `tools/tokenizer/LOG.md`) und vergleicht die Antwortzeile.
 
 ```sh
 bash tools/tokenizer/run.sh
@@ -434,7 +434,7 @@ xmlViolation.test              4 /     4 100.00 %       3 /     4  75.00 %
 GESAMT                      6810 /  6810 100.00 %    6809 /  6810  99.99 %
 ```
 
-**Durchsatz auf ZWEI Korpora** (`bash tools/tokenizer/durchsatz.sh`, echte
+**Durchsatz auf ZWEI Korpora** (`bash tools/tokenizer/throughput.sh`, echte
 Ausgabe vom 14.08.2026, bester von je 3 Läufen):
 
 ```
@@ -475,7 +475,7 @@ Ehrlich benannt:
 * **Die XML-Anpassung ist ein optionaler Modus, kein Sonderweg**: die vier
   `xmlViolationTests` verlangen die Anpassungen aus „Coercing an HTML DOM into
   an infoset". Der Treiber schaltet sie über eine Auftragsflagge zu (Bit 0,
-  `tools/tokenizer/PROTOKOLL.md`), der Harness setzt sie ausschließlich für die
+  `tools/tokenizer/LOG.md`), der Harness setzt sie ausschließlich für die
   Fälle unter dem Schlüssel `xmlViolationTests`. Gegenprobe (fährt `run.sh`
   selbst mit): `python3 tools/tokenizer/harness.py <binary> --ohne-xml-modus`
   ergibt `6807 / 6810 (99,96 %)` — der reine HTML-Pfad ist also unverändert.
@@ -499,7 +499,7 @@ Ehrlich benannt:
   Tokenizer führt Zeile und Spalte selbst mit und gibt hinter dem Tokenstrom
   (durch Tabulator getrennt) eine zweite JSON-Liste aus, z. B.
   `[{"code":"eof-in-tag","line":1,"col":6}]`; die Codenamen stehen in
-  `lib/html/fehler_codes.fi` (WHATWG §13.2 „Parse errors"). Ergebnis
+  `lib/html/error_codes.fi` (WHATWG §13.2 „Parse errors"). Ergebnis
   **6.809 / 6.810 (99,99 %)**. Der eine Fehlschlag ist `xmlViolation.test #0`:
   dort steht `U+FFFF` in der Eingabe, der Tokenizer meldet dafür korrekt
   `noncharacter-in-input-stream`, die Datei `xmlViolation.test` führt aber gar
@@ -754,7 +754,7 @@ var m: [u8; 42] = "firn-gc: gc_init() wurde nicht aufgerufen\n"
 **WTF-16 hält ungepaarte Surrogate** — `u"a\uD800b"` ist gültig und ergibt
 `[97, 55296, 98]`. Das ist keine Nachlässigkeit, sondern Pflicht: eine Sprache,
 die nur wohlgeformtes Unicode zulässt, kann JavaScript nicht umsetzen
-(`FIRN-ANFORDERUNGEN.md` §2). Nachweis in `tests/570_zeichenkettenliterale.fi`.
+(`FIRN-ANFORDERUNGEN.md` §2). Nachweis in `tests/570_string_literals.fi`.
 
 **Wie es gebaut ist — und warum so klein:** Die Entschlüsselung lag seit
 Runde 2 fertig in `compiler/src/strings.rs`, sie war nur nie an den Lexer
@@ -765,7 +765,7 @@ landen als Folge einzelner Speicherbefehle im Rahmen, nicht in `.rodata`. Für
 Meldungen und Pfade ist das gleichgültig, für große Tabellen wäre es das nicht.
 
 **Sofort eingelöst:** die handgeschriebenen Oktettlisten in `lib/gc/gc.fi`,
-`lib/dom/mess.fi` und `lib/html/entities_ausfall.fi` sind verschwunden — aus
+`lib/dom/meas.fi` und `lib/html/entities_ausfall.fi` sind verschwunden — aus
 einer 63-stelligen Zahlenreihe wurde
 `"FEHLER: tabelle() lieferte 0, obwohl mmap moeglich sein sollte\n"`.
 
@@ -1024,7 +1024,7 @@ Selbstauskunft der Laufzeit.
 | RSS-Verlauf | konstant über 1.001 Stichproben | linear steigend |
 | lebende Objekte | 8–12 | 12.000.000 |
 
-Die Gegenprobe (`lib/dom/soak_leck.fi`) läuft **bei jedem Testlauf mit** und
+Die Gegenprobe (`lib/dom/soak_leak.fi`) läuft **bei jedem Testlauf mit** und
 **muss** lecken; bleibt sie grün, bricht `run.sh` ab. Eine Messung, die ein Leck
 gar nicht anzeigen kann, ist keine Messung. Ihr Zähler ist korrekt — sie gibt
 die eine Struktur ohne Rückverweis jedes Mal frei und scheitert ausschließlich
@@ -1040,7 +1040,7 @@ ihr Objekt am Leben. `docs/berichte/dom.md` beschreibt beides mit Messwerten.
 ```
 RUN.md                   wie man alles baut, startet und nachmisst
 SPEC.md, ROADMAP.md      Sprachspezifikation und Fahrplan (Vertrag)
-tools/baustufen/         misst dev / dev-fast / release gegeneinander
+tools/build_stages/         misst dev / dev-fast / release gegeneinander
 tools/schichten/         Architekturwaechter: Feldzugriff <-> Speicherort
 tools/ergebnisort/       prueft die Ergebnisort-Garantie am Assembler
 DESIGNZIELE.md           10 Fundamententscheidungen (async-Farben, fehlbare
@@ -1353,7 +1353,7 @@ firnc --opt-level=release-fast # alle Durchgänge (heute identisch zu -safe)
 firnc --no-pass=inline datei.fi
 ```
 
-Gemessen mit `bash tools/baustufen/run.sh 3` (Median über sechs Benchmarks):
+Gemessen mit `bash tools/build_stages/run.sh 3` (Median über sechs Benchmarks):
 
 * **`dev-fast`: 2,06× langsamer als `release-fast`**
 * `dev`: 10,54× langsamer — dieselbe Größenordnung wie Rusts Debug-Builds

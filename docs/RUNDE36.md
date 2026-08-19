@@ -21,11 +21,11 @@ Funktions-Lookup — eine eigene Funktion gleichen Namens gewinnt), Lowering
 - `select` mit Zeigertypen (431) und `secure_zero` (433) decken die
   zusaetzlichen Faelle ab.
 
-Tests: tests/430_ct_select.fi, 431_ct_select_zeiger.fi, 432_ct_barrier.fi
-(Vervollstaendigung), 433_ct_secure_zero.fi, Kern-Test tests/780_ct_kern.fi.
-Negativtests (rc=1 beidseitig): tests/neg/ct_select_bedingung.fi,
-ct_select_stellenzahl.fi, ct_select_typen_verschieden.fi,
-ct_secure_zero_kein_zeiger.fi, ct_barrier_aggregat.fi.
+Tests: tests/430_ct_select.fi, 431_ct_select_ptr.fi, 432_ct_barrier.fi
+(Vervollstaendigung), 433_ct_secure_zero.fi, Kern-Test tests/780_ct_core.fi.
+Negativtests (rc=1 beidseitig): tests/neg/ct_select_cond.fi,
+ct_select_digit_count.fi, ct_select_types_different.fi,
+ct_secure_zero_no_ptr.fi, ct_barrier_aggregate.fi.
 
 ## 2. errdefer (Vorbild Stufe 0, defer.fi als firnc1-Vorbild)
 
@@ -47,9 +47,9 @@ Commit 6ef2616.
 
 | Werkzeug | vorher (Runde 34) | nachher |
 |---|---|---|
-| tools/selbst_vergleich.sh | 180 gleich | **185 gleich, 0 abw., 0 fehlerhaft, NICHT KERN 0** |
+| tools/self_compare.sh | 180 gleich | **185 gleich, 0 abw., 0 fehlerhaft, NICHT KERN 0** |
 | test.sh | 637/637 | **640/640** |
-| tools/fixpunkt.sh | 279201 Zeilen | **284207 Zeilen, zeichengleich** |
+| tools/fixpoint.sh | 279201 Zeilen | **284207 Zeilen, zeichengleich** |
 
 ## Grenzen (ehrlich benannt)
 

@@ -4,7 +4,7 @@
 **Stand (Runde 31): der Fixpunkt steht.** `firnc1` — der Compiler, geschrieben
 in Firn — übersetzt **sich selbst**, und das Ergebnis ist ein Fixpunkt:
 Stufe 2 (von `firnc1` erzeugt) und Stufe 3 (von Stufe 2 erzeugt) sind
-**zeichengleich**. Nachweis: `tools/fixpunkt.sh`, Abschnitt 17 von `test.sh`.
+**zeichengleich**. Nachweis: `tools/fixpoint.sh`, Abschnitt 17 von `test.sh`.
 Der Verlauf dorthin steht unten, Runde für Runde, mit Messwerten statt
 Behauptungen — §21 ist der Schlussstein.
 
@@ -58,7 +58,7 @@ Sortiert nach „blockiert am meisten zuerst". `[ ]` = fehlt,
 | # | Merkmal | Stand | Warum der Compiler es braucht |
 |---|---|---|---|
 | 1 | **Heap-Allokator** (`mmap`-basiert, `alloc`/`free`) | **`[x]`** `lib/rt/rt.fi` (Runde 15) | Ohne ihn gibt es kein `Vec`, keinen AST, keine Symboltabelle |
-| 2 | **`Vec[T]`** (wachsendes Feld) | **`[x]`** als Bibliothek `lib/rt/vec.fi` (Runde 18, `tests/640_vec_modul.fi`) | Tokenstrom, Anweisungslisten, Blocklisten — überall |
+| 2 | **`Vec[T]`** (wachsendes Feld) | **`[x]`** als Bibliothek `lib/rt/vec.fi` (Runde 18, `tests/640_vec_module.fi`) | Tokenstrom, Anweisungslisten, Blocklisten — überall |
 | 3 | **Hash-Abbildung `Map[K,V]`** | **`[x]`** `lib/rt/map.fi` + `lib/rt/intern.fi` (Runde 19) | Namenstabellen (`fns`, `consts`, Bereiche) |
 | 4 | **Zeichenketten** `Str`/`Bytes` mit Verkettung | `[~]` `rt.Buf` + `intern.Interner` (Runde 19); es fehlt ein `Str`-Typ mit Verkettungsoperator | Bezeichner, Fehlermeldungen, Assemblertext |
 | 5 | **Textformatierung** (`format`-Ersatz) | **`[~]`** `buf_push_dez_u64/i64`, `buf_push_hex_u64` in `lib/rt/` | Jede Diagnose und der gesamte Assembler-Ausdruck |
@@ -67,7 +67,7 @@ Sortiert nach „blockiert am meisten zuerst". `[ ]` = fehlt,
 | 8 | **Methoden / `impl`** | `[ ]` | Kosmetik, ersetzbar durch freie Funktionen mit erstem Parameter |
 | 9 | **Schnittstellen / dynamischer Versand** | `[ ]` | Für Stufe 1 **nicht** nötig |
 | 10 | **Fehlerbehandlung** (`Result`, `?`) | `[ ]` | Ersetzbar durch Summentyp + `match`, sobald 6 steht |
-| 11 | **Prozessstart** (`fork`/`execve`-Hülle) | **`[x]`** seit Runde 28 (`rt.lauf`, `tests/700_prozessstart.fi`) | `firnc` ruft `as` und `ld` auf |
+| 11 | **Prozessstart** (`fork`/`execve`-Hülle) | **`[x]`** seit Runde 28 (`rt.lauf`, `tests/700_process_start.fi`) | `firnc` ruft `as` und `ld` auf |
 | 12 | **Dateizugriff** (`open`/`read`/`write`) | **`[x]`** `lies_datei`, `lies_stdin`, `schreib_alles` in `lib/rt/` | Quelle lesen, `.s` schreiben |
 | 13 | **Veränderliche globale Zustände** | `[ ]` (nur `const`) | Umgehbar: Kontext-Struct durchreichen — der Rust-Code tut das schon fast überall |
 | 14 | **Aggregate an Funktionsgrenzen** | `[x]` seit Runde 2 | Strukturen als Parameter/Rückgabe |
@@ -227,7 +227,7 @@ sie bindet `rt` aus ihrem eigenen Verzeichnis ein (B3), ruft
 Wurzeldatei schreibt `var v: Vec[i32] = vec_neu[i32]()` (B1). Die Doppelung der
 Speicherfunktionen ist wieder verschwunden.
 
-Nachweis: `tests/640_vec_modul.fi` (1.000 `i32`, 300 `u8`, 100 `u64`, `pop`,
+Nachweis: `tests/640_vec_module.fi` (1.000 `i32`, 300 `u8`, 100 `u64`, `pop`,
 `setzen`, Zugriff jenseits des Endes) in allen drei Baustufen.
 
 **Damit ist `lib/std/` schreibbar** — der nächste Schritt auf der Liste in §2.
@@ -306,10 +306,10 @@ Eine Falle steckt im Umzug: `intern_nummer` muss den Hash aus dem **eigenen**
 Puffer nehmen, nachdem kopiert wurde — der übergebene Zeiger kann in denselben
 Puffer gezeigt haben und beim Wachsen ungültig geworden sein.
 
-Nachweis: `tests/650_map_modul.fi` (1.000 Einträge über mehrere Verdopplungen,
+Nachweis: `tests/650_map_module.fi` (1.000 Einträge über mehrere Verdopplungen,
 Überschreiben, Löschen **und Suchen hinter dem Grabstein**, Wiedereinfügen,
 Durchlauf, drei Ausprägungen mit ungleichen Größen, negative Schlüssel,
-`map_reserve` ohne Umstreuen) und `tests/651_intern_modul.fi` (Präfixe „ab" vs.
+`map_reserve` ohne Umstreuen) und `tests/651_intern_module.fi` (Präfixe „ab" vs.
 „abc", leere Zeichenkette, 2.000 erzeugte Bezeichner mit umziehendem Puffer,
 Nummer als `Map`-Schlüssel) — beide in allen drei Baustufen.
 
@@ -352,7 +352,7 @@ Tokenfeld hinaus.
 
 Ein Lexer lässt sich nicht gegen sich selbst prüfen. `bin/lexdump.fi` schreibt
 den Tokenstrom in **genau** dem Format von `firnc0 --emit=tokens`;
-`tools/lex_vergleich.sh` lässt beide über `tests/`, `lib/`, `bin/` und
+`tools/lex_compare.sh` lässt beide über `tests/`, `lib/`, `bin/` und
 `bench/` laufen und vergleicht Oktett für Oktett.
 
 | | |
@@ -381,7 +381,7 @@ ohne Optimierer war die ganze Zeit richtig.
 
 Beide Stellen sind behoben; `fold_cast` rechnet die Umwandlung jetzt **echt**
 (und faltet auch `f64 -> Ganzzahl`, außer bei NaN, Unendlich und außerhalb des
-Zielbereichs). Rückfalltest: `tests/591_f64_umwandlung.fi`, der wie jeder
+Zielbereichs). Rückfalltest: `tests/591_f64_conversion.fi`, der wie jeder
 Positivtest mit **und** ohne Optimierer läuft.
 
 Das ist der eigentliche Ertrag dieser Runde. Ein Bootstrap ist keine
@@ -399,7 +399,7 @@ Tests gerutscht.
   Zeichen. Der Firn-Lexer arbeitet auf Oktetten und zählt eine Spalte nur beim
   **führenden** Oktett eines UTF-8-Zeichens. Ohne das verschieben sich alle
   Spalten hinter einem Umlaut in derselben Zeile — und genau das prüft der
-  Vergleich mit, weil `tests/570_zeichenkettenliterale.fi` Umlaute enthält.
+  Vergleich mit, weil `tests/570_string_literals.fi` Umlaute enthält.
 * **Worttafeln statt globaler Zustand.** Firn hat keine veränderlichen
   globalen Zustände (Punkt 13). Die Schlüsselwort- und Namenstabellen entstehen
   deshalb aus **einem** Literal, das an `|` zerlegt wird.
@@ -418,7 +418,7 @@ Exponenten bis 37 ab. Darüber wird schrittweise multipliziert, und das liegt um
 
 Gemessen: von 211.405 Token im Korpus braucht **genau eines** den langsamen
 Pfad. Korrekt wäre Eisel-Lemire mit 128-Bit-Arithmetik — die fehlt noch, und
-die Zeile bleibt in `tools/lex_vergleich.sh` stehen, bis sie da ist.
+die Zeile bleibt in `tools/lex_compare.sh` stehen, bis sie da ist.
 
 ### Weitere ehrliche Grenzen
 
@@ -478,7 +478,7 @@ error: in einem zeichenkettenliteral: \u{...} ist nicht abgeschlossen
 
 ### Der Vergleich prüft jetzt beide Ströme
 
-`tools/lex_vergleich.sh` vergleicht nicht mehr nur den Tokenstrom, sondern auch
+`tools/lex_compare.sh` vergleicht nicht mehr nur den Tokenstrom, sondern auch
 die **Fehlerausgabe** — Oktett für Oktett gegen `firnc0 --emit=tokens`.
 
 | | |
@@ -511,7 +511,7 @@ Beim Prozessstart zeigt `rsp` auf `[argc][argv0]..[argvN][0][envp..]`;
 Programm mit `fn main() -> i32` merkt davon nichts — es liest `rdi` nie.
 `lib/rt/rt.fi` bekommt dazu `arg_anzahl`, `arg_zeiger` und `c_laenge`; die
 argv-Zeichenketten sind nullabgeschlossen und damit genau das, was
-`lies_datei` erwartet. Nachweis: `tests/660_argumente.fi`.
+`lies_datei` erwartet. Nachweis: `tests/660_args.fi`.
 
 Das ist der erste Teil von Punkt 11 der Liste. `fork`/`execve` fehlen weiter —
 ohne sie kann `firnc1` `as` und `ld` nicht aufrufen.
@@ -606,7 +606,7 @@ Stück abgelegt.
 `--emit=ast` ist Rusts `{:#?}` — an `Box`, `Some`/`None` und Feldnamen
 gebunden. Ein Parser in einer anderen Sprache kann das nicht nachbauen, ohne
 Rusts Debug-Ausgabe nachzuäffen; dann prüft der Vergleich die Formatierung
-statt den Baum. `compiler/src/ast_kanon.rs` erzeugt deshalb eine
+statt den Baum. `compiler/src/ast_canon.rs` erzeugt deshalb eine
 **sprachneutrale** geklammerte Form:
 
 ```text
@@ -619,7 +619,7 @@ Datei.
 
 ### Ergebnis
 
-`tools/parser_vergleich.sh`, Abschnitt 12 in `test.sh`:
+`tools/parser_compare.sh`, Abschnitt 12 in `test.sh`:
 
 | | |
 |---|---:|
@@ -682,7 +682,7 @@ Typ und Größe). Danach wird es ernst: `sema`.
 
 §3 nennt `types.rs` und `abi.rs` seit der ersten Fassung als die Dateien, die
 **heute schon vollständig in Firn schreibbar** wären: sie rechnen nur auf Typ
-und Größe, ohne Heap und ohne Text. `lib/firnc1/typen.fi` löst das ein.
+und Größe, ohne Heap und ohne Text. `lib/firnc1/types.fi` löst das ein.
 
 ### Warum ausgerechnet die zwei als Nächstes
 
@@ -694,7 +694,7 @@ findet hier mehr als jeder ausgedachte Testfall.
 
 ### Der Maßstab: `--emit=layout`
 
-`compiler/src/layout_kanon.rs` druckt je Struct Größe, Ausrichtung und **jeden
+`compiler/src/layout_canon.rs` druckt je Struct Größe, Ausrichtung und **jeden
 Feldversatz**, je Funktion die System-V-Klasse jedes Arguments und des
 Rückgabewertes samt `sret`:
 
@@ -710,7 +710,7 @@ Unsicherheit scheitern statt an einem echten Unterschied.
 
 ### Ergebnis
 
-`tools/typen_vergleich.sh`, Abschnitt 13 in `test.sh`:
+`tools/types_compare.sh`, Abschnitt 13 in `test.sh`:
 
 | | |
 |---|---:|
@@ -741,7 +741,7 @@ Läuft mit und ohne Optimierer, und beide Layoutausgaben stimmen überein.
 
 ### Ehrliche Grenzen
 
-* `typen.fi` löst nur auf, was die **Kernsprache** kennt. `enum`-Layout
+* `types.fi` löst nur auf, was die **Kernsprache** kennt. `enum`-Layout
   (Marke + überlagerte Varianten), Fehlerunionen und `gc class` fehlen — sie
   gehören zu den 109 Dateien, die der Parser ohnehin nicht liest.
 * Es gibt **keine Typprüfung**. Was hier steht, ist Layout und ABI, nicht
@@ -804,7 +804,7 @@ verwirrenden Operandenfehler statt des echten Fehlers an der Zuweisung.
 
 ### Ergebnis
 
-`tools/sema_vergleich.sh`, Abschnitt 14 in `test.sh`:
+`tools/sema_compare.sh`, Abschnitt 14 in `test.sh`:
 
 | | |
 |---|---:|
@@ -853,7 +853,7 @@ dagegen ein konstanter Ausdruck stehen (`[0 as u8; FLAECHE]`).
 
 Beim Anlegen der Symlinks in `lib/firnc1/` hat ein falsch geschriebener
 `ln -sf`-Aufruf vier echte Dateien durch Verweise auf sich selbst ersetzt.
-`ast.fi` und `typen.fi` kamen aus dem Git zurück, `sema.fi` und `druck.fi`
+`ast.fi` und `types.fi` kamen aus dem Git zurück, `sema.fi` und `print.fi`
 waren noch nicht eingecheckt und mussten neu geschrieben werden. Lehre, ohne
 Beschönigung: **vor jedem Sammelbefehl auf Verzeichnisse committen.** Der
 Verlust hat eine halbe Runde gekostet.
@@ -941,7 +941,7 @@ entfernt ihn erst später. Wer ihn weglässt, bekommt einen anderen Text.
 * Die Zeilentabelle für `.debug_line` (`dwarf.rs`) — sie ändert den FIR-Text
   nicht, gehört aber zum Lowering.
 
-### `tests/690_lowering_kern.fi`
+### `tests/690_lowering_core.fi`
 
 Fährt die Formen ab, an denen Nummerierung und Blockbildung hängen:
 verschachtelte Aufrufe, Aufruf ohne Rückgabewert, Kurzschluss mit `&&`/`||`,
@@ -1081,7 +1081,7 @@ wird zu `rep movsb`.
 
 ### Ergebnis
 
-`tools/selbst_vergleich.sh`, Abschnitt 16 in `test.sh`:
+`tools/self_compare.sh`, Abschnitt 16 in `test.sh`:
 
 | | |
 |---|---:|
@@ -1144,7 +1144,7 @@ if kind == 0 {
 
 Kommt `execve` zurück, ist es **fehlgeschlagen** — und dann läuft das Kind im
 Programm des Elternteils weiter. Ohne das `beende` würde bei einem fehlenden
-`as` der ganze Compiler ein zweites Mal ablaufen. `tests/700_prozessstart.fi`
+`as` der ganze Compiler ein zweites Mal ablaufen. `tests/700_process_start.fi`
 prüft genau diesen Fall mit einem Pfad, den es nicht gibt.
 
 Dazu kam `rt.schreib_datei` (`open` mit `O_WRONLY|O_CREAT|O_TRUNC`, Rechte
@@ -1152,7 +1152,7 @@ Dazu kam `rt.schreib_datei` (`open` mit `O_WRONLY|O_CREAT|O_TRUNC`, Rechte
 
 ### Was der Nachweis jetzt wirklich zeigt
 
-`tools/selbst_vergleich.sh` ruft **kein Werkzeug mehr selbst auf**. Es startet
+`tools/self_compare.sh` ruft **kein Werkzeug mehr selbst auf**. Es startet
 `firnc1`, und alles Weitere passiert in Firn:
 
 | | |
@@ -1205,10 +1205,10 @@ Die Wurzeldatei wird **zuletzt** geparst und **nicht** umbenannt. Die Module
 davor: eine Konstante darf eine aus einem anderen Modul benutzen, also müssen
 die Abhängigkeiten vorher im Baum stehen.
 
-### `tests/710_modul_kern.fi`
+### `tests/710_module_core.fi`
 
 Drei Ebenen, und der Name `wert` steht in **allen dreien** — in der
-Wurzeldatei, in `kern/mittel.fi` und in `kern/tief.fi`. Ohne Umbenennung würde
+Wurzeldatei, in `kern/mid.fi` und in `kern/deep.fi`. Ohne Umbenennung würde
 eine Fassung die andere verdecken. Dazu eine Konstante und ein `struct` aus
 einem fremden Modul (als Wert übergeben) und eine Kette über zwei Ebenen
 (`mittel` bindet `tief` ein).
@@ -1262,7 +1262,7 @@ Der Stapel bleibt beim vorzeitigen Ablaufen **unverändert**: der Block räumt
 seine eigene Ebene selbst ab. Was danach noch erzeugt wird, landet im
 unerreichbaren Block hinter dem Sprung — doppelt ausgeführt wird nichts.
 
-`tests/720_defer_kern.fi` schreibt die Reihenfolge in einen Puffer, statt nur
+`tests/720_defer_core.fi` schreibt die Reihenfolge in einen Puffer, statt nur
 Aufrufe zu zählen. Dabei fiel eine Eigenschaft auf, die ich falsch erwartet
 hatte: **das Argument einer aufgeschobenen Anweisung wird erst beim Ablaufen
 ausgewertet**, nicht bei der Vereinbarung. `defer merke(s, 49 + i)` schreibt
@@ -1382,12 +1382,12 @@ berührt. Ein Compiler, der sich selbst übersetzt, ist der schärfere Test.
    ohne Meldung — das Programm lief und rechnete falsch (`tests/fwd`-Fall:
    `firnc0` gab 0, `firnc1` gab 2). Aufgefallen ist es an der
    Monomorphisierung: `Vec__u32` entsteht **nach** allen handgeschriebenen
-   Structs, wird aber von `lexer.Lexer` als Feld benutzt. `typen.fi` rechnet
+   Structs, wird aber von `lexer.Lexer` als Feld benutzt. `types.fi` rechnet
    das Layout jetzt **abhängigkeitsgetrieben** (`struct_layout` mit
    `zustand`-Markierung); über Zeiger wird nicht abgestiegen, damit
    `struct Knoten { naechster: *mut Knoten }` möglich bleibt.
 3. **`import` galt nur für die Wurzeldatei.** Ein Modul durfte kein Modul
-   einbinden. `tests/640_vec_modul.fi` scheiterte still daran, dass
+   einbinden. `tests/640_vec_module.fi` scheiterte still daran, dass
    `modules/vec.fi` sein eigenes `rt` nicht bekam. `bin/firnc1.fi` hält jetzt
    eine **Warteschlange** über den ganzen Einbindungsgraphen (Breitensuche wie
    `modules.rs::resolve`), mit Pfad-Dedup — damit sind auch die in Runde 29
@@ -1409,7 +1409,7 @@ Der Preis ist ein zweites Lexen jeder Modulquelle. Das ist billiger als alle
 Lexer gleichzeitig offen zu halten — und es macht die Reihenfolge der
 `import`-Zeilen bedeutungslos.
 
-### `tests/730_generik_kern.fi`
+### `tests/730_generics_core.fi`
 
 Der Test zur Runde, und er prüft genau das, was schiefging: eine Vorlage aus
 einem **Modul**, mit `i32`/`u8`/`i64` ausgeprägt; eine Vorlage, die eine
@@ -1456,7 +1456,7 @@ Architektur wie Stufe 0 (`sema_match.rs`): die Fälle eines `match` liegen
 **nicht** im Syntaxbaum, sondern in einer Registrierung; im Baum steht nur
 ein Aufruf `__match#<nummer>` ohne Argumente. Das Layout einer Aufzählung
 wird als Struct mit den Feldern `__tag` und `__v<tag>_<i>` in den Typkontext
-eingetragen, die Offsets in `muster.fi` gerechnet, nicht von `typen.fi`.
+eingetragen, die Offsets in `pattern.fi` gerechnet, nicht von `types.fi`.
 
 | | Runde 31 | Runde 32 |
 |---|---:|---:|
@@ -1479,7 +1479,7 @@ gegen `firnc0`.
 
 1. **Die `__match#`-Nummern der Wurzeldatei müssen die kleinen bleiben.**
    `firnc0` parst die Wurzel zuerst, `firnc1` die Module zuerst (Konstanten
-   dürfen modulübergreifend sein). `tests/231_modul_match.fi` hat zwei
+   dürfen modulübergreifend sein). `tests/231_module_match.fi` hat zwei
    `match` im Modul und eines in der Wurzel — `--emit=ast-kanon` zeigt in
    der Wurzel `__match#0`. Der Vergleich läuft nur über die Einzeldatei-
    Werkzeuge, und die parsen genau eine Datei — dort stimmt die Nummer.
@@ -1492,7 +1492,7 @@ gegen `firnc0`.
    Reihenfolge vertauscht, bekommt andere Wertnummern und der FIR-Vergleich
    bricht. (Genau daneben lag ein erster Entwurf: im Nicht-Aufzählungs-Fall
    wurde der Schlüsselwert nie gesetzt — der Switch verzweigte auf `%0`.)
-3. **Das Layout verlangt zwei getrennte Eingriffe in `typen.fi`.** Die
+3. **Das Layout verlangt zwei getrennte Eingriffe in `types.fi`.** Die
    Aufzählungsnamen müssen VOR dem Structlayout angemeldet sein (sonst kennt
    `fn dauer(a: Ampel)` den Typ nicht), die Layouts erst NACHHER eingetragen
    werden (eine Aufzählung darf ein Struct dem Wert nach enthalten, nicht
@@ -1510,7 +1510,7 @@ gegen `firnc0`.
   Verhalten, nicht der Assemblertext.
 * **`u64`-Marken jenseits von `i64::MAX` lassen sich nicht niederschreiben.**
   Stufe 0 rechnet Musterwerte in `i128`; diese Stufe in `i64`. Kein
-  Programm im Korpus hat eine solche Marke; es steht in `muster.fi` und hier.
+  Programm im Korpus hat eine solche Marke; es steht in `pattern.fi` und hier.
 * **Fehler werden gezählt, nicht beschrieben** — wie überall in Stufe 1.
   Die Vollständigkeitsprüfung (`check_exhaustive`) IST portiert: ein
   fehlender Fall ist ein Fehler, kein Warnhinweis.
@@ -1518,10 +1518,10 @@ gegen `firnc0`.
 ### Ehrliche Grenzen
 
 * **`--emit=layout` vergleicht die enum/match-Dateien weiter nicht.** Der
-  Maßstab (`layout_kanon.rs`) kennt Aufzählungen nicht und druckt ihre Namen
+  Maßstab (`layout_canon.rs`) kennt Aufzählungen nicht und druckt ihre Namen
   als `?`; `bin/layoutdump.fi` meldet das Muster-Register deshalb bewusst
   NICHT an, und die Dateien zählen dort als „nicht Kern" (gezählt, nicht
-  übergeben: es sind 9 Programmdateien plus `tests/modules/zustand.fi`).
+  übergeben: es sind 9 Programmdateien plus `tests/modules/state.fi`).
 * **`match` in generischen Vorlagen** ist wie in Stufe 0 ein Fehler; hier
   zählt die Datei zusätzlich als „nicht Kern" (Vorab-Suche).
 * **Enum dem Wert nach als Structfeld** bleibt ein Fehler (Zeiger geht);
@@ -1544,7 +1544,7 @@ benannt: Fehlerunionen (20), `gc`/`rc` (14), konstante Laufzeit (4),
 
 `firnc1` liest jetzt Fehlerunionen — mit derselben Architektur wie Stufe 0
 (`errors.rs`/`lower_errors.rs`): eine Registrierung ausserhalb des Baums
-(`lib/firnc1/fehler.fi`), im Baum stehen Aufrufe `__try#` und `__catch#`,
+(`lib/firnc1/err.fi`), im Baum stehen Aufrufe `__try#` und `__catch#`,
 und die Typangabe `E!T` wandert als Platzhalter `__eu#<nummer>` durch den
 Baum, bis die Typaufloesung sie gegen die Registrierung aufloest. Die Union
 selbst ist ein gewoehnlicher Struct `{ __err: u32, __val: T }` im
@@ -1570,13 +1570,13 @@ die Suite prueft Negativtests nur gegen `firnc0`.
 
 ### Drei Stellen, an denen man das nicht raten kann
 
-1. **Die Typangabe `E!T` geht durch einen Importzyklus.** `typen.fi` loest
+1. **Die Typangabe `E!T` geht durch einen Importzyklus.** `types.fi` loest
    Typausdruecke auf, aber die Bedeutung des Platzhalters `__eu#<n>` kennt
-   nur `fehler.fi` — und `fehler.fi` braucht `typen.fi`, um die Union als
+   nur `err.fi` — und `err.fi` braucht `types.fi`, um die Union als
    Struct anzulegen. Firn kennt keine Funktionszeiger, also tragen die
    Typen einen Zeiger auf die Registrierung (`typen_fehler_setzen`) und
-   `aufloesen` ruft `fehler.fehler_typ` direkt — `typen.fi` und
-   `fehler.fi` einander importierend. Dass `modules.rs` Zyklen aufloest,
+   `aufloesen` ruft `fehler.fehler_typ` direkt — `types.fi` und
+   `err.fi` einander importierend. Dass `modules.rs` Zyklen aufloest,
    steht nirgends; es ist an einem Gegenstueck in `/tmp` gemessen, nicht
    geraten.
 2. **Der Zeitpunkt der Union entscheidet ueber den Structindex.** In Stufe
@@ -1610,14 +1610,14 @@ die Suite prueft Negativtests nur gegen `firnc0`.
   aus als „nicht Kern"; ohne die Marke waere `581` still mit falschem
   Verhalten kompiliert worden.
 * **`--emit=layout` vergleicht die Fehlerunion-Dateien nicht** — derselbe
-  Stand wie bei den Aufzaehlungen: `layout_kanon.rs` loest `__eu#<n>`
+  Stand wie bei den Aufzaehlungen: `layout_canon.rs` loest `__eu#<n>`
   nicht auf und druckt `?`; `bin/layoutdump.fi` meldet das Register
   deshalb bewusst NICHT an, und die Dateien zaehlen dort als „nicht Kern".
 * **`tests/130_must_consume.fi` bleibt „nicht Kern"** — es braucht die
   Attributsyntax `#[must_consume]` (`attrs.rs`), nicht die Fehlerunionen.
   Was die Runde dafuer mitbringt: ein `E!T`-Wert ist implizit
   must_consume, und das Verwerfen ist ein Fehler (`sema.fi`, Vorbild
-  `check_discard`) — einzeln gemessen an `tests/neg/err_verworfen.fi`
+  `check_discard`) — einzeln gemessen an `tests/neg/err_discarded.fi`
   (`rc=1`).
 * **`E!T` in generischen Vorlagen** ist nicht durchdacht, nur benannt: der
   Platzhalter verweist auf den Typknoten, wie er GESCHRIEBEN steht — eine
@@ -1628,8 +1628,8 @@ die Suite prueft Negativtests nur gegen `firnc0`.
   Selbstuebersetzen mituebersetzt (Stufe 2 == Stufe 3 beweist das), aber
   nicht durchlaufen.
 
-Neuer Dauer-Test: `tests/740_fehlerunion_kern.fi` — Fehlermenge und Union
-aus einem Modul (`tests/modules/kern/mittel.fi`), `try` ueber zwei Ebenen
+Neuer Dauer-Test: `tests/740_error_union_core.fi` — Fehlermenge und Union
+aus einem Modul (`tests/modules/kern/mid.fi`), `try` ueber zwei Ebenen
 durch die Modulgrenze, `catch |e|` mit Fehlervergleich, Umwandlung bei
 `return`/`let`/Zuweisung/Argument, Union als Structfeld.
 
@@ -1649,7 +1649,7 @@ Parallel zu Runde 34 in einem eigenen git-Worktree gebaut (Branch
 `r35-comptime`), weil comptime der isolierteste Restblock war; der Merge
 lief fast-forward ohne einen Konflikt.
 
-`lib/firnc1/zeit.fi` (689 Zeilen) ist ein echter Interpreter nach dem
+`lib/firnc1/time.fi` (689 Zeilen) ist ein echter Interpreter nach dem
 Vorbild von `compiler/src/comptime.rs`: die comptime-Bloecke der
 Wurzeldatei werden zur Uebersetzungszeit ausgefuehrt, ihr erzeugter
 Quelltext wird ueber dieselbe Lex/Parse-Maschinerie als Modul ohne Alias
@@ -1668,7 +1668,7 @@ verhaltensgleiche Programme (vorher 166) bei 0 abweichend und 0
 fehlerhaft, Fixpunkt steht — Stufe 2 == Stufe 3, zeichengleich, 210 324
 Zeilen Assembler. Beide Zieldateien (601, 602 — darunter die
 UCD-Tabellen-Erzeugung, der haerteste comptime-Fall im Korpus) laufen
-identisch zu `firnc0`. Neu: `tests/760_comptime_kern.fi` und
+identisch zu `firnc0`. Neu: `tests/760_comptime_core.fi` und
 `docs/RUNDE35.md`.
 
 Uebrig bleiben: `gc` (9), konstante Laufzeit (4), `errdefer` (1) und die
@@ -1696,7 +1696,7 @@ Messwerte: `selbst_vergleich` 169 -> 179 verhaltensgleiche Programme
 (alle neun gc-Dateien, darunter 510 Zyklus und 560 DOM-Zyklen mit echter
 Aufloesung), 0 abweichend, 0 fehlerhaft. Fixpunkt steht: Stufe 2 ==
 Stufe 3, zeichengleich, 279 201 Zeilen Assembler. Alle sechs
-gc/nogc-Negativtests brechen wie firnc0 ab. Neu: `tests/770_gc_kern.fi`
+gc/nogc-Negativtests brechen wie firnc0 ab. Neu: `tests/770_gc_core.fi`
 (gc-Klasse nur im Modul, Zyklus unter Wurzel) und `docs/RUNDE34.md`.
 
 Uebrig bleiben: konstante Laufzeit (4), `errdefer` (1), `must_consume` (1).
@@ -1712,7 +1712,7 @@ Funktions-Lookup, damit eine eigene Funktion gleichen Namens gewinnt.
 `errdefer` laeuft nur auf dem Fehlerweg (Fertige-Union-Ablehnung wie
 Stufe 0), `#[must_consume]` an Funktionen und Structs meldet verworfene
 Ergebnisse. Details in `docs/RUNDE36.md`, Kern-Test
-`tests/780_ct_kern.fi`.
+`tests/780_ct_core.fi`.
 
 Messwerte: `test.sh` 640/640, `selbst_vergleich` 186 verhaltensgleiche
 Programme bei 0 abweichend und 0 fehlerhaft, Fixpunkt zeichengleich
@@ -1757,12 +1757,12 @@ Modul-Suchpfad in BEIDEN Compilern identisch: neben der importierenden
 Datei, neben der Wurzeldatei, `$FIRNLIB`, `<exe>/../lib`
 (Installationslayout). Darauf steht `lib/std/` — die Fassade im
 C#-Stil ueber den bewaehrten Bausteinen (io, math, str, vec, map, num,
-mem), Kern-Test tests/790_std_kern.fi. Die String-Interpolation
+mem), Kern-Test tests/790_std_core.fi. Die String-Interpolation
 `f"x = {x}"` zerlegt der Parser ZUR UEBERSETZUNGSZEIT in eine Kette auf
 den Fmt-Builder (keine Varargs, kein Laufzeit-Parsen, keine
 Verlangsamung), gebaut in firnc0 UND firnc1; Anzeige ist die von i64 —
 die ehrlich benannte Grenze der Kernfassung. Kern-Test
-tests/791_interpolation_kern.fi, drei Negativtests brechen auf beiden
+tests/791_interpolation_core.fi, drei Negativtests brechen auf beiden
 Seiten ab. Verifiziert aus einem /tmp-Projekt per FIRNLIB.
 
 ## 30. Runde 40: Regalloc gegen realweb — und ein Alias, der zu weit ging
@@ -1783,7 +1783,7 @@ Der Zellen-Alias aus Runde 40 liess einen Load das Zellenregister
 direkt lesen. Die Registerverteilung war da aber schon gelaufen — sie
 kannte die vom Alias VERLAENGERTE Lebensspanne nicht und durfte
 dasselbe Register an einen anderen Wert vergeben. In
-bin/druck.fi/drucke_binop wurde daraus `43 - &tab[start]` statt
+bin/print.fi/drucke_binop wurde daraus `43 - &tab[start]` statt
 `43 - start`: die Laenge unterlief, `rt.buf_wachse` verdoppelte bis
 zum Ueberlauf und drehte sich ewig. Wirkung: `.astdump` hing bei JEDER
 Datei mit `||` — also bei fast jeder — und test.sh blieb in Abschnitt
@@ -1841,7 +1841,7 @@ gebraucht; das Profil zeigte den Aufwand woanders.
 
 Instruktionen realweb **1.297.226.150 -> 957.989.680 (-26,15 %)**, html5lib
 -13,39 %. Selbst nachgemessen auf dem Merge-Stand mit
-`tools/tokenizer/durchsatz.sh`: **realweb 1,54x** (Ziel <= 2,00x erreicht),
+`tools/tokenizer/throughput.sh`: **realweb 1,54x** (Ziel <= 2,00x erreicht),
 **html5lib 0,95x** — auf den Grenzfaellen ist der Firn-Tokenizer damit
 schneller als html5ever. Durchsatz realweb 29,25 MB/s.
 
@@ -1866,13 +1866,13 @@ sondern im gestueckelten Fegen.
 * **Zweite Uhr (Rechenzeit des Fadens)** neben der Wanduhr in der
   Pausenmessung; nur so laesst sich Fremdlast von echter Pause trennen —
   genau der Fehler, der in Runde 40 die 19-ms-Ausreisser erzeugt hatte.
-* Neue Messwerkzeuge: `aufbau.fi` (nullt das Histogramm NICHT, misst also
+* Neue Messwerkzeuge: `build.fi` (nullt das Histogramm NICHT, misst also
   auch die Aufbauphase), `durchsatz.fi` (feste Arbeit, gemessene Zeit),
   `ab.fi` (A/B im selben Prozess).
 
 Ergebnis: laengste Unterbrechung **11,82 ms -> 0,45 ms** (5-s-Lauf), 0,62 ms
 reine Rechenzeit im 10-Minuten-Dauerlauf. Durchsatzverlust 2 % bei kleiner,
-0 % bei grosser lebender Menge. `tests/771_gc_aufbau_ohne_stw.fi` prueft das
+0 % bei grosser lebender Menge. `tests/771_gc_build_without_stw.fi` prueft das
 deterministisch ueber `gc_volle_laeufe() == 0` statt ueber einen
 Zeitvergleich — der waere auf belasteter Maschine wertlos.
 
@@ -1897,20 +1897,20 @@ Die drei Runden liefen parallel in getrennten Worktrees mit sauber
 getrennten Revieren (Regalloc/Codegen · GC · Parser/Sema) und liessen sich
 bis auf einen `.gitignore`-Konflikt konfliktfrei zusammenfuehren.
 
-Die Abnahme meldete danach **eine** Abweichung: `771_gc_aufbau_ohne_stw.fi`,
+Die Abnahme meldete danach **eine** Abweichung: `771_gc_build_without_stw.fi`,
 firnc0 gab 0, firnc1 gab 3 (`gc_volle_laeufe() != 0`). Mit **frisch
 gebautem** `.firnc1` war der Test dreimal hintereinander gruen. Ursache war
-wieder ein wiederverwendetes Binary: `tools/selbst_vergleich.sh` baute
+wieder ein wiederverwendetes Binary: `tools/self_compare.sh` baute
 `.firnc1` nur, **wenn es fehlte** — nach dem Merge verglich es also einen
 Compiler, den es nicht mehr gab.
 
 Das ist derselbe Fehler wie bei den Dump-Binaries (Runde 41, dort behoben).
-`selbst_vergleich.sh` baut `.firnc1` jetzt auch dann neu, wenn firnc0 oder
+`self_compare.sh` baut `.firnc1` jetzt auch dann neu, wenn firnc0 oder
 irgendeine Quelle unter `bin/` oder `lib/` juenger ist.
 **Regel: nie ein Binary wiederverwenden, nur weil es existiert.**
 
 **Abnahme des Merge-Stands im Hauptrepo, selbst gemessen:** `test.sh`
-**696/696** · `selbst_vergleich.sh` **201 gleich / 0 abweichend / 0
+**696/696** · `self_compare.sh` **201 gleich / 0 abweichend / 0
 fehlerhaft**, CODEGEN FEHLT 0 · `fixpunkt.sh` Stufe 2 == Stufe 3,
 zeichengleich, **328.343 Zeilen** · Durchsatz realweb **1,54x**, html5lib
 **0,95x**.
@@ -1956,13 +1956,13 @@ verschiebt den Stapel, weshalb die Runde den Stapelboden jetzt aus
 Bis hierhin gab es nur `import a.b` und die Umgebungsvariable `FIRNLIB`.
 Runde 48 bringt ein Manifest `firn.paket` — **bewusst kein TOML**: das Format
 hat sechs Schluesselwoerter, ist zeilenweise und laesst sich ohne Fremdparser
-in beiden Uebersetzern lesen (`compiler/src/paketwelt.rs` und
-`lib/firnc1/paket.fi`). Dazu eine deterministische Suchreihenfolge
+in beiden Uebersetzern lesen (`compiler/src/package_world.rs` und
+`lib/firnc1/package.fi`). Dazu eine deterministische Suchreihenfolge
 (Projektquellen → Abhaengigkeiten → `FIRNLIB` → Compilerverzeichnis) mit
 klaren Fehlern bei Zyklen, fehlenden Paketen und Namenskonflikten, sowie
 oeffentlich/privat auf Modulebene. `--paket` uebersetzt ein Projekt anhand
 des Manifests; zusammen mit einer Quelldatei wird es in **beiden** Uebersetzern
-gleich abgelehnt. Neuer Abschnitt 18 in `test.sh`: `tools/pakete/run.sh`,
+gleich abgelehnt. Neuer Abschnitt 18 in `test.sh`: `tools/packages/run.sh`,
 **21 Faelle durch beide Uebersetzer**.
 
 ## 40. Der Merge der Runden 46-48
@@ -1992,7 +1992,7 @@ uebernommen):**
 | Pruefung | vorher | nachher |
 |---|---|---|
 | `test.sh` | 751/751 | **819/819** |
-| `selbst_vergleich.sh` | 213/0/0 | **225 gleich / 0 abweichend / 0 fehlerhaft** |
+| `self_compare.sh` | 213/0/0 | **225 gleich / 0 abweichend / 0 fehlerhaft** |
 | Fixpunkt | zeichengleich | **zeichengleich, 495.250 Zeilen** |
 | Tokenizer realweb (callgrind) | 957.989.680 | **699.459.494** |
 
@@ -2008,7 +2008,7 @@ Runde 51: wo gar nichts mehr geschrieben wird, ist die Ausnahme fuer
 Interrupts gegenstandslos — das ist strikt staerker, nicht schwaecher.
 
 **Der Fund beim Nachpruefen: Runde 52 war unvollstaendig.**
-`tools/freistehend/run.sh` bindet den Kernel gegen `beispiele/kernel/start.s`
+`tools/freestanding/run.sh` bindet den Kernel gegen `demos/kernel/start.s`
 — diese Datei existierte nie. Ursache ist Zeile 2 der `.gitignore`: das
 Muster `*.s` fiel fuer erzeugten Assembler gedacht, verschluckte aber auch
 den handgeschriebenen Boot-Vorspann. Der Worker sah in seinem Worktree eine
@@ -2020,7 +2020,7 @@ Nachgetragen wurde ein vollstaendiger Vorspann (Multiboot-Kopf,
 Seitentabellen zur Laufzeit gebaut und genullt, 1 GiB identisch mit
 2-MiB-Seiten abgebildet, PAE, EFER.LME, CR0.PG, 64-Bit-GDT, Fernsprung in
 den langen Modus, dann `KERN_START`) plus die Ausnahme
-`!beispiele/kernel/start.s` in der `.gitignore`. Ergebnis:
+`!demos/kernel/start.s` in der `.gitignore`. Ergebnis:
 **FREISTEHEND 41/41**, der Kernel **bootet in QEMU aus beiden Compilern**
 und gibt seriell aus.
 
@@ -2089,7 +2089,7 @@ Runde 49, `842_gcmap_grund` tut es jetzt auch.
 * Ein Rust-Modultest (`schmales_add_wird_nicht_zur_adresse`) suchte nach
   `add e…` und uebersah `add r10d` — der Merge verschob nur die
   Registerwahl. Der Test war zu eng, nicht der Code falsch.
-* `tests/neg/arc_verworfen.fi` erwartete `416:5`; die Faden-Erweiterung in
+* `tests/neg/arc_discarded.fi` erwartete `416:5`; die Faden-Erweiterung in
   `tests/modules/rc.fi` hat die erzeugte Datei verlaengert (jetzt `441:5`).
-  Solche Positionen gehoeren in den Rumpf unter `lib/rc/teile/`, nicht in
+  Solche Positionen gehoeren in den Rumpf unter `lib/rc/parts/`, nicht in
   die erzeugte Datei.
