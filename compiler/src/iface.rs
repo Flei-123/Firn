@@ -1,66 +1,66 @@
-//! `interface` und **dynamischer Versand** — Runde 46 (SPEC §6.2).
+//! `interface` and **dynamic dispatch** — round 46 (SPEC §6.2).
 //!
-//! ## Was diese Runde hinzufuegt
+//! ## What this round adds
 //!
-//! Runde 45 brachte `impl Typ { fn m(*self) … }` — eine reine Schreibhilfe:
-//! `x.m(a)` wurde zu `Typ__m(&x, a)`, entschieden allein vom **statischen**
-//! Typ. Diese Runde ergaenzt das um den anderen Fall, den SPEC §6.2
-//! ausdruecklich verlangt: **eine Aufrufstelle, viele Typen**.
+//! Round 45 brought `impl T { fn m(*self) … }` — a pure writing aid:
+//! `x.m(a)` became `T__m(&x, a)`, decided by the **static** type alone.
+//! This round adds the other case to it, the one that SPEC §6.2 demands
+//! explicitly: **one call site, many types**.
 //!
 //! ```text
-//! interface Flaeche {              // Vertrag: Methoden ohne Rumpf
-//!     fn flaeche(*self) -> i64
-//!     fn skaliere(*mut self, k: i64)
+//! interface Area {                 // contract: methods without a body
+//!     fn area(*self) -> i64
+//!     fn scale(*mut self, k: i64)
 //! }
 //!
-//! impl Flaeche for Rechteck { … }  // Umsetzung, vollstaendig geprueft
+//! impl Area for Rectangle { … }    // implementation, fully checked
 //!
-//! let f: dyn Flaeche = (&r) as dyn Flaeche   // Schnittstellenwert
-//! f.flaeche()                                // ueber die Methodentafel
+//! let f: dyn Area = (&r) as dyn Area         // interface value
+//! f.area()                                   // through the method table
 //! ```
 //!
-//! ## Die Darstellung — verbindlich
+//! ## The representation — binding
 //!
 //! ```text
-//! interface I      -> Struct "dyn I" in types::TypeCtx, 16 Byte:
-//!                       daten: *mut u8   (Versatz 0) — der Wert selbst
-//!                       tafel: *mut u8   (Versatz 8) — die Methodentafel
-//! dyn I            -> genau dieser Struct (ein FETTER ZEIGER, kein Zeiger)
-//! impl I for T     -> Methodentafel `.L__iface.I.T` in `.rodata`:
+//! interface I      -> struct "dyn I" at types::TypeCtx, 16 bytes:
+//!                       data:  *mut u8   (offset 0) — the value itself
+//!                       table: *mut u8   (offset 8) — the method table
+//! dyn I            -> exactly that struct (a FAT POINTER, no pointer)
+//! impl I for T     -> method table `.L__iface.I.T` at `.rodata`:
 //!                       .quad T__m1
-//!                       .quad T__m2      (Reihenfolge = Reihenfolge in `I`)
+//!                       .quad T__m2      (order = order within `I`)
 //! ```
 //!
-//! Der interne Structname traegt ein **Leerzeichen** (`"dyn I"`) — dieselbe
-//! Bauart wie `"gc C"` in `gc.rs` und `"methode m"` in `impls.rs`. Er kann aus
-//! keinem Bezeichner des Quelltextes entstehen, und `TypeCtx::name_of` gibt
-//! ihn unveraendert aus: in jeder Fehlermeldung steht `dyn I`, so wie es im
-//! Quelltext geschrieben wird.
+//! The internal struct label carries a **space** (`"dyn I"`) — the same build
+//! as `"gc C"` at `gc.rs` and `"method m"` at `impls.rs`. It can come about
+//! from no identifier of the source text, and `TypeCtx::name_of` prints it
+//! unchanged: every error message shows `dyn I`, just as it gets written
+//! within the source text.
 //!
-//! ## Warum ein Struct und kein eigener `Type`
+//! ## Why a struct and no `Type` of its own
 //!
-//! Ein `Type::Dyn(..)` haette jede Fallunterscheidung ueber `Type` angefasst —
-//! Layout, ABI, Monomorphisierung, Optimierer, Debuginfo. Als Struct ist der
-//! Schnittstellenwert ein **gewoehnliches 16-Byte-Aggregat**: `abi::classify`
-//! gibt ihm zwei INTEGER-Woerter, er wird kopiert, uebergeben, zurueckgegeben
-//! und im Rahmen abgelegt wie jeder andere Struct. Die ganze Sprachaenderung
-//! sitzt in Parser, Typpruefer und zwei FIR-Instruktionen.
+//! A `Type::Dyn(..)` would have touched every case split over `Type` —
+//! layout, ABI, monomorphization, optimizer, debug info. As a struct the
+//! interface value is one **ordinary 16-byte aggregate**: `abi::classify`
+//! gives it two INTEGER words, it gets copied, passed, returned and put down
+//! at the frame like every other struct. The whole language change sits at
+//! parser, type checker and two FIR instructions.
 //!
-//! ## Warum der Sammler den Wert dahinter weiter findet
+//! ## Why the collector still finds the value behind it
 //!
-//! Der Datenzeiger ist ein **gewoehnlicher Zeiger auf den Anfang** des Wertes
-//! — nicht verschleiert (anders als `GcWeak`, `gc.rs`), nicht auf ein Feld
-//! versetzt. Ein `dyn I` liegt im Rahmen oder in einem callee-saved Register;
-//! beides durchsucht der Sammler konservativ (SPEC §3.5.3), und beim
-//! Sammellauf rettet `Op::GcAddr { regs: true }` die Register vorher in den
-//! Zustandsblock. Damit haelt ein Schnittstellenwert sein Objekt am Leben,
-//! auch wenn es sonst keine Wurzel mehr gibt (`tests/823_iface_gc_core.fi`).
+//! The data pointer is one **ordinary pointer to the start** of the value —
+//! not veiled (unlike `GcWeak`, `gc.rs`), not offset onto a field. A `dyn I`
+//! sits at the frame or within a callee-saved register; both get searched
+//! conservatively by the collector (SPEC §3.5.3), and at the collection run
+//! `Op::GcAddr { regs: true }` rescues the registers into the state block
+//! beforehand. One interface value thereby keeps its object alive even when
+//! no other root is left (`tests/823_iface_gc_core.fi`).
 //!
-//! Die **eine** Stelle, an der das nicht traegt, ist der Heap: dort verfolgt
-//! der Sammler PRAEZISE anhand des Feldlayouts und wuerde den Datenzeiger in
-//! einem `dyn I`-Feld nicht kennen. Deshalb ist `dyn I` als Feld einer
-//! `gc class` ein Fehler (`iface_dyn_in_gc_class.fi`) — ein Loch in einer
-//! Zusage waere schlimmer als eine fehlende Bequemlichkeit.
+//! The **one** spot where that does not carry is the heap: there the
+//! collector traces PRECISELY per the field layout and would not know the
+//! data pointer within a `dyn I` field. That is why `dyn I` as a field of a
+//! `gc class` is a fault (`iface_dyn_in_gc_class.fi`) — a hole within a
+//! promise would be worse than a missing convenience.
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -72,35 +72,35 @@ use crate::parser::Parser;
 use crate::sema::Checker;
 use crate::types::{Type, TypeCtx};
 
-/// Praefix des internen Structnamens eines Schnittstellenwertes.
-/// Das Leerzeichen macht ihn unerreichbar fuer den Quelltext.
+/// Prefix of the internal struct label of one interface value.
+/// The space makes it unreachable for the source text.
 pub(crate) const P_DYN: &str = "dyn ";
-/// Praefix der Methodentafeln im Assembler (dateilokal, `.L`).
+/// Prefix of the method tables at the assembler (file local, `.L`).
 const TABLE_LABEL: &str = ".L__iface.";
-/// Versatz des Datenzeigers im Schnittstellenwert.
+/// Offset of the data pointer within the interface value.
 pub(crate) const OFF_DATA: u64 = 0;
-/// Versatz der Methodentafel im Schnittstellenwert.
+/// Offset of the method table within the interface value.
 pub(crate) const OFF_TABLE: u64 = 8;
 
-// ---------------------------------------------------------------- Datenmodell
+// ----------------------------------------------------------------- Data model
 
 #[derive(Clone, Debug)]
 struct Method {
     name: String,
-    /// Parameter OHNE den Empfaenger.
+    /// parameters WITHOUT the receiver.
     params: Vec<TypeExpr>,
     ret: Option<TypeExpr>,
-    /// `*mut self` statt `*self` — heute Absicht, kein Zwang (impls.rs).
+    /// `*mut self` rather than `*self` — intent today, no constraint (impls.rs).
     mutable: bool,
     span: Span,
-    /// nach `hook_check_impls`: aufgeloeste Typen
+    /// after `hook_check_impls`: resolved types
     ptypes: Vec<Type>,
     rtyp: Type,
-    /// Typen bereits aufgeloest (Nachtraege aus `comptime` melden sonst doppelt)
+    /// types resolved already (addenda out of `comptime` would else report twice)
     resolved: bool,
-    /// Die Signatur nennt `Self` (Runde 50). Dann haengen `ptypen`/`rtyp` am
-    /// umsetzenden Typ und werden ERST JE UMSETZUNG aufgeloest; global
-    /// bleiben sie leer, und ueber `dyn I` ist die Methode nicht aufrufbar.
+    /// The signature states `Self` (round 50). Then `ptypen`/`rtyp` hang off the
+    /// implementing type and get resolved ONLY PER IMPLEMENTATION; globally they
+    /// stay empty, and through `dyn I` the method is not callable.
     has_self: bool,
 }
 
@@ -108,26 +108,26 @@ struct Method {
 struct Interface {
     name: String,
     methods: Vec<Method>,
-    /// Index des Structs `"dyn I"` in `TypeCtx`, `usize::MAX` bis zur Anmeldung
+    /// index of the struct `"dyn I"` at `TypeCtx`, `usize::MAX` until registered
     struct_idx: usize,
 }
 
 #[derive(Clone, Debug)]
 struct Impl {
     iface: String,
-    /// Typname, wie er im Quelltext steht (VOR der Modulumbenennung).
+    /// type label the way it stands at the source (BEFORE the module renaming).
     ty: String,
     span: Span,
-    /// nach der Pruefung: Index des Structs, `usize::MAX` = nicht aufgeloest
+    /// after the check: index of the struct, `usize::MAX` = not resolved
     struct_idx: usize,
-    /// nach der Pruefung: Name, unter dem die Methoden dieses Typs stehen
-    /// (`T__m`) — also der ENDGUELTIGE Name nach der Modulumbenennung, ohne
-    /// das interne `"gc "` einer Klasse. Der Codegenerator hat die Typtabelle
-    /// nicht mehr; deshalb steht er hier.
+    /// after the check: label under which the methods of this type stand
+    /// (`T__m`) — that is, the FINAL label after the module renaming, without
+    /// the internal `"gc "` of a class. The code generator no longer holds the
+    /// type table; that is why it stands here.
     prefix: String,
-    /// nach der Pruefung: `true`, wenn die Umsetzung vollstaendig ist
+    /// after the check: `true` when the implementation is complete
     ok: bool,
-    /// schon geprueft (Nachtraege aus `comptime` melden sonst doppelt)
+    /// checked already (addenda out of `comptime` would else report twice)
     checked: bool,
 }
 
@@ -141,7 +141,7 @@ thread_local! {
     static REG: RefCell<Registry> = RefCell::new(Registry::default());
 }
 
-/// Setzt die Registrierung zurueck (eine je Uebersetzung, `parser::reset_hooks`).
+/// Resets the registry (one per compilation, `parser::reset_hooks`).
 pub(crate) fn hook_reset() {
     REG.with(|r| *r.borrow_mut() = Registry::default());
 }
@@ -150,23 +150,23 @@ fn iface_index(name: &str) -> Option<usize> {
     REG.with(|r| r.borrow().ifaces.iter().position(|i| i.name == name))
 }
 
-/// Gibt es ueberhaupt eine Schnittstelle in dieser Uebersetzung?
+/// Is there any interface at all within this compilation?
 pub(crate) fn has_interfaces() -> bool {
     REG.with(|r| !r.borrow().ifaces.is_empty())
 }
 
-/// Ist `sname` der interne Name eines Schnittstellenwertes? Liefert den
-/// Schnittstellennamen.
+/// Is `sname` the internal label of one interface value? Yields the
+/// interface label.
 pub(crate) fn interface_of(sname: &str) -> Option<&str> {
     sname.strip_prefix(P_DYN)
 }
 
-/// Name des Structs hinter `dyn I`.
+/// Label of the struct behind `dyn I`.
 fn dyn_name(iface: &str) -> String {
     format!("{}{}", P_DYN, iface)
 }
 
-/// Ist dieser Typ ein Schnittstellenwert?
+/// Is this type one interface value?
 pub(crate) fn is_dyn(tcx: &TypeCtx, t: &Type) -> bool {
     match t {
         Type::Struct(i) => tcx
@@ -178,17 +178,17 @@ pub(crate) fn is_dyn(tcx: &TypeCtx, t: &Type) -> bool {
     }
 }
 
-/// Schluessel der Methodentafel: `<Schnittstelle>.<Typ>`.
+/// Key of the method table: `<interface>.<type>`.
 fn table_key(iface: &str, ty_name: &str) -> String {
     format!("{}.{}", iface, ty_name)
 }
 
-/// Der eingebaute Typ hinter einem Namen — `None`, wenn es keiner ist.
+/// The builtin type behind a label — `None` when it is none.
 ///
-/// Seit Runde 50 darf auch ein GRUNDTYP eine Schnittstelle umsetzen
-/// (`impl Ord for i32`). Ohne das haette `vec_sortiere[T: Ord]` nur Structs
-/// sortieren koennen, und die Standardbibliothek haette den fest verdrahteten
-/// Vergleich behalten muessen.
+/// Since round 50 a BASE TYPE may implement interfaces as well
+/// (`impl Ord for i32`). Without it `vec_sort[T: Ord]` could have sorted
+/// structs only, and the standard library would have had to keep the
+/// hard wired comparison.
 pub(crate) fn base_ty_of_name(n: &str) -> Option<Type> {
     Some(match n {
         "i8" => Type::I8,
@@ -207,7 +207,7 @@ pub(crate) fn base_ty_of_name(n: &str) -> Option<Type> {
     })
 }
 
-/// Name eines Grundtyps fuer das Methodennamensschema (`i32__kleiner`).
+/// Label of a base type for the method naming scheme (`i32__less`).
 pub(crate) fn base_ty_name(t: &Type) -> Option<&'static str> {
     Some(match t {
         Type::I8 => "i8",
@@ -226,13 +226,13 @@ pub(crate) fn base_ty_name(t: &Type) -> Option<&'static str> {
     })
 }
 
-/// Ist das der Name einer Methode auf einem GRUNDTYP (`i32__kleiner`)?
+/// Is this the label of a method on a BASE TYPE (`i32__less`)?
 ///
-/// Solche Methoden gelten PROGRAMMWEIT und werden von `modules.rs` nicht
-/// umbenannt — genauso wie Schnittstellen, gc-Klassen und generische
-/// Vorlagen. Der Grund ist derselbe: der Typ `i32` gehoert keinem Modul.
-/// Wuerde die Methode zu `vec__i32__kleiner`, suchte die Aufloesung weiter
-/// `i32__kleiner` und faende nichts.
+/// Such methods hold PROGRAM WIDE and do not get renamed by `modules.rs` —
+/// just like interfaces, gc classes and generic templates. The reason is
+/// the same: the type `i32` belongs to no module. Should the method become
+/// `vec__i32__less`, the resolution would keep looking for `i32__less`
+/// and find nothing.
 pub(crate) fn is_base_ty_method(name: &str) -> bool {
     match name.split_once(crate::impls::SEP) {
         Some((header, rest)) => !rest.is_empty() && base_ty_of_name(header).is_some(),
@@ -240,7 +240,7 @@ pub(crate) fn is_base_ty_method(name: &str) -> bool {
     }
 }
 
-/// Nennt dieser Typausdruck `Self`?
+/// Does this type expression state `Self`?
 fn names_self(te: &TypeExpr) -> bool {
     match te {
         TypeExpr::Named(n, _) => n == "Self",
@@ -249,19 +249,19 @@ fn names_self(te: &TypeExpr) -> bool {
     }
 }
 
-// ------------------------------------------------- Schranken (Runde 50)
+// ---------------------------------------------------- Bounds (round 50)
 //
-// `fn f[T: Ord](…)` — die Schranke wird bei der AUSPRAEGUNG geprueft
-// (`mono.rs::bind_params`), also bevor der Typpruefer laeuft. Zu dem
-// Zeitpunkt gibt es weder Structtabelle noch aufgeloeste Typen; was es gibt,
-// sind die Namen: die Registrierung dieser Datei und die Liste aller
-// Funktionsnamen des zusammengefuehrten Programms. Genau daraus wird die
-// Meldung gebaut, und genau deshalb kann sie die FEHLENDE METHODE nennen,
-// statt spaeter als „unbekannte methode" mitten in einer ausgepraegten
+// `fn f[T: Ord](…)` — the bound gets checked at the INSTANTIATION
+// (`mono.rs::bind_params`), so before the type checker runs. At that point
+// there is neither a struct table nor resolved types; what there is are
+// the labels: the registry of this file and the list of all function
+// labels of the merged program. Exactly out of that the message gets
+// built, and exactly therefore it can state the METHOD MISSING rather than
+// striking later as "unknown method" amidst some instantiated function.
 // Funktion aufzuschlagen.
 
-/// Lesbare Form eines noch nicht aufgeloesten Typs (fuer Meldungen vor dem
-/// Typpruefer). `Self` bleibt `Self` — genau so steht es in der Schnittstelle.
+/// Readable form of a type not yet resolved (for messages ahead of the type
+/// checker). `Self` stays `Self` — just as it stands at the interface.
 fn te_text(te: &TypeExpr) -> String {
     match te {
         TypeExpr::Named(n, _) => n.clone(),
@@ -272,9 +272,9 @@ fn te_text(te: &TypeExpr) -> String {
     }
 }
 
-/// Signatur einer Schnittstellenmethode aus dem UNAUFGELOESTEN Kopf.
-/// (`signatur` weiter unten macht dasselbe mit aufgeloesten Typen; hier ist
-/// noch kein Typpruefer gelaufen.)
+/// Signature of one interface method out of the UNRESOLVED head.
+/// (`signature` further down does the same with resolved types; here no
+/// type checker has run yet.)
 fn header_signature(m: &Method) -> String {
     let mut s = String::from(if m.mutable { "*mut self" } else { "*self" });
     for t in &m.params {
@@ -287,13 +287,13 @@ fn header_signature(m: &Method) -> String {
     }
 }
 
-/// Setzt der Typ `typname` die Schnittstelle `iface` um?
+/// Does the type `ty_name` implement the interface `iface`?
 ///
-/// Verglichen werden NAMEN, nicht Typen — den Typpruefer gibt es hier noch
-/// nicht. Der Name in der Registrierung steht so da, wie er im Quelltext
-/// geschrieben wurde; das Typargument traegt dagegen schon den Namen nach der
-/// Modulumbenennung. Deshalb dieselben drei Schritte wie in `typ_struct`:
-/// gleich, `gc <Name>`, oder auf `__<Name>` endend (Typ aus einem Modul).
+/// Compared get LABELS, not types — the type checker does not exist here
+/// yet. The label at the registry stands the way it got written within the
+/// source; the type argument on the other hand carries the label after the
+/// module renaming already. Hence the same three steps as at `ty_struct`:
+/// equal, `gc <label>`, or ending with `__<label>` (type out of a module).
 fn impl_da(iface: &str, ty_name: &str) -> bool {
     REG.with(|r| {
         r.borrow().impls.iter().any(|u| {
@@ -303,17 +303,17 @@ fn impl_da(iface: &str, ty_name: &str) -> bool {
             if u.ty == ty_name || ty_name == format!("gc {}", u.ty) {
                 return true;
             }
-            // Die Endungsregel gilt NUR fuer benannte Typen aus einem Modul.
-            // Fuer einen Grundtyp waere sie falsch: `Vec__i32` endet auf
-            // `__i32`, ist aber der Struct `Vec[i32]` und nicht `i32`.
+            // The suffix rule holds for named types out of a module ONLY.
+            // For a base type it would be wrong: `Vec__i32` ends with
+            // `__i32`, yet is the struct `Vec[i32]` and not `i32`.
             base_ty_of_name(&u.ty).is_none()
                 && ty_name.ends_with(&format!("__{}", u.ty))
         })
     })
 }
 
-/// `// HOOK iface` in `mono.rs::schranke_ok` — `T: I` bei der Auspraegung.
-/// `true` = die Schranke ist erfuellt.
+/// `// HOOK iface` within `mono.rs::bound_ok` — `T: I` at the instantiation.
+/// `true` = the bound is satisfied.
 pub(crate) fn bound_check(
     dg: &mut Diags,
     fnames: &HashSet<String>,
@@ -346,8 +346,8 @@ pub(crate) fn bound_check(
             return false;
         }
     };
-    // Eine Schnittstelle wird von einem BENANNTEN Typ umgesetzt. Ein Zeiger
-    // oder ein Feld hat keinen Namen, unter dem eine Umsetzung stehen koennte.
+    // One interface gets implemented by a NAMED type. A pointer or a field
+    // has no label under which one implementation could stand.
     let ty_name = match arg {
         TypeExpr::Named(n, _) => n.clone(),
         _ => {
@@ -369,8 +369,8 @@ pub(crate) fn bound_check(
     if impl_da(iface, &ty_name) {
         return true;
     }
-    // Kein `impl I for T`. Jetzt die nuetzliche Meldung: welche Methoden der
-    // Schnittstelle hat der Typ ueberhaupt schon?
+    // No `impl I for T`. Now the useful message: which methods of the
+    // interface does the type hold already?
     let methods = REG.with(|r| r.borrow().ifaces[ii].methods.clone());
     let mut missing: Vec<String> = Vec::new();
     for m in &methods {
@@ -411,12 +411,12 @@ pub(crate) fn bound_check(
 
 // ------------------------------------------------------------------- Parser
 
-/// `// HOOK iface` in `parser.rs::program` — `interface Name { … }`.
+/// `// HOOK iface` within `parser.rs::program` — `interface I { … }`.
 ///
-/// `interface` ist KEIN Schluesselwort (der Tokenisierer kennt es nicht),
-/// sondern ein Bezeichner in einer Stellung, in der sonst nichts stehen darf —
-/// dieselbe Loesung wie `gc class` (gc.rs) und `impl` (impls.rs). Damit bleibt
-/// `interface` als Variablenname gueltig.
+/// `interface` is NO keyword (the tokenizer does not know it) but one
+/// identifier at a position where nothing else may stand — the same
+/// solution as `gc class` (gc.rs) and `impl` (impls.rs). That keeps
+/// `interface` valid as a variable label.
 pub(crate) fn hook_item(p: &mut Parser) -> bool {
     if !matches!(p.kind(), TokKind::Ident(n) if n == "interface") {
         return false;
@@ -474,9 +474,9 @@ fn interface_decl(p: &mut Parser) {
             p.sync_item();
             return;
         }
-        // Eine kaputte Methode bricht die GANZE Schnittstelle ab — dieselbe
-        // Regel wie im `impl`-Block (impls.rs): die erste Meldung ist die
-        // einzige, die etwas erklaert.
+        // One broken method aborts the WHOLE interface — the same rule as at
+        // the `impl` block (impls.rs): the first message is the only one that
+        // explains something.
         match method_head(p, &name) {
             Some(m) => {
                 if methods.iter().any(|x| x.name == m.name) {
@@ -518,8 +518,8 @@ fn interface_decl(p: &mut Parser) {
     });
 }
 
-/// Eine Methode der Schnittstelle: `fn name(<empfaenger>[, param…]) [-> T]`
-/// — ohne Rumpf.
+/// One method of the interface: `fn m(<receiver>[, param…]) [-> T]`
+/// — without a body.
 fn method_head(p: &mut Parser, iface: &str) -> Option<Method> {
     p.bump(); // 'fn'
     let (name, nsp) = match p.ident("after 'fn' in an interface") {
@@ -533,9 +533,9 @@ fn method_head(p: &mut Parser, iface: &str) -> Option<Method> {
     if !p.expect(TokKind::LParen, "after the method name") {
         return None;
     }
-    // DER EMPFAENGER MUSS EIN ZEIGER SEIN. Ueber die Methodentafel steht nur
-    // der Datenzeiger zur Verfuegung — eine Kopie des Wertes koennte der
-    // Aufrufer gar nicht bilden, er kennt den konkreten Typ nicht.
+    // THE RECEIVER MUST BE A POINTER. Through the method table the data
+    // pointer alone is available — a copy of the value the caller could not
+    // build at all, it does not know the concrete type.
     let mutable = if p.at(&TokKind::Star) {
         match crate::impls::ptr_self(p) {
             Some((m, _)) => m,
@@ -575,10 +575,10 @@ fn method_head(p: &mut Parser, iface: &str) -> Option<Method> {
         ));
         return None;
     }
-    // `Self` (Runde 50): der Typ, der die Schnittstelle umsetzt. Erst damit
-    // laesst sich eine Ordnung aufschreiben — `fn kleiner(*self, b: *Self)`.
-    // Ohne `Self` muesste in der Schnittstelle ein KONKRETER Typ stehen, und
-    // eine allgemeine `Ord` waere unmoeglich.
+    // `Self` (round 50): the type that implements the interface. Only with it
+    // can orderings be written down — `fn less(*self, b: *Self)`.
+    // Without `Self` a CONCRETE type would have to stand at the interface, and
+    // a general `Ord` would be impossible.
     let has_self =
         params.iter().any(names_self) || ret.as_ref().map(names_self).unwrap_or(false);
     Some(Method {
@@ -594,10 +594,10 @@ fn method_head(p: &mut Parser, iface: &str) -> Option<Method> {
     })
 }
 
-/// `// HOOK iface` in `parser.rs::parse_type_inner` — `dyn I`.
+/// `// HOOK iface` within `parser.rs::parse_type_inner` — `dyn I`.
 ///
-/// Der Typname wird zu EINEM Namen mit Leerzeichen zusammengezogen; aufgeloest
-/// wird er im Typpruefer, der die Structtabelle kennt.
+/// The type label gets drawn together into ONE label with a space; resolved
+/// it gets at the type checker, which knows the struct table.
 pub(crate) fn hook_type(p: &mut Parser, name: &str, sp: Span) -> Option<TypeExpr> {
     if name != "dyn" {
         return None;
@@ -610,7 +610,7 @@ pub(crate) fn hook_type(p: &mut Parser, name: &str, sp: Span) -> Option<TypeExpr
     Some(TypeExpr::Named(dyn_name(&n), Parser::join(sp, end)))
 }
 
-/// `// HOOK iface` in `impls.rs::impl_decl` — `impl I for T { … }` anmelden.
+/// `// HOOK iface` within `impls.rs::impl_decl` — register `impl I for T`.
 pub(crate) fn remember_impl(iface: String, ty: String, span: Span) {
     REG.with(|r| {
         r.borrow_mut().impls.push(Impl {
@@ -625,13 +625,13 @@ pub(crate) fn remember_impl(iface: String, ty: String, span: Span) {
     });
 }
 
-// -------------------------------------------------------------- Typpruefung
+// --------------------------------------------------------------- Type check
 
-/// `// HOOK iface` in `sema::add_items_inner` (VOR `collect_structs`): fuer
-/// jede Schnittstelle den Struct `"dyn I"` anlegen.
+/// `// HOOK iface` within `sema::add_items_inner` (BEFORE `collect_structs`):
+/// create the struct `"dyn I"` for every interface.
 ///
-/// Zweimal aufgerufen zu werden ist erlaubt (`comptime`-Nachtraege): eine
-/// bereits angemeldete Schnittstelle wird uebersprungen.
+/// Being called twice is allowed (`comptime` addenda): one interface
+/// registered already gets skipped.
 pub(crate) fn declare_interfaces(ck: &mut Checker) {
     let n = REG.with(|r| r.borrow().ifaces.len());
     for i in 0..n {
@@ -655,7 +655,7 @@ pub(crate) fn declare_interfaces(ck: &mut Checker) {
     }
 }
 
-/// `// HOOK iface` in `sema::resolve_ty_d` — `dyn I` mit unbekanntem `I`.
+/// `// HOOK iface` within `sema::resolve_ty_d` — `dyn I` with unknown `I`.
 pub(crate) fn hook_resolve_ty(ck: &mut Checker, te: &TypeExpr) -> Option<Type> {
     let (name, span) = match te {
         TypeExpr::Named(n, s) => (n.as_str(), *s),
@@ -663,7 +663,7 @@ pub(crate) fn hook_resolve_ty(ck: &mut Checker, te: &TypeExpr) -> Option<Type> {
     };
     let iface = interface_of(name)?;
     if ck.tcx.lookup(name).is_some() {
-        return None; // die gewoehnliche Aufloesung findet den Struct
+        return None; // the ordinary resolution finds the struct
     }
     ck.dg.error_note(
         span,
@@ -673,8 +673,8 @@ pub(crate) fn hook_resolve_ty(ck: &mut Checker, te: &TypeExpr) -> Option<Type> {
     Some(Type::Error)
 }
 
-/// Der Name, unter dem die Methoden eines Typs stehen: `T__m`.
-/// Fuer eine `gc class` ist das der Klassenname OHNE das interne `"gc "`.
+/// The label under which the methods of a type stand: `T__m`.
+/// For a `gc class` that is the class label WITHOUT the internal `"gc "`.
 pub(crate) fn method_prefix(tcx: &TypeCtx, idx: usize) -> String {
     match tcx.structs.get(idx) {
         Some(s) => s.name.strip_prefix("gc ").unwrap_or(&s.name).to_string(),
@@ -682,9 +682,9 @@ pub(crate) fn method_prefix(tcx: &TypeCtx, idx: usize) -> String {
     }
 }
 
-/// Vergleich zweier Typen an einer Signaturgrenze — dieselbe Regel wie
-/// `sema::compatible`: Zeiger werden OHNE die Veraenderlichkeit verglichen
-/// (`*T` und `*mut T` sind in dieser Sprache fuereinander einsetzbar).
+/// Comparison of two types at a signature boundary — the same rule as
+/// `sema::compatible`: pointers get compared WITHOUT the mutability
+/// (`*T` and `*mut T` are usable for each other within this language).
 fn fits(a: &Type, b: &Type) -> bool {
     if a.is_error() || b.is_error() {
         return true;
@@ -695,15 +695,15 @@ fn fits(a: &Type, b: &Type) -> bool {
     }
 }
 
-/// Struct hinter dem Typnamen einer Umsetzung.
+/// Struct behind the type label of one implementation.
 ///
-/// Der Name steht so in der Registrierung, wie er im Quelltext geschrieben
-/// wurde — die Modulumbenennung (`modules.rs`) laeuft NACH dem Parsen und
-/// fasst die Registrierung nicht an. Deshalb wird hier in drei Schritten
-/// gesucht: der Name selbst, die `gc class` desselben Namens, und zuletzt
-/// GENAU EIN Struct, dessen Name auf `__<Name>` endet (das ist der Fall
-/// „Typ in einem Modul"). Mehrere Treffer sind ein Fehler — raten waere die
-/// gefaehrlichere Wahl.
+/// The label stands at the registry the way it got written within the
+/// source text — the module renaming (`modules.rs`) runs AFTER the parsing
+/// and does not touch the registry. That is why the search happens here at
+/// three steps: the label itself, the `gc class` of the same label, and
+/// finally EXACTLY ONE struct whose label ends with `__<label>` (that is
+/// the case "type within a module"). Several hits are a fault — guessing
+/// would be the more dangerous choice.
 fn ty_struct(ck: &Checker, name: &str) -> Result<usize, bool> {
     if let Some(i) = ck.tcx.lookup(name) {
         return Ok(i);
@@ -727,10 +727,10 @@ fn ty_struct(ck: &Checker, name: &str) -> Result<usize, bool> {
     }
 }
 
-/// Lesbare Signatur einer Schnittstellenmethode (fuer die Fehlermeldung).
+/// Readable signature of one interface method (for the error message).
 ///
-/// Die Typen werden ausdruecklich uebergeben: bei einer Signatur mit `Self`
-/// stehen sie nicht in der Schnittstelle, sondern haengen an der Umsetzung.
+/// The types get passed explicitly: with a signature holding `Self` they do
+/// not stand at the interface but hang off the implementation.
 fn signature(ck: &Checker, m: &Method, ptypes: &[Type], rtyp: &Type) -> String {
     let mut s = String::from(if m.mutable { "*mut self" } else { "*self" });
     for t in ptypes {
@@ -743,7 +743,7 @@ fn signature(ck: &Checker, m: &Method, ptypes: &[Type], rtyp: &Type) -> String {
     }
 }
 
-/// Loest einen Typ der Schnittstelle auf und setzt dabei `Self` ein.
+/// Resolves a type of the interface and substitutes `Self` along the way.
 fn resolve_with_self(ck: &mut Checker, te: &TypeExpr, slf: &Type) -> Type {
     match te {
         TypeExpr::Named(n, _) if n == "Self" => slf.clone(),
@@ -757,10 +757,10 @@ fn resolve_with_self(ck: &mut Checker, te: &TypeExpr, slf: &Type) -> Type {
     }
 }
 
-/// `// HOOK iface` in `sema::add_items_inner` (NACH `collect_fns`): prueft
-/// jede Umsetzung vollstaendig — alle Methoden da, alle Signaturen passend.
+/// `// HOOK iface` within `sema::add_items_inner` (AFTER `collect_fns`):
+/// checks every implementation fully — all methods there, all signatures fit.
 pub(crate) fn hook_check_impls(ck: &mut Checker) {
-    // 1. Typen der Schnittstellenmethoden aufloesen (einmal je Methode).
+    // 1. Resolve the types of the interface methods (once per method).
     let n = REG.with(|r| r.borrow().ifaces.len());
     for i in 0..n {
         let cnt = REG.with(|r| r.borrow().ifaces[i].methods.len());
@@ -773,11 +773,11 @@ pub(crate) fn hook_check_impls(ck: &mut Checker) {
             if done {
                 continue;
             }
-            // Eine Signatur mit `Self` hat GLOBAL keine Typen — sie bekommt
-            // sie erst je Umsetzung (`pruefe_umsetzung`). Hier aufzuloesen
-            // hiesse, `Self` als gewoehnlichen Typnamen zu suchen, und das
-            // waere eine Fehlermeldung ueber einen Typ, den niemand
-            // deklarieren wollte.
+            // A signature holding `Self` has NO types globally — it gets them
+            // only per implementation (`check_impl_am`). Resolving here would
+            // mean looking for `Self` as a plain type label, and that
+            // would be a message about a type that nobody wanted to
+            // declare.
             if has_self {
                 REG.with(|r| r.borrow_mut().ifaces[i].methods[k].resolved = true);
                 continue;
@@ -796,7 +796,7 @@ pub(crate) fn hook_check_impls(ck: &mut Checker) {
             });
         }
     }
-    // 2. Jede Umsetzung pruefen.
+    // 2. Check every implementation.
     let cnt = REG.with(|r| r.borrow().impls.len());
     for u in 0..cnt {
         let (iface, ty, span, checked) = REG.with(|r| {
@@ -810,8 +810,8 @@ pub(crate) fn hook_check_impls(ck: &mut Checker) {
         REG.with(|r| r.borrow_mut().impls[u].checked = true);
         check_impl(ck, u, &iface, &ty, span);
     }
-    // 3. Kein Schnittstellenwert im Heap: der Sammler verfolgt dort PRAEZISE
-    //    (SPEC §3.5.3) und kennt den Datenzeiger in einem `dyn I` nicht.
+    // 3. No interface value within the heap: the collector traces PRECISELY
+    //    there (SPEC §3.5.3) and does not know the data pointer of a `dyn I`.
     check_gc_fields(ck);
 }
 
@@ -834,16 +834,16 @@ fn check_impl(ck: &mut Checker, u: usize, iface: &str, ty: &str, span: Span) {
             return;
         }
     };
-    // TRAEGER DER UMSETZUNG: ein Struct oder — seit Runde 50 — ein eingebauter
-    // GRUNDTYP. Ein Grundtyp steht nicht in der Structtabelle; `struct_idx`
-    // bleibt dann `usize::MAX`, und alles, was diesen Index braucht
-    // (Methodentafel, `as dyn I`), gilt fuer ihn nicht. Der dynamische Versand
-    // ueber einen Grundtyp ist damit ausgeschlossen, der statische nicht — und
-    // genau der wird gebraucht (`vec_sortiere[i32]`).
-    // GRUNDTYP ZUERST. `i32` heisst immer der eingebaute Typ; die
-    // Endungssuche in `typ_struct` (drittes Feld: „genau ein Struct, dessen
-    // Name auf `__<Name>` endet") wuerde sonst `Vec__i32` finden — der ist
-    // `Vec[i32]` und nicht `i32`.
+    // CARRIER OF THE IMPLEMENTATION: a struct or — since round 50 — a builtin
+    // BASE TYPE. A base type does not stand at the struct table; `struct_idx`
+    // then stays `usize::MAX`, and everything that needs this index (method
+    // table, `as dyn I`) does not hold for it. Dynamic dispatch over a base
+    // type is thereby ruled out, static dispatch is not — and exactly that is
+    // what gets needed (`vec_sort[i32]`).
+    // BASE TYPE FIRST. `i32` always means the builtin type; the suffix
+    // search at `ty_struct` (third field: "exactly one struct whose label
+    // ends with `__<label>`") would otherwise find `Vec__i32` — which is
+    // `Vec[i32]` and not `i32`.
     if let Some(t) = base_ty_of_name(ty) {
         return check_impl_am(ck, u, iface, ii, ty, span, usize::MAX, t);
     }
@@ -865,9 +865,9 @@ fn check_impl(ck: &mut Checker, u: usize, iface: &str, ty: &str, span: Span) {
     check_impl_am(ck, u, iface, ii, ty, span, sidx, self_ty)
 }
 
-/// Der zweite Teil: die Umsetzung gegen einen BEKANNTEN Traeger pruefen.
-/// `sidx == usize::MAX` heisst „Grundtyp" — dann gibt es keinen Struct und
-/// damit weder Methodentafel noch `as dyn I`.
+/// The second part: check the implementation against a KNOWN carrier.
+/// `sidx == usize::MAX` means "base type" — then there is no struct and
+/// therefore neither a method table nor `as dyn I`.
 fn check_impl_am(
     ck: &mut Checker,
     u: usize,
@@ -896,10 +896,10 @@ fn check_impl_am(
     } else {
         ck.tcx.structs[sidx].name.clone()
     };
-    // Doppelte Umsetzung — verglichen wird der METHODENPRAEFIX des
-    // aufgeloesten Traegers, damit `impl I for T` und `impl I for modul.T`
-    // als dasselbe erkannt werden und Grundtypen mitzaehlen. (Ein leerer
-    // Praefix heisst: jene Umsetzung war schon fehlerhaft.)
+    // Implemented twice — compared gets the METHOD PREFIX of the resolved
+    // carrier, so that `impl I for T` and `impl I for module.T` get spotted
+    // as the same one and base types count along. (Empty prefix means:
+    // that implementation was faulty already.)
     let duplicate = REG.with(|r| {
         r.borrow()
             .impls
@@ -922,8 +922,8 @@ fn check_impl_am(
     let methods = REG.with(|r| r.borrow().ifaces[ii].methods.clone());
     let mut complete = true;
     for m in &methods {
-        // Bei `Self` haengen die Typen an DIESER Umsetzung, nicht an der
-        // Schnittstelle — deshalb hier aufgeloest und nicht in Schritt 1.
+        // With `Self` the types hang off THIS implementation, not off the
+        // interface — resolved here therefore and not at step 1.
         let (ptypes, rtyp): (Vec<Type>, Type) = if m.has_self {
             (
                 m.params
@@ -954,7 +954,7 @@ fn check_impl_am(
                 continue;
             }
         };
-        // Empfaenger: ein Zeiger auf GENAU diesen Typ.
+        // Receiver: a pointer to EXACTLY this type.
         let recv_ok = match sig.params.first() {
             Some(Type::Ptr { inner, .. }) => **inner == self_ty,
             _ => false,
@@ -1031,7 +1031,7 @@ fn check_impl_am(
     REG.with(|r| r.borrow_mut().impls[u].ok = complete);
 }
 
-/// Enthaelt `t` DEM WERT NACH einen Schnittstellenwert?
+/// Does `t` hold one interface value BY VALUE?
 fn contains_dyn(tcx: &TypeCtx, t: &Type, depth: u32) -> bool {
     if depth > 32 {
         return false;
@@ -1050,7 +1050,7 @@ fn contains_dyn(tcx: &TypeCtx, t: &Type, depth: u32) -> bool {
     }
 }
 
-/// `dyn I` im Heap waere ein Loch in der Sammlerzusage (siehe Kopf der Datei).
+/// `dyn I` at the heap would be a hole at the collector promise (see head).
 fn check_gc_fields(ck: &mut Checker) {
     if !has_interfaces() {
         return;
@@ -1079,13 +1079,13 @@ fn check_gc_fields(ck: &mut Checker) {
     }
 }
 
-/// `// HOOK iface` in `sema::expr_inner`, Zweig `Cast` — `x as dyn I`.
+/// `// HOOK iface` within `sema::expr_inner`, branch `Cast` — `x as dyn I`.
 ///
-/// Der Schnittstellenwert entsteht AUSDRUECKLICH (SPEC §6.2: „dynamische
-/// Aufloesung ueber `dyn Interface`, ausdruecklich hingeschrieben"). Es gibt
-/// keine stille Umwandlung an einer Zuweisung oder an einem Argument — Firn
-/// hat keine impliziten Umwandlungen (SPEC §4.5), und fuer eine, die eine
-/// Methodentafel anhaengt, waere das die schlechteste Stelle anzufangen.
+/// The interface value comes about EXPLICITLY (SPEC §6.2: "dynamic
+/// resolution through `dyn Interface`, written down explicitly"). There is
+/// no silent conversion at assignments or arguments — Firn has no
+/// implicit conversions (SPEC §4.5), and for one that appends a method
+/// table this would be the worst spot to start.
 pub(crate) fn hook_cast(ck: &mut Checker, span: Span, src: &Type, dst: &Type) -> Option<Type> {
     let sidx = match dst {
         Type::Struct(i) => *i,
@@ -1149,7 +1149,7 @@ pub(crate) fn hook_cast(ck: &mut Checker, span: Span, src: &Type, dst: &Type) ->
     Some(Type::Error)
 }
 
-/// Setzt der Struct `sidx` die Schnittstelle `iface` vollstaendig um?
+/// Does the struct `sidx` implement the interface `iface` completely?
 fn impl_ok(iface: &str, sidx: usize) -> bool {
     REG.with(|r| {
         r.borrow()
@@ -1159,7 +1159,7 @@ fn impl_ok(iface: &str, sidx: usize) -> bool {
     })
 }
 
-/// Nummer der Methode in der Schnittstelle (= Platz in der Methodentafel).
+/// Number of the method within the interface (= place at the method table).
 pub(crate) fn slot_of(iface: &str, method: &str) -> Option<usize> {
     let i = iface_index(iface)?;
     REG.with(|r| {
@@ -1170,8 +1170,8 @@ pub(crate) fn slot_of(iface: &str, method: &str) -> Option<usize> {
     })
 }
 
-/// Rueckgabetyp einer Schnittstellenmethode — auch fuer `sema::probe`, damit
-/// ein Literal daneben seinen Typ bekommt (`f.flaeche() != 42`).
+/// Return type of one interface method — for `sema::probe` too, so that a
+/// literal next to it gets its type (`f.area() != 42`).
 pub(crate) fn ret_of(iface: &str, method: &str) -> Option<Type> {
     let i = iface_index(iface)?;
     REG.with(|r| {
@@ -1183,11 +1183,11 @@ pub(crate) fn ret_of(iface: &str, method: &str) -> Option<Type> {
     })
 }
 
-/// `// HOOK iface` in `impls::hook_call` — `f.m(args)` auf einem `dyn I`.
+/// `// HOOK iface` within `impls::hook_call` — `f.m(args)` on a `dyn I`.
 ///
-/// Der Empfaenger ist ein WERT (der fette Zeiger selbst). Ein `*dyn I` wird
-/// bewusst nicht angenommen: `(*z).m(…)` sagt dasselbe und macht sichtbar,
-/// dass zwei Woerter gelesen werden.
+/// The receiver is a VALUE (the fat pointer itself). A `*dyn I` does not
+/// get accepted deliberately: `(*z).m(…)` says the same and makes visible
+/// that two words get read.
 pub(crate) fn hook_method(
     ck: &mut Checker,
     iface: &str,
@@ -1235,10 +1235,10 @@ pub(crate) fn hook_method(
             return Type::Error;
         }
     };
-    // OBJEKTSICHERHEIT (Runde 50): eine Signatur mit `Self` kennt der Aufrufer
-    // ueber `dyn I` nicht — welcher Typ dahintersteckt, steht erst zur
-    // Laufzeit fest, und `*Self` waere fuer jeden ein anderer Typ. Solche
-    // Methoden gibt es nur STATISCH, ueber eine Schranke.
+    // OBJECT SAFETY (round 50): a signature holding `Self` the caller does not
+    // know through `dyn I` — which type sits behind it is settled at runtime
+    // only, and `*Self` would be a different type for each. Such methods exist
+    // STATICALLY only, through a bound.
     if m.has_self {
         for a in &args[1..] {
             ck.type_out_expr(a);
@@ -1291,8 +1291,8 @@ pub(crate) fn hook_method(
 
 // ------------------------------------------------------------------ Lowering
 
-/// Methodentafel einer Umsetzung — der Schluessel fuer `Op::VtabAddr`.
-/// `None`, wenn dieser Typ die Schnittstelle nicht (vollstaendig) umsetzt.
+/// Method table of one implementation — the key for `Op::VtabAddr`.
+/// `None` when this type does not implement the interface (completely).
 pub(crate) fn table_of(iface: &str, sidx: usize) -> Option<String> {
     REG.with(|r| {
         r.borrow()
@@ -1303,15 +1303,15 @@ pub(crate) fn table_of(iface: &str, sidx: usize) -> Option<String> {
     })
 }
 
-// ------------------------------------------------------------- Codegenerator
+// ------------------------------------------------------------ Code generator
 
-/// Alle Methodentafeln als `.rodata`-Block.
+/// All method tables as one `.rodata` block.
 ///
-/// Eine Tafel je vollstaendiger Umsetzung — auch fuer eine, die nie in einem
-/// `as dyn` vorkommt. Das ist Absicht: der Inhalt haengt allein an der
-/// Deklaration, nicht an den Aufrufstellen; eine Tafel, die nur manchmal
-/// entsteht, waere die Sorte Zustand, die man beim Fehlersuchen nicht sehen
-/// will.
+/// One table per complete implementation — even for one that never shows up
+/// within some `as dyn`. That is deliberate: the content hangs off the
+/// declaration alone, not off the call sites; a table that comes about only
+/// sometimes would be the sort of state you do not want to see while
+/// troubleshooting.
 pub(crate) fn tables_asm() -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
@@ -1345,10 +1345,10 @@ pub(crate) fn tables_asm() -> String {
     out
 }
 
-/// Signatur einer Schnittstellenmethode fuer das Lowering: der Empfaenger
-/// zaehlt als erster Parameter (ein Zeiger), danach die Parameter aus der
-/// Deklaration. Damit sieht der Aufruf fuer `lower_call` genauso aus wie
-/// jeder andere.
+/// Signature of one interface method for the lowering: the receiver counts
+/// as the first parameter (a pointer), after it the parameters out of the
+/// declaration. That way the call looks to `lower_call` just like every
+/// other one.
 fn methods_sig(iface: &str, method: &str) -> Option<crate::sema::FnSig> {
     let i = iface_index(iface)?;
     REG.with(|r| {
@@ -1360,18 +1360,18 @@ fn methods_sig(iface: &str, method: &str) -> Option<crate::sema::FnSig> {
     })
 }
 
-/// `// HOOK iface` in `lower::lower_call` — den dynamischen Versand
-/// vorbereiten: Datenzeiger lesen, Methodentafel lesen, Eintrag lesen.
+/// `// HOOK iface` within `lower::lower_call` — prepare the dynamic
+/// dispatch: read the data pointer, read the method table, read the entry.
 ///
 /// ```text
-/// %b = <adresse des schnittstellenwertes>
-/// %d = load.ptr [%b + 0]      ; der Wert selbst
-/// %t = load.ptr [%b + 8]      ; die Methodentafel
-/// %z = load.ptr [%t + 8*k]    ; die k-te Methode der Schnittstelle
+/// %b = <address of the interface value>
+/// %d = load.ptr [%b + 0]      ; the value itself
+/// %t = load.ptr [%b + 8]      ; the method table
+/// %z = load.ptr [%t + 8*k]    ; the k-th method of the interface
 /// ```
 ///
-/// Drei Ladebefehle je Aufruf — das ist der Preis des dynamischen Versands,
-/// und er steht hier sichtbar (SPEC §1, Leitsatz 1: nichts versteckt).
+/// Three loads per call — that is the price of the dynamic dispatch, and it
+/// stands here visibly (SPEC §1, guiding principle 1: nothing hidden).
 pub(crate) fn lower_dispatch(
     lo: &mut crate::lower::Lower,
     iface: &str,
@@ -1398,12 +1398,12 @@ pub(crate) fn lower_dispatch(
     Some((target, data, sig))
 }
 
-/// `// HOOK iface` in `lower::write_into_inner` — `p as dyn I`.
+/// `// HOOK iface` within `lower::write_into_inner` — `p as dyn I`.
 ///
-/// Zwei Woerter: der Zeiger, wie er ist, und die Adresse der Methodentafel.
-/// Der Datenzeiger wird NICHT veraendert (kein Versatz, keine Verschleierung)
-/// — nur so findet der konservative Stapelscan des Sammlers das Objekt
-/// dahinter (SPEC §3.5.3, siehe Kopf dieser Datei).
+/// Two words: the pointer as it is, and the address of the method table.
+/// The data pointer does NOT get changed (no offset, no veiling) — only
+/// that way does the conservative stack scan of the collector find the
+/// object behind it (SPEC §3.5.3, see the head of this file).
 pub(crate) fn lower_cast_into(
     lo: &mut crate::lower::Lower,
     addr: crate::fir::Val,
@@ -1440,7 +1440,7 @@ pub(crate) fn lower_cast_into(
     Some(())
 }
 
-/// Assemblername einer Methodentafel.
+/// Assembler label of a method table.
 pub(crate) fn table_label(key: &str) -> String {
     format!("{}{}", TABLE_LABEL, key)
 }
