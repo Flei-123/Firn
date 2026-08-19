@@ -1362,17 +1362,26 @@ mod tests {
 
     #[test]
     fn laufzeit_enthaelt_die_pflichtnamen() {
-        let q = laufzeit_quelle(true, true);
+        let q = laufzeit_quelle(true, true, true);
         for n in ["gc_init", "gc_collect", "gc_live_objects", FN_ALLOC, FN_WEAK, FN_STARK, FN_AS] {
             assert!(q.contains(n), "laufzeit ohne '{}'", n);
         }
         assert!(q.contains("error AllocError"));
-        assert!(!laufzeit_quelle(false, true).contains("error AllocError {"));
+        assert!(!laufzeit_quelle(false, true, false).contains("error AllocError {"));
         // Runde 47: der Verteiler ist genau EINMAL da — entweder als
         // Voreinstellung oder aus dem Programm, nie doppelt.
         assert!(q.contains("fn __gc_finalisiere(art: u64, p: *mut u8) {"));
         assert!(!laufzeit_quelle(true, false, false).contains("fn __gc_finalisiere(art: u64, p: *mut u8) {"));
         assert!(q.contains("gc_finalisierer_setzen"));
+        // Runde 53: die Sammlungen kommen nur dazu, wenn sie gebraucht werden.
+        for n in ["gcvec_anhaengen", "gcmap_setzen", "gc class GcSlots"] {
+            assert!(q.contains(n), "laufzeit ohne '{}'", n);
+            assert!(
+                !laufzeit_quelle(true, true, false).contains(n),
+                "'{}' auch ohne Sammlungen dabei",
+                n
+            );
+        }
         assert!(q.contains("gc_wurzel_anmelden"));
     }
 }
