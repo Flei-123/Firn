@@ -9,12 +9,12 @@
 #
 # Zwei Programme, dieselbe Arbeit:
 #
-#   statisch.fi   fn zaehle[T: Ordnung](a: *T, …)     Schranke, Auspraegung
-#   dynamisch.fi  fn zaehle_dyn(a: dyn OrdnungD, …)   Methodentafel
+#   statisch.fi   fn count[T: Order](a: *T, …)     Schranke, Auspraegung
+#   dynamisch.fi  fn count_dyn(a: dyn OrderD, …)   Methodentafel
 #
 # Geprueft wird:
 #   1. In `statisch` gibt es KEINEN indirekten Aufruf (`call <register>`) —
-#      und ohne Optimierer dafuer einen namentlichen `call … Punkt__kleiner`.
+#      und ohne Optimierer dafuer einen namentlichen `call … Dot__less`.
 #   2. In `dynamisch` gibt es mindestens einen. (Ohne diese Gegenprobe wuerde
 #      der Test auch dann bestehen, wenn er gar nichts misst.)
 #   3. Dasselbe in der FIR: `statisch` enthaelt weder `calli` noch `vtab`,
@@ -41,17 +41,17 @@ indirekte() {
 N=${SCHRANKEN_N:-2000000}
 
 cat > "$W/statisch.fi" <<EOF
-interface Ordnung {
+interface Order {
     fn kleiner(*self, b: *Self) -> bool
 }
 
 struct Punkt { x: i64 }
 
-impl Ordnung for Punkt {
+impl Order for Punkt {
     fn kleiner(*self, b: *Punkt) -> bool { return (*self).x < (*b).x }
 }
 
-fn zaehle[T: Ordnung](a: *T, b: *T, n: i64) -> i64 {
+fn count[T: Order](a: *T, b: *T, n: i64) -> i64 {
     var i: i64 = 0
     var s: i64 = 0
     while i < n {
@@ -66,7 +66,7 @@ fn zaehle[T: Ordnung](a: *T, b: *T, n: i64) -> i64 {
 fn main() -> i32 {
     var p: Punkt = Punkt{ x: 1 }
     var q: Punkt = Punkt{ x: 2 }
-    if zaehle[Punkt](&p, &q, $N) != $N {
+    if count[Punkt](&p, &q, $N) != $N {
         return 1
     }
     return 0
@@ -74,17 +74,17 @@ fn main() -> i32 {
 EOF
 
 cat > "$W/dynamisch.fi" <<EOF
-interface OrdnungD {
+interface OrderD {
     fn kleiner(*self, b: *Punkt) -> bool
 }
 
 struct Punkt { x: i64 }
 
-impl OrdnungD for Punkt {
+impl OrderD for Punkt {
     fn kleiner(*self, b: *Punkt) -> bool { return (*self).x < (*b).x }
 }
 
-fn zaehle_dyn(a: dyn OrdnungD, b: *Punkt, n: i64) -> i64 {
+fn count_dyn(a: dyn OrderD, b: *Punkt, n: i64) -> i64 {
     var i: i64 = 0
     var s: i64 = 0
     while i < n {
@@ -99,8 +99,8 @@ fn zaehle_dyn(a: dyn OrdnungD, b: *Punkt, n: i64) -> i64 {
 fn main() -> i32 {
     var p: Punkt = Punkt{ x: 1 }
     var q: Punkt = Punkt{ x: 2 }
-    let d: dyn OrdnungD = (&p) as dyn OrdnungD
-    if zaehle_dyn(d, &q, $N) != $N {
+    let d: dyn OrderD = (&p) as dyn OrderD
+    if count_dyn(d, &q, $N) != $N {
         return 1
     }
     return 0
@@ -127,8 +127,8 @@ for stufe in "release-fast:" "no-opt:--no-opt" "dev-fast:--opt-level=dev-fast"; 
 done
 # Der namentliche Aufruf ist ohne Optimierer sichtbar — MIT Optimierer
 # verschwindet er ganz, und das ist der eigentliche Gewinn (siehe Messung).
-grep -qE '^[[:space:]]*call[[:space:]]+\S*Punkt__kleiner' "$W/s_no-opt.s" \
-    || melde "firnc0/no-opt: kein namentlicher Aufruf 'Punkt__kleiner' in der Schrankenfassung"
+grep -qE '^[[:space:]]*call[[:space:]]+\S*Dot__less' "$W/s_no-opt.s" \
+    || melde "firnc0/no-opt: kein namentlicher Aufruf 'Dot__less' in der Schrankenfassung"
 
 # --- 3. Dieselbe Aussage in der FIR ----------------------------------------
 "$FIRNC" --emit=fir-raw "$W/statisch.fi"  > "$W/s.fir" 2>/dev/null
@@ -149,8 +149,8 @@ if [ -x "$FC1" ]; then
     if "$FC1" "$W/statisch.fi" -o "$W/s1.bin" >/dev/null 2>"$W/e1"; then
         si=$(indirekte "$W/s1.bin.s")
         [ "$si" -eq 0 ] || melde "firnc1: die Schrankenfassung hat $si indirekte Aufrufe"
-        grep -qE '^[[:space:]]*call[[:space:]]+\S*Punkt__kleiner' "$W/s1.bin.s" \
-            || melde "firnc1: kein namentlicher Aufruf 'Punkt__kleiner'"
+        grep -qE '^[[:space:]]*call[[:space:]]+\S*Dot__less' "$W/s1.bin.s" \
+            || melde "firnc1: kein namentlicher Aufruf 'Dot__less'"
         set +e; "$W/s1.bin"; rc=$?; set -e
         [ "$rc" -eq 0 ] || melde "firnc1: die Schrankenfassung liefert $rc statt 0"
     else

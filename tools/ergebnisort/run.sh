@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Nachweis der ERGEBNISORT-GARANTIE (SPEC.md §13.1, DESIGNZIELE.md §6).
 #
-# Behauptung: Bei `let g = baue(…)` mit aggregiertem Rueckgabetyp wird die
+# Behauptung: Bei `let g = build(…)` mit aggregiertem Rueckgabetyp wird die
 # Zieladresse durchgereicht. Die Struktur entsteht GENAU EINMAL im Rahmen des
 # Aufrufers — nicht zusaetzlich im Rahmen der erzeugenden Funktion und nicht
 # per Kopie.
 #
 # Geprueft wird am erzeugten Assembler:
-#   1. Der Rahmen von `baue` ist KLEIN (< 64 KB), obwohl die Struktur 1 MB hat.
+#   1. Der Rahmen von `build` ist KLEIN (< 64 KB), obwohl die Struktur 1 MB hat.
 #   2. Der Rahmen von `main` ist etwa 1 MB (genau eine Ausfertigung).
 #   3. Es gibt keine Bulk-Kopie (`rep movs`) — nichts wird umgeschaufelt.
 set -euo pipefail
@@ -30,18 +30,18 @@ rahmen() {   # $1 = Funktionsname -> Byte-Zahl aus 'sub rsp, N'
     ' "$ASM"
 }
 
-R_BAUE=$(rahmen baue)
+R_BUILD=$(rahmen build)
 R_MAIN=$(rahmen main)
 KOPIEN=$(grep -c 'rep movs' "$ASM" || true)
 
-echo "Rahmen baue: ${R_BAUE:-?} Byte   Rahmen main: ${R_MAIN:-?} Byte   rep-movs: $KOPIEN"
+echo "Rahmen build: ${R_BUILD:-?} Byte   Rahmen main: ${R_MAIN:-?} Byte   rep-movs: $KOPIEN"
 
 FEHLER=0
-if [ -z "${R_BAUE:-}" ] || [ -z "${R_MAIN:-}" ]; then
+if [ -z "${R_BUILD:-}" ] || [ -z "${R_MAIN:-}" ]; then
     echo "FEHLER: Rahmengroesse nicht gefunden — Assembler-Format geaendert?"; exit 1
 fi
-if [ "$R_BAUE" -ge 65536 ]; then
-    echo "FEHLER: 'baue' baut die 1-MB-Struktur auf dem eigenen Stapel ($R_BAUE Byte)."
+if [ "$R_BUILD" -ge 65536 ]; then
+    echo "FEHLER: 'build' baut die 1-MB-Struktur auf dem eigenen Stapel ($R_BUILD Byte)."
     echo "        Die Ergebnisort-Garantie aus SPEC.md §13.1 ist verletzt."
     FEHLER=1
 fi
@@ -55,4 +55,4 @@ if [ "$KOPIEN" -ne 0 ]; then
 fi
 
 [ "$FEHLER" -eq 0 ] || exit 1
-echo "OK: Ergebnisort-Garantie gehalten (baue $R_BAUE B, main $R_MAIN B, keine Bulk-Kopie)."
+echo "OK: Ergebnisort-Garantie gehalten (build $R_BUILD B, main $R_MAIN B, keine Bulk-Kopie)."
