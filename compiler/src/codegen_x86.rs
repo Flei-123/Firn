@@ -170,7 +170,9 @@ pub fn emit(m: &Module) -> Result<String, String> {
     }
     // HOOK gc: Typtabelle (.rodata) und Zustandsblock (.data) des Sammlers —
     // nur, wenn das Programm ueberhaupt ein `gc class` enthaelt (gc.rs).
-    if crate::gc::hat_klassen() {
+    // Runde 49: auch ein Programm OHNE `gc class`, das Faeden benutzt, braucht
+    // den Zustandsblock — die Fadentafel und die Sperren liegen darin.
+    if crate::gc::hat_klassen() || crate::gc::laufzeit_aktiv() {
         e.raw(&crate::gc::typtabelle_asm());
     }
     // HOOK iface: die Methodentafeln (.rodata) — nur, wenn das Programm
@@ -613,6 +615,28 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
             load_full(e, fr, "rcx", *addr);
             load_full(e, fr, "rax", *val);
             e.line("lock xadd qword ptr [rcx], rax");
+            store_dst(e, fr, d, "rax");
+        }
+        // Runde 49 (faden.rs): Vergleichs-Tausch, Fadenerzeugung, Selbstzeiger.
+        Op::AtomicCas { addr, erw, neu } => {
+            let d = i.dst.ok_or("interner Fehler: atomcas ohne Ziel")?;
+            load_full(e, fr, "rcx", *addr);
+            load_full(e, fr, "rdx", *neu);
+            load_full(e, fr, "rax", *erw);
+            crate::faden::cas_sequenz(e);
+            store_dst(e, fr, d, "rax");
+        }
+        Op::ThreadSpawn { arg, stapel, ctid } => {
+            let d = i.dst.ok_or("interner Fehler: spawn ohne Ziel")?;
+            load_full(e, fr, "rdi", *arg);
+            load_full(e, fr, "rsi", *stapel);
+            load_full(e, fr, "rdx", *ctid);
+            crate::faden::spawn_sequenz(e);
+            store_dst(e, fr, d, "rax");
+        }
+        Op::ThreadSelf => {
+            let d = i.dst.ok_or("interner Fehler: fadenselbst ohne Ziel")?;
+            crate::faden::selbst_sequenz(e);
             store_dst(e, fr, d, "rax");
         }
         Op::CopyMem { dst, src, size } => {
