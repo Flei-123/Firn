@@ -1,71 +1,71 @@
-//! `impl Typ { fn methode(*mut self, …) }` — Methoden auf struct-Typen
-//! (Runde 45).
+//! `impl T { fn method(*mut self, …) }` — methods on struct types
+//! (round 45).
 //!
-//! ## Was hier passiert — und was ausdruecklich nicht
+//! ## What happens here — and what explicitly does not
 //!
-//! Eine Methode ist in Firn **keine neue Art von Ding**. `impl` ist eine
-//! Schreibhilfe mit genau zwei Wirkungen:
+//! A method is **no new kind of thing** within Firn. `impl` is a writing aid
+//! with exactly two effects:
 //!
-//!  1. `impl T { fn m(*mut self, x: i32) … }` legt die gewoehnliche Funktion
-//!     `T__m(self: *mut T, x: i32)` an — mehr nicht. Sie steht danach in
-//!     `Program::funcs` wie jede andere und geht durch dieselbe Typpruefung,
-//!     dasselbe Lowering, denselben Codegenerator.
-//!  2. `x.m(a)` wird zum Aufruf dieser Funktion. Welche Funktion gemeint ist,
-//!     entscheidet **allein der statische Typ des Empfaengers** — keine
-//!     vtable, kein dynamischer Versand, kein Suchen zur Laufzeit. Steht der
-//!     Typ fest, steht der Sprungbefehl fest.
+//!  1. `impl T { fn m(*mut self, x: i32) … }` creates the ordinary function
+//!     `T__m(self: *mut T, x: i32)` — nothing more. It stands afterwards at
+//!     `Program::funcs` like every other and goes through the same type
+//!     check, the same lowering, the same code generator.
+//!  2. `x.m(a)` becomes the call of that function. Which function is meant
+//!     gets decided **by the static type of the receiver alone** — no vtable,
+//!     no dynamic dispatch, no lookup at runtime. Once the type is settled,
+//!     the jump instruction is settled.
 //!
-//! Der Aufruf traegt bis zur Typpruefung den Namen `"methode m"`. Das
-//! Leerzeichen macht ihn zu einem Namen, der aus keinem Bezeichner des
-//! Quelltextes entstehen kann — dieselbe Bauart wie `"gc C"` in `gc.rs`.
-//! `sema.rs` loest ihn auf, `lower.rs` leitet dieselbe Aufloesung noch einmal
-//! ab. Beide rechnen aus demselben Material (Empfaengertyp + Methodenname);
-//! eine Seitentabelle zwischen den Phasen gibt es bewusst nicht, denn sie
-//! muesste in `firnc1` mitgeschleppt werden, ohne etwas zu koennen, was der
-//! Typ nicht schon sagt.
+//! Up to the type check the call carries the label `"method m"`. The space
+//! makes it a label that can come about from no identifier of the source
+//! text — the same build as `"gc C"` at `gc.rs`. `sema.rs` resolves it,
+//! `lower.rs` derives the very same resolution once more. Both compute from
+//! the same material (receiver type + method label); a side table between
+//! the phases deliberately does not exist, because it would have to be
+//! dragged along within `firnc1` without being able to do anything that the
+//! type does not say already.
 //!
-//! ## Der Empfaenger — warum `*self` und nicht `&self`
+//! ## The receiver — why `*self` and not `&self`
 //!
-//! Firn hat **keine Referenzen**. Es hat Zeiger (`*T`, `*mut T`) und den
-//! Adressoperator `&x`. Ein `&self` waere ein neuer Begriff, der in der
-//! ganzen uebrigen Sprache nicht vorkommt. Deshalb wird der Empfaenger so
-//! geschrieben, wie ein Parameter in Firn geschrieben wird:
+//! Firn has **no references**. It has pointers (`*T`, `*mut T`) and the
+//! address operator `&x`. A `&self` would be a new term that shows up
+//! nowhere within the rest of the language. That is why the receiver gets
+//! written the way a parameter gets written within Firn:
 //!
 //! ```text
 //! impl Bytes {
-//!     fn laenge(*self) -> usize        // self: *Bytes
-//!     fn dazu(*mut self, v: u8)        // self: *mut Bytes
-//!     fn kopf(self) -> u8              // self: Bytes   (Kopie)
+//!     fn length(*self) -> usize        // self: *Bytes
+//!     fn push(*mut self, v: u8)        // self: *mut Bytes
+//!     fn head(self) -> u8              // self: Bytes   (copy)
 //! }
 //! ```
 //!
-//! Am Aufrufort wird **eine** Anpassung gemacht, und zwar die, die man sonst
-//! von Hand schreibt: verlangt die Methode einen Zeiger und liegt der
-//! Empfaenger als Wert vor, nimmt der Compiler seine Adresse (`&x`). Liegt er
-//! schon als Zeiger vor, wird er durchgereicht. Mehr Automatik gibt es nicht:
-//! kein automatisches Dereferenzieren, keine Kette von `*`, keine Umwege ueber
-//! Felder. Wer eine Kopie will, schreibt `(*p).m()`.
+//! At the call site **one** adaptation happens, namely the one you would
+//! otherwise write by hand: if the method demands a pointer and the receiver
+//! is present as a value, the compiler takes its address (`&x`). If it is
+//! present as a pointer already, it gets passed through. More automatism
+//! does not exist: no automatic dereferencing, no chain of `*`, no detours
+//! through fields. Whoever wants a copy writes `(*p).m()`.
 //!
-//! Dass `*self` und `*mut self` in der Typpruefung **denselben** Empfaenger
-//! zulassen, ist keine Nachlaessigkeit dieser Datei, sondern die Regel der
-//! Sprache: `sema::compatible` vergleicht Zeiger ohne die Veraenderlichkeit
-//! (`*T` und `*mut T` sind fuereinander einsetzbar). `*mut self` sagt also
-//! genau das, was `*mut T` als Parametertyp heute sagt — Absicht, nicht
-//! Zwang. Aendert sich diese Regel einmal fuer Parameter, aendert sie sich
-//! fuer den Empfaenger von selbst mit.
+//! That `*self` and `*mut self` admit the **same** receiver at the type
+//! check is no sloppiness of this file but the rule of the language:
+//! `sema::compatible` compares pointers without the mutability (`*T` and
+//! `*mut T` are usable for each other). `*mut self` therefore says exactly
+//! what `*mut T` says as a parameter type today — intent, not constraint.
+//! Once that rule changes for parameters, it changes for the receiver
+//! along with it by itself.
 //!
-//! ## Namensaufloesung (SPEC-Ergaenzung §12.6)
+//! ## Label resolution (SPEC addendum §12.6)
 //!
-//! * Methoden und freie Funktionen liegen in **einem** Namensraum, aber unter
-//!   verschiedenen Namen: die Methode `m` von `T` heisst `T__m`. `m(x)` findet
-//!   deshalb nie eine Methode, und `x.m()` findet nie eine freie Funktion.
-//!   Verdecken ist damit ausgeschlossen — es gibt nichts zu verdecken.
-//! * Im Modul `str` wird aus `T__m` beim Zusammenfuehren `str__T__m`
-//!   (`modules.rs`), und aus dem Typ `T` wird `str__T`. Die Aufloesung
-//!   `Strukturname ++ "__" ++ Methode` stimmt danach weiter — sie rechnet
-//!   immer mit dem Namen, den der Typ zu diesem Zeitpunkt traegt.
-//! * Generische Typen (`Vec[T]`) haben in dieser Runde keine Methoden; siehe
-//!   `docs/RUNDE45.md`, Abschnitt „Bewusst weggelassen".
+//! * Methods and free functions live within **one** namespace, yet under
+//!   different labels: the method `m` of `T` is called `T__m`. `m(x)`
+//!   therefore never finds a method, and `x.m()` never finds a free
+//!   function. Shadowing is thereby ruled out — there is nothing to shadow.
+//! * Within the module `str`, `T__m` becomes `str__T__m` while merging
+//!   (`modules.rs`), and the type `T` becomes `str__T`. The resolution
+//!   `struct label ++ "__" ++ method` still holds afterwards — it always
+//!   computes with the label that the type carries at that point.
+//! * Generic types (`Vec[T]`) have no methods during this round; see
+//!   `docs/RUNDE45.md`, section "deliberately left out".
 
 use crate::ast::{Expr, ExprKind, FnDecl, Param, Program, TypeExpr, UnOp};
 use crate::diag::Span;
@@ -76,33 +76,33 @@ use std::collections::HashMap;
 use crate::sema::{Checker, FnSig, TypeInfo};
 use crate::types::{Type, TypeCtx};
 
-/// Praefix des noch nicht aufgeloesten Methodenaufrufs im AST.
-/// Das Leerzeichen macht ihn unerreichbar fuer den Quelltext.
+/// Prefix of the method call not yet resolved within the AST.
+/// The space makes it unreachable for the source text.
 pub(crate) const P_CALL: &str = "method ";
-/// Trenner im Namen der Methodenfunktion: `Typ__methode`.
+/// Separator within the label of the method function: `Type__method`.
 pub(crate) const SEP: &str = "__";
 
-/// Ist das ein noch nicht aufgeloester Methodenaufruf? Liefert den
-/// Methodennamen.
+/// Is this a method call that is not resolved yet? Yields the
+/// method label.
 pub(crate) fn method_name(name: &str) -> Option<&str> {
     name.strip_prefix(P_CALL)
 }
 
-/// Name der Funktion hinter `Typ.methode`.
+/// Label of the function behind `Type.method`.
 pub(crate) fn fn_name(ty: &str, method: &str) -> String {
     format!("{}{}{}", ty, SEP, method)
 }
 
 // ------------------------------------------------------------------- Parser
 
-/// `// HOOK impl` in `parser.rs::program` — `impl Typ { … }` und (Runde 46)
-/// `impl Schnittstelle for Typ { … }`.
+/// `// HOOK impl` within `parser.rs::program` — `impl T { … }` and (round
+/// 46) `impl Interface for T { … }`.
 ///
-/// `impl` ist KEIN Schluesselwort (der Tokenisierer kennt es nicht), sondern
-/// ein Bezeichner in einer Stellung, in der sonst nichts stehen darf —
-/// dieselbe Loesung wie `gc class` (gc.rs). Damit bleibt `impl` als
-/// Variablenname gueltig. `for` ist dagegen schon ein Schluesselwort
-/// (`for i in a..b`) und deshalb hier eindeutig.
+/// `impl` is NO keyword (the tokenizer does not know it) but one identifier
+/// at a position where nothing else may stand — the same solution as
+/// `gc class` (gc.rs). That keeps `impl` valid as a variable label. `for`
+/// on the other hand is a keyword already (the loop) and therefore
+/// unambiguous here.
 pub(crate) fn hook_item(p: &mut Parser, prog: &mut Program) -> bool {
     if !matches!(p.kind(), TokKind::Ident(n) if n == "impl") {
         return false;
@@ -148,9 +148,9 @@ fn impl_decl(p: &mut Parser, prog: &mut Program, is_for: bool) {
             return;
         }
     };
-    // HOOK iface: `impl Schnittstelle for Typ` (iface.rs, Runde 46). Der
-    // Block legt DIESELBEN Funktionen an wie `impl Typ` — die Schnittstelle
-    // sagt nur zusaetzlich, was darin stehen MUSS.
+    // HOOK iface: `impl Interface for T` (iface.rs, round 46). The block
+    // creates THE SAME functions as `impl T` — the interface merely says
+    // additionally what MUST stand within it.
     let (ty, tsp) = if is_for {
         p.bump(); // 'for'
         match p.ident("after 'for' in 'impl … for …'") {
@@ -189,9 +189,9 @@ fn impl_decl(p: &mut Parser, prog: &mut Program, is_for: bool) {
             p.recovering = false;
             break;
         }
-        // Eine kaputte Methode bricht den GANZEN Block ab. Sonst folgt auf
-        // die eigentliche Meldung eine Kaskade aus Folgefehlern, und die
-        // erste — die einzige, die etwas erklaert — geht darin unter.
+        // One broken method aborts the WHOLE block. Otherwise the message
+        // proper gets followed by a cascade of consequential errors, and the
+        // first — the only one that explains something — drowns within it.
         if !method(p, prog, &ty, tsp) {
             p.recovering = false;
             p.sync_item();
@@ -206,8 +206,8 @@ fn impl_decl(p: &mut Parser, prog: &mut Program, is_for: bool) {
     let _ = start;
 }
 
-/// Eine Methode: `fn name(<empfaenger>[, param…]) [-> T] { … }`.
-/// `false` = abgebrochen, der umgebende `impl`-Block wird verworfen.
+/// One method: `fn label(<receiver>[, param…]) [-> T] { … }`.
+/// `false` = aborted, the surrounding `impl` block gets discarded.
 fn method(p: &mut Parser, prog: &mut Program, ty: &str, tsp: Span) -> bool {
     let start = p.bump(); // 'fn'
     let name = match p.ident("after 'fn' in an impl block") {
@@ -278,16 +278,16 @@ fn method(p: &mut Parser, prog: &mut Program, ty: &str, tsp: Span) -> bool {
     true
 }
 
-/// Der Empfaenger: `self`, `*self` oder `*mut self`.
+/// The receiver: `self`, `*self` or `*mut self`.
 ///
-/// FUER EINE `gc class` (Runde 46) traegt der Empfaenger den INTERNEN
-/// Structnamen `"gc K"`. Damit wird aus `*self` genau `Gc[K]` — ein
-/// `gc class`-Wert existiert nur auf dem Heap, ein Zeiger darauf ist der
-/// einzige Weg, ihn anzufassen (SPEC §3.5.1). Ob `K` eine Klasse ist, steht
-/// in der Registrierung von `gc.rs`; sie wird beim Parsen gefuellt, deshalb
-/// muss `gc class K` VOR dem `impl`-Block stehen (docs/RUNDE46.md §9).
-/// Der interne Name wird von `modules.rs` nicht umbenannt — richtig so:
-/// Klassennamen gelten programmweit.
+/// FOR A `gc class` (round 46) the receiver carries the INTERNAL struct
+/// label `"gc K"`. That turns `*self` into exactly `Gc[K]` — a `gc class`
+/// value exists on the heap only, a pointer to it is the only way to touch
+/// it (SPEC §3.5.1). Whether `K` is a class stands at the registry of
+/// `gc.rs`; it gets filled while parsing, which is why `gc class K` must
+/// stand BEFORE the `impl` block (docs/RUNDE46.md §9). The internal label
+/// does not get renamed by `modules.rs` — rightly so: class labels hold
+/// program wide.
 fn self_param(p: &mut Parser, ty: &str, tsp: Span) -> Option<Param> {
     let class = crate::gc::is_class(ty);
     let tname = if class {
@@ -332,8 +332,8 @@ fn self_param(p: &mut Parser, ty: &str, tsp: Span) -> Option<Param> {
     None
 }
 
-/// Verbraucht `*self` bzw. `*mut self` und liefert (veraenderlich, Position
-/// von `self`). Steht danach kein `self`, wird nichts verbraucht.
+/// Consumes `*self` or `*mut self` and yields (mutable, position of
+/// `self`). If no `self` follows, nothing gets consumed.
 pub(crate) fn ptr_self(p: &mut Parser) -> Option<(bool, Span)> {
     let with_mut = matches!(p.toks.get(p.pos + 1).map(|t| &t.kind), Some(TokKind::KwMut));
     let idx = if with_mut { p.pos + 2 } else { p.pos + 1 };
@@ -347,23 +347,23 @@ pub(crate) fn ptr_self(p: &mut Parser) -> Option<(bool, Span)> {
     Some((with_mut, p.bump())) // 'self'
 }
 
-/// `// HOOK impl` in `parser.rs::postfix` — `x.m(args)`.
+/// `// HOOK impl` within `parser.rs::postfix` — `x.m(args)`.
 ///
-/// Der Feldname ist bereits gelesen; folgt jetzt eine Klammer, ist es ein
-/// Methodenaufruf und kein Feldzugriff. Ein qualifizierter Modulzugriff
-/// (`modul.funktion(..)`) kommt hier nie an: den hat `Parser::qualify` in
-/// `primary` schon zu EINEM Namen gemacht.
+/// The field label is read already; if a bracket follows now, this is a
+/// method call and no field access. A qualified module access
+/// (`module.function(..)`) never arrives here: `Parser::qualify` turned
+/// that into ONE label at `primary` already.
 pub(crate) fn hook_method_call(
     p: &mut Parser,
     base: &Expr,
     name: &str,
     nsp: Span,
 ) -> Option<Expr> {
-    // Die Klammer muss in DERSELBEN Zeile stehen. Ohne diese Frage waere
-    //     let g: usize = (*p).kein_slit
-    //     (*p).kein_slit = 0
-    // ein Methodenaufruf `(*p).kein_slit((*p))` — der Zeilenumbruch beendet
-    // die Anweisung (SPEC §10), und genau das prueft `cont`.
+    // The bracket must stand on the SAME line. Without that question
+    //     let g: usize = (*p).field
+    //     (*p).field = 0
+    // would be a method call `(*p).field((*p))` — the line break ends the
+    // statement (SPEC §10), and exactly that is what `cont` checks.
     if !p.cont() || !p.at(&TokKind::LParen) {
         return None;
     }
@@ -376,10 +376,10 @@ pub(crate) fn hook_method_call(
     Some(p.mk(span, ExprKind::Call(format!("{}{}", P_CALL, name), all, nsp)))
 }
 
-// -------------------------------------------------------------- Typpruefung
+// --------------------------------------------------------------- Type check
 
-/// Struktur hinter einem Empfaengertyp: `(Index, liegt schon als Zeiger vor)`.
-/// Nur fuer die Frage „ist das ein `dyn I`?" — sonst gilt `empfaenger_praefix`.
+/// Structure behind a receiver type: `(index, present as pointer already)`.
+/// Only for the question "is that a `dyn I`?" — otherwise `receiver_prefix`.
 fn receiver_structure(tcx: &TypeCtx, t: &Type) -> Option<(usize, bool)> {
     match t {
         Type::Struct(i) if tcx.structs.get(*i).is_some() => Some((*i, false)),
@@ -391,13 +391,13 @@ fn receiver_structure(tcx: &TypeCtx, t: &Type) -> Option<(usize, bool)> {
     }
 }
 
-/// Der Name, unter dem die Methoden dieses Empfaengers stehen, und ob er
-/// schon als Zeiger vorliegt: `(Praefix, ist_zeiger)`.
+/// The label under which the methods of this receiver stand, and whether it
+/// is present as a pointer already: `(prefix, is_pointer)`.
 ///
-/// Seit Runde 50 zaehlt dazu auch ein GRUNDTYP (`impl Ord for i32` legt
-/// `i32__kleiner` an). Ein typloses Ganzzahlliteral gehoert ausdruecklich
-/// nicht dazu: `1.m()` haette keinen festen Typ, und welcher `impl`-Block
-/// gemeint waere, koennte niemand sagen.
+/// Since round 50 that includes a BASE TYPE as well (`impl Ord for i32`
+/// creates `i32__less`). One untyped integer literal explicitly does not
+/// belong to it: `1.m()` would have no settled type, and which `impl`
+/// block was meant nobody could say.
 fn receiver_prefix(tcx: &TypeCtx, t: &Type) -> Option<(String, bool)> {
     fn name(tcx: &TypeCtx, t: &Type) -> Option<String> {
         match t {
@@ -413,18 +413,18 @@ fn receiver_prefix(tcx: &TypeCtx, t: &Type) -> Option<(String, bool)> {
     }
 }
 
-/// Schnittstelle hinter einem Empfaengertyp, wenn es ein `dyn I` ist.
-/// (Runde 46; auch `sema::probe` fragt hier.)
+/// Interface behind a receiver type, if it is a `dyn I`.
+/// (Round 46; `sema::probe` asks here too.)
 pub(crate) fn dyn_interface(tcx: &TypeCtx, t: &Type) -> Option<String> {
     let (i, _) = receiver_structure(tcx, t)?;
     let name = &tcx.structs.get(i)?.name;
     crate::iface::interface_of(name).map(|s| s.to_string())
 }
 
-/// Aufloesung: Zielfunktion und ob der Empfaenger als ADRESSE uebergeben
-/// wird. EINE Stelle, drei Benutzer — `sema::probe` (Typhinweis),
-/// `sema::call` (Pruefung) und `lower::lower_call` (Aufruf) rechnen alle
-/// hiermit, damit sie nicht auseinanderlaufen koennen.
+/// Resolution: target function and whether the receiver gets passed as
+/// ADDRESS. ONE spot, three users — `sema::probe` (type hint),
+/// `sema::call` (check) and `lower::lower_call` (call) all compute with
+/// this, so that they cannot drift apart.
 pub(crate) fn target_of(
     tcx: &TypeCtx,
     fns: &HashMap<String, FnSig>,
@@ -438,13 +438,13 @@ pub(crate) fn target_of(
     Some((full, will_ptr && !is_ptr))
 }
 
-/// Dasselbe fuer das Lowering, das die fertige `TypeInfo` hat.
+/// The same for the lowering, which holds the finished `TypeInfo`.
 pub(crate) fn target(info: &TypeInfo, method: &str, recv: &Type) -> Option<(String, bool)> {
     target_of(&info.tcx, &info.fns, method, recv)
 }
 
-/// Kann von diesem Ausdruck eine Adresse genommen werden?
-/// Dieselbe Menge, die `&x` erlaubt und die `lower::lower_addr` beherrscht.
+/// Can the address of this expression be taken?
+/// The same set that `&x` allows and that `lower::lower_addr` masters.
 fn is_slot(e: &Expr) -> bool {
     match &e.kind {
         ExprKind::Ident(_) | ExprKind::Field(..) | ExprKind::Index(..) => true,
@@ -453,7 +453,7 @@ fn is_slot(e: &Expr) -> bool {
     }
 }
 
-/// Alle Methoden eines Typs, alphabetisch — fuer die Fehlermeldung.
+/// All methods of a type, alphabetically — for the error message.
 fn methods_of(ck: &Checker, prefix: &str) -> Vec<String> {
     let prefix = format!("{}{}", prefix, SEP);
     let mut out: Vec<String> = ck
@@ -467,7 +467,7 @@ fn methods_of(ck: &Checker, prefix: &str) -> Vec<String> {
     out
 }
 
-/// `// HOOK impl` in `sema::Checker::call` — loest `x.m(args)` auf.
+/// `// HOOK impl` within `sema::Checker::call` — resolves `x.m(args)`.
 pub(crate) fn hook_call(
     ck: &mut Checker,
     name: &str,
@@ -476,7 +476,7 @@ pub(crate) fn hook_call(
     espan: Span,
 ) -> Option<Type> {
     let method = method_name(name)?.to_string();
-    // Der Parser legt den Empfaenger immer als erstes Argument ab.
+    // The parser always puts the receiver down as the first argument.
     let recv = match args.first() {
         Some(e) => e,
         None => return Some(Type::Error),
@@ -507,9 +507,9 @@ pub(crate) fn hook_call(
             return Some(Type::Error);
         }
     };
-    // HOOK iface: `f.m(args)` auf einem `dyn I` — DYNAMISCHER VERSAND. Welche
-    // Funktion laeuft, steht erst zur Laufzeit in der Methodentafel; geprueft
-    // wird gegen die Schnittstelle (iface.rs, Runde 46).
+    // HOOK iface: `f.m(args)` on a `dyn I` — DYNAMIC DISPATCH. Which function
+    // runs is settled at runtime within the method table; checked it gets
+    // against the interface (iface.rs, round 46).
     if let Some((sidx, _)) = receiver_structure(&ck.tcx, &et) {
         let sname = ck.tcx.structs[sidx].name.clone();
         if let Some(iname) = crate::iface::interface_of(&sname) {
@@ -542,7 +542,7 @@ pub(crate) fn hook_call(
         }
     };
     let display = format!("{}.{}", prefix, method);
-    // Empfaenger anpassen — die einzige Automatik am Aufrufort.
+    // Adapt the receiver — the only automatism at the call site.
     match sig.params.first() {
         Some(t) if t.is_ptr() && !is_ptr => {
             if !is_slot(recv) {
@@ -569,7 +569,7 @@ pub(crate) fn hook_call(
         }
         _ => {}
     }
-    // Die uebrigen Argumente — gezaehlt wird OHNE den Empfaenger.
+    // The remaining arguments — counted WITHOUT the receiver.
     let expected = sig.params.len().saturating_sub(1);
     let found = args.len().saturating_sub(1);
     if found != expected {
