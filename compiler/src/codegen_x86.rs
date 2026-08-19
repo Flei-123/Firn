@@ -726,8 +726,11 @@ mod tests {
         g.set_term(0, Term::Ret(Some(rc)));
         m.funcs.push(g);
         let asm = emit(&m).expect("codegen");
-        assert!(asm.contains("mov rax, qword ptr [rbp+16]"), "{}", asm);
-        assert!(asm.contains("mov rax, qword ptr [rbp+24]"), "{}", asm);
+        // Seit Runde 43 uebernimmt der Registerpfad auch diesen Fall; die
+        // Aufrufkonvention ist in BEIDEN Pfaden dieselbe, deshalb prueft der
+        // Test nur noch sie und nicht mehr den erzeugenden Pfad.
+        assert!(asm.contains("qword ptr [rbp+16]"), "{}", asm);
+        assert!(asm.contains("qword ptr [rbp+24]"), "{}", asm);
         assert!(asm.contains("sub rsp, 16"), "{}", asm);
         assert!(asm.contains("mov qword ptr [rsp+0], rax"), "{}", asm);
         assert!(asm.contains("mov qword ptr [rsp+8], rax"), "{}", asm);
