@@ -1979,3 +1979,52 @@ reservierten Bereich pro Runde, sonst kostet jede Parallelrunde diesen Konflikt.
 **751/751** · `selbst_vergleich` **213 gleich / 0 abweichend / 0 fehlerhaft** ·
 Fixpunkt zeichengleich (**427 401 Zeilen** Assembler, 2 459 904 Oktette) ·
 Pakete 21/21.
+
+## 41. Runden 50, 51, 52, 53 und ihr Merge
+
+Vier parallele Runden auf Basis `cc1710f`, einzeln jeweils konfliktfrei
+gegen `main`, gemeinsam in dieser Reihenfolge gemergt: r51-tempo,
+r53-gcvec, r50-generik, r52-freistehend.
+
+**Stand nach dem Merge (selbst gemessen, nicht aus Worker-Meldungen
+uebernommen):**
+
+| Pruefung | vorher | nachher |
+|---|---|---|
+| `test.sh` | 751/751 | **819/819** |
+| `selbst_vergleich.sh` | 213/0/0 | **225 gleich / 0 abweichend / 0 fehlerhaft** |
+| Fixpunkt | zeichengleich | **zeichengleich, 495.250 Zeilen** |
+| Tokenizer realweb (callgrind) | 957.989.680 | **699.459.494** |
+
+`CODEGEN FEHLT` steht erstmals auf **0** — die alte Luecke „Gleitkomma,
+mehr als sechs Argumente" im Compiler in Firn ist geschlossen.
+
+**Der einzige echte Merge-Konflikt** lag in `codegen_x86.rs`, `Term::Ret`:
+Runde 51 hat das `xor eax, eax` vor dem Ruecksprung einer void-Funktion
+ersatzlos gestrichen (4.229.623 nutzlose Instruktionen im Messlauf), Runde
+52 hatte an derselben Stelle die Bedingung `!f.interrupt` eingezogen, damit
+Unterbrechungsbehandler `rax` nicht anfassen. Aufgeloest zugunsten von
+Runde 51: wo gar nichts mehr geschrieben wird, ist die Ausnahme fuer
+Interrupts gegenstandslos — das ist strikt staerker, nicht schwaecher.
+
+**Der Fund beim Nachpruefen: Runde 52 war unvollstaendig.**
+`tools/freistehend/run.sh` bindet den Kernel gegen `beispiele/kernel/start.s`
+— diese Datei existierte nie. Ursache ist Zeile 2 der `.gitignore`: das
+Muster `*.s` fiel fuer erzeugten Assembler gedacht, verschluckte aber auch
+den handgeschriebenen Boot-Vorspann. Der Worker sah in seinem Worktree eine
+funktionierende Datei und meldete gruen; im Hauptrepo fehlte sie, und die
+Abschnitte 3 und 3b (Binden, QEMU-Boot) schlugen fehl — also genau der
+Nachweis, auf den es in dieser Runde ankommt.
+
+Nachgetragen wurde ein vollstaendiger Vorspann (Multiboot-Kopf,
+Seitentabellen zur Laufzeit gebaut und genullt, 1 GiB identisch mit
+2-MiB-Seiten abgebildet, PAE, EFER.LME, CR0.PG, 64-Bit-GDT, Fernsprung in
+den langen Modus, dann `KERN_START`) plus die Ausnahme
+`!beispiele/kernel/start.s` in der `.gitignore`. Ergebnis:
+**FREISTEHEND 41/41**, der Kernel **bootet in QEMU aus beiden Compilern**
+und gibt seriell aus.
+
+**Lehre (dritte Auspraegung derselben Regel):** eine gruene Worker-Meldung
+beweist nur, dass es im Worktree des Workers lief. Erst Abschnitt 19 im
+Hauptrepo beweist, dass es im Repo liegt. Nach `.gitignore` ist beim Merge
+kuenftig zu sehen, wenn ein Zweig Dateien anlegt, die kein Erzeugnis sind.
