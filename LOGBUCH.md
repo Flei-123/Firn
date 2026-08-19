@@ -1,4 +1,29 @@
 
+## Runde 47 (19.08.2026) — Finalisierer, Arc[T], schwache Verweise; Branch r47-arc
+Die drei seit Runde 4 offenen Posten der Speicherverwaltung erledigt: S4 Finalisierer, Arc[T] mit
+ATOMAREM Zaehler (neues FIR-Primitiv Op::AtomicAdd -> `lock xadd`, in BEIDEN Compilern, FIR
+oktettgleich), S3 schwache Felder werden beim Einsammeln WIRKLICH genullt (bisher wirkten sie nur
+leer, weil die Seriennummer nicht mehr passte). Dazu externe Wurzelbereiche, damit ein Gc[T] im
+Wert eines Arc nicht eingesammelt wird.
+ENTSCHEIDUNG Wiederbelebung: gibt es nicht, und zwar erzwungen — Gc-Felder vor dem Aufruf genullt,
+stark() liefert 0, Allokation/gc_collect/Gc-Schreibzugriff brechen sichtbar ab (71/72/73). Die Sperre
+steckt in der ohnehin vorhandenen S_INIT-Pruefung: der Normalfall kostet nichts.
+MESSMITTEL ZUERST REPARIERT: kein Programm mit `gc class` lief unter valgrind (auch nicht mit der
+Basis) — __gc_stapel_boden las /proc/self/stat Feld 28, und unter valgrind laeuft der Klient auf einem
+anderen Stapel. Jetzt zuerst /proc/self/maps. Damit ist der Sammler erstmals mit callgrind messbar.
+MESSWERTE: laengste Unterbrechung in RECHENZEIT Median 460 us (Basis 469 us, je 7 Laeufe), Durchsatz
+unveraendert, 150-s-Lauf mit 48,4 Mio. Finalisierern RSS konstant 1372 KiB, 0 von 253698
+Unterbrechungen ueber 1 ms (Rechenzeit). Instruktionen +4,6 % ohne schwache Felder, +12,1 % im
+weak-schwersten Fall; der erste Wurf lag bei +21,1 % — vier gemessene Ruecknahmen in der Fegeschleife
+(docs/RUNDE47.md §4.3). Zwei Bloecke statt einem in __gc_alloc_raw kosteten allein 3,3 Mio.
+Instruktionen, weil die Registerzuteilung kippte.
+GELERNT: tests/520 und 535 hielten nach der Vergroesserung der Laufzeit 1 bzw. 126 unerreichbare
+Objekte fest — sie verliessen sich auf die Rahmenlage. Ein Polster IM Sammler (3 KiB in gc_collect)
+reparierte einen Test und kippte drei andere: die Luecke verschwindet nicht, sie wandert. Richtig ist,
+die zeigerhaltenden Rahmen tief zu legen (rekursiv + Polster), wie dom_observer_lebt() es seit
+Runde 4 macht.
+Abnahme: test.sh 725/725, selbst_vergleich 210/0/0, Fixpunkt zeichengleich (374454 Zeilen).
+
 ## Runde 35 (16.08.2026) — comptime in firnc1, Commit 5e16d8a
 Parallel-Experiment: eigenes git-Worktree (Branch r35-comptime), Merge fast-forward, null Konflikte.
 Gebaut: lib/firnc1/zeit.fi (689 Z. Interpreter nach comptime.rs-Vorbild), Parser liest comptime-Bloecke,

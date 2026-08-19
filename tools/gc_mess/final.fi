@@ -24,6 +24,8 @@
 import mess
 
 const BUDGET_MS: i64 = 20000  // GCM_FIN_MS
+const BUDGET_B_MS: i64 = 20000  // GCM_FIN_B_MS
+const STICHPROBE_MS: i64 = 2000  // GCM_FIN_STICH
 const LEBEND: u64 = 4000      // GCM_FIN_LEBEND
 const KETTE: u64 = 6
 const FIN_JEDER: u64 = 4
@@ -65,7 +67,7 @@ fn ld(a: u64) -> u64 {
 // Eine Runde: eine kurze Kette bauen, ringfoermig schliessen, einen schwachen
 // Verweis setzen und sie fallen lassen. Genau der Fall, der den Sammler
 // beschaeftigt (Zyklus + schwacher Verweis + gegebenenfalls Finalisierer).
-fn runde(z: u64, kennung: u64, mit_fin: bool) -> AllocError!bool {
+fn runde(z: u64, kennung: u64, mit_fin: bool, beob: Gc[Knoten]) -> AllocError!bool {
     var erste: Gc[Knoten] = gc_null[Knoten]()
     var vorige: Gc[Knoten] = gc_null[Knoten]()
     var i: u64 = 0
@@ -86,6 +88,12 @@ fn runde(z: u64, kennung: u64, mit_fin: bool) -> AllocError!bool {
     }
     // Ring schliessen — ohne Sammler wuerde das lecken.
     erste.naechster = vorige
+    // Ein LEBENDES Objekt bekommt einen schwachen Verweis auf ein sterbendes:
+    // nur so kostet das Nullen der schwachen Felder ueberhaupt etwas, und nur
+    // so ist die Zusage 'wird beim Einsammeln genullt' hier gemessen.
+    if beob != gc_null[Knoten]() {
+        beob.sicht = weak(vorige)
+    }
     if mit_fin {
         if kennung % FIN_JEDER == 0 {
             if !gc_finalisierer_setzen(vorige as *mut u8, 1 + kennung % 7) {
@@ -128,17 +136,44 @@ fn feld(name: u64, n: i64, wert: u64) {
     mess.mess_nl()
 }
 
-fn phase(z: u64, budget: i64, mit_fin: bool, marke: u64) -> AllocError!u64 {
+fn phase(z: u64, budget: i64, mit_fin: bool, marke: u64, kopf: Gc[Knoten]) -> AllocError!u64 {
     gc_hist_reset()
+    var zeiger: Gc[Knoten] = kopf
     let l0: u64 = gc_collections()
     let t0: u64 = mess.mess_jetzt_ms()
     var zyklen: u64 = 0
     var kennung: u64 = marke
+    var naechste: u64 = 0
     while (mess.mess_jetzt_ms() - t0) as i64 < budget {
+        let t: u64 = mess.mess_jetzt_ms() - t0
+        if t >= naechste {
+            naechste = t + STICHPROBE_MS as u64
+            // S <phase> <t_ms> <rss_kib> <heap_bytes> <lebende> <laeufe> <fin>
+            var sm: [u8; 2] = "S\t"
+            mess.mess_schreib((&sm) as u64, 2)
+            mess.mess_u64(marke)
+            mess.mess_tab()
+            mess.mess_u64(t)
+            mess.mess_tab()
+            mess.mess_u64(mess.mess_rss_kib())
+            mess.mess_tab()
+            mess.mess_u64(gc_heap_bytes())
+            mess.mess_tab()
+            mess.mess_u64(gc_live_objects())
+            mess.mess_tab()
+            mess.mess_u64(gc_collections())
+            mess.mess_tab()
+            mess.mess_u64(gc_fin_laeufe())
+            mess.mess_nl()
+        }
         var j: u64 = 0
         while j < 64 {
-            if !(try runde(z, kennung, mit_fin)) {
+            if !(try runde(z, kennung, mit_fin, zeiger)) {
                 return 0
+            }
+            zeiger = zeiger.naechster
+            if zeiger == gc_null[Knoten]() {
+                zeiger = kopf
             }
             kennung = kennung + 1
             zyklen = zyklen + 1
@@ -177,6 +212,8 @@ fn phase(z: u64, budget: i64, mit_fin: bool, marke: u64) -> AllocError!u64 {
     feld((&nf) as u64, 15, gc_pause_ns_fin_max())
     var ng: [u8; 11] = "verteiler_n"
     feld((&ng) as u64, 11, ld(z))
+    var nh: [u8; 15] = "cpu_stop_max_ns"
+    feld((&nh) as u64, 15, gc_cpu_stop_max())
     // Histogramm der GANZEN Unterbrechung (Typ 7), 16 Faecher.
     var i: u64 = 0
     while i < 16 {
@@ -185,6 +222,8 @@ fn phase(z: u64, budget: i64, mit_fin: bool, marke: u64) -> AllocError!u64 {
         mess.mess_u64(i)
         mess.mess_tab()
         mess.mess_u64(gc_hist(7, i))
+        mess.mess_tab()
+        mess.mess_u64(gc_chist(i))
         mess.mess_nl()
         i = i + 1
     }
@@ -199,6 +238,13 @@ fn main() -> i32 {
     if z == 0 {
         return 91
     }
+    // Messprogramm: die Uhr je einzelnem Finalisierer kostet zwei
+    // Systemaufrufe und ist deshalb standardmaessig aus (gc.fi, S_FINUHR).
+    gc_set_fin_uhr(1)
+    // Zweite Uhr: reine Rechenzeit des Fadens (Runde 44). Auf einer Maschine,
+    // auf der parallel andere Laeufe stehen, ist die Wanduhr sonst nicht
+    // auswertbar — genau der Fehlbefund der Runde 40.
+    gc_set_cpu_uhr(1)
     kopf_zeile()
     return lauf(z) catch 92
 }
@@ -209,10 +255,10 @@ fn lauf(z: u64) -> AllocError!i32 {
     if kopf == gc_null[Knoten]() {
         return 1
     }
-    if (try phase(z, BUDGET_MS, false, 1000)) == 0 {
+    if (try phase(z, BUDGET_MS, false, 1000, kopf)) == 0 {
         return 2
     }
-    if (try phase(z, BUDGET_MS, true, 2000)) == 0 {
+    if (try phase(z, BUDGET_B_MS, true, 2000, kopf)) == 0 {
         return 3
     }
     // Die Lebendmenge muss beide Phasen ueberlebt haben — sonst hat der
