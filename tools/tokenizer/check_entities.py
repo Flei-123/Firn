@@ -65,7 +65,7 @@ def main():
     roh = bytearray()
     for _, _, _, ein, _ in liste:
         b = ein.encode("utf-8", "surrogatepass")
-        # zustand, flaggen, len_lasttag, len_input (siehe PROTOKOLL.md)
+        # state, flags, len_lasttag, len_input (see PROTOKOLL.md)
         roh += struct.pack("<I", 0) + struct.pack("<I", 0) + struct.pack("<I", 0)
         roh += struct.pack("<I", len(b)) + b
     p = subprocess.run([binary], input=bytes(roh), stdout=subprocess.PIPE)
@@ -78,8 +78,8 @@ def main():
     schlecht = []
     for (datei, i, beschr, ein, erwartet), zeile in zip(liste, zeilen):
         try:
-            # Antwortzeile: Tokenstrom TAB Parse-Fehlerliste (PROTOKOLL.md).
-            # Der Pruefstand vergleicht nur den Tokenstrom.
+            # Answer line: token stream TAB list of parse errors (PROTOKOLL.md).
+            # The test bench only compares the token stream.
             ist = normalisiere(json.loads(zeile.split("\t")[0]))
         except ValueError:
             ist = ["<kaputte antwort>"]

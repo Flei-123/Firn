@@ -1,48 +1,48 @@
 #!/usr/bin/env bash
-# Vollstaendige Testsuite fuer firnc0.
+# The complete test suite for firnc0.
 #
-# Ablauf:
-#   1. Compiler bauen (cargo build --release) — Warnungen werden gemeldet.
-#   2. Modul-Tests des Compilers (cargo test --release).
-#   3. Jedes Programm in tests/, tests/opt/ und examples/ wird ZWEIMAL
-#      uebersetzt (--opt-level=release-fast, --no-opt und --opt-level=dev-fast),
-#      assembliert, gelinkt,
-#      AUSGEFUEHRT und Exit-Code bzw. Standardausgabe gegen die Erwartung
-#      in Zeile 1 geprueft (// expect_exit: N  bzw.  // expect_out: TEXT).
-#   4. Jedes Programm in tests/neg/ muss mit Exit-Code != 0 abbrechen und die
-#      erwartete Meldung mit Zeile:Spalte ausgeben (// expect_error: Z:S TEXT).
-#      Ein Rust-Panic gilt als Fehlschlag.
-#   5. Nachweis des Optimierers (test_opt.sh: FIR vorher/nachher).
-#   6. Nachweis der Ergebnisort-Garantie (tools/ergebnisort/run.sh:
-#      Rahmengroessen im erzeugten Assembler).
-#   7. Architekturpruefung: Feldzugriff ist vom Speicherort getrennt
-#      (tools/schichten/run.sh, Vorbedingung fuer SoA).
-#   8. Symbol-Namensschema: reservierter Praefix, Platz fuer die
-#      ABI-Version, Module kollisionsfrei (tools/symbole/run.sh).
-#   8b. Das atomare Primitiv `__atomar_addieren` erzeugt wirklich ein
-#      `lock xadd` — in drei Baustufen und in beiden Compilern, mit
-#      Gegenprobe (tools/atomic/run.sh, Runde 47).
-#   8c. Schnittstellenschranken versenden STATISCH: kein indirekter Aufruf,
-#      keine Methodentafel — Gegenprobe mit `dyn I`, beide Compiler
-#      (tools/bounds/run.sh, Runde 50).
-#   9. HTML5-Tokenizer (lib/html/, in Firn) gegen die offizielle
-#      html5lib-Testsuite: exakte Quote aus 6.810 Faellen, Schranke in
+# Sequence:
+#   1. Build the compiler (cargo build --release) -- warnings are reported.
+#   2. Module tests of the compiler (cargo test --release).
+#   3. Every program in tests/, tests/opt/ and examples/ is compiled TWICE
+#      (--opt-level=release-fast, --no-opt and --opt-level=dev-fast),
+#      assembled, linked,
+#      RUN, and the exit code resp. the standard output is checked against the
+#      expectation in line 1 (// expect_exit: N  resp.  // expect_out: TEXT).
+#   4. Every program in tests/neg/ has to stop with an exit code != 0 and print
+#      the expected message with a line:column (// expect_error: L:C TEXT).
+#      A Rust panic counts as a failure.
+#   5. Proof of the optimiser (test_opt.sh: FIR before/after).
+#   6. Proof of the result-location guarantee (tools/ergebnisort/run.sh:
+#      frame sizes in the emitted assembly).
+#   7. Architecture check: field access is separated from the memory location
+#      (tools/schichten/run.sh, a precondition for SoA).
+#   8. Symbol naming scheme: reserved prefix, room for the
+#      ABI version, modules free of collisions (tools/symbole/run.sh).
+#   8b. The atomic primitive `__atomic_add` really produces a
+#      `lock xadd` -- in three build stages and in both compilers, with a
+#      counter-check (tools/atomic/run.sh, round 47).
+#   8c. Interface bounds dispatch STATICALLY: no indirect call,
+#      no method table -- counter-check with `dyn I`, both compilers
+#      (tools/bounds/run.sh, round 50).
+#   9. HTML5 tokenizer (lib/html/, in Firn) against the official
+#      html5lib test suite: the exact quota out of 6,810 cases, the limit in
 #      tools/tokenizer/mindestquote.txt (tools/tokenizer/run.sh).
-#   9b. HTML-Baumkonstruktion und DOM-Kern (lib/browser/, in Firn) gegen
-#      die eigenen Faelle aus dem WHATWG-Standard, gegen echte Seiten und
-#      im Dauerlauf mit Gegenprobe (tools/html/run.sh, docs/RUNDE54.md).
-#  18. Paket- und Projektsystem (tools/packages/run.sh): Manifest, Such-
-#      reihenfolge, Sichtbarkeit, Bau-Treiber — in BEIDEN Uebersetzern.
-#  19. Freistehendes Uebersetzen (tools/freestanding/run.sh, Runde 52):
-#      `profile kernel`, Inline-Assembler, MMIO, `#[interrupt]` — das
-#      Kernel-Beispiel wird zu einer ELF-Objektdatei OHNE undefinierte
-#      Symbole, in BEIDEN Compilern, und gegen ein Linkerskript gebunden.
-#  10. DOM-Dauerlauf (tools/dom_soak/run.sh): der DOM-Prototyp in Firn baut
-#      fortlaufend echte Zyklen (Eltern/Kind, Listener, JS-Wrapper) und darf
-#      dabei nicht wachsen; die absichtlich leckende Gegenprobe mit
-#      Zaehlverweisen MUSS anschlagen, sonst gilt die Messung als kaputt.
+#   9b. HTML tree construction and the DOM core (lib/browser/, in Firn) against
+#      the own cases from the WHATWG standard, against real pages and
+#      in a soak run with a counter-check (tools/html/run.sh, docs/RUNDE54.md).
+#  18. Package and project system (tools/packages/run.sh): manifest, search
+#      order, visibility, build driver -- in BOTH compilers.
+#  19. Freestanding compilation (tools/freestanding/run.sh, round 52):
+#      `profile kernel`, inline assembly, MMIO, `#[interrupt]` -- the
+#      kernel example becomes an ELF object file WITHOUT undefined
+#      symbols, in BOTH compilers, and is linked against a linker script.
+#  10. DOM soak run (tools/dom_soak/run.sh): the DOM prototype in Firn builds
+#      real cycles continuously (parent/child, listener, JS wrapper) and must
+#      not grow while doing so; the deliberately leaking counter-check with
+#      reference counts MUST strike, otherwise the measurement counts as broken.
 #
-# Kein '|| true', kein Verschlucken von Exit-Codes: set -euo pipefail.
+# No '|| true', no swallowing of exit codes: set -euo pipefail.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -50,8 +50,8 @@ ROOT=$(pwd)
 FIRNC="$ROOT/compiler/target/release/firnc"
 WORK="$ROOT/.test-work"
 
-# Modul-Suchpfad (Runde 39): `import std.*` loest ueber $FIRNLIB nach
-# <repo>/lib auf — egal, aus welchem Verzeichnis ein Testprojekt ruft.
+# Module search path (round 39): `import std.*` resolves over $FIRNLIB to
+# <repo>/lib -- no matter which directory a test project calls from.
 export FIRNLIB="$ROOT/lib"
 
 PASS=0
@@ -165,7 +165,7 @@ for f in tests/neg/*.fi; do
         sed 's/^/        /' "$WORK/neg.out" | head -6
         continue
     fi
-    # Quelltextzeile und Markierung muessen dabei sein
+    # The source line and the marker have to be there
     if ! grep -q '\^' "$WORK/neg.out"; then
         echo
         bad "$f: keine Markierung (^) in der Meldung"
@@ -238,8 +238,8 @@ else
 fi
 
 echo "== 8c. Schranken: statischer Versand ohne indirekten Aufruf (RUNDE 50) =="
-# `fn f[T: I]` ruft die Schnittstellenmethode DIREKT — belegt am erzeugten
-# Assembler und an der FIR, mit `dyn I` als Gegenprobe, in beiden Compilern.
+# `fn f[T: I]` calls the interface method DIRECTLY -- proven on the emitted
+# assembly and on the FIR, with `dyn I` as a counter-check, in both compilers.
 SCHRANKEN_MESSEN=${SCHRANKEN_MESSEN:-0} bash tools/bounds/run.sh > "$WORK/schranken.log" 2>&1 && SKRC=0 || SKRC=$?
 if [ "$SKRC" -eq 0 ]; then
     ok
@@ -260,9 +260,9 @@ else
 fi
 
 echo "== 9b. HTML-Baumkonstruktion + DOM-Kern (tools/html/run.sh) =="
-# Der Baumaufbau in Firn (lib/browser/) gegen die eigenen Faelle aus dem
-# WHATWG-Standard, dazu die echten Seiten aus testdata/realweb/ und der
-# Dauerlauf mit Gegenprobe. Kurzfassung; der volle Lauf steht in
+# The tree building in Firn (lib/browser/) against the own cases from the
+# WHATWG standard, plus the real pages from testdata/realweb/ and the
+# soak run with a counter-check. The short version; the full run is in
 # docs/RUNDE54.md.
 bash tools/html/run.sh --schnell > "$WORK/baum.log" 2>&1 && BMRC=0 || BMRC=$?
 if [ "$BMRC" -eq 0 ]; then
@@ -274,8 +274,8 @@ else
 fi
 
 echo "== 10. DOM-Dauerlauf: Zyklen ohne Leck (tools/dom_soak/run.sh) =="
-# Kurzfassung: 12 s je Variante. Der lange Lauf steht in ABNAHME.md Punkt 2;
-# hier geht es darum, dass die Zusage bei JEDER Aenderung nachgeprueft wird.
+# The short version: 12 s per variant. The long run is in ABNAHME.md item 2;
+# the point here is that the promise is re-checked at EVERY change.
 SOAK_SEK=${SOAK_SEK:-12} SOAK_ZYKLEN=${SOAK_ZYKLEN:-400000} \
   SOAK_STICHPROBE=${SOAK_STICHPROBE:-10000} SOAK_MIN_ZYKLEN=${SOAK_MIN_ZYKLEN:-100000} \
   bash tools/dom_soak/run.sh > "$WORK/dom_soak.log" 2>&1 && DSRC=0 || DSRC=$?
@@ -288,8 +288,8 @@ else
 fi
 
 echo "== 11. Lexer in Firn gegen Lexer in Rust (tools/lex_compare.sh) =="
-# Der erste Teil von Stufe 1: `lib/firnc1/lexer.fi` erzeugt denselben
-# Tokenstrom wie `firnc0 --emit=tokens`, ueber das ganze Quellkorpus.
+# The first part of stage 1: `lib/firnc1/lexer.fi` produces the same
+# token stream as `firnc0 --emit=tokens`, over the whole source corpus.
 bash tools/lex_compare.sh > "$WORK/lex_vergleich.log" 2>&1 && LXRC=0 || LXRC=$?
 if [ "$LXRC" -eq 0 ]; then
     ok
@@ -360,10 +360,10 @@ else
 fi
 
 echo "== 20. Nebenlaeufigkeit: Faeden, Mutex, atomare Primitive (tools/thread/run.sh) =="
-# Runde 49. clone(2)/exit(2), `lock cmpxchg`, Fadenspeicher ueber `fs:0` —
-# in drei Baustufen und BEIDEN Compilern, mit Gegenproben, die anschlagen
-# muessen. Der Dauerlauf (tools/thread/stress.sh) laeuft nicht hier, sondern
-# einzeln: er braucht Minuten.
+# Round 49. clone(2)/exit(2), `lock cmpxchg`, thread storage over `fs:0` --
+# in three build stages and BOTH compilers, with counter-checks that have to
+# strike. The soak run (tools/thread/stress.sh) does not run here but
+# separately: it needs minutes.
 bash tools/thread/run.sh > "$WORK/faden.log" 2>&1 && FDRC=0 || FDRC=$?
 if [ "$FDRC" -eq 0 ]; then
     ok
@@ -374,9 +374,9 @@ else
 fi
 
 echo "== 19. Freistehend: profile kernel, Inline-Asm, MMIO, iretq (tools/freestanding/run.sh) =="
-# Runde 52. Das Kernel-Beispiel wird von BEIDEN Compilern zu einer
-# ELF-Objektdatei uebersetzt, die KEINEN undefinierten Namen hat, keinen
-# syscall enthaelt und sich gegen ein Linkerskript binden laesst.
+# Round 52. The kernel example is compiled by BOTH compilers into an
+# ELF object file that has NO undefined name, contains no
+# syscall and can be linked against a linker script.
 bash tools/freestanding/run.sh > "$WORK/freistehend.log" 2>&1 && FSRC=0 || FSRC=$?
 if [ "$FSRC" -eq 0 ]; then
     ok
@@ -387,9 +387,9 @@ else
 fi
 
 echo "== 18. Paket- und Projektsystem (tools/packages/run.sh) =="
-# Manifest `firn.paket`, Suchreihenfolge, Sichtbarkeit auf Modulebene und der
-# Bau-Treiber `--paket` — jeder Fall durch BEIDE Uebersetzer, Meldungen
-# Oktett fuer Oktett verglichen.
+# The manifest `firn.package`, the search order, visibility at module level and the
+# build driver `--package` -- every case through BOTH compilers, messages
+# compared octet for octet.
 bash tools/packages/run.sh > "$WORK/pakete.log" 2>&1 && PKRC=0 || PKRC=$?
 if [ "$PKRC" -eq 0 ]; then
     ok
@@ -400,9 +400,9 @@ else
 fi
 
 echo "== 21. Englisch-Umstellung: keine deutschen Bezeichner mehr (tools/englisch/pruefe.sh) =="
-# Etappe A (Runde 55): jeder Bezeichner in compiler/src, lib, bin, tools,
-# tests und demos wird gegen die Morphemtabelle gehalten. Ein Treffer heisst,
-# dass ein deutscher Name uebersehen wurde.
+# Stage A (round 55): every identifier in compiler/src, lib, bin, tools,
+# tests and demos is held against the morpheme table. A hit means
+# that a German name was overlooked.
 bash tools/englisch/pruefe.sh > "$WORK/englisch.log" 2>&1 && ENRC=0 || ENRC=$?
 if [ "$ENRC" -eq 0 ]; then
     ok

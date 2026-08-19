@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# tools/sema_compare.sh — der Typpruefer in FIRN gegen den in RUST.
+# tools/sema_compare.sh -- the type checker in FIRN against the one in RUST.
 #
-# MASSSTAB ist `firnc0 --emit=typen`: der kanonische Syntaxbaum mit dem TYP an
-# jedem Ausdruck. `firnc0` sichert zu, dass nach der Pruefung jeder Ausdruck
-# einen konkreten Typ hat — genau diese Zusicherung wird hier verglichen.
+# The YARDSTICK is `firnc0 --emit=typen`: the canonical syntax tree with the TYPE at
+# every expression. `firnc0` promises that after the check every expression
+# has a concrete type -- exactly this promise is compared here.
 #
-# Rueckgabewerte von `.semadump`:
-#   0  Ausgabe erzeugt
-#   1  Fehler
-#   3  keine Kernsprache (enum/match, Fehlerunionen, Generics, gc, Attribute,
-#      comptime, die Intrinsics fuer konstante Laufzeit)
-#   4  eine Konstante braucht Auswertung zur Uebersetzungszeit (comptime.rs)
+# Return values of `.semadump`:
+#   0  output produced
+#   1  error
+#   3  not core language (enum/match, error unions, generics, gc, attributes,
+#      comptime, the intrinsics for constant run time)
+#   4  a constant needs evaluation at compile time (comptime.rs)
 #
-# UEBERSPRUNGEN werden Dateien, die `firnc0` SELBST nicht einzeln pruefen kann
-# — fast alle davon binden ein Modul ein, dessen Namen einzeln unbekannt sind.
+# SKIPPED are files that `firnc0` ITSELF cannot check separately
+# -- almost all of them import a module whose names are unknown on their own.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 # A temp directory of its own per run: two simultaneous runs (e.g. the main
@@ -31,9 +31,9 @@ if [ ! -x "$DUMP" ] || [ -n "$(find bin lib/firnc1 -name '*.fi' -newer "$DUMP" -
     "$FIRNC" bin/semadump.fi -o "$DUMP" || exit 1
 fi
 
-# BEKANNTE ABWEICHUNG: tests/590_f64.fi, das Literal `1e308`. Kein Typfehler,
-# sondern der Gleitkomma-Rundungsfall aus Runde 20 — der Wert steht schon im
-# Token falsch.
+# KNOWN DEVIATION: tests/590_f64.fi, the literal `1e308`. No type error
+# but the floating point rounding case from round 20 -- the value is already
+# wrong in the token.
 BEKANNT="tests/590_f64.fi"
 
 gleich=0
@@ -62,7 +62,7 @@ while IFS= read -r f; do
     fi
     if [ "$rc" -eq 0 ] && cmp -s "$TMPD"/semv_a.txt "$TMPD"/semv_b.txt; then
         gleich=$((gleich+1))
-        # Jede " :" ist ein typisierter Ausdruck.
+        # Every " :" is a typed expression.
         n=$(grep -o ' :' "$TMPD"/semv_a.txt | wc -l)
         ausdruecke=$((ausdruecke + n))
         continue

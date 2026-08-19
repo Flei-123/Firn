@@ -130,7 +130,7 @@ def referenz(data, kontext=None):
     if kontext:
         return serialisiere(p.parseFragment(data, container=kontext))
     dom = p.parse(data)
-    # `dom` ist das Wurzelelement-Dokument von minidom
+    # `dom` is the root element document of minidom
     return serialisiere(dom.ownerDocument or dom)
 
 

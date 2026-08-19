@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# tools/parser_compare.sh — der in FIRN geschriebene Parser gegen den in
-# RUST geschriebenen, ueber das gesamte Quellkorpus.
+# tools/parser_compare.sh -- the parser written in FIRN against the one
+# written in RUST, over the whole source corpus.
 #
-# MASSSTAB ist `firnc0 --emit=ast-kanon`: eine sprachneutrale, geklammerte
-# Form des Syntaxbaums (compiler/src/ast_canon.rs). Zwei unabhaengige Parser
-# erzeugen denselben Text genau dann, wenn sie denselben Baum gebaut haben.
+# The YARDSTICK is `firnc0 --emit=ast-kanon`: a language-neutral, parenthesised
+# form of the syntax tree (compiler/src/ast_canon.rs). Two independent parsers
+# produce the same text exactly when they have built the same tree.
 #
-# Rueckgabewerte von `.astdump`:
-#   0  Ausgabe erzeugt
-#   1  Syntaxfehler
-#   3  die Datei benutzt eine Erweiterung, die der Kernparser nicht kennt
-#      (`enum`/`match`, Fehlerunionen, Generics, `gc class`, Attribute,
-#      `comptime`) — solche Dateien werden GEZAEHLT, nicht uebergangen.
+# Return values of `.astdump`:
+#   0  output produced
+#   1  syntax error
+#   3  the file uses an extension the core parser does not know
+#      (`enum`/`match`, error unions, generics, `gc class`, attributes,
+#      `comptime`) -- such files are COUNTED, not passed over.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 # A temp directory of its own per run: two simultaneous runs (e.g. the main
@@ -30,10 +30,10 @@ if [ ! -x "$DUMP" ] || [ -n "$(find bin lib/firnc1 -name '*.fi' -newer "$DUMP" -
     "$FIRNC" bin/astdump.fi -o "$DUMP" || exit 1
 fi
 
-# BEKANNTE ABWEICHUNG — einzeln benannt:
-#   tests/590_f64.fi  ->  das Literal `1e308`. Das ist KEIN Parserfehler,
-#   sondern der bekannte Gleitkomma-Rundungsfall aus Runde 20
-#   (tools/lex_compare.sh); der Wert steht schon im Token falsch.
+# KNOWN DEVIATION -- named separately:
+#   tests/590_f64.fi  ->  the literal `1e308`. That is NO parser error
+#   but the known floating point rounding case from round 20
+#   (tools/lex_compare.sh); the value is already wrong in the token.
 BEKANNT="tests/590_f64.fi"
 
 gleich=0
@@ -45,7 +45,7 @@ erste=""
 
 while IFS= read -r f; do
     if ! "$FIRNC" --emit=ast-kanon "$f" > "$TMPD"/parv_a.txt 2>/dev/null; then
-        # firnc0 kommt selbst nicht durch (Modulbruchstueck, Negativtest).
+        # firnc0 does not get through itself (module fragment, negative test).
         uebersprungen=$((uebersprungen+1))
         continue
     fi
