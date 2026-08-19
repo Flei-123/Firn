@@ -6,7 +6,7 @@
 # nicht nachruestbar. Deshalb darf aus einem Versatz NUR in `layout.rs` eine
 # Adresse werden.
 #
-# Geprueft wird:
+# What is checked:
 #   1. `Op::PtrAdd` wird ausserhalb von layout.rs nur in der einen
 #      Hilfsfunktion `ptradd_const` gebaut.
 #   2. `ptradd_const` wird ausserhalb von layout.rs nur an Stellen gerufen,
