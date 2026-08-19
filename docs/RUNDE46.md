@@ -1,11 +1,11 @@
-# Runde 46: Schnittstellen — `interface` und dynamischer Versand
+# Round 46: interfaces — `interface` and dynamic dispatch
 
-**Basis: `a492d26` (main nach den Runden 43/44/45).** Zweig `r46-interfaces`.
+**Base: `a492d26` (main after rounds 43/44/45).** Branch `r46-interfaces`.
 
-Runde 45 brachte Methoden — aber ausdrücklich nur als Schreibhilfe: `x.m(a)`
-wurde zu `Typ__m(&x, a)`, entschieden allein vom **statischen** Typ. Diese
-Runde ergänzt den anderen Fall, den `SPEC.md` §6.2 seit v0.1 fordert und den
-`DESIGNZIELE.md` §1 für `Io` voraussetzt: **eine Aufrufstelle, viele Typen.**
+Round 45 brought methods — but explicitly only as a writing aid: `x.m(a)`
+became `Typ__m(&x, a)`, decided solely by the **static** type. This
+round adds the other case, which `SPEC.md` §6.2 has demanded since v0.1 and
+which `DESIGNZIELE.md` §1 presumes for `Io`: **one call site, many types.**
 
 ```firn
 interface Flaeche {
@@ -23,7 +23,7 @@ f.flaeche()          // über die Methodentafel — welcher Code läuft,
 
 ---
 
-## 1. Die Darstellung — verbindlich
+## 1. The representation — binding
 
 ```text
 interface I      -> Struct "dyn I" in types::TypeCtx, 16 Byte:
@@ -35,35 +35,36 @@ impl I for T     -> Methodentafel `.L__iface.I.T` in `.rodata`:
                       .quad T__m2      (Reihenfolge = Reihenfolge in `I`)
 ```
 
-Der interne Structname trägt ein **Leerzeichen** (`"dyn I"`) — dieselbe Bauart
-wie `"gc C"` (gc.rs) und `"methode m"` (impls.rs). Er kann aus keinem
-Bezeichner des Quelltextes entstehen, und `TypeCtx::name_of` gibt ihn
-unverändert aus: in jeder Fehlermeldung steht `dyn I`, so wie man es schreibt.
+The internal struct name carries a **space** (`"dyn I"`) — the same
+construction as `"gc C"` (gc.rs) and `"methode m"` (impls.rs). It cannot
+arise from any identifier of the source text, and `TypeCtx::name_of` prints
+it unchanged: every error message says `dyn I`, exactly as one writes it.
 
-### Warum ein Struct und kein eigener `Type`
+### Why a struct and not a `Type` of its own
 
-Ein `Type::Dyn(..)` hätte **jede** Fallunterscheidung über `Type` angefasst:
-Layout, ABI, Monomorphisierung, Optimierer, Debuginfo, Codegenerator. Als
-Struct ist der Schnittstellenwert ein gewöhnliches 16-Byte-Aggregat:
-`abi::classify` gibt ihm zwei INTEGER-Wörter, er wird kopiert, übergeben,
-zurückgegeben und im Rahmen abgelegt wie jeder andere Struct. Deshalb gilt
-alles, was `tests/820` durchprobiert — Parameter, Rückgabewert, Structfeld,
-Arrayelement, Kopie —, ohne dass dafür eine Zeile geschrieben wurde.
+A `Type::Dyn(..)` would have touched **every** case distinction over `Type`:
+layout, ABI, monomorphization, optimizer, debug info, code generator. As a
+struct the interface value is an ordinary 16-byte aggregate:
+`abi::classify` gives it two INTEGER words, and it is copied, passed,
+returned and placed in the frame like any other struct. That is why
+everything `tests/820` tries out — parameter, return value, struct field,
+array element, copy — holds without a single line having been written for
+it.
 
-Die ganze Sprachänderung sitzt damit in Parser, Typprüfer und **zwei**
-FIR-Instruktionen.
+The entire language change thereby sits in the parser, the type checker and
+**two** FIR instructions.
 
 ---
 
-## 2. Zwei neue FIR-Instruktionen
+## 2. Two new FIR instructions
 
-| Instruktion | Textform | Bedeutung |
+| Instruction | Textual form | Meaning |
 |---|---|---|
-| `Op::CallIndirect { target, args }` | `calli.i64 %7(%3, %4)` | Aufruf über einen Zeiger; sonst gilt alles wie bei `Call` |
-| `Op::VtabAddr { tafel }` | `vtab.ptr @Flaeche.Kreis` | Adresse einer Methodentafel (`.rodata`) |
+| `Op::CallIndirect { target, args }` | `calli.i64 %7(%3, %4)` | call via a pointer; otherwise everything is as with `Call` |
+| `Op::VtabAddr { tafel }` | `vtab.ptr @Flaeche.Kreis` | address of a method table (`.rodata`) |
 
-Beide erzeugen in **beiden** Codewegen von `firnc0` (Grundpfad und
-Registerzuteilung) und in `firnc1` denselben Befehl:
+Both produce the same instruction in **both** code paths of `firnc0` (base
+path and register allocation) and in `firnc1`:
 
 ```asm
     lea rax, [rip + .L__iface.Flaeche.Kreis]
@@ -71,37 +72,38 @@ Registerzuteilung) und in `firnc1` denselben Befehl:
     call rax
 ```
 
-**Warum `rax` und nicht `r11`:** `r11` ist in `regalloc.rs` ein
-Arbeitsregister (`TEMP_REGS`) und kann die **Heimat eines Wertes** sein — ein
-Argument, das gerade dort liegt, wäre beim Laden des Ziels zerstört. `rax` ist
-nie Heimat eines Wertes (Kopf von `regalloc.rs`) und kein Argumentregister;
-deshalb wird das Ziel dorthin und **zuletzt** geladen, nach allen Argumenten.
-Das ist die einzige Stelle dieser Runde, an der eine falsche Entscheidung
-still falschen Code erzeugt hätte.
+**Why `rax` and not `r11`:** `r11` is a working register in `regalloc.rs`
+(`TEMP_REGS`) and can be the **home of a value** — an argument that happens
+to be there would be destroyed when the target is loaded. `rax` is
+never the home of a value (header of `regalloc.rs`) and is not an argument
+register; that is why the target is loaded there and **last**, after all
+arguments. That is the one spot of this round at which a wrong decision
+would silently have produced wrong code.
 
-Der Aufruf selbst läuft durch **denselben** Pfad wie jeder andere Aufruf
-(`lower::lower_call`): Aggregate in Registern, versteckter Rückgabezeiger ab
-9 Byte, Stapelargumente ab dem siebten Wort. Es gibt keinen zweiten
-Aufrufpfad, der auseinanderlaufen könnte.
+The call itself runs through **the same** path as every other call
+(`lower::lower_call`): aggregates in registers, hidden return pointer from
+9 bytes on, stack arguments from the seventh word on. There is no second
+call path that could drift apart.
 
 ---
 
-## 3. Wie ein Schnittstellenwert entsteht
+## 3. How an interface value comes into being
 
-**Ausdrücklich, nie still.** `SPEC.md` §6.2 verlangt die dynamische Auflösung
-„ausdrücklich hingeschrieben", und §4.5 streicht implizite Umwandlungen
-generell. Eine stille Umwandlung an einer Zuweisung, die zusätzlich eine
-Methodentafel anhängt, wäre die schlechteste Stelle, damit anzufangen.
+**Explicitly, never silently.** `SPEC.md` §6.2 demands that dynamic
+resolution be „written down explicitly", and §4.5 abolishes implicit
+conversions in general. A silent conversion at an assignment that
+additionally attaches a method table would be the worst place to start
+with it.
 
 ```firn
 let f: dyn Flaeche = (&r) as dyn Flaeche
 ```
 
-Die Klammern um `&r` sind Pflicht — `as` bindet stärker als die unären
-Operatoren (`SPEC.md` §14.1 Punkt 12). Für einen Wert, der schon ein Zeiger
-ist (`Gc[K]`, `*mut T`), entfallen sie.
+The parentheses around `&r` are mandatory — `as` binds more tightly than
+the unary operators (`SPEC.md` §14.1 item 12). For a value that already is
+a pointer (`Gc[K]`, `*mut T`) they are unnecessary.
 
-Im Lowering sind das genau zwei Wörter:
+In the lowering that is exactly two words:
 
 ```text
 store.ptr %zeiger, [%ziel + 0]
@@ -109,12 +111,12 @@ store.ptr %zeiger, [%ziel + 0]
 store.ptr %t,     [%ziel + 8]
 ```
 
-Der Datenzeiger wird **nicht verändert** — kein Versatz, keine Verschleierung.
-Das ist die Voraussetzung für Abschnitt 5.
+The data pointer is **not modified** — no offset, no obfuscation.
+That is the precondition for section 5.
 
 ---
 
-## 4. Der Aufruf
+## 4. The call
 
 ```text
 %b = <adresse des schnittstellenwertes>
@@ -124,105 +126,106 @@ Das ist die Voraussetzung für Abschnitt 5.
 %r = calli.i64 %z(%d, …)
 ```
 
-Drei Ladebefehle und ein indirekter Sprung je Aufruf. Der Preis steht damit
-sichtbar im Quelltext des Compilers und in der FIR — `SPEC.md` §1, Leitsatz 1
-(„nichts versteckt") und Leitsatz 4 („wer nicht bestellt, zahlt nicht"): ein
-Programm ohne `interface` bekommt keine einzige dieser Instruktionen und keine
-`.rodata`-Tafel.
+Three loads and one indirect jump per call. The price is thereby visibly
+present in the source text of the compiler and in the FIR — `SPEC.md` §1,
+principle 1 („nothing hidden") and principle 4 („whoever does not order
+does not pay"): a program without `interface` gets not a single one of
+these instructions and no `.rodata` table.
 
-### Gemessen (callgrind, `--tool=callgrind`, 2.000.000 Aufrufe in einer Schleife)
+### Measured (callgrind, `--tool=callgrind`, 2.000.000 calls in a loop)
 
-| | Instruktionen gesamt | je Durchlauf |
+| | instructions total | per iteration |
 |---|---|---|
-| statischer Aufruf, mit Optimierer | 10.000.017 | **5** |
-| dynamischer Aufruf, mit Optimierer | 52.000.037 | **26** |
-| statischer Aufruf, `--no-opt` | 150.000.066 | **75** |
-| dynamischer Aufruf, `--no-opt` | 182.000.082 | **91** |
+| static call, with optimizer | 10.000.017 | **5** |
+| dynamic call, with optimizer | 52.000.037 | **26** |
+| static call, `--no-opt` | 150.000.066 | **75** |
+| dynamic call, `--no-opt` | 182.000.082 | **91** |
 
-Ehrlich gelesen: der **reine** Versand kostet 16 Instruktionen (`--no-opt`,
-beide Seiten ohne Inlining). Mit Optimierer klafft die Lücke weiter auf — 5
-gegen 26 —, und zwar **nicht**, weil der Versand teurer würde, sondern weil
-der statische Aufruf ganz verschwindet: `inline.rs` setzt ihn ein, der Rest
-fällt der Konstantenfaltung zum Opfer. Genau das ist der Grund, warum `dyn`
-in dieser Sprache ausdrücklich hingeschrieben wird und nicht die Voreinstellung
-ist.
+Read honestly: the **pure** dispatch costs 16 instructions (`--no-opt`,
+both sides without inlining). With the optimizer the gap opens further — 5
+against 26 — and **not** because the dispatch gets more expensive, but
+because the static call disappears entirely: `inline.rs` inlines it, and
+the rest falls victim to constant folding. That is exactly the reason why
+`dyn` is written down explicitly in this language and is not the default.
 
 ---
 
-## 5. Der Sammler und der fette Zeiger
+## 5. The collector and the fat pointer
 
-Der Datenzeiger ist ein gewöhnlicher Zeiger auf den **Anfang** des Wertes.
-Ein `dyn I` liegt im Rahmen oder in einem callee-saved Register; beides
-durchsucht der Sammler konservativ (`SPEC.md` §3.5.3), und vor einem
-Sammellauf rettet `Op::GcAddr { regs: true }` die Register in den
-Zustandsblock. Damit hält ein Schnittstellenwert sein Objekt am Leben, auch
-wenn es sonst keine Wurzel mehr gibt.
+The data pointer is an ordinary pointer to the **start** of the value.
+A `dyn I` lies in the frame or in a callee-saved register; the collector
+scans both conservatively (`SPEC.md` §3.5.3), and before a collection
+`Op::GcAddr { regs: true }` saves the registers into the state block.
+With that an interface value keeps its object alive, even if there is no
+other root left.
 
-`tests/822_iface_gc_core.fi` weist das nach, ohne sich auf Zufall zu
-verlassen:
+`tests/822_iface_gc_core.fi` demonstrates that without relying on
+chance:
 
-* 64 `gc class`-Zellen werden erzeugt und **ausschließlich** als `dyn Zaehler`
-  in einem Array im Rahmen abgelegt,
-* danach entstehen 20.000 unerreichbare Zellen (`muell`), die Laufzeit sammelt
-  dabei von selbst,
-* nach zwei ausdrücklichen `gc_collect()` leben **höchstens 200** Objekte —
-  die 20.000 sind also wirklich gefegt —, und die 64 Werte sind unverändert,
-* danach wird über die Schnittstelle geschrieben (`dazu`) und wieder gelesen.
+* 64 `gc class` cells are created and stored **exclusively** as
+  `dyn Zaehler` in an array in the frame,
+* afterwards 20.000 unreachable cells (`muell`) come into being, and the
+  runtime collects on its own while that happens,
+* after two explicit `gc_collect()` calls **at most 200** objects are alive
+  — so the 20.000 have really been swept — and the 64 values are unchanged,
+* after that a write goes through the interface (`dazu`) and is read back.
 
-Wären die fetten Zeiger keine Wurzeln, wären die 64 Zellen mitgefegt und ihr
-Speicher an den Abfall vergeben worden; die Summe danach wäre Müll. Der Test
-läuft in allen drei Übersetzungsarten (`release-fast`, `--no-opt`,
-`dev-fast`) und unter `firnc1`.
+If the fat pointers were not roots, the 64 cells would have been swept
+along and their memory handed out to the garbage; the sum afterwards would
+be junk. The test runs in all three compilation modes (`release-fast`,
+`--no-opt`, `dev-fast`) and under `firnc1`.
 
-**Die eine Stelle, an der das nicht trägt, ist der Heap:** dort verfolgt der
-Sammler PRÄZISE anhand des Feldlayouts und kennt den Datenzeiger in einem
-`dyn I`-Feld nicht. Ein `dyn I` als Feld einer `gc class` ist deshalb ein
-Fehler — und zwar an der Stelle, an der die Regel schon lebt: `gc.rs` lässt in
-einer Klasse ohnehin nur Ganzzahlen, `bool`, Zeiger, `Gc[T]`, `GcWeak[T]` und
-Arrays davon zu, also auch keinen Struct und damit auch kein `dyn I`
-(`tests/neg/iface_dyn_in_gc_class.fi` hält das fest). Eine zweite Prüfung
-daneben wäre eine zweite Wahrheit gewesen.
+**The one place where this does not carry is the heap:** there the
+collector traces PRECISELY from the field layout and does not know the data
+pointer in a `dyn I` field. A `dyn I` as a field of a `gc class` is
+therefore an error — and it is one at the spot where the rule already
+lives: `gc.rs` permits only integers, `bool`, pointers, `Gc[T]`,
+`GcWeak[T]` and arrays of those in a class anyway, so no struct either and
+therefore no `dyn I`
+(`tests/neg/iface_dyn_in_gc_class.fi` records that). A second check next to
+it would have been a second truth.
 
 ### `impl I for <gc class>`
 
-Damit der Nachweis oben überhaupt möglich ist, darf eine `gc class` eine
-Schnittstelle umsetzen. Der Empfänger `*self` ist dann `Gc[K]` — ein
-`gc class`-Wert existiert nur auf dem Heap, ein Zeiger darauf ist der einzige
-Weg, ihn anzufassen (`SPEC.md` §3.5.1). Technisch trägt der Empfänger dafür
-den internen Structnamen `"gc K"`; `self` als **Kopie** ist für eine Klasse ein
-Fehler mit klarer Ansage.
+For the proof above to be possible at all, a `gc class` may implement an
+interface. The receiver `*self` is then `Gc[K]` — a
+`gc class` value only exists on the heap, and a pointer to it is the only
+way to touch it (`SPEC.md` §3.5.1). Technically the receiver carries the
+internal struct name `"gc K"` for that; `self` as a **copy** is an error
+with a clear statement for a class.
 
-**Einschränkung, offen benannt:** ob `K` eine Klasse ist, steht in der
-Registrierung von `gc.rs`, und die wird beim **Parsen** gefüllt. `gc class K`
-muss deshalb vor dem `impl`-Block stehen (in derselben Datei oder in einer
-früher eingelesenen). Steht es dahinter, meldet der Typprüfer „'K' ist eine
-gc-klasse und kann kein wert sein" — verständlich, aber nicht die Meldung, die
-man sich wünscht. Beide Compiler verhalten sich hier gleich, weil beide
-dieselbe Registrierung zum selben Zeitpunkt lesen.
+**Restriction, openly named:** whether `K` is a class is recorded in the
+registration of `gc.rs`, and that is filled during **parsing**.
+`gc class K` therefore has to stand before the `impl` block (in the same
+file or in one read in earlier). If it stands after it, the type checker
+reports „'K' ist eine gc-klasse und kann kein wert sein" — understandable,
+but not the message one would wish for. Both compilers behave the same way
+here, because both read the same registration at the same point in time.
 
 ---
 
-## 6. Was geprüft wird — und wo
+## 6. What is checked — and where
 
-| Prüfung | Stelle | Negativtest |
+| Check | Place | Negative test |
 |---|---|---|
-| alle Methoden der Schnittstelle vorhanden | `iface::pruefe_umsetzung` | `iface_method_missing.fi` |
-| Rückgabetyp passt | dieselbe | `iface_signature_ret.fi` |
-| Parametertyp passt | dieselbe | `iface_signature_parameter.fi` |
-| Parameterzahl passt (ohne Empfänger gezählt) | dieselbe | `iface_parameterzahl.fi` |
-| Empfänger ist ein Zeiger auf genau diesen Typ | dieselbe | — |
-| keine zwei `impl I for T` | dieselbe | `iface_duplicate_impl.fi` |
-| die Schnittstelle gibt es | dieselbe | `iface_unknown.fi` |
-| `dyn I` mit unbekanntem `I` | `iface::hook_resolve_ty` | `iface_dyn_unknown.fi` |
-| Empfänger einer Schnittstellenmethode ist `*self`/`*mut self` | Parser | `iface_receiver_value.fi` |
-| Schnittstellenmethode hat keinen Rumpf | Parser | `iface_body.fi` |
-| nur Methoden der Schnittstelle sind über `dyn` erreichbar | `iface::hook_methode` | `iface_no_method.fi` |
-| Umwandlung nur aus einem Zeiger auf einen Struct | `iface::hook_cast` | `iface_no_ptr.fi` |
-| der Typ setzt die Schnittstelle wirklich um | dieselbe | `iface_does_not_impl.fi` |
-| `*dyn I` ist kein Schnittstellenwert | `iface::hook_methode` | `iface_ptr_receiver.fi` |
-| `dyn I` nicht im GC-Heap | `gc.rs` (Feldtypen einer Klasse) | `iface_dyn_in_gc_class.fi` |
+| all methods of the interface present | `iface::pruefe_umsetzung` | `iface_method_missing.fi` |
+| return type matches | the same | `iface_signature_ret.fi` |
+| parameter type matches | the same | `iface_signature_parameter.fi` |
+| parameter count matches (counted without the receiver) | the same | `iface_parameterzahl.fi` |
+| receiver is a pointer to exactly this type | the same | — |
+| no two `impl I for T` | the same | `iface_duplicate_impl.fi` |
+| the interface exists | the same | `iface_unknown.fi` |
+| `dyn I` with an unknown `I` | `iface::hook_resolve_ty` | `iface_dyn_unknown.fi` |
+| receiver of an interface method is `*self`/`*mut self` | parser | `iface_receiver_value.fi` |
+| interface method has no body | parser | `iface_body.fi` |
+| only methods of the interface are reachable via `dyn` | `iface::hook_methode` | `iface_no_method.fi` |
+| conversion only from a pointer to a struct | `iface::hook_cast` | `iface_no_ptr.fi` |
+| the type really implements the interface | the same | `iface_does_not_impl.fi` |
+| `*dyn I` is not an interface value | `iface::hook_methode` | `iface_ptr_receiver.fi` |
+| `dyn I` not in the GC heap | `gc.rs` (field types of a class) | `iface_dyn_in_gc_class.fi` |
 
-Jede Meldung nennt Zeile, Spalte und im Hinweis die **erwartete Signatur**:
+Every message names the line, the column and, in the hint, the **expected
+signature**:
 
 ```
 error: 'Kreis' setzt die methode 'Flaeche.skaliere' nicht um
@@ -230,179 +233,185 @@ error: 'Kreis' setzt die methode 'Flaeche.skaliere' nicht um
    = hinweis: erwartet wird 'fn skaliere(*mut self, i64)' im block
 ```
 
-Alle 14 Negativtests werden auch von `firnc1` abgelehnt. Bei
-`iface_dyn_unknown.fi` endet `firnc1` mit 5 („das Lowering gibt auf") statt
-mit 1 — das ist **nicht** neu und nicht schnittstellenspezifisch: ein
-unbekannter Typname liefert in `firnc1` seit jeher einen Fehlertyp ohne eigene
-Meldung (`let x: Unbekannt = 1` verhält sich genauso).
+All 14 negative tests are rejected by `firnc1` as well. With
+`iface_dyn_unknown.fi`, `firnc1` ends with 5 („the lowering gives up")
+instead of 1 — that is **not** new and not interface-specific: an
+unknown type name has always yielded an error type without a message of its
+own in `firnc1` (`let x: Unbekannt = 1` behaves exactly the same).
 
 ---
 
-## 7. Namensauflösung
+## 7. Name resolution
 
-Methoden einer Schnittstelle sind **gewöhnliche Funktionen**: `impl I for T`
-legt genau dieselben `T__m` an wie `impl T` aus Runde 45. Die Schnittstelle
-sagt nur zusätzlich, was darin stehen **muss**. Daraus folgt:
+Methods of an interface are **ordinary functions**: `impl I for T`
+creates exactly the same `T__m` as `impl T` from round 45. The interface
+only additionally says what **must** be in there. It follows that:
 
-* Der statische Aufruf bleibt möglich (`r.flaeche()`), und er ist derselbe
-  Code, den die Tafel nennt.
-* Ein zweiter, schnittstellenloser `impl`-Block für denselben Typ ist erlaubt.
-* Eine freie Funktion darf weiter genauso heißen (`tests/820`: `flaeche(a, b)`
-  neben `Rechteck.flaeche()`).
+* The static call remains possible (`r.flaeche()`), and it is the same
+  code that the table names.
+* A second `impl` block without an interface for the same type is allowed.
+* A free function may still have the same name (`tests/820`:
+  `flaeche(a, b)` next to `Rechteck.flaeche()`).
 
-**Über `dyn` ist nur erreichbar, was in der Schnittstelle steht** — auch dann,
-wenn der konkrete Typ mehr kann. Sonst wäre die Tafel nicht die ganze
-Wahrheit.
+**Via `dyn` only what stands in the interface is reachable** — even when
+the concrete type can do more. Otherwise the table would not be the whole
+truth.
 
-### Module
+### Modules
 
-`interface`-Namen gelten **programmweit** und werden nicht umbenannt — wie
-Aufzählungen und `gc class` (`SPEC.md` §14.1 T6). Ein `impl Groesse for Kreis`
-in einem Modul erzeugt dagegen `zeichnen__Kreis__groesse`, und genau dieser
-Name muss in der Tafel stehen.
+`interface` names are valid **program-wide** and are not renamed — like
+enums and `gc class` (`SPEC.md` §14.1 T6). An `impl Groesse for Kreis`
+in a module, by contrast, produces `zeichnen__Kreis__groesse`, and exactly
+that name has to stand in the table.
 
-Der Typname in der Registrierung steht so da, wie er im Quelltext geschrieben
-wurde — `firnc0` benennt **nach** dem Parsen um (`modules.rs`), `firnc1`
-**während** des Parsens (`parser.fi`), und keiner von beiden fasst die
-Registrierung an. Beide Compiler suchen den Struct deshalb in derselben
-Reihenfolge (`iface.rs::typ_struct`, `iface.fi::typ_struct`):
+The type name in the registration stands there as it was written in the
+source text — `firnc0` renames **after** parsing (`modules.rs`), `firnc1`
+**during** parsing (`parser.fi`), and neither of them touches the
+registration. Both compilers therefore look for the struct in the same
+order (`iface.rs::typ_struct`, `iface.fi::typ_struct`):
 
-1. der Name selbst,
+1. the name itself,
 2. `gc <Name>`,
-3. genau **ein** Struct, dessen Name auf `__<Name>` endet (der Fall „Typ in
-   einem Modul"). Mehrere Treffer sind ein Fehler — raten wäre die
-   gefährlichere Wahl.
+3. exactly **one** struct whose name ends in `__<Name>` (the case „type in
+   a module"). Several hits are an error — guessing would be the
+   more dangerous choice.
 
-`tests/821_iface_module_core.fi` fährt beides gleichzeitig: zwei Umsetzungen im
-Modul, eine in der Wurzeldatei, alle über dieselbe Schnittstelle.
+`tests/821_iface_module_core.fi` drives both at the same time: two
+implementations in the module, one in the root file, all over the same
+interface.
 
 ---
 
-## 8. Was in beiden Compilern geändert wurde
+## 8. What was changed in both compilers
 
-| `firnc0` (Rust) | Zeilen | was |
+| `firnc0` (Rust) | Lines | what |
 |---|---|---|
-| `compiler/src/iface.rs` | **+1010 neu** | alles Eigene: Registrierung, Parser, Prüfungen, Auflösung, Lowering-Bausteine, `.rodata`-Tafeln |
-| `compiler/src/impls.rs` | +100/−28 | `impl I for T`, Methodenpräfix ohne `"gc "`, Empfänger einer Klasse |
-| `compiler/src/fir.rs` | +29 | `CallIndirect`, `VtabAddr`, Textform |
-| `compiler/src/regalloc.rs` | +55/−2 | beide Instruktionen, Aufrufsperren erweitert |
-| `compiler/src/codegen_x86.rs` | +47 | dieselben Instruktionen im Grundpfad, Tafeln |
-| `compiler/src/lower.rs` | +59/−3 | Versand im gewöhnlichen Aufrufpfad, `as dyn I` |
-| `compiler/src/sema.rs`, `parser.rs`, `mem2reg.rs`, `inline.rs`, `main.rs` | +46 | Haken |
+| `compiler/src/iface.rs` | **+1010 new** | everything specific: registration, parser, checks, resolution, lowering building blocks, `.rodata` tables |
+| `compiler/src/impls.rs` | +100/−28 | `impl I for T`, method prefix without `"gc "`, receiver of a class |
+| `compiler/src/fir.rs` | +29 | `CallIndirect`, `VtabAddr`, textual form |
+| `compiler/src/regalloc.rs` | +55/−2 | both instructions, call barriers extended |
+| `compiler/src/codegen_x86.rs` | +47 | the same instructions in the base path, tables |
+| `compiler/src/lower.rs` | +59/−3 | dispatch in the ordinary call path, `as dyn I` |
+| `compiler/src/sema.rs`, `parser.rs`, `mem2reg.rs`, `inline.rs`, `main.rs` | +46 | hooks |
 
-| `firnc1` (Firn) | Zeilen | was |
+| `firnc1` (Firn) | Lines | what |
 |---|---|---|
-| `lib/firnc1/iface.fi` | **+558 neu** | dieselbe Registrierung, dieselbe Namensarithmetik |
-| `lib/firnc1/parser.fi` | +299/−13 | `interface`, `impl … for …`, `dyn I`, Vorabsuche |
-| `lib/firnc1/codegen.fi` | +168/−1 | `O_CALLI`, `O_VTAB`, Methodentafeln |
-| `lib/firnc1/lower.fi` | +143/−7 | Versand, `as dyn I` |
-| `lib/firnc1/sema.fi` | +126/−1 | Anmeldung, Prüfung, Aufruf, Umwandlung |
-| `lib/firnc1/fir.fi` | +29 | dieselben zwei Instruktionen, gleiche Textform |
-| `bin/firnc1.fi`, `bin/semadump.fi`, `bin/firdump.fi` | +21 | Registrierung durchreichen |
+| `lib/firnc1/iface.fi` | **+558 new** | the same registration, the same name arithmetic |
+| `lib/firnc1/parser.fi` | +299/−13 | `interface`, `impl … for …`, `dyn I`, pre-scan |
+| `lib/firnc1/codegen.fi` | +168/−1 | `O_CALLI`, `O_VTAB`, method tables |
+| `lib/firnc1/lower.fi` | +143/−7 | dispatch, `as dyn I` |
+| `lib/firnc1/sema.fi` | +126/−1 | registration, check, call, conversion |
+| `lib/firnc1/fir.fi` | +29 | the same two instructions, the same textual form |
+| `bin/firnc1.fi`, `bin/semadump.fi`, `bin/firdump.fi` | +21 | pass the registration through |
 
-`bin/astdump.fi` und `bin/layoutdump.fi` bekommen die Registrierung
-**bewusst nicht**: ihr Maßstab (`ast_canon.rs`, `layout_canon.rs`) kennt nur
-die Wurzeldatei, dort ist `dyn I` — wie `Gc[C]` und `E!T` — ein unbekannter
-Name und wird zu `?`. Beide Seiten tun dasselbe, und der Vergleich bleibt
-exakt.
-
----
-
-## 9. Bewusst weggelassen
-
-* **Vorgabemethoden** (`fn m(*self) -> i64 { … }` in der Schnittstelle). Sie
-  bräuchten eine Funktion ohne Typ dahinter und eine Regel, welcher Name sie
-  trägt. Heute ein Fehler mit klarer Ansage statt eines Syntaxfehlers.
-* **Statische Auflösung über Schnittstellen** (`fn f[T: Flaeche](x: T)`,
-  `SPEC.md` §6.2, erster Halbsatz). Das ist die Monomorphisierungsseite und
-  gehört zu den Anforderungen an Typparameter (§14.1 T7) — eine eigene Runde.
-* **Schnittstellen als Anforderung an eine generische Vorlage**, aus demselben
-  Grund.
-* **Vererbung zwischen Schnittstellen** (`interface A: B`).
-* **`dyn I` im GC-Heap** — siehe Abschnitt 5, das ist eine Zusage, keine
-  Lücke.
-* **Umgekehrte Prüfung** (`x.as?[T]` von `dyn I` auf den konkreten Typ). Dafür
-  müsste die Tafel eine Typkennung tragen; heute enthält sie nur
-  Methodenzeiger. Der Platz dafür ist da (ein Wort vor der Tafel), die
-  Entscheidung ist vertagt.
-* **`#[no_gc]` und Schnittstellen.** Ein Aufruf über `dyn` ist in einer
-  `#[no_gc]`-Funktion abgelehnt — dieselbe Regel wie für Methoden in Runde 45,
-  und hier sogar zwingend: welche Funktion läuft, weiß der Prüfer nicht.
-* **Tafeln nur für benutzte Umsetzungen.** Erzeugt wird eine Tafel je
-  vollständiger Umsetzung, auch wenn kein `as dyn` sie je anfasst. Der Inhalt
-  hängt allein an der Deklaration; eine Tafel, die nur manchmal entsteht, wäre
-  die Sorte Zustand, die man beim Fehlersuchen nicht sehen will.
+`bin/astdump.fi` and `bin/layoutdump.fi` **deliberately** do not get the
+registration: their yardstick (`ast_canon.rs`, `layout_canon.rs`) knows
+only the root file, and there `dyn I` — like `Gc[C]` and `E!T` — is an
+unknown name and becomes `?`. Both sides do the same thing, and the
+comparison stays exact.
 
 ---
 
-## 10. Verworfene Ansätze
+## 9. Deliberately left out
 
-**Ein eigener `Type::Dyn`.** Erster Entwurf, nach dem Durchzählen der
-Fallunterscheidungen verworfen: `types.rs`, `abi.rs`, `layout.rs`, `mono.rs`,
-`sema.rs`, `lower.rs` und `codegen_x86.rs` hätten je einen neuen Zweig
-gebraucht, und `firnc1` dieselben noch einmal. Der Struct mit dem
-Leerzeichen-Namen kostet null davon.
-
-**Stille Umwandlung an Zuweisung und Argument.** Bequemer, aber gegen
-`SPEC.md` §4.5 und §6.2 — und sie hätte die Frage aufgeworfen, welche der
-möglichen Schnittstellen gemeint ist, sobald ein Typ mehrere umsetzt.
-
-**Der Empfänger als eigene Typform** (`TypeExpr::Named("impl T")`), um `impl`
-für `gc class` ohne Reihenfolgeregel zu ermöglichen. Verworfen, weil
-`modules.rs` diesen Namen nicht mitbenennt: ein Modultyp wäre danach
-unauffindbar gewesen — die Modulunterstützung aus Runde 45 wäre für einen
-Randfall zerbrochen.
-
-**`r11` als Sprungregister.** Naheliegend (caller-saved, kein Argumentregister)
-und falsch: `regalloc.rs` vergibt `r11` als Heimat eines Wertes. Gefunden beim
-Lesen von `TEMP_REGS`, nicht durch einen Testfehler — deshalb steht die
-Begründung jetzt an beiden Codestellen.
-
-**Eine Seitentabelle zwischen Typprüfer und Lowering.** Wie in Runde 45 nicht
-gebaut: Empfängertyp und Methodenname stehen in beiden Phasen zur Verfügung,
-die Ableitung ist reine Namensarithmetik. Eine Tabelle müsste `firnc1`
-mitschleppen, ohne etwas zu können, was der Typ nicht schon sagt.
+* **Default methods** (`fn m(*self) -> i64 { … }` in the interface). They
+  would need a function without a type behind it and a rule for what name
+  it carries. Today an error with a clear statement instead of a syntax
+  error.
+* **Static resolution over interfaces** (`fn f[T: Flaeche](x: T)`,
+  `SPEC.md` §6.2, first half-sentence). That is the monomorphization side
+  and belongs to the requirements on type parameters (§14.1 T7) — a round
+  of its own.
+* **Interfaces as a requirement on a generic template**, for the same
+  reason.
+* **Inheritance between interfaces** (`interface A: B`).
+* **`dyn I` in the GC heap** — see section 5, that is a promise, not a
+  gap.
+* **The reverse check** (`x.as?[T]` from `dyn I` to the concrete type). For
+  that the table would have to carry a type tag; today it contains only
+  method pointers. The room for it is there (one word before the table),
+  the decision is postponed.
+* **`#[no_gc]` and interfaces.** A call via `dyn` is rejected in a
+  `#[no_gc]` function — the same rule as for methods in round 45,
+  and here even compulsory: the checker does not know which function runs.
+* **Tables only for used implementations.** One table is generated per
+  complete implementation, even if no `as dyn` ever touches it. The content
+  depends solely on the declaration; a table that comes into being only
+  sometimes would be the sort of state one does not want to see while
+  debugging.
 
 ---
 
-## 11. Abnahme
+## 10. Rejected approaches
 
-Gemessen auf `r46-interfaces` mit frisch gebautem `firnc0` und frisch
-gebauten Hilfsbinärdateien (`.firnc1`, `.astdump`, `.semadump`, `.firdump`,
+**A `Type::Dyn` of its own.** First draft, rejected after counting the
+case distinctions: `types.rs`, `abi.rs`, `layout.rs`, `mono.rs`,
+`sema.rs`, `lower.rs` and `codegen_x86.rs` would each have needed a new
+branch, and `firnc1` the same ones again. The struct with the
+space in its name costs none of them.
+
+**Silent conversion at assignment and argument.** More comfortable, but
+against `SPEC.md` §4.5 and §6.2 — and it would have raised the question of
+which of the possible interfaces is meant as soon as a type implements
+several.
+
+**The receiver as a type form of its own** (`TypeExpr::Named("impl T")`),
+to make `impl` for `gc class` possible without an ordering rule. Rejected
+because `modules.rs` does not rename this name along: a module type would
+have been unfindable afterwards — the module support from round 45 would
+have broken for a corner case.
+
+**`r11` as the jump register.** Obvious (caller-saved, not an argument
+register) and wrong: `regalloc.rs` hands out `r11` as the home of a value.
+Found while reading `TEMP_REGS`, not through a test failure — that is why
+the justification now stands at both places in the code.
+
+**A side table between the type checker and the lowering.** Not built, as
+in round 45: the receiver type and the method name are available in both
+phases, and the derivation is pure name arithmetic. A table would have to
+be carried along by `firnc1` without being able to do anything the type
+does not already say.
+
+---
+
+## 11. Acceptance
+
+Measured on `r46-interfaces` with a freshly built `firnc0` and freshly
+built helper binaries (`.firnc1`, `.astdump`, `.semadump`, `.firdump`,
 `.layoutdump`).
 
-| Prüfung | Basis `a492d26` | jetzt |
+| Check | Base `a492d26` | now |
 |---|---|---|
 | `bash ./test.sh` | 696/696 | **719/719** |
-| `tools/self_compare.sh` | 201 / 0 / 0 | **204 gleich / 0 abweichend / 0 fehlerhaft** |
-| `tools/fixpoint.sh` | zeichengleich | **Stufe 2 == Stufe 3, zeichengleich (344.864 Zeilen Assembler)** |
-| Parser (`parser_compare.sh`) | 240 gleich, 1 bekannt | 254 gleich, 1 bekannt |
-| Layout/ABI (`types_compare.sh`) | 190 gleich, 0 ungleich | 204 gleich, 0 ungleich |
-| Typprüfer (`sema_compare.sh`) | 147 gleich, 1 bekannt | 148 gleich, 1 bekannt |
-| Lowering (`fir_compare.sh`) | 146 gleich, 1 bekannt | 147 gleich, 1 bekannt |
+| `tools/self_compare.sh` | 201 / 0 / 0 | **204 identical / 0 differing / 0 failing** |
+| `tools/fixpoint.sh` | character-identical | **stage 2 == stage 3, character-identical (344.864 lines of assembly)** |
+| parser (`parser_compare.sh`) | 240 identical, 1 known | 254 identical, 1 known |
+| layout/ABI (`types_compare.sh`) | 190 identical, 0 different | 204 identical, 0 different |
+| type checker (`sema_compare.sh`) | 147 identical, 1 known | 148 identical, 1 known |
+| lowering (`fir_compare.sh`) | 146 identical, 1 known | 147 identical, 1 known |
 
-Die eine bekannte Abweichung ist unverändert `tests/590_f64.fi` (Literal
-`1e308`, Rundungsfall aus Runde 20 — kein Parserfehler).
+The one known deviation is unchanged `tests/590_f64.fi` (literal
+`1e308`, rounding case from round 20 — not a parser bug).
 
-**Wie gemessen.** Die Basiswerte stammen aus einem eigenen Auszug von
-`a492d26` (`git archive`, frisch gebaut, `bash ./test.sh` -> `PASS 696/696`),
-die vier Vergleichszahlen auf beiden Seiten aus einem EINZELN gestarteten
-Lauf des jeweiligen Skripts. Innerhalb von `test.sh` zählen `parser_` und
-`typen_vergleich` je neun Dateien mehr (Zwischenstände, die die früheren
-Schritte im Baum ablegen); das gilt für beide Seiten gleichermaßen und ist
-kein Effekt dieser Runde — verglichen wird deshalb gleich mit gleich.
+**How it was measured.** The base values come from a separate export of
+`a492d26` (`git archive`, freshly built, `bash ./test.sh` -> `PASS 696/696`),
+and the four comparison numbers on both sides from an INDIVIDUALLY started
+run of the respective script. Inside `test.sh`, `parser_` and
+`typen_vergleich` count nine files more each (intermediate states that the
+earlier steps deposit in the tree); that applies equally to both sides and
+is not an effect of this round — like is therefore compared with like.
 
-Der Zuwachs erklärt sich Datei für Datei: die vierzehn Negativtests kommen
-durch den Parser (nur der Typprüfer lehnt sie ab) und werden dort mitgezählt;
-`tests/820`, `tests/821`, `tests/modules/draw.fi` und `lib/firnc1/iface.fi`
-kommen hinzu, `tests/822` zählt als „nicht Kern" (gc). Für Typprüfer und
-Lowering bleibt nur `tests/820` übrig — die übrigen neuen Dateien kann
-`firnc0` nicht einzeln prüfen (Modul, gc) oder sie sind Negativtests.
+The increase can be explained file by file: the fourteen negative tests
+pass the parser (only the type checker rejects them) and are counted there;
+`tests/820`, `tests/821`, `tests/modules/draw.fi` and `lib/firnc1/iface.fi`
+are added, and `tests/822` counts as „not core" (gc). For the type checker
+and the lowering only `tests/820` remains — the other new files cannot be
+checked individually by `firnc0` (module, gc) or they are negative tests.
 
-## 12. Zeilen
+## 12. Lines
 
-| | Zeilen |
+| | Lines |
 |---|---|
 | `firnc0` (Rust) | +1422 / −33 |
 | `firnc1` (Firn) | +1326 / −22 |
-| Tests (3 Programme, 1 Modul, 14 Negativtests) | +652 |
+| tests (3 programs, 1 module, 14 negative tests) | +652 |
