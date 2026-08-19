@@ -37,10 +37,17 @@
 //! werden unveraendert erzeugt, und die Pruefung „bedingter Sprung haengt von
 //! einem `secret`-Wert ab" gilt in diesem Pfad genauso wie im Grundpfad.
 //!
-//! Der Emissionspfad ist **abgesichert**: Konstrukte, die er nicht vollstaendig
-//! beherrscht (mehr als sechs Parameter/Argumente, unbekannte Blocknummerierung
-//! …), fuehren dazu, dass `emit_func_ra` `None` liefert und `codegen_x86.rs`
-//! seinen bewaehrten Grundpfad benutzt.
+//! Seit Runde 43 beherrscht dieser Pfad auch **mehr als sechs Parameter bzw.
+//! Argumente** (System V: ab dem siebten ueber den Stapel). Vorher fiel jede
+//! Funktion, die einen solchen Aufruf enthielt, auf den Grundpfad zurueck —
+//! im Tokenizer-Messlauf waren das `main`, `tok_emit`, `sink_flush_chars`,
+//! `sink_end`, `out_fehlerliste` und `out_wort`, zusammen ein Viertel aller
+//! ausgefuehrten Instruktionen.
+//!
+//! Der Emissionspfad bleibt **abgesichert**: Konstrukte, die er nicht
+//! vollstaendig beherrscht (`f64`, unbekannte Blocknummerierung …), fuehren
+//! dazu, dass `emit_func_ra` `None` liefert und `codegen_x86.rs` seinen
+//! bewaehrten Grundpfad benutzt.
 
 use crate::codegen_x86::{block_label, label, size_word, Emitter, Frame, ARG_REGS};
 use crate::fir::{BinOp, Block, BlockId, CmpOp, FTy, Func, Inst, Op, Term, UnOp, Val};
@@ -1336,8 +1343,20 @@ fn debug_lines_active(f: &Func) -> bool {
 }
 
 fn supported(f: &Func) -> bool {
-    if debug_lines_active(f) {
+    let grund = unsupported_grund(f);
+    if let Some(g) = grund {
+        if std::env::var_os("FIRN_RA_WARN").is_some() {
+            eprintln!("RA-Grundpfad: {} — {}", f.name, g);
+        }
         return false;
+    }
+    true
+}
+
+/// Warum faellt `f` auf den Grundpfad zurueck? `None` = Registerzuteilung moeglich.
+fn unsupported_grund(f: &Func) -> Option<String> {
+    if debug_lines_active(f) {
+        return Some("Debugzeilen aktiv".into());
     }
     // GLEITKOMMA: dieser Zuteiler kennt nur die Ganzzahlregister. `f64` lebt
     // in den SSE-Registern und braucht eine zweite Registerklasse mit eigenen
@@ -1345,35 +1364,31 @@ fn supported(f: &Func) -> bool {
     // Grundpfad in `codegen_x86.rs` — korrekt, aber ohne Registerzuteilung.
     // Ehrlich benannt in SPEC §14.1.f64.
     if f.val_types.iter().any(|t| *t == FTy::F64) {
-        return false;
+        return Some("f64 im Wertesatz".into());
     }
-    if f.params.len() > ARG_REGS.len() {
-        return false;
+    if f.blocks.is_empty() {
+        return Some("keine Bloecke".into());
     }
-    if f.blocks.is_empty() || f.blocks.iter().enumerate().any(|(i, b)| b.id as usize != i) {
-        return false;
+    if let Some((i, b)) = f.blocks.iter().enumerate().find(|(i, b)| b.id as usize != *i) {
+        return Some(format!("Blocknummern nicht fortlaufend (Index {}, id {})", i, b.id));
     }
     for b in &f.blocks {
         if matches!(b.term, Term::Unset) {
-            return false;
+            return Some(format!("Block {} ohne Abschluss", b.id));
         }
         for i in &b.insts {
             match &i.op {
-                Op::Call { args, .. } => {
-                    if args.len() > ARG_REGS.len() {
-                        return false;
-                    }
-                }
+                Op::Call { .. } => {}
                 Op::Syscall { args } => {
                     if args.is_empty() || args.len() > 7 {
-                        return false;
+                        return Some(format!("syscall mit {} Argumenten", args.len()));
                     }
                 }
                 _ => {}
             }
         }
     }
-    true
+    None
 }
 
 fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
@@ -1399,7 +1414,7 @@ fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
     // Heimat frueherer Parameter. Deshalb erst alle Slot-Ziele (die
     // ueberschreiben kein Register), dann die Register-Ziele PARALLEL.
     let mut prolog_moves: Vec<(String, String)> = Vec::new();
-    for (i, _t) in f.params.iter().enumerate() {
+    for (i, _t) in f.params.iter().enumerate().take(ARG_REGS.len()) {
         match ra.a.loc(i as Val) {
             Loc::Slot(off) => {
                 e.line(&format!("mov qword ptr [rbp-{}], {}", off, ARG_REGS[i]))
@@ -1408,6 +1423,22 @@ fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
         }
     }
     parallele_reg_bewegungen(e, &prolog_moves);
+    // Parameter ab dem siebten liegen im Rahmen des AUFRUFERS (System V:
+    // [rbp+16], [rbp+24], … — davor stehen gesicherte Ruecksprungadresse und
+    // gesichertes rbp). Sie werden ERST NACH den parallelen Bewegungen geholt:
+    // ihr Zielregister darf sonst eine noch gebrauchte Quelle ueberschreiben.
+    // `rax` ist als Arbeitsregister nie Heimat eines Wertes und darf hier als
+    // Zwischenlager dienen.
+    for (i, _t) in f.params.iter().enumerate().skip(ARG_REGS.len()) {
+        let von = 16 + 8 * (i - ARG_REGS.len()) as u64;
+        match ra.a.loc(i as Val) {
+            Loc::Slot(off) => {
+                e.line(&format!("mov rax, qword ptr [rbp+{}]", von));
+                e.line(&format!("mov qword ptr [rbp-{}], rax", off));
+            }
+            Loc::Reg(dst) => e.line(&format!("mov {}, qword ptr [rbp+{}]", dst, von)),
+        }
+    }
     for (bi, b) in f.blocks.iter().enumerate() {
         e.raw(&format!("{}:", block_label(&f.name, b.id)));
         // Fallthrough: steht das Sprungziel unmittelbar dahinter, faellt der
@@ -1910,9 +1941,29 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
             // Register-zu-Register-Bewegungen PARALLEL geschehen; Operanden aus
             // Speicher oder Sofortkonstanten lesen kein Register und kommen
             // danach.
+            // Argumente ab dem siebten liegen bei `call` auf dem Stapel
+            // ([rsp], [rsp+8], …). Sie werden ZUERST abgelegt: danach sind die
+            // Argumentregister frei und werden nicht mehr angefasst. Als
+            // Zwischenlager dient `rax` (nie Heimat eines Wertes); die Quellen
+            // sind rbp-relativ oder Register und bleiben von `sub rsp`
+            // unberuehrt.
+            //
+            // AUSRICHTUNG: an der `call`-Grenze muss `rsp` 16-fach ausgerichtet
+            // sein. Nach `push rbp` + `sub rsp, <Vielfaches von 16>` ist sie es;
+            // der Argumentbereich wird deshalb ebenfalls auf 16 aufgerundet —
+            // wortgleich mit dem Grundpfad in codegen_x86.rs.
+            let stapel = args.len().saturating_sub(ARG_REGS.len());
+            let raum = align_up(stapel as u64 * 8, 16);
+            if raum > 0 {
+                e.line(&format!("sub rsp, {}", raum));
+                for (k, arg) in args.iter().skip(ARG_REGS.len()).enumerate() {
+                    ra.load_full(e, "rax", *arg);
+                    e.line(&format!("mov qword ptr [rsp+{}], rax", k * 8));
+                }
+            }
             let mut reg_moves: Vec<(String, String)> = Vec::new();
             let mut spaeter: Vec<(usize, Val)> = Vec::new();
-            for (k, arg) in args.iter().enumerate() {
+            for (k, arg) in args.iter().enumerate().take(ARG_REGS.len()) {
                 let o = ra.opnd(*arg);
                 if ist_reg64(&o) {
                     reg_moves.push((ARG_REGS[k].to_string(), o));
@@ -1925,6 +1976,9 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
                 ra.load_full(e, ARG_REGS[k], arg);
             }
             e.line(&format!("call {}", label(name)));
+            if raum > 0 {
+                e.line(&format!("add rsp, {}", raum));
+            }
             if let Some(d) = i.dst {
                 ra.store_dst(e, d, "rax");
             }
@@ -2316,10 +2370,36 @@ mod tests {
         assert!(asm.contains("cmovnz"), "{}", asm);
     }
 
+    /// Runde 43: mehr als sechs Parameter sind KEIN Grund mehr fuer den
+    /// Grundpfad — der siebte kommt aus [rbp+16].
     #[test]
-    fn zu_viele_parameter_gehen_an_den_grundpfad() {
+    fn viele_parameter_bleiben_im_registerpfad() {
         let mut f = Func::new("f", vec![FTy::I64; 7], FTy::I64);
-        f.set_term(0, Term::Ret(Some(0)));
-        assert!(!supported(&f));
+        f.set_term(0, Term::Ret(Some(6)));
+        assert!(supported(&f));
+        let mut e = Emitter { out: String::new() };
+        emit_func_ra(&mut e, &f).expect("Registerpfad zustaendig").expect("codegen");
+        assert!(e.out.contains("qword ptr [rbp+16]"), "{}", e.out);
+    }
+
+    /// … und ein Aufruf mit acht Argumenten legt die letzten zwei auf den
+    /// Stapel, ohne die 16-Byte-Ausrichtung zu verletzen.
+    #[test]
+    fn aufruf_mit_acht_argumenten_legt_zwei_auf_den_stapel() {
+        let mut g = Func::new("main", vec![], FTy::I32);
+        let mut args = Vec::new();
+        for k in 0..8 {
+            args.push(g.push(0, FTy::I64, Op::Const(k as i128 + 1)));
+        }
+        let r = g.push(0, FTy::I64, Op::Call { name: "f".to_string(), args });
+        let rc = g.push(0, FTy::I32, Op::Cast { src: r, from: FTy::I64 });
+        g.set_term(0, Term::Ret(Some(rc)));
+        assert!(supported(&g));
+        let mut e = Emitter { out: String::new() };
+        emit_func_ra(&mut e, &g).expect("Registerpfad zustaendig").expect("codegen");
+        assert!(e.out.contains("sub rsp, 16"), "{}", e.out);
+        assert!(e.out.contains("mov qword ptr [rsp+0], rax"), "{}", e.out);
+        assert!(e.out.contains("mov qword ptr [rsp+8], rax"), "{}", e.out);
+        assert!(e.out.contains("add rsp, 16"), "{}", e.out);
     }
 }
