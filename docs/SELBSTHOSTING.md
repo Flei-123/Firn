@@ -1,6 +1,6 @@
 # Selbst-Hosting: Plan und ehrlicher Stand
 
-**Anforderung:** `L1` · `SPEC.md` §11 (Bootstrap-Plan) · `ABNAHME.md` Punkt 1
+**Anforderung:** `L1` · `SPEC.md` §11 (Bootstrap-Plan) · `ACCEPTANCE.md` Punkt 1
 **Stand (Runde 31): der Fixpunkt steht.** `firnc1` — der Compiler, geschrieben
 in Firn — übersetzt **sich selbst**, und das Ergebnis ist ein Fixpunkt:
 Stufe 2 (von `firnc1` erzeugt) und Stufe 3 (von Stufe 2 erzeugt) sind
@@ -74,7 +74,7 @@ Sortiert nach „blockiert am meisten zuerst". `[ ]` = fehlt,
 | 15 | **mehr als 6 Parameter** | `[x]` seit Runde 2 | `emit_inst(e, f, fr, i, …)` |
 | 16 | **Modulsystem** | `[x]` seit Runde 2 | Der Compiler hat 24 Dateien |
 | 17 | **`for`/`break`/`continue`** | `[x]` seit Runde 2 | Jede Schleife im Compiler |
-| 18 | **`comptime`-Codeerzeugung** | `[ ]` | Nur für Unicode-Tabellen (`ABNAHME` Punkt 6), nicht für Stufe 1 |
+| 18 | **`comptime`-Codeerzeugung** | `[ ]` | Nur für Unicode-Tabellen (`ACCEPTANCE` Punkt 6), nicht für Stufe 1 |
 
 ## 5. Wie viel des Compilers wäre heute portierbar? — gemessen, nicht geschätzt
 

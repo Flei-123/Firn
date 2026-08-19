@@ -302,7 +302,7 @@ Tokenizer und Krypto.
 `FIRN-ANFORDERUNGEN.md` §13 Punkt 2 / `TODO-FIRN.md` 0.9: DOM-Prototyp mit
 Eltern-/Kind-Zyklen und Listener-Zyklen, **24 h Dauerlauf ohne
 Speicherwachstum**. Bis dieser Test läuft, gilt der GC als *entworfen*, nicht als
-*belegt*. Siehe `ABNAHME.md`.
+*belegt*. Siehe `ACCEPTANCE.md`.
 
 ### 3.6 Rohzeiger und `unsafe`
 
@@ -1541,7 +1541,7 @@ O4. **Leistungsziel §10.3 (`P1`, ≤ 2x Rust) noch nicht erreicht.** Gemessen a
     13.08.2026 mit `bash bench/run.sh` (6 Mikrobenchmarks, je doppelt in Firn
     und in Rust `-O`, Median aus 7 Laeufen): **Median 2,75x**, Spanne 1,57x
     (Fibonacci) bis 4,95x (Matrixmultiplikation). Die Zahlen stehen in
-    `bench/RESULTS.md`, `README.md` und `ABNAHME.md` — nicht geschoent. Der
+    `bench/RESULTS.md`, `README.md` und `ACCEPTANCE.md` — nicht geschoent. Der
     Abstand entsteht vor allem dort, wo LLVM vektorisiert (Sieb, Matmul);
     Firn erzeugt ausschliesslich skalaren Code (kein SIMD, `L16` offen).
 O5. **Bereichspruefungen (`P5`).** Die Sprache erzeugt in Stufe 0 gar keine
@@ -1683,7 +1683,7 @@ F10. **Fehlerunion über einem Struct-Erfolgstyp taugt nicht als Feldtyp eines
 
 Damit prüfbar ist, dass keine Anforderung aus `FIRN-ANFORDERUNGEN.md`
 stillschweigend unter den Tisch gefallen ist. Der Umsetzungsstand steht in
-`ABNAHME.md`, nicht hier.
+`ACCEPTANCE.md`, nicht hier.
 
 | Anforderung | Abschnitt |
 |---|---|

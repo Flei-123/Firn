@@ -136,13 +136,13 @@ meldet **PASS 166/166** (75 Programme x 2 Durchlaeufe, 15 Negativtests,
 
 **Bezug:** `SPEC.md` v0.2 (§3 Speichermodell, §4.4 Vererbung, §6.3 match,
 §8 Zeichenketten/WTF-16, §9 Constant-Time, §10.3 Leistungsziel, §14/§14.1),
-`ROADMAP.md` Phase 2, `ABNAHME.md` (sechs Punkte),
+`ROADMAP.md` Phase 2, `ACCEPTANCE.md` (sechs Punkte),
 `../karstos-browser/FIRN-ANFORDERUNGEN.md` (nur lesen).
 
 **Grundsatz dieser Runde:** `SPEC.md` ist der Vertrag. Wer bewusst enger baut,
 traegt das in **§14.1** als nummerierten Punkt ein und schreibt die SPEC NICHT
 um. Wer einen Punkt aus §14.1 aufhebt, streicht ihn dort mit Begruendung.
-Nicht Erreichtes kommt ehrlich in `ABNAHME.md` und `README.md`.
+Nicht Erreichtes kommt ehrlich in `ACCEPTANCE.md` und `README.md`.
 
 ## 0. Was der Lead-Architekt in dieser Runde bereits gebaut hat (steht, nicht neu bauen)
 
@@ -193,7 +193,7 @@ erlaubt `impl Fremdtyp { }` innerhalb desselben Crates).
 
 Gemeinsame Dateien, an denen **nur zeilenweise angehaengt** wird (nie
 umstrukturiert): `compiler/src/main.rs` (je Modul genau eine `mod`-Zeile und
-hoechstens eine CLI-Option), `README.md`, `ABNAHME.md`, `SPEC.md` §14.1 — jedes
+hoechstens eine CLI-Option), `README.md`, `ACCEPTANCE.md`, `SPEC.md` §14.1 — jedes
 Modul schreibt dort in **seinen eigenen, mit dem Modulnamen ueberschriebenen
 Abschnitt**. `config.rs`, `fir.rs`, `Cargo.toml` bleiben **unveraendert**
 (Aenderungsbedarf an `fir.rs` wird gemeldet, nicht eigenmaechtig gemacht — er
@@ -219,7 +219,7 @@ mit dem heutigen Sprachumfang schreibbar sind, und zieht nach, sobald
 `types`/`str` liefern.
 
 **Wenn ein Modul blockiert ist:** liefert es den Teil, der ohne die fehlende
-Zulieferung geht, und schreibt den Rest ehrlich als offen in `ABNAHME.md`.
+Zulieferung geht, und schreibt den Rest ehrlich als offen in `ACCEPTANCE.md`.
 Halbfertiges wird NICHT als fertig gemeldet.
 
 ## 3. Feste Schnittstellen zwischen den Modulen
@@ -316,7 +316,7 @@ Halbfertiges wird NICHT als fertig gemeldet.
   `secure_zero` muss im Assembler sichtbar bleiben.
 * Speichermodell (Punkt 7 des Ziels): `Rc[T]`/`Weak[T]` zuerst. `Gc[T]`,
   `gc class`, Mark-Sweep und DOM-Dauerlauf **nur, wenn der Rest steht** —
-  sonst wird es in `ABNAHME.md` ehrlich als *verschoben* gefuehrt. Halb gebauter
+  sonst wird es in `ACCEPTANCE.md` ehrlich als *verschoben* gefuehrt. Halb gebauter
   GC ist ausdruecklich unerwuenscht.
 
 ### 3.6 tok: HTML5-Tokenizer
@@ -347,7 +347,7 @@ Halbfertiges wird NICHT als fertig gemeldet.
 6. Sprachname weiterhin ausschliesslich in `config.rs`.
 7. Selbst messen, bevor „fertig" gemeldet wird: Testsuite laufen lassen,
    Benchmarks wirklich messen, Harness wirklich fahren. **Echte Zahlen** in
-   `README.md` und `ABNAHME.md`.
+   `README.md` und `ACCEPTANCE.md`.
 
 ---
 
@@ -397,7 +397,7 @@ Nachgemessen mit `bash test.sh` → **PASS 397/397** und
 | **tokenizer-kern** | `lib/html/tokenizer.fi` | `lib/html/mem.fi`, `tokens.fi` |
 | **tokenizer-text** | `lib/html/entities.fi` (neu), `lib/html/entities_data.fi` (erzeugt), `tools/tokenizer/gen_entities.py` (neu) | `lib/html/mem.fi` |
 | **tokenizer-tokens** | `lib/html/tokens.fi`, `lib/html/tokenize_main.fi`, `lib/html/mem.fi` | — |
-| **harness-bench** | `tools/tokenizer/harness.py`, `run.sh`, `durchsatz.sh`, `korpus.py`, `mindestquote.txt`, `bench/tokenizer/**` (neu), `bench/RESULTS.md`, `ABNAHME.md`, `README.md` | alles andere |
+| **harness-bench** | `tools/tokenizer/harness.py`, `run.sh`, `durchsatz.sh`, `korpus.py`, `mindestquote.txt`, `bench/tokenizer/**` (neu), `bench/RESULTS.md`, `ACCEPTANCE.md`, `README.md` | alles andere |
 
 `test.sh` fasst **niemand** an ausser dem Lead bei der Zusammenfuehrung.
 `tools/tokenizer/mindestquote.txt` schreibt nur **harness-bench** — und nur
@@ -459,7 +459,7 @@ Registerzuteilung und Codegen ohne Aenderung.
 * `tokenizer-kern` kann sofort loslegen; solange `entities` fehlt, ruft es
   weiter `sink_abort` fuer `&`.
 * `tokenizer-text` kann sofort loslegen (eigene Dateien).
-* `harness-bench` kann sofort loslegen; die Zahlen fuer `ABNAHME.md`/`README.md`
+* `harness-bench` kann sofort loslegen; die Zahlen fuer `ACCEPTANCE.md`/`README.md`
   werden **zuletzt** selbst gemessen und nur dann eingetragen.
 
 ## 4. Nicht verhandelbar
@@ -477,7 +477,7 @@ Registerzuteilung und Codegen ohne Aenderung.
 
 # PLAN — Runde 4 (Haertetest 2): Speichermodell SPEC §3 + DOM-Prototyp mit Zyklen
 
-Ziel dieser Runde ist **Abnahmepunkt 2** aus `ABNAHME.md`: das Speichermodell aus
+Ziel dieser Runde ist **Abnahmepunkt 2** aus `ACCEPTANCE.md`: das Speichermodell aus
 `SPEC.md` §3 wirklich bauen (`Rc`/`Weak`, Opt-in-Tracing-GC, `#[no_gc]`) und mit
 einem **DOM-Prototypen in Firn** belegen, dass zyklische Objektgraphen ohne Leck
 getragen werden — gemessen, nicht behauptet.
@@ -510,11 +510,11 @@ zu bekommen** — das war der Zweck des Skeletts.
 
 | Modul | Darf schreiben | Darf **nicht** anfassen |
 |---|---|---|
-| **gckern** | `compiler/src/gc.rs`, `compiler/src/gc_lower.rs` (neu), `lib/gc/*.fi`, und als **einziges Modul** die bestehenden Compilerdateien `parser.rs`, `lexer.rs`, `ast.rs`, `sema.rs`, `sema_generic.rs`, `types.rs`, `layout.rs`, `lower.rs`, `lower_errors.rs`, `errors.rs`, `mono.rs`, `modules.rs`, `abi.rs`, `codegen_x86.rs`, `fir.rs`, `opt.rs`, `mem2reg.rs`, `regalloc.rs`, `main.rs`; `tests/50*_gc_*.fi` … `tests/53*_gc_*.fi`, `tests/neg/gc_*.fi`; `docs/GC.md`, `docs/berichte/gckern.md` | `compiler/src/nogc.rs`, `compiler/src/attrs.rs`, `lib/rc/`, `lib/dom/`, `tools/`, `test.sh`, `SPEC.md`, `ABNAHME.md`, `README.md` |
+| **gckern** | `compiler/src/gc.rs`, `compiler/src/gc_lower.rs` (neu), `lib/gc/*.fi`, und als **einziges Modul** die bestehenden Compilerdateien `parser.rs`, `lexer.rs`, `ast.rs`, `sema.rs`, `sema_generic.rs`, `types.rs`, `layout.rs`, `lower.rs`, `lower_errors.rs`, `errors.rs`, `mono.rs`, `modules.rs`, `abi.rs`, `codegen_x86.rs`, `fir.rs`, `opt.rs`, `mem2reg.rs`, `regalloc.rs`, `main.rs`; `tests/50*_gc_*.fi` … `tests/53*_gc_*.fi`, `tests/neg/gc_*.fi`; `docs/GC.md`, `docs/berichte/gckern.md` | `compiler/src/nogc.rs`, `compiler/src/attrs.rs`, `lib/rc/`, `lib/dom/`, `tools/`, `test.sh`, `SPEC.md`, `ACCEPTANCE.md`, `README.md` |
 | **nogc** | `compiler/src/nogc.rs`, `compiler/src/attrs.rs`, `lib/html/*.fi`, `tests/54*_no_gc_*.fi`, `tests/neg/nogc_*.fi`, `docs/berichte/nogc.md` | alle anderen Compilerdateien (Hook steht bereits), `lib/gc/`, `lib/dom/`, `test.sh`, Dokumente |
 | **rclib** | `lib/rc/*`, `tests/modules/rc.fi`, `tests/55*_rc_*.fi`, `tests/neg/rc_*.fi`, `docs/RC.md`, `docs/berichte/rclib.md` | Compilerquellen, `lib/dom/`, `lib/gc/`, `test.sh`, Dokumente |
 | **dom** | `lib/dom/*.fi`, `tests/modules/dom.fi` (Symlink), `tests/56*_dom_*.fi`, `docs/berichte/dom.md` | Compilerquellen, `lib/rc/`, `lib/gc/`, `tools/`, `test.sh`, Dokumente |
-| **mess** | `tools/dom_soak/*`, `test.sh` (nur **Anhaengen** von Abschnitt 10), `ABNAHME.md`, `README.md`, `SPEC.md` §14.1, `RUN.md`, `PLAN.md`, `docs/berichte/mess.md` | jede Quelldatei in `compiler/`, `lib/` |
+| **mess** | `tools/dom_soak/*`, `test.sh` (nur **Anhaengen** von Abschnitt 10), `ACCEPTANCE.md`, `README.md`, `SPEC.md` §14.1, `RUN.md`, `PLAN.md`, `docs/berichte/mess.md` | jede Quelldatei in `compiler/`, `lib/` |
 
 Neue `tests/*.fi` werden von `test.sh` automatisch eingesammelt — dafuer muss
 niemand `test.sh` anfassen. **Nur `mess`** darf `test.sh` erweitern, und nur
@@ -704,7 +704,7 @@ Ausgabeprotokoll auf der Standardausgabe (TSV, verbindlich):
    eine Zusammenfassung auf die Standardausgabe;
 6. Exit 0 nur, wenn (4) fuer beide Fassungen das erwartete Urteil liefert.
 
-`mess` traegt danach in `ABNAHME.md` Punkt 2 die **echten** Werte ein: Laufzeit,
+`mess` traegt danach in `ACCEPTANCE.md` Punkt 2 die **echten** Werte ein: Laufzeit,
 Zyklenzahl, RSS-Verlauf, Sammellaeufe, lebende Objekte, dazu ausdruecklich den
 Satz, dass der 24-Stunden-Lauf aus der Abnahme **noch aussteht**, und was nicht
 gebaut wurde (inkrementelles Sammeln, `virtual`, `GcVec`/`GcMap`,
@@ -745,7 +745,7 @@ Bibliothekspfad existiert, ohne Code zu doppeln.
   uebersetzt.
 * `mess` baut `run.sh` gegen das Protokoll aus §4 und kann es lange vor `dom`
   fertig haben (Probe mit einer selbst geschriebenen TSV-Datei). Die Zahlen in
-  `ABNAHME.md`/`README.md` werden **zuletzt** selbst gemessen.
+  `ACCEPTANCE.md`/`README.md` werden **zuletzt** selbst gemessen.
 
 ## 7. Nicht verhandelbar
 
@@ -761,7 +761,7 @@ Bibliothekspfad existiert, ohne Code zu doppeln.
 5. `SPEC.md` wird nicht umgeschrieben — Abweichungen kommen nach §14.1.
 6. Jedes Modul schreibt seinen Bericht nach `docs/berichte/<modul>.md`:
    was gebaut, was gemessen (echte Ausgaben), was offen. `mess` faltet das in
-   `ABNAHME.md` und `README.md` zusammen.
+   `ACCEPTANCE.md` und `README.md` zusammen.
 7. Ein GC, der im Test nicht nachweislich sammelt, ist wertlos. Jeder
    GC-Testfall belegt seine Behauptung mit `gc_collections()` und
    `gc_live_objects()`.

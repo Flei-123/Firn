@@ -16,7 +16,7 @@ freistehendes Linux-Binary ohne libc.
 Der verbindliche Umfang steht in [SPEC.md §14](SPEC.md) (Abweichungen der
 Umsetzung in §14.1), die IR ist in [docs/FIR.md](docs/FIR.md) dokumentiert.
 Wie man alles baut, startet und **selbst nachmisst**: [RUN.md](RUN.md).
-Der Abnahmestand mit echten Zahlen: [ABNAHME.md](ABNAHME.md).
+Der Abnahmestand mit echten Zahlen: [ACCEPTANCE.md](ACCEPTANCE.md).
 Die Fundamententscheidungen — was jetzt ins Fundament muss, damit es später
 noch möglich ist, und was warten kann: [DESIGNZIELE.md](DESIGNZIELE.md).
 
@@ -307,7 +307,7 @@ Firn** gebaut, Runde 4 den **Opt-in-Tracing-GC samt DOM-Prototyp und Dauerlauf**
   wachsen (`lib/gc/gcvec.fi`, `lib/gc/gcmap.fi`, `docs/RUNDE53.md`). Der
   DOM-Prototyp benutzt sie: 5000 Kinder an einem Knoten, beliebig viele
   Attribute.
-  **Offen bleibt:** der 24-Stunden-Lauf aus ABNAHME.md Punkt 2, Fragmentierung
+  **Offen bleibt:** der 24-Stunden-Lauf aus ACCEPTANCE.md Punkt 2, Fragmentierung
   bei wechselnden Objektgrößen, `virtual`, und bei den Sammlungen die
   nominale Typsicherheit des Behälters.
   `Rc[T]`/`Weak[T]`/`Arc[T]` gibt es als **Firn-Module** (`tests/modules/rc.fi`,
@@ -318,7 +318,7 @@ Firn** gebaut, Runde 4 den **Opt-in-Tracing-GC samt DOM-Prototyp und Dauerlauf**
   Parse-Fehlercodes (`--mit-fehlern`); die XML-Anpassung der
   `xmlViolationTests` ist als optionaler Modus umgesetzt. Offen bleibt das
   Geschwindigkeitsziel ≤ 2×. Abschnitt „HTML5-Tokenizer" weiter unten, Zahlen
-  in ABNAHME.md Punkt 3.
+  in ACCEPTANCE.md Punkt 3.
 * **`comptime`**, **Interfaces**, **Optionals**,
   **Abwicklung/`throw`** (SPEC §5.3). Fehlerunionen `E!T` gibt es seit Runde 3,
   aber ohne abgeleitete Fehlermenge, ohne `defer`/`errdefer` und mit
@@ -1046,7 +1046,7 @@ tools/ergebnisort/       prueft die Ergebnisort-Garantie am Assembler
 DESIGNZIELE.md           10 Fundamententscheidungen (async-Farben, fehlbare
                          Allokation, Capabilities, ABI, Debug-Bau, In-Place-
                          Init, comptime/Reflexion, SoA-Layout, Hot Reload)
-ABNAHME.md               die sechs Abnahmepunkte mit echten Messwerten
+ACCEPTANCE.md               die sechs Abnahmepunkte mit echten Messwerten
 docs/FIR.md              die eigene IR: Instruktionen, Typen, Invarianten
 docs/DEBUGGER.md         .debug_line + wörtlich kopierte gdb-Sitzung
 docs/SELBSTHOSTING.md    was heute schon in Firn geschrieben werden könnte
@@ -1320,7 +1320,7 @@ Messung steht immer in `bench/RESULTS.md`.
 
 **Median 2,75×–3,36× langsamer als Rust `-O`** (Einzelwerte 1,57× – 6,04×). Das
 Leistungsziel aus SPEC §10.3 (`P1`, ≤ 2×) ist damit **nicht erreicht** — die
-Zahl steht so auch in `ABNAHME.md` und `SPEC.md` §14.1.opt O4. Der Optimierer
+Zahl steht so auch in `ACCEPTANCE.md` und `SPEC.md` §14.1.opt O4. Der Optimierer
 selbst bringt gegenüber `--no-opt` im Median **9,9×**. Der verbleibende Abstand
 liegt vor allem dort, wo LLVM vektorisiert (Sieb, Matrixmultiplikation): Firn
 erzeugt ausschließlich skalaren Code, SIMD (`L16`) ist offen.

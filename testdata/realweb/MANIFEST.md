@@ -9,7 +9,7 @@ Warum es diesen zweiten Korpus gibt: der Korpus aus den html5lib-Eingaben ist
 absichtlich pathologisch (fast nur Grenzfaelle, extrem viele Zustandswechsel je
 Byte, kaum lange Textlaeufe). Er misst den schlechtesten Fall. Erst zusammen
 mit echten Seiten ergibt der Vergleich gegen `html5ever` ein ehrliches Bild;
-beide Faktoren stehen in `README.md` und `ABNAHME.md`.
+beide Faktoren stehen in `README.md` und `ACCEPTANCE.md`.
 
 | Datei | Bytes | Quelle (URL) |
 |---|---:|---|

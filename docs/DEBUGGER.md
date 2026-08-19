@@ -1,6 +1,6 @@
 # Debugger: `.debug_line` und eine echte `gdb`-Sitzung
 
-**Anforderung:** `W3` · `ABNAHME.md` Punkt 4 Kriterium B · `TODO-FIRN.md` 0.4
+**Anforderung:** `W3` · `ACCEPTANCE.md` Punkt 4 Kriterium B · `TODO-FIRN.md` 0.4
 **Stand:** Zeilennummern funktionieren, Variablen noch nicht (siehe „Grenzen").
 
 ## Wie es erzeugt wird
@@ -91,6 +91,6 @@ können sich mit dem Codegenerator ändern, Datei und Zeilen nicht.
   Dafür müsste der Compiler das `.debug_info` selbst schreiben, statt es von
   `as` erzeugen zu lassen.
 * **Keine Zeilen im optimierten Bau** außer der Funktionszeile.
-* `ABNAHME.md` Punkt 4 Kriterium B verlangt zusätzlich, dass **ein echter
+* `ACCEPTANCE.md` Punkt 4 Kriterium B verlangt zusätzlich, dass **ein echter
   Fehler** mit dem Debugger gefunden wurde. Das ist noch nicht der Fall und
   bleibt dort als offen geführt.

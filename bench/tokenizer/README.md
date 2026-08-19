@@ -52,7 +52,7 @@ Auf dem zweiten Korpus (`realweb`, echte Seiten) ist der Abstand **groesser**:
 drei Laeufe am 14.08.2026 ergaben 5,72x / 7,72x / 7,84x (Firn 5,5–7,4 MB/s
 gegen html5ever 42–45 MB/s). Lange Textlaeufe sind html5evers bester Fall,
 waehrend der Firn-Tokenizer weiter Codepunkt fuer Codepunkt arbeitet und
-zusaetzlich das html5lib-JSON schreibt. Die Zahlen stehen in ABNAHME.md
+zusaetzlich das html5lib-JSON schreibt. Die Zahlen stehen in ACCEPTANCE.md
 Punkt 3.
 
 ## Was verglichen wird — und was nicht

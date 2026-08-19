@@ -1,7 +1,7 @@
 # Runde 47 — Finalisierer, `Arc[T]`, schwache Verweise: die Restarbeit an der Speicherverwaltung
 
 Branch `r47-arc`, Basis `a492d26`. Diese Runde schließt die drei Posten ab, die
-seit Runde 4 unverändert als „offen" in `ABNAHME.md` und `docs/RUNDE44.md`
+seit Runde 4 unverändert als „offen" in `ACCEPTANCE.md` und `docs/RUNDE44.md`
 standen: **Finalisierer (`S4`)**, **`Arc[T]`** und **schwache Verweise, die
 beim Einsammeln wirklich genullt werden (`S3`)**.
 
@@ -433,4 +433,4 @@ nicht lösen, nur verschieben; deshalb wurde es zurückgenommen.
   sortiertes Chunkfeld mit binärer Suche würde das erledigen — es ist ein
   Umbau der Chunkverwaltung und gehört nicht in diese Runde.
 * **`GcVec`/`GcMap`, `virtual`, 24-Stunden-Lauf, Fragmentierung bei
-  wechselnden Objektgrößen** — unverändert offen (`ABNAHME.md` Punkt 2).
+  wechselnden Objektgrößen** — unverändert offen (`ACCEPTANCE.md` Punkt 2).
