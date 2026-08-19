@@ -468,7 +468,7 @@ pub(crate) fn hook_resolve_ty(ck: &mut Checker, te: &TypeExpr) -> Option<Type> {
     if in_struct_phase() && contains_struct(&val_ty) {
         // Waehrend `collect_structs` stehen die Struct-Layouts noch nicht fest;
         // die Fehlerunion bekaeme eine falsche Groesse. Lieber ein klarer
-        // Fehler als ein stilles Fehl-Layout (SPEC §14.1.fehlerunionen F10).
+        // Fehler als ein stilles Fehl-Layout (SPEC §14.1.error_unions F10).
         ck.dg.error_note(
             span,
             format!(

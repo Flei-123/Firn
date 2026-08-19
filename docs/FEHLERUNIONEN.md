@@ -1,6 +1,6 @@
 # Fehlerunionen `E!T` in Firn
 
-Bezug: `SPEC.md` §5.1 (Vertrag), `SPEC.md` §14.1.fehlerunionen (bewusste
+Bezug: `SPEC.md` §5.1 (Vertrag), `SPEC.md` §14.1.error_unions (bewusste
 Einschränkungen der Umsetzung), `PLAN.md` Runde 3.
 Umgesetzt in `compiler/src/errors.rs` (Syntax, Anmeldung, Typprüfung) und
 `compiler/src/lower_errors.rs` (Lowering nach FIR).
@@ -142,7 +142,7 @@ Die Aufteilung folgt dem Vorbild `sema_match.rs` / `lower_match.rs`.
 
 ## 6. Grenzen
 
-Vollständig und nummeriert in `SPEC.md` §14.1.fehlerunionen (F1–F10). Die
+Vollständig und nummeriert in `SPEC.md` §14.1.error_unions (F1–F10). Die
 wichtigsten: keine abgeleitete Fehlermenge (`!T` ohne `E`), kein `defer`/
 `errdefer`, `catch |e|` bindet an einen Ausdruck statt an einen Block, kein
 `match` auf Fehlerwerten, keine Vereinigung von Fehlermengen, und als Feldtyp
