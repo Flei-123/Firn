@@ -26,8 +26,8 @@ cd "$(dirname "$0")/../.."
 export FIRNLIB="$(pwd)/lib"
 FIRNC=compiler/target/release/firnc
 FC1=${FIRNC1:-./.firnc1}
-QUELLE=demos/kernel/core.fi
-SKRIPT=demos/kernel/linker.ld
+SOURCE=demos/kernel/core.fi
+LDSCRIPT=demos/kernel/linker.ld
 # A temp directory of its own per run (several rounds run in parallel).
 TMPD=$(mktemp -d)
 trap 'rm -rf "$TMPD"' EXIT
@@ -37,7 +37,7 @@ fail=0
 ok()  { pass=$((pass+1)); printf '  OK    %s\n' "$1"; }
 bad() { fail=$((fail+1)); printf '  FAIL  %s\n' "$1"; }
 
-[ -x "$FIRNC" ] || { echo "firnc0 fehlt: $FIRNC"; exit 1; }
+[ -x "$FIRNC" ] || { echo "firnc0 is missing: $FIRNC"; exit 1; }
 # Rebuild `.firnc1` when it is missing or a source is younger (the trap
 # from round 35/45/46: an outdated binary measures yesterday's state).
 neu=0
@@ -50,65 +50,65 @@ if [ -x "$FC1" ]; then
 fi
 [ "$neu" -eq 1 ] && { rm -f "$FC1"; "$FIRNC" bin/firnc1.fi -o "$FC1" || exit 1; }
 
-echo "== 1. Uebersetzen (beide Compiler, Profil aus der Quelle) =="
-"$FIRNC" -o "$TMPD/k0.o" "$QUELLE" 2>"$TMPD/e0" \
-    && ok "firnc0: $QUELLE -> k0.o" || { bad "firnc0 uebersetzt nicht"; sed 's/^/        /' "$TMPD/e0"; }
-"$FC1" "$QUELLE" -o "$TMPD/k1.o" >"$TMPD/e1" 2>&1 \
-    && ok "firnc1: $QUELLE -> k1.o" || { bad "firnc1 uebersetzt nicht (rc=$?)"; sed 's/^/        /' "$TMPD/e1"; }
+echo "== 1. compile (both compilers, the profile comes from the source) =="
+"$FIRNC" -o "$TMPD/k0.o" "$SOURCE" 2>"$TMPD/e0" \
+    && ok "firnc0: $SOURCE -> k0.o" || { bad "firnc0 does not compile it"; sed 's/^/        /' "$TMPD/e0"; }
+"$FC1" "$SOURCE" -o "$TMPD/k1.o" >"$TMPD/e1" 2>&1 \
+    && ok "firnc1: $SOURCE -> k1.o" || { bad "firnc1 does not compile it (rc=$?)"; sed 's/^/        /' "$TMPD/e1"; }
 
 # Counter-check: the same source text with `--profile=app` MUST fail --
 # `syscall` does exist there, but `#[interrupt]` does not. Without this probe
 # a compiler that ignores the profile would pass here unnoticed.
-if "$FIRNC" --profile=app -o "$TMPD/app.o" "$QUELLE" >"$TMPD/app.err" 2>&1; then
-    bad "Gegenprobe: --profile=app haette scheitern muessen"
+if "$FIRNC" --profile=app -o "$TMPD/app.o" "$SOURCE" >"$TMPD/app.err" 2>&1; then
+    bad "counter-check: --profile=app should have failed"
 else
     grep -q "only in profile 'kernel'" "$TMPD/app.err" \
-        && ok "Gegenprobe: --profile=app wird abgelehnt (#[interrupt])" \
-        || { bad "Gegenprobe: falsche Meldung"; sed 's/^/        /' "$TMPD/app.err" | head -4; }
+        && ok "counter-check: --profile=app is rejected (#[interrupt])" \
+        || { bad "counter-check: wrong message"; sed 's/^/        /' "$TMPD/app.err" | head -4; }
 fi
 
-echo "== 2. Es ist eine OBJEKTdatei, und sie ist freistehend =="
+echo "== 2. it is an OBJECT file, and it is freestanding =="
 for s in 0 1; do
     f="$TMPD/k$s.o"
     [ -f "$f" ] || { bad "firnc$s: keine Ausgabedatei"; continue; }
-    typ=$(readelf -h "$f" | awk -F: '/^  Type:/ {print $2}' | awk '{print $1}')
-    [ "$typ" = "REL" ] && ok "firnc$s: ELF-Typ REL (verschiebbare Objektdatei)" \
-                       || bad "firnc$s: ELF-Typ '$typ', erwartet REL"
+    kind=$(readelf -h "$f" | awk -F: '/^  Type:/ {print $2}' | awk '{print $1}')
+    [ "$kind" = "REL" ] && ok "firnc$s: ELF-Typ REL (verschiebbare Objektdatei)" \
+                       || bad "firnc$s: ELF kind '$kind', expected REL"
     undef=$(nm -u "$f" 2>/dev/null | sed '/^$/d')
-    [ -z "$undef" ] && ok "firnc$s: KEIN undefiniertes Symbol" \
+    [ -z "$undef" ] && ok "firnc$s: NO undefined symbol" \
                     || { bad "firnc$s: undefinierte Symbole"; echo "$undef" | sed 's/^/        /'; }
     # Every defined symbol belongs to the program itself (prefix _F0./_F1.).
     fremd=$(nm --defined-only "$f" | awk '{print $3}' | grep -vE "^_F[01]\." || true)
     [ -z "$fremd" ] && ok "firnc$s: alle definierten Symbole sind eigene" \
                     || { bad "firnc$s: fremde Symbole"; echo "$fremd" | sed 's/^/        /'; }
     if objdump -d "$f" | grep -qE '^\s+[0-9a-f]+:.*\bsyscall\b'; then
-        bad "firnc$s: die Objektdatei enthaelt einen syscall"
+        bad "firnc$s: the object file contains a syscall"
     else
-        ok "firnc$s: kein syscall im Maschinencode"
+        ok "firnc$s: no syscall in the machine code"
     fi
 done
 
-echo "== 3. Gegen das Linkerskript binden (kein libc, keine crt-Dateien) =="
+echo "== 3. link against the linker script (no libc, no crt files) =="
 as --64 -o "$TMPD/start.o" demos/kernel/start.s 2>"$TMPD/as.err" \
-    && ok "start.s assembliert (Multiboot-Kopf, Langer Modus)" \
+    && ok "start.s assembles (multiboot header, long mode)" \
     || { bad "start.s"; sed 's/^/        /' "$TMPD/as.err" | head -5; }
 for s in 0 1; do
     f="$TMPD/k$s.o"
     [ -f "$f" ] || continue
-    if ld -n -T "$SKRIPT" --defsym=KERN_START="_F$s.core_start" \
+    if ld -n -T "$LDSCRIPT" --defsym=KERN_START="_F$s.core_start" \
           -o "$TMPD/k$s.elf" "$TMPD/start.o" "$f" 2>"$TMPD/ld$s.err"; then
         ein=$(readelf -h "$TMPD/k$s.elf" | awk -F: '/Entry point/ {print $2}' | tr -d ' ')
         ok "firnc$s: gelinkt, Einsprung $ein"
         # The only code that does not come from Firn is `start.s`.
         undef=$(nm -u "$TMPD/k$s.elf" 2>/dev/null | sed '/^$/d')
-        [ -z "$undef" ] && ok "firnc$s: das gebundene Abbild hat kein offenes Symbol" \
+        [ -z "$undef" ] && ok "firnc$s: the linked image has no open symbol" \
                         || { bad "firnc$s: offene Symbole im Abbild"; echo "$undef" | sed 's/^/        /'; }
     else
         bad "firnc$s: ld schlug fehl"; sed 's/^/        /' "$TMPD/ld$s.err" | head -5
     fi
 done
 
-echo "== 3b. In QEMU booten (der eigentliche Beweis) =="
+echo "== 3b. boot in QEMU (the real proof) =="
 if command -v qemu-system-x86_64 >/dev/null 2>&1; then
     for s in 0 1; do
         [ -f "$TMPD/k$s.elf" ] || continue
@@ -126,33 +126,33 @@ if command -v qemu-system-x86_64 >/dev/null 2>&1; then
         fi
     done
 else
-    echo "  (uebersprungen: qemu-system-x86_64 ist nicht vorhanden)"
+    echo "  (skipped: qemu-system-x86_64 is not available)"
 fi
 
-echo "== 4. Inline-Assembler und Interrupt-ABI stehen wirklich im Code =="
+echo "== 4. inline assembly and the interrupt ABI are really in the code =="
 for s in 0 1; do
     f="$TMPD/k$s.o"
     [ -f "$f" ] || continue
     objdump -d "$f" > "$TMPD/d$s.txt"
-    for befehl in cli hlt "out    %al,(%dx)" "in     (%dx),%al" iretq; do
-        if grep -qF "$befehl" "$TMPD/d$s.txt"; then
-            ok "firnc$s: '$befehl' im Maschinencode"
+    for instr in cli hlt "out    %al,(%dx)" "in     (%dx),%al" iretq; do
+        if grep -qF "$instr" "$TMPD/d$s.txt"; then
+            ok "firnc$s: '$instr' im Maschinencode"
         else
-            bad "firnc$s: '$befehl' fehlt"
+            bad "firnc$s: '$instr' is missing"
         fi
     done
     # `#[interrupt]`: 14 push + 14 pop in the entry point.
     n=$(awk '/<_F'"$s"'\.timer_ih>:/,/iretq/' "$TMPD/d$s.txt" | grep -cE '\bpush\b')
     [ "$n" -eq 15 ] && ok "firnc$s: timer_ih rettet 14 Register + rbp" \
-                    || bad "firnc$s: timer_ih hat $n push, erwartet 15"
+                    || bad "firnc$s: timer_ih has $n push, expected 15"
 done
 
 echo "== 5. volatile haelt in allen drei Baustufen =="
 # `cli` and `hlt` stand in `core_start`, which nobody calls -- so they cannot
 # become more through inlining either. Exactly once, in every build stage.
-for stufe in "" "--no-opt" "--opt-level=dev-fast"; do
-    name=${stufe:---release-fast}
-    "$FIRNC" $stufe --emit=asm -o "$TMPD/k.s" "$QUELLE" 2>/dev/null || { bad "asm-Ausgabe $name"; continue; }
+for stage in "" "--no-opt" "--opt-level=dev-fast"; do
+    name=${stage:---release-fast}
+    "$FIRNC" $stage --emit=asm -o "$TMPD/k.s" "$SOURCE" 2>/dev/null || { bad "asm-Ausgabe $name"; continue; }
     c=$(grep -cE '^\s+cli$' "$TMPD/k.s")
     h=$(grep -cE '^\s+hlt$' "$TMPD/k.s")
     o=$(grep -cE '^\s+out dx, al$' "$TMPD/k.s")
@@ -172,9 +172,9 @@ done
 # merging), and the `rdtsc` with an unused result must not
 # disappear (the trap from round 40).
 VOL=tools/freestanding/volatile.fi
-for stufe in "" "--no-opt" "--opt-level=dev-fast"; do
-    name=${stufe:---release-fast}
-    "$FIRNC" $stufe --emit=fir "$VOL" > "$TMPD/v.fir" 2>/dev/null || { bad "volatile.fi $name"; continue; }
+for stage in "" "--no-opt" "--opt-level=dev-fast"; do
+    name=${stage:---release-fast}
+    "$FIRNC" $stage --emit=fir "$VOL" > "$TMPD/v.fir" 2>/dev/null || { bad "volatile.fi $name"; continue; }
     a1=$(grep -cF 'asm.void "pause"' "$TMPD/v.fir")
     a2=$(grep -cF 'asm.u64 "rdtsc"' "$TMPD/v.fir")
     l=$(grep -cF 'mmio_load.u32' "$TMPD/v.fir")
@@ -184,8 +184,8 @@ for stufe in "" "--no-opt" "--opt-level=dev-fast"; do
     else
         bad "volatile.fi $name: pause=$a1 (3) rdtsc=$a2 (1) load=$l (2) store=$st (1)"
     fi
-    "$FIRNC" $stufe -o "$TMPD/v0" "$VOL" 2>/dev/null && "$TMPD/v0" >/dev/null 2>&1
-    [ "$?" = 6 ] && ok "volatile.fi $name: laeuft, liefert 6" || bad "volatile.fi $name: falscher Rueckgabewert"
+    "$FIRNC" $stage -o "$TMPD/v0" "$VOL" 2>/dev/null && "$TMPD/v0" >/dev/null 2>&1
+    [ "$?" = 6 ] && ok "volatile.fi $name: runs, yields 6" || bad "volatile.fi $name: wrong return value"
 done
 # And the same through the compiler in Firn: there is no optimiser there,
 # so the assembly text counts -- and after that the behaviour.
@@ -196,12 +196,12 @@ if "$FC1" "$VOL" -o "$TMPD/v1" >/dev/null 2>&1; then
     [ "$c" = 3 ] && [ "$r" = 1 ] && ok "volatile.fi firnc1: pause=3 rdtsc=1 (exakt)" \
                                 || bad "volatile.fi firnc1: pause=$c (3) rdtsc=$r (1)"
     "$TMPD/v1" >/dev/null 2>&1
-    [ "$?" = 6 ] && ok "volatile.fi firnc1: laeuft, liefert 6" || bad "volatile.fi firnc1: falscher Rueckgabewert"
+    [ "$?" = 6 ] && ok "volatile.fi firnc1: runs, yields 6" || bad "volatile.fi firnc1: wrong return value"
 else
-    bad "volatile.fi: firnc1 uebersetzt nicht"
+    bad "volatile.fi: firnc1 does not compile it"
 fi
 
 echo
-echo "FREISTEHEND: $pass bestanden, $fail fehlgeschlagen"
+echo "FREESTANDING: $pass passed, $fail failed"
 [ "$fail" -eq 0 ] || exit 1
 exit 0

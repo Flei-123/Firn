@@ -71,7 +71,7 @@ fn main() -> i32 {
 }
 EOF
 
-cat > "$W/nichtatom.fi" <<'EOF'
+cat > "$W/nonatomic.fi" <<'EOF'
 fn main() -> i32 {
     var z: u64 = 5
     let p: *mut u64 = &z
@@ -107,12 +107,12 @@ for stage in "release-fast:" "no-opt:--no-opt" "dev-fast:--opt-level=dev-fast"; 
 done
 
 # --- 2. counter-check: an ordinary += has NO lock --------------------------
-"$FIRNC" --emit=asm -o "$W/nicht.s" "$W/nichtatom.fi" 2>/dev/null
-if grep -q 'lock' "$W/nicht.s"; then
+"$FIRNC" --emit=asm -o "$W/plain.s" "$W/nonatomic.fi" 2>/dev/null
+if grep -q 'lock' "$W/plain.s"; then
     report "counter-check: an ordinary '*p = *p + 7' produces a 'lock' -- the proof would be worthless"
 fi
-"$FIRNC" -o "$W/nicht" "$W/nichtatom.fi" 2>/dev/null
-set +e; "$W/nicht"; rc=$?; set -e
+"$FIRNC" -o "$W/plain" "$W/nonatomic.fi" 2>/dev/null
+set +e; "$W/plain"; rc=$?; set -e
 [ "$rc" -eq 0 ] || report "counter-check: the program yields $rc instead of 0"
 
 # --- 4. firnc1: the same instruction, octet-identical FIR -------------------

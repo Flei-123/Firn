@@ -71,7 +71,7 @@ echo "   cargo test: ok"
 rm -rf "$WORK"
 mkdir -p "$WORK"
 
-run_case() {          # $1 = Datei, $2 = "opt" | "noopt" | "devfast"
+run_case() {          # $1 = file, $2 = "opt" | "noopt" | "devfast"
     local file="$1" mode="$2"
     local base ext bin flags hdr exp out rc
     base=$(basename "$file" .fi)
