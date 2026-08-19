@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# Nachweis der ERGEBNISORT-GARANTIE (SPEC.md §13.1, DESIGNZIELE.md §6).
+# Proof of the RESULT-LOCATION GUARANTEE (SPEC.md 13.1, DESIGNZIELE.md 6).
 #
-# Behauptung: Bei `let g = build(…)` mit aggregiertem Rueckgabetyp wird die
-# Zieladresse durchgereicht. Die Struktur entsteht GENAU EINMAL im Rahmen des
-# Aufrufers — nicht zusaetzlich im Rahmen der erzeugenden Funktion und nicht
-# per Kopie.
+# Claim: with `let g = build(...)` and an aggregate return type the
+# target address is passed through. The structure comes into being EXACTLY ONCE in the
+# frame of the caller -- not additionally in the frame of the producing function and not
+# through a copy.
 #
-# Geprueft wird am erzeugten Assembler:
-#   1. Der Rahmen von `build` ist KLEIN (< 64 KB), obwohl die Struktur 1 MB hat.
-#   2. Der Rahmen von `main` ist etwa 1 MB (genau eine Ausfertigung).
-#   3. Es gibt keine Bulk-Kopie (`rep movs`) — nichts wird umgeschaufelt.
+# It is checked on the emitted assembly:
+#   1. The frame of `build` is SMALL (< 64 KB) although the structure has 1 MB.
+#   2. The frame of `main` is about 1 MB (exactly one instance).
+#   3. There is no bulk copy (`rep movs`) -- nothing is shovelled around.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
@@ -21,8 +21,8 @@ trap 'rm -f "$ASM"' EXIT
 MB=1048576
 "$FIRNC" --emit=asm -o "$ASM" "$SRC"
 
-# Linker-Symbol: 'main' behaelt seinen nackten Namen, alles andere traegt das
-# Schema aus modules.rs (_F<schema>.<name>, DESIGNZIELE 4).
+# Linker symbol: 'main' keeps its bare name, everything else carries the
+# scheme from modules.rs (_F<scheme>.<name>, DESIGNZIELE 4).
 rahmen() {   # $1 = Funktionsname -> Byte-Zahl aus 'sub rsp, N'
     awk -v n="$1" '
         $0 == n":" || $0 ~ "^_F[0-9]+\\." n ":" { inf = 1; next }

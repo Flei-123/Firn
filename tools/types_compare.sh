@@ -13,17 +13,17 @@
 # System-V-Klasse jedes Arguments und des Rueckgabewertes samt `sret`.
 set -uo pipefail
 cd "$(dirname "$0")/.."
-# Eigenes Temp-Verzeichnis je Lauf: zwei gleichzeitige Laeufe (z. B. Haupt-
-# repo und ein Worktree) benutzten sonst DIESELBEN /tmp-Dateien und
-# ueberschrieben sich gegenseitig die Vergleichsausgaben — das sah wie ein
-# echter Unterschied aus (Runde 41).
+# A temp directory of its own per run: two simultaneous runs (e.g. the main
+# repo and a worktree) otherwise used THE SAME /tmp files and
+# overwrote each other's comparison output -- which looked like a
+# real difference (round 41).
 TMPD=$(mktemp -d)
 trap 'rm -rf "$TMPD"' EXIT
 
 FIRNC=compiler/target/release/firnc
 DUMP=${LAYOUTDUMP:-./.layoutdump}
 
-# Neu bauen, wenn das Dump-Binary fehlt ODER Quellen juenger sind
+# Rebuild when the dump binary is missing OR sources are younger
 if [ ! -x "$DUMP" ] || [ -n "$(find bin lib/firnc1 -name '*.fi' -newer "$DUMP" -print -quit)" ]; then
     rm -f "$DUMP"
     "$FIRNC" bin/layoutdump.fi -o "$DUMP" || exit 1

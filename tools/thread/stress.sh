@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tools/thread/stress.sh — Dauerlauf mit mehreren Faeden und laufendem Sammler.
 #
-# Gemessen wird der ECHTE Speicherverbrauch des Prozesses (RSS aus
+# What is measured is the REAL memory consumption of the process (RSS from
 # /proc/self/statm), nicht die Selbstauskunft der Laufzeit. Bewertet wird:
 #
 #   * kein Absturz und kein Verklemmen ueber die ganze Laufzeit
@@ -13,7 +13,7 @@
 #   * RSS driftet nicht: die letzte Stichprobe darf die kleinste nicht um
 #     mehr als STRESS_DRIFT_KIB uebersteigen
 #
-# Umgebung:
+# Environment:
 #   STRESS_SEK    Laufzeit in Sekunden (Standard 130)
 #   STRESS_THREADS Zahl der Faeden (Standard 4)
 #   STRESS_LOCAL  1 = Freilisten je Faden (Variante B), 0 = GC-Sperre (A)

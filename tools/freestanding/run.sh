@@ -1,25 +1,25 @@
 #!/usr/bin/env bash
-# tools/freestanding/run.sh — DER NACHWEIS, DASS `profile kernel` ETWAS BEDEUTET.
+# tools/freestanding/run.sh -- THE PROOF THAT `profile kernel` MEANS SOMETHING.
 #
-# Runde 52. Geprueft wird, was man an der erzeugten Datei ABLESEN kann, nicht
-# was der Compiler ueber sich selbst behauptet:
+# Round 52. What is checked is what can be READ OFF the produced file, not
+# what the compiler claims about itself:
 #
-#   1. `demos/kernel/core.fi` uebersetzt mit BEIDEN Compilern zu einer
-#      ELF-Objektdatei (`ET_REL`), nicht zu einer ausfuehrbaren Datei.
-#   2. Die Objektdatei hat KEINEN undefinierten Namen — kein libc, kein
-#      `_start`, keine Laufzeit. (`nm -u` liefert nichts.)
-#   3. Sie enthaelt keinen einzigen `syscall`-Befehl (`objdump -d`).
-#   4. Sie laesst sich mit `ld -T demos/kernel/linker.ld` zu einem Abbild
-#      binden und in QEMU BOOTEN: die serielle Ausgabe des Kernels erscheint.
-#   5. Der Inline-Assembler steht wirklich drin (`in`/`out`, `hlt`, `cli`),
-#      der Interrupt-Einsprungpunkt endet mit `iretq` und rettet 14 Register.
-#   6. Die volatile-Zusage haelt in ALLEN DREI Baustufen: `asm` und MMIO
-#      bleiben stehen und werden nicht zusammengelegt (tests/850-854 pruefen
-#      dasselbe zur Laufzeit; hier zaehlen wir die Befehle im Assembler).
+#   1. `demos/kernel/core.fi` compiles with BOTH compilers to an
+#      ELF object file (`ET_REL`), not to an executable.
+#   2. The object file has NO undefined name -- no libc, no
+#      `_start`, no runtime. (`nm -u` yields nothing.)
+#   3. It contains not a single `syscall` instruction (`objdump -d`).
+#   4. It can be linked with `ld -T demos/kernel/linker.ld` into an image
+#      and BOOTED in QEMU: the serial output of the kernel appears.
+#   5. The inline assembly is really in there (`in`/`out`, `hlt`, `cli`),
+#      the interrupt entry point ends with `iretq` and saves 14 registers.
+#   6. The volatile promise holds in ALL THREE build stages: `asm` and MMIO
+#      stay and are not merged (tests/850-854 check the same
+#      at run time; here we count the instructions in the assembly).
 #
-# Kein Vergleich der Assemblertexte zwischen den Stufen: `firnc0` hat eine
-# Registerzuteilung, `lib/firnc1/codegen.fi` nicht. Verglichen wird, was
-# gleich sein MUSS — die Symboltabelle und die Freistehendheit.
+# No comparison of the assembly texts between the stages: `firnc0` has a
+# register allocation, `lib/firnc1/codegen.fi` does not. What is compared is what
+# HAS to be equal -- the symbol table and the freestanding property.
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 
@@ -28,7 +28,7 @@ FIRNC=compiler/target/release/firnc
 FC1=${FIRNC1:-./.firnc1}
 QUELLE=demos/kernel/core.fi
 SKRIPT=demos/kernel/linker.ld
-# Eigenes Temp-Verzeichnis je Lauf (mehrere Runden laufen parallel).
+# A temp directory of its own per run (several rounds run in parallel).
 TMPD=$(mktemp -d)
 trap 'rm -rf "$TMPD"' EXIT
 
@@ -38,8 +38,8 @@ ok()  { pass=$((pass+1)); printf '  OK    %s\n' "$1"; }
 bad() { fail=$((fail+1)); printf '  FAIL  %s\n' "$1"; }
 
 [ -x "$FIRNC" ] || { echo "firnc0 fehlt: $FIRNC"; exit 1; }
-# `.firnc1` neu bauen, wenn es fehlt oder eine Quelle juenger ist (die Falle
-# aus Runde 35/45/46: ein veraltetes Binary misst den Stand von gestern).
+# Rebuild `.firnc1` when it is missing or a source is younger (the trap
+# from round 35/45/46: an outdated binary measures yesterday's state).
 neu=0
 [ -x "$FC1" ] || neu=1
 if [ -x "$FC1" ]; then
@@ -56,9 +56,9 @@ echo "== 1. Uebersetzen (beide Compiler, Profil aus der Quelle) =="
 "$FC1" "$QUELLE" -o "$TMPD/k1.o" >"$TMPD/e1" 2>&1 \
     && ok "firnc1: $QUELLE -> k1.o" || { bad "firnc1 uebersetzt nicht (rc=$?)"; sed 's/^/        /' "$TMPD/e1"; }
 
-# Gegenprobe: derselbe Quelltext mit `--profile=app` MUSS scheitern —
-# `syscall` gibt es dort zwar, aber `#[interrupt]` nicht. Ohne diese Probe
-# wuerde ein Compiler, der das Profil ignoriert, hier unbemerkt durchlaufen.
+# Counter-check: the same source text with `--profile=app` MUST fail --
+# `syscall` does exist there, but `#[interrupt]` does not. Without this probe
+# a compiler that ignores the profile would pass here unnoticed.
 if "$FIRNC" --profile=app -o "$TMPD/app.o" "$QUELLE" >"$TMPD/app.err" 2>&1; then
     bad "Gegenprobe: --profile=app haette scheitern muessen"
 else
@@ -77,7 +77,7 @@ for s in 0 1; do
     undef=$(nm -u "$f" 2>/dev/null | sed '/^$/d')
     [ -z "$undef" ] && ok "firnc$s: KEIN undefiniertes Symbol" \
                     || { bad "firnc$s: undefinierte Symbole"; echo "$undef" | sed 's/^/        /'; }
-    # Jedes definierte Symbol gehoert dem Programm selbst (Praefix _F0./_F1.).
+    # Every defined symbol belongs to the program itself (prefix _F0./_F1.).
     fremd=$(nm --defined-only "$f" | awk '{print $3}' | grep -vE "^_F[01]\." || true)
     [ -z "$fremd" ] && ok "firnc$s: alle definierten Symbole sind eigene" \
                     || { bad "firnc$s: fremde Symbole"; echo "$fremd" | sed 's/^/        /'; }
@@ -99,7 +99,7 @@ for s in 0 1; do
           -o "$TMPD/k$s.elf" "$TMPD/start.o" "$f" 2>"$TMPD/ld$s.err"; then
         ein=$(readelf -h "$TMPD/k$s.elf" | awk -F: '/Entry point/ {print $2}' | tr -d ' ')
         ok "firnc$s: gelinkt, Einsprung $ein"
-        # Der einzige nicht aus Firn stammende Code ist `start.s`.
+        # The only code that does not come from Firn is `start.s`.
         undef=$(nm -u "$TMPD/k$s.elf" 2>/dev/null | sed '/^$/d')
         [ -z "$undef" ] && ok "firnc$s: das gebundene Abbild hat kein offenes Symbol" \
                         || { bad "firnc$s: offene Symbole im Abbild"; echo "$undef" | sed 's/^/        /'; }
@@ -112,8 +112,8 @@ echo "== 3b. In QEMU booten (der eigentliche Beweis) =="
 if command -v qemu-system-x86_64 >/dev/null 2>&1; then
     for s in 0 1; do
         [ -f "$TMPD/k$s.elf" ] || continue
-        # QEMUs Multiboot-Lader nimmt nur ELF32; alle Adressen liegen unter
-        # 4 GiB, deshalb genuegt eine Umschrift des Kopfes.
+        # QEMU's multiboot loader only takes ELF32; all addresses lie below
+        # 4 GiB, so a rewrite of the header is enough.
         objcopy -O elf32-i386 "$TMPD/k$s.elf" "$TMPD/k$s.mb" 2>/dev/null
         timeout 20 qemu-system-x86_64 -kernel "$TMPD/k$s.mb" -serial stdio \
             -display none -no-reboot > "$TMPD/q$s.txt" 2>&1
@@ -141,15 +141,15 @@ for s in 0 1; do
             bad "firnc$s: '$befehl' fehlt"
         fi
     done
-    # `#[interrupt]`: 14 push + 14 pop im Einsprungpunkt.
+    # `#[interrupt]`: 14 push + 14 pop in the entry point.
     n=$(awk '/<_F'"$s"'\.timer_ih>:/,/iretq/' "$TMPD/d$s.txt" | grep -cE '\bpush\b')
     [ "$n" -eq 15 ] && ok "firnc$s: timer_ih rettet 14 Register + rbp" \
                     || bad "firnc$s: timer_ih hat $n push, erwartet 15"
 done
 
 echo "== 5. volatile haelt in allen drei Baustufen =="
-# `cli` und `hlt` stehen in `core_start`, das niemand ruft — sie koennen also
-# auch durch Einbetten nicht mehr werden. Genau einmal, in jeder Baustufe.
+# `cli` and `hlt` stand in `core_start`, which nobody calls -- so they cannot
+# become more through inlining either. Exactly once, in every build stage.
 for stufe in "" "--no-opt" "--opt-level=dev-fast"; do
     name=${stufe:---release-fast}
     "$FIRNC" $stufe --emit=asm -o "$TMPD/k.s" "$QUELLE" 2>/dev/null || { bad "asm-Ausgabe $name"; continue; }
@@ -164,13 +164,13 @@ for stufe in "" "--no-opt" "--opt-level=dev-fast"; do
     fi
 done
 
-# Die SCHARFE Zaehlung: tools/freestanding/volatile.fi hat alles in EINER
-# Funktion und ruft nichts — Einbetten kann die Zahlen nicht verschieben.
-# Gezaehlt wird in der FIR NACH dem Optimierer: dort steht, was er stehen
-# gelassen hat. Drei woertlich gleiche `asm("pause")` muessen drei bleiben
-# (kein CSE), zwei MMIO-Lasten auf dieselbe Adresse zwei (keine
-# Zusammenlegung), und das `rdtsc` mit unbenutztem Ergebnis darf nicht
-# verschwinden (die Falle aus Runde 40).
+# The SHARP count: tools/freestanding/volatile.fi has everything in ONE
+# function and calls nothing -- inlining cannot shift the numbers.
+# Counted in the FIR AFTER the optimiser: what it has left standing is
+# written there. Three literally equal `asm("pause")` have to stay three
+# (no CSE), two MMIO loads on the same address two (no
+# merging), and the `rdtsc` with an unused result must not
+# disappear (the trap from round 40).
 VOL=tools/freestanding/volatile.fi
 for stufe in "" "--no-opt" "--opt-level=dev-fast"; do
     name=${stufe:---release-fast}
@@ -187,8 +187,8 @@ for stufe in "" "--no-opt" "--opt-level=dev-fast"; do
     "$FIRNC" $stufe -o "$TMPD/v0" "$VOL" 2>/dev/null && "$TMPD/v0" >/dev/null 2>&1
     [ "$?" = 6 ] && ok "volatile.fi $name: laeuft, liefert 6" || bad "volatile.fi $name: falscher Rueckgabewert"
 done
-# Und dasselbe durch den Compiler in Firn: dort gibt es keinen Optimierer,
-# also zaehlt der Assemblertext — und danach das Verhalten.
+# And the same through the compiler in Firn: there is no optimiser there,
+# so the assembly text counts -- and after that the behaviour.
 rm -f "$TMPD/v1" "$TMPD/v1.s" "$TMPD/v1.o"
 if "$FC1" "$VOL" -o "$TMPD/v1" >/dev/null 2>&1; then
     c=$(grep -cE '^\s+pause$' "$TMPD/v1.s")

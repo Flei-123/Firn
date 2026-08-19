@@ -17,11 +17,11 @@
 #      and without the optimiser a call by name `call ... Dot__less` instead.
 #   2. In `dynamic` there is at least one. (Without this counter-check the
 #      test would pass even if it measured nothing at all.)
-#   3. Dasselbe in der FIR: `statisch` enthaelt weder `calli` noch `vtab`,
-#      `dynamisch` beides.
-#   4. `statisch` laedt auch keine Methodentafel-Adresse (`lea … .L__iface`).
-#   5. Beide Compiler (firnc0 und firnc1) verhalten sich gleich.
-#   6. Instruktionszahlen mit callgrind — deterministisch, nicht die Uhr.
+#   3. The same in the FIR: `static` contains neither `calli` nor `vtab`,
+#      `dynamic` contains both.
+#   4. `static` does not load a method table address either (`lea ... .L__iface`).
+#   5. Both compilers (firnc0 and firnc1) behave the same.
+#   6. Instruction counts with callgrind -- deterministic, not the clock.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 FIRNC="compiler/target/release/firnc"
@@ -33,7 +33,7 @@ melde() { echo "FEHLER: $1"; FEHLER=1; }
 
 export FIRNLIB="$(pwd)/lib"
 
-# Wie viele indirekte Aufrufe stehen in dieser Assemblerdatei?
+# How many indirect calls are in this assembly file?
 indirekte() {
     grep -cE '^[[:space:]]*call[[:space:]]+(\*|r[a-z0-9]+$)' "$1" || true
 }
@@ -107,7 +107,7 @@ fn main() -> i32 {
 }
 EOF
 
-# --- 1./2./4. firnc0: Assembler, in allen drei Baustufen --------------------
+# --- 1./2./4. firnc0: assembly, in all three build stages ------------------
 for stufe in "release-fast:" "no-opt:--no-opt" "dev-fast:--opt-level=dev-fast"; do
     name=${stufe%%:*}
     opt=${stufe#*:}
@@ -125,12 +125,12 @@ for stufe in "release-fast:" "no-opt:--no-opt" "dev-fast:--opt-level=dev-fast"; 
     grep -qE 'lea.*\.L__iface' "$W/d_$name.s" \
         || melde "firnc0/$name: die dyn-Fassung laedt KEINE Methodentafel-Adresse"
 done
-# Der namentliche Aufruf ist ohne Optimierer sichtbar — MIT Optimierer
-# verschwindet er ganz, und das ist der eigentliche Gewinn (siehe Messung).
+# The call by name is visible without the optimiser -- WITH the optimiser
+# it disappears completely, and that is the real gain (see the measurement).
 grep -qE '^[[:space:]]*call[[:space:]]+\S*Dot__less' "$W/s_no-opt.s" \
     || melde "firnc0/no-opt: kein namentlicher Aufruf 'Dot__less' in der Schrankenfassung"
 
-# --- 3. Dieselbe Aussage in der FIR ----------------------------------------
+# --- 3. the same statement in the FIR --------------------------------------
 "$FIRNC" --emit=fir-raw "$W/statisch.fi"  > "$W/s.fir" 2>/dev/null
 "$FIRNC" --emit=fir-raw "$W/dynamisch.fi" > "$W/d.fir" 2>/dev/null
 for wort in calli vtab; do
@@ -140,7 +140,7 @@ for wort in calli vtab; do
     [ "$n" -ge 1 ] || melde "FIR der dyn-Fassung enthaelt kein '$wort'"
 done
 
-# --- 5. firnc1 sagt dasselbe -----------------------------------------------
+# --- 5. firnc1 says the same -----------------------------------------------
 if [ ! -x "$FC1" ] || [ -n "$(find bin lib/firnc1 -name '*.fi' -newer "$FC1" -print -quit)" ]; then
     rm -f "$FC1"
     "$FIRNC" bin/firnc1.fi -o "$FC1" >/dev/null || melde "firnc1 liess sich nicht bauen"
@@ -168,7 +168,7 @@ if [ -x "$FC1" ]; then
     fi
 fi
 
-# --- 6. Instruktionen (callgrind) ------------------------------------------
+# --- 6. instructions (callgrind) -------------------------------------------
 messen() {   # $1 = Binary -> Instruktionen gesamt
     valgrind --tool=callgrind --callgrind-out-file=/dev/null "$1" 2>&1 \
         | sed -n 's/.*I *refs: *//p' | tr -d ', '

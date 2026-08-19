@@ -1,32 +1,32 @@
 #!/usr/bin/env bash
-# tools/dom_soak/run.sh — Dauerlauf des DOM-Prototyps (Abnahmepunkt 2).
+# tools/dom_soak/run.sh -- soak run of the DOM prototype (acceptance item 2).
 #
-# Prueft die Zusage aus FIRN-ANFORDERUNGEN.md §13: "DOM-Prototyp mit Eltern-/
-# Kind-Rueckverweisen und Listener-Zyklen, der im Dauerlauf nicht leckt."
+# Checks the promise from FIRN-ANFORDERUNGEN.md 13: "DOM prototype with
+# parent/child back references and listener cycles that does not leak in a soak run."
 #
-# Gemessen wird der ECHTE Speicherverbrauch des Prozesses (RSS aus
-# /proc/self/statm), nicht die Selbstauskunft der Laufzeit. Zusaetzlich laeuft
-# JEDES MAL die absichtlich leckende Gegenprobe (lib/dom/soak_leak.fi, gleicher
-# Zyklensatz mit Zaehlverweisen). Bleibt die gruen, ist das Messverfahren
-# kaputt und dieses Skript bricht ab — eine Messung, die nichts anzeigen kann,
-# waere schlimmer als keine.
+# What is measured is the REAL memory consumption of the process (RSS from
+# /proc/self/statm), not the self-report of the runtime. In addition the
+# deliberately leaking counter-check runs EVERY TIME (lib/dom/soak_leak.fi, the same
+# set of cycles with reference counts). If it stays green, the measuring method
+# is broken and this script aborts -- a measurement that cannot show anything
+# would be worse than none.
 #
-# Umgebung:
-#   SOAK_SEC         Laufzeitbudget je Fassung in Sekunden (Standard 600)
-#   SOAK_CYCLES      Hoechstzahl Zyklensaetze (Standard 100000000)
-#   SOAK_SAMPLE  Zyklen je Datenzeile (Standard 1000)
-#   SOAK_MIN_CYCLES  Mindestzahl Zyklen fuer ein gueltiges Urteil (Standard 100000)
-#   SOAK_LEAK_CYCLES Obergrenze fuer die LECKENDE Gegenprobe (Standard 600000;
-#                    seit Runde 53 leckt ein Satz 13 Objekte zu 128 Byte,
-#                    das sind rund 1,0 GiB — vorher 6 zu 64 Byte)
-#   SOAK_LEAK_MB     harte Speicherbremse fuer die Gegenprobe in MiB (Standard 3072)
+# Environment:
+#   SOAK_SEC         time budget per version in seconds (default 600)
+#   SOAK_CYCLES      maximum number of cycle sets (default 100000000)
+#   SOAK_SAMPLE      cycles per data line (default 1000)
+#   SOAK_MIN_CYCLES  minimum number of cycles for a valid verdict (default 100000)
+#   SOAK_LEAK_CYCLES upper limit for the LEAKING counter-check (default 600000;
+#                    since round 53 one set leaks 13 objects of 128 bytes,
+#                    that is about 1.0 GiB -- before it was 6 of 64 bytes)
+#   SOAK_LEAK_MB     hard memory brake for the counter-check in MiB (default 3072)
 #
-# WARUM DIE GEGENPROBE GEDECKELT IST: sie leckt bauartbedingt rund 384 Byte je
-# Zyklus (6 von 7 Objekten a 64 Byte). Ohne Deckel frisst sie bei voller
-# Zyklenzahl zweistellige Gigabyte und reisst die Maschine mit — beim ersten
-# Langlauf gemessen: 7,0 GB nach 18,8 Mio. Zyklen. 2 Mio. Zyklen (~770 MiB)
-# zeigen dasselbe Bild und sind ungefaehrlich. Zusaetzlich begrenzt `ulimit -v`
-# den Adressraum als harte Bremse.
+# WHY THE COUNTER-CHECK IS CAPPED: by construction it leaks about 384 bytes per
+# cycle (6 of 7 objects at 64 bytes). Without a cap it eats double-digit
+# gigabytes at the full number of cycles and takes the machine down with it -- measured
+# on the first long run: 7.0 GB after 18.8 million cycles. 2 million cycles (~770 MiB)
+# show the same picture and are harmless. In addition `ulimit -v` limits
+# the address space as a hard brake.
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 
@@ -56,14 +56,14 @@ rm -rf "$ARBEIT"
 mkdir -p "$ARBEIT" "$AUS"
 cp lib/dom/dom.fi lib/dom/meas.fi "$ARBEIT/"
 
-# Arbeitskopie mit umgestellten Konstanten anlegen.
-# $1 Quelle  $2 Ziel  $3 Budget ms  $4 Zyklen  $5 Stichprobe
+# Create a working copy with the constants changed over.
+# $1 source  $2 target  $3 budget ms  $4 cycles  $5 sample
 stelle_um() {
     sed -e "s|^const BUDGET_MS: i64 = .*$|const BUDGET_MS: i64 = $3  // SOAK_BUDGET_MS|" \
         -e "s|^const CYCLES_MAX: i64 = .*$|const CYCLES_MAX: i64 = $4  // SOAK_CYCLES_MAX|" \
         -e "s|^const SAMPLE: i64 = .*$|const SAMPLE: i64 = $5  // SOAK_SAMPLE|" \
         "$1" > "$2"
-    # Die drei Zeilen muessen wirklich ersetzt worden sein.
+    # The three lines really have to have been replaced.
     if ! grep -q "const BUDGET_MS: i64 = $3 " "$2"; then
         echo "FEHLER: BUDGET_MS in $1 nicht ersetzbar (Zeile veraendert?)."
         exit 1
@@ -81,9 +81,9 @@ stelle_um() {
 echo "== DOM-Dauerlauf (Abnahmepunkt 2) =="
 echo "   Budget je Fassung: ${SEK}s, hoechstens $ZYKLEN Zyklen, Stichprobe alle $STICH"
 
-# ---------------------------------------------------------------- 1. Baustufen
-# Beide Programme in ALLEN DREI Baustufen bauen und einen Kurzlauf vergleichen.
-# Ein Speichermodell, das nur bei eingeschaltetem Optimierer haelt, taugt nichts.
+# ---------------------------------------------------------- 1. build stages
+# Build both programs in ALL THREE build stages and compare a short run.
+# A memory model that only holds with the optimiser switched on is worthless.
 echo
 echo "-- 1. Bau in drei Baustufen und Kurzlauf-Vergleich --"
 STUFEN=("release-fast:" "no-opt:--no-opt" "dev-fast:--opt-level=dev-fast")
@@ -125,13 +125,13 @@ if [ $fehler -ne 0 ]; then
     exit 1
 fi
 
-# ------------------------------------------------------------------ 2. Messlauf
+# ------------------------------------------------------------ 2. measuring run
 echo
 echo "-- 2. Dauerlauf --"
 for variante in gc leak; do
     grenze=$ZYKLEN
     if [ "$variante" = leak ]; then
-        # Gedeckelt: siehe Kopf der Datei. Diese Fassung leckt absichtlich.
+        # Capped: see the head of the file. This version leaks on purpose.
         grenze=$LECK_ZYKLEN
     fi
     stelle_um "lib/dom/soak_$variante.fi" "$ARBEIT/soak_$variante.fi" "$BUDGET_MS" "$grenze" "$STICH"
@@ -142,8 +142,8 @@ for variante in gc leak; do
     fi
     start=$(date +%s)
     if [ "$variante" = leak ]; then
-        # Harte Bremse: der Adressraum ist begrenzt, damit ein Fehler in der
-        # Gegenprobe niemals die Maschine mitnimmt.
+        # Hard brake: the address space is limited so that a bug in the
+        # counter-check never takes the machine with it.
         ( ulimit -v $((LECK_MB * 1024)); exec "$ARBEIT/soak_$variante" ) > "$AUS/measurement-$variante.tsv"
     else
         "$ARBEIT/soak_$variante" > "$AUS/measurement-$variante.tsv"
@@ -158,7 +158,7 @@ for variante in gc leak; do
     echo "   $variante: $(grep '^# fertig' "$AUS/measurement-$variante.tsv") (${dauer}s Wanduhr)"
 done
 
-# ---------------------------------------------------------------- 3. Auswertung
+# ---------------------------------------------------------------- 3. evaluation
 echo
 echo "-- 3. Auswertung --"
 LECK_MINZ=$((LECK_ZYKLEN / 4))
@@ -204,10 +204,10 @@ def urteil(pfad, minz):
     letztes = z[3 * v:] or z[-1:]
     rss2, rssl = median([r[2] for r in zweites]), median([r[2] for r in letztes])
     leb2, lebl = median([r[3] for r in zweites]), median([r[3] for r in letztes])
-    # Monotonie: steigt der RSS nach der Aufwaermphase durchgehend?
+    # Monotonicity: does the RSS rise continuously after the warm-up phase?
     nach = [r[2] for r in z[v:]]
     monoton = all(b >= a for a, b in zip(nach, nach[1:])) and nach[-1] > nach[0]
-    # Schwelle: 5 % Zuwachs des Medians gilt als Leck.
+    # Threshold: a 5 % increase of the median counts as a leak.
     wuchs = rssl > rss2 * 1.05
     return {
         'pfad': pfad, 'zyklen': zyklen, 'stichproben': n, 'fertig': fertig,
