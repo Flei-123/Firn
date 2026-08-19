@@ -1262,15 +1262,53 @@ fn deskriptor_peephole(asm: &str, nv: usize) -> String {
             }
         }
     }
+    /// Bitbreite eines Registernamens.
+    fn breite_von(r: &str) -> u32 {
+        match r {
+            "al" | "bl" | "cl" | "dl" | "sil" | "dil" | "bpl" => 8,
+            "ax" | "bx" | "cx" | "dx" | "si" | "di" | "bp" => 16,
+            "eax" | "ebx" | "ecx" | "edx" | "esi" | "edi" | "ebp" => 32,
+            _ => {
+                let b = r.as_bytes();
+                if b.len() >= 3 && b[0] == b'r' && r[1..r.len() - 1].chars().all(|c| c.is_ascii_digit())
+                {
+                    match b[b.len() - 1] {
+                        b'b' => 8,
+                        b'w' => 16,
+                        b'd' => 32,
+                        _ => 64,
+                    }
+                } else {
+                    64
+                }
+            }
+        }
+    }
     let max_slot = nv as u64 * 8;
     let mut out = String::with_capacity(asm.len());
-    // slot_off -> Register mit demselben Inhalt
-    let mut sync: HashMap<u64, String> = HashMap::new();
+    // slot_off -> (Register mit demselben Inhalt, Breite der Speicherung)
+    let mut sync: HashMap<u64, (String, u32)> = HashMap::new();
     // Register -> slot_off (Umkehrung)
     let mut holds: HashMap<String, u64> = HashMap::new();
-    let kill_reg = |r: &str, sync: &mut HashMap<u64, String>, holds: &mut HashMap<String, u64>| {
+    // NULLERWEITERUNG (Runde 51). `nullab[r] = k` heisst: alle Bits ab k
+    // sind in `r` garantiert null. Ohne Eintrag ist nichts bekannt.
+    //
+    // Grundlage ist eine Eigenschaft von x86-64, die im ganzen Nachpass
+    // gilt: JEDER Schreibzugriff auf ein 32-Bit-Register nullt die oberen
+    // 32 Bit des 64-Bit-Registers. Ein `movzx r32, byte ptr [..]` sagt
+    // sogar, dass alles ab Bit 8 null ist.
+    //
+    // Erst damit darf ein schmaler Reload gestrichen werden: `mov [X], r8d`
+    // gefolgt von `mov r8d, [X]` laedt genau die Bits zurueck, die schon in
+    // r8 stehen — aber nur, wenn r8 oben ohnehin schon null ist. Genau diese
+    // Bedingung fehlte in Runde 43, weshalb der Fall dort zurueckgestellt
+    // wurde (docs/RUNDE43.md §6).
+    let mut nullab: HashMap<String, u32> = HashMap::new();
+    let kill_reg = |r: &str,
+                    sync: &mut HashMap<u64, (String, u32)>,
+                    holds: &mut HashMap<String, u64>| {
         if let Some(off) = holds.remove(r) {
-            if sync.get(&off).map(|s| s.as_str()) == Some(r) {
+            if sync.get(&off).map(|s| s.0.as_str()) == Some(r) {
                 sync.remove(&off);
             }
         }
@@ -1283,9 +1321,11 @@ fn deskriptor_peephole(asm: &str, nv: usize) -> String {
             if t.ends_with(':') && !t.starts_with('.') {
                 sync.clear();
                 holds.clear();
+                nullab.clear();
             } else if t.starts_with(".L") && t.ends_with(':') {
                 sync.clear();
                 holds.clear();
+                nullab.clear();
             }
             out.push_str(zeile);
             out.push('\n');
@@ -1295,47 +1335,114 @@ fn deskriptor_peephole(asm: &str, nv: usize) -> String {
         let mn = teile.next().unwrap_or("");
         let ops = teile.next().unwrap_or("").trim();
         // Zielenformen, die wir tracken/ersetzen.
-        if let Some(rest) = t.strip_prefix("mov qword ptr [rbp-") {
+        // Speichern in ein WERT-Fach, in JEDER Breite (Runde 51: vorher nur
+        // `qword`). `off <= max_slot` grenzt auf die Wert-Faecher ein —
+        // `alloca`-Plaetze liegen dahinter und koennen ueber Zeiger
+        // beschrieben werden.
+        let stbreite = if t.starts_with("mov qword ptr [rbp-") {
+            Some(64)
+        } else if t.starts_with("mov dword ptr [rbp-") {
+            Some(32)
+        } else if t.starts_with("mov word ptr [rbp-") {
+            Some(16)
+        } else if t.starts_with("mov byte ptr [rbp-") {
+            Some(8)
+        } else {
+            None
+        };
+        if let Some(bw) = stbreite {
+            let rest = &t[t.find("[rbp-").unwrap() + 5..];
             if let Some(kl) = rest.find(']') {
                 let off: u64 = rest[..kl].parse().unwrap_or(0);
                 let q = rest[kl + 1..].trim_start_matches(',').trim();
-                if off >= 8 && off <= max_slot && ist_reg64(q) {
+                if off >= 8 && off <= max_slot && breite_von(q) == bw && ist_reg64(stamm(q)) {
                     let q = stamm(q).to_string();
                     kill_reg(&q, &mut sync, &mut holds);
-                    sync.insert(off, q.clone());
+                    sync.insert(off, (q.clone(), bw));
                     holds.insert(q, off);
                     out.push_str(zeile);
                     out.push('\n');
                     continue;
                 }
+                // Sofortkonstante o.ae.: das Fach hat einen neuen Inhalt,
+                // der in keinem Register steht.
+                if off >= 8 && off <= max_slot {
+                    if let Some((r, _)) = sync.remove(&off) {
+                        holds.remove(&r);
+                    }
+                }
             }
         }
-        if t.strip_prefix("mov r").is_some() {
-            // `mov rX, qword ptr [rbp-off]` — der Reload.
-            if let Some(kl) = ops.find(", qword ptr [rbp-") {
-                let ziel = &ops[..kl];
-                if ist_reg64(ziel) {
-                    if let Some(ende) = ops[kl + 17..].find(']') {
-                        let off: u64 = ops[kl + 17..kl + 17 + ende].parse().unwrap_or(0);
-                        if off >= 8 && off <= max_slot {
-                            let z = stamm(ziel).to_string();
-                            if let Some(r2) = sync.get(&off).cloned() {
-                                if r2 != z {
-                                    out.push_str(&format!("    mov {}, {}\n", z, r2));
-                                }
-                                // r2 == z: Reload entfaellt ganz.
+        // Reload aus einem Wert-Fach. Vier Formen, jede mit ihrer eigenen
+        // Bedingung:
+        //   mov  rY,  qword ptr [X]   braucht Speicherbreite 64
+        //   mov  rYd, dword ptr [X]   braucht >= 32 und nullab[rY] <= 32
+        //   movzx rYd, byte ptr [X]   braucht >=  8 und nullab[rY] <=  8
+        //   movzx rYd, word ptr [X]   braucht >= 16 und nullab[rY] <= 16
+        // `movsx`/`movsxd` bleiben aussen vor: Vorzeichenerweiterung laesst
+        // sich aus `nullab` nicht belegen.
+        let rlform = if mn == "mov" {
+            if let Some(k) = ops.find(", qword ptr [rbp-") {
+                Some((k, 17usize, 64u32, 64u32))
+            } else {
+                ops.find(", dword ptr [rbp-").map(|k| (k, 17usize, 32u32, 32u32))
+            }
+        } else if mn == "movzx" {
+            if let Some(k) = ops.find(", byte ptr [rbp-") {
+                Some((k, 16usize, 8u32, 8u32))
+            } else {
+                ops.find(", word ptr [rbp-").map(|k| (k, 16usize, 16u32, 16u32))
+            }
+        } else {
+            None
+        };
+        if let Some((kl, vor, mindest, ndbits)) = rlform {
+            let ziel = &ops[..kl];
+            let zb = breite_von(ziel);
+            // Zielbreite muss zur Ladeform passen: qword -> 64, sonst 32.
+            let passt_ziel = if mindest == 64 { zb == 64 } else { zb == 32 };
+            if passt_ziel && ist_reg64(stamm(ziel)) {
+                if let Some(ende) = ops[kl + vor..].find(']') {
+                    let off: u64 = ops[kl + vor..kl + vor + ende].parse().unwrap_or(0);
+                    if off >= 8 && off <= max_slot {
+                        let z = stamm(ziel).to_string();
+                        let treffer = match sync.get(&off) {
+                            Some((r2, bw)) if *bw >= mindest => Some(r2.clone()),
+                            _ => None,
+                        };
+                        if let Some(r2) = treffer {
+                            let selbe = r2 == z;
+                            let schon_null = nullab.get(&z).copied().unwrap_or(64) <= ndbits;
+                            if selbe && (mindest == 64 || schon_null) {
+                                // Der Wert steht bereits genau so im Register.
                                 kill_reg(&z, &mut sync, &mut holds);
-                                sync.insert(off, z.clone());
-                                holds.insert(z, off);
+                                sync.insert(off, (z.clone(), mindest));
+                                holds.insert(z.clone(), off);
+                                if mindest < 64 {
+                                    nullab.insert(z, ndbits);
+                                }
                                 continue;
                             }
-                            kill_reg(&z, &mut sync, &mut holds);
-                            sync.insert(off, z.clone());
-                            holds.insert(z, off);
-                            out.push_str(zeile);
-                            out.push('\n');
-                            continue;
+                            if !selbe && mindest == 64 {
+                                out.push_str(&format!("    mov {}, {}\n", z, r2));
+                                kill_reg(&z, &mut sync, &mut holds);
+                                sync.insert(off, (z.clone(), 64));
+                                holds.insert(z.clone(), off);
+                                nullab.remove(&z);
+                                continue;
+                            }
                         }
+                        kill_reg(&z, &mut sync, &mut holds);
+                        sync.insert(off, (z.clone(), mindest));
+                        holds.insert(z.clone(), off);
+                        if mindest < 64 {
+                            nullab.insert(z, ndbits);
+                        } else {
+                            nullab.remove(&z);
+                        }
+                        out.push_str(zeile);
+                        out.push('\n');
+                        continue;
                     }
                 }
             }
@@ -1344,6 +1451,7 @@ fn deskriptor_peephole(asm: &str, nv: usize) -> String {
         if mn.starts_with('j') || mn == "ret" {
             sync.clear();
             holds.clear();
+            nullab.clear();
             out.push_str(zeile);
             out.push('\n');
             continue;
@@ -1351,6 +1459,7 @@ fn deskriptor_peephole(asm: &str, nv: usize) -> String {
         if mn == "call" {
             for r in ["rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11"] {
                 kill_reg(r, &mut sync, &mut holds);
+                nullab.remove(r);
             }
             out.push_str(zeile);
             out.push('\n');
@@ -1359,6 +1468,7 @@ fn deskriptor_peephole(asm: &str, nv: usize) -> String {
         if mn == "syscall" {
             for r in ["rax", "rcx", "r11"] {
                 kill_reg(r, &mut sync, &mut holds);
+                nullab.remove(r);
             }
             out.push_str(zeile);
             out.push('\n');
@@ -1367,6 +1477,7 @@ fn deskriptor_peephole(asm: &str, nv: usize) -> String {
         if mn == "rep" {
             for r in ["rdi", "rsi", "rcx"] {
                 kill_reg(r, &mut sync, &mut holds);
+                nullab.remove(r);
             }
             out.push_str(zeile);
             out.push('\n');
@@ -1375,18 +1486,22 @@ fn deskriptor_peephole(asm: &str, nv: usize) -> String {
         if mn == "div" || mn == "idiv" {
             kill_reg("rax", &mut sync, &mut holds);
             kill_reg("rdx", &mut sync, &mut holds);
+            nullab.remove("rax");
+            nullab.remove("rdx");
             out.push_str(zeile);
             out.push('\n');
             continue;
         }
         if mn == "cqo" || mn == "cdq" {
             kill_reg("rdx", &mut sync, &mut holds);
+            nullab.remove("rdx");
             out.push_str(zeile);
             out.push('\n');
             continue;
         }
         if mn.starts_with("set") {
             kill_reg("rax", &mut sync, &mut holds); // Ziel ist im RA-Pfad immer `al`
+            nullab.remove("rax"); // `setcc al` laesst die oberen Bits stehen
             out.push_str(zeile);
             out.push('\n');
             continue;
@@ -1405,8 +1520,32 @@ fn deskriptor_peephole(asm: &str, nv: usize) -> String {
             // liess tests/305_dtoa_hardcases falsch rechnen).
             let z = stamm(ziel);
             if !ziel.contains('[') && ist_reg64(z) {
-                let z = z.to_string();
-                kill_reg(&z, &mut sync, &mut holds);
+                let zs = z.to_string();
+                kill_reg(&zs, &mut sync, &mut holds);
+                // Nullerweiterung fortschreiben (Runde 51). Ein Schreibzugriff
+                // auf ein 32-Bit-Register nullt die oberen 32 Bit; `movzx`
+                // aus einer 8-/16-Bit-Quelle sagt sogar mehr. Alles andere
+                // macht den Inhalt oben unbekannt.
+                let bw = breite_von(ziel);
+                if mn == "movzx" {
+                    let q = ops.rsplit(',').next().unwrap_or("").trim();
+                    let von = if q.starts_with("byte ptr") {
+                        8
+                    } else if q.starts_with("word ptr") {
+                        16
+                    } else {
+                        breite_von(q)
+                    };
+                    if bw >= 32 && (von == 8 || von == 16) {
+                        nullab.insert(zs, von);
+                    } else {
+                        nullab.remove(&zs);
+                    }
+                } else if bw == 32 {
+                    nullab.insert(zs, 32);
+                } else {
+                    nullab.remove(&zs);
+                }
             }
         }
         out.push_str(zeile);
@@ -1769,7 +1908,12 @@ fn emit_block(e: &mut Emitter, ra: &Ra, b: &Block, next: Option<BlockId>) -> Res
             if let Some(v) = v {
                 ra.load_full(e, "rax", *v);
             } else {
-                e.line("xor eax, eax");
+                // Runde 51: KEIN `xor eax, eax` mehr. Eine Funktion mit
+                // Rueckgabetyp `void` hat keinen Ergebniswert; System V
+                // laesst `rax` in diesem Fall undefiniert, und in FIR liest
+                // niemand das Ergebnis eines void-Aufrufs (`Op::Call` ohne
+                // `dst`). Gemessen im Tokenizer: 4.229.623 Aufrufe, also
+                // ebenso viele Instruktionen fuer nichts.
             }
             epilogue(e, ra.a);
         }

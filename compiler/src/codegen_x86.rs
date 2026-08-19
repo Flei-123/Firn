@@ -280,7 +280,12 @@ fn emit_block(e: &mut Emitter, f: &Func, fr: &Frame, b: &Block) -> Result<(), St
             if let Some(v) = v {
                 e.line(&format!("mov rax, qword ptr [rbp-{}]", fr.slot[*v as usize]));
             } else {
-                e.line("xor eax, eax");
+                // Runde 51: KEIN `xor eax, eax` mehr. Eine Funktion mit
+                // Rueckgabetyp `void` hat keinen Ergebniswert; System V
+                // laesst `rax` in diesem Fall undefiniert, und in FIR liest
+                // niemand das Ergebnis eines void-Aufrufs (`Op::Call` ohne
+                // `dst`). Gemessen im Tokenizer: 4.229.623 Aufrufe, also
+                // ebenso viele Instruktionen fuer nichts.
             }
             e.line("mov rsp, rbp");
             e.line("pop rbp");
