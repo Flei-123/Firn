@@ -1,35 +1,35 @@
-//! **`size_of[T]()`** — die Größe eines Typs in Bytes, zur Übersetzungszeit.
+//! **`size_of[T]()`** — the size of a type as bytes, at compile time.
 //!
-//! SCHNITTSTELLE (fest):
+//! INTERFACE (fixed):
 //!   `pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr>`  (Parser)
-//!   `pub(crate) fn hook_call(ck, name, args, span) -> Option<Type>` (Typprüfer)
-//!   `pub(crate) fn wert(name: &str) -> Option<i128>`               (Lowering)
+//!   `pub(crate) fn hook_call(..) -> Option<Type>`                 (type checker)
+//!   `pub(crate) fn value(..) -> Option<i128>`                     (Lowering)
 //!
-//! ## Wozu
+//! ## What for
 //!
-//! `docs/SELBSTHOSTING.md` §4 führt `Vec[T]` als zweitgrößten Blocker auf dem
-//! Weg zu Stufe 1. Ein Feld **fester** Größe geht seit Runde 2
-//! (`tests/211_generic_struct.fi`), ein **wachsendes** nicht: dafür muss die
-//! Adresse des `i`-ten Elements ausgerechnet werden, und das braucht die
-//! Elementgröße.
+//! `docs/SELBSTHOSTING.md` §4 lists `Vec[T]` as the second largest blocker
+//! on the way to stage 1. A field of **fixed** size works since round 2
+//! (`tests/211_generic_struct.fi`), a **growing** one does not: for that the
+//! address of the `i`-th element must be computed, and that needs the
+//! element size.
 //!
-//! ## Wie es aussieht
+//! ## How it looks
 //!
 //! ```firn
 //! let n: usize = size_of[i32]()      // 4
-//! let m: usize = size_of[Punkt]()    // Layout des Structs
+//! let m: usize = size_of[Point]()    // layout of the struct
 //! ```
 //!
-//! ## Wie es gebaut ist
+//! ## How it is built
 //!
-//! Wie `gc_null[C]()` (siehe `gc.rs`): der Parser erkennt die Form direkt und
-//! verpackt sie als **Aufruf mit einem reservierten Namen**, in dem der
-//! Typtext steckt. Der Typprüfer löst den Typ auf, rechnet die Größe aus und
-//! merkt sie sich; das Lowering setzt eine Konstante ein. Zur Laufzeit bleibt
-//! **nichts** davon übrig.
+//! Like `gc_null[C]()` (see `gc.rs`): the parser spots the form directly and
+//! wraps it as a **call carrying a reserved identifier** that holds the type
+//! text. The type checker resolves the type, computes the size and keeps it;
+//! lowering substitutes a constant. At runtime **nothing** of it is left
+//! over.
 //!
-//! Der Weg über den Namen ist Absicht: `size_of` ist damit kein Schlüsselwort
-//! und kollidiert mit keinem Bezeichner, den jemand schon benutzt.
+//! Routing it through the identifier is deliberate: `size_of` is thereby no
+//! keyword and collides with no identifier that somebody already uses.
 
 use crate::ast::{Expr, ExprKind, TypeExpr};
 use crate::diag::Span;
@@ -40,21 +40,21 @@ use crate::types::Type;
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-/// Reservierter Namenspräfix. Firn-Bezeichner können `$` nicht enthalten,
-/// deshalb ist eine Kollision mit Nutzercode ausgeschlossen.
+/// Reserved identifier prefix. Firn identifiers cannot hold a `$`, so a
+/// collision with user code is ruled out.
 const P_SIZE: &str = "size_of$";
 
 thread_local! {
-    /// Name -> Größe. Gefüllt vom Typprüfer, gelesen vom Lowering.
+    /// Identifier -> size. Filled by the type checker, read by lowering.
     static VALUES: RefCell<HashMap<String, i128>> = RefCell::new(HashMap::new());
 }
 
-/// Setzt die Tabelle zurück (eine je Übersetzung, `parser::reset_hooks`).
+/// Resets the table (one per compilation, `parser::reset_hooks`).
 pub(crate) fn hook_reset() {
     VALUES.with(|w| w.borrow_mut().clear());
 }
 
-/// `// HOOK sizeof` in `parser.rs::primary` — `size_of[T]()`.
+/// `// HOOK sizeof` within `parser.rs::primary` — `size_of[T]()`.
 pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
     match p.kind() {
         TokKind::Ident(n) if n == "size_of" => {}
@@ -65,9 +65,9 @@ pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
     }
     let start = p.bump(); // 'size_of'
     p.bump(); // '['
-    // BEWUSST NUR EIN TYPNAME, kein voller Typausdruck: `size_of[i32]`,
-    // `size_of[Punkt]`. Wer die Groesse eines zusammengesetzten Typs braucht,
-    // gibt ihm einen Namen — das ist ohnehin lesbarer als `size_of[*mut u8]`.
+    // DELIBERATELY JUST ONE TYPE IDENTIFIER, no full type expression:
+    // `size_of[i32]`, `size_of[Point]`. Whoever needs the size of a composite
+    // type gives it a label — which reads better anyway than `size_of[*mut u8]`.
     let (ty_name, _) = p.ident("after 'size_of['")?;
     if !p.expect(TokKind::RBracket, "after the type argument of 'size_of'") {
         return None;
@@ -83,12 +83,12 @@ pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
         }
     };
     let span = Parser::join(start, end);
-    // Der Typtext wandert in den Namen; aufgeloest wird er im Typpruefer,
-    // der die Struct-Tabelle kennt.
+    // The type text moves into the identifier; it gets resolved by the type
+    // checker, which knows the struct table.
     Some(p.mk(span, ExprKind::Call(format!("{}{}", P_SIZE, ty_name), Vec::new(), start)))
 }
 
-/// `// HOOK sizeof` in `sema::call`.
+/// `// HOOK sizeof` within `sema::call`.
 pub(crate) fn hook_call(
     ck: &mut Checker,
     name: &str,
@@ -114,7 +114,7 @@ pub(crate) fn hook_call(
     Some(Type::Usize)
 }
 
-/// Die im Typprüfer ermittelte Größe — für das Lowering.
+/// The size determined by the type checker — for lowering.
 pub(crate) fn value(name: &str) -> Option<i128> {
     if !name.starts_with(P_SIZE) {
         return None;

@@ -1,30 +1,30 @@
-//! Die Paketwelt: das Wurzelmanifest, alle ueber `brauche` erreichbaren
-//! Pakete und der Graph dazwischen.
+//! The package world: the root manifest, every package reachable through
+//! `needs` and the graph between them.
 //!
-//! `package.rs` kennt nur das Format (reine Funktionen, ohne Dateisystem).
-//! Hier kommt das Dateisystem dazu: Manifest suchen, lesen, Abhaengigkeiten
-//! nachladen, Zyklen finden.
+//! `package.rs` knows the format only (pure functions, no file system).
+//! Here the file system joins: find the manifest, read it, load dependencies
+//! after it, spot cycles.
 //!
-//! SUCHE NACH DEM MANIFEST: von dem Verzeichnis der Wurzeldatei aus nach
-//! OBEN, bis `firn.package` gefunden ist oder das Dateisystem endet
-//! (`paket::SUCHTIEFE` als Notbremse). Findet sich keins, ist die Welt LEER —
-//! und dann verhaelt sich der Uebersetzer exakt wie vor Runde 48. Das ist
-//! Absicht: alles Neue haengt am Manifest, nichts aendert sich ohne eins.
+//! SEARCH FOR THE MANIFEST: from the directory of the root file UPWARDS,
+//! until `firn.package` shows up or the file system ends
+//! (`package::SUCHTIEFE` as the emergency brake). Without a find the world
+//! is EMPTY — the compiler then behaves exactly as before round 48. That is
+//! deliberate: all that is new hangs off the manifest, nothing moves without.
 
 use crate::package::{self, Manifest};
 
-/// Ein geladenes Paket.
+/// One loaded package.
 pub struct Package {
     pub manifest: Manifest,
-    /// Verzeichnis des Manifests, normalisiert und absolut.
+    /// Directory of the manifest, normalized and absolute.
     pub root: String,
-    /// Pfad der Manifestdatei, wie er gemeldet wird.
+    /// Path of the manifest file, the way it gets reported.
     pub manifestpfad: String,
-    /// Index in `Welt::pakete` je Eintrag von `manifest.abhaengig`.
+    /// Index into `World::packages` per entry of `manifest.dependent`.
     pub edges: Vec<usize>,
 }
 
-/// Alle Pakete dieser Uebersetzung. `pakete[0]` ist das Wurzelpaket.
+/// All packages of this compilation. `packages[0]` is the root package.
 pub struct World {
     pub packages: Vec<Package>,
 }
@@ -37,8 +37,8 @@ fn error_with_note(text: String, note: String) -> String {
     format!("error: {}\nnote: {}\n", text, note)
 }
 
-/// Arbeitsverzeichnis, normalisiert. Alles Interne rechnet absolut, damit
-/// „liegt diese Datei in jenem Paket" eine reine Zeichenkettenfrage bleibt.
+/// Working directory, normalized. Everything internal computes absolute, so
+/// that "does this file sit within that package" stays pure string work.
 pub fn cwd() -> String {
     match std::env::current_dir() {
         Ok(p) => package::normalize(&p.display().to_string()),
@@ -46,7 +46,7 @@ pub fn cwd() -> String {
     }
 }
 
-/// `pfad` absolut machen (relativ zu `cwd`).
+/// Make `path` absolute (relative to `cwd`).
 pub fn absolute(path: &str, cwd: &str) -> String {
     if path.starts_with('/') {
         package::normalize(path)
@@ -59,8 +59,8 @@ fn is_file(p: &str) -> bool {
     std::path::Path::new(p).is_file()
 }
 
-/// Sucht `firn.package` ab `verzeichnis` nach oben. Gibt das Verzeichnis
-/// zurueck, in dem es liegt.
+/// Searches `firn.package` from `dirname` upwards. Yields the directory
+/// that holds it.
 pub fn search_manifest(dirname: &str) -> Option<String> {
     let mut d = package::normalize(dirname);
     for _ in 0..package::SUCHTIEFE {
@@ -97,7 +97,7 @@ fn load(root: &str) -> Result<(Manifest, String), String> {
 }
 
 impl World {
-    /// Leere Welt: kein Manifest, alles wie vor Runde 48.
+    /// Empty world: no manifest, everything as before round 48.
     pub fn empty() -> World {
         World { packages: Vec::new() }
     }
@@ -106,7 +106,7 @@ impl World {
         self.packages.is_empty()
     }
 
-    /// Welt zu einem Wurzelverzeichnis (dort MUSS ein Manifest liegen).
+    /// World for a root directory (a manifest MUST sit there).
     pub fn ab_root(root: &str) -> Result<World, String> {
         let c = cwd();
         let w = absolute(root, &c);
@@ -119,8 +119,8 @@ impl World {
         World::build(&w)
     }
 
-    /// Welt zu einer Quelldatei: Manifest ab ihrem Verzeichnis nach oben
-    /// suchen. Ohne Fund eine leere Welt.
+    /// World for a source file: search the manifest from its directory
+    /// upwards. Without a find, the world stays empty.
     pub fn ab_file(file: &str) -> Result<World, String> {
         let c = cwd();
         let d = package::dirname(&absolute(file, &c));
@@ -130,7 +130,7 @@ impl World {
         }
     }
 
-    /// Baut die Welt ab einem absoluten, normalisierten Wurzelverzeichnis.
+    /// Builds the world from one absolute, normalized root directory.
     fn build(root: &str) -> Result<World, String> {
         let mut packages: Vec<Package> = Vec::new();
         let (m, mp) = load(root)?;
@@ -140,9 +140,9 @@ impl World {
             manifestpfad: mp,
             edges: Vec::new(),
         });
-        // BREITENSUCHE ueber `brauche`. Ein bereits geladenes Paket wird am
-        // Wurzelverzeichnis wiedererkannt — derselbe Ort ist dasselbe Paket,
-        // auch wenn zwei Manifeste ihn verschieden schreiben.
+        // BREADTH-FIRST SEARCH over `needs`. A package already loaded gets
+        // recognized by its root directory — the same spot is the same package,
+        // even when two manifests spell it differently.
         let mut i = 0usize;
         while i < packages.len() {
             let own_root = packages[i].root.clone();
@@ -193,8 +193,8 @@ impl World {
         Ok(world)
     }
 
-    /// Tiefensuche mit drei Farben: 0 = ungesehen, 1 = auf dem Weg,
-    /// 2 = fertig. Trifft der Weg auf sich selbst, ist es ein Zyklus.
+    /// Depth-first search with three colors: 0 = unseen, 1 = on the path,
+    /// 2 = done. Once the path meets itself, that is a cycle.
     fn check_cycles(&self) -> Result<(), String> {
         let n = self.packages.len();
         let mut color = vec![0u8; n];
@@ -237,8 +237,8 @@ impl World {
         None
     }
 
-    /// Zu welchem Paket gehoert diese Datei? Laengste passende Wurzel
-    /// gewinnt, damit ein Paket IM Verzeichnis eines anderen liegen darf.
+    /// Which package does this file belong to? The longest matching root wins,
+    /// so that a package may sit WITHIN the directory of another.
     pub fn package_of(&self, absolute_path: &str) -> Option<usize> {
         let mut hit: Option<usize> = None;
         for (i, p) in self.packages.iter().enumerate() {
@@ -255,7 +255,7 @@ impl World {
         hit
     }
 
-    /// Index der Abhaengigkeit `name` von Paket `i`.
+    /// Index of the given dependency of package `i`.
     pub fn edge(&self, i: usize, name: &str) -> Option<usize> {
         let p = &self.packages[i];
         p.manifest
@@ -270,8 +270,8 @@ impl World {
     }
 }
 
-/// Fehlertext „modul ist nicht oeffentlich" — an EINER Stelle, damit
-/// `firnc0` und `firnc1` denselben Satz schreiben.
+/// Error text "module is not public" — at ONE spot, so that `firnc0` and
+/// `firnc1` write the very same sentence.
 pub fn text_not_public(module: &str, package_name: &str, manifestpfad: &str) -> String {
     error_with_note(
         format!("module '{}' is not public in package '{}'", module, package_name),
@@ -279,7 +279,7 @@ pub fn text_not_public(module: &str, package_name: &str, manifestpfad: &str) -> 
     )
 }
 
-/// Fehlertext „paket ist keine abhaengigkeit".
+/// Error text "package is not a dependency".
 pub fn text_no_dependency(target: &str, of: &str, manifestpfad: &str) -> String {
     error_with_note(
         format!("package '{}' is not a dependency of package '{}'", target, of),
@@ -287,7 +287,7 @@ pub fn text_no_dependency(target: &str, of: &str, manifestpfad: &str) -> String 
     )
 }
 
-/// Fehlertext „zwei dateien, ein modulname".
+/// Error text "two files, one module label".
 pub fn text_name_clash(module: &str, a: &str, b: &str) -> String {
     error_with_note(
         format!("name conflict: module '{}' comes from two files", module),

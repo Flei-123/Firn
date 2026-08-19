@@ -1,7 +1,7 @@
-//! Typdarstellung und Speicherlayout (SPEC §11).
+//! Type representation and memory layout (SPEC §11).
 //!
-//! Struct-Layout: Deklarationsreihenfolge, natuerliche Ausrichtung, kein
-//! Umsortieren. Groesse wird auf die Ausrichtung des Structs aufgerundet.
+//! Struct layout: declaration order, natural alignment, no reordering of
+//! the fields. The size gets rounded up to the alignment of the struct.
 
 use std::collections::HashMap;
 
@@ -20,16 +20,16 @@ pub enum Type {
     Bool,
     /// IEEE-754 binary64 (SPEC §8.6).
     F64,
-    /// Zeiger; `mutable` = `*mut T`.
+    /// Pointer; `mutable` = `*mut T`.
     Ptr { mutable: bool, inner: Box<Type> },
     Array(Box<Type>, u64),
-    /// Index in `TypeCtx::structs`.
+    /// Index into `TypeCtx::structs`.
     Struct(usize),
-    /// Typloses Ganzzahlliteral, muss aus dem Kontext abgeleitet werden.
+    /// Untyped integer literal, must be derived from the context.
     UntypedInt,
-    /// Rueckgabetyp einer Funktion ohne `-> T`.
+    /// Return type of a function without `-> T`.
     Void,
-    /// Nur zur Fehlerunterdrueckung nach einem gemeldeten Fehler.
+    /// Only to suppress follow-up errors after a reported error.
     Error,
 }
 
@@ -44,7 +44,7 @@ impl Type {
                 | Type::U32 | Type::U64 | Type::Usize | Type::Isize | Type::UntypedInt
         )
     }
-    /// Ganzzahltyp mit fester Breite (ohne UntypedInt).
+    /// Integer type of fixed width (without UntypedInt).
     pub fn is_concrete_int(&self) -> bool {
         self.is_int() && *self != Type::UntypedInt
     }
@@ -57,7 +57,7 @@ impl Type {
     pub fn is_error(&self) -> bool {
         matches!(self, Type::Error)
     }
-    /// Bitbreite fuer Ganzzahlen/bool/Zeiger; 0 fuer aggregierte Typen.
+    /// Bit width for integers/bool/pointers; 0 for aggregate types.
     pub fn bits(&self) -> u32 {
         match self {
             Type::I8 | Type::U8 => 8,
@@ -85,8 +85,8 @@ pub struct StructDef {
     pub fields: Vec<Field>,
     pub size: u64,
     pub align: u64,
-    /// `#[must_consume]` (attrs.rs): ein Wert dieses Typs darf nicht
-    /// stillschweigend verworfen werden.
+    /// `#[must_consume]` (attrs.rs): a value of this type must not be
+    /// discarded silently.
     pub must_consume: bool,
 }
 
@@ -96,7 +96,7 @@ impl StructDef {
     }
 }
 
-/// Tabelle aller bekannten Structs.
+/// Table of all known structs.
 #[derive(Clone, Debug, Default)]
 pub struct TypeCtx {
     pub structs: Vec<StructDef>,
@@ -112,7 +112,7 @@ impl TypeCtx {
         self.by_name.get(name).copied()
     }
 
-    /// Legt einen Struct an (Layout wird von `finish_struct` gesetzt).
+    /// Creates a struct (the layout gets set by `finish_struct`).
     pub fn declare(&mut self, name: &str) -> usize {
         let idx = self.structs.len();
         self.structs.push(StructDef {
@@ -126,7 +126,7 @@ impl TypeCtx {
         idx
     }
 
-    /// Berechnet Offsets/Groesse/Ausrichtung aus (Name, Typ)-Paaren.
+    /// Computes offsets/size/alignment from (identifier, type) pairs.
     pub fn set_fields(&mut self, idx: usize, fields: Vec<(String, Type)>) {
         let mut off: u64 = 0;
         let mut max_align: u64 = 1;
@@ -171,7 +171,7 @@ impl TypeCtx {
         }
     }
 
-    /// Name der gc-Klasse hinter einem Typ, sofern es eine ist.
+    /// Identifier of the gc class behind a type, if it is one.
     fn gc_class_name(&self, t: &Type) -> Option<&str> {
         match t {
             Type::Struct(i) => self
@@ -182,7 +182,7 @@ impl TypeCtx {
         }
     }
 
-    /// Menschenlesbarer Typname fuer Fehlermeldungen.
+    /// Human-readable rendering of a type, for error messages.
     pub fn name_of(&self, t: &Type) -> String {
         match t {
             Type::I8 => "i8".into(),
@@ -197,8 +197,8 @@ impl TypeCtx {
             Type::Isize => "isize".into(),
             Type::Bool => "bool".into(),
             Type::F64 => "f64".into(),
-            // Ein Zeiger auf eine gc-Klasse heisst im Quelltext `Gc[C]`
-            // (der Struct traegt intern den Namen "gc C", siehe gc.rs).
+            // A pointer to a gc class is spelled `Gc[C]` within the source text
+            // (the struct carries "gc C" as its internal label, see gc.rs).
             Type::Ptr { inner, .. } if self.gc_class_name(inner).is_some() => {
                 match self.gc_class_name(inner) {
                     Some(n) => format!("Gc[{}]", n),
