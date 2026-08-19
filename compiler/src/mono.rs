@@ -271,7 +271,7 @@ fn subst_name(
         // Ersetzt wird nur, wenn das Argument ein NAME ist: `Gc[*mut u8]`
         // gibt es nicht, der Parser laesst dort ohnehin nur einen
         // Bezeichner zu.
-        for pfx in [crate::gc::P_TYP_PUB, crate::gc::P_WTYP_PUB] {
+        for pfx in [crate::gc::P_TY_PUB, crate::gc::P_WTYP_PUB] {
             if let Some(rest) = n.strip_prefix(pfx) {
                 if let Some(TypeExpr::Named(concrete, _)) = map.get(rest) {
                     return Some(TypeExpr::Named(format!("{}{}", pfx, concrete), sp));

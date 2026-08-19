@@ -309,7 +309,7 @@ pub(crate) fn gc_runtime(files: &[SourceFile]) -> Option<SourceFile> {
     }
     Some(SourceFile {
         id: files.len() as u32,
-        path: PathBuf::from(crate::gc::LAUFZEIT_PFAD),
+        path: PathBuf::from(crate::gc::RUNTIME_PATH),
         src: crate::gc::runtime_source(
             !has_allocerror,
             !has_finalizer,
@@ -362,7 +362,7 @@ fn module_name(f: &SourceFile) -> String {
     }
     // Die GC-Laufzeit liegt im Wurzelnamensraum: `gc_init()` heisst in jedem
     // Modul `gc_init()`, ohne `import` und ohne Modulpraefix.
-    if f.path == Path::new(crate::gc::LAUFZEIT_PFAD) {
+    if f.path == Path::new(crate::gc::RUNTIME_PATH) {
         return String::new();
     }
     f.path
@@ -487,17 +487,17 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
         for x in &p.consts {
             items.insert(x.name.clone());
         }
-        for im in &p.imports {
+        for imp in &p.imports {
             // HOOK profil (prof.rs, Runde 52): im Kernel-Profil ist die
             // Standardbibliothek gesperrt. Die Pruefung sitzt hier, weil nur
             // hier die Einbindungen JEDER Datei mit Position bekannt sind.
-            crate::prof::hook_import(dg, &im.path, im.span);
-            let target = im.path.last().cloned().unwrap_or_default();
+            crate::prof::hook_import(dg, &imp.path, imp.span);
+            let target = imp.path.last().cloned().unwrap_or_default();
             let known = files.iter().any(|g| module_name(g) == target);
             if !known {
                 dg.error(
-                    im.span,
-                    format!("module '{}' was not found", im.path.join(".")),
+                    imp.span,
+                    format!("module '{}' was not found", imp.path.join(".")),
                 );
             }
         }
@@ -870,7 +870,7 @@ mod tests {
     }
 
     #[test]
-    fn names_become_je_module_different() {
+    fn names_become_per_module_different() {
         assert_eq!(mangle("", "main"), "main");
         assert_eq!(mangle("helper", "square"), "helper__square");
         assert_eq!(mangle("", "square"), "square");

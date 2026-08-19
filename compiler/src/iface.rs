@@ -76,11 +76,11 @@ use crate::types::{Type, TypeCtx};
 /// Das Leerzeichen macht ihn unerreichbar fuer den Quelltext.
 pub(crate) const P_DYN: &str = "dyn ";
 /// Praefix der Methodentafeln im Assembler (dateilokal, `.L`).
-const TAFEL_LABEL: &str = ".L__iface.";
+const TABLE_LABEL: &str = ".L__iface.";
 /// Versatz des Datenzeigers im Schnittstellenwert.
-pub(crate) const OFF_DATEN: u64 = 0;
+pub(crate) const OFF_DATA: u64 = 0;
 /// Versatz der Methodentafel im Schnittstellenwert.
-pub(crate) const OFF_TAFEL: u64 = 8;
+pub(crate) const OFF_TABLE: u64 = 8;
 
 // ---------------------------------------------------------------- Datenmodell
 
@@ -234,7 +234,7 @@ pub(crate) fn base_ty_name(t: &Type) -> Option<&'static str> {
 /// Wuerde die Methode zu `vec__i32__kleiner`, suchte die Aufloesung weiter
 /// `i32__kleiner` und faende nichts.
 pub(crate) fn is_base_ty_method(name: &str) -> bool {
-    match name.split_once(crate::impls::TRENNER) {
+    match name.split_once(crate::impls::SEP) {
         Some((header, rest)) => !rest.is_empty() && base_ty_of_name(header).is_some(),
         None => false,
     }
@@ -374,7 +374,7 @@ pub(crate) fn bound_check(
     let methods = REG.with(|r| r.borrow().ifaces[ii].methods.clone());
     let mut missing: Vec<String> = Vec::new();
     for m in &methods {
-        let full = format!("{}{}{}", ty_name, crate::impls::TRENNER, m.name);
+        let full = format!("{}{}{}", ty_name, crate::impls::SEP, m.name);
         if !fnames.contains(&full) {
             missing.push(header_signature(m));
         }
@@ -938,7 +938,7 @@ fn check_impl_am(
         } else {
             (m.ptypes.clone(), m.rtyp.clone())
         };
-        let full = format!("{}{}{}", prefix, crate::impls::TRENNER, m.name);
+        let full = format!("{}{}{}", prefix, crate::impls::SEP, m.name);
         let sig = match ck.fns.get(&full) {
             Some(s) => s.clone(),
             None => {
@@ -1325,7 +1325,7 @@ pub(crate) fn tables_asm() -> String {
                 let targets: Vec<String> = reg.ifaces[ii]
                     .methods
                     .iter()
-                    .map(|m| format!("{}{}{}", u.prefix, crate::impls::TRENNER, m.name))
+                    .map(|m| format!("{}{}{}", u.prefix, crate::impls::SEP, m.name))
                     .collect();
                 Some((table_key(&u.iface, &u.prefix), targets))
             })
@@ -1337,7 +1337,7 @@ pub(crate) fn tables_asm() -> String {
     let _ = writeln!(out, ".section .rodata");
     let _ = writeln!(out, ".align 8");
     for (key, targets) in tables {
-        let _ = writeln!(out, "{}{}:", TAFEL_LABEL, key);
+        let _ = writeln!(out, "{}{}:", TABLE_LABEL, key);
         for z in targets {
             let _ = writeln!(out, "    .quad {}", crate::codegen_x86::label(&z));
         }
@@ -1389,9 +1389,9 @@ pub(crate) fn lower_dispatch(
         None => return lo.ice(span, "interface method without signature in lowering"),
     };
     let base = lo.lower_addr(recv)?;
-    let dadr = lo.field_addr_at(base, OFF_DATEN);
+    let dadr = lo.field_addr_at(base, OFF_DATA);
     let data = lo.load(FTy::Ptr, dadr);
-    let tadr = lo.field_addr_at(base, OFF_TAFEL);
+    let tadr = lo.field_addr_at(base, OFF_TABLE);
     let table = lo.load(FTy::Ptr, tadr);
     let eadr = lo.field_addr_at(table, 8 * slot as u64);
     let target = lo.load(FTy::Ptr, eadr);
@@ -1432,15 +1432,15 @@ pub(crate) fn lower_cast_into(
         None => return lo.ice(span, "implementation without method table in lowering"),
     };
     let pv = lo.lower_expr(inner)?;
-    let dadr = lo.field_addr_at(addr, OFF_DATEN);
+    let dadr = lo.field_addr_at(addr, OFF_DATA);
     lo.store(FTy::Ptr, dadr, pv);
     let tv = lo.push(FTy::Ptr, Op::VtabAddr { table: key });
-    let tadr = lo.field_addr_at(addr, OFF_TAFEL);
+    let tadr = lo.field_addr_at(addr, OFF_TABLE);
     lo.store(FTy::Ptr, tadr, tv);
     Some(())
 }
 
 /// Assemblername einer Methodentafel.
 pub(crate) fn table_label(key: &str) -> String {
-    format!("{}{}", TAFEL_LABEL, key)
+    format!("{}{}", TABLE_LABEL, key)
 }

@@ -62,7 +62,7 @@ echo "== 1. Uebersetzen (beide Compiler, Profil aus der Quelle) =="
 if "$FIRNC" --profile=app -o "$TMPD/app.o" "$QUELLE" >"$TMPD/app.err" 2>&1; then
     bad "Gegenprobe: --profile=app haette scheitern muessen"
 else
-    grep -q "nur im profil 'kernel'" "$TMPD/app.err" \
+    grep -q "only in profile 'kernel'" "$TMPD/app.err" \
         && ok "Gegenprobe: --profile=app wird abgelehnt (#[interrupt])" \
         || { bad "Gegenprobe: falsche Meldung"; sed 's/^/        /' "$TMPD/app.err" | head -4; }
 fi

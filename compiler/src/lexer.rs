@@ -719,7 +719,7 @@ mod tests {
     }
 
     #[test]
-    fn zu_big_number() {
+    fn too_big_number() {
         let (_, n) = kinds("99999999999999999999999999");
         assert_eq!(n, 1);
     }

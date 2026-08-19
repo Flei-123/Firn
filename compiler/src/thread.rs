@@ -58,7 +58,7 @@ use crate::types::Type;
 /// Faden erzeugen.
 pub(crate) const START: &str = "__thread_start";
 /// Eigener Fadenblock (TLS, `fs:0`).
-pub(crate) const SELBST: &str = "__thread_self";
+pub(crate) const SELF: &str = "__thread_self";
 /// Atomarer Vergleichs-Tausch.
 pub(crate) const CAS: &str = "__atomic_swap";
 
@@ -66,7 +66,7 @@ pub(crate) const CAS: &str = "__atomic_swap";
 /// Sammler-Laufzeit (`lib/gc/gc.fi`) und bekommt den Fadenblock als einziges
 /// Argument. Ein Funktionszeiger waere die Alternative; Stufe 0 hat keine
 /// (dieselbe Entscheidung wie beim Verteiler der Finalisierer, Runde 47).
-pub(crate) const EINSTIEG: &str = "__thread_entry";
+pub(crate) const ENTRY: &str = "__thread_entry";
 
 /// `clone(2)`-Merker: geteilter Adressraum, geteilte Dateien, echter Faden
 /// derselben Fadengruppe, und die beiden TID-Merker, aus denen `faden_warten`
@@ -83,7 +83,7 @@ pub(crate) const CLONE_FLAGS: u64 = 0x0000_0100  // CLONE_VM
 
 /// Ist `name` eines der drei Primitive?
 pub(crate) fn is_thread_call(name: &str) -> bool {
-    name == START || name == SELBST || name == CAS
+    name == START || name == SELF || name == CAS
 }
 
 // ------------------------------------------------------------------- Typphase
@@ -102,14 +102,14 @@ pub(crate) fn hook_call(
     }
     let _ = nspan;
     match name {
-        SELBST => {
+        SELF => {
             if !args.is_empty() {
                 for a in args {
                     ck.type_out_expr(a);
                 }
                 ck.dg.error_note(
                     espan,
-                    format!("'{}' expects no arguments, found {}", SELBST, args.len()),
+                    format!("'{}' expects no arguments, found {}", SELF, args.len()),
                     "the form is __thread_self() -> *mut u8",
                 );
                 return Some(Type::Error);
@@ -239,7 +239,7 @@ pub(crate) fn lower_thread_call(
     span: Span,
 ) -> Option<Option<Val>> {
     match name {
-        SELBST => Some(Some(lo.push(FTy::Ptr, Op::ThreadSelf))),
+        SELF => Some(Some(lo.push(FTy::Ptr, Op::ThreadSelf))),
         START => {
             if args.len() != 3 {
                 return lo.ice(span, "thread primitive with wrong arity");
@@ -288,7 +288,7 @@ pub(crate) fn spawn_sequence(e: &mut crate::codegen_x86::Emitter) {
     e.line("mov rdi, qword ptr [rsp]");
     e.line("add rsp, 16");
     e.line("xor ebp, ebp");
-    e.line(&format!("call {}", crate::codegen_x86::label(EINSTIEG)));
+    e.line(&format!("call {}", crate::codegen_x86::label(ENTRY)));
     // exit(2), NICHT exit_group(2): nur dieser Faden endet.
     e.line("mov edi, eax");
     e.line("mov eax, 60");

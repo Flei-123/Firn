@@ -51,19 +51,19 @@ use crate::types::Type;
 /// `gc C{…}` steht als Aufruf `"gc C"` im AST. Der Name enthaelt ein
 /// Leerzeichen, kann also nie ein Bezeichner des Quelltextes sein — und er
 /// liest sich in der `#[no_gc]`-Meldung genauso, wie er im Quelltext steht.
-const P_NEU: &str = "gc ";
-const P_TYP: &str = "__gc#p:";
+const P_NEW: &str = "gc ";
+const P_TY: &str = "__gc#p:";
 const P_WTYP: &str = "__gc#w:";
 /// Dieselben Praefixe fuer `mono.rs` (Runde 53: `Gc[T]` in einer Vorlage).
-pub(crate) const P_TYP_PUB: &str = P_TYP;
+pub(crate) const P_TY_PUB: &str = P_TY;
 pub(crate) const P_WTYP_PUB: &str = P_WTYP;
 const P_AS: &str = "__gc#as:";
 
 /// Aufrufnamen der Laufzeit (`lib/gc/gc.fi`), die einen Sammellauf ausloesen
 /// koennen oder den Zustand des Sammlers anfassen.
-const LAUFZEIT_SAMMELT: [&str; 4] = ["gc_init", "gc_collect", "__gc_alloc_raw", "__gc_collect_now"];
+const RUNTIME_COLLECTS: [&str; 4] = ["gc_init", "gc_collect", "__gc_alloc_raw", "__gc_collect_now"];
 /// Weitere Laufzeitnamen: reine Abfragen, aber Teil des Sammlers.
-const LAUFZEIT_ABFRAGE: [&str; 11] = [
+const RUNTIME_QUERY: [&str; 11] = [
     "gc_set_max_bytes",
     "gc_max_bytes",
     "gc_total_bytes",
@@ -84,7 +84,7 @@ pub(crate) const INTR_REGS: &str = "__gc_save_regs";
 /// Laufzeitfunktion hinter `weak(g)`.
 pub(crate) const FN_WEAK: &str = "__gc_weak_raw";
 /// Laufzeitfunktion hinter `stark(w)`.
-pub(crate) const FN_STARK: &str = "__gc_strong_raw";
+pub(crate) const FN_STRONG: &str = "__gc_strong_raw";
 /// Laufzeitfunktion hinter `x.as?[T]`.
 pub(crate) const FN_AS: &str = "__gc_as_raw";
 /// Laufzeitfunktion hinter `gc C{…}`.
@@ -112,7 +112,7 @@ pub(crate) const FN_FINAL: &str = "__gc_finalize";
 /// Stufe 0 hat keine Funktionszeiger, also traegt ein Faden eine ARBEITSART
 /// statt einer Adresse. Deklariert die Wurzeldatei die Funktion selbst, nimmt
 /// der Compiler sie; sonst legt er die leere Voreinstellung dazu.
-pub(crate) const FN_FADEN: &str = "__thread_work";
+pub(crate) const FN_THREAD: &str = "__thread_work";
 
 // ---------------------------------------------------------------- Datenmodell
 
@@ -181,13 +181,13 @@ pub(crate) fn hook_reset() {
 /// `modules.rs`, wo sie wirklich in die Dateiliste kommt — nicht in
 /// `laufzeit_quelle`, denn deren Ergebnis wird auch in Tests gebaut.
 pub(crate) fn runtime_remember() {
-    LAUFZEIT_DRIN.with(|c| c.set(true));
+    RUNTIME_INSIDE.with(|c| c.set(true));
 }
 
 /// Vor jeder Uebersetzung zuruecksetzen (ein Prozess kann mehrere
 /// uebersetzen — `cargo test`).
 pub(crate) fn runtime_reset() {
-    LAUFZEIT_DRIN.with(|c| c.set(false));
+    RUNTIME_INSIDE.with(|c| c.set(false));
 }
 
 // ------------------------------------------------------- Vertrag fuer nogc.rs
@@ -197,20 +197,20 @@ pub(crate) fn runtime_reset() {
 ///
 /// Genau diese Aufrufe sind in einer `#[no_gc]`-Funktion verboten.
 pub(crate) fn is_gc_alloc_call(name: &str) -> bool {
-    if name.starts_with(P_NEU) {
+    if name.starts_with(P_NEW) {
         return true;
     }
     // Auch der Modulpfad davor zaehlt (`modul__gc_collect`), sonst waere die
     // Zusage ueber eine Modulgrenze hinweg zu umgehen.
     let blank = name.rsplit("__").next().unwrap_or(name);
-    LAUFZEIT_SAMMELT.contains(&name)
-        || LAUFZEIT_SAMMELT.contains(&blank)
-        || LAUFZEIT_ABFRAGE.contains(&name)
-        || LAUFZEIT_ABFRAGE.contains(&blank)
+    RUNTIME_COLLECTS.contains(&name)
+        || RUNTIME_COLLECTS.contains(&blank)
+        || RUNTIME_QUERY.contains(&name)
+        || RUNTIME_QUERY.contains(&blank)
         || name == INTR_STATE
         || name == INTR_REGS
         || name == FN_WEAK
-        || name == FN_STARK
+        || name == FN_STRONG
         || name == FN_AS
         || name == FN_BARRIER
 }
@@ -437,12 +437,12 @@ pub(crate) fn hook_type(p: &mut Parser, name: &str, sp: Span) -> Option<TypeExpr
         let n = if name == "GcVec" { 1 } else { 2 };
         let ksp = p.gc_collection_args(name, n)?;
         return Some(TypeExpr::Named(
-            format!("{}{}", P_TYP, name),
+            format!("{}{}", P_TY, name),
             Parser::join(sp, ksp),
         ));
     }
     let prefix = match name {
-        "Gc" => P_TYP,
+        "Gc" => P_TY,
         "GcWeak" => P_WTYP,
         _ => return None,
     };
@@ -475,12 +475,12 @@ pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
             let span = Parser::join(sp, ksp);
             let saved = p.no_struct_lit;
             p.no_struct_lit = false;
-            let lit = p.struct_lit(format!("{}{}", P_NEU, class), span);
+            let lit = p.struct_lit(format!("{}{}", P_NEW, class), span);
             p.no_struct_lit = saved;
             // Als AUFRUF verpackt: nur so sieht die `#[no_gc]`-Pruefung
             // (nogc.rs, Regel 1) die Allokation — sie prueft Aufrufnamen.
             let full = Parser::join(span, lit.span);
-            Some(p.mk(full, ExprKind::Call(format!("{}{}", P_NEU, class), vec![lit], span)))
+            Some(p.mk(full, ExprKind::Call(format!("{}{}", P_NEW, class), vec![lit], span)))
         }
         "gc_null" | "weak_null" => {
             if !matches!(p.toks.get(p.pos + 1).map(|t| &t.kind), Some(TokKind::LBracket)) {
@@ -502,7 +502,7 @@ pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
                     span,
                     ExprKind::Cast(
                         Box::new(null),
-                        TypeExpr::Named(format!("{}{}", P_TYP, class), span),
+                        TypeExpr::Named(format!("{}{}", P_TY, class), span),
                     ),
                 ))
             } else {
@@ -776,7 +776,7 @@ pub(crate) fn hook_resolve_ty(ck: &mut Checker, te: &TypeExpr) -> Option<Type> {
         TypeExpr::Named(n, s) => (n.as_str(), *s),
         _ => return None,
     };
-    if let Some(class) = name.strip_prefix(P_TYP) {
+    if let Some(class) = name.strip_prefix(P_TY) {
         return Some(match index_of(class) {
             Some(i) => {
                 let sidx = REG.with(|r| r.borrow().classes[i].struct_idx);
@@ -826,7 +826,7 @@ fn check_new(
     fields: &[(String, Expr, Span)],
     nspan: Span,
 ) -> Option<Type> {
-    let class = name.strip_prefix(P_NEU)?;
+    let class = name.strip_prefix(P_NEW)?;
     let i = match index_of(class) {
         Some(i) => i,
         None => {
@@ -925,7 +925,7 @@ pub(crate) fn hook_call(
     nspan: Span,
     espan: Span,
 ) -> Option<Type> {
-    if let Some(lit) = name.strip_prefix(P_NEU) {
+    if let Some(lit) = name.strip_prefix(P_NEW) {
         let _ = lit;
         let fields: Vec<(String, Expr, Span)> = match args.first().map(|a| &a.kind) {
             Some(ExprKind::StructLit(_, f, _)) => f.clone(),
@@ -1182,7 +1182,7 @@ pub(crate) fn union_idx(name: &str) -> Option<usize> {
 
 /// Name der Klasse hinter einem `__gc#neu:`/`__gc#as:`-Aufruf.
 pub(crate) fn class_out_new(name: &str) -> Option<&str> {
-    name.strip_prefix(P_NEU)
+    name.strip_prefix(P_NEW)
 }
 
 pub(crate) fn class_out_as(name: &str) -> Option<&str> {
@@ -1260,7 +1260,7 @@ pub(crate) fn ty_table_asm() -> String {
 // ------------------------------------------------------------------ Laufzeit
 
 /// Die Sammler-Laufzeit als lesbares Firn (`lib/gc/gc.fi`), eingebettet.
-const LAUFZEIT: &str = include_str!("../../lib/gc/gc.fi");
+const RUNTIME: &str = include_str!("../../lib/gc/gc.fi");
 
 /// **Runde 53** — die Sammlungen mit veraenderlicher Laenge (`SPEC` §3.5.2).
 ///
@@ -1269,11 +1269,11 @@ const LAUFZEIT: &str = include_str!("../../lib/gc/gc.fi");
 /// `__gc_alloc_raw`, `__gc_barrier`) ohne `import`. Angehaengt wird nur,
 /// wenn das Programm sie wirklich braucht — ein Programm mit `gc class`,
 /// aber ohne Sammlungen, erzeugt danach denselben Code wie vorher.
-const LAUFZEIT_VEC: &str = include_str!("../../lib/gc/gcvec.fi");
-const LAUFZEIT_MAP: &str = include_str!("../../lib/gc/gcmap.fi");
+const RUNTIME_VEC: &str = include_str!("../../lib/gc/gcvec.fi");
+const RUNTIME_MAP: &str = include_str!("../../lib/gc/gcmap.fi");
 
 /// Pfadname der eingezogenen Laufzeit in Fehlermeldungen und `.debug_line`.
-pub(crate) const LAUFZEIT_PFAD: &str = "lib/gc/gc.fi";
+pub(crate) const RUNTIME_PATH: &str = "lib/gc/gc.fi";
 
 /// Braucht dieses Programm die Laufzeit? Entschieden am Tokenstrom: irgendwo
 /// stehen die beiden Bezeichner `gc class` nebeneinander.
@@ -1332,7 +1332,7 @@ pub(crate) fn source_has_finalizer(toks: &[crate::lexer::Token]) -> bool {
 pub(crate) fn source_has_thread_work(toks: &[crate::lexer::Token]) -> bool {
     toks.windows(2).any(|w| {
         matches!(&w[0].kind, TokKind::KwFn)
-            && matches!(&w[1].kind, TokKind::Ident(b) if b == FN_FADEN)
+            && matches!(&w[1].kind, TokKind::Ident(b) if b == FN_THREAD)
     })
 }
 
@@ -1342,7 +1342,7 @@ fn thread_work_default() -> String {
     s.push_str("// Round 49: default of the thread dispatcher. The program\n");
     s.push_str("// declares none of its own, so a thread does nothing.\n");
     s.push_str("fn ");
-    s.push_str(FN_FADEN);
+    s.push_str(FN_THREAD);
     s.push_str("(kind: u64, arg: u64) -> u64 {\n");
     s.push_str("    return kind + arg - kind - arg\n");
     s.push_str("}\n");
@@ -1365,12 +1365,12 @@ fn finalizer_default() -> String {
 thread_local! {
     /// Wurde die Laufzeit in dieses Programm eingezogen? (Runde 49: dann muss
     /// der Zustandsblock auch ohne `gc class` im Assembler stehen.)
-    static LAUFZEIT_DRIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static RUNTIME_INSIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Ist die Sammler-/Faden-Laufzeit Teil dieses Programms?
 pub(crate) fn runtime_active() -> bool {
-    LAUFZEIT_DRIN.with(|c| c.get())
+    RUNTIME_INSIDE.with(|c| c.get())
 }
 
 /// Quelltext der Laufzeit. `mit_fehlermenge = false`, wenn das Programm
@@ -1399,10 +1399,10 @@ pub(crate) fn runtime_source(
     } else {
         s.push_str("// __thread_work is declared by the program itself\n");
     }
-    s.push_str(LAUFZEIT);
+    s.push_str(RUNTIME);
     if with_collections {
-        s.push_str(LAUFZEIT_VEC);
-        s.push_str(LAUFZEIT_MAP);
+        s.push_str(RUNTIME_VEC);
+        s.push_str(RUNTIME_MAP);
     }
     s
 }
@@ -1432,7 +1432,7 @@ mod tests {
     #[test]
     fn runtime_contains_the_required_names() {
         let q = runtime_source(true, true, true, true);
-        for n in ["gc_init", "gc_collect", "gc_live_objects", FN_ALLOC, FN_WEAK, FN_STARK, FN_AS] {
+        for n in ["gc_init", "gc_collect", "gc_live_objects", FN_ALLOC, FN_WEAK, FN_STRONG, FN_AS] {
             assert!(q.contains(n), "runtime without '{}'", n);
         }
         assert!(q.contains("error AllocError"));

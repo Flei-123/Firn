@@ -917,12 +917,12 @@ pub fn allocate(f: &Func) -> Alloc {
                 // Rest-Verwendung kann im Terminator stecken (brcond/ret).
                 // Switch NICHT: der erwartet den Wert im Rahmen
                 // (codegen_switch).
-                let im_term = match &b.term {
+                let in_term = match &b.term {
                     Term::BrCond { cond, .. } if *cond == d => 1,
                     Term::Ret(Some(v)) if *v == d => 1,
                     _ => 0,
                 };
-                ok = found + im_term == needs && im_term > 0;
+                ok = found + in_term == needs && in_term > 0;
             }
             if ok {
                 alloc.alias.insert(d, rc);
@@ -2848,8 +2848,8 @@ fn emit_bin(
             };
             let is_reg = |v: Val| ra.a.imm(v).is_none() && matches!(ra.a.place(v), Loc::Reg(_));
             // `+` ist kommutativ: der Registeroperand wird zum Indexteil.
-            let (out_frame, im_reg) = if is_reg(b) { (a, b) } else { (b, a) };
-            let y = match ra.a.place(im_reg) {
+            let (out_frame, in_reg) = if is_reg(b) { (a, b) } else { (b, a) };
+            let y = match ra.a.place(in_reg) {
                 Loc::Reg(r) => r,
                 Loc::Slot(_) => unreachable!("add_via_rax has reserved a register"),
             };
@@ -2968,7 +2968,7 @@ mod tests {
     }
 
     #[test]
-    fn loop_counter_lands_im_register() {
+    fn loop_counter_lands_in_a_register() {
         let f = loop_func();
         let a = allocate(&f);
         assert!(!a.cells.is_empty(), "the alloca cell must be promoted");
@@ -3042,7 +3042,7 @@ mod tests {
     /// Runde 43: mehr als sechs Parameter sind KEIN Grund mehr fuer den
     /// Grundpfad — der siebte kommt aus [rbp+16].
     #[test]
-    fn many_parameter_stay_im_register_path() {
+    fn many_parameter_stay_in_register_path() {
         let mut f = Func::new("f", vec![FTy::I64; 7], FTy::I64);
         f.set_term(0, Term::Ret(Some(6)));
         assert!(supported(&f));

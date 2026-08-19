@@ -515,7 +515,7 @@ mod tests {
     }
 
     #[test]
-    fn membership_zu_a_package() {
+    fn membership_to_a_package() {
         assert!(read_within("/a/b/c.fi", "/a/b"));
         assert!(read_within("/a/b", "/a/b"));
         assert!(!read_within("/a/bc/d.fi", "/a/b"));

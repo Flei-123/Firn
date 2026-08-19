@@ -46,12 +46,12 @@ const P_SIZE: &str = "size_of$";
 
 thread_local! {
     /// Name -> Größe. Gefüllt vom Typprüfer, gelesen vom Lowering.
-    static WERTE: RefCell<HashMap<String, i128>> = RefCell::new(HashMap::new());
+    static VALUES: RefCell<HashMap<String, i128>> = RefCell::new(HashMap::new());
 }
 
 /// Setzt die Tabelle zurück (eine je Übersetzung, `parser::reset_hooks`).
 pub(crate) fn hook_reset() {
-    WERTE.with(|w| w.borrow_mut().clear());
+    VALUES.with(|w| w.borrow_mut().clear());
 }
 
 /// `// HOOK sizeof` in `parser.rs::primary` — `size_of[T]()`.
@@ -110,7 +110,7 @@ pub(crate) fn hook_call(
         return Some(Type::Error);
     }
     let size = ck.tcx.size_of(&t) as i128;
-    WERTE.with(|w| w.borrow_mut().insert(name.to_string(), size));
+    VALUES.with(|w| w.borrow_mut().insert(name.to_string(), size));
     Some(Type::Usize)
 }
 
@@ -119,5 +119,5 @@ pub(crate) fn value(name: &str) -> Option<i128> {
     if !name.starts_with(P_SIZE) {
         return None;
     }
-    WERTE.with(|w| w.borrow().get(name).copied())
+    VALUES.with(|w| w.borrow().get(name).copied())
 }
