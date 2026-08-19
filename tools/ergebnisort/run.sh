@@ -23,36 +23,36 @@ MB=1048576
 
 # Linker symbol: 'main' keeps its bare name, everything else carries the
 # scheme from modules.rs (_F<scheme>.<name>, DESIGNZIELE 4).
-rahmen() {   # $1 = Funktionsname -> Byte-Zahl aus 'sub rsp, N'
+frame() {   # $1 = function name -> the number of bytes from 'sub rsp, N'
     awk -v n="$1" '
         $0 == n":" || $0 ~ "^_F[0-9]+\\." n ":" { inf = 1; next }
         inf && /sub rsp,/  { gsub(/,/, "", $3); print $3; exit }
     ' "$ASM"
 }
 
-R_BUILD=$(rahmen build)
-R_MAIN=$(rahmen main)
-KOPIEN=$(grep -c 'rep movs' "$ASM" || true)
+R_BUILD=$(frame build)
+R_MAIN=$(frame main)
+COPIES=$(grep -c 'rep movs' "$ASM" || true)
 
-echo "Rahmen build: ${R_BUILD:-?} Byte   Rahmen main: ${R_MAIN:-?} Byte   rep-movs: $KOPIEN"
+echo "frame build: ${R_BUILD:-?} bytes   frame main: ${R_MAIN:-?} bytes   rep-movs: $COPIES"
 
-FEHLER=0
+ERRORS=0
 if [ -z "${R_BUILD:-}" ] || [ -z "${R_MAIN:-}" ]; then
-    echo "FEHLER: Rahmengroesse nicht gefunden — Assembler-Format geaendert?"; exit 1
+    echo "ERROR: frame size not found -- has the assembly format changed?"; exit 1
 fi
 if [ "$R_BUILD" -ge 65536 ]; then
-    echo "FEHLER: 'build' baut die 1-MB-Struktur auf dem eigenen Stapel ($R_BUILD Byte)."
-    echo "        Die Ergebnisort-Garantie aus SPEC.md §13.1 ist verletzt."
-    FEHLER=1
+    echo "ERROR: 'build' builds the 1 MB structure on its own stack ($R_BUILD bytes)."
+    echo "        The result-location guarantee from SPEC.md 13.1 is violated."
+    ERRORS=1
 fi
 if [ "$R_MAIN" -lt "$MB" ] || [ "$R_MAIN" -gt $((2 * MB)) ]; then
-    echo "FEHLER: 'main' hat $R_MAIN Byte Rahmen, erwartet ~$MB (genau eine Ausfertigung)."
-    FEHLER=1
+    echo "ERROR: 'main' has a frame of $R_MAIN bytes, expected ~$MB (exactly one instance)."
+    ERRORS=1
 fi
-if [ "$KOPIEN" -ne 0 ]; then
-    echo "FEHLER: $KOPIEN Bulk-Kopien im Assembler — es wird umgeschaufelt statt am Ziel gebaut."
-    FEHLER=1
+if [ "$COPIES" -ne 0 ]; then
+    echo "ERROR: $COPIES bulk copies in the assembly -- it is shovelled around instead of built at the target."
+    ERRORS=1
 fi
 
-[ "$FEHLER" -eq 0 ] || exit 1
-echo "OK: Ergebnisort-Garantie gehalten (build $R_BUILD B, main $R_MAIN B, keine Bulk-Kopie)."
+[ "$ERRORS" -eq 0 ] || exit 1
+echo "OK: result-location guarantee kept (build $R_BUILD B, main $R_MAIN B, no bulk copy)."

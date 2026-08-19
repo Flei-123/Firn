@@ -34,46 +34,46 @@ fi
 #   tests/590_f64.fi  ->  the literal `1e308`. That is NO parser error
 #   but the known floating point rounding case from round 20
 #   (tools/lex_compare.sh); the value is already wrong in the token.
-BEKANNT="tests/590_f64.fi"
+KNOWN="tests/590_f64.fi"
 
-gleich=0
-ungleich=0
-bekannt=0
-nichtkern=0
-uebersprungen=0
-erste=""
+same=0
+different=0
+known=0
+noncore=0
+skipped=0
+first=""
 
 while IFS= read -r f; do
     if ! "$FIRNC" --emit=ast-kanon "$f" > "$TMPD"/parv_a.txt 2>/dev/null; then
         # firnc0 does not get through itself (module fragment, negative test).
-        uebersprungen=$((uebersprungen+1))
+        skipped=$((skipped+1))
         continue
     fi
     "$DUMP" "$f" > "$TMPD"/parv_b.txt 2>/dev/null
     rc=$?
     if [ "$rc" -eq 3 ]; then
-        nichtkern=$((nichtkern+1))
+        noncore=$((noncore+1))
         continue
     fi
     if [ "$rc" -eq 0 ] && cmp -s "$TMPD"/parv_a.txt "$TMPD"/parv_b.txt; then
-        gleich=$((gleich+1))
+        same=$((same+1))
         continue
     fi
-    ungleich=$((ungleich+1))
-    if echo "$BEKANNT" | tr ' ' '\n' | grep -qxF "$f"; then
-        bekannt=$((bekannt+1))
+    different=$((different+1))
+    if echo "$KNOWN" | tr ' ' '\n' | grep -qxF "$f"; then
+        known=$((known+1))
     else
-        [ -z "$erste" ] && erste="$f (rc=$rc)"
+        [ -z "$first" ] && first="$f (rc=$rc)"
     fi
 done < <(find tests lib bin bench -name '*.fi' -not -type l | sort)
 
-echo "GLEICH:        $gleich"
-echo "UNGLEICH:      $ungleich   (bekannt und benannt: $bekannt)"
-echo "NICHT KERN:    $nichtkern  (enum/match, Fehlerunionen, Generics, gc, Attribute, comptime)"
-echo "UEBERSPRUNGEN: $uebersprungen  (firnc0 kommt selbst nicht durch)"
-if [ -n "$erste" ]; then
-    echo "erste unerwartete Abweichung: $erste"
-    ff=${erste%% *}
+echo "SAME:          $same"
+echo "DIFFERENT:     $different   (known and named: $known)"
+echo "NOT CORE:      $noncore  (enum/match, error unions, generics, gc, attributes, comptime)"
+echo "SKIPPED:       $skipped  (firnc0 does not get through itself)"
+if [ -n "$first" ]; then
+    echo "first unexpected deviation: $first"
+    ff=${first%% *}
     "$FIRNC" --emit=ast-kanon "$ff" > "$TMPD"/parv_a.txt 2>/dev/null
     "$DUMP" "$ff" > "$TMPD"/parv_b.txt 2>/dev/null
     diff "$TMPD"/parv_a.txt "$TMPD"/parv_b.txt | head -10
