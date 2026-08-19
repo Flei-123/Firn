@@ -53,9 +53,9 @@ pub enum Profile {
 
 thread_local! {
     /// Was `--profile=` gesagt hat (`None` = nichts gesagt).
-    static FLAGGE: Cell<Option<Profile>> = const { Cell::new(None) };
+    static FLAG: Cell<Option<Profile>> = const { Cell::new(None) };
     /// Das aufgeloeste Profil dieser Uebersetzungseinheit.
-    static AKTIV: Cell<Profile> = const { Cell::new(Profile::App) };
+    static ACTIVE: Cell<Profile> = const { Cell::new(Profile::App) };
 }
 
 /// `--profile=<name>` auswerten. `Err` = unbekannter Name.
@@ -70,26 +70,26 @@ pub fn flag_set(name: &str) -> Result<(), String> {
             ))
         }
     };
-    FLAGGE.with(|f| f.set(Some(p)));
-    AKTIV.with(|a| a.set(p));
+    FLAG.with(|f| f.set(Some(p)));
+    ACTIVE.with(|a| a.set(p));
     Ok(())
 }
 
 /// Profil aus der Deklaration festlegen; die Kommandozeile gewinnt.
 pub fn define(prog: &Program, _unused: Option<()>) {
-    if let Some(p) = FLAGGE.with(|f| f.get()) {
-        AKTIV.with(|a| a.set(p));
+    if let Some(p) = FLAG.with(|f| f.get()) {
+        ACTIVE.with(|a| a.set(p));
         return;
     }
     let p = match prog.profile.as_ref().map(|(n, _)| n.as_str()) {
         Some("kernel") => Profile::Kernel,
         _ => Profile::App,
     };
-    AKTIV.with(|a| a.set(p));
+    ACTIVE.with(|a| a.set(p));
 }
 
 pub fn active() -> Profile {
-    AKTIV.with(|a| a.get())
+    ACTIVE.with(|a| a.get())
 }
 
 pub fn is_kernel() -> bool {
@@ -108,8 +108,8 @@ pub fn name() -> &'static str {
 /// EINEM Prozess uebersetzen.
 #[cfg(test)]
 pub(crate) fn reset() {
-    FLAGGE.with(|f| f.set(None));
-    AKTIV.with(|a| a.set(Profile::App));
+    FLAG.with(|f| f.set(None));
+    ACTIVE.with(|a| a.set(Profile::App));
 }
 
 // ------------------------------------------------------------- import ---

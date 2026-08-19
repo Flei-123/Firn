@@ -15,7 +15,7 @@ sys.path.insert(0, 'tools/englisch')
 import quelltext as Q
 
 ROOTS = ['compiler/src', 'lib', 'bin', 'tools', 'tests', 'demos', 'examples', 'bench']
-TEIL = re.compile(r'[a-z0-9]+|[A-Z][a-z0-9]*|[A-Z]+(?![a-z])')
+TEIL = re.compile(r'[a-z0-9]+|[A-Z]+(?![a-z])|[A-Z][a-z0-9]*')
 
 
 def morpheme():

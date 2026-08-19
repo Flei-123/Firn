@@ -78,19 +78,19 @@ use crate::types::{Type, TypeCtx};
 
 /// Praefix des noch nicht aufgeloesten Methodenaufrufs im AST.
 /// Das Leerzeichen macht ihn unerreichbar fuer den Quelltext.
-pub(crate) const P_RUF: &str = "method ";
+pub(crate) const P_CALL: &str = "method ";
 /// Trenner im Namen der Methodenfunktion: `Typ__methode`.
-pub(crate) const TRENNER: &str = "__";
+pub(crate) const SEP: &str = "__";
 
 /// Ist das ein noch nicht aufgeloester Methodenaufruf? Liefert den
 /// Methodennamen.
 pub(crate) fn method_name(name: &str) -> Option<&str> {
-    name.strip_prefix(P_RUF)
+    name.strip_prefix(P_CALL)
 }
 
 /// Name der Funktion hinter `Typ.methode`.
 pub(crate) fn fn_name(ty: &str, method: &str) -> String {
-    format!("{}{}{}", ty, TRENNER, method)
+    format!("{}{}{}", ty, SEP, method)
 }
 
 // ------------------------------------------------------------------- Parser
@@ -373,7 +373,7 @@ pub(crate) fn hook_method_call(
     all.push(base.clone());
     all.extend(args);
     let span = Parser::join(base.span, end);
-    Some(p.mk(span, ExprKind::Call(format!("{}{}", P_RUF, name), all, nsp)))
+    Some(p.mk(span, ExprKind::Call(format!("{}{}", P_CALL, name), all, nsp)))
 }
 
 // -------------------------------------------------------------- Typpruefung
@@ -455,7 +455,7 @@ fn is_slot(e: &Expr) -> bool {
 
 /// Alle Methoden eines Typs, alphabetisch — fuer die Fehlermeldung.
 fn methods_of(ck: &Checker, prefix: &str) -> Vec<String> {
-    let prefix = format!("{}{}", prefix, TRENNER);
+    let prefix = format!("{}{}", prefix, SEP);
     let mut out: Vec<String> = ck
         .fns
         .keys()

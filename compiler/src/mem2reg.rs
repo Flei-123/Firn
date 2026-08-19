@@ -766,7 +766,7 @@ mod tests {
     }
 
     #[test]
-    fn load_after_store_becomes_im_block_forwarded() {
+    fn load_after_store_becomes_in_block_forwarded() {
         let mut f = Func::new("t", vec![], FTy::I32);
         let slot = f.alloca(4, 4);
         let c = f.push(0, FTy::I32, Op::Const(5));

@@ -80,13 +80,13 @@ use crate::types::Type;
 const P_ASM: &str = "asm$";
 
 /// Die acht MMIO-Namen. Reihenfolge = Breite 8/16/32/64.
-pub(crate) const MMIO_LESEN: [&str; 4] = [
+pub(crate) const MMIO_READ: [&str; 4] = [
     "__mmio_read8",
     "__mmio_read16",
     "__mmio_read32",
     "__mmio_read64",
 ];
-pub(crate) const MMIO_SCHREIBEN: [&str; 4] = [
+pub(crate) const MMIO_WRITE: [&str; 4] = [
     "__mmio_write8",
     "__mmio_write16",
     "__mmio_write32",
@@ -95,7 +95,7 @@ pub(crate) const MMIO_SCHREIBEN: [&str; 4] = [
 
 /// Breitenindex 0..3 eines MMIO-Namens, oder `None`.
 fn mmio_width(name: &str, write: bool) -> Option<usize> {
-    let tab = if write { &MMIO_SCHREIBEN } else { &MMIO_LESEN };
+    let tab = if write { &MMIO_WRITE } else { &MMIO_READ };
     tab.iter().position(|n| *n == name)
 }
 
@@ -138,7 +138,7 @@ const REGISTER: &[(&str, &str)] = &[
 /// Register, die es zwar gibt, die der Inline-Assembler aber ablehnt: sie sind
 /// callee-saved bzw. tragen den Rahmen. Getrennte Liste, damit die Meldung
 /// sagen kann WARUM (und nicht nur „unbekannt").
-const GESPERRT: &[&str] = &[
+const LOCKED: &[&str] = &[
     "rbx", "ebx", "bx", "bl",
     "rbp", "ebp", "bp", "bpl",
     "rsp", "esp", "sp", "spl",
@@ -209,7 +209,7 @@ fn is_str_at(p: &Parser, off: usize) -> bool {
 }
 
 /// Liest ein Zeichenkettenliteral als Rust-`String` (nur Oktettliterale).
-fn str_lit(p: &mut Parser, whatfor: &str) -> Option<(String, Span)> {
+fn str_lit(p: &mut Parser, what_for: &str) -> Option<(String, Span)> {
     let k = p.kind().clone();
     match k {
         TokKind::Str(_, LitValue::Octets(v)) => {
@@ -217,19 +217,19 @@ fn str_lit(p: &mut Parser, whatfor: &str) -> Option<(String, Span)> {
             match String::from_utf8(v) {
                 Ok(s) => Some((s, sp)),
                 Err(_) => {
-                    p.error_here(format!("{} must be valid UTF-8", whatfor));
+                    p.error_here(format!("{} must be valid UTF-8", what_for));
                     None
                 }
             }
         }
         TokKind::Str(_, LitValue::Units(_)) => {
-            p.error_here(format!("{} must not be a u\"…\" literal", whatfor));
+            p.error_here(format!("{} must not be a u\"…\" literal", what_for));
             None
         }
         _ => {
             p.error_here(format!(
                 "expected a string literal {}, found '{}'",
-                whatfor,
+                what_for,
                 p.kind().text()
             ));
             None
@@ -342,7 +342,7 @@ fn check_reg(ck: &mut Checker, reg: &str, span: Span, wo: &str) -> bool {
     if stem(reg).is_some() {
         return true;
     }
-    if GESPERRT.contains(&reg) {
+    if LOCKED.contains(&reg) {
         ck.dg.error_note(
             span,
             format!("register '{}' is not allowed in the asm block ({})", reg, wo),

@@ -1655,7 +1655,7 @@ impl<'a> Parser<'a> {
             }
             // Das schliessende '}' suchen; Schachtelung von '{' ist ein Fehler.
             let mut j = i + 1;
-            let mut zu = false;
+            let mut too = false;
             while j < chars.len() {
                 if chars[j] == '{' {
                     self.dg.error(
@@ -1666,7 +1666,7 @@ impl<'a> Parser<'a> {
                     break;
                 }
                 if chars[j] == '}' {
-                    zu = true;
+                    too = true;
                     break;
                 }
                 j += 1;
@@ -1674,7 +1674,7 @@ impl<'a> Parser<'a> {
             if broken {
                 break;
             }
-            if !zu {
+            if !too {
                 self.dg.error(
                     sp,
                     "unbalanced brace in an interpolation: '{' without '}'".to_string(),

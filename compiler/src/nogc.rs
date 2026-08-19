@@ -145,7 +145,7 @@ struct NoGcChecker<'a> {
 /// Hoechste Schachtelung von `match`-Faellen, in die hineingesehen wird. Der
 /// Parser begrenzt die Verschachtelung ohnehin auf 200; diese Schranke ist
 /// die zweite Sicherung gegen eine Rekursionsexplosion.
-const MAX_TIEFE: u32 = 256;
+const MAX_DEPTH: u32 = 256;
 
 impl<'a> NoGcChecker<'a> {
     fn ty_of(&self, e: &Expr) -> Type {
@@ -345,7 +345,7 @@ impl<'a> NoGcChecker<'a> {
             Some(m) => m,
             None => return,
         };
-        if self.depth >= MAX_TIEFE {
+        if self.depth >= MAX_DEPTH {
             return;
         }
         self.depth += 1;
