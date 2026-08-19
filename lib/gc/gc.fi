@@ -186,6 +186,23 @@ const S_FINUHR: u64 = 1944
 // Mehr als 64 Klassen: dann steht Bit 63 fuer "koennte sein" und es wird
 // nachgesehen — richtig bleibt es immer, nur nicht mehr ganz so billig.
 const S_WEAKMASK: u64 = 1952
+// ---------------------------------------------------------------- Runde 53
+// Typkennung des Slot-Puffers (lib/gc/gcvec.fi setzt sie einmal je Prozess).
+const S_SLOTS_TID: u64 = 1960
+// Scheibengroesse und Zeitbudget des Markierens ZUR LAUFZEIT stellbar;
+// 0 = Voreinstellung (SCHEIBE_TRACE bzw. ZEIT_BUDGET_NS).
+//
+// WOZU: der kritische Fall der Runde 53 ist eine Sammlung, die WAEHREND
+// einer laufenden Markierung waechst. Wie oft er von selbst eintritt, ist
+// nachgemessen und ernuechternd: bei 200.000 Anhaengungen fielen 526 in
+// Phase 1 und KEIN EINZIGES Wachsen des Puffers (0,26 %). Ein Test, der
+// darauf wartet, prueft nichts. Mit `gc_set_scheibe(1)` verfolgt eine
+// Scheibe genau EIN Objekt — die Markierphase erstreckt sich dann ueber so
+// viele Allokationen, wie es lebende Objekte gibt, und der kritische Fall
+// wird zum Normalfall. Derselbe Kunstgriff wie S_CPUUHR und S_INKRAB:
+// bitgleicher Code, nur ein anderer Zustand.
+const S_SCHEIBE: u64 = 1968
+const S_ZBUDGET: u64 = 1976
 
 // Zustandswort eines Blockkopfes (siehe Kopfkommentar).
 const M_MARKE: u32 = 3
@@ -193,6 +210,31 @@ const M_OHNE_MARKE: u32 = 4294967292
 const F_FIN: u32 = 4
 const F_WART: u32 = 8
 const F_GETAN: u32 = 16
+// ---------------------------------------------------------------- Runde 53
+// SLOT-PUFFER: der Block traegt statt fester Felder ein FELD von Elementen,
+// deren Zahl erst zur Laufzeit feststeht (`GcVec`, `GcMap` — lib/gc/gcvec.fi,
+// lib/gc/gcmap.fi). Die compilergenerierte Typtabelle kann so etwas nicht
+// beschreiben, sie kennt nur feste Offsets. Dieses Bit im Zustandswort
+// schaltet die Verfolgung auf `__gc_trace_slots` um. Es kostet NICHTS: das
+// Wort wird in `__gc_trace` ohnehin gelesen und geschrieben. Bits 5..7 waren
+// frei (0..1 Marke, 2 F_FIN, 3 F_WART, 4 F_GETAN, 8..31 Aufraeumart).
+const F_SLOTS: u32 = 32
+// Kopf eines Slot-Puffers, in Bytes (Nutzdaten, nicht Blockkopf):
+//   [0..8)   u64 n            Zahl der Elemente, die verfolgt werden
+//   [8..16)  u64 desc         schritt | (maske << 8)
+//   [16..24) u64 fortschritt  Wiederaufnahmepunkt der Markierung
+//   [24..32) u64 kap          Kapazitaet in Elementen
+//   [32..)   die Elemente
+// 32 Byte, damit die Elemente 16-byte-ausgerichtet liegen.
+const SLOT_KOPF: u64 = 32
+// Elemente je Markierscheibe eines Slot-Puffers. Siehe __gc_trace_slots:
+// ein Puffer mit Millionen Elementen darf das Zeitbudget einer Scheibe
+// (ZEIT_BUDGET_NS) nicht sprengen, sonst ist die Pausenzusage der Runde 44
+// hin. Die Uhr wird in __gc_zyklus_schritt nur alle ZEIT_PROBE Objekte
+// gelesen, also ist die schlimmste Strecke ohne Uhr ZEIT_PROBE * SLOT_SCHEIBE
+// Markierungen. Bei 16 * 64 = 1024 bleibt sie in derselben Groessenordnung
+// wie ein gewoehnliches Objekt mit acht Zeigerfeldern.
+const SLOT_SCHEIBE: u64 = 64
 const ART_MAX: u64 = 16777215
 // Anfangsgroesse des Feldes externer Wurzelbereiche (Eintraege zu 16 Byte).
 const WROOT_START: u64 = 256
@@ -729,12 +771,91 @@ fn __gc_mark(a: u64) {
     __gc_mark_push(b + KOPF)
 }
 
+// ------------------------------------------------------------- Runde 53
+// Verfolgung eines SLOT-PUFFERS: der Block, in dem `GcVec`/`GcMap` ihre
+// Elemente halten. Layout siehe SLOT_KOPF.
+//
+// `desc = schritt | (maske << 8)`: `schritt` ist die Zahl der Woerter je
+// Element, Bit `j` der Maske sagt, dass Wort `j` eines Elements ein
+// Gc-Zeiger ist. Damit deckt ein einziger Puffertyp alles ab, was gebraucht
+// wird — `GcVec[Gc[T]]` (1/1), `GcVec[u64]` (1/0), `GcMap[Gc[K],Gc[V]]`
+// (2/3), `GcMap[u64,Gc[V]]` (2/2).
+//
+// STUECKELUNG: ein Puffer kann Millionen Elemente tragen. In einem Stueck
+// verfolgt risse er das Zeitbudget einer Markierscheibe und damit die
+// Pausenzusage der Runde 44. Also hoechstens SLOT_SCHEIBE Elemente je
+// Aufruf, Wiederaufnahmepunkt IM Puffer, und der Puffer legt sich selbst
+// wieder auf den Markstapel. Laeuft der Markstapel dabei ueber, findet
+// `__gc_nachtragen` ihn als grauen Block wieder und macht weiter — die
+// Vollstaendigkeit haengt also nicht am Stapel.
+//
+// Rueckgabe: true = fertig verfolgt (der Aufrufer faerbt schwarz),
+//            false = noch Arbeit offen (der Puffer bleibt grau).
+fn __gc_trace_slots(obj: u64) -> bool {
+    let n: u64 = __gc_ld64(obj)
+    let desc: u64 = __gc_ld64(obj + 8)
+    let maske: u64 = desc >> 8
+    var i: u64 = __gc_ld64(obj + 16)
+    if maske == 0 || i >= n {
+        __gc_st64(obj + 16, 0)
+        return true
+    }
+    let schritt: u64 = desc & 255
+    let basis: u64 = obj + SLOT_KOPF
+    var rest: u64 = SLOT_SCHEIBE
+    if schritt == 1 {
+        // Der haeufige Fall (GcVec[Gc[T]]) ohne innere Schleife.
+        while i < n && rest > 0 {
+            let v: u64 = __gc_ld64(basis + i * 8)
+            if v != 0 {
+                __gc_mark(v)
+            }
+            i = i + 1
+            rest = rest - 1
+        }
+    } else {
+        while i < n && rest > 0 {
+            let e: u64 = basis + i * schritt * 8
+            var j: u64 = 0
+            while j < schritt {
+                if ((maske >> j) & 1) != 0 {
+                    let v: u64 = __gc_ld64(e + j * 8)
+                    if v != 0 {
+                        __gc_mark(v)
+                    }
+                }
+                j = j + 1
+            }
+            i = i + 1
+            rest = rest - 1
+        }
+    }
+    if i >= n {
+        __gc_st64(obj + 16, 0)
+        return true
+    }
+    __gc_st64(obj + 16, i)
+    __gc_mark_push(obj)
+    return false
+}
+
 // Praezise Verfolgung eines Objekts ueber die compilergenerierte Typtabelle.
 fn __gc_trace(obj: u64) {
     let st: u64 = __gc_state() as u64
     let b: u64 = obj - KOPF
+    let zw: u32 = __gc_ld32(b + 4)
     let schwarz: u32 = (2 - __gc_ld64(st + S_PAR)) as u32
-    __gc_st32(b + 4, (__gc_ld32(b + 4) & M_OHNE_MARKE) | schwarz)
+    // Runde 53: Sammlungen veraenderlicher Laenge. Ein Slot-Puffer wird
+    // stueckweise verfolgt und bleibt GRAU, bis er durch ist — grau heisst
+    // genau "noch nicht fertig". Der Test kostet keinen Speicherzugriff, das
+    // Zustandswort wird hier ohnehin gelesen.
+    if (zw & F_SLOTS) != 0 {
+        if __gc_trace_slots(obj) {
+            __gc_st32(b + 4, (zw & M_OHNE_MARKE) | schwarz)
+        }
+        return
+    }
+    __gc_st32(b + 4, (zw & M_OHNE_MARKE) | schwarz)
     let tid: u64 = __gc_ld32(b) as u64
     let tab: u64 = __gc_ld64(st + S_TABELLE)
     if tid == 0 || tid > __gc_ld64(tab) {
@@ -958,7 +1079,11 @@ fn __gc_sweep_schritt(t0: u64) -> u64 {
         if probe == 0 {
             probe = SCHEIBE_SWEEP
             if t0 != 0 {
-                if __gc_jetzt_ns() - t0 >= ZEIT_BUDGET_NS {
+                var budget: u64 = __gc_ld64(st + S_ZBUDGET)
+                if budget == 0 {
+                    budget = ZEIT_BUDGET_NS
+                }
+                if __gc_jetzt_ns() - t0 >= budget {
                     break
                 }
             }
@@ -1309,7 +1434,14 @@ fn __gc_zyklus_schritt() {
         // Markierscheibe: bis zu SCHEIBE_TRACE Objekte verfolgen.
         __gc_diag_inc(S_D_SCH_MARK)
         let t0: u64 = __gc_jetzt_ns()
-        var n: u64 = SCHEIBE_TRACE
+        var n: u64 = __gc_ld64(st + S_SCHEIBE)
+        if n == 0 {
+            n = SCHEIBE_TRACE
+        }
+        var budget: u64 = __gc_ld64(st + S_ZBUDGET)
+        if budget == 0 {
+            budget = ZEIT_BUDGET_NS
+        }
         var probe: u64 = ZEIT_PROBE
         while __gc_ld64(st + S_MLEN) > 0 && n > 0 {
             let len: u64 = __gc_ld64(st + S_MLEN) - 1
@@ -1320,7 +1452,7 @@ fn __gc_zyklus_schritt() {
             probe = probe - 1
             if probe == 0 {
                 probe = ZEIT_PROBE
-                if __gc_jetzt_ns() - t0 >= ZEIT_BUDGET_NS {
+                if __gc_jetzt_ns() - t0 >= budget {
                     n = 0
                 }
             }
@@ -2278,6 +2410,25 @@ fn gc_pause_ns_max() -> u64 {
 
 fn gc_pause_ns_total() -> u64 {
     return __gc_ld64(__gc_state() as u64 + S_PAUSE_TOTAL)
+}
+
+// Runde 53: die Phase des laufenden Zyklus (0 Ruhe, 1 Markieren, 2 Fegen,
+// 3 Finalisierer). Nur lesend — Messprogramme brauchen sie, um zu BELEGEN,
+// dass ein Eintrag wirklich in eine laufende Markierung gefallen ist, statt
+// es zu behaupten (tests/841_gcvec_inkrementell.fi).
+// Runde 53: Scheibengroesse (Objekte je Markierscheibe) und Zeitbudget
+// (ns) stellen. 0 = Voreinstellung. NUR fuer Tests und Messprogramme; im
+// Normalbetrieb bleibt beides 0 und der Code ist bitgleich zu vorher.
+fn gc_set_scheibe(n: u64) {
+    __gc_st64(__gc_state() as u64 + S_SCHEIBE, n)
+}
+
+fn gc_set_zeitbudget(ns: u64) {
+    __gc_st64(__gc_state() as u64 + S_ZBUDGET, ns)
+}
+
+fn gc_phase() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_PHASE)
 }
 
 fn gc_barriers() -> u64 {

@@ -1194,9 +1194,27 @@ Zählverweis-Gegenprobe mit identischem Graphen braucht nach 2.000.000 Zyklen
 
 **Ehrliche Grenzen dieser Umsetzung:**
 
-* **Keine `GcVec`/`GcMap`, kein `virtual`.**
+* **`GcVec`/`GcMap` gibt es seit Runde 53** (`lib/gc/gcvec.fi`,
+  `lib/gc/gcmap.fi`, `docs/RUNDE53.md`), **`virtual` nicht.**
   *Inkrementelles Sammeln* kam in Runde 44 dazu (längste Unterbrechung
   **0,45 ms** statt 3,54 ms), *Finalisierer* (`S4`) in Runde 47.
+* **Sammlungen, Stufe-0-Form (Runde 53, `docs/RUNDE53.md`):** Der Sammler
+  verfolgt den Heap präzise über eine Typtabelle mit **festen** Feldoffsets;
+  eine wachsende Sammlung passt da nicht hinein. Sie liegt deshalb in einem
+  zweiten Objekt, dem **Slot-Puffer** — ein gewöhnlicher GC-Block, der im
+  Zustandswort seines Kopfes das Bit `F_SLOTS` trägt und Elementzahl,
+  Schrittweite und Zeigermaske selbst mitbringt. Er wird in Scheiben zu
+  64 Elementen verfolgt und bleibt dazwischen grau; ohne diese Stückelung
+  steigt die längste Unterbrechung bei 120.000 Elementen von **0,50 ms auf
+  2,67 ms** (gemessen). Der Preis der Stufe 0, benannt statt verschwiegen:
+  * `GcVec[Gc[Node]]` ist **ein** nominaler Typ, nicht einer je Elementtyp —
+    Stufe 0 hat keine generischen `gc class`. Der Elementtyp wird am
+    **Zugriff** geprüft (`gcvec_anhaengen[Node](…)`), nicht am Feld.
+  * Statt `parent.children.push(child)` steht dort
+    `gcvec_anhaengen[Node](eltern.kinder, kind)` — Stufe 0 hat keine
+    Methoden, dieselbe Entscheidung wie bei den Finalisierern.
+  * In `GcMap` sind die Schlüssel **0 und 1** reserviert (leerer Platz und
+    Grabstein).
 * **Finalisierer, Stufe-0-Form (Runde 47, `docs/RUNDE47.md`):** Stufe 0 hat
   keine Methoden und keine Funktionszeiger, deshalb ist aus
   `fn finalize(inout self)` ein Paar geworden — `gc_finalisierer_setzen(p, art)`

@@ -138,6 +138,9 @@ wenn die Messung selbst stimmte.
   `GcVec`/`GcMap`, kein `virtual`. Die längste gemessene Pause ist **6,58 ms** —
   für einen Browser mit 16-ms-Bildabstand ist das bereits zu viel und der Grund,
   warum `S5` in der ROADMAP steht.
+  *(Stand 14.08.2026. Inkrementelles Sammeln kam in Runde 44, Finalisierer in
+  Runde 47, `GcVec`/`GcMap` in Runde 53 — siehe den Nachtrag am Ende dieses
+  Berichts.)*
 * **Ein Faden.** Der Zustandsblock ist fadenlokal gedacht, Stufe 0 hat nur einen
   Faden.
 
@@ -176,3 +179,47 @@ Codegen-Modell (ROADMAP, nach der echten Registerzuteilung).
 | `tools/dom_soak/messung-leck.tsv` | letzte Messreihe Gegenprobe |
 | `tools/dom_soak/langlauf/gc-100mio-zyklen.tsv` | der 100-Mio-Lauf |
 | `tests/560_dom_zyklen.fi` | Strukturtest, läuft in allen drei Baustufen |
+
+---
+
+## Nachtrag Runde 53 (19.08.2026): der Prototyp benutzt jetzt Sammlungen
+
+`docs/RUNDE53.md` hat `GcVec`/`GcMap` gebracht, und `lib/dom/dom.fi` ist darauf
+umgestellt. Was sich am Objektgraphen geändert hat:
+
+| vorher | jetzt |
+|---|---|
+| `erstes_kind` / `letztes_kind` / `naechstes` | `kinder: GcVec[Gc[Node]]` |
+| `listener: Gc[Listener]` (Kette) | `listener: GcVec[Gc[Listener]]` |
+| `attr_name: [u32; 4]`, `attr_wert: [u32; 4]` | `attrs: GcMap[u32, Gc[Str]]` |
+
+Die Zyklenarten 1, 2 und 3 laufen damit **über Sammlungen**. Ein Satz besteht
+jetzt aus **14** statt 7 Objekten: Wurzelelement (1), Attributtabelle + Puffer
++ `Str` (3), drei Kinder (3), Kinderliste + Puffer (2), Listener +
+Listenerliste + Puffer (3), Sammlung (1), Wrapper (1).
+
+**Die Gegenprobe wurde mitgezogen** — `lib/dom/soak_leck.fi` bildet denselben
+Satz Objekt für Objekt nach (128-Byte-Objekt, generische Verweisspalten,
+14 Objekte, davon lecken 13). Ohne das wären nicht mehr dieselben zwei Graphen
+verglichen worden, und der ganze Bericht hinge in der Luft.
+
+Messung mit `tools/dom_soak/run.sh` (im Rahmen von `test.sh`, 19.08.2026):
+
+| | GC-Fassung | Zählverweis-Gegenprobe |
+|---|---|---|
+| RSS Median 2. Viertel → letztes Viertel | **1.644,0 → 1.644 KiB** | 357.572 → 853.258 KiB |
+| lebende Objekte | 27 → 27 | 6.825.000 |
+| Urteil | **kein Leck** | **LECK** (wie verlangt) |
+
+Eigenständiger Lauf mit größerem Budget: GC **1.640 → 1.640 KiB**, Gegenprobe
+364.884 → 853.256 KiB, **Faktor 520**.
+
+`SOAK_LECK_ZYKLEN` steht seitdem auf **600.000** statt 2.000.000: ein Satz leckt
+jetzt 13 Objekte zu 128 Byte statt 6 zu 64, das sind rund 1,0 GiB statt
+770 MiB. Dieselbe Bremse, derselbe Grund wie oben.
+
+**Pausen:** die längste Unterbrechung in Rechenzeit liegt bei 120.000 lebenden
+Knoten im Median bei **497 µs** (Basis vor Runde 53: 477 µs), keine einzige von
+538.936 gemessenen Unterbrechungen über 1,02 ms. Ohne die Stückelung der
+Puffer-Verfolgung wären es **2,67 ms** — die Zahl steht in `docs/RUNDE53.md`
+§1.1.
