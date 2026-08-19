@@ -10,7 +10,7 @@
 # wachsen — sonst kann die Messung gar kein Leck anzeigen und ist wertlos.
 # Bleibt die Gegenprobe flach, bricht dieses Skript ab.
 #
-# Umgebung:
+# Environment:
 #   BAUM_RUNDEN     Runden im Normallauf (Standard 20000)
 #   BAUM_MS         Zeitbudget im Normallauf in ms (Standard 8000)
 #   BAUM_LECK_RUNDEN Runden der Gegenprobe (Standard 4000)

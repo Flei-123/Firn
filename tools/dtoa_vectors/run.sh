@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# Grosser Zahlenlauf des Moduls `str` (SPEC §8.4, Z5/Z6).
+# The big number run of the module `str` (SPEC 8.4, Z5/Z6).
 #
-#   f64 -> Text (lib/num/dtoa.fi, in Firn)  ->  f64 (lib/num/strtod.fi, in Firn)
+#   f64 -> text (lib/num/dtoa.fi, in Firn)  ->  f64 (lib/num/strtod.fi, in Firn)
 #
-# geprueft wird ZWEIFACH:
-#   1. das Firn-Programm selbst vergleicht die Rueckwandlung bitgenau,
-#   2. das Rust-Werkzeug tools/dtoa_vectors/gen.rs vergleicht jede Zeile mit
-#      der kuerzesten Darstellung von Rust und wandelt sie zusaetzlich mit
-#      Rusts eigenem strtod zurueck.
+# it is checked TWICE:
+#   1. the Firn program itself compares the conversion back bit by bit,
+#   2. the Rust tool tools/dtoa_vectors/gen.rs compares every line with
+#      the shortest representation of Rust and additionally converts it back
+#      with Rust's own strtod.
 #
-# Rust ist hier MESSLATTE, nicht Abhaengigkeit: der Compiler selbst benutzt
-# weder gen.rs noch irgendeine fremde Kiste.
+# Rust is the YARDSTICK here, not a dependency: the compiler itself uses
+# neither gen.rs nor any foreign crate.
 #
-# Aufruf:  bash tools/dtoa_vectors/run.sh [ANZAHL] [SAAT]
+# Usage:  bash tools/dtoa_vectors/run.sh [COUNT] [SEED]
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."

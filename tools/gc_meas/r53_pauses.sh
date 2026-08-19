@@ -1,34 +1,34 @@
 #!/usr/bin/env bash
-# tools/gc_meas/r53_pauses.sh — Pausenmessung der Runde 53.
+# tools/gc_meas/r53_pauses.sh -- pause measurement of round 53.
 #
-# FRAGE: Sind die Pausen durch die Sammlungen schlechter geworden? Stand nach
-# R44/R47: laengste Unterbrechung 0,45 ms bzw. 460 us (Rechenzeit, Median aus
-# 7 Laeufen), 0 von 253 698 ueber 1 ms.
+# QUESTION: have the pauses become worse through the collections? The state after
+# R44/R47: longest interruption 0.45 ms resp. 460 us (compute time, median of
+# 7 runs), 0 of 253,698 above 1 ms.
 #
-# Gemessen werden DREI Faelle mit demselben Messprogramm (build.fi):
+# THREE cases are measured with the same measuring program (build.fi):
 #
-#   A  BASIS      — Baum bei $BASIS, eigener Compiler, alter DOM
-#                   (Geschwisterkette, feste Attributzahl)
-#   B  KERN       — Compiler und GC-Laufzeit der Runde 53, aber der ALTE DOM.
-#                   Die Sammlungen werden nie benutzt; gemessen wird also
-#                   genau der Aufpreis des F_SLOTS-Zweigs in __gc_trace und
-#                   der beiden zusaetzlichen Zustandswoerter.
-#   C  SAMMLUNGEN — Runde 53, wie sie ist: der DOM auf GcVec/GcMap.
+#   A  BASE       -- tree at $BASIS, own compiler, the old DOM
+#                    (sibling chain, fixed number of attributes)
+#   B  CORE       -- compiler and GC runtime of round 53, but the OLD DOM.
+#                    The collections are never used; so what is measured is
+#                    exactly the surcharge of the F_SLOTS branch in __gc_trace and
+#                    of the two additional state words.
+#   C  COLLECTIONS -- round 53 as it is: the DOM on GcVec/GcMap.
 #
-# A gegen B beantwortet „kostet der Umbau des Sammlers etwas?",
-# B gegen C beantwortet „kostet der Umbau des DOM etwas?".
+# A against B answers "does rebuilding the collector cost anything?",
+# B against C answers "does rebuilding the DOM cost anything?".
 #
-# MASSGEBLICH IST DIE RECHENZEIT DES FADENS (K <phase> 21). Auf dieser
-# Maschine laufen mehrere Runden gleichzeitig; die Wanduhr misst dann
-# Verdraengung, nicht den Sammler (Fehlbefund der Runde 40). callgrind
-# scheidet aus: es verschiebt den Stapel (docs/RUNDE47.md §4.1).
+# WHAT COUNTS IS THE COMPUTE TIME OF THE THREAD (K <phase> 21). On this
+# machine several rounds run at the same time; the wall clock then measures
+# preemption, not the collector (the wrong finding of round 40). callgrind
+# is out of the question: it shifts the stack (docs/RUNDE47.md 4.1).
 #
-# Umgebung:
-#   R53_LAEUFE   Laeufe je Fall (Standard 7, Median wird berichtet)
-#   R53_MS       Budget je Lauf in ms (Standard 5000)
-#   R53_KINDER   lebende Textknoten (Standard 120000, wie R44/R47)
-#   R53_BASIS    Basis-Commit (Standard cc1710f)
-#   R53_SCHWELLE Umschaltschwelle atomar/inkrementell (Standard 0)
+# Environment:
+#   R53_LAEUFE   runs per case (default 7, the median is reported)
+#   R53_MS       budget per run in ms (default 5000)
+#   R53_KINDER   live text nodes (default 120000, as R44/R47)
+#   R53_BASIS    base commit (default cc1710f)
+#   R53_SCHWELLE switching threshold atomic/incremental (default 0)
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 WURZEL=$(pwd)
@@ -37,33 +37,33 @@ LAEUFE=${R53_LAEUFE:-7}
 MS=${R53_MS:-5000}
 KINDER=${R53_KINDER:-120000}
 BASIS=${R53_BASIS:-cc1710f}
-# 0 = immer inkrementell (der Pfad, um den es seit Runde 44 geht).
+# 0 = always incremental (the path at issue since round 44).
 SCHWELLE=${R53_SCHWELLE:-0}
 
 TMPD=$(mktemp -d /tmp/r53pausen.XXXXXX)
 if [ "${R53_BEHALTEN:-0}" = 0 ]; then trap 'rm -rf "$TMPD"' EXIT; fi
 echo "Arbeitsverzeichnis: $TMPD"
 
-# --------------------------------------------------------------- Basis holen
+# --------------------------------------------------------------- fetch the base
 echo "== Basis $BASIS auspacken und bauen =="
 mkdir -p "$TMPD/basis"
 git archive "$BASIS" | tar -x -C "$TMPD/basis" || exit 1
 ( cd "$TMPD/basis" && cargo build --release --manifest-path compiler/Cargo.toml \
     >"$TMPD/basis-cargo.log" 2>&1 ) || { echo "Basis-Bau fehlgeschlagen"; tail -5 "$TMPD/basis-cargo.log"; exit 1; }
 
-# ---------------------------------------------------------------- Fall bauen
-# $1 Name  $2 Quellverzeichnis fuer dom.fi/meas.fi/build.fi  $3 Compiler
+# ---------------------------------------------------------------- build a case
+# $1 name  $2 source directory for dom.fi/meas.fi/build.fi  $3 compiler
 bauen() {
     local name=$1 quelle=$2 fc=$3
     local d="$TMPD/$name"
     mkdir -p "$d"
     cp "$quelle/lib/dom/dom.fi" "$quelle/lib/dom/meas.fi" "$d/"
-    # AB_SCHWELLE = 0: IMMER inkrementell. Mit der Voreinstellung 8 MiB
-    # laeuft die Aufbauphase atomar, und dann misst man die drei
-    # Stop-the-World-Laeufe der Runde 44 (0,88 / 2,90 / 11,81 ms) statt der
-    # inkrementellen Scheiben. Nachgemessen: mit der Voreinstellung kommen
-    # in diesem Aufbau 11,6 ms heraus — die Zahl stimmt, sie beantwortet nur
-    # eine andere Frage als die dieser Runde.
+    # AB_SCHWELLE = 0: ALWAYS incremental. With the default of 8 MiB
+    # the build-up phase runs atomically, and then one measures the three
+    # stop-the-world runs of round 44 (0.88 / 2.90 / 11.81 ms) instead of the
+    # incremental slices. Measured: with the default this build-up gives
+    # 11.6 ms -- the number is right, it just answers
+    # a different question than the one of this round.
     sed -e "s|^const BUDGET_MS: i64 = .*$|const BUDGET_MS: i64 = $MS|" \
         -e "s|^const CHILDREN: u32 = .*$|const CHILDREN: u32 = $KINDER|" \
         -e "s|^const INCR_THRESHOLD: u64 = .*$|const INCR_THRESHOLD: u64 = $SCHWELLE|" \
@@ -73,7 +73,7 @@ bauen() {
     return 0
 }
 
-# $1 Name -> gibt je Lauf eine Zeile "cpu_max wand_max zyklen ueber1ms gesamt rss"
+# $1 name -> gives one line per run: "cpu_max wall_max cycles above1ms total rss"
 messen() {
     local name=$1
     local d="$TMPD/$name"
@@ -100,7 +100,7 @@ def lies(p):
 zeilen = []
 for i in range(n):
     k, c = lies(f'{d}/aus.{i}.tsv')
-    # Fach 11 = [1,02 ms, 2,05 ms), alles ab 11 gilt als "ueber 1 ms".
+    # Bucket 11 = [1.02 ms, 2.05 ms), everything from 11 on counts as "above 1 ms".
     ueber = sum(v for f, v in c.items() if f >= 11)
     ges = sum(c.values())
     zeilen.append((k.get(21, 0), k.get(13, 0), k.get(1, 0), ueber, ges,
