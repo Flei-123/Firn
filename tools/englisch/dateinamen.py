@@ -20,7 +20,7 @@ sys.path.insert(0, 'tools/englisch')
 import vorschlag as V
 
 AUS = ('.git', 'target', '__pycache__', '.test-work', '.gauntlet-shots',
-       'testdata', '.gc-mess-work', '.dom-soak-work', 'node_modules',
+       'testdata', '.gc-meas-work', '.dom-soak-work', 'node_modules',
        # Das Umstellungswerkzeug selbst behaelt seine deutschen Namen:
        # es steht in der Arbeitsanweisung und benennt sich sonst selbst um.
        'englisch')

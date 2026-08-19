@@ -21,8 +21,8 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-ALT="${1:?erster firnc fehlt}"
-NEU="${2:?zweiter firnc fehlt}"
+OLD="${1:?first firnc missing}"
+NEW="${2:?second firnc missing}"
 shift 2
 WORK=.bench-instr
 mkdir -p "$WORK"
@@ -44,24 +44,24 @@ zaehle() {
     grep -oP 'I\s+refs:\s+\K[0-9,]+' "$WORK/$tag.log" | tr -d ','
 }
 
-printf '%-14s %16s %16s %10s\n' PROGRAMM ALT NEU AENDERUNG
+printf '%-14s %16s %16s %10s\n' PROGRAM OLD NEW CHANGE
 echo "-------------------------------------------------------------"
 sa=0
 sn=0
 for src in "${QUELLEN[@]}"; do
     name=$(basename "$src" .fi)
-    if ! "$ALT" "$src" -o "$WORK/$name.alt" 2>/dev/null; then
-        printf '%-14s   BAU-FEHLER (alt)\n' "$name"
+    if ! "$OLD" "$src" -o "$WORK/$name.old" 2>/dev/null; then
+        printf '%-14s   BUILD ERROR (old)\n' "$name"
         continue
     fi
-    if ! "$NEU" "$src" -o "$WORK/$name.neu" 2>/dev/null; then
-        printf '%-14s   BAU-FEHLER (neu)\n' "$name"
+    if ! "$NEW" "$src" -o "$WORK/$name.new" 2>/dev/null; then
+        printf '%-14s   BUILD ERROR (new)\n' "$name"
         continue
     fi
-    a=$(zaehle "$WORK/$name.alt" "$name.alt")
-    n=$(zaehle "$WORK/$name.neu" "$name.neu")
+    a=$(zaehle "$WORK/$name.old" "$name.old")
+    n=$(zaehle "$WORK/$name.new" "$name.new")
     if [ -z "$a" ] || [ -z "$n" ]; then
-        printf '%-14s   KEINE ZAEHLUNG (valgrind)\n' "$name"
+        printf '%-14s   NO COUNT (valgrind)\n' "$name"
         continue
     fi
     sa=$(awk -v x="$sa" -v y="$a" 'BEGIN{printf "%.0f", x+y}')
@@ -71,4 +71,4 @@ for src in "${QUELLEN[@]}"; do
 done
 echo "-------------------------------------------------------------"
 awk -v a="$sa" -v b="$sn" \
-    'BEGIN{if(a>0) printf "%-14s %16d %16d %+9.2f%%\n", "SUMME", a, b, (b-a)/a*100}'
+    'BEGIN{if(a>0) printf "%-14s %16d %16d %+9.2f%%\n", "TOTAL", a, b, (b-a)/a*100}'

@@ -10,7 +10,7 @@ os.chdir(ROOT)
 sys.path.insert(0, 'tools/englisch')
 import quelltext as Q
 
-AUS = ('.git', 'target', '__pycache__', '.test-work', 'testdata', '.gc-mess-work')
+AUS = ('.git', 'target', '__pycache__', '.test-work', 'testdata', '.gc-meas-work')
 
 
 def main(argv):

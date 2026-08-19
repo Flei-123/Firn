@@ -21,7 +21,7 @@ cd "$(dirname "$0")/../.."
 
 FIRNC=compiler/target/release/firnc
 export FIRNLIB="$(pwd)/lib"
-ARBEIT=.baum-work
+ARBEIT=.tree-work
 RUNDEN=${BAUM_RUNDEN:-20000}
 MS=${BAUM_MS:-8000}
 LECK_RUNDEN=${BAUM_LECK_RUNDEN:-4000}

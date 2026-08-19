@@ -22,7 +22,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 FIRNC=compiler/target/release/firnc
-ARBEIT=.gc-mess-work
+ARBEIT=.gc-meas-work
 AUS=tools/gc_meas
 PAUSE_SEK=${GCM_PAUSE_SEK:-20}
 RUNDEN=${GCM_ROUNDS:-600}
