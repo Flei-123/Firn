@@ -22,7 +22,7 @@ Objekte fest — sie verliessen sich auf die Rahmenlage. Ein Polster IM Sammler 
 reparierte einen Test und kippte drei andere: die Luecke verschwindet nicht, sie wandert. Richtig ist,
 die zeigerhaltenden Rahmen tief zu legen (rekursiv + Polster), wie dom_observer_lebt() es seit
 Runde 4 macht.
-Abnahme: test.sh 725/725, selbst_vergleich 210/0/0, Fixpunkt zeichengleich (374454 Zeilen).
+Abnahme: test.sh 727/727, selbst_vergleich 210/0/0, Fixpunkt zeichengleich (374454 Zeilen).
 
 ## Runde 35 (16.08.2026) — comptime in firnc1, Commit 5e16d8a
 Parallel-Experiment: eigenes git-Worktree (Branch r35-comptime), Merge fast-forward, null Konflikte.
