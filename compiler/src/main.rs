@@ -33,6 +33,8 @@ mod mono;
 mod mem2reg;
 mod nogc;
 mod opt;
+mod paket;
+mod paketwelt;
 mod parser;
 mod regalloc;
 mod sema;
@@ -63,8 +65,13 @@ enum Emit {
 }
 
 struct Options {
-    input: PathBuf,
+    /// Quelldatei; entfaellt bei `--paket`.
+    input: Option<PathBuf>,
     output: Option<PathBuf>,
+    /// `--paket <verzeichnis>`: Projekt anhand seines Manifests uebersetzen.
+    paket: Option<String>,
+    /// `--paket-info <verzeichnis>`: Manifest lesen und berichten.
+    paket_info: Option<String>,
     emit: Emit,
     optimize: bool,
     keep_asm: bool,
@@ -82,6 +89,8 @@ fn usage() -> String {
          \n\
          Optionen:\n  \
          -o <pfad>          Ausgabedatei (Standard: Eingabename ohne Endung)\n  \
+         --paket <verz>     Projekt aus <verz>/firn.paket uebersetzen\n  \
+         --paket-info <verz> Manifest von <verz> lesen und berichten\n  \
          --emit=exe         ausfuehrbare Datei erzeugen (Standard, ruft as/ld)\n  \
          --emit=asm         x86_64-Assembler auf die Ausgabe schreiben\n  \
          --emit=fir         FIR-Textform (nach Optimierung, sofern aktiv)\n  \
@@ -115,6 +124,8 @@ fn usage() -> String {
 fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut input: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
+    let mut paket: Option<String> = None;
+    let mut paket_info: Option<String> = None;
     let mut emit = Emit::Exe;
     let mut optimize = true;
     let mut keep_asm = false;
@@ -192,6 +203,23 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                     None => return Err("-o erwartet einen Pfad".to_string()),
                 }
             }
+            // Runde 48: der Bau-Treiber. Beide Optionen nehmen ihr
+            // Verzeichnis als EIGENES Argument — `firnc1` liest die
+            // Kommandozeile genauso.
+            "--paket" => {
+                i += 1;
+                match args.get(i) {
+                    Some(p) => paket = Some(p.clone()),
+                    None => return Err("--paket erwartet ein Verzeichnis".to_string()),
+                }
+            }
+            "--paket-info" => {
+                i += 1;
+                match args.get(i) {
+                    Some(p) => paket_info = Some(p.clone()),
+                    None => return Err("--paket-info erwartet ein Verzeichnis".to_string()),
+                }
+            }
             _ => {
                 if let Some(rest) = a.strip_prefix("--emit=") {
                     emit = match rest {
@@ -223,10 +251,13 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         }
         i += 1;
     }
-    match input {
-        Some(input) => Ok(Options { input, output, emit, optimize, keep_asm, stats, optcfg }),
-        None => Err(format!("keine Eingabedatei angegeben (.{})", config::FILE_EXT)),
+    if input.is_none() && paket.is_none() && paket_info.is_none() {
+        return Err(format!("keine Eingabedatei angegeben (.{})", config::FILE_EXT));
     }
+    if input.is_some() && paket.is_some() {
+        return Err("--paket und eine Eingabedatei schliessen einander aus".to_string());
+    }
+    Ok(Options { input, output, paket, paket_info, emit, optimize, keep_asm, stats, optcfg })
 }
 
 fn main() {
@@ -247,11 +278,70 @@ fn main() {
 }
 
 fn run(opts: &Options) -> i32 {
-    let path = &opts.input;
+    // --- `--paket-info`: Manifest lesen, pruefen, berichten (Runde 48) ---
+    if let Some(verz) = &opts.paket_info {
+        match paketwelt::Welt::ab_wurzel(verz) {
+            Ok(w) => {
+                print!("{}", paket::info_text(&w.pakete[0].manifest, verz));
+                return 0;
+            }
+            Err(t) => {
+                eprint!("{}", t);
+                return 2;
+            }
+        }
+    }
+    // --- Paketwelt: mit `--paket` das genannte Projekt, sonst das Manifest
+    // ueber der Quelldatei (fehlt eins, ist die Welt leer und nichts aendert
+    // sich gegenueber Runde 47).
+    let (welt, eingabe, ziel_aus_manifest) = match &opts.paket {
+        Some(verz) => {
+            let w = match paketwelt::Welt::ab_wurzel(verz) {
+                Ok(w) => w,
+                Err(t) => {
+                    eprint!("{}", t);
+                    return 2;
+                }
+            };
+            let m = &w.pakete[0].manifest;
+            if m.start.is_empty() {
+                eprintln!(
+                    "error: {}: das manifest hat keinen einstiegspunkt ('start <pfad>')",
+                    w.pakete[0].manifestpfad
+                );
+                return 2;
+            }
+            let start = PathBuf::from(paket::verbinde(verz, &m.start));
+            let ziel = PathBuf::from(paket::verbinde(verz, &m.name));
+            (w, start, Some(ziel))
+        }
+        None => {
+            let p = match &opts.input {
+                Some(p) => p.clone(),
+                None => {
+                    eprintln!("error: keine Eingabedatei angegeben (.{})", config::FILE_EXT);
+                    return 2;
+                }
+            };
+            let w = match paketwelt::Welt::ab_datei(&p.display().to_string()) {
+                Ok(w) => w,
+                Err(t) => {
+                    eprint!("{}", t);
+                    return 2;
+                }
+            };
+            (w, p, None)
+        }
+    };
+    let path = &eingabe;
     // --- Module aufloesen (Wurzeldatei + alle 'import'-Module) ---
-    let files = match modules::resolve(path) {
+    let files = match modules::resolve(path, &welt) {
         Ok(f) => f,
-        Err(d) => {
+        Err(modules::Fehler::Paket(t)) => {
+            eprint!("{}", t);
+            return 2;
+        }
+        Err(modules::Fehler::Diag(d)) => {
             // Fehler der Modulaufloesung im ueblichen Format ausgeben.
             let src = std::fs::read_to_string(path).unwrap_or_default();
             let mut dg = diag::Diags::new(&path.display().to_string(), &src);
@@ -472,7 +562,11 @@ fn run(opts: &Options) -> i32 {
         }
     };
 
-    let out = opts.output.clone().unwrap_or_else(|| default_output(path));
+    let out = opts
+        .output
+        .clone()
+        .or_else(|| ziel_aus_manifest.clone())
+        .unwrap_or_else(|| default_output(path));
     if opts.emit == Emit::Asm {
         if let Err(e) = std::fs::write(&out, asm.as_bytes()) {
             eprintln!("error: kann '{}' nicht schreiben: {}", out.display(), e);
