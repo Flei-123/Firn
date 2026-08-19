@@ -1,32 +1,32 @@
-//! Summentypen (`enum`) und Musterabgleich (`match`) — SPEC §6.3, `L4`.
+//! Sum types (`enum`) and pattern matching (`match`) — SPEC §6.3, `L4`.
 //!
-//! Diese Datei gehoert dem Modul `types`. Sie enthaelt
-//!  * die Parser-Erweiterungen (als `impl` auf `parser::Parser`, angebunden an
-//!    die `// HOOK types`-Zeilen in `parser.rs`),
-//!  * die Registrierung der Aufzaehlungen im Typkontext,
-//!  * die Typpruefung der Muster und
-//!  * die **Vollstaendigkeitspruefung zur Uebersetzungszeit**
-//!    (`check_exhaustive`) — ein fehlender Fall ist ein FEHLER mit Zeile und
-//!    Spalte und nennt die fehlende Variante, kein Warnhinweis.
+//! This file belongs to the module `types`. It holds
+//!  * the parser extensions (as `impl` on `parser::Parser`, wired up to the
+//!    `// HOOK types` lines within `parser.rs`),
+//!  * the registration of the enums at the type context,
+//!  * the type check of the patterns and
+//!  * the **exhaustiveness check at compile time**
+//!    (`check_exhaustive`) — a missing case is a hard ERROR with line and
+//!    column that states the missing variant, not a warning.
 //!
-//! ## Speicherlayout einer Aufzaehlung (verbindlich)
+//! ## Memory layout of one enum (binding)
 //!
 //! ```text
-//! offset 0        : __tag : u32      (Variantennummer, 0-basiert, Deklarationsreihenfolge)
-//! offset payload_off : Nutzdaten der jeweiligen Variante
+//! offset 0        : __tag : u32      (variant number, 0-based, declaration order)
+//! offset payload_off : payload data of the respective variant
 //! ```
 //!
-//! `payload_off = round_up(4, payload_align)`, wobei `payload_align` die
-//! groesste Ausrichtung aller Nutzdatenfelder ist (mindestens 1). Die
-//! Nutzdatenfelder einer Variante liegen in Deklarationsreihenfolge mit
-//! natuerlicher Ausrichtung hintereinander; die Bereiche **verschiedener**
-//! Varianten ueberlagern sich (echte Vereinigung). Groesse der Aufzaehlung =
-//! `round_up(payload_off + max_variantengroesse, align)`,
+//! `payload_off = round_up(4, payload_align)`, where `payload_align` is the
+//! largest alignment of all payload fields (at least 1). The payload fields
+//! of one variant sit one after another with natural alignment, ordered by
+//! declaration; the regions of **different** variants overlap (a true
+//! union). Size of the enum =
+//! `round_up(payload_off + max_variant_size, align)`,
 //! `align = max(4, payload_align)`.
 //!
-//! Technisch wird die Aufzaehlung als Struct mit den Feldern `__tag` und
-//! `__v<tag>_<i>` in `types::TypeCtx` eingetragen; die Offsets werden hier
-//! berechnet, nicht von `TypeCtx::set_fields`.
+//! Technically the enum gets entered as a struct with the fields `__tag` and
+//! `__v<tag>_<i>` at `types::TypeCtx`; the offsets are computed here, not by
+//! `TypeCtx::set_fields`.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -38,21 +38,21 @@ use crate::parser::Parser;
 use crate::sema::Checker;
 use crate::types::{round_up, Field, StructDef, Type};
 
-/// Praefix der internen Aufruf-Namen fuer `match`-Anweisungen. Enthaelt `#`,
-/// kann also nie ein Bezeichner aus dem Quelltext sein.
+/// Prefix of the internal call labels for `match` statements. It holds `#`,
+/// so it can never be some identifier out of the source text.
 pub(crate) const MATCH_PREFIX: &str = "__match#";
 
-// ---------------------------------------------------------------- Datenmodell
+// ----------------------------------------------------------------- Data model
 
 #[derive(Clone, Debug)]
 pub(crate) struct VariantDef {
     pub(crate) name: String,
     pub(crate) tag: i128,
-    /// Nutzdatentypen wie geschrieben
+    /// payload types as written
     pub(crate) field_tys: Vec<TypeExpr>,
-    /// aufgeloeste Nutzdatentypen (nach `layout_enums`)
+    /// resolved payload types (after `layout_enums`)
     pub(crate) fields: Vec<Type>,
-    /// Byte-Offsets der Nutzdatenfelder (nach `layout_enums`)
+    /// byte offsets of the payload fields (after `layout_enums`)
     pub(crate) offsets: Vec<u64>,
 }
 
@@ -61,7 +61,7 @@ pub(crate) struct EnumDef {
     pub(crate) name: String,
     pub(crate) span: Span,
     pub(crate) variants: Vec<VariantDef>,
-    /// Index in `TypeCtx::structs`
+    /// Index into `TypeCtx::structs`
     pub(crate) struct_idx: usize,
     pub(crate) size: u64,
     pub(crate) align: u64,
@@ -73,18 +73,18 @@ impl EnumDef {
     }
 }
 
-/// Muster (SPEC §6.3): Variante mit Bindung, Literal, Bereich, `_`, verschachtelt.
+/// Pattern (SPEC §6.3): variant with binding, literal, range, `_`, nested.
 #[derive(Clone, Debug)]
 pub(crate) enum Pattern {
     /// `_`
     Wild(Span),
-    /// `name` — bindet den ganzen Wert
+    /// `x` — binds the whole value
     Bind(String, Span),
     Int(i128, Span),
     Bool(bool, Span),
-    /// `lo..hi` (halboffen) bzw. `lo..=hi` (einschliessend)
+    /// `lo..hi` (half open) or `lo..=hi` (inclusive)
     Range { lo: i128, hi: i128, inclusive: bool, span: Span },
-    /// `Enum::Variante(unter, muster)` — `ename` kann fehlen (`::Variante`)
+    /// `Enum::Variant(sub, pattern)` — `ename` may be absent (`::Variant`)
     Variant { ename: Option<String>, vname: String, subs: Vec<Pattern>, span: Span },
 }
 
@@ -96,7 +96,7 @@ impl Pattern {
             Pattern::Variant { span, .. } => *span,
         }
     }
-    /// Trifft das Muster IMMER zu (bindet also nur)?
+    /// Does the pattern ALWAYS match (binding only, that is)?
     pub(crate) fn is_irrefutable(&self) -> bool {
         matches!(self, Pattern::Wild(_) | Pattern::Bind(..))
     }
@@ -116,13 +116,13 @@ pub(crate) struct MatchInfo {
     pub(crate) span: Span,
 }
 
-/// Was der Musterabgleich untersucht — Grundlage der Vollstaendigkeitspruefung.
+/// What the pattern match examines — basis of the exhaustiveness check.
 #[derive(Clone, Debug)]
 pub(crate) enum Subject {
     Enum(EnumDef),
     Bool,
     Int(Type),
-    /// Fehlerhafter Ausdruck — es wurde bereits gemeldet.
+    /// Faulty expression — it got reported already.
     Bad,
 }
 
@@ -138,7 +138,7 @@ thread_local! {
     static REG: RefCell<Registry> = RefCell::new(Registry::default());
 }
 
-/// Setzt alle Registrierungen zurueck (eine je Uebersetzung).
+/// Resets all registrations (one per compilation).
 pub(crate) fn hook_reset() {
     REG.with(|r| *r.borrow_mut() = Registry::default());
     crate::sema_generic::reset();
@@ -174,15 +174,15 @@ pub(crate) fn match_info(idx: usize) -> Option<MatchInfo> {
     REG.with(|r| r.borrow().matches.get(idx).cloned())
 }
 
-/// `// HOOK types` fuer das Modulsystem (`modules.rs`): die Rumpfbloecke der
-/// `match`-Faelle liegen NICHT im AST, sondern in dieser Registrierung. Damit
-/// das Modulsystem die Namen darin genauso umschreiben kann wie im uebrigen
-/// AST, wird ein Eintrag herausgenommen und nach der Umschrift zurueckgelegt.
+/// `// HOOK types` for the module system (`modules.rs`): the body blocks of
+/// the `match` cases do NOT sit at the AST but at this registry. So that the
+/// module system can rewrite the labels there just like at the rest of the
+/// AST, one entry gets taken out and put back after the rewrite.
 pub(crate) fn take_match(idx: usize) -> Option<MatchInfo> {
     REG.with(|r| r.borrow().matches.get(idx).cloned())
 }
 
-/// Gegenstueck zu `take_match`.
+/// Counterpart to `take_match`.
 pub(crate) fn put_match(idx: usize, m: MatchInfo) {
     REG.with(|r| {
         let mut reg = r.borrow_mut();
@@ -196,7 +196,7 @@ fn match_index_of(name: &str) -> Option<usize> {
     name.strip_prefix(MATCH_PREFIX).and_then(|s| s.parse::<usize>().ok())
 }
 
-// ------------------------------------------------------------- Parser-Hooks
+// ------------------------------------------------------------- Parser hooks
 
 impl<'a> Parser<'a> {
     fn tk(&self, off: usize) -> TokKind {
@@ -213,7 +213,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Stehen die Token `off` und `off+1` unmittelbar nebeneinander?
+    /// Do the tokens `off` and `off+1` stand right next to each other?
     fn adjacent(&self, off: usize) -> bool {
         let a = self.tspan(off);
         let b = self.tspan(off + 1);
@@ -240,7 +240,7 @@ impl<'a> Parser<'a> {
         self.bump();
     }
 
-    /// Aufzaehlungsdeklaration: `enum Name { A, B(i32), C(Point, bool) }`
+    /// Enum declaration: `enum E { A, B(i32), C(Point, bool) }`
     fn types_enum_decl(&mut self) {
         let start = self.bump(); // 'enum'
         let (name, nspan) = match self.ident("after 'enum'") {
@@ -340,12 +340,12 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `match subjekt { muster => { .. } .. }` als Anweisung.
+    /// `match subject { pattern => { .. } .. }` as a statement.
     fn types_match_stmt(&mut self) -> Stmt {
         let start = self.bump(); // 'match'
         if crate::sema_generic::in_template() {
-            // Die Rumpfbloecke der Faelle liegen in der Registrierung, nicht im
-            // AST — eine Vorlage koennte sie nicht je Auspraegung ersetzen.
+            // The body blocks of the cases sit at the registry, not at the
+            // AST — a template could not replace them per instantiation.
             self.dg.error_note(
                 start,
                 "'match' inside a generic template is not supported in this stage",
@@ -514,8 +514,8 @@ impl<'a> Parser<'a> {
     }
 }
 
-/// `// HOOK types` in `parser.rs::program` — Aufzaehlungen und generische
-/// Vorlagen auf oberster Ebene.
+/// `// HOOK types` within `parser.rs::program` — enums and generic
+/// templates at top level.
 pub(crate) fn hook_item(p: &mut Parser) -> bool {
     if matches!(p.kind(), TokKind::KwEnum) {
         p.types_enum_decl();
@@ -524,7 +524,7 @@ pub(crate) fn hook_item(p: &mut Parser) -> bool {
     crate::sema_generic::hook_item(p)
 }
 
-/// `// HOOK types` in `parser.rs::stmt_inner` — `match`-Anweisung.
+/// `// HOOK types` within `parser.rs::stmt_inner` — `match` statement.
 pub(crate) fn hook_stmt(p: &mut Parser) -> Option<Stmt> {
     if matches!(p.kind(), TokKind::KwMatch) {
         return Some(p.types_match_stmt());
@@ -532,7 +532,7 @@ pub(crate) fn hook_stmt(p: &mut Parser) -> Option<Stmt> {
     None
 }
 
-/// `// HOOK types` in `parser.rs::primary` — `Enum::Variante(..)`.
+/// `// HOOK types` within `parser.rs::primary` — `Enum::Variant(..)`.
 pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
     if let TokKind::Ident(name) = p.kind().clone() {
         if p.types_at_colon2(1) && matches!(p.tk(3), TokKind::Ident(_)) {
@@ -555,10 +555,10 @@ pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
     crate::sema_generic::hook_primary(p)
 }
 
-// ---------------------------------------------------- Anmeldung im Typkontext
+// ------------------------------------------- Registration at the type context
 
-/// `// HOOK types` in `sema::run` (vor `collect_structs`): meldet die Namen
-/// aller Aufzaehlungen an, damit Structs und Funktionen sie benennen koennen.
+/// `// HOOK types` within `sema::run` (before `collect_structs`): registers
+/// the labels of all enums, so that structs and functions can refer to them.
 pub(crate) fn declare_enums(ck: &mut Checker) {
     let n = enum_count();
     for i in 0..n {
@@ -582,14 +582,14 @@ pub(crate) fn declare_enums(ck: &mut Checker) {
     }
 }
 
-/// `// HOOK types` in `sema::run` (nach `collect_structs`): berechnet das
-/// Layout jeder Aufzaehlung und traegt es als Struct-Layout ein.
+/// `// HOOK types` within `sema::run` (after `collect_structs`): computes the
+/// layout of every enum and enters it as struct layout.
 pub(crate) fn layout_enums(ck: &mut Checker, prog: &crate::ast::Program) {
     if enum_count() == 0 {
         return;
     }
-    // Aufzaehlungen duerfen (noch) nicht dem Wert nach in einem Struct liegen:
-    // die Struct-Layouts stehen zu diesem Zeitpunkt bereits fest.
+    // Enums may (as yet) not sit by value inside a struct:
+    // the struct layouts are settled by that point already.
     for s in &prog.structs {
         for (fname, te, span) in &s.fields {
             if let Some(n) = value_named(te) {
@@ -607,8 +607,8 @@ pub(crate) fn layout_enums(ck: &mut Checker, prog: &crate::ast::Program) {
         }
     }
 
-    // Reihenfolge nach Abhaengigkeit (eine Aufzaehlung kann eine andere dem
-    // Wert nach enthalten). Zyklen sind ein Fehler.
+    // Ordered by dependency (one enum can hold another by value).
+    // Cycles are errors.
     let n = enum_count();
     let mut deps: Vec<Vec<usize>> = vec![Vec::new(); n];
     let mut defs: Vec<EnumDef> = Vec::with_capacity(n);
@@ -655,7 +655,7 @@ pub(crate) fn layout_enums(ck: &mut Checker, prog: &crate::ast::Program) {
         if d.struct_idx == usize::MAX {
             continue;
         }
-        // 1. Nutzdatentypen aufloesen, Ausrichtung bestimmen
+        // 1. resolve payload types, determine alignment
         let mut payload_align: u64 = 1;
         let mut resolved: Vec<Vec<Type>> = Vec::new();
         for v in &d.variants {
@@ -674,7 +674,7 @@ pub(crate) fn layout_enums(ck: &mut Checker, prog: &crate::ast::Program) {
             resolved.push(tys);
         }
         let payload_off = round_up(4, payload_align);
-        // 2. Offsets je Variante (Varianten ueberlagern sich)
+        // 2. offsets per variant (variants overlap)
         let mut max_end = payload_off;
         let mut fields: Vec<Field> = vec![Field {
             name: "__tag".to_string(),
@@ -726,7 +726,7 @@ pub(crate) fn layout_enums(ck: &mut Checker, prog: &crate::ast::Program) {
     }
 }
 
-/// Name eines Typs, sofern er DEM WERT NACH enthalten ist (Zeiger nicht).
+/// Label of a type if it is held BY VALUE (pointers are not).
 fn value_named(te: &TypeExpr) -> Option<String> {
     match te {
         TypeExpr::Named(n, _) => Some(n.clone()),
@@ -757,11 +757,11 @@ fn toposort(i: usize, deps: &[Vec<usize>], state: &mut Vec<u8>, order: &mut Vec<
     order.push(i);
 }
 
-// ------------------------------------------------------------- Typpruefung
+// -------------------------------------------------------------- Type check
 
-/// `// HOOK types` in `sema::stmt_returns`: kehrt ein `match` auf jedem Pfad
-/// zurueck? Der Musterabgleich ist zu diesem Zeitpunkt geprueft, also
-/// vollstaendig — es genuegt, dass jeder Fall zurueckkehrt.
+/// `// HOOK types` within `sema::stmt_returns`: does a `match` return on
+/// every path? The pattern match is checked by that point, so exhaustive —
+/// it suffices that every case returns.
 pub(crate) fn match_returns(e: &Expr) -> bool {
     let idx = match &e.kind {
         ExprKind::Call(name, _, _) => match match_index_of(name) {
@@ -794,7 +794,7 @@ fn stmt_returns(s: &Stmt) -> bool {
     }
 }
 
-/// `// HOOK types` in `sema::call`: faengt `Enum::Variante(..)` und `match` ab.
+/// `// HOOK types` within `sema::call`: catches `Enum::Variant(..)` and `match`.
 pub(crate) fn hook_call(
     ck: &mut Checker,
     name: &str,
@@ -911,7 +911,7 @@ fn check_match(ck: &mut Checker, idx: usize, espan: Span) {
     let sty = ck.expr(&mi.subject, None);
     let subject = classify_subject(ck, &sty, mi.subject.span);
 
-    // 1. Muster pruefen, Bindungen anlegen, Rumpf pruefen
+    // 1. check patterns, create bindings, check the body
     for arm in &mi.arms {
         ck.scopes.push(HashMap::new());
         check_pattern(ck, &arm.pat, &subject_type(&subject, &sty), &subject, true);
@@ -919,7 +919,7 @@ fn check_match(ck: &mut Checker, idx: usize, espan: Span) {
         ck.scopes.pop();
     }
 
-    // 2. Erreichbarkeit: nach einem immer zutreffenden Fall kommt nichts mehr
+    // 2. reachability: after a case that always matches nothing follows
     let mut catchall: Option<Span> = None;
     for arm in &mi.arms {
         if let Some(prev) = catchall {
@@ -938,7 +938,7 @@ fn check_match(ck: &mut Checker, idx: usize, espan: Span) {
         }
     }
 
-    // 3. Vollstaendigkeit — FEHLER, kein Warnhinweis (SPEC §6.3)
+    // 3. exhaustiveness — ERROR, not a warning (SPEC §6.3)
     if let Err(d) = check_exhaustive(&subject, &mi.arms, mi.span) {
         match d.note {
             Some(note) => ck.dg.error_note(d.span, d.msg, note),
@@ -989,7 +989,7 @@ fn classify_subject(ck: &mut Checker, ty: &Type, span: Span) -> Subject {
     Subject::Bad
 }
 
-/// Prueft ein Muster gegen den erwarteten Typ und legt seine Bindungen an.
+/// Checks a pattern against the expected type and creates its bindings.
 fn check_pattern(ck: &mut Checker, pat: &Pattern, ty: &Type, subject: &Subject, top: bool) {
     match pat {
         Pattern::Wild(_) => {}
@@ -1034,7 +1034,7 @@ fn check_pattern(ck: &mut Checker, pat: &Pattern, ty: &Type, subject: &Subject, 
             }
         }
         Pattern::Variant { ename, vname, subs, span } => {
-            // Aufzaehlung des Musters bestimmen
+            // determine the enum of the pattern
             let def = match ename {
                 Some(n) => match enum_by_name(n) {
                     Some(d) => Some(d),
@@ -1125,11 +1125,11 @@ fn fits(v: i128, t: &Type) -> bool {
     v >= lo && v <= hi
 }
 
-/// **Vollstaendigkeitspruefung zur Uebersetzungszeit** (SPEC §6.3).
+/// **Exhaustiveness check at compile time** (SPEC §6.3).
 ///
-/// Liefert `Err(Diag)` mit Zeile/Spalte und dem Namen der fehlenden Variante,
-/// wenn der Musterabgleich einen Fall nicht abdeckt. Das ist ein Fehler, kein
-/// Warnhinweis — der Aufrufer meldet ihn ueber `Diags`.
+/// Yields `Err(Diag)` with line/column and the label of the missing variant
+/// when the pattern match leaves a case uncovered. That is a hard error, not
+/// a warning — the caller reports it through `Diags`.
 pub fn check_exhaustive(subject: &Subject, arms: &[Arm], span: Span) -> Result<(), Diag> {
     let has_catchall = arms.iter().any(|a| a.pat.is_irrefutable());
     match subject {
