@@ -375,7 +375,7 @@ gebauten Hilfsbinärdateien (`.firnc1`, `.astdump`, `.semadump`, `.firdump`,
 |---|---|---|
 | `bash ./test.sh` | 696/696 | **719/719** |
 | `tools/self_compare.sh` | 201 / 0 / 0 | **204 gleich / 0 abweichend / 0 fehlerhaft** |
-| `tools/fixpunkt.sh` | zeichengleich | **Stufe 2 == Stufe 3, zeichengleich (344.864 Zeilen Assembler)** |
+| `tools/fixpoint.sh` | zeichengleich | **Stufe 2 == Stufe 3, zeichengleich (344.864 Zeilen Assembler)** |
 | Parser (`parser_compare.sh`) | 240 gleich, 1 bekannt | 254 gleich, 1 bekannt |
 | Layout/ABI (`types_compare.sh`) | 190 gleich, 0 ungleich | 204 gleich, 0 ungleich |
 | Typprüfer (`sema_compare.sh`) | 147 gleich, 1 bekannt | 148 gleich, 1 bekannt |

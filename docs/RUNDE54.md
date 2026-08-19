@@ -78,7 +78,7 @@ Fragen der Form *„ist der Name des aktuellen Knotens einer aus dieser Liste vo
 40 Namen"*. Mit Zeichenketten wäre jede davon ein Haufen `memcmp`.
 
 Die **124 Namen, die der Standard beim Namen nennt**, haben eine feste Kennung
-(`lib/browser/tag.fi`, erzeugt von `tools/html/gen_namen.py`) — `tag.M_DIV`
+(`lib/browser/tag.fi`, erzeugt von `tools/html/gen_names.py`) — `tag.M_DIV`
 ist damit eine Übersetzungszeitkonstante. Alles darüber hinaus (eigene
 Elementnamen, beliebige Attributnamen) bekommt beim ersten Auftreten eine
 Kennung > 124. Die Ablage ist WTF-8, nicht UTF-8: ein Tagname darf ungepaarte
@@ -370,7 +370,7 @@ var a: [u8; _] = "abc"                   // error: erwartet ganzzahlige laenge
 ```
 
 Jedes Literal ist ein Array-Literal mit fester Länge, und die zählt der Mensch.
-In dieser Runde wurden die Längen deshalb von `tools/html/gen_namen.py` und vom
+In dieser Runde wurden die Längen deshalb von `tools/html/gen_names.py` und vom
 Erzeuger für `tests/902_tree_construction.fi` ausgerechnet — was für erzeugte
 Dateien in Ordnung ist, für handgeschriebenen Code aber eine Fehlerquelle
 bleibt (dreimal darauf hereingefallen).
@@ -463,7 +463,7 @@ auf keinem Branch).
 Also wurden **150 eigene Fälle von Hand aus dem WHATWG-Standard geschrieben** —
 Eingabe *und* erwarteter Baum, je Fall aus der Regel abgeleitet, die er prüfen
 soll. Das Format ist trotzdem **genau das `.dat`-Format von html5lib**: liegen
-die Originaldaten eines Tages vor, läuft `tools/html/harness_baum.py` ohne
+die Originaldaten eines Tages vor, läuft `tools/html/harness_tree.py` ohne
 Änderung dagegen.
 
 Von Hand heißt auch: fehleranfällig. Deshalb gibt es `tools/html/orakel.py` —
@@ -512,7 +512,7 @@ vor dem Lauf):
 | `bash tools/self_compare.sh` | **GLEICHES VERHALTEN 216, ABWEICHEND 0, FEHLERHAFT 0** (Basis 213/0/0) |
 | `bash tools/html/run.sh` | 150/150 in drei Baustufen, 8/8 Seiten byte-gleich, Dauerlauf bestanden |
 | `bash tools/tokenizer/run.sh` | 6810/6810 bzw. 6809/6810 mit Fehlercodes — unverändert |
-| `tools/fixpunkt.sh` (in `test.sh`) | Stufe 2 == Stufe 3, zeichengleich |
+| `tools/fixpoint.sh` (in `test.sh`) | Stufe 2 == Stufe 3, zeichengleich |
 
 `tools/html/orakel.py` getrennt gefahren: `faelle/` 150 geprüft, 0 unerwartete
 Abweichungen (1 vermerkte); `luecken/` 10 geprüft, 0 unerwartete Abweichungen

@@ -20,7 +20,7 @@ Dauerbetrieb. Neu:
   dem Aufbau, Phase 1 die Bilanz über den GANZEN Lauf; der Dauerbetrieb ist
   die Differenz. Jeder Sammellauf während des Aufbaus wird einzeln gemeldet
   (mit Heapgröße und Knotenzahl an dieser Stelle).
-* **`tools/gc_meas/durchsatz.fi`** — feste ARBEIT, gemessene ZEIT (die
+* **`tools/gc_meas/throughput.fi`** — feste ARBEIT, gemessene ZEIT (die
   Pausenläufe messen umgekehrt und taugen für Durchsatz nicht).
 * **`tools/gc_meas/ab.fi`** — A/B im selben Prozess, siehe §4.
 
@@ -223,7 +223,7 @@ Fehler: im Fegen frisch gemappte Chunks.
 |---|---|
 | `bash ./test.sh` | **676/676** (673 Basis + neuer Test 771, jeder Test laeuft in drei Baustufen) |
 | `bash tools/self_compare.sh` | **197** gleiches Verhalten, 0 abweichend, 0 fehlerhaft (196 Basis + Test 771) |
-| `bash tools/fixpunkt.sh` | Stufe 2 == Stufe 3, zeichengleich (322 723 Zeilen Assembler) |
+| `bash tools/fixpoint.sh` | Stufe 2 == Stufe 3, zeichengleich (322 723 Zeilen Assembler) |
 | `bash tools/gc_meas/run.sh` | Fragmentierung Drift +0,0 % (stabil), RSS Ende 2632 KiB, Phasen-Test Ende 2368 KiB, `volle_laeufe` 0 |
 | Pausen-Histogramm ≥ 10 min, große lebende Menge, Aufbau eingeschlossen | §8 — Wanduhr max 2,14 ms, Rechenzeit max 0,62 ms, 0 volle Läufe |
 | `tools/dom_soak` (in test.sh) | Verbrauch flach 1360 → 1360 KiB, Gegenprobe schlägt an |

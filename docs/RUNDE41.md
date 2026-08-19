@@ -45,7 +45,7 @@ Durchsatz (Zyklen im selben Zeitfenster) unverändert im Rauschen
 (2 198 000 / 2 347 000 / 2 231 000), Pausensumme unverändert. Das Budget
 kostet also nichts und schneidet den Schwanz ab.
 
-60-Sekunden-Kontrolllauf auf dem Endstand (`tools/gc_meas/scheiben60.tsv`):
+60-Sekunden-Kontrolllauf auf dem Endstand (`tools/gc_meas/slices60.tsv`):
 518 137 Markierscheiben, davon **99,88 % in 64–128 µs**, 284 darüber, drei
 Einzelfälle über 1 ms (Ausplanen durch das Betriebssystem, nicht der
 Sammler). `pause_max_typ4 = 11,7 ms` sind weiterhin die **drei vollen
@@ -123,7 +123,7 @@ Moduls ab). Der zuverlässige Wächter bleibt Abschnitt 12 von `test.sh`.
 
 * `bash ./test.sh` → **PASS 652/652**
 * `bash tools/self_compare.sh` → **189 gleiches Verhalten**, 0 Abweichungen
-* `bash tools/fixpunkt.sh` → Stufe 2 == Stufe 3, zeichengleich,
+* `bash tools/fixpoint.sh` → Stufe 2 == Stufe 3, zeichengleich,
   **309 468 Zeilen** Assembler (gewachsen, weil `lib/gc/gc.fi` um Histogramm
   und Zeitbudget größer wurde)
 * callgrind realweb unverändert (siehe oben)

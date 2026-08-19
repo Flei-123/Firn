@@ -407,7 +407,7 @@ nicht lösen, nur verschieben; deshalb wurde es zurückgenommen.
 |---|---|---|
 | `bash ./test.sh` | 696/696 | **727/727** |
 | `bash tools/self_compare.sh` | 201 / 0 / 0 | **210 / 0 / 0** |
-| `bash tools/fixpunkt.sh` | zeichengleich | **zeichengleich** |
+| `bash tools/fixpoint.sh` | zeichengleich | **zeichengleich** |
 
 ---
 

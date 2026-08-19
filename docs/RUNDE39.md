@@ -170,7 +170,7 @@ Modulzugriff.
 Der Fixpunkt steht; die optionale Umstellung einer kleinen Stelle wurde
 bewusst NICHT gemacht, aus drei messbaren Gruenden: (1) die Desugar
 ruft `io.fmt_*` — `firnc1` muesste `std.io` einbinden, und
-`tools/fixpunkt.sh` muesste `FIRNLIB` exportieren (die Dumps loesen
+`tools/fixpoint.sh` muesste `FIRNLIB` exportieren (die Dumps loesen
 `std.io` sonst nicht auf); (2) die Kern-Fassade kennt nur
 `fmt_zahl`/`fmt_text` — die Stellen, die sich anbieten (Lexer- und
 Parser-Meldungen), brauchen Zeichen (`{c}` als Buchstabe, nicht als

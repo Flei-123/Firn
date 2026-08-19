@@ -8,7 +8,7 @@ werden deshalb als Folge von u64-Stuecken (je 8 ASCII-Bytes, little-endian,
 Die Liste stammt aus dem WHATWG-HTML-Standard §13.2 ("parse errors") und deckt
 alle Codes ab, die in testdata/html5lib-tokenizer/*.test vorkommen.
 
-Aufruf:  python3 tools/tokenizer/gen_fehler.py
+Aufruf:  python3 tools/tokenizer/gen_errors.py
 """
 import os
 
@@ -88,7 +88,7 @@ def main():
     z = []
     z.append("// lib/html/error_codes.fi — Namen der WHATWG-Parse-Fehler (erzeugt).")
     z.append("//")
-    z.append("// ERZEUGT von tools/tokenizer/gen_fehler.py — nicht von Hand aendern.")
+    z.append("// ERZEUGT von tools/tokenizer/gen_errors.py — nicht von Hand aendern.")
     z.append("//")
     z.append("// Stufe 0 hat keine Zeichenkettenliterale (SPEC §14.1.str S1); jeder")
     z.append("// Codename liegt als Folge von u64-Stuecken vor (8 ASCII-Bytes je Stueck,")

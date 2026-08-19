@@ -11,7 +11,7 @@ Faelle, die dieser enge Ausschnitt nicht abdeckt, werden hier NICHT gezaehlt —
 die verbindliche Gesamtzahl liefert allein tools/tokenizer/harness.py ueber
 alle 6.810 Faelle. Dieses Skript ist ein Modulnachweis, keine Bilanz.
 
-Aufruf:  python3 tools/tokenizer/pruefe_entities.py [binary]
+Aufruf:  python3 tools/tokenizer/check_entities.py [binary]
 """
 
 import glob

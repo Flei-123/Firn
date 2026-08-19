@@ -50,7 +50,7 @@ drei Kindknoten, Listener, Sammlung, Wrapper.
 
 ### GC-Fassung — 100 Millionen Zyklensätze
 
-`tools/dom_soak/langlauf/gc-100mio-zyklen.tsv` (1.001 Stichproben):
+`tools/dom_soak/longrun/gc-100mio-cycles.tsv` (1.001 Stichproben):
 
 | Größe | Wert |
 |---|---|
@@ -83,7 +83,7 @@ längsten Pause von 6,58 ms — die Pausenlänge streut, der Verbrauch nicht.
 
 ### Zählverweis-Gegenprobe — dasselbe Programm, anderes Speichermodell
 
-`tools/dom_soak/langlauf/leck-2mio-zyklen.tsv`:
+`tools/dom_soak/longrun/leak-2mio-cycles.tsv`:
 
 | Zyklen | RSS | lebende Objekte |
 |---|---|---|
@@ -177,7 +177,7 @@ Codegen-Modell (ROADMAP, nach der echten Registerzuteilung).
 | `tools/dom_soak/run.sh` | Bau in drei Stufen, beide Läufe, Auswertung, Urteil |
 | `tools/dom_soak/messung-gc.tsv` | letzte Messreihe GC |
 | `tools/dom_soak/messung-leck.tsv` | letzte Messreihe Gegenprobe |
-| `tools/dom_soak/langlauf/gc-100mio-zyklen.tsv` | der 100-Mio-Lauf |
+| `tools/dom_soak/longrun/gc-100mio-cycles.tsv` | der 100-Mio-Lauf |
 | `tests/560_dom_cycles.fi` | Strukturtest, läuft in allen drei Baustufen |
 
 ---

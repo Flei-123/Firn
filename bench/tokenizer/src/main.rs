@@ -8,7 +8,7 @@
 //!     bench/tokenizer/target/release/html5ever_bench .tokenizer-work/korpus.html
 //!
 //! Ausgabe: eine Zeile `tokens=<n> bytes=<n> sekunden=<x.xxx>`.
-//! `tools/tokenizer/durchsatz.sh` ruft das Binary automatisch auf, sobald es
+//! `tools/tokenizer/throughput.sh` ruft das Binary automatisch auf, sobald es
 //! gebaut ist, und stellt die MB/s neben die des Firn-Tokenizers.
 //!
 //! Vergleichbarkeit — ehrlich benannt:

@@ -13,7 +13,7 @@ Ergebnis vorweg, alles selbst gemessen:
 |---|---|---|
 | `test.sh` | 751/751 | **763/763** |
 | `tools/self_compare.sh` | 213 / 0 / 0 | **217 / 0 / 0** |
-| `tools/fixpunkt.sh` | zeichengleich, 427 401 Zeilen | **zeichengleich, 470 042 Zeilen** |
+| `tools/fixpoint.sh` | zeichengleich, 427 401 Zeilen | **zeichengleich, 470 042 Zeilen** |
 | längste Unterbrechung, **Rechenzeit**, Median aus 7 Läufen | 476 711 ns | **496 501 ns** |
 | Unterbrechungen über 1,02 ms (Rechenzeit) | 1 von 307 089 | **0 von 538 936** |
 | DOM-Dauerlauf, RSS | flach | **flach (1644 → 1644 KiB)** |
@@ -330,7 +330,7 @@ Werkzeug (Runde 44).
 
 ## 6. Messung: sind die Pausen schlechter geworden?
 
-`tools/gc_meas/r53_pausen.sh` (neu). Drei Fälle, **dasselbe** Messprogramm
+`tools/gc_meas/r53_pauses.sh` (neu). Drei Fälle, **dasselbe** Messprogramm
 (`build.fi`, 120 000 lebende Knoten, `AB_SCHWELLE = 0` also immer
 inkrementell):
 
@@ -480,4 +480,4 @@ Scheiben. Die Zahl stimmte, sie beantwortete nur eine andere Frage.
 | `bin/firnc1.fi` | Vorabscan der Laufzeit-Vorlagen |
 | `tests/840`–`843` | Grundlagen, der inkrementelle Fall, Zusammenspiel |
 | `lib/dom/dom.fi`, `soak_leak.fi` | der DOM auf Sammlungen, Gegenprobe mitgezogen |
-| `tools/gc_meas/r53_pausen.sh` | die Pausenmessung dieser Runde |
+| `tools/gc_meas/r53_pauses.sh` | die Pausenmessung dieser Runde |

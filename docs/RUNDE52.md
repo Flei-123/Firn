@@ -19,7 +19,7 @@ Datei. Diese Runde macht die Deklaration wahr.
 |---|---|---|
 | `bash ./test.sh` | 751/751 | **782/782** |
 | `bash tools/self_compare.sh` | 213 / 0 abweichend / 0 fehlerhaft | **218 / 0 / 0** |
-| `bash tools/fixpunkt.sh` | zeichengleich, 427 401 Zeilen | **zeichengleich, 448 038 Zeilen** |
+| `bash tools/fixpoint.sh` | zeichengleich, 427 401 Zeilen | **zeichengleich, 448 038 Zeilen** |
 | `bash tools/freestanding/run.sh` | — | **41 / 41** |
 | Kernel-Beispiel in QEMU gebootet | — | **ja, mit beiden Compilern** |
 
@@ -292,7 +292,7 @@ auf beiden Seiten denselben Text.
 
 ```
 $ rm -f .firnc1 .firnc2 .firnc3
-$ bash tools/fixpunkt.sh
+$ bash tools/fixpoint.sh
 STUFE 2: 2760 ms   2581456 Oktette
 STUFE 3: 8004 ms   2581456 Oktette
 FIXPUNKT:  Stufe 2 == Stufe 3, zeichengleich (448038 Zeilen Assembler)

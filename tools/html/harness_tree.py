@@ -18,7 +18,7 @@ Ehrlichkeitsregeln:
   * Ein `#KAPUTT`-Vermerk des Binaries ist ein Fehlschlag.
   * Verglichen wird der vollstaendige Baum, nicht ein Ausschnitt.
 
-Aufruf: python3 tools/html/harness_baum.py <binary> [--json datei] [--zeige N]
+Aufruf: python3 tools/html/harness_tree.py <binary> [--json datei] [--zeige N]
                                            [--nur MUSTER]
 """
 

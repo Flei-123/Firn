@@ -375,8 +375,8 @@ Nachgemessen mit `bash test.sh` → **PASS 397/397** und
 | `lib/html/tokenize_main.fi` | Wurzeldatei: Auftragsprotokoll lesen, WTF-8 dekodieren, `\r\n`→`\n`, Zeile je Auftrag schreiben | fertig |
 | `tools/tokenizer/harness.py` | Werkbank: `doubleEscaped`, `xmlViolationTests`, `initialStates`, `lastStartTag`, Bilanz je Datei, JSON-Bericht | fertig |
 | `tools/tokenizer/run.sh` | baut, faehrt drei Baustufen gegen dieselbe Bilanz, misst Durchsatz, prueft Regressionsschranke | fertig |
-| `tools/tokenizer/durchsatz.sh`, `korpus.py` | 4-MB-Korpus + MB/s; ruft `bench/tokenizer/…/html5ever_bench`, wenn gebaut | Firn-Seite fertig, Referenzseite offen |
-| `tools/tokenizer/PROTOKOLL.md` | Vertrag Firn ↔ Harness | fertig |
+| `tools/tokenizer/throughput.sh`, `korpus.py` | 4-MB-Korpus + MB/s; ruft `bench/tokenizer/…/html5ever_bench`, wenn gebaut | Firn-Seite fertig, Referenzseite offen |
+| `tools/tokenizer/LOG.md` | Vertrag Firn ↔ Harness | fertig |
 | `test.sh` Abschnitt 9 | Tokenizer-Lauf als Teil der Suite, Schranke `tools/tokenizer/mindestquote.txt` | fertig |
 | `compiler/src/modules.rs` + `sema_match.rs` | **Fehlerbehebung:** `match`-Rumpfbloecke liegen in der Registrierung, nicht im AST — das Modulsystem hat Namen darin bisher nicht umgeschrieben. `match` in einem importierten Modul war unbenutzbar. Nachweis: `tests/231_module_match.fi` + `tests/modules/state.fi` | erledigt |
 

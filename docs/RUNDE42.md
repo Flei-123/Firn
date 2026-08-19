@@ -596,7 +596,7 @@ Gemessen auf **`fe31d13`** (Basis dieses Zweiges), mit selbst gebautem
 |---|---|---|
 | `bash ./test.sh` | **PASS 673/673**, `RC=0` | 652/652 |
 | `bash tools/self_compare.sh` | **GLEICHES VERHALTEN 196 · ABWEICHEND 0 · FEHLERHAFT 0 · CODEGEN FEHLT 0**, `RC=0` | 189 / 0 / 0 |
-| `bash tools/fixpunkt.sh` | **Stufe 2 == Stufe 3, zeichengleich (309468 Zeilen Assembler)** · Korpus: `.firnc2` verhält sich wie `firnc0`, `RC=0` | zeichengleich, 309468 Zeilen |
+| `bash tools/fixpoint.sh` | **Stufe 2 == Stufe 3, zeichengleich (309468 Zeilen Assembler)** · Korpus: `.firnc2` verhält sich wie `firnc0`, `RC=0` | zeichengleich, 309468 Zeilen |
 
 Die 673 sind 652 + 21: sieben neue Programme × drei Durchläufe
 (`opt` / `noopt` / `dev-fast`). Die 196 sind 189 + 7. Die **309468 Zeilen sind
