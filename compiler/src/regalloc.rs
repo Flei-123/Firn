@@ -79,6 +79,11 @@ fn align_up(x: u64, a: u64) -> u64 {
 /// Ergebnis der Registerzuteilung einer Funktion.
 pub struct Alloc {
     locs: Vec<Loc>,
+    /// Load-Ergebnisse, die ihren Wert direkt im Zellenregister lesen
+    /// (Zellen-Alias, Runde 40): val -> Zellenregister
+    alias: HashMap<Val, &'static str>,
+    /// val -> befoerderte Zelle, aus der es geladen wurde
+    alias_src: HashMap<Val, Val>,
     /// Konstanten, die an JEDER ihrer Verwendungsstellen als Sofortoperand
     /// stehen duerfen: sie brauchen weder Register noch Slot.
     imms: HashMap<Val, i64>,
@@ -97,6 +102,14 @@ impl Alloc {
     /// Ort eines Wertes. Einzige Anfrageschnittstelle des Codegenerators.
     pub fn loc(&self, v: Val) -> Loc {
         self.locs.get(v as usize).copied().unwrap_or(Loc::Slot(0))
+    }
+    /// Ort eines Wertes als QUELLE: ein Load-Ergebnis mit Zellen-Alias liegt
+    /// nie irgendwo, sein Wert steht im Zellenregister. Fuer ZIELE gilt loc().
+    pub fn ort(&self, v: Val) -> Loc {
+        if let Some(r) = self.alias.get(&v) {
+            return Loc::Reg(r);
+        }
+        self.loc(v)
     }
     /// Sofortoperand eines Wertes, falls er als solcher taugt.
     fn imm(&self, v: Val) -> Option<i64> {
@@ -475,6 +488,8 @@ pub fn allocate(f: &Func) -> Alloc {
     }
     let mut alloc = Alloc {
         locs,
+        alias: HashMap::new(),
+        alias_src: HashMap::new(),
         imms: HashMap::new(),
         frame_addr: HashMap::new(),
         cells: HashMap::new(),
@@ -758,6 +773,130 @@ pub fn allocate(f: &Func) -> Alloc {
             alloc.locs[*v as usize] = Loc::Reg(r);
         }
     }
+    let gelesen = zaehle_lesezugriffe(f);
+    let mut nbuf = Vec::new();
+    if std::env::var("FIRN_NO_ALIAS").is_err() {
+    // ---- Zellen-Alias (Runde 40) ---------------------------------------
+    // `d = load c` mit genau EINER Verwendung im selben Block, vor der die
+    // Zelle nicht geschrieben wird: d braucht keinen eigenen Ort, sein Wert
+    // steht bereits im Zellenregister. Der Load entfaellt bei der Emission,
+    // die Verwendung liest das Zellenregister ueber `ort()` direkt — das
+    // streicht das Dreiervierertel `mov r9, r15` vor jeder Benutzung des
+    // Schleifenzaehlers (heissester Loop von `dekodiere`: 3 Kopien je
+    // Iteration, 33,5 Mio. Iterationen im realweb-Lauf).
+    for b in &f.blocks {
+        for (ii, inst) in b.insts.iter().enumerate() {
+            let (addr, d) = match (&inst.op, inst.dst) {
+                (Op::Load { addr }, Some(d)) => (*addr, d),
+                _ => continue,
+            };
+            // NUR volle Breite: bei 8/16/32 Bit zieht der Load die relevanten
+            // Bits per movzx/mov32 heraus — das Zellenregister enthaelt oben
+            // Reste, ein Alias wuerde sie mitlesen (Runde 40, Fehlerbild
+            // 211_generic_struct/430_ct_select/416_fehler_ausgabe).
+            if inst.ty.bits().max(8) != 64 {
+                continue;
+            }
+            let rc = match alloc.cells.get(&addr) {
+                Some(r) => *r,
+                None => continue,
+            };
+            let braucht = gelesen.get(d as usize).copied().unwrap_or(0) as usize;
+            if braucht == 0 {
+                continue;
+            }
+            // ALLE Verwendungen muessen in diesem Block liegen, bevor die
+            // Zelle wieder geschrieben wird (bei mehreren Verwendungen
+            // streicht der Alias trotzdem jede Kopie, z. B. Zaehler als
+            // Index fuer Quelle UND Ziel im Kopierloop von dekodiere).
+            let mut gefunden = 0usize;
+            let mut ok = false;
+            for nj in b.insts.iter().skip(ii + 1) {
+                nbuf.clear();
+                nj.op.uses(&mut nbuf);
+                gefunden += nbuf.iter().filter(|u| **u == d).count();
+                if matches!(nj.op, Op::Store { addr: a2, .. } if a2 == addr) {
+                    break; // danach ist der geladene Wert veraltet
+                }
+            }
+            if gefunden == braucht {
+                ok = true;
+            } else {
+                // Rest-Verwendung kann im Terminator stecken (brcond/ret).
+                // Switch NICHT: der erwartet den Wert im Rahmen
+                // (codegen_switch).
+                let im_term = match &b.term {
+                    Term::BrCond { cond, .. } if *cond == d => 1,
+                    Term::Ret(Some(v)) if *v == d => 1,
+                    _ => 0,
+                };
+                ok = gefunden + im_term == braucht && im_term > 0;
+            }
+            if ok {
+                alloc.alias.insert(d, rc);
+                alloc.alias_src.insert(d, addr);
+            }
+        }
+    }
+
+    }
+    if std::env::var("FIRN_NO_INPLACE").is_err() {
+    // ---- In-place-Zellenupdate (Runde 40) -------------------------------
+    // `d1 = load c` (alias), `v = d1 + k`, `store c, v` mit jeweils einer
+    // Verwendung: v bekommt das Zellenregister als Ort — die Emission rechnet
+    // dann direkt im Zellenregister (`lea r15, [r15+1]`) und der Store
+    // entfaellt. Bedingung: zwischen der Definition von v und dem Store wird
+    // die Zelle weder gelesen noch geschrieben (sonst sahe ein Zwischenleser
+    // den neuen Wert zu frueh) und kein Aufruf trennt die beiden. Auch kein
+    // ALIAS-Wert derselben Zelle darf in dem Fenster noch ausstehen (seine
+    // Verwendung laesst den alten Inhalt erwarten, der schon ueberschrieben
+    // waere).
+    for b in &f.blocks {
+        for (ii, inst) in b.insts.iter().enumerate() {
+            let (a, k, v) = match (&inst.op, inst.dst) {
+                (Op::Bin(BinOp::Add | BinOp::Sub, a, k), Some(v)) => (*a, *k, v),
+                _ => continue,
+            };
+            let (rc, zelle) = match (alloc.alias.get(&a), alloc.alias_src.get(&a)) {
+                (Some(r), Some(z)) => (*r, *z),
+                _ => continue,
+            };
+            if alloc.imm(k).is_none()
+                || gelesen.get(v as usize).copied().unwrap_or(0) != 1
+                || f.is_secret(v)
+            {
+                continue;
+            }
+            let mut ok = false;
+            for (jj, nj) in b.insts.iter().enumerate().skip(ii + 1) {
+                match &nj.op {
+                    Op::Store { addr: a2, val } if *a2 == zelle => {
+                        ok = *val == v;
+                        break;
+                    }
+                    Op::Load { addr: a2 } if *a2 == zelle => break,
+                    Op::Call { .. } | Op::Syscall { .. } => break,
+                    _ => {}
+                }
+                // steht noch die Verwendung eines Alias-Werts derselben Zelle
+                // aus? Der erwartet den ALTEN Inhalt.
+                nbuf.clear();
+                nj.op.uses(&mut nbuf);
+                if nbuf.iter().any(|u| {
+                    *u != a && alloc.alias_src.get(u) == Some(&zelle)
+                }) {
+                    break;
+                }
+                let _ = jj;
+            }
+            if ok {
+                alloc.locs[v as usize] = Loc::Reg(rc);
+            }
+        }
+    }
+
+    }
+
     // Rahmen inklusive Sicherungs-Slots fuer die benutzten callee-saved Register
     used_saved.sort_unstable();
     let (frame, slots) = layout(f, used_saved.len() as u64);
@@ -855,7 +994,7 @@ impl<'a> Ra<'a> {
         if let Some(k) = self.a.imm(v) {
             return format!("{}", k);
         }
-        match self.a.loc(v) {
+        match self.a.ort(v) {
             Loc::Reg(r) => r.to_string(),
             Loc::Slot(off) => format!("qword ptr [rbp-{}]", off),
         }
@@ -865,7 +1004,7 @@ impl<'a> Ra<'a> {
         if let Some(k) = self.a.imm(v) {
             return format!("{}", k);
         }
-        match self.a.loc(v) {
+        match self.a.ort(v) {
             Loc::Reg(r) => rn(r, bits),
             Loc::Slot(off) => format!("{} [rbp-{}]", size_word(bits), off),
         }
@@ -1570,6 +1709,11 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
         }
         Op::Load { addr } => {
             let d = i.dst.ok_or("interner Fehler: load ohne Ziel")?;
+            if ra.a.alias.contains_key(&d) {
+                // Zellen-Alias: der Wert steht bereits im Zellenregister,
+                // die einzige Verwendung liest ihn ueber ort() direkt.
+                return Ok(());
+            }
             let bits = ty.bits().max(8);
             if let Some((r, _)) = ra.a.cell(*addr) {
                 // Zelle im Register: nur die relevante Breite herausziehen,
@@ -1592,7 +1736,7 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
                     return Ok(());
                 }
             } else {
-                let mem = match (ra.a.frame_addr.get(addr), ra.a.loc(*addr)) {
+                let mem = match (ra.a.frame_addr.get(addr), ra.a.ort(*addr)) {
                     (Some(off), _) => format!("[rbp-{}]", off),
                     (None, Loc::Reg(r)) => format!("[{}]", r),
                     (None, Loc::Slot(_)) => {
@@ -1631,7 +1775,7 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
                     e.line(&format!("mov {}, {}", r, o));
                 }
             } else {
-                let mem = match (ra.a.frame_addr.get(addr), ra.a.loc(*addr)) {
+                let mem = match (ra.a.frame_addr.get(addr), ra.a.ort(*addr)) {
                     (Some(off), _) => format!("[rbp-{}]", off),
                     (None, Loc::Reg(r)) => format!("[{}]", r),
                     (None, Loc::Slot(_)) => {
@@ -1659,7 +1803,7 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
                 Loc::Reg(r) => r,
                 Loc::Slot(_) => "rax",
             };
-            let reg_von = |v: Val| match (ra.a.imm(v), ra.a.loc(v)) {
+            let reg_von = |v: Val| match (ra.a.imm(v), ra.a.ort(v)) {
                 (None, Loc::Reg(r)) => Some(r),
                 _ => None,
             };
@@ -1813,8 +1957,8 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
 /// Genau ein Operand liegt in einem Register, der andere im Rahmen (kein
 /// Sofortwert)? Dann lohnt der Weg ueber rax mit abschliessendem `lea`.
 fn add_ueber_rax(ra: &Ra, a: Val, b: Val) -> bool {
-    let ist_reg = |v: Val| ra.a.imm(v).is_none() && matches!(ra.a.loc(v), Loc::Reg(_));
-    let ist_rahmen = |v: Val| ra.a.imm(v).is_none() && matches!(ra.a.loc(v), Loc::Slot(_));
+    let ist_reg = |v: Val| ra.a.imm(v).is_none() && matches!(ra.a.ort(v), Loc::Reg(_));
+    let ist_rahmen = |v: Val| ra.a.imm(v).is_none() && matches!(ra.a.ort(v), Loc::Slot(_));
     (ist_reg(a) && ist_rahmen(b)) || (ist_rahmen(a) && ist_reg(b))
 }
 
@@ -1828,7 +1972,7 @@ fn lea_moeglich(ra: &Ra, op: BinOp, ty: FTy, a: Val, b: Val, d: Val) -> bool {
     if ty.bits() <= 32 || !matches!(ra.a.loc(d), Loc::Reg(_)) {
         return false;
     }
-    let ist_reg = |v: Val| ra.a.imm(v).is_none() && matches!(ra.a.loc(v), Loc::Reg(_));
+    let ist_reg = |v: Val| ra.a.imm(v).is_none() && matches!(ra.a.ort(v), Loc::Reg(_));
     match op {
         BinOp::Add => {
             (ist_reg(a) && ist_reg(b))
@@ -1899,7 +2043,7 @@ fn emit_bin(
                 Loc::Reg(r) => r,
                 Loc::Slot(_) => unreachable!("lea_moeglich verlangt ein Zielregister"),
             };
-            let reg_von = |v: Val| match (ra.a.imm(v), ra.a.loc(v)) {
+            let reg_von = |v: Val| match (ra.a.imm(v), ra.a.ort(v)) {
                 (None, Loc::Reg(r)) => Some(r),
                 _ => None,
             };
@@ -1927,10 +2071,10 @@ fn emit_bin(
                 Loc::Reg(r) => r,
                 Loc::Slot(_) => unreachable!("durch die Bedingung ausgeschlossen"),
             };
-            let ist_reg = |v: Val| ra.a.imm(v).is_none() && matches!(ra.a.loc(v), Loc::Reg(_));
+            let ist_reg = |v: Val| ra.a.imm(v).is_none() && matches!(ra.a.ort(v), Loc::Reg(_));
             // `+` ist kommutativ: der Registeroperand wird zum Indexteil.
             let (aus_rahmen, im_reg) = if ist_reg(b) { (a, b) } else { (b, a) };
-            let y = match ra.a.loc(im_reg) {
+            let y = match ra.a.ort(im_reg) {
                 Loc::Reg(r) => r,
                 Loc::Slot(_) => unreachable!("add_ueber_rax hat ein Register zugesichert"),
             };
