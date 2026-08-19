@@ -302,6 +302,15 @@ fn remap_op(op: &Op, mv: &dyn Fn(Val) -> Val) -> Op {
         Op::SecureZero { addr, size } => Op::SecureZero { addr: mv(*addr), size: mv(*size) },
         Op::AtomicAdd { addr, val } => Op::AtomicAdd { addr: mv(*addr), val: mv(*val) },
         Op::GcAddr { regs } => Op::GcAddr { regs: *regs },
+        Op::Asm { vorlage, aus, ein_regs, ein, clobber } => Op::Asm {
+            vorlage: vorlage.clone(),
+            aus: aus.clone(),
+            ein_regs: ein_regs.clone(),
+            ein: ein.iter().map(|a| mv(*a)).collect(),
+            clobber: clobber.clone(),
+        },
+        Op::MmioLoad { addr } => Op::MmioLoad { addr: mv(*addr) },
+        Op::MmioStore { addr, val } => Op::MmioStore { addr: mv(*addr), val: mv(*val) },
     }
 }
 
