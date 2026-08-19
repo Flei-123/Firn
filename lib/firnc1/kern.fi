@@ -1,0 +1,155 @@
+// lib/firnc1/kern.fi — FREISTEHEND: Inline-Assembler, MMIO, Interrupt.
+//
+// Portierung von `compiler/src/kern.rs` (Runde 52). Dieses Modul haelt
+// KEINEN Zustand: es ist die gemeinsame Tabelle, die Parser, Typpruefer,
+// Lowering und Codegenerator brauchen, damit alle vier von denselben
+// Registernamen reden. Der eigentliche `asm`-Block liegt im Baum (`ast.fi`,
+// `asm_dazu`) — genau wie die `match`-Faelle im Musterregister liegen.
+//
+// ERLAUBTE REGISTER (kern.rs, gleiche Begruendung): nur die caller-saved
+// Menge von System V — rax rcx rdx rsi rdi r8..r11, samt ihren schmalen
+// Namen. Genau die zerstoert auch ein gewoehnlicher `call`; dadurch braucht
+// weder die Registerzuteilung von firnc0 noch der rahmenbasierte
+// Codegenerator dieser Stufe eine Sonderregel. rbx, rbp, rsp und r12-r15
+// tragen den Rahmen bzw. sind callee-saved und werden mit eigener Meldung
+// abgelehnt.
+
+import rt
+import vec
+import intern
+
+export { reg_stamm, reg_gesperrt, mmio_lesen_breite, mmio_schreiben_breite,
+         asm_nummer, KEIN_REG, KEINE_BREITE, KEINE_NUMMER }
+
+// „kein Register" / „keine Breite" / „keine asm-Nummer"
+const KEIN_REG: u32 = 4294967295
+const KEINE_BREITE: u32 = 4294967295
+const KEINE_NUMMER: u32 = 4294967295
+
+// Vergleicht die internierte Zeichenkette `nr` mit einem Wortfeld.
+fn gleich(it: *mut intern.Interner, nr: u32, p: u64, n: usize) -> bool {
+    return intern.intern_gleich(it, nr, p, n)
+}
+
+// 64-Bit-Stamm eines erlaubten Registernamens, als internierte Nummer;
+// `KEIN_REG`, wenn der Name nicht erlaubt ist.
+//
+// Die Tabelle steht als EIN Wortfeld mit '|' als Trenner: erst der Name,
+// dann sein Stamm. So bleibt sie in einer Zeile pruefbar und braucht keine
+// 36 einzelnen Feldliterale.
+fn reg_stamm(it: *mut intern.Interner, nr: u32) -> u32 {
+    var tab: [u8; 275] = "rax|rax|eax|rax|ax|rax|al|rax|rcx|rcx|ecx|rcx|cx|rcx|cl|rcx|rdx|rdx|edx|rdx|dx|rdx|dl|rdx|rsi|rsi|esi|rsi|si|rsi|sil|rsi|rdi|rdi|edi|rdi|di|rdi|dil|rdi|r8|r8|r8d|r8|r8w|r8|r8b|r8|r9|r9|r9d|r9|r9w|r9|r9b|r9|r10|r10|r10d|r10|r10w|r10|r10b|r10|r11|r11|r11d|r11|r11w|r11|r11b|r11"
+    let p: u64 = (&tab[0]) as u64
+    var i: usize = 0
+    var feld: u32 = 0
+    var anf: usize = 0
+    var name_anf: usize = 0
+    var name_len: usize = 0
+    while i <= 275 {
+        var ende: bool = i == 275
+        if !ende {
+            ende = rt.ld8(p, i) == 124 as u8
+        }
+        if ende {
+            if feld % 2 == 0 {
+                name_anf = anf
+                name_len = i - anf
+            } else {
+                if gleich(it, nr, p + name_anf as u64, name_len) {
+                    return intern.intern_nummer(it, p + anf as u64, i - anf) as u32
+                }
+            }
+            feld = feld + 1
+            anf = i + 1
+        }
+        i = i + 1
+    }
+    return KEIN_REG
+}
+
+// Register, die es gibt, die der Inline-Assembler aber ablehnt. Eigene
+// Tabelle, damit die Meldung sagen kann WARUM.
+fn reg_gesperrt(it: *mut intern.Interner, nr: u32) -> bool {
+    var tab: [u8; 119] = "rbx|ebx|bx|bl|rbp|ebp|bp|bpl|rsp|esp|sp|spl|r12|r12d|r12w|r12b|r13|r13d|r13w|r13b|r14|r14d|r14w|r14b|r15|r15d|r15w|r15b"
+    let p: u64 = (&tab[0]) as u64
+    var i: usize = 0
+    var anf: usize = 0
+    while i <= 119 {
+        var ende: bool = i == 119
+        if !ende {
+            ende = rt.ld8(p, i) == 124 as u8
+        }
+        if ende {
+            if gleich(it, nr, p + anf as u64, i - anf) {
+                return true
+            }
+            anf = i + 1
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// Breitenindex (0 = 8 Bit, 1 = 16, 2 = 32, 3 = 64) eines MMIO-Namens.
+fn breite_aus_tabelle(it: *mut intern.Interner, nr: u32, p: u64, n: usize) -> u32 {
+    var i: usize = 0
+    var anf: usize = 0
+    var feld: u32 = 0
+    while i <= n {
+        var ende: bool = i == n
+        if !ende {
+            ende = rt.ld8(p, i) == 124 as u8
+        }
+        if ende {
+            if gleich(it, nr, p + anf as u64, i - anf) {
+                return feld
+            }
+            feld = feld + 1
+            anf = i + 1
+        }
+        i = i + 1
+    }
+    return KEINE_BREITE
+}
+
+fn mmio_lesen_breite(it: *mut intern.Interner, nr: u32) -> u32 {
+    var tab: [u8; 58] = "__mmio_lesen8|__mmio_lesen16|__mmio_lesen32|__mmio_lesen64"
+    return breite_aus_tabelle(it, nr, (&tab[0]) as u64, 58)
+}
+
+fn mmio_schreiben_breite(it: *mut intern.Interner, nr: u32) -> u32 {
+    var tab: [u8; 74] = "__mmio_schreiben8|__mmio_schreiben16|__mmio_schreiben32|__mmio_schreiben64"
+    return breite_aus_tabelle(it, nr, (&tab[0]) as u64, 74)
+}
+
+// Nummer eines `asm$<n>`-Namens; `KEINE_NUMMER`, wenn es keiner ist.
+fn asm_nummer(it: *mut intern.Interner, nr: u32) -> u32 {
+    let n: usize = intern.intern_laenge(it, nr)
+    if n < 5 {
+        return KEINE_NUMMER
+    }
+    let p: u64 = intern.intern_zeiger(it, nr)
+    if rt.ld8(p, 0) != 97 as u8 {
+        return KEINE_NUMMER
+    }
+    if rt.ld8(p, 1) != 115 as u8 {
+        return KEINE_NUMMER
+    }
+    if rt.ld8(p, 2) != 109 as u8 {
+        return KEINE_NUMMER
+    }
+    if rt.ld8(p, 3) != 36 as u8 {
+        return KEINE_NUMMER
+    }
+    var wert: u64 = 0
+    var i: usize = 4
+    while i < n {
+        let z: u8 = rt.ld8(p, i)
+        if z < 48 as u8 || z > 57 as u8 {
+            return KEINE_NUMMER
+        }
+        wert = wert * 10 + ((z as u64) - 48)
+        i = i + 1
+    }
+    return wert as u32
+}

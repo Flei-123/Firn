@@ -642,6 +642,10 @@ impl<'a> Lower<'a> {
         if let Some(g) = crate::sizeof::wert(name) {
             return Some(Some(self.konst(FTy::U64, g)));
         }
+        // HOOK kern: Inline-Assembler und MMIO (kern.rs, Runde 52)
+        if let Some(r) = crate::kern::lower_hook(self, name, args, span) {
+            return r;
+        }
         // HOOK gc: Allokation `gc C{…}`, Sammler-Intrinsics, `x.as?[C]`
         // (gc_lower.rs, SPEC 3.5)
         if let Some(r) = crate::gc_lower::hook_call(self, name, args, dest, span) {
@@ -1315,7 +1319,10 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
         }
     };
 
-    let f = Func::new(&d.name, pf.clone(), rf);
+    let mut f = Func::new(&d.name, pf.clone(), rf);
+    // HOOK kern: `#[interrupt]` — eigene Aufrufkonvention im Codegenerator
+    // (kern.rs/codegen_x86.rs, Runde 52).
+    f.interrupt = crate::kern::hat_interrupt(d);
     dwarf::set_fn(&d.name, d.span.file, d.span.line);
     let mut lo = Lower {
         info,

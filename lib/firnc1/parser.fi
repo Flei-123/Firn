@@ -189,6 +189,8 @@ struct Parser {
     ifr: u64,
     // Das Attribut `#[no_gc]` vor der naechsten Funktionsdeklaration.
     nogc_anstehend: u32,
+    // RUNDE 52: `#[interrupt]` vor der naechsten Funktion (SPEC 2).
+    int_anstehend: u32,
     // Das Attribut `#[must_consume]` vor der naechsten fn-/struct-Deklaration
     // (Runde 36, attrs.rs — Ziel::Beides).
     mc_anstehend: u32,
@@ -215,7 +217,7 @@ fn par_neu(lx: u64) -> Parser {
         module: vec_neu[u32](),
         kladde: rt.buf_neu(),
         klammern: 0, kein_slit: 0, fehler: 0, nicht_kern: false,
-        gen: 0, mu: 0, feh: 0, zeit: false, gcr: 0, ifr: 0, nogc_anstehend: 0, mc_anstehend: 0, tpoff: 0, sonr: -1,
+        gen: 0, mu: 0, feh: 0, zeit: false, gcr: 0, ifr: 0, nogc_anstehend: 0, int_anstehend: 0, mc_anstehend: 0, tpoff: 0, sonr: -1,
         lokal: vec_neu[u32](), lgrenze: vec_neu[u32](),
         hoist: vec_neu[u32](), interp: 0,
     }
@@ -1213,6 +1215,109 @@ fn alit_aus_lit(p: *mut Parser, lx2: *mut lexer.Lexer, k: usize) -> u32 {
     return ast.ausdruck_neu(par_baum(p), ast.E_ALIT, 0, off, n as u32, 0)
 }
 
+// ------------------------------------------------------- Inline-Assembler
+//
+// RUNDE 52 (compiler/src/kern.rs). Grammatik:
+//
+//   asm_ausdruck = "asm" "(" str_lit { "," asm_op } ")" ;
+//   asm_op       = "in"      "(" str_lit ")" ausdruck
+//                | "out"     "(" str_lit ")"
+//                | "clobber" "(" str_lit ")" ;
+//
+// Im Baum bleibt ein Aufruf `asm$<nummer>` mit den EINGABEAUSDRUECKEN als
+// Argumenten; Vorlage, Register und Clobber liegen im Baum-Register
+// (`ast.asm_dazu`). Genau diese Aufteilung hat auch `firnc0` — deshalb
+// druckt `--emit=ast-kanon` auf beiden Seiten denselben Text.
+
+// Zeichenkettenliteral an der aktuellen Stelle als internierte Nummer.
+fn lit_intern(p: *mut Parser) -> u32 {
+    let k: usize = nummer(p, 0) as usize
+    let n: usize = lexer.lex_lit_len(lx(p), k)
+    rt.buf_leeren(&(*p).kladde)
+    var i: usize = 0
+    while i < n {
+        rt.buf_push(&(*p).kladde, lexer.lex_lit_byte(lx(p), k, i))
+        i = i + 1
+    }
+    weiter_bump(p)
+    let it: *mut intern.Interner = lexer.lex_namen(lx(p))
+    return intern.intern_nummer(it, rt.buf_ptr(&(*p).kladde),
+                                rt.buf_len(&(*p).kladde)) as u32
+}
+
+fn asm_block(p: *mut Parser) -> u32 {
+    let it: *mut intern.Interner = lexer.lex_namen(lx(p))
+    weiter_bump(p)
+    weiter_bump(p)
+    let vorlage: u32 = lit_intern(p)
+    var aus: u32 = ast.NICHTS
+    var regs: Vec[u32] = vec_neu[u32]()
+    var clobs: Vec[u32] = vec_neu[u32]()
+    var args: Vec[u32] = vec_neu[u32]()
+    var ow: [u8; 3] = "out"
+    var cw: [u8; 7] = "clobber"
+    while friss(p, A_COMMA) {
+        if ist(p, A_RPAREN) || am_ende(p) {
+            break
+        }
+        let vor: usize = (*p).pos
+        var welche: u32 = 3
+        if ist(p, A_KWIN) {
+            weiter_bump(p)
+            welche = 0
+        } else if ist(p, A_IDENT) && intern.intern_gleich(it, nummer(p, 0), (&ow[0]) as u64, 3) {
+            weiter_bump(p)
+            welche = 1
+        } else if ist(p, A_IDENT) && intern.intern_gleich(it, nummer(p, 0), (&cw[0]) as u64, 7) {
+            weiter_bump(p)
+            welche = 2
+        }
+        if welche == 3 {
+            meckern(p)
+            break
+        }
+        if !erwarte(p, A_LPAREN) {
+            break
+        }
+        if !ist(p, A_STR) {
+            meckern(p)
+            break
+        }
+        let reg: u32 = lit_intern(p)
+        if !erwarte(p, A_RPAREN) {
+            break
+        }
+        if welche == 0 {
+            vec_push[u32](&regs, reg)
+            vec_push[u32](&args, innen_ausdruck(p))
+        } else if welche == 1 {
+            if aus != ast.NICHTS {
+                meckern(p)
+            }
+            aus = reg
+        } else {
+            vec_push[u32](&clobs, reg)
+        }
+        if (*p).pos == vor {
+            weiter_bump(p)
+        }
+    }
+    erwarte(p, A_RPAREN)
+    let blk: u32 = ast.asm_dazu(par_baum(p), vorlage, aus, &regs, &clobs)
+    vec_frei[u32](&regs)
+    vec_frei[u32](&clobs)
+    rt.buf_leeren(&(*p).kladde)
+    var pw: [u8; 4] = "asm$"
+    rt.buf_push_bytes(&(*p).kladde, (&pw[0]) as u64, 4)
+    rt.buf_push_dez_u64(&(*p).kladde, blk as u64)
+    let name: u32 = intern.intern_nummer(it, rt.buf_ptr(&(*p).kladde),
+                                         rt.buf_len(&(*p).kladde)) as u32
+    let off: u32 = liste_ablegen(p, &args)
+    let laen: u32 = vec_len[u32](&args) as u32
+    vec_frei[u32](&args)
+    return ast.ausdruck_neu(par_baum(p), ast.E_RUF, name, off, laen, 0)
+}
+
 fn text_literal(p: *mut Parser) -> u32 {
     let k: usize = nummer(p, 0) as usize
     let n: usize = lexer.lex_lit_len(lx(p), k)
@@ -1556,6 +1661,15 @@ fn grund_ausdruck(p: *mut Parser) -> u32 {
         return ast.ausdruck_neu(par_baum(p), ast.E_SYSCALL, 0, off, laen, 0)
     }
     if a == A_IDENT {
+        // RUNDE 52 (kern.rs::hook_primary): `asm("…", in("dx") p, out("rax"),
+        // clobber("memory"))`. NUR wenn auf `asm` unmittelbar `(` und ein
+        // Zeichenkettenliteral folgen — sonst bleibt `asm` ein gewoehnlicher
+        // Bezeichner und es gibt kein neues Schluesselwort.
+        var asmw: [u8; 3] = "asm"
+        let ist_asm: bool = intern.intern_gleich(lexer.lex_namen(lx(p)), nummer(p, 0), (&asmw[0]) as u64, 3)
+        if ist_asm && art(p, 1) == A_LPAREN && art(p, 2) == A_STR {
+            return asm_block(p)
+        }
         let nr: u32 = nummer(p, 0)
         weiter_bump(p)
         // RUNDE 34 (gc.rs::hook_primary): `gc C{ ... }`, `gc_null[C]()` und
@@ -2087,9 +2201,11 @@ fn fn_deklaration(p: *mut Parser) {
     }
     let rumpf: u32 = block(p)
     lok_zu(p)
-    ast.fn_dazu(par_baum(p), name, poff, plen, ret, rumpf, (*p).nogc_anstehend, (*p).mc_anstehend)
+    ast.fn_dazu(par_baum(p), name, poff, plen, ret, rumpf, (*p).nogc_anstehend,
+                (*p).mc_anstehend, (*p).int_anstehend)
     (*p).nogc_anstehend = 0
     (*p).mc_anstehend = 0
+    (*p).int_anstehend = 0
 }
 
 fn struct_deklaration(p: *mut Parser) {
@@ -2665,10 +2781,15 @@ fn erweiterungen_suchen(p: *mut Parser) {
                         var an: [u8; 5] = "no_gc"
                         var mc: [u8; 12] = "must_consume"
                         // Runde 36: beide umgesetzten Attribute (attrs.rs).
-                        ok_attr = intern.intern_gleich(lexer.lex_namen(lx(p)),
-                                lexer.lex_nr(lx(p), i + 2), (&an[0]) as u64, 5) ||
-                                intern.intern_gleich(lexer.lex_namen(lx(p)),
-                                lexer.lex_nr(lx(p), i + 2), (&mc[0]) as u64, 12)
+                        // Runde 52: dazu `#[interrupt]` und `#[allow_fp]`.
+                        var iw: [u8; 9] = "interrupt"
+                        var fw: [u8; 8] = "allow_fp"
+                        let anr: u32 = lexer.lex_nr(lx(p), i + 2)
+                        let itn: *mut intern.Interner = lexer.lex_namen(lx(p))
+                        ok_attr = intern.intern_gleich(itn, anr, (&an[0]) as u64, 5) ||
+                                intern.intern_gleich(itn, anr, (&mc[0]) as u64, 12) ||
+                                intern.intern_gleich(itn, anr, (&iw[0]) as u64, 9) ||
+                                intern.intern_gleich(itn, anr, (&fw[0]) as u64, 8)
                     }
                 }
             }
@@ -3052,7 +3173,7 @@ fn methoden_deklaration(p: *mut Parser, tname: u32) {
     }
     let rumpf: u32 = block(p)
     lok_zu(p)
-    ast.fn_dazu(par_baum(p), name, poff, plen, ret, rumpf, 0, 0)
+    ast.fn_dazu(par_baum(p), name, poff, plen, ret, rumpf, 0, 0, 0)
 }
 
 // RUNDE 46 (iface.rs::interface_decl): `interface I { fn m(*self) -> T … }`.
@@ -3275,10 +3396,15 @@ fn attribut(p: *mut Parser) {
     }
     var an: [u8; 5] = "no_gc"
     var mc: [u8; 12] = "must_consume"
+    // RUNDE 52 (attrs.rs): `#[interrupt]` und `#[allow_fp]` (SPEC 2).
+    var iw: [u8; 9] = "interrupt"
+    var fw: [u8; 8] = "allow_fp"
     let it: *mut intern.Interner = lexer.lex_namen(lx(p))
     let ist_nogc: bool = intern.intern_gleich(it, nummer(p, 0), (&an[0]) as u64, 5)
     let ist_mc: bool = intern.intern_gleich(it, nummer(p, 0), (&mc[0]) as u64, 12)
-    if !ist_nogc && !ist_mc {
+    let ist_int: bool = intern.intern_gleich(it, nummer(p, 0), (&iw[0]) as u64, 9)
+    let ist_fp: bool = intern.intern_gleich(it, nummer(p, 0), (&fw[0]) as u64, 8)
+    if !ist_nogc && !ist_mc && !ist_int && !ist_fp {
         meckern(p)
         return
     }
@@ -3292,6 +3418,13 @@ fn attribut(p: *mut Parser) {
     }
     if ist_mc {
         (*p).mc_anstehend = 1
+    } else if ist_int {
+        (*p).int_anstehend = 1
+    } else if ist_fp {
+        // `#[allow_fp]` erlaubt Gleitkomma im Kernel-Profil; im Baum bleibt
+        // davon nichts uebrig, weil diese Stufe die Profilverbote nicht
+        // durchsetzt (docs/RUNDE52.md, „Offenes").
+        (*p).nogc_anstehend = (*p).nogc_anstehend
     } else {
         (*p).nogc_anstehend = 1
     }

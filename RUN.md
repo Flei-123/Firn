@@ -159,6 +159,28 @@ Einzelne Nachweise:
 | **Verworfenes `!T` ist ein Fehler** | `firnc -o /tmp/e tests/neg/err_verworfen.fi` | `error: das ergebnis darf nicht verworfen werden: der typ 'E!i32' ist mit #[must_consume] gekennzeichnet` mit Zeile:Spalte |
 | **`try` außerhalb einer Fehlerfunktion** | `firnc -o /tmp/e tests/neg/err_try_ausserhalb.fi` | `error: 'try' ist nur in einer funktion mit fehlerunions-rueckgabetyp erlaubt, diese liefert i32` mit `8:13` |
 
+## 4b. Freistehend übersetzen: `profile kernel` (Runde 52)
+
+```sh
+bash tools/freistehend/run.sh
+```
+
+Gemessenes Ergebnis (19.08.2026): **41 bestanden, 0 fehlgeschlagen** — darunter
+ein echter QEMU-Boot des Kernel-Beispiels mit **beiden** Compilern.
+
+| Was | Befehl | Gemessenes Ergebnis |
+|---|---|---|
+| **ELF-Objekt statt Binary** | `firnc -o /tmp/k.o beispiele/kernel/kern.fi && readelf -h /tmp/k.o \| grep Type` | `REL (Relocatable file)` — kein `ld`, kein `_start` |
+| **Keine undefinierten Symbole** | `nm -u /tmp/k.o` | leer |
+| **Kein Systemaufruf im Code** | `objdump -d /tmp/k.o \| grep -c syscall` | `0` |
+| **Bootet** | `ld -n -T beispiele/kernel/linker.ld --defsym=KERN_START=_F0.kern_start -o /tmp/k.elf /tmp/start.o /tmp/k.o && objcopy -O elf32-i386 /tmp/k.elf /tmp/k.mb && qemu-system-x86_64 -kernel /tmp/k.mb -serial stdio -display none` | `FIRN: profile kernel ist` / `freistehend.` |
+| **`syscall` im Kernel-Profil** | `firnc -o /tmp/x tests/neg/frei_syscall_im_kernel.fi` | `error: 'syscall' gibt es im profil 'kernel' nicht` mit Zeile:Spalte |
+| **Gleitkomma ohne `#[allow_fp]`** | `firnc -o /tmp/x tests/neg/frei_gleitkomma_ohne_allow_fp.fi` | `error: gleitkomma (der typ f64) ist im profil 'kernel' nur mit #[allow_fp] erlaubt` |
+| **`#[interrupt]` ist nicht aufrufbar** | `firnc -o /tmp/x tests/neg/frei_interrupt_aufruf.fi` | `error: 'ih' ist ein interrupt-einsprungpunkt und kann nicht aufgerufen werden` |
+| **volatile hält** | `firnc --emit=fir tools/freistehend/volatile.fi \| grep -c 'asm.void "pause"'` | `3` — drei wörtlich gleiche Blöcke, kein CSE |
+
+Ausführlich in `docs/RUNDE52.md`.
+
 ## 5. Was NICHT läuft, weil es nicht gebaut wurde
 
 Ehrlich und vollständig (ausführlich in `ABNAHME.md`):
