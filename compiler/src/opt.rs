@@ -1,81 +1,81 @@
-//! Optimierer auf FIR: Konstantenfaltung und Entfernen toten Codes.
+//! Optimizer on FIR: constant folding and removal of dead code.
 //!
-//! SCHNITTSTELLE (fest):
+//! INTERFACE (fixed):
 //!   `pub fn optimize(m: &mut fir::Module) -> OptStats`
-//! Regel: Die Optimierung darf das Programmverhalten NIE aendern. Die
-//! Testsuite faehrt jedes Programm mit und ohne `--no-opt` und vergleicht.
+//! Rule: the optimization may NEVER change program behaviour. The test suite
+//! runs every program with and without `--no-opt` and compares.
 //!
-//! Durchgefuehrte Umformungen (alle verhaltenserhaltend):
-//!  1. **Konstantenfaltung** ueber `Op::Bin`, `Op::Cmp`, `Op::Un` und
-//!     `Op::Cast`, wenn alle Operanden `Op::Const` sind. Das Ergebnis wird mit
-//!     `FTy::truncate` auf Breite und Vorzeichen des Ergebnistyps normalisiert
-//!     und ersetzt die Instruktion durch `Op::Const` — die `Val`-Id bleibt
-//!     gleich, alle Verwendungen bleiben gueltig.
-//!     NICHT gefaltet werden: Division/Rest durch null, der Ueberlauffall
-//!     `MIN / -1` bzw. `MIN % -1` (beides loest auf der CPU eine Ausnahme aus)
-//!     und Verschiebungen mit einer Weite >= Bitbreite (auf x86 undefiniert).
-//!  2. **Vereinfachung von `brcond`** mit konstanter Bedingung (oder gleichen
-//!     Zielen) zu `br`. Erst dadurch entsteht unerreichbarer Code.
-//!  3. **Toter Code**: unerreichbare Bloecke (Erreichbarkeit ab `bb0` ueber
-//!     `Term::successors`) werden entfernt und die verbleibenden Bloecke
-//!     luecklos neu nummeriert (Invariante `blocks[i].id == i` bleibt erhalten,
-//!     alle Terminatoren werden umgeschrieben). Unbenutzte REINE Instruktionen
-//!     (kein `store`/`call`/`syscall`/`copymem`) werden entfernt; `alloca` nur
-//!     dann, wenn ihr Zeiger nirgends mehr verwendet wird.
+//! Transformations carried out (all behaviour preserving):
+//!  1. **Constant folding** over `Op::Bin`, `Op::Cmp`, `Op::Un` and
+//!     `Op::Cast` when all operands are `Op::Const`. The result gets
+//!     normalized with `FTy::truncate` to width and sign of the result type
+//!     and replaces the instruction by `Op::Const` — the `Val` id stays the
+//!     same, all uses stay valid.
+//!     NOT folded are: division/remainder by zero, the overflow case
+//!     `MIN / -1` or `MIN % -1` (both raise a CPU exception) and shifts
+//!     with a width >= the bit width (undefined on x86).
+//!  2. **Simplification of `brcond`** with a constant condition (or equal
+//!     targets) to `br`. Only that makes unreachable code come about.
+//!  3. **Dead code**: unreachable blocks (reachability from `bb0` through
+//!     `Term::successors`) get removed and the remaining blocks renumbered
+//!     without gaps (the invariant `blocks[i].id == i` survives, every
+//!     terminator gets rewritten). Unused PURE instructions (no
+//!     `store`/`call`/`syscall`/`copymem`) get removed; `alloca` only when
+//!     its pointer is used nowhere any more.
 //!
-//! Es wird bis zum Fixpunkt iteriert, aber hoechstens `MAX_ROUNDS` mal, damit
-//! der Optimierer unter keinen Umstaenden haengen bleibt.
+//! Iterated gets up to the fixpoint, yet at most `MAX_ROUNDS` times, so that
+//! the optimizer cannot hang under any circumstances.
 
 use crate::fir::{BinOp, BlockId, CmpOp, FTy, Func, Module, Op, Term, UnOp, Val};
 use std::collections::{HashMap, HashSet};
 
-/// harte Obergrenze der Fixpunkt-Iterationen
+/// hard upper bound of the fixpoint iterations
 const MAX_ROUNDS: u32 = 50;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct OptStats {
-    /// Anzahl zu Konstanten gefalteter Instruktionen
+    /// count of instructions folded into constants
     pub folded: usize,
-    /// entfernte Instruktionen (tot/unbenutzt und rein)
+    /// removed instructions (dead/unused and pure)
     pub removed_insts: usize,
-    /// entfernte, unerreichbare Basisbloecke
+    /// removed, unreachable basic blocks
     pub removed_blocks: usize,
-    /// aufgeloeste `load`s (mem2reg + lokale Speicherweiterleitung)
+    /// resolved `load`s (mem2reg + local store forwarding)
     pub promoted_loads: usize,
-    /// fortgepflanzte Kopien / algebraische Identitaeten
+    /// propagated copies / algebraic identities
     pub copies: usize,
-    /// entfernte gemeinsame Teilausdruecke
+    /// removed common subexpressions
     pub cse: usize,
-    /// verschmolzene bzw. ueberbrueckte Bloecke
+    /// merged or bridged blocks
     pub merged_blocks: usize,
-    /// eingebettete Aufrufe (inline.rs)
+    /// embedded calls (inline.rs)
     pub inlined: usize,
-    /// entfernte, beweisbar immer erfuellte Bereichspruefungen
+    /// removed range checks provably always satisfied
     pub removed_checks: usize,
-    /// schleifeninvariante Instruktionen, die in den Vorkopf gewandert sind
+    /// loop invariant instructions that moved into the preheader
     pub hoisted: usize,
-    /// Kanten, die an einem Bool-Zusammenfluss vorbeigefaedelt wurden
+    /// edges threaded past a bool confluence
     pub threaded: usize,
 }
 
-// ------------------------------------------------ Durchgangsregister ---
+// ----------------------------------------------------- Pass register ---
 //
-// DESIGNZIELE.md §5 und §10.4 Punkt 4: Jeder Optimierungsdurchgang hat einen
-// NAMEN, einen SCHALTER und ein ETIKETT `debugerhaltend ja/nein`. Nur so laesst
-// sich spaeter die Baustufe `--dev-fast` bauen (schnell, aber debuggbar), ohne
-// jeden Durchgang anzufassen. Das Register ist die einzige Wahrheit darueber,
-// welche Durchgaenge es gibt — `--list-passes` gibt es aus.
+// DESIGNZIELE.md §5 and §10.4 point 4: every optimization pass has a LABEL,
+// a SWITCH and a TAG `debug preserving yes/no`. Only that way can the build
+// level `--dev-fast` (fast, yet debuggable) be built later without touching
+// every pass. The register is the single truth about which passes exist —
+// `--list-passes` prints it.
 
-/// Baustufe. `DevFast` ist die Voreinstellung (DESIGNZIELE.md §5).
+/// Build level. `DevFast` is the default (DESIGNZIELE.md §5).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Level {
-    /// gar keine Optimierung (`--no-opt`) — nur zur Compilerfehlersuche
+    /// no optimization at all (`--no-opt`) — for compiler troubleshooting only
     Dev,
-    /// nur debugerhaltende Durchgaenge — der Alltagsmodus
+    /// debug preserving passes only — the everyday mode
     DevFast,
-    /// alle Durchgaenge (Pruefungen bleiben an, sobald es welche gibt)
+    /// all passes (checks stay on as soon as there are any)
     ReleaseSafe,
-    /// alle Durchgaenge
+    /// all passes
     ReleaseFast,
 }
 
@@ -89,35 +89,35 @@ impl Level {
             _ => None,
         }
     }
-    /// Laeuft in dieser Stufe auch nicht-debugerhaltendes?
+    /// Does non-debug-preserving work run at this level too?
     fn allows_all(self) -> bool {
         matches!(self, Level::ReleaseSafe | Level::ReleaseFast)
     }
 }
 
-/// Wirkungsbereich eines Durchgangs.
+/// Scope of a pass.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Scope {
-    /// arbeitet auf einer einzelnen Funktion, laeuft in der Fixpunktschleife
+    /// works on a single function, runs within the fixpoint loop
     Func,
-    /// arbeitet auf dem ganzen Modul, laeuft einmal
+    /// works on the whole module, runs once
     Module,
 }
 
-/// Beschreibung eines Durchgangs.
+/// Description of a pass.
 pub struct PassInfo {
-    /// Schaltername fuer `--no-pass=<name>`
+    /// switch label for `--no-pass=`
     pub name: &'static str,
     pub scope: Scope,
-    /// **Etikett.** `true` = jede benannte Variable zeigt an jedem Haltepunkt
-    /// weiterhin ihren korrekten Wert; der Aufrufstapel bleibt lesbar.
-    /// `false` = der Durchgang zerstoert das Debugbild und laeuft nur in den
-    /// Release-Stufen.
+    /// **Tag.** `true` = every named variable still shows its correct value at
+    /// every breakpoint; the call stack stays readable.
+    /// `false` = the pass destroys the debug picture and runs at the release
+    /// levels only.
     pub debug_preserving: bool,
     pub what: &'static str,
 }
 
-/// Alle Durchgaenge. Reihenfolge = Ausfuehrungsreihenfolge innerhalb einer Runde.
+/// All passes. Order = order of execution within one round.
 pub const PASSES: &[PassInfo] = &[
     PassInfo {
         name: "fold",
@@ -187,11 +187,11 @@ pub const PASSES: &[PassInfo] = &[
     },
 ];
 
-/// Was in einem Lauf ausgefuehrt werden soll.
+/// What shall be executed during a run.
 #[derive(Clone, Debug)]
 pub struct OptConfig {
     pub level: Level,
-    /// einzeln abgeschaltete Durchgaenge (`--no-pass=<name>`)
+    /// passes switched off one by one (`--no-pass=`)
     pub disabled: Vec<String>,
 }
 
@@ -202,7 +202,7 @@ impl Default for OptConfig {
 }
 
 impl OptConfig {
-    /// Laeuft dieser Durchgang?
+    /// Does this pass run?
     pub fn runs(&self, name: &str) -> bool {
         if self.level == Level::Dev {
             return false;
@@ -212,18 +212,18 @@ impl OptConfig {
         }
         match PASSES.iter().find(|p| p.name == name) {
             Some(p) => p.debug_preserving || self.level.allows_all(),
-            // Unbekannter Name kann nicht vorkommen (nur interne Aufrufer),
-            // wird aber konservativ ausgefuehrt statt still uebersprungen.
+            // Unknown labels cannot occur (internal callers only), yet they
+            // get executed conservatively rather than silently skipped.
             None => true,
         }
     }
-    /// Gibt es diesen Durchgangsnamen ueberhaupt?
+    /// Does this pass label exist at all?
     pub fn is_known(name: &str) -> bool {
         PASSES.iter().any(|p| p.name == name)
     }
 }
 
-/// Register als Text (fuer `--list-passes`).
+/// The register as text (for `--list-passes`).
 pub fn passes_text() -> String {
     let mut out = String::from(
         "optimization passes (order = execution order)\n\nNAME            SCOPE    DEBUG-PRESERVING  DESCRIPTION\n",
@@ -246,9 +246,9 @@ pub fn passes_text() -> String {
     out
 }
 
-// ------------------------------------------------------- Ausfuehrung ---
+// --------------------------------------------------------- Execution ---
 
-/// Volle Optimierung (`Level::ReleaseFast`) — Kurzform fuer die Modultests.
+/// Full optimization (`Level::ReleaseFast`) — short form for the module tests.
 #[cfg(test)]
 pub fn optimize(m: &mut Module) -> OptStats {
     optimize_with(m, &OptConfig::default())
@@ -259,8 +259,8 @@ pub fn optimize_with(m: &mut Module, cfg: &OptConfig) -> OptStats {
     if cfg.level == Level::Dev {
         return st;
     }
-    // Erst je Funktion aufraeumen, damit die Groessenheuristik des Inliners
-    // auf bereits vereinfachten Rumpfen arbeitet.
+    // Clean up per function first, so that the size heuristic of the inliner
+    // works on bodies that are simplified already.
     for f in m.funcs.iter_mut() {
         optimize_func(f, &mut st, cfg);
     }
@@ -333,9 +333,9 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig) {
     }
 }
 
-// ------------------------------------------- gemeinsame Teilausdruecke (CSE) ---
+// ----------------------------------------------- common subexpressions (CSE) ---
 
-/// Schluessel eines reinen, wiederverwendbaren Ausdrucks.
+/// Key of a pure, reusable expression.
 #[derive(PartialEq, Eq, Hash, Clone)]
 enum Key {
     Const(u8, i128),
@@ -346,7 +346,7 @@ enum Key {
     PtrAdd(Val, Val),
 }
 
-/// Kennzahl eines FIR-Typs (fir::FTy leitet `Hash` nicht ab).
+/// Number of a FIR type (fir::FTy does not derive `Hash`).
 fn tyk(t: FTy) -> u8 {
     match t {
         FTy::F64 => 12,
@@ -405,15 +405,15 @@ fn key_of(i: &crate::fir::Inst) -> Option<Key> {
         Op::Un(o, a) => Some(Key::Un(tyk(i.ty), unk(*o), *a)),
         Op::Cast { src, from } => Some(Key::Cast(tyk(i.ty), tyk(*from), *src)),
         Op::PtrAdd { base, off } => Some(Key::PtrAdd(*base, *off)),
-        // `load` haengt vom Speicher ab, `alloca` liefert je Instruktion eine
-        // eigene Adresse, `select`/`barrier`/`secure_zero` sind unantastbar.
+        // `load` depends on memory, `alloca` yields a separate address per
+        // instruction, `select`/`barrier`/`secure_zero` are untouchable.
         _ => None,
     }
 }
 
-/// Entfernt mehrfach berechnete reine Ausdruecke entlang des Dominatorbaums:
-/// ein Ausdruck darf nur durch einen Wert ersetzt werden, dessen Definition
-/// die Verwendung dominiert.
+/// Removes pure expressions computed several times along the dominator tree:
+/// one expression may only get replaced by a value whose definition
+/// dominates the use.
 fn cse(f: &mut Func) -> usize {
     if f.blocks.len() > 512 || f.blocks.iter().enumerate().any(|(i, b)| b.id as usize != i) {
         return 0;
@@ -439,7 +439,7 @@ fn cse(f: &mut Func) -> usize {
             let e = avail.entry(k).or_default();
             let mut hit = None;
             for &(ob, ov) in e.iter() {
-                // Dominanz: gleicher Block (frueher) oder dominierender Block
+                // Dominance: same block (earlier) or dominating block
                 if (ob == bi || dom[bi][ob]) && !f.is_secret(ov) {
                     hit = Some(ov);
                     break;
@@ -461,24 +461,24 @@ fn cse(f: &mut Func) -> usize {
     cnt
 }
 
-// ------------------------------------------------------- Bereichspruefungen ---
+// ------------------------------------------------------------- Range checks ---
 
-/// Entfernt beweisbar immer erfuellte Bereichspruefungen: ein `brcond` auf
-/// `i < n`, das von einem dominierenden `brcond` mit derselben Bedingung
-/// bereits als wahr (bzw. falsch) entschieden wurde, wird zum unbedingten
-/// Sprung. Damit verschwindet die doppelte Pruefung, die beim Zugriff auf ein
-/// Feld innerhalb einer bereits gepruefte Schleife entsteht.
-/// Liefert die Anzahl entfernter Pruefungen.
+/// Removes range checks provably always satisfied: a `brcond` on `i < n`
+/// that a dominating `brcond` with the same condition decided as true (or
+/// false) already turns into one unconditional jump. That way the duplicate
+/// check vanishes which comes about at the access to a field within a loop
+/// that got checked already.
+/// Yields the count of removed checks.
 fn remove_redundant_checks(f: &mut Func) -> usize {
     if f.blocks.len() > 512 || f.blocks.iter().enumerate().any(|(i, b)| b.id as usize != i) {
         return 0;
     }
     let preds = crate::mem2reg::preds(f);
     let n = f.blocks.len();
-    // Wissen wird ausschliesslich entlang von Ketten mit GENAU EINEM Vorgaenger
-    // fortgeschrieben. Eine solche Kette kann keinen Zyklus enthalten (ein
-    // wiederbetretener Block haette einen zweiten Vorgaenger), also ist der
-    // Wert der Bedingung auf dem tatsaechlich gelaufenen Weg unveraendert.
+    // Knowledge gets carried forward exclusively along chains with EXACTLY ONE
+    // predecessor. Such a chain can hold no cycle (a block entered again would
+    // have a second predecessor), so the value of the condition is unchanged
+    // on the path actually taken.
     let mut known: Vec<HashMap<Val, bool>> = vec![HashMap::new(); n];
     for bi in 0..n {
         let mut cur = bi;
@@ -504,7 +504,7 @@ fn remove_redundant_checks(f: &mut Func) -> usize {
     for bi in 0..n {
         if let Term::BrCond { cond, then_bb, else_bb } = f.blocks[bi].term {
             if f.is_secret(cond) {
-                continue; // SPEC §9.2: geheime Bedingungen bleiben unberuehrt
+                continue; // SPEC §9.2: secret conditions stay untouched
             }
             if let Some(&v) = known[bi].get(&cond) {
                 f.blocks[bi].term = Term::Br(if v { then_bb } else { else_bb });
@@ -515,9 +515,9 @@ fn remove_redundant_checks(f: &mut Func) -> usize {
     removed
 }
 
-// ---------------------------------------------------------------- Faltung ---
+// ---------------------------------------------------------------- Folding ---
 
-/// Sammelt alle bekannten Konstantenwerte der Funktion.
+/// Collects all known constant values of the function.
 fn const_map(f: &Func) -> HashMap<Val, i128> {
     let mut m = HashMap::new();
     for b in &f.blocks {
@@ -543,11 +543,11 @@ fn fold_constants(f: &mut Func, st: &mut OptStats) -> bool {
                 Some(d) => d,
                 None => continue,
             };
-            // GLEITKOMMA WIRD NIE GEFALTET. Der Wert einer `Op::Const` mit
-            // `FTy::F64` ist ein BITMUSTER; die Faltung hier rechnet
-            // ganzzahlig und wuerde aus `1.5 + 1.5` stillen Unsinn machen.
-            // Faltung von Gleitkomma braucht eine eigene, rundungstreue
-            // Auswertung — die kommt mit `comptime` (SPEC §8.6).
+            // FLOATING POINT NEVER GETS FOLDED. The value of one `Op::Const` with
+            // `FTy::F64` is a BIT PATTERN; the folding here computes
+            // integer wise and would turn `1.5 + 1.5` into silent nonsense.
+            // Folding floating point needs its own evaluation that is
+            // faithful to rounding — that comes with `comptime` (SPEC §8.6).
             if ty == FTy::F64 || op_has_f64(&op, f) {
                 continue;
             }
@@ -615,9 +615,9 @@ fn fold_bin(ty: FTy, op: BinOp, a: i128, b: i128) -> Option<i128> {
             if b < 0 || b >= bits {
                 return None;
             }
-            // `a` ist bereits vorzeichenrichtig normalisiert: bei
-            // vorzeichenlosen Typen nicht negativ (-> logische Verschiebung),
-            // bei vorzeichenbehafteten arithmetisch.
+            // `a` is normalized sign correctly already: for unsigned
+            // types not negative (-> logical shift), for signed ones
+            // arithmetic.
             a >> b
         }
     };
@@ -664,20 +664,20 @@ fn fold_cast(to: FTy, from: FTy, a: i128) -> Option<i128> {
     if to == FTy::Void || from == FTy::Void {
         return None;
     }
-    // Ganzzahl -> bool ist keine reine Bitoperation (Vergleich mit 0 gegenueber
-    // "lowest bit"); das ueberlaesst der Optimierer dem Backend.
+    // Integer -> bool is no pure bit operation (comparison with 0 versus
+    // "lowest bit"); the optimizer leaves that to the backend.
     if to == FTy::Bool && from != FTy::Bool {
         return None;
     }
-    // GLEITKOMMA IST KEINE BITOPERATION.
+    // FLOATING POINT IS NO BIT OPERATION.
     //
-    // Bis Runde 20 fiel `f64` unter dieselbe Zeile wie jede Ganzzahl. Fuer
-    // `u64 -> f64` ist das falsch: aus der Konstante 100 wurde ein `const.f64`
-    // mit dem BITMUSTER 100 (also 5e-322), nicht mit dem Wert 100.0.
-    // Aufgefallen ist es erst, als der in Firn geschriebene Lexer `10.0`
-    // uebersetzte und `firnc0` danebenstand — beide Tokenstroeme mussten
-    // gleich sein, und sie waren es nicht. Der Weg ohne Optimierer war die
-    // ganze Zeit richtig (`cvtsi2sd`); nur die Faltung log.
+    // Up to round 20 `f64` fell under the same line as every integer. For
+    // `u64 -> f64` that is wrong: the constant 100 became a `const.f64`
+    // with the BIT PATTERN 100 (that is 5e-322), not with the value 100.0.
+    // It came out only when the lexer written with Firn compiled `10.0`
+    // and `firnc0` stood next to it — both token streams had to be equal,
+    // and they were not. The path without the optimizer was right the
+    // whole time (`cvtsi2sd`); the folding alone lied.
     if to == FTy::F64 || from == FTy::F64 {
         if to == FTy::F64 && from == FTy::F64 {
             return Some(a);
@@ -687,10 +687,10 @@ fn fold_cast(to: FTy, from: FTy, a: i128) -> Option<i128> {
             let f = if from.signed() { x as f64 } else { (x as u128) as f64 };
             return Some(f.to_bits() as i128);
         }
-        // f64 -> Ganzzahl: abschneidend Richtung null, wie `cvttsd2si`.
-        // Ausserhalb des Zielbereichs, bei NaN und bei Unendlich liefert die
-        // Instruktion einen Sonderwert — dann wird NICHT gefaltet, sondern dem
-        // Backend ueberlassen.
+        // f64 -> integer: cutting towards zero, like `cvttsd2si`.
+        // Outside the target range, for NaN and for infinity the instruction
+        // yields a special value — then NOTHING gets folded, it is left to
+        // the backend.
         let f = f64::from_bits((a as u128) as u64);
         if !f.is_finite() {
             return None;
@@ -713,7 +713,7 @@ fn fold_cast(to: FTy, from: FTy, a: i128) -> Option<i128> {
     Some(to.truncate(from.truncate(a)))
 }
 
-// ---------------------------------------------------------- Terminatoren ---
+// ----------------------------------------------------------- Terminators ---
 
 fn simplify_terminators(f: &mut Func) -> bool {
     let consts = const_map(f);
@@ -728,7 +728,7 @@ fn simplify_terminators(f: &mut Func) -> bool {
                 changed = true;
             }
         } else if let Term::Switch { val, cases, default, .. } = &b.term {
-            // Konstante Marke: direkt zum passenden Zweig springen.
+            // Constant label: jump straight to the matching branch.
             if let Some(&c) = consts.get(val) {
                 let t = cases.iter().find(|(k, _)| *k == c).map(|(_, t)| *t).unwrap_or(*default);
                 b.term = Term::Br(t);
@@ -743,7 +743,7 @@ fn simplify_terminators(f: &mut Func) -> bool {
     changed
 }
 
-// ------------------------------------------------------------- toter Code ---
+// -------------------------------------------------------------- dead code ---
 
 fn collect_uses(f: &Func, blocks: &[usize]) -> HashSet<Val> {
     let mut used = HashSet::new();
@@ -781,7 +781,7 @@ fn remove_unreachable_blocks(f: &mut Func, st: &mut OptStats) -> bool {
     for (i, b) in f.blocks.iter().enumerate() {
         index_of.insert(b.id, i);
     }
-    // Erreichbarkeit ab dem Eintrittsblock
+    // Reachability from the entry block
     let mut reachable = vec![false; f.blocks.len()];
     let mut stack = vec![0usize];
     reachable[0] = true;
@@ -799,10 +799,10 @@ fn remove_unreachable_blocks(f: &mut Func, st: &mut OptStats) -> bool {
         return false;
     }
 
-    // Sicherheitsnetz: Wird ein in einem unerreichbaren Block definierter Wert
-    // noch aus erreichbarem Code heraus gelesen (das waere ein Verstoss gegen
-    // die SSA-Dominanz), wird NICHTS entfernt — lieber toter Code als eine
-    // baumelnde Val-Id.
+    // Safety net: if a value defined inside some unreachable block still
+    // gets read out of reachable code (that would violate the SSA
+    // dominance), NOTHING gets removed — better dead code than a
+    // dangling Val id.
     let live_idx: Vec<usize> = (0..f.blocks.len()).filter(|&i| reachable[i]).collect();
     let used = collect_uses(f, &live_idx);
     for (i, b) in f.blocks.iter().enumerate() {
@@ -822,7 +822,7 @@ fn remove_unreachable_blocks(f: &mut Func, st: &mut OptStats) -> bool {
         f.blocks.iter().enumerate().filter(|(i, _)| !reachable[*i]).map(|(_, b)| b.insts.len()).sum();
     let removed_blocks = reachable.iter().filter(|&&r| !r).count();
 
-    // luecklos neu nummerieren, Reihenfolge bleibt erhalten
+    // renumber without gaps, the order survives
     let mut new_id: HashMap<BlockId, BlockId> = HashMap::new();
     let mut kept = Vec::with_capacity(live_idx.len());
     for (n, &i) in live_idx.iter().enumerate() {
@@ -867,7 +867,7 @@ fn remove_dead_insts(f: &mut Func, st: &mut OptStats) -> bool {
                 }
                 match i.dst {
                     Some(d) => used.contains(&d),
-                    // reine Instruktion ohne Ergebnis: wirkungslos
+                    // pure instruction without result: without effect
                     None => false,
                 }
             });
@@ -964,7 +964,7 @@ mod tests {
         let mut m = Module::new();
         m.funcs.push(f);
         optimize(&mut m);
-        assert_eq!(consts_in(&m.funcs[0]), vec![-56]); // 200 mod 256 als i8
+        assert_eq!(consts_in(&m.funcs[0]), vec![-56]); // 200 mod 256 as i8
     }
 
     #[test]
@@ -980,7 +980,7 @@ mod tests {
         optimize(&mut m);
         assert_eq!(consts_in(&m.funcs[0]), vec![100]);
 
-        // vorzeichenbehaftete Verkuerzung/Erweiterung
+        // signed shortening/widening
         let mut f = Func::new("t2", vec![], FTy::I64);
         let a = f.push(0, FTy::I8, Op::Const(-1));
         let c = f.push(0, FTy::I64, Op::Cast { src: a, from: FTy::I8 });
@@ -1019,12 +1019,12 @@ mod tests {
         m.funcs.push(f);
         let st = optimize(&mut m);
         let f = &m.funcs[0];
-        // 3 < 4 ist wahr: der else-Zweig faellt weg, der then-Zweig wird in
-        // bb0 verschmolzen — uebrig bleibt EIN Block mit `ret 1`.
+        // 3 < 4 is true: the else branch falls away, the then branch gets merged
+        // into bb0 — left over is ONE block with `ret 1`.
         assert_eq!(st.removed_blocks, 2);
         assert!(f.blocks.len() < blocks_before);
         assert_eq!(f.blocks.len(), 1);
-        // Block-Ids bleiben lueckenlos und passen zu ihrer Position
+        // Block ids stay gapless and match their position
         for (i, b) in f.blocks.iter().enumerate() {
             assert_eq!(b.id, i as u32);
         }
@@ -1052,10 +1052,10 @@ mod tests {
         m.funcs.push(f);
         let st = optimize(&mut m);
         let f = &m.funcs[0];
-        // Entfernt werden: die unbenutzte Konstante 99, dazu (neu in Runde 2)
-        // die tote lokale Zelle — der `load` wird auf den gespeicherten Wert
-        // weitergeleitet, danach liest niemand mehr aus der `alloca`.
-        // Syscall und Call MUESSEN stehen bleiben.
+        // Removed get: the unused constant 99, plus (new at round 2) the dead
+        // local cell — the `load` gets forwarded to the stored value, after
+        // which nobody reads from the `alloca` any more.
+        // Syscall and call MUST stay.
         assert!(st.removed_insts >= 1);
         let kinds: Vec<&str> = f.blocks[0]
             .insts
@@ -1092,8 +1092,8 @@ mod tests {
 
     #[test]
     fn loop_stays_untouched_and_terminated() {
-        // while (i < 10) { i = i + 1 }  — nichts davon ist konstant faltbar,
-        // der Optimierer darf hier nichts entfernen und muss anhalten.
+        // while (i < 10) { i = i + 1 }  — nothing of that is constant foldable,
+        // the optimizer may remove nothing here and must halt.
         let mut f = Func::new("t", vec![], FTy::I32);
         let head = f.add_block();
         let body = f.add_block();
@@ -1143,8 +1143,8 @@ mod tests {
     }
 }
 
-/// Faellt bei dieser Instruktion irgendwo ein `f64` an? Fuer die
-/// Konstantenfaltung ist das ein Ausschlusskriterium (siehe `fold_constants`).
+/// Does some `f64` show up anywhere at this instruction? For constant
+/// folding that rules it out (see `fold_constants`).
 fn op_has_f64(op: &Op, f: &Func) -> bool {
     match op {
         Op::Cmp { ty, .. } => *ty == FTy::F64,
