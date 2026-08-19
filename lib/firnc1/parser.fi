@@ -896,16 +896,18 @@ fn liste_ablegen(p: *mut Parser, tmp: *mut Vec[u32]) -> u32 {
     return off
 }
 
-// Argumentliste nach bereits verbrauchtem '('.
-fn ruf_argumente(p: *mut Parser) -> u32 {
-    var tmp: Vec[u32] = vec_neu[u32]()
+// Argumentliste nach bereits verbrauchtem '('. Die Argumente kommen in einen
+// ZWISCHENSPEICHER und wandern erst am Stueck in `kinder` — ein geschachtelter
+// Aufruf legt sonst seine eigene Liste mittenhinein (dieselbe Lehre wie in
+// `liste_ablegen`). Beim Methodenaufruf steht der Empfaenger schon darin.
+fn ruf_argumente_in(p: *mut Parser, tmp: *mut Vec[u32]) {
     while true {
         if ist(p, A_RPAREN) || am_ende(p) {
             break
         }
         let vor: usize = (*p).pos
         let e: u32 = innen_ausdruck(p)
-        vec_push[u32](&tmp, e)
+        vec_push[u32](tmp, e)
         if !friss(p, A_COMMA) {
             break
         }
@@ -914,9 +916,28 @@ fn ruf_argumente(p: *mut Parser) -> u32 {
         }
     }
     erwarte(p, A_RPAREN)
+}
+
+fn ruf_argumente(p: *mut Parser) -> u32 {
+    var tmp: Vec[u32] = vec_neu[u32]()
+    ruf_argumente_in(p, &tmp)
     let off: u32 = liste_ablegen(p, &tmp)
     vec_frei[u32](&tmp)
     return off
+}
+
+// RUNDE 45 (impls.rs): `"methode " ++ name` — der Aufrufname eines noch nicht
+// aufgeloesten Methodenaufrufs. Das Leerzeichen macht ihn zu einem Namen, der
+// aus keinem Bezeichner des Quelltextes entstehen kann.
+fn methodenrufname(p: *mut Parser, nr: u32) -> u32 {
+    let it: *mut intern.Interner = lexer.lex_namen(lx(p))
+    rt.buf_leeren(&(*p).kladde)
+    var w: [u8; 8] = "methode "
+    rt.buf_push_bytes(&(*p).kladde, (&w[0]) as u64, 8)
+    rt.buf_push_bytes(&(*p).kladde, intern.intern_zeiger(it, nr),
+                      intern.intern_laenge(it, nr))
+    return intern.intern_nummer(it, rt.buf_ptr(&(*p).kladde),
+                                rt.buf_len(&(*p).kladde)) as u32
 }
 
 fn nach_ausdruck(p: *mut Parser) -> u32 {
@@ -966,6 +987,25 @@ fn nach_ausdruck(p: *mut Parser) -> u32 {
             }
             let nr: u32 = nummer(p, 0)
             weiter_bump(p)
+            // RUNDE 45 (impls.rs::hook_methodenaufruf): folgt eine Klammer,
+            // ist es ein METHODENAUFRUF. Der Empfaenger wird das erste
+            // Argument; welche Funktion gemeint ist, entscheidet erst der
+            // Typpruefer aus seinem Typ.
+            // Die Klammer muss in DERSELBEN Zeile stehen (`weiter`) — sonst
+            // waere die naechste Anweisung, die mit `(` beginnt, ein
+            // Methodenaufruf des Feldzugriffs davor.
+            if weiter(p) && ist(p, A_LPAREN) {
+                weiter_bump(p)
+                var mtmp: Vec[u32] = vec_neu[u32]()
+                vec_push[u32](&mtmp, e)
+                ruf_argumente_in(p, &mtmp)
+                let mname: u32 = methodenrufname(p, nr)
+                let mlaen: u32 = vec_len[u32](&mtmp) as u32
+                let moff: u32 = liste_ablegen(p, &mtmp)
+                vec_frei[u32](&mtmp)
+                e = ast.ausdruck_neu(par_baum(p), ast.E_RUF, mname, moff, mlaen, 0)
+                continue
+            }
             e = ast.ausdruck_neu(par_baum(p), ast.E_FELD, e, nr, 0, 0)
         } else if a == A_LBRACKET {
             // `summe[i32](a, b)` — Aufruf einer generischen Vorlage. Das ist
@@ -2635,6 +2675,14 @@ fn eigene_suchen(p: *mut Parser) {
     }
     var i: usize = 0
     while i + 1 < (*p).n {
+        // RUNDE 45: die Methoden eines `impl`-Blocks heissen `Typ__methode`
+        // und stehen nie unter ihrem kurzen Namen im Modul. `firnc0` sammelt
+        // die Namen erst NACH dem Parsen (modules.rs) und sieht sie deshalb
+        // ebenfalls nicht — ohne diesen Sprung liefen beide auseinander.
+        if ist_impl_bei(p, i) {
+            i = impl_ende(p, i)
+            continue
+        }
         let a: u32 = lexer.lex_art(lx(p), i)
         if a == A_KWFN || a == A_KWSTRUCT || a == A_KWCONST {
             if lexer.lex_art(lx(p), i + 1) == A_IDENT {
@@ -2681,6 +2729,173 @@ fn ist_gc_class(p: *mut Parser) -> bool {
     }
     var cw: [u8; 5] = "class"
     return intern.intern_gleich(it, nummer(p, 1), (&cw[0]) as u64, 5)
+}
+
+// RUNDE 45 (impls.rs::hook_item): Steht an dieser Stelle `impl Typ {`?
+// `impl` ist KEIN Schluesselwort, sondern ein Bezeichner in einer Stellung,
+// in der sonst nichts stehen darf — dieselbe Loesung wie `gc class`.
+fn ist_impl(p: *mut Parser) -> bool {
+    if !ist(p, A_IDENT) {
+        return false
+    }
+    var iw: [u8; 4] = "impl"
+    let it: *mut intern.Interner = lexer.lex_namen(lx(p))
+    if !intern.intern_gleich(it, nummer(p, 0), (&iw[0]) as u64, 4) {
+        return false
+    }
+    if art(p, 1) != A_IDENT {
+        return false
+    }
+    return art(p, 2) == A_LBRACE
+}
+
+// Dasselbe an einer ABSOLUTEN Tokenstelle (fuer die Vorabsuche).
+fn ist_impl_bei(p: *mut Parser, i: usize) -> bool {
+    if i + 2 >= (*p).n {
+        return false
+    }
+    if lexer.lex_art(lx(p), i) != A_IDENT {
+        return false
+    }
+    var iw: [u8; 4] = "impl"
+    let it: *mut intern.Interner = lexer.lex_namen(lx(p))
+    if !intern.intern_gleich(it, lexer.lex_nr(lx(p), i), (&iw[0]) as u64, 4) {
+        return false
+    }
+    if lexer.lex_art(lx(p), i + 1) != A_IDENT {
+        return false
+    }
+    return lexer.lex_art(lx(p), i + 2) == A_LBRACE
+}
+
+// Stelle NACH der schliessenden Klammer des impl-Blocks bei `i`.
+fn impl_ende(p: *mut Parser, i: usize) -> usize {
+    var k: usize = i + 2
+    var tiefe: usize = 0
+    while k < (*p).n {
+        let a: u32 = lexer.lex_art(lx(p), k)
+        if a == A_LBRACE {
+            tiefe = tiefe + 1
+        }
+        if a == A_RBRACE {
+            tiefe = tiefe - 1
+            if tiefe == 0 {
+                return k + 1
+            }
+        }
+        k = k + 1
+    }
+    return k
+}
+
+// Der Empfaenger einer Methode: `self`, `*self` oder `*mut self`.
+// Firn hat keine Referenzen — der Empfaenger wird geschrieben wie jeder
+// andere Parameter dieser Sprache (impls.rs, Abschnitt „Der Empfaenger").
+fn selbst_param(p: *mut Parser, tname: u32) -> bool {
+    var sw: [u8; 4] = "self"
+    let it: *mut intern.Interner = lexer.lex_namen(lx(p))
+    let snr: u32 = intern.intern_nummer(it, (&sw[0]) as u64, 4) as u32
+    if ist(p, A_IDENT) && nummer(p, 0) == snr {
+        weiter_bump(p)
+        let t: u32 = ast.typ_neu(par_baum(p), ast.T_NAME, tname, 0)
+        ast.param_dazu(par_baum(p), snr, t)
+        lok_dazu(p, snr)
+        return true
+    }
+    if ist(p, A_STAR) {
+        var m: u64 = 0
+        var k: usize = 1
+        if art(p, 1) == A_KWMUT {
+            m = 1
+            k = 2
+        }
+        if art(p, k) == A_IDENT && nummer(p, k) == snr {
+            weiter_bump(p)
+            if m == 1 {
+                weiter_bump(p)
+            }
+            weiter_bump(p)
+            let innen: u32 = ast.typ_neu(par_baum(p), ast.T_NAME, tname, 0)
+            let t: u32 = ast.typ_neu(par_baum(p), ast.T_PTR, innen, m)
+            ast.param_dazu(par_baum(p), snr, t)
+            lok_dazu(p, snr)
+            return true
+        }
+    }
+    meckern(p)
+    return false
+}
+
+// Eine Methode wird zur gewoehnlichen Funktion `Typ__methode`. Danach ist sie
+// nichts Besonderes mehr — dieselbe Typpruefung, dasselbe Lowering.
+fn methoden_deklaration(p: *mut Parser, tname: u32) {
+    weiter_bump(p)
+    if !ist(p, A_IDENT) {
+        meckern(p)
+        return
+    }
+    let mnr: u32 = nummer(p, 0)
+    weiter_bump(p)
+    if ist(p, A_LBRACKET) {
+        meckern(p)
+        return
+    }
+    var tr: [u8; 2] = "__"
+    let name: u32 = verbinde(p, tname, (&tr[0]) as u64, 2, mnr)
+    if !erwarte(p, A_LPAREN) {
+        return
+    }
+    lok_auf(p)
+    let poff: u32 = ast.param_anfang(par_baum(p))
+    if !selbst_param(p, tname) {
+        lok_zu(p)
+        return
+    }
+    if friss(p, A_COMMA) {
+        parameterliste(p)
+    }
+    erwarte(p, A_RPAREN)
+    let plen: u32 = ast.param_anfang(par_baum(p)) - poff
+    var ret: u32 = ast.NICHTS
+    if friss(p, A_ARROW) {
+        ret = typ(p)
+        if ret == ast.NICHTS {
+            lok_zu(p)
+            return
+        }
+    }
+    let rumpf: u32 = block(p)
+    lok_zu(p)
+    ast.fn_dazu(par_baum(p), name, poff, plen, ret, rumpf, 0, 0)
+}
+
+fn impl_deklaration(p: *mut Parser) {
+    weiter_bump(p)
+    let roh: u32 = nummer(p, 0)
+    weiter_bump(p)
+    let tname: u32 = umbenannt(p, roh)
+    if !erwarte(p, A_LBRACE) {
+        return
+    }
+    while true {
+        while friss(p, A_SEMI) {}
+        if ist(p, A_RBRACE) || am_ende(p) {
+            break
+        }
+        if (*p).fehler > 0 {
+            break
+        }
+        let vor: usize = (*p).pos
+        if !ist(p, A_KWFN) {
+            meckern(p)
+            break
+        }
+        methoden_deklaration(p, tname)
+        if (*p).pos == vor {
+            weiter_bump(p)
+        }
+    }
+    erwarte(p, A_RBRACE)
 }
 
 // `#[no_gc]` und `#[must_consume]` — die beiden umgesetzten Attribute
@@ -2834,6 +3049,8 @@ fn par_lauf(p: *mut Parser) {
             attribut(p)
         } else if a == A_IDENT && hat_gc(p) && ist_gc_class(p) {
             gc_class_deklaration(p)
+        } else if a == A_IDENT && ist_impl(p) {
+            impl_deklaration(p)
         } else if a == A_KWFN {
             fn_deklaration(p)
         } else if a == A_KWSTRUCT {
