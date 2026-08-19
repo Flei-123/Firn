@@ -172,6 +172,18 @@ pub(crate) fn hat_klassen() -> bool {
 /// Setzt die Registrierung zurueck (eine je Uebersetzung, `parser::reset_hooks`).
 pub(crate) fn hook_reset() {
     REG.with(|r| *r.borrow_mut() = Registry::default());
+}
+
+/// Runde 49: die Laufzeit ist Teil dieses Programms. Gesetzt in
+/// `modules.rs`, wo sie wirklich in die Dateiliste kommt — nicht in
+/// `laufzeit_quelle`, denn deren Ergebnis wird auch in Tests gebaut.
+pub(crate) fn laufzeit_merken() {
+    LAUFZEIT_DRIN.with(|c| c.set(true));
+}
+
+/// Vor jeder Uebersetzung zuruecksetzen (ein Prozess kann mehrere
+/// uebersetzen — `cargo test`).
+pub(crate) fn laufzeit_reset() {
     LAUFZEIT_DRIN.with(|c| c.set(false));
 }
 
@@ -1300,7 +1312,6 @@ pub(crate) fn laufzeit_quelle(
         s.push_str("// __faden_arbeit wird vom Programm selbst deklariert\n");
     }
     s.push_str(LAUFZEIT);
-    LAUFZEIT_DRIN.with(|c| c.set(true));
     s
 }
 
