@@ -379,6 +379,7 @@ pub(crate) fn hook_methodenaufruf(
 // -------------------------------------------------------------- Typpruefung
 
 /// Struktur hinter einem Empfaengertyp: `(Index, liegt schon als Zeiger vor)`.
+/// Nur fuer die Frage „ist das ein `dyn I`?" — sonst gilt `empfaenger_praefix`.
 fn empfaenger_struktur(tcx: &TypeCtx, t: &Type) -> Option<(usize, bool)> {
     match t {
         Type::Struct(i) if tcx.structs.get(*i).is_some() => Some((*i, false)),
@@ -387,6 +388,28 @@ fn empfaenger_struktur(tcx: &TypeCtx, t: &Type) -> Option<(usize, bool)> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// Der Name, unter dem die Methoden dieses Empfaengers stehen, und ob er
+/// schon als Zeiger vorliegt: `(Praefix, ist_zeiger)`.
+///
+/// Seit Runde 50 zaehlt dazu auch ein GRUNDTYP (`impl Ord for i32` legt
+/// `i32__kleiner` an). Ein typloses Ganzzahlliteral gehoert ausdruecklich
+/// nicht dazu: `1.m()` haette keinen festen Typ, und welcher `impl`-Block
+/// gemeint waere, koennte niemand sagen.
+fn empfaenger_praefix(tcx: &TypeCtx, t: &Type) -> Option<(String, bool)> {
+    fn name(tcx: &TypeCtx, t: &Type) -> Option<String> {
+        match t {
+            Type::Struct(i) if tcx.structs.get(*i).is_some() => {
+                Some(crate::iface::methodenpraefix(tcx, *i))
+            }
+            other => crate::iface::grundtyp_name(other).map(|s| s.to_string()),
+        }
+    }
+    match t {
+        Type::Ptr { inner, .. } => name(tcx, inner).map(|n| (n, true)),
+        other => name(tcx, other).map(|n| (n, false)),
     }
 }
 
@@ -408,8 +431,8 @@ pub(crate) fn ziel_von(
     methode: &str,
     empf: &Type,
 ) -> Option<(String, bool)> {
-    let (sidx, ist_zeiger) = empfaenger_struktur(tcx, empf)?;
-    let voll = fn_name(&crate::iface::methodenpraefix(tcx, sidx), methode);
+    let (praefix, ist_zeiger) = empfaenger_praefix(tcx, empf)?;
+    let voll = fn_name(&praefix, methode);
     let sig = fns.get(&voll)?;
     let will_zeiger = sig.params.first().map(|t| t.is_ptr()).unwrap_or(false);
     Some((voll, will_zeiger && !ist_zeiger))
@@ -465,7 +488,7 @@ pub(crate) fn hook_call(
         }
         return Some(Type::Error);
     }
-    let (sidx, ist_zeiger) = match empfaenger_struktur(&ck.tcx, &et) {
+    let (praefix, ist_zeiger) = match empfaenger_praefix(&ck.tcx, &et) {
         Some(x) => x,
         None => {
             for a in &args[1..] {
@@ -474,27 +497,29 @@ pub(crate) fn hook_call(
             ck.dg.error_note(
                 nspan,
                 format!(
-                    "methode '{}' auf einem wert vom typ {} — methoden gibt es nur fuer struct-typen",
+                    "methode '{}' auf einem wert vom typ {} — dieser typ kann keine methoden haben",
                     methode,
                     ck.tcx.name_of(&et)
                 ),
-                "eine methode wird mit 'impl Typ { fn … }' fuer einen struct-typ vereinbart"
+                "eine methode wird mit 'impl Typ { fn … }' fuer einen struct- oder grundtyp vereinbart"
                     .to_string(),
             );
             return Some(Type::Error);
         }
     };
-    let sname = ck.tcx.structs[sidx].name.clone();
     // HOOK iface: `f.m(args)` auf einem `dyn I` — DYNAMISCHER VERSAND. Welche
     // Funktion laeuft, steht erst zur Laufzeit in der Methodentafel; geprueft
     // wird gegen die Schnittstelle (iface.rs, Runde 46).
-    if let Some(iname) = crate::iface::schnittstelle_von(&sname) {
-        let iname = iname.to_string();
-        return Some(crate::iface::hook_methode(
-            ck, &iname, &methode, args, &et, ist_zeiger, nspan, espan,
-        ));
+    if let Some((sidx, _)) = empfaenger_struktur(&ck.tcx, &et) {
+        let sname = ck.tcx.structs[sidx].name.clone();
+        if let Some(iname) = crate::iface::schnittstelle_von(&sname) {
+            let iname = iname.to_string();
+            return Some(crate::iface::hook_methode(
+                ck, &iname, &methode, args, &et, ist_zeiger, nspan, espan,
+            ));
+        }
     }
-    let praefix = crate::iface::methodenpraefix(&ck.tcx, sidx);
+    let sname = praefix.clone();
     let voll = fn_name(&praefix, &methode);
     let sig = match ck.fns.get(&voll) {
         Some(s) => s.clone(),
