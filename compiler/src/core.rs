@@ -780,7 +780,7 @@ mod tests {
     }
 
     #[test]
-    fn asm_stays_despite_unused_result_stand() {
+    fn asm_stays_despite_unused_result() {
         // DIE FALLE AUS RUNDE 40: das Ergebnis wird nie gelesen. Ein
         // Optimierer, der `Op::Asm` fuer rein haelt, wirft die Zeile weg.
         let (asm, _) = build(

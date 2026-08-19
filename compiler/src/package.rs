@@ -155,7 +155,7 @@ pub fn module_name(path: &str) -> String {
 }
 
 /// Liegt `pfad` in `wurzel` (oder IST er es)? Beide muessen normalisiert sein.
-pub fn lies_in(path: &str, root: &str) -> bool {
+pub fn read_within(path: &str, root: &str) -> bool {
     if path == root {
         return true;
     }
@@ -516,11 +516,11 @@ mod tests {
 
     #[test]
     fn membership_zu_a_package() {
-        assert!(lies_in("/a/b/c.fi", "/a/b"));
-        assert!(lies_in("/a/b", "/a/b"));
-        assert!(!lies_in("/a/bc/d.fi", "/a/b"));
-        assert!(!lies_in("/a", "/a/b"));
-        assert!(lies_in("/a", "/"));
+        assert!(read_within("/a/b/c.fi", "/a/b"));
+        assert!(read_within("/a/b", "/a/b"));
+        assert!(!read_within("/a/bc/d.fi", "/a/b"));
+        assert!(!read_within("/a", "/a/b"));
+        assert!(read_within("/a", "/"));
     }
 
     #[test]

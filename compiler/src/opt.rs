@@ -926,7 +926,7 @@ mod tests {
     }
 
     #[test]
-    fn division_by_null_stays_stand() {
+    fn division_by_null_stays() {
         let mut f = Func::new("t", vec![], FTy::I32);
         let a = f.push(0, FTy::I32, Op::Const(7));
         let b = f.push(0, FTy::I32, Op::Const(0));
@@ -941,7 +941,7 @@ mod tests {
     }
 
     #[test]
-    fn zu_width_shift_stays_stand() {
+    fn wide_width_shift_stays() {
         let mut f = Func::new("t", vec![], FTy::I32);
         let a = f.push(0, FTy::I32, Op::Const(1));
         let b = f.push(0, FTy::I32, Op::Const(32));
