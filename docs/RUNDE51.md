@@ -1,35 +1,37 @@
-# Runde 51 — realweb unter 1,3× (in Instruktionen gemessen)
+# Round 51 — realweb below 1,3× (measured in instructions)
 
-Basis: `cc1710f` (Merge der Runden 46/47/48). Branch `r51-tempo`.
-Revier: Optimierer, Registerzuteilung, Codeerzeugung, Tokenizer-Messlauf.
+Base: `cc1710f` (merge of rounds 46/47/48). Branch `r51-tempo`.
+Territory: optimizer, register allocation, code generation, tokenizer
+measuring run.
 
-**Auftrag.** Den Tokenizer-Vergleich gegen `html5ever` auf dem Korpus
-`realweb` sicher unter 2× halten und weiter druecken, Zielmarke **≤ 1,3×**,
-gemessen in **Instruktionen mit callgrind** — nicht mit der Wanduhr.
+**Assignment.** Keep the tokenizer comparison against `html5ever` on the
+corpus `realweb` safely below 2× and push further, target mark **≤ 1,3×**,
+measured in **instructions with callgrind** — not with the wall clock.
 
-**Ergebnis.** Sieben Aenderungen, jede einzeln gemessen, zusammen
-**−26,99 %** auf `realweb` und **−23,43 %** auf `html5lib`.
+**Result.** Seven changes, each measured individually, together
+**−26,99 %** on `realweb` and **−23,43 %** on `html5lib`.
 
-| Korpus   | Instruktionen vorher | nachher       | Aenderung |
-|----------|---------------------:|--------------:|----------:|
+| Corpus   | instructions before | after         | change |
+|----------|--------------------:|--------------:|----------:|
 | realweb  |        957.989.680   |  699.459.494  | **−26,99 %** |
 | html5lib |      2.149.257.366   | 1.645.729.694 | **−23,43 %** |
 
-| Korpus   | Faktor vorher | Faktor nachher | Ziel |
+| Corpus   | factor before | factor after | goal |
 |----------|--------------:|---------------:|-----:|
 | realweb  |     **1,772×** |     **1,294×** | ≤ 1,30× ✅ |
 | html5lib |     **1,034×** |     **0,791×** | ≤ 1,30× ✅ |
 
-Alle sieben Aenderungen sitzen im **Compiler**, keine im Tokenizer. Der
-Gewinn gilt also fuer jedes Firn-Programm, nicht nur fuer den Messlauf.
+All seven changes sit in the **compiler**, none in the tokenizer. The
+gain therefore holds for every Firn program, not only for the measuring
+run.
 
 ---
 
-## 0. Was hier „Faktor" heisst — und warum das ein anderer Wert ist als in Runde 43
+## 0. What „factor" means here — and why it is a different value than in round 43
 
-Runde 43 hat den Faktor mit `tools/tokenizer/throughput.sh` bestimmt, also mit
-der **Wanduhr** (1,54× realweb). Diese Runde rechnet ihn aus
-**Instruktionszahlen**:
+Round 43 determined the factor with `tools/tokenizer/throughput.sh`, i.e.
+with the **wall clock** (1,54× realweb). This round computes it from
+**instruction counts**:
 
 ```
 valgrind --tool=callgrind --cache-sim=no --branch-sim=no  <binary>
@@ -38,28 +40,28 @@ valgrind --tool=callgrind --cache-sim=no --branch-sim=no  <binary>
 * Firn:      `.tokenizer-work/tokenize_bench < korpus.<k>.auftrag`
 * html5ever: `bench/tokenizer/target/release/html5ever_bench korpus.<k>.html`
 
-Messwerte der Gegenseite (unveraendert, dieselbe Maschine):
+Measurements of the other side (unchanged, same machine):
 
-| Korpus   | html5ever, Instruktionen |
+| Corpus   | html5ever, instructions |
 |----------|-------------------------:|
 | realweb  |              540.567.228 |
 | html5lib |            2.079.365.558 |
 
-Der Instruktionsfaktor ist **strenger** als der Wanduhrfaktor: 1,772× gegen
-1,54× am selben Stand. Firn fuehrt also mehr Instruktionen aus als html5ever
-und braucht trotzdem weniger Zeit je Instruktion. Beide Zahlen sind ehrlich,
-sie messen nur Verschiedenes. Diese Runde druckt die Instruktionszahl, weil
-sie auf die Instruktion genau reproduzierbar ist — die Wanduhr streute an
-dieser Maschine zwischen 2,58× und 2,85× **fuer dieselbe Binary**
-(docs/RUNDE43.md). Waehrend dieser Runde liefen zwei weitere Runden parallel
-auf derselben Maschine; Wanduhrwerte werden deshalb **gar nicht** als Beleg
-angefuehrt.
+The instruction factor is **stricter** than the wall clock factor: 1,772×
+against 1,54× at the same state. So Firn executes more instructions than
+html5ever and still needs less time per instruction. Both numbers are
+honest, they only measure different things. This round prints the
+instruction count because it is reproducible to the instruction — the wall
+clock scattered on this machine between 2,58× and 2,85× **for the same
+binary** (docs/RUNDE43.md). During this round two further rounds ran in
+parallel on the same machine; wall clock values are therefore **not** cited
+as evidence at all.
 
-**Neues Werkzeug: `tools/tokenizer/patterns.py`.** `profil.py` (Runde 43)
-beantwortet „welche FUNKTION kostet?". Die neue Datei beantwortet die Frage
-daneben — „welche FORM von Code kostet?": sie verbindet `objdump` mit der
-instruktionsgenauen callgrind-Ausgabe (`--dump-instr=yes`) und gewichtet
-Instruktions**muster** mit ihren echten Ausfuehrungszahlen. Aufruf:
+**New tool: `tools/tokenizer/patterns.py`.** `profil.py` (round 43)
+answers „which FUNCTION costs?". The new file answers the question
+next to it — „which FORM of code costs?": it combines `objdump` with the
+instruction-precise callgrind output (`--dump-instr=yes`) and weights
+instruction **patterns** by their real execution counts. Invocation:
 
 ```sh
 objdump -d --no-show-raw-insn .tokenizer-work/tokenize_bench > dis.txt
@@ -68,13 +70,13 @@ valgrind --tool=callgrind --dump-instr=yes --cache-sim=no --branch-sim=no \
 python3 tools/tokenizer/patterns.py dis.txt cg.out
 ```
 
-Dazu im Arbeitsverzeichnis (nicht eingecheckt) `.r51/messe.sh`, das callgrind
-auf beide Korpora fahrt und die Instruktionszahl ablegt.
+Plus, in the working directory (not checked in), `.r51/messe.sh`, which
+runs callgrind on both corpora and records the instruction count.
 
-**Die Lehre aus Runde 43 hat sich wieder bewaehrt** und diesmal in die andere
-Richtung: statische Haeufigkeit sagt nichts, aber ein *dynamisch gewichtetes
-Muster* sagt sehr viel. Die drei groessten Posten dieser Runde standen nach
-20 Minuten Werkzeugbau als Tabelle da:
+**The lesson from round 43 proved itself again**, this time in the other
+direction: static frequency says nothing, but a *dynamically weighted
+pattern* says a great deal. The three largest items of this round were on
+the table after 20 minutes of tool building:
 
 ```
 jmp direkt hinter jcc (Blocklayout)          29.258.200 Ir   3,05%    614 Stellen
@@ -84,7 +86,7 @@ Store+Reload derselben Zelle                 98.393.560 Ir  10,27%    294 Stelle
 
 ---
 
-## 1. Das Profil vorher (realweb, 957.989.680 Ir)
+## 1. The profile before (realweb, 957.989.680 Ir)
 
 ```
           SELBST   ANTEIL         INKLUSIV  FUNKTION
@@ -96,37 +98,37 @@ Store+Reload derselben Zelle                 98.393.560 Ir  10,27%    294 Stelle
       11.448.890    1,20%      957.989.676  main
 ```
 
-Nach Mnemonics: **51,7 % aller ausgefuehrten Instruktionen waren
-Datenbewegungen** (`mov`/`movzx`/`movabs`; das reine `mov` allein 43,2 %),
-darunter **129.637.675 Ir Rahmen-Loads (13,53 %)** und **126.722.224 Ir
-Rahmen-Stores (13,23 %)**. Der Tokenizer verbrachte also mehr als die Haelfte
-seiner Instruktionen damit, Werte hin und her zu schieben, und ueber ein
-Viertel allein zwischen Registern und dem Stapelrahmen.
+By mnemonic: **51,7 % of all executed instructions were
+data movements** (`mov`/`movzx`/`movabs`; the plain `mov` alone 43,2 %),
+among them **129.637.675 Ir of frame loads (13,53 %)** and **126.722.224 Ir
+of frame stores (13,23 %)**. The tokenizer therefore spent more than half
+of its instructions shoving values back and forth, and more than a quarter
+of them between registers and the stack frame alone.
 
 ---
 
-## 2. Messtabelle — sieben Aenderungen, sieben Messungen
+## 2. Measurement table — seven changes, seven measurements
 
-| # | Aenderung | realweb Ir | Δ | html5lib Ir | Δ |
+| # | Change | realweb Ir | Δ | html5lib Ir | Δ |
 |---|---|---:|---:|---:|---:|
-| — | Basis `cc1710f` | 957.989.680 | — | 2.149.257.366 | — |
-| H1 | Sprungfaedelung durch Bool-Zellen (`thread-bool`) | 790.898.007 | **−17,44 %** | 1.824.956.636 | **−15,09 %** |
-| H2 | `switch`-Wert aus dem Register, kein `mov eax, eax` | 775.569.867 | −1,94 % | 1.818.386.969 | −0,36 % |
-| H3 | Blocklayout entlang von Spuren | 747.247.528 | **−3,65 %** | 1.758.320.039 | −3,30 % |
-| H4 | kein `xor eax, eax` bei `void`-Rueckgabe | 743.411.513 | −0,51 % | 1.756.522.359 | −0,10 % |
-| H5 | Deskriptor-Nachpass mit Nullerweiterungs-Verfolgung | 733.566.422 | −1,32 % | 1.748.021.433 | −0,48 % |
-| H6 | volle x86-Adressierung `[basis+index*faktor+k]` | 712.941.773 | **−2,81 %** | 1.683.365.701 | −3,70 % |
-| H7 | Adressfaltung auch mit Basis/Index aus dem Rahmen | 699.459.494 | −1,89 % | 1.645.729.694 | −2,24 % |
-| | **gesamt** | | **−26,99 %** | | **−23,43 %** |
+| — | base `cc1710f` | 957.989.680 | — | 2.149.257.366 | — |
+| H1 | jump threading through bool cells (`thread-bool`) | 790.898.007 | **−17,44 %** | 1.824.956.636 | **−15,09 %** |
+| H2 | `switch` value from the register, no `mov eax, eax` | 775.569.867 | −1,94 % | 1.818.386.969 | −0,36 % |
+| H3 | block layout along traces | 747.247.528 | **−3,65 %** | 1.758.320.039 | −3,30 % |
+| H4 | no `xor eax, eax` on a `void` return | 743.411.513 | −0,51 % | 1.756.522.359 | −0,10 % |
+| H5 | descriptor post-pass with zero-extension tracking | 733.566.422 | −1,32 % | 1.748.021.433 | −0,48 % |
+| H6 | full x86 addressing `[basis+index*faktor+k]` | 712.941.773 | **−2,81 %** | 1.683.365.701 | −3,70 % |
+| H7 | address folding with base/index from the frame as well | 699.459.494 | −1,89 % | 1.645.729.694 | −2,24 % |
+| | **total** | | **−26,99 %** | | **−23,43 %** |
 
-Die Ausgabe blieb bei jedem Schritt gleich: realweb 187.473 Token / 1 Auftrag,
+The output stayed the same at every step: realweb 187.473 tokens / 1 job,
 html5lib 8.511 / 1.
 
 ---
 
-## 3. H1 — Sprungfaedelung durch Bool-Zellen (`compiler/src/threading.rs`, neu)
+## 3. H1 — jump threading through bool cells (`compiler/src/threading.rs`, new)
 
-**Beobachtung.** 17,13 % aller Instruktionen steckten in Ketten der Form
+**Observation.** 17,13 % of all instructions sat in chains of the form
 
 ```
 setb   %al                       ; Bool herstellen
@@ -137,9 +139,9 @@ test   %r11b,%r11b
 je     ...
 ```
 
-**Ursache.** FIR hat **keine Phi-Knoten** — eine ausdrueckliche Invariante.
-Die Kurzschlussoperatoren `&&` und `||` muessen ihr Ergebnis deshalb ueber
-eine `alloca` zusammenfuehren. Aus `if c0 < 0x80 && c0 != 13` wird:
+**Cause.** FIR has **no phi nodes** — an explicit invariant.
+The short-circuit operators `&&` and `||` therefore have to merge their
+result over an `alloca`. From `if c0 < 0x80 && c0 != 13` becomes:
 
 ```text
 bbA: %1 = cmp.lt %c, 128 ; store.bool %1, %zelle ; brcond %1, bbB, bbJ
@@ -147,52 +149,54 @@ bbB: %2 = cmp.ne %c, 13  ; store.bool %2, %zelle ; br bbJ
 bbJ: %3 = load.bool %zelle ; brcond %3, bbT, bbE
 ```
 
-`mem2reg` kann diese Zelle nicht aufloesen (zwei Schreibzugriffe, kein Phi),
-und die bestehende Verschmelzung `cmp`+`jcc` in `regalloc.rs` greift nicht,
-weil zwischen Vergleich und Terminator der `store` steht.
+`mem2reg` cannot resolve this cell (two writes, no phi),
+and the existing fusion of `cmp`+`jcc` in `regalloc.rs` does not apply,
+because the `store` stands between the comparison and the terminator.
 
-**Umsetzung.** Ein neuer Durchgang `thread-bool` faedelt die Kante am
-Zusammenfluss vorbei. Ein **Weichenblock** besteht aus genau einer Instruktion
-`%v = load.bool %zelle` und endet mit `brcond %v, T, E`. Ein Vorgaenger, der
-unmittelbar vor seinem Terminator `store.bool %x, %zelle` ausfuehrt, kennt den
-Inhalt der Zelle auf dieser Kante bereits:
+**Implementation.** A new pass `thread-bool` threads the edge past the
+confluence. A **switch block** consists of exactly one instruction
+`%v = load.bool %zelle` and ends with `brcond %v, T, E`. A predecessor that
+executes `store.bool %x, %zelle` immediately before its terminator already
+knows the content of the cell on this edge:
 
 * `br J`            → `brcond %x, T, E`
-* `brcond %x, A, J` → `brcond %x, A, E`  (auf der J-Kante ist `%x` falsch)
+* `brcond %x, A, J` → `brcond %x, A, E`  (on the J edge `%x` is false)
 * `brcond %x, J, B` → `brcond %x, T, B`
 
-Danach ist der Weichenblock unerreichbar (`dce`), die Zelle wird nirgends mehr
-gelesen (`mem2reg::remove_dead_stores` raeumt `store` und `alloca` weg), und
-der Vergleich steht wieder unmittelbar vor dem Terminator — die bestehende
-Verschmelzung macht daraus `cmp` + `jcc`. Aus sieben Instruktionen werden zwei.
+After that the switch block is unreachable (`dce`), the cell is no longer
+read anywhere (`mem2reg::remove_dead_stores` clears away the `store` and
+the `alloca`), and the comparison stands immediately before the terminator
+again — the existing fusion turns that into `cmp` + `jcc`. Seven
+instructions become two.
 
-**Warum das nicht die Fehlerklasse aus Runde 40/41 ist.** Dort wurde eine
-Lebensspanne ueber eine `call`-Grenze gedehnt, ohne dass der Registerverteiler
-davon wusste. Hier entsteht **keine neue Spanne ueber einen Block hinaus**:
-`%x` ist bereits Operand des `store` im selben Block, der Terminator liest es
-eine Instruktion spaeter — und `Term::BrCond` gehoert ohnehin zur
-Lebensdaueranalyse des Verteilers. Zusaetzlich abgesichert:
+**Why this is not the class of bug from rounds 40/41.** There, a lifetime
+was stretched across a `call` boundary without the register allocator
+knowing about it. Here **no new lifetime beyond a block** comes into being:
+`%x` is already an operand of the `store` in the same block, and the
+terminator reads it one instruction later — and `Term::BrCond` belongs to
+the lifetime analysis of the allocator anyway. Additionally safeguarded:
 
-* zwischen `store` und Terminator darf keine Instruktion mit Speicherwirkung
-  stehen (`store`, `call`, `syscall`, `copymem`, `atomicadd`, `securezero`),
-* die Zelle muss eine `alloca` sein, deren Zeiger **nicht entkommt**,
-* `secret`-Werte und `#[constant_time]`-Funktionen bleiben unberuehrt
+* between the `store` and the terminator no instruction with a memory
+  effect may stand (`store`, `call`, `syscall`, `copymem`, `atomicadd`,
+  `securezero`),
+* the cell has to be an `alloca` whose pointer does **not escape**,
+* `secret` values and `#[constant_time]` functions remain untouched
   (SPEC §9.2),
-* `store` und `alloca` bleiben stehen; erst der bestehende Durchgang fuer tote
-  Speicherungen entfernt sie. Der Durchgang ist damit debugerhaltend.
+* the `store` and the `alloca` stay; only the existing pass for dead
+  stores removes them. The pass is therefore debug-preserving.
 
-Acht Modultests in `threading.rs` decken das ab, darunter „Aufruf zwischen
-`store` und Sprung blockiert", „fremder `store` dazwischen blockiert",
-„Zelle, deren Zeiger entkommt", „`constant_time`", „geheimer Wert" und
-„zweiter Lauf aendert nichts mehr" (Fixpunkt).
+Eight module tests in `threading.rs` cover that, among them „a call between
+`store` and jump blocks it", „a foreign `store` in between blocks it",
+„a cell whose pointer escapes", „`constant_time`", „a secret value" and
+„a second run changes nothing more" (fixpoint).
 
-**Wirkung im Binary:** die Muster „setcc-Kette" fielen von 164.130.198 Ir auf
-847.126 Ir.
+**Effect in the binary:** the patterns „setcc chain" fell from 164.130.198
+Ir to 847.126 Ir.
 
-## 4. H2 — der `switch`-Wert kam ueber den Rahmen
+## 4. H2 — the `switch` value came via the frame
 
-**Beobachtung.** Der Zustandsversand des Tokenizers — einmal je Zeichen,
-5.109.380 Durchlaeufe — sah so aus:
+**Observation.** The state dispatch of the tokenizer — once per character,
+5.109.380 iterations — looked like this:
 
 ```
 mov %r12d,%r9d          ; Zustand aus der Zelle
@@ -202,20 +206,20 @@ mov -0x260(%rbp),%eax   ; und sofort wieder heraus
 cmp $0x48,%eax
 ```
 
-`codegen_switch::emit_switch` konnte den Wert nur aus dem Rahmen lesen; der
-Registerpfad musste ihn deshalb erst dorthin schreiben.
+`codegen_switch::emit_switch` could only read the value from the frame; the
+register path therefore had to write it there first.
 
-**Umsetzung.** `emit_switch` bekommt eine `Wertquelle`: entweder `Rahmen(fr)`
-(Grundpfad) oder `Geladen(f)` — dann laedt der Aufrufer den Wert selbst nach
-`rax`. Dazu entfaellt das `mov eax, eax` vor der Sprungtabelle: auf x86-64
-nullt **jeder** Schreibzugriff auf ein 32-Bit-Register die oberen 32 Bit, und
-jeder Zweig von `load_ext` schreibt `eax`. Der Registerpfad prueft zur
-Sicherheit, dass der Wert nicht selbst in `rax` liegt (`rax` wird nie
-vergeben).
+**Implementation.** `emit_switch` gets a `Wertquelle`: either `Rahmen(fr)`
+(base path) or `Geladen(f)` — in which case the caller loads the value into
+`rax` itself. In addition the `mov eax, eax` in front of the jump table is
+dropped: on x86-64 **every** write to a 32-bit register zeroes the upper 32
+bits, and every branch of `load_ext` writes `eax`. To be safe, the register
+path checks that the value is not itself in `rax` (`rax` is never handed
+out).
 
-## 5. H3 — Blocklayout entlang von Spuren
+## 5. H3 — block layout along traces
 
-**Beobachtung.** 614 Stellen, 28.414.304 Ir (3,66 %), sahen so aus:
+**Observation.** 614 spots, 28.414.304 Ir (3,66 %), looked like this:
 
 ```
 cmp  -0x18(%rbp),%r8
@@ -223,54 +227,57 @@ jae  40dbd4          ; then
 jmp  40dbe0          ; else — haette Fallthrough sein koennen
 ```
 
-Die Bloecke wurden in ihrer FIR-Nummerierung ausgegeben; war weder `then` noch
-`else` zufaellig der naechste Block, kostete jeder bedingte Sprung einen
-zweiten, unbedingten.
+The blocks were emitted in their FIR numbering; if neither `then` nor
+`else` happened to be the next block, every conditional jump cost a
+second, unconditional one.
 
-**Umsetzung.** `emissionsreihenfolge()` legt gierige Spuren: ab `bb0` dem
-bevorzugten Nachfolger folgen, solange der noch frei ist; reisst die Spur ab,
-beim kleinsten noch nicht platzierten Block weitermachen. Bevorzugt wird
-`else` — `emit_block` dreht die Bedingung selbst um, wenn stattdessen `then`
-folgt.
+**Implementation.** `emissionsreihenfolge()` lays out greedy traces:
+starting at `bb0`, follow the preferred successor as long as it is still
+free; when the trace breaks off, continue at the smallest block not yet
+placed. `else` is preferred — `emit_block` inverts the condition itself if
+`then` follows instead.
 
-Das betrifft **ausschliesslich die Ausgabe**. Lebendigkeitsanalyse,
-Intervalle und Registerwahl arbeiten weiter auf der FIR-Reihenfolge; jeder
-Block hat einen expliziten Terminator, und ein Sprung faellt nur weg, wenn
-sein Ziel wirklich unmittelbar folgt. Abschaltbar mit `FIRN_NO_LAYOUT=1`.
+That affects **the output only**. Liveness analysis,
+intervals and register choice still work on the FIR order; every
+block has an explicit terminator, and a jump is only dropped if
+its target really follows immediately. Can be switched off with
+`FIRN_NO_LAYOUT=1`.
 
-**Wirkung:** das Muster fiel von 28.414.304 Ir auf 10.021 Ir; `jmp` insgesamt
-von 46.639.178 auf 18.316.839 Ir.
+**Effect:** the pattern fell from 28.414.304 Ir to 10.021 Ir; `jmp` in
+total from 46.639.178 to 18.316.839 Ir.
 
-## 6. H4 — `void` braucht kein `xor eax, eax`
+## 6. H4 — `void` needs no `xor eax, eax`
 
-Jede Funktion mit Rueckgabetyp `void` setzte vor dem Epilog `rax` auf null.
-System V laesst `rax` in diesem Fall undefiniert, und in FIR liest niemand das
-Ergebnis eines void-Aufrufs (`Op::Call` ohne `dst`). Bei 4.229.623 Aufrufen im
-Messlauf ist das eine Instruktion je Aufruf fuer nichts. In beiden Pfaden
-gestrichen (Grundpfad und Registerpfad).
+Every function with return type `void` set `rax` to zero before the
+epilogue. System V leaves `rax` undefined in this case, and in FIR nobody
+reads the result of a void call (`Op::Call` without `dst`). With 4.229.623
+calls in the measuring run that is one instruction per call for nothing.
+Deleted in both paths (base path and register path).
 
-## 7. H5 — der Deskriptor-Nachpass lernt Nullerweiterung
+## 7. H5 — the descriptor post-pass learns zero extension
 
-Runde 43 hatte diesen Punkt ausdruecklich **zurueckgestellt** (§6): schmale
-Reloads sind nur dann ueberfluessig, wenn das Register „bereits nullerweitert"
-ist, und ohne diese Information waere das Streichen genau die Bauform, die in
-Runde 40 den Miscompile erzeugt hat.
+Round 43 had explicitly **deferred** this item (§6): narrow
+reloads are only superfluous if the register is „already zero-extended",
+and without that information deleting them would be exactly the kind of
+construction that produced the miscompile in round 40.
 
-Die fehlende Information ist eine Eigenschaft von x86-64: **jeder
-Schreibzugriff auf ein 32-Bit-Register nullt die oberen 32 Bit.** Der Nachpass
-fuehrt jetzt `nullab[r] = k` mit („ab Bit k ist `r` garantiert null"):
+The missing information is a property of x86-64: **every
+write to a 32-bit register zeroes the upper 32 bits.** The post-pass
+now carries `nullab[r] = k` („from bit k on, `r` is guaranteed to be
+zero"):
 
 * `movzx r32, byte ptr …` → 8, `movzx r32, word ptr …` → 16,
-* jeder andere Schreibzugriff mit 32-Bit-Ziel → 32,
-* alles uebrige, `call`, `syscall`, `div`, `setcc`, Blockgrenzen → unbekannt.
+* every other write with a 32-bit target → 32,
+* everything else, `call`, `syscall`, `div`, `setcc`, block boundaries →
+  unknown.
 
-Dazu merkt sich der Nachpass die **Breite** jeder Speicherung. Gestrichen wird
-ein Reload nur, wenn Ziel- und Quellregister gleich sind, die gespeicherte
-Breite ausreicht und `nullab` die Erweiterung belegt. `movsx`/`movsxd` bleiben
-aussen vor.
+In addition the post-pass remembers the **width** of every store. A reload
+is deleted only if the target and source registers are the same, the stored
+width suffices and `nullab` establishes the extension. `movsx`/`movsxd`
+stay out of it.
 
-Im heissen Pfad von `dekodiere` verschwinden dadurch zwei von 29
-Instruktionen je Byte:
+In the hot path of `dekodiere` two of 29 instructions per byte disappear
+because of this:
 
 ```
 movzbl (%rcx),%eax
@@ -280,20 +287,20 @@ mov    %rax,-0x660(%rbp)
 mov    -0x660(%rbp),%eax   <- entfaellt (rax ist schon nullerweitert)
 ```
 
-## 8. H6/H7 — die x86-Adressierung endlich ganz benutzen
+## 8. H6/H7 — finally using x86 addressing in full
 
-Runde 43 hatte nur den **konstanten Versatz** in den Speicherzugriff gefaltet
-(`faltbare_versaetze`). Die dynamische Messung zeigte, was daneben liegen
-blieb:
+Round 43 had only folded the **constant offset** into the memory access
+(`faltbare_versaetze`). The dynamic measurement showed what was left over
+next to it:
 
-| Muster                                   |          Ir | Anteil |
+| Pattern                                  |          Ir | Share |
 |------------------------------------------|------------:|-------:|
-| `shl k` + `lea (b,i,1)` + Zugriff        |  28.840.310 |  3,93 % |
-| `lea (b,i,1)` + Zugriff                  |  16.231.553 |  2,21 % |
-| `lea off(b)` + Zugriff                   |  14.432.184 |  1,97 % |
+| `shl k` + `lea (b,i,1)` + access         |  28.840.310 |  3,93 % |
+| `lea (b,i,1)` + access                   |  16.231.553 |  2,21 % |
+| `lea off(b)` + access                    |  14.432.184 |  1,97 % |
 
-Aus `faltbare_versaetze` wurde `faltbare_adressen`, das den vollen
-x86-Operanden `[basis + index*faktor + versatz]` erzeugt. Aus
+`faltbare_versaetze` became `faltbare_adressen`, which produces the full
+x86 operand `[basis + index*faktor + versatz]`. From
 
 ```
 mov  r8, qword ptr [rbp-416]
@@ -302,123 +309,124 @@ lea  r8, [r9+r8]
 mov  r8d, dword ptr [r8]
 ```
 
-wird
+becomes
 
 ```
 mov  r8, qword ptr [rbp-416]
 mov  r8d, dword ptr [r9+r8*4]
 ```
 
-**H7** nimmt zusaetzlich die Faelle dazu, in denen Basis oder Index **im Rahmen**
-liegen. Dann bleibt von der Adressrechnung genau das Fuellen ihres ohnehin
-vorhandenen Zielregisters uebrig (`vorlader`) — eine Instruktion statt zwei
-bis drei.
+**H7** additionally takes in the cases in which the base or the index lies
+**in the frame**. Then all that remains of the address computation is the
+filling of its target register, which is there anyway (`vorlader`) — one
+instruction instead of two or three.
 
-**Die Bedingungen sind eng gehalten**, weil jede Lockerung die Lebensspanne
-der Basis verlaengert:
+**The conditions are kept narrow**, because every relaxation lengthens the
+lifetime of the base:
 
-* adressbildend ist `ptradd` oder ein **64-Bit**-`add` — bei 32 Bit wuerde die
-  Adressierung den Ueberlauf nicht abschneiden, den FIR verlangt;
-* das Ergebnis wird **genau einmal** gelesen, und dieser Leser ist der
-  **unmittelbar folgende** `load`/`store` desselben Blocks;
-* Skalierung ist ein 64-Bit-`shl` mit 0..3 bzw. `mul` mit 1/2/4/8, steht
-  **unmittelbar davor** und wird ebenfalls genau einmal gelesen;
-* Basis, Index und Skalierung sind weder Rahmenadresse noch befoerderte Zelle
-  noch Zellen-Alias noch `secret` (SPEC §9.2);
-* wird ein Register vorgeladen, darf es nicht zugleich Index oder gespeicherter
-  Wert sein — dieser Fall wird ausdruecklich geprueft, weil der Verteiler
-  Register von Werten mit beruehrenden Intervallen wiederverwenden darf.
+* address-forming is `ptradd` or a **64-bit** `add` — with 32 bits the
+  addressing would not truncate the overflow that FIR demands;
+* the result is read **exactly once**, and this reader is the
+  **immediately following** `load`/`store` of the same block;
+* scaling is a 64-bit `shl` with 0..3 resp. `mul` with 1/2/4/8, stands
+  **immediately before it** and is likewise read exactly once;
+* base, index and scaling are neither a frame address nor a promoted cell
+  nor a cell alias nor `secret` (SPEC §9.2);
+* if a register is preloaded, it must not at the same time be the index or
+  the stored value — this case is checked explicitly, because the allocator
+  may reuse registers of values with touching intervals.
 
-Damit verschiebt sich der Lesezeitpunkt von Basis und Index um genau die ein
-bis zwei Instruktionen, die dabei **ganz entfallen**; dazwischen liegt danach
-nichts mehr, insbesondere kein `call`. Abschaltbar mit `FIRN_NO_FALTUNG=1`.
+With that, the point in time at which the base and the index are read
+shifts by exactly the one or two instructions that are **dropped
+entirely**; afterwards nothing lies in between any more, in particular no
+`call`. Can be switched off with `FIRN_NO_FALTUNG=1`.
 
-**Neuer Test `tests/332_adressierung.fi`** (in drei Baustufen, Rueckgabe 77),
-gebaut gegen genau die Warnung aus der Rundenvorgabe:
+**New test `tests/332_adressierung.fi`** (in three build stages, return
+77), built against exactly the warning from the round's brief:
 
-* jede Skalierung 1/2/4/8 (u8/u16/u32/u64), lesend und schreibend,
-* dieselbe Adresse zweimal gelesen (darf nicht gefaltet werden),
-* **Aufrufe mitten in der Kette** Basis → Index → Zugriff, mit einer Funktion,
-  die alle sechs Argumentregister beschreibt,
-* ein Index, der selbst aus einem Aufruf kommt,
-* eine Kette, in der das Ergebnis eines Zugriffs sofort wieder Index ist
-  (Ziel- und Indexregister kollidieren).
+* every scaling 1/2/4/8 (u8/u16/u32/u64), reading and writing,
+* the same address read twice (must not be folded),
+* **calls in the middle of the chain** base → index → access, with a
+  function that writes all six argument registers,
+* an index that itself comes from a call,
+* a chain in which the result of an access is immediately the index again
+  (target and index registers collide).
 
-Im Tokenizer entstehen dadurch **419 skalierte Speicheroperanden**; `lea`
-faellt von 78.473.907 auf 55.831.640 Ir (−28,9 %) und die Zahl der statischen
-`lea`-Stellen von 2.697 auf 1.010.
+In the tokenizer this produces **419 scaled memory operands**; `lea`
+falls from 78.473.907 to 55.831.640 Ir (−28,9 %) and the number of static
+`lea` spots from 2.697 to 1.010.
 
 ---
 
-## 9. Verworfen — mit Zahlen
+## 9. Rejected — with numbers
 
-### 9.1 Groessere Inlining-Grenzen: **widerlegt**
+### 9.1 Larger inlining limits: **refuted**
 
-`tok_attr_value_push` kostet 37 Instruktionen je Aufruf, davon 13 reine
-Rahmenverwaltung, und wird 2.500.787 mal gerufen. Naheliegende Hypothese: die
-Grenzen des Inliners (`MAX_CALLEE_INSTS = 40`, `MAX_CALLEE_BLOCKS = 8`) sperren
-genau die kleinen heissen Funktionen aus, weil sie durch vorheriges Inlining
-selbst gewachsen sind (`cp_push` wandert in `tok_attr_value_push`, das dadurch
-ueber die Grenze rutscht).
+`tok_attr_value_push` costs 37 instructions per call, of which 13 are pure
+frame management, and it is called 2.500.787 times. The obvious hypothesis:
+the limits of the inliner (`MAX_CALLEE_INSTS = 40`, `MAX_CALLEE_BLOCKS = 8`)
+lock out exactly the small hot functions, because they have themselves
+grown through earlier inlining (`cp_push` moves into
+`tok_attr_value_push`, which thereby slips over the limit).
 
-Gemessen auf dem Stand nach H3:
+Measured on the state after H3:
 
-| Grenzen | realweb Ir | Binary | Uebersetzung |
+| Limits | realweb Ir | binary | compilation |
 |---|---:|---:|---:|
-| 40 / 8 (Basis) | 747.247.528 | 206.904 B | 1,4 s |
+| 40 / 8 (base) | 747.247.528 | 206.904 B | 1,4 s |
 | 80 / 14 | 730.776.445 (−2,20 %) | 397.584 B (**+92 %**) | 6,6 s |
 | 120 / 20 | **1.327.230.572 (+77,7 %)** | 531.680 B | 11,9 s |
 
-Bei 120/20 **explodiert** die Instruktionszahl: was in `tokenizer__tokenize`
-eingebettet wird, treibt den Registerdruck der ohnehin groessten Funktion so
-weit hoch, dass alles in den Rahmen ausgelagert wird. Und 80/14 kauft 2,2 %
-mit fast doppelter Binaergroesse und der fuenffachen Uebersetzungszeit.
-**Verworfen; die Grenzen bleiben bei 40/8.** Das ist zugleich der Beleg
-dafuer, dass mehr Inlining ohne besseren Verteiler nichts bringt.
+At 120/20 the instruction count **explodes**: what gets inlined into
+`tokenizer__tokenize` drives the register pressure of the largest function
+anyway so high that everything is spilled into the frame. And 80/14 buys
+2,2 % at almost double the binary size and five times the compilation time.
+**Rejected; the limits stay at 40/8.** That is at the same time the
+evidence that more inlining brings nothing without a better allocator.
 
-### 9.2 `leave` statt `mov rsp, rbp` + `pop rbp`: **bewusst nicht gemacht**
+### 9.2 `leave` instead of `mov rsp, rbp` + `pop rbp`: **deliberately not done**
 
-`leave` tut genau dasselbe wie die beiden Instruktionen und wuerde die
-gemessene Zahl um 4.229.623 Ir (0,6 %) druecken — ohne dass das Programm
-weniger arbeitet. Die Instruktionszahl ist hier das Messmittel fuer Arbeit,
-nicht das Ziel. Ein solcher Tausch wuerde die Metrik schoener machen und die
-Aussage kaputt. Ausdruecklich unterlassen und hier vermerkt, damit es niemand
-spaeter „vergisst" zu erwaehnen.
+`leave` does exactly the same as the two instructions and would push the
+measured number down by 4.229.623 Ir (0,6 %) — without the program doing
+less work. The instruction count is the measuring instrument for work here,
+not the goal. Such a swap would make the metric prettier and the
+statement broken. Explicitly refrained from and noted here, so that nobody
+„forgets" to mention it later.
 
-### 9.3 Nicht angefasst: `sink_fehler_bei`
+### 9.3 Not touched: `sink_fehler_bei`
 
-41.444.572 Ir (5,93 %) bei nur 1.503 Aufrufen — die Funktion rechnet je
-Parse-Fehler Zeile und Spalte aus, indem sie den Eingabestrom nachscannt.
-`html5ever` tut das im Messlauf **nicht**. Das ist eine echte Asymmetrie des
-Vergleichs zu Firns Ungunsten, aber sie gehoert dem Tokenizer, nicht dem
-Compiler; sie hier wegzuoptimieren hiesse, den Messlauf zu aendern statt den
-Uebersetzer. **Benannt, nicht angefasst.**
+41.444.572 Ir (5,93 %) at only 1.503 calls — the function computes the line
+and column per parse error by rescanning the input stream.
+`html5ever` does **not** do that in the measuring run. That is a real
+asymmetry of the comparison to Firn's disadvantage, but it belongs to the
+tokenizer, not to the compiler; optimizing it away here would mean changing
+the measuring run instead of the compiler. **Named, not touched.**
 
 ---
 
 ## 10. firnc1
 
-`lib/firnc1` hat **keinen Optimierer und keine Registerzuteilung** — jeder
-Wert liegt dort im Rahmen (so steht es im Kopf von
-`tools/self_compare.sh`). Alle sieben Aenderungen dieser Runde liegen
-genau in diesen beiden Teilen und haben in firnc1 kein Gegenstueck; es gibt
-dort nichts zu spiegeln. Die geforderte Gleichheit wird deshalb dort
-nachgewiesen, wo sie in diesem Aufbau nachweisbar ist:
+`lib/firnc1` has **no optimizer and no register allocation** — every
+value lies in the frame there (that is what it says in the header of
+`tools/self_compare.sh`). All seven changes of this round lie
+exactly in those two parts and have no counterpart in firnc1; there is
+nothing to mirror there. The demanded equality is therefore demonstrated
+where it can be demonstrated in this setup:
 
-* `tools/self_compare.sh` — **214 gleiches Verhalten, 0 abweichend,
-  0 fehlerhaft**: jedes Testprogramm, von firnc1 uebersetzt, liefert denselben
-  Rueckgabewert und dieselbe Ausgabe wie von firnc0 uebersetzt.
-* `tools/fixpoint.sh` — Stufe 2 == Stufe 3, **zeichengleich, 427.401 Zeilen**:
-  der von firnc0 uebersetzte Compiler erzeugt denselben Assembler wie der von
-  sich selbst uebersetzte.
-* `tools/fir_compare.sh` — 42.472 FIR-Instruktionen gleich (1 bekannte,
-  benannte Abweichung wie vor der Runde).
+* `tools/self_compare.sh` — **214 identical behavior, 0 differing,
+  0 failing**: every test program, compiled by firnc1, yields the same
+  return value and the same output as when compiled by firnc0.
+* `tools/fixpoint.sh` — stage 2 == stage 3, **character-identical, 427.401
+  lines**: the compiler compiled by firnc0 produces the same assembly as
+  the one compiled by itself.
+* `tools/fir_compare.sh` — 42.472 FIR instructions identical (1 known,
+  named deviation as before the round).
 
-Neue FIR-Opcodes waren nicht noetig; der Nummernbereich 40–49 bleibt frei.
+New FIR opcodes were not necessary; the number range 40–49 remains free.
 
 ---
 
-## 11. Profil nachher (realweb, 699.459.494 Ir)
+## 11. Profile after (realweb, 699.459.494 Ir)
 
 ```
           SELBST   ANTEIL         INKLUSIV  FUNKTION
@@ -431,40 +439,41 @@ Neue FIR-Opcodes waren nicht noetig; der Nummernbereich 40–49 bleibt frei.
       10.234.104    1,46%       14.808.079  tokens__tok_attr_finish
 ```
 
-| Kennzahl | vorher | nachher |
+| Metric | before | after |
 |---|---:|---:|
-| `tokenize` je Zeichen | 107 Ir | **72,3 Ir** |
-| `dekodiere` je Byte | 39 Ir | **26,0 Ir** |
-| `tok_attr_value_push` je Aufruf | 40 Ir | **37,0 Ir** |
-| Datenbewegungen (`mov`/`movzx`/`movabs`) | 494.930.767 (51,7 %) | 371.999.741 (53,2 %) |
-| Rahmen-Loads | 129.637.675 (13,53 %) | 94.014.270 (13,44 %) |
-| Rahmen-Stores | 126.722.224 (13,23 %) | 80.695.439 (11,54 %) |
+| `tokenize` per character | 107 Ir | **72,3 Ir** |
+| `dekodiere` per byte | 39 Ir | **26,0 Ir** |
+| `tok_attr_value_push` per call | 40 Ir | **37,0 Ir** |
+| data movements (`mov`/`movzx`/`movabs`) | 494.930.767 (51,7 %) | 371.999.741 (53,2 %) |
+| frame loads | 129.637.675 (13,53 %) | 94.014.270 (13,44 %) |
+| frame stores | 126.722.224 (13,23 %) | 80.695.439 (11,54 %) |
 
-Der **Anteil** der Datenbewegungen steigt, obwohl ihre absolute Zahl um
-24,8 % faellt: alles andere ist staerker geschrumpft. Die Rahmen-Stores gehen
-um 36,3 % zurueck, die Rahmen-Loads nur um 27,5 % — genau das Bild, das man
-erwartet, wenn ueberfluessige Zwischenspeicherungen verschwinden, der Grund
-fuer die Auslagerung aber bleibt. Der verbleibende Engpass ist damit
-unveraendert benannt: **zu wenige Register** (§13.2).
+The **share** of data movements rises although their absolute number falls
+by 24,8 %: everything else has shrunk more strongly. The frame stores go
+down by 36,3 %, the frame loads only by 27,5 % — exactly the picture one
+expects when superfluous intermediate stores disappear but the reason
+for the spilling remains. The remaining bottleneck is thereby named
+unchanged: **too few registers** (§13.2).
 
-## 12. Abnahme
+## 12. Acceptance
 
-| Pruefung | Ergebnis | Basis |
+| Check | Result | Base |
 |---|---|---|
-| `bash ./test.sh` | **PASS 754/754** | 751/751 (+3 durch `tests/332_adressierung.fi` in drei Baustufen) |
-| `cargo test --release` (Modultests) | **169/169** | 155 (+8 `threading.rs`, +6 `regalloc.rs`) |
-| `bash tools/self_compare.sh` | **214 gleich, 0 abweichend, 0 fehlerhaft**, CODEGEN FEHLT 0 | 213/0/0 (+1 neue Testdatei) |
-| `bash tools/fixpoint.sh` | **Stufe 2 == Stufe 3, zeichengleich, 427.401 Zeilen** | 427.401 |
-| `bash tools/tokenizer/run.sh` | **6810/6810 = 100,00 %**, mit Fehlern **6809/6810** | unveraendert |
-| Lexer/Parser/Layout/Sema/FIR-Vergleich | unveraendert (je 1 bekannte, benannte Abweichung; Layout 0) | unveraendert |
-| DOM-Dauerlauf, Pakete, atomares Primitiv | bestanden | unveraendert |
+| `bash ./test.sh` | **PASS 754/754** | 751/751 (+3 from `tests/332_adressierung.fi` in three build stages) |
+| `cargo test --release` (module tests) | **169/169** | 155 (+8 `threading.rs`, +6 `regalloc.rs`) |
+| `bash tools/self_compare.sh` | **214 identical, 0 differing, 0 failing**, CODEGEN FEHLT 0 | 213/0/0 (+1 new test file) |
+| `bash tools/fixpoint.sh` | **stage 2 == stage 3, character-identical, 427.401 lines** | 427.401 |
+| `bash tools/tokenizer/run.sh` | **6810/6810 = 100,00 %**, with errors **6809/6810** | unchanged |
+| lexer/parser/layout/sema/FIR comparison | unchanged (1 known, named deviation each; layout 0) | unchanged |
+| DOM endurance run, packages, atomic primitive | passed | unchanged |
 
-Vor jeder Abnahme wurden `.firnc1 .firnc2 .firnc3` geloescht (Falle (a) der
-Rundenvorgabe). Alle Zwischendateien lagen unter `.r51/` bzw.
-`.tokenizer-work/` im eigenen Worktree — kein `/tmp` (Falle (b)). Wanduhrwerte
-werden nirgends als Beleg angefuehrt (Falle (c)).
+Before every acceptance run, `.firnc1 .firnc2 .firnc3` were deleted (trap
+(a) of the round's brief). All intermediate files lay under `.r51/` resp.
+`.tokenizer-work/` in the own worktree — no `/tmp` (trap (b)). Wall clock
+values are cited as evidence nowhere (trap (c)).
 
-Zustand des Messlaufs am Ende, mit `tools/tokenizer/patterns.py`:
+State of the measuring run at the end, with
+`tools/tokenizer/patterns.py`:
 
 ```
 Rahmenverwaltung (callee-saved sichern/holen)   36.414.390 Ir   5,21%    932 Stellen
@@ -477,38 +486,41 @@ setcc-Kette statt direktem Sprung                  565.336 Ir   0,08%     16 Ste
 jmp direkt hinter jcc (Blocklayout)                 10.021 Ir   0,00%     39 Stellen
 ```
 
-## 13. Offene Punkte
+## 13. Open points
 
-1. **Store/Reload an Blockgrenzen: 28.215.979 Ir (4,03 %), 118 Stellen.** Das
-   ist der Rest des Phi-in-Speicher-Problems: ein Zusammenfluss, an dem jeder
-   Vorgaenger in eine Zelle schreibt und der Nachfolger sie sofort liest. H1
-   loest das fuer `bool` (weil dort der Leser ein `brcond` ist); fuer Werte
-   geht es nur ueber echte Phi-Knoten in FIR, Tail-Duplizierung des
-   Zusammenflusses oder eine Zellen-Befoerderung, die genug Register haette.
-2. **Registerdruck ist der Engpass.** In `tokenize` (Rahmen 43 KiB) und
-   `dekodiere` werden Schleifeninvarianten wie `off`, `len`, `basis` bei
-   jedem Durchlauf aus dem Rahmen geholt. Ursache ist der Linear Scan ohne
-   Intervall-Splitting: wer einen `call` kreuzt, bekommt nur eines der fuenf
-   callee-saved Register — auch dann, wenn der Aufruf auf einem **kalten
-   Zweig** liegt und der Wert dort gar nicht lebt. `crosses_call` wird heute
-   als „irgendein Aufruf liegt zwischen `start` und `end`" bestimmt; eine
-   Berechnung aus der echten Lebendigkeit (`live_out` an der Aufrufstelle,
-   ohne das Ergebnis des Aufrufs, plus seine Argumente) waere praeziser und
-   ohne Splitting zu haben. Das ist der naechstgroesste Hebel.
-3. **Rahmenverwaltung: 66.021.751 Ir (9,44 %)** bei 4.229.623 Aufrufen —
-   Prolog, Epilog, Sichern und Zurueckholen der callee-saved Register
-   (36.414.390 Ir davon). `tok_attr_value_push` sichert vier Register, obwohl
-   eines davon nur auf dem kalten Zweig gebraucht wird; „shrink wrapping"
-   waere der Fachbegriff. Mehr Inlining ist es ausdruecklich **nicht** (§9.1).
-4. **Adressfaltung: 16.188.606 Ir (2,3 %) blieben stehen**, weil das Ergebnis
-   der Adressrechnung mehr als einmal gelesen wird — typisch mehrere Felder
-   desselben Structs. Das zu falten hiesse, die Lebensspanne der Basis ueber
-   mehrere Instruktionen zu verlaengern; dafuer muesste der Verteiler die
-   Verlaengerung **vor** der Zuteilung kennen. Unveraendert offen seit
-   Runde 43.
-5. **`sink_fehler_bei`** (5,93 %) rechnet Zeile/Spalte je Parse-Fehler durch
-   Nachscannen des Stroms; ein mitlaufender Zaehler waere billiger. Gehoert
-   dem Tokenizer, nicht dem Compiler (§9.3).
-6. **Der Grundpfad** (`codegen_x86.rs`) hat kein Blocklayout und keine
-   Adressfaltung. Fuer `--no-opt` ist das richtig so; falls `dev-fast`
-   einmal auf ihn zurueckfaellt, kostet es unnoetig.
+1. **Store/reload at block boundaries: 28.215.979 Ir (4,03 %), 118 spots.**
+   That is the remainder of the phi-in-memory problem: a confluence at
+   which every predecessor writes into a cell and the successor reads it
+   immediately. H1 solves that for `bool` (because there the reader is a
+   `brcond`); for values it only works via real phi nodes in FIR, tail
+   duplication of the confluence or a cell promotion that would have enough
+   registers.
+2. **Register pressure is the bottleneck.** In `tokenize` (frame 43 KiB)
+   and `dekodiere`, loop invariants such as `off`, `len`, `basis` are
+   fetched from the frame on every iteration. The cause is the linear scan
+   without interval splitting: whoever crosses a `call` gets only one of
+   the five callee-saved registers — even when the call lies on a **cold
+   branch** and the value is not live there at all. `crosses_call` is
+   determined today as „some call lies between `start` and `end`"; a
+   computation from the real liveness (`live_out` at the call site,
+   without the result of the call, plus its arguments) would be more
+   precise and can be had without splitting. That is the next biggest
+   lever.
+3. **Frame management: 66.021.751 Ir (9,44 %)** at 4.229.623 calls —
+   prologue, epilogue, saving and restoring the callee-saved registers
+   (36.414.390 Ir of that). `tok_attr_value_push` saves four registers
+   although one of them is only needed on the cold branch; „shrink
+   wrapping" would be the technical term. It is explicitly **not** more
+   inlining (§9.1).
+4. **Address folding: 16.188.606 Ir (2,3 %) were left standing**, because
+   the result of the address computation is read more than once — typically
+   several fields of the same struct. To fold that would mean lengthening
+   the lifetime of the base over several instructions; for that the
+   allocator would have to know about the lengthening **before**
+   allocation. Unchanged open since round 43.
+5. **`sink_fehler_bei`** (5,93 %) computes the line/column per parse error
+   by rescanning the stream; a running counter would be cheaper. Belongs to
+   the tokenizer, not to the compiler (§9.3).
+6. **The base path** (`codegen_x86.rs`) has no block layout and no
+   address folding. For `--no-opt` that is right; if `dev-fast`
+   should ever fall back to it, it costs unnecessarily.
