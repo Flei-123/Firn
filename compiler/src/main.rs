@@ -23,6 +23,7 @@ mod gc;
 mod gc_lower;
 mod iface;
 mod impls;
+mod kern;
 mod inline;
 mod layout;
 mod lexer;
@@ -37,6 +38,7 @@ mod nogc;
 mod opt;
 mod paket;
 mod paketwelt;
+mod profil;
 mod parser;
 mod regalloc;
 mod sema;
@@ -80,6 +82,9 @@ struct Options {
     stats: bool,
     /// Baustufe und einzeln abgeschaltete Durchgaenge (DESIGNZIELE.md §5)
     optcfg: opt::OptConfig,
+    /// `-c` / `--objekt`: nur assemblieren, NICHT linken (Runde 52).
+    /// Im Profil `kernel` ohnehin immer an (SPEC §2: Ziel ist ein ELF-Objekt).
+    nur_objekt: bool,
 }
 
 fn usage() -> String {
@@ -104,6 +109,8 @@ fn usage() -> String {
          --emit=layout      Speicherlayout und Aufrufkonvention (kanonisch)\n  \
          --emit=typen       AST mit dem Typ an jedem Ausdruck (kanonisch)\n  \
          --emit=ast         AST als Debug-Text (Fehlersuche)\n  \
+         -c, --objekt       nur assemblieren: ELF-Objektdatei, kein ld\n  \
+         --profile=<name>   kernel | app (SPEC 2), erzwingt das Profil\n  \
          --no-opt           Optimierer abschalten (= --opt-level=dev)\n  \
          --opt-level=<stufe> dev | dev-fast | release-safe | release-fast\n  \
                               ('dev-fast' = nur debugerhaltende Durchgaenge)\n  \
@@ -133,6 +140,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut keep_asm = false;
     let mut stats = false;
     let mut optcfg = opt::OptConfig::default();
+    let mut nur_objekt = false;
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -196,6 +204,12 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                     }
                 }
             }
+            "-c" | "--objekt" => nur_objekt = true,
+            _ if a.starts_with("--profile=") => {
+                if let Err(e) = profil::flagge_setzen(&a["--profile=".len()..]) {
+                    return Err(e);
+                }
+            }
             "--keep-asm" => keep_asm = true,
             "--stats" => stats = true,
             "-o" => {
@@ -256,7 +270,18 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     if input.is_none() && paket.is_none() && paket_info.is_none() {
         return Err(format!("keine Eingabedatei angegeben (.{})", config::FILE_EXT));
     }
-    Ok(Options { input, output, paket, paket_info, emit, optimize, keep_asm, stats, optcfg })
+    Ok(Options {
+        input,
+        output,
+        paket,
+        paket_info,
+        emit,
+        optimize,
+        keep_asm,
+        stats,
+        optcfg,
+        nur_objekt,
+    })
 }
 
 fn main() {
@@ -522,6 +547,15 @@ fn run(opts: &Options) -> i32 {
 
     if opts.stats {
         eprintln!(
+            "profil:     {}{}",
+            profil::name(),
+            if kern::block_anzahl() > 0 {
+                format!("  ({} asm-bloecke)", kern::block_anzahl())
+            } else {
+                String::new()
+            }
+        );
+        eprintln!(
             "fir (roh):  {} Funktionen, {} Bloecke, {} Instruktionen",
             module.funcs.len(),
             module.block_count(),
@@ -581,13 +615,33 @@ fn run(opts: &Options) -> i32 {
         return 0;
     }
 
-    // --- Assemblieren und Linken ---
+    // --- Assemblieren, und nur im App-Profil auch linken ---
+    //
+    // RUNDE 52 (SPEC §2): das Kernel-Profil erzeugt eine freistehende
+    // ELF-OBJEKTDATEI. Kein `ld`, kein `_start`, kein libc-Kontakt — gelinkt
+    // wird spaeter vom Kernel-Bau mit dessen eigenem Linkerskript.
+    let objekt = opts.nur_objekt || profil::ist_kernel();
     let asm_path = out.with_extension("s");
-    let obj_path = out.with_extension("o");
     if let Err(e) = std::fs::write(&asm_path, asm.as_bytes()) {
         eprintln!("error: kann '{}' nicht schreiben: {}", asm_path.display(), e);
         return 2;
     }
+    if objekt {
+        // Ohne `-o` heisst das Ergebnis `<eingabe>.o`; mit `-o` genau so, wie
+        // es dasteht (dann darf der Name auch ohne Endung bleiben).
+        let obj_path = match &opts.output {
+            Some(p) => p.clone(),
+            None => out.with_extension("o"),
+        };
+        if let Err(code) = assemble(&asm_path, &obj_path) {
+            return code;
+        }
+        if !opts.keep_asm {
+            let _ = std::fs::remove_file(&asm_path);
+        }
+        return 0;
+    }
+    let obj_path = out.with_extension("o");
     if let Err(code) = assemble_and_link(&asm_path, &obj_path, &out) {
         return code;
     }
@@ -618,6 +672,22 @@ fn default_output(input: &Path) -> PathBuf {
         p = PathBuf::from("a.out");
     }
     p
+}
+
+/// Nur assemblieren (`as --64 -o x.o x.s`) — die freistehende Ausgabe.
+fn assemble(asm: &Path, obj: &Path) -> Result<(), i32> {
+    let st = Command::new("as").arg("--64").arg("-o").arg(obj).arg(asm).status();
+    match st {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => {
+            eprintln!("error: 'as' schlug fehl ({})", s);
+            Err(3)
+        }
+        Err(e) => {
+            eprintln!("error: 'as' nicht ausfuehrbar: {} (binutils installiert?)", e);
+            Err(3)
+        }
+    }
 }
 
 fn assemble_and_link(asm: &Path, obj: &Path, out: &Path) -> Result<(), i32> {

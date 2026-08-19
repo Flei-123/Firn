@@ -1436,6 +1436,11 @@ fn supported(f: &Func) -> bool {
 
 /// Warum faellt `f` auf den Grundpfad zurueck? `None` = Registerzuteilung moeglich.
 fn unsupported_grund(f: &Func) -> Option<String> {
+    // RUNDE 52: `#[interrupt]` hat eine eigene Aufrufkonvention (alle Register
+    // retten, `iretq`). Sie steht im Grundpfad von `codegen_x86.rs`.
+    if f.interrupt {
+        return Some("#[interrupt]".into());
+    }
     if debug_lines_active(f) {
         return Some("Debugzeilen aktiv".into());
     }
@@ -1464,6 +1469,17 @@ fn unsupported_grund(f: &Func) -> Option<String> {
                     if args.is_empty() || args.len() > 7 {
                         return Some(format!("syscall mit {} Argumenten", args.len()));
                     }
+                }
+                // RUNDE 52: Inline-Assembler und MMIO gehen ueber den
+                // Grundpfad. Beides bindet feste Register und ist `volatile`;
+                // die Zuteilung haette dafuer eine eigene Sonderregel
+                // gebraucht, und eine Sonderregel im Zuteiler ist genau die
+                // Sorte Code, die den Fehler aus Runde 40 erzeugt hat.
+                // Kernel-Code laeuft damit ohne Registerzuteilung — langsamer,
+                // aber nachweislich richtig. Ehrlich benannt in docs/RUNDE52.md.
+                Op::Asm { .. } => return Some("Inline-Assembler".into()),
+                Op::MmioLoad { .. } | Op::MmioStore { .. } => {
+                    return Some("MMIO-Zugriff".into())
                 }
                 _ => {}
             }
@@ -2187,6 +2203,14 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
             e.line(&format!("mov rcx, {}", size));
             e.line("cld");
             e.line("rep movsb");
+        }
+        // RUNDE 52: unerreichbar — `unsupported_grund` schickt jede Funktion
+        // mit Inline-Assembler oder MMIO in den Grundpfad. Als Fehler statt
+        // als stiller Zweig, damit ein spaeteres Lockern auffliegt.
+        Op::Asm { .. } | Op::MmioLoad { .. } | Op::MmioStore { .. } => {
+            return Err(
+                "interner Fehler: Inline-Assembler/MMIO im registerzuteilenden Pfad".to_string(),
+            )
         }
     }
     Ok(())
