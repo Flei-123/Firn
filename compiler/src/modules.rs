@@ -153,7 +153,7 @@ pub fn resolve(root: &Path, world: &World) -> Result<Vec<SourceFile>, Error> {
         } else {
             world.package_of(&abs_file)
         };
-        // NAMENSKONFLIKT: two different files with the same module label
+        // LABEL CONFLICT: two different files with the same module label
         // would fall onto the same internal renaming `module__label` and
         // cover each other silently. Checked with a manifest only — without
         // a manifest everything stays as before.
@@ -208,7 +208,7 @@ pub fn resolve(root: &Path, world: &World) -> Result<Vec<SourceFile>, Error> {
                     }
                 }
             }
-            // SICHTBARKEIT: should the hit lead into ANOTHER package, it must be
+            // VISIBILITY: should the hit lead into ANOTHER package, it must be
             // a registered dependency and the module must stand at that package's
             // `public` list.
             if !world.is_empty() {
