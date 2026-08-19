@@ -1,44 +1,44 @@
-//! **Profile `kernel` und `app` (SPEC.md §2) — Runde 52.**
+//! **Profiles `kernel` and `app` (SPEC.md §2) — round 52.**
 //!
-//! Bis Runde 51 war `profile` eine Deklaration, die geparst und auf ihren
-//! Namen geprueft wurde und **sonst nichts tat** (SPEC §14, Punkt 6). Diese
-//! Datei macht sie wahr.
+//! Up to round 51 `profile` was a declaration that got parsed, checked for
+//! its label and did **nothing else** (SPEC §14, point 6). This file makes
+//! it come true.
 //!
-//! ## Woher das Profil kommt
+//! ## Where the profile comes from
 //!
-//! 1. `--profile=kernel` bzw. `--profile=app` auf der Kommandozeile —
-//!    erzwingt das Profil fuer die GANZE Uebersetzungseinheit (SPEC §2).
-//! 2. sonst `profile kernel` / `profile app` in der ersten Zeile der
-//!    Wurzeldatei.
-//! 3. sonst `app`.
+//! 1. `--profile=kernel` or `--profile=app` on the command line —
+//!    forces the profile for the WHOLE compilation unit (SPEC §2).
+//! 2. otherwise `profile kernel` / `profile app` on the first line of the
+//!    root file.
+//! 3. otherwise `app`.
 //!
-//! ## Was `kernel` verbietet — und woran es der Compiler merkt
+//! ## What `kernel` forbids — and how the compiler notices
 //!
-//! | SPEC §2 sagt | hier geprueft |
+//! | SPEC §2 says | checked here |
 //! |---|---|
-//! | kein globaler Allokator, keine Laufzeit | `import std.*` abgelehnt |
-//! | keine `Gc[T]` (Tracing-Sammler) | `gc class` abgelehnt |
-//! | keine Abwicklung / `throw` | `#[unwinds]` abgelehnt |
-//! | keine versteckte Allokation | ergibt sich aus beidem: die einzige vom
-//! |   | Compiler selbst eingesetzte Allokation ist die des Sammlers |
-//! | Gleitkomma nur mit `#[allow_fp]` | `f64` und Gleitkommaliterale |
-//! | freistehend | `syscall` abgelehnt, kein `_start`, ELF-Objekt |
+//! | no global allocator, no runtime | `import std.*` rejected |
+//! | no `Gc[T]` (tracing collector) | `gc class` rejected |
+//! | no unwinding / `throw` | `#[unwinds]` rejected |
+//! | no hidden allocation | follows from both: the only allocation the
+//! |   | compiler itself puts there is that of the collector |
+//! | floating point only with `#[allow_fp]` | `f64` and float literals |
+//! | freestanding | `syscall` rejected, no `_start`, ELF object |
 //!
-//! `syscall` steht nicht in der Tabelle von SPEC §2, gehoert aber zwingend
-//! dazu: unter einem freistehenden Kernel liegt kein Betriebssystem, das
-//! einen Systemaufruf entgegennehmen koennte. Genau diese eine Regel macht
-//! die gesamte Standardbibliothek im Kernel-Profil unbenutzbar — jede
-//! Allokation dort geht ueber `mmap`, jede Ausgabe ueber `write`. Sie ist
-//! damit die schaerfste der sechs.
+//! `syscall` does not appear at the table of SPEC §2, yet belongs there
+//! inevitably: below a freestanding kernel there is no operating system
+//! that could accept a system call. That single rule renders the whole
+//! standard library unusable under the kernel profile — every allocation
+//! there goes through `mmap`, every output through `write`. It is thereby
+//! the sharpest of the six.
 //!
-//! ## Wo die Pruefungen haengen
+//! ## Where the checks hang
 //!
-//! * `modules.rs::build_program` — `import`-Regel (nur dort sind die
-//!   Einbindungen JEDER Datei mit ihrer Position bekannt),
-//! * `sema.rs::check_profile` — alles Uebrige,
-//! * `core.rs` — Inline-Assembler und `#[interrupt]`,
-//! * `codegen_x86.rs` — kein `_start`, kein Laufzeitvorspann,
-//! * `main.rs` — ELF-Objekt statt ausfuehrbarer Datei.
+//! * `modules.rs::build_program` — the `import` rule (only there are the
+//!   inclusions of EVERY file known together with their position),
+//! * `sema.rs::check_profile` — all the rest,
+//! * `core.rs` — inline assembler and `#[interrupt]`,
+//! * `codegen_x86.rs` — no `_start`, no runtime prologue,
+//! * `main.rs` — ELF object rather than executable file.
 
 use std::cell::Cell;
 
@@ -52,13 +52,13 @@ pub enum Profile {
 }
 
 thread_local! {
-    /// Was `--profile=` gesagt hat (`None` = nichts gesagt).
+    /// What `--profile=` said (`None` = nothing said).
     static FLAG: Cell<Option<Profile>> = const { Cell::new(None) };
-    /// Das aufgeloeste Profil dieser Uebersetzungseinheit.
+    /// The resolved profile of this compilation unit.
     static ACTIVE: Cell<Profile> = const { Cell::new(Profile::App) };
 }
 
-/// `--profile=<name>` auswerten. `Err` = unbekannter Name.
+/// Evaluate the `--profile=` flag. `Err` = unknown label.
 pub fn flag_set(name: &str) -> Result<(), String> {
     let p = match name {
         "kernel" => Profile::Kernel,
@@ -75,7 +75,7 @@ pub fn flag_set(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Profil aus der Deklaration festlegen; die Kommandozeile gewinnt.
+/// Fix the profile from the declaration; the command line wins.
 pub fn define(prog: &Program, _unused: Option<()>) {
     if let Some(p) = FLAG.with(|f| f.get()) {
         ACTIVE.with(|a| a.set(p));
@@ -96,7 +96,7 @@ pub fn is_kernel() -> bool {
     active() == Profile::Kernel
 }
 
-/// Name des aktiven Profils (Fehlermeldungen, `--stats`).
+/// Label of the active profile (error messages, `--stats`).
 pub fn name() -> &'static str {
     match active() {
         Profile::Kernel => "kernel",
@@ -104,8 +104,8 @@ pub fn name() -> &'static str {
     }
 }
 
-/// Alles zuruecksetzen — nur fuer Selbsttests, die mehrere Programme in
-/// EINEM Prozess uebersetzen.
+/// Reset everything — for self tests only, which compile several programs
+/// within ONE process.
 #[cfg(test)]
 pub(crate) fn reset() {
     FLAG.with(|f| f.set(None));
@@ -114,11 +114,11 @@ pub(crate) fn reset() {
 
 // ------------------------------------------------------------- import ---
 
-/// `// HOOK profil` in `modules.rs::build_program`.
+/// `// HOOK profil` within `modules.rs::build_program`.
 ///
-/// Im Kernel-Profil ist die Standardbibliothek gesperrt: sie setzt einen
-/// globalen Allokator (`mmap`) und Linux-Systemaufrufe voraus. Eigene Module
-/// bleiben erlaubt — der Kernel besteht ja aus ihnen.
+/// Under the kernel profile the standard library is barred: it presumes a
+/// global allocator (`mmap`) and Linux system calls. Modules of your own
+/// stay allowed — the kernel is made of them, after all.
 pub fn hook_import(dg: &mut Diags, path: &[String], span: Span) {
     if !is_kernel() {
         return;
@@ -139,8 +139,8 @@ pub fn hook_import(dg: &mut Diags, path: &[String], span: Span) {
 
 // ------------------------------------------------------------- sema ---
 
-/// `// HOOK profil` in `sema::check_profile`. Prueft alles, was am AST der
-/// zusammengefuehrten Uebersetzungseinheit sichtbar ist.
+/// `// HOOK profil` within `sema::check_profile`. Checks everything visible
+/// at the AST of the merged compilation unit.
 pub fn hook_check(dg: &mut Diags, prog: &Program) {
     if let Some((n, span)) = &prog.profile {
         if n != "kernel" && n != "app" {
@@ -155,7 +155,7 @@ pub fn hook_check(dg: &mut Diags, prog: &Program) {
     if !is_kernel() {
         return;
     }
-    // 1. Tracing-Sammler
+    // 1. tracing collector
     if crate::gc::has_classes() {
         let span = prog
             .profile
@@ -170,7 +170,7 @@ pub fn hook_check(dg: &mut Diags, prog: &Program) {
              a global heap, which a freestanding kernel does not have",
         );
     }
-    // 2. Funktionen: Abwicklung, Gleitkomma, Systemaufrufe
+    // 2. functions: unwinding, floating point, system calls
     for f in &prog.funcs {
         if f.attrs.iter().any(|a| a.name == "unwinds") {
             dg.error_note(
@@ -193,7 +193,7 @@ pub fn hook_check(dg: &mut Diags, prog: &Program) {
         }
         w.block(&f.body);
     }
-    // 3. Konstanten und Strukturen
+    // 3. constants and structures
     for c in &prog.consts {
         let mut w = Guard { dg, fp_allowed: false, func: c.name.clone() };
         w.ty(&c.ty);
@@ -208,21 +208,21 @@ pub fn hook_check(dg: &mut Diags, prog: &Program) {
     }
 }
 
-/// Inline-Assembler und MMIO gibt es in BEIDEN Profilen.
+/// Inline assembler and MMIO exist under BOTH profiles.
 ///
-/// Das ist eine bewusste Entscheidung und keine Nachlaessigkeit: beides ist
-/// eine Fluchtluke zur Maschine, und die braucht auch eine Anwendung
-/// gelegentlich (`rdtsc`, `cpuid`, ein per `/dev/mem` eingeblendetes Geraet).
-/// Der Preis — der Code ist an x86-64 genagelt — steht im Quelltext, wo ihn
-/// jeder sieht. Der Gewinn ist Nachweisbarkeit: nur so lassen sich die
-/// volatile-Zusagen in einem Programm pruefen, das WIRKLICH LAEUFT
-/// (`tests/85x_*.fi`), statt nur im erzeugten Assemblertext.
+/// That is a deliberate decision and no sloppiness: both are escape
+/// hatches to the machine, and even applications need them now and then
+/// (`rdtsc`, `cpuid`, a device mapped through `/dev/mem`). The price — the
+/// code is nailed to x86-64 — stands within the source text, where anybody
+/// sees it. The gain is provability: only that way can the volatile
+/// promises be checked inside a program that REALLY RUNS
+/// (`tests/85x_*.fi`), rather than at the generated assembler text alone.
 ///
-/// Nur `#[interrupt]` bleibt dem Kernel-Profil vorbehalten (`core.rs`) — eine
-/// Anwendung hat keine Unterbrechungsvektortabelle.
+/// Only `#[interrupt]` stays reserved for the kernel profile (`core.rs`) —
+/// applications have no interrupt vector table.
 pub fn hook_asm(_ck: &mut crate::sema::Checker, _span: Span) {}
 
-// ------------------------------------------------------------- Waechter ---
+// --------------------------------------------------------------- Guards ---
 
 struct Guard<'a> {
     dg: &'a mut Diags,
@@ -393,8 +393,8 @@ mod tests {
 
     #[test]
     fn app_allowed_inline_assembler() {
-        // Bewusste Entscheidung (siehe hook_asm): nur so ist die
-        // volatile-Zusage in einem laufenden Programm pruefbar.
+        // Deliberate decision (see hook_asm): only that way is the
+        // volatile promise checkable inside a running program.
         let t = error_of("profile app\nfn f() { asm(\"nop\") }\nfn main() -> i32 { return 0 }\n");
         assert!(!t.contains("error"), "{}", t);
     }
