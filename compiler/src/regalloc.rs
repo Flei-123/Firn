@@ -345,7 +345,18 @@ fn immediate_consts(f: &Func) -> HashMap<Val, i64> {
         for i in &b.insts {
             if let (Some(d), Op::Const(c)) = (i.dst, &i.op) {
                 let v = i.ty.truncate(*c);
-                if !f.is_secret(d) && v >= i32::MIN as i128 && v <= i32::MAX as i128 {
+                // Bis 32 Bit darf das Immediate den ganzen vorzeichenlosen
+                // Bereich ausschoepfen: `cmp $0xffffffff,%r9d` rechnet mit
+                // 32-Bit-Operanden exakt richtig. Ohne das faellt genau EOF
+                // (u32 0xFFFFFFFF) aus den Immediates, und jeder EOF-Vergleich
+                // im Tokenizer laedt seine Konstante aus einem Rahmenslot
+                // (Runde 40: 52 solche Stellen allein in `tokenize`).
+                let passt = if i.ty.bits() <= 32 {
+                    v >= i32::MIN as i128 && v <= u32::MAX as i128
+                } else {
+                    v >= i32::MIN as i128 && v <= i32::MAX as i128
+                };
+                if !f.is_secret(d) && passt {
                     cand.insert(d, v as i64);
                 }
             }
