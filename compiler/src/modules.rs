@@ -10,7 +10,7 @@
 //!     Addressed gets the module under the last path part.
 //!   * `export { a, b }` — visibility list per module. Without it everything
 //!     is visible.
-//!   * `module.item` — access to an element of a module that got loaded.
+//!   * `module.item` — access to some element of a loaded module.
 //!
 //! Method: every file gets parsed ON ITS OWN (own `ExprId` range, own file
 //! number at the source map). After that the labels of the non-root modules
