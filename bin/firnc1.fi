@@ -27,6 +27,7 @@ import fehler
 import zeit
 import gc
 import gctext
+import paket
 import parser
 import typen
 import sema
@@ -137,6 +138,61 @@ fn exe_suchpfad(aus: *mut rt.Buf) {
     rt.buf_push_bytes(aus, (&rest[0]) as u64, 7)
 }
 
+// ------------------------------------------------------------- Suchraum
+//
+// Alles, was die Aufloesung EINES `import` braucht. Als Struct, weil
+// `lib/firnc1/codegen.fi` hoechstens sechs Argumente kann und die Liste
+// mit dem Paketsystem (Runde 48) auf acht angewachsen waere.
+struct Suchraum {
+    verz: rt.Buf,        // Verzeichnis der importierenden Datei, mit '/'
+    wurzelverz: rt.Buf,  // Verzeichnis der Wurzeldatei, mit '/'
+    firnlib: rt.Buf,
+    exelib: rt.Buf,
+    cwd: rt.Buf,
+    mein_paket: i64,     // Paket der importierenden Datei, -1 = keins
+}
+
+fn sr_neu() -> Suchraum {
+    return Suchraum{
+        verz: rt.buf_neu(), wurzelverz: rt.buf_neu(),
+        firnlib: rt.buf_neu(), exelib: rt.buf_neu(),
+        cwd: rt.buf_neu(), mein_paket: 0 - 1,
+    }
+}
+
+fn sr_frei(s: *mut Suchraum) {
+    rt.buf_frei(&(*s).verz)
+    rt.buf_frei(&(*s).wurzelverz)
+    rt.buf_frei(&(*s).firnlib)
+    rt.buf_frei(&(*s).exelib)
+    rt.buf_frei(&(*s).cwd)
+}
+
+fn buf_setzen(b: *mut rt.Buf, p: u64, n: usize) {
+    rt.buf_leeren(b)
+    rt.buf_push_bytes(b, p, n)
+}
+
+// Zu welchem Paket gehoert diese Datei? -1 = zu keinem (oder keine Welt).
+fn paket_von_datei(w: *mut paket.Welt, cwd: *mut rt.Buf, p: u64, n: usize) -> i64 {
+    if paket.welt_ist_leer(w) {
+        return 0 - 1
+    }
+    var abs: rt.Buf = rt.buf_neu()
+    paket.absolut(&abs, p, n, rt.buf_ptr(cwd), rt.buf_len(cwd))
+    let r: i64 = paket.welt_paket_von(w, rt.buf_ptr(&abs), rt.buf_len(&abs))
+    rt.buf_frei(&abs)
+    return r
+}
+
+// Ist das Argument genau diese Option?
+fn arg_ist(a: u64, an: usize, lit: u64) -> bool {
+    if an != rt.c_laenge(lit) {
+        return false
+    }
+    return rt.mem_eq(a, lit, an)
+}
+
 // ------------------------------------------------------------ Modulliste
 //
 // Die Warteschlange aller Dateien dieser Uebersetzung. Index 0 ist IMMER die
@@ -198,6 +254,45 @@ fn ml_dazu(m: *mut Modulliste, p: u64, n: usize, alias: u32) {
     rt.buf_push(&(*m).text, 0 as u8)
 }
 
+// NAMENSKONFLIKT (Runde 48): zwei VERSCHIEDENE Dateien mit demselben
+// Modulnamen fielen beim Zusammenfuehren auf dieselbe Umbenennung
+// `modul__name` und wuerden sich still ueberdecken. Gesucht wird ueber die
+// absoluten Pfade, damit zwei Schreibweisen derselben Datei kein Konflikt
+// sind. Rueckgabe: Index des aelteren Eintrags oder -1.
+fn ml_namensdoppel(ml: *mut Modulliste, cwd: *mut rt.Buf, neu: u64, nn: usize) -> i64 {
+    var an: rt.Buf = rt.buf_neu()
+    var bn: rt.Buf = rt.buf_neu()
+    var xa: rt.Buf = rt.buf_neu()
+    var xb: rt.Buf = rt.buf_neu()
+    paket.absolut(&xa, neu, nn, rt.buf_ptr(cwd), rt.buf_len(cwd))
+    paket.modulname(&an, rt.buf_ptr(&xa), rt.buf_len(&xa))
+    var r: i64 = 0 - 1
+    var i: usize = 0
+    while i < ml_anzahl(ml) {
+        paket.absolut(&xb, ml_zeiger(ml, i), ml_laenge(ml, i),
+                      rt.buf_ptr(cwd), rt.buf_len(cwd))
+        var gleiche_datei: bool = false
+        if rt.buf_len(&xa) == rt.buf_len(&xb) {
+            gleiche_datei = rt.mem_eq(rt.buf_ptr(&xa), rt.buf_ptr(&xb), rt.buf_len(&xa))
+        }
+        if !gleiche_datei {
+            paket.modulname(&bn, rt.buf_ptr(&xb), rt.buf_len(&xb))
+            if rt.buf_len(&an) == rt.buf_len(&bn) {
+                if rt.mem_eq(rt.buf_ptr(&an), rt.buf_ptr(&bn), rt.buf_len(&an)) {
+                    r = i as i64
+                    break
+                }
+            }
+        }
+        i = i + 1
+    }
+    rt.buf_frei(&an)
+    rt.buf_frei(&bn)
+    rt.buf_frei(&xa)
+    rt.buf_frei(&xb)
+    return r
+}
+
 // Alle `import`-Zeilen eines Tokenstroms aufloesen und die noch unbekannten
 // Dateien hinten anhaengen. So wird die Liste zur BREITENSUCHE ueber den
 // ganzen Einbindungsgraphen: ein Modul darf ein Modul einbinden, ohne dass
@@ -207,13 +302,32 @@ fn ml_dazu(m: *mut Modulliste, p: u64, n: usize, alias: u32) {
 // fiel lange nicht auf, weil `bin/firnc1.fi` seine Abhaengigkeiten ohnehin
 // alle aufzaehlt — `tests/640_vec_modul.fi` dagegen scheiterte still daran,
 // dass `modules/vec.fi` sein eigenes `rt` nicht bekam.
-fn imports_sammeln(l: *mut lexer.Lexer, verz: *mut rt.Buf, wurzelverz: *mut rt.Buf,
-                   firnlib: *mut rt.Buf, exelib: *mut rt.Buf,
+//
+// SUCHREIHENFOLGE (Runde 48, Zwilling von `modules.rs::resolve`):
+//   1. neben der importierenden Datei
+//   2. neben der Wurzeldatei
+//   3. in den `quelle`-Verzeichnissen des eigenen Pakets
+//   4. in einer `brauche`-Abhaengigkeit des eigenen Pakets, wenn der erste
+//      Pfadteil ihr Name ist
+//   5. in `$FIRNLIB`
+//   6. in `<exe>/../lib`
+// Ohne Manifest ist die Welt leer, 3 und 4 entfallen, und es bleibt bei der
+// Reihenfolge von Runde 39.
+//
+// Rueckgabe: 0 = gut · 2 = Modul nicht gefunden · 9 = Paketfehler, die
+// fertige Meldung steht in `paket.welt_fehler(w)`.
+fn imports_sammeln(l: *mut lexer.Lexer, s: *mut Suchraum, w: *mut paket.Welt,
                    ml: *mut Modulliste) -> i32 {
     var pfad: rt.Buf = rt.buf_neu()
     defer rt.buf_frei(&pfad)
-    var probe: rt.Buf = rt.buf_neu()
-    defer rt.buf_frei(&probe)
+    var basis: rt.Buf = rt.buf_neu()
+    defer rt.buf_frei(&basis)
+    var abs: rt.Buf = rt.buf_neu()
+    defer rt.buf_frei(&abs)
+    var mname: rt.Buf = rt.buf_neu()
+    defer rt.buf_frei(&mname)
+    var alt: rt.Buf = rt.buf_neu()
+    defer rt.buf_frei(&alt)
     var i: usize = 0
     while i + 1 < lexer.lex_anzahl(l) {
         if lexer.lex_art(l, i) != 27 {
@@ -223,11 +337,13 @@ fn imports_sammeln(l: *mut lexer.Lexer, verz: *mut rt.Buf, wurzelverz: *mut rt.B
         // Pfadteile einsammeln: IDENT (DOT IDENT)*
         var j: usize = i + 1
         var alias: u32 = 0
+        var teile: usize = 0
         while j < lexer.lex_anzahl(l) {
             if lexer.lex_art(l, j) != 1 {
                 break
             }
             alias = lexer.lex_nr(l, j)
+            teile = teile + 1
             j = j + 1
             if j >= lexer.lex_anzahl(l) {
                 break
@@ -237,44 +353,128 @@ fn imports_sammeln(l: *mut lexer.Lexer, verz: *mut rt.Buf, wurzelverz: *mut rt.B
             }
             j = j + 1
         }
-        // (1) neben der importierenden Datei, (2) neben der Wurzeldatei,
-        // (3) $FIRNLIB, (4) <exe>/../lib — derselbe Ablauf wie in
-        // `modules.rs::resolve`. Leere Puffer (Variable nicht gesetzt,
-        // readlink erfolglos) ueberspringen ihren Schritt. Der Treffer
-        // steht im Rueckgabewert, NICHT in der Pufferlaenge: eine leere
-        // Datei ist ein gueltiges Modul.
+        if teile == 0 {
+            i = j
+            continue
+        }
         var gefunden: bool = false
-        modulpfad(&pfad, verz, l, i + 1, j)
-        rt.buf_leeren(&probe)
-        if rt.lies_datei(rt.buf_ptr(&pfad), &probe) {
+        // (1) neben der importierenden Datei
+        modulpfad(&pfad, &(*s).verz, l, i + 1, j)
+        if paket.ist_datei(rt.buf_ptr(&pfad)) {
             gefunden = true
         }
+        // (2) neben der Wurzeldatei
         if !gefunden {
-            modulpfad(&pfad, wurzelverz, l, i + 1, j)
-            rt.buf_leeren(&probe)
-            if rt.lies_datei(rt.buf_ptr(&pfad), &probe) {
+            modulpfad(&pfad, &(*s).wurzelverz, l, i + 1, j)
+            if paket.ist_datei(rt.buf_ptr(&pfad)) {
                 gefunden = true
             }
         }
-        if !gefunden && rt.buf_len(firnlib) > 0 {
-            modulpfad(&pfad, firnlib, l, i + 1, j)
-            rt.buf_leeren(&probe)
-            if rt.lies_datei(rt.buf_ptr(&pfad), &probe) {
-                gefunden = true
+        // (3) die eigenen Quellverzeichnisse
+        if !gefunden {
+            if (*s).mein_paket >= 0 {
+                let mp: usize = (*s).mein_paket as usize
+                var qi: usize = 0
+                while qi < paket.welt_quelle_anzahl(w, mp) {
+                    paket.welt_quelle_basis(w, mp, qi, &basis)
+                    modulpfad(&pfad, &basis, l, i + 1, j)
+                    if paket.ist_datei(rt.buf_ptr(&pfad)) {
+                        gefunden = true
+                        break
+                    }
+                    qi = qi + 1
+                }
             }
         }
-        if !gefunden && rt.buf_len(exelib) > 0 {
-            modulpfad(&pfad, exelib, l, i + 1, j)
-            rt.buf_leeren(&probe)
-            if rt.lies_datei(rt.buf_ptr(&pfad), &probe) {
-                gefunden = true
+        // (4) eine Abhaengigkeit: der ERSTE Pfadteil nennt das Paket.
+        if !gefunden {
+            if (*s).mein_paket >= 0 {
+                let mp: usize = (*s).mein_paket as usize
+                let knr: u32 = lexer.lex_nr(l, i + 1)
+                let di: i64 = paket.welt_kante(w, mp, lexer.lex_name_zeiger(l, knr),
+                                               lexer.lex_name_laenge(l, knr))
+                if di >= 0 {
+                    var von: usize = i + 1
+                    if teile > 1 {
+                        von = i + 3
+                    }
+                    var qi: usize = 0
+                    while qi < paket.welt_quelle_anzahl(w, di as usize) {
+                        paket.welt_quelle_basis(w, di as usize, qi, &basis)
+                        modulpfad(&pfad, &basis, l, von, j)
+                        if paket.ist_datei(rt.buf_ptr(&pfad)) {
+                            gefunden = true
+                            break
+                        }
+                        qi = qi + 1
+                    }
+                }
+            }
+        }
+        // (5) $FIRNLIB
+        if !gefunden {
+            if rt.buf_len(&(*s).firnlib) > 0 {
+                modulpfad(&pfad, &(*s).firnlib, l, i + 1, j)
+                if paket.ist_datei(rt.buf_ptr(&pfad)) {
+                    gefunden = true
+                }
+            }
+        }
+        // (6) <exe>/../lib
+        if !gefunden {
+            if rt.buf_len(&(*s).exelib) > 0 {
+                modulpfad(&pfad, &(*s).exelib, l, i + 1, j)
+                if paket.ist_datei(rt.buf_ptr(&pfad)) {
+                    gefunden = true
+                }
             }
         }
         if !gefunden {
             return 2
         }
         let n: usize = rt.buf_len(&pfad) - 1
+        // SICHTBARKEIT: fuehrt der Treffer in ein ANDERES Paket, muss es eine
+        // eingetragene Abhaengigkeit sein und das Modul in dessen
+        // `oeffentlich`-Liste stehen.
+        if !paket.welt_ist_leer(w) {
+            paket.absolut(&abs, rt.buf_ptr(&pfad), n,
+                          rt.buf_ptr(&(*s).cwd), rt.buf_len(&(*s).cwd))
+            let zp: i64 = paket.welt_paket_von(w, rt.buf_ptr(&abs), rt.buf_len(&abs))
+            if zp >= 0 {
+                if (*s).mein_paket >= 0 {
+                    if zp != (*s).mein_paket {
+                        let mp: usize = (*s).mein_paket as usize
+                        let zn: u64 = paket.welt_name_zeiger(w, zp as usize)
+                        if paket.welt_kante(w, mp, zn, rt.c_laenge(zn)) != zp {
+                            paket.welt_text_keine_abhaengigkeit(w, zp as usize, mp)
+                            return 9
+                        }
+                        paket.modulname(&mname, rt.buf_ptr(&abs), rt.buf_len(&abs))
+                        if !paket.welt_ist_oeffentlich(w, zp as usize,
+                                                       rt.buf_ptr(&mname), rt.buf_len(&mname)) {
+                            paket.welt_text_nicht_oeffentlich(w, zp as usize,
+                                                              rt.buf_ptr(&mname), rt.buf_len(&mname))
+                            return 9
+                        }
+                    }
+                }
+            }
+        }
         if !ml_kennt(ml, rt.buf_ptr(&pfad), n) {
+            if !paket.welt_ist_leer(w) {
+                let doppel: i64 = ml_namensdoppel(ml, &(*s).cwd, rt.buf_ptr(&pfad), n)
+                if doppel >= 0 {
+                    paket.absolut(&abs, rt.buf_ptr(&pfad), n,
+                                  rt.buf_ptr(&(*s).cwd), rt.buf_len(&(*s).cwd))
+                    paket.modulname(&mname, rt.buf_ptr(&abs), rt.buf_len(&abs))
+                    paket.absolut(&alt, ml_zeiger(ml, doppel as usize),
+                                  ml_laenge(ml, doppel as usize),
+                                  rt.buf_ptr(&(*s).cwd), rt.buf_len(&(*s).cwd))
+                    paket.welt_text_namenskonflikt(w, rt.buf_ptr(&mname),
+                                                   rt.buf_ptr(&alt), rt.buf_ptr(&abs))
+                    return 9
+                }
+            }
             ml_dazu(ml, rt.buf_ptr(&pfad), n, alias)
         }
         i = j
@@ -283,13 +483,114 @@ fn imports_sammeln(l: *mut lexer.Lexer, verz: *mut rt.Buf, wurzelverz: *mut rt.B
 }
 
 fn main(start: u64) -> i32 {
+    // --- Kommandozeile (Runde 48). Dieselben Optionen wie `firnc0`:
+    //     firnc1 quelle.fi [-o ziel]
+    //     firnc1 --paket <verzeichnis> [-o ziel]
+    //     firnc1 --paket-info <verzeichnis>
+    var eing: u64 = 0
+    var eing_n: usize = 0
+    var pak: u64 = 0
+    var pak_n: usize = 0
+    var info: u64 = 0
+    var info_n: usize = 0
+    var zielb: rt.Buf = rt.buf_neu()
+    defer rt.buf_frei(&zielb)
+    var hat_ziel: bool = false
+    var o_opt: [u8; 3] = "-o\0"
+    var p_opt: [u8; 8] = "--paket\0"
+    var i_opt: [u8; 13] = "--paket-info\0"
+    var ai: usize = 1
+    while ai < rt.arg_anzahl(start) {
+        let a: u64 = rt.arg_zeiger(start, ai)
+        let an: usize = rt.c_laenge(a)
+        if arg_ist(a, an, (&o_opt[0]) as u64) {
+            ai = ai + 1
+            if ai < rt.arg_anzahl(start) {
+                let z: u64 = rt.arg_zeiger(start, ai)
+                rt.buf_leeren(&zielb)
+                rt.buf_push_bytes(&zielb, z, rt.c_laenge(z))
+                rt.buf_push(&zielb, 0 as u8)
+                rt.buf_set_len(&zielb, rt.buf_len(&zielb) - 1)
+                hat_ziel = true
+            }
+        } else {
+        if arg_ist(a, an, (&p_opt[0]) as u64) {
+            ai = ai + 1
+            if ai < rt.arg_anzahl(start) {
+                pak = rt.arg_zeiger(start, ai)
+                pak_n = rt.c_laenge(pak)
+            }
+        } else {
+        if arg_ist(a, an, (&i_opt[0]) as u64) {
+            ai = ai + 1
+            if ai < rt.arg_anzahl(start) {
+                info = rt.arg_zeiger(start, ai)
+                info_n = rt.c_laenge(info)
+            }
+        } else {
+            if eing == 0 {
+                eing = a
+                eing_n = an
+            }
+        }
+        }
+        }
+        ai = ai + 1
+    }
+
+    // --- die Paketwelt. Mit `--paket`/`--paket-info` das genannte Projekt,
+    // sonst das Manifest ueber der Quelldatei; ohne Manifest bleibt sie leer
+    // und alles verhaelt sich wie vor Runde 48.
+    var w: paket.Welt = paket.welt_neu()
+    defer paket.welt_frei(&w)
+    var startb: rt.Buf = rt.buf_neu()
+    defer rt.buf_frei(&startb)
+
+    if info != 0 {
+        if !paket.welt_ab_wurzel(&w, info, info_n) {
+            rt.schreib_alles(2, rt.buf_ptr(paket.welt_fehler(&w)),
+                             rt.buf_len(paket.welt_fehler(&w)))
+            return 2
+        }
+        var ib: rt.Buf = rt.buf_neu()
+        defer rt.buf_frei(&ib)
+        paket.welt_info(&w, info, info_n, &ib)
+        if !rt.schreib_alles(1, rt.buf_ptr(&ib), rt.buf_len(&ib)) {
+            return 2
+        }
+        return 0
+    }
+
+    if pak != 0 {
+        if !paket.welt_ab_wurzel(&w, pak, pak_n) {
+            rt.schreib_alles(2, rt.buf_ptr(paket.welt_fehler(&w)),
+                             rt.buf_len(paket.welt_fehler(&w)))
+            return 2
+        }
+        let sp: u64 = paket.welt_start_zeiger(&w, 0)
+        if sp == 0 {
+            paket.welt_text_kein_start(&w, 0)
+            rt.schreib_alles(2, rt.buf_ptr(paket.welt_fehler(&w)),
+                             rt.buf_len(paket.welt_fehler(&w)))
+            return 2
+        }
+        paket.verbinde(&startb, pak, pak_n, sp, rt.c_laenge(sp))
+        eing = rt.buf_ptr(&startb)
+        eing_n = rt.buf_len(&startb)
+        if !hat_ziel {
+            let np: u64 = paket.welt_name_zeiger(&w, 0)
+            paket.verbinde(&zielb, pak, pak_n, np, rt.c_laenge(np))
+            hat_ziel = true
+        }
+    }
+
     var quelle: rt.Buf = rt.buf_neu()
     defer rt.buf_frei(&quelle)
     var name: u64 = 0
     var name_n: usize = 0
-    if rt.arg_anzahl(start) > 1 {
-        name = rt.arg_zeiger(start, 1)
-        name_n = rt.c_laenge(name)
+    if eing != 0 {
+        name = eing
+        name_n = eing_n
         if !rt.lies_datei(name, &quelle) {
             return 2
         }
@@ -301,6 +602,17 @@ fn main(start: u64) -> i32 {
             return 2
         }
     }
+    // Ohne `--paket` bestimmt die Quelldatei das Projekt.
+    if pak == 0 {
+        if eing != 0 {
+            if !paket.welt_ab_datei(&w, name, name_n) {
+                rt.schreib_alles(2, rt.buf_ptr(paket.welt_fehler(&w)),
+                                 rt.buf_len(paket.welt_fehler(&w)))
+                return 2
+            }
+        }
+    }
+
     var kwtxt: [u8; 172] = "fn|let|var|if|else|while|return|struct|const|profile|as|mut|true|false|syscall|extern|break|continue|defer|errdefer|comptime|for|in|import|export|enum|match|error|try|catch"
     var l: lexer.Lexer = lexer.lex_neu(rt.buf_ptr(&quelle), rt.buf_len(&quelle),
                                        (&kwtxt[0]) as u64, 172, name, name_n)
@@ -324,21 +636,21 @@ fn main(start: u64) -> i32 {
     // --- Zusaetzliche Modul-Suchpfade: $FIRNLIB (mit Schraegstrich
     // abgeschlossen, `modulpfad` haengt die Teile direkt an) und
     // `<exe>/../lib/`. Beide bleiben leer, wenn es sie nicht gibt.
-    var firnlib: rt.Buf = rt.buf_neu()
-    defer rt.buf_frei(&firnlib)
+    var sr: Suchraum = sr_neu()
+    defer sr_frei(&sr)
     var flname: [u8; 7] = "FIRNLIB"
     let flwert: u64 = umgebung(start, (&flname[0]) as u64, 7)
     if flwert != 0 {
-        rt.buf_push_bytes(&firnlib, flwert, rt.c_laenge(flwert))
-        if rt.buf_len(&firnlib) > 0 {
-            if rt.buf_at(&firnlib, rt.buf_len(&firnlib) - 1) != 47 as u8 {
-                rt.buf_push(&firnlib, 47 as u8)
+        rt.buf_push_bytes(&sr.firnlib, flwert, rt.c_laenge(flwert))
+        if rt.buf_len(&sr.firnlib) > 0 {
+            if rt.buf_at(&sr.firnlib, rt.buf_len(&sr.firnlib) - 1) != 47 as u8 {
+                rt.buf_push(&sr.firnlib, 47 as u8)
             }
         }
     }
-    var exelib: rt.Buf = rt.buf_neu()
-    defer rt.buf_frei(&exelib)
-    exe_suchpfad(&exelib)
+    exe_suchpfad(&sr.exelib)
+    paket.arbeitsverzeichnis(&sr.cwd)
+    buf_setzen(&sr.wurzelverz, rt.buf_ptr(&verz), rt.buf_len(&verz))
 
     // --- generische Vorlagen: erst wissen, WELCHE Namen generisch sind,
     // dann parsen. Vorher ist `Vec[i32]` nicht von einer Indizierung zu
@@ -396,7 +708,14 @@ fn main(start: u64) -> i32 {
     // als alle Lexer gleichzeitig offen zu halten, und es macht die
     // Reihenfolge der `import`-Zeilen bedeutungslos.
     mono.gen_vorab(&g, (&l) as u64)
-    let wrc: i32 = imports_sammeln(&l, &verz, &verz, &firnlib, &exelib, &ml)
+    buf_setzen(&sr.verz, rt.buf_ptr(&verz), rt.buf_len(&verz))
+    sr.mein_paket = paket_von_datei(&w, &sr.cwd, name, name_n)
+    let wrc: i32 = imports_sammeln(&l, &sr, &w, &ml)
+    if wrc == 9 {
+        rt.schreib_alles(2, rt.buf_ptr(paket.welt_fehler(&w)),
+                         rt.buf_len(paket.welt_fehler(&w)))
+        return 2
+    }
     if wrc != 0 {
         return wrc
     }
@@ -422,8 +741,16 @@ fn main(start: u64) -> i32 {
         gc_scan = gc_scan | gc.gc_quelle_scan((&vl) as u64, gc_nr, class_nr, ae_nr)
         rt.buf_leeren(&mverz)
         verzeichnis(&mverz, rt.buf_ptr(&mpfad), rt.buf_len(&mpfad) - 1)
-        let irc: i32 = imports_sammeln(&vl, &mverz, &verz, &firnlib, &exelib, &ml)
+        buf_setzen(&sr.verz, rt.buf_ptr(&mverz), rt.buf_len(&mverz))
+        sr.mein_paket = paket_von_datei(&w, &sr.cwd, rt.buf_ptr(&mpfad),
+                                        rt.buf_len(&mpfad) - 1)
+        let irc: i32 = imports_sammeln(&vl, &sr, &w, &ml)
         lexer.lex_frei(&vl)
+        if irc == 9 {
+            rt.schreib_alles(2, rt.buf_ptr(paket.welt_fehler(&w)),
+                             rt.buf_len(paket.welt_fehler(&w)))
+            return 2
+        }
         if irc != 0 {
             return irc
         }
@@ -617,15 +944,15 @@ fn main(start: u64) -> i32 {
     }
     let aus: *mut rt.Buf = codegen.cg_text(&cg)
 
-    // Ohne `-o`: der Assembler geht auf die Standardausgabe.
-    if rt.arg_anzahl(start) < 4 {
+    // Ohne `-o` und ohne `--paket`: der Assembler geht auf die Standardausgabe.
+    if !hat_ziel {
         if !rt.schreib_alles(1, rt.buf_ptr(aus), rt.buf_len(aus)) {
             return 2
         }
         return 0
     }
-    let ziel: u64 = rt.arg_zeiger(start, 3)
-    let ziel_n: usize = rt.c_laenge(ziel)
+    let ziel: u64 = rt.buf_ptr(&zielb)
+    let ziel_n: usize = rt.buf_len(&zielb)
 
     // `ziel.s` und `ziel.o` als nullabgeschlossene Namen bauen.
     var sname: rt.Buf = rt.buf_neu()
