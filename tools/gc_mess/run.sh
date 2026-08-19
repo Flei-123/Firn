@@ -2,6 +2,10 @@
 # tools/gc_mess/run.sh — GC-Messwerkzeuge der Runde 38:
 #   1. Pausen-Histogramm  (pause.fi, DOM-Workload, alle Pausen in Klassen)
 #   2. Fragmentierung     (frag.fi, wechselnde Objektgroessen unter Dauerlast)
+#   3. Pausen bei GROSSER lebender Menge (pause_gross.fi, Runde 40): erst
+#      dieser Lauf haelt genug am Leben, dass der Heap ueber INKR_AB (8 MiB)
+#      steigt — nur dort laeuft ueberhaupt der inkrementelle Zyklus. Der
+#      Lauf 2 misst den NICHT-inkrementellen Pfad.
 #
 # Beide werden in allen drei Baustufen gebaut; ein Kurzlauf vergleicht die
 # Zaehler (Sammellaeufe/lebende Objekte muessen uebereinstimmen — sonst ist
@@ -12,6 +16,8 @@
 #   GCM_PAUSE_SEK   Laufzeitbudget des Pausenlaufs (Standard 20)
 #   GCM_RUNDEN      Runden des Fragmentierungstests (Standard 600)
 #   GCM_BATCH       Objekte je Runde und Klasse (Standard 200)
+#   GCM_GROSS_SEK   Laufzeitbudget des Grosslaufs (Standard 20)
+#   GCM_KINDER      lebende Textknoten im Grosslauf (Standard 120000, ~10 MiB)
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
@@ -21,6 +27,8 @@ AUS=tools/gc_mess
 PAUSE_SEK=${GCM_PAUSE_SEK:-20}
 RUNDEN=${GCM_RUNDEN:-600}
 BATCH=${GCM_BATCH:-200}
+GROSS_SEK=${GCM_GROSS_SEK:-20}
+KINDER=${GCM_KINDER:-120000}
 
 if [ ! -x "$FIRNC" ]; then
     echo "FEHLER: $FIRNC fehlt — zuerst 'cargo build --release' im Ordner compiler/."
@@ -31,6 +39,7 @@ rm -rf "$ARBEIT"
 mkdir -p "$ARBEIT"
 cp lib/dom/dom.fi lib/dom/mess.fi "$ARBEIT/"
 cp tools/gc_mess/pause.fi tools/gc_mess/frag.fi tools/gc_mess/frag2.fi "$ARBEIT/"
+cp tools/gc_mess/pause_gross.fi "$ARBEIT/"
 
 echo "== GC-Messung (Runde 38) =="
 
@@ -106,6 +115,17 @@ sed -e "s|^const BUDGET_MS: i64 = .*$|const BUDGET_MS: i64 = $((PAUSE_SEK * 1000
 "$ARBEIT/pause_lauf" > "$AUS/pause.tsv"
 grep '^#' "$AUS/pause.tsv"
 
+# ------------------------------------ 2b. Pausen bei grosser lebender Menge
+echo
+echo "-- 2b. Pausen bei grosser lebender Menge (${GROSS_SEK}s, $KINDER lebende Knoten) --"
+sed -e "s|^const BUDGET_MS: i64 = .*$|const BUDGET_MS: i64 = $((GROSS_SEK * 1000))  // GCM_BUDGET_MS|" \
+    -e "s|^const KINDER: u32 = .*$|const KINDER: u32 = $KINDER    // GCM_KINDER|" \
+    "$ARBEIT/pause_gross.fi" > "$ARBEIT/gross_lauf.fi"
+"$FIRNC" "$ARBEIT/gross_lauf.fi" -o "$ARBEIT/gross_lauf" 2>"$ARBEIT/bau2b.err" || {
+    echo "FEHLER: Bau des Grosslaufs"; head -5 "$ARBEIT/bau2b.err"; exit 1; }
+"$ARBEIT/gross_lauf" > "$AUS/pause_gross.tsv"
+grep '^#' "$AUS/pause_gross.tsv"
+
 # ---------------------------------------------------- 3. Fragmentierungslauf
 echo
 echo "-- 3. Fragmentierungstest ($RUNDEN Runden x $BATCH Objekte) --"
@@ -143,7 +163,7 @@ PYEOF2
 # ------------------------------------------------------------ 4. Auswertung
 echo
 echo "-- 4. Auswertung --"
-python3 - "$AUS/pause.tsv" "$AUS/frag.tsv" <<'PYEOF'
+python3 - "$AUS/pause.tsv" "$AUS/frag.tsv" "$AUS/pause_gross.tsv" <<'PYEOF'
 import sys
 
 def lies(pfad):
@@ -186,6 +206,26 @@ if gesamt:
     print(f'     >=16000000 ns : {hist[-1][1]:>6}')
 else:
     print('     (keine Sammellaeufe beobachtet)')
+
+gk, gz = lies(sys.argv[3]) if len(sys.argv) > 3 else ({}, [])
+if gk:
+    print('   Pausen bei grosser lebender Menge:')
+    print(f'     lebende Knoten {gk.get("lebende_knoten","?")}, Heap {int(gk.get("heap_bytes",0))/1048576:.1f} MiB, '
+          f'Sammellaeufe {gk.get("sammellaeufe","?")}')
+    gmax = int(gk.get('pause_max_ns', 0))
+    print(f'     laengste Pause {gmax} ns ({gmax/1e6:.2f} ms), Summe {int(gk.get("pause_total_ns",0))/1e6:.1f} ms')
+    ghist = gz[-9:]
+    ggesamt = sum(a for _, a in ghist)
+    if ggesamt:
+        kum = 0
+        for grenze, anzahl in ghist:
+            kum += anzahl
+            if anzahl:
+                print(f'     <= {grenze:>9} ns : {anzahl:>6}  (kumuliert {kum*100.0/ggesamt:5.1f} %)')
+    # WICHTIG: pause_max_ns ist der Hoechstwert SEIT PROZESSSTART und
+    # enthaelt damit die Sammellaeufe des AUFBAUS (Heap waechst, noch kein
+    # inkrementeller Zyklus). Die Klassen oben zaehlen nur die Laeufe der
+    # Messschleife — Abweichung ist zu erwarten und kein Widerspruch.
 
 fk, fz = lies(sys.argv[2])
 print('   Fragmentierung:')
