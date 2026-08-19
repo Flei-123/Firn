@@ -91,7 +91,7 @@ pub(crate) const FN_AS: &str = "__gc_as_raw";
 pub(crate) const FN_ALLOC: &str = "__gc_alloc_raw";
 /// Einfuegebarriere beim Schreiben eines Gc-Zeigers in den Heap.
 pub(crate) const FN_BARRIER: &str = "__gc_barrier";
-/// Fehlermenge der fehlbaren Allokation (DESIGNZIELE §2).
+/// Fehlermenge der fehlbaren Allokation (DESIGN_GOALS §2).
 pub(crate) const ERR_SET: &str = "AllocError";
 /// **Runde 47** — Verteiler der Finalisierer (`SPEC` §3.5.3 `S4`).
 ///
@@ -901,7 +901,7 @@ fn check_new(
     Some(u)
 }
 
-/// `AllocError!T` — die fehlbare Allokation (DESIGNZIELE §2).
+/// `AllocError!T` — die fehlbare Allokation (DESIGN_GOALS §2).
 fn alloc_union(ck: &mut Checker, val: Type, span: Span) -> Type {
     match crate::errors::union_type(ck, ERR_SET, &val) {
         Some(t) => t,

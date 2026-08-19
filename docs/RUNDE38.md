@@ -185,7 +185,7 @@ Korrektheit ohne Kompaktieren und ohne erneuten Stapelscan:
   und keine Altmarken im naechsten Zyklus.
 - **Erschoepfungs-Fallback**: findet die Allokation mitten im Zyklus keinen
   Block, wird der Rest des Zyklus atomar zu Ende gebracht, bevor
-  OutOfMemory gemeldet wird (DESIGNZIELE §2 bleibt).
+  OutOfMemory gemeldet wird (DESIGN_GOALS §2 bleibt).
 
 ### Messungen (diese Maschine, Lastvorbehalt: parallel laufende Runden)
 

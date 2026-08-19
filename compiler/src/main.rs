@@ -82,7 +82,7 @@ struct Options {
     optimize: bool,
     keep_asm: bool,
     stats: bool,
-    /// Baustufe und einzeln abgeschaltete Durchgaenge (DESIGNZIELE.md §5)
+    /// Baustufe und einzeln abgeschaltete Durchgaenge (DESIGN_GOALS.md §5)
     optcfg: opt::OptConfig,
     /// `-c` / `--objekt`: nur assemblieren, NICHT linken (Runde 52).
     /// Im Profil `kernel` ohnehin immer an (SPEC §2: Ziel ist ein ELF-Objekt).

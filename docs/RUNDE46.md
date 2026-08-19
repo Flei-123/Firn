@@ -5,7 +5,7 @@
 Runde 45 brachte Methoden — aber ausdrücklich nur als Schreibhilfe: `x.m(a)`
 wurde zu `Typ__m(&x, a)`, entschieden allein vom **statischen** Typ. Diese
 Runde ergänzt den anderen Fall, den `SPEC.md` §6.2 seit v0.1 fordert und den
-`DESIGNZIELE.md` §1 für `Io` voraussetzt: **eine Aufrufstelle, viele Typen.**
+`DESIGN_GOALS.md` §1 für `Io` voraussetzt: **eine Aufrufstelle, viele Typen.**
 
 ```firn
 interface Flaeche {

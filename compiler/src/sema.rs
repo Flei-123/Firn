@@ -145,7 +145,7 @@ impl<'a> Checker<'a> {
         self.check_main(prog);
     }
 
-    /// **Wiedereintritt in die Pruefphasen** (DESIGNZIELE.md §7, Fundamentpunkt
+    /// **Wiedereintritt in die Pruefphasen** (DESIGN_GOALS.md §7, Fundamentpunkt
     /// aus §10.4).
     ///
     /// Prueft ZUSAETZLICHE Deklarationen mit dem bereits aufgebauten Zustand —
@@ -2150,7 +2150,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Wiedereintritt in die Pruefphasen (DESIGNZIELE.md §7)
+    // Wiedereintritt in die Pruefphasen (DESIGN_GOALS.md §7)
     // ------------------------------------------------------------------
 
     /// Baut einen Pruefer im Zustand *nach* dem ersten Durchlauf.

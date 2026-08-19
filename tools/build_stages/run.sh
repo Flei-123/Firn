@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Misst die BAUSTUFEN gegeneinander (DESIGNZIELE.md §5).
+# Misst die BAUSTUFEN gegeneinander (DESIGN_GOALS.md §5).
 #
 # Frage: Ist '--opt-level=dev-fast' (nur debugerhaltende Durchgaenge) nahe genug
-# an 'release-fast'? Zielwert laut DESIGNZIELE.md §5: 2-3x, nicht 30x wie bei
+# an 'release-fast'? Zielwert laut DESIGN_GOALS.md §5: 2-3x, nicht 30x wie bei
 # Rusts Debug-Builds.
 #
 # Aufruf:  bash tools/build_stages/run.sh [LAEUFE]   (Standard 5, Median)

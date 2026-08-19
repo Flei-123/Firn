@@ -56,7 +56,7 @@ def main():
     m_df, m_dev = statistics.median(verh_df), statistics.median(verh_dev)
     print(f"\nMedian dev-fast : {m_df:.2f}x langsamer als release-fast")
     print(f"Median dev      : {m_dev:.2f}x langsamer als release-fast")
-    print(f"\nZielwert aus DESIGNZIELE.md §5 fuer dev-fast: 2-3x. "
+    print(f"\nZielwert aus DESIGN_GOALS.md §5 fuer dev-fast: 2-3x. "
           f"{'ERREICHT' if m_df <= 3.0 else 'VERFEHLT'}.")
     print("Zum Vergleich: Rust-Debug-Builds liegen typisch bei 10-50x.")
 

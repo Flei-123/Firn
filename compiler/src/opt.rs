@@ -60,13 +60,13 @@ pub struct OptStats {
 
 // ------------------------------------------------ Durchgangsregister ---
 //
-// DESIGNZIELE.md §5 und §10.4 Punkt 4: Jeder Optimierungsdurchgang hat einen
+// DESIGN_GOALS.md §5 und §10.4 Punkt 4: Jeder Optimierungsdurchgang hat einen
 // NAMEN, einen SCHALTER und ein ETIKETT `debugerhaltend ja/nein`. Nur so laesst
 // sich spaeter die Baustufe `--dev-fast` bauen (schnell, aber debuggbar), ohne
 // jeden Durchgang anzufassen. Das Register ist die einzige Wahrheit darueber,
 // welche Durchgaenge es gibt — `--list-passes` gibt es aus.
 
-/// Baustufe. `DevFast` ist die Voreinstellung (DESIGNZIELE.md §5).
+/// Baustufe. `DevFast` ist die Voreinstellung (DESIGN_GOALS.md §5).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Level {
     /// gar keine Optimierung (`--no-opt`) — nur zur Compilerfehlersuche

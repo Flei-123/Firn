@@ -371,7 +371,7 @@ fn module_name(f: &SourceFile) -> String {
         .unwrap_or_else(|| format!("m{}", f.id))
 }
 
-/// **Version des Symbol-Namensschemas** (DESIGNZIELE.md §4, Fundamentpunkt).
+/// **Version des Symbol-Namensschemas** (DESIGN_GOALS.md §4, Fundamentpunkt).
 ///
 /// Sie steht in **jedem** erzeugten Linker-Symbol. Aendert sich das Schema,
 /// aendern sich alle Symbole — dann meldet der Linker einen fehlenden Namen,
@@ -400,7 +400,7 @@ pub const ENTRY_SYMBOL: &str = "main";
 /// main                der Einstiegspunkt, unveraendert
 /// ```
 ///
-/// **Warum jetzt schon?** `DESIGNZIELE.md` §4: Gibt Firn heute `main` und `add`
+/// **Warum jetzt schon?** `DESIGN_GOALS.md` §4: Gibt Firn heute `main` und `add`
 /// als nackte Symbole aus und braucht spaeter versionierte, ist das ein Bruch
 /// fuer alles, was bereits gebaut wurde. Der Platz fuer die Version kostet
 /// heute nichts und macht ein stabiles ABI (`#[abi_stable]`) spaeter zu einer
@@ -874,7 +874,7 @@ mod tests {
         assert_eq!(mangle("", "main"), "main");
         assert_eq!(mangle("helper", "square"), "helper__square");
         assert_eq!(mangle("", "square"), "square");
-        // Linker-Symbole: reservierter Praefix + Schemaversion (DESIGNZIELE 4)
+        // Linker-Symbole: reservierter Praefix + Schemaversion (DESIGN_GOALS 4)
         assert_eq!(symbol("square", None), "_F0.square");
         assert_eq!(symbol("helper__square", None), "_F0.helper__square");
         // Platz fuer die ABI-Version ist da.

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Nachweis des SYMBOL-NAMENSSCHEMAS (DESIGNZIELE.md §4, modules.rs).
+# Nachweis des SYMBOL-NAMENSSCHEMAS (DESIGN_GOALS.md §4, modules.rs).
 #
 # Geprueft wird an einem wirklich gebauten Binary:
 #   1. Jedes von Firn erzeugte Symbol traegt den reservierten Praefix mit

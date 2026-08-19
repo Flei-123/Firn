@@ -4,8 +4,8 @@
 //! Firns Spezifikation stuetzt sich an vielen Stellen auf Attribute:
 //! `#[must_consume]` (SPEC §3.3, §5.1), `#[no_gc]` (§3.5.4),
 //! `#[constant_time]` (§9.2), `#[unwinds]` (§5.3), `#[packed]`/`#[align(n)]`
-//! (§13), `#[layout(soa)]` (DESIGNZIELE §8), `#[abi_stable]`/`#[frozen]`
-//! (DESIGNZIELE §4), `#[hot]` (DESIGNZIELE §9).
+//! (§13), `#[layout(soa)]` (DESIGN_GOALS §8), `#[abi_stable]`/`#[frozen]`
+//! (DESIGN_GOALS §4), `#[hot]` (DESIGN_GOALS §9).
 //!
 //! Sie kommen zu sehr verschiedenen Zeitpunkten. Damit das nicht in einem
 //! Wildwuchs aus verstreuten Zeichenkettenvergleichen endet, stehen sie **hier**
@@ -117,35 +117,35 @@ pub const ATTRS: &[AttrInfo] = &[
         target: Target::Type,
         args: 1,
         implemented: false,
-        what: "choose the arrangement, e.g. #[layout(soa)] (DESIGNZIELE 8)",
+        what: "choose the arrangement, e.g. #[layout(soa)] (DESIGN_GOALS 8)",
     },
     AttrInfo {
         name: "no_move",
         target: Target::Type,
         args: 0,
         implemented: false,
-        what: "no longer movable after construction (DESIGNZIELE 6)",
+        what: "no longer movable after construction (DESIGN_GOALS 6)",
     },
     AttrInfo {
         name: "abi_stable",
         target: Target::Both,
         args: 1,
         implemented: false,
-        what: "stable ABI across component boundaries (DESIGNZIELE 4)",
+        what: "stable ABI across component boundaries (DESIGN_GOALS 4)",
     },
     AttrInfo {
         name: "frozen",
         target: Target::Type,
         args: 0,
         implemented: false,
-        what: "layout frozen, in exchange embeddable again (DESIGNZIELE 4)",
+        what: "layout frozen, in exchange embeddable again (DESIGN_GOALS 4)",
     },
     AttrInfo {
         name: "hot",
         target: Target::Func,
         args: 0,
         implemented: false,
-        what: "exchangeable at run time (DESIGNZIELE 9, no date)",
+        what: "exchangeable at run time (DESIGN_GOALS 9, no date)",
     },
 ];
 
