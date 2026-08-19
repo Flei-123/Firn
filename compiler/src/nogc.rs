@@ -291,6 +291,23 @@ impl<'a> Pruefer<'a> {
             );
             return;
         }
+        // HOOK impl: `x.m(..)` steht bis zur Typpruefung als `"methode m"`
+        // im Baum — welche Funktion gemeint ist, weiss erst der Typpruefer.
+        // Diese Pruefung laeuft ohne Typtabelle der Empfaenger, also wird der
+        // Fall AUSDRUECKLICH abgelehnt statt stillschweigend uebergangen: ein
+        // Loch in einer Zusage waere schlimmer als eine fehlende Bequemlichkeit
+        // (Runde 45, impls.rs).
+        if let Some(m) = crate::impls::methodenname(name) {
+            self.melde(
+                sp,
+                format!("'{wer}' ist #[no_gc], ruft aber die methode '{m}'"),
+                "SPEC 3.5.4: die zusage gilt transitiv — welche funktion hinter einem \
+                 methodenaufruf steht, entscheidet der empfaengertyp; rufe die funktion \
+                 hier direkt auf (Typ__methode) oder verzichte auf #[no_gc]"
+                    .to_string(),
+            );
+            return;
+        }
         if ist_interner_name(name) {
             return;
         }
