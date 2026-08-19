@@ -43,6 +43,11 @@ const SYS_CLOCK_GETTIME: i64 = 228
 const PROT_RW: i64 = 3
 const MAP_PRIVATE_ANON: i64 = 34
 const CLOCK_MONOTONIC: i64 = 1
+// Runde 44: Rechenzeit DIESES Fadens. Damit laesst sich eine lange Pause,
+// die der Sammler wirklich verursacht hat, von einer unterscheiden, in der
+// die Maschine den Prozess nur verdraengt hat (parallele Runden auf
+// derselben Maschine — der Fehlbefund der Runde 40).
+const CLOCK_THREAD_CPUTIME: i64 = 3
 
 // Zustandsblock: Offsets in Bytes (siehe compiler/src/gc.rs).
 const S_TABELLE: u64 = 0
@@ -134,6 +139,12 @@ const S_INKRAB: u64 = 1536
 // Fegen: je Groessenklasse ein Merker, ob ihre Freiliste in DIESEM Fegedurchlauf
 // schon geleert wurde (13 Klassen, 1544..1648).
 const S_SWKL: u64 = 1544
+// Histogramm der ganzen Unterbrechung in REINER RECHENZEIT (16 Faecher wie
+// S_HIST), sein Maximum, und der Schalter dafuer (0 = aus, keine zusaetzliche
+// Uhr; nur Messprogramme schalten ihn ein).
+const S_CHIST: u64 = 1704
+const S_CSTOPMAX: u64 = 1832
+const S_CPUUHR: u64 = 1840
 // Scheibengroessen: so viele Objekte pro Allokation tracen bzw. Chunks fegen.
 const SCHEIBE_TRACE: u64 = 512
 // Runde 41: Zeitbudget einer Markierscheibe (ns). Die Objektzahl allein
@@ -219,6 +230,15 @@ fn __gc_mmap(n: u64) -> u64 {
 fn __gc_munmap(p: u64, n: u64) {
     let len: u64 = (n + 4095) / 4096 * 4096
     syscall(SYS_MUNMAP, p as i64, len as i64, 0, 0, 0, 0)
+}
+
+fn __gc_cpu_ns() -> u64 {
+    let st: u64 = __gc_state() as u64
+    let puf: u64 = st + S_ZEIT
+    __gc_st64(puf, 0)
+    __gc_st64(puf + 8, 0)
+    syscall(SYS_CLOCK_GETTIME, CLOCK_THREAD_CPUTIME, puf as i64, 0, 0, 0, 0)
+    return __gc_ld64(puf) * 1000000000 + __gc_ld64(puf + 8)
 }
 
 fn __gc_jetzt_ns() -> u64 {
@@ -816,8 +836,7 @@ fn __gc_collect_now() -> u64 {
 
 // Eine Scheibe verbuchen: die Pausen-Zaehler messen jetzt die laengste
 // UNTERBRECHUNG (eine Scheibe), nicht mehr den ganzen Zyklus.
-fn __gc_hist_buche(dauer: u64, typ: u64) {
-    let st: u64 = __gc_state() as u64
+fn __gc_fach(dauer: u64) -> u64 {
     var i: u64 = 0
     var g: u64 = 1000
     while i + 1 < HIST_FAECHER {
@@ -827,6 +846,22 @@ fn __gc_hist_buche(dauer: u64, typ: u64) {
         g = g * 2
         i = i + 1
     }
+    return i
+}
+
+// Dieselbe Unterbrechung, aber in reiner Rechenzeit des Fadens gebucht.
+fn __gc_chist_buche(dauer: u64) {
+    let st: u64 = __gc_state() as u64
+    let f: u64 = st + S_CHIST + __gc_fach(dauer) * 8
+    __gc_st64(f, __gc_ld64(f) + 1)
+    if dauer > __gc_ld64(st + S_CSTOPMAX) {
+        __gc_st64(st + S_CSTOPMAX, dauer)
+    }
+}
+
+fn __gc_hist_buche(dauer: u64, typ: u64) {
+    let st: u64 = __gc_state() as u64
+    let i: u64 = __gc_fach(dauer)
     let f: u64 = st + S_HIST + (typ * HIST_FAECHER + i) * 8
     __gc_st64(f, __gc_ld64(f) + 1)
     // Typ 6 ist die Summe der SCHEIBEN; die ganze Unterbrechung (Typ 7)
@@ -865,6 +900,32 @@ fn gc_hist_reset() {
         i = i + 1
     }
     __gc_st64(st + S_STOPMAX, 0)
+    var j: u64 = 0
+    while j < HIST_FAECHER {
+        __gc_st64(st + S_CHIST + j * 8, 0)
+        j = j + 1
+    }
+    __gc_st64(st + S_CSTOPMAX, 0)
+}
+
+// Histogramm der ganzen Unterbrechung in REINER RECHENZEIT (Faecher wie
+// gc_hist). Nur belegt, wenn gc_set_cpu_uhr(1) gesetzt ist.
+fn gc_chist(i: u64) -> u64 {
+    if i >= HIST_FAECHER {
+        return 0
+    }
+    return __gc_ld64(__gc_state() as u64 + S_CHIST + i * 8)
+}
+
+fn gc_cpu_stop_max() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_CSTOPMAX)
+}
+
+// Zweite Uhr einschalten (Rechenzeit statt Wanduhr). Kostet zwei zusaetzliche
+// Systemaufrufe je Allokationsstelle MIT Sammlerarbeit, deshalb standardmaessig
+// aus.
+fn gc_set_cpu_uhr(an: u64) {
+    __gc_st64(__gc_state() as u64 + S_CPUUHR, an)
 }
 
 // Laengste GANZE Unterbrechung an einer Allokationsstelle (Typ 7).
@@ -1050,8 +1111,12 @@ fn __gc_alloc_raw(tid: u64, size: u64) -> *mut u8 {
     // was hier hintereinander laeuft (Zyklusstart UND Scheibe UND Abschluss).
     // Die Uhr wird nur gelesen, wenn ueberhaupt Sammlerarbeit anfaellt.
     var tstop: u64 = 0
+    var tcpu: u64 = 0
     if __gc_ld64(st + S_PHASE) == 0 && __gc_ld64(st + S_SEIT) >= __gc_ld64(st + S_GRENZE) {
         tstop = __gc_jetzt_ns()
+        if __gc_ld64(st + S_CPUUHR) != 0 {
+            tcpu = __gc_cpu_ns()
+        }
         if __gc_ld64(st + S_HEAP) < __gc_ld64(st + S_INKRAB) {
             __gc_scrub()
             __gc_collect_now()
@@ -1062,6 +1127,9 @@ fn __gc_alloc_raw(tid: u64, size: u64) -> *mut u8 {
     if __gc_ld64(st + S_PHASE) != 0 {
         if tstop == 0 {
             tstop = __gc_jetzt_ns()
+            if __gc_ld64(st + S_CPUUHR) != 0 {
+                tcpu = __gc_cpu_ns()
+            }
         }
         __gc_zyklus_schritt()
     }
@@ -1071,6 +1139,9 @@ fn __gc_alloc_raw(tid: u64, size: u64) -> *mut u8 {
         // Zyklus zuende bringen, sonst einen kompletten Lauf erzwingen.
         if tstop == 0 {
             tstop = __gc_jetzt_ns()
+            if __gc_ld64(st + S_CPUUHR) != 0 {
+                tcpu = __gc_cpu_ns()
+            }
         }
         if __gc_ld64(st + S_PHASE) != 0 {
             __gc_zyklus_fertig()
@@ -1087,6 +1158,14 @@ fn __gc_alloc_raw(tid: u64, size: u64) -> *mut u8 {
             dstop = te - tstop
         }
         __gc_hist_buche(dstop, 7)
+        if tcpu != 0 {
+            let ce: u64 = __gc_cpu_ns()
+            var dcpu: u64 = 0
+            if ce > tcpu {
+                dcpu = ce - tcpu
+            }
+            __gc_chist_buche(dcpu)
+        }
     }
     if b == 0 {
         return 0 as *mut u8
