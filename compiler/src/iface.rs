@@ -63,9 +63,10 @@
 //! Zusage waere schlimmer als eine fehlende Bequemlichkeit.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 
 use crate::ast::{Expr, TypeExpr};
-use crate::diag::Span;
+use crate::diag::{Diags, Span};
 use crate::lexer::TokKind;
 use crate::parser::Parser;
 use crate::sema::Checker;
@@ -97,6 +98,10 @@ struct Methode {
     rtyp: Type,
     /// Typen bereits aufgeloest (Nachtraege aus `comptime` melden sonst doppelt)
     aufgeloest: bool,
+    /// Die Signatur nennt `Self` (Runde 50). Dann haengen `ptypen`/`rtyp` am
+    /// umsetzenden Typ und werden ERST JE UMSETZUNG aufgeloest; global
+    /// bleiben sie leer, und ueber `dyn I` ist die Methode nicht aufrufbar.
+    hat_self: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -176,6 +181,232 @@ pub(crate) fn ist_dyn(tcx: &TypeCtx, t: &Type) -> bool {
 /// Schluessel der Methodentafel: `<Schnittstelle>.<Typ>`.
 fn tafelschluessel(iface: &str, typname: &str) -> String {
     format!("{}.{}", iface, typname)
+}
+
+/// Der eingebaute Typ hinter einem Namen — `None`, wenn es keiner ist.
+///
+/// Seit Runde 50 darf auch ein GRUNDTYP eine Schnittstelle umsetzen
+/// (`impl Ord for i32`). Ohne das haette `vec_sortiere[T: Ord]` nur Structs
+/// sortieren koennen, und die Standardbibliothek haette den fest verdrahteten
+/// Vergleich behalten muessen.
+pub(crate) fn grundtyp_von_name(n: &str) -> Option<Type> {
+    Some(match n {
+        "i8" => Type::I8,
+        "i16" => Type::I16,
+        "i32" => Type::I32,
+        "i64" => Type::I64,
+        "u8" => Type::U8,
+        "u16" => Type::U16,
+        "u32" => Type::U32,
+        "u64" => Type::U64,
+        "usize" => Type::Usize,
+        "isize" => Type::Isize,
+        "bool" => Type::Bool,
+        "f64" => Type::F64,
+        _ => return None,
+    })
+}
+
+/// Name eines Grundtyps fuer das Methodennamensschema (`i32__kleiner`).
+pub(crate) fn grundtyp_name(t: &Type) -> Option<&'static str> {
+    Some(match t {
+        Type::I8 => "i8",
+        Type::I16 => "i16",
+        Type::I32 => "i32",
+        Type::I64 => "i64",
+        Type::U8 => "u8",
+        Type::U16 => "u16",
+        Type::U32 => "u32",
+        Type::U64 => "u64",
+        Type::Usize => "usize",
+        Type::Isize => "isize",
+        Type::Bool => "bool",
+        Type::F64 => "f64",
+        _ => return None,
+    })
+}
+
+/// Ist das der Name einer Methode auf einem GRUNDTYP (`i32__kleiner`)?
+///
+/// Solche Methoden gelten PROGRAMMWEIT und werden von `modules.rs` nicht
+/// umbenannt — genauso wie Schnittstellen, gc-Klassen und generische
+/// Vorlagen. Der Grund ist derselbe: der Typ `i32` gehoert keinem Modul.
+/// Wuerde die Methode zu `vec__i32__kleiner`, suchte die Aufloesung weiter
+/// `i32__kleiner` und faende nichts.
+pub(crate) fn ist_grundtyp_methode(name: &str) -> bool {
+    match name.split_once(crate::impls::TRENNER) {
+        Some((kopf, rest)) => !rest.is_empty() && grundtyp_von_name(kopf).is_some(),
+        None => false,
+    }
+}
+
+/// Nennt dieser Typausdruck `Self`?
+fn nennt_self(te: &TypeExpr) -> bool {
+    match te {
+        TypeExpr::Named(n, _) => n == "Self",
+        TypeExpr::Ptr { inner, .. } => nennt_self(inner),
+        TypeExpr::Array { elem, .. } => nennt_self(elem),
+    }
+}
+
+// ------------------------------------------------- Schranken (Runde 50)
+//
+// `fn f[T: Ord](…)` — die Schranke wird bei der AUSPRAEGUNG geprueft
+// (`mono.rs::bind_params`), also bevor der Typpruefer laeuft. Zu dem
+// Zeitpunkt gibt es weder Structtabelle noch aufgeloeste Typen; was es gibt,
+// sind die Namen: die Registrierung dieser Datei und die Liste aller
+// Funktionsnamen des zusammengefuehrten Programms. Genau daraus wird die
+// Meldung gebaut, und genau deshalb kann sie die FEHLENDE METHODE nennen,
+// statt spaeter als „unbekannte methode" mitten in einer ausgepraegten
+// Funktion aufzuschlagen.
+
+/// Lesbare Form eines noch nicht aufgeloesten Typs (fuer Meldungen vor dem
+/// Typpruefer). `Self` bleibt `Self` — genau so steht es in der Schnittstelle.
+fn te_text(te: &TypeExpr) -> String {
+    match te {
+        TypeExpr::Named(n, _) => n.clone(),
+        TypeExpr::Ptr { mutable, inner, .. } => {
+            format!("*{}{}", if *mutable { "mut " } else { "" }, te_text(inner))
+        }
+        TypeExpr::Array { elem, len, .. } => format!("[{}; {}]", te_text(elem), len),
+    }
+}
+
+/// Signatur einer Schnittstellenmethode aus dem UNAUFGELOESTEN Kopf.
+/// (`signatur` weiter unten macht dasselbe mit aufgeloesten Typen; hier ist
+/// noch kein Typpruefer gelaufen.)
+fn kopf_signatur(m: &Methode) -> String {
+    let mut s = String::from(if m.veraenderlich { "*mut self" } else { "*self" });
+    for t in &m.params {
+        s.push_str(", ");
+        s.push_str(&te_text(t));
+    }
+    match &m.ret {
+        None => format!("fn {}({})", m.name, s),
+        Some(r) => format!("fn {}({}) -> {}", m.name, s, te_text(r)),
+    }
+}
+
+/// Setzt der Typ `typname` die Schnittstelle `iface` um?
+///
+/// Verglichen werden NAMEN, nicht Typen — den Typpruefer gibt es hier noch
+/// nicht. Der Name in der Registrierung steht so da, wie er im Quelltext
+/// geschrieben wurde; das Typargument traegt dagegen schon den Namen nach der
+/// Modulumbenennung. Deshalb dieselben drei Schritte wie in `typ_struct`:
+/// gleich, `gc <Name>`, oder auf `__<Name>` endend (Typ aus einem Modul).
+fn umsetzung_da(iface: &str, typname: &str) -> bool {
+    REG.with(|r| {
+        r.borrow().impls.iter().any(|u| {
+            if u.iface != iface {
+                return false;
+            }
+            if u.typ == typname || typname == format!("gc {}", u.typ) {
+                return true;
+            }
+            // Die Endungsregel gilt NUR fuer benannte Typen aus einem Modul.
+            // Fuer einen Grundtyp waere sie falsch: `Vec__i32` endet auf
+            // `__i32`, ist aber der Struct `Vec[i32]` und nicht `i32`.
+            grundtyp_von_name(&u.typ).is_none()
+                && typname.ends_with(&format!("__{}", u.typ))
+        })
+    })
+}
+
+/// `// HOOK iface` in `mono.rs::schranke_ok` — `T: I` bei der Auspraegung.
+/// `true` = die Schranke ist erfuellt.
+pub(crate) fn schranke_pruefen(
+    dg: &mut Diags,
+    fnamen: &HashSet<String>,
+    arg: &TypeExpr,
+    iface: &str,
+    pname: &str,
+    basis: &str,
+    span: Span,
+) -> bool {
+    let ii = match iface_index(iface) {
+        Some(i) => i,
+        None => {
+            let bekannt: Vec<String> =
+                REG.with(|r| r.borrow().ifaces.iter().map(|s| s.name.clone()).collect());
+            let note = if bekannt.is_empty() {
+                "in dieser uebersetzung ist keine schnittstelle vereinbart; \
+                 eingebaut sind nur Any, Int und Scalar"
+                    .to_string()
+            } else {
+                format!("bekannt sind: {} (eingebaut: Any, Int, Scalar)", bekannt.join(", "))
+            };
+            dg.error_note(
+                span,
+                format!(
+                    "unbekannte schnittstelle '{}' als schranke am typparameter '{}' von '{}'",
+                    iface, pname, basis
+                ),
+                note,
+            );
+            return false;
+        }
+    };
+    // Eine Schnittstelle wird von einem BENANNTEN Typ umgesetzt. Ein Zeiger
+    // oder ein Feld hat keinen Namen, unter dem eine Umsetzung stehen koennte.
+    let typname = match arg {
+        TypeExpr::Named(n, _) => n.clone(),
+        _ => {
+            dg.error_note(
+                span,
+                format!(
+                    "typargument '{}' erfuellt die schranke '{}' des typparameters '{}' von '{}' nicht",
+                    te_text(arg), iface, pname, basis
+                ),
+                format!(
+                    "eine schnittstelle wird mit 'impl {} for <typ>' umgesetzt; \
+                     ein zeiger- oder feldtyp hat keinen namen, unter dem das stehen koennte",
+                    iface
+                ),
+            );
+            return false;
+        }
+    };
+    if umsetzung_da(iface, &typname) {
+        return true;
+    }
+    // Kein `impl I for T`. Jetzt die nuetzliche Meldung: welche Methoden der
+    // Schnittstelle hat der Typ ueberhaupt schon?
+    let methoden = REG.with(|r| r.borrow().ifaces[ii].methoden.clone());
+    let mut fehlen: Vec<String> = Vec::new();
+    for m in &methoden {
+        let voll = format!("{}{}{}", typname, crate::impls::TRENNER, m.name);
+        if !fnamen.contains(&voll) {
+            fehlen.push(kopf_signatur(m));
+        }
+    }
+    let note = if methoden.is_empty() {
+        format!("'{}' hat keine methode; es fehlt nur 'impl {} for {}'", iface, iface, typname)
+    } else if fehlen.is_empty() {
+        format!(
+            "'{}' hat alle methoden von '{}'; es fehlt der block 'impl {} for {} {{ … }}'",
+            typname, iface, iface, typname
+        )
+    } else {
+        format!(
+            "es fehlt {} in 'impl {} for {} {{ … }}'",
+            fehlen
+                .iter()
+                .map(|x| format!("'{}'", x))
+                .collect::<Vec<_>>()
+                .join(" und "),
+            iface,
+            typname
+        )
+    };
+    dg.error_note(
+        span,
+        format!(
+            "typ '{}' setzt die schnittstelle '{}' nicht um — schranke am typparameter '{}' von '{}'",
+            typname, iface, pname, basis
+        ),
+        note,
+    );
+    false
 }
 
 // ------------------------------------------------------------------- Parser
@@ -344,6 +575,12 @@ fn methodenkopf(p: &mut Parser, iface: &str) -> Option<Methode> {
         ));
         return None;
     }
+    // `Self` (Runde 50): der Typ, der die Schnittstelle umsetzt. Erst damit
+    // laesst sich eine Ordnung aufschreiben — `fn kleiner(*self, b: *Self)`.
+    // Ohne `Self` muesste in der Schnittstelle ein KONKRETER Typ stehen, und
+    // eine allgemeine `Ord` waere unmoeglich.
+    let hat_self =
+        params.iter().any(nennt_self) || ret.as_ref().map(nennt_self).unwrap_or(false);
     Some(Methode {
         name,
         params,
@@ -353,6 +590,7 @@ fn methodenkopf(p: &mut Parser, iface: &str) -> Option<Methode> {
         ptypen: Vec::new(),
         rtyp: Type::Void,
         aufgeloest: false,
+        hat_self,
     })
 }
 
@@ -490,15 +728,32 @@ fn typ_struct(ck: &Checker, name: &str) -> Result<usize, bool> {
 }
 
 /// Lesbare Signatur einer Schnittstellenmethode (fuer die Fehlermeldung).
-fn signatur(ck: &Checker, m: &Methode) -> String {
+///
+/// Die Typen werden ausdruecklich uebergeben: bei einer Signatur mit `Self`
+/// stehen sie nicht in der Schnittstelle, sondern haengen an der Umsetzung.
+fn signatur(ck: &Checker, m: &Methode, ptypen: &[Type], rtyp: &Type) -> String {
     let mut s = String::from(if m.veraenderlich { "*mut self" } else { "*self" });
-    for t in &m.ptypen {
+    for t in ptypen {
         s.push_str(", ");
         s.push_str(&ck.tcx.name_of(t));
     }
-    match &m.rtyp {
+    match rtyp {
         Type::Void => format!("fn {}({})", m.name, s),
         r => format!("fn {}({}) -> {}", m.name, s, ck.tcx.name_of(r)),
+    }
+}
+
+/// Loest einen Typ der Schnittstelle auf und setzt dabei `Self` ein.
+fn resolve_mit_self(ck: &mut Checker, te: &TypeExpr, selbst: &Type) -> Type {
+    match te {
+        TypeExpr::Named(n, _) if n == "Self" => selbst.clone(),
+        TypeExpr::Ptr { mutable, inner, .. } => {
+            Type::ptr(resolve_mit_self(ck, inner, selbst), *mutable)
+        }
+        TypeExpr::Array { elem, len, .. } => {
+            Type::Array(Box::new(resolve_mit_self(ck, elem, selbst)), *len)
+        }
+        _ => ck.resolve_ty(te),
     }
 }
 
@@ -510,12 +765,21 @@ pub(crate) fn hook_check_impls(ck: &mut Checker) {
     for i in 0..n {
         let anz = REG.with(|r| r.borrow().ifaces[i].methoden.len());
         for k in 0..anz {
-            let (fertig, params, ret) = REG.with(|r| {
+            let (fertig, params, ret, hat_self) = REG.with(|r| {
                 let reg = r.borrow();
                 let m = &reg.ifaces[i].methoden[k];
-                (m.aufgeloest, m.params.clone(), m.ret.clone())
+                (m.aufgeloest, m.params.clone(), m.ret.clone(), m.hat_self)
             });
             if fertig {
+                continue;
+            }
+            // Eine Signatur mit `Self` hat GLOBAL keine Typen — sie bekommt
+            // sie erst je Umsetzung (`pruefe_umsetzung`). Hier aufzuloesen
+            // hiesse, `Self` als gewoehnlichen Typnamen zu suchen, und das
+            // waere eine Fehlermeldung ueber einen Typ, den niemand
+            // deklarieren wollte.
+            if hat_self {
+                REG.with(|r| r.borrow_mut().ifaces[i].methoden[k].aufgeloest = true);
                 continue;
             }
             let pt: Vec<Type> = params.iter().map(|t| ck.resolve_ty(t)).collect();
@@ -570,22 +834,51 @@ fn pruefe_umsetzung(ck: &mut Checker, u: usize, iface: &str, typ: &str, span: Sp
             return;
         }
     };
-    let sidx = match typ_struct(ck, typ) {
-        Ok(i) => i,
-        Err(mehrdeutig) => {
-            if mehrdeutig {
-                ck.dg.error_note(
-                    span,
-                    format!("der typ '{}' ist mehrdeutig", typ),
-                    "mehrere module deklarieren einen typ dieses namens".to_string(),
-                );
-            } else {
-                ck.dg.error(span, format!("unbekannter typ '{}'", typ));
-            }
+    // TRAEGER DER UMSETZUNG: ein Struct oder — seit Runde 50 — ein eingebauter
+    // GRUNDTYP. Ein Grundtyp steht nicht in der Structtabelle; `struct_idx`
+    // bleibt dann `usize::MAX`, und alles, was diesen Index braucht
+    // (Methodentafel, `as dyn I`), gilt fuer ihn nicht. Der dynamische Versand
+    // ueber einen Grundtyp ist damit ausgeschlossen, der statische nicht — und
+    // genau der wird gebraucht (`vec_sortiere[i32]`).
+    // GRUNDTYP ZUERST. `i32` heisst immer der eingebaute Typ; die
+    // Endungssuche in `typ_struct` (drittes Feld: „genau ein Struct, dessen
+    // Name auf `__<Name>` endet") wuerde sonst `Vec__i32` finden — der ist
+    // `Vec[i32]` und nicht `i32`.
+    if let Some(t) = grundtyp_von_name(typ) {
+        return pruefe_umsetzung_am(ck, u, iface, ii, typ, span, usize::MAX, t);
+    }
+    let (sidx, selbst_typ) = match typ_struct(ck, typ) {
+        Ok(i) => (i, Type::Struct(i)),
+        Err(true) => {
+            ck.dg.error_note(
+                span,
+                format!("der typ '{}' ist mehrdeutig", typ),
+                "mehrere module deklarieren einen typ dieses namens".to_string(),
+            );
+            return;
+        }
+        Err(false) => {
+            ck.dg.error(span, format!("unbekannter typ '{}'", typ));
             return;
         }
     };
-    if ck.tcx.structs[sidx].name.starts_with(P_DYN) {
+    pruefe_umsetzung_am(ck, u, iface, ii, typ, span, sidx, selbst_typ)
+}
+
+/// Der zweite Teil: die Umsetzung gegen einen BEKANNTEN Traeger pruefen.
+/// `sidx == usize::MAX` heisst „Grundtyp" — dann gibt es keinen Struct und
+/// damit weder Methodentafel noch `as dyn I`.
+fn pruefe_umsetzung_am(
+    ck: &mut Checker,
+    u: usize,
+    iface: &str,
+    ii: usize,
+    typ: &str,
+    span: Span,
+    sidx: usize,
+    selbst_typ: Type,
+) {
+    if sidx != usize::MAX && ck.tcx.structs[sidx].name.starts_with(P_DYN) {
         ck.dg.error_note(
             span,
             format!("'{}' ist eine schnittstelle und kein typ", typ),
@@ -593,14 +886,26 @@ fn pruefe_umsetzung(ck: &mut Checker, u: usize, iface: &str, typ: &str, span: Sp
         );
         return;
     }
-    // Doppelte Umsetzung — verglichen wird der AUFGELOESTE Struct, damit
-    // `impl I for T` und `impl I for modul.T` als dasselbe erkannt werden.
+    let praefix = if sidx == usize::MAX {
+        typ.to_string()
+    } else {
+        methodenpraefix(&ck.tcx, sidx)
+    };
+    let anzeige = if sidx == usize::MAX {
+        typ.to_string()
+    } else {
+        ck.tcx.structs[sidx].name.clone()
+    };
+    // Doppelte Umsetzung — verglichen wird der METHODENPRAEFIX des
+    // aufgeloesten Traegers, damit `impl I for T` und `impl I for modul.T`
+    // als dasselbe erkannt werden und Grundtypen mitzaehlen. (Ein leerer
+    // Praefix heisst: jene Umsetzung war schon fehlerhaft.)
     let doppelt = REG.with(|r| {
         r.borrow()
             .impls
             .iter()
             .take(u)
-            .any(|x| x.iface == iface && x.struct_idx == sidx)
+            .any(|x| x.iface == iface && !x.praefix.is_empty() && x.praefix == praefix)
     });
     if doppelt {
         ck.dg.error(
@@ -609,16 +914,30 @@ fn pruefe_umsetzung(ck: &mut Checker, u: usize, iface: &str, typ: &str, span: Sp
         );
         return;
     }
-    let praefix = methodenpraefix(&ck.tcx, sidx);
     REG.with(|r| {
         let mut reg = r.borrow_mut();
         reg.impls[u].struct_idx = sidx;
         reg.impls[u].praefix = praefix.clone();
     });
-    let anzeige = ck.tcx.structs[sidx].name.clone();
     let methoden = REG.with(|r| r.borrow().ifaces[ii].methoden.clone());
     let mut vollstaendig = true;
     for m in &methoden {
+        // Bei `Self` haengen die Typen an DIESER Umsetzung, nicht an der
+        // Schnittstelle — deshalb hier aufgeloest und nicht in Schritt 1.
+        let (ptypen, rtyp): (Vec<Type>, Type) = if m.hat_self {
+            (
+                m.params
+                    .iter()
+                    .map(|t| resolve_mit_self(ck, t, &selbst_typ))
+                    .collect(),
+                match &m.ret {
+                    Some(t) => resolve_mit_self(ck, t, &selbst_typ),
+                    None => Type::Void,
+                },
+            )
+        } else {
+            (m.ptypen.clone(), m.rtyp.clone())
+        };
         let voll = format!("{}{}{}", praefix, crate::impls::TRENNER, m.name);
         let sig = match ck.fns.get(&voll) {
             Some(s) => s.clone(),
@@ -630,14 +949,14 @@ fn pruefe_umsetzung(ck: &mut Checker, u: usize, iface: &str, typ: &str, span: Sp
                         "'{}' setzt die methode '{}.{}' nicht um",
                         anzeige, iface, m.name
                     ),
-                    format!("erwartet wird '{}' im block", signatur(ck, m)),
+                    format!("erwartet wird '{}' im block", signatur(ck, m, &ptypen, &rtyp)),
                 );
                 continue;
             }
         };
         // Empfaenger: ein Zeiger auf GENAU diesen Typ.
         let empf_ok = match sig.params.first() {
-            Some(Type::Ptr { inner, .. }) => **inner == Type::Struct(sidx),
+            Some(Type::Ptr { inner, .. }) => **inner == selbst_typ,
             _ => false,
         };
         if !empf_ok {
@@ -648,11 +967,11 @@ fn pruefe_umsetzung(ck: &mut Checker, u: usize, iface: &str, typ: &str, span: Sp
                     "der empfaenger von '{}.{}' passt nicht zu '{}'",
                     anzeige, m.name, iface
                 ),
-                format!("erwartet wird '{}' im block", signatur(ck, m)),
+                format!("erwartet wird '{}' im block", signatur(ck, m, &ptypen, &rtyp)),
             );
             continue;
         }
-        if sig.params.len() != m.ptypen.len() + 1 {
+        if sig.params.len() != ptypen.len() + 1 {
             vollstaendig = false;
             ck.dg.error_note(
                 span,
@@ -662,14 +981,14 @@ fn pruefe_umsetzung(ck: &mut Checker, u: usize, iface: &str, typ: &str, span: Sp
                     m.name,
                     sig.params.len() - 1,
                     iface,
-                    m.ptypen.len()
+                    ptypen.len()
                 ),
-                format!("erwartet wird '{}' im block", signatur(ck, m)),
+                format!("erwartet wird '{}' im block", signatur(ck, m, &ptypen, &rtyp)),
             );
             continue;
         }
         let mut passend = true;
-        for (k, erwartet) in m.ptypen.iter().enumerate() {
+        for (k, erwartet) in ptypen.iter().enumerate() {
             let ist = &sig.params[k + 1];
             if !passt(ist, erwartet) {
                 passend = false;
@@ -684,7 +1003,7 @@ fn pruefe_umsetzung(ck: &mut Checker, u: usize, iface: &str, typ: &str, span: Sp
                         iface,
                         ck.tcx.name_of(erwartet)
                     ),
-                    format!("erwartet wird '{}' im block", signatur(ck, m)),
+                    format!("erwartet wird '{}' im block", signatur(ck, m, &ptypen, &rtyp)),
                 );
                 break;
             }
@@ -693,7 +1012,7 @@ fn pruefe_umsetzung(ck: &mut Checker, u: usize, iface: &str, typ: &str, span: Sp
             vollstaendig = false;
             continue;
         }
-        if !passt(&sig.ret, &m.rtyp) {
+        if !passt(&sig.ret, &rtyp) {
             vollstaendig = false;
             ck.dg.error_note(
                 span,
@@ -703,9 +1022,9 @@ fn pruefe_umsetzung(ck: &mut Checker, u: usize, iface: &str, typ: &str, span: Sp
                     m.name,
                     ck.tcx.name_of(&sig.ret),
                     iface,
-                    ck.tcx.name_of(&m.rtyp)
+                    ck.tcx.name_of(&rtyp)
                 ),
-                format!("erwartet wird '{}' im block", signatur(ck, m)),
+                format!("erwartet wird '{}' im block", signatur(ck, m, &ptypen, &rtyp)),
             );
         }
     }
@@ -916,6 +1235,27 @@ pub(crate) fn hook_methode(
             return Type::Error;
         }
     };
+    // OBJEKTSICHERHEIT (Runde 50): eine Signatur mit `Self` kennt der Aufrufer
+    // ueber `dyn I` nicht — welcher Typ dahintersteckt, steht erst zur
+    // Laufzeit fest, und `*Self` waere fuer jeden ein anderer Typ. Solche
+    // Methoden gibt es nur STATISCH, ueber eine Schranke.
+    if m.hat_self {
+        for a in &args[1..] {
+            ck.type_out_expr(a);
+        }
+        ck.dg.error_note(
+            nspan,
+            format!(
+                "'{}.{}' nennt 'Self' und ist deshalb nicht ueber 'dyn {}' aufrufbar",
+                iface, methode, iface
+            ),
+            format!(
+                "rufe sie ueber eine schranke auf: 'fn f[T: {}](x: *T)' — dort steht der typ fest",
+                iface
+            ),
+        );
+        return Type::Error;
+    }
     if ist_zeiger {
         if let Some(empf) = args.first() {
             ck.dg.error_note(
