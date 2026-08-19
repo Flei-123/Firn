@@ -7,7 +7,7 @@
 #      have to yield the same balance)
 #   3. tools/tokenizer/harness.py: 6,810 cases, a balance per .test file
 #      (the 4 xmlViolationTests run in XML mode, counter-check without it);
-#      TWO quotas: only the token stream and additionally `--mit-fehlern`, which
+#      TWO quotas: only the token stream and additionally `--with-errors`, which
 #      compares the 'errors' lists (WHATWG code name, line, column) exactly
 #   4. throughput in MB/s on the test corpus; if bench/tokenizer/ is built,
 #      html5ever next to it on THE SAME corpus
