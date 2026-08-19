@@ -28,6 +28,9 @@
 #   9. HTML5-Tokenizer (lib/html/, in Firn) gegen die offizielle
 #      html5lib-Testsuite: exakte Quote aus 6.810 Faellen, Schranke in
 #      tools/tokenizer/mindestquote.txt (tools/tokenizer/run.sh).
+#   9b. HTML-Baumkonstruktion und DOM-Kern (lib/browser/, in Firn) gegen
+#      die eigenen Faelle aus dem WHATWG-Standard, gegen echte Seiten und
+#      im Dauerlauf mit Gegenprobe (tools/html/run.sh, docs/RUNDE54.md).
 #  18. Paket- und Projektsystem (tools/pakete/run.sh): Manifest, Such-
 #      reihenfolge, Sichtbarkeit, Bau-Treiber — in BEIDEN Uebersetzern.
 #  19. Freistehendes Uebersetzen (tools/freistehend/run.sh, Runde 52):
@@ -254,6 +257,20 @@ if [ "$TKRC" -eq 0 ]; then
 else
     bad "tools/tokenizer/run.sh schlug fehl (siehe .test-work/tokenizer.log)"
     tail -20 "$WORK/tokenizer.log" | sed 's/^/   /'
+fi
+
+echo "== 9b. HTML-Baumkonstruktion + DOM-Kern (tools/html/run.sh) =="
+# Der Baumaufbau in Firn (lib/browser/) gegen die eigenen Faelle aus dem
+# WHATWG-Standard, dazu die echten Seiten aus testdata/realweb/ und der
+# Dauerlauf mit Gegenprobe. Kurzfassung; der volle Lauf steht in
+# docs/RUNDE54.md.
+bash tools/html/run.sh --schnell > "$WORK/baum.log" 2>&1 && BMRC=0 || BMRC=$?
+if [ "$BMRC" -eq 0 ]; then
+    ok
+    grep -E '^GESAMT|^OK:' "$WORK/baum.log" | sed 's/^/   /'
+else
+    bad "tools/html/run.sh schlug fehl (siehe .test-work/baum.log)"
+    tail -20 "$WORK/baum.log" | sed 's/^/   /'
 fi
 
 echo "== 10. DOM-Dauerlauf: Zyklen ohne Leck (tools/dom_soak/run.sh) =="

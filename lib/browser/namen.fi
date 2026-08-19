@@ -1,0 +1,393 @@
+// lib/browser/namen.fi — ATOMTABELLE fuer Element- und Attributnamen.
+//
+// SPEC §8.3 (`Z4`) nennt Atome als eigenen Zeichenkettentyp: eine `u32`-
+// Kennung in eine globale Tabelle, gedacht genau fuer Tag-, Attribut- und
+// Eigenschaftsnamen. Diese Datei ist die Umsetzung fuer den Baumaufbau.
+//
+// WARUM DAS DIE WICHTIGSTE ENTSCHEIDUNG DES BAUMAUFBAUS IST: die
+// WHATWG-Baumkonstruktion besteht zu einem grossen Teil aus Fragen der Form
+// "ist der Name des aktuellen Knotens einer aus dieser Liste von 40 Namen".
+// Mit Zeichenketten waere jede solche Frage ein Haufen `memcmp`. Mit Atomen
+// ist sie ein Ganzzahlvergleich, und weil die 123 bekannten Namen eine FESTE
+// Kennung haben (lib/browser/tag.fi, erzeugt), sind die Vergleichswerte
+// Uebersetzungszeitkonstanten.
+//
+// Ablage:
+//   * `text`  — alle Namen hintereinander, WTF-8. WTF-8 und nicht UTF-8, weil
+//               ein Tagname ungepaarte Surrogate enthalten kann (der Tokenizer
+//               reicht sie durch, SPEC §8.2).
+//   * `off`/`laenge` — je Kennung ein Paar. Kennung 0 ist "kein Name".
+//   * `streu` — offene Adressierung mit linearer Sondierung, Kapazitaet immer
+//               Zweierpotenz, Lastgrenze 1/2. Werte sind Kennungen, 0 = leer.
+//
+// Diese Datei ist vollstaendig `#[no_gc]`: sie kommt ohne den Sammler aus und
+// darf deshalb auch aus heissen Pfaden gerufen werden (SPEC §3.5.4).
+
+import html.mem
+import browser.tag
+
+export {
+    Namen,
+    namen_neu, namen_init, namen_frei,
+    namen_von_bytes, namen_von_cp, namen_finde_bytes,
+    namen_ptr, namen_laenge, namen_anzahl,
+    namen_nach_cpbuf, namen_gleich_ascii,
+    cp_nach_wtf8,
+}
+
+const STREU_START: usize = 512
+
+struct Namen {
+    text: mem.Buf,      // alle Namen hintereinander (WTF-8)
+    off: *mut u32,      // je Kennung: Anfang in `text`
+    laenge: *mut u32,   // je Kennung: Laenge in Bytes
+    kap: usize,         // Plaetze in off/laenge
+    n: usize,           // vergebene Kennungen (1..n)
+    streu: *mut u32,    // Streutabelle, Werte = Kennung (0 = leer)
+    skap: usize,        // Zweierpotenz
+    tmp: mem.Buf,       // Arbeitspuffer fuer die WTF-8-Kodierung
+    ok: bool,           // Aufbau gelungen?
+}
+
+#[no_gc]
+fn namen_neu() -> Namen {
+    return Namen{
+        text: mem.buf_neu(),
+        off: 0 as *mut u32,
+        laenge: 0 as *mut u32,
+        kap: 0,
+        n: 0,
+        streu: 0 as *mut u32,
+        skap: 0,
+        tmp: mem.buf_neu(),
+        ok: false,
+    }
+}
+
+#[no_gc]
+fn u32_bei(p: *mut u32, i: usize) -> u32 {
+    return *((p as u64 + i as u64 * 4) as *mut u32)
+}
+
+#[no_gc]
+fn u32_setzen(p: *mut u32, i: usize, v: u32) {
+    *((p as u64 + i as u64 * 4) as *mut u32) = v
+}
+
+// FNV-1a ueber die Bytes. Klein, schnell, und fuer Namen dieser Laenge
+// (1..20 Bytes) voellig ausreichend.
+#[no_gc]
+fn streuwert(p: *mut u8, n: usize) -> u64 {
+    var h: u64 = 14695981039346656037
+    var i: usize = 0
+    while i < n {
+        h = h ^ ((*((p as u64 + i as u64) as *mut u8)) as u64)
+        h = h * 1099511628211
+        i = i + 1
+    }
+    return h
+}
+
+#[no_gc]
+fn bytes_gleich(a: *mut u8, b: *mut u8, n: usize) -> bool {
+    var i: usize = 0
+    while i < n {
+        if *((a as u64 + i as u64) as *mut u8) != *((b as u64 + i as u64) as *mut u8) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+#[no_gc]
+fn eintraege_wachsen(t: *mut Namen) -> bool {
+    var neu: usize = (*t).kap * 2
+    if neu == 0 {
+        neu = 256
+    }
+    let po: *mut u8 = mem.heap_alloc(neu * 4)
+    let pl: *mut u8 = mem.heap_alloc(neu * 4)
+    if po as u64 == 0 || pl as u64 == 0 {
+        return false
+    }
+    if (*t).kap > 0 {
+        mem.mem_copy(po, (*t).off as *mut u8, (*t).kap * 4)
+        mem.mem_copy(pl, (*t).laenge as *mut u8, (*t).kap * 4)
+        mem.heap_free((*t).off as *mut u8, (*t).kap * 4)
+        mem.heap_free((*t).laenge as *mut u8, (*t).kap * 4)
+    }
+    (*t).off = po as *mut u32
+    (*t).laenge = pl as *mut u32
+    (*t).kap = neu
+    return true
+}
+
+#[no_gc]
+fn streu_einfuegen_roh(t: *mut Namen, id: u32) {
+    let p: *mut u8 = namen_ptr(t, id)
+    let n: usize = namen_laenge(t, id)
+    let maske: u64 = (*t).skap as u64 - 1
+    var i: u64 = streuwert(p, n) & maske
+    while u32_bei((*t).streu, i as usize) != 0 as u32 {
+        i = (i + 1) & maske
+    }
+    u32_setzen((*t).streu, i as usize, id)
+}
+
+#[no_gc]
+fn streu_wachsen(t: *mut Namen) -> bool {
+    var neu: usize = (*t).skap * 2
+    if neu == 0 {
+        neu = STREU_START
+    }
+    let p: *mut u8 = mem.heap_alloc(neu * 4)
+    if p as u64 == 0 {
+        return false
+    }
+    var i: usize = 0
+    while i < neu {
+        u32_setzen(p as *mut u32, i, 0)
+        i = i + 1
+    }
+    let alt: *mut u32 = (*t).streu
+    let altkap: usize = (*t).skap
+    (*t).streu = p as *mut u32
+    (*t).skap = neu
+    var id: u32 = 1
+    while id as usize <= (*t).n {
+        streu_einfuegen_roh(t, id)
+        id = id + 1
+    }
+    if altkap > 0 {
+        mem.heap_free(alt as *mut u8, altkap * 4)
+    }
+    return true
+}
+
+// Kennung eines Namens; legt ihn an, wenn er neu ist. 0 = Speicher aus.
+#[no_gc]
+fn namen_von_bytes(t: *mut Namen, p: *mut u8, n: usize) -> u32 {
+    let vorhanden: u32 = namen_finde_bytes(t, p, n)
+    if vorhanden != 0 as u32 {
+        return vorhanden
+    }
+    if (*t).n + 1 >= (*t).kap {
+        if !eintraege_wachsen(t) {
+            return 0
+        }
+    }
+    // Lastgrenze 1/2: bei mehr Fuellung steigen die Sondierschritte spuerbar.
+    if ((*t).n + 1) * 2 >= (*t).skap {
+        if !streu_wachsen(t) {
+            return 0
+        }
+    }
+    let start: usize = mem.buf_len(&(*t).text)
+    var i: usize = 0
+    while i < n {
+        mem.buf_push(&(*t).text, *((p as u64 + i as u64) as *mut u8))
+        i = i + 1
+    }
+    let id: u32 = ((*t).n + 1) as u32
+    u32_setzen((*t).off, id as usize, start as u32)
+    u32_setzen((*t).laenge, id as usize, n as u32)
+    (*t).n = (*t).n + 1
+    streu_einfuegen_roh(t, id)
+    return id
+}
+
+// Kennung eines Namens, ohne ihn anzulegen. 0 = unbekannt.
+#[no_gc]
+fn namen_finde_bytes(t: *mut Namen, p: *mut u8, n: usize) -> u32 {
+    if (*t).skap == 0 {
+        return 0
+    }
+    let maske: u64 = (*t).skap as u64 - 1
+    var i: u64 = streuwert(p, n) & maske
+    while true {
+        let id: u32 = u32_bei((*t).streu, i as usize)
+        if id == 0 as u32 {
+            return 0
+        }
+        if namen_laenge(t, id) == n && bytes_gleich(namen_ptr(t, id), p, n) {
+            return id
+        }
+        i = (i + 1) & maske
+    }
+    return 0
+}
+
+// Codepunkte -> WTF-8 in `out`. Ungepaarte Surrogate bleiben als
+// Dreibytefolge erhalten (das ist der Unterschied zu UTF-8, SPEC §8.2).
+#[no_gc]
+fn cp_nach_wtf8(b: *mut mem.CpBuf, out: *mut mem.Buf) {
+    mem.buf_clear(out)
+    let n: usize = mem.cp_len(b)
+    var i: usize = 0
+    while i < n {
+        let c: u32 = mem.cp_at(b, i)
+        if c < 0x80 as u32 {
+            mem.buf_push(out, c as u8)
+        } else if c < 0x800 as u32 {
+            mem.buf_push(out, (0xC0 as u32 | (c >> 6)) as u8)
+            mem.buf_push(out, (0x80 as u32 | (c & 0x3F as u32)) as u8)
+        } else if c < 0x10000 as u32 {
+            mem.buf_push(out, (0xE0 as u32 | (c >> 12)) as u8)
+            mem.buf_push(out, (0x80 as u32 | ((c >> 6) & 0x3F as u32)) as u8)
+            mem.buf_push(out, (0x80 as u32 | (c & 0x3F as u32)) as u8)
+        } else {
+            mem.buf_push(out, (0xF0 as u32 | (c >> 18)) as u8)
+            mem.buf_push(out, (0x80 as u32 | ((c >> 12) & 0x3F as u32)) as u8)
+            mem.buf_push(out, (0x80 as u32 | ((c >> 6) & 0x3F as u32)) as u8)
+            mem.buf_push(out, (0x80 as u32 | (c & 0x3F as u32)) as u8)
+        }
+        i = i + 1
+    }
+}
+
+// Kennung eines Namens aus einem Codepunktpuffer des Tokenizers.
+#[no_gc]
+fn namen_von_cp(t: *mut Namen, b: *mut mem.CpBuf) -> u32 {
+    cp_nach_wtf8(b, &(*t).tmp)
+    return namen_von_bytes(t, mem.buf_ptr(&(*t).tmp), mem.buf_len(&(*t).tmp))
+}
+
+#[no_gc]
+fn namen_ptr(t: *mut Namen, id: u32) -> *mut u8 {
+    if id == 0 as u32 || id as usize > (*t).n {
+        return 0 as *mut u8
+    }
+    return (mem.buf_ptr(&(*t).text) as u64 + u32_bei((*t).off, id as usize) as u64) as *mut u8
+}
+
+#[no_gc]
+fn namen_laenge(t: *mut Namen, id: u32) -> usize {
+    if id == 0 as u32 || id as usize > (*t).n {
+        return 0
+    }
+    return u32_bei((*t).laenge, id as usize) as usize
+}
+
+#[no_gc]
+fn namen_anzahl(t: *mut Namen) -> usize {
+    return (*t).n
+}
+
+// Haengt den Namen als Codepunkte an einen Puffer an (Ausgabeweg).
+// Die Ablage ist WTF-8, also wird hier dekodiert.
+#[no_gc]
+fn namen_nach_cpbuf(t: *mut Namen, id: u32, out: *mut mem.CpBuf) {
+    let p: *mut u8 = namen_ptr(t, id)
+    let n: usize = namen_laenge(t, id)
+    var i: usize = 0
+    while i < n {
+        let c0: u32 = (*((p as u64 + i as u64) as *mut u8)) as u32
+        var cp: u32 = c0
+        var breite: usize = 1
+        if c0 >= 0xF0 as u32 {
+            breite = 4
+            cp = ((c0 & 0x07 as u32) << 18) |
+                ((byte_bei(p, n, i + 1) & 0x3F as u32) << 12) |
+                ((byte_bei(p, n, i + 2) & 0x3F as u32) << 6) |
+                (byte_bei(p, n, i + 3) & 0x3F as u32)
+        } else if c0 >= 0xE0 as u32 {
+            breite = 3
+            cp = ((c0 & 0x0F as u32) << 12) |
+                ((byte_bei(p, n, i + 1) & 0x3F as u32) << 6) |
+                (byte_bei(p, n, i + 2) & 0x3F as u32)
+        } else if c0 >= 0xC0 as u32 {
+            breite = 2
+            cp = ((c0 & 0x1F as u32) << 6) | (byte_bei(p, n, i + 1) & 0x3F as u32)
+        }
+        mem.cp_push(out, cp)
+        i = i + breite
+    }
+}
+
+#[no_gc]
+fn byte_bei(p: *mut u8, n: usize, i: usize) -> u32 {
+    if i >= n {
+        return 0
+    }
+    return (*((p as u64 + i as u64) as *mut u8)) as u32
+}
+
+#[no_gc]
+fn namen_gleich_ascii(t: *mut Namen, id: u32, p: *mut u8, n: usize) -> bool {
+    if namen_laenge(t, id) != n {
+        return false
+    }
+    return bytes_gleich(namen_ptr(t, id), p, n)
+}
+
+// Legt die feste Tabelle an: die 123 bekannten Namen bekommen die Kennungen
+// 1..123, in der Reihenfolge von lib/browser/tag.fi. `false` = Speicher
+// aus; der Aufrufer MUSS dann sichtbar scheitern.
+#[no_gc]
+fn namen_init(t: *mut Namen) -> bool {
+    mem.buf_init(&(*t).text)
+    mem.buf_init(&(*t).tmp)
+    (*t).off = 0 as *mut u32
+    (*t).laenge = 0 as *mut u32
+    (*t).kap = 0
+    (*t).n = 0
+    (*t).streu = 0 as *mut u32
+    (*t).skap = 0
+    (*t).ok = false
+
+    var roh: mem.Buf = mem.buf_neu()
+    mem.buf_init(&roh)
+    tag.tab_bytes(&roh)
+    let ges: usize = mem.buf_len(&roh)
+    let basis: *mut u8 = mem.buf_ptr(&roh)
+    var i: usize = 0
+    var zahl: u32 = 0
+    while i < ges {
+        var j: usize = i
+        while j < ges && *((basis as u64 + j as u64) as *mut u8) != 32 as u8 {
+            j = j + 1
+        }
+        if j > i {
+            let id: u32 = namen_von_bytes(t, (basis as u64 + i as u64) as *mut u8, j - i)
+            if id == 0 as u32 {
+                mem.buf_free(&roh)
+                return false
+            }
+            zahl = zahl + 1
+            // Die Reihenfolge MUSS stimmen, sonst zeigen alle Konstanten
+            // aus tag.fi ins Leere. Lieber hier sichtbar scheitern.
+            if id != zahl {
+                mem.buf_free(&roh)
+                return false
+            }
+        }
+        i = j + 1
+    }
+    mem.buf_free(&roh)
+    if zahl != tag.M_LETZTES_FEST {
+        return false
+    }
+    (*t).ok = true
+    return true
+}
+
+#[no_gc]
+fn namen_frei(t: *mut Namen) {
+    mem.buf_free(&(*t).text)
+    mem.buf_free(&(*t).tmp)
+    if (*t).kap > 0 {
+        mem.heap_free((*t).off as *mut u8, (*t).kap * 4)
+        mem.heap_free((*t).laenge as *mut u8, (*t).kap * 4)
+        (*t).off = 0 as *mut u32
+        (*t).laenge = 0 as *mut u32
+        (*t).kap = 0
+    }
+    if (*t).skap > 0 {
+        mem.heap_free((*t).streu as *mut u8, (*t).skap * 4)
+        (*t).streu = 0 as *mut u32
+        (*t).skap = 0
+    }
+    (*t).n = 0
+    (*t).ok = false
+}

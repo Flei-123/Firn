@@ -1,0 +1,239 @@
+// lib/browser/schreiben.fi — Baumausgabe im html5lib-Format.
+//
+// Das Format der `tree-construction`-Testdaten von html5lib. Bewusst genau
+// dieses und kein eigenes: liegen die Originaldaten eines Tages vor, laeuft
+// derselbe Laeufer ohne Aenderung dagegen.
+//
+//     | <!DOCTYPE html>
+//     | <html>
+//     |   <head>
+//     |   <body>
+//     |     <div>
+//     |       id="a"
+//     |       "Text"
+//     |       <!-- Kommentar -->
+//
+// Regeln, die leicht uebersehen werden und hier ausdruecklich stehen:
+//   * je Ebene ZWEI Leerzeichen, beginnend bei den Kindern des Dokuments
+//     (Ebene 0 = "| ").
+//   * Attribute stehen VOR den Kindern, eine Ebene tiefer als ihr Element,
+//     und sind nach dem Namen SORTIERT (der DOM behaelt die Reihenfolge des
+//     Quelltexts — nur die Ausgabe sortiert).
+//   * Elemente ausserhalb des HTML-Namensraums bekommen ein Praefix:
+//     `<svg circle>`, `<math mi>`.
+//   * Textknoten stehen in doppelten Anfuehrungszeichen, ohne Maskierung —
+//     genau wie in den Originaldaten.
+
+import html.mem
+import browser.knoten
+import browser.namen
+
+export { baum_schreiben, kette_nach_buf, cp_nach_buf }
+
+const MAX_ATTR_SORT: usize = 128
+
+#[no_gc]
+fn cp_nach_buf(out: *mut mem.Buf, c: u32) {
+    if c < 0x80 as u32 {
+        mem.buf_push(out, c as u8)
+    } else if c < 0x800 as u32 {
+        mem.buf_push(out, (0xC0 as u32 | (c >> 6)) as u8)
+        mem.buf_push(out, (0x80 as u32 | (c & 0x3F as u32)) as u8)
+    } else if c < 0x10000 as u32 {
+        mem.buf_push(out, (0xE0 as u32 | (c >> 12)) as u8)
+        mem.buf_push(out, (0x80 as u32 | ((c >> 6) & 0x3F as u32)) as u8)
+        mem.buf_push(out, (0x80 as u32 | (c & 0x3F as u32)) as u8)
+    } else {
+        mem.buf_push(out, (0xF0 as u32 | (c >> 18)) as u8)
+        mem.buf_push(out, (0x80 as u32 | ((c >> 12) & 0x3F as u32)) as u8)
+        mem.buf_push(out, (0x80 as u32 | ((c >> 6) & 0x3F as u32)) as u8)
+        mem.buf_push(out, (0x80 as u32 | (c & 0x3F as u32)) as u8)
+    }
+}
+
+fn kette_nach_buf(k: Gc[Kette], out: *mut mem.Buf) {
+    if k == gc_null[Kette]() {
+        return
+    }
+    var s: Gc[Strang] = k.erstes
+    while s != gc_null[Strang]() {
+        var i: usize = 0
+        let n: usize = s.len as usize
+        while i < n {
+            cp_nach_buf(out, s.zeichen[i])
+            i = i + 1
+        }
+        s = s.naechster
+    }
+}
+
+#[no_gc]
+fn name_nach_buf(nm: *mut namen.Namen, id: u32, out: *mut mem.Buf) {
+    let p: *mut u8 = namen.namen_ptr(nm, id)
+    let n: usize = namen.namen_laenge(nm, id)
+    var i: usize = 0
+    while i < n {
+        mem.buf_push(out, *((p as u64 + i as u64) as *mut u8))
+        i = i + 1
+    }
+}
+
+#[no_gc]
+fn einrueckung(out: *mut mem.Buf, tiefe: u32) {
+    mem.buf_push(out, 124 as u8)      // |
+    mem.buf_push(out, 32 as u8)
+    var i: u32 = 0
+    while i < tiefe {
+        mem.buf_push(out, 32 as u8)
+        mem.buf_push(out, 32 as u8)
+        i = i + 1
+    }
+}
+
+#[no_gc]
+fn lit_nach_buf(out: *mut mem.Buf, p: *mut u8, n: usize) {
+    var i: usize = 0
+    while i < n {
+        mem.buf_push(out, *((p as u64 + i as u64) as *mut u8))
+        i = i + 1
+    }
+}
+
+// Vergleicht zwei Namen als Bytefolgen: kleiner, gleich, groesser.
+#[no_gc]
+fn name_kleiner(nm: *mut namen.Namen, a: u32, c: u32) -> bool {
+    let pa: *mut u8 = namen.namen_ptr(nm, a)
+    let pc: *mut u8 = namen.namen_ptr(nm, c)
+    let na: usize = namen.namen_laenge(nm, a)
+    let nc: usize = namen.namen_laenge(nm, c)
+    var i: usize = 0
+    while i < na && i < nc {
+        let x: u8 = *((pa as u64 + i as u64) as *mut u8)
+        let y: u8 = *((pc as u64 + i as u64) as *mut u8)
+        if x != y {
+            return x < y
+        }
+        i = i + 1
+    }
+    return na < nc
+}
+
+fn attribute_schreiben(nm: *mut namen.Namen, e: Gc[Element], out: *mut mem.Buf, tiefe: u32) {
+    let n: u32 = e.nattr
+    if n == 0 as u32 {
+        return
+    }
+    var feld: [Gc[Attribut]; 128] = [gc_null[Attribut](); 128]
+    var m: usize = 0
+    var a: Gc[Attribut] = e.erstes_attr
+    while a != gc_null[Attribut]() && m < MAX_ATTR_SORT {
+        feld[m] = a
+        m = m + 1
+        a = a.naechstes
+    }
+    // Einfuegesortierung: Attributzahlen sind einstellig bis zweistellig.
+    var i: usize = 1
+    while i < m {
+        let x: Gc[Attribut] = feld[i]
+        var j: usize = i
+        while j > 0 && name_kleiner(nm, x.name, feld[j - 1].name) {
+            feld[j] = feld[j - 1]
+            j = j - 1
+        }
+        feld[j] = x
+        i = i + 1
+    }
+    i = 0
+    while i < m {
+        let at: Gc[Attribut] = feld[i]
+        einrueckung(out, tiefe)
+        if at.ns == knoten.NS_XLINK {
+            var l: [u8; 6] = "xlink "
+            lit_nach_buf(out, &l[0], 6)
+        } else if at.ns == knoten.NS_XML {
+            var l: [u8; 4] = "xml "
+            lit_nach_buf(out, &l[0], 4)
+        } else if at.ns == knoten.NS_XMLNS {
+            var l: [u8; 6] = "xmlns "
+            lit_nach_buf(out, &l[0], 6)
+        }
+        name_nach_buf(nm, at.name, out)
+        mem.buf_push(out, 61 as u8)   // =
+        mem.buf_push(out, 34 as u8)   // "
+        kette_nach_buf(at.wert, out)
+        mem.buf_push(out, 34 as u8)
+        mem.buf_push(out, 10 as u8)
+        i = i + 1
+    }
+}
+
+fn knoten_schreiben(nm: *mut namen.Namen, k: Gc[Knoten], out: *mut mem.Buf, tiefe: u32) {
+    if k == gc_null[Knoten]() {
+        return
+    }
+    let art: u32 = k.art
+    if art == knoten.K_ELEMENT {
+        let e: Gc[Element] = k.as?[Element]
+        einrueckung(out, tiefe)
+        mem.buf_push(out, 60 as u8)   // <
+        if e.ns == knoten.NS_SVG {
+            var l: [u8; 4] = "svg "
+            lit_nach_buf(out, &l[0], 4)
+        } else if e.ns == knoten.NS_MATHML {
+            var l: [u8; 5] = "math "
+            lit_nach_buf(out, &l[0], 5)
+        }
+        name_nach_buf(nm, e.name, out)
+        mem.buf_push(out, 62 as u8)   // >
+        mem.buf_push(out, 10 as u8)
+        attribute_schreiben(nm, e, out, tiefe + 1)
+    } else if art == knoten.K_TEXT {
+        let t: Gc[Text] = k.as?[Text]
+        einrueckung(out, tiefe)
+        mem.buf_push(out, 34 as u8)
+        kette_nach_buf(t.daten, out)
+        mem.buf_push(out, 34 as u8)
+        mem.buf_push(out, 10 as u8)
+    } else if art == knoten.K_KOMMENTAR {
+        let c: Gc[Kommentar] = k.as?[Kommentar]
+        einrueckung(out, tiefe)
+        var l1: [u8; 5] = "<!-- "
+        lit_nach_buf(out, &l1[0], 5)
+        kette_nach_buf(c.daten, out)
+        var l2: [u8; 4] = " -->"
+        lit_nach_buf(out, &l2[0], 4)
+        mem.buf_push(out, 10 as u8)
+    } else if art == knoten.K_DOCTYPE {
+        let d: Gc[Doctype] = k.as?[Doctype]
+        einrueckung(out, tiefe)
+        var l1: [u8; 10] = "<!DOCTYPE "
+        lit_nach_buf(out, &l1[0], 10)
+        kette_nach_buf(d.name, out)
+        if d.hat_pubid || d.hat_sysid {
+            mem.buf_push(out, 32 as u8)
+            mem.buf_push(out, 34 as u8)
+            kette_nach_buf(d.pubid, out)
+            mem.buf_push(out, 34 as u8)
+            mem.buf_push(out, 32 as u8)
+            mem.buf_push(out, 34 as u8)
+            kette_nach_buf(d.sysid, out)
+            mem.buf_push(out, 34 as u8)
+        }
+        mem.buf_push(out, 62 as u8)   // >
+        mem.buf_push(out, 10 as u8)
+    }
+    var c: Gc[Knoten] = k.erstes_kind
+    while c != gc_null[Knoten]() {
+        knoten_schreiben(nm, c, out, tiefe + 1)
+        c = c.naechstes
+    }
+}
+
+// Schreibt den ganzen Baum. Die Kinder des Dokuments stehen auf Ebene 0.
+fn baum_schreiben(nm: *mut namen.Namen, d: Gc[Dokument], out: *mut mem.Buf) {
+    var c: Gc[Knoten] = d.erstes_kind
+    while c != gc_null[Knoten]() {
+        knoten_schreiben(nm, c, out, 0)
+        c = c.naechstes
+    }
+}
