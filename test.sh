@@ -399,6 +399,19 @@ else
     tail -20 "$WORK/pakete.log" | sed 's/^/   /'
 fi
 
+echo "== 21. Englisch-Umstellung: keine deutschen Bezeichner mehr (tools/englisch/pruefe.sh) =="
+# Etappe A (Runde 55): jeder Bezeichner in compiler/src, lib, bin, tools,
+# tests und demos wird gegen die Morphemtabelle gehalten. Ein Treffer heisst,
+# dass ein deutscher Name uebersehen wurde.
+bash tools/englisch/pruefe.sh > "$WORK/englisch.log" 2>&1 && ENRC=0 || ENRC=$?
+if [ "$ENRC" -eq 0 ]; then
+    ok
+    tail -1 "$WORK/englisch.log" | sed 's/^/   /'
+else
+    bad "tools/englisch/pruefe.sh meldet deutsche Bezeichner (siehe .test-work/englisch.log)"
+    tail -20 "$WORK/englisch.log" | sed 's/^/   /'
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then
