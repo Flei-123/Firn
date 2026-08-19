@@ -186,6 +186,52 @@ const S_FINUHR: u64 = 1944
 // Mehr als 64 Klassen: dann steht Bit 63 fuer "koennte sein" und es wird
 // nachgesehen — richtig bleibt es immer, nur nicht mehr ganz so billig.
 const S_WEAKMASK: u64 = 1952
+// ------------------------------------------------------------ Runde 49
+// Der Rettungsbereich der callee-saved Register. Er liegt am ENDE des
+// Zustandsblocks (compiler/src/gc.rs, REG_SAVE_OFF = 3968).
+//
+// BEFUND DER RUNDE 49: bis hierher stand in `__gc_collect_now`
+// `__gc_scan(regs, regs + 48)` mit `regs = __gc_save_regs()` — und
+// `__gc_save_regs()` liefert die Adresse des BLOCKS, nicht die des
+// Rettungsbereichs. Gescannt wurden also die ersten 48 Oktette des
+// Zustandsblocks (Typtabelle, S_INIT, Chunkliste, Stapelboden, zwei Zaehler)
+// statt der Register. Der KONSERVATIVE REGISTERSCAN aus SPEC §3.5.3 lief
+// damit ins Leere. Das faellt hier auf, weil die Runde denselben Mechanismus
+// je Faden braucht; die Zeile ist repariert und der Nachweis steht in
+// tools/faden/run.sh.
+const S_REGS: u64 = 3968
+// Fadentafel: Zeiger, Platzzahl, lebende Faeden, je gestartete Faeden.
+const S_FADEN_TAB: u64 = 1960
+const S_FADEN_MAX: u64 = 1968
+const S_FADEN_N: u64 = 1976
+const S_FADEN_GES: u64 = 1984
+// 1 = es gibt (oder gab) mehr als einen Faden. DER Schalter des heissen Weges:
+// solange er 0 ist, kostet die ganze Runde 49 nichts ausser einem
+// Speicherzugriff und einem immer gleich vorhergesagten Sprung.
+const S_MULTI: u64 = 1992
+// Futex-Wort: 1 = die Welt haelt an.
+const S_STOPP: u64 = 2000
+// Die GC-Sperre. Wer sie haelt, darf als Einziger die Welt anhalten (R1).
+const S_SPERRE: u64 = 2008
+// Drehsperre um den EINEN Registerrettungsbereich.
+const S_REGSPERRE: u64 = 2016
+// Sperre um die Fadentafel.
+const S_TSPERRE: u64 = 2024
+const S_HAUPT: u64 = 2032
+const S_STAPELN: u64 = 2040
+// Diagnose des Anhaltens.
+const S_STW_N: u64 = 2048
+const S_STW_MAX: u64 = 2056
+const S_STW_WARTE: u64 = 2064
+const S_STW_NS: u64 = 2072
+const S_STW_T0: u64 = 2080
+const S_STW_ARBEIT_MAX: u64 = 2088
+const S_SPERR_W: u64 = 2096
+// 1 = Freilisten pro Faden (Variante B), 0 = alles unter der GC-Sperre (A).
+const S_LOKAL: u64 = 2104
+const S_LOKAL_N: u64 = 2112
+// So viele Bloecke holt ein Faden auf einmal in seine eigene Freiliste.
+const SCHWUNG: u64 = 32
 
 // Zustandswort eines Blockkopfes (siehe Kopfkommentar).
 const M_MARKE: u32 = 3
@@ -826,6 +872,11 @@ fn __gc_sweep_init() {
     // derselben Klasse. Ein Block eines noch nicht gefegten Chunks kann
     // nicht doppelt vergeben werden — er faellt beim Leeren aus der Liste
     // und kommt erst wieder hinein, wenn sein Chunk gefegt ist.
+    // Runde 49: die Bloecke in den Freilisten der einzelnen Faeden zurueck in
+    // die globalen Listen. Ein solcher Block ist frei (Typkennung 0) und kaeme
+    // beim Fegen ein zweites Mal in eine Liste — er stuende dann in zweien und
+    // wuerde doppelt vergeben. Die Welt steht hier.
+    __faden_listen_alle_zurueck()
     var k: u64 = 0
     while k < KLASSEN {
         __gc_st64(st + S_SWKL + k * 8, 0)
@@ -1019,6 +1070,73 @@ fn __gc_scrub() {
     __gc_scrub_tief(3)
 }
 
+// RUNDE 49 — DASSELBE, ABER VOM AUFRUFER AUS.
+//
+// `__gc_scrub()` laeuft aus dem Rahmen von `gc_collect` heraus und saeubert
+// deshalb nur, was UNTER diesem Rahmen liegt. Die toten Rahmen, die das
+// Programm unmittelbar vor dem Sammellauf hinterlassen hat, liegen aber
+// GENAU DORT, wo `gc_collect` seinen eigenen Rahmen hinlegt — und was der
+// nicht ueberschreibt, bleibt stehen und haelt als Zufallstreffer des
+// konservativen Scans tote Objekte am Leben.
+//
+// Ein Test, der belegen will, dass ein schwacher Verweis sein Ziel NICHT
+// haelt, haengt damit an der Rahmenaufteilung des Sammlers: waechst die
+// Laufzeit, kippt er. Genau das ist in Runde 47 (tests/520, 535) und wieder
+// in Runde 49 (tests/833, lib/dom) passiert. Wer das ausschliessen will,
+// ruft dies HIER auf — aus seinem eigenen Rahmen, VOR `gc_collect()`.
+//
+// Das ist kein Trick, sondern die ehrliche Bedingung: ein konservativer
+// Sammler darf tote Objekte behalten. Wer das Gegenteil beweisen will, muss
+// zuerst dafuer sorgen, dass wirklich kein Bitmuster mehr auf sie zeigt.
+fn gc_stapel_saeubern() {
+    __gc_scrub_tief(3)
+}
+
+// RUNDE 49 — EINE ADRESSE UNTERHALB DES EIGENEN RAHMENS.
+//
+// BEFUND: der konservative Stapelscan begann bisher bei der Adresse einer
+// LOKALEN Variablen (`var anker`). Das ist NICHT der untere Rand des Rahmens.
+// Die Registerzuteilung (regalloc.rs::layout) legt die Rettungsplaetze der
+// callee-saved Register ZULETZT an — sie bekommen also die groessten
+// Abstaende zu `rbp` und liegen damit UNTER allen Allocas, auch unter
+// `anker`. Genau dort steht aber das `rbx`/`r12`…`r15` des AUFRUFERS, und
+// wenn dessen einziger Verweis auf ein Objekt in so einem Register lag, war
+// das Objekt fuer den Sammler unsichtbar und wurde eingesammelt, obwohl es
+// noch benutzt wurde.
+//
+// Sichtbar wurde das in Runde 49 an tests/820 (nur `release-fast`, also nur
+// mit Registerzuteilung): eine Umstellung in `gc_collect` verschob die
+// Zuteilung, und das Programm starb mit einem Speicherzugriffsfehler. Der
+// Fehler ist AELTER als diese Runde; er war bisher nur nicht ausgeloest.
+//
+// Der Selbstaufruf ist Absicht — eine rekursive Funktion wird NIE eingebettet
+// (inline.rs), also liegt ihr Rahmen wirklich UNTER dem des Aufrufers. Dieselbe
+// Technik benutzt `__gc_scrub_tief` seit Runde 4.
+// Der Stapelboden DIESES Fadens. Ohne Faeden ist das der des Hauptfadens
+// (S_BODEN). Mit Faeden waere genau das falsch: ein Faden, der den Sammler
+// fuehrt, scannte dann von SEINEM Stapelzeiger bis zum Boden des HAUPTfadens
+// — quer durch nicht abgebildeten Speicher. Gemessen: Speicherzugriffsfehler
+// beim ersten Zyklus, den ein Nebenfaden startet.
+fn __gc_eigener_boden(st: u64) -> u64 {
+    let tcb: u64 = __faden_tcb()
+    if tcb == 0 {
+        return __gc_ld64(st + S_BODEN)
+    }
+    let b: u64 = __gc_ld64(tcb + FT_BODEN)
+    if b == 0 {
+        return __gc_ld64(st + S_BODEN)
+    }
+    return b
+}
+
+fn __gc_sp_unten(n: u64) -> u64 {
+    var a: u64 = 0
+    if n > 0 {
+        return __gc_sp_unten(n - 1)
+    }
+    return (&a) as u64
+}
+
 fn __gc_collect_now() -> u64 {
     let st: u64 = __gc_state() as u64
     if __gc_ld64(st + S_INIT) != 1 {
@@ -1028,15 +1146,22 @@ fn __gc_collect_now() -> u64 {
     __gc_st64(st + S_MLEN, 0)
     __gc_st64(st + S_UEBERLAUF, 0)
     // Wurzeln 1: die callee-saved Register (vom Codegenerator gerettet).
+    // Runde 49: unter der Drehsperre, weil der Rettungsbereich EINER ist und
+    // ein parkender Faden in denselben schreibt — und ab `+ S_REGS`, weil
+    // `__gc_save_regs()` die Adresse des Blocks liefert, nicht die des
+    // Bereichs (der Befund steht bei S_REGS).
+    __faden_sperren_roh(st + S_REGSPERRE)
     let regs: u64 = __gc_save_regs() as u64
-    __gc_scan(regs, regs + 48)
+    __gc_scan(regs + S_REGS, regs + S_REGS + 48)
+    __faden_entsperren_roh(st + S_REGSPERRE)
     // Wurzeln 2: der Stapel, konservativ, von hier bis zum Stapelboden.
-    var anker: u64 = 0
-    let sp: u64 = (&anker) as u64
-    anker = 0
-    __gc_scan(sp, __gc_ld64(st + S_BODEN))
+    let sp: u64 = __gc_sp_unten(0)
+    __gc_scan(sp, __gc_eigener_boden(st))
     // Wurzeln 3 (Runde 47): angemeldete Bereiche ausserhalb des GC-Heaps.
     __gc_wurzeln_scannen()
+    // Wurzeln 4 (Runde 49): JEDER andere Faden — seine geretteten Register
+    // und sein Stapel. Die Welt steht hier.
+    __gc_faeden_scannen()
     __gc_drain()
     __gc_nachtragen()
     __gc_sweep()
@@ -1259,14 +1384,16 @@ fn __gc_zyklus_start() {
     __gc_st64(st + S_MLEN, 0)
     __gc_st64(st + S_UEBERLAUF, 0)
     __gc_scrub()
+    __faden_sperren_roh(st + S_REGSPERRE)
     let regs: u64 = __gc_save_regs() as u64
-    __gc_scan(regs, regs + 48)
-    var anker: u64 = 0
-    let sp: u64 = (&anker) as u64
-    anker = 0
-    __gc_scan(sp, __gc_ld64(st + S_BODEN))
+    __gc_scan(regs + S_REGS, regs + S_REGS + 48)
+    __faden_entsperren_roh(st + S_REGSPERRE)
+    let sp: u64 = __gc_sp_unten(0)
+    __gc_scan(sp, __gc_eigener_boden(st))
     // Wurzeln 3 (Runde 47): angemeldete Bereiche ausserhalb des GC-Heaps.
     __gc_wurzeln_scannen()
+    // Wurzeln 4 (Runde 49): JEDER andere Faden. Die Welt steht hier.
+    __gc_faeden_scannen()
     __gc_st64(st + S_SCHRT, __gc_ld64(st + S_SEIT))
     __gc_st64(st + S_PZYK, 0)
     __gc_st64(st + S_PHASE, 1)
@@ -1412,6 +1539,17 @@ fn __gc_alloc_raw(tid: u64, size: u64) -> *mut u8 {
         __gc_alloc_gesperrt(st)
         return 0 as *mut u8
     }
+    // RUNDE 49. Einfaedig kostet das genau einen Aufruf, der sofort
+    // zurueckkehrt (ein Speicherzugriff, ein Sprung). Mehrfaedig steckt darin
+    // der Safepoint und ENTWEDER ein fertiger Block aus der Freiliste dieses
+    // Fadens (dann sind wir schon fertig, ganz ohne Sperre) ODER die genommene
+    // GC-Sperre. Der Rumpf darunter bleibt Zeile fuer Zeile der alte —
+    // Absicht: er bestimmt die Rahmenaufteilung, und die bestimmt beim
+    // konservativen Scan, welche toten Objekte zufaellig ueberleben.
+    let vorab: u64 = __gc_alloc_ein(st, tid, size)
+    if vorab != 0 {
+        return vorab as *mut u8
+    }
     let klasse: u64 = __gc_klasse_fuer(size)
     // Runde 44: die GANZE Unterbrechung an dieser Allokationsstelle messen.
     // Ein Bild sieht nicht die einzelne Scheibe, sondern die Summe dessen,
@@ -1424,12 +1562,14 @@ fn __gc_alloc_raw(tid: u64, size: u64) -> *mut u8 {
         if __gc_ld64(st + S_CPUUHR) != 0 {
             tcpu = __gc_cpu_ns()
         }
+        __gc_stw_an()
         if __gc_ld64(st + S_HEAP) < __gc_ld64(st + S_INKRAB) {
             __gc_scrub()
             __gc_collect_now()
         } else {
             __gc_zyklus_start()
         }
+        __gc_stw_aus()
     }
     if __gc_ld64(st + S_PHASE) != 0 {
         if tstop == 0 {
@@ -1438,7 +1578,9 @@ fn __gc_alloc_raw(tid: u64, size: u64) -> *mut u8 {
                 tcpu = __gc_cpu_ns()
             }
         }
+        __gc_stw_an()
         __gc_zyklus_schritt()
+        __gc_stw_aus()
     }
     var b: u64 = __gc_hole_block(klasse, size)
     if b == 0 {
@@ -1450,12 +1592,14 @@ fn __gc_alloc_raw(tid: u64, size: u64) -> *mut u8 {
                 tcpu = __gc_cpu_ns()
             }
         }
+        __gc_stw_an()
         if __gc_ld64(st + S_PHASE) != 0 {
             __gc_zyklus_fertig()
         } else {
             __gc_scrub()
             __gc_collect_now()
         }
+        __gc_stw_aus()
         b = __gc_hole_block(klasse, size)
     }
     if tstop != 0 {
@@ -1475,6 +1619,7 @@ fn __gc_alloc_raw(tid: u64, size: u64) -> *mut u8 {
         }
     }
     if b == 0 {
+        __gc_alloc_aus(st)
         return 0 as *mut u8
     }
     let serie: u64 = __gc_ld64(st + S_SERIE) + 1
@@ -1504,11 +1649,102 @@ fn __gc_alloc_raw(tid: u64, size: u64) -> *mut u8 {
     let block: u64 = __gc_ld64(st + S_BLOCKGROESSE)
     __gc_st64(st + S_SEIT, __gc_ld64(st + S_SEIT) + block)
     __gc_st64(st + S_GESAMT, __gc_ld64(st + S_GESAMT) + block)
+    __gc_alloc_aus(st)
     return obj as *mut u8
+}
+
+// Eintritt in die Allokation (Runde 49).
+//   einfaedig  -> 0, sonst nichts
+//   mehrfaedig -> Safepoint; danach entweder ein FERTIGER Block aus der
+//                 Freiliste dieses Fadens (Rueckgabe != 0, KEINE Sperre
+//                 genommen) oder die genommene GC-Sperre (Rueckgabe 0).
+fn __gc_alloc_ein(st: u64, tid: u64, size: u64) -> u64 {
+    if __gc_ld64(st + S_MULTI) == 0 {
+        return 0
+    }
+    __faden_safepoint()
+    if __gc_ld64(st + S_LOKAL) != 0 {
+        let p: u64 = __gc_alloc_lokal(st, tid, size)
+        if p != 0 {
+            return p
+        }
+    }
+    __faden_sperren(st + S_SPERRE)
+    return 0
+}
+
+fn __gc_alloc_aus(st: u64) {
+    if __gc_ld64(st + S_MULTI) == 0 {
+        return
+    }
+    __faden_entsperren(st + S_SPERRE)
+}
+
+// RUNDE 49, Variante B — die Allokation OHNE Sperre.
+//
+// Sie ist genau dann erlaubt, wenn keine Sammlerarbeit ansteht: Phase 0, und
+// die Allokationsgrenze ist noch nicht erreicht. Der Block kommt aus der
+// Freiliste DIESES Fadens, sonst waere er nicht sein Eigentum.
+//
+// Warum das trotz laufender anderer Faeden richtig ist: eine Phase wechselt
+// NUR bei stehender Welt, und die Welt steht nur, wenn kein Faden mehr
+// LAUFEND ist. Dieser Faden ist waehrend der ganzen Funktion LAUFEND — also
+// kann zwischen der Pruefung und dem fertigen Block keine Phase wechseln und
+// keine Weiss-Paritaet umschlagen. Ein hier erzeugtes Objekt ist weiss und
+// haengt am Stapel oder in einem Register dieses Fadens; beides wird beim
+// naechsten Anhalten gescannt, denn der Sammler wartet, bis dieser Faden
+// parkt, und scannt ihn ERST DANN.
+//
+// Die drei gemeinsamen Zaehler (Seriennummer, Bytes seit dem letzten Lauf,
+// Gesamtbytes) laufen atomar. Ohne das waeren die Zahlen unter
+// Nebenlaeufigkeit einfach falsch.
+fn __gc_alloc_lokal(st: u64, tid: u64, size: u64) -> u64 {
+    if __gc_ld64(st + S_PHASE) != 0 {
+        return 0
+    }
+    if __gc_ld64(st + S_SEIT) >= __gc_ld64(st + S_GRENZE) {
+        return 0
+    }
+    let klasse: u64 = __gc_klasse_fuer(size)
+    if klasse >= KLASSEN {
+        return 0
+    }
+    let tcb: u64 = __faden_tcb()
+    if tcb == 0 {
+        return 0
+    }
+    let b: u64 = __faden_block_lokal(tcb, klasse)
+    if b == 0 {
+        return 0
+    }
+    let serie: u64 = __atomar_addieren((st + S_SERIE) as *mut u64, 1) + 1
+    __gc_st32(b, tid as u32)
+    __gc_st32(b + 4, __gc_ld64(st + S_PAR) as u32)
+    __gc_st64(b + 8, serie)
+    let obj: u64 = b + KOPF
+    var i: u64 = 0
+    while i < size {
+        __gc_st64(obj + i, 0)
+        i = i + 8
+    }
+    let block: u64 = KOPF + __gc_klassen_bytes(klasse)
+    __atomar_addieren((st + S_SEIT) as *mut u64, block)
+    __atomar_addieren((st + S_GESAMT) as *mut u64, block)
+    __gc_diag_inc(S_D_ALLOK)
+    return obj
 }
 
 fn __gc_hole_block(klasse: u64, size: u64) -> u64 {
     let st: u64 = __gc_state() as u64
+    // Runde 49, Variante B: solange die Sperre ohnehin gehalten wird, einen
+    // SCHWUNG Bloecke in die Freiliste dieses Fadens holen. Der naechste
+    // Aufruf wird dann in __gc_alloc_lokal sperrenfrei bedient.
+    if __gc_ld64(st + S_LOKAL) != 0 && __gc_ld64(st + S_MULTI) != 0 {
+        let bl: u64 = __gc_hole_block_lokal(st, klasse, size)
+        if bl != 0 {
+            return bl
+        }
+    }
     if klasse >= KLASSEN {
         let c: u64 = __gc_chunk_neu(klasse, size)
         if c == 0 {
@@ -1529,6 +1765,24 @@ fn __gc_hole_block(klasse: u64, size: u64) -> u64 {
         }
     }
     __gc_st64(kopf, __gc_ld64(b + KOPF))
+    __gc_st64(st + S_BLOCKGROESSE, KOPF + __gc_klassen_bytes(klasse))
+    return b
+}
+
+// Nachfuellen und sofort einen Block liefern (Variante B). 0 = nicht moeglich.
+fn __gc_hole_block_lokal(st: u64, klasse: u64, size: u64) -> u64 {
+    if klasse >= KLASSEN || __gc_ld64(st + S_PHASE) != 0 {
+        return 0
+    }
+    let tcb: u64 = __faden_tcb()
+    if tcb == 0 {
+        return 0
+    }
+    __faden_nachfuellen(tcb, klasse, size)
+    let b: u64 = __faden_block_lokal(tcb, klasse)
+    if b == 0 {
+        return 0
+    }
     __gc_st64(st + S_BLOCKGROESSE, KOPF + __gc_klassen_bytes(klasse))
     return b
 }
@@ -1637,6 +1891,17 @@ fn __gc_barrier(feld: *mut u8, wert: *mut u8) {
 fn __gc_barrier_zyklus(st: u64, wert: *mut u8) {
     if __gc_ld64(st + S_INIT) != 1 {
         __gc_fehler_fin_wieder()
+    }
+    // Runde 49: Faerben heisst Chunkliste lesen und auf den Markstapel legen —
+    // beides gehoert unter die GC-Sperre, sobald es mehr als einen Faden gibt.
+    // Die Pruefung auf S_INIT steht BEWUSST davor: waehrend eines Finalisierers
+    // haelt dieser Faden die Sperre schon, und ein zweites Nehmen waere ein
+    // Selbstverklemmer. Der Abbruch kommt also, bevor gesperrt wird.
+    if __gc_ld64(st + S_MULTI) != 0 {
+        __faden_sperren(st + S_SPERRE)
+        __gc_mark(wert as u64)
+        __faden_entsperren(st + S_SPERRE)
+        return
     }
     __gc_mark(wert as u64)
 }
@@ -2121,6 +2386,8 @@ fn __gc_wroot_platz() -> bool {
     return true
 }
 
+// Runde 49: An- und Abmelden aendern das Wurzelfeld und laufen deshalb unter
+// der GC-Sperre. Beides ist selten (einmal je Arc mit Gc-Inhalt).
 fn gc_wurzel_anmelden(p: *mut u8, bytes: u64) -> bool {
     let a: u64 = p as u64
     if a == 0 || bytes == 0 {
@@ -2245,11 +2512,22 @@ fn gc_collect() -> u64 {
         }
         return 0
     }
+    let multi: u64 = __gc_ld64(st + S_MULTI)
+    if multi != 0 {
+        __faden_safepoint()
+        __faden_sperren(st + S_SPERRE)
+        __gc_stw_an()
+    }
     if __gc_ld64(st + S_PHASE) != 0 {
         __gc_zyklus_fertig()
     }
     __gc_scrub()
-    return __gc_collect_now()
+    let d: u64 = __gc_collect_now()
+    if multi != 0 {
+        __gc_stw_aus()
+        __faden_entsperren(st + S_SPERRE)
+    }
+    return d
 }
 
 fn gc_collections() -> u64 {
@@ -2286,4 +2564,807 @@ fn gc_barriers() -> u64 {
 
 fn gc_total_bytes() -> u64 {
     return __gc_ld64(__gc_state() as u64 + S_GESAMT)
+}
+
+// ==========================================================================
+// RUNDE 49 — FAEDEN
+// ==========================================================================
+//
+// Diese Haelfte der Datei ist die Laufzeit der Nebenlaeufigkeit. Sie steht
+// bewusst HIER und nicht in einem eigenen Modul: sie braucht denselben
+// statischen Zustandsblock wie der Sammler (Stufe 0 hat keine veraenderlichen
+// globalen Variablen — genau deshalb gibt es den Block ueberhaupt), und der
+// Sammler braucht sie umgekehrt, um alle Fadenstapel als Wurzeln zu sehen.
+// Zwei getrennte Bloecke waeren zwei Wahrheiten ueber denselben Zustand.
+//
+// ENTWURF IN EINEM ABSATZ
+//
+//   Ein Faden entsteht mit `clone(2)` (`__faden_starten`, compiler/src/faden.rs),
+//   bekommt einen eigenen mmap-Stapel mit Schutzseite und einen Fadenblock
+//   (TCB), auf den sein `fs`-Register zeigt. Der Sammler fuehrt eine Tafel
+//   dieser Bloecke. Ein Faden ist LAUFEND, GEPARKT (er steht in einem
+//   Safepoint) oder BLOCKIERT (er wartet auf eine Sperre/einen Futex und sein
+//   Stapel liegt still). Sammlerarbeit macht immer nur EIN Faden, und zwar der
+//   Halter der GC-Sperre; bevor er anfaengt, haelt er die Welt an (S_STOPP=1)
+//   und wartet, bis kein anderer Faden mehr LAUFEND ist. Dann scannt er JEDEN
+//   Fadenstapel und die je Faden geretteten Register.
+//
+// DIE ZWEI REGELN, AUS DENEN DIE VERKLEMMUNGSFREIHEIT FOLGT
+//
+//   R1  Nur der Halter der GC-Sperre haelt die Welt an.
+//   R2  Wer auf eine Sperre oder einen Futex wartet, meldet sich vorher als
+//       BLOCKIERT (Stapel + Register veroeffentlicht).
+//
+//   Aus R2 folgt: ein Faden, der auf die GC-Sperre wartet, ist fuer das
+//   Anhalten bereits "stehend". Aus R1 folgt: waehrend die Welt steht, kann
+//   kein zweiter Faden ein Anhalten beginnen. Ohne R2 wuerde der Sammler auf
+//   einen Faden warten, der auf ihn wartet — der klassische Verklemmer.
+//
+// WAS DIESE STUFE NICHT KANN (ehrlich, siehe docs/RUNDE49.md §7)
+//
+//   * Ein Faden, der WEDER alloziert NOCH blockiert (reine Rechenschleife),
+//     erreicht keinen Safepoint. Die Welt haelt dann nicht an. Abhilfe:
+//     `faden_safepoint()` von Hand in solche Schleifen. Ein Safepoint an
+//     jeder Rueckwaertskante waere die vollstaendige Loesung und kostet den
+//     einfaedigen Fall — das ist eine Codegenerator-Runde, nicht diese.
+//   * `Gc[T]` ueber Fadengrenzen ist NICHT zugesagt (SPEC §7). Der Sammler
+//     ist jetzt fadensicher, die SPRACHE hat aber noch keine `#[sendable]`-
+//     Markierung, die das pruefen wuerde.
+
+const SYS_MPROTECT: i64 = 10
+const SYS_SCHED_YIELD: i64 = 24
+const SYS_GETTID: i64 = 186
+const SYS_ARCH_PRCTL: i64 = 158
+const SYS_FUTEX: i64 = 202
+const ARCH_SET_FS: i64 = 4098
+// FUTEX_WAIT/FUTEX_WAKE, jeweils mit FUTEX_PRIVATE_FLAG (128): der Futex
+// gehoert nur diesem Prozess, der Kern spart sich die Abbildung auf ein
+// globales Schluesselobjekt.
+const FUTEX_WARTEN: i64 = 128
+const FUTEX_WECKEN: i64 = 129
+// Zweierkomplement von 1 (Erniedrigen ist die Addition davon, wie in arc.fi).
+const FADEN_MINUS1: u64 = 18446744073709551615
+
+// Fadenblock (TCB), 512 Byte. Offset 0 ist die eigene Adresse: `fs:0` liefert
+// damit den Block in EINER Instruktion (compiler/src/faden.rs, Op::ThreadSelf).
+const FT_SELBST: u64 = 0
+const FT_ZUSTAND: u64 = 8
+// Die Fadenkennung. Der Kern SCHREIBT sie beim Start (CLONE_PARENT_SETTID)
+// und NULLT sie beim Fadenende (CLONE_CHILD_CLEARTID) — auf genau dieses
+// Wort wartet `faden_warten`. Es ist ein 32-Bit-Wort (der Kern schreibt
+// `int`), liegt aber in einem 64-Bit-Platz.
+const FT_TID: u64 = 16
+const FT_STAPEL: u64 = 24
+const FT_STAPELN: u64 = 32
+const FT_BODEN: u64 = 40
+const FT_SP: u64 = 48
+const FT_ARG: u64 = 56
+const FT_ART: u64 = 64
+const FT_ERG: u64 = 72
+// 6 callee-saved Register (rbx, rbp, r12..r15), je Faden.
+const FT_REGS: u64 = 80
+// Freilisten dieses Fadens (Variante B, `gc_set_lokal(1)`): je Groessenklasse
+// eine Liste, dazu die Anzahl der darin liegenden Bloecke.
+const FT_FREI: u64 = 128
+const FT_FREIN: u64 = 240
+const FT_BYTES: u64 = 512
+const FADEN_MAX: u64 = 64
+// Voreinstellung der Stapelgroesse je Faden (1 MiB, davon 4 KiB Schutzseite).
+const STAPEL_BYTES: u64 = 1048576
+
+const Z_FREI: u64 = 0
+const Z_LAUFEND: u64 = 1
+const Z_GEPARKT: u64 = 2
+const Z_BLOCKIERT: u64 = 3
+const Z_TOT: u64 = 4
+
+// -------------------------------------------------------------- Systemdienste
+
+fn __faden_gettid() -> u64 {
+    return syscall(SYS_GETTID, 0, 0, 0, 0, 0, 0) as u64
+}
+
+fn __faden_nachgeben() {
+    syscall(SYS_SCHED_YIELD, 0, 0, 0, 0, 0, 0)
+}
+
+fn __faden_futex_warten(a: u64, v: u64) {
+    syscall(SYS_FUTEX, a as i64, FUTEX_WARTEN, v as i64, 0, 0, 0)
+}
+
+// Warten OHNE FUTEX_PRIVATE_FLAG. Das ist kein Schoenheitsfehler, sondern
+// Pflicht fuer genau EINEN Fall: das TID-Wort. Der KERN weckt es beim
+// Fadenende selbst (CLONE_CHILD_CLEARTID) und benutzt dafuer den GETEILTEN
+// Futex-Schluessel. Ein privater Warter haengt an einem anderen Schluessel und
+// wird nie geweckt — gemessen: `faden_warten` blieb fuer immer stehen,
+// obwohl der Faden laengst zu Ende war.
+fn __faden_futex_warten_geteilt(a: u64, v: u64) {
+    syscall(SYS_FUTEX, a as i64, 0, v as i64, 0, 0, 0)
+}
+
+fn __faden_futex_wecken(a: u64, n: u64) {
+    syscall(SYS_FUTEX, a as i64, FUTEX_WECKEN, n as i64, 0, 0, 0)
+}
+
+// --------------------------------------------------------------- Fadenblock
+
+// Der eigene Fadenblock — 0, solange keine Fadentafel besteht. Die Abfrage
+// auf die Tafel ist NICHT Zierde: ohne `arch_prctl(ARCH_SET_FS)` ist die
+// `fs`-Basis 0 und `fs:0` waere ein Zugriff auf Adresse 0.
+fn __faden_tcb() -> u64 {
+    let st: u64 = __gc_state() as u64
+    if __gc_ld64(st + S_FADEN_TAB) == 0 {
+        return 0
+    }
+    return __faden_selbst() as u64
+}
+
+// ------------------------------------------------------------------- Sperren
+//
+// Mutex nach Drepper („Futexes are Tricky"), drei Zustaende:
+//   0 = frei · 1 = belegt, kein Warter · 2 = belegt, mindestens ein Warter
+// Im unbestrittenen Fall kostet Nehmen und Geben je EINE atomare Instruktion
+// und KEINEN Systemaufruf.
+
+// Tausch ohne eigenes Primitiv. `xchg` waere eine Instruktion; dafuer haette
+// es einen vierten Opcode gebraucht (docs/RUNDE49.md §2.3 — verworfen, weil
+// die Schleife nur im bestrittenen Fall laeuft).
+fn __faden_tausch(a: u64, neu: u64) -> u64 {
+    var alt: u64 = __gc_ld64(a)
+    var fertig: bool = false
+    while !fertig {
+        let g: u64 = __atomar_tauschen(a as *mut u64, alt, neu)
+        if g == alt {
+            fertig = true
+        } else {
+            alt = g
+        }
+    }
+    return alt
+}
+
+// Reine Drehsperre OHNE Zustandsmeldung. Nur fuer sehr kurze Abschnitte, die
+// selbst Teil der Zustandsmeldung sind (sonst gaebe es eine Rekursion).
+fn __faden_sperren_roh(a: u64) {
+    var i: u64 = 0
+    var g: u64 = __atomar_tauschen(a as *mut u64, 0, 1)
+    while g != 0 {
+        i = i + 1
+        if i > 64 {
+            __faden_nachgeben()
+        }
+        g = __atomar_tauschen(a as *mut u64, 0, 1)
+    }
+}
+
+fn __faden_entsperren_roh(a: u64) {
+    __atomar_addieren(a as *mut u64, FADEN_MINUS1)
+}
+
+fn __faden_sperren(a: u64) {
+    let g: u64 = __atomar_tauschen(a as *mut u64, 0, 1)
+    if g == 0 {
+        return
+    }
+    __faden_sperren_langsam(a)
+}
+
+fn __faden_sperren_langsam(a: u64) {
+    let st: u64 = __gc_state() as u64
+    __gc_st64(st + S_SPERR_W, __gc_ld64(st + S_SPERR_W) + 1)
+    // REGEL R2: wer wartet, meldet sich als BLOCKIERT. Ohne das kann die Welt
+    // nicht anhalten, solange ein Faden auf die GC-Sperre wartet.
+    __faden_blockiert_an()
+    var c: u64 = __faden_tausch(a, 2)
+    while c != 0 {
+        __faden_futex_warten(a, 2)
+        c = __faden_tausch(a, 2)
+    }
+    __faden_blockiert_aus()
+}
+
+fn __faden_entsperren(a: u64) {
+    // Ergebnis ist der ALTE Wert: war er 1, gab es keinen Warter und das Wort
+    // steht jetzt auf 0. War er 2, muss es auf 0 gesetzt und geweckt werden.
+    let alt: u64 = __atomar_addieren(a as *mut u64, FADEN_MINUS1)
+    if alt != 1 {
+        __gc_st64(a, 0)
+        __faden_futex_wecken(a, 1)
+    }
+}
+
+// Oeffentlich: ein Mutex ist ein genulltes u64-Wort, mehr nicht.
+fn faden_sperren(a: *mut u64) {
+    __faden_sperren(a as u64)
+}
+
+fn faden_entsperren(a: *mut u64) {
+    __faden_entsperren(a as u64)
+}
+
+// ------------------------------------------------------- Zustand veroeffentlichen
+
+// Der Faden macht seinen Stapel und seine Register fuer den Sammler lesbar
+// und geht in den Zustand `z`.
+//
+// WARUM DIE REGISTER UEBER DEN GLOBALEN BEREICH LAUFEN: `__gc_save_regs()` ist
+// ein Compilerintrinsic, das an seiner Aufrufstelle EINGEBETTET wird und die
+// callee-saved Register in den Zustandsblock schreibt — es gibt genau einen
+// solchen Bereich. Zwei Faeden, die gleichzeitig retten, wuerden sich
+// ueberschreiben; deshalb die kurze Drehsperre. Der Bereich wird sofort in den
+// eigenen Fadenblock kopiert, und erst der wird gescannt.
+//
+// Und warum ueberhaupt: ein `Gc[T]`, das nur in `rbx` steht, liegt auf KEINEM
+// Stapel. Ohne diese Rettung waere die Zusage „konservativer Stapel- UND
+// Registerscan" (SPEC §3.5.3) fuer jeden Faden ausser dem Sammler falsch.
+fn __faden_zustand_melden(z: u64) {
+    let tcb: u64 = __faden_tcb()
+    if tcb == 0 {
+        return
+    }
+    let st: u64 = __gc_state() as u64
+    __faden_sperren_roh(st + S_REGSPERRE)
+    let g: u64 = __gc_save_regs() as u64
+    var i: u64 = 0
+    while i < 6 {
+        __gc_st64(tcb + FT_REGS + i * 8, __gc_ld64(g + S_REGS + i * 8))
+        i = i + 1
+    }
+    __faden_entsperren_roh(st + S_REGSPERRE)
+    let sp: u64 = __gc_sp_unten(0)
+    __gc_st64(tcb + FT_SP, sp)
+    __gc_st64(tcb + FT_ZUSTAND, z)
+}
+
+fn __faden_blockiert_an() {
+    __faden_zustand_melden(Z_BLOCKIERT)
+}
+
+// Zurueck in den Zustand LAUFEND. Die Reihenfolge ist wichtig: ERST sichtbar
+// machen, dass wieder gerechnet wird, DANN pruefen, ob die Welt steht. In der
+// umgekehrten Reihenfolge koennte zwischen Pruefung und Zustandswechsel ein
+// Anhalten beginnen, und dieser Faden liefe waehrend des Wurzelscans weiter.
+fn __faden_blockiert_aus() {
+    let tcb: u64 = __faden_tcb()
+    if tcb == 0 {
+        return
+    }
+    __gc_st64(tcb + FT_ZUSTAND, Z_LAUFEND)
+    __faden_safepoint()
+}
+
+// ---------------------------------------------------------------- Safepoint
+
+fn __faden_safepoint() {
+    let st: u64 = __gc_state() as u64
+    if __gc_ld64(st + S_STOPP) == 0 {
+        return
+    }
+    __faden_parken()
+}
+
+fn __faden_parken() {
+    let st: u64 = __gc_state() as u64
+    __faden_zustand_melden(Z_GEPARKT)
+    while __gc_ld64(st + S_STOPP) != 0 {
+        __faden_futex_warten(st + S_STOPP, 1)
+    }
+    let tcb: u64 = __faden_tcb()
+    if tcb != 0 {
+        __gc_st64(tcb + FT_ZUSTAND, Z_LAUFEND)
+    }
+}
+
+// Oeffentlich: in eine lange Rechenschleife ohne Allokation gehoert das hier,
+// sonst wartet ein Sammellauf auf diesen Faden (siehe Kopfkommentar).
+fn faden_safepoint() {
+    __faden_safepoint()
+}
+
+// ------------------------------------------------------------ Welt anhalten
+
+// Vorbedingung: der Aufrufer HAELT die GC-Sperre (Regel R1).
+fn __gc_stw_an() {
+    let st: u64 = __gc_state() as u64
+    if __gc_ld64(st + S_MULTI) == 0 {
+        return
+    }
+    let t0: u64 = __gc_jetzt_ns()
+    __gc_st64(st + S_STOPP, 1)
+    let selbst: u64 = __faden_tcb()
+    let tab: u64 = __gc_ld64(st + S_FADEN_TAB)
+    var i: u64 = 0
+    while i < FADEN_MAX {
+        let t: u64 = tab + i * FT_BYTES
+        if t != selbst {
+            var n: u64 = 0
+            while __gc_ld64(t + FT_ZUSTAND) == Z_LAUFEND {
+                n = n + 1
+                if n > 16 {
+                    __faden_nachgeben()
+                }
+            }
+        }
+        i = i + 1
+    }
+    let t1: u64 = __gc_jetzt_ns()
+    var d: u64 = 0
+    if t1 > t0 {
+        d = t1 - t0
+    }
+    __gc_st64(st + S_STW_N, __gc_ld64(st + S_STW_N) + 1)
+    __gc_st64(st + S_STW_WARTE, __gc_ld64(st + S_STW_WARTE) + d)
+    if d > __gc_ld64(st + S_STW_MAX) {
+        __gc_st64(st + S_STW_MAX, d)
+    }
+    __gc_st64(st + S_STW_T0, t1)
+}
+
+fn __gc_stw_aus() {
+    let st: u64 = __gc_state() as u64
+    if __gc_ld64(st + S_MULTI) == 0 {
+        return
+    }
+    let t1: u64 = __gc_jetzt_ns()
+    let t0: u64 = __gc_st_t0(st)
+    if t1 > t0 {
+        let d: u64 = t1 - t0
+        __gc_st64(st + S_STW_NS, __gc_ld64(st + S_STW_NS) + d)
+        if d > __gc_ld64(st + S_STW_ARBEIT_MAX) {
+            __gc_st64(st + S_STW_ARBEIT_MAX, d)
+        }
+    }
+    __gc_st64(st + S_STOPP, 0)
+    __faden_futex_wecken(st + S_STOPP, FADEN_MAX)
+}
+
+fn __gc_st_t0(st: u64) -> u64 {
+    return __gc_ld64(st + S_STW_T0)
+}
+
+// ------------------------------------------------------- Fadenstapel als Wurzeln
+
+// Alle ANDEREN Faeden konservativ scannen: erst ihre geretteten Register,
+// dann ihren Stapel von dem Zeiger, den sie beim Anhalten veroeffentlicht
+// haben, bis zu ihrem Stapelboden. Vorbedingung: die Welt steht.
+//
+// Ein toter Faden (Z_TOT) wird nicht mehr ueber den Stapel gescannt — er hat
+// keinen mehr, der etwas hielte. Sein ERGEBNISWORT wird aber gescannt: es
+// steht bis zum `faden_warten` in seinem Block und waere sonst die einzige
+// Stelle im ganzen System, an der ein Wert unbemerkt verschwaende.
+fn __gc_faeden_scannen() {
+    let st: u64 = __gc_state() as u64
+    if __gc_ld64(st + S_MULTI) == 0 {
+        return
+    }
+    let tab: u64 = __gc_ld64(st + S_FADEN_TAB)
+    if tab == 0 {
+        return
+    }
+    let selbst: u64 = __faden_tcb()
+    var i: u64 = 0
+    while i < FADEN_MAX {
+        let t: u64 = tab + i * FT_BYTES
+        let z: u64 = __gc_ld64(t + FT_ZUSTAND)
+        if t != selbst && z != Z_FREI {
+            __gc_scan(t + FT_REGS, t + FT_REGS + 48)
+            __gc_scan(t + FT_ERG, t + FT_ERG + 8)
+            if z != Z_TOT {
+                let sp: u64 = __gc_ld64(t + FT_SP)
+                let boden: u64 = __gc_ld64(t + FT_BODEN)
+                if sp != 0 && boden > sp {
+                    __gc_scan(sp, boden)
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+// --------------------------------------------------------------- Fadentafel
+
+fn __faden_platz_neu(st: u64) -> u64 {
+    let tab: u64 = __gc_ld64(st + S_FADEN_TAB)
+    var i: u64 = 1
+    while i < FADEN_MAX {
+        let t: u64 = tab + i * FT_BYTES
+        if __gc_ld64(t + FT_ZUSTAND) == Z_FREI {
+            return t
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// Einmal vor dem ersten `faden_starten`. Meldet den HAUPTFADEN an — ohne das
+// wuesste der Sammler von dessen Stapel nichts, sobald es einen zweiten Faden
+// gibt. Idempotent.
+fn faden_init() -> bool {
+    let st: u64 = __gc_state() as u64
+    if __gc_ld64(st + S_FADEN_TAB) != 0 {
+        return true
+    }
+    if __gc_ld64(st + S_INIT) != 1 {
+        if !gc_init() {
+            return false
+        }
+    }
+    let tab: u64 = __gc_mmap(FADEN_MAX * FT_BYTES)
+    if tab == 0 {
+        return false
+    }
+    __gc_st64(tab + FT_SELBST, tab)
+    __gc_st64(tab + FT_ZUSTAND, Z_LAUFEND)
+    __gc_st64(tab + FT_BODEN, __gc_ld64(st + S_BODEN))
+    __gc_st64(tab + FT_TID, __faden_gettid())
+    __gc_st64(st + S_HAUPT, tab)
+    __gc_st64(st + S_FADEN_MAX, FADEN_MAX)
+    __gc_st64(st + S_FADEN_N, 1)
+    if __gc_ld64(st + S_STAPELN) == 0 {
+        __gc_st64(st + S_STAPELN, STAPEL_BYTES)
+    }
+    // ERST die `fs`-Basis setzen, DANN die Tafel eintragen: `__faden_tcb()`
+    // liest `fs:0`, sobald die Tafel steht. Andersherum waere zwischen den
+    // beiden Zeilen ein Zugriff auf Adresse 0 moeglich.
+    syscall(SYS_ARCH_PRCTL, ARCH_SET_FS, tab as i64, 0, 0, 0, 0)
+    __gc_st64(st + S_FADEN_TAB, tab)
+    return true
+}
+
+// Stapelgroesse je Faden in Bytes (vor dem ersten `faden_starten` zu setzen).
+fn faden_stapel_setzen(n: u64) {
+    __gc_st64(__gc_state() as u64 + S_STAPELN, n)
+}
+
+// Einen Faden starten. `art` und `arg` gehen unveraendert an den Verteiler
+// `__faden_arbeit(art, arg)` des Programms — dieselbe Loesung wie beim
+// Verteiler der Finalisierer (Runde 47), weil Stufe 0 keine Funktionszeiger
+// hat. Rueckgabe: das Handle (1..63) fuer `faden_warten`, 0 = fehlgeschlagen.
+fn faden_starten(art: u64, arg: u64) -> u64 {
+    let st: u64 = __gc_state() as u64
+    if __gc_ld64(st + S_FADEN_TAB) == 0 {
+        if !faden_init() {
+            return 0
+        }
+    }
+    __faden_safepoint()
+    __faden_sperren(st + S_TSPERRE)
+    let tcb: u64 = __faden_platz_neu(st)
+    if tcb == 0 {
+        __faden_entsperren(st + S_TSPERRE)
+        return 0
+    }
+    let n: u64 = __gc_ld64(st + S_STAPELN)
+    let sp: u64 = __gc_mmap(n)
+    if sp == 0 {
+        __faden_entsperren(st + S_TSPERRE)
+        return 0
+    }
+    // Schutzseite ganz unten: ein Stapelueberlauf endet mit einem sauberen
+    // Speicherzugriffsfehler statt mit stiller Zerstoerung fremden Speichers.
+    syscall(SYS_MPROTECT, sp as i64, 4096, 0, 0, 0, 0)
+    __gc_st64(tcb + FT_SELBST, tcb)
+    __gc_st64(tcb + FT_STAPEL, sp)
+    __gc_st64(tcb + FT_STAPELN, n)
+    __gc_st64(tcb + FT_BODEN, sp + n)
+    __gc_st64(tcb + FT_SP, sp + n)
+    __gc_st64(tcb + FT_ARG, arg)
+    __gc_st64(tcb + FT_ART, art)
+    __gc_st64(tcb + FT_ERG, 0)
+    __gc_st64(tcb + FT_TID, 0)
+    __gc_st64(tcb + FT_FREIN, 0)
+    var i: u64 = 0
+    while i < 6 {
+        __gc_st64(tcb + FT_REGS + i * 8, 0)
+        i = i + 1
+    }
+    var k: u64 = 0
+    while k < KLASSEN {
+        __gc_st64(tcb + FT_FREI + k * 8, 0)
+        k = k + 1
+    }
+    // Der Platz gilt AB JETZT als laufender Faden. Andersherum koennte ein
+    // Anhalten der Welt zwischen `clone` und der ersten Meldung des Kindes
+    // fallen, und sein Stapel bliebe ungescannt.
+    __gc_st64(tcb + FT_ZUSTAND, Z_LAUFEND)
+    __gc_st64(st + S_FADEN_N, __gc_ld64(st + S_FADEN_N) + 1)
+    __gc_st64(st + S_FADEN_GES, __gc_ld64(st + S_FADEN_GES) + 1)
+    // Ab hier laeuft der Sammler im Mehrfadenbetrieb. Der Schalter geht NIE
+    // wieder zurueck: ein Wechsel waehrend eines laufenden Zyklus waere ein
+    // Wettrennen ohne Nutzen (docs/RUNDE49.md §4.2).
+    __gc_st64(st + S_MULTI, 1)
+    let r: i64 = __faden_starten(tcb, sp + n, (tcb + FT_TID) as *mut u8)
+    if r <= 0 {
+        __gc_st64(tcb + FT_ZUSTAND, Z_FREI)
+        __gc_st64(st + S_FADEN_N, __gc_ld64(st + S_FADEN_N) - 1)
+        __gc_munmap(sp, n)
+        __faden_entsperren(st + S_TSPERRE)
+        return 0
+    }
+    __faden_entsperren(st + S_TSPERRE)
+    return (tcb - __gc_ld64(st + S_FADEN_TAB)) / FT_BYTES
+}
+
+// Der Einstieg, den das Kind aus der `clone`-Folge heraus ruft
+// (compiler/src/faden.rs, `EINSTIEG`). Argument ist der Fadenblock.
+fn __faden_einstieg(tcb: u64) -> i32 {
+    // Als Allererstes die eigene `fs`-Basis: davor liefert `__faden_selbst()`
+    // die des Erzeugers, und der Faden wuerde in fremden Zustand schreiben.
+    syscall(SYS_ARCH_PRCTL, ARCH_SET_FS, tcb as i64, 0, 0, 0, 0)
+    __gc_st64(tcb + FT_ZUSTAND, Z_LAUFEND)
+    let r: u64 = __faden_arbeit(__gc_ld64(tcb + FT_ART), __gc_ld64(tcb + FT_ARG))
+    __gc_st64(tcb + FT_ERG, r)
+    // Lokale Freilisten zurueckgeben, sonst waeren ihre Bloecke bis zum
+    // naechsten Fegen weder frei noch belegt.
+    __faden_listen_zurueck(tcb)
+    __gc_st64(tcb + FT_ZUSTAND, Z_TOT)
+    let st: u64 = __gc_state() as u64
+    __atomar_addieren((st + S_FADEN_N) as *mut u64, FADEN_MINUS1)
+    return 0
+}
+
+// Auf das Ende eines Fadens warten und sein Ergebnis holen. Der Kern nullt
+// beim Fadenende das TID-Wort und weckt darauf — genau der Mechanismus, mit
+// dem auch `pthread_join` arbeitet, nur ohne pthread.
+fn faden_warten(h: u64) -> u64 {
+    let st: u64 = __gc_state() as u64
+    let tab: u64 = __gc_ld64(st + S_FADEN_TAB)
+    if tab == 0 || h == 0 || h >= FADEN_MAX {
+        return 0
+    }
+    let tcb: u64 = tab + h * FT_BYTES
+    __faden_blockiert_an()
+    var t: u32 = __gc_ld32(tcb + FT_TID)
+    while t != 0 {
+        __faden_futex_warten_geteilt(tcb + FT_TID, t as u64)
+        t = __gc_ld32(tcb + FT_TID)
+    }
+    __faden_blockiert_aus()
+    let r: u64 = __gc_ld64(tcb + FT_ERG)
+    let sp: u64 = __gc_ld64(tcb + FT_STAPEL)
+    let n: u64 = __gc_ld64(tcb + FT_STAPELN)
+    __gc_st64(tcb + FT_STAPEL, 0)
+    __gc_st64(tcb + FT_SP, 0)
+    __gc_st64(tcb + FT_BODEN, 0)
+    __gc_st64(tcb + FT_ERG, 0)
+    __gc_st64(tcb + FT_ZUSTAND, Z_FREI)
+    if sp != 0 {
+        __gc_munmap(sp, n)
+    }
+    return r
+}
+
+fn faden_anzahl() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_FADEN_N)
+}
+
+fn faden_gestartet() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_FADEN_GES)
+}
+
+fn faden_mehrfaedig() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_MULTI)
+}
+
+fn faden_tid() -> u64 {
+    return __faden_gettid()
+}
+
+// Diagnose: Anlaeufe, laengste Wartezeit bis die Welt stand, laengste Zeit
+// mit stehender Welt, Summe, Sperrenwartungen.
+fn gc_stw_laeufe() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_STW_N)
+}
+
+fn gc_stw_warte_max() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_STW_MAX)
+}
+
+fn gc_stw_arbeit_max() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_STW_ARBEIT_MAX)
+}
+
+fn gc_stw_ns_total() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_STW_NS)
+}
+
+fn gc_sperre_wartungen() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_SPERR_W)
+}
+
+fn gc_lokal_nachfuellungen() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_LOKAL_N)
+}
+
+// ------------------------------------------------- Freilisten pro Faden (B)
+//
+// Variante B der Allokation: statt fuer JEDE Allokation die GC-Sperre zu
+// nehmen, holt sich ein Faden unter der Sperre einen SCHWUNG Bloecke in seine
+// eigene Liste und bedient sich daraus sperrenfrei. Die Messung, welche der
+// beiden Varianten gewinnt, steht in docs/RUNDE49.md §5 — deshalb sind beide
+// da und zur Laufzeit umschaltbar (`gc_set_lokal`), im selben Prozess und mit
+// bitgleichem Code.
+
+fn gc_set_lokal(an: u64) {
+    __gc_st64(__gc_state() as u64 + S_LOKAL, an)
+}
+
+fn gc_lokal() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_LOKAL)
+}
+
+// Einen Block aus der eigenen Liste; 0 = leer.
+fn __faden_block_lokal(tcb: u64, klasse: u64) -> u64 {
+    let kopf: u64 = tcb + FT_FREI + klasse * 8
+    let b: u64 = __gc_ld64(kopf)
+    if b == 0 {
+        return 0
+    }
+    __gc_st64(kopf, __gc_ld64(b + KOPF))
+    __gc_st64(tcb + FT_FREIN, __gc_ld64(tcb + FT_FREIN) - 1)
+    return b
+}
+
+// Nachfuellen: unter der GC-Sperre bis zu SCHWUNG Bloecke aus der globalen
+// Liste in die eigene haengen.
+fn __faden_nachfuellen(tcb: u64, klasse: u64, size: u64) -> u64 {
+    let st: u64 = __gc_state() as u64
+    let quelle: u64 = st + S_FREI + klasse * 8
+    let ziel: u64 = tcb + FT_FREI + klasse * 8
+    var n: u64 = 0
+    while n < SCHWUNG {
+        var b: u64 = __gc_ld64(quelle)
+        if b == 0 {
+            if __gc_chunk_neu(klasse, size) == 0 {
+                n = SCHWUNG
+            } else {
+                b = __gc_ld64(quelle)
+            }
+        }
+        if b != 0 {
+            __gc_st64(quelle, __gc_ld64(b + KOPF))
+            __gc_st64(b + KOPF, __gc_ld64(ziel))
+            __gc_st64(ziel, b)
+            __gc_st64(tcb + FT_FREIN, __gc_ld64(tcb + FT_FREIN) + 1)
+            n = n + 1
+        } else {
+            n = SCHWUNG
+        }
+    }
+    __gc_st64(st + S_LOKAL_N, __gc_ld64(st + S_LOKAL_N) + 1)
+    return __gc_ld64(ziel)
+}
+
+// Alle lokalen Listen eines Fadens zurueck in die globalen. Aufrufer haelt
+// entweder die GC-Sperre oder die Welt steht.
+fn __faden_listen_zurueck(tcb: u64) {
+    let st: u64 = __gc_state() as u64
+    if __gc_ld64(tcb + FT_FREIN) == 0 {
+        return
+    }
+    var k: u64 = 0
+    while k < KLASSEN {
+        let kopf: u64 = tcb + FT_FREI + k * 8
+        var b: u64 = __gc_ld64(kopf)
+        while b != 0 {
+            let n: u64 = __gc_ld64(b + KOPF)
+            __gc_st64(b + KOPF, __gc_ld64(st + S_FREI + k * 8))
+            __gc_st64(st + S_FREI + k * 8, b)
+            b = n
+        }
+        __gc_st64(kopf, 0)
+        k = k + 1
+    }
+    __gc_st64(tcb + FT_FREIN, 0)
+}
+
+// Vor dem Fegen: die lokalen Listen ALLER Faeden aufloesen. Ein Block in einer
+// lokalen Liste ist frei (Typkennung 0) und wuerde beim Fegen erneut in die
+// globale Liste kommen — er stuende dann in zwei Listen. Die Welt steht hier.
+fn __faden_listen_alle_zurueck() {
+    let st: u64 = __gc_state() as u64
+    if __gc_ld64(st + S_MULTI) == 0 {
+        return
+    }
+    let tab: u64 = __gc_ld64(st + S_FADEN_TAB)
+    if tab == 0 {
+        return
+    }
+    var i: u64 = 0
+    while i < FADEN_MAX {
+        let t: u64 = tab + i * FT_BYTES
+        if __gc_ld64(t + FT_ZUSTAND) != Z_FREI {
+            __faden_listen_zurueck(t)
+        }
+        i = i + 1
+    }
+}
+
+// ------------------------------------------------------------------- Kanal
+//
+// Ein beschraenkter Ringpuffer fuer u64-Werte, mit Sperre und Futex. Bewusst
+// die einfachste Form, die stimmt: EIN Futex-Wort (die Belegung) und ein
+// Wecken ALLER Warter. Ein Kanal mit getrennten Warteschlangen fuer Sender
+// und Empfaenger waere schneller; das ist nicht die Frage dieser Runde und
+// steht als offener Punkt in docs/RUNDE49.md §8.
+//
+//   +0 sperre · +8 kapazitaet · +16 kopf · +24 schwanz · +32 belegt · +40 bytes
+//   +48 daten
+const KA_SPERRE: u64 = 0
+const KA_KAP: u64 = 8
+const KA_KOPF: u64 = 16
+const KA_SCHWANZ: u64 = 24
+const KA_BELEGT: u64 = 32
+const KA_BYTES: u64 = 40
+const KA_DATEN: u64 = 48
+
+fn faden_kanal_neu(kap: u64) -> u64 {
+    if kap == 0 {
+        return 0
+    }
+    let bytes: u64 = KA_DATEN + kap * 8
+    let k: u64 = __gc_mmap(bytes)
+    if k == 0 {
+        return 0
+    }
+    __gc_st64(k + KA_KAP, kap)
+    __gc_st64(k + KA_BYTES, bytes)
+    return k
+}
+
+fn faden_kanal_frei(k: u64) {
+    if k == 0 {
+        return
+    }
+    __gc_munmap(k, __gc_ld64(k + KA_BYTES))
+}
+
+fn faden_kanal_senden(k: u64, v: u64) {
+    let kap: u64 = __gc_ld64(k + KA_KAP)
+    var fertig: bool = false
+    while !fertig {
+        __faden_sperren(k + KA_SPERRE)
+        if __gc_ld64(k + KA_BELEGT) < kap {
+            let s: u64 = __gc_ld64(k + KA_SCHWANZ)
+            __gc_st64(k + KA_DATEN + s * 8, v)
+            __gc_st64(k + KA_SCHWANZ, (s + 1) % kap)
+            __gc_st64(k + KA_BELEGT, __gc_ld64(k + KA_BELEGT) + 1)
+            __faden_entsperren(k + KA_SPERRE)
+            __faden_futex_wecken(k + KA_BELEGT, FADEN_MAX)
+            fertig = true
+        } else {
+            __faden_entsperren(k + KA_SPERRE)
+            __faden_blockiert_an()
+            __faden_futex_warten(k + KA_BELEGT, kap)
+            __faden_blockiert_aus()
+        }
+    }
+}
+
+fn faden_kanal_empfangen(k: u64) -> u64 {
+    let kap: u64 = __gc_ld64(k + KA_KAP)
+    var aus: u64 = 0
+    var fertig: bool = false
+    while !fertig {
+        __faden_sperren(k + KA_SPERRE)
+        if __gc_ld64(k + KA_BELEGT) > 0 {
+            let h: u64 = __gc_ld64(k + KA_KOPF)
+            aus = __gc_ld64(k + KA_DATEN + h * 8)
+            __gc_st64(k + KA_KOPF, (h + 1) % kap)
+            __gc_st64(k + KA_BELEGT, __gc_ld64(k + KA_BELEGT) - 1)
+            __faden_entsperren(k + KA_SPERRE)
+            __faden_futex_wecken(k + KA_BELEGT, FADEN_MAX)
+            fertig = true
+        } else {
+            __faden_entsperren(k + KA_SPERRE)
+            __faden_blockiert_an()
+            __faden_futex_warten(k + KA_BELEGT, 0)
+            __faden_blockiert_aus()
+        }
+    }
+    return aus
+}
+
+fn faden_kanal_belegt(k: u64) -> u64 {
+    return __gc_ld64(k + KA_BELEGT)
 }
