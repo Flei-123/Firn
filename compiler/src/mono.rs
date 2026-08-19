@@ -190,7 +190,7 @@ fn expand_struct(
             return;
         }
     };
-    let map = match bind_params(dg, fnames, &tpl.params, inst, "generischer struct") {
+    let map = match bind_params(dg, fnames, &tpl.params, inst, "generic struct") {
         Some(m) => m,
         None => return,
     };

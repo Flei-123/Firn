@@ -270,7 +270,7 @@ mod tests {
         let toks = crate::lexer::lex(&src, &mut dg);
         let mut prog = crate::parser::parse(&toks, &mut dg);
         crate::mono::expand(&mut prog, &mut dg);
-        let info = crate::sema::check(&prog, &mut dg).expect("typpruefung");
+        let info = crate::sema::check(&prog, &mut dg).expect("type check");
         let mut m = crate::lower::lower(&prog, &info, &mut dg).expect("lowering");
         assert!(!dg.has_errors(), "{}", dg.render());
         crate::opt::optimize(&mut m);
