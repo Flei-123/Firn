@@ -1,0 +1,163 @@
+// expect_exit: 0
+// tests/901_dom_baum_gc.fi — DER BAUM HAELT IM SAMMLER (Runde 54).
+//
+// Ein DOM-Baum ist genau die Zyklenart, an der ein Zaehlverweis scheitert:
+// jeder Knoten haelt seine Eltern STARK und seine Kinder STARK, dazu beide
+// Geschwister. Ein Baum aus n Knoten hat rund 2n Zyklen; wird er
+// unerreichbar, gibt ein Zaehlverweis NICHTS frei.
+//
+// Geprueft wird hier die STRUKTUR der Aussage; die Messung ueber viele
+// Runden mit RSS und Gegenprobe steht in tools/html/gc_baum.sh.
+//
+//   A  Ein gebauter Baum ist wirklich zyklisch (Rueckverweise stimmen).
+//   B  Solange er erreichbar ist, ueberlebt er jeden Sammellauf.
+//   C  Wird er unerreichbar, sinkt die Zahl der lebenden Objekte wieder auf
+//      den Stand von vorher — er wird also eingesammelt.
+//   D  Ueber viele Runden waechst weder die Objektzahl noch der Heap.
+//
+// Jeder Rueckgabewert != 0 nennt die Stelle.
+
+import browser.knoten
+
+const BREITE: u32 = 8
+const TIEFE: u32 = 4
+
+// Baut einen Baum mit BREITE^TIEFE-artiger Verzweigung und liefert die Zahl
+// der angelegten Knoten. Alle Verweise sind stark, in beide Richtungen.
+fn baum_bauen(eltern: Gc[Knoten], tiefe: u32) -> AllocError!u64 {
+    if tiefe == 0 as u32 {
+        return 0
+    }
+    var n: u64 = 0
+    var i: u32 = 0
+    while i < BREITE {
+        let e = try knoten.element_neu(100 + i, knoten.NS_HTML)
+        knoten.kind_anhaengen(eltern, e)
+        // Der Rueckverweis MUSS stehen, sonst waere der Zyklus keiner.
+        if e.eltern != eltern {
+            return 0
+        }
+        n = n + 1
+        n = n + try baum_bauen(e, tiefe - 1)
+        i = i + 1
+    }
+    return n
+}
+
+fn knoten_zaehlen(k: Gc[Knoten]) -> u64 {
+    if k == gc_null[Knoten]() {
+        return 0
+    }
+    var n: u64 = 1
+    var c: Gc[Knoten] = k.erstes_kind
+    while c != gc_null[Knoten]() {
+        n = n + knoten_zaehlen(c)
+        c = c.naechstes
+    }
+    return n
+}
+
+// Baut einen Baum, prueft ihn und laesst ihn mit der Rueckkehr fallen.
+// EIGENE FUNKTION: der starke Zeiger darf nach der Rueckkehr in keinem
+// LEBENDEN Rahmen mehr liegen (der Stapelscan ist konservativ, SPEC §3.5.3).
+fn eine_runde(tiefe: u32) -> u64 {
+    let d = knoten.dokument_neu() catch gc_null[Dokument]()
+    if d == gc_null[Dokument]() {
+        return 0
+    }
+    let n: u64 = baum_bauen(d, tiefe) catch 0
+    if n == 0 {
+        return 0
+    }
+    // Der Baum ist ueber die Kinderkette vollstaendig erreichbar …
+    if knoten_zaehlen(d) != n + 1 {
+        return 0
+    }
+    // … und ueber die Elternkette wieder zurueck (das ist der Zyklus).
+    var tief: Gc[Knoten] = d
+    while tief.erstes_kind != gc_null[Knoten]() {
+        tief = tief.erstes_kind
+    }
+    var hoch: Gc[Knoten] = tief
+    while hoch.eltern != gc_null[Knoten]() {
+        hoch = hoch.eltern
+    }
+    if hoch != d {
+        return 0
+    }
+    // B: ein Sammellauf mitten im Betrieb nimmt nichts Erreichbares weg.
+    gc_collect()
+    if knoten_zaehlen(d) != n + 1 {
+        return 0
+    }
+    return n
+}
+
+// Legt einen tiefen, genullten Rahmen ueber die aufgegebenen Rahmen: der
+// konservative Stapelscan wuerde einen Altzeiger sonst als Wurzel lesen.
+// Der Selbstaufruf haelt die Funktion aus dem Einbetter heraus.
+fn scrub_tief(n: u64) {
+    var puffer: [u64; 512] = [0; 512]
+    var i: usize = 0
+    while i < 512 {
+        puffer[i] = 0
+        i = i + 1
+    }
+    barrier(&puffer)
+    if n > 0 {
+        scrub_tief(n - 1)
+    }
+}
+
+fn main() -> i32 {
+    if !gc_init() {
+        return 90
+    }
+    // Grundstand
+    scrub_tief(3)
+    gc_collect()
+    let basis: u64 = gc_live_objects()
+
+    // A und B
+    let n: u64 = eine_runde(TIEFE)
+    if n == 0 {
+        return 1
+    }
+    // 8 + 64 + 512 + 4096 = 4680 Elemente
+    if n != 4680 {
+        return 2
+    }
+
+    // C: unerreichbar -> eingesammelt
+    scrub_tief(3)
+    gc_collect()
+    let nachher: u64 = gc_live_objects()
+    if nachher > basis + 64 {
+        return 3
+    }
+
+    // D: viele Runden, kein Wachstum
+    let heap0: u64 = gc_heap_bytes()
+    var r: u32 = 0
+    while r < 20 as u32 {
+        if eine_runde(TIEFE) != 4680 {
+            return 4
+        }
+        r = r + 1
+    }
+    scrub_tief(3)
+    gc_collect()
+    if gc_live_objects() > basis + 64 {
+        return 5
+    }
+    // Der Heap darf sich einmal einpendeln, aber nicht mit den Runden wachsen.
+    let heap1: u64 = gc_heap_bytes()
+    if heap1 > heap0 * 4 + 1048576 {
+        return 6
+    }
+    // Es wurde wirklich gesammelt.
+    if gc_collections() == 0 {
+        return 7
+    }
+    return 0
+}

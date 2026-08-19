@@ -33,7 +33,52 @@ export {
     sink_fehler, sink_fehler_bei, sink_fehler_anzahl,
     tok_attr_war_doppelt, tok_ist_endtag, tok_hat_attribute, tok_ist_self_closing,
     sink_entities, sink_set_entities, sink_entities_versucht, sink_set_entities_versucht,
+    // RUNDE 54 (Baumaufbau, lib/browser/): Quellposition je Token und das
+    // binaere Tokenprotokoll, mit dem der Baumaufbau den Tokenstrom liest.
+    tok_emit_bei, sink_pos,
+    sink_set_baum_modus, sink_baum_modus, sink_abgebrochen,
+    sink_out_ptr, sink_out_len, sink_out_clear,
+    TB_START, TB_END, TB_COMMENT, TB_DOCTYPE, TB_CHARACTER,
+    TB_F_SELF_CLOSING, TB_F_FORCE_QUIRKS, TB_F_HAT_NAME, TB_F_HAT_PUBID, TB_F_HAT_SYSID,
 }
+
+// ---------------------------------------------- Binaeres Tokenprotokoll (R54)
+//
+// Der Baumaufbau (lib/browser/baum.fi) legt GC-Objekte an und darf deshalb
+// NICHT aus dem Tokenizer heraus gerufen werden: der ganze Tokenizer ist
+// `#[no_gc]` (SPEC §3.5.4), und diese Zusage gilt transitiv. Der Weg ist
+// deshalb ein PUFFER: der Tokenizer schreibt seine Token als kompakte
+// Datensaetze, der Baumaufbau liest sie danach.
+//
+// Aufbau eines Satzes (alle Zahlen u32, little-endian, in `out`):
+//     u32 art       TB_START | TB_END | TB_COMMENT | TB_DOCTYPE | TB_CHARACTER
+//     u32 flaggen   TB_F_*
+//     u32 pos       Quellposition (in Codepunkten) UNMITTELBAR HINTER dem Token
+//     u32 nattr     Zahl der Attribute (nur TB_START, sonst 0)
+//     danach je nach Art Zeichenketten in der Form  u32 laenge, laenge * u32:
+//       TB_START      name, dann nattr mal (name, wert)
+//       TB_END        name
+//       TB_COMMENT    daten
+//       TB_DOCTYPE    name, pubid, sysid
+//       TB_CHARACTER  daten
+//
+// `pos` ist der Grund, warum es dieses Protokoll gibt und nicht das JSON: der
+// Baumaufbau muss den Tokenizer bei `<title>`, `<style>`, `<script>` und
+// `<plaintext>` in einen anderen Startzustand schicken (WHATWG: "generic raw
+// text element parsing algorithm"). Dafuer braucht er die Stelle, an der es
+// weitergeht. Doppelte Attribute stehen NICHT im Satz — der Standard verwirft
+// sie, und der Baumaufbau soll sie gar nicht erst sehen.
+const TB_START: u32 = 1
+const TB_END: u32 = 2
+const TB_COMMENT: u32 = 3
+const TB_DOCTYPE: u32 = 4
+const TB_CHARACTER: u32 = 5
+
+const TB_F_SELF_CLOSING: u32 = 1
+const TB_F_FORCE_QUIRKS: u32 = 2
+const TB_F_HAT_NAME: u32 = 4
+const TB_F_HAT_PUBID: u32 = 8
+const TB_F_HAT_SYSID: u32 = 16
 
 // Tokenarten des aktuellen Tokens.
 const TOK_NONE: u32 = 0
@@ -84,6 +129,11 @@ struct Sink {
     // Ausgabe, die die Gegenseite gar nicht schreibt.
     nur_zaehlen: bool,
     tokenzahl: u64,
+    // RUNDE 54: Quellposition des zuletzt ausgegebenen Tokens und der
+    // Betrieb "binaeres Tokenprotokoll statt JSON" (siehe oben).
+    pos: usize,
+    baum_modus: bool,
+    abgebrochen: bool,
 }
 
 #[no_gc]
@@ -124,6 +174,9 @@ fn sink_neu() -> Sink {
         ent_versucht: false,
         nur_zaehlen: false,
         tokenzahl: 0,
+        pos: 0,
+        baum_modus: false,
+        abgebrochen: false,
     }
 }
 
@@ -154,6 +207,8 @@ fn sink_init(s: *mut Sink) {
     (*s).letztes_doppelt = false
     (*s).ent_tab = 0 as *mut u8
     (*s).ent_versucht = false
+    (*s).pos = 0
+    (*s).abgebrochen = false
     (*s).attrs = mem.heap_alloc(MAX_ATTRS * 56) as *mut Attr
     var i: usize = 0
     while i < MAX_ATTRS {
@@ -548,7 +603,9 @@ fn sink_begin(s: *mut Sink) {
     (*s).art = TOK_NONE
     (*s).nattr = 0
     (*s).marke = mem.buf_len(&(*s).out)
-    if (*s).nur_zaehlen {
+    (*s).pos = 0
+    (*s).abgebrochen = false
+    if (*s).nur_zaehlen || (*s).baum_modus {
         return
     }
     out_ascii(s, 91 as u32)           // [
@@ -562,6 +619,13 @@ fn sink_abort(s: *mut Sink) {
     mem.buf_set_len(&(*s).out, (*s).marke)
     mem.cp_clear(&(*s).chars)
     (*s).art = TOK_NONE
+    if (*s).baum_modus {
+        // Der Baumaufbau bekommt kein halbes Protokoll: die Saetze dieses
+        // Auftrags sind weg und die Abbruchmarke steht.
+        (*s).abgebrochen = true
+        mem.cp_clear(&(*s).fehler)
+        return
+    }
     if (*s).nur_zaehlen {
         mem.cp_clear(&(*s).fehler)
         return
@@ -600,6 +664,10 @@ fn sink_abort(s: *mut Sink) {
 #[no_gc]
 fn sink_end(s: *mut Sink) {
     sink_flush_chars(s)
+    if (*s).baum_modus {
+        mem.cp_clear(&(*s).fehler)
+        return
+    }
     if (*s).nur_zaehlen {
         // Die Fehler wurden gesammelt (das tut html5ever auch), nur die
         // JSON-Ausgabe entfaellt.
@@ -656,6 +724,12 @@ fn sink_flush_chars(s: *mut Sink) {
     }
     if (*s).nur_zaehlen {
         (*s).tokenzahl = (*s).tokenzahl + 1
+        mem.cp_clear(&(*s).chars)
+        return
+    }
+    if (*s).baum_modus {
+        tb_kopf(s, TB_CHARACTER, 0, 0)
+        tb_kette(s, &(*s).chars)
         mem.cp_clear(&(*s).chars)
         return
     }
@@ -841,6 +915,10 @@ fn tok_emit(s: *mut Sink) {
         (*s).art = TOK_NONE
         return
     }
+    if (*s).baum_modus {
+        tb_emit(s)
+        return
+    }
     komma_wenn_noetig(s)
     out_ascii(s, 91 as u32)           // [
     if (*s).art == TOK_START {
@@ -912,4 +990,140 @@ fn tok_emit(s: *mut Sink) {
     }
     out_ascii(s, 93 as u32)           // ]
     (*s).art = TOK_NONE
+}
+
+// ---------------------------------------------- Binaeres Tokenprotokoll (R54)
+//
+// Alles hier laeuft NUR im Baummodus (`sink_set_baum_modus`). Der JSON-Weg
+// und der Messbetrieb sind davon unberuehrt: sie sehen kein einziges
+// zusaetzliches Wort, nur einen Zweig, der bei ihnen nie genommen wird.
+
+#[no_gc]
+fn tb_u32(s: *mut Sink, v: u32) {
+    mem.buf_push(&(*s).out, (v & 0xFF as u32) as u8)
+    mem.buf_push(&(*s).out, ((v >> 8) & 0xFF as u32) as u8)
+    mem.buf_push(&(*s).out, ((v >> 16) & 0xFF as u32) as u8)
+    mem.buf_push(&(*s).out, ((v >> 24) & 0xFF as u32) as u8)
+}
+
+#[no_gc]
+fn tb_kopf(s: *mut Sink, art: u32, flaggen: u32, nattr: u32) {
+    tb_u32(s, art)
+    tb_u32(s, flaggen)
+    tb_u32(s, (*s).pos as u32)
+    tb_u32(s, nattr)
+}
+
+#[no_gc]
+fn tb_kette(s: *mut Sink, c: *mut mem.CpBuf) {
+    let n: usize = mem.cp_len(c)
+    tb_u32(s, n as u32)
+    var i: usize = 0
+    while i < n {
+        tb_u32(s, mem.cp_at(c, i))
+        i = i + 1
+    }
+}
+
+#[no_gc]
+fn tb_emit(s: *mut Sink) {
+    if (*s).art == TOK_START {
+        var f: u32 = 0
+        if (*s).self_closing {
+            f = f | TB_F_SELF_CLOSING
+        }
+        // Doppelte Attribute werden verworfen (HTML-Standard); sie kommen
+        // deshalb gar nicht erst in den Satz.
+        var echte: u32 = 0
+        var i: usize = 0
+        while i < (*s).nattr {
+            let a: *mut Attr = attr_ptr(s, i)
+            if !(*a).doppelt {
+                echte = echte + 1
+            }
+            i = i + 1
+        }
+        tb_kopf(s, TB_START, f, echte)
+        tb_kette(s, &(*s).name)
+        i = 0
+        while i < (*s).nattr {
+            let a: *mut Attr = attr_ptr(s, i)
+            if !(*a).doppelt {
+                tb_kette(s, &(*a).name)
+                tb_kette(s, &(*a).value)
+            }
+            i = i + 1
+        }
+        mem.cp_copy_from(&(*s).letzter_starttag, &(*s).name)
+    } else if (*s).art == TOK_END {
+        tb_kopf(s, TB_END, 0, 0)
+        tb_kette(s, &(*s).name)
+    } else if (*s).art == TOK_COMMENT {
+        tb_kopf(s, TB_COMMENT, 0, 0)
+        tb_kette(s, &(*s).daten)
+    } else {
+        var f: u32 = 0
+        if (*s).force_quirks {
+            f = f | TB_F_FORCE_QUIRKS
+        }
+        if (*s).hat_name {
+            f = f | TB_F_HAT_NAME
+        }
+        if (*s).hat_pubid {
+            f = f | TB_F_HAT_PUBID
+        }
+        if (*s).hat_sysid {
+            f = f | TB_F_HAT_SYSID
+        }
+        tb_kopf(s, TB_DOCTYPE, f, 0)
+        tb_kette(s, &(*s).name)
+        tb_kette(s, &(*s).pubid)
+        tb_kette(s, &(*s).sysid)
+    }
+    (*s).art = TOK_NONE
+}
+
+// Wie `tok_emit`, merkt sich aber die Quellposition UNMITTELBAR HINTER dem
+// Token. Der Tokenizer ruft ausschliesslich diese Fassung; `tok_emit` bleibt
+// als Weg ohne Position bestehen (dann ist `pos` der zuletzt gesetzte Wert).
+#[no_gc]
+fn tok_emit_bei(s: *mut Sink, pos: usize) {
+    (*s).pos = pos
+    tok_emit(s)
+}
+
+#[no_gc]
+fn sink_pos(s: *mut Sink) -> usize {
+    return (*s).pos
+}
+
+#[no_gc]
+fn sink_set_baum_modus(s: *mut Sink, an: bool) {
+    (*s).baum_modus = an
+}
+
+#[no_gc]
+fn sink_baum_modus(s: *mut Sink) -> bool {
+    return (*s).baum_modus
+}
+
+#[no_gc]
+fn sink_abgebrochen(s: *mut Sink) -> bool {
+    return (*s).abgebrochen
+}
+
+#[no_gc]
+fn sink_out_ptr(s: *mut Sink) -> *mut u8 {
+    return mem.buf_ptr(&(*s).out)
+}
+
+#[no_gc]
+fn sink_out_len(s: *mut Sink) -> usize {
+    return mem.buf_len(&(*s).out)
+}
+
+#[no_gc]
+fn sink_out_clear(s: *mut Sink) {
+    mem.buf_clear(&(*s).out)
+    (*s).marke = 0
 }

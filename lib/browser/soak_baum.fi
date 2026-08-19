@@ -1,0 +1,237 @@
+// lib/browser/soak_baum.fi — DAUERLAUF: echte DOM-Baeume aufbauen und
+// verwerfen, ohne dass der Speicher waechst.
+//
+// WORUM ES GEHT (Abnahmepunkt 2, SPEC §3.5.5): ein DOM-Baum ist die
+// Zyklenart, an der ein Zaehlverweis scheitert. Jeder Knoten haelt seine
+// Eltern STARK und seine Kinder STARK; dazu kommen die Geschwisterzeiger in
+// beide Richtungen. Ein Baum aus n Knoten hat damit rund 2n Zyklen. Wird er
+// unerreichbar, gibt ein Zaehlverweis NICHTS frei.
+//
+// Anders als lib/dom/soak_gc.fi (der Prototyp aus Runde 4) baut dieses
+// Programm keine kuenstlichen Zyklensaetze, sondern faehrt den ECHTEN
+// Baumaufbau aus lib/browser/baum.fi ueber ein echtes HTML-Stueck — mit
+// Tabelle, Formatierungselementen, Attributen, Rohtext und Kommentar. Was
+// hier nicht eingesammelt wird, waere in einer Engine ein Leck.
+//
+// Eingabe (stdin, 12 Byte): u32 runden, u32 budget_ms, u32 leck.
+// Fehlt sie, gelten die Vorgaben unten.
+//
+// `leck != 0` schaltet die GEGENPROBE ein: jeder gebaute Baum wird in einer
+// GC-Kette FESTGEHALTEN. Dann MUSS der Verbrauch steigen. Eine Messung, die
+// ein Leck nicht anzeigen kann, ist wertlos — deshalb wird sie bei jedem Lauf
+// mitgefahren (tools/html/gc_baum.sh bricht ab, wenn die Gegenprobe gruen
+// bleibt).
+//
+// Ausgabe: TSV auf stdout, eine Zeile je STICHPROBE Runden:
+//     t_ms  runden  knoten  rss_kib  lebende  laeufe  heap_bytes  pause_max_ns
+
+import html.mem
+import browser.knoten
+import browser.treiber
+import dom.mess
+
+const VORGABE_RUNDEN: u64 = 20000
+const VORGABE_BUDGET_MS: i64 = 10000
+const STICHPROBE: u64 = 500
+const QUELLE_LEN: usize = 446
+
+// Das Stueck HTML, das je Runde zu einem Baum wird. Bewusst mit allem, was
+// im Baumaufbau Knoten erzeugt: Doctype, Kopf, Rohtext (RCDATA und RAWTEXT,
+// also zwei Umschaltungen des Tokenizers), Tabelle, verschachtelte
+// Formatierung mit Adoption-Agency-Fall, Attribute, Kommentar, Auswahlliste.
+#[no_gc]
+fn quelle(out: *mut mem.Buf) {
+    var t: [u8; 446] = "<!DOCTYPE html><html><head><title>Dauerlauf</title><style>b{x:1}</style></head><body id=\"w\" class=\"k\"><h1>Kopf</h1><p>Ein <b>fetter <i>und schraeger</i></b> Absatz mit <a href=\"/x\">Verweis</a>.</p><!--Kommentar--><table><caption>Tab</caption><tr><td>a<td><b>b</b><tr><td colspan=\"2\">c</table><ul><li>eins<li>zwei<li>drei</ul><div><div><div><span>tief</span></div></div></div><p>a<b>b<i>c</p>d</i>e<select><option>1<option>2</select></body></html>"
+    mem.buf_clear(out)
+    var i: usize = 0
+    while i < QUELLE_LEN {
+        mem.buf_push(out, t[i])
+        i = i + 1
+    }
+}
+
+// Haelt einen Baum fest — nur fuer die Gegenprobe.
+gc class Halter {
+    dok: Gc[Dokument],
+    naechster: Gc[Halter],
+}
+
+fn knoten_zaehlen(k: Gc[Knoten]) -> u64 {
+    if k == gc_null[Knoten]() {
+        return 0
+    }
+    var n: u64 = 1
+    var c: Gc[Knoten] = k.erstes_kind
+    while c != gc_null[Knoten]() {
+        n = n + knoten_zaehlen(c)
+        c = c.naechstes
+    }
+    return n
+}
+
+// Legt einen tiefen, genullten Rahmen ueber die aufgegebenen Stapelrahmen der
+// letzten Runde. Der Stapelscan ist KONSERVATIV (SPEC §3.5.3) — ein alter
+// Zeiger in einem toten Rahmen haelt sonst einen ganzen Baum am Leben. Der
+// Selbstaufruf haelt die Funktion aus dem Einbetter heraus, sonst laegen die
+// genullten Rahmen im LEBENDEN Rahmen des Aufrufers.
+fn scrub_tief(n: u64) {
+    var puffer: [u64; 512] = [0; 512]
+    var i: usize = 0
+    while i < 512 {
+        puffer[i] = 0
+        i = i + 1
+    }
+    barrier(&puffer)
+    if n > 0 {
+        scrub_tief(n - 1)
+    }
+}
+
+fn zeile(t_ms: u64, runden: u64, knoten: u64, rss: u64, lebende: u64,
+         laeufe: u64, heap: u64, pause: u64) {
+    mess.mess_u64(t_ms)
+    mess.mess_tab()
+    mess.mess_u64(runden)
+    mess.mess_tab()
+    mess.mess_u64(knoten)
+    mess.mess_tab()
+    mess.mess_u64(rss)
+    mess.mess_tab()
+    mess.mess_u64(lebende)
+    mess.mess_tab()
+    mess.mess_u64(laeufe)
+    mess.mess_tab()
+    mess.mess_u64(heap)
+    mess.mess_tab()
+    mess.mess_u64(pause)
+    mess.mess_nl()
+}
+
+fn text_aus(p: u64, n: i64) {
+    mess.mess_schreib(p, n)
+}
+
+fn main() -> i32 {
+    if !gc_init() {
+        return 2
+    }
+    var runden_max: u64 = VORGABE_RUNDEN
+    var budget: i64 = VORGABE_BUDGET_MS
+    var leck: bool = false
+    var ein: mem.Buf = mem.buf_neu()
+    mem.read_all_stdin(&ein)
+    if mem.buf_len(&ein) >= 8 {
+        var v: u64 = 0
+        var i: usize = 0
+        while i < 4 {
+            v = v | ((mem.buf_at(&ein, i) as u64) << (8 * i as u64))
+            i = i + 1
+        }
+        if v > 0 {
+            runden_max = v
+        }
+        var w: u64 = 0
+        i = 0
+        while i < 4 {
+            w = w | ((mem.buf_at(&ein, 4 + i) as u64) << (8 * i as u64))
+            i = i + 1
+        }
+        if w > 0 {
+            budget = w as i64
+        }
+        if mem.buf_len(&ein) >= 12 {
+            var lw: u64 = 0
+            i = 0
+            while i < 4 {
+                lw = lw | ((mem.buf_at(&ein, 8 + i) as u64) << (8 * i as u64))
+                i = i + 1
+            }
+            leck = lw != 0
+        }
+    }
+    mem.buf_free(&ein)
+
+    var kopf: [u8; 97] = "# firn-baum-soak v1\n# spalten: t_ms\trunden\tknoten\trss_kib\tlebende\tlaeufe\theap_bytes\tpause_max_ns\n"
+    text_aus((&kopf) as u64, 97)
+
+    var quell: mem.Buf = mem.buf_neu()
+    mem.buf_init(&quell)
+    quelle(&quell)
+
+    // Der `Lauf` liegt im Rahmen von `main` (konservativer Stapelscan).
+    var l: treiber.Lauf = treiber.lauf_neu()
+    if !treiber.lauf_init(&l) {
+        return 3
+    }
+
+    let t0: u64 = mess.mess_jetzt_ms()
+    var runden: u64 = 0
+    var knoten_je_runde: u64 = 0
+    var kette: Gc[Halter] = gc_null[Halter]()
+    while runden < runden_max {
+        treiber.lauf_text_aus_bytes(&l, mem.buf_ptr(&quell), mem.buf_len(&quell))
+        let rc: u32 = treiber.lauf_dokument_bauen(&l)
+        if rc != 0 as u32 {
+            var f: [u8; 18] = "# fehler in runde\n"
+            text_aus((&f) as u64, 18)
+            return 4
+        }
+        let n: u64 = knoten_zaehlen(treiber.lauf_dokument(&l))
+        if knoten_je_runde == 0 {
+            knoten_je_runde = n
+        } else if knoten_je_runde != n {
+            var f2: [u8; 23] = "# knotenzahl schwankt!\n"
+            text_aus((&f2) as u64, 23)
+            return 5
+        }
+        if leck {
+            let h = gc Halter{ dok: treiber.lauf_dokument(&l), naechster: kette } catch gc_null[Halter]()
+            if h == gc_null[Halter]() {
+                var fo: [u8; 20] = "# speicher aus (gc)\n"
+                text_aus((&fo) as u64, 20)
+                return 6
+            }
+            kette = h
+        }
+        runden = runden + 1
+        if runden % STICHPROBE == 0 {
+            // Der Baum der LETZTEN Runde haengt noch am Zustand; erst hier
+            // wird er losgelassen und der Stapel gesaeubert.
+            baum_loslassen_und_saeubern(&l)
+            let t: u64 = mess.mess_jetzt_ms() - t0
+            zeile(t, runden, knoten_je_runde, mess.mess_rss_kib(),
+                  gc_live_objects(), gc_collections(), gc_heap_bytes(),
+                  gc_pause_ns_max())
+            if t as i64 >= budget {
+                break
+            }
+        }
+    }
+    var ez: [u8; 11] = "# angelegt="
+    text_aus((&ez) as u64, 11)
+    mess.mess_u64(gc_diag(6))
+    var ez2: [u8; 9] = " lebende="
+    text_aus((&ez2) as u64, 9)
+    mess.mess_u64(gc_live_objects())
+    var ez3: [u8; 6] = " leck="
+    text_aus((&ez3) as u64, 6)
+    if leck {
+        mess.mess_u64(1)
+    } else {
+        mess.mess_u64(0)
+    }
+    mess.mess_nl()
+    // Die Kette darf bis hierhin nicht wegoptimiert werden.
+    if leck && kette == gc_null[Halter]() {
+        return 7
+    }
+    var e: [u8; 9] = "# fertig\n"
+    text_aus((&e) as u64, 9)
+    treiber.lauf_frei(&l)
+    return 0
+}
+
+fn baum_loslassen_und_saeubern(l: *mut treiber.Lauf) {
+    treiber.lauf_baum_loslassen(l)
+    scrub_tief(3)
+}
