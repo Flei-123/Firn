@@ -2099,8 +2099,8 @@ mod tests {
 /// `SPEC.md` §14 fuehrt sie unter "not contained".
 fn not_implemented_ty(name: &str) -> Option<&'static str> {
     match name {
-        "secret" => Some("secret[T] and the constant-time primitives (SPEC §9) are not implemented; see ABNAHME.md"),
-        "Rc" | "Arc" | "Weak" => Some("Rc/Arc/Weak (SPEC §3.4) are not implemented; see ABNAHME.md"),
+        "secret" => Some("secret[T] and the constant-time primitives (SPEC §9) are not implemented; see ACCEPTANCE.md"),
+        "Rc" | "Arc" | "Weak" => Some("Rc/Arc/Weak (SPEC §3.4) are not implemented; see ACCEPTANCE.md"),
         _ => None,
     }
 }

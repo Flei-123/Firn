@@ -1,6 +1,6 @@
 # DESIGNZIELE.md — Was Firn von Anfang an anders machen soll
 
-**Stand:** 2026-08-14 · **Bezug:** `SPEC.md` v0.2, `ROADMAP.md`, `ABNAHME.md`
+**Stand:** 2026-08-14 · **Bezug:** `SPEC.md` v0.2, `ROADMAP.md`, `ACCEPTANCE.md`
 
 Dieses Dokument sammelt bekannte Schwachstellen heutiger Systemsprachen und legt
 für jede fest, wie Firn damit umgeht. **Es geht nicht darum, alles sofort zu

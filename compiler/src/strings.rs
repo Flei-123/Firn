@@ -17,7 +17,7 @@
 //! kein `Span`): der Lexer braucht genau einen Aufruf von
 //! [`lex_string_literal`] und macht aus [`LitError`] eine Meldung mit
 //! Zeile/Spalte. Diese Anbindung im Lexer gehoert dem Modul `kern` und ist in
-//! dieser Runde noch nicht gesetzt (siehe `ABNAHME.md`, Abschnitt `str`);
+//! dieser Runde noch nicht gesetzt (siehe `ACCEPTANCE.md`, Abschnitt `str`);
 //! ueber `firnc --strlit <literal>` ist der gesamte Pfad trotzdem
 //! nachpruefbar.
 
