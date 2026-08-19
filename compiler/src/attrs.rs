@@ -117,7 +117,7 @@ pub const ATTRS: &[AttrInfo] = &[
         target: Target::Type,
         args: 1,
         implemented: false,
-        what: "Anordnung waehlen, z. B. #[layout(soa)] (DESIGNZIELE 8)",
+        what: "choose the arrangement, e.g. #[layout(soa)] (DESIGNZIELE 8)",
     },
     AttrInfo {
         name: "no_move",

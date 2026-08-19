@@ -1320,7 +1320,7 @@ fn main() -> i32 { return 0 as i32 }
         let mut dg = Diags::new("test.fi", src);
         let toks = crate::lexer::lex(src, &mut dg);
         let prog = crate::parser::parse(&toks, &mut dg);
-        let info = crate::sema::check(&prog, &mut dg).expect("typpruefung");
+        let info = crate::sema::check(&prog, &mut dg).expect("type check");
         let idx = info.tcx.lookup("T").expect("enum T");
         let sd = &info.tcx.structs[idx];
         assert_eq!(sd.field("__tag").expect("tag").offset, 0);

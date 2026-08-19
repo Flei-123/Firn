@@ -763,7 +763,7 @@ pub fn strlit_report(lit: &str) -> Result<String, String> {
             let back = from_wtf8(&w);
             out.push_str(&format!(
                 "wtf8_rt   {}\n",
-                if back == *v { "bitgleich" } else { "ABWEICHUNG" }
+                if back == *v { "bit identical" } else { "MISMATCH" }
             ));
         }
     }
@@ -808,7 +808,7 @@ mod tests {
     }
     fn err(kind: LitKind, s: &str) -> String {
         let body: Vec<char> = s.chars().collect();
-        decode_literal(kind, &body).expect_err("literal sollte fehlerhaft sein").msg
+        decode_literal(kind, &body).expect_err("literal should be faulty").msg
     }
 
     #[test]
@@ -921,7 +921,7 @@ mod tests {
         assert!(r.contains("D800"), "{}", r);
         assert!(r.contains("to_utf8   nothing"), "{}", r);
         assert!(r.contains("EF BF BD"), "{}", r);
-        assert!(r.contains("wtf8_rt   bitgleich"), "{}", r);
+        assert!(r.contains("wtf8_rt   bit identical"), "{}", r);
         assert!(strlit_report("42").is_err());
     }
 }
