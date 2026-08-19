@@ -1,25 +1,25 @@
-# Auftragsprotokoll des Baumaufbau-Treibers
+# Job protocol of the tree building driver
 
-Vertrag zwischen `lib/browser/parse_main.fi` (Firn) und
-`tools/html/harness_tree.py` bzw. `tools/html/realweb.py` (Werkbank). Wer eine
-Seite ändert, ändert die andere mit — sonst nichts.
+A contract between `lib/browser/parse_main.fi` (Firn) and
+`tools/html/harness_tree.py` resp. `tools/html/realweb.py` (the workbench).
+Whoever changes one side changes the other with it -- and nothing else.
 
-## Eingabe (stdin, binär, little-endian)
+## Input (stdin, binary, little-endian)
 
-Ein Strom aus Aufträgen, ohne Kopf, ohne Ende-Marke:
+A stream of jobs, without a header, without an end marker:
 
-| Feld | Typ | Bedeutung |
+| field | type | meaning |
 |---|---|---|
-| `len_input` | `u32` | Länge von `input` in Bytes |
-| `input` | `u8[len_input]` | Das HTML-Dokument, WTF-8 (hält ungepaarte Surrogate) |
+| `len_input` | `u32` | length of `input` in bytes |
+| `input` | `u8[len_input]` | the HTML document, WTF-8 (keeps unpaired surrogates) |
 
-Zeilenenden werden vom Treiber normalisiert (`\r\n` und `\r` → `\n`), genau
-wie beim Tokenizer-Treiber (`lib/html/tokenize_main.fi`).
+Line endings are normalised by the driver (`\r\n` and `\r` -> `\n`), exactly
+as in the tokenizer driver (`lib/html/tokenize_main.fi`).
 
-## Ausgabe (stdout, UTF-8)
+## Output (stdout, UTF-8)
 
-Je Auftrag der Baum im **`.dat`-Format der html5lib-`tree-construction`-Tests**,
-danach eine Zeile `#ENDE`:
+Per job the tree in the **`.dat` format of the html5lib `tree-construction`
+tests**, followed by a line `#ENDE`:
 
 ```
 | <!DOCTYPE html>
@@ -31,40 +31,42 @@ danach eine Zeile `#ENDE`:
 #ENDE
 ```
 
-Regeln des Formats (`lib/browser/write.fi`):
+Rules of the format (`lib/browser/write.fi`):
 
-* Jede Zeile beginnt mit `| `, danach **zwei Leerzeichen je Ebene**. Die Kinder
-  des Dokuments stehen auf Ebene 0.
-* Element: `<name>`. Außerhalb des HTML-Namensraums mit Präfix: `<svg circle>`,
+* Every line begins with `| `, then **two spaces per level**. The children of
+  the document stand at level 0.
+* Element: `<name>`. Outside the HTML namespace with a prefix: `<svg circle>`,
   `<math mi>`.
-* Attribute stehen **vor** den Kindern, eine Ebene tiefer als ihr Element, und
-  sind **nach dem Namen sortiert** — der DOM behält die Reihenfolge des
-  Quelltexts, nur die Ausgabe sortiert. Namensraum-Attribute mit Präfix:
-  `xlink href="…"`.
-* Text: `"daten"`, ohne Maskierung.
-* Kommentar: `<!-- daten -->`.
-* Doctype: `<!DOCTYPE name>` bzw. `<!DOCTYPE name "public" "system">`.
+* Attributes stand **before** the children, one level deeper than their
+  element, and are **sorted by name** -- the DOM keeps the order of the source
+  text, only the output sorts. Namespace attributes with a prefix:
+  `xlink href="..."`.
+* Text: `"data"`, without escaping.
+* Comment: `<!-- data -->`.
+* Doctype: `<!DOCTYPE name>` resp. `<!DOCTYPE name "public" "system">`.
 
-Kommt der Treiber nicht durch, steht **vor** dem Baum eine Zeile
-`#KAPUTT <code>`; der Läufer zählt den Fall dann als Fehlschlag. Die Codes
-stehen in `lib/browser/driver.fi` (`lauf_dokument_bauen`):
+If the driver does not get through, a line `#KAPUTT <code>` stands **before**
+the tree; the runner then counts the case as a failure. The codes are in
+`lib/browser/driver.fi` (`lauf_dokument_bauen`):
 
-| Code | Bedeutung |
+| code | meaning |
 |---|---|
-| 1 | der Tokenizer erreichte einen Zustand, den er nicht umsetzt |
-| 2 | der Baumaufbau brach ab (Stapelüberlauf oder Speicher aus) |
-| 3 | zu viele Tokenizer-Umschaltungen (kann nur ein Fehler im Code sein) |
-| 9 | kein Dokument (Speicher aus) |
+| 1 | the tokenizer reached a state it does not implement |
+| 2 | the tree building stopped (stack overflow or out of memory) |
+| 3 | too many tokenizer switch-overs (can only be a bug in the code) |
+| 9 | no document (out of memory) |
 
-## Warum der Umweg über einen Puffer
+## Why the detour through a buffer
 
-Der Tokenizer ist vollständig `#[no_gc]` (SPEC §3.5.4) — er darf keine Funktion
-aufrufen, die GC-Speicher anfordert. Der Baumaufbau tut genau das (jeder Knoten
-ist ein GC-Objekt). Zwischen beiden steht deshalb ein **binäres Tokenprotokoll**
-(`lib/html/tokens.fi`, `tb_*`; gelesen von `lib/browser/token_stream.fi`).
+The tokenizer is completely `#[no_gc]` (SPEC 3.5.4) -- it must not call a
+function that asks for GC memory. The tree building does exactly that (every
+node is a GC object). Between the two there is therefore a **binary token
+protocol** (`lib/html/tokens.fi`, `tb_*`; read by
+`lib/browser/token_stream.fi`).
 
-Jeder Satz trägt neben dem Token die **Quellposition unmittelbar hinter dem
-Token**. Die braucht der Baumaufbau, um den Tokenizer bei `<title>`, `<style>`,
-`<script>`, `<textarea>` und `<plaintext>` in einen anderen Startzustand zu
-schicken (WHATWG „generic raw text element parsing algorithm"). Wie das
-gemacht wird — und was es kostet — steht im Kopf von `lib/browser/driver.fi`.
+Besides the token, every record carries the **source position immediately
+behind the token**. The tree building needs it to send the tokenizer into a
+different start state at `<title>`, `<style>`, `<script>`, `<textarea>` and
+`<plaintext>` (the WHATWG "generic raw text element parsing algorithm"). How
+that is done -- and what it costs -- is written in the head of
+`lib/browser/driver.fi`.
