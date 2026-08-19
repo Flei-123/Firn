@@ -1,37 +1,37 @@
-//! `#[no_gc]` — die Garantie fuer heisse Pfade, SPEC §3.5.4.
+//! `#[no_gc]` — the guarantee for hot paths, SPEC §3.5.4.
 //!
-//! In einer `#[no_gc]`-Funktion sind verboten:
-//!  1. GC-Allokation (und jeder Aufruf, der einen Sammellauf ausloesen kann),
-//!  2. Aufruf einer Funktion **ohne** `#[no_gc]`,
-//!  3. Schreiben eines `Gc[T]`/`GcWeak[T]`-Zeigers in ein Feld oder ein
-//!     Feldelement (Einfuegebarriere).
+//! Within a `#[no_gc]` function these are forbidden:
+//!  1. GC allocation (and every call that can trigger a collection run),
+//!  2. calling a function **without** `#[no_gc]`,
+//!  3. writing a `Gc[T]`/`GcWeak[T]` pointer into a field or a field
+//!     element (insertion barrier).
 //!
-//! Die Pruefung ist **transitiv**: weil jede aufgerufene Funktion selbst
-//! `#[no_gc]` tragen muss, gilt die Zusage fuer den ganzen Aufrufbaum. Bricht
-//! die Kette — auch ueber mehrere Ebenen oder ueber eine Modulgrenze hinweg —
-//! gibt es einen Fehler mit Zeile und Spalte.
+//! The check is **transitive**: because every function called must carry
+//! `#[no_gc]` itself, the promise holds for the whole call tree. Once the
+//! chain breaks — across several levels or across a module boundary too —
+//! there is one error with line and column.
 //!
-//! Angebunden ueber die Zeile `// HOOK nogc` in `sema::Checker::run`. Die
-//! GC-spezifischen Abfragen (1 und 3) kommen aus `gc.rs` — diese Datei kennt
-//! den GC nur ueber diese zwei Funktionen und ist damit unabhaengig davon
-//! baubar. Fuer die Selbsttests am Ende der Datei sind die beiden Abfragen
-//! in `Regeln` gebuendelt, damit die Regeln 1 und 3 auch ohne gebauten
-//! Sammler nachweisbar sind; im Compiler laeuft **immer** `Regeln::echt()`.
+//! Wired up through the line `// HOOK nogc` at `sema::Checker::run`. The
+//! GC specific queries (1 and 3) come from `gc.rs` — this file knows the GC
+//! through those two functions only and is therefore buildable without it.
+//! For the self tests at the end of the file both queries are bundled
+//! within `Rules`, so that rules 1 and 3 are provable even without a built
+//! collector; inside the compiler **always** `Rules::real()` runs.
 //!
-//! ## Umfang, ehrlich benannt
+//! ## Scope, honestly stated
 //!
-//! * Geprueft werden alle Aufrufe im Rumpf, **einschliesslich** der Rumpf-
-//!   bloecke von `match`-Faellen (die liegen nicht im AST, sondern in der
-//!   Registrierung von `sema_match.rs`).
-//! * Compilerinterne Aufrufnamen (`__match#N`, `__try#`, `__catch#`,
-//!   `Enum::Variante`) sind keine Funktionsaufrufe und loesen keinen Fehler
-//!   aus; ihre Argumente werden trotzdem durchsucht.
-//! * Aufrufe eines Namens, den es gar nicht gibt, meldet die Typpruefung
-//!   selbst — hier gibt es dafuer keinen zweiten, verwirrenden Fehler.
-//! * Aufrufe ueber Funktionszeiger gibt es in Stufe 0 nicht (`ExprKind::Call`
-//!   traegt immer einen Namen), es gibt hier also kein Schlupfloch.
+//! * Checked are all calls of the body, **including** the body blocks of
+//!   `match` cases (those do not sit at the AST but at the registry of
+//!   `sema_match.rs`).
+//! * Compiler internal call labels (`__match#N`, `__try#`, `__catch#`,
+//!   `Enum::Variant`) are no function calls and trigger no error; their
+//!   arguments get searched nonetheless.
+//! * Calls of a label that does not exist at all get reported by the type
+//!   check itself — no second, confusing error for it here.
+//! * Calls through function pointers do not exist at stage 0 (`ExprKind::Call`
+//!   always carries a label), so there is no loophole here.
 //!
-//! Diese Datei gehoert dem Modul `nogc` (PLAN.md, Runde „Haertetest 2").
+//! This file belongs to the module `nogc` (PLAN.md, round "hardening test 2").
 
 use std::collections::HashMap;
 
@@ -40,10 +40,10 @@ use crate::diag::Span;
 use crate::sema::Checker;
 use crate::types::Type;
 
-/// Die beiden GC-Abfragen, die diese Datei braucht. Im Compiler immer
-/// `Regeln::echt()` (Vertrag von `gc.rs`); die Selbsttests setzen eigene
-/// Vorhersagen ein, damit die Regeln 1 und 3 pruefbar sind, bevor der
-/// Sammler steht.
+/// The two GC queries this file needs. Inside the compiler always
+/// `Rules::real()` (contract of `gc.rs`); the self tests substitute their own
+/// predicates, so that rules 1 and 3 are checkable before the collector
+/// stands.
 #[derive(Clone, Copy)]
 struct Rules {
     is_alloc: fn(&str) -> bool,
@@ -59,22 +59,22 @@ impl Rules {
     }
 }
 
-/// Traegt die Funktion `#[no_gc]`?
+/// Does the function carry `#[no_gc]`?
 pub(crate) fn has_no_gc(f: &FnDecl) -> bool {
     f.attrs.iter().any(|a| a.name == "no_gc")
 }
 
-/// Compilerintern erzeugter Aufrufname (kein Funktionsaufruf im Quelltext).
+/// Call label produced compiler internally (no function call of the source).
 ///
-/// `__match#N` (sema_match.rs), `__try#`/`__catch#` (errors.rs) und
-/// `Enum::Variante` (lower_match.rs) koennen nie aus einem Bezeichner des
-/// Quelltextes entstehen — sie enthalten `#` bzw. `::`.
+/// `__match#N` (sema_match.rs), `__try#`/`__catch#` (errors.rs) and
+/// `Enum::Variant` (lower_match.rs) can never come about from one identifier
+/// of the source text — they hold `#` respectively `::`.
 fn is_interner_name(name: &str) -> bool {
     name.contains('#') || name.contains("::")
 }
 
-/// `helper__square` (Modulsystem, `modules.rs`) wieder als `helper.square`
-/// schreiben — die Meldung soll den Namen zeigen, der im Quelltext steht.
+/// Write `helper__square` (module system, `modules.rs`) as `helper.square`
+/// again — the message shall show the label that stands within the source.
 fn readable(name: &str) -> String {
     if name.starts_with('_') || is_interner_name(name) {
         return name.to_string();
@@ -86,7 +86,7 @@ fn readable(name: &str) -> String {
     name.to_string()
 }
 
-/// `// HOOK nogc` in `sema::Checker::run`: prueft alle `#[no_gc]`-Funktionen.
+/// `// HOOK nogc` within `sema::Checker::run`: checks all `#[no_gc]` functions.
 pub(crate) fn hook_check(ck: &mut Checker, prog: &Program) {
     let findings = collect_findings(prog, &ck.expr_types, Rules::real());
     for (span, msg, note) in findings {
@@ -94,7 +94,7 @@ pub(crate) fn hook_check(ck: &mut Checker, prog: &Program) {
     }
 }
 
-/// Der eigentliche Durchlauf, ohne `Checker` — dadurch einzeln testbar.
+/// The pass proper, without `Checker` — testable on its own that way.
 fn collect_findings(
     prog: &Program,
     expr_types: &[Type],
@@ -102,8 +102,8 @@ fn collect_findings(
 ) -> Vec<(Span, String, String)> {
     let mut marked: HashMap<&str, bool> = HashMap::new();
     for f in &prog.funcs {
-        // Bei doppelt deklarierten Namen (eigener Fehler der Typpruefung)
-        // zaehlt die strengere Angabe: markiert bleibt markiert.
+        // With labels declared twice (a separate error of the type check)
+        // the stricter entry counts: marked stays marked.
         let e = marked.entry(f.name.as_str()).or_insert(false);
         *e |= has_no_gc(f);
     }
@@ -135,16 +135,16 @@ struct NoGcChecker<'a> {
     expr_types: &'a [Type],
     marked: &'a HashMap<&'a str, bool>,
     rules: Rules,
-    /// Name der gerade geprueften `#[no_gc]`-Funktion (fuer die Meldung).
+    /// Label of the `#[no_gc]` function checked right now (for the message).
     who: String,
-    /// Schachtelungstiefe der `match`-Rumpfbloecke (Reissleine, s. u.).
+    /// Nesting depth of the `match` body blocks (rip cord, see below).
     depth: u32,
     out: Vec<(Span, String, String)>,
 }
 
-/// Hoechste Schachtelung von `match`-Faellen, in die hineingesehen wird. Der
-/// Parser begrenzt die Verschachtelung ohnehin auf 200; diese Schranke ist
-/// die zweite Sicherung gegen eine Rekursionsexplosion.
+/// Highest nesting of `match` cases that gets looked into. The parser caps
+/// the nesting at 200 anyway; this bound is the second safeguard against
+/// a recursion explosion.
 const MAX_DEPTH: u32 = 256;
 
 impl<'a> NoGcChecker<'a> {
@@ -167,8 +167,8 @@ impl<'a> NoGcChecker<'a> {
 
     fn check_stmt(&mut self, s: &Stmt) {
         match s {
-            // Der aufgeschobene Rumpf laeuft im selben Rahmen und unterliegt
-            // denselben Regeln.
+            // The deferred body runs within the same frame and obeys
+            // the same rules.
             Stmt::Defer(inner, _, _) => self.check_stmt(inner),
             Stmt::Let { init, .. } => self.check_expr(init),
             Stmt::Assign { target, value, span } => {
@@ -203,10 +203,10 @@ impl<'a> NoGcChecker<'a> {
         }
     }
 
-    /// Regel 3: Schreiben eines GC-Zeigers in ein Feld (oder in ein
-    /// Feldelement). Eine reine Zuweisung an eine oertliche Veraenderliche
-    /// (`ExprKind::Ident`) liegt auf dem Stapel, braucht keine Einfuegebarriere
-    /// und ist erlaubt.
+    /// Rule 3: writing a GC pointer into a field (or into a field
+    /// element). A plain assignment to a local variable
+    /// (`ExprKind::Ident`) sits on the stack, needs no insertion barrier
+    /// and is allowed.
     fn check_write_target(&mut self, target: &Expr, fallback: Span) {
         let ty = self.ty_of(target);
         if !(self.rules.is_gc_ref)(&ty) {
@@ -215,7 +215,7 @@ impl<'a> NoGcChecker<'a> {
         let (what, sp) = match &target.kind {
             ExprKind::Field(_, name, sp) => (format!("the GC field '{}'", name), *sp),
             ExprKind::Index(b, _) => match &b.kind {
-                ExprKind::Ident(_) => return, // oertliches Feld auf dem Stapel
+                ExprKind::Ident(_) => return, // local field on the stack
                 _ => ("a GC element in memory".to_string(), target.span),
             },
             ExprKind::Unary(_, _) => ("a GC field behind a pointer".to_string(), target.span),
@@ -239,10 +239,10 @@ impl<'a> NoGcChecker<'a> {
                 for a in args {
                     self.check_expr(a);
                 }
-                // `match` steht als Aufruf `__match#N` im AST; die Rumpf-
-                // bloecke der Faelle liegen in der Registrierung von
-                // sema_match.rs. Ohne diesen Abstieg waere jede Zustands-
-                // maschine ein blinder Fleck.
+                // `match` stands as the call `__match#N` at the AST; the
+                // body blocks of the cases sit at the registry of
+                // sema_match.rs. Without this descent every state machine
+                // would be a blind spot.
                 self.check_match_cases(name);
             }
             ExprKind::Unary(_, a) => self.check_expr(a),
@@ -278,7 +278,7 @@ impl<'a> NoGcChecker<'a> {
         let sp = if sp == Span::none() { fallback } else { sp };
         let who = self.who.clone();
         if (self.rules.is_alloc)(name) {
-            // Regel 1: GC-Allokation — kann einen Sammellauf ausloesen.
+            // Rule 1: GC allocation — can trigger a collection run.
             self.report(
                 sp,
                 format!(
@@ -291,12 +291,12 @@ impl<'a> NoGcChecker<'a> {
             );
             return;
         }
-        // HOOK impl: `x.m(..)` steht bis zur Typpruefung als `"methode m"`
-        // im Baum — welche Funktion gemeint ist, weiss erst der Typpruefer.
-        // Diese Pruefung laeuft ohne Typtabelle der Empfaenger, also wird der
-        // Fall AUSDRUECKLICH abgelehnt statt stillschweigend uebergangen: ein
-        // Loch in einer Zusage waere schlimmer als eine fehlende Bequemlichkeit
-        // (Runde 45, impls.rs).
+        // HOOK impl: `x.m(..)` stands as `"method m"` at the tree up to the
+        // type check — which function is meant only the type checker knows.
+        // This check runs without a type table of the receivers, so the case
+        // gets rejected EXPLICITLY rather than passed over silently: a hole
+        // within a promise would be worse than a missing convenience
+        // (round 45, impls.rs).
         if let Some(m) = crate::impls::method_name(name) {
             self.report(
                 sp,
@@ -313,7 +313,7 @@ impl<'a> NoGcChecker<'a> {
         }
         match self.marked.get(name) {
             Some(false) => {
-                // Regel 2: Aufruf ohne #[no_gc] — bricht die Kette.
+                // Rule 2: call without #[no_gc] — breaks the chain.
                 self.report(
                     sp,
                     format!(
@@ -327,8 +327,8 @@ impl<'a> NoGcChecker<'a> {
                     ),
                 );
             }
-            // markiert: in Ordnung. Unbekannt: die Typpruefung meldet den
-            // unbekannten Namen selbst, hier kein zweiter Fehler.
+            // marked: fine. Unknown: the type check reports the unknown
+            // label itself, no second error here.
             Some(true) | None => {}
         }
     }
@@ -362,7 +362,7 @@ mod tests {
     use super::*;
     use crate::ast::{Attr, ExprId};
 
-    // ------------------------------------------------------- AST von Hand
+    // -------------------------------------------------------- AST by hand
 
     fn span(line: u32, col: u32) -> Span {
         Span { file: 0, line, col, len: 1 }
@@ -420,8 +420,8 @@ mod tests {
         }
     }
 
-    /// Vorhersagen fuer die Selbsttests: `gc_neu` alloziert, `Gc[T]` wird
-    /// durch `Type::Ptr` vertreten.
+    /// Predicates for the self tests: `gc_new` allocates, `Gc[T]` gets
+    /// represented by `Type::Ptr`.
     fn test_rules() -> Rules {
         fn alloc(n: &str) -> bool {
             n == "gc_new"
@@ -432,7 +432,7 @@ mod tests {
         Rules { is_alloc: alloc, is_gc_ref: ptr }
     }
 
-    // ------------------------------------------------------------- Regeln
+    // -------------------------------------------------------------- Rules
 
     #[test]
     fn regel1_gc_allocation_is_forbidden() {
@@ -558,7 +558,7 @@ mod tests {
 
     #[test]
     fn depth_nesting_becomes_reaches() {
-        // Der Verstoss steckt in einer if-in-while-in-if-Kette.
+        // The violation sits within a chain of if inside while inside if.
         let mut b = Build::new();
         let call = b.call("cold", span(20, 9));
         let cond1 = b.expr(span(10, 1), ExprKind::Bool(true));
@@ -595,7 +595,7 @@ mod tests {
 
     #[test]
     fn real_rules_are_the_out_gc_rs() {
-        // Der Vertrag: der Compiler fragt ausschliesslich gc.rs.
+        // The contract: the compiler asks gc.rs exclusively.
         let r = Rules::real();
         assert_eq!((r.is_alloc)("main"), crate::gc::is_gc_alloc_call("main"));
         assert_eq!((r.is_gc_ref)(&Type::I32), crate::gc::is_gc_ref(&Type::I32));
