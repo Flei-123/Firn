@@ -297,11 +297,15 @@ Firn** gebaut, Runde 4 den **Opt-in-Tracing-GC samt DOM-Prototyp und Dauerlauf**
   Zählverweis-Gegenprobe mit identischem Objektgraphen braucht nach 2.000.000
   Zyklen **750.080 KiB** (Faktor 550). Abschnitt „Speichermodell" weiter unten,
   Bericht `docs/berichte/dom.md`.
+  **Seit Runde 44** ist das Sammeln inkrementell (längste Unterbrechung
+  0,45 ms), **seit Runde 47** gibt es **Finalisierer** (`S4`), schwache Felder
+  werden beim Einsammeln **wirklich genullt** (`S3`), es gibt **externe
+  Wurzelbereiche** und `Arc[T]` mit **atomarem** Zähler (`lib/rc/arc.fi`,
+  `docs/RUNDE47.md`).
   **Offen bleibt:** der 24-Stunden-Lauf aus ABNAHME.md Punkt 2, Fragmentierung
-  bei wechselnden Objektgrößen, **inkrementelles Sammeln** (längste Pause
-  3,54 ms — für 16-ms-Bilder zu viel), Finalisierer, `GcVec`/`GcMap`,
-  `virtual`. `Rc[T]`/`Weak[T]` gibt es als **Firn-Modul** (`tests/modules/rc.fi`),
-  nicht als Sprachtyp; `Arc[T]` fehlt ganz. `Gc[modul.Klasse]` lässt sich nicht
+  bei wechselnden Objektgrößen, `GcVec`/`GcMap`, `virtual`.
+  `Rc[T]`/`Weak[T]`/`Arc[T]` gibt es als **Firn-Module** (`tests/modules/rc.fi`,
+  `lib/rc/arc.fi`), nicht als Sprachtypen; `Gc[modul.Klasse]` lässt sich nicht
   schreiben.
 * **HTML5-Tokenizer:** gebaut und gemessen — **6.810 von 6.810 (100,00 %)**
   Tokenstrom-Vergleich und **6.809 von 6.810 (99,99 %)** mit Vergleich der

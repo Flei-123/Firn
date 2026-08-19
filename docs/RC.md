@@ -202,6 +202,6 @@ aufgezaehlt und sind **nicht** in der SPEC wegretuschiert.
 | A2 | `rc_neu(…)` statt `Rc[T].neu(…)` | Stufe 0 kennt keine Methoden |
 | A3 | `h: *mut RcHeap` statt `inout alloc` | Stufe 0 kennt kein `inout` |
 | A4 | Rueckgabe `AllocError!bool` + Ausgabezeiger statt `AllocError!Rc[T]` | Die Monomorphisierung setzt Typargumente in der Nutzlast einer Fehlerunion nicht ein: `fn f[T](..) -> AllocError!Zaehlverweis[T]` meldet „unbekannter typ 'Zaehlverweis__T'". Die Allokation bleibt vollstaendig fehlbar und `#[must_consume]`. |
-| A5 | `Arc[T]` (atomarer Zaehler, fadensicher) ist **nicht gebaut** | Zeit; ausserdem hat Stufe 0 keine Faeden und keine atomaren Befehle. Offen. |
+| A5 | `Arc[T]` ist seit **Runde 47** gebaut: `lib/rc/arc.fi`, Typen `Atomverweis[T]`/`AtomSchwachverweis[T]`, Zaehler wirklich atomar (`__atomar_addieren` -> `lock xadd`, `compiler/src/atomar.rs`) | Nachweis `tools/atomar/run.sh` und `tests/830`-`833`. Ehrlich benannt bleibt: `aufwerten_atomar` braucht fuer echte Nebenlaeufigkeit einen Vergleichs-Tausch, den Runde 47 nicht baut, und Faeden hat Stufe 0 weiterhin keine (SPEC §7). Siehe `docs/RUNDE47.md`. |
 | A6 | Keine Destruktoren: in einem Wert gespeicherte Verweise muessen von Hand geloest werden | `drop` (SPEC §3.3) ist in Stufe 0 nicht gebaut. Betrifft nur Werte, die selbst Verweise enthalten. |
 | A7 | Halde mit fester Kapazitaet, kein Nachwachsen | macht die Allokation ehrlich fehlbar und ist die Grundlage fuer Speichergrenzen pro Auftrag |

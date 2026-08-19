@@ -216,6 +216,12 @@ Zählung", für berechnete Stilwerte — Stylo macht das mit `Arc`).
   oder einen Lock.
 * `Arc[T]` ist die fadensichere Variante (atomarer Zähler). Getrennter Typ, damit
   einfädiger Code den atomaren Zähler nicht bezahlt.
+  **Gebaut seit Runde 47** als Firn-Modul `lib/rc/arc.fi` (`Atomverweis[T]`,
+  `AtomSchwachverweis[T]`); der Zähler ist wirklich atomar (`lock xadd`,
+  `compiler/src/atomar.rs`, Nachweis `tools/atomar/run.sh`). Ehrlich benannt:
+  das Aufwerten eines schwachen Verweises braucht einen Vergleichs-Tausch, den
+  Runde 47 nicht baut — es ist heute korrekt (ein Faden, §7), aber keine
+  Fadenzusage. `docs/RUNDE47.md`.
 * `Weak[T]` bricht Zyklen manuell — für Fälle, in denen der Zyklus offensichtlich
   und lokal ist.
 * **Zyklen lecken.** Das steht so in der Dokumentation und ist der Grund, warum
@@ -274,7 +280,7 @@ fn append(parent: Gc[Node], child: Gc[Node]) {
 | **Sammelzeitpunkt** | **nur an Allokationsstellen** eines GC-Typs. Kein preemptives Sammeln, keine Signale, keine Safepoint-Polls in Schleifen | Eine Endlosschleife ohne GC-Allokation blockiert eine Sammlung — akzeptabel, weil sie dann auch keinen Müll erzeugt |
 | **Algorithmus** | Mark-Sweep, **inkrementell mit Dreifarbenmarkierung** ab v0.5 (`S5`), Dijkstra-Einfügebarriere beim Schreiben eines `Gc[T]`-Feldes | Die Barriere kostet — aber **nur** beim Schreiben von `Gc[T]`-Feldern. Nicht-GC-Code führt sie nie aus (Leitsatz 4) |
 | **Pausenzeiten** | messbar über `gc.stats()`, begrenzbar über `gc.set_budget(ms)` (`S6`) | |
-| **Finalisierer** | `fn finalize(inout self)` (`S4`), läuft **nach** dem Einsammeln, darf **nicht** wiederbeleben und keine neuen GC-Objekte anlegen — der Compiler prüft das | eingeschränkt, dafür berechenbar |
+| **Finalisierer** | `fn finalize(inout self)` (`S4`), läuft **nach** dem Einsammeln, darf **nicht** wiederbeleben und keine neuen GC-Objekte anlegen. **Gebaut seit Runde 47**; Stufe 0 hat keine Methoden, deshalb Aufräumart je Objekt + ein Verteiler, und die drei Verbote werden zur **Laufzeit** erzwungen (sichtbarer Abbruch) statt vom Compiler geprüft — §14.1, `docs/RUNDE47.md` | eingeschränkt, dafür berechenbar |
 | **Fäden** | Ein GC-Heap **pro Faden**, keine `Gc[T]`-Übergabe zwischen Fäden (`Gc[T]` ist nicht sendbar, §7) | Paralleles Layout arbeitet auf Arena-Daten, nicht auf GC-Daten. Das ist eine echte Einschränkung und steht hier, damit sie beim Layout-Entwurf bekannt ist |
 
 #### 3.5.4 `#[no_gc]` — die Garantie für heiße Pfade
@@ -1178,9 +1184,27 @@ Zählverweis-Gegenprobe mit identischem Graphen braucht nach 2.000.000 Zyklen
 
 **Ehrliche Grenzen dieser Umsetzung:**
 
-* **Keine Finalisierer**, **kein inkrementelles Sammeln**, keine `GcVec`/`GcMap`,
-  kein `virtual`. Die längste gemessene Pause ist **3,54 ms** — für einen
-  Browser mit 16-ms-Bildabstand bereits zu viel.
+* **Keine `GcVec`/`GcMap`, kein `virtual`.**
+  *Inkrementelles Sammeln* kam in Runde 44 dazu (längste Unterbrechung
+  **0,45 ms** statt 3,54 ms), *Finalisierer* (`S4`) in Runde 47.
+* **Finalisierer, Stufe-0-Form (Runde 47, `docs/RUNDE47.md`):** Stufe 0 hat
+  keine Methoden und keine Funktionszeiger, deshalb ist aus
+  `fn finalize(inout self)` ein Paar geworden — `gc_finalisierer_setzen(p, art)`
+  trägt eine **Aufräumart** in den Blockkopf ein, und das Programm deklariert
+  **einen** Verteiler `fn __gc_finalisiere(art: u64, p: *mut u8)` in seiner
+  Wurzeldatei. Die Zusagen aus §3.5.3 gelten unverändert und werden zur
+  **Laufzeit erzwungen** statt nur geprüft: vor dem Aufruf sind alle
+  `Gc[T]`/`GcWeak[T]`-Felder des Objekts genullt, `stark()` auf ein wartendes
+  Objekt liefert 0, und Allokation (Abbruch 71), `gc_collect()` (72) sowie das
+  Schreiben eines Gc-Zeigers in ein Heapfeld (73) brechen sichtbar ab.
+  **Wiederbelebung gibt es damit nicht** — der Block wird freigegeben, sobald
+  der Finalisierer zurückkehrt. Reihenfolge zwischen zwei Objekten: **keine
+  Zusage**. Höchstens einmal je Objekt.
+* **Externe Wurzelbereiche (Runde 47):** `gc_wurzel_anmelden(p, bytes)` meldet
+  Speicher **außerhalb** des GC-Heaps an, der `Gc[T]` enthalten darf (gebraucht
+  von `Arc[T]`, `lib/rc/arc.fi`). Er wird bei jedem Zyklusstart konservativ
+  mitgescannt; der Preis ist eine mit der angemeldeten Größe wachsende
+  Startpause.
 * **Ein Faden.** Der Zustandsblock ist fadenlokal gedacht; Stufe 0 hat nur einen.
 * **Der konservative Scan hat einen Preis, der sich messen lässt:** eine alte
   Zeigerkopie in einem **lebenden** Stapelrahmen hält ihr Objekt am Leben. Wer

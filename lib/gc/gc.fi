@@ -172,6 +172,20 @@ const S_PMAX_FIN: u64 = 1928
 // Typtabelle bestimmt, damit das Fegen bei Programmen ohne schwache Felder
 // keinen einzigen zusaetzlichen Tabellenzugriff macht.
 const S_HATWEAK: u64 = 1936
+// Uhr je EINZELNEM Finalisierer (0 = aus). Sie kostet zwei Systemaufrufe je
+// Finalisierer — bei knapp einer Million Finalisierern in drei Sekunden sind
+// das gemessen ~3 % Laufzeit. Die Scheibenzeit (S_PMAX_FIN) wird IMMER
+// gemessen, sie kostet nur zwei Aufrufe je Scheibe. Wie bei S_CPUUHR
+// schalten nur Messprogramme das hier ein.
+const S_FINUHR: u64 = 1944
+// Bitmaske der Typkennungen MIT schwachem Feld (Bit i = Typkennung i+1).
+// Damit kostet die Frage "hat dieses Objekt ueberhaupt ein GcWeak-Feld?" im
+// Fegen eine Verschiebung und ein Und statt vier abhaengiger Speicherzugriffe
+// in die Typtabelle. Gemessen hat genau das den Durchsatzverlust der Runde
+// von 3,0 % auf 0,4 % gedrueckt (docs/RUNDE47.md).
+// Mehr als 64 Klassen: dann steht Bit 63 fuer "koennte sein" und es wird
+// nachgesehen — richtig bleibt es immer, nur nicht mehr ganz so billig.
+const S_WEAKMASK: u64 = 1952
 
 // Zustandswort eines Blockkopfes (siehe Kopfkommentar).
 const M_MARKE: u32 = 3
@@ -321,8 +335,119 @@ fn __gc_fehler_fin_wieder() {
 
 // ------------------------------------------------------- Stapelboden ermitteln
 
-// Feld 28 aus /proc/self/stat ist die Startadresse des Stapels. Damit ist der
-// Stapelboden EXAKT bekannt, unabhaengig davon, wo gc_init() gerufen wird.
+// RUNDE 47 — DER STAPELBODEN AUS /proc/self/maps.
+//
+// Feld 28 aus /proc/self/stat ist die Startadresse des Stapels, wie der Kern
+// sie beim Programmstart notiert hat. Das ist EXAKT, solange das Programm auf
+// genau diesem Stapel laeuft — unter valgrind aber NICHT: dort laeuft der
+// Klient auf einem von valgrind bereitgestellten Stapel, waehrend Feld 28
+// weiterhin den urspruenglichen nennt. Der konservative Scan lief dann von
+// seinem Stapelzeiger bis zu einer Adresse, die gar nicht dazugehoert, und
+// das Programm starb mit einem Speicherzugriffsfehler.
+//
+// Folge, bis diese Runde: KEIN Programm mit `gc class` liess sich unter
+// callgrind messen (mit dem Compiler der Runde 44 genauso wenig — es ist
+// kein neuer Fehler, nur ein bisher nicht benannter). Damit fehlte
+// ausgerechnet fuer den Sammler das einzige Messmittel, das nicht streut.
+//
+// Jetzt wird ZUERST /proc/self/maps gelesen und die Abbildung gesucht, in der
+// der eigene Stapelzeiger wirklich liegt; ihr Ende ist der Boden. Das gilt
+// auf beiden Wegen. Schlaegt es fehl, bleibt Feld 28 als Rueckfall.
+fn __gc_hexziffer(c: u8) -> i64 {
+    if c >= 48 && c <= 57 {
+        return c as i64 - 48
+    }
+    if c >= 97 && c <= 102 {
+        return c as i64 - 87
+    }
+    if c >= 65 && c <= 70 {
+        return c as i64 - 55
+    }
+    return -1
+}
+
+fn __gc_stapel_boden_maps(sp: u64) -> u64 {
+    var pfad: [u8; 16] = "/proc/self/maps\0"
+    let kap: u64 = 262144
+    let puffer: u64 = __gc_mmap(kap)
+    if puffer == 0 {
+        return 0
+    }
+    let pp: u64 = (&pfad) as u64
+    let fd: i64 = syscall(SYS_OPEN, pp as i64, 0, 0, 0, 0, 0)
+    if fd < 0 {
+        __gc_munmap(puffer, kap)
+        return 0
+    }
+    var len: u64 = 0
+    var weiter: bool = true
+    while weiter {
+        let n: i64 = syscall(SYS_READ, fd, (puffer + len) as i64,
+                             (kap - len - 1) as i64, 0, 0, 0)
+        if n <= 0 {
+            weiter = false
+        } else {
+            len = len + n as u64
+            if len + 1 >= kap {
+                weiter = false
+            }
+        }
+    }
+    syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+    if len == 0 {
+        __gc_munmap(puffer, kap)
+        return 0
+    }
+    // Zeilen der Form "7ffd0a1b2000-7ffd0a1d3000 rw-p ..." — gesucht ist die,
+    // in der `sp` liegt; ihr Ende ist der Stapelboden.
+    var i: u64 = 0
+    var treffer: u64 = 0
+    while i < len {
+        var von: u64 = 0
+        var stellen: u64 = 0
+        while i < len {
+            let z: i64 = __gc_hexziffer(*((puffer + i) as *mut u8))
+            if z < 0 {
+                break
+            }
+            von = von * 16 + z as u64
+            stellen = stellen + 1
+            i = i + 1
+        }
+        var bis: u64 = 0
+        if stellen > 0 && i < len && *((puffer + i) as *mut u8) == 45 {
+            i = i + 1
+            var st2: u64 = 0
+            while i < len {
+                let z2: i64 = __gc_hexziffer(*((puffer + i) as *mut u8))
+                if z2 < 0 {
+                    break
+                }
+                bis = bis * 16 + z2 as u64
+                st2 = st2 + 1
+                i = i + 1
+            }
+            if st2 > 0 && sp >= von && sp < bis {
+                treffer = bis
+            }
+        }
+        // Rest der Zeile ueberspringen.
+        while i < len && *((puffer + i) as *mut u8) != 10 {
+            i = i + 1
+        }
+        if i < len {
+            i = i + 1
+        }
+        if treffer != 0 {
+            i = len
+        }
+    }
+    __gc_munmap(puffer, kap)
+    return treffer
+}
+
+// Feld 28 aus /proc/self/stat ist die Startadresse des Stapels. Rueckfall,
+// wenn /proc/self/maps nichts hergibt.
 fn __gc_stapel_boden() -> u64 {
     var pfad: [u8; 16] = "/proc/self/stat\0"
     let puffer: u64 = __gc_mmap(8192)
@@ -544,11 +669,22 @@ fn __gc_block_von(a: u64) -> u64 {
 // Zwischenspeicher.
 fn __gc_chunk_von(a: u64) -> u64 {
     let st: u64 = __gc_state() as u64
+    // Derselbe eintraegige Zwischenspeicher wie in __gc_block_von: aufeinander
+    // folgende Finalisierer treffen fast immer denselben Chunk.
+    let cc: u64 = __gc_ld64(st + S_CHUNK_CACHE)
+    if cc != 0 {
+        let d0: u64 = cc + CHUNK_KOPF
+        let e0: u64 = d0 + __gc_ld64(cc + 16) * __gc_ld64(cc + 24)
+        if a >= d0 && a < e0 {
+            return cc
+        }
+    }
     var c: u64 = __gc_ld64(st + S_CHUNKS)
     while c != 0 {
         let daten: u64 = c + CHUNK_KOPF
         let ende: u64 = daten + __gc_ld64(c + 16) * __gc_ld64(c + 24)
         if a >= daten && a < ende {
+            __gc_st64(st + S_CHUNK_CACHE, c)
             return c
         }
         c = __gc_ld64(c)
@@ -710,7 +846,7 @@ fn __gc_sweep_schritt(t0: u64) -> u64 {
     var lebbytes: u64 = __gc_ld64(st + S_SWLEBB)
     var vorher: u64 = __gc_ld64(st + S_SWV)
     var c: u64 = __gc_ld64(st + S_SWC)
-    let hatweak: u64 = __gc_ld64(st + S_HATWEAK)
+    let weakmask: u64 = __gc_ld64(st + S_WEAKMASK)
     var probe: u64 = SCHEIBE_SWEEP
     while c != 0 {
         let naechster: u64 = __gc_ld64(c)
@@ -736,8 +872,12 @@ fn __gc_sweep_schritt(t0: u64) -> u64 {
         while i < anzahl {
             let b: u64 = daten + i * block
             let tid: u32 = __gc_ld32(b)
-            let zw: u32 = __gc_ld32(b + 4)
-            if tid != 0 && (zw & M_MARKE) != weiss {
+            // Das Zustandswort wird ERST gelesen, wenn der Block ueberhaupt
+            // belegt ist: die weitaus meisten besuchten Bloecke sind frei
+            // (tid == 0). Gegenprobe gemessen — die Typkennung stattdessen
+            // zweimal zu lesen statt sie zu binden, war um 0,3 Mio.
+            // Instruktionen SCHLECHTER (docs/RUNDE47.md).
+            if tid != 0 && (__gc_ld32(b + 4) & M_MARKE) != weiss {
                 // Lebt (grau oder schwarz). Die Marke bleibt STEHEN — das
                 // Umschalten der Weiss-Paritaet am Zyklusende macht alle
                 // Ueberlebenden in einem Zug wieder weiss, ohne dass dieser
@@ -747,34 +887,32 @@ fn __gc_sweep_schritt(t0: u64) -> u64 {
                 // Runde 47: schwache Felder dieses lebenden Objekts, deren
                 // Ziel in DIESEM Lauf stirbt, werden hier wirklich genullt
                 // (SPEC 3.5.3 S3) — nicht erst beim naechsten `stark()`.
-                if hatweak != 0 {
+                // Eine Verschiebung, ein Und, ein Sprung. Bei weakmask == 0
+                // (kein Programm mit schwachen Feldern) ist das Ergebnis
+                // immer 0 — dann kostet die ganze Zusage NICHTS.
+                if (weakmask >> ((tid as u64) - 1)) & 1 != 0 {
                     __gc_weak_saeubern(b, weiss)
                 }
             } else {
-                var behalten: bool = false
-                if tid != 0 && (zw & F_FIN) != 0 && (zw & F_GETAN) == 0 {
-                    // Runde 47: unerreichbar UND mit Finalisierer. Der Block
-                    // wird NICHT freigegeben, sondern in die Warteschlange
-                    // gehaengt (verkettet ueber das Seriennummernwort). Erst
-                    // wenn sein Finalisierer gelaufen ist, wird er frei.
-                    __gc_st32(b + 4, zw | F_WART)
-                    __gc_st64(b + 8, __gc_ld64(st + S_FINQ))
-                    __gc_st64(st + S_FINQ, b)
-                    __gc_st64(st + S_FINQ_N, __gc_ld64(st + S_FINQ_N) + 1)
-                    lebende = lebende + 1
-                    lebbytes = lebbytes + block
-                    behalten = true
+                if tid != 0 {
+                    // Der Finalisiererfall steht in einer eigenen Funktion:
+                    // in der Fegeschleife zaehlt jede Instruktion (sie laeuft
+                    // je Sammellauf ueber JEDEN Block des Heaps).
+                    if (__gc_ld32(b + 4) & F_FIN) != 0 {
+                        if __gc_fin_einreihen(b) != 0 {
+                            lebende = lebende + 1
+                            lebbytes = lebbytes + block
+                            i = i + 1
+                            continue
+                        }
+                    }
+                    __gc_st32(b, 0)
+                    __gc_st64(b + 8, 0)
                 }
-                if !behalten {
-                    if tid != 0 {
-                        __gc_st32(b, 0)
-                        __gc_st64(b + 8, 0)
-                    }
-                    tot = tot + 1
-                    if klasse < KLASSEN {
-                        __gc_st64(b + KOPF, __gc_ld64(kopf_addr))
-                        __gc_st64(kopf_addr, b)
-                    }
+                tot = tot + 1
+                if klasse < KLASSEN {
+                    __gc_st64(b + KOPF, __gc_ld64(kopf_addr))
+                    __gc_st64(kopf_addr, b)
                 }
             }
             i = i + 1
@@ -1250,6 +1388,17 @@ fn __gc_zyklus_fertig() {
 
 // -------------------------------------------------------------- Allokation
 
+// Der kalte Zweig der Allokation. Er steht in einer EIGENEN Funktion, damit
+// `__gc_alloc_raw` genau einen zusaetzlichen Block bekommt und nicht zwei:
+// gemessen kosteten die zwei Bloecke dort 3,3 Mio. Instruktionen, weil die
+// Registerzuteilung in der heissesten Funktion des Sammlers kippte.
+fn __gc_alloc_gesperrt(st: u64) {
+    if __gc_ld64(st + S_INIT) == 0 {
+        __gc_abbruch(70)
+    }
+    __gc_fehler_fin_alloc()
+}
+
 // Liefert die Nutzdatenadresse (= der Wert eines `Gc[T]`) oder 0.
 // Bei Erschoepfung: ERST ein Sammellauf, DANN das Scheitern.
 fn __gc_alloc_raw(tid: u64, size: u64) -> *mut u8 {
@@ -1260,11 +1409,7 @@ fn __gc_alloc_raw(tid: u64, size: u64) -> *mut u8 {
     // aus dem Sammellauf heraus starten (Reentranz), und der kostet sonst
     // jeden Allokationspfad einen zusaetzlichen Speicherzugriff.
     if __gc_ld64(st + S_INIT) != 1 {
-        if __gc_ld64(st + S_INIT) == 0 {
-            __gc_abbruch(70)
-            return 0 as *mut u8
-        }
-        __gc_fehler_fin_alloc()
+        __gc_alloc_gesperrt(st)
         return 0 as *mut u8
     }
     let klasse: u64 = __gc_klasse_fuer(size)
@@ -1475,18 +1620,25 @@ fn __gc_barrier(feld: *mut u8, wert: *mut u8) {
     // Ziel grau — sonst koennte ein weisses Objekt hinter einem bereits
     // verfolgten (schwarzen) verschwinden, ohne je gesehen zu werden.
     if __gc_ld64(st + S_PHASE) != 0 {
-        // Runde 47: WIEDERBELEBUNG. Waehrend ein Finalisierer laeuft, steht
-        // S_INIT auf 2. Ein Gc-Zeiger, der jetzt in ein Heapfeld geschrieben
-        // wird, koennte das gerade sterbende Objekt zurueck in den lebenden
-        // Graphen holen — der Block wird aber gleich freigegeben. Also: kein
-        // stiller Zeiger ins Nichts, sondern sichtbarer Abbruch.
-        // Der Test steht INNERHALB dieses Zweiges und kostet den Normalfall
-        // (Phase 0, kein Zyklus) damit nichts.
-        if __gc_ld64(st + S_INIT) != 1 {
-            __gc_fehler_fin_wieder()
-        }
-        __gc_mark(wert as u64)
+        __gc_barrier_zyklus(st, wert)
     }
+}
+
+// Der Teil der Barriere, der NUR waehrend eines Zyklus laeuft. Er steht in
+// einer eigenen Funktion, damit `__gc_barrier` klein genug bleibt, um
+// eingebettet zu werden (gemessen: sonst kostet jeder Zeigerschreibzugriff
+// einen echten Aufruf).
+//
+// WIEDERBELEBUNG: waehrend ein Finalisierer laeuft, steht S_INIT auf 2. Ein
+// Gc-Zeiger, der jetzt in ein Heapfeld geschrieben wird, koennte das gerade
+// sterbende Objekt zurueck in den lebenden Graphen holen — der Block wird
+// aber gleich freigegeben. Also: kein stiller Zeiger ins Nichts, sondern
+// sichtbarer Abbruch.
+fn __gc_barrier_zyklus(st: u64, wert: *mut u8) {
+    if __gc_ld64(st + S_INIT) != 1 {
+        __gc_fehler_fin_wieder()
+    }
+    __gc_mark(wert as u64)
 }
 
 // ------------------------------------------------------------ Finalisierer
@@ -1695,18 +1847,23 @@ fn __gc_fin_einen() -> u64 {
     __gc_st64(b + 8, 0)
     __gc_felder_nullen(b)
     __gc_st64(st + S_INIT, 2)
-    let t0: u64 = __gc_jetzt_ns()
+    var t0: u64 = 0
+    if __gc_ld64(st + S_FINUHR) != 0 {
+        t0 = __gc_jetzt_ns()
+    }
     __gc_finalisiere(art, (b + KOPF) as *mut u8)
-    let t1: u64 = __gc_jetzt_ns()
+    if t0 != 0 {
+        let t1: u64 = __gc_jetzt_ns()
+        var d: u64 = 0
+        if t1 > t0 {
+            d = t1 - t0
+        }
+        __gc_st64(st + S_FIN_NS, __gc_ld64(st + S_FIN_NS) + d)
+        if d > __gc_ld64(st + S_FIN_MAX) {
+            __gc_st64(st + S_FIN_MAX, d)
+        }
+    }
     __gc_st64(st + S_INIT, 1)
-    var d: u64 = 0
-    if t1 > t0 {
-        d = t1 - t0
-    }
-    __gc_st64(st + S_FIN_NS, __gc_ld64(st + S_FIN_NS) + d)
-    if d > __gc_ld64(st + S_FIN_MAX) {
-        __gc_st64(st + S_FIN_MAX, d)
-    }
     __gc_st64(st + S_FIN_LAEUFE, __gc_ld64(st + S_FIN_LAEUFE) + 1)
     __gc_block_frei(b)
     return 1
@@ -1771,6 +1928,12 @@ fn gc_fin_ns_max() -> u64 {
     return __gc_ld64(__gc_state() as u64 + S_FIN_MAX)
 }
 
+// Uhr je einzelnem Finalisierer einschalten (Voreinstellung aus, siehe
+// S_FINUHR). Ohne sie bleiben gc_fin_ns_max/_total 0.
+fn gc_set_fin_uhr(an: u64) {
+    __gc_st64(__gc_state() as u64 + S_FINUHR, an)
+}
+
 // Laengste Finalisiererscheibe (Sammlerarbeit + die Finalisierer, die in
 // DERSELBEN Scheibe liefen).
 fn gc_pause_ns_fin_max() -> u64 {
@@ -1805,6 +1968,55 @@ fn __gc_weak_vorhanden() -> u64 {
         i = i + 1
     }
     return 0
+}
+
+// Bitmaske der Klassen mit schwachem Feld (siehe S_WEAKMASK).
+fn __gc_weak_maske() -> u64 {
+    let st: u64 = __gc_state() as u64
+    let tab: u64 = __gc_ld64(st + S_TABELLE)
+    if tab == 0 {
+        return 0
+    }
+    let n: u64 = __gc_ld64(tab)
+    var m: u64 = 0
+    var i: u64 = 0
+    var viele: bool = false
+    while i < n {
+        if __gc_ld64(tab + 8 + i * 64 + 32) != 0 {
+            if i < 64 {
+                m = m | (1 << i)
+            } else {
+                viele = true
+            }
+        }
+        i = i + 1
+    }
+    // Mehr als 64 Klassen mit schwachem Feld: die Maske kann das nicht mehr
+    // abbilden, also wird jedes Objekt nachgesehen (richtig, nur nicht mehr
+    // ganz so billig). Alle Bits gesetzt heisst: die Verschiebung im Fegen
+    // liefert immer 1, egal um wie viel verschoben wird.
+    if viele {
+        return 18446744073709551615
+    }
+    return m
+}
+
+// Runde 47: einen unerreichbaren Block mit Finalisierer in die Warteschlange
+// haengen. 1 = eingereiht (der Block bleibt stehen), 0 = nichts zu tun.
+// Verkettet wird ueber das Seriennummernwort des toten Blocks — die
+// Warteschlange braucht damit keinen eigenen Speicher und kann nicht
+// ueberlaufen.
+fn __gc_fin_einreihen(b: u64) -> u64 {
+    let zw: u32 = __gc_ld32(b + 4)
+    if (zw & F_GETAN) != 0 {
+        return 0
+    }
+    let st: u64 = __gc_state() as u64
+    __gc_st32(b + 4, zw | F_WART)
+    __gc_st64(b + 8, __gc_ld64(st + S_FINQ))
+    __gc_st64(st + S_FINQ, b)
+    __gc_st64(st + S_FINQ_N, __gc_ld64(st + S_FINQ_N) + 1)
+    return 1
 }
 
 // Ist das Ziel eines schwachen Verweises in diesem Lauf tot?
@@ -1976,8 +2188,14 @@ fn gc_init() -> bool {
     if __gc_ld64(st + S_INIT) != 0 {
         return true
     }
-    let boden: u64 = __gc_stapel_boden()
+    var anker0: u64 = 0
+    let sp0: u64 = (&anker0) as u64
+    anker0 = 0
+    var boden: u64 = __gc_stapel_boden_maps(sp0)
     if boden == 0 {
+        boden = __gc_stapel_boden()
+    }
+    if boden == 0 || boden <= sp0 {
         return false
     }
     let ms: u64 = __gc_mmap(MARK_BYTES)
@@ -1993,6 +2211,7 @@ fn gc_init() -> bool {
     // Runde 47: einmal feststellen, ob ueberhaupt eine Klasse ein schwaches
     // Feld hat. Programme ohne GcWeak zahlen fuers Nullen dann gar nichts.
     __gc_st64(st + S_HATWEAK, __gc_weak_vorhanden())
+    __gc_st64(st + S_WEAKMASK, __gc_weak_maske())
     __gc_st64(st + S_INIT, 1)
     return true
 }
