@@ -173,6 +173,11 @@ pub fn emit(m: &Module) -> Result<String, String> {
     if crate::gc::hat_klassen() {
         e.raw(&crate::gc::typtabelle_asm());
     }
+    // HOOK iface: die Methodentafeln (.rodata) — nur, wenn das Programm
+    // ueberhaupt eine Schnittstelle umsetzt (iface.rs, Runde 46).
+    if crate::iface::hat_schnittstellen() {
+        e.raw(&crate::iface::tafeln_asm());
+    }
     e.raw(".section .note.GNU-stack,\"\",@progbits");
     Ok(e.out)
 }
@@ -523,6 +528,42 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
             if let Some(d) = i.dst {
                 store_dst(e, fr, d, "rax");
             }
+        }
+        // Dynamischer Versand (iface.rs, Runde 46): wie `Op::Call`, nur steht
+        // das Ziel in einem Register. `rax` ist im Grundpfad reines
+        // Arbeitsregister und kein Argumentregister — es wird ZULETZT geladen.
+        Op::CallIndirect { target, args } => {
+            let stack_args = args.len().saturating_sub(ARG_REGS.len());
+            let mut adjust = 8 * stack_args as u64;
+            if stack_args % 2 == 1 {
+                adjust += 8;
+            }
+            if adjust > 0 {
+                e.line(&format!("sub rsp, {}", adjust));
+                for (k, a) in args.iter().skip(ARG_REGS.len()).enumerate() {
+                    load_full(e, fr, "rax", *a);
+                    e.line(&format!("mov qword ptr [rsp+{}], rax", 8 * k));
+                }
+            }
+            for (k, a) in args.iter().take(ARG_REGS.len()).enumerate() {
+                load_full(e, fr, ARG_REGS[k], *a);
+            }
+            load_full(e, fr, "rax", *target);
+            e.line("call rax");
+            if adjust > 0 {
+                e.line(&format!("add rsp, {}", adjust));
+            }
+            if let Some(d) = i.dst {
+                store_dst(e, fr, d, "rax");
+            }
+        }
+        Op::VtabAddr { tafel } => {
+            let d = i.dst.ok_or("interner Fehler: vtab ohne Ziel")?;
+            e.line(&format!(
+                "lea rax, [rip + {}]",
+                crate::iface::tafel_label(tafel)
+            ));
+            store_dst(e, fr, d, "rax");
         }
         Op::Syscall { args } => {
             if args.is_empty() {

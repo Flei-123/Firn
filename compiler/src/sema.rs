@@ -172,6 +172,9 @@ impl<'a> Checker<'a> {
         if prog.expr_count as usize > self.expr_types.len() {
             self.expr_types.resize(prog.expr_count as usize, Type::Error);
         }
+        // HOOK iface: `dyn I` als Struct anmelden — VOR den Structs des
+        // Programms, damit ein Feld vom Typ `dyn I` sein Layout findet (iface.rs)
+        crate::iface::declare_interfaces(self);
         self.collect_structs(prog);
         if layout_enums {
             // HOOK types: Aufzaehlungen auslegen (sema_match.rs)
@@ -182,6 +185,11 @@ impl<'a> Checker<'a> {
         // einer gc-Klasse bekommt so die richtige Meldung.
         crate::gc::layout_classes(self);
         self.collect_fns(prog);
+        // HOOK iface: `impl I for T` vollstaendig pruefen — alle Methoden da,
+        // alle Signaturen passend (iface.rs, Runde 46). Laeuft VOR den
+        // Rumpfen, damit die Meldung der Umsetzung vor der der Aufrufstelle
+        // steht.
+        crate::iface::hook_check_impls(self);
         // Attribute pruefen und anwenden (attrs.rs)
         self.check_attrs(prog);
         self.check_consts(prog);
@@ -1101,6 +1109,10 @@ impl<'a> Checker<'a> {
                 if src.is_error() || dst.is_error() {
                     return dst;
                 }
+                // HOOK iface: `x as dyn I` — der Schnittstellenwert (iface.rs)
+                if let Some(t) = crate::iface::hook_cast(self, e.span, &src, &dst) {
+                    return t;
+                }
                 let ok = cast_kind(&src) && cast_kind(&dst);
                 if !ok {
                     self.dg.error(
@@ -1659,6 +1671,11 @@ impl<'a> Checker<'a> {
                 // nur ohne zu melden und ohne zu schreiben (impls.rs)
                 if let Some(m) = crate::impls::methodenname(name) {
                     let et = args.first().and_then(|a| self.probe_d(a, d + 1))?;
+                    // HOOK iface: auf einem `dyn I` steht der Typ in der
+                    // Schnittstelle, nicht in der Funktionstabelle (iface.rs)
+                    if let Some(iname) = crate::impls::dyn_schnittstelle(&self.tcx, &et) {
+                        return crate::iface::ret_von(&iname, m);
+                    }
                     let (voll, _) = crate::impls::ziel_von(&self.tcx, &self.fns, m, &et)?;
                     return self.fns.get(&voll).map(|s| s.ret.clone());
                 }
@@ -1706,6 +1723,10 @@ impl<'a> Checker<'a> {
         // HOOK gc: `Gc[C]`, `GcWeak[C]` und der verbotene Gebrauch eines
         // `gc class`-Namens als gewoehnlicher Wert (gc.rs)
         if let Some(t) = crate::gc::hook_resolve_ty(self, te) {
+            return t;
+        }
+        // HOOK iface: `dyn I` mit unbekanntem `I` (iface.rs)
+        if let Some(t) = crate::iface::hook_resolve_ty(self, te) {
             return t;
         }
         match te {

@@ -20,6 +20,7 @@ mod errors;
 mod fir;
 mod gc;
 mod gc_lower;
+mod iface;
 mod impls;
 mod inline;
 mod layout;
