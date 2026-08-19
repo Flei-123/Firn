@@ -42,20 +42,20 @@ N=${SCHRANKEN_N:-2000000}
 
 cat > "$W/statisch.fi" <<EOF
 interface Order {
-    fn kleiner(*self, b: *Self) -> bool
+    fn less(*self, b: *Self) -> bool
 }
 
-struct Punkt { x: i64 }
+struct Dot { x: i64 }
 
-impl Order for Punkt {
-    fn kleiner(*self, b: *Punkt) -> bool { return (*self).x < (*b).x }
+impl Order for Dot {
+    fn less(*self, b: *Dot) -> bool { return (*self).x < (*b).x }
 }
 
 fn count[T: Order](a: *T, b: *T, n: i64) -> i64 {
     var i: i64 = 0
     var s: i64 = 0
     while i < n {
-        if a.kleiner(b) {
+        if a.less(b) {
             s = s + 1
         }
         i = i + 1
@@ -64,9 +64,9 @@ fn count[T: Order](a: *T, b: *T, n: i64) -> i64 {
 }
 
 fn main() -> i32 {
-    var p: Punkt = Punkt{ x: 1 }
-    var q: Punkt = Punkt{ x: 2 }
-    if count[Punkt](&p, &q, $N) != $N {
+    var p: Dot = Dot{ x: 1 }
+    var q: Dot = Dot{ x: 2 }
+    if count[Dot](&p, &q, $N) != $N {
         return 1
     }
     return 0
@@ -75,20 +75,20 @@ EOF
 
 cat > "$W/dynamisch.fi" <<EOF
 interface OrderD {
-    fn kleiner(*self, b: *Punkt) -> bool
+    fn less(*self, b: *Dot) -> bool
 }
 
-struct Punkt { x: i64 }
+struct Dot { x: i64 }
 
-impl OrderD for Punkt {
-    fn kleiner(*self, b: *Punkt) -> bool { return (*self).x < (*b).x }
+impl OrderD for Dot {
+    fn less(*self, b: *Dot) -> bool { return (*self).x < (*b).x }
 }
 
-fn count_dyn(a: dyn OrderD, b: *Punkt, n: i64) -> i64 {
+fn count_dyn(a: dyn OrderD, b: *Dot, n: i64) -> i64 {
     var i: i64 = 0
     var s: i64 = 0
     while i < n {
-        if a.kleiner(b) {
+        if a.less(b) {
             s = s + 1
         }
         i = i + 1
@@ -97,8 +97,8 @@ fn count_dyn(a: dyn OrderD, b: *Punkt, n: i64) -> i64 {
 }
 
 fn main() -> i32 {
-    var p: Punkt = Punkt{ x: 1 }
-    var q: Punkt = Punkt{ x: 2 }
+    var p: Dot = Dot{ x: 1 }
+    var q: Dot = Dot{ x: 2 }
     let d: dyn OrderD = (&p) as dyn OrderD
     if count_dyn(d, &q, $N) != $N {
         return 1

@@ -30,7 +30,7 @@ import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-FAELLE = os.path.join(ROOT, "tools", "html", "faelle")
+FAELLE = os.path.join(ROOT, "tools", "html", "cases")
 LUECKEN = os.path.join(ROOT, "tools", "html", "luecken")
 
 
