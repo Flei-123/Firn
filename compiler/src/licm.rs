@@ -62,67 +62,67 @@ pub(crate) fn hoist_loop_invariants(f: &mut Func) -> usize {
     }
     let preds = crate::mem2reg::preds(f);
     let dom = crate::mem2reg::dominators(f);
-    let mut bewegt = 0;
+    let mut moved = 0;
 
     // Rückwärtskanten: b -> h, wobei h den Block b dominiert.
-    let mut kanten: Vec<(usize, usize)> = Vec::new();
+    let mut edges: Vec<(usize, usize)> = Vec::new();
     for (b, blk) in f.blocks.iter().enumerate() {
         for s in blk.term.successors() {
             let h = s as usize;
             if h < n && dom[b][h] {
-                kanten.push((h, b));
+                edges.push((h, b));
             }
         }
     }
-    if kanten.is_empty() {
+    if edges.is_empty() {
         return 0;
     }
 
     // Innerste Schleifen zuerst: kleinerer Rumpf = weiter innen.
-    let mut schleifen: Vec<(usize, HashSet<usize>)> = Vec::new();
-    for (h, b) in kanten {
-        schleifen.push((h, natuerliche_schleife(h, b, &preds)));
+    let mut loops: Vec<(usize, HashSet<usize>)> = Vec::new();
+    for (h, b) in edges {
+        loops.push((h, natural_loop(h, b, &preds)));
     }
-    schleifen.sort_by_key(|(_, rumpf)| rumpf.len());
+    loops.sort_by_key(|(_, body)| body.len());
 
-    for (head, rumpf) in schleifen {
-        let vorkopf = match vorkopf_von(f, head, &rumpf, &preds) {
+    for (head, body) in loops {
+        let preheader = match preheader_of(f, head, &body, &preds) {
             Some(p) => p,
             None => continue,
         };
-        bewegt += hebe_aus(f, head, &rumpf, vorkopf);
+        moved += hoist_out(f, head, &body, preheader);
     }
-    bewegt
+    moved
 }
 
 /// Rumpf der natürlichen Schleife zur Rückwärtskante `back -> head`:
 /// `head` plus alles, was `back` erreicht, ohne `head` zu passieren.
-fn natuerliche_schleife(head: usize, back: usize, preds: &[Vec<usize>]) -> HashSet<usize> {
-    let mut rumpf = HashSet::new();
-    rumpf.insert(head);
-    let mut stapel = Vec::new();
+fn natural_loop(head: usize, back: usize, preds: &[Vec<usize>]) -> HashSet<usize> {
+    let mut body = HashSet::new();
+    body.insert(head);
+    let mut stack = Vec::new();
     if back != head {
-        rumpf.insert(back);
-        stapel.push(back);
+        body.insert(back);
+        stack.push(back);
     }
-    while let Some(b) = stapel.pop() {
+    while let Some(b) = stack.pop() {
         for &p in &preds[b] {
-            if rumpf.insert(p) {
-                stapel.push(p);
+            if body.insert(p) {
+                stack.push(p);
             }
         }
     }
-    rumpf
+    body
 }
 
 /// Der eine Vorgänger des Kopfes außerhalb der Schleife — und nur, wenn er mit
 /// einem schlichten `br` dorthin springt. Gibt es mehrere Eintritte, wird die
 /// Schleife übersprungen: einen Vorkopf einzuziehen würde die Blocknummern
 /// verschieben, und das ist diesen Durchgang nicht wert.
-fn vorkopf_von(f: &Func, head: usize, rumpf: &HashSet<usize>, preds: &[Vec<usize>]) -> Option<usize> {
-    let mut aussen = preds[head].iter().copied().filter(|p| !rumpf.contains(p));
-    let p = aussen.next()?;
-    if aussen.next().is_some() {
+fn preheader_of(f: &Func, head: usize, body: &HashSet<usize>, preds: &[Vec<usize>]) -> Option<usize> {
+    let mut outer = preds[head].iter().copied().filter(|p| !body.contains(p));
+    let p = outer.next()?;
+    if outer.next().is_some() {
         return None;
     }
     match f.blocks[p].term {
@@ -132,7 +132,7 @@ fn vorkopf_von(f: &Func, head: usize, rumpf: &HashSet<usize>, preds: &[Vec<usize
 }
 
 /// Darf diese Instruktion überhaupt bewegt werden? (Reinheit + Fallenfreiheit)
-fn hebbare_op(op: &Op) -> bool {
+fn hoistable_op(op: &Op) -> bool {
     if crate::mem2reg::is_untouchable(op) {
         return false;
     }
@@ -150,28 +150,28 @@ fn hebbare_op(op: &Op) -> bool {
     }
 }
 
-fn hebe_aus(f: &mut Func, head: usize, rumpf: &HashSet<usize>, vorkopf: usize) -> usize {
-    let mut bewegt = 0;
+fn hoist_out(f: &mut Func, head: usize, body: &HashSet<usize>, preheader: usize) -> usize {
+    let mut moved = 0;
     let mut buf: Vec<Val> = Vec::new();
     loop {
         // 1. Welche Werte entstehen in der Schleife?
-        let mut in_schleife: HashSet<Val> = HashSet::new();
-        for &b in rumpf {
+        let mut in_loop: HashSet<Val> = HashSet::new();
+        for &b in body {
             for i in &f.blocks[b].insts {
                 if let Some(d) = i.dst {
-                    in_schleife.insert(d);
+                    in_loop.insert(d);
                 }
             }
         }
         // 2. Erste bewegbare Instruktion suchen (in Blockreihenfolge).
-        let mut fund: Option<(usize, usize)> = None;
-        'suche: for &b in {
-            let mut v: Vec<usize> = rumpf.iter().copied().collect();
+        let mut hit: Option<(usize, usize)> = None;
+        'search: for &b in {
+            let mut v: Vec<usize> = body.iter().copied().collect();
             v.sort_unstable();
             &v.clone()
         } {
             for (ix, i) in f.blocks[b].insts.iter().enumerate() {
-                if !hebbare_op(&i.op) {
+                if !hoistable_op(&i.op) {
                     continue;
                 }
                 let d = match i.dst {
@@ -183,7 +183,7 @@ fn hebe_aus(f: &mut Func, head: usize, rumpf: &HashSet<usize>, vorkopf: usize) -
                 }
                 buf.clear();
                 i.op.uses(&mut buf);
-                if buf.iter().any(|v| in_schleife.contains(v) || f.is_secret(*v)) {
+                if buf.iter().any(|v| in_loop.contains(v) || f.is_secret(*v)) {
                     continue;
                 }
                 // Der Kopf selbst darf seine Bedingung behalten: eine
@@ -191,23 +191,23 @@ fn hebe_aus(f: &mut Func, head: usize, rumpf: &HashSet<usize>, vorkopf: usize) -
                 // hebbar, aber der Gewinn ist null. Wir heben sie trotzdem —
                 // sie ist invariant, also ist auch die Bedingung invariant.
                 let _ = head;
-                fund = Some((b, ix));
-                break 'suche;
+                hit = Some((b, ix));
+                break 'search;
             }
         }
-        let (b, ix) = match fund {
+        let (b, ix) = match hit {
             Some(x) => x,
             None => break,
         };
         // 3. Verschieben: ans Ende des Vorkopfs, vor dessen Terminator.
         let inst: Inst = f.blocks[b].insts.remove(ix);
-        f.blocks[vorkopf].insts.push(inst);
-        bewegt += 1;
-        if bewegt > 10_000 {
+        f.blocks[preheader].insts.push(inst);
+        moved += 1;
+        if moved > 10_000 {
             break; // harte Bremse, kann nicht vorkommen
         }
     }
-    bewegt
+    moved
 }
 
 #[cfg(test)]
@@ -216,7 +216,7 @@ mod tests {
     use crate::fir::{BinOp, Block, FTy, Func, Inst, Op, Term};
 
     /// `bb0: br bb1` · `bb1: cmp/brcond` · `bb2: %x = mul p0,p1 ; br bb1`
-    fn schleife_mit_invarianter_multiplikation() -> Func {
+    fn loop_with_invariant_multiplication() -> Func {
         let mut f = Func::new("t", vec![FTy::U64, FTy::U64], FTy::U64);
         // %0, %1 sind Parameter
         let c = f.new_val_pub(FTy::U64);
@@ -243,8 +243,8 @@ mod tests {
     }
 
     #[test]
-    fn invariante_multiplikation_wandert_in_den_vorkopf() {
-        let mut f = schleife_mit_invarianter_multiplikation();
+    fn invariant_multiplication_moves_in_the_preheader() {
+        let mut f = loop_with_invariant_multiplication();
         let n = hoist_loop_invariants(&mut f);
         assert!(n >= 1, "nichts hochgezogen");
         assert!(
@@ -259,8 +259,8 @@ mod tests {
     }
 
     #[test]
-    fn division_bleibt_in_der_schleife() {
-        let mut f = schleife_mit_invarianter_multiplikation();
+    fn division_stays_in_the_loop() {
+        let mut f = loop_with_invariant_multiplication();
         f.blocks[2].insts[0].op = Op::Bin(BinOp::Div, 0, 1);
         hoist_loop_invariants(&mut f);
         assert_eq!(
@@ -271,8 +271,8 @@ mod tests {
     }
 
     #[test]
-    fn abhaengiger_wert_bleibt_drin() {
-        let mut f = schleife_mit_invarianter_multiplikation();
+    fn dependent_value_stays_inside() {
+        let mut f = loop_with_invariant_multiplication();
         // %m haengt von einem load ab -> nicht invariant
         let l = f.new_val_pub(FTy::U64);
         f.blocks[2].insts.insert(

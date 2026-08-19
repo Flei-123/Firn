@@ -352,11 +352,11 @@ impl<'a> Parser<'a> {
                 if self.kind() == &TokKind::LBracket
                     && !crate::sema_generic::is_generic_struct(&name)
                 {
-                    if let Some(grund) = nicht_umgesetzter_typ(&name) {
+                    if let Some(basic) = not_implemented_ty(&name) {
                         self.dg.error_note(
                             sp,
                             format!("'{}[T]' ist in Stufe 0 nicht umgesetzt", name),
-                            grund,
+                            basic,
                         );
                         self.recovering = true;
                         return None;
@@ -565,7 +565,7 @@ impl<'a> Parser<'a> {
                         Some((name, sp)) => {
                             // HOOK impl: `x.m(args)` ist ein Methodenaufruf,
                             // kein Feldzugriff (impls.rs, Runde 45)
-                            if let Some(m) = crate::impls::hook_methodenaufruf(self, &e, &name, sp) {
+                            if let Some(m) = crate::impls::hook_method_call(self, &e, &name, sp) {
                                 e = m;
                                 continue;
                             }
@@ -663,9 +663,9 @@ impl<'a> Parser<'a> {
             return e;
         }
         // HOOK kern: `asm("…", in("dx") p, out("rax"), clobber("memory"))`
-        // (kern.rs, Runde 52). Nur wenn auf `asm` unmittelbar `(` und ein
+        // (core.rs, Runde 52). Nur wenn auf `asm` unmittelbar `(` und ein
         // Zeichenkettenliteral folgen — sonst bleibt `asm` ein Bezeichner.
-        if let Some(e) = crate::kern::hook_primary(self) {
+        if let Some(e) = crate::core::hook_primary(self) {
             return e;
         }
         // HOOK gc: `gc C{…}`, `gc_null[C]()`, `weak_null[C]()` (gc.rs)
@@ -681,10 +681,10 @@ impl<'a> Parser<'a> {
                 let sp = self.bump();
                 self.mk(sp, ExprKind::Float(bits))
             }
-            TokKind::FStr(roh) => {
+            TokKind::FStr(raw) => {
                 let sp = self.bump();
-                let roh = roh.clone();
-                self.interpolation(sp, &roh)
+                let raw = raw.clone();
+                self.interpolation(sp, &raw)
             }
             // ZEICHENKETTENLITERAL -> Array-Literal.
             //
@@ -931,16 +931,16 @@ impl<'a> Parser<'a> {
     /// `defer <anweisung>` — die Anweisung laeuft beim Verlassen des
     /// umschliessenden Blocks (SPEC §5.1). Erlaubt ist sowohl ein Block
     /// (`defer { … }`) als auch eine einzelne Anweisung (`defer close(fd)`).
-    fn defer_stmt(&mut self, nur_fehler: bool) -> Stmt {
-        let wort = if nur_fehler { "errdefer" } else { "defer" };
+    fn defer_stmt(&mut self, only_error: bool) -> Stmt {
+        let word = if only_error { "errdefer" } else { "defer" };
         let start = self.bump();
         if self.at_eof() {
-            self.error_here(format!("nach '{}' fehlt die aufgeschobene anweisung", wort));
+            self.error_here(format!("nach '{}' fehlt die aufgeschobene anweisung", word));
             return Stmt::Error(start);
         }
         let inner = self.stmt();
         let sp = Parser::join(start, inner.span());
-        Stmt::Defer(Box::new(inner), nur_fehler, sp)
+        Stmt::Defer(Box::new(inner), only_error, sp)
     }
 
     fn stmt_inner(&mut self, start: Span) -> Stmt {
@@ -1543,7 +1543,7 @@ impl<'a> Parser<'a> {
                     let start = self.bump();
                     let b = self.block("nach 'comptime'");
                     let sp = Parser::join(start, b.span);
-                    prog.comptime_bloecke.push((b, sp));
+                    prog.comptime_blocks.push((b, sp));
                 }
                 TokKind::KwFn | TokKind::KwExtern => self.fn_decl(&mut prog),
                 TokKind::KwStruct => self.struct_decl(&mut prog),
@@ -1614,7 +1614,7 @@ impl<'a> Parser<'a> {
     /// Anweisung gehoben (`block` leert `self.hoist`). Wer `f"..."`
     /// schreibt, braucht `import std.io` — sonst meldet die Aufloesung
     /// `io` als nicht eingebunden, genau wie bei handgeschriebenem `io.`.
-    fn interpolation(&mut self, sp: Span, roh: &str) -> Expr {
+    fn interpolation(&mut self, sp: Span, raw: &str) -> Expr {
         if self.interp_depth > 0 {
             self.dg.error(
                 sp,
@@ -1622,19 +1622,19 @@ impl<'a> Parser<'a> {
             );
             return self.broken_expr(sp);
         }
-        let zeichen: Vec<char> = roh.chars().collect();
-        let mut kette = self.mk(sp, ExprKind::Call("io.fmt_neu".to_string(), Vec::new(), sp));
+        let chars: Vec<char> = raw.chars().collect();
+        let mut chain = self.mk(sp, ExprKind::Call("io.fmt_new".to_string(), Vec::new(), sp));
         let mut i: usize = 0;
-        let mut text_von: usize = 0;
-        let mut kaputt = false;
-        while i < zeichen.len() {
-            let c = zeichen[i];
+        let mut text_of: usize = 0;
+        let mut broken = false;
+        while i < chars.len() {
+            let c = chars[i];
             if c == '}' {
                 self.dg.error(
                     sp,
                     "unbalancierte klammer in einer interpolation: '}' ohne '{'".to_string(),
                 );
-                kaputt = true;
+                broken = true;
                 break;
             }
             if c == '\\' {
@@ -1650,28 +1650,28 @@ impl<'a> Parser<'a> {
                 continue;
             }
             // Textsegment vor der Klammer abschliessen.
-            if i > text_von {
-                kette = self.interp_text(kette, sp, &zeichen[text_von..i], text_von);
+            if i > text_of {
+                chain = self.interp_text(chain, sp, &chars[text_of..i], text_of);
             }
             // Das schliessende '}' suchen; Schachtelung von '{' ist ein Fehler.
             let mut j = i + 1;
             let mut zu = false;
-            while j < zeichen.len() {
-                if zeichen[j] == '{' {
+            while j < chars.len() {
+                if chars[j] == '{' {
                     self.dg.error(
                         sp,
                         "unbalancierte klammer in einer interpolation: '{' im ausdruck".to_string(),
                     );
-                    kaputt = true;
+                    broken = true;
                     break;
                 }
-                if zeichen[j] == '}' {
+                if chars[j] == '}' {
                     zu = true;
                     break;
                 }
                 j += 1;
             }
-            if kaputt {
+            if broken {
                 break;
             }
             if !zu {
@@ -1679,35 +1679,35 @@ impl<'a> Parser<'a> {
                     sp,
                     "unbalancierte klammer in einer interpolation: '{' ohne '}'".to_string(),
                 );
-                kaputt = true;
+                broken = true;
                 break;
             }
-            kette = self.interp_ausdruck(kette, sp, &zeichen[i + 1..j], i + 1);
+            chain = self.interp_expr(chain, sp, &chars[i + 1..j], i + 1);
             i = j + 1;
-            text_von = i;
+            text_of = i;
         }
-        if !kaputt && text_von < zeichen.len() {
-            kette = self.interp_text(kette, sp, &zeichen[text_von..], text_von);
+        if !broken && text_of < chars.len() {
+            chain = self.interp_text(chain, sp, &chars[text_of..], text_of);
         }
-        kette
+        chain
     }
 
     /// Ein Textsegment: entschluesseln, als verstecktes `let _fseg<N>`
     /// anmelden und `io.fmt_text(kette, &name[0] as u64, N)` an die Kette.
-    fn interp_text(&mut self, kette: Expr, sp: Span, roh: &[char], von: usize) -> Expr {
-        let bytes = match crate::strings::decode_literal(crate::strings::LitKind::Str, roh) {
+    fn interp_text(&mut self, chain: Expr, sp: Span, raw: &[char], of: usize) -> Expr {
+        let bytes = match crate::strings::decode_literal(crate::strings::LitKind::Str, raw) {
             Ok(crate::strings::LitValue::Octets(v)) => v,
             Ok(_) => Vec::new(),
             Err(e) => {
                 self.dg.error(
-                    self.spanned(sp.line, sp.col + 2 + von as u32 + e.off, 1),
+                    self.spanned(sp.line, sp.col + 2 + of as u32 + e.off, 1),
                     format!("in einem textsegment einer interpolation: {}", e.msg),
                 );
-                return kette;
+                return chain;
             }
         };
         if bytes.is_empty() {
-            return kette;
+            return chain;
         }
         let n = bytes.len();
         let name = format!("_fseg{}", self.next_id);
@@ -1730,36 +1730,36 @@ impl<'a> Parser<'a> {
         let ident = self.mk(sp, ExprKind::Ident(name));
         let null = self.mk(sp, ExprKind::Int(0));
         let idx = self.mk(sp, ExprKind::Index(Box::new(ident), Box::new(null)));
-        let adr = self.mk(sp, ExprKind::Unary(UnOp::AddrOf, Box::new(idx)));
+        let addr = self.mk(sp, ExprKind::Unary(UnOp::AddrOf, Box::new(idx)));
         let ptr = self.mk(
             sp,
-            ExprKind::Cast(Box::new(adr), TypeExpr::Named("u64".to_string(), sp)),
+            ExprKind::Cast(Box::new(addr), TypeExpr::Named("u64".to_string(), sp)),
         );
-        let laen = self.mk(sp, ExprKind::Int(n as i128));
+        let len = self.mk(sp, ExprKind::Int(n as i128));
         self.mk(
             sp,
-            ExprKind::Call("io.fmt_text".to_string(), vec![kette, ptr, laen], sp),
+            ExprKind::Call("io.fmt_text".to_string(), vec![chain, ptr, len], sp),
         )
     }
 
     /// Ein Ausdruckssegment: das Fragment mit aufgefuellten Positionen
     /// neu lexen, EINEN Ausdruck daraus parsen und als
     /// `io.fmt_zahl(kette, (ausdruck) as i64)` an die Kette haengen.
-    fn interp_ausdruck(&mut self, kette: Expr, sp: Span, roh: &[char], von: usize) -> Expr {
+    fn interp_expr(&mut self, chain: Expr, sp: Span, raw: &[char], of: usize) -> Expr {
         // Positionen stimmen, wenn das Fragment an seiner echten Stelle
         // steht: Zeilen und Spalten vorweg auffuellen (Zeichenketten sind
         // einzeilig, darum reicht EINE Zeile).
-        let mut quelle = String::new();
+        let mut source = String::new();
         for _ in 1..sp.line {
-            quelle.push('\n');
+            source.push('\n');
         }
-        for _ in 0..sp.col + 1 + von as u32 {
-            quelle.push(' ');
+        for _ in 0..sp.col + 1 + of as u32 {
+            source.push(' ');
         }
-        quelle.extend(roh.iter());
-        let toks = crate::lexer::lex_file(&quelle, self.file, self.dg);
-        let ausdruck = ein_ausdruck(&toks, self.dg, self.file, &self.modules, &mut self.next_id);
-        match ausdruck {
+        source.extend(raw.iter());
+        let toks = crate::lexer::lex_file(&source, self.file, self.dg);
+        let expr = in_expr(&toks, self.dg, self.file, &self.modules, &mut self.next_id);
+        match expr {
             Some(e) => {
                 let cast = self.mk(
                     sp,
@@ -1767,10 +1767,10 @@ impl<'a> Parser<'a> {
                 );
                 self.mk(
                     sp,
-                    ExprKind::Call("io.fmt_zahl".to_string(), vec![kette, cast], sp),
+                    ExprKind::Call("io.fmt_number".to_string(), vec![chain, cast], sp),
                 )
             }
-            None => kette,
+            None => chain,
         }
     }
 
@@ -1786,7 +1786,7 @@ impl<'a> Parser<'a> {
 /// aufrufenden Parser; die `ExprId`s laufen ueber `next_id` nahtlos weiter.
 /// `interp_depth = 1` sperrt die Schachtelung: ein `f"..."` im Fragment
 /// wird ein sauberer Fehler statt stiller Hoist-Lecks.
-fn ein_ausdruck(
+fn in_expr(
     toks: &[Token],
     dg: &mut Diags,
     file: u32,
@@ -1871,7 +1871,7 @@ mod tests {
     }
 
     #[test]
-    fn leeres_hauptprogramm() {
+    fn empty_main_program() {
         let p = ok("fn main() -> i32 { return 0 }");
         assert_eq!(p.funcs.len(), 1);
         assert_eq!(p.funcs[0].name, "main");
@@ -1879,7 +1879,7 @@ mod tests {
     }
 
     #[test]
-    fn expr_ids_sind_fortlaufend() {
+    fn expr_ids_are_continuous() {
         let p = ok("fn main() -> i32 { let a: i32 = 1 + 2 * 3\n return a }");
         // 1, 2, 3, 2*3, 1+..., a  => 6 Ausdruecke
         assert_eq!(p.expr_count, 6);
@@ -1934,7 +1934,7 @@ mod tests {
     }
 
     #[test]
-    fn praezedenz_nach_ebnf() {
+    fn precedence_after_ebnf() {
         assert_eq!(first_expr("1 + 2 * 3"), "(1 + (2 * 3))");
         assert_eq!(first_expr("1 | 2 & 3"), "(1 | (2 & 3))");
         assert_eq!(first_expr("1 + 2 << 3"), "(1 + (2 << 3))");
@@ -1951,13 +1951,13 @@ mod tests {
     }
 
     #[test]
-    fn semikolon_ist_optional() {
+    fn semicolon_is_optional() {
         let p = ok("fn main() -> i32 {\n let a: i32 = 1;;\n var b: i32 = 2\n b = a + b\n return b\n}");
         assert_eq!(p.funcs[0].body.stmts.len(), 4);
     }
 
     #[test]
-    fn zeilenende_beendet_die_anweisung() {
+    fn line_end_finished_the_stmt() {
         // `*p = ...` in der naechsten Zeile ist KEINE Multiplikation.
         let p = ok("fn main() -> i32 {\n var a: i32 = 1\n var p: *mut i32 = &a\n *p = 2\n return a\n}");
         match &p.funcs[0].body.stmts[2] {
@@ -1977,7 +1977,7 @@ mod tests {
     }
 
     #[test]
-    fn struct_und_const_und_profile() {
+    fn struct_and_const_and_profile() {
         let p = ok("profile app\nstruct P { x: i32, y: i32 }\nconst M: i32 = 7\nfn main() -> i32 { let p: P = P{ x: 1, y: 2 }\n return p.x }");
         assert_eq!(p.structs.len(), 1);
         assert_eq!(p.structs[0].fields.len(), 2);
@@ -1986,20 +1986,20 @@ mod tests {
     }
 
     #[test]
-    fn bedingung_ohne_struct_literal() {
+    fn cond_without_struct_literal() {
         let p = ok("fn main() -> i32 { var x: i32 = 0\n while x < 3 { x = x + 1 }\n if x == 3 { return 0 } else { return 1 } }");
         assert_eq!(p.funcs[0].body.stmts.len(), 3);
     }
 
     #[test]
-    fn typen_und_arrays() {
+    fn types_and_arrays() {
         let p = ok("fn f(p: *mut u8, a: [i32; 4]) -> *u8 { return p as *u8 }\nfn main() -> i32 { return 0 }");
         assert_eq!(p.funcs.len(), 2);
         assert_eq!(p.funcs[0].params.len(), 2);
     }
 
     #[test]
-    fn else_if_kette() {
+    fn else_if_chain() {
         let p = ok("fn main() -> i32 { if false { return 1 } else if true { return 2 } else { return 3 } }");
         match &p.funcs[0].body.stmts[0] {
             Stmt::If { els: Some(b), .. } => match b.as_ref() {
@@ -2011,7 +2011,7 @@ mod tests {
     }
 
     #[test]
-    fn mehrere_fehler_werden_gemeldet() {
+    fn several_error_become_reported() {
         let src = "fn main() -> i32 {\n    let x = add(1, 2 ;\n    let = 3\n    return 0\n}\n";
         let (_, n, text) = parse_src(src);
         assert!(n >= 2, "erwartet mehrere fehler, bekam {}:\n{}", n, text);
@@ -2020,14 +2020,14 @@ mod tests {
     }
 
     #[test]
-    fn fehler_in_zwei_funktionen() {
+    fn error_in_two_funcs() {
         let src = "fn a() -> i32 { return ) }\nfn b() -> i32 { return * }\n";
         let (_, n, text) = parse_src(src);
         assert!(n >= 2, "{}", text);
     }
 
     #[test]
-    fn kein_haenger_bei_abbruch() {
+    fn no_hanger_at_abort() {
         for src in [
             "fn",
             "fn main(",
@@ -2050,7 +2050,7 @@ mod tests {
     }
 
     #[test]
-    fn tiefe_verschachtelung_bricht_sauber_ab() {
+    fn depth_nesting_breaks_clean_ab() {
         let deep = format!("fn main() -> i32 {{ return {}1{} }}", "(".repeat(500), ")".repeat(500));
         let (_, n, _) = parse_src(&deep);
         assert!(n >= 1);
@@ -2067,14 +2067,14 @@ mod tests {
     }
 
     #[test]
-    fn vergleich_ist_nicht_assoziativ() {
+    fn compare_is_not_associative() {
         let (_, n, text) = parse_src("fn main() -> i32 { let b: bool = 1 < 2 < 3\n return 0 }");
         assert!(n >= 1);
         assert!(text.contains("nicht verkettbar"), "{}", text);
     }
 
     #[test]
-    fn extern_wird_abgelehnt() {
+    fn extern_becomes_rejected() {
         let (p, n, text) = parse_src("extern fn write(fd: i32) -> i32 { return 0 }\nfn main() -> i32 { return 0 }");
         assert!(n >= 1);
         assert!(text.contains("Stufe 0"), "{}", text);
@@ -2082,7 +2082,7 @@ mod tests {
     }
 
     #[test]
-    fn syscall_wird_erkannt() {
+    fn syscall_becomes_recognized() {
         let p = ok("fn main() -> i32 { let r: i64 = syscall(1 as i64, 1 as i64, 0 as i64, 0 as i64)\n return 0 }");
         match &p.funcs[0].body.stmts[0] {
             Stmt::Let { init, .. } => match &init.kind {
@@ -2097,7 +2097,7 @@ mod tests {
 /// Typkonstruktoren, die `SPEC.md` beschreibt, die Stufe 0 aber nicht umsetzt.
 /// Sie bekommen einen eigenen, klaren Fehler statt eines Syntaxfehlers —
 /// `SPEC.md` §14 fuehrt sie unter "Nicht enthalten".
-fn nicht_umgesetzter_typ(name: &str) -> Option<&'static str> {
+fn not_implemented_ty(name: &str) -> Option<&'static str> {
     match name {
         "secret" => Some("secret[T] und die Constant-Time-Primitive (SPEC §9) sind nicht umgesetzt; siehe ABNAHME.md"),
         "Rc" | "Arc" | "Weak" => Some("Rc/Arc/Weak (SPEC §3.4) sind nicht umgesetzt; siehe ABNAHME.md"),

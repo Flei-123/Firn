@@ -1,0 +1,213 @@
+// expect_exit: 0
+// RUNDE 49 — `Arc[T]` UEBER FADENGRENZEN.
+//
+// Runde 47 hat den atomaren Zaehler gebaut und ehrlich dazugeschrieben, dass
+// er mangels Faeden nicht unter Nebenlaeufigkeit geprueft werden konnte
+// (docs/RUNDE47.md §3.2). Jetzt gibt es Faeden — und damit wird geprueft,
+// was zugesagt ist:
+//
+//   A  Sechs Faeden klonen und geben DENSELBEN `Arc` je 20.000 Mal frei.
+//      Am Ende steht der starke Zaehler exakt auf 1 (der Verweis des
+//      Hauptfadens) und der Block ist NICHT freigegeben.
+//   B  Gegenprobe im selben Lauf: dieselbe Zahl von Erhoehungen und
+//      Erniedrigungen auf einem gewoehnlichen Wort OHNE `lock` verliert
+//      welche. Ohne diese Gegenprobe belegt A nicht, dass die Faeden
+//      wirklich gleichzeitig liefen.
+//   C  `aufwerten_atomar` (schwach -> stark) unter Nebenlaeufigkeit: waehrend
+//      sechs Faeden dauernd aufwerten und wieder freigeben, bleibt der
+//      Zaehler stimmig, und es wird nichts doppelt freigegeben.
+//   D  Wenn der letzte starke Verweis faellt, liefert `aufwerten_atomar`
+//      LEER — und der Block geht genau EINMAL in die Freiliste zurueck.
+//   E  Nach allem: `arc_heap_lebende` == 0, `arc_heap_freigaben` == 1.
+//
+// Die Arc-Halde selbst hat KEINE Sperre (das steht so in E1): deshalb
+// alloziert hier nur der Hauptfaden. Die Faeden fassen ausschliesslich die
+// ZAEHLER an — genau das ist der Gegenstand der Zusage.
+
+const AF_SYS_MMAP: i64 = 9
+const AF_PROT_RW: i64 = 3
+const AF_MAP_ANON: i64 = 34
+
+const AF_BLOCK: u64 = 0
+const AF_ROH: u64 = 8
+const AF_HEAP: u64 = 16
+const AF_FEHLER: u64 = 24
+
+const AF_RUNDEN: u64 = 20000
+const AF_FAEDEN: u64 = 6
+
+struct Payload { value: u64, second: u64 }
+
+fn af_page() -> u64 {
+    let r: i64 = syscall(AF_SYS_MMAP, 0, 4096, AF_PROT_RW, AF_MAP_ANON, -1, 0)
+    if r < 0 {
+        return 0
+    }
+    return r as u64
+}
+
+fn af_ld(a: u64, o: u64) -> u64 {
+    return *((a + o) as *mut u64)
+}
+
+fn af_st(a: u64, o: u64, v: u64) {
+    *((a + o) as *mut u64) = v
+}
+
+// Art 1: klonen und freigeben. Art 2: schwach aufwerten und freigeben.
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    let block: usize = af_ld(arg, AF_BLOCK) as usize
+    let h: *mut ArcHeap = af_ld(arg, AF_HEAP) as *mut ArcHeap
+    if kind == 1 {
+        var i: u64 = 0
+        while i < AF_RUNDEN {
+            var k: AtomicRef[Payload] = arc_clone[Payload](arc_raw_ref[Payload](block))
+            if arc_strong_number[Payload](k) < 2 as u64 {
+                af_st(arg, AF_FEHLER, 1)
+            }
+            arc_free[Payload](h, &k)
+            // Gegenprobe OHNE lock: dieselbe Zahl von Schritten.
+            af_st(arg, AF_ROH, af_ld(arg, AF_ROH) + 1)
+            i = i + 1
+        }
+        return AF_RUNDEN
+    }
+    if kind == 2 {
+        let w: AtomWeakRef[Payload] = aweak_of[Payload](arc_raw_ref[Payload](block))
+        var i: u64 = 0
+        var strong: u64 = 0
+        while i < AF_RUNDEN {
+            var s: AtomicRef[Payload] = promote_atomic[Payload](w)
+            if !arc_is_empty[Payload](s) {
+                strong = strong + 1
+                if arc_read[Payload](s).value != 4711 as u64 {
+                    af_st(arg, AF_FEHLER, 2)
+                }
+                arc_free[Payload](h, &s)
+            }
+            i = i + 1
+        }
+        var wm: AtomWeakRef[Payload] = w
+        aweak_free[Payload](h, &wm)
+        return strong
+    }
+    return 0
+}
+
+fn main() -> i32 {
+    if !thread_init() {
+        return 90
+    }
+    var h: ArcHeap = ArcHeap{
+        base: 0 as usize, capacity: 0 as usize, next: 0 as usize,
+        free: [0 as usize; 8], live: 0 as usize, used: 0 as usize,
+        allocations: 0 as usize, releases: 0 as usize
+    }
+    if !arc_heap_init(&h, 65536 as usize) {
+        return 91
+    }
+    let rc: i32 = run(&h) catch 92
+    arc_heap_free(&h)
+    return rc
+}
+
+fn run(h: *mut ArcHeap) -> AllocError!i32 {
+    let z: u64 = af_page()
+    if z == 0 {
+        return 1
+    }
+    var a: AtomicRef[Payload] = arc_empty[Payload]()
+    if !(try arc_new[Payload](h, Payload{ value: 4711 as u64, second: 7 as u64 }, &a)) {
+        return 2
+    }
+    af_st(z, AF_BLOCK, arc_raw_address[Payload](a) as u64)
+    af_st(z, AF_HEAP, h as u64)
+
+    // --- A/B: klonen und freigeben aus sechs Faeden ---------------------------
+    var f: [u64; 6] = [0; 6]
+    var i: u64 = 0
+    while i < AF_FAEDEN {
+        f[i as usize] = thread_start(1, z)
+        if f[i as usize] == 0 {
+            return 3
+        }
+        i = i + 1
+    }
+    var sum: u64 = 0
+    i = 0
+    while i < AF_FAEDEN {
+        sum = sum + thread_wait(f[i as usize])
+        i = i + 1
+    }
+    if sum != AF_FAEDEN * AF_RUNDEN {
+        return 4
+    }
+    if af_ld(z, AF_FEHLER) != 0 {
+        return 5
+    }
+    // Der Zaehler steht exakt wieder auf 1 — keine Erhoehung ist verloren
+    // gegangen und keine zu viel zurueckgenommen worden.
+    if arc_strong_number[Payload](a) != 1 as u64 {
+        return 6
+    }
+    if arc_heap_live(h) != 1 as usize {
+        return 7
+    }
+    if arc_heap_releases(h) != 0 as usize {
+        return 8
+    }
+    // Die Gegenprobe MUSS verloren haben.
+    if af_ld(z, AF_ROH) >= AF_FAEDEN * AF_RUNDEN {
+        return 9
+    }
+
+    // --- C: aufwerten unter Nebenlaeufigkeit ---------------------------------
+    af_st(z, AF_FEHLER, 0)
+    i = 0
+    while i < AF_FAEDEN {
+        f[i as usize] = thread_start(2, z)
+        if f[i as usize] == 0 {
+            return 10
+        }
+        i = i + 1
+    }
+    var strong: u64 = 0
+    i = 0
+    while i < AF_FAEDEN {
+        strong = strong + thread_wait(f[i as usize])
+        i = i + 1
+    }
+    // Solange der Hauptfaden seinen starken Verweis haelt, MUSS jede
+    // Aufwertung gelingen.
+    if strong != AF_FAEDEN * AF_RUNDEN {
+        return 11
+    }
+    if af_ld(z, AF_FEHLER) != 0 {
+        return 12
+    }
+    if arc_strong_number[Payload](a) != 1 as u64 {
+        return 13
+    }
+
+    // --- D/E: der letzte starke Verweis faellt --------------------------------
+    var w: AtomWeakRef[Payload] = aweak_of[Payload](a)
+    arc_free[Payload](h, &a)
+    var empty: AtomicRef[Payload] = promote_atomic[Payload](w)
+    if !arc_is_empty[Payload](empty) {
+        return 14
+    }
+    if arc_heap_releases(h) != 0 as usize {
+        return 15
+    }
+    aweak_free[Payload](h, &w)
+    if arc_heap_live(h) != 0 as usize {
+        return 16
+    }
+    if arc_heap_releases(h) != 1 as usize {
+        return 17
+    }
+    if thread_count() != 1 {
+        return 18
+    }
+    return 0
+}

@@ -55,7 +55,7 @@ pub struct OptStats {
     /// schleifeninvariante Instruktionen, die in den Vorkopf gewandert sind
     pub hoisted: usize,
     /// Kanten, die an einem Bool-Zusammenfluss vorbeigefaedelt wurden
-    pub gefaedelt: usize,
+    pub threaded: usize,
 }
 
 // ------------------------------------------------ Durchgangsregister ---
@@ -311,8 +311,8 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig) {
             changed |= r > 0;
         }
         if cfg.runs("thread-bool") {
-            let t = crate::faedeln::thread_bool_cells(f);
-            st.gefaedelt += t;
+            let t = crate::threading::thread_bool_cells(f);
+            st.threaded += t;
             changed |= t > 0;
         }
         if cfg.runs("simplify-term") {
@@ -548,7 +548,7 @@ fn fold_constants(f: &mut Func, st: &mut OptStats) -> bool {
             // ganzzahlig und wuerde aus `1.5 + 1.5` stillen Unsinn machen.
             // Faltung von Gleitkomma braucht eine eigene, rundungstreue
             // Auswertung — die kommt mit `comptime` (SPEC §8.6).
-            if ty == FTy::F64 || op_hat_f64(&op, f) {
+            if ty == FTy::F64 || op_has_f64(&op, f) {
                 continue;
             }
             let folded = match op {
@@ -905,7 +905,7 @@ mod tests {
     }
 
     #[test]
-    fn faltet_arithmetik_und_entfernt_zwischenwerte() {
+    fn folds_arithmetic_and_removed_intermediates() {
         let mut f = Func::new("t", vec![], FTy::I32);
         let a = f.push(0, FTy::I32, Op::Const(20));
         let b = f.push(0, FTy::I32, Op::Const(2));
@@ -926,7 +926,7 @@ mod tests {
     }
 
     #[test]
-    fn division_durch_null_bleibt_stehen() {
+    fn division_by_null_stays_stand() {
         let mut f = Func::new("t", vec![], FTy::I32);
         let a = f.push(0, FTy::I32, Op::Const(7));
         let b = f.push(0, FTy::I32, Op::Const(0));
@@ -941,7 +941,7 @@ mod tests {
     }
 
     #[test]
-    fn zu_breite_verschiebung_bleibt_stehen() {
+    fn zu_width_shift_stays_stand() {
         let mut f = Func::new("t", vec![], FTy::I32);
         let a = f.push(0, FTy::I32, Op::Const(1));
         let b = f.push(0, FTy::I32, Op::Const(32));
@@ -955,7 +955,7 @@ mod tests {
     }
 
     #[test]
-    fn ueberlauf_wird_korrekt_zurechtgestutzt() {
+    fn overflow_becomes_correct_trimmed() {
         let mut f = Func::new("t", vec![], FTy::I8);
         let a = f.push(0, FTy::I8, Op::Const(100));
         let b = f.push(0, FTy::I8, Op::Const(100));
@@ -968,7 +968,7 @@ mod tests {
     }
 
     #[test]
-    fn unsignierte_verschiebung_und_cast() {
+    fn unsigned_shift_and_cast() {
         let mut f = Func::new("t", vec![], FTy::U64);
         let a = f.push(0, FTy::U8, Op::Const(200));
         let c = f.push(0, FTy::U64, Op::Cast { src: a, from: FTy::U8 });
@@ -1002,7 +1002,7 @@ mod tests {
     }
 
     #[test]
-    fn vergleich_und_zweig_falten_unerreichbaren_block_weg() {
+    fn compare_and_branch_fold_unreachable_block_away() {
         let mut f = Func::new("t", vec![], FTy::I32);
         let then_bb = f.add_block();
         let else_bb = f.add_block();
@@ -1033,7 +1033,7 @@ mod tests {
     }
 
     #[test]
-    fn seiteneffekte_bleiben_erhalten() {
+    fn side_effects_stay_keep() {
         let mut f = Func::new("t", vec![], FTy::I32);
         let slot = f.alloca(4, 4);
         let v = f.push(0, FTy::I32, Op::Const(5));
@@ -1075,7 +1075,7 @@ mod tests {
     }
 
     #[test]
-    fn unbenutzte_alloca_verschwindet_kettenweise() {
+    fn unused_alloca_vanishes_chained() {
         let mut f = Func::new("t", vec![], FTy::I32);
         let slot = f.alloca(8, 8);
         let off = f.push(0, FTy::I64, Op::Const(4));
@@ -1091,7 +1091,7 @@ mod tests {
     }
 
     #[test]
-    fn schleife_bleibt_unangetastet_und_terminiert() {
+    fn loop_stays_untouched_and_terminated() {
         // while (i < 10) { i = i + 1 }  — nichts davon ist konstant faltbar,
         // der Optimierer darf hier nichts entfernen und muss anhalten.
         let mut f = Func::new("t", vec![], FTy::I32);
@@ -1126,7 +1126,7 @@ mod tests {
     }
 
     #[test]
-    fn kette_wird_bis_zum_fixpunkt_gefaltet() {
+    fn chain_becomes_to_to_fixpunkt_folded() {
         let mut f = Func::new("t", vec![], FTy::I32);
         let mut v = f.push(0, FTy::I32, Op::Const(1));
         for _ in 0..10 {
@@ -1145,7 +1145,7 @@ mod tests {
 
 /// Faellt bei dieser Instruktion irgendwo ein `f64` an? Fuer die
 /// Konstantenfaltung ist das ein Ausschlusskriterium (siehe `fold_constants`).
-fn op_hat_f64(op: &Op, f: &Func) -> bool {
+fn op_has_f64(op: &Op, f: &Func) -> bool {
     match op {
         Op::Cmp { ty, .. } => *ty == FTy::F64,
         Op::Cast { from, .. } => *from == FTy::F64,

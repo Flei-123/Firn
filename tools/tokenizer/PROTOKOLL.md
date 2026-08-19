@@ -62,7 +62,7 @@ Auftretens:
 ```
 
 * `code` ist der WHATWG-Codename aus §13.2 "Parse errors"
-  (`lib/html/fehler_codes.fi` fuehrt alle Namen, die der Tokenizer melden
+  (`lib/html/error_codes.fi` fuehrt alle Namen, die der Tokenizer melden
   kann).
 * `line` zaehlt ab 1, `col` ist die Spalte **hinter** dem Zeichen, das den
   Fehler ausgeloest hat — dieselbe Zaehlung wie in den `errors`-Listen der

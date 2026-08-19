@@ -16,7 +16,7 @@ Maximum rauscht, eine Verteilung nicht. Neu in `lib/gc/gc.fi`:
   Nachtragen nach Markstapel-Überlauf** (im Maximum steckt es unter Typ 1),
   Typ 6 = alle Scheiben zusammen.
 * Abfrage `gc_hist(typ, fach)`, Nullen mit `gc_hist_reset()`.
-  `tools/gc_mess/pause_gross.fi` nullt nach dem Aufbau und gibt alle
+  `tools/gc_meas/pause_big.fi` nullt nach dem Aufbau und gibt alle
   besetzten Fächer aus.
 
 Erster Befund gleich mit dem neuen Werkzeug: Typ 5 blieb über alle Läufe
@@ -31,7 +31,7 @@ Textknotens — im Histogramm streuten die Scheiben deshalb über drei
 Zehnerpotenzen. Neu: `ZEIT_BUDGET_NS = 100 000` (100 µs), die Uhr wird alle
 `ZEIT_PROBE = 16` Objekte gelesen (`__gc_jetzt_ns` kostet selbst ~25 ns).
 
-Messung `pause_gross.fi`, 120 000 lebende Knoten, Heap 13 MiB, je 20 s,
+Messung `pause_big.fi`, 120 000 lebende Knoten, Heap 13 MiB, je 20 s,
 Markierscheiben (Typ 1):
 
 | Fach (Scheibendauer) | vorher (nur Objektzahl) | Probe 64 | **Probe 16 (eingebaut)** |
@@ -45,7 +45,7 @@ Durchsatz (Zyklen im selben Zeitfenster) unverändert im Rauschen
 (2 198 000 / 2 347 000 / 2 231 000), Pausensumme unverändert. Das Budget
 kostet also nichts und schneidet den Schwanz ab.
 
-60-Sekunden-Kontrolllauf auf dem Endstand (`tools/gc_mess/scheiben60.tsv`):
+60-Sekunden-Kontrolllauf auf dem Endstand (`tools/gc_meas/scheiben60.tsv`):
 518 137 Markierscheiben, davon **99,88 % in 64–128 µs**, 284 darüber, drei
 Einzelfälle über 1 ms (Ausplanen durch das Betriebssystem, nicht der
 Sammler). `pause_max_typ4 = 11,7 ms` sind weiterhin die **drei vollen
@@ -114,7 +114,7 @@ Zwei Gründe, beide ärgerlich:
   „148 UNGLEICH", die beim Einzelnachlauf verschwanden. Alle sechs
   Vergleichswerkzeuge legen jetzt ein eigenes `mktemp -d` an.
 
-Der Regressionstest `tests/opt/zellen_alias_clobber.fi` beschreibt das
+Der Regressionstest `tests/opt/cells_alias_clobber.fi` beschreibt das
 Muster; **ehrlich vermerkt**: er löst den Fehler in dieser Größe nicht selbst
 aus (ob das Register überschrieben wird, hängt vom Registerdruck des ganzen
 Moduls ab). Der zuverlässige Wächter bleibt Abschnitt 12 von `test.sh`.
@@ -122,7 +122,7 @@ Moduls ab). Der zuverlässige Wächter bleibt Abschnitt 12 von `test.sh`.
 ## 5. Verifikation dieser Runde
 
 * `bash ./test.sh` → **PASS 652/652**
-* `bash tools/selbst_vergleich.sh` → **189 gleiches Verhalten**, 0 Abweichungen
+* `bash tools/self_compare.sh` → **189 gleiches Verhalten**, 0 Abweichungen
 * `bash tools/fixpunkt.sh` → Stufe 2 == Stufe 3, zeichengleich,
   **309 468 Zeilen** Assembler (gewachsen, weil `lib/gc/gc.fi` um Histogramm
   und Zeitbudget größer wurde)

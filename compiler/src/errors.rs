@@ -125,8 +125,8 @@ thread_local! {
 
 /// `// HOOK fehlerunionen` in `sema::collect_structs`: markiert die Phase, in
 /// der die Struct-Layouts noch nicht feststehen.
-pub(crate) fn hook_struct_phase(aktiv: bool) {
-    IN_STRUCTS.with(|f| *f.borrow_mut() = aktiv);
+pub(crate) fn hook_struct_phase(active: bool) {
+    IN_STRUCTS.with(|f| *f.borrow_mut() = active);
 }
 
 fn in_struct_phase() -> bool {
@@ -306,7 +306,7 @@ impl<'a> Parser<'a> {
             return;
         }
         let span = Parser::join(start, end);
-        let doppelt = REG.with(|r| {
+        let duplicate = REG.with(|r| {
             let mut reg = r.borrow_mut();
             if reg.by_name.contains_key(&name) {
                 return true;
@@ -321,7 +321,7 @@ impl<'a> Parser<'a> {
             reg.by_name.insert(name.clone(), i);
             false
         });
-        if doppelt {
+        if duplicate {
             self.dg
                 .error(nspan, format!("fehlermenge '{}' ist bereits deklariert", name));
         }

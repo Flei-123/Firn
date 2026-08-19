@@ -38,8 +38,8 @@ TARGETS = [
     # Bibliotheken; die Fassade wird als EIN Modul textuell zusammengesetzt.
     ("tools/strlib/src/std_str.fi", "lib/std/str.fi"),
     ("tools/strlib/src/std_num.fi", "lib/std/num.fi"),
-    ("tools/strlib/src/neg/str_bytes_ist_kein_text.fi", "tests/neg/str_bytes_ist_kein_text.fi"),
-    ("tools/strlib/src/neg/str16_ist_kein_bytes.fi", "tests/neg/str16_ist_kein_bytes.fi"),
+    ("tools/strlib/src/neg/str_bytes_is_no_text.fi", "tests/neg/str_bytes_is_no_text.fi"),
+    ("tools/strlib/src/neg/str16_is_no_bytes.fi", "tests/neg/str16_is_no_bytes.fi"),
 ]
 
 

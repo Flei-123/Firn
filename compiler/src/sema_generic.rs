@@ -97,7 +97,7 @@ pub(crate) struct Instantiation {
     pub(crate) args: Vec<TypeExpr>,
     pub(crate) span: Span,
     /// innerhalb einer Vorlage aufgeschrieben (enthaelt evtl. Typparameter)
-    pub(crate) abstrakt: bool,
+    pub(crate) is_abstract: bool,
     pub(crate) is_fn: bool,
 }
 
@@ -131,7 +131,7 @@ pub(crate) fn fn_template(name: &str) -> Option<FnTemplate> {
 /// sondern hier — das Modul-Umschreiben erreichte sie deshalb nie, und eine
 /// Vorlage sah nur die Namen der Wurzeldatei
 /// (docs/SELBSTHOSTING.md §7, Blocker B2).
-pub(crate) fn fn_vorlagen_der_datei(file: u32) -> Vec<String> {
+pub(crate) fn fn_templates_the_file(file: u32) -> Vec<String> {
     REG.with(|r| {
         r.borrow()
             .fns
@@ -142,7 +142,7 @@ pub(crate) fn fn_vorlagen_der_datei(file: u32) -> Vec<String> {
     })
 }
 
-pub(crate) fn struct_vorlagen_der_datei(file: u32) -> Vec<String> {
+pub(crate) fn struct_templates_the_file(file: u32) -> Vec<String> {
     REG.with(|r| {
         r.borrow()
             .structs
@@ -154,7 +154,7 @@ pub(crate) fn struct_vorlagen_der_datei(file: u32) -> Vec<String> {
 }
 
 /// Aendert eine Funktionsvorlage an Ort und Stelle.
-pub(crate) fn mit_fn_vorlage<F: FnOnce(&mut crate::ast::FnDecl)>(name: &str, f: F) {
+pub(crate) fn with_fn_template<F: FnOnce(&mut crate::ast::FnDecl)>(name: &str, f: F) {
     REG.with(|r| {
         if let Some(t) = r.borrow_mut().fns.get_mut(name) {
             f(&mut t.decl);
@@ -163,7 +163,7 @@ pub(crate) fn mit_fn_vorlage<F: FnOnce(&mut crate::ast::FnDecl)>(name: &str, f: 
 }
 
 /// Aendert eine Structvorlage an Ort und Stelle.
-pub(crate) fn mit_struct_vorlage<F: FnOnce(&mut crate::ast::StructDecl)>(name: &str, f: F) {
+pub(crate) fn with_struct_template<F: FnOnce(&mut crate::ast::StructDecl)>(name: &str, f: F) {
     REG.with(|r| {
         if let Some(t) = r.borrow_mut().structs.get_mut(name) {
             f(&mut t.decl);
@@ -352,7 +352,7 @@ impl<'a> Parser<'a> {
             Some(d) => d,
             None => return,
         };
-        let doppelt = REG.with(|r| {
+        let duplicate = REG.with(|r| {
             let mut reg = r.borrow_mut();
             if reg.fns.contains_key(&name) {
                 return true;
@@ -363,7 +363,7 @@ impl<'a> Parser<'a> {
             }
             false
         });
-        if doppelt {
+        if duplicate {
             self.dg.error(
                 nspan,
                 format!("generische funktion '{}' ist bereits deklariert", name),
@@ -460,7 +460,7 @@ impl<'a> Parser<'a> {
         REG.with(|r| r.borrow_mut().in_template -= 1);
         let decl =
             StructDecl { name: name.clone(), fields, span: Parser::join(start, end), attrs: Vec::new() };
-        let doppelt = REG.with(|r| {
+        let duplicate = REG.with(|r| {
             let mut reg = r.borrow_mut();
             if reg.structs.contains_key(&name) {
                 return true;
@@ -472,7 +472,7 @@ impl<'a> Parser<'a> {
             }
             false
         });
-        if doppelt {
+        if duplicate {
             self.dg.error(
                 nspan,
                 format!("generischer struct '{}' ist bereits deklariert", name),
@@ -482,10 +482,10 @@ impl<'a> Parser<'a> {
 
     fn note_inst(&mut self, base: &str, args: Vec<TypeExpr>, span: Span, is_fn: bool) -> String {
         let mangled = mangle(base, &args);
-        let abstrakt = REG.with(|r| r.borrow().in_template > 0);
+        let is_abstract = REG.with(|r| r.borrow().in_template > 0);
         record_inst(
             &mangled,
-            Instantiation { base: base.to_string(), args, span, abstrakt, is_fn },
+            Instantiation { base: base.to_string(), args, span, is_abstract, is_fn },
         );
         mangled
     }

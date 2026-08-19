@@ -51,8 +51,8 @@ Binary. Deshalb gibt es **zwei neue Quelldateien, die ausschließlich die
 Fassade einbindet**:
 
 ```
-lib/str/std_fassade.fi   <- nur aus tools/strlib/src/std_str.fi
-lib/num/std_fassade.fi   <- nur aus tools/strlib/src/std_num.fi
+lib/str/std_facade.fi   <- nur aus tools/strlib/src/std_str.fi
+lib/num/std_facade.fi   <- nur aus tools/strlib/src/std_num.fi
 ```
 
 `lib/str/*.fi` und `lib/num/*.fi` sind **unverändert**; die erzeugten Tests
@@ -74,7 +74,7 @@ gegliedert.
 
 ## 3. Was dazugekommen ist — Modul für Modul
 
-### 3.1 `std.str` (+863 Zeilen, `lib/str/std_fassade.fi`)
+### 3.1 `std.str` (+863 Zeilen, `lib/str/std_facade.fi`)
 
 Zwei Typen, eine Regel, an jeder Signatur ablesbar:
 
@@ -198,7 +198,7 @@ Festgelegte Regeln, damit nichts geraten werden muss:
   Alternative wäre ein Zustand *im* Aufrufer oder ein vierter Parameter, und
   beides wäre für den Regelfall schlechter.
 
-### 3.2 `std.num` (+422 Zeilen, `lib/num/std_fassade.fi`)
+### 3.2 `std.num` (+422 Zeilen, `lib/num/std_facade.fi`)
 
 Eine Regel für die Richtung, an jedem Namen ablesbar: `schreibe_*` hängt den
 Text einer Zahl an ein `*mut Bytes` an, `lies_*` liest Text und gibt die Zahl
@@ -498,7 +498,7 @@ gleich.** Gemessen mit `num.f64_bits` auf beiden Compilern:
 | `0.1` | 4591870180066957722 | 4591870180066957722 | gleich |
 
 `firnc0` stimmt mit der korrekten Rundung überein, `firnc1` weicht um 1–2 ULP
-ab. Das ist die **eine** bekannte Abweichung, die `tools/lex_vergleich.sh`
+ab. Das ist die **eine** bekannte Abweichung, die `tools/lex_compare.sh`
 seit Langem als „UNGLEICH: 1 (bekannt und benannt: 1) / GLEITKOMMA außerhalb
 des schnellen Pfades: 1" meldet — die neue `std.num` macht sie nur zum ersten
 Mal *sichtbar*, weil sie Bitmuster ausdrucken kann. Die Tests dieser Runde
@@ -516,9 +516,9 @@ firnc0 --emit=ast-kanon :  (ruf str.utf8_zaehle (id u))
 
 `firnc1` setzt beim Neu-Lexen des Ausdruckssegments schon den **internen**
 Namen ein (`modul__name`, SPEC §14.1.15), `firnc0` den geschriebenen. Das
-*Verhalten* ist identisch — `tools/selbst_vergleich.sh` meldet für alle
+*Verhalten* ist identisch — `tools/self_compare.sh` meldet für alle
 betroffenen Dateien `GLEICH`, und die Programme drucken dieselbe Zeile.
-`tools/parser_vergleich.sh` vergleicht aber den Baum Oktett für Oktett, und
+`tools/parser_compare.sh` vergleicht aber den Baum Oktett für Oktett, und
 dort fällt es auf. Die Tests binden solche Werte deshalb vor der
 Interpolation an einen Namen. Behebung wäre eine Parser-Änderung.
 
@@ -533,7 +533,7 @@ fn f(a: bool, b: bool) -> bool { if a || b { return a } return b }
 ```
 
 `./.astdump` auf diese sechs Zeilen: läuft ewig, kein Byte Ausgabe. Damit
-hängt `tools/parser_vergleich.sh` beim ersten Quelltext mit `||` — und das
+hängt `tools/parser_compare.sh` beim ersten Quelltext mit `||` — und das
 ist praktisch jeder. Drei Messungen haben gezeigt, dass es **nicht** an
 dieser Runde liegt:
 
@@ -548,7 +548,7 @@ dieser Runde liegt:
 Die Ursache steht in `fe31d13`: die Optimierung „Zellen-Alias" (Runde 40,
 `regalloc.rs`) ließ einen Load das Zellenregister direkt lesen, obwohl
 zwischen Load und Verwendung ein anderer Wert genau dieses Register
-beschrieb. In `bin/druck.fi`/`drucke_binop` wurde aus `43 - start` ein
+beschrieb. In `bin/print.fi`/`drucke_binop` wurde aus `43 - start` ein
 `43 - &tab[start]`, die Länge lief unter Null, und `rt.buf_wachse` drehte
 sich ewig. Aufgefallen ist es erst jetzt, weil die Dump-Binaries vorher
 veraltet wiederverwendet wurden — dieselbe Falle, vor der Abschnitt 7 warnt.
@@ -562,7 +562,7 @@ gemessen.
 ## 6. Testabdeckung
 
 Sieben neue Programme in `tests/`, jedes läuft in `test.sh` **dreimal**
-(`opt` / `noopt` / `dev-fast`) und zusätzlich in `tools/selbst_vergleich.sh`
+(`opt` / `noopt` / `dev-fast`) und zusätzlich in `tools/self_compare.sh`
 gegen `firnc1`. Jede einzelne Erwartung steht als `return <code>` im Programm
 — schlägt eine fehl, endet der Test mit genau diesem Code und `test.sh` nennt
 ihn; die gedruckte Zeile ist zusätzlich der Vergleichspunkt zwischen den
@@ -573,13 +573,13 @@ Zusammen: 310.
 
 | Test | Inhalt | Zahlen |
 |---|---|---|
-| `800_std_str_kern.fi` | trimmen, teilen (fester Trenner **und** Leerraum), verbinden, suchen (vorwärts/rückwärts/zählen), ersetzen, Groß/Klein, auffüllen, vergleichen, Zeichenklassen, UTF-8 vorwärts/rückwärts/nach Zeichen geschnitten, ungültiges Oktett | 49 Fehlerausgänge |
-| `801_std_num_kern.fi` | Basis 2/8/10/16/36, Auffüllen, Breite, u64::MAX, **u64::MAX+1 als Überlauf**, i64::MIN, Präfixe `0x`/`0b`/`0o`, Teillesen mit Rest, dtoa/strtod-Hülle, `1e21`, Rundreise `0.1+0.2` | 43 Fehlerausgänge |
-| `802_std_vec_kern.fi` | zwei Ausprägungen (`i32`, `u64`), suchen, sortieren, binär suchen, untere Schranke, einfügen/entfernen (beide Formen), kopieren/anhängen/vergleichen, 200 Elemente absteigend und 200 gleiche | 41 Fehlerausgänge |
-| `803_std_map_kern.fi` | Kursor über 50 Paare (Summe der Schlüssel und Werte), Entry-Helfer, Wert an Ort und Stelle, herausnehmen, **4000 Einfügungen mit jeder dritten Löschung** und anschließendem Aufräumen, zweite Ausprägung `Map[u32, i32]` | 36 Fehlerausgänge |
-| `804_std_math_kern.fi` | der **exakte** Teil, alles mit `==`: Ganzzahl-Helfer, `fabs/fmin/fmax/fclamp`, `trunc/floor/ceil/round` samt dem größten Double unter 0,5 und dem Raster bei 2⁵¹, `fmod`, `ldexp`, `frexp` (auch subnormal), `hypot`, Sonderwerte | 57 Fehlerausgänge |
+| `800_std_str_core.fi` | trimmen, teilen (fester Trenner **und** Leerraum), verbinden, suchen (vorwärts/rückwärts/zählen), ersetzen, Groß/Klein, auffüllen, vergleichen, Zeichenklassen, UTF-8 vorwärts/rückwärts/nach Zeichen geschnitten, ungültiges Oktett | 49 Fehlerausgänge |
+| `801_std_num_core.fi` | Basis 2/8/10/16/36, Auffüllen, Breite, u64::MAX, **u64::MAX+1 als Überlauf**, i64::MIN, Präfixe `0x`/`0b`/`0o`, Teillesen mit Rest, dtoa/strtod-Hülle, `1e21`, Rundreise `0.1+0.2` | 43 Fehlerausgänge |
+| `802_std_vec_core.fi` | zwei Ausprägungen (`i32`, `u64`), suchen, sortieren, binär suchen, untere Schranke, einfügen/entfernen (beide Formen), kopieren/anhängen/vergleichen, 200 Elemente absteigend und 200 gleiche | 41 Fehlerausgänge |
+| `803_std_map_core.fi` | Kursor über 50 Paare (Summe der Schlüssel und Werte), Entry-Helfer, Wert an Ort und Stelle, herausnehmen, **4000 Einfügungen mit jeder dritten Löschung** und anschließendem Aufräumen, zweite Ausprägung `Map[u32, i32]` | 36 Fehlerausgänge |
+| `804_std_math_core.fi` | der **exakte** Teil, alles mit `==`: Ganzzahl-Helfer, `fabs/fmin/fmax/fclamp`, `trunc/floor/ceil/round` samt dem größten Double unter 0,5 und dem Raster bei 2⁵¹, `fmod`, `ldexp`, `frexp` (auch subnormal), `hypot`, Sonderwerte | 57 Fehlerausgänge |
 | `805_std_math_f64.fi` | der **genäherte** Teil gegen benannte Schranken; dazu zwei Schleifen: sin²+cos²=1 an 41 Stellen, `tan(atan(x)) == x` an 30 Stellen | 54 Fehlerausgänge |
-| `806_std_io_kern.fi` | schreiben/anhängen/gibt-es-sie, Zeilen mit `\r\n` und ohne Schlussumbruch, der ganze `Fmt`-Ausbau; die Funktionen, die **selbst** einen Umbruch schreiben (`println`, `print_zeile`, `fmt_druck_zeile`), laufen mit über `dup2` umgebogenem Deskriptor 1 und werden aus der Datei zurückgelesen — ausgeführt, nicht behauptet | 30 Fehlerausgänge |
+| `806_std_io_core.fi` | schreiben/anhängen/gibt-es-sie, Zeilen mit `\r\n` und ohne Schlussumbruch, der ganze `Fmt`-Ausbau; die Funktionen, die **selbst** einen Umbruch schreiben (`println`, `print_zeile`, `fmt_druck_zeile`), laufen mit über `dup2` umgebogenem Deskriptor 1 und werden aus der Datei zurückgelesen — ausgeführt, nicht behauptet | 30 Fehlerausgänge |
 
 Nicht abgedeckt und hier benannt: `read_stdin` (siehe 4.9), die
 Speichermangel-Zweige (`heap_alloc` liefert 0) — die lassen sich ohne
@@ -595,7 +595,7 @@ Gemessen auf **`fe31d13`** (Basis dieses Zweiges), mit selbst gebautem
 | Messung | Wert | Ausgangslage `fe31d13` |
 |---|---|---|
 | `bash ./test.sh` | **PASS 673/673**, `RC=0` | 652/652 |
-| `bash tools/selbst_vergleich.sh` | **GLEICHES VERHALTEN 196 · ABWEICHEND 0 · FEHLERHAFT 0 · CODEGEN FEHLT 0**, `RC=0` | 189 / 0 / 0 |
+| `bash tools/self_compare.sh` | **GLEICHES VERHALTEN 196 · ABWEICHEND 0 · FEHLERHAFT 0 · CODEGEN FEHLT 0**, `RC=0` | 189 / 0 / 0 |
 | `bash tools/fixpunkt.sh` | **Stufe 2 == Stufe 3, zeichengleich (309468 Zeilen Assembler)** · Korpus: `.firnc2` verhält sich wie `firnc0`, `RC=0` | zeichengleich, 309468 Zeilen |
 
 Die 673 sind 652 + 21: sieben neue Programme × drei Durchläufe
@@ -631,7 +631,7 @@ grün gewesen, ohne etwas zu beweisen.
 **Eines gehört noch zur Ehrlichkeit dieser Messung:**
 
 1. **Die Messung lief in einem eigenen Mount-Namensraum mit privatem `/tmp`**
-   (`unshare --mount` + `tmpfs`). `tools/lex_vergleich.sh` und die anderen
+   (`unshare --mount` + `tmpfs`). `tools/lex_compare.sh` und die anderen
    Vergleicher benutzen feste Pfade wie `/tmp/lexv_a.txt`; läuft in einem
    zweiten Arbeitsbaum gleichzeitig dieselbe Suite (hier: Runde 41), schreiben
    beide in dieselben Dateien und die Ergebnisse sind Zufall. Ohne

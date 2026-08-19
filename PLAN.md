@@ -378,7 +378,7 @@ Nachgemessen mit `bash test.sh` → **PASS 397/397** und
 | `tools/tokenizer/durchsatz.sh`, `korpus.py` | 4-MB-Korpus + MB/s; ruft `bench/tokenizer/…/html5ever_bench`, wenn gebaut | Firn-Seite fertig, Referenzseite offen |
 | `tools/tokenizer/PROTOKOLL.md` | Vertrag Firn ↔ Harness | fertig |
 | `test.sh` Abschnitt 9 | Tokenizer-Lauf als Teil der Suite, Schranke `tools/tokenizer/mindestquote.txt` | fertig |
-| `compiler/src/modules.rs` + `sema_match.rs` | **Fehlerbehebung:** `match`-Rumpfbloecke liegen in der Registrierung, nicht im AST — das Modulsystem hat Namen darin bisher nicht umgeschrieben. `match` in einem importierten Modul war unbenutzbar. Nachweis: `tests/231_modul_match.fi` + `tests/modules/zustand.fi` | erledigt |
+| `compiler/src/modules.rs` + `sema_match.rs` | **Fehlerbehebung:** `match`-Rumpfbloecke liegen in der Registrierung, nicht im AST — das Modulsystem hat Namen darin bisher nicht umgeschrieben. `match` in einem importierten Modul war unbenutzbar. Nachweis: `tests/231_module_match.fi` + `tests/modules/state.fi` | erledigt |
 
 **Bekannte Grenzen (ehrlich, gehoeren nach SPEC §14.1, nicht wegdiskutieren):**
 * Aufzaehlungsnamen sind programmweit, nicht je Modul: `Ampel::Rot`, nicht
@@ -571,7 +571,7 @@ gc class Element extends Node {
 | `Gc[Element]` → `Gc[Node]` bei `let`/Zuweisung/Argument/`return` | — | kostenlose Aufwaertsumwandlung |
 
 `AllocError { OutOfMemory }` wird von der GC-Laufzeit programmweit deklariert
-(Fehlermengennamen sind programmweit, siehe `tests/414_modul_fehler.fi`) und ist
+(Fehlermengennamen sind programmweit, siehe `tests/414_module_error.fi`) und ist
 in jedem Programm verfuegbar, das den GC benutzt. `rclib` benutzt **dieselbe**
 Menge; solange `gckern` sie noch nicht bereitstellt, deklariert `rclib` sie
 selbst in seinem Modul und `mess` traegt am Ende ein, welche der beiden
@@ -656,7 +656,7 @@ fn dom_selbsttest() -> i32                   // 0 = alle Zyklenarten geprueft, s
 
 `dom` liefert zwei **Wurzelprogramme** mit identischem Aufbau:
 `lib/dom/soak_gc.fi` (GC-Fassung, darf **nicht** lecken) und
-`lib/dom/soak_leck.fi` (absichtlich leckende Fassung: Zyklus ueber Zaehlverweise
+`lib/dom/soak_leak.fi` (absichtlich leckende Fassung: Zyklus ueber Zaehlverweise
 statt `Gc`, selbst enthalten, **ohne** `import` von `lib/rc`).
 
 Beide enthalten diese drei Zeilen woertlich, damit `tools/dom_soak/run.sh` sie

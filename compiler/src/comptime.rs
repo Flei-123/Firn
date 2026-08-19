@@ -48,60 +48,60 @@ const MAX_SCHRITTE: u64 = 2_000_000;
 /// Obergrenze verschachtelter Aufrufe.
 const MAX_TIEFE: u32 = 64;
 
-type Fehler = (Span, String);
+type Error = (Span, String);
 
 /// Ergebnis einer ausgeführten Anweisung.
-enum Fluss {
+enum Flow {
     /// weiter mit der nächsten Anweisung
-    Weiter,
+    Next,
     /// `return` mit Wert (bzw. 0 bei `return` ohne Wert)
-    Zurueck(i128),
-    Abbruch,
-    Weitermachen,
+    Back(i128),
+    Abort,
+    Resume,
 }
 
-pub(crate) struct Ausfuehrung<'a> {
+pub(crate) struct Execution<'a> {
     prog: &'a Program,
     /// Programmweite Konstanten, wie der Typprüfer sie kennt.
     consts: &'a HashMap<String, (Type, i128)>,
     /// Typ jedes Ausdrucks (für die Breite bei Umwandlungen).
     expr_types: &'a [Type],
-    schritte: u64,
+    steps: u64,
     /// Von `emit_*` aufgebauter Quelltext.
-    pub(crate) ausgabe: String,
+    pub(crate) output: String,
     /// Verzeichnis der Wurzelquelldatei — der EINZIGE Ort, aus dem
     /// `datei_*` lesen darf.
-    basis: std::path::PathBuf,
+    base: std::path::PathBuf,
     /// Einmal gelesene Dateien; eine Tabelle wird Byte fuer Byte abgefragt.
-    dateien: HashMap<String, Vec<u8>>,
+    files: HashMap<String, Vec<u8>>,
 }
 
-impl<'a> Ausfuehrung<'a> {
-    pub(crate) fn neu(
+impl<'a> Execution<'a> {
+    pub(crate) fn new(
         prog: &'a Program,
         consts: &'a HashMap<String, (Type, i128)>,
         expr_types: &'a [Type],
-    ) -> Ausfuehrung<'a> {
-        Ausfuehrung {
+    ) -> Execution<'a> {
+        Execution {
             prog,
             consts,
             expr_types,
-            schritte: 0,
-            ausgabe: String::new(),
-            basis: std::path::PathBuf::from("."),
-            dateien: HashMap::new(),
+            steps: 0,
+            output: String::new(),
+            base: std::path::PathBuf::from("."),
+            files: HashMap::new(),
         }
     }
 
     /// Ruft `name` mit bereits ausgewerteten Argumenten auf.
-    pub(crate) fn ruf_auf(
+    pub(crate) fn call_on(
         &mut self,
         name: &str,
         args: &[i128],
         span: Span,
-        tiefe: u32,
-    ) -> Result<i128, Fehler> {
-        if tiefe >= MAX_TIEFE {
+        depth: u32,
+    ) -> Result<i128, Error> {
+        if depth >= MAX_TIEFE {
             return Err((
                 span,
                 format!("comptime: mehr als {} verschachtelte aufrufe", MAX_TIEFE),
@@ -127,12 +127,12 @@ impl<'a> Ausfuehrung<'a> {
                 ),
             ));
         }
-        let mut umgebung: Vec<HashMap<String, i128>> = vec![HashMap::new()];
+        let mut env: Vec<HashMap<String, i128>> = vec![HashMap::new()];
         for (p, v) in f.params.iter().zip(args.iter()) {
-            umgebung[0].insert(p.name.clone(), *v);
+            env[0].insert(p.name.clone(), *v);
         }
-        match self.block(&f.body, &mut umgebung, tiefe)? {
-            Fluss::Zurueck(v) => Ok(v),
+        match self.block(&f.body, &mut env, depth)? {
+            Flow::Back(v) => Ok(v),
             // Eine Funktion ohne `return` liefert 0 — der Typprüfer hat
             // vorher sichergestellt, dass das nur bei `-> void` vorkommt.
             _ => Ok(0),
@@ -142,29 +142,29 @@ impl<'a> Ausfuehrung<'a> {
     fn block(
         &mut self,
         b: &Block,
-        umg: &mut Vec<HashMap<String, i128>>,
-        tiefe: u32,
-    ) -> Result<Fluss, Fehler> {
-        umg.push(HashMap::new());
-        let mut r = Fluss::Weiter;
+        env: &mut Vec<HashMap<String, i128>>,
+        depth: u32,
+    ) -> Result<Flow, Error> {
+        env.push(HashMap::new());
+        let mut r = Flow::Next;
         for s in &b.stmts {
-            r = self.stmt(s, umg, tiefe)?;
-            if !matches!(r, Fluss::Weiter) {
+            r = self.stmt(s, env, depth)?;
+            if !matches!(r, Flow::Next) {
                 break;
             }
         }
-        umg.pop();
+        env.pop();
         Ok(r)
     }
 
     fn stmt(
         &mut self,
         s: &Stmt,
-        umg: &mut Vec<HashMap<String, i128>>,
-        tiefe: u32,
-    ) -> Result<Fluss, Fehler> {
-        self.schritte += 1;
-        if self.schritte > MAX_SCHRITTE {
+        env: &mut Vec<HashMap<String, i128>>,
+        depth: u32,
+    ) -> Result<Flow, Error> {
+        self.steps += 1;
+        if self.steps > MAX_SCHRITTE {
             return Err((
                 s.span(),
                 format!(
@@ -174,16 +174,16 @@ impl<'a> Ausfuehrung<'a> {
             ));
         }
         match s {
-            Stmt::Error(_) => Ok(Fluss::Weiter),
+            Stmt::Error(_) => Ok(Flow::Next),
             Stmt::Let { name, init, .. } => {
-                let v = self.expr(init, umg, tiefe)?;
-                if let Some(top) = umg.last_mut() {
+                let v = self.expr(init, env, depth)?;
+                if let Some(top) = env.last_mut() {
                     top.insert(name.clone(), v);
                 }
-                Ok(Fluss::Weiter)
+                Ok(Flow::Next)
             }
             Stmt::Assign { target, value, span } => {
-                let v = self.expr(value, umg, tiefe)?;
+                let v = self.expr(value, env, depth)?;
                 let name = match &target.kind {
                     ExprKind::Ident(n) => n.clone(),
                     _ => {
@@ -194,40 +194,40 @@ impl<'a> Ausfuehrung<'a> {
                         ))
                     }
                 };
-                for ebene in umg.iter_mut().rev() {
-                    if let Some(slot) = ebene.get_mut(&name) {
+                for level in env.iter_mut().rev() {
+                    if let Some(slot) = level.get_mut(&name) {
                         *slot = v;
-                        return Ok(Fluss::Weiter);
+                        return Ok(Flow::Next);
                     }
                 }
                 Err((*span, format!("comptime: '{}' ist keine lokale variable", name)))
             }
             Stmt::Expr(e) => {
-                self.expr(e, umg, tiefe)?;
-                Ok(Fluss::Weiter)
+                self.expr(e, env, depth)?;
+                Ok(Flow::Next)
             }
-            Stmt::Block(b) => self.block(b, umg, tiefe),
+            Stmt::Block(b) => self.block(b, env, depth),
             Stmt::Return { value, .. } => {
                 let v = match value {
-                    Some(e) => self.expr(e, umg, tiefe)?,
+                    Some(e) => self.expr(e, env, depth)?,
                     None => 0,
                 };
-                Ok(Fluss::Zurueck(v))
+                Ok(Flow::Back(v))
             }
             Stmt::If { cond, then, els, .. } => {
-                if self.expr(cond, umg, tiefe)? != 0 {
-                    self.block(then, umg, tiefe)
+                if self.expr(cond, env, depth)? != 0 {
+                    self.block(then, env, depth)
                 } else {
                     match els {
-                        Some(e) => self.stmt(e, umg, tiefe),
-                        None => Ok(Fluss::Weiter),
+                        Some(e) => self.stmt(e, env, depth),
+                        None => Ok(Flow::Next),
                     }
                 }
             }
             Stmt::While { cond, body, .. } => {
                 loop {
-                    self.schritte += 1;
-                    if self.schritte > MAX_SCHRITTE {
+                    self.steps += 1;
+                    if self.steps > MAX_SCHRITTE {
                         return Err((
                             s.span(),
                             format!(
@@ -236,23 +236,23 @@ impl<'a> Ausfuehrung<'a> {
                             ),
                         ));
                     }
-                    if self.expr(cond, umg, tiefe)? == 0 {
-                        return Ok(Fluss::Weiter);
+                    if self.expr(cond, env, depth)? == 0 {
+                        return Ok(Flow::Next);
                     }
-                    match self.block(body, umg, tiefe)? {
-                        Fluss::Weiter | Fluss::Weitermachen => {}
-                        Fluss::Abbruch => return Ok(Fluss::Weiter),
-                        Fluss::Zurueck(v) => return Ok(Fluss::Zurueck(v)),
+                    match self.block(body, env, depth)? {
+                        Flow::Next | Flow::Resume => {}
+                        Flow::Abort => return Ok(Flow::Next),
+                        Flow::Back(v) => return Ok(Flow::Back(v)),
                     }
                 }
             }
             Stmt::For { name, start, end, body, .. } => {
-                let von = self.expr(start, umg, tiefe)?;
-                let bis = self.expr(end, umg, tiefe)?;
-                let mut i = von;
-                while i < bis {
-                    self.schritte += 1;
-                    if self.schritte > MAX_SCHRITTE {
+                let of = self.expr(start, env, depth)?;
+                let to = self.expr(end, env, depth)?;
+                let mut i = of;
+                while i < to {
+                    self.steps += 1;
+                    if self.steps > MAX_SCHRITTE {
                         return Err((
                             s.span(),
                             format!(
@@ -261,23 +261,23 @@ impl<'a> Ausfuehrung<'a> {
                             ),
                         ));
                     }
-                    umg.push(HashMap::new());
-                    if let Some(top) = umg.last_mut() {
+                    env.push(HashMap::new());
+                    if let Some(top) = env.last_mut() {
                         top.insert(name.clone(), i);
                     }
-                    let r = self.block(body, umg, tiefe);
-                    umg.pop();
+                    let r = self.block(body, env, depth);
+                    env.pop();
                     match r? {
-                        Fluss::Weiter | Fluss::Weitermachen => {}
-                        Fluss::Abbruch => return Ok(Fluss::Weiter),
-                        Fluss::Zurueck(v) => return Ok(Fluss::Zurueck(v)),
+                        Flow::Next | Flow::Resume => {}
+                        Flow::Abort => return Ok(Flow::Next),
+                        Flow::Back(v) => return Ok(Flow::Back(v)),
                     }
                     i += 1;
                 }
-                Ok(Fluss::Weiter)
+                Ok(Flow::Next)
             }
-            Stmt::Break(_) => Ok(Fluss::Abbruch),
-            Stmt::Continue(_) => Ok(Fluss::Weitermachen),
+            Stmt::Break(_) => Ok(Flow::Abort),
+            Stmt::Continue(_) => Ok(Flow::Resume),
             // Aufgeschobene Anweisungen haetten in einer reinen Rechnung keine
             // Wirkung; sie werden abgelehnt statt still uebergangen.
             Stmt::Defer(_, _, span) => Err((
@@ -302,50 +302,50 @@ impl<'a> Ausfuehrung<'a> {
     /// Das ist bewusst enger als noetig. Wenn Firn ein Modulsystem mit
     /// Faehigkeiten bekommt (DESIGNZIELE §3), wird daraus eine Erlaubnis, die
     /// ein Modul ausdruecklich anfordern muss.
-    fn lies_datei(&mut self, pfad: &str, span: Span) -> Result<&Vec<u8>, Fehler> {
-        if !self.dateien.contains_key(pfad) {
-            if pfad.is_empty() {
+    fn read_file(&mut self, path: &str, span: Span) -> Result<&Vec<u8>, Error> {
+        if !self.files.contains_key(path) {
+            if path.is_empty() {
                 return Err((span, "comptime: leerer dateiname".to_string()));
             }
-            let p = std::path::Path::new(pfad);
-            if p.is_absolute() || pfad.starts_with('/') || pfad.starts_with('\\') {
+            let p = std::path::Path::new(path);
+            if p.is_absolute() || path.starts_with('/') || path.starts_with('\\') {
                 return Err((
                     span,
-                    format!("comptime: '{}' ist ein absoluter pfad — erlaubt sind nur pfade relativ zur quelldatei", pfad),
+                    format!("comptime: '{}' ist ein absoluter pfad — erlaubt sind nur pfade relativ zur quelldatei", path),
                 ));
             }
             if p.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
                 return Err((
                     span,
-                    format!("comptime: '{}' enthaelt '..' — der zugriff bleibt im verzeichnis der quelldatei", pfad),
+                    format!("comptime: '{}' enthaelt '..' — der zugriff bleibt im verzeichnis der quelldatei", path),
                 ));
             }
-            let voll = self.basis.join(p);
-            let inhalt = std::fs::read(&voll).map_err(|e| {
+            let full = self.base.join(p);
+            let content = std::fs::read(&full).map_err(|e| {
                 (
                     span,
-                    format!("comptime: '{}' ist nicht lesbar: {}", voll.display(), e),
+                    format!("comptime: '{}' ist nicht lesbar: {}", full.display(), e),
                 )
             })?;
-            self.dateien.insert(pfad.to_string(), inhalt);
+            self.files.insert(path.to_string(), content);
         }
-        Ok(&self.dateien[pfad])
+        Ok(&self.files[path])
     }
 
     fn expr(
         &mut self,
         e: &Expr,
-        umg: &mut Vec<HashMap<String, i128>>,
-        tiefe: u32,
-    ) -> Result<i128, Fehler> {
-        let nein = |msg: &str| Err((e.span, format!("comptime: {}", msg)));
+        env: &mut Vec<HashMap<String, i128>>,
+        depth: u32,
+    ) -> Result<i128, Error> {
+        let no = |msg: &str| Err((e.span, format!("comptime: {}", msg)));
         match &e.kind {
             ExprKind::Int(v) => Ok(*v),
             ExprKind::Bool(b) => Ok(if *b { 1 } else { 0 }),
-            ExprKind::Float(_) => nein("gleitkomma ist zur uebersetzungszeit noch nicht moeglich"),
+            ExprKind::Float(_) => no("gleitkomma ist zur uebersetzungszeit noch nicht moeglich"),
             ExprKind::Ident(n) => {
-                for ebene in umg.iter().rev() {
-                    if let Some(v) = ebene.get(n) {
+                for level in env.iter().rev() {
+                    if let Some(v) = level.get(n) {
                         return Ok(*v);
                     }
                 }
@@ -355,15 +355,15 @@ impl<'a> Ausfuehrung<'a> {
                 }
             }
             ExprKind::Unary(op, inner) => {
-                let v = self.expr(inner, umg, tiefe)?;
+                let v = self.expr(inner, env, depth)?;
                 match op {
                     UnOp::Neg => Ok(-v),
                     UnOp::Not => Ok(if v == 0 { 1 } else { 0 }),
-                    _ => nein("zeigeroperationen gibt es zur uebersetzungszeit nicht"),
+                    _ => no("zeigeroperationen gibt es zur uebersetzungszeit nicht"),
                 }
             }
             ExprKind::Binary(op, l, r) => {
-                let a = self.expr(l, umg, tiefe)?;
+                let a = self.expr(l, env, depth)?;
                 // Kurzschluss beibehalten: `false && f()` ruft `f` nicht.
                 if matches!(op, BinOp::LAnd) && a == 0 {
                     return Ok(0);
@@ -371,24 +371,24 @@ impl<'a> Ausfuehrung<'a> {
                 if matches!(op, BinOp::LOr) && a != 0 {
                     return Ok(1);
                 }
-                let b = self.expr(r, umg, tiefe)?;
-                rechne(*op, a, b, e.span)
+                let b = self.expr(r, env, depth)?;
+                compute(*op, a, b, e.span)
             }
             ExprKind::Cast(inner, _) => {
-                let v = self.expr(inner, umg, tiefe)?;
-                let ziel = self
+                let v = self.expr(inner, env, depth)?;
+                let target = self
                     .expr_types
                     .get(e.id as usize)
                     .cloned()
                     .unwrap_or(Type::I64);
-                Ok(crate::sema::comptime_wrap(v, &ziel))
+                Ok(crate::sema::comptime_wrap(v, &target))
             }
             ExprKind::Call(name, args, _) => {
                 // EMIT: die einzigen Nebenwirkungen, die ein `comptime` haben
                 // darf — sie schreiben in den Quelltextpuffer (SPEC §6.4).
-                if name == "emit_roh" {
+                if name == "emit_raw" {
                     let text = literal_text(args, e.span)?;
-                    self.ausgabe.push_str(&text);
+                    self.output.push_str(&text);
                     return Ok(0);
                 }
                 // DATENZUGRIFF ZUR UEBERSETZUNGSZEIT (SPEC §6.4).
@@ -398,45 +398,45 @@ impl<'a> Ausfuehrung<'a> {
                 // entsteht Quelltext. Die Datei wird byteweise abgefragt —
                 // damit braucht der Interpreter weder Zeichenketten noch
                 // Arrays.
-                if name == "datei_groesse" {
-                    let pfad = literal_text(args, e.span)?;
-                    let inhalt = self.lies_datei(&pfad, e.span)?;
-                    return Ok(inhalt.len() as i128);
+                if name == "file_size" {
+                    let path = literal_text(args, e.span)?;
+                    let content = self.read_file(&path, e.span)?;
+                    return Ok(content.len() as i128);
                 }
-                if name == "datei_byte" {
+                if name == "file_byte" {
                     if args.len() != 2 {
-                        return nein("'datei_byte' erwartet pfad und index");
+                        return no("'datei_byte' erwartet pfad und index");
                     }
-                    let pfad = literal_text(&args[..1], e.span)?;
-                    let idx = self.expr(&args[1], umg, tiefe)?;
-                    let inhalt = self.lies_datei(&pfad, e.span)?;
-                    if idx < 0 || idx >= inhalt.len() as i128 {
+                    let path = literal_text(&args[..1], e.span)?;
+                    let idx = self.expr(&args[1], env, depth)?;
+                    let content = self.read_file(&path, e.span)?;
+                    if idx < 0 || idx >= content.len() as i128 {
                         return Ok(-1);
                     }
-                    return Ok(inhalt[idx as usize] as i128);
+                    return Ok(content[idx as usize] as i128);
                 }
-                if name == "emit_zahl" {
+                if name == "emit_number" {
                     if args.len() != 1 {
-                        return nein("'emit_zahl' erwartet genau ein argument");
+                        return no("'emit_zahl' erwartet genau ein argument");
                     }
-                    let v = self.expr(&args[0], umg, tiefe)?;
-                    self.ausgabe.push_str(&v.to_string());
+                    let v = self.expr(&args[0], env, depth)?;
+                    self.output.push_str(&v.to_string());
                     return Ok(v);
                 }
-                let mut werte = Vec::with_capacity(args.len());
+                let mut values = Vec::with_capacity(args.len());
                 for a in args {
-                    werte.push(self.expr(a, umg, tiefe)?);
+                    values.push(self.expr(a, env, depth)?);
                 }
-                self.ruf_auf(name, &werte, e.span, tiefe + 1)
+                self.call_on(name, &values, e.span, depth + 1)
             }
-            _ => nein(
+            _ => no(
                 "hier sind nur literale, namen, operatoren, umwandlungen und aufrufe erlaubt",
             ),
         }
     }
 }
 
-fn rechne(op: BinOp, a: i128, b: i128, span: Span) -> Result<i128, Fehler> {
+fn compute(op: BinOp, a: i128, b: i128, span: Span) -> Result<i128, Error> {
     let bit = |x: bool| if x { 1 } else { 0 };
     Ok(match op {
         BinOp::Add => a + b,
@@ -484,7 +484,7 @@ fn rechne(op: BinOp, a: i128, b: i128, span: Span) -> Result<i128, Fehler> {
 /// Array-Literal aus Oktetten verwandelt (SPEC §14.1.str) — hier wird es
 /// zurueckgelesen. Damit braucht `emit_roh` keine Zeichenkettenunterstuetzung
 /// im Interpreter.
-fn literal_text(args: &[Expr], span: Span) -> Result<String, Fehler> {
+fn literal_text(args: &[Expr], span: Span) -> Result<String, Error> {
     if args.len() != 1 {
         return Err((span, "comptime: 'emit_roh' erwartet genau ein argument".to_string()));
     }
@@ -519,25 +519,25 @@ fn literal_text(args: &[Expr], span: Span) -> Result<String, Fehler> {
 /// Der Lauf findet VOR der Typpruefung statt: die Bloecke duerfen deshalb keine
 /// programmweiten Konstanten benutzen, wohl aber jede Funktion des Programms
 /// aufrufen. Ehrlich benannt in SPEC §14.1.comptime.
-pub(crate) fn fuehre_bloecke_aus(
+pub(crate) fn run_blocks_out(
     prog: &Program,
     dg: &mut crate::diag::Diags,
-    basis: &std::path::Path,
+    base: &std::path::Path,
 ) -> String {
-    if prog.comptime_bloecke.is_empty() {
+    if prog.comptime_blocks.is_empty() {
         return String::new();
     }
-    let leer_consts: HashMap<String, (Type, i128)> = HashMap::new();
-    let leer_typen: Vec<Type> = Vec::new();
-    let mut gesamt = String::new();
-    for (b, _span) in &prog.comptime_bloecke {
-        let mut lauf = Ausfuehrung::neu(prog, &leer_consts, &leer_typen);
-        lauf.basis = basis.to_path_buf();
-        let mut umg: Vec<HashMap<String, i128>> = vec![HashMap::new()];
-        match lauf.block(b, &mut umg, 0) {
-            Ok(_) => gesamt.push_str(&lauf.ausgabe),
+    let empty_consts: HashMap<String, (Type, i128)> = HashMap::new();
+    let empty_types: Vec<Type> = Vec::new();
+    let mut total = String::new();
+    for (b, _span) in &prog.comptime_blocks {
+        let mut run = Execution::new(prog, &empty_consts, &empty_types);
+        run.base = base.to_path_buf();
+        let mut env: Vec<HashMap<String, i128>> = vec![HashMap::new()];
+        match run.block(b, &mut env, 0) {
+            Ok(_) => total.push_str(&run.output),
             Err((span, msg)) => dg.error(span, msg),
         }
     }
-    gesamt
+    total
 }

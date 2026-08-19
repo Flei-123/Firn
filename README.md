@@ -276,9 +276,9 @@ Firn** gebaut, Runde 4 den **Opt-in-Tracing-GC samt DOM-Prototyp und Dauerlauf**
 * **`secret[T]`, `u128`, `mul_wide`, `declassify`, `#[constant_time]`**
   (SPEC §9) — **nicht umgesetzt.** `fn f(a: secret[u8])` meldet
   `'secret[T]' ist in Stufe 0 nicht umgesetzt`
-  (`tests/neg/int_secret_nicht_umgesetzt.fi`), `#[constant_time]` meldet
+  (`tests/neg/int_secret_not_implemented.fi`), `#[constant_time]` meldet
   `attribut 'constant_time' ist in Stufe 0 nicht umgesetzt`
-  (`tests/neg/attr_nicht_umgesetzt.fi`). **Umgesetzt sind seit Runde 4 die drei
+  (`tests/neg/attr_not_implemented.fi`). **Umgesetzt sind seit Runde 4 die drei
   Primitive** `select(bedingung, a, b)` (wird `cmov`, nie ein bedingter
   Sprung), `barrier(x)` (undurchsichtige Sperre) und
   `secure_zero(zeiger, anzahl_bytes)` (überlebt jeden Optimierungsdurchgang,
@@ -396,7 +396,7 @@ Nachweise: `tests/400…419_*.fi` (20 Programme, alle in drei Baustufen) und
 `tests/neg/err_*.fi` (11 Negativtests). Beispiel:
 
 ```
-$ ./compiler/target/release/firnc -o /tmp/n tests/neg/err_try_ausserhalb.fi
+$ ./compiler/target/release/firnc -o /tmp/n tests/neg/err_try_outside.fi
 error: 'try' ist nur in einer funktion mit fehlerunions-rueckgabetyp erlaubt, diese liefert i32
 ```
 
@@ -499,7 +499,7 @@ Ehrlich benannt:
   Tokenizer führt Zeile und Spalte selbst mit und gibt hinter dem Tokenstrom
   (durch Tabulator getrennt) eine zweite JSON-Liste aus, z. B.
   `[{"code":"eof-in-tag","line":1,"col":6}]`; die Codenamen stehen in
-  `lib/html/fehler_codes.fi` (WHATWG §13.2 „Parse errors"). Ergebnis
+  `lib/html/error_codes.fi` (WHATWG §13.2 „Parse errors"). Ergebnis
   **6.809 / 6.810 (99,99 %)**. Der eine Fehlschlag ist `xmlViolation.test #0`:
   dort steht `U+FFFF` in der Eingabe, der Tokenizer meldet dafür korrekt
   `noncharacter-in-input-stream`, die Datei `xmlViolation.test` führt aber gar
@@ -765,7 +765,7 @@ landen als Folge einzelner Speicherbefehle im Rahmen, nicht in `.rodata`. Für
 Meldungen und Pfade ist das gleichgültig, für große Tabellen wäre es das nicht.
 
 **Sofort eingelöst:** die handgeschriebenen Oktettlisten in `lib/gc/gc.fi`,
-`lib/dom/mess.fi` und `lib/html/entities_ausfall.fi` sind verschwunden — aus
+`lib/dom/meas.fi` und `lib/html/entities_ausfall.fi` sind verschwunden — aus
 einer 63-stelligen Zahlenreihe wurde
 `"FEHLER: tabelle() lieferte 0, obwohl mmap moeglich sein sollte\n"`.
 
@@ -1024,7 +1024,7 @@ Selbstauskunft der Laufzeit.
 | RSS-Verlauf | konstant über 1.001 Stichproben | linear steigend |
 | lebende Objekte | 8–12 | 12.000.000 |
 
-Die Gegenprobe (`lib/dom/soak_leck.fi`) läuft **bei jedem Testlauf mit** und
+Die Gegenprobe (`lib/dom/soak_leak.fi`) läuft **bei jedem Testlauf mit** und
 **muss** lecken; bleibt sie grün, bricht `run.sh` ab. Eine Messung, die ein Leck
 gar nicht anzeigen kann, ist keine Messung. Ihr Zähler ist korrekt — sie gibt
 die eine Struktur ohne Rückverweis jedes Mal frei und scheitert ausschließlich

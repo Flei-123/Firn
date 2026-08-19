@@ -32,16 +32,16 @@ use crate::fir::{FTy, Func, Term};
 ///
 /// Im Tokenizer ist das der Zustandsversand je Zeichen: 5.109.380 Durchlaeufe
 /// mal zwei ueberfluessige Speicherzugriffe.
-pub(crate) enum Wertquelle<'a> {
+pub(crate) enum ValueSource<'a> {
     /// Grundpfad: der Wert liegt in seinem Rahmenfach.
-    Rahmen(&'a Frame),
+    Frame(&'a Frame),
     /// Registerpfad: der Aufrufer laedt den Wert selbst nach `rax`,
     /// erweitert auf die uebergebene Breite.
     ///
     /// **Zusicherung des Aufrufers:** die Funktion emittiert IMMER mindestens
     /// einen Schreibzugriff auf `eax`/`rax`. Das ist die Grundlage dafuer,
     /// dass die Tabelle unten auf `mov eax, eax` verzichten darf.
-    Geladen(&'a dyn Fn(&mut Emitter, u32)),
+    Loaded(&'a dyn Fn(&mut Emitter, u32)),
 }
 
 /// Breite, in der der Wert verglichen und indiziert wird.
@@ -64,7 +64,7 @@ const MAX_TABLE_ENTRIES: i128 = 65536;
 pub(crate) fn emit_switch(
     e: &mut Emitter,
     f: &Func,
-    q: Wertquelle,
+    q: ValueSource,
     term: &Term,
 ) -> Result<(), String> {
     let (val, ty, cases, default) = match term {
@@ -87,8 +87,8 @@ pub(crate) fn emit_switch(
     }
     let bits = switch_bits(ty);
     match q {
-        Wertquelle::Rahmen(fr) => load_ext(e, fr, "rax", val, ty, bits),
-        Wertquelle::Geladen(lade) => lade(e, bits),
+        ValueSource::Frame(fr) => load_ext(e, fr, "rax", val, ty, bits),
+        ValueSource::Loaded(load) => load(e, bits),
     }
 
     if let Some((min, max)) = table_range(cases) {
@@ -110,12 +110,12 @@ fn table_range(cases: &[(i128, crate::fir::BlockId)]) -> Option<(i128, i128)> {
     }
     let min = cases.iter().map(|(k, _)| *k).min()?;
     let max = cases.iter().map(|(k, _)| *k).max()?;
-    let weite = max - min + 1;
-    if weite <= 0 || weite > MAX_TABLE_ENTRIES {
+    let extent = max - min + 1;
+    if extent <= 0 || extent > MAX_TABLE_ENTRIES {
         return None;
     }
-    let dichte = (cases.len() as i128) * 100 / weite;
-    if dichte < MIN_DENSITY as i128 {
+    let density = (cases.len() as i128) * 100 / extent;
+    if density < MIN_DENSITY as i128 {
         return None;
     }
     Some((min, max))
@@ -130,7 +130,7 @@ fn emit_table(
     max: i128,
     bits: u32,
 ) {
-    let weite = max - min + 1;
+    let extent = max - min + 1;
     let label = table_label(e, &f.name);
     let dflt = block_label(&f.name, default);
 
@@ -139,7 +139,7 @@ fn emit_table(
         if min != 0 {
             e.line(&format!("sub eax, {}", min as i64));
         }
-        e.line(&format!("cmp eax, {}", (weite - 1) as i64));
+        e.line(&format!("cmp eax, {}", (extent - 1) as i64));
         e.line(&format!("ja {}", dflt));
         // KEIN `mov eax, eax` (Runde 51): auf x86-64 nullt JEDER Schreibzugriff
         // auf ein 32-Bit-Register die oberen 32 Bit. Bis hierher ist rax
@@ -153,7 +153,7 @@ fn emit_table(
             e.line(&format!("mov rcx, {}", min as i64));
             e.line("sub rax, rcx");
         }
-        e.line(&format!("mov rcx, {}", (weite - 1) as i64));
+        e.line(&format!("mov rcx, {}", (extent - 1) as i64));
         e.line("cmp rax, rcx");
         e.line(&format!("ja {}", dflt));
     }
@@ -194,7 +194,7 @@ mod tests {
 
     /// Wenige Marken: Vergleichskette.
     #[test]
-    fn switch_erzeugt_vergleichskette() {
+    fn switch_generated_compare_chain() {
         let mut f = Func::new("main", vec![], FTy::I32);
         let v = f.push(0, FTy::I32, Op::Const(2));
         let b1 = f.add_block();
@@ -216,7 +216,7 @@ mod tests {
 
     /// Viele dichte Marken: Sprungtabelle in `.rodata` mit indirektem Sprung.
     #[test]
-    fn dichter_switch_erzeugt_sprungtabelle() {
+    fn denser_switch_generated_jump_table() {
         let mut f = Func::new("main", vec![], FTy::I32);
         let v = f.push(0, FTy::I32, Op::Const(3));
         let mut cases = Vec::new();
@@ -240,7 +240,7 @@ mod tests {
 
     /// Weit gestreute Marken: keine Tabelle (Dichte zu gering).
     #[test]
-    fn sparsamer_switch_bleibt_kette() {
+    fn sparsamer_switch_stays_chain() {
         let mut f = Func::new("main", vec![], FTy::I32);
         let v = f.push(0, FTy::I32, Op::Const(3));
         let mut cases = Vec::new();
@@ -263,10 +263,10 @@ mod tests {
     /// `tests/230_zustandsmaschine.fi` bekommt eine echte Sprungtabelle —
     /// ein indirekter Sprung ueber `.rodata`, keine Kette aus 32 `cmp`.
     #[test]
-    fn sprungtabelle_bei_30_zustaenden() {
-        let pfad = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/230_zustandsmaschine.fi");
-        let src = std::fs::read_to_string(pfad).expect("testprogramm fehlt");
-        let mut dg = crate::diag::Diags::new(pfad, &src);
+    fn jump_table_at_30_states() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/230_zustandsmaschine.fi");
+        let src = std::fs::read_to_string(path).expect("testprogramm fehlt");
+        let mut dg = crate::diag::Diags::new(path, &src);
         let toks = crate::lexer::lex(&src, &mut dg);
         let mut prog = crate::parser::parse(&toks, &mut dg);
         crate::mono::expand(&mut prog, &mut dg);
@@ -277,15 +277,15 @@ mod tests {
         let asm = emit(&m).expect("codegen");
         assert!(asm.contains("jmp qword ptr ["), "keine sprungtabelle:\n{}", asm);
         assert!(asm.contains(".section .rodata"), "tabelle nicht in .rodata:\n{}", asm);
-        let eintraege = asm.matches(".quad .Lmain__bb").count();
-        assert!(eintraege >= 32, "nur {} tabelleneintraege", eintraege);
-        let vergleiche = asm.lines().filter(|l| l.trim().starts_with("cmp ")).count();
-        assert!(vergleiche <= 4, "{} vergleiche statt tabelle:\n{}", vergleiche, asm);
+        let entries = asm.matches(".quad .Lmain__bb").count();
+        assert!(entries >= 32, "nur {} tabelleneintraege", entries);
+        let compare = asm.lines().filter(|l| l.trim().starts_with("cmp ")).count();
+        assert!(compare <= 4, "{} vergleiche statt tabelle:\n{}", compare, asm);
     }
 
     /// `select` muss ein `cmov` werden — niemals ein Sprung (SPEC §9.2).
     #[test]
-    fn select_wird_cmov_und_nie_ein_sprung() {
+    fn select_becomes_cmov_and_never_in_jump() {
         let mut f = Func::new("main", vec![], FTy::I32);
         let c = f.push(0, FTy::Bool, Op::Const(1));
         let a = f.push(0, FTy::I32, Op::Const(7));

@@ -139,8 +139,8 @@ impl<'a> Checker<'a> {
         // Gc[T]-Feld) die Typtabelle braucht.
         crate::nogc::hook_check(self, prog);
         // HOOK kern: `#[interrupt]` — Form pruefen und Aufrufe verbieten
-        // (kern.rs, Runde 52).
-        crate::kern::check_interrupts(self, prog);
+        // (core.rs, Runde 52).
+        crate::core::check_interrupts(self, prog);
         // Ganzprogramm-Pruefung: laeuft genau einmal, nicht je Nachtrag.
         self.check_main(prog);
     }
@@ -214,7 +214,7 @@ impl<'a> Checker<'a> {
             ExprKind::Call(n, _, _) => n.clone(),
             _ => return,
         };
-        let grund = if self.must_consume_fns.contains(&name) {
+        let basic = if self.must_consume_fns.contains(&name) {
             format!("'{}' ist mit #[must_consume] gekennzeichnet", name)
         } else if let Type::Struct(i) = t {
             match self.tcx.structs.get(*i) {
@@ -228,7 +228,7 @@ impl<'a> Checker<'a> {
         };
         self.dg.error_note(
             e.span,
-            format!("das ergebnis darf nicht verworfen werden: {}", grund),
+            format!("das ergebnis darf nicht verworfen werden: {}", basic),
             "binde es an eine variable oder uebergib es weiter".to_string(),
         );
     }
@@ -268,12 +268,12 @@ impl<'a> Checker<'a> {
     }
 
     /// `true` = Attribut ist gueltig UND in Stufe 0 umgesetzt.
-    fn check_one_attr(&mut self, a: &crate::ast::Attr, auf_funktion: bool) -> bool {
-        let info = match crate::attrs::suche(&a.name) {
+    fn check_one_attr(&mut self, a: &crate::ast::Attr, on_func: bool) -> bool {
+        let info = match crate::attrs::search(&a.name) {
             Some(i) => i,
             None => {
                 let msg = format!("unbekanntes attribut '{}'", a.name);
-                match crate::attrs::vorschlag(&a.name) {
+                match crate::attrs::proposal(&a.name) {
                     Some(v) => self.dg.error_note(
                         a.span,
                         msg,
@@ -288,13 +288,13 @@ impl<'a> Checker<'a> {
                 return false;
             }
         };
-        if !crate::attrs::passt(info, auf_funktion) {
+        if !crate::attrs::fits(info, on_func) {
             self.dg.error(
                 a.span,
                 format!(
                     "attribut '{}' gehoert nicht vor {}",
                     a.name,
-                    if auf_funktion { "eine funktion" } else { "einen struct" }
+                    if on_func { "eine funktion" } else { "einen struct" }
                 ),
             );
             return false;
@@ -311,11 +311,11 @@ impl<'a> Checker<'a> {
             );
             return false;
         }
-        if !info.umgesetzt {
+        if !info.implemented {
             self.dg.error_note(
                 a.span,
                 format!("attribut '{}' ist in Stufe 0 nicht umgesetzt", a.name),
-                format!("geplant: {}", info.was),
+                format!("geplant: {}", info.what),
             );
             return false;
         }
@@ -325,10 +325,10 @@ impl<'a> Checker<'a> {
     // ---------------------------------------------------------------- Profil
 
     fn check_profile(&mut self, prog: &Program) {
-        // HOOK profil (profil.rs, Runde 52): das Profil festlegen UND seine
+        // HOOK profil (prof.rs, Runde 52): das Profil festlegen UND seine
         // Regeln durchsetzen. Bis Runde 51 stand hier nur die Namenspruefung —
         // die Deklaration hatte keine Wirkung (SPEC §14, Punkt 6).
-        crate::profil::hook_check(self.dg, prog);
+        crate::prof::hook_check(self.dg, prog);
     }
 
     // --------------------------------------------------------------- Structs
@@ -475,7 +475,7 @@ impl<'a> Checker<'a> {
                 // Laufzeitvorspann und niemanden, der einen Exit-Code
                 // entgegennaehme — nur eine Objektdatei, die ein Bootlader
                 // bzw. ein Linkerskript einbindet.
-                if crate::profil::ist_kernel() {
+                if crate::prof::is_kernel() {
                     return;
                 }
                 self.dg.error_note(
@@ -636,12 +636,12 @@ impl<'a> Checker<'a> {
             // und `continue` wuerden die Reihenfolge der uebrigen
             // aufgeschobenen Anweisungen zerreissen und den Rueckgabewert
             // ueberschreiben. Zig verbietet es aus demselben Grund.
-            Stmt::Defer(inner, nur_fehler, span) => {
-                let art = if *nur_fehler { "errdefer" } else { "defer" };
-                if let Some((bad, wort)) = crate::sema::defer_sprung(inner) {
+            Stmt::Defer(inner, only_error, span) => {
+                let kind = if *only_error { "errdefer" } else { "defer" };
+                if let Some((bad, word)) = crate::sema::defer_jump(inner) {
                     self.dg.error_note(
                         bad,
-                        format!("'{}' ist in einem '{}' nicht erlaubt", wort, art),
+                        format!("'{}' ist in einem '{}' nicht erlaubt", word, kind),
                         "der aufgeschobene rumpf muss normal enden; sonst waere unbestimmt, was mit den uebrigen aufgeschobenen anweisungen geschieht",
                     );
                     let _ = span;
@@ -852,7 +852,7 @@ impl<'a> Checker<'a> {
                 // `let a: Gc[Knoten]` bindet den GRIFF unveraenderlich — das
                 // Objekt am anderen Ende bleibt schreibbar, genau wie bei
                 // `let p: *mut T` und `(*p).feld = …`.
-                if let Some(bt) = self.probe(base).filter(crate::gc::ist_gc_ptr) {
+                if let Some(bt) = self.probe(base).filter(crate::gc::is_gc_ptr) {
                     let _ = self.expr(base, None);
                     let ty = self.field_type(&bt, name, *nspan, base.span);
                     self.record(e.id, ty.clone());
@@ -1333,7 +1333,7 @@ impl<'a> Checker<'a> {
                 return Type::Bool;
             }
             // HOOK gc: Identitaetsvergleich zweier verwandter Gc-Zeiger (gc.rs)
-            let same = compatible(&lt, &rt) || crate::gc::ist_verwandt(&lt, &rt);
+            let same = compatible(&lt, &rt) || crate::gc::is_related(&lt, &rt);
             if !same {
                 self.dg.error(
                     e.span,
@@ -1411,8 +1411,8 @@ impl<'a> Checker<'a> {
         // Bitoperationen haetten auf einem Bitmuster keine sinnvolle Bedeutung
         // (wer sie braucht, wandelt ausdruecklich in `u64` um).
         if lt == Type::F64 || rt == Type::F64 {
-            let erlaubt = matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div);
-            if !erlaubt {
+            let allowed = matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div);
+            if !allowed {
                 self.dg.error_note(
                     e.span,
                     format!("operator '{}' ist fuer f64 nicht definiert", op.text()),
@@ -1461,12 +1461,12 @@ impl<'a> Checker<'a> {
             return t;
         }
         // HOOK constant-time: select/barrier/secure_zero (ct.rs, SPEC §9.2/§9.3)
-        // HOOK faden: die drei Faden-Primitive (faden.rs, Runde 49)
-        if let Some(t) = crate::faden::hook_call(self, name, args, nspan, espan) {
+        // HOOK faden: die drei Faden-Primitive (thread.rs, Runde 49)
+        if let Some(t) = crate::thread::hook_call(self, name, args, nspan, espan) {
             return t;
         }
-        // HOOK atomar: das atomare Primitiv (atomar.rs, Runde 47)
-        if let Some(t) = crate::atomar::hook_call(self, name, args, nspan, espan) {
+        // HOOK atomar: das atomare Primitiv (atomic.rs, Runde 47)
+        if let Some(t) = crate::atomic::hook_call(self, name, args, nspan, espan) {
             return t;
         }
         if let Some(t) = crate::ct::hook_call(self, name, args, nspan, espan) {
@@ -1476,8 +1476,8 @@ impl<'a> Checker<'a> {
         if let Some(t) = crate::sizeof::hook_call(self, name, args, nspan) {
             return t;
         }
-        // HOOK kern: `asm(…)` und die acht MMIO-Namen (kern.rs, Runde 52)
-        if let Some(t) = crate::kern::hook_call(self, name, args, nspan, espan) {
+        // HOOK kern: `asm(…)` und die acht MMIO-Namen (core.rs, Runde 52)
+        if let Some(t) = crate::core::hook_call(self, name, args, nspan, espan) {
             return t;
         }
         // HOOK gc: `gc C{…}`, `weak(g)`, `stark(w)`, `x.as?[C]` und die
@@ -1516,7 +1516,7 @@ impl<'a> Checker<'a> {
         }
         for (i, a) in args.iter().enumerate() {
             match sig.params.get(i) {
-                Some(p) => self.pruefe_argument(name, i + 1, a, p),
+                Some(p) => self.check_argument(name, i + 1, a, p),
                 None => {
                     self.type_out_expr(a);
                 }
@@ -1529,7 +1529,7 @@ impl<'a> Checker<'a> {
     /// der Meldung erscheint (1-basiert). Bei einem Methodenaufruf zaehlt
     /// sie OHNE den Empfaenger — `v.push(x)` hat ein Argument, nicht zwei
     /// (impls.rs).
-    pub(crate) fn pruefe_argument(&mut self, wer: &str, nr: usize, a: &Expr, p: &Type) {
+    pub(crate) fn check_argument(&mut self, who: &str, nr: usize, a: &Expr, p: &Type) {
         // HOOK fehlerunionen: implizite Umwandlung (errors.rs)
         if crate::errors::hook_coerce(self, a, p) {
             return;
@@ -1541,7 +1541,7 @@ impl<'a> Checker<'a> {
                 format!(
                     "argument {} von '{}' hat typ {}, erwartet {}",
                     nr,
-                    wer,
+                    who,
                     self.tcx.name_of(&t),
                     self.tcx.name_of(p)
                 ),
@@ -1687,25 +1687,25 @@ impl<'a> Checker<'a> {
                 // Ohne das bekaeme ein Literal daneben keinen Typ
                 // (`p.summe() != 42`) — dieselbe Aufloesung wie in `call`,
                 // nur ohne zu melden und ohne zu schreiben (impls.rs)
-                if let Some(m) = crate::impls::methodenname(name) {
+                if let Some(m) = crate::impls::method_name(name) {
                     let et = args.first().and_then(|a| self.probe_d(a, d + 1))?;
                     // HOOK iface: auf einem `dyn I` steht der Typ in der
                     // Schnittstelle, nicht in der Funktionstabelle (iface.rs)
-                    if let Some(iname) = crate::impls::dyn_schnittstelle(&self.tcx, &et) {
-                        return crate::iface::ret_von(&iname, m);
+                    if let Some(iname) = crate::impls::dyn_interface(&self.tcx, &et) {
+                        return crate::iface::ret_of(&iname, m);
                     }
-                    let (voll, _) = crate::impls::ziel_von(&self.tcx, &self.fns, m, &et)?;
-                    return self.fns.get(&voll).map(|s| s.ret.clone());
+                    let (full, _) = crate::impls::target_of(&self.tcx, &self.fns, m, &et)?;
+                    return self.fns.get(&full).map(|s| s.ret.clone());
                 }
                 // HOOK sizeof: `size_of[T]()` ist immer `usize` — ohne das
                 // bekommt ein Literal daneben keinen Typ (`size_of[u8]() != 1`)
-                if crate::sizeof::wert(name).is_some() || name.starts_with("size_of$") {
+                if crate::sizeof::value(name).is_some() || name.starts_with("size_of$") {
                     return Some(Type::Usize);
                 }
                 // HOOK gc: Typ von `weak(g)`, `stark(w)` und `x.as?[C]` OHNE
                 // Pruefung, damit ein Literal daneben seinen Typ bekommt (gc.rs)
                 let arg0 = args.first().and_then(|a| self.probe_d(a, d + 1));
-                if let Some(t) = crate::gc::probe_typ(name, arg0.as_ref()) {
+                if let Some(t) = crate::gc::probe_ty(name, arg0.as_ref()) {
                     return Some(t);
                 }
                 self.fns.get(name).map(|s| s.ret.clone())
@@ -1917,9 +1917,9 @@ impl<'a> Checker<'a> {
             // Damit sind Tabellengroessen und Kennzahlen berechenbar, statt sie
             // von Hand auszurechnen und als Literal hinzuschreiben.
             ExprKind::Call(name, args, _) => {
-                let mut werte = Vec::with_capacity(args.len());
+                let mut values = Vec::with_capacity(args.len());
                 for a in args {
-                    werte.push(self.eval_const_d(a, d + 1)?);
+                    values.push(self.eval_const_d(a, d + 1)?);
                 }
                 let prog = match self.prog {
                     // SICHER: gesetzt in `run`/`add_items_inner`, gilt fuer die
@@ -1927,9 +1927,9 @@ impl<'a> Checker<'a> {
                     Some(p) => unsafe { &*p },
                     None => return nope("comptime: das programm steht hier nicht zur verfuegung"),
                 };
-                let mut lauf =
-                    crate::comptime::Ausfuehrung::neu(prog, &self.consts, &self.expr_types);
-                lauf.ruf_auf(name, &werte, e.span, 0)
+                let mut run =
+                    crate::comptime::Execution::new(prog, &self.consts, &self.expr_types);
+                run.call_on(name, &values, e.span, 0)
             }
             _ => nope("konstanter ausdruck muss zur uebersetzungszeit auswertbar sein (nur literale, konstanten, operatoren und aufrufe)"),
         }
@@ -2015,7 +2015,7 @@ fn assignable(got: &Type, want: &Type) -> bool {
     // HOOK gc: kostenlose Aufwaertsumwandlung `Gc[Abgeleitet]` -> `Gc[Basis]`
     // (gc.rs, SPEC 4.4). NUR diese Richtung; abwaerts geht ausschliesslich
     // ueber das gepruefte `x.as?[C]`.
-    if crate::gc::ist_aufwaerts(got, want) {
+    if crate::gc::is_upward(got, want) {
         return true;
     }
     compatible(got, want)
@@ -2154,128 +2154,128 @@ mod tests {
     // ------------------------------------------------------------------
 
     /// Baut einen Pruefer im Zustand *nach* dem ersten Durchlauf.
-    fn checker_nach_erstem_lauf<'d>(
+    fn checker_after_first_run<'d>(
         dg: &'d mut Diags,
-        erstes: &Program,
+        first: &Program,
     ) -> Checker<'d> {
         let mut ck = Checker {
             dg,
             tcx: TypeCtx::new(),
             fns: HashMap::new(),
             consts: HashMap::new(),
-            expr_types: vec![Type::Error; erstes.expr_count as usize],
+            expr_types: vec![Type::Error; first.expr_count as usize],
             scopes: Vec::new(),
             ret: Type::Void,
             depth: 0,
             must_consume_fns: HashSet::new(),
             prog: None,
         };
-        ck.run(erstes);
+        ck.run(first);
         ck
     }
 
     #[test]
-    fn pruefphasen_nehmen_nachtraeglich_erzeugte_elemente_an() {
+    fn check_phases_take_later_generated_elems_an() {
         // Erster Durchlauf: nur `main` und `basis`.
         let mut b = B::new();
-        let ret_basis = b.int(7);
-        let basis = FnDecl {
-            name: "basis".to_string(),
+        let ret_base = b.int(7);
+        let base = FnDecl {
+            name: "base".to_string(),
             params: Vec::new(),
             ret: Some(named("i32")),
-            body: blk(vec![Stmt::Return { value: Some(ret_basis), span: sp() }]),
+            body: blk(vec![Stmt::Return { value: Some(ret_base), span: sp() }]),
             span: sp(),
             attrs: Vec::new(),
         };
         let ret_main = b.int(0);
-        let erstes = Program {
-            funcs: vec![basis, main_fn(vec![Stmt::Return { value: Some(ret_main), span: sp() }])],
+        let first = Program {
+            funcs: vec![base, main_fn(vec![Stmt::Return { value: Some(ret_main), span: sp() }])],
             expr_count: b.next,
             ..Default::default()
         };
 
         let mut dg = Diags::new("test.fi", "");
-        let mut ck = checker_nach_erstem_lauf(&mut dg, &erstes);
+        let mut ck = checker_after_first_run(&mut dg, &first);
         assert!(!ck.dg.has_errors(), "erster Durchlauf muss fehlerfrei sein");
-        assert!(ck.fns.contains_key("basis"));
-        assert!(!ck.fns.contains_key("spaeter"));
+        assert!(ck.fns.contains_key("base"));
+        assert!(!ck.fns.contains_key("later"));
 
         // Zweiter Durchlauf: eine Funktion, die es beim ersten Mal noch nicht
         // gab und die auf eine Funktion des ersten Durchlaufs zugreift.
         // Genau das muss `comptime emit` spaeter tun.
-        let ruf = b.e(ExprKind::Call("basis".to_string(), Vec::new(), sp()));
-        let nachtrag = Program {
+        let call = b.e(ExprKind::Call("base".to_string(), Vec::new(), sp()));
+        let addendum = Program {
             funcs: vec![FnDecl {
-                name: "spaeter".to_string(),
+                name: "later".to_string(),
                 params: Vec::new(),
                 ret: Some(named("i32")),
-                body: blk(vec![Stmt::Return { value: Some(ruf), span: sp() }]),
+                body: blk(vec![Stmt::Return { value: Some(call), span: sp() }]),
                 span: sp(),
                 attrs: Vec::new(),
             }],
             expr_count: b.next,
             ..Default::default()
         };
-        ck.add_items(&nachtrag);
+        ck.add_items(&addendum);
 
         assert!(!ck.dg.has_errors(), "Nachtrag muss fehlerfrei durchlaufen");
-        assert!(ck.fns.contains_key("spaeter"), "die neue Funktion fehlt");
+        assert!(ck.fns.contains_key("later"), "die neue Funktion fehlt");
         // Der Aufruf hat wirklich einen Typ bekommen — die Tabelle ist mitgewachsen.
         assert_eq!(ck.expr_types.len(), b.next as usize);
-        assert_eq!(ck.fns["spaeter"].ret, Type::I32);
+        assert_eq!(ck.fns["later"].ret, Type::I32);
     }
 
     #[test]
-    fn nachtrag_wird_genauso_streng_geprueft() {
+    fn addendum_becomes_likewise_strict_checked() {
         let mut b = B::new();
         let ret_main = b.int(0);
-        let erstes = Program {
+        let first = Program {
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(ret_main), span: sp() }])],
             expr_count: b.next,
             ..Default::default()
         };
         let mut dg = Diags::new("test.fi", "");
-        let mut ck = checker_nach_erstem_lauf(&mut dg, &erstes);
+        let mut ck = checker_after_first_run(&mut dg, &first);
         assert!(!ck.dg.has_errors());
 
         // Nachtrag ruft etwas auf, das es nicht gibt -> derselbe Fehler wie im
         // ersten Durchlauf. Ein Nachtrag darf keine Hintertuer sein.
-        let ruf = b.e(ExprKind::Call("gibt_es_nicht".to_string(), Vec::new(), sp()));
-        let nachtrag = Program {
+        let call = b.e(ExprKind::Call("gibt_es_nicht".to_string(), Vec::new(), sp()));
+        let addendum = Program {
             funcs: vec![FnDecl {
-                name: "kaputt".to_string(),
+                name: "broken".to_string(),
                 params: Vec::new(),
                 ret: Some(named("i32")),
-                body: blk(vec![Stmt::Return { value: Some(ruf), span: sp() }]),
+                body: blk(vec![Stmt::Return { value: Some(call), span: sp() }]),
                 span: sp(),
                 attrs: Vec::new(),
             }],
             expr_count: b.next,
             ..Default::default()
         };
-        ck.add_items(&nachtrag);
+        ck.add_items(&addendum);
         assert!(ck.dg.has_errors(), "unbekannter Name im Nachtrag muss auffallen");
     }
 
     #[test]
-    fn nachtrag_meldet_doppelte_deklaration() {
+    fn addendum_reports_duplicate_decl() {
         let mut b = B::new();
         let ret_main = b.int(0);
-        let erstes = Program {
+        let first = Program {
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(ret_main), span: sp() }])],
             expr_count: b.next,
             ..Default::default()
         };
         let mut dg = Diags::new("test.fi", "");
-        let mut ck = checker_nach_erstem_lauf(&mut dg, &erstes);
+        let mut ck = checker_after_first_run(&mut dg, &first);
 
         let ret2 = b.int(1);
-        let nachtrag = Program {
+        let addendum = Program {
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(ret2), span: sp() }])],
             expr_count: b.next,
             ..Default::default()
         };
-        ck.add_items(&nachtrag);
+        ck.add_items(&addendum);
         assert!(ck.dg.has_errors(), "'main' zweimal muss ein Fehler sein");
     }
 
@@ -2314,7 +2314,7 @@ mod tests {
             imports: Vec::new(),
             exports: Vec::new(),
             expr_count: b.next,
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
         }
     }
 
@@ -2349,7 +2349,7 @@ mod tests {
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(ret), span: sp() }])],
             structs: vec![sd],
             consts: Vec::new(),
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
         let (info, out) = run(prog, "");
@@ -2403,7 +2403,7 @@ mod tests {
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(ret), span: sp() }])],
             structs: vec![sd],
             consts: Vec::new(),
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
         let (info, out) = run(prog, "");
@@ -2444,7 +2444,7 @@ mod tests {
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(ret), span: sp() }])],
             structs: vec![outer, inner],
             consts: Vec::new(),
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
         let (info, out) = run(prog, "");
@@ -2477,7 +2477,7 @@ mod tests {
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(ret), span: sp() }])],
             structs: vec![a, bs],
             consts: Vec::new(),
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
         expect_err(prog, "enthaelt sich selbst");
@@ -2509,7 +2509,7 @@ mod tests {
             imports: Vec::new(),
             exports: Vec::new(),
             expr_count: b.next,
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
         };
         let (info, out) = run(prog, "");
         let info = info.unwrap_or_else(|| panic!("unerwarteter fehler:\n{}", out));
@@ -2541,7 +2541,7 @@ mod tests {
             ])],
             structs: Vec::new(),
             consts: Vec::new(),
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
         expect_err(prog, "typ des ganzzahlliterals ist nicht ableitbar");
@@ -2579,7 +2579,7 @@ mod tests {
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(call), span: sp() }]), f],
             structs: Vec::new(),
             consts: Vec::new(),
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
         expect_err(prog, "erwartet 2 argument(e), gefunden 1");
@@ -2594,7 +2594,7 @@ mod tests {
             funcs: vec![main_fn(Vec::new())],
             structs: Vec::new(),
             consts: Vec::new(),
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
             expr_count: 0,
         };
         expect_err(prog, "erreicht das ende ohne 'return'");
@@ -2624,7 +2624,7 @@ mod tests {
             ])],
             structs: Vec::new(),
             consts: Vec::new(),
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
         expect_err(prog, "mit 'let' gebunden");
@@ -2653,7 +2653,7 @@ mod tests {
             ])],
             structs: Vec::new(),
             consts: Vec::new(),
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
         expect_err(prog, "index auf nicht-array-typ i32");
@@ -2681,7 +2681,7 @@ mod tests {
             ])],
             structs: Vec::new(),
             consts: Vec::new(),
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
         expect_err(prog, "feldzugriff auf nicht-struct-typ i32");
@@ -2709,7 +2709,7 @@ mod tests {
             ])],
             structs: Vec::new(),
             consts: Vec::new(),
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
         expect_err(prog, "dereferenzierung erwartet einen zeiger");
@@ -2730,7 +2730,7 @@ mod tests {
             ])],
             structs: Vec::new(),
             consts: Vec::new(),
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
         expect_err(prog, "wahrheitswert vom typ bool erwartet");
@@ -2755,7 +2755,7 @@ mod tests {
             ])],
             structs: Vec::new(),
             consts: Vec::new(),
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
         expect_err(prog, "desselben ganzzahltyps, gefunden i32 und i64");
@@ -2764,7 +2764,7 @@ mod tests {
     #[test]
     /// Runde 2: Aggregate an Funktionsgrenzen sind ERLAUBT (SPEC §14.1 Punkt 1
     /// gestrichen). Der Typpruefer nimmt sie an, `abi.rs` klassifiziert sie.
-    fn aggregate_parameter_ist_erlaubt() {
+    fn aggregate_parameter_is_allowed() {
         let mut b = B::new();
         let ret = b.int(0);
         let f = FnDecl {
@@ -2786,7 +2786,7 @@ mod tests {
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(ret), span: sp() }]), f],
             structs: Vec::new(),
             consts: Vec::new(),
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
         let (info, out) = run(prog, "");
@@ -2827,7 +2827,7 @@ mod tests {
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(c), span: sp() }])],
             structs: vec![sd],
             consts: Vec::new(),
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
         expect_err(prog, "umwandlung von P nach i32 ist nicht erlaubt");
@@ -2861,7 +2861,7 @@ mod tests {
             ])],
             structs: vec![sd],
             consts: Vec::new(),
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
         expect_err(prog, "fehlt das feld 'y'");
@@ -2887,7 +2887,7 @@ mod tests {
                 span: sp(),
             }],
             expr_count: b.next,
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
         };
         let (info, out) = run(prog, "");
         let info = info.unwrap_or_else(|| panic!("fehler:\n{}", out));
@@ -2914,7 +2914,7 @@ mod tests {
                 span: sp(),
             }],
             expr_count: b.next,
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
         };
         expect_err(prog, "division durch null");
     }
@@ -2942,7 +2942,7 @@ mod tests {
             ])],
             structs: Vec::new(),
             consts: Vec::new(),
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
         let (info, out) = run(prog, "");
@@ -2990,7 +2990,7 @@ mod tests {
             ])],
             structs: Vec::new(),
             consts: Vec::new(),
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
         expect_err(prog, "index muss vom typ usize sein");
@@ -3000,18 +3000,18 @@ mod tests {
 /// Findet einen Sprung (`return`/`break`/`continue`), der aus einem
 /// `defer`-Rumpf HERAUSfuehrt. Sprunge innerhalb einer Schleife, die im Rumpf
 /// selbst beginnt, sind erlaubt — sie verlassen den Rumpf nicht.
-pub(crate) fn defer_sprung(s: &Stmt) -> Option<(Span, &'static str)> {
+pub(crate) fn defer_jump(s: &Stmt) -> Option<(Span, &'static str)> {
     match s {
         Stmt::Return { span, .. } => Some((*span, "return")),
         Stmt::Break(span) => Some((*span, "break")),
         Stmt::Continue(span) => Some((*span, "continue")),
-        Stmt::Block(b) => b.stmts.iter().find_map(defer_sprung),
-        Stmt::Defer(inner, _, _) => defer_sprung(inner),
+        Stmt::Block(b) => b.stmts.iter().find_map(defer_jump),
+        Stmt::Defer(inner, _, _) => defer_jump(inner),
         Stmt::If { then, els, .. } => then
             .stmts
             .iter()
-            .find_map(defer_sprung)
-            .or_else(|| els.as_deref().and_then(defer_sprung)),
+            .find_map(defer_jump)
+            .or_else(|| els.as_deref().and_then(defer_jump)),
         // In `while`/`for` duerfen `break`/`continue` stehen: sie gehoeren zu
         // dieser Schleife und verlassen den Rumpf nicht. Ein `return` schon.
         Stmt::While { body, .. } | Stmt::For { body, .. } => {

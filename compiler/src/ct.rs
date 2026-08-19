@@ -45,7 +45,7 @@ pub(crate) fn is_ct_call(name: &str) -> bool {
 
 /// Darf an einem Wert dieses Typs `select`/`barrier` arbeiten?
 /// Nur skalare Typen: Ganzzahl, `bool`, Zeiger.
-fn ist_skalar(t: &Type) -> bool {
+fn is_scalar(t: &Type) -> bool {
     t.is_concrete_int() || *t == Type::Bool || t.is_ptr()
 }
 
@@ -72,8 +72,8 @@ pub(crate) fn hook_call(
 
 /// Erwartete Argumentzahl pruefen; bei Abweichung werden die vorhandenen
 /// Argumente trotzdem durchgetypt, damit keine ExprId ohne Typ bleibt.
-fn stellenzahl(ck: &mut Checker, name: &str, args: &[Expr], soll: usize, nspan: Span) -> bool {
-    if args.len() == soll {
+fn digit_count(ck: &mut Checker, name: &str, args: &[Expr], should: usize, nspan: Span) -> bool {
+    if args.len() == should {
         return true;
     }
     for a in args {
@@ -84,7 +84,7 @@ fn stellenzahl(ck: &mut Checker, name: &str, args: &[Expr], soll: usize, nspan: 
         format!(
             "'{}' erwartet {} argument(e), gefunden {}",
             name,
-            soll,
+            should,
             args.len()
         ),
         match name {
@@ -97,7 +97,7 @@ fn stellenzahl(ck: &mut Checker, name: &str, args: &[Expr], soll: usize, nspan: 
 }
 
 fn check_select(ck: &mut Checker, args: &[Expr], nspan: Span, espan: Span) -> Type {
-    if !stellenzahl(ck, SELECT, args, 3, nspan) {
+    if !digit_count(ck, SELECT, args, 3, nspan) {
         return Type::Error;
     }
     let ct = ck.expr(&args[0], Some(&Type::Bool));
@@ -115,7 +115,7 @@ fn check_select(ck: &mut Checker, args: &[Expr], nspan: Span, espan: Span) -> Ty
     if ta.is_error() || tb.is_error() {
         return Type::Error;
     }
-    if !ist_skalar(&ta) {
+    if !is_scalar(&ta) {
         ck.dg.error_note(
             args[1].span,
             format!(
@@ -142,14 +142,14 @@ fn check_select(ck: &mut Checker, args: &[Expr], nspan: Span, espan: Span) -> Ty
 }
 
 fn check_barrier(ck: &mut Checker, args: &[Expr], nspan: Span, _espan: Span) -> Type {
-    if !stellenzahl(ck, BARRIER, args, 1, nspan) {
+    if !digit_count(ck, BARRIER, args, 1, nspan) {
         return Type::Error;
     }
     let t = ck.expr(&args[0], None);
     if t.is_error() {
         return Type::Error;
     }
-    if !ist_skalar(&t) {
+    if !is_scalar(&t) {
         ck.dg.error_note(
             args[0].span,
             format!(
@@ -164,7 +164,7 @@ fn check_barrier(ck: &mut Checker, args: &[Expr], nspan: Span, _espan: Span) -> 
 }
 
 fn check_secure_zero(ck: &mut Checker, args: &[Expr], nspan: Span, _espan: Span) -> Type {
-    if !stellenzahl(ck, SECURE_ZERO, args, 2, nspan) {
+    if !digit_count(ck, SECURE_ZERO, args, 2, nspan) {
         return Type::Error;
     }
     let tp = ck.expr(&args[0], None);
@@ -225,7 +225,7 @@ pub(crate) fn lower_ct_call(
             }
             let addr = lw.lower_expr(&args[0])?;
             let n = lw.lower_expr(&args[1])?;
-            let size = angleichen(lw, &args[1], n)?;
+            let size = align(lw, &args[1], n)?;
             lw.push_void(FTy::Void, Op::SecureZero { addr, size });
             Some(None)
         }
@@ -234,7 +234,7 @@ pub(crate) fn lower_ct_call(
 
 /// Die Byteanzahl von `secure_zero` wird als `u64` gebraucht; schmalere
 /// Ganzzahlen werden erweitert (vorzeichenrichtig nach Quelltyp).
-fn angleichen(lw: &mut Lower, arg: &Expr, v: Val) -> Option<Val> {
+fn align(lw: &mut Lower, arg: &Expr, v: Val) -> Option<Val> {
     let from = lw.fty_of(arg)?;
     if from == FTy::U64 || from == FTy::I64 {
         return Some(v);
@@ -246,7 +246,7 @@ fn angleichen(lw: &mut Lower, arg: &Expr, v: Val) -> Option<Val> {
 mod tests {
     /// Uebersetzt Quelltext bis zum Assembler — genau der Weg, den `firnc`
     /// nimmt (mit Optimierer).
-    fn asm_von(src: &str) -> String {
+    fn asm_of(src: &str) -> String {
         let mut dg = crate::diag::Diags::new("ct_test", src);
         let toks = crate::lexer::lex(src, &mut dg);
         let mut prog = crate::parser::parse(&toks, &mut dg);
@@ -261,16 +261,16 @@ mod tests {
     /// NACHWEIS (SPEC §9.2): `select` wird ein `cmov` — und in der Funktion,
     /// die nur aus dem `select` besteht, entsteht KEIN bedingter Sprung.
     #[test]
-    fn select_wird_cmov_und_nie_ein_sprung() {
-        let asm = asm_von(
+    fn select_becomes_cmov_and_never_in_jump() {
+        let asm = asm_of(
             "fn waehle(b: bool, a: i32, c: i32) -> i32 { return select(b, a, c) }\n\
              fn main() -> i32 { return waehle(true, 1 as i32, 2 as i32) }\n",
         );
         assert!(asm.contains("cmov"), "kein cmov:\n{}", asm);
-        let koerper = asm.split("waehle:").nth(1).expect("funktion fehlt");
-        let koerper = koerper.split("\nmain:").next().unwrap_or(koerper);
-        for zeile in koerper.lines() {
-            let l = zeile.trim();
+        let body = asm.split("waehle:").nth(1).expect("funktion fehlt");
+        let body = body.split("\nmain:").next().unwrap_or(body);
+        for line in body.lines() {
+            let l = line.trim();
             assert!(
                 !(l.starts_with('j') && !l.starts_with("jmp")),
                 "bedingter sprung in 'waehle': {}\n{}",
@@ -284,8 +284,8 @@ mod tests {
     /// Puffer danach nie wieder gelesen wird — der Optimierer darf es nicht
     /// als toten Speicherzugriff entfernen.
     #[test]
-    fn secure_zero_ueberlebt_den_optimierer() {
-        let asm = asm_von(
+    fn secure_zero_survives_the_optimizer() {
+        let asm = asm_of(
             "fn main() -> i32 {\n\
                  var buf: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8]\n\
                  secure_zero(&buf[0], 8 as usize)\n\
@@ -298,11 +298,11 @@ mod tests {
     /// NACHWEIS (SPEC §9.2): `barrier` ueberlebt die Konstantenfaltung — der
     /// Wert wird NICHT durch die Konstante ersetzt.
     #[test]
-    fn barrier_bleibt_undurchsichtig() {
-        let asm = asm_von("fn main() -> i32 { let a: i32 = barrier(7 as i32)\n return a }\n");
-        let koerper = asm.split("main:").nth(1).expect("main fehlt");
+    fn barrier_stays_opaque() {
+        let asm = asm_of("fn main() -> i32 { let a: i32 = barrier(7 as i32)\n return a }\n");
+        let body = asm.split("main:").nth(1).expect("main fehlt");
         assert!(
-            !koerper.contains("mov rax, 7") && !koerper.contains("mov eax, 7"),
+            !body.contains("mov rax, 7") && !body.contains("mov eax, 7"),
             "barrier wegoptimiert:\n{}",
             asm
         );
@@ -312,8 +312,8 @@ mod tests {
     /// koennte ein Programm durch das neue Primitiv still die Bedeutung
     /// wechseln.
     #[test]
-    fn eigene_funktion_verdeckt_das_primitiv() {
-        let asm = asm_von(
+    fn own_func_shadowed_the_primitive() {
+        let asm = asm_of(
             "fn barrier(x: i32) -> i32 { return x + 1 as i32 }\n\
              fn main() -> i32 { return barrier(1 as i32) }\n",
         );

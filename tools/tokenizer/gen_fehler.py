@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Erzeugt lib/html/fehler_codes.fi — die Namenstabelle der WHATWG-Parse-Fehler.
+"""Erzeugt lib/html/error_codes.fi — die Namenstabelle der WHATWG-Parse-Fehler.
 
 Stufe 0 kennt keine Zeichenkettenliterale (SPEC §14.1.str S1). Die Codenamen
 werden deshalb als Folge von u64-Stuecken (je 8 ASCII-Bytes, little-endian,
@@ -64,7 +64,7 @@ CODES = [
 ]
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-ZIEL = os.path.join(ROOT, "lib", "html", "fehler_codes.fi")
+ZIEL = os.path.join(ROOT, "lib", "html", "error_codes.fi")
 
 
 def konstante(name):
@@ -86,7 +86,7 @@ def stuecke(name):
 def main():
     max_st = max(len(stuecke(c)) for c in CODES)
     z = []
-    z.append("// lib/html/fehler_codes.fi — Namen der WHATWG-Parse-Fehler (erzeugt).")
+    z.append("// lib/html/error_codes.fi — Namen der WHATWG-Parse-Fehler (erzeugt).")
     z.append("//")
     z.append("// ERZEUGT von tools/tokenizer/gen_fehler.py — nicht von Hand aendern.")
     z.append("//")
