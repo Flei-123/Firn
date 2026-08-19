@@ -127,7 +127,7 @@ pub(crate) fn replace_uses(f: &mut Func, map: &HashMap<Val, Val>) -> usize {
                 continue; // SPEC §9.2: Operanden bleiben, wie sie sind
             }
             match &mut i.op {
-                Op::Const(_) | Op::Alloca { .. } | Op::GcAddr { .. } => {}
+                Op::Const(_) | Op::Alloca { .. } | Op::GcAddr { .. } | Op::ThreadSelf => {}
                 Op::Bin(_, a, b2) => {
                     rep(a, &mut n);
                     rep(b2, &mut n);
@@ -162,6 +162,16 @@ pub(crate) fn replace_uses(f: &mut Func, map: &HashMap<Val, Val>) -> usize {
                 Op::CopyMem { dst, src, .. } => {
                     rep(dst, &mut n);
                     rep(src, &mut n);
+                }
+                Op::AtomicCas { addr, erw, neu } => {
+                    rep(addr, &mut n);
+                    rep(erw, &mut n);
+                    rep(neu, &mut n);
+                }
+                Op::ThreadSpawn { arg, stapel, ctid } => {
+                    rep(arg, &mut n);
+                    rep(stapel, &mut n);
+                    rep(ctid, &mut n);
                 }
                 Op::AtomicAdd { addr, val } => {
                     rep(addr, &mut n);
@@ -357,6 +367,8 @@ fn clobbers_memory(op: &Op) -> bool {
             | Op::Asm { .. }
             | Op::MmioLoad { .. }
             | Op::MmioStore { .. }
+            | Op::AtomicCas { .. }
+            | Op::ThreadSpawn { .. }
             | Op::SecureZero { .. }
     )
 }

@@ -9,6 +9,7 @@ mod ast;
 mod ast_kanon;
 mod layout_kanon;
 mod atomar;
+mod faden;
 mod attrs;
 mod codegen_switch;
 mod codegen_x86;
@@ -303,6 +304,9 @@ fn main() {
 }
 
 fn run(opts: &Options) -> i32 {
+    // Runde 49: Merker „Laufzeit eingezogen" gehoert zum Anfang einer
+    // Uebersetzung (codegen_x86::emit gibt danach den Zustandsblock aus).
+    crate::gc::laufzeit_reset();
     // Der Satz steht hier und nicht in `parse_args`, weil `firnc1` ihn
     // ZEICHENGLEICH schreiben muss und dort keine `--help`-Nachbemerkung
     // hat (Runde 48).

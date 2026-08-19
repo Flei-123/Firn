@@ -1,0 +1,187 @@
+// expect_exit: 0
+// RUNDE 49 — FAEDEN, das Fundament (SPEC §7).
+//
+// Geprueft wird, was zugesagt ist:
+//   A  `faden_starten` erzeugt einen ECHTEN Faden (eigene Fadenkennung,
+//      eigener Stapel) und `faden_warten` liefert dessen Ergebnis.
+//   B  Der Mutex verliert keine Erhoehung: vier Faeden zaehlen je 20.000 Mal
+//      unter der Sperre hoch, und am Ende stehen exakt 80.000 da. Zur
+//      Gegenprobe zaehlt derselbe Lauf einen zweiten Zaehler REIN ATOMAR
+//      hoch — beide muessen exakt stimmen.
+//   C  Ein Zaehler OHNE Sperre und OHNE atomare Instruktion verliert
+//      Erhoehungen. Ohne diese Gegenprobe waere B wertlos: der Test bestuende
+//      auch dann, wenn die Faeden gar nicht gleichzeitig liefen.
+//   D  Der Kanal ueberträgt jeden Wert genau einmal.
+//   E  Ein Handle laesst sich nach dem Join wiederverwenden (Plaetze der
+//      Fadentafel werden frei).
+//
+// Dieses Programm hat KEIN `gc class`. Es zieht die Laufzeit allein ueber
+// seine `faden_`-Bezeichner ein (quelle_braucht_gc in gc.rs) — genau das ist
+// hier mitgeprueft, denn der Zustandsblock muss trotzdem im Assembler stehen.
+
+const F_SYS_MMAP: i64 = 9
+const F_PROT_RW: i64 = 3
+const F_MAP_ANON: i64 = 34
+
+const Z_SPERRZ: u64 = 0
+const Z_MUTEX: u64 = 8
+const Z_ATOMZ: u64 = 16
+const Z_ROHZ: u64 = 24
+const Z_KANAL: u64 = 32
+
+const RUNDEN: u64 = 20000
+const KANALWERTE: u64 = 2000
+
+fn seite() -> u64 {
+    let r: i64 = syscall(F_SYS_MMAP, 0, 4096, F_PROT_RW, F_MAP_ANON, -1, 0)
+    if r < 0 {
+        return 0
+    }
+    return r as u64
+}
+
+fn ld(a: u64, o: u64) -> u64 {
+    return *((a + o) as *mut u64)
+}
+
+fn st(a: u64, o: u64, v: u64) {
+    *((a + o) as *mut u64) = v
+}
+
+// DER VERTEILER. Stufe 0 hat keine Funktionszeiger; ein Faden traegt eine
+// ARBEITSART, genau wie ein Objekt eine Aufraeumart traegt (Runde 47).
+fn __faden_arbeit(art: u64, arg: u64) -> u64 {
+    if art == 1 {
+        var i: u64 = 0
+        while i < RUNDEN {
+            faden_sperren((arg + Z_MUTEX) as *mut u64)
+            st(arg, Z_SPERRZ, ld(arg, Z_SPERRZ) + 1)
+            faden_entsperren((arg + Z_MUTEX) as *mut u64)
+            __atomar_addieren((arg + Z_ATOMZ) as *mut u64, 1)
+            // Gegenprobe: dasselbe ohne Sperre und ohne atomare Instruktion.
+            st(arg, Z_ROHZ, ld(arg, Z_ROHZ) + 1)
+            i = i + 1
+        }
+        return RUNDEN
+    }
+    if art == 2 {
+        let k: u64 = ld(arg, Z_KANAL)
+        var i: u64 = 0
+        var s: u64 = 0
+        while i < KANALWERTE {
+            faden_kanal_senden(k, i + 1)
+            s = s + i + 1
+            i = i + 1
+        }
+        return s
+    }
+    if art == 3 {
+        return arg * 3
+    }
+    return 0
+}
+
+fn main() -> i32 {
+    if !faden_init() {
+        return 90
+    }
+    let z: u64 = seite()
+    if z == 0 {
+        return 91
+    }
+
+    // --- A/E: ein Faden, sein Ergebnis, sein Platz --------------------------
+    let h0: u64 = faden_starten(3, 14)
+    if h0 == 0 {
+        return 1
+    }
+    if faden_warten(h0) != 42 {
+        return 2
+    }
+    let h1: u64 = faden_starten(3, 15)
+    if h1 == 0 {
+        return 3
+    }
+    if faden_warten(h1) != 45 {
+        return 4
+    }
+    // Der Platz wurde wiederverwendet — sonst waere die Tafel nach 64
+    // Faeden erschoepft.
+    if h1 != h0 {
+        return 5
+    }
+    if faden_gestartet() != 2 {
+        return 6
+    }
+
+    // --- B/C: vier Faeden, drei Zaehler -------------------------------------
+    var h: [u64; 4] = [0; 4]
+    var i: u64 = 0
+    while i < 4 {
+        h[i as usize] = faden_starten(1, z)
+        if h[i as usize] == 0 {
+            return 10
+        }
+        i = i + 1
+    }
+    var summe: u64 = 0
+    i = 0
+    while i < 4 {
+        summe = summe + faden_warten(h[i as usize])
+        i = i + 1
+    }
+    if summe != 4 * RUNDEN {
+        return 11
+    }
+    if ld(z, Z_SPERRZ) != 4 * RUNDEN {
+        return 12
+    }
+    if ld(z, Z_ATOMZ) != 4 * RUNDEN {
+        return 13
+    }
+    // Die Gegenprobe MUSS verlieren. Tut sie das nicht, liefen die Faeden
+    // nicht wirklich gleichzeitig, und B belegt nichts.
+    if ld(z, Z_ROHZ) >= 4 * RUNDEN {
+        return 14
+    }
+
+    // --- D: der Kanal --------------------------------------------------------
+    let k: u64 = faden_kanal_neu(64)
+    if k == 0 {
+        return 20
+    }
+    st(z, Z_KANAL, k)
+    let hs: u64 = faden_starten(2, z)
+    if hs == 0 {
+        return 21
+    }
+    var empfangen: u64 = 0
+    var n: u64 = 0
+    while n < KANALWERTE {
+        empfangen = empfangen + faden_kanal_empfangen(k)
+        n = n + 1
+    }
+    let gesendet: u64 = faden_warten(hs)
+    if empfangen != gesendet {
+        return 22
+    }
+    if empfangen != KANALWERTE * (KANALWERTE + 1) / 2 {
+        return 23
+    }
+    if faden_kanal_belegt(k) != 0 {
+        return 24
+    }
+    faden_kanal_frei(k)
+
+    // --- Buchhaltung ---------------------------------------------------------
+    if faden_anzahl() != 1 {
+        return 30
+    }
+    if faden_mehrfaedig() != 1 {
+        return 31
+    }
+    if faden_tid() == 0 {
+        return 32
+    }
+    return 0
+}

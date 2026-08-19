@@ -630,6 +630,10 @@ impl<'a> Lower<'a> {
         span: Span,
     ) -> Option<Option<Val>> {
         // HOOK constant-time: select/barrier/secure_zero (ct.rs, SPEC §9.2/§9.3)
+        // HOOK faden: die drei Faden-Primitive (faden.rs, Runde 49)
+        if crate::faden::ist_faden_call(name) && !self.info.fns.contains_key(name) {
+            return crate::faden::lower_faden_call(self, name, args, span);
+        }
         // HOOK atomar: das atomare Primitiv (atomar.rs, Runde 47)
         if crate::atomar::is_atomar_call(name) && !self.info.fns.contains_key(name) {
             return crate::atomar::lower_atomar_call(self, name, args, span);
