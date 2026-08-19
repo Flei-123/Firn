@@ -29,7 +29,7 @@
 # Instruktionen), obwohl html5ever sie nicht braucht: das ist ein echter
 # Nachteil von Firns Aufbau und keine Unfairness des Messaufbaus.
 #
-# Aufruf:  bash tools/tokenizer/durchsatz.sh [tokenizer-binary] [laeufe]
+# Aufruf:  bash tools/tokenizer/throughput.sh [tokenizer-binary] [laeufe]
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 BIN="${1:-}"

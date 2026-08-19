@@ -176,7 +176,7 @@ mit Instruktionszählung belegen, nie mit der Uhr.
 ## Strang B2 — der 30-Minuten-Dauerlauf MIT großer lebender Menge
 
 Nachgeholt mit `pause_big.fi` (120 000 lebende Knoten, Heap 13 MiB,
-1800 s). Rohdaten: `tools/gc_meas/dauer30_gross.tsv`.
+1800 s). Rohdaten: `tools/gc_meas/duration30_big.tsv`.
 
 - 23 840 Sammelläufe, 202 453 000 Zyklen, 3 übersehene Mehrfach-Sammlungen
 - RSS über die ganze Zeit 12,9–13,9 MiB, Ende 12,89 MiB — **kein Drift**,

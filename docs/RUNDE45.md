@@ -345,7 +345,7 @@ Hilfsbinärdateien (`.firnc1`, `.astdump`, …).
 |---|---|---|
 | `bash ./test.sh` | 673/673 | **690/690** |
 | `tools/self_compare.sh` | 196 gleich / 0 abweichend / 0 fehlerhaft | **199 / 0 / 0** |
-| `tools/fixpunkt.sh` | Stufe 2 == Stufe 3, 309 468 Zeilen | **Stufe 2 == Stufe 3, 315 088 Zeilen** |
+| `tools/fixpoint.sh` | Stufe 2 == Stufe 3, 309 468 Zeilen | **Stufe 2 == Stufe 3, 315 088 Zeilen** |
 | Parser (`parser_compare.sh`) | 236 gleich, 1 bekannt ungleich | 248 gleich, 1 bekannt ungleich |
 | Layout/ABI (`types_compare.sh`) | 186 gleich, 0 ungleich | 198 gleich, 0 ungleich |
 | Typprüfer (`sema_compare.sh`) | 145 gleich, 1 bekannt | 146 gleich, 1 bekannt |

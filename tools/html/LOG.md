@@ -1,7 +1,7 @@
 # Auftragsprotokoll des Baumaufbau-Treibers
 
 Vertrag zwischen `lib/browser/parse_main.fi` (Firn) und
-`tools/html/harness_baum.py` bzw. `tools/html/realweb.py` (Werkbank). Wer eine
+`tools/html/harness_tree.py` bzw. `tools/html/realweb.py` (Werkbank). Wer eine
 Seite ändert, ändert die andere mit — sonst nichts.
 
 ## Eingabe (stdin, binär, little-endian)

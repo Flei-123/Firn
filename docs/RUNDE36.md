@@ -49,7 +49,7 @@ Commit 6ef2616.
 |---|---|---|
 | tools/self_compare.sh | 180 gleich | **185 gleich, 0 abw., 0 fehlerhaft, NICHT KERN 0** |
 | test.sh | 637/637 | **640/640** |
-| tools/fixpunkt.sh | 279201 Zeilen | **284207 Zeilen, zeichengleich** |
+| tools/fixpoint.sh | 279201 Zeilen | **284207 Zeilen, zeichengleich** |
 
 ## Grenzen (ehrlich benannt)
 

@@ -2,7 +2,7 @@
 
 Am **14.08.2026** mit `curl -sSL` geholt und **unveraendert** abgelegt (kein
 Umformatieren, kein Kuerzen, keine Ersetzungen). Sie dienen ausschliesslich der
-Durchsatzmessung (`tools/tokenizer/durchsatz.sh`, Korpus `realweb`) — sie sind
+Durchsatzmessung (`tools/tokenizer/throughput.sh`, Korpus `realweb`) — sie sind
 keine Testdaten fuer die Quote und beeinflussen die html5lib-Bilanz nicht.
 
 Warum es diesen zweiten Korpus gibt: der Korpus aus den html5lib-Eingaben ist

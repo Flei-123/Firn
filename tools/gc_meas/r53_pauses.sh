@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tools/gc_meas/r53_pausen.sh — Pausenmessung der Runde 53.
+# tools/gc_meas/r53_pauses.sh — Pausenmessung der Runde 53.
 #
 # FRAGE: Sind die Pausen durch die Sammlungen schlechter geworden? Stand nach
 # R44/R47: laengste Unterbrechung 0,45 ms bzw. 460 us (Rechenzeit, Median aus

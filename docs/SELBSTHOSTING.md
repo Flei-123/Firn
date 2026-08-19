@@ -4,7 +4,7 @@
 **Stand (Runde 31): der Fixpunkt steht.** `firnc1` — der Compiler, geschrieben
 in Firn — übersetzt **sich selbst**, und das Ergebnis ist ein Fixpunkt:
 Stufe 2 (von `firnc1` erzeugt) und Stufe 3 (von Stufe 2 erzeugt) sind
-**zeichengleich**. Nachweis: `tools/fixpunkt.sh`, Abschnitt 17 von `test.sh`.
+**zeichengleich**. Nachweis: `tools/fixpoint.sh`, Abschnitt 17 von `test.sh`.
 Der Verlauf dorthin steht unten, Runde für Runde, mit Messwerten statt
 Behauptungen — §21 ist der Schlussstein.
 
@@ -67,7 +67,7 @@ Sortiert nach „blockiert am meisten zuerst". `[ ]` = fehlt,
 | 8 | **Methoden / `impl`** | `[ ]` | Kosmetik, ersetzbar durch freie Funktionen mit erstem Parameter |
 | 9 | **Schnittstellen / dynamischer Versand** | `[ ]` | Für Stufe 1 **nicht** nötig |
 | 10 | **Fehlerbehandlung** (`Result`, `?`) | `[ ]` | Ersetzbar durch Summentyp + `match`, sobald 6 steht |
-| 11 | **Prozessstart** (`fork`/`execve`-Hülle) | **`[x]`** seit Runde 28 (`rt.lauf`, `tests/700_prozessstart.fi`) | `firnc` ruft `as` und `ld` auf |
+| 11 | **Prozessstart** (`fork`/`execve`-Hülle) | **`[x]`** seit Runde 28 (`rt.lauf`, `tests/700_process_start.fi`) | `firnc` ruft `as` und `ld` auf |
 | 12 | **Dateizugriff** (`open`/`read`/`write`) | **`[x]`** `lies_datei`, `lies_stdin`, `schreib_alles` in `lib/rt/` | Quelle lesen, `.s` schreiben |
 | 13 | **Veränderliche globale Zustände** | `[ ]` (nur `const`) | Umgehbar: Kontext-Struct durchreichen — der Rust-Code tut das schon fast überall |
 | 14 | **Aggregate an Funktionsgrenzen** | `[x]` seit Runde 2 | Strukturen als Parameter/Rückgabe |
@@ -399,7 +399,7 @@ Tests gerutscht.
   Zeichen. Der Firn-Lexer arbeitet auf Oktetten und zählt eine Spalte nur beim
   **führenden** Oktett eines UTF-8-Zeichens. Ohne das verschieben sich alle
   Spalten hinter einem Umlaut in derselben Zeile — und genau das prüft der
-  Vergleich mit, weil `tests/570_zeichenkettenliterale.fi` Umlaute enthält.
+  Vergleich mit, weil `tests/570_string_literals.fi` Umlaute enthält.
 * **Worttafeln statt globaler Zustand.** Firn hat keine veränderlichen
   globalen Zustände (Punkt 13). Die Schlüsselwort- und Namenstabellen entstehen
   deshalb aus **einem** Literal, das an `|` zerlegt wird.
@@ -1144,7 +1144,7 @@ if kind == 0 {
 
 Kommt `execve` zurück, ist es **fehlgeschlagen** — und dann läuft das Kind im
 Programm des Elternteils weiter. Ohne das `beende` würde bei einem fehlenden
-`as` der ganze Compiler ein zweites Mal ablaufen. `tests/700_prozessstart.fi`
+`as` der ganze Compiler ein zweites Mal ablaufen. `tests/700_process_start.fi`
 prüft genau diesen Fall mit einem Pfad, den es nicht gibt.
 
 Dazu kam `rt.schreib_datei` (`open` mit `O_WRONLY|O_CREAT|O_TRUNC`, Rechte
@@ -1841,7 +1841,7 @@ gebraucht; das Profil zeigte den Aufwand woanders.
 
 Instruktionen realweb **1.297.226.150 -> 957.989.680 (-26,15 %)**, html5lib
 -13,39 %. Selbst nachgemessen auf dem Merge-Stand mit
-`tools/tokenizer/durchsatz.sh`: **realweb 1,54x** (Ziel <= 2,00x erreicht),
+`tools/tokenizer/throughput.sh`: **realweb 1,54x** (Ziel <= 2,00x erreicht),
 **html5lib 0,95x** — auf den Grenzfaellen ist der Firn-Tokenizer damit
 schneller als html5ever. Durchsatz realweb 29,25 MB/s.
 

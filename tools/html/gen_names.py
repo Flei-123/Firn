@@ -7,7 +7,7 @@ Reihenfolge fest ist, ist die Atomkennung jedes bekannten Namens eine
 Uebersetzungszeitkonstante (`M_DIV`, `M_TABLE`, …) — der Baumaufbau vergleicht
 dann `u32` gegen `u32` statt Zeichen gegen Zeichen.
 
-Aufruf:  python3 tools/html/gen_namen.py
+Aufruf:  python3 tools/html/gen_names.py
 """
 
 import os
@@ -57,7 +57,7 @@ NAMEN = [
     "ruby",
 ]
 
-KOPF = '''// lib/browser/tag.fi — ERZEUGT von tools/html/gen_namen.py.
+KOPF = '''// lib/browser/tag.fi — ERZEUGT von tools/html/gen_names.py.
 // NICHT VON HAND AENDERN. Quelle der Reihenfolge ist das Skript.
 //
 // Die feste Namenstabelle des Baumaufbaus: {n} Namen, deren Atomkennung
@@ -96,7 +96,7 @@ def main():
     out.append(
         "// Die Namen, durch ein Leerzeichen getrennt. `namen_init` zerlegt sie.\n"
         "// Ein Zeichenkettenliteral hat in Firn den Typ `[u8; N]` (SPEC §8,\n"
-        "// tests/570_zeichenkettenliterale.fi), deshalb steht die Laenge hier\n"
+        "// tests/570_string_literals.fi), deshalb steht die Laenge hier\n"
         "// ausgeschrieben — das Skript rechnet sie aus.\n"
         "#[no_gc]\n"
         "fn tab_bytes(out: *mut mem.Buf) {\n"

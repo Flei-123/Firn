@@ -135,7 +135,7 @@ GESAMT                           6807 /   6810    99.96 %
 ```
 
 Die XML-Anpassung (`xmlViolationTests`) ist ein optionaler Modus des Treibers
-(Auftragsflagge Bit 0, `tools/tokenizer/PROTOKOLL.md`); der Harness setzt sie
+(Auftragsflagge Bit 0, `tools/tokenizer/LOG.md`); der Harness setzt sie
 nur für die vier Fälle aus `xmlViolation.test`, der HTML-Pfad bleibt gleich.
 
 Die Messlatte html5ever muss dafür einmal gebaut werden (eigenes Cargo-Projekt,
@@ -153,7 +153,7 @@ Einzelne Nachweise:
 |---|---|---|
 | **Tokenizer ist Firn** | `wc -l lib/html/*.fi tools/tokenizer/harness.py` | 8.647 Zeilen `.fi` gegen 295 Zeilen Harness; die Zustandsmaschine steht in `lib/html/tokenizer.fi` (1.516 Zeilen) |
 | **Sprungtabelle über 73 Zustände** | `firnc --emit=asm -o /tmp/tok.s lib/html/tokenize_main.fi && grep -c "jmp qword ptr" /tmp/tok.s` | `1` — indirekter Sprung über `.Ltbl_tokenizer__tokenize_0` |
-| **Zeichenreferenzen einzeln** | `python3 tools/tokenizer/pruefe_entities.py` | `bestanden: 4657 / 4657` |
+| **Zeichenreferenzen einzeln** | `python3 tools/tokenizer/check_entities.py` | `bestanden: 4657 / 4657` |
 | **Fehlerunion: `catch` liefert Ersatz** | `firnc -o /tmp/e tests/403_catch_replacement.fi && /tmp/e; echo $?` | `0` |
 | **Fehlerunion: `try` reicht durch** | `firnc -o /tmp/e tests/401_try_chain.fi && /tmp/e; echo $?` | der in Zeile 1 als `// expect_exit:` eingetragene Wert |
 | **Verworfenes `!T` ist ein Fehler** | `firnc -o /tmp/e tests/neg/err_discarded.fi` | `error: das ergebnis darf nicht verworfen werden: der typ 'E!i32' ist mit #[must_consume] gekennzeichnet` mit Zeile:Spalte |

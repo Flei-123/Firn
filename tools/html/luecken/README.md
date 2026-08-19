@@ -5,7 +5,7 @@ DIESE FAELLE SCHLAGEN FEHL — MIT ABSICHT.
 Sie halten fest, was die Baumkonstruktion aus Runde 54 NICHT kann. Die
 erwarteten Baeume sind die RICHTIGEN (aus dem WHATWG-Standard, gegen
 html5lib 1.1 geprueft). Der Laeufer faehrt sie getrennt von der Hauptquote
-(tools/html/harness_baum.py --luecken) und weist sie eigens aus.
+(tools/html/harness_tree.py --luecken) und weist sie eigens aus.
 
 Warum ueberhaupt: eine Testsuite, die nur enthaelt, was schon geht, sagt
 nichts ueber das, was fehlt. Diese Datei ist die Gegenrechnung.
@@ -19,7 +19,7 @@ Integrationspunkte, Ausbruchtags).
 Die erwarteten Baeume in `bekannte_luecken.dat` sind die RICHTIGEN (aus dem
 WHATWG-Standard). Der Laeufer faehrt sie getrennt von der Hauptquote:
 
-    python3 tools/html/harness_baum.py <binary> --luecken
+    python3 tools/html/harness_tree.py <binary> --luecken
 
 Sie werden eigens ausgewiesen und gehen NICHT in die Quote von
 `tools/html/cases/` ein. Eine Testsuite, die nur enthaelt, was schon geht,

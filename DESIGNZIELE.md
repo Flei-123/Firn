@@ -590,7 +590,7 @@ kein Gefühl — und es wird als Test gefahren (`gdb`-Sitzung, Werte vergleichen
 * **Erwartungsdämpfer:** `--dev-fast` wird nicht Release-Geschwindigkeit
   erreichen. Ziel war Faktor **2–3× langsamer als Release**, nicht 30×.
 
-**Gemessen am 14.08.2026** (`bash tools/baustufen/run.sh 3`, Median über die
+**Gemessen am 14.08.2026** (`bash tools/build_stages/run.sh 3`, Median über die
 sechs Mikrobenchmarks, AMD EPYC 7571):
 
 | Benchmark | `dev` | `dev-fast` | `release-fast` | dev-fast/rel | dev/rel |
