@@ -254,9 +254,6 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     if input.is_none() && paket.is_none() && paket_info.is_none() {
         return Err(format!("keine Eingabedatei angegeben (.{})", config::FILE_EXT));
     }
-    if input.is_some() && paket.is_some() {
-        return Err("--paket und eine Eingabedatei schliessen einander aus".to_string());
-    }
     Ok(Options { input, output, paket, paket_info, emit, optimize, keep_asm, stats, optcfg })
 }
 
@@ -278,6 +275,13 @@ fn main() {
 }
 
 fn run(opts: &Options) -> i32 {
+    // Der Satz steht hier und nicht in `parse_args`, weil `firnc1` ihn
+    // ZEICHENGLEICH schreiben muss und dort keine `--help`-Nachbemerkung
+    // hat (Runde 48).
+    if opts.paket.is_some() && opts.input.is_some() {
+        eprint!("error: --paket und eine eingabedatei schliessen einander aus\n");
+        return 2;
+    }
     // --- `--paket-info`: Manifest lesen, pruefen, berichten (Runde 48) ---
     if let Some(verz) = &opts.paket_info {
         match paketwelt::Welt::ab_wurzel(verz) {
