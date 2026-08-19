@@ -46,8 +46,8 @@
 //! ## 2. MMIO
 //!
 //! ```firn
-//! __mmio_schreiben8(p, 65 as u8)
-//! let z: u32 = __mmio_lesen32(p)
+//! __mmio_write8(p, 65 as u8)
+//! let z: u32 = __mmio_read32(p)
 //! ```
 //!
 //! Acht eingebaute Namen (`8|16|32|64` × `lesen|schreiben`). Sie werden zu
@@ -81,16 +81,16 @@ const P_ASM: &str = "asm$";
 
 /// Die acht MMIO-Namen. Reihenfolge = Breite 8/16/32/64.
 pub(crate) const MMIO_LESEN: [&str; 4] = [
-    "__mmio_lesen8",
-    "__mmio_lesen16",
-    "__mmio_lesen32",
-    "__mmio_lesen64",
+    "__mmio_read8",
+    "__mmio_read16",
+    "__mmio_read32",
+    "__mmio_read64",
 ];
 pub(crate) const MMIO_SCHREIBEN: [&str; 4] = [
-    "__mmio_schreiben8",
-    "__mmio_schreiben16",
-    "__mmio_schreiben32",
-    "__mmio_schreiben64",
+    "__mmio_write8",
+    "__mmio_write16",
+    "__mmio_write32",
+    "__mmio_write64",
 ];
 
 /// Breitenindex 0..3 eines MMIO-Namens, oder `None`.
@@ -456,7 +456,7 @@ fn check_mmio_read(
                 name,
                 args.len()
             ),
-            "die form ist __mmio_lesen<breite>(p: *mut T) -> T",
+            "die form ist __mmio_read<breite>(p: *mut T) -> T",
         );
         return Type::Error;
     }
@@ -494,7 +494,7 @@ fn check_mmio_write(
                 name,
                 args.len()
             ),
-            "die form ist __mmio_schreiben<breite>(p: *mut T, wert: T)",
+            "die form ist __mmio_write<breite>(p: *mut T, wert: T)",
         );
         return Type::Error;
     }
@@ -800,7 +800,7 @@ mod tests {
     #[test]
     fn mmio_accesses_become_not_merged() {
         let (asm, _) = build(
-            "profile kernel\nfn f(p: *mut u32) -> u32 { let a: u32 = __mmio_lesen32(p)\n let b: u32 = __mmio_lesen32(p)\n return a + b }\n",
+            "profile kernel\nfn f(p: *mut u32) -> u32 { let a: u32 = __mmio_read32(p)\n let b: u32 = __mmio_read32(p)\n return a + b }\n",
         );
         assert_eq!(
             asm.matches("dword ptr [rcx]").count(),

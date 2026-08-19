@@ -2679,7 +2679,7 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
             ra.store_dst(e, d, "rax");
         }
         Op::ThreadSelf => {
-            let d = i.dst.ok_or("interner Fehler: fadenselbst ohne Ziel")?;
+            let d = i.dst.ok_or("interner Fehler: threadself ohne Ziel")?;
             crate::thread::self_sequence(e);
             ra.store_dst(e, d, "rax");
         }

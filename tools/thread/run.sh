@@ -4,12 +4,12 @@
 #
 # WAS HIER BELEGT WIRD UND WARUM GERADE DAS:
 #
-#   1. `__faden_starten` erzeugt wirklich einen `clone(2)` mit den vereinbarten
+#   1. `__thread_start` erzeugt wirklich einen `clone(2)` mit den vereinbarten
 #      Merkern und beendet das Kind mit `exit(2)` — NICHT mit `exit_group(2)`.
 #      Der Unterschied ist der zwischen „ein Faden endet" und „der Prozess
 #      endet"; im Assembler steht er als `mov eax, 60` gegen `mov eax, 231`.
-#   2. `__atomar_tauschen` wird zu genau EINER Instruktion mit `lock`-Praefix.
-#   3. `__faden_selbst` liest die Fadenbasis (`fs:0`) — ohne Systemaufruf.
+#   2. `__atomic_swap` wird zu genau EINER Instruktion mit `lock`-Praefix.
+#   3. `__thread_self` liest die Fadenbasis (`fs:0`) — ohne Systemaufruf.
 #   4. Gegenprobe: gewoehnlicher Code erzeugt nichts davon. Ohne sie waere
 #      der Nachweis wertlos, weil er alles bestehen liesse.
 #   5. Alles in DREI Baustufen und in BEIDEN Compilern, und die FIR beider
@@ -34,11 +34,11 @@ cat > "$W/prim.fi" <<'EOF'
 fn main() -> i32 {
     var z: u64 = 5
     var t: u64 = 0
-    let alt: u64 = __atomar_tauschen(&z, 5, 9)
-    let alt2: u64 = __atomar_tauschen(&z, 5, 11)
-    let s: *mut u8 = __faden_selbst()
+    let alt: u64 = __atomic_swap(&z, 5, 9)
+    let alt2: u64 = __atomic_swap(&z, 5, 11)
+    let s: *mut u8 = __thread_self()
     let tp: *mut u8 = (&t) as *mut u8
-    let r: i64 = __faden_starten(1, 2, tp)
+    let r: i64 = __thread_start(1, 2, tp)
     if alt != 5 {
         return 1
     }
@@ -95,7 +95,7 @@ for stufe in "release-fast:" "no-opt:--no-opt" "dev-fast:--opt-level=dev-fast"; 
     if grep -q 'mov eax, 231' "$W/main_$name.s"; then
         melde "firnc0/$name: 'exit_group' in der Faden-Folge — ein endender Faden naehme den Prozess mit"
     fi
-    grep -q 'call _F0.__faden_einstieg' "$W/main_$name.s" || melde "firnc0/$name: das Kind ruft den Einstieg nicht"
+    grep -q 'call _F0.__thread_entry' "$W/main_$name.s" || melde "firnc0/$name: das Kind ruft den Einstieg nicht"
     # Das Probeprogramm wird NICHT ausgefuehrt: es startet einen Faden ohne
     # angemeldeten Fadenblock. Dass die Instruktionen auch das Richtige tun,
     # zeigt der Kurzlauf in Abschnitt 6.
@@ -157,7 +157,7 @@ if [ -x "$FDUMP" ]; then
         diff "$W/m0.txt" "$W/m1.txt" | head -10
     fi
     grep -q 'atomcas.u64' "$W/m0.txt" || melde "FIR-Text ohne 'atomcas.u64'"
-    grep -q 'fadenselbst.ptr' "$W/m0.txt" || melde "FIR-Text ohne 'fadenselbst.ptr'"
+    grep -q 'threadself.ptr' "$W/m0.txt" || melde "FIR-Text ohne 'threadself.ptr'"
     grep -q 'spawn.i64' "$W/m0.txt" || melde "FIR-Text ohne 'spawn.i64'"
 fi
 
@@ -180,13 +180,13 @@ fn seite() -> u64 {
 fn ld(a: u64, o: u64) -> u64 { return *((a + o) as *mut u64) }
 fn st(a: u64, o: u64, v: u64) { *((a + o) as *mut u64) = v }
 
-fn __faden_arbeit(art: u64, arg: u64) -> u64 {
+fn __thread_work(art: u64, arg: u64) -> u64 {
     let _u: u64 = art
     var i: u64 = 0
     while i < L_RUNDEN {
-        faden_sperren((arg + L_MUTEX) as *mut u64)
+        thread_lock((arg + L_MUTEX) as *mut u64)
         st(arg, L_MIT, ld(arg, L_MIT) + 1)
-        faden_entsperren((arg + L_MUTEX) as *mut u64)
+        thread_unlock((arg + L_MUTEX) as *mut u64)
         st(arg, L_OHNE, ld(arg, L_OHNE) + 1)
         i = i + 1
     }
@@ -194,7 +194,7 @@ fn __faden_arbeit(art: u64, arg: u64) -> u64 {
 }
 
 fn main() -> i32 {
-    if !faden_init() {
+    if !thread_init() {
         return 90
     }
     let z: u64 = seite()
@@ -204,7 +204,7 @@ fn main() -> i32 {
     var h: [u64; 4] = [0; 4]
     var i: u64 = 0
     while i < 4 {
-        h[i as usize] = faden_starten(1, z)
+        h[i as usize] = thread_start(1, z)
         if h[i as usize] == 0 {
             return 1
         }
@@ -212,7 +212,7 @@ fn main() -> i32 {
     }
     i = 0
     while i < 4 {
-        if faden_warten(h[i as usize]) != L_RUNDEN {
+        if thread_wait(h[i as usize]) != L_RUNDEN {
             return 2
         }
         i = i + 1
