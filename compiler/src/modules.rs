@@ -240,7 +240,10 @@ pub fn resolve(root: &Path, welt: &Welt) -> Result<Vec<SourceFile>, Fehler> {
     // HOOK gc: die Sammler-Laufzeit wird automatisch eingezogen, sobald
     // irgendwo ein `gc class` steht (gc.rs, SPEC 3.5) — kein `import`, keine
     // zusaetzliche Kommandozeilenoption.
+    // Runde 49: HIER wird die Laufzeit wirklich Teil des Programms — und nur
+    // dann muss der Zustandsblock im Assembler stehen (codegen_x86::emit).
     if let Some(f) = gc_laufzeit(&out) {
+        crate::gc::laufzeit_merken();
         out.push(f);
     }
     Ok(out)
