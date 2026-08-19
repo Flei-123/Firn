@@ -748,7 +748,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_written_alloca_stays_stand() {
+    fn multi_written_alloca_stays() {
         let mut f = Func::new("t", vec![], FTy::I32);
         let slot = f.alloca(4, 4);
         let c = f.push(0, FTy::I32, Op::Const(1));

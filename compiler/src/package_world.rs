@@ -242,7 +242,7 @@ impl World {
     pub fn package_of(&self, absolute_path: &str) -> Option<usize> {
         let mut hit: Option<usize> = None;
         for (i, p) in self.packages.iter().enumerate() {
-            if package::lies_in(absolute_path, &p.root) {
+            if package::read_within(absolute_path, &p.root) {
                 let better = match hit {
                     None => true,
                     Some(t) => p.root.len() > self.packages[t].root.len(),
@@ -308,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    fn error_texts_stand_fixed() {
+    fn error_texts_are_fixed() {
         assert_eq!(
             text_not_public("inner", "geo", "/p/geo/firn.package"),
             "error: modul 'inner' ist in paket 'geo' nicht oeffentlich\n\
