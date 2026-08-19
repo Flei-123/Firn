@@ -359,6 +359,20 @@ else
     tail -20 "$WORK/fixpunkt.log" | sed 's/^/   /'
 fi
 
+echo "== 20. Nebenlaeufigkeit: Faeden, Mutex, atomare Primitive (tools/faden/run.sh) =="
+# Runde 49. clone(2)/exit(2), `lock cmpxchg`, Fadenspeicher ueber `fs:0` —
+# in drei Baustufen und BEIDEN Compilern, mit Gegenproben, die anschlagen
+# muessen. Der Dauerlauf (tools/faden/stress.sh) laeuft nicht hier, sondern
+# einzeln: er braucht Minuten.
+bash tools/faden/run.sh > "$WORK/faden.log" 2>&1 && FDRC=0 || FDRC=$?
+if [ "$FDRC" -eq 0 ]; then
+    ok
+    tail -1 "$WORK/faden.log" | sed 's/^/   /'
+else
+    bad "tools/faden/run.sh schlug fehl (siehe .test-work/faden.log)"
+    grep FAIL "$WORK/faden.log" | head -10 | sed 's/^/   /'
+fi
+
 echo "== 19. Freistehend: profile kernel, Inline-Asm, MMIO, iretq (tools/freistehend/run.sh) =="
 # Runde 52. Das Kernel-Beispiel wird von BEIDEN Compilern zu einer
 # ELF-Objektdatei uebersetzt, die KEINEN undefinierten Namen hat, keinen
