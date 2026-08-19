@@ -1,30 +1,30 @@
-//! Constant-Time-Primitive (SPEC §9.2/§9.3) — `select`, `barrier`,
+//! Constant-time primitives (SPEC §9.2/§9.3) — `select`, `barrier`,
 //! `secure_zero`.
 //!
-//! Diese drei Primitive sind der Teil von SPEC §9, der OHNE den Typqualifizierer
-//! `secret[T]` schon heute etwas Handfestes tut und den der Codegenerator
-//! bereits kennt (`fir::Op::Select`, `Op::Barrier`, `Op::SecureZero`):
+//! These three primitives are the part of SPEC §9 that does something solid
+//! today WITHOUT the type qualifier `secret[T]`, and that the code generator
+//! already knows (`fir::Op::Select`, `Op::Barrier`, `Op::SecureZero`):
 //!
-//! * `select(bedingung, a, b)` — datenunabhaengige Auswahl, wird im Backend zu
-//!   `cmov`. Kein Durchgang darf daraus eine Verzweigung machen (SPEC §9.2);
-//!   `mem2reg` und `opt` behandeln `Op::Select` deshalb als unantastbar.
-//! * `barrier(x)` — undurchsichtige Sperre: liefert `x` unveraendert zurueck,
-//!   gilt aber fuer jeden Durchgang als undurchschaubar (kein CSE, keine
-//!   Konstantenfaltung ueber die Sperre hinweg).
-//! * `secure_zero(zeiger, anzahl)` — nullt `anzahl` Bytes ab `zeiger` und gilt
-//!   NIE als toter Code (SPEC §9.3, `C3`).
+//! * `select(cond, a, b)` — data independent choice, becomes `cmov` at the
+//!   backend. No pass may turn it into a branch (SPEC §9.2); `mem2reg` and
+//!   `opt` therefore treat `Op::Select` as untouchable.
+//! * `barrier(x)` — opaque barrier: hands `x` back unchanged, yet counts as
+//!   impenetrable for every pass (no CSE, no constant folding across the
+//!   barrier).
+//! * `secure_zero(ptr, count)` — zeroes `count` bytes from `ptr` onwards and
+//!   NEVER counts as dead code (SPEC §9.3, `C3`).
 //!
-//! **Bewusst noch nicht hier:** `secret[T]` als Typqualifizierer, die Ausbreitung
-//! der Markierung durch Ausdruecke, `declassify` und die Wirkung von
-//! `#[constant_time]`. Solange es keine `secret`-Werte gibt, ist die Pruefung im
-//! Codegenerator (`f.constant_time && f.is_secret(cond)`) zwar vorhanden, aber
-//! ohne Futter — deshalb bleibt `#[constant_time]` in `attrs.rs` weiter als
-//! *nicht umgesetzt* gefuehrt und meldet einen sauberen Fehler. Festgehalten in
+//! **Deliberately not here yet:** `secret[T]` as a type qualifier, the
+//! spreading of that marker through expressions, `declassify` and the effect
+//! of `#[constant_time]`. As long as no `secret` values exist, the check at
+//! the code generator (`f.constant_time && f.is_secret(cond)`) is present
+//! but unfed — which is why `attrs.rs` keeps `#[constant_time]` listed as
+//! *not implemented*, reporting a clean error. Recorded by
 //! SPEC §14.1.
 //!
-//! `barrier(inout x)`/`secure_zero(inout buf)` aus SPEC §9 brauchen `inout`,
-//! das es in Stufe 0 nicht gibt; die Stufe-0-Form nimmt den Wert bzw. einen
-//! Zeiger samt Laenge. Auch das steht in SPEC §14.1.
+//! `barrier(inout x)`/`secure_zero(inout buf)` from SPEC §9 need `inout`,
+//! which stage 0 lacks; the stage 0 form takes the value, respectively a
+//! pointer plus length. That too is written down at SPEC §14.1.
 
 use crate::ast::Expr;
 use crate::diag::Span;
@@ -33,26 +33,26 @@ use crate::lower::Lower;
 use crate::sema::Checker;
 use crate::types::Type;
 
-/// Namen der eingebauten Primitive.
+/// Names of the builtin primitives.
 pub(crate) const SELECT: &str = "select";
 pub(crate) const BARRIER: &str = "barrier";
 pub(crate) const SECURE_ZERO: &str = "secure_zero";
 
-/// Ist `name` der Name eines eingebauten Constant-Time-Primitivs?
+/// Does this spelling belong to a builtin constant-time primitive?
 pub(crate) fn is_ct_call(name: &str) -> bool {
     matches!(name, SELECT | BARRIER | SECURE_ZERO)
 }
 
-/// Darf an einem Wert dieses Typs `select`/`barrier` arbeiten?
-/// Nur skalare Typen: Ganzzahl, `bool`, Zeiger.
+/// May `select`/`barrier` work on a value of this type?
+/// Scalar types only: integer, `bool`, pointer.
 fn is_scalar(t: &Type) -> bool {
     t.is_concrete_int() || *t == Type::Bool || t.is_ptr()
 }
 
-// ------------------------------------------------------------------- Typphase
+// ----------------------------------------------------------------- Type phase
 
-/// Hook aus `sema::call`. Liefert `None`, wenn der Name kein Primitiv ist oder
-/// im Programm eine gleichnamige Funktion steht — die gewinnt dann.
+/// Hook from `sema::call`. Yields `None` if the spelling is no primitive or
+/// if the program holds a function of the same spelling — that one wins.
 pub(crate) fn hook_call(
     ck: &mut Checker,
     name: &str,
@@ -70,8 +70,8 @@ pub(crate) fn hook_call(
     })
 }
 
-/// Erwartete Argumentzahl pruefen; bei Abweichung werden die vorhandenen
-/// Argumente trotzdem durchgetypt, damit keine ExprId ohne Typ bleibt.
+/// Check the expected argument count; on a mismatch the arguments present
+/// still get typed, so that no ExprId is left without a type.
 fn digit_count(ck: &mut Checker, name: &str, args: &[Expr], should: usize, nspan: Span) -> bool {
     if args.len() == should {
         return true;
@@ -191,9 +191,9 @@ fn check_secure_zero(ck: &mut Checker, args: &[Expr], nspan: Span, _espan: Span)
     Type::Void
 }
 
-// ---------------------------------------------------------------- Lowerphase
+// ------------------------------------------------------------ Lowering phase
 
-/// Hook aus `lower::lower_call`. Erzeugt die FIR-Instruktion.
+/// Hook from `lower::lower_call`. Produces the FIR instruction.
 pub(crate) fn lower_ct_call(
     lw: &mut Lower,
     name: &str,
@@ -232,8 +232,8 @@ pub(crate) fn lower_ct_call(
     }
 }
 
-/// Die Byteanzahl von `secure_zero` wird als `u64` gebraucht; schmalere
-/// Ganzzahlen werden erweitert (vorzeichenrichtig nach Quelltyp).
+/// The byte count of `secure_zero` is needed as `u64`; narrower integers
+/// get widened (sign correct per source type).
 fn align(lw: &mut Lower, arg: &Expr, v: Val) -> Option<Val> {
     let from = lw.fty_of(arg)?;
     if from == FTy::U64 || from == FTy::I64 {
@@ -244,8 +244,8 @@ fn align(lw: &mut Lower, arg: &Expr, v: Val) -> Option<Val> {
 
 #[cfg(test)]
 mod tests {
-    /// Uebersetzt Quelltext bis zum Assembler — genau der Weg, den `firnc`
-    /// nimmt (mit Optimierer).
+    /// Compiles source text down to the assembler — exactly the path `firnc`
+    /// takes (with the optimizer).
     fn asm_of(src: &str) -> String {
         let mut dg = crate::diag::Diags::new("ct_test", src);
         let toks = crate::lexer::lex(src, &mut dg);
@@ -258,8 +258,8 @@ mod tests {
         crate::codegen_x86::emit(&m).expect("codegen")
     }
 
-    /// NACHWEIS (SPEC §9.2): `select` wird ein `cmov` — und in der Funktion,
-    /// die nur aus dem `select` besteht, entsteht KEIN bedingter Sprung.
+    /// PROOF (SPEC §9.2): `select` becomes a `cmov` — and the function built
+    /// from nothing but that `select` grows NO conditional jump.
     #[test]
     fn select_becomes_cmov_and_never_in_jump() {
         let asm = asm_of(
@@ -280,9 +280,9 @@ mod tests {
         }
     }
 
-    /// NACHWEIS (SPEC §9.3, `C3`): `secure_zero` bleibt stehen, obwohl der
-    /// Puffer danach nie wieder gelesen wird — der Optimierer darf es nicht
-    /// als toten Speicherzugriff entfernen.
+    /// PROOF (SPEC §9.3, `C3`): `secure_zero` stays, although the buffer never
+    /// gets read afterwards — the optimizer may not drop it as a dead memory
+    /// access.
     #[test]
     fn secure_zero_survives_the_optimizer() {
         let asm = asm_of(
@@ -295,8 +295,8 @@ mod tests {
         assert!(asm.contains("rep stosb"), "secure_zero removed:\n{}", asm);
     }
 
-    /// NACHWEIS (SPEC §9.2): `barrier` ueberlebt die Konstantenfaltung — der
-    /// Wert wird NICHT durch die Konstante ersetzt.
+    /// PROOF (SPEC §9.2): `barrier` survives constant folding — the value does
+    /// NOT get replaced by the constant.
     #[test]
     fn barrier_stays_opaque() {
         let asm = asm_of("fn main() -> i32 { let a: i32 = barrier(7 as i32)\n return a }\n");
@@ -308,9 +308,9 @@ mod tests {
         );
     }
 
-    /// Eine eigene Funktion mit dem Namen eines Primitivs gewinnt — sonst
-    /// koennte ein Programm durch das neue Primitiv still die Bedeutung
-    /// wechseln.
+    /// A function of your own that is spelled like a primitive wins —
+    /// otherwise the new primitive could silently change the meaning of a
+    /// program.
     #[test]
     fn own_func_shadowed_the_primitive() {
         let asm = asm_of(

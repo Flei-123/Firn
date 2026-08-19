@@ -1,15 +1,15 @@
-//! Lowering der Fehlerunionen `E!T` nach FIR (Modul `fehlerunionen`, SPEC §5.1).
+//! Lowering of the error unions `E!T` to FIR (module `fehlerunionen`, SPEC §5.1).
 //!
-//! Eine Fehlerunion ist ein gewoehnlicher Struct (`errors.rs`):
-//! `{ __err: u32, __val: T }`, `__err == 0` heisst Erfolg. Damit braucht es
-//! hier keine neue FIR-Instruktion — nur `load`/`store`, einen Vergleich und
-//! eine Verzweigung.
+//! One error union is a plain struct (`errors.rs`):
+//! `{ __err: u32, __val: T }`, `__err == 0` means success. So no new FIR
+//! instruction is needed here — just `load`/`store`, one comparison and one
+//! branch.
 //!
-//! Erzeugt wird:
+//! What gets produced:
 //!  * `IoError::NotFound` — `store __err = code`
-//!  * implizite Umwandlung bei `return`/`let`/Zuweisung — `__err = 0` und der
-//!    Wert bzw. `__err = code`
-//!  * `try a` — `if a.__err != 0 { return fehler(a.__err) }`, sonst `a.__val`
+//!  * implicit conversion at `return`/`let`/assignment — `__err = 0` plus the
+//!    value, respectively `__err = code`
+//!  * `try a` — `if a.__err != 0 { return error(a.__err) }`, else `a.__val`
 //!  * `a catch b` — `if a.__err == 0 { a.__val } else { b }`
 
 use std::cell::RefCell;
@@ -24,17 +24,17 @@ use crate::fir::{CmpOp, FTy, Op, Term, Val};
 use crate::lower::Lower;
 use crate::types::Type;
 
-/// Welche Art Fehlerunions-Ausdruck ist das?
+/// Which sort of error union expression is this?
 enum Kind {
     Try,
     Catch,
-    /// `Fehlermenge::Variante`
+    /// `ErrorSet::Variant`
     Ctor(i128),
 }
 
 thread_local! {
-    /// Ausdruecke, deren implizite Umwandlung gerade erzeugt wird. Verhindert,
-    /// dass der Zugriff auf den Rohwert erneut in die Umwandlung laeuft.
+    /// Expressions whose implicit conversion is being produced right now. Keeps
+    /// the access to the raw value from running into the conversion again.
     static BUSY: RefCell<HashSet<ExprId>> = RefCell::new(HashSet::new());
 }
 
@@ -80,7 +80,7 @@ fn is_agg(t: &Type) -> bool {
 
 // -------------------------------------------------------------------- Hooks
 
-/// `// HOOK fehlerunionen` in `lower::lower_addr_inner`.
+/// `// HOOK fehlerunionen` within `lower::lower_addr_inner`.
 pub(crate) fn hook_addr(lo: &mut Lower, e: &Expr) -> Option<Option<Val>> {
     if let Some(c) = pending_coerce(e) {
         let (size, align) = (c.union.size.max(1), c.union.align.max(1));
@@ -98,7 +98,7 @@ pub(crate) fn hook_addr(lo: &mut Lower, e: &Expr) -> Option<Option<Val>> {
     })
 }
 
-/// `// HOOK fehlerunionen` in `lower::write_into_inner`.
+/// `// HOOK fehlerunionen` within `lower::write_into_inner`.
 pub(crate) fn hook_write_into(lo: &mut Lower, addr: Val, e: &Expr) -> Option<Option<()>> {
     if let Some(c) = pending_coerce(e) {
         return Some(write_union(lo, addr, e, &c));
@@ -121,12 +121,12 @@ pub(crate) fn hook_write_into(lo: &mut Lower, addr: Val, e: &Expr) -> Option<Opt
     })
 }
 
-/// `// HOOK fehlerunionen` in `lower::lower_expr_inner` (skalares Ergebnis).
+/// `// HOOK fehlerunionen` within `lower::lower_expr_inner` (scalar result).
 pub(crate) fn hook_value(lo: &mut Lower, e: &Expr) -> Option<Option<Val>> {
     let k = kind_of(e)?;
     let t = lo.ty_of(e);
     if is_agg(&t) {
-        return None; // Aggregate laufen ueber `hook_addr`
+        return None; // aggregates run through `hook_addr`
     }
     let addr = match k {
         Kind::Try => try_value_addr(lo, e),
@@ -142,7 +142,7 @@ pub(crate) fn hook_value(lo: &mut Lower, e: &Expr) -> Option<Option<Val>> {
     })
 }
 
-/// `// HOOK fehlerunionen` in `lower::lower_expr_stmt`.
+/// `// HOOK fehlerunionen` within `lower::lower_expr_stmt`.
 pub(crate) fn hook_stmt(lo: &mut Lower, e: &Expr) -> Option<Option<()>> {
     let k = kind_of(e)?;
     Some(match k {
@@ -158,14 +158,14 @@ pub(crate) fn hook_stmt(lo: &mut Lower, e: &Expr) -> Option<Option<()>> {
     })
 }
 
-/// `// HOOK fehlerunionen` in `lower::lower_stmt` (`return wert`).
-/// Liefert `None`, wenn keine implizite Umwandlung noetig ist.
+/// `// HOOK fehlerunionen` within `lower::lower_stmt` (`return value`).
+/// Yields `None` when no implicit conversion is needed.
 pub(crate) fn hook_return(lo: &mut Lower, v: &Expr) -> Option<Option<()>> {
     let c = pending_coerce(v)?;
     Some(do_return(lo, v, &c))
 }
 
-/// `// HOOK fehlerunionen` in `lower::lower_stmt` (`let x: E!T = wert`).
+/// `// HOOK fehlerunionen` within `lower::lower_stmt` (`let x: E!T = value`).
 pub(crate) fn hook_let(lo: &mut Lower, name: &str, init: &Expr) -> Option<Option<()>> {
     let c = pending_coerce(init)?;
     let (size, align) = (c.union.size.max(1), c.union.align.max(1));
@@ -179,15 +179,15 @@ pub(crate) fn hook_let(lo: &mut Lower, name: &str, init: &Expr) -> Option<Option
     })
 }
 
-/// `// HOOK fehlerunionen` in `lower::lower_call`: der Typ eines Arguments,
-/// das implizit in eine Fehlerunion umgewandelt wird — das Argument ueberquert
-/// die Aufrufgrenze als Aggregat (abi.rs), nicht als Erfolgswert.
+/// `// HOOK fehlerunionen` within `lower::lower_call`: the type of one
+/// argument converted implicitly into some error union — that argument
+/// crosses the call boundary like aggregates (abi.rs), not as success value.
 pub(crate) fn hook_arg_type(e: &Expr) -> Option<Type> {
     let c = pending_coerce(e)?;
     Some(Type::Struct(c.union.struct_idx))
 }
 
-/// `// HOOK fehlerunionen` in `lower::lower_binary`: `e == E::NotFound`.
+/// `// HOOK fehlerunionen` within `lower::lower_binary`: `e == E::NotFound`.
 pub(crate) fn hook_binary(
     lo: &mut Lower,
     op: crate::ast::BinOp,
@@ -216,9 +216,9 @@ fn cmp_codes(lo: &mut Lower, cmp: CmpOp, a: &Expr, b: &Expr) -> Option<Val> {
     ))
 }
 
-// ---------------------------------------------------------------- Bausteine
+// ---------------------------------------------------------- Building blocks
 
-/// Schreibt die Fehlerunion an `addr` — Erfolgswert oder Fehlercode.
+/// Writes the error union to `addr` — success value or error code.
 fn write_union(lo: &mut Lower, addr: Val, e: &Expr, c: &crate::errors::CoerceInfo) -> Option<()> {
     BUSY.with(|b| b.borrow_mut().insert(e.id));
     let r = write_union_inner(lo, addr, e, c);
@@ -238,7 +238,7 @@ fn write_union_inner(
         CoerceKind::FromValue => {
             let zero = lo.constant(FTy::U32, 0);
             lo.store(FTy::U32, addr, zero);
-            // Schicht Feldzugriff <-> Speicherort (layout.rs, DESIGNZIELE 8)
+            // Layer field access <-> storage location (layout.rs, DESIGNZIELE 8)
             let va = lo.field_addr_at(addr, c.union.val_off);
             lo.write_into(va, e)
         }
@@ -250,7 +250,7 @@ fn write_union_inner(
     }
 }
 
-/// Fehlercode eines Ausdrucks vom Typ einer Fehlermenge.
+/// Error code of one expression with the type of some error set.
 fn error_code(lo: &mut Lower, e: &Expr) -> Option<Val> {
     if let Some(Kind::Ctor(code)) = kind_of(e) {
         return Some(lo.constant(FTy::U32, code));
@@ -267,7 +267,7 @@ fn ctor_addr(lo: &mut Lower, e: &Expr, code: i128) -> Option<Val> {
     Some(slot)
 }
 
-/// Kopiert einen Wert vom Typ `t` von `src` nach `dst`.
+/// Copies a value of type `t` from `src` to `dst`.
 fn copy_value(lo: &mut Lower, dst: Val, src: Val, t: &Type) -> Option<()> {
     if is_agg(t) {
         let size = lo.size_align(t).0;
@@ -299,10 +299,10 @@ fn scalar_fty(t: &Type) -> Option<FTy> {
     })
 }
 
-/// `return` mit impliziter Umwandlung in die Fehlerunion der Funktion.
+/// `return` with implicit conversion into the error union of the function.
 fn do_return(lo: &mut Lower, v: &Expr, c: &crate::errors::CoerceInfo) -> Option<()> {
-    // `return E::Variante` ist der Fehlerpfad, `return wert` der Erfolgspfad —
-    // der Typpruefer hat das bereits entschieden (`CoerceKind`).
+    // `return E::Variant` is the error path, `return value` the success path —
+    // the type checker has decided that already (`CoerceKind`).
     let error_path = matches!(c.kind, CoerceKind::FromError);
     match lo.sret {
         Some(dst) => {
@@ -314,9 +314,9 @@ fn do_return(lo: &mut Lower, v: &Expr, c: &crate::errors::CoerceInfo) -> Option<
             }
         }
         None => {
-            // Bis 8 Byte liegt die Fehlerunion in einem Wort in `rax`
-            // (abi.rs). Der Zwischenspeicher wird genullt, damit die
-            // Fuellbytes in jeder Baustufe denselben Wert haben.
+            // Up to 8 bytes the error union sits as one word within `rax`
+            // (abi.rs). The scratch slot gets zeroed, so that the
+            // padding bytes hold the same value at every build stage.
             let slot = lo.alloca(8, 8);
             let zero = lo.constant(FTy::I64, 0);
             lo.store(FTy::I64, slot, zero);
@@ -332,9 +332,9 @@ fn do_return(lo: &mut Lower, v: &Expr, c: &crate::errors::CoerceInfo) -> Option<
     Some(())
 }
 
-/// Verlaesst die Funktion mit dem Fehlercode `code` (`try`).
+/// Leaves the function carrying the error code `code` (`try`).
 fn return_error(lo: &mut Lower, code: Val) -> Option<()> {
-    // FEHLERPFAD: hier laufen auch die `errdefer`-Anweisungen.
+    // ERROR PATH: the `errdefer` statements run here as well.
     match lo.sret {
         Some(dst) => {
             lo.store(FTy::U32, dst, code);
@@ -352,8 +352,8 @@ fn return_error(lo: &mut Lower, code: Val) -> Option<()> {
     Some(())
 }
 
-/// `try a` — liefert die Adresse des Erfolgswertes; im Fehlerfall wird die
-/// Funktion mit demselben Code verlassen.
+/// `try a` — yields the address of the success value; on the error case the
+/// function gets left carrying the same code.
 fn try_value_addr(lo: &mut Lower, e: &Expr) -> Option<Val> {
     let ti = match try_of(e.id) {
         Some(t) => t,
@@ -376,11 +376,11 @@ fn try_value_addr(lo: &mut Lower, e: &Expr) -> Option<Val> {
     lo.cur = fail;
     return_error(lo, code)?;
     lo.cur = cont;
-    // Schicht Feldzugriff <-> Speicherort (layout.rs, DESIGNZIELE 8)
+    // Layer field access <-> storage location (layout.rs, DESIGNZIELE 8)
     Some(lo.field_addr_at(src, ti.inner.val_off))
 }
 
-/// `a catch b` — liefert die Adresse des Ergebnisses (Erfolgswert oder Ersatz).
+/// `a catch b` — yields the address of the result (success value or fallback).
 fn catch_slot(lo: &mut Lower, e: &Expr) -> Option<Val> {
     let ci = match catch_of(e.id) {
         Some(c) => c,
@@ -406,7 +406,7 @@ fn catch_slot(lo: &mut Lower, e: &Expr) -> Option<Val> {
     lo.set_term(Term::BrCond { cond: good, then_bb: ok_bb, else_bb: old_bb });
 
     lo.cur = ok_bb;
-    // Schicht Feldzugriff <-> Speicherort (layout.rs, DESIGNZIELE 8)
+    // Layer field access <-> storage location (layout.rs, DESIGNZIELE 8)
     let va = lo.field_addr_at(src, ci.inner.val_off);
     copy_value(lo, slot, va, &ci.inner.val_ty)?;
     if !lo.terminated() {
@@ -416,7 +416,7 @@ fn catch_slot(lo: &mut Lower, e: &Expr) -> Option<Val> {
     lo.cur = old_bb;
     let bind = catch_bind(e.id);
     if let Some(name) = &bind {
-        // `catch |e| …`: der Fehlerwert liegt im Ersatzausdruck als Variable
+        // `catch |e| …`: the error value shows up as a variable of the fallback
         lo.enter();
         let eslot = lo.alloca(4, 4);
         lo.store(FTy::U32, eslot, code);
