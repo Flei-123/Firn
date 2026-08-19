@@ -1,45 +1,45 @@
-//! Zwischenschicht zwischen **Feldzugriff** und **Speicherort**
-//! (`DESIGNZIELE.md` §8, Fundamentpunkt aus §10.4).
+//! Intermediate layer between **field access** and **storage location**
+//! (`DESIGNZIELE.md` §8, foundation point from §10.4).
 //!
-//! # Warum es dieses Modul gibt
+//! # Why this module exists
 //!
-//! Heute kennt Firn genau eine Anordnung: **Array von Strukturen** (AoS). Alle
-//! Felder eines Wertes liegen zusammenhaengend, die Adresse eines Feldes ist
-//! `Basis + Versatz`. Genau diese Gleichsetzung ist aber die Annahme, die
-//! **Struktur von Arrays** (SoA, geplanter `SoaVec[T]`) unmoeglich macht: dort
-//! existiert der zusammenhaengende Wert physisch gar nicht, jedes Feld hat sein
-//! eigenes Array, und die Adresse des Feldes `f` von Element `i` lautet
-//! `spalte_f + i * groesse(f)` — nicht `basis + versatz_f`.
+//! Today Firn knows exactly one arrangement: **array of structures** (AoS).
+//! All fields of a value sit contiguously, the address of a field is
+//! `base + offset`. That very equation, though, is the assumption that makes
+//! **structure of arrays** (SoA, the planned `SoaVec[T]`) impossible: there
+//! the contiguous value does not physically exist at all, every field has its
+//! own array, and the address of field `f` of element `i` reads
+//! `column_f + i * size(f)` — not `base + offset_f`.
 //!
-//! Solange `a.b` im ganzen Baum fest als „Basis plus Versatz" ausgeschrieben
-//! wird, ist SoA nicht nachruestbar, ohne jede Aufrufstelle anzufassen.
-//! Deshalb geht **jeder** Feld- und Elementzugriff des Lowerings durch die
-//! Funktionen dieses Moduls. Eine zweite Anordnung einzufuehren heisst dann:
-//! **hier** eine Fallunterscheidung ergaenzen.
+//! As long as `a.b` gets spelled out across the whole tree as "base plus
+//! offset", SoA cannot be retrofitted without touching every call site.
+//! That is why **every** field and element access of the lowering runs
+//! through the functions of this module. Adding a second arrangement then
+//! means: extend a case split **here**.
 //!
-//! # Architekturregel
+//! # Architecture rule
 //!
-//! Ausserhalb dieses Moduls berechnet im Lowering niemand `feld.offset` und
-//! niemand baut Elementadressen von Hand. `tools/schichten/run.sh` prueft das
-//! und ist Teil von `test.sh`.
+//! Outside this module nobody within the lowering computes `field.offset` and
+//! nobody builds element addresses by hand. `tools/schichten/run.sh` checks
+//! that and is part of `test.sh`.
 //!
-//! # Was hier (noch) NICHT steht
+//! # What is (still) NOT here
 //!
-//! Die SoA-Anordnung selbst. Sie braucht einen Sammlungstyp `SoaVec[T]`,
-//! Sichtwerte statt Zeiger und Generics — alles Phase 3/4 der ROADMAP. Dieses
-//! Modul ist die **Vorbedingung** dafuer, nicht die Umsetzung.
+//! The SoA arrangement itself. It needs a collection type `SoaVec[T]`, view
+//! values rather than pointers, and generics — all of that is phase 3/4 of
+//! the ROADMAP. This module is the **precondition** for it, not the work.
 
 use crate::diag::Span;
 use crate::fir::{BinOp as FBin, FTy, Op, Val};
 use crate::lower::Lower;
 
 impl Lower<'_> {
-    /// Adresse des Feldes `fname` der Struktur `sidx`, deren Wert an `base`
-    /// liegt.
+    /// Address of field `fname` of structure `sidx`, whose value sits at
+    /// `base`.
     ///
-    /// **Einziger** Weg, an eine Feldadresse zu kommen. Bei AoS ist das
-    /// `base + versatz`; bei SoA wuerde hier stattdessen die Spaltenadresse
-    /// berechnet.
+    /// **The only** way to get at a field address. Under AoS that is
+    /// `base + offset`; under SoA the column address would be computed here
+    /// instead.
     pub(crate) fn field_addr(
         &mut self,
         base: Val,
@@ -54,30 +54,30 @@ impl Lower<'_> {
         Some(self.field_addr_at(base, off))
     }
 
-    /// Adresse eines Feldes, dessen Versatz bereits bekannt ist.
+    /// Address of a field whose offset is already known.
     ///
-    /// Wird von `lower_match.rs` fuer die Nutzdaten einer Aufzaehlungsvariante
-    /// gebraucht: dort steht der Versatz in `VariantDef::offsets`, nicht in
-    /// einer benannten Feldliste. Auch dieser Weg laeuft bewusst hier durch,
-    /// damit es nur **eine** Stelle gibt, an der aus einem Versatz eine Adresse
-    /// wird.
+    /// Needed by `lower_match.rs` for the payload data of one enum variant:
+    /// there the offset sits at `VariantDef::offsets`, not within a labelled
+    /// field list. This path too runs through here deliberately, so that there
+    /// is only **one** spot where some offset gets turned into a real
+    /// address.
     pub(crate) fn field_addr_at(&mut self, base: Val, offset: u64) -> Val {
         self.ptradd_const(base, offset)
     }
 
-    /// Adresse des Elements mit dem **konstanten** Index `index` in einem Feld
-    /// von Elementen der Groesse `elem_size` ab `base`.
+    /// Address of the element with the **constant** index `index` within a field
+    /// of elements of size `elem_size` starting at `base`.
     ///
-    /// Fuer Literale (`[a, b, c]`) und ausgerollte Wiederholungen.
+    /// For literals (`[a, b, c]`) and unrolled repetitions.
     pub(crate) fn elem_addr_const(&mut self, base: Val, elem_size: u64, index: u64) -> Val {
         self.ptradd_const(base, elem_size * index)
     }
 
-    /// Adresse des Elements mit dem **berechneten** Index `index`.
+    /// Address of the element with the **computed** index `index`.
     ///
-    /// `index` wird auf `u64` gebracht, mit der Elementgroesse multipliziert und
-    /// auf `base` addiert. Bei SoA waere `base` stattdessen die Spaltenbasis des
-    /// jeweiligen Feldes und die Multiplikation liefe pro Feld getrennt.
+    /// `index` gets brought to `u64`, multiplied by the element size and added
+    /// to `base`. Under SoA `base` would instead be the column base of the
+    /// respective field, and the multiplication would run per field separately.
     pub(crate) fn elem_addr(
         &mut self,
         base: Val,

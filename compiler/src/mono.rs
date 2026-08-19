@@ -1,13 +1,13 @@
-//! Monomorphisierung generischer Vorlagen (`L5`, Modul `types`).
+//! Monomorphization of generic templates (`L5`, module `types`).
 //!
-//! Laeuft zwischen Parser und Typpruefer: fuer jede im Quelltext benutzte
-//! Typkombination entsteht eine konkrete Funktion bzw. ein konkreter Struct mit
-//! dem Namen nach dem Vertrag `name__T1_T2` (siehe `sema_generic.rs`). Der
-//! Typpruefer sieht danach nur noch gewoehnlichen, vollstaendig konkreten Code.
+//! Runs between parser and type checker: for every type combination used by
+//! the source text a concrete function, respectively a concrete struct, comes
+//! about, spelled per the contract `name__T1_T2` (see `sema_generic.rs`).
+//! After that the type checker sees plain, fully concrete code only.
 //!
-//! Fehler dieser Stufe (falsche Anzahl Typargumente, nicht erfuellte
-//! Anforderung, generischer Name ohne Typargumente) werden mit Zeile und Spalte
-//! gemeldet; es gibt keinen Absturz.
+//! Errors of this stage (wrong count of type arguments, unmet requirement,
+//! generic identifier without type arguments) get reported with line and
+//! column; there is no crash.
 
 use std::collections::{HashMap, HashSet};
 
@@ -17,15 +17,15 @@ use crate::sema_generic::{
     self, instantiation, is_generic_fn, is_generic_struct, mangle, Bound, Instantiation,
 };
 
-/// Obergrenze gegen unendliche Auspraegungsketten (`Vec[Vec[Vec[..]]]`).
+/// Upper bound against endless instantiation chains (`Vec[Vec[Vec[..]]]`).
 const MAX_INSTANCES: usize = 4096;
 
 pub fn expand(prog: &mut Program, dg: &mut Diags) {
-    // Alle Funktionsnamen VOR der Auspraegung — daraus liest die Schranken-
-    // pruefung, welche Methode eines Typs fehlt (`T__m`). Waehrend der
-    // Auspraegung kommen nur monomorphisierte Funktionen dazu; eine
-    // Schnittstelle wird fuer die nie umgesetzt (`impl I for Vec__i32` kann
-    // man nicht schreiben), deshalb reicht die Aufnahme von jetzt.
+    // All function names BEFORE instantiation — the bound check reads from
+    // that which method of a type is missing (`T__m`). During instantiation
+    // only monomorphized functions join; no interface ever gets implemented
+    // for those (`impl I for Vec__i32` cannot be written), so the snapshot
+    // taken now suffices.
     let fnames: HashSet<String> = prog.funcs.iter().map(|f| f.name.clone()).collect();
     let mut queue: Vec<(String, Instantiation)> = sema_generic::instantiations()
         .into_iter()
@@ -56,11 +56,11 @@ pub fn expand(prog: &mut Program, dg: &mut Diags) {
     }
     prog.expr_count = next_id;
 
-    // Generische Namen ohne Typargumente sind ein Fehler mit Zeile/Spalte.
+    // Generic names without type arguments are errors with line/column.
     check_bare_uses(prog, dg);
 }
 
-// ------------------------------------------------------------- Auspraegungen
+// ------------------------------------------------------------ Instantiations
 
 fn bind_params(
     dg: &mut Diags,
@@ -84,9 +84,9 @@ fn bind_params(
     }
     let mut map = HashMap::new();
     for (p, a) in params.iter().zip(inst.args.iter()) {
-        // ALLE Schranken muessen gelten. Gemeldet wird die ERSTE verletzte —
-        // eine Kaskade aus Folgemeldungen zu demselben Typargument sagt
-        // nichts Neues.
+        // EVERY bound must hold. Reported gets the FIRST violated one —
+        // a cascade of follow-up messages about the same type argument says
+        // nothing new.
         for b in &p.bounds {
             if !bound_ok(dg, fnames, a, b, &p.name, inst) {
                 return None;
@@ -97,11 +97,11 @@ fn bind_params(
     Some(map)
 }
 
-/// Eine einzelne Schranke gegen ein Typargument. `true` = erfuellt.
+/// One single bound against one type argument. `true` = satisfied.
 ///
-/// Die drei eingebauten Schranken entscheidet `satisfies` allein aus der
-/// Typform. Eine SCHNITTSTELLENSCHRANKE geht nach `iface.rs`: nur dort steht,
-/// welche Umsetzungen es gibt und welche Methode fehlt.
+/// The three builtin bounds are decided by `satisfies` from the type shape
+/// alone. One INTERFACE BOUND goes to `iface.rs`: only there it is written
+/// which implementations exist and which method is missing.
 fn bound_ok(
     dg: &mut Diags,
     fnames: &HashSet<String>,
@@ -211,7 +211,7 @@ fn satisfies(te: &TypeExpr, b: &Bound) -> bool {
             TypeExpr::Named(n, _) => is_int_name(n) || n == "bool",
             TypeExpr::Array { .. } => false,
         },
-        // Schnittstellen entscheidet `iface.rs`, nicht die Typform.
+        // Interfaces are decided by `iface.rs`, not by the type shape.
         Bound::Iface(_) => false,
     }
 }
@@ -246,8 +246,8 @@ fn subst_ty(
     }
 }
 
-/// Ersetzt einen Namen: Typparameter -> Argument, Auspraegungsname
-/// (`Vec__T`) -> neuer Auspraegungsname (`Vec__i32`, dabei angemeldet).
+/// Replaces one identifier: type parameter -> argument, instantiation label
+/// (`Vec__T`) -> new instantiation label (`Vec__i32`, registered on the way).
 fn subst_name(
     n: &str,
     sp: Span,
@@ -259,18 +259,18 @@ fn subst_name(
         if let Some(t) = map.get(n) {
             return Some(with_span(t, sp));
         }
-        // Runde 53: `Gc[T]` und `GcWeak[T]` IN EINER VORLAGE.
+        // Round 53: `Gc[T]` and `GcWeak[T]` WITHIN ONE TEMPLATE.
         //
-        // Der Parser macht daraus die Namen `__gc#p:T` bzw. `__gc#w:T`
-        // (gc.rs::hook_type). Ohne diese Stelle sucht die Typaufloesung
-        // spaeter eine gc-Klasse namens `T` und meldet „unbekannte
-        // gc-klasse 'T'" — generische Funktionen ueber Gc-Zeiger waren
-        // damit unmoeglich, und genau die braucht die typsichere
-        // Oberflaeche von `GcVec`/`GcMap` (`gcvec_anhaengen[T]`).
+        // The parser turns those into the labels `__gc#p:T` and `__gc#w:T`
+        // (gc.rs::hook_type). Without this spot the type resolution later
+        // looks for a gc class called `T` and reports "unknown gc class
+        // 'T'" — generic functions over Gc pointers were impossible that
+        // way, and those are exactly what the type-safe surface of
+        // `GcVec`/`GcMap` needs (`gcvec_append[T]`).
         //
-        // Ersetzt wird nur, wenn das Argument ein NAME ist: `Gc[*mut u8]`
-        // gibt es nicht, der Parser laesst dort ohnehin nur einen
-        // Bezeichner zu.
+        // Replaced gets only what carries a LABEL as argument: `Gc[*mut u8]`
+        // does not exist, the parser allows nothing but one identifier
+        // there anyway.
         for pfx in [crate::gc::P_TY_PUB, crate::gc::P_WTYP_PUB] {
             if let Some(rest) = n.strip_prefix(pfx) {
                 if let Some(TypeExpr::Named(concrete, _)) = map.get(rest) {
@@ -312,17 +312,17 @@ fn with_span(t: &TypeExpr, sp: Span) -> TypeExpr {
     }
 }
 
-/// Name einer Funktion bzw. eines Struct-Literals im Rumpf umschreiben.
+/// Rewrite the label of a function or struct literal inside the body.
 fn subst_call_name(
     n: &str,
     sp: Span,
     map: &HashMap<String, TypeExpr>,
     queue: &mut Vec<(String, Instantiation)>,
 ) -> String {
-    // `size_of[T]()` innerhalb einer generischen Vorlage: der Typparameter
-    // steckt im AUFRUFNAMEN (`size_of$T`, siehe sizeof.rs) und muss hier mit
-    // ersetzt werden — sonst meldet der Typpruefer "unknown type 'T'",
-    // sobald die Vorlage ausgepraegt wird.
+    // `size_of[T]()` inside a generic template: the type parameter sits
+    // within the CALL LABEL (`size_of$T`, see sizeof.rs) and must be
+    // substituted here as well — otherwise the type checker reports
+    // "unknown type 'T'" as soon as the template gets instantiated.
     if let Some(param) = n.strip_prefix("size_of$") {
         if let Some(TypeExpr::Named(concrete, _)) = map.get(param) {
             return format!("size_of${}", concrete);
@@ -428,7 +428,7 @@ fn subst_expr(e: &mut Expr, map: &HashMap<String, TypeExpr>, queue: &mut Vec<(St
     }
 }
 
-// ------------------------------------------------------------ Neunummerierung
+// ---------------------------------------------------------------- Renumbering
 
 pub(crate) fn renumber_block(b: &mut Block, next: &mut u32) {
     for s in b.stmts.iter_mut() {
@@ -509,7 +509,7 @@ pub(crate) fn renumber_expr(e: &mut Expr, next: &mut u32) {
     }
 }
 
-// --------------------------------------------------- generische Namen ohne []
+// --------------------------------------------------- generic names without []
 
 fn check_bare_uses(prog: &Program, dg: &mut Diags) {
     let mut err: Vec<(Span, String)> = Vec::new();
