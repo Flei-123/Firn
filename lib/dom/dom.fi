@@ -5,11 +5,13 @@
 // ZYKLISCHEN Objektgraphen eines DOM. Jede hier gebaute Zyklenart kommt in
 // einer echten Browser-Engine wirklich vor:
 //
-//   1. Knoten <-> Kind      Eltern- UND Kinderzeiger, beide STARK.
-//   2. Element extends Node Vererbung mit Attributen (Atom-Kennung -> Wert).
-//   3. Knoten <-> Listener  Der Knoten haelt den Listener, der Listener haelt
-//                           seinen Knoten (Gecko musste dafuer einen
-//                           Zyklensammler nachruesten).
+//   1. Knoten <-> Kind      Eltern- UND Kinderzeiger, beide STARK; die
+//                           Kinderliste ist eine `GcVec` (Runde 53).
+//   2. Element extends Node Vererbung mit Attributen als `GcMap`, deren
+//                           WERTE selbst auf dem GC-Heap liegen.
+//   3. Knoten <-> Listener  Der Knoten haelt seine Listener in einer `GcVec`,
+//                           jeder Listener haelt seinen Knoten (Gecko musste
+//                           dafuer einen Zyklensammler nachruesten).
 //   4. Sammlung -> Wurzel   Eine live `HTMLCollection` haelt ihren Wurzelknoten.
 //   5. Observer -> GcWeak   Haelt sein Ziel NICHT am Leben (Gegenprobe).
 //   6. Knoten <-> Wrapper   Der simulierte JS-Wrapper haelt den Knoten, der
@@ -19,19 +21,36 @@
 // aufloest, steht in tests/560_dom_zyklen.fi und im Dauerlauf
 // lib/dom/soak_gc.fi (Messung: tools/dom_soak/run.sh).
 //
-// Stufe 0 hat keine Methoden, keine globalen Variablen und keine Sammlungen
-// mit veraenderlicher Laenge. Deshalb: Funktionen statt Methoden, Kinderliste
-// als einfach verkettete Geschwisterkette, feste Attributzahl.
+// ------------------------------------------------------------- Runde 53
+//
+// Bis Runde 52 stand hier: „Stufe 0 hat keine Sammlungen mit veraenderlicher
+// Laenge. Deshalb: Kinderliste als einfach verkettete Geschwisterkette, feste
+// Attributzahl." Beides ist weg. Der Baum benutzt jetzt
+//
+//     kinder:   GcVec[Gc[Node]]        (SPEC §3.5.2)
+//     listener: GcVec[Gc[Listener]]
+//     attrs:    GcMap[Atom, Gc[Str]]
+//
+// und damit laufen die Zyklen 1, 2 und 3 UEBER SAMMLUNGEN — genau der Fall,
+// den `SPEC.md` §3.5.2 als DOM-Grundlage beschreibt und den der Sammler seit
+// Runde 53 einsammeln kann. Die Sammlungen werden ERST BEI BEDARF angelegt:
+// ein Blattknoten ohne Attribute und ohne Listener kostet weiterhin genau ein
+// Objekt, und das ist im DOM der haeufigste Knoten ueberhaupt.
+//
+// Stufe 0 hat weiterhin keine Methoden — statt `parent.children.push(child)`
+// steht hier `dom_kind_anhaengen(eltern, kind)`.
 
 export {
-    Node, Element, Listener, Sammlung, Wrapper, Observer,
+    Node, Element, Listener, Sammlung, Wrapper, Observer, Str,
     DOM_ART_KNOTEN, DOM_ART_ELEMENT, DOM_ART_TEXT,
     DOM_OBJEKTE_JE_SATZ,
     dom_knoten_neu, dom_element_neu,
-    dom_kind_anhaengen, dom_kinder_zaehlen, dom_listener_anhaengen,
+    dom_kind_anhaengen, dom_kinder_zaehlen, dom_kind, dom_kind_entfernen,
+    dom_listener_anhaengen, dom_listener_zaehlen, dom_listener,
     dom_sammlung_neu, dom_sammlung_auffrischen, dom_wrapper_anhaengen,
     dom_observer_neu,
-    dom_attribut_setzen, dom_attribut_lesen,
+    dom_attribut_setzen, dom_attribut_lesen, dom_attribut_entfernen,
+    dom_attribut_zahl,
     dom_zyklus_bauen, dom_zyklus_verwerfen, dom_scrub_tief,
     dom_selbsttest, dom_observer_test, dom_observer_lebt, dom_observer_anlegen
 }
@@ -42,10 +61,8 @@ export {
 // per `GcWeak` wegdefiniert — genau das ist der Punkt des Nachweises.
 gc class Node {
     eltern: Gc[Node],
-    erstes_kind: Gc[Node],
-    letztes_kind: Gc[Node],
-    naechstes: Gc[Node],
-    listener: Gc[Listener],
+    kinder: GcVec[Gc[Node]],
+    listener: GcVec[Gc[Listener]],
     wrapper: Gc[Wrapper],
     kennung: u32,
     art: u32,
@@ -54,14 +71,18 @@ gc class Node {
 // Praefixlayout (SPEC §4.4): die geerbten Felder liegen vorne, deshalb ist
 // jede `Gc[Element]` kostenlos eine `Gc[Node]`.
 gc class Element extends Node {
-    attr_name: [u32; 4],
-    attr_wert: [u32; 4],
-    attr_zahl: u32,
+    attrs: GcMap[u32, Gc[Str]],
+}
+
+// Der Attributwert liegt auf dem GC-Heap — sonst waere die Wertspalte der
+// `GcMap` nur eine Zahl und der Sammler haette dort nichts zu verfolgen.
+gc class Str {
+    kennung: u32,
+    laenge: u32,
 }
 
 gc class Listener {
     ziel: Gc[Node],
-    naechster: Gc[Listener],
     typ: u32,
 }
 
@@ -85,19 +106,25 @@ const DOM_ART_KNOTEN: u32 = 1
 const DOM_ART_ELEMENT: u32 = 2
 const DOM_ART_TEXT: u32 = 3
 
-// Ein Satz aus dom_zyklus_bauen(): 1 Wurzelelement + 3 Kinder + 1 Listener
-// + 1 Sammlung + 1 Wrapper.
-const DOM_OBJEKTE_JE_SATZ: u64 = 7
+// Ein Satz aus dom_zyklus_bauen(), Objekt fuer Objekt:
+//   1  Wurzelelement
+//   3  Attributtabelle (GcMap) + ihr Slot-Puffer + ein Str als Wert
+//   3  Kindknoten
+//   2  Kinderliste (GcVec) + ihr Slot-Puffer
+//   3  Listener + Listenerliste (GcVec) + ihr Slot-Puffer
+//   1  Sammlung
+//   1  Wrapper
+// Vor Runde 53 waren es 7 — die Sammlungen kosten die Differenz, und genau
+// das ist der Preis dafuer, dass der Baum jetzt beliebig breit werden darf.
+const DOM_OBJEKTE_JE_SATZ: u64 = 14
 
 // ------------------------------------------------------------- Erzeugung
 
 fn dom_knoten_neu(kennung: u32, art: u32) -> AllocError!Gc[Node] {
     return try gc Node{
         eltern: gc_null[Node](),
-        erstes_kind: gc_null[Node](),
-        letztes_kind: gc_null[Node](),
-        naechstes: gc_null[Node](),
-        listener: gc_null[Listener](),
+        kinder: gc_null[GcVec](),
+        listener: gc_null[GcVec](),
         wrapper: gc_null[Wrapper](),
         kennung: kennung,
         art: art,
@@ -107,51 +134,89 @@ fn dom_knoten_neu(kennung: u32, art: u32) -> AllocError!Gc[Node] {
 fn dom_element_neu(kennung: u32) -> AllocError!Gc[Element] {
     return try gc Element{
         eltern: gc_null[Node](),
-        erstes_kind: gc_null[Node](),
-        letztes_kind: gc_null[Node](),
-        naechstes: gc_null[Node](),
-        listener: gc_null[Listener](),
+        kinder: gc_null[GcVec](),
+        listener: gc_null[GcVec](),
         wrapper: gc_null[Wrapper](),
         kennung: kennung,
         art: DOM_ART_ELEMENT,
-        attr_name: [0; 4],
-        attr_wert: [0; 4],
-        attr_zahl: 0,
+        attrs: gc_null[GcMap](),
     }
 }
 
 // ------------------------------------------------------------ Baumstruktur
 
-// Haengt `kind` an `eltern` an — BEIDE Richtungen stark. Das ist Zyklus 1.
-fn dom_kind_anhaengen(eltern: Gc[Node], kind: Gc[Node]) {
-    kind.eltern = eltern
-    if eltern.erstes_kind == gc_null[Node]() {
-        eltern.erstes_kind = kind
-    } else {
-        eltern.letztes_kind.naechstes = kind
+// Haengt `kind` an `eltern` an — BEIDE Richtungen stark. Das ist Zyklus 1,
+// und er laeuft jetzt ueber eine `GcVec`: Elter -> GcVec -> Kind -> Elter.
+//
+// Die Kinderliste entsteht beim ERSTEN Kind. Ein Blatt bleibt damit so
+// billig wie vorher.
+fn dom_kind_anhaengen(eltern: Gc[Node], kind: Gc[Node]) -> AllocError!bool {
+    if eltern.kinder == gc_null[GcVec]() {
+        eltern.kinder = try gcvec_neu()
     }
-    eltern.letztes_kind = kind
+    if !(try gcvec_anhaengen[Node](eltern.kinder, kind)) {
+        return false
+    }
+    kind.eltern = eltern
+    return true
 }
 
 fn dom_kinder_zaehlen(eltern: Gc[Node]) -> u32 {
-    var n: u32 = 0
-    var c: Gc[Node] = eltern.erstes_kind
-    while c != gc_null[Node]() {
-        n = n + 1
-        c = c.naechstes
+    if eltern.kinder == gc_null[GcVec]() {
+        return 0
     }
-    return n
+    return gcvec_laenge(eltern.kinder) as u32
 }
 
-// Zyklus 3: der Knoten haelt den Listener, der Listener haelt den Knoten.
-fn dom_listener_anhaengen(knoten: Gc[Node], typ: u32) -> AllocError!Gc[Listener] {
-    let l = try gc Listener{
-        ziel: knoten,
-        naechster: knoten.listener,
-        typ: typ,
+fn dom_kind(eltern: Gc[Node], i: u64) -> Gc[Node] {
+    if eltern.kinder == gc_null[GcVec]() {
+        return gc_null[Node]()
     }
-    knoten.listener = l
+    return gcvec_lesen[Node](eltern.kinder, i)
+}
+
+// `removeChild`: die Reihenfolge der Geschwister bleibt erhalten, und der
+// Rueckverweis wird geloest — sonst haelt das Kind seinen alten Elter weiter.
+fn dom_kind_entfernen(eltern: Gc[Node], i: u64) -> bool {
+    if eltern.kinder == gc_null[GcVec]() {
+        return false
+    }
+    let k: Gc[Node] = gcvec_lesen[Node](eltern.kinder, i)
+    if k == gc_null[Node]() {
+        return false
+    }
+    if !gcvec_entfernen(eltern.kinder, i) {
+        return false
+    }
+    k.eltern = gc_null[Node]()
+    return true
+}
+
+// Zyklus 3: der Knoten haelt seine Listener in einer `GcVec`, jeder Listener
+// haelt seinen Knoten zurueck.
+fn dom_listener_anhaengen(knoten: Gc[Node], typ: u32) -> AllocError!Gc[Listener] {
+    if knoten.listener == gc_null[GcVec]() {
+        knoten.listener = try gcvec_neu()
+    }
+    let l: Gc[Listener] = try gc Listener{ ziel: knoten, typ: typ }
+    if !(try gcvec_anhaengen[Listener](knoten.listener, l)) {
+        return gc_null[Listener]()
+    }
     return l
+}
+
+fn dom_listener_zaehlen(knoten: Gc[Node]) -> u32 {
+    if knoten.listener == gc_null[GcVec]() {
+        return 0
+    }
+    return gcvec_laenge(knoten.listener) as u32
+}
+
+fn dom_listener(knoten: Gc[Node], i: u64) -> Gc[Listener] {
+    if knoten.listener == gc_null[GcVec]() {
+        return gc_null[Listener]()
+    }
+    return gcvec_lesen[Listener](knoten.listener, i)
 }
 
 // Zyklus 4: eine live Sammlung haelt ihre Wurzel.
@@ -178,36 +243,47 @@ fn dom_observer_neu(ziel: Gc[Node]) -> AllocError!Gc[Observer] {
 }
 
 // ------------------------------------------------------------- Attribute
+//
+// `attrs: GcMap[Atom, Gc[Str]]` (SPEC §3.5.2). Der Schluessel ist die
+// Atom-Kennung, der Wert ein Objekt auf dem GC-Heap. Die Kennungen 0 und 1
+// sind reserviert (GCMAP_LEER/GCMAP_GRAB); 0 war schon vorher „nicht
+// vorhanden".
 
-fn dom_attribut_setzen(e: Gc[Element], name: u32, wert: u32) -> bool {
-    var i: usize = 0
-    while i < 4 {
-        if e.attr_name[i] == name {
-            e.attr_wert[i] = wert
-            return true
-        }
-        i = i + 1
-    }
-    if e.attr_zahl >= 4 {
+fn dom_attribut_setzen(e: Gc[Element], name: u32, wert: u32) -> AllocError!bool {
+    if name < 2 {
         return false
     }
-    let k: usize = e.attr_zahl as usize
-    e.attr_name[k] = name
-    e.attr_wert[k] = wert
-    e.attr_zahl = e.attr_zahl + 1
-    return true
+    if e.attrs == gc_null[GcMap]() {
+        e.attrs = try gcmap_neu(false, true)
+    }
+    let s: Gc[Str] = try gc Str{ kennung: wert, laenge: 0 }
+    return try gcmap_setzen_wert[Str](e.attrs, name as u64, s)
 }
 
 // 0 = nicht vorhanden (die Atom-Kennung 0 ist reserviert).
 fn dom_attribut_lesen(e: Gc[Element], name: u32) -> u32 {
-    var i: usize = 0
-    while i < 4 {
-        if i < e.attr_zahl as usize && e.attr_name[i] == name {
-            return e.attr_wert[i]
-        }
-        i = i + 1
+    if e.attrs == gc_null[GcMap]() {
+        return 0
     }
-    return 0
+    let s: Gc[Str] = gcmap_holen_wert[Str](e.attrs, name as u64)
+    if s == gc_null[Str]() {
+        return 0
+    }
+    return s.kennung
+}
+
+fn dom_attribut_entfernen(e: Gc[Element], name: u32) -> bool {
+    if e.attrs == gc_null[GcMap]() {
+        return false
+    }
+    return gcmap_entfernen(e.attrs, name as u64)
+}
+
+fn dom_attribut_zahl(e: Gc[Element]) -> u32 {
+    if e.attrs == gc_null[GcMap]() {
+        return 0
+    }
+    return gcmap_groesse(e.attrs) as u32
 }
 
 // ---------------------------------------------------------- Dauerlauf-Satz
@@ -219,18 +295,21 @@ fn dom_attribut_lesen(e: Gc[Element], name: u32) -> u32 {
 // deshalb ausschliesslich an den Rahmenzellen DIESER Funktion und ist mit der
 // Rueckkehr unerreichbar — genau das ist fuer den Dauerlauf gewollt. Ein
 // Zaehlverweis wuerde hier nichts freigeben (Kind haelt Eltern, Eltern halten
-// Kind; Listener haelt Knoten, Knoten haelt Listener).
+// ihre GcVec, die GcVec haelt das Kind; Listener haelt Knoten, Knoten haelt
+// seine Listenerliste).
 fn dom_zyklus_bauen() -> AllocError!u64 {
     let w = try dom_element_neu(1)
     let wurzel: Gc[Node] = w
-    if !dom_attribut_setzen(w, 7, 42) {
+    if !(try dom_attribut_setzen(w, 7, 42)) {
         return 0
     }
 
     var i: u32 = 0
     while i < 3 {
         let k = try dom_knoten_neu(100 + i, DOM_ART_TEXT)
-        dom_kind_anhaengen(wurzel, k)
+        if !(try dom_kind_anhaengen(wurzel, k)) {
+            return 0
+        }
         // Rueckverweis pruefen, damit der Zyklus nicht wegoptimiert wird.
         if k.eltern != wurzel {
             return 0
@@ -287,7 +366,7 @@ fn dom_scrub_tief(n: u64) {
 
 // Prueft jede Zyklenart einzeln. 0 = alles in Ordnung, sonst Fehlercode.
 fn dom_selbsttest() -> i32 {
-    // --- Art 1: Eltern <-> Kind, beide stark
+    // --- Art 1: Eltern <-> Kind ueber eine GcVec, beide stark
     let e = dom_element_neu(1) catch gc_null[Element]()
     if e == gc_null[Element]() {
         return 1
@@ -298,26 +377,30 @@ fn dom_selbsttest() -> i32 {
     if k1 == gc_null[Node]() || k2 == gc_null[Node]() {
         return 2
     }
-    dom_kind_anhaengen(wurzel, k1)
-    dom_kind_anhaengen(wurzel, k2)
-    if wurzel.erstes_kind != k1 || wurzel.letztes_kind != k2 {
+    if !(dom_kind_anhaengen(wurzel, k1) catch false) {
+        return 3
+    }
+    if !(dom_kind_anhaengen(wurzel, k2) catch false) {
+        return 3
+    }
+    if dom_kind(wurzel, 0) != k1 || dom_kind(wurzel, 1) != k2 {
         return 3
     }
     if k1.eltern != wurzel || k2.eltern != wurzel {
         return 4
     }
-    if k1.eltern.erstes_kind != k1 {
+    if dom_kind(k1.eltern, 0) != k1 {
         return 5
     }
     if dom_kinder_zaehlen(wurzel) != 2 {
         return 6
     }
 
-    // --- Art 2: Vererbung und Attribute
-    if !dom_attribut_setzen(e, 7, 42) {
+    // --- Art 2: Vererbung und Attribute in einer GcMap
+    if !(dom_attribut_setzen(e, 7, 42) catch false) {
         return 7
     }
-    if !dom_attribut_setzen(e, 8, 43) {
+    if !(dom_attribut_setzen(e, 8, 43) catch false) {
         return 8
     }
     if dom_attribut_lesen(e, 7) != 42 || dom_attribut_lesen(e, 8) != 43 {
@@ -325,6 +408,26 @@ fn dom_selbsttest() -> i32 {
     }
     if dom_attribut_lesen(e, 99) != 0 {
         return 10
+    }
+    // Die Attributzahl ist nicht mehr auf vier begrenzt.
+    var a: u32 = 10
+    while a < 200 {
+        if !(dom_attribut_setzen(e, a, a * 2) catch false) {
+            return 24
+        }
+        a = a + 1
+    }
+    if dom_attribut_zahl(e) != 192 {
+        return 25
+    }
+    if dom_attribut_lesen(e, 150) != 300 {
+        return 26
+    }
+    if !dom_attribut_entfernen(e, 150) {
+        return 27
+    }
+    if dom_attribut_lesen(e, 150) != 0 || dom_attribut_zahl(e) != 191 {
+        return 28
     }
     // Aufwaertsumwandlung ist kostenlos, abwaerts nur geprueft.
     if wurzel.as?[Element] == gc_null[Element]() {
@@ -334,15 +437,15 @@ fn dom_selbsttest() -> i32 {
         return 12
     }
 
-    // --- Art 3: Knoten <-> Listener
+    // --- Art 3: Knoten <-> Listener ueber eine GcVec
     let l = dom_listener_anhaengen(wurzel, 5) catch gc_null[Listener]()
     if l == gc_null[Listener]() {
         return 13
     }
-    if wurzel.listener != l || l.ziel != wurzel {
+    if dom_listener(wurzel, 0) != l || l.ziel != wurzel {
         return 14
     }
-    if wurzel.listener.ziel.listener != l {
+    if dom_listener(dom_listener(wurzel, 0).ziel, 0) != l {
         return 15
     }
 
@@ -364,13 +467,14 @@ fn dom_selbsttest() -> i32 {
         return 19
     }
 
-    // Ein Sammellauf mitten im Betrieb darf nichts Erreichbares wegnehmen.
+    // Ein Sammellauf mitten im Betrieb darf nichts Erreichbares wegnehmen —
+    // auch nicht aus den Sammlungen.
     let vorher: u64 = gc_collections()
     gc_collect()
     if gc_collections() != vorher + 1 {
         return 20
     }
-    if wurzel.listener.ziel != wurzel || w.knoten.wrapper != w {
+    if dom_listener(wurzel, 0).ziel != wurzel || w.knoten.wrapper != w {
         return 21
     }
     if dom_kinder_zaehlen(wurzel) != 2 {
@@ -378,6 +482,58 @@ fn dom_selbsttest() -> i32 {
     }
     if dom_attribut_lesen(e, 7) != 42 {
         return 23
+    }
+
+    // --- Baumumbau: removeChild loest den Rueckverweis
+    if !dom_kind_entfernen(wurzel, 0) {
+        return 29
+    }
+    if dom_kinder_zaehlen(wurzel) != 1 {
+        return 30
+    }
+    if dom_kind(wurzel, 0) != k2 {
+        return 31
+    }
+    if k1.eltern != gc_null[Node]() {
+        return 32
+    }
+
+    // --- Breite: 5000 Kinder an EINEM Knoten. Genau das war vor Runde 53
+    // nicht moeglich (feste Attributzahl, verkettete Liste ohne Index).
+    let breit = dom_element_neu(2) catch gc_null[Element]()
+    if breit == gc_null[Element]() {
+        return 33
+    }
+    let bw: Gc[Node] = breit
+    var i: u32 = 0
+    while i < 5000 {
+        let k = dom_knoten_neu(1000 + i, DOM_ART_TEXT) catch gc_null[Node]()
+        if k == gc_null[Node]() {
+            return 34
+        }
+        if !(dom_kind_anhaengen(bw, k) catch false) {
+            return 35
+        }
+        i = i + 1
+    }
+    gc_collect()
+    gc_collect()
+    if dom_kinder_zaehlen(bw) != 5000 {
+        return 36
+    }
+    var j: u64 = 0
+    while j < 5000 {
+        let k: Gc[Node] = dom_kind(bw, j)
+        if k == gc_null[Node]() {
+            return 37
+        }
+        if k.kennung != 1000 + j as u32 {
+            return 38
+        }
+        if k.eltern != bw {
+            return 39
+        }
+        j = j + 1
     }
 
     return 0
