@@ -2028,3 +2028,68 @@ und gibt seriell aus.
 beweist nur, dass es im Worktree des Workers lief. Erst Abschnitt 19 im
 Hauptrepo beweist, dass es im Repo liegt. Nach `.gitignore` ist beim Merge
 kuenftig zu sehen, wenn ein Zweig Dateien anlegt, die kein Erzeugnis sind.
+
+## 42. Runde 54 (DOM), Runde 49 (Faeden) und der schwerste Merge bisher
+
+`r54-dom` ging bis auf die `.gitignore` konfliktfrei ein. `r49-threads`
+nicht: **13 Konflikte**, davon drei echte Kollisionen — zweimal hatten beide
+Zweige DIESELBE Nummer vergeben, ohne voneinander zu wissen.
+
+**Stand nach dem Merge (im Hauptrepo gemessen):** `test.sh` **846/846** ·
+selbst_vergleich **232 gleich / 0 abweichend / 0 fehlerhaft** · Fixpunkt
+zeichengleich, **561.666 Zeilen** · Faden-Dauerlauf 60 s: 1.171.122 Runden,
+11.903 Sammellaeufe, 75.844 Anhalter, **RSS-Drift −128 KiB**.
+
+### Die drei echten Kollisionen
+
+1. **Slots im Zustandsblock.** Runde 53 legte `S_SLOTS_TID`, `S_SCHEIBE`,
+   `S_ZBUDGET` auf 1960/1968/1976 — genau dorthin, wo Runde 49 ihre
+   Fadentafel (`S_FADEN_TAB` …) hingelegt hat. Runde 53 zieht auf
+   2120/2128/2136 um (frei, unterhalb `REG_SAVE_OFF` = 3968).
+2. **Bit 8 im Quellscan.** `gc_quelle_scan` meldete in Runde 53 mit Bit 8
+   „das Programm braucht GcVec/GcMap", in Runde 49 „das Programm bringt
+   einen eigenen `__faden_arbeit` mit". Bit 8 bleibt bei den Sammlungen (es
+   zaehlt auch aus MODULEN), der Fadenverteiler zieht auf **Bit 16** (zaehlt
+   wie Bit 4 nur aus der Wurzeldatei).
+3. **`laufzeit_quelle`** hat jetzt **vier** Parameter statt drei; beide
+   Runden hatten den dritten fuer sich beansprucht.
+
+Die Lehre aus §40 (reservierte Opcode-Bereiche) greift also zu kurz:
+**reserviert gehoert jede fortlaufend vergebene Nummer** — Opcodes,
+Slot-Offsets, Bitmasken, Testnummern. Die Faden-Tests hiessen 840–842 und
+trafen damit auf 840–842 der Sammlungen; sie heissen jetzt 860–862.
+
+### Der interessanteste Fund: ein Test, der vom kaputten Registerscan lebte
+
+`842_gcmap_grund` schlug nach dem Merge fehl: nach dem Loeschen von 1000
+Eintraegen blieben **768** Objekte am Leben. Kein Leck — die Ursache ist
+Runde 49, die den **konservativen Registerscan repariert** hat: bis dahin
+scannte `__gc_collect_now` die ersten 48 Oktette des Zustandsblocks statt
+des Rettungsbereichs, der Scan lief also ins Leere. Seither halten alte
+Bitmuster zwei fruehere Slot-Puffer der Karte fest, und die halten ihre
+Werte.
+
+Gepruefte Gegenprobe, in dieser Reihenfolge:
+
+* Registerscan versuchsweise abgeschaltet → **unveraendert 768** (also nicht
+  der Scan selbst),
+* sechs statt zwei `gc_collect()` → **unveraendert** (also kein
+  unvollendetes Fegen),
+* Abschnitt in eine eigene Funktion ausgelagert, danach Registerwaesche
+  durch tiefe Rekursion → **unveraendert**,
+* `gc_stapel_saeubern()` vor der Messung → **0**.
+
+Damit ist es kein Fehler, sondern der bekannte Preis eines konservativen
+Sammlers: er DARF tote Objekte behalten. Wer das Gegenteil behauptet, muss
+zuerst den toten Stapel saeubern — `tests/833` und `lib/dom` tun das seit
+Runde 49, `842_gcmap_grund` tut es jetzt auch.
+
+### Zwei Nebenbefunde
+
+* Ein Rust-Modultest (`schmales_add_wird_nicht_zur_adresse`) suchte nach
+  `add e…` und uebersah `add r10d` — der Merge verschob nur die
+  Registerwahl. Der Test war zu eng, nicht der Code falsch.
+* `tests/neg/arc_verworfen.fi` erwartete `416:5`; die Faden-Erweiterung in
+  `tests/modules/rc.fi` hat die erzeugte Datei verlaengert (jetzt `441:5`).
+  Solche Positionen gehoeren in den Rumpf unter `lib/rc/teile/`, nicht in
+  die erzeugte Datei.
