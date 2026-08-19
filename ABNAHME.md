@@ -65,8 +65,8 @@ Legende: `[ ]` offen · `[~]` teilweise, mit Zahl · `[x]` bestanden und gemesse
 | **Kriterium** | DOM-Prototyp mit Eltern-/Kind-Zyklen **und** Listener-Zyklen läuft **24 h** ohne Speicherwachstum |
 | **Messbefehl** | `bash tools/dom_soak/run.sh` (Umgebung: `SOAK_SEK`, `SOAK_ZYKLEN`, `SOAK_STICHPROBE`); Messgröße RSS aus `/proc/self/statm` über die Zeit, Toleranz: kein monotoner Anstieg nach der Aufwärmphase |
 | **Stand Entscheidung** | **`[x]` getroffen und begründet** — Opt-in-Tracing-GC in drei Stufen, `SPEC.md` §3.2/§3.5. Alternativen (Arena+Indizes, Refcount+Weak) mit Begründung verworfen |
-| **Stand Beleg (14.08.2026, selbst gemessen)** | **`[~]` prototypisch belegt, 24-h-Lauf steht aus.** Der GC ist gebaut (`compiler/src/gc.rs`, Laufzeit `lib/gc/gc.fi` in Firn), der DOM-Prototyp ebenfalls (`lib/dom/dom.fi`, 6 Zyklenarten). **Dauerlauf: 100.000.000 Zyklensätze = 700.000.000 Objekte in 116,5 s, RSS konstant 1.364 KiB von der ersten bis zur letzten von 1.001 Stichproben, 47.300 Sammelläufe, längste Pause 3,54 ms.** Gegenprobe mit Zählverweis (identischer Objektgraph, `lib/dom/soak_leck.fi`): **750.080 KiB nach 2.000.000 Zyklen, 12.000.000 lebende Objekte — Faktor 550.** Rohdaten: `tools/dom_soak/langlauf/*.tsv`, Bericht: `docs/berichte/dom.md` |
-| **Teilpunkte** | `S1` deterministisch als Standard: Stufe 0 hat Rohzeiger, kein Move-Prüfer · `S2` GC-Heap: **`[x]` Mark-Sweep, präzise Heap-Verfolgung über compilergenerierte Typtabelle, konservativer Stapel-/Registerscan, kein Kompaktieren** · `S3` schwache Verweise: **`[x]` `GcWeak[T]`, negativ getestet; seit Runde 47 werden schwache Felder beim Einsammeln WIRKLICH genullt (`tests/822`), nicht nur `stark()`-leer** · `S4` Finalisierer: **`[x]` seit Runde 47** — Aufraeumart je Objekt, eigene Zyklusphase in Scheiben, Wiederbelebung unmoeglich und erzwungen (Abbruch 71/72/73), `tests/820`-`824`, `docs/RUNDE47.md` · `S5` inkrementell: **`[x]` seit Runde 44**, laengste Unterbrechung 0,45 ms · `S6` Pausenzeiten messbar: **`[x]` `gc_pause_ns_last/max/total`, `gc_hist`, `gc_stop_max`, seit Runde 47 zusaetzlich `gc_fin_*`** · `S7` `Rc`/`Weak`: **`[x]` als reines Firn-Modul (`tests/modules/rc.fi`), Zyklen lecken absichtlich und sichtbar (`tests/552_rc_zyklus_leck.fi`); `Arc[T]` seit Runde 47 gebaut (`lib/rc/arc.fi`, atomarer Zaehler, `tests/830`-`833`)** |
+| **Stand Beleg (14.08.2026, selbst gemessen)** | **`[~]` prototypisch belegt, 24-h-Lauf steht aus.** Der GC ist gebaut (`compiler/src/gc.rs`, Laufzeit `lib/gc/gc.fi` in Firn), der DOM-Prototyp ebenfalls (`lib/dom/dom.fi`, 6 Zyklenarten). **Dauerlauf: 100.000.000 Zyklensätze = 700.000.000 Objekte in 116,5 s, RSS konstant 1.364 KiB von der ersten bis zur letzten von 1.001 Stichproben, 47.300 Sammelläufe, längste Pause 3,54 ms.** Gegenprobe mit Zählverweis (identischer Objektgraph, `lib/dom/soak_leak.fi`): **750.080 KiB nach 2.000.000 Zyklen, 12.000.000 lebende Objekte — Faktor 550.** Rohdaten: `tools/dom_soak/langlauf/*.tsv`, Bericht: `docs/berichte/dom.md` |
+| **Teilpunkte** | `S1` deterministisch als Standard: Stufe 0 hat Rohzeiger, kein Move-Prüfer · `S2` GC-Heap: **`[x]` Mark-Sweep, präzise Heap-Verfolgung über compilergenerierte Typtabelle, konservativer Stapel-/Registerscan, kein Kompaktieren** · `S3` schwache Verweise: **`[x]` `GcWeak[T]`, negativ getestet; seit Runde 47 werden schwache Felder beim Einsammeln WIRKLICH genullt (`tests/822`), nicht nur `stark()`-leer** · `S4` Finalisierer: **`[x]` seit Runde 47** — Aufraeumart je Objekt, eigene Zyklusphase in Scheiben, Wiederbelebung unmoeglich und erzwungen (Abbruch 71/72/73), `tests/820`-`824`, `docs/RUNDE47.md` · `S5` inkrementell: **`[x]` seit Runde 44**, laengste Unterbrechung 0,45 ms · `S6` Pausenzeiten messbar: **`[x]` `gc_pause_ns_last/max/total`, `gc_hist`, `gc_stop_max`, seit Runde 47 zusaetzlich `gc_fin_*`** · `S7` `Rc`/`Weak`: **`[x]` als reines Firn-Modul (`tests/modules/rc.fi`), Zyklen lecken absichtlich und sichtbar (`tests/552_rc_cycle_leak.fi`); `Arc[T]` seit Runde 47 gebaut (`lib/rc/arc.fi`, atomarer Zaehler, `tests/830`-`833`)** |
 | **Was fehlt bis `[x]`** | (a) der **24-Stunden-Lauf**, (b) **Fragmentierung bei wechselnden Objektgrößen** — der Dauerlauf benutzt immer denselben Satz, das ist der freundliche Fall, (c) `virtual`, und bei den Sammlungen die **nominale Typsicherheit des Behälters** (`docs/RUNDE53.md` §4.1). Inkrementelles Sammeln (Runde 44), Finalisierer (Runde 47) und `GcVec`/`GcMap` (Runde 53) sind erledigt |
 | **Aufwand laut TODO-FIRN** | 0.1 = 2 PM (Entscheidung + Prototyp), 0.9 = 2 PM (Dauerlauf) |
 | **Risiko** | Konservatives Stack-Scanning schließt einen kompaktierenden Sammler aus → Fragmentierung im Dauerlauf bleibt das eigentliche Risiko. Nachweisbar außerdem: **eine alte Zeigerkopie in einem lebenden Rahmen hält ihr Objekt am Leben** (`docs/berichte/dom.md`, Abschnitt „Die unbequeme Stelle") |
@@ -98,7 +98,7 @@ Legende: `[ ]` offen · `[~]` teilweise, mit Zahl · `[x]` bestanden und gemesse
   Codename, `line`, `col`, in der Reihenfolge der Erwartung
   (`python3 tools/tokenizer/harness.py … --mit-fehlern`, in `run.sh` als
   Schritt 2a). Die Codes erzeugt der Tokenizer selbst
-  (`lib/html/fehler_codes.fi`, 452 Zeilen, alle Codenamen aus WHATWG §13.2.
+  (`lib/html/error_codes.fi`, 452 Zeilen, alle Codenamen aus WHATWG §13.2.
   Parse errors), nicht der Harness.
 
 Der Tokenizer ist in Firn geschrieben (`lib/html/*.fi`, **8.647 Zeilen**, davon
@@ -173,7 +173,7 @@ bestanden, wenn er in **jedem** seiner Startzustände stimmt); die Antwort
 Auftrag hinter dem Tokenstrom — durch ein Tabulatorzeichen getrennt — eine
 zweite JSON-Liste aus, z. B.
 `[{"code":"eof-in-tag","line":1,"col":6}]`. Die Codenamen stehen in
-`lib/html/fehler_codes.fi` (WHATWG §13.2 „Parse errors"), die Zählung von
+`lib/html/error_codes.fi` (WHATWG §13.2 „Parse errors"), die Zählung von
 Zeile/Spalte in `lib/html/tokens.fi`. Ergebnis: **6.809 / 6.810 (99,99 %)**.
 
 Der eine Fehlschlag ist `xmlViolation.test #0` („Non-XML character"): die
@@ -276,8 +276,8 @@ drei Läufe und nicht der günstigste Einzelwert.
 | **Kriterium** | Zwei verschiedene Rechner erzeugen aus demselben Quelltextstand ein **bit-identisches** Artefakt |
 | **Messbefehl** | `firn build --locked` auf zwei Rechnern, danach `sha256sum` vergleichen |
 | **Stand vor Runde 2** | **`[ ]`** Es gibt kein Modulsystem und keine Paketverwaltung. `firnc0` übersetzt genau eine Datei |
-| **Stand nach Runde 2** | **`[~]` teilweise.** Es gibt ein **Modulsystem**: `import pfad.modul`, `export { … }`, Zugriff über `modul.name`, mehrere `.fi`-Dateien → **ein** Binary (`compiler/src/modules.rs`; `tests/110_module.fi`, `tests/neg/kern_export.fi`, `tests/neg/kern_modul_fehlt.fi`). Umgesetzt ist Gesamtprogramm-Übersetzung mit getrennten Namensräumen, **keine** getrennten Objektdateien. **Nicht vorhanden:** Paketverwaltung, Sperrdatei, Registry, `firn build --locked`, Zwei-Rechner-Vergleich per `sha256sum`. Das Kriterium dieses Punktes ist damit **nicht** erfüllt |
-| **Stand nach Runde 48** | **`[~]` weiter, Kriterium weiter nicht erfüllt.** Es gibt jetzt ein **Projektsystem**: das Manifest `firn.paket` (Name, Version, Einstiegspunkt, Quellverzeichnisse, öffentliche Module, lokale Abhängigkeiten), eine festgelegte Suchreihenfolge (eigene Datei → Wurzeldatei → Projektquellen → Abhängigkeiten → `$FIRNLIB` → `<exe>/../lib`), **Sichtbarkeit auf Modulebene** als Paketschnittstelle, Erkennung von Paketzyklen und Modul-Namenskonflikten, und den Bau-Treiber `firnc --paket <verz>` — alles in **beiden** Übersetzern mit zeichengleichen Meldungen (`compiler/src/paket.rs`, `compiler/src/paketwelt.rs`, `lib/firnc1/paket.fi`; `tools/pakete/run.sh`: 21 Fälle, `beispiele/pakete/`). **Weiterhin nicht vorhanden:** Netzwerk/Registry, Sperrdatei mit Prüfsummen, Versionsauflösung, `firn build --locked`, Zwei-Rechner-Vergleich per `sha256sum`. Das Kriterium dieses Punktes bleibt damit **nicht** erfüllt (`docs/RUNDE48.md`) |
+| **Stand nach Runde 2** | **`[~]` teilweise.** Es gibt ein **Modulsystem**: `import pfad.modul`, `export { … }`, Zugriff über `modul.name`, mehrere `.fi`-Dateien → **ein** Binary (`compiler/src/modules.rs`; `tests/110_module.fi`, `tests/neg/core_export.fi`, `tests/neg/core_module_missing.fi`). Umgesetzt ist Gesamtprogramm-Übersetzung mit getrennten Namensräumen, **keine** getrennten Objektdateien. **Nicht vorhanden:** Paketverwaltung, Sperrdatei, Registry, `firn build --locked`, Zwei-Rechner-Vergleich per `sha256sum`. Das Kriterium dieses Punktes ist damit **nicht** erfüllt |
+| **Stand nach Runde 48** | **`[~]` weiter, Kriterium weiter nicht erfüllt.** Es gibt jetzt ein **Projektsystem**: das Manifest `firn.paket` (Name, Version, Einstiegspunkt, Quellverzeichnisse, öffentliche Module, lokale Abhängigkeiten), eine festgelegte Suchreihenfolge (eigene Datei → Wurzeldatei → Projektquellen → Abhängigkeiten → `$FIRNLIB` → `<exe>/../lib`), **Sichtbarkeit auf Modulebene** als Paketschnittstelle, Erkennung von Paketzyklen und Modul-Namenskonflikten, und den Bau-Treiber `firnc --paket <verz>` — alles in **beiden** Übersetzern mit zeichengleichen Meldungen (`compiler/src/package.rs`, `compiler/src/package_world.rs`, `lib/firnc1/package.fi`; `tools/packages/run.sh`: 21 Fälle, `demos/packages/`). **Weiterhin nicht vorhanden:** Netzwerk/Registry, Sperrdatei mit Prüfsummen, Versionsauflösung, `firn build --locked`, Zwei-Rechner-Vergleich per `sha256sum`. Das Kriterium dieses Punktes bleibt damit **nicht** erfüllt (`docs/RUNDE48.md`) |
 | **Aufwand laut TODO-FIRN** | 2 PM |
 
 ---
@@ -319,7 +319,7 @@ Jury selbst ausführen kann; `RUN.md` führt sie in einer Liste.
 | 3 | Generics per Monomorphisierung, `Vec[T]`, `Map[K,V]` | **`[x]`** | `tests/210…212`, `tests/neg/generic_*.fi` |
 | 4 | Zeichenketten `Bytes`/`Str`/`Str16`/`Atom`, WTF-16, strtod/dtoa | **`[x]`** | `tests/300_str16_surrogate.fi` (einzelnes `0xD800` bleibt erhalten, `to_utf8()` liefert nichts, `to_utf8_lossy()` liefert `EF BF BD`); `bash tools/dtoa_vectors/run.sh 100000 4242` → **100.000/100.000 bitgleich zurück, 100.000/100.000 kürzeste Darstellung wie Rust**, 7,9 s. Ausnahme: keine Stringliterale im Lexer (SPEC §14.1.str S1) |
 | 5 | Optimierer + ehrliche Messung | **`[~]`** | Registerzuteilung, mem2reg, Inlining, CSE, Blockverschmelzung real (`test_opt.sh`: 41/41). **Leistungsziel ≤ 2× verfehlt:** `BENCH_RUNS=5 bash bench/run.sh` → fib 1,57×, sieve 3,97×, matmul 6,04×, bytecount 1,77×, bubblesort 5,19×, statemachine 2,76×, **Median 3,36×** (ein früherer Lauf derselben Suite: Median 2,80×). Gewinn gegenüber `--no-opt`: Median ~10× |
-| 6 | Constant-Time (`secret[T]`, `select`, `secure_zero`, `u128`) | **`[~]` drei Primitive gebaut, `secret[T]` nicht** | Umgesetzt (Runde 4, `compiler/src/ct.rs`): `select(b, a, c)` → `cmov` ohne bedingten Sprung, `barrier(x)` überlebt die Konstantenfaltung, `secure_zero(p, n)` überlebt den Optimierer (`rep stosb`). Nachweis: `tests/430_ct_select.fi` … `tests/433_ct_secure_zero.fi` (drei Baustufen), `tests/neg/ct_*.fi` (5 Negativtests), vier Codegen-Tests in `ct.rs`. **Nicht** umgesetzt: `secret[T]`, Ausbreitung der Markierung, `declassify`, `u128`, `mul_wide`, Wirkung von `#[constant_time]` — beide melden weiterhin einen sauberen Fehler mit Zeile/Spalte (`tests/neg/int_secret_nicht_umgesetzt.fi`, `tests/neg/attr_nicht_umgesetzt.fi`). Ohne `secret[T]` gibt es keine Typprüfung auf Geheimnisdaten; **der Punkt bleibt offen** |
+| 6 | Constant-Time (`secret[T]`, `select`, `secure_zero`, `u128`) | **`[~]` drei Primitive gebaut, `secret[T]` nicht** | Umgesetzt (Runde 4, `compiler/src/ct.rs`): `select(b, a, c)` → `cmov` ohne bedingten Sprung, `barrier(x)` überlebt die Konstantenfaltung, `secure_zero(p, n)` überlebt den Optimierer (`rep stosb`). Nachweis: `tests/430_ct_select.fi` … `tests/433_ct_secure_zero.fi` (drei Baustufen), `tests/neg/ct_*.fi` (5 Negativtests), vier Codegen-Tests in `ct.rs`. **Nicht** umgesetzt: `secret[T]`, Ausbreitung der Markierung, `declassify`, `u128`, `mul_wide`, Wirkung von `#[constant_time]` — beide melden weiterhin einen sauberen Fehler mit Zeile/Spalte (`tests/neg/int_secret_not_implemented.fi`, `tests/neg/attr_not_implemented.fi`). Ohne `secret[T]` gibt es keine Typprüfung auf Geheimnisdaten; **der Punkt bleibt offen** |
 | 7 | GC + DOM-Prototyp mit Zyklen | **`[ ]` nicht gebaut** | siehe Punkt 2 oben — verschoben, nichts vorgetäuscht |
 | 8 | HTML5-Tokenizer in Firn | **`[~]` gebaut, gemessen** | **6.810 / 6.810 (100,00 %)** ohne, **6.809 / 6.810 (99,99 %)** mit Parse-Fehlercodes, `bash tools/tokenizer/run.sh`; Faktor gegen html5ever **2,25×–3,09×** (Korpus `html5lib`) bzw. **5,72×–8,31×** (Korpus `realweb`, echte Seiten) — siehe Punkt 3 oben |
 | 9 | Werkzeuge: JSON-Testrunner, Modulauflösung, DWARF, Selbsthosting-Plan | **`[~]`** | JSON-Runner **256/256**; Modulauflösung ja, Paketverwaltung nein; `.debug_line` in `gdb` belegt (`docs/DEBUGGER.md`); `docs/SELBSTHOSTING.md` |
@@ -357,12 +357,12 @@ bestehenden (`git diff --stat 25bf066 -- tests/ test.sh test_opt.sh` meldet
 `test_opt.sh` und `tests/opt/` sind byte-identisch zum Ausgangsstand):
 
 * **+20 Fehlerunionen** (Punkt „Ziel 1" dieser Runde):
-  `tests/400_fehlerunion_grund.fi` … `tests/419_catch_bindung.fi`
-* **+10 Negativtests Fehlerunionen**: `tests/neg/err_try_ausserhalb.fi`,
-  `err_verworfen.fi`, `err_unbekannte_variante.fi`, `err_unbekannte_menge.fi`,
-  `err_catch_typ.fi`, `err_catch_ohne_union.fi`, `err_doppelte_variante.fi`,
-  `err_falsche_menge.fi`, `err_rueckgabe_typ.fi`, `err_union_in_struct.fi`,
-  `err_vergleich_mengen.fi`
+  `tests/400_error_union_basic.fi` … `tests/419_catch_binding.fi`
+* **+10 Negativtests Fehlerunionen**: `tests/neg/err_try_outside.fi`,
+  `err_discarded.fi`, `err_unknown_variant.fi`, `err_unknown_set.fi`,
+  `err_catch_ty.fi`, `err_catch_without_union.fi`, `err_duplicate_variant.fi`,
+  `err_wrong_set.fi`, `err_ret_ty.fi`, `err_union_in_struct.fi`,
+  `err_compare_sets.fi`
 * **+4 Constant-Time**: `tests/430_ct_select.fi` … `tests/433_ct_secure_zero.fi`
 * **+5 Negativtests Constant-Time**: `tests/neg/ct_*.fi`
 
@@ -397,7 +397,7 @@ gemessen.
 | Musterarten: Variante+Bindung, Literal, Bereich, `_`, verschachtelt | `[x]` | `tests/200..204_*.fi` (laufen mit und ohne `--no-opt`, gleiches Ergebnis) |
 | Sprungtabelle bei dichten Varianten | `[x]` | `firnc --emit=asm tests/230_zustandsmaschine.fi` (32 Zustände): 1× `jmp qword ptr [rdx + rax*8]`, 0× `cmp`; Test `codegen_switch::tests::sprungtabelle_bei_30_zustaenden` |
 | Generics per Monomorphisierung (`name__T1_T2`) | `[x]` | `tests/210_generic_fn.fi`, `tests/211_generic_struct.fi` (`Vec[T]`), `tests/212_generic_map.fi` (`Map[K,V]`) |
-| Klare Fehlermeldung bei nicht erfüllter Anforderung | `[x]` | `tests/neg/generic_anforderung.fi` (7:13), `generic_argzahl.fi`, `generic_ohne_typargumente.fi` |
+| Klare Fehlermeldung bei nicht erfüllter Anforderung | `[x]` | `tests/neg/generic_anforderung.fi` (7:13), `generic_arg_count.fi`, `generic_without_ty_args.fi` |
 | `match` als **Ausdruck**, generische `enum`, `modul.E::V` | `[ ]` **verschoben** | ehrlich festgehalten in `SPEC.md` §14.1.types T1, T3, T6 |
 
 Messung am 13.08.2026 (letzter Stand dieses Moduls): alle 105 Programme in
@@ -405,7 +405,7 @@ Messung am 13.08.2026 (letzter Stand dieses Moduls): alle 105 Programme in
 Optimierer und mit `--no-opt`) mit dem erwarteten Ergebnis — **210/210**, davon
 9 neue Programme dieses Moduls. Von den 28 Negativtests melden 26 den erwarteten
 Fehler mit Zeile:Spalte; die 2 Abweichungen liegen in Dateien des Moduls `str`
-(`tests/neg/str16_ist_kein_bytes.fi`, `tests/neg/str_bytes_ist_kein_text.fi`)
+(`tests/neg/str16_is_no_bytes.fi`, `tests/neg/str_bytes_is_no_text.fi`)
 und gehören nicht zu diesem Modul. Alle 7 Negativtests dieses Moduls
 (`tests/neg/match_*.fi`, `tests/neg/generic_*.fi`) bestehen.
 

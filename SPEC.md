@@ -218,7 +218,7 @@ Zählung", für berechnete Stilwerte — Stylo macht das mit `Arc`).
   einfädiger Code den atomaren Zähler nicht bezahlt.
   **Gebaut seit Runde 47** als Firn-Modul `lib/rc/arc.fi` (`Atomverweis[T]`,
   `AtomSchwachverweis[T]`); der Zähler ist wirklich atomar (`lock xadd`,
-  `compiler/src/atomar.rs`, Nachweis `tools/atomar/run.sh`). Ehrlich benannt:
+  `compiler/src/atomic.rs`, Nachweis `tools/atomic/run.sh`). Ehrlich benannt:
   das Aufwerten eines schwachen Verweises braucht einen Vergleichs-Tausch, den
   Runde 47 nicht baut — es ist heute korrekt (ein Faden, §7), aber keine
   Fadenzusage. `docs/RUNDE47.md`.
@@ -943,7 +943,7 @@ in diesem Dokument ist Zukunft und wird im README als „noch nicht" geführt.
 `Arc[T]`, Standardbibliothek, Nebenläufigkeit, Paketverwaltung, aarch64, WASM,
 LLVM-Backend. Nicht umgesetzte Typkonstruktoren melden einen eigenen Fehler mit
 Zeile/Spalte statt eines Syntaxfehlers (`Rc[T]`, `Weak[T]`, `Arc[T]`; Nachweis:
-`tests/neg/int_gc_nicht_umgesetzt.fi`).
+`tests/neg/int_gc_not_implemented.fi`).
 
 **Runde 3 hat aus dieser Liste gestrichen:** Fehlerunionen `E!T` mit `try`/
 `catch` (§14.1.fehler), `secret`/Constant-Time-Primitive (§9, `compiler/src/ct.rs`)
@@ -1019,8 +1019,8 @@ Code nicht auseinanderlaufen.
    Ganzzahl-/`bool`-Ausdrücke beschränkt.
 5. **Globale Variablen** gibt es nicht (nur `const`).
 6. ~~**`profile`-Deklaration** wird geparst und geprüft, hat aber keine
-   Wirkung.~~ **Gestrichen in Runde 52** (`compiler/src/profil.rs`,
-   `compiler/src/kern.rs`, `docs/RUNDE52.md`): `--profile=kernel` bzw.
+   Wirkung.~~ **Gestrichen in Runde 52** (`compiler/src/prof.rs`,
+   `compiler/src/core.rs`, `docs/RUNDE52.md`): `--profile=kernel` bzw.
    `profile kernel` setzt die Tabelle aus §2 durch — kein `import std.*`,
    kein `gc class`, kein `syscall`, kein `#[unwinds]`, Gleitkomma nur mit
    `#[allow_fp]` — und erzeugt eine freistehende **ELF-Objektdatei** (`-c`,
@@ -1028,8 +1028,8 @@ Code nicht auseinanderlaufen.
    (`asm("…", in("dx") p, out("rax"), clobber("memory"))`), MMIO
    (`__mmio_lesen/schreiben8|16|32|64`) und Interrupt-Einsprungpunkte
    (`#[interrupt]`, rettet 14 Register und schließt mit `iretq`). Nachweis:
-   `beispiele/kernel/kern.fi` bootet in QEMU, mit **beiden** Compilern
-   (`tools/freistehend/run.sh`). Im App-Profil bleibt alles wie zuvor: ein
+   `demos/kernel/core.fi` bootet in QEMU, mit **beiden** Compilern
+   (`tools/freestanding/run.sh`). Im App-Profil bleibt alles wie zuvor: ein
    freistehendes Binary mit `_start` ohne libc.
 7. **`extern fn`** wird syntaktisch erkannt, aber mit klarem Fehler abgelehnt.
 8. **Rückgabewert des Programms.** `fn main() -> i32`; `_start` ruft `main` und
@@ -1038,7 +1038,7 @@ Code nicht auseinanderlaufen.
    `kern`): Argumente ab dem siebten INTEGER-Wort werden vor dem `call` bei
    `[rsp+8k]` abgelegt, die 16-Byte-Ausrichtung bleibt erhalten; der
    Aufgerufene liest sie bei `[rbp+16+8k]`. Nachweis:
-   `tests/108_stapelargumente.fi` und der Codegen-Test
+   `tests/108_stack_args.fi` und der Codegen-Test
    `stapelargumente_ab_dem_siebten_wort`.
 10. **Parameter sind unveränderlich** (wie `let`-Bindungen).
 11. ~~**Kein Wiederholungsliteral `[wert; N]`.**~~ **Gestrichen in Runde 2**
@@ -1053,8 +1053,8 @@ Code nicht auseinanderlaufen.
     ausschließlich im Lowering statt (`continue` springt in einer `for`-Schleife
     auf den Fortschaltblock, nicht auf den Kopf). Außerhalb einer Schleife ist
     `break`/`continue` ein Fehler mit Zeile/Spalte. Nachweis:
-    `tests/106_for_schleife.fi`, `tests/107_break_continue.fi`,
-    `tests/neg/kern_break_ausserhalb.fi`.
+    `tests/106_for_loop.fi`, `tests/107_break_continue.fi`,
+    `tests/neg/core_break_outside.fi`.
 14. **Assembler-Ausgabe** ist Intel-Syntax mit `.intel_syntax noprefix`. `as` und
     `ld` werden ausschließlich als Assembler bzw. Linker aufgerufen, nie ein
     C-Compiler.
@@ -1087,7 +1087,7 @@ Code nicht auseinanderlaufen.
     geführt. Ein `enum` in einem importierten Modul ist deshalb als
     `Ampel::Rot` anzusprechen, **nicht** als `zustand.Ampel::Rot`; zwei Module
     dürfen keine gleichnamige Aufzählung deklarieren. Nachweis:
-    `tests/231_modul_match.fi`. (Runde 3 hat an derselben Stelle einen echten
+    `tests/231_module_match.fi`. (Runde 3 hat an derselben Stelle einen echten
     Fehler behoben: die Rumpfblöcke der `match`-Fälle liegen in der
     Registrierung und wurden vom Modulsystem nicht umgeschrieben — `match` in
     einem importierten Modul war unbenutzbar. `compiler/src/modules.rs`
@@ -1107,7 +1107,7 @@ Code nicht auseinanderlaufen.
     Typqualifizierer `secret[T]`, die Ausbreitung der Markierung durch
     Ausdrücke, `declassify` und damit auch die Wirkung von `#[constant_time]`:
     das Attribut bleibt in `attrs.rs` als *nicht umgesetzt* geführt und meldet
-    einen sauberen Fehler (`tests/neg/attr_nicht_umgesetzt.fi`). Die Prüfung im
+    einen sauberen Fehler (`tests/neg/attr_not_implemented.fi`). Die Prüfung im
     Codegenerator (bedingter Sprung auf einem `secret`-Wert bricht ab) ist
     vorhanden, bekommt aber erst mit `secret[T]` Futter. Abweichung in der
     Schreibweise: §9 schreibt `barrier(inout x)` und `secure_zero(inout buf)`;
@@ -1175,7 +1175,7 @@ Umgesetzt und mit laufendem Code belegt:
   Nullwerte `gc_null[T]()`/`weak_null[T]()`.
 * **Allokation ist fehlbar**: `gc C{…}` hat den Typ `AllocError!Gc[C]`
   (DESIGNZIELE §2). Bei erschöpftem Heap wird **erst gesammelt, dann
-  gescheitert** — nachgewiesen in `tests/535_gc_fehlbare_allokation.fi` mit
+  gescheitert** — nachgewiesen in `tests/535_gc_fallible_allocation.fi` mit
   einer Obergrenze von 256 KiB.
 * **Mark-Sweep**, anhaltend, Sammlung nur an Allokationsstellen und bei
   `gc_collect()`. **Präzise** Heap-Verfolgung über eine compilergenerierte
@@ -1192,10 +1192,10 @@ Umgesetzt und mit laufendem Code belegt:
   `gc_barriers`, `gc_set_max_bytes`.
 * **`Rc[T]`/`Weak[T]`** als reines Firn-Modul (`tests/modules/rc.fi`), immer
   unveränderlich, fehlbare Allokation, `#[must_consume]`. Zyklen lecken dort
-  **absichtlich** und werden sichtbar gemacht (`tests/552_rc_zyklus_leck.fi`),
+  **absichtlich** und werden sichtbar gemacht (`tests/552_rc_cycle_leak.fi`),
   statt sie wegzuerklären.
 
-**Belegt am DOM** (`lib/dom/dom.fi`, `tests/560_dom_zyklen.fi`,
+**Belegt am DOM** (`lib/dom/dom.fi`, `tests/560_dom_cycles.fi`,
 `tools/dom_soak/run.sh`): sechs Zyklenarten — Eltern↔Kind beide stark,
 `Element extends Node` mit Attributen, Knoten↔Listener, Sammlung→Wurzel,
 Observer über `GcWeak`, Knoten↔JS-Wrapper. Dauerlauf **100.000.000
@@ -1281,7 +1281,7 @@ Namen sucht und generische Namen programmweit gelten.
 Damit ist eine generische Sammlung als Bibliothek schreibbar:
 `lib/rt/vec.fi` bindet `rt` ein, ruft `rt.heap_alloc` aus dem Rumpf einer
 Vorlage, und die Wurzeldatei schreibt `var v: Vec[i32] = vec_neu[i32]()`
-(`tests/640_vec_modul.fi`).
+(`tests/640_vec_module.fi`).
 
 #### 14.1.sizeof — `size_of[T]()` (Runde 16)
 
@@ -1334,12 +1334,12 @@ Zurechtschneiden, Aufrufe (auch rekursiv).
 **Grenzen, die eingehalten werden:** höchstens 2.000.000 ausgeführte
 Anweisungen und 64 verschachtelte Aufrufe. Beides endet mit einer Meldung samt
 Quellposition — ein `comptime` darf den Compiler nicht aufhängen
-(`tests/neg/comptime_endlos.fi`).
+(`tests/neg/comptime_endless.fi`).
 
 **Nicht möglich:** Zeiger, Arrays, Structs, `syscall`, Gleitkomma,
 GC-Allokation. Alles davon braucht einen Speicher zur Übersetzungszeit; der
 kommt mit `emit`. Ein Versuch wird gemeldet, nicht still falsch übersetzt
-(`tests/neg/comptime_zeiger.fi`).
+(`tests/neg/comptime_ptr.fi`).
 
 **`emit` gibt es seit Runde 13.** Ein `comptime { … }`-Block auf oberster Ebene
 baut mit `emit_roh("…")` und `emit_zahl(x)` **Firn-Quelltext** auf, der im
@@ -1392,7 +1392,7 @@ schreiben. Deshalb gilt:
 * **kein absoluter Pfad**.
 
 Beides wird abgewiesen, mit Meldung und Quellposition
-(`tests/neg/comptime_datei_absolut.fi`, `comptime_datei_eltern.fi`). Das ist
+(`tests/neg/comptime_file_absolute.fi`, `comptime_file_parent.fi`). Das ist
 bewusst enger als nötig; wenn Firn das Fähigkeitenmodell aus `DESIGNZIELE.md`
 §3 bekommt, wird daraus eine Erlaubnis, die ein Modul ausdrücklich anfordern
 muss.
@@ -1421,9 +1421,9 @@ sind von sich aus ungeordnet-sicher. Nur `==` und `!=` brauchen zusätzlich
 * **Kein `%`** (das wäre `fmod` und braucht eine Bibliotheksfunktion) und
   **keine Bitoperationen** auf `f64` — auf einem Bitmuster haben sie keine
   sinnvolle Bedeutung. Wer sie braucht, wandelt ausdrücklich in `u64` um.
-  Negativtest: `tests/neg/f64_kein_modulo.fi`.
+  Negativtest: `tests/neg/f64_no_modulo.fi`.
 * **Keine implizite Umwandlung**, auch nicht zwischen `i64` und `f64`
-  (`tests/neg/f64_keine_implizite_umwandlung.fi`).
+  (`tests/neg/f64_no_implicit_conversion.fi`).
 * **Keine Konstantenfaltung.** Der Wert einer `Op::Const` mit `FTy::F64` ist
   ein **Bitmuster**; die Faltung in `opt.rs` rechnet ganzzahlig und würde aus
   `1.5 + 1.5` stillen Unsinn machen. Sie ist deshalb für jede Instruktion
@@ -1485,8 +1485,8 @@ S2. **Kein Gleitkommatyp in der Sprache.** `strtod` liefert und `dtoa`
 S3. **`Bytes`/`Str`/`Str16`/`Atom` sind Bibliothekstypen** (`lib/str/*.fi`),
     keine eingebauten Typen. Das Layout aus §8.1 ist eingehalten; die Trennung
     erzwingt der Typprüfer, weil es verschiedene `struct`-Typen sind
-    (Negativtests `tests/neg/str_bytes_ist_kein_text.fi`,
-    `tests/neg/str16_ist_kein_bytes.fi`). `Str` ist `Bytes` mit geprüftem
+    (Negativtests `tests/neg/str_bytes_is_no_text.fi`,
+    `tests/neg/str16_is_no_bytes.fi`). `Str` ist `Bytes` mit geprüftem
     Inhalt (`bytes_is_str`), kein eigener Typ — die Umdeutung von `Bytes` zu
     `Str` ist damit noch nicht compilergeprüft.
 S4. **Die API ist zeigerbasiert.** Weil §14.1 Punkt 1 (keine Aggregate an
@@ -1581,14 +1581,14 @@ F1. **Die Fehlermenge wird nicht abgeleitet.** `E!T` muss vollständig
 F2. **Fehlermengennamen sind programmweit**, nicht je Modul — wie
     Aufzählungsnamen (§14.1.types). `LeseFehler::Ende` gilt in jeder Datei,
     `modul.LeseFehler::Ende` gibt es nicht. Nachweis:
-    `tests/414_modul_fehler.fi`.
+    `tests/414_module_error.fi`.
 F3. **`try` verlangt dieselbe Fehlermenge.** Es gibt keine Vereinigung oder
     Verbreiterung von Fehlermengen und kein Umschlüsseln beim Durchreichen;
     unterschiedliche Mengen sind ein Fehler mit Zeile und Spalte
-    (`tests/neg/err_falsche_menge.fi`).
+    (`tests/neg/err_wrong_set.fi`).
 F4. **`catch |e| …` bindet an einen Ausdruck, nicht an einen Block.** Der
     Fehlerwert `e` hat den Typ der Fehlermenge und wird mit `==`/`!=`
-    untersucht (`tests/419_catch_bindung.fi`); `match e { … }` auf einem
+    untersucht (`tests/419_catch_binding.fi`); `match e { … }` auf einem
     Fehlerwert ist **nicht** umgesetzt und meldet einen sauberen Fehler.
     Auch der Schreibweise nach ist `catch` damit enger als das Beispiel in
     §5.1, das einen Block mit `return` darin zeigt.
@@ -1653,7 +1653,7 @@ F10. **Fehlerunion über einem Struct-Erfolgstyp taugt nicht als Feldtyp eines
     Struct-Layouts noch nicht fest — die Fehlerunion bekäme eine falsche Größe.
     Statt eines stillen Fehl-Layouts gibt es einen Fehler mit Zeile und Spalte
     (`tests/neg/err_union_in_struct.fi`). Mit skalarem Erfolgstyp
-    (`E!i32`, `E!*mut u8`) ist der Feldtyp erlaubt (`tests/408_union_feld.fi`),
+    (`E!i32`, `E!*mut u8`) ist der Feldtyp erlaubt (`tests/408_union_field.fi`),
     als Rückgabe-, Variablen- und Parametertyp jeder Erfolgstyp.
 
 

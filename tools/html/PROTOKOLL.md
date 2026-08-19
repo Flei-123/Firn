@@ -31,7 +31,7 @@ danach eine Zeile `#ENDE`:
 #ENDE
 ```
 
-Regeln des Formats (`lib/browser/schreiben.fi`):
+Regeln des Formats (`lib/browser/write.fi`):
 
 * Jede Zeile beginnt mit `| `, danach **zwei Leerzeichen je Ebene**. Die Kinder
   des Dokuments stehen auf Ebene 0.
@@ -47,7 +47,7 @@ Regeln des Formats (`lib/browser/schreiben.fi`):
 
 Kommt der Treiber nicht durch, steht **vor** dem Baum eine Zeile
 `#KAPUTT <code>`; der Läufer zählt den Fall dann als Fehlschlag. Die Codes
-stehen in `lib/browser/treiber.fi` (`lauf_dokument_bauen`):
+stehen in `lib/browser/driver.fi` (`lauf_dokument_bauen`):
 
 | Code | Bedeutung |
 |---|---|
@@ -61,10 +61,10 @@ stehen in `lib/browser/treiber.fi` (`lauf_dokument_bauen`):
 Der Tokenizer ist vollständig `#[no_gc]` (SPEC §3.5.4) — er darf keine Funktion
 aufrufen, die GC-Speicher anfordert. Der Baumaufbau tut genau das (jeder Knoten
 ist ein GC-Objekt). Zwischen beiden steht deshalb ein **binäres Tokenprotokoll**
-(`lib/html/tokens.fi`, `tb_*`; gelesen von `lib/browser/tokenstrom.fi`).
+(`lib/html/tokens.fi`, `tb_*`; gelesen von `lib/browser/token_stream.fi`).
 
 Jeder Satz trägt neben dem Token die **Quellposition unmittelbar hinter dem
 Token**. Die braucht der Baumaufbau, um den Tokenizer bei `<title>`, `<style>`,
 `<script>`, `<textarea>` und `<plaintext>` in einen anderen Startzustand zu
 schicken (WHATWG „generic raw text element parsing algorithm"). Wie das
-gemacht wird — und was es kostet — steht im Kopf von `lib/browser/treiber.fi`.
+gemacht wird — und was es kostet — steht im Kopf von `lib/browser/driver.fi`.

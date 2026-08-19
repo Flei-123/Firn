@@ -6,7 +6,7 @@
 #
 # Gemessen wird der ECHTE Speicherverbrauch des Prozesses (RSS aus
 # /proc/self/statm), nicht die Selbstauskunft der Laufzeit. Zusaetzlich laeuft
-# JEDES MAL die absichtlich leckende Gegenprobe (lib/dom/soak_leck.fi, gleicher
+# JEDES MAL die absichtlich leckende Gegenprobe (lib/dom/soak_leak.fi, gleicher
 # Zyklensatz mit Zaehlverweisen). Bleibt die gruen, ist das Messverfahren
 # kaputt und dieses Skript bricht ab — eine Messung, die nichts anzeigen kann,
 # waere schlimmer als keine.
@@ -45,7 +45,7 @@ if [ ! -x "$FIRNC" ]; then
     echo "FEHLER: $FIRNC fehlt — zuerst 'cargo build --release' im Ordner compiler/."
     exit 1
 fi
-for f in lib/dom/dom.fi lib/dom/mess.fi lib/dom/soak_gc.fi lib/dom/soak_leck.fi; do
+for f in lib/dom/dom.fi lib/dom/meas.fi lib/dom/soak_gc.fi lib/dom/soak_leak.fi; do
     if [ ! -f "$f" ]; then
         echo "FEHLER: $f fehlt — der DOM-Prototyp ist nicht gebaut."
         exit 1
@@ -54,7 +54,7 @@ done
 
 rm -rf "$ARBEIT"
 mkdir -p "$ARBEIT" "$AUS"
-cp lib/dom/dom.fi lib/dom/mess.fi "$ARBEIT/"
+cp lib/dom/dom.fi lib/dom/meas.fi "$ARBEIT/"
 
 # Arbeitskopie mit umgestellten Konstanten anlegen.
 # $1 Quelle  $2 Ziel  $3 Budget ms  $4 Zyklen  $5 Stichprobe
@@ -234,7 +234,7 @@ def zeig(u, name):
           f' (Zuwachs {"ja" if u["wuchs"] else "nein"}, monoton {"ja" if u["monoton"] else "nein"})')
 
 zeig(gc, 'GC-Fassung  (lib/dom/soak_gc.fi)')
-zeig(leck, 'Zaehlverweis (lib/dom/soak_leck.fi, MUSS lecken)')
+zeig(leck, 'Zaehlverweis (lib/dom/soak_leak.fi, MUSS lecken)')
 
 print()
 fehler = 0

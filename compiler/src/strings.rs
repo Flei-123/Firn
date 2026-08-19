@@ -812,7 +812,7 @@ mod tests {
     }
 
     #[test]
-    fn str_ist_utf8() {
+    fn str_is_utf8() {
         assert_eq!(dec(LitKind::Str, "Hi"), LitValue::Octets(b"Hi".to_vec()));
         assert_eq!(dec(LitKind::Str, "\\u00e4"), LitValue::Octets(vec![0xC3, 0xA4]));
         assert_eq!(dec(LitKind::Str, "ä"), LitValue::Octets(vec![0xC3, 0xA4]));
@@ -825,13 +825,13 @@ mod tests {
     }
 
     #[test]
-    fn str_lehnt_ungepaartes_surrogat_ab() {
+    fn str_rejects_unpaired_surrogate_ab() {
         assert!(err(LitKind::Str, "\\uD800").contains("ungepaartes surrogat U+D800"));
         assert!(err(LitKind::Str, "\\uDC00x").contains("ungepaartes surrogat U+DC00"));
     }
 
     #[test]
-    fn str16_haelt_ungepaartes_surrogat() {
+    fn str16_holds_unpaired_surrogate() {
         let v = dec(LitKind::Str16, "a\\uD800b");
         assert_eq!(v, LitValue::Units(vec![0x61, 0xD800, 0x62]));
         let u = match v {
@@ -846,7 +846,7 @@ mod tests {
     }
 
     #[test]
-    fn str16_normalisiert_nichts() {
+    fn str16_normalized_nothing() {
         // Ein Paar bleibt ein Paar, ein Nicht-BMP-Escape wird zum Paar.
         assert_eq!(dec(LitKind::Str16, "\\uD83D\\uDE00"), LitValue::Units(vec![0xD83D, 0xDE00]));
         assert_eq!(dec(LitKind::Str16, "\\u{1F600}"), LitValue::Units(vec![0xD83D, 0xDE00]));
@@ -855,14 +855,14 @@ mod tests {
     }
 
     #[test]
-    fn bytes_ist_kein_text() {
+    fn bytes_is_no_text() {
         assert_eq!(dec(LitKind::Bytes, "AB\\xff"), LitValue::Octets(vec![65, 66, 255]));
         assert!(err(LitKind::Bytes, "\\u0041").contains("Bytes ist kein text"));
         assert!(err(LitKind::Bytes, "ä").contains("nicht erlaubt"));
     }
 
     #[test]
-    fn maskierungen() {
+    fn maskings() {
         assert_eq!(dec(LitKind::Str, "\\n\\r\\t\\0\\\\\\\""), LitValue::Octets(vec![10, 13, 9, 0, 92, 34]));
         assert!(err(LitKind::Str, "\\q").contains("unbekannte maskierung"));
         assert!(err(LitKind::Str, "\\u12").contains("vier hexadezimalziffern"));
@@ -891,7 +891,7 @@ mod tests {
     }
 
     #[test]
-    fn utf16_hin_und_zurueck() {
+    fn utf16_to_and_back() {
         let s = "Hallo, Wüste 🏜!";
         let u = utf8_to_utf16(s.as_bytes());
         assert_eq!(to_utf8(&u).unwrap(), s.as_bytes());
@@ -899,24 +899,24 @@ mod tests {
     }
 
     #[test]
-    fn atome_sind_ganzzahlen() {
+    fn atoms_are_ints() {
         let mut t = AtomTable::new();
         let div = t.intern(b"div");
         assert_eq!(div, t.intern(b"div"));
         assert!(div < 64, "haeufige atome haben kleine nummern");
         assert_ne!(div, t.intern(b"span"));
-        let neu = t.intern(b"karstos");
-        assert_eq!(t.text(neu), Some(&b"karstos"[..]));
+        let new = t.intern(b"karstos");
+        assert_eq!(t.text(new), Some(&b"karstos"[..]));
         assert_eq!(t.len(), STATIC_ATOMS.len() + 1);
     }
 
     #[test]
-    fn layout_ist_vertrag() {
+    fn layout_is_contract() {
         assert_eq!((SLICE_PTR_OFF, SLICE_LEN_OFF, SLICE_CAP_OFF, SLICE_SIZE), (0, 8, 16, 24));
     }
 
     #[test]
-    fn report_zeigt_surrogat() {
+    fn report_shows_surrogate() {
         let r = strlit_report(r#"u"\uD800""#).unwrap();
         assert!(r.contains("D800"), "{}", r);
         assert!(r.contains("to_utf8   nichts"), "{}", r);

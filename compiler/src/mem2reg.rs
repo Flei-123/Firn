@@ -163,14 +163,14 @@ pub(crate) fn replace_uses(f: &mut Func, map: &HashMap<Val, Val>) -> usize {
                     rep(dst, &mut n);
                     rep(src, &mut n);
                 }
-                Op::AtomicCas { addr, erw, neu } => {
+                Op::AtomicCas { addr, erw, new } => {
                     rep(addr, &mut n);
                     rep(erw, &mut n);
-                    rep(neu, &mut n);
+                    rep(new, &mut n);
                 }
-                Op::ThreadSpawn { arg, stapel, ctid } => {
+                Op::ThreadSpawn { arg, stack, ctid } => {
                     rep(arg, &mut n);
-                    rep(stapel, &mut n);
+                    rep(stack, &mut n);
                     rep(ctid, &mut n);
                 }
                 Op::AtomicAdd { addr, val } => {
@@ -456,9 +456,9 @@ pub(crate) fn copy_propagate(f: &mut Func) -> usize {
                     // Gefunden beim Vergleich des in Firn geschriebenen Lexers
                     // gegen `firnc0` (Runde 20): `10.0` ergab zwei verschiedene
                     // Tokenstroeme, je nachdem ob der Optimierer lief.
-                    let gleitwechsel = (*from == crate::fir::FTy::F64)
+                    let floatswitch = (*from == crate::fir::FTy::F64)
                         != (i.ty == crate::fir::FTy::F64);
-                    if !gleitwechsel
+                    if !floatswitch
                         && (*from == i.ty
                             || (from.bits() == i.ty.bits()
                                 && from.signed() == i.ty.signed()
@@ -729,7 +729,7 @@ mod tests {
     use crate::fir::{CmpOp, FTy, Module, Term};
 
     #[test]
-    fn einmal_geschriebene_alloca_wird_aufgeloest() {
+    fn once_written_alloca_becomes_resolved() {
         let mut f = Func::new("t", vec![], FTy::I32);
         let slot = f.alloca(4, 4);
         let c = f.push(0, FTy::I32, Op::Const(7));
@@ -748,7 +748,7 @@ mod tests {
     }
 
     #[test]
-    fn mehrfach_geschriebene_alloca_bleibt_stehen() {
+    fn multi_written_alloca_stays_stand() {
         let mut f = Func::new("t", vec![], FTy::I32);
         let slot = f.alloca(4, 4);
         let c = f.push(0, FTy::I32, Op::Const(1));
@@ -766,7 +766,7 @@ mod tests {
     }
 
     #[test]
-    fn load_nach_store_wird_im_block_weitergeleitet() {
+    fn load_after_store_becomes_im_block_forwarded() {
         let mut f = Func::new("t", vec![], FTy::I32);
         let slot = f.alloca(4, 4);
         let c = f.push(0, FTy::I32, Op::Const(5));
@@ -779,7 +779,7 @@ mod tests {
     }
 
     #[test]
-    fn aufruf_zwischen_store_und_load_verhindert_weiterleitung() {
+    fn call_between_store_and_load_prevents_forwarding() {
         let mut f = Func::new("t", vec![], FTy::I32);
         let slot = f.alloca(4, 4);
         let c = f.push(0, FTy::I32, Op::Const(5));
@@ -791,7 +791,7 @@ mod tests {
     }
 
     #[test]
-    fn algebraische_identitaeten() {
+    fn algebraic_identities() {
         let mut f = Func::new("t", vec![], FTy::I32);
         let p = f.push(0, FTy::I32, Op::Call { name: "g".into(), args: vec![] });
         let z = f.push(0, FTy::I32, Op::Const(0));
@@ -808,7 +808,7 @@ mod tests {
     }
 
     #[test]
-    fn leere_bloecke_werden_verschmolzen() {
+    fn empty_blocks_become_merged() {
         let mut f = Func::new("t", vec![], FTy::I32);
         let b1 = f.add_block();
         let b2 = f.add_block();
@@ -825,7 +825,7 @@ mod tests {
     }
 
     #[test]
-    fn secret_werte_bleiben_unangetastet() {
+    fn secret_values_stay_untouched() {
         let mut f = Func::new("t", vec![], FTy::I32);
         let slot = f.alloca(4, 4);
         let c = f.push(0, FTy::I32, Op::Const(9));
@@ -838,7 +838,7 @@ mod tests {
     }
 
     #[test]
-    fn select_bleibt_select() {
+    fn select_stays_select() {
         let mut f = Func::new("t", vec![], FTy::I32);
         let c = f.push(0, FTy::Bool, Op::Const(1));
         let a = f.push(0, FTy::I32, Op::Const(1));

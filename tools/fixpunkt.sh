@@ -91,7 +91,7 @@ zeilen=$(wc -l < .firnc2.s)
 echo "FIXPUNKT:  Stufe 2 == Stufe 3, zeichengleich ($zeilen Zeilen Assembler)"
 
 # --- der selbst uebersetzte Compiler am ganzen Korpus ----------------------
-FIRNC1=./.firnc2 bash tools/selbst_vergleich.sh > "$TMPD"/fixpunkt_korpus.txt 2>&1
+FIRNC1=./.firnc2 bash tools/self_compare.sh > "$TMPD"/fixpunkt_korpus.txt 2>&1
 krc=$?
 sed 's/^/  /' "$TMPD"/fixpunkt_korpus.txt
 if [ "$krc" -ne 0 ]; then

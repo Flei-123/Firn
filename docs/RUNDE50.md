@@ -117,7 +117,7 @@ dasselbe Namensschema wie für einen Struct (Runde 45). Zwei Folgen:
 * **Ein Grundtyp bekommt keine Methodentafel.** Eine Tafel gibt es nur je
   Struct-Umsetzung, denn nur ein Struct kann hinter einem `dyn I` stehen
   (`hook_cast` verlangt einen Zeiger auf einen Struct). `(&n) as dyn Zeigbar`
-  mit `n: i64` ist ein Fehler, `tests/neg/schranke_dyn_grundtyp.fi`.
+  mit `n: i64` ist ein Fehler, `tests/neg/bound_dyn_base_ty.fi`.
 
 ---
 
@@ -145,7 +145,7 @@ Stelle nichts zu versenden.
                                  |     call rax
 ```
 
-`tools/schranken/run.sh` hält das fest — und zwar nicht mit der Uhr, sondern
+`tools/bounds/run.sh` hält das fest — und zwar nicht mit der Uhr, sondern
 am erzeugten Code. Zwei Programme, dieselbe Arbeit; geprüft wird:
 
 | Prüfung | Schranke | `dyn` |
@@ -193,7 +193,7 @@ sind die, die eine Methode benennen.
 
 ```
 error: typ 'Kreis' setzt die schnittstelle 'Ordnung' nicht um — schranke am typparameter 'T' von 'kleineres'
-  --> tests/neg/schranke_kein_impl.fi:28:21
+  --> tests/neg/bound_no_impl.fi:28:21
    = hinweis: es fehlt 'fn kleiner(*self, *Self) -> bool' in 'impl Ordnung for Kreis { … }'
 ```
 
@@ -241,24 +241,24 @@ zweite Meldung zu demselben Typargument sagte nichts Neues.
 
 | Datei | Fall |
 |---|---|
-| `schranke_kein_impl.fi` | Typ ohne `impl` (Meldung nennt die Methode) |
-| `schranke_methode_teilweise.fi` | Typ hat eine von zwei Methoden — genannt wird nur die fehlende |
-| `schranke_grundtyp_ohne_impl.fi` | Grundtyp ohne Umsetzung |
-| `schranke_unbekannt.fi` | Schranke auf unbekannter Schnittstelle |
-| `schranke_doppelt.fi` | dieselbe Schranke zweimal (Parser) |
-| `schranke_widerspruch.fi` | `Int + Ordnung`, `Int` verletzt |
-| `schranke_zweite_schnittstelle.fi` | `Ordnung + Anzeige`, zweite verletzt |
-| `schranke_verschachtelt.fi` | Verletzung erst in der ZWEITEN Ausprägungsstufe |
-| `schranke_struct.fi` | Schranke an einem generischen Struct |
-| `schranke_zeigerargument.fi` | Zeiger als Typargument |
-| `schranke_signatur.fi` | `impl` da, Signatur passt nicht (`Self` ≠ `i64`) |
-| `schranke_self_dyn.fi` | `Self`-Methode über `dyn` gerufen |
-| `schranke_dyn_grundtyp.fi` | `as dyn I` auf einem Grundtyp |
-| `schranke_doppelte_umsetzung_grundtyp.fi` | zwei `impl Ord for i32` |
-| `methode_ohne_typ.fi` | Methode auf einem Feldtyp (hat keinen Namen) |
+| `bound_no_impl.fi` | Typ ohne `impl` (Meldung nennt die Methode) |
+| `bound_method_partial.fi` | Typ hat eine von zwei Methoden — genannt wird nur die fehlende |
+| `bound_base_ty_without_impl.fi` | Grundtyp ohne Umsetzung |
+| `bound_unknown.fi` | Schranke auf unbekannter Schnittstelle |
+| `bound_duplicate.fi` | dieselbe Schranke zweimal (Parser) |
+| `bound_contradiction.fi` | `Int + Ordnung`, `Int` verletzt |
+| `bound_second_interface.fi` | `Ordnung + Anzeige`, zweite verletzt |
+| `bound_nested.fi` | Verletzung erst in der ZWEITEN Ausprägungsstufe |
+| `bound_struct.fi` | Schranke an einem generischen Struct |
+| `bound_ptr_arg.fi` | Zeiger als Typargument |
+| `bound_signature.fi` | `impl` da, Signatur passt nicht (`Self` ≠ `i64`) |
+| `bound_self_dyn.fi` | `Self`-Methode über `dyn` gerufen |
+| `bound_dyn_base_ty.fi` | `as dyn I` auf einem Grundtyp |
+| `bound_duplicate_impl_base_ty.fi` | zwei `impl Ord for i32` |
+| `method_without_ty.fi` | Methode auf einem Feldtyp (hat keinen Namen) |
 
 Dazu geändert: `generic_anforderung.fi` (Wortlaut „anforderung" → „schranke")
-und `impl_kein_struct.fi` — dessen alte Meldung („methoden gibt es nur fuer
+und `impl_no_struct.fi` — dessen alte Meldung („methoden gibt es nur fuer
 struct-typen") ist seit dieser Runde falsch; er prüft jetzt, dass `i32.summe()`
 sauber als „typ 'i32' hat keine methode 'summe'" abgelehnt wird.
 
@@ -297,7 +297,7 @@ alten `vec.fi` und **209.579** mit dem neuen. Der Preis für `Ord` und zehn
 Umsetzungen in einem Programm, das sie nicht benutzt, sind also **191 Zeilen
 Assembler (+0,09 %)**.
 
-**Was das bringt** — `tests/831_schranken_std_kern.fi` fährt beide Seiten:
+**Was das bringt** — `tests/831_bounds_std_core.fi` fährt beide Seiten:
 dieselben Funktionen mit `i32` (wie bisher) und mit
 
 ```firn
@@ -322,7 +322,7 @@ Sonst fände die Suche eine Stelle, an der nach der Ordnung nichts steht.
 **Warum `Ord` nicht über einen Schlüssel geht.** Der einfachere Entwurf wäre
 `interface Ord { fn schluessel(*self) -> i64 }` gewesen — ohne `Self`, ohne
 Umsetzungen für Grundtypen. Er scheitert an einem Wert, der schon im
-Testkorpus steht: `tests/802_std_vec_kern.fi` sortiert `u64` und sucht
+Testkorpus steht: `tests/802_std_vec_core.fi` sortiert `u64` und sucht
 `9223372036854775808`. Der passt in kein `i64`. Ein Schlüssel hätte die
 Ordnung für die Hälfte aller `u64` still falsch gemacht.
 
@@ -343,7 +343,7 @@ Ordnung für die Hälfte aller `u64` still falsch gemacht.
 | `lib/firnc1/iface.fi` | +222/−48 | `Self`, Grundtyp-Umsetzungen, `if_umsetzung_da` |
 | `lib/firnc1/mono.fi` | +107/−12 | Schrankenlisten, Schnittstellenschranken |
 | `lib/firnc1/parser.fi` | +55/−17 | `+`-Listen, `Self`-Erkennung |
-| `lib/firnc1/typen.fi` | +32 | `grundtyp_name` (die Umkehrung von `grundtyp`) |
+| `lib/firnc1/types.fi` | +32 | `grundtyp_name` (die Umkehrung von `grundtyp`) |
 | `lib/firnc1/sema.fi`, `lower.fi`, `codegen.fi` | +41/−16 | Methoden auf Grundtypen, keine Tafel für einen Grundtyp |
 
 **Keine neuen FIR-Opcodes.** Die Opcode-Regel dieser Runde (Nummern 30–39
@@ -361,18 +361,18 @@ wiederverwendetes Binary), eigenes `mktemp -d` in jedem Werkzeug.
 | Prüfung | Basis `cc1710f` | jetzt |
 |---|---|---|
 | `bash ./test.sh` | 751/751 | **PASS 773/773** |
-| `bash tools/selbst_vergleich.sh` | 213 gleich / 0 abweichend / 0 fehlerhaft | **215 gleich / 0 abweichend / 0 fehlerhaft** |
+| `bash tools/self_compare.sh` | 213 gleich / 0 abweichend / 0 fehlerhaft | **215 gleich / 0 abweichend / 0 fehlerhaft** |
 | `bash tools/fixpunkt.sh` | zeichengleich, 427.401 Zeilen | **Stufe 2 == Stufe 3, zeichengleich, 431.972 Zeilen** |
 
 Die +22 in `test.sh` erklären sich Datei für Datei: 2 neue Programme x 3
 Baustufen (`830`, `831`) = 6, 15 neue Negativtests = 15, der neue Schritt 8c
-(`tools/schranken/run.sh`) = 1. Die +2 im Selbstvergleich sind dieselben zwei
-Programme; `tests/modules/schranken.fi` zählt nicht mit (`firnc0` übersetzt ein
+(`tools/bounds/run.sh`) = 1. Die +2 im Selbstvergleich sind dieselben zwei
+Programme; `tests/modules/bounds.fi` zählt nicht mit (`firnc0` übersetzt ein
 Modul nicht einzeln).
 
 Beide Vergleichszahlen stammen aus einem EINZELN gestarteten Lauf des
 jeweiligen Skripts, jeweils nach `rm -f .firnc1 .firnc2 .firnc3` — kein
-wiederverwendetes Binary. `tools/fixpunkt.sh` und `tools/schranken/run.sh`
+wiederverwendetes Binary. `tools/fixpunkt.sh` und `tools/bounds/run.sh`
 legen ihr Arbeitsverzeichnis mit `mktemp -d` an; feste `/tmp`-Namen gibt es
 in dieser Runde keine.
 
@@ -475,11 +475,11 @@ substituierte Typ heißt anschließend `schranken.Marke`, der Struct aber
 `schranken__Marke`. Dasselbe gilt für einen modullokalen Typ, der innerhalb
 seines eigenen Moduls als Typargument benutzt wird. Nicht repariert, weil die
 Reparatur die Ausprägungsnamen im ganzen Baum umschreiben müsste — das ist
-eine eigene Runde und berührt `ast_kanon`. `tests/modules/schranken.fi` prüft
+eine eigene Runde und berührt `ast_kanon`. `tests/modules/bounds.fi` prüft
 deshalb, was geht: Schnittstelle und Vorlage im Modul, Umsetzung und
 Typargument in der Wurzeldatei, plus `impl Reihe for u16` im Modul.
 
 **Kleine Falle, festgehalten:** `*self as i64` ist `*(self as i64)` — `as`
 bindet stärker als die unären Operatoren (SPEC §14.1 Punkt 12). Richtig ist
 `(*self) as i64`. Gekostet hat das einen Fehlversuch in
-`tests/modules/schranken.fi`, mit einer Meldung, die auf eine leere Zeile zeigte.
+`tests/modules/bounds.fi`, mit einer Meldung, die auf eine leere Zeile zeigte.

@@ -1,0 +1,187 @@
+// expect_exit: 0
+// RUNDE 49 — FAEDEN, das Fundament (SPEC §7).
+//
+// Geprueft wird, was zugesagt ist:
+//   A  `faden_starten` erzeugt einen ECHTEN Faden (eigene Fadenkennung,
+//      eigener Stapel) und `faden_warten` liefert dessen Ergebnis.
+//   B  Der Mutex verliert keine Erhoehung: vier Faeden zaehlen je 20.000 Mal
+//      unter der Sperre hoch, und am Ende stehen exakt 80.000 da. Zur
+//      Gegenprobe zaehlt derselbe Lauf einen zweiten Zaehler REIN ATOMAR
+//      hoch — beide muessen exakt stimmen.
+//   C  Ein Zaehler OHNE Sperre und OHNE atomare Instruktion verliert
+//      Erhoehungen. Ohne diese Gegenprobe waere B wertlos: der Test bestuende
+//      auch dann, wenn die Faeden gar nicht gleichzeitig liefen.
+//   D  Der Kanal ueberträgt jeden Wert genau einmal.
+//   E  Ein Handle laesst sich nach dem Join wiederverwenden (Plaetze der
+//      Fadentafel werden frei).
+//
+// Dieses Programm hat KEIN `gc class`. Es zieht die Laufzeit allein ueber
+// seine `faden_`-Bezeichner ein (quelle_braucht_gc in gc.rs) — genau das ist
+// hier mitgeprueft, denn der Zustandsblock muss trotzdem im Assembler stehen.
+
+const F_SYS_MMAP: i64 = 9
+const F_PROT_RW: i64 = 3
+const F_MAP_ANON: i64 = 34
+
+const Z_SPERRZ: u64 = 0
+const Z_MUTEX: u64 = 8
+const Z_ATOMZ: u64 = 16
+const Z_ROHZ: u64 = 24
+const Z_KANAL: u64 = 32
+
+const RUNDEN: u64 = 20000
+const KANALWERTE: u64 = 2000
+
+fn page() -> u64 {
+    let r: i64 = syscall(F_SYS_MMAP, 0, 4096, F_PROT_RW, F_MAP_ANON, -1, 0)
+    if r < 0 {
+        return 0
+    }
+    return r as u64
+}
+
+fn ld(a: u64, o: u64) -> u64 {
+    return *((a + o) as *mut u64)
+}
+
+fn st(a: u64, o: u64, v: u64) {
+    *((a + o) as *mut u64) = v
+}
+
+// DER VERTEILER. Stufe 0 hat keine Funktionszeiger; ein Faden traegt eine
+// ARBEITSART, genau wie ein Objekt eine Aufraeumart traegt (Runde 47).
+fn __thread_work(kind: u64, arg: u64) -> u64 {
+    if kind == 1 {
+        var i: u64 = 0
+        while i < RUNDEN {
+            thread_lock((arg + Z_MUTEX) as *mut u64)
+            st(arg, Z_SPERRZ, ld(arg, Z_SPERRZ) + 1)
+            thread_unlock((arg + Z_MUTEX) as *mut u64)
+            __atomic_add((arg + Z_ATOMZ) as *mut u64, 1)
+            // Gegenprobe: dasselbe ohne Sperre und ohne atomare Instruktion.
+            st(arg, Z_ROHZ, ld(arg, Z_ROHZ) + 1)
+            i = i + 1
+        }
+        return RUNDEN
+    }
+    if kind == 2 {
+        let k: u64 = ld(arg, Z_KANAL)
+        var i: u64 = 0
+        var s: u64 = 0
+        while i < KANALWERTE {
+            thread_channel_send(k, i + 1)
+            s = s + i + 1
+            i = i + 1
+        }
+        return s
+    }
+    if kind == 3 {
+        return arg * 3
+    }
+    return 0
+}
+
+fn main() -> i32 {
+    if !thread_init() {
+        return 90
+    }
+    let z: u64 = page()
+    if z == 0 {
+        return 91
+    }
+
+    // --- A/E: ein Faden, sein Ergebnis, sein Platz --------------------------
+    let h0: u64 = thread_start(3, 14)
+    if h0 == 0 {
+        return 1
+    }
+    if thread_wait(h0) != 42 {
+        return 2
+    }
+    let h1: u64 = thread_start(3, 15)
+    if h1 == 0 {
+        return 3
+    }
+    if thread_wait(h1) != 45 {
+        return 4
+    }
+    // Der Platz wurde wiederverwendet — sonst waere die Tafel nach 64
+    // Faeden erschoepft.
+    if h1 != h0 {
+        return 5
+    }
+    if thread_started() != 2 {
+        return 6
+    }
+
+    // --- B/C: vier Faeden, drei Zaehler -------------------------------------
+    var h: [u64; 4] = [0; 4]
+    var i: u64 = 0
+    while i < 4 {
+        h[i as usize] = thread_start(1, z)
+        if h[i as usize] == 0 {
+            return 10
+        }
+        i = i + 1
+    }
+    var sum: u64 = 0
+    i = 0
+    while i < 4 {
+        sum = sum + thread_wait(h[i as usize])
+        i = i + 1
+    }
+    if sum != 4 * RUNDEN {
+        return 11
+    }
+    if ld(z, Z_SPERRZ) != 4 * RUNDEN {
+        return 12
+    }
+    if ld(z, Z_ATOMZ) != 4 * RUNDEN {
+        return 13
+    }
+    // Die Gegenprobe MUSS verlieren. Tut sie das nicht, liefen die Faeden
+    // nicht wirklich gleichzeitig, und B belegt nichts.
+    if ld(z, Z_ROHZ) >= 4 * RUNDEN {
+        return 14
+    }
+
+    // --- D: der Kanal --------------------------------------------------------
+    let k: u64 = thread_channel_new(64)
+    if k == 0 {
+        return 20
+    }
+    st(z, Z_KANAL, k)
+    let hs: u64 = thread_start(2, z)
+    if hs == 0 {
+        return 21
+    }
+    var receive: u64 = 0
+    var n: u64 = 0
+    while n < KANALWERTE {
+        receive = receive + thread_channel_receive(k)
+        n = n + 1
+    }
+    let sent: u64 = thread_wait(hs)
+    if receive != sent {
+        return 22
+    }
+    if receive != KANALWERTE * (KANALWERTE + 1) / 2 {
+        return 23
+    }
+    if thread_channel_used(k) != 0 {
+        return 24
+    }
+    thread_channel_free(k)
+
+    // --- Buchhaltung ---------------------------------------------------------
+    if thread_count() != 1 {
+        return 30
+    }
+    if thread_multithreaded() != 1 {
+        return 31
+    }
+    if thread_tid() == 0 {
+        return 32
+    }
+    return 0
+}

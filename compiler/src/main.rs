@@ -6,10 +6,10 @@
 
 mod abi;
 mod ast;
-mod ast_kanon;
-mod layout_kanon;
-mod atomar;
-mod faden;
+mod ast_canon;
+mod layout_canon;
+mod atomic;
+mod thread;
 mod attrs;
 mod codegen_switch;
 mod codegen_x86;
@@ -19,13 +19,13 @@ mod ct;
 mod diag;
 mod dwarf;
 mod errors;
-mod faedeln;
+mod threading;
 mod fir;
 mod gc;
 mod gc_lower;
 mod iface;
 mod impls;
-mod kern;
+mod core;
 mod inline;
 mod layout;
 mod lexer;
@@ -38,9 +38,9 @@ mod mono;
 mod mem2reg;
 mod nogc;
 mod opt;
-mod paket;
-mod paketwelt;
-mod profil;
+mod package;
+mod package_world;
+mod prof;
 mod parser;
 mod regalloc;
 mod sema;
@@ -58,9 +58,9 @@ enum Emit {
     Exe,
     Asm,
     Tokens,
-    AstKanon,
-    LayoutKanon,
-    TypenKanon,
+    AstCanon,
+    LayoutCanon,
+    TypesCanon,
     Ast,
     /// FIR nach dem Lowering (unoptimiert)
     FirRaw,
@@ -75,9 +75,9 @@ struct Options {
     input: Option<PathBuf>,
     output: Option<PathBuf>,
     /// `--paket <verzeichnis>`: Projekt anhand seines Manifests uebersetzen.
-    paket: Option<String>,
+    package: Option<String>,
     /// `--paket-info <verzeichnis>`: Manifest lesen und berichten.
-    paket_info: Option<String>,
+    package_info: Option<String>,
     emit: Emit,
     optimize: bool,
     keep_asm: bool,
@@ -86,7 +86,7 @@ struct Options {
     optcfg: opt::OptConfig,
     /// `-c` / `--objekt`: nur assemblieren, NICHT linken (Runde 52).
     /// Im Profil `kernel` ohnehin immer an (SPEC §2: Ziel ist ein ELF-Objekt).
-    nur_objekt: bool,
+    only_object: bool,
 }
 
 fn usage() -> String {
@@ -135,14 +135,14 @@ fn usage() -> String {
 fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut input: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
-    let mut paket: Option<String> = None;
-    let mut paket_info: Option<String> = None;
+    let mut package: Option<String> = None;
+    let mut package_info: Option<String> = None;
     let mut emit = Emit::Exe;
     let mut optimize = true;
     let mut keep_asm = false;
     let mut stats = false;
     let mut optcfg = opt::OptConfig::default();
-    let mut nur_objekt = false;
+    let mut only_object = false;
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -206,9 +206,9 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                     }
                 }
             }
-            "-c" | "--objekt" => nur_objekt = true,
+            "-c" | "--object" => only_object = true,
             _ if a.starts_with("--profile=") => {
-                if let Err(e) = profil::flagge_setzen(&a["--profile=".len()..]) {
+                if let Err(e) = prof::flag_set(&a["--profile=".len()..]) {
                     return Err(e);
                 }
             }
@@ -224,17 +224,17 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             // Runde 48: der Bau-Treiber. Beide Optionen nehmen ihr
             // Verzeichnis als EIGENES Argument — `firnc1` liest die
             // Kommandozeile genauso.
-            "--paket" => {
+            "--package" => {
                 i += 1;
                 match args.get(i) {
-                    Some(p) => paket = Some(p.clone()),
+                    Some(p) => package = Some(p.clone()),
                     None => return Err("--paket erwartet ein Verzeichnis".to_string()),
                 }
             }
-            "--paket-info" => {
+            "--package-info" => {
                 i += 1;
                 match args.get(i) {
-                    Some(p) => paket_info = Some(p.clone()),
+                    Some(p) => package_info = Some(p.clone()),
                     None => return Err("--paket-info erwartet ein Verzeichnis".to_string()),
                 }
             }
@@ -248,9 +248,9 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                         "fir-opt" => Emit::FirOpt,
                         "comptime" => Emit::Comptime,
                         "tokens" => Emit::Tokens,
-                        "ast-kanon" => Emit::AstKanon,
-                        "layout" => Emit::LayoutKanon,
-                        "typen" => Emit::TypenKanon,
+                        "ast-canon" => Emit::AstCanon,
+                        "layout" => Emit::LayoutCanon,
+                        "types" => Emit::TypesCanon,
                         "ast" => Emit::Ast,
                         other => return Err(format!("unbekanntes Ausgabeziel '{}'", other)),
                     };
@@ -269,20 +269,20 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         }
         i += 1;
     }
-    if input.is_none() && paket.is_none() && paket_info.is_none() {
+    if input.is_none() && package.is_none() && package_info.is_none() {
         return Err(format!("keine Eingabedatei angegeben (.{})", config::FILE_EXT));
     }
     Ok(Options {
         input,
         output,
-        paket,
-        paket_info,
+        package,
+        package_info,
         emit,
         optimize,
         keep_asm,
         stats,
         optcfg,
-        nur_objekt,
+        only_object,
     })
 }
 
@@ -306,19 +306,19 @@ fn main() {
 fn run(opts: &Options) -> i32 {
     // Runde 49: Merker „Laufzeit eingezogen" gehoert zum Anfang einer
     // Uebersetzung (codegen_x86::emit gibt danach den Zustandsblock aus).
-    crate::gc::laufzeit_reset();
+    crate::gc::runtime_reset();
     // Der Satz steht hier und nicht in `parse_args`, weil `firnc1` ihn
     // ZEICHENGLEICH schreiben muss und dort keine `--help`-Nachbemerkung
     // hat (Runde 48).
-    if opts.paket.is_some() && opts.input.is_some() {
+    if opts.package.is_some() && opts.input.is_some() {
         eprint!("error: --paket und eine eingabedatei schliessen einander aus\n");
         return 2;
     }
     // --- `--paket-info`: Manifest lesen, pruefen, berichten (Runde 48) ---
-    if let Some(verz) = &opts.paket_info {
-        match paketwelt::Welt::ab_wurzel(verz) {
+    if let Some(dir) = &opts.package_info {
+        match package_world::World::ab_root(dir) {
             Ok(w) => {
-                print!("{}", paket::info_text(&w.pakete[0].manifest, verz));
+                print!("{}", package::info_text(&w.packages[0].manifest, dir));
                 return 0;
             }
             Err(t) => {
@@ -330,26 +330,26 @@ fn run(opts: &Options) -> i32 {
     // --- Paketwelt: mit `--paket` das genannte Projekt, sonst das Manifest
     // ueber der Quelldatei (fehlt eins, ist die Welt leer und nichts aendert
     // sich gegenueber Runde 47).
-    let (welt, eingabe, ziel_aus_manifest) = match &opts.paket {
-        Some(verz) => {
-            let w = match paketwelt::Welt::ab_wurzel(verz) {
+    let (world, input, target_out_manifest) = match &opts.package {
+        Some(dir) => {
+            let w = match package_world::World::ab_root(dir) {
                 Ok(w) => w,
                 Err(t) => {
                     eprint!("{}", t);
                     return 2;
                 }
             };
-            let m = &w.pakete[0].manifest;
+            let m = &w.packages[0].manifest;
             if m.start.is_empty() {
                 eprintln!(
                     "error: {}: das manifest hat keinen einstiegspunkt ('start <pfad>')",
-                    w.pakete[0].manifestpfad
+                    w.packages[0].manifestpfad
                 );
                 return 2;
             }
-            let start = PathBuf::from(paket::verbinde(verz, &m.start));
-            let ziel = PathBuf::from(paket::verbinde(verz, &m.name));
-            (w, start, Some(ziel))
+            let start = PathBuf::from(package::join(dir, &m.start));
+            let target = PathBuf::from(package::join(dir, &m.name));
+            (w, start, Some(target))
         }
         None => {
             let p = match &opts.input {
@@ -359,7 +359,7 @@ fn run(opts: &Options) -> i32 {
                     return 2;
                 }
             };
-            let w = match paketwelt::Welt::ab_datei(&p.display().to_string()) {
+            let w = match package_world::World::ab_file(&p.display().to_string()) {
                 Ok(w) => w,
                 Err(t) => {
                     eprint!("{}", t);
@@ -369,15 +369,15 @@ fn run(opts: &Options) -> i32 {
             (w, p, None)
         }
     };
-    let path = &eingabe;
+    let path = &input;
     // --- Module aufloesen (Wurzeldatei + alle 'import'-Module) ---
-    let files = match modules::resolve(path, &welt) {
+    let files = match modules::resolve(path, &world) {
         Ok(f) => f,
-        Err(modules::Fehler::Paket(t)) => {
+        Err(modules::Error::Package(t)) => {
             eprint!("{}", t);
             return 2;
         }
-        Err(modules::Fehler::Diag(d)) => {
+        Err(modules::Error::Diag(d)) => {
             // Fehler der Modulaufloesung im ueblichen Format ausgeben.
             let src = std::fs::read_to_string(path).unwrap_or_default();
             let mut dg = diag::Diags::new(&path.display().to_string(), &src);
@@ -402,7 +402,7 @@ fn run(opts: &Options) -> i32 {
         !opts.optimize,
     );
 
-    if opts.emit == Emit::TypenKanon {
+    if opts.emit == Emit::TypesCanon {
         let toks = lexer::lex(&root.src, &mut dg);
         let prog = parser::parse(&toks, &mut dg);
         if dg.has_errors() {
@@ -411,7 +411,7 @@ fn run(opts: &Options) -> i32 {
         }
         match sema::check(&prog, &mut dg) {
             Some(info) => {
-                print!("{}", ast_kanon::render_typed(&prog, &info));
+                print!("{}", ast_canon::render_typed(&prog, &info));
                 0
             }
             None => {
@@ -422,18 +422,18 @@ fn run(opts: &Options) -> i32 {
         return if dg.has_errors() { 1 } else { 0 };
     }
 
-    if opts.emit == Emit::LayoutKanon {
+    if opts.emit == Emit::LayoutCanon {
         let toks = lexer::lex(&root.src, &mut dg);
         let prog = parser::parse(&toks, &mut dg);
         if dg.has_errors() {
             dg.print();
             return 1;
         }
-        print!("{}", layout_kanon::render(&prog));
+        print!("{}", layout_canon::render(&prog));
         return 0;
     }
 
-    if opts.emit == Emit::AstKanon {
+    if opts.emit == Emit::AstCanon {
         // NUR die Wurzeldatei, VOR dem Zusammenfuehren der Module und vor der
         // Monomorphisierung: der Parser in Firn sieht ebenfalls genau eine
         // Datei. Alles andere waere kein Vergleich, sondern ein Vergleich mit
@@ -444,7 +444,7 @@ fn run(opts: &Options) -> i32 {
             dg.print();
             return 1;
         }
-        print!("{}", ast_kanon::render(&prog));
+        print!("{}", ast_canon::render(&prog));
         return 0;
     }
 
@@ -469,35 +469,35 @@ fn run(opts: &Options) -> i32 {
     // angehaengt — danach sieht der Typpruefer keinen Unterschied zu von Hand
     // geschriebenem Quelltext. Genau das verlangt Abnahmepunkt 6 fuer die
     // Unicode-, Web-IDL- und CSS-Tabellen eines Browsers.
-    let basis = root
+    let base = root
         .path
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let erzeugt = comptime::fuehre_bloecke_aus(&prog, &mut dg, &basis);
-    if !erzeugt.is_empty() && !dg.has_errors() {
-        let datei = dg.add_file("<comptime>", &erzeugt);
+    let generated = comptime::run_blocks_out(&prog, &mut dg, &base);
+    if !generated.is_empty() && !dg.has_errors() {
+        let file = dg.add_file("<comptime>", &generated);
         // Dieselbe Datei muss auch die Zeilentabelle kennen, sonst erzeugt der
         // Codegenerator `.loc`-Direktiven mit einer Nummer, die `as` nicht
         // kennt ("unassigned file number").
         dwarf::add_file("<comptime>");
-        let toks = lexer::lex_file(&erzeugt, datei, &mut dg);
-        let mut zusatz = parser::parse(&toks, &mut dg);
+        let toks = lexer::lex_file(&generated, file, &mut dg);
+        let mut extra = parser::parse(&toks, &mut dg);
         // Die Ausdrucks-Ids des Zusatzes beginnen bei 0 und muessen hinter
         // die des Hauptprogramms wandern.
-        let mut naechste = prog.expr_count;
-        for f in zusatz.funcs.iter_mut() {
-            crate::mono::renumber_block(&mut f.body, &mut naechste);
+        let mut next = prog.expr_count;
+        for f in extra.funcs.iter_mut() {
+            crate::mono::renumber_block(&mut f.body, &mut next);
         }
-        for c in zusatz.consts.iter_mut() {
-            crate::mono::renumber_expr(&mut c.value, &mut naechste);
+        for c in extra.consts.iter_mut() {
+            crate::mono::renumber_expr(&mut c.value, &mut next);
         }
-        prog.expr_count = naechste;
-        prog.funcs.extend(zusatz.funcs);
-        prog.structs.extend(zusatz.structs);
-        prog.consts.extend(zusatz.consts);
+        prog.expr_count = next;
+        prog.funcs.extend(extra.funcs);
+        prog.structs.extend(extra.structs);
+        prog.consts.extend(extra.consts);
         if opts.emit == Emit::Comptime {
-            print!("{}", erzeugt);
+            print!("{}", generated);
             return if dg.has_errors() { report(&dg) } else { 0 };
         }
     }
@@ -553,9 +553,9 @@ fn run(opts: &Options) -> i32 {
     if opts.stats {
         eprintln!(
             "profil:     {}{}",
-            profil::name(),
-            if kern::block_anzahl() > 0 {
-                format!("  ({} asm-bloecke)", kern::block_anzahl())
+            prof::name(),
+            if core::block_count() > 0 {
+                format!("  ({} asm-bloecke)", core::block_count())
             } else {
                 String::new()
             }
@@ -610,7 +610,7 @@ fn run(opts: &Options) -> i32 {
     let out = opts
         .output
         .clone()
-        .or_else(|| ziel_aus_manifest.clone())
+        .or_else(|| target_out_manifest.clone())
         .unwrap_or_else(|| default_output(path));
     if opts.emit == Emit::Asm {
         if let Err(e) = std::fs::write(&out, asm.as_bytes()) {
@@ -625,13 +625,13 @@ fn run(opts: &Options) -> i32 {
     // RUNDE 52 (SPEC §2): das Kernel-Profil erzeugt eine freistehende
     // ELF-OBJEKTDATEI. Kein `ld`, kein `_start`, kein libc-Kontakt — gelinkt
     // wird spaeter vom Kernel-Bau mit dessen eigenem Linkerskript.
-    let objekt = opts.nur_objekt || profil::ist_kernel();
+    let object = opts.only_object || prof::is_kernel();
     let asm_path = out.with_extension("s");
     if let Err(e) = std::fs::write(&asm_path, asm.as_bytes()) {
         eprintln!("error: kann '{}' nicht schreiben: {}", asm_path.display(), e);
         return 2;
     }
-    if objekt {
+    if object {
         // Ohne `-o` heisst das Ergebnis `<eingabe>.o`; mit `-o` genau so, wie
         // es dasteht (dann darf der Name auch ohne Endung bleiben).
         let obj_path = match &opts.output {

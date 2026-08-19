@@ -106,7 +106,7 @@ pub(crate) fn hook_write_into(lo: &mut Lower, addr: Val, e: &Expr) -> Option<Opt
     let k = kind_of(e)?;
     Some(match k {
         Kind::Ctor(code) => {
-            let c = lo.konst(FTy::U32, code);
+            let c = lo.constant(FTy::U32, code);
             lo.store(FTy::U32, addr, c);
             Some(())
         }
@@ -151,7 +151,7 @@ pub(crate) fn hook_stmt(lo: &mut Lower, e: &Expr) -> Option<Option<()>> {
         Kind::Ctor(code) => {
             let (size, align) = lo.size_align(&lo.ty_of(e));
             let slot = lo.alloca(size, align);
-            let c = lo.konst(FTy::U32, code);
+            let c = lo.constant(FTy::U32, code);
             lo.store(FTy::U32, slot, c);
             Some(())
         }
@@ -236,7 +236,7 @@ fn write_union_inner(
 ) -> Option<()> {
     match c.kind {
         CoerceKind::FromValue => {
-            let zero = lo.konst(FTy::U32, 0);
+            let zero = lo.constant(FTy::U32, 0);
             lo.store(FTy::U32, addr, zero);
             // Schicht Feldzugriff <-> Speicherort (layout.rs, DESIGNZIELE 8)
             let va = lo.field_addr_at(addr, c.union.val_off);
@@ -253,7 +253,7 @@ fn write_union_inner(
 /// Fehlercode eines Ausdrucks vom Typ einer Fehlermenge.
 fn error_code(lo: &mut Lower, e: &Expr) -> Option<Val> {
     if let Some(Kind::Ctor(code)) = kind_of(e) {
-        return Some(lo.konst(FTy::U32, code));
+        return Some(lo.constant(FTy::U32, code));
     }
     let a = lo.lower_addr(e)?;
     Some(lo.load(FTy::U32, a))
@@ -262,7 +262,7 @@ fn error_code(lo: &mut Lower, e: &Expr) -> Option<Val> {
 fn ctor_addr(lo: &mut Lower, e: &Expr, code: i128) -> Option<Val> {
     let (size, align) = lo.size_align(&lo.ty_of(e));
     let slot = lo.alloca(size, align);
-    let c = lo.konst(FTy::U32, code);
+    let c = lo.constant(FTy::U32, code);
     lo.store(FTy::U32, slot, c);
     Some(slot)
 }
@@ -303,12 +303,12 @@ fn scalar_fty(t: &Type) -> Option<FTy> {
 fn do_return(lo: &mut Lower, v: &Expr, c: &crate::errors::CoerceInfo) -> Option<()> {
     // `return E::Variante` ist der Fehlerpfad, `return wert` der Erfolgspfad —
     // der Typpruefer hat das bereits entschieden (`CoerceKind`).
-    let fehlerpfad = matches!(c.kind, CoerceKind::FromError);
+    let error_path = matches!(c.kind, CoerceKind::FromError);
     match lo.sret {
         Some(dst) => {
             write_union(lo, dst, v, c)?;
-            if fehlerpfad {
-                lo.ret_term_fehler(Some(dst));
+            if error_path {
+                lo.ret_term_error(Some(dst));
             } else {
                 lo.ret_term(Some(dst));
             }
@@ -318,12 +318,12 @@ fn do_return(lo: &mut Lower, v: &Expr, c: &crate::errors::CoerceInfo) -> Option<
             // (abi.rs). Der Zwischenspeicher wird genullt, damit die
             // Fuellbytes in jeder Baustufe denselben Wert haben.
             let slot = lo.alloca(8, 8);
-            let zero = lo.konst(FTy::I64, 0);
+            let zero = lo.constant(FTy::I64, 0);
             lo.store(FTy::I64, slot, zero);
             write_union(lo, slot, v, c)?;
             let w = lo.load(FTy::I64, slot);
-            if fehlerpfad {
-                lo.ret_term_fehler(Some(w));
+            if error_path {
+                lo.ret_term_error(Some(w));
             } else {
                 lo.ret_term(Some(w));
             }
@@ -338,15 +338,15 @@ fn return_error(lo: &mut Lower, code: Val) -> Option<()> {
     match lo.sret {
         Some(dst) => {
             lo.store(FTy::U32, dst, code);
-            lo.ret_term_fehler(Some(dst));
+            lo.ret_term_error(Some(dst));
         }
         None => {
             let slot = lo.alloca(8, 8);
-            let zero = lo.konst(FTy::I64, 0);
+            let zero = lo.constant(FTy::I64, 0);
             lo.store(FTy::I64, slot, zero);
             lo.store(FTy::U32, slot, code);
             let w = lo.load(FTy::I64, slot);
-            lo.ret_term_fehler(Some(w));
+            lo.ret_term_error(Some(w));
         }
     }
     Some(())
@@ -365,7 +365,7 @@ fn try_value_addr(lo: &mut Lower, e: &Expr) -> Option<Val> {
     };
     let src = lo.lower_addr(&arg)?;
     let code = lo.load(FTy::U32, src);
-    let zero = lo.konst(FTy::U32, 0);
+    let zero = lo.constant(FTy::U32, 0);
     let bad = lo.push(
         FTy::Bool,
         Op::Cmp { op: CmpOp::Ne, ty: FTy::U32, a: code, b: zero },
@@ -395,15 +395,15 @@ fn catch_slot(lo: &mut Lower, e: &Expr) -> Option<Val> {
     let slot = lo.alloca(size, align);
     let src = lo.lower_addr(&lhs)?;
     let code = lo.load(FTy::U32, src);
-    let zero = lo.konst(FTy::U32, 0);
+    let zero = lo.constant(FTy::U32, 0);
     let good = lo.push(
         FTy::Bool,
         Op::Cmp { op: CmpOp::Eq, ty: FTy::U32, a: code, b: zero },
     );
     let ok_bb = lo.new_block();
-    let alt_bb = lo.new_block();
+    let old_bb = lo.new_block();
     let join = lo.new_block();
-    lo.set_term(Term::BrCond { cond: good, then_bb: ok_bb, else_bb: alt_bb });
+    lo.set_term(Term::BrCond { cond: good, then_bb: ok_bb, else_bb: old_bb });
 
     lo.cur = ok_bb;
     // Schicht Feldzugriff <-> Speicherort (layout.rs, DESIGNZIELE 8)
@@ -413,7 +413,7 @@ fn catch_slot(lo: &mut Lower, e: &Expr) -> Option<Val> {
         lo.set_term(Term::Br(join));
     }
 
-    lo.cur = alt_bb;
+    lo.cur = old_bb;
     let bind = catch_bind(e.id);
     if let Some(name) = &bind {
         // `catch |e| …`: der Fehlerwert liegt im Ersatzausdruck als Variable

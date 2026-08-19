@@ -324,7 +324,7 @@ impl<'a> Parser<'a> {
             size: 0,
             align: 1,
         };
-        let doppelt = REG.with(|r| {
+        let duplicate = REG.with(|r| {
             let mut reg = r.borrow_mut();
             if reg.by_name.contains_key(&name) {
                 return true;
@@ -334,7 +334,7 @@ impl<'a> Parser<'a> {
             reg.by_name.insert(name.clone(), i);
             false
         });
-        if doppelt {
+        if duplicate {
             self.dg
                 .error(nspan, format!("aufzaehlung '{}' ist bereits deklariert", name));
         }
@@ -1131,68 +1131,68 @@ fn fits(v: i128, t: &Type) -> bool {
 /// wenn der Musterabgleich einen Fall nicht abdeckt. Das ist ein Fehler, kein
 /// Warnhinweis — der Aufrufer meldet ihn ueber `Diags`.
 pub fn check_exhaustive(subject: &Subject, arms: &[Arm], span: Span) -> Result<(), Diag> {
-    let hat_catchall = arms.iter().any(|a| a.pat.is_irrefutable());
+    let has_catchall = arms.iter().any(|a| a.pat.is_irrefutable());
     match subject {
         Subject::Bad => Ok(()),
         Subject::Enum(def) => {
-            if hat_catchall {
+            if has_catchall {
                 return Ok(());
             }
-            let mut fehlend: Vec<String> = Vec::new();
+            let mut missing: Vec<String> = Vec::new();
             for v in &def.variants {
-                let abgedeckt = arms.iter().any(|a| match &a.pat {
+                let covered = arms.iter().any(|a| match &a.pat {
                     Pattern::Variant { vname, subs, .. } => {
                         *vname == v.name && subs.iter().all(|s| s.is_irrefutable())
                     }
                     _ => false,
                 });
-                if !abgedeckt {
-                    fehlend.push(format!("{}::{}", def.name, v.name));
+                if !covered {
+                    missing.push(format!("{}::{}", def.name, v.name));
                 }
             }
-            if fehlend.is_empty() {
+            if missing.is_empty() {
                 return Ok(());
             }
-            let liste = fehlend.join(", ");
+            let list = missing.join(", ");
             Err(Diag {
                 msg: format!(
                     "'match' ist nicht vollstaendig: {} nicht abgedeckt",
-                    if fehlend.len() == 1 {
-                        format!("die variante {} ist", liste)
+                    if missing.len() == 1 {
+                        format!("die variante {} ist", list)
                     } else {
-                        format!("die varianten {} sind", liste)
+                        format!("die varianten {} sind", list)
                     }
                 ),
                 span,
                 label: "hier".to_string(),
                 note: Some(format!(
                     "ergaenze einen fall '{} => {{ }}' oder '_ => {{ }}'",
-                    fehlend[0]
+                    missing[0]
                 )),
             })
         }
         Subject::Bool => {
-            if hat_catchall {
+            if has_catchall {
                 return Ok(());
             }
-            let hat = |b: bool| {
+            let has = |b: bool| {
                 arms.iter()
                     .any(|a| matches!(&a.pat, Pattern::Bool(x, _) if *x == b))
             };
-            let mut fehlend = Vec::new();
-            if !hat(true) {
-                fehlend.push("true");
+            let mut missing = Vec::new();
+            if !has(true) {
+                missing.push("true");
             }
-            if !hat(false) {
-                fehlend.push("false");
+            if !has(false) {
+                missing.push("false");
             }
-            if fehlend.is_empty() {
+            if missing.is_empty() {
                 return Ok(());
             }
             Err(Diag {
                 msg: format!(
                     "'match' ist nicht vollstaendig: der fall {} fehlt",
-                    fehlend.join(" und ")
+                    missing.join(" und ")
                 ),
                 span,
                 label: "hier".to_string(),
@@ -1200,7 +1200,7 @@ pub fn check_exhaustive(subject: &Subject, arms: &[Arm], span: Span) -> Result<(
             })
         }
         Subject::Int(t) => {
-            if hat_catchall {
+            if has_catchall {
                 return Ok(());
             }
             Err(Diag {
@@ -1236,7 +1236,7 @@ fn type_name(t: &Type) -> &'static str {
 mod tests {
     use crate::diag::Diags;
 
-    fn uebersetze(src: &str) -> (String, bool) {
+    fn compile(src: &str) -> (String, bool) {
         let mut dg = Diags::new("test.fi", src);
         let toks = crate::lexer::lex(src, &mut dg);
         let mut prog = crate::parser::parse(&toks, &mut dg);
@@ -1258,7 +1258,7 @@ mod tests {
     }
 
     #[test]
-    fn fehlende_variante_ist_ein_fehler_mit_namen() {
+    fn missing_variant_is_in_error_with_names() {
         let src = "\
 enum T { A, B(i32), C }
 fn main() -> i32 {
@@ -1270,14 +1270,14 @@ fn main() -> i32 {
     return 0 as i32
 }
 ";
-        let (out, ok) = uebersetze(src);
+        let (out, ok) = compile(src);
         assert!(!ok, "unvollstaendiges match muss ein fehler sein:\n{}", out);
         assert!(out.contains("nicht vollstaendig"), "{}", out);
         assert!(out.contains("T::C"), "{}", out);
     }
 
     #[test]
-    fn vollstaendiges_match_uebersetzt() {
+    fn complete_match_compiled() {
         let src = "\
 enum T { A, B(i32) }
 fn main() -> i32 {
@@ -1290,12 +1290,12 @@ fn main() -> i32 {
     return r
 }
 ";
-        let (out, ok) = uebersetze(src);
+        let (out, ok) = compile(src);
         assert!(ok, "{}", out);
     }
 
     #[test]
-    fn ganzzahl_match_braucht_einen_auffangfall() {
+    fn int_match_needs_a_catch_arm() {
         let src = "\
 fn main() -> i32 {
     let n: i32 = 3 as i32
@@ -1306,13 +1306,13 @@ fn main() -> i32 {
     return 0 as i32
 }
 ";
-        let (out, ok) = uebersetze(src);
+        let (out, ok) = compile(src);
         assert!(!ok, "{}", out);
         assert!(out.contains("nicht vollstaendig"), "{}", out);
     }
 
     #[test]
-    fn layout_tag_und_nutzdaten() {
+    fn layout_tag_and_payload() {
         let src = "\
 enum T { A, B(i64) }
 fn main() -> i32 { return 0 as i32 }

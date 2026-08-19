@@ -90,7 +90,7 @@ impl Lower<'_> {
         } else {
             self.push(FTy::U64, Op::Cast { src: index, from: index_ty })
         };
-        let sz = self.konst(FTy::U64, elem_size as i128);
+        let sz = self.constant(FTy::U64, elem_size as i128);
         let off = self.push(FTy::U64, Op::Bin(FBin::Mul, idx64, sz));
         self.push(FTy::Ptr, Op::PtrAdd { base, off })
     }
