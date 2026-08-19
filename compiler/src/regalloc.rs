@@ -3124,8 +3124,19 @@ mod tests {
         f.set_term(0, Term::Ret(Some(w)));
         let asm = emit(&Module { funcs: vec![f] }).expect("codegen");
         let rumpf = asm.split("main:").nth(1).unwrap();
+        // Die 32-Bit-Addition muss als EIGENE Instruktion dastehen. Welches
+        // Register der Verteiler dafuer waehlt, ist seine Sache: die schmale
+        // Sicht heisst `eax`..`edi`, aber `r8d`..`r15d` bei den erweiterten
+        // (der Merge der Runde 49 hat die Wahl auf `r10d` verschoben — der
+        // alte Test suchte nur nach "add e" und schlug deshalb an, obwohl
+        // der Code richtig war).
+        let schmale_addition = rumpf.lines().any(|l| {
+            let l = l.trim();
+            l.starts_with("add e")
+                || (l.starts_with("add r") && l.split(',').next().is_some_and(|r| r.ends_with('d')))
+        });
         assert!(
-            rumpf.contains("add e") || rumpf.contains("lea "),
+            schmale_addition || rumpf.contains("lea "),
             "32-Bit-Addition muss eine eigene Instruktion bleiben:\n{}",
             asm
         );
