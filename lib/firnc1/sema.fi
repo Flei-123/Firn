@@ -34,11 +34,13 @@ import typen
 import muster
 import fehler
 import gc
+import iface
 import nogc
 
 export { Sema, sema_neu, sema_frei, sema_lauf, sema_fehler, sema_typ,
          sema_typen, sema_typ_anzahl, sema_braucht_comptime, sema_konst_wert,
-         sema_mu_setzen, sema_fe_setzen, sema_gc_setzen, sema_baum }
+         sema_mu_setzen, sema_fe_setzen, sema_gc_setzen, sema_if_setzen,
+         sema_baum }
 
 const KEIN: u32 = 4294967295
 
@@ -63,6 +65,7 @@ struct Sema {
     mu: u64,             // Register der Aufzaehlungen/Musterabgleiche (0 = keins)
     feh: u64,            // Register der Fehlermengen/-unionen (0 = keins)
     gc: u64,             // Registrierung der gc-Klassen (Runde 34; 0 = keine)
+    ifr: u64,            // Registrierung der Schnittstellen (Runde 46; 0 = keine)
     // `#[must_consume]` (Runde 36, attrs.rs/sema.rs::check_attrs): Namensnummern
     // der gekennzeichneten Funktionen und StructINDIZES der gekennzeichneten Typen.
     mc_fname: Vec[u32],
@@ -79,7 +82,7 @@ fn sema_neu(b: u64, it: u64) -> Sema {
         v_name: vec_neu[u32](), v_typ: vec_neu[u32](), b_grenze: vec_neu[u32](),
         k_name: vec_neu[u32](), k_typ: vec_neu[u32](), k_wert: vec_neu[u64](),
         t_bool: 0, t_i64: 0, t_usize: 0, t_void: 0, t_fehler: 0, t_f64: 0,
-        ret: 0, mu: 0, feh: 0, gc: 0, mc_fname: vec_neu[u32](), mc_si: vec_neu[u32](),
+        ret: 0, mu: 0, feh: 0, gc: 0, ifr: 0, mc_fname: vec_neu[u32](), mc_si: vec_neu[u32](),
         fehler: 0, ct_noetig: false,
     }
 }
@@ -116,6 +119,13 @@ fn sema_gc_setzen(s: *mut Sema, g: u64) { (*s).gc = g }
 
 fn gcp(s: *mut Sema) -> *mut gc.Gc { return (*s).gc as *mut gc.Gc }
 fn hat_gc(s: *mut Sema) -> bool { return (*s).gc != 0 }
+
+// Die Schnittstellen-Registrierung anmelden (Runde 46). MUSS vor
+// `sema_lauf` stehen.
+fn sema_if_setzen(s: *mut Sema, f: u64) { (*s).ifr = f }
+
+fn ifp(s: *mut Sema) -> *mut iface.If { return (*s).ifr as *mut iface.If }
+fn hat_if(s: *mut Sema) -> bool { return (*s).ifr != 0 }
 
 // Der Baum hinter diesem Lauf (fuer `nogc.fi`).
 fn sema_baum(s: *mut Sema) -> *mut ast.Baum { return (*s).b as *mut ast.Baum }
@@ -369,6 +379,18 @@ fn probe_t(s: *mut Sema, e: u32, d: u32) -> u32 {
                 return KEIN
             }
             let m: u32 = intern.intern_ab(namen(s), ast.e_a(b, e), 8)
+            // HOOK iface: auf einem `dyn I` steht der Typ in der
+            // Schnittstelle, nicht in der Funktionstabelle (iface.fi).
+            if hat_if(s) {
+                let ii: u32 = iface.if_von_dyn(ifp(s), sn)
+                if ii != KEIN {
+                    let k: u32 = iface.if_slot(ifp(s), ii as usize, m)
+                    if k == KEIN {
+                        return KEIN
+                    }
+                    return iface.if_rtyp(ifp(s), ii as usize, k)
+                }
+            }
             let mf: u32 = fn_suchen(s, methodenfunktion(s, sn, m))
             if mf == KEIN {
                 return KEIN
@@ -1080,6 +1102,15 @@ fn methoden_ruf(s: *mut Sema, e: u32) -> u32 {
         meckern(s)
         return (*s).t_fehler
     }
+    // HOOK iface (iface.rs::hook_methode): `f.m(args)` auf einem `dyn I` —
+    // DYNAMISCHER VERSAND. Welche Funktion laeuft, steht erst zur Laufzeit
+    // in der Methodentafel; geprueft wird gegen die Schnittstelle.
+    if hat_if(s) {
+        let ii: u32 = iface.if_von_dyn(ifp(s), sn)
+        if ii != KEIN {
+            return schnittstellen_ruf(s, e, ii, m, et)
+        }
+    }
     let f: u32 = fn_suchen(s, methodenfunktion(s, sn, m))
     if f == KEIN {
         while k < anz {
@@ -1127,6 +1158,53 @@ fn methoden_ruf(s: *mut Sema, e: u32) -> u32 {
         k = k + 1
     }
     return typen.ret_typ_der_funktion(tafel(s), f as usize)
+}
+
+// Ein Aufruf ueber die Schnittstelle. Der Empfaenger ist der fette Zeiger
+// SELBST (ein Wert); ein `*dyn I` wird bewusst nicht angenommen —
+// `(*z).m(…)` sagt dasselbe und macht sichtbar, dass zwei Woerter gelesen
+// werden.
+fn schnittstellen_ruf(s: *mut Sema, e: u32, ii: u32, m: u32, et: u32) -> u32 {
+    let b: *mut ast.Baum = baum(s)
+    let off: u32 = ast.e_b(b, e)
+    let anz: u32 = ast.e_c(b, e)
+    let mk: u32 = iface.if_slot(ifp(s), ii as usize, m)
+    var k: u32 = 1
+    if mk == KEIN {
+        while k < anz {
+            austypen(s, ast.kind_at(b, off + k))
+            k = k + 1
+        }
+        // die schnittstelle hat keine methode dieses namens
+        meckern(s)
+        return (*s).t_fehler
+    }
+    if typen.ist_zeiger(tafel(s), et) {
+        // ein Zeiger auf einen Schnittstellenwert ist keiner
+        meckern(s)
+    }
+    let plen: u32 = iface.if_plen(ifp(s), ii as usize, mk)
+    if anz != plen + 1 {
+        meckern(s)
+    }
+    while k < anz {
+        let arg: u32 = ast.kind_at(b, off + k)
+        if k <= plen {
+            let pt: u32 = iface.if_ptyp(ifp(s), ii as usize, mk, k - 1)
+            if hat_fe(s) && coerce_pruefen(s, arg, pt) {
+                k = k + 1
+                continue
+            }
+            let t: u32 = ausdruck(s, arg, pt)
+            if !typen.vertraeglich(tafel(s), t, pt) {
+                meckern(s)
+            }
+        } else {
+            austypen(s, arg)
+        }
+        k = k + 1
+    }
+    return iface.if_rtyp(ifp(s), ii as usize, mk)
 }
 
 fn ruf(s: *mut Sema, e: u32) -> u32 {
@@ -1426,6 +1504,32 @@ fn ausdruck_inner(s: *mut Sema, e: u32, hinweis: u32) -> u32 {
     }
     if a == ast.E_AS {
         let dst: u32 = ast_typ(s, ast.e_b(b, e))
+        // HOOK iface (iface.rs::hook_cast): `x as dyn I` — der
+        // Schnittstellenwert entsteht AUSDRUECKLICH (SPEC §6.2).
+        if hat_if(s) && typen.ty_art(tafel(s), dst) == typen.K_STRUCT {
+            let dn: u32 = typen.st_name(tafel(s), typen.ty_a(tafel(s), dst) as usize)
+            let ii: u32 = iface.if_von_dyn(ifp(s), dn)
+            if ii != KEIN {
+                let src: u32 = ausdruck(s, ast.e_a(b, e), KEIN)
+                if ist_fehler(s, src) {
+                    return dst
+                }
+                if !typen.ist_zeiger(tafel(s), src) {
+                    meckern(s)
+                    return (*s).t_fehler
+                }
+                let inner: u32 = typen.ty_a(tafel(s), src)
+                if typen.ty_art(tafel(s), inner) != typen.K_STRUCT {
+                    meckern(s)
+                    return (*s).t_fehler
+                }
+                if !iface.if_umsetzung_ok(ifp(s), ii, typen.ty_a(tafel(s), inner)) {
+                    meckern(s)
+                    return (*s).t_fehler
+                }
+                return dst
+            }
+        }
         var ih: u32 = KEIN
         if ist_int(s, dst) {
             ih = dst
@@ -2214,9 +2318,27 @@ fn sema_lauf(s: *mut Sema) {
         gc.gc_anmelden((*s).gc, tafel(s), namen(s))
         typen.typen_gc_setzen(tafel(s), (*s).gc)
     }
+    // 0d. Schnittstellen: `dyn I` als Struct anmelden — VOR den Structs des
+    //    Baums, genau wie `declare_interfaces` in Stufe 0. Ein eigener Haken
+    //    in der Typaufloesung ist nicht noetig: der Struct traegt den Namen
+    //    `"dyn I"`, und den findet `aufloesen` wie jeden anderen.
+    var if_bisher: usize = 0
+    if hat_if(s) {
+        iface.if_anmelden((*s).ifr, tafel(s), namen(s))
+    }
     // 1. Structlayout und Funktionssignaturen — dieselbe Rechnung wie in
     //    `typen.fi`, hier einmal fuer alles.
     typen.typen_aufloesen(tafel(s), b, namen(s))
+    // 1a. Schnittstellen: jede Umsetzung vollstaendig pruefen — alle Methoden
+    //    da, alle Signaturen passend (`hook_check_impls` in Stufe 0). Laeuft
+    //    NACH den Signaturen und VOR den Rumpfen.
+    if hat_if(s) {
+        let ij: usize = iface.if_pruefen((*s).ifr, tafel(s), b, namen(s))
+        while if_bisher < ij {
+            meckern(s)
+            if_bisher = if_bisher + 1
+        }
+    }
     // 1b. `#[must_consume]` einsammeln (sema.rs::check_attrs, Runde 36):
     //    gekennzeichnete Funktionen ueber ihren NAMEN, gekennzeichnete Typen
     //    ueber ihren Structindex (die Typnummer ist nicht stabil — `neuer_typ`
