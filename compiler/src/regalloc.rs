@@ -2986,4 +2986,128 @@ mod tests {
         assert!(e.out.contains("mov qword ptr [rsp+8], rax"), "{}", e.out);
         assert!(e.out.contains("add rsp, 16"), "{}", e.out);
     }
+    // ---------------------------------------------------------- Runde 51 ---
+
+    /// `[basis + index*4]` statt `shl` + `lea` + Zugriff.
+    #[test]
+    fn adressrechnung_wandert_in_den_speicheroperanden() {
+        let mut f = Func::new("main", vec![FTy::Ptr, FTy::U64], FTy::U64);
+        let vier = f.push(0, FTy::U64, Op::Const(4));
+        let sk = f.push(0, FTy::U64, Op::Bin(BinOp::Mul, 1, vier));
+        let ad = f.push(0, FTy::U64, Op::Bin(BinOp::Add, 0, sk));
+        let w = f.push(0, FTy::U32, Op::Load { addr: ad });
+        let c = f.push(0, FTy::U64, Op::Cast { src: w, from: FTy::U32 });
+        f.set_term(0, Term::Ret(Some(c)));
+        let asm = emit(&Module { funcs: vec![f] }).expect("codegen");
+        let rumpf = asm.split("main:").nth(1).unwrap();
+        assert!(
+            rumpf.lines().any(|l| l.contains("dword ptr [") && l.contains("*4]")),
+            "kein skalierter Speicheroperand:\n{}",
+            asm
+        );
+        assert!(!rumpf.contains("shl "), "Skalierung blieb stehen:\n{}", asm);
+        assert!(!rumpf.contains("lea "), "Adressrechnung blieb stehen:\n{}", asm);
+    }
+
+    /// Wird dieselbe Adresse ZWEIMAL gelesen, darf sie nicht in den
+    /// Speicheroperanden wandern — sonst lebt die Basis laenger, als der
+    /// Verteiler weiss (die Fehlerklasse aus Runde 40/41).
+    #[test]
+    fn zweimal_gelesene_adresse_wird_nicht_gefaltet() {
+        let mut f = Func::new("main", vec![FTy::Ptr, FTy::U64], FTy::U64);
+        let ad = f.push(0, FTy::U64, Op::Bin(BinOp::Add, 0, 1));
+        let a = f.push(0, FTy::U64, Op::Load { addr: ad });
+        let b = f.push(0, FTy::U64, Op::Load { addr: ad });
+        let sum = f.push(0, FTy::U64, Op::Bin(BinOp::Add, a, b));
+        f.set_term(0, Term::Ret(Some(sum)));
+        let asm = emit(&Module { funcs: vec![f] }).expect("codegen");
+        let rumpf = asm.split("main:").nth(1).unwrap();
+        assert!(
+            rumpf.contains("lea ") || rumpf.lines().filter(|l| l.contains("add ")).count() > 0,
+            "Adresse muesste einmal ausgerechnet werden:\n{}",
+            asm
+        );
+    }
+
+    /// Ein 32-Bit-`add` darf NICHT zur Adressierung werden: dort schneidet
+    /// FIR das Ergebnis ab, die Adressierung taete es nicht.
+    #[test]
+    fn schmales_add_wird_nicht_zur_adresse() {
+        let mut f = Func::new("main", vec![FTy::Ptr, FTy::U32], FTy::U32);
+        let ad = f.push(0, FTy::U32, Op::Bin(BinOp::Add, 0, 1));
+        let w = f.push(0, FTy::U32, Op::Load { addr: ad });
+        f.set_term(0, Term::Ret(Some(w)));
+        let asm = emit(&Module { funcs: vec![f] }).expect("codegen");
+        let rumpf = asm.split("main:").nth(1).unwrap();
+        assert!(
+            rumpf.contains("add e") || rumpf.contains("lea "),
+            "32-Bit-Addition muss eine eigene Instruktion bleiben:\n{}",
+            asm
+        );
+    }
+
+    /// Der Wert eines `switch` kommt aus seinem Register, nicht ueber den
+    /// Rahmen — und der Index braucht kein `mov eax, eax`.
+    #[test]
+    fn switch_liest_den_wert_ohne_umweg_ueber_den_rahmen() {
+        let mut f = Func::new("main", vec![FTy::U32], FTy::I32);
+        let mut cases = Vec::new();
+        for i in 0..12i128 {
+            let b = f.add_block();
+            let c = f.push(b, FTy::I32, Op::Const(i));
+            f.set_term(b, Term::Ret(Some(c)));
+            cases.push((i, b));
+        }
+        let bd = f.add_block();
+        let cd = f.push(bd, FTy::I32, Op::Const(99));
+        f.set_term(bd, Term::Ret(Some(cd)));
+        f.set_term(0, Term::Switch { val: 0, ty: FTy::U32, cases, default: bd });
+        let asm = emit(&Module { funcs: vec![f] }).expect("codegen");
+        assert!(asm.contains("jmp qword ptr [rdx + rax*8]"), "{}", asm);
+        assert!(!asm.contains("mov eax, eax"), "ueberfluessige Nullerweiterung:\n{}", asm);
+        let rumpf = asm.split("main:").nth(1).unwrap();
+        // Der Wert wird nicht erst in sein Rahmenfach geschrieben.
+        assert!(
+            !rumpf.lines().any(|l| l.trim().starts_with("mov qword ptr [rbp-") && l.contains(", rax")),
+            "switch-Wert ging ueber den Rahmen:\n{}",
+            asm
+        );
+    }
+
+    /// Blocklayout: hinter einem bedingten Sprung darf kein unbedingter mehr
+    /// stehen, wenn eine der beiden Kanten Fallthrough sein kann.
+    #[test]
+    fn blocklayout_macht_aus_dem_zweiten_sprung_einen_fallthrough() {
+        let f = loop_func();
+        let asm = emit(&Module { funcs: vec![f] }).expect("codegen");
+        let zeilen: Vec<&str> = asm.lines().map(|l| l.trim()).collect();
+        for (i, z) in zeilen.iter().enumerate() {
+            let bedingt = z.starts_with('j') && !z.starts_with("jmp");
+            if bedingt {
+                if let Some(n) = zeilen.get(i + 1) {
+                    assert!(
+                        !n.starts_with("jmp "),
+                        "unbedingter Sprung hinter bedingtem:\n{}",
+                        asm
+                    );
+                }
+            }
+        }
+    }
+
+    /// Eine `void`-Funktion setzt `rax` nicht mehr auf null.
+    #[test]
+    fn void_rueckgabe_ohne_xor() {
+        let mut leer = Func::new("leer", vec![], FTy::Void);
+        leer.set_term(0, Term::Ret(None));
+        let mut m = Func::new("main", vec![], FTy::I32);
+        let n = m.push(0, FTy::I32, Op::Const(7));
+        m.set_term(0, Term::Ret(Some(n)));
+        let asm = emit(&Module { funcs: vec![leer, m] }).expect("codegen");
+        let rumpf = asm.split("_F0.leer:").nth(1).unwrap();
+        let rumpf = rumpf.split("main:").next().unwrap();
+        assert!(!rumpf.contains("xor eax, eax"), "{}", asm);
+        assert!(rumpf.contains("ret"), "{}", asm);
+    }
+
 }
