@@ -1764,3 +1764,63 @@ Verlangsamung), gebaut in firnc0 UND firnc1; Anzeige ist die von i64 —
 die ehrlich benannte Grenze der Kernfassung. Kern-Test
 tests/791_interpolation_kern.fi, drei Negativtests brechen auf beiden
 Seiten ab. Verifiziert aus einem /tmp-Projekt per FIRNLIB.
+
+## 30. Runde 40: Regalloc gegen realweb — und ein Alias, der zu weit ging
+
+Vier Hebel, alle mit callgrind belegt (die Wanduhr schwankt hier um
+±30 % und hat den ersten Gewinn NICHT gezeigt): Register-Deskriptor
+gegen Store->Reload, Zellen-Alias fuer Loads, zwei Schnellwege im
+Tokenizer (`eingabe_pruefen` als EIN Bereichstest, `dekodiere` mit
+Vorabreservierung), Immediates bis 32 Bit im vollen vorzeichenlosen
+Bereich. realweb 4,34x -> 2,68x, html5lib 1,69x -> 1,33x,
+Instruktionen realweb -44,4 %. Widerlegt und verworfen: "Textlauf am
+Stueck" im Data-State (0,008 %) — der Zustands-`match` ist laengst
+eine Sprungtabelle.
+
+## 31. Runde 41: der Preis einer Optimierung, die der Verteiler nicht kannte
+
+Der Zellen-Alias aus Runde 40 liess einen Load das Zellenregister
+direkt lesen. Die Registerverteilung war da aber schon gelaufen — sie
+kannte die vom Alias VERLAENGERTE Lebensspanne nicht und durfte
+dasselbe Register an einen anderen Wert vergeben. In
+bin/druck.fi/drucke_binop wurde daraus `43 - &tab[start]` statt
+`43 - start`: die Laenge unterlief, `rt.buf_wachse` verdoppelte bis
+zum Ueberlauf und drehte sich ewig. Wirkung: `.astdump` hing bei JEDER
+Datei mit `||` — also bei fast jeder — und test.sh blieb in Abschnitt
+12 stehen. Zweites Loch derselben Optimierung: ein `call` zwischen
+Load und Verwendung zerstoert caller-saved Register (layoutdump
+stuerzte in `intern_finde` mit t=0 ab). Beide Faelle brechen den Alias
+jetzt ab; die Korrektur kostet +4 Instruktionen auf 1,297 Mrd.
+
+ZWEI LEHREN, teuer bezahlt:
+  * Der Fehler war seit Runde 40 im Baum und 649/649 blieben gruen,
+    weil die Dump-Binaries VERALTET wiederverwendet wurden. Ein
+    Vergleichswerkzeug, das seinen Massstab nicht neu baut, prueft den
+    Stand von gestern.
+  * Zwei gleichzeitige Laeufe (Hauptrepo + Worktree) benutzten
+    DIESELBEN /tmp-Dateien und ueberschrieben sich die
+    Vergleichsausgaben — das sah wie 148 echte Abweichungen aus. Alle
+    sechs Vergleichsskripte legen jetzt ein eigenes mktemp -d an.
+
+Dazu der geplante Teil: Histogramm der EINZELNEN Scheiben (7 Typen x
+16 Faecher) statt nur Maxima — der Markstapel laeuft nie ueber, das
+teure Nachtragen kommt im Dauerbetrieb gar nicht vor. Und die
+Markierscheibe endet nach einem ZEITBUDGET von 100 us statt nach 512
+Objekten (ein Knoten mit vielen Zeigerfeldern kostet ein Vielfaches
+eines Textknotens): Scheiben ueber 128 us von 60 865 auf 137 je 20 s,
+im 60-Sekunden-Lauf 99,88 % zwischen 64 und 128 us, Durchsatz
+unveraendert.
+
+## 32. Runde 42: die std bekommt Tiefe
+
+Die Fassade aus Runde 39 war breit und duenn — jedes Thema hatte ein
+Modul, jedes Modul das Noetigste. Runde 42 fuellt sie: str (suchen,
+teilen, verbinden, trimmen, ersetzen, Gross/Klein, Zeichen-Iteration),
+num (Ganzzahl <-> Text in beide Richtungen, Basen, Ueberlauferkennung,
+f64-Huelle ueber dtoa/strtod), vec (suchen, einfuegen, entfernen,
+umkehren, sortieren, binaer suchen), map (Iteration, Schluessel/Werte,
+herausnehmen), math (floor/ceil/round, exp/ln/log, Trigonometrie,
+gcd/lcm, INF/NAN/EPSILON), io (Zeilen lesen, stdin, Anhaengen,
+Zeichen/Hex/bool im Fmt-Builder). Neue Kern-Tests 800-806.
+Abnahme im Hauptrepo nachgemessen: test.sh 673/673, selbst 196/0/0,
+Fixpunkt Stufe 2 == Stufe 3 zeichengleich (309 468 Zeilen).
