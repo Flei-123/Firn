@@ -1,22 +1,21 @@
-# Runde 50: Schranken — Generik und Schnittstellen zusammengebracht
+# Round 50: bounds — generics and interfaces brought together
 
-**Basis: `cc1710f` (main nach den Runden 46/47/48).** Zweig `r50-generik`.
+**Base: `cc1710f` (main after rounds 46/47/48).** Branch `r50-generik`.
 
-Seit Runde 30 gibt es generische Vorlagen (`Vec[T]`, `Map[K,V]`), seit
-Runde 46 Schnittstellen mit dynamischem Versand (`interface I`, `dyn I`).
-Zwischen beiden lag eine Lücke, die man an einer Zeile sieht:
+Generic templates (`Vec[T]`, `Map[K,V]`) have existed since round 30, and
+interfaces with dynamic dispatch (`interface I`, `dyn I`) since round 46.
+Between the two lay a gap that one can see in a single line:
 
 ```firn
 fn vec_sortiere[T: Scalar](v: *mut Vec[T]) { … a < b … }
 ```
 
-`Scalar` sagt, welche **Form** `T` hat (Ganzzahl, `bool`, Zeiger) — nicht, was
-`T` **kann**. Der Vergleich musste deshalb fest verdrahtet werden, und damit
-konnte `Vec[T]` genau die Typen sortieren, für die der Übersetzer ein `<`
-kennt. Ein `Vec[Person]` ließ sich anlegen und füllen, aber nicht sortieren.
+`Scalar` says what **shape** `T` has (integer, `bool`, pointer) — not what
+`T` **can do**. The comparison therefore had to be hard-wired, and with that
+`Vec[T]` could sort exactly those types for which the compiler knows a `<`.
+A `Vec[Person]` could be created and filled, but not sorted.
 
-Diese Runde schließt die Lücke: **der Name einer Schnittstelle ist eine
-Schranke.**
+This round closes the gap: **the name of an interface is a bound.**
 
 ```firn
 interface Ord {
@@ -28,7 +27,7 @@ fn vec_sortiere[T: Ord](v: *mut Vec[T]) { … a.kleiner(b) … }
 
 ---
 
-## 1. Die Syntax — und warum genau diese
+## 1. The syntax — and why exactly this one
 
 ```text
 fn f[T: Ord](…)                 eine Schranke
@@ -37,38 +36,39 @@ struct Paar[T: Ord] { … }       auch an einem Typ, nicht nur an einer Funktion
 fn f[K: Int, V: Ord](…)         je Parameter eigene Schranken
 ```
 
-**Kein neues Zeichen, kein neues Schlüsselwort.** Die Stelle nach dem
-Doppelpunkt gab es schon (`[T: Int]`, Runde 30); neu ist nur, dass dort
-**jeder** Name stehen darf. `Any`, `Int` und `Scalar` bleiben die drei
-eingebauten Schranken, jeder andere Name ist der Name einer Schnittstelle.
-`+` als Trenner ist die einzige Zutat — und `+` kann an dieser Stelle nichts
-anderes bedeuten, weil zwischen zwei Typparameter-Namen kein Ausdruck steht.
+**No new character, no new keyword.** The place after the
+colon already existed (`[T: Int]`, round 30); the only new thing is that
+**any** name may stand there. `Any`, `Int` and `Scalar` remain the three
+built-in bounds, and every other name is the name of an interface.
+`+` as a separator is the only ingredient — and `+` cannot mean anything
+else at this place, because there is no expression between two type
+parameter names.
 
-**Der Name wird beim Parsen NICHT aufgelöst.** `Bound::parse` liefert für
-jeden unbekannten Namen `Bound::Iface(name)`, ohne zu fragen, ob es die
-Schnittstelle gibt. Das ist Absicht: `interface Ord` darf weiter unten in
-derselben Datei oder in einer ganz anderen stehen, und der Parser sieht immer
-nur eine Datei. Ein Tippfehler fällt deshalb erst bei der Ausprägung auf —
-dafür mit der Liste der bekannten Namen (§3).
+**The name is NOT resolved during parsing.** `Bound::parse` yields
+`Bound::Iface(name)` for every unknown name, without asking whether the
+interface exists. That is intentional: `interface Ord` may stand further
+down in the same file or in a completely different one, and the parser
+always sees only one file. A typo therefore only comes to light at the
+instantiation — but with the list of known names (§3).
 
-**Geprüft wird bei der AUSPRÄGUNG**, in `mono::bind_params`, also bevor der
-Typprüfer läuft. Zu diesem Zeitpunkt gibt es weder Structtabelle noch
-aufgelöste Typen; was es gibt, sind Namen: die Registrierung aus `iface.rs`
-und die Liste aller Funktionsnamen des zusammengeführten Programms. Genau
-daraus wird die Meldung gebaut — und genau deshalb kann sie sagen, **welche
-Methode fehlt**, statt später als „unbekannte methode" mitten in einer
-ausgeprägten Kopie aufzuschlagen.
+**The check happens at the INSTANTIATION**, in `mono::bind_params`, i.e.
+before the type checker runs. At that point there is neither a struct table
+nor resolved types; what there is are names: the registration from
+`iface.rs` and the list of all function names of the merged program.
+Exactly from that the message is built — and exactly for that reason it can
+say **which method is missing**, instead of turning up later as „unknown
+method" in the middle of an instantiated copy.
 
-### `Self` — ohne das geht keine Ordnung
+### `Self` — without it there is no ordering
 
-Eine Schnittstelle aus Runde 46 kennt nur konkrete Parametertypen:
+An interface from round 46 knows only concrete parameter types:
 
 ```firn
 interface Ord { fn kleiner(*self, b: *Punkt) -> bool }   // nur für Punkt
 ```
 
-Eine Ordnung vergleicht aber **zwei Werte desselben Typs**. Deshalb darf die
-Signatur jetzt `Self` nennen — den Typ, der die Schnittstelle umsetzt:
+An ordering, however, compares **two values of the same type**. That is why
+the signature may now name `Self` — the type that implements the interface:
 
 ```firn
 interface Ord { fn kleiner(*self, b: *Self) -> bool }
@@ -76,63 +76,63 @@ impl Ord for Punkt { fn kleiner(*self, b: *Punkt) -> bool { … } }
 impl Ord for i32   { fn kleiner(*self, b: *i32)   -> bool { … } }
 ```
 
-Die ganze Sonderbehandlung: eine Methode, deren Signatur `Self` nennt, wird
-**nicht global** aufgelöst, sondern **je Umsetzung** (`resolve_mit_self` in
-`iface.rs`, `aufloesen_self` in `iface.fi`). Global hätte `Self` gar keinen
-Typ.
+The whole special treatment: a method whose signature names `Self` is
+**not resolved globally** but **per implementation** (`resolve_mit_self` in
+`iface.rs`, `aufloesen_self` in `iface.fi`). Globally, `Self` would have no
+type at all.
 
-**`Self` und `dyn` schließen einander aus.** Über `dyn I` steht erst zur
-Laufzeit fest, welcher Typ dahintersteckt; `*Self` wäre für jeden ein anderer
-Typ, und der Aufrufer könnte das Argument nicht bilden. Ein solcher Aufruf ist
-deshalb ein Fehler — mit dem Hinweis auf den Weg, der geht:
+**`Self` and `dyn` exclude each other.** Over `dyn I` it is only clear at
+runtime which type is behind it; `*Self` would be a different type for each
+one, and the caller could not form the argument. Such a call is
+therefore an error — with a hint towards the way that does work:
 
 ```
 error: 'Ord.kleiner' nennt 'Self' und ist deshalb nicht ueber 'dyn Ord' aufrufbar
    = hinweis: rufe sie ueber eine schranke auf: 'fn f[T: Ord](x: *T)' — dort steht der typ fest
 ```
 
-Das ist die Objektsicherheitsregel dieser Sprache, in einem Satz und an einer
-Stelle. `dyn I` bleibt für Schnittstellen ohne `Self` unverändert erlaubt —
-auch für dieselbe Schnittstelle, solange nur ihre `Self`-freien Methoden über
-`dyn` gerufen werden.
+That is the object safety rule of this language, in one sentence and in one
+place. `dyn I` remains permitted unchanged for interfaces without `Self` —
+even for the same interface, as long as only its `Self`-free methods are
+called via `dyn`.
 
-### `impl I for <Grundtyp>`
+### `impl I for <base type>`
 
-`vec_sortiere[i32]` muss weiter gehen. Also darf seit dieser Runde auch ein
-**eingebauter Typ** eine Schnittstelle umsetzen:
+`vec_sortiere[i32]` has to keep working. So since this round a
+**built-in type** may implement an interface as well:
 
 ```firn
 impl Ord for i32 { fn kleiner(*self, b: *i32) -> bool { return *self < *b } }
 ```
 
-Das legt die gewöhnliche Funktion `i32__kleiner(self: *i32, b: *i32)` an —
-dasselbe Namensschema wie für einen Struct (Runde 45). Zwei Folgen:
+That creates the ordinary function `i32__kleiner(self: *i32, b: *i32)` —
+the same naming scheme as for a struct (round 45). Two consequences:
 
-* **Methoden eines Grundtyps gelten programmweit.** `modules.rs` benennt sie
-  nicht um. Der Typ `i32` gehört keinem Modul, seine Methoden also auch
-  keinem; hieße die Methode in `std.vec` `vec__i32__kleiner`, suchte die
-  Auflösung weiter `i32__kleiner` und fände nichts. `firnc1` tat das schon
-  immer so — `eigene_suchen` überspringt `impl`-Blöcke —, hier sind beide
-  Compiler jetzt aus demselben Grund gleich.
-* **Ein Grundtyp bekommt keine Methodentafel.** Eine Tafel gibt es nur je
-  Struct-Umsetzung, denn nur ein Struct kann hinter einem `dyn I` stehen
-  (`hook_cast` verlangt einen Zeiger auf einen Struct). `(&n) as dyn Zeigbar`
-  mit `n: i64` ist ein Fehler, `tests/neg/bound_dyn_base_ty.fi`.
+* **Methods of a base type are valid program-wide.** `modules.rs` does not
+  rename them. The type `i32` belongs to no module, so neither do its
+  methods; if the method were called `vec__i32__kleiner` in `std.vec`, the
+  resolution would still look for `i32__kleiner` and would find nothing.
+  `firnc1` always did it that way — `eigene_suchen` skips `impl` blocks —
+  and here both compilers are now the same for the same reason.
+* **A base type gets no method table.** A table exists only per
+  struct implementation, because only a struct can stand behind a `dyn I`
+  (`hook_cast` demands a pointer to a struct). `(&n) as dyn Zeigbar`
+  with `n: i64` is an error, `tests/neg/bound_dyn_base_ty.fi`.
 
 ---
 
-## 2. Was daraus folgt: der Versand ist statisch
+## 2. What follows from that: the dispatch is static
 
-Das ist der eigentliche Gewinn, und er kostete **keine Zeile im Codegenerator
-und keinen neuen FIR-Opcode**. Nach der Monomorphisierung steht in
+That is the actual gain, and it cost **not a line in the code generator
+and no new FIR opcode**. After monomorphization, in
 
 ```firn
 fn kleineres[T: Ord](a: *T, b: *T) -> *T { if a.kleiner(b) { return a } … }
 ```
 
-für `T = Punkt` ein gewöhnlicher Methodenaufruf auf `*Punkt` — und den löst
-`impls.rs` seit Runde 45 allein aus dem statischen Typ auf. Es gibt an dieser
-Stelle nichts zu versenden.
+for `T = Punkt` there is an ordinary method call on `*Punkt` — and
+`impls.rs` has resolved that from the static type alone since round 45.
+There is nothing to dispatch at this place.
 
 ```asm
 ; fn f[T: Ord] (--no-opt)        | ; dyn OrdnungD (--no-opt)
@@ -145,51 +145,52 @@ Stelle nichts zu versenden.
                                  |     call rax
 ```
 
-`tools/bounds/run.sh` hält das fest — und zwar nicht mit der Uhr, sondern
-am erzeugten Code. Zwei Programme, dieselbe Arbeit; geprüft wird:
+`tools/bounds/run.sh` records that — and it does so not with the clock but
+on the generated code. Two programs, the same work; what is checked is:
 
-| Prüfung | Schranke | `dyn` |
+| Check | bound | `dyn` |
 |---|---|---|
-| indirekte Aufrufe (`call <register>`) im Assembler | **0** | ≥ 1 |
-| `lea … .L__iface…` (Adresse einer Methodentafel) | **nein** | ja |
-| `calli` in der FIR | **0** | ≥ 1 |
-| `vtab` in der FIR | **0** | ≥ 1 |
-| namentlicher `call … Punkt__kleiner` | ja | — |
+| indirect calls (`call <register>`) in the assembly | **0** | ≥ 1 |
+| `lea … .L__iface…` (address of a method table) | **no** | yes |
+| `calli` in the FIR | **0** | ≥ 1 |
+| `vtab` in the FIR | **0** | ≥ 1 |
+| named `call … Punkt__kleiner` | yes | — |
 
-in **drei Baustufen** (`release-fast`, `--no-opt`, `dev-fast`) und in **beiden
-Compilern**. Die Gegenprobe mit `dyn` ist Teil des Tests: ohne sie würde er
-auch dann bestehen, wenn er gar nichts misst. Der Lauf hängt als Schritt 8c in
-`test.sh` (dort ohne die callgrind-Messung, damit er kurz bleibt).
+in **three build stages** (`release-fast`, `--no-opt`, `dev-fast`) and in
+**both compilers**. The counter-check with `dyn` is part of the test:
+without it, it would pass even if it measured nothing at all. The run hangs
+in `test.sh` as step 8c (there without the callgrind measurement, so that
+it stays short).
 
-### Gemessen (callgrind, 2.000.000 Aufrufe in einer Schleife)
+### Measured (callgrind, 2.000.000 calls in a loop)
 
-| | Instruktionen gesamt | je Durchlauf |
+| | instructions total | per iteration |
 |---|---|---|
-| Schranke, `release-fast` | 10.000.019 | **5** |
+| bound, `release-fast` | 10.000.019 | **5** |
 | `dyn`, `release-fast` | 58.000.046 | **29** |
-| Schranke, `--no-opt` | 182.000.106 | **91** |
+| bound, `--no-opt` | 182.000.106 | **91** |
 | `dyn`, `--no-opt` | 208.000.145 | **104** |
 
-Ehrlich gelesen: der **reine** Versand kostet 13 Instruktionen je Aufruf
-(`--no-opt`, beide Seiten ohne Inlining — die drei Ladebefehle aus
-docs/RUNDE46.md §4 plus der indirekte Sprung und das, was er an
-Registerrettung nach sich zieht). Mit Optimierer klafft die Lücke weiter auf,
-5 gegen 29, und zwar **nicht**, weil der Versand teurer würde, sondern weil
-der statische Aufruf ganz verschwindet: `inline.rs` setzt ihn ein, der Rest
-fällt der Konstantenfaltung zum Opfer. Ein indirekter Sprung kann das nicht.
+Read honestly: the **pure** dispatch costs 13 instructions per call
+(`--no-opt`, both sides without inlining — the three loads from
+docs/RUNDE46.md §4 plus the indirect jump and the register saving it
+entails). With the optimizer the gap opens further,
+5 against 29, and **not** because the dispatch gets more expensive, but
+because the static call disappears entirely: `inline.rs` inlines it, and
+the rest falls victim to constant folding. An indirect jump cannot do that.
 
-Das ist derselbe Befund wie in Runde 46 (dort 5 gegen 26 mit einer
-Schnittstelle ohne Argument) — neu ist, dass man die statische Seite jetzt
-**mit einer Schnittstelle** hinschreiben kann und nicht nur ohne.
+That is the same finding as in round 46 (there 5 against 26 with an
+interface without an argument) — the new thing is that the static side can
+now be written down **with an interface** and not only without one.
 
 ---
 
-## 3. Die Fehlermeldungen
+## 3. The error messages
 
-Jede nennt Zeile, Spalte und im Hinweis, was zu tun ist. Die interessanten
-sind die, die eine Methode benennen.
+Every one of them names the line, the column and, in the hint, what to do.
+The interesting ones are those that name a method.
 
-**Kein `impl` — die Meldung sagt, welche Methode fehlen würde:**
+**No `impl` — the message says which method would be missing:**
 
 ```
 error: typ 'Kreis' setzt die schnittstelle 'Ordnung' nicht um — schranke am typparameter 'T' von 'kleineres'
@@ -197,29 +198,30 @@ error: typ 'Kreis' setzt die schnittstelle 'Ordnung' nicht um — schranke am ty
    = hinweis: es fehlt 'fn kleiner(*self, *Self) -> bool' in 'impl Ordnung for Kreis { … }'
 ```
 
-**Der Typ hat schon einen Teil — dann steht nur der Rest da.** `Punkt` hat
-`kleiner` aus einem gewöhnlichen `impl`-Block, aber keinen `impl Ordnung
-for`-Block; genannt wird nur `gleich`:
+**The type already has a part — then only the rest is listed.** `Punkt` has
+`kleiner` from an ordinary `impl` block, but no `impl Ordnung for` block;
+only `gleich` is named:
 
 ```
 error: typ 'Punkt' setzt die schnittstelle 'Ordnung' nicht um — schranke am typparameter 'T' von 'f'
    = hinweis: es fehlt 'fn gleich(*self, *Self) -> bool' in 'impl Ordnung for Punkt { … }'
 ```
 
-Dafür liest `schranke_pruefen` die Namen aller Funktionen des
-zusammengeführten Programms und fragt für jede Methode der Schnittstelle, ob
-`<Typ>__<Methode>` existiert. Hätte der Typ **alle** Methoden und nur den
-Block nicht, sagt die Meldung genau das („es fehlt der block `impl … { … }`").
+For that, `schranke_pruefen` reads the names of all functions of the
+merged program and asks for every method of the interface whether
+`<Typ>__<Methode>` exists. If the type had **all** methods and only lacked
+the block, the message says exactly that („the block `impl … { … }` is
+missing").
 
-**Schranke auf einer Schnittstelle, die es nicht gibt:**
+**A bound on an interface that does not exist:**
 
 ```
 error: unbekannte schnittstelle 'Ordnunng' als schranke am typparameter 'T' von 'f'
    = hinweis: bekannt sind: Ordnung (eingebaut: Any, Int, Scalar)
 ```
 
-**Ein Zeiger als Typargument** — hier ist die Ursache eine andere, und die
-Meldung sagt es:
+**A pointer as a type argument** — here the cause is a different one, and
+the message says so:
 
 ```
 error: typargument '*Punkt' erfuellt die schranke 'Ordnung' des typparameters 'T' von 'f' nicht
@@ -227,78 +229,80 @@ error: typargument '*Punkt' erfuellt die schranke 'Ordnung' des typparameters 'T
               ein zeiger- oder feldtyp hat keinen namen, unter dem das stehen koennte
 ```
 
-**Dieselbe Schranke zweimal** — beim Parsen, nicht erst bei der Ausprägung:
+**The same bound twice** — during parsing, not only at the instantiation:
 
 ```
 error: die schranke 'Ordnung' steht zweimal an 'T'
    = hinweis: jede schranke wird hoechstens einmal genannt
 ```
 
-**Mehrere Schranken, eine verletzt** — gemeldet wird die **erste**; eine
-zweite Meldung zu demselben Typargument sagte nichts Neues.
+**Several bounds, one violated** — what is reported is the **first** one; a
+second message about the same type argument would say nothing new.
 
-### Die 15 Negativtests
+### The 15 negative tests
 
-| Datei | Fall |
+| File | Case |
 |---|---|
-| `bound_no_impl.fi` | Typ ohne `impl` (Meldung nennt die Methode) |
-| `bound_method_partial.fi` | Typ hat eine von zwei Methoden — genannt wird nur die fehlende |
-| `bound_base_ty_without_impl.fi` | Grundtyp ohne Umsetzung |
-| `bound_unknown.fi` | Schranke auf unbekannter Schnittstelle |
-| `bound_duplicate.fi` | dieselbe Schranke zweimal (Parser) |
-| `bound_contradiction.fi` | `Int + Ordnung`, `Int` verletzt |
-| `bound_second_interface.fi` | `Ordnung + Anzeige`, zweite verletzt |
-| `bound_nested.fi` | Verletzung erst in der ZWEITEN Ausprägungsstufe |
-| `bound_struct.fi` | Schranke an einem generischen Struct |
-| `bound_ptr_arg.fi` | Zeiger als Typargument |
-| `bound_signature.fi` | `impl` da, Signatur passt nicht (`Self` ≠ `i64`) |
-| `bound_self_dyn.fi` | `Self`-Methode über `dyn` gerufen |
-| `bound_dyn_base_ty.fi` | `as dyn I` auf einem Grundtyp |
-| `bound_duplicate_impl_base_ty.fi` | zwei `impl Ord for i32` |
-| `method_without_ty.fi` | Methode auf einem Feldtyp (hat keinen Namen) |
+| `bound_no_impl.fi` | type without `impl` (the message names the method) |
+| `bound_method_partial.fi` | type has one of two methods — only the missing one is named |
+| `bound_base_ty_without_impl.fi` | base type without an implementation |
+| `bound_unknown.fi` | bound on an unknown interface |
+| `bound_duplicate.fi` | the same bound twice (parser) |
+| `bound_contradiction.fi` | `Int + Ordnung`, `Int` violated |
+| `bound_second_interface.fi` | `Ordnung + Anzeige`, the second one violated |
+| `bound_nested.fi` | violation only in the SECOND instantiation level |
+| `bound_struct.fi` | bound on a generic struct |
+| `bound_ptr_arg.fi` | pointer as a type argument |
+| `bound_signature.fi` | `impl` present, signature does not match (`Self` ≠ `i64`) |
+| `bound_self_dyn.fi` | `Self` method called via `dyn` |
+| `bound_dyn_base_ty.fi` | `as dyn I` on a base type |
+| `bound_duplicate_impl_base_ty.fi` | two `impl Ord for i32` |
+| `method_without_ty.fi` | method on an array type (which has no name) |
 
-Dazu geändert: `generic_anforderung.fi` (Wortlaut „anforderung" → „schranke")
-und `impl_no_struct.fi` — dessen alte Meldung („methoden gibt es nur fuer
-struct-typen") ist seit dieser Runde falsch; er prüft jetzt, dass `i32.summe()`
-sauber als „typ 'i32' hat keine methode 'summe'" abgelehnt wird.
+Changed as well: `generic_anforderung.fi` (wording „anforderung" →
+„schranke") and `impl_no_struct.fi` — whose old message („methoden gibt es
+nur fuer struct-typen") is wrong as of this round; it now checks that
+`i32.summe()` is cleanly rejected as „typ 'i32' hat keine methode 'summe'".
 
-Alle 15 werden auch von `firnc1` abgelehnt (nachgemessen: 109 von 115
-Negativtests lehnt `firnc1` ab; die 6 Ausnahmen sind dieselben wie vor dieser
-Runde und betreffen sie nicht).
+All 15 are rejected by `firnc1` as well (measured afterwards: `firnc1`
+rejects 109 of 115 negative tests; the 6 exceptions are the same as before
+this round and are unaffected by it).
 
 ---
 
-## 4. Die Standardbibliothek: vorher / nachher
+## 4. The standard library: before / after
 
-`lib/rt/vec.fi` (identisch als `lib/std/vec.fi`, Symlink).
+`lib/rt/vec.fi` (identical as `lib/std/vec.fi`, symlink).
 
-| | vorher | nachher |
+| | before | after |
 |---|---|---|
-| `vec_sortiere` | `[T: Scalar]`, im Rumpf `a > b` | `[T: Ord]`, im Rumpf `a.kleiner(b)` |
-| `vec_binaersuche` | `[T: Scalar]`, `<` und `==` | `[T: Ord]`, Gleichheit aus der Ordnung |
+| `vec_sortiere` | `[T: Scalar]`, `a > b` in the body | `[T: Ord]`, `a.kleiner(b)` in the body |
+| `vec_binaersuche` | `[T: Scalar]`, `<` and `==` | `[T: Ord]`, equality from the ordering |
 | `vec_ist_sortiert`, `vec_untere_schranke`, `vec_sortiert_einfuegen`, `vec_senken` | `[T: Scalar]` | `[T: Ord]` |
 | `vec_min`, `vec_max` | `[T: Scalar]` | `[T: Scalar + Ord]` |
-| sortierbare Typen | die Skalare, für die der Übersetzer `<` kennt | **jeder Typ mit `impl Ord`** |
-| Ordnung wählbar | nein | ja, sie gehört dem Typ |
+| sortable types | the scalars for which the compiler knows `<` | **every type with `impl Ord`** |
+| ordering selectable | no | yes, it belongs to the type |
 
-**Was dafür nötig war — `vec_zeiger[T]`.** `vec_at[T]` liefert jenseits des
-Endes `0 as T`, und `0 as T` gibt es nur für Skalare. Genau daran hing die
-Schranke `T: Scalar`, und genau deshalb ließ sich ein `Vec[Punkt]` nicht
-sortieren. Ein **Zeiger** hat für jeden Elementtyp einen Nullwert; alles, was
-ordnet (Sortieren, Suchen, Tauschen, Einfügen), arbeitet jetzt darüber. `vec_at`
-bleibt unverändert `[T: Scalar]` — es ist die bequeme Fassung für Skalare.
+**What was needed for that — `vec_zeiger[T]`.** `vec_at[T]` returns
+`0 as T` beyond the end, and `0 as T` exists only for scalars. Exactly that
+was what the bound `T: Scalar` hung on, and exactly for that reason a
+`Vec[Punkt]` could not be sorted. A **pointer** has a null value for every
+element type; everything that orders (sorting, searching, swapping,
+inserting) now works over it. `vec_at`
+remains `[T: Scalar]` unchanged — it is the comfortable version for scalars.
 
-**Was das kostet.** `interface Ord` und zehn Umsetzungen (`i8`…`isize`) stehen
-in `lib/rt/vec.fi` und sind damit in jedem Programm da, das `vec` einbindet.
-Das sind zehn Funktionen mit je einem Vergleich; eine Methodentafel entsteht
-für keine davon (Grundtyp). Nachgemessen an einem Programm, das nie sortiert — dem Compiler
-selbst: `firnc0 --emit=asm bin/firnc1.fi` liefert **209.388** Zeilen mit dem
-alten `vec.fi` und **209.579** mit dem neuen. Der Preis für `Ord` und zehn
-Umsetzungen in einem Programm, das sie nicht benutzt, sind also **191 Zeilen
-Assembler (+0,09 %)**.
+**What that costs.** `interface Ord` and ten implementations (`i8`…`isize`)
+stand in `lib/rt/vec.fi` and are therefore present in every program that
+includes `vec`. That is ten functions with one comparison each; a method
+table is created for none of them (base type). Measured afterwards on a
+program that never sorts — the compiler
+itself: `firnc0 --emit=asm bin/firnc1.fi` yields **209.388** lines with the
+old `vec.fi` and **209.579** with the new one. The price for `Ord` and ten
+implementations in a program that does not use them is therefore **191
+lines of assembly (+0,09 %)**.
 
-**Was das bringt** — `tests/831_bounds_std_core.fi` fährt beide Seiten:
-dieselben Funktionen mit `i32` (wie bisher) und mit
+**What it brings** — `tests/831_bounds_std_core.fi` drives both sides:
+the same functions with `i32` (as before) and with
 
 ```firn
 struct Person { alter: i64, nummer: i64 }
@@ -310,176 +314,181 @@ impl Ord for Person {
 }
 ```
 
-Zwei Schlüssel, absteigend nach dem zweiten wäre genauso möglich — darum geht
-es: die Ordnung gehört dem Typ, nicht dem Sortierer. Vorher war dieses
-Programm nicht schreibbar.
+Two keys, and descending by the second one would be just as possible —
+that is the point: the ordering belongs to the type, not to the sorter.
+Before, this program could not be written.
 
-**Gleichheit aus der Ordnung.** `vec_binaersuche` prüft `!(a<b) && !(b<a)`
-statt `a == b`. Das ist keine Bequemlichkeit, sondern die einzige Gleichheit,
-die zu einer Binärsuche passt: sie muss dieselbe sein, nach der sortiert wurde.
-Sonst fände die Suche eine Stelle, an der nach der Ordnung nichts steht.
+**Equality from the ordering.** `vec_binaersuche` checks `!(a<b) && !(b<a)`
+instead of `a == b`. That is not a convenience but the only equality
+that fits a binary search: it has to be the same one the sorting used.
+Otherwise the search would find a place at which, by the ordering, nothing
+stands.
 
-**Warum `Ord` nicht über einen Schlüssel geht.** Der einfachere Entwurf wäre
-`interface Ord { fn schluessel(*self) -> i64 }` gewesen — ohne `Self`, ohne
-Umsetzungen für Grundtypen. Er scheitert an einem Wert, der schon im
-Testkorpus steht: `tests/802_std_vec_core.fi` sortiert `u64` und sucht
-`9223372036854775808`. Der passt in kein `i64`. Ein Schlüssel hätte die
-Ordnung für die Hälfte aller `u64` still falsch gemacht.
-
----
-
-## 5. Was geändert wurde
-
-| `firnc0` (Rust) | Zeilen | was |
-|---|---|---|
-| `compiler/src/iface.rs` | +410/−45 | Schrankenprüfung mit Methodennamen, `Self`, Grundtyp-Umsetzungen |
-| `compiler/src/mono.rs` | +84/−26 | alle Schranken je Parameter, Weg zu `iface.rs` |
-| `compiler/src/sema_generic.rs` | +53/−22 | `Bound::Iface`, `+`-Listen, doppelte Schranke |
-| `compiler/src/impls.rs` | +49/−16 | Empfänger darf ein Grundtyp sein |
-| `compiler/src/modules.rs` | +9 | Grundtyp-Methoden nicht umbenennen |
-
-| `firnc1` (Firn) | Zeilen | was |
-|---|---|---|
-| `lib/firnc1/iface.fi` | +222/−48 | `Self`, Grundtyp-Umsetzungen, `if_umsetzung_da` |
-| `lib/firnc1/mono.fi` | +107/−12 | Schrankenlisten, Schnittstellenschranken |
-| `lib/firnc1/parser.fi` | +55/−17 | `+`-Listen, `Self`-Erkennung |
-| `lib/firnc1/types.fi` | +32 | `grundtyp_name` (die Umkehrung von `grundtyp`) |
-| `lib/firnc1/sema.fi`, `lower.fi`, `codegen.fi` | +41/−16 | Methoden auf Grundtypen, keine Tafel für einen Grundtyp |
-
-**Keine neuen FIR-Opcodes.** Die Opcode-Regel dieser Runde (Nummern 30–39
-reserviert) wurde nicht gebraucht: statischer Versand ist ein gewöhnlicher
-`Call`, und die Schranke ist eine Prüfung, keine Instruktion. Der reservierte
-Bereich bleibt unangetastet — `fir.rs`/`fir.fi` sind unverändert.
+**Why `Ord` does not go via a key.** The simpler design would have been
+`interface Ord { fn schluessel(*self) -> i64 }` — without `Self`, without
+implementations for base types. It fails on a value that is already in the
+test corpus: `tests/802_std_vec_core.fi` sorts `u64` and searches for
+`9223372036854775808`. That fits into no `i64`. A key would have silently
+made the ordering wrong for half of all `u64`.
 
 ---
 
-## 6. Abnahme
+## 5. What was changed
 
-Gemessen auf `r50-generik` nach `rm -f .firnc1 .firnc2 .firnc3` (kein
-wiederverwendetes Binary), eigenes `mktemp -d` in jedem Werkzeug.
+| `firnc0` (Rust) | Lines | what |
+|---|---|---|
+| `compiler/src/iface.rs` | +410/−45 | bound check with method names, `Self`, base type implementations |
+| `compiler/src/mono.rs` | +84/−26 | all bounds per parameter, route to `iface.rs` |
+| `compiler/src/sema_generic.rs` | +53/−22 | `Bound::Iface`, `+` lists, duplicate bound |
+| `compiler/src/impls.rs` | +49/−16 | the receiver may be a base type |
+| `compiler/src/modules.rs` | +9 | do not rename base type methods |
 
-| Prüfung | Basis `cc1710f` | jetzt |
+| `firnc1` (Firn) | Lines | what |
+|---|---|---|
+| `lib/firnc1/iface.fi` | +222/−48 | `Self`, base type implementations, `if_umsetzung_da` |
+| `lib/firnc1/mono.fi` | +107/−12 | bound lists, interface bounds |
+| `lib/firnc1/parser.fi` | +55/−17 | `+` lists, `Self` detection |
+| `lib/firnc1/types.fi` | +32 | `grundtyp_name` (the inverse of `grundtyp`) |
+| `lib/firnc1/sema.fi`, `lower.fi`, `codegen.fi` | +41/−16 | methods on base types, no table for a base type |
+
+**No new FIR opcodes.** The opcode rule of this round (numbers 30–39
+reserved) was not needed: static dispatch is an ordinary
+`Call`, and the bound is a check, not an instruction. The reserved
+range remains untouched — `fir.rs`/`fir.fi` are unchanged.
+
+---
+
+## 6. Acceptance
+
+Measured on `r50-generik` after `rm -f .firnc1 .firnc2 .firnc3` (no
+reused binary), with its own `mktemp -d` in every tool.
+
+| Check | base `cc1710f` | now |
 |---|---|---|
 | `bash ./test.sh` | 751/751 | **PASS 773/773** |
-| `bash tools/self_compare.sh` | 213 gleich / 0 abweichend / 0 fehlerhaft | **215 gleich / 0 abweichend / 0 fehlerhaft** |
-| `bash tools/fixpoint.sh` | zeichengleich, 427.401 Zeilen | **Stufe 2 == Stufe 3, zeichengleich, 431.972 Zeilen** |
+| `bash tools/self_compare.sh` | 213 identical / 0 differing / 0 failing | **215 identical / 0 differing / 0 failing** |
+| `bash tools/fixpoint.sh` | character-identical, 427.401 lines | **stage 2 == stage 3, character-identical, 431.972 lines** |
 
-Die +22 in `test.sh` erklären sich Datei für Datei: 2 neue Programme x 3
-Baustufen (`830`, `831`) = 6, 15 neue Negativtests = 15, der neue Schritt 8c
-(`tools/bounds/run.sh`) = 1. Die +2 im Selbstvergleich sind dieselben zwei
-Programme; `tests/modules/bounds.fi` zählt nicht mit (`firnc0` übersetzt ein
-Modul nicht einzeln).
+The +22 in `test.sh` can be explained file by file: 2 new programs x 3
+build stages (`830`, `831`) = 6, 15 new negative tests = 15, the new step 8c
+(`tools/bounds/run.sh`) = 1. The +2 in the self-comparison are the same two
+programs; `tests/modules/bounds.fi` does not count (`firnc0` does not
+compile a module individually).
 
-Beide Vergleichszahlen stammen aus einem EINZELN gestarteten Lauf des
-jeweiligen Skripts, jeweils nach `rm -f .firnc1 .firnc2 .firnc3` — kein
-wiederverwendetes Binary. `tools/fixpoint.sh` und `tools/bounds/run.sh`
-legen ihr Arbeitsverzeichnis mit `mktemp -d` an; feste `/tmp`-Namen gibt es
-in dieser Runde keine.
+Both comparison numbers come from an INDIVIDUALLY started run of the
+respective script, each time after `rm -f .firnc1 .firnc2 .firnc3` — no
+reused binary. `tools/fixpoint.sh` and `tools/bounds/run.sh`
+create their working directory with `mktemp -d`; there are no fixed `/tmp`
+names in this round.
 
-**Der Fixpunkt hält.** `.firnc2` (von einem Compiler erzeugt, der aus Rust
-kam) und `.firnc3` (von einem, der aus Firn kam) sind Oktett für Oktett
-gleich — 2.483.328 Oktette. Die Sprachänderung dieser Runde ist damit in
-beiden Compilern dieselbe, nicht nur ähnlich.
+**The fixpoint holds.** `.firnc2` (produced by a compiler that came from
+Rust) and `.firnc3` (by one that came from Firn) are octet for octet
+identical — 2.483.328 octets. The language change of this round is
+therefore the same in both compilers, not merely similar.
 
-Der Assembler von `.firnc2` wuchs von 427.401 auf 431.972 Zeilen (+1,07 %) —
-das ist die ganze Runde, überwiegend `iface.fi` und `mono.fi`.
-
----
-
-## 7. Bewusst weggelassen
-
-* **Prüfung des Vorlagenrumpfes gegen die Schranke.** Die Schranke ist heute
-  eine Zusage an den **Aufrufer**, keine Beschränkung des Rumpfes. Der Rumpf
-  wird erst nach der Ausprägung geprüft, also gegen den **konkreten** Typ:
-  eine Vorlage `fn f[T: Ord](a: *T)` darf `a.etwas_anderes()` schreiben, und
-  das geht durch, solange der ausgeprägte Typ diese Methode hat. Eine Vorlage,
-  die nie ausgeprägt wird, wird gar nicht geprüft. Das ist die Kehrseite der
-  Monomorphisierung ohne getrennte Typprüfung der Vorlage; wer es ändern will,
-  braucht einen Prüflauf über den Rumpf mit `T` als abstraktem Typ — eine
-  eigene Runde, und eine, die die Fehlermeldungen aller bestehenden Vorlagen
-  anfasst.
-* **Statisch unerfüllbare Schrankenmengen.** `[T: Int + Ordnung]` ist erlaubt,
-  auch wenn keine Umsetzung von `Ordnung` je ein Ganzzahltyp ist. Gemeldet
-  wird bei der Ausprägung, nicht bei der Deklaration. Das zu erkennen hieße,
-  alle Umsetzungen zu zählen — und die dürfen später noch dazukommen.
-* **Vererbung zwischen Schnittstellen** (`interface A: B`) und
-  **Vorgabemethoden** — beides steht seit Runde 46 offen und ist es geblieben.
-* **`dyn I` für Grundtypen.** Ein Schnittstellenwert trägt Datenzeiger und
-  Methodentafel; eine Tafel entsteht nur je Struct-Umsetzung.
-* **Schranken an `gc class`-Typen.** `impl I for <gc class>` geht seit
-  Runde 46; als **Typargument** einer Vorlage steht eine Klasse nur als
-  `Gc[K]` zur Verfügung, und das ist ein Zeigertyp — siehe die nächste Zeile.
-* **Ordnung für `f64` und `bool`.** `lib/rt/vec.fi` setzt `Ord` nur für die
-  zehn Ganzzahltypen um. `f64` hätte Gleitkommacode in eine Datei gebracht,
-  die `firnc1` selbst übersetzt (dessen Codegenerator kann kein Gleitkomma);
-  `bool` hat keine Ordnung, die jemand erwartet.
+The assembly of `.firnc2` grew from 427.401 to 431.972 lines (+1,07 %) —
+that is the whole round, predominantly `iface.fi` and `mono.fi`.
 
 ---
 
-## 8. Verworfene Ansätze
+## 7. Deliberately left out
 
-**Schranken beim Parsen auflösen.** Erster Entwurf: unbekannter Name =
-Fehler, wie bisher bei `Any/Int/Scalar`. Verworfen, sobald `interface Ord`
-unter `fn vec_sortiere[T: Ord]` stehen soll — und in `lib/rt/vec.fi` steht es
-genau so, weil die Umsetzungen für die Grundtypen dazwischen liegen. Der
-Parser sieht immer nur eine Datei; er kann diese Frage nicht beantworten.
-
-**Strukturelle Erfüllung** („der Typ hat die Methoden, also erfüllt er die
-Schranke"). Bequem und falsch: `impl I for T` ist die Stelle, an der der
-Typprüfer die **Signaturen** prüft. Ohne Block gibt es diese Prüfung nicht,
-und eine zufällig gleichnamige Methode mit anderer Bedeutung wäre stillschweigend
-akzeptiert worden. Die Namen der vorhandenen Methoden werden trotzdem gelesen —
-aber nur, um die **Meldung** brauchbar zu machen.
-
-**`Ord` über einen Schlüssel** (`fn schluessel(*self) -> i64`). Siehe §4:
-scheitert an `u64`-Werten oberhalb von `i64::MAX`, und die stehen schon im
-Testkorpus.
-
-**Grundtyp-Methoden pro Modul umbenennen.** Wäre die Regel gewesen, die
-`modules.rs` sonst anwendet — und hätte `i32__kleiner` aus `std.vec` in
-`vec__i32__kleiner` verwandelt, während die Auflösung am Aufrufort weiter
-`i32__kleiner` sucht (sie rechnet aus dem **Typ**, und der Typ heißt in jedem
-Modul `i32`). Verworfen zugunsten der Regel „programmweiter Typ, programmweite
-Methoden" — dieselbe, die für `interface`, `enum`, `gc class` und generische
-Vorlagen schon gilt.
-
-**`struct_idx` als Schlüssel für „doppelte Umsetzung".** Funktionierte, solange
-jede Umsetzung einen Struct hatte. Ein Grundtyp hat keinen; alle hätten
-`usize::MAX` getragen und wären als **dieselbe** Umsetzung gezählt worden.
-Verglichen wird jetzt der Methodenpräfix (`i32`, `geo__Punkt`) — er ist für
-beide Fälle da und eindeutig.
-
-**Die Endungsregel auch für Grundtypen.** `iface::typ_struct` sucht als
-dritten Schritt „genau einen Struct, dessen Name auf `__<Name>` endet" (Typ aus
-einem Modul). Für `i32` findet diese Regel `Vec__i32` — den Struct `Vec[i32]`.
-Der Fehler war echt und stand nach fünf Minuten im Testlauf
-(`'Vec__i32' setzt die methode 'Ord.kleiner' nicht um`). Deshalb wird der
-Grundtyp **zuerst** gefragt, und die Endungsregel gilt nur für Namen, die
-keiner sind.
+* **Checking the template body against the bound.** Today the bound is a
+  promise to the **caller**, not a restriction of the body. The body
+  is only checked after the instantiation, i.e. against the **concrete**
+  type: a template `fn f[T: Ord](a: *T)` may write `a.etwas_anderes()`, and
+  that goes through as long as the instantiated type has this method. A
+  template that is never instantiated is not checked at all. That is the
+  flip side of monomorphization without a separate type check of the
+  template; whoever wants to change it needs a checking pass over the body
+  with `T` as an abstract type — a round of its own, and one that touches
+  the error messages of all existing templates.
+* **Statically unsatisfiable bound sets.** `[T: Int + Ordnung]` is allowed,
+  even if no implementation of `Ordnung` is ever an integer type. It is
+  reported at the instantiation, not at the declaration. To recognize that
+  would mean enumerating all implementations — and more of those may still
+  be added later.
+* **Inheritance between interfaces** (`interface A: B`) and
+  **default methods** — both have been open since round 46 and have
+  remained so.
+* **`dyn I` for base types.** An interface value carries a data pointer and
+  a method table; a table is created only per struct implementation.
+* **Bounds on `gc class` types.** `impl I for <gc class>` has worked since
+  round 46; as a **type argument** of a template a class is only available
+  as `Gc[K]`, and that is a pointer type — see the next line.
+* **Ordering for `f64` and `bool`.** `lib/rt/vec.fi` implements `Ord` only
+  for the ten integer types. `f64` would have brought floating point code
+  into a file that `firnc1` compiles itself (whose code generator cannot do
+  floating point); `bool` has no ordering that anyone expects.
 
 ---
 
-## 9. Offen geblieben — und wo es weh tut
+## 8. Rejected approaches
 
-**Typargumente aus einem Modul gehen nicht.** Das ist ÄLTER als diese Runde
-(seit Runde 30) und fiel hier auf, weil `tests/830` es zuerst versucht hat:
+**Resolving bounds during parsing.** First draft: unknown name =
+error, as up to now with `Any/Int/Scalar`. Rejected as soon as
+`interface Ord` is supposed to stand below `fn vec_sortiere[T: Ord]` — and
+in `lib/rt/vec.fi` it stands exactly that way, because the implementations
+for the base types lie in between. The parser always sees only one file; it
+cannot answer this question.
+
+**Structural satisfaction** („the type has the methods, so it satisfies the
+bound"). Comfortable and wrong: `impl I for T` is the place at which the
+type checker checks the **signatures**. Without a block there is no such
+check, and a method that happens to have the same name but a different
+meaning would have been accepted silently. The names of the existing
+methods are read anyway — but only to make the **message** usable.
+
+**`Ord` via a key** (`fn schluessel(*self) -> i64`). See §4:
+fails on `u64` values above `i64::MAX`, and those are already in the test
+corpus.
+
+**Renaming base type methods per module.** That would have been the rule
+`modules.rs` otherwise applies — and it would have turned `i32__kleiner`
+from `std.vec` into `vec__i32__kleiner`, while the resolution at the call
+site still looks for `i32__kleiner` (it computes from the **type**, and the
+type is called `i32` in every module). Rejected in favor of the rule
+„program-wide type, program-wide methods" — the same one that already
+applies to `interface`, `enum`, `gc class` and generic templates.
+
+**`struct_idx` as the key for „duplicate implementation".** It worked as
+long as every implementation had a struct. A base type has none; all of
+them would have carried `usize::MAX` and would have counted as the **same**
+implementation. What is compared now is the method prefix (`i32`,
+`geo__Punkt`) — it is there for both cases and is unambiguous.
+
+**The suffix rule for base types as well.** `iface::typ_struct` looks, as
+its third step, for „exactly one struct whose name ends in `__<Name>`"
+(type from a module). For `i32` this rule finds `Vec__i32` — the struct
+`Vec[i32]`. The bug was real and appeared in the test run after five
+minutes (`'Vec__i32' setzt die methode 'Ord.kleiner' nicht um`). That is
+why the base type is asked **first**, and the suffix rule applies only to
+names that are not one.
+
+---
+
+## 9. What remained open — and where it hurts
+
+**Type arguments from a module do not work.** That is OLDER than this round
+(since round 30) and came to light here because `tests/830` tried it first:
 
 ```firn
 groesster[schranken.Marke](&a, &b)      // error: unbekannter typ 'schranken.Marke'
 ```
 
-Ursache: der Ausprägungsname (`groesster__schranken.Marke`) entsteht beim
-**Parsen** und steht danach als Aufrufname im Baum; die Modulumbenennung läuft
-erst **danach** und fasst die Typargumente in der Registrierung nicht an. Der
-substituierte Typ heißt anschließend `schranken.Marke`, der Struct aber
-`schranken__Marke`. Dasselbe gilt für einen modullokalen Typ, der innerhalb
-seines eigenen Moduls als Typargument benutzt wird. Nicht repariert, weil die
-Reparatur die Ausprägungsnamen im ganzen Baum umschreiben müsste — das ist
-eine eigene Runde und berührt `ast_kanon`. `tests/modules/bounds.fi` prüft
-deshalb, was geht: Schnittstelle und Vorlage im Modul, Umsetzung und
-Typargument in der Wurzeldatei, plus `impl Reihe for u16` im Modul.
+Cause: the instantiation name (`groesster__schranken.Marke`) comes into
+being during **parsing** and stands in the tree as the call name afterwards;
+the module renaming only runs **after that** and does not touch the type
+arguments in the registration. The substituted type is subsequently called
+`schranken.Marke`, but the struct is called `schranken__Marke`. The same
+holds for a module-local type that is used as a type argument within its
+own module. Not repaired, because the repair would have to rewrite the
+instantiation names in the whole tree — that is a round of its own and
+touches `ast_kanon`. `tests/modules/bounds.fi` therefore checks what does
+work: interface and template in the module, implementation and
+type argument in the root file, plus `impl Reihe for u16` in the module.
 
-**Kleine Falle, festgehalten:** `*self as i64` ist `*(self as i64)` — `as`
-bindet stärker als die unären Operatoren (SPEC §14.1 Punkt 12). Richtig ist
-`(*self) as i64`. Gekostet hat das einen Fehlversuch in
-`tests/modules/bounds.fi`, mit einer Meldung, die auf eine leere Zeile zeigte.
+**A small trap, recorded:** `*self as i64` is `*(self as i64)` — `as`
+binds more tightly than the unary operators (SPEC §14.1 item 12). The
+correct form is `(*self) as i64`. That cost one failed attempt in
+`tests/modules/bounds.fi`, with a message that pointed at an empty line.
