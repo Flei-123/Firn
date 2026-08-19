@@ -1,0 +1,3429 @@
+// lib/browser/baum.fi — HTML-BAUMKONSTRUKTION nach WHATWG §13.2.6, in Firn.
+//
+// Eingabe ist der Tokenstrom aus lib/html/tokenizer.fi (ueber das binaere
+// Protokoll, lib/browser/tokenstrom.fi), Ausgabe ist ein DOM-Baum aus
+// lib/browser/knoten.fi.
+//
+// UMGESETZT (vollstaendig, nicht angedeutet):
+//   * die Einfuegemodi "initial", "before html", "before head", "in head",
+//     "in head noscript", "after head", "in body", "text", "in table",
+//     "in table text", "in caption", "in column group", "in table body",
+//     "in row", "in cell", "in select", "in select in table", "after body",
+//     "in frameset", "after frameset", "after after body",
+//     "after after frameset" — 22 der 23 Modi.
+//   * Stapel offener Elemente mit allen vier Geltungsbereichen (scope,
+//     list item scope, button scope, table scope)
+//   * Liste der aktiven Formatierungselemente samt Marken, Noahs Arche
+//     (hoechstens drei gleiche Eintraege) und "reconstruct the active
+//     formatting elements"
+//   * das Adoption-Agency-Verfahren, beide Schleifen, mit Lesezeichen
+//   * implizites Schliessen ("generate implied end tags", auch die
+//     gruendliche Fassung)
+//   * "foster parenting" mit der vollstaendigen Fundstelle
+//     ("appropriate place for inserting a node")
+//   * "reset the insertion mode appropriately"
+//   * der generische Rohtext-/RCDATA-Weg mit RUECKKOPPLUNG auf den
+//     Tokenizer (`<title>`, `<style>`, `<script>`, `<textarea>`,
+//     `<plaintext>` …)
+//   * Quirks-Modus aus dem DOCTYPE
+//
+// NICHT UMGESETZT — bewusst, und hier genannt statt versteckt:
+//   * "in template" und der `<template>`-Inhalt. Das ist der 23. Modus und
+//     braucht einen zweiten Baum je Template plus einen eigenen Stapel von
+//     Einfuegemodi. `<template>` wird deshalb wie ein gewoehnliches Element
+//     behandelt.
+//   * FREMDINHALT (SVG/MathML) als eigener Regelsatz. Namensraeume gibt es
+//     (`<svg>` und `<math>` erzeugen Elemente im richtigen Namensraum, und
+//     der Namensraum steht am Knoten), aber die Sonderregeln fuer den
+//     Inhalt — Namenskorrektur, Attributanpassung, Integrationspunkte,
+//     Ausbruchtags — fehlen.
+//   * Fragmentzerlegung (`innerHTML`) mit Kontextelement.
+//   * Skriptausfuehrung und alles, was daran haengt (`document.write`,
+//     "scripting flag" ist AUS).
+//
+// GRENZEN DER BAUART:
+//   * Der Stapel offener Elemente hat 512 Plaetze, die Formatierungsliste
+//     128. Beides sind Felder IM Zustand, damit der konservative Stapelscan
+//     des Sammlers sie ohne Anmeldung sieht (SPEC §3.5.3). Ein Ueberlauf
+//     ist ein SICHTBARER Abbruch, keine stille Kuerzung.
+
+import html.mem
+import html.tokens
+import browser.knoten
+import browser.namen
+import browser.tag
+import browser.tokenstrom
+
+export {
+    Baum,
+    EM_INITIAL, EM_VOR_HTML, EM_VOR_HEAD, EM_IN_HEAD, EM_IN_HEAD_NOSCRIPT,
+    EM_NACH_HEAD, EM_IN_BODY, EM_TEXT, EM_IN_TABLE, EM_IN_TABLE_TEXT,
+    EM_IN_CAPTION, EM_IN_COLGROUP, EM_IN_TABLE_BODY, EM_IN_ROW, EM_IN_CELL,
+    EM_IN_SELECT, EM_IN_SELECT_IN_TABLE, EM_NACH_BODY, EM_IN_FRAMESET,
+    EM_NACH_FRAMESET, EM_NACH_NACH_BODY, EM_NACH_NACH_FRAMESET,
+    baum_neu, baum_puffer_init, baum_init, baum_frei,
+    baum_token, baum_eof, baum_dokument, baum_fehler, baum_kaputt, baum_loslassen,
+    baum_umschaltung, baum_um_pos, baum_um_tag, baum_um_loeschen,
+    baum_modus, baum_offen_zahl,
+}
+
+// --------------------------------------------------------------- Einfuegemodi
+
+const EM_INITIAL: u32 = 1
+const EM_VOR_HTML: u32 = 2
+const EM_VOR_HEAD: u32 = 3
+const EM_IN_HEAD: u32 = 4
+const EM_IN_HEAD_NOSCRIPT: u32 = 5
+const EM_NACH_HEAD: u32 = 6
+const EM_IN_BODY: u32 = 7
+const EM_TEXT: u32 = 8
+const EM_IN_TABLE: u32 = 9
+const EM_IN_TABLE_TEXT: u32 = 10
+const EM_IN_CAPTION: u32 = 11
+const EM_IN_COLGROUP: u32 = 12
+const EM_IN_TABLE_BODY: u32 = 13
+const EM_IN_ROW: u32 = 14
+const EM_IN_CELL: u32 = 15
+const EM_IN_SELECT: u32 = 16
+const EM_IN_SELECT_IN_TABLE: u32 = 17
+const EM_NACH_BODY: u32 = 18
+const EM_IN_FRAMESET: u32 = 19
+const EM_NACH_FRAMESET: u32 = 20
+const EM_NACH_NACH_BODY: u32 = 21
+const EM_NACH_NACH_FRAMESET: u32 = 22
+
+// Geltungsbereiche des Stapels (WHATWG §13.2.4.2).
+const SC_NORMAL: u32 = 0
+const SC_LISTE: u32 = 1
+const SC_BUTTON: u32 = 2
+const SC_TABELLE: u32 = 3
+const SC_SELECT: u32 = 4
+
+const MAX_OFFEN: usize = 512
+const MAX_AKTIV: usize = 128
+
+// Startzustaende des Tokenizers (lib/html/tokenizer.fi).
+const ZST_DATA: u32 = 0
+const ZST_PLAINTEXT: u32 = 1
+const ZST_RCDATA: u32 = 2
+const ZST_RAWTEXT: u32 = 3
+const ZST_SCRIPT: u32 = 4
+
+// ------------------------------------------------------------------ Zustand
+
+// ALLE `Gc[…]`-Felder liegen ABSICHTLICH in diesem Struct und damit im
+// Rahmen des Aufrufers: der Stapelscan des Sammlers ist konservativ
+// (SPEC §3.5.3) und sieht sie dort ohne jede Anmeldung. Ein `Baum` auf der
+// Halde (mem.heap_alloc) waere fuer den Sammler UNSICHTBAR — dann muesste er
+// mit `gc_wurzel_anmelden` angemeldet werden.
+struct Baum {
+    namen: *mut namen.Namen,
+    strom: *mut tokenstrom.Strom,
+
+    dok: Gc[Dokument],
+    kopf: Gc[Element],          // head element pointer
+    form: Gc[Element],          // form element pointer
+
+    offen: [Gc[Knoten]; 512],
+    noffen: usize,
+
+    // Liste der aktiven Formatierungselemente. Der Nullzeiger ist die MARKE.
+    aktiv: [Gc[Knoten]; 128],
+    naktiv: usize,
+
+    modus: u32,
+    urmodus: u32,               // "original insertion mode"
+    frameset_ok: bool,
+    foster: bool,               // "foster parenting" eingeschaltet?
+
+    // "in table text": gesammelte Zeichen und ob alles nur Leerraum war
+    tt: Gc[Kette],
+    tt_nur_space: bool,
+
+    // Rueckkopplung auf den Tokenizer
+    umschaltung: u32,           // 0 = keine, sonst ZST_*
+    um_pos: usize,              // Quellposition (relativ zum aktuellen Lauf)
+    um_tag: mem.CpBuf,          // lastStartTag fuer den Neustart
+    hilf: mem.CpBuf,            // Arbeitspuffer (Namen aus dem Protokoll)
+    nl_ueberspringen: bool,     // naechstes U+000A verwerfen (pre/textarea)
+
+    // Buchhaltung
+    tname: u32,                 // Atom des aktuellen Tag-Namens
+    fehler: u64,                // Zahl der Parse-Fehler
+    kaputt: u32,                // != 0: Ueberlauf / Speicher aus (sichtbar)
+}
+
+#[no_gc]
+fn baum_neu() -> Baum {
+    return Baum{
+        namen: 0 as *mut namen.Namen,
+        strom: 0 as *mut tokenstrom.Strom,
+        dok: gc_null[Dokument](),
+        kopf: gc_null[Element](),
+        form: gc_null[Element](),
+        offen: [gc_null[Knoten](); 512],
+        noffen: 0,
+        aktiv: [gc_null[Knoten](); 128],
+        naktiv: 0,
+        modus: EM_INITIAL,
+        urmodus: EM_INITIAL,
+        frameset_ok: true,
+        foster: false,
+        tt: gc_null[Kette](),
+        tt_nur_space: true,
+        umschaltung: 0,
+        um_pos: 0,
+        um_tag: mem.cp_neu(),
+        hilf: mem.cp_neu(),
+        nl_ueberspringen: false,
+        tname: 0,
+        fehler: 0,
+        kaputt: 0,
+    }
+}
+
+// EINMAL vor dem ersten Dokument. Getrennt von `baum_init`, und das ist
+// kein Schoenheitsfehler: `mem.cp_init` nullt den Zeiger, OHNE freizugeben.
+// Stuende es in `baum_init`, verloere jedes weitere Dokument die Puffer des
+// vorigen — im Dauerlauf gemessen 8 KiB je Runde, bei flachem GC-Heap.
+#[no_gc]
+fn baum_puffer_init(b: *mut Baum) {
+    mem.cp_init(&(*b).um_tag)
+    mem.cp_init(&(*b).hilf)
+}
+
+// Legt ein frisches Dokument an und setzt den Zustand zurueck.
+// `false` = Speicher aus; der Aufrufer MUSS dann sichtbar scheitern.
+fn baum_init(b: *mut Baum, nm: *mut namen.Namen, st: *mut tokenstrom.Strom) -> bool {
+    mem.cp_clear(&(*b).um_tag)
+    mem.cp_clear(&(*b).hilf)
+    (*b).nl_ueberspringen = false
+    (*b).namen = nm
+    (*b).strom = st
+    (*b).dok = knoten.dokument_neu() catch gc_null[Dokument]()
+    if (*b).dok == gc_null[Dokument]() {
+        return false
+    }
+    (*b).kopf = gc_null[Element]()
+    (*b).form = gc_null[Element]()
+    (*b).noffen = 0
+    (*b).naktiv = 0
+    var i: usize = 0
+    while i < MAX_OFFEN {
+        (*b).offen[i] = gc_null[Knoten]()
+        i = i + 1
+    }
+    i = 0
+    while i < MAX_AKTIV {
+        (*b).aktiv[i] = gc_null[Knoten]()
+        i = i + 1
+    }
+    (*b).modus = EM_INITIAL
+    (*b).urmodus = EM_INITIAL
+    (*b).frameset_ok = true
+    (*b).foster = false
+    (*b).tt = gc_null[Kette]()
+    (*b).tt_nur_space = true
+    (*b).umschaltung = 0
+    (*b).um_pos = 0
+    (*b).tname = 0
+    (*b).fehler = 0
+    (*b).kaputt = 0
+    return true
+}
+
+// Laesst den zuletzt gebauten Baum los: alle Gc-Felder des Zustands werden
+// genullt. Ohne das haelt der Zustand den fertigen Baum weiter fest — fuer
+// den Dauerlauf (lib/browser/soak_baum.fi) ist genau das der Unterschied
+// zwischen "wird eingesammelt" und "waechst".
+fn baum_loslassen(b: *mut Baum) {
+    (*b).dok = gc_null[Dokument]()
+    (*b).kopf = gc_null[Element]()
+    (*b).form = gc_null[Element]()
+    (*b).tt = gc_null[Kette]()
+    var i: usize = 0
+    while i < MAX_OFFEN {
+        (*b).offen[i] = gc_null[Knoten]()
+        i = i + 1
+    }
+    i = 0
+    while i < MAX_AKTIV {
+        (*b).aktiv[i] = gc_null[Knoten]()
+        i = i + 1
+    }
+    (*b).noffen = 0
+    (*b).naktiv = 0
+}
+
+#[no_gc]
+fn baum_frei(b: *mut Baum) {
+    mem.cp_free(&(*b).um_tag)
+    mem.cp_free(&(*b).hilf)
+}
+
+fn baum_dokument(b: *mut Baum) -> Gc[Dokument] {
+    return (*b).dok
+}
+
+#[no_gc]
+fn baum_fehler(b: *mut Baum) -> u64 {
+    return (*b).fehler
+}
+
+#[no_gc]
+fn baum_kaputt(b: *mut Baum) -> u32 {
+    return (*b).kaputt
+}
+
+#[no_gc]
+fn baum_modus(b: *mut Baum) -> u32 {
+    return (*b).modus
+}
+
+#[no_gc]
+fn baum_offen_zahl(b: *mut Baum) -> usize {
+    return (*b).noffen
+}
+
+#[no_gc]
+fn baum_umschaltung(b: *mut Baum) -> u32 {
+    return (*b).umschaltung
+}
+
+#[no_gc]
+fn baum_um_pos(b: *mut Baum) -> usize {
+    return (*b).um_pos
+}
+
+#[no_gc]
+fn baum_um_tag(b: *mut Baum) -> *mut mem.CpBuf {
+    return &(*b).um_tag
+}
+
+#[no_gc]
+fn baum_um_loeschen(b: *mut Baum) {
+    (*b).umschaltung = 0
+}
+
+#[no_gc]
+fn parse_fehler(b: *mut Baum) {
+    (*b).fehler = (*b).fehler + 1
+}
+
+// ------------------------------------------------------- Stapel und Listen
+
+fn stapel_push(b: *mut Baum, k: Gc[Knoten]) {
+    if (*b).noffen >= MAX_OFFEN {
+        (*b).kaputt = 1
+        return
+    }
+    (*b).offen[(*b).noffen] = k
+    (*b).noffen = (*b).noffen + 1
+}
+
+fn stapel_pop(b: *mut Baum) -> Gc[Knoten] {
+    if (*b).noffen == 0 {
+        return gc_null[Knoten]()
+    }
+    (*b).noffen = (*b).noffen - 1
+    let k: Gc[Knoten] = (*b).offen[(*b).noffen]
+    (*b).offen[(*b).noffen] = gc_null[Knoten]()
+    return k
+}
+
+fn aktueller(b: *mut Baum) -> Gc[Knoten] {
+    if (*b).noffen == 0 {
+        return gc_null[Knoten]()
+    }
+    return (*b).offen[(*b).noffen - 1]
+}
+
+fn stapel_bei(b: *mut Baum, i: usize) -> Gc[Knoten] {
+    if i >= (*b).noffen {
+        return gc_null[Knoten]()
+    }
+    return (*b).offen[i]
+}
+
+fn stapel_index(b: *mut Baum, k: Gc[Knoten]) -> i64 {
+    var i: usize = (*b).noffen
+    while i > 0 {
+        i = i - 1
+        if (*b).offen[i] == k {
+            return i as i64
+        }
+    }
+    return -1
+}
+
+fn stapel_enthaelt(b: *mut Baum, k: Gc[Knoten]) -> bool {
+    return stapel_index(b, k) >= 0
+}
+
+// Entfernt EINEN bestimmten Knoten aus dem Stapel (nicht unbedingt oben).
+fn stapel_entferne(b: *mut Baum, k: Gc[Knoten]) {
+    let idx: i64 = stapel_index(b, k)
+    if idx < 0 {
+        return
+    }
+    var i: usize = idx as usize
+    while i + 1 < (*b).noffen {
+        (*b).offen[i] = (*b).offen[i + 1]
+        i = i + 1
+    }
+    (*b).noffen = (*b).noffen - 1
+    (*b).offen[(*b).noffen] = gc_null[Knoten]()
+}
+
+// Fuegt `neu` unmittelbar UNTER `bezug` ein (also an dessen Stelle, `bezug`
+// rutscht eine Stelle hoch). Schritt 19 des Adoption-Agency-Verfahrens.
+fn stapel_einfuegen_unter(b: *mut Baum, bezug: Gc[Knoten], neu: Gc[Knoten]) {
+    let idx: i64 = stapel_index(b, bezug)
+    if idx < 0 {
+        stapel_push(b, neu)
+        return
+    }
+    if (*b).noffen >= MAX_OFFEN {
+        (*b).kaputt = 1
+        return
+    }
+    var i: usize = (*b).noffen
+    while i > idx as usize {
+        (*b).offen[i] = (*b).offen[i - 1]
+        i = i - 1
+    }
+    (*b).offen[idx as usize] = neu
+    (*b).noffen = (*b).noffen + 1
+}
+
+fn stapel_ersetzen(b: *mut Baum, alt: Gc[Knoten], neu: Gc[Knoten]) {
+    let idx: i64 = stapel_index(b, alt)
+    if idx >= 0 {
+        (*b).offen[idx as usize] = neu
+    }
+}
+
+// Poppt so lange, bis `k` gepoppt wurde (einschliesslich).
+fn stapel_pop_bis(b: *mut Baum, k: Gc[Knoten]) {
+    while (*b).noffen > 0 {
+        let x: Gc[Knoten] = stapel_pop(b)
+        if x == k {
+            return
+        }
+    }
+}
+
+// Poppt so lange, bis ein HTML-Element mit diesem Namen gepoppt wurde.
+// Der Standard ruft das nur, wenn das Element wirklich im Stapel steht.
+// Die Vorpruefung ist trotzdem da: ohne sie raeumt EIN Denkfehler an der
+// Aufrufstelle den ganzen Stapel leer, und der Fehler zeigt sich erst viel
+// spaeter als leerer Baum.
+fn stapel_pop_bis_name(b: *mut Baum, name: u32) {
+    var da: bool = false
+    var i: usize = (*b).noffen
+    while i > 0 {
+        i = i - 1
+        if knoten.element_ist((*b).offen[i], name) {
+            da = true
+            break
+        }
+    }
+    if !da {
+        return
+    }
+    while (*b).noffen > 0 {
+        let x: Gc[Knoten] = stapel_pop(b)
+        if knoten.element_ist(x, name) {
+            return
+        }
+    }
+}
+
+// ------------------------------------------------------ Geltungsbereiche
+
+// Die Grundliste des Geltungsbereichs (WHATWG §13.2.4.2 "has an element in
+// scope"). Alles ausser den drei Fremdinhaltsgruppen ist HTML.
+fn scope_grundliste(name: u32, ns: u32) -> bool {
+    if ns == knoten.NS_HTML {
+        return name == tag.M_APPLET || name == tag.M_CAPTION || name == tag.M_HTML ||
+            name == tag.M_TABLE || name == tag.M_TD || name == tag.M_TH ||
+            name == tag.M_MARQUEE || name == tag.M_OBJECT || name == tag.M_TEMPLATE
+    }
+    if ns == knoten.NS_MATHML {
+        return name == tag.M_MI || name == tag.M_MO || name == tag.M_MN ||
+            name == tag.M_MS || name == tag.M_MTEXT || name == tag.M_ANNOTATION_XML
+    }
+    if ns == knoten.NS_SVG {
+        return name == tag.M_FOREIGNOBJECT || name == tag.M_DESC || name == tag.M_TITLE
+    }
+    return false
+}
+
+fn scope_ende(name: u32, ns: u32, art: u32) -> bool {
+    if art == SC_TABELLE {
+        if ns != knoten.NS_HTML {
+            return false
+        }
+        return name == tag.M_HTML || name == tag.M_TABLE || name == tag.M_TEMPLATE
+    }
+    if art == SC_SELECT {
+        // "has an element in select scope" ist umgekehrt formuliert: alles
+        // AUSSER optgroup/option beendet die Suche.
+        if ns != knoten.NS_HTML {
+            return true
+        }
+        return !(name == tag.M_OPTGROUP || name == tag.M_OPTION)
+    }
+    if scope_grundliste(name, ns) {
+        return true
+    }
+    if art == SC_LISTE && ns == knoten.NS_HTML {
+        return name == tag.M_OL || name == tag.M_UL
+    }
+    if art == SC_BUTTON && ns == knoten.NS_HTML {
+        return name == tag.M_BUTTON
+    }
+    return false
+}
+
+// Steht ein HTML-Element mit diesem Namen im angegebenen Geltungsbereich?
+fn in_scope(b: *mut Baum, name: u32, art: u32) -> bool {
+    var i: usize = (*b).noffen
+    while i > 0 {
+        i = i - 1
+        let k: Gc[Knoten] = (*b).offen[i]
+        let e: Gc[Element] = knoten.knoten_als_element(k)
+        if e == gc_null[Element]() {
+            continue
+        }
+        if e.ns == knoten.NS_HTML && e.name == name {
+            return true
+        }
+        if scope_ende(e.name, e.ns, art) {
+            return false
+        }
+    }
+    return false
+}
+
+// Wie `in_scope`, aber fuer einen bestimmten Knoten statt fuer einen Namen.
+fn knoten_in_scope(b: *mut Baum, ziel: Gc[Knoten], art: u32) -> bool {
+    var i: usize = (*b).noffen
+    while i > 0 {
+        i = i - 1
+        let k: Gc[Knoten] = (*b).offen[i]
+        if k == ziel {
+            return true
+        }
+        let e: Gc[Element] = knoten.knoten_als_element(k)
+        if e == gc_null[Element]() {
+            continue
+        }
+        if scope_ende(e.name, e.ns, art) {
+            return false
+        }
+    }
+    return false
+}
+
+// Steht EINES der Tabellenzellenelemente im Tabellen-Geltungsbereich?
+fn zelle_in_table_scope(b: *mut Baum) -> bool {
+    return in_scope(b, tag.M_TD, SC_TABELLE) || in_scope(b, tag.M_TH, SC_TABELLE)
+}
+
+// ------------------------------------------------------------- Kategorien
+
+// WHATWG §13.2.4.2 "Special". Vollstaendig; die Liste steht so im Standard.
+fn ist_speziell(name: u32, ns: u32) -> bool {
+    if ns == knoten.NS_MATHML {
+        return name == tag.M_MI || name == tag.M_MO || name == tag.M_MN ||
+            name == tag.M_MS || name == tag.M_MTEXT || name == tag.M_ANNOTATION_XML
+    }
+    if ns == knoten.NS_SVG {
+        return name == tag.M_FOREIGNOBJECT || name == tag.M_DESC || name == tag.M_TITLE
+    }
+    if ns != knoten.NS_HTML {
+        return false
+    }
+    if name == tag.M_ADDRESS || name == tag.M_APPLET || name == tag.M_AREA ||
+        name == tag.M_ARTICLE || name == tag.M_ASIDE || name == tag.M_BASE ||
+        name == tag.M_BASEFONT || name == tag.M_BGSOUND || name == tag.M_BLOCKQUOTE ||
+        name == tag.M_BODY || name == tag.M_BR || name == tag.M_BUTTON ||
+        name == tag.M_CAPTION || name == tag.M_CENTER || name == tag.M_COL ||
+        name == tag.M_COLGROUP || name == tag.M_DD || name == tag.M_DETAILS ||
+        name == tag.M_DIR || name == tag.M_DIV || name == tag.M_DL ||
+        name == tag.M_DT || name == tag.M_EMBED || name == tag.M_FIELDSET {
+        return true
+    }
+    if name == tag.M_FIGCAPTION || name == tag.M_FIGURE || name == tag.M_FOOTER ||
+        name == tag.M_FORM || name == tag.M_FRAME || name == tag.M_FRAMESET ||
+        name == tag.M_H1 || name == tag.M_H2 || name == tag.M_H3 ||
+        name == tag.M_H4 || name == tag.M_H5 || name == tag.M_H6 ||
+        name == tag.M_HEAD || name == tag.M_HEADER || name == tag.M_HGROUP ||
+        name == tag.M_HR || name == tag.M_HTML || name == tag.M_IFRAME ||
+        name == tag.M_IMG || name == tag.M_INPUT || name == tag.M_KEYGEN ||
+        name == tag.M_LI || name == tag.M_LINK || name == tag.M_LISTING {
+        return true
+    }
+    if name == tag.M_MAIN || name == tag.M_MARQUEE || name == tag.M_MENU ||
+        name == tag.M_META || name == tag.M_NAV || name == tag.M_NOEMBED ||
+        name == tag.M_NOFRAMES || name == tag.M_NOSCRIPT || name == tag.M_OBJECT ||
+        name == tag.M_OL || name == tag.M_P || name == tag.M_PARAM ||
+        name == tag.M_PLAINTEXT || name == tag.M_PRE || name == tag.M_SCRIPT ||
+        name == tag.M_SEARCH || name == tag.M_SECTION || name == tag.M_SELECT ||
+        name == tag.M_SOURCE || name == tag.M_STYLE || name == tag.M_SUMMARY ||
+        name == tag.M_TABLE || name == tag.M_TBODY || name == tag.M_TD {
+        return true
+    }
+    return name == tag.M_TEMPLATE || name == tag.M_TEXTAREA || name == tag.M_TFOOT ||
+        name == tag.M_TH || name == tag.M_THEAD || name == tag.M_TITLE ||
+        name == tag.M_TR || name == tag.M_TRACK || name == tag.M_UL ||
+        name == tag.M_WBR || name == tag.M_XMP
+}
+
+// WHATWG §13.2.4.2 "Formatting" — genau die Elemente, die in der Liste der
+// aktiven Formatierungselemente landen.
+fn ist_formatierung(name: u32) -> bool {
+    return name == tag.M_A || name == tag.M_B || name == tag.M_BIG ||
+        name == tag.M_CODE || name == tag.M_EM || name == tag.M_FONT ||
+        name == tag.M_I || name == tag.M_NOBR || name == tag.M_S ||
+        name == tag.M_SMALL || name == tag.M_STRIKE || name == tag.M_STRONG ||
+        name == tag.M_TT || name == tag.M_U
+}
+
+fn ist_ueberschrift(name: u32) -> bool {
+    return name == tag.M_H1 || name == tag.M_H2 || name == tag.M_H3 ||
+        name == tag.M_H4 || name == tag.M_H5 || name == tag.M_H6
+}
+
+// Die Gruppe "address, article, aside, …" aus "in body".
+fn ist_blockgruppe(name: u32) -> bool {
+    return name == tag.M_ADDRESS || name == tag.M_ARTICLE || name == tag.M_ASIDE ||
+        name == tag.M_BLOCKQUOTE || name == tag.M_CENTER || name == tag.M_DETAILS ||
+        name == tag.M_DIALOG || name == tag.M_DIR || name == tag.M_DIV ||
+        name == tag.M_DL || name == tag.M_FIELDSET || name == tag.M_FIGCAPTION ||
+        name == tag.M_FIGURE || name == tag.M_FOOTER || name == tag.M_HEADER ||
+        name == tag.M_HGROUP || name == tag.M_MAIN || name == tag.M_MENU ||
+        name == tag.M_NAV || name == tag.M_OL || name == tag.M_P ||
+        name == tag.M_SEARCH || name == tag.M_SECTION || name == tag.M_SUMMARY ||
+        name == tag.M_UL
+}
+
+// Die Gruppe der ENDTAGS "address, article, …". Sie ist NICHT dieselbe wie
+// die Starttag-Gruppe: `p` hat eine eigene Regel (es wird notfalls erzeugt),
+// dafuer gehoeren `button`, `listing` und `pre` dazu. Diese Verwechslung hat
+// beim ersten Lauf `</p>` den ganzen Stapel leergeraeumt.
+fn ende_blockgruppe(name: u32) -> bool {
+    if name == tag.M_P {
+        return false
+    }
+    return ist_blockgruppe(name) || name == tag.M_BUTTON ||
+        name == tag.M_LISTING || name == tag.M_PRE
+}
+
+fn ist_leerraum(c: u32) -> bool {
+    return c == 9 as u32 || c == 10 as u32 || c == 12 as u32 || c == 13 as u32 ||
+        c == 32 as u32
+}
+
+// -------------------------------------------------- Knoten bauen/einfuegen
+
+// WHATWG §13.2.6.1 "appropriate place for inserting a node", vollstaendig
+// samt "foster parenting". Ergebnis sind ZWEI Werte (Elternknoten und der
+// Knoten, VOR dem eingefuegt wird; Nullzeiger = anhaengen) — Firn hat keine
+// Tupel, also gehen sie ueber Zeiger hinaus.
+fn passende_stelle(b: *mut Baum, ueberschreibung: Gc[Knoten],
+                   eltern_aus: *mut Gc[Knoten], ref_aus: *mut Gc[Knoten]) {
+    var ziel: Gc[Knoten] = ueberschreibung
+    if ziel == gc_null[Knoten]() {
+        ziel = aktueller(b)
+    }
+    *eltern_aus = ziel
+    *ref_aus = gc_null[Knoten]()
+    if !(*b).foster {
+        return
+    }
+    let e: Gc[Element] = knoten.knoten_als_element(ziel)
+    if e == gc_null[Element]() || e.ns != knoten.NS_HTML {
+        return
+    }
+    if !(e.name == tag.M_TABLE || e.name == tag.M_TBODY || e.name == tag.M_TFOOT ||
+         e.name == tag.M_THEAD || e.name == tag.M_TR) {
+        return
+    }
+    // Die letzte `table` im Stapel suchen.
+    var i: usize = (*b).noffen
+    var tabelle: Gc[Knoten] = gc_null[Knoten]()
+    var tidx: usize = 0
+    while i > 0 {
+        i = i - 1
+        if knoten.element_ist((*b).offen[i], tag.M_TABLE) {
+            tabelle = (*b).offen[i]
+            tidx = i
+            break
+        }
+    }
+    if tabelle == gc_null[Knoten]() {
+        // Fragmentfall: in das unterste Element des Stapels.
+        if (*b).noffen > 0 {
+            *eltern_aus = (*b).offen[0]
+        }
+        return
+    }
+    if tabelle.eltern != gc_null[Knoten]() {
+        *eltern_aus = tabelle.eltern
+        *ref_aus = tabelle
+        return
+    }
+    if tidx > 0 {
+        *eltern_aus = (*b).offen[tidx - 1]
+    }
+}
+
+// Setzt die Attribute des aktuellen Starttag-Tokens auf `e`.
+fn attribute_uebernehmen(b: *mut Baum, e: Gc[Element]) -> AllocError!bool {
+    let st: *mut tokenstrom.Strom = (*b).strom
+    let n: u32 = tokenstrom.strom_nattr(st)
+    var off: usize = tokenstrom.strom_attr_erstes(st)
+    var k: u32 = 0
+    let puffer: *mut mem.CpBuf = &(*b).hilf
+    while k < n {
+        // Name
+        mem.cp_clear(puffer)
+        let nl: usize = tokenstrom.kette_laenge(st, off)
+        var j: usize = 0
+        while j < nl {
+            mem.cp_push(puffer, tokenstrom.kette_cp(st, off, j))
+            j = j + 1
+        }
+        let aname: u32 = namen.namen_von_cp((*b).namen, puffer)
+        off = tokenstrom.kette_ende(st, off)
+        // Wert
+        let wert = try knoten.kette_neu()
+        let wl: usize = tokenstrom.kette_laenge(st, off)
+        j = 0
+        while j < wl {
+            let ok: bool = try knoten.kette_push(wert, tokenstrom.kette_cp(st, off, j))
+            if !ok {
+                return false
+            }
+            j = j + 1
+        }
+        off = tokenstrom.kette_ende(st, off)
+        if aname == 0 as u32 {
+            return false
+        }
+        let gesetzt: bool = try knoten.attr_setzen(e, aname, 0, wert)
+        if !gesetzt {
+            // Doppelte Attribute verwirft schon der Tokenizer; hier waere es
+            // nur ein zweiter Schutz.
+            parse_fehler(b)
+        }
+        k = k + 1
+    }
+    return true
+}
+
+// "create an element for a token" — ohne Einfuegen.
+fn element_fuer_token(b: *mut Baum, ns: u32) -> AllocError!Gc[Element] {
+    let e = try knoten.element_neu((*b).tname, ns)
+    if tokenstrom.strom_art((*b).strom) == tokens.TB_START {
+        let ok: bool = try attribute_uebernehmen(b, e)
+        if !ok {
+            return gc_null[Element]()
+        }
+    }
+    return e
+}
+
+// Kopiert ein Element mitsamt Attributen. Das Adoption-Agency-Verfahren
+// verlangt "create an element for the token for which the element was
+// created" — der Kopie eines Elements ist das gleichwertig und braucht kein
+// Aufbewahren alter Token.
+fn element_klonen(e: Gc[Element]) -> AllocError!Gc[Element] {
+    let neu = try knoten.element_neu(e.name, e.ns)
+    var a: Gc[Attribut] = e.erstes_attr
+    while a != gc_null[Attribut]() {
+        let ok: bool = try knoten.attr_setzen(neu, a.name, a.ns, a.wert)
+        a = a.naechstes
+    }
+    return neu
+}
+
+// "insert a node at the appropriate place"
+fn knoten_einfuegen(b: *mut Baum, k: Gc[Knoten]) {
+    var eltern: Gc[Knoten] = gc_null[Knoten]()
+    var bezug: Gc[Knoten] = gc_null[Knoten]()
+    passende_stelle(b, gc_null[Knoten](), &eltern, &bezug)
+    if eltern == gc_null[Knoten]() {
+        return
+    }
+    knoten.kind_einfuegen_vor(eltern, k, bezug)
+}
+
+// "insert an HTML element for the token": erzeugen, einfuegen, auf den
+// Stapel legen.
+fn element_einfuegen_fuer_token(b: *mut Baum, ns: u32) -> AllocError!Gc[Element] {
+    let e = try element_fuer_token(b, ns)
+    if e == gc_null[Element]() {
+        return e
+    }
+    knoten_einfuegen(b, e)
+    stapel_push(b, e)
+    return e
+}
+
+// Wie oben, aber mit einem selbst gewaehlten Namen (z. B. das implizite
+// `html`, `head` oder `body`).
+fn element_einfuegen_name(b: *mut Baum, name: u32) -> AllocError!Gc[Element] {
+    let e = try knoten.element_neu(name, knoten.NS_HTML)
+    knoten_einfuegen(b, e)
+    stapel_push(b, e)
+    return e
+}
+
+// WHATWG §13.2.6.1 "insert a character".
+fn zeichen_einfuegen(b: *mut Baum, cp: u32) -> AllocError!bool {
+    var eltern: Gc[Knoten] = gc_null[Knoten]()
+    var bezug: Gc[Knoten] = gc_null[Knoten]()
+    passende_stelle(b, gc_null[Knoten](), &eltern, &bezug)
+    if eltern == gc_null[Knoten]() {
+        return false
+    }
+    // In ein Dokument kommt kein Text.
+    if eltern.art == knoten.K_DOKUMENT {
+        return true
+    }
+    var davor: Gc[Knoten] = gc_null[Knoten]()
+    if bezug == gc_null[Knoten]() {
+        davor = eltern.letztes_kind
+    } else {
+        davor = bezug.vorheriges
+    }
+    if davor != gc_null[Knoten]() && davor.art == knoten.K_TEXT {
+        let t: Gc[Text] = davor.as?[Text]
+        if t != gc_null[Text]() {
+            return try knoten.kette_push(t.daten, cp)
+        }
+    }
+    let kette = try knoten.kette_neu()
+    let ok: bool = try knoten.kette_push(kette, cp)
+    if !ok {
+        return false
+    }
+    let t = try knoten.text_neu(kette)
+    knoten.kind_einfuegen_vor(eltern, t, bezug)
+    return true
+}
+
+// Kommentar des aktuellen Tokens an eine bestimmte Stelle haengen.
+// `eltern == gc_null` heisst "an die passende Stelle".
+fn kommentar_einfuegen(b: *mut Baum, eltern: Gc[Knoten]) -> AllocError!bool {
+    let st: *mut tokenstrom.Strom = (*b).strom
+    let off: usize = tokenstrom.strom_daten(st)
+    let n: usize = tokenstrom.kette_laenge(st, off)
+    let kette = try knoten.kette_neu()
+    var i: usize = 0
+    while i < n {
+        let ok: bool = try knoten.kette_push(kette, tokenstrom.kette_cp(st, off, i))
+        if !ok {
+            return false
+        }
+        i = i + 1
+    }
+    let c = try knoten.kommentar_neu(kette)
+    if eltern != gc_null[Knoten]() {
+        knoten.kind_anhaengen(eltern, c)
+    } else {
+        knoten_einfuegen(b, c)
+    }
+    return true
+}
+
+// --------------------------------------- Liste der aktiven Formatierungen
+
+fn aktiv_push_marke(b: *mut Baum) {
+    if (*b).naktiv >= MAX_AKTIV {
+        (*b).kaputt = 2
+        return
+    }
+    (*b).aktiv[(*b).naktiv] = gc_null[Knoten]()
+    (*b).naktiv = (*b).naktiv + 1
+}
+
+fn attribute_gleich(a: Gc[Element], c: Gc[Element]) -> bool {
+    if a.nattr != c.nattr {
+        return false
+    }
+    var x: Gc[Attribut] = a.erstes_attr
+    while x != gc_null[Attribut]() {
+        var y: Gc[Attribut] = c.erstes_attr
+        var gefunden: bool = false
+        while y != gc_null[Attribut]() {
+            if y.name == x.name && y.ns == x.ns && knoten.kette_gleich(y.wert, x.wert) {
+                gefunden = true
+                break
+            }
+            y = y.naechstes
+        }
+        if !gefunden {
+            return false
+        }
+        x = x.naechstes
+    }
+    return true
+}
+
+// "push onto the list of active formatting elements" mit NOAHS ARCHE:
+// stehen nach der letzten Marke schon drei gleiche Eintraege, faellt der
+// aelteste heraus.
+fn aktiv_push(b: *mut Baum, k: Gc[Knoten]) {
+    let e: Gc[Element] = knoten.knoten_als_element(k)
+    if e != gc_null[Element]() {
+        var gleiche: u32 = 0
+        var erster: i64 = -1
+        var i: usize = (*b).naktiv
+        while i > 0 {
+            i = i - 1
+            let x: Gc[Knoten] = (*b).aktiv[i]
+            if x == gc_null[Knoten]() {
+                break
+            }
+            let xe: Gc[Element] = knoten.knoten_als_element(x)
+            if xe == gc_null[Element]() {
+                continue
+            }
+            if xe.name == e.name && xe.ns == e.ns && attribute_gleich(xe, e) {
+                gleiche = gleiche + 1
+                erster = i as i64
+            }
+        }
+        if gleiche >= 3 as u32 && erster >= 0 {
+            aktiv_entferne_bei(b, erster as usize)
+        }
+    }
+    if (*b).naktiv >= MAX_AKTIV {
+        (*b).kaputt = 2
+        return
+    }
+    (*b).aktiv[(*b).naktiv] = k
+    (*b).naktiv = (*b).naktiv + 1
+}
+
+fn aktiv_entferne_bei(b: *mut Baum, idx: usize) {
+    if idx >= (*b).naktiv {
+        return
+    }
+    var i: usize = idx
+    while i + 1 < (*b).naktiv {
+        (*b).aktiv[i] = (*b).aktiv[i + 1]
+        i = i + 1
+    }
+    (*b).naktiv = (*b).naktiv - 1
+    (*b).aktiv[(*b).naktiv] = gc_null[Knoten]()
+}
+
+fn aktiv_index(b: *mut Baum, k: Gc[Knoten]) -> i64 {
+    if k == gc_null[Knoten]() {
+        return -1
+    }
+    var i: usize = (*b).naktiv
+    while i > 0 {
+        i = i - 1
+        if (*b).aktiv[i] == k {
+            return i as i64
+        }
+    }
+    return -1
+}
+
+fn aktiv_entferne(b: *mut Baum, k: Gc[Knoten]) {
+    let i: i64 = aktiv_index(b, k)
+    if i >= 0 {
+        aktiv_entferne_bei(b, i as usize)
+    }
+}
+
+// "clear the list of active formatting elements up to the last marker"
+fn aktiv_bis_marke_leeren(b: *mut Baum) {
+    while (*b).naktiv > 0 {
+        (*b).naktiv = (*b).naktiv - 1
+        let k: Gc[Knoten] = (*b).aktiv[(*b).naktiv]
+        (*b).aktiv[(*b).naktiv] = gc_null[Knoten]()
+        if k == gc_null[Knoten]() {
+            return
+        }
+    }
+}
+
+// Letzter Eintrag mit diesem Namen NACH der letzten Marke.
+fn aktiv_letzter_mit_namen(b: *mut Baum, name: u32) -> i64 {
+    var i: usize = (*b).naktiv
+    while i > 0 {
+        i = i - 1
+        let k: Gc[Knoten] = (*b).aktiv[i]
+        if k == gc_null[Knoten]() {
+            return -1
+        }
+        if knoten.element_ist(k, name) {
+            return i as i64
+        }
+    }
+    return -1
+}
+
+// WHATWG §13.2.4.3 "reconstruct the active formatting elements".
+fn aktiv_wiederherstellen(b: *mut Baum) -> AllocError!bool {
+    if (*b).naktiv == 0 {
+        return true
+    }
+    var i: usize = (*b).naktiv - 1
+    let letzter: Gc[Knoten] = (*b).aktiv[i]
+    if letzter == gc_null[Knoten]() || stapel_enthaelt(b, letzter) {
+        return true
+    }
+    // Zurueckspulen
+    while i > 0 {
+        i = i - 1
+        let x: Gc[Knoten] = (*b).aktiv[i]
+        if x == gc_null[Knoten]() || stapel_enthaelt(b, x) {
+            i = i + 1
+            break
+        }
+    }
+    // Vorwaerts neu anlegen
+    while i < (*b).naktiv {
+        let x: Gc[Knoten] = (*b).aktiv[i]
+        let xe: Gc[Element] = knoten.knoten_als_element(x)
+        if xe == gc_null[Element]() {
+            i = i + 1
+            continue
+        }
+        let neu = try element_klonen(xe)
+        knoten_einfuegen(b, neu)
+        stapel_push(b, neu)
+        (*b).aktiv[i] = neu
+        i = i + 1
+    }
+    return true
+}
+
+// ------------------------------------------------- Implizites Schliessen
+
+// WHATWG §13.2.6.3 "generate implied end tags", `ausser` wird ausgenommen
+// (0 = nichts ausnehmen).
+fn implizit_schliessen(b: *mut Baum, ausser: u32) {
+    while true {
+        let k: Gc[Knoten] = aktueller(b)
+        let e: Gc[Element] = knoten.knoten_als_element(k)
+        if e == gc_null[Element]() || e.ns != knoten.NS_HTML {
+            return
+        }
+        if e.name == ausser {
+            return
+        }
+        if e.name == tag.M_DD || e.name == tag.M_DT || e.name == tag.M_LI ||
+            e.name == tag.M_OPTGROUP || e.name == tag.M_OPTION || e.name == tag.M_P ||
+            e.name == tag.M_RB || e.name == tag.M_RP || e.name == tag.M_RT ||
+            e.name == tag.M_RTC {
+            stapel_pop(b)
+        } else {
+            return
+        }
+    }
+}
+
+// "generate all implied end tags thoroughly"
+fn implizit_schliessen_gruendlich(b: *mut Baum) {
+    while true {
+        let k: Gc[Knoten] = aktueller(b)
+        let e: Gc[Element] = knoten.knoten_als_element(k)
+        if e == gc_null[Element]() || e.ns != knoten.NS_HTML {
+            return
+        }
+        if e.name == tag.M_CAPTION || e.name == tag.M_COLGROUP || e.name == tag.M_DD ||
+            e.name == tag.M_DT || e.name == tag.M_LI || e.name == tag.M_OPTGROUP ||
+            e.name == tag.M_OPTION || e.name == tag.M_P || e.name == tag.M_RB ||
+            e.name == tag.M_RP || e.name == tag.M_RT || e.name == tag.M_RTC ||
+            e.name == tag.M_TBODY || e.name == tag.M_TD || e.name == tag.M_TFOOT ||
+            e.name == tag.M_TH || e.name == tag.M_THEAD || e.name == tag.M_TR {
+            stapel_pop(b)
+        } else {
+            return
+        }
+    }
+}
+
+// "close a p element"
+fn p_schliessen(b: *mut Baum) {
+    implizit_schliessen(b, tag.M_P)
+    if !knoten.element_ist(aktueller(b), tag.M_P) {
+        parse_fehler(b)
+    }
+    stapel_pop_bis_name(b, tag.M_P)
+}
+
+// "clear the stack back to a table context" und die beiden Verwandten.
+fn stapel_bis_tabellenkontext(b: *mut Baum) {
+    while (*b).noffen > 0 {
+        let k: Gc[Knoten] = aktueller(b)
+        if knoten.element_ist(k, tag.M_TABLE) || knoten.element_ist(k, tag.M_TEMPLATE) ||
+            knoten.element_ist(k, tag.M_HTML) {
+            return
+        }
+        stapel_pop(b)
+    }
+}
+
+fn stapel_bis_koerperkontext(b: *mut Baum) {
+    while (*b).noffen > 0 {
+        let k: Gc[Knoten] = aktueller(b)
+        if knoten.element_ist(k, tag.M_TBODY) || knoten.element_ist(k, tag.M_TFOOT) ||
+            knoten.element_ist(k, tag.M_THEAD) || knoten.element_ist(k, tag.M_TEMPLATE) ||
+            knoten.element_ist(k, tag.M_HTML) {
+            return
+        }
+        stapel_pop(b)
+    }
+}
+
+fn stapel_bis_zeilenkontext(b: *mut Baum) {
+    while (*b).noffen > 0 {
+        let k: Gc[Knoten] = aktueller(b)
+        if knoten.element_ist(k, tag.M_TR) || knoten.element_ist(k, tag.M_TEMPLATE) ||
+            knoten.element_ist(k, tag.M_HTML) {
+            return
+        }
+        stapel_pop(b)
+    }
+}
+
+// "close the cell"
+fn zelle_schliessen(b: *mut Baum) {
+    implizit_schliessen(b, 0)
+    let k: Gc[Knoten] = aktueller(b)
+    if !(knoten.element_ist(k, tag.M_TD) || knoten.element_ist(k, tag.M_TH)) {
+        parse_fehler(b)
+    }
+    while (*b).noffen > 0 {
+        let x: Gc[Knoten] = stapel_pop(b)
+        if knoten.element_ist(x, tag.M_TD) || knoten.element_ist(x, tag.M_TH) {
+            break
+        }
+    }
+    aktiv_bis_marke_leeren(b)
+    (*b).modus = EM_IN_ROW
+}
+
+// WHATWG §13.2.6.2 "reset the insertion mode appropriately".
+fn einfuegemodus_zuruecksetzen(b: *mut Baum) {
+    var i: usize = (*b).noffen
+    while i > 0 {
+        i = i - 1
+        let k: Gc[Knoten] = (*b).offen[i]
+        let letzter: bool = i == 0
+        let e: Gc[Element] = knoten.knoten_als_element(k)
+        if e == gc_null[Element]() || e.ns != knoten.NS_HTML {
+            if letzter {
+                (*b).modus = EM_IN_BODY
+                return
+            }
+            continue
+        }
+        let n: u32 = e.name
+        if n == tag.M_SELECT {
+            // Der Standard sucht hier nach einer umgebenden Tabelle.
+            var j: usize = i
+            while j > 0 {
+                j = j - 1
+                let a: Gc[Knoten] = (*b).offen[j]
+                if knoten.element_ist(a, tag.M_TEMPLATE) {
+                    break
+                }
+                if knoten.element_ist(a, tag.M_TABLE) {
+                    (*b).modus = EM_IN_SELECT_IN_TABLE
+                    return
+                }
+            }
+            (*b).modus = EM_IN_SELECT
+            return
+        }
+        if (n == tag.M_TD || n == tag.M_TH) && !letzter {
+            (*b).modus = EM_IN_CELL
+            return
+        }
+        if n == tag.M_TR {
+            (*b).modus = EM_IN_ROW
+            return
+        }
+        if n == tag.M_TBODY || n == tag.M_THEAD || n == tag.M_TFOOT {
+            (*b).modus = EM_IN_TABLE_BODY
+            return
+        }
+        if n == tag.M_CAPTION {
+            (*b).modus = EM_IN_CAPTION
+            return
+        }
+        if n == tag.M_COLGROUP {
+            (*b).modus = EM_IN_COLGROUP
+            return
+        }
+        if n == tag.M_TABLE {
+            (*b).modus = EM_IN_TABLE
+            return
+        }
+        if n == tag.M_HEAD && !letzter {
+            (*b).modus = EM_IN_HEAD
+            return
+        }
+        if n == tag.M_BODY {
+            (*b).modus = EM_IN_BODY
+            return
+        }
+        if n == tag.M_FRAMESET {
+            (*b).modus = EM_IN_FRAMESET
+            return
+        }
+        if n == tag.M_HTML {
+            if (*b).kopf == gc_null[Element]() {
+                (*b).modus = EM_VOR_HEAD
+            } else {
+                (*b).modus = EM_NACH_HEAD
+            }
+            return
+        }
+        if letzter {
+            (*b).modus = EM_IN_BODY
+            return
+        }
+    }
+    (*b).modus = EM_IN_BODY
+}
+
+// --------------------------------------------- Rohtext- und RCDATA-Wege
+
+// WHATWG §13.2.6.2: "generic raw text element parsing algorithm" bzw.
+// "generic RCDATA element parsing algorithm". Der einzige Ort, an dem der
+// Baumaufbau den TOKENIZER umstellt — deshalb wird hier die Rueckkopplung
+// vermerkt, die der Treiber danach ausfuehrt.
+fn rohtext_element(b: *mut Baum, zustand: u32) -> AllocError!bool {
+    let e = try element_einfuegen_fuer_token(b, knoten.NS_HTML)
+    if e == gc_null[Element]() {
+        return false
+    }
+    (*b).urmodus = (*b).modus
+    (*b).modus = EM_TEXT
+    (*b).umschaltung = zustand
+    (*b).um_pos = tokenstrom.strom_pos((*b).strom)
+    mem.cp_clear(&(*b).um_tag)
+    namen.namen_nach_cpbuf((*b).namen, (*b).tname, &(*b).um_tag)
+    return true
+}
+
+// ----------------------------------------- Das Adoption-Agency-Verfahren
+
+// WHATWG §13.2.6.4.7, "adoption agency algorithm". Antwort `true` heisst:
+// erledigt. `false` heisst: der Aufrufer soll das Token wie in "any other
+// end tag" behandeln.
+fn adoption_agency(b: *mut Baum, subjekt: u32) -> AllocError!bool {
+    // Schritt 2
+    let akt: Gc[Knoten] = aktueller(b)
+    if knoten.element_ist(akt, subjekt) && aktiv_index(b, akt) < 0 {
+        stapel_pop(b)
+        return true
+    }
+    var runde: u32 = 0
+    while runde < 8 as u32 {
+        runde = runde + 1
+        // Schritt 4.3
+        let fidx: i64 = aktiv_letzter_mit_namen(b, subjekt)
+        if fidx < 0 {
+            return false
+        }
+        let formatierung: Gc[Knoten] = (*b).aktiv[fidx as usize]
+        // Schritt 4.4
+        if !stapel_enthaelt(b, formatierung) {
+            parse_fehler(b)
+            aktiv_entferne_bei(b, fidx as usize)
+            return true
+        }
+        // Schritt 4.5
+        if !knoten_in_scope(b, formatierung, SC_NORMAL) {
+            parse_fehler(b)
+            return true
+        }
+        // Schritt 4.6
+        if formatierung != aktueller(b) {
+            parse_fehler(b)
+        }
+        // Schritt 4.7: der oberste Sonderknoten UNTERHALB von formatierung
+        let sidx: i64 = stapel_index(b, formatierung)
+        var fernster: Gc[Knoten] = gc_null[Knoten]()
+        var fidx_stapel: usize = 0
+        var i: usize = sidx as usize + 1
+        while i < (*b).noffen {
+            let x: Gc[Knoten] = (*b).offen[i]
+            let xe: Gc[Element] = knoten.knoten_als_element(x)
+            if xe != gc_null[Element]() && ist_speziell(xe.name, xe.ns) {
+                fernster = x
+                fidx_stapel = i
+                break
+            }
+            i = i + 1
+        }
+        // Schritt 4.8
+        if fernster == gc_null[Knoten]() {
+            stapel_pop_bis(b, formatierung)
+            aktiv_entferne(b, formatierung)
+            return true
+        }
+        // Schritt 4.9
+        let ahn: Gc[Knoten] = (*b).offen[sidx as usize - 1]
+        // Schritt 4.10: das Lesezeichen steht VOR formatierung
+        var lesezeichen: usize = fidx as usize
+        // Schritt 4.11
+        var knotenX: Gc[Knoten] = fernster
+        var letzterX: Gc[Knoten] = fernster
+        var knoten_idx: usize = fidx_stapel
+        var innen: u32 = 0
+        while true {
+            innen = innen + 1
+            // Schritt 4.13.2
+            if knoten_idx == 0 {
+                break
+            }
+            knoten_idx = knoten_idx - 1
+            knotenX = (*b).offen[knoten_idx]
+            // Schritt 4.13.3
+            if knotenX == formatierung {
+                break
+            }
+            let aidx: i64 = aktiv_index(b, knotenX)
+            // Schritt 4.13.4
+            if innen > 3 as u32 && aidx >= 0 {
+                aktiv_entferne_bei(b, aidx as usize)
+                if lesezeichen > aidx as usize {
+                    lesezeichen = lesezeichen - 1
+                }
+                // knotenX steht jetzt nicht mehr in der Liste
+                stapel_entferne(b, knotenX)
+                continue
+            }
+            // Schritt 4.13.5
+            if aidx < 0 {
+                stapel_entferne(b, knotenX)
+                continue
+            }
+            // Schritt 4.13.6
+            let xe: Gc[Element] = knoten.knoten_als_element(knotenX)
+            if xe == gc_null[Element]() {
+                stapel_entferne(b, knotenX)
+                continue
+            }
+            let neu = try element_klonen(xe)
+            (*b).aktiv[aidx as usize] = neu
+            (*b).offen[knoten_idx] = neu
+            knotenX = neu
+            // Schritt 4.13.7
+            if letzterX == fernster {
+                lesezeichen = aidx as usize + 1
+            }
+            // Schritt 4.13.8
+            knoten.kind_anhaengen(knotenX, letzterX)
+            // Schritt 4.13.9
+            letzterX = knotenX
+        }
+        // Schritt 4.14
+        var eltern: Gc[Knoten] = gc_null[Knoten]()
+        var bezug: Gc[Knoten] = gc_null[Knoten]()
+        passende_stelle(b, ahn, &eltern, &bezug)
+        if eltern != gc_null[Knoten]() {
+            knoten.kind_einfuegen_vor(eltern, letzterX, bezug)
+        }
+        // Schritt 4.15..4.17
+        let fe: Gc[Element] = knoten.knoten_als_element(formatierung)
+        if fe == gc_null[Element]() {
+            return true
+        }
+        let neues = try element_klonen(fe)
+        knoten.kinder_umhaengen(fernster, neues)
+        knoten.kind_anhaengen(fernster, neues)
+        // Schritt 4.18
+        aktiv_entferne(b, formatierung)
+        if lesezeichen > (*b).naktiv {
+            lesezeichen = (*b).naktiv
+        }
+        aktiv_einfuegen_bei(b, lesezeichen, neues)
+        // Schritt 4.19
+        stapel_entferne(b, formatierung)
+        stapel_einfuegen_ueber(b, fernster, neues)
+    }
+    return true
+}
+
+fn aktiv_einfuegen_bei(b: *mut Baum, idx: usize, k: Gc[Knoten]) {
+    if (*b).naktiv >= MAX_AKTIV {
+        (*b).kaputt = 2
+        return
+    }
+    var i: usize = (*b).naktiv
+    while i > idx {
+        (*b).aktiv[i] = (*b).aktiv[i - 1]
+        i = i - 1
+    }
+    (*b).aktiv[idx] = k
+    (*b).naktiv = (*b).naktiv + 1
+}
+
+// Legt `neu` unmittelbar OBERHALB von `bezug` ab (im Standard heisst das
+// "immediately below the position of furthestBlock" — der Stapel dort waechst
+// nach unten, hier nach oben, die Stelle ist dieselbe).
+fn stapel_einfuegen_ueber(b: *mut Baum, bezug: Gc[Knoten], neu: Gc[Knoten]) {
+    let idx: i64 = stapel_index(b, bezug)
+    if idx < 0 {
+        stapel_push(b, neu)
+        return
+    }
+    if (*b).noffen >= MAX_OFFEN {
+        (*b).kaputt = 1
+        return
+    }
+    var i: usize = (*b).noffen
+    while i > idx as usize + 1 {
+        (*b).offen[i] = (*b).offen[i - 1]
+        i = i - 1
+    }
+    (*b).offen[idx as usize + 1] = neu
+    (*b).noffen = (*b).noffen + 1
+}
+
+// ===========================================================================
+//                        DIE EINFUEGEMODI
+// ===========================================================================
+//
+// Jeder Modus beantwortet ein Token mit einer von drei Zahlen:
+//     0  fertig
+//     1  ERNEUT verarbeiten (der Modus wurde gewechselt — "reprocess")
+//    99  Speicher aus (kommt nur aus einem `catch`)
+// Das ist die woertliche Entsprechung des "reprocess the token" im Standard.
+
+const A_FERTIG: u32 = 0
+const A_ERNEUT: u32 = 1
+const A_AUS: u32 = 99
+
+// ------------------------------------------------------------ Hilfsfragen
+
+fn tok_ist_start(b: *mut Baum) -> bool {
+    return tokenstrom.strom_art((*b).strom) == tokens.TB_START
+}
+
+fn tok_ist_ende(b: *mut Baum) -> bool {
+    return tokenstrom.strom_art((*b).strom) == tokens.TB_END
+}
+
+fn tok_self_closing(b: *mut Baum) -> bool {
+    return (tokenstrom.strom_flaggen((*b).strom) & tokens.TB_F_SELF_CLOSING) != 0 as u32
+}
+
+// Fuegt ein leeres Element ein und nimmt es sofort wieder vom Stapel
+// ("Insert an HTML element for the token. Immediately pop …").
+fn leeres_element(b: *mut Baum) -> AllocError!bool {
+    let e = try element_einfuegen_fuer_token(b, knoten.NS_HTML)
+    if e == gc_null[Element]() {
+        return false
+    }
+    stapel_pop(b)
+    return true
+}
+
+// Attribute des Tokens an ein bestehendes Element anfuegen, ohne
+// vorhandene zu ueberschreiben (`<html>` und `<body>` in "in body").
+fn attribute_ergaenzen(b: *mut Baum, e: Gc[Element]) -> AllocError!bool {
+    if e == gc_null[Element]() {
+        return true
+    }
+    let st: *mut tokenstrom.Strom = (*b).strom
+    let n: u32 = tokenstrom.strom_nattr(st)
+    var off: usize = tokenstrom.strom_attr_erstes(st)
+    var k: u32 = 0
+    let puffer: *mut mem.CpBuf = &(*b).hilf
+    while k < n {
+        mem.cp_clear(puffer)
+        let nl: usize = tokenstrom.kette_laenge(st, off)
+        var j: usize = 0
+        while j < nl {
+            mem.cp_push(puffer, tokenstrom.kette_cp(st, off, j))
+            j = j + 1
+        }
+        let aname: u32 = namen.namen_von_cp((*b).namen, puffer)
+        off = tokenstrom.kette_ende(st, off)
+        let wert = try knoten.kette_neu()
+        let wl: usize = tokenstrom.kette_laenge(st, off)
+        j = 0
+        while j < wl {
+            let ok: bool = try knoten.kette_push(wert, tokenstrom.kette_cp(st, off, j))
+            if !ok {
+                return false
+            }
+            j = j + 1
+        }
+        off = tokenstrom.kette_ende(st, off)
+        let gesetzt: bool = try knoten.attr_setzen(e, aname, 0, wert)
+        k = k + 1
+    }
+    return true
+}
+
+// Hat das aktuelle Starttag-Token ein `type`-Attribut mit dem Wert `hidden`
+// (ASCII-fallunempfindlich)? Braucht "in body" fuer `<input>` und
+// "in table" fuer das versteckte Eingabefeld.
+fn tok_type_ist(b: *mut Baum, p: *mut u8, len: usize) -> bool {
+    let st: *mut tokenstrom.Strom = (*b).strom
+    let n: u32 = tokenstrom.strom_nattr(st)
+    var off: usize = tokenstrom.strom_attr_erstes(st)
+    var k: u32 = 0
+    let puffer: *mut mem.CpBuf = &(*b).hilf
+    while k < n {
+        mem.cp_clear(puffer)
+        let nl: usize = tokenstrom.kette_laenge(st, off)
+        var j: usize = 0
+        while j < nl {
+            mem.cp_push(puffer, tokenstrom.kette_cp(st, off, j))
+            j = j + 1
+        }
+        let ist_type: bool = nl == 4 && mem.cp_at(puffer, 0) == 116 as u32 &&
+            mem.cp_at(puffer, 1) == 121 as u32 && mem.cp_at(puffer, 2) == 112 as u32 &&
+            mem.cp_at(puffer, 3) == 101 as u32
+        off = tokenstrom.kette_ende(st, off)
+        if ist_type {
+            let wl: usize = tokenstrom.kette_laenge(st, off)
+            if wl != len {
+                return false
+            }
+            var i: usize = 0
+            while i < wl {
+                var c: u32 = tokenstrom.kette_cp(st, off, i)
+                if c >= 65 as u32 && c <= 90 as u32 {
+                    c = c + 32 as u32
+                }
+                if c != (*((p as u64 + i as u64) as *mut u8)) as u32 {
+                    return false
+                }
+                i = i + 1
+            }
+            return true
+        }
+        off = tokenstrom.kette_ende(st, off)
+        k = k + 1
+    }
+    return false
+}
+
+fn hat_type_attribut(b: *mut Baum) -> bool {
+    let st: *mut tokenstrom.Strom = (*b).strom
+    let n: u32 = tokenstrom.strom_nattr(st)
+    var off: usize = tokenstrom.strom_attr_erstes(st)
+    var k: u32 = 0
+    while k < n {
+        let nl: usize = tokenstrom.kette_laenge(st, off)
+        if nl == 4 && tokenstrom.kette_cp(st, off, 0) == 116 as u32 &&
+            tokenstrom.kette_cp(st, off, 1) == 121 as u32 &&
+            tokenstrom.kette_cp(st, off, 2) == 112 as u32 &&
+            tokenstrom.kette_cp(st, off, 3) == 101 as u32 {
+            return true
+        }
+        off = tokenstrom.kette_ende(st, off)
+        off = tokenstrom.kette_ende(st, off)
+        k = k + 1
+    }
+    return false
+}
+
+// -------------------------------------------------------- Zeichen: Modi
+
+fn zeichen_in_body(b: *mut Baum, cp: u32) -> AllocError!u32 {
+    if cp == 0 as u32 {
+        parse_fehler(b)
+        return A_FERTIG
+    }
+    let ok0: bool = try aktiv_wiederherstellen(b)
+    let ok: bool = try zeichen_einfuegen(b, cp)
+    if !ok {
+        return A_AUS
+    }
+    if !ist_leerraum(cp) {
+        (*b).frameset_ok = false
+    }
+    return A_FERTIG
+}
+
+fn zeichen_modus(b: *mut Baum, cp: u32) -> AllocError!u32 {
+    let m: u32 = (*b).modus
+    if m == EM_INITIAL {
+        if ist_leerraum(cp) {
+            return A_FERTIG
+        }
+        parse_fehler(b)
+        knoten.dok_modus_setzen((*b).dok, knoten.MODUS_QUIRKS)
+        (*b).modus = EM_VOR_HTML
+        return A_ERNEUT
+    }
+    if m == EM_VOR_HTML {
+        if ist_leerraum(cp) {
+            return A_FERTIG
+        }
+        let e = try knoten.element_neu(tag.M_HTML, knoten.NS_HTML)
+        knoten.kind_anhaengen((*b).dok, e)
+        stapel_push(b, e)
+        (*b).modus = EM_VOR_HEAD
+        return A_ERNEUT
+    }
+    if m == EM_VOR_HEAD {
+        if ist_leerraum(cp) {
+            return A_FERTIG
+        }
+        let e = try element_einfuegen_name(b, tag.M_HEAD)
+        (*b).kopf = e
+        (*b).modus = EM_IN_HEAD
+        return A_ERNEUT
+    }
+    if m == EM_IN_HEAD {
+        if ist_leerraum(cp) {
+            let ok: bool = try zeichen_einfuegen(b, cp)
+            return A_FERTIG
+        }
+        stapel_pop(b)
+        (*b).modus = EM_NACH_HEAD
+        return A_ERNEUT
+    }
+    if m == EM_IN_HEAD_NOSCRIPT {
+        if ist_leerraum(cp) {
+            let ok: bool = try zeichen_einfuegen(b, cp)
+            return A_FERTIG
+        }
+        parse_fehler(b)
+        stapel_pop(b)
+        (*b).modus = EM_IN_HEAD
+        return A_ERNEUT
+    }
+    if m == EM_NACH_HEAD {
+        if ist_leerraum(cp) {
+            let ok: bool = try zeichen_einfuegen(b, cp)
+            return A_FERTIG
+        }
+        let e = try element_einfuegen_name(b, tag.M_BODY)
+        (*b).modus = EM_IN_BODY
+        return A_ERNEUT
+    }
+    if m == EM_IN_BODY || m == EM_IN_CAPTION || m == EM_IN_CELL {
+        return try zeichen_in_body(b, cp)
+    }
+    if m == EM_TEXT {
+        let ok: bool = try zeichen_einfuegen(b, cp)
+        if !ok {
+            return A_AUS
+        }
+        return A_FERTIG
+    }
+    if m == EM_IN_TABLE || m == EM_IN_TABLE_BODY || m == EM_IN_ROW {
+        let k: Gc[Knoten] = aktueller(b)
+        if knoten.element_ist(k, tag.M_TABLE) || knoten.element_ist(k, tag.M_TBODY) ||
+            knoten.element_ist(k, tag.M_TFOOT) || knoten.element_ist(k, tag.M_THEAD) ||
+            knoten.element_ist(k, tag.M_TR) {
+            (*b).tt = try knoten.kette_neu()
+            (*b).tt_nur_space = true
+            (*b).urmodus = m
+            (*b).modus = EM_IN_TABLE_TEXT
+            return A_ERNEUT
+        }
+        parse_fehler(b)
+        (*b).foster = true
+        let r: u32 = try zeichen_in_body(b, cp)
+        (*b).foster = false
+        return r
+    }
+    if m == EM_IN_TABLE_TEXT {
+        if cp == 0 as u32 {
+            parse_fehler(b)
+            return A_FERTIG
+        }
+        if !ist_leerraum(cp) {
+            (*b).tt_nur_space = false
+        }
+        let ok: bool = try knoten.kette_push((*b).tt, cp)
+        if !ok {
+            return A_AUS
+        }
+        return A_FERTIG
+    }
+    if m == EM_IN_COLGROUP {
+        if ist_leerraum(cp) {
+            let ok: bool = try zeichen_einfuegen(b, cp)
+            return A_FERTIG
+        }
+        if !knoten.element_ist(aktueller(b), tag.M_COLGROUP) {
+            parse_fehler(b)
+            return A_FERTIG
+        }
+        stapel_pop(b)
+        (*b).modus = EM_IN_TABLE
+        return A_ERNEUT
+    }
+    if m == EM_IN_SELECT || m == EM_IN_SELECT_IN_TABLE {
+        if cp == 0 as u32 {
+            parse_fehler(b)
+            return A_FERTIG
+        }
+        let ok: bool = try zeichen_einfuegen(b, cp)
+        return A_FERTIG
+    }
+    if m == EM_NACH_BODY || m == EM_NACH_NACH_BODY {
+        if ist_leerraum(cp) {
+            return try zeichen_in_body(b, cp)
+        }
+        parse_fehler(b)
+        (*b).modus = EM_IN_BODY
+        return A_ERNEUT
+    }
+    if m == EM_IN_FRAMESET || m == EM_NACH_FRAMESET || m == EM_NACH_NACH_FRAMESET {
+        if ist_leerraum(cp) {
+            let ok: bool = try zeichen_einfuegen(b, cp)
+            return A_FERTIG
+        }
+        parse_fehler(b)
+        return A_FERTIG
+    }
+    return A_FERTIG
+}
+
+// Schuettet die im Modus "in table text" gesammelten Zeichen aus.
+fn tt_ausschuetten(b: *mut Baum) -> AllocError!bool {
+    let k: Gc[Kette] = (*b).tt
+    (*b).tt = gc_null[Kette]()
+    if k == gc_null[Kette]() {
+        (*b).modus = (*b).urmodus
+        return true
+    }
+    let n: u64 = knoten.kette_len(k)
+    if (*b).tt_nur_space {
+        var i: u64 = 0
+        while i < n {
+            let ok: bool = try zeichen_einfuegen(b, knoten.kette_bei(k, i))
+            if !ok {
+                return false
+            }
+            i = i + 1
+        }
+        (*b).modus = (*b).urmodus
+        return true
+    }
+    parse_fehler(b)
+    (*b).foster = true
+    var i: u64 = 0
+    while i < n {
+        let r: u32 = try zeichen_in_body(b, knoten.kette_bei(k, i))
+        i = i + 1
+    }
+    (*b).foster = false
+    (*b).modus = (*b).urmodus
+    return true
+}
+
+// ------------------------------------------------- "initial" / "before html"
+
+// Quirks-Erkennung aus dem DOCTYPE (WHATWG §13.2.6.4.1).
+// EHRLICHE GRENZE: die vollstaendige Liste der oeffentlichen Kennungen des
+// Standards (rund 55 Praefixe aus der Zeit vor HTML5) ist NICHT eingebaut.
+// Umgesetzt sind: die "force quirks"-Flagge des Tokenizers, ein Name != html,
+// ein vorhandenes System-Literal in Verbindung mit HTML 4.01, sowie die vier
+// Praefixe, die heute noch vorkommen. Alles andere gilt als "no quirks".
+fn doctype_modus(b: *mut Baum, name: Gc[Kette], pubid: Gc[Kette], sysid: Gc[Kette],
+                 force: bool, hat_pubid: bool, hat_sysid: bool) -> u32 {
+    var lit_html: [u8; 4] = "html"
+    if force || !knoten.kette_gleich_ascii(name, &lit_html[0], 4) {
+        return knoten.MODUS_QUIRKS
+    }
+    var p_x_frame: [u8; 32] = "-//W3C//DTD XHTML 1.0 Frameset//"
+    var p_x_trans: [u8; 36] = "-//W3C//DTD XHTML 1.0 Transitional//"
+    var p_h_frame: [u8; 32] = "-//W3C//DTD HTML 4.01 Frameset//"
+    var p_h_trans: [u8; 36] = "-//W3C//DTD HTML 4.01 Transitional//"
+    if hat_pubid {
+        if knoten.kette_beginnt_ascii_klein(pubid, &p_h_frame[0], 32) ||
+            knoten.kette_beginnt_ascii_klein(pubid, &p_h_trans[0], 36) {
+            if hat_sysid {
+                return knoten.MODUS_BEGRENZT
+            }
+            return knoten.MODUS_QUIRKS
+        }
+        if knoten.kette_beginnt_ascii_klein(pubid, &p_x_frame[0], 32) ||
+            knoten.kette_beginnt_ascii_klein(pubid, &p_x_trans[0], 36) {
+            return knoten.MODUS_BEGRENZT
+        }
+    }
+    return knoten.MODUS_KEIN_QUIRKS
+}
+
+fn kette_aus_strom(b: *mut Baum, off: usize) -> AllocError!Gc[Kette] {
+    let st: *mut tokenstrom.Strom = (*b).strom
+    let k = try knoten.kette_neu()
+    let n: usize = tokenstrom.kette_laenge(st, off)
+    var i: usize = 0
+    while i < n {
+        let ok: bool = try knoten.kette_push(k, tokenstrom.kette_cp(st, off, i))
+        i = i + 1
+    }
+    return k
+}
+
+fn m_initial(b: *mut Baum) -> AllocError!u32 {
+    let art: u32 = tokenstrom.strom_art((*b).strom)
+    if art == tokens.TB_COMMENT {
+        let ok: bool = try kommentar_einfuegen(b, (*b).dok)
+        return A_FERTIG
+    }
+    if art == tokens.TB_DOCTYPE {
+        let st: *mut tokenstrom.Strom = (*b).strom
+        let f: u32 = tokenstrom.strom_flaggen(st)
+        let name = try kette_aus_strom(b, tokenstrom.strom_name(st))
+        let pubid = try kette_aus_strom(b, tokenstrom.strom_doctype_pubid(st))
+        let sysid = try kette_aus_strom(b, tokenstrom.strom_doctype_sysid(st))
+        let hat_pubid: bool = (f & tokens.TB_F_HAT_PUBID) != 0 as u32
+        let hat_sysid: bool = (f & tokens.TB_F_HAT_SYSID) != 0 as u32
+        let force: bool = (f & tokens.TB_F_FORCE_QUIRKS) != 0 as u32
+        let d = try knoten.doctype_neu(name, pubid, sysid, hat_pubid, hat_sysid)
+        knoten.kind_anhaengen((*b).dok, d)
+        knoten.dok_modus_setzen((*b).dok,
+            doctype_modus(b, name, pubid, sysid, force, hat_pubid, hat_sysid))
+        (*b).modus = EM_VOR_HTML
+        return A_FERTIG
+    }
+    parse_fehler(b)
+    knoten.dok_modus_setzen((*b).dok, knoten.MODUS_QUIRKS)
+    (*b).modus = EM_VOR_HTML
+    return A_ERNEUT
+}
+
+fn m_vor_html(b: *mut Baum) -> AllocError!u32 {
+    let art: u32 = tokenstrom.strom_art((*b).strom)
+    if art == tokens.TB_DOCTYPE {
+        parse_fehler(b)
+        return A_FERTIG
+    }
+    if art == tokens.TB_COMMENT {
+        let ok: bool = try kommentar_einfuegen(b, (*b).dok)
+        return A_FERTIG
+    }
+    if art == tokens.TB_START && (*b).tname == tag.M_HTML {
+        let e = try element_fuer_token(b, knoten.NS_HTML)
+        knoten.kind_anhaengen((*b).dok, e)
+        stapel_push(b, e)
+        (*b).modus = EM_VOR_HEAD
+        return A_FERTIG
+    }
+    if art == tokens.TB_END {
+        let n: u32 = (*b).tname
+        if !(n == tag.M_HEAD || n == tag.M_BODY || n == tag.M_HTML || n == tag.M_BR) {
+            parse_fehler(b)
+            return A_FERTIG
+        }
+    }
+    let e = try knoten.element_neu(tag.M_HTML, knoten.NS_HTML)
+    knoten.kind_anhaengen((*b).dok, e)
+    stapel_push(b, e)
+    (*b).modus = EM_VOR_HEAD
+    return A_ERNEUT
+}
+
+fn m_vor_head(b: *mut Baum) -> AllocError!u32 {
+    let art: u32 = tokenstrom.strom_art((*b).strom)
+    if art == tokens.TB_COMMENT {
+        let ok: bool = try kommentar_einfuegen(b, gc_null[Knoten]())
+        return A_FERTIG
+    }
+    if art == tokens.TB_DOCTYPE {
+        parse_fehler(b)
+        return A_FERTIG
+    }
+    if art == tokens.TB_START && (*b).tname == tag.M_HTML {
+        return try m_in_body(b)
+    }
+    if art == tokens.TB_START && (*b).tname == tag.M_HEAD {
+        let e = try element_einfuegen_fuer_token(b, knoten.NS_HTML)
+        (*b).kopf = e
+        (*b).modus = EM_IN_HEAD
+        return A_FERTIG
+    }
+    if art == tokens.TB_END {
+        let n: u32 = (*b).tname
+        if !(n == tag.M_HEAD || n == tag.M_BODY || n == tag.M_HTML || n == tag.M_BR) {
+            parse_fehler(b)
+            return A_FERTIG
+        }
+    }
+    let e = try element_einfuegen_name(b, tag.M_HEAD)
+    (*b).kopf = e
+    (*b).modus = EM_IN_HEAD
+    return A_ERNEUT
+}
+
+// ------------------------------------------------------------- "in head"
+
+fn m_in_head(b: *mut Baum) -> AllocError!u32 {
+    let art: u32 = tokenstrom.strom_art((*b).strom)
+    if art == tokens.TB_COMMENT {
+        let ok: bool = try kommentar_einfuegen(b, gc_null[Knoten]())
+        return A_FERTIG
+    }
+    if art == tokens.TB_DOCTYPE {
+        parse_fehler(b)
+        return A_FERTIG
+    }
+    let n: u32 = (*b).tname
+    if art == tokens.TB_START {
+        if n == tag.M_HTML {
+            return try m_in_body(b)
+        }
+        if n == tag.M_BASE || n == tag.M_BASEFONT || n == tag.M_BGSOUND ||
+            n == tag.M_LINK || n == tag.M_META {
+            let ok: bool = try leeres_element(b)
+            return A_FERTIG
+        }
+        if n == tag.M_TITLE {
+            let ok: bool = try rohtext_element(b, ZST_RCDATA)
+            return A_FERTIG
+        }
+        if n == tag.M_NOFRAMES || n == tag.M_STYLE {
+            let ok: bool = try rohtext_element(b, ZST_RAWTEXT)
+            return A_FERTIG
+        }
+        if n == tag.M_NOSCRIPT {
+            // Die Skriptflagge ist AUS (kein Skriptbetrieb, siehe Kopf).
+            let e = try element_einfuegen_fuer_token(b, knoten.NS_HTML)
+            (*b).modus = EM_IN_HEAD_NOSCRIPT
+            return A_FERTIG
+        }
+        if n == tag.M_SCRIPT {
+            let ok: bool = try rohtext_element(b, ZST_SCRIPT)
+            return A_FERTIG
+        }
+        if n == tag.M_HEAD {
+            parse_fehler(b)
+            return A_FERTIG
+        }
+    }
+    if art == tokens.TB_END {
+        if n == tag.M_HEAD {
+            stapel_pop(b)
+            (*b).modus = EM_NACH_HEAD
+            return A_FERTIG
+        }
+        if !(n == tag.M_BODY || n == tag.M_HTML || n == tag.M_BR) {
+            parse_fehler(b)
+            return A_FERTIG
+        }
+    }
+    stapel_pop(b)
+    (*b).modus = EM_NACH_HEAD
+    return A_ERNEUT
+}
+
+fn m_in_head_noscript(b: *mut Baum) -> AllocError!u32 {
+    let art: u32 = tokenstrom.strom_art((*b).strom)
+    let n: u32 = (*b).tname
+    if art == tokens.TB_DOCTYPE {
+        parse_fehler(b)
+        return A_FERTIG
+    }
+    if art == tokens.TB_START && n == tag.M_HTML {
+        return try m_in_body(b)
+    }
+    if art == tokens.TB_END && n == tag.M_NOSCRIPT {
+        stapel_pop(b)
+        (*b).modus = EM_IN_HEAD
+        return A_FERTIG
+    }
+    if art == tokens.TB_COMMENT {
+        return try m_in_head(b)
+    }
+    if art == tokens.TB_START {
+        if n == tag.M_BASEFONT || n == tag.M_BGSOUND || n == tag.M_LINK ||
+            n == tag.M_META || n == tag.M_NOFRAMES || n == tag.M_STYLE {
+            return try m_in_head(b)
+        }
+        if n == tag.M_HEAD || n == tag.M_NOSCRIPT {
+            parse_fehler(b)
+            return A_FERTIG
+        }
+    }
+    if art == tokens.TB_END && n != tag.M_BR {
+        parse_fehler(b)
+        return A_FERTIG
+    }
+    parse_fehler(b)
+    stapel_pop(b)
+    (*b).modus = EM_IN_HEAD
+    return A_ERNEUT
+}
+
+fn m_nach_head(b: *mut Baum) -> AllocError!u32 {
+    let art: u32 = tokenstrom.strom_art((*b).strom)
+    let n: u32 = (*b).tname
+    if art == tokens.TB_COMMENT {
+        let ok: bool = try kommentar_einfuegen(b, gc_null[Knoten]())
+        return A_FERTIG
+    }
+    if art == tokens.TB_DOCTYPE {
+        parse_fehler(b)
+        return A_FERTIG
+    }
+    if art == tokens.TB_START {
+        if n == tag.M_HTML {
+            return try m_in_body(b)
+        }
+        if n == tag.M_BODY {
+            let e = try element_einfuegen_fuer_token(b, knoten.NS_HTML)
+            (*b).frameset_ok = false
+            (*b).modus = EM_IN_BODY
+            return A_FERTIG
+        }
+        if n == tag.M_FRAMESET {
+            let e = try element_einfuegen_fuer_token(b, knoten.NS_HTML)
+            (*b).modus = EM_IN_FRAMESET
+            return A_FERTIG
+        }
+        if n == tag.M_BASE || n == tag.M_BASEFONT || n == tag.M_BGSOUND ||
+            n == tag.M_LINK || n == tag.M_META || n == tag.M_NOFRAMES ||
+            n == tag.M_SCRIPT || n == tag.M_STYLE || n == tag.M_TEMPLATE ||
+            n == tag.M_TITLE {
+            parse_fehler(b)
+            // Der `head` kommt fuer die Dauer der Verarbeitung zurueck auf
+            // den Stapel — genau so steht es im Standard.
+            stapel_push(b, (*b).kopf)
+            let r: u32 = try m_in_head(b)
+            stapel_entferne(b, (*b).kopf)
+            return r
+        }
+        if n == tag.M_HEAD {
+            parse_fehler(b)
+            return A_FERTIG
+        }
+    }
+    if art == tokens.TB_END && !(n == tag.M_BODY || n == tag.M_HTML || n == tag.M_BR) {
+        parse_fehler(b)
+        return A_FERTIG
+    }
+    let e = try element_einfuegen_name(b, tag.M_BODY)
+    (*b).modus = EM_IN_BODY
+    return A_ERNEUT
+}
+
+// ------------------------------------------------------------- "in body"
+
+// "any other end tag" aus "in body" — die Schleife, die einen Endtag durch
+// den Stapel sucht und dabei an Sonderelementen abbricht.
+fn ende_allgemein(b: *mut Baum) -> AllocError!u32 {
+    let name: u32 = (*b).tname
+    var i: usize = (*b).noffen
+    while i > 0 {
+        i = i - 1
+        let k: Gc[Knoten] = (*b).offen[i]
+        if knoten.element_ist(k, name) {
+            implizit_schliessen(b, name)
+            if k != aktueller(b) {
+                parse_fehler(b)
+            }
+            stapel_pop_bis(b, k)
+            return A_FERTIG
+        }
+        let e: Gc[Element] = knoten.knoten_als_element(k)
+        if e != gc_null[Element]() && ist_speziell(e.name, e.ns) {
+            parse_fehler(b)
+            return A_FERTIG
+        }
+    }
+    return A_FERTIG
+}
+
+fn in_body_start(b: *mut Baum) -> AllocError!u32 {
+    let n: u32 = (*b).tname
+    if n == tag.M_HTML {
+        parse_fehler(b)
+        if (*b).noffen > 0 {
+            let ok: bool = try attribute_ergaenzen(b, knoten.knoten_als_element((*b).offen[0]))
+        }
+        return A_FERTIG
+    }
+    if n == tag.M_BASE || n == tag.M_BASEFONT || n == tag.M_BGSOUND ||
+        n == tag.M_LINK || n == tag.M_META || n == tag.M_NOFRAMES ||
+        n == tag.M_SCRIPT || n == tag.M_STYLE || n == tag.M_TEMPLATE ||
+        n == tag.M_TITLE {
+        return try m_in_head(b)
+    }
+    if n == tag.M_BODY {
+        parse_fehler(b)
+        if (*b).noffen < 2 || !knoten.element_ist((*b).offen[1], tag.M_BODY) {
+            return A_FERTIG
+        }
+        (*b).frameset_ok = false
+        let ok: bool = try attribute_ergaenzen(b, knoten.knoten_als_element((*b).offen[1]))
+        return A_FERTIG
+    }
+    if n == tag.M_FRAMESET {
+        parse_fehler(b)
+        if (*b).noffen < 2 || !knoten.element_ist((*b).offen[1], tag.M_BODY) {
+            return A_FERTIG
+        }
+        if !(*b).frameset_ok {
+            return A_FERTIG
+        }
+        knoten.kind_entfernen((*b).offen[1])
+        while (*b).noffen > 1 {
+            stapel_pop(b)
+        }
+        let e = try element_einfuegen_fuer_token(b, knoten.NS_HTML)
+        (*b).modus = EM_IN_FRAMESET
+        return A_FERTIG
+    }
+    if ist_blockgruppe(n) {
+        if in_scope(b, tag.M_P, SC_BUTTON) {
+            p_schliessen(b)
+        }
+        let e = try element_einfuegen_fuer_token(b, knoten.NS_HTML)
+        return A_FERTIG
+    }
+    if ist_ueberschrift(n) {
+        if in_scope(b, tag.M_P, SC_BUTTON) {
+            p_schliessen(b)
+        }
+        let k: Gc[Knoten] = aktueller(b)
+        let ke: Gc[Element] = knoten.knoten_als_element(k)
+        if ke != gc_null[Element]() && ke.ns == knoten.NS_HTML && ist_ueberschrift(ke.name) {
+            parse_fehler(b)
+            stapel_pop(b)
+        }
+        let e = try element_einfuegen_fuer_token(b, knoten.NS_HTML)
+        return A_FERTIG
+    }
+    if n == tag.M_PRE || n == tag.M_LISTING {
+        if in_scope(b, tag.M_P, SC_BUTTON) {
+            p_schliessen(b)
+        }
+        let e = try element_einfuegen_fuer_token(b, knoten.NS_HTML)
+        (*b).nl_ueberspringen = true
+        (*b).frameset_ok = false
+        return A_FERTIG
+    }
+    if n == tag.M_FORM {
+        if (*b).form != gc_null[Element]() {
+            parse_fehler(b)
+            return A_FERTIG
+        }
+        if in_scope(b, tag.M_P, SC_BUTTON) {
+            p_schliessen(b)
+        }
+        let e = try element_einfuegen_fuer_token(b, knoten.NS_HTML)
+        (*b).form = e
+        return A_FERTIG
+    }
+    if n == tag.M_LI {
+        (*b).frameset_ok = false
+        var i: usize = (*b).noffen
+        while i > 0 {
+            i = i - 1
+            let k: Gc[Knoten] = (*b).offen[i]
+            if knoten.element_ist(k, tag.M_LI) {
+                implizit_schliessen(b, tag.M_LI)
+                if !knoten.element_ist(aktueller(b), tag.M_LI) {
+                    parse_fehler(b)
+                }
+                stapel_pop_bis_name(b, tag.M_LI)
+                break
+            }
+            let e2: Gc[Element] = knoten.knoten_als_element(k)
+            if e2 != gc_null[Element]() && ist_speziell(e2.name, e2.ns) &&
+                !(e2.name == tag.M_ADDRESS || e2.name == tag.M_DIV || e2.name == tag.M_P) {
+                break
+            }
+        }
+        if in_scope(b, tag.M_P, SC_BUTTON) {
+            p_schliessen(b)
+        }
+        let e = try element_einfuegen_fuer_token(b, knoten.NS_HTML)
+        return A_FERTIG
+    }
+    if n == tag.M_DD || n == tag.M_DT {
+        (*b).frameset_ok = false
+        var i: usize = (*b).noffen
+        while i > 0 {
+            i = i - 1
+            let k: Gc[Knoten] = (*b).offen[i]
+            if knoten.element_ist(k, tag.M_DD) {
+                implizit_schliessen(b, tag.M_DD)
+                if !knoten.element_ist(aktueller(b), tag.M_DD) {
+                    parse_fehler(b)
+                }
+                stapel_pop_bis_name(b, tag.M_DD)
+                break
+            }
+            if knoten.element_ist(k, tag.M_DT) {
+                implizit_schliessen(b, tag.M_DT)
+                if !knoten.element_ist(aktueller(b), tag.M_DT) {
+                    parse_fehler(b)
+                }
+                stapel_pop_bis_name(b, tag.M_DT)
+                break
+            }
+            let e2: Gc[Element] = knoten.knoten_als_element(k)
+            if e2 != gc_null[Element]() && ist_speziell(e2.name, e2.ns) &&
+                !(e2.name == tag.M_ADDRESS || e2.name == tag.M_DIV || e2.name == tag.M_P) {
+                break
+            }
+        }
+        if in_scope(b, tag.M_P, SC_BUTTON) {
+            p_schliessen(b)
+        }
+        let e = try element_einfuegen_fuer_token(b, knoten.NS_HTML)
+        return A_FERTIG
+    }
+    if n == tag.M_PLAINTEXT {
+        if in_scope(b, tag.M_P, SC_BUTTON) {
+            p_schliessen(b)
+        }
+        let e = try element_einfuegen_fuer_token(b, knoten.NS_HTML)
+        (*b).umschaltung = ZST_PLAINTEXT
+        (*b).um_pos = tokenstrom.strom_pos((*b).strom)
+        mem.cp_clear(&(*b).um_tag)
+        return A_FERTIG
+    }
+    if n == tag.M_BUTTON {
+        if in_scope(b, tag.M_BUTTON, SC_NORMAL) {
+            parse_fehler(b)
+            implizit_schliessen(b, 0)
+            stapel_pop_bis_name(b, tag.M_BUTTON)
+        }
+        let ok: bool = try aktiv_wiederherstellen(b)
+        let e = try element_einfuegen_fuer_token(b, knoten.NS_HTML)
+        (*b).frameset_ok = false
+        return A_FERTIG
+    }
+    if n == tag.M_A {
+        let idx: i64 = aktiv_letzter_mit_namen(b, tag.M_A)
+        if idx >= 0 {
+            parse_fehler(b)
+            let alt: Gc[Knoten] = (*b).aktiv[idx as usize]
+            let r: bool = try adoption_agency(b, tag.M_A)
+            aktiv_entferne(b, alt)
+            stapel_entferne(b, alt)
+        }
+        let ok: bool = try aktiv_wiederherstellen(b)
+        let e = try element_einfuegen_fuer_token(b, knoten.NS_HTML)
+        aktiv_push(b, e)
+        return A_FERTIG
+    }
+    if ist_formatierung(n) && n != tag.M_NOBR {
+        let ok: bool = try aktiv_wiederherstellen(b)
+        let e = try element_einfuegen_fuer_token(b, knoten.NS_HTML)
+        aktiv_push(b, e)
+        return A_FERTIG
+    }
+    if n == tag.M_NOBR {
+        let ok: bool = try aktiv_wiederherstellen(b)
+        if in_scope(b, tag.M_NOBR, SC_NORMAL) {
+            parse_fehler(b)
+            let r: bool = try adoption_agency(b, tag.M_NOBR)
+            let ok2: bool = try aktiv_wiederherstellen(b)
+        }
+        let e = try element_einfuegen_fuer_token(b, knoten.NS_HTML)
+        aktiv_push(b, e)
+        return A_FERTIG
+    }
+    if n == tag.M_APPLET || n == tag.M_MARQUEE || n == tag.M_OBJECT {
+        let ok: bool = try aktiv_wiederherstellen(b)
+        let e = try element_einfuegen_fuer_token(b, knoten.NS_HTML)
+        aktiv_push_marke(b)
+        (*b).frameset_ok = false
+        return A_FERTIG
+    }
+    if n == tag.M_TABLE {
+        if knoten.dok_modus((*b).dok) != knoten.MODUS_QUIRKS &&
+            in_scope(b, tag.M_P, SC_BUTTON) {
+            p_schliessen(b)
+        }
+        let e = try element_einfuegen_fuer_token(b, knoten.NS_HTML)
+        (*b).frameset_ok = false
+        (*b).modus = EM_IN_TABLE
+        return A_FERTIG
+    }
+    if n == tag.M_AREA || n == tag.M_BR || n == tag.M_EMBED || n == tag.M_IMG ||
+        n == tag.M_KEYGEN || n == tag.M_WBR {
+        let ok: bool = try aktiv_wiederherstellen(b)
+        let ok2: bool = try leeres_element(b)
+        (*b).frameset_ok = false
+        return A_FERTIG
+    }
+    if n == tag.M_INPUT {
+        let ok: bool = try aktiv_wiederherstellen(b)
+        var lit_hidden: [u8; 6] = "hidden"
+        let versteckt: bool = tok_type_ist(b, &lit_hidden[0], 6)
+        let ok2: bool = try leeres_element(b)
+        if !versteckt {
+            (*b).frameset_ok = false
+        }
+        return A_FERTIG
+    }
+    if n == tag.M_PARAM || n == tag.M_SOURCE || n == tag.M_TRACK {
+        let ok: bool = try leeres_element(b)
+        return A_FERTIG
+    }
+    if n == tag.M_HR {
+        if in_scope(b, tag.M_P, SC_BUTTON) {
+            p_schliessen(b)
+        }
+        let ok: bool = try leeres_element(b)
+        (*b).frameset_ok = false
+        return A_FERTIG
+    }
+    if n == tag.M_IMAGE {
+        // Der Standard sagt woertlich: "Don't ask."
+        parse_fehler(b)
+        (*b).tname = tag.M_IMG
+        return A_ERNEUT
+    }
+    if n == tag.M_TEXTAREA {
+        let e = try element_einfuegen_fuer_token(b, knoten.NS_HTML)
+        (*b).nl_ueberspringen = true
+        (*b).frameset_ok = false
+        (*b).urmodus = (*b).modus
+        (*b).modus = EM_TEXT
+        (*b).umschaltung = ZST_RCDATA
+        (*b).um_pos = tokenstrom.strom_pos((*b).strom)
+        mem.cp_clear(&(*b).um_tag)
+        namen.namen_nach_cpbuf((*b).namen, tag.M_TEXTAREA, &(*b).um_tag)
+        return A_FERTIG
+    }
+    if n == tag.M_XMP {
+        if in_scope(b, tag.M_P, SC_BUTTON) {
+            p_schliessen(b)
+        }
+        let ok: bool = try aktiv_wiederherstellen(b)
+        (*b).frameset_ok = false
+        let ok2: bool = try rohtext_element(b, ZST_RAWTEXT)
+        return A_FERTIG
+    }
+    if n == tag.M_IFRAME {
+        (*b).frameset_ok = false
+        let ok: bool = try rohtext_element(b, ZST_RAWTEXT)
+        return A_FERTIG
+    }
+    if n == tag.M_NOEMBED {
+        let ok: bool = try rohtext_element(b, ZST_RAWTEXT)
+        return A_FERTIG
+    }
+    if n == tag.M_SELECT {
+        let ok: bool = try aktiv_wiederherstellen(b)
+        let e = try element_einfuegen_fuer_token(b, knoten.NS_HTML)
+        (*b).frameset_ok = false
+        let m: u32 = (*b).modus
+        if m == EM_IN_TABLE || m == EM_IN_CAPTION || m == EM_IN_TABLE_BODY ||
+            m == EM_IN_ROW || m == EM_IN_CELL {
+            (*b).modus = EM_IN_SELECT_IN_TABLE
+        } else {
+            (*b).modus = EM_IN_SELECT
+        }
+        return A_FERTIG
+    }
+    if n == tag.M_OPTGROUP || n == tag.M_OPTION {
+        if knoten.element_ist(aktueller(b), tag.M_OPTION) {
+            stapel_pop(b)
+        }
+        let ok: bool = try aktiv_wiederherstellen(b)
+        let e = try element_einfuegen_fuer_token(b, knoten.NS_HTML)
+        return A_FERTIG
+    }
+    if n == tag.M_RB || n == tag.M_RTC {
+        if in_scope(b, tag.M_RUBY, SC_NORMAL) {
+            implizit_schliessen(b, 0)
+        }
+        let e = try element_einfuegen_fuer_token(b, knoten.NS_HTML)
+        return A_FERTIG
+    }
+    if n == tag.M_RP || n == tag.M_RT {
+        implizit_schliessen(b, tag.M_RTC)
+        let e = try element_einfuegen_fuer_token(b, knoten.NS_HTML)
+        return A_FERTIG
+    }
+    if n == tag.M_MATH || n == tag.M_SVG {
+        // Runde 54: NUR der Namensraum, nicht der Regelsatz fuer Fremdinhalt
+        // (siehe Kopf dieser Datei).
+        let ok: bool = try aktiv_wiederherstellen(b)
+        var ns: u32 = knoten.NS_MATHML
+        if n == tag.M_SVG {
+            ns = knoten.NS_SVG
+        }
+        let e = try element_einfuegen_fuer_token(b, ns)
+        if tok_self_closing(b) {
+            stapel_pop(b)
+        }
+        return A_FERTIG
+    }
+    if n == tag.M_CAPTION || n == tag.M_COL || n == tag.M_COLGROUP ||
+        n == tag.M_FRAME || n == tag.M_HEAD || n == tag.M_TBODY ||
+        n == tag.M_TD || n == tag.M_TFOOT || n == tag.M_TH ||
+        n == tag.M_THEAD || n == tag.M_TR {
+        parse_fehler(b)
+        return A_FERTIG
+    }
+    let ok: bool = try aktiv_wiederherstellen(b)
+    let e = try element_einfuegen_fuer_token(b, knoten.NS_HTML)
+    return A_FERTIG
+}
+
+fn in_body_ende(b: *mut Baum) -> AllocError!u32 {
+    let n: u32 = (*b).tname
+    if n == tag.M_BODY || n == tag.M_HTML {
+        if !in_scope(b, tag.M_BODY, SC_NORMAL) {
+            parse_fehler(b)
+            return A_FERTIG
+        }
+        (*b).modus = EM_NACH_BODY
+        if n == tag.M_HTML {
+            return A_ERNEUT
+        }
+        return A_FERTIG
+    }
+    if ende_blockgruppe(n) {
+        if !in_scope(b, n, SC_NORMAL) {
+            parse_fehler(b)
+            return A_FERTIG
+        }
+        implizit_schliessen(b, 0)
+        if !knoten.element_ist(aktueller(b), n) {
+            parse_fehler(b)
+        }
+        stapel_pop_bis_name(b, n)
+        return A_FERTIG
+    }
+    if n == tag.M_FORM {
+        let f: Gc[Element] = (*b).form
+        (*b).form = gc_null[Element]()
+        if f == gc_null[Element]() || !knoten_in_scope(b, f, SC_NORMAL) {
+            parse_fehler(b)
+            return A_FERTIG
+        }
+        implizit_schliessen(b, 0)
+        if aktueller(b) != f {
+            parse_fehler(b)
+        }
+        stapel_entferne(b, f)
+        return A_FERTIG
+    }
+    if n == tag.M_P {
+        if !in_scope(b, tag.M_P, SC_BUTTON) {
+            parse_fehler(b)
+            let e = try element_einfuegen_name(b, tag.M_P)
+        }
+        p_schliessen(b)
+        return A_FERTIG
+    }
+    if n == tag.M_LI {
+        if !in_scope(b, tag.M_LI, SC_LISTE) {
+            parse_fehler(b)
+            return A_FERTIG
+        }
+        implizit_schliessen(b, tag.M_LI)
+        if !knoten.element_ist(aktueller(b), tag.M_LI) {
+            parse_fehler(b)
+        }
+        stapel_pop_bis_name(b, tag.M_LI)
+        return A_FERTIG
+    }
+    if n == tag.M_DD || n == tag.M_DT {
+        if !in_scope(b, n, SC_NORMAL) {
+            parse_fehler(b)
+            return A_FERTIG
+        }
+        implizit_schliessen(b, n)
+        if !knoten.element_ist(aktueller(b), n) {
+            parse_fehler(b)
+        }
+        stapel_pop_bis_name(b, n)
+        return A_FERTIG
+    }
+    if ist_ueberschrift(n) {
+        if !(in_scope(b, tag.M_H1, SC_NORMAL) || in_scope(b, tag.M_H2, SC_NORMAL) ||
+             in_scope(b, tag.M_H3, SC_NORMAL) || in_scope(b, tag.M_H4, SC_NORMAL) ||
+             in_scope(b, tag.M_H5, SC_NORMAL) || in_scope(b, tag.M_H6, SC_NORMAL)) {
+            parse_fehler(b)
+            return A_FERTIG
+        }
+        implizit_schliessen(b, 0)
+        if !knoten.element_ist(aktueller(b), n) {
+            parse_fehler(b)
+        }
+        while (*b).noffen > 0 {
+            let x: Gc[Knoten] = stapel_pop(b)
+            let xe: Gc[Element] = knoten.knoten_als_element(x)
+            if xe != gc_null[Element]() && xe.ns == knoten.NS_HTML && ist_ueberschrift(xe.name) {
+                break
+            }
+        }
+        return A_FERTIG
+    }
+    if ist_formatierung(n) {
+        let weiter: bool = try adoption_agency(b, n)
+        if !weiter {
+            return try ende_allgemein(b)
+        }
+        return A_FERTIG
+    }
+    if n == tag.M_APPLET || n == tag.M_MARQUEE || n == tag.M_OBJECT {
+        if !in_scope(b, n, SC_NORMAL) {
+            parse_fehler(b)
+            return A_FERTIG
+        }
+        implizit_schliessen(b, 0)
+        if !knoten.element_ist(aktueller(b), n) {
+            parse_fehler(b)
+        }
+        stapel_pop_bis_name(b, n)
+        aktiv_bis_marke_leeren(b)
+        return A_FERTIG
+    }
+    if n == tag.M_BR {
+        parse_fehler(b)
+        let ok: bool = try aktiv_wiederherstellen(b)
+        let ok2: bool = try leeres_element(b)
+        (*b).frameset_ok = false
+        return A_FERTIG
+    }
+    if n == tag.M_TEMPLATE {
+        return try m_in_head(b)
+    }
+    return try ende_allgemein(b)
+}
+
+fn m_in_body(b: *mut Baum) -> AllocError!u32 {
+    let art: u32 = tokenstrom.strom_art((*b).strom)
+    if art == tokens.TB_COMMENT {
+        let ok: bool = try kommentar_einfuegen(b, gc_null[Knoten]())
+        return A_FERTIG
+    }
+    if art == tokens.TB_DOCTYPE {
+        parse_fehler(b)
+        return A_FERTIG
+    }
+    if art == tokens.TB_START {
+        return try in_body_start(b)
+    }
+    return try in_body_ende(b)
+}
+
+// --------------------------------------------------------------- "text"
+
+fn m_text(b: *mut Baum) -> AllocError!u32 {
+    // In diesem Modus kommen nur Zeichen und der passende Endtag an.
+    stapel_pop(b)
+    (*b).modus = (*b).urmodus
+    return A_FERTIG
+}
+
+// ------------------------------------------------------------ "in table"
+
+fn tabelle_sonst(b: *mut Baum) -> AllocError!u32 {
+    parse_fehler(b)
+    (*b).foster = true
+    let r: u32 = try m_in_body(b)
+    (*b).foster = false
+    return r
+}
+
+fn m_in_table(b: *mut Baum) -> AllocError!u32 {
+    let art: u32 = tokenstrom.strom_art((*b).strom)
+    let n: u32 = (*b).tname
+    if art == tokens.TB_COMMENT {
+        let ok: bool = try kommentar_einfuegen(b, gc_null[Knoten]())
+        return A_FERTIG
+    }
+    if art == tokens.TB_DOCTYPE {
+        parse_fehler(b)
+        return A_FERTIG
+    }
+    if art == tokens.TB_START {
+        if n == tag.M_CAPTION {
+            stapel_bis_tabellenkontext(b)
+            aktiv_push_marke(b)
+            let e = try element_einfuegen_fuer_token(b, knoten.NS_HTML)
+            (*b).modus = EM_IN_CAPTION
+            return A_FERTIG
+        }
+        if n == tag.M_COLGROUP {
+            stapel_bis_tabellenkontext(b)
+            let e = try element_einfuegen_fuer_token(b, knoten.NS_HTML)
+            (*b).modus = EM_IN_COLGROUP
+            return A_FERTIG
+        }
+        if n == tag.M_COL {
+            stapel_bis_tabellenkontext(b)
+            let e = try element_einfuegen_name(b, tag.M_COLGROUP)
+            (*b).modus = EM_IN_COLGROUP
+            return A_ERNEUT
+        }
+        if n == tag.M_TBODY || n == tag.M_TFOOT || n == tag.M_THEAD {
+            stapel_bis_tabellenkontext(b)
+            let e = try element_einfuegen_fuer_token(b, knoten.NS_HTML)
+            (*b).modus = EM_IN_TABLE_BODY
+            return A_FERTIG
+        }
+        if n == tag.M_TD || n == tag.M_TH || n == tag.M_TR {
+            stapel_bis_tabellenkontext(b)
+            let e = try element_einfuegen_name(b, tag.M_TBODY)
+            (*b).modus = EM_IN_TABLE_BODY
+            return A_ERNEUT
+        }
+        if n == tag.M_TABLE {
+            parse_fehler(b)
+            if !in_scope(b, tag.M_TABLE, SC_TABELLE) {
+                return A_FERTIG
+            }
+            stapel_pop_bis_name(b, tag.M_TABLE)
+            einfuegemodus_zuruecksetzen(b)
+            return A_ERNEUT
+        }
+        if n == tag.M_STYLE || n == tag.M_SCRIPT || n == tag.M_TEMPLATE {
+            return try m_in_head(b)
+        }
+        if n == tag.M_INPUT {
+            var lit_hidden: [u8; 6] = "hidden"
+            if hat_type_attribut(b) && tok_type_ist(b, &lit_hidden[0], 6) {
+                parse_fehler(b)
+                let ok: bool = try leeres_element(b)
+                return A_FERTIG
+            }
+            return try tabelle_sonst(b)
+        }
+        if n == tag.M_FORM {
+            parse_fehler(b)
+            if (*b).form != gc_null[Element]() {
+                return A_FERTIG
+            }
+            let e = try element_einfuegen_fuer_token(b, knoten.NS_HTML)
+            (*b).form = e
+            stapel_pop(b)
+            return A_FERTIG
+        }
+    }
+    if art == tokens.TB_END {
+        if n == tag.M_TABLE {
+            if !in_scope(b, tag.M_TABLE, SC_TABELLE) {
+                parse_fehler(b)
+                return A_FERTIG
+            }
+            stapel_pop_bis_name(b, tag.M_TABLE)
+            einfuegemodus_zuruecksetzen(b)
+            return A_FERTIG
+        }
+        if n == tag.M_BODY || n == tag.M_CAPTION || n == tag.M_COL ||
+            n == tag.M_COLGROUP || n == tag.M_HTML || n == tag.M_TBODY ||
+            n == tag.M_TD || n == tag.M_TFOOT || n == tag.M_TH ||
+            n == tag.M_THEAD || n == tag.M_TR {
+            parse_fehler(b)
+            return A_FERTIG
+        }
+        if n == tag.M_TEMPLATE {
+            return try m_in_head(b)
+        }
+    }
+    return try tabelle_sonst(b)
+}
+
+// ---------------------------------------------------------- "in caption"
+
+fn caption_schliessen(b: *mut Baum) -> u32 {
+    if !in_scope(b, tag.M_CAPTION, SC_TABELLE) {
+        parse_fehler(b)
+        return A_FERTIG
+    }
+    implizit_schliessen(b, 0)
+    if !knoten.element_ist(aktueller(b), tag.M_CAPTION) {
+        parse_fehler(b)
+    }
+    stapel_pop_bis_name(b, tag.M_CAPTION)
+    aktiv_bis_marke_leeren(b)
+    (*b).modus = EM_IN_TABLE
+    return A_ERNEUT
+}
+
+fn m_in_caption(b: *mut Baum) -> AllocError!u32 {
+    let art: u32 = tokenstrom.strom_art((*b).strom)
+    let n: u32 = (*b).tname
+    if art == tokens.TB_END && n == tag.M_CAPTION {
+        let r: u32 = caption_schliessen(b)
+        if r == A_ERNEUT {
+            return A_FERTIG
+        }
+        return A_FERTIG
+    }
+    if art == tokens.TB_START {
+        if n == tag.M_CAPTION || n == tag.M_COL || n == tag.M_COLGROUP ||
+            n == tag.M_TBODY || n == tag.M_TD || n == tag.M_TFOOT ||
+            n == tag.M_TH || n == tag.M_THEAD || n == tag.M_TR {
+            parse_fehler(b)
+            return caption_schliessen(b)
+        }
+    }
+    if art == tokens.TB_END {
+        if n == tag.M_TABLE {
+            parse_fehler(b)
+            return caption_schliessen(b)
+        }
+        if n == tag.M_BODY || n == tag.M_COL || n == tag.M_COLGROUP ||
+            n == tag.M_HTML || n == tag.M_TBODY || n == tag.M_TD ||
+            n == tag.M_TFOOT || n == tag.M_TH || n == tag.M_THEAD ||
+            n == tag.M_TR {
+            parse_fehler(b)
+            return A_FERTIG
+        }
+    }
+    return try m_in_body(b)
+}
+
+// ------------------------------------------------------ "in column group"
+
+fn m_in_colgroup(b: *mut Baum) -> AllocError!u32 {
+    let art: u32 = tokenstrom.strom_art((*b).strom)
+    let n: u32 = (*b).tname
+    if art == tokens.TB_COMMENT {
+        let ok: bool = try kommentar_einfuegen(b, gc_null[Knoten]())
+        return A_FERTIG
+    }
+    if art == tokens.TB_DOCTYPE {
+        parse_fehler(b)
+        return A_FERTIG
+    }
+    if art == tokens.TB_START {
+        if n == tag.M_HTML {
+            return try m_in_body(b)
+        }
+        if n == tag.M_COL {
+            let ok: bool = try leeres_element(b)
+            return A_FERTIG
+        }
+        if n == tag.M_TEMPLATE {
+            return try m_in_head(b)
+        }
+    }
+    if art == tokens.TB_END {
+        if n == tag.M_COLGROUP {
+            if !knoten.element_ist(aktueller(b), tag.M_COLGROUP) {
+                parse_fehler(b)
+                return A_FERTIG
+            }
+            stapel_pop(b)
+            (*b).modus = EM_IN_TABLE
+            return A_FERTIG
+        }
+        if n == tag.M_COL {
+            parse_fehler(b)
+            return A_FERTIG
+        }
+        if n == tag.M_TEMPLATE {
+            return try m_in_head(b)
+        }
+    }
+    if !knoten.element_ist(aktueller(b), tag.M_COLGROUP) {
+        parse_fehler(b)
+        return A_FERTIG
+    }
+    stapel_pop(b)
+    (*b).modus = EM_IN_TABLE
+    return A_ERNEUT
+}
+
+// ------------------------------------------------------- "in table body"
+
+fn m_in_table_body(b: *mut Baum) -> AllocError!u32 {
+    let art: u32 = tokenstrom.strom_art((*b).strom)
+    let n: u32 = (*b).tname
+    if art == tokens.TB_START {
+        if n == tag.M_TR {
+            stapel_bis_koerperkontext(b)
+            let e = try element_einfuegen_fuer_token(b, knoten.NS_HTML)
+            (*b).modus = EM_IN_ROW
+            return A_FERTIG
+        }
+        if n == tag.M_TD || n == tag.M_TH {
+            parse_fehler(b)
+            stapel_bis_koerperkontext(b)
+            let e = try element_einfuegen_name(b, tag.M_TR)
+            (*b).modus = EM_IN_ROW
+            return A_ERNEUT
+        }
+        if n == tag.M_CAPTION || n == tag.M_COL || n == tag.M_COLGROUP ||
+            n == tag.M_TBODY || n == tag.M_TFOOT || n == tag.M_THEAD {
+            if !(in_scope(b, tag.M_TBODY, SC_TABELLE) ||
+                 in_scope(b, tag.M_THEAD, SC_TABELLE) ||
+                 in_scope(b, tag.M_TFOOT, SC_TABELLE)) {
+                parse_fehler(b)
+                return A_FERTIG
+            }
+            stapel_bis_koerperkontext(b)
+            stapel_pop(b)
+            (*b).modus = EM_IN_TABLE
+            return A_ERNEUT
+        }
+    }
+    if art == tokens.TB_END {
+        if n == tag.M_TBODY || n == tag.M_TFOOT || n == tag.M_THEAD {
+            if !in_scope(b, n, SC_TABELLE) {
+                parse_fehler(b)
+                return A_FERTIG
+            }
+            stapel_bis_koerperkontext(b)
+            stapel_pop(b)
+            (*b).modus = EM_IN_TABLE
+            return A_FERTIG
+        }
+        if n == tag.M_TABLE {
+            if !(in_scope(b, tag.M_TBODY, SC_TABELLE) ||
+                 in_scope(b, tag.M_THEAD, SC_TABELLE) ||
+                 in_scope(b, tag.M_TFOOT, SC_TABELLE)) {
+                parse_fehler(b)
+                return A_FERTIG
+            }
+            stapel_bis_koerperkontext(b)
+            stapel_pop(b)
+            (*b).modus = EM_IN_TABLE
+            return A_ERNEUT
+        }
+        if n == tag.M_BODY || n == tag.M_CAPTION || n == tag.M_COL ||
+            n == tag.M_COLGROUP || n == tag.M_HTML || n == tag.M_TD ||
+            n == tag.M_TH || n == tag.M_TR {
+            parse_fehler(b)
+            return A_FERTIG
+        }
+    }
+    return try m_in_table(b)
+}
+
+// ------------------------------------------------------------- "in row"
+
+fn m_in_row(b: *mut Baum) -> AllocError!u32 {
+    let art: u32 = tokenstrom.strom_art((*b).strom)
+    let n: u32 = (*b).tname
+    if art == tokens.TB_START {
+        if n == tag.M_TD || n == tag.M_TH {
+            stapel_bis_zeilenkontext(b)
+            let e = try element_einfuegen_fuer_token(b, knoten.NS_HTML)
+            (*b).modus = EM_IN_CELL
+            aktiv_push_marke(b)
+            return A_FERTIG
+        }
+        if n == tag.M_CAPTION || n == tag.M_COL || n == tag.M_COLGROUP ||
+            n == tag.M_TBODY || n == tag.M_TFOOT || n == tag.M_THEAD ||
+            n == tag.M_TR {
+            if !in_scope(b, tag.M_TR, SC_TABELLE) {
+                parse_fehler(b)
+                return A_FERTIG
+            }
+            stapel_bis_zeilenkontext(b)
+            stapel_pop(b)
+            (*b).modus = EM_IN_TABLE_BODY
+            return A_ERNEUT
+        }
+    }
+    if art == tokens.TB_END {
+        if n == tag.M_TR {
+            if !in_scope(b, tag.M_TR, SC_TABELLE) {
+                parse_fehler(b)
+                return A_FERTIG
+            }
+            stapel_bis_zeilenkontext(b)
+            stapel_pop(b)
+            (*b).modus = EM_IN_TABLE_BODY
+            return A_FERTIG
+        }
+        if n == tag.M_TABLE {
+            if !in_scope(b, tag.M_TR, SC_TABELLE) {
+                parse_fehler(b)
+                return A_FERTIG
+            }
+            stapel_bis_zeilenkontext(b)
+            stapel_pop(b)
+            (*b).modus = EM_IN_TABLE_BODY
+            return A_ERNEUT
+        }
+        if n == tag.M_TBODY || n == tag.M_TFOOT || n == tag.M_THEAD {
+            if !in_scope(b, n, SC_TABELLE) {
+                parse_fehler(b)
+                return A_FERTIG
+            }
+            if !in_scope(b, tag.M_TR, SC_TABELLE) {
+                return A_FERTIG
+            }
+            stapel_bis_zeilenkontext(b)
+            stapel_pop(b)
+            (*b).modus = EM_IN_TABLE_BODY
+            return A_ERNEUT
+        }
+        if n == tag.M_BODY || n == tag.M_CAPTION || n == tag.M_COL ||
+            n == tag.M_COLGROUP || n == tag.M_HTML || n == tag.M_TD ||
+            n == tag.M_TH {
+            parse_fehler(b)
+            return A_FERTIG
+        }
+    }
+    return try m_in_table(b)
+}
+
+// ------------------------------------------------------------ "in cell"
+
+fn m_in_cell(b: *mut Baum) -> AllocError!u32 {
+    let art: u32 = tokenstrom.strom_art((*b).strom)
+    let n: u32 = (*b).tname
+    if art == tokens.TB_END {
+        if n == tag.M_TD || n == tag.M_TH {
+            if !in_scope(b, n, SC_TABELLE) {
+                parse_fehler(b)
+                return A_FERTIG
+            }
+            implizit_schliessen(b, 0)
+            if !knoten.element_ist(aktueller(b), n) {
+                parse_fehler(b)
+            }
+            stapel_pop_bis_name(b, n)
+            aktiv_bis_marke_leeren(b)
+            (*b).modus = EM_IN_ROW
+            return A_FERTIG
+        }
+        if n == tag.M_BODY || n == tag.M_CAPTION || n == tag.M_COL ||
+            n == tag.M_COLGROUP || n == tag.M_HTML {
+            parse_fehler(b)
+            return A_FERTIG
+        }
+        if n == tag.M_TABLE || n == tag.M_TBODY || n == tag.M_TFOOT ||
+            n == tag.M_THEAD || n == tag.M_TR {
+            if !in_scope(b, n, SC_TABELLE) {
+                parse_fehler(b)
+                return A_FERTIG
+            }
+            zelle_schliessen(b)
+            return A_ERNEUT
+        }
+    }
+    if art == tokens.TB_START {
+        if n == tag.M_CAPTION || n == tag.M_COL || n == tag.M_COLGROUP ||
+            n == tag.M_TBODY || n == tag.M_TD || n == tag.M_TFOOT ||
+            n == tag.M_TH || n == tag.M_THEAD || n == tag.M_TR {
+            if !zelle_in_table_scope(b) {
+                parse_fehler(b)
+                return A_FERTIG
+            }
+            zelle_schliessen(b)
+            return A_ERNEUT
+        }
+    }
+    return try m_in_body(b)
+}
+
+// ---------------------------------------------------------- "in select"
+
+fn m_in_select(b: *mut Baum) -> AllocError!u32 {
+    let art: u32 = tokenstrom.strom_art((*b).strom)
+    let n: u32 = (*b).tname
+    if art == tokens.TB_COMMENT {
+        let ok: bool = try kommentar_einfuegen(b, gc_null[Knoten]())
+        return A_FERTIG
+    }
+    if art == tokens.TB_DOCTYPE {
+        parse_fehler(b)
+        return A_FERTIG
+    }
+    if art == tokens.TB_START {
+        if n == tag.M_HTML {
+            return try m_in_body(b)
+        }
+        if n == tag.M_OPTION {
+            if knoten.element_ist(aktueller(b), tag.M_OPTION) {
+                stapel_pop(b)
+            }
+            let e = try element_einfuegen_fuer_token(b, knoten.NS_HTML)
+            return A_FERTIG
+        }
+        if n == tag.M_OPTGROUP {
+            if knoten.element_ist(aktueller(b), tag.M_OPTION) {
+                stapel_pop(b)
+            }
+            if knoten.element_ist(aktueller(b), tag.M_OPTGROUP) {
+                stapel_pop(b)
+            }
+            let e = try element_einfuegen_fuer_token(b, knoten.NS_HTML)
+            return A_FERTIG
+        }
+        if n == tag.M_HR {
+            if knoten.element_ist(aktueller(b), tag.M_OPTION) {
+                stapel_pop(b)
+            }
+            if knoten.element_ist(aktueller(b), tag.M_OPTGROUP) {
+                stapel_pop(b)
+            }
+            let ok: bool = try leeres_element(b)
+            return A_FERTIG
+        }
+        if n == tag.M_SELECT {
+            parse_fehler(b)
+            if !in_scope(b, tag.M_SELECT, SC_SELECT) {
+                return A_FERTIG
+            }
+            stapel_pop_bis_name(b, tag.M_SELECT)
+            einfuegemodus_zuruecksetzen(b)
+            return A_FERTIG
+        }
+        if n == tag.M_INPUT || n == tag.M_KEYGEN || n == tag.M_TEXTAREA {
+            parse_fehler(b)
+            if !in_scope(b, tag.M_SELECT, SC_SELECT) {
+                return A_FERTIG
+            }
+            stapel_pop_bis_name(b, tag.M_SELECT)
+            einfuegemodus_zuruecksetzen(b)
+            return A_ERNEUT
+        }
+        if n == tag.M_SCRIPT || n == tag.M_TEMPLATE {
+            return try m_in_head(b)
+        }
+    }
+    if art == tokens.TB_END {
+        if n == tag.M_OPTGROUP {
+            if knoten.element_ist(aktueller(b), tag.M_OPTION) && (*b).noffen >= 2 &&
+                knoten.element_ist((*b).offen[(*b).noffen - 2], tag.M_OPTGROUP) {
+                stapel_pop(b)
+            }
+            if knoten.element_ist(aktueller(b), tag.M_OPTGROUP) {
+                stapel_pop(b)
+            } else {
+                parse_fehler(b)
+            }
+            return A_FERTIG
+        }
+        if n == tag.M_OPTION {
+            if knoten.element_ist(aktueller(b), tag.M_OPTION) {
+                stapel_pop(b)
+            } else {
+                parse_fehler(b)
+            }
+            return A_FERTIG
+        }
+        if n == tag.M_SELECT {
+            if !in_scope(b, tag.M_SELECT, SC_SELECT) {
+                parse_fehler(b)
+                return A_FERTIG
+            }
+            stapel_pop_bis_name(b, tag.M_SELECT)
+            einfuegemodus_zuruecksetzen(b)
+            return A_FERTIG
+        }
+        if n == tag.M_TEMPLATE {
+            return try m_in_head(b)
+        }
+    }
+    parse_fehler(b)
+    return A_FERTIG
+}
+
+fn m_in_select_in_table(b: *mut Baum) -> AllocError!u32 {
+    let art: u32 = tokenstrom.strom_art((*b).strom)
+    let n: u32 = (*b).tname
+    let betroffen: bool = n == tag.M_CAPTION || n == tag.M_TABLE || n == tag.M_TBODY ||
+        n == tag.M_TFOOT || n == tag.M_THEAD || n == tag.M_TR || n == tag.M_TD ||
+        n == tag.M_TH
+    if art == tokens.TB_START && betroffen {
+        parse_fehler(b)
+        stapel_pop_bis_name(b, tag.M_SELECT)
+        einfuegemodus_zuruecksetzen(b)
+        return A_ERNEUT
+    }
+    if art == tokens.TB_END && betroffen {
+        parse_fehler(b)
+        if !in_scope(b, n, SC_TABELLE) {
+            return A_FERTIG
+        }
+        stapel_pop_bis_name(b, tag.M_SELECT)
+        einfuegemodus_zuruecksetzen(b)
+        return A_ERNEUT
+    }
+    return try m_in_select(b)
+}
+
+// --------------------------------------------------------- "after body" …
+
+fn m_nach_body(b: *mut Baum) -> AllocError!u32 {
+    let art: u32 = tokenstrom.strom_art((*b).strom)
+    let n: u32 = (*b).tname
+    if art == tokens.TB_COMMENT {
+        var ziel: Gc[Knoten] = gc_null[Knoten]()
+        if (*b).noffen > 0 {
+            ziel = (*b).offen[0]
+        }
+        let ok: bool = try kommentar_einfuegen(b, ziel)
+        return A_FERTIG
+    }
+    if art == tokens.TB_DOCTYPE {
+        parse_fehler(b)
+        return A_FERTIG
+    }
+    if art == tokens.TB_START && n == tag.M_HTML {
+        return try m_in_body(b)
+    }
+    if art == tokens.TB_END && n == tag.M_HTML {
+        (*b).modus = EM_NACH_NACH_BODY
+        return A_FERTIG
+    }
+    parse_fehler(b)
+    (*b).modus = EM_IN_BODY
+    return A_ERNEUT
+}
+
+fn m_in_frameset(b: *mut Baum) -> AllocError!u32 {
+    let art: u32 = tokenstrom.strom_art((*b).strom)
+    let n: u32 = (*b).tname
+    if art == tokens.TB_COMMENT {
+        let ok: bool = try kommentar_einfuegen(b, gc_null[Knoten]())
+        return A_FERTIG
+    }
+    if art == tokens.TB_DOCTYPE {
+        parse_fehler(b)
+        return A_FERTIG
+    }
+    if art == tokens.TB_START {
+        if n == tag.M_HTML {
+            return try m_in_body(b)
+        }
+        if n == tag.M_FRAMESET {
+            let e = try element_einfuegen_fuer_token(b, knoten.NS_HTML)
+            return A_FERTIG
+        }
+        if n == tag.M_FRAME {
+            let ok: bool = try leeres_element(b)
+            return A_FERTIG
+        }
+        if n == tag.M_NOFRAMES {
+            return try m_in_head(b)
+        }
+    }
+    if art == tokens.TB_END && n == tag.M_FRAMESET {
+        if knoten.element_ist(aktueller(b), tag.M_HTML) {
+            parse_fehler(b)
+            return A_FERTIG
+        }
+        stapel_pop(b)
+        if !knoten.element_ist(aktueller(b), tag.M_FRAMESET) {
+            (*b).modus = EM_NACH_FRAMESET
+        }
+        return A_FERTIG
+    }
+    parse_fehler(b)
+    return A_FERTIG
+}
+
+fn m_nach_frameset(b: *mut Baum) -> AllocError!u32 {
+    let art: u32 = tokenstrom.strom_art((*b).strom)
+    let n: u32 = (*b).tname
+    if art == tokens.TB_COMMENT {
+        let ok: bool = try kommentar_einfuegen(b, gc_null[Knoten]())
+        return A_FERTIG
+    }
+    if art == tokens.TB_DOCTYPE {
+        parse_fehler(b)
+        return A_FERTIG
+    }
+    if art == tokens.TB_START && n == tag.M_HTML {
+        return try m_in_body(b)
+    }
+    if art == tokens.TB_END && n == tag.M_HTML {
+        (*b).modus = EM_NACH_NACH_FRAMESET
+        return A_FERTIG
+    }
+    if art == tokens.TB_START && n == tag.M_NOFRAMES {
+        return try m_in_head(b)
+    }
+    parse_fehler(b)
+    return A_FERTIG
+}
+
+fn m_nach_nach_body(b: *mut Baum) -> AllocError!u32 {
+    let art: u32 = tokenstrom.strom_art((*b).strom)
+    let n: u32 = (*b).tname
+    if art == tokens.TB_COMMENT {
+        let ok: bool = try kommentar_einfuegen(b, (*b).dok)
+        return A_FERTIG
+    }
+    if art == tokens.TB_DOCTYPE {
+        return try m_in_body(b)
+    }
+    if art == tokens.TB_START && n == tag.M_HTML {
+        return try m_in_body(b)
+    }
+    parse_fehler(b)
+    (*b).modus = EM_IN_BODY
+    return A_ERNEUT
+}
+
+fn m_nach_nach_frameset(b: *mut Baum) -> AllocError!u32 {
+    let art: u32 = tokenstrom.strom_art((*b).strom)
+    let n: u32 = (*b).tname
+    if art == tokens.TB_COMMENT {
+        let ok: bool = try kommentar_einfuegen(b, (*b).dok)
+        return A_FERTIG
+    }
+    if art == tokens.TB_DOCTYPE {
+        return try m_in_body(b)
+    }
+    if art == tokens.TB_START && n == tag.M_HTML {
+        return try m_in_body(b)
+    }
+    if art == tokens.TB_START && n == tag.M_NOFRAMES {
+        return try m_in_head(b)
+    }
+    parse_fehler(b)
+    return A_FERTIG
+}
+
+// ------------------------------------------------------------ Verteiler
+
+fn marke_modus(b: *mut Baum) -> AllocError!u32 {
+    let m: u32 = (*b).modus
+    if m == EM_INITIAL {
+        return try m_initial(b)
+    }
+    if m == EM_VOR_HTML {
+        return try m_vor_html(b)
+    }
+    if m == EM_VOR_HEAD {
+        return try m_vor_head(b)
+    }
+    if m == EM_IN_HEAD {
+        return try m_in_head(b)
+    }
+    if m == EM_IN_HEAD_NOSCRIPT {
+        return try m_in_head_noscript(b)
+    }
+    if m == EM_NACH_HEAD {
+        return try m_nach_head(b)
+    }
+    if m == EM_IN_BODY {
+        return try m_in_body(b)
+    }
+    if m == EM_TEXT {
+        return try m_text(b)
+    }
+    if m == EM_IN_TABLE {
+        return try m_in_table(b)
+    }
+    if m == EM_IN_TABLE_TEXT {
+        let ok: bool = try tt_ausschuetten(b)
+        return A_ERNEUT
+    }
+    if m == EM_IN_CAPTION {
+        return try m_in_caption(b)
+    }
+    if m == EM_IN_COLGROUP {
+        return try m_in_colgroup(b)
+    }
+    if m == EM_IN_TABLE_BODY {
+        return try m_in_table_body(b)
+    }
+    if m == EM_IN_ROW {
+        return try m_in_row(b)
+    }
+    if m == EM_IN_CELL {
+        return try m_in_cell(b)
+    }
+    if m == EM_IN_SELECT {
+        return try m_in_select(b)
+    }
+    if m == EM_IN_SELECT_IN_TABLE {
+        return try m_in_select_in_table(b)
+    }
+    if m == EM_NACH_BODY {
+        return try m_nach_body(b)
+    }
+    if m == EM_IN_FRAMESET {
+        return try m_in_frameset(b)
+    }
+    if m == EM_NACH_FRAMESET {
+        return try m_nach_frameset(b)
+    }
+    if m == EM_NACH_NACH_BODY {
+        return try m_nach_nach_body(b)
+    }
+    return try m_nach_nach_frameset(b)
+}
+
+// EOF: der Standard behandelt es je Modus. Alles, was nicht ausdruecklich
+// etwas anderes tut, laeuft in "stop parsing".
+fn eof_modus(b: *mut Baum) -> AllocError!u32 {
+    let m: u32 = (*b).modus
+    if m == EM_INITIAL {
+        parse_fehler(b)
+        knoten.dok_modus_setzen((*b).dok, knoten.MODUS_QUIRKS)
+        (*b).modus = EM_VOR_HTML
+        return A_ERNEUT
+    }
+    if m == EM_VOR_HTML {
+        let e = try knoten.element_neu(tag.M_HTML, knoten.NS_HTML)
+        knoten.kind_anhaengen((*b).dok, e)
+        stapel_push(b, e)
+        (*b).modus = EM_VOR_HEAD
+        return A_ERNEUT
+    }
+    if m == EM_VOR_HEAD {
+        let e = try element_einfuegen_name(b, tag.M_HEAD)
+        (*b).kopf = e
+        (*b).modus = EM_IN_HEAD
+        return A_ERNEUT
+    }
+    if m == EM_IN_HEAD {
+        stapel_pop(b)
+        (*b).modus = EM_NACH_HEAD
+        return A_ERNEUT
+    }
+    if m == EM_IN_HEAD_NOSCRIPT {
+        parse_fehler(b)
+        stapel_pop(b)
+        (*b).modus = EM_IN_HEAD
+        return A_ERNEUT
+    }
+    if m == EM_NACH_HEAD {
+        let e = try element_einfuegen_name(b, tag.M_BODY)
+        (*b).modus = EM_IN_BODY
+        return A_ERNEUT
+    }
+    if m == EM_TEXT {
+        parse_fehler(b)
+        stapel_pop(b)
+        (*b).modus = (*b).urmodus
+        return A_ERNEUT
+    }
+    if m == EM_IN_TABLE_TEXT {
+        let ok: bool = try tt_ausschuetten(b)
+        return A_ERNEUT
+    }
+    if m == EM_IN_CAPTION || m == EM_IN_CELL {
+        return A_FERTIG
+    }
+    if m == EM_IN_COLGROUP {
+        if !knoten.element_ist(aktueller(b), tag.M_COLGROUP) {
+            return A_FERTIG
+        }
+        stapel_pop(b)
+        (*b).modus = EM_IN_TABLE
+        return A_ERNEUT
+    }
+    return A_FERTIG
+}
+
+// ===========================================================================
+//                       EINSTIEG: EIN TOKEN
+// ===========================================================================
+
+fn tname_lesen(b: *mut Baum) {
+    let st: *mut tokenstrom.Strom = (*b).strom
+    let off: usize = tokenstrom.strom_name(st)
+    let n: usize = tokenstrom.kette_laenge(st, off)
+    mem.cp_clear(&(*b).hilf)
+    var i: usize = 0
+    while i < n {
+        mem.cp_push(&(*b).hilf, tokenstrom.kette_cp(st, off, i))
+        i = i + 1
+    }
+    (*b).tname = namen.namen_von_cp((*b).namen, &(*b).hilf)
+}
+
+// Die Schleife hinter "reprocess the token": ein Modus darf das Token an den
+// naechsten weiterreichen. 64 Runden sind grosszuegig — der Standard braucht
+// nie mehr als eine Handvoll; mehr waere ein Fehler in diesem Code und soll
+// SICHTBAR abbrechen statt zu haengen.
+fn verarbeite_zeichen(b: *mut Baum, cp: u32) -> bool {
+    var runde: u32 = 0
+    while runde < 64 as u32 {
+        runde = runde + 1
+        let r: u32 = zeichen_modus(b, cp) catch A_AUS
+        if r == A_AUS {
+            (*b).kaputt = 3
+            return false
+        }
+        if r == A_FERTIG {
+            return true
+        }
+    }
+    (*b).kaputt = 4
+    return false
+}
+
+fn verarbeite_marke(b: *mut Baum) -> bool {
+    var runde: u32 = 0
+    while runde < 64 as u32 {
+        runde = runde + 1
+        let r: u32 = marke_modus(b) catch A_AUS
+        if r == A_AUS {
+            (*b).kaputt = 3
+            return false
+        }
+        if r == A_FERTIG {
+            return true
+        }
+    }
+    (*b).kaputt = 4
+    return false
+}
+
+// Verarbeitet den Satz, auf dem der Strom gerade steht.
+fn baum_token(b: *mut Baum) -> bool {
+    let st: *mut tokenstrom.Strom = (*b).strom
+    let art: u32 = tokenstrom.strom_art(st)
+    if art == tokens.TB_CHARACTER {
+        let off: usize = tokenstrom.strom_daten(st)
+        let n: usize = tokenstrom.kette_laenge(st, off)
+        var i: usize = 0
+        if (*b).nl_ueberspringen {
+            (*b).nl_ueberspringen = false
+            if n > 0 && tokenstrom.kette_cp(st, off, 0) == 10 as u32 {
+                i = 1
+            }
+        }
+        while i < n {
+            if !verarbeite_zeichen(b, tokenstrom.kette_cp(st, off, i)) {
+                return false
+            }
+            i = i + 1
+        }
+        return true
+    }
+    (*b).nl_ueberspringen = false
+    (*b).tname = 0
+    if art == tokens.TB_START || art == tokens.TB_END {
+        tname_lesen(b)
+        if (*b).tname == 0 as u32 {
+            (*b).kaputt = 3
+            return false
+        }
+    }
+    return verarbeite_marke(b)
+}
+
+// Das Ende der Eingabe ("stop parsing"). Danach steht der Baum.
+fn baum_eof(b: *mut Baum) -> bool {
+    var runde: u32 = 0
+    while runde < 64 as u32 {
+        runde = runde + 1
+        let r: u32 = eof_modus(b) catch A_AUS
+        if r == A_AUS {
+            (*b).kaputt = 3
+            return false
+        }
+        if r == A_FERTIG {
+            return true
+        }
+    }
+    (*b).kaputt = 4
+    return false
+}
