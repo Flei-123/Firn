@@ -32,7 +32,7 @@
 //! ```
 //!
 //! Gemessen im Tokenizer-Benchmark (realweb, callgrind, instruktionsgenau):
-//! die Muster „setcc+movzx+store+reload+test+jcc" und „setcc+movzx+store"
+//! die Muster „setcc+movzx+store+reload+test+jcc" and "setcc+movzx+store"
 //! zusammen **137,0 Mio von 958,0 Mio Instruktionen = 14,3 %**.
 //!
 //! ## Was der Durchgang tut
@@ -300,11 +300,11 @@ mod tests {
     fn and_short_circuit_becomes_threaded() {
         let mut f = and_func();
         let n = thread_bool_cells(&mut f);
-        assert_eq!(n, 2, "beide Vorgaenger der Weiche muessen gefaedelt werden");
+        assert_eq!(n, 2, "both predecessors of the branch must be threaded");
         match &f.blocks[0].term {
             Term::BrCond { then_bb, else_bb, .. } => {
                 assert_eq!(*then_bb, 1);
-                assert_eq!(*else_bb, 4, "falsche Kante geht direkt nach bb_e");
+                assert_eq!(*else_bb, 4, "wrong edge goes straight to bb_e");
             }
             t => panic!("bb0: {:?}", t),
         }
@@ -324,7 +324,7 @@ mod tests {
     fn second_run_changes_nothing_more() {
         let mut f = and_func();
         assert_eq!(thread_bool_cells(&mut f), 2);
-        assert_eq!(thread_bool_cells(&mut f), 0, "Fixpunkt nach einem Lauf");
+        assert_eq!(thread_bool_cells(&mut f), 0, "fixed point after one run");
     }
 
     #[test]
@@ -372,7 +372,7 @@ mod tests {
         assert_eq!(thread_bool_cells(&mut f), 1);
         match &f.blocks[0].term {
             Term::BrCond { then_bb, else_bb, .. } => {
-                assert_eq!((*then_bb, *else_bb), (1, 2), "bb0 unveraendert");
+                assert_eq!((*then_bb, *else_bb), (1, 2), "bb0 unchanged");
             }
             t => panic!("bb0: {:?}", t),
         }

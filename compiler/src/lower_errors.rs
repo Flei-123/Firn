@@ -357,11 +357,11 @@ fn return_error(lo: &mut Lower, code: Val) -> Option<()> {
 fn try_value_addr(lo: &mut Lower, e: &Expr) -> Option<Val> {
     let ti = match try_of(e.id) {
         Some(t) => t,
-        None => return lo.ice(e.span, "'try' ohne fehlerunion"),
+        None => return lo.ice(e.span, "'try' without error union"),
     };
     let arg = match args_of(e).first() {
         Some(a) => a.clone(),
-        None => return lo.ice(e.span, "'try' ohne operand"),
+        None => return lo.ice(e.span, "'try' without operand"),
     };
     let src = lo.lower_addr(&arg)?;
     let code = lo.load(FTy::U32, src);
@@ -384,12 +384,12 @@ fn try_value_addr(lo: &mut Lower, e: &Expr) -> Option<Val> {
 fn catch_slot(lo: &mut Lower, e: &Expr) -> Option<Val> {
     let ci = match catch_of(e.id) {
         Some(c) => c,
-        None => return lo.ice(e.span, "'catch' ohne fehlerunion"),
+        None => return lo.ice(e.span, "'catch' without error union"),
     };
     let args = args_of(e).to_vec();
     let (lhs, rhs) = match (args.first(), args.get(1)) {
         (Some(a), Some(b)) => (a.clone(), b.clone()),
-        _ => return lo.ice(e.span, "'catch' ohne zwei operanden"),
+        _ => return lo.ice(e.span, "'catch' without two operands"),
     };
     let (size, align) = lo.size_align(&ci.inner.val_ty);
     let slot = lo.alloca(size, align);

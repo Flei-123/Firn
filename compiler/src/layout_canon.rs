@@ -52,12 +52,12 @@ pub fn render(p: &Program) -> String {
         };
         let d = &tcx.structs[i];
         o.push_str(&format!(
-            "  (struct {} groesse {} ausrichtung {}",
+            "  (struct {} size {} align {}",
             d.name, d.size, d.align
         ));
         for f in &d.fields {
             o.push_str(&format!(
-                " (feld {} versatz {} groesse {} ausrichtung {} typ {})",
+                " (field {} offset {} size {} align {} type {})",
                 f.name,
                 f.offset,
                 tcx.size_of(&f.ty),
@@ -72,7 +72,7 @@ pub fn render(p: &Program) -> String {
         for pa in &f.params {
             let t = resolve(&pa.ty, &idx);
             o.push_str(&format!(
-                " (arg {} groesse {} klasse {})",
+                " (arg {} size {} class {})",
                 tyname(&t, &tcx),
                 tcx.size_of(&t),
                 class(abi::classify(&t, &tcx))
@@ -83,7 +83,7 @@ pub fn render(p: &Program) -> String {
             None => Type::Void,
         };
         o.push_str(&format!(
-            " (ret {} groesse {} klasse {} sret {})",
+            " (ret {} size {} class {} sret {})",
             tyname(&rt, &tcx),
             tcx.size_of(&rt),
             class(abi::classify(&rt, &tcx)),
@@ -146,7 +146,7 @@ fn tyname(t: &Type, tcx: &TypeCtx) -> String {
         Type::Error => "?".into(),
         Type::Ptr { mutable, inner } => format!(
             "(ptr {} {})",
-            if *mutable { "mut" } else { "konst" },
+            if *mutable { "mut" } else { "const" },
             tyname(inner, tcx)
         ),
         Type::Array(e, n) => format!("(arr {} {})", n, tyname(e, tcx)),

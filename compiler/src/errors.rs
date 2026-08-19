@@ -258,7 +258,7 @@ impl<'a> Parser<'a> {
     /// `error IoError { NotFound, Permission, Closed }`
     fn errors_decl(&mut self) {
         let start = self.bump(); // 'error'
-        let (name, nspan) = match self.ident("nach 'error'") {
+        let (name, nspan) = match self.ident("after 'error'") {
             Some(x) => x,
             None => {
                 self.recovering = false;
@@ -266,7 +266,7 @@ impl<'a> Parser<'a> {
                 return;
             }
         };
-        if !self.expect(TokKind::LBrace, "nach dem namen der fehlermenge") {
+        if !self.expect(TokKind::LBrace, "after the name of the error set") {
             self.recovering = false;
             self.sync_item();
             return;
@@ -278,7 +278,7 @@ impl<'a> Parser<'a> {
                 break;
             }
             let before = self.pos;
-            let (vname, vspan) = match self.ident("fuer eine variante der fehlermenge") {
+            let (vname, vspan) = match self.ident("for a variant of the error set") {
                 Some(x) => x,
                 None => break,
             };
@@ -286,7 +286,7 @@ impl<'a> Parser<'a> {
                 self.dg.error(
                     vspan,
                     format!(
-                        "fehlervariante '{}' ist in fehlermenge '{}' bereits deklariert",
+                        "error variant '{}' is already declared in error set '{}'",
                         vname, name
                     ),
                 );
@@ -298,11 +298,11 @@ impl<'a> Parser<'a> {
             }
         }
         let end = self.span();
-        self.close(TokKind::RBrace, "am ende der fehlermenge");
+        self.close(TokKind::RBrace, "at the end of the error set");
         self.recovering = false;
         if variants.is_empty() {
             self.dg
-                .error(nspan, format!("fehlermenge '{}' hat keine variante", name));
+                .error(nspan, format!("error set '{}' has no variant", name));
             return;
         }
         let span = Parser::join(start, end);
@@ -323,7 +323,7 @@ impl<'a> Parser<'a> {
         });
         if duplicate {
             self.dg
-                .error(nspan, format!("fehlermenge '{}' ist bereits deklariert", name));
+                .error(nspan, format!("error set '{}' is already declared", name));
         }
     }
 }
@@ -375,11 +375,11 @@ pub(crate) fn hook_catch(p: &mut Parser, mut lhs: Expr) -> Expr {
         let mut bind: Option<String> = None;
         if matches!(p.kind(), TokKind::Pipe) {
             p.bump();
-            match p.ident("nach '|' in 'catch |e|'") {
+            match p.ident("after '|' in 'catch |e|'") {
                 Some((n, _)) => bind = Some(n),
                 None => return lhs,
             }
-            if !p.expect(TokKind::Pipe, "nach dem namen der fehlerbindung") {
+            if !p.expect(TokKind::Pipe, "after the name of the error binding") {
                 return lhs;
             }
         }
@@ -422,7 +422,7 @@ pub(crate) fn declare_error_sets(ck: &mut Checker) {
         };
         if ck.tcx.lookup(&name).is_some() {
             ck.dg
-                .error(span, format!("typ '{}' ist bereits deklariert", name));
+                .error(span, format!("type '{}' is already declared", name));
             continue;
         }
         let idx = ck.tcx.declare(&name);
@@ -449,8 +449,8 @@ pub(crate) fn hook_resolve_ty(ck: &mut Checker, te: &TypeExpr) -> Option<Type> {
     if set_index(&set).is_none() {
         ck.dg.error_note(
             set_span,
-            format!("unbekannte fehlermenge '{}'", set),
-            "eine fehlermenge wird mit 'error Name { A, B }' deklariert",
+            format!("unknown error set '{}'", set),
+            "an error set is declared with 'error Name { A, B }'",
         );
         return Some(Type::Error);
     }
@@ -461,7 +461,7 @@ pub(crate) fn hook_resolve_ty(ck: &mut Checker, te: &TypeExpr) -> Option<Type> {
     if matches!(val_ty, Type::Void) {
         ck.dg.error(
             span,
-            "der erfolgstyp einer fehlerunion kann nicht '()' sein",
+            "the success type of an error union cannot be '()'",
         );
         return Some(Type::Error);
     }
@@ -472,10 +472,10 @@ pub(crate) fn hook_resolve_ty(ck: &mut Checker, te: &TypeExpr) -> Option<Type> {
         ck.dg.error_note(
             span,
             format!(
-                "eine fehlerunion ueber dem erfolgstyp '{}' kann nicht feldtyp eines structs sein",
+                "an error union over the success type '{}' cannot be the field type of a struct",
                 ck.tcx.name_of(&val_ty)
             ),
-            "als rueckgabe-, variablen- und parametertyp ist sie erlaubt; im struct hilft ein zeiger",
+            "as return, variable and parameter type it is allowed; inside a struct a pointer helps",
         );
         return Some(Type::Error);
     }
@@ -560,7 +560,7 @@ pub(crate) fn hook_call(
         ck.dg.error(
             espan,
             format!(
-                "die fehlervariante '{}::{}' traegt keine nutzdaten",
+                "the error variant '{}::{}' carries no payload",
                 sname, vname
             ),
         );
@@ -568,8 +568,8 @@ pub(crate) fn hook_call(
     if variant_code(sname, vname).is_none() {
         ck.dg.error_note(
             nspan,
-            format!("fehlermenge '{}' hat keine variante '{}'", sname, vname),
-            format!("bekannt sind: {}", variant_list(sname)),
+            format!("error set '{}' has no variant '{}'", sname, vname),
+            format!("known are: {}", variant_list(sname)),
         );
         return Some(Type::Error);
     }
@@ -599,10 +599,10 @@ fn check_try(ck: &mut Checker, id: ExprId, args: &[Expr], espan: Span) -> Type {
                 ck.dg.error_note(
                     arg.span,
                     format!(
-                        "'try' erwartet einen wert einer fehlerunion, gefunden {}",
+                        "'try' expects a value of an error union, found {}",
                         ck.tcx.name_of(&got)
                     ),
-                    "eine fehlerunion entsteht aus einem rueckgabetyp der form 'E!T'",
+                    "an error union is made from a return type of the form 'E!T'",
                 );
             }
             return Type::Error;
@@ -615,10 +615,10 @@ fn check_try(ck: &mut Checker, id: ExprId, args: &[Expr], espan: Span) -> Type {
             ck.dg.error_note(
                 espan,
                 format!(
-                    "'try' ist nur in einer funktion mit fehlerunions-rueckgabetyp erlaubt, diese liefert {}",
+                    "'try' is only allowed in a function with an error union return type, this one returns {}",
                     ck.tcx.name_of(&ret)
                 ),
-                "schreibe den rueckgabetyp als 'E!T' oder benutze 'catch'",
+                "write the return type as 'E!T' or use 'catch'",
             );
             return inner.val_ty.clone();
         }
@@ -627,10 +627,10 @@ fn check_try(ck: &mut Checker, id: ExprId, args: &[Expr], espan: Span) -> Type {
         ck.dg.error_note(
             espan,
             format!(
-                "'try' liefert fehler der menge '{}', die funktion liefert fehler der menge '{}'",
+                "'try' yields errors of the set '{}', the function yields errors of the set '{}'",
                 inner.set, rinfo.set
             ),
-            "beide fehlermengen muessen dieselbe sein",
+            "both error sets must be the same",
         );
         return inner.val_ty.clone();
     }
@@ -653,10 +653,10 @@ fn check_catch(ck: &mut Checker, id: ExprId, args: &[Expr]) -> Type {
                 ck.dg.error_note(
                     lhs.span,
                     format!(
-                        "'catch' erwartet links einen wert einer fehlerunion, gefunden {}",
+                        "'catch' expects a value of an error union on the left, found {}",
                         ck.tcx.name_of(&got)
                     ),
-                    "eine fehlerunion entsteht aus einem rueckgabetyp der form 'E!T'",
+                    "an error union is made from a return type of the form 'E!T'",
                 );
             }
             ck.type_out_expr(rhs);
@@ -682,11 +682,11 @@ fn check_catch(ck: &mut Checker, id: ExprId, args: &[Expr]) -> Type {
         ck.dg.error_note(
             rhs.span,
             format!(
-                "der ersatzwert von 'catch' hat typ {}, erwartet {}",
+                "the replacement value of 'catch' has type {}, expected {}",
                 ck.tcx.name_of(&rt),
                 ck.tcx.name_of(&want)
             ),
-            "es gibt keine implizite umwandlung",
+            "there is no implicit conversion",
         );
     }
     REG.with(|r| r.borrow_mut().catches.insert(id, CatchInfo { inner }));
@@ -720,11 +720,11 @@ pub(crate) fn hook_binary(
                 ck.dg.error_note(
                     espan,
                     format!(
-                        "vergleich erwartet zwei fehlerwerte derselben menge, gefunden {} und {}",
+                        "comparison expects two error values of the same set, found {} and {}",
                         ck.tcx.name_of(&lt),
                         ck.tcx.name_of(&rt)
                     ),
-                    "es gibt keine implizite umwandlung",
+                    "there is no implicit conversion",
                 );
             }
             Some(Type::Bool)
@@ -779,7 +779,7 @@ pub(crate) fn hook_coerce(ck: &mut Checker, e: &Expr, want: &Type) -> bool {
         ck.dg.error(
             e.span,
             format!(
-                "fehlerwert der menge '{}' passt nicht zur fehlermenge '{}'",
+                "error value of the set '{}' does not fit the error set '{}'",
                 set, u.set
             ),
         );
@@ -796,13 +796,13 @@ pub(crate) fn hook_coerce(ck: &mut Checker, e: &Expr, want: &Type) -> bool {
     ck.dg.error_note(
         e.span,
         format!(
-            "erwartet {} (erfolgswert {} oder ein fehler der menge '{}'), gefunden {}",
+            "expected {} (success value {} or an error of the set '{}'), found {}",
             ck.tcx.name_of(want),
             ck.tcx.name_of(&u.val_ty),
             u.set,
             ck.tcx.name_of(&got)
         ),
-        "es gibt keine implizite umwandlung",
+        "there is no implicit conversion",
     );
     true
 }

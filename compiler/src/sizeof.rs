@@ -68,17 +68,17 @@ pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
     // BEWUSST NUR EIN TYPNAME, kein voller Typausdruck: `size_of[i32]`,
     // `size_of[Punkt]`. Wer die Groesse eines zusammengesetzten Typs braucht,
     // gibt ihm einen Namen — das ist ohnehin lesbarer als `size_of[*mut u8]`.
-    let (ty_name, _) = p.ident("nach 'size_of['")?;
-    if !p.expect(TokKind::RBracket, "nach dem typargument von 'size_of'") {
+    let (ty_name, _) = p.ident("after 'size_of['")?;
+    if !p.expect(TokKind::RBracket, "after the type argument of 'size_of'") {
         return None;
     }
-    if !p.expect(TokKind::LParen, "nach dem typargument von 'size_of'") {
+    if !p.expect(TokKind::LParen, "after the type argument of 'size_of'") {
         return None;
     }
     let end = match p.kind() {
         TokKind::RParen => p.bump(),
         _ => {
-            p.error_here("'size_of' nimmt keine argumente".to_string());
+            p.error_here("'size_of' takes no arguments".to_string());
             return None;
         }
     };
@@ -97,7 +97,7 @@ pub(crate) fn hook_call(
 ) -> Option<Type> {
     let ty_text = name.strip_prefix(P_SIZE)?;
     if !args.is_empty() {
-        ck.dg.error(span, "'size_of' nimmt keine argumente".to_string());
+        ck.dg.error(span, "'size_of' takes no arguments".to_string());
         return Some(Type::Error);
     }
     let te = TypeExpr::Named(ty_text.to_string(), span);
@@ -106,7 +106,7 @@ pub(crate) fn hook_call(
         return Some(Type::Error);
     }
     if matches!(t, Type::Void) {
-        ck.dg.error(span, "'size_of[void]' ist nicht sinnvoll".to_string());
+        ck.dg.error(span, "'size_of[void]' is not meaningful".to_string());
         return Some(Type::Error);
     }
     let size = ck.tcx.size_of(&t) as i128;

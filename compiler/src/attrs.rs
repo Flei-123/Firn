@@ -61,56 +61,56 @@ pub const ATTRS: &[AttrInfo] = &[
         target: Target::Both,
         args: 0,
         implemented: true,
-        what: "Ergebnis darf nicht verworfen werden (SPEC 3.3, 5.1)",
+        what: "result must not be discarded (SPEC 3.3, 5.1)",
     },
     AttrInfo {
         name: "no_gc",
         target: Target::Func,
         args: 0,
         implemented: true,
-        what: "kein Sammellauf in diesem Aufrufbaum (SPEC 3.5.4)",
+        what: "no collection run in this call tree (SPEC 3.5.4)",
     },
     AttrInfo {
         name: "interrupt",
         target: Target::Func,
         args: 0,
         implemented: true,
-        what: "unterbrechungs-einsprungpunkt: alle register retten, iretq (SPEC 2)",
+        what: "interrupt entry point: save all registers, iretq (SPEC 2)",
     },
     AttrInfo {
         name: "allow_fp",
         target: Target::Both,
         args: 0,
         implemented: true,
-        what: "gleitkomma im profil 'kernel' erlauben, FPU-Zustand (SPEC 2)",
+        what: "allow floating point in profile 'kernel', FPU state (SPEC 2)",
     },
     AttrInfo {
         name: "constant_time",
         target: Target::Func,
         args: 0,
         implemented: false,
-        what: "kein Sprung auf Geheimnisdaten, im Codegen geprueft (SPEC 9.2)",
+        what: "no jump on secret data, checked in the code generator (SPEC 9.2)",
     },
     AttrInfo {
         name: "unwinds",
         target: Target::Func,
         args: 0,
         implemented: false,
-        what: "darf 'throw' ausloesen oder durchlassen (SPEC 5.3)",
+        what: "may raise or pass on 'throw' (SPEC 5.3)",
     },
     AttrInfo {
         name: "packed",
         target: Target::Type,
         args: 0,
         implemented: false,
-        what: "Felder ohne Auffuellbytes anordnen (SPEC 13)",
+        what: "arrange fields without padding bytes (SPEC 13)",
     },
     AttrInfo {
         name: "align",
         target: Target::Type,
         args: 1,
         implemented: false,
-        what: "Ausrichtung erzwingen, z. B. #[align(64)] (SPEC 13)",
+        what: "force alignment, e.g. #[align(64)] (SPEC 13)",
     },
     AttrInfo {
         name: "layout",
@@ -124,28 +124,28 @@ pub const ATTRS: &[AttrInfo] = &[
         target: Target::Type,
         args: 0,
         implemented: false,
-        what: "nach dem Aufbau nicht mehr verschiebbar (DESIGNZIELE 6)",
+        what: "no longer movable after construction (DESIGNZIELE 6)",
     },
     AttrInfo {
         name: "abi_stable",
         target: Target::Both,
         args: 1,
         implemented: false,
-        what: "stabiles ABI ueber Komponentengrenzen (DESIGNZIELE 4)",
+        what: "stable ABI across component boundaries (DESIGNZIELE 4)",
     },
     AttrInfo {
         name: "frozen",
         target: Target::Type,
         args: 0,
         implemented: false,
-        what: "Layout eingefroren, dafuer wieder einbettbar (DESIGNZIELE 4)",
+        what: "layout frozen, in exchange embeddable again (DESIGNZIELE 4)",
     },
     AttrInfo {
         name: "hot",
         target: Target::Func,
         args: 0,
         implemented: false,
-        what: "zur Laufzeit austauschbar (DESIGNZIELE 9, ohne Termin)",
+        what: "exchangeable at run time (DESIGNZIELE 9, no date)",
     },
 ];
 
@@ -193,22 +193,22 @@ fn distance(a: &str, b: &str) -> usize {
 pub fn attrs_text() -> String {
     let mut out = String::new();
     out.push_str("Attribute\n\n");
-    out.push_str("NAME            ZIEL         ARGS  STUFE 0     ZWECK\n");
+    out.push_str("NAME            TARGET       ARGS  STAGE 0     PURPOSE\n");
     for a in ATTRS {
         out.push_str(&format!(
             "{:<15} {:<12} {:<5} {:<11} {}\n",
             a.name,
             a.target.text(),
             a.args,
-            if a.implemented { "umgesetzt" } else { "Fehler" },
+            if a.implemented { "implemented" } else { "error" },
             a.what
         ));
     }
     out.push_str(
-        "\n'Fehler' heisst: das Attribut ist bekannt und geplant, wird aber in\n",
+        "\n'error' means: the attribute is known and planned, but is\n",
     );
     out.push_str(
-        "Stufe 0 mit einer klaren Meldung abgelehnt statt still ignoriert.\n",
+        "rejected in stage 0 with a clear message instead of silently ignored.\n",
     );
     out
 }
@@ -222,7 +222,7 @@ mod tests {
         for (i, a) in ATTRS.iter().enumerate() {
             assert!(
                 ATTRS.iter().skip(i + 1).all(|b| b.name != a.name),
-                "doppelter Attributname: {}",
+                "duplicate attribute name: {}",
                 a.name
             );
         }
@@ -246,7 +246,7 @@ mod tests {
         // Attribute bleiben abgelehnt, nichts wird still ignoriert.
         for name in ["constant_time", "unwinds", "packed", "align", "layout", "no_move", "hot"] {
             let a = search(name).expect(name);
-            assert!(!a.implemented, "{} gilt unerwartet als umgesetzt", name);
+            assert!(!a.implemented, "{} unexpectedly counts as implemented", name);
         }
     }
 

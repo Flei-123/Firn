@@ -242,14 +242,14 @@ pub fn read(text: &str) -> Result<Manifest, Error> {
         match w[0] {
             "package" => {
                 if w.len() != 2 {
-                    return Err(err("'package' erwartet genau einen namen"));
+                    return Err(err("'package' expects exactly one name"));
                 }
                 if has_name {
-                    return Err(err("'package' steht mehrfach im manifest"));
+                    return Err(err("'package' appears more than once in the manifest"));
                 }
                 if !is_name(w[1]) {
                     return Err(err(&format!(
-                        "ungueltiger name '{}' (buchstabe zuerst, dann buchstaben, ziffern, unterstrich)",
+                        "invalid name '{}' (letter first, then letters, digits, underscore)",
                         w[1]
                     )));
                 }
@@ -258,14 +258,14 @@ pub fn read(text: &str) -> Result<Manifest, Error> {
             }
             "version" => {
                 if w.len() != 2 {
-                    return Err(err("'version' erwartet genau eine versionsnummer"));
+                    return Err(err("'version' expects exactly one version number"));
                 }
                 if has_version {
-                    return Err(err("'version' steht mehrfach im manifest"));
+                    return Err(err("'version' appears more than once in the manifest"));
                 }
                 if !is_version(w[1]) {
                     return Err(err(&format!(
-                        "ungueltige version '{}' (erwartet zahl.zahl.zahl)",
+                        "invalid version '{}' (expected number.number.number)",
                         w[1]
                     )));
                 }
@@ -274,14 +274,14 @@ pub fn read(text: &str) -> Result<Manifest, Error> {
             }
             "start" => {
                 if w.len() != 2 {
-                    return Err(err("'start' erwartet genau einen pfad"));
+                    return Err(err("'start' expects exactly one path"));
                 }
                 if has_start {
-                    return Err(err("'start' steht mehrfach im manifest"));
+                    return Err(err("'start' appears more than once in the manifest"));
                 }
                 if !is_inner_path(w[1]) {
                     return Err(err(&format!(
-                        "ungueltiger pfad '{}' (relativ, ohne '..')",
+                        "invalid path '{}' (relative, without '..')",
                         w[1]
                     )));
                 }
@@ -290,34 +290,34 @@ pub fn read(text: &str) -> Result<Manifest, Error> {
             }
             "source" => {
                 if w.len() != 2 {
-                    return Err(err("'source' erwartet genau einen pfad"));
+                    return Err(err("'source' expects exactly one path"));
                 }
                 if !is_inner_path(w[1]) {
                     return Err(err(&format!(
-                        "ungueltiger pfad '{}' (relativ, ohne '..')",
+                        "invalid path '{}' (relative, without '..')",
                         w[1]
                     )));
                 }
                 let q = normalize(w[1]);
                 if m.sources.iter().any(|x| *x == q) {
-                    return Err(err(&format!("source '{}' steht mehrfach im manifest", w[1])));
+                    return Err(err(&format!("source '{}' appears more than once in the manifest", w[1])));
                 }
                 m.sources.push(q);
             }
             "public" => {
                 if w.len() < 2 {
-                    return Err(err("'public' erwartet mindestens einen modulnamen"));
+                    return Err(err("'public' expects at least one module name"));
                 }
                 for x in &w[1..] {
                     if !is_name(x) {
                         return Err(err(&format!(
-                            "ungueltiger name '{}' (buchstabe zuerst, dann buchstaben, ziffern, unterstrich)",
+                            "invalid name '{}' (letter first, then letters, digits, underscore)",
                             x
                         )));
                     }
                     if m.public.iter().any(|y| y == x) {
                         return Err(err(&format!(
-                            "modul '{}' steht mehrfach in 'public'",
+                            "module '{}' appears more than once in 'public'",
                             x
                         )));
                     }
@@ -326,20 +326,20 @@ pub fn read(text: &str) -> Result<Manifest, Error> {
             }
             "needs" => {
                 if w.len() != 3 {
-                    return Err(err("'needs' erwartet einen namen und einen pfad"));
+                    return Err(err("'needs' expects a name and a path"));
                 }
                 if !is_name(w[1]) {
                     return Err(err(&format!(
-                        "ungueltiger name '{}' (buchstabe zuerst, dann buchstaben, ziffern, unterstrich)",
+                        "invalid name '{}' (letter first, then letters, digits, underscore)",
                         w[1]
                     )));
                 }
                 if !is_outer_path(w[2]) {
-                    return Err(err("'needs' erwartet einen namen und einen pfad"));
+                    return Err(err("'needs' expects a name and a path"));
                 }
                 if m.dependent.iter().any(|a| a.name == w[1]) {
                     return Err(err(&format!(
-                        "paket '{}' steht mehrfach als abhaengigkeit im manifest",
+                        "package '{}' appears more than once as a dependency in the manifest",
                         w[1]
                     )));
                 }
@@ -351,23 +351,23 @@ pub fn read(text: &str) -> Result<Manifest, Error> {
             }
             other => {
                 return Err(err(&format!(
-                    "unbekannter schluessel '{}' (erlaubt: package, version, start, source, public, needs)",
+                    "unknown key '{}' (allowed: package, version, start, source, public, needs)",
                     other
                 )));
             }
         }
     }
     if !has_name {
-        return Err(Error { line: 0, msg: "das manifest braucht eine zeile 'package <name>'".to_string() });
+        return Err(Error { line: 0, msg: "the manifest needs a line 'package <name>'".to_string() });
     }
     if !has_version {
-        return Err(Error { line: 0, msg: "das manifest braucht eine zeile 'version <zahl.zahl.zahl>'".to_string() });
+        return Err(Error { line: 0, msg: "the manifest needs a line 'version <number.number.number>'".to_string() });
     }
     if m.dependent.iter().any(|a| a.name == m.name) {
         let z = m.dependent.iter().find(|a| a.name == m.name).map(|a| a.line).unwrap_or(0);
         return Err(Error {
             line: z,
-            msg: format!("abhaengigkeit '{}' heisst wie das paket selbst", m.name),
+            msg: format!("dependency '{}' has the same name as the package itself", m.name),
         });
     }
     if m.sources.is_empty() {
@@ -407,7 +407,7 @@ mod tests {
     use super::*;
 
     fn m(text: &str) -> Manifest {
-        read(text).expect("manifest sollte gueltig sein")
+        read(text).expect("manifest should be valid")
     }
 
     #[test]
@@ -426,7 +426,7 @@ mod tests {
 
     #[test]
     fn comments_blank_lines_tabs() {
-        let x = m("# kopf\n\n\tpackage\tdemo\t# name\nversion 1.2.3\nstart a.fi\n   \n");
+        let x = m("# head\n\n\tpackage\tdemo\t# name\nversion 1.2.3\nstart a.fi\n   \n");
         assert_eq!(x.name, "demo");
         assert_eq!(x.version, "1.2.3");
     }
@@ -449,9 +449,9 @@ mod tests {
     #[test]
     fn missing_required() {
         assert_eq!(read("version 1.0.0\nstart a.fi\n").unwrap_err().msg,
-                   "das manifest braucht eine zeile 'package <name>'");
+                   "the manifest needs a line 'package <name>'");
         assert_eq!(read("package a\nstart a.fi\n").unwrap_err().msg,
-                   "das manifest braucht eine zeile 'version <zahl.zahl.zahl>'");
+                   "the manifest needs a line 'version <number.number.number>'");
         // 'start' ist KEINE Pflicht: eine Bibliothek hat keinen Einstiegspunkt.
         assert_eq!(read("package a\nversion 1.0.0\n").unwrap().start, "");
     }
@@ -460,15 +460,15 @@ mod tests {
     fn unknown_key_is_in_error() {
         let e = read("package a\nversion 1.0.0\nstart a.fi\npubli b\n").unwrap_err();
         assert_eq!(e.line, 4);
-        assert!(e.msg.starts_with("unbekannter schluessel 'publi'"), "{}", e.msg);
+        assert!(e.msg.starts_with("unknown key 'publi'"), "{}", e.msg);
     }
 
     #[test]
     fn checked_become_name_version_path() {
-        assert!(read("package 1a\nversion 1.0.0\nstart a.fi\n").unwrap_err().msg.contains("ungueltiger name '1a'"));
-        assert!(read("package a\nversion 1.0\nstart a.fi\n").unwrap_err().msg.contains("ungueltige version '1.0'"));
-        assert!(read("package a\nversion 1.0.0\nstart ../x.fi\n").unwrap_err().msg.contains("ungueltiger pfad '../x.fi'"));
-        assert!(read("package a\nversion 1.0.0\nstart /x.fi\n").unwrap_err().msg.contains("ungueltiger pfad '/x.fi'"));
+        assert!(read("package 1a\nversion 1.0.0\nstart a.fi\n").unwrap_err().msg.contains("invalid name '1a'"));
+        assert!(read("package a\nversion 1.0\nstart a.fi\n").unwrap_err().msg.contains("invalid version '1.0'"));
+        assert!(read("package a\nversion 1.0.0\nstart ../x.fi\n").unwrap_err().msg.contains("invalid path '../x.fi'"));
+        assert!(read("package a\nversion 1.0.0\nstart /x.fi\n").unwrap_err().msg.contains("invalid path '/x.fi'"));
         assert!(is_name("a_1"));
         assert!(!is_name(""));
         assert!(!is_name("a-b"));
@@ -479,19 +479,19 @@ mod tests {
 
     #[test]
     fn duplicate_entries_become_reported() {
-        assert!(read("package a\npackage b\nversion 1.0.0\nstart a.fi\n").unwrap_err().msg.contains("'package' steht mehrfach"));
-        assert!(read("package a\nversion 1.0.0\nversion 1.0.1\nstart a.fi\n").unwrap_err().msg.contains("'version' steht mehrfach"));
-        assert!(read("package a\nversion 1.0.0\nstart a.fi\nsource s\nsource s\n").unwrap_err().msg.contains("source 's' steht mehrfach"));
-        assert!(read("package a\nversion 1.0.0\nstart a.fi\npublic m m\n").unwrap_err().msg.contains("modul 'm' steht mehrfach"));
-        assert!(read("package a\nversion 1.0.0\nstart a.fi\nneeds g ../g\nneeds g ../h\n").unwrap_err().msg.contains("steht mehrfach als abhaengigkeit"));
-        assert!(read("package a\nversion 1.0.0\nstart a.fi\nneeds a ../a\n").unwrap_err().msg.contains("heisst wie das paket selbst"));
+        assert!(read("package a\npackage b\nversion 1.0.0\nstart a.fi\n").unwrap_err().msg.contains("'package' appears more than once"));
+        assert!(read("package a\nversion 1.0.0\nversion 1.0.1\nstart a.fi\n").unwrap_err().msg.contains("'version' appears more than once"));
+        assert!(read("package a\nversion 1.0.0\nstart a.fi\nsource s\nsource s\n").unwrap_err().msg.contains("source 's' appears more than once"));
+        assert!(read("package a\nversion 1.0.0\nstart a.fi\npublic m m\n").unwrap_err().msg.contains("module 'm' appears more than once"));
+        assert!(read("package a\nversion 1.0.0\nstart a.fi\nneeds g ../g\nneeds g ../h\n").unwrap_err().msg.contains("appears more than once as a dependency"));
+        assert!(read("package a\nversion 1.0.0\nstart a.fi\nneeds a ../a\n").unwrap_err().msg.contains("has the same name as the package itself"));
     }
 
     #[test]
     fn wrong_arity() {
-        assert!(read("package a b\nversion 1.0.0\nstart a.fi\n").unwrap_err().msg.contains("'package' erwartet genau einen namen"));
-        assert!(read("package a\nversion 1.0.0\nstart a.fi\nneeds g\n").unwrap_err().msg.contains("'needs' erwartet einen namen und einen pfad"));
-        assert!(read("package a\nversion 1.0.0\nstart a.fi\npublic\n").unwrap_err().msg.contains("'public' erwartet mindestens einen modulnamen"));
+        assert!(read("package a b\nversion 1.0.0\nstart a.fi\n").unwrap_err().msg.contains("'package' expects exactly one name"));
+        assert!(read("package a\nversion 1.0.0\nstart a.fi\nneeds g\n").unwrap_err().msg.contains("'needs' expects a name and a path"));
+        assert!(read("package a\nversion 1.0.0\nstart a.fi\npublic\n").unwrap_err().msg.contains("'public' expects at least one module name"));
     }
 
     #[test]
@@ -528,9 +528,9 @@ mod tests {
         let x = m("package app\nversion 0.2.0\nstart src/main.fi\nsource src\n\
                    public app\nneeds geo ../geo\n");
         assert_eq!(
-            info_text(&x, "./beispiel/app/"),
-            "package app\nversion 0.2.0\nroot beispiel/app\nstart beispiel/app/src/main.fi\n\
-             source beispiel/app/src\npublic app\nneeds geo beispiel/geo\n"
+            info_text(&x, "./example/app/"),
+            "package app\nversion 0.2.0\nroot example/app\nstart example/app/src/main.fi\n\
+             source example/app/src\npublic app\nneeds geo example/geo\n"
         );
     }
 }

@@ -252,7 +252,7 @@ impl<'a> Parser<'a> {
     fn gc_class_decl(&mut self) {
         let start = self.bump(); // 'gc'
         self.bump(); // 'class'
-        let (name, nspan) = match self.ident("nach 'gc class'") {
+        let (name, nspan) = match self.ident("after 'gc class'") {
             Some(x) => x,
             None => {
                 self.recovering = false;
@@ -263,7 +263,7 @@ impl<'a> Parser<'a> {
         let mut base: Option<(String, Span)> = None;
         if matches!(self.kind(), TokKind::Ident(n) if n == "extends") {
             self.bump();
-            match self.ident("nach 'extends'") {
+            match self.ident("after 'extends'") {
                 Some((b, example)) => base = Some((b, example)),
                 None => {
                     self.recovering = false;
@@ -275,15 +275,15 @@ impl<'a> Parser<'a> {
                 let sp = self.span();
                 self.dg.error_note(
                     sp,
-                    "mehrfachvererbung ist nicht erlaubt".to_string(),
-                    "SPEC 4.4: 'gc class' hat hoechstens EINE basis",
+                    "multiple inheritance is not allowed".to_string(),
+                    "SPEC 4.4: 'gc class' has at most ONE base",
                 );
                 self.recovering = false;
                 self.sync_item();
                 return;
             }
         }
-        if !self.expect(TokKind::LBrace, "nach dem namen der gc-klasse") {
+        if !self.expect(TokKind::LBrace, "after the name of the gc class") {
             self.recovering = false;
             self.sync_item();
             return;
@@ -295,11 +295,11 @@ impl<'a> Parser<'a> {
                 break;
             }
             let before = self.pos;
-            let (fname, fspan) = match self.ident("fuer ein feld der gc-klasse") {
+            let (fname, fspan) = match self.ident("for a field of the gc class") {
                 Some(x) => x,
                 None => break,
             };
-            if !self.expect(TokKind::Colon, "nach dem feldnamen") {
+            if !self.expect(TokKind::Colon, "after the field name") {
                 break;
             }
             let ty = match self.parse_type() {
@@ -309,7 +309,7 @@ impl<'a> Parser<'a> {
             if fields.iter().any(|f| f.name == fname) {
                 self.dg.error(
                     fspan,
-                    format!("feld '{}' ist in 'gc class {}' bereits deklariert", fname, name),
+                    format!("field '{}' is already declared in 'gc class {}'", fname, name),
                 );
             } else {
                 fields.push(Field { name: fname, ty, span: fspan });
@@ -325,13 +325,13 @@ impl<'a> Parser<'a> {
             }
         }
         let end = self.span();
-        self.close(TokKind::RBrace, "am ende der gc-klasse");
+        self.close(TokKind::RBrace, "at the end of the gc class");
         self.recovering = false;
         let span = Parser::join(start, end);
         let _ = span;
         if index_of(&name).is_some() {
             self.dg
-                .error(nspan, format!("'gc class {}' ist bereits deklariert", name));
+                .error(nspan, format!("'gc class {}' is already declared", name));
             return;
         }
         REG.with(|r| {
@@ -360,7 +360,7 @@ impl<'a> Parser<'a> {
     /// verworfen — der Behaelter ist nominal einer. Liefert die Spanne der
     /// schliessenden Klammer.
     fn gc_collection_args(&mut self, name: &str, n: usize) -> Option<Span> {
-        if !self.expect(TokKind::LBracket, "nach 'GcVec'/'GcMap'") {
+        if !self.expect(TokKind::LBracket, "after 'GcVec'/'GcMap'") {
             return None;
         }
         let mut i = 0;
@@ -376,14 +376,14 @@ impl<'a> Parser<'a> {
         if i != n {
             self.dg.error_note(
                 self.span(),
-                format!("'{}' erwartet {} typargument(e), bekommen {}", name, n, i),
-                "GcVec[E] hat eines, GcMap[K, V] hat zwei (SPEC 3.5.2)",
+                format!("'{}' expects {} type argument(s), got {}", name, n, i),
+                "GcVec[E] has one, GcMap[K, V] has two (SPEC 3.5.2)",
             );
             self.recovering = true;
             return None;
         }
         let end = self.span();
-        if !self.expect(TokKind::RBracket, "nach den typargumenten") {
+        if !self.expect(TokKind::RBracket, "after the type arguments") {
             return None;
         }
         Some(end)
@@ -395,7 +395,7 @@ impl<'a> Parser<'a> {
             return None;
         }
         let r = self.ident(what)?;
-        if !self.expect(TokKind::RBracket, "nach dem typargument") {
+        if !self.expect(TokKind::RBracket, "after the type argument") {
             return None;
         }
         Some(r)
@@ -449,7 +449,7 @@ pub(crate) fn hook_type(p: &mut Parser, name: &str, sp: Span) -> Option<TypeExpr
     if !p.at(&TokKind::LBracket) {
         return None;
     }
-    let (class, ksp) = p.gc_ty_arg("nach 'Gc'/'GcWeak'")?;
+    let (class, ksp) = p.gc_ty_arg("after 'Gc'/'GcWeak'")?;
     Some(TypeExpr::Named(format!("{}{}", prefix, class), Parser::join(sp, ksp)))
 }
 
@@ -487,12 +487,12 @@ pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
                 return None;
             }
             let sp = p.bump();
-            let (class, ksp) = p.gc_ty_arg("nach 'gc_null'/'weak_null'")?;
+            let (class, ksp) = p.gc_ty_arg("after 'gc_null'/'weak_null'")?;
             let span = Parser::join(sp, ksp);
-            if !p.expect(TokKind::LParen, "nach dem typargument") {
+            if !p.expect(TokKind::LParen, "after the type argument") {
                 return None;
             }
-            if !p.expect(TokKind::RParen, "nach '(' — der nullwert hat kein argument") {
+            if !p.expect(TokKind::RParen, "after '(' — the null value has no argument") {
                 return None;
             }
             if name == "gc_null" {
@@ -537,7 +537,7 @@ pub(crate) fn hook_postfix(p: &mut Parser, base: &Expr) -> Option<Expr> {
     }
     let sp = p.bump(); // 'as'
     p.bump(); // '?'
-    let (class, ksp) = p.gc_ty_arg("nach '.as?'")?;
+    let (class, ksp) = p.gc_ty_arg("after '.as?'")?;
     let span = Parser::join(base.span, ksp);
     Some(p.mk(
         span,
@@ -568,7 +568,7 @@ pub(crate) fn declare_classes(ck: &mut Checker) {
             };
         if ck.tcx.lookup(&name).is_some() {
             ck.dg
-                .error(span, format!("typ '{}' ist bereits deklariert", name));
+                .error(span, format!("type '{}' is already declared", name));
         }
         let sidx = ck.tcx.declare(&format!("gc {}", name));
         let widx = ck.tcx.declare(&weak_struct_name(&name));
@@ -599,8 +599,8 @@ pub(crate) fn declare_classes(ck: &mut Checker) {
             None => {
                 ck.dg.error_note(
                     bspan,
-                    format!("unbekannte basisklasse '{}'", bname),
-                    "eine basis muss selbst mit 'gc class' deklariert sein (SPEC 4.4)",
+                    format!("unknown base class '{}'", bname),
+                    "a base must itself be declared with 'gc class' (SPEC 4.4)",
                 );
                 REG.with(|r| {
                     if let Some(k) = r.borrow_mut().classes.get_mut(i) {
@@ -613,7 +613,7 @@ pub(crate) fn declare_classes(ck: &mut Checker) {
         if circle(bi, i) {
             ck.dg.error(
                 bspan,
-                format!("die vererbungskette von 'gc class {}' ist ringfoermig", name),
+                format!("the inheritance chain of 'gc class {}' is cyclic", name),
             );
             REG.with(|r| {
                 if let Some(k) = r.borrow_mut().classes.get_mut(i) {
@@ -706,8 +706,8 @@ fn put_out(ck: &mut Checker, i: usize) {
         if fields.iter().any(|(n, _)| *n == f.name) {
             ck.dg.error_note(
                 f.span,
-                format!("feld '{}' ist schon in der basis von 'gc class {}' vergeben", f.name, k.name),
-                "geerbte feldnamen duerfen nicht erneut vergeben werden (SPEC 4.4)",
+                format!("field '{}' is already taken in the base of 'gc class {}'", f.name, k.name),
+                "inherited field names must not be assigned again (SPEC 4.4)",
             );
             continue;
         }
@@ -716,10 +716,10 @@ fn put_out(ck: &mut Checker, i: usize) {
             ck.dg.error_note(
                 f.span,
                 format!(
-                    "feldtyp {} ist in einer gc-klasse nicht erlaubt",
+                    "field type {} is not allowed in a gc class",
                     ck.tcx.name_of(&t)
                 ),
-                "erlaubt sind ganzzahlen, bool, zeiger, Gc[T], GcWeak[T] und arrays davon",
+                "allowed are integers, bool, pointers, Gc[T], GcWeak[T] and arrays of these",
             );
             continue;
         }
@@ -801,8 +801,8 @@ pub(crate) fn hook_resolve_ty(ck: &mut Checker, te: &TypeExpr) -> Option<Type> {
     if is_class(name) {
         ck.dg.error_note(
             span,
-            format!("'{}' ist eine gc-klasse und kann kein wert sein", name),
-            "ein 'gc class'-wert lebt nur auf dem GC-Heap: schreibe 'Gc[".to_string()
+            format!("'{}' is a gc class and cannot be a value", name),
+            "a 'gc class' value lives only on the GC heap: write 'Gc[".to_string()
                 + name
                 + "]' (SPEC 3.5.1)",
         );
@@ -814,8 +814,8 @@ pub(crate) fn hook_resolve_ty(ck: &mut Checker, te: &TypeExpr) -> Option<Type> {
 fn unknown_class(ck: &mut Checker, name: &str, span: Span) {
     ck.dg.error_note(
         span,
-        format!("unbekannte gc-klasse '{}'", name),
-        "eine gc-klasse wird mit 'gc class Name { … }' deklariert",
+        format!("unknown gc class '{}'", name),
+        "a gc class is declared with 'gc class Name { … }'",
     );
 }
 
@@ -851,7 +851,7 @@ fn check_new(
                     ck.dg.error(
                         *fspan,
                         format!(
-                            "feld '{}' von 'gc class {}' erwartet {}, gefunden {}",
+                            "field '{}' of 'gc class {}' expects {}, found {}",
                             fname,
                             class,
                             ck.tcx.name_of(want),
@@ -864,13 +864,13 @@ fn check_new(
                 ck.type_out_expr(fexpr);
                 ck.dg.error(
                     *fspan,
-                    format!("'gc class {}' hat kein feld '{}'", class, fname),
+                    format!("'gc class {}' has no field '{}'", class, fname),
                 );
             }
         }
         if seen.contains(&fname.as_str()) {
             ck.dg
-                .error(*fspan, format!("feld '{}' ist doppelt angegeben", fname));
+                .error(*fspan, format!("field '{}' is given twice", fname));
         }
         seen.push(fname);
     }
@@ -883,11 +883,11 @@ fn check_new(
         ck.dg.error_note(
             nspan,
             format!(
-                "in 'gc {}{{…}}' fehlen die felder: {}",
+                "the fields are missing in 'gc {}{{…}}': {}",
                 class,
                 missing.join(", ")
             ),
-            "bei einer gc-allokation muessen ALLE felder angegeben werden",
+            "in a gc allocation ALL fields must be given",
         );
     }
     let u = alloc_union(ck, Type::ptr(Type::Struct(sidx), true), nspan);
@@ -908,8 +908,8 @@ fn alloc_union(ck: &mut Checker, val: Type, span: Span) -> Type {
         None => {
             ck.dg.error_note(
                 span,
-                format!("die fehlermenge '{}' ist nicht deklariert", ERR_SET),
-                "sie kommt mit der GC-Laufzeit (lib/gc/gc.fi) und wird automatisch eingezogen",
+                format!("the error set '{}' is not declared", ERR_SET),
+                "it comes with the GC runtime (lib/gc/gc.fi) and is pulled in automatically",
             );
             Type::Error
         }
@@ -955,7 +955,7 @@ pub(crate) fn hook_call(
         }
         ck.dg.error(
             espan,
-            format!("'{}' erwartet genau ein argument, gefunden {}", name, args.len()),
+            format!("'{}' expects exactly one argument, found {}", name, args.len()),
         );
         return Some(Type::Error);
     }
@@ -977,10 +977,10 @@ pub(crate) fn hook_call(
                 ck.dg.error_note(
                     args[0].span,
                     format!(
-                        "'weak' erwartet einen Gc[T], gefunden {}",
+                        "'weak' expects a Gc[T], found {}",
                         ck.tcx.name_of(&at)
                     ),
-                    "ein schwacher verweis entsteht nur aus einem starken",
+                    "a weak reference is made only from a strong one",
                 );
                 Type::Error
             }
@@ -1001,10 +1001,10 @@ pub(crate) fn hook_call(
             ck.dg.error_note(
                 args[0].span,
                 format!(
-                    "'stark' erwartet einen GcWeak[T], gefunden {}",
+                    "'strong' expects a GcWeak[T], found {}",
                     ck.tcx.name_of(&at)
                 ),
-                "'stark' wertet einen schwachen verweis auf",
+                "'strong' upgrades a weak reference",
             );
             Type::Error
         }
@@ -1043,7 +1043,7 @@ fn check_as(ck: &mut Checker, class: &str, args: &[Expr], nspan: Span) -> Type {
             ck.dg.error(
                 arg.span,
                 format!(
-                    "'.as?[{}]' erwartet einen Gc[T], gefunden {}",
+                    "'.as?[{}]' expects a Gc[T], found {}",
                     class,
                     ck.tcx.name_of(&at)
                 ),
@@ -1059,8 +1059,8 @@ fn check_as(ck: &mut Checker, class: &str, args: &[Expr], nspan: Span) -> Type {
         });
         ck.dg.error_note(
             nspan,
-            format!("'{}' und '{}' sind nicht verwandt", qn, zn),
-            "'.as?[T]' prueft nur innerhalb einer vererbungskette (SPEC 4.4)",
+            format!("'{}' and '{}' are not related", qn, zn),
+            "'.as?[T]' only checks within an inheritance chain (SPEC 4.4)",
         );
         return Type::Error;
     }
@@ -1196,9 +1196,9 @@ pub(crate) const REG_SAVE_OFF: u64 = 3968;
 /// Groesse des Zustandsblocks (Bytes).
 pub(crate) const STATE_SIZE: u64 = 4096;
 /// Label des Zustandsblocks (`.data`, dateilokal).
-pub(crate) const STATE_LABEL: &str = ".L__gc_zustand";
+pub(crate) const STATE_LABEL: &str = ".L__gc_state";
 /// Label der Typtabelle (`.rodata`, dateilokal).
-pub(crate) const TABLE_LABEL: &str = ".L__gc_typtabelle";
+pub(crate) const TABLE_LABEL: &str = ".L__gc_typetable";
 
 /// Die compilergenerierte Typtabelle: aus dem Feldlayout, je Typ ein Eintrag
 /// von 8 Woertern (SPEC §3.5.3 — praezise Heap-Verfolgung).
@@ -1339,8 +1339,8 @@ pub(crate) fn source_has_thread_work(toks: &[crate::lexer::Token]) -> bool {
 /// Die leere Voreinstellung des Fadenverteilers.
 fn thread_work_default() -> String {
     let mut s = String::new();
-    s.push_str("// Runde 49: Voreinstellung des Fadenverteilers. Das Programm\n");
-    s.push_str("// deklariert keinen eigenen, also tut ein Faden nichts.\n");
+    s.push_str("// Round 49: default of the thread dispatcher. The program\n");
+    s.push_str("// declares none of its own, so a thread does nothing.\n");
     s.push_str("fn ");
     s.push_str(FN_FADEN);
     s.push_str("(kind: u64, arg: u64) -> u64 {\n");
@@ -1352,8 +1352,8 @@ fn thread_work_default() -> String {
 /// Die leere Voreinstellung des Finalisierer-Verteilers.
 fn finalizer_default() -> String {
     let mut s = String::new();
-    s.push_str("// Runde 47: Voreinstellung des Finalisierer-Verteilers. Das Programm\n");
-    s.push_str("// deklariert keinen eigenen, also tut das Aufraeumen nichts.\n");
+    s.push_str("// Round 47: default of the finalizer dispatcher. The program\n");
+    s.push_str("// declares none of its own, so cleanup does nothing.\n");
     s.push_str("fn ");
     s.push_str(FN_FINAL);
     s.push_str("(kind: u64, p: *mut u8) {\n");
@@ -1387,17 +1387,17 @@ pub(crate) fn runtime_source(
     if with_error_set {
         s.push_str("error AllocError { OutOfMemory }\n");
     } else {
-        s.push_str("// AllocError wird vom Programm selbst deklariert\n");
+        s.push_str("// AllocError is declared by the program itself\n");
     }
     if with_finalizer {
         s.push_str(&finalizer_default());
     } else {
-        s.push_str("// __gc_finalize wird vom Programm selbst deklariert\n");
+        s.push_str("// __gc_finalize is declared by the program itself\n");
     }
     if with_thread_work {
         s.push_str(&thread_work_default());
     } else {
-        s.push_str("// __thread_work wird vom Programm selbst deklariert\n");
+        s.push_str("// __thread_work is declared by the program itself\n");
     }
     s.push_str(LAUFZEIT);
     if with_collections {
@@ -1433,7 +1433,7 @@ mod tests {
     fn runtime_contains_the_required_names() {
         let q = runtime_source(true, true, true, true);
         for n in ["gc_init", "gc_collect", "gc_live_objects", FN_ALLOC, FN_WEAK, FN_STARK, FN_AS] {
-            assert!(q.contains(n), "laufzeit ohne '{}'", n);
+            assert!(q.contains(n), "runtime without '{}'", n);
         }
         assert!(q.contains("error AllocError"));
         assert!(!runtime_source(false, true, true, false).contains("error AllocError {"));
@@ -1446,10 +1446,10 @@ mod tests {
         assert!(q.contains("gc_finalizer_set"));
         // Runde 53: die Sammlungen kommen nur dazu, wenn sie gebraucht werden.
         for n in ["gcvec_append", "gcmap_set", "gc class GcSlots"] {
-            assert!(q.contains(n), "laufzeit ohne '{}'", n);
+            assert!(q.contains(n), "runtime without '{}'", n);
             assert!(
                 !runtime_source(true, true, true, false).contains(n),
-                "'{}' auch ohne Sammlungen dabei",
+                "'{}' present even without collections",
                 n
             );
         }
