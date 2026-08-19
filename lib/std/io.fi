@@ -11,8 +11,17 @@
 import rt
 
 export {
+    // Runde 39
     print, eprint, read_file, write_file,
     Fmt, fmt_neu, fmt_text, fmt_zahl, fmt_len, fmt_druck, fmt_frei,
+    // Runde 42 — Ausgabe, Dateien, Zeilen
+    println, eprintln, print_c, eprint_c, print_zeile, print_fd,
+    read_stdin, append_file, file_exists,
+    Zeilenleser, zeilen_neu, zeilen_von_buf, zeilen_naechst, zeilen_zahl,
+    // Runde 42 — der Fmt-Builder, ausgebaut
+    fmt_zeichen, fmt_bool, fmt_u64, fmt_hex, fmt_c, fmt_wiederhole,
+    fmt_zeile, fmt_breit, fmt_anhaengen, fmt_inhalt, fmt_druck_zeile,
+    fmt_eprint, fmt_eprint_zeile, fmt_in_datei,
 }
 
 // ------------------------------------------------------------- Ein-/Ausgabe
@@ -89,4 +98,280 @@ fn fmt_druck(f: Fmt) {
 fn fmt_frei(f: Fmt) {
     var g: Fmt = f
     rt.buf_frei(&g.b)
+}
+
+// =====================================================================
+// Runde 42 — der Ausbau: Zeilen, stdin, Anhaengen an Dateien und ein
+// Fmt-Builder, der mehr kann als Text und Dezimalzahl.
+// =====================================================================
+
+const O_NUR_LESEN: i64 = 0
+const O_ANHAENGEN: i64 = 1089      // O_WRONLY|O_CREAT|O_APPEND
+const O_RECHTE: i64 = 493          // 0755
+const SYS_OEFFNEN: i64 = 2
+const SYS_SCHLIESSEN: i64 = 3
+
+// --------------------------------------------------------- Ausgabe kurz
+
+// Wie `print`, mit Zeilenvorschub. Zwei Schreibaufrufe — ein Zwischenpuffer
+// waere eine Allokation je Zeile.
+fn println(p: u64, n: usize) {
+    rt.schreib_alles(1, p, n)
+    var nl: [u8; 1] = "\n"
+    rt.schreib_alles(1, (&nl[0]) as u64, 1)
+}
+
+fn eprintln(p: u64, n: usize) {
+    rt.schreib_alles(2, p, n)
+    var nl: [u8; 1] = "\n"
+    rt.schreib_alles(2, (&nl[0]) as u64, 1)
+}
+
+// Nullabgeschlossene Folge (ohne das Nulloktett) — die Form, in der
+// Kommandozeilenargumente ankommen (`rt.arg_zeiger`).
+fn print_c(p: u64) {
+    rt.schreib_alles(1, p, rt.c_laenge(p))
+}
+
+fn eprint_c(p: u64) {
+    rt.schreib_alles(2, p, rt.c_laenge(p))
+}
+
+fn print_zeile() {
+    var nl: [u8; 1] = "\n"
+    rt.schreib_alles(1, (&nl[0]) as u64, 1)
+}
+
+// Auf einen beliebigen Deskriptor. `false` = der Schreibaufruf brach ab.
+fn print_fd(fd: i64, p: u64, n: usize) -> bool {
+    return rt.schreib_alles(fd, p, n)
+}
+
+// ------------------------------------------------------------- Dateien
+
+// Alles von der Standardeingabe bis zum Ende.
+fn read_stdin(aus: *mut rt.Buf) -> bool {
+    return rt.lies_stdin(aus)
+}
+
+// An eine Datei ANHAENGEN statt sie zu ueberschreiben (O_APPEND). Legt sie
+// an, wenn sie fehlt. Das ist der Unterschied zwischen einem Protokoll und
+// einem verlorenen Protokoll.
+fn append_file(pfad: u64, p: u64, n: usize) -> bool {
+    let fd: i64 = syscall(SYS_OEFFNEN, pfad as i64, O_ANHAENGEN, O_RECHTE, 0, 0, 0)
+    if fd < 0 {
+        return false
+    }
+    let ok: bool = rt.schreib_alles(fd, p, n)
+    syscall(SYS_SCHLIESSEN, fd, 0, 0, 0, 0, 0)
+    return ok
+}
+
+// Laesst sich die Datei zum Lesen oeffnen? Mehr sagt Stufe 0 nicht: es gibt
+// kein `stat`, und ein Rateversuch ueber die Groesse waere eine Luege.
+fn file_exists(pfad: u64) -> bool {
+    let fd: i64 = syscall(SYS_OEFFNEN, pfad as i64, O_NUR_LESEN, 0, 0, 0, 0)
+    if fd < 0 {
+        return false
+    }
+    syscall(SYS_SCHLIESSEN, fd, 0, 0, 0, 0, 0)
+    return true
+}
+
+// --------------------------------------------------------------- Zeilen
+//
+// Ein KURSOR ueber einen bereits gelesenen Block — kein zweiter Puffer, kein
+// Kopieren. Jede Zeile kommt als Zeiger+Laenge INNERHALB des Blocks:
+//
+//     var buf: rt.Buf = rt.buf_neu()
+//     io.read_file(pfad, &buf)
+//     var z: io.Zeilenleser = io.zeilen_von_buf(&buf)
+//     var p: u64 = 0
+//     var n: usize = 0
+//     while io.zeilen_naechst(&z, &p, &n) { ... }
+//
+// Der Zeilenvorschub gehoert NICHT zur Zeile; ein vorangehendes \r wird
+// mit entfernt (DOS-Zeilenenden). Endet der Block mit \n, gibt es KEINE
+// leere Schlusszeile — das ist die Regel, die `wc -l` und jeder Editor
+// benutzen.
+
+struct Zeilenleser {
+    p: u64,
+    n: usize,
+    i: usize,
+}
+
+fn zeilen_neu(p: u64, n: usize) -> Zeilenleser {
+    return Zeilenleser{ p: p, n: n, i: 0 }
+}
+
+fn zeilen_von_buf(b: *mut rt.Buf) -> Zeilenleser {
+    return Zeilenleser{ p: rt.buf_ptr(b), n: rt.buf_len(b), i: 0 }
+}
+
+fn zeilen_naechst(z: *mut Zeilenleser, ap: *mut u64, an: *mut usize) -> bool {
+    let ende: usize = (*z).n
+    var i: usize = (*z).i
+    if i >= ende {
+        return false
+    }
+    let start: usize = i
+    while i < ende && rt.ld8((*z).p, i) != 10 as u8 {
+        i = i + 1
+    }
+    var laenge: usize = i - start
+    if laenge > 0 && rt.ld8((*z).p, start + laenge - 1) == 13 as u8 {
+        laenge = laenge - 1
+    }
+    *ap = (*z).p + start as u64
+    *an = laenge
+    if i < ende {
+        i = i + 1
+    }
+    (*z).i = i
+    return true
+}
+
+// Wie viele Zeilen der Block hat (ohne ihn zu verbrauchen).
+fn zeilen_zahl(p: u64, n: usize) -> usize {
+    var z: Zeilenleser = zeilen_neu(p, n)
+    var ap: u64 = 0
+    var an: usize = 0
+    var k: usize = 0
+    while zeilen_naechst(&z, &ap, &an) {
+        k = k + 1
+    }
+    return k
+}
+
+// ------------------------------------------------------ Fmt, ausgebaut
+//
+// Dieselbe Bauform wie in Runde 39: Wert rein, Wert raus, damit die ganze
+// Kette EIN Ausdruck bleibt.
+
+// Ein einzelnes Oktett. Damit wird `{c}` als BUCHSTABE druckbar — mit
+// `fmt_zahl` kaeme die Zahl 65 statt "A" heraus.
+fn fmt_zeichen(f: Fmt, c: u8) -> Fmt {
+    var g: Fmt = f
+    rt.buf_push(&g.b, c)
+    return g
+}
+
+fn fmt_bool(f: Fmt, w: bool) -> Fmt {
+    var g: Fmt = f
+    var ja: [u8; 4] = "wahr"
+    var nein: [u8; 6] = "falsch"
+    if w {
+        rt.buf_push_bytes(&g.b, (&ja[0]) as u64, 4)
+    } else {
+        rt.buf_push_bytes(&g.b, (&nein[0]) as u64, 6)
+    }
+    return g
+}
+
+// Vorzeichenlos — `fmt_zahl` zeigt i64 und braeche oberhalb von i64::MAX um.
+fn fmt_u64(f: Fmt, v: u64) -> Fmt {
+    var g: Fmt = f
+    rt.buf_push_dez_u64(&g.b, v)
+    return g
+}
+
+// Hexadezimal, mindestens `mindest` Ziffern, ohne "0x".
+fn fmt_hex(f: Fmt, v: u64, mindest: usize) -> Fmt {
+    var g: Fmt = f
+    rt.buf_push_hex_u64(&g.b, v, mindest)
+    return g
+}
+
+// Nullabgeschlossene Folge.
+fn fmt_c(f: Fmt, p: u64) -> Fmt {
+    var g: Fmt = f
+    rt.buf_push_bytes(&g.b, p, rt.c_laenge(p))
+    return g
+}
+
+fn fmt_wiederhole(f: Fmt, c: u8, mal: usize) -> Fmt {
+    var g: Fmt = f
+    var i: usize = 0
+    while i < mal {
+        rt.buf_push(&g.b, c)
+        i = i + 1
+    }
+    return g
+}
+
+fn fmt_zeile(f: Fmt) -> Fmt {
+    var g: Fmt = f
+    rt.buf_push(&g.b, 10 as u8)
+    return g
+}
+
+// Rechtsbuendig auf `breite` auffuellen und dann die Zahl — fuer Tabellen.
+fn fmt_breit(f: Fmt, v: i64, breite: usize, fueller: u8) -> Fmt {
+    var g: Fmt = f
+    var stellen: usize = 1
+    var x: u64 = v as u64
+    if v < 0 {
+        stellen = 2
+        x = (0 - (v + 1)) as u64 + 1
+    }
+    var rest: u64 = x / 10
+    while rest > 0 {
+        stellen = stellen + 1
+        rest = rest / 10
+    }
+    var i: usize = stellen
+    while i < breite {
+        rt.buf_push(&g.b, fueller)
+        i = i + 1
+    }
+    rt.buf_push_dez_i64(&g.b, v)
+    return g
+}
+
+// Zwei Builder verbinden: `h` wird angehaengt UND FREIGEGEBEN. So kann eine
+// Funktion einen Fmt zurueckgeben, den der Aufrufer weiterbaut.
+fn fmt_anhaengen(f: Fmt, h: Fmt) -> Fmt {
+    var g: Fmt = f
+    var q: Fmt = h
+    rt.buf_push_bytes(&g.b, rt.buf_ptr(&q.b), rt.buf_len(&q.b))
+    rt.buf_frei(&q.b)
+    return g
+}
+
+// Inhalt an einen Puffer ANHAENGEN und den Builder freigeben — der Weg,
+// einen `f"..."` nicht zu drucken, sondern weiterzuverarbeiten.
+fn fmt_inhalt(f: Fmt, aus: *mut rt.Buf) {
+    var g: Fmt = f
+    rt.buf_push_bytes(aus, rt.buf_ptr(&g.b), rt.buf_len(&g.b))
+    rt.buf_frei(&g.b)
+}
+
+fn fmt_druck_zeile(f: Fmt) {
+    var g: Fmt = f
+    rt.buf_push(&g.b, 10 as u8)
+    rt.schreib_alles(1, rt.buf_ptr(&g.b), rt.buf_len(&g.b))
+    rt.buf_frei(&g.b)
+}
+
+// Auf stderr statt stdout — Diagnosen gehoeren nicht in die Ausgabe.
+fn fmt_eprint(f: Fmt) {
+    var g: Fmt = f
+    rt.schreib_alles(2, rt.buf_ptr(&g.b), rt.buf_len(&g.b))
+    rt.buf_frei(&g.b)
+}
+
+fn fmt_eprint_zeile(f: Fmt) {
+    var g: Fmt = f
+    rt.buf_push(&g.b, 10 as u8)
+    rt.schreib_alles(2, rt.buf_ptr(&g.b), rt.buf_len(&g.b))
+    rt.buf_frei(&g.b)
+}
+
+// In eine Datei schreiben (ueberschreibend) und freigeben.
+fn fmt_in_datei(f: Fmt, pfad: u64) -> bool {
+    var g: Fmt = f
+    let ok: bool = rt.schreib_datei(pfad, rt.buf_ptr(&g.b), rt.buf_len(&g.b))
+    rt.buf_frei(&g.b)
+    return ok
 }
