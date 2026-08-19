@@ -1,0 +1,187 @@
+// lib/browser/tokenstrom.fi — Leser des binaeren Tokenprotokolls.
+//
+// Gegenstueck zu `tb_*` in lib/html/tokens.fi. Der Tokenizer schreibt seine
+// Token als Datensaetze in einen Bytepuffer, dieser Leser laeuft sie ab.
+//
+// WARUM EIN PUFFER UND KEIN RUECKRUF: der Tokenizer ist vollstaendig
+// `#[no_gc]` (SPEC §3.5.4) — er darf keine Funktion aufrufen, die GC-Speicher
+// anfordert. Der Baumaufbau tut genau das (jeder Knoten ist ein GC-Objekt).
+// Zwischen beiden MUSS also etwas stehen, das keine Zeiger auf GC-Objekte
+// kennt. Das ist dieser Puffer.
+//
+// Der Leser haelt nur Offsets in den Puffer; er kopiert nichts. Alle
+// Zugriffe gehen ueber `kette_*`, damit der Baumaufbau die Zeichen direkt in
+// eine GC-Kette schaufeln kann, ohne Zwischenpuffer.
+
+import html.mem
+import html.tokens
+
+export {
+    Strom,
+    strom_neu, strom_setzen, strom_weiter, strom_am_ende,
+    strom_art, strom_flaggen, strom_pos, strom_nattr,
+    strom_name, strom_attr_erstes, strom_daten,
+    strom_doctype_pubid, strom_doctype_sysid,
+    kette_laenge, kette_cp, kette_ende,
+    strom_zurueck,
+}
+
+struct Strom {
+    p: *mut u8,
+    n: usize,
+    i: usize,          // naechster ungelesener Byte-Offset
+    satz: usize,       // Anfang des AKTUELLEN Satzes
+    art: u32,
+    flaggen: u32,
+    pos: usize,
+    nattr: u32,
+}
+
+#[no_gc]
+fn strom_neu() -> Strom {
+    return Strom{
+        p: 0 as *mut u8,
+        n: 0,
+        i: 0,
+        satz: 0,
+        art: 0,
+        flaggen: 0,
+        pos: 0,
+        nattr: 0,
+    }
+}
+
+#[no_gc]
+fn strom_setzen(s: *mut Strom, p: *mut u8, n: usize) {
+    (*s).p = p
+    (*s).n = n
+    (*s).i = 0
+    (*s).satz = 0
+    (*s).art = 0
+    (*s).flaggen = 0
+    (*s).pos = 0
+    (*s).nattr = 0
+}
+
+#[no_gc]
+fn u32_bei(s: *mut Strom, off: usize) -> u32 {
+    if off + 4 > (*s).n {
+        return 0
+    }
+    let b: u64 = (*s).p as u64 + off as u64
+    return (*(b as *mut u8)) as u32 |
+        (((*((b + 1) as *mut u8)) as u32) << 8) |
+        (((*((b + 2) as *mut u8)) as u32) << 16) |
+        (((*((b + 3) as *mut u8)) as u32) << 24)
+}
+
+// Laenge der Kette, die bei `off` beginnt (in Codepunkten).
+#[no_gc]
+fn kette_laenge(s: *mut Strom, off: usize) -> usize {
+    return u32_bei(s, off) as usize
+}
+
+// Codepunkt `i` der Kette bei `off`.
+#[no_gc]
+fn kette_cp(s: *mut Strom, off: usize, i: usize) -> u32 {
+    return u32_bei(s, off + 4 + i * 4)
+}
+
+// Offset direkt HINTER der Kette bei `off` — so laeuft man Attributpaare ab.
+#[no_gc]
+fn kette_ende(s: *mut Strom, off: usize) -> usize {
+    return off + 4 + kette_laenge(s, off) * 4
+}
+
+#[no_gc]
+fn strom_am_ende(s: *mut Strom) -> bool {
+    return (*s).i >= (*s).n
+}
+
+// Liest den naechsten Satz. `false` = Strom zu Ende.
+#[no_gc]
+fn strom_weiter(s: *mut Strom) -> bool {
+    if (*s).i + 16 > (*s).n {
+        return false
+    }
+    (*s).satz = (*s).i
+    (*s).art = u32_bei(s, (*s).i)
+    (*s).flaggen = u32_bei(s, (*s).i + 4)
+    (*s).pos = u32_bei(s, (*s).i + 8) as usize
+    (*s).nattr = u32_bei(s, (*s).i + 12)
+    var off: usize = (*s).i + 16
+    if (*s).art == tokens.TB_START {
+        off = kette_ende(s, off)
+        var k: u32 = 0
+        while k < (*s).nattr {
+            off = kette_ende(s, off)
+            off = kette_ende(s, off)
+            k = k + 1
+        }
+    } else if (*s).art == tokens.TB_DOCTYPE {
+        off = kette_ende(s, off)
+        off = kette_ende(s, off)
+        off = kette_ende(s, off)
+    } else {
+        off = kette_ende(s, off)
+    }
+    (*s).i = off
+    return true
+}
+
+// Setzt den Leser auf den Anfang des zuletzt gelesenen Satzes zurueck. Das
+// braucht der Baumaufbau, wenn ein Token in einem anderen Einfuegemodus
+// ERNEUT verarbeitet werden muss ("reprocess the token") und der Modus
+// zwischendurch den Strom nicht weiterschieben darf.
+#[no_gc]
+fn strom_zurueck(s: *mut Strom) {
+    (*s).i = (*s).satz
+}
+
+#[no_gc]
+fn strom_art(s: *mut Strom) -> u32 {
+    return (*s).art
+}
+
+#[no_gc]
+fn strom_flaggen(s: *mut Strom) -> u32 {
+    return (*s).flaggen
+}
+
+#[no_gc]
+fn strom_pos(s: *mut Strom) -> usize {
+    return (*s).pos
+}
+
+#[no_gc]
+fn strom_nattr(s: *mut Strom) -> u32 {
+    return (*s).nattr
+}
+
+// Offset der Namenskette des aktuellen Satzes (Start-/Endtag, DOCTYPE).
+#[no_gc]
+fn strom_name(s: *mut Strom) -> usize {
+    return (*s).satz + 16
+}
+
+// Offset der ersten Attributkette (Name des ersten Attributs).
+#[no_gc]
+fn strom_attr_erstes(s: *mut Strom) -> usize {
+    return kette_ende(s, (*s).satz + 16)
+}
+
+// Offset der Datenkette (Kommentar, Zeichen).
+#[no_gc]
+fn strom_daten(s: *mut Strom) -> usize {
+    return (*s).satz + 16
+}
+
+#[no_gc]
+fn strom_doctype_pubid(s: *mut Strom) -> usize {
+    return kette_ende(s, (*s).satz + 16)
+}
+
+#[no_gc]
+fn strom_doctype_sysid(s: *mut Strom) -> usize {
+    return kette_ende(s, kette_ende(s, (*s).satz + 16))
+}
