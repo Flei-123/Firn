@@ -220,8 +220,10 @@ ohne Manifest, falscher Paketname, ungültige Version, unbekannter
 Schlüssel, fehlende `paket`-Zeile, Namenskonflikt, Bibliothek ohne `start`,
 Verzeichnis ohne Manifest, `--paket` zusammen mit einer Quelldatei.
 
-Dazu **12 neue Rust-Modultests** in `compiler/src/paket.rs` und
-`compiler/src/paketwelt.rs` (Format, Pfadrechnen, Fehlertexte).
+Dazu **13 neue Rust-Modultests** in `compiler/src/paket.rs` (11) und
+`compiler/src/paketwelt.rs` (2): Format, Pflichtangaben, doppelte Einträge,
+Stelligkeit, Pfadrechnen, Paketzugehörigkeit, `--paket-info`-Text und die
+festen Fehlertexte.
 
 ## 9. Migrationshinweise
 
@@ -238,7 +240,7 @@ Dazu **12 neue Rust-Modultests** in `compiler/src/paket.rs` und
   in einer Übersetzung sind dann ein Fehler statt einer stillen
   Überdeckung — das ist der Zweck, kann aber beim ersten Lauf auffallen.
 * **Kein Manifest im Wurzelverzeichnis dieses Repos.** Das ist Absicht: es
-  würde die Auflösung der 181 Testprogramme verändern. Das Beispielprojekt
+  würde die Auflösung aller Testprogramme im Repo verändern. Das Beispielprojekt
   liegt deshalb unter `beispiele/pakete/`.
 
 ## 10. Offen (ehrlich)
@@ -263,10 +265,19 @@ Dazu **12 neue Rust-Modultests** in `compiler/src/paket.rs` und
 * **Die Sichtbarkeitsprüfung greift erst mit Manifest.** Wer ohne Manifest
   baut, hat keine Paketgrenzen — dann gibt es auch keine zu verletzen.
 
-## 11. Abnahme (gemessen, siehe Abschlussbericht)
+## 11. Abnahme (gemessen, 19.08.2026, Branch `r48-pakete`)
+
+Gemessen wurde nach `rm -f .firnc1 .firnc2 .firnc3` — kein Binary aus einem
+früheren Lauf war beteiligt.
 
 | Prüfung | Ergebnis |
 |---|---|
-| `bash ./test.sh` | siehe Abschlussbericht |
-| `bash tools/selbst_vergleich.sh` | siehe Abschlussbericht |
-| `bash tools/fixpunkt.sh` | siehe Abschlussbericht |
+| `bash ./test.sh` | **PASS 697/697**, Exit 0 (Basis 696/696; +1 = Schritt 18) |
+| ⤷ Schritt 18 `tools/pakete/run.sh` | **21 bestanden, 0 fehlgeschlagen** |
+| `bash tools/selbst_vergleich.sh` | **201 gleiches Verhalten · 0 abweichend · 0 fehlerhaft**, Exit 0 |
+| `bash tools/fixpunkt.sh` | **Stufe 2 == Stufe 3, zeichengleich**, 2.070.856 Oktette, 364.765 Zeilen Assembler; Korpus: `.firnc2` verhält sich wie `firnc0`, Exit 0 |
+
+Zum Vergleich der Ausgangsstand von Commit `a492d26`: `test.sh` 696/696,
+`selbst_vergleich.sh` 201/0/0, `fixpunkt.sh` zeichengleich bei 2.065.816
+Oktetten. Der Zuwachs von 5.040 Oktetten im selbst übersetzten Compiler ist
+`lib/firnc1/paket.fi` plus die Änderungen in `bin/firnc1.fi`.
