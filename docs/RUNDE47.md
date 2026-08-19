@@ -13,7 +13,7 @@ Ergebnis vorweg, alles selbst gemessen:
 | Durchsatz `aufbau.fi` (Zyklen in 5 s, Median) | 554 000 | **554 000** |
 | Unterbrechungen über 1 ms in Rechenzeit (150-s-Lauf mit Finalisierern) | — | **0** von 253 698 |
 | RSS über 140 s Dauerbetrieb mit 48 Mio. Finalisierern | — | **1372 KiB, driftfrei** |
-| `test.sh` | 696/696 | **725/725** |
+| `test.sh` | 696/696 | **727/727** |
 
 ---
 
@@ -367,6 +367,8 @@ finalisiert und freigegeben wurden.
 | `tests/832_arc_zyklus_leck.fi` | Zyklen lecken (2000 Blöcke, 0 Freigaben) — und mit einer schwachen Seite nicht |
 | `tests/833_arc_gc_wurzel.fi` | GC-Zusammenspiel **ohne** und **mit** `gc_wurzel_anmelden`, Abmelden, beide Buchhaltungen |
 | `tests/neg/arc_verworfen.fi` | `arc_neu` ist `#[must_consume]` |
+| `tests/neg/atomar_typ.fi` | falscher Zeigertyp beim atomaren Primitiv — Fehler mit Zeile/Spalte, kein stilles Rechnen auf 32 Bit |
+| `tests/neg/atomar_stellen.fi` | falsche Stellenzahl — die Meldung nennt die vereinbarte Form |
 | `tools/atomar/run.sh` (test.sh 8b) | `lock xadd` in 3 Baustufen und beiden Compilern, Gegenprobe, FIR oktettgleich |
 
 Jeder Positivtest läuft in **drei Baustufen** (release-fast, no-opt, dev-fast)
@@ -403,7 +405,7 @@ nicht lösen, nur verschieben; deshalb wurde es zurückgenommen.
 
 | Prüfung | Basis | Runde 47 |
 |---|---|---|
-| `bash ./test.sh` | 696/696 | **725/725** |
+| `bash ./test.sh` | 696/696 | **727/727** |
 | `bash tools/selbst_vergleich.sh` | 201 / 0 / 0 | **210 / 0 / 0** |
 | `bash tools/fixpunkt.sh` | zeichengleich | **zeichengleich** |
 
