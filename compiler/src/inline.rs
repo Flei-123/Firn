@@ -288,6 +288,11 @@ fn remap_op(op: &Op, mv: &dyn Fn(Val) -> Val) -> Op {
         Op::Call { name, args } => {
             Op::Call { name: name.clone(), args: args.iter().map(|a| mv(*a)).collect() }
         }
+        Op::CallIndirect { target, args } => Op::CallIndirect {
+            target: mv(*target),
+            args: args.iter().map(|a| mv(*a)).collect(),
+        },
+        Op::VtabAddr { tafel } => Op::VtabAddr { tafel: tafel.clone() },
         Op::Syscall { args } => Op::Syscall { args: args.iter().map(|a| mv(*a)).collect() },
         Op::CopyMem { dst, src, size } => {
             Op::CopyMem { dst: mv(*dst), src: mv(*src), size: *size }
