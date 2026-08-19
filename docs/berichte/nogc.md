@@ -1,15 +1,15 @@
-# Bericht Modul `nogc` — `#[no_gc]` scharf gemacht (SPEC §3.5.4)
+# Report on module `nogc` — `#[no_gc]` made sharp (SPEC §3.5.4)
 
-Stand: Runde „Haertetest 2". Alle Ausgaben unten sind **echte** Ausgaben des
-gebauten Compilers (`compiler/target/release/firnc`), nicht nacherzaehlt.
+State: round „hardening test 2". All outputs below are **real** outputs of
+the built compiler (`compiler/target/release/firnc`), not retold.
 
-## 1. Was jetzt gilt
+## 1. What applies now
 
-`#[no_gc]` ist im Attributregister (`compiler/src/attrs.rs`) auf
-`umgesetzt: true` gesetzt und wird von `compiler/src/nogc.rs` geprueft
-(angebunden ueber `// HOOK nogc` in `sema::Checker::run`, `sema.rs` wurde
-nicht angefasst). Geprueft wird nach der Typpruefung, weil Regel (iii) die
-Typtabelle braucht.
+`#[no_gc]` is set to `umgesetzt: true` in the attribute registry
+(`compiler/src/attrs.rs`) and is checked by `compiler/src/nogc.rs`
+(hooked in via `// HOOK nogc` in `sema::Checker::run`; `sema.rs` was
+not touched). The check runs after the type check, because rule (iii) needs
+the type table.
 
 ```
 $ ./compiler/target/release/firnc --list-attrs | head -5
@@ -20,61 +20,61 @@ must_consume    fn, struct   0     umgesetzt   Ergebnis darf nicht verworfen wer
 no_gc           fn           0     umgesetzt   kein Sammellauf in diesem Aufrufbaum (SPEC 3.5.4)
 ```
 
-Die uebrigen Attribute bleiben unveraendert abgelehnt — `constant_time`,
+The remaining attributes stay rejected as before — `constant_time`,
 `unwinds`, `packed`, `align`, `layout`, `no_move`, `abi_stable`, `frozen`,
-`hot` melden weiter „attribut '…' ist in Stufe 0 nicht umgesetzt"
-(`tests/neg/attr_not_implemented.fi` unveraendert gruen, zusaetzlich der
-Modultest `attrs::tests::nicht_umgesetzte_attribute_melden_weiter_einen_fehler`).
-Der Test `nur_must_consume_ist_umgesetzt` wurde mitgezogen und verlangt jetzt
-genau `["must_consume", "no_gc"]` — die Klammer, die verhindert, dass ein
-Attribut still „umgesetzt" wird.
+`hot` still report „attribut '…' ist in Stufe 0 nicht umgesetzt"
+(`tests/neg/attr_not_implemented.fi` unchanged green, plus the
+module test `attrs::tests::nicht_umgesetzte_attribute_melden_weiter_einen_fehler`).
+The test `nur_must_consume_ist_umgesetzt` was pulled along and now demands
+exactly `["must_consume", "no_gc"]` — the bracket that prevents an
+attribute from silently becoming „implemented".
 
-### Die drei Regeln
+### The three rules
 
-In einer `#[no_gc]`-Funktion sind verboten:
+In a `#[no_gc]` function the following are forbidden:
 
-| Regel | Was | Woher die Auskunft kommt |
+| Rule | What | Where the information comes from |
 |---|---|---|
-| (i) | GC-Allokation / Aufruf, der einen Sammellauf ausloesen kann | `crate::gc::ist_gc_alloc_aufruf(name)` |
-| (ii) | Aufruf einer Funktion **ohne** `#[no_gc]` | Attributtabelle des Gesamtprogramms |
-| (iii) | Schreiben eines `Gc[T]`/`GcWeak[T]`-Zeigers in ein Feld | `crate::gc::ist_gc_zeiger(typ)` |
+| (i) | GC allocation / a call that can trigger a collection | `crate::gc::ist_gc_alloc_aufruf(name)` |
+| (ii) | a call to a function **without** `#[no_gc]` | the attribute table of the whole program |
+| (iii) | writing a `Gc[T]`/`GcWeak[T]` pointer into a field | `crate::gc::ist_gc_zeiger(typ)` |
 
-Die beiden GC-Abfragen sind der **Vertrag von Modul `gckern`** und wurden
-nicht veraendert; `nogc.rs` fragt ausschliesslich diese zwei Funktionen und
-kennt den GC sonst nicht.
+The two GC queries are the **contract of module `gckern`** and were
+not changed; `nogc.rs` asks exclusively these two functions and
+otherwise does not know the GC.
 
-Die Pruefung ist transitiv: weil jede gerufene Funktion selbst `#[no_gc]`
-tragen muss, gilt die Zusage fuer den ganzen Aufrufbaum, ueber beliebig viele
-Ebenen und ueber Modulgrenzen hinweg.
+The check is transitive: because every called function has to carry
+`#[no_gc]` itself, the promise holds for the whole call tree, over
+arbitrarily many levels and across module boundaries.
 
-### Gehaertet gegenueber der Ausgangsfassung
+### Hardened against the starting version
 
-* **`match`-Faelle werden mitgeprueft.** Die Rumpfbloecke der Faelle liegen
-  nicht im AST, sondern in der Registrierung von `sema_match.rs`
-  (`__match#N`). Ohne den Abstieg dorthin waere jede Zustandsmaschine ein
-  blinder Fleck — also genau der Code, fuer den `#[no_gc]` gedacht ist.
-  Nachweis: `tests/neg/nogc_match_case.fi`.
-* **Modulqualifizierte Aufrufe.** `modul.funktion` heisst nach der Umschrift
-  durch `modules.rs` intern `modul__funktion`; die Meldung zeigt wieder die
-  Schreibweise aus dem Quelltext (`nogc_kalt.aufwaendig`).
-  Nachweis: `tests/neg/nogc_modulgrenze.fi`.
-* **Keine Fehlalarme.** Compilerintern erzeugte Aufrufnamen (`__match#N`,
-  `__try#`, `__catch#`, `Enum::Variante`) sind keine Funktionsaufrufe und
-  loesen nichts aus; ihre Argumente werden trotzdem durchsucht. Aufrufe eines
-  Namens, den es gar nicht gibt, meldet die Typpruefung selbst — hier gibt es
-  keinen zweiten, verwirrenden Fehler. Nachweis:
+* **`match` cases are checked as well.** The body blocks of the cases lie
+  not in the AST but in the registry of `sema_match.rs`
+  (`__match#N`). Without descending there, every state machine would be a
+  blind spot — that is, exactly the code `#[no_gc]` is meant for.
+  Proof: `tests/neg/nogc_match_case.fi`.
+* **Module-qualified calls.** After the rewriting by `modules.rs`,
+  `modul.funktion` is internally called `modul__funktion`; the message
+  shows the spelling from the source text again (`nogc_kalt.aufwaendig`).
+  Proof: `tests/neg/nogc_modulgrenze.fi`.
+* **No false alarms.** Call names generated internally by the compiler
+  (`__match#N`, `__try#`, `__catch#`, `Enum::Variante`) are not function
+  calls and trigger nothing; their arguments are searched nonetheless.
+  A call to a name that does not exist at all is reported by the type check
+  itself — here there is no second, confusing error. Proof:
   `nogc::tests::interne_namen_loesen_keinen_fehler_aus`.
-* **Regel (iii) genauer.** Gemeldet wird das Schreiben in ein Feld, in ein
-  Element hinter einem Feld und hinter einem Zeiger. Die Zuweisung an eine
-  oertliche Veraenderliche auf dem Stapel braucht keine Einfuegebarriere und
-  bleibt erlaubt.
-* Meldungen mit Zeile **und** Spalte, mit Quelltextzeile, `^^^`-Markierung und
-  Hinweis, was zu tun ist; Befunde deterministisch nach Datei/Zeile/Spalte
-  sortiert; doppelte Meldungen unterdrueckt.
-* Rekursionsschranke `MAX_TIEFE = 256` fuer geschachtelte `match`-Rumpfbloecke
-  (zweite Sicherung neben der Parser-Grenze von 200).
+* **Rule (iii) more precisely.** What is reported is writing into a field,
+  into an element behind a field and behind a pointer. Assignment to a
+  local variable on the stack needs no insertion barrier and
+  stays permitted.
+* Messages with a line **and** a column, with the source line, a `^^^`
+  marker and a hint about what to do; findings sorted deterministically by
+  file/line/column; duplicate messages suppressed.
+* A recursion limit `MAX_TIEFE = 256` for nested `match` body blocks
+  (a second safeguard next to the parser limit of 200).
 
-## 2. Negativtests — echte Compilerausgaben
+## 2. Negative tests — real compiler outputs
 
 ```
 $ ./compiler/target/release/firnc -o /dev/null tests/neg/nogc_call_without_attr.fi
@@ -110,28 +110,28 @@ error: 'heiss' ist #[no_gc], ruft aber 'nogc_kalt.aufwaendig' ohne #[no_gc]
     = hinweis: SPEC 3.5.4: die Zusage gilt transitiv fuer den ganzen Aufrufbaum — schreibe #[no_gc] vor 'nogc_kalt.aufwaendig' oder rufe es hier nicht auf
 ```
 
-In `tests/neg/nogc_transitiv.fi` steht der Bruch bewusst **eine Ebene tiefer**
-als der markierte Einstieg (`oben` → `mitte` → `unten`): gemeldet wird die
-Stelle, an der die Kette reisst.
+In `tests/neg/nogc_transitiv.fi` the break deliberately lies **one level
+deeper** than the marked entry (`oben` → `mitte` → `unten`): what is
+reported is the place at which the chain tears.
 
-## 3. Positivtests
+## 3. Positive tests
 
-| Datei | was sie zeigt | Ergebnis |
+| File | what it shows | Result |
 |---|---|---|
-| `tests/540_no_gc_aufruftree.fi` | markierter Aufrufbaum ueber vier Ebenen, Schleifen, Verzweigungen; eine unmarkierte Funktion darf eine markierte rufen | `expect_exit: 42` |
-| `tests/541_no_gc_zustandsmaschine.fi` | `#[no_gc]` + `match` mit vier Faellen, Aufrufe aus den Fallrumpfen heraus | `expect_exit: 99` |
-| `tests/542_no_gc_module.fi` (+ `tests/modules/nogc_hot.fi`) | `#[no_gc]` ueber die Modulgrenze | `expect_exit: 100` |
+| `tests/540_no_gc_aufruftree.fi` | a marked call tree over four levels, loops, branches; an unmarked function may call a marked one | `expect_exit: 42` |
+| `tests/541_no_gc_zustandsmaschine.fi` | `#[no_gc]` + `match` with four cases, calls out of the case bodies | `expect_exit: 99` |
+| `tests/542_no_gc_module.fi` (+ `tests/modules/nogc_hot.fi`) | `#[no_gc]` across the module boundary | `expect_exit: 100` |
 
-Alle drei laufen in `test.sh` in **drei** Baustufen (`opt`, `--no-opt`,
-`--opt-level=dev-fast`) mit demselben Ergebnis.
+All three run in `test.sh` in **three** build stages (`opt`, `--no-opt`,
+`--opt-level=dev-fast`) with the same result.
 
-## 4. Der HTML5-Tokenizer ist jetzt `#[no_gc]`
+## 4. The HTML5 tokenizer is now `#[no_gc]`
 
-Das ist die Zusage aus SPEC §3.5.4 an Tokenizer, Rasterizer und Krypto —
-und hier ist sie an echtem Code eingeloest. **Jede** Funktion in `lib/html/`
-traegt `#[no_gc]`, einschliesslich `main` des Treibers:
+That is the promise from SPEC §3.5.4 to tokenizers, rasterizers and crypto
+— and here it is redeemed on real code. **Every** function in `lib/html/`
+carries `#[no_gc]`, including the `main` of the driver:
 
-| Datei | markierte Funktionen |
+| File | marked functions |
 |---|---|
 | `lib/html/mem.fi` | 31 |
 | `lib/html/tokens.fi` | 58 |
@@ -139,15 +139,15 @@ traegt `#[no_gc]`, einschliesslich `main` des Treibers:
 | `lib/html/entities.fi` | 19 |
 | `lib/html/entities_data.fi` | 14 |
 | `lib/html/error_codes.fi` | 1 |
-| `lib/html/tokenize_main.fi` | 3 (mit `main`) |
+| `lib/html/tokenize_main.fi` | 3 (with `main`) |
 | `lib/html/entities_probe.fi` | 4 |
 | `lib/html/entities_ausfall.fi` | 12 |
-| **Summe** | **159** |
+| **Sum** | **159** |
 
-Damit steht statisch fest: im ganzen Tokenizer-Programm kann keine Sammlung
-stattfinden, es gibt keine Barriere und keine Pause.
+With that it is statically established: in the whole tokenizer program no
+collection can take place, there is no barrier and no pause.
 
-Die Quote ist **nicht** schlechter geworden (`bash tools/tokenizer/run.sh`):
+The rate has **not** become worse (`bash tools/tokenizer/run.sh`):
 
 ```
 == 3. Gleiche Bilanz in allen drei Baustufen ==
@@ -160,11 +160,11 @@ Die Quote ist **nicht** schlechter geworden (`bash tools/tokenizer/run.sh`):
 OK: 6810 / 6810 ohne, 6809 / 6810 mit Fehlercodes bestanden
 ```
 
-### Gegenprobe: greift die Markierung wirklich?
+### Counter-check: does the marking really take effect?
 
-Ein Attribut, das nichts tut, waere wertlos. Probe: `#[no_gc]` vor
-`mem.buf_at` **entfernt**, danach uebersetzen — der Compiler bricht sofort ab
-(danach wieder hergestellt):
+An attribute that does nothing would be worthless. Probe: `#[no_gc]`
+**removed** in front of `mem.buf_at`, then compile — the compiler aborts
+immediately (restored afterwards):
 
 ```
 $ ./compiler/target/release/firnc -o .test-work/tk lib/html/tokenize_main.fi
@@ -182,10 +182,10 @@ error: 'dekodiere' ist #[no_gc], ruft aber 'mem.buf_at' ohne #[no_gc]
     = hinweis: SPEC 3.5.4: die Zusage gilt transitiv fuer den ganzen Aufrufbaum — schreibe #[no_gc] vor 'mem.buf_at' oder rufe es hier nicht auf
 ```
 
-## 5. Modultests des Compilers
+## 5. Module tests of the compiler
 
-`cargo test --release --manifest-path compiler/Cargo.toml` (Abschnitt 2 von
-`test.sh`), Ausschnitt:
+`cargo test --release --manifest-path compiler/Cargo.toml` (section 2 of
+`test.sh`), excerpt:
 
 ```
 test nogc::tests::echte_regeln_sind_die_aus_gc_rs ... ok
@@ -204,33 +204,36 @@ test attrs::tests::nur_must_consume_ist_umgesetzt ... ok
 test result: ok. 134 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
-## 6. Ehrlich offen — was NICHT geht
+## 6. Honestly open — what does NOT work
 
-* **Regel (i) und (iii) koennen heute in keinem Firn-Programm ausgeloest
-  werden**, weil `compiler/src/gc.rs` (Modul `gckern`) in der Skelettfassung
-  fuer beide Abfragen `false` liefert und es damit weder `gc class` noch
-  `Gc[T]` gibt. Die Pruefung ist verdrahtet und **im Compiler nachgewiesen**
-  (die drei Modultests oben setzen fuer die beiden Abfragen Vorhersagen ein
-  und pruefen Meldung, Zeile und Spalte); der Compiler selbst benutzt immer
-  `Regeln::echt()`, also `gc.rs` (Test `echte_regeln_sind_die_aus_gc_rs`).
-  Sobald `gc.rs` antwortet, greifen (i) und (iii) ohne weitere Aenderung.
-  Die beiden fertigen Negativprogramme dafuer liegen in
-  `tests/nogc_waits_on_gc/` samt `LIESMICH.md`; sie gehoeren dann
-  unveraendert nach `tests/neg/`. Sie stehen bewusst **nicht** schon dort:
-  `test.sh` wuerde sie sonst gegen eine Meldung des Parsers pruefen und damit
-  etwas anderes belegen, als draufsteht.
-* Der Pruefer sieht das **ganze, flache Programm** nach Modulzusammenfuehrung
-  und Monomorphisierung. Getrennte Uebersetzungseinheiten mit
-  Schnittstellendateien gibt es nicht (Grenze des Modulsystems, `modules.rs`),
-  also auch keine `#[no_gc]`-Pruefung ueber Bibliotheksgrenzen ohne Quelltext.
-* Aufrufe ueber Funktionszeiger gibt es in Stufe 0 nicht (`ExprKind::Call`
-  traegt immer einen Namen). Sobald es sie gibt, braucht Regel (ii) eine
-  Erweiterung — heute ist dort kein Schlupfloch, aber auch keine Vorsorge.
-* `#[no_gc]` erzeugt **keinen** Code und aendert nichts am Lowering; es ist
-  reine statische Zusage. Der Sammler selbst, `gc.stats()`, die
-  Einfuegebarriere und inkrementelles Sammeln gehoeren zu `gckern`.
+* **Rules (i) and (iii) cannot be triggered in any Firn program today**,
+  because `compiler/src/gc.rs` (module `gckern`) returns `false` for both
+  queries in its skeleton version, and therefore there is neither
+  `gc class` nor `Gc[T]`. The check is wired up and **demonstrated in the
+  compiler** (the three module tests above substitute predictions for the
+  two queries and check the message, the line and the column); the compiler
+  itself always uses `Regeln::echt()`, i.e. `gc.rs` (test
+  `echte_regeln_sind_die_aus_gc_rs`).
+  As soon as `gc.rs` answers, (i) and (iii) take effect without a further
+  change. The two finished negative programs for that lie in
+  `tests/nogc_waits_on_gc/` including a `LIESMICH.md`; they then belong,
+  unchanged, in `tests/neg/`. They are deliberately **not** there yet:
+  `test.sh` would otherwise check them against a message of the parser and
+  would thereby establish something other than what it says on the label.
+* The checker sees the **whole, flat program** after module merging
+  and monomorphization. Separate compilation units with
+  interface files do not exist (a limit of the module system,
+  `modules.rs`), and therefore neither does a `#[no_gc]` check across
+  library boundaries without source text.
+* Calls through function pointers do not exist in stage 0
+  (`ExprKind::Call` always carries a name). As soon as they do, rule (ii)
+  needs an extension — today there is no loophole there, but no provision
+  either.
+* `#[no_gc]` produces **no** code and changes nothing in the lowering; it
+  is a purely static promise. The collector itself, `gc.stats()`, the
+  insertion barrier and incremental collection belong to `gckern`.
 
-## 7. Selbst gefahren
+## 7. Run by ourselves
 
 ```
 cargo build --release --manifest-path compiler/Cargo.toml   # 0 Warnungen
@@ -239,7 +242,7 @@ bash tools/tokenizer/run.sh                                 # 6810/6810, 6809/68
 bash test.sh                                                # Abschnitte 1-9
 ```
 
-Ergebnis des vollstaendigen Laufs zum Zeitpunkt dieser Fertigmeldung:
+Result of the complete run at the time of this completion notice:
 
 ```
 == 9. HTML5-Tokenizer gegen html5lib (tools/tokenizer/run.sh) ==
@@ -248,12 +251,12 @@ Ergebnis des vollstaendigen Laufs zum Zeitpunkt dieser Fertigmeldung:
 PASS 510/510
 ```
 
-(Die Gesamtzahl waechst mit den Tests der anderen Module dieser Runde; von
-`nogc` kommen 3 Positivprogramme x 3 Baustufen und 4 Negativtests dazu.)
+(The total grows with the tests of the other modules of this round; from
+`nogc` come 3 positive programs x 3 build stages and 4 negative tests.)
 
-Nebenbefund, damit er nicht untergeht: in `tests/neg/` lag eine leere Datei mit
-dem woertlichen Namen `*.fi` (0 Byte, offensichtlich aus einer verunglueckten
-Umleitung). Sie liess `test.sh` fehlschlagen und wurde geloescht.
+A side finding, so that it does not get lost: in `tests/neg/` there was an
+empty file with the literal name `*.fi` (0 bytes, evidently from a botched
+redirection). It made `test.sh` fail and was deleted.
 
-Kein `#[allow(...)]`, keine Sammelunterdrueckung, kein `todo!()`, keine
-externen Crates, keine feste Adresse.
+No `#[allow(...)]`, no blanket suppression, no `todo!()`, no
+external crates, no fixed address.
