@@ -1,54 +1,54 @@
-//! Inlining (Einbetten von Funktionsrumpfen) mit Groessenheuristik.
+//! Inlining (embedding function bodies) with a size heuristic.
 //!
-//! Arbeitsweise: Ein `Op::Call` auf eine im selben `fir::Module` vorhandene
-//! Funktion wird durch eine Kopie ihres Rumpfes ersetzt.
+//! How it works: one `Op::Call` to a function present within the same
+//! `fir::Module` gets replaced by a copy of its body.
 //!
-//!  * Der Aufrufblock wird an der Aufrufstelle **geteilt**; der Rumpf der
-//!    aufgerufenen Funktion kommt als eigene Blockgruppe dazwischen.
-//!  * FIR kennt keine Phi-Knoten. Der Rueckgabewert wird deshalb ueber eine
-//!    `alloca` im Eintrittsblock des Aufrufers gefuehrt: jedes `ret v` des
-//!    Rumpfes wird zu `store slot, v` + `br <Fortsetzung>`, und der urspruengliche
-//!    Ergebniswert wird am Anfang der Fortsetzung mit `load slot` definiert.
-//!    Bei genau einem `ret` loest `mem2reg` (einmal geschriebene alloca)
-//!    diesen Umweg direkt wieder auf.
-//!  * `alloca`s des Rumpfes wandern in den Eintrittsblock des Aufrufers
-//!    (FIR-Invariante: alle `alloca` stehen in `bb0`).
+//!  * The calling block gets **split** at the call site; the body of the
+//!    called function gets inserted between as a block group of its own.
+//!  * FIR knows no phi nodes. The return value therefore travels through one
+//!    `alloca` of the entry block of the caller: every `ret v` of the body
+//!    becomes `store slot, v` + `br <continuation>`, and the original result
+//!    value gets defined at the start of the continuation with `load slot`.
+//!    Given exactly one `ret`, `mem2reg` (alloca written once) resolves this
+//!    detour straight away again.
+//!  * `alloca`s of the body move to the entry block of the caller
+//!    (FIR invariant: all `alloca` stand at `bb0`).
 //!
-//! **Modulgrenzen:** Das Modulsystem uebersetzt alle `.fi`-Dateien in EIN
-//! `fir::Module` (getrennte Uebersetzung, gemeinsames Modul). Damit ist jeder
-//! Aufruf einer importierten Funktion fuer diesen Durchgang genauso sichtbar
-//! wie ein lokaler — Inlining wirkt ueber Modulgrenzen hinweg.
+//! **Module boundaries:** the module system compiles all `.fi` files into ONE
+//! `fir::Module` (separate compilation, shared module). Every call of one
+//! imported function is therefore just as visible to this pass as a local
+//! one — inlining works across module boundaries.
 //!
-//! Heuristik (bewusst konservativ, damit Uebersetzungszeit und Codegroesse
-//! nicht explodieren):
-//!  * Rumpf hoechstens `MAX_CALLEE_INSTS` Instruktionen,
-//!    Bloecke hoechstens `MAX_CALLEE_BLOCKS`.
-//!  * Aufrufer hoechstens `MAX_CALLER_INSTS` Instruktionen (danach Stopp).
-//!  * keine Rekursion: kann die aufgerufene Funktion den Aufrufer im
-//!    Aufrufgraphen wieder erreichen, wird nicht eingebettet.
-//!  * Funktionen mit `secret`-Werten oder `#[constant_time]` bleiben aussen vor
-//!    (SPEC §9: die Pruefung im Codegenerator ist funktionsweise).
-//!  * hoechstens `MAX_INLINES` Einbettungen je Modul.
+//! Heuristic (deliberately conservative, so that compile time and code size
+//! do not explode):
+//!  * body at most `MAX_CALLEE_INSTS` instructions,
+//!    blocks at most `MAX_CALLEE_BLOCKS`.
+//!  * caller at most `MAX_CALLER_INSTS` instructions (stop after that).
+//!  * no recursion: if the called function can reach the caller again
+//!    through the call graph, nothing gets embedded.
+//!  * functions with `secret` values or `#[constant_time]` stay outside
+//!    (SPEC §9: the check at the code generator works per function).
+//!  * at most `MAX_INLINES` embeddings per module.
 
 use crate::fir::{FTy, Func, Inst, Module, Op, Term, Val};
 use std::collections::{HashMap, HashSet};
 
 const MAX_CALLEE_INSTS: usize = 40;
 const MAX_CALLEE_BLOCKS: usize = 8;
-/// Obergrenze fuer den AUFRUFER. Sie schuetzt Uebersetzungszeit und
-/// Codegroesse — aber sie darf nicht die heisseste Funktion des Programms
-/// aussperren.
+/// Upper bound for the CALLER. It protects compile time and code size — but
+/// it must not lock out the hottest function of the program.
 ///
-/// GEMESSEN (14.08.2026): der HTML5-Tokenizer `tokenizer__tokenize` hat 4.139
-/// FIR-Instruktionen. Mit der alten Grenze von 4.000 bekam ausgerechnet die
-/// Funktion, die jedes Zeichen jeder Seite anfasst, KEINE einzige Einbettung —
-/// obwohl `sink_emit_char` mit 18 Instruktionen und einem Block weit unter
-/// jeder Callee-Grenze liegt. Eine grosse Funktion ist nicht automatisch kalt;
-/// bei einer Zustandsmaschine ist das Gegenteil der Fall.
+///
+/// MEASURED (14.08.2026): the HTML5 tokenizer `tokenizer__tokenize` has 4.139
+/// FIR instructions. With the old bound of 4.000 exactly the function that
+/// touches every character of every page got NOT a single embedding —
+/// although `sink_emit_char` with 18 instructions and one block sits far
+/// below every callee bound. A big function is not automatically cold; with
+/// a state machine the opposite holds.
 const MAX_CALLER_INSTS: usize = 24000;
 const MAX_INLINES: usize = 2000;
 
-/// Kann `from` ueber Aufrufe `to` erreichen?
+/// Can `from` reach `to` through calls?
 fn reaches(m: &Module, from: &str, to: &str) -> bool {
     let mut seen: HashSet<&str> = HashSet::new();
     let mut stack = vec![from];
@@ -72,17 +72,17 @@ fn reaches(m: &Module, from: &str, to: &str) -> bool {
     false
 }
 
-/// Kann `name` sich selbst ueber mindestens einen Aufruf wieder erreichen
-/// (direkte oder indirekte Rekursion)?
+/// Can a function reach itself again through at least one call (direct or
+/// indirect recursion)?
 ///
-/// Solche Rümpfe werden NICHT eingebettet. Inlining entrollt eine
-/// Rekursionsstufe und verlagert ihre Rahmen in den Aufrufer — Programmcode,
-/// dessen Wirkung auf der Stapeltiefe beruht (das Stapel-Scrubbing des
-/// konservativen GC, `lib/gc`: `__gc_scrub_tief`), verliert dadurch seine
-/// Wirkung. GEMESSEN in Runde 37: mit erhoehten Grenzen (60/10) wurde
-/// `__gc_scrub_tief` (29 Insts, 9 Bloecke, rekursiv) in `main` eingebettet —
-/// `tests/520_gc_weak.fi` fiel mit Exit 6 aus, weil Phantom-Zeiger im
-/// ungescrubbten Stapel den Sammler naehrten.
+/// Such bodies get NOT embedded. Inlining unrolls one recursion level and
+/// moves its frames into the caller — program code whose effect rests on the
+/// stack depth (the stack scrubbing of the conservative GC, `lib/gc`:
+/// `__gc_scrub_deep`) loses its effect that way. MEASURED at round 37: with
+/// raised bounds (60/10) `__gc_scrub_deep` (29 insts, 9 blocks, recursive)
+/// got embedded into `main` — `tests/520_gc_weak.fi` failed with exit 6,
+/// because phantom pointers within the unscrubbed stack fed the collector.
+///
 fn reaches_itself_self(m: &Module, name: &str) -> bool {
     if let Some(f) = m.funcs.iter().find(|f| f.name == name) {
         for b in &f.blocks {
@@ -99,15 +99,15 @@ fn reaches_itself_self(m: &Module, name: &str) -> bool {
 }
 
 fn inlinable(callee: &Func) -> bool {
-    // Schleifenfreie Ruempfe OHNE Rueckgabewert (Wirkung ueber
-    // Zeiger-Argumente, z. B. die Sink-Mutatoren des Tokenizers) duerfen mehr
-    // Bloecke haben: ihr Kontrollfluss ist ein DAG, und weil `dst` leer ist,
-    // entsteht im Aufrufer nicht einmal die Ergebnis-Alloca — der Rahmen des
-    // Aufrufers bleibt bis auf echte Rumpf-Allocas unveraendert. Das ist
-    // der Unterschied zu Wertruempfen: deren Ergebnis-Zelle wandert in den
-    // Eintrittsblock des Aufrufers und veraendert dessen Rahmenlayout —
-    // fatal fuer den stapel-scannenden konservativen GC
-    // (`tests/520_gc_weak.fi`, Runde 37: `__gc_strong_raw` in `anlegen`
+    // Loop free bodies WITHOUT a return value (effect through pointer
+    // arguments, say the sink mutators of the tokenizer) may hold more
+    // blocks: their control flow is a DAG, and because `dst` is empty, not
+    // even the result alloca comes about at the caller — the frame of the
+    // caller stays unchanged apart from real body allocas. That is the
+    // difference to value bodies: their result cell moves into the entry
+    // block of the caller and changes its frame layout — fatal for the
+    // stack scanning conservative GC (`tests/520_gc_weak.fi`, round 37:
+    // `__gc_strong_raw` embedded into `create` -> phantom pointers, exit 6).
     // eingebettet -> Phantom-Zeiger, Exit 6).
     !callee.constant_time
         && callee.secret.is_empty()
@@ -117,9 +117,9 @@ fn inlinable(callee: &Func) -> bool {
         && callee.blocks.iter().enumerate().all(|(i, b)| b.id as usize == i)
 }
 
-/// Sucht eine lohnende Aufrufstelle im Aufrufer `ci`.
-/// `selbst_rek`: je Funktion vorberechnet (aendert sich durch Einbettungen
-/// nicht — mutiert wird nur der Aufrufer).
+/// Looks for a worthwhile call site within the caller `ci`.
+/// `self_rec`: precomputed per function (does not change through
+/// embeddings — mutated gets the caller only).
 fn find_site(m: &Module, ci: usize, self_rec: &[bool]) -> Option<(usize, usize, usize)> {
     let caller = &m.funcs[ci];
     if caller.constant_time || !caller.secret.is_empty() {
@@ -148,11 +148,11 @@ fn find_site(m: &Module, ci: usize, self_rec: &[bool]) -> Option<(usize, usize, 
                 if inst.dst.is_some() && callee.ret == FTy::Void {
                     continue;
                 }
-                // Rekursion (auch indirekt) wird nicht eingebettet.
+                // Recursion (indirect one too) does not get embedded.
                 if reaches(m, &callee.name, &caller.name) {
                     continue;
                 }
-                // Selbst-erreichbare Rümpfe ebenfalls nicht (siehe oben).
+                // Self reachable bodies neither (see above).
                 if self_rec[gi] {
                     continue;
                 }
@@ -163,7 +163,7 @@ fn find_site(m: &Module, ci: usize, self_rec: &[bool]) -> Option<(usize, usize, 
     None
 }
 
-/// Bettet genau eine Aufrufstelle ein.
+/// Embeds exactly one call site.
 fn inline_one(m: &mut Module, ci: usize, bi: usize, mut ii: usize, gi: usize) {
     let callee = m.funcs[gi].clone();
     let (args, dst, ret_ty) = match &m.funcs[ci].blocks[bi].insts[ii] {
@@ -171,9 +171,9 @@ fn inline_one(m: &mut Module, ci: usize, bi: usize, mut ii: usize, gi: usize) {
         _ => return,
     };
 
-    // 1. Ergebnis-Slot und Rumpf-Allocas im Eintrittsblock anlegen.
-    //    `Func::alloca` fuegt vorne ein — das verschiebt die Aufrufstelle,
-    //    wenn sie selbst in bb0 liegt.
+    // 1. Create the result slot and the body allocas at the entry block.
+    //    `Func::alloca` inserts at the front — that shifts the call site
+    //    when it sits within bb0 itself.
     let mut shift = 0usize;
     let result_slot = if dst.is_some() {
         shift += 1;
@@ -198,7 +198,7 @@ fn inline_one(m: &mut Module, ci: usize, bi: usize, mut ii: usize, gi: usize) {
         ii += shift;
     }
 
-    // 2. Restliche Werte des Rumpfes auf neue Ids abbilden.
+    // 2. Map the remaining values of the body onto new ids.
     let f = &mut m.funcs[ci];
     for b in &callee.blocks {
         for i in &b.insts {
@@ -214,7 +214,7 @@ fn inline_one(m: &mut Module, ci: usize, bi: usize, mut ii: usize, gi: usize) {
     }
     let mv = |v: Val| -> Val { valmap.get(&v).copied().unwrap_or(v) };
 
-    // 3. Bloecke des Rumpfes + Fortsetzungsblock anlegen.
+    // 3. Create the blocks of the body + the continuation block.
     let mut blockmap: HashMap<u32, u32> = HashMap::new();
     for b in &callee.blocks {
         let nb = f.add_block();
@@ -222,26 +222,26 @@ fn inline_one(m: &mut Module, ci: usize, bi: usize, mut ii: usize, gi: usize) {
     }
     let cont = f.add_block();
 
-    // 4. Aufrufblock teilen.
+    // 4. Split the calling block.
     let tail: Vec<Inst> = f.blocks[bi].insts.split_off(ii + 1);
-    f.blocks[bi].insts.pop(); // der `call` selbst faellt weg
+    f.blocks[bi].insts.pop(); // the `call` itself falls away
     let old_term = std::mem::replace(&mut f.blocks[bi].term, Term::Br(blockmap[&callee.entry()]));
     f.blocks[cont as usize].insts = tail;
     f.blocks[cont as usize].term = old_term;
 
-    // 5. Ergebniswert am Anfang der Fortsetzung definieren.
+    // 5. Define the result value at the start of the continuation.
     if let (Some(d), Some(slot)) = (dst, result_slot) {
         f.blocks[cont as usize]
             .insts
             .insert(0, Inst { dst: Some(d), ty: ret_ty, op: Op::Load { addr: slot } });
     }
 
-    // 6. Rumpf kopieren.
+    // 6. Copy the body.
     for b in &callee.blocks {
         let nb = blockmap[&b.id] as usize;
         for i in &b.insts {
             if matches!(i.op, Op::Alloca { .. }) {
-                continue; // steht bereits im Eintrittsblock
+                continue; // stands at the entry block already
             }
             let op = remap_op(&i.op, &mv);
             f.blocks[nb].insts.push(Inst { dst: i.dst.map(&mv), ty: i.ty, op });
@@ -321,13 +321,13 @@ fn remap_op(op: &Op, mv: &dyn Fn(Val) -> Val) -> Op {
     }
 }
 
-/// Bettet ein, solange die Heuristik es erlaubt. Liefert die Anzahl der
-/// eingebetteten Aufrufe.
+/// Embeds as long as the heuristic allows. Yields the count of embedded
+/// calls.
 pub fn inline_module(m: &mut Module) -> usize {
     let mut n = 0usize;
     let dbg = std::env::var("FIRNC_INLINE_DEBUG").is_ok();
-    // Einmalig bestimmen: haengt nur am Rumpf der Aufgerufenen, der sich
-    // durch Einbettungen nie aendert (mutiert wird nur der Aufrufer).
+    // Determined once: hangs off the body of the callee only, which never
+    // changes through embeddings (mutated gets the caller only).
     let self_rec: Vec<bool> = m
         .funcs
         .iter()
@@ -384,7 +384,7 @@ mod tests {
             .any(|b| b.insts.iter().any(|i| matches!(i.op, Op::Call { .. }))));
         crate::opt::optimize(&mut m);
         let main = m.funcs.iter().find(|f| f.name == "main").expect("main");
-        // 2 + 40 wird nach dem Einbetten zu einer einzigen Konstante
+        // 2 + 40 becomes a single constant after embedding
         assert_eq!(main.inst_count(), 1);
         assert!(main.blocks[0].insts.iter().any(|i| matches!(i.op, Op::Const(42))));
     }
