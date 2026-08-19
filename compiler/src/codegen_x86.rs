@@ -565,6 +565,15 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
             e.line("cld");
             e.line("rep stosb");
         }
+        Op::AtomicAdd { addr, val } => {
+            // Runde 47 (atomar.rs): `lock xadd` — eine Instruktion, Ergebnis
+            // ist der ALTE Wert.
+            let d = i.dst.ok_or("interner Fehler: atomadd ohne Ziel")?;
+            load_full(e, fr, "rcx", *addr);
+            load_full(e, fr, "rax", *val);
+            e.line("lock xadd qword ptr [rcx], rax");
+            store_dst(e, fr, d, "rax");
+        }
         Op::CopyMem { dst, src, size } => {
             load_full(e, fr, "rdi", *dst);
             load_full(e, fr, "rsi", *src);

@@ -19,6 +19,9 @@
 #      (tools/schichten/run.sh, Vorbedingung fuer SoA).
 #   8. Symbol-Namensschema: reservierter Praefix, Platz fuer die
 #      ABI-Version, Module kollisionsfrei (tools/symbole/run.sh).
+#   8b. Das atomare Primitiv `__atomar_addieren` erzeugt wirklich ein
+#      `lock xadd` — in drei Baustufen und in beiden Compilern, mit
+#      Gegenprobe (tools/atomar/run.sh, Runde 47).
 #   9. HTML5-Tokenizer (lib/html/, in Firn) gegen die offizielle
 #      html5lib-Testsuite: exakte Quote aus 6.810 Faellen, Schranke in
 #      tools/tokenizer/mindestquote.txt (tools/tokenizer/run.sh).
@@ -210,6 +213,16 @@ if [ "$SYRC" -eq 0 ]; then
 else
     bad "tools/symbole/run.sh schlug fehl (siehe .test-work/symbole.log)"
     tail -20 "$WORK/symbole.log" | sed 's/^/   /'
+fi
+
+echo "== 8b. Atomares Primitiv: 'lock xadd' (tools/atomar/run.sh, RUNDE 47) =="
+bash tools/atomar/run.sh > "$WORK/atomar.log" 2>&1 && ATRC=0 || ATRC=$?
+if [ "$ATRC" -eq 0 ]; then
+    ok
+    tail -1 "$WORK/atomar.log" | sed 's/^/   /'
+else
+    bad "tools/atomar/run.sh schlug fehl (siehe .test-work/atomar.log)"
+    tail -20 "$WORK/atomar.log" | sed 's/^/   /'
 fi
 
 echo "== 9. HTML5-Tokenizer gegen html5lib (tools/tokenizer/run.sh) =="

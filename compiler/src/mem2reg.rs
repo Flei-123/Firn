@@ -147,6 +147,10 @@ pub(crate) fn replace_uses(f: &mut Func, map: &HashMap<Val, Val>) -> usize {
                     rep(dst, &mut n);
                     rep(src, &mut n);
                 }
+                Op::AtomicAdd { addr, val } => {
+                    rep(addr, &mut n);
+                    rep(val, &mut n);
+                }
                 Op::Select { .. } | Op::Barrier { .. } | Op::SecureZero { .. } => {}
             }
         }
@@ -326,6 +330,7 @@ fn clobbers_memory(op: &Op) -> bool {
             | Op::Call { .. }
             | Op::Syscall { .. }
             | Op::CopyMem { .. }
+            | Op::AtomicAdd { .. }
             | Op::SecureZero { .. }
     )
 }

@@ -2123,6 +2123,17 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
             e.line("cld");
             e.line("rep stosb");
         }
+        Op::AtomicAdd { addr, val } => {
+            // Runde 47: EINE Instruktion, mit `lock`-Praefix. rax und rcx sind
+            // nie Heimat eines Wertes (weder CALLEE_SAVED noch TEMP_REGS noch
+            // ARG_SPARE/DIV_SPARE), deshalb braucht diese Instruktion keinen
+            // Eintrag in memop_pos/divsel_pos.
+            let d = i.dst.ok_or("interner Fehler: atomadd ohne Ziel")?;
+            ra.load_full(e, "rcx", *addr);
+            ra.load_full(e, "rax", *val);
+            e.line("lock xadd qword ptr [rcx], rax");
+            ra.store_dst(e, d, "rax");
+        }
         Op::CopyMem { dst, src, size } => {
             ra.load_full(e, "rdi", *dst);
             ra.load_full(e, "rsi", *src);

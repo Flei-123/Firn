@@ -615,6 +615,10 @@ impl<'a> Lower<'a> {
         span: Span,
     ) -> Option<Option<Val>> {
         // HOOK constant-time: select/barrier/secure_zero (ct.rs, SPEC §9.2/§9.3)
+        // HOOK atomar: das atomare Primitiv (atomar.rs, Runde 47)
+        if crate::atomar::is_atomar_call(name) && !self.info.fns.contains_key(name) {
+            return crate::atomar::lower_atomar_call(self, name, args, span);
+        }
         if crate::ct::is_ct_call(name) && !self.info.fns.contains_key(name) {
             return crate::ct::lower_ct_call(self, name, args, span);
         }
