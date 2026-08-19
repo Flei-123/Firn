@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
-# tools/thread/stress.sh — Dauerlauf mit mehreren Faeden und laufendem Sammler.
+# tools/thread/stress.sh -- soak run with several threads and a running collector.
 #
 # What is measured is the REAL memory consumption of the process (RSS from
-# /proc/self/statm), nicht die Selbstauskunft der Laufzeit. Bewertet wird:
+# /proc/self/statm), not the self-report of the runtime. What is judged:
 #
-#   * kein Absturz und kein Verklemmen ueber die ganze Laufzeit
-#   * Fehlerwort 0 — KEIN Faden hat eine Kette vorgefunden, aus der der
-#     Sammler ein Glied entfernt hatte
-#   * Mutexzaehler und Atomzaehler stimmen EXAKT mit der Rundenzahl
-#   * der Zaehler OHNE Sperre hat verloren (sonst liefen die Faeden nicht
-#     wirklich gleichzeitig und der Lauf belegt nichts)
-#   * RSS driftet nicht: die letzte Stichprobe darf die kleinste nicht um
-#     mehr als STRESS_DRIFT_KIB uebersteigen
+#   * no crash and no deadlock over the whole run time
+#   * error word 0 -- NO thread found a chain from which the
+#     collector had removed a link
+#   * the mutex counter and the atomic counter match the number of rounds EXACTLY
+#   * the counter WITHOUT a lock has lost (otherwise the threads did not
+#     really run at the same time and the run proves nothing)
+#   * the RSS does not drift: the last sample must not exceed the smallest one
+#     by more than STRESS_DRIFT_KIB
 #
 # Environment:
-#   STRESS_SEK    Laufzeit in Sekunden (Standard 130)
-#   STRESS_THREADS Zahl der Faeden (Standard 4)
-#   STRESS_LOCAL  1 = Freilisten je Faden (Variante B), 0 = GC-Sperre (A)
-#   STRESS_DRIFT_KIB  erlaubter RSS-Zuwachs (Standard 1024)
+#   STRESS_SEK     run time in seconds (default 130)
+#   STRESS_THREADS number of threads (default 4)
+#   STRESS_LOCAL   1 = free lists per thread (variant B), 0 = GC lock (A)
+#   STRESS_DRIFT_KIB  allowed RSS increase (default 1024)
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 

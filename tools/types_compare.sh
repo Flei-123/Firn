@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# tools/types_compare.sh — Speicherlayout und Aufrufkonvention:
-# `lib/firnc1/types.fi` gegen `compiler/src/types.rs` + `abi.rs`.
+# tools/types_compare.sh -- memory layout and calling convention:
+# `lib/firnc1/types.fi` against `compiler/src/types.rs` + `abi.rs`.
 #
-# WARUM DAS EIGENS GEPRUEFT WIRD: Layout und ABI sind die Stellen, an denen
-# ein Compiler STILL falsch wird. Ein Feldversatz daneben, ein Aggregat in
-# Registern statt im Speicher — das Programm laeuft, nur eben falsch. Zwei
-# unabhaengige Umsetzungen gegeneinander zu stellen findet hier mehr als jeder
-# ausgedachte Testfall.
+# WHY THIS IS CHECKED SEPARATELY: layout and ABI are the places where
+# a compiler goes wrong SILENTLY. One field offset off, one aggregate in
+# registers instead of in memory -- the program runs, only wrongly. Putting two
+# independent implementations against each other finds more here than any
+# invented test case.
 #
-# Verglichen wird `firnc0 --emit=layout` gegen `bin/layoutdump.fi`:
-# je Struct Groesse, Ausrichtung und jeder Feldversatz, je Funktion die
-# System-V-Klasse jedes Arguments und des Rueckgabewertes samt `sret`.
+# What is compared is `firnc0 --emit=layout` against `bin/layoutdump.fi`:
+# per struct the size, the alignment and every field offset, per function the
+# System V class of every argument and of the return value including `sret`.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 # A temp directory of its own per run: two simultaneous runs (e.g. the main

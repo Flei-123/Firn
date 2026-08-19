@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
-# tools/tokenizer/gen_entities.py — erzeugt lib/html/entities_data.fi.
+# tools/tokenizer/gen_entities.py -- produces lib/html/entities_data.fi.
 #
-# QUELLE: `html.entities.html5` aus der Python-Standardbibliothek. Das ist die
-# offizielle WHATWG-Namensliste (2.231 Eintraege, mit und ohne Semikolon).
-# Die Tabelle wird NICHT aus den Testdaten abgeleitet — der Erzeuger liegt im
-# Baum und ist jederzeit wiederholbar:
+# SOURCE: `html.entities.html5` from the Python standard library. That is the
+# official WHATWG list of names (2,231 entries, with and without a semicolon).
+# The table is NOT derived from the test data -- the generator lies in the
+# tree and can be repeated at any time:
 #
 #     python3 tools/tokenizer/gen_entities.py
 #
-# Warum ueberhaupt erzeugter Firn-Quelltext: Stufe 0 kennt weder
-# Zeichenkettenliterale noch globale Felder (`const` nur skalar). Die Tabelle
-# wird deshalb als Folge von u64-Woertern in einen Speicherbereich geschrieben
-# (lib/html/entities.fi haelt ihn ueber mmap MAP_FIXED_NOREPLACE, einmal je
-# Prozess). Layout siehe unten und lib/html/entities.fi.
+# Why generated Firn source text at all: stage 0 has neither
+# string literals nor global fields (`const` only scalar). The table
+# is therefore written as a sequence of u64 words into a memory area
+# (lib/html/entities.fi holds it over mmap MAP_FIXED_NOREPLACE, once per
+# process). For the layout see below and lib/html/entities.fi.
 #
-# Speicherbild (Byte-Offsets ab Basis, alles 8-Byte-ausgerichtet):
-#   0            u64  Kennung (Magic) — wird ZULETZT gesetzt
-#   OFF_NAMEN    u8[] alle Namen hintereinander, ohne Trenner, sortiert
-#   OFF_LEN      u8[] Laenge je Eintrag (1..32)
-#   OFF_WERT     u64[] Ersatzzeichen: cp1 | cp2 << 32   (cp2 == 0: nur eines)
-#   OFF_POS      u32[] Anfang je Name im Namensfeld — zur Laufzeit berechnet
+# Memory picture (byte offsets from the base, everything 8-byte aligned):
+#   0            u64  magic -- set LAST
+#   OFF_NAMEN    u8[] all names one after another, without a separator, sorted
+#   OFF_LEN      u8[] length per entry (1..32)
+#   OFF_WERT     u64[] replacement characters: cp1 | cp2 << 32   (cp2 == 0: only one)
+#   OFF_POS      u32[] start of each name in the name field -- computed at run time
 import html.entities
 import os
 import sys
@@ -62,14 +62,14 @@ def main() -> int:
     off_pos = off_wert + 8 * anzahl
     bytes_gesamt = off_pos + 4 * anzahl
 
-    # Rohbild bauen (nur der erzeugte Teil; OFF_POS entsteht zur Laufzeit).
+    # Build the raw picture (only the generated part; OFF_POS comes into being at run time).
     bild = bytearray(off_pos)
     bild[off_namen:off_namen + len(blob)] = blob
     bild[off_len:off_len + len(lens)] = lens
     for i, v in enumerate(werte):
         bild[off_wert + 8 * i:off_wert + 8 * i + 8] = v.to_bytes(8, "little")
 
-    # Woerter ab Index 2 (die ersten 16 Byte sind Kennung + Reserve).
+    # Words from index 2 on (the first 16 bytes are magic + reserve).
     worte = []
     for i in range(2, len(bild) // 8):
         w = int.from_bytes(bild[8 * i:8 * i + 8], "little")

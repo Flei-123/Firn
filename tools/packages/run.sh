@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
-# tools/packages/run.sh — das Paket- und Projektsystem (Runde 48).
+# tools/packages/run.sh -- the package and project system (round 48).
 #
-# Geprueft wird DREIERLEI, an echten Projekten auf der Platte:
+# THREE things are checked, on real projects on disk:
 #
-#   1. Der Bau-Treiber `--package` uebersetzt ein Projekt anhand seines
-#      Manifests, das Ergebnis LAEUFT und gibt das Erwartete aus.
-#   2. Jede Fehlerlage (privates Modul, fremdes Paket, Zyklus, kaputtes
-#      Manifest, Namenskonflikt) wird erkannt — Exit-Code 2 und eine
-#      Meldung, die den Grund nennt.
-#   3. `firnc0` (Rust) und `firnc1` (Firn) verhalten sich GLEICH: jeder Fall
-#      laeuft durch BEIDE Uebersetzer, und ihre Meldungen werden Oktett fuer
-#      Oktett verglichen. Ein Paketsystem, das nur in einem der beiden
-#      Uebersetzer stimmt, waere keins.
+#   1. The build driver `--package` compiles a project along its
+#      manifest, the result RUNS and prints what is expected.
+#   2. Every error situation (private module, foreign package, cycle, broken
+#      manifest, name conflict) is recognised -- exit code 2 and a
+#      message that names the reason.
+#   3. `firnc0` (Rust) and `firnc1` (Firn) behave THE SAME: every case
+#      runs through BOTH compilers, and their messages are compared octet for
+#      octet. A package system that is only right in one of the two
+#      compilers would be none.
 #
-# Eigenes `mktemp -d` je Lauf: auf dieser Maschine laufen mehrere Runden
-# gleichzeitig, feste /tmp-Namen wuerden sich gegenseitig ueberschreiben.
+# An own `mktemp -d` per run: several rounds run on this machine
+# at the same time, fixed /tmp names would overwrite each other.
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 ROOT=$(pwd)
@@ -28,9 +28,9 @@ if [ ! -x "$FIRNC" ]; then
     exit 1
 fi
 
-# LEKTION aus den Runden 35/45/46: nie ein Binary wiederverwenden, nur weil
-# es existiert. Ist `firnc0` oder eine Quelle juenger, wird `.firnc1` neu
-# gebaut — sonst misst dieser Lauf einen Compiler, den es nicht mehr gibt.
+# LESSON from rounds 35/45/46: never reuse a binary just because
+# it exists. If `firnc0` or a source is younger, `.firnc1` is rebuilt
+# -- otherwise this run measures a compiler that no longer exists.
 neu_bauen=0
 [ -x "$FC1" ] || neu_bauen=1
 if [ -x "$FC1" ]; then
@@ -52,7 +52,7 @@ fall() { printf "  %-58s" "$1"; }
 gut()  { OK=$((OK + 1)); echo "ok"; }
 weh()  { BAD=$((BAD + 1)); echo "FEHLER"; for z in "$@"; do printf '      %s\n' "$z"; done; }
 
-# Beide Uebersetzer auf denselben Fall loslassen.
+# Let both compilers loose on the same case.
 beide() {
     local kennung="$1"; shift
     "$FIRNC" "$@" > "$WORK/$kennung.0.out" 2> "$WORK/$kennung.0.err"
@@ -61,8 +61,8 @@ beide() {
     echo $? > "$WORK/$kennung.1.rc"
 }
 
-# Erwartung an einen FEHLERFALL: beide melden Exit 2, dieselbe Meldung,
-# und der Text enthaelt das gesuchte Stichwort.
+# Expectation for an ERROR CASE: both report exit 2, the same message,
+# and the text contains the keyword looked for.
 erwarte_fehler() {
     local kennung="$1" stichwort="$2"
     local rc0 rc1
@@ -89,7 +89,7 @@ erwarte_fehler() {
     gut
 }
 
-# Eine eigene Kopie des Beispielprojekts je Fall.
+# A copy of its own of the example project per case.
 kopie() {
     rm -rf "$WORK/$1"
     cp -r demos/packages "$WORK/$1"
@@ -98,7 +98,7 @@ kopie() {
 
 echo "== Paket- und Projektsystem (Runde 48) =="
 
-# --- 1/2: das Beispielprojekt im Repo, mit BEIDEN Uebersetzern ------------
+# --- 1/2: the example project in the repo, with BOTH compilers ------------
 
 for c in 0 1; do
     if [ "$c" = 0 ]; then CC="$FIRNC"; NAME="firnc0"; else CC="$FC1"; NAME="firnc1"; fi
@@ -118,7 +118,7 @@ for c in 0 1; do
     fi
 done
 
-# --- 3: `--package` ohne `-o` legt das Binary unter dem Paketnamen ab -------
+# --- 3: `--package` without `-o` puts the binary under the package name -----
 
 fall "--package ohne -o benennt nach dem Manifest"
 P=$(kopie f_name_aus)
@@ -130,7 +130,7 @@ else
     weh "kein lauffaehiges '$P/app/app'"
 fi
 
-# --- 4: --package-info, zeichengleich in beiden Uebersetzern ---------------
+# --- 4: --package-info, character-identical in both compilers --------------
 
 fall "--package-info ist in beiden Uebersetzern gleich"
 beide info --package-info demos/packages/app
@@ -144,7 +144,7 @@ else
     gut
 fi
 
-# --- 5: privates Modul einer Abhaengigkeit -------------------------------
+# --- 5: private module of a dependency -----------------------------------
 
 fall "privates Modul einer Abhaengigkeit wird abgelehnt"
 P=$(kopie f_privat)
@@ -152,11 +152,11 @@ sed -i 's/^import geo.dot$/import geo.inner/' "$P/app/src/main.fi"
 beide privat --package "$P/app" -o "$WORK/f_privat.bin"
 erwarte_fehler privat "is not public in package 'geo'"
 
-# --- 6: ein Paket, das nicht als Abhaengigkeit eingetragen ist -----------
+# --- 6: a package that is not entered as a dependency --------------------
 #
-# `secret` liegt IM Quellbaum von `app` und ist ein eigenes Paket; `app`
-# traegt es nicht ein. Der Import findet die Datei ueber den Weg (1), die
-# Sichtbarkeitspruefung muss trotzdem greifen.
+# `secret` lies IN the source tree of `app` and is a package of its own; `app`
+# does not enter it. The import finds the file over way (1), the
+# visibility check still has to bite.
 
 fall "Paket ohne 'needs' wird abgelehnt"
 mkdir -p "$WORK/f_fremd/app/src/secret" "$WORK/f_fremd/h"
@@ -194,7 +194,7 @@ EOF
 beide fremd --package "$WORK/f_fremd/app" -o "$WORK/f_fremd.bin"
 erwarte_fehler fremd "package 'secret' is not a dependency of package 'app'"
 
-# --- 7: Paketzyklus ------------------------------------------------------
+# --- 7: package cycle ----------------------------------------------------
 
 fall "Paketzyklus wird gemeldet"
 P=$(kopie f_zyklus)
@@ -202,7 +202,7 @@ printf 'needs app ../app\n' >> "$P/geo/firn.package"
 beide zyklus --package "$P/app" -o "$WORK/f_zyklus.bin"
 erwarte_fehler zyklus "package cycle: app -> geo -> app"
 
-# --- 8: Abhaengigkeit ohne Manifest --------------------------------------
+# --- 8: dependency without a manifest ------------------------------------
 
 fall "Abhaengigkeit ohne Manifest wird gemeldet"
 P=$(kopie f_kein_manifest)
@@ -210,7 +210,7 @@ rm -f "$P/geo/firn.package"
 beide keinman --package "$P/app" -o "$WORK/f_km.bin"
 erwarte_fehler keinman "dependency 'geo' has no manifest"
 
-# --- 9: Abhaengigkeit zeigt auf ein anders benanntes Paket ---------------
+# --- 9: a dependency points at a differently named package ---------------
 
 fall "falscher Paketname in der Abhaengigkeit"
 P=$(kopie f_name)
@@ -218,7 +218,7 @@ sed -i 's/^package  *geo$/package  geometry/' "$P/geo/firn.package"
 beide falschname --package "$P/app" -o "$WORK/f_name.bin"
 erwarte_fehler falschname "dependency 'geo' points to package 'geometry'"
 
-# --- 10: kaputte Versionsangabe ------------------------------------------
+# --- 10: broken version entry --------------------------------------------
 
 fall "ungueltige Version im Manifest"
 P=$(kopie f_version)
@@ -226,7 +226,7 @@ sed -i 's/^version  *0.2.0$/version  0.2/' "$P/geo/firn.package"
 beide version --package "$P/app" -o "$WORK/f_ver.bin"
 erwarte_fehler version "invalid version '0.2' (expected number.number.number)"
 
-# --- 11: unbekannter Schluessel ------------------------------------------
+# --- 11: unknown key -----------------------------------------------------
 
 fall "unbekannter Schluessel im Manifest"
 P=$(kopie f_schluessel)
@@ -234,7 +234,7 @@ sed -i 's/^public  *geo dot$/publi   geo dot/' "$P/geo/firn.package"
 beide schluessel --package "$P/app" -o "$WORK/f_sch.bin"
 erwarte_fehler schluessel "unknown key 'publi'"
 
-# --- 12: fehlende Pflichtzeile -------------------------------------------
+# --- 12: missing mandatory line ------------------------------------------
 
 fall "Manifest ohne 'package'-Zeile"
 P=$(kopie f_ohne_paket)
@@ -242,7 +242,7 @@ sed -i 's/^package  *app$//' "$P/app/firn.package"
 beide ohnepaket --package "$P/app" -o "$WORK/f_op.bin"
 erwarte_fehler ohnepaket "the manifest needs a line 'package <name>'"
 
-# --- 13: Namenskonflikt zweier Module ------------------------------------
+# --- 13: name conflict of two modules ------------------------------------
 
 fall "zwei Module gleichen Namens werden gemeldet"
 P=$(kopie f_konflikt)
@@ -263,20 +263,20 @@ EOF
 beide konflikt --package "$P/app" -o "$WORK/f_konf.bin"
 erwarte_fehler konflikt "name conflict: module 'help' comes from two files"
 
-# --- 14: `--package` auf eine Bibliothek ohne Einstiegspunkt ---------------
+# --- 14: `--package` on a library without an entry point -------------------
 
 fall "Bibliothek ohne 'start' laesst sich nicht bauen"
 beide biblio --package demos/packages/geo -o "$WORK/f_bib.bin"
 erwarte_fehler biblio "the manifest has no entry point"
 
-# --- 15: `--package` auf ein Verzeichnis ohne Manifest ---------------------
+# --- 15: `--package` on a directory without a manifest --------------------
 
 fall "Verzeichnis ohne Manifest wird gemeldet"
 mkdir -p "$WORK/leer"
 beide leer --package "$WORK/leer" -o "$WORK/f_leer.bin"
 erwarte_fehler leer "no manifest in"
 
-# --- 16: privates Modul IM eigenen Paket bleibt erlaubt ------------------
+# --- 16: a private module INSIDE one's own package stays allowed ---------
 
 fall "innerhalb eines Pakets gibt es keine Schranke"
 P=$(kopie f_intern)
@@ -284,8 +284,8 @@ cat > "$P/app/src/main.fi" <<'EOF'
 import geo
 
 fn main() -> i32 {
-    // geo.extent rechnet ueber geo.inner — ein Modul, das NICHT oeffentlich
-    // ist. Innerhalb des Pakets 'geo' ist das erlaubt.
+    // geo.extent computes through geo.inner -- a module that is NOT public.
+    // Inside the package 'geo' that is allowed.
     return geo.extent(geo.rect_new(0, 0, 3, 4))
 }
 EOF
@@ -302,7 +302,7 @@ else
         "$(head -4 "$WORK/f_intern.log")"
 fi
 
-# --- 17: ohne Manifest aendert sich NICHTS -------------------------------
+# --- 17: without a manifest NOTHING changes ------------------------------
 
 fall "ohne Manifest bleibt die Aufloesung von Runde 47"
 "$FIRNC" tests/110_module.fi -o "$WORK/alt0" >/dev/null 2>&1 && "$WORK/alt0"
@@ -315,7 +315,7 @@ else
     weh "Exit $a0/$a1, erwartet 60/60"
 fi
 
-# --- 18: Suchreihenfolge — die eigene Quelle gewinnt ---------------------
+# --- 18: search order -- one's own source wins ---------------------------
 
 fall "Projektquelle gewinnt vor gleichnamigem Modul der Abhaengigkeit"
 P=$(kopie f_vorrang)
@@ -344,7 +344,7 @@ else
     weh "Exit $v0/$v1, erwartet 1/1 (die eigene Quelle)"
 fi
 
-# --- 19: Manifest wird von der Quelldatei aus nach OBEN gefunden ---------
+# --- 19: the manifest is found UPWARDS from the source file --------------
 
 fall "Manifest wird auch ohne --package nach oben gefunden"
 P=$(kopie f_aufwaerts)
@@ -360,7 +360,7 @@ else
     weh "Exit $r0/$r1 oder falsche Ausgabe"
 fi
 
-# --- 20: mehrere Quellverzeichnisse in einem Paket -----------------------
+# --- 20: several source directories in one package -----------------------
 
 fall "zweites 'source'-Verzeichnis wird durchsucht"
 P=$(kopie f_zweitquelle)
@@ -387,7 +387,7 @@ else
     weh "Exit $z0/$z1, erwartet 3/3"
 fi
 
-# --- 21: `--package` und eine Quelldatei schliessen einander aus ----------
+# --- 21: `--package` and a source file exclude each other -----------------
 
 fall "--package und eine Quelldatei zugleich wird abgelehnt"
 beide beides --package demos/packages/app tests/110_module.fi -o "$WORK/f_beides.bin"

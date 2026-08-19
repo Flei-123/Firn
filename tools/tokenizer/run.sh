@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
-# Baut den HTML5-Tokenizer aus lib/html/ (in Firn), faehrt ihn gegen die
-# offizielle html5lib-Testsuite und gibt die Bilanz aus.
+# Builds the HTML5 tokenizer from lib/html/ (in Firn), drives it against the
+# official html5lib test suite and prints the balance.
 #
-#   1. Compiler bauen (falls noetig)
-#   2. lib/html/tokenize_main.fi uebersetzen (drei Baustufen: opt/noopt/dev-fast
-#      muessen dieselbe Bilanz liefern)
-#   3. tools/tokenizer/harness.py: 6.810 Faelle, Bilanz je .test-Datei
-#      (die 4 xmlViolationTests laufen im XML-Modus, Gegenprobe ohne ihn);
-#      ZWEI Quoten: nur Tokenstrom und zusaetzlich `--mit-fehlern`, das die
-#      'errors'-Listen (WHATWG-Codename, Zeile, Spalte) exakt vergleicht
-#   4. Durchsatz in MB/s auf dem Testkorpus; wenn bench/tokenizer/ gebaut ist,
-#      daneben html5ever auf DEMSELBEN Korpus
+#   1. build the compiler (if needed)
+#   2. compile lib/html/tokenize_main.fi (three build stages: opt/noopt/dev-fast
+#      have to yield the same balance)
+#   3. tools/tokenizer/harness.py: 6,810 cases, a balance per .test file
+#      (the 4 xmlViolationTests run in XML mode, counter-check without it);
+#      TWO quotas: only the token stream and additionally `--mit-fehlern`, which
+#      compares the 'errors' lists (WHATWG code name, line, column) exactly
+#   4. throughput in MB/s on the test corpus; if bench/tokenizer/ is built,
+#      html5ever next to it on THE SAME corpus
 #
-# Nicht unterstuetzte Faelle zaehlen als FEHLSCHLAG. Es wird nichts gefiltert.
+# Cases that are not supported count as a FAILURE. Nothing is filtered.
 #
-# Aufruf:  bash tools/tokenizer/run.sh [--schnell]
+# Usage:  bash tools/tokenizer/run.sh [--fast]
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
@@ -34,8 +34,8 @@ echo
 
 echo "== 1. Tokenizer uebersetzen (Firn) =="
 "$FIRNC" -o "$WORK/tokenize" lib/html/tokenize_main.fi
-# Messfassung: zaehlt nur Token (fairer Vergleich mit html5ever, das ebenfalls
-# nur zaehlt). Siehe Kopf von tools/tokenizer/throughput.sh.
+# Measuring version: it only counts tokens (a fair comparison with html5ever, which
+# also only counts). See the head of tools/tokenizer/throughput.sh.
 "$FIRNC" -o "$WORK/tokenize_bench" lib/html/tokenize_bench.fi
 echo "   opt      : $WORK/tokenize"
 if [ "$SCHNELL" -eq 0 ]; then

@@ -124,11 +124,11 @@ def main():
         mn, ops, sym = code[a]
         nxt = reihe[i + 1] if i + 1 < len(reihe) else None
 
-        # (1) unbedingter Sprung direkt hinter bedingtem -> Blocklayout
+        # (1) an unconditional jump directly behind a conditional one -> block layout
         if ist_bedingt(mn) and nxt is not None and code[nxt][0] == "jmp" and code[nxt][2] == sym:
             zaehle("jmp direkt hinter jcc (Blocklayout)", kosten.get(nxt, 0))
 
-        # (2) setcc-Kette statt direktem Sprung
+        # (2) a setcc chain instead of a direct jump
         if mn.startswith("set"):
             kette = [a]
             j = i + 1
@@ -148,7 +148,7 @@ def main():
                 zaehle("setcc-Kette statt direktem Sprung",
                        sum(kosten.get(x, 0) for x in kette))
 
-        # (3) Speichern und sofort wieder Laden derselben Zelle
+        # (3) storing and immediately loading the same cell again
         if mn == "mov" and ops.startswith("%") and "," in ops:
             q, z = ops.rsplit(",", 1)
             if "(%rbp)" in z and "(" not in q and nxt is not None:
@@ -157,13 +157,13 @@ def main():
                     zaehle("Store+Reload derselben Zelle",
                            kosten.get(a, 0) + kosten.get(nxt, 0))
 
-        # (4) Adressrechnung, die in den Speicheroperanden koennte
+        # (4) address arithmetic that could go into the memory operand
         if mn == "lea" and nxt is not None:
             m = re.match(r"^(-?0x[0-9a-f]+)?\((%r[a-z0-9]+)(,(%r[a-z0-9]+),(\d))?\),(%r[a-z0-9]+)$", ops)
             if m and code[nxt][0].startswith("mov") and f"({m.group(6)})" in code[nxt][1]:
                 zaehle("lea + Zugriff (Adressierungsmodus ungenutzt)", kosten.get(a, 0))
 
-        # (5) Rahmenverwaltung
+        # (5) frame management
         if mn in ("push", "pop", "ret"):
             zaehle("Rahmenverwaltung (push/pop/ret)", kosten.get(a, 0))
         elif mn == "call":

@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
-# tools/html/gc_tree.sh — Dauerlauf: echte DOM-Baeume, kein Wachstum.
+# tools/html/gc_tree.sh -- soak run: real DOM trees, no growth.
 #
-# Ein DOM-Baum ist die Zyklenart, an der ein Zaehlverweis scheitert (jeder
-# Knoten haelt Eltern UND Kinder stark). Dieses Skript baut in einer Schleife
-# vollstaendige Baeume aus echtem HTML (lib/browser/soak_tree.fi) und prueft,
-# dass der Speicherverbrauch des Prozesses FLACH bleibt.
+# A DOM tree is the kind of cycle a reference count fails at (every
+# node holds parent AND children strongly). This script builds complete
+# trees from real HTML in a loop (lib/browser/soak_tree.fi) and checks
+# that the memory consumption of the process stays FLAT.
 #
-# GEGENPROBE: derselbe Lauf mit `leck=1` haelt jeden Baum fest. Er MUSS
-# wachsen — sonst kann die Messung gar kein Leck anzeigen und ist wertlos.
-# Bleibt die Gegenprobe flach, bricht dieses Skript ab.
+# COUNTER-CHECK: the same run with `leck=1` keeps every tree. It MUST
+# grow -- otherwise the measurement cannot show a leak at all and is worthless.
+# If the counter-check stays flat, this script aborts.
 #
 # Environment:
-#   BAUM_RUNDEN     Runden im Normallauf (Standard 20000)
-#   BAUM_MS         Zeitbudget im Normallauf in ms (Standard 8000)
-#   BAUM_LECK_RUNDEN Runden der Gegenprobe (Standard 4000)
-#   BAUM_LECK_MB    harte Speicherbremse der Gegenprobe in MiB (Standard 1024)
-#   BAUM_DRIFT_KIB  erlaubter RSS-Zuwachs im Normallauf (Standard 256)
+#   BAUM_RUNDEN      rounds in the normal run (default 20000)
+#   BAUM_MS          time budget of the normal run in ms (default 8000)
+#   BAUM_LECK_RUNDEN rounds of the counter-check (default 4000)
+#   BAUM_LECK_MB     hard memory brake of the counter-check in MiB (default 1024)
+#   BAUM_DRIFT_KIB   allowed RSS increase in the normal run (default 256)
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 
