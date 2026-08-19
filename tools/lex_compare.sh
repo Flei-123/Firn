@@ -57,7 +57,7 @@ while IFS= read -r f; do
     # uebersetzen: `firnc0` bricht schon in der Modulaufloesung ab, VOR dem
     # Lexer. Das ist keine Lexerfrage — solche Dateien werden gezaehlt und
     # uebersprungen.
-    if grep -q "nicht lesen:" "$TMPD"/lexv_ae.txt; then
+    if grep -q "cannot read" "$TMPD"/lexv_ae.txt; then
         uebersprungen=$((uebersprungen+1))
         continue
     fi
