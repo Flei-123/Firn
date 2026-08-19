@@ -5,7 +5,7 @@
 //!  * `gc C{ … }` — Aufruf der Laufzeit (`__gc_alloc_raw`), danach die
 //!    Fehlerunion `AllocError!Gc[C]` bauen und die Felder schreiben. Der
 //!    Sammellauf steckt in `__gc_alloc_raw`: **erst sammeln, dann
-//!    `AllocError::OutOfMemory`** (DESIGNZIELE §2).
+//!    `AllocError::OutOfMemory`** (DESIGN_GOALS §2).
 //!  * `weak(g)`, `stark(w)`, `x.as?[C]` — Aufrufe der Laufzeit.
 //!  * `__gc_state()` / `__gc_save_regs()` — die beiden Compilerintrinsics.
 //!    `Op::GcAddr` liefert die Adresse des Zustandsblocks; mit `regs = true`

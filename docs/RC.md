@@ -1,7 +1,7 @@
 # `Rc` / `Weak` — Stufe 2 des Speichermodells
 
 Bezug: `SPEC.md` §3.2 (drei Stufen), §3.4 (`Rc[T]`, `Weak[T]`, `Arc[T]`),
-§3.6 (Rohzeiger), `DESIGNZIELE.md` §2 (fehlbare Allokation),
+§3.6 (Rohzeiger), `DESIGN_GOALS.md` §2 (fehlbare Allokation),
 `../karstos-browser/FIRN-ANFORDERUNGEN.md` Anforderung **S7**.
 
 Diese Datei beschreibt, was im Baum steht, wie es benutzt wird, und **was
@@ -65,7 +65,7 @@ struct RcHeap { … }                        // Halde fester Kapazitaet
 |---|---|
 | `rc_heap_init(h, bytes) -> bool` | Halde per `mmap` anlegen. `false` = fehlgeschlagen — **sichtbarer** Fehlschlag, kein stiller Ersatz. Kein `MAP_FIXED`, keine feste Adresse. |
 | `rc_heap_frei(h)` | `munmap` |
-| `rc_neu[T](h, wert, aus) -> AllocError!bool` | Wert auf die Halde legen, starker Verweis nach `*aus`. **Fehlbar** (DESIGNZIELE §2), Ergebnis ist `#[must_consume]`. |
+| `rc_neu[T](h, wert, aus) -> AllocError!bool` | Wert auf die Halde legen, starker Verweis nach `*aus`. **Fehlbar** (DESIGN_GOALS §2), Ergebnis ist `#[must_consume]`. |
 | `rc_lesen[T](r) -> T` | **nur lesen** — liefert eine Kopie |
 | `rc_klonen[T](r) -> Zaehlverweis[T]` | starker Zaehler + 1 |
 | `rc_freigeben[T](h, r)` | starker Zaehler − 1, leert `*r`; bei 0 und ohne schwachen Verweis geht der Block in die Freiliste |

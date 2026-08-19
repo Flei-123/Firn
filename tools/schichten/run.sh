@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ARCHITEKTURPRUEFUNG: Feldzugriff ist vom Speicherort getrennt.
 #
-# Hintergrund: DESIGNZIELE.md §8. Solange `a.b` im ganzen Baum fest als
+# Hintergrund: DESIGN_GOALS.md §8. Solange `a.b` im ganzen Baum fest als
 # "Basis + Versatz" ausgeschrieben wird, ist die SoA-Anordnung (`SoaVec[T]`)
 # nicht nachruestbar. Deshalb darf aus einem Versatz NUR in `layout.rs` eine
 # Adresse werden.
@@ -59,7 +59,7 @@ grep -q 'mod layout;' "$SRC/main.rs" || melde "layout ist in main.rs nicht angem
 
 if [ "$FEHLER" -ne 0 ]; then
     echo
-    echo "Die Trennung Feldzugriff <-> Speicherort ist verletzt (DESIGNZIELE.md 8)."
+    echo "Die Trennung Feldzugriff <-> Speicherort ist verletzt (DESIGN_GOALS.md 8)."
     exit 1
 fi
 

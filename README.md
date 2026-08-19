@@ -83,7 +83,7 @@ after the merge of round 3):
    OK: Ergebnisort-Garantie gehalten (baue 224 B, main 1048816 B, keine Bulk-Kopie).
 == 7. Architektur: Feldzugriff <-> Speicherort getrennt ==
    OK: Feldzugriff und Speicherort getrennt (4 Zugaenge in layout.rs, keine Umgehung).
-== 8. Symbol-Namensschema (DESIGNZIELE 4) ==
+== 8. Symbol-Namensschema (DESIGN_GOALS 4) ==
    OK: Symbolschema gehalten (_F0.-Praefix, 'main' nackt, Module kollisionsfrei).
 == 9. HTML5-Tokenizer gegen html5lib (tools/tokenizer/run.sh) ==
    GESAMT                      6810 /  6810 100.00 %    6809 /  6810  99.99 %

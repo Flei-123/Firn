@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Nachweis der ERGEBNISORT-GARANTIE (SPEC.md §13.1, DESIGNZIELE.md §6).
+# Nachweis der ERGEBNISORT-GARANTIE (SPEC.md §13.1, DESIGN_GOALS.md §6).
 #
 # Behauptung: Bei `let g = build(…)` mit aggregiertem Rueckgabetyp wird die
 # Zieladresse durchgereicht. Die Struktur entsteht GENAU EINMAL im Rahmen des
@@ -22,7 +22,7 @@ MB=1048576
 "$FIRNC" --emit=asm -o "$ASM" "$SRC"
 
 # Linker-Symbol: 'main' behaelt seinen nackten Namen, alles andere traegt das
-# Schema aus modules.rs (_F<schema>.<name>, DESIGNZIELE 4).
+# Schema aus modules.rs (_F<schema>.<name>, DESIGN_GOALS 4).
 rahmen() {   # $1 = Funktionsname -> Byte-Zahl aus 'sub rsp, N'
     awk -v n="$1" '
         $0 == n":" || $0 ~ "^_F[0-9]+\\." n ":" { inf = 1; next }

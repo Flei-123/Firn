@@ -4,12 +4,12 @@
 **Autor:** Justin (GitHub: Flei123) · **Zielsysteme:** Karstos / karst-Kernel **und
 die Karstos-Browser-Engine**, x86_64
 
-> **Ergänzendes Dokument.** `DESIGNZIELE.md` behandelt zehn bekannte
+> **Ergänzendes Dokument.** `DESIGN_GOALS.md` behandelt zehn bekannte
 > Schwachstellen heutiger Sprachen (Funktionsfarben, fehlbare Allokation,
 > Capability-Module, stabiles ABI, Debug-Bau-Geschwindigkeit,
 > In-Place-Initialisierung, comptime/Reflexion, Datenlayout/SoA, Hot Reload) und
 > trennt, was **jetzt** ins Fundament muss von dem, was nachrüstbar ist. Wo es
-> dieser Spezifikation widerspricht, gewinnt `DESIGNZIELE.md` und §7 bzw. §15
+> dieser Spezifikation widerspricht, gewinnt `DESIGN_GOALS.md` und §7 bzw. §15
 > werden korrigiert — das ist bereits geschehen.
 
 > **Umbenennbarkeit.** Sprachname und Dateiendung stehen an *genau einer* Stelle im
@@ -364,7 +364,7 @@ sieht nie eine Vtable.
 | Implizite Umwandlungen (auch verlustfreie) | `u8 → u32` schreibt man `as u32` |
 | Ausnahmen als *normaler* Fehlerweg | `L7`: Parser erzeugen dauernd erwartbare Fehler; Ausnahmen dafür sind Gift für die Geschwindigkeit. §5.3 ist die eng gezogene Ausnahme für JS |
 | Makros mit eigener Syntax | `comptime` und Bauskripte reichen (`FIRN-ANFORDERUNGEN.md` §11: „kein turingvollständiges Makrosystem") |
-| `async`/`await` **als Sprachfarbe** | §7 — ersetzt durch `Io` als Parameter (`DESIGNZIELE.md` §1) |
+| `async`/`await` **als Sprachfarbe** | §7 — ersetzt durch `Io` als Parameter (`DESIGN_GOALS.md` §1) |
 | Überladen von Funktionsnamen | erschwert Fehlermeldungen und Selbst-Hosting |
 | Automatische Dereferenzierung | `p.*.feld`, nicht `p.feld`. Ausnahme: `Gc[T]` wird automatisch dereferenziert, weil `node.*.children.*` unlesbar wäre — das ist bewusst und steht hier |
 | Vorprozessor | `comptime if` ersetzt `#ifdef` |
@@ -509,7 +509,7 @@ HTML-Entities, Unicode-Tabellen aus der UCD, CLDR-Daten.
   Einschränkung ist eine Folge der GC-Entscheidung und steht hier, damit sie
   beim Layout-Entwurf bekannt ist, nicht erst beim Debuggen.
 * **Kein `async`/`await` als Sprachfarbe** (revidiert 14.08.2026, ausführlich
-  begründet in `DESIGNZIELE.md` §1). Eine `async`-Markierung färbt jeden
+  begründet in `DESIGN_GOALS.md` §1). Eine `async`-Markierung färbt jeden
   Aufrufer und zerreißt das Ökosystem — in Rust gibt es deshalb zwei
   inkompatible E/A-Welten. Firn übernimmt stattdessen **Zigs Modell aus 0.16**:
   **`Io` wird als Parameter übergeben**, genau wie der `Allocator`.
@@ -908,7 +908,7 @@ so — `abi::ret_needs_sret()` klassifiziert Rückgaben über 16 Byte als `MEMOR
 mit verstecktem Zeiger in `rdi`, und das Lowering reicht die Zieladresse durch
 (`compiler/src/lower.rs:604`). **Noch offen:** dieselbe Garantie für Struct- und
 Arrayliterale sowie für den geplanten `init`-Ausdruck. Ausführlich in
-`DESIGNZIELE.md` §6.
+`DESIGN_GOALS.md` §6.
 
 ---
 
@@ -1174,7 +1174,7 @@ Umgesetzt und mit laufendem Code belegt:
   `(*p).feld`), **`GcWeak[T]`** als schwacher Verweis mit `weak(g)`/`stark(w)`,
   Nullwerte `gc_null[T]()`/`weak_null[T]()`.
 * **Allokation ist fehlbar**: `gc C{…}` hat den Typ `AllocError!Gc[C]`
-  (DESIGNZIELE §2). Bei erschöpftem Heap wird **erst gesammelt, dann
+  (DESIGN_GOALS §2). Bei erschöpftem Heap wird **erst gesammelt, dann
   gescheitert** — nachgewiesen in `tests/535_gc_fallible_allocation.fi` mit
   einer Obergrenze von 256 KiB.
 * **Mark-Sweep**, anhaltend, Sammlung nur an Allokationsstellen und bei
@@ -1393,7 +1393,7 @@ schreiben. Deshalb gilt:
 
 Beides wird abgewiesen, mit Meldung und Quellposition
 (`tests/neg/comptime_file_absolute.fi`, `comptime_file_parent.fi`). Das ist
-bewusst enger als nötig; wenn Firn das Fähigkeitenmodell aus `DESIGNZIELE.md`
+bewusst enger als nötig; wenn Firn das Fähigkeitenmodell aus `DESIGN_GOALS.md`
 §3 bekommt, wird daraus eine Erlaubnis, die ein Modul ausdrücklich anfordern
 muss.
 
@@ -1666,7 +1666,7 @@ F10. **Fehlerunion über einem Struct-Erfolgstyp taugt nicht als Feldtyp eines
    Dauerlauf zum Problem wird, ist das die Stelle, an der nachgebessert werden
    muss — und es wird teuer. Entscheidung vertagt bis nach dem 24-h-Test.
 2. ~~**`async`/Koroutinen**~~ — **entschieden am 14.08.2026**: `Io` als
-   Parameter statt Sprachfarbe (§7, `DESIGNZIELE.md` §1). Offen bleibt nur die
+   Parameter statt Sprachfarbe (§7, `DESIGN_GOALS.md` §1). Offen bleibt nur die
    Größe der Koroutinen-Stapel und ob sie wachsen dürfen.
 3. **Seile** (`Z3`, SOLL) — ab wann lohnt der Aufwand?
 4. **SIMD** (`L16`, SOLL) — als eingebaute Vektortypen oder nur über

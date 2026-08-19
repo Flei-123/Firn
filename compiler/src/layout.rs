@@ -1,5 +1,5 @@
 //! Zwischenschicht zwischen **Feldzugriff** und **Speicherort**
-//! (`DESIGNZIELE.md` §8, Fundamentpunkt aus §10.4).
+//! (`DESIGN_GOALS.md` §8, Fundamentpunkt aus §10.4).
 //!
 //! # Warum es dieses Modul gibt
 //!

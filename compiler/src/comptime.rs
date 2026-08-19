@@ -290,7 +290,7 @@ impl<'a> Execution<'a> {
 
     /// Liest eine Datendatei — EINMAL, danach aus dem Zwischenspeicher.
     ///
-    /// SICHERHEIT (DESIGNZIELE §3): Uebersetzungszeit-Dateizugriff ist ein
+    /// SICHERHEIT (DESIGN_GOALS §3): Uebersetzungszeit-Dateizugriff ist ein
     /// Einfallstor fuer Lieferketten-Angriffe — eine eingebundene Bibliothek
     /// koennte sonst beim Bauen `/etc/passwd` lesen und in den erzeugten Code
     /// schreiben. Deshalb gilt hier eine harte Regel:
@@ -300,7 +300,7 @@ impl<'a> Execution<'a> {
     ///   * kein absoluter Pfad, kein Laufwerks- oder Wurzelpraefix.
     ///
     /// Das ist bewusst enger als noetig. Wenn Firn ein Modulsystem mit
-    /// Faehigkeiten bekommt (DESIGNZIELE §3), wird daraus eine Erlaubnis, die
+    /// Faehigkeiten bekommt (DESIGN_GOALS §3), wird daraus eine Erlaubnis, die
     /// ein Modul ausdruecklich anfordern muss.
     fn read_file(&mut self, path: &str, span: Span) -> Result<&Vec<u8>, Error> {
         if !self.files.contains_key(path) {

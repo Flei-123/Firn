@@ -217,7 +217,7 @@ else
     tail -20 "$WORK/schichten.log" | sed 's/^/   /'
 fi
 
-echo "== 8. Symbol-Namensschema (DESIGNZIELE 4) =="
+echo "== 8. Symbol-Namensschema (DESIGN_GOALS 4) =="
 bash tools/symbole/run.sh > "$WORK/symbole.log" 2>&1 && SYRC=0 || SYRC=$?
 if [ "$SYRC" -eq 0 ]; then
     ok

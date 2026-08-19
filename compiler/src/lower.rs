@@ -290,7 +290,7 @@ impl<'a> Lower<'a> {
                     },
                     _ => return self.ice(*fspan, "field access on a non-struct"),
                 };
-                // Schicht Feldzugriff <-> Speicherort (layout.rs, DESIGNZIELE 8)
+                // Schicht Feldzugriff <-> Speicherort (layout.rs, DESIGN_GOALS 8)
                 self.field_addr(baddr, sidx, fname, *fspan)
             }
             ExprKind::Index(base, idx) => {
@@ -303,7 +303,7 @@ impl<'a> Lower<'a> {
                 let esz = self.info.tcx.size_of(&elem).max(1);
                 let iv = self.lower_expr(idx)?;
                 let ift = self.fty_of(idx)?;
-                // Schicht Feldzugriff <-> Speicherort (layout.rs, DESIGNZIELE 8)
+                // Schicht Feldzugriff <-> Speicherort (layout.rs, DESIGN_GOALS 8)
                 Some(self.elem_addr(baddr, esz, iv, ift))
             }
             ExprKind::StructLit(..) | ExprKind::ArrayLit(_) | ExprKind::ArrayRepeat(..) => {
@@ -370,7 +370,7 @@ impl<'a> Lower<'a> {
                     _ => return self.ice(*span, "struct literal without struct type"),
                 };
                 for (fname, fexpr, fspan) in fields {
-                    // Schicht Feldzugriff <-> Speicherort (layout.rs, DESIGNZIELE 8)
+                    // Schicht Feldzugriff <-> Speicherort (layout.rs, DESIGN_GOALS 8)
                     let fa = self.field_addr(addr, sidx, fname, *fspan)?;
                     self.write_into(fa, fexpr)?;
                 }
@@ -847,7 +847,7 @@ impl<'a> Lower<'a> {
 
         self.cur = body;
         let iv2 = self.load(FTy::U64, islot);
-        // Schicht Feldzugriff <-> Speicherort (layout.rs, DESIGNZIELE 8)
+        // Schicht Feldzugriff <-> Speicherort (layout.rs, DESIGN_GOALS 8)
         let ea = self.elem_addr(addr, esz, iv2, FTy::U64);
         match (sv, saddr) {
             (Some((ft, v)), _) => self.store(ft, ea, v),
