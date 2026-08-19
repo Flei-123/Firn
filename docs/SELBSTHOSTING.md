@@ -1914,3 +1914,68 @@ irgendeine Quelle unter `bin/` oder `lib/` juenger ist.
 fehlerhaft**, CODEGEN FEHLT 0 · `fixpunkt.sh` Stufe 2 == Stufe 3,
 zeichengleich, **328.343 Zeilen** · Durchsatz realweb **1,54x**, html5lib
 **0,95x**.
+
+## 37. Runde 46: Schnittstellen — `interface` und dynamischer Versand
+
+Runde 45 hatte Methoden nur als Schreibhilfe gebracht: `x.m(a)` wurde nach dem
+**statischen** Typ zu `Typ__m(&x, a)`. Runde 46 ergänzt den Fall, den `SPEC.md`
+§6.2 seit v0.1 fordert — **eine Aufrufstelle, viele Typen**:
+
+```firn
+interface Flaeche { fn flaeche(*self) -> i64 }
+impl Flaeche for Rechteck { … }
+let f: dyn Flaeche = (&r) as dyn Flaeche
+f.flaeche()      // welcher Code laeuft, steht erst zur Laufzeit fest
+```
+
+`dyn I` ist ein Doppelzeiger (Datenzeiger + Methodentafel). Die Tafeln stehen
+als `.L__iface.<I>.<T>` in `.rodata`. Zwei neue FIR-Instruktionen tragen das:
+`O_CALLI` (Aufruf ueber einen Zeiger) und `O_VTAB` (Adresse einer Tafel) — in
+beiden Uebersetzern identisch, 14 Negativtests decken fehlende Methoden,
+falsche Signaturen, doppelte `impl` und unbekannte Schnittstellen ab. Der
+Sammler erreicht die Objekte hinter dem Doppelzeiger weiterhin; ein eigener
+GC-Test sichert das.
+
+## 38. Runde 47: Finalisierer, `Arc[T]` und schwache Felder
+
+Die seit Runde 38 benannte Restarbeit an der Speicherverwaltung. Finalisierer
+laufen beim Einsammeln, Wiederbelebung ist definiert, der Sammler bleibt dabei
+nicht-reentrant. Schwache Felder werden beim Einsammeln **wirklich genullt**
+(eigener Test). `Arc[T]` bekam ein neues, unteilbares Primitiv: `O_ATOMADD` →
+`lock xadd qword ptr [rcx], rax`, eine Instruktion; ohne das waere `Arc` nur
+`Rc` mit anderem Namen.
+
+**Messung:** im 150-s-Lauf mit Finalisierern **0 von 253 698** Unterbrechungen
+ueber 1 ms (in Rechenzeit gemessen) — die Pausen sind nicht schlechter
+geworden, sondern rund 2 % besser. Callgrind war hier untauglich: es
+verschiebt den Stapel, weshalb die Runde den Stapelboden jetzt aus
+`/proc/self/maps` liest statt ihn zu raten.
+
+## 39. Runde 48: Pakete — Manifest, Sichtbarkeit, `--paket`
+
+Bis hierhin gab es nur `import a.b` und die Umgebungsvariable `FIRNLIB`.
+Runde 48 bringt ein Manifest `firn.paket` — **bewusst kein TOML**: das Format
+hat sechs Schluesselwoerter, ist zeilenweise und laesst sich ohne Fremdparser
+in beiden Uebersetzern lesen (`compiler/src/paketwelt.rs` und
+`lib/firnc1/paket.fi`). Dazu eine deterministische Suchreihenfolge
+(Projektquellen → Abhaengigkeiten → `FIRNLIB` → Compilerverzeichnis) mit
+klaren Fehlern bei Zyklen, fehlenden Paketen und Namenskonflikten, sowie
+oeffentlich/privat auf Modulebene. `--paket` uebersetzt ein Projekt anhand
+des Manifests; zusammen mit einer Quelldatei wird es in **beiden** Uebersetzern
+gleich abgelehnt. Neuer Abschnitt 18 in `test.sh`: `tools/pakete/run.sh`,
+**21 Faelle durch beide Uebersetzer**.
+
+## 40. Der Merge der Runden 46-48
+
+Ein einziger echter Konflikt, und zwar ein interessanter: R46 und R47 hatten
+**beide** eine neue FIR-Instruktion mit der Nummer 15 vergeben (`O_CALLI` bzw.
+`O_ATOMADD`). Da Zweige die Nummernvergabe nicht sehen koennen, ist das kein
+Fehler der Runden, sondern der Preis paralleler Arbeit am selben
+Instruktionssatz — beim Zusammenfuehren umnummeriert auf `O_ATOMADD = 15`,
+`O_CALLI = 16`, `O_VTAB = 17`. **Lehre:** neue FIR-Opcodes gehoeren in einen
+reservierten Bereich pro Runde, sonst kostet jede Parallelrunde diesen Konflikt.
+
+**Abnahme des Merge-Standes, im Hauptrepo selbst gemessen:** `test.sh`
+**751/751** · `selbst_vergleich` **213 gleich / 0 abweichend / 0 fehlerhaft** ·
+Fixpunkt zeichengleich (**427 401 Zeilen** Assembler, 2 459 904 Oktette) ·
+Pakete 21/21.
