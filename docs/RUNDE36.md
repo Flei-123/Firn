@@ -1,61 +1,62 @@
-# Runde 36 — ct-Intrinsics, errdefer, must_consume (die letzten drei Kernbloecke)
+# Round 36 — ct intrinsics, errdefer, must_consume (the last three core blocks)
 
-Stand nach Runde 36: selbst_vergleich **185 gleich / 0 abweichend / 0 fehlerhaft**,
-test.sh **640/640**, Fixpunkt **zeichengleich (284207 Zeilen Assembler)**.
+State after round 36: selbst_vergleich **185 identical / 0 differing /
+0 failing**, test.sh **640/640**, fixpoint **character-identical (284207
+lines of assembly)**.
 
-## 1. Konstante Laufzeit / ct-Intrinsics (Vorbild compiler/src/ct.rs)
+## 1. Constant runtime / ct intrinsics (model compiler/src/ct.rs)
 
-Drei Intrinsics in firnc1 portiert — Parser-Kernregistrierung (parser.fi,
-`erweiterungen_suchen`: nur Kern, sobald die gc-Registrierung angemeldet ist,
-wie bei `barrier` in Runde 34), Sema (sema.fi, eigene Erkennung vor dem
-Funktions-Lookup — eine eigene Funktion gleichen Namens gewinnt), Lowering
-(lower.fi, eigene Fir-Terme) und Codegen (codegen.fi).
+Three intrinsics ported to firnc1 — parser core registration (parser.fi,
+`erweiterungen_suchen`: core only, as soon as the gc registration is
+announced, as with `barrier` in round 34), sema (sema.fi, its own detection
+before the function lookup — a user function of the same name wins), lowering
+(lower.fi, its own Fir terms) and codegen (codegen.fi).
 
-- `select(bedingung, a, b)` — datenunabhaengige Auswahl. Sema: genau 3
-  Argumente, Bedingung `bool`, nur skalare Typen (int/bool/Zeiger), beide
-  Zweige exakt denselben Typs, keine implizite Umwandlung. Codegen: cmov-
-  Muster, keine Spruenge.
-- `secure_zero(zeiger, anzahl)` — nullt den Puffer, darf nie wegoptimiert
-  werden (SPEC §9.3, C3). Sema: Zeiger + Ganzzahl. Codegen: Schleife mit
-  volatile-Store-Semantik.
-- `select` mit Zeigertypen (431) und `secure_zero` (433) decken die
-  zusaetzlichen Faelle ab.
+- `select(bedingung, a, b)` — data-independent selection. Sema: exactly 3
+  arguments, condition `bool`, scalar types only (int/bool/pointer), both
+  branches of exactly the same type, no implicit conversion. Codegen: cmov
+  pattern, no branches.
+- `secure_zero(zeiger, anzahl)` — zeroes the buffer, must never be optimized
+  away (SPEC §9.3, C3). Sema: pointer + integer. Codegen: loop with
+  volatile store semantics.
+- `select` with pointer types (431) and `secure_zero` (433) cover the
+  additional cases.
 
 Tests: tests/430_ct_select.fi, 431_ct_select_ptr.fi, 432_ct_barrier.fi
-(Vervollstaendigung), 433_ct_secure_zero.fi, Kern-Test tests/780_ct_core.fi.
-Negativtests (rc=1 beidseitig): tests/neg/ct_select_cond.fi,
+(completion), 433_ct_secure_zero.fi, core test tests/780_ct_core.fi.
+Negative tests (rc=1 on both sides): tests/neg/ct_select_cond.fi,
 ct_select_digit_count.fi, ct_select_types_different.fi,
 ct_secure_zero_no_ptr.fi, ct_barrier_aggregate.fi.
 
-## 2. errdefer (Vorbild Stufe 0, defer.fi als firnc1-Vorbild)
+## 2. errdefer (model stage 0, defer.fi as the firnc1 model)
 
-`errdefer` laeuft nur, wenn der Block mit einem Fehler verlassen wird.
-Umsetzung: `defer_bis_fehler` im Parser/Sema, `ret_term_fehler` im Lowering —
-die Defer-Kette wird am fehlerhaften Return-Punkt in umgekehrter
-Reihenfolge abgearbeitet, am Erfolgspfad nicht. Fertige-Union-Weitergabe
-wird korrekt abgelehnt (tests/neg/errdefer_union_weitergabe.fi, rc=1).
+`errdefer` only runs if the block is left with an error.
+Implementation: `defer_bis_fehler` in parser/sema, `ret_term_fehler` in
+lowering — the defer chain is worked off at the failing return point in
+reverse order, and not on the success path. Passing on a finished union
+is correctly rejected (tests/neg/errdefer_union_weitergabe.fi, rc=1).
 Commit 3144601.
 
-## 3. #[must_consume] (Vorbild compiler/src/attrs.rs)
+## 3. #[must_consume] (model compiler/src/attrs.rs)
 
-Attribut auf Funktionen und Structs: Werden Aufruf-Ergebnisse (fn) bzw.
-Werte des Typs (struct) verworfen, bricht der Compiler ab
-(`check_discard` in sema.fi). Negativtests attr_must_consume_* rc=1.
+Attribute on functions and structs: if call results (fn) or values of the
+type (struct) are discarded, the compiler aborts
+(`check_discard` in sema.fi). Negative tests attr_must_consume_* rc=1.
 Commit 6ef2616.
 
-## Messwerte
+## Measurements
 
-| Werkzeug | vorher (Runde 34) | nachher |
+| Tool | before (round 34) | after |
 |---|---|---|
-| tools/self_compare.sh | 180 gleich | **185 gleich, 0 abw., 0 fehlerhaft, NICHT KERN 0** |
+| tools/self_compare.sh | 180 identical | **185 identical, 0 diff., 0 failing, NOT CORE 0** |
 | test.sh | 637/637 | **640/640** |
-| tools/fixpoint.sh | 279201 Zeilen | **284207 Zeilen, zeichengleich** |
+| tools/fixpoint.sh | 279201 lines | **284207 lines, character-identical** |
 
-## Grenzen (ehrlich benannt)
+## Limits (honestly named)
 
-- selbst_vergleich COMPTIME: 1 — 600_comptime.fi (rc=4) bleibt der einzige
-  benannte Restfall; die comptime-Maschine aus Runde 35 deckt den vollen
-  Stufe-0-Sprachschatz dort noch nicht ab.
-- fir_vergleich: 1 ungleich (bekannt und benannt aus Vor-Runden).
-- UEBERSPRUNGEN: 15 Dateien, die firnc0 nicht einzeln uebersetzt
-  (unveraendert, kein Rueckschritt).
+- selbst_vergleich COMPTIME: 1 — 600_comptime.fi (rc=4) remains the only
+  named residual case; the comptime machinery from round 35 does not yet
+  cover the full stage 0 vocabulary there.
+- fir_vergleich: 1 differing (known and named from earlier rounds).
+- SKIPPED: 15 files that firnc0 does not compile individually
+  (unchanged, no regression).
