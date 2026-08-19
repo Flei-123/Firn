@@ -1,0 +1,232 @@
+// tools/faden/stress.fi — DAUERLAUF MIT MEHREREN FAEDEN UND LAUFENDEM SAMMLER.
+//
+// Der Nachweis, den Runde 49 schuldig ist: mehrere Faeden allozieren
+// gleichzeitig aus demselben GC-Heap, der Sammler laeuft dabei, und das ueber
+// Minuten — ohne Absturz, ohne Speicherdrift, mit deterministischem Ergebnis.
+//
+// Jeder Faden baut in einer Endlosschleife eine Kette aus KETTE Gliedern mit
+// vorhersagbaren Werten, RECHNET SIE NACH und verwirft sie wieder. Ein einziges
+// faelschlich eingesammeltes Glied setzt das Fehlerwort — und das ist der
+// eigentliche Punkt: der Sammler laeuft waehrenddessen, gefuehrt von einem
+// BELIEBIGEN der Faeden, und muss trotzdem jeden anderen Stapel sehen.
+//
+// Zusaetzlich laeuft in jeder Runde ein Mutex-Abschnitt und ein rein atomarer
+// Zaehler. Am Ende muessen beide exakt der Rundenzahl entsprechen; ein dritter
+// Zaehler OHNE Sperre muss dagegen VERLOREN haben — sonst liefen die Faeden
+// nicht wirklich gleichzeitig und der ganze Lauf belegt nichts.
+//
+// Ausgabe (eine Zeile je Stichprobe, TAB-getrennt):
+//   S <t_ms> <rss_kib> <runden> <laeufe> <stw> <heap_bytes> <lebende> <stw_max_ns>
+//   Q <code> <wert>   Schlusswerte
+// Codes: 0 Fehlerwort · 1 Runden gesamt · 2 Mutexzaehler · 3 Atomzaehler ·
+//        4 Zaehler ohne Sperre · 5 RSS am Ende · 6 Sammellaeufe · 7 STW-Laeufe
+//        8 laengste Wartezeit bis die Welt stand (ns)
+//        9 laengste Zeit mit stehender Welt (ns)
+import mess
+
+gc class Knoten {
+    naechster: Gc[Knoten],
+    wert: u64,
+}
+
+// Von tools/faden/stress.sh umgestellt.
+const BUDGET_MS: i64 = 20000  // STRESS_BUDGET_MS
+const FAEDEN: u64 = 4         // STRESS_FAEDEN
+const LOKAL: u64 = 0          // STRESS_LOKAL
+const KETTE: u64 = 200
+const STICH_MS: u64 = 2000
+
+const ST_SYS_MMAP: i64 = 9
+
+const Z_STOPP: u64 = 0
+const Z_MUTEX: u64 = 8
+const Z_MIT: u64 = 16
+const Z_ATOM: u64 = 24
+const Z_OHNE: u64 = 32
+const Z_RUNDEN: u64 = 40
+const Z_FEHLER: u64 = 48
+
+fn seite() -> u64 {
+    let r: i64 = syscall(ST_SYS_MMAP, 0, 4096, 3, 34, -1, 0)
+    if r < 0 {
+        return 0
+    }
+    return r as u64
+}
+
+fn ld(a: u64, o: u64) -> u64 {
+    return *((a + o) as *mut u64)
+}
+
+fn st(a: u64, o: u64, v: u64) {
+    *((a + o) as *mut u64) = v
+}
+
+// Schlafen als BLOCKIERT — sonst wartet jedes Anhalten der Welt auf diesen
+// Faden, bis er von selbst aufwacht (siehe faden_blockierend_an in gc.fi).
+fn schlafe_ms(ms: u64) {
+    faden_schlafen(ms)
+}
+
+fn kette_bauen(marke: u64) -> AllocError!Gc[Knoten] {
+    var kopf: Gc[Knoten] = gc_null[Knoten]()
+    var i: u64 = 0
+    while i < KETTE {
+        let n: Gc[Knoten] = try gc Knoten{ naechster: kopf, wert: marke + i }
+        kopf = n
+        i = i + 1
+    }
+    return kopf
+}
+
+fn kette_pruefen(kopf: Gc[Knoten], marke: u64) -> bool {
+    var p: Gc[Knoten] = kopf
+    var i: u64 = KETTE
+    while i > 0 {
+        i = i - 1
+        if p == gc_null[Knoten]() {
+            return false
+        }
+        if p.wert != marke + i {
+            return false
+        }
+        p = p.naechster
+    }
+    return true
+}
+
+fn runde(arg: u64, marke: u64) -> AllocError!bool {
+    let kopf: Gc[Knoten] = try kette_bauen(marke)
+    if !kette_pruefen(kopf, marke) {
+        return false
+    }
+    faden_sperren((arg + Z_MUTEX) as *mut u64)
+    st(arg, Z_MIT, ld(arg, Z_MIT) + 1)
+    faden_entsperren((arg + Z_MUTEX) as *mut u64)
+    __atomar_addieren((arg + Z_ATOM) as *mut u64, 1)
+    // Gegenprobe: dieselbe Erhoehung OHNE Sperre und OHNE atomare
+    // Instruktion, mit absichtlich weitem Fenster zwischen Lesen und
+    // Schreiben. Sie MUSS verlieren — sonst liefen die Faeden nicht wirklich
+    // gleichzeitig und der ganze Dauerlauf belegt nichts.
+    let v: u64 = ld(arg, Z_OHNE)
+    var d: u64 = 0
+    while d < 64 {
+        d = d + 1
+    }
+    st(arg, Z_OHNE, v + 1)
+    __atomar_addieren((arg + Z_RUNDEN) as *mut u64, 1)
+    return true
+}
+
+fn __faden_arbeit(art: u64, arg: u64) -> u64 {
+    var runden: u64 = 0
+    while ld(arg, Z_STOPP) == 0 {
+        let marke: u64 = art * 1000000 + (runden % 977) * 1000
+        let ok: bool = runde(arg, marke) catch false
+        if !ok {
+            __atomar_addieren((arg + Z_FEHLER) as *mut u64, 1)
+            return runden
+        }
+        runden = runden + 1
+        // Von Zeit zu Zeit einen vollen Lauf erzwingen — sonst sieht dieser
+        // Dauerlauf fast nur inkrementelle Scheiben.
+        if runden % 512 == 0 {
+            gc_collect()
+        }
+    }
+    return runden
+}
+
+fn q(code: u64, wert: u64) {
+    mess.mess_zeichen(81)
+    mess.mess_tab()
+    mess.mess_u64(code)
+    mess.mess_tab()
+    mess.mess_u64(wert)
+    mess.mess_nl()
+}
+
+fn main() -> i32 {
+    if !gc_init() {
+        return 90
+    }
+    if !faden_init() {
+        return 91
+    }
+    if LOKAL != 0 {
+        gc_set_lokal(1)
+    }
+    let z: u64 = seite()
+    if z == 0 {
+        return 92
+    }
+    var h: [u64; 16] = [0; 16]
+    var i: u64 = 0
+    while i < FAEDEN {
+        h[i as usize] = faden_starten(i + 1, z)
+        if h[i as usize] == 0 {
+            return 93
+        }
+        i = i + 1
+    }
+
+    let t0: u64 = mess.mess_jetzt_ms()
+    var t: u64 = 0
+    while t < BUDGET_MS as u64 {
+        schlafe_ms(STICH_MS)
+        faden_safepoint()
+        t = mess.mess_jetzt_ms() - t0
+        mess.mess_zeichen(83)
+        mess.mess_tab()
+        mess.mess_u64(t)
+        mess.mess_tab()
+        mess.mess_u64(mess.mess_rss_kib())
+        mess.mess_tab()
+        mess.mess_u64(ld(z, Z_RUNDEN))
+        mess.mess_tab()
+        mess.mess_u64(gc_collections())
+        mess.mess_tab()
+        mess.mess_u64(gc_stw_laeufe())
+        mess.mess_tab()
+        mess.mess_u64(gc_heap_bytes())
+        mess.mess_tab()
+        mess.mess_u64(gc_live_objects())
+        mess.mess_tab()
+        mess.mess_u64(gc_stw_warte_max())
+        mess.mess_nl()
+    }
+    st(z, Z_STOPP, 1)
+
+    var summe: u64 = 0
+    i = 0
+    while i < FAEDEN {
+        summe = summe + faden_warten(h[i as usize])
+        i = i + 1
+    }
+    q(0, ld(z, Z_FEHLER))
+    q(1, summe)
+    q(2, ld(z, Z_MIT))
+    q(3, ld(z, Z_ATOM))
+    q(4, ld(z, Z_OHNE))
+    q(5, mess.mess_rss_kib())
+    q(6, gc_collections())
+    q(7, gc_stw_laeufe())
+    q(8, gc_stw_warte_max())
+    q(9, gc_stw_arbeit_max())
+    if ld(z, Z_FEHLER) != 0 {
+        return 1
+    }
+    if summe != ld(z, Z_RUNDEN) {
+        return 2
+    }
+    if ld(z, Z_MIT) != summe {
+        return 3
+    }
+    if ld(z, Z_ATOM) != summe {
+        return 4
+    }
+    if faden_anzahl() != 1 {
+        return 5
+    }
+    return 0
+}

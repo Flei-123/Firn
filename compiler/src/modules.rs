@@ -240,7 +240,10 @@ pub fn resolve(root: &Path, welt: &Welt) -> Result<Vec<SourceFile>, Fehler> {
     // HOOK gc: die Sammler-Laufzeit wird automatisch eingezogen, sobald
     // irgendwo ein `gc class` steht (gc.rs, SPEC 3.5) — kein `import`, keine
     // zusaetzliche Kommandozeilenoption.
+    // Runde 49: HIER wird die Laufzeit wirklich Teil des Programms — und nur
+    // dann muss der Zustandsblock im Assembler stehen (codegen_x86::emit).
     if let Some(f) = gc_laufzeit(&out) {
+        crate::gc::laufzeit_merken();
         out.push(f);
     }
     Ok(out)
@@ -288,6 +291,8 @@ pub(crate) fn gc_laufzeit(files: &[SourceFile]) -> Option<SourceFile> {
     let mut hat_finalisierer = false;
     // Runde 53: `GcVec`/`GcMap` kommen nur dazu, wenn sie vorkommen.
     let mut braucht_sammlungen = false;
+    // Runde 49: dasselbe fuer den Fadenverteiler.
+    let mut hat_fadenarbeit = false;
     for f in files {
         let mut dg = Diags::new("<gc-suche>", &f.src);
         let toks = lexer::lex_file(&f.src, f.id, &mut dg);
@@ -296,6 +301,7 @@ pub(crate) fn gc_laufzeit(files: &[SourceFile]) -> Option<SourceFile> {
         braucht_sammlungen |= crate::gc::quelle_braucht_sammlungen(&toks);
         if f.id == 0 {
             hat_finalisierer = crate::gc::quelle_hat_finalisierer(&toks);
+            hat_fadenarbeit = crate::gc::quelle_hat_fadenarbeit(&toks);
         }
     }
     if !braucht {
@@ -307,6 +313,7 @@ pub(crate) fn gc_laufzeit(files: &[SourceFile]) -> Option<SourceFile> {
         src: crate::gc::laufzeit_quelle(
             !hat_allocerror,
             !hat_finalisierer,
+            !hat_fadenarbeit,
             braucht_sammlungen,
         ),
     })

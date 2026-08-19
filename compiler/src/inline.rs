@@ -301,6 +301,13 @@ fn remap_op(op: &Op, mv: &dyn Fn(Val) -> Val) -> Op {
         Op::Barrier { val } => Op::Barrier { val: mv(*val) },
         Op::SecureZero { addr, size } => Op::SecureZero { addr: mv(*addr), size: mv(*size) },
         Op::AtomicAdd { addr, val } => Op::AtomicAdd { addr: mv(*addr), val: mv(*val) },
+        Op::AtomicCas { addr, erw, neu } => {
+            Op::AtomicCas { addr: mv(*addr), erw: mv(*erw), neu: mv(*neu) }
+        }
+        Op::ThreadSpawn { arg, stapel, ctid } => {
+            Op::ThreadSpawn { arg: mv(*arg), stapel: mv(*stapel), ctid: mv(*ctid) }
+        }
+        Op::ThreadSelf => Op::ThreadSelf,
         Op::GcAddr { regs } => Op::GcAddr { regs: *regs },
         Op::Asm { vorlage, aus, ein_regs, ein, clobber } => Op::Asm {
             vorlage: vorlage.clone(),
