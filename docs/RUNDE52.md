@@ -147,10 +147,10 @@ einmal"; die exakte Zählung macht `volatile.fi`.
 ## 4. MMIO
 
 ```firn
-__mmio_lesen8(p)      __mmio_schreiben8(p, w)
-__mmio_lesen16(p)     __mmio_schreiben16(p, w)
-__mmio_lesen32(p)     __mmio_schreiben32(p, w)
-__mmio_lesen64(p)     __mmio_schreiben64(p, w)
+__mmio_read8(p)      __mmio_write8(p, w)
+__mmio_read16(p)     __mmio_write16(p, w)
+__mmio_read32(p)     __mmio_write32(p, w)
+__mmio_read64(p)     __mmio_write64(p, w)
 ```
 
 Acht eingebaute Namen mit reserviertem `__`-Präfix (wie `__atomar_addieren`,

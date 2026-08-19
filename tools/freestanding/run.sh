@@ -95,7 +95,7 @@ as --64 -o "$TMPD/start.o" demos/kernel/start.s 2>"$TMPD/as.err" \
 for s in 0 1; do
     f="$TMPD/k$s.o"
     [ -f "$f" ] || continue
-    if ld -n -T "$SKRIPT" --defsym=KERN_START="_F$s.kern_start" \
+    if ld -n -T "$SKRIPT" --defsym=KERN_START="_F$s.core_start" \
           -o "$TMPD/k$s.elf" "$TMPD/start.o" "$f" 2>"$TMPD/ld$s.err"; then
         ein=$(readelf -h "$TMPD/k$s.elf" | awk -F: '/Entry point/ {print $2}' | tr -d ' ')
         ok "firnc$s: gelinkt, Einsprung $ein"
@@ -118,7 +118,7 @@ if command -v qemu-system-x86_64 >/dev/null 2>&1; then
         timeout 20 qemu-system-x86_64 -kernel "$TMPD/k$s.mb" -serial stdio \
             -display none -no-reboot > "$TMPD/q$s.txt" 2>&1
         if grep -q "FIRN: profile kernel ist" "$TMPD/q$s.txt" \
-           && grep -q "freistehend." "$TMPD/q$s.txt"; then
+           && grep -q "freestanding." "$TMPD/q$s.txt"; then
             ok "firnc$s: gebootet, serielle Ausgabe erschienen"
         else
             bad "firnc$s: keine serielle Ausgabe aus QEMU"
@@ -148,7 +148,7 @@ for s in 0 1; do
 done
 
 echo "== 5. volatile haelt in allen drei Baustufen =="
-# `cli` und `hlt` stehen in `kern_start`, das niemand ruft — sie koennen also
+# `cli` und `hlt` stehen in `core_start`, das niemand ruft — sie koennen also
 # auch durch Einbetten nicht mehr werden. Genau einmal, in jeder Baustufe.
 for stufe in "" "--no-opt" "--opt-level=dev-fast"; do
     name=${stufe:---release-fast}
