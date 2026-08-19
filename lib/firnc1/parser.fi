@@ -30,10 +30,11 @@ import mono
 import muster
 import fehler
 import gc
+import iface
 
 export { Parser, par_neu, par_neu_modul, par_frei, par_lauf, par_fehler, par_baum,
          par_nicht_kern, par_baum_uebernehmen, par_gen_setzen, par_mu_setzen,
-         par_fe_setzen, par_zeit_setzen, par_gc_setzen }
+         par_fe_setzen, par_zeit_setzen, par_gc_setzen, par_if_setzen }
 
 // Token-Arten aus lexer.fi (dieselbe Reihenfolge wie compiler/src/lexer.rs)
 // "kein Wert"
@@ -180,6 +181,12 @@ struct Parser {
     // Klassennamen programmweit gelten. 0 = kein Register, dann sind
     // `gc class`, `Gc[T]`, `x.as?[C]` und `#[no_gc]` nicht portiert.
     gcr: u64,
+    // RUNDE 46: Registrierung der Schnittstellen (`iface.fi`). Dieselbe
+    // Bauart wie `gcr`. 0 = kein Register; dann werden `interface`-Bloecke
+    // zwar richtig gelesen, aber nicht aufgehoben — das reicht fuer
+    // `bin/astdump.fi`, dessen Massstab (`ast_kanon.rs`) sie ebenfalls
+    // nicht ausgibt.
+    ifr: u64,
     // Das Attribut `#[no_gc]` vor der naechsten Funktionsdeklaration.
     nogc_anstehend: u32,
     // Das Attribut `#[must_consume]` vor der naechsten fn-/struct-Deklaration
@@ -208,7 +215,7 @@ fn par_neu(lx: u64) -> Parser {
         module: vec_neu[u32](),
         kladde: rt.buf_neu(),
         klammern: 0, kein_slit: 0, fehler: 0, nicht_kern: false,
-        gen: 0, mu: 0, feh: 0, zeit: false, gcr: 0, nogc_anstehend: 0, mc_anstehend: 0, tpoff: 0, sonr: -1,
+        gen: 0, mu: 0, feh: 0, zeit: false, gcr: 0, ifr: 0, nogc_anstehend: 0, mc_anstehend: 0, tpoff: 0, sonr: -1,
         lokal: vec_neu[u32](), lgrenze: vec_neu[u32](),
         hoist: vec_neu[u32](), interp: 0,
     }
@@ -247,6 +254,9 @@ fn hat_zeit(p: *mut Parser) -> bool { return (*p).zeit }
 
 // RUNDE 34: die gc-Registrierung anmelden. Ebenfalls VOR `par_lauf`.
 fn par_gc_setzen(p: *mut Parser, g: u64) { (*p).gcr = g }
+fn par_if_setzen(p: *mut Parser, f: u64) { (*p).ifr = f }
+fn ifr(p: *mut Parser) -> *mut iface.If { return (*p).ifr as *mut iface.If }
+fn hat_if(p: *mut Parser) -> bool { return (*p).ifr != 0 }
 fn gr(p: *mut Parser) -> *mut gc.Gc { return (*p).gcr as *mut gc.Gc }
 fn hat_gc(p: *mut Parser) -> bool { return (*p).gcr != 0 }
 
@@ -693,6 +703,24 @@ fn typ(p: *mut Parser) -> u32 {
             let m: u32 = mono.gen_auspraegung(gn(p), nr, &targs, false)
             vec_frei[u32](&targs)
             return ast.typ_neu(par_baum(p), ast.T_NAME, m, 0)
+        }
+        // RUNDE 46 (iface.rs::hook_type): `dyn I` — der Schnittstellenwert.
+        // Der Name wird zu EINEM Namen mit Leerzeichen; aufgeloest wird er
+        // erst in der Typaufloesung. Schnittstellennamen gelten programmweit
+        // und werden NICHT umbenannt.
+        var dw: [u8; 3] = "dyn"
+        let itd: *mut intern.Interner = lexer.lex_namen(lx(p))
+        if intern.intern_gleich(itd, nr, (&dw[0]) as u64, 3) && ist(p, A_IDENT) {
+            let inr: u32 = nummer(p, 0)
+            weiter_bump(p)
+            rt.buf_leeren(&(*p).kladde)
+            var dw2: [u8; 4] = "dyn "
+            rt.buf_push_bytes(&(*p).kladde, (&dw2[0]) as u64, 4)
+            rt.buf_push_bytes(&(*p).kladde, intern.intern_zeiger(itd, inr),
+                              intern.intern_laenge(itd, inr))
+            let dn: u32 = intern.intern_nummer(itd, rt.buf_ptr(&(*p).kladde),
+                                               rt.buf_len(&(*p).kladde)) as u32
+            return ast.typ_neu(par_baum(p), ast.T_NAME, dn, 0)
         }
         let q: u32 = vielleicht_qualifiziert(p, nr, false)
         return ast.typ_neu(par_baum(p), ast.T_NAME, q, 0)
@@ -2683,6 +2711,13 @@ fn eigene_suchen(p: *mut Parser) {
             i = impl_ende(p, i)
             continue
         }
+        // RUNDE 46: dasselbe fuer `interface I { fn … }`. Die Methoden einer
+        // Schnittstelle sind keine Namen des Moduls — `firnc0` sieht sie
+        // ebenfalls nie (der Block landet gar nicht im Baum).
+        if ist_interface_bei(p, i) {
+            i = impl_ende(p, i)
+            continue
+        }
         let a: u32 = lexer.lex_art(lx(p), i)
         if a == A_KWFN || a == A_KWSTRUCT || a == A_KWCONST {
             if lexer.lex_art(lx(p), i + 1) == A_IDENT {
@@ -2746,7 +2781,53 @@ fn ist_impl(p: *mut Parser) -> bool {
     if art(p, 1) != A_IDENT {
         return false
     }
+    if art(p, 2) == A_LBRACE {
+        return true
+    }
+    // RUNDE 46: `impl Schnittstelle for Typ {`. `for` ist ein
+    // Schluesselwort und macht die Form eindeutig.
+    if art(p, 2) != A_KWFOR {
+        return false
+    }
+    if art(p, 3) != A_IDENT {
+        return false
+    }
+    return art(p, 4) == A_LBRACE
+}
+
+// RUNDE 46 (iface.rs::hook_item): Steht an dieser Stelle `interface Name {`?
+fn ist_interface(p: *mut Parser) -> bool {
+    if !ist(p, A_IDENT) {
+        return false
+    }
+    var iw: [u8; 9] = "interface"
+    let it: *mut intern.Interner = lexer.lex_namen(lx(p))
+    if !intern.intern_gleich(it, nummer(p, 0), (&iw[0]) as u64, 9) {
+        return false
+    }
+    if art(p, 1) != A_IDENT {
+        return false
+    }
     return art(p, 2) == A_LBRACE
+}
+
+// Dasselbe an einer ABSOLUTEN Tokenstelle (fuer die Vorabsuche).
+fn ist_interface_bei(p: *mut Parser, i: usize) -> bool {
+    if i + 2 >= (*p).n {
+        return false
+    }
+    if lexer.lex_art(lx(p), i) != A_IDENT {
+        return false
+    }
+    var iw: [u8; 9] = "interface"
+    let it: *mut intern.Interner = lexer.lex_namen(lx(p))
+    if !intern.intern_gleich(it, lexer.lex_nr(lx(p), i), (&iw[0]) as u64, 9) {
+        return false
+    }
+    if lexer.lex_art(lx(p), i + 1) != A_IDENT {
+        return false
+    }
+    return lexer.lex_art(lx(p), i + 2) == A_LBRACE
 }
 
 // Dasselbe an einer ABSOLUTEN Tokenstelle (fuer die Vorabsuche).
@@ -2765,12 +2846,32 @@ fn ist_impl_bei(p: *mut Parser, i: usize) -> bool {
     if lexer.lex_art(lx(p), i + 1) != A_IDENT {
         return false
     }
-    return lexer.lex_art(lx(p), i + 2) == A_LBRACE
+    if lexer.lex_art(lx(p), i + 2) == A_LBRACE {
+        return true
+    }
+    if i + 4 >= (*p).n {
+        return false
+    }
+    if lexer.lex_art(lx(p), i + 2) != A_KWFOR {
+        return false
+    }
+    if lexer.lex_art(lx(p), i + 3) != A_IDENT {
+        return false
+    }
+    return lexer.lex_art(lx(p), i + 4) == A_LBRACE
 }
 
-// Stelle NACH der schliessenden Klammer des impl-Blocks bei `i`.
+// Stelle NACH der schliessenden Klammer des Blocks bei `i`. Gesucht wird ab
+// der ERSTEN geschweiften Klammer — `impl T {` und `impl I for T {` (und
+// ebenso `interface I {`) sind damit derselbe Fall.
 fn impl_ende(p: *mut Parser, i: usize) -> usize {
     var k: usize = i + 2
+    while k < (*p).n {
+        if lexer.lex_art(lx(p), k) == A_LBRACE {
+            break
+        }
+        k = k + 1
+    }
     var tiefe: usize = 0
     while k < (*p).n {
         let a: u32 = lexer.lex_art(lx(p), k)
@@ -2791,11 +2892,33 @@ fn impl_ende(p: *mut Parser, i: usize) -> usize {
 // Der Empfaenger einer Methode: `self`, `*self` oder `*mut self`.
 // Firn hat keine Referenzen — der Empfaenger wird geschrieben wie jeder
 // andere Parameter dieser Sprache (impls.rs, Abschnitt „Der Empfaenger").
-fn selbst_param(p: *mut Parser, tname: u32) -> bool {
+fn selbst_param(p: *mut Parser, tname0: u32) -> bool {
     var sw: [u8; 4] = "self"
     let it: *mut intern.Interner = lexer.lex_namen(lx(p))
     let snr: u32 = intern.intern_nummer(it, (&sw[0]) as u64, 4) as u32
+    // RUNDE 46: fuer eine `gc class` traegt der Empfaenger den INTERNEN
+    // Structnamen `"gc K"` — aus `*self` wird damit genau `Gc[K]`. Ob `K`
+    // eine Klasse ist, steht in der Registrierung; sie wird beim Parsen
+    // gefuellt, deshalb muss `gc class K` VOR dem `impl`-Block stehen
+    // (docs/RUNDE46.md §9). Wortgleich zu impls.rs::selbst_param.
+    var tname: u32 = tname0
+    var klasse: bool = false
+    if hat_gc(p) && gc.gc_ist_klasse(gr(p), tname0) {
+        klasse = true
+        rt.buf_leeren(&(*p).kladde)
+        var gw: [u8; 3] = "gc "
+        rt.buf_push_bytes(&(*p).kladde, (&gw[0]) as u64, 3)
+        rt.buf_push_bytes(&(*p).kladde, intern.intern_zeiger(it, tname0),
+                          intern.intern_laenge(it, tname0))
+        tname = intern.intern_nummer(it, rt.buf_ptr(&(*p).kladde),
+                                     rt.buf_len(&(*p).kladde)) as u32
+    }
     if ist(p, A_IDENT) && nummer(p, 0) == snr {
+        if klasse {
+            // ein 'gc class'-Wert lebt nur auf dem GC-Heap
+            meckern(p)
+            return false
+        }
         weiter_bump(p)
         let t: u32 = ast.typ_neu(par_baum(p), ast.T_NAME, tname, 0)
         ast.param_dazu(par_baum(p), snr, t)
@@ -2869,11 +2992,173 @@ fn methoden_deklaration(p: *mut Parser, tname: u32) {
     ast.fn_dazu(par_baum(p), name, poff, plen, ret, rumpf, 0, 0)
 }
 
+// RUNDE 46 (iface.rs::interface_decl): `interface I { fn m(*self) -> T … }`.
+// Der Block geht in die Registrierung (`iface.fi`), NICHT in den Baum —
+// Schnittstellennamen gelten programmweit und werden nicht umbenannt. Ohne
+// Registrierung (astdump) wird er richtig gelesen und verworfen.
+fn interface_deklaration(p: *mut Parser) {
+    weiter_bump(p)
+    let name: u32 = nummer(p, 0)
+    weiter_bump(p)
+    var ii: u32 = KEIN
+    if hat_if(p) {
+        ii = iface.if_dazu(ifr(p), lexer.lex_namen(lx(p)), name)
+        if ii == KEIN {
+            // die schnittstelle ist bereits deklariert
+            meckern(p)
+            return
+        }
+    }
+    if !erwarte(p, A_LBRACE) {
+        return
+    }
+    while true {
+        while friss(p, A_SEMI) {}
+        if ist(p, A_RBRACE) || am_ende(p) {
+            break
+        }
+        if (*p).fehler > 0 {
+            break
+        }
+        let vor: usize = (*p).pos
+        if !ist(p, A_KWFN) {
+            meckern(p)
+            break
+        }
+        if !schnittstellen_methode(p, ii) {
+            break
+        }
+        if (*p).pos == vor {
+            weiter_bump(p)
+        }
+    }
+    erwarte(p, A_RBRACE)
+}
+
+// Eine Methode der Schnittstelle: `fn name(<empfaenger>[, param…]) [-> T]`
+// — OHNE Rumpf. Der Empfaenger MUSS ein Zeiger sein: ueber die Tafel steht
+// nur der Datenzeiger zur Verfuegung.
+fn schnittstellen_methode(p: *mut Parser, ii: u32) -> bool {
+    weiter_bump(p)
+    if !ist(p, A_IDENT) {
+        meckern(p)
+        return false
+    }
+    let mnr: u32 = nummer(p, 0)
+    weiter_bump(p)
+    if ist(p, A_LBRACKET) {
+        meckern(p)
+        return false
+    }
+    if !erwarte(p, A_LPAREN) {
+        return false
+    }
+    var sw: [u8; 4] = "self"
+    let it: *mut intern.Interner = lexer.lex_namen(lx(p))
+    let snr: u32 = intern.intern_nummer(it, (&sw[0]) as u64, 4) as u32
+    if !ist(p, A_STAR) {
+        meckern(p)
+        return false
+    }
+    var k: usize = 1
+    if art(p, 1) == A_KWMUT {
+        k = 2
+    }
+    if art(p, k) != A_IDENT || nummer(p, k) != snr {
+        meckern(p)
+        return false
+    }
+    weiter_bump(p)
+    if k == 2 {
+        weiter_bump(p)
+    }
+    weiter_bump(p)
+    var ptypen: Vec[u32] = vec_neu[u32]()
+    if friss(p, A_COMMA) {
+        while true {
+            if ist(p, A_RPAREN) || am_ende(p) {
+                break
+            }
+            let vor: usize = (*p).pos
+            if !ist(p, A_IDENT) {
+                meckern(p)
+                vec_frei[u32](&ptypen)
+                return false
+            }
+            weiter_bump(p)
+            if !erwarte(p, A_COLON) {
+                vec_frei[u32](&ptypen)
+                return false
+            }
+            let pt: u32 = typ(p)
+            if pt == ast.NICHTS {
+                vec_frei[u32](&ptypen)
+                return false
+            }
+            vec_push[u32](&ptypen, pt)
+            if !friss(p, A_COMMA) {
+                break
+            }
+            if (*p).pos == vor {
+                weiter_bump(p)
+            }
+        }
+    }
+    if !erwarte(p, A_RPAREN) {
+        vec_frei[u32](&ptypen)
+        return false
+    }
+    var ret: u32 = ast.NICHTS
+    if friss(p, A_ARROW) {
+        ret = typ(p)
+        if ret == ast.NICHTS {
+            vec_frei[u32](&ptypen)
+            return false
+        }
+    }
+    if ist(p, A_LBRACE) {
+        // eine schnittstellenmethode hat keinen rumpf
+        meckern(p)
+        vec_frei[u32](&ptypen)
+        return false
+    }
+    if ii != KEIN {
+        if !iface.if_methode_dazu(ifr(p), ii, mnr, &ptypen, ret) {
+            // die methode gibt es in dieser schnittstelle schon
+            meckern(p)
+            vec_frei[u32](&ptypen)
+            return false
+        }
+    }
+    vec_frei[u32](&ptypen)
+    return true
+}
+
 fn impl_deklaration(p: *mut Parser) {
     weiter_bump(p)
-    let roh: u32 = nummer(p, 0)
+    let erster: u32 = nummer(p, 0)
     weiter_bump(p)
+    // RUNDE 46 (iface.rs): `impl Schnittstelle for Typ`. Der Block legt
+    // DIESELBEN Funktionen an wie `impl Typ` — die Schnittstelle sagt nur
+    // zusaetzlich, was darin stehen MUSS. In der Registrierung steht der
+    // Typname so, wie er im Quelltext steht (ohne Modulpraefix): `firnc0`
+    // hat an dieser Stelle ebenfalls nur den rohen Namen.
+    var roh: u32 = erster
+    var fuer: bool = false
+    if ist(p, A_KWFOR) {
+        weiter_bump(p)
+        if !ist(p, A_IDENT) {
+            meckern(p)
+            return
+        }
+        roh = nummer(p, 0)
+        weiter_bump(p)
+        fuer = true
+    }
     let tname: u32 = umbenannt(p, roh)
+    if fuer && hat_if(p) {
+        iface.if_umsetzung_dazu(ifr(p), erster, roh)
+    }
     if !erwarte(p, A_LBRACE) {
         return
     }
@@ -3049,6 +3334,8 @@ fn par_lauf(p: *mut Parser) {
             attribut(p)
         } else if a == A_IDENT && hat_gc(p) && ist_gc_class(p) {
             gc_class_deklaration(p)
+        } else if a == A_IDENT && ist_interface(p) {
+            interface_deklaration(p)
         } else if a == A_IDENT && ist_impl(p) {
             impl_deklaration(p)
         } else if a == A_KWFN {
