@@ -17,7 +17,7 @@ os.chdir(ROOT)
 sys.path.insert(0, 'tools/englisch')
 import quelltext as Q
 
-ROOTS = ['compiler/src', 'lib', 'bin', 'tools', 'beispiele', 'examples', 'tests', 'bench', 'testdata']
+ROOTS = ['compiler/src', 'lib', 'bin', 'tools', 'demos', 'examples', 'tests', 'bench', 'testdata']
 
 
 def tabelle(pfad):

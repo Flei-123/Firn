@@ -32,8 +32,8 @@ FIRN_KW = set("""fn let var if else while return struct const profile as mut tru
 extern break defer errdefer comptime continue for in import export enum match error try catch""".split())
 RESERVIERT = RUST_KW | FIRN_KW
 
-ROOTS = ['compiler/src', 'lib', 'bin', 'tools', 'beispiele', 'examples', 'tests', 'bench', 'testdata']
-TEIL = re.compile(r'[a-z0-9]+|[A-Z][a-z0-9]*|[A-Z]+(?![a-z])')
+ROOTS = ['compiler/src', 'lib', 'bin', 'tools', 'demos', 'examples', 'tests', 'bench', 'testdata']
+TEIL = re.compile(r'[a-z0-9]+|[A-Z]+(?![a-z])|[A-Z][a-z0-9]*')
 
 
 def dateien():

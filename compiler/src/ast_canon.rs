@@ -31,19 +31,19 @@ thread_local! {
     /// Ausdruck sein Typ. Ein `thread_local` statt eines zusaetzlichen
     /// Parameters durch zwoelf Funktionen: die Ausgabe ist ein
     /// Fehlersuchwerkzeug, kein Teil des Compilerpfades.
-    static TYPEN: RefCell<Option<(Vec<crate::types::Type>, TypeCtx)>> = RefCell::new(None);
+    static TYPES: RefCell<Option<(Vec<crate::types::Type>, TypeCtx)>> = RefCell::new(None);
 }
 
 /// Wie `render`, aber mit dem Typ an jedem Ausdruck: `(int 5 :i32)`.
 pub fn render_typed(p: &Program, info: &TypeInfo) -> String {
-    TYPEN.with(|t| *t.borrow_mut() = Some((info.expr_types.clone(), info.tcx.clone())));
+    TYPES.with(|t| *t.borrow_mut() = Some((info.expr_types.clone(), info.tcx.clone())));
     let out = render(p);
-    TYPEN.with(|t| *t.borrow_mut() = None);
+    TYPES.with(|t| *t.borrow_mut() = None);
     out
 }
 
 fn ty_of(id: ExprId) -> Option<String> {
-    TYPEN.with(|t| {
+    TYPES.with(|t| {
         t.borrow().as_ref().map(|(tys, tcx)| {
             let ty = tys.get(id as usize).cloned().unwrap_or(crate::types::Type::Error);
             tcx.name_of(&ty)

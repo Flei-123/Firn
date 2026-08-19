@@ -138,7 +138,7 @@ if [ "$(cat "$WORK/info.0.rc")" != 0 ] || [ "$(cat "$WORK/info.1.rc")" != 0 ]; t
     weh "Exit-Codes $(cat "$WORK/info.0.rc")/$(cat "$WORK/info.1.rc")"
 elif ! cmp -s "$WORK/info.0.out" "$WORK/info.1.out"; then
     weh "Berichte unterscheiden sich" "$(diff "$WORK/info.0.out" "$WORK/info.1.out" | head -4)"
-elif ! grep -q '^brauche geo demos/packages/geo$' "$WORK/info.0.out"; then
+elif ! grep -q '^needs geo demos/packages/geo$' "$WORK/info.0.out"; then
     weh "Abhaengigkeit fehlt im Bericht" "$(head -8 "$WORK/info.0.out")"
 else
     gut
@@ -150,7 +150,7 @@ fall "privates Modul einer Abhaengigkeit wird abgelehnt"
 P=$(kopie f_privat)
 sed -i 's/^import geo.dot$/import geo.inner/' "$P/app/src/main.fi"
 beide privat --package "$P/app" -o "$WORK/f_privat.bin"
-erwarte_fehler privat "ist in paket 'geo' nicht oeffentlich"
+erwarte_fehler privat "is not public in package 'geo'"
 
 # --- 6: ein Paket, das nicht als Abhaengigkeit eingetragen ist -----------
 #
@@ -158,7 +158,7 @@ erwarte_fehler privat "ist in paket 'geo' nicht oeffentlich"
 # traegt es nicht ein. Der Import findet die Datei ueber den Weg (1), die
 # Sichtbarkeitspruefung muss trotzdem greifen.
 
-fall "Paket ohne 'brauche' wird abgelehnt"
+fall "Paket ohne 'needs' wird abgelehnt"
 mkdir -p "$WORK/f_fremd/app/src/secret" "$WORK/f_fremd/h"
 cat > "$WORK/f_fremd/app/firn.package" <<'EOF'
 package app
@@ -192,7 +192,7 @@ export { help_it }
 fn help_it() -> i32 { return 1 }
 EOF
 beide fremd --package "$WORK/f_fremd/app" -o "$WORK/f_fremd.bin"
-erwarte_fehler fremd "paket 'secret' ist keine abhaengigkeit von paket 'app'"
+erwarte_fehler fremd "package 'secret' is not a dependency of package 'app'"
 
 # --- 7: Paketzyklus ------------------------------------------------------
 
@@ -200,7 +200,7 @@ fall "Paketzyklus wird gemeldet"
 P=$(kopie f_zyklus)
 printf 'needs app ../app\n' >> "$P/geo/firn.package"
 beide zyklus --package "$P/app" -o "$WORK/f_zyklus.bin"
-erwarte_fehler zyklus "paketzyklus: app -> geo -> app"
+erwarte_fehler zyklus "package cycle: app -> geo -> app"
 
 # --- 8: Abhaengigkeit ohne Manifest --------------------------------------
 
@@ -208,7 +208,7 @@ fall "Abhaengigkeit ohne Manifest wird gemeldet"
 P=$(kopie f_kein_manifest)
 rm -f "$P/geo/firn.package"
 beide keinman --package "$P/app" -o "$WORK/f_km.bin"
-erwarte_fehler keinman "abhaengigkeit 'geo' hat kein manifest"
+erwarte_fehler keinman "dependency 'geo' has no manifest"
 
 # --- 9: Abhaengigkeit zeigt auf ein anders benanntes Paket ---------------
 
@@ -216,7 +216,7 @@ fall "falscher Paketname in der Abhaengigkeit"
 P=$(kopie f_name)
 sed -i 's/^package  *geo$/package  geometry/' "$P/geo/firn.package"
 beide falschname --package "$P/app" -o "$WORK/f_name.bin"
-erwarte_fehler falschname "abhaengigkeit 'geo' zeigt auf paket 'geometry'"
+erwarte_fehler falschname "dependency 'geo' points to package 'geometry'"
 
 # --- 10: kaputte Versionsangabe ------------------------------------------
 
@@ -224,7 +224,7 @@ fall "ungueltige Version im Manifest"
 P=$(kopie f_version)
 sed -i 's/^version  *0.2.0$/version  0.2/' "$P/geo/firn.package"
 beide version --package "$P/app" -o "$WORK/f_ver.bin"
-erwarte_fehler version "ungueltige version '0.2' (erwartet zahl.zahl.zahl)"
+erwarte_fehler version "invalid version '0.2' (expected number.number.number)"
 
 # --- 11: unbekannter Schluessel ------------------------------------------
 
@@ -232,15 +232,15 @@ fall "unbekannter Schluessel im Manifest"
 P=$(kopie f_schluessel)
 sed -i 's/^public  *geo dot$/publi   geo dot/' "$P/geo/firn.package"
 beide schluessel --package "$P/app" -o "$WORK/f_sch.bin"
-erwarte_fehler schluessel "unbekannter schluessel 'publi'"
+erwarte_fehler schluessel "unknown key 'publi'"
 
 # --- 12: fehlende Pflichtzeile -------------------------------------------
 
-fall "Manifest ohne 'paket'-Zeile"
+fall "Manifest ohne 'package'-Zeile"
 P=$(kopie f_ohne_paket)
 sed -i 's/^package  *app$//' "$P/app/firn.package"
 beide ohnepaket --package "$P/app" -o "$WORK/f_op.bin"
-erwarte_fehler ohnepaket "das manifest braucht eine zeile 'paket <name>'"
+erwarte_fehler ohnepaket "the manifest needs a line 'package <name>'"
 
 # --- 13: Namenskonflikt zweier Module ------------------------------------
 
@@ -261,20 +261,20 @@ fn main() -> i32 {
 }
 EOF
 beide konflikt --package "$P/app" -o "$WORK/f_konf.bin"
-erwarte_fehler konflikt "namenskonflikt: modul 'help' kommt aus zwei dateien"
+erwarte_fehler konflikt "name conflict: module 'help' comes from two files"
 
 # --- 14: `--package` auf eine Bibliothek ohne Einstiegspunkt ---------------
 
 fall "Bibliothek ohne 'start' laesst sich nicht bauen"
 beide biblio --package demos/packages/geo -o "$WORK/f_bib.bin"
-erwarte_fehler biblio "das manifest hat keinen einstiegspunkt"
+erwarte_fehler biblio "the manifest has no entry point"
 
 # --- 15: `--package` auf ein Verzeichnis ohne Manifest ---------------------
 
 fall "Verzeichnis ohne Manifest wird gemeldet"
 mkdir -p "$WORK/leer"
 beide leer --package "$WORK/leer" -o "$WORK/f_leer.bin"
-erwarte_fehler leer "kein manifest in"
+erwarte_fehler leer "no manifest in"
 
 # --- 16: privates Modul IM eigenen Paket bleibt erlaubt ------------------
 
@@ -284,9 +284,9 @@ cat > "$P/app/src/main.fi" <<'EOF'
 import geo
 
 fn main() -> i32 {
-    // geo.umfang rechnet ueber geo.inner — ein Modul, das NICHT oeffentlich
+    // geo.extent rechnet ueber geo.inner — ein Modul, das NICHT oeffentlich
     // ist. Innerhalb des Pakets 'geo' ist das erlaubt.
-    return geo.umfang(geo.rechteck_neu(0, 0, 3, 4))
+    return geo.extent(geo.rect_new(0, 0, 3, 4))
 }
 EOF
 "$FIRNC" --package "$P/app" -o "$WORK/f_intern0.bin" > "$WORK/f_intern.log" 2>&1
@@ -362,19 +362,19 @@ fi
 
 # --- 20: mehrere Quellverzeichnisse in einem Paket -----------------------
 
-fall "zweites 'quelle'-Verzeichnis wird durchsucht"
+fall "zweites 'source'-Verzeichnis wird durchsucht"
 P=$(kopie f_zweitquelle)
 mkdir -p "$P/app/extra"
-printf 'quelle   extra\n' >> "$P/app/firn.package"
-cat > "$P/app/extra/zusatz.fi" <<'EOF'
-export { drei }
-fn drei() -> i32 { return 3 }
+printf 'source   extra\n' >> "$P/app/firn.package"
+cat > "$P/app/extra/extra_mod.fi" <<'EOF'
+export { three }
+fn three() -> i32 { return 3 }
 EOF
 cat > "$P/app/src/main.fi" <<'EOF'
-import zusatz
+import extra_mod
 
 fn main() -> i32 {
-    return zusatz.drei()
+    return extra_mod.three()
 }
 EOF
 "$FIRNC" --package "$P/app" -o "$WORK/f_zq0.bin" >/dev/null 2>&1 && "$WORK/f_zq0.bin"
@@ -391,7 +391,7 @@ fi
 
 fall "--package und eine Quelldatei zugleich wird abgelehnt"
 beide beides --package demos/packages/app tests/110_module.fi -o "$WORK/f_beides.bin"
-erwarte_fehler beides "--package und eine eingabedatei schliessen einander aus"
+erwarte_fehler beides "--package and an input file are mutually exclusive"
 
 echo
 echo "PAKETE: $OK bestanden, $BAD fehlgeschlagen"

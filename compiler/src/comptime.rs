@@ -44,9 +44,9 @@ use crate::types::Type;
 use std::collections::HashMap;
 
 /// Obergrenze ausgeführter Anweisungen je `comptime`-Auswertung.
-const MAX_SCHRITTE: u64 = 2_000_000;
+const MAX_STEPS: u64 = 2_000_000;
 /// Obergrenze verschachtelter Aufrufe.
-const MAX_TIEFE: u32 = 64;
+const MAX_DEPTH: u32 = 64;
 
 type Error = (Span, String);
 
@@ -101,10 +101,10 @@ impl<'a> Execution<'a> {
         span: Span,
         depth: u32,
     ) -> Result<i128, Error> {
-        if depth >= MAX_TIEFE {
+        if depth >= MAX_DEPTH {
             return Err((
                 span,
-                format!("comptime: more than {} nested calls", MAX_TIEFE),
+                format!("comptime: more than {} nested calls", MAX_DEPTH),
             ));
         }
         let f: &FnDecl = match self.prog.funcs.iter().find(|f| f.name == name) {
@@ -164,12 +164,12 @@ impl<'a> Execution<'a> {
         depth: u32,
     ) -> Result<Flow, Error> {
         self.steps += 1;
-        if self.steps > MAX_SCHRITTE {
+        if self.steps > MAX_STEPS {
             return Err((
                 s.span(),
                 format!(
                     "comptime: more than {} steps — endless loop?",
-                    MAX_SCHRITTE
+                    MAX_STEPS
                 ),
             ));
         }
@@ -227,12 +227,12 @@ impl<'a> Execution<'a> {
             Stmt::While { cond, body, .. } => {
                 loop {
                     self.steps += 1;
-                    if self.steps > MAX_SCHRITTE {
+                    if self.steps > MAX_STEPS {
                         return Err((
                             s.span(),
                             format!(
                                 "comptime: more than {} steps — endless loop?",
-                                MAX_SCHRITTE
+                                MAX_STEPS
                             ),
                         ));
                     }
@@ -252,12 +252,12 @@ impl<'a> Execution<'a> {
                 let mut i = of;
                 while i < to {
                     self.steps += 1;
-                    if self.steps > MAX_SCHRITTE {
+                    if self.steps > MAX_STEPS {
                         return Err((
                             s.span(),
                             format!(
                                 "comptime: more than {} steps — endless loop?",
-                                MAX_SCHRITTE
+                                MAX_STEPS
                             ),
                         ));
                     }

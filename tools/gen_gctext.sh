@@ -13,7 +13,7 @@
 # genau wie `laufzeit_quelle` in gc.rs sie zusammensetzt. Die Sammlungen
 # haengen hinten dran und werden nur mit ausgepackt, wenn das Programm sie
 # braucht — deshalb gibt es zwei Laengen: GCTEXT_N (nur gc.fi) und
-# GCTEXT_ALLE (mit Sammlungen).
+# GCTEXT_ALL (mit Sammlungen).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 python3 - <<'PYEOF'
@@ -37,19 +37,19 @@ out.append('// aus — der Treiber zieht ihn als zusaetzliches Modul ein, sobald
 out.append('// im Programm ein `gc class` steht (laufzeit_quelle in gc.rs).')
 out.append('import rt')
 out.append('')
-out.append('export { GCTEXT_N, GCTEXT_ALLE, gctext_write }')
+out.append('export { GCTEXT_N, GCTEXT_ALL, gctext_write }')
 out.append('')
 out.append('// Laenge des Kerns (lib/gc/gc.fi) in Oktetten.')
 out.append('const GCTEXT_N: u64 = %d' % n)
 out.append('// Laenge mit den Sammlungen (gcvec.fi + gcmap.fi) dahinter.')
-out.append('const GCTEXT_ALLE: u64 = %d' % alle)
+out.append('const GCTEXT_ALL: u64 = %d' % alle)
 out.append('')
 out.append('// `with_collections` entscheidet, ob GcVec/GcMap mit ausgepackt')
 out.append('// werden — genau wie der dritte Parameter von laufzeit_quelle.')
 out.append('fn gctext_write(b: *mut rt.Buf, with_collections: bool) {')
 out.append('    var limit: u64 = GCTEXT_N')
 out.append('    if with_collections {')
-out.append('        limit = GCTEXT_ALLE')
+out.append('        limit = GCTEXT_ALL')
 out.append('    }')
 out.append('    var w: [u64; %d] = [' % len(words))
 for i in range(0, len(words), 10):

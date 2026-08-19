@@ -29,7 +29,7 @@ use crate::types::Type;
 pub(crate) fn real_name(name: &str) -> Option<&'static str> {
     match name {
         "weak" => Some(gc::FN_WEAK),
-        "strong" => Some(gc::FN_STARK),
+        "strong" => Some(gc::FN_STRONG),
         _ => None,
     }
 }
