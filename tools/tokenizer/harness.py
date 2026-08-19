@@ -47,7 +47,7 @@ STATES = {
     "CDATA section state": 5,
 }
 
-# Auftragsflaggen (Bit 0 = XML-Anpassung), siehe tools/tokenizer/LOG.md.
+# Job flags (bit 0 = XML adjustment), see tools/tokenizer/LOG.md.
 FLAG_XML = 1
 
 
@@ -106,7 +106,7 @@ def lade_faelle(xml_modus=True):
         liste = daten.get("tests")
         flaggen = 0
         if liste is None:
-            # Diese Faelle erwarten die XML-Anpassung des Tokenstroms.
+            # These cases expect the XML adjustment of the token stream.
             liste = daten.get("xmlViolationTests", [])
             if xml_modus:
                 flaggen = FLAG_XML
@@ -182,10 +182,10 @@ def main():
             "FEHLER: %d Antwortzeilen fuer %d Auftraege — das Binary ist "
             "abgebrochen (Exit %d)" % (len(zeilen), len(plan), p.returncode)
         )
-        # Alles, was fehlt, gilt als Fehlschlag: mit leeren Zeilen auffuellen.
+        # Everything that is missing counts as a failure: pad with empty lines.
         zeilen += ["[]"] * (len(plan) - len(zeilen))
 
-    # Zwei Bilanzen: ohne und mit Vergleich der Parse-Fehler.
+    # Two balances: without and with a comparison of the parse errors.
     ok_ohne = [True] * len(faelle)
     ok_mit = [True] * len(faelle)
     grund = [None] * len(faelle)

@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# tools/lex_compare.sh — der in FIRN geschriebene Lexer gegen den in RUST
-# geschriebenen, ueber das gesamte Quellkorpus, Oktett fuer Oktett.
+# tools/lex_compare.sh -- the lexer written in FIRN against the one written
+# in RUST, over the whole source corpus, octet for octet.
 #
-# WARUM SO: ein Lexer laesst sich nicht sinnvoll gegen sich selbst pruefen.
-# `firnc0 --emit=tokens` ist eine unabhaengige Umsetzung in einer anderen
-# Sprache — stimmen beide Ausgaben ueberein, ist das eine echte Gegenprobe.
+# WHY LIKE THIS: a lexer cannot sensibly be checked against itself.
+# `firnc0 --emit=tokens` is an independent implementation in another
+# language -- if both outputs agree, that is a real counter-check.
 #
-# Verglichen werden BEIDE Stroeme:
-#   * Standardausgabe = der Tokenstrom          (lib/firnc1/lexer.fi)
-#   * Fehlerausgabe   = die Diagnosen mit Zeile, Spalte, Quelltextzeile und
-#                       Markierung              (lib/firnc1/diag.fi)
-# Deshalb bekommt `lexdump` den DATEINAMEN als Aufrufargument: er steht in
-# jeder Diagnose.
+# BOTH streams are compared:
+#   * standard output = the token stream          (lib/firnc1/lexer.fi)
+#   * error output    = the diagnostics with line, column, source line and
+#                       marker                    (lib/firnc1/diag.fi)
+# That is why `lexdump` gets the FILE NAME as a call argument: it is in
+# every diagnostic.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 # A temp directory of its own per run: two simultaneous runs (e.g. the main
@@ -30,15 +30,15 @@ if [ ! -x "$DUMP" ] || [ -n "$(find bin lib/firnc1 -name '*.fi' -newer "$DUMP" -
     "$FIRNC" bin/lexdump.fi -o "$DUMP" || exit 1
 fi
 
-# BEKANNTE ABWEICHUNGEN — jede einzeln benannt, mit Grund. Diese Liste ist
-# KEIN Freibrief: sie steht hier, damit die Zahl der Ausnahmen sichtbar bleibt
-# und nicht schweigend waechst.
+# KNOWN DEVIATIONS -- each one named separately, with a reason. This list is
+# NO free pass: it stands here so that the number of exceptions stays visible
+# and does not grow silently.
 #
-#   tests/590_f64.fi  ->  das Literal `1e308`. Der Lexer in Firn rechnet
-#   Gleitkommaliterale ausserhalb des schnellen Pfades von Clinger
-#   (|Exponent| > 22 und Mantisse passt nicht in 2^53) schrittweise und liegt
-#   dort um bis zu ein ULP daneben. Korrekt waere Eisel-Lemire mit
-#   128-Bit-Arithmetik; die fehlt noch.
+#   tests/590_f64.fi  ->  the literal `1e308`. The lexer in Firn computes
+#   floating point literals outside the fast path of Clinger
+#   (|exponent| > 22 and the mantissa does not fit into 2^53) step by step and is
+#   off by up to one ULP there. Correct would be Eisel-Lemire with
+#   128-bit arithmetic; that is still missing.
 BEKANNT="tests/590_f64.fi"
 
 gleich=0
@@ -53,17 +53,17 @@ erste=""
 
 while IFS= read -r f; do
     "$FIRNC" --emit=tokens "$f" > "$TMPD"/lexv_a.txt 2>"$TMPD"/lexv_ae.txt
-    # Modulbruchstuecke (`tests/modules/*.fi`) lassen sich nicht einzeln
-    # uebersetzen: `firnc0` bricht schon in der Modulaufloesung ab, VOR dem
-    # Lexer. Das ist keine Lexerfrage — solche Dateien werden gezaehlt und
-    # uebersprungen.
+    # Module fragments (`tests/modules/*.fi`) cannot be compiled
+    # separately: `firnc0` already stops in the module resolution, BEFORE the
+    # lexer. That is no question of the lexer -- such files are counted and
+    # skipped.
     if grep -q "cannot read" "$TMPD"/lexv_ae.txt; then
         uebersprungen=$((uebersprungen+1))
         continue
     fi
     "$DUMP" "$f" > "$TMPD"/lexv_b.txt 2>"$TMPD"/lexv_be.txt
-    # Zaehlwerte stehen nur dann auf der Fehlerausgabe, wenn es KEINE
-    # Diagnosen gab — sonst gehoert der ganze Strom den Meldungen.
+    # The counts are only on the error output when there were NO
+    # diagnostics -- otherwise the whole stream belongs to the messages.
     if grep -q '^; tokens ' "$TMPD"/lexv_be.txt; then
         t=$(awk '{print $3}' "$TMPD"/lexv_be.txt)
         g=$(awk '{print $5}' "$TMPD"/lexv_be.txt)

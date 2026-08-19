@@ -1,35 +1,35 @@
 #!/usr/bin/env bash
-# Durchsatz des Firn-Tokenizers auf ZWEI Eingabekorpora, danach — wenn
-# vorhanden — html5ever (cargo --release) auf DENSELBEN Korpora.
+# Throughput of the Firn tokenizer on TWO input corpora, after that -- if
+# available -- html5ever (cargo --release) on THE SAME corpora.
 #
-#   Korpus A "html5lib": die Eingaben der html5lib-Faelle, vielfach
-#       aneinandergehaengt. ABSICHTLICH PATHOLOGISCH (fast nur Grenzfaelle,
-#       sehr viele Zustandswechsel je Byte, kaum lange Textlaeufe) — ein Wert
-#       fuer den schlechtesten Fall. Begruendung in tools/tokenizer/korpus.py.
-#   Korpus B "realweb": acht gespeicherte echte Seiten aus testdata/realweb/
-#       (Wikipedia, WHATWG-Standard, W3C, rustdoc, Hacker News), ~4,6 MB,
-#       unveraendert wie ausgeliefert. Das ist der Alltagsfall.
+#   Corpus A "html5lib": the inputs of the html5lib cases, concatenated
+#       many times over. DELIBERATELY PATHOLOGICAL (almost only edge cases,
+#       very many state changes per byte, hardly any long runs of text) -- a value
+#       for the worst case. The reasoning is in tools/tokenizer/korpus.py.
+#   Corpus B "realweb": eight stored real pages from testdata/realweb/
+#       (Wikipedia, the WHATWG standard, W3C, rustdoc, Hacker News), ~4.6 MB,
+#       unchanged as delivered. That is the everyday case.
 #
-# Beide Korpora erzeugt tools/tokenizer/korpus.py; beide Seiten (Firn und
-# html5ever) bekommen exakt dieselben Bytes.
+# Both corpora are produced by tools/tokenizer/korpus.py; both sides (Firn and
+# html5ever) get exactly the same bytes.
 #
-# Gemessen wird DREIMAL, ausgewiesen wird der beste Lauf je Seite (die
-# Schwankung zwischen Laeufen liegt bei ~30 %). Der Faktor wird ausgerechnet
-# und ausgegeben, auch wenn er das Abnahmeziel (<= 2x) verfehlt.
+# It is measured THREE TIMES, what is reported is the best run per side (the
+# scatter between runs is about 30 %). The factor is computed
+# and printed, even when it misses the acceptance goal (<= 2x).
 #
-# FAIRER VERGLEICH (seit 14.08.2026): gemessen wird `tokenize_bench`, das nur
-# Token ZAEHLT — genau wie html5ever. Der urspruengliche Treiber schrieb
-# zusaetzlich html5lib-JSON; gemessen mit callgrind waren das **14,7 % aller
-# Instruktionen** (`out_json_cp` 7,93 %, `out_json_cpbuf` 4,22 %, `out_wort`
-# 2,55 %). Ein Faktor, der solche Arbeit einrechnet, misst nicht den Tokenizer.
-# Steht `tokenize_bench` nicht bereit, faellt das Skript auf den JSON-Treiber
-# zurueck und sagt das an.
+# FAIR COMPARISON (since 14.08.2026): what is measured is `tokenize_bench`, which only
+# COUNTS tokens -- exactly like html5ever. The original driver additionally wrote
+# html5lib JSON; measured with callgrind that was **14.7 % of all
+# instructions** (`out_json_cp` 7.93 %, `out_json_cpbuf` 4.22 %, `out_word`
+# 2.55 %). A factor that counts such work in does not measure the tokenizer.
+# If `tokenize_bench` is not available, the script falls back to the JSON driver
+# and says so.
 #
-# NICHT herausgerechnet wird die Dekodierung nach UTF-32 (`dekodiere`, 28 % der
-# Instruktionen), obwohl html5ever sie nicht braucht: das ist ein echter
-# Nachteil von Firns Aufbau und keine Unfairness des Messaufbaus.
+# What is NOT taken out is the decoding to UTF-32 (`decode`, 28 % of the
+# instructions), although html5ever does not need it: that is a real
+# disadvantage of Firn's build and no unfairness of the measuring setup.
 #
-# Aufruf:  bash tools/tokenizer/throughput.sh [tokenizer-binary] [laeufe]
+# Usage:  bash tools/tokenizer/throughput.sh [tokenizer-binary] [runs]
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 BIN="${1:-}"
@@ -46,7 +46,7 @@ LAEUFE="${2:-3}"
 WORK=".tokenizer-work"
 mkdir -p "$WORK"
 
-# beste (kleinste) Zeit aus $LAEUFE Laeufen
+# the best (smallest) time out of $LAEUFE runs
 beste_zeit() {
     local best=""
     local i a b t

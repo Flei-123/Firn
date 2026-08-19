@@ -64,9 +64,9 @@ def korpus_realweb():
     if not dateien:
         sys.exit("korpus.py: keine Seiten in testdata/realweb/ gefunden")
     roh = b"\n".join(open(p, "rb").read() for p in dateien)
-    # Die acht gespeicherten Seiten ergeben bereits > 4 MB; verdoppelt wird
-    # nur, falls jemand Seiten entfernt — lieber messbar gross als still zu
-    # klein gemessen.
+    # The eight stored pages already give > 4 MB; it is only doubled
+    # in case somebody removes pages -- better measurably large than silently too
+    # small.
     while len(roh) < ZIEL_MB * 1048576:
         roh += b"\n" + roh
     return roh
@@ -88,7 +88,7 @@ def main():
 
     open(html_pfad, "wb").write(roh)
     with open(auftrag_pfad, "wb") as fh:
-        # zustand, flaggen, len_lasttag, len_input (siehe PROTOKOLL.md)
+        # state, flags, len_lasttag, len_input (see PROTOKOLL.md)
         fh.write(struct.pack("<I", 0) + struct.pack("<I", 0) + struct.pack("<I", 0))
         fh.write(struct.pack("<I", len(roh)) + roh)
     print("   Korpus (%s): %.2f MB" % (quelle, len(roh) / 1048576))

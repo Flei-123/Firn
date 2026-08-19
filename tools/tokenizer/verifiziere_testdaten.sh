@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
-# Beweist, dass an den html5lib-Testdaten NICHTS veraendert wurde.
+# Proves that NOTHING was changed in the html5lib test data.
 #
-# Geprueft wird zweierlei:
-#   1. Es liegen genau die 14 erwarteten .test-Dateien in
-#      testdata/html5lib-tokenizer/ — keine mehr, keine weniger.
-#   2. Jede Datei hat exakt die sha256-Summe aus
-#      tools/tokenizer/testdaten.sha256. Diese Summen wurden Byte fuer Byte
-#      gegen den Upstream-Commit 224991ec10db04f056a89eed8b0bd8695fd2950e
-#      von https://github.com/html5lib/html5lib-tests (Pfad tokenizer/)
-#      geprueft.
+# Two things are checked:
+#   1. Exactly the 14 expected .test files lie in
+#      testdata/html5lib-tokenizer/ -- no more, no fewer.
+#   2. Every file has exactly the sha256 sum from
+#      tools/tokenizer/testdaten.sha256. These sums were checked byte for
+#      byte against the upstream commit
+#      224991ec10db04f056a89eed8b0bd8695fd2950e of
+#      https://github.com/html5lib/html5lib-tests (path tokenizer/).
 #
-# Zusaetzlich wird die Fallzahl nachgezaehlt (Erwartung: 6810), damit auch
-# eine Veraenderung, die zufaellig dieselbe Summe haette, auffiele.
+# In addition the number of cases is counted (expectation: 6810), so that
+# a change that happened to have the same sum would show up as well.
 #
-# Mit --gegen-upstream laedt das Skript die Dateien des festgeschriebenen
-# Commits erneut von GitHub und vergleicht direkt (braucht Netz; ohne Netz
-# ist der Schalter ein sauberer Fehler, kein stiller Erfolg).
+# With --gegen-upstream the script loads the files of the fixed
+# commit from GitHub again and compares directly (needs the network; without it
+# the switch is a clean error, not a silent success).
 #
-# Aufruf:  bash tools/tokenizer/verifiziere_testdaten.sh [--gegen-upstream]
-# Rueckgabe: 0 = alles unveraendert, 1 = Abweichung gefunden.
+# Usage:  bash tools/tokenizer/verifiziere_testdaten.sh [--gegen-upstream]
+# Return: 0 = everything unchanged, 1 = a deviation was found.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
@@ -35,7 +35,7 @@ fehler=0
 echo "== Testdaten pruefen: $DATEN =="
 echo "   Referenz: html5lib-tests @ $COMMIT (Pfad tokenizer/)"
 
-# --- 1. Dateibestand -------------------------------------------------------
+# --- 1. the set of files ---------------------------------------------------
 vorhanden=$(cd "$DATEN" && ls -1 *.test 2>/dev/null | sort)
 erwartet=$(awk '!/^#/ && NF==2 {print $2}' "$SUMMEN" | sort)
 anzahl=$(printf '%s\n' "$vorhanden" | grep -c . || true)
@@ -53,8 +53,8 @@ else
     echo "   Dateien : $anzahl (erwartet $ERWARTETE_DATEIEN)"
 fi
 
-# --- 2. sha256 gegen den festgeschriebenen Satz -----------------------------
-# sha256sum liest die Namen relativ zum Datenverzeichnis.
+# --- 2. sha256 against the fixed set ----------------------------------------
+# sha256sum reads the names relative to the data directory.
 if (cd "$DATEN" && grep -v '^#' "../../$SUMMEN" | grep . | sha256sum -c --status -); then
     echo "   sha256  : alle $ERWARTETE_DATEIEN Summen stimmen"
 else
@@ -64,7 +64,7 @@ else
     fehler=1
 fi
 
-# --- 3. Fallzahl nachzaehlen -----------------------------------------------
+# --- 3. count the cases -----------------------------------------------------
 faelle=$(python3 - "$DATEN" <<'PY'
 import glob, json, os, sys
 n = 0
@@ -81,7 +81,7 @@ else
     echo "   Faelle  : $faelle (erwartet $ERWARTETE_FAELLE)"
 fi
 
-# --- 4. optional: direkt gegen Upstream ------------------------------------
+# --- 4. optional: directly against upstream ---------------------------------
 if [ "$GEGEN_UPSTREAM" -eq 1 ]; then
     echo
     echo "== Direktvergleich mit GitHub (Commit $COMMIT) =="

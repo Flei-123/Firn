@@ -22,7 +22,7 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Quelle (in tools/strlib/src) -> erzeugte Datei (in tests/ bzw. tools/)
+# source (in tools/strlib/src) -> generated file (in tests/ resp. tools/)
 TARGETS = [
     ("tools/strlib/src/300_str16_surrogate.fi", "tests/300_str16_surrogate.fi"),
     ("tools/strlib/src/301_bytes_utf8.fi", "tests/301_bytes_utf8.fi"),
@@ -34,8 +34,8 @@ TARGETS = [
     ("tools/strlib/src/307_bignum.fi", "tests/307_bignum.fi"),
     ("tools/strlib/src/308_str16_api.fi", "tests/308_str16_api.fi"),
     ("tools/strlib/src/dtoa_stream.fi", "tools/dtoa_vectors/dtoa_stream.fi"),
-    # std-Fassade (Runde 39): lib/str und lib/num sind Einbindungs-
-    # Bibliotheken; die Fassade wird als EIN Modul textuell zusammengesetzt.
+    # std facade (round 39): lib/str and lib/num are include
+    # libraries; the facade is put together textually as ONE module.
     ("tools/strlib/src/std_str.fi", "lib/std/str.fi"),
     ("tools/strlib/src/std_num.fi", "lib/std/num.fi"),
     ("tools/strlib/src/neg/str_bytes_is_no_text.fi", "tests/neg/str_bytes_is_no_text.fi"),
@@ -106,19 +106,19 @@ def build(src, dst):
     out = []
     expand(src, set(), out, [])
     text = "\n".join(out)
-    # doppelte Leerzeilen zusammenfassen, damit die erzeugte Datei lesbar bleibt
+    # merge double empty lines so that the generated file stays readable
     while "\n\n\n" in text:
         text = text.replace("\n\n\n", "\n\n")
     if not text.endswith("\n"):
         text += "\n"
     header = "// ERZEUGT von tools/strlib/expand.py aus %s — nicht von Hand aendern.\n" % src
-    # Die Erwartungszeile (// expect_*) muss Zeile 1 bleiben (test.sh liest sie).
+    # The expectation line (// expect_*) has to stay line 1 (test.sh reads it).
     lines = text.split("\n")
     if lines and lines[0].startswith("// expect"):
         lines = [lines[0], header.rstrip("\n")] + lines[1:]
     else:
         lines = [header.rstrip("\n")] + lines
-    # Zeilennummern stehen erst jetzt endgueltig fest.
+    # Only now are the line numbers finally settled.
     lines = fix_error_line(lines)
     return "\n".join(lines)
 

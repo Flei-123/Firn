@@ -12,59 +12,59 @@ Aufruf:  python3 tools/html/gen_names.py
 
 import os
 
-# Reihenfolge = Atomkennung (1-basiert). NICHT umsortieren, nur hinten
-# anhaengen — sonst aendern sich alle Konstanten.
+# The order = the atom id (1-based). Do NOT re-sort, only append at the
+# end -- otherwise all the constants change.
 NAMEN = [
-    # --- Grundgeruest
+    # --- basic skeleton
     "html", "head", "body", "frameset", "frame", "noframes", "title",
     # --- "in head"
     "base", "basefont", "bgsound", "link", "meta", "style", "script",
     "noscript", "template",
-    # --- Blockelemente ("in body", Gruppe address/div/…)
+    # --- block elements ("in body", group address/div/...)
     "address", "article", "aside", "blockquote", "center", "details",
     "dialog", "dir", "div", "dl", "dt", "dd", "fieldset", "figcaption",
     "figure", "footer", "header", "hgroup", "main", "menu", "nav", "ol",
     "p", "search", "section", "summary", "ul",
-    # --- Ueberschriften
+    # --- headings
     "h1", "h2", "h3", "h4", "h5", "h6",
-    # --- Sonderfaelle mit eigener Regel
+    # --- special cases with a rule of their own
     "pre", "listing", "form", "li", "plaintext", "button",
-    # --- Formatierungselemente (Liste der aktiven Formatierungselemente)
+    # --- formatting elements (list of active formatting elements)
     "a", "b", "big", "code", "em", "font", "i", "nobr", "s", "small",
     "strike", "strong", "tt", "u",
-    # --- Elemente mit Marke in der Formatierungsliste
+    # --- elements with a marker in the formatting list
     "applet", "marquee", "object",
-    # --- Tabellen
+    # --- tables
     "table", "caption", "colgroup", "col", "tbody", "tfoot", "thead",
     "tr", "td", "th",
-    # --- leere Elemente
+    # --- empty elements
     "area", "br", "embed", "img", "keygen", "wbr", "param", "source",
     "track", "hr", "input",
-    # --- Text-/Rohtextelemente
+    # --- text/raw text elements
     "textarea", "xmp", "iframe", "noembed",
-    # --- Auswahl
+    # --- select
     "select", "option", "optgroup",
-    # --- Ruby
+    # --- ruby
     "rb", "rt", "rtc", "rp",
-    # --- Fremdinhalt (nur als Namensraummarker gebraucht, Runde 54)
+    # --- foreign content (only needed as a namespace marker, round 54)
     "math", "svg", "mi", "mo", "mn", "ms", "mtext", "annotation-xml",
     "foreignObject", "desc",
-    # --- vom Baumaufbau umbenannt
+    # --- renamed by the tree building
     "image",
-    # --- Attributnamen, die der Baumaufbau selbst liest
+    # --- attribute names the tree building reads itself
     "type", "id", "class", "href", "src", "name", "action", "prompt",
-    # --- nachgetragen (Reihenfolge davor bleibt unveraendert)
+    # --- added later (the order before that stays unchanged)
     "ruby",
 ]
 
 KOPF = '''// lib/browser/tag.fi — ERZEUGT von tools/html/gen_names.py.
-// NICHT VON HAND AENDERN. Quelle der Reihenfolge ist das Skript.
+// DO NOT EDIT BY HAND. The source of the order is the script.
 //
-// Die feste Namenstabelle des Baumaufbaus: {n} Namen, deren Atomkennung
-// (1..{n}) zur Uebersetzungszeit feststeht. `namen_init` traegt sie in genau
-// dieser Reihenfolge in die Tabelle ein, deshalb gilt `M_DIV == 25` und so
-// weiter. Alles darueber hinaus (eigene Elementnamen, beliebige
-// Attributnamen) bekommt beim ersten Auftreten eine Kennung > {n}.
+// The fixed name table of the tree building: {n} names whose atom id
+// (1..{n}) is settled at compile time. `namen_init` enters them in exactly
+// this order into the table, which is why `M_DIV == 25` and so
+// on holds. Everything beyond that (own element names, arbitrary
+// attribute names) gets an id > {n} at its first appearance.
 
 import html.mem
 

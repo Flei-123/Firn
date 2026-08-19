@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# tools/html/run.sh — HTML-Baumkonstruktion + DOM-Kern (Runde 54).
+# tools/html/run.sh -- HTML tree construction + DOM core (round 54).
 #
-#   1. lib/browser/parse_main.fi in DREI Baustufen uebersetzen
-#      (opt / --no-opt / dev-fast) — alle muessen dieselbe Quote liefern
-#   2. tools/html/harness_tree.py gegen tools/html/cases/*.dat
-#   3. die BEKANNTEN LUECKEN getrennt ausweisen (tools/html/luecken/)
-#   4. Robustheit auf echten Seiten (testdata/realweb/): kein Abbruch, und
-#      alle drei Baustufen liefern denselben Baum, Byte fuer Byte
-#   5. Dauerlauf mit Gegenprobe (tools/html/gc_tree.sh)
-#   6. Regressionsschranke aus tools/html/minquota_tree.txt
+#   1. compile lib/browser/parse_main.fi in THREE build stages
+#      (opt / --no-opt / dev-fast) -- all of them have to yield the same quota
+#   2. tools/html/harness_tree.py against tools/html/cases/*.dat
+#   3. report the KNOWN GAPS separately (tools/html/luecken/)
+#   4. robustness on real pages (testdata/realweb/): no abort, and
+#      all three build stages yield the same tree, byte for byte
+#   5. soak run with a counter-check (tools/html/gc_tree.sh)
+#   6. regression limit from tools/html/minquota_tree.txt
 #
-# Nicht bestandene Faelle zaehlen als FEHLSCHLAG. Es wird nichts gefiltert.
+# Cases that do not pass count as a FAILURE. Nothing is filtered.
 #
-# Aufruf:  bash tools/html/run.sh [--schnell]
+# Usage:  bash tools/html/run.sh [--fast]
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
