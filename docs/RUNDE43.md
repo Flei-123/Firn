@@ -12,21 +12,23 @@ Runde **nicht** angefasst; es blieb nicht noetig. Gemessen hat entschieden.
 
 | Korpus   | Instruktionen vorher | nachher       | Aenderung |
 |----------|---------------------:|--------------:|----------:|
-| realweb  |    1.297.226.150     |  965.887.079  | **-25,54 %** |
-| html5lib |    2.481.675.238     | 2.150.834.784 | **-13,33 %** |
+| realweb  |    1.297.226.150     |  957.989.680  | **-26,15 %** |
+| html5lib |    2.481.675.238     | 2.149.257.366 | **-13,39 %** |
 
 | Korpus   | Faktor vorher | Faktor nachher | Ziel |
 |----------|--------------:|---------------:|-----:|
-| realweb  |     **2,85x** |      **1,47x** | <= 2,00x |
-| html5lib |     **1,23x** |      **0,94x** | <= 2,00x |
+| realweb  |     **2,58x** |      **1,48x** | <= 2,00x |
+| html5lib |     **1,31x** |      **0,99x** | <= 2,00x |
 
 Die Faktoren stammen aus `tools/tokenizer/durchsatz.sh` (bester von sieben
 Laeufen je Seite), **beide Staende unmittelbar nacheinander auf derselben
 Maschine gemessen**, damit die bekannte Schwankung von rund 30 % nicht in den
-Vergleich eingeht. Der ausgewiesene Startwert 2,85x weicht deshalb leicht vom
-notierten 2,68x aus Runde 41 ab: dieselbe Binary, andere Tagesform der
-Maschine. Die Instruktionszahlen darueber sind reproduzierbar auf die
-Instruktion genau und der eigentliche Beleg.
+Vergleich eingeht. Ueber drei solcher Paare lag der Startwert zwischen 2,58x
+und 2,85x, der Endwert zwischen 1,47x und 1,54x — der Wert 2,68x aus Runde 41
+liegt mitten im Streuband derselben Binary. Belastbar ist der Durchsatz:
+realweb 15,9-17,0 MB/s vorher gegen 29,3-30,6 MB/s nachher, also rund
+**+80 %**. Die Instruktionszahlen darueber sind auf die Instruktion genau
+reproduzierbar und der eigentliche Beleg.
 
 Auf `html5lib` ist der Firn-Tokenizer damit **schneller als html5ever**.
 
@@ -214,7 +216,56 @@ Miscompile auftaucht. Deshalb:
 **Schluss.** Bestaetigt. Der Rueckfall auf den Grundpfad war teuer und lag an
 einer einzigen Signatur.
 
-## 5. Was NICHT gemacht wurde — und warum
+## 5. Hypothese 3 — der Adressversatz gehoert in den Speicherzugriff
+
+**Beobachtung.** Im erzeugten Assembler steht ueberall
+
+```
+lea r8, [r8+160]
+mov r8, qword ptr [r8]
+```
+
+obwohl x86-64 den Versatz selbst kann: `mov r8, qword ptr [r8+160]`.
+Statisch sind 1.589 der 2.478 `lea rX,[rY+k]` im Tokenizer direkt von einem
+Zugriff ueber `rX` gefolgt — auf den ersten Blick 3,6 % aller Zeilen.
+
+**Umsetzung.** `faltbare_versaetze()` sammelt vor der Emission die
+`ptradd`-Werte, deren Adresse nur im unmittelbar folgenden Zugriff gebraucht
+wird; das `lea` entfaellt dann ganz, Load/Store schreiben `[base+k]`.
+Abschaltbar mit `FIRN_NO_FALTUNG=1`.
+
+**Die Bedingungen sind absichtlich eng**, weil jede Lockerung die
+Lebensspanne der Basis verlaengert — genau die Klasse aus Runde 41. Gefaltet
+wird nur, wenn der Versatz eine Sofortkonstante `0 <= k <= i32::MAX` ist, das
+Ergebnis **genau einmal** gelesen wird (Terminatoren mitgezaehlt), dieser
+eine Leser die **unmittelbar folgende** Instruktion desselben Blocks ist, und
+die Basis in einem Register liegt und weder Rahmenadresse noch befoerderte
+Zelle noch Zellen-Alias ist. Der Lesezeitpunkt der Basis verschiebt sich damit
+um genau eine Instruktion; dazwischen liegt nichts. An der neuen Stelle werden
+nur zwei Register geschrieben: das Ziel des Zugriffs (das seine Adresse
+zuerst liest — `mov r9, qword ptr [r9+8]` ist korrekt) und die Heimat des
+uebersprungenen `ptradd`, die gar nicht mehr beschrieben wird.
+
+**Messwerte.**
+
+| Korpus   | vorher        | nachher      | Aenderung |
+|----------|--------------:|-------------:|----------:|
+| realweb  |   965.887.079 |  957.989.680 | -7.897.399 (-0,82 %) |
+| html5lib | 2.150.834.784 | 2.149.257.366 | -1.577.418 (-0,07 %) |
+
+**Schluss.** Bestaetigt, aber klein — und der statische Zaehler hat
+**geluegt**. Von 1.589 vermeintlichen Stellen wurden 195 gefaltet
+(`lea` 2.898 -> 2.703, 239 Zugriffe mit Versatz). Der Rest scheitert an der
+Einmal-Lesen-Bedingung, und der Grund ist strukturell: die haeufigste Form ist
+eine Adresse, die **mehrere Felder desselben Structs** bedient —
+`lea r13,[r14+8]`, danach viermal `[r13]`. Die zu falten hiesse, die
+Lebensspanne ueber mehrere Instruktionen zu verlaengern. Das ist ohne neue
+Absicherung genau der Fehler aus Runde 40. Notiert als offener Punkt.
+
+Merksatz fuer die naechste Runde: **statische Haeufigkeit ist keine
+Schaetzung des Gewinns.** Sie war hier um den Faktor acht zu optimistisch.
+
+## 6. Was NICHT gemacht wurde — und warum
 
 ### Intervall-Splitting (der notierte Hebel)
 
@@ -267,26 +318,30 @@ eigentlich schon kennt. Nicht angefasst: `dekodiere` steht wortgleich in
 und ihre Semantik bei abgeschnittener Eingabe (Bytes jenseits des Endes lesen
 sich als 0) exakt erhalten. Lohnt, war aber fuer das Ziel nicht noetig.
 
-## 6. Profil nachher (realweb, 965.887.079 Ir)
+## 7. Profil nachher (realweb, 957.989.680 Ir)
 
 ```
           SELBST   ANTEIL         INKLUSIV  FUNKTION
-     526.900.669   54,55%      762.188.529  tokenizer__tokenize
-     192.243.336   19,90%      192.243.336  dekodiere
-     105.033.364   10,87%      105.145.676  tokens__tok_attr_value_push
-      47.342.985    4,90%       47.469.496  tokens__sink_fehler_bei
-      18.589.583    1,92%       18.590.675  tokens__tok_attr_name_push
-      11.641.019    1,21%       16.293.464  tokens__tok_attr_finish
-      11.448.891    1,19%      965.887.075  main
+     526.801.688   54,99%      754.292.482  tokenizer__tokenize
+     192.243.334   20,07%      192.243.334  dekodiere
+     100.031.790   10,44%      100.144.102  tokens__tok_attr_value_push
+      47.342.985    4,94%       47.469.496  tokens__sink_fehler_bei
+      17.682.777    1,85%       17.683.869  tokens__tok_attr_name_push
+      11.448.890    1,20%      957.989.676  main
+      11.439.550    1,19%       16.091.995  tokens__tok_attr_finish
 ```
 
-`tokenize` ist mit 54,55 % jetzt klar der einzige grosse Posten:
-526.900.669 Ir auf 4.917.779 Codepunkte sind **107 Instruktionen je
+`tokenize` ist mit 54,99 % jetzt klar der einzige grosse Posten:
+526.801.688 Ir auf 4.917.779 Codepunkte sind **107 Instruktionen je
 Zeichen**. Darin steckt der naechste Hebel, und er ist immer noch der aus
 Runde 40 — zu wenige Register fuer eine Funktion mit einem Rahmen von
 43.104 Byte.
 
-## 7. Abnahme
+Zum Vergleich der Ausgangslage: `main` ist von 332.932.201 auf 11.448.890
+gefallen (-96,6 %), die gesamte Ausgabekette des Sinks (`tok_emit`,
+`sink_flush_chars`, `sink_end`) hat sich ungefaehr halbiert.
+
+## 8. Abnahme
 
 | Pruefung | Ergebnis |
 |---|---|
@@ -301,7 +356,7 @@ Messwerkzeuge dieser Runde: `tools/tokenizer/profil.py` (neu),
 `.r43/messe.sh` (Arbeitsverzeichnis, nicht eingecheckt),
 `tools/tokenizer/durchsatz.sh`, `valgrind --tool=callgrind`.
 
-## 8. Offene Punkte
+## 9. Offene Punkte
 
 1. **`tokenize` mit 107 Instruktionen je Zeichen.** Der Rahmen ist
    43.104 Byte gross, es gibt neun vergebbare Register. Hier liegt
@@ -317,3 +372,8 @@ Messwerkzeuge dieser Runde: `tools/tokenizer/profil.py` (neu),
 5. **`out_wort` mit zehn Parametern** ist jetzt nicht mehr teuer, aber
    immer noch eine Signatur, die Zeichen einzeln durchreicht. Ein
    Zeichenkettenliteral waere billiger und lesbarer.
+6. **Adressversatz ueber mehrere Verwendungen falten** (Hypothese 3): die
+   haeufigste ungenutzte Form ist eine Basisadresse fuer mehrere Felder
+   desselben Structs. Braucht eine Absicherung gegen die Runde-40-Klasse —
+   am ehesten, indem die verlaengerte Lebensspanne dem Verteiler VOR der
+   Zuteilung mitgeteilt wird, statt sie ihm nachtraeglich unterzuschieben.
