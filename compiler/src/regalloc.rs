@@ -550,15 +550,19 @@ pub fn allocate(f: &Func) -> Alloc {
     let mut divsel_pos: Vec<usize> = Vec::new();
     for (bi, b) in f.blocks.iter().enumerate() {
         for (ii, i) in b.insts.iter().enumerate() {
-            if matches!(i.op, Op::Call { .. } | Op::CallIndirect { .. } | Op::Syscall { .. }) {
+            if matches!(i.op, Op::Call { .. } | Op::CallIndirect { .. } | Op::Syscall { .. } | Op::ThreadSpawn { .. }) {
                 call_pos.push(live.pos[bi][ii]);
             }
             if matches!(i.op, Op::CopyMem { .. } | Op::SecureZero { .. }) {
                 memop_pos.push(live.pos[bi][ii]);
             }
+            // Runde 49: `Op::AtomicCas` benutzt `rdx` als drittes Arbeitsregister
+            // (`lock cmpxchg [rcx], rdx`) — genau wie `div`/`rem`/`select`. Ohne
+            // diesen Eintrag traegt ein Intervall, das darueber lebt, weiterhin
+            // `rdx` und wird zerstoert. Gefunden an tests/820 (nur release-fast).
             if matches!(
                 i.op,
-                Op::Bin(BinOp::Div | BinOp::Rem, _, _) | Op::Select { .. }
+                Op::Bin(BinOp::Div | BinOp::Rem, _, _) | Op::Select { .. } | Op::AtomicCas { .. }
             ) {
                 divsel_pos.push(live.pos[bi][ii]);
             }
@@ -721,10 +725,39 @@ pub fn allocate(f: &Func) -> Alloc {
     };
 
     for iv in ivs.iter().copied() {
-        // abgelaufene Intervalle freigeben
+        // Abgelaufene Intervalle freigeben.
+        //
+        // RUNDE 49 — `<` STATT `<=`, EIN SOUNDNESS-FEHLER.
+        //
+        // Die Intervalle sind ABGESCHLOSSEN: `crosses_call` prueft
+        // `s <= p && p <= e`. Zwei abgeschlossene Intervalle [a,b] und [c,d]
+        // mit a <= c ueberschneiden sich also genau dann, wenn c <= b — und
+        // dann duerfen sie NICHT dasselbe Register bekommen.
+        //
+        // Mit `<=` wurde ein Intervall, das bei p endet, freigegeben, sobald
+        // das naechste bei p BEGINNT. Bei klassischem linearem Scan ist das
+        // erlaubt, weil dort „Ende" die letzte VERWENDUNG und „Anfang" die
+        // DEFINITION derselben Instruktion ist (erst lesen, dann schreiben).
+        // Hier stimmt diese Annahme nicht: die Intervallgrenzen kommen auch
+        // aus `live_in`/`live_out` an BLOCKGRENZEN. Ein Wert, der von einem
+        // spaeter angeordneten Block aus ueber einen frueheren hinweg lebt,
+        // bekommt dadurch als Anfang den Blockanfang — und teilte sich das
+        // Register mit einem Wert, der genau dort definiert wird.
+        //
+        // GEMESSEN an tests/820_gc_finalisierer.fi (nur `release-fast`, also
+        // nur mit Registerzuteilung): `%355 = z + 24` hatte das Intervall
+        // [175,356], `%135 = call gc_collect()` das Intervall [175,175].
+        // Beide bekamen `r12`; zur Laufzeit lief der Weg bb45 (Definition von
+        // %355) -> bb46 -> bb21 (`mov r12, rax`) -> ... -> bb49 (`mov r8,
+        // [r12]`), und das Programm starb mit einem Speicherzugriffsfehler.
+        //
+        // Der Fehler ist AELTER als Runde 49: sechs Zeilen Attrappe in
+        // `gc_collect` genuegen, um ihn mit dem Compiler der Basis (cc1710f)
+        // auszuloesen. Runde 49 hat ihn nur getroffen. Die Zuteilung ist mit
+        // `<` minimal enger; die Messung steht in docs/RUNDE49.md §3.
         let mut k = 0;
         while k < active.len() {
-            if active[k].0.end <= iv.start {
+            if active[k].0.end < iv.start {
                 let (_, r) = active.remove(k);
                 freigeben(r, &mut free_saved, &mut free_temp, &mut free_arg, &mut free_div);
             } else {
@@ -865,7 +898,7 @@ pub fn allocate(f: &Func) -> Alloc {
                 // Zellenwert steht dann nur noch im Rahmen, nicht im
                 // Register. (Fehlerbild: bin/layoutdump.fi stuerzte in
                 // intern_finde mit t=0 ab.)
-                if matches!(nj.op, Op::Call { .. } | Op::CallIndirect { .. } | Op::Syscall { .. })
+                if matches!(nj.op, Op::Call { .. } | Op::CallIndirect { .. } | Op::Syscall { .. } | Op::ThreadSpawn { .. })
                     && !CALLEE_SAVED.contains(&rc)
                 {
                     zerstoert = true;
@@ -934,7 +967,10 @@ pub fn allocate(f: &Func) -> Alloc {
                         break;
                     }
                     Op::Load { addr: a2 } if *a2 == zelle => break,
-                    Op::Call { .. } | Op::CallIndirect { .. } | Op::Syscall { .. } => break,
+                    Op::Call { .. }
+                    | Op::CallIndirect { .. }
+                    | Op::Syscall { .. }
+                    | Op::ThreadSpawn { .. } => break,
                     _ => {}
                 }
                 // steht noch die Verwendung eines Alias-Werts derselben Zelle
@@ -2169,6 +2205,31 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
             e.line("xor eax, eax");
             e.line("cld");
             e.line("rep stosb");
+        }
+        // Runde 49 (faden.rs). Wie beim atomaren Addieren sind rax/rcx/rdx
+        // nie Heimat eines Wertes; `spawn` benutzt zusaetzlich die
+        // Systemaufrufregister und ist oben als aufrufaehnlich eingetragen,
+        // damit kein Intervall in einem caller-saved Register darueber lebt.
+        Op::AtomicCas { addr, erw, neu } => {
+            let d = i.dst.ok_or("interner Fehler: atomcas ohne Ziel")?;
+            ra.load_full(e, "rcx", *addr);
+            ra.load_full(e, "rdx", *neu);
+            ra.load_full(e, "rax", *erw);
+            crate::faden::cas_sequenz(e);
+            ra.store_dst(e, d, "rax");
+        }
+        Op::ThreadSpawn { arg, stapel, ctid } => {
+            let d = i.dst.ok_or("interner Fehler: spawn ohne Ziel")?;
+            ra.load_full(e, "rdi", *arg);
+            ra.load_full(e, "rsi", *stapel);
+            ra.load_full(e, "rdx", *ctid);
+            crate::faden::spawn_sequenz(e);
+            ra.store_dst(e, d, "rax");
+        }
+        Op::ThreadSelf => {
+            let d = i.dst.ok_or("interner Fehler: fadenselbst ohne Ziel")?;
+            crate::faden::selbst_sequenz(e);
+            ra.store_dst(e, d, "rax");
         }
         Op::AtomicAdd { addr, val } => {
             // Runde 47: EINE Instruktion, mit `lock`-Praefix. rax und rcx sind
