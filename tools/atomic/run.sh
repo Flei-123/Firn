@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
-# Nachweis des ATOMAREN PRIMITIVS (Runde 47, compiler/src/atomic.rs,
+# Proof of the ATOMIC PRIMITIVE (round 47, compiler/src/atomic.rs,
 # lib/firnc1/{fir,sema,lower,codegen}.fi).
 #
-# WARUM DIESER NACHWEIS UND KEIN ZWEIFADEN-LAUF: Firn hat in Stufe 0 keine
-# Faeden (SPEC §7). Ein Wettrennen laesst sich also nicht herbeifuehren, und
-# eine Behauptung "fadensicher" waere ungedeckt. Was sich BELEGEN laesst, ist
-# das, worauf es ankommt: dass `__atomic_add` zu genau EINER
-# Maschineninstruktion mit `lock`-Praefix wird und dass gewoehnliches `+= 1`
-# das NICHT tut. Genau das prueft dieses Werkzeug — am erzeugten Assembler und
-# am fertigen Binary, in BEIDEN Compilern.
+# WHY THIS PROOF AND NOT A TWO-THREAD RUN: Firn has no threads in stage 0
+# (SPEC 7). A race cannot be provoked, and a claim of "thread safe" would
+# be uncovered. What CAN be proven is what matters:
+# that `__atomic_add` becomes exactly ONE
+# machine instruction with a `lock` prefix and that an ordinary `+= 1`
+# does NOT. Exactly that is what this tool checks -- on the emitted assembly
+# and on the finished binary, in BOTH compilers.
 #
-# Geprueft wird:
-#   1. `__atomic_add` erzeugt `lock xadd qword ptr [..], ..` — je
-#      Aufrufstelle genau einmal, in allen drei Baustufen.
-#   2. Ein gewoehnliches `*p = *p + 7` erzeugt KEIN `lock` (sonst waere der
-#      Nachweis wertlos, weil er alles bestehen liesse).
-#   3. Der Rueckgabewert ist der ALTE Wert, und der Zaehler stimmt nach
-#      100.000 Erhoehungen und 100.000 Erniedrigungen exakt.
-#   4. firnc1 (der Compiler in Firn) erzeugt dieselbe Instruktion, und seine
-#      FIR ist oktettgleich mit der von firnc0.
+# What is checked:
+#   1. `__atomic_add` produces `lock xadd qword ptr [..], ..` -- exactly
+#      once per call site, in all three build stages.
+#   2. An ordinary `*p = *p + 7` produces NO `lock` (otherwise the
+#      proof would be worthless, because it would let everything pass).
+#   3. The return value is the OLD value, and the counter is exactly right
+#      after 100,000 increments and 100,000 decrements.
+#   4. firnc1 (the compiler in Firn) produces the same instruction, and its
+#      FIR is octet-identical with the one of firnc0.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 FIRNC="compiler/target/release/firnc"
@@ -57,9 +57,9 @@ fn main() -> i32 {
     if z != 12 {
         return 4
     }
-    // (Der Rueckgabewert wird gebunden: ein Ganzzahlliteral neben einem
-    // Aufruf bekommt seinen Typ nur ueber die Probe, und die kennt dieses
-    // Primitiv nicht — dieselbe Einschraenkung wie bei den ct-Primitiven.)
+    // (The return value is bound: an integer literal next to a
+    // call only gets its type through the probe, and the probe does not know
+    // this primitive -- the same limitation as with the ct primitives.)
     let alt2: u64 = __atomic_add(&z, 30)
     if alt2 != 12 {
         return 5
@@ -83,7 +83,7 @@ fn main() -> i32 {
 }
 EOF
 
-# --- 1./3. firnc0: Instruktion und Verhalten, in allen drei Baustufen -------
+# --- 1./3. firnc0: instruction and behaviour, in all three build stages -----
 for stufe in "release-fast:" "no-opt:--no-opt" "dev-fast:--opt-level=dev-fast"; do
     name=${stufe%%:*}
     opt=${stufe#*:}
@@ -106,7 +106,7 @@ for stufe in "release-fast:" "no-opt:--no-opt" "dev-fast:--opt-level=dev-fast"; 
     [ "$b" -ge 1 ] || melde "firnc0/$name: im Binary steht kein 'lock'"
 done
 
-# --- 2. Gegenprobe: gewoehnliches += hat KEIN lock --------------------------
+# --- 2. counter-check: an ordinary += has NO lock --------------------------
 "$FIRNC" --emit=asm -o "$W/nicht.s" "$W/nichtatom.fi" 2>/dev/null
 if grep -q 'lock' "$W/nicht.s"; then
     melde "Gegenprobe: gewoehnliches '*p = *p + 7' erzeugt ein 'lock' — der Nachweis waere wertlos"
@@ -115,7 +115,7 @@ fi
 set +e; "$W/nicht"; rc=$?; set -e
 [ "$rc" -eq 0 ] || melde "Gegenprobe: Programm liefert $rc statt 0"
 
-# --- 4. firnc1: dieselbe Instruktion, oktettgleiche FIR ---------------------
+# --- 4. firnc1: the same instruction, octet-identical FIR -------------------
 if [ ! -x "$FC1" ] || [ -n "$(find bin lib/firnc1 -name '*.fi' -newer "$FC1" -print -quit)" ]; then
     rm -f "$FC1"
     "$FIRNC" bin/firnc1.fi -o "$FC1" >/dev/null || melde "firnc1 liess sich nicht bauen"
