@@ -302,8 +302,14 @@ Firn** gebaut, Runde 4 den **Opt-in-Tracing-GC samt DOM-Prototyp und Dauerlauf**
   werden beim Einsammeln **wirklich genullt** (`S3`), es gibt **externe
   Wurzelbereiche** und `Arc[T]` mit **atomarem** Zähler (`lib/rc/arc.fi`,
   `docs/RUNDE47.md`).
+  Seit Runde 53 gibt es **`GcVec[T]` und `GcMap[K,V]`** — Sammlungen mit
+  veränderlicher Länge, die der Sammler wirklich verfolgt, auch während sie
+  wachsen (`lib/gc/gcvec.fi`, `lib/gc/gcmap.fi`, `docs/RUNDE53.md`). Der
+  DOM-Prototyp benutzt sie: 5000 Kinder an einem Knoten, beliebig viele
+  Attribute.
   **Offen bleibt:** der 24-Stunden-Lauf aus ABNAHME.md Punkt 2, Fragmentierung
-  bei wechselnden Objektgrößen, `GcVec`/`GcMap`, `virtual`.
+  bei wechselnden Objektgrößen, `virtual`, und bei den Sammlungen die
+  nominale Typsicherheit des Behälters.
   `Rc[T]`/`Weak[T]`/`Arc[T]` gibt es als **Firn-Module** (`tests/modules/rc.fi`,
   `lib/rc/arc.fi`), nicht als Sprachtypen; `Gc[modul.Klasse]` lässt sich nicht
   schreiben.

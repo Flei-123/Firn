@@ -54,6 +54,9 @@ use crate::types::Type;
 const P_NEU: &str = "gc ";
 const P_TYP: &str = "__gc#p:";
 const P_WTYP: &str = "__gc#w:";
+/// Dieselben Praefixe fuer `mono.rs` (Runde 53: `Gc[T]` in einer Vorlage).
+pub(crate) const P_TYP_PUB: &str = P_TYP;
+pub(crate) const P_WTYP_PUB: &str = P_WTYP;
 const P_AS: &str = "__gc#as:";
 
 /// Aufrufnamen der Laufzeit (`lib/gc/gc.fi`), die einen Sammellauf ausloesen
@@ -331,6 +334,40 @@ impl<'a> Parser<'a> {
         });
     }
 
+    /// Runde 53: `[E]` bzw. `[K, V]` nach `GcVec`/`GcMap`. Die Argumente
+    /// sind VOLLE Typen (`GcVec[Gc[Node]]`), werden geprueft und dann
+    /// verworfen — der Behaelter ist nominal einer. Liefert die Spanne der
+    /// schliessenden Klammer.
+    fn gc_sammlung_args(&mut self, name: &str, n: usize) -> Option<Span> {
+        if !self.expect(TokKind::LBracket, "nach 'GcVec'/'GcMap'") {
+            return None;
+        }
+        let mut i = 0;
+        loop {
+            self.parse_type()?;
+            i += 1;
+            if self.at(&TokKind::Comma) {
+                self.bump();
+                continue;
+            }
+            break;
+        }
+        if i != n {
+            self.dg.error_note(
+                self.span(),
+                format!("'{}' erwartet {} typargument(e), bekommen {}", name, n, i),
+                "GcVec[E] hat eines, GcMap[K, V] hat zwei (SPEC 3.5.2)",
+            );
+            self.recovering = true;
+            return None;
+        }
+        let end = self.span();
+        if !self.expect(TokKind::RBracket, "nach den typargumenten") {
+            return None;
+        }
+        Some(end)
+    }
+
     /// `[Name]` nach `Gc`/`GcWeak`/`gc_null`/`weak_null`/`as?`.
     fn gc_typ_arg(&mut self, was: &str) -> Option<(String, Span)> {
         if !self.expect(TokKind::LBracket, was) {
@@ -361,6 +398,28 @@ pub(crate) fn hook_item(p: &mut Parser) -> bool {
 /// `// HOOK gc` in `parser.rs::parse_type_inner` — `Gc[C]` und `GcWeak[C]`.
 /// `name` ist bereits verbraucht, `sp` seine Position.
 pub(crate) fn hook_type(p: &mut Parser, name: &str, sp: Span) -> Option<TypeExpr> {
+    // Runde 53: `GcVec[E]` und `GcMap[K,V]` (SPEC §3.5.2). Beide sind
+    // ZEIGER auf die Laufzeitklassen `GcVec`/`GcMap` aus lib/gc/gcvec.fi
+    // bzw. lib/gc/gcmap.fi — `GcVec[Gc[Node]]` ist also genau `Gc[GcVec]`,
+    // nur so geschrieben, wie es in der SPEC steht.
+    //
+    // WAS DAS NICHT IST, und das gehoert hierher: eine je Elementtyp EIGENE
+    // Klasse. Stufe 0 hat keine generischen `gc class` — der Behaelter ist
+    // nominal EINER, und der Elementtyp wird am ZUGRIFF geprueft
+    // (`gcvec_anhaengen[Node](…)`), nicht am Feld. Die Typargumente werden
+    // hier vollstaendig geparst (auch `Gc[Node]`), damit ein Tippfehler
+    // auffaellt, danach aber verworfen. `docs/RUNDE53.md` §6 nennt den Preis.
+    if name == "GcVec" || name == "GcMap" {
+        if !p.at(&TokKind::LBracket) {
+            return None;
+        }
+        let n = if name == "GcVec" { 1 } else { 2 };
+        let ksp = p.gc_sammlung_args(name, n)?;
+        return Some(TypeExpr::Named(
+            format!("{}{}", P_TYP, name),
+            Parser::join(sp, ksp),
+        ));
+    }
     let praefix = match name {
         "Gc" => P_TYP,
         "GcWeak" => P_WTYP,
@@ -1182,6 +1241,16 @@ pub(crate) fn typtabelle_asm() -> String {
 /// Die Sammler-Laufzeit als lesbares Firn (`lib/gc/gc.fi`), eingebettet.
 const LAUFZEIT: &str = include_str!("../../lib/gc/gc.fi");
 
+/// **Runde 53** — die Sammlungen mit veraenderlicher Laenge (`SPEC` §3.5.2).
+///
+/// Sie stehen in EIGENEN Dateien und werden an `gc.fi` angehaengt: zusammen
+/// sind sie ein Modul, also sehen sie dessen Namen (`KOPF`, `F_SLOTS`,
+/// `__gc_alloc_raw`, `__gc_barrier`) ohne `import`. Angehaengt wird nur,
+/// wenn das Programm sie wirklich braucht — ein Programm mit `gc class`,
+/// aber ohne Sammlungen, erzeugt danach denselben Code wie vorher.
+const LAUFZEIT_VEC: &str = include_str!("../../lib/gc/gcvec.fi");
+const LAUFZEIT_MAP: &str = include_str!("../../lib/gc/gcmap.fi");
+
 /// Pfadname der eingezogenen Laufzeit in Fehlermeldungen und `.debug_line`.
 pub(crate) const LAUFZEIT_PFAD: &str = "lib/gc/gc.fi";
 
@@ -1199,6 +1268,24 @@ pub(crate) fn quelle_hat_allocerror(toks: &[crate::lexer::Token]) -> bool {
     toks.windows(2).any(|w| {
         matches!(&w[0].kind, TokKind::KwError)
             && matches!(&w[1].kind, TokKind::Ident(b) if b == ERR_SET)
+    })
+}
+
+/// **Runde 53** — braucht dieses Programm die Sammlungen (`GcVec`/`GcMap`)?
+///
+/// Entschieden am Tokenstrom wie `quelle_braucht_gc`: irgendwo steht ein
+/// Bezeichner, der mit `GcVec`, `GcMap`, `gcvec_` oder `gcmap_` beginnt.
+/// Der Praefixtest statt eines Gleichheitstests deckt beides ab — den Typ
+/// `GcVec[Gc[T]]` und den Aufruf `gcvec_anhaengen[T](…)`.
+pub(crate) fn quelle_braucht_sammlungen(toks: &[crate::lexer::Token]) -> bool {
+    toks.iter().any(|t| match &t.kind {
+        TokKind::Ident(n) => {
+            n.starts_with("GcVec")
+                || n.starts_with("GcMap")
+                || n.starts_with("gcvec_")
+                || n.starts_with("gcmap_")
+        }
+        _ => false,
     })
 }
 
@@ -1227,7 +1314,11 @@ fn finalisierer_default() -> String {
 /// `AllocError` bereits selbst deklariert (Fehlermengennamen sind programmweit).
 /// `mit_finalisierer = false`, wenn die Wurzeldatei den Verteiler selbst
 /// mitbringt.
-pub(crate) fn laufzeit_quelle(mit_fehlermenge: bool, mit_finalisierer: bool) -> String {
+pub(crate) fn laufzeit_quelle(
+    mit_fehlermenge: bool,
+    mit_finalisierer: bool,
+    mit_sammlungen: bool,
+) -> String {
     let mut s = String::new();
     if mit_fehlermenge {
         s.push_str("error AllocError { OutOfMemory }\n");
@@ -1240,6 +1331,10 @@ pub(crate) fn laufzeit_quelle(mit_fehlermenge: bool, mit_finalisierer: bool) -> 
         s.push_str("// __gc_finalisiere wird vom Programm selbst deklariert\n");
     }
     s.push_str(LAUFZEIT);
+    if mit_sammlungen {
+        s.push_str(LAUFZEIT_VEC);
+        s.push_str(LAUFZEIT_MAP);
+    }
     s
 }
 
@@ -1267,17 +1362,26 @@ mod tests {
 
     #[test]
     fn laufzeit_enthaelt_die_pflichtnamen() {
-        let q = laufzeit_quelle(true, true);
+        let q = laufzeit_quelle(true, true, true);
         for n in ["gc_init", "gc_collect", "gc_live_objects", FN_ALLOC, FN_WEAK, FN_STARK, FN_AS] {
             assert!(q.contains(n), "laufzeit ohne '{}'", n);
         }
         assert!(q.contains("error AllocError"));
-        assert!(!laufzeit_quelle(false, true).contains("error AllocError {"));
+        assert!(!laufzeit_quelle(false, true, false).contains("error AllocError {"));
         // Runde 47: der Verteiler ist genau EINMAL da — entweder als
         // Voreinstellung oder aus dem Programm, nie doppelt.
         assert!(q.contains("fn __gc_finalisiere(art: u64, p: *mut u8) {"));
-        assert!(!laufzeit_quelle(true, false).contains("fn __gc_finalisiere(art: u64, p: *mut u8) {"));
+        assert!(!laufzeit_quelle(true, false, false).contains("fn __gc_finalisiere(art: u64, p: *mut u8) {"));
         assert!(q.contains("gc_finalisierer_setzen"));
+        // Runde 53: die Sammlungen kommen nur dazu, wenn sie gebraucht werden.
+        for n in ["gcvec_anhaengen", "gcmap_setzen", "gc class GcSlots"] {
+            assert!(q.contains(n), "laufzeit ohne '{}'", n);
+            assert!(
+                !laufzeit_quelle(true, true, false).contains(n),
+                "'{}' auch ohne Sammlungen dabei",
+                n
+            );
+        }
         assert!(q.contains("gc_wurzel_anmelden"));
     }
 }

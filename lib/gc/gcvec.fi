@@ -1,0 +1,356 @@
+// lib/gc/gcvec.fi — `GcVec`: die Sammlung mit VERAENDERLICHER LAENGE im
+// GC-Heap (SPEC §3.5.2, Runde 53).
+//
+// Diese Datei wird an `lib/gc/gc.fi` ANGEHAENGT und bildet mit ihr EIN Modul
+// (`compiler/src/gc.rs::laufzeit_quelle`). Sie kommt nur ins Programm, wenn
+// dort wirklich `GcVec`/`GcMap` vorkommt — Programme ohne Sammlungen zahlen
+// kein Byte. Alle Namen aus `gc.fi` (KOPF, F_SLOTS, SLOT_KOPF, __gc_ld64,
+// __gc_alloc_raw, __gc_barrier, …) sind hier sichtbar.
+//
+// ---------------------------------------------------------------- Warum so
+//
+// Der Sammler verfolgt den Heap PRAEZISE ueber die compilergenerierte
+// Typtabelle: je Klasse eine feste Liste von Feldoffsets. Eine Sammlung, die
+// waechst, passt da nicht hinein — ihre Elementzahl steht erst zur Laufzeit
+// fest. Genau deshalb sagte `SPEC.md` §1197 bisher „Keine GcVec/GcMap".
+//
+// Die Loesung ist ein zweites Objekt, der SLOT-PUFFER: ein gewoehnlicher
+// GC-Block, dessen Nutzdaten ein Feld von Elementen sind und der im
+// Blockkopf das Bit `F_SLOTS` traegt. `__gc_trace` (gc.fi) schaltet an
+// diesem Bit auf `__gc_trace_slots` um und liest Elementzahl, Schrittweite
+// und Zeigermaske aus dem Puffer selbst. Der Puffer ist damit ein
+// vollwertiges, vom Sammler verfolgtes Objekt — kein Sonderweg, keine
+// externe Wurzel, kein Festhalten.
+//
+//     Gc[GcVec] ---puffer---> Gc[GcSlots] ---Elemente---> Gc[T] …
+//        ^ gewoehnliches           ^ F_SLOTS, __gc_trace_slots
+//          starkes Feld,
+//          Typtabelle + Barriere vom Compiler
+//
+// ------------------------------------------------- Die Barrierenfrage (Ziel 4)
+//
+// Seit Runde 44 markiert der Sammler in Scheiben. Er darf also MITTEN im
+// Wachsen laufen. Drei Stellen sind kritisch, und alle drei haengen an
+// derselben Dijkstra-Einfuegebarriere aus `gc.fi`:
+//
+//  (B1) NEUER PUFFER. `__gcvec_wachsen` legt einen groesseren Puffer an —
+//       und `__gc_alloc_raw` ist genau die Stelle, an der eine Markier- oder
+//       Fegescheibe laeuft. Danach kann der Vektor selbst laengst SCHWARZ
+//       sein. Der neue Puffer wird trotzdem gefunden, weil er ueber das
+//       gewoehnliche starke Feld `v.puffer` eingehaengt wird und der
+//       Compiler dort `__gc_barrier` legt: die faerbt ihn grau.
+//
+//  (B2) DER ALTE PUFFER waehrend des Umkopierens. Zwischen Allokation und
+//       Einhaengen alloziert NICHTS — es kann also keine Scheibe laufen.
+//       Der alte Puffer haengt die ganze Zeit am Vektor, der neue am Stapel
+//       (konservativ erfasst). Faellt der alte hinterher heraus, ist er
+//       entweder schon verfolgt (schwarz) oder liegt noch grau auf dem
+//       Markstapel — in beiden Faellen sind seine Elemente gesehen.
+//
+//  (B3) JEDES EINGETRAGENE ELEMENT. Ein Element wird mit `__gc_st64`
+//       geschrieben, nicht ueber ein typisiertes Feld — der Compiler kann
+//       hier keine Barriere legen, weil er den Puffer gar nicht kennt.
+//       Also ruft `gcvec_setzen_roh` sie SELBST. Ohne das verschwindet ein
+//       frisch angehaengtes Kind hinter einem bereits schwarzen Puffer.
+//       `tests/841_gcvec_inkrementell.fi` provoziert genau diesen Fall.
+//
+// Was NICHT noetig ist: den Puffer beim Wachsen von Hand wieder grau zu
+// faerben. Jedes Element, das je in ihm steht, ist entweder ueber (B3)
+// grau geworden oder stand vorher im alten Puffer, der nach (B2) verfolgt
+// wird. Das ist die ganze Begruendung; sie steht hier, weil sie sich nicht
+// aus dem Code ablesen laesst.
+
+// `S_SLOTS_TID` steht in gc.fi: der Compiler vergibt die Typkennungen, die
+// Laufzeit kennt sie nicht — sie erfaehrt die von `GcSlots` einmal je
+// Prozess, indem sie EIN gewoehnliches Exemplar anlegt und dessen Blockkopf
+// liest, und legt sie im Zustandsblock ab.
+
+// Schrittweite/Maske in `desc` (siehe __gc_trace_slots).
+const GCVEC_DESC_ZEIGER: u64 = 257
+const GCVEC_DESC_ROH: u64 = 1
+// Anfangskapazitaet eines Puffers in Elementen.
+const GCVEC_START: u64 = 8
+
+// Der Slot-Puffer. Die Felder decken sich mit dem Kopf, den
+// `__gc_trace_slots` liest; die Elemente liegen dahinter und werden
+// UEBERGROSS alloziert (deshalb `__gc_alloc_raw` statt `gc GcSlots{…}`).
+gc class GcSlots {
+    n: u64,
+    desc: u64,
+    fortschritt: u64,
+    kap: u64,
+}
+
+// Der Vektor. Ein gewoehnliches `gc class` mit EINEM starken Feld — damit
+// ist er ueberall verwendbar, wo `Gc[T]` verwendbar ist, insbesondere als
+// Feld einer anderen `gc class` (`kinder: GcVec[Gc[Node]]`).
+gc class GcVec {
+    puffer: Gc[GcSlots],
+    desc: u64,
+}
+
+// ------------------------------------------------------------ Slot-Puffer
+
+// Typkennung von `GcSlots` besorgen (einmal je Prozess).
+fn __gcslots_tid() -> AllocError!u64 {
+    let st: u64 = __gc_state() as u64
+    let t: u64 = __gc_ld64(st + S_SLOTS_TID)
+    if t != 0 {
+        return t
+    }
+    let vorlage: Gc[GcSlots] = try gc GcSlots{ n: 0, desc: 0, fortschritt: 0, kap: 0 }
+    let neu: u64 = __gc_ld32((vorlage as u64) - KOPF) as u64
+    __gc_st64(st + S_SLOTS_TID, neu)
+    return neu
+}
+
+// Einen Puffer fuer `kap` Elemente anlegen. `desc` bestimmt Schrittweite und
+// Zeigermaske. Die Nutzdaten sind nach `__gc_alloc_raw` genullt, also ist
+// der Puffer ab dem ersten Augenblick verfolgbar (n = 0, fortschritt = 0).
+fn __gcslots_neu(kap: u64, desc: u64) -> AllocError!Gc[GcSlots] {
+    let tid: u64 = try __gcslots_tid()
+    let schritt: u64 = desc & 255
+    let bytes: u64 = SLOT_KOPF + kap * schritt * 8
+    let p: *mut u8 = __gc_alloc_raw(tid, bytes)
+    let a: u64 = p as u64
+    if a == 0 {
+        return AllocError::OutOfMemory
+    }
+    // DAS Bit. Ab hier verfolgt der Sammler diesen Block als Slot-Puffer.
+    __gc_st32(a - KOPF + 4, __gc_ld32(a - KOPF + 4) | F_SLOTS)
+    __gc_st64(a + 8, desc)
+    __gc_st64(a + 24, kap)
+    return a as Gc[GcSlots]
+}
+
+// Adresse des Elements `i` (nur intern; keine Bereichspruefung).
+fn __gcslots_adr(s: Gc[GcSlots], i: u64) -> u64 {
+    return (s as u64) + SLOT_KOPF + i * (s.desc & 255) * 8
+}
+
+// ---------------------------------------------------------------- GcVec
+
+// Ein leerer Vektor fuer Gc-Zeiger (`GcVec[Gc[T]]`). Der Puffer entsteht
+// erst beim ersten Eintrag — ein leerer Vektor kostet ein Objekt, nicht zwei.
+fn gcvec_neu() -> AllocError!Gc[GcVec] {
+    return try gc GcVec{ puffer: gc_null[GcSlots](), desc: GCVEC_DESC_ZEIGER }
+}
+
+// Ein leerer Vektor fuer ROHE Woerter (`GcVec[u64]`): der Sammler verfolgt
+// die Elemente NICHT. Fuer Zahlen, Kennungen, Atome.
+fn gcvec_neu_roh() -> AllocError!Gc[GcVec] {
+    return try gc GcVec{ puffer: gc_null[GcSlots](), desc: GCVEC_DESC_ROH }
+}
+
+fn gcvec_laenge(v: Gc[GcVec]) -> u64 {
+    let s: Gc[GcSlots] = v.puffer
+    if (s as u64) == 0 {
+        return 0
+    }
+    return s.n
+}
+
+fn gcvec_kapazitaet(v: Gc[GcVec]) -> u64 {
+    let s: Gc[GcSlots] = v.puffer
+    if (s as u64) == 0 {
+        return 0
+    }
+    return s.kap
+}
+
+// Platz fuer mindestens `n` Elemente schaffen. Verdoppelnd, damit `n`
+// Anhaengungen zusammen O(n) kosten.
+//
+// HIER liegt der Fallstrick der Runde: `__gcslots_neu` alloziert, und an
+// einer Allokationsstelle laeuft eine Sammlerscheibe. Siehe (B1)/(B2) im
+// Kopfkommentar.
+fn gcvec_platz(v: Gc[GcVec], mindestens: u64) -> AllocError!bool {
+    let alt: Gc[GcSlots] = v.puffer
+    var altkap: u64 = 0
+    var n: u64 = 0
+    if (alt as u64) != 0 {
+        altkap = alt.kap
+        n = alt.n
+    }
+    if altkap >= mindestens {
+        return true
+    }
+    var neukap: u64 = altkap * 2
+    if neukap < GCVEC_START {
+        neukap = GCVEC_START
+    }
+    while neukap < mindestens {
+        neukap = neukap * 2
+    }
+    let neu: Gc[GcSlots] = try __gcslots_neu(neukap, v.desc)
+    // Umkopieren. Zwischen der Allokation oben und dem Einhaengen unten
+    // alloziert nichts, also kann hier KEINE Scheibe dazwischenkommen.
+    let schritt: u64 = v.desc & 255
+    let qa: u64 = (alt as u64) + SLOT_KOPF
+    let za: u64 = (neu as u64) + SLOT_KOPF
+    var i: u64 = 0
+    let worte: u64 = n * schritt
+    while i < worte {
+        __gc_st64(za + i * 8, __gc_ld64(qa + i * 8))
+        i = i + 1
+    }
+    __gc_st64((neu as u64), n)
+    // Zuweisung in ein starkes Feld: der Compiler legt hier __gc_barrier.
+    // Das ist (B1) — ohne diese Zeile verliert ein schwarzer Vektor seinen
+    // frischen Puffer.
+    v.puffer = neu
+    return true
+}
+
+// Element `i` als rohes Wort setzen. Ruft die Einfuegebarriere SELBST, weil
+// der Compiler den Puffer nicht kennt — siehe (B3).
+fn gcvec_setzen_roh(v: Gc[GcVec], i: u64, w: u64) -> bool {
+    let s: Gc[GcSlots] = v.puffer
+    if (s as u64) == 0 {
+        return false
+    }
+    if i >= s.n {
+        return false
+    }
+    let a: u64 = __gcslots_adr(s, i)
+    if (s.desc >> 8) != 0 {
+        __gc_barrier(a as *mut u8, w as *mut u8)
+    }
+    __gc_st64(a, w)
+    return true
+}
+
+fn gcvec_lesen_roh(v: Gc[GcVec], i: u64) -> u64 {
+    let s: Gc[GcSlots] = v.puffer
+    if (s as u64) == 0 {
+        return 0
+    }
+    if i >= s.n {
+        return 0
+    }
+    return __gc_ld64(__gcslots_adr(s, i))
+}
+
+// Anhaengen. Reihenfolge mit Absicht: erst die Barriere und der Wert, DANN
+// die Laenge. Andersherum stuende fuer einen Augenblick ein Nullwort im
+// verfolgten Bereich — harmlos, aber die Reihenfolge hier ist die, die auch
+// bei mehreren Faeden (Runde 49) noch stimmt.
+fn gcvec_anhaengen_roh(v: Gc[GcVec], w: u64) -> AllocError!bool {
+    let n: u64 = gcvec_laenge(v)
+    if !(try gcvec_platz(v, n + 1)) {
+        return false
+    }
+    let s: Gc[GcSlots] = v.puffer
+    let a: u64 = __gcslots_adr(s, n)
+    if (s.desc >> 8) != 0 {
+        __gc_barrier(a as *mut u8, w as *mut u8)
+    }
+    __gc_st64(a, w)
+    __gc_st64((s as u64), n + 1)
+    return true
+}
+
+// Letztes Element entfernen und liefern (0 bei leerem Vektor). Der Slot wird
+// GENULLT: ein Zeiger jenseits der Laenge wird nicht mehr verfolgt, soll aber
+// auch nicht als Leiche im Puffer stehen bleiben.
+fn gcvec_abhaengen_roh(v: Gc[GcVec]) -> u64 {
+    let s: Gc[GcSlots] = v.puffer
+    if (s as u64) == 0 {
+        return 0
+    }
+    let n: u64 = s.n
+    if n == 0 {
+        return 0
+    }
+    let a: u64 = __gcslots_adr(s, n - 1)
+    let w: u64 = __gc_ld64(a)
+    __gc_st64((s as u64), n - 1)
+    __gc_st64(a, 0)
+    return w
+}
+
+// Element `i` entfernen, Reihenfolge bleibt erhalten (der DOM braucht das:
+// `removeChild` darf die Geschwister nicht durcheinanderbringen).
+fn gcvec_entfernen(v: Gc[GcVec], i: u64) -> bool {
+    let s: Gc[GcSlots] = v.puffer
+    if (s as u64) == 0 {
+        return false
+    }
+    let n: u64 = s.n
+    if i >= n {
+        return false
+    }
+    let schritt: u64 = s.desc & 255
+    let basis: u64 = (s as u64) + SLOT_KOPF
+    var k: u64 = i * schritt
+    let ende: u64 = (n - 1) * schritt
+    while k < ende {
+        __gc_st64(basis + k * 8, __gc_ld64(basis + (k + schritt) * 8))
+        k = k + 1
+    }
+    __gc_st64((s as u64), n - 1)
+    var j: u64 = 0
+    while j < schritt {
+        __gc_st64(basis + (ende + j) * 8, 0)
+        j = j + 1
+    }
+    return true
+}
+
+// Alles heraus. Der Puffer BLEIBT — wer ihn loswerden will, legt einen neuen
+// Vektor an. Die Slots werden genullt, damit kein toter Zeiger den Sammler
+// beschaeftigt.
+fn gcvec_leeren(v: Gc[GcVec]) {
+    let s: Gc[GcSlots] = v.puffer
+    if (s as u64) == 0 {
+        return
+    }
+    let worte: u64 = s.n * (s.desc & 255)
+    let basis: u64 = (s as u64) + SLOT_KOPF
+    __gc_st64((s as u64), 0)
+    var i: u64 = 0
+    while i < worte {
+        __gc_st64(basis + i * 8, 0)
+        i = i + 1
+    }
+}
+
+// Sucht ein rohes Wort, liefert den Index oder die Laenge (= nicht gefunden).
+fn gcvec_finden_roh(v: Gc[GcVec], w: u64) -> u64 {
+    let n: u64 = gcvec_laenge(v)
+    var i: u64 = 0
+    while i < n {
+        if gcvec_lesen_roh(v, i) == w {
+            return i
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// ------------------------------------------------------- Typisierte Sicht
+//
+// Stufe 0 hat keine Methoden. Die typsichere Oberflaeche sind generische
+// Funktionen — moeglich, seit `Gc[T]` in einer Vorlage stehen darf
+// (Compiler-Haken der Runde 53, `mono.rs::subst_name` bzw.
+// `lib/firnc1/mono.fi::subst_typ`).
+
+fn gcvec_anhaengen[T: Any](v: Gc[GcVec], x: Gc[T]) -> AllocError!bool {
+    return try gcvec_anhaengen_roh(v, x as u64)
+}
+
+fn gcvec_lesen[T: Any](v: Gc[GcVec], i: u64) -> Gc[T] {
+    return gcvec_lesen_roh(v, i) as Gc[T]
+}
+
+fn gcvec_setzen[T: Any](v: Gc[GcVec], i: u64, x: Gc[T]) -> bool {
+    return gcvec_setzen_roh(v, i, x as u64)
+}
+
+fn gcvec_abhaengen[T: Any](v: Gc[GcVec]) -> Gc[T] {
+    return gcvec_abhaengen_roh(v) as Gc[T]
+}
+
+fn gcvec_finden[T: Any](v: Gc[GcVec], x: Gc[T]) -> u64 {
+    return gcvec_finden_roh(v, x as u64)
+}
