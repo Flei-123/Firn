@@ -92,3 +92,83 @@ stammt aus der **Aufbauphase**, in der der Heap erst wächst und noch
 nicht-inkrementell gesammelt wird. Ein 12-ms-Aussetzer beim Heap-Wachstum
 ist für ein 16-ms-Bildbudget zu viel: der Übergang in den inkrementellen
 Modus muss früher greifen oder das Wachstum selbst inkrementell laufen.
+
+## Strang C — der eigentliche Durchbruch lag nicht im Compiler
+
+Nach A2 zeigte das callgrind-Profil des realweb-Laufs (2,14 Mrd. Ir):
+
+| Anteil | Ir | Funktion |
+|---|---|---|
+| 26,1 % | 557 993 466 | `dekodiere` (UTF-8 → Codepunkte) |
+| 23,9 % | 510 486 268 | `eingabe_pruefen` |
+| 23,1 % | 492 598 522 | `tokenize` (Zustandsautomat) |
+| 15,6 % | 332 932 201 | `main` (Sammeltopf: alles ohne eigenes Symbol) |
+
+Damit war klar: der teuerste Teil ist nicht der Automat, sondern die
+Vorverarbeitung je Zeichen. Drei Experimente, jeweils mit callgrind gemessen
+und mit oktettgleicher Ausgabe gegengeprüft:
+
+### C1 — `eingabe_pruefen`: ein Bereichstest statt zwölf Vergleichen
+
+`0x20..0x7E` ist auf echten Seiten der Normalfall und **nie** ein Fehler des
+Eingabestroms. Ein vorangestellter Bereichstest beendet die Funktion sofort.
+
+**2 136 489 667 → 1 793 235 323 Ir (−16,1 %)**
+
+### C2 — `dekodiere`: vorab reservieren, ASCII direkt schreiben
+
+Ein Codepunkt kostet mindestens ein Byte, also reichen `len` Plätze immer:
+`cp_reserve(out, len)` einmal, danach direkt in den Rohspeicher schreiben
+statt `cp_push` je Zeichen (Aufruf + Kapazitätstest). Dazu ein
+ASCII-Schnellweg (`c0 < 0x80 && c0 != CR`), der die vier Breitenvergleiche
+überspringt. Neu in `lib/html/mem.fi`: `cp_ptr`, `cp_set_len` (exportiert).
+
+**1 793 235 323 → 1 427 485 223 Ir (−20,4 %)**
+
+### C3 — Schnellweg an der Aufrufstelle
+
+Auch der reine Funktionsaufruf von `eingabe_pruefen` kostet; derselbe
+Bereichstest direkt in `tokenize` spart ihn für ~95 % aller Zeichen.
+
+**1 427 485 223 → 1 297 240 896 Ir (−9,1 %)**
+
+### C4 — widerlegt: „Textlauf am Stück" im Data-State
+
+Hypothese: eine innere Schleife, die unbedenkliche Textzeichen ohne
+Zustandsverzweigung am Stück in den Zeichenpuffer schiebt (das, was
+html5ever aus `memchr` zieht), spart den `match`-Dispatch je Zeichen.
+
+Gemessen: **1 297 240 896 → 1 297 140 701 Ir (−0,008 %)** — also nichts. Der
+`match` über den Zustand ist bereits eine echte Sprungtabelle
+(`jmp *(%rdx,%rax,8)` im Disassemblat), der Dispatch kostet praktisch nichts.
+Die Änderung wurde **verworfen**: mehr Code ohne Gegenwert.
+
+### Ergebnis Strang C
+
+| Korpus | vor Runde 40 | nach Runde 40 | Ziel |
+|---|---|---|---|
+| html5lib (pathologisch) | 1,69× | **1,33×** | ≤ 2× ✅ |
+| realweb (echte Seiten) | 4,34× | **2,68×** | ≤ 3× ✅ (Stretch), ≤ 2× offen |
+
+Instruktionen realweb insgesamt: 2 334 236 911 → 1 297 240 896 = **−44,4 %**.
+html5lib-Konformität unverändert 6810/6810 (Fehlermeldungen 6809/6810),
+`test.sh` 649/649, `selbst_vergleich` 188/0/0, Fixpunkt 289 096 zeichengleich.
+
+### Lehre
+
+Der Wanduhr-Vergleich hat den ersten Gewinn (A2) **nicht** gezeigt und wäre
+fast als „bringt nichts" verworfen worden; callgrind zeigte −8,47 %. Und der
+größte Hebel lag in zwei Bibliotheksfunktionen, nicht im Optimierer. Reihen-
+folge für Runde 41: erst profilieren, dann optimieren — und jede Optimierung
+mit Instruktionszählung belegen, nie mit der Uhr.
+
+### Offen für Runde 41
+
+- `tokenize` ist jetzt mit 492 Mio. Ir (38 %) der größte Posten: ~100
+  Instruktionen je Zeichen im Automaten, überwiegend Slot-Verkehr in einer
+  Funktion mit 8 200 Assemblerzeilen → Intervall-Splitting im Regalloc.
+- 52 Vergleiche in `tokenize` laden ihre Konstante aus einem Rahmen-Slot
+  (`cmp -0x270(%rbp),%r9d`): `immediate_consts` verwirft eine Konstante
+  global, sobald **eine** ihrer Verwendungen kein Immediate zulässt. Fix:
+  Konstante an der problematischen Stelle klonen statt überall aufgeben.
+- `tok_attr_value_push` 105 Mio. Ir (8 %) — noch ungeprüft.
