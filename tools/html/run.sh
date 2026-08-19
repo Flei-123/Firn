@@ -4,7 +4,7 @@
 #   1. compile lib/browser/parse_main.fi in THREE build stages
 #      (opt / --no-opt / dev-fast) -- all of them have to yield the same quota
 #   2. tools/html/harness_tree.py against tools/html/cases/*.dat
-#   3. report the KNOWN GAPS separately (tools/html/luecken/)
+#   3. report the KNOWN GAPS separately (tools/html/gaps/)
 #   4. robustness on real pages (testdata/realweb/): no abort, and
 #      all three build stages yield the same tree, byte for byte
 #   5. soak run with a counter-check (tools/html/gc_tree.sh)
@@ -19,18 +19,18 @@ cd "$(dirname "$0")/../.."
 FIRNC="compiler/target/release/firnc"
 export FIRNLIB="$(pwd)/lib"
 WORK=".tree-work"
-SCHNELL=0
-[ "${1:-}" = "--schnell" ] && SCHNELL=1
+FAST=0
+[ "${1:-}" = "--fast" ] && FAST=1
 
 mkdir -p "$WORK"
 if [ ! -x "$FIRNC" ]; then
     cargo build --release --manifest-path compiler/Cargo.toml
 fi
 
-echo "== 1. Baumaufbau uebersetzen (Firn) =="
+echo "== 1. compile the tree builder (Firn) =="
 "$FIRNC" -o "$WORK/parse" lib/browser/parse_main.fi
 echo "   opt      : $WORK/parse"
-if [ "$SCHNELL" -eq 0 ]; then
+if [ "$FAST" -eq 0 ]; then
     "$FIRNC" --no-opt -o "$WORK/parse.noopt" lib/browser/parse_main.fi
     "$FIRNC" --opt-level=dev-fast -o "$WORK/parse.devfast" lib/browser/parse_main.fi
     echo "   noopt    : $WORK/parse.noopt"
@@ -38,56 +38,56 @@ if [ "$SCHNELL" -eq 0 ]; then
 fi
 
 echo
-echo "== 2. Eigene Faelle (tools/html/cases/*.dat) =="
+echo "== 2. own cases (tools/html/cases/*.dat) =="
 python3 tools/html/harness_tree.py "$WORK/parse" \
-        --json "$WORK/bilanz.json" --zeige 5 | tee "$WORK/bilanz.txt"
-QUOTE=$(python3 -c "import json;print(json.load(open('$WORK/bilanz.json'))['passed'])")
-GESAMT=$(python3 -c "import json;print(json.load(open('$WORK/bilanz.json'))['total'])")
+        --json "$WORK/balance.json" --show 5 | tee "$WORK/balance.txt"
+QUOTA=$(python3 -c "import json;print(json.load(open('$WORK/balance.json'))['passed'])")
+TOTAL=$(python3 -c "import json;print(json.load(open('$WORK/balance.json'))['total'])")
 
-if [ "$SCHNELL" -eq 0 ]; then
+if [ "$FAST" -eq 0 ]; then
     echo
-    echo "== 2a. Gleiche Quote in allen drei Baustufen =="
+    echo "== 2a. the same quota in all three build stages =="
     for m in noopt devfast; do
-        python3 tools/html/harness_tree.py "$WORK/parse.$m" --json "$WORK/bilanz.$m.json" >/dev/null || true
-        Q=$(python3 -c "import json;print(json.load(open('$WORK/bilanz.$m.json'))['passed'])")
-        if [ "$Q" != "$QUOTE" ]; then
-            echo "   FEHLER: $m liefert $Q statt $QUOTE bestandene Faelle"
+        python3 tools/html/harness_tree.py "$WORK/parse.$m" --json "$WORK/balance.$m.json" >/dev/null || true
+        Q=$(python3 -c "import json;print(json.load(open('$WORK/balance.$m.json'))['passed'])")
+        if [ "$Q" != "$QUOTA" ]; then
+            echo "   ERROR: $m yields $Q instead of $QUOTA passed cases"
             exit 1
         fi
-        echo "   $m: $Q — gleich"
+        echo "   $m: $Q -- equal"
     done
 fi
 
 echo
-echo "== 3. Bekannte Luecken (tools/html/luecken/) — muessen fehlschlagen =="
-echo "   Erwartete Baeume sind die RICHTIGEN; sie zeigen, was Runde 54 nicht kann."
+echo "== 3. known gaps (tools/html/gaps/) -- they have to fail =="
+echo "   The expected trees are the RIGHT ones; they show what round 54 cannot do."
 set +e
-python3 tools/html/harness_tree.py "$WORK/parse" --luecken \
-        --json "$WORK/luecken.json" > "$WORK/luecken.txt"
+python3 tools/html/harness_tree.py "$WORK/parse" --gaps \
+        --json "$WORK/gaps.json" > "$WORK/gaps.txt"
 set -e
-tail -4 "$WORK/luecken.txt" | sed 's/^/   /'
-LQ=$(python3 -c "import json;print(json.load(open('$WORK/luecken.json'))['passed'])")
-LG=$(python3 -c "import json;print(json.load(open('$WORK/luecken.json'))['total'])")
-echo "   $LQ von $LG bekannten Luecken bereits geschlossen"
+tail -4 "$WORK/gaps.txt" | sed 's/^/   /'
+GQ=$(python3 -c "import json;print(json.load(open('$WORK/gaps.json'))['passed'])")
+GT=$(python3 -c "import json;print(json.load(open('$WORK/gaps.json'))['total'])")
+echo "   $GQ of $GT known gaps already closed"
 
 echo
-echo "== 4. Echte Seiten (testdata/realweb/) =="
+echo "== 4. real pages (testdata/realweb/) =="
 python3 tools/html/realweb.py "$WORK/parse" > "$WORK/realweb.txt"
 sed 's/^/   /' "$WORK/realweb.txt"
-if [ "$SCHNELL" -eq 0 ]; then
+if [ "$FAST" -eq 0 ]; then
     for m in noopt devfast; do
         python3 tools/html/realweb.py "$WORK/parse.$m" > "$WORK/realweb.$m.txt"
         if ! cmp -s "$WORK/realweb.txt" "$WORK/realweb.$m.txt"; then
-            echo "   FEHLER: $m liefert auf echten Seiten einen anderen Baum"
+            echo "   ERROR: $m yields a different tree on real pages"
             exit 1
         fi
-        echo "   $m: gleiche Baeume, Byte fuer Byte"
+        echo "   $m: the same trees, byte for byte"
     done
 fi
 
 echo
-echo "== 5. Dauerlauf: Baeume aufbauen und verwerfen, ohne zu wachsen =="
-if [ "$SCHNELL" -eq 1 ]; then
+echo "== 5. soak run: build and discard trees without growing =="
+if [ "$FAST" -eq 1 ]; then
     BAUM_RUNDEN=${BAUM_RUNDEN:-4000} BAUM_MS=${BAUM_MS:-3000} \
       BAUM_LECK_RUNDEN=${BAUM_LECK_RUNDEN:-3000} bash tools/html/gc_tree.sh | sed 's/^/   /'
 else
@@ -95,11 +95,11 @@ else
 fi
 
 echo
-echo "== 6. Regressionsschranke =="
+echo "== 6. regression limit =="
 MIN=$(cat tools/html/minquota_tree.txt)
-echo "   Baumkonstruktion: $QUOTE / $GESAMT   (Schranke: $MIN)"
-if [ "$QUOTE" -lt "$MIN" ]; then
-    echo "   FEHLGESCHLAGEN: die Quote ist unter die eingetragene Schranke gefallen."
+echo "   tree construction: $QUOTA / $TOTAL   (limit: $MIN)"
+if [ "$QUOTA" -lt "$MIN" ]; then
+    echo "   FAILED: the quota has fallen below the recorded limit."
     exit 1
 fi
-echo "OK: $QUOTE / $GESAMT eigene Faelle bestanden"
+echo "OK: $QUOTA / $TOTAL own cases passed"
