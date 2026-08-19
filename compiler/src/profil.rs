@@ -387,7 +387,7 @@ mod tests {
 
     #[test]
     fn app_bleibt_unberuehrt() {
-        let t = fehler_von("profile app\nfn f(x: f64) -> f64 { return x }\n");
+        let t = fehler_von("profile app\nfn f(x: f64) -> f64 { return x }\nfn main() -> i32 { return 0 }\n");
         assert!(!t.contains("gleitkomma"), "{}", t);
     }
 
@@ -395,13 +395,13 @@ mod tests {
     fn app_erlaubt_inline_assembler() {
         // Bewusste Entscheidung (siehe hook_asm): nur so ist die
         // volatile-Zusage in einem laufenden Programm pruefbar.
-        let t = fehler_von("profile app\nfn f() { asm(\"nop\") }\n");
+        let t = fehler_von("profile app\nfn f() { asm(\"nop\") }\nfn main() -> i32 { return 0 }\n");
         assert!(!t.contains("error"), "{}", t);
     }
 
     #[test]
     fn app_verbietet_interrupt() {
-        let t = fehler_von("profile app\n#[interrupt]\nfn ih() { asm(\"nop\") }\n");
+        let t = fehler_von("profile app\n#[interrupt]\nfn ih() { asm(\"nop\") }\nfn main() -> i32 { return 0 }\n");
         assert!(t.contains("nur im profil 'kernel'"), "{}", t);
     }
 }
