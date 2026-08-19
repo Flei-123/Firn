@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
-# Nachweis des STATISCHEN VERSANDS bei Schnittstellenschranken (Runde 50).
+# Proof of STATIC DISPATCH with interface bounds (round 50).
 #
-# Die Zusage lautet: `fn f[T: I](x: *T)` ruft `x.m()` DIREKT auf, sobald die
-# Auspraegung bekannt ist — kein Umweg ueber eine Methodentafel, kein
-# indirekter Sprung. Eine Zusage dieser Art laesst sich nicht mit der Wanduhr
-# belegen (die streut), sondern nur am ERZEUGTEN CODE. Genau das tut dieses
-# Werkzeug.
+# The promise is: `fn f[T: I](x: *T)` calls `x.m()` DIRECTLY as soon as the
+# instantiation is known -- no detour over a method table, no
+# indirect jump. A promise of this kind cannot be proven with the wall clock
+# (which scatters), only on the EMITTED CODE. Exactly that is what this
+# tool does.
 #
-# Zwei Programme, dieselbe Arbeit:
+# Two programs, the same work:
 #
-#   statisch.fi   fn count[T: Order](a: *T, …)     Schranke, Auspraegung
-#   dynamisch.fi  fn count_dyn(a: dyn OrderD, …)   Methodentafel
+#   static.fi     fn count[T: Order](a: *T, ...)    bound, instantiation
+#   dynamic.fi    fn count_dyn(a: dyn OrderD, ...)  method table
 #
-# Geprueft wird:
-#   1. In `statisch` gibt es KEINEN indirekten Aufruf (`call <register>`) —
-#      und ohne Optimierer dafuer einen namentlichen `call … Dot__less`.
-#   2. In `dynamisch` gibt es mindestens einen. (Ohne diese Gegenprobe wuerde
-#      der Test auch dann bestehen, wenn er gar nichts misst.)
+# What is checked:
+#   1. In `static` there is NO indirect call (`call <register>`) --
+#      and without the optimiser a call by name `call ... Dot__less` instead.
+#   2. In `dynamic` there is at least one. (Without this counter-check the
+#      test would pass even if it measured nothing at all.)
 #   3. Dasselbe in der FIR: `statisch` enthaelt weder `calli` noch `vtab`,
 #      `dynamisch` beides.
 #   4. `statisch` laedt auch keine Methodentafel-Adresse (`lea … .L__iface`).
