@@ -238,7 +238,7 @@ fn write_union_inner(
         CoerceKind::FromValue => {
             let zero = lo.constant(FTy::U32, 0);
             lo.store(FTy::U32, addr, zero);
-            // Schicht Feldzugriff <-> Speicherort (layout.rs, DESIGNZIELE 8)
+            // Schicht Feldzugriff <-> Speicherort (layout.rs, DESIGN_GOALS 8)
             let va = lo.field_addr_at(addr, c.union.val_off);
             lo.write_into(va, e)
         }
@@ -376,7 +376,7 @@ fn try_value_addr(lo: &mut Lower, e: &Expr) -> Option<Val> {
     lo.cur = fail;
     return_error(lo, code)?;
     lo.cur = cont;
-    // Schicht Feldzugriff <-> Speicherort (layout.rs, DESIGNZIELE 8)
+    // Schicht Feldzugriff <-> Speicherort (layout.rs, DESIGN_GOALS 8)
     Some(lo.field_addr_at(src, ti.inner.val_off))
 }
 
@@ -406,7 +406,7 @@ fn catch_slot(lo: &mut Lower, e: &Expr) -> Option<Val> {
     lo.set_term(Term::BrCond { cond: good, then_bb: ok_bb, else_bb: old_bb });
 
     lo.cur = ok_bb;
-    // Schicht Feldzugriff <-> Speicherort (layout.rs, DESIGNZIELE 8)
+    // Schicht Feldzugriff <-> Speicherort (layout.rs, DESIGN_GOALS 8)
     let va = lo.field_addr_at(src, ci.inner.val_off);
     copy_value(lo, slot, va, &ci.inner.val_ty)?;
     if !lo.terminated() {

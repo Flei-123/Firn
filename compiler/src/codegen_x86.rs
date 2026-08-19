@@ -125,7 +125,7 @@ impl Emitter {
 /// Linker-Symbol eines Funktionsnamens.
 ///
 /// **Einzige** Stelle, an der aus einem internen Namen ein Symbol wird — das
-/// Schema selbst steht in `modules.rs` (`SYMBOL_SCHEMA`, DESIGNZIELE.md §4).
+/// Schema selbst steht in `modules.rs` (`SYMBOL_SCHEMA`, DESIGN_GOALS.md §4).
 /// Interne Blocklabels (`block_label`) gehen bewusst NICHT hier durch: sie sind
 /// dateilokal (`.L…`) und erscheinen nie in der Symboltabelle.
 pub(crate) fn label(name: &str) -> String {
