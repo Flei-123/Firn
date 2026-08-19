@@ -71,6 +71,20 @@ pub const ATTRS: &[AttrInfo] = &[
         was: "kein Sammellauf in diesem Aufrufbaum (SPEC 3.5.4)",
     },
     AttrInfo {
+        name: "interrupt",
+        ziel: Ziel::Funktion,
+        args: 0,
+        umgesetzt: true,
+        was: "unterbrechungs-einsprungpunkt: alle register retten, iretq (SPEC 2)",
+    },
+    AttrInfo {
+        name: "allow_fp",
+        ziel: Ziel::Beides,
+        args: 0,
+        umgesetzt: true,
+        was: "gleitkomma im profil 'kernel' erlauben, FPU-Zustand (SPEC 2)",
+    },
+    AttrInfo {
         name: "constant_time",
         ziel: Ziel::Funktion,
         args: 0,
@@ -221,8 +235,9 @@ mod tests {
         // Stand Runde „Haertetest 2": zusaetzlich #[no_gc] (SPEC 3.5.4,
         // geprueft in nogc.rs, Testprogramme tests/54x_no_gc_*.fi und
         // tests/neg/nogc_*.fi).
+        // Runde 52: dazu #[interrupt] und #[allow_fp] (SPEC 2, kern.rs/profil.rs).
         let u: Vec<&str> = ATTRS.iter().filter(|a| a.umgesetzt).map(|a| a.name).collect();
-        assert_eq!(u, vec!["must_consume", "no_gc"]);
+        assert_eq!(u, vec!["must_consume", "no_gc", "interrupt", "allow_fp"]);
     }
 
     #[test]

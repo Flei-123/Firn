@@ -35,11 +35,13 @@ import muster
 import fehler
 import gc
 import iface
+import kern
 import nogc
 
 export { Sema, sema_neu, sema_frei, sema_lauf, sema_fehler, sema_typ,
          sema_typen, sema_typ_anzahl, sema_braucht_comptime, sema_konst_wert,
          sema_mu_setzen, sema_fe_setzen, sema_gc_setzen, sema_if_setzen,
+         sema_kernel_setzen,
          sema_baum }
 
 const KEIN: u32 = 4294967295
@@ -71,6 +73,10 @@ struct Sema {
     mc_fname: Vec[u32],
     mc_si: Vec[u32],
     fehler: usize,
+    // RUNDE 52 (SPEC 2): das Kernel-Profil. Aufgeloest wird es in
+    // `bin/firnc1.fi` (Deklaration oder `--profile=`), hier wird es nur
+    // durchgesetzt.
+    kernel: bool,
     ct_noetig: bool,     // eine Konstante braucht Auswertung zur Uebersetzungszeit
 }
 
@@ -83,7 +89,7 @@ fn sema_neu(b: u64, it: u64) -> Sema {
         k_name: vec_neu[u32](), k_typ: vec_neu[u32](), k_wert: vec_neu[u64](),
         t_bool: 0, t_i64: 0, t_usize: 0, t_void: 0, t_fehler: 0, t_f64: 0,
         ret: 0, mu: 0, feh: 0, gc: 0, ifr: 0, mc_fname: vec_neu[u32](), mc_si: vec_neu[u32](),
-        fehler: 0, ct_noetig: false,
+        fehler: 0, kernel: false, ct_noetig: false,
     }
 }
 
@@ -123,6 +129,10 @@ fn hat_gc(s: *mut Sema) -> bool { return (*s).gc != 0 }
 // Die Schnittstellen-Registrierung anmelden (Runde 46). MUSS vor
 // `sema_lauf` stehen.
 fn sema_if_setzen(s: *mut Sema, f: u64) { (*s).ifr = f }
+
+// RUNDE 52 (SPEC 2): im Kernel-Profil gibt es weder `syscall` (kein
+// Betriebssystem darunter) noch `gc class` (kein globaler Heap).
+fn sema_kernel_setzen(s: *mut Sema, v: bool) { (*s).kernel = v }
 
 fn ifp(s: *mut Sema) -> *mut iface.If { return (*s).ifr as *mut iface.If }
 fn hat_if(s: *mut Sema) -> bool { return (*s).ifr != 0 }
@@ -1224,6 +1234,128 @@ fn schnittstellen_ruf(s: *mut Sema, e: u32, ii: u32, m: u32, et: u32) -> u32 {
     return iface.if_rtyp(ifp(s), ii as usize, mk)
 }
 
+// ---------------------------------------------- Inline-Assembler und MMIO
+//
+// RUNDE 52 (compiler/src/kern.rs::hook_call).
+
+// Ganzzahltyp zu einem MMIO-Breitenindex (0 = u8 … 3 = u64).
+fn mmio_typ(s: *mut Sema, w: u32) -> u32 {
+    if w == 0 {
+        return typen.neuer_typ(tafel(s), typen.K_U8, 0, 0)
+    }
+    if w == 1 {
+        return typen.neuer_typ(tafel(s), typen.K_U16, 0, 0)
+    }
+    if w == 2 {
+        return typen.neuer_typ(tafel(s), typen.K_U32, 0, 0)
+    }
+    return typen.neuer_typ(tafel(s), typen.K_U64, 0, 0)
+}
+
+// Ein Registername in einem asm-Block. `wo`: 0 = out, 1 = in, 2 = clobber.
+fn asm_reg_pruefen(s: *mut Sema, reg: u32, wo: u32) -> bool {
+    if wo == 2 {
+        var mw: [u8; 6] = "memory"
+        if intern.intern_gleich(namen(s), reg, (&mw[0]) as u64, 6) {
+            return true
+        }
+    }
+    if kern.reg_stamm(namen(s), reg) != kern.KEIN_REG {
+        return true
+    }
+    meckern(s)
+    return false
+}
+
+fn asm_pruefen(s: *mut Sema, blk: u32, e: u32) -> u32 {
+    let b: *mut ast.Baum = baum(s)
+    let off: u32 = ast.e_b(b, e)
+    let anz: u32 = ast.e_c(b, e)
+    var gut: bool = true
+    let aus: u32 = ast.asm_aus(b, blk)
+    if aus != ast.NICHTS {
+        if !asm_reg_pruefen(s, aus, 0) {
+            gut = false
+        }
+    }
+    var k: u32 = 0
+    while k < ast.asm_ein_anzahl(b, blk) {
+        if !asm_reg_pruefen(s, ast.asm_ein_reg(b, blk, k), 1) {
+            gut = false
+        }
+        k = k + 1
+    }
+    var k2: u32 = 0
+    while k2 < ast.asm_clob_anzahl(b, blk) {
+        if !asm_reg_pruefen(s, ast.asm_clob(b, blk, k2), 2) {
+            gut = false
+        }
+        k2 = k2 + 1
+    }
+    // Jeder Eingabewert muss skalar sein — in ein Register passt nichts
+    // anderes.
+    let u64t: u32 = typen.neuer_typ(tafel(s), typen.K_U64, 0, 0)
+    var k3: u32 = 0
+    while k3 < anz {
+        let t: u32 = ausdruck(s, ast.kind_at(b, off + k3), u64t)
+        if ist_fehler(s, t) {
+            gut = false
+        } else if !ist_int(s, t) && !ist_bool(s, t) && !typen.ist_zeiger(tafel(s), t) {
+            meckern(s)
+            gut = false
+        }
+        k3 = k3 + 1
+    }
+    if !gut {
+        return (*s).t_fehler
+    }
+    if aus != ast.NICHTS {
+        return u64t
+    }
+    return (*s).t_void
+}
+
+fn mmio_pruefen(s: *mut Sema, w: u32, e: u32, schreiben: bool) -> u32 {
+    let b: *mut ast.Baum = baum(s)
+    let off: u32 = ast.e_b(b, e)
+    let anz: u32 = ast.e_c(b, e)
+    var soll: u32 = 1
+    if schreiben {
+        soll = 2
+    }
+    let zt: u32 = mmio_typ(s, w)
+    if anz != soll {
+        var k: u32 = 0
+        while k < anz {
+            austypen(s, ast.kind_at(b, off + k))
+            k = k + 1
+        }
+        meckern(s)
+        return (*s).t_fehler
+    }
+    let pt: u32 = typen.neuer_typ(tafel(s), typen.K_PTR, zt, 1)
+    let at: u32 = ausdruck(s, ast.kind_at(b, off), pt)
+    if !ist_fehler(s, at) && !typen.ist_zeiger(tafel(s), at) {
+        meckern(s)
+        return (*s).t_fehler
+    }
+    if ist_fehler(s, at) {
+        return (*s).t_fehler
+    }
+    if !schreiben {
+        return zt
+    }
+    let wt: u32 = ausdruck(s, ast.kind_at(b, off + 1), zt)
+    if ist_fehler(s, wt) {
+        return (*s).t_fehler
+    }
+    if !ist_int(s, wt) {
+        meckern(s)
+        return (*s).t_fehler
+    }
+    return (*s).t_void
+}
+
 fn ruf(s: *mut Sema, e: u32) -> u32 {
     let b: *mut ast.Baum = baum(s)
     // `size_of[T]()` — kein gewoehnlicher Aufruf, sondern eine Groesse zur
@@ -1279,6 +1411,23 @@ fn ruf(s: *mut Sema, e: u32) -> u32 {
         }
         if muster.mus_ist_ctorname(namen(s), name) {
             return ctor_pruefen(s, name, e)
+        }
+    }
+    // RUNDE 52 (kern.rs): der Inline-Assembler und die acht MMIO-Namen.
+    // `asm$N` kann keine eigene Funktion sein ('$' ist kein Bezeichnerzeichen);
+    // bei MMIO gewinnt eine gleichnamige eigene Funktion.
+    let anr: u32 = kern.asm_nummer(namen(s), name)
+    if anr != kern.KEINE_NUMMER {
+        return asm_pruefen(s, anr, e)
+    }
+    if fn_suchen(s, name) == KEIN {
+        let wl: u32 = kern.mmio_lesen_breite(namen(s), name)
+        if wl != kern.KEINE_BREITE {
+            return mmio_pruefen(s, wl, e, false)
+        }
+        let ws: u32 = kern.mmio_schreiben_breite(namen(s), name)
+        if ws != kern.KEINE_BREITE {
+            return mmio_pruefen(s, ws, e, true)
         }
     }
     // `__atomar_addieren(p, delta)` (atomar.rs, RUNDE 47): atomares
@@ -1537,6 +1686,11 @@ fn ausdruck_inner(s: *mut Sema, e: u32, hinweis: u32) -> u32 {
     if a == ast.E_SYSCALL {
         let off: u32 = ast.e_b(b, e)
         let anz: u32 = ast.e_c(b, e)
+        // RUNDE 52 (profil.rs): unter einem freistehenden Kernel liegt kein
+        // Betriebssystem, das einen Systemaufruf entgegennehmen koennte.
+        if (*s).kernel {
+            meckern(s)
+        }
         if anz == 0 || anz > 7 {
             meckern(s)
         }
@@ -2363,6 +2517,11 @@ fn sema_lauf(s: *mut Sema) {
     //    Platzhalter aufloesen kann (derselbe Uebergabepunkt wie `__eu#<n>`).
     var gc_bisher: usize = 0
     if hat_gc(s) {
+        // RUNDE 52 (profil.rs): `gc class` braucht den Tracing-Sammler; im
+        // Kernel-Profil gibt es keine GC-Typen (SPEC 2).
+        if (*s).kernel && gc.gc_hat_klassen((*s).gc as *mut gc.Gc) {
+            meckern(s)
+        }
         gc.gc_anmelden((*s).gc, tafel(s), namen(s))
         typen.typen_gc_setzen(tafel(s), (*s).gc)
     }

@@ -459,6 +459,13 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
     if dg.has_errors() {
         return None;
     }
+    // HOOK profil (profil.rs, Runde 52): das Profil steht in der ERSTEN Datei
+    // (der Wurzeldatei); `--profile=` gewinnt. Es muss hier schon feststehen,
+    // weil die `import`-Regel unmittelbar darunter danach fragt — der
+    // Typpruefer laeuft erst viel spaeter.
+    if let Some(root) = progs.first() {
+        crate::profil::festlegen(root, None);
+    }
 
     // Was bietet welches Modul an?
     let mut infos: Vec<ModuleInfo> = Vec::new();
@@ -474,6 +481,10 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
             items.insert(x.name.clone());
         }
         for im in &p.imports {
+            // HOOK profil (profil.rs, Runde 52): im Kernel-Profil ist die
+            // Standardbibliothek gesperrt. Die Pruefung sitzt hier, weil nur
+            // hier die Einbindungen JEDER Datei mit Position bekannt sind.
+            crate::profil::hook_import(dg, &im.path, im.span);
             let target = im.path.last().cloned().unwrap_or_default();
             let known = files.iter().any(|g| module_name(g) == target);
             if !known {

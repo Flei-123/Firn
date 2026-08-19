@@ -138,6 +138,9 @@ impl<'a> Checker<'a> {
         // Laeuft NACH der Typpruefung, weil Regel 3 (Schreiben in ein
         // Gc[T]-Feld) die Typtabelle braucht.
         crate::nogc::hook_check(self, prog);
+        // HOOK kern: `#[interrupt]` — Form pruefen und Aufrufe verbieten
+        // (kern.rs, Runde 52).
+        crate::kern::check_interrupts(self, prog);
         // Ganzprogramm-Pruefung: laeuft genau einmal, nicht je Nachtrag.
         self.check_main(prog);
     }
@@ -322,15 +325,10 @@ impl<'a> Checker<'a> {
     // ---------------------------------------------------------------- Profil
 
     fn check_profile(&mut self, prog: &Program) {
-        if let Some((name, span)) = &prog.profile {
-            if name != "kernel" && name != "app" {
-                self.dg.error_note(
-                    *span,
-                    format!("unbekanntes profil '{}'", name),
-                    "erlaubt sind 'kernel' und 'app'",
-                );
-            }
-        }
+        // HOOK profil (profil.rs, Runde 52): das Profil festlegen UND seine
+        // Regeln durchsetzen. Bis Runde 51 stand hier nur die Namenspruefung —
+        // die Deklaration hatte keine Wirkung (SPEC §14, Punkt 6).
+        crate::profil::hook_check(self.dg, prog);
     }
 
     // --------------------------------------------------------------- Structs
@@ -472,6 +470,14 @@ impl<'a> Checker<'a> {
     fn check_main(&mut self, prog: &Program) {
         match self.fns.get("main") {
             None => {
+                // RUNDE 52 (SPEC §2): das Kernel-Profil hat keinen
+                // Einstiegspunkt. Es gibt kein `_start`, keinen
+                // Laufzeitvorspann und niemanden, der einen Exit-Code
+                // entgegennaehme — nur eine Objektdatei, die ein Bootlader
+                // bzw. ein Linkerskript einbindet.
+                if crate::profil::ist_kernel() {
+                    return;
+                }
                 self.dg.error_note(
                     Span::none(),
                     "das programm hat keine funktion 'main'",
@@ -1464,6 +1470,10 @@ impl<'a> Checker<'a> {
         }
         // HOOK sizeof: `size_of[T]()` (sizeof.rs)
         if let Some(t) = crate::sizeof::hook_call(self, name, args, nspan) {
+            return t;
+        }
+        // HOOK kern: `asm(…)` und die acht MMIO-Namen (kern.rs, Runde 52)
+        if let Some(t) = crate::kern::hook_call(self, name, args, nspan, espan) {
             return t;
         }
         // HOOK gc: `gc C{…}`, `weak(g)`, `stark(w)`, `x.as?[C]` und die

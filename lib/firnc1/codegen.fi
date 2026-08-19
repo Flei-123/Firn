@@ -36,8 +36,10 @@ import intern
 import fir
 import gc
 import iface
+import kern
 
 export { Cg, cg_neu, cg_frei, cg_lauf, cg_ungeeignet, cg_text, cg_gc_setzen,
+         cg_freistehend_setzen,
          cg_if_setzen }
 
 const KEIN: u32 = 4294967295
@@ -52,6 +54,7 @@ struct Cg {
     ungeeignet: bool
     gcr: u64            // gc-Registrierung (Runde 34), 0 = keine Klassen
     ifr: u64            // Schnittstellen (Runde 46), 0 = keine
+    frei: bool          // RUNDE 52: freistehend — kein `_start`, kein exit
 }
 
 fn cg_neu(f: u64, it: u64) -> Cg {
@@ -59,13 +62,18 @@ fn cg_neu(f: u64, it: u64) -> Cg {
         f: f, it: it,
         aus: rt.buf_neu(),
         slot: vec_neu[u64](), aslot: vec_neu[u64](),
-        rahmen: 0, ungeeignet: false, gcr: 0, ifr: 0,
+        rahmen: 0, ungeeignet: false, gcr: 0, ifr: 0, frei: false,
     }
 }
 
 // Die gc-Registrierung anmelden (Runde 34): sie traegt Groesse, Typkennung
 // und Feldoffsets jeder Klasse — daraus entsteht die Typtabelle des Sammlers.
 fn cg_gc_setzen(c: *mut Cg, g: u64) { (*c).gcr = g }
+
+// RUNDE 52 (SPEC 2): freistehend uebersetzen — KEIN `_start`, kein
+// Laufzeitvorspann, kein `exit`. Das Ergebnis ist eine Objektdatei, die ein
+// Bootlader bzw. ein Linkerskript einbindet.
+fn cg_freistehend_setzen(c: *mut Cg, v: bool) { (*c).frei = v }
 
 // Die Schnittstellen-Registrierung anmelden (Runde 46): aus ihr entstehen
 // die Methodentafeln in `.rodata`.
@@ -940,6 +948,107 @@ fn emit_atomadd(c: *mut Cg, addr: u32, val: u32, dst: u32) {
     speichere_slot(c, slot_von(c, dst), R_AX)
 }
 
+// ---------------------------------------------- Inline-Assembler und MMIO
+//
+// RUNDE 52 (compiler/src/kern.rs, codegen_x86.rs). IMMER volatile: die
+// Zeilen stehen genau einmal und genau hier.
+
+// Eine internierte Zeichenkette in den Assemblertext schreiben.
+fn iname(c: *mut Cg, nr: u32) {
+    rt.buf_push_bytes(&(*c).aus, intern.intern_zeiger(it(c), nr),
+                      intern.intern_laenge(it(c), nr))
+}
+
+fn emit_asm(c: *mut Cg, f: *mut fir.Fir, i: u32, dst: u32) {
+    let vorlage: u32 = fir.i_a_von(f, i)
+    let aus: u32 = fir.i_b_von(f, i)
+    let aoff: u32 = fir.i_aoff_von(f, i)
+    let alen: u32 = fir.i_alen_von(f, i)
+    var kom: [u8; 60] = "# asm (volatile): darf weder entfernt noch verschoben werden"
+    roh(c, (&kom[0]) as u64, 60)
+    // Eingaben in ihre Register legen. Die schmalen Namen sind Sichten auf
+    // denselben 64-Bit-Stamm, deshalb geht immer das ganze Wort hinein.
+    var k: u32 = 0
+    while k < alen {
+        let rn: u32 = fir.arg_bei(f, aoff + k * 2)
+        let v: u32 = fir.arg_bei(f, aoff + k * 2 + 1)
+        ein(c)
+        var m: [u8; 4] = "mov "
+        w(c, (&m[0]) as u64, 4)
+        iname(c, kern.reg_stamm(it(c), rn))
+        var s: [u8; 17] = ", qword ptr [rbp-"
+        w(c, (&s[0]) as u64, 17)
+        zahl(c, slot_von(c, v))
+        var kl: [u8; 1] = "]"
+        w(c, (&kl[0]) as u64, 1)
+        nl(c)
+        k = k + 1
+    }
+    // Die Vorlage zeilenweise, woertlich.
+    let p: u64 = intern.intern_zeiger(it(c), vorlage)
+    let n: usize = intern.intern_laenge(it(c), vorlage)
+    var start: usize = 0
+    var j: usize = 0
+    while j <= n {
+        var ende: bool = j == n
+        if !ende {
+            ende = rt.ld8(p, j) == 10 as u8
+        }
+        if ende {
+            ein(c)
+            w(c, p + start as u64, j - start)
+            nl(c)
+            start = j + 1
+        }
+        j = j + 1
+    }
+    if aus != fir.KEIN {
+        ein(c)
+        var m2: [u8; 19] = "mov qword ptr [rbp-"
+        w(c, (&m2[0]) as u64, 19)
+        zahl(c, slot_von(c, dst))
+        var s2: [u8; 3] = "], "
+        w(c, (&s2[0]) as u64, 3)
+        iname(c, kern.reg_stamm(it(c), aus))
+        nl(c)
+    }
+}
+
+fn emit_mmio_load(c: *mut Cg, ty: u32, adr: u32, dst: u32) {
+    lade_wert(c, R_CX, adr)
+    let bits: u32 = fir.fty_bits(ty)
+    ein(c)
+    if bits >= 64 {
+        var m: [u8; 24] = "mov rax, qword ptr [rcx]"
+        w(c, (&m[0]) as u64, 24)
+    } else if bits == 32 {
+        var m2: [u8; 24] = "mov eax, dword ptr [rcx]"
+        w(c, (&m2[0]) as u64, 24)
+    } else {
+        var m3: [u8; 11] = "movzx eax, "
+        w(c, (&m3[0]) as u64, 11)
+        wortgroesse(c, bits)
+        var p2: [u8; 9] = "ptr [rcx]"
+        w(c, (&p2[0]) as u64, 9)
+    }
+    nl(c)
+    speichere_slot(c, slot_von(c, dst), R_AX)
+}
+
+fn emit_mmio_store(c: *mut Cg, ty: u32, adr: u32, val: u32) {
+    lade_wert(c, R_CX, adr)
+    lade_wert(c, R_AX, val)
+    let bits: u32 = fir.fty_bits(ty)
+    ein(c)
+    var m: [u8; 4] = "mov "
+    w(c, (&m[0]) as u64, 4)
+    wortgroesse(c, bits)
+    var p: [u8; 11] = "ptr [rcx], "
+    w(c, (&p[0]) as u64, 11)
+    regb(c, R_AX, bits)
+    nl(c)
+}
+
 fn emit_copymem(c: *mut Cg, ziel: u32, quelle: u32, groesse: u64) {
     lade_slot(c, 4, slot_von(c, ziel))
     lade_slot(c, 3, slot_von(c, quelle))
@@ -1186,6 +1295,18 @@ fn emit_inst(c: *mut Cg, fnr: u32, i: u32) {
         emit_vtab(c, fir.i_a_von(f, i), fir.i_b_von(f, i), dst)
         return
     }
+    if art == fir.O_ASM {
+        emit_asm(c, f, i, dst)
+        return
+    }
+    if art == fir.O_MMIOLD {
+        emit_mmio_load(c, ty, fir.i_a_von(f, i), dst)
+        return
+    }
+    if art == fir.O_MMIOST {
+        emit_mmio_store(c, ty, fir.i_a_von(f, i), fir.i_b_von(f, i))
+        return
+    }
     (*c).ungeeignet = true
 }
 
@@ -1262,18 +1383,54 @@ fn emit_term(c: *mut Cg, fnr: u32, bb: u32) {
     }
     var lv: [u8; 5] = "leave"
     roh(c, (&lv[0]) as u64, 5)
+    // RUNDE 52: eine `#[interrupt]`-Funktion stellt erst alle Register her
+    // und schliesst mit `iretq` ab — nur diese Instruktion setzt rflags, cs
+    // und rsp des unterbrochenen Fadens zurueck.
+    if fir.f_int_von(f, fnr) == 1 {
+        int_register(c, true)
+        var iq: [u8; 5] = "iretq"
+        roh(c, (&iq[0]) as u64, 5)
+        return
+    }
     var rt2: [u8; 3] = "ret"
     roh(c, (&rt2[0]) as u64, 3)
+}
+
+// RUNDE 52: die Register, die eine `#[interrupt]`-Funktion rettet — alle
+// Universalregister ausser `rsp` (der Prozessor) und `rbp` (der gewoehnliche
+// Prolog). `rueck = true` kehrt die Reihenfolge um und schreibt `pop`.
+fn int_register(c: *mut Cg, rueck: bool) {
+    var tab: [u8; 53] = "rax|rcx|rdx|rbx|rsi|rdi|r8|r9|r10|r11|r12|r13|r14|r15"
+    var k: u32 = 0
+    while k < 14 {
+        var nr: u32 = k
+        if rueck {
+            nr = 13 - k
+        }
+        ein(c)
+        if rueck {
+            var po: [u8; 4] = "pop "
+            w(c, (&po[0]) as u64, 4)
+        } else {
+            var pu: [u8; 5] = "push "
+            w(c, (&pu[0]) as u64, 5)
+        }
+        stueck(c, (&tab[0]) as u64, 53, nr)
+        nl(c)
+        k = k + 1
+    }
 }
 
 fn cg_lauf(c: *mut Cg) {
     let f: *mut fir.Fir = ff(c)
     var kopf: [u8; 29] = ".intel_syntax noprefix\n.text\n"
     t(c, (&kopf[0]) as u64, 29)
-    var st: [u8; 91] = ".globl _start\n_start:\n    xor rbp, rbp\n    mov rdi, rsp\n    and rsp, -16\n    call _F1.main\n"
-    t(c, (&st[0]) as u64, 91)
-    var st2: [u8; 53] = "    mov edi, eax\n    mov eax, 60\n    syscall\n    hlt\n"
-    t(c, (&st2[0]) as u64, 53)
+    if !(*c).frei {
+        var st: [u8; 91] = ".globl _start\n_start:\n    xor rbp, rbp\n    mov rdi, rsp\n    and rsp, -16\n    call _F1.main\n"
+        t(c, (&st[0]) as u64, 91)
+        var st2: [u8; 53] = "    mov edi, eax\n    mov eax, 60\n    syscall\n    hlt\n"
+        t(c, (&st2[0]) as u64, 53)
+    }
 
     var fi: u32 = 0
     while fi < fir.fn_anzahl(f) as u32 {
@@ -1287,6 +1444,12 @@ fn cg_lauf(c: *mut Cg) {
         var dp: [u8; 1] = ":"
         t(c, (&dp[0]) as u64, 1)
         nl(c)
+        if fir.f_int_von(f, fi) == 1 {
+            var ik: [u8; 46] = "    # interrupt: alle universalregister retten"
+            t(c, (&ik[0]) as u64, 46)
+            nl(c)
+            int_register(c, false)
+        }
         var pr: [u8; 30] = "    push rbp\n    mov rbp, rsp\n"
         t(c, (&pr[0]) as u64, 30)
         if (*c).rahmen > 0 {
