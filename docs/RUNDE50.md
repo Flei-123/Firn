@@ -362,7 +362,7 @@ wiederverwendetes Binary), eigenes `mktemp -d` in jedem Werkzeug.
 |---|---|---|
 | `bash ./test.sh` | 751/751 | **PASS 773/773** |
 | `bash tools/self_compare.sh` | 213 gleich / 0 abweichend / 0 fehlerhaft | **215 gleich / 0 abweichend / 0 fehlerhaft** |
-| `bash tools/fixpunkt.sh` | zeichengleich, 427.401 Zeilen | **Stufe 2 == Stufe 3, zeichengleich, 431.972 Zeilen** |
+| `bash tools/fixpoint.sh` | zeichengleich, 427.401 Zeilen | **Stufe 2 == Stufe 3, zeichengleich, 431.972 Zeilen** |
 
 Die +22 in `test.sh` erklären sich Datei für Datei: 2 neue Programme x 3
 Baustufen (`830`, `831`) = 6, 15 neue Negativtests = 15, der neue Schritt 8c
@@ -372,7 +372,7 @@ Modul nicht einzeln).
 
 Beide Vergleichszahlen stammen aus einem EINZELN gestarteten Lauf des
 jeweiligen Skripts, jeweils nach `rm -f .firnc1 .firnc2 .firnc3` — kein
-wiederverwendetes Binary. `tools/fixpunkt.sh` und `tools/bounds/run.sh`
+wiederverwendetes Binary. `tools/fixpoint.sh` und `tools/bounds/run.sh`
 legen ihr Arbeitsverzeichnis mit `mktemp -d` an; feste `/tmp`-Namen gibt es
 in dieser Runde keine.
 

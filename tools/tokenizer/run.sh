@@ -35,7 +35,7 @@ echo
 echo "== 1. Tokenizer uebersetzen (Firn) =="
 "$FIRNC" -o "$WORK/tokenize" lib/html/tokenize_main.fi
 # Messfassung: zaehlt nur Token (fairer Vergleich mit html5ever, das ebenfalls
-# nur zaehlt). Siehe Kopf von tools/tokenizer/durchsatz.sh.
+# nur zaehlt). Siehe Kopf von tools/tokenizer/throughput.sh.
 "$FIRNC" -o "$WORK/tokenize_bench" lib/html/tokenize_bench.fi
 echo "   opt      : $WORK/tokenize"
 if [ "$SCHNELL" -eq 0 ]; then
@@ -48,7 +48,7 @@ fi
 echo
 echo "== 1b. Modulnachweis Zeichenreferenzen (lib/html/entities.fi) =="
 "$FIRNC" -o "$WORK/entities_probe" lib/html/entities_probe.fi
-python3 tools/tokenizer/pruefe_entities.py "$WORK/entities_probe"
+python3 tools/tokenizer/check_entities.py "$WORK/entities_probe"
 
 echo
 echo "== 1c. Namenstabelle: keine feste Adresse, Ausfall wird gemeldet =="
@@ -105,12 +105,12 @@ fi
 
 echo
 echo "== 4. Durchsatz =="
-bash tools/tokenizer/durchsatz.sh "$WORK/tokenize" || true
+bash tools/tokenizer/throughput.sh "$WORK/tokenize" || true
 
 echo
 echo "== 5. Regressionsschranke =="
 MIN=$(cat tools/tokenizer/mindestquote.txt)
-MINF=$(cat tools/tokenizer/mindestquote_fehler.txt)
+MINF=$(cat tools/tokenizer/minquota_errors.txt)
 echo "   ohne Fehlercodes: $QUOTE / $GESAMT   (Schranke: $MIN)"
 echo "   mit  Fehlercodes: $QUOTE_FEHLER / $GESAMT   (Schranke: $MINF)"
 if [ "$QUOTE" -lt "$MIN" ] || [ "$QUOTE_FEHLER" -lt "$MINF" ]; then

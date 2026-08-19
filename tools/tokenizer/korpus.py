@@ -27,7 +27,7 @@ Es gibt ZWEI Korpora, weil ein einzelner in die Irre fuehrt:
 Es entstehen ZWEI Dateien mit demselben Inhalt:
 
   <korpus.html>     roher Text  — fuer die Referenzimplementierung
-  <korpus.auftrag>  EIN Auftrag im Protokoll aus tools/tokenizer/PROTOKOLL.md
+  <korpus.auftrag>  EIN Auftrag im Protokoll aus tools/tokenizer/LOG.md
 
 Aufruf:  korpus.py <html-pfad> <auftrag-pfad> [--quelle html5lib|realweb]
 """

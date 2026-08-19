@@ -230,7 +230,7 @@ festen Fehlertexte.
 * **Bestehende Projekte müssen nichts tun.** Ohne `firn.paket` ist alles
   wie vorher; `FIRNLIB` gilt unverändert und wird weiterhin als Schritt 5
   durchsucht. `test.sh`, `tools/self_compare.sh` und
-  `tools/fixpunkt.sh` setzen `FIRNLIB` selbst und laufen unverändert.
+  `tools/fixpoint.sh` setzen `FIRNLIB` selbst und laufen unverändert.
 * **Ein Projekt umstellen:** `firn.paket` ins Wurzelverzeichnis legen
   (`paket`, `version`, `start`, `quelle`), Abhängigkeiten mit `brauche`
   eintragen, und in jeder Bibliothek `oeffentlich` schreiben. Danach baut
@@ -275,7 +275,7 @@ früheren Lauf war beteiligt.
 | `bash ./test.sh` | **PASS 697/697**, Exit 0 (Basis 696/696; +1 = Schritt 18) |
 | ⤷ Schritt 18 `tools/packages/run.sh` | **21 bestanden, 0 fehlgeschlagen** |
 | `bash tools/self_compare.sh` | **201 gleiches Verhalten · 0 abweichend · 0 fehlerhaft**, Exit 0 |
-| `bash tools/fixpunkt.sh` | **Stufe 2 == Stufe 3, zeichengleich**, 2.070.856 Oktette, 364.765 Zeilen Assembler; Korpus: `.firnc2` verhält sich wie `firnc0`, Exit 0 |
+| `bash tools/fixpoint.sh` | **Stufe 2 == Stufe 3, zeichengleich**, 2.070.856 Oktette, 364.765 Zeilen Assembler; Korpus: `.firnc2` verhält sich wie `firnc0`, Exit 0 |
 
 Zum Vergleich der Ausgangsstand von Commit `a492d26`: `test.sh` 696/696,
 `self_compare.sh` 201/0/0, `fixpunkt.sh` zeichengleich bei 2.065.816

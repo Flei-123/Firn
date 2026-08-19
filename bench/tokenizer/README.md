@@ -9,7 +9,7 @@ Zeit aus.
 
 ```
 cargo build --release --manifest-path bench/tokenizer/Cargo.toml
-bash tools/tokenizer/durchsatz.sh .tokenizer-work/tokenize
+bash tools/tokenizer/throughput.sh .tokenizer-work/tokenize
 ```
 
 `durchsatz.sh` erzeugt ZWEI Korpora (`tools/tokenizer/korpus.py`), misst je

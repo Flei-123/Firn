@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tools/fixpunkt.sh — DER FIXPUNKT: Firn traegt sich selbst.
+# tools/fixpoint.sh — DER FIXPUNKT: Firn traegt sich selbst.
 #
 # Drei Stufen, dieselbe Quelle:
 #

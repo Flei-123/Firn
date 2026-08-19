@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Dynamisch gewichtete INSTRUKTIONSMUSTER eines Firn-Binaries (Runde 51).
 
-WARUM: `tools/tokenizer/profil.py` beantwortet „welche FUNKTION kostet?".
+WARUM: `tools/tokenizer/profile.py` beantwortet „welche FUNKTION kostet?".
 Diese Datei beantwortet die Frage daneben — „welche FORM von Code kostet?".
 Beides zusammen zeigt erst, wo der Uebersetzer schlecht arbeitet.
 
@@ -19,7 +19,7 @@ Erzeugen der Eingaben:
 
 Aufruf:
 
-    python3 tools/tokenizer/muster.py dis.txt cg.out
+    python3 tools/tokenizer/patterns.py dis.txt cg.out
 
 FALLEN beim Lesen der callgrind-Datei (beide haben hier schon zugeschlagen):
   * Mit `--dump-instr=yes` beginnt eine Kostenzeile mit der ADRESSE, die auch

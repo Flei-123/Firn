@@ -17,7 +17,7 @@ nach `calls=` ist die INKLUSIVE Kosten des Aufrufs und wird uebersprungen)
 und zusaetzlich die INKLUSIVKOSTEN je Funktion (Summe der `calls=`-Zeilen,
 die auf sie zeigen; bei Rekursion ueberzaehlt das und ist nur ein Hinweis).
 
-Aufruf:  python3 tools/tokenizer/profil.py <binary> <callgrind-out> [anzahl]
+Aufruf:  python3 tools/tokenizer/profile.py <binary> <callgrind-out> [anzahl]
 """
 import subprocess
 import sys

@@ -65,7 +65,7 @@ Legende: `[ ]` offen · `[~]` teilweise, mit Zahl · `[x]` bestanden und gemesse
 | **Kriterium** | DOM-Prototyp mit Eltern-/Kind-Zyklen **und** Listener-Zyklen läuft **24 h** ohne Speicherwachstum |
 | **Messbefehl** | `bash tools/dom_soak/run.sh` (Umgebung: `SOAK_SEK`, `SOAK_ZYKLEN`, `SOAK_STICHPROBE`); Messgröße RSS aus `/proc/self/statm` über die Zeit, Toleranz: kein monotoner Anstieg nach der Aufwärmphase |
 | **Stand Entscheidung** | **`[x]` getroffen und begründet** — Opt-in-Tracing-GC in drei Stufen, `SPEC.md` §3.2/§3.5. Alternativen (Arena+Indizes, Refcount+Weak) mit Begründung verworfen |
-| **Stand Beleg (14.08.2026, selbst gemessen)** | **`[~]` prototypisch belegt, 24-h-Lauf steht aus.** Der GC ist gebaut (`compiler/src/gc.rs`, Laufzeit `lib/gc/gc.fi` in Firn), der DOM-Prototyp ebenfalls (`lib/dom/dom.fi`, 6 Zyklenarten). **Dauerlauf: 100.000.000 Zyklensätze = 700.000.000 Objekte in 116,5 s, RSS konstant 1.364 KiB von der ersten bis zur letzten von 1.001 Stichproben, 47.300 Sammelläufe, längste Pause 3,54 ms.** Gegenprobe mit Zählverweis (identischer Objektgraph, `lib/dom/soak_leak.fi`): **750.080 KiB nach 2.000.000 Zyklen, 12.000.000 lebende Objekte — Faktor 550.** Rohdaten: `tools/dom_soak/langlauf/*.tsv`, Bericht: `docs/berichte/dom.md` |
+| **Stand Beleg (14.08.2026, selbst gemessen)** | **`[~]` prototypisch belegt, 24-h-Lauf steht aus.** Der GC ist gebaut (`compiler/src/gc.rs`, Laufzeit `lib/gc/gc.fi` in Firn), der DOM-Prototyp ebenfalls (`lib/dom/dom.fi`, 6 Zyklenarten). **Dauerlauf: 100.000.000 Zyklensätze = 700.000.000 Objekte in 116,5 s, RSS konstant 1.364 KiB von der ersten bis zur letzten von 1.001 Stichproben, 47.300 Sammelläufe, längste Pause 3,54 ms.** Gegenprobe mit Zählverweis (identischer Objektgraph, `lib/dom/soak_leak.fi`): **750.080 KiB nach 2.000.000 Zyklen, 12.000.000 lebende Objekte — Faktor 550.** Rohdaten: `tools/dom_soak/longrun/*.tsv`, Bericht: `docs/berichte/dom.md` |
 | **Teilpunkte** | `S1` deterministisch als Standard: Stufe 0 hat Rohzeiger, kein Move-Prüfer · `S2` GC-Heap: **`[x]` Mark-Sweep, präzise Heap-Verfolgung über compilergenerierte Typtabelle, konservativer Stapel-/Registerscan, kein Kompaktieren** · `S3` schwache Verweise: **`[x]` `GcWeak[T]`, negativ getestet; seit Runde 47 werden schwache Felder beim Einsammeln WIRKLICH genullt (`tests/822`), nicht nur `stark()`-leer** · `S4` Finalisierer: **`[x]` seit Runde 47** — Aufraeumart je Objekt, eigene Zyklusphase in Scheiben, Wiederbelebung unmoeglich und erzwungen (Abbruch 71/72/73), `tests/820`-`824`, `docs/RUNDE47.md` · `S5` inkrementell: **`[x]` seit Runde 44**, laengste Unterbrechung 0,45 ms · `S6` Pausenzeiten messbar: **`[x]` `gc_pause_ns_last/max/total`, `gc_hist`, `gc_stop_max`, seit Runde 47 zusaetzlich `gc_fin_*`** · `S7` `Rc`/`Weak`: **`[x]` als reines Firn-Modul (`tests/modules/rc.fi`), Zyklen lecken absichtlich und sichtbar (`tests/552_rc_cycle_leak.fi`); `Arc[T]` seit Runde 47 gebaut (`lib/rc/arc.fi`, atomarer Zaehler, `tests/830`-`833`)** |
 | **Was fehlt bis `[x]`** | (a) der **24-Stunden-Lauf**, (b) **Fragmentierung bei wechselnden Objektgrößen** — der Dauerlauf benutzt immer denselben Satz, das ist der freundliche Fall, (c) `virtual`, und bei den Sammlungen die **nominale Typsicherheit des Behälters** (`docs/RUNDE53.md` §4.1). Inkrementelles Sammeln (Runde 44), Finalisierer (Runde 47) und `GcVec`/`GcMap` (Runde 53) sind erledigt |
 | **Aufwand laut TODO-FIRN** | 0.1 = 2 PM (Entscheidung + Prototyp), 0.9 = 2 PM (Dauerlauf) |
@@ -128,7 +128,7 @@ Tokenizer-Logik**. Selbst ausgeführt bei der Zusammenführung,
 Die vier `xmlViolationTests` verlangen die XML-Anpassung
 (`U+FFFF` → `U+FFFD`, `U+000C` → Leerzeichen, `--` → `- -` im Kommentar), die
 **nicht** im WHATWG-Tokenizer steht. Sie ist seit Runde 4 als **optionaler
-Modus** umgesetzt: eine Auftragsflagge (Bit 0, `tools/tokenizer/PROTOKOLL.md`)
+Modus** umgesetzt: eine Auftragsflagge (Bit 0, `tools/tokenizer/LOG.md`)
 schaltet in `lib/html/tokens.fi` die Anpassung von Text, Attributwerten und
 Kommentaren zu; der Harness setzt sie genau für die Fälle unter dem Schlüssel
 `xmlViolationTests` und für **keinen** anderen Fall. Der reine HTML-Pfad bleibt
@@ -207,7 +207,7 @@ bricht ab, wenn beide Läufe dieselbe Adresse melden.
 ```
 
 **Kriterium B: `[ ]` verfehlt — auf BEIDEN Korpora.** Selbst gemessen mit
-`bash tools/tokenizer/durchsatz.sh`, bester von je drei Läufen; html5ever ist
+`bash tools/tokenizer/throughput.sh`, bester von je drei Läufen; html5ever ist
 mit `--release`, `opt-level=3` gebaut (`bench/tokenizer/`, eigenes
 Cargo-Projekt, **keine** Abhängigkeit des Compilers) und bekommt byteweise
 dieselbe Eingabe.
@@ -530,7 +530,7 @@ Nicht Teil der sechs Abnahmepunkte, aber Voraussetzung dafür, dass sie später
 | Fundamentpunkt | Stand | Nachweis |
 |---|---|---|
 | Durchgangsregister mit Etikett *debugerhaltend* | **`[x]`** | `firnc --list-passes` — 9 Durchgänge, genau einer (`inline`) nicht debugerhaltend |
-| Baustufen `--opt-level=dev/dev-fast/release-safe/release-fast` | **`[x]`** | `bash tools/baustufen/run.sh 3` → **dev-fast 2,06×**, dev 10,54× gegenüber release-fast |
+| Baustufen `--opt-level=dev/dev-fast/release-safe/release-fast` | **`[x]`** | `bash tools/build_stages/run.sh 3` → **dev-fast 2,06×**, dev 10,54× gegenüber release-fast |
 | Ergebnisort-Garantie für Aggregatrückgaben | **`[x]`** | `bash tools/ergebnisort/run.sh` → 1-MB-Struktur, `baue` hat 224 Byte Rahmen, keine Bulk-Kopie |
 | Ergebnisort für Struct-/Arrayliterale und `init` | **`[~]`** | Literale schreiben bereits feldweise ins Ziel (`lower.rs: write_into`); als Garantie in SPEC festgeschrieben, `init` gibt es noch nicht |
 | Feldzugriff vom Speicherort trennen (Vorbedingung SoA) | **`[x]`** | `compiler/src/layout.rs` (4 Zugaenge); `bash tools/schichten/run.sh` erzwingt es, Gegenprobe mit absichtlicher Verletzung schlaegt an |
@@ -550,7 +550,7 @@ Sechs Fundamentpunkte aus `DESIGNZIELE.md` §10.4 — **alle sechs erledigt**:
 
 | # | Fundamentpunkt | Nachweis |
 |---|---|---|
-| 1 | Durchgangsregister mit Etikett *debugerhaltend* + vier Baustufen | `firnc --list-passes`; `tools/baustufen/run.sh` → **dev-fast 2,06×** |
+| 1 | Durchgangsregister mit Etikett *debugerhaltend* + vier Baustufen | `firnc --list-passes`; `tools/build_stages/run.sh` → **dev-fast 2,06×** |
 | 2 | Ergebnisort-Garantie | `tools/ergebnisort/run.sh` → 1-MB-Struktur, `baue` 224 B Rahmen |
 | 3 | Feldzugriff vom Speicherort getrennt | `compiler/src/layout.rs`; `tools/schichten/run.sh` |
 | 4 | `#[must_consume]` + Attributsystem | `firnc --list-attrs`; `tests/130_*`, 5 Negativtests |
