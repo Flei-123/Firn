@@ -209,7 +209,7 @@ text/        firn.paket   ohne 'oeffentlich' → alles öffentlich
 
 ## 8. Was geprüft wird
 
-`tools/pakete/run.sh` (neu, in `test.sh` als Schritt 18): **20 Fälle**,
+`tools/pakete/run.sh` (neu, in `test.sh` als Schritt 18): **21 Fälle**,
 jeder durch **beide** Übersetzer, Fehlermeldungen Oktett für Oktett
 verglichen. Positiv: Bau des Beispielprojekts (firnc0 und firnc1), Ausgabe
 `12 14 3`, Benennung nach dem Manifest, `--paket-info`-Gleichheit, privates
@@ -218,7 +218,7 @@ zweites `quelle`-Verzeichnis, Regression ohne Manifest. Negativ: privates
 Modul einer Abhängigkeit, Paket ohne `brauche`, Paketzyklus, Abhängigkeit
 ohne Manifest, falscher Paketname, ungültige Version, unbekannter
 Schlüssel, fehlende `paket`-Zeile, Namenskonflikt, Bibliothek ohne `start`,
-Verzeichnis ohne Manifest.
+Verzeichnis ohne Manifest, `--paket` zusammen mit einer Quelldatei.
 
 Dazu **12 neue Rust-Modultests** in `compiler/src/paket.rs` und
 `compiler/src/paketwelt.rs` (Format, Pfadrechnen, Fehlertexte).

@@ -76,7 +76,7 @@ erwarte_fehler() {
         weh "firnc1 gab Exit $rc1, erwartet 2" "$(head -2 "$WORK/$kennung.1.err")"
         return
     fi
-    if ! grep -qF "$stichwort" "$WORK/$kennung.0.err"; then
+    if ! grep -qF -- "$stichwort" "$WORK/$kennung.0.err"; then
         weh "Meldung ohne '$stichwort'" "$(head -2 "$WORK/$kennung.0.err")"
         return
     fi
@@ -386,6 +386,12 @@ if [ "$z0" -eq 3 ] && [ "$z1" -eq 3 ]; then
 else
     weh "Exit $z0/$z1, erwartet 3/3"
 fi
+
+# --- 21: `--paket` und eine Quelldatei schliessen einander aus ----------
+
+fall "--paket und eine Quelldatei zugleich wird abgelehnt"
+beide beides --paket beispiele/pakete/anwendung tests/110_module.fi -o "$WORK/f_beides.bin"
+erwarte_fehler beides "--paket und eine eingabedatei schliessen einander aus"
 
 echo
 echo "PAKETE: $OK bestanden, $BAD fehlgeschlagen"
