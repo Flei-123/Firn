@@ -27,6 +27,8 @@ use std::path::{Path, PathBuf};
 use crate::ast::{Block, Expr, ExprKind, Program, Stmt, TypeExpr};
 use crate::config;
 use crate::diag::{Diag, Diags, Span};
+use crate::paket;
+use crate::paketwelt::{self, Welt};
 use crate::lexer::{self, TokKind};
 use crate::parser;
 
@@ -76,15 +78,52 @@ fn zusaetzliche_suchpfade() -> Vec<PathBuf> {
     out
 }
 
+/// Fehler der Modulaufloesung. `Diag` ist die gewohnte Meldung mit
+/// Quelltextausschnitt; `Paket` ist ein fertig formatierter Text, den
+/// `firnc0` und `firnc1` ZEICHENGLEICH ausgeben (Runde 48).
+pub enum Fehler {
+    Diag(Diag),
+    Paket(String),
+}
+
+/// Ein Eintrag der Warteschlange: die Datei und der Ort des `import`, der
+/// sie angefordert hat. Zu welchem Paket sie gehoert, ergibt sich aus ihrem
+/// Pfad (`Welt::paket_von`) — nicht daraus, wer sie angefordert hat.
+struct Wartend {
+    pfad: PathBuf,
+    span: Span,
+}
+
 /// Findet die Wurzeldatei und alle ueber `import` erreichbaren Module.
 /// Die Wurzeldatei hat immer die Nummer 0.
-pub fn resolve(root: &Path) -> Result<Vec<SourceFile>, Diag> {
+///
+/// SUCHREIHENFOLGE (Runde 48, deterministisch, erster Treffer gewinnt):
+///   1. neben der importierenden Datei
+///   2. neben der Wurzeldatei
+///   3. in den `quelle`-Verzeichnissen des Pakets, zu dem die importierende
+///      Datei gehoert
+///   4. in einer `brauche`-Abhaengigkeit dieses Pakets, wenn der erste
+///      Pfadteil ihr Name ist
+///   5. in `$FIRNLIB`
+///   6. in `<Verzeichnis des Compiler-Binarys>/../lib`
+///
+/// Ohne Manifest ist `welt` leer, die Schritte 3 und 4 entfallen, und die
+/// Aufloesung ist Zeichen fuer Zeichen die von vor Runde 48.
+pub fn resolve(root: &Path, welt: &Welt) -> Result<Vec<SourceFile>, Fehler> {
+    let arbeitsverz = paketwelt::cwd();
     let base = root.parent().map(|p| p.to_path_buf()).unwrap_or_default();
     let mut out: Vec<SourceFile> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
-    let mut queue: Vec<(PathBuf, Span)> = vec![(root.to_path_buf(), Span::none())];
-    while let Some((path, span)) = queue.first().cloned() {
-        queue.remove(0);
+    let mut queue: Vec<Wartend> = vec![Wartend {
+        pfad: root.to_path_buf(),
+        span: Span::none(),
+    }];
+    // Modulname -> zuerst gesehener Pfad, fuer die Konfliktpruefung.
+    let mut namen: HashMap<String, String> = HashMap::new();
+    while !queue.is_empty() {
+        let eintrag = queue.remove(0);
+        let path = eintrag.pfad;
+        let span = eintrag.span;
         let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
         if !seen.insert(key) {
             continue;
@@ -92,22 +131,45 @@ pub fn resolve(root: &Path) -> Result<Vec<SourceFile>, Diag> {
         let src = match std::fs::read_to_string(&path) {
             Ok(s) => s,
             Err(e) => {
-                return Err(Diag {
+                return Err(Fehler::Diag(Diag {
                     msg: format!("kann '{}' nicht lesen: {}", path.display(), e),
                     span,
                     label: "hier".to_string(),
                     note: Some(format!(
-                        "gesucht wird relativ zur importierenden datei, relativ zu '{}', dann in $FIRNLIB und in <verzeichnis des compiler-binarys>/../lib",
+                        "gesucht wird relativ zur importierenden datei, relativ zu '{}', in den quellen des projekts, in seinen abhaengigkeiten, dann in $FIRNLIB und in <verzeichnis des compiler-binarys>/../lib",
                         if base.as_os_str().is_empty() {
                             ".".to_string()
                         } else {
                             base.display().to_string()
                         }
                     )),
-                });
+                }));
             }
         };
         let id = out.len() as u32;
+        let abs_datei = paketwelt::absolut(&path.display().to_string(), &arbeitsverz);
+        let mein_paket = if welt.ist_leer() {
+            None
+        } else {
+            welt.paket_von(&abs_datei)
+        };
+        // NAMENSKONFLIKT: zwei verschiedene Dateien mit demselben Modulnamen
+        // wuerden auf dieselbe interne Umbenennung `modul__name` fallen und
+        // sich still ueberdecken. Nur mit Manifest geprueft — ohne Manifest
+        // bleibt alles wie bisher.
+        if !welt.ist_leer() {
+            let mname = paket::modulname(&abs_datei);
+            match namen.get(&mname) {
+                Some(vorher) if *vorher != abs_datei => {
+                    return Err(Fehler::Paket(paketwelt::text_namenskonflikt(
+                        &mname, vorher, &abs_datei,
+                    )));
+                }
+                _ => {
+                    namen.insert(mname, abs_datei.clone());
+                }
+            }
+        }
         // IMPORTPFAD: zuerst relativ zur DATEI, die den Import schreibt —
         // erst danach relativ zur Wurzeldatei.
         //
@@ -122,13 +184,19 @@ pub fn resolve(root: &Path) -> Result<Vec<SourceFile>, Diag> {
         let eigenes = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
         let zusaetze = zusaetzliche_suchpfade();
         for (parts, ispan) in scan_imports(&src, id) {
-            // (1) neben der importierenden Datei, (2) neben der Wurzeldatei,
-            // (3) $FIRNLIB, (4) <exe>/../lib — der erste Treffer zaehlt.
             let mut p = modul_pfad(&eigenes, &parts);
             if !p.exists() {
                 let q = modul_pfad(&base, &parts);
                 if q.exists() {
                     p = q;
+                }
+            }
+            // (3) und (4): die Sicht des Pakets, zu dem diese Datei gehoert.
+            if !p.exists() {
+                if let Some(pi) = mein_paket {
+                    if let Some(q) = paket_kandidat(welt, pi, &parts) {
+                        p = q;
+                    }
                 }
             }
             if !p.exists() {
@@ -140,7 +208,32 @@ pub fn resolve(root: &Path) -> Result<Vec<SourceFile>, Diag> {
                     }
                 }
             }
-            queue.push((p, ispan));
+            // SICHTBARKEIT: fuehrt der Treffer in ein ANDERES Paket, muss es
+            // eine eingetragene Abhaengigkeit sein und das Modul muss in
+            // dessen `oeffentlich`-Liste stehen.
+            if !welt.ist_leer() {
+                let ziel = paketwelt::absolut(&p.display().to_string(), &arbeitsverz);
+                if let (Some(zp), Some(mp)) = (welt.paket_von(&ziel), mein_paket) {
+                    if zp != mp {
+                        if welt.kante(mp, welt.name(zp)) != Some(zp) {
+                            return Err(Fehler::Paket(paketwelt::text_keine_abhaengigkeit(
+                                welt.name(zp),
+                                welt.name(mp),
+                                &welt.pakete[mp].manifestpfad,
+                            )));
+                        }
+                        let modul = paket::modulname(&ziel);
+                        if !welt.pakete[zp].manifest.ist_oeffentlich(&modul) {
+                            return Err(Fehler::Paket(paketwelt::text_nicht_oeffentlich(
+                                &modul,
+                                welt.name(zp),
+                                &welt.pakete[zp].manifestpfad,
+                            )));
+                        }
+                    }
+                }
+            }
+            queue.push(Wartend { pfad: p, span: ispan });
         }
         out.push(SourceFile { id, path, src });
     }
@@ -151,6 +244,37 @@ pub fn resolve(root: &Path) -> Result<Vec<SourceFile>, Diag> {
         out.push(f);
     }
     Ok(out)
+}
+
+/// Schritt 3 und 4 der Suche: Projektquellen, dann Abhaengigkeiten.
+/// Liefert den ersten Pfad, der wirklich existiert.
+fn paket_kandidat(welt: &Welt, pi: usize, parts: &[String]) -> Option<PathBuf> {
+    let p = &welt.pakete[pi];
+    // (3) eigene Quellverzeichnisse
+    for q in &p.manifest.quellen {
+        let basis = paket::verbinde(&p.wurzel, q);
+        let kand = modul_pfad(Path::new(&basis), parts);
+        if kand.exists() {
+            return Some(kand);
+        }
+    }
+    // (4) Abhaengigkeit: der ERSTE Pfadteil nennt das Paket.
+    let kopf = parts.first()?;
+    let di = welt.kante(pi, kopf)?;
+    let dp = &welt.pakete[di];
+    let rest: Vec<String> = if parts.len() > 1 {
+        parts[1..].to_vec()
+    } else {
+        vec![kopf.clone()]
+    };
+    for q in &dp.manifest.quellen {
+        let basis = paket::verbinde(&dp.wurzel, q);
+        let kand = modul_pfad(Path::new(&basis), &rest);
+        if kand.exists() {
+            return Some(kand);
+        }
+    }
+    None
 }
 
 /// Pfad der eingezogenen GC-Laufzeit (Modulname bleibt leer: ihre Namen sind
