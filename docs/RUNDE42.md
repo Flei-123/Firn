@@ -544,17 +544,20 @@ Sieben neue Programme in `tests/`, jedes läuft in `test.sh` **dreimal**
 gegen `firnc1`. Jede einzelne Erwartung steht als `return <code>` im Programm
 — schlägt eine fehl, endet der Test mit genau diesem Code und `test.sh` nennt
 ihn; die gedruckte Zeile ist zusätzlich der Vergleichspunkt zwischen den
-Compilern.
+Compilern. Die Spalte „Fehlerausgänge" zählt genau diese `return <code>`
+(ohne das abschließende `return 0`); viele davon prüfen mit `||` mehrere
+Dinge auf einmal, die Zahl der geprüften Zusagen liegt also höher.
+Zusammen: 310.
 
 | Test | Inhalt | Zahlen |
 |---|---|---|
-| `800_std_str_kern.fi` | trimmen, teilen (fester Trenner **und** Leerraum), verbinden, suchen (vorwärts/rückwärts/zählen), ersetzen, Groß/Klein, auffüllen, vergleichen, Zeichenklassen, UTF-8 vorwärts/rückwärts/nach Zeichen geschnitten, ungültiges Oktett | 41 Prüfpunkte |
-| `801_std_num_kern.fi` | Basis 2/8/10/16/36, Auffüllen, Breite, u64::MAX, **u64::MAX+1 als Überlauf**, i64::MIN, Präfixe `0x`/`0b`/`0o`, Teillesen mit Rest, dtoa/strtod-Hülle, `1e21`, Rundreise `0.1+0.2` | 40 Prüfpunkte |
-| `802_std_vec_kern.fi` | zwei Ausprägungen (`i32`, `u64`), suchen, sortieren, binär suchen, untere Schranke, einfügen/entfernen (beide Formen), kopieren/anhängen/vergleichen, 200 Elemente absteigend und 200 gleiche | 38 Prüfpunkte |
-| `803_std_map_kern.fi` | Kursor über 50 Paare (Summe der Schlüssel und Werte), Entry-Helfer, Wert an Ort und Stelle, herausnehmen, **4000 Einfügungen mit jeder dritten Löschung** und anschließendem Aufräumen, zweite Ausprägung `Map[u32, i32]` | 34 Prüfpunkte |
-| `804_std_math_kern.fi` | der **exakte** Teil, alles mit `==`: Ganzzahl-Helfer, `fabs/fmin/fmax/fclamp`, `trunc/floor/ceil/round` samt `0.49999999999999994` und dem Raster bei 2⁵¹, `fmod`, `ldexp`, `frexp` (auch subnormal), `hypot`, Sonderwerte | 47 Prüfpunkte |
-| `805_std_math_f64.fi` | der **genäherte** Teil gegen benannte Schranken; dazu zwei Schleifen: sin²+cos²=1 an 41 Stellen, `tan(atan(x)) == x` an 30 Stellen | 45 Prüfpunkte |
-| `806_std_io_kern.fi` | schreiben/anhängen/gibt-es-sie, Zeilen mit `\r\n` und ohne Schlussumbruch, der ganze `Fmt`-Ausbau; die Funktionen, die **selbst** einen Umbruch schreiben (`println`, `print_zeile`, `fmt_druck_zeile`), laufen mit über `dup2` umgebogenem Deskriptor 1 und werden aus der Datei zurückgelesen — ausgeführt, nicht behauptet | 30 Prüfpunkte |
+| `800_std_str_kern.fi` | trimmen, teilen (fester Trenner **und** Leerraum), verbinden, suchen (vorwärts/rückwärts/zählen), ersetzen, Groß/Klein, auffüllen, vergleichen, Zeichenklassen, UTF-8 vorwärts/rückwärts/nach Zeichen geschnitten, ungültiges Oktett | 49 Fehlerausgänge |
+| `801_std_num_kern.fi` | Basis 2/8/10/16/36, Auffüllen, Breite, u64::MAX, **u64::MAX+1 als Überlauf**, i64::MIN, Präfixe `0x`/`0b`/`0o`, Teillesen mit Rest, dtoa/strtod-Hülle, `1e21`, Rundreise `0.1+0.2` | 43 Fehlerausgänge |
+| `802_std_vec_kern.fi` | zwei Ausprägungen (`i32`, `u64`), suchen, sortieren, binär suchen, untere Schranke, einfügen/entfernen (beide Formen), kopieren/anhängen/vergleichen, 200 Elemente absteigend und 200 gleiche | 41 Fehlerausgänge |
+| `803_std_map_kern.fi` | Kursor über 50 Paare (Summe der Schlüssel und Werte), Entry-Helfer, Wert an Ort und Stelle, herausnehmen, **4000 Einfügungen mit jeder dritten Löschung** und anschließendem Aufräumen, zweite Ausprägung `Map[u32, i32]` | 36 Fehlerausgänge |
+| `804_std_math_kern.fi` | der **exakte** Teil, alles mit `==`: Ganzzahl-Helfer, `fabs/fmin/fmax/fclamp`, `trunc/floor/ceil/round` samt dem größten Double unter 0,5 und dem Raster bei 2⁵¹, `fmod`, `ldexp`, `frexp` (auch subnormal), `hypot`, Sonderwerte | 57 Fehlerausgänge |
+| `805_std_math_f64.fi` | der **genäherte** Teil gegen benannte Schranken; dazu zwei Schleifen: sin²+cos²=1 an 41 Stellen, `tan(atan(x)) == x` an 30 Stellen | 54 Fehlerausgänge |
+| `806_std_io_kern.fi` | schreiben/anhängen/gibt-es-sie, Zeilen mit `\r\n` und ohne Schlussumbruch, der ganze `Fmt`-Ausbau; die Funktionen, die **selbst** einen Umbruch schreiben (`println`, `print_zeile`, `fmt_druck_zeile`), laufen mit über `dup2` umgebogenem Deskriptor 1 und werden aus der Datei zurückgelesen — ausgeführt, nicht behauptet | 30 Fehlerausgänge |
 
 Nicht abgedeckt und hier benannt: `read_stdin` (siehe 4.9), die
 Speichermangel-Zweige (`heap_alloc` liefert 0) — die lassen sich ohne
