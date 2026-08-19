@@ -1,0 +1,216 @@
+// tools/gc_mess/aufbau.fi — Pausen ueber den GANZEN Lauf, AUFBAU EINGESCHLOSSEN
+// (Runde 44).
+//
+// WARUM ein neues Messprogramm: pause_gross.fi ruft gc_hist_reset() NACH dem
+// Aufbau der lebenden Menge — das Histogramm zeigt dort also nur den
+// Dauerbetrieb. Genau die Pausen des Aufbaus (volle Stop-the-World-Laeufe
+// unterhalb von INKR_AB) sind aber der Gegenstand dieser Runde. Dieser Lauf
+// nullt NICHTS: Phase 0 ist die Bilanz nach dem Aufbau, Phase 1 die Bilanz
+// ueber den GANZEN Lauf (Aufbau + Dauerbetrieb). Der Dauerbetrieb allein ist
+// die Differenz.
+//
+// Ausgabe bewusst ohne Textmarken (maschinenlesbar, ein Zeichen je Zeilenart):
+//   A  <lauf> <pause_ns> <heap_bytes> <volle_laeufe> <kind_index>
+//        ein Sammellauf WAEHREND des Aufbaus (bei welcher Heapgroesse?)
+//   S  <t_ms> <zyklen> <rss_kib> <lebende> <laeufe> <heap_bytes> <pause_max_ns>
+//        Stichprobe im Dauerbetrieb
+//   H  <phase> <typ> <fach> <anzahl>     Scheiben-Histogramm (kumulativ)
+//   M  <phase> <typ> <ns>                laengste Scheibe je Typ (kumulativ)
+//   C  <phase> <fach> <anzahl>           ganze Unterbrechung in RECHENZEIT
+//   K  <phase> <code> <wert>             Kennzahlen, siehe unten
+//
+// Kennzahl-Codes: 0 ms, 1 zyklen, 2 sammellaeufe, 3 volle_laeufe, 4 heap_bytes,
+// 5 rss_kib, 6 lebbytes, 7 ueberlaeufe, 8 pause_max_ns, 9 pause_total_ns,
+// 10 barrieren, 11 gesamt_bytes, 12 lebende_objekte, 13 stop_max_ns
+// (laengste GANZE Unterbrechung, Histogramm-Typ 7), 14..20 Diagnose
+// gc_diag(0..6): neue Chunks in Ruhe/Mark/Sweep, Mark-Scheiben,
+// Sweep-Scheiben, graue Allokationen, Allokationen gesamt, 21 laengste ganze
+// Unterbrechung in reiner Rechenzeit.
+//
+// Phasen: 0 = nach dem Aufbau, 1 = Ende (ganzer Lauf).
+
+import dom
+import mess
+
+const BUDGET_MS: i64 = 20000  // GCM_BUDGET_MS
+const KINDER: u32 = 120000    // GCM_KINDER
+const STICHPROBE: i64 = 1000  // GCM_STICHPROBE
+// Umschaltschwelle atomar/inkrementell (Runde 44, gc_set_inkr_ab).
+// 0 = immer inkrementell, 8388608 = altes Verhalten.
+const AB_SCHWELLE: u64 = 8388608  // GCM_SCHWELLE
+// Zweite Uhr: reine Rechenzeit des Fadens (Runde 44). Nur damit laesst sich
+// eine Pause, die der Sammler verursacht hat, von einer unterscheiden, in
+// der die Maschine den Prozess verdraengt hat.
+const CPU_UHR: u64 = 1            // GCM_CPUUHR
+
+fn kenn(phase: u64, code: u64, wert: u64) {
+    mess.mess_zeichen(75)
+    mess.mess_tab()
+    mess.mess_u64(phase)
+    mess.mess_tab()
+    mess.mess_u64(code)
+    mess.mess_tab()
+    mess.mess_u64(wert)
+    mess.mess_nl()
+}
+
+fn hist_aus(phase: u64) {
+    var typ: u64 = 0
+    while typ < 8 {
+        var fach: u64 = 0
+        while fach < 16 {
+            let n: u64 = gc_hist(typ, fach)
+            if n != 0 {
+                mess.mess_zeichen(72)
+                mess.mess_tab()
+                mess.mess_u64(phase)
+                mess.mess_tab()
+                mess.mess_u64(typ)
+                mess.mess_tab()
+                mess.mess_u64(fach)
+                mess.mess_tab()
+                mess.mess_u64(n)
+                mess.mess_nl()
+            }
+            fach = fach + 1
+        }
+        typ = typ + 1
+    }
+    var fc: u64 = 0
+    while fc < 16 {
+        let nc: u64 = gc_chist(fc)
+        if nc != 0 {
+            mess.mess_zeichen(67)
+            mess.mess_tab()
+            mess.mess_u64(phase)
+            mess.mess_tab()
+            mess.mess_u64(fc)
+            mess.mess_tab()
+            mess.mess_u64(nc)
+            mess.mess_nl()
+        }
+        fc = fc + 1
+    }
+    var t2: u64 = 0
+    while t2 < 5 {
+        mess.mess_zeichen(77)
+        mess.mess_tab()
+        mess.mess_u64(phase)
+        mess.mess_tab()
+        mess.mess_u64(t2)
+        mess.mess_tab()
+        mess.mess_u64(gc_pause_max_typ(t2))
+        mess.mess_nl()
+        t2 = t2 + 1
+    }
+}
+
+fn kennzahlen(phase: u64, ms: u64, zyklen: u64) {
+    kenn(phase, 0, ms)
+    kenn(phase, 1, zyklen)
+    kenn(phase, 2, gc_collections())
+    kenn(phase, 3, gc_volle_laeufe())
+    kenn(phase, 4, gc_heap_bytes())
+    kenn(phase, 5, mess.mess_rss_kib())
+    kenn(phase, 6, gc_live_bytes())
+    kenn(phase, 7, gc_ueberlaeufe())
+    kenn(phase, 8, gc_pause_ns_max())
+    kenn(phase, 9, gc_pause_ns_total())
+    kenn(phase, 10, gc_barriers())
+    kenn(phase, 11, gc_total_bytes())
+    kenn(phase, 12, gc_live_objects())
+    kenn(phase, 13, gc_stop_max())
+    kenn(phase, 21, gc_cpu_stop_max())
+    var i: u64 = 0
+    while i < 7 {
+        kenn(phase, 14 + i, gc_diag(i))
+        i = i + 1
+    }
+}
+
+fn main() -> i32 {
+    if !gc_init() {
+        return 2
+    }
+    return lauf() catch 9
+}
+
+fn lauf() -> AllocError!i32 {
+    gc_set_inkr_ab(AB_SCHWELLE)
+    gc_set_cpu_uhr(CPU_UHR)
+    let t0: u64 = mess.mess_jetzt_ms()
+    // ---- grosse lebende Menge aufbauen (jeder Sammellauf wird gemeldet) ----
+    let wurzel = try dom.dom_element_neu(1)
+    var k: u32 = 0
+    var laeufe: u64 = 0
+    while k < KINDER {
+        let kind = try dom.dom_knoten_neu(1000 + k, dom.DOM_ART_TEXT)
+        dom.dom_kind_anhaengen(wurzel, kind)
+        let l: u64 = gc_collections()
+        if l != laeufe {
+            laeufe = l
+            mess.mess_zeichen(65)
+            mess.mess_tab()
+            mess.mess_u64(l)
+            mess.mess_tab()
+            mess.mess_u64(gc_pause_ns_last())
+            mess.mess_tab()
+            mess.mess_u64(gc_heap_bytes())
+            mess.mess_tab()
+            mess.mess_u64(gc_volle_laeufe())
+            mess.mess_tab()
+            mess.mess_u64(k as u64)
+            mess.mess_nl()
+        }
+        k = k + 1
+    }
+    let t1: u64 = mess.mess_jetzt_ms()
+    kennzahlen(0, t1 - t0, 0)
+    hist_aus(0)
+
+    // ---- Dauerbetrieb: derselbe Muellstrom wie pause.fi --------------------
+    var zyklen: u64 = 0
+    var seit: i64 = 0
+    var t: u64 = 0
+    var laufen: bool = true
+    while laufen {
+        let n: u64 = dom.dom_zyklus_bauen() catch 0
+        if n != dom.DOM_OBJEKTE_JE_SATZ {
+            return 5
+        }
+        zyklen = zyklen + 1
+        seit = seit + 1
+        if seit >= STICHPROBE {
+            seit = 0
+            t = mess.mess_jetzt_ms() - t1
+            mess.mess_zeichen(83)
+            mess.mess_tab()
+            mess.mess_u64(t)
+            mess.mess_tab()
+            mess.mess_u64(zyklen)
+            mess.mess_tab()
+            mess.mess_u64(mess.mess_rss_kib())
+            mess.mess_tab()
+            mess.mess_u64(gc_live_objects())
+            mess.mess_tab()
+            mess.mess_u64(gc_collections())
+            mess.mess_tab()
+            mess.mess_u64(gc_heap_bytes())
+            mess.mess_tab()
+            mess.mess_u64(gc_pause_ns_max())
+            mess.mess_nl()
+            if t >= BUDGET_MS as u64 {
+                laufen = false
+            }
+        }
+    }
+    // Die Wurzel MUSS hier noch benutzt werden, sonst darf der Sammler sie
+    // waehrend der Schleife einsammeln — dann misst der Lauf nichts.
+    if dom.dom_kinder_zaehlen(wurzel) != KINDER {
+        return 6
+    }
+    let t2: u64 = mess.mess_jetzt_ms()
+    kennzahlen(1, t2 - t1, zyklen)
+    hist_aus(1)
+    return 0
+}
