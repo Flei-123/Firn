@@ -1,291 +1,293 @@
-# Firn — Fahrplan
+# Firn -- roadmap
 
-**Stand:** 2026-08-14 (v0.2) · **Bezug:** `SPEC.md`, `DESIGNZIELE.md`, `ABNAHME.md`,
+**As of:** 2026-08-14 (v0.2) - **Related:** `SPEC.md`, `DESIGN_GOALS.md`, `ACCEPTANCE.md`,
 `../karstos-browser/FIRN-ANFORDERUNGEN.md`, `../karstos-browser/PLAN-FIRN.md`
-Zeitangaben = Arbeitsaufwand einer Person mit KI-Unterstützung, nicht Kalenderzeit.
+Time figures = the effort of one person with AI support, not calendar time.
 
 ---
 
-## Was sich gegenüber v0.1 geändert hat
+## What has changed since v0.1
 
-Firn ist seit der Browser-Entscheidung (**B1**: jede Zeile ausführbarer Code der
-Karstos-Browser-Engine ist Firn) **kritischer Pfad Nummer 1** des gesamten
-Ökosystems. Das ändert den Fahrplan an drei Stellen:
+Since the browser decision (**B1**: every line of executable code in the Karstos
+browser engine is Firn), Firn is **critical path number 1** of the whole
+ecosystem. That changes the roadmap in three places:
 
-* **Neue Pflichtteile:** Opt-in-GC, WTF-16-Zeichenketten, Constant-Time-Primitive,
-  Abwicklung für JS, Kompilierzeit-Codegenerierung, Debugger, Paketverwaltung.
-* **Neues Leistungsziel:** ≤ 2× Rust auf Mikrobenchmarks. Das verschiebt Arbeit
-  vom Sprachumfang in den Optimierer.
-* **Gestrichen:** aarch64- und WASM-Backend haben keinen Termin mehr
-  (`FIRN-ANFORDERUNGEN.md` §11 braucht beides nicht). Das entlastet spürbar.
+* **New mandatory parts:** opt-in GC, WTF-16 strings, constant-time primitives,
+  unwinding for JS, compile-time code generation, debugger, package management.
+* **New performance target:** <= 2x Rust on microbenchmarks. That moves work from
+  language surface into the optimizer.
+* **Dropped:** the aarch64 and WASM backends no longer have a date
+  (`FIRN-ANFORDERUNGEN.md` 11 needs neither). That helps noticeably.
 
-**Zwei Härtetests entscheiden alles** und sind deshalb vorgezogen:
-HTML5-Tokenizer (100 % html5lib, ≤ 2× Referenz) und DOM-Prototyp mit Zyklen
-(24 h ohne Speicherwachstum). Fallen sie durch, wird nicht der Browser
-repariert, sondern Firn.
+**Two acid tests decide everything** and have therefore been pulled forward:
+the HTML5 tokenizer (100 % html5lib, <= 2x the reference) and a DOM prototype
+with cycles (24 h without memory growth). If they fail, it is not the browser
+that gets repaired but Firn.
 
 ---
 
-## Fundamentarbeit aus DESIGNZIELE.md (neu, 14.08.2026)
+## Foundation work from DESIGN_GOALS.md (new, 2026-08-14)
 
-`DESIGNZIELE.md` prüft zehn bekannte Schwachstellen heutiger Sprachen und trennt,
-was **jetzt** ins Fundament muss (später unmöglich) von dem, was **additiv**
-nachrüstbar ist. Sechs Punkte betreffen den Compiler direkt und sind unten in die
-Phasen eingearbeitet:
+`DESIGN_GOALS.md` examines ten known weak spots of today's languages and
+separates what has to go into the foundation **now** (impossible later) from
+what can be **added on** afterwards. Six items concern the compiler directly and
+are worked into the phases below:
 
-| Fundamentpunkt | Warum jetzt | Phase |
+| Foundation item | Why now | Phase |
 |---|---|---|
-| **Kein `async`-Schlüsselwort**, Codegen ohne Annahme über Stapelstetigkeit | Farbe wäre später nicht mehr zu entfernen; `Io` als Parameter braucht Stapelwechsel | 2 (Regel), 3–4 (Umsetzung) |
-| **`!T` + `#[must_consume]`**, Regel „jede Allokation ist fehlbar" | Rust-for-Linux belegt: nicht nachrüstbar | 2 → 3 |
-| **Ergebnisort-Operand in FIR und Lowering** | Teuerste Fundamentarbeit — jetzt hat das Lowering ~2.000 Zeilen, später 20.000 | **2** |
-| **Feldzugriff vom Speicherort trennen** (Vorbedingung für SoA) | Solange `a.b` fest „Basis + Versatz" heißt, ist SoA tot | 2/3 |
-| **Optimierungsdurchgänge einzeln schaltbar, mit Etikett „debugerhaltend"** | sonst ist die `--dev-fast`-Stufe später ein Umbau jedes Durchgangs | 2 → 3 |
-| **Prüfphasen wiedereintrittsfähig**, FIR interpretierbar | Vorbedingung für `comptime`/`emit` | 2 → 3 |
+| **No `async` keyword**, codegen without any assumption about stack continuity | the colour could not be removed later; `Io` as a parameter needs stack switching | 2 (rule), 3-4 (implementation) |
+| **`!T` + `#[must_consume]`**, the rule "every allocation is fallible" | Rust-for-Linux proves it: cannot be added later | 2 -> 3 |
+| **Result-location operand in FIR and lowering** | the most expensive foundation work -- today lowering is ~2,000 lines, later 20,000 | **2** |
+| **Separate field access from storage location** (precondition for SoA) | as long as `a.b` firmly means "base + offset", SoA is dead | 2/3 |
+| **Optimization passes individually switchable, with a "debug-preserving" label** | otherwise the `--dev-fast` stage later means rebuilding every pass | 2 -> 3 |
+| **Re-entrant checking phases**, FIR interpretable | precondition for `comptime`/`emit` | 2 -> 3 |
 
-Nachrüstbar und deshalb **nicht** eingeplant: stabiles ABI (nur ein
-Symbol-Namensschema als Vorleistung in Phase 3), Hot Reload (kein Termin, siehe
-`DESIGNZIELE.md` §9 — die ehrliche Einschätzung lautet: lohnt sich nicht).
+Addable later and therefore **not** scheduled: a stable ABI (only a symbol
+naming scheme as groundwork in phase 3), hot reload (no date, see
+`DESIGN_GOALS.md` 9 -- the honest assessment is: not worth it).
 
 ---
 
-## Wie realistisch ist das?
+## How realistic is this?
 
-| Sprache | Erster Compiler | Version 1.0 / stabil | Dauer |
+| Language | First compiler | Version 1.0 / stable | Duration |
 |---|---|---|---|
-| Rust | 2006 (Graydon, in OCaml) | Mai 2015 | **9 Jahre** |
-| Zig | 2015 | noch nicht (0.16, 2026) | **11+ Jahre** |
-| Go | 2007 | März 2012 | 5 Jahre, mit Google-Team |
-| Odin | 2016 | noch nicht stabil | 10 Jahre |
+| Rust | 2006 (Graydon, in OCaml) | May 2015 | **9 years** |
+| Zig | 2015 | not yet (0.16, 2026) | **11+ years** |
+| Go | 2007 | March 2012 | 5 years, with a Google team |
+| Odin | 2016 | not stable yet | 10 years |
 
-Firn wird nicht schneller fertig, nur weil KI mitschreibt. KI beschleunigt das
-Tippen, nicht die Entwurfsentscheidungen und nicht das Finden der Fehler, die
-erst bei 50.000 Zeilen echtem Code auftauchen. Die frühen Phasen (Parser,
-Typprüfer, Codegen für eine Teilmenge) schrumpfen von Monaten auf Tage. Die
-späten Phasen (Selbst-Hosting, Optimierer auf ≤ 2× Rust, GC im Dauerlauf,
-Stabilität) schrumpfen kaum.
+Firn will not be finished any faster just because an AI helps with the typing.
+AI speeds up the typing, not the design decisions and not the finding of the
+bugs that only show up at 50,000 lines of real code. The early phases (parser,
+type checker, codegen for a subset) shrink from months to days. The late phases
+(self-hosting, an optimizer within <= 2x of Rust, a GC in a soak test,
+stability) hardly shrink at all.
 
-**Ehrliche Erwartung:** *Nutzbar für kleine Karstos-Systemprogramme* in 6–12
-Monaten. *Selbst-hostender Compiler* in 1–2 Jahren. *Abnahme nach
-`FIRN-ANFORDERUNGEN.md` §13 bestanden* — also bereit für die erste
-Browser-Bibliothek — realistisch **2–4 Jahre**. `PLAN-FIRN.md` veranschlagt für
-Phase F0 allein 27 Personenmonate.
+**Honest expectation:** *usable for small Karstos system programs* in 6-12
+months. *Self-hosting compiler* in 1-2 years. *Acceptance according to
+`FIRN-ANFORDERUNGEN.md` 13 passed* -- that is, ready for the first browser
+library -- realistically **2-4 years**. `PLAN-FIRN.md` budgets 27 person-months
+for phase F0 alone.
 
 ---
 
-## Phase 0 — Spezifikation ✔
+## Phase 0 -- specification (done)
 
-* `SPEC.md` v0.1: Profile, Besitzmodell, Fehlerbehandlung, `comptime`,
-  Backend-Strategie, Bootstrap, Grammatik.
-* `SPEC.md` v0.2: Speichermodell in drei Stufen mit **Opt-in-GC**, Vererbung für
-  `gc class`, WTF-16, Constant-Time, Abwicklung, Leistungsziel, Rückverfolgung.
-* `ABNAHME.md`: die sechs Prüfpunkte aus `FIRN-ANFORDERUNGEN.md` §13 als
-  abhakbare Liste.
+* `SPEC.md` v0.1: profiles, ownership model, error handling, `comptime`,
+  backend strategy, bootstrap, grammar.
+* `SPEC.md` v0.2: memory model in three levels with an **opt-in GC**,
+  inheritance for `gc class`, WTF-16, constant time, unwinding, performance
+  target, traceability.
+* `ACCEPTANCE.md`: the six checkpoints from `FIRN-ANFORDERUNGEN.md` 13 as a
+  tickable list.
 
-## Phase 1 — `firnc0`: Prototyp in Rust ✔
+## Phase 1 -- `firnc0`: prototype in Rust (done)
 
-Teilmenge aus `SPEC.md` §14, wirklich bis zum laufenden Binary.
-Lexer, Parser, Typprüfer, FIR, Konstantenfaltung + DCE, x86_64-Codegen ohne
-LLVM, `syscall`, 75 Testprogramme × 2 Durchläufe + 15 Negativtests, alle grün.
-**Ergebnis:** kompilierbare Sprache, noch kein Werkzeug.
+The subset from `SPEC.md` 14, really all the way to a running binary.
+Lexer, parser, type checker, FIR, constant folding + DCE, x86_64 codegen without
+LLVM, `syscall`, 75 test programs x 2 runs + 15 negative tests, all green.
+**Result:** a compilable language, not yet a tool.
 
-## Phase 2 — v0.2: Sprachkern für Browser-Code `← hier stehen wir`
+## Phase 2 -- v0.2: language core for browser code `<- we are here`
 
-Was der Browser vom *Sprachkern* verlangt, ohne Laufzeit und ohne Bibliothek.
+What the browser demands of the *language core*, without a runtime and without
+a library.
 
-* **Summentypen + `match`** mit Vollständigkeitsprüfung, Sprungtabellen (`L4`, `P4`)
-* **Generics** durch Monomorphisierung (`L5`)
-* **Zeichenketten**: `Bytes`, `Str` (UTF-8), **`Str16` (WTF-16)**, `Atom`,
-  korrekt gerundetes `strtod`, kürzeste Double-Ausgabe (`Z1`–`Z6`)
-* **Optimierer**: Inlining, echte Registerzuteilung, DCE, Bereichsprüfungen
-  entfernen — mit **gemessenem** Vergleich gegen Rust (`P1`–`P3`, `P5`, `P9`)
-* **`secret[T]` + `#[constant_time]`**, `secure_zero`, `u128` (`C1`–`C3`, `C5`)
-* **Speichermodell**: `Rc[T]`/`Weak[T]`, `Gc[T]`/`GcWeak[T]`, `gc class`,
-  `#[no_gc]` (`S1`–`S3`, `S7`)
-* `break`/`continue`, `for`, `defer`, `drop`, Move-Prüfer, Referenztypen
-* **Härtetest 1**: HTML5-Tokenizer gegen html5lib
-* **Härtetest 2**: DOM-Prototyp mit Zyklen im Dauerlauf
-* Testrunner mit maschinenlesbarer Ausgabe (`W2`)
-* **Fundamentarbeit aus `DESIGNZIELE.md`** — vor allem anderen:
-  * **Ergebnisort** (`DESIGNZIELE.md` §6): Aggregatrückgabe schreibt direkt ans
-    Ziel, Zielort-Operand in FIR. Zuerst prüfen, was `compiler/src/abi.rs` heute
-    tut
-  * **Feldzugriff ↔ Speicherort trennen** (§8): Zwischenschicht im Lowering
-    statt fest verdrahtetem „Basis + Versatz"
-  * **Durchgangsregister** (§5): jeder Optimierungsdurchgang bekommt Name,
-    Schalter und Etikett *debugerhaltend ja/nein*; Zeileninfo überlebt jeden
-    Durchgang
-  * **Prüfphasen wiedereintrittsfähig** (§7): „prüfe diese neu entstandene
-    Funktion" muss möglich sein
-  * **Regel festschreiben**: kein `async`-Schlüsselwort, keine unfehlbare
-    Allokationsfunktion, keine Ambient-Autorität in der Bibliothek
-* **Aufwand:** Monate, nicht Wochen. Das ist der eigentliche Brocken.
+* **Sum types + `match`** with an exhaustiveness check, jump tables (`L4`, `P4`)
+* **Generics** by monomorphization (`L5`)
+* **Strings**: `Bytes`, `Str` (UTF-8), **`Str16` (WTF-16)**, `Atom`,
+  correctly rounded `strtod`, shortest double output (`Z1`-`Z6`)
+* **Optimizer**: inlining, real register allocation, DCE, removal of bounds
+  checks -- with a **measured** comparison against Rust (`P1`-`P3`, `P5`, `P9`)
+* **`secret[T]` + `#[constant_time]`**, `secure_zero`, `u128` (`C1`-`C3`, `C5`)
+* **Memory model**: `Rc[T]`/`Weak[T]`, `Gc[T]`/`GcWeak[T]`, `gc class`,
+  `#[no_gc]` (`S1`-`S3`, `S7`)
+* `break`/`continue`, `for`, `defer`, `drop`, move checker, reference types
+* **Acid test 1**: HTML5 tokenizer against html5lib
+* **Acid test 2**: DOM prototype with cycles in a soak test
+* Test runner with machine-readable output (`W2`)
+* **Foundation work from `DESIGN_GOALS.md`** -- before everything else:
+  * **Result location** (`DESIGN_GOALS.md` 6): an aggregate return writes
+    straight to the destination, destination operand in FIR. First check what
+    `compiler/src/abi.rs` does today
+  * **Separate field access <-> storage location** (8): an intermediate layer in
+    lowering instead of a hard-wired "base + offset"
+  * **Pass registry** (5): every optimization pass gets a name, a switch and a
+    label *debug-preserving yes/no*; line information survives every pass
+  * **Re-entrant checking phases** (7): "check this newly created function" has
+    to be possible
+  * **Write down the rules**: no `async` keyword, no infallible allocation
+    function, no ambient authority in the library
+* **Effort:** months, not weeks. This is the real chunk of work.
 
-**Zwischenstand 13.08.2026 (Runde 2 zusammengeführt), ehrlich:**
+**Interim status 2026-08-13 (round 2 merged), honestly:**
 
-| Punkt der Liste oben | Stand |
+| Item from the list above | State |
 |---|---|
-| Summentypen + `match` + Sprungtabellen | **fertig und geprüft** |
-| Generics (Monomorphisierung) | **fertig und geprüft** |
-| Zeichenketten `Bytes`/`Str`/`Str16`/`Atom`, `strtod`, kürzeste Ausgabe | **fertig** (ohne Stringliterale im Lexer) |
-| Optimierer + gemessener Rust-Vergleich | **fertig, Ziel verfehlt**: Median 2,8×–3,4× statt ≤ 2× |
-| `secret[T]`, `#[constant_time]`, `u128` | **nicht begonnen** |
-| `Rc`/`Gc`/`gc class`/`#[no_gc]` | **nicht begonnen** |
-| `break`/`continue`, `for` | fertig; `defer`, `drop`, Move-Prüfer, Referenztypen: nicht begonnen |
-| Härtetest 1 (HTML5-Tokenizer) | **nicht begonnen — 0 von 6.810 Fällen** |
-| Härtetest 2 (DOM-Dauerlauf) | **nicht begonnen** |
-| Testrunner mit maschinenlesbarer Ausgabe (`W2`) | **fertig** (`tools/testrunner`, JSON) |
+| Sum types + `match` + jump tables | **done and verified** |
+| Generics (monomorphization) | **done and verified** |
+| Strings `Bytes`/`Str`/`Str16`/`Atom`, `strtod`, shortest output | **done** (without string literals in the lexer) |
+| Optimizer + measured comparison against Rust | **done, target missed**: median 2.8x-3.4x instead of <= 2x |
+| `secret[T]`, `#[constant_time]`, `u128` | **not started** |
+| `Rc`/`Gc`/`gc class`/`#[no_gc]` | **not started** |
+| `break`/`continue`, `for` | done; `defer`, `drop`, move checker, reference types: not started |
+| Acid test 1 (HTML5 tokenizer) | **not started -- 0 of 6,810 cases** |
+| Acid test 2 (DOM soak test) | **not started** |
+| Test runner with machine-readable output (`W2`) | **done** (`tools/testrunner`, JSON) |
 
-Vorgezogen aus Phase 3, weil ohne sie kein Tokenizer schreibbar ist:
-**Modulsystem** (`import`/`export`) und `.debug_line` für `gdb`.
-Zahlen und Befehle stehen in `ABNAHME.md`, die Reproduktion in `RUN.md`.
+Pulled forward out of phase 3, because no tokenizer can be written without them:
+the **module system** (`import`/`export`) and `.debug_line` for `gdb`.
+The numbers and commands are in `ACCEPTANCE.md`, the reproduction in `RUN.md`.
 
-## Phase 3 — v0.3: Module, `comptime`, Standardbibliothek
+## Phase 3 -- v0.3: modules, `comptime`, standard library
 
-* Modulsystem, `import`, `export`-Listen, getrennte Übersetzung
-* `comptime`-Auswertung (Interpreter über FIR), `interface` statisch + dynamisch
-* **Kompilierzeit-Codegenerierung** (`G1`–`G4`): Bauskripte, perfektes Hashing,
-  komprimierte Tries — Abnahme: Unicode-Tabelle aus der UCD
-* Standardbibliothek `B1`–`B11`: Sammlungen, E/A, Zeit, Formatierung, Sortieren,
-  Zufall (CSPRNG getrennt vom schnellen Generator)
-* Nebenläufigkeit `N1`–`N4`: Fäden, Atomics, Mutex/Condvar/RwLock/Kanäle,
+* Module system, `import`, `export` lists, separate compilation
+* `comptime` evaluation (an interpreter over FIR), `interface` static + dynamic
+* **Compile-time code generation** (`G1`-`G4`): build scripts, perfect hashing,
+  compressed tries -- acceptance: a Unicode table from the UCD
+* Standard library `B1`-`B11`: collections, I/O, time, formatting, sorting,
+  randomness (CSPRNG separated from the fast generator)
+* Concurrency `N1`-`N4`: threads, atomics, mutex/condvar/rwlock/channels,
   `#[sendable]`/`#[shareable]`
-* **Paketverwaltung + reproduzierbarer Bau** (`W1`)
-* **DWARF-Grundlagen + Debugger** (`W3`) — ohne ihn wird jede folgende Aufgabe
-  dreimal so lang
-* **Stufe 1 beginnt:** Lexer und Parser werden in Firn neu geschrieben
-* Aus `DESIGNZIELE.md`:
-  * **`Io` als Parameter** statt `async` (§1): `Io`-Schnittstelle, `Future[T]`
-    als `#[must_consume]`, `io.async`/`io.concurrent`, `Io.Threaded` und
-    `Io.SingleThread` (letzteres erfüllt `N7`)
-  * **Fehlbare Allokation durchgängig** (§2): `Allocator` als Parameter,
-    `try v.push(inout a, x)`, `reserve` + `push_within_capacity` für heiße Pfade
-  * **Capability-Deklaration in `firn.toml`** (§3) + Bauskript-Sandbox ohne Netz
-  * **Symbol-Namensschema mit Versionsplatz** (§4) — billige Vorleistung für ein
-    späteres stabiles ABI
-  * **Vier Baustufen** `--dev` / `--dev-fast` / `--release-safe` /
-    `--release-fast` (§5); Ziel für `--dev-fast`: höchstens 2–3× langsamer als
-    Release, nicht 30×
-  * **`init`-Ausdruck** mit Teilaufräumung, `#[no_move]` (§6)
-  * **`comptime`-Interpreter über FIR + `reflect.*` + `emit`** (§7) — Vorbedingung
-    für Abnahmepunkt 6 (UCD-Tabelle) und jede Web-IDL-Bindung
-  * **`SoaVec[T]` / `#[layout(soa)]`**, `#[bitfeld]`, `#[klein(N)]` (§8)
-* **Aufwand:** 3–6 Monate
+* **Package management + reproducible builds** (`W1`)
+* **DWARF basics + debugger** (`W3`) -- without it every following task takes
+  three times as long
+* **Stage 1 begins:** lexer and parser are rewritten in Firn
+* From `DESIGN_GOALS.md`:
+  * **`Io` as a parameter** instead of `async` (1): the `Io` interface,
+    `Future[T]` as `#[must_consume]`, `io.async`/`io.concurrent`, `Io.Threaded`
+    and `Io.SingleThread` (the latter satisfies `N7`)
+  * **Fallible allocation throughout** (2): `Allocator` as a parameter,
+    `try v.push(inout a, x)`, `reserve` + `push_within_capacity` for hot paths
+  * **Capability declaration in `firn.toml`** (3) + a build-script sandbox
+    without network access
+  * **Symbol naming scheme with a version slot** (4) -- cheap groundwork for a
+    later stable ABI
+  * **Four build stages** `--dev` / `--dev-fast` / `--release-safe` /
+    `--release-fast` (5); target for `--dev-fast`: at most 2-3x slower than
+    release, not 30x
+  * **`init` expression** with partial cleanup, `#[no_move]` (6)
+  * **`comptime` interpreter over FIR + `reflect.*` + `emit`** (7) --
+    precondition for acceptance item 6 (UCD table) and for every Web IDL binding
+  * **`SoaVec[T]` / `#[layout(soa)]`**, `#[bitfeld]`, `#[klein(N)]` (8)
+* **Effort:** 3-6 months
 
-## Phase 4 — v0.4/0.5: Selbst-Hosting
+## Phase 4 -- v0.4/0.5: self-hosting
 
-* `firnc1` übersetzt `firnc2`, `firnc2` übersetzt sich selbst, Ergebnis
-  bit-identisch (Fixpunkt) → `L1` und `ABNAHME.md` Punkt 1 erfüllt
-* Rust wird Bootstrap-Archiv, `firnc0` eingefroren
-* **Abwicklung/`throw`** (`L8`) mit Tabellen in zwei Phasen
-* Inkrementeller GC mit Dreifarbenmarkierung (`S5`), Pausenzeiten messbar (`S6`)
-* Profiler mit Flamegraphs (`W4`), Fuzzing-Anbindung (`W5`)
-* `Io.Evented` mit stapelvollen Koroutinen (`DESIGNZIELE.md` §1)
-* Hot Reload **Stufe B** — Daten neu laden statt Code (§9); kostenlos,
-  löst geschätzt 80 % des Iterationsbedarfs ohne jede Sprachänderung
-* **Aufwand:** 6–12 Monate · **Ab hier ist Firn eine echte Sprache**
+* `firnc1` compiles `firnc2`, `firnc2` compiles itself, the result is
+  bit-identical (fixpoint) -> `L1` and `ACCEPTANCE.md` item 1 satisfied
+* Rust becomes a bootstrap archive, `firnc0` is frozen
+* **Unwinding/`throw`** (`L8`) with tables in two phases
+* Incremental GC with tri-colour marking (`S5`), pause times measurable (`S6`)
+* Profiler with flame graphs (`W4`), fuzzing hookup (`W5`)
+* `Io.Evented` with stackful coroutines (`DESIGN_GOALS.md` 1)
+* Hot reload **level B** -- reload data instead of code (9); free of charge,
+  estimated to solve 80 % of the iteration need without any language change
+* **Effort:** 6-12 months - **from here on Firn is a real language**
 
-## Phase 5 — Abnahme nach `FIRN-ANFORDERUNGEN.md` §13
+## Phase 5 -- acceptance according to `FIRN-ANFORDERUNGEN.md` 13
 
-Alle sechs Punkte aus `ABNAHME.md` grün. Erst danach darf im Browser-Projekt
-Block 1 starten. **Das ist das eigentliche Ziel dieses Fahrplans.**
+All six items from `ACCEPTANCE.md` green. Only after that may block 1 start in
+the browser project. **That is the actual goal of this roadmap.**
 
-## Phase 6 — Laufzeit auf Karstos (`R1`–`R6`)
+## Phase 6 -- runtime on Karstos (`R1`-`R6`)
 
-* Firn-Laufzeit portiert: Speicher, Fäden, Datei, Zeit, E/A
-* Trennung Laufzeit ↔ Plattformschicht, Kreuzcompiler nach Karstos im CI
-* Firns eigene Testsuite läuft **auf Karstos** durch (`R6`)
-* Läuft parallel zur Karstos-Kernel-Arbeit (K1–K10)
+* The Firn runtime ported: memory, threads, files, time, I/O
+* Separation of runtime <-> platform layer, cross-compiler to Karstos in CI
+* Firn's own test suite passes **on Karstos** (`R6`)
+* Runs in parallel with the Karstos kernel work (K1-K10)
 
-## Phase 7 — Karstos-Kernelmodule in Firn
+## Phase 7 -- Karstos kernel modules in Firn
 
-* Kernel-Profil gegen echten karst-Code prüfen (ABI, Inline-Assembler, MMIO)
-* Erstes Karstos-Modul in Firn (Kandidat: ein kleiner, isolierter Treiber)
-* Danach schrittweise Ersetzung — **kein großer Neuschrieb**
+* Check the kernel profile against real karst code (ABI, inline assembly, MMIO)
+* First Karstos module in Firn (candidate: a small, isolated driver)
+* Then step-by-step replacement -- **no big rewrite**
 
-## Phase 8 — v1.0: Stabilität
+## Phase 8 -- v1.0: stability
 
-* Sprachstabilitätsversprechen, Rückwärtskompatibilität
-* SIMD (`L16`), Schleifenoptimierung, optionales LLVM-Backend als Vergleichsmaß
-* Formatierer, Linter, Abdeckungsmessung, Übersetzungs-Zwischenspeicher
-* **Frühestens in mehreren Jahren**
+* Language stability promise, backwards compatibility
+* SIMD (`L16`), loop optimization, optional LLVM backend as a yardstick
+* Formatter, linter, coverage measurement, compilation cache
+* **Several years away at the earliest**
 
-## Ohne Termin (bewusst gestrichen)
+## Without a date (deliberately dropped)
 
-* **aarch64-Backend** — erst wenn Karstos auf ARM zielt
-* **WASM-Backend** — für den Browser nicht nötig; „Firn statt JavaScript im
-  Browser" bleibt ein Fernziel, blockiert aber nichts
-* **JIT**, dynamische Bibliotheken, C++-Interop — dauerhaft ausgeschlossen
-* **Hot Reload Stufe C** (echter Codeaustausch) — `DESIGNZIELE.md` §9:
-  kollidiert mit statischem Linken (`R5`) und Inlining über Modulgrenzen
-  (`P1`). Ehrliche Einschätzung: lohnt sich nicht. Die Tür bleibt über
-  `#[hot]` offen, mehr nicht
-* **Stabiles ABI** (`#[abi_stable]`, `#[frozen]`) — erst wenn Karstos
-  austauschbare Systemkomponenten braucht, Phase 7/8. IPC ist bis dahin
-  der bessere Weg
-
----
-
-## Woran das Projekt scheitern kann
-
-Offen benannt, damit es nicht überrascht:
-
-1. **Der Optimierer erreicht ≤ 2× Rust nicht.** Das ist das größte Einzelrisiko.
-   Ein Tokenizer läuft über jedes Zeichen jeder Seite; 10× zu langsam heißt
-   Browser 10× zu langsam, und das lässt sich später nicht herausoptimieren.
-   Gegenmittel: früh und ehrlich messen (`Phase 2`), nicht am Ende.
-2. **Der GC trägt den DOM nicht.** Konservatives Stack-Scanning schließt einen
-   kompaktierenden Sammler aus; Fragmentierung im 24-h-Dauerlauf ist ein reales
-   Risiko. Gegenmittel: Härtetest 2 früh, Größenklassen-Allokator.
-3. **Durchhalten.** Der gefährlichste Punkt ist Phase 3/4 — der Reiz ist weg,
-   die Arbeit wird zäh (Fehlermeldungen, Randfälle, Regressionen).
-4. **Selbstbezug.** Ein Compiler, der sich selbst übersetzt, verbirgt Fehler
-   hervorragend. Gegenmittel: Fixpunkt-Prüfung und eine ernst genommene
-   Testsuite.
-5. **Drei Baustellen gleichzeitig.** Karstos, Firn *und* der Browser ist viel.
-   Firn darf Karstos nicht ausbremsen — deshalb bleibt Rust im Kernel, bis Firn
-   nachweislich besser passt.
-6. **Verbaute Fundamente.** Wird die Fundamentarbeit aus `DESIGNZIELE.md`
-   §10 übersprungen, sind SoA-Layout, `comptime`-`emit` und die
-   `--dev-fast`-Stufe später nur noch mit einem Umbau des gesamten
-   Lowerings erreichbar. Gegenmittel: Phase 2 damit beginnen, nicht damit
-   enden.
-7. **Zielkonflikt Optimierer ↔ Krypto.** §9 der Spezifikation löst ihn auf dem
-   Papier. Ob er in der Umsetzung hält, zeigt erst die Assembler-Inspektion.
+* **aarch64 backend** -- only once Karstos targets ARM
+* **WASM backend** -- not needed for the browser; "Firn instead of JavaScript in
+  the browser" stays a distant goal, but it blocks nothing
+* **JIT**, dynamic libraries, C++ interop -- permanently excluded
+* **Hot reload level C** (real code swapping) -- `DESIGN_GOALS.md` 9:
+  collides with static linking (`R5`) and with inlining across module boundaries
+  (`P1`). Honest assessment: not worth it. The door stays open through
+  `#[hot]`, no more than that
+* **Stable ABI** (`#[abi_stable]`, `#[frozen]`) -- only once Karstos needs
+  interchangeable system components, phase 7/8. Until then IPC is the better
+  route
 
 ---
 
-## Nächster konkreter Schritt
+## How this project can fail
 
-**Stand 14.08.2026.** Aus der Reihenfolge nach `FIRN-ANFORDERUNGEN.md` §12
-(**Fundamentarbeit → Speichermodell → Optimierer/Messung → Sprachkern →
-`comptime` → Paketverwaltung → Selbst-Hosting**) sind erledigt:
+Named openly, so that it comes as no surprise:
 
-* **Fundamentarbeit** (`DESIGNZIELE.md` §10.4) — alle sechs Punkte, siehe
-  `ABNAHME.md`.
-* **Speichermodell** — Opt-in-Tracing-GC gebaut **und im Dauerlauf belegt**:
-  100.000.000 DOM-Zyklensätze (700 Mio. Objekte) bei konstant 1.364 KiB RSS,
-  Zählverweis-Gegenprobe leckt auf 750.080 KiB. `docs/berichte/dom.md`.
-  Offen bleibt der 24-Stunden-Lauf und Fragmentierung bei wechselnden
-  Objektgrößen.
-* **Härtetest 1** (HTML5-Tokenizer): Quote erreicht (6.810/6.810), **Tempo
-  verfehlt** (5,7×–8,3× auf echten Seiten statt ≤ 2×).
-* **Härtetest 2** (DOM-Dauerlauf): bestanden, siehe oben.
+1. **The optimizer does not reach <= 2x Rust.** That is the biggest single risk.
+   A tokenizer runs over every character of every page; 10x too slow means a
+   browser 10x too slow, and that cannot be optimized away afterwards.
+   Countermeasure: measure early and honestly (`phase 2`), not at the end.
+2. **The GC does not carry the DOM.** Conservative stack scanning rules out a
+   compacting collector; fragmentation in a 24 h soak test is a real risk.
+   Countermeasure: acid test 2 early, size-class allocator.
+3. **Stamina.** The most dangerous point is phase 3/4 -- the thrill is gone and
+   the work turns tough (error messages, edge cases, regressions).
+4. **Self-reference.** A compiler that compiles itself is excellent at hiding
+   its own bugs. Countermeasure: the fixpoint check and a test suite that is
+   taken seriously.
+5. **Three building sites at once.** Karstos, Firn *and* the browser is a lot.
+   Firn must not slow Karstos down -- which is why Rust stays in the kernel
+   until Firn demonstrably fits better.
+6. **Foundations built shut.** If the foundation work from `DESIGN_GOALS.md`
+   10 is skipped, the SoA layout, `comptime` `emit` and the `--dev-fast` stage
+   can later only be reached by rebuilding the entire lowering.
+   Countermeasure: begin phase 2 with it, do not end phase 2 with it.
+7. **The optimizer <-> crypto conflict.** Section 9 of the specification
+   resolves it on paper. Whether it holds in the implementation only the
+   assembly inspection will show.
 
-**Als Nächstes, in dieser Reihenfolge:**
+---
 
-1. **Optimierer auf das Tempoziel** — das ist der einzige *gemessen verfehlte*
-   Zielwert. Ansatzpunkte in der Reihenfolge ihres erwarteten Nutzens:
-   Bereichsprüfungen entfernen, echte Registerzuteilung über Blockgrenzen,
-   Sprungtabellen im Tokenizer-Kern, Inlining über Modulgrenzen.
-   Ohne ≤ 2× trägt die Sprache keine Browser-Engine.
-2. **Inkrementelles Sammeln** (`S5`) — 3,54 ms längste Pause ist bei 16 ms
-   Bildabstand zu viel.
-3. **Restlicher Sprachkern**: `defer`, `drop`, Move-Prüfer, Referenztypen
-   `&T`/`inout T`, `for`, Gleitkomma, Zeichenkettenliterale.
-4. **`comptime` + Reflexion** — Vorbedingung (wiedereintrittsfähige Prüfphasen)
-   steht seit der Fundamentarbeit.
-5. **Paketverwaltung**, dann **Selbst-Hosting** in drei Stufen.
+## Next concrete step
 
-Constant-Time wird dabei mitgebaut, nicht nachgerüstet. Die Fundamentarbeit
-stand bewusst **vor** allem anderen: sie war billig und wäre später nicht mehr
-bezahlbar gewesen.
+**As of 2026-08-14.** Out of the order given by `FIRN-ANFORDERUNGEN.md` 12
+(**foundation work -> memory model -> optimizer/measurement -> language core ->
+`comptime` -> package management -> self-hosting**) the following are done:
+
+* **Foundation work** (`DESIGN_GOALS.md` 10.4) -- all six items, see
+  `ACCEPTANCE.md`.
+* **Memory model** -- an opt-in tracing GC built **and proven in a soak test**:
+  100,000,000 DOM cycle sets (700 million objects) at a constant 1,364 KiB RSS,
+  while the reference-counting counter-check leaks up to 750,080 KiB.
+  `docs/berichte/dom.md`. Still open are the 24 hour run and fragmentation with
+  changing object sizes.
+* **Acid test 1** (HTML5 tokenizer): the pass rate is reached (6,810/6,810),
+  **the speed is missed** (5.7x-8.3x on real pages instead of <= 2x).
+* **Acid test 2** (DOM soak test): passed, see above.
+
+**Next, in this order:**
+
+1. **The optimizer up to the speed target** -- that is the only target value
+   that has been *measurably missed*. Starting points in the order of their
+   expected benefit: remove bounds checks, real register allocation across block
+   boundaries, jump tables in the tokenizer core, inlining across module
+   boundaries. Without <= 2x the language does not carry a browser engine.
+2. **Incremental collection** (`S5`) -- a longest pause of 3.54 ms is too much
+   against a frame time of 16 ms.
+3. **The rest of the language core**: `defer`, `drop`, move checker, reference
+   types `&T`/`inout T`, `for`, floating point, string literals.
+4. **`comptime` + reflection** -- the precondition (re-entrant checking phases)
+   has been in place since the foundation work.
+5. **Package management**, then **self-hosting** in three stages.
+
+Constant time is built in along the way, not retrofitted. The foundation work
+deliberately came **before** everything else: it was cheap and would not have
+been affordable later.

@@ -1,5 +1,5 @@
 # Gauntlet log -- firn
-**Goal:** TRIAL BY FIRE 1 for the Firn language: write an HTML5 tokenizer IN FIRN and measure it against the official html5lib test suite. Build the error unions as a language feature along the way, because a tokenizer without error handling is not an honest one.
+**Goal:** ACID TEST 1 for the Firn language: write an HTML5 tokenizer IN FIRN and measure it against the official html5lib test suite. Build the error unions as a language feature along the way, because a tokenizer without error handling is not an honest one.
 
 === STARTING POINT -- READ THIS FIRST ===
 The firnc compiler works and is mature enough for this job. `bash test.sh` currently reports **PASS 393/393**, and `cargo build --release --manifest-path compiler/Cargo.toml` builds with ZERO warnings. Read this before you touch anything:
@@ -32,7 +32,7 @@ Scope:
   7) `defer { ... }` and `errdefer { ... }` if time is left -- otherwise leave them out and record them as open in SPEC 14.1.
 At least 15 test programs under `tests/` plus 6 negative tests (`try` outside an error-returning function, a discarded `!T`, an unknown error variant, a type error in the `catch` fallback, a duplicate error variant, mismatched error sets).
 
-=== TASK 2: HTML5 TOKENIZER IN FIRN (the actual trial by fire) ===
+=== TASK 2: HTML5 TOKENIZER IN FIRN (the actual acid test) ===
 A tokenizer following the WHATWG HTML standard, **written in Firn** (`.fi`), under `lib/html/`. The test driver may be Rust or Python (workbench, not product) -- the tokenizer itself must be Firn.
 - States as `enum` + `match` with a jump table. Start with the core states: Data, TagOpen, EndTagOpen, TagName, BeforeAttributeName, AttributeName, AfterAttributeName, BeforeAttributeValue, AttributeValue(Double/Single/Unquoted), AfterAttributeValueQuoted, SelfClosingStartTag, BogusComment, MarkupDeclarationOpen, CommentStart, Comment, CommentEnd, the doctype states, RCDATA, RAWTEXT, ScriptData, CharacterReference.
 - Output: token stream (DOCTYPE, StartTag with attributes and self-closing flag, EndTag, Comment, Character, EOF) in the html5lib JSON format, so that the comparison can be done mechanically.
