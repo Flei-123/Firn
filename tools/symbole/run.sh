@@ -41,8 +41,8 @@ SYMS=$(nm "$W/prog" | awk '$2 == "T" { print $3 }')
 printf '%s\n' "$SYMS" | grep -qx 'main' || melde "Einstiegspunkt 'main' fehlt oder wurde umbenannt"
 
 # 3. beide Modulfunktionen getrennt vorhanden
-A=$(printf '%s\n' "$SYMS" | grep -c '^_F[0-9]\+\.a__hilf$' || true)
-B=$(printf '%s\n' "$SYMS" | grep -c '^_F[0-9]\+\.b__hilf$' || true)
+A=$(printf '%s\n' "$SYMS" | grep -c '^_F[0-9]\+\.a__help$' || true)
+B=$(printf '%s\n' "$SYMS" | grep -c '^_F[0-9]\+\.b__help$' || true)
 [ "$A" -eq 1 ] || melde "Symbol fuer a.help fehlt (Praefix/Schema falsch?)"
 [ "$B" -eq 1 ] || melde "Symbol fuer b.help fehlt (Praefix/Schema falsch?)"
 

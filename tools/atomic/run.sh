@@ -5,13 +5,13 @@
 # WARUM DIESER NACHWEIS UND KEIN ZWEIFADEN-LAUF: Firn hat in Stufe 0 keine
 # Faeden (SPEC §7). Ein Wettrennen laesst sich also nicht herbeifuehren, und
 # eine Behauptung "fadensicher" waere ungedeckt. Was sich BELEGEN laesst, ist
-# das, worauf es ankommt: dass `__atomar_addieren` zu genau EINER
+# das, worauf es ankommt: dass `__atomic_add` zu genau EINER
 # Maschineninstruktion mit `lock`-Praefix wird und dass gewoehnliches `+= 1`
 # das NICHT tut. Genau das prueft dieses Werkzeug — am erzeugten Assembler und
 # am fertigen Binary, in BEIDEN Compilern.
 #
 # Geprueft wird:
-#   1. `__atomar_addieren` erzeugt `lock xadd qword ptr [..], ..` — je
+#   1. `__atomic_add` erzeugt `lock xadd qword ptr [..], ..` — je
 #      Aufrufstelle genau einmal, in allen drei Baustufen.
 #   2. Ein gewoehnliches `*p = *p + 7` erzeugt KEIN `lock` (sonst waere der
 #      Nachweis wertlos, weil er alles bestehen liesse).
@@ -34,7 +34,7 @@ export FIRNLIB="$(pwd)/lib"
 cat > "$W/atom.fi" <<'EOF'
 fn main() -> i32 {
     var z: u64 = 5
-    let alt: u64 = __atomar_addieren(&z, 7)
+    let alt: u64 = __atomic_add(&z, 7)
     if alt != 5 {
         return 1
     }
@@ -43,7 +43,7 @@ fn main() -> i32 {
     }
     var i: u64 = 0
     while i < 100000 {
-        __atomar_addieren(&z, 1)
+        __atomic_add(&z, 1)
         i = i + 1
     }
     if z != 100012 {
@@ -51,7 +51,7 @@ fn main() -> i32 {
     }
     var j: u64 = 0
     while j < 100000 {
-        __atomar_addieren(&z, 18446744073709551615)
+        __atomic_add(&z, 18446744073709551615)
         j = j + 1
     }
     if z != 12 {
@@ -60,7 +60,7 @@ fn main() -> i32 {
     // (Der Rueckgabewert wird gebunden: ein Ganzzahlliteral neben einem
     // Aufruf bekommt seinen Typ nur ueber die Probe, und die kennt dieses
     // Primitiv nicht — dieselbe Einschraenkung wie bei den ct-Primitiven.)
-    let alt2: u64 = __atomar_addieren(&z, 30)
+    let alt2: u64 = __atomic_add(&z, 30)
     if alt2 != 12 {
         return 5
     }
