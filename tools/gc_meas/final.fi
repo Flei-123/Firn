@@ -1,0 +1,278 @@
+// tools/gc_meas/final.fi — WAS KOSTEN FINALISIERER? (Runde 47)
+//
+// Die Frage der Runde ist nicht "laufen Finalisierer?" (das prueft
+// tests/820), sondern "sprengen sie die Pausen?". Deshalb misst dieses
+// Programm ZWEI Phasen im SELBEN Prozess mit demselben Code:
+//
+//   Phase A  derselbe Arbeitsablauf OHNE Finalisierer
+//   Phase B  derselbe Arbeitsablauf, jedes FIN_JEDER-te Objekt hat einen
+//
+// A/B im selben Prozess ist Absicht: zwei getrennte Binaries unterscheiden
+// sich im Codelayout, und das ueberdeckt Unterschiede im Prozentbereich
+// (Lehre der Runden 5 und 40). Zwischen den Phasen wird das Histogramm
+// genullt (gc_hist_reset), die Lebendmenge aber NICHT abgebaut — beide
+// Phasen sehen denselben Heap.
+//
+// Gemessen wird die GANZE Unterbrechung an einer Allokationsstelle
+// (gc_hist(7, ..) / gc_stop_max) — das ist die Zahl, die ein Bild wirklich
+// sieht, nicht die einzelne Scheibe.
+//
+// Der Finalisierer selbst tut absichtlich WENIG (einen Zaehler hochzaehlen).
+// Was ein Finalisierer sonst noch tut, ist Sache des Programms und wird
+// getrennt ausgewiesen (gc_fin_ns_max).
+
+import meas
+
+const BUDGET_MS: i64 = 20000  // GCM_FIN_MS
+const BUDGET_B_MS: i64 = 20000  // GCM_FIN_B_MS
+const SAMPLE_MS: i64 = 2000  // GCM_FIN_SAMPLE
+const LIVE: u64 = 4000      // GCM_FIN_LEBEND
+const CHAIN: u64 = 6
+const FIN_JEDER: u64 = 4
+
+gc class Node {
+    next: Gc[Node],
+    view: GcWeak[Node],
+    counter: *mut u8,
+    id: u64,
+}
+
+// Der Verteiler: zaehlt nur mit. Wort 0 = Anzahl, Wort 1 = Summe der Arten.
+fn __gc_finalize(kind: u64, p: *mut u8) {
+    let k: Gc[Node] = p as Gc[Node]
+    let z: u64 = k.counter as u64
+    if z == 0 {
+        return
+    }
+    *(z as *mut u64) = *(z as *mut u64) + 1
+    *((z + 8) as *mut u64) = *((z + 8) as *mut u64) + kind
+}
+
+const F_SYS_MMAP: i64 = 9
+const F_PROT_RW: i64 = 3
+const F_MAP_ANON: i64 = 34
+
+fn page() -> u64 {
+    let r: i64 = syscall(F_SYS_MMAP, 0, 4096, F_PROT_RW, F_MAP_ANON, -1, 0)
+    if r < 0 && r > -4096 {
+        return 0
+    }
+    return r as u64
+}
+
+fn ld(a: u64) -> u64 {
+    return *(a as *mut u64)
+}
+
+// Eine Runde: eine kurze Kette bauen, ringfoermig schliessen, einen schwachen
+// Verweis setzen und sie fallen lassen. Genau der Fall, der den Sammler
+// beschaeftigt (Zyklus + schwacher Verweis + gegebenenfalls Finalisierer).
+fn round(z: u64, id: u64, with_fin: bool, observer: Gc[Node]) -> AllocError!bool {
+    var first: Gc[Node] = gc_null[Node]()
+    var previous: Gc[Node] = gc_null[Node]()
+    var i: u64 = 0
+    while i < CHAIN {
+        let k: Gc[Node] = try gc Node{
+            next: previous,
+            view: weak_null[Node](),
+            counter: z as *mut u8,
+            id: id + i
+        }
+        if i == 0 {
+            first = k
+        } else {
+            k.view = weak(previous)
+        }
+        previous = k
+        i = i + 1
+    }
+    // Ring schliessen — ohne Sammler wuerde das lecken.
+    first.next = previous
+    // Ein LEBENDES Objekt bekommt einen schwachen Verweis auf ein sterbendes:
+    // nur so kostet das Nullen der schwachen Felder ueberhaupt etwas, und nur
+    // so ist die Zusage 'wird beim Einsammeln genullt' hier gemessen.
+    if observer != gc_null[Node]() {
+        observer.view = weak(previous)
+    }
+    if with_fin {
+        if id % FIN_JEDER == 0 {
+            if !gc_finalizer_set(previous as *mut u8, 1 + id % 7) {
+                return false
+            }
+        }
+    }
+    return true
+}
+
+// Lebendmenge aufbauen: eine lange Kette, die die ganze Messung ueber steht.
+fn live_set(z: u64, n: u64) -> AllocError!Gc[Node] {
+    var header: Gc[Node] = gc_null[Node]()
+    var i: u64 = 0
+    while i < n {
+        let k: Gc[Node] = try gc Node{
+            next: header,
+            view: weak_null[Node](),
+            counter: z as *mut u8,
+            id: i
+        }
+        header = k
+        i = i + 1
+    }
+    return header
+}
+
+fn header_line() {
+    var t: [u8; 19] = "# firn-gc-final v1\n"
+    meas.meas_write((&t) as u64, 19)
+}
+
+fn field(name: u64, n: i64, value: u64) {
+    var h: [u8; 2] = "# "
+    meas.meas_write((&h) as u64, 2)
+    meas.meas_write(name, n)
+    var g: [u8; 1] = "="
+    meas.meas_write((&g) as u64, 1)
+    meas.meas_u64(value)
+    meas.meas_nl()
+}
+
+fn phase(z: u64, budget: i64, with_fin: bool, mark: u64, header: Gc[Node]) -> AllocError!u64 {
+    gc_hist_reset()
+    var ptr: Gc[Node] = header
+    let l0: u64 = gc_collections()
+    let t0: u64 = meas.meas_now_ms()
+    var cycles: u64 = 0
+    var id: u64 = mark
+    var next: u64 = 0
+    while (meas.meas_now_ms() - t0) as i64 < budget {
+        let t: u64 = meas.meas_now_ms() - t0
+        if t >= next {
+            next = t + SAMPLE_MS as u64
+            // S <phase> <t_ms> <rss_kib> <heap_bytes> <lebende> <laeufe> <fin>
+            var sm: [u8; 2] = "S\t"
+            meas.meas_write((&sm) as u64, 2)
+            meas.meas_u64(mark)
+            meas.meas_tab()
+            meas.meas_u64(t)
+            meas.meas_tab()
+            meas.meas_u64(meas.meas_rss_kib())
+            meas.meas_tab()
+            meas.meas_u64(gc_heap_bytes())
+            meas.meas_tab()
+            meas.meas_u64(gc_live_objects())
+            meas.meas_tab()
+            meas.meas_u64(gc_collections())
+            meas.meas_tab()
+            meas.meas_u64(gc_fin_runs())
+            meas.meas_nl()
+        }
+        var j: u64 = 0
+        while j < 64 {
+            if !(try round(z, id, with_fin, ptr)) {
+                return 0
+            }
+            ptr = ptr.next
+            if ptr == gc_null[Node]() {
+                ptr = header
+            }
+            id = id + 1
+            cycles = cycles + 1
+            j = j + 1
+        }
+    }
+    var n1: [u8; 5] = "phase"
+    field((&n1) as u64, 5, mark)
+    var n2: [u8; 6] = "cycles"
+    field((&n2) as u64, 6, cycles)
+    var n3: [u8; 12] = "sammellaeufe"
+    field((&n3) as u64, 12, gc_collections() - l0)
+    var n4: [u8; 11] = "stop_max_ns"
+    field((&n4) as u64, 11, gc_stop_max())
+    var n5: [u8; 12] = "pause_max_ns"
+    field((&n5) as u64, 12, gc_pause_ns_max())
+    var n6: [u8; 14] = "pause_total_ns"
+    field((&n6) as u64, 14, gc_pause_ns_total())
+    var n7: [u8; 7] = "rss_kib"
+    field((&n7) as u64, 7, meas.meas_rss_kib())
+    var n8: [u8; 10] = "heap_bytes"
+    field((&n8) as u64, 10, gc_heap_bytes())
+    var n9: [u8; 15] = "lebende_objekte"
+    field((&n9) as u64, 15, gc_live_objects())
+    var na: [u8; 10] = "fin_laeufe"
+    field((&na) as u64, 10, gc_fin_runs())
+    var nb: [u8; 10] = "fin_max_ns"
+    field((&nb) as u64, 10, gc_fin_ns_max())
+    var nc: [u8; 12] = "fin_total_ns"
+    field((&nc) as u64, 12, gc_fin_ns_total())
+    var nd: [u8; 15] = "fin_registriert"
+    field((&nd) as u64, 15, gc_fin_registered())
+    var ne: [u8; 12] = "weak_genullt"
+    field((&ne) as u64, 12, gc_weak_zeroed())
+    var nf: [u8; 15] = "fin_scheibe_max"
+    field((&nf) as u64, 15, gc_pause_ns_fin_max())
+    var ng: [u8; 11] = "verteiler_n"
+    field((&ng) as u64, 11, ld(z))
+    var nh: [u8; 15] = "cpu_stop_max_ns"
+    field((&nh) as u64, 15, gc_cpu_stop_max())
+    // Histogramm der GANZEN Unterbrechung (Typ 7), 16 Faecher.
+    var i: u64 = 0
+    while i < 16 {
+        var hh: [u8; 6] = "hist7\t"
+        meas.meas_write((&hh) as u64, 6)
+        meas.meas_u64(i)
+        meas.meas_tab()
+        meas.meas_u64(gc_hist(7, i))
+        meas.meas_tab()
+        meas.meas_u64(gc_chist(i))
+        meas.meas_nl()
+        i = i + 1
+    }
+    return cycles
+}
+
+fn main() -> i32 {
+    if !gc_init() {
+        return 90
+    }
+    let z: u64 = page()
+    if z == 0 {
+        return 91
+    }
+    // Messprogramm: die Uhr je einzelnem Finalisierer kostet zwei
+    // Systemaufrufe und ist deshalb standardmaessig aus (gc.fi, S_FINUHR).
+    gc_set_fin_clock(1)
+    // Zweite Uhr: reine Rechenzeit des Fadens (Runde 44). Auf einer Maschine,
+    // auf der parallel andere Laeufe stehen, ist die Wanduhr sonst nicht
+    // auswertbar — genau der Fehlbefund der Runde 40.
+    gc_set_cpu_clock(1)
+    header_line()
+    return run(z) catch 92
+}
+
+fn run(z: u64) -> AllocError!i32 {
+    // Lebendmenge zuerst — beide Phasen sehen denselben Heap.
+    let header: Gc[Node] = try live_set(z, LIVE)
+    if header == gc_null[Node]() {
+        return 1
+    }
+    if (try phase(z, BUDGET_MS, false, 1000, header)) == 0 {
+        return 2
+    }
+    if (try phase(z, BUDGET_B_MS, true, 2000, header)) == 0 {
+        return 3
+    }
+    // Die Lebendmenge muss beide Phasen ueberlebt haben — sonst hat der
+    // Sammler etwas Lebendes eingesammelt und die Messung ist wertlos.
+    var n: u64 = 0
+    var p: Gc[Node] = header
+    while p != gc_null[Node]() && n < LIVE + 10 {
+        n = n + 1
+        p = p.next
+    }
+    if n != LIVE {
+        return 4
+    }
+    var nz: [u8; 14] = "kette_geprueft"
+    field((&nz) as u64, 14, n)
+    return 0
+}

@@ -158,7 +158,7 @@ Sammellauf rettet `Op::GcAddr { regs: true }` die Register in den
 Zustandsblock. Damit hält ein Schnittstellenwert sein Objekt am Leben, auch
 wenn es sonst keine Wurzel mehr gibt.
 
-`tests/822_iface_gc_kern.fi` weist das nach, ohne sich auf Zufall zu
+`tests/822_iface_gc_core.fi` weist das nach, ohne sich auf Zufall zu
 verlassen:
 
 * 64 `gc class`-Zellen werden erzeugt und **ausschließlich** als `dyn Zaehler`
@@ -180,7 +180,7 @@ Sammler PRÄZISE anhand des Feldlayouts und kennt den Datenzeiger in einem
 Fehler — und zwar an der Stelle, an der die Regel schon lebt: `gc.rs` lässt in
 einer Klasse ohnehin nur Ganzzahlen, `bool`, Zeiger, `Gc[T]`, `GcWeak[T]` und
 Arrays davon zu, also auch keinen Struct und damit auch kein `dyn I`
-(`tests/neg/iface_dyn_in_gc_klasse.fi` hält das fest). Eine zweite Prüfung
+(`tests/neg/iface_dyn_in_gc_class.fi` hält das fest). Eine zweite Prüfung
 daneben wäre eine zweite Wahrheit gewesen.
 
 ### `impl I for <gc class>`
@@ -206,32 +206,32 @@ dieselbe Registrierung zum selben Zeitpunkt lesen.
 
 | Prüfung | Stelle | Negativtest |
 |---|---|---|
-| alle Methoden der Schnittstelle vorhanden | `iface::pruefe_umsetzung` | `iface_methode_fehlt.fi` |
-| Rückgabetyp passt | dieselbe | `iface_signatur_rueckgabe.fi` |
-| Parametertyp passt | dieselbe | `iface_signatur_parameter.fi` |
+| alle Methoden der Schnittstelle vorhanden | `iface::pruefe_umsetzung` | `iface_method_missing.fi` |
+| Rückgabetyp passt | dieselbe | `iface_signature_ret.fi` |
+| Parametertyp passt | dieselbe | `iface_signature_parameter.fi` |
 | Parameterzahl passt (ohne Empfänger gezählt) | dieselbe | `iface_parameterzahl.fi` |
 | Empfänger ist ein Zeiger auf genau diesen Typ | dieselbe | — |
-| keine zwei `impl I for T` | dieselbe | `iface_doppelte_umsetzung.fi` |
-| die Schnittstelle gibt es | dieselbe | `iface_unbekannt.fi` |
-| `dyn I` mit unbekanntem `I` | `iface::hook_resolve_ty` | `iface_dyn_unbekannt.fi` |
-| Empfänger einer Schnittstellenmethode ist `*self`/`*mut self` | Parser | `iface_empfaenger_wert.fi` |
-| Schnittstellenmethode hat keinen Rumpf | Parser | `iface_rumpf.fi` |
-| nur Methoden der Schnittstelle sind über `dyn` erreichbar | `iface::hook_methode` | `iface_keine_methode.fi` |
-| Umwandlung nur aus einem Zeiger auf einen Struct | `iface::hook_cast` | `iface_kein_zeiger.fi` |
-| der Typ setzt die Schnittstelle wirklich um | dieselbe | `iface_setzt_nicht_um.fi` |
-| `*dyn I` ist kein Schnittstellenwert | `iface::hook_methode` | `iface_zeiger_empfaenger.fi` |
-| `dyn I` nicht im GC-Heap | `gc.rs` (Feldtypen einer Klasse) | `iface_dyn_in_gc_klasse.fi` |
+| keine zwei `impl I for T` | dieselbe | `iface_duplicate_impl.fi` |
+| die Schnittstelle gibt es | dieselbe | `iface_unknown.fi` |
+| `dyn I` mit unbekanntem `I` | `iface::hook_resolve_ty` | `iface_dyn_unknown.fi` |
+| Empfänger einer Schnittstellenmethode ist `*self`/`*mut self` | Parser | `iface_receiver_value.fi` |
+| Schnittstellenmethode hat keinen Rumpf | Parser | `iface_body.fi` |
+| nur Methoden der Schnittstelle sind über `dyn` erreichbar | `iface::hook_methode` | `iface_no_method.fi` |
+| Umwandlung nur aus einem Zeiger auf einen Struct | `iface::hook_cast` | `iface_no_ptr.fi` |
+| der Typ setzt die Schnittstelle wirklich um | dieselbe | `iface_does_not_impl.fi` |
+| `*dyn I` ist kein Schnittstellenwert | `iface::hook_methode` | `iface_ptr_receiver.fi` |
+| `dyn I` nicht im GC-Heap | `gc.rs` (Feldtypen einer Klasse) | `iface_dyn_in_gc_class.fi` |
 
 Jede Meldung nennt Zeile, Spalte und im Hinweis die **erwartete Signatur**:
 
 ```
 error: 'Kreis' setzt die methode 'Flaeche.skaliere' nicht um
-  --> tests/neg/iface_methode_fehlt.fi:13:6
+  --> tests/neg/iface_method_missing.fi:13:6
    = hinweis: erwartet wird 'fn skaliere(*mut self, i64)' im block
 ```
 
 Alle 14 Negativtests werden auch von `firnc1` abgelehnt. Bei
-`iface_dyn_unbekannt.fi` endet `firnc1` mit 5 („das Lowering gibt auf") statt
+`iface_dyn_unknown.fi` endet `firnc1` mit 5 („das Lowering gibt auf") statt
 mit 1 — das ist **nicht** neu und nicht schnittstellenspezifisch: ein
 unbekannter Typname liefert in `firnc1` seit jeher einen Fehlertyp ohne eigene
 Meldung (`let x: Unbekannt = 1` verhält sich genauso).
@@ -273,7 +273,7 @@ Reihenfolge (`iface.rs::typ_struct`, `iface.fi::typ_struct`):
    einem Modul"). Mehrere Treffer sind ein Fehler — raten wäre die
    gefährlichere Wahl.
 
-`tests/821_iface_modul_kern.fi` fährt beides gleichzeitig: zwei Umsetzungen im
+`tests/821_iface_module_core.fi` fährt beides gleichzeitig: zwei Umsetzungen im
 Modul, eine in der Wurzeldatei, alle über dieselbe Schnittstelle.
 
 ---
@@ -301,7 +301,7 @@ Modul, eine in der Wurzeldatei, alle über dieselbe Schnittstelle.
 | `bin/firnc1.fi`, `bin/semadump.fi`, `bin/firdump.fi` | +21 | Registrierung durchreichen |
 
 `bin/astdump.fi` und `bin/layoutdump.fi` bekommen die Registrierung
-**bewusst nicht**: ihr Maßstab (`ast_kanon.rs`, `layout_kanon.rs`) kennt nur
+**bewusst nicht**: ihr Maßstab (`ast_canon.rs`, `layout_canon.rs`) kennt nur
 die Wurzeldatei, dort ist `dyn I` — wie `Gc[C]` und `E!T` — ein unbekannter
 Name und wird zu `?`. Beide Seiten tun dasselbe, und der Vergleich bleibt
 exakt.
@@ -374,12 +374,12 @@ gebauten Hilfsbinärdateien (`.firnc1`, `.astdump`, `.semadump`, `.firdump`,
 | Prüfung | Basis `a492d26` | jetzt |
 |---|---|---|
 | `bash ./test.sh` | 696/696 | **719/719** |
-| `tools/selbst_vergleich.sh` | 201 / 0 / 0 | **204 gleich / 0 abweichend / 0 fehlerhaft** |
-| `tools/fixpunkt.sh` | zeichengleich | **Stufe 2 == Stufe 3, zeichengleich (344.864 Zeilen Assembler)** |
-| Parser (`parser_vergleich.sh`) | 240 gleich, 1 bekannt | 254 gleich, 1 bekannt |
-| Layout/ABI (`typen_vergleich.sh`) | 190 gleich, 0 ungleich | 204 gleich, 0 ungleich |
-| Typprüfer (`sema_vergleich.sh`) | 147 gleich, 1 bekannt | 148 gleich, 1 bekannt |
-| Lowering (`fir_vergleich.sh`) | 146 gleich, 1 bekannt | 147 gleich, 1 bekannt |
+| `tools/self_compare.sh` | 201 / 0 / 0 | **204 gleich / 0 abweichend / 0 fehlerhaft** |
+| `tools/fixpoint.sh` | zeichengleich | **Stufe 2 == Stufe 3, zeichengleich (344.864 Zeilen Assembler)** |
+| Parser (`parser_compare.sh`) | 240 gleich, 1 bekannt | 254 gleich, 1 bekannt |
+| Layout/ABI (`types_compare.sh`) | 190 gleich, 0 ungleich | 204 gleich, 0 ungleich |
+| Typprüfer (`sema_compare.sh`) | 147 gleich, 1 bekannt | 148 gleich, 1 bekannt |
+| Lowering (`fir_compare.sh`) | 146 gleich, 1 bekannt | 147 gleich, 1 bekannt |
 
 Die eine bekannte Abweichung ist unverändert `tests/590_f64.fi` (Literal
 `1e308`, Rundungsfall aus Runde 20 — kein Parserfehler).
@@ -394,7 +394,7 @@ kein Effekt dieser Runde — verglichen wird deshalb gleich mit gleich.
 
 Der Zuwachs erklärt sich Datei für Datei: die vierzehn Negativtests kommen
 durch den Parser (nur der Typprüfer lehnt sie ab) und werden dort mitgezählt;
-`tests/820`, `tests/821`, `tests/modules/zeichnen.fi` und `lib/firnc1/iface.fi`
+`tests/820`, `tests/821`, `tests/modules/draw.fi` und `lib/firnc1/iface.fi`
 kommen hinzu, `tests/822` zählt als „nicht Kern" (gc). Für Typprüfer und
 Lowering bleibt nur `tests/820` übrig — die übrigen neuen Dateien kann
 `firnc0` nicht einzeln prüfen (Modul, gc) oder sie sind Negativtests.

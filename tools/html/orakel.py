@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Gegenprobe fuer die HANDGESCHRIEBENEN Erwartungen in tools/html/faelle/.
+"""Gegenprobe fuer die HANDGESCHRIEBENEN Erwartungen in tools/html/cases/.
 
 WOZU: die `tree-construction`-Daten von html5lib liegen diesem Projekt nicht
-vor (siehe docs/RUNDE54.md). Die Erwartungen in `tools/html/faelle/*.dat`
+vor (siehe docs/RUNDE54.md). Die Erwartungen in `tools/html/cases/*.dat`
 sind deshalb von Hand aus dem WHATWG-Standard geschrieben. Von Hand heisst
 auch: fehleranfaellig. Dieses Skript prueft sie gegen html5lib 1.1, eine
 unabhaengige, spezifikationstreue Umsetzung.

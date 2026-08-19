@@ -46,12 +46,12 @@ const P_SIZE: &str = "size_of$";
 
 thread_local! {
     /// Name -> Größe. Gefüllt vom Typprüfer, gelesen vom Lowering.
-    static WERTE: RefCell<HashMap<String, i128>> = RefCell::new(HashMap::new());
+    static VALUES: RefCell<HashMap<String, i128>> = RefCell::new(HashMap::new());
 }
 
 /// Setzt die Tabelle zurück (eine je Übersetzung, `parser::reset_hooks`).
 pub(crate) fn hook_reset() {
-    WERTE.with(|w| w.borrow_mut().clear());
+    VALUES.with(|w| w.borrow_mut().clear());
 }
 
 /// `// HOOK sizeof` in `parser.rs::primary` — `size_of[T]()`.
@@ -68,24 +68,24 @@ pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
     // BEWUSST NUR EIN TYPNAME, kein voller Typausdruck: `size_of[i32]`,
     // `size_of[Punkt]`. Wer die Groesse eines zusammengesetzten Typs braucht,
     // gibt ihm einen Namen — das ist ohnehin lesbarer als `size_of[*mut u8]`.
-    let (typname, _) = p.ident("nach 'size_of['")?;
-    if !p.expect(TokKind::RBracket, "nach dem typargument von 'size_of'") {
+    let (ty_name, _) = p.ident("after 'size_of['")?;
+    if !p.expect(TokKind::RBracket, "after the type argument of 'size_of'") {
         return None;
     }
-    if !p.expect(TokKind::LParen, "nach dem typargument von 'size_of'") {
+    if !p.expect(TokKind::LParen, "after the type argument of 'size_of'") {
         return None;
     }
     let end = match p.kind() {
         TokKind::RParen => p.bump(),
         _ => {
-            p.error_here("'size_of' nimmt keine argumente".to_string());
+            p.error_here("'size_of' takes no arguments".to_string());
             return None;
         }
     };
     let span = Parser::join(start, end);
     // Der Typtext wandert in den Namen; aufgeloest wird er im Typpruefer,
     // der die Struct-Tabelle kennt.
-    Some(p.mk(span, ExprKind::Call(format!("{}{}", P_SIZE, typname), Vec::new(), start)))
+    Some(p.mk(span, ExprKind::Call(format!("{}{}", P_SIZE, ty_name), Vec::new(), start)))
 }
 
 /// `// HOOK sizeof` in `sema::call`.
@@ -95,29 +95,29 @@ pub(crate) fn hook_call(
     args: &[Expr],
     span: Span,
 ) -> Option<Type> {
-    let typtext = name.strip_prefix(P_SIZE)?;
+    let ty_text = name.strip_prefix(P_SIZE)?;
     if !args.is_empty() {
-        ck.dg.error(span, "'size_of' nimmt keine argumente".to_string());
+        ck.dg.error(span, "'size_of' takes no arguments".to_string());
         return Some(Type::Error);
     }
-    let te = TypeExpr::Named(typtext.to_string(), span);
+    let te = TypeExpr::Named(ty_text.to_string(), span);
     let t = ck.resolve_ty(&te);
     if t.is_error() {
         return Some(Type::Error);
     }
     if matches!(t, Type::Void) {
-        ck.dg.error(span, "'size_of[void]' ist nicht sinnvoll".to_string());
+        ck.dg.error(span, "'size_of[void]' is not meaningful".to_string());
         return Some(Type::Error);
     }
-    let groesse = ck.tcx.size_of(&t) as i128;
-    WERTE.with(|w| w.borrow_mut().insert(name.to_string(), groesse));
+    let size = ck.tcx.size_of(&t) as i128;
+    VALUES.with(|w| w.borrow_mut().insert(name.to_string(), size));
     Some(Type::Usize)
 }
 
 /// Die im Typprüfer ermittelte Größe — für das Lowering.
-pub(crate) fn wert(name: &str) -> Option<i128> {
+pub(crate) fn value(name: &str) -> Option<i128> {
     if !name.starts_with(P_SIZE) {
         return None;
     }
-    WERTE.with(|w| w.borrow().get(name).copied())
+    VALUES.with(|w| w.borrow().get(name).copied())
 }

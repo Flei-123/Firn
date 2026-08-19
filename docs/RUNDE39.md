@@ -21,7 +21,7 @@ Die neuen Orte kommen NACH den alten: bestehende Aufloesungen aendern sich
 nicht (test.sh 640/640, selbst 186/0/0, Fixpunkt zeichengleich — vor dem
 Bibliotheks-Commit nachgemessen). `firnc1` findet `envp` im Startblock
 hinter `argv` (`umgebung()` in `bin/firnc1.fi`); `test.sh` und
-`tools/selbst_vergleich.sh` exportieren `FIRNLIB=<repo>/lib`.
+`tools/self_compare.sh` exportieren `FIRNLIB=<repo>/lib`.
 
 Nachweis aus einem fremden Verzeichnis (`/tmp/firnproj`): `import std.math`
 uebersetzt und laeuft — per `FIRNLIB` und per Installationslayout
@@ -72,7 +72,7 @@ dieselbe Datei ueber zwei verschiedene Pfade einbindet (etwa `std.vec` UND
 `rt.vec` mischen), laedt sie zweimal — `firnc0` kanonisiert, `firnc1`
 (noch) nicht; nicht mischen.
 
-`tests/790_std_kern.fi` fasst jede Fassade einmal an und laeuft auf beiden
+`tests/790_std_core.fi` fasst jede Fassade einmal an und laeuft auf beiden
 Compilern zur selben Ausgabe (selbst-Vergleich: `GLEICH`).
 
 ## Teil B — `f"..."`: die String-Interpolation
@@ -108,7 +108,7 @@ Modulzugriff.
   Entschluesselung per Bauart) dekodiert. Ausdruckssegmente werden mit
   aufgefuellten Positionen neu gelext und von EINEM Unter-Parser als
   genau ein Ausdruck gelesen — Fehler zeigen auf die echte Stelle in
-  der Datei (`tests/neg/interp_unbekannter_name.fi`: 5:27, mitten im
+  der Datei (`tests/neg/interp_unknown_name.fi`: 5:27, mitten im
   `f"..."`).
 * **Das Hoist-Problem**: `(&_fseg[0])` braucht eine benannte Variable —
   ein nacktes `(&[104, 105][0])` hat keinen ableitbaren Typ und ist
@@ -130,8 +130,8 @@ Modulzugriff.
   Ausdruck ohnehin die aeussere Zeichenkette.
 * **Keine Maskierung der Klammern**: `{{`/`}}` gibt es (noch) nicht;
   eine einzelne `}` ohne `{` ist ein Fehler
-  (`tests/neg/interp_klammer_allein.fi`), ebenso `{` ohne `}`
-  (`tests/neg/interp_klammer_offen.fi`) und `{` im Ausdruck.
+  (`tests/neg/interp_paren_alone.fi`), ebenso `{` ohne `}`
+  (`tests/neg/interp_paren_open.fi`) und `{` im Ausdruck.
 * **Keine Zeichenketten im Ausdruck** (das `"` beendet das aeussere
   Literal) und keine Interpolation auf Item-Ebene (`const`) — es gibt
   keine Anweisung, vor die die Textsegmente gehoben werden koennten.
@@ -142,10 +142,10 @@ Modulzugriff.
 
 ### Nachweis
 
-* `tests/791_interpolation_kern.fi`: mehrere Segmente, Operatoren und
+* `tests/791_interpolation_core.fi`: mehrere Segmente, Operatoren und
   Aufrufe in `{...}`, i32/u64/u8/bool, i64::MIN+1, und eine
   Interpolation **in einem importierten Modul**
-  (`tests/modules/fhelfer.fi`). Laeuft in beiden Compilern zur selben
+  (`tests/modules/fhelper.fi`). Laeuft in beiden Compilern zur selben
   Ausgabe (selbst-Vergleich: `GLEICH`).
 * Negativtests (`tests/neg/interp_*.fi`): unbekannter Name in `{...}`,
   `{` ohne `}`, `}` ohne `{` — jeweils rc=1 auf beiden Seiten.
@@ -160,7 +160,7 @@ Modulzugriff.
   `fremd` ohnehin gesetzt ist). Die Kopie setzt darum
   `sub.fremd = par_baum(p)`.
 * **Die versteckten Namen muessen zwischen den Compilern UEBEREINSTIMMEN.**
-  `tools/parser_vergleich.sh` vergleicht die kanonischen Baeume
+  `tools/parser_compare.sh` vergleicht die kanonischen Baeume
   Oktett fuer Oktett: `_fseg<ExprId>` (firnc0) und `_fseg<Knotenstand>`
   (firnc1) sind dieselbe Zahl, weil beide Parser Knoten in derselben
   Reihenfolge erzeugen — sonst waere `tests/791` dort eine Abweichung.
@@ -170,12 +170,12 @@ Modulzugriff.
 Der Fixpunkt steht; die optionale Umstellung einer kleinen Stelle wurde
 bewusst NICHT gemacht, aus drei messbaren Gruenden: (1) die Desugar
 ruft `io.fmt_*` — `firnc1` muesste `std.io` einbinden, und
-`tools/fixpunkt.sh` muesste `FIRNLIB` exportieren (die Dumps loesen
+`tools/fixpoint.sh` muesste `FIRNLIB` exportieren (die Dumps loesen
 `std.io` sonst nicht auf); (2) die Kern-Fassade kennt nur
 `fmt_zahl`/`fmt_text` — die Stellen, die sich anbieten (Lexer- und
 Parser-Meldungen), brauchen Zeichen (`{c}` als Buchstabe, nicht als
 Dezimalzahl) oder einen Puffer statt stdout; sonst aendert sich der
-Meldungstext und `tools/lex_vergleich.sh` (vergleicht auch die
+Meldungstext und `tools/lex_compare.sh` (vergleicht auch die
 Fehlerstroeme) kippt; (3) der Gewinn waere kosmetisch. Was sie
 freischaltet: `fmt_zeichen` + `fmt_inhalt(f, &buf)` in `std.io` und
 `FIRNLIB` in `fixpunkt.sh`.
@@ -183,9 +183,9 @@ freischaltet: `fmt_zeichen` + `fmt_inhalt(f, &buf)` in `std.io` und
 ### Messwerte (Endstand Runde 39)
 
 * `test.sh`: **649/649** (640 + 790×3 + 791×3 + 3 Interpolations-Negativtests)
-* `tools/selbst_vergleich.sh`: **188/0/0** (790 und 791 sind `GLEICH`)
+* `tools/self_compare.sh`: **188/0/0** (790 und 791 sind `GLEICH`)
 * Fixpunkt: Stufe 2 == Stufe 3, **289 096 Zeilen**, zeichengleich
-* `tools/lex_vergleich.sh`, `parser_vergleich.sh`, `typen_vergleich.sh`:
+* `tools/lex_compare.sh`, `parser_compare.sh`, `types_compare.sh`:
   gruen; die Interpolation ist in allen drei Stroemen identisch
   (Token, kanonischer Baum, Layout)
 * `import std.math` aus `/tmp/firnproj`: FIRNLIB und Installationslayout

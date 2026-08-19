@@ -49,7 +49,7 @@ impl Lower<'_> {
     ) -> Option<Val> {
         let off = match self.info.tcx.structs.get(sidx).and_then(|s| s.field(fname)) {
             Some(f) => f.offset,
-            None => return self.ice(span, "unbekanntes feld im lowering"),
+            None => return self.ice(span, "unknown field in lowering"),
         };
         Some(self.field_addr_at(base, off))
     }
@@ -90,7 +90,7 @@ impl Lower<'_> {
         } else {
             self.push(FTy::U64, Op::Cast { src: index, from: index_ty })
         };
-        let sz = self.konst(FTy::U64, elem_size as i128);
+        let sz = self.constant(FTy::U64, elem_size as i128);
         let off = self.push(FTy::U64, Op::Bin(FBin::Mul, idx64, sz));
         self.push(FTy::Ptr, Op::PtrAdd { base, off })
     }

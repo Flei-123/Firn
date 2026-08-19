@@ -139,8 +139,8 @@ impl<'a> Checker<'a> {
         // Gc[T]-Feld) die Typtabelle braucht.
         crate::nogc::hook_check(self, prog);
         // HOOK kern: `#[interrupt]` — Form pruefen und Aufrufe verbieten
-        // (kern.rs, Runde 52).
-        crate::kern::check_interrupts(self, prog);
+        // (core.rs, Runde 52).
+        crate::core::check_interrupts(self, prog);
         // Ganzprogramm-Pruefung: laeuft genau einmal, nicht je Nachtrag.
         self.check_main(prog);
     }
@@ -214,12 +214,12 @@ impl<'a> Checker<'a> {
             ExprKind::Call(n, _, _) => n.clone(),
             _ => return,
         };
-        let grund = if self.must_consume_fns.contains(&name) {
-            format!("'{}' ist mit #[must_consume] gekennzeichnet", name)
+        let basic = if self.must_consume_fns.contains(&name) {
+            format!("'{}' is marked with #[must_consume]", name)
         } else if let Type::Struct(i) = t {
             match self.tcx.structs.get(*i) {
                 Some(d) if d.must_consume => {
-                    format!("der typ '{}' ist mit #[must_consume] gekennzeichnet", d.name)
+                    format!("the type '{}' is marked with #[must_consume]", d.name)
                 }
                 _ => return,
             }
@@ -228,8 +228,8 @@ impl<'a> Checker<'a> {
         };
         self.dg.error_note(
             e.span,
-            format!("das ergebnis darf nicht verworfen werden: {}", grund),
-            "binde es an eine variable oder uebergib es weiter".to_string(),
+            format!("the result must not be discarded: {}", basic),
+            "bind it to a variable or pass it on".to_string(),
         );
     }
 
@@ -268,33 +268,33 @@ impl<'a> Checker<'a> {
     }
 
     /// `true` = Attribut ist gueltig UND in Stufe 0 umgesetzt.
-    fn check_one_attr(&mut self, a: &crate::ast::Attr, auf_funktion: bool) -> bool {
-        let info = match crate::attrs::suche(&a.name) {
+    fn check_one_attr(&mut self, a: &crate::ast::Attr, on_func: bool) -> bool {
+        let info = match crate::attrs::search(&a.name) {
             Some(i) => i,
             None => {
-                let msg = format!("unbekanntes attribut '{}'", a.name);
-                match crate::attrs::vorschlag(&a.name) {
+                let msg = format!("unknown attribute '{}'", a.name);
+                match crate::attrs::proposal(&a.name) {
                     Some(v) => self.dg.error_note(
                         a.span,
                         msg,
-                        format!("meintest du '{}'? '--list-attrs' zeigt alle", v),
+                        format!("did you mean '{}'? '--list-attrs' shows all", v),
                     ),
                     None => self.dg.error_note(
                         a.span,
                         msg,
-                        "'--list-attrs' zeigt alle bekannten attribute".to_string(),
+                        "'--list-attrs' shows all known attributes".to_string(),
                     ),
                 }
                 return false;
             }
         };
-        if !crate::attrs::passt(info, auf_funktion) {
+        if !crate::attrs::fits(info, on_func) {
             self.dg.error(
                 a.span,
                 format!(
-                    "attribut '{}' gehoert nicht vor {}",
+                    "attribute '{}' does not belong before {}",
                     a.name,
-                    if auf_funktion { "eine funktion" } else { "einen struct" }
+                    if on_func { "a function" } else { "a struct" }
                 ),
             );
             return false;
@@ -303,7 +303,7 @@ impl<'a> Checker<'a> {
             self.dg.error(
                 a.span,
                 format!(
-                    "attribut '{}' erwartet {} argument(e), gefunden {}",
+                    "attribute '{}' expects {} argument(s), found {}",
                     a.name,
                     info.args,
                     a.args.len()
@@ -311,11 +311,11 @@ impl<'a> Checker<'a> {
             );
             return false;
         }
-        if !info.umgesetzt {
+        if !info.implemented {
             self.dg.error_note(
                 a.span,
-                format!("attribut '{}' ist in Stufe 0 nicht umgesetzt", a.name),
-                format!("geplant: {}", info.was),
+                format!("attribute '{}' is not implemented in stage 0", a.name),
+                format!("geplant: {}", info.what),
             );
             return false;
         }
@@ -325,10 +325,10 @@ impl<'a> Checker<'a> {
     // ---------------------------------------------------------------- Profil
 
     fn check_profile(&mut self, prog: &Program) {
-        // HOOK profil (profil.rs, Runde 52): das Profil festlegen UND seine
+        // HOOK profil (prof.rs, Runde 52): das Profil festlegen UND seine
         // Regeln durchsetzen. Bis Runde 51 stand hier nur die Namenspruefung —
         // die Deklaration hatte keine Wirkung (SPEC §14, Punkt 6).
-        crate::profil::hook_check(self.dg, prog);
+        crate::prof::hook_check(self.dg, prog);
     }
 
     // --------------------------------------------------------------- Structs
@@ -341,7 +341,7 @@ impl<'a> Checker<'a> {
         for s in &prog.structs {
             if self.tcx.lookup(&s.name).is_some() {
                 self.dg
-                    .error(s.span, format!("struct '{}' ist bereits deklariert", s.name));
+                    .error(s.span, format!("struct '{}' is already declared", s.name));
                 // Doppelte Deklaration: auf den ersten Eintrag zeigen lassen.
                 idx_of.push(self.tcx.lookup(&s.name).unwrap_or(0));
                 continue;
@@ -359,13 +359,13 @@ impl<'a> Checker<'a> {
                 if !seen.insert(name.clone()) {
                     self.dg.error(
                         *span,
-                        format!("feld '{}' ist in struct '{}' bereits deklariert", name, s.name),
+                        format!("field '{}' is already declared in struct '{}'", name, s.name),
                     );
                     continue;
                 }
                 if matches!(ty, Type::Void) {
                     self.dg
-                        .error(te.span(), "ein feld kann nicht den typ '()' haben");
+                        .error(te.span(), "a field cannot have the type '()'");
                     continue;
                 }
                 fields.push((name.clone(), ty));
@@ -399,8 +399,8 @@ impl<'a> Checker<'a> {
             if bad.contains(&target) {
                 self.dg.error_note(
                     s.span,
-                    format!("struct '{}' enthaelt sich selbst (direkt oder indirekt)", s.name),
-                    "benutze an der Stelle einen zeiger, z. B. '*mut T'",
+                    format!("struct '{}' contains itself (directly or indirectly)", s.name),
+                    "use a pointer there, e.g. '*mut T'",
                 );
             }
         }
@@ -442,11 +442,11 @@ impl<'a> Checker<'a> {
                 if !seen.insert(p.name.clone()) {
                     self.dg.error(
                         p.span,
-                        format!("parameter '{}' ist bereits deklariert", p.name),
+                        format!("parameter '{}' is already declared", p.name),
                     );
                 }
                 if matches!(ty, Type::Void) {
-                    self.dg.error(p.ty.span(), "ein parameter kann nicht den typ '()' haben");
+                    self.dg.error(p.ty.span(), "a parameter cannot have the type '()'");
                     params.push(Type::Error);
                     continue;
                 }
@@ -459,7 +459,7 @@ impl<'a> Checker<'a> {
             if self.fns.contains_key(&f.name) {
                 self.dg.error(
                     f.span,
-                    format!("funktion '{}' ist bereits deklariert", f.name),
+                    format!("function '{}' is already declared", f.name),
                 );
                 continue;
             }
@@ -475,13 +475,13 @@ impl<'a> Checker<'a> {
                 // Laufzeitvorspann und niemanden, der einen Exit-Code
                 // entgegennaehme — nur eine Objektdatei, die ein Bootlader
                 // bzw. ein Linkerskript einbindet.
-                if crate::profil::ist_kernel() {
+                if crate::prof::is_kernel() {
                     return;
                 }
                 self.dg.error_note(
                     Span::none(),
-                    "das programm hat keine funktion 'main'",
-                    "erwartet wird 'fn main() -> i32'",
+                    "the program has no function 'main'",
+                    "'fn main() -> i32' is expected",
                 );
             }
             Some(sig) => {
@@ -506,8 +506,8 @@ impl<'a> Checker<'a> {
                         .unwrap_or_else(Span::none);
                     self.dg.error_note(
                         span,
-                        "'main' muss ohne parameter oder mit genau einem 'u64' deklariert sein und 'i32' zurueckgeben",
-                        "erwartet wird 'fn main() -> i32' oder 'fn main(start: u64) -> i32' (startblock: argc, argv, envp)",
+                        "'main' must be declared without parameters or with exactly one 'u64' and must return 'i32'",
+                        "'fn main() -> i32' or 'fn main(start: u64) -> i32' is expected (start block: argc, argv, envp)",
                     );
                 }
             }
@@ -531,11 +531,11 @@ impl<'a> Checker<'a> {
             self.dg.error_note(
                 f.span,
                 format!(
-                    "funktion '{}' erreicht das ende ohne 'return' (rueckgabetyp {})",
+                    "function '{}' reaches the end without 'return' (return type {})",
                     f.name,
                     self.tcx.name_of(&sig.ret)
                 ),
-                "jeder pfad muss mit 'return <wert>' enden",
+                "every path must end with 'return <value>'",
             );
         }
     }
@@ -548,7 +548,7 @@ impl<'a> Checker<'a> {
             if !ty.is_error() && !(ty.is_concrete_int() || ty == Type::Bool) {
                 self.dg.error(
                     c.ty.span(),
-                    "'const' unterstuetzt in stufe 0 nur ganzzahl- und bool-typen",
+                    "'const' supports only integer and bool types in stage 0",
                 );
                 self.type_out_expr(&c.value);
                 continue;
@@ -558,7 +558,7 @@ impl<'a> Checker<'a> {
                 self.dg.error(
                     c.value.span,
                     format!(
-                        "konstante '{}' hat typ {}, der wert ist vom typ {}",
+                        "constant '{}' has type {}, the value is of type {}",
                         c.name,
                         self.tcx.name_of(&ty),
                         self.tcx.name_of(&t)
@@ -569,7 +569,7 @@ impl<'a> Checker<'a> {
             if self.consts.contains_key(&c.name) {
                 self.dg.error(
                     c.span,
-                    format!("konstante '{}' ist bereits deklariert", c.name),
+                    format!("constant '{}' is already declared", c.name),
                 );
                 continue;
             }
@@ -579,7 +579,7 @@ impl<'a> Checker<'a> {
                 }
                 Err((span, msg)) => {
                     self.dg.error(span, msg);
-                    // Damit Folgeverwendungen keinen "unbekannter name"-Fehler geben.
+                    // Damit Folgeverwendungen keinen "unknown name"-Fehler geben.
                     self.consts.insert(c.name.clone(), (ty.clone(), 0));
                 }
             }
@@ -593,7 +593,7 @@ impl<'a> Checker<'a> {
             if top.contains_key(name) {
                 self.dg.error(
                     span,
-                    format!("'{}' ist in diesem block bereits deklariert", name),
+                    format!("'{}' is already declared in this block", name),
                 );
             }
         }
@@ -636,13 +636,13 @@ impl<'a> Checker<'a> {
             // und `continue` wuerden die Reihenfolge der uebrigen
             // aufgeschobenen Anweisungen zerreissen und den Rueckgabewert
             // ueberschreiben. Zig verbietet es aus demselben Grund.
-            Stmt::Defer(inner, nur_fehler, span) => {
-                let art = if *nur_fehler { "errdefer" } else { "defer" };
-                if let Some((bad, wort)) = crate::sema::defer_sprung(inner) {
+            Stmt::Defer(inner, only_error, span) => {
+                let kind = if *only_error { "errdefer" } else { "defer" };
+                if let Some((bad, word)) = crate::sema::defer_jump(inner) {
                     self.dg.error_note(
                         bad,
-                        format!("'{}' ist in einem '{}' nicht erlaubt", wort, art),
-                        "der aufgeschobene rumpf muss normal enden; sonst waere unbestimmt, was mit den uebrigen aufgeschobenen anweisungen geschieht",
+                        format!("'{}' is not allowed in a '{}'", word, kind),
+                        "the deferred body must end normally; otherwise it would be undefined what happens to the remaining deferred statements",
                     );
                     let _ = span;
                 }
@@ -664,7 +664,7 @@ impl<'a> Checker<'a> {
                             self.dg.error(
                                 init.span,
                                 format!(
-                                    "erwartet typ {}, gefunden {}",
+                                    "expected type {}, found {}",
                                     self.tcx.name_of(d),
                                     self.tcx.name_of(&got)
                                 ),
@@ -677,7 +677,7 @@ impl<'a> Checker<'a> {
                         if matches!(got, Type::Void) {
                             self.dg.error(
                                 init.span,
-                                "der ausdruck liefert keinen wert und kann nicht gebunden werden",
+                                "the expression yields no value and cannot be bound",
                             );
                             Type::Error
                         } else {
@@ -696,7 +696,7 @@ impl<'a> Checker<'a> {
                     }
                 };
                 if let Mutability::Fixed(reason) = mutability {
-                    self.dg.error_note(*span, reason, "benutze 'var' statt 'let'");
+                    self.dg.error_note(*span, reason, "use 'var' instead of 'let'");
                 }
                 // HOOK fehlerunionen: implizite Umwandlung (errors.rs)
                 if crate::errors::hook_coerce(self, value, &ty) {
@@ -707,7 +707,7 @@ impl<'a> Checker<'a> {
                     self.dg.error(
                         value.span,
                         format!(
-                            "zuweisung erwartet typ {}, gefunden {}",
+                            "assignment expects type {}, found {}",
                             self.tcx.name_of(&ty),
                             self.tcx.name_of(&got)
                         ),
@@ -738,11 +738,11 @@ impl<'a> Checker<'a> {
                     self.dg.error_note(
                         start.span,
                         format!(
-                            "der bereich von 'for' braucht zwei werte desselben ganzzahltyps, gefunden {} und {}",
+                            "the range of 'for' needs two values of the same integer type, found {} and {}",
                             self.tcx.name_of(&st),
                             self.tcx.name_of(&et)
                         ),
-                        "schreibe z. B. 'for i in 0 as usize..n'",
+                        "write e.g. 'for i in 0 as usize..n'",
                     );
                     Type::Error
                 } else {
@@ -761,7 +761,7 @@ impl<'a> Checker<'a> {
                             self.dg.error(
                                 *span,
                                 format!(
-                                    "'return' ohne wert, erwartet wird ein wert vom typ {}",
+                                    "'return' without value, a value of type {} is expected",
                                     self.tcx.name_of(&want)
                                 ),
                             );
@@ -772,7 +772,7 @@ impl<'a> Checker<'a> {
                             self.expr(e, Some(&Type::I64));
                             self.dg.error(
                                 e.span,
-                                "diese funktion hat keinen rueckgabetyp, 'return' darf keinen wert haben",
+                                "this function has no return type, 'return' must not carry a value",
                             );
                             return;
                         }
@@ -785,7 +785,7 @@ impl<'a> Checker<'a> {
                             self.dg.error(
                                 e.span,
                                 format!(
-                                    "'return' erwartet typ {}, gefunden {}",
+                                    "'return' expects type {}, found {}",
                                     self.tcx.name_of(&want),
                                     self.tcx.name_of(&got)
                                 ),
@@ -803,11 +803,11 @@ impl<'a> Checker<'a> {
             self.dg.error_note(
                 e.span,
                 format!(
-                    "bedingung von '{}' muss vom typ bool sein, gefunden {}",
+                    "condition of '{}' must be of type bool, found {}",
                     kw,
                     self.tcx.name_of(&t)
                 ),
-                "es gibt keine implizite umwandlung, schreibe z. B. 'x != 0'",
+                "there is no implicit conversion, write e.g. 'x != 0'",
             );
         }
     }
@@ -824,7 +824,7 @@ impl<'a> Checker<'a> {
                         Mutability::Mutable
                     } else {
                         Mutability::Fixed(format!(
-                            "'{}' ist mit 'let' gebunden und kann nicht veraendert werden",
+                            "'{}' is bound with 'let' and cannot be modified",
                             name
                         ))
                     };
@@ -836,13 +836,13 @@ impl<'a> Checker<'a> {
                     Some((
                         ty,
                         Mutability::Fixed(format!(
-                            "'{}' ist eine konstante und kann nicht veraendert werden",
+                            "'{}' is a constant and cannot be modified",
                             name
                         )),
                     ))
                 } else {
                     self.dg
-                        .error(e.span, format!("unbekannter name '{}'", name));
+                        .error(e.span, format!("unknown name '{}'", name));
                     self.record(e.id, Type::Error);
                     Some((Type::Error, Mutability::Mutable))
                 }
@@ -852,7 +852,7 @@ impl<'a> Checker<'a> {
                 // `let a: Gc[Knoten]` bindet den GRIFF unveraenderlich — das
                 // Objekt am anderen Ende bleibt schreibbar, genau wie bei
                 // `let p: *mut T` und `(*p).feld = …`.
-                if let Some(bt) = self.probe(base).filter(crate::gc::ist_gc_ptr) {
+                if let Some(bt) = self.probe(base).filter(crate::gc::is_gc_ptr) {
                     let _ = self.expr(base, None);
                     let ty = self.field_type(&bt, name, *nspan, base.span);
                     self.record(e.id, ty.clone());
@@ -878,7 +878,7 @@ impl<'a> Checker<'a> {
                         self.dg.error(
                             e.span,
                             format!(
-                                "dereferenzierung erwartet einen zeiger, gefunden {}",
+                                "dereference expects a pointer, found {}",
                                 self.tcx.name_of(other)
                             ),
                         );
@@ -892,7 +892,7 @@ impl<'a> Checker<'a> {
                 self.expr(e, Some(&Type::I64));
                 self.dg.error(
                     e.span,
-                    "linke seite ist kein zuweisbarer ausdruck (variable, feld, index oder '*zeiger')",
+                    "left side is not an assignable expression (variable, field, index or '*pointer')",
                 );
                 None
             }
@@ -916,7 +916,7 @@ impl<'a> Checker<'a> {
                         .map(|s| s.name.clone())
                         .unwrap_or_else(|| "<struct>".to_string());
                     self.dg
-                        .error(nspan, format!("struct '{}' hat kein feld '{}'", sname, name));
+                        .error(nspan, format!("struct '{}' has no field '{}'", sname, name));
                     Type::Error
                 }
             },
@@ -925,10 +925,10 @@ impl<'a> Checker<'a> {
                 self.dg.error_note(
                     bspan,
                     format!(
-                        "feldzugriff auf zeigertyp {}",
+                        "field access on the pointer type {}",
                         self.tcx.name_of(base)
                     ),
-                    "es gibt keine automatische dereferenzierung, schreibe '(*p).feld'",
+                    "there is no automatic dereference, write '(*p).field'",
                 );
                 Type::Error
             }
@@ -936,7 +936,7 @@ impl<'a> Checker<'a> {
                 self.dg.error(
                     bspan,
                     format!(
-                        "feldzugriff auf nicht-struct-typ {}",
+                        "field access on the non-struct type {}",
                         self.tcx.name_of(other)
                     ),
                 );
@@ -951,10 +951,10 @@ impl<'a> Checker<'a> {
             self.dg.error_note(
                 idx.span,
                 format!(
-                    "index muss vom typ usize sein, gefunden {}",
+                    "index must be of type usize, found {}",
                     self.tcx.name_of(&it)
                 ),
-                "schreibe z. B. 'a[i as usize]'",
+                "write e.g. 'a[i as usize]'",
             );
         }
         match base {
@@ -963,7 +963,7 @@ impl<'a> Checker<'a> {
             other => {
                 self.dg.error(
                     bspan,
-                    format!("index auf nicht-array-typ {}", self.tcx.name_of(other)),
+                    format!("index on the non-array type {}", self.tcx.name_of(other)),
                 );
                 Type::Error
             }
@@ -980,7 +980,7 @@ impl<'a> Checker<'a> {
 
     /// Gibt allen Teilausdruecken einen konkreten Typ, ohne inhaltlich zu
     /// pruefen — benutzt nach einem bereits gemeldeten Fehler, damit keine
-    /// Folgefehlerlawine ("typ des literals ...") entsteht.
+    /// Folgefehlerlawine ("type of the literal ...") entsteht.
     pub(crate) fn type_out_expr(&mut self, e: &Expr) {
         self.expr(e, Some(&Type::I64));
     }
@@ -989,7 +989,7 @@ impl<'a> Checker<'a> {
         if self.depth >= MAX_DEPTH {
             self.dg.error(
                 e.span,
-                "ausdruck ist zu tief verschachtelt (mehr als 200 ebenen)",
+                "expression is nested too deeply (more than 200 levels)",
             );
             self.record(e.id, Type::Error);
             return Type::Error;
@@ -1013,7 +1013,7 @@ impl<'a> Checker<'a> {
                         self.dg.error(
                             e.span,
                             format!(
-                                "ganzzahlliteral {} passt nicht in den typ {}",
+                                "integer literal {} does not fit into the type {}",
                                 v,
                                 self.tcx.name_of(t)
                             ),
@@ -1025,16 +1025,16 @@ impl<'a> Checker<'a> {
                 Some(Type::Bool) => {
                     self.dg.error_note(
                         e.span,
-                        "hier wird ein wahrheitswert vom typ bool erwartet, gefunden ein ganzzahlliteral",
-                        "es gibt keine implizite umwandlung, schreibe z. B. 'x != 0'",
+                        "a truth value of type bool is expected here, found an integer literal",
+                        "there is no implicit conversion, write e.g. 'x != 0'",
                     );
                     Type::Error
                 }
                 _ => {
                     self.dg.error_note(
                         e.span,
-                        "typ des ganzzahlliterals ist nicht ableitbar",
-                        "gib den typ an, z. B. '5 as i32' oder 'let x: i32 = 5'",
+                        "the type of the integer literal cannot be inferred",
+                        "give the type, e.g. '5 as i32' or 'let x: i32 = 5'",
                     );
                     Type::Error
                 }
@@ -1048,13 +1048,13 @@ impl<'a> Checker<'a> {
                 } else if self.fns.contains_key(name) {
                     self.dg.error_note(
                         e.span,
-                        format!("'{}' ist eine funktion und kein wert", name),
-                        "funktionszeiger gibt es in stufe 0 nicht, rufe sie mit '(...)' auf",
+                        format!("'{}' is a function and not a value", name),
+                        "function pointers do not exist in stage 0, call them with '(...)'",
                     );
                     Type::Error
                 } else {
                     self.dg
-                        .error(e.span, format!("unbekannter name '{}'", name));
+                        .error(e.span, format!("unknown name '{}'", name));
                     Type::Error
                 }
             }
@@ -1080,10 +1080,10 @@ impl<'a> Checker<'a> {
                     self.dg.error_note(
                         e.span,
                         format!(
-                            "'syscall' erwartet 1 bis 7 argumente (nummer und bis zu 6 werte), gefunden {}",
+                            "'syscall' expects 1 to 7 arguments (number and up to 6 values), found {}",
                             args.len()
                         ),
-                        "aufruf: syscall(nr, a1, ..., a6)",
+                        "call: syscall(nr, a1, ..., a6)",
                     );
                 }
                 for a in args {
@@ -1092,7 +1092,7 @@ impl<'a> Checker<'a> {
                         self.dg.error(
                             a.span,
                             format!(
-                                "'syscall'-argument muss ganzzahl- oder zeigertyp sein, gefunden {}",
+                                "'syscall' argument must be an integer or pointer type, found {}",
                                 self.tcx.name_of(&t)
                             ),
                         );
@@ -1124,7 +1124,7 @@ impl<'a> Checker<'a> {
                     self.dg.error(
                         e.span,
                         format!(
-                            "umwandlung von {} nach {} ist nicht erlaubt",
+                            "conversion from {} to {} is not allowed",
                             self.tcx.name_of(&src),
                             self.tcx.name_of(&dst)
                         ),
@@ -1141,7 +1141,7 @@ impl<'a> Checker<'a> {
                         self.dg.error(
                             count.span,
                             format!(
-                                "die laenge eines wiederholungsliterals muss eine ganzzahl sein, gefunden {}",
+                                "the length of a repetition literal must be an integer, found {}",
                                 self.tcx.name_of(&ct)
                             ),
                         );
@@ -1153,7 +1153,7 @@ impl<'a> Checker<'a> {
                         Ok(_) => {
                             self.dg.error(
                                 count.span,
-                                "die laenge eines wiederholungsliterals muss groesser als null sein",
+                                "the length of a repetition literal must be greater than zero",
                             );
                             0
                         }
@@ -1176,7 +1176,7 @@ impl<'a> Checker<'a> {
                         self.dg.error(
                             val.span,
                             format!(
-                                "element hat typ {}, erwartet {}",
+                                "element has type {}, expected {}",
                                 self.tcx.name_of(&vt),
                                 self.tcx.name_of(et)
                             ),
@@ -1185,7 +1185,7 @@ impl<'a> Checker<'a> {
                     if *want_n != n {
                         self.dg.error(
                             count.span,
-                            format!("erwartet werden {} elemente, das literal hat {}", want_n, n),
+                            format!("{} elements are expected, the literal has {}", want_n, n),
                         );
                     }
                 }
@@ -1197,7 +1197,7 @@ impl<'a> Checker<'a> {
                         self.dg.error(
                             e.span,
                             format!(
-                                "array-literal hat {} elemente, erwartet werden {}",
+                                "array literal has {} elements, {} are expected",
                                 elems.len(),
                                 n
                             ),
@@ -1209,7 +1209,7 @@ impl<'a> Checker<'a> {
                             self.dg.error(
                                 el.span,
                                 format!(
-                                    "element hat typ {}, erwartet {}",
+                                    "element has type {}, expected {}",
                                     self.tcx.name_of(&t),
                                     self.tcx.name_of(et)
                                 ),
@@ -1224,8 +1224,8 @@ impl<'a> Checker<'a> {
                     }
                     self.dg.error_note(
                         e.span,
-                        "typ des array-literals ist nicht ableitbar",
-                        "gib den typ an, z. B. 'var a: [i32; 3] = [1, 2, 3]'",
+                        "the type of the array literal cannot be inferred",
+                        "give the type, e.g. 'var a: [i32; 3] = [1, 2, 3]'",
                     );
                     Type::Error
                 }
@@ -1247,7 +1247,7 @@ impl<'a> Checker<'a> {
                     self.dg.error(
                         e.span,
                         format!(
-                            "unaeres '-' erwartet einen ganzzahltyp, gefunden {}",
+                            "unary '-' expects an integer type, found {}",
                             self.tcx.name_of(&t)
                         ),
                     );
@@ -1264,10 +1264,10 @@ impl<'a> Checker<'a> {
                     self.dg.error_note(
                         e.span,
                         format!(
-                            "unaeres '!' erwartet den typ bool, gefunden {}",
+                            "unary '!' expects the type bool, found {}",
                             self.tcx.name_of(&t)
                         ),
-                        "bitweise negation gibt es in stufe 0 nicht, schreibe 'x ^ -1'",
+                        "bitwise negation does not exist in stage 0, write 'x ^ -1'",
                     );
                     return Type::Error;
                 }
@@ -1292,7 +1292,7 @@ impl<'a> Checker<'a> {
                         self.dg.error(
                             e.span,
                             format!(
-                                "dereferenzierung erwartet einen zeiger, gefunden {}",
+                                "dereference expects a pointer, found {}",
                                 self.tcx.name_of(other)
                             ),
                         );
@@ -1316,7 +1316,7 @@ impl<'a> Checker<'a> {
                     self.dg.error(
                         sp,
                         format!(
-                            "operator '{}' erwartet operanden vom typ bool, gefunden {}",
+                            "operator '{}' expects operands of type bool, found {}",
                             op.text(),
                             self.tcx.name_of(&t)
                         ),
@@ -1333,12 +1333,12 @@ impl<'a> Checker<'a> {
                 return Type::Bool;
             }
             // HOOK gc: Identitaetsvergleich zweier verwandter Gc-Zeiger (gc.rs)
-            let same = compatible(&lt, &rt) || crate::gc::ist_verwandt(&lt, &rt);
+            let same = compatible(&lt, &rt) || crate::gc::is_related(&lt, &rt);
             if !same {
                 self.dg.error(
                     e.span,
                     format!(
-                        "vergleich zwischen unterschiedlichen typen {} und {}",
+                        "comparison between different types {} and {}",
                         self.tcx.name_of(&lt),
                         self.tcx.name_of(&rt)
                     ),
@@ -1355,7 +1355,7 @@ impl<'a> Checker<'a> {
                 self.dg.error(
                     e.span,
                     format!(
-                        "operator '{}' ist fuer den typ {} nicht definiert",
+                        "operator '{}' is not defined for the type {}",
                         op.text(),
                         self.tcx.name_of(&lt)
                     ),
@@ -1383,7 +1383,7 @@ impl<'a> Checker<'a> {
                 self.dg.error(
                     e.span,
                     format!(
-                        "operator '{}' erwartet ganzzahltypen, gefunden {} und {}",
+                        "operator '{}' expects integer types, found {} and {}",
                         op.text(),
                         self.tcx.name_of(&lt),
                         self.tcx.name_of(&rt)
@@ -1411,12 +1411,12 @@ impl<'a> Checker<'a> {
         // Bitoperationen haetten auf einem Bitmuster keine sinnvolle Bedeutung
         // (wer sie braucht, wandelt ausdruecklich in `u64` um).
         if lt == Type::F64 || rt == Type::F64 {
-            let erlaubt = matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div);
-            if !erlaubt {
+            let allowed = matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div);
+            if !allowed {
                 self.dg.error_note(
                     e.span,
-                    format!("operator '{}' ist fuer f64 nicht definiert", op.text()),
-                    "erlaubt sind '+', '-', '*', '/' und die vergleiche; fuer den rest wandle ausdruecklich um",
+                    format!("operator '{}' is not defined for f64", op.text()),
+                    "allowed are '+', '-', '*', '/' and the comparisons; for the rest convert explicitly",
                 );
                 return Type::Error;
             }
@@ -1424,12 +1424,12 @@ impl<'a> Checker<'a> {
                 self.dg.error_note(
                     e.span,
                     format!(
-                        "operator '{}' erwartet zwei operanden desselben typs, gefunden {} und {}",
+                        "operator '{}' expects two operands of the same type, found {} and {}",
                         op.text(),
                         self.tcx.name_of(&lt),
                         self.tcx.name_of(&rt)
                     ),
-                    "es gibt keine implizite umwandlung, benutze 'as f64'",
+                    "there is no implicit conversion, use 'as f64'",
                 );
                 return Type::Error;
             }
@@ -1439,12 +1439,12 @@ impl<'a> Checker<'a> {
             self.dg.error_note(
                 e.span,
                 format!(
-                    "operator '{}' erwartet zwei operanden desselben ganzzahltyps, gefunden {} und {}",
+                    "operator '{}' expects two operands of the same integer type, found {} and {}",
                     op.text(),
                     self.tcx.name_of(&lt),
                     self.tcx.name_of(&rt)
                 ),
-                "es gibt keine implizite umwandlung, benutze 'as'",
+                "there is no implicit conversion, use 'as'",
             );
             return Type::Error;
         }
@@ -1461,12 +1461,12 @@ impl<'a> Checker<'a> {
             return t;
         }
         // HOOK constant-time: select/barrier/secure_zero (ct.rs, SPEC §9.2/§9.3)
-        // HOOK faden: die drei Faden-Primitive (faden.rs, Runde 49)
-        if let Some(t) = crate::faden::hook_call(self, name, args, nspan, espan) {
+        // HOOK faden: die drei Faden-Primitive (thread.rs, Runde 49)
+        if let Some(t) = crate::thread::hook_call(self, name, args, nspan, espan) {
             return t;
         }
-        // HOOK atomar: das atomare Primitiv (atomar.rs, Runde 47)
-        if let Some(t) = crate::atomar::hook_call(self, name, args, nspan, espan) {
+        // HOOK atomar: das atomare Primitiv (atomic.rs, Runde 47)
+        if let Some(t) = crate::atomic::hook_call(self, name, args, nspan, espan) {
             return t;
         }
         if let Some(t) = crate::ct::hook_call(self, name, args, nspan, espan) {
@@ -1476,8 +1476,8 @@ impl<'a> Checker<'a> {
         if let Some(t) = crate::sizeof::hook_call(self, name, args, nspan) {
             return t;
         }
-        // HOOK kern: `asm(…)` und die acht MMIO-Namen (kern.rs, Runde 52)
-        if let Some(t) = crate::kern::hook_call(self, name, args, nspan, espan) {
+        // HOOK kern: `asm(…)` und die acht MMIO-Namen (core.rs, Runde 52)
+        if let Some(t) = crate::core::hook_call(self, name, args, nspan, espan) {
             return t;
         }
         // HOOK gc: `gc C{…}`, `weak(g)`, `stark(w)`, `x.as?[C]` und die
@@ -1494,11 +1494,11 @@ impl<'a> Checker<'a> {
                 if self.lookup_var(name).is_some() || self.consts.contains_key(name) {
                     self.dg.error(
                         nspan,
-                        format!("'{}' ist keine funktion und kann nicht aufgerufen werden", name),
+                        format!("'{}' is not a function and cannot be called", name),
                     );
                 } else {
                     self.dg
-                        .error(nspan, format!("unbekannte funktion '{}'", name));
+                        .error(nspan, format!("unknown function '{}'", name));
                 }
                 return Type::Error;
             }
@@ -1507,7 +1507,7 @@ impl<'a> Checker<'a> {
             self.dg.error(
                 espan,
                 format!(
-                    "funktion '{}' erwartet {} argument(e), gefunden {}",
+                    "function '{}' expects {} argument(s), found {}",
                     name,
                     sig.params.len(),
                     args.len()
@@ -1516,7 +1516,7 @@ impl<'a> Checker<'a> {
         }
         for (i, a) in args.iter().enumerate() {
             match sig.params.get(i) {
-                Some(p) => self.pruefe_argument(name, i + 1, a, p),
+                Some(p) => self.check_argument(name, i + 1, a, p),
                 None => {
                     self.type_out_expr(a);
                 }
@@ -1529,7 +1529,7 @@ impl<'a> Checker<'a> {
     /// der Meldung erscheint (1-basiert). Bei einem Methodenaufruf zaehlt
     /// sie OHNE den Empfaenger — `v.push(x)` hat ein Argument, nicht zwei
     /// (impls.rs).
-    pub(crate) fn pruefe_argument(&mut self, wer: &str, nr: usize, a: &Expr, p: &Type) {
+    pub(crate) fn check_argument(&mut self, who: &str, nr: usize, a: &Expr, p: &Type) {
         // HOOK fehlerunionen: implizite Umwandlung (errors.rs)
         if crate::errors::hook_coerce(self, a, p) {
             return;
@@ -1539,9 +1539,9 @@ impl<'a> Checker<'a> {
             self.dg.error(
                 a.span,
                 format!(
-                    "argument {} von '{}' hat typ {}, erwartet {}",
+                    "argument {} of '{}' has type {}, expected {}",
                     nr,
-                    wer,
+                    who,
                     self.tcx.name_of(&t),
                     self.tcx.name_of(p)
                 ),
@@ -1557,7 +1557,7 @@ impl<'a> Checker<'a> {
                     self.type_out_expr(e);
                 }
                 self.dg
-                    .error(nspan, format!("unbekannter struct-typ '{}'", name));
+                    .error(nspan, format!("unknown struct type '{}'", name));
                 return Type::Error;
             }
         };
@@ -1574,7 +1574,7 @@ impl<'a> Checker<'a> {
                     if !seen.insert(fname.clone()) {
                         self.dg.error(
                             *fspan,
-                            format!("feld '{}' ist mehrfach angegeben", fname),
+                            format!("field '{}' is given more than once", fname),
                         );
                     }
                     // HOOK fehlerunionen: implizite Umwandlung (errors.rs)
@@ -1586,7 +1586,7 @@ impl<'a> Checker<'a> {
                         self.dg.error(
                             fexpr.span,
                             format!(
-                                "feld '{}' hat typ {}, erwartet {}",
+                                "field '{}' has type {}, expected {}",
                                 fname,
                                 self.tcx.name_of(&t),
                                 self.tcx.name_of(ft)
@@ -1598,7 +1598,7 @@ impl<'a> Checker<'a> {
                     self.type_out_expr(fexpr);
                     self.dg.error(
                         *fspan,
-                        format!("struct '{}' hat kein feld '{}'", name, fname),
+                        format!("struct '{}' has no field '{}'", name, fname),
                     );
                 }
             }
@@ -1612,7 +1612,7 @@ impl<'a> Checker<'a> {
             self.dg.error(
                 nspan,
                 format!(
-                    "struct-literal '{}' fehlt das feld '{}'",
+                    "struct literal '{}' is missing the field '{}'",
                     name,
                     missing.join("', '")
                 ),
@@ -1687,25 +1687,25 @@ impl<'a> Checker<'a> {
                 // Ohne das bekaeme ein Literal daneben keinen Typ
                 // (`p.summe() != 42`) — dieselbe Aufloesung wie in `call`,
                 // nur ohne zu melden und ohne zu schreiben (impls.rs)
-                if let Some(m) = crate::impls::methodenname(name) {
+                if let Some(m) = crate::impls::method_name(name) {
                     let et = args.first().and_then(|a| self.probe_d(a, d + 1))?;
                     // HOOK iface: auf einem `dyn I` steht der Typ in der
                     // Schnittstelle, nicht in der Funktionstabelle (iface.rs)
-                    if let Some(iname) = crate::impls::dyn_schnittstelle(&self.tcx, &et) {
-                        return crate::iface::ret_von(&iname, m);
+                    if let Some(iname) = crate::impls::dyn_interface(&self.tcx, &et) {
+                        return crate::iface::ret_of(&iname, m);
                     }
-                    let (voll, _) = crate::impls::ziel_von(&self.tcx, &self.fns, m, &et)?;
-                    return self.fns.get(&voll).map(|s| s.ret.clone());
+                    let (full, _) = crate::impls::target_of(&self.tcx, &self.fns, m, &et)?;
+                    return self.fns.get(&full).map(|s| s.ret.clone());
                 }
                 // HOOK sizeof: `size_of[T]()` ist immer `usize` — ohne das
                 // bekommt ein Literal daneben keinen Typ (`size_of[u8]() != 1`)
-                if crate::sizeof::wert(name).is_some() || name.starts_with("size_of$") {
+                if crate::sizeof::value(name).is_some() || name.starts_with("size_of$") {
                     return Some(Type::Usize);
                 }
                 // HOOK gc: Typ von `weak(g)`, `stark(w)` und `x.as?[C]` OHNE
                 // Pruefung, damit ein Literal daneben seinen Typ bekommt (gc.rs)
                 let arg0 = args.first().and_then(|a| self.probe_d(a, d + 1));
-                if let Some(t) = crate::gc::probe_typ(name, arg0.as_ref()) {
+                if let Some(t) = crate::gc::probe_ty(name, arg0.as_ref()) {
                     return Some(t);
                 }
                 self.fns.get(name).map(|s| s.ret.clone())
@@ -1731,7 +1731,7 @@ impl<'a> Checker<'a> {
     fn resolve_ty_d(&mut self, te: &TypeExpr, d: u32) -> Type {
         if d >= MAX_DEPTH {
             self.dg
-                .error(te.span(), "typ ist zu tief verschachtelt (mehr als 200 ebenen)");
+                .error(te.span(), "type is nested too deeply (more than 200 levels)");
             return Type::Error;
         }
         // HOOK fehlerunionen: Fehlerunion `E!T` (errors.rs)
@@ -1753,7 +1753,7 @@ impl<'a> Checker<'a> {
                 None => match self.tcx.lookup(name) {
                     Some(i) => Type::Struct(i),
                     None => {
-                        self.dg.error(*span, format!("unbekannter typ '{}'", name));
+                        self.dg.error(*span, format!("unknown type '{}'", name));
                         Type::Error
                     }
                 },
@@ -1771,7 +1771,7 @@ impl<'a> Checker<'a> {
                     return Type::Error;
                 }
                 if *len == 0 {
-                    self.dg.error(*span, "arraylaenge muss groesser als null sein");
+                    self.dg.error(*span, "array length must be greater than zero");
                     return Type::Error;
                 }
                 Type::Array(Box::new(t), *len)
@@ -1804,7 +1804,7 @@ impl<'a> Checker<'a> {
     fn eval_const_d(&self, e: &Expr, d: u32) -> Result<i128, (Span, String)> {
         let nope = |msg: &str| Err((e.span, msg.to_string()));
         if d >= MAX_DEPTH {
-            return nope("konstanter ausdruck ist zu tief verschachtelt");
+            return nope("constant expression is nested too deeply");
         }
         match &e.kind {
             ExprKind::Int(v) => Ok(*v),
@@ -1813,7 +1813,7 @@ impl<'a> Checker<'a> {
                 Some((_, v)) => Ok(*v),
                 None => Err((
                     e.span,
-                    format!("'{}' ist keine bereits deklarierte konstante", n),
+                    format!("'{}' is not an already declared constant", n),
                 )),
             },
             ExprKind::Unary(op, inner) => {
@@ -1821,7 +1821,7 @@ impl<'a> Checker<'a> {
                 match op {
                     UnOp::Neg => Ok(-v),
                     UnOp::Not => Ok(if v == 0 { 1 } else { 0 }),
-                    _ => nope("konstanter ausdruck darf keine zeiger benutzen"),
+                    _ => nope("a constant expression must not use pointers"),
                 }
             }
             ExprKind::Binary(op, l, r) => {
@@ -1847,7 +1847,7 @@ impl<'a> Checker<'a> {
                         if b == 0 {
                             return Err((
                                 e.span,
-                                "division durch null im konstanten ausdruck".to_string(),
+                                "division by zero in the constant expression".to_string(),
                             ));
                         }
                         if *op == BinOp::Div {
@@ -1863,7 +1863,7 @@ impl<'a> Checker<'a> {
                         if !(0..128).contains(&b) {
                             return Err((
                                 e.span,
-                                "verschiebeweite im konstanten ausdruck ist zu gross".to_string(),
+                                "shift amount in the constant expression is too large".to_string(),
                             ));
                         }
                         a << b
@@ -1872,7 +1872,7 @@ impl<'a> Checker<'a> {
                         if !(0..128).contains(&b) {
                             return Err((
                                 e.span,
-                                "verschiebeweite im konstanten ausdruck ist zu gross".to_string(),
+                                "shift amount in the constant expression is too large".to_string(),
                             ));
                         }
                         if signed {
@@ -1908,7 +1908,7 @@ impl<'a> Checker<'a> {
                     return Ok(bit(v != 0));
                 }
                 if dst.is_ptr() {
-                    return nope("zeiger sind im konstanten ausdruck nicht erlaubt");
+                    return nope("pointers are not allowed in a constant expression");
                 }
                 Ok(wrap(v, &dst))
             }
@@ -1917,21 +1917,21 @@ impl<'a> Checker<'a> {
             // Damit sind Tabellengroessen und Kennzahlen berechenbar, statt sie
             // von Hand auszurechnen und als Literal hinzuschreiben.
             ExprKind::Call(name, args, _) => {
-                let mut werte = Vec::with_capacity(args.len());
+                let mut values = Vec::with_capacity(args.len());
                 for a in args {
-                    werte.push(self.eval_const_d(a, d + 1)?);
+                    values.push(self.eval_const_d(a, d + 1)?);
                 }
                 let prog = match self.prog {
                     // SICHER: gesetzt in `run`/`add_items_inner`, gilt fuer die
                     // Dauer dieses Durchgangs.
                     Some(p) => unsafe { &*p },
-                    None => return nope("comptime: das programm steht hier nicht zur verfuegung"),
+                    None => return nope("comptime: the program is not available here"),
                 };
-                let mut lauf =
-                    crate::comptime::Ausfuehrung::neu(prog, &self.consts, &self.expr_types);
-                lauf.ruf_auf(name, &werte, e.span, 0)
+                let mut run =
+                    crate::comptime::Execution::new(prog, &self.consts, &self.expr_types);
+                run.call_on(name, &values, e.span, 0)
             }
-            _ => nope("konstanter ausdruck muss zur uebersetzungszeit auswertbar sein (nur literale, konstanten, operatoren und aufrufe)"),
+            _ => nope("a constant expression must be evaluable at compile time (only literals, constants, operators and calls)"),
         }
     }
 }
@@ -2015,7 +2015,7 @@ fn assignable(got: &Type, want: &Type) -> bool {
     // HOOK gc: kostenlose Aufwaertsumwandlung `Gc[Abgeleitet]` -> `Gc[Basis]`
     // (gc.rs, SPEC 4.4). NUR diese Richtung; abwaerts geht ausschliesslich
     // ueber das gepruefte `x.as?[C]`.
-    if crate::gc::ist_aufwaerts(got, want) {
+    if crate::gc::is_upward(got, want) {
         return true;
     }
     compatible(got, want)
@@ -2154,129 +2154,129 @@ mod tests {
     // ------------------------------------------------------------------
 
     /// Baut einen Pruefer im Zustand *nach* dem ersten Durchlauf.
-    fn checker_nach_erstem_lauf<'d>(
+    fn checker_after_first_run<'d>(
         dg: &'d mut Diags,
-        erstes: &Program,
+        first: &Program,
     ) -> Checker<'d> {
         let mut ck = Checker {
             dg,
             tcx: TypeCtx::new(),
             fns: HashMap::new(),
             consts: HashMap::new(),
-            expr_types: vec![Type::Error; erstes.expr_count as usize],
+            expr_types: vec![Type::Error; first.expr_count as usize],
             scopes: Vec::new(),
             ret: Type::Void,
             depth: 0,
             must_consume_fns: HashSet::new(),
             prog: None,
         };
-        ck.run(erstes);
+        ck.run(first);
         ck
     }
 
     #[test]
-    fn pruefphasen_nehmen_nachtraeglich_erzeugte_elemente_an() {
+    fn check_phases_take_later_generated_elems_an() {
         // Erster Durchlauf: nur `main` und `basis`.
         let mut b = B::new();
-        let ret_basis = b.int(7);
-        let basis = FnDecl {
-            name: "basis".to_string(),
+        let ret_base = b.int(7);
+        let base = FnDecl {
+            name: "base".to_string(),
             params: Vec::new(),
             ret: Some(named("i32")),
-            body: blk(vec![Stmt::Return { value: Some(ret_basis), span: sp() }]),
+            body: blk(vec![Stmt::Return { value: Some(ret_base), span: sp() }]),
             span: sp(),
             attrs: Vec::new(),
         };
         let ret_main = b.int(0);
-        let erstes = Program {
-            funcs: vec![basis, main_fn(vec![Stmt::Return { value: Some(ret_main), span: sp() }])],
+        let first = Program {
+            funcs: vec![base, main_fn(vec![Stmt::Return { value: Some(ret_main), span: sp() }])],
             expr_count: b.next,
             ..Default::default()
         };
 
         let mut dg = Diags::new("test.fi", "");
-        let mut ck = checker_nach_erstem_lauf(&mut dg, &erstes);
-        assert!(!ck.dg.has_errors(), "erster Durchlauf muss fehlerfrei sein");
-        assert!(ck.fns.contains_key("basis"));
-        assert!(!ck.fns.contains_key("spaeter"));
+        let mut ck = checker_after_first_run(&mut dg, &first);
+        assert!(!ck.dg.has_errors(), "first run must be free of errors");
+        assert!(ck.fns.contains_key("base"));
+        assert!(!ck.fns.contains_key("later"));
 
         // Zweiter Durchlauf: eine Funktion, die es beim ersten Mal noch nicht
         // gab und die auf eine Funktion des ersten Durchlaufs zugreift.
         // Genau das muss `comptime emit` spaeter tun.
-        let ruf = b.e(ExprKind::Call("basis".to_string(), Vec::new(), sp()));
-        let nachtrag = Program {
+        let call = b.e(ExprKind::Call("base".to_string(), Vec::new(), sp()));
+        let addendum = Program {
             funcs: vec![FnDecl {
-                name: "spaeter".to_string(),
+                name: "later".to_string(),
                 params: Vec::new(),
                 ret: Some(named("i32")),
-                body: blk(vec![Stmt::Return { value: Some(ruf), span: sp() }]),
+                body: blk(vec![Stmt::Return { value: Some(call), span: sp() }]),
                 span: sp(),
                 attrs: Vec::new(),
             }],
             expr_count: b.next,
             ..Default::default()
         };
-        ck.add_items(&nachtrag);
+        ck.add_items(&addendum);
 
-        assert!(!ck.dg.has_errors(), "Nachtrag muss fehlerfrei durchlaufen");
-        assert!(ck.fns.contains_key("spaeter"), "die neue Funktion fehlt");
+        assert!(!ck.dg.has_errors(), "addendum must run through without errors");
+        assert!(ck.fns.contains_key("later"), "the new function is missing");
         // Der Aufruf hat wirklich einen Typ bekommen — die Tabelle ist mitgewachsen.
         assert_eq!(ck.expr_types.len(), b.next as usize);
-        assert_eq!(ck.fns["spaeter"].ret, Type::I32);
+        assert_eq!(ck.fns["later"].ret, Type::I32);
     }
 
     #[test]
-    fn nachtrag_wird_genauso_streng_geprueft() {
+    fn addendum_becomes_likewise_strict_checked() {
         let mut b = B::new();
         let ret_main = b.int(0);
-        let erstes = Program {
+        let first = Program {
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(ret_main), span: sp() }])],
             expr_count: b.next,
             ..Default::default()
         };
         let mut dg = Diags::new("test.fi", "");
-        let mut ck = checker_nach_erstem_lauf(&mut dg, &erstes);
+        let mut ck = checker_after_first_run(&mut dg, &first);
         assert!(!ck.dg.has_errors());
 
         // Nachtrag ruft etwas auf, das es nicht gibt -> derselbe Fehler wie im
         // ersten Durchlauf. Ein Nachtrag darf keine Hintertuer sein.
-        let ruf = b.e(ExprKind::Call("gibt_es_nicht".to_string(), Vec::new(), sp()));
-        let nachtrag = Program {
+        let call = b.e(ExprKind::Call("does_not_exist".to_string(), Vec::new(), sp()));
+        let addendum = Program {
             funcs: vec![FnDecl {
-                name: "kaputt".to_string(),
+                name: "broken".to_string(),
                 params: Vec::new(),
                 ret: Some(named("i32")),
-                body: blk(vec![Stmt::Return { value: Some(ruf), span: sp() }]),
+                body: blk(vec![Stmt::Return { value: Some(call), span: sp() }]),
                 span: sp(),
                 attrs: Vec::new(),
             }],
             expr_count: b.next,
             ..Default::default()
         };
-        ck.add_items(&nachtrag);
-        assert!(ck.dg.has_errors(), "unbekannter Name im Nachtrag muss auffallen");
+        ck.add_items(&addendum);
+        assert!(ck.dg.has_errors(), "unknown name in the addendum must be noticed");
     }
 
     #[test]
-    fn nachtrag_meldet_doppelte_deklaration() {
+    fn addendum_reports_duplicate_decl() {
         let mut b = B::new();
         let ret_main = b.int(0);
-        let erstes = Program {
+        let first = Program {
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(ret_main), span: sp() }])],
             expr_count: b.next,
             ..Default::default()
         };
         let mut dg = Diags::new("test.fi", "");
-        let mut ck = checker_nach_erstem_lauf(&mut dg, &erstes);
+        let mut ck = checker_after_first_run(&mut dg, &first);
 
         let ret2 = b.int(1);
-        let nachtrag = Program {
+        let addendum = Program {
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(ret2), span: sp() }])],
             expr_count: b.next,
             ..Default::default()
         };
-        ck.add_items(&nachtrag);
-        assert!(ck.dg.has_errors(), "'main' zweimal muss ein Fehler sein");
+        ck.add_items(&addendum);
+        assert!(ck.dg.has_errors(), "'main' twice must be an error");
     }
 
     fn named(n: &str) -> TypeExpr {
@@ -2314,16 +2314,16 @@ mod tests {
             imports: Vec::new(),
             exports: Vec::new(),
             expr_count: b.next,
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
         }
     }
 
     fn expect_err(prog: Program, needle: &str) {
         let (info, out) = run(prog, "");
-        assert!(info.is_none(), "erwarteter fehler '{}' blieb aus", needle);
+        assert!(info.is_none(), "expected error '{}' did not appear", needle);
         assert!(
             out.contains(needle),
-            "meldung '{}' fehlt in:\n{}",
+            "message '{}' is missing in:\n{}",
             needle,
             out
         );
@@ -2349,11 +2349,11 @@ mod tests {
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(ret), span: sp() }])],
             structs: vec![sd],
             consts: Vec::new(),
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
         let (info, out) = run(prog, "");
-        let info = info.unwrap_or_else(|| panic!("layout-programm fehlerhaft:\n{}", out));
+        let info = info.unwrap_or_else(|| panic!("layout program faulty:\n{}", out));
         let s = &info.tcx.structs[0];
         (s.fields.iter().map(|f| f.offset).collect(), s.size, s.align)
     }
@@ -2403,11 +2403,11 @@ mod tests {
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(ret), span: sp() }])],
             structs: vec![sd],
             consts: Vec::new(),
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
         let (info, out) = run(prog, "");
-        let info = info.unwrap_or_else(|| panic!("fehler:\n{}", out));
+        let info = info.unwrap_or_else(|| panic!("error:\n{}", out));
         let s = &info.tcx.structs[0];
         assert_eq!(s.fields[0].offset, 0);
         assert_eq!(s.fields[1].offset, 8);
@@ -2444,11 +2444,11 @@ mod tests {
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(ret), span: sp() }])],
             structs: vec![outer, inner],
             consts: Vec::new(),
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
         let (info, out) = run(prog, "");
-        let info = info.unwrap_or_else(|| panic!("fehler:\n{}", out));
+        let info = info.unwrap_or_else(|| panic!("error:\n{}", out));
         let o = &info.tcx.structs[0];
         assert_eq!(o.fields[0].offset, 0);
         assert_eq!(o.fields[1].offset, 4);
@@ -2477,10 +2477,10 @@ mod tests {
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(ret), span: sp() }])],
             structs: vec![a, bs],
             consts: Vec::new(),
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
-        expect_err(prog, "enthaelt sich selbst");
+        expect_err(prog, "contains itself");
     }
 
     // ---- je ein Fehlerfall pro Pruefung -----------------------------------
@@ -2509,13 +2509,13 @@ mod tests {
             imports: Vec::new(),
             exports: Vec::new(),
             expr_count: b.next,
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
         };
         let (info, out) = run(prog, "");
-        let info = info.unwrap_or_else(|| panic!("unerwarteter fehler:\n{}", out));
+        let info = info.unwrap_or_else(|| panic!("unexpected error:\n{}", out));
         assert_eq!(info.expr_types.len(), 4);
         for t in &info.expr_types {
-            assert!(!t.is_error() && *t != Type::UntypedInt, "typ {:?}", t);
+            assert!(!t.is_error() && *t != Type::UntypedInt, "type {:?}", t);
         }
         assert_eq!(info.expr_types[0], Type::I32);
     }
@@ -2541,10 +2541,10 @@ mod tests {
             ])],
             structs: Vec::new(),
             consts: Vec::new(),
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
-        expect_err(prog, "typ des ganzzahlliterals ist nicht ableitbar");
+        expect_err(prog, "the type of the integer literal cannot be inferred");
     }
 
     #[test]
@@ -2552,7 +2552,7 @@ mod tests {
         let mut b = B::new();
         let x = b.id("nix");
         let prog = prog_with(&mut b, x);
-        expect_err(prog, "unbekannter name 'nix'");
+        expect_err(prog, "unknown name 'nix'");
     }
 
     #[test]
@@ -2579,10 +2579,10 @@ mod tests {
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(call), span: sp() }]), f],
             structs: Vec::new(),
             consts: Vec::new(),
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
-        expect_err(prog, "erwartet 2 argument(e), gefunden 1");
+        expect_err(prog, "expects 2 argument(s), found 1");
     }
 
     #[test]
@@ -2594,10 +2594,10 @@ mod tests {
             funcs: vec![main_fn(Vec::new())],
             structs: Vec::new(),
             consts: Vec::new(),
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
             expr_count: 0,
         };
-        expect_err(prog, "erreicht das ende ohne 'return'");
+        expect_err(prog, "reaches the end without 'return'");
     }
 
     #[test]
@@ -2624,10 +2624,10 @@ mod tests {
             ])],
             structs: Vec::new(),
             consts: Vec::new(),
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
-        expect_err(prog, "mit 'let' gebunden");
+        expect_err(prog, "bound with 'let'");
     }
 
     #[test]
@@ -2653,10 +2653,10 @@ mod tests {
             ])],
             structs: Vec::new(),
             consts: Vec::new(),
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
-        expect_err(prog, "index auf nicht-array-typ i32");
+        expect_err(prog, "index on the non-array type i32");
     }
 
     #[test]
@@ -2681,10 +2681,10 @@ mod tests {
             ])],
             structs: Vec::new(),
             consts: Vec::new(),
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
-        expect_err(prog, "feldzugriff auf nicht-struct-typ i32");
+        expect_err(prog, "field access on the non-struct type i32");
     }
 
     #[test]
@@ -2709,10 +2709,10 @@ mod tests {
             ])],
             structs: Vec::new(),
             consts: Vec::new(),
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
-        expect_err(prog, "dereferenzierung erwartet einen zeiger");
+        expect_err(prog, "dereference expects a pointer");
     }
 
     #[test]
@@ -2730,10 +2730,10 @@ mod tests {
             ])],
             structs: Vec::new(),
             consts: Vec::new(),
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
-        expect_err(prog, "wahrheitswert vom typ bool erwartet");
+        expect_err(prog, "a truth value of type bool is expected here");
     }
 
     #[test]
@@ -2755,16 +2755,16 @@ mod tests {
             ])],
             structs: Vec::new(),
             consts: Vec::new(),
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
-        expect_err(prog, "desselben ganzzahltyps, gefunden i32 und i64");
+        expect_err(prog, "of the same integer type, found i32 and i64");
     }
 
     #[test]
     /// Runde 2: Aggregate an Funktionsgrenzen sind ERLAUBT (SPEC §14.1 Punkt 1
     /// gestrichen). Der Typpruefer nimmt sie an, `abi.rs` klassifiziert sie.
-    fn aggregate_parameter_ist_erlaubt() {
+    fn aggregate_parameter_is_allowed() {
         let mut b = B::new();
         let ret = b.int(0);
         let f = FnDecl {
@@ -2786,12 +2786,12 @@ mod tests {
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(ret), span: sp() }]), f],
             structs: Vec::new(),
             consts: Vec::new(),
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
         let (info, out) = run(prog, "");
-        let info = info.unwrap_or_else(|| panic!("aggregat-parameter abgelehnt:\n{}", out));
-        let sig = info.fns.get("f").expect("signatur von f");
+        let info = info.unwrap_or_else(|| panic!("aggregate parameter rejected:\n{}", out));
+        let sig = info.fns.get("f").expect("signature of f");
         assert_eq!(sig.params[0], Type::Array(Box::new(Type::I32), 4));
         assert_eq!(
             crate::abi::classify(&sig.params[0], &info.tcx),
@@ -2802,7 +2802,7 @@ mod tests {
     #[test]
     fn missing_main_is_error() {
         let prog = Program::default();
-        expect_err(prog, "keine funktion 'main'");
+        expect_err(prog, "no function 'main'");
     }
 
     #[test]
@@ -2827,10 +2827,10 @@ mod tests {
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(c), span: sp() }])],
             structs: vec![sd],
             consts: Vec::new(),
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
-        expect_err(prog, "umwandlung von P nach i32 ist nicht erlaubt");
+        expect_err(prog, "conversion from P to i32 is not allowed");
     }
 
     #[test]
@@ -2861,10 +2861,10 @@ mod tests {
             ])],
             structs: vec![sd],
             consts: Vec::new(),
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
-        expect_err(prog, "fehlt das feld 'y'");
+        expect_err(prog, "is missing the field 'y'");
     }
 
     #[test]
@@ -2887,10 +2887,10 @@ mod tests {
                 span: sp(),
             }],
             expr_count: b.next,
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
         };
         let (info, out) = run(prog, "");
-        let info = info.unwrap_or_else(|| panic!("fehler:\n{}", out));
+        let info = info.unwrap_or_else(|| panic!("error:\n{}", out));
         assert_eq!(info.consts.get("K"), Some(&(Type::I32, 42)));
     }
 
@@ -2914,9 +2914,9 @@ mod tests {
                 span: sp(),
             }],
             expr_count: b.next,
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
         };
-        expect_err(prog, "division durch null");
+        expect_err(prog, "division by zero");
     }
 
     #[test]
@@ -2942,11 +2942,11 @@ mod tests {
             ])],
             structs: Vec::new(),
             consts: Vec::new(),
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
         let (info, out) = run(prog, "");
-        let info = info.unwrap_or_else(|| panic!("fehler:\n{}", out));
+        let info = info.unwrap_or_else(|| panic!("error:\n{}", out));
         for t in &info.expr_types {
             assert!(!t.is_error());
         }
@@ -2959,7 +2959,7 @@ mod tests {
         let a = b.e(ExprKind::Unary(UnOp::AddrOf, Box::new(lit)));
         let p = b.e(ExprKind::Unary(UnOp::Deref, Box::new(a)));
         let prog = prog_with(&mut b, p);
-        expect_err(prog, "kein zuweisbarer ausdruck");
+        expect_err(prog, "not an assignable expression");
     }
 
     #[test]
@@ -2990,28 +2990,28 @@ mod tests {
             ])],
             structs: Vec::new(),
             consts: Vec::new(),
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
-        expect_err(prog, "index muss vom typ usize sein");
+        expect_err(prog, "index must be of type usize");
     }
 }
 
 /// Findet einen Sprung (`return`/`break`/`continue`), der aus einem
 /// `defer`-Rumpf HERAUSfuehrt. Sprunge innerhalb einer Schleife, die im Rumpf
 /// selbst beginnt, sind erlaubt — sie verlassen den Rumpf nicht.
-pub(crate) fn defer_sprung(s: &Stmt) -> Option<(Span, &'static str)> {
+pub(crate) fn defer_jump(s: &Stmt) -> Option<(Span, &'static str)> {
     match s {
         Stmt::Return { span, .. } => Some((*span, "return")),
         Stmt::Break(span) => Some((*span, "break")),
         Stmt::Continue(span) => Some((*span, "continue")),
-        Stmt::Block(b) => b.stmts.iter().find_map(defer_sprung),
-        Stmt::Defer(inner, _, _) => defer_sprung(inner),
+        Stmt::Block(b) => b.stmts.iter().find_map(defer_jump),
+        Stmt::Defer(inner, _, _) => defer_jump(inner),
         Stmt::If { then, els, .. } => then
             .stmts
             .iter()
-            .find_map(defer_sprung)
-            .or_else(|| els.as_deref().and_then(defer_sprung)),
+            .find_map(defer_jump)
+            .or_else(|| els.as_deref().and_then(defer_jump)),
         // In `while`/`for` duerfen `break`/`continue` stehen: sie gehoeren zu
         // dieser Schleife und verlassen den Rumpf nicht. Ein `return` schon.
         Stmt::While { body, .. } | Stmt::For { body, .. } => {

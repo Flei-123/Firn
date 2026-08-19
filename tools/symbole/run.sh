@@ -18,17 +18,17 @@ melde() { echo "FEHLER: $1"; FEHLER=1; }
 
 # --- Aufbau: zwei Module mit derselben Funktion ---
 cat > "$W/a.fi" <<'EOF'
-export { hilf }
-fn hilf(x: i32) -> i32 { return x + 1 }
+export { help }
+fn help(x: i32) -> i32 { return x + 1 }
 EOF
 cat > "$W/b.fi" <<'EOF'
-export { hilf }
-fn hilf(x: i32) -> i32 { return x + 2 }
+export { help }
+fn help(x: i32) -> i32 { return x + 2 }
 EOF
 cat > "$W/main.fi" <<'EOF'
 import a
 import b
-fn main() -> i32 { return a.hilf(10) + b.hilf(20) }
+fn main() -> i32 { return a.help(10) + b.help(20) }
 EOF
 
 "$FIRNC" -o "$W/prog" "$W/main.fi"
@@ -41,10 +41,10 @@ SYMS=$(nm "$W/prog" | awk '$2 == "T" { print $3 }')
 printf '%s\n' "$SYMS" | grep -qx 'main' || melde "Einstiegspunkt 'main' fehlt oder wurde umbenannt"
 
 # 3. beide Modulfunktionen getrennt vorhanden
-A=$(printf '%s\n' "$SYMS" | grep -c '^_F[0-9]\+\.a__hilf$' || true)
-B=$(printf '%s\n' "$SYMS" | grep -c '^_F[0-9]\+\.b__hilf$' || true)
-[ "$A" -eq 1 ] || melde "Symbol fuer a.hilf fehlt (Praefix/Schema falsch?)"
-[ "$B" -eq 1 ] || melde "Symbol fuer b.hilf fehlt (Praefix/Schema falsch?)"
+A=$(printf '%s\n' "$SYMS" | grep -c '^_F[0-9]\+\.a__help$' || true)
+B=$(printf '%s\n' "$SYMS" | grep -c '^_F[0-9]\+\.b__help$' || true)
+[ "$A" -eq 1 ] || melde "Symbol fuer a.help fehlt (Praefix/Schema falsch?)"
+[ "$B" -eq 1 ] || melde "Symbol fuer b.help fehlt (Praefix/Schema falsch?)"
 
 # 1. keine nackten Firn-Symbole ausser main und den Linker-eigenen
 FREMD=$(printf '%s\n' "$SYMS" \

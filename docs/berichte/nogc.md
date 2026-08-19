@@ -23,7 +23,7 @@ no_gc           fn           0     umgesetzt   kein Sammellauf in diesem Aufrufb
 Die uebrigen Attribute bleiben unveraendert abgelehnt — `constant_time`,
 `unwinds`, `packed`, `align`, `layout`, `no_move`, `abi_stable`, `frozen`,
 `hot` melden weiter „attribut '…' ist in Stufe 0 nicht umgesetzt"
-(`tests/neg/attr_nicht_umgesetzt.fi` unveraendert gruen, zusaetzlich der
+(`tests/neg/attr_not_implemented.fi` unveraendert gruen, zusaetzlich der
 Modultest `attrs::tests::nicht_umgesetzte_attribute_melden_weiter_einen_fehler`).
 Der Test `nur_must_consume_ist_umgesetzt` wurde mitgezogen und verlangt jetzt
 genau `["must_consume", "no_gc"]` — die Klammer, die verhindert, dass ein
@@ -53,7 +53,7 @@ Ebenen und ueber Modulgrenzen hinweg.
   nicht im AST, sondern in der Registrierung von `sema_match.rs`
   (`__match#N`). Ohne den Abstieg dorthin waere jede Zustandsmaschine ein
   blinder Fleck — also genau der Code, fuer den `#[no_gc]` gedacht ist.
-  Nachweis: `tests/neg/nogc_match_fall.fi`.
+  Nachweis: `tests/neg/nogc_match_case.fi`.
 * **Modulqualifizierte Aufrufe.** `modul.funktion` heisst nach der Umschrift
   durch `modules.rs` intern `modul__funktion`; die Meldung zeigt wieder die
   Schreibweise aus dem Quelltext (`nogc_kalt.aufwaendig`).
@@ -77,9 +77,9 @@ Ebenen und ueber Modulgrenzen hinweg.
 ## 2. Negativtests — echte Compilerausgaben
 
 ```
-$ ./compiler/target/release/firnc -o /dev/null tests/neg/nogc_aufruf_ohne_attribut.fi
+$ ./compiler/target/release/firnc -o /dev/null tests/neg/nogc_call_without_attr.fi
 error: 'heiss' ist #[no_gc], ruft aber 'langsam' ohne #[no_gc]
-   --> tests/neg/nogc_aufruf_ohne_attribut.fi:11:12
+   --> tests/neg/nogc_call_without_attr.fi:11:12
     |
  11 |     return langsam(a)
     |            ^^^^^^^ hier
@@ -93,9 +93,9 @@ error: 'mitte' ist #[no_gc], ruft aber 'unten' ohne #[no_gc]
     |                 ^^^^^ hier
     = hinweis: SPEC 3.5.4: die Zusage gilt transitiv fuer den ganzen Aufrufbaum — schreibe #[no_gc] vor 'unten' oder rufe es hier nicht auf
 
-$ ./compiler/target/release/firnc -o /dev/null tests/neg/nogc_match_fall.fi
+$ ./compiler/target/release/firnc -o /dev/null tests/neg/nogc_match_case.fi
 error: 'schritt' ist #[no_gc], ruft aber 'protokoll' ohne #[no_gc]
-   --> tests/neg/nogc_match_fall.fi:17:35
+   --> tests/neg/nogc_match_case.fi:17:35
     |
  17 |         Zustand::Ende => { return protokoll(c) }
     |                                   ^^^^^^^^^ hier
@@ -118,9 +118,9 @@ Stelle, an der die Kette reisst.
 
 | Datei | was sie zeigt | Ergebnis |
 |---|---|---|
-| `tests/540_no_gc_aufrufbaum.fi` | markierter Aufrufbaum ueber vier Ebenen, Schleifen, Verzweigungen; eine unmarkierte Funktion darf eine markierte rufen | `expect_exit: 42` |
+| `tests/540_no_gc_aufruftree.fi` | markierter Aufrufbaum ueber vier Ebenen, Schleifen, Verzweigungen; eine unmarkierte Funktion darf eine markierte rufen | `expect_exit: 42` |
 | `tests/541_no_gc_zustandsmaschine.fi` | `#[no_gc]` + `match` mit vier Faellen, Aufrufe aus den Fallrumpfen heraus | `expect_exit: 99` |
-| `tests/542_no_gc_modul.fi` (+ `tests/modules/nogc_heiss.fi`) | `#[no_gc]` ueber die Modulgrenze | `expect_exit: 100` |
+| `tests/542_no_gc_module.fi` (+ `tests/modules/nogc_hot.fi`) | `#[no_gc]` ueber die Modulgrenze | `expect_exit: 100` |
 
 Alle drei laufen in `test.sh` in **drei** Baustufen (`opt`, `--no-opt`,
 `--opt-level=dev-fast`) mit demselben Ergebnis.
@@ -138,7 +138,7 @@ traegt `#[no_gc]`, einschliesslich `main` des Treibers:
 | `lib/html/tokenizer.fi` | 17 |
 | `lib/html/entities.fi` | 19 |
 | `lib/html/entities_data.fi` | 14 |
-| `lib/html/fehler_codes.fi` | 1 |
+| `lib/html/error_codes.fi` | 1 |
 | `lib/html/tokenize_main.fi` | 3 (mit `main`) |
 | `lib/html/entities_probe.fi` | 4 |
 | `lib/html/entities_ausfall.fi` | 12 |
@@ -215,7 +215,7 @@ test result: ok. 134 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
   `Regeln::echt()`, also `gc.rs` (Test `echte_regeln_sind_die_aus_gc_rs`).
   Sobald `gc.rs` antwortet, greifen (i) und (iii) ohne weitere Aenderung.
   Die beiden fertigen Negativprogramme dafuer liegen in
-  `tests/nogc_wartet_auf_gc/` samt `LIESMICH.md`; sie gehoeren dann
+  `tests/nogc_waits_on_gc/` samt `LIESMICH.md`; sie gehoeren dann
   unveraendert nach `tests/neg/`. Sie stehen bewusst **nicht** schon dort:
   `test.sh` wuerde sie sonst gegen eine Meldung des Parsers pruefen und damit
   etwas anderes belegen, als draufsteht.

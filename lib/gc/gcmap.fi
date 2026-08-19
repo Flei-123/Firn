@@ -33,15 +33,15 @@
 // zweites Feld je Platz — ein Drittel mehr Speicher und ein zweiter
 // Speicherzugriff je Sondierschritt, fuer nichts.
 
-const GCMAP_LEER: u64 = 0
-const GCMAP_GRAB: u64 = 1
+const GCMAP_EMPTY: u64 = 0
+const GCMAP_TOMBSTONE: u64 = 1
 // Anfangskapazitaet in Plaetzen (Zweierpotenz).
 const GCMAP_START: u64 = 8
 
 gc class GcMap {
-    puffer: Gc[GcSlots],
+    buffer: Gc[GcSlots],
     n: u64,
-    tot: u64,
+    dead: u64,
     desc: u64,
 }
 
@@ -59,32 +59,32 @@ fn gcmap_hash(k: u64) -> u64 {
 
 // `k_zeiger`/`w_zeiger`: sind Schluessel bzw. Wert Gc-Zeiger und damit vom
 // Sammler zu verfolgen?
-fn gcmap_neu(k_zeiger: bool, w_zeiger: bool) -> AllocError!Gc[GcMap] {
-    var maske: u64 = 0
-    if k_zeiger {
-        maske = maske + 1
+fn gcmap_new(k_ptr: bool, w_ptr: bool) -> AllocError!Gc[GcMap] {
+    var mask: u64 = 0
+    if k_ptr {
+        mask = mask + 1
     }
-    if w_zeiger {
-        maske = maske + 2
+    if w_ptr {
+        mask = mask + 2
     }
     return try gc GcMap{
-        puffer: gc_null[GcSlots](),
+        buffer: gc_null[GcSlots](),
         n: 0,
-        tot: 0,
-        desc: 2 + (maske * 256),
+        dead: 0,
+        desc: 2 + (mask * 256),
     }
 }
 
-fn gcmap_groesse(m: Gc[GcMap]) -> u64 {
+fn gcmap_size(m: Gc[GcMap]) -> u64 {
     return m.n
 }
 
-fn gcmap_kapazitaet(m: Gc[GcMap]) -> u64 {
-    let s: Gc[GcSlots] = m.puffer
+fn gcmap_capacity(m: Gc[GcMap]) -> u64 {
+    let s: Gc[GcSlots] = m.buffer
     if (s as u64) == 0 {
         return 0
     }
-    return s.kap
+    return s.cap
 }
 
 // Platz von `k` suchen. Liefert entweder den belegten Platz mit diesem
@@ -94,73 +94,73 @@ fn gcmap_kapazitaet(m: Gc[GcMap]) -> u64 {
 // WICHTIG: der ERSTE Grabstein wird gemerkt, aber die Suche laeuft weiter,
 // bis sie den Schluessel oder einen nie belegten Platz findet. Nur so kann
 // ein Eintrag nicht doppelt entstehen, wenn er hinter einem Grabstein liegt.
-fn __gcmap_platz(m: Gc[GcMap], k: u64) -> u64 {
-    let s: Gc[GcSlots] = m.puffer
+fn __gcmap_slot(m: Gc[GcMap], k: u64) -> u64 {
+    let s: Gc[GcSlots] = m.buffer
     if (s as u64) == 0 {
         return 0
     }
-    let kap: u64 = s.kap
-    let maske: u64 = kap - 1
-    let basis: u64 = (s as u64) + SLOT_KOPF
-    var i: u64 = gcmap_hash(k) & maske
-    var grab: u64 = kap
-    var schritte: u64 = 0
-    while schritte < kap {
-        let sk: u64 = __gc_ld64(basis + i * 16)
+    let cap: u64 = s.cap
+    let mask: u64 = cap - 1
+    let base: u64 = (s as u64) + SLOT_HEADER
+    var i: u64 = gcmap_hash(k) & mask
+    var tombstone: u64 = cap
+    var steps: u64 = 0
+    while steps < cap {
+        let sk: u64 = __gc_ld64(base + i * 16)
         if sk == k {
             return i
         }
-        if sk == GCMAP_LEER {
-            if grab < kap {
-                return grab
+        if sk == GCMAP_EMPTY {
+            if tombstone < cap {
+                return tombstone
             }
             return i
         }
-        if sk == GCMAP_GRAB {
-            if grab == kap {
-                grab = i
+        if sk == GCMAP_TOMBSTONE {
+            if tombstone == cap {
+                tombstone = i
             }
         }
-        i = (i + 1) & maske
-        schritte = schritte + 1
+        i = (i + 1) & mask
+        steps = steps + 1
     }
-    if grab < kap {
-        return grab
+    if tombstone < cap {
+        return tombstone
     }
-    return kap
+    return cap
 }
 
 // Neuen Puffer anlegen und alles einstreuen. Wie beim Vektor liegt die
 // Allokation VOR dem Umstreuen: waehrend `__gcslots_neu` kann eine
 // Sammlerscheibe laufen, waehrend des Umstreuens nicht. Die Barriere auf
 // `m.puffer = neu` legt der Compiler.
-fn __gcmap_wachsen(m: Gc[GcMap], neukap: u64) -> AllocError!bool {
-    let alt: Gc[GcSlots] = m.puffer
-    var altkap: u64 = 0
-    if (alt as u64) != 0 {
-        altkap = alt.kap
+fn __gcmap_grow(m: Gc[GcMap], newcap: u64) -> AllocError!bool {
+    let old: Gc[GcSlots] = m.buffer
+    var oldcap: u64 = 0
+    if (old as u64) != 0 {
+        oldcap = old.cap
     }
-    let neu: Gc[GcSlots] = try __gcslots_neu(neukap, m.desc)
-    __gc_st64((neu as u64), neukap)
-    let nbasis: u64 = (neu as u64) + SLOT_KOPF
-    let abasis: u64 = (alt as u64) + SLOT_KOPF
-    let nmaske: u64 = neukap - 1
+    let new: Gc[GcSlots] = try __gcslots_new(newcap, m.desc)
+    __gc_st64((new as u64), newcap)
+    let nbase: u64 = (new as u64) + SLOT_HEADER
+    let abase: u64 = (old as u64) + SLOT_HEADER
+    let nmask: u64 = newcap - 1
     var j: u64 = 0
-    while j < altkap {
-        let sk: u64 = __gc_ld64(abasis + j * 16)
-        if sk != GCMAP_LEER && sk != GCMAP_GRAB {
-            let sw: u64 = __gc_ld64(abasis + j * 16 + 8)
-            var i: u64 = gcmap_hash(sk) & nmaske
-            while __gc_ld64(nbasis + i * 16) != GCMAP_LEER {
-                i = (i + 1) & nmaske
+    while j < oldcap {
+        let sk: u64 = __gc_ld64(abase + j * 16)
+        if sk != GCMAP_EMPTY && sk != GCMAP_TOMBSTONE {
+            let sw: u64 = __gc_ld64(abase + j * 16 + 8)
+            var i: u64 = gcmap_hash(sk) & nmask
+            while __gc_ld64(nbase + i * 16) != GCMAP_EMPTY {
+                i = (i + 1) & nmask
             }
-            __gc_st64(nbasis + i * 16, sk)
-            __gc_st64(nbasis + i * 16 + 8, sw)
+            __gc_st64(nbase + i * 16, sk)
+            __gc_st64(nbase + i * 16 + 8, sw)
         }
         j = j + 1
     }
-    m.tot = 0
-    m.puffer = neu
+    m.dead = 0
+    m.buffer = new
     return true
 }
 
@@ -168,83 +168,83 @@ fn __gcmap_wachsen(m: Gc[GcMap], neukap: u64) -> AllocError!bool {
 // (n im Slot-Puffer = kap), nicht die Zahl der Eintraege: die Plaetze liegen
 // gestreut, nicht dicht. Leere Plaetze tragen 0 und kosten beim Verfolgen
 // einen Vergleich.
-fn gcmap_setzen(m: Gc[GcMap], k: u64, w: u64) -> AllocError!bool {
-    if k == GCMAP_LEER || k == GCMAP_GRAB {
+fn gcmap_set(m: Gc[GcMap], k: u64, w: u64) -> AllocError!bool {
+    if k == GCMAP_EMPTY || k == GCMAP_TOMBSTONE {
         return false
     }
-    var kap: u64 = gcmap_kapazitaet(m)
-    if kap == 0 {
-        if !(try __gcmap_wachsen(m, GCMAP_START)) {
+    var cap: u64 = gcmap_capacity(m)
+    if cap == 0 {
+        if !(try __gcmap_grow(m, GCMAP_START)) {
             return false
         }
-        kap = GCMAP_START
+        cap = GCMAP_START
     }
     // Lastgrenze 3/4, Grabsteine zaehlen mit — sonst laeuft eine Abbildung,
     // in der viel geloescht und wieder eingefuegt wird, in eine volle
     // Sondierkette.
-    if (m.n + m.tot + 1) * 4 > kap * 3 {
-        if !(try __gcmap_wachsen(m, kap * 2)) {
+    if (m.n + m.dead + 1) * 4 > cap * 3 {
+        if !(try __gcmap_grow(m, cap * 2)) {
             return false
         }
-        kap = kap * 2
+        cap = cap * 2
     }
-    let s: Gc[GcSlots] = m.puffer
-    let i: u64 = __gcmap_platz(m, k)
-    if i >= kap {
+    let s: Gc[GcSlots] = m.buffer
+    let i: u64 = __gcmap_slot(m, k)
+    if i >= cap {
         return false
     }
-    let a: u64 = (s as u64) + SLOT_KOPF + i * 16
-    let alt: u64 = __gc_ld64(a)
-    let maske: u64 = s.desc >> 8
-    if alt != k {
-        if alt == GCMAP_GRAB {
-            m.tot = m.tot - 1
+    let a: u64 = (s as u64) + SLOT_HEADER + i * 16
+    let old: u64 = __gc_ld64(a)
+    let mask: u64 = s.desc >> 8
+    if old != k {
+        if old == GCMAP_TOMBSTONE {
+            m.dead = m.dead - 1
         }
         // Einfuegebarriere fuer den SCHLUESSEL (der Compiler kennt den
         // Puffer nicht, also ruft die Bibliothek sie selbst).
-        if (maske & 1) != 0 {
+        if (mask & 1) != 0 {
             __gc_barrier(a as *mut u8, k as *mut u8)
         }
         __gc_st64(a, k)
         m.n = m.n + 1
     }
-    if (maske & 2) != 0 {
+    if (mask & 2) != 0 {
         __gc_barrier((a + 8) as *mut u8, w as *mut u8)
     }
     __gc_st64(a + 8, w)
     return true
 }
 
-fn gcmap_hat(m: Gc[GcMap], k: u64) -> bool {
-    if k == GCMAP_LEER || k == GCMAP_GRAB {
+fn gcmap_has(m: Gc[GcMap], k: u64) -> bool {
+    if k == GCMAP_EMPTY || k == GCMAP_TOMBSTONE {
         return false
     }
-    let kap: u64 = gcmap_kapazitaet(m)
-    if kap == 0 {
+    let cap: u64 = gcmap_capacity(m)
+    if cap == 0 {
         return false
     }
-    let i: u64 = __gcmap_platz(m, k)
-    if i >= kap {
+    let i: u64 = __gcmap_slot(m, k)
+    if i >= cap {
         return false
     }
-    return __gc_ld64((m.puffer as u64) + SLOT_KOPF + i * 16) == k
+    return __gc_ld64((m.buffer as u64) + SLOT_HEADER + i * 16) == k
 }
 
-fn gcmap_holen(m: Gc[GcMap], k: u64, fehlt: u64) -> u64 {
-    if k == GCMAP_LEER || k == GCMAP_GRAB {
-        return fehlt
+fn gcmap_get(m: Gc[GcMap], k: u64, missing: u64) -> u64 {
+    if k == GCMAP_EMPTY || k == GCMAP_TOMBSTONE {
+        return missing
     }
-    let kap: u64 = gcmap_kapazitaet(m)
-    if kap == 0 {
-        return fehlt
+    let cap: u64 = gcmap_capacity(m)
+    if cap == 0 {
+        return missing
     }
-    let i: u64 = __gcmap_platz(m, k)
-    if i >= kap {
-        return fehlt
+    let i: u64 = __gcmap_slot(m, k)
+    if i >= cap {
+        return missing
     }
-    let a: u64 = (m.puffer as u64) + SLOT_KOPF + i * 16
+    let a: u64 = (m.buffer as u64) + SLOT_HEADER + i * 16
     if __gc_ld64(a) != k {
-        return fehlt
+        return missing
     }
     return __gc_ld64(a + 8)
 }
@@ -252,43 +252,43 @@ fn gcmap_holen(m: Gc[GcMap], k: u64, fehlt: u64) -> u64 {
 // Loeschen hinterlaesst einen GRABSTEIN. Schluessel und Wert werden dabei
 // wirklich ueberschrieben — ein geloeschter Eintrag darf sein Objekt nicht
 // weiter am Leben halten, sonst waere die Abbildung ein Leck.
-fn gcmap_entfernen(m: Gc[GcMap], k: u64) -> bool {
-    if k == GCMAP_LEER || k == GCMAP_GRAB {
+fn gcmap_remove(m: Gc[GcMap], k: u64) -> bool {
+    if k == GCMAP_EMPTY || k == GCMAP_TOMBSTONE {
         return false
     }
-    let kap: u64 = gcmap_kapazitaet(m)
-    if kap == 0 {
+    let cap: u64 = gcmap_capacity(m)
+    if cap == 0 {
         return false
     }
-    let i: u64 = __gcmap_platz(m, k)
-    if i >= kap {
+    let i: u64 = __gcmap_slot(m, k)
+    if i >= cap {
         return false
     }
-    let a: u64 = (m.puffer as u64) + SLOT_KOPF + i * 16
+    let a: u64 = (m.buffer as u64) + SLOT_HEADER + i * 16
     if __gc_ld64(a) != k {
         return false
     }
-    __gc_st64(a, GCMAP_GRAB)
+    __gc_st64(a, GCMAP_TOMBSTONE)
     __gc_st64(a + 8, 0)
     m.n = m.n - 1
-    m.tot = m.tot + 1
+    m.dead = m.dead + 1
     return true
 }
 
-fn gcmap_leeren(m: Gc[GcMap]) {
-    let s: Gc[GcSlots] = m.puffer
+fn gcmap_clear(m: Gc[GcMap]) {
+    let s: Gc[GcSlots] = m.buffer
     if (s as u64) == 0 {
         return
     }
-    let basis: u64 = (s as u64) + SLOT_KOPF
-    let worte: u64 = s.kap * 2
+    let base: u64 = (s as u64) + SLOT_HEADER
+    let words: u64 = s.cap * 2
     var i: u64 = 0
-    while i < worte {
-        __gc_st64(basis + i * 8, 0)
+    while i < words {
+        __gc_st64(base + i * 8, 0)
         i = i + 1
     }
     m.n = 0
-    m.tot = 0
+    m.dead = 0
 }
 
 // ------------------------------------------------------------- Durchlauf
@@ -302,38 +302,38 @@ fn gcmap_leeren(m: Gc[GcMap]) {
 //         i = i + 1
 //     }
 
-fn gcmap_platz_belegt(m: Gc[GcMap], i: u64) -> bool {
-    if i >= gcmap_kapazitaet(m) {
+fn gcmap_slot_used(m: Gc[GcMap], i: u64) -> bool {
+    if i >= gcmap_capacity(m) {
         return false
     }
-    let sk: u64 = __gc_ld64((m.puffer as u64) + SLOT_KOPF + i * 16)
-    return sk != GCMAP_LEER && sk != GCMAP_GRAB
+    let sk: u64 = __gc_ld64((m.buffer as u64) + SLOT_HEADER + i * 16)
+    return sk != GCMAP_EMPTY && sk != GCMAP_TOMBSTONE
 }
 
-fn gcmap_platz_schluessel(m: Gc[GcMap], i: u64) -> u64 {
-    if i >= gcmap_kapazitaet(m) {
+fn gcmap_slot_key(m: Gc[GcMap], i: u64) -> u64 {
+    if i >= gcmap_capacity(m) {
         return 0
     }
-    return __gc_ld64((m.puffer as u64) + SLOT_KOPF + i * 16)
+    return __gc_ld64((m.buffer as u64) + SLOT_HEADER + i * 16)
 }
 
-fn gcmap_platz_wert(m: Gc[GcMap], i: u64) -> u64 {
-    if i >= gcmap_kapazitaet(m) {
+fn gcmap_slot_value(m: Gc[GcMap], i: u64) -> u64 {
+    if i >= gcmap_capacity(m) {
         return 0
     }
-    return __gc_ld64((m.puffer as u64) + SLOT_KOPF + i * 16 + 8)
+    return __gc_ld64((m.buffer as u64) + SLOT_HEADER + i * 16 + 8)
 }
 
 // ------------------------------------------------------- Typisierte Sicht
 
-fn gcmap_setzen_wert[V: Any](m: Gc[GcMap], k: u64, w: Gc[V]) -> AllocError!bool {
-    return try gcmap_setzen(m, k, w as u64)
+fn gcmap_set_value[V: Any](m: Gc[GcMap], k: u64, w: Gc[V]) -> AllocError!bool {
+    return try gcmap_set(m, k, w as u64)
 }
 
-fn gcmap_holen_wert[V: Any](m: Gc[GcMap], k: u64) -> Gc[V] {
-    return gcmap_holen(m, k, 0) as Gc[V]
+fn gcmap_get_value[V: Any](m: Gc[GcMap], k: u64) -> Gc[V] {
+    return gcmap_get(m, k, 0) as Gc[V]
 }
 
-fn gcmap_platz_wert_als[V: Any](m: Gc[GcMap], i: u64) -> Gc[V] {
-    return gcmap_platz_wert(m, i) as Gc[V]
+fn gcmap_slot_value_as[V: Any](m: Gc[GcMap], i: u64) -> Gc[V] {
+    return gcmap_slot_value(m, i) as Gc[V]
 }

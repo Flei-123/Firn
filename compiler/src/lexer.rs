@@ -95,13 +95,13 @@ pub enum TokKind {
 }
 
 impl TokKind {
-    /// Beschreibung fuer Fehlermeldungen ("erwartet ')' ...").
+    /// Beschreibung fuer Fehlermeldungen ("expected ')' ...").
     pub fn text(&self) -> String {
         match self {
             TokKind::Int(v) => format!("{}", v),
             TokKind::Float(bits) => format!("{}", f64::from_bits(*bits)),
             TokKind::Ident(s) => s.clone(),
-            TokKind::Str(k, v) => format!("{}\"…\" ({} elemente)", k.prefix(), v.len()),
+            TokKind::Str(k, v) => format!("{}\"…\" ({} elements)", k.prefix(), v.len()),
             TokKind::FStr(_) => "f\"…\" (interpolation)".into(),
             TokKind::KwFn => "fn".into(),
             TokKind::KwLet => "let".into(),
@@ -167,7 +167,7 @@ impl TokKind {
             TokKind::Le => "<=".into(),
             TokKind::Gt => ">".into(),
             TokKind::Ge => ">=".into(),
-            TokKind::Eof => "Dateiende".into(),
+            TokKind::Eof => "end of file".into(),
         }
     }
 }
@@ -286,7 +286,7 @@ impl<'a> Lexer<'a> {
                             None => {
                                 self.dg.error(
                                     self.sp(sl, sc, 2),
-                                    "blockkommentar wird nicht geschlossen ('*/' fehlt)",
+                                    "block comment is not closed ('*/' missing)",
                                 );
                                 break;
                             }
@@ -314,8 +314,8 @@ impl<'a> Lexer<'a> {
     /// Zahl ab der aktuellen Position (Dezimal, 0x, 0b, '_' als Trenner).
     /// Rest eines Gleitkommaliterals ab dem Punkt bzw. dem Exponenten.
     /// `vorne` sind die bereits gelesenen Vorkommaziffern (ohne `_`).
-    fn float_rest(&mut self, line: u32, col: u32, mut ncols: u32, vorne: String) {
-        let mut text = vorne;
+    fn float_rest(&mut self, line: u32, col: u32, mut ncols: u32, front: String) {
+        let mut text = front;
         if self.peek() == Some('.') {
             text.push('.');
             self.bump();
@@ -345,7 +345,7 @@ impl<'a> Lexer<'a> {
                 self.bump();
                 ncols += 1;
             }
-            let mut ziffern = 0;
+            let mut digits = 0;
             while let Some(c) = self.peek() {
                 if c == '_' {
                     self.bump();
@@ -356,14 +356,14 @@ impl<'a> Lexer<'a> {
                     break;
                 }
                 text.push(c);
-                ziffern += 1;
+                digits += 1;
                 self.bump();
                 ncols += 1;
             }
-            if ziffern == 0 {
+            if digits == 0 {
                 self.dg.error(
                     self.sp(line, col, ncols.max(1)),
-                    "gleitkommaliteral: nach 'e' fehlen die ziffern des exponenten",
+                    "floating point literal: the digits of the exponent are missing after 'e'",
                 );
                 self.push(TokKind::Float(0), line, col, ncols.max(1));
                 return;
@@ -427,11 +427,11 @@ impl<'a> Lexer<'a> {
         // eine ZIFFER folgt — `0..10` bleibt der Bereich einer `for`-Schleife
         // und wird nicht als `0.` gelesen.
         if radix == 10 && bad_digit.is_none() && !digits.is_empty() {
-            let punkt = self.peek() == Some('.') && self.peek2().map(|c| c.is_ascii_digit()) == Some(true);
+            let dot = self.peek() == Some('.') && self.peek2().map(|c| c.is_ascii_digit()) == Some(true);
             let expo = matches!(self.peek(), Some('e') | Some('E'))
                 && (self.peek2().map(|c| c.is_ascii_digit()) == Some(true)
                     || matches!(self.peek2(), Some('+') | Some('-')));
-            if punkt || expo {
+            if dot || expo {
                 return self.float_rest(line, col, ncols, digits);
             }
         }
@@ -439,7 +439,7 @@ impl<'a> Lexer<'a> {
         if let Some((c, bl, bc)) = bad_digit {
             self.dg.error(
                 self.sp(bl, bc, 1),
-                format!("ungueltiges zeichen '{}' in einem ganzzahlliteral zur basis {}", c, radix),
+                format!("invalid character '{}' in an integer literal to base {}", c, radix),
             );
             self.push(TokKind::Int(0), line, col, len);
             return;
@@ -447,7 +447,7 @@ impl<'a> Lexer<'a> {
         if digits.is_empty() {
             self.dg.error(
                 self.sp(line, col, len),
-                format!("ganzzahlliteral ohne ziffern (basis {})", radix),
+                format!("integer literal without digits (base {})", radix),
             );
             self.push(TokKind::Int(0), line, col, len);
             return;
@@ -463,7 +463,7 @@ impl<'a> Lexer<'a> {
                 _ => {
                     self.dg.error(
                         self.sp(line, col, len),
-                        "ganzzahlliteral ist zu gross (mehr als 64 bit)",
+                        "integer literal is too large (more than 64 bit)",
                     );
                     self.push(TokKind::Int(0), line, col, len);
                     return;
@@ -553,48 +553,48 @@ impl<'a> Lexer<'a> {
     fn string_literal(&mut self) -> bool {
         let (line, col) = (self.line, self.col);
         // ZUERST die Interpolation: `f"` ist sonst Bezeichner + Literal.
-        if let Some((res, verbraucht)) = crate::strings::lex_fstring_literal(&self.chars, self.pos) {
-            for _ in 0..verbraucht {
+        if let Some((res, consumed)) = crate::strings::lex_fstring_literal(&self.chars, self.pos) {
+            for _ in 0..consumed {
                 self.bump();
             }
             match res {
-                Ok(roh) => self.push(TokKind::FStr(roh), line, col, verbraucht as u32),
+                Ok(raw) => self.push(TokKind::FStr(raw), line, col, consumed as u32),
                 Err(e) => {
                     self.dg.error(
                         self.sp(line, col + e.off, 1),
-                        format!("in einem zeichenkettenliteral: {}", e.msg),
+                        format!("in a string literal: {}", e.msg),
                     );
                     // Weiterlexen mit leerem Rumpf — wie bei den anderen Literalen.
-                    self.push(TokKind::FStr(String::new()), line, col, verbraucht as u32);
+                    self.push(TokKind::FStr(String::new()), line, col, consumed as u32);
                 }
             }
             return true;
         }
-        let (kind, res, verbraucht) =
+        let (kind, res, consumed) =
             match crate::strings::lex_string_literal(&self.chars, self.pos) {
                 Some(x) => x,
                 None => return false,
             };
-        for _ in 0..verbraucht {
+        for _ in 0..consumed {
             self.bump();
         }
         match res {
-            Ok(val) => self.push(TokKind::Str(kind, val), line, col, verbraucht as u32),
+            Ok(val) => self.push(TokKind::Str(kind, val), line, col, consumed as u32),
             Err(e) => {
                 // Die Spalte des Fehlers liegt `e.off` Zeichen hinter dem Anfang.
                 self.dg.error(
                     self.sp(line, col + e.off, 1),
-                    format!("in einem zeichenkettenliteral: {}", e.msg),
+                    format!("in a string literal: {}", e.msg),
                 );
                 // Weiterlexen mit einem leeren Literal, damit Folgefehler
                 // nicht auf eine kaputte Tokenfolge zurueckgehen.
-                let leer = match kind {
+                let empty = match kind {
                     crate::strings::LitKind::Str16 => {
                         crate::strings::LitValue::Units(Vec::new())
                     }
                     _ => crate::strings::LitValue::Octets(Vec::new()),
                 };
-                self.push(TokKind::Str(kind, leer), line, col, verbraucht as u32);
+                self.push(TokKind::Str(kind, empty), line, col, consumed as u32);
             }
         }
         true
@@ -618,7 +618,7 @@ impl<'a> Lexer<'a> {
                 let (line, col) = (self.line, self.col);
                 self.dg.error(
                     self.sp(line, col, 1),
-                    format!("unbekanntes zeichen '{}' im quelltext", c),
+                    format!("unknown character '{}' in the source text", c),
                 );
                 // Weiterlexen: das stoerende Zeichen wird uebersprungen.
                 self.bump();
@@ -659,7 +659,7 @@ mod tests {
     }
 
     #[test]
-    fn zahlen_und_trenner() {
+    fn numbers_and_sep() {
         let (k, n) = kinds("1_000 0xFF 0b1010 0");
         assert_eq!(n, 0);
         assert_eq!(
@@ -675,7 +675,7 @@ mod tests {
     }
 
     #[test]
-    fn operatoren_maximal_lang() {
+    fn operators_max_long() {
         let (k, n) = kinds("<< <= < >> >= > && & || | == = != ! ->");
         assert_eq!(n, 0);
         assert_eq!(k[0], TokKind::Shl);
@@ -689,14 +689,14 @@ mod tests {
     }
 
     #[test]
-    fn kommentare_verschachtelt() {
-        let (k, n) = kinds("1 /* a /* b */ c */ 2 // weg\n3");
+    fn comments_nested() {
+        let (k, n) = kinds("1 /* a /* b */ c */ 2 // gone\n3");
         assert_eq!(n, 0);
         assert_eq!(k, vec![TokKind::Int(1), TokKind::Int(2), TokKind::Int(3), TokKind::Eof]);
     }
 
     #[test]
-    fn positionen_sind_zeichenbasiert() {
+    fn positions_are_char_based() {
         let src = "let a\n  bb = 1";
         let mut dg = Diags::new("test", src);
         let toks = lex(src, &mut dg);
@@ -705,21 +705,21 @@ mod tests {
     }
 
     #[test]
-    fn fehler_dann_weiterlexen() {
+    fn error_then_relex() {
         let (k, n) = kinds("1 § 2");
         assert_eq!(n, 1);
         assert_eq!(k, vec![TokKind::Int(1), TokKind::Int(2), TokKind::Eof]);
     }
 
     #[test]
-    fn offener_blockkommentar_meldet_und_endet() {
-        let (k, n) = kinds("1 /* offen");
+    fn open_block_comment_reports_and_ends() {
+        let (k, n) = kinds("1 /* open");
         assert_eq!(n, 1);
         assert_eq!(k, vec![TokKind::Int(1), TokKind::Eof]);
     }
 
     #[test]
-    fn zu_grosse_zahl() {
+    fn too_big_number() {
         let (_, n) = kinds("99999999999999999999999999");
         assert_eq!(n, 1);
     }

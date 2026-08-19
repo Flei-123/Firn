@@ -10,7 +10,7 @@ Ergebnis vorweg, alles selbst gemessen:
 | | Basis (a492d26) | Runde 47 |
 |---|---|---|
 | längste Unterbrechung, **Rechenzeit**, Median aus 7 Läufen | 469 µs | **460 µs** |
-| Durchsatz `aufbau.fi` (Zyklen in 5 s, Median) | 554 000 | **554 000** |
+| Durchsatz `build.fi` (Zyklen in 5 s, Median) | 554 000 | **554 000** |
 | Unterbrechungen über 1 ms in Rechenzeit (150-s-Lauf mit Finalisierern) | — | **0** von 253 698 |
 | RSS über 140 s Dauerbetrieb mit 48 Mio. Finalisierern | — | **1372 KiB, driftfrei** |
 | `test.sh` | 696/696 | **727/727** |
@@ -131,7 +131,7 @@ in diesem Lauf stirbt, wird auf den leeren Verweis gesetzt. Die Entscheidung
 fällt über die **Marke** (weiß = tot), nicht über die Seriennummer — deshalb
 ist sie unabhängig davon, ob der Zielblock schon gefegt wurde.
 
-`tests/822_gc_weak_genullt.fi` sieht sich das **Rohwort** des Feldes an und
+`tests/822_gc_weak_zeroed.fi` sieht sich das **Rohwort** des Feldes an und
 verlangt, dass es nach dem Sammellauf 0 ist.
 
 **Was das nicht kann, offen benannt:** ein `GcWeak[T]` in einer *lokalen
@@ -155,14 +155,14 @@ __atomar_addieren(p: *mut u64, delta: u64) -> u64    // liefert den ALTEN Wert
 
 → `lock xadd qword ptr [rcx], rax`, eine Instruktion. Erniedrigen ist die
 Addition des Zweierkomplements; ein eigenes Primitiv dafür wäre Ballast.
-Gebaut in **beiden** Compilern (`compiler/src/atomar.rs`, `Op::AtomicAdd`;
+Gebaut in **beiden** Compilern (`compiler/src/atomic.rs`, `Op::AtomicAdd`;
 `lib/firnc1/{fir,sema,lower,codegen}.fi`, `O_ATOMADD`), FIR-Text oktettgleich.
 
 ### 3.2 Kein „fadensicher" ohne Beleg
 
 Firn hat in Stufe 0 **keine Fäden** (`SPEC` §7). Ein Wettrennen lässt sich
 also nicht herbeiführen, und die Behauptung „fadensicher" wäre ungedeckt.
-Belegt wird deshalb das, was belegbar ist — `tools/atomar/run.sh`, als
+Belegt wird deshalb das, was belegbar ist — `tools/atomic/run.sh`, als
 Abschnitt 8b in `test.sh`:
 
 * `__atomar_addieren` erzeugt `lock xadd` — in **drei Baustufen** und in
@@ -197,7 +197,7 @@ gc_wurzel_abmelden(arc_wert_adresse(a) as *mut u8)
 ```
 
 Ein angemeldeter Bereich wird bei jedem Zyklusstart konservativ mitgescannt,
-genau wie der Stapel. `tests/833_arc_gc_wurzel.fi` misst **beide** Seiten in
+genau wie der Stapel. `tests/833_arc_gc_root.fi` misst **beide** Seiten in
 einem Lauf: ohne Anmeldung stirbt das Ziel (der Fehler steht als Messung da,
 nicht als Warnung), mit Anmeldung überlebt es 2000 Müllobjekte und mehrere
 Sammelläufe, nach dem Abmelden stirbt es wieder.
@@ -209,7 +209,7 @@ geht in die Freiliste der Arc-Halde), der Sammler ausschließlich über
 überschneiden sich nicht.
 
 **Zyklen lecken**, genau wie bei `Rc` — der atomare Zähler ändert daran
-nichts. `tests/832_arc_zyklus_leck.fi` zeigt beides in einem Lauf: 1000
+nichts. `tests/832_arc_cycle_leak.fi` zeigt beides in einem Lauf: 1000
 Zyklenpaare mit zwei starken Verweisen lecken vollständig (2000 lebende
 Blöcke, 0 Freigaben), dieselben 1000 Paare mit einer schwachen Seite werden
 restlos frei. Wäre das Leck weg, wäre die Dokumentation falsch — der Test
@@ -253,7 +253,7 @@ einmal mit Runde 47:
 
 Das ist der **teuerste denkbare** Fall: jede Runde schreibt einen schwachen
 Verweis, und *alle* 4000 lebenden Objekte haben ein schwaches Feld, das bei
-jedem Fegen durchgesehen wird. Auf dem DOM-Arbeitsablauf (`aufbau.fi`, wo nur
+jedem Fegen durchgesehen wird. Auf dem DOM-Arbeitsablauf (`build.fi`, wo nur
 `Observer` ein schwaches Feld hat) ist der Durchsatz **unverändert** (§4.4).
 
 ### 4.3 Was der Weg dahin gekostet hat — vier gemessene Rücknahmen
@@ -278,7 +278,7 @@ Zwei Einzelbefunde, die man nicht rät, sondern misst:
   einmal zu binden**, war um 0,3 Mio. Instruktionen **schlechter**. Der Rahmenplatz
   ist hier billiger als der zweite Speicherzugriff — also blieb die Bindung.
 
-### 4.4 Pausen: `aufbau.fi`, 120 000 lebende Knoten, 5 s, je 7 Läufe
+### 4.4 Pausen: `build.fi`, 120 000 lebende Knoten, 5 s, je 7 Läufe
 
 Auf dieser Maschine liefen dabei **zwei weitere Runden parallel**. Die Wanduhr
 ist damit nicht auswertbar (das war der Fehlbefund der Runde 40); maßgeblich
@@ -298,7 +298,7 @@ Durchsatz ist auf diesem Arbeitsablauf unverändert.
 
 ### 4.5 Sprengen Finalisierer die Pausen? Nein — A/B im selben Prozess
 
-`tools/gc_mess/final.fi` misst zwei Phasen im **selben** Prozess mit
+`tools/gc_meas/final.fi` misst zwei Phasen im **selben** Prozess mit
 demselben Code (zwei Binaries hätten anderes Codelayout, und das überdeckt
 Unterschiede im Prozentbereich). Beide Uhren an, je 30 s, 4000 lebende Objekte:
 
@@ -357,19 +357,19 @@ finalisiert und freigegeben wurden.
 
 | Datei | Was sie prüft |
 |---|---|
-| `tests/820_gc_finalisierer.fi` | Finalisierer läuft mit richtiger Aufräumart; Gc-Felder sind vorher genullt; **höchstens einmal**; ein erreichbares Objekt wird nicht finalisiert; Massenlauf (300 Objekte) — der Verteiler des Programms lief genau so oft, wie der Sammler zählt |
-| `tests/821_gc_finalisierer_grenzen.fi` | jede Ablehnung: Nullzeiger, Stapelzeiger, Zeiger mitten ins Objekt, Art 0, Art > 16777215, doppelte Registrierung; `gc_finalisierer_loeschen` nimmt sie wirklich zurück |
-| `tests/822_gc_weak_genullt.fi` | das **Rohwort** des schwachen Feldes ist nach dem Sammeln 0; ein lebendes Ziel wird nicht genullt; nichts zählt doppelt |
-| `tests/823_gc_finalisierer_reentranz.fi` | Allokation im Finalisierer bricht mit **71** ab |
-| `tests/824_gc_finalisierer_wiederbelebung.fi` | Selbst-Einhängen im Finalisierer bricht mit **73** ab |
-| `tests/830_arc_grund.fi` | Zähler, letzter Verweis gibt frei, **kein doppeltes Freigeben**, Block wird wiederverwendet, 20 000 Runden ohne Rest |
+| `tests/820_gc_finalizer.fi` | Finalisierer läuft mit richtiger Aufräumart; Gc-Felder sind vorher genullt; **höchstens einmal**; ein erreichbares Objekt wird nicht finalisiert; Massenlauf (300 Objekte) — der Verteiler des Programms lief genau so oft, wie der Sammler zählt |
+| `tests/821_gc_finalizer_limits.fi` | jede Ablehnung: Nullzeiger, Stapelzeiger, Zeiger mitten ins Objekt, Art 0, Art > 16777215, doppelte Registrierung; `gc_finalisierer_loeschen` nimmt sie wirklich zurück |
+| `tests/822_gc_weak_zeroed.fi` | das **Rohwort** des schwachen Feldes ist nach dem Sammeln 0; ein lebendes Ziel wird nicht genullt; nichts zählt doppelt |
+| `tests/823_gc_finalizer_reentrancy.fi` | Allokation im Finalisierer bricht mit **71** ab |
+| `tests/824_gc_finalizer_resurrection.fi` | Selbst-Einhängen im Finalisierer bricht mit **73** ab |
+| `tests/830_arc_basic.fi` | Zähler, letzter Verweis gibt frei, **kein doppeltes Freigeben**, Block wird wiederverwendet, 20 000 Runden ohne Rest |
 | `tests/831_arc_weak.fi` | schwach hält nicht am Leben, Aufwerten nach dem Tod ist sichtbar leer, Freigabe genau einmal in **beiden** Reihenfolgen |
-| `tests/832_arc_zyklus_leck.fi` | Zyklen lecken (2000 Blöcke, 0 Freigaben) — und mit einer schwachen Seite nicht |
-| `tests/833_arc_gc_wurzel.fi` | GC-Zusammenspiel **ohne** und **mit** `gc_wurzel_anmelden`, Abmelden, beide Buchhaltungen |
-| `tests/neg/arc_verworfen.fi` | `arc_neu` ist `#[must_consume]` |
-| `tests/neg/atomar_typ.fi` | falscher Zeigertyp beim atomaren Primitiv — Fehler mit Zeile/Spalte, kein stilles Rechnen auf 32 Bit |
-| `tests/neg/atomar_stellen.fi` | falsche Stellenzahl — die Meldung nennt die vereinbarte Form |
-| `tools/atomar/run.sh` (test.sh 8b) | `lock xadd` in 3 Baustufen und beiden Compilern, Gegenprobe, FIR oktettgleich |
+| `tests/832_arc_cycle_leak.fi` | Zyklen lecken (2000 Blöcke, 0 Freigaben) — und mit einer schwachen Seite nicht |
+| `tests/833_arc_gc_root.fi` | GC-Zusammenspiel **ohne** und **mit** `gc_wurzel_anmelden`, Abmelden, beide Buchhaltungen |
+| `tests/neg/arc_discarded.fi` | `arc_neu` ist `#[must_consume]` |
+| `tests/neg/atomic_ty.fi` | falscher Zeigertyp beim atomaren Primitiv — Fehler mit Zeile/Spalte, kein stilles Rechnen auf 32 Bit |
+| `tests/neg/atomic_digits.fi` | falsche Stellenzahl — die Meldung nennt die vereinbarte Form |
+| `tools/atomic/run.sh` (test.sh 8b) | `lock xadd` in 3 Baustufen und beiden Compilern, Gegenprobe, FIR oktettgleich |
 
 Jeder Positivtest läuft in **drei Baustufen** (release-fast, no-opt, dev-fast)
 und zusätzlich unter **firnc1**.
@@ -406,8 +406,8 @@ nicht lösen, nur verschieben; deshalb wurde es zurückgenommen.
 | Prüfung | Basis | Runde 47 |
 |---|---|---|
 | `bash ./test.sh` | 696/696 | **727/727** |
-| `bash tools/selbst_vergleich.sh` | 201 / 0 / 0 | **210 / 0 / 0** |
-| `bash tools/fixpunkt.sh` | zeichengleich | **zeichengleich** |
+| `bash tools/self_compare.sh` | 201 / 0 / 0 | **210 / 0 / 0** |
+| `bash tools/fixpoint.sh` | zeichengleich | **zeichengleich** |
 
 ---
 

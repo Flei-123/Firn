@@ -12,17 +12,17 @@ gestückelten Fegen und ist jetzt behoben.
 
 ## 1. Zuerst messen: was in der Aufbauphase wirklich passiert
 
-`tools/gc_mess/pause_gross.fi` konnte die Frage nicht beantworten: es ruft
+`tools/gc_meas/pause_big.fi` konnte die Frage nicht beantworten: es ruft
 `gc_hist_reset()` **nach** dem Aufbau, das Histogramm zeigt also nur den
 Dauerbetrieb. Neu:
 
-* **`tools/gc_mess/aufbau.fi`** — nullt nichts. Phase 0 ist die Bilanz nach
+* **`tools/gc_meas/build.fi`** — nullt nichts. Phase 0 ist die Bilanz nach
   dem Aufbau, Phase 1 die Bilanz über den GANZEN Lauf; der Dauerbetrieb ist
   die Differenz. Jeder Sammellauf während des Aufbaus wird einzeln gemeldet
   (mit Heapgröße und Knotenzahl an dieser Stelle).
-* **`tools/gc_mess/durchsatz.fi`** — feste ARBEIT, gemessene ZEIT (die
+* **`tools/gc_meas/throughput.fi`** — feste ARBEIT, gemessene ZEIT (die
   Pausenläufe messen umgekehrt und taugen für Durchsatz nicht).
-* **`tools/gc_mess/ab.fi`** — A/B im selben Prozess, siehe §4.
+* **`tools/gc_meas/ab.fi`** — A/B im selben Prozess, siehe §4.
 
 Dazu vier Ergänzungen in der Laufzeit (`lib/gc/gc.fi`):
 
@@ -43,7 +43,7 @@ Dazu vier Ergänzungen in der Laufzeit (`lib/gc/gc.fi`):
 
 ### Ausgangsmessung (Stand `main` f48e51c, `INKR_AB` = 8 MiB)
 
-`aufbau.fi`, 120 000 lebende Textknoten, Aufbau bis Heap 9,5 MiB:
+`build.fi`, 120 000 lebende Textknoten, Aufbau bis Heap 9,5 MiB:
 
 | Sammellauf | Pause | Heap dabei | Knoten dabei | Art |
 |---|---|---|---|---|
@@ -154,7 +154,7 @@ dieser Runde gemessen: dieselbe Messung lief nach dem Einbau reiner
 Diagnosezähler von 121 auf 104 ms, also 14 % **schneller**, obwohl mehr Code
 lief. Wer so vergleicht, misst Zufall.
 
-`tools/gc_mess/ab.fi` vergleicht deshalb im **selben Prozess**, mit
+`tools/gc_meas/ab.fi` vergleicht deshalb im **selben Prozess**, mit
 demselben Maschinencode und derselben lebenden Menge: `gc_set_inkr_ab()`
 schaltet um, die Phasen laufen verschachtelt (A B A B A B), damit eine Drift
 der Maschine beide gleich trifft.
@@ -185,7 +185,7 @@ Aus −26 % (vor der Änderung) wurden **−2 %**. Die Vorgabe von höchstens
 
 ## 5. Ergebnis: Pausen über den ganzen Lauf
 
-`aufbau.fi`, 120 000 lebende Knoten, Aufbau eingeschlossen, 5 s Dauerbetrieb,
+`build.fi`, 120 000 lebende Knoten, Aufbau eingeschlossen, 5 s Dauerbetrieb,
 ruhige Maschine:
 
 | | vorher (`INKR_AB` 8 MiB) | nachher (`INKR_AB` 0) |
@@ -213,7 +213,7 @@ einschließlich Aufbau.
 Runde 38 nannte als „ehrliche Nebenwirkung" des Hybrids im Phasen-Test
 `rss_ende` = 14 912 KiB gegenüber 2112 KiB in Stufe 2 — Floating Garbage und
 verzögerte Rückgabe. Mit dem verzögerten Leeren der Freilisten misst
-`tools/gc_mess/run.sh` (3b, Phasen-Fragmentierung) jetzt **2368 KiB**. Der
+`tools/gc_meas/run.sh` (3b, Phasen-Fragmentierung) jetzt **2368 KiB**. Der
 Überhang war also größtenteils nicht Floating Garbage, sondern derselbe
 Fehler: im Fegen frisch gemappte Chunks.
 
@@ -222,13 +222,13 @@ Fehler: im Fegen frisch gemappte Chunks.
 | Prüfung | Ergebnis |
 |---|---|
 | `bash ./test.sh` | **676/676** (673 Basis + neuer Test 771, jeder Test laeuft in drei Baustufen) |
-| `bash tools/selbst_vergleich.sh` | **197** gleiches Verhalten, 0 abweichend, 0 fehlerhaft (196 Basis + Test 771) |
-| `bash tools/fixpunkt.sh` | Stufe 2 == Stufe 3, zeichengleich (322 723 Zeilen Assembler) |
-| `bash tools/gc_mess/run.sh` | Fragmentierung Drift +0,0 % (stabil), RSS Ende 2632 KiB, Phasen-Test Ende 2368 KiB, `volle_laeufe` 0 |
+| `bash tools/self_compare.sh` | **197** gleiches Verhalten, 0 abweichend, 0 fehlerhaft (196 Basis + Test 771) |
+| `bash tools/fixpoint.sh` | Stufe 2 == Stufe 3, zeichengleich (322 723 Zeilen Assembler) |
+| `bash tools/gc_meas/run.sh` | Fragmentierung Drift +0,0 % (stabil), RSS Ende 2632 KiB, Phasen-Test Ende 2368 KiB, `volle_laeufe` 0 |
 | Pausen-Histogramm ≥ 10 min, große lebende Menge, Aufbau eingeschlossen | §8 — Wanduhr max 2,14 ms, Rechenzeit max 0,62 ms, 0 volle Läufe |
 | `tools/dom_soak` (in test.sh) | Verbrauch flach 1360 → 1360 KiB, Gegenprobe schlägt an |
 
-Neuer Test `tests/771_gc_aufbau_ohne_stw.fi`: 200 000 lebende Knoten (Heap
+Neuer Test `tests/771_gc_build_without_stw.fi`: 200 000 lebende Knoten (Heap
 über der alten Schwelle), geprüft wird deterministisch — nicht über die Uhr —
 dass `gc_volle_laeufe() == 0`, dass überhaupt gesammelt wurde, dass der Heap
 unter dem 2,5-fachen der lebenden Menge bleibt (gemessen 1,2-fach) und dass

@@ -6,20 +6,20 @@
 #
 # Gemessen wird der ECHTE Speicherverbrauch des Prozesses (RSS aus
 # /proc/self/statm), nicht die Selbstauskunft der Laufzeit. Zusaetzlich laeuft
-# JEDES MAL die absichtlich leckende Gegenprobe (lib/dom/soak_leck.fi, gleicher
+# JEDES MAL die absichtlich leckende Gegenprobe (lib/dom/soak_leak.fi, gleicher
 # Zyklensatz mit Zaehlverweisen). Bleibt die gruen, ist das Messverfahren
 # kaputt und dieses Skript bricht ab — eine Messung, die nichts anzeigen kann,
 # waere schlimmer als keine.
 #
 # Umgebung:
-#   SOAK_SEK         Laufzeitbudget je Fassung in Sekunden (Standard 600)
-#   SOAK_ZYKLEN      Hoechstzahl Zyklensaetze (Standard 100000000)
-#   SOAK_STICHPROBE  Zyklen je Datenzeile (Standard 1000)
-#   SOAK_MIN_ZYKLEN  Mindestzahl Zyklen fuer ein gueltiges Urteil (Standard 100000)
-#   SOAK_LECK_ZYKLEN Obergrenze fuer die LECKENDE Gegenprobe (Standard 600000;
+#   SOAK_SEC         Laufzeitbudget je Fassung in Sekunden (Standard 600)
+#   SOAK_CYCLES      Hoechstzahl Zyklensaetze (Standard 100000000)
+#   SOAK_SAMPLE  Zyklen je Datenzeile (Standard 1000)
+#   SOAK_MIN_CYCLES  Mindestzahl Zyklen fuer ein gueltiges Urteil (Standard 100000)
+#   SOAK_LEAK_CYCLES Obergrenze fuer die LECKENDE Gegenprobe (Standard 600000;
 #                    seit Runde 53 leckt ein Satz 13 Objekte zu 128 Byte,
 #                    das sind rund 1,0 GiB — vorher 6 zu 64 Byte)
-#   SOAK_LECK_MB     harte Speicherbremse fuer die Gegenprobe in MiB (Standard 3072)
+#   SOAK_LEAK_MB     harte Speicherbremse fuer die Gegenprobe in MiB (Standard 3072)
 #
 # WARUM DIE GEGENPROBE GEDECKELT IST: sie leckt bauartbedingt rund 384 Byte je
 # Zyklus (6 von 7 Objekten a 64 Byte). Ohne Deckel frisst sie bei voller
@@ -33,19 +33,19 @@ cd "$(dirname "$0")/../.."
 FIRNC=compiler/target/release/firnc
 ARBEIT=.dom-soak-work
 AUS=tools/dom_soak
-SEK=${SOAK_SEK:-600}
-ZYKLEN=${SOAK_ZYKLEN:-100000000}
-STICH=${SOAK_STICHPROBE:-1000}
-MINZ=${SOAK_MIN_ZYKLEN:-100000}
-LECK_ZYKLEN=${SOAK_LECK_ZYKLEN:-600000}
-LECK_MB=${SOAK_LECK_MB:-3072}
+SEK=${SOAK_SEC:-600}
+ZYKLEN=${SOAK_CYCLES:-100000000}
+STICH=${SOAK_SAMPLE:-1000}
+MINZ=${SOAK_MIN_CYCLES:-100000}
+LECK_ZYKLEN=${SOAK_LEAK_CYCLES:-600000}
+LECK_MB=${SOAK_LEAK_MB:-3072}
 BUDGET_MS=$((SEK * 1000))
 
 if [ ! -x "$FIRNC" ]; then
     echo "FEHLER: $FIRNC fehlt — zuerst 'cargo build --release' im Ordner compiler/."
     exit 1
 fi
-for f in lib/dom/dom.fi lib/dom/mess.fi lib/dom/soak_gc.fi lib/dom/soak_leck.fi; do
+for f in lib/dom/dom.fi lib/dom/meas.fi lib/dom/soak_gc.fi lib/dom/soak_leak.fi; do
     if [ ! -f "$f" ]; then
         echo "FEHLER: $f fehlt — der DOM-Prototyp ist nicht gebaut."
         exit 1
@@ -54,26 +54,26 @@ done
 
 rm -rf "$ARBEIT"
 mkdir -p "$ARBEIT" "$AUS"
-cp lib/dom/dom.fi lib/dom/mess.fi "$ARBEIT/"
+cp lib/dom/dom.fi lib/dom/meas.fi "$ARBEIT/"
 
 # Arbeitskopie mit umgestellten Konstanten anlegen.
 # $1 Quelle  $2 Ziel  $3 Budget ms  $4 Zyklen  $5 Stichprobe
 stelle_um() {
     sed -e "s|^const BUDGET_MS: i64 = .*$|const BUDGET_MS: i64 = $3  // SOAK_BUDGET_MS|" \
-        -e "s|^const ZYKLEN_MAX: i64 = .*$|const ZYKLEN_MAX: i64 = $4  // SOAK_ZYKLEN_MAX|" \
-        -e "s|^const STICHPROBE: i64 = .*$|const STICHPROBE: i64 = $5  // SOAK_STICHPROBE|" \
+        -e "s|^const CYCLES_MAX: i64 = .*$|const CYCLES_MAX: i64 = $4  // SOAK_CYCLES_MAX|" \
+        -e "s|^const SAMPLE: i64 = .*$|const SAMPLE: i64 = $5  // SOAK_SAMPLE|" \
         "$1" > "$2"
     # Die drei Zeilen muessen wirklich ersetzt worden sein.
     if ! grep -q "const BUDGET_MS: i64 = $3 " "$2"; then
         echo "FEHLER: BUDGET_MS in $1 nicht ersetzbar (Zeile veraendert?)."
         exit 1
     fi
-    if ! grep -q "const ZYKLEN_MAX: i64 = $4 " "$2"; then
-        echo "FEHLER: ZYKLEN_MAX in $1 nicht ersetzbar."
+    if ! grep -q "const CYCLES_MAX: i64 = $4 " "$2"; then
+        echo "FEHLER: CYCLES_MAX in $1 nicht ersetzbar."
         exit 1
     fi
-    if ! grep -q "const STICHPROBE: i64 = $5 " "$2"; then
-        echo "FEHLER: STICHPROBE in $1 nicht ersetzbar."
+    if ! grep -q "const SAMPLE: i64 = $5 " "$2"; then
+        echo "FEHLER: SAMPLE in $1 nicht ersetzbar."
         exit 1
     fi
 }
@@ -88,7 +88,7 @@ echo
 echo "-- 1. Bau in drei Baustufen und Kurzlauf-Vergleich --"
 STUFEN=("release-fast:" "no-opt:--no-opt" "dev-fast:--opt-level=dev-fast")
 fehler=0
-for variante in gc leck; do
+for variante in gc leak; do
     stelle_um "lib/dom/soak_$variante.fi" "$ARBEIT/kurz_$variante.fi" 3000 5000 1000
     erwartet=""
     for st in "${STUFEN[@]}"; do
@@ -128,9 +128,9 @@ fi
 # ------------------------------------------------------------------ 2. Messlauf
 echo
 echo "-- 2. Dauerlauf --"
-for variante in gc leck; do
+for variante in gc leak; do
     grenze=$ZYKLEN
-    if [ "$variante" = leck ]; then
+    if [ "$variante" = leak ]; then
         # Gedeckelt: siehe Kopf der Datei. Diese Fassung leckt absichtlich.
         grenze=$LECK_ZYKLEN
     fi
@@ -141,7 +141,7 @@ for variante in gc leck; do
         exit 1
     fi
     start=$(date +%s)
-    if [ "$variante" = leck ]; then
+    if [ "$variante" = leak ]; then
         # Harte Bremse: der Adressraum ist begrenzt, damit ein Fehler in der
         # Gegenprobe niemals die Maschine mitnimmt.
         ( ulimit -v $((LECK_MB * 1024)); exec "$ARBEIT/soak_$variante" ) > "$AUS/messung-$variante.tsv"
@@ -163,7 +163,7 @@ echo
 echo "-- 3. Auswertung --"
 LECK_MINZ=$((LECK_ZYKLEN / 4))
 if [ "$LECK_MINZ" -gt "$MINZ" ]; then LECK_MINZ=$MINZ; fi
-python3 - "$AUS/messung-gc.tsv" "$AUS/messung-leck.tsv" "$MINZ" "$LECK_MINZ" <<'PYEOF'
+python3 - "$AUS/messung-gc.tsv" "$AUS/messung-leak.tsv" "$MINZ" "$LECK_MINZ" <<'PYEOF'
 import sys
 
 def lies(pfad):
@@ -234,7 +234,7 @@ def zeig(u, name):
           f' (Zuwachs {"ja" if u["wuchs"] else "nein"}, monoton {"ja" if u["monoton"] else "nein"})')
 
 zeig(gc, 'GC-Fassung  (lib/dom/soak_gc.fi)')
-zeig(leck, 'Zaehlverweis (lib/dom/soak_leck.fi, MUSS lecken)')
+zeig(leck, 'Zaehlverweis (lib/dom/soak_leak.fi, MUSS lecken)')
 
 print()
 fehler = 0
@@ -258,7 +258,7 @@ rc=$?
 
 echo
 if [ $rc -eq 0 ]; then
-    echo "OK: DOM-Dauerlauf bestanden (Messreihen in $AUS/messung-gc.tsv und $AUS/messung-leck.tsv)."
+    echo "OK: DOM-Dauerlauf bestanden (Messreihen in $AUS/messung-gc.tsv und $AUS/messung-leak.tsv)."
 else
     echo "FEHLER: DOM-Dauerlauf NICHT bestanden."
 fi
