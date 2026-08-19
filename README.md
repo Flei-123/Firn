@@ -1447,12 +1447,12 @@ Four kinds of error, all with a source excerpt:
 ```
 error: unknown attribute 'must_consum'
   --> file.fi:3:1
-   = note: did you mean 'must_consume'? '--list-attrs' shows all of them
+   = note: did you mean 'must_consume'? '--list-attrs' shows all
 
 error: attribute 'constant_time' is not implemented in stage 0
-   = note: planned: no jump on secret data, checked in the code generator (SPEC 9.2)
+   = note: geplant: no jump on secret data, checked in the code generator (SPEC 9.2)
 
-error: attribute 'packed' does not belong in front of a function
+error: attribute 'packed' does not belong before a function
 error: attribute 'align' expects 1 argument(s), found 2
 ```
 
