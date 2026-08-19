@@ -313,6 +313,15 @@ impl<'a> Lower<'a> {
                 self.write_into(slot, e)?;
                 Some(slot)
             }
+            // HOOK iface: `((&x) as dyn I).m()` — der Schnittstellenwert
+            // bekommt einen Zwischenplatz, dessen Adresse hier steht (iface.rs)
+            ExprKind::Cast(..) if crate::iface::ist_dyn(&self.info.tcx, &self.ty_of(e)) => {
+                let t = self.ty_of(e);
+                let (size, align) = self.size_align(&t);
+                let slot = self.alloca(size, align);
+                self.write_into(slot, e)?;
+                Some(slot)
+            }
             // HOOK types: `Enum::Variante(..)` liefert ein Aggregat (lower_match.rs)
             ExprKind::Call(name, args, _) if crate::lower_match::is_ctor(name) => {
                 crate::lower_match::lower_ctor_addr(self, e, name, args)
@@ -385,6 +394,12 @@ impl<'a> Lower<'a> {
                     _ => return self.ice(e.span, "wiederholungsliteral ohne array-typ"),
                 };
                 self.lower_repeat(addr, val, &et, n)
+            }
+            // HOOK iface: `p as dyn I` — Datenzeiger und Methodentafel
+            // (iface.rs, Runde 46)
+            ExprKind::Cast(inner, _) if crate::iface::ist_dyn(&self.info.tcx, &t) => {
+                let inner = (**inner).clone();
+                crate::iface::lower_cast_into(self, addr, &inner, &t, e.span)
             }
             // HOOK types: `Enum::Variante(..)` schreibt direkt ins Ziel (lower_match.rs)
             ExprKind::Call(name, args, _) if crate::lower_match::is_ctor(name) => {
@@ -644,8 +659,32 @@ impl<'a> Lower<'a> {
         // wird seine ADRESSE uebergeben.
         let aufgeloest;
         let mut empfaenger_adresse = false;
+        // HOOK iface: `f.m(a)` auf einem `dyn I` — der dynamische Versand
+        // (iface.rs, Runde 46). `versand` traegt das AUFRUFZIEL (aus der
+        // Methodentafel) und den Datenzeiger; alles andere — Aggregate,
+        // versteckter Rueckgabezeiger, Stapelargumente — laeuft danach durch
+        // genau denselben Code wie ein gewoehnlicher Aufruf.
+        let mut versand: Option<(Val, Val)> = None;
+        let mut dyn_sig: Option<crate::sema::FnSig> = None;
+        if let Some(m) = crate::impls::methodenname(name) {
+            let et = match args.first() {
+                Some(e) => self.ty_of(e),
+                None => return self.ice(span, "methodenaufruf ohne empfaenger"),
+            };
+            if let Some(iname) = crate::impls::dyn_schnittstelle(&self.info.tcx, &et) {
+                let empf = match args.first() {
+                    Some(e) => e,
+                    None => return self.ice(span, "methodenaufruf ohne empfaenger"),
+                };
+                let (ziel, daten, sig) =
+                    crate::iface::lower_versand(self, &iname, m, empf, span)?;
+                versand = Some((ziel, daten));
+                dyn_sig = Some(sig);
+            }
+        }
         let name: &str = match crate::impls::methodenname(name) {
             None => name,
+            Some(_) if versand.is_some() => name,
             Some(m) => {
                 let et = match args.first() {
                     Some(e) => self.ty_of(e),
@@ -661,9 +700,12 @@ impl<'a> Lower<'a> {
                 }
             }
         };
-        let sig = match self.info.fns.get(name) {
-            Some(s) => s.clone(),
-            None => return self.ice(span, "unbekannte funktion im lowering"),
+        let sig = match dyn_sig {
+            Some(s) => s,
+            None => match self.info.fns.get(name) {
+                Some(s) => s.clone(),
+                None => return self.ice(span, "unbekannte funktion im lowering"),
+            },
         };
         let ret_agg = is_agg(&sig.ret);
         let sret = abi::ret_needs_sret(&sig.ret, &self.info.tcx);
@@ -686,6 +728,14 @@ impl<'a> Lower<'a> {
             }
         }
         for (i, a) in args.iter().enumerate() {
+            // HOOK iface: der Empfaenger ist der Datenzeiger aus dem fetten
+            // Zeiger — er wurde oben schon gelesen (iface.rs)
+            if i == 0 {
+                if let Some((_, daten)) = versand {
+                    vals.push(daten);
+                    continue;
+                }
+            }
             // HOOK impl: der Empfaenger geht als Adresse hinein (impls.rs)
             if i == 0 && empfaenger_adresse {
                 let adr = self.lower_addr(a)?;
@@ -716,7 +766,10 @@ impl<'a> Lower<'a> {
                 }
             }
         }
-        let op = Op::Call { name: name.to_string(), args: vals };
+        let op = match versand {
+            Some((ziel, _)) => Op::CallIndirect { target: ziel, args: vals },
+            None => Op::Call { name: name.to_string(), args: vals },
+        };
         if ret_agg {
             let d = match target {
                 Some(d) => d,

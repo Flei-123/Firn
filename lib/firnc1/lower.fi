@@ -43,9 +43,10 @@ import fir
 import muster
 import fehler
 import gc
+import iface
 
 export { Lower, low_neu, low_frei, low_lauf, low_fehler, low_fir, low_ungeeignet,
-         low_mu_setzen, low_fe_setzen, low_gc_setzen }
+         low_mu_setzen, low_fe_setzen, low_gc_setzen, low_if_setzen }
 
 const KEIN: u32 = 4294967295
 
@@ -69,6 +70,7 @@ struct Lower {
     mu: u64             // Register der Aufzaehlungen/Musterabgleiche (0 = keins)
     feh: u64            // Register der Fehlermengen/-unionen (0 = keins)
     gcr: u64            // Registrierung der gc-Klassen (Runde 34; 0 = keine)
+    ifr: u64            // Registrierung der Schnittstellen (Runde 46; 0 = keine)
     fehler: usize
     ungeeignet: bool    // Aggregat oder `defer` gefunden
 }
@@ -81,7 +83,7 @@ fn low_neu(b: u64, it: u64, sm: u64) -> Lower {
         v_name: vec_neu[u32](), v_slot: vec_neu[u32](), b_grenze: vec_neu[u32](),
         l_break: vec_neu[u32](), l_cont: vec_neu[u32](), l_tiefe: vec_neu[u32](),
         d_stmt: vec_neu[u32](), d_err: vec_neu[u32](), d_grenze: vec_neu[u32](),
-        sret: KEIN, mu: 0, feh: 0, gcr: 0, fehler: 0, ungeeignet: false,
+        sret: KEIN, mu: 0, feh: 0, gcr: 0, ifr: 0, fehler: 0, ungeeignet: false,
     }
 }
 
@@ -112,10 +114,16 @@ fn low_fe_setzen(l: *mut Lower, f: u64) { (*l).feh = f }
 // Die gc-Registrierung anmelden (Runde 34). MUSS vor `low_lauf` stehen.
 fn low_gc_setzen(l: *mut Lower, g: u64) { (*l).gcr = g }
 
+// Die Schnittstellen-Registrierung anmelden (Runde 46). MUSS vor
+// `low_lauf` stehen.
+fn low_if_setzen(l: *mut Lower, f: u64) { (*l).ifr = f }
+
 fn fel(l: *mut Lower) -> *mut fehler.Fehler { return (*l).feh as *mut fehler.Fehler }
 fn hat_fe(l: *mut Lower) -> bool { return (*l).feh != 0 }
 fn gcl(l: *mut Lower) -> *mut gc.Gc { return (*l).gcr as *mut gc.Gc }
 fn hat_gc(l: *mut Lower) -> bool { return (*l).gcr != 0 }
+fn ifl(l: *mut Lower) -> *mut iface.If { return (*l).ifr as *mut iface.If }
+fn hat_if(l: *mut Lower) -> bool { return (*l).ifr != 0 }
 fn low_ungeeignet(l: *mut Lower) -> bool { return (*l).ungeeignet }
 fn low_fir(l: *mut Lower) -> *mut fir.Fir { return &(*l).f }
 
@@ -377,6 +385,16 @@ fn adresse(l: *mut Lower, e: u32) -> u32 {
         schreib_nach(l, slot, e)
         return slot
     }
+    // HOOK iface: `((&x) as dyn I).m()` — der Schnittstellenwert bekommt
+    // einen Zwischenplatz, dessen Adresse hier steht (iface.fi).
+    if a == ast.E_AS {
+        let t2: u32 = sema.sema_typ(sm(l), e)
+        if ist_dyn_typ(l, t2) {
+            let slot2: u32 = alloca(l, q_groesse(l, t2), q_ausricht(l, t2))
+            schreib_nach(l, slot2, e)
+            return slot2
+        }
+    }
     if a == ast.E_RUF {
         // HOOK fehlerunionen (lower_errors.rs::hook_addr): `try`, `catch`
         // und der reine Fehlerwert legen ihren Platz selbst an.
@@ -418,6 +436,53 @@ fn adresse(l: *mut Lower, e: u32) -> u32 {
 }
 
 // -------------------------------------------------- Ablegen an eine Adresse
+
+// Ist `t` ein Schnittstellenwert (`dyn I`)?
+fn ist_dyn_typ(l: *mut Lower, t: u32) -> bool {
+    if !hat_if(l) {
+        return false
+    }
+    if typen.ty_art(tf(l), t) != typen.K_STRUCT {
+        return false
+    }
+    let nm: u32 = typen.st_name(tf(l), typen.ty_a(tf(l), t) as usize)
+    return iface.if_von_dyn(ifl(l), nm) != KEIN
+}
+
+// HOOK iface (iface.rs::lower_cast_into): `p as dyn I` — zwei Woerter.
+// Der Datenzeiger wird NICHT veraendert (kein Versatz, keine
+// Verschleierung); nur so findet der konservative Stapelscan des Sammlers
+// das Objekt dahinter (SPEC §3.5.3).
+fn schnittstelle_schreiben(l: *mut Lower, adr: u32, e: u32, t: u32) {
+    let b: *mut ast.Baum = baum(l)
+    let dn: u32 = typen.st_name(tf(l), typen.ty_a(tf(l), t) as usize)
+    let ii: u32 = iface.if_von_dyn(ifl(l), dn)
+    if ii == KEIN {
+        aufgeben(l)
+        return
+    }
+    let innen: u32 = ast.e_a(b, e)
+    let qt: u32 = sema.sema_typ(sm(l), innen)
+    if typen.ty_art(tf(l), qt) != typen.K_PTR {
+        aufgeben(l)
+        return
+    }
+    let qi: u32 = typen.ty_a(tf(l), qt)
+    if typen.ty_art(tf(l), qi) != typen.K_STRUCT {
+        aufgeben(l)
+        return
+    }
+    let prae: u32 = iface.if_tafel(ifl(l), ii, typen.ty_a(tf(l), qi))
+    if prae == KEIN {
+        aufgeben(l)
+        return
+    }
+    let pv: u32 = wert(l, innen)
+    speichere(l, fir.T_PTR, ptradd_konst(l, adr, 0), pv)
+    let tv: u32 = push(l, fir.O_VTAB, fir.T_PTR,
+                       iface.if_name(ifl(l), ii as usize), prae, 0, 0, 0, 0)
+    speichere(l, fir.T_PTR, ptradd_konst(l, adr, 8), tv)
+}
 
 fn schreib_nach(l: *mut Lower, adr: u32, e: u32) {
     if (*l).ungeeignet {
@@ -495,6 +560,11 @@ fn schreib_nach(l: *mut Lower, adr: u32, e: u32) {
     }
     if a == ast.E_RUF && ist_aggregat(l, t) {
         ruf_mit_ziel(l, e, adr)
+        return
+    }
+    // HOOK iface: `p as dyn I` schreibt Datenzeiger und Tafel (iface.fi).
+    if a == ast.E_AS && ist_dyn_typ(l, t) {
+        schnittstelle_schreiben(l, adr, e, t)
         return
     }
     if ist_aggregat(l, t) {
@@ -1129,7 +1199,38 @@ fn ruf_voll(l: *mut Lower, e: u32, ziel: u32) -> u32 {
     // und dem Methodennamen, genau wie im Typpruefer. Eine Seitentabelle
     // zwischen den Phasen gibt es bewusst nicht.
     var empf_adr: bool = false
-    if ist_methodenruf(namen(l), name) {
+    // HOOK iface (iface.rs::lower_versand, Runde 46): `f.m(a)` auf einem
+    // `dyn I`. `ziel` traegt die Adresse aus der Methodentafel, `daten` den
+    // Zeiger auf den Wert; alles andere — Aggregate, versteckter
+    // Rueckgabezeiger, Stapelargumente — laeuft danach durch genau denselben
+    // Code wie ein gewoehnlicher Aufruf.
+    var versand: bool = false
+    var v_ziel: u32 = 0
+    var v_daten: u32 = 0
+    var v_rt: u32 = 0
+    if hat_if(l) && ist_methodenruf(namen(l), name) {
+        let empf0: u32 = ast.kind_at(b, ast.e_b(b, e))
+        let et0: u32 = sema.sema_typ(sm(l), empf0)
+        let sn0: u32 = empf_struct_l(l, et0)
+        if sn0 != KEIN {
+            let ii: u32 = iface.if_von_dyn(ifl(l), sn0)
+            if ii != KEIN {
+                let m0: u32 = intern.intern_ab(namen(l), name, 8)
+                let mk: u32 = iface.if_slot(ifl(l), ii as usize, m0)
+                if mk == KEIN {
+                    aufgeben(l)
+                    return 0
+                }
+                let basis: u32 = adresse(l, empf0)
+                v_daten = lade(l, fir.T_PTR, ptradd_konst(l, basis, 0))
+                let tafel: u32 = lade(l, fir.T_PTR, ptradd_konst(l, basis, 8))
+                v_ziel = lade(l, fir.T_PTR, ptradd_konst(l, tafel, 8 * mk as u64))
+                v_rt = iface.if_rtyp(ifl(l), ii as usize, mk)
+                versand = true
+            }
+        }
+    }
+    if !versand && ist_methodenruf(namen(l), name) {
         let empf: u32 = ast.kind_at(b, ast.e_b(b, e))
         let et: u32 = sema.sema_typ(sm(l), empf)
         let sn: u32 = empf_struct_l(l, et)
@@ -1149,12 +1250,17 @@ fn ruf_voll(l: *mut Lower, e: u32, ziel: u32) -> u32 {
             empf_adr = typen.ist_zeiger(tf(l), p0) && !typen.ist_zeiger(tf(l), et)
         }
     }
-    let fnr: u32 = fn_nummer(l, name)
-    if fnr == KEIN {
-        aufgeben(l)
-        return 0
+    var rt2: u32 = 0
+    if versand {
+        rt2 = v_rt
+    } else {
+        let fnr: u32 = fn_nummer(l, name)
+        if fnr == KEIN {
+            aufgeben(l)
+            return 0
+        }
+        rt2 = typen.ret_typ_der_funktion(tf(l), fnr as usize)
     }
-    let rt2: u32 = typen.ret_typ_der_funktion(tf(l), fnr as usize)
     let ret_agg: bool = ist_aggregat(l, rt2)
     let sret: bool = abi_sret(l, rt2)
 
@@ -1173,6 +1279,13 @@ fn ruf_voll(l: *mut Lower, e: u32, ziel: u32) -> u32 {
     var k: u32 = 0
     while k < ast.e_c(b, e) {
         let arg: u32 = ast.kind_at(b, ast.e_b(b, e) + k)
+        // HOOK iface: der Empfaenger ist der Datenzeiger aus dem fetten
+        // Zeiger — er wurde oben schon gelesen (iface.fi).
+        if k == 0 && versand {
+            vec_push[u32](&tmp, v_daten)
+            k = k + 1
+            continue
+        }
         // HOOK impl: der Empfaenger geht als ADRESSE hinein (impls.rs).
         if k == 0 && empf_adr {
             vec_push[u32](&tmp, adresse(l, arg))
@@ -1210,22 +1323,28 @@ fn ruf_voll(l: *mut Lower, e: u32, ziel: u32) -> u32 {
     let off: u32 = args_ablegen(l, &tmp)
     vec_frei[u32](&tmp)
 
+    var rufart: u32 = fir.O_CALL
+    var rufziel: u32 = name
+    if versand {
+        rufart = fir.O_CALLI
+        rufziel = v_ziel
+    }
     if ret_agg {
         let gr: u64 = typen.groesse_von(tf(l), rt2)
         if sret {
-            push(l, fir.O_CALL, fir.T_PTR, name, 0, 0, 0, off, anz)
+            push(l, rufart, fir.T_PTR, rufziel, 0, 0, 0, off, anz)
         } else {
-            let w: u32 = push(l, fir.O_CALL, fir.T_I64, name, 0, 0, 0, off, anz)
+            let w: u32 = push(l, rufart, fir.T_I64, rufziel, 0, 0, 0, off, anz)
             woerter_speichern(l, target, gr, w)
         }
         return 0
     }
     let ft: u32 = fty(l, rt2)
     if ft == fir.T_VOID {
-        push_void(l, fir.O_CALL, ft, name, 0, 0, 0, off, anz)
+        push_void(l, rufart, ft, rufziel, 0, 0, 0, off, anz)
         return 0
     }
-    return push(l, fir.O_CALL, ft, name, 0, 0, 0, off, anz)
+    return push(l, rufart, ft, rufziel, 0, 0, 0, off, anz)
 }
 
 fn ruf_mit_ziel(l: *mut Lower, e: u32, ziel: u32) {

@@ -550,7 +550,7 @@ pub fn allocate(f: &Func) -> Alloc {
     let mut divsel_pos: Vec<usize> = Vec::new();
     for (bi, b) in f.blocks.iter().enumerate() {
         for (ii, i) in b.insts.iter().enumerate() {
-            if matches!(i.op, Op::Call { .. } | Op::Syscall { .. }) {
+            if matches!(i.op, Op::Call { .. } | Op::CallIndirect { .. } | Op::Syscall { .. }) {
                 call_pos.push(live.pos[bi][ii]);
             }
             if matches!(i.op, Op::CopyMem { .. } | Op::SecureZero { .. }) {
@@ -865,7 +865,7 @@ pub fn allocate(f: &Func) -> Alloc {
                 // Zellenwert steht dann nur noch im Rahmen, nicht im
                 // Register. (Fehlerbild: bin/layoutdump.fi stuerzte in
                 // intern_finde mit t=0 ab.)
-                if matches!(nj.op, Op::Call { .. } | Op::Syscall { .. })
+                if matches!(nj.op, Op::Call { .. } | Op::CallIndirect { .. } | Op::Syscall { .. })
                     && !CALLEE_SAVED.contains(&rc)
                 {
                     zerstoert = true;
@@ -934,7 +934,7 @@ pub fn allocate(f: &Func) -> Alloc {
                         break;
                     }
                     Op::Load { addr: a2 } if *a2 == zelle => break,
-                    Op::Call { .. } | Op::Syscall { .. } => break,
+                    Op::Call { .. } | Op::CallIndirect { .. } | Op::Syscall { .. } => break,
                     _ => {}
                 }
                 // steht noch die Verwendung eines Alias-Werts derselben Zelle
@@ -1459,7 +1459,7 @@ fn unsupported_grund(f: &Func) -> Option<String> {
         }
         for i in &b.insts {
             match &i.op {
-                Op::Call { .. } => {}
+                Op::Call { .. } | Op::CallIndirect { .. } | Op::VtabAddr { .. } => {}
                 Op::Syscall { args } => {
                     if args.is_empty() || args.len() > 7 {
                         return Some(format!("syscall mit {} Argumenten", args.len()));
@@ -2072,6 +2072,53 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
             if let Some(d) = i.dst {
                 ra.store_dst(e, d, "rax");
             }
+        }
+        // Dynamischer Versand (iface.rs, Runde 46). Wortgleich zum `call`
+        // darueber, nur steht das Ziel in einem Register statt in einem
+        // Symbol. Das Ziel wird ZULETZT geladen, und zwar nach `rax`: `rax`
+        // ist nie Heimat eines Wertes (siehe Kopf dieser Datei) und kein
+        // Argumentregister — damit kann das Laden weder ein schon gesetztes
+        // Argument noch das Ziel selbst zerstoeren.
+        Op::CallIndirect { target, args } => {
+            let stapel = args.len().saturating_sub(ARG_REGS.len());
+            let raum = align_up(stapel as u64 * 8, 16);
+            if raum > 0 {
+                e.line(&format!("sub rsp, {}", raum));
+                for (k, arg) in args.iter().skip(ARG_REGS.len()).enumerate() {
+                    ra.load_full(e, "rax", *arg);
+                    e.line(&format!("mov qword ptr [rsp+{}], rax", k * 8));
+                }
+            }
+            let mut reg_moves: Vec<(String, String)> = Vec::new();
+            let mut spaeter: Vec<(usize, Val)> = Vec::new();
+            for (k, arg) in args.iter().enumerate().take(ARG_REGS.len()) {
+                let o = ra.opnd(*arg);
+                if ist_reg64(&o) {
+                    reg_moves.push((ARG_REGS[k].to_string(), o));
+                } else {
+                    spaeter.push((k, *arg));
+                }
+            }
+            parallele_reg_bewegungen(e, &reg_moves);
+            for (k, arg) in spaeter {
+                ra.load_full(e, ARG_REGS[k], arg);
+            }
+            ra.load_full(e, "rax", *target);
+            e.line("call rax");
+            if raum > 0 {
+                e.line(&format!("add rsp, {}", raum));
+            }
+            if let Some(d) = i.dst {
+                ra.store_dst(e, d, "rax");
+            }
+        }
+        Op::VtabAddr { tafel } => {
+            let d = i.dst.ok_or("interner Fehler: vtab ohne Ziel")?;
+            e.line(&format!(
+                "lea rax, [rip + {}]",
+                crate::iface::tafel_label(tafel)
+            ));
+            ra.store_dst(e, d, "rax");
         }
         Op::Syscall { args } => {
             const SYS_REGS: [&str; 6] = ["rdi", "rsi", "rdx", "r10", "r8", "r9"];
