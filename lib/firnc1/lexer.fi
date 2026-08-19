@@ -1,25 +1,25 @@
-// lib/firnc1/lexer.fi — DER LEXER VON FIRN, GESCHRIEBEN IN FIRN.
+// lib/firnc1/lexer.fi -- THE LEXER OF FIRN, WRITTEN AS FIRN.
 //
-// Erster Teil von Stufe 1 (docs/SELBSTHOSTING.md §2, Punkt 5). Der Lexer hat
-// die kleinste Schnittstelle im ganzen Compiler — Text hinein, Tokenfeld
-// hinaus — und braucht genau die Bausteine, die seit Runde 15 bis 19 stehen:
-// Allokator (`rt`), `Vec[T]` und `Interner`.
+// First part of stage 1 (docs/SELBSTHOSTING.md section 2, point 5). The lexer
+// has the smallest interface of the whole compiler -- text enters, a token
+// array comes out -- and needs exactly the parts standing since rounds 15 to 19:
+// allocator (`rt`), `Vec[T]` and `Interner`.
 //
-// MASSSTAB: `bin/lexdump.fi` gibt den Tokenstrom im GENAU gleichen Format aus
-// wie `firnc0 --emit=tokens`. `tools/lex_compare.sh` laesst beide ueber das
-// ganze Quellkorpus laufen und vergleicht Oktett fuer Oktett. Das ist keine
-// Selbstauskunft, sondern eine Gegenprobe gegen eine unabhaengige Umsetzung
-// in einer anderen Sprache.
+// YARDSTICK: `bin/lexdump.fi` writes the token stream with the EXACT same
+// format as `firnc0 --emit=tokens`. `tools/lex_compare.sh` runs both over the
+// whole source corpus and compares octet for octet. That is no
+// self report but a counter check against one independent implementation
+// written with another language.
 //
-// AUFBAU: Struktur der Felder statt Feld der Strukturen. `Vec[T]` verlangt
-// `T: Scalar`, ein Token ist aber ein Verbund — also liegen Art, Zeile,
-// Spalte, Laenge, Zahlwert und Nummer in SECHS gleich langen `Vec`. Das ist
-// nicht nur ein Ausweg: der Parser liest fast immer nur die Art.
+// LAYOUT: structure of arrays instead of array of structures. `Vec[T]` demands
+// `T: Scalar`, but one token is a compound -- so kind, line,
+// column, length, numeric value and number sit inside SIX equally long `Vec`.
+// That is not only a way out: the parser almost always reads just the kind.
 //
-// ZEICHEN GEGEN OKTETTE: `firnc0` arbeitet auf `Vec<char>`, Spalten zaehlen
-// ZEICHEN. Dieser Lexer arbeitet auf Oktetten und zaehlt eine Spalte nur beim
-// FUEHRENDEN Oktett eines UTF-8-Zeichens. Ohne das verschieben sich alle
-// Spalten hinter einem Umlaut in derselben Zeile.
+// CHARACTERS AGAINST OCTETS: `firnc0` works on `Vec<char>`, columns count
+// CHARACTERS. This lexer works on octets and counts one column only at the
+// LEADING octet of a UTF-8 character. Without that, every column behind
+// one umlaut of the same line would shift.
 
 import rt
 import vec
@@ -34,8 +34,8 @@ export { Lexer, lex_new, lex_free, lex_run, lex_count, lex_kind, lex_line,
          lex_diags, lex_names, lex_names_set,
          lex_kw_ptr, lex_kw_len, A_FSTR }
 
-// ------------------------------------------------------------- Tokenarten
-// Reihenfolge = Reihenfolge in `compiler/src/lexer.rs`.
+// ------------------------------------------------------------ token kinds
+// order = order inside `compiler/src/lexer.rs`.
 const A_INT: u32 = 0
 const A_IDENT: u32 = 1
 const A_FLOAT: u32 = 2
@@ -107,18 +107,18 @@ const A_GE: u32 = 67
 const A_EOF: u32 = 68
 const A_FSTR: u32 = 69
 
-// Art eines Zeichenkettenliterals
+// kind of a string literal
 const L_BYTES: u32 = 0
 const L_STR: u32 = 1
 const L_STR16: u32 = 2
-// `f"..."` (Interpolation, Runde 39): die Literaltafel traegt den ROHEN
-// Rumpf — entschluesselt und zerlegt wird erst im Parser.
+// `f"..."` (interpolation, round 39): the literal table carries the RAW
+// body -- decoded and split up it gets only inside the parser.
 const L_FSTR: u32 = 3
 
-// ------------------------------------------------------------------- Tafel
-// Firn hat keine veraenderlichen globalen Zustaende (Punkt 13 der Liste in
-// docs/SELBSTHOSTING.md). Eine Worttafel kann also nicht als globale Konstante
-// liegen — sie wird aus EINEM Literal gebaut, das mit '|' getrennt ist.
+// ------------------------------------------------------------------- table
+// Firn has no mutable global state (point 13 of the list inside
+// docs/SELBSTHOSTING.md). So a word table cannot sit there as a global
+// constant -- it is built out of ONE literal separated by '|'.
 struct Table {
     txt: u64,
     off: Vec[u32],
@@ -152,37 +152,37 @@ fn tab_count(t: *mut Table) -> usize { return vec_len[u32](&(*t).off) }
 fn tab_ptr(t: *mut Table, i: usize) -> u64 { return (*t).txt + vec_at[u32](&(*t).off, i) as u64 }
 fn tab_length(t: *mut Table, i: usize) -> usize { return vec_at[u32](&(*t).len, i) as usize }
 
-// ------------------------------------------------------------------ Lexer
+// ------------------------------------------------------------------ lexer
 
 struct Lexer {
-    q: u64,             // Quelltext (Oktette)
+    q: u64,             // source text (octets)
     n: usize,
-    p: usize,           // Leseposition in OKTETTEN
+    p: usize,           // read position, counted by OCTETS
     line: u32,
-    col: u32,        // Spalte in ZEICHEN, 1-basiert
+    col: u32,        // column counted by CHARACTERS, 1-based
     kind: Vec[u32],
     zl: Vec[u32],
     spl: Vec[u32],
     ln: Vec[u32],
-    number: Vec[u64],     // Int-Wert bzw. Bitmuster des f64
-    nr: Vec[u32],       // Ident: Internnummer · Str: Index in die Literaltafel
+    number: Vec[u64],     // int value or bit pattern of the f64
+    nr: Vec[u32],       // ident: intern number | str: index into the literal table
     names: intern.Interner,
-    // Ist dieser Zeiger gesetzt, wird STATT der eigenen Tafel eine gemeinsame
-    // benutzt. Das Modulsystem braucht das: mehrere Dateien, ein Namensraum —
-    // sonst meinte dieselbe Nummer in zwei Dateien zwei verschiedene Woerter.
+    // Once this pointer is set, a shared table gets used INSTEAD of the own
+    // one. The module system needs that: several files, one namespace --
+    // otherwise the same number would mean two different words inside two files.
     names_extern: u64,
-    lit: rt.Buf,        // Inhalte aller Literale hintereinander
-    lit_off: Vec[u32],  // Versatz in `lit` (in OKTETTEN)
-    lit_len: Vec[u32],  // Laenge in ELEMENTEN (u16 bei Str16!)
+    lit: rt.Buf,        // contents of all literals one after another
+    lit_off: Vec[u32],  // offset inside `lit` (counted by OCTETS)
+    lit_len: Vec[u32],  // length counted by ELEMENTS (u16 for Str16!)
     lit_kind: Vec[u32],
     kw: Table,
-    kw_txt: u64,        // Schluesselworttext wie an `lex_neu` uebergeben —
-    kw_len: usize,      // der Parser braucht ihn zum Lexen von Fragmenten
-                        // (Interpolation, Runde 39)
-    digits: Vec[u8],   // Kladde fuer die Ziffern eines Zahlliterals
-    dg: diag.Diags,     // gesammelte Meldungen
-    file: u32,         // Nummer der Quelldatei in der Karte
-    msg: rt.Buf,        // Kladde fuer den Text einer Meldung
+    kw_txt: u64,        // keyword text just as handed to `lex_new` --
+    kw_len: usize,      // the parser needs it to lex fragments
+                        // (interpolation, round 39)
+    digits: Vec[u8],   // scratch pad for the digits of a numeric literal
+    dg: diag.Diags,     // collected messages
+    file: u32,         // number of the source file inside the map
+    msg: rt.Buf,        // scratch pad for the text of one message
     float_slow: usize,
 }
 
@@ -215,7 +215,7 @@ fn lex_free(l: *mut Lexer) {
     vec_free[u32](&(*l).ln)
     vec_free[u64](&(*l).number)
     vec_free[u32](&(*l).nr)
-    // Eine GEMEINSAME Tafel gehoert dem Aufrufer und wird hier nicht frei.
+    // A SHARED table belongs to the caller and is not released here.
     if (*l).names_extern == 0 {
         intern.intern_free(&(*l).names)
     }
@@ -247,16 +247,16 @@ fn lex_names(l: *mut Lexer) -> *mut intern.Interner {
     return &(*l).names
 }
 
-// Muss VOR `lex_lauf` gesetzt werden.
+// Has to be set BEFORE `lex_run`.
 fn lex_names_set(l: *mut Lexer, it: u64) {
     (*l).names_extern = it
 }
 
-// ---------------------------------------------------------------- Meldungen
+// ----------------------------------------------------------------- messages
 //
-// Der Text einer Meldung wird in `msg` zusammengesetzt und dann als
-// Oktettfolge an `diag` uebergeben. Firn hat keine Textverkettung (Punkt 4 der
-// Liste in docs/SELBSTHOSTING.md) — dieser Puffer IST die Verkettung.
+// The text of one message is put together inside `msg` and then handed to
+// `diag` as octet sequence. Firn has no text concatenation (point 4 of the
+// list inside docs/SELBSTHOSTING.md) -- this buffer IS the concatenation.
 
 fn m_on(l: *mut Lexer) {
     rt.buf_clear(&(*l).msg)
@@ -270,7 +270,7 @@ fn m_number(l: *mut Lexer, v: u64) {
     rt.buf_push_dec_u64(&(*l).msg, v)
 }
 
-// Ein ZEICHEN der Quelle (alle Oktette) in die Meldung kopieren.
+// Copy one CHARACTER of the source (all octets) into the message.
 fn m_char(l: *mut Lexer, i: usize) {
     var w: usize = 1
     while i + w < (*l).n {
@@ -284,7 +284,7 @@ fn m_char(l: *mut Lexer, i: usize) {
     }
 }
 
-// Ein Codepunkt als vier GROSSE Hexziffern (`{:04X}` in Rust).
+// One code point as four CAPITAL hex digits (`{:04X}` at Rust).
 fn m_hex4(l: *mut Lexer, v: u64) {
     var i: i64 = 3
     while i >= 0 {
@@ -324,8 +324,8 @@ fn lex_name_length(l: *mut Lexer, nr: u32) -> usize {
     return intern.intern_length(lex_names(l), nr)
 }
 
-// ------------------------------------------------------------ Zeichenzugriff
-// 256 bedeutet Dateiende — so bleibt der Vergleich mit einem Oktett eindeutig.
+// ---------------------------------------------------------- character access
+// 256 means end of file -- that way the comparison with one octet stays clear.
 
 fn look(l: *mut Lexer, k: usize) -> u32 {
     if (*l).p + k >= (*l).n {
@@ -341,8 +341,8 @@ fn oct(l: *mut Lexer, i: usize) -> u32 {
     return rt.ld8((*l).q, i) as u32
 }
 
-// Ein OKTETT weiter. Zeile/Spalte werden nur beim fuehrenden Oktett
-// nachgefuehrt — Fortsetzungsoktette (10xxxxxx) gehoeren zum selben Zeichen.
+// One OCTET further. Line/column are tracked only at the leading
+// octet -- continuation octets (10xxxxxx) belong to the same character.
 fn vor1(l: *mut Lexer) {
     if (*l).p >= (*l).n {
         return
@@ -360,7 +360,7 @@ fn vor1(l: *mut Lexer) {
     }
 }
 
-// Ein ZEICHEN weiter.
+// One CHARACTER further.
 fn sign(l: *mut Lexer) {
     vor1(l)
     while (*l).p < (*l).n {
@@ -386,9 +386,9 @@ fn is_letter(c: u32) -> bool { return (c >= 65 && c <= 90) || (c >= 97 && c <= 1
 fn is_name_start(c: u32) -> bool { return c == 95 || is_letter(c) }
 fn is_name_next(c: u32) -> bool { return c == 95 || is_letter(c) || is_digit(c) }
 
-// EHRLICHE GRENZE: `char::is_whitespace` in Rust kennt auch U+00A0, U+2028 und
-// weitere. Hier zaehlt nur ASCII-Leerraum; alles andere wird zu 'unbekanntes
-// zeichen'. Im gesamten Quellkorpus kommt kein Unicode-Leerraum vor.
+// HONEST LIMIT: `char::is_whitespace` at Rust knows U+00A0, U+2028 and
+// others too. Here only ASCII blank space counts; everything else becomes
+// 'unknown character'. The whole source corpus holds no Unicode blank space.
 fn is_empty(c: u32) -> bool {
     return c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12
 }
@@ -400,7 +400,7 @@ fn hex_value(c: u32) -> i32 {
     return -1
 }
 
-// ------------------------------------------------- Leerraum und Kommentare
+// ------------------------------------------------ blank space and comments
 
 fn skip(l: *mut Lexer) {
     while true {
@@ -444,7 +444,7 @@ fn skip(l: *mut Lexer) {
     }
 }
 
-// --------------------------------------------------------------- Bezeichner
+// -------------------------------------------------------------- identifiers
 
 fn lex_name(l: *mut Lexer) {
     let line: u32 = (*l).line
@@ -469,14 +469,14 @@ fn lex_name(l: *mut Lexer) {
     tok(l, A_IDENT, line, col, len as u32, 0, n as u32)
 }
 
-// -------------------------------------------------------------------- Zahlen
+// ------------------------------------------------------------------- numbers
 
-// Bitmuster eines binary64. Der Umweg ueber eine ADRESSE ist Absicht: ein
-// direktes `(&t) as *mut u64` mit anschliessendem Lesen hat der Codegenerator
-// in Stufe 0 als Wertumwandlung behandelt und die Zahl 1 statt des Musters
-// 4607182418800017408 geliefert — der Fehler faellt nur auf, weil `firnc0`
-// danebensteht. Ueber `rt.ld64` auf dieselbe Adresse ist es eine echte
-// Neudeutung derselben acht Oktette.
+// Bit pattern of one binary64. The detour over the ADDRESS is deliberate: a
+// direct `(&t) as *mut u64` with a read behind it was treated by the code
+// generator of stage 0 as value conversion and yielded the number 1 instead of
+// the pattern 4607182418800017408 -- the bug shows up only because `firnc0`
+// stands beside it. Over `rt.ld64` onto the same address it is a true
+// reinterpretation of the very same eight octets.
 fn bits_of(x: f64) -> u64 {
     var t: f64 = 0.0
     let p: u64 = (&t) as u64
@@ -484,9 +484,9 @@ fn bits_of(x: f64) -> u64 {
     return rt.ld64(p, 0)
 }
 
-// 10^k ist fuer k <= 22 in binary64 EXAKT darstellbar, und das Produkt
-// 10^(k-1) * 10 rundet genau auf 10^k. Deshalb ist diese Schleife exakt.
-// 10^k als Ganzzahl; 0, wenn es nicht mehr in 64 Bit passt.
+// 10^k is EXACTLY representable as binary64 for k <= 22, and the product
+// 10^(k-1) * 10 rounds exactly onto 10^k. That is why this loop is exact.
+// 10^k as integer; 0, once it no longer fits into 64 bit.
 fn ten_high_whole(k: usize) -> u64 {
     if k > 19 {
         return 0
@@ -510,12 +510,12 @@ fn ten_high(k: usize) -> f64 {
     return t
 }
 
-// Der schnelle Pfad von Clinger: passt die Mantisse in 2^53 und liegt der
-// Zehnerexponent zwischen -22 und 22, dann ist EINE Multiplikation bzw.
-// Division in binary64 korrekt gerundet — das Ergebnis stimmt also aufs Bit.
-// Sonst wird gezaehlt (`gleit_langsam`) und schrittweise gerechnet; das kann
-// um ein ULP danebenliegen. Ein vollstaendiger Algorithmus (Eisel-Lemire)
-// braucht 128-Bit-Arithmetik und steht noch aus.
+// The fast path of Clinger: once the mantissa fits into 2^53 and the
+// decimal exponent lies between -22 and 22, ONE multiplication or
+// division is correctly rounded as binary64 -- so the result holds to the bit.
+// Otherwise it gets counted (`float_slow`) and computed stepwise; that can
+// lie one ULP beside. A complete algorithm (Eisel-Lemire)
+// needs 128 bit arithmetic and is still outstanding.
 fn float_value(l: *mut Lexer, mant: u64, overflow: bool, e: i64) -> f64 {
     if !overflow && mant <= 9007199254740992 && e >= -22 && e <= 22 {
         let f: f64 = mant as f64
@@ -524,10 +524,10 @@ fn float_value(l: *mut Lexer, mant: u64, overflow: bool, e: i64) -> f64 {
         }
         return f / ten_high((0 - e) as usize)
     }
-    // Erweiterung von Clinger: liegt der Exponent ueber 22, laesst sich der
-    // Ueberschuss oft in die MANTISSE ziehen, solange sie exakt bleibt
-    // (<= 2^53). Dann bleibt es bei EINER Multiplikation und damit bei EINER
-    // Rundung — das Ergebnis ist weiterhin korrekt gerundet.
+    // Extension of Clinger: once the exponent lies above 22, the
+    // excess can often be pulled into the MANTISSA, as long as it stays exact
+    // (<= 2^53). Then it stays with ONE multiplication and therefore with ONE
+    // rounding -- the result is still correctly rounded.
     if !overflow && e > 22 && e <= 37 {
         let excess: usize = (e - 22) as usize
         let factor: u64 = ten_high_whole(excess)
@@ -655,8 +655,8 @@ fn lex_int(l: *mut Lexer) {
         if !(is_digit(c) || is_letter(c)) {
             break
         }
-        // Bei Basis 10 beendet ein 'e'/'E' mit folgender Ziffer oder Vorzeichen
-        // die Ganzzahl — sonst waere '1e3' eine ungueltige Ziffer.
+        // For base 10 one 'e'/'E' followed by a digit or a sign ends
+        // the integer -- otherwise '1e3' would count as one invalid digit.
         if base == 10 && (c == 101 || c == 69) {
             let c2: u32 = look(l, 1)
             if is_digit(c2) || c2 == 43 || c2 == 45 {
@@ -667,7 +667,7 @@ fn lex_int(l: *mut Lexer) {
         if w >= 0 && (w as u32) < base {
             vec_push[u8](&(*l).digits, w as u8)
         } else {
-            // Nur die ERSTE ungueltige Ziffer wird gemeldet.
+            // Only the FIRST invalid digit gets reported.
             if !bad {
                 bad = true
                 s_line = (*l).line
@@ -679,7 +679,7 @@ fn lex_int(l: *mut Lexer) {
         width = width + 1
     }
     let cnt: usize = vec_len[u8](&(*l).digits)
-    // Gleitkomma nur zur Basis 10.
+    // Floating point only for base 10.
     if base == 10 && !bad && cnt > 0 {
         let dot: bool = look(l, 0) == 46 && is_digit(look(l, 1))
         var expo: bool = false
@@ -752,9 +752,9 @@ fn lex_int(l: *mut Lexer) {
     tok(l, A_INT, line, col, b, value, 0)
 }
 
-// -------------------------------------------------------- Satz- und Rechenzeichen
+// ------------------------------------------------------ punctuation and operators
 
-// `false`, wenn das Zeichen unbekannt ist.
+// `false`, once the character is unknown.
 fn lex_char(l: *mut Lexer) -> bool {
     let line: u32 = (*l).line
     let col: u32 = (*l).col
@@ -809,7 +809,7 @@ fn lex_char(l: *mut Lexer) -> bool {
     return true
 }
 
-// ------------------------------------------------------ Zeichenkettenliterale
+// ------------------------------------------------------------ string literals
 
 fn push_utf8(l: *mut Lexer, cp: u32) {
     if cp < 128 {
@@ -844,7 +844,7 @@ fn push_utf16(l: *mut Lexer, cp: u32) {
     }
 }
 
-// Codepunkt eines UTF-8-Zeichens ab `i` mit `w` Oktetten.
+// Code point of one UTF-8 character from `i` onwards with `w` octets.
 fn utf8_code_point(l: *mut Lexer, i: usize, w: usize) -> u32 {
     let b0: u32 = oct(l, i)
     if w == 1 { return b0 }
@@ -855,7 +855,7 @@ fn utf8_code_point(l: *mut Lexer, i: usize, w: usize) -> u32 {
     return ((b0 & 7) << 18) | ((oct(l, i + 1) & 63) << 12) | ((oct(l, i + 2) & 63) << 6) | (oct(l, i + 3) & 63)
 }
 
-// Genau `anz` Hexziffern ab `i`; -1, wenn eine fehlt.
+// Exactly `count` hex digits from `i` onwards; -1, once one is missing.
 fn hex_fixed(l: *mut Lexer, i: usize, cnt: usize, end: usize) -> i64 {
     if i + cnt > end { return -1 }
     var v: i64 = 0
@@ -869,13 +869,13 @@ fn hex_fixed(l: *mut Lexer, i: usize, cnt: usize, end: usize) -> i64 {
     return v
 }
 
-// `\uXXXX` bzw. `\u{...}` ab `i` lesen. Rueckgabe: (breite << 32) | codepunkt,
-// oder -1 bei Fehler. Firn hat keine Mehrfachrueckgabe — deshalb gepackt.
-// Fehlercodes, damit die Meldung genau die von `firnc0` ist:
-//   -1 nicht-hexadezimale Ziffer in `\u{...}`
-//   -2 Codepunkt ueber U+10FFFF
-//   -3 `\u{...}` nicht abgeschlossen
-//   -4 `\uXXXX` ohne vier Hexziffern
+// Read `\uXXXX` or `\u{...}` from `i` onwards. Return: (width << 32) | code point,
+// or -1 on error. Firn has no multiple return -- therefore packed.
+// Error codes, so that the message is exactly the one of `firnc0`:
+//   -1 non hexadecimal digit inside `\u{...}`
+//   -2 code point above U+10FFFF
+//   -3 `\u{...}` not terminated
+//   -4 `\uXXXX` without four hex digits
 fn read_u_escape(l: *mut Lexer, i: usize, end: usize) -> i64 {
     if oct(l, i) == 123 {
         var j: usize = i + 1
@@ -903,7 +903,7 @@ fn read_u_escape(l: *mut Lexer, i: usize, end: usize) -> i64 {
 fn is_high_surrogate(cp: i64) -> bool { return cp >= 55296 && cp <= 56319 }
 fn is_deep_surrogate(cp: i64) -> bool { return cp >= 56320 && cp <= 57343 }
 
-// Folgt ab `i` ein maskiertes NIEDRIGES Surrogat? Rueckgabe wie oben.
+// Does one escaped LOW surrogate follow from `i` onwards? Return as above.
 fn peek_deep(l: *mut Lexer, i: usize, end: usize) -> i64 {
     if i + 1 >= end { return -1 }
     if oct(l, i) != 92 || oct(l, i + 1) != 117 { return -1 }
@@ -915,10 +915,10 @@ fn peek_deep(l: *mut Lexer, i: usize, end: usize) -> i64 {
     return (br << 32) | cp
 }
 
-// Meldung eines Literalfehlers. Rust setzt die Spalte auf
-// `spalte + off`, wobei `off` ZEICHEN vom Anfang des Literals zaehlt
-// (einschliesslich `b`/`u` und Anfuehrungszeichen), und stellt jeder Meldung
-// "in a string literal: " voran.
+// Report of one literal error. Rust puts the column onto
+// `column + off`, where `off` counts CHARACTERS from the start of the literal
+// (`b`/`u` and quotes included), and puts the fixed prefix from `lit_on`
+// ahead of every message.
 fn lit_on(l: *mut Lexer) {
     var v: [u8; 21] = "in a string literal: "
     m_on(l)
@@ -929,12 +929,12 @@ fn lit_report(l: *mut Lexer, line: u32, col: u32, off: usize) {
     m_report(l, line, col + off as u32, 1)
 }
 
-// Entschluesselt den Rumpf [bs, be) und haengt ihn an `lit`. `false` = Fehler.
-// `lead` sind die Zeichen vor dem Rumpf (1 bei `"`, 2 bei `b"`/`u"`).
+// Decodes the body [bs, be) and appends it to `lit`. `false` = error.
+// `lead` are the characters ahead of the body (1 for `"`, 2 for `b"`/`u"`).
 fn decode(l: *mut Lexer, kind: u32, bs: usize, be: usize,
                   line: u32, col: u32, lead: usize) -> bool {
     var i: usize = bs
-    var zi: usize = 0        // Zeichenzaehler im Rumpf
+    var zi: usize = 0        // character counter inside the body
     var good: bool = true
     while i < be {
         let b: u32 = oct(l, i)
@@ -970,7 +970,7 @@ fn decode(l: *mut Lexer, kind: u32, bs: usize, be: usize,
             zi = zi + 1
             continue
         }
-        let start: usize = zi          // Zeichenindex des Rueckstrichs
+        let start: usize = zi          // character index of the backslash
         i = i + 1
         zi = zi + 1
         if i >= be {
@@ -1070,8 +1070,8 @@ fn decode(l: *mut Lexer, kind: u32, bs: usize, be: usize,
                 }
                 continue
             }
-            // `Str` ist geprueftes UTF-8: ein ungepaartes Surrogat ist ein
-            // Fehler, ein Paar wird zu EINEM Codepunkt vereinigt.
+            // `Str` is checked UTF-8: unpaired surrogates are errors,
+            // a pair gets joined into ONE code point.
             var unpaired: bool = false
             if is_high_surrogate(cp) {
                 let t: i64 = peek_deep(l, i, be)
@@ -1113,7 +1113,7 @@ fn decode(l: *mut Lexer, kind: u32, bs: usize, be: usize,
     return good
 }
 
-// `false`, wenn an dieser Stelle kein Literal steht.
+// `false`, once no literal stands at this spot.
 fn lex_text(l: *mut Lexer) -> bool {
     let c0: u32 = look(l, 0)
     var kind: u32 = 0
@@ -1184,23 +1184,23 @@ fn lex_text(l: *mut Lexer) -> bool {
     let offset: usize = rt.buf_len(&(*l).lit)
     var good: bool = closed
     if closed && kind == L_FSTR {
-        // Interpolation: der Rumpf bleibt ROH — das Zerlegen in Text- und
-        // Ausdruckssegmente samt Entschluesseln macht der Parser (Runde 39).
+        // Interpolation: the body stays RAW -- splitting it into text and
+        // expression segments together with decoding is the parser's job (round 39).
         rt.buf_push_bytes(&(*l).lit, (*l).q + bs as u64, be - bs)
     } else if closed {
         good = decode(l, kind, bs, be, line, col, front + 1)
     } else {
-        // Der Versatz ist hier `lead + Zeichen im Rumpf` — genau das steht in
-        // `zeichen`, weil der Zaehler bei `lead` beginnt und das schliessende
-        // Anfuehrungszeichen nie gelesen wurde.
+        // The offset here is `lead + characters inside the body` -- exactly what
+        // `chars` holds, because the counter starts at `lead` and the closing
+        // quote was never read.
         var u1: [u8; 34] = "string literal without a closing \""
         lit_on(l)
         m_txt(l, (&u1[0]) as u64, 34)
         lit_report(l, line, col, chars)
     }
     if !good {
-        // Weiterlexen mit einem LEEREN Literal — genau wie firnc0, damit
-        // Folgefehler nicht auf eine kaputte Tokenfolge zurueckgehen.
+        // Lex on with one EMPTY literal -- exactly like firnc0, so that
+        // follow up errors do not go back to a broken token sequence.
         rt.buf_set_len(&(*l).lit, offset)
     }
     let bytes: usize = rt.buf_len(&(*l).lit) - offset
@@ -1220,7 +1220,7 @@ fn lex_text(l: *mut Lexer) -> bool {
     return true
 }
 
-// ------------------------------------------------------------------- Lauf
+// ---------------------------------------------------------------- the run
 
 fn lex_run(l: *mut Lexer) {
     while true {
