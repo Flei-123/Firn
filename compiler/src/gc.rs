@@ -90,6 +90,18 @@ pub(crate) const FN_ALLOC: &str = "__gc_alloc_raw";
 pub(crate) const FN_BARRIER: &str = "__gc_barrier";
 /// Fehlermenge der fehlbaren Allokation (DESIGNZIELE §2).
 pub(crate) const ERR_SET: &str = "AllocError";
+/// **Runde 47** — Verteiler der Finalisierer (`SPEC` §3.5.3 `S4`).
+///
+/// Die Laufzeit ruft beim Einsammeln `__gc_finalisiere(art, p)`. Stufe 0 hat
+/// keine Funktionszeiger; eine Verteilerfunktion mit einer Kennung ist die
+/// ehrliche Entsprechung und braucht keinen indirekten Aufruf im
+/// Codegenerator (den baut R46 fuer Vtables, nicht diese Runde).
+///
+/// Deklariert die **Wurzeldatei** des Programms diese Funktion selbst, nimmt
+/// der Compiler sie; sonst legt er die leere Voreinstellung dazu. Nur die
+/// Wurzeldatei zaehlt, weil in einem Modul der Name zu `modul__…` wird und
+/// die Laufzeit ihn dann nicht mehr faende.
+pub(crate) const FN_FINAL: &str = "__gc_finalisiere";
 
 // ---------------------------------------------------------------- Datenmodell
 
@@ -1190,14 +1202,42 @@ pub(crate) fn quelle_hat_allocerror(toks: &[crate::lexer::Token]) -> bool {
     })
 }
 
+/// Deklariert die Wurzeldatei selbst `fn __gc_finalisiere`?
+pub(crate) fn quelle_hat_finalisierer(toks: &[crate::lexer::Token]) -> bool {
+    toks.windows(2).any(|w| {
+        matches!(&w[0].kind, TokKind::KwFn)
+            && matches!(&w[1].kind, TokKind::Ident(b) if b == FN_FINAL)
+    })
+}
+
+/// Die leere Voreinstellung des Finalisierer-Verteilers.
+fn finalisierer_default() -> String {
+    let mut s = String::new();
+    s.push_str("// Runde 47: Voreinstellung des Finalisierer-Verteilers. Das Programm\n");
+    s.push_str("// deklariert keinen eigenen, also tut das Aufraeumen nichts.\n");
+    s.push_str("fn ");
+    s.push_str(FN_FINAL);
+    s.push_str("(art: u64, p: *mut u8) {\n");
+    s.push_str("    let _unbenutzt: u64 = art + (p as u64)\n");
+    s.push_str("}\n");
+    s
+}
+
 /// Quelltext der Laufzeit. `mit_fehlermenge = false`, wenn das Programm
 /// `AllocError` bereits selbst deklariert (Fehlermengennamen sind programmweit).
-pub(crate) fn laufzeit_quelle(mit_fehlermenge: bool) -> String {
+/// `mit_finalisierer = false`, wenn die Wurzeldatei den Verteiler selbst
+/// mitbringt.
+pub(crate) fn laufzeit_quelle(mit_fehlermenge: bool, mit_finalisierer: bool) -> String {
     let mut s = String::new();
     if mit_fehlermenge {
         s.push_str("error AllocError { OutOfMemory }\n");
     } else {
         s.push_str("// AllocError wird vom Programm selbst deklariert\n");
+    }
+    if mit_finalisierer {
+        s.push_str(&finalisierer_default());
+    } else {
+        s.push_str("// __gc_finalisiere wird vom Programm selbst deklariert\n");
     }
     s.push_str(LAUFZEIT);
     s
@@ -1227,11 +1267,17 @@ mod tests {
 
     #[test]
     fn laufzeit_enthaelt_die_pflichtnamen() {
-        let q = laufzeit_quelle(true);
+        let q = laufzeit_quelle(true, true);
         for n in ["gc_init", "gc_collect", "gc_live_objects", FN_ALLOC, FN_WEAK, FN_STARK, FN_AS] {
             assert!(q.contains(n), "laufzeit ohne '{}'", n);
         }
         assert!(q.contains("error AllocError"));
-        assert!(!laufzeit_quelle(false).contains("error AllocError {"));
+        assert!(!laufzeit_quelle(false, true).contains("error AllocError {"));
+        // Runde 47: der Verteiler ist genau EINMAL da — entweder als
+        // Voreinstellung oder aus dem Programm, nie doppelt.
+        assert!(q.contains("fn __gc_finalisiere(art: u64, p: *mut u8) {"));
+        assert!(!laufzeit_quelle(true, false).contains("fn __gc_finalisiere(art: u64, p: *mut u8) {"));
+        assert!(q.contains("gc_finalisierer_setzen"));
+        assert!(q.contains("gc_wurzel_anmelden"));
     }
 }
