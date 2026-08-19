@@ -17,10 +17,18 @@
 // nachruesten musste und den DESIGNZIELE/SPEC §3.5 als Grund fuer den
 // Tracing-GC nennen.
 //
-// Objektaufbau (64 Byte):
-//   [0]  Zaehler        [8]  eltern         [16] erstes_kind
-//   [24] naechstes      [32] listener/ziel  [40] wrapper/knoten
-//   [48] wurzel         [56] Freiliste-Verkettung
+// Objektaufbau (128 Byte, Runde 53). Der Satz bildet den GC-Satz aus
+// lib/dom/dom.fi OBJEKT FUER OBJEKT nach — auch die Sammlungen und ihre
+// Slot-Puffer, sonst waeren nicht mehr dieselben zwei Graphen verglichen:
+//   [0]   Zaehler
+//   [8]   eltern        [16]  kinderliste   [24]  puffer der kinderliste
+//   [32]  element 0     [40]  element 1     [48]  element 2
+//   [56]  listenerliste [64]  wrapper       [72]  wurzel
+//   [80]  ziel          [88]  attrtabelle   [96]  attrwert (Str)
+//   [104] naechstes     [112] reserviert    [120] Freiliste-Verkettung
+// Alle Spalten von [8] bis [112] sind VERWEISE und werden beim Freigeben
+// generisch losgelassen — deshalb kostet eine neue Spalte hier keine neue
+// Zeile in `lk_lassen`.
 
 import mess
 
@@ -32,7 +40,7 @@ const SYS_MMAP: i64 = 9
 const PROT_RW: i64 = 3
 const MAP_PRIVATE_ANON: i64 = 34
 
-const OBJ_BYTES: u64 = 64
+const OBJ_BYTES: u64 = 128
 const CHUNK_BYTES: u64 = 1048576
 
 // Zustandsblock der Halde
@@ -46,12 +54,22 @@ const H_BYTES: u64 = 40
 // Objektfelder
 const F_ZAEHLER: u64 = 0
 const F_ELTERN: u64 = 8
-const F_KIND: u64 = 16
-const F_NAECHST: u64 = 24
-const F_LISTENER: u64 = 32
-const F_WRAPPER: u64 = 40
-const F_WURZEL: u64 = 48
-const F_FREI: u64 = 56
+const F_KINDER: u64 = 16
+const F_PUFFER: u64 = 24
+const F_E0: u64 = 32
+const F_E1: u64 = 40
+const F_E2: u64 = 48
+const F_LISTENER: u64 = 56
+const F_WRAPPER: u64 = 64
+const F_WURZEL: u64 = 72
+const F_ZIEL: u64 = 80
+const F_ATTRS: u64 = 88
+const F_WERT: u64 = 96
+const F_NAECHST: u64 = 104
+const F_FREI: u64 = 120
+// Verweisspalten: [F_SLOT0, F_SLOT0 + F_SLOTS*8)
+const F_SLOT0: u64 = 8
+const F_SLOTS: u64 = 14
 
 fn lk_ld(a: u64) -> u64 {
     return *(a as *mut u64)
@@ -134,24 +152,20 @@ fn lk_lassen(h: u64, o: u64) {
         return
     }
     lk_st(o + F_ZAEHLER, 0)
-    let a: u64 = lk_ld(o + F_ELTERN)
-    let b: u64 = lk_ld(o + F_KIND)
-    let c: u64 = lk_ld(o + F_NAECHST)
-    let d: u64 = lk_ld(o + F_LISTENER)
-    let e: u64 = lk_ld(o + F_WRAPPER)
-    let f: u64 = lk_ld(o + F_WURZEL)
-    lk_st(o + F_ELTERN, 0)
-    lk_st(o + F_KIND, 0)
-    lk_st(o + F_NAECHST, 0)
-    lk_st(o + F_LISTENER, 0)
-    lk_st(o + F_WRAPPER, 0)
-    lk_st(o + F_WURZEL, 0)
-    lk_lassen(h, a)
-    lk_lassen(h, b)
-    lk_lassen(h, c)
-    lk_lassen(h, d)
-    lk_lassen(h, e)
-    lk_lassen(h, f)
+    // Erst ALLE Spalten sichern und nullen, dann loslassen: waehrend des
+    // Loslassens kann dieses Objekt erneut betreten werden.
+    var gesichert: [u64; 14] = [0; 14]
+    var i: u64 = 0
+    while i < F_SLOTS {
+        gesichert[i as usize] = lk_ld(o + F_SLOT0 + i * 8)
+        lk_st(o + F_SLOT0 + i * 8, 0)
+        i = i + 1
+    }
+    i = 0
+    while i < F_SLOTS {
+        lk_lassen(h, gesichert[i as usize])
+        i = i + 1
+    }
     lk_st(o + F_FREI, lk_ld(h + H_FREI))
     lk_st(h + H_FREI, o)
     lk_st(h + H_LEBENDE, lk_ld(h + H_LEBENDE) - 1)
@@ -165,15 +179,61 @@ fn lk_setz(h: u64, o: u64, feld: u64, wert: u64) {
     lk_lassen(h, alt)
 }
 
-// Ein vollstaendiger Zyklensatz, Aufbau identisch zu dom.dom_zyklus_bauen():
-// 1 Wurzel + 3 Kinder (mit starkem Elternverweis) + Listener + Sammlung +
-// Wrapper. Liefert die Zahl der angelegten Objekte, 0 bei Speichermangel.
+// Ein vollstaendiger Zyklensatz, Aufbau OBJEKT FUER OBJEKT identisch zu
+// dom.dom_zyklus_bauen() (Runde 53, 14 Objekte):
+//   1 Wurzel
+//   3 Attributtabelle + ihr Puffer + ein Wertobjekt (Str)
+//   3 Kinder mit starkem Elternverweis
+//   2 Kinderliste + ihr Puffer
+//   3 Listenerliste + ihr Puffer + der Listener
+//   1 Sammlung
+//   1 Wrapper
+// Liefert die Zahl der angelegten Objekte, 0 bei Speichermangel.
 fn lk_satz_bauen(h: u64) -> u64 {
     let wurzel: u64 = lk_alloc(h)
     if wurzel == 0 {
         return 0
     }
-    var letztes: u64 = 0
+
+    // --- Attribute: Tabelle -> Puffer -> Wert (Zyklus 2 ohne Rueckverweis)
+    let at: u64 = lk_alloc(h)
+    if at == 0 {
+        lk_lassen(h, wurzel)
+        return 0
+    }
+    lk_setz(h, wurzel, F_ATTRS, at)
+    lk_lassen(h, at)
+    let ap: u64 = lk_alloc(h)
+    if ap == 0 {
+        lk_lassen(h, wurzel)
+        return 0
+    }
+    lk_setz(h, at, F_PUFFER, ap)
+    lk_lassen(h, ap)
+    let av: u64 = lk_alloc(h)
+    if av == 0 {
+        lk_lassen(h, wurzel)
+        return 0
+    }
+    lk_setz(h, ap, F_WERT, av)
+    lk_lassen(h, av)
+
+    // --- Kinder: Wurzel -> Kinderliste -> Puffer -> Kind -> Wurzel.
+    // Genau dieser Zyklus laeuft in der GC-Fassung ueber eine GcVec.
+    let kl: u64 = lk_alloc(h)
+    if kl == 0 {
+        lk_lassen(h, wurzel)
+        return 0
+    }
+    lk_setz(h, wurzel, F_KINDER, kl)
+    lk_lassen(h, kl)
+    let kp: u64 = lk_alloc(h)
+    if kp == 0 {
+        lk_lassen(h, wurzel)
+        return 0
+    }
+    lk_setz(h, kl, F_PUFFER, kp)
+    lk_lassen(h, kp)
     var i: u64 = 0
     while i < 3 {
         let k: u64 = lk_alloc(h)
@@ -182,47 +242,60 @@ fn lk_satz_bauen(h: u64) -> u64 {
             return 0
         }
         lk_setz(h, k, F_ELTERN, wurzel)
-        if letztes == 0 {
-            lk_setz(h, wurzel, F_KIND, k)
-        } else {
-            lk_setz(h, letztes, F_NAECHST, k)
-        }
-        letztes = k
+        lk_setz(h, kp, F_E0 + i * 8, k)
         lk_lassen(h, k)
         i = i + 1
     }
+
+    // --- Listener: Wurzel -> Listenerliste -> Puffer -> Listener -> Wurzel
+    let ll: u64 = lk_alloc(h)
+    if ll == 0 {
+        lk_lassen(h, wurzel)
+        return 0
+    }
+    lk_setz(h, wurzel, F_LISTENER, ll)
+    lk_lassen(h, ll)
+    let lp: u64 = lk_alloc(h)
+    if lp == 0 {
+        lk_lassen(h, wurzel)
+        return 0
+    }
+    lk_setz(h, ll, F_PUFFER, lp)
+    lk_lassen(h, lp)
     let l: u64 = lk_alloc(h)
     if l == 0 {
         lk_lassen(h, wurzel)
         return 0
     }
-    lk_setz(h, l, F_LISTENER, wurzel)
-    lk_setz(h, wurzel, F_LISTENER, l)
+    lk_setz(h, l, F_ZIEL, wurzel)
+    lk_setz(h, lp, F_E0, l)
     lk_lassen(h, l)
 
+    // --- Sammlung: KEIN Rueckverweis, sie verschwindet gleich wieder.
     let s: u64 = lk_alloc(h)
     if s == 0 {
         lk_lassen(h, wurzel)
         return 0
     }
     lk_setz(h, s, F_WURZEL, wurzel)
-    // Die Sammlung hat KEINEN Rueckverweis — sie verschwindet gleich wieder.
     lk_lassen(h, s)
 
+    // --- Wrapper
     let w: u64 = lk_alloc(h)
     if w == 0 {
         lk_lassen(h, wurzel)
         return 0
     }
-    lk_setz(h, w, F_WRAPPER, wurzel)
+    lk_setz(h, w, F_ZIEL, wurzel)
     lk_setz(h, wurzel, F_WRAPPER, w)
     lk_lassen(h, w)
 
     // Die letzte lokale Referenz auf die Wurzel wird abgegeben. Ein
     // Tracing-Sammler wuerde den ganzen Satz jetzt einsammeln; der Zaehler
-    // kann es nicht: Kind haelt Eltern, Eltern halten Kind.
+    // kann es nicht: Kind haelt Eltern, Eltern halten ihre Kinderliste,
+    // die Kinderliste haelt das Kind.
     lk_lassen(h, wurzel)
-    return 7
+    return 14
 }
 
 // Kopfzeile 1 des Protokolls
@@ -337,7 +410,7 @@ fn main() -> i32 {
     var laufen: bool = true
     while laufen {
         let n: u64 = lk_satz_bauen(h)
-        if n != 7 {
+        if n != 14 {
             return fehler(4)
         }
         zyklen = zyklen + 1
