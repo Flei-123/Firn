@@ -1052,7 +1052,17 @@ Code nicht auseinanderlaufen.
     **einem** Binary übersetzt. Umgesetzt ist *Gesamtprogramm-Übersetzung mit
     getrennten Namensräumen* (Namen der Nicht-Wurzelmodule heißen intern
     `modul__name`), **nicht** getrennte Objektdateien mit Schnittstellendateien.
-    Es gibt keine Paketverwaltung (`W1`, ABNAHME Punkt 5 bleibt offen).
+    **Runde 48 — Projektsystem.** Dazugekommen ist das Manifest
+    `firn.paket` (`paket`, `version`, `start`, `quelle`, `oeffentlich`,
+    `brauche`), eine festgelegte Suchreihenfolge (importierende Datei →
+    Wurzeldatei → Projektquellen → `brauche`-Abhängigkeiten → `$FIRNLIB` →
+    `<exe>/../lib`), **Sichtbarkeit auf Modulebene** über die
+    `oeffentlich`-Liste, Erkennung von Paketzyklen und
+    Modul-Namenskonflikten und der Bau-Treiber `firnc --paket <verz>`.
+    Ohne Manifest ändert sich **nichts**. Es bleibt bei
+    Gesamtprogramm-Übersetzung: keine getrennten Objektdateien, kein
+    Netzwerk, keine Sperrdatei, keine Versionsauflösung — `W1` und ABNAHME
+    Punkt 5 bleiben deshalb offen (`docs/RUNDE48.md`).
 16. **Zeilennummern für den Debugger (Runde 2, Modul `kern`).** Der Compiler
     schreibt `.file`/`.loc`-Direktiven; `as` erzeugt daraus `.debug_line`.
     Anweisungsgenaue Zeilen gibt es **nur ohne Optimierer** (`--no-opt`), weil

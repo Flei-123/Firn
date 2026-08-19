@@ -1,0 +1,1443 @@
+// lib/firnc1/paket.fi — das Projektmanifest `firn.paket`, in Firn.
+//
+// ZWILLING von `compiler/src/paket.rs` (Format, reine Funktionen) und
+// `compiler/src/paketwelt.rs` (Dateisystem, Abhaengigkeitsgraph). Beide
+// Seiten muessen dieselbe Suchreihenfolge, dieselbe Sichtbarkeitsregel und
+// ZEICHENGLEICHE Meldungen liefern — `tools/pakete/run.sh` stellt sie
+// gegeneinander.
+//
+// WARUM KEIN TOML: siehe compiler/src/paket.rs. Kurz: TOML ist eine echte
+// Spezifikation, dieser Uebersetzer hat keine Fremdbibliotheken, und alles
+// muss zweimal stehen — hier ohne libc, nur mit Puffern und `syscall`. Ein
+// halbes TOML waere schlimmer als ein ehrliches eigenes Zeilenformat.
+//
+// GRENZEN DIESER FASSUNG (bewusst, gleich in beiden Uebersetzern):
+//   * keine Anfuehrungszeichen, keine Maskierungen — ein Wert enthaelt
+//     weder Leerzeichen noch `#`
+//   * Pfade werden REIN LEXIKALISCH normalisiert; symbolische Verweise
+//     werden nicht aufgeloest
+//   * hoechstens sechs Parameter je Funktion, weil `lib/firnc1/codegen.fi`
+//     nicht mehr kann — deshalb reisen Zwischenergebnisse in Feldern von
+//     `Welt` statt in Ausgabeparametern
+
+import rt
+import vec
+
+export {
+    Welt,
+    welt_neu, welt_frei, welt_ist_leer, welt_anzahl, welt_fehler,
+    welt_ab_wurzel, welt_ab_datei,
+    welt_paket_von, welt_kante, welt_ist_oeffentlich,
+    welt_quelle_anzahl, welt_quelle_basis, welt_info,
+    welt_name_zeiger, welt_start_zeiger,
+    welt_text_nicht_oeffentlich, welt_text_keine_abhaengigkeit,
+    welt_text_namenskonflikt, welt_text_kein_start,
+    normalisiere, verbinde, verzeichnis_von, modulname, absolut, liegt_in,
+    arbeitsverzeichnis, ist_datei, ptext,
+}
+
+// "kein Eintrag" — Offsets in der Zeichenkettenablage sind sonst gueltig.
+const KEIN: u32 = 4294967295
+// Wie viele Verzeichnisebenen die Manifestsuche nach oben geht.
+const SUCHTIEFE: usize = 64
+
+// ----------------------------------------------------------- Zeichenhilfen
+
+fn ist_trenner(c: u8) -> bool {
+    return c == 32 as u8 || c == 9 as u8
+}
+
+fn ist_ziffer(c: u8) -> bool {
+    return c >= 48 as u8 && c <= 57 as u8
+}
+
+fn ist_buchst(c: u8) -> bool {
+    if c >= 65 as u8 && c <= 90 as u8 {
+        return true
+    }
+    return c >= 97 as u8 && c <= 122 as u8
+}
+
+// Einen nullabgeschlossenen Text anhaengen. Alle festen Meldungstexte in
+// dieser Datei enden auf `\0`, damit ihre Laenge nur EINMAL dasteht.
+fn ptext(b: *mut rt.Buf, p: u64) {
+    rt.buf_push_bytes(b, p, rt.c_laenge(p))
+}
+
+// Puffer nullabschliessen, ohne die Laenge mitzuzaehlen: der Inhalt bleibt
+// (p, len), aber `open`/`c_laenge` sehen eine gueltige Zeichenkette.
+fn null_dahinter(b: *mut rt.Buf) {
+    rt.buf_push(b, 0 as u8)
+    rt.buf_set_len(b, rt.buf_len(b) - 1)
+}
+
+// ------------------------------------------------------------- Pfadrechnen
+//
+// `a/./b/../c` -> `a/c`. Der Kellerspeicher fuer `..` ist der AUSGABEPUFFER
+// selbst: zurueckgehen heisst, bis zum vorigen Schraegstrich zu kuerzen. So
+// braucht die Rechnung kein Hilfsfeld und hat keine Tiefengrenze.
+
+fn normalisiere(aus: *mut rt.Buf, p: u64, n: usize) {
+    rt.buf_leeren(aus)
+    var absolut_: bool = false
+    if n > 0 {
+        if rt.ld8(p, 0) == 47 as u8 {
+            absolut_ = true
+        }
+    }
+    if absolut_ {
+        rt.buf_push(aus, 47 as u8)
+    }
+    let kopf: usize = rt.buf_len(aus)
+    var i: usize = 0
+    while i < n {
+        while i < n {
+            if rt.ld8(p, i) != 47 as u8 {
+                break
+            }
+            i = i + 1
+        }
+        if i >= n {
+            break
+        }
+        let s: usize = i
+        while i < n {
+            if rt.ld8(p, i) == 47 as u8 {
+                break
+            }
+            i = i + 1
+        }
+        let laen: usize = i - s
+        var punkt1: bool = false
+        var punkt2: bool = false
+        if laen == 1 {
+            if rt.ld8(p, s) == 46 as u8 {
+                punkt1 = true
+            }
+        }
+        if laen == 2 {
+            if rt.ld8(p, s) == 46 as u8 {
+                if rt.ld8(p, s + 1) == 46 as u8 {
+                    punkt2 = true
+                }
+            }
+        }
+        if punkt1 {
+            continue
+        }
+        if punkt2 {
+            var zurueck: bool = false
+            let l: usize = rt.buf_len(aus)
+            if l > kopf {
+                var k: usize = l
+                while k > kopf {
+                    if rt.buf_at(aus, k - 1) == 47 as u8 {
+                        break
+                    }
+                    k = k - 1
+                }
+                var vorher_pp: bool = false
+                if l - k == 2 {
+                    if rt.buf_at(aus, k) == 46 as u8 {
+                        if rt.buf_at(aus, k + 1) == 46 as u8 {
+                            vorher_pp = true
+                        }
+                    }
+                }
+                if !vorher_pp {
+                    var neu: usize = k
+                    if neu > kopf {
+                        neu = neu - 1
+                    }
+                    rt.buf_set_len(aus, neu)
+                    zurueck = true
+                }
+            }
+            if !zurueck {
+                if !absolut_ {
+                    if rt.buf_len(aus) > kopf {
+                        rt.buf_push(aus, 47 as u8)
+                    }
+                    rt.buf_push(aus, 46 as u8)
+                    rt.buf_push(aus, 46 as u8)
+                }
+            }
+            continue
+        }
+        if rt.buf_len(aus) > kopf {
+            rt.buf_push(aus, 47 as u8)
+        }
+        rt.buf_push_bytes(aus, p + s as u64, laen)
+    }
+    if rt.buf_len(aus) == 0 {
+        rt.buf_push(aus, 46 as u8)
+    }
+    null_dahinter(aus)
+}
+
+// `basis` + `rel`, normalisiert. Ein absolutes `rel` gewinnt.
+fn verbinde(aus: *mut rt.Buf, bp: u64, bn: usize, rp: u64, rn: usize) {
+    var abs_rel: bool = false
+    if rn > 0 {
+        if rt.ld8(rp, 0) == 47 as u8 {
+            abs_rel = true
+        }
+    }
+    if abs_rel || bn == 0 {
+        normalisiere(aus, rp, rn)
+        return
+    }
+    var t: rt.Buf = rt.buf_neu()
+    rt.buf_push_bytes(&t, bp, bn)
+    rt.buf_push(&t, 47 as u8)
+    rt.buf_push_bytes(&t, rp, rn)
+    normalisiere(aus, rt.buf_ptr(&t), rt.buf_len(&t))
+    rt.buf_frei(&t)
+}
+
+// Verzeichnisteil eines Pfades, OHNE abschliessenden Schraegstrich.
+fn verzeichnis_von(aus: *mut rt.Buf, p: u64, n: usize) {
+    rt.buf_leeren(aus)
+    var letzter: i64 = 0 - 1
+    var i: usize = 0
+    while i < n {
+        if rt.ld8(p, i) == 47 as u8 {
+            letzter = i as i64
+        }
+        i = i + 1
+    }
+    if letzter < 0 {
+        rt.buf_push(aus, 46 as u8)
+    } else {
+        if letzter == 0 {
+            rt.buf_push(aus, 47 as u8)
+        } else {
+            rt.buf_push_bytes(aus, p, letzter as usize)
+        }
+    }
+    null_dahinter(aus)
+}
+
+// Letzter Namensteil ohne Endung — der Modulname einer Datei.
+fn modulname(aus: *mut rt.Buf, p: u64, n: usize) {
+    rt.buf_leeren(aus)
+    var s: usize = 0
+    var i: usize = 0
+    while i < n {
+        if rt.ld8(p, i) == 47 as u8 {
+            s = i + 1
+        }
+        i = i + 1
+    }
+    var punkt: usize = 0
+    var k: usize = s + 1
+    while k < n {
+        if rt.ld8(p, k) == 46 as u8 {
+            punkt = k
+        }
+        k = k + 1
+    }
+    var e: usize = n
+    if punkt > s {
+        e = punkt
+    }
+    rt.buf_push_bytes(aus, p + s as u64, e - s)
+    null_dahinter(aus)
+}
+
+// Liegt `a` in `wurzel` (oder IST es das)? Beide normalisiert.
+fn liegt_in(ap: u64, an: usize, wp: u64, wn: usize) -> bool {
+    if an == wn {
+        return rt.mem_eq(ap, wp, an)
+    }
+    if wn == 1 {
+        if rt.ld8(wp, 0) == 47 as u8 {
+            if an > 0 {
+                return rt.ld8(ap, 0) == 47 as u8
+            }
+            return false
+        }
+    }
+    if an <= wn {
+        return false
+    }
+    if !rt.mem_eq(ap, wp, wn) {
+        return false
+    }
+    return rt.ld8(ap, wn) == 47 as u8
+}
+
+// Arbeitsverzeichnis (getcwd). Schlaegt es fehl, gilt "/".
+fn arbeitsverzeichnis(aus: *mut rt.Buf) {
+    var b: [u8; 4096] = [0 as u8; 4096]
+    let r: i64 = syscall(79, (&b[0]) as i64, 4096, 0, 0, 0, 0)
+    if r <= 0 {
+        rt.buf_leeren(aus)
+        rt.buf_push(aus, 47 as u8)
+        null_dahinter(aus)
+        return
+    }
+    normalisiere(aus, (&b[0]) as u64, (r as usize) - 1)
+}
+
+// `pfad` absolut machen (relativ zum Arbeitsverzeichnis).
+fn absolut(aus: *mut rt.Buf, p: u64, n: usize, cp: u64, cn: usize) {
+    var ist_abs: bool = false
+    if n > 0 {
+        if rt.ld8(p, 0) == 47 as u8 {
+            ist_abs = true
+        }
+    }
+    if ist_abs {
+        normalisiere(aus, p, n)
+        return
+    }
+    verbinde(aus, cp, cn, p, n)
+}
+
+// Gibt es diese Datei? `access(pfad, F_OK)`.
+fn ist_datei(p: u64) -> bool {
+    return syscall(21, p as i64, 0, 0, 0, 0, 0) == 0
+}
+
+// ------------------------------------------------------------------- Welt
+//
+// Alle Zeichenketten liegen hintereinander in `txt`, je mit einer Null
+// abgeschlossen; gespeichert wird nur der OFFSET. Deshalb darf ein Zeiger
+// aus `s_zeiger` nicht ueber ein weiteres `s_dazu` hinweg benutzt werden.
+
+struct Welt {
+    txt: rt.Buf,
+    fehler: rt.Buf,
+    wert: rt.Buf,
+
+    p_name: Vec[u32],
+    p_ver: Vec[u32],
+    p_start: Vec[u32],
+    p_wurzel: Vec[u32],
+    p_mpfad: Vec[u32],
+    p_q0: Vec[u32],
+    p_q1: Vec[u32],
+    p_o0: Vec[u32],
+    p_o1: Vec[u32],
+    p_a0: Vec[u32],
+    p_a1: Vec[u32],
+
+    q: Vec[u32],
+    o: Vec[u32],
+    a_name: Vec[u32],
+    a_pfad: Vec[u32],
+    a_zeile: Vec[u32],
+
+    farbe: Vec[u32],
+    weg: Vec[u32],
+
+    letzt_name: u32,
+    letzt_ver: u32,
+    letzt_start: u32,
+}
+
+fn welt_neu() -> Welt {
+    return Welt{
+        txt: rt.buf_neu(), fehler: rt.buf_neu(), wert: rt.buf_neu(),
+        p_name: vec_neu[u32](), p_ver: vec_neu[u32](), p_start: vec_neu[u32](),
+        p_wurzel: vec_neu[u32](), p_mpfad: vec_neu[u32](),
+        p_q0: vec_neu[u32](), p_q1: vec_neu[u32](),
+        p_o0: vec_neu[u32](), p_o1: vec_neu[u32](),
+        p_a0: vec_neu[u32](), p_a1: vec_neu[u32](),
+        q: vec_neu[u32](), o: vec_neu[u32](),
+        a_name: vec_neu[u32](), a_pfad: vec_neu[u32](), a_zeile: vec_neu[u32](),
+        farbe: vec_neu[u32](), weg: vec_neu[u32](),
+        letzt_name: KEIN, letzt_ver: KEIN, letzt_start: KEIN,
+    }
+}
+
+fn welt_frei(w: *mut Welt) {
+    rt.buf_frei(&(*w).txt)
+    rt.buf_frei(&(*w).fehler)
+    rt.buf_frei(&(*w).wert)
+    vec_frei[u32](&(*w).p_name)
+    vec_frei[u32](&(*w).p_ver)
+    vec_frei[u32](&(*w).p_start)
+    vec_frei[u32](&(*w).p_wurzel)
+    vec_frei[u32](&(*w).p_mpfad)
+    vec_frei[u32](&(*w).p_q0)
+    vec_frei[u32](&(*w).p_q1)
+    vec_frei[u32](&(*w).p_o0)
+    vec_frei[u32](&(*w).p_o1)
+    vec_frei[u32](&(*w).p_a0)
+    vec_frei[u32](&(*w).p_a1)
+    vec_frei[u32](&(*w).q)
+    vec_frei[u32](&(*w).o)
+    vec_frei[u32](&(*w).a_name)
+    vec_frei[u32](&(*w).a_pfad)
+    vec_frei[u32](&(*w).a_zeile)
+    vec_frei[u32](&(*w).farbe)
+    vec_frei[u32](&(*w).weg)
+}
+
+fn welt_anzahl(w: *mut Welt) -> usize {
+    return vec_len[u32](&(*w).p_name)
+}
+
+fn welt_ist_leer(w: *mut Welt) -> bool {
+    return welt_anzahl(w) == 0
+}
+
+fn welt_fehler(w: *mut Welt) -> *mut rt.Buf {
+    return &(*w).fehler
+}
+
+fn s_dazu(w: *mut Welt, p: u64, n: usize) -> u32 {
+    let off: u32 = rt.buf_len(&(*w).txt) as u32
+    rt.buf_push_bytes(&(*w).txt, p, n)
+    rt.buf_push(&(*w).txt, 0 as u8)
+    return off
+}
+
+fn s_zeiger(w: *mut Welt, off: u32) -> u64 {
+    return rt.buf_ptr(&(*w).txt) + off as u64
+}
+
+// ---------------------------------------------------------- Fehlermeldungen
+
+fn fehler_beginn(w: *mut Welt) {
+    rt.buf_leeren(&(*w).fehler)
+    var t: [u8; 8] = "error: \0"
+    ptext(&(*w).fehler, (&t[0]) as u64)
+}
+
+fn fehler_hinweis(w: *mut Welt) {
+    var t: [u8; 10] = "hinweis: \0"
+    ptext(&(*w).fehler, (&t[0]) as u64)
+}
+
+fn fehler_schluss(w: *mut Welt) {
+    rt.buf_push(&(*w).fehler, 10 as u8)
+}
+
+// "<manifest>:<zeile>: " bzw. "<manifest>: " fuer zeile == 0.
+fn fehler_ort(w: *mut Welt, mp: u64, mpn: usize, zeile: u32) {
+    rt.buf_push_bytes(&(*w).fehler, mp, mpn)
+    if zeile > 0 {
+        rt.buf_push(&(*w).fehler, 58 as u8)
+        rt.buf_push_dez_u64(&(*w).fehler, zeile as u64)
+    }
+    rt.buf_push(&(*w).fehler, 58 as u8)
+    rt.buf_push(&(*w).fehler, 32 as u8)
+}
+
+// Meldung ohne eingesetzten Wert.
+fn fehl(w: *mut Welt, mp: u64, mpn: usize, zeile: u32, txt: u64) -> bool {
+    fehler_beginn(w)
+    fehler_ort(w, mp, mpn, zeile)
+    ptext(&(*w).fehler, txt)
+    fehler_schluss(w)
+    return false
+}
+
+// Meldung mit dem strittigen Wort in Hochkommas: <vorn>'<wert>'<hinten>.
+// Der Wert steht vorher in `(*w).wert`.
+fn fehl_wert(w: *mut Welt, mp: u64, mpn: usize, zeile: u32, vorn: u64, hinten: u64) -> bool {
+    fehler_beginn(w)
+    fehler_ort(w, mp, mpn, zeile)
+    ptext(&(*w).fehler, vorn)
+    rt.buf_push(&(*w).fehler, 39 as u8)
+    rt.buf_push_bytes(&(*w).fehler, rt.buf_ptr(&(*w).wert), rt.buf_len(&(*w).wert))
+    rt.buf_push(&(*w).fehler, 39 as u8)
+    ptext(&(*w).fehler, hinten)
+    fehler_schluss(w)
+    return false
+}
+
+fn wert_setzen(w: *mut Welt, p: u64, n: usize) {
+    rt.buf_leeren(&(*w).wert)
+    rt.buf_push_bytes(&(*w).wert, p, n)
+}
+
+// -------------------------------------------------------------- Manifest
+
+// Naechstes Wort in [*i, ende). Liefert false, wenn keines mehr kommt.
+fn wort(txt: u64, ende: usize, i: *mut usize, wo: *mut usize, wn: *mut usize) -> bool {
+    var k: usize = *i
+    while k < ende {
+        if !ist_trenner(rt.ld8(txt, k)) {
+            break
+        }
+        k = k + 1
+    }
+    if k >= ende {
+        *i = k
+        return false
+    }
+    let s: usize = k
+    while k < ende {
+        if ist_trenner(rt.ld8(txt, k)) {
+            break
+        }
+        k = k + 1
+    }
+    *wo = s
+    *wn = k - s
+    *i = k
+    return true
+}
+
+fn ist_wort(txt: u64, o: usize, n: usize, lit: u64) -> bool {
+    if n != rt.c_laenge(lit) {
+        return false
+    }
+    return rt.mem_eq(txt + o as u64, lit, n)
+}
+
+fn ist_name_b(p: u64, n: usize) -> bool {
+    if n == 0 {
+        return false
+    }
+    let c: u8 = rt.ld8(p, 0)
+    if !ist_buchst(c) {
+        if c != 95 as u8 {
+            return false
+        }
+    }
+    var i: usize = 0
+    while i < n {
+        let d: u8 = rt.ld8(p, i)
+        if !ist_buchst(d) {
+            if !ist_ziffer(d) {
+                if d != 95 as u8 {
+                    return false
+                }
+            }
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn ist_version_b(p: u64, n: usize) -> bool {
+    var teile: usize = 1
+    var stellen: usize = 0
+    var i: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c == 46 as u8 {
+            if stellen == 0 {
+                return false
+            }
+            teile = teile + 1
+            stellen = 0
+        } else {
+            if !ist_ziffer(c) {
+                return false
+            }
+            stellen = stellen + 1
+        }
+        i = i + 1
+    }
+    if stellen == 0 {
+        return false
+    }
+    return teile == 3
+}
+
+// Pfad INNERHALB des Pakets: nicht leer, relativ, ohne `..`.
+fn ist_innenpfad_b(p: u64, n: usize) -> bool {
+    if n == 0 {
+        return false
+    }
+    if rt.ld8(p, 0) == 47 as u8 {
+        return false
+    }
+    var i: usize = 0
+    while i <= n {
+        var s: usize = i
+        while i < n {
+            if rt.ld8(p, i) == 47 as u8 {
+                break
+            }
+            i = i + 1
+        }
+        if i - s == 2 {
+            if rt.ld8(p, s) == 46 as u8 {
+                if rt.ld8(p, s + 1) == 46 as u8 {
+                    return false
+                }
+            }
+        }
+        if i >= n {
+            break
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Steht (p, n) ab Index `von` schon in der Liste `feld`?
+// feld: 0 = quellen, 1 = oeffentlich, 2 = abhaengigkeitsnamen
+fn schon_da(w: *mut Welt, feld: usize, von: usize, p: u64, n: usize) -> bool {
+    var anz: usize = 0
+    if feld == 0 {
+        anz = vec_len[u32](&(*w).q)
+    }
+    if feld == 1 {
+        anz = vec_len[u32](&(*w).o)
+    }
+    if feld == 2 {
+        anz = vec_len[u32](&(*w).a_name)
+    }
+    var i: usize = von
+    while i < anz {
+        var off: u32 = 0
+        if feld == 0 {
+            off = vec_at[u32](&(*w).q, i)
+        }
+        if feld == 1 {
+            off = vec_at[u32](&(*w).o, i)
+        }
+        if feld == 2 {
+            off = vec_at[u32](&(*w).a_name, i)
+        }
+        let z: u64 = s_zeiger(w, off)
+        if rt.c_laenge(z) == n {
+            if rt.mem_eq(z, p, n) {
+                return true
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// Liest ein Manifest. Die Listen `q`, `o`, `a_*` werden hinten angehaengt;
+// Name, Version und Einstiegspunkt landen in `letzt_*`. Bei `false` steht
+// die fertige Meldung in `(*w).fehler`.
+fn manifest_lesen(w: *mut Welt, txt: u64, tn: usize, mp: u64, mpn: usize) -> bool {
+    let q0: usize = vec_len[u32](&(*w).q)
+    let o0: usize = vec_len[u32](&(*w).o)
+    let a0: usize = vec_len[u32](&(*w).a_name)
+    (*w).letzt_name = KEIN
+    (*w).letzt_ver = KEIN
+    (*w).letzt_start = KEIN
+
+    var k_paket: [u8; 6] = "paket\0"
+    var k_version: [u8; 8] = "version\0"
+    var k_start: [u8; 6] = "start\0"
+    var k_quelle: [u8; 7] = "quelle\0"
+    var k_oeff: [u8; 12] = "oeffentlich\0"
+    var k_brauche: [u8; 8] = "brauche\0"
+
+    var m_paket1: [u8; 35] = "'paket' erwartet genau einen namen\0"
+    var m_paket2: [u8; 35] = "'paket' steht mehrfach im manifest\0"
+    var m_ver1: [u8; 45] = "'version' erwartet genau eine versionsnummer\0"
+    var m_ver2: [u8; 37] = "'version' steht mehrfach im manifest\0"
+    var m_start1: [u8; 34] = "'start' erwartet genau einen pfad\0"
+    var m_start2: [u8; 35] = "'start' steht mehrfach im manifest\0"
+    var m_quelle1: [u8; 35] = "'quelle' erwartet genau einen pfad\0"
+    var m_oeff1: [u8; 51] = "'oeffentlich' erwartet mindestens einen modulnamen\0"
+    var m_brauche1: [u8; 46] = "'brauche' erwartet einen namen und einen pfad\0"
+    var v_name: [u8; 18] = "ungueltiger name \0"
+    var h_name: [u8; 59] = " (buchstabe zuerst, dann buchstaben, ziffern, unterstrich)\0"
+    var v_ver: [u8; 20] = "ungueltige version \0"
+    var h_ver: [u8; 27] = " (erwartet zahl.zahl.zahl)\0"
+    var v_pfad: [u8; 18] = "ungueltiger pfad \0"
+    var h_pfad: [u8; 22] = " (relativ, ohne '..')\0"
+    var v_quelle: [u8; 8] = "quelle \0"
+    var h_mehrfach: [u8; 28] = " steht mehrfach im manifest\0"
+    var v_modul: [u8; 7] = "modul \0"
+    var h_oeffdop: [u8; 33] = " steht mehrfach in 'oeffentlich'\0"
+    var v_pkt: [u8; 7] = "paket \0"
+    var h_abhdop: [u8; 46] = " steht mehrfach als abhaengigkeit im manifest\0"
+    var v_schl: [u8; 24] = "unbekannter schluessel \0"
+    var h_schl: [u8; 64] = " (erlaubt: paket, version, start, quelle, oeffentlich, brauche)\0"
+    var v_abh: [u8; 15] = "abhaengigkeit \0"
+    var h_selbst: [u8; 29] = " heisst wie das paket selbst\0"
+    var m_ohne_paket: [u8; 47] = "das manifest braucht eine zeile 'paket <name>'\0"
+    var m_ohne_ver: [u8; 59] = "das manifest braucht eine zeile 'version <zahl.zahl.zahl>'\0"
+
+    var i: usize = 0
+    var zeile: u32 = 0
+    while true {
+        let zs: usize = i
+        var ze: usize = i
+        while ze < tn {
+            if rt.ld8(txt, ze) == 10 as u8 {
+                break
+            }
+            ze = ze + 1
+        }
+        let naechste: usize = ze + 1
+        let zeilenende: usize = ze
+        zeile = zeile + 1
+        var e: usize = ze
+        if e > zs {
+            if rt.ld8(txt, e - 1) == 13 as u8 {
+                e = e - 1
+            }
+        }
+        var c: usize = zs
+        while c < e {
+            if rt.ld8(txt, c) == 35 as u8 {
+                break
+            }
+            c = c + 1
+        }
+        let ende: usize = c
+
+        var pos: usize = zs
+        var ko: usize = 0
+        var kn: usize = 0
+        if wort(txt, ende, &pos, &ko, &kn) {
+            var vo: usize = 0
+            var vn: usize = 0
+            var vo2: usize = 0
+            var vn2: usize = 0
+            var rest: usize = 0
+            var rn: usize = 0
+            if ist_wort(txt, ko, kn, (&k_paket[0]) as u64) {
+                if !wort(txt, ende, &pos, &vo, &vn) {
+                    return fehl(w, mp, mpn, zeile, (&m_paket1[0]) as u64)
+                }
+                if wort(txt, ende, &pos, &rest, &rn) {
+                    return fehl(w, mp, mpn, zeile, (&m_paket1[0]) as u64)
+                }
+                if (*w).letzt_name != KEIN {
+                    return fehl(w, mp, mpn, zeile, (&m_paket2[0]) as u64)
+                }
+                if !ist_name_b(txt + vo as u64, vn) {
+                    wert_setzen(w, txt + vo as u64, vn)
+                    return fehl_wert(w, mp, mpn, zeile, (&v_name[0]) as u64, (&h_name[0]) as u64)
+                }
+                (*w).letzt_name = s_dazu(w, txt + vo as u64, vn)
+            } else {
+            if ist_wort(txt, ko, kn, (&k_version[0]) as u64) {
+                if !wort(txt, ende, &pos, &vo, &vn) {
+                    return fehl(w, mp, mpn, zeile, (&m_ver1[0]) as u64)
+                }
+                if wort(txt, ende, &pos, &rest, &rn) {
+                    return fehl(w, mp, mpn, zeile, (&m_ver1[0]) as u64)
+                }
+                if (*w).letzt_ver != KEIN {
+                    return fehl(w, mp, mpn, zeile, (&m_ver2[0]) as u64)
+                }
+                if !ist_version_b(txt + vo as u64, vn) {
+                    wert_setzen(w, txt + vo as u64, vn)
+                    return fehl_wert(w, mp, mpn, zeile, (&v_ver[0]) as u64, (&h_ver[0]) as u64)
+                }
+                (*w).letzt_ver = s_dazu(w, txt + vo as u64, vn)
+            } else {
+            if ist_wort(txt, ko, kn, (&k_start[0]) as u64) {
+                if !wort(txt, ende, &pos, &vo, &vn) {
+                    return fehl(w, mp, mpn, zeile, (&m_start1[0]) as u64)
+                }
+                if wort(txt, ende, &pos, &rest, &rn) {
+                    return fehl(w, mp, mpn, zeile, (&m_start1[0]) as u64)
+                }
+                if (*w).letzt_start != KEIN {
+                    return fehl(w, mp, mpn, zeile, (&m_start2[0]) as u64)
+                }
+                if !ist_innenpfad_b(txt + vo as u64, vn) {
+                    wert_setzen(w, txt + vo as u64, vn)
+                    return fehl_wert(w, mp, mpn, zeile, (&v_pfad[0]) as u64, (&h_pfad[0]) as u64)
+                }
+                (*w).letzt_start = s_dazu(w, txt + vo as u64, vn)
+            } else {
+            if ist_wort(txt, ko, kn, (&k_quelle[0]) as u64) {
+                if !wort(txt, ende, &pos, &vo, &vn) {
+                    return fehl(w, mp, mpn, zeile, (&m_quelle1[0]) as u64)
+                }
+                if wort(txt, ende, &pos, &rest, &rn) {
+                    return fehl(w, mp, mpn, zeile, (&m_quelle1[0]) as u64)
+                }
+                if !ist_innenpfad_b(txt + vo as u64, vn) {
+                    wert_setzen(w, txt + vo as u64, vn)
+                    return fehl_wert(w, mp, mpn, zeile, (&v_pfad[0]) as u64, (&h_pfad[0]) as u64)
+                }
+                var qn: rt.Buf = rt.buf_neu()
+                normalisiere(&qn, txt + vo as u64, vn)
+                if schon_da(w, 0, q0, rt.buf_ptr(&qn), rt.buf_len(&qn)) {
+                    wert_setzen(w, txt + vo as u64, vn)
+                    rt.buf_frei(&qn)
+                    return fehl_wert(w, mp, mpn, zeile, (&v_quelle[0]) as u64, (&h_mehrfach[0]) as u64)
+                }
+                let qoff: u32 = s_dazu(w, rt.buf_ptr(&qn), rt.buf_len(&qn))
+                vec_push[u32](&(*w).q, qoff)
+                rt.buf_frei(&qn)
+            } else {
+            if ist_wort(txt, ko, kn, (&k_oeff[0]) as u64) {
+                var anz: usize = 0
+                while wort(txt, ende, &pos, &vo, &vn) {
+                    anz = anz + 1
+                    if !ist_name_b(txt + vo as u64, vn) {
+                        wert_setzen(w, txt + vo as u64, vn)
+                        return fehl_wert(w, mp, mpn, zeile, (&v_name[0]) as u64, (&h_name[0]) as u64)
+                    }
+                    if schon_da(w, 1, o0, txt + vo as u64, vn) {
+                        wert_setzen(w, txt + vo as u64, vn)
+                        return fehl_wert(w, mp, mpn, zeile, (&v_modul[0]) as u64, (&h_oeffdop[0]) as u64)
+                    }
+                    let ooff: u32 = s_dazu(w, txt + vo as u64, vn)
+                    vec_push[u32](&(*w).o, ooff)
+                }
+                if anz == 0 {
+                    return fehl(w, mp, mpn, zeile, (&m_oeff1[0]) as u64)
+                }
+            } else {
+            if ist_wort(txt, ko, kn, (&k_brauche[0]) as u64) {
+                if !wort(txt, ende, &pos, &vo, &vn) {
+                    return fehl(w, mp, mpn, zeile, (&m_brauche1[0]) as u64)
+                }
+                if !wort(txt, ende, &pos, &vo2, &vn2) {
+                    return fehl(w, mp, mpn, zeile, (&m_brauche1[0]) as u64)
+                }
+                if wort(txt, ende, &pos, &rest, &rn) {
+                    return fehl(w, mp, mpn, zeile, (&m_brauche1[0]) as u64)
+                }
+                if !ist_name_b(txt + vo as u64, vn) {
+                    wert_setzen(w, txt + vo as u64, vn)
+                    return fehl_wert(w, mp, mpn, zeile, (&v_name[0]) as u64, (&h_name[0]) as u64)
+                }
+                if schon_da(w, 2, a0, txt + vo as u64, vn) {
+                    wert_setzen(w, txt + vo as u64, vn)
+                    return fehl_wert(w, mp, mpn, zeile, (&v_pkt[0]) as u64, (&h_abhdop[0]) as u64)
+                }
+                let noff: u32 = s_dazu(w, txt + vo as u64, vn)
+                let poff: u32 = s_dazu(w, txt + vo2 as u64, vn2)
+                vec_push[u32](&(*w).a_name, noff)
+                vec_push[u32](&(*w).a_pfad, poff)
+                vec_push[u32](&(*w).a_zeile, zeile)
+            } else {
+                wert_setzen(w, txt + ko as u64, kn)
+                return fehl_wert(w, mp, mpn, zeile, (&v_schl[0]) as u64, (&h_schl[0]) as u64)
+            }
+            }
+            }
+            }
+            }
+            }
+        }
+        if zeilenende >= tn {
+            break
+        }
+        i = naechste
+    }
+
+    if (*w).letzt_name == KEIN {
+        return fehl(w, mp, mpn, 0, (&m_ohne_paket[0]) as u64)
+    }
+    if (*w).letzt_ver == KEIN {
+        return fehl(w, mp, mpn, 0, (&m_ohne_ver[0]) as u64)
+    }
+    // Eine Abhaengigkeit darf nicht heissen wie das Paket selbst.
+    let np: u64 = s_zeiger(w, (*w).letzt_name)
+    let nn: usize = rt.c_laenge(np)
+    var ai: usize = a0
+    while ai < vec_len[u32](&(*w).a_name) {
+        let ap: u64 = s_zeiger(w, vec_at[u32](&(*w).a_name, ai))
+        if rt.c_laenge(ap) == nn {
+            if rt.mem_eq(ap, s_zeiger(w, (*w).letzt_name), nn) {
+                wert_setzen(w, ap, nn)
+                return fehl_wert(w, mp, mpn, vec_at[u32](&(*w).a_zeile, ai),
+                                 (&v_abh[0]) as u64, (&h_selbst[0]) as u64)
+            }
+        }
+        ai = ai + 1
+    }
+    // Ohne `quelle` gilt das Manifestverzeichnis selbst.
+    if vec_len[u32](&(*w).q) == q0 {
+        var pnkt: [u8; 2] = ".\0"
+        let doff: u32 = s_dazu(w, (&pnkt[0]) as u64, 1)
+        vec_push[u32](&(*w).q, doff)
+    }
+    return true
+}
+
+// ------------------------------------------------------- Pakete nachladen
+
+fn manifestpfad(aus: *mut rt.Buf, wp: u64, wn: usize) {
+    var mn: [u8; 11] = "firn.paket\0"
+    verbinde(aus, wp, wn, (&mn[0]) as u64, 10)
+}
+
+// Index des Pakets mit genau dieser (absoluten) Wurzel, sonst -1.
+fn welt_finde_wurzel(w: *mut Welt, p: u64, n: usize) -> i64 {
+    var i: usize = 0
+    while i < welt_anzahl(w) {
+        let z: u64 = s_zeiger(w, vec_at[u32](&(*w).p_wurzel, i))
+        if rt.c_laenge(z) == n {
+            if rt.mem_eq(z, p, n) {
+                return i as i64
+            }
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// Ein Paket aus `wurzel` (absolut) laden und anhaengen.
+fn welt_lade(w: *mut Welt, wp: u64, wn: usize) -> bool {
+    var mpb: rt.Buf = rt.buf_neu()
+    manifestpfad(&mpb, wp, wn)
+    var quelle: rt.Buf = rt.buf_neu()
+    if !rt.lies_datei(rt.buf_ptr(&mpb), &quelle) {
+        var m_lesen: [u8; 6] = "kann \0"
+        var m_nicht: [u8; 13] = " nicht lesen\0"
+        wert_setzen(w, rt.buf_ptr(&mpb), rt.buf_len(&mpb))
+        fehler_beginn(w)
+        ptext(&(*w).fehler, (&m_lesen[0]) as u64)
+        rt.buf_push(&(*w).fehler, 39 as u8)
+        rt.buf_push_bytes(&(*w).fehler, rt.buf_ptr(&mpb), rt.buf_len(&mpb))
+        rt.buf_push(&(*w).fehler, 39 as u8)
+        ptext(&(*w).fehler, (&m_nicht[0]) as u64)
+        fehler_schluss(w)
+        rt.buf_frei(&quelle)
+        rt.buf_frei(&mpb)
+        return false
+    }
+    let q0: u32 = vec_len[u32](&(*w).q) as u32
+    let o0: u32 = vec_len[u32](&(*w).o) as u32
+    let a0: u32 = vec_len[u32](&(*w).a_name) as u32
+    let ok: bool = manifest_lesen(w, rt.buf_ptr(&quelle), rt.buf_len(&quelle),
+                                  rt.buf_ptr(&mpb), rt.buf_len(&mpb))
+    if !ok {
+        rt.buf_frei(&quelle)
+        rt.buf_frei(&mpb)
+        return false
+    }
+    vec_push[u32](&(*w).p_name, (*w).letzt_name)
+    vec_push[u32](&(*w).p_ver, (*w).letzt_ver)
+    vec_push[u32](&(*w).p_start, (*w).letzt_start)
+    vec_push[u32](&(*w).p_wurzel, s_dazu(w, wp, wn))
+    vec_push[u32](&(*w).p_mpfad, s_dazu(w, rt.buf_ptr(&mpb), rt.buf_len(&mpb)))
+    vec_push[u32](&(*w).p_q0, q0)
+    vec_push[u32](&(*w).p_q1, vec_len[u32](&(*w).q) as u32)
+    vec_push[u32](&(*w).p_o0, o0)
+    vec_push[u32](&(*w).p_o1, vec_len[u32](&(*w).o) as u32)
+    vec_push[u32](&(*w).p_a0, a0)
+    vec_push[u32](&(*w).p_a1, vec_len[u32](&(*w).a_name) as u32)
+    rt.buf_frei(&quelle)
+    rt.buf_frei(&mpb)
+    return true
+}
+
+// Absolute Wurzel der Abhaengigkeit `k` (globaler Index) aus Sicht von `p`.
+fn dep_wurzel(w: *mut Welt, p: usize, k: usize, aus: *mut rt.Buf) {
+    var wz: rt.Buf = rt.buf_neu()
+    let zw: u64 = s_zeiger(w, vec_at[u32](&(*w).p_wurzel, p))
+    rt.buf_push_bytes(&wz, zw, rt.c_laenge(zw))
+    var pf: rt.Buf = rt.buf_neu()
+    let zp: u64 = s_zeiger(w, vec_at[u32](&(*w).a_pfad, k))
+    rt.buf_push_bytes(&pf, zp, rt.c_laenge(zp))
+    verbinde(aus, rt.buf_ptr(&wz), rt.buf_len(&wz), rt.buf_ptr(&pf), rt.buf_len(&pf))
+    rt.buf_frei(&wz)
+    rt.buf_frei(&pf)
+}
+
+// Tiefensuche mit drei Farben: 0 = ungesehen, 1 = auf dem Weg, 2 = fertig.
+fn zyklus_dfs(w: *mut Welt, i: usize) -> bool {
+    vec_setzen[u32](&(*w).farbe, i, 1)
+    vec_push[u32](&(*w).weg, i as u32)
+    var k: usize = vec_at[u32](&(*w).p_a0, i) as usize
+    let bis: usize = vec_at[u32](&(*w).p_a1, i) as usize
+    while k < bis {
+        var dw: rt.Buf = rt.buf_neu()
+        dep_wurzel(w, i, k, &dw)
+        let z: i64 = welt_finde_wurzel(w, rt.buf_ptr(&dw), rt.buf_len(&dw))
+        rt.buf_frei(&dw)
+        if z >= 0 {
+            let zi: usize = z as usize
+            if vec_at[u32](&(*w).farbe, zi) == 1 {
+                var m_zyk: [u8; 14] = "paketzyklus: \0"
+                var m_pfeil: [u8; 5] = " -> \0"
+                var m_hin: [u8; 57] = "abhaengigkeiten muessen einen kreisfreien graphen bilden\0"
+                fehler_beginn(w)
+                ptext(&(*w).fehler, (&m_zyk[0]) as u64)
+                var ab: usize = 0
+                var t: usize = 0
+                while t < vec_len[u32](&(*w).weg) {
+                    if vec_at[u32](&(*w).weg, t) as usize == zi {
+                        ab = t
+                        break
+                    }
+                    t = t + 1
+                }
+                var s: usize = ab
+                while s < vec_len[u32](&(*w).weg) {
+                    let pi: usize = vec_at[u32](&(*w).weg, s) as usize
+                    ptext(&(*w).fehler, s_zeiger(w, vec_at[u32](&(*w).p_name, pi)))
+                    ptext(&(*w).fehler, (&m_pfeil[0]) as u64)
+                    s = s + 1
+                }
+                ptext(&(*w).fehler, s_zeiger(w, vec_at[u32](&(*w).p_name, zi)))
+                fehler_schluss(w)
+                fehler_hinweis(w)
+                ptext(&(*w).fehler, (&m_hin[0]) as u64)
+                fehler_schluss(w)
+                return false
+            }
+            if vec_at[u32](&(*w).farbe, zi) == 0 {
+                if !zyklus_dfs(w, zi) {
+                    return false
+                }
+            }
+        }
+        k = k + 1
+    }
+    vec_pop[u32](&(*w).weg)
+    vec_setzen[u32](&(*w).farbe, i, 2)
+    return true
+}
+
+fn zyklen_pruefen(w: *mut Welt) -> bool {
+    vec_leeren[u32](&(*w).farbe)
+    vec_leeren[u32](&(*w).weg)
+    var i: usize = 0
+    while i < welt_anzahl(w) {
+        vec_push[u32](&(*w).farbe, 0)
+        i = i + 1
+    }
+    i = 0
+    while i < welt_anzahl(w) {
+        if vec_at[u32](&(*w).farbe, i) == 0 {
+            if !zyklus_dfs(w, i) {
+                return false
+            }
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Die ganze Welt ab einer absoluten Wurzel aufbauen.
+fn welt_bauen(w: *mut Welt, wp: u64, wn: usize) -> bool {
+    if !welt_lade(w, wp, wn) {
+        return false
+    }
+    var i: usize = 0
+    while i < welt_anzahl(w) {
+        var k: usize = vec_at[u32](&(*w).p_a0, i) as usize
+        let bis: usize = vec_at[u32](&(*w).p_a1, i) as usize
+        while k < bis {
+            var dw: rt.Buf = rt.buf_neu()
+            dep_wurzel(w, i, k, &dw)
+            if welt_finde_wurzel(w, rt.buf_ptr(&dw), rt.buf_len(&dw)) < 0 {
+                var mpb: rt.Buf = rt.buf_neu()
+                manifestpfad(&mpb, rt.buf_ptr(&dw), rt.buf_len(&dw))
+                if !ist_datei(rt.buf_ptr(&mpb)) {
+                    var m_kein1: [u8; 15] = "abhaengigkeit \0"
+                    var m_kein2: [u8; 19] = " hat kein manifest\0"
+                    var m_kein3: [u8; 15] = "erwartet wird \0"
+                    fehler_beginn(w)
+                    fehler_ort(w, s_zeiger(w, vec_at[u32](&(*w).p_mpfad, i)),
+                               rt.c_laenge(s_zeiger(w, vec_at[u32](&(*w).p_mpfad, i))),
+                               vec_at[u32](&(*w).a_zeile, k))
+                    ptext(&(*w).fehler, (&m_kein1[0]) as u64)
+                    rt.buf_push(&(*w).fehler, 39 as u8)
+                    ptext(&(*w).fehler, s_zeiger(w, vec_at[u32](&(*w).a_name, k)))
+                    rt.buf_push(&(*w).fehler, 39 as u8)
+                    ptext(&(*w).fehler, (&m_kein2[0]) as u64)
+                    fehler_schluss(w)
+                    fehler_hinweis(w)
+                    ptext(&(*w).fehler, (&m_kein3[0]) as u64)
+                    rt.buf_push(&(*w).fehler, 39 as u8)
+                    rt.buf_push_bytes(&(*w).fehler, rt.buf_ptr(&mpb), rt.buf_len(&mpb))
+                    rt.buf_push(&(*w).fehler, 39 as u8)
+                    fehler_schluss(w)
+                    rt.buf_frei(&mpb)
+                    rt.buf_frei(&dw)
+                    return false
+                }
+                rt.buf_frei(&mpb)
+                if !welt_lade(w, rt.buf_ptr(&dw), rt.buf_len(&dw)) {
+                    rt.buf_frei(&dw)
+                    return false
+                }
+                let neu: usize = welt_anzahl(w) - 1
+                let np: u64 = s_zeiger(w, vec_at[u32](&(*w).p_name, neu))
+                let ap: u64 = s_zeiger(w, vec_at[u32](&(*w).a_name, k))
+                var gleich: bool = false
+                if rt.c_laenge(np) == rt.c_laenge(ap) {
+                    gleich = rt.mem_eq(np, ap, rt.c_laenge(np))
+                }
+                if !gleich {
+                    var m_z1: [u8; 15] = "abhaengigkeit \0"
+                    var m_z2: [u8; 18] = " zeigt auf paket \0"
+                    var m_z3: [u8; 20] = " nennt sich selbst \0"
+                    fehler_beginn(w)
+                    fehler_ort(w, s_zeiger(w, vec_at[u32](&(*w).p_mpfad, i)),
+                               rt.c_laenge(s_zeiger(w, vec_at[u32](&(*w).p_mpfad, i))),
+                               vec_at[u32](&(*w).a_zeile, k))
+                    ptext(&(*w).fehler, (&m_z1[0]) as u64)
+                    rt.buf_push(&(*w).fehler, 39 as u8)
+                    ptext(&(*w).fehler, s_zeiger(w, vec_at[u32](&(*w).a_name, k)))
+                    rt.buf_push(&(*w).fehler, 39 as u8)
+                    ptext(&(*w).fehler, (&m_z2[0]) as u64)
+                    rt.buf_push(&(*w).fehler, 39 as u8)
+                    ptext(&(*w).fehler, s_zeiger(w, vec_at[u32](&(*w).p_name, neu)))
+                    rt.buf_push(&(*w).fehler, 39 as u8)
+                    fehler_schluss(w)
+                    fehler_hinweis(w)
+                    rt.buf_push(&(*w).fehler, 39 as u8)
+                    ptext(&(*w).fehler, s_zeiger(w, vec_at[u32](&(*w).p_mpfad, neu)))
+                    rt.buf_push(&(*w).fehler, 39 as u8)
+                    ptext(&(*w).fehler, (&m_z3[0]) as u64)
+                    rt.buf_push(&(*w).fehler, 39 as u8)
+                    ptext(&(*w).fehler, s_zeiger(w, vec_at[u32](&(*w).p_name, neu)))
+                    rt.buf_push(&(*w).fehler, 39 as u8)
+                    fehler_schluss(w)
+                    rt.buf_frei(&dw)
+                    return false
+                }
+            }
+            rt.buf_frei(&dw)
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return zyklen_pruefen(w)
+}
+
+// Manifest ab `verzeichnis` nach oben suchen. Ergebnis in `aus`; false = keins.
+fn suche_manifest(aus: *mut rt.Buf, p: u64, n: usize) -> bool {
+    var d: rt.Buf = rt.buf_neu()
+    normalisiere(&d, p, n)
+    var mpb: rt.Buf = rt.buf_neu()
+    var hoch: rt.Buf = rt.buf_neu()
+    var pp: [u8; 3] = "..\0"
+    var gefunden: bool = false
+    var t: usize = 0
+    while t < SUCHTIEFE {
+        manifestpfad(&mpb, rt.buf_ptr(&d), rt.buf_len(&d))
+        if ist_datei(rt.buf_ptr(&mpb)) {
+            gefunden = true
+            break
+        }
+        verbinde(&hoch, rt.buf_ptr(&d), rt.buf_len(&d), (&pp[0]) as u64, 2)
+        if rt.buf_len(&hoch) == rt.buf_len(&d) {
+            if rt.mem_eq(rt.buf_ptr(&hoch), rt.buf_ptr(&d), rt.buf_len(&d)) {
+                break
+            }
+        }
+        rt.buf_leeren(&d)
+        rt.buf_push_bytes(&d, rt.buf_ptr(&hoch), rt.buf_len(&hoch))
+        null_dahinter(&d)
+        t = t + 1
+    }
+    if gefunden {
+        rt.buf_leeren(aus)
+        rt.buf_push_bytes(aus, rt.buf_ptr(&d), rt.buf_len(&d))
+        null_dahinter(aus)
+    }
+    rt.buf_frei(&d)
+    rt.buf_frei(&mpb)
+    rt.buf_frei(&hoch)
+    return gefunden
+}
+
+// Welt zu einem Wurzelverzeichnis. Dort MUSS ein Manifest liegen.
+fn welt_ab_wurzel(w: *mut Welt, p: u64, n: usize) -> bool {
+    var cwd: rt.Buf = rt.buf_neu()
+    arbeitsverzeichnis(&cwd)
+    var abs: rt.Buf = rt.buf_neu()
+    absolut(&abs, p, n, rt.buf_ptr(&cwd), rt.buf_len(&cwd))
+    var mpb: rt.Buf = rt.buf_neu()
+    manifestpfad(&mpb, rt.buf_ptr(&abs), rt.buf_len(&abs))
+    if !ist_datei(rt.buf_ptr(&mpb)) {
+        var m1: [u8; 18] = "kein manifest in \0"
+        var m2: [u8; 25] = "erwartet wird die datei \0"
+        var mrel: rt.Buf = rt.buf_neu()
+        manifestpfad(&mrel, p, n)
+        fehler_beginn(w)
+        ptext(&(*w).fehler, (&m1[0]) as u64)
+        rt.buf_push(&(*w).fehler, 39 as u8)
+        rt.buf_push_bytes(&(*w).fehler, p, n)
+        rt.buf_push(&(*w).fehler, 39 as u8)
+        fehler_schluss(w)
+        fehler_hinweis(w)
+        ptext(&(*w).fehler, (&m2[0]) as u64)
+        rt.buf_push(&(*w).fehler, 39 as u8)
+        rt.buf_push_bytes(&(*w).fehler, rt.buf_ptr(&mrel), rt.buf_len(&mrel))
+        rt.buf_push(&(*w).fehler, 39 as u8)
+        fehler_schluss(w)
+        rt.buf_frei(&mrel)
+        rt.buf_frei(&mpb)
+        rt.buf_frei(&abs)
+        rt.buf_frei(&cwd)
+        return false
+    }
+    let ok: bool = welt_bauen(w, rt.buf_ptr(&abs), rt.buf_len(&abs))
+    rt.buf_frei(&mpb)
+    rt.buf_frei(&abs)
+    rt.buf_frei(&cwd)
+    return ok
+}
+
+// Welt zu einer Quelldatei: Manifest ab ihrem Verzeichnis nach oben suchen.
+// Ohne Fund bleibt die Welt LEER — und alles verhaelt sich wie vor Runde 48.
+fn welt_ab_datei(w: *mut Welt, p: u64, n: usize) -> bool {
+    var cwd: rt.Buf = rt.buf_neu()
+    arbeitsverzeichnis(&cwd)
+    var abs: rt.Buf = rt.buf_neu()
+    absolut(&abs, p, n, rt.buf_ptr(&cwd), rt.buf_len(&cwd))
+    var vz: rt.Buf = rt.buf_neu()
+    verzeichnis_von(&vz, rt.buf_ptr(&abs), rt.buf_len(&abs))
+    var wz: rt.Buf = rt.buf_neu()
+    var ok: bool = true
+    if suche_manifest(&wz, rt.buf_ptr(&vz), rt.buf_len(&vz)) {
+        ok = welt_bauen(w, rt.buf_ptr(&wz), rt.buf_len(&wz))
+    }
+    rt.buf_frei(&wz)
+    rt.buf_frei(&vz)
+    rt.buf_frei(&abs)
+    rt.buf_frei(&cwd)
+    return ok
+}
+
+// -------------------------------------------------------------- Abfragen
+
+// Zu welchem Paket gehoert diese (absolute) Datei? Laengste Wurzel gewinnt.
+fn welt_paket_von(w: *mut Welt, p: u64, n: usize) -> i64 {
+    var treffer: i64 = 0 - 1
+    var beste: usize = 0
+    var i: usize = 0
+    while i < welt_anzahl(w) {
+        let z: u64 = s_zeiger(w, vec_at[u32](&(*w).p_wurzel, i))
+        let zn: usize = rt.c_laenge(z)
+        if liegt_in(p, n, z, zn) {
+            if treffer < 0 || zn > beste {
+                treffer = i as i64
+                beste = zn
+            }
+        }
+        i = i + 1
+    }
+    return treffer
+}
+
+// Index des Pakets, das `p` unter dem Namen (np, nn) einbindet; sonst -1.
+fn welt_kante(w: *mut Welt, p: usize, np: u64, nn: usize) -> i64 {
+    var k: usize = vec_at[u32](&(*w).p_a0, p) as usize
+    let bis: usize = vec_at[u32](&(*w).p_a1, p) as usize
+    while k < bis {
+        let z: u64 = s_zeiger(w, vec_at[u32](&(*w).a_name, k))
+        if rt.c_laenge(z) == nn {
+            if rt.mem_eq(z, np, nn) {
+                var dw: rt.Buf = rt.buf_neu()
+                dep_wurzel(w, p, k, &dw)
+                let idx: i64 = welt_finde_wurzel(w, rt.buf_ptr(&dw), rt.buf_len(&dw))
+                rt.buf_frei(&dw)
+                return idx
+            }
+        }
+        k = k + 1
+    }
+    return 0 - 1
+}
+
+// Steht das Modul in der `oeffentlich`-Liste? Leere Liste = alles sichtbar,
+// genau wie eine Datei ohne `export`-Liste.
+fn welt_ist_oeffentlich(w: *mut Welt, p: usize, np: u64, nn: usize) -> bool {
+    var k: usize = vec_at[u32](&(*w).p_o0, p) as usize
+    let bis: usize = vec_at[u32](&(*w).p_o1, p) as usize
+    if k >= bis {
+        return true
+    }
+    while k < bis {
+        let z: u64 = s_zeiger(w, vec_at[u32](&(*w).o, k))
+        if rt.c_laenge(z) == nn {
+            if rt.mem_eq(z, np, nn) {
+                return true
+            }
+        }
+        k = k + 1
+    }
+    return false
+}
+
+fn welt_quelle_anzahl(w: *mut Welt, p: usize) -> usize {
+    return vec_at[u32](&(*w).p_q1, p) as usize - vec_at[u32](&(*w).p_q0, p) as usize
+}
+
+// `<wurzel>/<quelle>/` — die Suchbasis fuer `modulpfad`, mit Schraegstrich.
+fn welt_quelle_basis(w: *mut Welt, p: usize, i: usize, aus: *mut rt.Buf) {
+    let k: usize = vec_at[u32](&(*w).p_q0, p) as usize + i
+    var wz: rt.Buf = rt.buf_neu()
+    let z: u64 = s_zeiger(w, vec_at[u32](&(*w).p_wurzel, p))
+    rt.buf_push_bytes(&wz, z, rt.c_laenge(z))
+    var qs: rt.Buf = rt.buf_neu()
+    let y: u64 = s_zeiger(w, vec_at[u32](&(*w).q, k))
+    rt.buf_push_bytes(&qs, y, rt.c_laenge(y))
+    verbinde(aus, rt.buf_ptr(&wz), rt.buf_len(&wz), rt.buf_ptr(&qs), rt.buf_len(&qs))
+    rt.buf_push(aus, 47 as u8)
+    null_dahinter(aus)
+    rt.buf_frei(&wz)
+    rt.buf_frei(&qs)
+}
+
+// Der Name des Pakets, nullabgeschlossen.
+fn welt_name_zeiger(w: *mut Welt, p: usize) -> u64 {
+    return s_zeiger(w, vec_at[u32](&(*w).p_name, p))
+}
+
+// Der Einstiegspunkt, WIE ER IM MANIFEST STEHT (relativ). 0 = Bibliothek.
+fn welt_start_zeiger(w: *mut Welt, p: usize) -> u64 {
+    if vec_at[u32](&(*w).p_start, p) == KEIN {
+        return 0
+    }
+    return s_zeiger(w, vec_at[u32](&(*w).p_start, p))
+}
+
+// --------------------------------------------------------- Fertige Texte
+
+fn welt_text_nicht_oeffentlich(w: *mut Welt, zp: usize, mp: u64, mn: usize) {
+    var t1: [u8; 7] = "modul \0"
+    var t2: [u8; 15] = " ist in paket \0"
+    var t3: [u8; 19] = " nicht oeffentlich\0"
+    var t4: [u8; 23] = "ergaenze 'oeffentlich \0"
+    var t5: [u8; 6] = "' in \0"
+    fehler_beginn(w)
+    ptext(&(*w).fehler, (&t1[0]) as u64)
+    rt.buf_push(&(*w).fehler, 39 as u8)
+    rt.buf_push_bytes(&(*w).fehler, mp, mn)
+    rt.buf_push(&(*w).fehler, 39 as u8)
+    ptext(&(*w).fehler, (&t2[0]) as u64)
+    rt.buf_push(&(*w).fehler, 39 as u8)
+    ptext(&(*w).fehler, s_zeiger(w, vec_at[u32](&(*w).p_name, zp)))
+    rt.buf_push(&(*w).fehler, 39 as u8)
+    ptext(&(*w).fehler, (&t3[0]) as u64)
+    fehler_schluss(w)
+    fehler_hinweis(w)
+    ptext(&(*w).fehler, (&t4[0]) as u64)
+    rt.buf_push_bytes(&(*w).fehler, mp, mn)
+    ptext(&(*w).fehler, (&t5[0]) as u64)
+    rt.buf_push(&(*w).fehler, 39 as u8)
+    ptext(&(*w).fehler, s_zeiger(w, vec_at[u32](&(*w).p_mpfad, zp)))
+    rt.buf_push(&(*w).fehler, 39 as u8)
+    fehler_schluss(w)
+}
+
+fn welt_text_keine_abhaengigkeit(w: *mut Welt, zp: usize, vp: usize) {
+    var t1: [u8; 7] = "paket \0"
+    var t2: [u8; 36] = " ist keine abhaengigkeit von paket \0"
+    var t3: [u8; 19] = "ergaenze 'brauche \0"
+    var t4: [u8; 13] = " <pfad>' in \0"
+    fehler_beginn(w)
+    ptext(&(*w).fehler, (&t1[0]) as u64)
+    rt.buf_push(&(*w).fehler, 39 as u8)
+    ptext(&(*w).fehler, s_zeiger(w, vec_at[u32](&(*w).p_name, zp)))
+    rt.buf_push(&(*w).fehler, 39 as u8)
+    ptext(&(*w).fehler, (&t2[0]) as u64)
+    rt.buf_push(&(*w).fehler, 39 as u8)
+    ptext(&(*w).fehler, s_zeiger(w, vec_at[u32](&(*w).p_name, vp)))
+    rt.buf_push(&(*w).fehler, 39 as u8)
+    fehler_schluss(w)
+    fehler_hinweis(w)
+    ptext(&(*w).fehler, (&t3[0]) as u64)
+    ptext(&(*w).fehler, s_zeiger(w, vec_at[u32](&(*w).p_name, zp)))
+    ptext(&(*w).fehler, (&t4[0]) as u64)
+    rt.buf_push(&(*w).fehler, 39 as u8)
+    ptext(&(*w).fehler, s_zeiger(w, vec_at[u32](&(*w).p_mpfad, vp)))
+    rt.buf_push(&(*w).fehler, 39 as u8)
+    fehler_schluss(w)
+}
+
+// Alle drei Zeiger sind nullabgeschlossen.
+fn welt_text_namenskonflikt(w: *mut Welt, modul: u64, a: u64, b: u64) {
+    var t1: [u8; 23] = "namenskonflikt: modul \0"
+    var t2: [u8; 24] = " kommt aus zwei dateien\0"
+    var t3: [u8; 6] = " und \0"
+    fehler_beginn(w)
+    ptext(&(*w).fehler, (&t1[0]) as u64)
+    rt.buf_push(&(*w).fehler, 39 as u8)
+    ptext(&(*w).fehler, modul)
+    rt.buf_push(&(*w).fehler, 39 as u8)
+    ptext(&(*w).fehler, (&t2[0]) as u64)
+    fehler_schluss(w)
+    fehler_hinweis(w)
+    rt.buf_push(&(*w).fehler, 39 as u8)
+    ptext(&(*w).fehler, a)
+    rt.buf_push(&(*w).fehler, 39 as u8)
+    ptext(&(*w).fehler, (&t3[0]) as u64)
+    rt.buf_push(&(*w).fehler, 39 as u8)
+    ptext(&(*w).fehler, b)
+    rt.buf_push(&(*w).fehler, 39 as u8)
+    fehler_schluss(w)
+}
+
+fn welt_text_kein_start(w: *mut Welt, p: usize) {
+    var t1: [u8; 56] = "das manifest hat keinen einstiegspunkt ('start <pfad>')\0"
+    fehler_beginn(w)
+    let z: u64 = s_zeiger(w, vec_at[u32](&(*w).p_mpfad, p))
+    fehler_ort(w, z, rt.c_laenge(z), 0)
+    ptext(&(*w).fehler, (&t1[0]) as u64)
+    fehler_schluss(w)
+}
+
+// ------------------------------------------------------------ Paket-Info
+//
+// REIN LEXIKALISCH aus dem uebergebenen Verzeichnis gerechnet, damit die
+// Ausgabe auf beiden Uebersetzern und auf jedem Rechner dieselbe ist.
+
+fn info_zeile(aus: *mut rt.Buf, schl: u64, wert: u64) {
+    ptext(aus, schl)
+    rt.buf_push(aus, 32 as u8)
+    ptext(aus, wert)
+    rt.buf_push(aus, 10 as u8)
+}
+
+fn welt_info(w: *mut Welt, vp: u64, vn: usize, aus: *mut rt.Buf) {
+    var k_paket: [u8; 6] = "paket\0"
+    var k_version: [u8; 8] = "version\0"
+    var k_wurzel: [u8; 7] = "wurzel\0"
+    var k_start: [u8; 6] = "start\0"
+    var k_quelle: [u8; 7] = "quelle\0"
+    var k_oeff: [u8; 12] = "oeffentlich\0"
+    var k_brauche: [u8; 8] = "brauche\0"
+    rt.buf_leeren(aus)
+    var wz: rt.Buf = rt.buf_neu()
+    normalisiere(&wz, vp, vn)
+    info_zeile(aus, (&k_paket[0]) as u64, s_zeiger(w, vec_at[u32](&(*w).p_name, 0)))
+    info_zeile(aus, (&k_version[0]) as u64, s_zeiger(w, vec_at[u32](&(*w).p_ver, 0)))
+    info_zeile(aus, (&k_wurzel[0]) as u64, rt.buf_ptr(&wz))
+    var t: rt.Buf = rt.buf_neu()
+    if vec_at[u32](&(*w).p_start, 0) != KEIN {
+        var st: rt.Buf = rt.buf_neu()
+        let y: u64 = s_zeiger(w, vec_at[u32](&(*w).p_start, 0))
+        rt.buf_push_bytes(&st, y, rt.c_laenge(y))
+        verbinde(&t, rt.buf_ptr(&wz), rt.buf_len(&wz), rt.buf_ptr(&st), rt.buf_len(&st))
+        info_zeile(aus, (&k_start[0]) as u64, rt.buf_ptr(&t))
+        rt.buf_frei(&st)
+    }
+    var i: usize = vec_at[u32](&(*w).p_q0, 0) as usize
+    while i < vec_at[u32](&(*w).p_q1, 0) as usize {
+        var qs: rt.Buf = rt.buf_neu()
+        let y: u64 = s_zeiger(w, vec_at[u32](&(*w).q, i))
+        rt.buf_push_bytes(&qs, y, rt.c_laenge(y))
+        verbinde(&t, rt.buf_ptr(&wz), rt.buf_len(&wz), rt.buf_ptr(&qs), rt.buf_len(&qs))
+        info_zeile(aus, (&k_quelle[0]) as u64, rt.buf_ptr(&t))
+        rt.buf_frei(&qs)
+        i = i + 1
+    }
+    i = vec_at[u32](&(*w).p_o0, 0) as usize
+    while i < vec_at[u32](&(*w).p_o1, 0) as usize {
+        info_zeile(aus, (&k_oeff[0]) as u64, s_zeiger(w, vec_at[u32](&(*w).o, i)))
+        i = i + 1
+    }
+    i = vec_at[u32](&(*w).p_a0, 0) as usize
+    while i < vec_at[u32](&(*w).p_a1, 0) as usize {
+        var ps: rt.Buf = rt.buf_neu()
+        let y: u64 = s_zeiger(w, vec_at[u32](&(*w).a_pfad, i))
+        rt.buf_push_bytes(&ps, y, rt.c_laenge(y))
+        verbinde(&t, rt.buf_ptr(&wz), rt.buf_len(&wz), rt.buf_ptr(&ps), rt.buf_len(&ps))
+        ptext(aus, (&k_brauche[0]) as u64)
+        rt.buf_push(aus, 32 as u8)
+        ptext(aus, s_zeiger(w, vec_at[u32](&(*w).a_name, i)))
+        rt.buf_push(aus, 32 as u8)
+        ptext(aus, rt.buf_ptr(&t))
+        rt.buf_push(aus, 10 as u8)
+        rt.buf_frei(&ps)
+        i = i + 1
+    }
+    rt.buf_frei(&t)
+    rt.buf_frei(&wz)
+}
