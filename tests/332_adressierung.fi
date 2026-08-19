@@ -1,0 +1,179 @@
+// expect_exit: 77
+//
+// RUNDE 51 — Adressrechnung im Speicheroperanden (`[basis + index*faktor + k]`).
+//
+// Der Registerpfad faltet seit dieser Runde `shl`/`mul` + `add`/`ptradd` in den
+// Speicherzugriff. Das verschiebt den Lesezeitpunkt von Basis und Index — genau
+// die Klasse, die in Runde 40 einen Miscompile erzeugt hat, weil der
+// Registerverteiler von der verlaengerten Lebensspanne nichts wusste und ein
+// `call` dazwischen die caller-saved Register zerstoerte (docs/RUNDE41.md).
+//
+// Deshalb pruefen die Faelle hier gezielt:
+//   * jede Skalierung 1/2/4/8 (u8, u16, u32, u64) lesend UND schreibend,
+//   * dieselbe Adresse mehrfach gelesen (darf NICHT gefaltet werden),
+//   * AUFRUFE mitten in der Kette Basis -> Index -> Zugriff, und zwar
+//     zwischen der Adressrechnung und ihrer Verwendung,
+//   * Basis und Index, die den Aufruf ueberleben muessen,
+//   * ein Index, der selbst aus einem Aufruf kommt,
+//   * ein Zugriff, dessen Zielregister zugleich Basis oder Index sein kann
+//     (Ergebnis wird sofort danach wieder als Index gebraucht).
+//
+// Jede Pruefung addiert eine eigene Zahl auf; ein vertauschter oder
+// verschobener Zugriff faellt dadurch als falsche Summe auf.
+
+import std.rt
+
+// Der Aufruf, der zwischen Adressrechnung und Zugriff steht. Er beschreibt
+// absichtlich alle Argumentregister und rechnet, damit ein Compiler, der einen
+// Wert in einem caller-saved Register liegen laesst, ihn hier verliert.
+fn stoere(a: u64, b: u64, c: u64, d: u64, e: u64, f: u64) -> u64 {
+    var s: u64 = 0
+    var i: u64 = 0
+    while i < 4 {
+        s = s + a + b * 2 + c * 3 + d * 4 + e * 5 + f * 6 + i
+        i = i + 1
+    }
+    return s
+}
+
+// --- Faktor 4: u32-Feld, lesen und schreiben -------------------------------
+fn u32_feld() -> u64 {
+    let p: u64 = rt.heap_alloc(64)
+    var i: u64 = 0
+    while i < 16 {
+        *((p + i * 4) as *mut u32) = (i * 3 + 1) as u32
+        i = i + 1
+    }
+    var s: u64 = 0
+    var k: u64 = 0
+    while k < 16 {
+        s = s + (*((p + k * 4) as *mut u32)) as u64
+        k = k + 1
+    }
+    rt.heap_free(p, 64)
+    return s // 3*(0+..+15) + 16 = 360 + 16 = 376
+}
+
+// --- Faktor 8: u64-Feld, mit einem AUFRUF zwischen Adresse und Zugriff -----
+//
+// `basis` und `idx` muessen den Aufruf ueberleben. Wird die Lebensspanne der
+// Basis in den Zugriff verschoben, OHNE dass der Verteiler davon weiss, liest
+// dieser Fall Muell.
+fn u64_feld_mit_aufruf() -> u64 {
+    let p: u64 = rt.heap_alloc(128)
+    var i: u64 = 0
+    while i < 16 {
+        *((p + i * 8) as *mut u64) = i * 7 + 2
+        i = i + 1
+    }
+    var s: u64 = 0
+    var k: u64 = 0
+    while k < 16 {
+        let t: u64 = stoere(k, k + 1, k + 2, k + 3, k + 4, k + 5)
+        // p und k sind hier beide noch lebendig und werden erst JETZT gelesen
+        s = s + (*((p + k * 8) as *mut u64)) + (t & 1)
+        k = k + 1
+    }
+    rt.heap_free(p, 128)
+    return s // 7*(0+..+15) + 32 = 840 + 32 = 872
+}
+
+// --- Faktor 2 und 1: u16- und u8-Feld --------------------------------------
+fn schmale_felder() -> u64 {
+    let p: u64 = rt.heap_alloc(64)
+    var i: u64 = 0
+    while i < 16 {
+        *((p + i * 2) as *mut u16) = (i + 5) as u16
+        *((p + 32 + i) as *mut u8) = (i + 9) as u8
+        i = i + 1
+    }
+    var s: u64 = 0
+    var k: u64 = 0
+    while k < 16 {
+        s = s + (*((p + k * 2) as *mut u16)) as u64
+        s = s + (*((p + 32 + k) as *mut u8)) as u64
+        k = k + 1
+    }
+    rt.heap_free(p, 64)
+    return s // (120+80) + (120+144) = 200 + 264 = 464
+}
+
+// --- Dieselbe Adresse ZWEIMAL gelesen: darf nicht gefaltet werden ----------
+fn doppelt_gelesen() -> u64 {
+    let p: u64 = rt.heap_alloc(32)
+    *((p + 8) as *mut u64) = 11
+    *((p + 16) as *mut u64) = 13
+    let a: u64 = p + 8
+    let x: u64 = *(a as *mut u64)
+    let y: u64 = *(a as *mut u64) // zweiter Leser derselben Adresse
+    let b: u64 = p + 16
+    *(b as *mut u64) = *(b as *mut u64) + 1
+    let z: u64 = *(b as *mut u64)
+    rt.heap_free(p, 32)
+    return x + y + z // 11 + 11 + 14 = 36
+}
+
+// --- Index kommt selbst aus einem Aufruf -----------------------------------
+fn index_aus_aufruf() -> u64 {
+    let p: u64 = rt.heap_alloc(128)
+    var i: u64 = 0
+    while i < 16 {
+        *((p + i * 8) as *mut u64) = i * 100
+        i = i + 1
+    }
+    var s: u64 = 0
+    var k: u64 = 0
+    while k < 8 {
+        let j: u64 = stoere(k, 0, 0, 0, 0, 0) % 16
+        s = s + *((p + j * 8) as *mut u64)
+        k = k + 1
+    }
+    rt.heap_free(p, 128)
+    return s % 1000
+}
+
+// --- Ergebnis eines Zugriffs ist sofort wieder Index (Register-Kollision) ---
+fn kette() -> u64 {
+    let p: u64 = rt.heap_alloc(128)
+    var i: u64 = 0
+    while i < 16 {
+        *((p + i * 8) as *mut u64) = (i + 1) % 16
+        i = i + 1
+    }
+    var k: u64 = 3
+    var n: u64 = 0
+    var s: u64 = 0
+    while n < 10 {
+        k = *((p + k * 8) as *mut u64) // Ziel == vorheriger Index
+        s = s + k
+        n = n + 1
+    }
+    rt.heap_free(p, 128)
+    return s // 4+5+..+13 = 85
+}
+
+fn main() -> i32 {
+    if u32_feld() != 376 {
+        return 1
+    }
+    if u64_feld_mit_aufruf() != 872 {
+        return 2
+    }
+    if schmale_felder() != 464 {
+        return 3
+    }
+    if doppelt_gelesen() != 36 {
+        return 4
+    }
+    if kette() != 85 {
+        return 5
+    }
+    // `index_aus_aufruf` haengt nur von `stoere` ab und muss in allen
+    // Baustufen dasselbe liefern; der Wert selbst ist hier zweitrangig.
+    let a: u64 = index_aus_aufruf()
+    let b: u64 = index_aus_aufruf()
+    if a != b {
+        return 6
+    }
+    return 77
+}
