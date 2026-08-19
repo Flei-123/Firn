@@ -43,8 +43,8 @@
 //! (say inside some `if` within the loop body) executes unconditionally after
 //! hoisting. For trap-free, pure computations that preserves behaviour — at
 //! worst the preheader computes something nobody reads. Exactly that is why
-//! trap freedom above is a condition and not a nicety.
-//! Kür.
+//! trap freedom above is a condition and not a
+//! nicety.
 //!
 //! Nested loops need no special handling here: `opt.rs` iterates up to the
 //! fixpoint, and whatever moved from the inner loop into its preheader lies

@@ -765,7 +765,7 @@ pub(crate) fn hook_coerce(ck: &mut Checker, e: &Expr, want: &Type) -> bool {
         return true;
     }
     if got == *want {
-        return true; // already an error union — nothing to convert
+        return true; // already one error union — nothing to convert
     }
     if let Some(set) = set_name_of(&got) {
         if set == u.set {
