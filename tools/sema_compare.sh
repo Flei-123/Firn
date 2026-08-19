@@ -34,26 +34,26 @@ fi
 # KNOWN DEVIATION: tests/590_f64.fi, the literal `1e308`. No type error
 # but the floating point rounding case from round 20 -- the value is already
 # wrong in the token.
-BEKANNT="tests/590_f64.fi"
+KNOWN="tests/590_f64.fi"
 
-gleich=0
-ungleich=0
-bekannt=0
-nichtkern=0
+same=0
+different=0
+known=0
+noncore=0
 comptime=0
-uebersprungen=0
-ausdruecke=0
-erste=""
+skipped=0
+exprs=0
+first=""
 
 while IFS= read -r f; do
     if ! "$FIRNC" --emit=typen "$f" > "$TMPD"/semv_a.txt 2>/dev/null; then
-        uebersprungen=$((uebersprungen+1))
+        skipped=$((skipped+1))
         continue
     fi
     "$DUMP" "$f" > "$TMPD"/semv_b.txt 2>/dev/null
     rc=$?
     if [ "$rc" -eq 3 ]; then
-        nichtkern=$((nichtkern+1))
+        noncore=$((noncore+1))
         continue
     fi
     if [ "$rc" -eq 4 ]; then
@@ -61,29 +61,29 @@ while IFS= read -r f; do
         continue
     fi
     if [ "$rc" -eq 0 ] && cmp -s "$TMPD"/semv_a.txt "$TMPD"/semv_b.txt; then
-        gleich=$((gleich+1))
+        same=$((same+1))
         # Every " :" is a typed expression.
         n=$(grep -o ' :' "$TMPD"/semv_a.txt | wc -l)
-        ausdruecke=$((ausdruecke + n))
+        exprs=$((exprs + n))
         continue
     fi
-    ungleich=$((ungleich+1))
-    if echo "$BEKANNT" | tr ' ' '\n' | grep -qxF "$f"; then
-        bekannt=$((bekannt+1))
+    different=$((different+1))
+    if echo "$KNOWN" | tr ' ' '\n' | grep -qxF "$f"; then
+        known=$((known+1))
     else
-        [ -z "$erste" ] && erste="$f (rc=$rc)"
+        [ -z "$first" ] && first="$f (rc=$rc)"
     fi
 done < <(find tests lib bin bench -name '*.fi' -not -type l | sort)
 
-echo "GLEICH:        $gleich"
-echo "UNGLEICH:      $ungleich   (bekannt und benannt: $bekannt)"
-echo "AUSDRUECKE:    $ausdruecke  (jeder mit demselben Typ wie in firnc0)"
-echo "NICHT KERN:    $nichtkern"
-echo "COMPTIME:      $comptime  (konstante Auswertung zur Uebersetzungszeit, nicht portiert)"
-echo "UEBERSPRUNGEN: $uebersprungen  (firnc0 prueft die Datei nicht einzeln)"
-if [ -n "$erste" ]; then
-    echo "erste unerwartete Abweichung: $erste"
-    ff=${erste%% *}
+echo "SAME:          $same"
+echo "DIFFERENT:     $different   (known and named: $known)"
+echo "EXPRESSIONS:   $exprs  (each with the same type as in firnc0)"
+echo "NOT CORE:      $noncore"
+echo "COMPTIME:      $comptime  (constant evaluation at compile time, not ported)"
+echo "SKIPPED:       $skipped  (firnc0 does not check the file on its own)"
+if [ -n "$first" ]; then
+    echo "first unexpected deviation: $first"
+    ff=${first%% *}
     diff <("$FIRNC" --emit=typen "$ff" 2>/dev/null) <("$DUMP" "$ff" 2>/dev/null) | head -6
     exit 1
 fi
