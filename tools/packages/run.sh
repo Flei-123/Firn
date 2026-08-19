@@ -109,7 +109,7 @@ for c in 0 1; do
     else
         out=$("$WORK/anw$c"); rc=$?
         if [ "$rc" -ne 0 ]; then
-            bad "Programm endete mit Exit $rc"
+            bad "the program ended with exit $rc"
         elif [ "$out" != "12 14 3" ]; then
             bad "output '$out', expected '12 14 3'"
         else
@@ -127,7 +127,7 @@ if "$FIRNC" --package "$P/app" >/dev/null 2>&1 \
    && [ "$("$P/app/app")" = "12 14 3" ]; then
     good
 else
-    bad "kein lauffaehiges '$P/app/app'"
+    bad "no runnable '$P/app/app'"
 fi
 
 # --- 4: --package-info, character-identical in both compilers --------------
@@ -139,7 +139,7 @@ if [ "$(cat "$WORK/info.0.rc")" != 0 ] || [ "$(cat "$WORK/info.1.rc")" != 0 ]; t
 elif ! cmp -s "$WORK/info.0.out" "$WORK/info.1.out"; then
     bad "Berichte unterscheiden sich" "$(diff "$WORK/info.0.out" "$WORK/info.1.out" | head -4)"
 elif ! grep -q '^needs geo demos/packages/geo$' "$WORK/info.0.out"; then
-    bad "Abhaengigkeit fehlt im Bericht" "$(head -8 "$WORK/info.0.out")"
+    bad "a dependency is missing from the report" "$(head -8 "$WORK/info.0.out")"
 else
     good
 fi

@@ -33,25 +33,25 @@ echo "== 2. Firn-Programm uebersetzen =="
 python3 tools/strlib/expand.py --all >/dev/null
 "$FIRNC" -o "$WORK/dtoa_stream" tools/dtoa_vectors/dtoa_stream.fi
 
-echo "== 3. $N Doubles erzeugen und wandeln =="
-"$WORK/gen" bits "$N" "$SEED" > "$WORK/vektoren.bin"
+echo "== 3. produce and convert $N doubles =="
+"$WORK/gen" bits "$N" "$SEED" > "$WORK/vectors.bin"
 START=$(date +%s.%N)
-if "$WORK/dtoa_stream" < "$WORK/vektoren.bin" > "$WORK/text.out" 2> "$WORK/summe.txt"; then
+if "$WORK/dtoa_stream" < "$WORK/vectors.bin" > "$WORK/text.out" 2> "$WORK/summary.txt"; then
     RC=0
 else
     RC=$?
 fi
 END=$(date +%s.%N)
-read -r GESAMT SCHLECHT < "$WORK/summe.txt"
-echo "   Firn selbst: $GESAMT gewandelt, $SCHLECHT Rueckwandlungen falsch"
+read -r TOTAL BAD < "$WORK/summary.txt"
+echo "   Firn itself: $TOTAL converted, $BAD conversions back wrong"
 echo "   Dauer: $(echo "$END $START" | awk '{printf "%.1f s", $1-$2}')"
 
-echo "== 4. Gegenpruefung mit Rust =="
+echo "== 4. counter-check with Rust =="
 "$WORK/gen" check "$N" "$SEED" < "$WORK/text.out"
 CHECKRC=$?
 
-if [ "$RC" -ne 0 ] || [ "$CHECKRC" -ne 0 ] || [ "$SCHLECHT" != "0" ]; then
-    echo "FEHLGESCHLAGEN"
+if [ "$RC" -ne 0 ] || [ "$CHECKRC" -ne 0 ] || [ "$BAD" != "0" ]; then
+    echo "FAILED"
     exit 1
 fi
 echo "OK: $N/$N bitgleich zurueck, $N/$N kuerzeste Darstellung wie Rust"

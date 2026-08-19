@@ -27,7 +27,7 @@ BENCHES = ["fib", "sieve", "matmul", "bytecount", "bubblesort", "statemachine"]
 def sh(cmd):
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
-        print("FEHLER bei: %s\n%s\n%s" % (" ".join(cmd), r.stdout, r.stderr))
+        print("ERROR at: %s\n%s\n%s" % (" ".join(cmd), r.stdout, r.stderr))
         sys.exit(1)
     return r
 
@@ -38,7 +38,7 @@ def timed(binary):
     r = subprocess.run([binary], capture_output=True, text=True)
     dt = time.perf_counter() - t0
     if r.returncode != 0:
-        print("FEHLER: %s endete mit %d" % (binary, r.returncode))
+        print("ERROR: %s ended with %d" % (binary, r.returncode))
         sys.exit(1)
     return dt, r.stdout.strip()
 
@@ -46,7 +46,7 @@ def timed(binary):
 def main():
     os.makedirs(WORK, exist_ok=True)
     if not os.path.exists(FIRNC):
-        print("Compiler fehlt: %s (cargo build --release)" % FIRNC)
+        print("the compiler is missing: %s (cargo build --release)" % FIRNC)
         sys.exit(1)
     rows = []
     for name in BENCHES:
@@ -93,7 +93,7 @@ def main():
             )
         )
         print(
-            "   Firn %.3fs | Firn --no-opt %.3fs | Rust -O %.3fs | Faktor %.2fx | Ergebnis %s"
+            "   Firn %.3fs | Firn --no-opt %.3fs | Rust -O %.3fs | factor %.2fx | result %s"
             % (
                 times["firn"],
                 times["firn_noopt"],
@@ -106,7 +106,7 @@ def main():
 
     hdr = (
         "| Benchmark | Firn | Firn `--no-opt` | Rust `-O` | Faktor Firn/Rust |"
-        " Gewinn durch Optimierer | Ergebnis |\n"
+        " gain through the optimiser | result |\n"
         "|---|---:|---:|---:|---:|---:|---:|\n"
     )
     body = ""
@@ -138,19 +138,19 @@ def main():
     rustc = subprocess.run(["rustc", "--version"], capture_output=True, text=True).stdout.strip()
     text = (
         "# Benchmark-Ergebnisse (real gemessen)\n\n"
-        "Erzeugt von `bench/run.sh` (`bench/bench.py`), %d Laeufe je Programm, **Median**.\n"
-        "Jeder Benchmark existiert zweimal — `bench/firn/<name>.fi` und "
-        "`bench/rust/<name>.rs` — und beide geben ihr Ergebnis aus; die Ausgaben "
-        "muessen uebereinstimmen, sonst bricht die Messung ab.\n"
-        "Die Rust-Seite benutzt `std::hint::black_box` und dieselben ungeprueften "
-        "Zeigerzugriffe wie die Firn-Seite, damit dieselbe Arbeit gemessen wird.\n\n"
+        "Produced by `bench/run.sh` (`bench/bench.py`), %d runs per program, **median**.\n"
+        "Every benchmark exists twice -- `bench/firn/<name>.fi` and "
+        "`bench/rust/<name>.rs` -- and both print their result; the outputs "
+        "have to match, otherwise the measurement stops.\n"
+        "The Rust side uses `std::hint::black_box` and the same unchecked "
+        "pointer accesses as the Firn side, so that the same work is measured.\n\n"
         "* CPU: %s\n* System: %s\n* %s\n* Firn: eigener Codegenerator, keine externen Crates\n\n"
         % (RUNS, cpu, uname, rustc)
     ) + hdr + body + summary
     with open(os.path.join(HERE, "RESULTS.md"), "w") as fh:
         fh.write(text)
     print("\n" + hdr + body + summary)
-    print("geschrieben: bench/RESULTS.md")
+    print("written: bench/RESULTS.md")
 
 
 if __name__ == "__main__":

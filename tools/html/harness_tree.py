@@ -47,14 +47,14 @@ def load_dat(path):
         if not block.strip():
             continue
         parts = {}
-        aktuell = "data"
-        parts[aktuell] = []
-        for zeile in block.split("\n"):
-            if zeile.startswith("#") and " " not in zeile.rstrip():
-                aktuell = zeile[1:].strip()
-                parts[aktuell] = []
+        cur = "data"
+        parts[cur] = []
+        for ln2 in block.split("\n"):
+            if ln2.startswith("#") and " " not in ln2.rstrip():
+                cur = ln2[1:].strip()
+                parts[cur] = []
                 continue
-            parts.setdefault(aktuell, []).append(zeile)
+            parts.setdefault(cur, []).append(ln2)
         data = "\n".join(parts.get("data", []))
         doc = parts.get("document", [])
         while doc and doc[-1] == "":
