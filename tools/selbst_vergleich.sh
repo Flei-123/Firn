@@ -28,7 +28,21 @@ FC1=${FIRNC1:-./.firnc1}
 WORK=.selbst-work
 mkdir -p "$WORK"
 
-if [ ! -x "$FC1" ]; then
+# LEKTION (Runde 46, zum vierten Mal dieselbe Falle): NIE ein Binary
+# wiederverwenden, nur weil es existiert. Nach einem Merge ist `.firnc1`
+# sonst aelter als firnc0 oder als die Quellen und der Vergleich misst
+# einen Compiler, den es nicht mehr gibt. Runde 45 meldete so ein
+# scheinbares UNGLEICH in tests/771_gc_aufbau_ohne_stw.fi, das mit frisch
+# gebautem `.firnc1` nicht existierte.
+neu_bauen=0
+[ -x "$FC1" ] || neu_bauen=1
+if [ -x "$FC1" ]; then
+    [ "$FIRNC" -nt "$FC1" ] && neu_bauen=1
+    while IFS= read -r q; do
+        [ "$q" -nt "$FC1" ] && { neu_bauen=1; break; }
+    done < <(find bin lib -name '*.fi' -not -type l)
+fi
+if [ "$neu_bauen" -eq 1 ]; then
     "$FIRNC" bin/firnc1.fi -o "$FC1" || exit 1
 fi
 
