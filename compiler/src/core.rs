@@ -1,47 +1,47 @@
-//! **Runde 52 — freistehend: Inline-Assembler, MMIO, Interrupt-Einsprung.**
+//! **Round 52 — freestanding: inline assembler, MMIO, interrupt entry.**
 //!
-//! Alles, was ein Kernel braucht und eine Anwendung nicht: die drei Stellen,
-//! an denen Firn den Prozessor direkt anspricht. `prof.rs` setzt daneben die
-//! Profilregeln aus `SPEC.md` §2 durch, `main.rs` erzeugt mit `-c` eine
-//! freistehende ELF-Objektdatei.
+//! Everything a kernel needs and applications do not: the three spots at
+//! which Firn addresses the processor directly. `prof.rs` enforces the
+//! profile rules of `SPEC.md` §2 alongside, `main.rs` produces a freestanding
+//! ELF object file with `-c`.
 //!
-//! ## 1. Inline-Assembler
+//! ## 1. Inline assembler
 //!
 //! ```firn
 //! asm("cli")
-//! asm("out dx, al", in("dx") port, in("al") wert)
-//! let alt: u64 = asm("rdtsc", out("rax"), clobber("rdx"))
+//! asm("out dx, al", <asm_op>, <asm_op>)
+//! let old: u64 = asm("rdtsc", out("rax"), clobber("rdx"))
 //! ```
 //!
-//! Grammatik (der Parser-Hook unten setzt genau das um):
+//! Grammar (the parser hook below implements exactly that):
 //!
 //! ```ebnf
-//! asm_ausdruck = "asm" "(" str_lit { "," asm_op } ")" ;
-//! asm_op       = "in"      "(" str_lit ")" ausdruck
-//!              | "out"     "(" str_lit ")"
-//!              | "clobber" "(" str_lit ")" ;
+//! asm_expr = "asm" "(" str_lit { "," asm_op } ")" ;
+//! asm_op   = KwIn      "(" str_lit ")" expression
+//!          | "out"     "(" str_lit ")"
+//!          | "clobber" "(" str_lit ")" ;
 //! ```
 //!
-//! `asm` ist **kein Schluesselwort**: der Parser erkennt die Form nur, wenn auf
-//! den Bezeichner `asm` unmittelbar `(` und ein Zeichenkettenliteral folgen.
-//! Damit bleibt `asm` als gewoehnlicher Name benutzbar und der Tokenstrom
-//! aendert sich nicht (dieselbe Entscheidung wie bei `size_of[T]`, `select`,
-//! `barrier`, `secure_zero`, `__atomar_addieren`).
+//! `asm` is **no keyword**: the parser spots the form only when the identifier
+//! `asm` is followed immediately by `(` and a string literal. That keeps `asm`
+//! usable as a plain label and leaves the token stream unchanged (the same
+//! decision as with `size_of[T]`, `select`, `barrier`, `secure_zero`,
+//! `__atomic_add`).
 //!
-//! **Volatile ist nicht abwaehlbar.** `fir::Op::Asm` gilt als unrein
-//! (`is_pure() == false`), hat keinen CSE-Schluessel (`opt.rs::key`), ist
-//! nicht schleifeninvariant hebbar (`licm.rs`) und gilt in `mem2reg.rs` als
-//! unantastbar und speicherveraendernd. Das ist die Lehre aus Runde 40 — dort
-//! entfernte der Optimierer Code, den er nicht entfernen durfte.
+//! **Volatile cannot be waived.** `fir::Op::Asm` counts as impure
+//! (`is_pure() == false`), has no CSE key (`opt.rs::key`), is not hoistable as
+//! loop invariant (`licm.rs`) and counts at `mem2reg.rs` as untouchable and
+//! memory changing. That is the lesson of round 40 — there the optimizer
+//! removed code it was not allowed to remove.
 //!
-//! **Registerbindung statt Platzhalter.** Operanden nennen ihr Register
-//! selbst; es gibt keine `{0}`-Ersetzung. Das ist die minimale ehrliche Form:
-//! der Codegenerator legt vor dem Block `mov <reg>, <wert>` und liest danach
-//! `out` aus. Erlaubt sind ausschliesslich die **caller-saved** Register
-//! (`rax rcx rdx rsi rdi r8..r11` samt ihren schmalen Namen) — genau die, die
-//! auch ein gewoehnlicher `call` zerstoert. Dadurch braucht die
-//! Registerzuteilung keine Sonderregel: sie behandelt `Op::Asm` wie einen
-//! Aufruf. `rbx`, `rbp`, `rsp` und `r12`–`r15` sind abgelehnt, mit Meldung.
+//! **Register binding rather than placeholders.** Operands state their own
+//! register; there is no `{0}` substitution. That is the minimal honest form:
+//! the code generator puts `mov <reg>, <value>` ahead of the block and reads
+//! `out` afterwards. Allowed are exclusively the **caller-saved** registers
+//! (`rax rcx rdx rsi rdi r8..r11` together with their narrow labels) — exactly
+//! those that any ordinary `call` destroys as well. That way the register
+//! allocation needs no special rule: it treats `Op::Asm` like a call. `rbx`,
+//! `rbp`, `rsp` and `r12`–`r15` are rejected, with a message.
 //!
 //! ## 2. MMIO
 //!
@@ -50,16 +50,16 @@
 //! let z: u32 = __mmio_read32(p)
 //! ```
 //!
-//! Acht eingebaute Namen (`8|16|32|64` × `lesen|schreiben`). Sie werden zu
-//! `fir::Op::MmioLoad` / `Op::MmioStore` — eine einzige Maschineninstruktion,
-//! die kein Durchgang zusammenlegen, verschieben oder entfernen darf. Der
-//! `__`-Praefix ist reserviert (wie `__atomar_addieren`, Runde 47).
+//! Eight builtin labels (`8|16|32|64` × `read|write`). They become
+//! `fir::Op::MmioLoad` / `Op::MmioStore` — a single machine instruction that
+//! no pass may merge, move or remove. The `__` prefix is reserved (like
+//! `__atomic_add`, round 47).
 //!
-//! ## 3. Interrupt-Einsprungpunkte
+//! ## 3. Interrupt entry points
 //!
-//! `#[interrupt] fn tastatur() { … }` — siehe `codegen_x86.rs`. Hier steht nur
-//! die Pruefung: keine Parameter, kein Rueckgabewert, nicht aufrufbar, nur im
-//! Kernel-Profil.
+//! `#[interrupt] fn keyboard() { … }` — see `codegen_x86.rs`. Here stands the
+//! check alone: no parameters, no return value, not callable, kernel profile
+//! only.
 
 use std::cell::RefCell;
 
@@ -73,13 +73,13 @@ use crate::sema::Checker;
 use crate::strings::LitValue;
 use crate::types::Type;
 
-// --------------------------------------------------------------- Namen ---
+// -------------------------------------------------------------- Labels ---
 
-/// Reservierter Namenspraefix des Inline-Assemblers. Firn-Bezeichner koennen
-/// `$` nicht enthalten — eine Kollision mit Nutzercode ist ausgeschlossen.
+/// Reserved label prefix of the inline assembler. Firn identifiers cannot
+/// hold a `$` — a collision with user code is ruled out.
 const P_ASM: &str = "asm$";
 
-/// Die acht MMIO-Namen. Reihenfolge = Breite 8/16/32/64.
+/// The eight MMIO labels. Order = width 8/16/32/64.
 pub(crate) const MMIO_READ: [&str; 4] = [
     "__mmio_read8",
     "__mmio_read16",
@@ -93,13 +93,13 @@ pub(crate) const MMIO_WRITE: [&str; 4] = [
     "__mmio_write64",
 ];
 
-/// Breitenindex 0..3 eines MMIO-Namens, oder `None`.
+/// Width index 0..3 of one MMIO label, or `None`.
 fn mmio_width(name: &str, write: bool) -> Option<usize> {
     let tab = if write { &MMIO_WRITE } else { &MMIO_READ };
     tab.iter().position(|n| *n == name)
 }
 
-/// Ganzzahltyp zur Breite (0..3 = u8/u16/u32/u64).
+/// Integer type per width (0..3 = u8/u16/u32/u64).
 fn mmio_ty(i: usize) -> Type {
     match i {
         0 => Type::U8,
@@ -118,11 +118,11 @@ fn mmio_fty(i: usize) -> FTy {
     }
 }
 
-// ------------------------------------------------------- Registertabelle ---
+// -------------------------------------------------------- Register table ---
 
-/// Erlaubte Register: die caller-saved Menge von System V, in allen vier
-/// Breiten. Der zweite Eintrag ist der 64-Bit-Stamm — in ihn legt der
-/// Codegenerator den Eingabewert (die schmalen Namen sind Sichten darauf).
+/// Allowed registers: the caller-saved set of System V, at all four widths.
+/// The second entry is the 64-bit trunk — the code generator puts the input
+/// value there (the narrow labels are views onto it).
 const REGISTER: &[(&str, &str)] = &[
     ("rax", "rax"), ("eax", "rax"), ("ax", "rax"), ("al", "rax"),
     ("rcx", "rcx"), ("ecx", "rcx"), ("cx", "rcx"), ("cl", "rcx"),
@@ -135,9 +135,9 @@ const REGISTER: &[(&str, &str)] = &[
     ("r11", "r11"), ("r11d", "r11"), ("r11w", "r11"), ("r11b", "r11"),
 ];
 
-/// Register, die es zwar gibt, die der Inline-Assembler aber ablehnt: sie sind
-/// callee-saved bzw. tragen den Rahmen. Getrennte Liste, damit die Meldung
-/// sagen kann WARUM (und nicht nur „unbekannt").
+/// Registers that do exist, yet the inline assembler rejects them: they are
+/// callee-saved or carry the frame. A separate list, so that the message can
+/// say WHY (and not merely "unknown").
 const LOCKED: &[&str] = &[
     "rbx", "ebx", "bx", "bl",
     "rbp", "ebp", "bp", "bpl",
@@ -148,17 +148,17 @@ const LOCKED: &[&str] = &[
     "r15", "r15d", "r15w", "r15b",
 ];
 
-/// 64-Bit-Stamm eines erlaubten Registernamens.
+/// 64-bit trunk of one allowed register label.
 pub(crate) fn stem(r: &str) -> Option<&'static str> {
     REGISTER.iter().find(|(n, _)| *n == r).map(|(_, s)| *s)
 }
 
 // ------------------------------------------------------------ Register ---
 
-/// Ein `asm`-Block, so wie ihn der Parser gesehen hat. Die Eingabe-AUSDRUECKE
-/// stehen nicht hier, sondern als Argumente des erzeugten Aufrufs — dadurch
-/// laufen Monomorphisierung, `#[no_gc]`-Pruefung und `comptime` unveraendert
-/// darueber hinweg (dieselbe Bauart wie `__match#N` in `sema_match.rs`).
+/// One `asm` block the way the parser saw it. The input EXPRESSIONS do not
+/// stand here but as arguments of the produced call — that way
+/// monomorphization, the `#[no_gc]` check and `comptime` run over it
+/// unchanged (the same build as `__match#N` at `sema_match.rs`).
 #[derive(Clone, Debug)]
 pub(crate) struct AsmBlock {
     pub(crate) template: String,
@@ -184,31 +184,31 @@ pub(crate) fn block_at(i: usize) -> Option<AsmBlock> {
     REG.with(|r| r.borrow().get(i).cloned())
 }
 
-/// Anzahl angemeldeter `asm`-Bloecke (Selbsttests, `--stats`).
+/// Count of registered `asm` blocks (self tests, `--stats`).
 pub(crate) fn block_count() -> usize {
     REG.with(|r| r.borrow().len())
 }
 
-/// Register leeren — nur fuer die Selbsttests, die mehrere Programme in
-/// EINEM Prozess uebersetzen.
+/// Clear the register — for the self tests only, which compile several
+/// programs within ONE process.
 #[cfg(test)]
 pub(crate) fn reset() {
     REG.with(|r| r.borrow_mut().clear());
 }
 
-/// Gehoert der Name zu einem `asm`-Block? Liefert die Nummer.
+/// Does the label belong to some `asm` block? Yields the number.
 fn asm_number(name: &str) -> Option<usize> {
     name.strip_prefix(P_ASM)?.parse::<usize>().ok()
 }
 
 // ------------------------------------------------------------- Parser ---
 
-/// Zeichenkettenliteral an Position `pos + off`?
+/// String literal at position `pos + off`?
 fn is_str_at(p: &Parser, off: usize) -> bool {
     matches!(p.toks.get(p.pos + off).map(|t| &t.kind), Some(TokKind::Str(..)))
 }
 
-/// Liest ein Zeichenkettenliteral als Rust-`String` (nur Oktettliterale).
+/// Reads a string literal as a Rust `String` (octet literals only).
 fn str_lit(p: &mut Parser, what_for: &str) -> Option<(String, Span)> {
     let k = p.kind().clone();
     match k {
@@ -237,10 +237,10 @@ fn str_lit(p: &mut Parser, what_for: &str) -> Option<(String, Span)> {
     }
 }
 
-/// `// HOOK kern` in `parser::primary`.
+/// `// HOOK kern` within `parser::primary`.
 ///
-/// Erkennt `asm ( "…" … )`. Nur diese Form — `asm(x)` mit einem
-/// Nicht-Literal bleibt ein gewoehnlicher Aufruf einer Funktion `asm`.
+/// Spots `asm ( "…" … )`. Only that form — `asm(x)` with a non-literal
+/// stays a plain call of a function `asm`.
 pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
     match p.kind() {
         TokKind::Ident(n) if n == "asm" => {}
@@ -266,8 +266,8 @@ pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
             break;
         }
         let before = p.pos;
-        // `in` ist ein Schluesselwort (for-Schleife), `out`/`clobber` sind
-        // gewoehnliche Bezeichner. Alle drei werden hier oertlich erkannt.
+        // The keyword `KwIn` (known from the for loop) versus `out`/`clobber`,
+        // which are ordinary identifiers. All three get spotted locally here.
         let kind = match p.kind().clone() {
             TokKind::KwIn => {
                 p.bump();
@@ -332,9 +332,9 @@ pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
     Some(p.mk(span, ExprKind::Call(format!("{}{}", P_ASM, nr), ins, start)))
 }
 
-// ------------------------------------------------------------ Typphase ---
+// ---------------------------------------------------------- Type phase ---
 
-/// Pruefung eines Registernamens. `wo` steht in der Meldung.
+/// Check of a register label. `wo` shows up within the message.
 fn check_reg(ck: &mut Checker, reg: &str, span: Span, wo: &str) -> bool {
     if reg == "memory" && wo == "clobber" {
         return true;
@@ -361,7 +361,7 @@ fn check_reg(ck: &mut Checker, reg: &str, span: Span, wo: &str) -> bool {
     false
 }
 
-/// `// HOOK kern` in `sema::call` — `asm$N(…)` und die acht MMIO-Namen.
+/// `// HOOK kern` within `sema::call` — `asm$N(…)` and the eight MMIO labels.
 pub(crate) fn hook_call(
     ck: &mut Checker,
     name: &str,
@@ -393,8 +393,8 @@ fn check_asm(ck: &mut Checker, nr: usize, args: &[Expr], espan: Span) -> Type {
             return Type::Error;
         }
     };
-    // SPEC §2: Inline-Assembler ist Kernel-Sache. Im `app`-Profil abgelehnt,
-    // damit niemand versehentlich eine Anwendung an eine Architektur nagelt.
+    // SPEC §2: the inline assembler is kernel business. Rejected under the
+    // `app` profile, so nobody nails applications to one architecture.
     crate::prof::hook_asm(ck, b.span);
     let mut good = true;
     if let Some(r) = &b.out {
@@ -406,8 +406,8 @@ fn check_asm(ck: &mut Checker, nr: usize, args: &[Expr], espan: Span) -> Type {
     for r in &b.clobber {
         good &= check_reg(ck, r, b.span, "clobber");
     }
-    // Jeder Eingabewert muss skalar sein (Ganzzahl, bool, Zeiger): in ein
-    // Register passt nichts anderes.
+    // Every input value must be scalar (integer, bool, pointer): nothing else
+    // fits into a register.
     for (i, a) in args.iter().enumerate() {
         let t = ck.expr(a, Some(&Type::U64));
         if t.is_error() {
@@ -527,9 +527,9 @@ fn check_mmio_write(
     Type::Void
 }
 
-// ---------------------------------------------------------- Lowerphase ---
+// ------------------------------------------------------ Lowering phase ---
 
-/// `// HOOK kern` in `lower::lower_call`.
+/// `// HOOK kern` within `lower::lower_call`.
 #[allow(clippy::option_option)]
 pub(crate) fn lower_hook(
     lw: &mut Lower,
@@ -577,8 +577,8 @@ fn lower_asm(
         Some(b) => b,
         None => return lw.ice(span, "unknown asm block in lowering"),
     };
-    // Eingabewerte in Quellreihenfolge auswerten, danach auf 64 Bit bringen:
-    // in ein Register geht immer das ganze Wort.
+    // Evaluate the input values by source order, then bring them to 64 bits:
+    // into a register goes the whole word, always.
     let mut ins: Vec<Val> = Vec::with_capacity(args.len());
     for a in args {
         let v = lw.lower_expr(a)?;
@@ -608,13 +608,13 @@ fn lower_asm(
 
 // ---------------------------------------------------------- #[interrupt] ---
 
-/// Traegt die Funktion `#[interrupt]`?
+/// Does the function carry `#[interrupt]`?
 pub(crate) fn has_interrupt(f: &crate::ast::FnDecl) -> bool {
     f.attrs.iter().any(|a| a.name == "interrupt")
 }
 
-/// `// HOOK kern` in `sema::run`: Form der `#[interrupt]`-Funktionen pruefen
-/// und sicherstellen, dass niemand sie ruft.
+/// `// HOOK kern` within `sema::run`: check the form of the `#[interrupt]`
+/// functions and make sure that nobody calls them.
 pub(crate) fn check_interrupts(ck: &mut Checker, prog: &crate::ast::Program) {
     let mut names: Vec<String> = Vec::new();
     for f in &prog.funcs {
@@ -659,8 +659,8 @@ pub(crate) fn check_interrupts(ck: &mut Checker, prog: &crate::ast::Program) {
     if names.is_empty() {
         return;
     }
-    // Ein Aufruf mit `call` wuerde in einem `iretq` enden und den Stapel
-    // zerlegen. Also verboten — mit Zeile und Spalte.
+    // A call through `call` would end at one `iretq` and take the stack
+    // apart. So forbidden — with line and column.
     for f in &prog.funcs {
         visit_calls(ck, &f.body, &names);
     }
@@ -781,8 +781,8 @@ mod tests {
 
     #[test]
     fn asm_stays_despite_unused_result() {
-        // DIE FALLE AUS RUNDE 40: das Ergebnis wird nie gelesen. Ein
-        // Optimierer, der `Op::Asm` fuer rein haelt, wirft die Zeile weg.
+        // THE TRAP OF ROUND 40: the result never gets read. Any optimizer
+        // that holds `Op::Asm` for pure throws the line away.
         let (asm, _) = build(
             "profile kernel\nfn f() { let _x: u64 = asm(\"rdtsc\", out(\"rax\"), clobber(\"rdx\")) }\n",
         );
