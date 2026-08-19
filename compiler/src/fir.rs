@@ -183,6 +183,12 @@ pub enum Op {
     /// (SPEC §3.4). Niemals rein, niemals zusammenlegbar, nie ueber einen
     /// anderen Speicherzugriff hinweg verschiebbar.
     AtomicAdd { addr: Val, val: Val },
+    /// Aufruf ueber einen ZEIGER — dynamischer Versand (`iface.rs`, Runde 46).
+    /// `target` ist die Adresse der Funktion, sonst gilt alles wie bei `Call`.
+    CallIndirect { target: Val, args: Vec<Val> },
+    /// Adresse einer Methodentafel (`iface.rs`, Runde 46). `tafel` ist der
+    /// Schluessel `<Schnittstelle>.<Typ>`; das Label steht in `.rodata`.
+    VtabAddr { tafel: String },
     /// Adresse des Zustandsblocks des Sammlers (SPEC §3.5, `gc.rs`).
     /// `regs = true`: vorher die callee-saved Register in den Block retten —
     /// erst dadurch ist der KONSERVATIVE Registerscan ehrlich (SPEC §3.5.3).
@@ -204,11 +210,14 @@ impl Op {
             | Op::Load { .. }
             | Op::Alloca { .. }
             | Op::Select { .. } => true,
+            // Die Adresse einer Tafel im `.rodata` ist eine Konstante.
+            Op::VtabAddr { .. } => true,
             // Der Zustandsblock ist immer da; das Retten der Register
             // schreibt aber Speicher und darf nicht wegfallen.
             Op::GcAddr { regs } => !*regs,
             Op::Store { .. }
             | Op::Call { .. }
+            | Op::CallIndirect { .. }
             | Op::Syscall { .. }
             | Op::CopyMem { .. }
             | Op::Barrier { .. }
@@ -220,7 +229,11 @@ impl Op {
     /// Alle gelesenen Werte.
     pub fn uses(&self, out: &mut Vec<Val>) {
         match self {
-            Op::Const(_) | Op::Alloca { .. } | Op::GcAddr { .. } => {}
+            Op::Const(_) | Op::Alloca { .. } | Op::GcAddr { .. } | Op::VtabAddr { .. } => {}
+            Op::CallIndirect { target, args } => {
+                out.push(*target);
+                out.extend_from_slice(args);
+            }
             Op::Bin(_, a, b) => {
                 out.push(*a);
                 out.push(*b);
@@ -488,6 +501,10 @@ fn fmt_inst(i: &Inst) -> String {
         Op::Store { addr, val } => format!("store.{} %{}, %{}", t, val, addr),
         Op::PtrAdd { base, off } => format!("ptradd.ptr %{}, %{}", base, off),
         Op::Call { name, args } => format!("call.{} @{}({})", t, name, vlist(args)),
+        Op::CallIndirect { target, args } => {
+            format!("calli.{} %{}({})", t, target, vlist(args))
+        }
+        Op::VtabAddr { tafel } => format!("vtab.ptr @{}", tafel),
         Op::Syscall { args } => format!("syscall.{} {}", t, vlist(args)),
         Op::CopyMem { dst, src, size } => format!("copymem %{}, %{}, size={}", dst, src, size),
         Op::Select { cond, a, b } => format!("select.{} %{}, %{}, %{}", t, cond, a, b),

@@ -143,6 +143,13 @@ pub(crate) fn replace_uses(f: &mut Func, map: &HashMap<Val, Val>) -> usize {
                         rep(a, &mut n);
                     }
                 }
+                Op::CallIndirect { target, args } => {
+                    rep(target, &mut n);
+                    for a in args.iter_mut() {
+                        rep(a, &mut n);
+                    }
+                }
+                Op::VtabAddr { .. } => {}
                 Op::CopyMem { dst, src, .. } => {
                     rep(dst, &mut n);
                     rep(src, &mut n);
@@ -328,6 +335,7 @@ fn clobbers_memory(op: &Op) -> bool {
         op,
         Op::Store { .. }
             | Op::Call { .. }
+            | Op::CallIndirect { .. }
             | Op::Syscall { .. }
             | Op::CopyMem { .. }
             | Op::AtomicAdd { .. }

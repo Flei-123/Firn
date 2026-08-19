@@ -35,8 +35,10 @@ import vec
 import intern
 import fir
 import gc
+import iface
 
-export { Cg, cg_neu, cg_frei, cg_lauf, cg_ungeeignet, cg_text, cg_gc_setzen }
+export { Cg, cg_neu, cg_frei, cg_lauf, cg_ungeeignet, cg_text, cg_gc_setzen,
+         cg_if_setzen }
 
 const KEIN: u32 = 4294967295
 
@@ -49,6 +51,7 @@ struct Cg {
     rahmen: u64
     ungeeignet: bool
     gcr: u64            // gc-Registrierung (Runde 34), 0 = keine Klassen
+    ifr: u64            // Schnittstellen (Runde 46), 0 = keine
 }
 
 fn cg_neu(f: u64, it: u64) -> Cg {
@@ -56,13 +59,24 @@ fn cg_neu(f: u64, it: u64) -> Cg {
         f: f, it: it,
         aus: rt.buf_neu(),
         slot: vec_neu[u64](), aslot: vec_neu[u64](),
-        rahmen: 0, ungeeignet: false, gcr: 0,
+        rahmen: 0, ungeeignet: false, gcr: 0, ifr: 0,
     }
 }
 
 // Die gc-Registrierung anmelden (Runde 34): sie traegt Groesse, Typkennung
 // und Feldoffsets jeder Klasse — daraus entsteht die Typtabelle des Sammlers.
 fn cg_gc_setzen(c: *mut Cg, g: u64) { (*c).gcr = g }
+
+// Die Schnittstellen-Registrierung anmelden (Runde 46): aus ihr entstehen
+// die Methodentafeln in `.rodata`.
+fn cg_if_setzen(c: *mut Cg, f: u64) { (*c).ifr = f }
+fn ifg(c: *mut Cg) -> *mut iface.If { return (*c).ifr as *mut iface.If }
+fn hat_if(c: *mut Cg) -> bool {
+    if (*c).ifr == 0 {
+        return false
+    }
+    return iface.if_hat(ifg(c))
+}
 fn gcg(c: *mut Cg) -> *mut gc.Gc { return (*c).gcr as *mut gc.Gc }
 fn hat_gc(c: *mut Cg) -> bool {
     if (*c).gcr == 0 {
@@ -720,6 +734,143 @@ fn emit_call(c: *mut Cg, f: *mut fir.Fir, i: u32, fnr: u32) {
     }
 }
 
+// Dynamischer Versand (iface.rs, Runde 46): wie `emit_call`, nur steht das
+// Ziel in einem Wert statt in einem Symbol. Es wird ZULETZT nach `rax`
+// geladen — `rax` ist hier reines Arbeitsregister und kein Argumentregister.
+fn emit_calli(c: *mut Cg, f: *mut fir.Fir, i: u32, fnr: u32) {
+    let aoff: u32 = fir.i_aoff_von(f, i)
+    let alen: u32 = fir.i_alen_von(f, i)
+    var stapel: u32 = 0
+    if alen > 6 {
+        stapel = alen - 6
+    }
+    var fuell: u32 = 0
+    if stapel % 2 == 1 {
+        fuell = 1
+        var sp: [u8; 10] = "sub rsp, 8"
+        roh(c, (&sp[0]) as u64, 10)
+    }
+    if stapel > 0 {
+        var j: u32 = alen
+        while j > 6 {
+            j = j - 1
+            ein(c)
+            var m: [u8; 20] = "push qword ptr [rbp-"
+            w(c, (&m[0]) as u64, 20)
+            zahl(c, slot_von(c, fir.arg_bei(f, aoff + j)))
+            var e: [u8; 1] = "]"
+            w(c, (&e[0]) as u64, 1)
+            nl(c)
+        }
+    }
+    var k: u32 = 0
+    while k < 6 && k < alen {
+        ein(c)
+        var m: [u8; 4] = "mov "
+        w(c, (&m[0]) as u64, 4)
+        argreg(c, k)
+        var s: [u8; 17] = ", qword ptr [rbp-"
+        w(c, (&s[0]) as u64, 17)
+        zahl(c, slot_von(c, fir.arg_bei(f, aoff + k)))
+        var e: [u8; 1] = "]"
+        w(c, (&e[0]) as u64, 1)
+        nl(c)
+        k = k + 1
+    }
+    lade_slot(c, R_AX, slot_von(c, fir.i_a_von(f, i)))
+    var cl: [u8; 8] = "call rax"
+    roh(c, (&cl[0]) as u64, 8)
+    if stapel + fuell > 0 {
+        ein(c)
+        var ad: [u8; 9] = "add rsp, "
+        w(c, (&ad[0]) as u64, 9)
+        zahl(c, (stapel + fuell) as u64 * 8)
+        nl(c)
+    }
+    let dst: u32 = fir.i_dst_von(f, i)
+    if dst != fir.KEIN {
+        normalisiere(c, R_AX, fir.i_ty_von(f, i))
+        speichere_slot(c, slot_von(c, dst), R_AX)
+    }
+}
+
+// Adresse einer Methodentafel: `lea rax, [rip + .L__iface.<I>.<T>]`.
+fn emit_vtab(c: *mut Cg, iname: u32, tname: u32, dst: u32) {
+    ein(c)
+    var le: [u8; 20] = "lea rax, [rip + .L__"
+    w(c, (&le[0]) as u64, 20)
+    var ifw: [u8; 6] = "iface."
+    w(c, (&ifw[0]) as u64, 6)
+    rt.buf_push_bytes(&(*c).aus, intern.intern_zeiger(it(c), iname),
+                      intern.intern_laenge(it(c), iname))
+    rt.buf_push(&(*c).aus, 46 as u8)
+    rt.buf_push_bytes(&(*c).aus, intern.intern_zeiger(it(c), tname),
+                      intern.intern_laenge(it(c), tname))
+    var zu: [u8; 1] = "]"
+    w(c, (&zu[0]) as u64, 1)
+    nl(c)
+    speichere_slot(c, slot_von(c, dst), R_AX)
+}
+
+// Die Methodentafeln (`.rodata`) — eine je vollstaendiger Umsetzung. Das
+// Format steht in iface.rs (`tafeln_asm`): Zeiger auf die Methoden, in der
+// Reihenfolge der Schnittstelle.
+fn if_tafeln(c: *mut Cg) {
+    let g: *mut iface.If = ifg(c)
+    var da: bool = false
+    var u: usize = 0
+    while u < iface.if_u_anzahl(g) {
+        if iface.if_u_ok(g, u) {
+            da = true
+        }
+        u = u + 1
+    }
+    if !da {
+        return
+    }
+    var sec: [u8; 16] = ".section .rodata"
+    t(c, (&sec[0]) as u64, 16)
+    nl(c)
+    var al: [u8; 8] = ".align 8"
+    t(c, (&al[0]) as u64, 8)
+    nl(c)
+    u = 0
+    while u < iface.if_u_anzahl(g) {
+        if iface.if_u_ok(g, u) {
+            let iname: u32 = iface.if_u_if(g, u)
+            let prae: u32 = iface.if_u_prae(g, u)
+            var lb: [u8; 10] = ".L__iface."
+            t(c, (&lb[0]) as u64, 10)
+            rt.buf_push_bytes(&(*c).aus, intern.intern_zeiger(it(c), iname),
+                              intern.intern_laenge(it(c), iname))
+            rt.buf_push(&(*c).aus, 46 as u8)
+            rt.buf_push_bytes(&(*c).aus, intern.intern_zeiger(it(c), prae),
+                              intern.intern_laenge(it(c), prae))
+            rt.buf_push(&(*c).aus, 58 as u8)
+            nl(c)
+            let ii: u32 = iface.if_index(g, iname)
+            var k: u32 = 0
+            while k < iface.if_mlen(g, ii as usize) {
+                ein(c)
+                var q: [u8; 6] = ".quad "
+                w(c, (&q[0]) as u64, 6)
+                var pre: [u8; 4] = "_F1."
+                w(c, (&pre[0]) as u64, 4)
+                rt.buf_push_bytes(&(*c).aus, intern.intern_zeiger(it(c), prae),
+                                  intern.intern_laenge(it(c), prae))
+                var tr: [u8; 2] = "__"
+                w(c, (&tr[0]) as u64, 2)
+                let mn: u32 = iface.if_mname(g, ii as usize, k)
+                rt.buf_push_bytes(&(*c).aus, intern.intern_zeiger(it(c), mn),
+                                  intern.intern_laenge(it(c), mn))
+                nl(c)
+                k = k + 1
+            }
+        }
+        u = u + 1
+    }
+}
+
 fn emit_syscall(c: *mut Cg, f: *mut fir.Fir, i: u32) {
     let aoff: u32 = fir.i_aoff_von(f, i)
     let alen: u32 = fir.i_alen_von(f, i)
@@ -1025,6 +1176,14 @@ fn emit_inst(c: *mut Cg, fnr: u32, i: u32) {
         emit_atomadd(c, fir.i_a_von(f, i), fir.i_b_von(f, i), dst)
         return
     }
+    if art == fir.O_CALLI {
+        emit_calli(c, f, i, fnr)
+        return
+    }
+    if art == fir.O_VTAB {
+        emit_vtab(c, fir.i_a_von(f, i), fir.i_b_von(f, i), dst)
+        return
+    }
     (*c).ungeeignet = true
 }
 
@@ -1184,6 +1343,11 @@ fn cg_lauf(c: *mut Cg) {
     // nur, wenn das Programm ueberhaupt ein `gc class` enthaelt (gc.rs).
     if hat_gc(c) {
         gc_tabelle(c)
+    }
+    // HOOK iface: die Methodentafeln (.rodata) — nur, wenn das Programm
+    // ueberhaupt eine Schnittstelle umsetzt (iface.rs, Runde 46).
+    if hat_if(c) {
+        if_tafeln(c)
     }
     var gnu: [u8; 38] = ".section .note.GNU-stack,\"\",@progbits\n"
     t(c, (&gnu[0]) as u64, 38)
