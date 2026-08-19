@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
-"""Callgrind-Profil eines Firn-Binaries mit AUFGELOESTEN Funktionsnamen.
+"""Callgrind profile of a Firn binary with RESOLVED function names.
 
-WARUM: Firn-Binaries sind statisch und ohne Dynamik-Abschnitt; callgrind
-findet die Symbole nicht und nennt jede Funktion nur nach ihrer Anfangs-
-adresse (`fn=(748) 0x000000000041d33b`). Die Namen stehen aber sehr wohl in
-`.symtab` (`nm` liest sie).
+WHY: Firn binaries are static and have no dynamic section; callgrind
+does not find the symbols and names every function only after its start
+address (`fn=(748) 0x000000000041d33b`). But the names are very much in
+`.symtab` (`nm` reads them).
 
-FORMAT (wichtig, hier wurde schon einmal falsch geparst): mit
-`positions: line` ist die ERSTE Zahl einer Kostenzeile die ZEILENNUMMER,
-NICHT die Adresse. Die Adresse einer Funktion steht ausschliesslich im
-`fn=`-Kopf. Die Kosten werden deshalb der zuletzt genannten `fn` zugeordnet.
-`fn=(id)` ohne Namen verweist auf eine frueher eingefuehrte id.
+FORMAT (important, this has already been parsed wrongly once): with
+`positions: line` the FIRST number of a cost line is the LINE NUMBER,
+NOT the address. The address of a function stands exclusively in the
+`fn=` head. The costs are therefore attributed to the last named `fn`.
+`fn=(id)` without a name refers to an id introduced earlier.
 
-Ausgegeben werden SELBSTKOSTEN (Kostenzeilen der Funktion selbst; die Zeile
-nach `calls=` ist die INKLUSIVE Kosten des Aufrufs und wird uebersprungen)
-und zusaetzlich die INKLUSIVKOSTEN je Funktion (Summe der `calls=`-Zeilen,
-die auf sie zeigen; bei Rekursion ueberzaehlt das und ist nur ein Hinweis).
+What is printed are the SELF COSTS (cost lines of the function itself; the
+line after `calls=` is the INCLUSIVE cost of the call and is skipped)
+and in addition the INCLUSIVE COSTS per function (the sum of the `calls=`
+lines pointing at it; with recursion that overcounts and is only a hint).
 
-Aufruf:  python3 tools/tokenizer/profile.py <binary> <callgrind-out> [anzahl]
+Usage:  python3 tools/tokenizer/profile.py <binary> <callgrind-out> [count]
 """
 import subprocess
 import sys

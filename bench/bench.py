@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Ehrliche Messung: Firn gegen Rust (rustc -O), gleicher Rechner, Median.
+"""An honest measurement: Firn against Rust (rustc -O), the same machine, median.
 
-Jeder Mikrobenchmark liegt doppelt vor: `bench/firn/<name>.fi` und
-`bench/rust/<name>.rs`. Beide rechnen dasselbe und GEBEN DAS ERGEBNIS AUS —
-der Vergleich der Ausgaben ist Teil des Tests, damit auf keiner Seite Arbeit
-wegoptimiert werden kann (auf der Rust-Seite zusaetzlich `black_box`).
+Every microbenchmark exists twice: `bench/firn/<name>.fi` and
+`bench/rust/<name>.rs`. Both compute the same thing and PRINT THE RESULT --
+comparing the outputs is part of the test, so that no work can be optimised
+away on either side (on the Rust side additionally `black_box`).
 
-Gemessen wird die Gesamtlaufzeit des Prozesses (Median aus N Laeufen).
-Ausgabe: Tabelle nach stdout und `bench/RESULTS.md`.
+What is measured is the total run time of the process (the median of N runs).
+Output: a table on stdout and `bench/RESULTS.md`.
 """
 import os
 import statistics
