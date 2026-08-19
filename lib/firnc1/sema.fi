@@ -35,6 +35,7 @@ import muster
 import fehler
 import gc
 import iface
+import kern
 import nogc
 
 export { Sema, sema_neu, sema_frei, sema_lauf, sema_fehler, sema_typ,
@@ -1207,6 +1208,128 @@ fn schnittstellen_ruf(s: *mut Sema, e: u32, ii: u32, m: u32, et: u32) -> u32 {
     return iface.if_rtyp(ifp(s), ii as usize, mk)
 }
 
+// ---------------------------------------------- Inline-Assembler und MMIO
+//
+// RUNDE 52 (compiler/src/kern.rs::hook_call).
+
+// Ganzzahltyp zu einem MMIO-Breitenindex (0 = u8 … 3 = u64).
+fn mmio_typ(s: *mut Sema, w: u32) -> u32 {
+    if w == 0 {
+        return typen.neuer_typ(tafel(s), typen.K_U8, 0, 0)
+    }
+    if w == 1 {
+        return typen.neuer_typ(tafel(s), typen.K_U16, 0, 0)
+    }
+    if w == 2 {
+        return typen.neuer_typ(tafel(s), typen.K_U32, 0, 0)
+    }
+    return typen.neuer_typ(tafel(s), typen.K_U64, 0, 0)
+}
+
+// Ein Registername in einem asm-Block. `wo`: 0 = out, 1 = in, 2 = clobber.
+fn asm_reg_pruefen(s: *mut Sema, reg: u32, wo: u32) -> bool {
+    if wo == 2 {
+        var mw: [u8; 6] = "memory"
+        if intern.intern_gleich(namen(s), reg, (&mw[0]) as u64, 6) {
+            return true
+        }
+    }
+    if kern.reg_stamm(namen(s), reg) != kern.KEIN_REG {
+        return true
+    }
+    meckern(s)
+    return false
+}
+
+fn asm_pruefen(s: *mut Sema, blk: u32, e: u32) -> u32 {
+    let b: *mut ast.Baum = baum(s)
+    let off: u32 = ast.e_b(b, e)
+    let anz: u32 = ast.e_c(b, e)
+    var gut: bool = true
+    let aus: u32 = ast.asm_aus(b, blk)
+    if aus != ast.NICHTS {
+        if !asm_reg_pruefen(s, aus, 0) {
+            gut = false
+        }
+    }
+    var k: u32 = 0
+    while k < ast.asm_ein_anzahl(b, blk) {
+        if !asm_reg_pruefen(s, ast.asm_ein_reg(b, blk, k), 1) {
+            gut = false
+        }
+        k = k + 1
+    }
+    var k2: u32 = 0
+    while k2 < ast.asm_clob_anzahl(b, blk) {
+        if !asm_reg_pruefen(s, ast.asm_clob(b, blk, k2), 2) {
+            gut = false
+        }
+        k2 = k2 + 1
+    }
+    // Jeder Eingabewert muss skalar sein — in ein Register passt nichts
+    // anderes.
+    let u64t: u32 = typen.neuer_typ(tafel(s), typen.K_U64, 0, 0)
+    var k3: u32 = 0
+    while k3 < anz {
+        let t: u32 = ausdruck(s, ast.kind_at(b, off + k3), u64t)
+        if ist_fehler(s, t) {
+            gut = false
+        } else if !ist_int(s, t) && !ist_bool(s, t) && !typen.ist_zeiger(tafel(s), t) {
+            meckern(s)
+            gut = false
+        }
+        k3 = k3 + 1
+    }
+    if !gut {
+        return (*s).t_fehler
+    }
+    if aus != ast.NICHTS {
+        return u64t
+    }
+    return (*s).t_void
+}
+
+fn mmio_pruefen(s: *mut Sema, w: u32, e: u32, schreiben: bool) -> u32 {
+    let b: *mut ast.Baum = baum(s)
+    let off: u32 = ast.e_b(b, e)
+    let anz: u32 = ast.e_c(b, e)
+    var soll: u32 = 1
+    if schreiben {
+        soll = 2
+    }
+    let zt: u32 = mmio_typ(s, w)
+    if anz != soll {
+        var k: u32 = 0
+        while k < anz {
+            austypen(s, ast.kind_at(b, off + k))
+            k = k + 1
+        }
+        meckern(s)
+        return (*s).t_fehler
+    }
+    let pt: u32 = typen.neuer_typ(tafel(s), typen.K_PTR, zt, 1)
+    let at: u32 = ausdruck(s, ast.kind_at(b, off), pt)
+    if !ist_fehler(s, at) && !typen.ist_zeiger(tafel(s), at) {
+        meckern(s)
+        return (*s).t_fehler
+    }
+    if ist_fehler(s, at) {
+        return (*s).t_fehler
+    }
+    if !schreiben {
+        return zt
+    }
+    let wt: u32 = ausdruck(s, ast.kind_at(b, off + 1), zt)
+    if ist_fehler(s, wt) {
+        return (*s).t_fehler
+    }
+    if !ist_int(s, wt) {
+        meckern(s)
+        return (*s).t_fehler
+    }
+    return (*s).t_void
+}
+
 fn ruf(s: *mut Sema, e: u32) -> u32 {
     let b: *mut ast.Baum = baum(s)
     // `size_of[T]()` — kein gewoehnlicher Aufruf, sondern eine Groesse zur
@@ -1262,6 +1385,23 @@ fn ruf(s: *mut Sema, e: u32) -> u32 {
         }
         if muster.mus_ist_ctorname(namen(s), name) {
             return ctor_pruefen(s, name, e)
+        }
+    }
+    // RUNDE 52 (kern.rs): der Inline-Assembler und die acht MMIO-Namen.
+    // `asm$N` kann keine eigene Funktion sein ('$' ist kein Bezeichnerzeichen);
+    // bei MMIO gewinnt eine gleichnamige eigene Funktion.
+    let anr: u32 = kern.asm_nummer(namen(s), name)
+    if anr != kern.KEINE_NUMMER {
+        return asm_pruefen(s, anr, e)
+    }
+    if fn_suchen(s, name) == KEIN {
+        let wl: u32 = kern.mmio_lesen_breite(namen(s), name)
+        if wl != kern.KEINE_BREITE {
+            return mmio_pruefen(s, wl, e, false)
+        }
+        let ws: u32 = kern.mmio_schreiben_breite(namen(s), name)
+        if ws != kern.KEINE_BREITE {
+            return mmio_pruefen(s, ws, e, true)
         }
     }
     // `__atomar_addieren(p, delta)` (atomar.rs, RUNDE 47): atomares
