@@ -1633,17 +1633,31 @@ fn emit_block(e: &mut Emitter, ra: &Ra, b: &Block, next: Option<BlockId>) -> Res
                 e.line(&format!("jmp {}", block_label(&f.name, *t)));
             }
         }
-        Term::Switch { val, .. } => {
-            // `codegen_switch.rs` (Modul `types`) erwartet den Wert im Rahmen.
-            let off = match ra.a.frame.slot.get(*val as usize) {
-                Some(o) => *o,
-                None => return Err("interner Fehler: switch ohne Slot".to_string()),
-            };
-            if let Loc::Reg(_) = ra.a.loc(*val) {
-                ra.load_full(e, "rax", *val);
-                e.line(&format!("mov qword ptr [rbp-{}], rax", off));
+        Term::Switch { val, ty, .. } => {
+            // Runde 51: der Wert wandert DIREKT von seinem Ort nach rax.
+            // Vorher schrieb dieser Pfad ihn erst in sein Rahmenfach, weil
+            // `emit_switch` ihn nur von dort lesen konnte — zwei Speicher-
+            // zugriffe je Zustandswechsel im Tokenizer (10,2 Mio Ir auf
+            // realweb).
+            //
+            // Zusicherung an `Wertquelle::Geladen`: `Ra::load_ext` emittiert
+            // hier IMMER einen Schreibzugriff auf `eax`/`rax`. Der einzige
+            // Zweig, der nichts emittieren wuerde, ist „Quelle ist bereits
+            // das Zielregister" — und `rax` wird nie vergeben (siehe
+            // CALLEE_SAVED / TEMP_REGS / ARG_SPARE / DIV_SPARE). Zur
+            // Sicherheit wird genau das hier geprueft.
+            let (v, vty) = (*val, *ty);
+            if matches!(ra.a.ort(v), Loc::Reg("rax")) {
+                return Err("interner Fehler: switch-Wert liegt in rax".to_string());
             }
-            crate::codegen_switch::emit_switch(e, f, &ra.a.frame, &b.term)?;
+            crate::codegen_switch::emit_switch(
+                e,
+                f,
+                crate::codegen_switch::Wertquelle::Geladen(&|e2: &mut Emitter, bits: u32| {
+                    ra.load_ext(e2, "rax", v, vty, bits);
+                }),
+                &b.term,
+            )?;
         }
         Term::BrCond { cond, then_bb, else_bb } => {
             if f.constant_time && f.is_secret(*cond) {
