@@ -12,14 +12,14 @@
 # waere schlimmer als keine.
 #
 # Umgebung:
-#   SOAK_SEK         Laufzeitbudget je Fassung in Sekunden (Standard 600)
-#   SOAK_ZYKLEN      Hoechstzahl Zyklensaetze (Standard 100000000)
-#   SOAK_STICHPROBE  Zyklen je Datenzeile (Standard 1000)
-#   SOAK_MIN_ZYKLEN  Mindestzahl Zyklen fuer ein gueltiges Urteil (Standard 100000)
-#   SOAK_LECK_ZYKLEN Obergrenze fuer die LECKENDE Gegenprobe (Standard 600000;
+#   SOAK_SEC         Laufzeitbudget je Fassung in Sekunden (Standard 600)
+#   SOAK_CYCLES      Hoechstzahl Zyklensaetze (Standard 100000000)
+#   SOAK_SAMPLE  Zyklen je Datenzeile (Standard 1000)
+#   SOAK_MIN_CYCLES  Mindestzahl Zyklen fuer ein gueltiges Urteil (Standard 100000)
+#   SOAK_LEAK_CYCLES Obergrenze fuer die LECKENDE Gegenprobe (Standard 600000;
 #                    seit Runde 53 leckt ein Satz 13 Objekte zu 128 Byte,
 #                    das sind rund 1,0 GiB — vorher 6 zu 64 Byte)
-#   SOAK_LECK_MB     harte Speicherbremse fuer die Gegenprobe in MiB (Standard 3072)
+#   SOAK_LEAK_MB     harte Speicherbremse fuer die Gegenprobe in MiB (Standard 3072)
 #
 # WARUM DIE GEGENPROBE GEDECKELT IST: sie leckt bauartbedingt rund 384 Byte je
 # Zyklus (6 von 7 Objekten a 64 Byte). Ohne Deckel frisst sie bei voller
@@ -33,12 +33,12 @@ cd "$(dirname "$0")/../.."
 FIRNC=compiler/target/release/firnc
 ARBEIT=.dom-soak-work
 AUS=tools/dom_soak
-SEK=${SOAK_SEK:-600}
-ZYKLEN=${SOAK_ZYKLEN:-100000000}
-STICH=${SOAK_STICHPROBE:-1000}
-MINZ=${SOAK_MIN_ZYKLEN:-100000}
-LECK_ZYKLEN=${SOAK_LECK_ZYKLEN:-600000}
-LECK_MB=${SOAK_LECK_MB:-3072}
+SEK=${SOAK_SEC:-600}
+ZYKLEN=${SOAK_CYCLES:-100000000}
+STICH=${SOAK_SAMPLE:-1000}
+MINZ=${SOAK_MIN_CYCLES:-100000}
+LECK_ZYKLEN=${SOAK_LEAK_CYCLES:-600000}
+LECK_MB=${SOAK_LEAK_MB:-3072}
 BUDGET_MS=$((SEK * 1000))
 
 if [ ! -x "$FIRNC" ]; then
@@ -60,20 +60,20 @@ cp lib/dom/dom.fi lib/dom/meas.fi "$ARBEIT/"
 # $1 Quelle  $2 Ziel  $3 Budget ms  $4 Zyklen  $5 Stichprobe
 stelle_um() {
     sed -e "s|^const BUDGET_MS: i64 = .*$|const BUDGET_MS: i64 = $3  // SOAK_BUDGET_MS|" \
-        -e "s|^const ZYKLEN_MAX: i64 = .*$|const ZYKLEN_MAX: i64 = $4  // SOAK_ZYKLEN_MAX|" \
-        -e "s|^const STICHPROBE: i64 = .*$|const STICHPROBE: i64 = $5  // SOAK_STICHPROBE|" \
+        -e "s|^const CYCLES_MAX: i64 = .*$|const CYCLES_MAX: i64 = $4  // SOAK_CYCLES_MAX|" \
+        -e "s|^const SAMPLE: i64 = .*$|const SAMPLE: i64 = $5  // SOAK_SAMPLE|" \
         "$1" > "$2"
     # Die drei Zeilen muessen wirklich ersetzt worden sein.
     if ! grep -q "const BUDGET_MS: i64 = $3 " "$2"; then
         echo "FEHLER: BUDGET_MS in $1 nicht ersetzbar (Zeile veraendert?)."
         exit 1
     fi
-    if ! grep -q "const ZYKLEN_MAX: i64 = $4 " "$2"; then
-        echo "FEHLER: ZYKLEN_MAX in $1 nicht ersetzbar."
+    if ! grep -q "const CYCLES_MAX: i64 = $4 " "$2"; then
+        echo "FEHLER: CYCLES_MAX in $1 nicht ersetzbar."
         exit 1
     fi
-    if ! grep -q "const STICHPROBE: i64 = $5 " "$2"; then
-        echo "FEHLER: STICHPROBE in $1 nicht ersetzbar."
+    if ! grep -q "const SAMPLE: i64 = $5 " "$2"; then
+        echo "FEHLER: SAMPLE in $1 nicht ersetzbar."
         exit 1
     fi
 }

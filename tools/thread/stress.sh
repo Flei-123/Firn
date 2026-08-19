@@ -15,16 +15,16 @@
 #
 # Umgebung:
 #   STRESS_SEK    Laufzeit in Sekunden (Standard 130)
-#   STRESS_FAEDEN Zahl der Faeden (Standard 4)
-#   STRESS_LOKAL  1 = Freilisten je Faden (Variante B), 0 = GC-Sperre (A)
+#   STRESS_THREADS Zahl der Faeden (Standard 4)
+#   STRESS_LOCAL  1 = Freilisten je Faden (Variante B), 0 = GC-Sperre (A)
 #   STRESS_DRIFT_KIB  erlaubter RSS-Zuwachs (Standard 1024)
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 
 FIRNC=compiler/target/release/firnc
 SEK=${STRESS_SEK:-130}
-FAEDEN=${STRESS_FAEDEN:-4}
-LOKAL=${STRESS_LOKAL:-0}
+FAEDEN=${STRESS_THREADS:-4}
+LOKAL=${STRESS_LOCAL:-0}
 DRIFT=${STRESS_DRIFT_KIB:-1024}
 ARBEIT=$(mktemp -d /tmp/firn-faden-stress.XXXXXX)
 trap 'rm -rf "$ARBEIT"' EXIT
@@ -36,8 +36,8 @@ fi
 
 cp lib/dom/meas.fi "$ARBEIT/"
 sed -e "s|^const BUDGET_MS: i64 = .*$|const BUDGET_MS: i64 = $((SEK * 1000))  // STRESS_BUDGET_MS|" \
-    -e "s|^const FAEDEN: u64 = .*$|const FAEDEN: u64 = $FAEDEN  // STRESS_FAEDEN|" \
-    -e "s|^const LOKAL: u64 = .*$|const LOKAL: u64 = $LOKAL  // STRESS_LOKAL|" \
+    -e "s|^const THREADS: u64 = .*$|const THREADS: u64 = $FAEDEN  // STRESS_THREADS|" \
+    -e "s|^const LOCAL: u64 = .*$|const LOCAL: u64 = $LOKAL  // STRESS_LOCAL|" \
     tools/thread/stress.fi > "$ARBEIT/stress.fi"
 
 export FIRNLIB="$(pwd)/lib"

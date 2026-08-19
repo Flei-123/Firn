@@ -65,8 +65,8 @@ bauen() {
     # in diesem Aufbau 11,6 ms heraus — die Zahl stimmt, sie beantwortet nur
     # eine andere Frage als die dieser Runde.
     sed -e "s|^const BUDGET_MS: i64 = .*$|const BUDGET_MS: i64 = $MS|" \
-        -e "s|^const KINDER: u32 = .*$|const KINDER: u32 = $KINDER|" \
-        -e "s|^const AB_SCHWELLE: u64 = .*$|const AB_SCHWELLE: u64 = $SCHWELLE|" \
+        -e "s|^const CHILDREN: u32 = .*$|const CHILDREN: u32 = $KINDER|" \
+        -e "s|^const INCR_THRESHOLD: u64 = .*$|const INCR_THRESHOLD: u64 = $SCHWELLE|" \
         "$quelle/tools/gc_meas/build.fi" > "$d/build.fi"
     ( cd "$d" && FIRNLIB="$quelle/lib" "$fc" build.fi -o aufbau 2>"$d/bau.err" ) \
         || { echo "   BAU FEHLGESCHLAGEN ($name):"; head -8 "$d/bau.err"; return 1; }
