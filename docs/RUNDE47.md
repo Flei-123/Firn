@@ -1,38 +1,39 @@
-# Runde 47 — Finalisierer, `Arc[T]`, schwache Verweise: die Restarbeit an der Speicherverwaltung
+# Round 47 — finalizers, `Arc[T]`, weak references: the remaining work on memory management
 
-Branch `r47-arc`, Basis `a492d26`. Diese Runde schließt die drei Posten ab, die
-seit Runde 4 unverändert als „offen" in `ABNAHME.md` und `docs/RUNDE44.md`
-standen: **Finalisierer (`S4`)**, **`Arc[T]`** und **schwache Verweise, die
-beim Einsammeln wirklich genullt werden (`S3`)**.
+Branch `r47-arc`, base `a492d26`. This round closes the three items that had
+stood unchanged as „open" in `ABNAHME.md` and `docs/RUNDE44.md` since round
+4: **finalizers (`S4`)**, **`Arc[T]`** and **weak references that are really
+zeroed on collection (`S3`)**.
 
-Ergebnis vorweg, alles selbst gemessen:
+Result up front, all measured by ourselves:
 
-| | Basis (a492d26) | Runde 47 |
+| | base (a492d26) | round 47 |
 |---|---|---|
-| längste Unterbrechung, **Rechenzeit**, Median aus 7 Läufen | 469 µs | **460 µs** |
-| Durchsatz `build.fi` (Zyklen in 5 s, Median) | 554 000 | **554 000** |
-| Unterbrechungen über 1 ms in Rechenzeit (150-s-Lauf mit Finalisierern) | — | **0** von 253 698 |
-| RSS über 140 s Dauerbetrieb mit 48 Mio. Finalisierern | — | **1372 KiB, driftfrei** |
+| longest interruption, **compute time**, median of 7 runs | 469 µs | **460 µs** |
+| throughput `build.fi` (cycles in 5 s, median) | 554 000 | **554 000** |
+| interruptions above 1 ms in compute time (150 s run with finalizers) | — | **0** of 253 698 |
+| RSS over 140 s of continuous operation with 48 million finalizers | — | **1372 KiB, drift-free** |
 | `test.sh` | 696/696 | **727/727** |
 
 ---
 
-## 1. Finalisierer (`S4`)
+## 1. Finalizers (`S4`)
 
-### 1.1 Die Form, und warum sie nicht `fn finalize(inout self)` ist
+### 1.1 The form, and why it is not `fn finalize(inout self)`
 
-`SPEC.md` §3.5.3 sagt `fn finalize(inout self)`. Stufe 0 hat weder Methoden
-noch `inout` noch Funktionszeiger — und **indirekte Aufrufe gehören Runde 46**
-(Interfaces/Vtables), nicht dieser. Die ehrliche Entsprechung ohne
-Funktionszeiger sind zwei Teile:
+`SPEC.md` §3.5.3 says `fn finalize(inout self)`. Stage 0 has neither methods
+nor `inout` nor function pointers — and **indirect calls belong to round 46**
+(interfaces/vtables), not to this one. The honest equivalent without
+function pointers is two parts:
 
 ```firn
 gc_finalisierer_setzen(p, art)      // je OBJEKT eine Aufraeumart (1..16777215)
 fn __gc_finalisiere(art: u64, p: *mut u8) { … }   // EIN Verteiler im Programm
 ```
 
-Die Aufräumart steht **im Blockkopf**, nicht in einer Seitentabelle: das Wort
-`[4..8)` trug bisher nur die Marke (0/1/2) und hat 30 Bits frei. Neu:
+The cleanup kind is recorded **in the block header**, not in a side table:
+the word `[4..8)` so far only carried the mark (0/1/2) and has 30 bits free.
+New:
 
 ```
 Bits 0..1   Marke        0 weiss, 1 grau, 2 schwarz
@@ -42,40 +43,40 @@ Bit  4      F_GETAN      sein Finalisierer ist gelaufen
 Bits 8..31  Aufraeumart  24 Bit
 ```
 
-Das kostet **kein Byte je Objekt** und macht die Erkennung beim Fegen zum Test
-eines Bits in einem Wort, das dort ohnehin gelesen wird.
+That costs **not a single byte per object** and makes the detection during
+the sweep a test of one bit in a word that is read there anyway.
 
-Deklariert die **Wurzeldatei** `fn __gc_finalisiere`, nimmt der Compiler sie;
-sonst legt er eine leere Voreinstellung dazu. Das ist genau der Mechanismus,
-mit dem schon `error AllocError` behandelt wird (Tokensuche in
-`gc.rs::quelle_hat_allocerror`), und er ist in **beiden** Compilern gleich
-gebaut (`gc.rs::quelle_hat_finalisierer` / `lib/firnc1/gc.fi::gc_quelle_scan`,
-Bit 4). Nur die Wurzeldatei zählt: in einem Modul hieße die Funktion
-`modul____gc_finalisiere` und die Laufzeit fände sie nicht mehr.
+If the **root file** declares `fn __gc_finalisiere`, the compiler takes it;
+otherwise it adds an empty default. That is exactly the mechanism with which
+`error AllocError` is already handled (token search in
+`gc.rs::quelle_hat_allocerror`), and it is built the same way in **both**
+compilers (`gc.rs::quelle_hat_finalisierer` / `lib/firnc1/gc.fi::gc_quelle_scan`,
+bit 4). Only the root file counts: in a module the function would be called
+`modul____gc_finalisiere` and the runtime would no longer find it.
 
-### 1.2 Wiederbelebung — die Entscheidung
+### 1.2 Resurrection — the decision
 
-Java lässt einen Finalisierer sein Objekt zurück in den lebenden Graphen
-hängen. Der Sammler braucht dafür einen zweiten Zyklus, die Semantik ist
-berüchtigt schwer, und `finalize()` gilt seit Java 9 als deprecated. **Firn
-macht das nicht.** Die Entscheidung ist:
+Java lets a finalizer hang its object back into the live graph.
+The collector needs a second cycle for that, the semantics are
+notoriously hard, and `finalize()` has been deprecated since Java 9. **Firn
+does not do that.** The decision is:
 
-> Ein Finalisierer kann sein Objekt nicht am Leben halten. Der Block wird
-> freigegeben, sobald der Finalisierer zurückkehrt — unabhängig davon, was er
-> getan hat.
+> A finalizer cannot keep its object alive. The block is
+> released as soon as the finalizer returns — no matter what it
+> did.
 
-Das ist nicht nur eine Bitte an den Programmierer, sondern **erzwungen**:
+That is not only a request to the programmer but is **enforced**:
 
-1. **Vor** dem Aufruf werden alle `Gc[T]`- und `GcWeak[T]`-Felder des Objekts
-   genullt. Ein Finalisierer sieht also nie einen Zeiger auf ein Nachbarobjekt,
-   das im selben Lauf schon eingesammelt sein kann. Er sieht statt eines
-   baumelnden Zeigers eine **0**, und die ist deterministisch.
-2. `stark(w)` auf ein wartendes Objekt liefert 0 (Merker `F_WART`).
-3. Eine **GC-Allokation** im Finalisierer bricht sichtbar ab (Rücksprungwert
-   **71**), `gc_collect()` ebenso (**72**), und das Schreiben eines Gc-Zeigers
-   in ein Heapfeld (**73**).
+1. **Before** the call, all `Gc[T]` and `GcWeak[T]` fields of the object are
+   zeroed. A finalizer therefore never sees a pointer to a neighboring
+   object that may already have been collected in the same run. Instead of
+   a dangling pointer it sees a **0**, and that is deterministic.
+2. `stark(w)` on a waiting object yields 0 (flag `F_WART`).
+3. A **GC allocation** in the finalizer aborts visibly (return value
+   **71**), `gc_collect()` likewise (**72**), and writing a Gc pointer
+   into a heap field (**73**).
 
-Die Meldungen, wörtlich:
+The messages, verbatim:
 
 ```
 firn-gc: allokation waehrend eines finalisierers (SPEC 3.5.3 S4)
@@ -83,237 +84,246 @@ firn-gc: gc_collect() waehrend eines finalisierers (SPEC 3.5.3 S4)
 firn-gc: wiederbelebung im finalisierer (SPEC 3.5.3 S4)
 ```
 
-**Punkt 3 löst zugleich die Reentranz-Frage.** Ein Finalisierer, der
-alloziert, würde einen Sammellauf mitten in einem Sammellauf starten:
-Warteschlange, Freilisten und Fegemerker sind in diesem Augenblick halb
-fertig. Weil er gar nicht erst allozieren kann, ist der Fall nicht behandelt,
-sondern **unmöglich**.
+**Item 3 also solves the reentrancy question.** A finalizer that
+allocates would start a collection in the middle of a collection:
+the queue, the free lists and the sweep markers are half finished at that
+moment. Because it cannot even allocate, the case is not handled but
+**impossible**.
 
-**Und es kostet den Normalfall nichts.** Die Sperre steckt in einer Prüfung,
-die ohnehin am Anfang jeder Allokation steht: `S_INIT` war 0 („kein
-`gc_init`") oder 1 („bereit") und ist jetzt 2, solange ein Finalisierer läuft.
-Aus `== 0` wurde `!= 1` — dieselbe Instruktion. Der Test in der
-Einfügebarriere sitzt **innerhalb** des Zweiges „es läuft gerade ein Zyklus",
-den es schon gab.
+**And it costs the normal case nothing.** The lock sits in a check that
+stands at the beginning of every allocation anyway: `S_INIT` was 0 („no
+`gc_init`") or 1 („ready") and is now 2 while a finalizer runs.
+`== 0` became `!= 1` — the same instruction. The test in the
+insertion barrier sits **inside** the branch „a cycle is currently
+running", which existed already.
 
-### 1.3 Reihenfolge, Anzahl, Zeitpunkt
+### 1.3 Order, count, point in time
 
-* **Zeitpunkt:** nachdem der Sammler das Objekt als unerreichbar erkannt hat.
-  Der Zyklus hat dafür eine **eigene Phase 3**, die wie Markieren und Fegen in
-  Scheiben läuft (Zeitbudget `ZEIT_BUDGET_NS`).
-* **Reihenfolge zwischen zwei Objekten: keine Zusage.** Die Warteschlange folgt
-  der Fegereihenfolge. Wer eine Reihenfolge braucht, nimmt keinen Finalisierer.
-* **Höchstens einmal je Objekt** (`F_GETAN`).
-* Ein Finalisierer selbst wird **nicht** unterbrochen. Seine Laufzeit gehört
-  dem Programm, nicht dem Sammler, und wird getrennt ausgewiesen
-  (`gc_fin_ns_max`, nur mit `gc_set_fin_uhr(1)`).
+* **Point in time:** after the collector has recognized the object as
+  unreachable. For that, the cycle has a **phase 3 of its own** which runs
+  in slices like marking and sweeping (time budget `ZEIT_BUDGET_NS`).
+* **Order between two objects: no promise.** The queue follows
+  the sweep order. Whoever needs an order does not take a finalizer.
+* **At most once per object** (`F_GETAN`).
+* A finalizer itself is **not** interrupted. Its runtime belongs to
+  the program, not to the collector, and is reported separately
+  (`gc_fin_ns_max`, only with `gc_set_fin_uhr(1)`).
 
-### 1.4 Die Warteschlange braucht keinen Speicher
+### 1.4 The queue needs no memory
 
-Ein wartender Block ist tot; sein **Seriennummernwort** `[8..16)` wird nicht
-mehr gebraucht. Dort steht der Verweis auf den nächsten Wartenden. Damit kann
-die Warteschlange nicht überlaufen und keine Allokation auslösen — beides
-wäre in einem Sammellauf fatal. Dass die Seriennummer dabei zerstört wird, ist
-harmlos und sogar richtig: `stark()` prüft zusätzlich `F_WART`.
-
----
-
-## 2. Schwache Verweise werden wirklich genullt (`S3`)
-
-Bis Runde 46 war die Zusage „ein schwacher Verweis wird beim Einsammeln leer"
-nur **scheinbar** erfüllt: `stark(w)` lieferte 0, weil die Seriennummer nicht
-mehr passte — im Feld stand aber weiter das alte, verschleierte Bitmuster.
-
-Die Typtabelle kennt die Offsets der `GcWeak[T]`-Felder seit Runde 4; sie waren
-bis jetzt „nur für die Statistik". Seit Runde 47 nutzt das Fegen sie: für jedes
-**lebende** Objekt werden die schwachen Felder durchgesehen, und ein Ziel, das
-in diesem Lauf stirbt, wird auf den leeren Verweis gesetzt. Die Entscheidung
-fällt über die **Marke** (weiß = tot), nicht über die Seriennummer — deshalb
-ist sie unabhängig davon, ob der Zielblock schon gefegt wurde.
-
-`tests/822_gc_weak_zeroed.fi` sieht sich das **Rohwort** des Feldes an und
-verlangt, dass es nach dem Sammellauf 0 ist.
-
-**Was das nicht kann, offen benannt:** ein `GcWeak[T]` in einer *lokalen
-Veränderlichen* wird nicht angefasst — der Sammler kennt den Stapel nur
-konservativ und hat dort keine Feldkarte. Dort schützt weiterhin die
-Seriennummer, und `stark()` liefert 0.
+A waiting block is dead; its **serial number word** `[8..16)` is not
+needed any more. That is where the link to the next waiter is stored. With
+that the queue cannot overflow and cannot trigger an allocation — both
+would be fatal in a collection. That the serial number is destroyed in the
+process is harmless and even right: `stark()` additionally checks `F_WART`.
 
 ---
 
-## 3. `Arc[T]` — und was „atomar" hier wirklich heißt
+## 2. Weak references are really zeroed (`S3`)
 
-### 3.1 Das Primitiv
+Up to round 46 the promise „a weak reference becomes empty on collection"
+was only **apparently** fulfilled: `stark(w)` yielded 0 because the serial
+number no longer matched — but the field still contained the old,
+obfuscated bit pattern.
 
-`Arc` unterscheidet sich von `Rc` durch genau eines: den atomaren Zähler.
-Ohne atomare Instruktion wäre `Arc` nur `Rc` mit anderem Namen. Also gibt es
-seit dieser Runde **ein** neues FIR-Primitiv, das kleinste, das reicht:
+The type table has known the offsets of the `GcWeak[T]` fields since
+round 4; up to now they were „only for the statistics". Since round 47 the
+sweep uses them: for every **live** object the weak fields are looked
+through, and a target that dies in this run is set to the empty reference.
+The decision is made via the **mark** (white = dead), not via the serial
+number — that is why it is independent of whether the target block has
+already been swept.
+
+`tests/822_gc_weak_zeroed.fi` looks at the **raw word** of the field and
+demands that it is 0 after the collection.
+
+**What this cannot do, openly named:** a `GcWeak[T]` in a *local
+variable* is not touched — the collector knows the stack only
+conservatively and has no field map there. There the serial number still
+protects, and `stark()` yields 0.
+
+---
+
+## 3. `Arc[T]` — and what „atomic" really means here
+
+### 3.1 The primitive
+
+`Arc` differs from `Rc` in exactly one thing: the atomic counter.
+Without an atomic instruction, `Arc` would only be `Rc` with a different
+name. So since this round there is **one** new FIR primitive, the smallest
+one that suffices:
 
 ```firn
 __atomar_addieren(p: *mut u64, delta: u64) -> u64    // liefert den ALTEN Wert
 ```
 
-→ `lock xadd qword ptr [rcx], rax`, eine Instruktion. Erniedrigen ist die
-Addition des Zweierkomplements; ein eigenes Primitiv dafür wäre Ballast.
-Gebaut in **beiden** Compilern (`compiler/src/atomic.rs`, `Op::AtomicAdd`;
-`lib/firnc1/{fir,sema,lower,codegen}.fi`, `O_ATOMADD`), FIR-Text oktettgleich.
+→ `lock xadd qword ptr [rcx], rax`, one instruction. Decrementing is the
+addition of the two's complement; a primitive of its own for it would be
+ballast. Built in **both** compilers (`compiler/src/atomic.rs`,
+`Op::AtomicAdd`; `lib/firnc1/{fir,sema,lower,codegen}.fi`, `O_ATOMADD`),
+FIR text octet-identical.
 
-### 3.2 Kein „fadensicher" ohne Beleg
+### 3.2 No „thread-safe" without evidence
 
-Firn hat in Stufe 0 **keine Fäden** (`SPEC` §7). Ein Wettrennen lässt sich
-also nicht herbeiführen, und die Behauptung „fadensicher" wäre ungedeckt.
-Belegt wird deshalb das, was belegbar ist — `tools/atomic/run.sh`, als
-Abschnitt 8b in `test.sh`:
+Firn has **no threads** in stage 0 (`SPEC` §7). A race can therefore
+not be brought about, and the claim „thread-safe" would be uncovered.
+What is demonstrated is therefore what can be demonstrated —
+`tools/atomic/run.sh`, as section 8b in `test.sh`:
 
-* `__atomar_addieren` erzeugt `lock xadd` — in **drei Baustufen** und in
-  **beiden Compilern**, im Assemblertext *und* im fertigen Binary;
-* ein gewöhnliches `*p = *p + 7` erzeugt **kein** `lock` (Gegenprobe: ohne sie
-  wäre der Nachweis wertlos, weil er alles bestehen ließe);
-* der Rückgabewert ist der **alte** Wert, und der Zähler stimmt nach 100 000
-  Erhöhungen und 100 000 Erniedrigungen exakt;
-* die FIR beider Compiler ist **oktettgleich**.
+* `__atomar_addieren` produces `lock xadd` — in **three build stages** and
+  in **both compilers**, in the assembly text *and* in the finished binary;
+* an ordinary `*p = *p + 7` produces **no** `lock` (counter-check: without
+  it the proof would be worthless, because it would let everything pass);
+* the return value is the **old** value, and the counter is exact after
+  100 000 increments and 100 000 decrements;
+* the FIR of both compilers is **octet-identical**.
 
-**Und die Grenze wird genannt:** `arc_klonen`/`arc_freigeben` sind mit
-`lock xadd` auch unter Nebenläufigkeit korrekt — freigegeben wird nur von dem
-Aufruf, der beim Erniedrigen die 1 *sieht*, und den sieht genau einer.
-`aufwerten_atomar` (schwach → stark) braucht dagegen einen **Vergleichs-Tausch**
-(`compare_exchange`); mit reinem fetch-add lässt sich das Wettrennen „der
-letzte starke Verweis fällt genau jetzt weg" nicht schließen. Runde 47 baut
-bewusst nur fetch-add. Im heutigen Firn ist `aufwerten_atomar` korrekt; als
-Fadenzusage gilt es **nicht**.
+**And the limit is named:** `arc_klonen`/`arc_freigeben` are correct with
+`lock xadd` even under concurrency — release happens only from the
+call that *sees* the 1 when decrementing, and exactly one call sees it.
+`aufwerten_atomar` (weak → strong), by contrast, needs a **compare and
+exchange** (`compare_exchange`); with pure fetch-add the race „the
+last strong reference falls away right now" cannot be closed. Round 47
+deliberately builds only fetch-add. In today's Firn `aufwerten_atomar` is
+correct; as a thread promise it does **not** hold.
 
-### 3.3 Das Zusammenspiel mit dem Tracing-GC
+### 3.3 The interplay with the tracing GC
 
-Die Arc-Halde ist ein eigenes mmap-Gebiet. Der Sammler kennt nur seine eigenen
-Chunks. Daraus folgt eine Falle, die vorher nirgends stand: **ein `Gc[T]` im
-Wert eines `Arc` ist für den Sammler unsichtbar** und sein Ziel wird
-eingesammelt, obwohl es noch benutzt wird.
+The Arc heap is an mmap area of its own. The collector knows only its own
+chunks. From that follows a trap that was written down nowhere before: **a
+`Gc[T]` inside the value of an `Arc` is invisible to the collector**, and
+its target gets collected although it is still in use.
 
-Deshalb gibt es jetzt **externe Wurzelbereiche**:
+That is why there are now **external root areas**:
 
 ```firn
 gc_wurzel_anmelden(arc_wert_adresse(a) as *mut u8, groesse)
 gc_wurzel_abmelden(arc_wert_adresse(a) as *mut u8)
 ```
 
-Ein angemeldeter Bereich wird bei jedem Zyklusstart konservativ mitgescannt,
-genau wie der Stapel. `tests/833_arc_gc_root.fi` misst **beide** Seiten in
-einem Lauf: ohne Anmeldung stirbt das Ziel (der Fehler steht als Messung da,
-nicht als Warnung), mit Anmeldung überlebt es 2000 Müllobjekte und mehrere
-Sammelläufe, nach dem Abmelden stirbt es wieder.
+A registered area is scanned conservatively at every cycle start, exactly
+like the stack. `tests/833_arc_gc_root.fi` measures **both** sides in
+one run: without registration the target dies (the bug stands there as a
+measurement, not as a warning), with registration it survives 2000 garbage
+objects and several collections, and after deregistration it dies again.
 
-**Kein doppeltes Freigeben** — und zwar aus einem strukturellen Grund, nicht
-aus Sorgfalt: der Zähler entscheidet ausschließlich über den **Arc-Block** (er
-geht in die Freiliste der Arc-Halde), der Sammler ausschließlich über
-**GC-Objekte** (er kennt nur seine Chunks). Die beiden Speicherbereiche
-überschneiden sich nicht.
+**No double release** — and for a structural reason, not out of
+carefulness: the counter decides exclusively about the **Arc block** (which
+goes into the free list of the Arc heap), the collector exclusively about
+**GC objects** (it knows only its own chunks). The two memory areas
+do not overlap.
 
-**Zyklen lecken**, genau wie bei `Rc` — der atomare Zähler ändert daran
-nichts. `tests/832_arc_cycle_leak.fi` zeigt beides in einem Lauf: 1000
-Zyklenpaare mit zwei starken Verweisen lecken vollständig (2000 lebende
-Blöcke, 0 Freigaben), dieselben 1000 Paare mit einer schwachen Seite werden
-restlos frei. Wäre das Leck weg, wäre die Dokumentation falsch — der Test
-schlägt dann an.
+**Cycles leak**, exactly as with `Rc` — the atomic counter changes nothing
+about that. `tests/832_arc_cycle_leak.fi` shows both in one run: 1000
+cycle pairs with two strong references leak completely (2000 live
+blocks, 0 releases), and the same 1000 pairs with one weak side become
+completely free. If the leak were gone, the documentation would be wrong —
+the test then fires.
 
-**Preis, offen benannt:** die Startpause eines Zyklus wächst mit der
-angemeldeten Gesamtgröße (konservativer Scan, 8 Byte je Wort).
+**Price, openly named:** the start pause of a cycle grows with the
+registered total size (conservative scan, 8 bytes per word).
 
 ---
 
-## 4. Messung
+## 4. Measurement
 
-### 4.1 Erst musste das Messmittel repariert werden
+### 4.1 The measuring instrument had to be repaired first
 
-Der Auftrag verlangt Instruktionszahlen mit callgrind. Das ging nicht: **jedes
-Programm mit `gc class` starb unter valgrind mit einem Speicherzugriffsfehler**
-— auch mit dem Compiler der Basis, es ist kein neuer Fehler.
+The assignment demands instruction counts with callgrind. That did not
+work: **every program with `gc class` died under valgrind with a
+segmentation fault** — with the compiler of the base as well, so it is not
+a new bug.
 
-Ursache: `__gc_stapel_boden()` las Feld 28 aus `/proc/self/stat`. Das ist die
-Startadresse des Stapels, wie der Kern sie beim Programmstart notiert hat —
-unter valgrind läuft der Klient aber auf einem von valgrind bereitgestellten
-Stapel. Der konservative Scan lief von seinem Stapelzeiger bis zu einer
-Adresse, die gar nicht dazugehört.
+Cause: `__gc_stapel_boden()` read field 28 from `/proc/self/stat`. That is
+the start address of the stack as the kernel noted it at program start —
+under valgrind, however, the client runs on a stack provided by valgrind.
+The conservative scan ran from its stack pointer to an
+address that does not belong to it at all.
 
-Jetzt wird zuerst `/proc/self/maps` gelesen und die Abbildung gesucht, in der
-der eigene Stapelzeiger wirklich liegt; ihr Ende ist der Boden. Feld 28 bleibt
-Rückfall. Damit ist der Sammler zum ersten Mal mit callgrind messbar.
+Now `/proc/self/maps` is read first and the mapping in which the own stack
+pointer really lies is looked up; its end is the bottom. Field 28 remains
+the fallback. With that the collector is measurable with callgrind for the
+first time.
 
-### 4.2 Instruktionen (callgrind, deterministisch)
+### 4.2 Instructions (callgrind, deterministic)
 
-Gleiche Quelle, gleicher Arbeitsablauf (60 000 Runden à 6 Objekte, Ring
-geschlossen, 4000 lebende Objekte), einmal mit dem Compiler der Basis
-(plus derselben Stapelboden-Reparatur, damit callgrind überhaupt läuft),
-einmal mit Runde 47:
+Same source, same workload (60 000 rounds of 6 objects each, ring
+closed, 4000 live objects), once with the compiler of the base
+(plus the same stack bottom repair, so that callgrind runs at all),
+once with round 47:
 
-| Arbeitsablauf | Basis | Runde 47 | Δ |
+| Workload | base | round 47 | Δ |
 |---|---|---|---|
-| Klasse **ohne** `GcWeak`-Feld | 128 067 085 | 134 015 379 | **+4,6 %** |
-| Klasse **mit** `GcWeak`-Feld, jede Runde gesetzt | 138 288 807 | 154 997 400 | **+12,1 %** |
-| dito **+ Finalisierer** auf jedem 4. Ring | — | 162 856 205 | +5,1 % gegenüber Runde 47 ohne |
+| class **without** a `GcWeak` field | 128 067 085 | 134 015 379 | **+4,6 %** |
+| class **with** a `GcWeak` field, set every round | 138 288 807 | 154 997 400 | **+12,1 %** |
+| ditto **+ finalizers** on every 4th ring | — | 162 856 205 | +5,1 % against round 47 without |
 
-Das ist der **teuerste denkbare** Fall: jede Runde schreibt einen schwachen
-Verweis, und *alle* 4000 lebenden Objekte haben ein schwaches Feld, das bei
-jedem Fegen durchgesehen wird. Auf dem DOM-Arbeitsablauf (`build.fi`, wo nur
-`Observer` ein schwaches Feld hat) ist der Durchsatz **unverändert** (§4.4).
+That is the **most expensive conceivable** case: every round writes a weak
+reference, and *all* 4000 live objects have a weak field that is looked
+through at every sweep. On the DOM workload (`build.fi`, where only
+`Observer` has a weak field) the throughput is **unchanged** (§4.4).
 
-### 4.3 Was der Weg dahin gekostet hat — vier gemessene Rücknahmen
+### 4.3 What the way there cost — four measured retractions
 
-Der erste Wurf kostete **+21,1 %** statt +12,1 %. Die Fegeschleife läuft je
-Sammellauf über **jeden** Block des Heaps; dort zählt jede Instruktion. Vier
-Eingriffe, jeder einzeln mit callgrind gemessen:
+The first attempt cost **+21,1 %** instead of +12,1 %. The sweep loop runs
+over **every** block of the heap per collection; there every instruction
+counts. Four interventions, each measured individually with callgrind:
 
-| Eingriff | fest.fi |
+| Intervention | fest.fi |
 |---|---|
-| erster Wurf (`behalten`-Merker in der Fegeschleife) | 167 427 654 |
-| `continue` statt Merker — freie Blöcke zahlen nichts mehr | 160 415 861 |
-| Typmaske für schwache Felder (eine Verschiebung statt vier abhängiger Speicherzugriffe), kalter Allokationszweig in eine eigene Funktion, Finalisierer-Einreihung in eine eigene Funktion, Reentranztest aus `__gc_barrier` ausgelagert | **154 997 400** |
+| first attempt (`behalten` flag in the sweep loop) | 167 427 654 |
+| `continue` instead of a flag — free blocks no longer pay anything | 160 415 861 |
+| type mask for weak fields (one shift instead of four dependent memory accesses), cold allocation branch moved into a function of its own, finalizer enqueueing moved into a function of its own, reentrancy test factored out of `__gc_barrier` | **154 997 400** |
 
-Zwei Einzelbefunde, die man nicht rät, sondern misst:
+Two individual findings that one does not guess but measures:
 
-* **Zwei zusätzliche Blöcke in `__gc_alloc_raw` kosteten 3,3 Mio.
-  Instruktionen** (2,4 %) — nicht durch die Prüfung selbst, sondern weil die
-  Registerzuteilung in der heißesten Funktion des Sammlers kippte. Mit *einem*
-  Block (kalter Zweig in einer eigenen Funktion) sind es 0,7 Mio.
-* Die Gegenprobe, die Typkennung in der Fegeschleife **zweimal zu lesen statt
-  einmal zu binden**, war um 0,3 Mio. Instruktionen **schlechter**. Der Rahmenplatz
-  ist hier billiger als der zweite Speicherzugriff — also blieb die Bindung.
+* **Two additional blocks in `__gc_alloc_raw` cost 3,3 million
+  instructions** (2,4 %) — not because of the check itself, but because
+  register allocation tipped over in the hottest function of the collector.
+  With *one* block (cold branch in a function of its own) it is 0,7
+  million.
+* The counter-check of reading the type tag in the sweep loop **twice
+  instead of binding it once** was **worse** by 0,3 million instructions.
+  The frame slot is cheaper here than the second memory access — so the
+  binding stayed.
 
-### 4.4 Pausen: `build.fi`, 120 000 lebende Knoten, 5 s, je 7 Läufe
+### 4.4 Pauses: `build.fi`, 120 000 live nodes, 5 s, 7 runs each
 
-Auf dieser Maschine liefen dabei **zwei weitere Runden parallel**. Die Wanduhr
-ist damit nicht auswertbar (das war der Fehlbefund der Runde 40); maßgeblich
-ist die **Rechenzeit des Fadens**.
+**Two further rounds ran in parallel** on this machine during that. The
+wall clock is therefore not evaluable (that was the wrong finding of round
+40); what counts is the **compute time of the thread**.
 
-| Kennzahl (min/Median/max) | Runde 47 | Basis |
+| Metric (min/median/max) | round 47 | base |
 |---|---|---|
-| **längste Unterbrechung, Rechenzeit** | 434 / **460** / 522 µs | 453 / **469** / 519 µs |
-| längste Unterbrechung, Wanduhr | 473 / 962 / 1854 µs | 476 / 541 / 609 µs |
-| Zyklen in 5 s | 545 000 / **554 000** / 562 000 | 546 000 / **554 000** / 554 000 |
-| volle Stop-the-World-Läufe | 0 / 0 / 0 | 0 / 0 / 0 |
+| **longest interruption, compute time** | 434 / **460** / 522 µs | 453 / **469** / 519 µs |
+| longest interruption, wall clock | 473 / 962 / 1854 µs | 476 / 541 / 609 µs |
+| cycles in 5 s | 545 000 / **554 000** / 562 000 | 546 000 / **554 000** / 554 000 |
+| full stop-the-world runs | 0 / 0 / 0 | 0 / 0 / 0 |
 | RSS | 12 388 / 13 160 / 13 924 KiB | 12 888 / 13 144 / 13 148 KiB |
 
-**Die Pausen sind nicht schlechter geworden** — in Rechenzeit sogar 2 %
-besser, und in derselben Größenordnung wie die 0,45 ms aus Runde 44. Der
-Durchsatz ist auf diesem Arbeitsablauf unverändert.
+**The pauses have not become worse** — in compute time they are even 2 %
+better, and in the same order of magnitude as the 0,45 ms from round 44.
+The throughput on this workload is unchanged.
 
-### 4.5 Sprengen Finalisierer die Pausen? Nein — A/B im selben Prozess
+### 4.5 Do finalizers blow up the pauses? No — A/B in the same process
 
-`tools/gc_meas/final.fi` misst zwei Phasen im **selben** Prozess mit
-demselben Code (zwei Binaries hätten anderes Codelayout, und das überdeckt
-Unterschiede im Prozentbereich). Beide Uhren an, je 30 s, 4000 lebende Objekte:
+`tools/gc_meas/final.fi` measures two phases in the **same** process with
+the same code (two binaries would have a different code layout, and that
+masks differences in the percent range). Both clocks on, 30 s each, 4000
+live objects:
 
-| | Phase A **ohne** Finalisierer | Phase B **mit** Finalisierer |
+| | phase A **without** finalizers | phase B **with** finalizers |
 |---|---|---|
-| Zyklen | 64 425 600 | 39 156 416 |
-| Sammelläufe | 23 581 | 14 325 |
-| gelaufene Finalisierer | 0 | **9 789 092** |
-| genullte schwache Felder | 64 382 273 | 103 512 460 |
-| **längste Unterbrechung, Rechenzeit** | 561 µs | **525 µs** |
-| längste Unterbrechung, Wanduhr | 955 µs | 1780 µs |
+| cycles | 64 425 600 | 39 156 416 |
+| collections | 23 581 | 14 325 |
+| finalizers run | 0 | **9 789 092** |
+| weak fields zeroed | 64 382 273 | 103 512 460 |
+| **longest interruption, compute time** | 561 µs | **525 µs** |
+| longest interruption, wall clock | 955 µs | 1780 µs |
 
-Histogramm der ganzen Unterbrechung (Fach *k* = [2^(k−1) µs, 2^k µs)):
+Histogram of the whole interruption (bucket *k* = [2^(k−1) µs, 2^k µs)):
 
-| Fach | A Wanduhr | A Rechenzeit | B Wanduhr | B Rechenzeit |
+| Bucket | A wall clock | A compute time | B wall clock | B compute time |
 |---|---|---|---|---|
 | ≤ 32 µs | 160 684 | 160 580 | 99 854 | 99 802 |
 | 64 µs | 27 563 | 27 723 | 18 969 | 19 105 |
@@ -322,115 +332,116 @@ Histogramm der ganzen Unterbrechung (Fach *k* = [2^(k−1) µs, 2^k µs)):
 | 512 µs | 106 | 87 | 202 | 174 |
 | 1,02 ms | 5 | **1** | 4 | **1** |
 | 2,05 ms | 0 | **0** | 2 | **0** |
-| darüber | 0 | **0** | 0 | **0** |
+| above that | 0 | **0** | 0 | **0** |
 
-**In Rechenzeit gibt es in beiden Phasen keine einzige Unterbrechung über
-1,02 ms** — 253 698 Unterbrechungen in Phase B, davon eine über 512 µs. Die
-beiden Wanduhrwerte über 1 ms in Phase B haben in der Rechenzeit **keine
-Entsprechung**: sie sind Verdrängung durch die parallelen Läufe, kein
-Sammlerverhalten. Die Vorgabe „im Dauerbetrieb 98 % unter 1 ms" ist mit
-**100 %** erfüllt.
+**In compute time there is not a single interruption above
+1,02 ms in either phase** — 253 698 interruptions in phase B, of which one
+above 512 µs. The two wall clock values above 1 ms in phase B have **no
+counterpart** in compute time: they are preemption by the parallel runs,
+not collector behavior. The requirement „98 % below 1 ms in continuous
+operation" is met with **100 %**.
 
-Der längste **einzelne** Finalisierer (Zähler hochzählen) wurde mit 882 µs
-gemessen — dieselbe Verdrängung; sie gehört dem Programm, nicht dem Sammler,
-und wird deshalb getrennt ausgewiesen.
+The longest **individual** finalizer (incrementing a counter) was measured
+at 882 µs — the same preemption; it belongs to the program, not to the
+collector, and is therefore reported separately.
 
-### 4.6 Dauerlauf: 150 s mit 48 Mio. Finalisierern, RSS driftfrei
+### 4.6 Endurance run: 150 s with 48 million finalizers, RSS drift-free
 
-Derselbe Aufbau, Phase B über **150 s**:
+The same setup, phase B over **150 s**:
 
-* 193 776 192 Zyklen, **70 888 Sammelläufe**, **48 444 045 Finalisierer**
-  gelaufen (alle registrierten), Warteschlange am Ende leer
-* 256 693 280 schwache Felder genullt
-* **RSS ab der ersten Stichprobe (5 s) bis zur letzten (145 s) konstant
-  1372 KiB**, Heap konstant 1 310 720 Bytes, lebende Objekte 4024–4029
-* die 4000 Objekte der lebenden Kette waren am Ende **vollständig und in der
-  richtigen Reihenfolge** vorhanden — der Sammler hat nichts Lebendes
-  eingesammelt
+* 193 776 192 cycles, **70 888 collections**, **48 444 045 finalizers**
+  run (all registered ones), queue empty at the end
+* 256 693 280 weak fields zeroed
+* **RSS constant at 1372 KiB from the first sample (5 s) to the last
+  (145 s)**, heap constant at 1 310 720 bytes, live objects 4024–4029
+* the 4000 objects of the live chain were **complete and in the
+  right order** at the end — the collector collected nothing that was
+  alive
 
-Kein Drift über 2,3 Minuten, obwohl in jeder Sekunde rund 320 000 Objekte
-finalisiert und freigegeben wurden.
+No drift over 2,3 minutes, although around 320 000 objects were
+finalized and released every second.
 
 ---
 
 ## 5. Tests
 
-| Datei | Was sie prüft |
+| File | What it checks |
 |---|---|
-| `tests/820_gc_finalizer.fi` | Finalisierer läuft mit richtiger Aufräumart; Gc-Felder sind vorher genullt; **höchstens einmal**; ein erreichbares Objekt wird nicht finalisiert; Massenlauf (300 Objekte) — der Verteiler des Programms lief genau so oft, wie der Sammler zählt |
-| `tests/821_gc_finalizer_limits.fi` | jede Ablehnung: Nullzeiger, Stapelzeiger, Zeiger mitten ins Objekt, Art 0, Art > 16777215, doppelte Registrierung; `gc_finalisierer_loeschen` nimmt sie wirklich zurück |
-| `tests/822_gc_weak_zeroed.fi` | das **Rohwort** des schwachen Feldes ist nach dem Sammeln 0; ein lebendes Ziel wird nicht genullt; nichts zählt doppelt |
-| `tests/823_gc_finalizer_reentrancy.fi` | Allokation im Finalisierer bricht mit **71** ab |
-| `tests/824_gc_finalizer_resurrection.fi` | Selbst-Einhängen im Finalisierer bricht mit **73** ab |
-| `tests/830_arc_basic.fi` | Zähler, letzter Verweis gibt frei, **kein doppeltes Freigeben**, Block wird wiederverwendet, 20 000 Runden ohne Rest |
-| `tests/831_arc_weak.fi` | schwach hält nicht am Leben, Aufwerten nach dem Tod ist sichtbar leer, Freigabe genau einmal in **beiden** Reihenfolgen |
-| `tests/832_arc_cycle_leak.fi` | Zyklen lecken (2000 Blöcke, 0 Freigaben) — und mit einer schwachen Seite nicht |
-| `tests/833_arc_gc_root.fi` | GC-Zusammenspiel **ohne** und **mit** `gc_wurzel_anmelden`, Abmelden, beide Buchhaltungen |
-| `tests/neg/arc_discarded.fi` | `arc_neu` ist `#[must_consume]` |
-| `tests/neg/atomic_ty.fi` | falscher Zeigertyp beim atomaren Primitiv — Fehler mit Zeile/Spalte, kein stilles Rechnen auf 32 Bit |
-| `tests/neg/atomic_digits.fi` | falsche Stellenzahl — die Meldung nennt die vereinbarte Form |
-| `tools/atomic/run.sh` (test.sh 8b) | `lock xadd` in 3 Baustufen und beiden Compilern, Gegenprobe, FIR oktettgleich |
+| `tests/820_gc_finalizer.fi` | finalizer runs with the right cleanup kind; Gc fields are zeroed beforehand; **at most once**; a reachable object is not finalized; mass run (300 objects) — the dispatcher of the program ran exactly as often as the collector counts |
+| `tests/821_gc_finalizer_limits.fi` | every rejection: null pointer, stack pointer, pointer into the middle of the object, kind 0, kind > 16777215, double registration; `gc_finalisierer_loeschen` really takes it back |
+| `tests/822_gc_weak_zeroed.fi` | the **raw word** of the weak field is 0 after collection; a live target is not zeroed; nothing is counted twice |
+| `tests/823_gc_finalizer_reentrancy.fi` | allocation in the finalizer aborts with **71** |
+| `tests/824_gc_finalizer_resurrection.fi` | self-linking in the finalizer aborts with **73** |
+| `tests/830_arc_basic.fi` | counter, last reference releases, **no double release**, block is reused, 20 000 rounds without a remainder |
+| `tests/831_arc_weak.fi` | weak does not keep alive, upgrading after death is visibly empty, release exactly once in **both** orders |
+| `tests/832_arc_cycle_leak.fi` | cycles leak (2000 blocks, 0 releases) — and not with one weak side |
+| `tests/833_arc_gc_root.fi` | GC interplay **without** and **with** `gc_wurzel_anmelden`, deregistration, both sets of bookkeeping |
+| `tests/neg/arc_discarded.fi` | `arc_neu` is `#[must_consume]` |
+| `tests/neg/atomic_ty.fi` | wrong pointer type at the atomic primitive — an error with line/column, no silent computation on 32 bits |
+| `tests/neg/atomic_digits.fi` | wrong digit count — the message names the agreed form |
+| `tools/atomic/run.sh` (test.sh 8b) | `lock xadd` in 3 build stages and both compilers, counter-check, FIR octet-identical |
 
-Jeder Positivtest läuft in **drei Baustufen** (release-fast, no-opt, dev-fast)
-und zusätzlich unter **firnc1**.
+Every positive test runs in **three build stages** (release-fast, no-opt,
+dev-fast) and additionally under **firnc1**.
 
-### 5.1 Zwei bestehende Tests mussten von der Rahmenlage unabhängig werden
+### 5.1 Two existing tests had to become independent of the frame position
 
-`__gc_scrub` säubert nur, was **unterhalb** seines eigenen Rahmens liegt. Die
-obersten paar hundert Oktette unter dem Stapelzeiger des Programms — dort, wo
-später die Rahmen von `gc_collect` und `__gc_scrub` selbst liegen — bleiben
-stehen. Ein Helfer, der **flach** aufgerufen wird, legt seine Zeiger genau
-dort ab, und der konservative Scan liest sie als Wurzeln.
+`__gc_scrub` only cleans what lies **below** its own frame. The
+topmost few hundred octets below the stack pointer of the program — where
+the frames of `gc_collect` and `__gc_scrub` itself later lie — remain
+standing. A helper that is called **shallowly** deposits its pointers
+exactly there, and the conservative scan reads them as roots.
 
-Bis Runde 46 ging das gut. Als die Laufzeit in dieser Runde größer wurde,
-verschoben sich die Rahmen, und dieselbe Lücke hielt in `tests/520` (dev-fast)
-**1** und in `tests/535` (ohne Optimierer) **126** längst unerreichbare
-Objekte fest. Das war vorher **Glück, kein Nachweis**.
+Up to round 46 that went well. When the runtime got bigger in this round,
+the frames shifted, and the same gap held on to **1** long unreachable
+object in `tests/520` (dev-fast) and **126** in `tests/535` (without the
+optimizer). Before that this was **luck, not proof**.
 
-Beide Tests prüfen unverändert dasselbe; neu ist nur, dass die
-zeigerhaltenden Rahmen kilobyteweise tiefer liegen (rekursiv — wird also nie
-eingebettet — und mit Polster). Dieselbe Technik benutzt das Projekt seit
-Runde 4 in `dom_observer_lebt()`.
+Both tests check the same thing unchanged; the only new thing is that the
+pointer-holding frames lie kilobytes deeper (recursive — so never
+inlined — and with padding). The project has used the same technique since
+round 4 in `dom_observer_lebt()`.
 
-**Verworfen:** der erste Versuch war, `gc_collect` einen 3 KiB großen,
-genullten Puffer im eigenen Rahmen zu geben. Das reparierte `tests/535`, kippte
-aber `tests/520`, `820` und `822` — und einer davon mit einem
-Speicherzugriffsfehler. Der Grund ist derselbe: die Lücke verschwindet nicht,
-sie **wandert** an eine andere Tiefe. Ein Polster im Sammler kann das Problem
-nicht lösen, nur verschieben; deshalb wurde es zurückgenommen.
+**Rejected:** the first attempt was to give `gc_collect` a 3 KiB zeroed
+buffer in its own frame. That repaired `tests/535` but tipped over
+`tests/520`, `820` and `822` — and one of them with a
+segmentation fault. The reason is the same: the gap does not disappear,
+it **wanders** to another depth. Padding in the collector cannot solve the
+problem, only shift it; that is why it was retracted.
 
 ---
 
-## 6. Abnahme
+## 6. Acceptance
 
-| Prüfung | Basis | Runde 47 |
+| Check | base | round 47 |
 |---|---|---|
 | `bash ./test.sh` | 696/696 | **727/727** |
 | `bash tools/self_compare.sh` | 201 / 0 / 0 | **210 / 0 / 0** |
-| `bash tools/fixpoint.sh` | zeichengleich | **zeichengleich** |
+| `bash tools/fixpoint.sh` | character-identical | **character-identical** |
 
 ---
 
-## 7. Was offen bleibt
+## 7. What remains open
 
-* **`compare_exchange`.** Ohne es ist `aufwerten_atomar` keine Fadenzusage
-  (§3.2). Es gehört in die Runde, die Fäden bringt — zusammen mit
-  Speicherordnungen (`acquire`/`release`/`relaxed`), die auf x86-64 bei
-  `lock xadd` ohnehin gegeben sind, auf aarch64 aber nicht.
-* **Finalisierer als Sprachform.** `fn finalize(inout self)` braucht Methoden
-  *und* indirekte Aufrufe. Die indirekten Aufrufe baut Runde 46 für Vtables;
-  danach ist der Verteiler eine reine Bequemlichkeitsfrage, keine
-  Fähigkeitsfrage. Die Semantik dieser Runde bleibt dabei unverändert.
-* **Statische Prüfung des Finalisierer-Vertrags.** `SPEC` §3.5.3 sagt „der
-  Compiler prüft das"; Runde 47 erzwingt es zur **Laufzeit**. Die statische
-  Variante wäre `#[no_gc]` auf `__gc_finalisiere` zu verlangen — die Prüfung
-  dafür gibt es schon (`nogc.rs`, transitiv). Bewusst nicht gemacht, weil
-  `#[no_gc]` auch das Schreiben *lokaler* Gc-Felder verbietet und damit mehr
-  einschränkt als der Vertrag verlangt.
-* **`__gc_block_von` ist linear.** Bei schwachen Feldern, deren Ziele über
-  viele Chunks streuen, ist die Chunkliste der teuerste Posten des Nullens
-  (gemessen: der größte Einzelanteil der +12,1 % in §4.2). Ein nach Adresse
-  sortiertes Chunkfeld mit binärer Suche würde das erledigen — es ist ein
-  Umbau der Chunkverwaltung und gehört nicht in diese Runde.
-* **`GcVec`/`GcMap`, `virtual`, 24-Stunden-Lauf, Fragmentierung bei
-  wechselnden Objektgrößen** — unverändert offen (`ABNAHME.md` Punkt 2).
+* **`compare_exchange`.** Without it, `aufwerten_atomar` is not a thread
+  promise (§3.2). It belongs in the round that brings threads — together
+  with memory orderings (`acquire`/`release`/`relaxed`), which are given
+  on x86-64 with `lock xadd` anyway, but not on aarch64.
+* **Finalizers as a language form.** `fn finalize(inout self)` needs
+  methods *and* indirect calls. Round 46 builds the indirect calls for
+  vtables; after that the dispatcher is a pure question of convenience,
+  not of capability. The semantics of this round remain unchanged.
+* **Static checking of the finalizer contract.** `SPEC` §3.5.3 says „the
+  compiler checks that"; round 47 enforces it at **runtime**. The static
+  variant would be to demand `#[no_gc]` on `__gc_finalisiere` — the check
+  for it already exists (`nogc.rs`, transitive). Deliberately not done,
+  because `#[no_gc]` also forbids writing *local* Gc fields and therefore
+  restricts more than the contract demands.
+* **`__gc_block_von` is linear.** With weak fields whose targets scatter
+  over many chunks, the chunk list is the most expensive item of the
+  zeroing (measured: the largest single share of the +12,1 % in §4.2). A
+  chunk array sorted by address with binary search would take care of that
+  — it is a rebuild of the chunk management and does not belong in this
+  round.
+* **`GcVec`/`GcMap`, `virtual`, 24-hour run, fragmentation with
+  changing object sizes** — unchanged open (`ABNAHME.md` item 2).
