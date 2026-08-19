@@ -16,7 +16,9 @@
 #   SOAK_ZYKLEN      Hoechstzahl Zyklensaetze (Standard 100000000)
 #   SOAK_STICHPROBE  Zyklen je Datenzeile (Standard 1000)
 #   SOAK_MIN_ZYKLEN  Mindestzahl Zyklen fuer ein gueltiges Urteil (Standard 100000)
-#   SOAK_LECK_ZYKLEN Obergrenze fuer die LECKENDE Gegenprobe (Standard 2000000)
+#   SOAK_LECK_ZYKLEN Obergrenze fuer die LECKENDE Gegenprobe (Standard 600000;
+#                    seit Runde 53 leckt ein Satz 13 Objekte zu 128 Byte,
+#                    das sind rund 1,0 GiB — vorher 6 zu 64 Byte)
 #   SOAK_LECK_MB     harte Speicherbremse fuer die Gegenprobe in MiB (Standard 3072)
 #
 # WARUM DIE GEGENPROBE GEDECKELT IST: sie leckt bauartbedingt rund 384 Byte je
@@ -35,7 +37,7 @@ SEK=${SOAK_SEK:-600}
 ZYKLEN=${SOAK_ZYKLEN:-100000000}
 STICH=${SOAK_STICHPROBE:-1000}
 MINZ=${SOAK_MIN_ZYKLEN:-100000}
-LECK_ZYKLEN=${SOAK_LECK_ZYKLEN:-2000000}
+LECK_ZYKLEN=${SOAK_LECK_ZYKLEN:-600000}
 LECK_MB=${SOAK_LECK_MB:-3072}
 BUDGET_MS=$((SEK * 1000))
 
