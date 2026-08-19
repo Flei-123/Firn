@@ -54,6 +54,8 @@ pub struct OptStats {
     pub removed_checks: usize,
     /// schleifeninvariante Instruktionen, die in den Vorkopf gewandert sind
     pub hoisted: usize,
+    /// Kanten, die an einem Bool-Zusammenfluss vorbeigefaedelt wurden
+    pub gefaedelt: usize,
 }
 
 // ------------------------------------------------ Durchgangsregister ---
@@ -152,6 +154,12 @@ pub const PASSES: &[PassInfo] = &[
         scope: Scope::Func,
         debug_preserving: true,
         what: "beweisbar immer erfuellte Bereichspruefungen entfernen",
+    },
+    PassInfo {
+        name: "thread-bool",
+        scope: Scope::Func,
+        debug_preserving: true,
+        what: "Sprungfaedelung durch Bool-Zellen (Kurzschluss && / ||)",
     },
     PassInfo {
         name: "simplify-term",
@@ -301,6 +309,11 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig) {
             let r = remove_redundant_checks(f);
             st.removed_checks += r;
             changed |= r > 0;
+        }
+        if cfg.runs("thread-bool") {
+            let t = crate::faedeln::thread_bool_cells(f);
+            st.gefaedelt += t;
+            changed |= t > 0;
         }
         if cfg.runs("simplify-term") {
             changed |= simplify_terminators(f);
