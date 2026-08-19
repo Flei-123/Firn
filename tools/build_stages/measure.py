@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Misst dev / dev-fast / release-fast auf der Benchmark-Suite (Median)."""
+"""Measures dev / dev-fast / release-fast on the benchmark suite (median)."""
 import glob, os, statistics, subprocess, sys, time
 
 FIRNC = "compiler/target/release/firnc"

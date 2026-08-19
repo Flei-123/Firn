@@ -38,19 +38,19 @@ if [ -z "$BIN" ]; then
         BIN=.tokenizer-work/tokenize_bench
     else
         BIN=.tokenizer-work/tokenize
-        echo "   HINWEIS: tokenize_bench fehlt — gemessen wird der JSON-Treiber."
-        echo "            Bauen mit: firnc -o .tokenizer-work/tokenize_bench lib/html/tokenize_bench.fi"
+        echo "   NOTE: tokenize_bench is missing -- the JSON driver is measured."
+        echo "         build it with: firnc -o .tokenizer-work/tokenize_bench lib/html/tokenize_bench.fi"
     fi
 fi
-LAEUFE="${2:-3}"
+RUNS="${2:-3}"
 WORK=".tokenizer-work"
 mkdir -p "$WORK"
 
-# the best (smallest) time out of $LAEUFE runs
-beste_zeit() {
+# the best (smallest) time out of $RUNS runs
+best_time() {
     local best=""
     local i a b t
-    for ((i = 0; i < LAEUFE; i++)); do
+    for ((i = 0; i < RUNS; i++)); do
         a=$(date +%s.%N)
         "$@" >/dev/null
         b=$(date +%s.%N)
@@ -60,42 +60,42 @@ beste_zeit() {
     echo "$best"
 }
 
-messe_korpus() {
-    local quelle="$1" beschreibung="$2"
-    local html="$WORK/korpus.$quelle.html"
-    local auftrag="$WORK/korpus.$quelle.auftrag"
-    local aus="$WORK/korpus.$quelle.out"
+measure_corpus() {
+    local source="$1" description="$2"
+    local html="$WORK/korpus.$source.html"
+    local job="$WORK/korpus.$source.job"
+    local out="$WORK/korpus.$source.out"
 
-    echo "   -- Korpus '$quelle' ($beschreibung)"
-    if [ ! -f "$html" ] || [ ! -f "$auftrag" ]; then
-        python3 tools/tokenizer/korpus.py "$html" "$auftrag" --quelle "$quelle"
+    echo "   -- corpus '$source' ($description)"
+    if [ ! -f "$html" ] || [ ! -f "$job" ]; then
+        python3 tools/tokenizer/korpus.py "$html" "$job" --source "$source"
     fi
-    local groesse
-    groesse=$(stat -c%s "$html")
+    local size
+    size=$(stat -c%s "$html")
 
     local tf
-    tf=$(beste_zeit sh -c "\"$BIN\" < \"$auftrag\" > \"$aus\"")
-    if grep -q 'NICHT-UNTERSTUETZT' "$aus"; then
-        echo "      ACHTUNG: der Tokenizer hat den Korpus NICHT vollstaendig verarbeitet"
-        echo "               (Zustand nicht umgesetzt) — die MB/s sind daher kein"
-        echo "               vergleichbarer Wert und werden nur nachrichtlich gezeigt."
+    tf=$(best_time sh -c "\"$BIN\" < \"$job\" > \"$out\"")
+    if grep -q 'NICHT-UNTERSTUETZT' "$out"; then
+        echo "      NOTE: the tokenizer did NOT process the corpus completely"
+        echo "            (a state is not implemented) -- the MB/s are therefore no"
+        echo "            comparable value and are shown for information only."
     fi
-    awk -v t="$tf" -v n="$groesse" -v l="$LAEUFE" \
-        'BEGIN{printf "      Firn      : %8.2f MB/s  (%.3f s fuer %.2f MB, bester von %d)\n", n/t/1048576, t, n/1048576, l}'
+    awk -v t="$tf" -v n="$size" -v l="$RUNS" \
+        'BEGIN{printf "      Firn      : %8.2f MB/s  (%.3f s for %.2f MB, best of %d)\n", n/t/1048576, t, n/1048576, l}'
 
     if [ -x bench/tokenizer/target/release/html5ever_bench ]; then
         local tr
-        tr=$(beste_zeit bench/tokenizer/target/release/html5ever_bench "$html")
-        awk -v t="$tr" -v n="$groesse" -v l="$LAEUFE" \
-            'BEGIN{printf "      html5ever : %8.2f MB/s  (%.3f s, bester von %d)\n", n/t/1048576, t, l}'
+        tr=$(best_time bench/tokenizer/target/release/html5ever_bench "$html")
+        awk -v t="$tr" -v n="$size" -v l="$RUNS" \
+            'BEGIN{printf "      html5ever : %8.2f MB/s  (%.3f s, best of %d)\n", n/t/1048576, t, l}'
         awk -v a="$tf" -v b="$tr" \
-            'BEGIN{printf "      Faktor    : %.2fx langsamer als html5ever (Abnahmeziel <= 2.00x)\n", a/b}'
+            'BEGIN{printf "      factor    : %.2fx slower than html5ever (acceptance goal <= 2.00x)\n", a/b}'
     else
-        echo "      html5ever : nicht gebaut — bauen mit"
+        echo "      html5ever : not built -- build it with"
         echo "                  cargo build --release --manifest-path bench/tokenizer/Cargo.toml"
     fi
 }
 
-messe_korpus html5lib "Grenzfaelle der Testsuite, absichtlich pathologisch"
+measure_corpus html5lib "edge cases of the test suite, deliberately pathological"
 echo
-messe_korpus realweb  "acht echte Seiten aus testdata/realweb/"
+measure_corpus realweb  "eight real pages from testdata/realweb/"
