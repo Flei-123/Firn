@@ -1289,7 +1289,7 @@ pub(crate) fn source_needs_gc(toks: &[crate::lexer::Token]) -> bool {
     // Programm mit Faeden, aber ohne `gc class`, zieht sie deshalb ueber
     // seine Bezeichner ein.
     toks.iter().any(|t| match &t.kind {
-        TokKind::Ident(a) => a.starts_with("faden_") || a.starts_with("__faden"),
+        TokKind::Ident(a) => a.starts_with("thread_") || a.starts_with("__thread"),
         _ => false,
     })
 }
@@ -1343,8 +1343,8 @@ fn thread_work_default() -> String {
     s.push_str("// deklariert keinen eigenen, also tut ein Faden nichts.\n");
     s.push_str("fn ");
     s.push_str(FN_FADEN);
-    s.push_str("(art: u64, arg: u64) -> u64 {\n");
-    s.push_str("    return art + arg - art - arg\n");
+    s.push_str("(kind: u64, arg: u64) -> u64 {\n");
+    s.push_str("    return kind + arg - kind - arg\n");
     s.push_str("}\n");
     s
 }
@@ -1392,12 +1392,12 @@ pub(crate) fn runtime_source(
     if with_finalizer {
         s.push_str(&finalizer_default());
     } else {
-        s.push_str("// __gc_finalisiere wird vom Programm selbst deklariert\n");
+        s.push_str("// __gc_finalize wird vom Programm selbst deklariert\n");
     }
     if with_thread_work {
         s.push_str(&thread_work_default());
     } else {
-        s.push_str("// __faden_arbeit wird vom Programm selbst deklariert\n");
+        s.push_str("// __thread_work wird vom Programm selbst deklariert\n");
     }
     s.push_str(LAUFZEIT);
     if with_collections {
@@ -1442,7 +1442,7 @@ mod tests {
         assert!(q.contains("fn __gc_finalize(kind: u64, p: *mut u8) {"));
         assert!(!runtime_source(true, false, true, false).contains("fn __gc_finalize(kind: u64, p: *mut u8) {"));
         // Runde 49: dasselbe fuer den Fadenverteiler.
-        assert!(!runtime_source(true, true, false, false).contains("fn __thread_work(kind: u64, arg: u64) {"));
+        assert!(!runtime_source(true, true, false, false).contains("fn __thread_work(kind: u64, arg: u64) -> u64 {"));
         assert!(q.contains("gc_finalizer_set"));
         // Runde 53: die Sammlungen kommen nur dazu, wenn sie gebraucht werden.
         for n in ["gcvec_append", "gcmap_set", "gc class GcSlots"] {
