@@ -183,6 +183,22 @@ pub enum Op {
     /// (SPEC §3.4). Niemals rein, niemals zusammenlegbar, nie ueber einen
     /// anderen Speicherzugriff hinweg verschiebbar.
     AtomicAdd { addr: Val, val: Val },
+    /// **Runde 49** — atomarer Vergleichs-Tausch (`faden.rs`): steht in
+    /// `[addr]` der Wert `erw`, wird `neu` hineingeschrieben. Ergebnis ist
+    /// IMMER der vorgefundene Wert; der Tausch fand statt, wenn er gleich
+    /// `erw` ist. Eine Maschineninstruktion (`lock cmpxchg`). Damit lassen
+    /// sich Sperren bauen — mit `lock xadd` allein geht das nicht, weil der
+    /// Uebergang „frei -> belegt" bedingt sein muss.
+    AtomicCas { addr: Val, erw: Val, neu: Val },
+    /// **Runde 49** — einen Faden erzeugen (`faden.rs`, `clone(2)`).
+    /// Ergebnis ist die Fadenkennung (> 0) bzw. ein negativer Fehlerwert.
+    /// Das Kind kehrt aus dem Systemaufruf mit EIGENEM `rsp` zurueck; deshalb
+    /// ist das eine Instruktionsfolge und kein `syscall`-Aufruf.
+    ThreadSpawn { arg: Val, stapel: Val, ctid: Val },
+    /// **Runde 49** — Adresse des eigenen Fadenblocks (`fs:0`, `faden.rs`).
+    /// Ohne `arch_prctl(ARCH_SET_FS)` ist das Ergebnis unbrauchbar; die
+    /// Laufzeit setzt die Basis, bevor sie den Wert je liest.
+    ThreadSelf,
     /// Aufruf ueber einen ZEIGER — dynamischer Versand (`iface.rs`, Runde 46).
     /// `target` ist die Adresse der Funktion, sonst gilt alles wie bei `Call`.
     CallIndirect { target: Val, args: Vec<Val> },
@@ -253,14 +269,26 @@ impl Op {
             | Op::Asm { .. }
             | Op::MmioLoad { .. }
             | Op::MmioStore { .. }
+            | Op::AtomicCas { .. }
+            | Op::ThreadSpawn { .. }
             | Op::SecureZero { .. } => false,
+            // Der Selbstzeiger aendert nichts und liest nur die Fadenbasis;
+            // er darf aber NICHT ueber einen `arch_prctl` hinweg verschoben
+            // werden. Reine Instruktionen werden nur ENTFERNT (wenn ungenutzt)
+            // und von LICM hochgezogen — LICM nimmt nur die Liste oben, und
+            // `ThreadSelf` steht nicht darin.
+            Op::ThreadSelf => true,
         }
     }
 
     /// Alle gelesenen Werte.
     pub fn uses(&self, out: &mut Vec<Val>) {
         match self {
-            Op::Const(_) | Op::Alloca { .. } | Op::GcAddr { .. } | Op::VtabAddr { .. } => {}
+            Op::Const(_)
+            | Op::Alloca { .. }
+            | Op::GcAddr { .. }
+            | Op::VtabAddr { .. }
+            | Op::ThreadSelf => {}
             Op::CallIndirect { target, args } => {
                 out.push(*target);
                 out.extend_from_slice(args);
@@ -298,6 +326,16 @@ impl Op {
             Op::AtomicAdd { addr, val } => {
                 out.push(*addr);
                 out.push(*val);
+            }
+            Op::AtomicCas { addr, erw, neu } => {
+                out.push(*addr);
+                out.push(*erw);
+                out.push(*neu);
+            }
+            Op::ThreadSpawn { arg, stapel, ctid } => {
+                out.push(*arg);
+                out.push(*stapel);
+                out.push(*ctid);
             }
             Op::SecureZero { addr, size } => {
                 out.push(*addr);
@@ -589,6 +627,13 @@ fn fmt_inst(i: &Inst) -> String {
         }
         Op::MmioLoad { addr } => format!("mmio_load.{} %{}", t, addr),
         Op::MmioStore { addr, val } => format!("mmio_store.{} %{}, %{}", t, val, addr),
+        Op::AtomicCas { addr, erw, neu } => {
+            format!("atomcas.{} %{}, %{}, %{}", t, addr, erw, neu)
+        }
+        Op::ThreadSpawn { arg, stapel, ctid } => {
+            format!("spawn.{} %{}, %{}, %{}", t, arg, stapel, ctid)
+        }
+        Op::ThreadSelf => format!("fadenselbst.{}", t),
         Op::GcAddr { regs } => {
             if *regs {
                 "gc_state.ptr regs=1".to_string()

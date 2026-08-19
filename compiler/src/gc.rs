@@ -106,6 +106,14 @@ pub(crate) const ERR_SET: &str = "AllocError";
 /// die Laufzeit ihn dann nicht mehr faende.
 pub(crate) const FN_FINAL: &str = "__gc_finalisiere";
 
+/// **Runde 49** — Verteiler der Fadenarbeit (`lib/gc/gc.fi`, `faden_starten`).
+///
+/// Derselbe Weg wie beim Verteiler der Finalisierer und aus demselben Grund:
+/// Stufe 0 hat keine Funktionszeiger, also traegt ein Faden eine ARBEITSART
+/// statt einer Adresse. Deklariert die Wurzeldatei die Funktion selbst, nimmt
+/// der Compiler sie; sonst legt er die leere Voreinstellung dazu.
+pub(crate) const FN_FADEN: &str = "__faden_arbeit";
+
 // ---------------------------------------------------------------- Datenmodell
 
 #[derive(Clone, Debug)]
@@ -167,6 +175,19 @@ pub(crate) fn hat_klassen() -> bool {
 /// Setzt die Registrierung zurueck (eine je Uebersetzung, `parser::reset_hooks`).
 pub(crate) fn hook_reset() {
     REG.with(|r| *r.borrow_mut() = Registry::default());
+}
+
+/// Runde 49: die Laufzeit ist Teil dieses Programms. Gesetzt in
+/// `modules.rs`, wo sie wirklich in die Dateiliste kommt — nicht in
+/// `laufzeit_quelle`, denn deren Ergebnis wird auch in Tests gebaut.
+pub(crate) fn laufzeit_merken() {
+    LAUFZEIT_DRIN.with(|c| c.set(true));
+}
+
+/// Vor jeder Uebersetzung zuruecksetzen (ein Prozess kann mehrere
+/// uebersetzen — `cargo test`).
+pub(crate) fn laufzeit_reset() {
+    LAUFZEIT_DRIN.with(|c| c.set(false));
 }
 
 // ------------------------------------------------------- Vertrag fuer nogc.rs
@@ -1257,9 +1278,19 @@ pub(crate) const LAUFZEIT_PFAD: &str = "lib/gc/gc.fi";
 /// Braucht dieses Programm die Laufzeit? Entschieden am Tokenstrom: irgendwo
 /// stehen die beiden Bezeichner `gc class` nebeneinander.
 pub(crate) fn quelle_braucht_gc(toks: &[crate::lexer::Token]) -> bool {
-    toks.windows(2).any(|w| {
+    if toks.windows(2).any(|w| {
         matches!(&w[0].kind, TokKind::Ident(a) if a == "gc")
             && matches!(&w[1].kind, TokKind::Ident(b) if b == "class")
+    }) {
+        return true;
+    }
+    // Runde 49: die Faden-Laufzeit steht in derselben Datei — sie braucht
+    // denselben statischen Zustandsblock, und der Sammler braucht sie. Ein
+    // Programm mit Faeden, aber ohne `gc class`, zieht sie deshalb ueber
+    // seine Bezeichner ein.
+    toks.iter().any(|t| match &t.kind {
+        TokKind::Ident(a) => a.starts_with("faden_") || a.starts_with("__faden"),
+        _ => false,
     })
 }
 
@@ -1297,6 +1328,27 @@ pub(crate) fn quelle_hat_finalisierer(toks: &[crate::lexer::Token]) -> bool {
     })
 }
 
+/// Deklariert die Quelle schon selbst `fn __faden_arbeit`?
+pub(crate) fn quelle_hat_fadenarbeit(toks: &[crate::lexer::Token]) -> bool {
+    toks.windows(2).any(|w| {
+        matches!(&w[0].kind, TokKind::KwFn)
+            && matches!(&w[1].kind, TokKind::Ident(b) if b == FN_FADEN)
+    })
+}
+
+/// Die leere Voreinstellung des Fadenverteilers.
+fn fadenarbeit_default() -> String {
+    let mut s = String::new();
+    s.push_str("// Runde 49: Voreinstellung des Fadenverteilers. Das Programm\n");
+    s.push_str("// deklariert keinen eigenen, also tut ein Faden nichts.\n");
+    s.push_str("fn ");
+    s.push_str(FN_FADEN);
+    s.push_str("(art: u64, arg: u64) -> u64 {\n");
+    s.push_str("    return art + arg - art - arg\n");
+    s.push_str("}\n");
+    s
+}
+
 /// Die leere Voreinstellung des Finalisierer-Verteilers.
 fn finalisierer_default() -> String {
     let mut s = String::new();
@@ -1310,6 +1362,17 @@ fn finalisierer_default() -> String {
     s
 }
 
+thread_local! {
+    /// Wurde die Laufzeit in dieses Programm eingezogen? (Runde 49: dann muss
+    /// der Zustandsblock auch ohne `gc class` im Assembler stehen.)
+    static LAUFZEIT_DRIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Ist die Sammler-/Faden-Laufzeit Teil dieses Programms?
+pub(crate) fn laufzeit_aktiv() -> bool {
+    LAUFZEIT_DRIN.with(|c| c.get())
+}
+
 /// Quelltext der Laufzeit. `mit_fehlermenge = false`, wenn das Programm
 /// `AllocError` bereits selbst deklariert (Fehlermengennamen sind programmweit).
 /// `mit_finalisierer = false`, wenn die Wurzeldatei den Verteiler selbst
@@ -1317,6 +1380,7 @@ fn finalisierer_default() -> String {
 pub(crate) fn laufzeit_quelle(
     mit_fehlermenge: bool,
     mit_finalisierer: bool,
+    mit_fadenarbeit: bool,
     mit_sammlungen: bool,
 ) -> String {
     let mut s = String::new();
@@ -1329,6 +1393,11 @@ pub(crate) fn laufzeit_quelle(
         s.push_str(&finalisierer_default());
     } else {
         s.push_str("// __gc_finalisiere wird vom Programm selbst deklariert\n");
+    }
+    if mit_fadenarbeit {
+        s.push_str(&fadenarbeit_default());
+    } else {
+        s.push_str("// __faden_arbeit wird vom Programm selbst deklariert\n");
     }
     s.push_str(LAUFZEIT);
     if mit_sammlungen {
@@ -1362,22 +1431,24 @@ mod tests {
 
     #[test]
     fn laufzeit_enthaelt_die_pflichtnamen() {
-        let q = laufzeit_quelle(true, true, true);
+        let q = laufzeit_quelle(true, true, true, true);
         for n in ["gc_init", "gc_collect", "gc_live_objects", FN_ALLOC, FN_WEAK, FN_STARK, FN_AS] {
             assert!(q.contains(n), "laufzeit ohne '{}'", n);
         }
         assert!(q.contains("error AllocError"));
-        assert!(!laufzeit_quelle(false, true, false).contains("error AllocError {"));
+        assert!(!laufzeit_quelle(false, true, true, false).contains("error AllocError {"));
         // Runde 47: der Verteiler ist genau EINMAL da — entweder als
         // Voreinstellung oder aus dem Programm, nie doppelt.
         assert!(q.contains("fn __gc_finalisiere(art: u64, p: *mut u8) {"));
-        assert!(!laufzeit_quelle(true, false, false).contains("fn __gc_finalisiere(art: u64, p: *mut u8) {"));
+        assert!(!laufzeit_quelle(true, false, true, false).contains("fn __gc_finalisiere(art: u64, p: *mut u8) {"));
+        // Runde 49: dasselbe fuer den Fadenverteiler.
+        assert!(!laufzeit_quelle(true, true, false, false).contains("fn __faden_arbeit(art: u64, arg: u64) {"));
         assert!(q.contains("gc_finalisierer_setzen"));
         // Runde 53: die Sammlungen kommen nur dazu, wenn sie gebraucht werden.
         for n in ["gcvec_anhaengen", "gcmap_setzen", "gc class GcSlots"] {
             assert!(q.contains(n), "laufzeit ohne '{}'", n);
             assert!(
-                !laufzeit_quelle(true, true, false).contains(n),
+                !laufzeit_quelle(true, true, true, false).contains(n),
                 "'{}' auch ohne Sammlungen dabei",
                 n
             );

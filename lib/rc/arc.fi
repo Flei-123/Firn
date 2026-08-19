@@ -13,16 +13,23 @@
 //
 // ------------------------------------------------------------------ EHRLICH
 //
-// E1  FADENSICHER IST DER ZAEHLER, NICHT ALLES. `arc_klonen` und
-//     `arc_freigeben` sind mit `lock xadd` korrekt, auch wenn mehrere Faeden
-//     gleichzeitig zugreifen: nur der Faden, der beim Erniedrigen die 1 sieht,
-//     gibt frei — deshalb kann NIEMALS doppelt freigegeben werden.
-//     `aufwerten` (schwach -> stark) braucht dagegen einen Vergleichs-Tausch
-//     (compare_exchange); mit reinem fetch-add laesst sich das Wettrennen
-//     "letzter starker Verweis faellt genau jetzt weg" nicht schliessen.
-//     Runde 47 baut bewusst NUR fetch-add. `aufwerten` ist damit im heutigen
-//     Firn (SPEC §7: EIN Faden) richtig, aber es ist keine Zusage fuer
-//     spaeter. Das steht so in docs/RUNDE47.md und wird nicht schoengeredet.
+// E1  DER ZAEHLER IST FADENSICHER — SEIT RUNDE 49 AUCH DIE AUFWERTUNG.
+//     `arc_klonen` und `arc_freigeben` sind mit `lock xadd` korrekt, auch
+//     wenn mehrere Faeden gleichzeitig zugreifen: nur der Faden, der beim
+//     Erniedrigen die 1 sieht, gibt frei — deshalb kann NIEMALS doppelt
+//     freigegeben werden. `aufwerten_atomar` (schwach -> stark) brauchte
+//     einen Vergleichs-Tausch; Runde 47 hatte den nicht und hat die Luecke
+//     benannt (docs/RUNDE47.md §3.2). Seit Runde 49 gibt es
+//     `__atomar_tauschen` (lock cmpxchg), und die Aufwertung erhoeht nur
+//     noch, solange der Zaehler nicht 0 ist. Nachweis mit vielen Faeden auf
+//     DERSELBEN Struktur: tests/843_arc_faden.fi.
+//
+//     WAS WEITER NICHT ZUGESAGT IST: der WERT hinter dem Verweis ist
+//     unveraenderlich (E4), aber `Arc[T]` macht ihn nicht fadensicher
+//     lesbar, wenn er selbst Zeiger auf veraenderlichen Speicher enthaelt.
+//     Und die Arc-Halde (`arc_neu`/`arc_freigeben` als Speicherverwaltung)
+//     hat KEINE eigene Sperre: wer aus mehreren Faeden alloziert, sperrt
+//     selbst (faden_sperren).
 //
 // E2  ZYKLEN LECKEN, genau wie bei `Rc`. Zwei `Arc`, die sich gegenseitig
 //     halten, werden nie frei — sichtbar gemacht in tests/833. Wer Zyklen
@@ -358,19 +365,37 @@ fn aweak_stark_zahl[T: Any](w: AtomSchwachverweis[T]) -> u64 {
 
 // Aufwertung: leerer Verweis, wenn der starke Zaehler schon 0 ist.
 //
-// EHRLICH (E1): dieses Verfahren — erhoehen und dann zuruecknehmen, falls
-// der alte Wert 0 war — schliesst das Wettrennen mit einem gleichzeitig
-// laufenden `arc_freigeben` NICHT. Dafuer braucht es einen Vergleichs-Tausch,
-// den Runde 47 bewusst nicht baut. Im heutigen Firn (ein Faden, SPEC §7) ist
-// es korrekt; als Fadenzusage gilt es NICHT.
+// RUNDE 49 — JETZT MIT VERGLEICHS-TAUSCH, UND DAMIT WIRKLICH FADENSICHER.
+//
+// Runde 47 hat hier erhoeht und die Erhoehung zurueckgenommen, falls der alte
+// Wert 0 war. Das schliesst das Wettrennen NICHT: zwischen dem Erhoehen und
+// dem Zuruecknehmen kann ein anderer Faden den Zaehler sehen, ihn fuer
+// lebendig halten und den Block benutzen, der gerade freigegeben wird. Genau
+// diese Luecke steht als offener Punkt in docs/RUNDE47.md §3.2.
+//
+// Der klassische Schluss (Rusts `Weak::upgrade`) braucht einen Vergleichs-
+// Tausch, und den gibt es seit dieser Runde (`__atomar_tauschen`,
+// compiler/src/faden.rs). Die Schleife erhoeht NUR, solange der Zaehler nicht
+// 0 ist — und wenn er 0 ist, war der letzte starke Verweis weg und bleibt weg.
+// Der Zaehler geht nie von 0 zurueck auf 1: `arc_freigeben` gibt den Block
+// frei, sobald es die 1 SIEHT, und das sieht genau einer.
 fn aufwerten_atomar[T: Any](w: AtomSchwachverweis[T]) -> Atomverweis[T] {
     if w.block == 0 as usize {
         return Atomverweis[T]{ block: 0 as usize }
     }
-    let alt: u64 = __atomar_addieren(w.block as *mut u64, 1)
-    if alt == 0 as u64 {
-        __atomar_addieren(w.block as *mut u64, ARC_MINUS1)
-        return Atomverweis[T]{ block: 0 as usize }
+    let p: *mut u64 = w.block as *mut u64
+    var n: u64 = arc_ld64(w.block + 0 as usize)
+    var fertig: bool = false
+    while !fertig {
+        if n == 0 as u64 {
+            return Atomverweis[T]{ block: 0 as usize }
+        }
+        let g: u64 = __atomar_tauschen(p, n, n + 1 as u64)
+        if g == n {
+            fertig = true
+        } else {
+            n = g
+        }
     }
     return Atomverweis[T]{ block: w.block }
 }
