@@ -1,8 +1,8 @@
-//! Treiber des Stufe-0-Compilers: Kommandozeile, Pipeline, Assemblieren/Linken.
+//! Driver of the stage 0 compiler: command line, pipeline, assembling/linking.
 //!
-//! Pipeline: Quelle -> Lexer -> Parser -> AST -> Typpruefer -> FIR -> Optimierer
-//!           -> x86_64-Assembler -> `as` -> `ld` -> ausfuehrbare Datei.
-//! `as` und `ld` werden AUSSCHLIESSLICH als Assembler/Linker benutzt.
+//! Pipeline: source -> lexer -> parser -> AST -> type checker -> FIR -> optimizer
+//!           -> x86_64 assembler -> `as` -> `ld` -> executable file.
+//! `as` and `ld` get used EXCLUSIVELY as assembler/linker.
 
 mod abi;
 mod ast;
@@ -62,30 +62,30 @@ enum Emit {
     LayoutCanon,
     TypesCanon,
     Ast,
-    /// FIR nach dem Lowering (unoptimiert)
+    /// FIR after lowering (unoptimized)
     FirRaw,
-    /// FIR nach dem Optimierer
+    /// FIR after the optimizer
     FirOpt,
-    /// nur den von `comptime` erzeugten Quelltext ausgeben
+    /// print the source text produced by `comptime` only
     Comptime,
 }
 
 struct Options {
-    /// Quelldatei; entfaellt bei `--package`.
+    /// Source file; dropped with `--package`.
     input: Option<PathBuf>,
     output: Option<PathBuf>,
-    /// `--package <verzeichnis>`: Projekt anhand seines Manifests uebersetzen.
+    /// `--package <dir>`: compile the project by way of its manifest.
     package: Option<String>,
-    /// `--package-info <verzeichnis>`: Manifest lesen und berichten.
+    /// `--package-info <dir>`: read the manifest and report.
     package_info: Option<String>,
     emit: Emit,
     optimize: bool,
     keep_asm: bool,
     stats: bool,
-    /// Baustufe und einzeln abgeschaltete Durchgaenge (DESIGNZIELE.md §5)
+    /// Build level and passes switched off one by one (DESIGNZIELE.md §5)
     optcfg: opt::OptConfig,
-    /// `-c` / `--objekt`: nur assemblieren, NICHT linken (Runde 52).
-    /// Im Profil `kernel` ohnehin immer an (SPEC §2: Ziel ist ein ELF-Objekt).
+    /// `-c` / `--object`: only assemble, do NOT link (round 52).
+    /// Always on under the `kernel` profile anyway (SPEC §2: target is ELF object code).
     only_object: bool,
 }
 
@@ -193,8 +193,8 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                 optcfg.disabled.push(v.to_string());
             }
             _ if a.starts_with("--strlit=") => {
-                // Modul str: Literalpfad (Bytes/Str/Str16, Maskierungen, WTF-16)
-                // ohne Quelldatei nachpruefbar machen.
+                // Module str: make the literal path (Bytes/Str/Str16, escapes, WTF-16)
+                // checkable without a source file.
                 match strings::strlit_report(&a["--strlit=".len()..]) {
                     Ok(rep) => {
                         print!("{}", rep);
@@ -221,9 +221,9 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                     None => return Err("-o expects a path".to_string()),
                 }
             }
-            // Runde 48: der Bau-Treiber. Beide Optionen nehmen ihr
-            // Verzeichnis als EIGENES Argument — `firnc1` liest die
-            // Kommandozeile genauso.
+            // Round 48: the build driver. Both options take their
+            // directory as a SEPARATE argument — `firnc1` reads the
+            // command line the same way.
             "--package" => {
                 i += 1;
                 match args.get(i) {
@@ -304,17 +304,17 @@ fn main() {
 }
 
 fn run(opts: &Options) -> i32 {
-    // Runde 49: Merker „Laufzeit eingezogen" gehoert zum Anfang einer
-    // Uebersetzung (codegen_x86::emit gibt danach den Zustandsblock aus).
+    // Round 49: the marker "runtime included" belongs to the start of a
+    // compilation (codegen_x86::emit prints the state block afterwards).
     crate::gc::runtime_reset();
-    // Der Satz steht hier und nicht in `parse_args`, weil `firnc1` ihn
-    // ZEICHENGLEICH schreiben muss und dort keine `--help`-Nachbemerkung
-    // hat (Runde 48).
+    // The sentence stands here and not at `parse_args`, because `firnc1`
+    // must write it CHARACTER FOR CHARACTER and holds no `--help` remark
+    // there (round 48).
     if opts.package.is_some() && opts.input.is_some() {
         eprint!("error: --package and an input file are mutually exclusive\n");
         return 2;
     }
-    // --- `--package-info`: Manifest lesen, pruefen, berichten (Runde 48) ---
+    // --- `--package-info`: read the manifest, check it, report (round 48) ---
     if let Some(dir) = &opts.package_info {
         match package_world::World::ab_root(dir) {
             Ok(w) => {
@@ -327,9 +327,9 @@ fn run(opts: &Options) -> i32 {
             }
         }
     }
-    // --- Paketwelt: mit `--package` das genannte Projekt, sonst das Manifest
-    // ueber der Quelldatei (fehlt eins, ist die Welt leer und nichts aendert
-    // sich gegenueber Runde 47).
+    // --- Package world: with `--package` the project named, otherwise the
+    // manifest above the source file (without one the world is empty and
+    // nothing changes compared to round 47).
     let (world, input, target_out_manifest) = match &opts.package {
         Some(dir) => {
             let w = match package_world::World::ab_root(dir) {
@@ -370,7 +370,7 @@ fn run(opts: &Options) -> i32 {
         }
     };
     let path = &input;
-    // --- Module aufloesen (Wurzeldatei + alle 'import'-Module) ---
+    // --- Resolve modules (root file + all 'import' modules) ---
     let files = match modules::resolve(path, &world) {
         Ok(f) => f,
         Err(modules::Error::Package(t)) => {
@@ -378,7 +378,7 @@ fn run(opts: &Options) -> i32 {
             return 2;
         }
         Err(modules::Error::Diag(d)) => {
-            // Fehler der Modulaufloesung im ueblichen Format ausgeben.
+            // Print errors of the module resolution using the usual format.
             let src = std::fs::read_to_string(path).unwrap_or_default();
             let mut dg = diag::Diags::new(&path.display().to_string(), &src);
             dg.report(d);
@@ -396,7 +396,7 @@ fn run(opts: &Options) -> i32 {
     for f in files.iter().skip(1) {
         dg.add_file(&f.path.display().to_string(), &f.src);
     }
-    // Zeilentabelle fuer .debug_line: anweisungsgenau nur ohne Optimierer.
+    // Line table for .debug_line: instruction-exact only without the optimizer.
     dwarf::reset(
         files.iter().map(|f| f.path.display().to_string()).collect(),
         !opts.optimize,
@@ -434,10 +434,10 @@ fn run(opts: &Options) -> i32 {
     }
 
     if opts.emit == Emit::AstCanon {
-        // NUR die Wurzeldatei, VOR dem Zusammenfuehren der Module und vor der
-        // Monomorphisierung: der Parser in Firn sieht ebenfalls genau eine
-        // Datei. Alles andere waere kein Vergleich, sondern ein Vergleich mit
-        // etwas anderem.
+        // The root file ONLY, BEFORE merging the modules and before
+        // monomorphization: the parser written for Firn sees exactly one file
+        // as well. Anything else would be no comparison but a comparison with
+        // something else.
         let toks = lexer::lex(&root.src, &mut dg);
         let prog = parser::parse(&toks, &mut dg);
         if dg.has_errors() {
@@ -457,18 +457,18 @@ fn run(opts: &Options) -> i32 {
         return if dg.has_errors() { 1 } else { 0 };
     }
 
-    // --- Lexer + Parser je Modul, danach zusammenfuehren ---
+    // --- Lexer + parser per module, merged afterwards ---
     let mut prog = match modules::build_program(&files, &mut dg) {
         Some(p) => p,
         None => return report(&dg),
     };
-    // --- comptime: erzeugten Quelltext im SELBEN Lauf uebersetzen (SPEC §6.4)
+    // --- comptime: compile the produced source text within the SAME run (SPEC §6.4)
     //
-    // Die `comptime { … }`-Bloecke laufen VOR der Typpruefung. Was sie per
-    // `emit_*` schreiben, wird hier gelext, geparst und ans Programm
-    // angehaengt — danach sieht der Typpruefer keinen Unterschied zu von Hand
-    // geschriebenem Quelltext. Genau das verlangt Abnahmepunkt 6 fuer die
-    // Unicode-, Web-IDL- und CSS-Tabellen eines Browsers.
+    // The `comptime { … }` blocks run BEFORE the type check. What they write
+    // through `emit_*` gets lexed here, parsed and appended to the program —
+    // after that the type checker sees no difference to hand written source
+    // text. Exactly that is what acceptance point 6 demands for the Unicode,
+    // Web IDL and CSS tables of a browser.
     let base = root
         .path
         .parent()
@@ -477,14 +477,14 @@ fn run(opts: &Options) -> i32 {
     let generated = comptime::run_blocks_out(&prog, &mut dg, &base);
     if !generated.is_empty() && !dg.has_errors() {
         let file = dg.add_file("<comptime>", &generated);
-        // Dieselbe Datei muss auch die Zeilentabelle kennen, sonst erzeugt der
-        // Codegenerator `.loc`-Direktiven mit einer Nummer, die `as` nicht
-        // kennt ("unassigned file number").
+        // The line table must know that same file too, otherwise the code
+        // generator produces `.loc` directives with a number that `as` does
+        // not know ("unassigned file number").
         dwarf::add_file("<comptime>");
         let toks = lexer::lex_file(&generated, file, &mut dg);
         let mut extra = parser::parse(&toks, &mut dg);
-        // Die Ausdrucks-Ids des Zusatzes beginnen bei 0 und muessen hinter
-        // die des Hauptprogramms wandern.
+        // The expression ids of the addition start at 0 and must move behind
+        // those of the main program.
         let mut next = prog.expr_count;
         for f in extra.funcs.iter_mut() {
             crate::mono::renumber_block(&mut f.body, &mut next);
@@ -502,7 +502,7 @@ fn run(opts: &Options) -> i32 {
         }
     }
 
-    // --- Monomorphisierung generischer Vorlagen (Modul types) ---
+    // --- Monomorphization of generic templates (module types) ---
     mono::expand(&mut prog, &mut dg);
     if opts.emit == Emit::Ast && !dg.has_errors() {
         println!("{:#?}", prog);
@@ -520,7 +520,7 @@ fn run(opts: &Options) -> i32 {
         return report(&dg);
     }
 
-    // --- Typpruefer ---
+    // --- Type checker ---
     let info = match sema::check(&prog, &mut dg) {
         Some(i) => i,
         None => {
@@ -535,7 +535,7 @@ fn run(opts: &Options) -> i32 {
         return report(&dg);
     }
 
-    // --- Lowering nach FIR ---
+    // --- Lowering to FIR ---
     let mut module = match lower::lower(&prog, &info, &mut dg) {
         Some(m) => m,
         None => {
@@ -573,7 +573,7 @@ fn run(opts: &Options) -> i32 {
         return 0;
     }
 
-    // --- Optimierer ---
+    // --- Optimizer ---
     if opts.optimize {
         let st = opt::optimize_with(&mut module, &opts.optcfg);
         if std::env::var(format!("{}_OPT_STATS", config::compiler_name().to_uppercase())).is_ok() {
@@ -620,11 +620,11 @@ fn run(opts: &Options) -> i32 {
         return 0;
     }
 
-    // --- Assemblieren, und nur im App-Profil auch linken ---
+    // --- Assemble, and link only under the app profile ---
     //
-    // RUNDE 52 (SPEC §2): das Kernel-Profil erzeugt eine freistehende
-    // ELF-OBJEKTDATEI. Kein `ld`, kein `_start`, kein libc-Kontakt — gelinkt
-    // wird spaeter vom Kernel-Bau mit dessen eigenem Linkerskript.
+    // ROUND 52 (SPEC §2): the kernel profile produces a freestanding
+    // ELF OBJECT FILE. No `ld`, no `_start`, no libc contact — linking
+    // happens later at the kernel build with its own linker script.
     let object = opts.only_object || prof::is_kernel();
     let asm_path = out.with_extension("s");
     if let Err(e) = std::fs::write(&asm_path, asm.as_bytes()) {
@@ -632,8 +632,8 @@ fn run(opts: &Options) -> i32 {
         return 2;
     }
     if object {
-        // Ohne `-o` heisst das Ergebnis `<eingabe>.o`; mit `-o` genau so, wie
-        // es dasteht (dann darf der Name auch ohne Endung bleiben).
+        // Without `-o` the result is called `<input>.o`; with `-o` exactly as
+        // written there (the label may then stay without a suffix).
         let obj_path = match &opts.output {
             Some(p) => p.clone(),
             None => out.with_extension("o"),
@@ -657,7 +657,7 @@ fn run(opts: &Options) -> i32 {
     0
 }
 
-/// Gibt alle gesammelten Fehler aus und liefert den Exit-Code.
+/// Prints all collected errors and yields the exit code.
 fn report(dg: &diag::Diags) -> i32 {
     dg.print();
     if dg.is_full() {
@@ -679,7 +679,7 @@ fn default_output(input: &Path) -> PathBuf {
     p
 }
 
-/// Nur assemblieren (`as --64 -o x.o x.s`) — die freistehende Ausgabe.
+/// Assemble only (`as --64 -o x.o x.s`) — the freestanding output.
 fn assemble(asm: &Path, obj: &Path) -> Result<(), i32> {
     let st = Command::new("as").arg("--64").arg("-o").arg(obj).arg(asm).status();
     match st {

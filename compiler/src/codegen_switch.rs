@@ -1,50 +1,50 @@
-//! Codeerzeugung fuer `Term::Switch` (SPEC §6.3, `P4`).
+//! Code generation for `Term::Switch` (SPEC §6.3, `P4`).
 //!
-//! SCHNITTSTELLE (fest, wird von `codegen_x86.rs` aufgerufen):
+//! INTERFACE (fixed, called by `codegen_x86.rs`):
 //!   `pub(crate) fn emit_switch(e, f, fr, term) -> Result<(), String>`
 //!
-//! Zwei Verfahren:
-//!  * **Sprungtabelle** — sobald mindestens `MIN_TABLE_CASES` Marken vorliegen
-//!    und die Dichte `cases.len() * 100 / (max - min + 1)` mindestens
-//!    `MIN_DENSITY` Prozent betraegt. Die Tabelle steht in `.rodata`, der
-//!    Sprung ist ein indirekter `jmp qword ptr [...]`; ausserhalb von
-//!    `[min, max]` geht es nach `default`.
-//!  * **Vergleichskette** — sonst (wenige oder weit gestreute Marken).
+//! Two methods:
+//!  * **jump table** — as soon as at least `MIN_TABLE_CASES` labels exist and
+//!    the density `cases.len() * 100 / (max - min + 1)` reaches at least
+//!    `MIN_DENSITY` percent. The table sits at `.rodata`, the jump is
+//!    one indirect `jmp qword ptr [...]`; outside of `[min, max]` control
+//!    goes to `default`.
+//!  * **comparison chain** — otherwise (few or widely scattered labels).
 //!
-//! Beide Verfahren sind verhaltensgleich; der Optimierer aendert daran nichts.
+//! Both methods behave alike; the optimizer changes nothing about that.
 
 use crate::codegen_x86::{block_label, load_ext, reg, Emitter, Frame};
 use crate::fir::{FTy, Func, Term};
 
-/// Woher kommt der Wert, ueber den verzweigt wird?
+/// Where does the value branched over come from?
 ///
-/// **Runde 51.** Vorher konnte `emit_switch` den Wert nur aus dem Rahmen
-/// lesen. Der Registerpfad (`regalloc.rs`) musste ihn deshalb erst dorthin
-/// schreiben, obwohl er in einem Register lag:
+/// **Round 51.** Formerly `emit_switch` could read the value from the frame
+/// only. The register path (`regalloc.rs`) therefore had to write it there
+/// first, although it already sat inside a register:
 ///
 /// ```text
-/// mov %r12d,%r9d          ; Zustand in ein Arbeitsregister
+/// mov %r12d,%r9d          ; state into a scratch register
 /// mov %r9,%rax
-/// mov %rax,-0x260(%rbp)   ; nur fuer emit_switch in den Rahmen
-/// mov -0x260(%rbp),%eax   ; und sofort wieder heraus
+/// mov %rax,-0x260(%rbp)   ; into the frame just for emit_switch
+/// mov -0x260(%rbp),%eax   ; and right back out again
 /// cmp $0x48,%eax
 /// ```
 ///
-/// Im Tokenizer ist das der Zustandsversand je Zeichen: 5.109.380 Durchlaeufe
-/// mal zwei ueberfluessige Speicherzugriffe.
+/// Within the tokenizer that is the state dispatch per character: 5.109.380
+/// runs times two superfluous memory accesses.
 pub(crate) enum ValueSource<'a> {
-    /// Grundpfad: der Wert liegt in seinem Rahmenfach.
+    /// Base path: the value sits at its frame slot.
     Frame(&'a Frame),
-    /// Registerpfad: der Aufrufer laedt den Wert selbst nach `rax`,
-    /// erweitert auf die uebergebene Breite.
+    /// Register path: the caller loads the value to `rax` itself,
+    /// widened to the given width.
     ///
-    /// **Zusicherung des Aufrufers:** die Funktion emittiert IMMER mindestens
-    /// einen Schreibzugriff auf `eax`/`rax`. Das ist die Grundlage dafuer,
-    /// dass die Tabelle unten auf `mov eax, eax` verzichten darf.
+    /// **Guarantee of the caller:** the function ALWAYS emits at least one write
+    /// to `eax`/`rax`. That is the ground on which the table below may do
+    /// without `mov eax, eax`.
     Loaded(&'a dyn Fn(&mut Emitter, u32)),
 }
 
-/// Breite, in der der Wert verglichen und indiziert wird.
+/// Width at which the value gets compared and indexed.
 pub(crate) fn switch_bits(ty: FTy) -> u32 {
     if ty.bits() > 32 {
         64
@@ -53,12 +53,12 @@ pub(crate) fn switch_bits(ty: FTy) -> u32 {
     }
 }
 
-/// ab so vielen Faellen lohnt eine Tabelle
+/// from this many cases onwards a table pays off
 pub(crate) const MIN_TABLE_CASES: usize = 8;
-/// Mindestdichte in Prozent
+/// minimum density as percent
 pub(crate) const MIN_DENSITY: usize = 40;
-/// Obergrenze fuer die Groesse einer Tabelle (Eintraege), damit sparsame
-/// Programme nicht ungewollt viel `.rodata` bekommen.
+/// Upper bound for the size of a table (entries), so that frugal programs
+/// do not get much `.rodata` unintentionally.
 const MAX_TABLE_ENTRIES: i128 = 65536;
 
 pub(crate) fn emit_switch(
@@ -71,7 +71,7 @@ pub(crate) fn emit_switch(
         Term::Switch { val, ty, cases, default } => (*val, *ty, cases, *default),
         _ => return Err("internal error: emit_switch without switch".to_string()),
     };
-    // SPEC §9.1: ueber einen geheimen Wert darf nicht verzweigt werden.
+    // SPEC §9.1: branching over a secret value is forbidden.
     if f.constant_time && f.is_secret(val) {
         return Err(format!(
             "#[constant_time]: switch in '{}' depends on a secret value (%{})",
@@ -103,7 +103,7 @@ pub(crate) fn emit_switch(
     Ok(())
 }
 
-/// Lohnt sich eine Sprungtabelle? Liefert `[min, max]` der Marken.
+/// Does a jump table pay off? Yields `[min, max]` of the labels.
 fn table_range(cases: &[(i128, crate::fir::BlockId)]) -> Option<(i128, i128)> {
     if cases.len() < MIN_TABLE_CASES {
         return None;
@@ -134,20 +134,20 @@ fn emit_table(
     let label = table_label(e, &f.name);
     let dflt = block_label(&f.name, default);
 
-    // Index = Wert - min; ausserhalb von [0, weite) geht es nach default.
+    // index = value - min; outside of [0, width) control goes to default.
     if bits == 32 {
         if min != 0 {
             e.line(&format!("sub eax, {}", min as i64));
         }
         e.line(&format!("cmp eax, {}", (extent - 1) as i64));
         e.line(&format!("ja {}", dflt));
-        // KEIN `mov eax, eax` (Runde 51): auf x86-64 nullt JEDER Schreibzugriff
-        // auf ein 32-Bit-Register die oberen 32 Bit. Bis hierher ist rax
-        // garantiert genau so beschrieben worden — entweder von `load_ext`
-        // (jeder seiner Zweige schreibt `eax`: `mov`, `movzx`, `movsx`,
-        // `movsxd`), von der Zusicherung in `Wertquelle::Geladen`, oder vom
-        // `sub eax, min` unmittelbar darueber. Der Index in rax ist damit
-        // bereits nullerweitert.
+        // NO `mov eax, eax` (round 51): on x86-64 EVERY write to a 32-bit
+        // register zeroes the upper 32 bits. Up to here rax has been
+        // written exactly that way for sure — either by `load_ext`
+        // (each of its branches writes `eax`: `mov`, `movzx`, `movsx`,
+        // `movsxd`), by the guarantee of `ValueSource::Loaded`, or by the
+        // `sub eax, min` right above. The index held by rax is thereby
+        // already zero extended.
     } else {
         if min != 0 {
             e.line(&format!("mov rcx, {}", min as i64));
@@ -160,7 +160,7 @@ fn emit_table(
     e.line(&format!("lea rdx, [rip + {}]", label));
     e.line("jmp qword ptr [rdx + rax*8]");
 
-    // Tabelle in .rodata; fehlende Marken zeigen auf den Vorgabezweig.
+    // table at .rodata; missing labels point to the default branch.
     e.raw(".section .rodata");
     e.raw(".align 8");
     e.raw(&format!("{}:", label));
@@ -180,7 +180,7 @@ fn emit_table(
     e.raw(".text");
 }
 
-/// Eindeutige Marke fuer eine Tabelle innerhalb der Ausgabe.
+/// Unique label for a table within the output.
 fn table_label(e: &Emitter, fname: &str) -> String {
     let base = format!(".Ltbl_{}", fname);
     let n = e.out.matches(&format!("{}_", base)).count();
@@ -192,7 +192,7 @@ mod tests {
     use crate::codegen_x86::emit;
     use crate::fir::{FTy, Func, Module, Op, Term};
 
-    /// Wenige Marken: Vergleichskette.
+    /// Few labels: comparison chain.
     #[test]
     fn switch_generated_compare_chain() {
         let mut f = Func::new("main", vec![], FTy::I32);
@@ -214,7 +214,7 @@ mod tests {
         assert!(!asm.contains("jmp qword ptr"), "unexpected table:\n{}", asm);
     }
 
-    /// Viele dichte Marken: Sprungtabelle in `.rodata` mit indirektem Sprung.
+    /// Many dense labels: jump table at `.rodata` with indirect jump.
     #[test]
     fn denser_switch_generated_jump_table() {
         let mut f = Func::new("main", vec![], FTy::I32);
@@ -234,11 +234,11 @@ mod tests {
         assert!(asm.contains("jmp qword ptr [rdx + rax*8]"), "{}", asm);
         assert!(asm.contains(".section .rodata"), "{}", asm);
         assert!(asm.contains(".quad .Lmain__bb5"), "{}", asm);
-        // keine Vergleichskette mehr
+        // no comparison chain any more
         assert!(!asm.contains("je .Lmain__bb5"), "{}", asm);
     }
 
-    /// Weit gestreute Marken: keine Tabelle (Dichte zu gering).
+    /// Widely scattered labels: no table (density too low).
     #[test]
     fn sparsamer_switch_stays_chain() {
         let mut f = Func::new("main", vec![], FTy::I32);
@@ -259,9 +259,9 @@ mod tests {
         assert!(asm.contains("je .Lmain__bb1"), "{}", asm);
     }
 
-    /// NACHWEIS (SPEC §6.3, `P4`): die Zustandsmaschine mit 32 Zustaenden in
-    /// `tests/230_zustandsmaschine.fi` bekommt eine echte Sprungtabelle —
-    /// ein indirekter Sprung ueber `.rodata`, keine Kette aus 32 `cmp`.
+    /// PROOF (SPEC §6.3, `P4`): the state machine with 32 states at
+    /// `tests/230_zustandsmaschine.fi` gets a real jump table —
+    /// one indirect jump through `.rodata`, no chain of 32 `cmp`.
     #[test]
     fn jump_table_at_30_states() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/230_zustandsmaschine.fi");
@@ -283,7 +283,7 @@ mod tests {
         assert!(compare <= 4, "{} comparisons instead of table:\n{}", compare, asm);
     }
 
-    /// `select` muss ein `cmov` werden — niemals ein Sprung (SPEC §9.2).
+    /// `select` must become a `cmov` — never a jump (SPEC §9.2).
     #[test]
     fn select_becomes_cmov_and_never_in_jump() {
         let mut f = Func::new("main", vec![], FTy::I32);
