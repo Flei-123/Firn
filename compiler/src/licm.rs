@@ -1,60 +1,60 @@
-//! **LICM** — schleifeninvariante Berechnungen aus der Schleife ziehen.
+//! **LICM** — pull loop invariant computations out of the loop.
 //!
-//! SCHNITTSTELLE (fest):
+//! INTERFACE (fixed):
 //!   `pub(crate) fn hoist_loop_invariants(f: &mut Func) -> usize`
 //!
-//! ## Warum dieser Durchgang
+//! ## Why this pass
 //!
-//! Gemessen an `bench/firn/matmul.fi` (Faktor 6,26× gegen Rust, der schlechteste
-//! Wert der Suite): die innerste Schleife rechnet
+//! Measured on `bench/firn/matmul.fi` (factor 6.26× against Rust, the worst
+//! value of the suite): the innermost loop computes
 //!
 //! ```text
 //! s = s + ld32(a, r * n + k) * ld32(b, k * n + cc)
 //! ```
 //!
-//! und `r * n` hängt von keiner Schleifenvariablen ab. Vor diesem Durchgang
-//! stand im erzeugten Code je Iteration ein `imul` dafür — 240 Mal je Zeile,
-//! 240 × 240 × 3 Mal je Lauf. LLVM zieht das heraus, Firn tat es nicht.
+//! and `r * n` depends on no loop variable. Before this pass the generated
+//! code held one `imul` for it per iteration — 240 times per row,
+//! 240 × 240 × 3 times per run. LLVM pulls that out, Firn did not.
 //!
-//! ## Was hochgezogen wird
+//! ## What gets hoisted
 //!
-//! Eine Instruktion wandert in den **Vorkopf**, wenn alles davon gilt:
+//! One instruction moves to the **preheader** once all of this holds:
 //!
-//! * Sie ist **rein**: `const`, `bin`, `cmp`, `un`, `cast`, `ptradd`. Kein
-//!   `load` (ohne Aliasanalyse nicht beweisbar), kein `store`, `call`,
+//! * It is **pure**: `const`, `bin`, `cmp`, `un`, `cast`, `ptradd`. No
+//!   `load` (not provable without alias analysis), no `store`, `call`,
 //!   `syscall`, `copymem`, `alloca`, `gcaddr`.
-//! * Sie kann **nicht fallen**: `div`/`rem` sind ausgeschlossen, weil eine
-//!   Division durch null auf der CPU eine Ausnahme auslöst. Ein Hochziehen
-//!   würde sie auch dann auslösen, wenn die Schleife nie läuft. Verschiebungen
-//!   sind erlaubt: eine zu große Weite ist auf x86 undefiniert, aber keine
-//!   Falle, und der Wert wäre in der Schleife derselbe.
-//! * **Kein Operand wird in der Schleife definiert** (oder er wurde selbst
-//!   schon hochgezogen — deshalb die Fixpunktschleife).
-//! * Weder Ergebnis noch Operand ist ein `secret`-Wert (SPEC §9.2), und die
-//!   Instruktion ist nicht `select`/`barrier`/`secure_zero`.
+//! * It **cannot trap**: `div`/`rem` are excluded, because a division by
+//!   zero raises a CPU exception. Hoisting would raise it even when the
+//!   loop never runs. Shifts are allowed: a width too large is undefined
+//!   on x86, but no trap, and the value would be the same throughout the
+//!   loop.
+//! * **No operand is defined inside the loop** (or it was hoisted itself
+//!   already — hence the fixpoint loop).
+//! * Neither result nor operand is a `secret` value (SPEC §9.2), and the
+//!   instruction is not `select`/`barrier`/`secure_zero`.
 //!
-//! ## Sicherheit
+//! ## Safety
 //!
-//! Der Vorkopf **dominiert** die ganze Schleife; damit ist jede hochgezogene
-//! Definition an jeder bisherigen Verwendungsstelle gültig. Die `Val`-Id bleibt
-//! gleich, es wird nichts umgeschrieben — nur die Position ändert sich.
+//! The preheader **dominates** the whole loop; every hoisted definition is
+//! therefore valid at every use site it had so far. The `Val` id stays the
+//! same, nothing gets rewritten — only the position changes.
 //!
-//! Eine Instruktion aus einem Block, der **nicht** bei jedem Durchlauf
-//! ausgeführt wird (etwa in einem `if` im Schleifenrumpf), wird nach dem
-//! Hochziehen unbedingt ausgeführt. Für fallenfreie, reine Rechnungen ist das
-//! verhaltenserhaltend — im schlechtesten Fall rechnet der Vorkopf etwas, das
-//! niemand liest. Genau deshalb ist die Fallenfreiheit oben Bedingung und nicht
+//! One instruction out of a block that does **not** execute on every pass
+//! (say inside some `if` within the loop body) executes unconditionally after
+//! hoisting. For trap-free, pure computations that preserves behaviour — at
+//! worst the preheader computes something nobody reads. Exactly that is why
+//! trap freedom above is a condition and not a nicety.
 //! Kür.
 //!
-//! Verschachtelte Schleifen brauchen hier keine Sonderbehandlung: `opt.rs`
-//! iteriert bis zum Fixpunkt, und was aus der inneren Schleife in deren Vorkopf
-//! gewandert ist, liegt danach im Rumpf der äußeren und wandert in der nächsten
-//! Runde weiter. In `matmul` erreicht `r * n` so den Kopf der `cc`-Schleife.
+//! Nested loops need no special handling here: `opt.rs` iterates up to the
+//! fixpoint, and whatever moved from the inner loop into its preheader lies
+//! afterwards within the body of the outer one and moves on during the next
+//! round. Within `matmul` `r * n` reaches the head of the `cc` loop that way.
 
 use crate::fir::{BinOp, Func, Inst, Op, Term, Val};
 use std::collections::HashSet;
 
-/// Zieht schleifeninvariante Instruktionen in den Vorkopf. Liefert die Anzahl.
+/// Hoists loop invariant instructions into the preheader. Yields the count.
 pub(crate) fn hoist_loop_invariants(f: &mut Func) -> usize {
     let n = f.blocks.len();
     if n < 2 {
@@ -64,7 +64,7 @@ pub(crate) fn hoist_loop_invariants(f: &mut Func) -> usize {
     let dom = crate::mem2reg::dominators(f);
     let mut moved = 0;
 
-    // Rückwärtskanten: b -> h, wobei h den Block b dominiert.
+    // Back edges: b -> h, where h dominates the block b.
     let mut edges: Vec<(usize, usize)> = Vec::new();
     for (b, blk) in f.blocks.iter().enumerate() {
         for s in blk.term.successors() {
@@ -78,7 +78,7 @@ pub(crate) fn hoist_loop_invariants(f: &mut Func) -> usize {
         return 0;
     }
 
-    // Innerste Schleifen zuerst: kleinerer Rumpf = weiter innen.
+    // Innermost loops first: smaller body = further inside.
     let mut loops: Vec<(usize, HashSet<usize>)> = Vec::new();
     for (h, b) in edges {
         loops.push((h, natural_loop(h, b, &preds)));
@@ -95,8 +95,8 @@ pub(crate) fn hoist_loop_invariants(f: &mut Func) -> usize {
     moved
 }
 
-/// Rumpf der natürlichen Schleife zur Rückwärtskante `back -> head`:
-/// `head` plus alles, was `back` erreicht, ohne `head` zu passieren.
+/// Body of the natural loop belonging to the back edge `back -> head`:
+/// `head` plus everything that reaches `back` without passing `head`.
 fn natural_loop(head: usize, back: usize, preds: &[Vec<usize>]) -> HashSet<usize> {
     let mut body = HashSet::new();
     body.insert(head);
@@ -115,10 +115,10 @@ fn natural_loop(head: usize, back: usize, preds: &[Vec<usize>]) -> HashSet<usize
     body
 }
 
-/// Der eine Vorgänger des Kopfes außerhalb der Schleife — und nur, wenn er mit
-/// einem schlichten `br` dorthin springt. Gibt es mehrere Eintritte, wird die
-/// Schleife übersprungen: einen Vorkopf einzuziehen würde die Blocknummern
-/// verschieben, und das ist diesen Durchgang nicht wert.
+/// The one predecessor of the head outside the loop — and only if it jumps
+/// there with a plain `br`. Given several entries the loop gets skipped:
+/// introducing a preheader would shift the block numbers, and that is not
+/// worth this pass.
 fn preheader_of(f: &Func, head: usize, body: &HashSet<usize>, preds: &[Vec<usize>]) -> Option<usize> {
     let mut outer = preds[head].iter().copied().filter(|p| !body.contains(p));
     let p = outer.next()?;
@@ -131,14 +131,14 @@ fn preheader_of(f: &Func, head: usize, body: &HashSet<usize>, preds: &[Vec<usize
     }
 }
 
-/// Darf diese Instruktion überhaupt bewegt werden? (Reinheit + Fallenfreiheit)
+/// May this instruction be moved at all? (purity + trap freedom)
 fn hoistable_op(op: &Op) -> bool {
     if crate::mem2reg::is_untouchable(op) {
         return false;
     }
     match op {
-        // Division und Rest können eine CPU-Ausnahme auslösen — niemals
-        // unbedingt ausführen, nur weil der Wert invariant ist.
+        // Division and remainder can raise a CPU exception — never execute
+        // unconditionally just because the value is invariant.
         Op::Bin(BinOp::Div, _, _) | Op::Bin(BinOp::Rem, _, _) => false,
         Op::Const(_)
         | Op::Bin(..)
@@ -154,7 +154,7 @@ fn hoist_out(f: &mut Func, head: usize, body: &HashSet<usize>, preheader: usize)
     let mut moved = 0;
     let mut buf: Vec<Val> = Vec::new();
     loop {
-        // 1. Welche Werte entstehen in der Schleife?
+        // 1. Which values come about inside the loop?
         let mut in_loop: HashSet<Val> = HashSet::new();
         for &b in body {
             for i in &f.blocks[b].insts {
@@ -163,7 +163,7 @@ fn hoist_out(f: &mut Func, head: usize, body: &HashSet<usize>, preheader: usize)
                 }
             }
         }
-        // 2. Erste bewegbare Instruktion suchen (in Blockreihenfolge).
+        // 2. Look for the first movable instruction (by block order).
         let mut hit: Option<(usize, usize)> = None;
         'search: for &b in {
             let mut v: Vec<usize> = body.iter().copied().collect();
@@ -186,10 +186,10 @@ fn hoist_out(f: &mut Func, head: usize, body: &HashSet<usize>, preheader: usize)
                 if buf.iter().any(|v| in_loop.contains(v) || f.is_secret(*v)) {
                     continue;
                 }
-                // Der Kopf selbst darf seine Bedingung behalten: eine
-                // Instruktion, die der Terminator des Kopfes braucht, ist zwar
-                // hebbar, aber der Gewinn ist null. Wir heben sie trotzdem —
-                // sie ist invariant, also ist auch die Bedingung invariant.
+                // The head itself may keep its condition: one instruction that
+                // the terminator of the head needs is hoistable indeed, yet the
+                // gain is zero. We hoist it anyway — it is invariant, so the
+                // condition is invariant too.
                 let _ = head;
                 hit = Some((b, ix));
                 break 'search;
@@ -199,12 +199,12 @@ fn hoist_out(f: &mut Func, head: usize, body: &HashSet<usize>, preheader: usize)
             Some(x) => x,
             None => break,
         };
-        // 3. Verschieben: ans Ende des Vorkopfs, vor dessen Terminator.
+        // 3. Move: to the end of the preheader, ahead of its terminator.
         let inst: Inst = f.blocks[b].insts.remove(ix);
         f.blocks[preheader].insts.push(inst);
         moved += 1;
         if moved > 10_000 {
-            break; // harte Bremse, kann nicht vorkommen
+            break; // hard brake, cannot happen
         }
     }
     moved
@@ -218,7 +218,7 @@ mod tests {
     /// `bb0: br bb1` · `bb1: cmp/brcond` · `bb2: %x = mul p0,p1 ; br bb1`
     fn loop_with_invariant_multiplication() -> Func {
         let mut f = Func::new("t", vec![FTy::U64, FTy::U64], FTy::U64);
-        // %0, %1 sind Parameter
+        // %0, %1 are parameters
         let c = f.new_val_pub(FTy::U64);
         let m = f.new_val_pub(FTy::U64);
         f.blocks = vec![
@@ -273,7 +273,7 @@ mod tests {
     #[test]
     fn dependent_value_stays_inside() {
         let mut f = loop_with_invariant_multiplication();
-        // %m haengt von einem load ab -> nicht invariant
+        // %m depends on a load -> not invariant
         let l = f.new_val_pub(FTy::U64);
         f.blocks[2].insts.insert(
             0,
