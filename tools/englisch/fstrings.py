@@ -11,7 +11,7 @@ os.chdir(ROOT)
 sys.path.insert(0, 'tools/englisch')
 import quelltext as Q
 
-AUS = ('.git', 'target', '__pycache__', '.test-work', 'testdata', '.gc-mess-work')
+AUS = ('.git', 'target', '__pycache__', '.test-work', 'testdata', '.gc-meas-work')
 KLAM = re.compile(r'\{([^{}]*)\}')
 IDENT = re.compile(r'[A-Za-z_][A-Za-z0-9_]*')
 

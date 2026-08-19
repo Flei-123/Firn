@@ -18,7 +18,7 @@ cd "$(dirname "$0")/../.."
 
 FIRNC="compiler/target/release/firnc"
 export FIRNLIB="$(pwd)/lib"
-WORK=".baum-work"
+WORK=".tree-work"
 SCHNELL=0
 [ "${1:-}" = "--schnell" ] && SCHNELL=1
 

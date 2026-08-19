@@ -21,7 +21,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 os.chdir(ROOT)
 
 MUSTER = re.compile(r'\[\s*(u8|u16)\s*;\s*(\d+)\s*\]\s*=\s*(b?u?)("(?:[^"\\]|\\.)*")')
-AUS = ('.git', 'target', '__pycache__', '.test-work', 'testdata', '.gc-mess-work',
+AUS = ('.git', 'target', '__pycache__', '.test-work', 'testdata', '.gc-meas-work',
        'lexneg')   # tests/lexneg enthaelt ABSICHTLICH kaputte Literale
 
 
