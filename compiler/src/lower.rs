@@ -633,6 +633,30 @@ impl<'a> Lower<'a> {
             Some(n) if !self.info.fns.contains_key(name) => n,
             _ => name,
         };
+        // HOOK impl: `x.m(a)` steht als `"methode m"` im Baum. Die Aufloesung
+        // wird hier NEU abgeleitet — aus dem Typ des Empfaengers und dem
+        // Methodennamen, genau wie in `sema` (impls.rs, Runde 45). Verlangt
+        // die Methode einen Zeiger und liegt der Empfaenger als Wert vor,
+        // wird seine ADRESSE uebergeben.
+        let aufgeloest;
+        let mut empfaenger_adresse = false;
+        let name: &str = match crate::impls::methodenname(name) {
+            None => name,
+            Some(m) => {
+                let et = match args.first() {
+                    Some(e) => self.ty_of(e),
+                    None => return self.ice(span, "methodenaufruf ohne empfaenger"),
+                };
+                match crate::impls::ziel(&self.info, m, &et) {
+                    Some((voll, adr)) => {
+                        aufgeloest = voll;
+                        empfaenger_adresse = adr;
+                        &aufgeloest
+                    }
+                    None => return self.ice(span, "unbekannte methode im lowering"),
+                }
+            }
+        };
         let sig = match self.info.fns.get(name) {
             Some(s) => s.clone(),
             None => return self.ice(span, "unbekannte funktion im lowering"),
@@ -657,7 +681,13 @@ impl<'a> Lower<'a> {
                 vals.push(t);
             }
         }
-        for a in args {
+        for (i, a) in args.iter().enumerate() {
+            // HOOK impl: der Empfaenger geht als Adresse hinein (impls.rs)
+            if i == 0 && empfaenger_adresse {
+                let adr = self.lower_addr(a)?;
+                vals.push(adr);
+                continue;
+            }
             // HOOK fehlerunionen: implizite Umwandlung eines Arguments (lower_errors.rs)
             let t = match crate::lower_errors::hook_arg_type(a) {
                 Some(t) => t,
