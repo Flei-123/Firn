@@ -1,63 +1,64 @@
-# RUN.md — bauen, starten, selbst nachmessen
+# RUN.md -- build it, run it, measure it yourself
 
-Alles hier ist **so ausgeführt worden**, wie es dasteht (14.08.2026, AMD EPYC
-7571, Linux x86_64, rustc 1.99.0-nightly, binutils `as`/`ld`). Nur relative
-Pfade, alles innerhalb dieses Ordners.
+Everything here **has been run** exactly as it stands (2026-08-14, AMD EPYC
+7571, Linux x86_64, rustc 1.99.0-nightly, binutils `as`/`ld`). Relative paths
+only, everything inside this directory.
 
-## 0. Voraussetzungen
+## 0. Prerequisites
 
-* `cargo`/`rustc` (nur zum Bauen des Compilers und der Messlatten — der
-  Compiler selbst hat **keine** externen Crates)
-* GNU `as` und `ld` (Assembler und Linker, **kein** C-Compiler als Backend)
-* `python3` (nur für die Werkbänke: Benchmarks, Einbinder)
-* `gdb` (nur für den Debugger-Nachweis)
+* `cargo`/`rustc` (only to build the compiler and the yardsticks -- the
+  compiler itself has **no** external crates)
+* GNU `as` and `ld` (assembler and linker, **no** C compiler as a backend)
+* `python3` (only for the workbenches: benchmarks, generators)
+* `gdb` (only for the debugger proof)
 
-## 1. Compiler bauen
+## 1. Build the compiler
 
 ```sh
 cargo build --release --manifest-path compiler/Cargo.toml
 ```
 
-Erwartung: **null Warnungen**, Binary unter `compiler/target/release/firnc`.
+Expected: **zero warnings**, binary at `compiler/target/release/firnc`.
 
-## 2. Ein Programm übersetzen und ausführen
+## 2. Compile and run a program
 
 ```sh
 compiler/target/release/firnc -o /tmp/hello examples/hello.fi
 /tmp/hello ; echo "exit=$?"
 ```
 
-Weitere Betriebsarten:
+Further modes:
 
 ```sh
-firnc --no-opt -o /tmp/a datei.fi     # ohne Optimierer (gleiches Ergebnis!)
-firnc --emit=asm datei.fi             # x86_64-Assembler (Intel-Syntax)
-firnc --emit=fir datei.fi             # eigene IR, lesbar
+firnc --no-opt -o /tmp/a file.fi      # without the optimizer (same result!)
+firnc --emit=asm file.fi              # x86_64 assembly (Intel syntax)
+firnc --emit=fir file.fi              # own IR, readable
 firnc --help
 ```
 
-Mehrere Dateien zu **einem** Binary (Modulsystem): die Wurzeldatei angeben,
-`import pfad.modul` löst relativ zu ihrem Verzeichnis auf:
+Several files into **one** binary (module system): name the root file,
+`import path.module` resolves relative to its directory:
 
 ```sh
 compiler/target/release/firnc -o /tmp/mod tests/110_module.fi
-/tmp/mod ; echo "exit=$?"     # exit=60, so steht es in Zeile 1 der Datei
+/tmp/mod ; echo "exit=$?"     # exit=60, as stated in line 1 of the file
 ```
 
-## 3. Die gesamte Testsuite
+## 3. The whole test suite
 
 ```sh
 bash test.sh
 ```
 
-Gemessenes Ergebnis dieses Stands: **PASS 485/485**
-(143 Programme × 3 Baustufen `opt` / `--no-opt` / `--opt-level=dev-fast` = 429,
-51 Negativtests, dazu je ein Abschnittsnachweis für Optimierer (`test_opt.sh`,
-seinerseits 41 Prüfungen), Ergebnisort-Garantie, Architekturwächter,
-Symbolschema und HTML5-Tokenizer gegen html5lib; ausserdem 122 Rust-
-Modultests, die nicht einzeln in PASS zählen). Laufzeit ca. 4 Minuten.
+Measured result for this state: **PASS 485/485**
+(143 programs x 3 build stages `opt` / `--no-opt` / `--opt-level=dev-fast` = 429,
+51 negative tests, plus one section proof each for the optimizer (`test_opt.sh`,
+41 checks in its own right), the result-location guarantee, the architecture
+guards, the symbol scheme and the HTML5 tokenizer against html5lib; on top of
+that 122 Rust module tests, which do not count individually towards PASS).
+Runtime about 4 minutes.
 
-Maschinenlesbar (CI, Ziel 9 / ABNAHME Punkt 4 A):
+Machine-readable (CI, goal 9 / ACCEPTANCE item 4 A):
 
 ```sh
 cargo build --release --manifest-path tools/testrunner/Cargo.toml
@@ -66,37 +67,37 @@ python3 -c "import json;d=json.load(open('/tmp/firn.json'));print(d['total'],d['
 # 337 337 0 1.0
 ```
 
-(337 statt 485: der Runner enthält weder den Optimierernachweis `test_opt.sh`
-noch die Abschnitte 6–9 von `test.sh`.)
+(337 instead of 485: the runner contains neither the optimizer proof
+`test_opt.sh` nor sections 6-9 of `test.sh`.)
 
-## 4. Die Nachweise einzeln — das, was die Jury prüft
+## 4. The proofs one by one -- what the jury checks
 
-| Was | Befehl | Gemessenes Ergebnis |
+| What | Command | Measured result |
 |---|---|---|
-| **Vollständigkeitsprüfung `match`** | `firnc -o /tmp/m tests/neg/match_missing_variant.fi` | `error: 'match' ist nicht vollstaendig: die variante … ist nicht abgedeckt` **mit Zeile:Spalte**, Exit ≠ 0 |
-| **Sprungtabelle bei 32 Zuständen** | `firnc --emit=asm -o /tmp/zm.s tests/230_zustandsmaschine.fi && grep -c "jmp qword ptr" /tmp/zm.s` | `1` — ein indirekter Sprung über eine `.quad`-Tabelle, keine Vergleichskette |
-| **WTF-16, ungepaartes Surrogat** | `firnc -o /tmp/s tests/300_str16_surrogate.fi && /tmp/s` | `3 97 55296 98 0 0 5 97 239 191 189 98 5 97 237 160 128 98 1 55296` — `0xD800` bleibt erhalten, `to_utf8()` liefert nichts, `to_utf8_lossy()` liefert `EF BF BD` |
-| **strtod/dtoa Härtefälle** | `firnc -o /tmp/h tests/304_strtod_hardcases.fi && /tmp/h` | 26 Bitmuster, beginnend mit `4591870180066957722` (= `0.1`); die Sollwerte stehen als `// expect_out:` in Zeile 1 derselben Datei |
-| **100.000 Doubles hin und zurück** | `bash tools/dtoa_vectors/run.sh 100000 4242` | `OK: 100000/100000 bitgleich zurück, 100000/100000 kürzeste Darstellung wie Rust` (7,9 s) |
-| **Benchmarks gegen Rust `-O`** | `BENCH_RUNS=5 bash bench/run.sh` | Median **3,36×** langsamer (Spanne 1,57×–6,04×), Tabelle in `bench/RESULTS.md`. **Ziel ≤ 2× verfehlt** |
-| **Optimierer wirkt** | `bash test_opt.sh` | `PASS 41/41` (FIR vorher/nachher) |
-| **Debugger zeigt `.fi`-Zeilen** | `firnc --no-opt -o /tmp/gdbdemo docs/gdb_beispiel.fi && gdb -batch -ex "break summe" -ex run -ex bt /tmp/gdbdemo` | `Breakpoint 1, summe () at docs/gdb_beispiel.fi:2` und `#1 … main () at docs/gdb_beispiel.fi:11` |
-| **Erzeugte Str-Tests sind aktuell** | `python3 tools/strlib/expand.py --check` | `expand.py: 0 veraltete Dateien` |
-| **Sauberkeit** | `grep -rn "todo!\|unimplemented!" compiler/src` | keine Treffer |
+| **Exhaustiveness check for `match`** | `firnc -o /tmp/m tests/neg/match_missing_variant.fi` | `error: 'match' is not exhaustive: ... not covered` **with line:column**, exit != 0 |
+| **Jump table for 32 states** | `firnc --emit=asm -o /tmp/zm.s tests/230_zustandsmaschine.fi && grep -c "jmp qword ptr" /tmp/zm.s` | `1` -- one indirect jump through a `.quad` table, no comparison chain |
+| **WTF-16, unpaired surrogate** | `firnc -o /tmp/s tests/300_str16_surrogate.fi && /tmp/s` | `3 97 55296 98 0 0 5 97 239 191 189 98 5 97 237 160 128 98 1 55296` -- `0xD800` is preserved, `to_utf8()` returns nothing, `to_utf8_lossy()` returns `EF BF BD` |
+| **strtod/dtoa hard cases** | `firnc -o /tmp/h tests/304_strtod_hardcases.fi && /tmp/h` | 26 bit patterns, starting with `4591870180066957722` (= `0.1`); the expected values are given as `// expect_out:` in line 1 of the same file |
+| **100,000 doubles there and back** | `bash tools/dtoa_vectors/run.sh 100000 4242` | `OK: 100000/100000 bitgleich zurueck, 100000/100000 kuerzeste Darstellung wie Rust` (7.9 s) |
+| **Benchmarks against Rust `-O`** | `BENCH_RUNS=5 bash bench/run.sh` | median **3.36x** slower (range 1.57x-6.04x), table in `bench/RESULTS.md`. **Target <= 2x missed** |
+| **The optimizer has an effect** | `bash test_opt.sh` | `PASS 41/41` (FIR before/after) |
+| **The debugger shows `.fi` lines** | `firnc --no-opt -o /tmp/gdbdemo docs/gdb_beispiel.fi && gdb -batch -ex "break summe" -ex run -ex bt /tmp/gdbdemo` | `Breakpoint 1, summe () at docs/gdb_beispiel.fi:2` and `#1 ... main () at docs/gdb_beispiel.fi:11` |
+| **The generated Str tests are current** | `python3 tools/strlib/expand.py --check` | `expand.py: 0 veraltete Dateien` |
+| **Cleanliness** | `grep -rn "todo!\|unimplemented!" compiler/src` | no hits |
 
 
-## 4a. HTML5-Tokenizer und Fehlerunionen (Runde 3)
+## 4a. HTML5 tokenizer and error unions (round 3)
 
 ```sh
 bash tools/tokenizer/run.sh
 ```
 
-Baut den Tokenizer aus `lib/html/*.fi` in **drei** Baustufen, fährt alle
-**6.810** html5lib-Fälle, prüft, dass alle drei Baustufen dieselbe Bilanz
-liefern, und misst den Durchsatz gegen html5ever. Es werden **zwei** Quoten
-ausgewiesen: nur Tokenstrom (linke Spalte) und zusätzlich mit Vergleich der
-Parse-Fehlercodes (rechte Spalte, `harness.py --mit-fehlern`). Gemessenes
-Ergebnis (14.08.2026):
+Builds the tokenizer from `lib/html/*.fi` in **three** build stages, runs all
+**6,810** html5lib cases, checks that all three build stages produce the same
+balance, and measures throughput against html5ever. **Two** rates are
+reported: token stream only (left column) and, in addition, with the parse
+error codes compared (right column, `harness.py --mit-fehlern`). Measured
+result (2026-08-14):
 
 ```
 GESAMT                      6810 /  6810 100.00 %    6809 /  6810  99.99 %
@@ -112,109 +113,110 @@ GESAMT                      6810 /  6810 100.00 %    6809 /  6810  99.99 %
       Faktor    : 5.72x langsamer als html5ever (Abnahmeziel <= 2.00x)
 ```
 
-Gemessen wird auf **zwei** Korpora: `html5lib` (die Eingaben der Testsuite,
-absichtlich pathologisch — fast nur Grenzfälle, schlechtester Fall) und
-`realweb` (acht gespeicherte echte Seiten, `testdata/realweb/MANIFEST.md`).
-Zwei weitere vollständige Läufe ergaben 2,25× / 2,79× (html5lib) und
-7,72× / 7,84× (realweb), ein fünfter 3,09× bzw. 6,39×; Spanne also
-2,25×–3,09× (html5lib) und 5,72×–8,31× (realweb). Die Bilanz war in allen Läufen und in allen drei
-Baustufen identisch, der Durchsatz schwankt um ~30 %.
+Measurements are taken on **two** corpora: `html5lib` (the inputs of the test
+suite, deliberately pathological -- almost nothing but edge cases, the worst
+case) and `realweb` (eight saved real pages, `testdata/realweb/MANIFEST.md`).
+Two further complete runs gave 2.25x / 2.79x (html5lib) and 7.72x / 7.84x
+(realweb), a fifth 3.09x and 6.39x respectively; the range is therefore
+2.25x-3.09x (html5lib) and 5.72x-8.31x (realweb). The balance was identical in
+every run and in all three build stages, throughput varies by about 30 %.
 
-Schritt 0 von `run.sh` beweist, dass die Erwartungen nicht angefasst wurden:
+Step 0 of `run.sh` proves that the expectations were not touched:
 
 ```sh
-bash tools/tokenizer/verifiziere_testdaten.sh              # sha256 gegen den Repo-Satz
-bash tools/tokenizer/verifiziere_testdaten.sh --gegen-upstream   # zusätzlich gegen GitHub
+bash tools/tokenizer/verifiziere_testdaten.sh              # sha256 against the repo set
+bash tools/tokenizer/verifiziere_testdaten.sh --gegen-upstream   # additionally against GitHub
 ```
 
-Schritt 2b von `run.sh` ist die **Gegenprobe ohne XML-Anpassung**:
+Step 2b of `run.sh` is the **counter-check without the XML adaptation**:
 
 ```
 python3 tools/tokenizer/harness.py .tokenizer-work/tokenize --ohne-xml-modus
 GESAMT                           6807 /   6810    99.96 %
 ```
 
-Die XML-Anpassung (`xmlViolationTests`) ist ein optionaler Modus des Treibers
-(Auftragsflagge Bit 0, `tools/tokenizer/LOG.md`); der Harness setzt sie
-nur für die vier Fälle aus `xmlViolation.test`, der HTML-Pfad bleibt gleich.
+The XML adaptation (`xmlViolationTests`) is an optional mode of the driver
+(job flag bit 0, `tools/tokenizer/LOG.md`); the harness enables it only for the
+four cases from `xmlViolation.test`, the HTML path stays the same.
 
-Die Messlatte html5ever muss dafür einmal gebaut werden (eigenes Cargo-Projekt,
-**keine** Abhängigkeit des Compilers):
+The html5ever yardstick has to be built once for this (a Cargo project of its
+own, **not** a dependency of the compiler):
 
 ```sh
 cargo build --release --manifest-path bench/tokenizer/Cargo.toml
 ```
 
-Ohne sie läuft `run.sh` weiter und weist die fehlende Messlatte aus.
+Without it `run.sh` keeps running and reports the missing yardstick.
 
-Einzelne Nachweise:
+Individual proofs:
 
-| Was | Befehl | Gemessenes Ergebnis |
+| What | Command | Measured result |
 |---|---|---|
-| **Tokenizer ist Firn** | `wc -l lib/html/*.fi tools/tokenizer/harness.py` | 8.647 Zeilen `.fi` gegen 295 Zeilen Harness; die Zustandsmaschine steht in `lib/html/tokenizer.fi` (1.516 Zeilen) |
-| **Sprungtabelle über 73 Zustände** | `firnc --emit=asm -o /tmp/tok.s lib/html/tokenize_main.fi && grep -c "jmp qword ptr" /tmp/tok.s` | `1` — indirekter Sprung über `.Ltbl_tokenizer__tokenize_0` |
-| **Zeichenreferenzen einzeln** | `python3 tools/tokenizer/check_entities.py` | `bestanden: 4657 / 4657` |
-| **Fehlerunion: `catch` liefert Ersatz** | `firnc -o /tmp/e tests/403_catch_replacement.fi && /tmp/e; echo $?` | `0` |
-| **Fehlerunion: `try` reicht durch** | `firnc -o /tmp/e tests/401_try_chain.fi && /tmp/e; echo $?` | der in Zeile 1 als `// expect_exit:` eingetragene Wert |
-| **Verworfenes `!T` ist ein Fehler** | `firnc -o /tmp/e tests/neg/err_discarded.fi` | `error: das ergebnis darf nicht verworfen werden: der typ 'E!i32' ist mit #[must_consume] gekennzeichnet` mit Zeile:Spalte |
-| **`try` außerhalb einer Fehlerfunktion** | `firnc -o /tmp/e tests/neg/err_try_outside.fi` | `error: 'try' ist nur in einer funktion mit fehlerunions-rueckgabetyp erlaubt, diese liefert i32` mit `8:13` |
+| **The tokenizer is Firn** | `wc -l lib/html/*.fi tools/tokenizer/harness.py` | 8,647 lines of `.fi` against 295 lines of harness; the state machine sits in `lib/html/tokenizer.fi` (1,516 lines) |
+| **Jump table over 73 states** | `firnc --emit=asm -o /tmp/tok.s lib/html/tokenize_main.fi && grep -c "jmp qword ptr" /tmp/tok.s` | `1` -- indirect jump through `.Ltbl_tokenizer__tokenize_0` |
+| **Character references one by one** | `python3 tools/tokenizer/check_entities.py` | `bestanden: 4657 / 4657` |
+| **Error union: `catch` delivers the fallback** | `firnc -o /tmp/e tests/403_catch_replacement.fi && /tmp/e; echo $?` | `0` |
+| **Error union: `try` propagates** | `firnc -o /tmp/e tests/401_try_chain.fi && /tmp/e; echo $?` | the value entered in line 1 as `// expect_exit:` |
+| **A discarded `!T` is an error** | `firnc -o /tmp/e tests/neg/err_discarded.fi` | `error: the result must not be discarded: the type 'E!i32' is marked with #[must_consume]` with line:column |
+| **`try` outside an error-returning function** | `firnc -o /tmp/e tests/neg/err_try_outside.fi` | `error: 'try' is only allowed in a function with an error union return type, this one returns i32` with `8:13` |
 
-## 4b. Freistehend übersetzen: `profile kernel` (Runde 52)
+## 4b. Freestanding compilation: `profile kernel` (round 52)
 
 ```sh
 bash tools/freestanding/run.sh
 ```
 
-Gemessenes Ergebnis (19.08.2026): **41 bestanden, 0 fehlgeschlagen** — darunter
-ein echter QEMU-Boot des Kernel-Beispiels mit **beiden** Compilern.
+Measured result (2026-08-19): **41 passed, 0 failed** -- among them a real QEMU
+boot of the kernel example with **both** compilers.
 
-| Was | Befehl | Gemessenes Ergebnis |
+| What | Command | Measured result |
 |---|---|---|
-| **ELF-Objekt statt Binary** | `firnc -o /tmp/k.o demos/kernel/core.fi && readelf -h /tmp/k.o \| grep Type` | `REL (Relocatable file)` — kein `ld`, kein `_start` |
-| **Keine undefinierten Symbole** | `nm -u /tmp/k.o` | leer |
-| **Kein Systemaufruf im Code** | `objdump -d /tmp/k.o \| grep -c syscall` | `0` |
-| **Bootet** | `ld -n -T demos/kernel/linker.ld --defsym=KERN_START=_F0.kern_start -o /tmp/k.elf /tmp/start.o /tmp/k.o && objcopy -O elf32-i386 /tmp/k.elf /tmp/k.mb && qemu-system-x86_64 -kernel /tmp/k.mb -serial stdio -display none` | `FIRN: profile kernel ist` / `freistehend.` |
-| **`syscall` im Kernel-Profil** | `firnc -o /tmp/x tests/neg/free_syscall_in_kernel.fi` | `error: 'syscall' gibt es im profil 'kernel' nicht` mit Zeile:Spalte |
-| **Gleitkomma ohne `#[allow_fp]`** | `firnc -o /tmp/x tests/neg/free_float_without_allow_fp.fi` | `error: gleitkomma (der typ f64) ist im profil 'kernel' nur mit #[allow_fp] erlaubt` |
-| **`#[interrupt]` ist nicht aufrufbar** | `firnc -o /tmp/x tests/neg/free_interrupt_call.fi` | `error: 'ih' ist ein interrupt-einsprungpunkt und kann nicht aufgerufen werden` |
-| **volatile hält** | `firnc --emit=fir tools/freestanding/volatile.fi \| grep -c 'asm.void "pause"'` | `3` — drei wörtlich gleiche Blöcke, kein CSE |
+| **ELF object instead of a binary** | `firnc -o /tmp/k.o demos/kernel/core.fi && readelf -h /tmp/k.o \| grep Type` | `REL (Relocatable file)` -- no `ld`, no `_start` |
+| **No undefined symbols** | `nm -u /tmp/k.o` | empty |
+| **No system call in the code** | `objdump -d /tmp/k.o \| grep -c syscall` | `0` |
+| **It boots** | `ld -n -T demos/kernel/linker.ld --defsym=KERN_START=_F0.kern_start -o /tmp/k.elf /tmp/start.o /tmp/k.o && objcopy -O elf32-i386 /tmp/k.elf /tmp/k.mb && qemu-system-x86_64 -kernel /tmp/k.mb -serial stdio -display none` | `FIRN: profile kernel ist` / `freestanding.` |
+| **`syscall` in the kernel profile** | `firnc -o /tmp/x tests/neg/free_syscall_in_kernel.fi` | `error: 'syscall' does not exist in profile 'kernel'` with line:column |
+| **Floating point without `#[allow_fp]`** | `firnc -o /tmp/x tests/neg/free_float_without_allow_fp.fi` | `error: floating point (the type f64) is allowed in profile 'kernel' only with #[allow_fp] ...` |
+| **`#[interrupt]` cannot be called** | `firnc -o /tmp/x tests/neg/free_interrupt_call.fi` | `error: 'ih' is an interrupt entry point and cannot be called` |
+| **volatile holds** | `firnc --emit=fir tools/freestanding/volatile.fi \| grep -c 'asm.void "pause"'` | `3` -- three literally identical blocks, no CSE |
 
-Ausführlich in `docs/RUNDE52.md`.
+In detail in `docs/RUNDE52.md`.
 
-## 5. Was NICHT läuft, weil es nicht gebaut wurde
+## 5. What does NOT work, because it was not built
 
-Ehrlich und vollständig (ausführlich in `ABNAHME.md`):
+Honestly and completely (in detail in `ACCEPTANCE.md`):
 
-* **Constant-Time — teilweise umgesetzt, Punkt bleibt offen.** Gebaut sind die
-  drei Primitive (`compiler/src/ct.rs`): `select(b, a, c)` → `cmov` ohne
-  bedingten Sprung, `barrier(x)`, `secure_zero(p, n)` (überlebt den
-  Optimierer). Nachweis: `tests/430_ct_select.fi` … `tests/433_ct_secure_zero.fi`
-  in drei Baustufen, `tests/neg/ct_*.fi` (5 Negativtests).
-  **Nicht** umgesetzt: `secret[T]`, Ausbreitung der Markierung, `declassify`,
-  `u128`, `mul_wide`, Wirkung von `#[constant_time]`. Ohne `secret[T]` gibt es
-  keine Typprüfung auf Geheimnisdaten. Prüfbar:
-  `firnc -o /tmp/x tests/neg/int_secret_not_implemented.fi` meldet
-  `'secret[T]' ist in Stufe 0 nicht umgesetzt` mit Zeile/Spalte.
-  Siehe `ABNAHME.md` Punkt 6.
-* **GC, `Rc`/`Gc`, DOM-Prototyp, RSS-Dauerlauf** — nicht umgesetzt. Prüfbar:
+* **Constant time -- partly implemented, the item stays open.** Built are the
+  three primitives (`compiler/src/ct.rs`): `select(b, a, c)` -> `cmov` without a
+  conditional jump, `barrier(x)`, `secure_zero(p, n)` (survives the
+  optimizer). Proof: `tests/430_ct_select.fi` ... `tests/433_ct_secure_zero.fi`
+  in three build stages, `tests/neg/ct_*.fi` (5 negative tests).
+  **Not** implemented: `secret[T]`, propagation of the marking, `declassify`,
+  `u128`, `mul_wide`, any effect of `#[constant_time]`. Without `secret[T]`
+  there is no type check for secret data. Verifiable:
+  `firnc -o /tmp/x tests/neg/int_secret_not_implemented.fi` reports
+  `secret[T] and the constant-time primitives (SPEC 9) are not implemented`
+  with line/column.
+  See `ACCEPTANCE.md` item 6.
+* **GC, `Rc`/`Gc`, DOM prototype, RSS soak test** -- not implemented. Verifiable:
   `tests/neg/int_gc_not_implemented.fi`.
-* **HTML5-Tokenizer: gebaut.** Bestandene html5lib-Fälle:
-  **6.810 von 6.810 (100,00 %)** im Tokenstrom-Vergleich und
-  **6.809 von 6.810 (99,99 %)**, wenn zusätzlich die `errors`-Einträge der
-  Suite (Parse-Fehlercode, `line`, `col`) verglichen werden
-  (`harness.py --mit-fehlern`, Schritt 2a von `run.sh`). Der eine Fehlschlag
-  ist `xmlViolation.test #0`. Die XML-Anpassung der vier `xmlViolationTests`
-  ist als optionaler Modus umgesetzt (Gegenprobe `--ohne-xml-modus`: 6.807).
-  Geschwindigkeitsziel ≤ 2× **verfehlt**: Spanne 2,25×–3,09× (Korpus
-  `html5lib`) und 5,72×–8,31× (Korpus `realweb`). Siehe Abschnitt 4a.
-* **`defer` / `errdefer`, abgeleitete Fehlermenge `!T`, `catch |e| { Block }`**
-  — nicht umgesetzt, siehe `SPEC.md` §14.1.fehlerunionen F1–F10.
-* **Selbst-Hosting, Paketverwaltung, `comptime`/UCD-Tabelle** — offen,
-  siehe `docs/SELBSTHOSTING.md` und `ABNAHME.md` Punkte 1, 5, 6.
+* **HTML5 tokenizer: built.** html5lib cases passed:
+  **6,810 of 6,810 (100.00 %)** in the token stream comparison and
+  **6,809 of 6,810 (99.99 %)** when the `errors` entries of the suite (parse
+  error code, `line`, `col`) are compared as well
+  (`harness.py --mit-fehlern`, step 2a of `run.sh`). The single failure is
+  `xmlViolation.test #0`. The XML adaptation of the four `xmlViolationTests` is
+  implemented as an optional mode (counter-check `--ohne-xml-modus`: 6,807).
+  The speed target of <= 2x is **missed**: range 2.25x-3.09x (corpus
+  `html5lib`) and 5.72x-8.31x (corpus `realweb`). See section 4a.
+* **`defer` / `errdefer`, inferred error set `!T`, `catch |e| { block }`**
+  -- not implemented, see `SPEC.md` 14.1.error_unions F1-F10.
+* **Self-hosting, package management, `comptime`/UCD table** -- open,
+  see `docs/SELBSTHOSTING.md` and `ACCEPTANCE.md` items 1, 5, 6.
 
-## 6. Aufräumen
+## 6. Cleaning up
 
-Alle Arbeitsverzeichnisse sind wegwerfbar und stehen in `.gitignore`:
+All working directories are disposable and listed in `.gitignore`:
 
 ```sh
 rm -rf .test-work .opt-work .strwork .dtoa-work .testrunner-work .tokenizer-work bench/.work
