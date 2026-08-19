@@ -82,6 +82,11 @@ fn hat_gc(c: *mut Cg) -> bool {
     if (*c).gcr == 0 {
         return false
     }
+    // Runde 49: auch ohne `gc class` braucht ein Programm mit Faeden den
+    // Zustandsblock (gc.rs: `hat_klassen() || laufzeit_aktiv()`).
+    if gc.gc_laufzeit(gcg(c)) != 0 as usize {
+        return true
+    }
     return gc.gc_hat_klassen(gcg(c))
 }
 
@@ -938,6 +943,76 @@ fn emit_atomadd(c: *mut Cg, addr: u32, val: u32, dst: u32) {
     speichere_slot(c, slot_von(c, dst), R_AX)
 }
 
+// `Op::AtomicCas` (faden.rs, RUNDE 49): `lock cmpxchg [rcx], rdx` — eine
+// Instruktion. rax traegt den erwarteten Wert und danach den vorgefundenen.
+fn emit_atomcas(c: *mut Cg, addr: u32, erw: u32, neu: u32, dst: u32) {
+    lade_wert(c, R_CX, addr)
+    lade_wert(c, R_DX, neu)
+    lade_wert(c, R_AX, erw)
+    var x: [u8; 33] = "lock cmpxchg qword ptr [rcx], rdx"
+    roh(c, (&x[0]) as u64, 33)
+    speichere_slot(c, slot_von(c, dst), R_AX)
+}
+
+// `Op::ThreadSelf` (faden.rs, RUNDE 49): der eigene Fadenblock aus `fs:0`.
+// Vor `arch_prctl(ARCH_SET_FS)` ist das ein Zugriff auf Adresse 0 — die
+// Laufzeit setzt die Basis, bevor sie den Wert je liest (lib/gc/gc.fi).
+fn emit_tls(c: *mut Cg, dst: u32) {
+    var x: [u8; 23] = "mov rax, qword ptr fs:0"
+    roh(c, (&x[0]) as u64, 23)
+    speichere_slot(c, slot_von(c, dst), R_AX)
+}
+
+// `Op::ThreadSpawn` (faden.rs, RUNDE 49): `clone(2)` mit Trampolin. Wort fuer
+// Wort dieselbe Folge wie in Stufe 0 (compiler/src/faden.rs::spawn_sequenz);
+// nur das Symbol des Einstiegs traegt das Praefix dieser Stufe.
+//
+// `1:` ist eine NUMERISCHE Marke des Assemblers — `jnz 1f` springt zur
+// naechsten `1:` nach vorn. Damit braucht die Folge keinen Zaehler und darf
+// beliebig oft im selben Modul stehen.
+fn emit_spawn(c: *mut Cg, arg: u32, stapel: u32, ctid: u32, dst: u32) {
+    lade_wert(c, 4, arg)
+    lade_wert(c, 3, stapel)
+    lade_wert(c, R_DX, ctid)
+    var z1: [u8; 11] = "sub rsi, 16"
+    roh(c, (&z1[0]) as u64, 11)
+    var z2: [u8; 24] = "mov qword ptr [rsi], rdi"
+    roh(c, (&z2[0]) as u64, 24)
+    var z3: [u8; 12] = "mov r10, rdx"
+    roh(c, (&z3[0]) as u64, 12)
+    var z4: [u8; 16] = "mov rdi, 3477248"
+    roh(c, (&z4[0]) as u64, 16)
+    var z5: [u8; 12] = "xor r8d, r8d"
+    roh(c, (&z5[0]) as u64, 12)
+    var z6: [u8; 11] = "mov eax, 56"
+    roh(c, (&z6[0]) as u64, 11)
+    var z7: [u8; 7] = "syscall"
+    roh(c, (&z7[0]) as u64, 7)
+    var z8: [u8; 13] = "test rax, rax"
+    roh(c, (&z8[0]) as u64, 13)
+    var z9: [u8; 6] = "jnz 1f"
+    roh(c, (&z9[0]) as u64, 6)
+    var za: [u8; 24] = "mov rdi, qword ptr [rsp]"
+    roh(c, (&za[0]) as u64, 24)
+    var zb: [u8; 11] = "add rsp, 16"
+    roh(c, (&zb[0]) as u64, 11)
+    var zc: [u8; 12] = "xor ebp, ebp"
+    roh(c, (&zc[0]) as u64, 12)
+    var zd: [u8; 25] = "call _F1.__faden_einstieg"
+    roh(c, (&zd[0]) as u64, 25)
+    var ze: [u8; 12] = "mov edi, eax"
+    roh(c, (&ze[0]) as u64, 12)
+    var zf: [u8; 11] = "mov eax, 60"
+    roh(c, (&zf[0]) as u64, 11)
+    roh(c, (&z7[0]) as u64, 7)
+    var zg: [u8; 3] = "ud2"
+    roh(c, (&zg[0]) as u64, 3)
+    var zh: [u8; 2] = "1:"
+    w(c, (&zh[0]) as u64, 2)
+    nl(c)
+    speichere_slot(c, slot_von(c, dst), R_AX)
+}
+
 fn emit_copymem(c: *mut Cg, ziel: u32, quelle: u32, groesse: u64) {
     lade_slot(c, 4, slot_von(c, ziel))
     lade_slot(c, 3, slot_von(c, quelle))
@@ -1174,6 +1249,18 @@ fn emit_inst(c: *mut Cg, fnr: u32, i: u32) {
     }
     if art == fir.O_ATOMADD {
         emit_atomadd(c, fir.i_a_von(f, i), fir.i_b_von(f, i), dst)
+        return
+    }
+    if art == fir.O_ATOMCAS {
+        emit_atomcas(c, fir.i_a_von(f, i), fir.i_b_von(f, i), fir.i_c_von(f, i), dst)
+        return
+    }
+    if art == fir.O_SPAWN {
+        emit_spawn(c, fir.i_a_von(f, i), fir.i_b_von(f, i), fir.i_c_von(f, i), dst)
+        return
+    }
+    if art == fir.O_TLS {
+        emit_tls(c, dst)
         return
     }
     if art == fir.O_CALLI {
