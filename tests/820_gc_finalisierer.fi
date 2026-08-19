@@ -1,0 +1,211 @@
+// expect_exit: 0
+// RUNDE 47 — FINALISIERER (SPEC 3.5.3 `S4`).
+//
+// Geprueft wird, was zugesagt ist:
+//   A  Ein registrierter Finalisierer LAEUFT, wenn das Objekt unerreichbar
+//      wird — mit der richtigen Aufraeumart, und das Objekt ist dabei noch
+//      lesbar (seine Nicht-Zeiger-Felder).
+//   B  Vor dem Aufruf sind ALLE Gc-Felder des Objekts genullt (die Zusage,
+//      die Wiederbelebung unmoeglich macht: ein Finalisierer sieht nie einen
+//      Zeiger auf ein Nachbarobjekt, das schon eingesammelt sein kann).
+//   C  HOECHSTENS EINMAL je Objekt.
+//   D  Ein ERREICHBARES Objekt wird nicht finalisiert.
+//   E  Massenlauf: der Verteiler des Programms lief genau so oft, wie der
+//      Sammler zaehlt, und die Warteschlange ist danach leer.
+//
+// Der Finalisierer kann sein Ergebnis nirgends ablegen — Stufe 0 hat keine
+// globalen Veraenderlichen. Deshalb traegt jedes Objekt einen ROHEN Zeiger
+// auf eine mmap-Seite; rohe Zeiger werden absichtlich NICHT genullt, nur
+// Gc[T] und GcWeak[T].
+
+const T_SYS_MMAP: i64 = 9
+const T_PROT_RW: i64 = 3
+const T_MAP_ANON: i64 = 34
+
+const Z_ANZAHL: u64 = 0
+const Z_SUMME: u64 = 8
+const Z_ARTEN: u64 = 16
+const Z_UNGENULLT: u64 = 24
+
+gc class Griff {
+    naechster: Gc[Griff],
+    zaehler: *mut u8,
+    nummer: u64,
+}
+
+// DER VERTEILER. Weil diese Wurzeldatei ihn selbst deklariert, laesst der
+// Compiler seine leere Voreinstellung weg (gc.rs::laufzeit_quelle).
+fn __gc_finalisiere(art: u64, p: *mut u8) {
+    let g: Gc[Griff] = p as Gc[Griff]
+    let z: u64 = g.zaehler as u64
+    if z == 0 {
+        return
+    }
+    *((z + Z_ANZAHL) as *mut u64) = *((z + Z_ANZAHL) as *mut u64) + 1
+    *((z + Z_SUMME) as *mut u64) = *((z + Z_SUMME) as *mut u64) + g.nummer
+    *((z + Z_ARTEN) as *mut u64) = *((z + Z_ARTEN) as *mut u64) + art
+    // B: das Gc-Feld MUSS genullt sein.
+    if g.naechster != gc_null[Griff]() {
+        *((z + Z_UNGENULLT) as *mut u64) = 1
+    }
+}
+
+fn seite() -> u64 {
+    let r: i64 = syscall(T_SYS_MMAP, 0, 4096, T_PROT_RW, T_MAP_ANON, -1, 0)
+    if r < 0 && r > -4096 {
+        return 0
+    }
+    return r as u64
+}
+
+fn ld(z: u64, off: u64) -> u64 {
+    return *((z + off) as *mut u64)
+}
+
+// Genau EIN Objekt, dessen einziger starker Verweis in diesem Rahmen liegt.
+// Rekursiv, damit der Einbetter die Funktion nicht in den Aufrufer zieht —
+// sonst bliebe der Zeiger im Rahmen von `lauf` liegen (konservativer Scan).
+fn eines(z: u64, tiefe: u64) -> AllocError!bool {
+    var fuell: [u64; 128] = [0; 128]
+    let fp: u64 = (&fuell) as u64
+    var iq: u64 = 0
+    while iq < 128 {
+        *((fp + iq * 8) as *mut u64) = iq
+        iq = iq + 1
+    }
+    if tiefe > 0 {
+        return try eines(z, tiefe - 1)
+    }
+    let g: Gc[Griff] = try gc Griff{ naechster: gc_null[Griff](), zaehler: z as *mut u8, nummer: 42 }
+    if !gc_finalisierer_setzen(g as *mut u8, 5) {
+        return false
+    }
+    if gc_finalisierer_art(g as *mut u8) != 5 {
+        return false
+    }
+    return true
+}
+
+fn viele(z: u64, n: u64, tiefe: u64) -> AllocError!bool {
+    var fuell: [u64; 128] = [0; 128]
+    let fp: u64 = (&fuell) as u64
+    var iq: u64 = 0
+    while iq < 128 {
+        *((fp + iq * 8) as *mut u64) = iq
+        iq = iq + 1
+    }
+    if tiefe > 0 {
+        return try viele(z, n, tiefe - 1)
+    }
+    var i: u64 = 0
+    while i < n {
+        let g: Gc[Griff] = try gc Griff{ naechster: gc_null[Griff](), zaehler: z as *mut u8, nummer: 1 }
+        if !gc_finalisierer_setzen(g as *mut u8, 1 + i % 3) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn main() -> i32 {
+    if !gc_init() {
+        return 90
+    }
+    let z: u64 = seite()
+    if z == 0 {
+        return 91
+    }
+    return lauf(z) catch 92
+}
+
+fn lauf(z: u64) -> AllocError!i32 {
+    // --- D: ein erreichbares Objekt wird nicht finalisiert -----------------
+    let bleibt: Gc[Griff] = try gc Griff{ naechster: gc_null[Griff](), zaehler: z as *mut u8, nummer: 7 }
+    if !gc_finalisierer_setzen(bleibt as *mut u8, 9) {
+        return 1
+    }
+
+    // --- A/B: genau ein sterbendes Objekt ----------------------------------
+    if !(try eines(z, 2)) {
+        return 2
+    }
+    gc_collect()
+    if gc_fin_laeufe() != 1 {
+        return 3
+    }
+    if ld(z, Z_ANZAHL) != 1 {
+        return 4
+    }
+    if ld(z, Z_SUMME) != 42 {
+        return 5
+    }
+    if ld(z, Z_ARTEN) != 5 {
+        return 6
+    }
+    if ld(z, Z_UNGENULLT) != 0 {
+        return 7
+    }
+    if gc_fin_wartend() != 0 {
+        return 8
+    }
+
+    // --- C: kein zweites Mal -----------------------------------------------
+    gc_collect()
+    gc_collect()
+    if gc_fin_laeufe() != 1 {
+        return 9
+    }
+    if ld(z, Z_ANZAHL) != 1 {
+        return 10
+    }
+
+    // --- D: das erreichbare Objekt lebt und traegt seine Art weiter --------
+    if bleibt.nummer != 7 {
+        return 11
+    }
+    if gc_finalisierer_art(bleibt as *mut u8) != 9 {
+        return 12
+    }
+
+    // --- E: Massenlauf ------------------------------------------------------
+    let n: u64 = 300
+    if !(try viele(z, n, 2)) {
+        return 13
+    }
+    gc_collect()
+    gc_collect()
+    let laeufe: u64 = gc_fin_laeufe()
+    // 1 aus Teil A; das erreichbare `bleibt` darf nie dabei sein.
+    if laeufe < 1 + n - 20 {
+        return 14
+    }
+    if laeufe > 1 + n {
+        return 15
+    }
+    // Der Verteiler des PROGRAMMS lief genau so oft wie der Sammler zaehlt.
+    if ld(z, Z_ANZAHL) != laeufe {
+        return 16
+    }
+    if ld(z, Z_UNGENULLT) != 0 {
+        return 17
+    }
+    if gc_fin_wartend() != 0 {
+        return 18
+    }
+    if gc_fin_registriert() != 1 + 1 + n {
+        return 19
+    }
+    // Arten 1..3 im Massenlauf, 5 aus Teil A.
+    if ld(z, Z_ARTEN) < 5 + (laeufe - 1) {
+        return 20
+    }
+    if ld(z, Z_ARTEN) > 5 + 3 * (laeufe - 1) {
+        return 21
+    }
+    // `bleibt` hat alles ueberlebt.
+    if bleibt.nummer != 7 {
+        return 22
+    }
+    return 0
+}

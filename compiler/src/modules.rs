@@ -158,11 +158,18 @@ pub fn resolve(root: &Path) -> Result<Vec<SourceFile>, Diag> {
 pub(crate) fn gc_laufzeit(files: &[SourceFile]) -> Option<SourceFile> {
     let mut braucht = false;
     let mut hat_allocerror = false;
+    // Runde 47: der Finalisierer-Verteiler zaehlt NUR aus der Wurzeldatei.
+    // In einem Modul hiesse er `modul__gc_finalisiere` und die Laufzeit
+    // faende ihn nicht mehr (siehe `module_name` weiter unten).
+    let mut hat_finalisierer = false;
     for f in files {
         let mut dg = Diags::new("<gc-suche>", &f.src);
         let toks = lexer::lex_file(&f.src, f.id, &mut dg);
         braucht |= crate::gc::quelle_braucht_gc(&toks);
         hat_allocerror |= crate::gc::quelle_hat_allocerror(&toks);
+        if f.id == 0 {
+            hat_finalisierer = crate::gc::quelle_hat_finalisierer(&toks);
+        }
     }
     if !braucht {
         return None;
@@ -170,7 +177,7 @@ pub(crate) fn gc_laufzeit(files: &[SourceFile]) -> Option<SourceFile> {
     Some(SourceFile {
         id: files.len() as u32,
         path: PathBuf::from(crate::gc::LAUFZEIT_PFAD),
-        src: crate::gc::laufzeit_quelle(!hat_allocerror),
+        src: crate::gc::laufzeit_quelle(!hat_allocerror, !hat_finalisierer),
     })
 }
 
