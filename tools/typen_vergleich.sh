@@ -13,6 +13,12 @@
 # System-V-Klasse jedes Arguments und des Rueckgabewertes samt `sret`.
 set -uo pipefail
 cd "$(dirname "$0")/.."
+# Eigenes Temp-Verzeichnis je Lauf: zwei gleichzeitige Laeufe (z. B. Haupt-
+# repo und ein Worktree) benutzten sonst DIESELBEN /tmp-Dateien und
+# ueberschrieben sich gegenseitig die Vergleichsausgaben — das sah wie ein
+# echter Unterschied aus (Runde 41).
+TMPD=$(mktemp -d)
+trap 'rm -rf "$TMPD"' EXIT
 
 FIRNC=compiler/target/release/firnc
 DUMP=${LAYOUTDUMP:-./.layoutdump}
@@ -31,18 +37,18 @@ mit_structs=0
 erste=""
 
 while IFS= read -r f; do
-    if ! "$FIRNC" --emit=layout "$f" > /tmp/typv_a.txt 2>/dev/null; then
+    if ! "$FIRNC" --emit=layout "$f" > "$TMPD"/typv_a.txt 2>/dev/null; then
         uebersprungen=$((uebersprungen+1))
         continue
     fi
-    "$DUMP" "$f" > /tmp/typv_b.txt 2>/dev/null
+    "$DUMP" "$f" > "$TMPD"/typv_b.txt 2>/dev/null
     rc=$?
     if [ "$rc" -eq 3 ]; then
         nichtkern=$((nichtkern+1))
         continue
     fi
-    grep -q '^  (struct' /tmp/typv_a.txt && mit_structs=$((mit_structs+1))
-    if [ "$rc" -eq 0 ] && cmp -s /tmp/typv_a.txt /tmp/typv_b.txt; then
+    grep -q '^  (struct' "$TMPD"/typv_a.txt && mit_structs=$((mit_structs+1))
+    if [ "$rc" -eq 0 ] && cmp -s "$TMPD"/typv_a.txt "$TMPD"/typv_b.txt; then
         gleich=$((gleich+1))
     else
         ungleich=$((ungleich+1))

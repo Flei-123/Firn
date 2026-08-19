@@ -55,6 +55,17 @@ pub enum Loc {
     Slot(u64),
 }
 
+/// Schreibt der Wert `v` in das physische Register `r`? (Runde 41 — Pruefung
+/// fuer den Zellen-Alias.)
+fn belegt_register(alloc: &Alloc, v: Val, r: &'static str) -> bool {
+    if let Some(rc) = alloc.cells.get(&v) {
+        if *rc == r {
+            return true;
+        }
+    }
+    matches!(alloc.locs.get(v as usize), Some(Loc::Reg(x)) if *x == r)
+}
+
 /// callee-saved Register, die vergeben werden duerfen (Prolog/Epilog sichern).
 const CALLEE_SAVED: [&str; 5] = ["rbx", "r12", "r13", "r14", "r15"];
 /// caller-saved Register fuer Intervalle, die KEINEN `call`/`syscall`
@@ -822,13 +833,43 @@ pub fn allocate(f: &Func) -> Alloc {
             // Index fuer Quelle UND Ziel im Kopierloop von dekodiere).
             let mut gefunden = 0usize;
             let mut ok = false;
+            // RUNDE 41: Das Zellenregister darf zwischen Load und letzter
+            // Verwendung von KEINEM anderen Wert beschrieben werden. Der
+            // Verteiler kannte die vom Alias verlaengerte Lebensspanne nicht
+            // und durfte `rc` an einen Wert vergeben, dessen Spanne die des
+            // Zellenwerts nicht ueberschneidet — dann steht beim Lesen etwas
+            // Fremdes darin. Fehlerbild: `43 - start` in bin/druck.fi
+            // (drucke_binop) wurde zu `43 - &tab[start]`, weil `lea` die
+            // Adresse in genau dieses Register schrieb; die Laenge lief unter
+            // Null und buf_wachse drehte sich ewig (Endlosschleife in
+            // .astdump auf jedem `||`).
+            let mut zerstoert = false;
             for nj in b.insts.iter().skip(ii + 1) {
                 nbuf.clear();
                 nj.op.uses(&mut nbuf);
                 gefunden += nbuf.iter().filter(|u| **u == d).count();
+                if let Some(d2) = nj.dst {
+                    if d2 != d && belegt_register(&alloc, d2, rc) {
+                        zerstoert = true;
+                        break;
+                    }
+                }
+                // Ein Aufruf zerstoert alle caller-saved Register; der
+                // Zellenwert steht dann nur noch im Rahmen, nicht im
+                // Register. (Fehlerbild: bin/layoutdump.fi stuerzte in
+                // intern_finde mit t=0 ab.)
+                if matches!(nj.op, Op::Call { .. } | Op::Syscall { .. })
+                    && !CALLEE_SAVED.contains(&rc)
+                {
+                    zerstoert = true;
+                    break;
+                }
                 if matches!(nj.op, Op::Store { addr: a2, .. } if a2 == addr) {
                     break; // danach ist der geladene Wert veraltet
                 }
+            }
+            if zerstoert {
+                continue;
             }
             if gefunden == braucht {
                 ok = true;

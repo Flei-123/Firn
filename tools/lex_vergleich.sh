@@ -14,6 +14,12 @@
 # jeder Diagnose.
 set -uo pipefail
 cd "$(dirname "$0")/.."
+# Eigenes Temp-Verzeichnis je Lauf: zwei gleichzeitige Laeufe (z. B. Haupt-
+# repo und ein Worktree) benutzten sonst DIESELBEN /tmp-Dateien und
+# ueberschrieben sich gegenseitig die Vergleichsausgaben — das sah wie ein
+# echter Unterschied aus (Runde 41).
+TMPD=$(mktemp -d)
+trap 'rm -rf "$TMPD"' EXIT
 
 FIRNC=compiler/target/release/firnc
 DUMP=${DUMP:-./.lexdump}
@@ -46,28 +52,28 @@ langsam=0
 erste=""
 
 while IFS= read -r f; do
-    "$FIRNC" --emit=tokens "$f" > /tmp/lexv_a.txt 2>/tmp/lexv_ae.txt
+    "$FIRNC" --emit=tokens "$f" > "$TMPD"/lexv_a.txt 2>"$TMPD"/lexv_ae.txt
     # Modulbruchstuecke (`tests/modules/*.fi`) lassen sich nicht einzeln
     # uebersetzen: `firnc0` bricht schon in der Modulaufloesung ab, VOR dem
     # Lexer. Das ist keine Lexerfrage — solche Dateien werden gezaehlt und
     # uebersprungen.
-    if grep -q "nicht lesen:" /tmp/lexv_ae.txt; then
+    if grep -q "nicht lesen:" "$TMPD"/lexv_ae.txt; then
         uebersprungen=$((uebersprungen+1))
         continue
     fi
-    "$DUMP" "$f" > /tmp/lexv_b.txt 2>/tmp/lexv_be.txt
+    "$DUMP" "$f" > "$TMPD"/lexv_b.txt 2>"$TMPD"/lexv_be.txt
     # Zaehlwerte stehen nur dann auf der Fehlerausgabe, wenn es KEINE
     # Diagnosen gab — sonst gehoert der ganze Strom den Meldungen.
-    if grep -q '^; tokens ' /tmp/lexv_be.txt; then
-        t=$(awk '{print $3}' /tmp/lexv_be.txt)
-        g=$(awk '{print $5}' /tmp/lexv_be.txt)
+    if grep -q '^; tokens ' "$TMPD"/lexv_be.txt; then
+        t=$(awk '{print $3}' "$TMPD"/lexv_be.txt)
+        g=$(awk '{print $5}' "$TMPD"/lexv_be.txt)
         tokens=$((tokens + ${t:-0}))
         langsam=$((langsam + ${g:-0}))
-        : > /tmp/lexv_be.txt
+        : > "$TMPD"/lexv_be.txt
     else
         mit_fehler=$((mit_fehler+1))
     fi
-    if cmp -s /tmp/lexv_a.txt /tmp/lexv_b.txt && cmp -s /tmp/lexv_ae.txt /tmp/lexv_be.txt; then
+    if cmp -s "$TMPD"/lexv_a.txt "$TMPD"/lexv_b.txt && cmp -s "$TMPD"/lexv_ae.txt "$TMPD"/lexv_be.txt; then
         gleich=$((gleich+1))
     else
         ungleich=$((ungleich+1))
@@ -88,10 +94,10 @@ echo "TOKEN GESAMT:  $tokens"
 echo "GLEITKOMMA ausserhalb des schnellen Pfades: $langsam"
 if [ "$unerwartet" -gt 0 ]; then
     echo "erste unerwartete Abweichung: $erste"
-    "$FIRNC" --emit=tokens "$erste" > /tmp/lexv_a.txt 2>/tmp/lexv_ae.txt
-    "$DUMP" "$erste" > /tmp/lexv_b.txt 2>/tmp/lexv_be.txt
-    diff /tmp/lexv_a.txt /tmp/lexv_b.txt | head -12
-    diff /tmp/lexv_ae.txt /tmp/lexv_be.txt | head -20
+    "$FIRNC" --emit=tokens "$erste" > "$TMPD"/lexv_a.txt 2>"$TMPD"/lexv_ae.txt
+    "$DUMP" "$erste" > "$TMPD"/lexv_b.txt 2>"$TMPD"/lexv_be.txt
+    diff "$TMPD"/lexv_a.txt "$TMPD"/lexv_b.txt | head -12
+    diff "$TMPD"/lexv_ae.txt "$TMPD"/lexv_be.txt | head -20
     exit 1
 fi
 exit 0
