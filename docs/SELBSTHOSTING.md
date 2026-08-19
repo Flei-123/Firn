@@ -1824,3 +1824,93 @@ gcd/lcm, INF/NAN/EPSILON), io (Zeilen lesen, stdin, Anhaengen,
 Zeichen/Hex/bool im Fmt-Builder). Neue Kern-Tests 800-806.
 Abnahme im Hauptrepo nachgemessen: test.sh 673/673, selbst 196/0/0,
 Fixpunkt Stufe 2 == Stufe 3 zeichengleich (309 468 Zeilen).
+
+## 33. Runde 43: das Tempo-Ziel faellt — und zwar nicht im Tokenizer
+
+Auftrag war `realweb` von 2,68x auf hoechstens 2x gegen `html5ever`. Der
+dokumentierte Hebel (Intervall-Splitting im Regalloc) wurde **nicht**
+gebraucht; das Profil zeigte den Aufwand woanders.
+
+* **`mem_copy` kopiert wortweise** statt byteweise — realweb -22,2 %,
+  html5lib -11,9 %. Die Selbstkosten von `main` fielen von 332,9 auf 45,8
+  Mio. Instruktionen; ein einziger Block trug 109 davon.
+* **Der Registerpfad kann Stapelargumente** (mehr als sechs Argumente
+  landeten bisher immer im Speicher) — realweb -4,3 %.
+* **Adressversatz wandert in den Speicherzugriff**, `mov r8, [r8+160]` statt
+  Addition davor — realweb -0,8 %.
+
+Instruktionen realweb **1.297.226.150 -> 957.989.680 (-26,15 %)**, html5lib
+-13,39 %. Selbst nachgemessen auf dem Merge-Stand mit
+`tools/tokenizer/durchsatz.sh`: **realweb 1,54x** (Ziel <= 2,00x erreicht),
+**html5lib 0,95x** — auf den Grenzfaellen ist der Firn-Tokenizer damit
+schneller als html5ever. Durchsatz realweb 29,25 MB/s.
+
+**Methodische Lehre der Runde:** die Wanduhr streut ueber drei Messpaare
+zwischen 2,58x und 2,85x fuer *dieselbe* Binary — der Wert 2,68x aus Runde 41
+lag mitten in diesem Band. Belastbar sind nur die auf die Instruktion genau
+reproduzierbaren callgrind-Zahlen; die Uhr taugt zur Kontrolle, nicht zum
+Beweis. Zwei weitere Hypothesen (Label ohne Sprungziel, Sprungtabelle) wurden
+begruendet zurueckgestellt, nachdem das Ziel erreicht war.
+
+## 34. Runde 44: die Aufbauphase ohne Stop-the-World
+
+Bis Runde 43 lief der Sammler unterhalb von `INKR_AB = 8 MiB` Heap atomar —
+beim Aufbau einer grossen lebenden Menge waren das drei volle Laeufe mit bis
+zu **11,82 ms**. Die Begruendung fuer diese Schwelle war richtig gemessen,
+aber **falsch zugeordnet**: die Ursache sass nicht in der Heapgroesse,
+sondern im gestueckelten Fegen.
+
+* **Fegen mit Zeitbudget** statt in einem Zug, **Freilisten klassenweise** —
+  ohne das benutzte das gestueckelte Fegen wieder frische Chunks statt der
+  Freilisten und verdoppelte den Heap.
+* **Zweite Uhr (Rechenzeit des Fadens)** neben der Wanduhr in der
+  Pausenmessung; nur so laesst sich Fremdlast von echter Pause trennen —
+  genau der Fehler, der in Runde 40 die 19-ms-Ausreisser erzeugt hatte.
+* Neue Messwerkzeuge: `aufbau.fi` (nullt das Histogramm NICHT, misst also
+  auch die Aufbauphase), `durchsatz.fi` (feste Arbeit, gemessene Zeit),
+  `ab.fi` (A/B im selben Prozess).
+
+Ergebnis: laengste Unterbrechung **11,82 ms -> 0,45 ms** (5-s-Lauf), 0,62 ms
+reine Rechenzeit im 10-Minuten-Dauerlauf. Durchsatzverlust 2 % bei kleiner,
+0 % bei grosser lebender Menge. `tests/771_gc_aufbau_ohne_stw.fi` prueft das
+deterministisch ueber `gc_volle_laeufe() == 0` statt ueber einen
+Zeitvergleich — der waere auf belasteter Maschine wertlos.
+
+## 35. Runde 45: Methoden — `impl`
+
+Bis hierher hatte Firn ausschliesslich freie Funktionen; das Praefix war der
+Typ, von Hand hingeschrieben und ungeprueft (`bytes_push(&b, x)`). Jetzt:
+`b.dazu(x)`, `quelle.trimme().laenge()`.
+
+`impl` ist bewusst eine **Schreibhilfe**: `a.f(b)` wird nach `Typ_f(&a, b)`
+aufgeloest, es gibt keinen dynamischen Versand und keine Vtable. Umgesetzt in
+beiden Compilern im Gleichschritt — firnc0 mit neuer `compiler/src/impls.rs`
+(490 Zeilen) plus Haken in Parser, Typpruefer, Lowering und nogc-Pruefung;
+firnc1 in `parser.fi`, `sema.fi`, `lower`, `nogc.fi`. Dazu eine `impl`-Huelle
+fuer `std.str`, Tests 810-812 und **acht Negativtests** (Empfaenger ohne
+Adresse, Empfaenger ist Zeiger, kein struct, freie Funktion ist keine
+Methode, falsche Argumentzahl/-typen).
+
+## 36. Der Merge der Runden 43-45 — und dieselbe Falle zum vierten Mal
+
+Die drei Runden liefen parallel in getrennten Worktrees mit sauber
+getrennten Revieren (Regalloc/Codegen · GC · Parser/Sema) und liessen sich
+bis auf einen `.gitignore`-Konflikt konfliktfrei zusammenfuehren.
+
+Die Abnahme meldete danach **eine** Abweichung: `771_gc_aufbau_ohne_stw.fi`,
+firnc0 gab 0, firnc1 gab 3 (`gc_volle_laeufe() != 0`). Mit **frisch
+gebautem** `.firnc1` war der Test dreimal hintereinander gruen. Ursache war
+wieder ein wiederverwendetes Binary: `tools/selbst_vergleich.sh` baute
+`.firnc1` nur, **wenn es fehlte** — nach dem Merge verglich es also einen
+Compiler, den es nicht mehr gab.
+
+Das ist derselbe Fehler wie bei den Dump-Binaries (Runde 41, dort behoben).
+`selbst_vergleich.sh` baut `.firnc1` jetzt auch dann neu, wenn firnc0 oder
+irgendeine Quelle unter `bin/` oder `lib/` juenger ist.
+**Regel: nie ein Binary wiederverwenden, nur weil es existiert.**
+
+**Abnahme des Merge-Stands im Hauptrepo, selbst gemessen:** `test.sh`
+**696/696** · `selbst_vergleich.sh` **201 gleich / 0 abweichend / 0
+fehlerhaft**, CODEGEN FEHLT 0 · `fixpunkt.sh` Stufe 2 == Stufe 3,
+zeichengleich, **328.343 Zeilen** · Durchsatz realweb **1,54x**, html5lib
+**0,95x**.
