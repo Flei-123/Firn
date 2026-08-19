@@ -22,6 +22,8 @@
 #   9. HTML5-Tokenizer (lib/html/, in Firn) gegen die offizielle
 #      html5lib-Testsuite: exakte Quote aus 6.810 Faellen, Schranke in
 #      tools/tokenizer/mindestquote.txt (tools/tokenizer/run.sh).
+#  18. Paket- und Projektsystem (tools/pakete/run.sh): Manifest, Such-
+#      reihenfolge, Sichtbarkeit, Bau-Treiber — in BEIDEN Uebersetzern.
 #  10. DOM-Dauerlauf (tools/dom_soak/run.sh): der DOM-Prototyp in Firn baut
 #      fortlaufend echte Zyklen (Eltern/Kind, Listener, JS-Wrapper) und darf
 #      dabei nicht wachsen; die absichtlich leckende Gegenprobe mit
@@ -306,6 +308,19 @@ if [ "$FPRC" -eq 0 ]; then
 else
     bad "tools/fixpunkt.sh schlug fehl (siehe .test-work/fixpunkt.log)"
     tail -20 "$WORK/fixpunkt.log" | sed 's/^/   /'
+fi
+
+echo "== 18. Paket- und Projektsystem (tools/pakete/run.sh) =="
+# Manifest `firn.paket`, Suchreihenfolge, Sichtbarkeit auf Modulebene und der
+# Bau-Treiber `--paket` — jeder Fall durch BEIDE Uebersetzer, Meldungen
+# Oktett fuer Oktett verglichen.
+bash tools/pakete/run.sh > "$WORK/pakete.log" 2>&1 && PKRC=0 || PKRC=$?
+if [ "$PKRC" -eq 0 ]; then
+    ok
+    grep -E '^PAKETE' "$WORK/pakete.log" | sed 's/^/   /'
+else
+    bad "tools/pakete/run.sh schlug fehl (siehe .test-work/pakete.log)"
+    tail -20 "$WORK/pakete.log" | sed 's/^/   /'
 fi
 
 TOTAL=$((PASS + FAIL))
