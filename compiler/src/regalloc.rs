@@ -1024,6 +1024,10 @@ struct Ra<'a> {
     versatz: HashMap<Val, Adresse>,
     /// Instruktionen (Skalierung `shl`/`mul`), die dabei ganz entfallen.
     uebersprungen: std::collections::HashSet<Val>,
+    /// Instruktionen, von denen nur noch das FUELLEN ihres Registers uebrig
+    /// bleibt: Wert -> Quellwert. Der Rest der Rechnung steckt im
+    /// Speicheroperanden des folgenden Zugriffs.
+    vorlader: HashMap<Val, Val>,
 }
 
 /// Ein Speicheroperand, den der Prozessor selbst ausrechnet:
@@ -1118,12 +1122,13 @@ fn faltbare_adressen(
     f: &Func,
     a: &Alloc,
     gelesen: &[u32],
-) -> (HashMap<Val, Adresse>, std::collections::HashSet<Val>) {
+) -> (HashMap<Val, Adresse>, std::collections::HashSet<Val>, HashMap<Val, Val>) {
     use std::collections::HashSet;
     let mut aus: HashMap<Val, Adresse> = HashMap::new();
     let mut weg: HashSet<Val> = HashSet::new();
+    let mut vor: HashMap<Val, Val> = HashMap::new();
     if std::env::var_os("FIRN_NO_FALTUNG").is_some() {
-        return (aus, weg);
+        return (aus, weg, vor);
     }
     // Liegt der Wert schlicht in einem Register — ohne Sonderbehandlung?
     let reines_reg = |v: Val| -> Option<&'static str> {
@@ -1172,14 +1177,42 @@ fn faltbare_adressen(
             if !passt {
                 continue;
             }
-            let br = match reines_reg(base) {
-                Some(r) => r,
-                None => continue,
+            // Register, die der folgende Zugriff selbst noch LESEN muss —
+            // sie duerfen nicht als Vorlade-Ziel dienen.
+            let wert_reg: Option<&'static str> = match &n.op {
+                Op::Store { val, .. } => match a.ort(*val) {
+                    Loc::Reg(r) => Some(r),
+                    _ => None,
+                },
+                _ => None,
+            };
+            // Die Basis liegt entweder schon in einem Register — oder sie
+            // wird in das Register der Adressrechnung geladen, das sonst
+            // ungenutzt bliebe (Fall C, Runde 51):
+            //     mov rax, qword ptr [rbp-8]      statt   mov rax, [rbp-8]
+            //     mov r9, qword ptr [rax+8]               lea r9, [rax+8]
+            //                                             mov r9, [r9]
+            let basis_darf_gelesen = |v: Val| -> bool {
+                !f.is_secret(v)
+                    && a.cell(v).is_none()
+                    && !a.alias.contains_key(&v)
+                    && !a.frame_addr.contains_key(&v)
+                    && a.imm(v).is_none()
+            };
+            let (br, basis_vorladen) = match reines_reg(base) {
+                Some(r) => (r, false),
+                None => match (a.loc(d), basis_darf_gelesen(base)) {
+                    (Loc::Reg(dr), true) if Some(dr) != wert_reg => (dr, true),
+                    _ => continue,
+                },
             };
             // (3a) konstanter Versatz
             if let Some(k) = a.imm(off) {
                 if (0..=i32::MAX as i64).contains(&k) && !f.is_secret(off) {
                     aus.insert(d, Adresse { basis: br, index: None, versatz: k });
+                    if basis_vorladen {
+                        vor.insert(d, base);
+                    }
                 }
                 continue;
             }
@@ -1203,24 +1236,54 @@ fn faltbare_adressen(
                 };
                 if let Some((xi, fak)) = skal {
                     if !f.is_secret(off) && !a.alias.contains_key(&off) && a.cell(off).is_none() {
+                        // Fall A: der Index liegt selbst in einem Register —
+                        // die Skalierung entfaellt ersatzlos.
                         if let Some(ir) = reines_reg(xi) {
-                            aus.insert(
-                                d,
-                                Adresse { basis: br, index: Some((ir, fak)), versatz: 0 },
-                            );
-                            weg.insert(off);
-                            continue;
+                            if !basis_vorladen || ir != br {
+                                aus.insert(
+                                    d,
+                                    Adresse { basis: br, index: Some((ir, fak)), versatz: 0 },
+                                );
+                                weg.insert(off);
+                                if basis_vorladen {
+                                    vor.insert(d, base);
+                                }
+                                continue;
+                            }
+                        }
+                        // Fall B: der Index liegt im Rahmen, aber die
+                        // Skalierung hat ein Registerheim. Dann wird dorthin
+                        // der UNSKALIERTE Wert geladen und der Faktor der
+                        // Adressierung ueberlassen — eine Instruktion statt
+                        // zwei.
+                        if let (Loc::Reg(ir), true) = (a.loc(off), basis_darf_gelesen(xi)) {
+                            if ir != br && Some(ir) != wert_reg {
+                                aus.insert(
+                                    d,
+                                    Adresse { basis: br, index: Some((ir, fak)), versatz: 0 },
+                                );
+                                vor.insert(off, xi);
+                                if basis_vorladen {
+                                    vor.insert(d, base);
+                                }
+                                continue;
+                            }
                         }
                     }
                 }
             }
             // (3c) Index direkt aus einem Register (Faktor 1)
             if let Some(ir) = reines_reg(off) {
-                aus.insert(d, Adresse { basis: br, index: Some((ir, 1)), versatz: 0 });
+                if !basis_vorladen || ir != br {
+                    aus.insert(d, Adresse { basis: br, index: Some((ir, 1)), versatz: 0 });
+                    if basis_vorladen {
+                        vor.insert(d, base);
+                    }
+                }
             }
         }
     }
-    (aus, weg)
+    (aus, weg, vor)
 }
 
 /// Zaehlt je Wert, wie oft er als Operand vorkommt (Instruktionen + Terminatoren).
@@ -1734,8 +1797,8 @@ fn unsupported_grund(f: &Func) -> Option<String> {
 
 fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
     let gelesen = zaehle_lesezugriffe(f);
-    let (versatz, uebersprungen) = faltbare_adressen(f, a, &gelesen);
-    let ra = Ra { f, a, gelesen, versatz, uebersprungen };
+    let (versatz, uebersprungen, vorlader) = faltbare_adressen(f, a, &gelesen);
+    let ra = Ra { f, a, gelesen, versatz, uebersprungen, vorlader };
     e.raw("");
     // Linker-Symbol ueber die eine Stelle (codegen_x86::label -> modules::symbol)
     e.raw(&format!(".globl {}", label(&f.name)));
@@ -2141,9 +2204,15 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
             let d = i.dst.ok_or("interner Fehler: Binaeroperation ohne Ziel")?;
             // Runde 51: Adressrechnung, die im folgenden Speicherzugriff steht
             // (`add` als Adressbildung, `shl`/`mul` als Skalierung des Index).
-            // Sie wird nirgends sonst gelesen und braucht keinen eigenen Code.
+            if let Some(src) = ra.vorlader.get(&d).copied() {
+                // Vom Rechnen bleibt nur, das Register zu fuellen.
+                if let Loc::Reg(r) = ra.a.loc(d) {
+                    ra.load_full(e, r, src);
+                    return Ok(());
+                }
+            }
             if ra.versatz.contains_key(&d) || ra.uebersprungen.contains(&d) {
-                return Ok(());
+                return Ok(()); // wird nirgends sonst gelesen
             }
             emit_bin(e, ra, *op, ty, *x, *y, d)?;
         }
@@ -2323,6 +2392,12 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
         }
         Op::PtrAdd { base, off } => {
             let d = i.dst.ok_or("interner Fehler: ptradd ohne Ziel")?;
+            if let Some(src) = ra.vorlader.get(&d).copied() {
+                if let Loc::Reg(r) = ra.a.loc(d) {
+                    ra.load_full(e, r, src);
+                    return Ok(());
+                }
+            }
             if ra.versatz.contains_key(&d) {
                 // Der Versatz steht im folgenden Speicherzugriff; die Adresse
                 // selbst wird nirgends sonst gelesen und braucht kein `lea`.
