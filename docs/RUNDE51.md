@@ -55,11 +55,21 @@ dieser Maschine zwischen 2,58× und 2,85× **fuer dieselbe Binary**
 auf derselben Maschine; Wanduhrwerte werden deshalb **gar nicht** als Beleg
 angefuehrt.
 
-Werkzeuge dieser Runde (Arbeitsverzeichnis `.r51/`, nicht eingecheckt):
-`.r51/messe.sh` (callgrind auf beide Korpora), `.r51/muster.py` (verbindet
-`objdump` mit instruktionsgenauem callgrind und gewichtet Instruktions**muster**
-mit ihren echten Ausfuehrungszahlen), `.r51/setcc.py`. Dazu das bestehende
-`tools/tokenizer/profil.py` aus Runde 43.
+**Neues Werkzeug: `tools/tokenizer/muster.py`.** `profil.py` (Runde 43)
+beantwortet „welche FUNKTION kostet?". Die neue Datei beantwortet die Frage
+daneben — „welche FORM von Code kostet?": sie verbindet `objdump` mit der
+instruktionsgenauen callgrind-Ausgabe (`--dump-instr=yes`) und gewichtet
+Instruktions**muster** mit ihren echten Ausfuehrungszahlen. Aufruf:
+
+```sh
+objdump -d --no-show-raw-insn .tokenizer-work/tokenize_bench > dis.txt
+valgrind --tool=callgrind --dump-instr=yes --cache-sim=no --branch-sim=no \
+         --callgrind-out-file=cg.out .tokenizer-work/tokenize_bench < auftrag
+python3 tools/tokenizer/muster.py dis.txt cg.out
+```
+
+Dazu im Arbeitsverzeichnis (nicht eingecheckt) `.r51/messe.sh`, das callgrind
+auf beide Korpora fahrt und die Instruktionszahl ablegt.
 
 **Die Lehre aus Runde 43 hat sich wieder bewaehrt** und diesmal in die andere
 Richtung: statische Haeufigkeit sagt nichts, aber ein *dynamisch gewichtetes
@@ -451,7 +461,21 @@ unveraendert benannt: **zu wenige Register** (§13.2).
 
 Vor jeder Abnahme wurden `.firnc1 .firnc2 .firnc3` geloescht (Falle (a) der
 Rundenvorgabe). Alle Zwischendateien lagen unter `.r51/` bzw.
-`.tokenizer-work/` im eigenen Worktree — kein `/tmp` (Falle (b)).
+`.tokenizer-work/` im eigenen Worktree — kein `/tmp` (Falle (b)). Wanduhrwerte
+werden nirgends als Beleg angefuehrt (Falle (c)).
+
+Zustand des Messlaufs am Ende, mit `tools/tokenizer/muster.py`:
+
+```
+Rahmenverwaltung (callee-saved sichern/holen)   36.414.390 Ir   5,21%    932 Stellen
+Store+Reload derselben Zelle                    28.215.979 Ir   4,03%    118 Stellen
+Rahmenverwaltung (push/pop/ret)                 12.688.869 Ir   1,81%   1177 Stellen
+lea + Zugriff (Adressierungsmodus ungenutzt)     9.467.272 Ir   1,35%    215 Stellen
+Rahmenverwaltung (rsp<->rbp)                     8.459.246 Ir   1,21%    664 Stellen
+Rahmenverwaltung (call)                          4.229.623 Ir   0,60%   3949 Stellen
+setcc-Kette statt direktem Sprung                  565.336 Ir   0,08%     16 Stellen
+jmp direkt hinter jcc (Blocklayout)                 10.021 Ir   0,00%     39 Stellen
+```
 
 ## 13. Offene Punkte
 
