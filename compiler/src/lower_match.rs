@@ -85,7 +85,7 @@ pub(crate) fn write_ctor_into(
         Some(v) => v.clone(),
         None => return lo.ice(e.span, "unbekannte variante im lowering"),
     };
-    let tag = lo.konst(FTy::U32, v.tag);
+    let tag = lo.constant(FTy::U32, v.tag);
     lo.store(FTy::U32, addr, tag);
     for (i, a) in args.iter().enumerate() {
         let off = match v.offsets.get(i) {
@@ -131,8 +131,8 @@ fn plan_arm(pat: &Pattern, subject_enum: Option<&EnumDef>) -> ArmPlan {
         }
         Pattern::Range { lo, hi, inclusive, .. } => {
             let last = if *inclusive { *hi } else { *hi - 1 };
-            let weite = last - *lo + 1;
-            if weite > 0 && weite <= MAX_RANGE_KEYS {
+            let extent = last - *lo + 1;
+            if extent > 0 && extent <= MAX_RANGE_KEYS {
                 ArmPlan {
                     keys: Some((*lo..=last).collect()),
                     needs_test: false,
@@ -241,12 +241,12 @@ fn lower_match(lo: &mut Lower, idx: usize, span: Span) -> Option<()> {
 fn candidates(plans: &[ArmPlan], key: Option<i128>) -> Vec<usize> {
     let mut out = Vec::new();
     for (i, p) in plans.iter().enumerate() {
-        let passt = match (&p.keys, key) {
+        let fits = match (&p.keys, key) {
             (None, _) => true,
             (Some(ks), Some(k)) => ks.contains(&k),
             (Some(_), None) => false,
         };
-        if !passt {
+        if !fits {
             continue;
         }
         out.push(i);
@@ -313,14 +313,14 @@ fn emit_tests(
         Pattern::Range { lo: rlo, hi, inclusive, .. } => {
             let last = if *inclusive { *hi } else { *hi - 1 };
             let c1 = {
-                let k = lo.konst(key_fty, *rlo);
+                let k = lo.constant(key_fty, *rlo);
                 lo.push(FTy::Bool, Op::Cmp { op: CmpOp::Ge, ty: key_fty, a: key, b: k })
             };
             let next = lo.new_block();
             lo.set_term(Term::BrCond { cond: c1, then_bb: next, else_bb: fail });
             lo.cur = next;
             let c2 = {
-                let k = lo.konst(key_fty, last);
+                let k = lo.constant(key_fty, last);
                 lo.push(FTy::Bool, Op::Cmp { op: CmpOp::Le, ty: key_fty, a: key, b: k })
             };
             let next2 = lo.new_block();
@@ -374,7 +374,7 @@ fn emit_sub_test(
                 None => return lo.ice(*span, "zahlenmuster auf nicht skalarem feld"),
             };
             let a = lo.load(ft, addr);
-            let b = lo.konst(ft, *v);
+            let b = lo.constant(ft, *v);
             let c = lo.push(FTy::Bool, Op::Cmp { op: CmpOp::Eq, ty: ft, a, b });
             let next = lo.new_block();
             lo.set_term(Term::BrCond { cond: c, then_bb: next, else_bb: fail });
@@ -383,7 +383,7 @@ fn emit_sub_test(
         }
         Pattern::Bool(v, _) => {
             let a = lo.load(FTy::Bool, addr);
-            let b = lo.konst(FTy::Bool, if *v { 1 } else { 0 });
+            let b = lo.constant(FTy::Bool, if *v { 1 } else { 0 });
             let c = lo.push(FTy::Bool, Op::Cmp { op: CmpOp::Eq, ty: FTy::Bool, a, b });
             let next = lo.new_block();
             lo.set_term(Term::BrCond { cond: c, then_bb: next, else_bb: fail });
@@ -397,12 +397,12 @@ fn emit_sub_test(
             };
             let last = if *inclusive { *hi } else { *hi - 1 };
             let a = lo.load(ft, addr);
-            let k1 = lo.konst(ft, *rlo);
+            let k1 = lo.constant(ft, *rlo);
             let c1 = lo.push(FTy::Bool, Op::Cmp { op: CmpOp::Ge, ty: ft, a, b: k1 });
             let next = lo.new_block();
             lo.set_term(Term::BrCond { cond: c1, then_bb: next, else_bb: fail });
             lo.cur = next;
-            let k2 = lo.konst(ft, last);
+            let k2 = lo.constant(ft, last);
             let c2 = lo.push(FTy::Bool, Op::Cmp { op: CmpOp::Le, ty: ft, a, b: k2 });
             let next2 = lo.new_block();
             lo.set_term(Term::BrCond { cond: c2, then_bb: next2, else_bb: fail });
@@ -423,7 +423,7 @@ fn emit_sub_test(
                 None => return lo.ice(*span, "unbekannte variante im lowering"),
             };
             let a = lo.load(FTy::U32, addr);
-            let b = lo.konst(FTy::U32, v.tag);
+            let b = lo.constant(FTy::U32, v.tag);
             let c = lo.push(FTy::Bool, Op::Cmp { op: CmpOp::Eq, ty: FTy::U32, a, b });
             let next = lo.new_block();
             lo.set_term(Term::BrCond { cond: c, then_bb: next, else_bb: fail });

@@ -68,7 +68,7 @@ pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
     // BEWUSST NUR EIN TYPNAME, kein voller Typausdruck: `size_of[i32]`,
     // `size_of[Punkt]`. Wer die Groesse eines zusammengesetzten Typs braucht,
     // gibt ihm einen Namen — das ist ohnehin lesbarer als `size_of[*mut u8]`.
-    let (typname, _) = p.ident("nach 'size_of['")?;
+    let (ty_name, _) = p.ident("nach 'size_of['")?;
     if !p.expect(TokKind::RBracket, "nach dem typargument von 'size_of'") {
         return None;
     }
@@ -85,7 +85,7 @@ pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
     let span = Parser::join(start, end);
     // Der Typtext wandert in den Namen; aufgeloest wird er im Typpruefer,
     // der die Struct-Tabelle kennt.
-    Some(p.mk(span, ExprKind::Call(format!("{}{}", P_SIZE, typname), Vec::new(), start)))
+    Some(p.mk(span, ExprKind::Call(format!("{}{}", P_SIZE, ty_name), Vec::new(), start)))
 }
 
 /// `// HOOK sizeof` in `sema::call`.
@@ -95,12 +95,12 @@ pub(crate) fn hook_call(
     args: &[Expr],
     span: Span,
 ) -> Option<Type> {
-    let typtext = name.strip_prefix(P_SIZE)?;
+    let ty_text = name.strip_prefix(P_SIZE)?;
     if !args.is_empty() {
         ck.dg.error(span, "'size_of' nimmt keine argumente".to_string());
         return Some(Type::Error);
     }
-    let te = TypeExpr::Named(typtext.to_string(), span);
+    let te = TypeExpr::Named(ty_text.to_string(), span);
     let t = ck.resolve_ty(&te);
     if t.is_error() {
         return Some(Type::Error);
@@ -109,13 +109,13 @@ pub(crate) fn hook_call(
         ck.dg.error(span, "'size_of[void]' ist nicht sinnvoll".to_string());
         return Some(Type::Error);
     }
-    let groesse = ck.tcx.size_of(&t) as i128;
-    WERTE.with(|w| w.borrow_mut().insert(name.to_string(), groesse));
+    let size = ck.tcx.size_of(&t) as i128;
+    WERTE.with(|w| w.borrow_mut().insert(name.to_string(), size));
     Some(Type::Usize)
 }
 
 /// Die im Typprüfer ermittelte Größe — für das Lowering.
-pub(crate) fn wert(name: &str) -> Option<i128> {
+pub(crate) fn value(name: &str) -> Option<i128> {
     if !name.starts_with(P_SIZE) {
         return None;
     }

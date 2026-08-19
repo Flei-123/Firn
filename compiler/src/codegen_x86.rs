@@ -154,8 +154,8 @@ pub fn emit(m: &Module) -> Result<String, String> {
     // keinen Laufzeitvorspann. Das Ergebnis ist eine Objektdatei, die ein
     // Bootlader bzw. ein Linkerskript einbindet — `_start`, das Aufsetzen von
     // `rsp` und der `exit`-Systemaufruf waeren dort falsch.
-    let freistehend = crate::profil::ist_kernel();
-    if !freistehend {
+    let freestanding = crate::prof::is_kernel();
+    if !freestanding {
     e.raw(".globl _start");
     e.raw("_start:");
     e.line("xor rbp, rbp");
@@ -175,7 +175,7 @@ pub fn emit(m: &Module) -> Result<String, String> {
     e.line("hlt");
     }
 
-    if !freistehend && !m.funcs.iter().any(|f| f.name == "main") {
+    if !freestanding && !m.funcs.iter().any(|f| f.name == "main") {
         return Err("kein Einstiegspunkt: 'fn main() -> i32' fehlt".to_string());
     }
 
@@ -186,13 +186,13 @@ pub fn emit(m: &Module) -> Result<String, String> {
     // nur, wenn das Programm ueberhaupt ein `gc class` enthaelt (gc.rs).
     // Runde 49: auch ein Programm OHNE `gc class`, das Faeden benutzt, braucht
     // den Zustandsblock — die Fadentafel und die Sperren liegen darin.
-    if crate::gc::hat_klassen() || crate::gc::laufzeit_aktiv() {
-        e.raw(&crate::gc::typtabelle_asm());
+    if crate::gc::has_classes() || crate::gc::runtime_active() {
+        e.raw(&crate::gc::ty_table_asm());
     }
     // HOOK iface: die Methodentafeln (.rodata) — nur, wenn das Programm
     // ueberhaupt eine Schnittstelle umsetzt (iface.rs, Runde 46).
-    if crate::iface::hat_schnittstellen() {
-        e.raw(&crate::iface::tafeln_asm());
+    if crate::iface::has_interfaces() {
+        e.raw(&crate::iface::tables_asm());
     }
     e.raw(".section .note.GNU-stack,\"\",@progbits");
     Ok(e.out)
@@ -277,7 +277,7 @@ fn emit_block(e: &mut Emitter, f: &Func, fr: &Frame, b: &Block) -> Result<(), St
         Term::Switch { .. } => crate::codegen_switch::emit_switch(
             e,
             f,
-            crate::codegen_switch::Wertquelle::Rahmen(fr),
+            crate::codegen_switch::ValueSource::Frame(fr),
             &b.term,
         )?,
         Term::BrCond { cond, then_bb, else_bb } => {
@@ -404,11 +404,11 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
                 // sich aus richtig. Fuer `<` und `<=` werden deshalb die
                 // OPERANDEN VERTAUSCHT (`a < b` wird zu `b > a`), statt
                 // hinterher am Paritaetsflag herumzurechnen.
-                let tausch = matches!(op, CmpOp::Lt | CmpOp::Le);
-                let (erst, zweit) = if tausch { (*b, *a) } else { (*a, *b) };
-                load_full(e, fr, "rax", erst);
+                let swap = matches!(op, CmpOp::Lt | CmpOp::Le);
+                let (first, second) = if swap { (*b, *a) } else { (*a, *b) };
+                load_full(e, fr, "rax", first);
                 e.line("movq xmm0, rax");
-                load_full(e, fr, "rax", zweit);
+                load_full(e, fr, "rax", second);
                 e.line("movq xmm1, rax");
                 e.line("ucomisd xmm0, xmm1");
                 let cc = match op {
@@ -608,11 +608,11 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
                 store_dst(e, fr, d, "rax");
             }
         }
-        Op::VtabAddr { tafel } => {
+        Op::VtabAddr { table } => {
             let d = i.dst.ok_or("interner Fehler: vtab ohne Ziel")?;
             e.line(&format!(
                 "lea rax, [rip + {}]",
-                crate::iface::tafel_label(tafel)
+                crate::iface::table_label(table)
             ));
             store_dst(e, fr, d, "rax");
         }
@@ -658,7 +658,7 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
             e.line("rep stosb");
         }
         Op::AtomicAdd { addr, val } => {
-            // Runde 47 (atomar.rs): `lock xadd` — eine Instruktion, Ergebnis
+            // Runde 47 (atomic.rs): `lock xadd` — eine Instruktion, Ergebnis
             // ist der ALTE Wert.
             let d = i.dst.ok_or("interner Fehler: atomadd ohne Ziel")?;
             load_full(e, fr, "rcx", *addr);
@@ -666,26 +666,26 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
             e.line("lock xadd qword ptr [rcx], rax");
             store_dst(e, fr, d, "rax");
         }
-        // Runde 49 (faden.rs): Vergleichs-Tausch, Fadenerzeugung, Selbstzeiger.
-        Op::AtomicCas { addr, erw, neu } => {
+        // Runde 49 (thread.rs): Vergleichs-Tausch, Fadenerzeugung, Selbstzeiger.
+        Op::AtomicCas { addr, erw, new } => {
             let d = i.dst.ok_or("interner Fehler: atomcas ohne Ziel")?;
             load_full(e, fr, "rcx", *addr);
-            load_full(e, fr, "rdx", *neu);
+            load_full(e, fr, "rdx", *new);
             load_full(e, fr, "rax", *erw);
-            crate::faden::cas_sequenz(e);
+            crate::thread::cas_sequence(e);
             store_dst(e, fr, d, "rax");
         }
-        Op::ThreadSpawn { arg, stapel, ctid } => {
+        Op::ThreadSpawn { arg, stack, ctid } => {
             let d = i.dst.ok_or("interner Fehler: spawn ohne Ziel")?;
             load_full(e, fr, "rdi", *arg);
-            load_full(e, fr, "rsi", *stapel);
+            load_full(e, fr, "rsi", *stack);
             load_full(e, fr, "rdx", *ctid);
-            crate::faden::spawn_sequenz(e);
+            crate::thread::spawn_sequence(e);
             store_dst(e, fr, d, "rax");
         }
         Op::ThreadSelf => {
             let d = i.dst.ok_or("interner Fehler: fadenselbst ohne Ziel")?;
-            crate::faden::selbst_sequenz(e);
+            crate::thread::self_sequence(e);
             store_dst(e, fr, d, "rax");
         }
         Op::CopyMem { dst, src, size } => {
@@ -695,23 +695,23 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
             e.line("cld");
             e.line("rep movsb");
         }
-        // RUNDE 52 (kern.rs, SPEC §2): Inline-Assembler. IMMER volatile —
+        // RUNDE 52 (core.rs, SPEC §2): Inline-Assembler. IMMER volatile —
         // die Zeilen stehen genau einmal und genau hier.
-        Op::Asm { vorlage, aus, ein_regs, ein, clobber } => {
+        Op::Asm { template, out, in_regs, ins, clobber } => {
             e.raw("    # asm (volatile): darf weder entfernt noch verschoben werden");
-            for (r, v) in ein_regs.iter().zip(ein.iter()) {
-                let stamm = crate::kern::stamm(r)
+            for (r, v) in in_regs.iter().zip(ins.iter()) {
+                let stem = crate::core::stem(r)
                     .ok_or_else(|| format!("unbekanntes asm-register '{}'", r))?;
-                load_full(e, fr, stamm, *v);
+                load_full(e, fr, stem, *v);
             }
-            for zeile in vorlage.split('\n') {
-                e.line(zeile);
+            for line in template.split('\n') {
+                e.line(line);
             }
-            if let Some(r) = aus {
-                let stamm = crate::kern::stamm(r)
+            if let Some(r) = out {
+                let stem = crate::core::stem(r)
                     .ok_or_else(|| format!("unbekanntes asm-register '{}'", r))?;
                 let d = i.dst.ok_or("interner Fehler: asm mit out ohne Ziel")?;
-                store_dst(e, fr, d, stamm);
+                store_dst(e, fr, d, stem);
             }
             if !clobber.is_empty() {
                 e.raw(&format!("    # asm clobber: {}", clobber.join(", ")));
@@ -853,7 +853,7 @@ mod tests {
     }
 
     #[test]
-    fn erzeugt_start_und_prolog() {
+    fn generated_start_and_prolog() {
         let s = emit(&simple_module()).expect("codegen");
         assert!(s.contains("_start:"));
         assert!(s.contains("push rbp"));
@@ -863,7 +863,7 @@ mod tests {
     }
 
     #[test]
-    fn rahmen_ist_16_ausgerichtet() {
+    fn frame_is_16_aligned() {
         let mut f = Func::new("main", vec![], FTy::I32);
         let p = f.alloca(12, 4);
         let c = f.push(0, FTy::I32, Op::Const(1));
@@ -877,7 +877,7 @@ mod tests {
     /// Mehr als sechs Parameter: die weiteren liegen auf dem Stapel des
     /// Aufrufers, die 16-Byte-Ausrichtung bleibt erhalten (abi.rs, SPEC §13).
     #[test]
-    fn stapelargumente_ab_dem_siebten_wort() {
+    fn stack_args_ab_the_seventh_word() {
         let mut m = Module::new();
         let mut f = Func::new("f", vec![FTy::I64; 8], FTy::I64);
         let p7 = f.param_val(7);

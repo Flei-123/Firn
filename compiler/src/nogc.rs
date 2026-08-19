@@ -45,22 +45,22 @@ use crate::types::Type;
 /// Vorhersagen ein, damit die Regeln 1 und 3 pruefbar sind, bevor der
 /// Sammler steht.
 #[derive(Clone, Copy)]
-struct Regeln {
-    ist_alloc: fn(&str) -> bool,
-    ist_gc_zeiger: fn(&Type) -> bool,
+struct Rules {
+    is_alloc: fn(&str) -> bool,
+    is_gc_ref: fn(&Type) -> bool,
 }
 
-impl Regeln {
-    fn echt() -> Regeln {
-        Regeln {
-            ist_alloc: crate::gc::ist_gc_alloc_aufruf,
-            ist_gc_zeiger: crate::gc::ist_gc_zeiger,
+impl Rules {
+    fn real() -> Rules {
+        Rules {
+            is_alloc: crate::gc::is_gc_alloc_call,
+            is_gc_ref: crate::gc::is_gc_ref,
         }
     }
 }
 
 /// Traegt die Funktion `#[no_gc]`?
-pub(crate) fn hat_no_gc(f: &FnDecl) -> bool {
+pub(crate) fn has_no_gc(f: &FnDecl) -> bool {
     f.attrs.iter().any(|a| a.name == "no_gc")
 }
 
@@ -69,61 +69,61 @@ pub(crate) fn hat_no_gc(f: &FnDecl) -> bool {
 /// `__match#N` (sema_match.rs), `__try#`/`__catch#` (errors.rs) und
 /// `Enum::Variante` (lower_match.rs) koennen nie aus einem Bezeichner des
 /// Quelltextes entstehen — sie enthalten `#` bzw. `::`.
-fn ist_interner_name(name: &str) -> bool {
+fn is_interner_name(name: &str) -> bool {
     name.contains('#') || name.contains("::")
 }
 
 /// `helfer__quadrat` (Modulsystem, `modules.rs`) wieder als `helfer.quadrat`
 /// schreiben — die Meldung soll den Namen zeigen, der im Quelltext steht.
-fn lesbar(name: &str) -> String {
-    if name.starts_with('_') || ist_interner_name(name) {
+fn readable(name: &str) -> String {
+    if name.starts_with('_') || is_interner_name(name) {
         return name.to_string();
     }
-    let teile: Vec<&str> = name.split("__").collect();
-    if teile.len() == 2 && !teile[0].is_empty() && !teile[1].is_empty() {
-        return format!("{}.{}", teile[0], teile[1]);
+    let parts: Vec<&str> = name.split("__").collect();
+    if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+        return format!("{}.{}", parts[0], parts[1]);
     }
     name.to_string()
 }
 
 /// `// HOOK nogc` in `sema::Checker::run`: prueft alle `#[no_gc]`-Funktionen.
 pub(crate) fn hook_check(ck: &mut Checker, prog: &Program) {
-    let befunde = sammle_befunde(prog, &ck.expr_types, Regeln::echt());
-    for (span, msg, note) in befunde {
+    let findings = collect_findings(prog, &ck.expr_types, Rules::real());
+    for (span, msg, note) in findings {
         ck.dg.error_note(span, msg, note);
     }
 }
 
 /// Der eigentliche Durchlauf, ohne `Checker` — dadurch einzeln testbar.
-fn sammle_befunde(
+fn collect_findings(
     prog: &Program,
     expr_types: &[Type],
-    regeln: Regeln,
+    rules: Rules,
 ) -> Vec<(Span, String, String)> {
-    let mut markiert: HashMap<&str, bool> = HashMap::new();
+    let mut marked: HashMap<&str, bool> = HashMap::new();
     for f in &prog.funcs {
         // Bei doppelt deklarierten Namen (eigener Fehler der Typpruefung)
         // zaehlt die strengere Angabe: markiert bleibt markiert.
-        let e = markiert.entry(f.name.as_str()).or_insert(false);
-        *e |= hat_no_gc(f);
+        let e = marked.entry(f.name.as_str()).or_insert(false);
+        *e |= has_no_gc(f);
     }
-    if !markiert.values().any(|v| *v) {
+    if !marked.values().any(|v| *v) {
         return Vec::new();
     }
-    let mut p = Pruefer {
+    let mut p = NoGcChecker {
         expr_types,
-        markiert: &markiert,
-        regeln,
-        wer: String::new(),
-        tiefe: 0,
+        marked: &marked,
+        rules,
+        who: String::new(),
+        depth: 0,
         out: Vec::new(),
     };
     for f in &prog.funcs {
-        if !hat_no_gc(f) {
+        if !has_no_gc(f) {
             continue;
         }
-        p.wer = lesbar(&f.name);
-        p.pruefe_block(&f.body);
+        p.who = readable(&f.name);
+        p.check_block(&f.body);
     }
     let mut out = p.out;
     out.sort_by_key(|(s, _, _)| (s.file, s.line, s.col));
@@ -131,14 +131,14 @@ fn sammle_befunde(
     out
 }
 
-struct Pruefer<'a> {
+struct NoGcChecker<'a> {
     expr_types: &'a [Type],
-    markiert: &'a HashMap<&'a str, bool>,
-    regeln: Regeln,
+    marked: &'a HashMap<&'a str, bool>,
+    rules: Rules,
     /// Name der gerade geprueften `#[no_gc]`-Funktion (fuer die Meldung).
-    wer: String,
+    who: String,
     /// Schachtelungstiefe der `match`-Rumpfbloecke (Reissleine, s. u.).
-    tiefe: u32,
+    depth: u32,
     out: Vec<(Span, String, String)>,
 }
 
@@ -147,58 +147,58 @@ struct Pruefer<'a> {
 /// die zweite Sicherung gegen eine Rekursionsexplosion.
 const MAX_TIEFE: u32 = 256;
 
-impl<'a> Pruefer<'a> {
-    fn typ_von(&self, e: &Expr) -> Type {
+impl<'a> NoGcChecker<'a> {
+    fn ty_of(&self, e: &Expr) -> Type {
         self.expr_types
             .get(e.id as usize)
             .cloned()
             .unwrap_or(Type::Error)
     }
 
-    fn melde(&mut self, span: Span, msg: String, note: String) {
+    fn report(&mut self, span: Span, msg: String, note: String) {
         self.out.push((span, msg, note));
     }
 
-    fn pruefe_block(&mut self, b: &Block) {
+    fn check_block(&mut self, b: &Block) {
         for s in &b.stmts {
-            self.pruefe_stmt(s);
+            self.check_stmt(s);
         }
     }
 
-    fn pruefe_stmt(&mut self, s: &Stmt) {
+    fn check_stmt(&mut self, s: &Stmt) {
         match s {
             // Der aufgeschobene Rumpf laeuft im selben Rahmen und unterliegt
             // denselben Regeln.
-            Stmt::Defer(inner, _, _) => self.pruefe_stmt(inner),
-            Stmt::Let { init, .. } => self.pruefe_expr(init),
+            Stmt::Defer(inner, _, _) => self.check_stmt(inner),
+            Stmt::Let { init, .. } => self.check_expr(init),
             Stmt::Assign { target, value, span } => {
-                self.pruefe_schreibziel(target, *span);
-                self.pruefe_expr(target);
-                self.pruefe_expr(value);
+                self.check_write_target(target, *span);
+                self.check_expr(target);
+                self.check_expr(value);
             }
             Stmt::If { cond, then, els, .. } => {
-                self.pruefe_expr(cond);
-                self.pruefe_block(then);
+                self.check_expr(cond);
+                self.check_block(then);
                 if let Some(e) = els {
-                    self.pruefe_stmt(e);
+                    self.check_stmt(e);
                 }
             }
             Stmt::While { cond, body, .. } => {
-                self.pruefe_expr(cond);
-                self.pruefe_block(body);
+                self.check_expr(cond);
+                self.check_block(body);
             }
             Stmt::For { start, end, body, .. } => {
-                self.pruefe_expr(start);
-                self.pruefe_expr(end);
-                self.pruefe_block(body);
+                self.check_expr(start);
+                self.check_expr(end);
+                self.check_block(body);
             }
             Stmt::Return { value, .. } => {
                 if let Some(v) = value {
-                    self.pruefe_expr(v);
+                    self.check_expr(v);
                 }
             }
-            Stmt::Expr(e) => self.pruefe_expr(e),
-            Stmt::Block(b) => self.pruefe_block(b),
+            Stmt::Expr(e) => self.check_expr(e),
+            Stmt::Block(b) => self.check_block(b),
             Stmt::Break(_) | Stmt::Continue(_) | Stmt::Error(_) => {}
         }
     }
@@ -207,12 +207,12 @@ impl<'a> Pruefer<'a> {
     /// Feldelement). Eine reine Zuweisung an eine oertliche Veraenderliche
     /// (`ExprKind::Ident`) liegt auf dem Stapel, braucht keine Einfuegebarriere
     /// und ist erlaubt.
-    fn pruefe_schreibziel(&mut self, target: &Expr, fallback: Span) {
-        let ty = self.typ_von(target);
-        if !(self.regeln.ist_gc_zeiger)(&ty) {
+    fn check_write_target(&mut self, target: &Expr, fallback: Span) {
+        let ty = self.ty_of(target);
+        if !(self.rules.is_gc_ref)(&ty) {
             return;
         }
-        let (was, sp) = match &target.kind {
+        let (what, sp) = match &target.kind {
             ExprKind::Field(_, name, sp) => (format!("das GC-Feld '{}'", name), *sp),
             ExprKind::Index(b, _) => match &b.kind {
                 ExprKind::Ident(_) => return, // oertliches Feld auf dem Stapel
@@ -222,68 +222,68 @@ impl<'a> Pruefer<'a> {
             _ => return,
         };
         let sp = if sp == Span::none() { fallback } else { sp };
-        let wer = self.wer.clone();
-        self.melde(
+        let who = self.who.clone();
+        self.report(
             sp,
-            format!("'{wer}' ist #[no_gc], schreibt aber in {was}"),
+            format!("'{who}' ist #[no_gc], schreibt aber in {what}"),
             "SPEC 3.5.4: das Schreiben eines Gc-Zeigers in den Heap braucht die \
              Einfuegebarriere und ist in einem #[no_gc]-Aufrufbaum verboten"
                 .to_string(),
         );
     }
 
-    fn pruefe_expr(&mut self, e: &Expr) {
+    fn check_expr(&mut self, e: &Expr) {
         match &e.kind {
             ExprKind::Call(name, args, sp) => {
-                self.pruefe_aufruf(name, *sp, e.span);
+                self.check_call(name, *sp, e.span);
                 for a in args {
-                    self.pruefe_expr(a);
+                    self.check_expr(a);
                 }
                 // `match` steht als Aufruf `__match#N` im AST; die Rumpf-
                 // bloecke der Faelle liegen in der Registrierung von
                 // sema_match.rs. Ohne diesen Abstieg waere jede Zustands-
                 // maschine ein blinder Fleck.
-                self.pruefe_match_faelle(name);
+                self.check_match_cases(name);
             }
-            ExprKind::Unary(_, a) => self.pruefe_expr(a),
+            ExprKind::Unary(_, a) => self.check_expr(a),
             ExprKind::Binary(_, a, b) => {
-                self.pruefe_expr(a);
-                self.pruefe_expr(b);
+                self.check_expr(a);
+                self.check_expr(b);
             }
-            ExprKind::Field(b, _, _) => self.pruefe_expr(b),
+            ExprKind::Field(b, _, _) => self.check_expr(b),
             ExprKind::Index(b, i) => {
-                self.pruefe_expr(b);
-                self.pruefe_expr(i);
+                self.check_expr(b);
+                self.check_expr(i);
             }
             ExprKind::Syscall(args) | ExprKind::ArrayLit(args) => {
                 for a in args {
-                    self.pruefe_expr(a);
+                    self.check_expr(a);
                 }
             }
-            ExprKind::Cast(a, _) => self.pruefe_expr(a),
-            ExprKind::StructLit(_, felder, _) => {
-                for (_, v, _) in felder {
-                    self.pruefe_expr(v);
+            ExprKind::Cast(a, _) => self.check_expr(a),
+            ExprKind::StructLit(_, fields, _) => {
+                for (_, v, _) in fields {
+                    self.check_expr(v);
                 }
             }
             ExprKind::ArrayRepeat(v, n) => {
-                self.pruefe_expr(v);
-                self.pruefe_expr(n);
+                self.check_expr(v);
+                self.check_expr(n);
             }
             ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Ident(_) => {}
         }
     }
 
-    fn pruefe_aufruf(&mut self, name: &str, sp: Span, fallback: Span) {
+    fn check_call(&mut self, name: &str, sp: Span, fallback: Span) {
         let sp = if sp == Span::none() { fallback } else { sp };
-        let wer = self.wer.clone();
-        if (self.regeln.ist_alloc)(name) {
+        let who = self.who.clone();
+        if (self.rules.is_alloc)(name) {
             // Regel 1: GC-Allokation — kann einen Sammellauf ausloesen.
-            self.melde(
+            self.report(
                 sp,
                 format!(
-                    "'{wer}' ist #[no_gc], alloziert aber ueber '{}' auf dem GC-Heap",
-                    lesbar(name)
+                    "'{who}' ist #[no_gc], alloziert aber ueber '{}' auf dem GC-Heap",
+                    readable(name)
                 ),
                 "SPEC 3.5.4: in einem #[no_gc]-Aufrufbaum darf kein Sammellauf \
                  ausgeloest werden"
@@ -297,10 +297,10 @@ impl<'a> Pruefer<'a> {
         // Fall AUSDRUECKLICH abgelehnt statt stillschweigend uebergangen: ein
         // Loch in einer Zusage waere schlimmer als eine fehlende Bequemlichkeit
         // (Runde 45, impls.rs).
-        if let Some(m) = crate::impls::methodenname(name) {
-            self.melde(
+        if let Some(m) = crate::impls::method_name(name) {
+            self.report(
                 sp,
-                format!("'{wer}' ist #[no_gc], ruft aber die methode '{m}'"),
+                format!("'{who}' ist #[no_gc], ruft aber die methode '{m}'"),
                 "SPEC 3.5.4: die zusage gilt transitiv — welche funktion hinter einem \
                  methodenaufruf steht, entscheidet der empfaengertyp; rufe die funktion \
                  hier direkt auf (Typ__methode) oder verzichte auf #[no_gc]"
@@ -308,22 +308,22 @@ impl<'a> Pruefer<'a> {
             );
             return;
         }
-        if ist_interner_name(name) {
+        if is_interner_name(name) {
             return;
         }
-        match self.markiert.get(name) {
+        match self.marked.get(name) {
             Some(false) => {
                 // Regel 2: Aufruf ohne #[no_gc] — bricht die Kette.
-                self.melde(
+                self.report(
                     sp,
                     format!(
-                        "'{wer}' ist #[no_gc], ruft aber '{}' ohne #[no_gc]",
-                        lesbar(name)
+                        "'{who}' ist #[no_gc], ruft aber '{}' ohne #[no_gc]",
+                        readable(name)
                     ),
                     format!(
                         "SPEC 3.5.4: die Zusage gilt transitiv fuer den ganzen Aufrufbaum — \
                          schreibe #[no_gc] vor '{}' oder rufe es hier nicht auf",
-                        lesbar(name)
+                        readable(name)
                     ),
                 );
             }
@@ -333,7 +333,7 @@ impl<'a> Pruefer<'a> {
         }
     }
 
-    fn pruefe_match_faelle(&mut self, name: &str) {
+    fn check_match_cases(&mut self, name: &str) {
         let idx = match name
             .strip_prefix(crate::sema_match::MATCH_PREFIX)
             .and_then(|s| s.parse::<usize>().ok())
@@ -345,15 +345,15 @@ impl<'a> Pruefer<'a> {
             Some(m) => m,
             None => return,
         };
-        if self.tiefe >= MAX_TIEFE {
+        if self.depth >= MAX_TIEFE {
             return;
         }
-        self.tiefe += 1;
-        self.pruefe_expr(&mi.subject);
+        self.depth += 1;
+        self.check_expr(&mi.subject);
         for arm in &mi.arms {
-            self.pruefe_block(&arm.body);
+            self.check_block(&arm.body);
         }
-        self.tiefe -= 1;
+        self.depth -= 1;
     }
 }
 
@@ -368,27 +368,27 @@ mod tests {
         Span { file: 0, line, col, len: 1 }
     }
 
-    struct Bau {
-        naechste: ExprId,
+    struct Build {
+        next: ExprId,
     }
 
-    impl Bau {
-        fn neu() -> Bau {
-            Bau { naechste: 0 }
+    impl Build {
+        fn new() -> Build {
+            Build { next: 0 }
         }
         fn expr(&mut self, sp: Span, kind: ExprKind) -> Expr {
-            let id = self.naechste;
-            self.naechste += 1;
+            let id = self.next;
+            self.next += 1;
             Expr { id, span: sp, kind }
         }
-        fn aufruf(&mut self, name: &str, sp: Span) -> Expr {
+        fn call(&mut self, name: &str, sp: Span) -> Expr {
             self.expr(sp, ExprKind::Call(name.to_string(), Vec::new(), sp))
         }
         fn ident(&mut self, name: &str, sp: Span) -> Expr {
             self.expr(sp, ExprKind::Ident(name.to_string()))
         }
-        fn feld(&mut self, basis: Expr, name: &str, sp: Span) -> Expr {
-            self.expr(sp, ExprKind::Field(Box::new(basis), name.to_string(), sp))
+        fn field(&mut self, base: Expr, name: &str, sp: Span) -> Expr {
+            self.expr(sp, ExprKind::Field(Box::new(base), name.to_string(), sp))
         }
     }
 
@@ -407,7 +407,7 @@ mod tests {
         }
     }
 
-    fn programm(funcs: Vec<FnDecl>, expr_count: u32) -> Program {
+    fn program(funcs: Vec<FnDecl>, expr_count: u32) -> Program {
         Program {
             profile: None,
             imports: Vec::new(),
@@ -416,188 +416,188 @@ mod tests {
             structs: Vec::new(),
             consts: Vec::new(),
             expr_count,
-            comptime_bloecke: Vec::new(),
+            comptime_blocks: Vec::new(),
         }
     }
 
     /// Vorhersagen fuer die Selbsttests: `gc_neu` alloziert, `Gc[T]` wird
     /// durch `Type::Ptr` vertreten.
-    fn test_regeln() -> Regeln {
+    fn test_rules() -> Rules {
         fn alloc(n: &str) -> bool {
-            n == "gc_neu"
+            n == "gc_new"
         }
-        fn zeiger(t: &Type) -> bool {
+        fn ptr(t: &Type) -> bool {
             matches!(t, Type::Ptr { .. })
         }
-        Regeln { ist_alloc: alloc, ist_gc_zeiger: zeiger }
+        Rules { is_alloc: alloc, is_gc_ref: ptr }
     }
 
     // ------------------------------------------------------------- Regeln
 
     #[test]
-    fn regel1_gc_allokation_ist_verboten() {
-        let mut b = Bau::neu();
-        let ruf = b.aufruf("gc_neu", span(7, 12));
-        let n = b.naechste;
-        let prog = programm(vec![fndecl("heiss", true, vec![Stmt::Expr(ruf)])], n);
-        let befunde = sammle_befunde(&prog, &vec![Type::I32; n as usize], test_regeln());
-        assert_eq!(befunde.len(), 1, "{:?}", befunde);
-        assert_eq!((befunde[0].0.line, befunde[0].0.col), (7, 12));
-        assert!(befunde[0].1.contains("alloziert"), "{}", befunde[0].1);
+    fn regel1_gc_allocation_is_forbidden() {
+        let mut b = Build::new();
+        let call = b.call("gc_new", span(7, 12));
+        let n = b.next;
+        let prog = program(vec![fndecl("hot", true, vec![Stmt::Expr(call)])], n);
+        let findings = collect_findings(&prog, &vec![Type::I32; n as usize], test_rules());
+        assert_eq!(findings.len(), 1, "{:?}", findings);
+        assert_eq!((findings[0].0.line, findings[0].0.col), (7, 12));
+        assert!(findings[0].1.contains("alloziert"), "{}", findings[0].1);
     }
 
     #[test]
-    fn regel2_aufruf_ohne_no_gc_ist_verboten() {
-        let mut b = Bau::neu();
-        let ruf = b.aufruf("kalt", span(9, 5));
-        let n = b.naechste;
-        let prog = programm(
+    fn regel2_call_without_no_gc_is_forbidden() {
+        let mut b = Build::new();
+        let call = b.call("cold", span(9, 5));
+        let n = b.next;
+        let prog = program(
             vec![
-                fndecl("heiss", true, vec![Stmt::Expr(ruf)]),
-                fndecl("kalt", false, Vec::new()),
+                fndecl("hot", true, vec![Stmt::Expr(call)]),
+                fndecl("cold", false, Vec::new()),
             ],
             n,
         );
-        let befunde = sammle_befunde(&prog, &vec![Type::I32; n as usize], test_regeln());
-        assert_eq!(befunde.len(), 1, "{:?}", befunde);
-        assert_eq!((befunde[0].0.line, befunde[0].0.col), (9, 5));
-        assert!(befunde[0].1.contains("ohne #[no_gc]"), "{}", befunde[0].1);
+        let findings = collect_findings(&prog, &vec![Type::I32; n as usize], test_rules());
+        assert_eq!(findings.len(), 1, "{:?}", findings);
+        assert_eq!((findings[0].0.line, findings[0].0.col), (9, 5));
+        assert!(findings[0].1.contains("ohne #[no_gc]"), "{}", findings[0].1);
     }
 
     #[test]
-    fn regel2_markierter_aufruf_ist_erlaubt() {
-        let mut b = Bau::neu();
-        let ruf = b.aufruf("auch_heiss", span(9, 5));
-        let n = b.naechste;
-        let prog = programm(
+    fn regel2_marked_call_is_allowed() {
+        let mut b = Build::new();
+        let call = b.call("auch_heiss", span(9, 5));
+        let n = b.next;
+        let prog = program(
             vec![
-                fndecl("heiss", true, vec![Stmt::Expr(ruf)]),
+                fndecl("hot", true, vec![Stmt::Expr(call)]),
                 fndecl("auch_heiss", true, Vec::new()),
             ],
             n,
         );
-        assert!(sammle_befunde(&prog, &vec![Type::I32; n as usize], test_regeln()).is_empty());
+        assert!(collect_findings(&prog, &vec![Type::I32; n as usize], test_rules()).is_empty());
     }
 
     #[test]
-    fn regel3_schreiben_in_gc_feld_ist_verboten() {
-        let mut b = Bau::neu();
-        let basis = b.ident("knoten", span(4, 5));
-        let ziel = b.feld(basis, "elternteil", span(4, 12));
-        let wert = b.ident("anderer", span(4, 26));
-        let n = b.naechste;
-        let ziel_id = ziel.id as usize;
-        let stmt = Stmt::Assign { target: ziel, value: wert, span: span(4, 5) };
-        let prog = programm(vec![fndecl("heiss", true, vec![stmt])], n);
-        let mut typen = vec![Type::I32; n as usize];
-        typen[ziel_id] = Type::Ptr { mutable: true, inner: Box::new(Type::I32) };
-        let befunde = sammle_befunde(&prog, &typen, test_regeln());
-        assert_eq!(befunde.len(), 1, "{:?}", befunde);
-        assert_eq!((befunde[0].0.line, befunde[0].0.col), (4, 12));
-        assert!(befunde[0].1.contains("GC-Feld 'elternteil'"), "{}", befunde[0].1);
+    fn regel3_write_in_gc_field_is_forbidden() {
+        let mut b = Build::new();
+        let base = b.ident("node", span(4, 5));
+        let target = b.field(base, "elternteil", span(4, 12));
+        let value = b.ident("anderer", span(4, 26));
+        let n = b.next;
+        let target_id = target.id as usize;
+        let stmt = Stmt::Assign { target: target, value: value, span: span(4, 5) };
+        let prog = program(vec![fndecl("hot", true, vec![stmt])], n);
+        let mut types = vec![Type::I32; n as usize];
+        types[target_id] = Type::Ptr { mutable: true, inner: Box::new(Type::I32) };
+        let findings = collect_findings(&prog, &types, test_rules());
+        assert_eq!(findings.len(), 1, "{:?}", findings);
+        assert_eq!((findings[0].0.line, findings[0].0.col), (4, 12));
+        assert!(findings[0].1.contains("GC-Feld 'elternteil'"), "{}", findings[0].1);
     }
 
     #[test]
-    fn regel3_zuweisung_an_oertliche_veraenderliche_ist_erlaubt() {
-        let mut b = Bau::neu();
-        let ziel = b.ident("x", span(4, 5));
-        let wert = b.ident("y", span(4, 9));
-        let n = b.naechste;
-        let ziel_id = ziel.id as usize;
-        let stmt = Stmt::Assign { target: ziel, value: wert, span: span(4, 5) };
-        let prog = programm(vec![fndecl("heiss", true, vec![stmt])], n);
-        let mut typen = vec![Type::I32; n as usize];
-        typen[ziel_id] = Type::Ptr { mutable: true, inner: Box::new(Type::I32) };
-        assert!(sammle_befunde(&prog, &typen, test_regeln()).is_empty());
+    fn regel3_assign_an_local_mutable_is_allowed() {
+        let mut b = Build::new();
+        let target = b.ident("x", span(4, 5));
+        let value = b.ident("y", span(4, 9));
+        let n = b.next;
+        let target_id = target.id as usize;
+        let stmt = Stmt::Assign { target: target, value: value, span: span(4, 5) };
+        let prog = program(vec![fndecl("hot", true, vec![stmt])], n);
+        let mut types = vec![Type::I32; n as usize];
+        types[target_id] = Type::Ptr { mutable: true, inner: Box::new(Type::I32) };
+        assert!(collect_findings(&prog, &types, test_rules()).is_empty());
     }
 
     #[test]
-    fn unmarkierte_funktion_wird_nicht_geprueft() {
-        let mut b = Bau::neu();
-        let ruf = b.aufruf("gc_neu", span(3, 3));
-        let n = b.naechste;
-        let prog = programm(vec![fndecl("kalt", false, vec![Stmt::Expr(ruf)])], n);
-        assert!(sammle_befunde(&prog, &vec![Type::I32; n as usize], test_regeln()).is_empty());
+    fn unmarked_func_becomes_not_checked() {
+        let mut b = Build::new();
+        let call = b.call("gc_new", span(3, 3));
+        let n = b.next;
+        let prog = program(vec![fndecl("cold", false, vec![Stmt::Expr(call)])], n);
+        assert!(collect_findings(&prog, &vec![Type::I32; n as usize], test_rules()).is_empty());
     }
 
     #[test]
-    fn interne_namen_loesen_keinen_fehler_aus() {
-        let mut b = Bau::neu();
-        let m = b.aufruf("__match#0", span(3, 3));
-        let t = b.aufruf("__try#", span(4, 3));
-        let c = b.aufruf("Farbe::Rot", span(5, 3));
-        let u = b.aufruf("gibtesnicht", span(6, 3));
-        let n = b.naechste;
-        let prog = programm(
+    fn internal_names_solve_no_error_out() {
+        let mut b = Build::new();
+        let m = b.call("__match#0", span(3, 3));
+        let t = b.call("__try#", span(4, 3));
+        let c = b.call("Farbe::Rot", span(5, 3));
+        let u = b.call("does_not_exist", span(6, 3));
+        let n = b.next;
+        let prog = program(
             vec![fndecl(
-                "heiss",
+                "hot",
                 true,
                 vec![Stmt::Expr(m), Stmt::Expr(t), Stmt::Expr(c), Stmt::Expr(u)],
             )],
             n,
         );
-        assert!(sammle_befunde(&prog, &vec![Type::I32; n as usize], test_regeln()).is_empty());
+        assert!(collect_findings(&prog, &vec![Type::I32; n as usize], test_rules()).is_empty());
     }
 
     #[test]
-    fn modulname_wird_lesbar_gemeldet() {
-        let mut b = Bau::neu();
-        let ruf = b.aufruf("helfer__quadrat", span(11, 12));
-        let n = b.naechste;
-        let prog = programm(
+    fn module_name_becomes_readable_reported() {
+        let mut b = Build::new();
+        let call = b.call("helfer__quadrat", span(11, 12));
+        let n = b.next;
+        let prog = program(
             vec![
-                fndecl("heiss", true, vec![Stmt::Expr(ruf)]),
+                fndecl("hot", true, vec![Stmt::Expr(call)]),
                 fndecl("helfer__quadrat", false, Vec::new()),
             ],
             n,
         );
-        let befunde = sammle_befunde(&prog, &vec![Type::I32; n as usize], test_regeln());
-        assert_eq!(befunde.len(), 1, "{:?}", befunde);
-        assert!(befunde[0].1.contains("'helfer.quadrat'"), "{}", befunde[0].1);
+        let findings = collect_findings(&prog, &vec![Type::I32; n as usize], test_rules());
+        assert_eq!(findings.len(), 1, "{:?}", findings);
+        assert!(findings[0].1.contains("'helfer.quadrat'"), "{}", findings[0].1);
     }
 
     #[test]
-    fn tiefe_verschachtelung_wird_erreicht() {
+    fn depth_nesting_becomes_reaches() {
         // Der Verstoss steckt in einer if-in-while-in-if-Kette.
-        let mut b = Bau::neu();
-        let ruf = b.aufruf("kalt", span(20, 9));
+        let mut b = Build::new();
+        let call = b.call("cold", span(20, 9));
         let cond1 = b.expr(span(10, 1), ExprKind::Bool(true));
         let cond2 = b.expr(span(11, 1), ExprKind::Bool(true));
-        let innen = Stmt::If {
+        let inner = Stmt::If {
             cond: cond2,
-            then: Block { stmts: vec![Stmt::Expr(ruf)], span: span(11, 1) },
+            then: Block { stmts: vec![Stmt::Expr(call)], span: span(11, 1) },
             els: None,
             span: span(11, 1),
         };
-        let mitte = Stmt::While {
+        let mid = Stmt::While {
             cond: cond1,
-            body: Block { stmts: vec![innen], span: span(10, 1) },
+            body: Block { stmts: vec![inner], span: span(10, 1) },
             span: span(10, 1),
         };
-        let n = b.naechste;
-        let prog = programm(
+        let n = b.next;
+        let prog = program(
             vec![
-                fndecl("heiss", true, vec![Stmt::Block(Block { stmts: vec![mitte], span: span(9, 1) })]),
-                fndecl("kalt", false, Vec::new()),
+                fndecl("hot", true, vec![Stmt::Block(Block { stmts: vec![mid], span: span(9, 1) })]),
+                fndecl("cold", false, Vec::new()),
             ],
             n,
         );
-        let befunde = sammle_befunde(&prog, &vec![Type::I32; n as usize], test_regeln());
-        assert_eq!(befunde.len(), 1, "{:?}", befunde);
-        assert_eq!((befunde[0].0.line, befunde[0].0.col), (20, 9));
+        let findings = collect_findings(&prog, &vec![Type::I32; n as usize], test_rules());
+        assert_eq!(findings.len(), 1, "{:?}", findings);
+        assert_eq!((findings[0].0.line, findings[0].0.col), (20, 9));
     }
 
     #[test]
-    fn hat_no_gc_erkennt_das_attribut() {
-        assert!(hat_no_gc(&fndecl("a", true, Vec::new())));
-        assert!(!hat_no_gc(&fndecl("a", false, Vec::new())));
+    fn has_no_gc_recognizes_the_attr() {
+        assert!(has_no_gc(&fndecl("a", true, Vec::new())));
+        assert!(!has_no_gc(&fndecl("a", false, Vec::new())));
     }
 
     #[test]
-    fn echte_regeln_sind_die_aus_gc_rs() {
+    fn real_rules_are_the_out_gc_rs() {
         // Der Vertrag: der Compiler fragt ausschliesslich gc.rs.
-        let r = Regeln::echt();
-        assert_eq!((r.ist_alloc)("main"), crate::gc::ist_gc_alloc_aufruf("main"));
-        assert_eq!((r.ist_gc_zeiger)(&Type::I32), crate::gc::ist_gc_zeiger(&Type::I32));
+        let r = Rules::real();
+        assert_eq!((r.is_alloc)("main"), crate::gc::is_gc_alloc_call("main"));
+        assert_eq!((r.is_gc_ref)(&Type::I32), crate::gc::is_gc_ref(&Type::I32));
     }
 }

@@ -3,11 +3,11 @@
 #
 #   1. lib/browser/parse_main.fi in DREI Baustufen uebersetzen
 #      (opt / --no-opt / dev-fast) — alle muessen dieselbe Quote liefern
-#   2. tools/html/harness_baum.py gegen tools/html/faelle/*.dat
+#   2. tools/html/harness_baum.py gegen tools/html/cases/*.dat
 #   3. die BEKANNTEN LUECKEN getrennt ausweisen (tools/html/luecken/)
 #   4. Robustheit auf echten Seiten (testdata/realweb/): kein Abbruch, und
 #      alle drei Baustufen liefern denselben Baum, Byte fuer Byte
-#   5. Dauerlauf mit Gegenprobe (tools/html/gc_baum.sh)
+#   5. Dauerlauf mit Gegenprobe (tools/html/gc_tree.sh)
 #   6. Regressionsschranke aus tools/html/mindestquote_baum.txt
 #
 # Nicht bestandene Faelle zaehlen als FEHLSCHLAG. Es wird nichts gefiltert.
@@ -38,7 +38,7 @@ if [ "$SCHNELL" -eq 0 ]; then
 fi
 
 echo
-echo "== 2. Eigene Faelle (tools/html/faelle/*.dat) =="
+echo "== 2. Eigene Faelle (tools/html/cases/*.dat) =="
 python3 tools/html/harness_baum.py "$WORK/parse" \
         --json "$WORK/bilanz.json" --zeige 5 | tee "$WORK/bilanz.txt"
 QUOTE=$(python3 -c "import json;print(json.load(open('$WORK/bilanz.json'))['passed'])")
@@ -89,9 +89,9 @@ echo
 echo "== 5. Dauerlauf: Baeume aufbauen und verwerfen, ohne zu wachsen =="
 if [ "$SCHNELL" -eq 1 ]; then
     BAUM_RUNDEN=${BAUM_RUNDEN:-4000} BAUM_MS=${BAUM_MS:-3000} \
-      BAUM_LECK_RUNDEN=${BAUM_LECK_RUNDEN:-3000} bash tools/html/gc_baum.sh | sed 's/^/   /'
+      BAUM_LECK_RUNDEN=${BAUM_LECK_RUNDEN:-3000} bash tools/html/gc_tree.sh | sed 's/^/   /'
 else
-    bash tools/html/gc_baum.sh | sed 's/^/   /'
+    bash tools/html/gc_tree.sh | sed 's/^/   /'
 fi
 
 echo

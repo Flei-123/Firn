@@ -68,7 +68,7 @@ fn kette(x: i32) -> IoError!i32 {
 
 `try` ist nur in einer Funktion erlaubt, die selbst eine Fehlerunion **derselben
 Fehlermenge** liefert. Sonst gibt es einen Fehler mit Zeile und Spalte
-(`tests/neg/err_try_ausserhalb.fi`, `tests/neg/err_falsche_menge.fi`).
+(`tests/neg/err_try_outside.fi`, `tests/neg/err_wrong_set.fi`).
 
 `try` bindet so stark wie ein unärer Operator: `try f() + 1` ist `(try f()) + 1`.
 
@@ -82,7 +82,7 @@ let z = lies(x) catch |e| deute(e)       // mit Bindung des Fehlerwertes
 
 `catch` bindet schwächer als jeder Operator: `a catch b * 2` ist
 `a catch (b * 2)`. Der Ersatzwert muss den Erfolgstyp haben; sonst Fehler mit
-Zeile und Spalte (`tests/neg/err_catch_typ.fi`).
+Zeile und Spalte (`tests/neg/err_catch_ty.fi`).
 
 ### 2.6 `!T` darf nicht verworfen werden
 

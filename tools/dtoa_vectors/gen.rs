@@ -125,7 +125,7 @@ fn main() {
             for b in &v {
                 buf.extend_from_slice(&b.to_le_bytes());
             }
-            std::io::stdout().write_all(&buf).expect("schreiben");
+            std::io::stdout().write_all(&buf).expect("write");
         }
         "check" => {
             let mut text = String::new();

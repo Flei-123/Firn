@@ -1,0 +1,175 @@
+// expect_out: 1 1 2 128 200 12800 198 1 0
+
+// PFLICHTNACHWEIS zu SPEC §3.4: ein Rc-ZYKLUS LECKT. Das ist kein Fehler
+// dieser Umsetzung, sondern die dokumentierte Eigenschaft der Zaehlung — und
+// genau der Grund, warum 'Rc' fuer den DOM ausdruecklich NICHT vorgesehen ist
+// (siehe docs/RC.md). Der Test macht das Leck SICHTBAR statt es zu verstecken.
+//
+// Aufbau: zwei Zellen a und b, die einander stark halten.
+// 'Rc' ist immer unveraenderlich (kein RefCell-Aequivalent), deshalb kann der
+// Rueckverweis nicht ueber die Rc-Schnittstelle nachgetragen werden — der Test
+// benutzt dafuer den Rohzeiger aus SPEC §3.6 (rc_wert_adresse). Genau das
+// wuerde eine Innenveraenderlichkeit tun; mit ihr waere derselbe Zyklus mit
+// gewoehnlichem Anwendungscode erreichbar.
+//
+// Ausgabe (eine Zeile):
+//   stark_a stark_b lebende belegt   nach dem Verwerfen EINES Zyklus
+//   lebende100 belegt100                nach 100 angelegten+verworfenen Zyklen
+//   lebende_nach_handaufloesung
+//   aufwerten_leer  lebende_weak_variante
+
+struct Cell { partner: usize, id: i64 }
+
+fn heap_empty() -> RcHeap {
+    return RcHeap{
+        base: 0 as usize, capacity: 0 as usize, next: 0 as usize,
+        free: [0 as usize, 0 as usize, 0 as usize, 0 as usize,
+               0 as usize, 0 as usize, 0 as usize, 0 as usize],
+        live: 0 as usize, used: 0 as usize,
+        allocations: 0 as usize, releases: 0 as usize,
+    }
+}
+
+fn new_cell(h: *mut RcHeap, k: i64, out: *mut RefCount[Cell]) -> bool {
+    return rc_new[Cell](h, Cell{ partner: 0 as usize, id: k }, out) catch false
+}
+
+// Traegt den Partner in eine bereits angelegte Zelle nach. Rohzugriff
+// (SPEC §3.6) — ueber 'Rc' selbst ist Schreiben nicht moeglich, siehe
+// tests/neg/rc_unveraenderlich.fi.
+fn partner_set(r: RefCount[Cell], partner_block: usize) {
+    let addr: usize = rc_value_address[Cell](r)
+    *(addr as *mut usize) = partner_block
+}
+
+// Legt einen echten Zyklus a -> b -> a an und verwirft beide aeusseren
+// Griffe. Was bleibt, sind die beiden Verweise IN den Zellen: die Zaehler
+// fallen nie auf 0.
+fn cycle_create_and_discard(h: *mut RcHeap) -> bool {
+    var a: RefCount[Cell] = rc_empty[Cell]()
+    var b: RefCount[Cell] = rc_empty[Cell]()
+    if new_cell(h, 1, &a) == false { return false }
+    if new_cell(h, 2, &b) == false { return false }
+    // a haelt b stark, b haelt a stark.
+    var a_in_b: RefCount[Cell] = rc_clone[Cell](a)
+    var b_in_a: RefCount[Cell] = rc_clone[Cell](b)
+    partner_set(a, rc_raw_address[Cell](b_in_a))
+    partner_set(b, rc_raw_address[Cell](a_in_b))
+    // Die aeusseren Griffe verschwinden (im echten Programm: Blockende).
+    rc_free[Cell](h, &a)
+    rc_free[Cell](h, &b)
+    return true
+}
+
+fn print_number(buf: *mut u8, pos: usize, v: u64) -> usize {
+    var digits: [u8; 24] = [0 as u8; 24]
+    var n: usize = 0 as usize
+    var x: u64 = v
+    if x == 0 as u64 {
+        digits[0] = 48 as u8
+        n = 1 as usize
+    }
+    while x > 0 as u64 {
+        digits[n] = (x % 10 as u64) as u8 + 48 as u8
+        x = x / 10 as u64
+        n = n + 1 as usize
+    }
+    var i: usize = 0 as usize
+    var p: usize = pos
+    while i < n {
+        *((buf as usize + p) as *mut u8) = digits[n - 1 as usize - i]
+        p = p + 1 as usize
+        i = i + 1 as usize
+    }
+    *((buf as usize + p) as *mut u8) = 32 as u8
+    return p + 1 as usize
+}
+
+fn main() -> i32 {
+    var h: RcHeap = heap_empty()
+    if rc_heap_init(&h, 1048576 as usize) == false { return 90 }
+
+    // --- Teil 1: EIN Zyklus, beide Zaehler bleiben bei 1 -------------------
+    var a: RefCount[Cell] = rc_empty[Cell]()
+    var b: RefCount[Cell] = rc_empty[Cell]()
+    if new_cell(&h, 1, &a) == false { return 91 }
+    if new_cell(&h, 2, &b) == false { return 92 }
+    var a_in_b: RefCount[Cell] = rc_clone[Cell](a)
+    var b_in_a: RefCount[Cell] = rc_clone[Cell](b)
+    let addr_a: usize = rc_raw_address[Cell](a)
+    let addr_b: usize = rc_raw_address[Cell](b)
+    partner_set(a, addr_b)
+    partner_set(b, addr_a)
+    rc_free[Cell](&h, &a)
+    rc_free[Cell](&h, &b)
+    // Beide Zaehler stehen weiter auf 1 — der Zyklus haelt sich selbst.
+    let strong_a: u64 = rc_ld64(addr_a + 0 as usize)
+    let strong_b: u64 = rc_ld64(addr_b + 0 as usize)
+    let lebende1: usize = rc_heap_live(&h)
+    let belegt1: usize = rc_heap_used_bytes(&h)
+
+    // --- Teil 2: 100 Zyklen anlegen und verwerfen -> der Verbrauch waechst
+    var i: i64 = 0
+    while i < 99 {
+        if cycle_create_and_discard(&h) == false { return 93 }
+        i = i + 1
+    }
+    let lebende100: usize = rc_heap_live(&h)
+    let belegt100: usize = rc_heap_used_bytes(&h)
+
+    // --- Teil 3: von Hand aufloesen (nur so kommt der Speicher zurueck) ---
+    // Stufe 0 kennt keine Destruktoren; die in den Zellen gespeicherten
+    // Verweise muessen einzeln geloest werden. Fuer die 99 Zyklen aus Teil 2
+    // ist die Adresse nicht mehr bekannt — genau das ist das Leck. Aufgeloest
+    // wird deshalb nur der erste Zyklus, dessen Adressen wir noch haben.
+    var inner_a: RefCount[Cell] = rc_raw_ref[Cell](addr_a)
+    var inner_b: RefCount[Cell] = rc_raw_ref[Cell](addr_b)
+    rc_free[Cell](&h, &inner_a)
+    rc_free[Cell](&h, &inner_b)
+    let live_hand: usize = rc_heap_live(&h)
+
+    // --- Teil 4: derselbe Aufbau mit Weak leckt NICHT ---------------------
+    var h2: RcHeap = heap_empty()
+    if rc_heap_init(&h2, 65536 as usize) == false { return 94 }
+    var x: RefCount[Cell] = rc_empty[Cell]()
+    var y: RefCount[Cell] = rc_empty[Cell]()
+    if new_cell(&h2, 3, &x) == false { return 95 }
+    if new_cell(&h2, 4, &y) == false { return 96 }
+    // y haelt x nur SCHWACH, x haelt y stark -> kein Zyklus aus starken Verweisen.
+    var w: WeakRef[Cell] = weak_of[Cell](x)
+    var y_in_x: RefCount[Cell] = rc_clone[Cell](y)
+    partner_set(x, rc_raw_address[Cell](y_in_x))
+    partner_set(y, weak_raw_address[Cell](w))
+    let addr_y: usize = rc_raw_address[Cell](y)
+    rc_free[Cell](&h2, &y)
+    rc_free[Cell](&h2, &x)
+    // x ist tot: die Aufwertung des schwachen Verweises liefert sichtbar leer.
+    var on: RefCount[Cell] = promote[Cell](w)
+    var empty: u64 = 0 as u64
+    if rc_is_empty[Cell](on) {
+        empty = 1 as u64
+    }
+    // Den inneren starken Verweis von x auf y von Hand loesen (kein 'drop').
+    var inner_y: RefCount[Cell] = rc_raw_ref[Cell](addr_y)
+    rc_free[Cell](&h2, &inner_y)
+    weak_free[Cell](&h2, &w)
+    let live_weak: usize = rc_heap_live(&h2)
+
+    var out: [u8; 128] = [0 as u8; 128]
+    var p: usize = 0 as usize
+    p = print_number(&out[0], p, strong_a)
+    p = print_number(&out[0], p, strong_b)
+    p = print_number(&out[0], p, lebende1 as u64)
+    p = print_number(&out[0], p, belegt1 as u64)
+    p = print_number(&out[0], p, lebende100 as u64)
+    p = print_number(&out[0], p, belegt100 as u64)
+    p = print_number(&out[0], p, live_hand as u64)
+    p = print_number(&out[0], p, empty)
+    p = print_number(&out[0], p, live_weak as u64)
+    out[p - 1 as usize] = 10 as u8
+    syscall(1, 1, &out[0], p as i64)
+
+    rc_heap_free(&h)
+    rc_heap_free(&h2)
+    return 0
+}

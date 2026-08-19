@@ -22,7 +22,7 @@ WHATWG-Standard). Der Laeufer faehrt sie getrennt von der Hauptquote:
     python3 tools/html/harness_baum.py <binary> --luecken
 
 Sie werden eigens ausgewiesen und gehen NICHT in die Quote von
-`tools/html/faelle/` ein. Eine Testsuite, die nur enthaelt, was schon geht,
+`tools/html/cases/` ein. Eine Testsuite, die nur enthaelt, was schon geht,
 sagt nichts ueber das, was fehlt — diese Datei ist die Gegenrechnung.
 
 Die vier `<template>`-Faelle traegt `#orakel-abweichung`: html5lib 1.1 legt

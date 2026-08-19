@@ -172,7 +172,7 @@ impl TypeCtx {
     }
 
     /// Name der gc-Klasse hinter einem Typ, sofern es eine ist.
-    fn gc_klassenname(&self, t: &Type) -> Option<&str> {
+    fn gc_class_name(&self, t: &Type) -> Option<&str> {
         match t {
             Type::Struct(i) => self
                 .structs
@@ -199,8 +199,8 @@ impl TypeCtx {
             Type::F64 => "f64".into(),
             // Ein Zeiger auf eine gc-Klasse heisst im Quelltext `Gc[C]`
             // (der Struct traegt intern den Namen "gc C", siehe gc.rs).
-            Type::Ptr { inner, .. } if self.gc_klassenname(inner).is_some() => {
-                match self.gc_klassenname(inner) {
+            Type::Ptr { inner, .. } if self.gc_class_name(inner).is_some() => {
+                match self.gc_class_name(inner) {
                     Some(n) => format!("Gc[{}]", n),
                     None => "Gc[?]".into(),
                 }

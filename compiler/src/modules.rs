@@ -27,8 +27,8 @@ use std::path::{Path, PathBuf};
 use crate::ast::{Block, Expr, ExprKind, Program, Stmt, TypeExpr};
 use crate::config;
 use crate::diag::{Diag, Diags, Span};
-use crate::paket;
-use crate::paketwelt::{self, Welt};
+use crate::package;
+use crate::package_world::{self, World};
 use crate::lexer::{self, TokKind};
 use crate::parser;
 
@@ -41,8 +41,8 @@ pub struct SourceFile {
 
 /// Baut `<basis>/<teil1>/<teil2>....<endung>` — den Pfad, den ein
 /// `import teil1.teil2` in einem Suchverzeichnis meint.
-fn modul_pfad(basis: &Path, parts: &[String]) -> PathBuf {
-    let mut p = basis.to_path_buf();
+fn module_path(base: &Path, parts: &[String]) -> PathBuf {
+    let mut p = base.to_path_buf();
     for part in parts {
         p.push(part);
     }
@@ -52,8 +52,8 @@ fn modul_pfad(basis: &Path, parts: &[String]) -> PathBuf {
 
 /// `$FIRNLIB` als Suchverzeichnis: gesetzt und nicht leer, sonst nichts.
 /// Reine Funktion, damit die Regel testbar bleibt.
-fn firnlib_pfad(wert: Option<&str>) -> Option<PathBuf> {
-    match wert {
+fn firnlib_path(value: Option<&str>) -> Option<PathBuf> {
+    match value {
         Some(v) if !v.is_empty() => Some(PathBuf::from(v)),
         _ => None,
     }
@@ -65,9 +65,9 @@ fn firnlib_pfad(wert: Option<&str>) -> Option<PathBuf> {
 /// beiden bisherigen Orten (importierende Datei, Wurzeldatei), damit
 /// bestehende Aufloesungen unveraendert bleiben. `firnc1` haelt in
 /// `bin/firnc1.fi` (`imports_sammeln`) dieselbe Reihenfolge ein.
-fn zusaetzliche_suchpfade() -> Vec<PathBuf> {
+fn extra_search_paths() -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
-    if let Some(p) = firnlib_pfad(std::env::var("FIRNLIB").ok().as_deref()) {
+    if let Some(p) = firnlib_path(std::env::var("FIRNLIB").ok().as_deref()) {
         out.push(p);
     }
     if let Ok(exe) = std::env::current_exe() {
@@ -81,16 +81,16 @@ fn zusaetzliche_suchpfade() -> Vec<PathBuf> {
 /// Fehler der Modulaufloesung. `Diag` ist die gewohnte Meldung mit
 /// Quelltextausschnitt; `Paket` ist ein fertig formatierter Text, den
 /// `firnc0` und `firnc1` ZEICHENGLEICH ausgeben (Runde 48).
-pub enum Fehler {
+pub enum Error {
     Diag(Diag),
-    Paket(String),
+    Package(String),
 }
 
 /// Ein Eintrag der Warteschlange: die Datei und der Ort des `import`, der
 /// sie angefordert hat. Zu welchem Paket sie gehoert, ergibt sich aus ihrem
 /// Pfad (`Welt::paket_von`) — nicht daraus, wer sie angefordert hat.
-struct Wartend {
-    pfad: PathBuf,
+struct Waiting {
+    path: PathBuf,
     span: Span,
 }
 
@@ -109,21 +109,21 @@ struct Wartend {
 ///
 /// Ohne Manifest ist `welt` leer, die Schritte 3 und 4 entfallen, und die
 /// Aufloesung ist Zeichen fuer Zeichen die von vor Runde 48.
-pub fn resolve(root: &Path, welt: &Welt) -> Result<Vec<SourceFile>, Fehler> {
-    let arbeitsverz = paketwelt::cwd();
+pub fn resolve(root: &Path, world: &World) -> Result<Vec<SourceFile>, Error> {
+    let work_dir = package_world::cwd();
     let base = root.parent().map(|p| p.to_path_buf()).unwrap_or_default();
     let mut out: Vec<SourceFile> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
-    let mut queue: Vec<Wartend> = vec![Wartend {
-        pfad: root.to_path_buf(),
+    let mut queue: Vec<Waiting> = vec![Waiting {
+        path: root.to_path_buf(),
         span: Span::none(),
     }];
     // Modulname -> zuerst gesehener Pfad, fuer die Konfliktpruefung.
-    let mut namen: HashMap<String, String> = HashMap::new();
+    let mut names: HashMap<String, String> = HashMap::new();
     while !queue.is_empty() {
-        let eintrag = queue.remove(0);
-        let path = eintrag.pfad;
-        let span = eintrag.span;
+        let entry = queue.remove(0);
+        let path = entry.path;
+        let span = entry.span;
         let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
         if !seen.insert(key) {
             continue;
@@ -131,7 +131,7 @@ pub fn resolve(root: &Path, welt: &Welt) -> Result<Vec<SourceFile>, Fehler> {
         let src = match std::fs::read_to_string(&path) {
             Ok(s) => s,
             Err(e) => {
-                return Err(Fehler::Diag(Diag {
+                return Err(Error::Diag(Diag {
                     msg: format!("kann '{}' nicht lesen: {}", path.display(), e),
                     span,
                     label: "hier".to_string(),
@@ -147,26 +147,26 @@ pub fn resolve(root: &Path, welt: &Welt) -> Result<Vec<SourceFile>, Fehler> {
             }
         };
         let id = out.len() as u32;
-        let abs_datei = paketwelt::absolut(&path.display().to_string(), &arbeitsverz);
-        let mein_paket = if welt.ist_leer() {
+        let abs_file = package_world::absolute(&path.display().to_string(), &work_dir);
+        let my_package = if world.is_empty() {
             None
         } else {
-            welt.paket_von(&abs_datei)
+            world.package_of(&abs_file)
         };
         // NAMENSKONFLIKT: zwei verschiedene Dateien mit demselben Modulnamen
         // wuerden auf dieselbe interne Umbenennung `modul__name` fallen und
         // sich still ueberdecken. Nur mit Manifest geprueft — ohne Manifest
         // bleibt alles wie bisher.
-        if !welt.ist_leer() {
-            let mname = paket::modulname(&abs_datei);
-            match namen.get(&mname) {
-                Some(vorher) if *vorher != abs_datei => {
-                    return Err(Fehler::Paket(paketwelt::text_namenskonflikt(
-                        &mname, vorher, &abs_datei,
+        if !world.is_empty() {
+            let mname = package::module_name(&abs_file);
+            match names.get(&mname) {
+                Some(before) if *before != abs_file => {
+                    return Err(Error::Package(package_world::text_name_clash(
+                        &mname, before, &abs_file,
                     )));
                 }
                 _ => {
-                    namen.insert(mname, abs_datei.clone());
+                    names.insert(mname, abs_file.clone());
                 }
             }
         }
@@ -181,27 +181,27 @@ pub fn resolve(root: &Path, welt: &Welt) -> Result<Vec<SourceFile>, Fehler> {
         // Der Rueckfall auf die Wurzel bleibt, damit bestehende Programme
         // unveraendert weiterlaufen: `tests/*.fi` binden `modules.mathe` ein,
         // und dort sind beide Wege derselbe.
-        let eigenes = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
-        let zusaetze = zusaetzliche_suchpfade();
+        let own = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        let extras = extra_search_paths();
         for (parts, ispan) in scan_imports(&src, id) {
-            let mut p = modul_pfad(&eigenes, &parts);
+            let mut p = module_path(&own, &parts);
             if !p.exists() {
-                let q = modul_pfad(&base, &parts);
+                let q = module_path(&base, &parts);
                 if q.exists() {
                     p = q;
                 }
             }
             // (3) und (4): die Sicht des Pakets, zu dem diese Datei gehoert.
             if !p.exists() {
-                if let Some(pi) = mein_paket {
-                    if let Some(q) = paket_kandidat(welt, pi, &parts) {
+                if let Some(pi) = my_package {
+                    if let Some(q) = package_candidate(world, pi, &parts) {
                         p = q;
                     }
                 }
             }
             if !p.exists() {
-                for z in &zusaetze {
-                    let q = modul_pfad(z, &parts);
+                for z in &extras {
+                    let q = module_path(z, &parts);
                     if q.exists() {
                         p = q;
                         break;
@@ -211,29 +211,29 @@ pub fn resolve(root: &Path, welt: &Welt) -> Result<Vec<SourceFile>, Fehler> {
             // SICHTBARKEIT: fuehrt der Treffer in ein ANDERES Paket, muss es
             // eine eingetragene Abhaengigkeit sein und das Modul muss in
             // dessen `oeffentlich`-Liste stehen.
-            if !welt.ist_leer() {
-                let ziel = paketwelt::absolut(&p.display().to_string(), &arbeitsverz);
-                if let (Some(zp), Some(mp)) = (welt.paket_von(&ziel), mein_paket) {
+            if !world.is_empty() {
+                let target = package_world::absolute(&p.display().to_string(), &work_dir);
+                if let (Some(zp), Some(mp)) = (world.package_of(&target), my_package) {
                     if zp != mp {
-                        if welt.kante(mp, welt.name(zp)) != Some(zp) {
-                            return Err(Fehler::Paket(paketwelt::text_keine_abhaengigkeit(
-                                welt.name(zp),
-                                welt.name(mp),
-                                &welt.pakete[mp].manifestpfad,
+                        if world.edge(mp, world.name(zp)) != Some(zp) {
+                            return Err(Error::Package(package_world::text_no_dependency(
+                                world.name(zp),
+                                world.name(mp),
+                                &world.packages[mp].manifestpfad,
                             )));
                         }
-                        let modul = paket::modulname(&ziel);
-                        if !welt.pakete[zp].manifest.ist_oeffentlich(&modul) {
-                            return Err(Fehler::Paket(paketwelt::text_nicht_oeffentlich(
-                                &modul,
-                                welt.name(zp),
-                                &welt.pakete[zp].manifestpfad,
+                        let module = package::module_name(&target);
+                        if !world.packages[zp].manifest.is_public(&module) {
+                            return Err(Error::Package(package_world::text_not_public(
+                                &module,
+                                world.name(zp),
+                                &world.packages[zp].manifestpfad,
                             )));
                         }
                     }
                 }
             }
-            queue.push(Wartend { pfad: p, span: ispan });
+            queue.push(Waiting { path: p, span: ispan });
         }
         out.push(SourceFile { id, path, src });
     }
@@ -242,8 +242,8 @@ pub fn resolve(root: &Path, welt: &Welt) -> Result<Vec<SourceFile>, Fehler> {
     // zusaetzliche Kommandozeilenoption.
     // Runde 49: HIER wird die Laufzeit wirklich Teil des Programms — und nur
     // dann muss der Zustandsblock im Assembler stehen (codegen_x86::emit).
-    if let Some(f) = gc_laufzeit(&out) {
-        crate::gc::laufzeit_merken();
+    if let Some(f) = gc_runtime(&out) {
+        crate::gc::runtime_remember();
         out.push(f);
     }
     Ok(out)
@@ -251,30 +251,30 @@ pub fn resolve(root: &Path, welt: &Welt) -> Result<Vec<SourceFile>, Fehler> {
 
 /// Schritt 3 und 4 der Suche: Projektquellen, dann Abhaengigkeiten.
 /// Liefert den ersten Pfad, der wirklich existiert.
-fn paket_kandidat(welt: &Welt, pi: usize, parts: &[String]) -> Option<PathBuf> {
-    let p = &welt.pakete[pi];
+fn package_candidate(world: &World, pi: usize, parts: &[String]) -> Option<PathBuf> {
+    let p = &world.packages[pi];
     // (3) eigene Quellverzeichnisse
-    for q in &p.manifest.quellen {
-        let basis = paket::verbinde(&p.wurzel, q);
-        let kand = modul_pfad(Path::new(&basis), parts);
-        if kand.exists() {
-            return Some(kand);
+    for q in &p.manifest.sources {
+        let base = package::join(&p.root, q);
+        let cand = module_path(Path::new(&base), parts);
+        if cand.exists() {
+            return Some(cand);
         }
     }
     // (4) Abhaengigkeit: der ERSTE Pfadteil nennt das Paket.
-    let kopf = parts.first()?;
-    let di = welt.kante(pi, kopf)?;
-    let dp = &welt.pakete[di];
+    let header = parts.first()?;
+    let di = world.edge(pi, header)?;
+    let dp = &world.packages[di];
     let rest: Vec<String> = if parts.len() > 1 {
         parts[1..].to_vec()
     } else {
-        vec![kopf.clone()]
+        vec![header.clone()]
     };
-    for q in &dp.manifest.quellen {
-        let basis = paket::verbinde(&dp.wurzel, q);
-        let kand = modul_pfad(Path::new(&basis), &rest);
-        if kand.exists() {
-            return Some(kand);
+    for q in &dp.manifest.sources {
+        let base = package::join(&dp.root, q);
+        let cand = module_path(Path::new(&base), &rest);
+        if cand.exists() {
+            return Some(cand);
         }
     }
     None
@@ -282,39 +282,39 @@ fn paket_kandidat(welt: &Welt, pi: usize, parts: &[String]) -> Option<PathBuf> {
 
 /// Pfad der eingezogenen GC-Laufzeit (Modulname bleibt leer: ihre Namen sind
 /// programmweit, genau wie die Fehlermengennamen).
-pub(crate) fn gc_laufzeit(files: &[SourceFile]) -> Option<SourceFile> {
-    let mut braucht = false;
-    let mut hat_allocerror = false;
+pub(crate) fn gc_runtime(files: &[SourceFile]) -> Option<SourceFile> {
+    let mut needs = false;
+    let mut has_allocerror = false;
     // Runde 47: der Finalisierer-Verteiler zaehlt NUR aus der Wurzeldatei.
     // In einem Modul hiesse er `modul__gc_finalisiere` und die Laufzeit
     // faende ihn nicht mehr (siehe `module_name` weiter unten).
-    let mut hat_finalisierer = false;
+    let mut has_finalizer = false;
     // Runde 53: `GcVec`/`GcMap` kommen nur dazu, wenn sie vorkommen.
-    let mut braucht_sammlungen = false;
+    let mut needs_collections = false;
     // Runde 49: dasselbe fuer den Fadenverteiler.
-    let mut hat_fadenarbeit = false;
+    let mut has_thread_work = false;
     for f in files {
         let mut dg = Diags::new("<gc-suche>", &f.src);
         let toks = lexer::lex_file(&f.src, f.id, &mut dg);
-        braucht |= crate::gc::quelle_braucht_gc(&toks);
-        hat_allocerror |= crate::gc::quelle_hat_allocerror(&toks);
-        braucht_sammlungen |= crate::gc::quelle_braucht_sammlungen(&toks);
+        needs |= crate::gc::source_needs_gc(&toks);
+        has_allocerror |= crate::gc::source_has_allocerror(&toks);
+        needs_collections |= crate::gc::source_needs_collections(&toks);
         if f.id == 0 {
-            hat_finalisierer = crate::gc::quelle_hat_finalisierer(&toks);
-            hat_fadenarbeit = crate::gc::quelle_hat_fadenarbeit(&toks);
+            has_finalizer = crate::gc::source_has_finalizer(&toks);
+            has_thread_work = crate::gc::source_has_thread_work(&toks);
         }
     }
-    if !braucht {
+    if !needs {
         return None;
     }
     Some(SourceFile {
         id: files.len() as u32,
         path: PathBuf::from(crate::gc::LAUFZEIT_PFAD),
-        src: crate::gc::laufzeit_quelle(
-            !hat_allocerror,
-            !hat_finalisierer,
-            !hat_fadenarbeit,
-            braucht_sammlungen,
+        src: crate::gc::runtime_source(
+            !has_allocerror,
+            !has_finalizer,
+            !has_thread_work,
+            needs_collections,
         ),
     })
 }
@@ -395,7 +395,7 @@ pub const ENTRY_SYMBOL: &str = "main";
 ///
 /// ```text
 /// _F0.add             Element der Wurzeldatei
-/// _F0.helfer__quadrat Element eines Moduls
+/// _F0.helper__square Element eines Moduls
 /// _F0.add.v3          mit ABI-Version (spaeter, #[abi_stable(3)])
 /// main                der Einstiegspunkt, unveraendert
 /// ```
@@ -452,26 +452,26 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
     // Der Reset der Hooks gehoert deshalb hierher, EINMAL fuer die ganze
     // Uebersetzung, und danach werden alle Dateien vorab gescannt.
     parser::reset_hooks();
-    let mut alle: Vec<Vec<lexer::Token>> = Vec::new();
+    let mut all: Vec<Vec<lexer::Token>> = Vec::new();
     for f in files {
         let toks = lexer::lex_file(&f.src, f.id, dg);
         crate::sema_generic::hook_prescan(&toks);
-        alle.push(toks);
+        all.push(toks);
     }
     for (i, f) in files.iter().enumerate() {
-        let p = parser::parse_module(&alle[i], dg, f.id, base_id);
+        let p = parser::parse_module(&all[i], dg, f.id, base_id);
         base_id = p.expr_count;
         progs.push(p);
     }
     if dg.has_errors() {
         return None;
     }
-    // HOOK profil (profil.rs, Runde 52): das Profil steht in der ERSTEN Datei
+    // HOOK profil (prof.rs, Runde 52): das Profil steht in der ERSTEN Datei
     // (der Wurzeldatei); `--profile=` gewinnt. Es muss hier schon feststehen,
     // weil die `import`-Regel unmittelbar darunter danach fragt — der
     // Typpruefer laeuft erst viel spaeter.
     if let Some(root) = progs.first() {
-        crate::profil::festlegen(root, None);
+        crate::prof::define(root, None);
     }
 
     // Was bietet welches Modul an?
@@ -488,10 +488,10 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
             items.insert(x.name.clone());
         }
         for im in &p.imports {
-            // HOOK profil (profil.rs, Runde 52): im Kernel-Profil ist die
+            // HOOK profil (prof.rs, Runde 52): im Kernel-Profil ist die
             // Standardbibliothek gesperrt. Die Pruefung sitzt hier, weil nur
             // hier die Einbindungen JEDER Datei mit Position bekannt sind.
-            crate::profil::hook_import(dg, &im.path, im.span);
+            crate::prof::hook_import(dg, &im.path, im.span);
             let target = im.path.last().cloned().unwrap_or_default();
             let known = files.iter().any(|g| module_name(g) == target);
             if !known {
@@ -533,7 +533,7 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
             // daraus `vec__i32__kleiner`, suchte `x.kleiner(..)` weiter
             // `i32__kleiner` und faende nichts — dieselbe Regel wie fuer
             // Schnittstellen, gc-Klassen und generische Vorlagen.
-            if crate::iface::ist_grundtyp_methode(&f.name) {
+            if crate::iface::is_base_ty_method(&f.name) {
                 continue;
             }
             f.name = mangle(&m, &f.name);
@@ -574,9 +574,9 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
         // Der NAME der Vorlage bleibt unangetastet: die Auspraegung sucht ihn
         // spaeter unter dem urspruenglichen Namen (`mono::expand_fn` ueber
         // `Instantiation::base`), und generische Namen gelten programmweit.
-        let datei_id = files[idx].id;
-        for name in crate::sema_generic::fn_vorlagen_der_datei(datei_id) {
-            crate::sema_generic::mit_fn_vorlage(&name, |decl| {
+        let file_id = files[idx].id;
+        for name in crate::sema_generic::fn_templates_the_file(file_id) {
+            crate::sema_generic::with_fn_template(&name, |decl| {
                 r.locals.clear();
                 r.push_scope();
                 for prm in decl.params.iter_mut() {
@@ -590,8 +590,8 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
                 r.pop_scope();
             });
         }
-        for name in crate::sema_generic::struct_vorlagen_der_datei(datei_id) {
-            crate::sema_generic::mit_struct_vorlage(&name, |decl| {
+        for name in crate::sema_generic::struct_templates_the_file(file_id) {
+            crate::sema_generic::with_struct_template(&name, |decl| {
                 for (_, t, _) in decl.fields.iter_mut() {
                     r.ty(t);
                 }
@@ -606,7 +606,7 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
         merged.consts.append(&mut p.consts);
         // `comptime { … }`-Bloecke gehoeren zum zusammengefuehrten Programm —
         // sonst laufen sie nie (SPEC §6.4).
-        merged.comptime_bloecke.append(&mut p.comptime_bloecke);
+        merged.comptime_blocks.append(&mut p.comptime_blocks);
     }
     if dg.has_errors() {
         return None;
@@ -845,7 +845,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn imports_werden_gefunden() {
+    fn imports_become_found() {
         let src = "import std.io\nimport helfer\nfn main() -> i32 { return 0 }\n";
         let found = scan_imports(src, 0);
         assert_eq!(found.len(), 2);
@@ -854,31 +854,31 @@ mod tests {
     }
 
     #[test]
-    fn suchpfade_und_modulpfad() {
+    fn search_paths_and_module_path() {
         // modul_pfad: teile werden zu <basis>/a/b.fi.
         assert_eq!(
-            modul_pfad(Path::new("x"), &["std".to_string(), "math".to_string()]),
+            module_path(Path::new("x"), &["std".to_string(), "math".to_string()]),
             PathBuf::from("x/std/math.fi")
         );
         // FIRNLIB: leer oder ungesetzt heisst "kein zusaetzlicher pfad".
-        assert_eq!(firnlib_pfad(None), None);
-        assert_eq!(firnlib_pfad(Some("")), None);
+        assert_eq!(firnlib_path(None), None);
+        assert_eq!(firnlib_path(Some("")), None);
         assert_eq!(
-            firnlib_pfad(Some("/opt/firn/lib")),
+            firnlib_path(Some("/opt/firn/lib")),
             Some(PathBuf::from("/opt/firn/lib"))
         );
     }
 
     #[test]
-    fn namen_werden_je_modul_verschieden() {
+    fn names_become_je_module_different() {
         assert_eq!(mangle("", "main"), "main");
-        assert_eq!(mangle("helfer", "quadrat"), "helfer__quadrat");
-        assert_eq!(mangle("", "quadrat"), "quadrat");
+        assert_eq!(mangle("helper", "square"), "helper__square");
+        assert_eq!(mangle("", "square"), "square");
         // Linker-Symbole: reservierter Praefix + Schemaversion (DESIGNZIELE 4)
-        assert_eq!(symbol("quadrat", None), "_F0.quadrat");
-        assert_eq!(symbol("helfer__quadrat", None), "_F0.helfer__quadrat");
+        assert_eq!(symbol("square", None), "_F0.square");
+        assert_eq!(symbol("helper__square", None), "_F0.helper__square");
         // Platz fuer die ABI-Version ist da.
-        assert_eq!(symbol("helfer__quadrat", Some(3)), "_F0.helfer__quadrat.v3");
+        assert_eq!(symbol("helper__square", Some(3)), "_F0.helper__square.v3");
         // Der Einstiegspunkt behaelt seinen nackten Namen.
         assert_eq!(symbol("main", None), "main");
         // Nutzercode kann den Praefix nicht erzeugen: Bezeichner haben keine Punkte.

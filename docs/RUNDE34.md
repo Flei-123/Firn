@@ -30,11 +30,11 @@ Firnc0 hat dieselbe Stelle in `main.rs`, dort steht `intern_nummer`.
 Jetzt `intern_nummer` — internen ist billig und idempotent.
 
 ## Messwerte
-- `tools/selbst_vergleich.sh`: 169 -> **179** verhaltensgleich, 0 abweichend,
+- `tools/self_compare.sh`: 169 -> **179** verhaltensgleich, 0 abweichend,
   0 fehlerhaft (alle neun gc-Dateien inklusive 510 Zyklus und 560 DOM-Zyklen)
 - Fixpunkt: Stufe 2 == Stufe 3, zeichengleich, **279 201 Zeilen** Assembler
 - Negativtests brechen wie firnc0 ab: nogc_transitiv, nogc_aufruf_ohne_attribut,
   nogc_modulgrenze, gc_klasse_auf_dem_stapel, gc_mehrfachvererbung,
   gc_as_nicht_verwandt (jeweils rc=1 auf beiden Seiten)
-- Neu: `tests/770_gc_kern.fi` + `tests/modules/kern/gckern.fi` — gc-Klasse
+- Neu: `tests/770_gc_core.fi` + `tests/modules/kern/gccore.fi` — gc-Klasse
   nur im Modul, Zyklus ueberlebt unter Wurzel, Statistik geprueft

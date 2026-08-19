@@ -19,7 +19,7 @@ dieser Aufbau **zwei** Programme mit identischem Objektgraphen:
 | Fassung | Speichermodell | Erwartung |
 |---|---|---|
 | `lib/dom/soak_gc.fi` | `gc class` / `Gc[T]`, Mark-Sweep | **darf nicht wachsen** |
-| `lib/dom/soak_leck.fi` | eigener Zählverweis über `mmap(2)` | **muss lecken** |
+| `lib/dom/soak_leak.fi` | eigener Zählverweis über `mmap(2)` | **muss lecken** |
 
 Bleibt die Gegenprobe grün, bricht `tools/dom_soak/run.sh` mit Fehler ab: eine
 Messung, die ein Leck gar nicht anzeigen kann, ist keine Messung.
@@ -171,14 +171,14 @@ Codegen-Modell (ROADMAP, nach der echten Registerzuteilung).
 | Datei | Inhalt |
 |---|---|
 | `lib/dom/dom.fi` | DOM-Prototyp, 6 Zyklenarten, Selbsttest |
-| `lib/dom/mess.fi` | Zeit, RSS aus `/proc/self/statm`, TSV-Ausgabe (ohne GC) |
+| `lib/dom/meas.fi` | Zeit, RSS aus `/proc/self/statm`, TSV-Ausgabe (ohne GC) |
 | `lib/dom/soak_gc.fi` | Dauerlauf mit `Gc[T]` |
-| `lib/dom/soak_leck.fi` | Gegenprobe mit Zählverweis, selbst enthalten |
+| `lib/dom/soak_leak.fi` | Gegenprobe mit Zählverweis, selbst enthalten |
 | `tools/dom_soak/run.sh` | Bau in drei Stufen, beide Läufe, Auswertung, Urteil |
 | `tools/dom_soak/messung-gc.tsv` | letzte Messreihe GC |
 | `tools/dom_soak/messung-leck.tsv` | letzte Messreihe Gegenprobe |
 | `tools/dom_soak/langlauf/gc-100mio-zyklen.tsv` | der 100-Mio-Lauf |
-| `tests/560_dom_zyklen.fi` | Strukturtest, läuft in allen drei Baustufen |
+| `tests/560_dom_cycles.fi` | Strukturtest, läuft in allen drei Baustufen |
 
 ---
 
@@ -198,7 +198,7 @@ jetzt aus **14** statt 7 Objekten: Wurzelelement (1), Attributtabelle + Puffer
 + `Str` (3), drei Kinder (3), Kinderliste + Puffer (2), Listener +
 Listenerliste + Puffer (3), Sammlung (1), Wrapper (1).
 
-**Die Gegenprobe wurde mitgezogen** — `lib/dom/soak_leck.fi` bildet denselben
+**Die Gegenprobe wurde mitgezogen** — `lib/dom/soak_leak.fi` bildet denselben
 Satz Objekt für Objekt nach (128-Byte-Objekt, generische Verweisspalten,
 14 Objekte, davon lecken 13). Ohne das wären nicht mehr dieselben zwei Graphen
 verglichen worden, und der ganze Bericht hinge in der Luft.

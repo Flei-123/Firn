@@ -64,7 +64,7 @@ pub enum Loc {
 
 /// Schreibt der Wert `v` in das physische Register `r`? (Runde 41 — Pruefung
 /// fuer den Zellen-Alias.)
-fn belegt_register(alloc: &Alloc, v: Val, r: &'static str) -> bool {
+fn used_register(alloc: &Alloc, v: Val, r: &'static str) -> bool {
     if let Some(rc) = alloc.cells.get(&v) {
         if *rc == r {
             return true;
@@ -123,7 +123,7 @@ impl Alloc {
     }
     /// Ort eines Wertes als QUELLE: ein Load-Ergebnis mit Zellen-Alias liegt
     /// nie irgendwo, sein Wert steht im Zellenregister. Fuer ZIELE gilt loc().
-    pub fn ort(&self, v: Val) -> Loc {
+    pub fn place(&self, v: Val) -> Loc {
         if let Some(r) = self.alias.get(&v) {
             return Loc::Reg(r);
         }
@@ -369,12 +369,12 @@ fn immediate_consts(f: &Func) -> HashMap<Val, i64> {
                 // (u32 0xFFFFFFFF) aus den Immediates, und jeder EOF-Vergleich
                 // im Tokenizer laedt seine Konstante aus einem Rahmenslot
                 // (Runde 40: 52 solche Stellen allein in `tokenize`).
-                let passt = if i.ty.bits() <= 32 {
+                let fits = if i.ty.bits() <= 32 {
                     v >= i32::MIN as i128 && v <= u32::MAX as i128
                 } else {
                     v >= i32::MIN as i128 && v <= i32::MAX as i128
                 };
-                if !f.is_secret(d) && passt {
+                if !f.is_secret(d) && fits {
                     cand.insert(d, v as i64);
                 }
             }
@@ -682,7 +682,7 @@ pub fn allocate(f: &Func) -> Alloc {
     //
     // Vier Pools, vom beschraenktesten zum freiesten Register. `passt` prueft,
     // ob ein Register die Kreuzungen eines Intervalls vertraegt.
-    fn passt(iv: &Iv, r: &str) -> bool {
+    fn fits(iv: &Iv, r: &str) -> bool {
         if CALLEE_SAVED.contains(&r) {
             return true;
         }
@@ -708,7 +708,7 @@ pub fn allocate(f: &Func) -> Alloc {
     let mut assign: HashMap<Val, &'static str> = HashMap::new();
     let mut used_saved: Vec<&'static str> = Vec::new();
 
-    let freigeben = |r: &'static str,
+    let free = |r: &'static str,
                      free_saved: &mut Vec<&'static str>,
                      free_temp: &mut Vec<&'static str>,
                      free_arg: &mut Vec<&'static str>,
@@ -744,7 +744,7 @@ pub fn allocate(f: &Func) -> Alloc {
         // bekommt dadurch als Anfang den Blockanfang — und teilte sich das
         // Register mit einem Wert, der genau dort definiert wird.
         //
-        // GEMESSEN an tests/820_gc_finalisierer.fi (nur `release-fast`, also
+        // GEMESSEN an tests/820_gc_finalizer.fi (nur `release-fast`, also
         // nur mit Registerzuteilung): `%355 = z + 24` hatte das Intervall
         // [175,356], `%135 = call gc_collect()` das Intervall [175,175].
         // Beide bekamen `r12`; zur Laufzeit lief der Weg bb45 (Definition von
@@ -759,7 +759,7 @@ pub fn allocate(f: &Func) -> Alloc {
         while k < active.len() {
             if active[k].0.end < iv.start {
                 let (_, r) = active.remove(k);
-                freigeben(r, &mut free_saved, &mut free_temp, &mut free_arg, &mut free_div);
+                free(r, &mut free_saved, &mut free_temp, &mut free_arg, &mut free_div);
             } else {
                 k += 1;
             }
@@ -798,7 +798,7 @@ pub fn allocate(f: &Func) -> Alloc {
                 // gleichem Gewicht entscheidet das spaetere Ende.
                 let mut worst: Option<usize> = None;
                 for (k, (a, r)) in active.iter().enumerate() {
-                    if !passt(&iv, r) {
+                    if !fits(&iv, r) {
                         continue; // dieses Register hilft uns nicht
                     }
                     let better = match worst {
@@ -835,7 +835,7 @@ pub fn allocate(f: &Func) -> Alloc {
             alloc.locs[*v as usize] = Loc::Reg(r);
         }
     }
-    let gelesen = zaehle_lesezugriffe(f);
+    let read = count_reads(f);
     let mut nbuf = Vec::new();
     if std::env::var("FIRN_NO_ALIAS").is_err() {
     // ---- Zellen-Alias (Runde 40) ---------------------------------------
@@ -863,34 +863,34 @@ pub fn allocate(f: &Func) -> Alloc {
                 Some(r) => *r,
                 None => continue,
             };
-            let braucht = gelesen.get(d as usize).copied().unwrap_or(0) as usize;
-            if braucht == 0 {
+            let needs = read.get(d as usize).copied().unwrap_or(0) as usize;
+            if needs == 0 {
                 continue;
             }
             // ALLE Verwendungen muessen in diesem Block liegen, bevor die
             // Zelle wieder geschrieben wird (bei mehreren Verwendungen
             // streicht der Alias trotzdem jede Kopie, z. B. Zaehler als
             // Index fuer Quelle UND Ziel im Kopierloop von dekodiere).
-            let mut gefunden = 0usize;
+            let mut found = 0usize;
             let mut ok = false;
             // RUNDE 41: Das Zellenregister darf zwischen Load und letzter
             // Verwendung von KEINEM anderen Wert beschrieben werden. Der
             // Verteiler kannte die vom Alias verlaengerte Lebensspanne nicht
             // und durfte `rc` an einen Wert vergeben, dessen Spanne die des
             // Zellenwerts nicht ueberschneidet — dann steht beim Lesen etwas
-            // Fremdes darin. Fehlerbild: `43 - start` in bin/druck.fi
+            // Fremdes darin. Fehlerbild: `43 - start` in bin/print.fi
             // (drucke_binop) wurde zu `43 - &tab[start]`, weil `lea` die
             // Adresse in genau dieses Register schrieb; die Laenge lief unter
             // Null und buf_wachse drehte sich ewig (Endlosschleife in
             // .astdump auf jedem `||`).
-            let mut zerstoert = false;
+            let mut destroys = false;
             for nj in b.insts.iter().skip(ii + 1) {
                 nbuf.clear();
                 nj.op.uses(&mut nbuf);
-                gefunden += nbuf.iter().filter(|u| **u == d).count();
+                found += nbuf.iter().filter(|u| **u == d).count();
                 if let Some(d2) = nj.dst {
-                    if d2 != d && belegt_register(&alloc, d2, rc) {
-                        zerstoert = true;
+                    if d2 != d && used_register(&alloc, d2, rc) {
+                        destroys = true;
                         break;
                     }
                 }
@@ -901,17 +901,17 @@ pub fn allocate(f: &Func) -> Alloc {
                 if matches!(nj.op, Op::Call { .. } | Op::CallIndirect { .. } | Op::Syscall { .. } | Op::ThreadSpawn { .. })
                     && !CALLEE_SAVED.contains(&rc)
                 {
-                    zerstoert = true;
+                    destroys = true;
                     break;
                 }
                 if matches!(nj.op, Op::Store { addr: a2, .. } if a2 == addr) {
                     break; // danach ist der geladene Wert veraltet
                 }
             }
-            if zerstoert {
+            if destroys {
                 continue;
             }
-            if gefunden == braucht {
+            if found == needs {
                 ok = true;
             } else {
                 // Rest-Verwendung kann im Terminator stecken (brcond/ret).
@@ -922,7 +922,7 @@ pub fn allocate(f: &Func) -> Alloc {
                     Term::Ret(Some(v)) if *v == d => 1,
                     _ => 0,
                 };
-                ok = gefunden + im_term == braucht && im_term > 0;
+                ok = found + im_term == needs && im_term > 0;
             }
             if ok {
                 alloc.alias.insert(d, rc);
@@ -949,12 +949,12 @@ pub fn allocate(f: &Func) -> Alloc {
                 (Op::Bin(BinOp::Add | BinOp::Sub, a, k), Some(v)) => (*a, *k, v),
                 _ => continue,
             };
-            let (rc, zelle) = match (alloc.alias.get(&a), alloc.alias_src.get(&a)) {
+            let (rc, cell) = match (alloc.alias.get(&a), alloc.alias_src.get(&a)) {
                 (Some(r), Some(z)) => (*r, *z),
                 _ => continue,
             };
             if alloc.imm(k).is_none()
-                || gelesen.get(v as usize).copied().unwrap_or(0) != 1
+                || read.get(v as usize).copied().unwrap_or(0) != 1
                 || f.is_secret(v)
             {
                 continue;
@@ -962,11 +962,11 @@ pub fn allocate(f: &Func) -> Alloc {
             let mut ok = false;
             for (jj, nj) in b.insts.iter().enumerate().skip(ii + 1) {
                 match &nj.op {
-                    Op::Store { addr: a2, val } if *a2 == zelle => {
+                    Op::Store { addr: a2, val } if *a2 == cell => {
                         ok = *val == v;
                         break;
                     }
-                    Op::Load { addr: a2 } if *a2 == zelle => break,
+                    Op::Load { addr: a2 } if *a2 == cell => break,
                     Op::Call { .. }
                     | Op::CallIndirect { .. }
                     | Op::Syscall { .. }
@@ -978,7 +978,7 @@ pub fn allocate(f: &Func) -> Alloc {
                 nbuf.clear();
                 nj.op.uses(&mut nbuf);
                 if nbuf.iter().any(|u| {
-                    *u != a && alloc.alias_src.get(u) == Some(&zelle)
+                    *u != a && alloc.alias_src.get(u) == Some(&cell)
                 }) {
                     break;
                 }
@@ -1054,32 +1054,32 @@ struct Ra<'a> {
     /// Verschmelzung von `cmp` und bedingtem Sprung: nur wenn das
     /// Vergleichsergebnis GENAU EINMAL gelesen wird (naemlich vom Terminator),
     /// darf das `setcc` entfallen.
-    gelesen: Vec<u32>,
+    read: Vec<u32>,
     /// Adressen, deren einzige Verwendung der UNMITTELBAR folgende
     /// Speicherzugriff ist — sie wandern vollstaendig in dessen Operanden.
-    versatz: HashMap<Val, Adresse>,
+    offset: HashMap<Val, Address>,
     /// Instruktionen (Skalierung `shl`/`mul`), die dabei ganz entfallen.
-    uebersprungen: std::collections::HashSet<Val>,
+    skipped: std::collections::HashSet<Val>,
     /// Instruktionen, von denen nur noch das FUELLEN ihres Registers uebrig
     /// bleibt: Wert -> Quellwert. Der Rest der Rechnung steckt im
     /// Speicheroperanden des folgenden Zugriffs.
-    vorlader: HashMap<Val, Val>,
+    preloader: HashMap<Val, Val>,
 }
 
 /// Ein Speicheroperand, den der Prozessor selbst ausrechnet:
 /// `[basis + index*faktor + versatz]` (x86-64 SIB-Adressierung).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Adresse {
-    basis: &'static str,
+pub(crate) struct Address {
+    base: &'static str,
     /// Indexregister mit Faktor 1, 2, 4 oder 8
     index: Option<(&'static str, i64)>,
-    versatz: i64,
+    offset: i64,
 }
 
-impl Adresse {
+impl Address {
     fn text(&self) -> String {
         let mut s = String::from("[");
-        s.push_str(self.basis);
+        s.push_str(self.base);
         if let Some((r, f)) = self.index {
             s.push('+');
             s.push_str(r);
@@ -1088,12 +1088,12 @@ impl Adresse {
                 s.push_str(&f.to_string());
             }
         }
-        if self.versatz > 0 {
+        if self.offset > 0 {
             s.push('+');
-            s.push_str(&self.versatz.to_string());
-        } else if self.versatz < 0 {
+            s.push_str(&self.offset.to_string());
+        } else if self.offset < 0 {
             s.push('-');
-            s.push_str(&(-self.versatz).to_string());
+            s.push_str(&(-self.offset).to_string());
         }
         s.push(']');
         s
@@ -1154,27 +1154,27 @@ impl Adresse {
 ///
 /// Liefert `(Adressen je Wert, uebersprungene Skalierungen)`.
 /// Abschaltbar mit FIRN_NO_FALTUNG=1 (Fehlersuche).
-fn faltbare_adressen(
+fn foldable_addresses(
     f: &Func,
     a: &Alloc,
-    gelesen: &[u32],
-) -> (HashMap<Val, Adresse>, std::collections::HashSet<Val>, HashMap<Val, Val>) {
+    read: &[u32],
+) -> (HashMap<Val, Address>, std::collections::HashSet<Val>, HashMap<Val, Val>) {
     use std::collections::HashSet;
-    let mut aus: HashMap<Val, Adresse> = HashMap::new();
-    let mut weg: HashSet<Val> = HashSet::new();
-    let mut vor: HashMap<Val, Val> = HashMap::new();
+    let mut out: HashMap<Val, Address> = HashMap::new();
+    let mut away: HashSet<Val> = HashSet::new();
+    let mut before: HashMap<Val, Val> = HashMap::new();
     if std::env::var_os("FIRN_NO_FALTUNG").is_some() {
-        return (aus, weg, vor);
+        return (out, away, before);
     }
     // Liegt der Wert schlicht in einem Register — ohne Sonderbehandlung?
-    let reines_reg = |v: Val| -> Option<&'static str> {
+    let pure_reg = |v: Val| -> Option<&'static str> {
         if a.imm(v).is_some() || a.cell(v).is_some() || f.is_secret(v) {
             return None;
         }
         if a.alias.contains_key(&v) || a.frame_addr.contains_key(&v) {
             return None;
         }
-        match a.ort(v) {
+        match a.place(v) {
             Loc::Reg(r) => Some(r),
             Loc::Slot(_) => None,
         }
@@ -1194,7 +1194,7 @@ fn faltbare_adressen(
                 Op::Bin(BinOp::Add, x, y) if i.ty.bits() == 64 => (*x, *y),
                 _ => continue,
             };
-            if gelesen.get(d as usize).copied() != Some(1) || f.is_secret(d) {
+            if read.get(d as usize).copied() != Some(1) || f.is_secret(d) {
                 continue;
             }
             if a.alias.contains_key(&d) || a.frame_addr.contains_key(&d) || a.cell(d).is_some() {
@@ -1205,18 +1205,18 @@ fn faltbare_adressen(
                 Some(n) => n,
                 None => continue,
             };
-            let passt = match &n.op {
+            let fits = match &n.op {
                 Op::Load { addr } => *addr == d,
                 Op::Store { addr, val } => *addr == d && *val != d,
                 _ => false,
             };
-            if !passt {
+            if !fits {
                 continue;
             }
             // Register, die der folgende Zugriff selbst noch LESEN muss —
             // sie duerfen nicht als Vorlade-Ziel dienen.
-            let wert_reg: Option<&'static str> = match &n.op {
-                Op::Store { val, .. } => match a.ort(*val) {
+            let value_reg: Option<&'static str> = match &n.op {
+                Op::Store { val, .. } => match a.place(*val) {
                     Loc::Reg(r) => Some(r),
                     _ => None,
                 },
@@ -1228,32 +1228,32 @@ fn faltbare_adressen(
             //     mov rax, qword ptr [rbp-8]      statt   mov rax, [rbp-8]
             //     mov r9, qword ptr [rax+8]               lea r9, [rax+8]
             //                                             mov r9, [r9]
-            let basis_darf_gelesen = |v: Val| -> bool {
+            let base_may_read = |v: Val| -> bool {
                 !f.is_secret(v)
                     && a.cell(v).is_none()
                     && !a.alias.contains_key(&v)
                     && !a.frame_addr.contains_key(&v)
                     && a.imm(v).is_none()
             };
-            let (br, basis_vorladen) = match reines_reg(base) {
+            let (br, base_preload) = match pure_reg(base) {
                 Some(r) => (r, false),
-                None => match (a.loc(d), basis_darf_gelesen(base)) {
-                    (Loc::Reg(dr), true) if Some(dr) != wert_reg => (dr, true),
+                None => match (a.loc(d), base_may_read(base)) {
+                    (Loc::Reg(dr), true) if Some(dr) != value_reg => (dr, true),
                     _ => continue,
                 },
             };
             // (3a) konstanter Versatz
             if let Some(k) = a.imm(off) {
                 if (0..=i32::MAX as i64).contains(&k) && !f.is_secret(off) {
-                    aus.insert(d, Adresse { basis: br, index: None, versatz: k });
-                    if basis_vorladen {
-                        vor.insert(d, base);
+                    out.insert(d, Address { base: br, index: None, offset: k });
+                    if base_preload {
+                        before.insert(d, base);
                     }
                 }
                 continue;
             }
             // (3b) Index mit Faktor: die Skalierung steht unmittelbar davor
-            if gelesen.get(off as usize).copied() == Some(1) && idx > 0 {
+            if read.get(off as usize).copied() == Some(1) && idx > 0 {
                 let p = &b.insts[idx - 1];
                 let skal = if p.dst == Some(off) && p.ty.bits() == 64 {
                     match &p.op {
@@ -1270,19 +1270,19 @@ fn faltbare_adressen(
                 } else {
                     None
                 };
-                if let Some((xi, fak)) = skal {
+                if let Some((xi, fact)) = skal {
                     if !f.is_secret(off) && !a.alias.contains_key(&off) && a.cell(off).is_none() {
                         // Fall A: der Index liegt selbst in einem Register —
                         // die Skalierung entfaellt ersatzlos.
-                        if let Some(ir) = reines_reg(xi) {
-                            if !basis_vorladen || ir != br {
-                                aus.insert(
+                        if let Some(ir) = pure_reg(xi) {
+                            if !base_preload || ir != br {
+                                out.insert(
                                     d,
-                                    Adresse { basis: br, index: Some((ir, fak)), versatz: 0 },
+                                    Address { base: br, index: Some((ir, fact)), offset: 0 },
                                 );
-                                weg.insert(off);
-                                if basis_vorladen {
-                                    vor.insert(d, base);
+                                away.insert(off);
+                                if base_preload {
+                                    before.insert(d, base);
                                 }
                                 continue;
                             }
@@ -1292,15 +1292,15 @@ fn faltbare_adressen(
                         // der UNSKALIERTE Wert geladen und der Faktor der
                         // Adressierung ueberlassen — eine Instruktion statt
                         // zwei.
-                        if let (Loc::Reg(ir), true) = (a.loc(off), basis_darf_gelesen(xi)) {
-                            if ir != br && Some(ir) != wert_reg {
-                                aus.insert(
+                        if let (Loc::Reg(ir), true) = (a.loc(off), base_may_read(xi)) {
+                            if ir != br && Some(ir) != value_reg {
+                                out.insert(
                                     d,
-                                    Adresse { basis: br, index: Some((ir, fak)), versatz: 0 },
+                                    Address { base: br, index: Some((ir, fact)), offset: 0 },
                                 );
-                                vor.insert(off, xi);
-                                if basis_vorladen {
-                                    vor.insert(d, base);
+                                before.insert(off, xi);
+                                if base_preload {
+                                    before.insert(d, base);
                                 }
                                 continue;
                             }
@@ -1309,21 +1309,21 @@ fn faltbare_adressen(
                 }
             }
             // (3c) Index direkt aus einem Register (Faktor 1)
-            if let Some(ir) = reines_reg(off) {
-                if !basis_vorladen || ir != br {
-                    aus.insert(d, Adresse { basis: br, index: Some((ir, 1)), versatz: 0 });
-                    if basis_vorladen {
-                        vor.insert(d, base);
+            if let Some(ir) = pure_reg(off) {
+                if !base_preload || ir != br {
+                    out.insert(d, Address { base: br, index: Some((ir, 1)), offset: 0 });
+                    if base_preload {
+                        before.insert(d, base);
                     }
                 }
             }
         }
     }
-    (aus, weg, vor)
+    (out, away, before)
 }
 
 /// Zaehlt je Wert, wie oft er als Operand vorkommt (Instruktionen + Terminatoren).
-fn zaehle_lesezugriffe(f: &Func) -> Vec<u32> {
+fn count_reads(f: &Func) -> Vec<u32> {
     let mut n = vec![0u32; f.val_types.len()];
     let mut buf = Vec::new();
     for b in &f.blocks {
@@ -1354,7 +1354,7 @@ impl<'a> Ra<'a> {
         if let Some(k) = self.a.imm(v) {
             return format!("{}", k);
         }
-        match self.a.ort(v) {
+        match self.a.place(v) {
             Loc::Reg(r) => r.to_string(),
             Loc::Slot(off) => format!("qword ptr [rbp-{}]", off),
         }
@@ -1364,7 +1364,7 @@ impl<'a> Ra<'a> {
         if let Some(k) = self.a.imm(v) {
             return format!("{}", k);
         }
-        match self.a.ort(v) {
+        match self.a.place(v) {
             Loc::Reg(r) => rn(r, bits),
             Loc::Slot(off) => format!("{} [rbp-{}]", size_word(bits), off),
         }
@@ -1429,7 +1429,7 @@ pub(crate) fn emit_func_ra(e: &mut Emitter, f: &Func) -> Option<Result<(), Strin
     match emit_with(&mut tmp, f, &a) {
         Ok(()) => {
             let nv = f.val_types.len();
-            e.out.push_str(&deskriptor_peephole(&tmp.out, nv));
+            e.out.push_str(&descriptor_peephole(&tmp.out, nv));
             Some(Ok(()))
         }
         Err(err) => Some(Err(err)),
@@ -1459,9 +1459,9 @@ pub(crate) fn emit_func_ra(e: &mut Emitter, f: &Func) -> Option<Result<(), Strin
 //    rax/rdx, `cqo/cdq` rdx, `setcc` al (= rax).
 //  * Jede andere Instruktion, die ein getracktes Register als Zieloperanden
 //    schreibt (mov/lea/add/.../cmov), invalidiert genau dieses Register.
-fn deskriptor_peephole(asm: &str, nv: usize) -> String {
+fn descriptor_peephole(asm: &str, nv: usize) -> String {
     /// 64-Bit-Stammregister eines Register-Namens beliebiger Breite.
-    fn stamm(r: &str) -> &str {
+    fn stem(r: &str) -> &str {
         match r {
             "al" | "ax" | "eax" | "rax" => "rax",
             "bl" | "bx" | "ebx" | "rbx" => "rbx",
@@ -1483,7 +1483,7 @@ fn deskriptor_peephole(asm: &str, nv: usize) -> String {
         }
     }
     /// Bitbreite eines Registernamens.
-    fn breite_von(r: &str) -> u32 {
+    fn width_of(r: &str) -> u32 {
         match r {
             "al" | "bl" | "cl" | "dl" | "sil" | "dil" | "bpl" => 8,
             "ax" | "bx" | "cx" | "dx" | "si" | "di" | "bp" => 16,
@@ -1533,9 +1533,9 @@ fn deskriptor_peephole(asm: &str, nv: usize) -> String {
             }
         }
     };
-    for zeile in asm.lines() {
-        let t = zeile.trim_start();
-        if !zeile.starts_with("    ") || t.is_empty() {
+    for line in asm.lines() {
+        let t = line.trim_start();
+        if !line.starts_with("    ") || t.is_empty() {
             // Label, Direktiven, Kommentare am Zeilenanfang. Ein Label ist
             // eine Blockgrenze: der Zustand des Vorgaengers gilt nicht.
             if t.ends_with(':') && !t.starts_with('.') {
@@ -1547,19 +1547,19 @@ fn deskriptor_peephole(asm: &str, nv: usize) -> String {
                 holds.clear();
                 nullab.clear();
             }
-            out.push_str(zeile);
+            out.push_str(line);
             out.push('\n');
             continue;
         }
-        let mut teile = t.splitn(2, ' ');
-        let mn = teile.next().unwrap_or("");
-        let ops = teile.next().unwrap_or("").trim();
+        let mut parts = t.splitn(2, ' ');
+        let mn = parts.next().unwrap_or("");
+        let ops = parts.next().unwrap_or("").trim();
         // Zielenformen, die wir tracken/ersetzen.
         // Speichern in ein WERT-Fach, in JEDER Breite (Runde 51: vorher nur
         // `qword`). `off <= max_slot` grenzt auf die Wert-Faecher ein —
         // `alloca`-Plaetze liegen dahinter und koennen ueber Zeiger
         // beschrieben werden.
-        let stbreite = if t.starts_with("mov qword ptr [rbp-") {
+        let st_width = if t.starts_with("mov qword ptr [rbp-") {
             Some(64)
         } else if t.starts_with("mov dword ptr [rbp-") {
             Some(32)
@@ -1570,17 +1570,17 @@ fn deskriptor_peephole(asm: &str, nv: usize) -> String {
         } else {
             None
         };
-        if let Some(bw) = stbreite {
+        if let Some(bw) = st_width {
             let rest = &t[t.find("[rbp-").unwrap() + 5..];
             if let Some(kl) = rest.find(']') {
                 let off: u64 = rest[..kl].parse().unwrap_or(0);
                 let q = rest[kl + 1..].trim_start_matches(',').trim();
-                if off >= 8 && off <= max_slot && breite_von(q) == bw && ist_reg64(stamm(q)) {
-                    let q = stamm(q).to_string();
+                if off >= 8 && off <= max_slot && width_of(q) == bw && is_reg64(stem(q)) {
+                    let q = stem(q).to_string();
                     kill_reg(&q, &mut sync, &mut holds);
                     sync.insert(off, (q.clone(), bw));
                     holds.insert(q, off);
-                    out.push_str(zeile);
+                    out.push_str(line);
                     out.push('\n');
                     continue;
                 }
@@ -1616,34 +1616,34 @@ fn deskriptor_peephole(asm: &str, nv: usize) -> String {
         } else {
             None
         };
-        if let Some((kl, vor, mindest, ndbits)) = rlform {
-            let ziel = &ops[..kl];
-            let zb = breite_von(ziel);
+        if let Some((kl, before, min, ndbits)) = rlform {
+            let target = &ops[..kl];
+            let zb = width_of(target);
             // Zielbreite muss zur Ladeform passen: qword -> 64, sonst 32.
-            let passt_ziel = if mindest == 64 { zb == 64 } else { zb == 32 };
-            if passt_ziel && ist_reg64(stamm(ziel)) {
-                if let Some(ende) = ops[kl + vor..].find(']') {
-                    let off: u64 = ops[kl + vor..kl + vor + ende].parse().unwrap_or(0);
+            let fits_target = if min == 64 { zb == 64 } else { zb == 32 };
+            if fits_target && is_reg64(stem(target)) {
+                if let Some(end) = ops[kl + before..].find(']') {
+                    let off: u64 = ops[kl + before..kl + before + end].parse().unwrap_or(0);
                     if off >= 8 && off <= max_slot {
-                        let z = stamm(ziel).to_string();
-                        let treffer = match sync.get(&off) {
-                            Some((r2, bw)) if *bw >= mindest => Some(r2.clone()),
+                        let z = stem(target).to_string();
+                        let hit = match sync.get(&off) {
+                            Some((r2, bw)) if *bw >= min => Some(r2.clone()),
                             _ => None,
                         };
-                        if let Some(r2) = treffer {
-                            let selbe = r2 == z;
-                            let schon_null = nullab.get(&z).copied().unwrap_or(64) <= ndbits;
-                            if selbe && (mindest == 64 || schon_null) {
+                        if let Some(r2) = hit {
+                            let same = r2 == z;
+                            let already_null = nullab.get(&z).copied().unwrap_or(64) <= ndbits;
+                            if same && (min == 64 || already_null) {
                                 // Der Wert steht bereits genau so im Register.
                                 kill_reg(&z, &mut sync, &mut holds);
-                                sync.insert(off, (z.clone(), mindest));
+                                sync.insert(off, (z.clone(), min));
                                 holds.insert(z.clone(), off);
-                                if mindest < 64 {
+                                if min < 64 {
                                     nullab.insert(z, ndbits);
                                 }
                                 continue;
                             }
-                            if !selbe && mindest == 64 {
+                            if !same && min == 64 {
                                 out.push_str(&format!("    mov {}, {}\n", z, r2));
                                 kill_reg(&z, &mut sync, &mut holds);
                                 sync.insert(off, (z.clone(), 64));
@@ -1653,14 +1653,14 @@ fn deskriptor_peephole(asm: &str, nv: usize) -> String {
                             }
                         }
                         kill_reg(&z, &mut sync, &mut holds);
-                        sync.insert(off, (z.clone(), mindest));
+                        sync.insert(off, (z.clone(), min));
                         holds.insert(z.clone(), off);
-                        if mindest < 64 {
+                        if min < 64 {
                             nullab.insert(z, ndbits);
                         } else {
                             nullab.remove(&z);
                         }
-                        out.push_str(zeile);
+                        out.push_str(line);
                         out.push('\n');
                         continue;
                     }
@@ -1672,7 +1672,7 @@ fn deskriptor_peephole(asm: &str, nv: usize) -> String {
             sync.clear();
             holds.clear();
             nullab.clear();
-            out.push_str(zeile);
+            out.push_str(line);
             out.push('\n');
             continue;
         }
@@ -1681,7 +1681,7 @@ fn deskriptor_peephole(asm: &str, nv: usize) -> String {
                 kill_reg(r, &mut sync, &mut holds);
                 nullab.remove(r);
             }
-            out.push_str(zeile);
+            out.push_str(line);
             out.push('\n');
             continue;
         }
@@ -1690,7 +1690,7 @@ fn deskriptor_peephole(asm: &str, nv: usize) -> String {
                 kill_reg(r, &mut sync, &mut holds);
                 nullab.remove(r);
             }
-            out.push_str(zeile);
+            out.push_str(line);
             out.push('\n');
             continue;
         }
@@ -1699,7 +1699,7 @@ fn deskriptor_peephole(asm: &str, nv: usize) -> String {
                 kill_reg(r, &mut sync, &mut holds);
                 nullab.remove(r);
             }
-            out.push_str(zeile);
+            out.push_str(line);
             out.push('\n');
             continue;
         }
@@ -1708,21 +1708,21 @@ fn deskriptor_peephole(asm: &str, nv: usize) -> String {
             kill_reg("rdx", &mut sync, &mut holds);
             nullab.remove("rax");
             nullab.remove("rdx");
-            out.push_str(zeile);
+            out.push_str(line);
             out.push('\n');
             continue;
         }
         if mn == "cqo" || mn == "cdq" {
             kill_reg("rdx", &mut sync, &mut holds);
             nullab.remove("rdx");
-            out.push_str(zeile);
+            out.push_str(line);
             out.push('\n');
             continue;
         }
         if mn.starts_with("set") {
             kill_reg("rax", &mut sync, &mut holds); // Ziel ist im RA-Pfad immer `al`
             nullab.remove("rax"); // `setcc al` laesst die oberen Bits stehen
-            out.push_str(zeile);
+            out.push_str(line);
             out.push('\n');
             continue;
         }
@@ -1733,31 +1733,31 @@ fn deskriptor_peephole(asm: &str, nv: usize) -> String {
                 | "imul" | "shl" | "sar" | "shr" | "neg" | "not" | "pop"
         ) || mn.starts_with("cmov")
         {
-            let ziel = ops.split(',').next().unwrap_or("").trim();
+            let target = ops.split(',').next().unwrap_or("").trim();
             // ACHTUNG: der Zielname kann schmal sein (`xor eax, eax` nullt
             // ganz rax) — die Pruefung muss auf das STAMMREGISTER gehen,
             // sonst ueberlebt ein veralteter Deskriptor-Eintrag (Runde 40:
             // liess tests/305_dtoa_hardcases falsch rechnen).
-            let z = stamm(ziel);
-            if !ziel.contains('[') && ist_reg64(z) {
+            let z = stem(target);
+            if !target.contains('[') && is_reg64(z) {
                 let zs = z.to_string();
                 kill_reg(&zs, &mut sync, &mut holds);
                 // Nullerweiterung fortschreiben (Runde 51). Ein Schreibzugriff
                 // auf ein 32-Bit-Register nullt die oberen 32 Bit; `movzx`
                 // aus einer 8-/16-Bit-Quelle sagt sogar mehr. Alles andere
                 // macht den Inhalt oben unbekannt.
-                let bw = breite_von(ziel);
+                let bw = width_of(target);
                 if mn == "movzx" {
                     let q = ops.rsplit(',').next().unwrap_or("").trim();
-                    let von = if q.starts_with("byte ptr") {
+                    let of = if q.starts_with("byte ptr") {
                         8
                     } else if q.starts_with("word ptr") {
                         16
                     } else {
-                        breite_von(q)
+                        width_of(q)
                     };
-                    if bw >= 32 && (von == 8 || von == 16) {
-                        nullab.insert(zs, von);
+                    if bw >= 32 && (of == 8 || of == 16) {
+                        nullab.insert(zs, of);
                     } else {
                         nullab.remove(&zs);
                     }
@@ -1768,7 +1768,7 @@ fn deskriptor_peephole(asm: &str, nv: usize) -> String {
                 }
             }
         }
-        out.push_str(zeile);
+        out.push_str(line);
         out.push('\n');
     }
     out
@@ -1783,8 +1783,8 @@ fn debug_lines_active(f: &Func) -> bool {
 }
 
 fn supported(f: &Func) -> bool {
-    let grund = unsupported_grund(f);
-    if let Some(g) = grund {
+    let basic = unsupported_basic(f);
+    if let Some(g) = basic {
         if std::env::var_os("FIRN_RA_WARN").is_some() {
             eprintln!("RA-Grundpfad: {} — {}", f.name, g);
         }
@@ -1794,7 +1794,7 @@ fn supported(f: &Func) -> bool {
 }
 
 /// Warum faellt `f` auf den Grundpfad zurueck? `None` = Registerzuteilung moeglich.
-fn unsupported_grund(f: &Func) -> Option<String> {
+fn unsupported_basic(f: &Func) -> Option<String> {
     // RUNDE 52: `#[interrupt]` hat eine eigene Aufrufkonvention (alle Register
     // retten, `iretq`). Sie steht im Grundpfad von `codegen_x86.rs`.
     if f.interrupt {
@@ -1848,9 +1848,9 @@ fn unsupported_grund(f: &Func) -> Option<String> {
 }
 
 fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
-    let gelesen = zaehle_lesezugriffe(f);
-    let (versatz, uebersprungen, vorlader) = faltbare_adressen(f, a, &gelesen);
-    let ra = Ra { f, a, gelesen, versatz, uebersprungen, vorlader };
+    let read = count_reads(f);
+    let (offset, skipped, preloader) = foldable_addresses(f, a, &read);
+    let ra = Ra { f, a, read, offset, skipped, preloader };
     e.raw("");
     // Linker-Symbol ueber die eine Stelle (codegen_x86::label -> modules::symbol)
     e.raw(&format!(".globl {}", label(&f.name)));
@@ -1880,7 +1880,7 @@ fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
             Loc::Reg(dst) => prolog_moves.push((dst.to_string(), ARG_REGS[i].to_string())),
         }
     }
-    parallele_reg_bewegungen(e, &prolog_moves);
+    parallel_reg_moves(e, &prolog_moves);
     // Parameter ab dem siebten liegen im Rahmen des AUFRUFERS (System V:
     // [rbp+16], [rbp+24], … — davor stehen gesicherte Ruecksprungadresse und
     // gesichertes rbp). Sie werden ERST NACH den parallelen Bewegungen geholt:
@@ -1888,24 +1888,24 @@ fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
     // `rax` ist als Arbeitsregister nie Heimat eines Wertes und darf hier als
     // Zwischenlager dienen.
     for (i, _t) in f.params.iter().enumerate().skip(ARG_REGS.len()) {
-        let von = 16 + 8 * (i - ARG_REGS.len()) as u64;
+        let of = 16 + 8 * (i - ARG_REGS.len()) as u64;
         match ra.a.loc(i as Val) {
             Loc::Slot(off) => {
-                e.line(&format!("mov rax, qword ptr [rbp+{}]", von));
+                e.line(&format!("mov rax, qword ptr [rbp+{}]", of));
                 e.line(&format!("mov qword ptr [rbp-{}], rax", off));
             }
-            Loc::Reg(dst) => e.line(&format!("mov {}, qword ptr [rbp+{}]", dst, von)),
+            Loc::Reg(dst) => e.line(&format!("mov {}, qword ptr [rbp+{}]", dst, of)),
         }
     }
     // Runde 51: die Bloecke werden nicht mehr in ihrer FIR-Reihenfolge
     // ausgegeben, sondern entlang von Spuren (siehe `emissionsreihenfolge`).
-    let ordnung = emissionsreihenfolge(f);
-    for (k, &bi) in ordnung.iter().enumerate() {
+    let order = emit_order(f);
+    for (k, &bi) in order.iter().enumerate() {
         let b = &f.blocks[bi];
         e.raw(&format!("{}:", block_label(&f.name, b.id)));
         // Fallthrough: steht das Sprungziel unmittelbar dahinter, faellt der
         // Sprung weg (spart pro BrCond mit else==naechster Block ein `jmp`).
-        let next = ordnung.get(k + 1).map(|&j| f.blocks[j].id);
+        let next = order.get(k + 1).map(|&j| f.blocks[j].id);
         emit_block(e, &ra, b, next)?;
     }
     Ok(())
@@ -1940,25 +1940,25 @@ fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
 /// selben Ort.
 ///
 /// Abschaltbar mit `FIRN_NO_LAYOUT=1` (Fehlersuche).
-fn emissionsreihenfolge(f: &Func) -> Vec<usize> {
+fn emit_order(f: &Func) -> Vec<usize> {
     let n = f.blocks.len();
     if std::env::var_os("FIRN_NO_LAYOUT").is_some() {
         return (0..n).collect();
     }
-    let mut platziert = vec![false; n];
-    let mut aus: Vec<usize> = Vec::with_capacity(n);
-    let mut frei = 0usize;
+    let mut placed = vec![false; n];
+    let mut out: Vec<usize> = Vec::with_capacity(n);
+    let mut free = 0usize;
     let mut b = 0usize;
-    while aus.len() < n {
+    while out.len() < n {
         // Spur legen, solange der bevorzugte Nachfolger noch frei ist.
         loop {
-            platziert[b] = true;
-            aus.push(b);
+            placed[b] = true;
+            out.push(b);
             let w = match &f.blocks[b].term {
                 Term::Br(t) => Some(*t as usize),
                 Term::BrCond { then_bb, else_bb, .. } => {
                     let el = *else_bb as usize;
-                    if el < n && !platziert[el] {
+                    if el < n && !placed[el] {
                         Some(el)
                     } else {
                         Some(*then_bb as usize)
@@ -1968,24 +1968,24 @@ fn emissionsreihenfolge(f: &Func) -> Vec<usize> {
                 Term::Ret(_) | Term::Unset => None,
             };
             match w {
-                Some(t) if t < n && !platziert[t] => b = t,
+                Some(t) if t < n && !placed[t] => b = t,
                 _ => break,
             }
         }
-        while frei < n && platziert[frei] {
-            frei += 1;
+        while free < n && placed[free] {
+            free += 1;
         }
-        if frei >= n {
+        if free >= n {
             break;
         }
-        b = frei;
+        b = free;
     }
-    aus
+    out
 }
 
 /// Ist `s` ein 64-Bit-Maschinenregistername (und damit ein Operand, dessen
 /// Inhalt durch andere Registerbewegungen zerstoert werden kann)?
-fn ist_reg64(s: &str) -> bool {
+fn is_reg64(s: &str) -> bool {
     matches!(
         s,
         "rax" | "rbx" | "rcx" | "rdx" | "rsi" | "rdi" | "rbp" | "rsp"
@@ -2007,30 +2007,30 @@ fn ist_reg64(s: &str) -> bool {
 /// Quelle gebraucht wird, wird dieses Paar sofort ausgegeben. Bleiben nur noch
 /// Zyklen uebrig, wird einer ueber `rax` aufgebrochen — `rax` ist nie Heimat
 /// eines Wertes (weder in `CALLEE_SAVED` noch in `TEMP_REGS`).
-fn parallele_reg_bewegungen(e: &mut Emitter, paare: &[(String, String)]) {
-    let mut offen: Vec<(String, String)> =
-        paare.iter().filter(|(z, q)| z != q).cloned().collect();
-    while !offen.is_empty() {
-        if let Some(i) = offen
+fn parallel_reg_moves(e: &mut Emitter, pairs: &[(String, String)]) {
+    let mut open: Vec<(String, String)> =
+        pairs.iter().filter(|(z, q)| z != q).cloned().collect();
+    while !open.is_empty() {
+        if let Some(i) = open
             .iter()
-            .position(|(z, _)| !offen.iter().any(|(_, q)| q == z))
+            .position(|(z, _)| !open.iter().any(|(_, q)| q == z))
         {
-            let (z, q) = offen.remove(i);
+            let (z, q) = open.remove(i);
             e.line(&format!("mov {}, {}", z, q));
             continue;
         }
         // Nur noch Zyklen: den alten Inhalt des Ziels nach rax retten, damit
         // das Ziel frei wird; alle Quellen, die darauf zeigten, lesen ab jetzt
         // aus rax.
-        let (z, q) = offen[0].clone();
+        let (z, q) = open[0].clone();
         e.line(&format!("mov rax, {}", z));
-        for (_, quelle) in offen.iter_mut() {
-            if *quelle == z {
-                *quelle = "rax".to_string();
+        for (_, source) in open.iter_mut() {
+            if *source == z {
+                *source = "rax".to_string();
             }
         }
         e.line(&format!("mov {}, {}", z, q));
-        offen.remove(0);
+        open.remove(0);
     }
 }
 
@@ -2061,20 +2061,20 @@ fn emit_block(e: &mut Emitter, ra: &Ra, b: &Block, next: Option<BlockId>) -> Res
     //   * ihr Ergebnis ist die Sprungbedingung,
     //   * es wird GENAU EINMAL gelesen (sonst wird der bool-Wert gebraucht),
     //   * kein `secret`-Wert (SPEC §9.2).
-    let verschmelzbar = match (&b.term, b.insts.last()) {
-        (Term::BrCond { cond, .. }, Some(letzte)) => {
-            matches!(letzte.op, Op::Cmp { .. })
-                && letzte.dst == Some(*cond)
-                && ra.gelesen.get(*cond as usize).copied().unwrap_or(2) == 1
+    let mergeable = match (&b.term, b.insts.last()) {
+        (Term::BrCond { cond, .. }, Some(last)) => {
+            matches!(last.op, Op::Cmp { .. })
+                && last.dst == Some(*cond)
+                && ra.read.get(*cond as usize).copied().unwrap_or(2) == 1
                 && !ra.f.is_secret(*cond)
         }
         _ => false,
     };
-    let n = if verschmelzbar { b.insts.len() - 1 } else { b.insts.len() };
+    let n = if mergeable { b.insts.len() - 1 } else { b.insts.len() };
     for i in &b.insts[..n] {
         emit_inst(e, ra, i)?;
     }
-    if verschmelzbar {
+    if mergeable {
         return emit_cmp_br(e, ra, b, next);
     }
     let f = ra.f;
@@ -2098,13 +2098,13 @@ fn emit_block(e: &mut Emitter, ra: &Ra, b: &Block, next: Option<BlockId>) -> Res
             // CALLEE_SAVED / TEMP_REGS / ARG_SPARE / DIV_SPARE). Zur
             // Sicherheit wird genau das hier geprueft.
             let (v, vty) = (*val, *ty);
-            if matches!(ra.a.ort(v), Loc::Reg("rax")) {
+            if matches!(ra.a.place(v), Loc::Reg("rax")) {
                 return Err("interner Fehler: switch-Wert liegt in rax".to_string());
             }
             crate::codegen_switch::emit_switch(
                 e,
                 f,
-                crate::codegen_switch::Wertquelle::Geladen(&|e2: &mut Emitter, bits: u32| {
+                crate::codegen_switch::ValueSource::Loaded(&|e2: &mut Emitter, bits: u32| {
                     ra.load_ext(e2, "rax", v, vty, bits);
                 }),
                 &b.term,
@@ -2167,8 +2167,8 @@ fn emit_block(e: &mut Emitter, ra: &Ra, b: &Block, next: Option<BlockId>) -> Res
 /// des Blocks setzt die Flags, der Terminator liest sie unmittelbar.
 fn emit_cmp_br(e: &mut Emitter, ra: &Ra, b: &Block, next: Option<BlockId>) -> Result<(), String> {
     let f = ra.f;
-    let letzte = b.insts.last().ok_or("interner Fehler: leerer Block bei cmp+jcc")?;
-    let (op, oty, a, bb) = match &letzte.op {
+    let last = b.insts.last().ok_or("interner Fehler: leerer Block bei cmp+jcc")?;
+    let (op, oty, a, bb) = match &last.op {
         Op::Cmp { op, ty, a, b } => (*op, *ty, *a, *b),
         _ => return Err("interner Fehler: cmp+jcc ohne Vergleich".to_string()),
     };
@@ -2200,7 +2200,7 @@ fn emit_cmp_br(e: &mut Emitter, ra: &Ra, b: &Block, next: Option<BlockId>) -> Re
     if next == Some(else_bb) {
         e.line(&format!("{} {}", jcc, block_label(&f.name, then_bb)));
     } else if next == Some(then_bb) {
-        e.line(&format!("{} {}", jcc_invers(jcc), block_label(&f.name, else_bb)));
+        e.line(&format!("{} {}", jcc_inverse(jcc), block_label(&f.name, else_bb)));
     } else {
         e.line(&format!("{} {}", jcc, block_label(&f.name, then_bb)));
         e.line(&format!("jmp {}", block_label(&f.name, else_bb)));
@@ -2209,7 +2209,7 @@ fn emit_cmp_br(e: &mut Emitter, ra: &Ra, b: &Block, next: Option<BlockId>) -> Re
 }
 
 /// Der Gegensprung (Fallthrough-Optimierung: Ziel und Fallthrough tauschen).
-fn jcc_invers(jcc: &str) -> &'static str {
+fn jcc_inverse(jcc: &str) -> &'static str {
     match jcc {
         "je" => "jne",
         "jne" => "je",
@@ -2256,14 +2256,14 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
             let d = i.dst.ok_or("interner Fehler: Binaeroperation ohne Ziel")?;
             // Runde 51: Adressrechnung, die im folgenden Speicherzugriff steht
             // (`add` als Adressbildung, `shl`/`mul` als Skalierung des Index).
-            if let Some(src) = ra.vorlader.get(&d).copied() {
+            if let Some(src) = ra.preloader.get(&d).copied() {
                 // Vom Rechnen bleibt nur, das Register zu fuellen.
                 if let Loc::Reg(r) = ra.a.loc(d) {
                     ra.load_full(e, r, src);
                     return Ok(());
                 }
             }
-            if ra.versatz.contains_key(&d) || ra.uebersprungen.contains(&d) {
+            if ra.offset.contains_key(&d) || ra.skipped.contains(&d) {
                 return Ok(()); // wird nirgends sonst gelesen
             }
             emit_bin(e, ra, *op, ty, *x, *y, d)?;
@@ -2384,8 +2384,8 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
                     return Ok(());
                 }
             } else {
-                let mem = match (ra.versatz.get(addr), ra.a.frame_addr.get(addr), ra.a.ort(*addr)) {
-                    (Some(adr), _, _) => adr.text(),
+                let mem = match (ra.offset.get(addr), ra.a.frame_addr.get(addr), ra.a.place(*addr)) {
+                    (Some(addr), _, _) => addr.text(),
                     (None, Some(off), _) => format!("[rbp-{}]", off),
                     (None, None, Loc::Reg(r)) => format!("[{}]", r),
                     (None, None, Loc::Slot(_)) => {
@@ -2424,8 +2424,8 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
                     e.line(&format!("mov {}, {}", r, o));
                 }
             } else {
-                let mem = match (ra.versatz.get(addr), ra.a.frame_addr.get(addr), ra.a.ort(*addr)) {
-                    (Some(adr), _, _) => adr.text(),
+                let mem = match (ra.offset.get(addr), ra.a.frame_addr.get(addr), ra.a.place(*addr)) {
+                    (Some(addr), _, _) => addr.text(),
                     (None, Some(off), _) => format!("[rbp-{}]", off),
                     (None, None, Loc::Reg(r)) => format!("[{}]", r),
                     (None, None, Loc::Slot(_)) => {
@@ -2444,13 +2444,13 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
         }
         Op::PtrAdd { base, off } => {
             let d = i.dst.ok_or("interner Fehler: ptradd ohne Ziel")?;
-            if let Some(src) = ra.vorlader.get(&d).copied() {
+            if let Some(src) = ra.preloader.get(&d).copied() {
                 if let Loc::Reg(r) = ra.a.loc(d) {
                     ra.load_full(e, r, src);
                     return Ok(());
                 }
             }
-            if ra.versatz.contains_key(&d) {
+            if ra.offset.contains_key(&d) {
                 // Der Versatz steht im folgenden Speicherzugriff; die Adresse
                 // selbst wird nirgends sonst gelesen und braucht kein `lea`.
                 return Ok(());
@@ -2464,52 +2464,52 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
                 Loc::Reg(r) => r,
                 Loc::Slot(_) => "rax",
             };
-            let reg_von = |v: Val| match (ra.a.imm(v), ra.a.ort(v)) {
+            let reg_of = |v: Val| match (ra.a.imm(v), ra.a.place(v)) {
                 (None, Loc::Reg(r)) => Some(r),
                 _ => None,
             };
-            let off_reg = reg_von(*off);
-            let base_reg = reg_von(*base);
-            let mut ziel = dreg;
+            let off_reg = reg_of(*off);
+            let base_reg = reg_of(*base);
+            let mut target = dreg;
             if let Some(boff) = ra.a.frame_addr.get(base).copied() {
                 // Adresse = rbp - boff + off  -> ein einziges `lea`
                 match (ra.a.imm(*off), off_reg) {
                     (Some(k), _) => {
                         let delta = k - boff as i64;
                         if delta >= 0 {
-                            e.line(&format!("lea {}, [rbp+{}]", ziel, delta));
+                            e.line(&format!("lea {}, [rbp+{}]", target, delta));
                         } else {
-                            e.line(&format!("lea {}, [rbp-{}]", ziel, -delta));
+                            e.line(&format!("lea {}, [rbp-{}]", target, -delta));
                         }
                     }
-                    (None, Some(r)) => e.line(&format!("lea {}, [rbp+{}-{}]", ziel, r, boff)),
+                    (None, Some(r)) => e.line(&format!("lea {}, [rbp+{}-{}]", target, r, boff)),
                     (None, None) => {
                         e.line(&format!("mov rcx, {}", ra.opnd(*off)));
-                        e.line(&format!("lea {}, [rbp+rcx-{}]", ziel, boff));
+                        e.line(&format!("lea {}, [rbp+rcx-{}]", target, boff));
                     }
                 }
             } else if let (Some(x), Some(k)) = (base_reg, ra.a.imm(*off)) {
-                lea_summe(e, ziel, x, k);
+                lea_sum(e, target, x, k);
             } else if let (Some(x), Some(y)) = (base_reg, off_reg) {
-                e.line(&format!("lea {}, [{}+{}]", ziel, x, y));
-            } else if ziel != "rax" {
+                e.line(&format!("lea {}, [{}+{}]", target, x, y));
+            } else if target != "rax" {
                 // Basis liegt im Rahmen oder ist eine Konstante: einmal nach
                 // rax holen, dann mit EINEM `lea` ins Ziel.
                 ra.load_full(e, "rax", *base);
                 match (ra.a.imm(*off), off_reg) {
-                    (Some(k), _) => lea_summe(e, ziel, "rax", k),
-                    (None, Some(y)) => e.line(&format!("lea {}, [rax+{}]", ziel, y)),
+                    (Some(k), _) => lea_sum(e, target, "rax", k),
+                    (None, Some(y)) => e.line(&format!("lea {}, [rax+{}]", target, y)),
                     (None, None) => {
                         e.line(&format!("add rax, {}", ra.opnd(*off)));
-                        ziel = "rax";
+                        target = "rax";
                     }
                 }
             } else {
                 ra.load_full(e, "rax", *base);
                 e.line(&format!("add rax, {}", ra.opnd(*off)));
-                ziel = "rax";
+                target = "rax";
             }
-            if ziel == "rax" {
+            if target == "rax" {
                 ra.store_dst(e, d, "rax");
             }
         }
@@ -2530,32 +2530,32 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
             // sein. Nach `push rbp` + `sub rsp, <Vielfaches von 16>` ist sie es;
             // der Argumentbereich wird deshalb ebenfalls auf 16 aufgerundet —
             // wortgleich mit dem Grundpfad in codegen_x86.rs.
-            let stapel = args.len().saturating_sub(ARG_REGS.len());
-            let raum = align_up(stapel as u64 * 8, 16);
-            if raum > 0 {
-                e.line(&format!("sub rsp, {}", raum));
+            let stack = args.len().saturating_sub(ARG_REGS.len());
+            let space = align_up(stack as u64 * 8, 16);
+            if space > 0 {
+                e.line(&format!("sub rsp, {}", space));
                 for (k, arg) in args.iter().skip(ARG_REGS.len()).enumerate() {
                     ra.load_full(e, "rax", *arg);
                     e.line(&format!("mov qword ptr [rsp+{}], rax", k * 8));
                 }
             }
             let mut reg_moves: Vec<(String, String)> = Vec::new();
-            let mut spaeter: Vec<(usize, Val)> = Vec::new();
+            let mut later: Vec<(usize, Val)> = Vec::new();
             for (k, arg) in args.iter().enumerate().take(ARG_REGS.len()) {
                 let o = ra.opnd(*arg);
-                if ist_reg64(&o) {
+                if is_reg64(&o) {
                     reg_moves.push((ARG_REGS[k].to_string(), o));
                 } else {
-                    spaeter.push((k, *arg));
+                    later.push((k, *arg));
                 }
             }
-            parallele_reg_bewegungen(e, &reg_moves);
-            for (k, arg) in spaeter {
+            parallel_reg_moves(e, &reg_moves);
+            for (k, arg) in later {
                 ra.load_full(e, ARG_REGS[k], arg);
             }
             e.line(&format!("call {}", label(name)));
-            if raum > 0 {
-                e.line(&format!("add rsp, {}", raum));
+            if space > 0 {
+                e.line(&format!("add rsp, {}", space));
             }
             if let Some(d) = i.dst {
                 ra.store_dst(e, d, "rax");
@@ -2568,43 +2568,43 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
         // Argumentregister — damit kann das Laden weder ein schon gesetztes
         // Argument noch das Ziel selbst zerstoeren.
         Op::CallIndirect { target, args } => {
-            let stapel = args.len().saturating_sub(ARG_REGS.len());
-            let raum = align_up(stapel as u64 * 8, 16);
-            if raum > 0 {
-                e.line(&format!("sub rsp, {}", raum));
+            let stack = args.len().saturating_sub(ARG_REGS.len());
+            let space = align_up(stack as u64 * 8, 16);
+            if space > 0 {
+                e.line(&format!("sub rsp, {}", space));
                 for (k, arg) in args.iter().skip(ARG_REGS.len()).enumerate() {
                     ra.load_full(e, "rax", *arg);
                     e.line(&format!("mov qword ptr [rsp+{}], rax", k * 8));
                 }
             }
             let mut reg_moves: Vec<(String, String)> = Vec::new();
-            let mut spaeter: Vec<(usize, Val)> = Vec::new();
+            let mut later: Vec<(usize, Val)> = Vec::new();
             for (k, arg) in args.iter().enumerate().take(ARG_REGS.len()) {
                 let o = ra.opnd(*arg);
-                if ist_reg64(&o) {
+                if is_reg64(&o) {
                     reg_moves.push((ARG_REGS[k].to_string(), o));
                 } else {
-                    spaeter.push((k, *arg));
+                    later.push((k, *arg));
                 }
             }
-            parallele_reg_bewegungen(e, &reg_moves);
-            for (k, arg) in spaeter {
+            parallel_reg_moves(e, &reg_moves);
+            for (k, arg) in later {
                 ra.load_full(e, ARG_REGS[k], arg);
             }
             ra.load_full(e, "rax", *target);
             e.line("call rax");
-            if raum > 0 {
-                e.line(&format!("add rsp, {}", raum));
+            if space > 0 {
+                e.line(&format!("add rsp, {}", space));
             }
             if let Some(d) = i.dst {
                 ra.store_dst(e, d, "rax");
             }
         }
-        Op::VtabAddr { tafel } => {
+        Op::VtabAddr { table } => {
             let d = i.dst.ok_or("interner Fehler: vtab ohne Ziel")?;
             e.line(&format!(
                 "lea rax, [rip + {}]",
-                crate::iface::tafel_label(tafel)
+                crate::iface::table_label(table)
             ));
             ra.store_dst(e, d, "rax");
         }
@@ -2616,17 +2616,17 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
             // Gleiche Fehlerklasse wie beim Aufruf: `r10`, `r8` und `r9`
             // sind zugleich Arbeitsregister der Zuteilung.
             let mut sys_moves: Vec<(String, String)> = Vec::new();
-            let mut sys_spaeter: Vec<(usize, Val)> = Vec::new();
+            let mut sys_later: Vec<(usize, Val)> = Vec::new();
             for (k, arg) in args.iter().skip(1).enumerate() {
                 let o = ra.opnd(*arg);
-                if ist_reg64(&o) {
+                if is_reg64(&o) {
                     sys_moves.push((SYS_REGS[k].to_string(), o));
                 } else {
-                    sys_spaeter.push((k, *arg));
+                    sys_later.push((k, *arg));
                 }
             }
-            parallele_reg_bewegungen(e, &sys_moves);
-            for (k, arg) in sys_spaeter {
+            parallel_reg_moves(e, &sys_moves);
+            for (k, arg) in sys_later {
                 ra.load_full(e, SYS_REGS[k], arg);
             }
             ra.load_full(e, "rax", args[0]);
@@ -2658,29 +2658,29 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
             e.line("cld");
             e.line("rep stosb");
         }
-        // Runde 49 (faden.rs). Wie beim atomaren Addieren sind rax/rcx/rdx
+        // Runde 49 (thread.rs). Wie beim atomaren Addieren sind rax/rcx/rdx
         // nie Heimat eines Wertes; `spawn` benutzt zusaetzlich die
         // Systemaufrufregister und ist oben als aufrufaehnlich eingetragen,
         // damit kein Intervall in einem caller-saved Register darueber lebt.
-        Op::AtomicCas { addr, erw, neu } => {
+        Op::AtomicCas { addr, erw, new } => {
             let d = i.dst.ok_or("interner Fehler: atomcas ohne Ziel")?;
             ra.load_full(e, "rcx", *addr);
-            ra.load_full(e, "rdx", *neu);
+            ra.load_full(e, "rdx", *new);
             ra.load_full(e, "rax", *erw);
-            crate::faden::cas_sequenz(e);
+            crate::thread::cas_sequence(e);
             ra.store_dst(e, d, "rax");
         }
-        Op::ThreadSpawn { arg, stapel, ctid } => {
+        Op::ThreadSpawn { arg, stack, ctid } => {
             let d = i.dst.ok_or("interner Fehler: spawn ohne Ziel")?;
             ra.load_full(e, "rdi", *arg);
-            ra.load_full(e, "rsi", *stapel);
+            ra.load_full(e, "rsi", *stack);
             ra.load_full(e, "rdx", *ctid);
-            crate::faden::spawn_sequenz(e);
+            crate::thread::spawn_sequence(e);
             ra.store_dst(e, d, "rax");
         }
         Op::ThreadSelf => {
             let d = i.dst.ok_or("interner Fehler: fadenselbst ohne Ziel")?;
-            crate::faden::selbst_sequenz(e);
+            crate::thread::self_sequence(e);
             ra.store_dst(e, d, "rax");
         }
         Op::AtomicAdd { addr, val } => {
@@ -2731,10 +2731,10 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
 /// Flags einer FIR-Rechenoperation.
 /// Genau ein Operand liegt in einem Register, der andere im Rahmen (kein
 /// Sofortwert)? Dann lohnt der Weg ueber rax mit abschliessendem `lea`.
-fn add_ueber_rax(ra: &Ra, a: Val, b: Val) -> bool {
-    let ist_reg = |v: Val| ra.a.imm(v).is_none() && matches!(ra.a.ort(v), Loc::Reg(_));
-    let ist_rahmen = |v: Val| ra.a.imm(v).is_none() && matches!(ra.a.ort(v), Loc::Slot(_));
-    (ist_reg(a) && ist_rahmen(b)) || (ist_rahmen(a) && ist_reg(b))
+fn add_over_rax(ra: &Ra, a: Val, b: Val) -> bool {
+    let is_reg = |v: Val| ra.a.imm(v).is_none() && matches!(ra.a.place(v), Loc::Reg(_));
+    let is_frame = |v: Val| ra.a.imm(v).is_none() && matches!(ra.a.place(v), Loc::Slot(_));
+    (is_reg(a) && is_frame(b)) || (is_frame(a) && is_reg(b))
 }
 
 /// Laesst sich `d = a op b` als ein einziges `lea` schreiben?
@@ -2743,27 +2743,27 @@ fn add_ueber_rax(ra: &Ra, a: Val, b: Val) -> bool {
 /// Operanden wirklich als Adressteile taugen: Register + Register,
 /// Register + Sofortwert, Sofortwert + Register. Bei `sub` zusaetzlich
 /// `k != i64::MIN`, weil `-k` sonst ueberlaeuft.
-fn lea_moeglich(ra: &Ra, op: BinOp, ty: FTy, a: Val, b: Val, d: Val) -> bool {
+fn lea_possible(ra: &Ra, op: BinOp, ty: FTy, a: Val, b: Val, d: Val) -> bool {
     if ty.bits() <= 32 || !matches!(ra.a.loc(d), Loc::Reg(_)) {
         return false;
     }
-    let ist_reg = |v: Val| ra.a.imm(v).is_none() && matches!(ra.a.ort(v), Loc::Reg(_));
+    let is_reg = |v: Val| ra.a.imm(v).is_none() && matches!(ra.a.place(v), Loc::Reg(_));
     match op {
         BinOp::Add => {
-            (ist_reg(a) && ist_reg(b))
-                || (ist_reg(a) && ra.a.imm(b).is_some())
-                || (ra.a.imm(a).is_some() && ist_reg(b))
+            (is_reg(a) && is_reg(b))
+                || (is_reg(a) && ra.a.imm(b).is_some())
+                || (ra.a.imm(a).is_some() && is_reg(b))
         }
-        BinOp::Sub => ist_reg(a) && matches!(ra.a.imm(b), Some(k) if k != i64::MIN),
+        BinOp::Sub => is_reg(a) && matches!(ra.a.imm(b), Some(k) if k != i64::MIN),
         _ => false,
     }
 }
 
-fn lea_summe(e: &mut Emitter, ziel: &str, basis: &str, versatz: i64) {
-    if versatz >= 0 {
-        e.line(&format!("lea {}, [{}+{}]", ziel, basis, versatz));
+fn lea_sum(e: &mut Emitter, target: &str, base: &str, offset: i64) {
+    if offset >= 0 {
+        e.line(&format!("lea {}, [{}+{}]", target, base, offset));
     } else {
-        e.line(&format!("lea {}, [{}-{}]", ziel, basis, -(versatz as i128) as i64));
+        e.line(&format!("lea {}, [{}-{}]", target, base, -(offset as i128) as i64));
     }
 }
 
@@ -2813,24 +2813,24 @@ fn emit_bin(
         // Ersatzpfad ohne diesen Schutz hat beim ersten Versuch
         // `mov r9, [rbp-8]` + `add r9, r9` erzeugt — matmul lief in einen
         // Speicherzugriffsfehler. Der Fehler ist der Grund fuer diese Form.
-        BinOp::Add | BinOp::Sub if lea_moeglich(ra, op, ty, a, b, d) => {
+        BinOp::Add | BinOp::Sub if lea_possible(ra, op, ty, a, b, d) => {
             let dr = match ra.a.loc(d) {
                 Loc::Reg(r) => r,
                 Loc::Slot(_) => unreachable!("lea_moeglich verlangt ein Zielregister"),
             };
-            let reg_von = |v: Val| match (ra.a.imm(v), ra.a.ort(v)) {
+            let reg_of = |v: Val| match (ra.a.imm(v), ra.a.place(v)) {
                 (None, Loc::Reg(r)) => Some(r),
                 _ => None,
             };
             match op {
-                BinOp::Add => match (reg_von(a), reg_von(b), ra.a.imm(a), ra.a.imm(b)) {
+                BinOp::Add => match (reg_of(a), reg_of(b), ra.a.imm(a), ra.a.imm(b)) {
                     (Some(x), Some(y), _, _) => e.line(&format!("lea {}, [{}+{}]", dr, x, y)),
-                    (Some(x), None, _, Some(k)) => lea_summe(e, dr, x, k),
-                    (None, Some(y), Some(k), _) => lea_summe(e, dr, y, k),
+                    (Some(x), None, _, Some(k)) => lea_sum(e, dr, x, k),
+                    (None, Some(y), Some(k), _) => lea_sum(e, dr, y, k),
                     _ => unreachable!("lea_moeglich hat den Fall zugesichert"),
                 },
-                _ => match (reg_von(a), ra.a.imm(b)) {
-                    (Some(x), Some(k)) => lea_summe(e, dr, x, -k),
+                _ => match (reg_of(a), ra.a.imm(b)) {
+                    (Some(x), Some(k)) => lea_sum(e, dr, x, -k),
                     _ => unreachable!("lea_moeglich hat den Fall zugesichert"),
                 },
             }
@@ -2841,19 +2841,19 @@ fn emit_bin(
         // EIN `lea` ins Ziel. Der allgemeine Zweig darunter braucht hier drei
         // Instruktionen, weil das Ziel mit dem Registeroperanden zusammenfaellt
         // und er deshalb ueber rax rechnen und zurueckkopieren muss.
-        BinOp::Add if wide && matches!(ra.a.loc(d), Loc::Reg(_)) && add_ueber_rax(ra, a, b) => {
+        BinOp::Add if wide && matches!(ra.a.loc(d), Loc::Reg(_)) && add_over_rax(ra, a, b) => {
             let dr = match ra.a.loc(d) {
                 Loc::Reg(r) => r,
                 Loc::Slot(_) => unreachable!("durch die Bedingung ausgeschlossen"),
             };
-            let ist_reg = |v: Val| ra.a.imm(v).is_none() && matches!(ra.a.ort(v), Loc::Reg(_));
+            let is_reg = |v: Val| ra.a.imm(v).is_none() && matches!(ra.a.place(v), Loc::Reg(_));
             // `+` ist kommutativ: der Registeroperand wird zum Indexteil.
-            let (aus_rahmen, im_reg) = if ist_reg(b) { (a, b) } else { (b, a) };
-            let y = match ra.a.ort(im_reg) {
+            let (out_frame, im_reg) = if is_reg(b) { (a, b) } else { (b, a) };
+            let y = match ra.a.place(im_reg) {
                 Loc::Reg(r) => r,
                 Loc::Slot(_) => unreachable!("add_ueber_rax hat ein Register zugesichert"),
             };
-            ra.load_full(e, "rax", aus_rahmen);
+            ra.load_full(e, "rax", out_frame);
             e.line(&format!("lea {}, [rax+{}]", dr, y));
         }
         BinOp::Add | BinOp::Sub | BinOp::And | BinOp::Or | BinOp::Xor | BinOp::Mul => {
@@ -2968,7 +2968,7 @@ mod tests {
     }
 
     #[test]
-    fn schleifenzaehler_landet_im_register() {
+    fn loop_counter_lands_im_register() {
         let f = loop_func();
         let a = allocate(&f);
         assert!(!a.cells.is_empty(), "die alloca-Zelle muss befoerdert werden");
@@ -2977,7 +2977,7 @@ mod tests {
     }
 
     #[test]
-    fn schleifenrumpf_ohne_speicherzugriff() {
+    fn loop_body_without_mem_access() {
         let asm = emit(&Module { funcs: vec![loop_func()] }).expect("codegen");
         // im Rumpf (bb2) darf kein [rbp- mehr vorkommen
         let body = asm.split(".Lmain__bb2:").nth(1).unwrap_or("");
@@ -2986,7 +2986,7 @@ mod tests {
     }
 
     #[test]
-    fn callee_saved_werden_gesichert_und_zurueckgeholt() {
+    fn callee_saved_become_saved_and_retrieved() {
         let f = loop_func();
         let a = allocate(&f);
         if a.saved.is_empty() {
@@ -3000,7 +3000,7 @@ mod tests {
     }
 
     #[test]
-    fn zellen_mit_entkommender_adresse_werden_nicht_befoerdert() {
+    fn cells_with_escaping_address_become_not_promoted() {
         let mut f = Func::new("main", vec![], FTy::I32);
         let slot = f.alloca(8, 8);
         let off = f.push(0, FTy::I64, Op::Const(0));
@@ -3014,7 +3014,7 @@ mod tests {
     }
 
     #[test]
-    fn secret_werte_bekommen_kein_register() {
+    fn secret_values_get_no_register() {
         let mut f = Func::new("main", vec![], FTy::I32);
         let c = f.push(0, FTy::I32, Op::Const(5));
         f.secret.insert(c);
@@ -3025,7 +3025,7 @@ mod tests {
     }
 
     #[test]
-    fn select_bleibt_cmov_auch_mit_registern() {
+    fn select_stays_cmov_also_with_registers() {
         let mut f = Func::new("main", vec![], FTy::I32);
         let c = f.push(0, FTy::Bool, Op::Call { name: "g".into(), args: vec![] });
         let x = f.push(0, FTy::I32, Op::Const(1));
@@ -3042,7 +3042,7 @@ mod tests {
     /// Runde 43: mehr als sechs Parameter sind KEIN Grund mehr fuer den
     /// Grundpfad — der siebte kommt aus [rbp+16].
     #[test]
-    fn viele_parameter_bleiben_im_registerpfad() {
+    fn many_parameter_stay_im_register_path() {
         let mut f = Func::new("f", vec![FTy::I64; 7], FTy::I64);
         f.set_term(0, Term::Ret(Some(6)));
         assert!(supported(&f));
@@ -3054,7 +3054,7 @@ mod tests {
     /// … und ein Aufruf mit acht Argumenten legt die letzten zwei auf den
     /// Stapel, ohne die 16-Byte-Ausrichtung zu verletzen.
     #[test]
-    fn aufruf_mit_acht_argumenten_legt_zwei_auf_den_stapel() {
+    fn call_with_eight_args_puts_two_on_the_stack() {
         let mut g = Func::new("main", vec![], FTy::I32);
         let mut args = Vec::new();
         for k in 0..8 {
@@ -3075,30 +3075,30 @@ mod tests {
 
     /// `[basis + index*4]` statt `shl` + `lea` + Zugriff.
     #[test]
-    fn adressrechnung_wandert_in_den_speicheroperanden() {
+    fn addressing_moves_in_the_mem_operands() {
         let mut f = Func::new("main", vec![FTy::Ptr, FTy::U64], FTy::U64);
-        let vier = f.push(0, FTy::U64, Op::Const(4));
-        let sk = f.push(0, FTy::U64, Op::Bin(BinOp::Mul, 1, vier));
+        let four = f.push(0, FTy::U64, Op::Const(4));
+        let sk = f.push(0, FTy::U64, Op::Bin(BinOp::Mul, 1, four));
         let ad = f.push(0, FTy::U64, Op::Bin(BinOp::Add, 0, sk));
         let w = f.push(0, FTy::U32, Op::Load { addr: ad });
         let c = f.push(0, FTy::U64, Op::Cast { src: w, from: FTy::U32 });
         f.set_term(0, Term::Ret(Some(c)));
         let asm = emit(&Module { funcs: vec![f] }).expect("codegen");
-        let rumpf = asm.split("main:").nth(1).unwrap();
+        let body = asm.split("main:").nth(1).unwrap();
         assert!(
-            rumpf.lines().any(|l| l.contains("dword ptr [") && l.contains("*4]")),
+            body.lines().any(|l| l.contains("dword ptr [") && l.contains("*4]")),
             "kein skalierter Speicheroperand:\n{}",
             asm
         );
-        assert!(!rumpf.contains("shl "), "Skalierung blieb stehen:\n{}", asm);
-        assert!(!rumpf.contains("lea "), "Adressrechnung blieb stehen:\n{}", asm);
+        assert!(!body.contains("shl "), "Skalierung blieb stehen:\n{}", asm);
+        assert!(!body.contains("lea "), "Adressrechnung blieb stehen:\n{}", asm);
     }
 
     /// Wird dieselbe Adresse ZWEIMAL gelesen, darf sie nicht in den
     /// Speicheroperanden wandern — sonst lebt die Basis laenger, als der
     /// Verteiler weiss (die Fehlerklasse aus Runde 40/41).
     #[test]
-    fn zweimal_gelesene_adresse_wird_nicht_gefaltet() {
+    fn twice_read_address_becomes_not_folded() {
         let mut f = Func::new("main", vec![FTy::Ptr, FTy::U64], FTy::U64);
         let ad = f.push(0, FTy::U64, Op::Bin(BinOp::Add, 0, 1));
         let a = f.push(0, FTy::U64, Op::Load { addr: ad });
@@ -3106,9 +3106,9 @@ mod tests {
         let sum = f.push(0, FTy::U64, Op::Bin(BinOp::Add, a, b));
         f.set_term(0, Term::Ret(Some(sum)));
         let asm = emit(&Module { funcs: vec![f] }).expect("codegen");
-        let rumpf = asm.split("main:").nth(1).unwrap();
+        let body = asm.split("main:").nth(1).unwrap();
         assert!(
-            rumpf.contains("lea ") || rumpf.lines().filter(|l| l.contains("add ")).count() > 0,
+            body.contains("lea ") || body.lines().filter(|l| l.contains("add ")).count() > 0,
             "Adresse muesste einmal ausgerechnet werden:\n{}",
             asm
         );
@@ -3117,26 +3117,26 @@ mod tests {
     /// Ein 32-Bit-`add` darf NICHT zur Adressierung werden: dort schneidet
     /// FIR das Ergebnis ab, die Adressierung taete es nicht.
     #[test]
-    fn schmales_add_wird_nicht_zur_adresse() {
+    fn narrow_add_becomes_not_to_address() {
         let mut f = Func::new("main", vec![FTy::Ptr, FTy::U32], FTy::U32);
         let ad = f.push(0, FTy::U32, Op::Bin(BinOp::Add, 0, 1));
         let w = f.push(0, FTy::U32, Op::Load { addr: ad });
         f.set_term(0, Term::Ret(Some(w)));
         let asm = emit(&Module { funcs: vec![f] }).expect("codegen");
-        let rumpf = asm.split("main:").nth(1).unwrap();
+        let body = asm.split("main:").nth(1).unwrap();
         // Die 32-Bit-Addition muss als EIGENE Instruktion dastehen. Welches
         // Register der Verteiler dafuer waehlt, ist seine Sache: die schmale
         // Sicht heisst `eax`..`edi`, aber `r8d`..`r15d` bei den erweiterten
         // (der Merge der Runde 49 hat die Wahl auf `r10d` verschoben — der
         // alte Test suchte nur nach "add e" und schlug deshalb an, obwohl
         // der Code richtig war).
-        let schmale_addition = rumpf.lines().any(|l| {
+        let narrow_addition = body.lines().any(|l| {
             let l = l.trim();
             l.starts_with("add e")
                 || (l.starts_with("add r") && l.split(',').next().is_some_and(|r| r.ends_with('d')))
         });
         assert!(
-            schmale_addition || rumpf.contains("lea "),
+            narrow_addition || body.contains("lea "),
             "32-Bit-Addition muss eine eigene Instruktion bleiben:\n{}",
             asm
         );
@@ -3145,7 +3145,7 @@ mod tests {
     /// Der Wert eines `switch` kommt aus seinem Register, nicht ueber den
     /// Rahmen — und der Index braucht kein `mov eax, eax`.
     #[test]
-    fn switch_liest_den_wert_ohne_umweg_ueber_den_rahmen() {
+    fn switch_reads_the_value_without_detour_over_the_frame() {
         let mut f = Func::new("main", vec![FTy::U32], FTy::I32);
         let mut cases = Vec::new();
         for i in 0..12i128 {
@@ -3161,10 +3161,10 @@ mod tests {
         let asm = emit(&Module { funcs: vec![f] }).expect("codegen");
         assert!(asm.contains("jmp qword ptr [rdx + rax*8]"), "{}", asm);
         assert!(!asm.contains("mov eax, eax"), "ueberfluessige Nullerweiterung:\n{}", asm);
-        let rumpf = asm.split("main:").nth(1).unwrap();
+        let body = asm.split("main:").nth(1).unwrap();
         // Der Wert wird nicht erst in sein Rahmenfach geschrieben.
         assert!(
-            !rumpf.lines().any(|l| l.trim().starts_with("mov qword ptr [rbp-") && l.contains(", rax")),
+            !body.lines().any(|l| l.trim().starts_with("mov qword ptr [rbp-") && l.contains(", rax")),
             "switch-Wert ging ueber den Rahmen:\n{}",
             asm
         );
@@ -3173,14 +3173,14 @@ mod tests {
     /// Blocklayout: hinter einem bedingten Sprung darf kein unbedingter mehr
     /// stehen, wenn eine der beiden Kanten Fallthrough sein kann.
     #[test]
-    fn blocklayout_macht_aus_dem_zweiten_sprung_einen_fallthrough() {
+    fn blocklayout_makes_out_the_second_jump_a_fallthrough() {
         let f = loop_func();
         let asm = emit(&Module { funcs: vec![f] }).expect("codegen");
-        let zeilen: Vec<&str> = asm.lines().map(|l| l.trim()).collect();
-        for (i, z) in zeilen.iter().enumerate() {
-            let bedingt = z.starts_with('j') && !z.starts_with("jmp");
-            if bedingt {
-                if let Some(n) = zeilen.get(i + 1) {
+        let lines: Vec<&str> = asm.lines().map(|l| l.trim()).collect();
+        for (i, z) in lines.iter().enumerate() {
+            let conditional = z.starts_with('j') && !z.starts_with("jmp");
+            if conditional {
+                if let Some(n) = lines.get(i + 1) {
                     assert!(
                         !n.starts_with("jmp "),
                         "unbedingter Sprung hinter bedingtem:\n{}",
@@ -3193,17 +3193,17 @@ mod tests {
 
     /// Eine `void`-Funktion setzt `rax` nicht mehr auf null.
     #[test]
-    fn void_rueckgabe_ohne_xor() {
-        let mut leer = Func::new("leer", vec![], FTy::Void);
-        leer.set_term(0, Term::Ret(None));
+    fn void_ret_without_xor() {
+        let mut empty = Func::new("empty", vec![], FTy::Void);
+        empty.set_term(0, Term::Ret(None));
         let mut m = Func::new("main", vec![], FTy::I32);
         let n = m.push(0, FTy::I32, Op::Const(7));
         m.set_term(0, Term::Ret(Some(n)));
-        let asm = emit(&Module { funcs: vec![leer, m] }).expect("codegen");
-        let rumpf = asm.split("_F0.leer:").nth(1).unwrap();
-        let rumpf = rumpf.split("main:").next().unwrap();
-        assert!(!rumpf.contains("xor eax, eax"), "{}", asm);
-        assert!(rumpf.contains("ret"), "{}", asm);
+        let asm = emit(&Module { funcs: vec![empty, m] }).expect("codegen");
+        let body = asm.split("_F0.empty:").nth(1).unwrap();
+        let body = body.split("main:").next().unwrap();
+        assert!(!body.contains("xor eax, eax"), "{}", asm);
+        assert!(body.contains("ret"), "{}", asm);
     }
 
 }

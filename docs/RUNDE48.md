@@ -21,8 +21,8 @@ wurde für ein eigenes, absichtlich winziges Zeilenformat namens
 **`firn.paket`**. Die Gründe, der Reihe nach:
 
 1. **Alles muss zweimal stehen.** Firn hostet sich selbst. Jede Zeile
-   Manifestlogik existiert in `compiler/src/paket.rs` (Rust) *und* in
-   `lib/firnc1/paket.fi` (Firn, **ohne libc**, nur Puffer und `syscall`).
+   Manifestlogik existiert in `compiler/src/package.rs` (Rust) *und* in
+   `lib/firnc1/package.fi` (Firn, **ohne libc**, nur Puffer und `syscall`).
    Ein TOML-Leser wäre in Firn mehrere tausend Zeilen: maskierte und
    mehrzeilige Zeichenketten, Reihungen, eingebettete Tabellen,
    Datumswerte, Zahlensyntax mit Unterstrichen, Hex/Oktal/Binär.
@@ -118,7 +118,7 @@ Führt ein Import in ein *anderes* Paket, gilt:
 * Das Modul muss in dessen `oeffentlich`-Liste stehen
   (`modul 'x' ist in paket 'p' nicht oeffentlich`).
 
-**Innerhalb** eines Pakets gibt es keine Schranke: `beispiele/pakete/geo`
+**Innerhalb** eines Pakets gibt es keine Schranke: `demos/packages/geo`
 benutzt sein privates Modul `innen` und darf das.
 
 **Fehlt `oeffentlich`, ist alles öffentlich.** Das ist bewusst dieselbe
@@ -142,7 +142,7 @@ Umbenennung und hätten sich still überdeckt. Das ist jetzt ein Fehler:
 
 ```
 error: namenskonflikt: modul 'hilfe' kommt aus zwei dateien
-hinweis: '/…/anwendung/src/hilfe.fi' und '/…/geo/src/hilfe.fi'
+hinweis: '/…/anwendung/src/help.fi' und '/…/geo/src/help.fi'
 ```
 
 Geprüft wird über die absoluten Pfade — zwei Schreibweisen derselben Datei
@@ -164,8 +164,8 @@ prüft den Graphen auf Zyklen und übersetzt `start`. Ohne `-o` heißt das
 Ergebnis wie das Paket:
 
 ```
-$ firnc --paket beispiele/pakete/anwendung
-$ ./beispiele/pakete/anwendung/anwendung
+$ firnc --paket demos/packages/app
+$ ./demos/packages/app/anwendung
 12 14 3
 ```
 
@@ -175,14 +175,14 @@ symbolischen Verweise) — deshalb ist er auf beiden Übersetzern und auf
 jedem Rechner derselbe:
 
 ```
-$ firnc --paket-info beispiele/pakete/anwendung
+$ firnc --paket-info demos/packages/app
 paket anwendung
 version 0.1.0
-wurzel beispiele/pakete/anwendung
-start beispiele/pakete/anwendung/src/main.fi
-quelle beispiele/pakete/anwendung/src
-brauche geo beispiele/pakete/geo
-brauche text beispiele/pakete/text
+wurzel demos/packages/app
+start demos/packages/app/src/main.fi
+quelle demos/packages/app/src
+brauche geo demos/packages/geo
+brauche text demos/packages/text
 ```
 
 **Inkrementell ist es nicht.** Der Treiber übersetzt immer alles. Das war
@@ -193,23 +193,23 @@ getroffen.
 
 ## 7. Das Beispielprojekt
 
-`beispiele/pakete/` — ein Programm und zwei Bibliotheken:
+`demos/packages/` — ein Programm und zwei Bibliotheken:
 
 ```
 anwendung/   firn.paket   brauche geo, brauche text; quelle src
              src/main.fi  import geo · import geo.punkt · import text · import hilfe
-             src/hilfe.fi eigenes Modul aus 'quelle src'
+             src/help.fi eigenes Modul aus 'quelle src'
 geo/         firn.paket   oeffentlich geo punkt   (KEIN start: Bibliothek)
              src/geo.fi   öffentlich, benutzt intern 'innen'
-             src/punkt.fi öffentlich
-             src/innen.fi PRIVAT — von außen nicht einbindbar
+             src/dot.fi öffentlich
+             src/inner.fi PRIVAT — von außen nicht einbindbar
 text/        firn.paket   ohne 'oeffentlich' → alles öffentlich
              src/text.fi
 ```
 
 ## 8. Was geprüft wird
 
-`tools/pakete/run.sh` (neu, in `test.sh` als Schritt 18): **21 Fälle**,
+`tools/packages/run.sh` (neu, in `test.sh` als Schritt 18): **21 Fälle**,
 jeder durch **beide** Übersetzer, Fehlermeldungen Oktett für Oktett
 verglichen. Positiv: Bau des Beispielprojekts (firnc0 und firnc1), Ausgabe
 `12 14 3`, Benennung nach dem Manifest, `--paket-info`-Gleichheit, privates
@@ -220,8 +220,8 @@ ohne Manifest, falscher Paketname, ungültige Version, unbekannter
 Schlüssel, fehlende `paket`-Zeile, Namenskonflikt, Bibliothek ohne `start`,
 Verzeichnis ohne Manifest, `--paket` zusammen mit einer Quelldatei.
 
-Dazu **13 neue Rust-Modultests** in `compiler/src/paket.rs` (11) und
-`compiler/src/paketwelt.rs` (2): Format, Pflichtangaben, doppelte Einträge,
+Dazu **13 neue Rust-Modultests** in `compiler/src/package.rs` (11) und
+`compiler/src/package_world.rs` (2): Format, Pflichtangaben, doppelte Einträge,
 Stelligkeit, Pfadrechnen, Paketzugehörigkeit, `--paket-info`-Text und die
 festen Fehlertexte.
 
@@ -229,7 +229,7 @@ festen Fehlertexte.
 
 * **Bestehende Projekte müssen nichts tun.** Ohne `firn.paket` ist alles
   wie vorher; `FIRNLIB` gilt unverändert und wird weiterhin als Schritt 5
-  durchsucht. `test.sh`, `tools/selbst_vergleich.sh` und
+  durchsucht. `test.sh`, `tools/self_compare.sh` und
   `tools/fixpunkt.sh` setzen `FIRNLIB` selbst und laufen unverändert.
 * **Ein Projekt umstellen:** `firn.paket` ins Wurzelverzeichnis legen
   (`paket`, `version`, `start`, `quelle`), Abhängigkeiten mit `brauche`
@@ -241,7 +241,7 @@ festen Fehlertexte.
   Überdeckung — das ist der Zweck, kann aber beim ersten Lauf auffallen.
 * **Kein Manifest im Wurzelverzeichnis dieses Repos.** Das ist Absicht: es
   würde die Auflösung aller Testprogramme im Repo verändern. Das Beispielprojekt
-  liegt deshalb unter `beispiele/pakete/`.
+  liegt deshalb unter `demos/packages/`.
 
 ## 10. Offen (ehrlich)
 
@@ -273,11 +273,11 @@ früheren Lauf war beteiligt.
 | Prüfung | Ergebnis |
 |---|---|
 | `bash ./test.sh` | **PASS 697/697**, Exit 0 (Basis 696/696; +1 = Schritt 18) |
-| ⤷ Schritt 18 `tools/pakete/run.sh` | **21 bestanden, 0 fehlgeschlagen** |
-| `bash tools/selbst_vergleich.sh` | **201 gleiches Verhalten · 0 abweichend · 0 fehlerhaft**, Exit 0 |
+| ⤷ Schritt 18 `tools/packages/run.sh` | **21 bestanden, 0 fehlgeschlagen** |
+| `bash tools/self_compare.sh` | **201 gleiches Verhalten · 0 abweichend · 0 fehlerhaft**, Exit 0 |
 | `bash tools/fixpunkt.sh` | **Stufe 2 == Stufe 3, zeichengleich**, 2.070.856 Oktette, 364.765 Zeilen Assembler; Korpus: `.firnc2` verhält sich wie `firnc0`, Exit 0 |
 
 Zum Vergleich der Ausgangsstand von Commit `a492d26`: `test.sh` 696/696,
-`selbst_vergleich.sh` 201/0/0, `fixpunkt.sh` zeichengleich bei 2.065.816
+`self_compare.sh` 201/0/0, `fixpunkt.sh` zeichengleich bei 2.065.816
 Oktetten. Der Zuwachs von 5.040 Oktetten im selbst übersetzten Compiler ist
-`lib/firnc1/paket.fi` plus die Änderungen in `bin/firnc1.fi`.
+`lib/firnc1/package.fi` plus die Änderungen in `bin/firnc1.fi`.

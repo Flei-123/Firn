@@ -193,13 +193,13 @@ Grundpfad, der es laengst beherrscht.
 Selbstkosten der betroffenen Funktionen (realweb):
 `main` 45.786.357 -> 11.448.891 (-75 %), `tok_emit` 10.700.120 -> 5.198.342
 (-51 %), `sink_flush_chars` faellt aus den ersten zwoelf heraus.
-`selbst_vergleich.sh` meldet jetzt „CODEGEN FEHLT: 0".
+`self_compare.sh` meldet jetzt „CODEGEN FEHLT: 0".
 
 **Absicherung.** Diese Aenderung fasst die Aufrufkonvention an — der Bereich,
 in dem ein Fehler nicht auffaellt, sondern erst drei Runden spaeter als
 Miscompile auftaucht. Deshalb:
 
-* `tests/331_stapelargumente.fi` (neu): sieben Argumente (**ein**
+* `tests/331_stack_args.fi` (neu): sieben Argumente (**ein**
   Stapelwort, also mit Fuellung — der Fall, der die 16-Byte-Ausrichtung
   bricht, wenn man sie vergisst), zehn Argumente (vier Stapelworte), ein
   Stapelargument, das selbst aus einem Aufruf kommt, und Rekursion mit einem
@@ -345,9 +345,9 @@ gefallen (-96,6 %), die gesamte Ausgabekette des Sinks (`tok_emit`,
 
 | Pruefung | Ergebnis |
 |---|---|
-| `bash ./test.sh` | **PASS 676/676** (Basis 673/673; +3 durch `tests/331_stapelargumente.fi` in drei Optimierungsstufen) |
+| `bash ./test.sh` | **PASS 676/676** (Basis 673/673; +3 durch `tests/331_stack_args.fi` in drei Optimierungsstufen) |
 | `cargo test --release` (Modul-Tests) | 142/142 |
-| `bash tools/selbst_vergleich.sh` | **197 gleiches Verhalten, 0 abweichend, 0 fehlerhaft** (Basis 196; +1 durch die neue Testdatei), CODEGEN FEHLT: 0 |
+| `bash tools/self_compare.sh` | **197 gleiches Verhalten, 0 abweichend, 0 fehlerhaft** (Basis 196; +1 durch die neue Testdatei), CODEGEN FEHLT: 0 |
 | `bash tools/fixpunkt.sh` | **Stufe 2 == Stufe 3, zeichengleich, 309.468 Zeilen** |
 | `bash tools/tokenizer/run.sh` | **6810/6810 = 100,00 %** |
 | Lexer/Parser/Layout/Sema/FIR-Vergleich | unveraendert (je 1 bekannte und benannte Abweichung, Layout 0) |
