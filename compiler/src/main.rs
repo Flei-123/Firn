@@ -71,12 +71,12 @@ enum Emit {
 }
 
 struct Options {
-    /// Quelldatei; entfaellt bei `--paket`.
+    /// Quelldatei; entfaellt bei `--package`.
     input: Option<PathBuf>,
     output: Option<PathBuf>,
-    /// `--paket <verzeichnis>`: Projekt anhand seines Manifests uebersetzen.
+    /// `--package <verzeichnis>`: Projekt anhand seines Manifests uebersetzen.
     package: Option<String>,
-    /// `--paket-info <verzeichnis>`: Manifest lesen und berichten.
+    /// `--package-info <verzeichnis>`: Manifest lesen und berichten.
     package_info: Option<String>,
     emit: Emit,
     optimize: bool,
@@ -98,8 +98,8 @@ fn usage() -> String {
          \n\
          Optionen:\n  \
          -o <pfad>          Ausgabedatei (Standard: Eingabename ohne Endung)\n  \
-         --paket <verz>     Projekt aus <verz>/firn.paket uebersetzen\n  \
-         --paket-info <verz> Manifest von <verz> lesen und berichten\n  \
+         --package <verz>     Projekt aus <verz>/firn.package uebersetzen\n  \
+         --package-info <verz> Manifest von <verz> lesen und berichten\n  \
          --emit=exe         ausfuehrbare Datei erzeugen (Standard, ruft as/ld)\n  \
          --emit=asm         x86_64-Assembler auf die Ausgabe schreiben\n  \
          --emit=fir         FIR-Textform (nach Optimierung, sofern aktiv)\n  \
@@ -228,14 +228,14 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                 i += 1;
                 match args.get(i) {
                     Some(p) => package = Some(p.clone()),
-                    None => return Err("--paket erwartet ein Verzeichnis".to_string()),
+                    None => return Err("--package erwartet ein Verzeichnis".to_string()),
                 }
             }
             "--package-info" => {
                 i += 1;
                 match args.get(i) {
                     Some(p) => package_info = Some(p.clone()),
-                    None => return Err("--paket-info erwartet ein Verzeichnis".to_string()),
+                    None => return Err("--package-info erwartet ein Verzeichnis".to_string()),
                 }
             }
             _ => {
@@ -311,10 +311,10 @@ fn run(opts: &Options) -> i32 {
     // ZEICHENGLEICH schreiben muss und dort keine `--help`-Nachbemerkung
     // hat (Runde 48).
     if opts.package.is_some() && opts.input.is_some() {
-        eprint!("error: --paket und eine eingabedatei schliessen einander aus\n");
+        eprint!("error: --package und eine eingabedatei schliessen einander aus\n");
         return 2;
     }
-    // --- `--paket-info`: Manifest lesen, pruefen, berichten (Runde 48) ---
+    // --- `--package-info`: Manifest lesen, pruefen, berichten (Runde 48) ---
     if let Some(dir) = &opts.package_info {
         match package_world::World::ab_root(dir) {
             Ok(w) => {
@@ -327,7 +327,7 @@ fn run(opts: &Options) -> i32 {
             }
         }
     }
-    // --- Paketwelt: mit `--paket` das genannte Projekt, sonst das Manifest
+    // --- Paketwelt: mit `--package` das genannte Projekt, sonst das Manifest
     // ueber der Quelldatei (fehlt eins, ist die Welt leer und nichts aendert
     // sich gegenueber Runde 47).
     let (world, input, target_out_manifest) = match &opts.package {
