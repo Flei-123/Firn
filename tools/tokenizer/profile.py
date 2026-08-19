@@ -53,29 +53,29 @@ def finde(tab, starts, adr):
 KOPF = re.compile(r"^(c?fn)=\((\d+)\)(?:\s+(.*))?$")
 
 
-def lies(pfad):
-    """Selbstkosten und Aufrufkosten je Funktions-id."""
-    namen = {}          # id -> Roh-Name (meist 0x...)
-    selbst = {}         # id -> Ir
-    inklusiv = {}       # id -> Ir (Summe der Aufrufe DORTHIN)
+def read_cg(path):
+    """Self costs and call costs per function id."""
+    names = {}          # id -> raw name (usually 0x...)
+    self_cost = {}         # id -> Ir
+    incl = {}       # id -> Ir (the sum of the calls THERE)
     akt = None
-    ziel = None
+    target = None
     warte_aufrufkosten = False
-    with open(pfad, "r", errors="replace") as f:
+    with open(path, "r", errors="replace") as f:
         for z in f:
             z = z.rstrip("\n")
             if not z:
                 continue
             m = KOPF.match(z)
             if m:
-                art, ident, name = m.group(1), m.group(2), m.group(3)
+                kind, ident, name = m.group(1), m.group(2), m.group(3)
                 if name:
-                    namen[ident] = name.strip()
-                if art == "fn":
+                    names[ident] = name.strip()
+                if kind == "fn":
                     akt = ident
                     warte_aufrufkosten = False
                 else:
-                    ziel = ident
+                    target = ident
                 continue
             if z.startswith("calls="):
                 warte_aufrufkosten = True
@@ -90,27 +90,27 @@ def lies(pfad):
                     continue
                 if warte_aufrufkosten:
                     warte_aufrufkosten = False
-                    if ziel is not None:
-                        inklusiv[ziel] = inklusiv.get(ziel, 0) + ir
+                    if target is not None:
+                        incl[target] = incl.get(target, 0) + ir
                     continue
                 if akt is not None:
-                    selbst[akt] = selbst.get(akt, 0) + ir
+                    self_cost[akt] = self_cost.get(akt, 0) + ir
                 continue
             warte_aufrufkosten = False
-    return namen, selbst, inklusiv
+    return names, self_cost, incl
 
 
-def aufloesen(namen, tab, starts):
+def resolve(names, tab, starts):
     """id -> lesbarer Name."""
     aus = {}
-    for ident, roh in namen.items():
-        if roh.startswith("0x"):
+    for ident, raw in names.items():
+        if raw.startswith("0x"):
             try:
-                aus[ident] = finde(tab, starts, int(roh, 16))
+                aus[ident] = finde(tab, starts, int(raw, 16))
                 continue
             except ValueError:
                 pass
-        aus[ident] = roh
+        aus[ident] = raw
     return aus
 
 
@@ -119,25 +119,25 @@ def main():
         print(__doc__)
         return 1
     binary, cg = sys.argv[1], sys.argv[2]
-    anzahl = int(sys.argv[3]) if len(sys.argv) > 3 else 30
+    count = int(sys.argv[3]) if len(sys.argv) > 3 else 30
     tab = symbole(binary)
     starts = [a for a, _ in tab]
-    namen, selbst, inklusiv = lies(cg)
-    lesbar = aufloesen(namen, tab, starts)
+    names, self_cost, incl = read_cg(cg)
+    readable = resolve(names, tab, starts)
 
     s = {}
-    for ident, v in selbst.items():
-        n = lesbar.get(ident, "???")
+    for ident, v in self_cost.items():
+        n = readable.get(ident, "???")
         s[n] = s.get(n, 0) + v
     i = {}
-    for ident, v in inklusiv.items():
-        n = lesbar.get(ident, "???")
+    for ident, v in incl.items():
+        n = readable.get(ident, "???")
         i[n] = i.get(n, 0) + v
 
     ges = sum(s.values())
     print(f"{'SELBST':>16} {'ANTEIL':>8} {'INKLUSIV':>16}  FUNKTION")
     print("-" * 78)
-    for n, v in sorted(s.items(), key=lambda kv: -kv[1])[:anzahl]:
+    for n, v in sorted(s.items(), key=lambda kv: -kv[1])[:count]:
         print(f"{v:16,d} {v/ges*100:7.2f}% {i.get(n, 0):16,d}  {n}")
     print("-" * 78)
     print(f"{ges:16,d} {100.0:7.2f}%                    SUMME (Selbstkosten)")
