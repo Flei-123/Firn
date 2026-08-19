@@ -1,29 +1,29 @@
-# Runde 54 — HTML-Baumkonstruktion und DOM-Kern
+# Round 54 — HTML tree construction and the DOM core
 
-Branch `r54-dom`, Basis `cc1710f`. Diese Runde baut die Stufe hinter dem
-Tokenizer: aus dem Tokenstrom wird ein **DOM-Baum**, nach WHATWG §13.2.6, in
-Firn geschrieben.
+Branch `r54-dom`, base `cc1710f`. This round builds the stage behind the
+tokenizer: the token stream becomes a **DOM tree**, following WHATWG
+§13.2.6, written in Firn.
 
-Ergebnis vorweg, alles selbst gemessen (Zahlen in §7):
+Result up front, all measured by ourselves (numbers in §7):
 
-| | Basis (`cc1710f`) | Runde 54 |
+| | base (`cc1710f`) | round 54 |
 |---|---|---|
 | `bash ./test.sh` | 751 / 751 | **761 / 761** |
-| `bash tools/self_compare.sh` | 213 gleich / 0 abweichend / 0 fehlerhaft | **216 / 0 / 0** |
-| eigene Baumfälle (WHATWG, von Hand) | — | **150 / 150** (in allen drei Baustufen) |
-| davon von html5lib 1.1 bestätigt | — | **149 / 150** (1× folgt html5lib einer älteren Fassung) |
-| echte Seiten aus `testdata/realweb/` | — | **8 / 8 baumgleich zu html5lib**, Zeile für Zeile |
-| bekannte Lücken (eigene Datei, müssen fehlschlagen) | — | **0 / 10** |
-| Dauerlauf: DOM-Bäume bauen und verwerfen | — | 20 000 Runden, 2 560 000 GC-Objekte, **RSS-Zuwachs 0 KiB** |
-| Gegenprobe (jeder Baum wird festgehalten) | — | **+41 756 KiB** — die Messung kann ein Leck sehen |
-| html5lib-Tokenizer-Suite | 6810 / 6810 | **6810 / 6810** |
-| Tokenizer-Durchsatz durch den Eingriff | — | −0,6 % / +1,8 % (Rauschen, §5) |
+| `bash tools/self_compare.sh` | 213 identical / 0 differing / 0 failing | **216 / 0 / 0** |
+| own tree cases (WHATWG, by hand) | — | **150 / 150** (in all three build stages) |
+| of those confirmed by html5lib 1.1 | — | **149 / 150** (1× html5lib follows an older version) |
+| real pages from `testdata/realweb/` | — | **8 / 8 tree-identical to html5lib**, line by line |
+| known gaps (own file, must fail) | — | **0 / 10** |
+| endurance run: building and discarding DOM trees | — | 20 000 rounds, 2 560 000 GC objects, **RSS growth 0 KiB** |
+| counter-check (every tree is retained) | — | **+41 756 KiB** — the measurement can see a leak |
+| html5lib tokenizer suite | 6810 / 6810 | **6810 / 6810** |
+| tokenizer throughput through the intervention | — | −0,6 % / +1,8 % (noise, §5) |
 
 ---
 
-## 1. Was gebaut wurde
+## 1. What was built
 
-Vier neue Module unter `lib/browser/` und ein Werkzeugordner `tools/html/`:
+Four new modules under `lib/browser/` and a tool directory `tools/html/`:
 
 ```
 lib/browser/node.fi       DOM-Kern: Knotenarten, Baum, Attribute, Ketten
@@ -37,14 +37,14 @@ lib/browser/parse_main.fi   Treiberprogramm (stdin -> stdout)
 lib/browser/soak_tree.fi    Dauerlauf mit Gegenprobe
 ```
 
-Am Tokenizer (`lib/html/`) wurde **additiv** ergänzt, was der Baumaufbau
-braucht — begründet in §5.
+What the tree construction needs was added **additively** to the tokenizer
+(`lib/html/`) — justified in §5.
 
 ---
 
-## 2. Die Datenstrukturen
+## 2. The data structures
 
-### 2.1 Knoten (`lib/browser/node.fi`)
+### 2.1 Nodes (`lib/browser/node.fi`)
 
 ```firn
 gc class Knoten {
@@ -61,54 +61,57 @@ gc class Fragment  extends Knoten { wirt }
 gc class Attribut  { naechstes: Gc[Attribut], wert: Gc[Kette], name: u32, ns: u32 }
 ```
 
-**Alle Baumverweise sind STARK, in beide Richtungen.** Ein Baum aus *n* Knoten
-hat damit rund 2*n* Zyklen. Das ist Absicht und der Kern der Sache: genau diese
-Struktur ist der Grund, warum Firn einen Tracing-Sammler hat (SPEC §3.5.1). Ein
-Zählverweis gibt hier **nichts** frei. Der Nachweis steht in §4.
+**All tree references are STRONG, in both directions.** A tree of *n* nodes
+thereby has around 2*n* cycles. That is intentional and the core of the
+matter: exactly this structure is the reason why Firn has a tracing
+collector (SPEC §3.5.1). A reference count releases **nothing** here. The
+proof is in §4.
 
-`Element extends Knoten` nutzt das Präfixlayout (SPEC §4.4): eine
-`Gc[Element]` ist kostenlos eine `Gc[Knoten]`, abwärts nur mit `.as?[Element]`.
+`Element extends Knoten` uses the prefix layout (SPEC §4.4): a
+`Gc[Element]` is a `Gc[Knoten]` for free, downwards only with
+`.as?[Element]`.
 
-### 2.2 Namen sind Atome
+### 2.2 Names are atoms
 
-Element- und Attributnamen sind `u32`-Kennungen in eine Tabelle
-(`lib/browser/names.fi`, SPEC §8.3 `Z4`). Der Grund ist nicht Sparsamkeit,
-sondern Machbarkeit: die WHATWG-Baumkonstruktion besteht zu großen Teilen aus
-Fragen der Form *„ist der Name des aktuellen Knotens einer aus dieser Liste von
-40 Namen"*. Mit Zeichenketten wäre jede davon ein Haufen `memcmp`.
+Element and attribute names are `u32` identifiers into a table
+(`lib/browser/names.fi`, SPEC §8.3 `Z4`). The reason is not thrift
+but feasibility: the WHATWG tree construction consists to a large extent of
+questions of the form *„is the name of the current node one from this list
+of 40 names"*. With strings each of those would be a pile of `memcmp`.
 
-Die **124 Namen, die der Standard beim Namen nennt**, haben eine feste Kennung
-(`lib/browser/tag.fi`, erzeugt von `tools/html/gen_names.py`) — `tag.M_DIV`
-ist damit eine Übersetzungszeitkonstante. Alles darüber hinaus (eigene
-Elementnamen, beliebige Attributnamen) bekommt beim ersten Auftreten eine
-Kennung > 124. Die Ablage ist WTF-8, nicht UTF-8: ein Tagname darf ungepaarte
-Surrogate enthalten (SPEC §8.2).
+The **124 names that the standard names by name** have a fixed identifier
+(`lib/browser/tag.fi`, generated by `tools/html/gen_names.py`) — `tag.M_DIV`
+is thereby a compile time constant. Everything beyond that (custom
+element names, arbitrary attribute names) gets an identifier > 124 on its
+first appearance. The storage is WTF-8, not UTF-8: a tag name may contain
+unpaired surrogates (SPEC §8.2).
 
-Die Tabelle ist vollständig `#[no_gc]` und darf deshalb auch aus heißen Pfaden
-gerufen werden.
+The table is completely `#[no_gc]` and may therefore also be called from
+hot paths.
 
-### 2.3 Text ist eine GC-Kette
+### 2.3 Text is a GC chain
 
 ```firn
 gc class Strang { naechster: Gc[Strang], len: u32, zeichen: [u32; 28] }
 gc class Kette  { erstes: Gc[Strang], letztes: Gc[Strang], laenge: u64 }
 ```
 
-Textknoten, Kommentare, Attributwerte und die DOCTYPE-Kennungen liegen als
-Kette aus GC-Stücken vor. **Damit lebt jedes Byte des Dokuments im GC-Heap.**
-Das ist eine bewusste Entscheidung gegen die naheliegende Abkürzung (eine Arena
-je Dokument, Text als Offset/Länge): hält später eine JS-Referenz einen
-einzelnen Textknoten fest, bleibt genau dieser Text am Leben und sonst nichts —
-und nichts zeigt ins Leere, wenn das Dokument abgeräumt wird. Eine Arena hätte
-genau dort weh getan, wo dieses Projekt hin will.
+Text nodes, comments, attribute values and the DOCTYPE identifiers exist as
+a chain of GC pieces. **With that, every byte of the document lives in the
+GC heap.** That is a deliberate decision against the obvious shortcut (one
+arena per document, text as offset/length): if a JS reference later holds
+on to a single text node, exactly that text stays alive and nothing else —
+and nothing points into the void when the document is cleared away. An
+arena would have hurt in exactly the place this project is headed.
 
-Der Preis ist benannt: ein Zeichen kostet 4 Byte (Codepunkt), ein Stück fasst
-28 davon. 28 × 4 + 8 (`naechster`) + 4 (`len`) = 124 → aufgerundet 128, **genau
-eine Größenklasse des Sammlers** (`lib/gc/gc.fi`, `__gc_klassen_bytes`), also
-kein Verschnitt. Anhängen ist O(1) (deshalb `letztes`), Indizieren O(n/28) —
-wer eine Kette zeichenweise durchläuft, nimmt `kette_nach_cpbuf`.
+The price is named: one character costs 4 bytes (code point), one piece
+holds 28 of them. 28 × 4 + 8 (`naechster`) + 4 (`len`) = 124 → rounded up
+to 128, **exactly one size class of the collector** (`lib/gc/gc.fi`,
+`__gc_klassen_bytes`), so there is no waste. Appending is O(1) (hence
+`letztes`), indexing O(n/28) — whoever walks a chain character by character
+takes `kette_nach_cpbuf`.
 
-### 2.4 Der Zustand des Baumaufbaus
+### 2.4 The state of the tree construction
 
 ```firn
 struct Baum {
@@ -123,36 +126,36 @@ struct Baum {
 }
 ```
 
-**Ein `Baum` MUSS im Rahmen des Aufrufers liegen** (als `var`, nicht auf der
-Halde). Der Stapelscan des Sammlers ist konservativ (SPEC §3.5.3): auf dem
-Stapel findet er die `Gc[…]`-Felder ohne jede Anmeldung, auf `mem.heap_alloc`
-nicht — dort müsste `gc_wurzel_anmelden` (Runde 47) benutzt werden. Das steht
-so im Kopf jeder betroffenen Datei, weil es die eine Regel ist, die man beim
-Weiterbauen nicht übersehen darf.
+**A `Baum` MUST lie in the frame of the caller** (as a `var`, not on the
+heap). The stack scan of the collector is conservative (SPEC §3.5.3): on
+the stack it finds the `Gc[…]` fields without any registration, on
+`mem.heap_alloc` it does not — there `gc_wurzel_anmelden` (round 47) would
+have to be used. That is stated in the header of every affected file,
+because it is the one rule one must not overlook when building further.
 
-Der Stapel ist ein **Feld fester Größe**, weil Firn noch kein `GcVec[T]` hat
-(§6). 512 Ebenen bzw. 128 Formatierungseinträge; ein Überlauf ist ein
-**sichtbarer Abbruch** (`kaputt != 0`, im Treiber `#KAPUTT 2`), keine stille
-Kürzung. Zum Vergleich: die realen Seiten in `testdata/realweb/` kommen auf
-höchstens 32 Ebenen.
+The stack is an **array of fixed size**, because Firn does not have
+`GcVec[T]` yet (§6). 512 levels resp. 128 formatting entries; an overflow
+is a **visible abort** (`kaputt != 0`, in the driver `#KAPUTT 2`), not a
+silent truncation. For comparison: the real pages in `testdata/realweb/`
+reach at most 32 levels.
 
 ---
 
-## 3. Die Baumkonstruktion
+## 3. The tree construction
 
-### 3.1 Umgesetzte Einfügemodi — 22 von 23
+### 3.1 Implemented insertion modes — 22 of 23
 
-| Modus | umgesetzt | Anmerkung |
+| Mode | implemented | Note |
 |---|---|---|
-| „initial" | ✔ | DOCTYPE, Quirks-Erkennung (eingeschränkt, §8) |
+| „initial" | ✔ | DOCTYPE, quirks detection (restricted, §8) |
 | „before html" | ✔ | |
 | „before head" | ✔ | |
-| „in head" | ✔ | inkl. Rohtext-/RCDATA-Weg |
-| „in head noscript" | ✔ | Skriptflagge ist **aus** |
-| „after head" | ✔ | inkl. `head` zurück auf den Stapel |
-| „in body" | ✔ | vollständig, inkl. Adoption Agency |
+| „in head" | ✔ | incl. the raw text / RCDATA path |
+| „in head noscript" | ✔ | the scripting flag is **off** |
+| „after head" | ✔ | incl. `head` back onto the stack |
+| „in body" | ✔ | complete, incl. the adoption agency |
 | „text" | ✔ | |
-| „in table" | ✔ | inkl. foster parenting |
+| „in table" | ✔ | incl. foster parenting |
 | „in table text" | ✔ | |
 | „in caption" | ✔ | |
 | „in column group" | ✔ | |
@@ -166,49 +169,51 @@ höchstens 32 Ebenen.
 | „after frameset" | ✔ | |
 | „after after body" | ✔ | |
 | „after after frameset" | ✔ | |
-| **„in template"** | **✘** | siehe §8 |
+| **„in template"** | **✘** | see §8 |
 
-Dazu vollständig umgesetzt:
+Fully implemented in addition:
 
-* **Stapel offener Elemente** mit allen vier Geltungsbereichen (*scope*,
-  *list item scope*, *button scope*, *table scope*) und dem eigenen Weg für
-  *select scope*.
-* **Liste der aktiven Formatierungselemente** mit Marken, **Noahs Arche**
-  (höchstens drei gleiche Einträge nach der letzten Marke) und
+* **The stack of open elements** with all four scopes (*scope*,
+  *list item scope*, *button scope*, *table scope*) and the separate path
+  for *select scope*.
+* **The list of active formatting elements** with markers, **Noah's Ark**
+  (at most three identical entries after the last marker) and
   *reconstruct the active formatting elements*.
-* **Das Adoption-Agency-Verfahren**, beide Schleifen, mit Lesezeichen. Die
-  äußere Schleife läuft wirklich bis zu achtmal — dass sie das tut, ist der
-  Unterschied zwischen `<b><p>a</b>b` richtig und falsch (Fall 1 in
-  `03_formatierung.dat`, beim ersten Anlauf falsch gehabt).
-* **Implizites Schließen**, auch die gründliche Fassung.
-* **Foster parenting** mit der vollständigen Fundstelle
-  (*appropriate place for inserting a node*, inkl. Überschreibungsziel).
+* **The adoption agency algorithm**, both loops, with a bookmark. The
+  outer loop really runs up to eight times — that it does so is the
+  difference between `<b><p>a</b>b` being right and being wrong (case 1 in
+  `03_formatierung.dat`, which was wrong on the first attempt).
+* **Implicit closing**, including the thorough version.
+* **Foster parenting** with the complete location
+  (*appropriate place for inserting a node*, incl. the override target).
 * **„reset the insertion mode appropriately"**.
-* Der generische **Rohtext-/RCDATA-Weg mit Rückkopplung auf den Tokenizer**
+* The generic **raw text / RCDATA path with feedback to the tokenizer**
   (§5).
-* Kategorien **Special** und **Formatting** wörtlich nach Standard.
+* The categories **Special** and **Formatting**, literally as in the
+  standard.
 
-### 3.2 Ein Fehler, der zweimal derselbe war
+### 3.2 A bug that was the same one twice
 
-Die Endtag-Gruppe *„address, article, …"* in „in body" ist **nicht** dieselbe
-wie die gleichnamige Starttag-Gruppe: `p` hat eine eigene Regel (es wird
-notfalls erzeugt), dafür gehören `button`, `listing` und `pre` dazu. Beim
-ersten Anlauf war es dieselbe Funktion — Folge: `</p>` rief
-`implizit_schliessen` (das `p` selbst poppt) und danach *„pop until p popped"*,
-und das räumte, weil kein `p` mehr da war, **den ganzen Stapel leer**. Beides
-ist repariert; `stapel_pop_bis_name` prüft seither vorher, ob der Name
-überhaupt im Stapel steht, damit ein solcher Denkfehler nicht mehr als leerer
-Baum, sondern an der Aufrufstelle auffällt.
+The end tag group *„address, article, …"* in „in body" is **not** the same
+as the start tag group of the same name: `p` has a rule of its own (it is
+created if need be), and in exchange `button`, `listing` and `pre` belong
+to it. On the first attempt it was the same function — consequence: `</p>`
+called `implizit_schliessen` (which pops the `p` itself) and after that
+*„pop until p popped"*, and because there was no `p` left, that emptied
+**the whole stack**. Both are repaired; since then
+`stapel_pop_bis_name` checks beforehand whether the name is in the stack at
+all, so that such a thinking error no longer shows up as an empty tree but
+at the call site.
 
 ---
 
-## 4. Der GC-Nachweis
+## 4. The GC proof
 
-Ein DOM-Baum ist genau die Zyklenart, an der ein Zählverweis scheitert.
-`tools/html/gc_tree.sh` fährt `lib/browser/soak_tree.fi`: in einer Schleife
-wird aus einem echten HTML-Stück (446 Byte, mit DOCTYPE, Rohtext, Tabelle,
-verschachtelter Formatierung, Attributen, Kommentar, Auswahlliste) ein
-vollständiger Baum gebaut, geprüft und wieder losgelassen.
+A DOM tree is exactly the kind of cycle at which a reference count fails.
+`tools/html/gc_tree.sh` runs `lib/browser/soak_tree.fi`: in a loop, a
+complete tree is built from a real piece of HTML (446 bytes, with a
+DOCTYPE, raw text, a table, nested formatting, attributes, a comment, a
+select list), checked and released again.
 
 ```
 t_ms    runden  knoten  rss_kib  lebende  laeufe  heap_bytes  pause_max_ns
@@ -219,12 +224,11 @@ t_ms    runden  knoten  rss_kib  lebende  laeufe  heap_bytes  pause_max_ns
 RSS erste Stichprobe: 2136 KiB, letzte: 2136 KiB, Zuwachs: 0 KiB
 ```
 
-**20 000 Runden, 2 560 000 angelegte GC-Objekte, RSS konstant 2136 KiB
-(Zuwachs 0 KiB), am Ende 624 lebende Objekte.** Der Heap steht bei 1,5 MB.
+**20 000 rounds, 2 560 000 GC objects created, RSS constant at 2136 KiB
+(growth 0 KiB), 624 live objects at the end.** The heap stands at 1,5 MB.
 
-Damit die Messung nicht bloß hübsch aussieht, läuft **jedes Mal die
-Gegenprobe** mit: derselbe Code, aber jeder Baum wird in einer GC-Kette
-festgehalten.
+So that the measurement does not merely look pretty, **the counter-check
+runs every time**: the same code, but every tree is retained in a GC chain.
 
 ```
 112     500     62      7000     44718    3       6553600     395734
@@ -232,136 +236,141 @@ festgehalten.
 RSS erste Stichprobe: 7000 KiB, letzte: 48756 KiB, Zuwachs: 41756 KiB
 ```
 
-**+41 756 KiB in 4000 Runden.** Bleibt die Gegenprobe flach, bricht `gc_tree.sh`
-ab — eine Messung, die ein Leck nicht anzeigen kann, wäre schlimmer als keine.
+**+41 756 KiB in 4000 rounds.** If the counter-check stays flat,
+`gc_tree.sh` aborts — a measurement that cannot indicate a leak would be
+worse than none.
 
-Zwei Dinge waren dafür nötig und stehen im Code:
+Two things were needed for that and are stated in the code:
 
-* `baum_loslassen` nullt am Rundenende alle `Gc[…]`-Felder des Zustands.
-  Ohne das hält der Zustand den letzten Baum fest.
-* `scrub_tief` legt einen tiefen, genullten Rahmen über die aufgegebenen
-  Stapelrahmen. Der Stapelscan ist konservativ; ein Altzeiger in einem toten
-  Rahmen hielte sonst einen ganzen Baum am Leben. Das ist der ehrliche Preis
-  des konservativen Scans, hier bezahlt statt verschwiegen (dieselbe Bauart
-  wie in `lib/dom/dom.fi` seit Runde 4).
+* `baum_loslassen` zeroes all `Gc[…]` fields of the state at the end of a
+  round. Without that the state holds on to the last tree.
+* `scrub_tief` lays a deep, zeroed frame over the abandoned
+  stack frames. The stack scan is conservative; an old pointer in a dead
+  frame would otherwise keep a whole tree alive. That is the honest price
+  of the conservative scan, paid here instead of concealed (the same
+  construction as in `lib/dom/dom.fi` since round 4).
 
-Ein **echtes Leck** hat der Dauerlauf dabei gefunden, und zwar keines im
-Sammler: `baum_init` rief `mem.cp_init` auf zwei Arbeitspuffer, und `cp_init`
-nullt den Zeiger, **ohne freizugeben**. Jedes weitere Dokument verlor die
-Puffer des vorigen — gemessen **8 KiB je Runde bei völlig flachem GC-Heap**.
-Seit der Trennung in `baum_puffer_init` (einmal) und `baum_init` (je Dokument)
-ist der Zuwachs 0. Der Fall steht hier, weil er zeigt, was der Sammler *nicht*
-tut: manueller Speicher bleibt manuell.
+The endurance run did find a **real leak** in the process, and not one in
+the collector: `baum_init` called `mem.cp_init` on two working buffers, and
+`cp_init` zeroes the pointer **without releasing**. Every further document
+lost the buffers of the previous one — measured at **8 KiB per round with a
+completely flat GC heap**. Since the separation into `baum_puffer_init`
+(once) and `baum_init` (per document) the growth is 0. The case is recorded
+here because it shows what the collector does *not* do: manual memory stays
+manual.
 
-Die Struktur derselben Aussage prüft `tests/901_dom_tree_gc.fi` ohne Werkzeuge:
-ein Baum aus 4680 Elementen, Rückverweise geprüft, überlebt einen Sammellauf
-solange er erreichbar ist, und ist danach fort.
+The structure of the same statement is checked by
+`tests/901_dom_tree_gc.fi` without tools: a tree of 4680 elements, back
+references checked, survives a collection as long as it is reachable, and
+is gone afterwards.
 
 ---
 
-## 5. Der Eingriff am Tokenizer — was, warum, und was er kostet
+## 5. The intervention on the tokenizer — what, why, and what it costs
 
-Der Tokenizer ist vollständig `#[no_gc]` (SPEC §3.5.4). Der Baumaufbau legt
-GC-Objekte an. **Der Tokenizer kann den Baumaufbau also nicht aufrufen** — die
-Zusage gilt transitiv, und der Compiler setzt sie durch. Zwischen beiden muss
-etwas stehen, das keine GC-Zeiger kennt.
+The tokenizer is completely `#[no_gc]` (SPEC §3.5.4). The tree construction
+creates GC objects. **The tokenizer therefore cannot call the tree
+construction** — the promise holds transitively, and the compiler enforces
+it. Between the two there has to be something that knows no GC pointers.
 
-Dazu kommt die Rückkopplung: bei `<title>`, `<style>`, `<script>`,
-`<textarea>` und `<plaintext>` schaltet der **Baumaufbau** den Tokenizer in
-einen anderen Startzustand (WHATWG *generic raw text element parsing
-algorithm*). Ohne das wäre `<title>a<b>c</title>` falsch.
+On top of that comes the feedback: with `<title>`, `<style>`, `<script>`,
+`<textarea>` and `<plaintext>`, the **tree construction** switches the
+tokenizer into a different start state (WHATWG *generic raw text element
+parsing algorithm*). Without that, `<title>a<b>c</title>` would be wrong.
 
-Umgesetzt wurde beides mit zwei **additiven** Ergänzungen in `lib/html/`:
+Both were implemented with two **additive** additions in `lib/html/`:
 
-1. **Binäres Tokenprotokoll** (`tokens.fi`, `tb_*`): im Betrieb
-   `sink_set_baum_modus(true)` schreibt der Sink statt html5lib-JSON kompakte
-   Datensätze. Der JSON-Weg und der Messbetrieb sehen davon nur einen Zweig,
-   der bei ihnen nie genommen wird.
-2. **Quellposition je Token**: `tok_emit(s)` wurde an allen 52 Stellen in
-   `tokenizer.fi` zu `tok_emit_bei(s, pos)`. Damit trägt jeder Datensatz die
-   Position unmittelbar hinter dem Token — die braucht der Treiber zum
-   Umschalten. **In der heißen Schleife steht dadurch kein einziges
-   zusätzliches Wort**; der Wert wird nur beim Ausgeben eines Tokens in einem
-   Register übergeben.
+1. **A binary token protocol** (`tokens.fi`, `tb_*`): in operation with
+   `sink_set_baum_modus(true)` the sink writes compact records instead of
+   html5lib JSON. The JSON path and the measuring mode see only a branch of
+   that which is never taken by them.
+2. **A source position per token**: `tok_emit(s)` became
+   `tok_emit_bei(s, pos)` at all 52 places in `tokenizer.fi`. With that
+   every record carries the position immediately behind the token — which
+   the driver needs for switching. **Because of that, not a single
+   additional word stands in the hot loop**; the value is only passed in a
+   register when a token is emitted.
 
-`lib/browser/driver.fi` tokenisiert danach den **Rest** der Eingabe ab der
-gemerkten Position erneut, mit dem neuen Startzustand. Der Preis ist ehrlich:
-**O(k·n) statt O(n)**, wobei *k* die Zahl der Umschaltungen ist. Auf den acht
-echten Seiten ist das tragbar; der saubere Weg wäre ein **fortsetzbarer
-Tokenizer**, und der gehört in eine eigene Runde, weil er die 6810/6810
-anfasst.
+`lib/browser/driver.fi` afterwards tokenizes the **rest** of the input from
+the remembered position again, with the new start state. The price is
+honest: **O(k·n) instead of O(n)**, where *k* is the number of switches. On
+the eight real pages that is bearable; the clean way would be a
+**resumable tokenizer**, and that belongs in a round of its own, because it
+touches the 6810/6810.
 
-**Nachgemessen, dass nichts kaputtging und nichts langsamer wurde:**
+**Measured afterwards that nothing broke and nothing got slower:**
 
-| | vorher (`cc1710f`) | nachher |
+| | before (`cc1710f`) | after |
 |---|---|---|
-| html5lib-Tokenizer-Suite | 6810 / 6810 | **6810 / 6810** |
-| dieselbe mit Fehlercodes | 6809 / 6810 | **6809 / 6810** |
-| Durchsatz Korpus „html5lib" | 11,43 MB/s | 11,37 MB/s (**−0,6 %**) |
-| Durchsatz Korpus „realweb" | 28,32 MB/s | 28,82 MB/s (**+1,8 %**) |
+| html5lib tokenizer suite | 6810 / 6810 | **6810 / 6810** |
+| the same with error codes | 6809 / 6810 | **6809 / 6810** |
+| throughput corpus „html5lib" | 11,43 MB/s | 11,37 MB/s (**−0,6 %**) |
+| throughput corpus „realweb" | 28,32 MB/s | 28,82 MB/s (**+1,8 %**) |
 
-Beide Durchsatzwerte sind der beste aus sieben Läufen, direkt gegeneinander
-auf derselben Maschine gemessen (Binary „vorher" aus `git show HEAD:` gebaut).
-Die Vorzeichen sind gegenläufig — das ist Rauschen, nicht Wirkung. Die
-absoluten MB/s liegen niedriger als in `docs/RUNDE40.md`, weil auf dieser
-Maschine gleichzeitig vier andere Runden liefen; für ein A/B ist das ohne
-Belang, für einen Vergleich mit html5ever wäre es einer.
+Both throughput values are the best of seven runs, measured directly
+against each other on the same machine (the „before" binary built from
+`git show HEAD:`). The signs run in opposite directions — that is noise,
+not an effect. The absolute MB/s are lower than in `docs/RUNDE40.md`,
+because four other rounds were running on this machine at the same time;
+for an A/B that is irrelevant, for a comparison with html5ever it would
+matter.
 
 ---
 
-## 6. Gebrauchte Sprachfeatures — was Firn noch nicht kann
+## 6. Language features needed — what Firn cannot do yet
 
-Alles hier ist beim Bauen dieser Runde wirklich aufgetreten. Nichts davon
-wurde am Compiler geändert (fremdes Revier); die Umwege stehen im Code.
+Everything here really came up while building this round. None of it was
+changed in the compiler (foreign territory); the workarounds are in the
+code.
 
-### 6.1 `Gc[modul.Typ]` lässt sich nicht schreiben
+### 6.1 `Gc[modul.Typ]` cannot be written
 
 ```firn
 fn nimm(e: Gc[knoten.Element]) -> u32 { … }
 //              ^ error: erwartet ']' nach dem typargument, gefunden '.'
 ```
 
-Die Position eines Typarguments nimmt keinen qualifizierten Namen. Dass es
-trotzdem geht, liegt an einer zweiten Eigenheit: **`gc class`-Namen liegen in
-einem globalen Namensraum**, nicht im Modulnamensraum. `Gc[Element]` ist
-deshalb aus jedem Modul erreichbar — auch aus einem, das `knoten` gar nicht
-importiert. Beides zusammen ist tragbar, aber keins von beidem ist Absicht:
-sobald zwei Bibliotheken eine `gc class Element` haben, kollidieren sie
-still.
+The position of a type argument does not take a qualified name. That it
+works nonetheless is due to a second peculiarity: **`gc class` names live in
+a global namespace**, not in the module namespace. `Gc[Element]` is
+therefore reachable from every module — even from one that does not import
+`knoten` at all. Both together are bearable, but neither of them is
+intentional: as soon as two libraries have a `gc class Element`, they
+collide silently.
 
-*Gebraucht:* qualifizierte Namen in Typargumenten, und `gc class` im
-Modulnamensraum.
+*Needed:* qualified names in type arguments, and `gc class` in the
+module namespace.
 
-### 6.2 Keine wachsenden Sammlungen über `Gc[T]`
+### 6.2 No growing collections over `Gc[T]`
 
-`SPEC §3.5.2` zeigt `GcVec[Gc[Node]]` und `GcMap[Atom, Str]` — die gibt es
-nicht. `Vec[T]`/`Map[K,V]` (`lib/rt/`) liegen auf der manuellen Halde, und die
-sieht der Sammler nicht; ein `Gc[T]` darin wäre unsichtbar und sein Ziel würde
-eingesammelt. (Seit Runde 47 ließe sich das mit `gc_wurzel_anmelden` von Hand
-reparieren, dann aber bei jedem Umkopieren neu.)
+`SPEC §3.5.2` shows `GcVec[Gc[Node]]` and `GcMap[Atom, Str]` — those do not
+exist. `Vec[T]`/`Map[K,V]` (`lib/rt/`) lie on the manual heap, and the
+collector does not see it; a `Gc[T]` in there would be invisible and its
+target would be collected. (Since round 47 that could be repaired by hand
+with `gc_wurzel_anmelden`, but then anew on every copy.)
 
-Folge in dieser Runde: der Stapel offener Elemente und die Liste der aktiven
-Formatierungselemente sind **Felder fester Größe im Zustand** (512/128), weil
-sie so auf dem Stapel liegen und konservativ gefunden werden. Das ist die
-größte einzelne Lücke, die diese Runde gespürt hat.
+Consequence in this round: the stack of open elements and the list of
+active formatting elements are **arrays of fixed size in the state**
+(512/128), because that way they lie on the stack and are found
+conservatively. That is the biggest single gap this round felt.
 
-*Gebraucht:* `GcVec[T]` — ein wachsendes Feld, dessen Inhalt der Sammler
-präzise verfolgt.
+*Needed:* `GcVec[T]` — a growing array whose content the collector traces
+precisely.
 
-### 6.3 Konstanten anderer Module in einem `const`
+### 6.3 Constants of other modules in a `const`
 
 ```firn
 const A_DIV: u32 = namen_tab.M_DIV
 //                 ^ error: unbekannter name 'namen_tab__M_DIV'
 ```
 
-Ein `const` kann nicht aus einem anderen Modul initialisiert werden. Folge:
-`tree.fi` schreibt an rund 600 Stellen `tag.M_DIV` statt eines kurzen Alias.
-(Deshalb heißt das Modul `tag` und nicht `namen_tab`.)
+A `const` cannot be initialized from another module. Consequence:
+`tree.fi` writes `tag.M_DIV` at around 600 places instead of a short alias.
+(That is why the module is called `tag` and not `namen_tab`.)
 
-*Gebraucht:* qualifizierte Namen in konstanten Ausdrücken.
+*Needed:* qualified names in constant expressions.
 
-### 6.4 Zeichenkettenliterale brauchen ihre Länge ausgeschrieben
+### 6.4 String literals need their length written out
 
 ```firn
 var t: [u8; 446] = "<!DOCTYPE html>…"   // 446 muss stimmen, sonst Fehler
@@ -369,77 +378,79 @@ let a = "abc"                            // error: typ nicht ableitbar
 var a: [u8; _] = "abc"                   // error: erwartet ganzzahlige laenge
 ```
 
-Jedes Literal ist ein Array-Literal mit fester Länge, und die zählt der Mensch.
-In dieser Runde wurden die Längen deshalb von `tools/html/gen_names.py` und vom
-Erzeuger für `tests/902_tree_construction.fi` ausgerechnet — was für erzeugte
-Dateien in Ordnung ist, für handgeschriebenen Code aber eine Fehlerquelle
-bleibt (dreimal darauf hereingefallen).
+Every literal is an array literal with a fixed length, and a human counts
+it. In this round the lengths were therefore computed by
+`tools/html/gen_names.py` and by the generator for
+`tests/902_tree_construction.fi` — which is fine for generated
+files, but remains a source of errors for hand-written code (fallen for it
+three times).
 
-*Gebraucht:* `[u8; _]` bzw. Längenableitung für Literale.
+*Needed:* `[u8; _]` resp. length inference for literals.
 
-### 6.5 Kein Zeilenumbruch vor einem Operator
+### 6.5 No line break before an operator
 
 ```firn
 cp = ((c0 & 0x07) << 18)
     | ((b1 & 0x3F) << 12)      // error: erwartet einen ausdruck, gefunden '|'
 ```
 
-Das Semikolon ist optional, also endet die Anweisung am Zeilenende. Ein
-Ausdruck über mehrere Zeilen muss den Operator ans **Zeilenende** setzen. Das
-ist eine Stilfrage, aber es kostet beim Portieren fremder Formeln Zeit.
+The semicolon is optional, so the statement ends at the end of the line. An
+expression over several lines has to put the operator at the **end of the
+line**. That is a matter of style, but it costs time when porting foreign
+formulas.
 
-### 6.6 Keine Tupel / kein Mehrfachrückgabewert
+### 6.6 No tuples / no multiple return values
 
-*„Appropriate place for inserting a node"* liefert im Standard zwei Werte
-(Elternknoten und Referenzknoten). In Firn geht das nur über zwei
-Ausgabezeiger:
+*„Appropriate place for inserting a node"* returns two values in the
+standard (the parent node and the reference node). In Firn that only works
+over two output pointers:
 
 ```firn
 fn passende_stelle(b: *mut Baum, ueberschreibung: Gc[Knoten],
                    eltern_aus: *mut Gc[Knoten], ref_aus: *mut Gc[Knoten])
 ```
 
-### 6.7 Keine Zerstörer — und das ist kein theoretisches Problem
+### 6.7 No destructors — and that is not a theoretical problem
 
-`mem.cp_init` nullt, `mem.cp_free` gibt frei; wer sie verwechselt, leckt. Genau
-das ist passiert (§4) und hat 8 KiB je Dokument gekostet, unbemerkt bei völlig
-flachem GC-Heap. Ein Zerstörer oder ein `defer` an der richtigen Stelle hätte
-es verhindert; `defer` gibt es (Runde 9), nur nutzt es nichts bei einem
-Zustand, der zwischen Dokumenten *lebt*.
+`mem.cp_init` zeroes, `mem.cp_free` releases; whoever confuses them leaks.
+Exactly that happened (§4) and cost 8 KiB per document, unnoticed with a
+completely flat GC heap. A destructor or a `defer` at the right place would
+have prevented it; `defer` exists (round 9), it is just of no use with a
+state that *lives* between documents.
 
-### 6.8 `lib/firnc1` erkennt GC-Gebrauch ohne eigene `gc class` nicht
+### 6.8 `lib/firnc1` does not detect GC use without an own `gc class`
 
-Gefunden, weil diese Runde den Fall zum ersten Mal erzeugt hat: eine Datei, die
-GC-Typen BENUTZT, aber selbst keine `gc class` deklariert (sie kommen aus einem
-Modul). `lib/firnc1/gc.fi::gc_quelle_scan` sucht am Tokenstrom nach `gc class`,
-`error AllocError` und `fn __gc_finalisiere` — keins davon steht dann in der
-Datei. Folge: `bin/astdump.fi` meldet für `gc_null[Kette]()` einen
-**Syntaxfehler (rc=1)** statt „nicht Kernsprache" (rc=3), und
-`tools/parser_compare.sh` zählt eine unerwartete Abweichung.
+Found because this round produced the case for the first time: a file that
+USES GC types but declares no `gc class` itself (they come from a module).
+`lib/firnc1/gc.fi::gc_quelle_scan` searches the token stream for `gc class`,
+`error AllocError` and `fn __gc_finalisiere` — none of which is then in the
+file. Consequence: `bin/astdump.fi` reports a **syntax error (rc=1)** for
+`gc_null[Kette]()` instead of „not core language" (rc=3), and
+`tools/parser_compare.sh` counts an unexpected deviation.
 
-Nicht repariert — `lib/firnc1` ist in dieser Runde fremdes Revier. Im Test
-umgangen: `tests/900_dom_core.fi` hat eine Funktion mit einem `Gc[…]` in der
-**Signatur**, und daran erkennt der Parser den Fall bereits. Für die
-Compiler-Runden: `gc_quelle_scan` sollte auch `Gc[`/`GcWeak[`/`gc_null[` im
-Tokenstrom sehen.
+Not repaired — `lib/firnc1` is foreign territory in this round. Worked
+around in the test: `tests/900_dom_core.fi` has a function with a `Gc[…]`
+in its **signature**, and by that the parser already recognizes the case.
+For the compiler rounds: `gc_quelle_scan` should also see
+`Gc[`/`GcWeak[`/`gc_null[` in the token stream.
 
-### 6.9 Kein fortsetzbarer Aufruf (Koroutine/Generator)
+### 6.9 No resumable call (coroutine/generator)
 
-Die eigentliche Ursache für den Umweg in §5: `tokenize()` ist eine Schleife,
-die einmal durchläuft. Ein `yield` je Token — oder ganz allgemein eine
-Funktion, die anhält und weiterläuft — würde den Tokenizer zur Quelle machen,
-aus der der Baumaufbau zieht, und die Rückkopplung wäre ein Feldzugriff statt
-einer erneuten Tokenisierung.
+The actual cause of the detour in §5: `tokenize()` is a loop
+that runs through once. A `yield` per token — or quite generally a
+function that halts and continues — would make the tokenizer the source
+from which the tree construction pulls, and the feedback would be a field
+access instead of another tokenization pass.
 
 ---
 
-## 7. Zahlen
+## 7. Numbers
 
-### 7.1 Baumkonstruktion
+### 7.1 Tree construction
 
-`tools/html/cases/*.dat` — **150 Fälle, alle bestanden**:
+`tools/html/cases/*.dat` — **150 cases, all passed**:
 
-| Datei | bestanden | gesamt |
+| File | passed | total |
 |---|---|---|
 | `01_grundgeruest.dat` | 27 | 27 |
 | `02_in_body.dat` | 31 | 31 |
@@ -447,123 +458,126 @@ einer erneuten Tokenisierung.
 | `04_tabellen.dat` | 25 | 25 |
 | `05_rohtext.dat` | 24 | 24 |
 | `06_auswahl_rahmen.dat` | 23 | 23 |
-| **gesamt** | **150** | **150** |
+| **total** | **150** | **150** |
 
-Dieselbe Quote in allen drei Baustufen (`opt`, `--no-opt`, `dev-fast`).
+The same rate in all three build stages (`opt`, `--no-opt`, `dev-fast`).
 
-### 7.2 Woher die Testdaten kommen — und wie ehrlich sie sind
+### 7.2 Where the test data come from — and how honest they are
 
-**Die `tree-construction`-Daten von html5lib liegen diesem Projekt nicht vor.**
-`testdata/html5lib-tokenizer/` enthält nur den Tokenizer-Teil; im Repository
-gibt es keine `.dat`-Datei, und der festgeschriebene Upstream-Commit
-`224991ec…` hat auch keinen Ordner `tree-construction` (nachgesehen über die
-GitHub-API: `encoding/`, `serializer/`, `tokenizer/`, `lint_lib/` — mehr nicht,
-auf keinem Branch).
+**The `tree-construction` data of html5lib are not available to this
+project.** `testdata/html5lib-tokenizer/` contains only the tokenizer part;
+there is no `.dat` file in the repository, and the pinned upstream commit
+`224991ec…` has no `tree-construction` directory either (looked up via the
+GitHub API: `encoding/`, `serializer/`, `tokenizer/`, `lint_lib/` — nothing
+more, on any branch).
 
-Also wurden **150 eigene Fälle von Hand aus dem WHATWG-Standard geschrieben** —
-Eingabe *und* erwarteter Baum, je Fall aus der Regel abgeleitet, die er prüfen
-soll. Das Format ist trotzdem **genau das `.dat`-Format von html5lib**: liegen
-die Originaldaten eines Tages vor, läuft `tools/html/harness_tree.py` ohne
-Änderung dagegen.
+So **150 own cases were written by hand from the WHATWG standard** —
+input *and* expected tree, each case derived from the rule it is supposed
+to check. The format is nevertheless **exactly the `.dat` format of
+html5lib**: if the original data become available one day,
+`tools/html/harness_tree.py` runs against them without a change.
 
-Von Hand heißt auch: fehleranfällig. Deshalb gibt es `tools/html/orakel.py` —
-es fährt **jede Erwartung gegen html5lib 1.1** (aus PyPI, in einer eigenen venv,
-kein Teil des Projekts) und meldet jede Abweichung. Ergebnis:
+By hand also means: error-prone. That is why there is
+`tools/html/orakel.py` — it runs **every expectation against html5lib 1.1**
+(from PyPI, in a venv of its own, not part of the project) and reports every
+deviation. Result:
 
-* **149 von 150 Erwartungen stimmen mit html5lib überein.**
-* Der eine Rest ist `<ruby><rb>a<rt>b</ruby>`: der aktuelle Standard nimmt `rb`
-  in die *implied end tags* auf, html5lib 1.1 folgt der älteren Fassung. Hier
-  ist der Standard maßgeblich; der Fall trägt `#orakel-abweichung`.
-* Beim ersten Durchgang hat das Orakel **acht eigene Denkfehler** in den
-  Erwartungen gefunden (u. a. `</p>` in „after head", Leerraum in „before
-  head", `<body></body><frameset>`). Die Fälle stehen jetzt richtig da.
+* **149 of 150 expectations agree with html5lib.**
+* The one remainder is `<ruby><rb>a<rt>b</ruby>`: the current standard
+  takes `rb` into the *implied end tags*, html5lib 1.1 follows the older
+  version. Here the standard is authoritative; the case carries
+  `#orakel-abweichung`.
+* On the first pass the oracle found **eight thinking errors of our own**
+  in the expectations (among them `</p>` in „after head", whitespace in
+  „before head", `<body></body><frameset>`). Those cases are now correct.
 
-Das Orakel ist eine **Prüfung** der Erwartungen, keine Erzeugung: es steht in
-keiner Testkette und wird nur von Hand gefahren (`tools/html/run.sh` braucht es
-nicht und kommt ohne Netz aus).
+The oracle is a **check** of the expectations, not a generator: it is in no
+test chain and is only run by hand (`tools/html/run.sh` does not need it
+and works without a network).
 
-### 7.3 Echte Seiten
+### 7.3 Real pages
 
-`tools/html/realweb.py` fährt die acht unveränderten Seiten aus
-`testdata/realweb/` (Hacker News, rustdoc, W3C, WHATWG, vier Wikipedia-Seiten;
-0,03 bis 1,0 MB). Kein `#KAPUTT`, kein Abbruch, und alle drei Baustufen liefern
-denselben Baum Byte für Byte.
+`tools/html/realweb.py` runs the eight unmodified pages from
+`testdata/realweb/` (Hacker News, rustdoc, W3C, WHATWG, four Wikipedia
+pages; 0,03 to 1,0 MB). No `#KAPUTT`, no abort, and all three build stages
+deliver the same tree byte for byte.
 
-Zusätzlich von Hand gegen html5lib geprüft: **alle acht Bäume sind Zeile für
-Zeile identisch** mit dem, was html5lib 1.1 baut — bis zu 61 325 Ausgabezeilen
-je Seite. Ehrlich dazugesagt: keine dieser Seiten enthält `<svg>`, `<math>`
-oder `<template>`, die drei großen Lücken werden davon also nicht berührt.
+Additionally checked by hand against html5lib: **all eight trees are
+identical line by line** with what html5lib 1.1 builds — up to 61 325
+output lines per page. Honestly added: none of these pages contains
+`<svg>`, `<math>` or `<template>`, so the three big gaps are not touched by
+this.
 
-### 7.4 Bekannte Lücken
+### 7.4 Known gaps
 
-`tools/html/luecken/bekannte_luecken.dat` hält fest, was **nicht** geht, mit
-den **richtigen** erwarteten Bäumen. `harness_baum.py --luecken` fährt sie
-getrennt aus: **0 von 10 bestanden** — wie erwartet. Eine Testsuite, die nur
-enthält, was schon geht, sagt nichts über das, was fehlt.
+`tools/html/luecken/bekannte_luecken.dat` records what does **not** work,
+with the **correct** expected trees. `harness_baum.py --luecken` runs them
+separately: **0 of 10 passed** — as expected. A test suite that contains
+only what already works says nothing about what is missing.
 
-### 7.5 Abnahme
+### 7.5 Acceptance
 
-Alles mit frisch gebauten Binaries (`rm -f .firnc1 .firnc2 .firnc3 .astdump …`
-vor dem Lauf):
+All with freshly built binaries (`rm -f .firnc1 .firnc2 .firnc3 .astdump …`
+before the run):
 
-| Prüfung | Ergebnis |
+| Check | Result |
 |---|---|
-| `bash ./test.sh` | **PASS 761/761** (Basis 751/751; +9 durch drei neue Programme × drei Baustufen, +1 durch Abschnitt 9b) |
-| `bash tools/self_compare.sh` | **GLEICHES VERHALTEN 216, ABWEICHEND 0, FEHLERHAFT 0** (Basis 213/0/0) |
-| `bash tools/html/run.sh` | 150/150 in drei Baustufen, 8/8 Seiten byte-gleich, Dauerlauf bestanden |
-| `bash tools/tokenizer/run.sh` | 6810/6810 bzw. 6809/6810 mit Fehlercodes — unverändert |
-| `tools/fixpoint.sh` (in `test.sh`) | Stufe 2 == Stufe 3, zeichengleich |
+| `bash ./test.sh` | **PASS 761/761** (base 751/751; +9 from three new programs × three build stages, +1 from section 9b) |
+| `bash tools/self_compare.sh` | **GLEICHES VERHALTEN 216, ABWEICHEND 0, FEHLERHAFT 0** (base 213/0/0) |
+| `bash tools/html/run.sh` | 150/150 in three build stages, 8/8 pages byte-identical, endurance run passed |
+| `bash tools/tokenizer/run.sh` | 6810/6810 resp. 6809/6810 with error codes — unchanged |
+| `tools/fixpoint.sh` (in `test.sh`) | stage 2 == stage 3, character-identical |
 
-`tools/html/orakel.py` getrennt gefahren: `faelle/` 150 geprüft, 0 unerwartete
-Abweichungen (1 vermerkte); `luecken/` 10 geprüft, 0 unerwartete Abweichungen
-(4 vermerkte — html5lib 1.1 legt Template-Inhalte nicht in einem eigenen
-Inhaltsbaum ab und kann die Erwartung dort nicht bestätigen; sie ist von Hand
-aus dem Standard geschrieben).
+`tools/html/orakel.py` run separately: `faelle/` 150 checked, 0 unexpected
+deviations (1 noted); `luecken/` 10 checked, 0 unexpected deviations
+(4 noted — html5lib 1.1 does not put template contents into a content tree
+of their own and cannot confirm the expectation there; it is written by
+hand from the standard).
 
-Der Compiler in Firn (`.firnc1`) übersetzt die drei neuen Tests
-`900_dom_kern`, `901_dom_baum_gc` und `902_baum_konstruktion` selbst, und die
-Ergebnisse verhalten sich wie die von `firnc0` — der Baumaufbau ist damit auch
-für Stufe 1 Kernsprache.
+The compiler in Firn (`.firnc1`) compiles the three new tests
+`900_dom_kern`, `901_dom_baum_gc` and `902_baum_konstruktion` itself, and
+the results behave like those of `firnc0` — the tree construction is
+therefore core language for stage 1 as well.
 
 ---
 
-## 8. Offen
+## 8. Open
 
-**Nicht umgesetzt, mit Absicht und hier benannt statt versteckt:**
+**Not implemented, on purpose and named here instead of hidden:**
 
-1. **„in template" und der `<template>`-Inhalt.** Der 23. Einfügemodus braucht
-   einen zweiten Baum je Template plus einen eigenen Stapel von Einfügemodi.
-   `<template>` wird derzeit wie ein gewöhnliches Element behandelt.
-   (`bekannte_luecken.dat` Fälle 6–9.)
-2. **Fremdinhalt (SVG/MathML) als Regelsatz.** Namensräume gibt es — `<svg>`
-   und `<math>` erzeugen Elemente im richtigen Namensraum, und der Namensraum
-   steht am Knoten und am Attribut. Die Sonderregeln für den *Inhalt* fehlen:
-   Namenskorrektur (`clipPath`, `foreignObject`), Attributanpassung
-   (`xlink:href`), Integrationspunkte, Ausbruchtags.
-   (`bekannte_luecken.dat` Fälle 1–5.)
-3. **Fragmentzerlegung** (`innerHTML`) mit Kontextelement.
-   (`bekannte_luecken.dat` Fall 10.)
-4. **Quirks-Erkennung** kennt nur die „force quirks"-Flagge, einen Namen
-   != `html` und vier öffentliche Kennungen; die vollständige Liste des
-   Standards (rund 55 Präfixe aus der Zeit vor HTML5) fehlt. Sichtbar wird das
-   nur bei `<table>` in „in body" (dort hängt das Schließen von `<p>` am
-   Modus).
-5. **Parse-Fehler** werden gezählt, aber nicht gegen eine Erwartung geprüft,
-   und die Zählung ist unvollständig (die Quittierung des
-   `self-closing`-Zeichens fehlt). Der Tokenizer prüft seine Fehlercodes
-   dagegen exakt (6809/6810).
-6. **Skriptausführung** und alles daran (`document.write`, die *scripting
-   flag*) — die Flagge ist aus.
-7. **Der fortsetzbare Tokenizer** (§5). Solange er fehlt, ist der Zerleger
-   O(k·n) statt O(n).
+1. **„in template" and the `<template>` content.** The 23rd insertion mode
+   needs a second tree per template plus a stack of insertion modes of its
+   own. `<template>` is currently treated like an ordinary element.
+   (`bekannte_luecken.dat` cases 6–9.)
+2. **Foreign content (SVG/MathML) as a rule set.** Namespaces exist —
+   `<svg>` and `<math>` create elements in the right namespace, and the
+   namespace is on the node and on the attribute. The special rules for the
+   *content* are missing: name correction (`clipPath`, `foreignObject`),
+   attribute adjustment (`xlink:href`), integration points, breakout tags.
+   (`bekannte_luecken.dat` cases 1–5.)
+3. **Fragment parsing** (`innerHTML`) with a context element.
+   (`bekannte_luecken.dat` case 10.)
+4. **Quirks detection** knows only the „force quirks" flag, a name
+   != `html` and four public identifiers; the complete list of the
+   standard (around 55 prefixes from the time before HTML5) is missing.
+   That only becomes visible with `<table>` in „in body" (there the closing
+   of `<p>` depends on the mode).
+5. **Parse errors** are counted but not checked against an expectation,
+   and the counting is incomplete (the acknowledgement of the
+   `self-closing` flag is missing). The tokenizer, by contrast, checks its
+   error codes exactly (6809/6810).
+6. **Script execution** and everything attached to it (`document.write`,
+   the *scripting flag*) — the flag is off.
+7. **The resumable tokenizer** (§5). As long as it is missing, the parser
+   is O(k·n) instead of O(n).
 
-**Nicht angefasst, mit Absicht:** `compiler/src`, `lib/firnc1` und `lib/gc`
-(fremdes Revier — parallel liefen vier Compiler-Runden). Auch `SELBSTHOSTING.md`
-bleibt unverändert; der Absatz zu dieser Runde gehört in den Merge, nicht in
-den Branch.
+**Not touched, on purpose:** `compiler/src`, `lib/firnc1` and `lib/gc`
+(foreign territory — four compiler rounds ran in parallel). `SELBSTHOSTING.md`
+also stays unchanged; the paragraph about this round belongs in the merge,
+not in the branch.
 
-**Was als Nächstes sinnvoll ist:** `GcVec[T]` (§6.2) räumt gleichzeitig den
-Stapel, die Formatierungsliste und den Weg zu `<template>` frei; danach der
-fortsetzbare Tokenizer, weil er den einzigen strukturellen Kostenpunkt dieser
-Runde beseitigt. Fremdinhalt ist viel Tabellenarbeit und wenig Struktur — das
-kann warten, bis eine Seite es braucht.
+**What makes sense next:** `GcVec[T]` (§6.2) clears the way for the
+stack, the formatting list and `<template>` all at once; after that the
+resumable tokenizer, because it removes the only structural cost item of
+this round. Foreign content is a lot of table work and little structure —
+that can wait until a page needs it.
