@@ -65,7 +65,7 @@ pub fn flag_set(name: &str) -> Result<(), String> {
         "app" => Profile::App,
         other => {
             return Err(format!(
-                "unbekanntes profil '{}' (erlaubt: kernel, app)",
+                "unknown profile '{}' (allowed: kernel, app)",
                 other
             ))
         }
@@ -129,11 +129,11 @@ pub fn hook_import(dg: &mut Diags, path: &[String], span: Span) {
     dg.error_note(
         span,
         format!(
-            "das modul '{}' gehoert zur standardbibliothek und ist im profil 'kernel' nicht verfuegbar",
+            "the module '{}' belongs to the standard library and is not available in profile 'kernel'",
             path.join(".")
         ),
-        "SPEC §2: das kernel-profil hat keinen globalen allokator und keine laufzeit; \
-         die standardbibliothek setzt beides voraus (mmap, write)",
+        "SPEC §2: the kernel profile has no global allocator and no runtime; \
+         the standard library presupposes both (mmap, write)",
     );
 }
 
@@ -146,8 +146,8 @@ pub fn hook_check(dg: &mut Diags, prog: &Program) {
         if n != "kernel" && n != "app" {
             dg.error_note(
                 *span,
-                format!("unbekanntes profil '{}'", n),
-                "erlaubt sind 'kernel' und 'app'",
+                format!("unknown profile '{}'", n),
+                "allowed are 'kernel' and 'app'",
             );
         }
     }
@@ -164,10 +164,10 @@ pub fn hook_check(dg: &mut Diags, prog: &Program) {
             .unwrap_or_else(|| prog.funcs.first().map(|f| f.span).unwrap_or(Span::in_file(0, 1, 1, 1)));
         dg.error_note(
             span,
-            "'gc class' braucht den tracing-sammler; im profil 'kernel' gibt es keine GC-typen"
+            "'gc class' needs the tracing collector; there are no GC types in profile 'kernel'"
                 .to_string(),
-            "SPEC §2: Gc[T] ist im kernel-profil nicht verfuegbar — der sammler braucht \
-             einen globalen heap, den ein freistehender kernel nicht hat",
+            "SPEC §2: Gc[T] is not available in the kernel profile — the collector needs \
+             a global heap, which a freestanding kernel does not have",
         );
     }
     // 2. Funktionen: Abwicklung, Gleitkomma, Systemaufrufe
@@ -176,11 +176,11 @@ pub fn hook_check(dg: &mut Diags, prog: &Program) {
             dg.error_note(
                 f.span,
                 format!(
-                    "'{}' ist mit #[unwinds] gekennzeichnet; abwicklung ist im profil 'kernel' verboten",
+                    "'{}' is marked with #[unwinds]; unwinding is forbidden in profile 'kernel'",
                     f.name
                 ),
-                "SPEC §2: fehler laufen im kernel-profil ueber ergebnistypen (§5.1), \
-                 nicht ueber abwicklung",
+                "SPEC §2: in the kernel profile errors run over result types (§5.1), \
+                 not over unwinding",
             );
         }
         let fp_allowed = f.attrs.iter().any(|a| a.name == "allow_fp");
@@ -238,11 +238,11 @@ impl Guard<'_> {
         self.dg.error_note(
             span,
             format!(
-                "gleitkomma ({}) ist im profil 'kernel' nur mit #[allow_fp] erlaubt — '{}' hat das attribut nicht",
+                "floating point ({}) is allowed in profile 'kernel' only with #[allow_fp] — '{}' does not have the attribute",
                 what, self.func
             ),
-            "SPEC §2: die FPU/SSE-register gehoeren im kernel dem unterbrochenen faden; \
-             wer sie anfasst, muss ihren zustand selbst retten",
+            "SPEC §2: in the kernel the FPU/SSE registers belong to the interrupted thread; \
+             whoever touches them must save their state himself",
         );
     }
 
@@ -250,7 +250,7 @@ impl Guard<'_> {
         match t {
             TypeExpr::Named(n, s) => {
                 if n == "f64" {
-                    self.fp(*s, "der typ f64");
+                    self.fp(*s, "the type f64");
                 }
             }
             TypeExpr::Ptr { inner, .. } => self.ty(inner),
@@ -306,13 +306,13 @@ impl Guard<'_> {
 
     fn expr(&mut self, e: &Expr) {
         match &e.kind {
-            ExprKind::Float(_) => self.fp(e.span, "ein gleitkommaliteral"),
+            ExprKind::Float(_) => self.fp(e.span, "a floating point literal"),
             ExprKind::Syscall(args) => {
                 self.dg.error_note(
                     e.span,
-                    "'syscall' gibt es im profil 'kernel' nicht".to_string(),
-                    "unter einem freistehenden kernel liegt kein betriebssystem, \
-                     das einen systemaufruf entgegennehmen koennte",
+                    "'syscall' does not exist in profile 'kernel'".to_string(),
+                    "under a freestanding kernel there is no operating system \
+                     that could accept a system call",
                 );
                 for a in args {
                     self.expr(a);
@@ -358,7 +358,7 @@ mod tests {
     fn error_of(src: &str) -> String {
         reset();
         crate::core::reset();
-        let mut dg = crate::diag::Diags::new("profil_test", src);
+        let mut dg = crate::diag::Diags::new("profile_test", src);
         let toks = crate::lexer::lex(src, &mut dg);
         let mut prog = crate::parser::parse(&toks, &mut dg);
         crate::mono::expand(&mut prog, &mut dg);
@@ -369,26 +369,26 @@ mod tests {
     #[test]
     fn kernel_forbids_syscall_and_names_es() {
         let t = error_of("profile kernel\nfn main() -> i32 { syscall(60, 0)\n return 0 }\n");
-        assert!(t.contains("'syscall' gibt es im profil 'kernel' nicht"), "{}", t);
+        assert!(t.contains("'syscall' does not exist in profile 'kernel'"), "{}", t);
     }
 
     #[test]
     fn kernel_forbids_float_without_attr() {
         let t = error_of("profile kernel\nfn f(x: f64) -> f64 { return x }\n");
-        assert!(t.contains("gleitkomma"), "{}", t);
+        assert!(t.contains("floating point"), "{}", t);
         assert!(t.contains("#[allow_fp]"), "{}", t);
     }
 
     #[test]
     fn allow_fp_makes_float_again_possible() {
         let t = error_of("profile kernel\n#[allow_fp]\nfn f(x: f64) -> f64 { return x }\n");
-        assert!(!t.contains("gleitkomma"), "{}", t);
+        assert!(!t.contains("floating point"), "{}", t);
     }
 
     #[test]
     fn app_stays_untouched() {
         let t = error_of("profile app\nfn f(x: f64) -> f64 { return x }\nfn main() -> i32 { return 0 }\n");
-        assert!(!t.contains("gleitkomma"), "{}", t);
+        assert!(!t.contains("floating point"), "{}", t);
     }
 
     #[test]
@@ -402,6 +402,6 @@ mod tests {
     #[test]
     fn app_forbids_interrupt() {
         let t = error_of("profile app\n#[interrupt]\nfn ih() { asm(\"nop\") }\nfn main() -> i32 { return 0 }\n");
-        assert!(t.contains("nur im profil 'kernel'"), "{}", t);
+        assert!(t.contains("only in profile 'kernel'"), "{}", t);
     }
 }

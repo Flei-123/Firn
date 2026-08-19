@@ -243,7 +243,7 @@ impl<'a> Parser<'a> {
     /// Aufzaehlungsdeklaration: `enum Name { A, B(i32), C(Point, bool) }`
     fn types_enum_decl(&mut self) {
         let start = self.bump(); // 'enum'
-        let (name, nspan) = match self.ident("nach 'enum'") {
+        let (name, nspan) = match self.ident("after 'enum'") {
             Some(x) => x,
             None => {
                 self.recovering = false;
@@ -251,7 +251,7 @@ impl<'a> Parser<'a> {
                 return;
             }
         };
-        if !self.expect(TokKind::LBrace, "nach dem namen der aufzaehlung") {
+        if !self.expect(TokKind::LBrace, "after the name of the enum") {
             self.recovering = false;
             self.sync_item();
             return;
@@ -263,7 +263,7 @@ impl<'a> Parser<'a> {
                 break;
             }
             let before = self.pos;
-            let (vname, vspan) = match self.ident("fuer eine variante der aufzaehlung") {
+            let (vname, vspan) = match self.ident("for a variant of the enum") {
                 Some(x) => x,
                 None => break,
             };
@@ -285,12 +285,12 @@ impl<'a> Parser<'a> {
                         self.bump();
                     }
                 }
-                self.close(TokKind::RParen, "nach den nutzdaten einer variante");
+                self.close(TokKind::RParen, "after the payload of a variant");
             }
             if variants.iter().any(|v| v.name == vname) {
                 self.dg.error(
                     vspan,
-                    format!("variante '{}' ist in aufzaehlung '{}' bereits deklariert", vname, name),
+                    format!("variant '{}' is already declared in enum '{}'", vname, name),
                 );
             } else {
                 let tag = variants.len() as i128;
@@ -307,12 +307,12 @@ impl<'a> Parser<'a> {
             }
         }
         let end = self.span();
-        self.close(TokKind::RBrace, "am ende der aufzaehlung");
+        self.close(TokKind::RBrace, "at the end of the enum");
         self.recovering = false;
         if variants.is_empty() {
             self.dg.error(
                 nspan,
-                format!("aufzaehlung '{}' hat keine variante", name),
+                format!("enum '{}' has no variant", name),
             );
             return;
         }
@@ -336,7 +336,7 @@ impl<'a> Parser<'a> {
         });
         if duplicate {
             self.dg
-                .error(nspan, format!("aufzaehlung '{}' ist bereits deklariert", name));
+                .error(nspan, format!("enum '{}' is already declared", name));
         }
     }
 
@@ -348,15 +348,15 @@ impl<'a> Parser<'a> {
             // AST — eine Vorlage koennte sie nicht je Auspraegung ersetzen.
             self.dg.error_note(
                 start,
-                "'match' innerhalb einer generischen vorlage wird in dieser stufe nicht unterstuetzt",
-                "lagere den musterabgleich in eine nicht generische funktion aus",
+                "'match' inside a generic template is not supported in this stage",
+                "move the pattern match into a non-generic function",
             );
         }
         let saved = self.no_struct_lit;
         self.no_struct_lit = true;
         let subject = self.expr();
         self.no_struct_lit = saved;
-        if !self.expect(TokKind::LBrace, "nach dem ausdruck von 'match'") {
+        if !self.expect(TokKind::LBrace, "after the expression of 'match'") {
             self.recovering = false;
             self.sync_item();
             return Stmt::Error(start);
@@ -374,7 +374,7 @@ impl<'a> Parser<'a> {
             };
             if !self.types_at_fat_arrow() {
                 self.error_here(format!(
-                    "erwartet '=>' nach dem muster, gefunden '{}'",
+                    "expected '=>' after the pattern, found '{}'",
                     self.kind().text()
                 ));
                 self.recovering = false;
@@ -384,13 +384,13 @@ impl<'a> Parser<'a> {
             self.bump();
             if !self.at(&TokKind::LBrace) {
                 self.error_here(format!(
-                    "erwartet '{{' nach '=>' (der rumpf eines falls ist ein block), gefunden '{}'",
+                    "expected '{{' after '=>' (the body of an arm is a block), found '{}'",
                     self.kind().text()
                 ));
                 self.recovering = false;
                 break;
             }
-            let body = self.block("am anfang eines match-falls");
+            let body = self.block("at the start of a match arm");
             self.recovering = false;
             let span = Parser::join(pat.span(), body.span);
             arms.push(Arm { pat, body, span });
@@ -399,11 +399,11 @@ impl<'a> Parser<'a> {
             }
         }
         let end = self.span();
-        self.close(TokKind::RBrace, "am ende von 'match'");
+        self.close(TokKind::RBrace, "at the end of 'match'");
         self.recovering = false;
         let span = Parser::join(start, end);
         if arms.is_empty() {
-            self.dg.error(span, "'match' braucht mindestens einen fall");
+            self.dg.error(span, "'match' needs at least one arm");
             return Stmt::Error(span);
         }
         let idx = REG.with(|r| {
@@ -418,7 +418,7 @@ impl<'a> Parser<'a> {
 
     fn types_pattern(&mut self, depth: u32) -> Option<Pattern> {
         if depth > 32 {
-            self.error_here("muster ist zu tief verschachtelt (mehr als 32 ebenen)");
+            self.error_here("pattern is nested too deeply (more than 32 levels)");
             self.recovering = false;
             return None;
         }
@@ -442,7 +442,7 @@ impl<'a> Parser<'a> {
                     let span = Parser::join(sp, hisp);
                     if (inclusive && hi < lo) || (!inclusive && hi <= lo) {
                         self.dg
-                            .error(span, "der bereich im muster ist leer (obere grenze zu klein)");
+                            .error(span, "the range in the pattern is empty (upper bound too small)");
                         return None;
                     }
                     return Some(Pattern::Range { lo, hi, inclusive, span });
@@ -457,7 +457,7 @@ impl<'a> Parser<'a> {
                 self.bump();
                 if self.types_at_colon2(0) {
                     self.types_eat_colon2();
-                    let (vname, vspan) = self.ident("nach '::' im muster")?;
+                    let (vname, vspan) = self.ident("after '::' in the pattern")?;
                     let mut subs = Vec::new();
                     let mut end = vspan;
                     if self.eat(&TokKind::LParen) {
@@ -476,7 +476,7 @@ impl<'a> Parser<'a> {
                             }
                         }
                         end = self.span();
-                        self.close(TokKind::RParen, "nach den untermustern");
+                        self.close(TokKind::RParen, "after the subpatterns");
                     }
                     return Some(Pattern::Variant {
                         ename: Some(name),
@@ -488,7 +488,7 @@ impl<'a> Parser<'a> {
                 Some(Pattern::Bind(name, sp))
             }
             other => {
-                self.error_here(format!("erwartet ein muster, gefunden '{}'", other.text()));
+                self.error_here(format!("expected a pattern, found '{}'", other.text()));
                 self.recovering = false;
                 None
             }
@@ -504,7 +504,7 @@ impl<'a> Parser<'a> {
             }
             other => {
                 self.error_here(format!(
-                    "erwartet eine ganzzahl im muster, gefunden '{}'",
+                    "expected an integer in the pattern, found '{}'",
                     other.text()
                 ));
                 self.recovering = false;
@@ -538,13 +538,13 @@ pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
         if p.types_at_colon2(1) && matches!(p.tk(3), TokKind::Ident(_)) {
             let sp = p.bump();
             p.types_eat_colon2();
-            let (vname, vspan) = p.ident("nach '::'")?;
+            let (vname, vspan) = p.ident("after '::'")?;
             let full = format!("{}::{}", name, vname);
             let mut args = Vec::new();
             let mut end = vspan;
             if p.at(&TokKind::LParen) {
                 p.bump();
-                let (a, e) = p.call_args("nach den nutzdaten der variante");
+                let (a, e) = p.call_args("after the payload of the variant");
                 args = a;
                 end = e;
             }
@@ -568,7 +568,7 @@ pub(crate) fn declare_enums(ck: &mut Checker) {
         };
         if ck.tcx.lookup(&def.name).is_some() {
             ck.dg
-                .error(def.span, format!("typ '{}' ist bereits deklariert", def.name));
+                .error(def.span, format!("type '{}' is already declared", def.name));
             continue;
         }
         let idx = ck.tcx.declare(&def.name);
@@ -597,10 +597,10 @@ pub(crate) fn layout_enums(ck: &mut Checker, prog: &crate::ast::Program) {
                     ck.dg.error_note(
                         *span,
                         format!(
-                            "feld '{}' hat den aufzaehlungstyp '{}' — das wird in dieser stufe nicht unterstuetzt",
+                            "field '{}' has the enum type '{}' — that is not supported in this stage",
                             fname, n
                         ),
-                        "benutze einen zeiger ('*mut T') auf die aufzaehlung",
+                        "use a pointer ('*mut T') to the enum",
                     );
                 }
             }
@@ -638,8 +638,8 @@ pub(crate) fn layout_enums(ck: &mut Checker, prog: &crate::ast::Program) {
         if let Some(d) = defs.get(*i) {
             ck.dg.error_note(
                 d.span,
-                format!("aufzaehlung '{}' enthaelt sich selbst (direkt oder indirekt)", d.name),
-                "benutze an der stelle einen zeiger, z. B. '*mut T'",
+                format!("enum '{}' contains itself (directly or indirectly)", d.name),
+                "use a pointer there, e.g. '*mut T'",
             );
         }
     }
@@ -663,7 +663,7 @@ pub(crate) fn layout_enums(ck: &mut Checker, prog: &crate::ast::Program) {
             for te in &v.field_tys {
                 let t = ck.resolve_ty(te);
                 if matches!(t, Type::Void) {
-                    ck.dg.error(te.span(), "nutzdaten einer variante koennen nicht den typ '()' haben");
+                    ck.dg.error(te.span(), "the payload of a variant cannot have the type '()'");
                 }
                 let a = ck.tcx.align_of(&t).max(1);
                 if a > payload_align {
@@ -827,7 +827,7 @@ fn check_ctor(
                 ck.type_out_expr(a);
             }
             ck.dg
-                .error(nspan, format!("unbekannte aufzaehlung '{}'", ename));
+                .error(nspan, format!("unknown enum '{}'", ename));
             return Type::Error;
         }
     };
@@ -839,8 +839,8 @@ fn check_ctor(
             }
             ck.dg.error_note(
                 nspan,
-                format!("aufzaehlung '{}' hat keine variante '{}'", ename, vname),
-                format!("bekannt sind: {}", variant_list(&def)),
+                format!("enum '{}' has no variant '{}'", ename, vname),
+                format!("known are: {}", variant_list(&def)),
             );
             return Type::Error;
         }
@@ -849,7 +849,7 @@ fn check_ctor(
         ck.dg.error(
             espan,
             format!(
-                "variante '{}::{}' erwartet {} nutzdatenwert(e), gefunden {}",
+                "variant '{}::{}' expects {} payload value(s), found {}",
                 ename,
                 vname,
                 v.fields.len(),
@@ -865,7 +865,7 @@ fn check_ctor(
                     ck.dg.error(
                         a.span,
                         format!(
-                            "nutzdatenwert {} von '{}::{}' hat typ {}, erwartet {}",
+                            "payload value {} of '{}::{}' has type {}, expected {}",
                             i + 1,
                             ename,
                             vname,
@@ -904,7 +904,7 @@ fn check_match(ck: &mut Checker, idx: usize, espan: Span) {
         Some(m) => m,
         None => {
             ck.dg
-                .error(espan, "interner fehler: unbekannter musterabgleich");
+                .error(espan, "internal error: unknown pattern match");
             return;
         }
     };
@@ -925,9 +925,9 @@ fn check_match(ck: &mut Checker, idx: usize, espan: Span) {
         if let Some(prev) = catchall {
             ck.dg.error_note(
                 arm.span,
-                "dieser fall ist unerreichbar",
+                "this arm is unreachable",
                 format!(
-                    "ein frueherer fall in zeile {} trifft immer zu",
+                    "an earlier arm in line {} always matches",
                     prev.line
                 ),
             );
@@ -974,15 +974,15 @@ fn classify_subject(ck: &mut Checker, ty: &Type, span: Span) -> Subject {
     if *ty == Type::UntypedInt {
         ck.dg.error_note(
             span,
-            "typ des ganzzahlausdrucks in 'match' ist nicht ableitbar",
-            "schreibe z. B. 'x as i32'",
+            "the type of the integer expression in 'match' cannot be inferred",
+            "write e.g. 'x as i32'",
         );
         return Subject::Bad;
     }
     ck.dg.error(
         span,
         format!(
-            "'match' arbeitet auf aufzaehlungen, ganzzahlen und bool, nicht auf {}",
+            "'match' works on enums, integers and bool, not on {}",
             ck.tcx.name_of(ty)
         ),
     );
@@ -1001,7 +1001,7 @@ fn check_pattern(ck: &mut Checker, pat: &Pattern, ty: &Type, subject: &Subject, 
                 ck.dg.error(
                     *span,
                     format!(
-                        "muster 'true'/'false' passt nicht zum typ {}",
+                        "pattern 'true'/'false' does not fit the type {}",
                         ck.tcx.name_of(ty)
                     ),
                 );
@@ -1011,12 +1011,12 @@ fn check_pattern(ck: &mut Checker, pat: &Pattern, ty: &Type, subject: &Subject, 
             if !ty.is_concrete_int() && !ty.is_error() {
                 ck.dg.error(
                     *span,
-                    format!("zahlenmuster passt nicht zum typ {}", ck.tcx.name_of(ty)),
+                    format!("number pattern does not fit the type {}", ck.tcx.name_of(ty)),
                 );
             } else if !fits(*v, ty) {
                 ck.dg.error(
                     *span,
-                    format!("zahl {} passt nicht in den typ {}", v, ck.tcx.name_of(ty)),
+                    format!("number {} does not fit into the type {}", v, ck.tcx.name_of(ty)),
                 );
             }
         }
@@ -1024,12 +1024,12 @@ fn check_pattern(ck: &mut Checker, pat: &Pattern, ty: &Type, subject: &Subject, 
             if !ty.is_concrete_int() && !ty.is_error() {
                 ck.dg.error(
                     *span,
-                    format!("bereichsmuster passt nicht zum typ {}", ck.tcx.name_of(ty)),
+                    format!("range pattern does not fit the type {}", ck.tcx.name_of(ty)),
                 );
             } else if !fits(*lo, ty) || !fits(*hi, ty) {
                 ck.dg.error(
                     *span,
-                    format!("die bereichsgrenzen passen nicht in den typ {}", ck.tcx.name_of(ty)),
+                    format!("the range bounds do not fit into the type {}", ck.tcx.name_of(ty)),
                 );
             }
         }
@@ -1039,7 +1039,7 @@ fn check_pattern(ck: &mut Checker, pat: &Pattern, ty: &Type, subject: &Subject, 
                 Some(n) => match enum_by_name(n) {
                     Some(d) => Some(d),
                     None => {
-                        ck.dg.error(*span, format!("unbekannte aufzaehlung '{}'", n));
+                        ck.dg.error(*span, format!("unknown enum '{}'", n));
                         None
                     }
                 },
@@ -1057,7 +1057,7 @@ fn check_pattern(ck: &mut Checker, pat: &Pattern, ty: &Type, subject: &Subject, 
                 ck.dg.error(
                     *span,
                     format!(
-                        "muster der aufzaehlung '{}' passt nicht zum typ {}",
+                        "pattern of the enum '{}' does not fit the type {}",
                         def.name,
                         ck.tcx.name_of(ty)
                     ),
@@ -1070,7 +1070,7 @@ fn check_pattern(ck: &mut Checker, pat: &Pattern, ty: &Type, subject: &Subject, 
                         ck.dg.error(
                             *span,
                             format!(
-                                "muster der aufzaehlung '{}' passt nicht zum typ '{}'",
+                                "pattern of the enum '{}' does not fit the type '{}'",
                                 def.name, sd.name
                             ),
                         );
@@ -1083,8 +1083,8 @@ fn check_pattern(ck: &mut Checker, pat: &Pattern, ty: &Type, subject: &Subject, 
                 None => {
                     ck.dg.error_note(
                         *span,
-                        format!("aufzaehlung '{}' hat keine variante '{}'", def.name, vname),
-                        format!("bekannt sind: {}", variant_list(&def)),
+                        format!("enum '{}' has no variant '{}'", def.name, vname),
+                        format!("known are: {}", variant_list(&def)),
                     );
                     return;
                 }
@@ -1093,7 +1093,7 @@ fn check_pattern(ck: &mut Checker, pat: &Pattern, ty: &Type, subject: &Subject, 
                 ck.dg.error(
                     *span,
                     format!(
-                        "muster '{}::{}' erwartet {} untermuster, gefunden {}",
+                        "pattern '{}::{}' expects {} subpatterns, found {}",
                         def.name,
                         vname,
                         v.fields.len(),
@@ -1156,17 +1156,17 @@ pub fn check_exhaustive(subject: &Subject, arms: &[Arm], span: Span) -> Result<(
             let list = missing.join(", ");
             Err(Diag {
                 msg: format!(
-                    "'match' ist nicht vollstaendig: {} nicht abgedeckt",
+                    "'match' is not exhaustive: {} not covered",
                     if missing.len() == 1 {
-                        format!("die variante {} ist", list)
+                        format!("the variant {} is", list)
                     } else {
-                        format!("die varianten {} sind", list)
+                        format!("the variants {} are", list)
                     }
                 ),
                 span,
-                label: "hier".to_string(),
+                label: "here".to_string(),
                 note: Some(format!(
-                    "ergaenze einen fall '{} => {{ }}' oder '_ => {{ }}'",
+                    "add an arm '{} => {{ }}' or '_ => {{ }}'",
                     missing[0]
                 )),
             })
@@ -1191,12 +1191,12 @@ pub fn check_exhaustive(subject: &Subject, arms: &[Arm], span: Span) -> Result<(
             }
             Err(Diag {
                 msg: format!(
-                    "'match' ist nicht vollstaendig: der fall {} fehlt",
-                    missing.join(" und ")
+                    "'match' is not exhaustive: the arm {} is missing",
+                    missing.join(" and ")
                 ),
                 span,
-                label: "hier".to_string(),
-                note: Some("ergaenze den fehlenden fall oder '_ => { }'".to_string()),
+                label: "here".to_string(),
+                note: Some("add the missing arm or '_ => { }'".to_string()),
             })
         }
         Subject::Int(t) => {
@@ -1205,12 +1205,12 @@ pub fn check_exhaustive(subject: &Subject, arms: &[Arm], span: Span) -> Result<(
             }
             Err(Diag {
                 msg: format!(
-                    "'match' ueber {} ist nicht vollstaendig: es fehlt ein fall fuer alle uebrigen werte",
+                    "'match' over {} is not exhaustive: an arm for all remaining values is missing",
                     type_name(t)
                 ),
                 span,
-                label: "hier".to_string(),
-                note: Some("ergaenze '_ => { }'".to_string()),
+                label: "here".to_string(),
+                note: Some("add '_ => { }'".to_string()),
             })
         }
     }
@@ -1228,7 +1228,7 @@ fn type_name(t: &Type) -> &'static str {
         Type::U64 => "u64",
         Type::Usize => "usize",
         Type::Isize => "isize",
-        _ => "ganzzahlen",
+        _ => "integers",
     }
 }
 
@@ -1271,8 +1271,8 @@ fn main() -> i32 {
 }
 ";
         let (out, ok) = compile(src);
-        assert!(!ok, "unvollstaendiges match muss ein fehler sein:\n{}", out);
-        assert!(out.contains("nicht vollstaendig"), "{}", out);
+        assert!(!ok, "an inexhaustive match must be an error:\n{}", out);
+        assert!(out.contains("not exhaustive"), "{}", out);
         assert!(out.contains("T::C"), "{}", out);
     }
 
@@ -1308,7 +1308,7 @@ fn main() -> i32 {
 ";
         let (out, ok) = compile(src);
         assert!(!ok, "{}", out);
-        assert!(out.contains("nicht vollstaendig"), "{}", out);
+        assert!(out.contains("not exhaustive"), "{}", out);
     }
 
     #[test]
@@ -1321,10 +1321,10 @@ fn main() -> i32 { return 0 as i32 }
         let toks = crate::lexer::lex(src, &mut dg);
         let prog = crate::parser::parse(&toks, &mut dg);
         let info = crate::sema::check(&prog, &mut dg).expect("typpruefung");
-        let idx = info.tcx.lookup("T").expect("aufzaehlung T");
+        let idx = info.tcx.lookup("T").expect("enum T");
         let sd = &info.tcx.structs[idx];
         assert_eq!(sd.field("__tag").expect("tag").offset, 0);
-        assert_eq!(sd.field("__v1_0").expect("nutzdaten").offset, 8);
+        assert_eq!(sd.field("__v1_0").expect("payload").offset, 8);
         assert_eq!(sd.size, 16);
         assert_eq!(sd.align, 8);
     }

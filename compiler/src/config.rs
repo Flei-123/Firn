@@ -11,4 +11,4 @@ pub fn compiler_name() -> String {
 }
 
 /// Version des Prototypen (Stufe 0).
-pub const VERSION: &str = "0.1.0 (Stufe 0)";
+pub const VERSION: &str = "0.1.0 (stage 0)";

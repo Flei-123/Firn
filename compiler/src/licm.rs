@@ -246,15 +246,15 @@ mod tests {
     fn invariant_multiplication_moves_in_the_preheader() {
         let mut f = loop_with_invariant_multiplication();
         let n = hoist_loop_invariants(&mut f);
-        assert!(n >= 1, "nichts hochgezogen");
+        assert!(n >= 1, "nothing hoisted");
         assert!(
             f.blocks[2].insts.is_empty(),
-            "die Multiplikation steht noch im Rumpf: {:?}",
+            "the multiplication is still in the body: {:?}",
             f.blocks[2].insts
         );
         assert!(
             f.blocks[0].insts.iter().any(|i| matches!(i.op, Op::Bin(BinOp::Mul, 0, 1))),
-            "die Multiplikation ist nicht im Vorkopf gelandet"
+            "the multiplication did not end up in the preheader"
         );
     }
 
@@ -266,7 +266,7 @@ mod tests {
         assert_eq!(
             f.blocks[2].insts.len(),
             1,
-            "eine Division darf NIE unbedingt ausgefuehrt werden (Division durch null)"
+            "a division must NEVER be executed unconditionally (division by zero)"
         );
     }
 
@@ -281,6 +281,6 @@ mod tests {
         );
         f.blocks[2].insts[1].op = Op::Bin(BinOp::Mul, l, 1);
         hoist_loop_invariants(&mut f);
-        assert_eq!(f.blocks[2].insts.len(), 2, "nichts haette wandern duerfen");
+        assert_eq!(f.blocks[2].insts.len(), 2, "nothing should have moved");
     }
 }

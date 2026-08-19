@@ -337,7 +337,7 @@ pub fn inline_module(m: &mut Module) -> usize {
         for ci in 0..m.funcs.len() {
             if let Some((bi, ii, gi)) = find_site(m, ci, &self_rec) {
                 if dbg {
-                    eprintln!("inline: {} <- {} ({} insts, {} bloecke)",
+                    eprintln!("inline: {} <- {} ({} insts, {} blocks)",
                         m.funcs[ci].name, m.funcs[gi].name,
                         m.funcs[gi].inst_count(), m.funcs[gi].blocks.len());
                 }

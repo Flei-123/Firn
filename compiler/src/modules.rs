@@ -132,11 +132,11 @@ pub fn resolve(root: &Path, world: &World) -> Result<Vec<SourceFile>, Error> {
             Ok(s) => s,
             Err(e) => {
                 return Err(Error::Diag(Diag {
-                    msg: format!("kann '{}' nicht lesen: {}", path.display(), e),
+                    msg: format!("cannot read '{}': {}", path.display(), e),
                     span,
-                    label: "hier".to_string(),
+                    label: "here".to_string(),
                     note: Some(format!(
-                        "gesucht wird relativ zur importierenden datei, relativ zu '{}', in den quellen des projekts, in seinen abhaengigkeiten, dann in $FIRNLIB und in <verzeichnis des compiler-binarys>/../lib",
+                        "the search runs relative to the importing file, relative to '{}', in the sources of the project, in its dependencies, then in $FIRNLIB and in <directory of the compiler binary>/../lib",
                         if base.as_os_str().is_empty() {
                             ".".to_string()
                         } else {
@@ -294,7 +294,7 @@ pub(crate) fn gc_runtime(files: &[SourceFile]) -> Option<SourceFile> {
     // Runde 49: dasselbe fuer den Fadenverteiler.
     let mut has_thread_work = false;
     for f in files {
-        let mut dg = Diags::new("<gc-suche>", &f.src);
+        let mut dg = Diags::new("<gc-search>", &f.src);
         let toks = lexer::lex_file(&f.src, f.id, &mut dg);
         needs |= crate::gc::source_needs_gc(&toks);
         has_allocerror |= crate::gc::source_has_allocerror(&toks);
@@ -321,7 +321,7 @@ pub(crate) fn gc_runtime(files: &[SourceFile]) -> Option<SourceFile> {
 
 /// Sucht `import a.b`-Deklarationen, ohne die Datei vollstaendig zu parsen.
 fn scan_imports(src: &str, file: u32) -> Vec<(Vec<String>, Span)> {
-    let mut dg = Diags::new("<import-suche>", src);
+    let mut dg = Diags::new("<import-search>", src);
     let toks = lexer::lex_file(src, file, &mut dg);
     let mut out = Vec::new();
     let mut i = 0usize;
@@ -497,7 +497,7 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
             if !known {
                 dg.error(
                     im.span,
-                    format!("modul '{}' wurde nicht gefunden", im.path.join(".")),
+                    format!("module '{}' was not found", im.path.join(".")),
                 );
             }
         }
@@ -569,7 +569,7 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
         // `sema_generic::REG` — das Umschreiben oben erreichte sie deshalb
         // nie, und eine Vorlage aus einem Modul sah nur die Namen der
         // WURZELDATEI. Selbst eine Hilfsfunktion in derselben Datei meldete
-        // "unbekannte funktion" (docs/SELBSTHOSTING.md §7, Blocker B2).
+        // "unknown function" (docs/SELBSTHOSTING.md §7, Blocker B2).
         //
         // Der NAME der Vorlage bleibt unangetastet: die Auspraegung sucht ihn
         // spaeter unter dem urspruenglichen Namen (`mono::expand_fn` ueber
@@ -653,22 +653,22 @@ impl<'a, 'b> Renamer<'a, 'b> {
                 Some(i) => i,
                 None => {
                     self.dg
-                        .error(span, format!("modul '{}' ist nicht eingebunden", m));
+                        .error(span, format!("module '{}' is not imported", m));
                     return None;
                 }
             };
             if !info.items.contains(rest) {
                 self.dg.error(
                     span,
-                    format!("modul '{}' hat kein element '{}'", m, rest),
+                    format!("module '{}' has no element '{}'", m, rest),
                 );
                 return None;
             }
             if !info.exports.is_empty() && !info.exports.contains(rest) {
                 self.dg.error_note(
                     span,
-                    format!("'{}' wird von modul '{}' nicht exportiert", rest, m),
-                    "ergaenze den namen in der 'export'-liste des moduls",
+                    format!("'{}' is not exported by module '{}'", rest, m),
+                    "add the name to the 'export' list of the module",
                 );
                 return None;
             }
@@ -846,11 +846,11 @@ mod tests {
 
     #[test]
     fn imports_become_found() {
-        let src = "import std.io\nimport helfer\nfn main() -> i32 { return 0 }\n";
+        let src = "import std.io\nimport helper\nfn main() -> i32 { return 0 }\n";
         let found = scan_imports(src, 0);
         assert_eq!(found.len(), 2);
         assert_eq!(found[0].0, vec!["std".to_string(), "io".to_string()]);
-        assert_eq!(found[1].0, vec!["helfer".to_string()]);
+        assert_eq!(found[1].0, vec!["helper".to_string()]);
     }
 
     #[test]
@@ -860,7 +860,7 @@ mod tests {
             module_path(Path::new("x"), &["std".to_string(), "math".to_string()]),
             PathBuf::from("x/std/math.fi")
         );
-        // FIRNLIB: leer oder ungesetzt heisst "kein zusaetzlicher pfad".
+        // FIRNLIB: leer oder ungesetzt heisst "no additional path".
         assert_eq!(firnlib_path(None), None);
         assert_eq!(firnlib_path(Some("")), None);
         assert_eq!(

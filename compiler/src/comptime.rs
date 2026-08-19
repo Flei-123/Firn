@@ -104,7 +104,7 @@ impl<'a> Execution<'a> {
         if depth >= MAX_TIEFE {
             return Err((
                 span,
-                format!("comptime: mehr als {} verschachtelte aufrufe", MAX_TIEFE),
+                format!("comptime: more than {} nested calls", MAX_TIEFE),
             ));
         }
         let f: &FnDecl = match self.prog.funcs.iter().find(|f| f.name == name) {
@@ -112,7 +112,7 @@ impl<'a> Execution<'a> {
             None => {
                 return Err((
                     span,
-                    format!("comptime: '{}' ist keine funktion dieses programms", name),
+                    format!("comptime: '{}' is not a function of this program", name),
                 ))
             }
         };
@@ -120,7 +120,7 @@ impl<'a> Execution<'a> {
             return Err((
                 span,
                 format!(
-                    "comptime: '{}' erwartet {} argumente, gefunden {}",
+                    "comptime: '{}' expects {} arguments, found {}",
                     name,
                     f.params.len(),
                     args.len()
@@ -168,7 +168,7 @@ impl<'a> Execution<'a> {
             return Err((
                 s.span(),
                 format!(
-                    "comptime: mehr als {} schritte — endlosschleife?",
+                    "comptime: more than {} steps — endless loop?",
                     MAX_SCHRITTE
                 ),
             ));
@@ -189,7 +189,7 @@ impl<'a> Execution<'a> {
                     _ => {
                         return Err((
                             *span,
-                            "comptime: nur zuweisungen an eine lokale variable (kein feld, kein index, kein zeiger)"
+                            "comptime: only assignments to a local variable (no field, no index, no pointer)"
                                 .to_string(),
                         ))
                     }
@@ -200,7 +200,7 @@ impl<'a> Execution<'a> {
                         return Ok(Flow::Next);
                     }
                 }
-                Err((*span, format!("comptime: '{}' ist keine lokale variable", name)))
+                Err((*span, format!("comptime: '{}' is not a local variable", name)))
             }
             Stmt::Expr(e) => {
                 self.expr(e, env, depth)?;
@@ -231,7 +231,7 @@ impl<'a> Execution<'a> {
                         return Err((
                             s.span(),
                             format!(
-                                "comptime: mehr als {} schritte — endlosschleife?",
+                                "comptime: more than {} steps — endless loop?",
                                 MAX_SCHRITTE
                             ),
                         ));
@@ -256,7 +256,7 @@ impl<'a> Execution<'a> {
                         return Err((
                             s.span(),
                             format!(
-                                "comptime: mehr als {} schritte — endlosschleife?",
+                                "comptime: more than {} steps — endless loop?",
                                 MAX_SCHRITTE
                             ),
                         ));
@@ -282,7 +282,7 @@ impl<'a> Execution<'a> {
             // Wirkung; sie werden abgelehnt statt still uebergangen.
             Stmt::Defer(_, _, span) => Err((
                 *span,
-                "comptime: 'defer' und 'errdefer' sind zur uebersetzungszeit nicht erlaubt"
+                "comptime: 'defer' and 'errdefer' are not allowed at compile time"
                     .to_string(),
             )),
         }
@@ -305,26 +305,26 @@ impl<'a> Execution<'a> {
     fn read_file(&mut self, path: &str, span: Span) -> Result<&Vec<u8>, Error> {
         if !self.files.contains_key(path) {
             if path.is_empty() {
-                return Err((span, "comptime: leerer dateiname".to_string()));
+                return Err((span, "comptime: empty file name".to_string()));
             }
             let p = std::path::Path::new(path);
             if p.is_absolute() || path.starts_with('/') || path.starts_with('\\') {
                 return Err((
                     span,
-                    format!("comptime: '{}' ist ein absoluter pfad — erlaubt sind nur pfade relativ zur quelldatei", path),
+                    format!("comptime: '{}' is an absolute path — only paths relative to the source file are allowed", path),
                 ));
             }
             if p.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
                 return Err((
                     span,
-                    format!("comptime: '{}' enthaelt '..' — der zugriff bleibt im verzeichnis der quelldatei", path),
+                    format!("comptime: '{}' contains '..' — access stays inside the directory of the source file", path),
                 ));
             }
             let full = self.base.join(p);
             let content = std::fs::read(&full).map_err(|e| {
                 (
                     span,
-                    format!("comptime: '{}' ist nicht lesbar: {}", full.display(), e),
+                    format!("comptime: '{}' is not readable: {}", full.display(), e),
                 )
             })?;
             self.files.insert(path.to_string(), content);
@@ -342,7 +342,7 @@ impl<'a> Execution<'a> {
         match &e.kind {
             ExprKind::Int(v) => Ok(*v),
             ExprKind::Bool(b) => Ok(if *b { 1 } else { 0 }),
-            ExprKind::Float(_) => no("gleitkomma ist zur uebersetzungszeit noch nicht moeglich"),
+            ExprKind::Float(_) => no("floating point is not yet possible at compile time"),
             ExprKind::Ident(n) => {
                 for level in env.iter().rev() {
                     if let Some(v) = level.get(n) {
@@ -351,7 +351,7 @@ impl<'a> Execution<'a> {
                 }
                 match self.consts.get(n) {
                     Some((_, v)) => Ok(*v),
-                    None => Err((e.span, format!("comptime: '{}' ist hier nicht bekannt", n))),
+                    None => Err((e.span, format!("comptime: '{}' is not known here", n))),
                 }
             }
             ExprKind::Unary(op, inner) => {
@@ -359,7 +359,7 @@ impl<'a> Execution<'a> {
                 match op {
                     UnOp::Neg => Ok(-v),
                     UnOp::Not => Ok(if v == 0 { 1 } else { 0 }),
-                    _ => no("zeigeroperationen gibt es zur uebersetzungszeit nicht"),
+                    _ => no("pointer operations do not exist at compile time"),
                 }
             }
             ExprKind::Binary(op, l, r) => {
@@ -405,7 +405,7 @@ impl<'a> Execution<'a> {
                 }
                 if name == "file_byte" {
                     if args.len() != 2 {
-                        return no("'datei_byte' erwartet pfad und index");
+                        return no("'file_byte' expects path and index");
                     }
                     let path = literal_text(&args[..1], e.span)?;
                     let idx = self.expr(&args[1], env, depth)?;
@@ -417,7 +417,7 @@ impl<'a> Execution<'a> {
                 }
                 if name == "emit_number" {
                     if args.len() != 1 {
-                        return no("'emit_zahl' erwartet genau ein argument");
+                        return no("'emit_number' expects exactly one argument");
                     }
                     let v = self.expr(&args[0], env, depth)?;
                     self.output.push_str(&v.to_string());
@@ -430,7 +430,7 @@ impl<'a> Execution<'a> {
                 self.call_on(name, &values, e.span, depth + 1)
             }
             _ => no(
-                "hier sind nur literale, namen, operatoren, umwandlungen und aufrufe erlaubt",
+                "only literals, names, operators, conversions and calls are allowed here",
             ),
         }
     }
@@ -444,13 +444,13 @@ fn compute(op: BinOp, a: i128, b: i128, span: Span) -> Result<i128, Error> {
         BinOp::Mul => a * b,
         BinOp::Div => {
             if b == 0 {
-                return Err((span, "comptime: division durch null".to_string()));
+                return Err((span, "comptime: division by zero".to_string()));
             }
             a / b
         }
         BinOp::Rem => {
             if b == 0 {
-                return Err((span, "comptime: rest bei division durch null".to_string()));
+                return Err((span, "comptime: remainder on division by zero".to_string()));
             }
             a % b
         }
@@ -459,13 +459,13 @@ fn compute(op: BinOp, a: i128, b: i128, span: Span) -> Result<i128, Error> {
         BinOp::Xor => a ^ b,
         BinOp::Shl => {
             if !(0..128).contains(&b) {
-                return Err((span, "comptime: verschiebeweite ausserhalb 0..127".to_string()));
+                return Err((span, "comptime: shift amount outside 0..127".to_string()));
             }
             a << b
         }
         BinOp::Shr => {
             if !(0..128).contains(&b) {
-                return Err((span, "comptime: verschiebeweite ausserhalb 0..127".to_string()));
+                return Err((span, "comptime: shift amount outside 0..127".to_string()));
             }
             a >> b
         }
@@ -486,14 +486,14 @@ fn compute(op: BinOp, a: i128, b: i128, span: Span) -> Result<i128, Error> {
 /// im Interpreter.
 fn literal_text(args: &[Expr], span: Span) -> Result<String, Error> {
     if args.len() != 1 {
-        return Err((span, "comptime: 'emit_roh' erwartet genau ein argument".to_string()));
+        return Err((span, "comptime: 'emit_raw' expects exactly one argument".to_string()));
     }
     let elems = match &args[0].kind {
         ExprKind::ArrayLit(v) => v,
         _ => {
             return Err((
                 args[0].span,
-                "comptime: 'emit_roh' erwartet ein zeichenkettenliteral".to_string(),
+                "comptime: 'emit_raw' expects a string literal".to_string(),
             ))
         }
     };
@@ -504,13 +504,13 @@ fn literal_text(args: &[Expr], span: Span) -> Result<String, Error> {
             _ => {
                 return Err((
                     args[0].span,
-                    "comptime: 'emit_roh' erwartet ein zeichenkettenliteral".to_string(),
+                    "comptime: 'emit_raw' expects a string literal".to_string(),
                 ))
             }
         }
     }
     String::from_utf8(bytes)
-        .map_err(|_| (args[0].span, "comptime: 'emit_roh' braucht gueltiges UTF-8".to_string()))
+        .map_err(|_| (args[0].span, "comptime: 'emit_raw' needs valid UTF-8".to_string()))
 }
 
 /// Fuehrt alle `comptime { … }`-Bloecke des Programms aus und liefert den dabei

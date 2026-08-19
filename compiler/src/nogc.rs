@@ -73,7 +73,7 @@ fn is_interner_name(name: &str) -> bool {
     name.contains('#') || name.contains("::")
 }
 
-/// `helfer__quadrat` (Modulsystem, `modules.rs`) wieder als `helfer.quadrat`
+/// `helper__square` (Modulsystem, `modules.rs`) wieder als `helper.square`
 /// schreiben — die Meldung soll den Namen zeigen, der im Quelltext steht.
 fn readable(name: &str) -> String {
     if name.starts_with('_') || is_interner_name(name) {
@@ -213,21 +213,21 @@ impl<'a> NoGcChecker<'a> {
             return;
         }
         let (what, sp) = match &target.kind {
-            ExprKind::Field(_, name, sp) => (format!("das GC-Feld '{}'", name), *sp),
+            ExprKind::Field(_, name, sp) => (format!("the GC field '{}'", name), *sp),
             ExprKind::Index(b, _) => match &b.kind {
                 ExprKind::Ident(_) => return, // oertliches Feld auf dem Stapel
-                _ => ("ein GC-Element im Speicher".to_string(), target.span),
+                _ => ("a GC element in memory".to_string(), target.span),
             },
-            ExprKind::Unary(_, _) => ("ein GC-Feld hinter einem Zeiger".to_string(), target.span),
+            ExprKind::Unary(_, _) => ("a GC field behind a pointer".to_string(), target.span),
             _ => return,
         };
         let sp = if sp == Span::none() { fallback } else { sp };
         let who = self.who.clone();
         self.report(
             sp,
-            format!("'{who}' ist #[no_gc], schreibt aber in {what}"),
-            "SPEC 3.5.4: das Schreiben eines Gc-Zeigers in den Heap braucht die \
-             Einfuegebarriere und ist in einem #[no_gc]-Aufrufbaum verboten"
+            format!("'{who}' is #[no_gc], but writes into {what}"),
+            "SPEC 3.5.4: writing a Gc pointer into the heap needs the insertion \
+             barrier and is forbidden in a #[no_gc] call tree"
                 .to_string(),
         );
     }
@@ -282,11 +282,11 @@ impl<'a> NoGcChecker<'a> {
             self.report(
                 sp,
                 format!(
-                    "'{who}' ist #[no_gc], alloziert aber ueber '{}' auf dem GC-Heap",
+                    "'{who}' is #[no_gc], but allocates on the GC heap via '{}'",
                     readable(name)
                 ),
-                "SPEC 3.5.4: in einem #[no_gc]-Aufrufbaum darf kein Sammellauf \
-                 ausgeloest werden"
+                "SPEC 3.5.4: no collection run may be triggered in a #[no_gc] \
+                 call tree"
                     .to_string(),
             );
             return;
@@ -300,10 +300,10 @@ impl<'a> NoGcChecker<'a> {
         if let Some(m) = crate::impls::method_name(name) {
             self.report(
                 sp,
-                format!("'{who}' ist #[no_gc], ruft aber die methode '{m}'"),
-                "SPEC 3.5.4: die zusage gilt transitiv — welche funktion hinter einem \
-                 methodenaufruf steht, entscheidet der empfaengertyp; rufe die funktion \
-                 hier direkt auf (Typ__methode) oder verzichte auf #[no_gc]"
+                format!("'{who}' is #[no_gc], but calls the method '{m}'"),
+                "SPEC 3.5.4: the promise holds transitively — which function stands behind a \
+                 method call is decided by the receiver type; call the function \
+                 directly here (Type__method) or give up #[no_gc]"
                     .to_string(),
             );
             return;
@@ -317,12 +317,12 @@ impl<'a> NoGcChecker<'a> {
                 self.report(
                     sp,
                     format!(
-                        "'{who}' ist #[no_gc], ruft aber '{}' ohne #[no_gc]",
+                        "'{who}' is #[no_gc], but calls '{}' without #[no_gc]",
                         readable(name)
                     ),
                     format!(
-                        "SPEC 3.5.4: die Zusage gilt transitiv fuer den ganzen Aufrufbaum — \
-                         schreibe #[no_gc] vor '{}' oder rufe es hier nicht auf",
+                        "SPEC 3.5.4: the promise holds transitively for the whole call tree — \
+                         write #[no_gc] before '{}' or do not call it here",
                         readable(name)
                     ),
                 );
@@ -443,7 +443,7 @@ mod tests {
         let findings = collect_findings(&prog, &vec![Type::I32; n as usize], test_rules());
         assert_eq!(findings.len(), 1, "{:?}", findings);
         assert_eq!((findings[0].0.line, findings[0].0.col), (7, 12));
-        assert!(findings[0].1.contains("alloziert"), "{}", findings[0].1);
+        assert!(findings[0].1.contains("allocates"), "{}", findings[0].1);
     }
 
     #[test]
@@ -461,18 +461,18 @@ mod tests {
         let findings = collect_findings(&prog, &vec![Type::I32; n as usize], test_rules());
         assert_eq!(findings.len(), 1, "{:?}", findings);
         assert_eq!((findings[0].0.line, findings[0].0.col), (9, 5));
-        assert!(findings[0].1.contains("ohne #[no_gc]"), "{}", findings[0].1);
+        assert!(findings[0].1.contains("without #[no_gc]"), "{}", findings[0].1);
     }
 
     #[test]
     fn regel2_marked_call_is_allowed() {
         let mut b = Build::new();
-        let call = b.call("auch_heiss", span(9, 5));
+        let call = b.call("also_hot", span(9, 5));
         let n = b.next;
         let prog = program(
             vec![
                 fndecl("hot", true, vec![Stmt::Expr(call)]),
-                fndecl("auch_heiss", true, Vec::new()),
+                fndecl("also_hot", true, Vec::new()),
             ],
             n,
         );
@@ -483,8 +483,8 @@ mod tests {
     fn regel3_write_in_gc_field_is_forbidden() {
         let mut b = Build::new();
         let base = b.ident("node", span(4, 5));
-        let target = b.field(base, "elternteil", span(4, 12));
-        let value = b.ident("anderer", span(4, 26));
+        let target = b.field(base, "parent", span(4, 12));
+        let value = b.ident("other", span(4, 26));
         let n = b.next;
         let target_id = target.id as usize;
         let stmt = Stmt::Assign { target: target, value: value, span: span(4, 5) };
@@ -494,7 +494,7 @@ mod tests {
         let findings = collect_findings(&prog, &types, test_rules());
         assert_eq!(findings.len(), 1, "{:?}", findings);
         assert_eq!((findings[0].0.line, findings[0].0.col), (4, 12));
-        assert!(findings[0].1.contains("GC-Feld 'elternteil'"), "{}", findings[0].1);
+        assert!(findings[0].1.contains("GC field 'parent'"), "{}", findings[0].1);
     }
 
     #[test]
@@ -525,7 +525,7 @@ mod tests {
         let mut b = Build::new();
         let m = b.call("__match#0", span(3, 3));
         let t = b.call("__try#", span(4, 3));
-        let c = b.call("Farbe::Rot", span(5, 3));
+        let c = b.call("Color::Red", span(5, 3));
         let u = b.call("does_not_exist", span(6, 3));
         let n = b.next;
         let prog = program(
@@ -542,18 +542,18 @@ mod tests {
     #[test]
     fn module_name_becomes_readable_reported() {
         let mut b = Build::new();
-        let call = b.call("helfer__quadrat", span(11, 12));
+        let call = b.call("helper__square", span(11, 12));
         let n = b.next;
         let prog = program(
             vec![
                 fndecl("hot", true, vec![Stmt::Expr(call)]),
-                fndecl("helfer__quadrat", false, Vec::new()),
+                fndecl("helper__square", false, Vec::new()),
             ],
             n,
         );
         let findings = collect_findings(&prog, &vec![Type::I32; n as usize], test_rules());
         assert_eq!(findings.len(), 1, "{:?}", findings);
-        assert!(findings[0].1.contains("'helfer.quadrat'"), "{}", findings[0].1);
+        assert!(findings[0].1.contains("'helper.square'"), "{}", findings[0].1);
     }
 
     #[test]

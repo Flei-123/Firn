@@ -65,11 +65,11 @@ pub(crate) fn hook_call(
         ck.dg.error_note(
             espan,
             format!(
-                "'{}' erwartet genau zwei argumente (zeiger, summand), gefunden {}",
+                "'{}' expects exactly two arguments (pointer, addend), found {}",
                 ADD,
                 args.len()
             ),
-            "die form ist __atomar_addieren(p: *mut u64, delta: u64) -> u64",
+            "the form is __atomic_add(p: *mut u64, delta: u64) -> u64",
         );
         return Some(Type::Error);
     }
@@ -79,11 +79,11 @@ pub(crate) fn hook_call(
         ck.dg.error_note(
             args[0].span,
             format!(
-                "'{}' erwartet als erstes argument einen *mut u64, gefunden {}",
+                "'{}' expects a *mut u64 as first argument, found {}",
                 ADD,
                 ck.tcx.name_of(&pt)
             ),
-            "atomar geaendert wird genau ein 64-bit-wort",
+            "exactly one 64-bit word is changed atomically",
         );
         return Some(Type::Error);
     }
@@ -91,7 +91,7 @@ pub(crate) fn hook_call(
         ck.dg.error(
             args[1].span,
             format!(
-                "'{}' erwartet als zweites argument einen u64, gefunden {}",
+                "'{}' expects a u64 as second argument, found {}",
                 ADD,
                 ck.tcx.name_of(&dt)
             ),
@@ -119,7 +119,7 @@ fn fits_as_u64(t: &Type) -> bool {
 pub(crate) fn lower_atomic_call(lo: &mut Lower, name: &str, args: &[Expr], span: Span) -> Option<Option<Val>> {
     let _ = name;
     if args.len() != 2 {
-        return lo.ice(span, "atomar-primitiv mit falscher stellenzahl");
+        return lo.ice(span, "atomic primitive with wrong arity");
     }
     let p = lo.lower_expr(&args[0])?;
     let d = lo.lower_expr(&args[1])?;

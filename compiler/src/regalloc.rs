@@ -736,7 +736,7 @@ pub fn allocate(f: &Func) -> Alloc {
         //
         // Mit `<=` wurde ein Intervall, das bei p endet, freigegeben, sobald
         // das naechste bei p BEGINNT. Bei klassischem linearem Scan ist das
-        // erlaubt, weil dort „Ende" die letzte VERWENDUNG und „Anfang" die
+        // erlaubt, weil dort „Ende" the last USE and "start" die
         // DEFINITION derselben Instruktion ist (erst lesen, dann schreiben).
         // Hier stimmt diese Annahme nicht: die Intervallgrenzen kommen auch
         // aus `live_in`/`live_out` an BLOCKGRENZEN. Ein Wert, der von einem
@@ -1786,7 +1786,7 @@ fn supported(f: &Func) -> bool {
     let basic = unsupported_basic(f);
     if let Some(g) = basic {
         if std::env::var_os("FIRN_RA_WARN").is_some() {
-            eprintln!("RA-Grundpfad: {} — {}", f.name, g);
+            eprintln!("RA base path: {} — {}", f.name, g);
         }
         return false;
     }
@@ -1801,7 +1801,7 @@ fn unsupported_basic(f: &Func) -> Option<String> {
         return Some("#[interrupt]".into());
     }
     if debug_lines_active(f) {
-        return Some("Debugzeilen aktiv".into());
+        return Some("debug lines active".into());
     }
     // GLEITKOMMA: dieser Zuteiler kennt nur die Ganzzahlregister. `f64` lebt
     // in den SSE-Registern und braucht eine zweite Registerklasse mit eigenen
@@ -1809,24 +1809,24 @@ fn unsupported_basic(f: &Func) -> Option<String> {
     // Grundpfad in `codegen_x86.rs` — korrekt, aber ohne Registerzuteilung.
     // Ehrlich benannt in SPEC §14.1.f64.
     if f.val_types.iter().any(|t| *t == FTy::F64) {
-        return Some("f64 im Wertesatz".into());
+        return Some("f64 in the value set".into());
     }
     if f.blocks.is_empty() {
-        return Some("keine Bloecke".into());
+        return Some("no blocks".into());
     }
     if let Some((i, b)) = f.blocks.iter().enumerate().find(|(i, b)| b.id as usize != *i) {
-        return Some(format!("Blocknummern nicht fortlaufend (Index {}, id {})", i, b.id));
+        return Some(format!("block numbers not consecutive (index {}, id {})", i, b.id));
     }
     for b in &f.blocks {
         if matches!(b.term, Term::Unset) {
-            return Some(format!("Block {} ohne Abschluss", b.id));
+            return Some(format!("block {} without terminator", b.id));
         }
         for i in &b.insts {
             match &i.op {
                 Op::Call { .. } | Op::CallIndirect { .. } | Op::VtabAddr { .. } => {}
                 Op::Syscall { args } => {
                     if args.is_empty() || args.len() > 7 {
-                        return Some(format!("syscall mit {} Argumenten", args.len()));
+                        return Some(format!("syscall with {} arguments", args.len()));
                     }
                 }
                 // RUNDE 52: Inline-Assembler und MMIO gehen ueber den
@@ -1838,7 +1838,7 @@ fn unsupported_basic(f: &Func) -> Option<String> {
                 // aber nachweislich richtig. Ehrlich benannt in docs/RUNDE52.md.
                 Op::Asm { .. } => return Some("Inline-Assembler".into()),
                 Op::MmioLoad { .. } | Op::MmioStore { .. } => {
-                    return Some("MMIO-Zugriff".into())
+                    return Some("MMIO access".into())
                 }
                 _ => {}
             }
@@ -2099,7 +2099,7 @@ fn emit_block(e: &mut Emitter, ra: &Ra, b: &Block, next: Option<BlockId>) -> Res
             // Sicherheit wird genau das hier geprueft.
             let (v, vty) = (*val, *ty);
             if matches!(ra.a.place(v), Loc::Reg("rax")) {
-                return Err("interner Fehler: switch-Wert liegt in rax".to_string());
+                return Err("internal error: switch value is in rax".to_string());
             }
             crate::codegen_switch::emit_switch(
                 e,
@@ -2113,13 +2113,13 @@ fn emit_block(e: &mut Emitter, ra: &Ra, b: &Block, next: Option<BlockId>) -> Res
         Term::BrCond { cond, then_bb, else_bb } => {
             if f.constant_time && f.is_secret(*cond) {
                 return Err(format!(
-                    "#[constant_time]: bedingter Sprung in '{}' haengt von einem secret-Wert (%{}) ab",
+                    "#[constant_time]: conditional jump in '{}' depends on a secret value (%{})",
                     f.name, cond
                 ));
             }
             if f.val_ty(*cond) != FTy::Bool {
                 return Err(format!(
-                    "interner Fehler: Bedingung %{} in '{}' ist {}, erwartet bool",
+                    "internal error: condition %{} in '{}' is {}, expected bool",
                     cond,
                     f.name,
                     f.val_ty(*cond).name()
@@ -2155,7 +2155,7 @@ fn emit_block(e: &mut Emitter, ra: &Ra, b: &Block, next: Option<BlockId>) -> Res
         }
         Term::Unset => {
             return Err(format!(
-                "interner Fehler: Block bb{} in '{}' hat keinen Terminator",
+                "internal error: block bb{} in '{}' has no terminator",
                 b.id, f.name
             ))
         }
@@ -2167,14 +2167,14 @@ fn emit_block(e: &mut Emitter, ra: &Ra, b: &Block, next: Option<BlockId>) -> Res
 /// des Blocks setzt die Flags, der Terminator liest sie unmittelbar.
 fn emit_cmp_br(e: &mut Emitter, ra: &Ra, b: &Block, next: Option<BlockId>) -> Result<(), String> {
     let f = ra.f;
-    let last = b.insts.last().ok_or("interner Fehler: leerer Block bei cmp+jcc")?;
+    let last = b.insts.last().ok_or("internal error: empty block at cmp+jcc")?;
     let (op, oty, a, bb) = match &last.op {
         Op::Cmp { op, ty, a, b } => (*op, *ty, *a, *b),
-        _ => return Err("interner Fehler: cmp+jcc ohne Vergleich".to_string()),
+        _ => return Err("internal error: cmp+jcc without comparison".to_string()),
     };
     let (then_bb, else_bb) = match &b.term {
         Term::BrCond { then_bb, else_bb, .. } => (*then_bb, *else_bb),
-        _ => return Err("interner Fehler: cmp+jcc ohne brcond".to_string()),
+        _ => return Err("internal error: cmp+jcc without brcond".to_string()),
     };
     let bits = oty.bits().max(8);
     let oa = ra.opnd_w(a, bits);
@@ -2221,7 +2221,7 @@ fn jcc_inverse(jcc: &str) -> &'static str {
         "jg" => "jle",
         "jbe" => "ja",
         "ja" => "jbe",
-        _ => unreachable!("unbekannter Sprung {}", jcc),
+        _ => unreachable!("unknown jump {}", jcc),
     }
 }
 
@@ -2229,7 +2229,7 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
     let ty = i.ty;
     match &i.op {
         Op::Const(c) => {
-            let d = i.dst.ok_or("interner Fehler: const ohne Ziel")?;
+            let d = i.dst.ok_or("internal error: const without target")?;
             if ra.a.imm(d).is_some() {
                 return Ok(()); // steht an jeder Verwendungsstelle als Sofortwert
             }
@@ -2253,7 +2253,7 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
             }
         }
         Op::Bin(op, x, y) => {
-            let d = i.dst.ok_or("interner Fehler: Binaeroperation ohne Ziel")?;
+            let d = i.dst.ok_or("internal error: binary operation without target")?;
             // Runde 51: Adressrechnung, die im folgenden Speicherzugriff steht
             // (`add` als Adressbildung, `shl`/`mul` als Skalierung des Index).
             if let Some(src) = ra.preloader.get(&d).copied() {
@@ -2269,7 +2269,7 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
             emit_bin(e, ra, *op, ty, *x, *y, d)?;
         }
         Op::Cmp { op, ty: oty, a, b } => {
-            let d = i.dst.ok_or("interner Fehler: Vergleich ohne Ziel")?;
+            let d = i.dst.ok_or("internal error: comparison without target")?;
             let bits = oty.bits().max(8);
             let oa = ra.opnd_w(*a, bits);
             let ob = ra.opnd_w(*b, bits);
@@ -2306,7 +2306,7 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
             }
         }
         Op::Un(op, x) => {
-            let d = i.dst.ok_or("interner Fehler: Unaeroperation ohne Ziel")?;
+            let d = i.dst.ok_or("internal error: unary operation without target")?;
             let bits = if ty.bits() > 32 { 64 } else { 32 };
             ra.load_full(e, "rax", *x);
             match op {
@@ -2322,7 +2322,7 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
             ra.store_dst(e, d, "rax");
         }
         Op::Cast { src, from } => {
-            let d = i.dst.ok_or("interner Fehler: Umwandlung ohne Ziel")?;
+            let d = i.dst.ok_or("internal error: conversion without target")?;
             if ty == FTy::Bool {
                 let bits = from.bits().max(8);
                 let o = ra.opnd_w(*src, bits);
@@ -2335,12 +2335,12 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
             ra.store_dst(e, d, "rax");
         }
         Op::GcAddr { regs } => {
-            let d = i.dst.ok_or("interner Fehler: gc_state ohne Ziel")?;
+            let d = i.dst.ok_or("internal error: gc_state without target")?;
             crate::codegen_x86::emit_gc_addr(e, *regs);
             ra.store_dst(e, d, "rax");
         }
         Op::Alloca { .. } => {
-            let d = i.dst.ok_or("interner Fehler: alloca ohne Ziel")?;
+            let d = i.dst.ok_or("internal error: alloca without target")?;
             if ra.a.cell(d).is_some() || ra.a.frame_addr.contains_key(&d) {
                 return Ok(()); // befoerderte bzw. direkt adressierte Zelle
             }
@@ -2351,12 +2351,12 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
                 .get(d as usize)
                 .copied()
                 .flatten()
-                .ok_or("interner Fehler: alloca ohne Platz")?;
+                .ok_or("internal error: alloca without space")?;
             e.line(&format!("lea rax, [rbp-{}]", off));
             ra.store_dst(e, d, "rax");
         }
         Op::Load { addr } => {
-            let d = i.dst.ok_or("interner Fehler: load ohne Ziel")?;
+            let d = i.dst.ok_or("internal error: load without target")?;
             if ra.a.alias.contains_key(&d) {
                 // Zellen-Alias: der Wert steht bereits im Zellenregister,
                 // die einzige Verwendung liest ihn ueber ort() direkt.
@@ -2443,7 +2443,7 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
             }
         }
         Op::PtrAdd { base, off } => {
-            let d = i.dst.ok_or("interner Fehler: ptradd ohne Ziel")?;
+            let d = i.dst.ok_or("internal error: ptradd without target")?;
             if let Some(src) = ra.preloader.get(&d).copied() {
                 if let Loc::Reg(r) = ra.a.loc(d) {
                     ra.load_full(e, r, src);
@@ -2601,7 +2601,7 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
             }
         }
         Op::VtabAddr { table } => {
-            let d = i.dst.ok_or("interner Fehler: vtab ohne Ziel")?;
+            let d = i.dst.ok_or("internal error: vtab without target")?;
             e.line(&format!(
                 "lea rax, [rip + {}]",
                 crate::iface::table_label(table)
@@ -2611,7 +2611,7 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
         Op::Syscall { args } => {
             const SYS_REGS: [&str; 6] = ["rdi", "rsi", "rdx", "r10", "r8", "r9"];
             if args.is_empty() {
-                return Err("interner Fehler: syscall ohne Nummer".to_string());
+                return Err("internal error: syscall without number".to_string());
             }
             // Gleiche Fehlerklasse wie beim Aufruf: `r10`, `r8` und `r9`
             // sind zugleich Arbeitsregister der Zuteilung.
@@ -2637,7 +2637,7 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
         }
         Op::Select { cond, a, b } => {
             // SPEC §9.2: immer `cmov`, niemals ein Sprung.
-            let d = i.dst.ok_or("interner Fehler: select ohne Ziel")?;
+            let d = i.dst.ok_or("internal error: select without target")?;
             ra.load_full(e, "rdx", *cond);
             ra.load_full(e, "rax", *b);
             ra.load_full(e, "rcx", *a);
@@ -2646,9 +2646,9 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
             ra.store_dst(e, d, "rax");
         }
         Op::Barrier { val } => {
-            let d = i.dst.ok_or("interner Fehler: barrier ohne Ziel")?;
+            let d = i.dst.ok_or("internal error: barrier without target")?;
             ra.load_full(e, "rax", *val);
-            e.raw("    # barrier: undurchsichtig fuer jeden Optimierungsdurchgang");
+            e.raw("    # barrier: opaque to every optimization pass");
             ra.store_dst(e, d, "rax");
         }
         Op::SecureZero { addr, size } => {
@@ -2663,7 +2663,7 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
         // Systemaufrufregister und ist oben als aufrufaehnlich eingetragen,
         // damit kein Intervall in einem caller-saved Register darueber lebt.
         Op::AtomicCas { addr, erw, new } => {
-            let d = i.dst.ok_or("interner Fehler: atomcas ohne Ziel")?;
+            let d = i.dst.ok_or("internal error: atomcas without target")?;
             ra.load_full(e, "rcx", *addr);
             ra.load_full(e, "rdx", *new);
             ra.load_full(e, "rax", *erw);
@@ -2671,7 +2671,7 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
             ra.store_dst(e, d, "rax");
         }
         Op::ThreadSpawn { arg, stack, ctid } => {
-            let d = i.dst.ok_or("interner Fehler: spawn ohne Ziel")?;
+            let d = i.dst.ok_or("internal error: spawn without target")?;
             ra.load_full(e, "rdi", *arg);
             ra.load_full(e, "rsi", *stack);
             ra.load_full(e, "rdx", *ctid);
@@ -2679,7 +2679,7 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
             ra.store_dst(e, d, "rax");
         }
         Op::ThreadSelf => {
-            let d = i.dst.ok_or("interner Fehler: threadself ohne Ziel")?;
+            let d = i.dst.ok_or("internal error: threadself without target")?;
             crate::thread::self_sequence(e);
             ra.store_dst(e, d, "rax");
         }
@@ -2688,7 +2688,7 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
             // nie Heimat eines Wertes (weder CALLEE_SAVED noch TEMP_REGS noch
             // ARG_SPARE/DIV_SPARE), deshalb braucht diese Instruktion keinen
             // Eintrag in memop_pos/divsel_pos.
-            let d = i.dst.ok_or("interner Fehler: atomadd ohne Ziel")?;
+            let d = i.dst.ok_or("internal error: atomadd without target")?;
             ra.load_full(e, "rcx", *addr);
             ra.load_full(e, "rax", *val);
             e.line("lock xadd qword ptr [rcx], rax");
@@ -2706,7 +2706,7 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
         // als stiller Zweig, damit ein spaeteres Lockern auffliegt.
         Op::Asm { .. } | Op::MmioLoad { .. } | Op::MmioStore { .. } => {
             return Err(
-                "interner Fehler: Inline-Assembler/MMIO im registerzuteilenden Pfad".to_string(),
+                "internal error: inline assembler/MMIO in the register-allocating path".to_string(),
             )
         }
     }
@@ -2816,7 +2816,7 @@ fn emit_bin(
         BinOp::Add | BinOp::Sub if lea_possible(ra, op, ty, a, b, d) => {
             let dr = match ra.a.loc(d) {
                 Loc::Reg(r) => r,
-                Loc::Slot(_) => unreachable!("lea_moeglich verlangt ein Zielregister"),
+                Loc::Slot(_) => unreachable!("lea_possible requires a target register"),
             };
             let reg_of = |v: Val| match (ra.a.imm(v), ra.a.place(v)) {
                 (None, Loc::Reg(r)) => Some(r),
@@ -2827,11 +2827,11 @@ fn emit_bin(
                     (Some(x), Some(y), _, _) => e.line(&format!("lea {}, [{}+{}]", dr, x, y)),
                     (Some(x), None, _, Some(k)) => lea_sum(e, dr, x, k),
                     (None, Some(y), Some(k), _) => lea_sum(e, dr, y, k),
-                    _ => unreachable!("lea_moeglich hat den Fall zugesichert"),
+                    _ => unreachable!("lea_possible has guaranteed the case"),
                 },
                 _ => match (reg_of(a), ra.a.imm(b)) {
                     (Some(x), Some(k)) => lea_sum(e, dr, x, -k),
-                    _ => unreachable!("lea_moeglich hat den Fall zugesichert"),
+                    _ => unreachable!("lea_possible has guaranteed the case"),
                 },
             }
         }
@@ -2844,14 +2844,14 @@ fn emit_bin(
         BinOp::Add if wide && matches!(ra.a.loc(d), Loc::Reg(_)) && add_over_rax(ra, a, b) => {
             let dr = match ra.a.loc(d) {
                 Loc::Reg(r) => r,
-                Loc::Slot(_) => unreachable!("durch die Bedingung ausgeschlossen"),
+                Loc::Slot(_) => unreachable!("excluded by the condition"),
             };
             let is_reg = |v: Val| ra.a.imm(v).is_none() && matches!(ra.a.place(v), Loc::Reg(_));
             // `+` ist kommutativ: der Registeroperand wird zum Indexteil.
             let (out_frame, im_reg) = if is_reg(b) { (a, b) } else { (b, a) };
             let y = match ra.a.place(im_reg) {
                 Loc::Reg(r) => r,
-                Loc::Slot(_) => unreachable!("add_ueber_rax hat ein Register zugesichert"),
+                Loc::Slot(_) => unreachable!("add_via_rax has reserved a register"),
             };
             ra.load_full(e, "rax", out_frame);
             e.line(&format!("lea {}, [rax+{}]", dr, y));
@@ -2971,9 +2971,9 @@ mod tests {
     fn loop_counter_lands_im_register() {
         let f = loop_func();
         let a = allocate(&f);
-        assert!(!a.cells.is_empty(), "die alloca-Zelle muss befoerdert werden");
+        assert!(!a.cells.is_empty(), "the alloca cell must be promoted");
         let regs = a.locs.iter().filter(|l| matches!(l, Loc::Reg(_))).count() + a.cells.len();
-        assert!(regs >= 3, "zu wenige Register vergeben: {}", regs);
+        assert!(regs >= 3, "too few registers assigned: {}", regs);
     }
 
     #[test]
@@ -2982,7 +2982,7 @@ mod tests {
         // im Rumpf (bb2) darf kein [rbp- mehr vorkommen
         let body = asm.split(".Lmain__bb2:").nth(1).unwrap_or("");
         let body = body.split(".Lmain__bb3:").next().unwrap_or("");
-        assert!(!body.contains("[rbp-"), "Schleifenrumpf greift noch auf den Stack zu:\n{}", body);
+        assert!(!body.contains("[rbp-"), "loop body still accesses the stack:\n{}", body);
     }
 
     #[test]
@@ -3010,7 +3010,7 @@ mod tests {
         let l = f.push(0, FTy::I32, Op::Load { addr: slot });
         f.set_term(0, Term::Ret(Some(l)));
         let a = allocate(&f);
-        assert!(a.cells.is_empty(), "Adresse entkommt ueber ptradd");
+        assert!(a.cells.is_empty(), "address escapes via ptradd");
     }
 
     #[test]
@@ -3047,7 +3047,7 @@ mod tests {
         f.set_term(0, Term::Ret(Some(6)));
         assert!(supported(&f));
         let mut e = Emitter { out: String::new() };
-        emit_func_ra(&mut e, &f).expect("Registerpfad zustaendig").expect("codegen");
+        emit_func_ra(&mut e, &f).expect("register path responsible").expect("codegen");
         assert!(e.out.contains("qword ptr [rbp+16]"), "{}", e.out);
     }
 
@@ -3065,7 +3065,7 @@ mod tests {
         g.set_term(0, Term::Ret(Some(rc)));
         assert!(supported(&g));
         let mut e = Emitter { out: String::new() };
-        emit_func_ra(&mut e, &g).expect("Registerpfad zustaendig").expect("codegen");
+        emit_func_ra(&mut e, &g).expect("register path responsible").expect("codegen");
         assert!(e.out.contains("sub rsp, 16"), "{}", e.out);
         assert!(e.out.contains("mov qword ptr [rsp+0], rax"), "{}", e.out);
         assert!(e.out.contains("mov qword ptr [rsp+8], rax"), "{}", e.out);
@@ -3087,11 +3087,11 @@ mod tests {
         let body = asm.split("main:").nth(1).unwrap();
         assert!(
             body.lines().any(|l| l.contains("dword ptr [") && l.contains("*4]")),
-            "kein skalierter Speicheroperand:\n{}",
+            "no scaled memory operand:\n{}",
             asm
         );
-        assert!(!body.contains("shl "), "Skalierung blieb stehen:\n{}", asm);
-        assert!(!body.contains("lea "), "Adressrechnung blieb stehen:\n{}", asm);
+        assert!(!body.contains("shl "), "scaling remained:\n{}", asm);
+        assert!(!body.contains("lea "), "address computation remained:\n{}", asm);
     }
 
     /// Wird dieselbe Adresse ZWEIMAL gelesen, darf sie nicht in den
@@ -3109,7 +3109,7 @@ mod tests {
         let body = asm.split("main:").nth(1).unwrap();
         assert!(
             body.contains("lea ") || body.lines().filter(|l| l.contains("add ")).count() > 0,
-            "Adresse muesste einmal ausgerechnet werden:\n{}",
+            "address should be computed once:\n{}",
             asm
         );
     }
@@ -3137,7 +3137,7 @@ mod tests {
         });
         assert!(
             narrow_addition || body.contains("lea "),
-            "32-Bit-Addition muss eine eigene Instruktion bleiben:\n{}",
+            "32-bit addition must remain its own instruction:\n{}",
             asm
         );
     }
@@ -3160,12 +3160,12 @@ mod tests {
         f.set_term(0, Term::Switch { val: 0, ty: FTy::U32, cases, default: bd });
         let asm = emit(&Module { funcs: vec![f] }).expect("codegen");
         assert!(asm.contains("jmp qword ptr [rdx + rax*8]"), "{}", asm);
-        assert!(!asm.contains("mov eax, eax"), "ueberfluessige Nullerweiterung:\n{}", asm);
+        assert!(!asm.contains("mov eax, eax"), "superfluous zero extension:\n{}", asm);
         let body = asm.split("main:").nth(1).unwrap();
         // Der Wert wird nicht erst in sein Rahmenfach geschrieben.
         assert!(
             !body.lines().any(|l| l.trim().starts_with("mov qword ptr [rbp-") && l.contains(", rax")),
-            "switch-Wert ging ueber den Rahmen:\n{}",
+            "switch value went out of range:\n{}",
             asm
         );
     }
@@ -3183,7 +3183,7 @@ mod tests {
                 if let Some(n) = lines.get(i + 1) {
                     assert!(
                         !n.starts_with("jmp "),
-                        "unbedingter Sprung hinter bedingtem:\n{}",
+                        "unconditional jump after conditional:\n{}",
                         asm
                     );
                 }

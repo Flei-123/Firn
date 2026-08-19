@@ -92,7 +92,7 @@ impl<'a> Lower<'a> {
     pub(crate) fn ice<T>(&mut self, span: Span, what: &str) -> Option<T> {
         self.dg.error(
             span,
-            format!("interner fehler beim uebersetzen nach FIR: {}", what),
+            format!("internal error while lowering to FIR: {}", what),
         );
         None
     }
@@ -107,7 +107,7 @@ impl<'a> Lower<'a> {
         let t = self.ty_of(e);
         match scalar_fty(&t) {
             Some(f) => Some(f),
-            None => self.ice(e.span, "ausdruck hat keinen skalaren typ"),
+            None => self.ice(e.span, "expression has no scalar type"),
         }
     }
 
@@ -254,7 +254,7 @@ impl<'a> Lower<'a> {
 
     pub(crate) fn lower_addr(&mut self, e: &Expr) -> Option<Val> {
         if self.depth > MAX_DEPTH {
-            return self.err(e.span, "ausdruck zu tief verschachtelt");
+            return self.err(e.span, "expression nested too deeply");
         }
         self.depth += 1;
         let r = self.lower_addr_inner(e);
@@ -272,9 +272,9 @@ impl<'a> Lower<'a> {
                 Some(slot) => Some(slot),
                 None => {
                     if self.info.consts.contains_key(name) {
-                        self.err(e.span, "eine konstante hat keine adresse")
+                        self.err(e.span, "a constant has no address")
                     } else {
-                        self.ice(e.span, "unbekannter name im lowering")
+                        self.ice(e.span, "unknown name in lowering")
                     }
                 }
             },
@@ -286,9 +286,9 @@ impl<'a> Lower<'a> {
                     // `p.f` auf einem Zeiger auf Struct: automatisch dereferenzieren
                     Type::Ptr { inner, .. } => match **inner {
                         Type::Struct(i) => (i, self.lower_expr(base)?),
-                        _ => return self.ice(*fspan, "feldzugriff auf nicht-struct"),
+                        _ => return self.ice(*fspan, "field access on a non-struct"),
                     },
-                    _ => return self.ice(*fspan, "feldzugriff auf nicht-struct"),
+                    _ => return self.ice(*fspan, "field access on a non-struct"),
                 };
                 // Schicht Feldzugriff <-> Speicherort (layout.rs, DESIGNZIELE 8)
                 self.field_addr(baddr, sidx, fname, *fspan)
@@ -298,7 +298,7 @@ impl<'a> Lower<'a> {
                 let (elem, baddr) = match &bt {
                     Type::Array(el, _) => ((**el).clone(), self.lower_addr(base)?),
                     Type::Ptr { inner, .. } => ((**inner).clone(), self.lower_expr(base)?),
-                    _ => return self.ice(e.span, "index auf nicht-indizierbarem typ"),
+                    _ => return self.ice(e.span, "index on a non-indexable type"),
                 };
                 let esz = self.info.tcx.size_of(&elem).max(1);
                 let iv = self.lower_expr(idx)?;
@@ -331,7 +331,7 @@ impl<'a> Lower<'a> {
             ExprKind::Call(name, args, span) => {
                 let t = self.ty_of(e);
                 if !is_agg(&t) {
-                    return self.err(e.span, "dieser ausdruck hat keine adresse");
+                    return self.err(e.span, "this expression has no address");
                 }
                 let (size, align) = self.size_align(&t);
                 let slot = self.alloca(size, align);
@@ -341,7 +341,7 @@ impl<'a> Lower<'a> {
                 self.lower_call(&name, &args, Some(slot), span)?;
                 Some(slot)
             }
-            _ => self.err(e.span, "dieser ausdruck hat keine adresse"),
+            _ => self.err(e.span, "this expression has no address"),
         }
     }
 
@@ -349,7 +349,7 @@ impl<'a> Lower<'a> {
     /// Literal: feld-/elementweise, sonstiges Aggregat: `copymem`).
     pub(crate) fn write_into(&mut self, addr: Val, e: &Expr) -> Option<()> {
         if self.depth > MAX_DEPTH {
-            return self.err(e.span, "ausdruck zu tief verschachtelt");
+            return self.err(e.span, "expression nested too deeply");
         }
         self.depth += 1;
         let r = self.write_into_inner(addr, e);
@@ -367,7 +367,7 @@ impl<'a> Lower<'a> {
             ExprKind::StructLit(_, fields, span) => {
                 let sidx = match t {
                     Type::Struct(i) => i,
-                    _ => return self.ice(*span, "struct-literal ohne struct-typ"),
+                    _ => return self.ice(*span, "struct literal without struct type"),
                 };
                 for (fname, fexpr, fspan) in fields {
                     // Schicht Feldzugriff <-> Speicherort (layout.rs, DESIGNZIELE 8)
@@ -379,7 +379,7 @@ impl<'a> Lower<'a> {
             ExprKind::ArrayLit(elems) => {
                 let et = match &t {
                     Type::Array(el, _) => (**el).clone(),
-                    _ => return self.ice(e.span, "array-literal ohne array-typ"),
+                    _ => return self.ice(e.span, "array literal without array type"),
                 };
                 let esz = self.info.tcx.size_of(&et).max(1);
                 for (i, el) in elems.iter().enumerate() {
@@ -391,7 +391,7 @@ impl<'a> Lower<'a> {
             ExprKind::ArrayRepeat(val, _) => {
                 let (et, n) = match &t {
                     Type::Array(el, n) => ((**el).clone(), *n),
-                    _ => return self.ice(e.span, "wiederholungsliteral ohne array-typ"),
+                    _ => return self.ice(e.span, "repetition literal without array type"),
                 };
                 self.lower_repeat(addr, val, &et, n)
             }
@@ -432,7 +432,7 @@ impl<'a> Lower<'a> {
 
     pub(crate) fn lower_expr(&mut self, e: &Expr) -> Option<Val> {
         if self.depth > MAX_DEPTH {
-            return self.err(e.span, "ausdruck zu tief verschachtelt");
+            return self.err(e.span, "expression nested too deeply");
         }
         self.depth += 1;
         let r = self.lower_expr_inner(e);
@@ -447,7 +447,7 @@ impl<'a> Lower<'a> {
         }
         let t = self.ty_of(e);
         if is_agg(&t) {
-            return self.ice(e.span, "aggregat als wert (nur adressen erlaubt)");
+            return self.ice(e.span, "aggregate as value (only addresses allowed)");
         }
         match &e.kind {
             ExprKind::Int(v) => {
@@ -465,11 +465,11 @@ impl<'a> Lower<'a> {
                 } else if let Some((ct, cv)) = self.info.consts.get(name).cloned() {
                     let ft = match scalar_fty(&ct) {
                         Some(f) => f,
-                        None => return self.ice(e.span, "konstante mit nicht-skalarem typ"),
+                        None => return self.ice(e.span, "constant with a non-scalar type"),
                     };
                     Some(self.constant(ft, cv))
                 } else {
-                    self.ice(e.span, "unbekannter name im lowering")
+                    self.ice(e.span, "unknown name in lowering")
                 }
             }
             ExprKind::Unary(op, inner) => self.lower_unary(e, *op, inner),
@@ -481,19 +481,19 @@ impl<'a> Lower<'a> {
             }
             // HOOK types: Aufzaehlungswerte sind Aggregate, kein Aufruf (lower_match.rs)
             ExprKind::Call(name, _, span) if crate::lower_match::is_types_call(name) => {
-                self.err(*span, "ein aufzaehlungswert ist ein aggregat und kein skalarer wert")
+                self.err(*span, "an enum value is an aggregate and not a scalar value")
             }
             ExprKind::Call(name, args, span) => {
                 let ft = self.fty_of(e)?;
                 if ft == FTy::Void {
                     return self.err(
                         *span,
-                        "aufruf ohne rueckgabewert kann nicht als wert benutzt werden",
+                        "call without return value cannot be used as a value",
                     );
                 }
                 match self.lower_call(name, args, None, *span)? {
                     Some(v) => Some(v),
-                    None => self.ice(*span, "aufruf ohne wert an einer wertstelle"),
+                    None => self.ice(*span, "call without value in a value position"),
                 }
             }
             ExprKind::Syscall(args) => {
@@ -518,7 +518,7 @@ impl<'a> Lower<'a> {
                 Some(self.push(to, Op::Cast { src, from }))
             }
             ExprKind::StructLit(..) | ExprKind::ArrayLit(_) | ExprKind::ArrayRepeat(..) => {
-                self.ice(e.span, "literal eines aggregats als wert")
+                self.ice(e.span, "literal of an aggregate as a value")
             }
         }
     }
@@ -579,7 +579,7 @@ impl<'a> Lower<'a> {
             B::Xor => FBin::Xor,
             B::Shl => FBin::Shl,
             B::Shr => FBin::Shr,
-            _ => return self.ice(e.span, "unbekannter binaeroperator"),
+            _ => return self.ice(e.span, "unknown binary operator"),
         };
         let av = self.lower_expr(a)?;
         let mut bv = self.lower_expr(b)?;
@@ -677,12 +677,12 @@ impl<'a> Lower<'a> {
         if let Some(m) = crate::impls::method_name(name) {
             let et = match args.first() {
                 Some(e) => self.ty_of(e),
-                None => return self.ice(span, "methodenaufruf ohne empfaenger"),
+                None => return self.ice(span, "method call without receiver"),
             };
             if let Some(iname) = crate::impls::dyn_interface(&self.info.tcx, &et) {
                 let recv = match args.first() {
                     Some(e) => e,
-                    None => return self.ice(span, "methodenaufruf ohne empfaenger"),
+                    None => return self.ice(span, "method call without receiver"),
                 };
                 let (target, data, sig) =
                     crate::iface::lower_dispatch(self, &iname, m, recv, span)?;
@@ -696,7 +696,7 @@ impl<'a> Lower<'a> {
             Some(m) => {
                 let et = match args.first() {
                     Some(e) => self.ty_of(e),
-                    None => return self.ice(span, "methodenaufruf ohne empfaenger"),
+                    None => return self.ice(span, "method call without receiver"),
                 };
                 match crate::impls::target(&self.info, m, &et) {
                     Some((full, addr)) => {
@@ -704,7 +704,7 @@ impl<'a> Lower<'a> {
                         receiver_address = addr;
                         &resolved
                     }
-                    None => return self.ice(span, "unbekannte methode im lowering"),
+                    None => return self.ice(span, "unknown method in lowering"),
                 }
             }
         };
@@ -712,7 +712,7 @@ impl<'a> Lower<'a> {
             Some(s) => s,
             None => match self.info.fns.get(name) {
                 Some(s) => s.clone(),
-                None => return self.ice(span, "unbekannte funktion im lowering"),
+                None => return self.ice(span, "unknown function in lowering"),
             },
         };
         let ret_agg = is_agg(&sig.ret);
@@ -781,7 +781,7 @@ impl<'a> Lower<'a> {
         if ret_agg {
             let d = match target {
                 Some(d) => d,
-                None => return self.ice(span, "aggregatrueckgabe ohne ziel"),
+                None => return self.ice(span, "aggregate return without target"),
             };
             let size = self.info.tcx.size_of(&sig.ret);
             if sret {
@@ -810,7 +810,7 @@ impl<'a> Lower<'a> {
         let (sv, saddr) = if scalar {
             let ft = match scalar_fty(et) {
                 Some(f) => f,
-                None => return self.ice(val.span, "element ohne skalaren typ"),
+                None => return self.ice(val.span, "element without scalar type"),
             };
             (Some((ft, self.lower_expr(val)?)), None)
         } else {
@@ -825,7 +825,7 @@ impl<'a> Lower<'a> {
                     (None, Some(src)) => {
                         self.push_void(FTy::Void, Op::CopyMem { dst: ea, src, size: esz })
                     }
-                    _ => return self.ice(val.span, "wiederholungsliteral ohne wert"),
+                    _ => return self.ice(val.span, "repetition literal without value"),
                 }
             }
             return Some(());
@@ -852,7 +852,7 @@ impl<'a> Lower<'a> {
         match (sv, saddr) {
             (Some((ft, v)), _) => self.store(ft, ea, v),
             (None, Some(src)) => self.push_void(FTy::Void, Op::CopyMem { dst: ea, src, size: esz }),
-            _ => return self.ice(val.span, "wiederholungsliteral ohne wert"),
+            _ => return self.ice(val.span, "repetition literal without value"),
         }
         let one = self.constant(FTy::U64, 1);
         let inc = self.push(FTy::U64, Op::Bin(FBin::Add, iv2, one));
@@ -886,7 +886,7 @@ impl<'a> Lower<'a> {
 
     pub(crate) fn lower_block(&mut self, b: &ast::Block) -> Option<()> {
         if self.depth > MAX_DEPTH {
-            return self.err(b.span, "block zu tief verschachtelt");
+            return self.err(b.span, "block nested too deeply");
         }
         self.depth += 1;
         self.enter();
@@ -981,7 +981,7 @@ impl<'a> Lower<'a> {
                 }
                 let t = self.ty_of(init);
                 if matches!(t, Type::Void) {
-                    return self.err(*span, "eine variable kann keinen wert ohne typ haben");
+                    return self.err(*span, "a variable cannot have a value without a type");
                 }
                 let (size, align) = self.size_align(&t);
                 let slot = self.alloca(size, align);
@@ -1013,7 +1013,7 @@ impl<'a> Lower<'a> {
                         if self.has_errdefer() && crate::errors::union_of(&t).is_some() {
                             return self.err(
                                 *span,
-                                "'errdefer' und die weitergabe einer fertigen fehlerunion vertragen sich in stufe 0 nicht: hier steht erst zur laufzeit fest, ob der fehlerpfad genommen wird — schreibe 'return try …' oder gib den fehler mit 'return E::Variante' zurueck",
+                                "'errdefer' and passing on a finished error union do not go together in stage 0: here it is only known at run time whether the error path is taken — write 'return try …' or return the error with 'return E::Variant'",
                             );
                         }
                         // HOOK fehlerunionen: implizite Umwandlung (lower_errors.rs)
@@ -1033,7 +1033,7 @@ impl<'a> Lower<'a> {
                                     let w = self.load_words(addr, size, 1)?;
                                     match w.first() {
                                         Some(w0) => self.ret_term(Some(*w0)),
-                                        None => return self.ice(*span, "rueckgabe ohne wort"),
+                                        None => return self.ice(*span, "return without word"),
                                     }
                                 }
                             }
@@ -1057,7 +1057,7 @@ impl<'a> Lower<'a> {
                         list.push(((**inner).clone(), *only_error));
                         Some(())
                     }
-                    None => self.ice(*span, "'defer' ausserhalb eines blocks"),
+                    None => self.ice(*span, "'defer' outside a block"),
                 }
             }
             Stmt::If { cond, then, els, .. } => self.lower_if(cond, then, els.as_deref()),
@@ -1068,7 +1068,7 @@ impl<'a> Lower<'a> {
             Stmt::Break(span) => {
                 let (target, depth) = match self.loops.last() {
                     Some((brk, _, t)) => (*brk, *t),
-                    None => return self.ice(*span, "'break' ausserhalb einer schleife"),
+                    None => return self.ice(*span, "'break' outside a loop"),
                 };
                 // Erst aufraeumen, dann springen.
                 self.lower_defers_to(depth, false);
@@ -1080,7 +1080,7 @@ impl<'a> Lower<'a> {
             Stmt::Continue(span) => {
                 let (target, depth) = match self.loops.last() {
                     Some((_, cont, t)) => (*cont, *t),
-                    None => return self.ice(*span, "'continue' ausserhalb einer schleife"),
+                    None => return self.ice(*span, "'continue' outside a loop"),
                 };
                 self.lower_defers_to(depth, false);
                 self.set_term(Term::Br(target));
@@ -1184,7 +1184,7 @@ impl<'a> Lower<'a> {
         let ty = self.ty_of(start);
         let ft = match scalar_fty(&ty) {
             Some(f) if f != FTy::Void => f,
-            _ => return self.ice(start.span, "bereich von 'for' ohne ganzzahltyp"),
+            _ => return self.ice(start.span, "range of 'for' without integer type"),
         };
         let bytes = ft.bytes().max(1);
         let islot = self.alloca(bytes, bytes);
@@ -1265,7 +1265,7 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
         None => {
             dg.error(
                 d.span,
-                format!("interner fehler beim uebersetzen nach FIR: signatur von '{}' fehlt", d.name),
+                format!("internal error while lowering to FIR: signature of '{}' is missing", d.name),
             );
             return None;
         }
@@ -1297,7 +1297,7 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
         }
         match scalar_fty(p) {
             Some(FTy::Void) | None => {
-                dg.error(span, "ein parameter dieses typs ist nicht uebersetzbar");
+                dg.error(span, "a parameter of this type is not compilable");
                 return None;
             }
             Some(f) => {
@@ -1317,7 +1317,7 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
         match scalar_fty(&sig.ret) {
             Some(f) => f,
             None => {
-                dg.error(d.span, "ein rueckgabetyp dieser art ist nicht uebersetzbar");
+                dg.error(d.span, "a return type of this kind is not compilable");
                 return None;
             }
         }
@@ -1419,7 +1419,7 @@ pub fn lower(prog: &Program, info: &TypeInfo, dg: &mut Diags) -> Option<Module> 
                 dg.error(
                     Span::none(),
                     format!(
-                        "interner fehler beim uebersetzen nach FIR: block bb{} in '{}' ohne terminator",
+                        "internal error while lowering to FIR: block bb{} in '{}' without terminator",
                         b.id, f.name
                     ),
                 );
@@ -1429,7 +1429,7 @@ pub fn lower(prog: &Program, info: &TypeInfo, dg: &mut Diags) -> Option<Module> 
                 dg.error(
                     Span::none(),
                     format!(
-                        "interner fehler beim uebersetzen nach FIR: alloca ausserhalb des eintrittsblocks in '{}'",
+                        "internal error while lowering to FIR: alloca outside the entry block in '{}'",
                         f.name
                     ),
                 );
@@ -1495,7 +1495,7 @@ mod tests {
         let mut dg = Diags::new("test", "");
         let m = lower(prog, info, &mut dg);
         assert!(!dg.has_errors(), "{}", dg.render());
-        assert!(m.is_some(), "lowering lieferte kein modul");
+        assert!(m.is_some(), "lowering yielded no module");
         m.unwrap_or_default()
     }
 
@@ -1708,7 +1708,7 @@ mod tests {
                 want.push('\n');
             }
         }
-        assert!(!want.is_empty(), "kein ```firdump-Block in docs/FIR.md gefunden");
+        assert!(!want.is_empty(), "no ```firdump block found in docs/FIR.md");
         assert_eq!(want, got);
     }
 

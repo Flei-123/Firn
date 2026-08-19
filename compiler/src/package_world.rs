@@ -34,7 +34,7 @@ fn err(text: String) -> String {
 }
 
 fn error_with_note(text: String, note: String) -> String {
-    format!("error: {}\nhinweis: {}\n", text, note)
+    format!("error: {}\nnote: {}\n", text, note)
 }
 
 /// Arbeitsverzeichnis, normalisiert. Alles Interne rechnet absolut, damit
@@ -81,7 +81,7 @@ fn load(root: &str) -> Result<(Manifest, String), String> {
     let text = match std::fs::read_to_string(&mpath) {
         Ok(t) => t,
         Err(e) => {
-            return Err(err(format!("kann '{}' nicht lesen: {}", mpath, e)));
+            return Err(err(format!("cannot read '{}': {}", mpath, e)));
         }
     };
     match package::read(&text) {
@@ -112,8 +112,8 @@ impl World {
         let w = absolute(root, &c);
         if !is_file(&package::join(&w, package::MANIFEST)) {
             return Err(error_with_note(
-                format!("kein manifest in '{}'", root),
-                format!("erwartet wird die datei '{}'", package::join(root, package::MANIFEST)),
+                format!("no manifest in '{}'", root),
+                format!("the file '{}' is expected", package::join(root, package::MANIFEST)),
             ));
         }
         World::build(&w)
@@ -158,20 +158,20 @@ impl World {
                         if !is_file(&package::join(&dw, package::MANIFEST)) {
                             return Err(error_with_note(
                                 format!(
-                                    "{}:{}: abhaengigkeit '{}' hat kein manifest",
+                                    "{}:{}: dependency '{}' has no manifest",
                                     mpath, a.line, a.name
                                 ),
-                                format!("erwartet wird '{}'", package::join(&dw, package::MANIFEST)),
+                                format!("'{}' is expected", package::join(&dw, package::MANIFEST)),
                             ));
                         }
                         let (dm, dmp) = load(&dw)?;
                         if dm.name != a.name {
                             return Err(error_with_note(
                                 format!(
-                                    "{}:{}: abhaengigkeit '{}' zeigt auf paket '{}'",
+                                    "{}:{}: dependency '{}' points to package '{}'",
                                     mpath, a.line, a.name, dm.name
                                 ),
-                                format!("'{}' nennt sich selbst '{}'", dmp, dm.name),
+                                format!("'{}' names itself '{}'", dmp, dm.name),
                             ));
                         }
                         packages.push(Package {
@@ -205,8 +205,8 @@ impl World {
             }
             if let Some(z) = self.dfs(s, &mut color, &mut away) {
                 return Err(error_with_note(
-                    format!("paketzyklus: {}", z),
-                    "abhaengigkeiten muessen einen kreisfreien graphen bilden".to_string(),
+                    format!("package cycle: {}", z),
+                    "dependencies must form an acyclic graph".to_string(),
                 ));
             }
         }
@@ -274,24 +274,24 @@ impl World {
 /// `firnc0` und `firnc1` denselben Satz schreiben.
 pub fn text_not_public(module: &str, package_name: &str, manifestpfad: &str) -> String {
     error_with_note(
-        format!("modul '{}' ist in paket '{}' nicht oeffentlich", module, package_name),
-        format!("ergaenze 'public {}' in '{}'", module, manifestpfad),
+        format!("module '{}' is not public in package '{}'", module, package_name),
+        format!("add 'public {}' in '{}'", module, manifestpfad),
     )
 }
 
 /// Fehlertext „paket ist keine abhaengigkeit".
 pub fn text_no_dependency(target: &str, of: &str, manifestpfad: &str) -> String {
     error_with_note(
-        format!("paket '{}' ist keine abhaengigkeit von paket '{}'", target, of),
-        format!("ergaenze 'needs {} <pfad>' in '{}'", target, manifestpfad),
+        format!("package '{}' is not a dependency of package '{}'", target, of),
+        format!("add 'needs {} <path>' in '{}'", target, manifestpfad),
     )
 }
 
 /// Fehlertext „zwei dateien, ein modulname".
 pub fn text_name_clash(module: &str, a: &str, b: &str) -> String {
     error_with_note(
-        format!("namenskonflikt: modul '{}' kommt aus zwei dateien", module),
-        format!("'{}' und '{}'", a, b),
+        format!("name conflict: module '{}' comes from two files", module),
+        format!("'{}' and '{}'", a, b),
     )
 }
 
@@ -311,18 +311,18 @@ mod tests {
     fn error_texts_are_fixed() {
         assert_eq!(
             text_not_public("inner", "geo", "/p/geo/firn.package"),
-            "error: modul 'inner' ist in paket 'geo' nicht oeffentlich\n\
-             hinweis: ergaenze 'public inner' in '/p/geo/firn.package'\n"
+            "error: module 'inner' is not public in package 'geo'\n\
+             note: add 'public inner' in '/p/geo/firn.package'\n"
         );
         assert_eq!(
             text_no_dependency("geo", "app", "/p/app/firn.package"),
-            "error: paket 'geo' ist keine abhaengigkeit von paket 'app'\n\
-             hinweis: ergaenze 'needs geo <pfad>' in '/p/app/firn.package'\n"
+            "error: package 'geo' is not a dependency of package 'app'\n\
+             note: add 'needs geo <path>' in '/p/app/firn.package'\n"
         );
         assert_eq!(
             text_name_clash("util", "/a/util.fi", "/b/util.fi"),
-            "error: namenskonflikt: modul 'util' kommt aus zwei dateien\n\
-             hinweis: '/a/util.fi' und '/b/util.fi'\n"
+            "error: name conflict: module 'util' comes from two files\n\
+             note: '/a/util.fi' and '/b/util.fi'\n"
         );
     }
 }

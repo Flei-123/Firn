@@ -165,7 +165,7 @@ impl<'a> Parser<'a> {
         }
         if !self.recovering {
             self.error_here(format!(
-                "erwartet '{}' {}, gefunden '{}'",
+                "expected '{}' {}, found '{}'",
                 k.text(),
                 ctx,
                 self.kind().text()
@@ -183,7 +183,7 @@ impl<'a> Parser<'a> {
             return false;
         }
         self.error_here(format!(
-            "erwartet '{}' {}, gefunden '{}'",
+            "expected '{}' {}, found '{}'",
             k.text(),
             ctx,
             self.kind().text()
@@ -199,7 +199,7 @@ impl<'a> Parser<'a> {
         }
         if !self.recovering {
             self.error_here(format!(
-                "erwartet einen namen {}, gefunden '{}'",
+                "expected a name {}, found '{}'",
                 ctx,
                 self.kind().text()
             ));
@@ -249,7 +249,7 @@ impl<'a> Parser<'a> {
         }
         if !self.recovering {
             self.error_here(format!(
-                "zu tief verschachtelt (mehr als {} ebenen)",
+                "nested too deeply (more than {} levels)",
                 MAX_DEPTH
             ));
         }
@@ -310,7 +310,7 @@ impl<'a> Parser<'a> {
             TokKind::LBracket => {
                 let start = self.bump();
                 let elem = self.parse_type()?;
-                if !self.expect(TokKind::Semi, "nach dem elementtyp eines arraytyps") {
+                if !self.expect(TokKind::Semi, "after the element type of an array type") {
                     return None;
                 }
                 let len = match self.kind().clone() {
@@ -320,14 +320,14 @@ impl<'a> Parser<'a> {
                     }
                     _ => {
                         self.error_here(format!(
-                            "erwartet eine ganzzahlige arraylaenge, gefunden '{}'",
+                            "expected an integer array length, found '{}'",
                             self.kind().text()
                         ));
                         return None;
                     }
                 };
                 let end = self.span();
-                if !self.expect(TokKind::RBracket, "nach der arraylaenge") {
+                if !self.expect(TokKind::RBracket, "after the array length") {
                     return None;
                 }
                 Some(TypeExpr::Array {
@@ -340,7 +340,7 @@ impl<'a> Parser<'a> {
                 let sp = self.bump();
                 // Integration: Typkonstruktoren, die die SPEC beschreibt, die
                 // Stufe 0 aber NICHT umsetzt, melden hier einen klaren Fehler
-                // statt eines ratlosen Syntaxfehlers (SPEC §14 "Nicht enthalten").
+                // statt eines ratlosen Syntaxfehlers (SPEC §14 "not contained").
                 // HOOK gc: `Gc[C]` und `GcWeak[C]` (gc.rs)
                 if let Some(t) = crate::gc::hook_type(self, &name, sp) {
                     return Some(t);
@@ -355,7 +355,7 @@ impl<'a> Parser<'a> {
                     if let Some(basic) = not_implemented_ty(&name) {
                         self.dg.error_note(
                             sp,
-                            format!("'{}[T]' ist in Stufe 0 nicht umgesetzt", name),
+                            format!("'{}[T]' is not implemented in stage 0", name),
                             basic,
                         );
                         self.recovering = true;
@@ -375,7 +375,7 @@ impl<'a> Parser<'a> {
             }
             other => {
                 if !self.recovering {
-                    self.error_here(format!("erwartet einen typ, gefunden '{}'", other.text()));
+                    self.error_here(format!("expected a type, found '{}'", other.text()));
                 }
                 None
             }
@@ -468,7 +468,7 @@ impl<'a> Parser<'a> {
                 None => break,
             };
             self.error_here(format!(
-                "vergleiche sind nicht verkettbar, setze klammern um den ersten vergleich"
+                "comparisons are not chainable, put parentheses around the first comparison"
             ));
             self.bump();
             let rhs2 = self.add_expr();
@@ -561,7 +561,7 @@ impl<'a> Parser<'a> {
                         e = g;
                         continue;
                     }
-                    match self.ident("nach '.' beim feldzugriff") {
+                    match self.ident("after '.' in the field access") {
                         Some((name, sp)) => {
                             // HOOK impl: `x.m(args)` ist ein Methodenaufruf,
                             // kein Feldzugriff (impls.rs, Runde 45)
@@ -584,7 +584,7 @@ impl<'a> Parser<'a> {
                     let start = self.bump();
                     let idx = self.nested_expr();
                     let end = self.span();
-                    if !self.close(TokKind::RBracket, "nach dem index") {
+                    if !self.close(TokKind::RBracket, "after the index") {
                         let sp = Parser::join(e.span, start);
                         return self.mk(sp, ExprKind::Index(Box::new(e), Box::new(idx)));
                     }
@@ -597,13 +597,13 @@ impl<'a> Parser<'a> {
                         ExprKind::Ident(n) => n.clone(),
                         _ => {
                             self.error_here(
-                                "nur direkte funktionsnamen koennen aufgerufen werden (zeigeraufrufe werden in Stufe 0 nicht unterstuetzt)",
+                                "only direct function names can be called (pointer calls are not supported in stage 0)",
                             );
                             return e;
                         }
                     };
                     self.bump();
-                    let (args, end) = self.call_args("nach der argumentliste");
+                    let (args, end) = self.call_args("after the argument list");
                     let sp = Parser::join(e.span, end);
                     let _ = lp;
                     e = self.mk(sp, ExprKind::Call(name, args, e.span));
@@ -714,8 +714,8 @@ impl<'a> Parser<'a> {
                 if elems.is_empty() {
                     self.dg.error_note(
                         sp,
-                        "leeres zeichenkettenliteral".to_string(),
-                        "ein array braucht mindestens ein element; schreibe ein feld der gewuenschten laenge, z. B. '[0 as u8; 8]'",
+                        "empty string literal".to_string(),
+                        "an array needs at least one element; write an array of the desired length, e.g. '[0 as u8; 8]'",
                     );
                     return self.broken_expr(sp);
                 }
@@ -732,7 +732,7 @@ impl<'a> Parser<'a> {
             TokKind::LParen => {
                 self.bump();
                 let e = self.nested_expr();
-                self.close(TokKind::RParen, "nach dem geklammerten ausdruck");
+                self.close(TokKind::RParen, "after the parenthesized expression");
                 e
             }
             TokKind::LBracket => {
@@ -745,7 +745,7 @@ impl<'a> Parser<'a> {
                         self.bump();
                         let count = self.nested_expr();
                         let end = self.span();
-                        self.close(TokKind::RBracket, "nach der laenge des wiederholungsliterals");
+                        self.close(TokKind::RBracket, "after the length of the repetition literal");
                         let sp = Parser::join(start, end);
                         return self
                             .mk(sp, ExprKind::ArrayRepeat(Box::new(first), Box::new(count)));
@@ -754,7 +754,7 @@ impl<'a> Parser<'a> {
                     elems.push(first);
                     if done {
                         let end = self.span();
-                        self.close(TokKind::RBracket, "nach den elementen des arrayliterals");
+                        self.close(TokKind::RBracket, "after the elements of the array literal");
                         let sp = Parser::join(start, end);
                         return self.mk(sp, ExprKind::ArrayLit(elems));
                     }
@@ -777,14 +777,14 @@ impl<'a> Parser<'a> {
                     }
                 }
                 let end = self.span();
-                self.close(TokKind::RBracket, "nach den elementen des arrayliterals");
+                self.close(TokKind::RBracket, "after the elements of the array literal");
                 let sp = Parser::join(start, end);
                 self.mk(sp, ExprKind::ArrayLit(elems))
             }
             TokKind::KwSyscall => {
                 let start = self.bump();
-                self.expect(TokKind::LParen, "nach 'syscall'");
-                let (args, end) = self.call_args("nach den argumenten von 'syscall'");
+                self.expect(TokKind::LParen, "after 'syscall'");
+                let (args, end) = self.call_args("after the arguments of 'syscall'");
                 let sp = Parser::join(start, end);
                 self.mk(sp, ExprKind::Syscall(args))
             }
@@ -799,7 +799,7 @@ impl<'a> Parser<'a> {
             other => {
                 if !self.recovering {
                     self.error_here(format!(
-                        "erwartet einen ausdruck, gefunden '{}'",
+                        "expected an expression, found '{}'",
                         other.text()
                     ));
                 }
@@ -818,11 +818,11 @@ impl<'a> Parser<'a> {
                 break;
             }
             let before = self.pos;
-            let (fname, fspan) = match self.ident("fuer ein feld im struct-literal") {
+            let (fname, fspan) = match self.ident("for a field in the struct literal") {
                 Some(x) => x,
                 None => break,
             };
-            if !self.expect(TokKind::Colon, "nach dem feldnamen im struct-literal") {
+            if !self.expect(TokKind::Colon, "after the field name in the struct literal") {
                 break;
             }
             let val = self.nested_expr();
@@ -838,7 +838,7 @@ impl<'a> Parser<'a> {
             }
         }
         let end = self.span();
-        self.close(TokKind::RBrace, "am ende des struct-literals");
+        self.close(TokKind::RBrace, "at the end of the struct literal");
         let sp = Parser::join(name_span, end);
         self.mk(sp, ExprKind::StructLit(name, fields, name_span))
     }
@@ -862,7 +862,7 @@ impl<'a> Parser<'a> {
             }
             if self.at_eof() {
                 if !self.recovering {
-                    self.error_here("erwartet '}' am ende des blocks, gefunden 'Dateiende'");
+                    self.error_here("expected '}' at the end of the block, found 'end of file'");
                 }
                 break;
             }
@@ -910,7 +910,7 @@ impl<'a> Parser<'a> {
             return;
         }
         self.error_here(format!(
-            "erwartet ';' oder ein zeilenende nach der anweisung, gefunden '{}'",
+            "expected ';' or an end of line after the statement, found '{}'",
             self.kind().text()
         ));
         self.recovering = false;
@@ -935,7 +935,7 @@ impl<'a> Parser<'a> {
         let word = if only_error { "errdefer" } else { "defer" };
         let start = self.bump();
         if self.at_eof() {
-            self.error_here(format!("nach '{}' fehlt die aufgeschobene anweisung", word));
+            self.error_here(format!("the deferred statement is missing after '{}'", word));
             return Stmt::Error(start);
         }
         let inner = self.stmt();
@@ -957,10 +957,10 @@ impl<'a> Parser<'a> {
             TokKind::KwDefer => self.defer_stmt(false),
             TokKind::KwErrDefer => self.defer_stmt(true),
             TokKind::KwReturn => self.return_stmt(),
-            TokKind::LBrace => Stmt::Block(self.block("am anfang eines blocks")),
+            TokKind::LBrace => Stmt::Block(self.block("at the start of a block")),
             TokKind::KwFn | TokKind::KwStruct | TokKind::KwConst | TokKind::KwExtern => {
                 self.error_here(format!(
-                    "'{}' ist nur auf oberster ebene erlaubt, nicht in einem funktionsrumpf",
+                    "'{}' is only allowed at top level, not inside a function body",
                     self.kind().text()
                 ));
                 self.recovering = false;
@@ -994,7 +994,7 @@ impl<'a> Parser<'a> {
         let mutable = self.at(&TokKind::KwVar);
         let kw = self.kind().text();
         self.bump();
-        let name = match self.ident(&format!("nach '{}'", kw)) {
+        let name = match self.ident(&format!("after '{}'", kw)) {
             Some((n, _)) => n,
             None => {
                 self.recovering = false;
@@ -1014,7 +1014,7 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        if !self.expect(TokKind::Assign, &format!("nach dem namen in einer '{}'-anweisung", kw)) {
+        if !self.expect(TokKind::Assign, &format!("after the name in a '{}' statement", kw)) {
             self.recovering = false;
             self.sync_stmt();
             return Stmt::Error(start);
@@ -1040,13 +1040,13 @@ impl<'a> Parser<'a> {
                 return Stmt::Error(start);
             }
         }
-        let then = self.block("nach der bedingung von 'if'");
+        let then = self.block("after the condition of 'if'");
         let els = if self.at(&TokKind::KwElse) {
             self.bump();
             if self.at(&TokKind::KwIf) {
                 Some(Box::new(self.stmt()))
             } else {
-                Some(Box::new(Stmt::Block(self.block("nach 'else'"))))
+                Some(Box::new(Stmt::Block(self.block("after 'else'"))))
             }
         } else {
             None
@@ -1065,7 +1065,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.loop_depth += 1;
-        let body = self.block("nach der bedingung von 'while'");
+        let body = self.block("after the condition of 'while'");
         self.loop_depth -= 1;
         Stmt::While { cond, body, span: start }
     }
@@ -1073,7 +1073,7 @@ impl<'a> Parser<'a> {
     /// `for name in start..end { }` — halboffener, aufsteigender Bereich.
     fn for_stmt(&mut self) -> Stmt {
         let start = self.bump(); // 'for'
-        let (name, name_span) = match self.ident("nach 'for'") {
+        let (name, name_span) = match self.ident("after 'for'") {
             Some(x) => x,
             None => {
                 self.recovering = false;
@@ -1081,13 +1081,13 @@ impl<'a> Parser<'a> {
                 return Stmt::Error(start);
             }
         };
-        if !self.expect(TokKind::KwIn, "nach dem schleifennamen") {
+        if !self.expect(TokKind::KwIn, "after the loop name") {
             self.recovering = false;
             self.sync_stmt();
             return Stmt::Error(start);
         }
         let from = self.cond_expr();
-        if !self.expect(TokKind::DotDot, "zwischen anfang und ende des bereichs") {
+        if !self.expect(TokKind::DotDot, "between start and end of the range") {
             self.recovering = false;
             self.sync_stmt();
             return Stmt::Error(start);
@@ -1101,7 +1101,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.loop_depth += 1;
-        let body = self.block("nach dem bereich von 'for'");
+        let body = self.block("after the range of 'for'");
         self.loop_depth -= 1;
         Stmt::For { name, start: from, end: to, body, name_span, span: start }
     }
@@ -1113,7 +1113,7 @@ impl<'a> Parser<'a> {
         let sp = self.bump();
         if self.loop_depth == 0 {
             self.dg
-                .error(sp, format!("'{}' steht ausserhalb einer schleife", word));
+                .error(sp, format!("'{}' is outside a loop", word));
             self.recovering = true;
         }
         self.end_stmt();
@@ -1158,11 +1158,11 @@ impl<'a> Parser<'a> {
                 break;
             }
             let before = self.pos;
-            let (name, sp) = match self.ident("fuer einen parameter") {
+            let (name, sp) = match self.ident("for a parameter") {
                 Some(x) => x,
                 None => break,
             };
-            if !self.expect(TokKind::Colon, "nach dem parameternamen") {
+            if !self.expect(TokKind::Colon, "after the parameter name") {
                 break;
             }
             let ty = match self.parse_type() {
@@ -1187,15 +1187,15 @@ impl<'a> Parser<'a> {
             self.bump();
             self.dg.error(
                 start,
-                "'extern fn' wird in Stufe 0 nicht unterstuetzt",
+                "'extern fn' is not supported in stage 0",
             );
         }
-        if !self.expect(TokKind::KwFn, "am anfang einer funktionsdeklaration") {
+        if !self.expect(TokKind::KwFn, "at the start of a function declaration") {
             self.recovering = false;
             self.sync_item();
             return;
         }
-        let name = match self.ident("nach 'fn'") {
+        let name = match self.ident("after 'fn'") {
             Some((n, _)) => n,
             None => {
                 self.recovering = false;
@@ -1203,13 +1203,13 @@ impl<'a> Parser<'a> {
                 return;
             }
         };
-        if !self.expect(TokKind::LParen, "nach dem funktionsnamen") {
+        if !self.expect(TokKind::LParen, "after the function name") {
             self.recovering = false;
             self.sync_item();
             return;
         }
         let params = self.params();
-        self.close(TokKind::RParen, "nach der parameterliste");
+        self.close(TokKind::RParen, "after the parameter list");
         self.recovering = false;
         let ret = if self.eat(&TokKind::Arrow) {
             match self.parse_type() {
@@ -1225,14 +1225,14 @@ impl<'a> Parser<'a> {
         };
         if !self.at(&TokKind::LBrace) {
             self.error_here(format!(
-                "erwartet '{{' am anfang des funktionsrumpfes, gefunden '{}'",
+                "expected '{{' at the start of the function body, found '{}'",
                 self.kind().text()
             ));
             self.recovering = false;
             self.sync_item();
             return;
         }
-        let body = self.block("am anfang des funktionsrumpfes");
+        let body = self.block("at the start of the function body");
         self.recovering = false;
         if !is_extern {
             let attrs = std::mem::take(&mut self.pending_attrs);
@@ -1242,7 +1242,7 @@ impl<'a> Parser<'a> {
 
     fn struct_decl(&mut self, prog: &mut Program) {
         let start = self.bump(); // 'struct'
-        let name = match self.ident("nach 'struct'") {
+        let name = match self.ident("after 'struct'") {
             Some((n, _)) => n,
             None => {
                 self.recovering = false;
@@ -1250,7 +1250,7 @@ impl<'a> Parser<'a> {
                 return;
             }
         };
-        if !self.expect(TokKind::LBrace, "nach dem structnamen") {
+        if !self.expect(TokKind::LBrace, "after the struct name") {
             self.recovering = false;
             self.sync_item();
             return;
@@ -1261,11 +1261,11 @@ impl<'a> Parser<'a> {
                 break;
             }
             let before = self.pos;
-            let (fname, fspan) = match self.ident("fuer ein structfeld") {
+            let (fname, fspan) = match self.ident("for a struct field") {
                 Some(x) => x,
                 None => break,
             };
-            if !self.expect(TokKind::Colon, "nach dem feldnamen") {
+            if !self.expect(TokKind::Colon, "after the field name") {
                 break;
             }
             let ty = match self.parse_type() {
@@ -1278,7 +1278,7 @@ impl<'a> Parser<'a> {
                 self.bump();
             }
         }
-        if !self.close(TokKind::RBrace, "am ende der structdeklaration") {
+        if !self.close(TokKind::RBrace, "at the end of the struct declaration") {
             self.recovering = false;
             self.sync_item();
             return;
@@ -1290,7 +1290,7 @@ impl<'a> Parser<'a> {
 
     fn const_decl(&mut self, prog: &mut Program) {
         let start = self.bump(); // 'const'
-        let name = match self.ident("nach 'const'") {
+        let name = match self.ident("after 'const'") {
             Some((n, _)) => n,
             None => {
                 self.recovering = false;
@@ -1298,7 +1298,7 @@ impl<'a> Parser<'a> {
                 return;
             }
         };
-        if !self.expect(TokKind::Colon, "nach dem namen einer konstanten") {
+        if !self.expect(TokKind::Colon, "after the name of a constant") {
             self.recovering = false;
             self.sync_item();
             return;
@@ -1311,7 +1311,7 @@ impl<'a> Parser<'a> {
                 return;
             }
         };
-        if !self.expect(TokKind::Assign, "nach dem typ einer konstanten") {
+        if !self.expect(TokKind::Assign, "after the type of a constant") {
             self.recovering = false;
             self.sync_item();
             return;
@@ -1330,7 +1330,7 @@ impl<'a> Parser<'a> {
         let start = self.bump(); // 'import'
         let mut path: Vec<String> = Vec::new();
         loop {
-            match self.ident("in einem modulpfad nach 'import'") {
+            match self.ident("in a module path after 'import'") {
                 Some((n, _)) => path.push(n),
                 None => {
                     self.recovering = false;
@@ -1352,7 +1352,7 @@ impl<'a> Parser<'a> {
         };
         if prog.imports.iter().any(|i| i.alias == alias) {
             self.dg
-                .error(start, format!("modul '{}' wird mehrfach eingebunden", alias));
+                .error(start, format!("module '{}' is imported more than once", alias));
         }
         self.modules.insert(alias.clone());
         prog.imports.push(ImportDecl { path, alias, span: start });
@@ -1363,7 +1363,7 @@ impl<'a> Parser<'a> {
     /// `export { a, b }`
     fn export_decl(&mut self, prog: &mut Program) {
         self.bump(); // 'export'
-        if !self.expect(TokKind::LBrace, "nach 'export'") {
+        if !self.expect(TokKind::LBrace, "after 'export'") {
             self.recovering = false;
             self.sync_item();
             return;
@@ -1373,7 +1373,7 @@ impl<'a> Parser<'a> {
                 break;
             }
             let before = self.pos;
-            match self.ident("in der export-liste") {
+            match self.ident("in the export list") {
                 Some((n, sp)) => prog.exports.push((n, sp)),
                 None => break,
             }
@@ -1384,16 +1384,16 @@ impl<'a> Parser<'a> {
                 self.bump();
             }
         }
-        self.close(TokKind::RBrace, "am ende der export-liste");
+        self.close(TokKind::RBrace, "at the end of the export list");
         self.recovering = false;
     }
 
     fn profile_decl(&mut self, prog: &mut Program) {
         let start = self.bump(); // 'profile'
-        match self.ident("nach 'profile'") {
+        match self.ident("after 'profile'") {
             Some((n, _)) => {
                 if prog.profile.is_some() {
-                    self.dg.error(start, "mehr als eine 'profile'-deklaration");
+                    self.dg.error(start, "more than one 'profile' declaration");
                 } else {
                     prog.profile = Some((n, start));
                 }
@@ -1416,12 +1416,12 @@ impl<'a> Parser<'a> {
         let mut out = Vec::new();
         while self.at(&TokKind::Hash) {
             let start = self.bump(); // '#'
-            if !self.expect(TokKind::LBracket, "nach '#'") {
+            if !self.expect(TokKind::LBracket, "after '#'") {
                 self.recovering = false;
                 self.sync_item();
                 return out;
             }
-            let name = match self.ident("als attributname nach '#['") {
+            let name = match self.ident("as attribute name after '#['") {
                 Some((n, _)) => n,
                 None => {
                     self.recovering = false;
@@ -1446,7 +1446,7 @@ impl<'a> Parser<'a> {
                         }
                         other => {
                             let msg = format!(
-                                "erwartet einen namen oder eine zahl als attributargument, gefunden '{}'",
+                                "expected a name or a number as attribute argument, found '{}'",
                                 other.text()
                             );
                             self.error_here(msg);
@@ -1459,13 +1459,13 @@ impl<'a> Parser<'a> {
                         break;
                     }
                 }
-                if !self.expect(TokKind::RParen, "nach den attributargumenten") {
+                if !self.expect(TokKind::RParen, "after the attribute arguments") {
                     self.recovering = false;
                     self.sync_item();
                     return out;
                 }
             }
-            if !self.expect(TokKind::RBracket, "nach dem attribut") {
+            if !self.expect(TokKind::RBracket, "after the attribute") {
                 self.recovering = false;
                 self.sync_item();
                 return out;
@@ -1493,7 +1493,7 @@ impl<'a> Parser<'a> {
                 if self.at_eof() {
                     if !self.pending_attrs.is_empty() {
                         let sp = self.pending_attrs[0].span;
-                        self.dg.error(sp, "attribut ohne deklaration dahinter".to_string());
+                        self.dg.error(sp, "attribute without a declaration after it".to_string());
                     }
                     break;
                 }
@@ -1541,7 +1541,7 @@ impl<'a> Parser<'a> {
             match self.kind() {
                 TokKind::KwComptime => {
                     let start = self.bump();
-                    let b = self.block("nach 'comptime'");
+                    let b = self.block("after 'comptime'");
                     let sp = Parser::join(start, b.span);
                     prog.comptime_blocks.push((b, sp));
                 }
@@ -1553,7 +1553,7 @@ impl<'a> Parser<'a> {
                 TokKind::KwExport => self.export_decl(&mut prog),
                 other => {
                     let msg = format!(
-                        "erwartet 'fn', 'struct', 'const', 'comptime', 'import', 'export' oder 'profile' auf oberster ebene, gefunden '{}'",
+                        "expected 'fn', 'struct', 'const', 'comptime', 'import', 'export' or 'profile' at top level, found '{}'",
                         other.text()
                     );
                     self.error_here(msg);
@@ -1618,7 +1618,7 @@ impl<'a> Parser<'a> {
         if self.interp_depth > 0 {
             self.dg.error(
                 sp,
-                "geschachtelte interpolation: ein f\"...\" im ausdruck eines f\"...\" ist noch nicht".to_string(),
+                "nested interpolation: an f\"...\" inside the expression of an f\"...\" is not yet".to_string(),
             );
             return self.broken_expr(sp);
         }
@@ -1632,7 +1632,7 @@ impl<'a> Parser<'a> {
             if c == '}' {
                 self.dg.error(
                     sp,
-                    "unbalancierte klammer in einer interpolation: '}' ohne '{'".to_string(),
+                    "unbalanced brace in an interpolation: '}' without '{'".to_string(),
                 );
                 broken = true;
                 break;
@@ -1660,7 +1660,7 @@ impl<'a> Parser<'a> {
                 if chars[j] == '{' {
                     self.dg.error(
                         sp,
-                        "unbalancierte klammer in einer interpolation: '{' im ausdruck".to_string(),
+                        "unbalanced brace in an interpolation: '{' inside the expression".to_string(),
                     );
                     broken = true;
                     break;
@@ -1677,7 +1677,7 @@ impl<'a> Parser<'a> {
             if !zu {
                 self.dg.error(
                     sp,
-                    "unbalancierte klammer in einer interpolation: '{' ohne '}'".to_string(),
+                    "unbalanced brace in an interpolation: '{' without '}'".to_string(),
                 );
                 broken = true;
                 break;
@@ -1701,7 +1701,7 @@ impl<'a> Parser<'a> {
             Err(e) => {
                 self.dg.error(
                     self.spanned(sp.line, sp.col + 2 + of as u32 + e.off, 1),
-                    format!("in einem textsegment einer interpolation: {}", e.msg),
+                    format!("in a text segment of an interpolation: {}", e.msg),
                 );
                 return chain;
             }
@@ -1815,7 +1815,7 @@ fn in_expr(
         return None;
     }
     if !p.at_eof() {
-        p.error_here("erwartet genau einen ausdruck in einer interpolation");
+        p.error_here("expected exactly one expression in an interpolation");
         return None;
     }
     Some(e)
@@ -1845,7 +1845,7 @@ pub fn parse_module(toks: &[Token], dg: &mut Diags, file: u32, base_id: u32) -> 
         // Anweisung, vor die die Textsegmente gehoben werden koennten.
         p.dg.error(
             Span::none(),
-            "interpolation f\"...\" ausserhalb einer anweisung (etwa in einer const) ist nicht sagbar".to_string(),
+            "interpolation f\"...\" outside a statement (for example in a const) cannot be expressed".to_string(),
         );
     }
     prog
@@ -1866,7 +1866,7 @@ mod tests {
 
     fn ok(src: &str) -> Program {
         let (p, n, t) = parse_src(src);
-        assert_eq!(n, 0, "unerwartete fehler:\n{}", t);
+        assert_eq!(n, 0, "unexpected errors:\n{}", t);
         p
     }
 
@@ -1929,7 +1929,7 @@ mod tests {
         let p = ok(&format!("fn main() -> i32 {{ let t: i32 = {}\n return 0 }}", src));
         match &p.funcs[0].body.stmts[0] {
             Stmt::Let { init, .. } => dump(init),
-            other => panic!("erwartet let, {:?}", other),
+            other => panic!("expected let, {:?}", other),
         }
     }
 
@@ -1965,7 +1965,7 @@ mod tests {
                 ExprKind::Unary(UnOp::Deref, _) => {}
                 other => panic!("{:?}", other),
             },
-            other => panic!("erwartet zuweisung, {:?}", other),
+            other => panic!("expected assignment, {:?}", other),
         }
         // Ein Operator am ZEILENENDE setzt den Ausdruck dagegen fort,
         // innerhalb von Klammern auch ein Zeilenumbruch.
@@ -2004,9 +2004,9 @@ mod tests {
         match &p.funcs[0].body.stmts[0] {
             Stmt::If { els: Some(b), .. } => match b.as_ref() {
                 Stmt::If { .. } => {}
-                other => panic!("erwartet else-if, {:?}", other),
+                other => panic!("expected else-if, {:?}", other),
             },
-            other => panic!("erwartet if, {:?}", other),
+            other => panic!("expected if, {:?}", other),
         }
     }
 
@@ -2014,9 +2014,9 @@ mod tests {
     fn several_error_become_reported() {
         let src = "fn main() -> i32 {\n    let x = add(1, 2 ;\n    let = 3\n    return 0\n}\n";
         let (_, n, text) = parse_src(src);
-        assert!(n >= 2, "erwartet mehrere fehler, bekam {}:\n{}", n, text);
-        assert!(text.contains("2:22"), "position fehlt:\n{}", text);
-        assert!(text.contains("erwartet ')'"), "meldung fehlt:\n{}", text);
+        assert!(n >= 2, "expected several errors, got {}:\n{}", n, text);
+        assert!(text.contains("2:22"), "position missing:\n{}", text);
+        assert!(text.contains("expected ')'"), "message missing:\n{}", text);
     }
 
     #[test]
@@ -2045,7 +2045,7 @@ mod tests {
             "fn main() -> i32 { syscall( }",
         ] {
             let (_, n, _) = parse_src(src);
-            assert!(n >= 1, "erwartet fehler fuer {:?}", src);
+            assert!(n >= 1, "expected error for {:?}", src);
         }
     }
 
@@ -2070,14 +2070,14 @@ mod tests {
     fn compare_is_not_associative() {
         let (_, n, text) = parse_src("fn main() -> i32 { let b: bool = 1 < 2 < 3\n return 0 }");
         assert!(n >= 1);
-        assert!(text.contains("nicht verkettbar"), "{}", text);
+        assert!(text.contains("not chainable"), "{}", text);
     }
 
     #[test]
     fn extern_becomes_rejected() {
         let (p, n, text) = parse_src("extern fn write(fd: i32) -> i32 { return 0 }\nfn main() -> i32 { return 0 }");
         assert!(n >= 1);
-        assert!(text.contains("Stufe 0"), "{}", text);
+        assert!(text.contains("stage 0"), "{}", text);
         assert_eq!(p.funcs.len(), 1);
     }
 
@@ -2096,11 +2096,11 @@ mod tests {
 
 /// Typkonstruktoren, die `SPEC.md` beschreibt, die Stufe 0 aber nicht umsetzt.
 /// Sie bekommen einen eigenen, klaren Fehler statt eines Syntaxfehlers —
-/// `SPEC.md` §14 fuehrt sie unter "Nicht enthalten".
+/// `SPEC.md` §14 fuehrt sie unter "not contained".
 fn not_implemented_ty(name: &str) -> Option<&'static str> {
     match name {
-        "secret" => Some("secret[T] und die Constant-Time-Primitive (SPEC §9) sind nicht umgesetzt; siehe ABNAHME.md"),
-        "Rc" | "Arc" | "Weak" => Some("Rc/Arc/Weak (SPEC §3.4) sind nicht umgesetzt; siehe ABNAHME.md"),
+        "secret" => Some("secret[T] and the constant-time primitives (SPEC §9) are not implemented; see ABNAHME.md"),
+        "Rc" | "Arc" | "Weak" => Some("Rc/Arc/Weak (SPEC §3.4) are not implemented; see ABNAHME.md"),
         _ => None,
     }
 }

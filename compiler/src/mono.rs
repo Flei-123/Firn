@@ -44,7 +44,7 @@ pub fn expand(prog: &mut Program, dg: &mut Diags) {
         if count > MAX_INSTANCES {
             dg.error(
                 inst.span,
-                "monomorphisierung: zu viele auspraegungen (rekursive generische verwendung?)",
+                "monomorphization: too many instantiations (recursive generic use?)",
             );
             break;
         }
@@ -73,7 +73,7 @@ fn bind_params(
         dg.error(
             inst.span,
             format!(
-                "{} '{}' erwartet {} typargument(e), gefunden {}",
+                "{} '{}' expects {} type argument(s), found {}",
                 what,
                 inst.base,
                 params.len(),
@@ -121,16 +121,16 @@ fn bound_ok(
     dg.error_note(
         inst.span,
         format!(
-            "typargument '{}' erfuellt die schranke '{}' des typparameters '{}' von '{}' nicht",
+            "type argument '{}' does not satisfy the bound '{}' of the type parameter '{}' of '{}'",
             sema_generic::type_tag(arg),
             b.name(),
             pname,
             inst.base
         ),
         match b {
-            Bound::Int => "erlaubt sind i8..i64, u8..u64, usize, isize",
-            Bound::Scalar => "erlaubt sind ganzzahlen, bool und zeiger",
-            _ => "kein typ erfuellt diese schranke",
+            Bound::Int => "allowed are i8..i64, u8..u64, usize, isize",
+            Bound::Scalar => "allowed are integers, bool and pointers",
+            _ => "no type satisfies this bound",
         },
     );
     false
@@ -150,12 +150,12 @@ fn expand_fn(
         None => {
             dg.error(
                 inst.span,
-                format!("unbekannte generische funktion '{}'", inst.base),
+                format!("unknown generic function '{}'", inst.base),
             );
             return;
         }
     };
-    let map = match bind_params(dg, fnames, &tpl.params, inst, "generische funktion") {
+    let map = match bind_params(dg, fnames, &tpl.params, inst, "generic function") {
         Some(m) => m,
         None => return,
     };
@@ -185,7 +185,7 @@ fn expand_struct(
         None => {
             dg.error(
                 inst.span,
-                format!("unbekannter generischer struct '{}'", inst.base),
+                format!("unknown generic struct '{}'", inst.base),
             );
             return;
         }
@@ -321,7 +321,7 @@ fn subst_call_name(
 ) -> String {
     // `size_of[T]()` innerhalb einer generischen Vorlage: der Typparameter
     // steckt im AUFRUFNAMEN (`size_of$T`, siehe sizeof.rs) und muss hier mit
-    // ersetzt werden — sonst meldet der Typpruefer "unbekannter typ 'T'",
+    // ersetzt werden — sonst meldet der Typpruefer "unknown type 'T'",
     // sobald die Vorlage ausgepraegt wird.
     if let Some(param) = n.strip_prefix("size_of$") {
         if let Some(TypeExpr::Named(concrete, _)) = map.get(param) {
@@ -538,7 +538,7 @@ fn check_bare_ty(te: &TypeExpr, out: &mut Vec<(Span, String)>) {
             if is_generic_struct(n) {
                 out.push((
                     *sp,
-                    format!("generischer struct '{}' braucht typargumente, z. B. '{}[i32]'", n, n),
+                    format!("generic struct '{}' needs type arguments, e.g. '{}[i32]'", n, n),
                 ));
             }
         }
@@ -611,7 +611,7 @@ fn check_bare_expr(e: &Expr, out: &mut Vec<(Span, String)>) {
                 out.push((
                     *nspan,
                     format!(
-                        "generische funktion '{}' braucht typargumente, z. B. '{}[i32](..)'",
+                        "generic function '{}' needs type arguments, e.g. '{}[i32](..)'",
                         name, name
                     ),
                 ));
@@ -633,7 +633,7 @@ fn check_bare_expr(e: &Expr, out: &mut Vec<(Span, String)>) {
             if is_generic_struct(name) {
                 out.push((
                     *nspan,
-                    format!("generischer struct '{}' braucht typargumente, z. B. '{}[i32]'", name, name),
+                    format!("generic struct '{}' needs type arguments, e.g. '{}[i32]'", name, name),
                 ));
             }
             for (_, fe, _) in fields {

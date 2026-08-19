@@ -95,13 +95,13 @@ pub enum TokKind {
 }
 
 impl TokKind {
-    /// Beschreibung fuer Fehlermeldungen ("erwartet ')' ...").
+    /// Beschreibung fuer Fehlermeldungen ("expected ')' ...").
     pub fn text(&self) -> String {
         match self {
             TokKind::Int(v) => format!("{}", v),
             TokKind::Float(bits) => format!("{}", f64::from_bits(*bits)),
             TokKind::Ident(s) => s.clone(),
-            TokKind::Str(k, v) => format!("{}\"…\" ({} elemente)", k.prefix(), v.len()),
+            TokKind::Str(k, v) => format!("{}\"…\" ({} elements)", k.prefix(), v.len()),
             TokKind::FStr(_) => "f\"…\" (interpolation)".into(),
             TokKind::KwFn => "fn".into(),
             TokKind::KwLet => "let".into(),
@@ -167,7 +167,7 @@ impl TokKind {
             TokKind::Le => "<=".into(),
             TokKind::Gt => ">".into(),
             TokKind::Ge => ">=".into(),
-            TokKind::Eof => "Dateiende".into(),
+            TokKind::Eof => "end of file".into(),
         }
     }
 }
@@ -286,7 +286,7 @@ impl<'a> Lexer<'a> {
                             None => {
                                 self.dg.error(
                                     self.sp(sl, sc, 2),
-                                    "blockkommentar wird nicht geschlossen ('*/' fehlt)",
+                                    "block comment is not closed ('*/' missing)",
                                 );
                                 break;
                             }
@@ -363,7 +363,7 @@ impl<'a> Lexer<'a> {
             if digits == 0 {
                 self.dg.error(
                     self.sp(line, col, ncols.max(1)),
-                    "gleitkommaliteral: nach 'e' fehlen die ziffern des exponenten",
+                    "floating point literal: the digits of the exponent are missing after 'e'",
                 );
                 self.push(TokKind::Float(0), line, col, ncols.max(1));
                 return;
@@ -439,7 +439,7 @@ impl<'a> Lexer<'a> {
         if let Some((c, bl, bc)) = bad_digit {
             self.dg.error(
                 self.sp(bl, bc, 1),
-                format!("ungueltiges zeichen '{}' in einem ganzzahlliteral zur basis {}", c, radix),
+                format!("invalid character '{}' in an integer literal to base {}", c, radix),
             );
             self.push(TokKind::Int(0), line, col, len);
             return;
@@ -447,7 +447,7 @@ impl<'a> Lexer<'a> {
         if digits.is_empty() {
             self.dg.error(
                 self.sp(line, col, len),
-                format!("ganzzahlliteral ohne ziffern (basis {})", radix),
+                format!("integer literal without digits (base {})", radix),
             );
             self.push(TokKind::Int(0), line, col, len);
             return;
@@ -463,7 +463,7 @@ impl<'a> Lexer<'a> {
                 _ => {
                     self.dg.error(
                         self.sp(line, col, len),
-                        "ganzzahlliteral ist zu gross (mehr als 64 bit)",
+                        "integer literal is too large (more than 64 bit)",
                     );
                     self.push(TokKind::Int(0), line, col, len);
                     return;
@@ -562,7 +562,7 @@ impl<'a> Lexer<'a> {
                 Err(e) => {
                     self.dg.error(
                         self.sp(line, col + e.off, 1),
-                        format!("in einem zeichenkettenliteral: {}", e.msg),
+                        format!("in a string literal: {}", e.msg),
                     );
                     // Weiterlexen mit leerem Rumpf — wie bei den anderen Literalen.
                     self.push(TokKind::FStr(String::new()), line, col, consumed as u32);
@@ -584,7 +584,7 @@ impl<'a> Lexer<'a> {
                 // Die Spalte des Fehlers liegt `e.off` Zeichen hinter dem Anfang.
                 self.dg.error(
                     self.sp(line, col + e.off, 1),
-                    format!("in einem zeichenkettenliteral: {}", e.msg),
+                    format!("in a string literal: {}", e.msg),
                 );
                 // Weiterlexen mit einem leeren Literal, damit Folgefehler
                 // nicht auf eine kaputte Tokenfolge zurueckgehen.
@@ -618,7 +618,7 @@ impl<'a> Lexer<'a> {
                 let (line, col) = (self.line, self.col);
                 self.dg.error(
                     self.sp(line, col, 1),
-                    format!("unbekanntes zeichen '{}' im quelltext", c),
+                    format!("unknown character '{}' in the source text", c),
                 );
                 // Weiterlexen: das stoerende Zeichen wird uebersprungen.
                 self.bump();
@@ -690,7 +690,7 @@ mod tests {
 
     #[test]
     fn comments_nested() {
-        let (k, n) = kinds("1 /* a /* b */ c */ 2 // weg\n3");
+        let (k, n) = kinds("1 /* a /* b */ c */ 2 // gone\n3");
         assert_eq!(n, 0);
         assert_eq!(k, vec![TokKind::Int(1), TokKind::Int(2), TokKind::Int(3), TokKind::Eof]);
     }
@@ -713,7 +713,7 @@ mod tests {
 
     #[test]
     fn open_block_comment_reports_and_ends() {
-        let (k, n) = kinds("1 /* offen");
+        let (k, n) = kinds("1 /* open");
         assert_eq!(n, 1);
         assert_eq!(k, vec![TokKind::Int(1), TokKind::Eof]);
     }

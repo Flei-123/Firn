@@ -329,16 +329,16 @@ pub(crate) fn bound_check(
             let known: Vec<String> =
                 REG.with(|r| r.borrow().ifaces.iter().map(|s| s.name.clone()).collect());
             let note = if known.is_empty() {
-                "in dieser uebersetzung ist keine schnittstelle vereinbart; \
-                 eingebaut sind nur Any, Int und Scalar"
+                "no interface is declared in this compilation; \
+                 built in are only Any, Int and Scalar"
                     .to_string()
             } else {
-                format!("bekannt sind: {} (eingebaut: Any, Int, Scalar)", known.join(", "))
+                format!("known are: {} (built in: Any, Int, Scalar)", known.join(", "))
             };
             dg.error_note(
                 span,
                 format!(
-                    "unbekannte schnittstelle '{}' als schranke am typparameter '{}' von '{}'",
+                    "unknown interface '{}' as bound on the type parameter '{}' of '{}'",
                     iface, pname, base
                 ),
                 note,
@@ -354,12 +354,12 @@ pub(crate) fn bound_check(
             dg.error_note(
                 span,
                 format!(
-                    "typargument '{}' erfuellt die schranke '{}' des typparameters '{}' von '{}' nicht",
+                    "type argument '{}' does not satisfy the bound '{}' of the type parameter '{}' of '{}'",
                     te_text(arg), iface, pname, base
                 ),
                 format!(
-                    "eine schnittstelle wird mit 'impl {} for <typ>' umgesetzt; \
-                     ein zeiger- oder feldtyp hat keinen namen, unter dem das stehen koennte",
+                    "an interface is implemented with 'impl {} for <type>'; \
+                     a pointer or field type has no name under which that could stand",
                     iface
                 ),
             );
@@ -380,20 +380,20 @@ pub(crate) fn bound_check(
         }
     }
     let note = if methods.is_empty() {
-        format!("'{}' hat keine methode; es fehlt nur 'impl {} for {}'", iface, iface, ty_name)
+        format!("'{}' has no method; only 'impl {} for {}' is missing", iface, iface, ty_name)
     } else if missing.is_empty() {
         format!(
-            "'{}' hat alle methoden von '{}'; es fehlt der block 'impl {} for {} {{ … }}'",
+            "'{}' has all methods of '{}'; the block 'impl {} for {} {{ … }}' is missing",
             ty_name, iface, iface, ty_name
         )
     } else {
         format!(
-            "es fehlt {} in 'impl {} for {} {{ … }}'",
+            "{} is missing in 'impl {} for {} {{ … }}'",
             missing
                 .iter()
                 .map(|x| format!("'{}'", x))
                 .collect::<Vec<_>>()
-                .join(" und "),
+                .join(" and "),
             iface,
             ty_name
         )
@@ -401,7 +401,7 @@ pub(crate) fn bound_check(
     dg.error_note(
         span,
         format!(
-            "typ '{}' setzt die schnittstelle '{}' nicht um — schranke am typparameter '{}' von '{}'",
+            "type '{}' does not implement the interface '{}' — bound on the type parameter '{}' of '{}'",
             ty_name, iface, pname, base
         ),
         note,
@@ -437,12 +437,12 @@ fn interface_decl(p: &mut Parser) {
         let sp = p.pending_attrs[0].span;
         p.dg.error_note(
             sp,
-            "vor 'interface' ist kein attribut erlaubt".to_string(),
-            "attribute an schnittstellen gibt es in dieser stufe nicht".to_string(),
+            "no attribute is allowed before 'interface'".to_string(),
+            "attributes on interfaces do not exist in this stage".to_string(),
         );
         p.pending_attrs.clear();
     }
-    let (name, nsp) = match p.ident("nach 'interface'") {
+    let (name, nsp) = match p.ident("after 'interface'") {
         Some(x) => x,
         None => {
             p.recovering = false;
@@ -450,7 +450,7 @@ fn interface_decl(p: &mut Parser) {
             return;
         }
     };
-    if !p.expect(TokKind::LBrace, "nach dem namen der schnittstelle") {
+    if !p.expect(TokKind::LBrace, "after the name of the interface") {
         p.recovering = false;
         p.sync_item();
         return;
@@ -467,7 +467,7 @@ fn interface_decl(p: &mut Parser) {
         let before = p.pos;
         if !p.at(&TokKind::KwFn) {
             p.error_here(format!(
-                "erwartet 'fn' in einer schnittstelle, gefunden '{}'",
+                "expected 'fn' in an interface, found '{}'",
                 p.kind().text()
             ));
             p.recovering = false;
@@ -483,7 +483,7 @@ fn interface_decl(p: &mut Parser) {
                     p.dg.error(
                         m.span,
                         format!(
-                            "die schnittstelle '{}' hat die methode '{}' bereits",
+                            "the interface '{}' already has the method '{}'",
                             name, m.name
                         ),
                     );
@@ -500,12 +500,12 @@ fn interface_decl(p: &mut Parser) {
             p.bump();
         }
     }
-    p.close(TokKind::RBrace, "am ende der schnittstelle");
+    p.close(TokKind::RBrace, "at the end of the interface");
     p.recovering = false;
     if iface_index(&name).is_some() {
         p.dg.error(
             nsp,
-            format!("die schnittstelle '{}' ist bereits deklariert", name),
+            format!("the interface '{}' is already declared", name),
         );
         return;
     }
@@ -522,15 +522,15 @@ fn interface_decl(p: &mut Parser) {
 /// — ohne Rumpf.
 fn method_head(p: &mut Parser, iface: &str) -> Option<Method> {
     p.bump(); // 'fn'
-    let (name, nsp) = match p.ident("nach 'fn' in einer schnittstelle") {
+    let (name, nsp) = match p.ident("after 'fn' in an interface") {
         Some(x) => x,
         None => return None,
     };
     if p.at(&TokKind::LBracket) {
-        p.error_here("eine schnittstellenmethode kann in dieser stufe nicht generisch sein");
+        p.error_here("an interface method cannot be generic in this stage");
         return None;
     }
-    if !p.expect(TokKind::LParen, "nach dem methodennamen") {
+    if !p.expect(TokKind::LParen, "after the method name") {
         return None;
     }
     // DER EMPFAENGER MUSS EIN ZEIGER SEIN. Ueber die Methodentafel steht nur
@@ -541,7 +541,7 @@ fn method_head(p: &mut Parser, iface: &str) -> Option<Method> {
             Some((m, _)) => m,
             None => {
                 p.error_here(format!(
-                    "der empfaenger einer schnittstellenmethode ist '*self' oder '*mut self' ('{}.{}')",
+                    "the receiver of an interface method is '*self' or '*mut self' ('{}.{}')",
                     iface, name
                 ));
                 return None;
@@ -549,7 +549,7 @@ fn method_head(p: &mut Parser, iface: &str) -> Option<Method> {
         }
     } else {
         p.error_here(format!(
-            "der empfaenger einer schnittstellenmethode ist '*self' oder '*mut self' ('{}.{}')",
+            "the receiver of an interface method is '*self' or '*mut self' ('{}.{}')",
             iface, name
         ));
         return None;
@@ -558,7 +558,7 @@ fn method_head(p: &mut Parser, iface: &str) -> Option<Method> {
     if p.eat(&TokKind::Comma) {
         params = p.params().into_iter().map(|x| x.ty).collect();
     }
-    p.close(TokKind::RParen, "nach der parameterliste");
+    p.close(TokKind::RParen, "after the parameter list");
     p.recovering = false;
     let ret = if p.eat(&TokKind::Arrow) {
         match p.parse_type() {
@@ -570,7 +570,7 @@ fn method_head(p: &mut Parser, iface: &str) -> Option<Method> {
     };
     if p.at(&TokKind::LBrace) {
         p.error_here(format!(
-            "eine schnittstellenmethode hat keinen rumpf ('{}.{}')",
+            "an interface method has no body ('{}.{}')",
             iface, name
         ));
         return None;
@@ -667,8 +667,8 @@ pub(crate) fn hook_resolve_ty(ck: &mut Checker, te: &TypeExpr) -> Option<Type> {
     }
     ck.dg.error_note(
         span,
-        format!("unbekannte schnittstelle '{}'", iface),
-        format!("eine schnittstelle wird mit 'interface {} {{ … }}' vereinbart", iface),
+        format!("unknown interface '{}'", iface),
+        format!("an interface is declared with 'interface {} {{ … }}'", iface),
     );
     Some(Type::Error)
 }
@@ -822,13 +822,13 @@ fn check_impl(ck: &mut Checker, u: usize, iface: &str, ty: &str, span: Span) {
             let known: Vec<String> =
                 REG.with(|r| r.borrow().ifaces.iter().map(|s| s.name.clone()).collect());
             let note = if known.is_empty() {
-                "in dieser uebersetzung ist keine schnittstelle vereinbart".to_string()
+                "no interface is declared in this compilation".to_string()
             } else {
-                format!("bekannt sind: {}", known.join(", "))
+                format!("known are: {}", known.join(", "))
             };
             ck.dg.error_note(
                 span,
-                format!("unbekannte schnittstelle '{}'", iface),
+                format!("unknown interface '{}'", iface),
                 note,
             );
             return;
@@ -852,13 +852,13 @@ fn check_impl(ck: &mut Checker, u: usize, iface: &str, ty: &str, span: Span) {
         Err(true) => {
             ck.dg.error_note(
                 span,
-                format!("der typ '{}' ist mehrdeutig", ty),
-                "mehrere module deklarieren einen typ dieses namens".to_string(),
+                format!("the type '{}' is ambiguous", ty),
+                "several modules declare a type of this name".to_string(),
             );
             return;
         }
         Err(false) => {
-            ck.dg.error(span, format!("unbekannter typ '{}'", ty));
+            ck.dg.error(span, format!("unknown type '{}'", ty));
             return;
         }
     };
@@ -881,8 +881,8 @@ fn check_impl_am(
     if sidx != usize::MAX && ck.tcx.structs[sidx].name.starts_with(P_DYN) {
         ck.dg.error_note(
             span,
-            format!("'{}' ist eine schnittstelle und kein typ", ty),
-            "eine schnittstelle setzt keine schnittstelle um".to_string(),
+            format!("'{}' is an interface and not a type", ty),
+            "an interface does not implement an interface".to_string(),
         );
         return;
     }
@@ -910,7 +910,7 @@ fn check_impl_am(
     if duplicate {
         ck.dg.error(
             span,
-            format!("'{}' setzt die schnittstelle '{}' bereits um", ty, iface),
+            format!("'{}' already implements the interface '{}'", ty, iface),
         );
         return;
     }
@@ -946,10 +946,10 @@ fn check_impl_am(
                 ck.dg.error_note(
                     span,
                     format!(
-                        "'{}' setzt die methode '{}.{}' nicht um",
+                        "'{}' does not implement the method '{}.{}'",
                         display, iface, m.name
                     ),
-                    format!("erwartet wird '{}' im block", signature(ck, m, &ptypes, &rtyp)),
+                    format!("'{}' is expected in the block", signature(ck, m, &ptypes, &rtyp)),
                 );
                 continue;
             }
@@ -964,10 +964,10 @@ fn check_impl_am(
             ck.dg.error_note(
                 span,
                 format!(
-                    "der empfaenger von '{}.{}' passt nicht zu '{}'",
+                    "the receiver of '{}.{}' does not fit '{}'",
                     display, m.name, iface
                 ),
-                format!("erwartet wird '{}' im block", signature(ck, m, &ptypes, &rtyp)),
+                format!("'{}' is expected in the block", signature(ck, m, &ptypes, &rtyp)),
             );
             continue;
         }
@@ -976,14 +976,14 @@ fn check_impl_am(
             ck.dg.error_note(
                 span,
                 format!(
-                    "'{}.{}' hat {} parameter, die schnittstelle '{}' verlangt {}",
+                    "'{}.{}' has {} parameters, the interface '{}' requires {}",
                     display,
                     m.name,
                     sig.params.len() - 1,
                     iface,
                     ptypes.len()
                 ),
-                format!("erwartet wird '{}' im block", signature(ck, m, &ptypes, &rtyp)),
+                format!("'{}' is expected in the block", signature(ck, m, &ptypes, &rtyp)),
             );
             continue;
         }
@@ -995,7 +995,7 @@ fn check_impl_am(
                 ck.dg.error_note(
                     span,
                     format!(
-                        "parameter {} von '{}.{}' hat typ {}, die schnittstelle '{}' verlangt {}",
+                        "parameter {} of '{}.{}' has type {}, the interface '{}' requires {}",
                         k + 1,
                         display,
                         m.name,
@@ -1003,7 +1003,7 @@ fn check_impl_am(
                         iface,
                         ck.tcx.name_of(expected)
                     ),
-                    format!("erwartet wird '{}' im block", signature(ck, m, &ptypes, &rtyp)),
+                    format!("'{}' is expected in the block", signature(ck, m, &ptypes, &rtyp)),
                 );
                 break;
             }
@@ -1017,14 +1017,14 @@ fn check_impl_am(
             ck.dg.error_note(
                 span,
                 format!(
-                    "'{}.{}' liefert {}, die schnittstelle '{}' verlangt {}",
+                    "'{}.{}' returns {}, the interface '{}' requires {}",
                     display,
                     m.name,
                     ck.tcx.name_of(&sig.ret),
                     iface,
                     ck.tcx.name_of(&rtyp)
                 ),
-                format!("erwartet wird '{}' im block", signature(ck, m, &ptypes, &rtyp)),
+                format!("'{}' is expected in the block", signature(ck, m, &ptypes, &rtyp)),
             );
         }
     }
@@ -1071,10 +1071,10 @@ fn check_gc_fields(ck: &mut Checker) {
         ck.dg.error_note(
             Span::none(),
             format!(
-                "feld '{}' der gc-klasse '{}' enthaelt einen schnittstellenwert",
+                "field '{}' of the gc class '{}' contains an interface value",
                 field, class
             ),
-            "der sammler verfolgt den heap praezise und kennt den zeiger hinter 'dyn' nicht (SPEC 3.5.3)".to_string(),
+            "the collector traces the heap precisely and does not know the pointer behind 'dyn' (SPEC 3.5.3)".to_string(),
         );
     }
 }
@@ -1104,10 +1104,10 @@ pub(crate) fn hook_cast(ck: &mut Checker, span: Span, src: &Type, dst: &Type) ->
                 ck.dg.error_note(
                     span,
                     format!(
-                        "ein schnittstellenwert entsteht aus einem zeiger auf einen struct, gefunden {}",
+                        "an interface value is made from a pointer to a struct, found {}",
                         ck.tcx.name_of(src)
                     ),
-                    format!("schreibe '(&x) as dyn {}'", iface),
+                    format!("write '(&x) as dyn {}'", iface),
                 );
                 return Some(Type::Error);
             }
@@ -1116,10 +1116,10 @@ pub(crate) fn hook_cast(ck: &mut Checker, span: Span, src: &Type, dst: &Type) ->
             ck.dg.error_note(
                 span,
                 format!(
-                    "ein schnittstellenwert entsteht aus einem zeiger, gefunden {}",
+                    "an interface value is made from a pointer, found {}",
                     ck.tcx.name_of(src)
                 ),
-                format!("schreibe '(&x) as dyn {}'", iface),
+                format!("write '(&x) as dyn {}'", iface),
             );
             return Some(Type::Error);
         }
@@ -1137,13 +1137,13 @@ pub(crate) fn hook_cast(ck: &mut Checker, span: Span, src: &Type, dst: &Type) ->
             .collect::<Vec<_>>()
     });
     let note = if known.is_empty() {
-        format!("kein typ setzt '{}' um", iface)
+        format!("no type implements '{}'", iface)
     } else {
-        format!("'{}' setzen um: {}", iface, known.join(", "))
+        format!("'{}' implement: {}", iface, known.join(", "))
     };
     ck.dg.error_note(
         span,
-        format!("'{}' setzt die schnittstelle '{}' nicht um", name, iface),
+        format!("'{}' does not implement the interface '{}'", name, iface),
         note,
     );
     Some(Type::Error)
@@ -1223,13 +1223,13 @@ pub(crate) fn hook_method(
                     .collect()
             });
             let note = if present.is_empty() {
-                format!("die schnittstelle '{}' hat keine methoden", iface)
+                format!("the interface '{}' has no methods", iface)
             } else {
-                format!("'{}' hat: {}", iface, present.join(", "))
+                format!("'{}' has: {}", iface, present.join(", "))
             };
             ck.dg.error_note(
                 nspan,
-                format!("die schnittstelle '{}' hat keine methode '{}'", iface, method),
+                format!("the interface '{}' has no method '{}'", iface, method),
                 note,
             );
             return Type::Error;
@@ -1246,11 +1246,11 @@ pub(crate) fn hook_method(
         ck.dg.error_note(
             nspan,
             format!(
-                "'{}.{}' nennt 'Self' und ist deshalb nicht ueber 'dyn {}' aufrufbar",
+                "'{}.{}' mentions 'Self' and is therefore not callable via 'dyn {}'",
                 iface, method, iface
             ),
             format!(
-                "rufe sie ueber eine schranke auf: 'fn f[T: {}](x: *T)' — dort steht der typ fest",
+                "call it via a bound: 'fn f[T: {}](x: *T)' — there the type is fixed",
                 iface
             ),
         );
@@ -1261,11 +1261,11 @@ pub(crate) fn hook_method(
             ck.dg.error_note(
                 recv.span,
                 format!(
-                    "'{}' erwartet den schnittstellenwert selbst, gefunden {}",
+                    "'{}' expects the interface value itself, found {}",
                     display,
                     ck.tcx.name_of(et)
                 ),
-                format!("schreibe (*x).{}(…)", method),
+                format!("write (*x).{}(…)", method),
             );
         }
     }
@@ -1275,7 +1275,7 @@ pub(crate) fn hook_method(
         ck.dg.error(
             espan,
             format!(
-                "methode '{}' erwartet {} argument(e), gefunden {}",
+                "method '{}' expects {} argument(s), found {}",
                 display, expected, found
             ),
         );
@@ -1382,11 +1382,11 @@ pub(crate) fn lower_dispatch(
     use crate::fir::{FTy, Op};
     let slot = match slot_of(iface, method) {
         Some(s) => s,
-        None => return lo.ice(span, "unbekannte schnittstellenmethode im lowering"),
+        None => return lo.ice(span, "unknown interface method in lowering"),
     };
     let sig = match methods_sig(iface, method) {
         Some(s) => s,
-        None => return lo.ice(span, "schnittstellenmethode ohne signatur im lowering"),
+        None => return lo.ice(span, "interface method without signature in lowering"),
     };
     let base = lo.lower_addr(recv)?;
     let dadr = lo.field_addr_at(base, OFF_DATEN);
@@ -1414,22 +1414,22 @@ pub(crate) fn lower_cast_into(
     use crate::fir::{FTy, Op};
     let sidx = match t {
         Type::Struct(i) => *i,
-        _ => return lo.ice(span, "schnittstellenwert ohne struct-typ"),
+        _ => return lo.ice(span, "interface value without struct type"),
     };
     let iface = match lo.info.tcx.structs.get(sidx).and_then(|s| interface_of(&s.name)) {
         Some(i) => i.to_string(),
-        None => return lo.ice(span, "umwandlung in einen nicht-schnittstellentyp"),
+        None => return lo.ice(span, "conversion into a non-interface type"),
     };
     let source = match lo.ty_of(inner) {
         Type::Ptr { inner, .. } => match *inner {
             Type::Struct(j) => j,
-            _ => return lo.ice(span, "schnittstellenwert aus einem zeiger ohne struct"),
+            _ => return lo.ice(span, "interface value from a pointer without struct"),
         },
-        _ => return lo.ice(span, "schnittstellenwert aus einem nicht-zeiger"),
+        _ => return lo.ice(span, "interface value from a non-pointer"),
     };
     let key = match table_of(&iface, source) {
         Some(k) => k,
-        None => return lo.ice(span, "umsetzung ohne methodentafel im lowering"),
+        None => return lo.ice(span, "implementation without method table in lowering"),
     };
     let pv = lo.lower_expr(inner)?;
     let dadr = lo.field_addr_at(addr, OFF_DATEN);
