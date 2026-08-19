@@ -23,8 +23,16 @@
 //
 // Aufbau eines Blocks (16 Byte Kopf, danach die Nutzdaten):
 //   [0..4)   u32 Typkennung (0 = frei)
-//   [4..8)   u32 Marke (0 weiss, 1 grau, 2 schwarz)
-//   [8..16)  u64 Seriennummer (fuer GcWeak; 0 = frei)
+//   [4..8)   u32 Zustandswort — Runde 47:
+//              Bits 0..1  Marke (0 weiss, 1 grau, 2 schwarz)
+//              Bit  2     F_FIN    das Objekt hat einen Finalisierer
+//              Bit  3     F_WART   es steht in der Finalisierungs-Schlange
+//              Bit  4     F_GETAN  sein Finalisierer ist gelaufen
+//              Bits 8..31 Aufraeumart (24 Bit, 0 = keine)
+//   [8..16)  u64 Seriennummer (fuer GcWeak; 0 = frei). Waehrend ein Block in
+//              der Finalisierungs-Schlange haengt, traegt dieses Wort statt
+//              der Seriennummer den Verweis auf den naechsten Wartenden —
+//              deshalb braucht die Schlange keinen eigenen Speicher.
 //   [16..)   Nutzdaten — das ist die Adresse, die `Gc[T]` traegt.
 //
 // Aufbau eines Chunks (64 Byte Kopf):
@@ -145,6 +153,35 @@ const S_SWKL: u64 = 1544
 const S_CHIST: u64 = 1704
 const S_CSTOPMAX: u64 = 1832
 const S_CPUUHR: u64 = 1840
+// ------------------------------------------------------------ Runde 47
+// Finalisierer: Kopf und Laenge der Warteschlange, Zaehler, laengste
+// Finalisiererscheibe. Schwache Felder: wie viele wurden je genullt.
+// Externe Wurzelbereiche: Feld, Kapazitaet, Belegung.
+const S_FINQ: u64 = 1848
+const S_FINQ_N: u64 = 1856
+const S_FIN_LAEUFE: u64 = 1864
+const S_FIN_NS: u64 = 1872
+const S_FIN_MAX: u64 = 1880
+const S_FIN_REG: u64 = 1888
+const S_WEAK_NULL: u64 = 1896
+const S_WROOT_P: u64 = 1904
+const S_WROOT_KAP: u64 = 1912
+const S_WROOT_N: u64 = 1920
+const S_PMAX_FIN: u64 = 1928
+// 1 = mindestens eine Klasse hat ein GcWeak-Feld. Einmal beim Start aus der
+// Typtabelle bestimmt, damit das Fegen bei Programmen ohne schwache Felder
+// keinen einzigen zusaetzlichen Tabellenzugriff macht.
+const S_HATWEAK: u64 = 1936
+
+// Zustandswort eines Blockkopfes (siehe Kopfkommentar).
+const M_MARKE: u32 = 3
+const M_OHNE_MARKE: u32 = 4294967292
+const F_FIN: u32 = 4
+const F_WART: u32 = 8
+const F_GETAN: u32 = 16
+const ART_MAX: u64 = 16777215
+// Anfangsgroesse des Feldes externer Wurzelbereiche (Eintraege zu 16 Byte).
+const WROOT_START: u64 = 256
 // Scheibengroessen: so viele Objekte pro Allokation tracen bzw. Chunks fegen.
 const SCHEIBE_TRACE: u64 = 512
 // Runde 41: Zeitbudget einer Markierscheibe (ns). Die Objektzahl allein
@@ -256,6 +293,30 @@ fn __gc_abbruch(code: i64) {
     let p: u64 = (&m) as u64
     syscall(SYS_WRITE, 2, p as i64, 42, 0, 0, 0)
     syscall(SYS_EXIT_GROUP, code, 0, 0, 0, 0, 0)
+}
+
+// Runde 47: dieselbe Regel fuer die drei Verstoesse gegen den
+// Finalisierer-Vertrag. Ein Finalisierer, der alloziert, sammelt oder
+// wiederbelebt, wuerde den Sammler von innen zerlegen — das MUSS sichtbar
+// abbrechen und darf nicht still weiterlaufen.
+fn __gc_schrei(p: u64, n: i64, code: i64) {
+    syscall(SYS_WRITE, 2, p as i64, n, 0, 0, 0)
+    syscall(SYS_EXIT_GROUP, code, 0, 0, 0, 0, 0)
+}
+
+fn __gc_fehler_fin_alloc() {
+    var m: [u8; 65] = "firn-gc: allokation waehrend eines finalisierers (SPEC 3.5.3 S4)\n"
+    __gc_schrei((&m) as u64, 65, 71)
+}
+
+fn __gc_fehler_fin_collect() {
+    var m: [u8; 67] = "firn-gc: gc_collect() waehrend eines finalisierers (SPEC 3.5.3 S4)\n"
+    __gc_schrei((&m) as u64, 67, 72)
+}
+
+fn __gc_fehler_fin_wieder() {
+    var m: [u8; 56] = "firn-gc: wiederbelebung im finalisierer (SPEC 3.5.3 S4)\n"
+    __gc_schrei((&m) as u64, 56, 73)
 }
 
 // ------------------------------------------------------- Stapelboden ermitteln
@@ -478,6 +539,23 @@ fn __gc_block_von(a: u64) -> u64 {
     return 0
 }
 
+// Zu welchem Chunk gehoert die Adresse? 0 = keine Heapadresse. Wird nur
+// selten gebraucht (Freigabe nach einem Finalisierer), deshalb ohne
+// Zwischenspeicher.
+fn __gc_chunk_von(a: u64) -> u64 {
+    let st: u64 = __gc_state() as u64
+    var c: u64 = __gc_ld64(st + S_CHUNKS)
+    while c != 0 {
+        let daten: u64 = c + CHUNK_KOPF
+        let ende: u64 = daten + __gc_ld64(c + 16) * __gc_ld64(c + 24)
+        if a >= daten && a < ende {
+            return c
+        }
+        c = __gc_ld64(c)
+    }
+    return 0
+}
+
 // ------------------------------------------------------------- Markierung
 
 fn __gc_mark_push(obj: u64) {
@@ -506,10 +584,12 @@ fn __gc_mark(a: u64) {
         return
     }
     let st: u64 = __gc_state() as u64
-    if __gc_ld32(b + 4) != __gc_ld64(st + S_PAR) as u32 {
+    // Runde 47: die Marke sind nur noch die untersten zwei Bits.
+    let zw: u32 = __gc_ld32(b + 4)
+    if (zw & M_MARKE) != __gc_ld64(st + S_PAR) as u32 {
         return
     }
-    __gc_st32(b + 4, 1)
+    __gc_st32(b + 4, (zw & M_OHNE_MARKE) | 1)
     __gc_mark_push(b + KOPF)
 }
 
@@ -517,7 +597,8 @@ fn __gc_mark(a: u64) {
 fn __gc_trace(obj: u64) {
     let st: u64 = __gc_state() as u64
     let b: u64 = obj - KOPF
-    __gc_st32(b + 4, (2 - __gc_ld64(st + S_PAR)) as u32)
+    let schwarz: u32 = (2 - __gc_ld64(st + S_PAR)) as u32
+    __gc_st32(b + 4, (__gc_ld32(b + 4) & M_OHNE_MARKE) | schwarz)
     let tid: u64 = __gc_ld32(b) as u64
     let tab: u64 = __gc_ld64(st + S_TABELLE)
     if tid == 0 || tid > __gc_ld64(tab) {
@@ -566,7 +647,7 @@ fn __gc_nachtragen() {
             var i: u64 = 0
             while i < anzahl {
                 let b: u64 = daten + i * block
-                if __gc_ld32(b) != 0 && __gc_ld32(b + 4) == 1 {
+                if __gc_ld32(b) != 0 && (__gc_ld32(b + 4) & M_MARKE) == 1 {
                     __gc_trace(b + KOPF)
                     __gc_drain()
                     weiter = true
@@ -629,6 +710,7 @@ fn __gc_sweep_schritt(t0: u64) -> u64 {
     var lebbytes: u64 = __gc_ld64(st + S_SWLEBB)
     var vorher: u64 = __gc_ld64(st + S_SWV)
     var c: u64 = __gc_ld64(st + S_SWC)
+    let hatweak: u64 = __gc_ld64(st + S_HATWEAK)
     var probe: u64 = SCHEIBE_SWEEP
     while c != 0 {
         let naechster: u64 = __gc_ld64(c)
@@ -653,22 +735,46 @@ fn __gc_sweep_schritt(t0: u64) -> u64 {
         let alt_kopf: u64 = __gc_ld64(kopf_addr)
         while i < anzahl {
             let b: u64 = daten + i * block
-            if __gc_ld32(b) != 0 && __gc_ld32(b + 4) != weiss {
+            let tid: u32 = __gc_ld32(b)
+            let zw: u32 = __gc_ld32(b + 4)
+            if tid != 0 && (zw & M_MARKE) != weiss {
                 // Lebt (grau oder schwarz). Die Marke bleibt STEHEN — das
                 // Umschalten der Weiss-Paritaet am Zyklusende macht alle
                 // Ueberlebenden in einem Zug wieder weiss, ohne dass dieser
                 // Block je wieder angefasst wird.
                 lebende = lebende + 1
                 lebbytes = lebbytes + block
-            } else {
-                if __gc_ld32(b) != 0 {
-                    __gc_st32(b, 0)
-                    __gc_st64(b + 8, 0)
+                // Runde 47: schwache Felder dieses lebenden Objekts, deren
+                // Ziel in DIESEM Lauf stirbt, werden hier wirklich genullt
+                // (SPEC 3.5.3 S3) — nicht erst beim naechsten `stark()`.
+                if hatweak != 0 {
+                    __gc_weak_saeubern(b, weiss)
                 }
-                tot = tot + 1
-                if klasse < KLASSEN {
-                    __gc_st64(b + KOPF, __gc_ld64(kopf_addr))
-                    __gc_st64(kopf_addr, b)
+            } else {
+                var behalten: bool = false
+                if tid != 0 && (zw & F_FIN) != 0 && (zw & F_GETAN) == 0 {
+                    // Runde 47: unerreichbar UND mit Finalisierer. Der Block
+                    // wird NICHT freigegeben, sondern in die Warteschlange
+                    // gehaengt (verkettet ueber das Seriennummernwort). Erst
+                    // wenn sein Finalisierer gelaufen ist, wird er frei.
+                    __gc_st32(b + 4, zw | F_WART)
+                    __gc_st64(b + 8, __gc_ld64(st + S_FINQ))
+                    __gc_st64(st + S_FINQ, b)
+                    __gc_st64(st + S_FINQ_N, __gc_ld64(st + S_FINQ_N) + 1)
+                    lebende = lebende + 1
+                    lebbytes = lebbytes + block
+                    behalten = true
+                }
+                if !behalten {
+                    if tid != 0 {
+                        __gc_st32(b, 0)
+                        __gc_st64(b + 8, 0)
+                    }
+                    tot = tot + 1
+                    if klasse < KLASSEN {
+                        __gc_st64(b + KOPF, __gc_ld64(kopf_addr))
+                        __gc_st64(kopf_addr, b)
+                    }
                 }
             }
             i = i + 1
@@ -735,6 +841,9 @@ fn __gc_sweep() {
     __gc_sweep_init()
     while __gc_sweep_schritt(0) == 0 {
     }
+    // Runde 47: erst die Finalisierer, dann die Buchhaltung — sie geben
+    // ihre Bloecke frei und veraendern S_SWLEB/S_SWLEBB noch.
+    __gc_fin_alle()
     let st: u64 = __gc_state() as u64
     __gc_st64(st + S_LEBENDE, __gc_ld64(st + S_SWLEB))
     __gc_st64(st + S_LEBBYTES, __gc_ld64(st + S_SWLEBB))
@@ -774,7 +883,7 @@ fn __gc_scrub() {
 
 fn __gc_collect_now() -> u64 {
     let st: u64 = __gc_state() as u64
-    if __gc_ld64(st + S_INIT) == 0 {
+    if __gc_ld64(st + S_INIT) != 1 {
         return 0
     }
     let t0: u64 = __gc_jetzt_ns()
@@ -788,6 +897,8 @@ fn __gc_collect_now() -> u64 {
     let sp: u64 = (&anker) as u64
     anker = 0
     __gc_scan(sp, __gc_ld64(st + S_BODEN))
+    // Wurzeln 3 (Runde 47): angemeldete Bereiche ausserhalb des GC-Heaps.
+    __gc_wurzeln_scannen()
     __gc_drain()
     __gc_nachtragen()
     __gc_sweep()
@@ -961,6 +1072,31 @@ fn __gc_pause_buche_h(t0: u64, typ: u64, htyp: u64) {
     __gc_hist_buche(dauer, htyp)
 }
 
+// Runde 47: eine Finalisiererscheibe. Sie bekommt kein eigenes Fach in den
+// Typmaxima (dort stehen nur die fuenf Sammlerabschnitte), sondern ein
+// eigenes Feld S_PMAX_FIN — und im Histogramm zaehlt sie unter Typ 6
+// ("alle Scheiben") mit, weil sie eine ist.
+fn __gc_pause_buche_fin(t0: u64) {
+    let st: u64 = __gc_state() as u64
+    let t1: u64 = __gc_jetzt_ns()
+    var dauer: u64 = 0
+    if t1 > t0 {
+        dauer = t1 - t0
+    }
+    __gc_st64(st + S_PAUSE_LAST, dauer)
+    if dauer > __gc_ld64(st + S_PZYK) {
+        __gc_st64(st + S_PZYK, dauer)
+    }
+    if dauer > __gc_ld64(st + S_PAUSE_MAX) {
+        __gc_st64(st + S_PAUSE_MAX, dauer)
+    }
+    __gc_st64(st + S_PAUSE_TOTAL, __gc_ld64(st + S_PAUSE_TOTAL) + dauer)
+    if dauer > __gc_ld64(st + S_PMAX_FIN) {
+        __gc_st64(st + S_PMAX_FIN, dauer)
+    }
+    __gc_hist_buche(dauer, 6)
+}
+
 // Diagnose-Zugriff: laengste Pause je Scheibentyp (0 Start, 1 Mark, 2 Sweep,
 // 3 Ende, 4 Voll).
 fn gc_ueberlaeufe() -> u64 {
@@ -991,6 +1127,8 @@ fn __gc_zyklus_start() {
     let sp: u64 = (&anker) as u64
     anker = 0
     __gc_scan(sp, __gc_ld64(st + S_BODEN))
+    // Wurzeln 3 (Runde 47): angemeldete Bereiche ausserhalb des GC-Heaps.
+    __gc_wurzeln_scannen()
     __gc_st64(st + S_SCHRT, __gc_ld64(st + S_SEIT))
     __gc_st64(st + S_PZYK, 0)
     __gc_st64(st + S_PHASE, 1)
@@ -1071,6 +1209,17 @@ fn __gc_zyklus_schritt() {
         let fertig: u64 = __gc_sweep_schritt(t0)
         __gc_pause_buche(t0, 2)
         if fertig == 1 {
+            // Runde 47: warten Finalisierer, kommt die eigene Phase 3 dazwischen.
+            if __gc_ld64(st + S_FINQ) != 0 {
+                __gc_st64(st + S_PHASE, 3)
+            } else {
+                __gc_zyklus_ende()
+            }
+        }
+        return
+    }
+    if phase == 3 {
+        if __gc_fin_scheibe() == 1 {
             __gc_zyklus_ende()
         }
         return
@@ -1091,6 +1240,10 @@ fn __gc_zyklus_fertig() {
     if __gc_ld64(st + S_PHASE) == 2 {
         while __gc_sweep_schritt(0) == 0 {
         }
+        __gc_st64(st + S_PHASE, 3)
+    }
+    if __gc_ld64(st + S_PHASE) == 3 {
+        __gc_fin_alle()
         __gc_zyklus_ende()
     }
 }
@@ -1101,8 +1254,17 @@ fn __gc_zyklus_fertig() {
 // Bei Erschoepfung: ERST ein Sammellauf, DANN das Scheitern.
 fn __gc_alloc_raw(tid: u64, size: u64) -> *mut u8 {
     let st: u64 = __gc_state() as u64
-    if __gc_ld64(st + S_INIT) == 0 {
-        __gc_abbruch(70)
+    // S_INIT: 0 = gc_init() fehlt, 1 = bereit, 2 = ein Finalisierer laeuft.
+    // Die Sperre steckt ABSICHTLICH in dieser einen, ohnehin vorhandenen
+    // Pruefung — ein Finalisierer, der alloziert, wuerde einen Sammellauf
+    // aus dem Sammellauf heraus starten (Reentranz), und der kostet sonst
+    // jeden Allokationspfad einen zusaetzlichen Speicherzugriff.
+    if __gc_ld64(st + S_INIT) != 1 {
+        if __gc_ld64(st + S_INIT) == 0 {
+            __gc_abbruch(70)
+            return 0 as *mut u8
+        }
+        __gc_fehler_fin_alloc()
         return 0 as *mut u8
     }
     let klasse: u64 = __gc_klasse_fuer(size)
@@ -1260,6 +1422,12 @@ fn __gc_strong_raw(w: GcWeakRaw) -> *mut u8 {
     if __gc_ld32(b) == 0 {
         return 0 as *mut u8
     }
+    // Runde 47: ein Block, der auf seinen Finalisierer wartet oder ihn
+    // gerade durchlaeuft, ist TOT. Er darf nie wieder stark werden — sonst
+    // waere `stark()` der Hintereingang zur Wiederbelebung.
+    if (__gc_ld32(b + 4) & F_WART) != 0 {
+        return 0 as *mut u8
+    }
     if __gc_ld64(b + 8) != w.__s {
         return 0 as *mut u8
     }
@@ -1307,7 +1475,494 @@ fn __gc_barrier(feld: *mut u8, wert: *mut u8) {
     // Ziel grau — sonst koennte ein weisses Objekt hinter einem bereits
     // verfolgten (schwarzen) verschwinden, ohne je gesehen zu werden.
     if __gc_ld64(st + S_PHASE) != 0 {
+        // Runde 47: WIEDERBELEBUNG. Waehrend ein Finalisierer laeuft, steht
+        // S_INIT auf 2. Ein Gc-Zeiger, der jetzt in ein Heapfeld geschrieben
+        // wird, koennte das gerade sterbende Objekt zurueck in den lebenden
+        // Graphen holen — der Block wird aber gleich freigegeben. Also: kein
+        // stiller Zeiger ins Nichts, sondern sichtbarer Abbruch.
+        // Der Test steht INNERHALB dieses Zweiges und kostet den Normalfall
+        // (Phase 0, kein Zyklus) damit nichts.
+        if __gc_ld64(st + S_INIT) != 1 {
+            __gc_fehler_fin_wieder()
+        }
         __gc_mark(wert as u64)
+    }
+}
+
+// ------------------------------------------------------------ Finalisierer
+//
+// SEMANTIK (verbindlich; Begruendungen in docs/RUNDE47.md, SPEC 3.5.3 `S4`):
+//
+//  1. REGISTRIERUNG je OBJEKT, nicht je Klasse: `gc_finalisierer_setzen(p, art)`
+//     traegt eine AUFRAEUMART (1..16777215) in das Zustandswort des Blockkopfes
+//     ein. Kein Seitentisch, keine Allokation, kein zusaetzliches Byte je
+//     Objekt — und die Erkennung beim Fegen kostet nur den Test eines Bits,
+//     das dort ohnehin gelesen wird.
+//
+//  2. WAS GERUFEN WIRD: die Funktion `__gc_finalisiere(art: u64, p: *mut u8)`.
+//     Deklariert das Programm sie in seiner WURZELDATEI selbst, nimmt der
+//     Compiler diese; sonst legt er eine leere Voreinstellung dazu
+//     (`gc.rs::laufzeit_quelle`). Firn hat in Stufe 0 keine Funktionszeiger —
+//     eine Verteilerfunktion mit einer Kennung ist die ehrliche Entsprechung
+//     und braucht keinen indirekten Aufruf im Codegenerator.
+//
+//  3. ZEITPUNKT: NACHDEM der Sammler das Objekt als unerreichbar erkannt hat.
+//     Der Zyklus hat dafuer eine eigene Phase 3, die wie Markieren und Fegen
+//     in Scheiben laeuft. Ein Finalisierer selbst wird NICHT unterbrochen —
+//     seine Laufzeit gehoert dem Programm, nicht dem Sammler
+//     (`gc_fin_ns_max()` weist sie getrennt aus).
+//
+//  4. WIEDERBELEBUNG IST UNMOEGLICH — und zwar erzwungen, nicht erbeten:
+//       * vor dem Aufruf werden ALLE `Gc[T]`- und `GcWeak[T]`-Felder des
+//         Objekts genullt. Ein Finalisierer sieht nie einen Zeiger auf ein
+//         Nachbarobjekt, das im selben Lauf schon eingesammelt sein kann;
+//       * `stark(w)` auf das sterbende Objekt liefert 0 (Merker F_WART);
+//       * eine GC-Allokation im Finalisierer bricht sichtbar ab (Code 71),
+//         `gc_collect()` ebenso (72) — damit kann ein Finalisierer den
+//         Sammler nicht reentrant aufreissen;
+//       * das Schreiben eines Gc-Zeigers in ein Heapfeld bricht ab (73);
+//       * der Block wird freigegeben, SOBALD der Finalisierer zurueckkehrt —
+//         unabhaengig davon, was er getan hat.
+//     Java-artige Auferstehung mit einem zweiten Zyklus gibt es also nicht.
+//     Der Preis ist benannt: ein Finalisierer kann seinem Objekt kein
+//     laengeres Leben verschaffen, auch nicht absichtlich.
+//
+//  5. REIHENFOLGE: keine Zusage zwischen zwei Objekten. Die Warteschlange
+//     folgt der Fegereihenfolge (Chunkliste, innerhalb eines Chunks von hinten
+//     nach vorn, weil vorne eingehaengt wird). Wer eine Reihenfolge braucht,
+//     nimmt keinen Finalisierer.
+//
+//  6. HOECHSTENS EINMAL je Objekt (Merker F_GETAN).
+//
+//  7. Ein Programm, das gar keinen Finalisierer registriert, zahlt NICHTS:
+//     der Zweig im Fegen wird nur betreten, wenn ein Block wirklich stirbt
+//     UND F_FIN traegt.
+
+fn gc_finalisierer_setzen(p: *mut u8, art: u64) -> bool {
+    let a: u64 = p as u64
+    if a == 0 {
+        return false
+    }
+    if art == 0 || art > ART_MAX {
+        return false
+    }
+    let b: u64 = __gc_block_von(a)
+    if b == 0 {
+        return false
+    }
+    if b + KOPF != a {
+        return false
+    }
+    if __gc_ld32(b) == 0 {
+        return false
+    }
+    let zw: u32 = __gc_ld32(b + 4)
+    if (zw & F_FIN) != 0 {
+        return false
+    }
+    __gc_st32(b + 4, (zw & M_MARKE) | F_FIN | ((art as u32) << 8))
+    let st: u64 = __gc_state() as u64
+    __gc_st64(st + S_FIN_REG, __gc_ld64(st + S_FIN_REG) + 1)
+    return true
+}
+
+// 0 = kein Finalisierer (oder er ist schon gelaufen).
+fn gc_finalisierer_art(p: *mut u8) -> u64 {
+    let a: u64 = p as u64
+    if a == 0 {
+        return 0
+    }
+    let b: u64 = __gc_block_von(a)
+    if b == 0 {
+        return 0
+    }
+    if b + KOPF != a {
+        return 0
+    }
+    if __gc_ld32(b) == 0 {
+        return 0
+    }
+    let zw: u32 = __gc_ld32(b + 4)
+    if (zw & F_FIN) == 0 {
+        return 0
+    }
+    if (zw & F_GETAN) != 0 {
+        return 0
+    }
+    return (zw as u64) >> 8
+}
+
+// Registrierung zuruecknehmen. false, wenn keine da war oder das Objekt schon
+// in der Warteschlange haengt — dann ist es zu spaet, und das wird gesagt.
+fn gc_finalisierer_loeschen(p: *mut u8) -> bool {
+    let a: u64 = p as u64
+    if a == 0 {
+        return false
+    }
+    let b: u64 = __gc_block_von(a)
+    if b == 0 {
+        return false
+    }
+    if b + KOPF != a {
+        return false
+    }
+    if __gc_ld32(b) == 0 {
+        return false
+    }
+    let zw: u32 = __gc_ld32(b + 4)
+    if (zw & F_FIN) == 0 {
+        return false
+    }
+    if (zw & F_WART) != 0 {
+        return false
+    }
+    __gc_st32(b + 4, zw & M_MARKE)
+    return true
+}
+
+// Alle Zeigerfelder des Objekts nullen, bevor sein Finalisierer laeuft.
+fn __gc_felder_nullen(b: u64) {
+    let st: u64 = __gc_state() as u64
+    let tab: u64 = __gc_ld64(st + S_TABELLE)
+    let tid: u64 = __gc_ld32(b) as u64
+    if tid == 0 || tid > __gc_ld64(tab) {
+        return
+    }
+    let obj: u64 = b + KOPF
+    let eintrag: u64 = tab + 8 + (tid - 1) * 64
+    let ns: u64 = __gc_ld64(eintrag + 16)
+    let os: u64 = __gc_ld64(eintrag + 24)
+    var i: u64 = 0
+    while i < ns {
+        __gc_st64(obj + __gc_ld64(os + i * 8), 0)
+        i = i + 1
+    }
+    let nw: u64 = __gc_ld64(eintrag + 32)
+    let ow: u64 = __gc_ld64(eintrag + 40)
+    var j: u64 = 0
+    while j < nw {
+        let wp: u64 = obj + __gc_ld64(ow + j * 8)
+        __gc_st64(wp, 0)
+        __gc_st64(wp + 8, 0)
+        j = j + 1
+    }
+}
+
+// Einen fertig finalisierten Block wirklich freigeben.
+fn __gc_block_frei(b: u64) {
+    let st: u64 = __gc_state() as u64
+    let c: u64 = __gc_chunk_von(b)
+    __gc_st32(b, 0)
+    __gc_st32(b + 4, 0)
+    __gc_st64(b + 8, 0)
+    if c == 0 {
+        return
+    }
+    let klasse: u64 = __gc_ld64(c + 40)
+    if klasse < KLASSEN {
+        let kopf: u64 = st + S_FREI + klasse * 8
+        __gc_st64(b + KOPF, __gc_ld64(kopf))
+        __gc_st64(kopf, b)
+    }
+    // Beim Fegen wurde der Wartende als belegt gezaehlt (er WAR es auch) —
+    // jetzt ist er es nicht mehr.
+    let bl: u64 = __gc_ld64(c + 16)
+    let leb: u64 = __gc_ld64(st + S_SWLEB)
+    if leb > 0 {
+        __gc_st64(st + S_SWLEB, leb - 1)
+    }
+    let lbb: u64 = __gc_ld64(st + S_SWLEBB)
+    if lbb >= bl {
+        __gc_st64(st + S_SWLEBB, lbb - bl)
+    }
+}
+
+// Genau einen Wartenden abarbeiten. 1 = einer lief, 0 = Schlange leer.
+fn __gc_fin_einen() -> u64 {
+    let st: u64 = __gc_state() as u64
+    let b: u64 = __gc_ld64(st + S_FINQ)
+    if b == 0 {
+        return 0
+    }
+    __gc_st64(st + S_FINQ, __gc_ld64(b + 8))
+    __gc_st64(st + S_FINQ_N, __gc_ld64(st + S_FINQ_N) - 1)
+    let zw: u32 = __gc_ld32(b + 4)
+    let art: u64 = (zw as u64) >> 8
+    // F_WART bleibt gesetzt, solange der Finalisierer laeuft: `stark()` auf
+    // dieses Objekt liefert dadurch weiterhin 0. F_GETAN kommt dazu, damit
+    // es auch nach einem Abbruch nie ein zweites Mal drankommt.
+    __gc_st32(b + 4, zw | F_GETAN)
+    __gc_st64(b + 8, 0)
+    __gc_felder_nullen(b)
+    __gc_st64(st + S_INIT, 2)
+    let t0: u64 = __gc_jetzt_ns()
+    __gc_finalisiere(art, (b + KOPF) as *mut u8)
+    let t1: u64 = __gc_jetzt_ns()
+    __gc_st64(st + S_INIT, 1)
+    var d: u64 = 0
+    if t1 > t0 {
+        d = t1 - t0
+    }
+    __gc_st64(st + S_FIN_NS, __gc_ld64(st + S_FIN_NS) + d)
+    if d > __gc_ld64(st + S_FIN_MAX) {
+        __gc_st64(st + S_FIN_MAX, d)
+    }
+    __gc_st64(st + S_FIN_LAEUFE, __gc_ld64(st + S_FIN_LAEUFE) + 1)
+    __gc_block_frei(b)
+    return 1
+}
+
+// Eine Finalisiererscheibe (Phase 3). 1 = Schlange leer.
+fn __gc_fin_scheibe() -> u64 {
+    let st: u64 = __gc_state() as u64
+    let t0: u64 = __gc_jetzt_ns()
+    var n: u64 = 0
+    while __gc_fin_einen() == 1 {
+        n = n + 1
+        if __gc_jetzt_ns() - t0 >= ZEIT_BUDGET_NS {
+            break
+        }
+    }
+    if n > 0 {
+        __gc_pause_buche_fin(t0)
+    }
+    if __gc_ld64(st + S_FINQ) == 0 {
+        return 1
+    }
+    return 0
+}
+
+// Alle Wartenden auf einen Schlag (atomarer Pfad und gc_collect).
+fn __gc_fin_alle() {
+    let st: u64 = __gc_state() as u64
+    if __gc_ld64(st + S_FINQ) == 0 {
+        return
+    }
+    let ph: u64 = __gc_ld64(st + S_PHASE)
+    __gc_st64(st + S_PHASE, 3)
+    let t0: u64 = __gc_jetzt_ns()
+    var n: u64 = 0
+    while __gc_fin_einen() == 1 {
+        n = n + 1
+    }
+    if n > 0 {
+        __gc_pause_buche_fin(t0)
+    }
+    __gc_st64(st + S_PHASE, ph)
+}
+
+fn gc_fin_laeufe() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_FIN_LAEUFE)
+}
+
+fn gc_fin_wartend() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_FINQ_N)
+}
+
+fn gc_fin_registriert() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_FIN_REG)
+}
+
+fn gc_fin_ns_total() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_FIN_NS)
+}
+
+fn gc_fin_ns_max() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_FIN_MAX)
+}
+
+// Laengste Finalisiererscheibe (Sammlerarbeit + die Finalisierer, die in
+// DERSELBEN Scheibe liefen).
+fn gc_pause_ns_fin_max() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_PMAX_FIN)
+}
+
+// -------------------------------------------------- Schwache Felder nullen
+//
+// SPEC 3.5.3 `S3` verlangt, dass ein schwacher Verweis beim Einsammeln leer
+// wird. Bis Runde 46 war das nur SCHEINBAR so: `stark(w)` lieferte 0, weil
+// die Seriennummer nicht mehr passte — im Feld stand aber weiter das alte
+// (verschleierte) Bitmuster. Seit Runde 47 nullt das Fegen die schwachen
+// Felder LEBENDER Objekte wirklich.
+//
+// Was das NICHT kann, offen benannt: ein `GcWeak[T]` in einer lokalen
+// Variablen oder in einem gewoehnlichen `struct` ausserhalb des GC-Heaps
+// wird nicht angefasst — der Sammler kennt den Stapel nur konservativ und
+// hat dort keine Feldkarte. Dort schuetzt weiterhin die Seriennummer, und
+// `stark()` liefert 0.
+fn __gc_weak_vorhanden() -> u64 {
+    let st: u64 = __gc_state() as u64
+    let tab: u64 = __gc_ld64(st + S_TABELLE)
+    if tab == 0 {
+        return 0
+    }
+    let n: u64 = __gc_ld64(tab)
+    var i: u64 = 0
+    while i < n {
+        if __gc_ld64(tab + 8 + i * 64 + 32) != 0 {
+            return 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// Ist das Ziel eines schwachen Verweises in diesem Lauf tot?
+fn __gc_weak_tot(a: u64, serie: u64, weiss: u32) -> bool {
+    let tb: u64 = __gc_block_von(a)
+    if tb == 0 {
+        return true
+    }
+    if tb + KOPF != a {
+        return true
+    }
+    if __gc_ld32(tb) == 0 {
+        return true
+    }
+    if __gc_ld64(tb + 8) != serie {
+        return true
+    }
+    let zw: u32 = __gc_ld32(tb + 4)
+    if (zw & F_WART) != 0 {
+        return true
+    }
+    if (zw & M_MARKE) == weiss {
+        return true
+    }
+    return false
+}
+
+fn __gc_weak_saeubern(b: u64, weiss: u32) {
+    let st: u64 = __gc_state() as u64
+    let tab: u64 = __gc_ld64(st + S_TABELLE)
+    let tid: u64 = __gc_ld32(b) as u64
+    if tid == 0 || tid > __gc_ld64(tab) {
+        return
+    }
+    let eintrag: u64 = tab + 8 + (tid - 1) * 64
+    let nw: u64 = __gc_ld64(eintrag + 32)
+    if nw == 0 {
+        return
+    }
+    let ow: u64 = __gc_ld64(eintrag + 40)
+    let obj: u64 = b + KOPF
+    var j: u64 = 0
+    while j < nw {
+        let wp: u64 = obj + __gc_ld64(ow + j * 8)
+        let pv: u64 = __gc_ld64(wp)
+        if pv != 0 {
+            if __gc_weak_tot(pv ^ WEAK_XOR, __gc_ld64(wp + 8), weiss) {
+                __gc_st64(wp, 0)
+                __gc_st64(wp + 8, 0)
+                __gc_st64(st + S_WEAK_NULL, __gc_ld64(st + S_WEAK_NULL) + 1)
+            }
+        }
+        j = j + 1
+    }
+}
+
+fn gc_weak_genullt() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_WEAK_NULL)
+}
+
+// ------------------------------------------------- Externe Wurzelbereiche
+//
+// Ein Speicherbereich AUSSERHALB des GC-Heaps, der `Gc[T]`-Zeiger enthalten
+// darf. Angemeldete Bereiche werden bei JEDEM Zyklusstart konservativ
+// mitgescannt, genau wie der Stapel.
+//
+// WOZU (Runde 47): `Arc[T]` legt seinen Wert auf einer eigenen Halde ab, die
+// der Sammler nicht kennt. Ohne Anmeldung waere ein `Gc[T]` in einem
+// Arc-Wert fuer den Sammler unsichtbar und sein Ziel wuerde eingesammelt,
+// obwohl es noch benutzt wird. Mit Anmeldung gilt die klare Arbeitsteilung:
+// der Zaehler entscheidet ueber den ARC-BLOCK, der Sammler ueber die
+// GC-OBJEKTE — keiner gibt frei, was dem anderen gehoert.
+//
+// PREIS, offen benannt: die Startpause eines Zyklus waechst mit der
+// angemeldeten Gesamtgroesse (konservativer Scan, 8 Byte je Wort).
+fn __gc_wroot_platz() -> bool {
+    let st: u64 = __gc_state() as u64
+    let n: u64 = __gc_ld64(st + S_WROOT_N)
+    let kap: u64 = __gc_ld64(st + S_WROOT_KAP)
+    if n < kap {
+        return true
+    }
+    var neu: u64 = kap * 2
+    if neu == 0 {
+        neu = WROOT_START
+    }
+    let p: u64 = __gc_mmap(neu * 16)
+    if p == 0 {
+        return false
+    }
+    let alt: u64 = __gc_ld64(st + S_WROOT_P)
+    if alt != 0 {
+        var i: u64 = 0
+        while i < n * 2 {
+            __gc_st64(p + i * 8, __gc_ld64(alt + i * 8))
+            i = i + 1
+        }
+        __gc_munmap(alt, kap * 16)
+    }
+    __gc_st64(st + S_WROOT_P, p)
+    __gc_st64(st + S_WROOT_KAP, neu)
+    return true
+}
+
+fn gc_wurzel_anmelden(p: *mut u8, bytes: u64) -> bool {
+    let a: u64 = p as u64
+    if a == 0 || bytes == 0 {
+        return false
+    }
+    if !__gc_wroot_platz() {
+        return false
+    }
+    let st: u64 = __gc_state() as u64
+    let n: u64 = __gc_ld64(st + S_WROOT_N)
+    let t: u64 = __gc_ld64(st + S_WROOT_P) + n * 16
+    __gc_st64(t, a)
+    __gc_st64(t + 8, bytes)
+    __gc_st64(st + S_WROOT_N, n + 1)
+    return true
+}
+
+fn gc_wurzel_abmelden(p: *mut u8) -> bool {
+    let a: u64 = p as u64
+    let st: u64 = __gc_state() as u64
+    let n: u64 = __gc_ld64(st + S_WROOT_N)
+    let f: u64 = __gc_ld64(st + S_WROOT_P)
+    if f == 0 {
+        return false
+    }
+    var i: u64 = 0
+    while i < n {
+        if __gc_ld64(f + i * 16) == a {
+            __gc_st64(f + i * 16, __gc_ld64(f + (n - 1) * 16))
+            __gc_st64(f + i * 16 + 8, __gc_ld64(f + (n - 1) * 16 + 8))
+            __gc_st64(st + S_WROOT_N, n - 1)
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn gc_wurzeln() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_WROOT_N)
+}
+
+fn __gc_wurzeln_scannen() {
+    let st: u64 = __gc_state() as u64
+    let n: u64 = __gc_ld64(st + S_WROOT_N)
+    if n == 0 {
+        return
+    }
+    let f: u64 = __gc_ld64(st + S_WROOT_P)
+    var i: u64 = 0
+    while i < n {
+        let a: u64 = __gc_ld64(f + i * 16)
+        __gc_scan(a, a + __gc_ld64(f + i * 16 + 8))
+        i = i + 1
     }
 }
 
@@ -1335,6 +1990,9 @@ fn gc_init() -> bool {
     __gc_st64(st + S_MLEN, 0)
     __gc_st64(st + S_GRENZE, MIN_GRENZE)
     __gc_st64(st + S_INKRAB, INKR_AB)
+    // Runde 47: einmal feststellen, ob ueberhaupt eine Klasse ein schwaches
+    // Feld hat. Programme ohne GcWeak zahlen fuers Nullen dann gar nichts.
+    __gc_st64(st + S_HATWEAK, __gc_weak_vorhanden())
     __gc_st64(st + S_INIT, 1)
     return true
 }
@@ -1362,7 +2020,10 @@ fn gc_max_bytes() -> u64 {
 
 fn gc_collect() -> u64 {
     let st: u64 = __gc_state() as u64
-    if __gc_ld64(st + S_INIT) == 0 {
+    if __gc_ld64(st + S_INIT) != 1 {
+        if __gc_ld64(st + S_INIT) == 2 {
+            __gc_fehler_fin_collect()
+        }
         return 0
     }
     if __gc_ld64(st + S_PHASE) != 0 {
