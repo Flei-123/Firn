@@ -9,6 +9,7 @@ mod ast;
 mod ast_kanon;
 mod layout_kanon;
 mod atomar;
+mod faden;
 mod attrs;
 mod codegen_switch;
 mod codegen_x86;
