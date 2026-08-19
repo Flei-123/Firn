@@ -1,31 +1,30 @@
-# `#[no_gc]`-Regeln (i) und (iii) — warten auf den GC-Kern
+# `#[no_gc]` rules (i) and (iii) -- waiting for the GC core
 
-Die Pruefung in `compiler/src/nogc.rs` fragt fuer
+For
 
-* **(i)** GC-Allokation  → `crate::gc::ist_gc_alloc_aufruf(name)`
-* **(iii)** Schreiben in ein `Gc[T]`/`GcWeak[T]`-Feld → `crate::gc::ist_gc_zeiger(typ)`
+* **(i)** GC allocation  -> `crate::gc::ist_gc_alloc_aufruf(name)`
+* **(iii)** writing into a `Gc[T]`/`GcWeak[T]` field -> `crate::gc::ist_gc_zeiger(typ)`
 
-ausschliesslich die beiden Vertragsfunktionen aus `compiler/src/gc.rs`
-(Modul `gckern`). Solange die dort noch `false` liefern (Skelettfassung),
-kann **kein Firn-Programm** die Regeln (i) und (iii) ausloesen — es gibt ja
-weder `gc class` noch `Gc[T]`.
+the check in `compiler/src/nogc.rs` asks exclusively the two contract
+functions from `compiler/src/gc.rs` (module `gckern`). As long as those still
+yield `false` there (the skeleton version), **no Firn program** can trigger
+rules (i) and (iii) -- there is neither `gc class` nor `Gc[T]` after all.
 
-Die beiden Programme hier sind deshalb **nicht** in `tests/neg/`: `test.sh`
-verlangt dort einen echten Compilerfehler, und ein solcher entstuende heute
-nur aus dem Parser („der Gc-Heap ist nicht umgesetzt"), nicht aus der
-`#[no_gc]`-Pruefung. Sobald `gc.rs` die beiden Abfragen beantwortet, gehoeren
-die Dateien unveraendert nach `tests/neg/` — die erwarteten Meldungen stehen
-in Zeile 1.
+The two programs here are therefore **not** in `tests/neg/`: `test.sh`
+demands a real compile error there, and today such an error would only come
+out of the parser ("the Gc heap is not implemented"), not out of the
+`#[no_gc]` check. As soon as `gc.rs` answers the two queries, the files
+belong into `tests/neg/` unchanged -- the expected messages are in line 1.
 
-Bis dahin sind die Regeln (i) und (iii) **im Compiler selbst** nachgewiesen:
-`cargo test --release` fuehrt in `nogc.rs` die Tests
+Until then rules (i) and (iii) are proven **inside the compiler itself**:
+`cargo test --release` runs the tests
 `regel1_gc_allokation_ist_verboten`, `regel3_schreiben_in_gc_feld_ist_verboten`
-und `regel3_zuweisung_an_oertliche_veraenderliche_ist_erlaubt` aus. Sie
-setzen fuer die beiden Abfragen Vorhersagen ein und pruefen Meldung, Zeile
-und Spalte. Der Compiler selbst benutzt immer `Regeln::echt()`, also `gc.rs`
-(Test `echte_regeln_sind_die_aus_gc_rs`).
+and `regel3_zuweisung_an_oertliche_veraenderliche_ist_erlaubt` in `nogc.rs`.
+They put predictions in place of the two queries and check the message, the
+line and the column. The compiler itself always uses `Regeln::echt()`, that is
+`gc.rs` (test `echte_regeln_sind_die_aus_gc_rs`).
 
-**Beim Umzug nach `tests/neg/` zu pruefen:** Zeile und Spalte in Zeile 1
-stimmen mit der Stelle ueberein, die `gckern` fuer `gc …{…}` bzw. fuer den
-Feldnamen als Span vergibt; notfalls dort nachziehen. Die Meldungstexte sind
-in `nogc.rs` festgelegt und aendern sich nicht.
+**To check when moving to `tests/neg/`:** the line and the column in line 1
+match the place that `gckern` gives as the span for `gc ...{...}` resp. for
+the field name; adjust them there if needed. The texts of the messages are
+fixed in `nogc.rs` and do not change.
