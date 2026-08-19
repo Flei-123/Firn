@@ -164,10 +164,10 @@ fi
 # --- 6. Kurzlauf: tun die Instruktionen auch das Richtige? ------------------
 cat > "$W/lauf.fi" <<'EOF'
 const L_SYS_MMAP: i64 = 9
-const L_MIT: u64 = 0
-const L_OHNE: u64 = 8
+const L_WITH: u64 = 0
+const L_WITHOUT: u64 = 8
 const L_MUTEX: u64 = 16
-const L_RUNDEN: u64 = 30000
+const L_ROUNDS: u64 = 30000
 
 fn seite() -> u64 {
     let r: i64 = syscall(L_SYS_MMAP, 0, 4096, 3, 34, -1, 0)
@@ -183,14 +183,14 @@ fn st(a: u64, o: u64, v: u64) { *((a + o) as *mut u64) = v }
 fn __thread_work(art: u64, arg: u64) -> u64 {
     let _u: u64 = art
     var i: u64 = 0
-    while i < L_RUNDEN {
+    while i < L_ROUNDS {
         thread_lock((arg + L_MUTEX) as *mut u64)
-        st(arg, L_MIT, ld(arg, L_MIT) + 1)
+        st(arg, L_WITH, ld(arg, L_WITH) + 1)
         thread_unlock((arg + L_MUTEX) as *mut u64)
-        st(arg, L_OHNE, ld(arg, L_OHNE) + 1)
+        st(arg, L_WITHOUT, ld(arg, L_WITHOUT) + 1)
         i = i + 1
     }
-    return L_RUNDEN
+    return L_ROUNDS
 }
 
 fn main() -> i32 {
@@ -212,15 +212,15 @@ fn main() -> i32 {
     }
     i = 0
     while i < 4 {
-        if thread_wait(h[i as usize]) != L_RUNDEN {
+        if thread_wait(h[i as usize]) != L_ROUNDS {
             return 2
         }
         i = i + 1
     }
-    if ld(z, L_MIT) != 4 * L_RUNDEN {
+    if ld(z, L_WITH) != 4 * L_ROUNDS {
         return 3
     }
-    if ld(z, L_OHNE) >= 4 * L_RUNDEN {
+    if ld(z, L_WITHOUT) >= 4 * L_ROUNDS {
         return 4
     }
     return 0
