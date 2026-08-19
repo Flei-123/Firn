@@ -30,25 +30,25 @@ EXPECTED_CASES=6810
 AGAINST_UPSTREAM=0
 [ "${1:-}" = "--against-upstream" ] && AGAINST_UPSTREAM=1
 
-fehler=0
+errs=0
 
 echo "== check the test data: $DATA =="
 echo "   reference: html5lib-tests @ $COMMIT (path tokenizer/)"
 
 # --- 1. the set of files ---------------------------------------------------
-vorhanden=$(cd "$DATA" && ls -1 *.test 2>/dev/null | sort)
-erwartet=$(awk '!/^#/ && NF==2 {print $2}' "$SUMS" | sort)
-count=$(printf '%s\n' "$vorhanden" | grep -c . || true)
+present=$(cd "$DATA" && ls -1 *.test 2>/dev/null | sort)
+expected=$(awk '!/^#/ && NF==2 {print $2}' "$SUMS" | sort)
+count=$(printf '%s\n' "$present" | grep -c . || true)
 
-if [ "$vorhanden" != "$erwartet" ]; then
+if [ "$present" != "$expected" ]; then
     echo "   ERROR: the set of files differs."
-    diff <(printf '%s\n' "$erwartet") <(printf '%s\n' "$vorhanden") \
+    diff <(printf '%s\n' "$expected") <(printf '%s\n' "$present") \
         | sed 's/^/          /' || true
-    fehler=1
+    errs=1
 fi
 if [ "$count" -ne "$EXPECTED_FILES" ]; then
     echo "   ERROR: $count .test files instead of $EXPECTED_FILES"
-    fehler=1
+    errs=1
 else
     echo "   files   : $count (expected $EXPECTED_FILES)"
 fi
@@ -61,22 +61,22 @@ else
     echo "   ERROR: at least one sum differs:"
     (cd "$DATA" && grep -v '^#' "../../$SUMS" | grep . | sha256sum -c - 2>&1 \
         | grep -v ': OK$' | sed 's/^/          /') || true
-    fehler=1
+    errs=1
 fi
 
 # --- 3. count the cases -----------------------------------------------------
 cases=$(python3 - "$DATA" <<'PY'
 import glob, json, os, sys
 n = 0
-for pfad in sorted(glob.glob(os.path.join(sys.argv[1], "*.test"))):
-    d = json.load(open(pfad, encoding="utf-8"))
+for path in sorted(glob.glob(os.path.join(sys.argv[1], "*.test"))):
+    d = json.load(open(path, encoding="utf-8"))
     n += len(d.get("tests", d.get("xmlViolationTests", [])))
 print(n)
 PY
 )
 if [ "$cases" -ne "$EXPECTED_CASES" ]; then
     echo "   ERROR: $cases test cases instead of $EXPECTED_CASES"
-    fehler=1
+    errs=1
 else
     echo "   cases   : $cases (expected $EXPECTED_CASES)"
 fi
@@ -87,24 +87,24 @@ if [ "$AGAINST_UPSTREAM" -eq 1 ]; then
     echo "== direct comparison with GitHub (commit $COMMIT) =="
     tmp=$(mktemp -d)
     trap 'rm -rf "$tmp"' EXIT
-    for f in $(printf '%s\n' "$erwartet"); do
+    for f in $(printf '%s\n' "$expected"); do
         url="https://raw.githubusercontent.com/html5lib/html5lib-tests/$COMMIT/tokenizer/$f"
         if ! curl -sSfL --max-time 60 -o "$tmp/$f" "$url"; then
             echo "   ERROR: $f could not be loaded ($url)"
-            fehler=1
+            errs=1
             continue
         fi
         if cmp -s "$tmp/$f" "$DATA/$f"; then
             echo "   $f: identical"
         else
             echo "   $f: DIFFERS from upstream"
-            fehler=1
+            errs=1
         fi
     done
 fi
 
 echo
-if [ "$fehler" -eq 0 ]; then
+if [ "$errs" -eq 0 ]; then
     echo "OK: test data unchanged (14 files, 6810 cases, sha256 as upstream)."
     exit 0
 fi

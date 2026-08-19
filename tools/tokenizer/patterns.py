@@ -1,48 +1,48 @@
 #!/usr/bin/env python3
-"""Dynamisch gewichtete INSTRUKTIONSMUSTER eines Firn-Binaries (Runde 51).
+"""Dynamically weighted INSTRUCTION PATTERNS of a Firn binary (round 51).
 
-WARUM: `tools/tokenizer/profile.py` beantwortet „welche FUNKTION kostet?".
-Diese Datei beantwortet die Frage daneben — „welche FORM von Code kostet?".
-Beides zusammen zeigt erst, wo der Uebersetzer schlecht arbeitet.
+WHY: `tools/tokenizer/profile.py` answers "which FUNCTION costs?".
+This file answers the question next to it -- "which FORM of code costs?".
+Only both together show where the compiler works badly.
 
-Die Lehre aus Runde 43 (§5) war: **statische Haeufigkeit ist keine Schaetzung
-des Gewinns** — dort war ein statischer Zaehler um den Faktor acht zu
-optimistisch. Deshalb verbindet dieses Werkzeug die Disassemblierung mit der
-INSTRUKTIONSGENAUEN callgrind-Ausgabe und gewichtet jedes Muster mit seiner
-echten Ausfuehrungszahl.
+The lesson of round 43 (5) was: **static frequency is no estimate
+of the gain** -- there a static counter was too optimistic by a factor of
+eight. That is why this tool combines the disassembly with the
+INSTRUCTION-EXACT callgrind output and weights every pattern with its
+real execution count.
 
-Erzeugen der Eingaben:
+Producing the inputs:
 
     objdump -d --no-show-raw-insn BINARY > dis.txt
     valgrind --tool=callgrind --dump-instr=yes --cache-sim=no --branch-sim=no \
-             --callgrind-out-file=cg.out BINARY < eingabe
+             --callgrind-out-file=cg.out BINARY < input
 
-Aufruf:
+Usage:
 
     python3 tools/tokenizer/patterns.py dis.txt cg.out
 
-FALLEN beim Lesen der callgrind-Datei (beide haben hier schon zugeschlagen):
-  * Mit `--dump-instr=yes` beginnt eine Kostenzeile mit der ADRESSE, die auch
-    relativ sein kann (`+12`, `-4`, `*`). Wer das nicht aufloest, bekommt ein
-    plausibel aussehendes, falsches Profil.
-  * Die Zeile unmittelbar nach `calls=` sind die INKLUSIVEN Kosten des
-    Aufrufs und gehoeren nicht zu den Selbstkosten der aufrufenden Funktion.
+TRAPS when reading the callgrind file (both have already struck here):
+  * With `--dump-instr=yes` a cost line begins with the ADDRESS, which can
+    also be relative (`+12`, `-4`, `*`). Whoever does not resolve that gets a
+    plausible looking, wrong profile.
+  * The line immediately after `calls=` is the INCLUSIVE cost of the
+    call and does not belong to the self costs of the calling function.
 
-Gefunden hat dieses Werkzeug die drei groessten Posten der Runde 51:
-`setcc`-Ketten (17,13 %), Store+Reload derselben Zelle (10,27 %) und
-unbedingte Spruenge hinter bedingten (3,05 %).
+This tool found the three largest items of round 51:
+`setcc` chains (17.13 %), store+reload of the same cell (10.27 %) and
+address arithmetic that could go into the memory operand (6.94 %).
 """
 import re
 import sys
 from collections import defaultdict
 
 
-def lies_dis(pfad):
+def read_dis(path):
     """addr -> (Mnemonic, Operanden, Symbol)"""
     code = {}
-    reihe = []
+    addrs = []
     sym = "?"
-    for z in open(pfad, errors="replace"):
+    for z in open(path, errors="replace"):
         m = re.match(r"^([0-9a-f]+) <(.+)>:", z)
         if m:
             sym = m.group(2)
@@ -52,24 +52,24 @@ def lies_dis(pfad):
             continue
         a = int(m.group(1), 16)
         code[a] = (m.group(2), m.group(3).strip(), sym)
-        reihe.append(a)
-    reihe.sort()
-    return code, reihe
+        addrs.append(a)
+    addrs.sort()
+    return code, addrs
 
 
-def lies_kosten(pfad):
+def read_costs(path):
     """addr -> Ir (Selbstkosten)"""
     kosten = defaultdict(int)
     letzte = 0
-    inaufruf = False
-    for z in open(pfad, errors="replace"):
+    in_call = False
+    for z in open(path, errors="replace"):
         if z.startswith(("calls=", "jump=", "jcnd=")):
-            inaufruf = z.startswith("calls=")
+            in_call = z.startswith("calls=")
             continue
         m = re.match(r"^(0x[0-9a-f]+|\+\d+|-\d+|\*)\s+(\S+)\s+(\d+)", z)
         if not m:
             if z.startswith(("fn=", "fl=", "cfn=", "cfl=", "cob=", "ob=")):
-                inaufruf = False
+                in_call = False
             continue
         p = m.group(1)
         if p.startswith("0x"):
@@ -79,8 +79,8 @@ def lies_kosten(pfad):
         else:
             a = letzte + int(p)
         letzte = a
-        if inaufruf:
-            inaufruf = False   # inklusive Kosten des Aufrufs, nicht Selbstkosten
+        if in_call:
+            in_call = False   # the inclusive cost of the call, not the self cost
             continue
         kosten[a] += int(m.group(3))
     return kosten
@@ -105,24 +105,24 @@ def stamm(r):
 
 
 def main():
-    code, reihe = lies_dis(sys.argv[1])
-    kosten = lies_kosten(sys.argv[2])
-    ges = sum(kosten.values())
-    if ges == 0:
+    code, addrs = read_dis(sys.argv[1])
+    kosten = read_costs(sys.argv[2])
+    total = sum(kosten.values())
+    if total == 0:
         print("keine Kosten gefunden — wurde --dump-instr=yes gesetzt?")
         return 1
-    print(f"Gesamt (Selbstkosten aus der Instruktionsdatei): {ges:,}")
+    print(f"total (self costs from the instruction file): {total:,}")
 
-    muster = defaultdict(lambda: [0, 0])   # Name -> [Ir, Stellen]
+    patterns = defaultdict(lambda: [0, 0])   # Name -> [Ir, Stellen]
 
     def zaehle(name, ir):
-        m = muster[name]
+        m = patterns[name]
         m[0] += ir
         m[1] += 1
 
-    for i, a in enumerate(reihe):
+    for i, a in enumerate(addrs):
         mn, ops, sym = code[a]
-        nxt = reihe[i + 1] if i + 1 < len(reihe) else None
+        nxt = addrs[i + 1] if i + 1 < len(addrs) else None
 
         # (1) an unconditional jump directly behind a conditional one -> block layout
         if ist_bedingt(mn) and nxt is not None and code[nxt][0] == "jmp" and code[nxt][2] == sym:
@@ -132,19 +132,19 @@ def main():
         if mn.startswith("set"):
             kette = [a]
             j = i + 1
-            treffer = False
-            while j < len(reihe) and j <= i + 5:
-                b = reihe[j]
+            hit = False
+            while j < len(addrs) and j <= i + 5:
+                b = addrs[j]
                 mb = code[b][0]
                 kette.append(b)
                 if mb == "test":
-                    if j + 1 < len(reihe) and ist_bedingt(code[reihe[j + 1]][0]):
-                        treffer = True
+                    if j + 1 < len(addrs) and ist_bedingt(code[addrs[j + 1]][0]):
+                        hit = True
                     break
                 if mb not in ("movzbl", "movzwl", "mov"):
                     break
                 j += 1
-            if treffer:
+            if hit:
                 zaehle("setcc-Kette statt direktem Sprung",
                        sum(kosten.get(x, 0) for x in kette))
 
@@ -176,32 +176,32 @@ def main():
             if (q in gesichert and "(%rbp)" in z) or (z in gesichert and "(%rbp)" in q):
                 zaehle("Rahmenverwaltung (callee-saved sichern/holen)", kosten.get(a, 0))
 
-    print("\n== Muster (dynamisch gewichtet) ==")
-    for name, (ir, n) in sorted(muster.items(), key=lambda x: -x[1][0]):
-        print(f"  {name:<48} {ir:>14,} Ir  {100 * ir / ges:6.2f}%   {n:>6} Stellen")
+    print("\n== patterns (dynamically weighted) ==")
+    for name, (ir, n) in sorted(patterns.items(), key=lambda x: -x[1][0]):
+        print(f"  {name:<48} {ir:>14,} Ir  {100 * ir / total:6.2f}%   {n:>6} Stellen")
 
     proMn = defaultdict(int)
     proN = defaultdict(int)
-    for a in reihe:
+    for a in addrs:
         proMn[code[a][0]] += kosten.get(a, 0)
         proN[code[a][0]] += 1
     print("\n== Top-Mnemonics ==")
     for mn, ir in sorted(proMn.items(), key=lambda x: -x[1])[:20]:
-        print(f"  {mn:<12} {ir:>14,} Ir  {100 * ir / ges:6.2f}%   {proN[mn]:>6} statisch")
+        print(f"  {mn:<12} {ir:>14,} Ir  {100 * ir / total:6.2f}%   {proN[mn]:>6} statisch")
 
-    print("\n== Datenbewegungen nach Art ==")
-    art = defaultdict(int)
+    print("\n== data movements by kind ==")
+    kind = defaultdict(int)
     artn = defaultdict(int)
-    for a in reihe:
+    for a in addrs:
         mn, ops, _ = code[a]
         if not mn.startswith("mov") or "," not in ops:
             continue
         q, z = ops.rsplit(",", 1)
-        f = lambda o: "Speicher" if "(" in o else ("Konstante" if o.startswith("$") else "Register")
-        art[f"{f(q)} -> {f(z)}"] += kosten.get(a, 0)
+        f = lambda o: "memory" if "(" in o else ("constant" if o.startswith("$") else "register")
+        kind[f"{f(q)} -> {f(z)}"] += kosten.get(a, 0)
         artn[f"{f(q)} -> {f(z)}"] += 1
-    for name, ir in sorted(art.items(), key=lambda x: -x[1]):
-        print(f"  {name:<28} {ir:>14,} Ir  {100 * ir / ges:6.2f}%   {artn[name]:>6} statisch")
+    for name, ir in sorted(kind.items(), key=lambda x: -x[1]):
+        print(f"  {name:<28} {ir:>14,} Ir  {100 * ir / total:6.2f}%   {artn[name]:>6} statisch")
     return 0
 
 
