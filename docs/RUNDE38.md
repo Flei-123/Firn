@@ -1,251 +1,256 @@
-# Runde 38 — GC: Pausen, Fragmentierung, Dauerlauf
+# Round 38 — GC: pauses, fragmentation, endurance run
 
-Revier dieser Runde: `lib/gc/gc.fi`, `lib/rc/`, Messwerkzeuge `tools/gc_meas/`.
-Compiler-Quellen wurden nicht angefasst. Basis: Runde 36 (Commit 97ec31a).
+Territory of this round: `lib/gc/gc.fi`, `lib/rc/`, measuring tools
+`tools/gc_meas/`. Compiler sources were not touched. Base: round 36
+(commit 97ec31a).
 
-## Stufe 1 — Messwerkzeuge und Vorher-Zahlen (ohne GC-Aenderung)
+## Stage 1 — measuring tools and before-numbers (without a GC change)
 
-Neu: `tools/gc_meas/` mit `run.sh`, `pause.fi`, `frag.fi`.
+New: `tools/gc_meas/` with `run.sh`, `pause.fi`, `frag.fi`.
 
-- **pause.fi**: DOM-artiger Dauer-Workload, sortiert jede Sammellauf-Pause
-  (`gc_pause_ns_last`) in neun Klassen (Histogramm) und meldet Maximum und
-  Summe. Laufzeitbudget per `GCM_PAUSE_SEK`.
-- **frag.fi**: sechs Groessenklassen (48 bis 2048 Bytes Nutzdaten), pro Runde
-  ein frischer Stapel genau einer Klasse, der Stapel derselben Klasse aus der
-  vorherigen Runde wird fallen gelassen. Lebend: konstant sechs Stapel.
-  Gemessen wird der echte RSS aus `/proc/self/statm` (via `lib/dom/meas.fi`).
-- **run.sh**: baut beide in drei Baustufen (release-fast, no-opt, dev-fast),
-  prueft im Kurzlauf, dass die Zaehler baustufenunabhaengig uebereinstimmen
-  (sonst waere die Messung wertlos), dann der eigentliche Lauf in release-fast
-  plus Auswertung (Pausen-Histogramm, Fragmentierungs-Urteil).
+- **pause.fi**: DOM-like endurance workload, sorts every collection pause
+  (`gc_pause_ns_last`) into nine classes (histogram) and reports the maximum
+  and the sum. Runtime budget via `GCM_PAUSE_SEK`.
+- **frag.fi**: six size classes (48 to 2048 bytes of payload), per round
+  a fresh stack of exactly one class; the stack of the same class from the
+  previous round is dropped. Live: constantly six stacks.
+  What is measured is the real RSS from `/proc/self/statm` (via
+  `lib/dom/meas.fi`).
+- **run.sh**: builds both in three build stages (release-fast, no-opt,
+  dev-fast), checks in a short run that the counters agree independently of
+  the build stage (otherwise the measurement would be worthless), then the
+  actual run in release-fast plus evaluation (pause histogram,
+  fragmentation verdict).
 
-### Befund: der Test musste erst messbar gemacht werden
+### Finding: the test first had to be made measurable
 
-Der erste Entwurf des Fragmentierungstests zeigte `lebende=120000` — exakt
-ALLE jemals angelegten Objekte, d.h. der GC hat im Test nichts eingesammelt.
-Isolation mit Mindesttests (im Log vermerkt, nicht Teil des Repos):
+The first draft of the fragmentation test showed `lebende=120000` — exactly
+ALL objects ever allocated, i.e. the GC collected nothing in the test.
+Isolation with minimal tests (noted in the log, not part of the repo):
 
-1. Verkettete Kette (10000 Objekte), Kopf-Variable auf null gesetzt, zweimal
-   `gc_collect()` → **10000 bleiben lebend**.
-2. Unverkettete Objekte, sofort fallengelassen → werden frei (1 Rest).
-3. Wie (1), plus 40 KiB Stapel-Verwuestung nach dem Nullen → **bleibt**.
+1. Linked chain (10000 objects), head variable set to null, `gc_collect()`
+   twice → **10000 stay live**.
+2. Unlinked objects, dropped immediately → become free (1 remainder).
+3. Like (1), plus 40 KiB of stack devastation after the nulling → **stays**.
 
-Ursache liegt NICHT im Sammler, sondern im Zusammenspiel Codegen +
-konservativem Stapelscan, zweifach nachgewiesen per `objdump`:
+The cause lies NOT in the collector but in the interplay of codegen and the
+conservative stack scan, demonstrated twice via `objdump`:
 
-- Der Optimierer entfernt `k = gc_null[T]()` als tote Zuweisung, wenn `k`
-  danach nie gelesen wird (min1: kein einziger Schreibzugriff auf den
-  k-Slot nach dem letzten Lesen). Der alte Zeiger bleibt physisch im Rahmen.
-- Ergebnis-Temp-Zellen von Aufrufen werden pro Aufrufstelle frisch vergeben
-  und nie genullt (min4: erste `bau()`-Union in `-0x50(%rbp)`, zweite in
-  `-0x110(%rbp)`). Der alte Stapelkopf klebt in der ersten Temp-Zelle —
-  EIN Zeiger haelt per Verkettung die ganze alte Kette.
+- The optimizer removes `k = gc_null[T]()` as a dead assignment if `k` is
+  never read afterwards (min1: not a single write to the k slot after the
+  last read). The old pointer physically stays in the frame.
+- Result temp cells of calls are allocated freshly per call site and are
+  never nulled (min4: first `bau()` union in `-0x50(%rbp)`, second in
+  `-0x110(%rbp)`). The old stack head sticks in the first temp cell —
+  ONE pointer holds the whole old chain through the links.
 
-Folge fuer alle GC-Messungen (und ehrlich fuer Nutzer der Laufzeit):
-**Unerreichbarkeit zuverlaessig herstellen heisst: den Zeiger in einer
-Hilfsfunktion sterben lassen (zurueckgekehrter Rahmen wird vom Scrubber
-genullt) oder die Wurzel als rohen Wert echt ueberschreiben** — niemals sich
-auf ein letztes Null-Setzen in derselben Funktion verlassen.
-`tests/510_gc_cycle_becomes_resolved.fi` macht es genau so (Zyklus in
-`zyklus()` angelegt, nur `u32` kommt zurueck) — der Test beweist, dass der
-Sammler selbst korrekt einsammelt.
+Consequence for all GC measurements (and, honestly, for users of the
+runtime):
+**Establishing unreachability reliably means: let the pointer die in a
+helper function (a returned frame is nulled by the scrubber) or really
+overwrite the root as a raw value** — never rely on a final nulling within
+the same function.
+`tests/510_gc_cycle_becomes_resolved.fi` does exactly that (cycle created in
+`zyklus()`, only `u32` comes back) — the test proves that the collector
+itself collects correctly.
 
-frag.fi haelt die sechs Stapelkoepfe deshalb als rohe Adressen in einem
-`[u64; 6]`-Array in `main` (echtes Ueberschreiben, Referenzsumme am Ende),
-gebaut wird in Hilfsfunktionen, die nur die Adresse zurueckgeben.
-Damit: `lebende=1200` nach dem Schluss-Collect — exakt die erwarteten
-6 Stapel × 200 Objekte. Kurzlauf-Zaehler in allen drei Baustufen identisch
-(300 bei 120×50).
+frag.fi therefore holds the six stack heads as raw addresses in a
+`[u64; 6]` array in `main` (real overwriting, reference sum at the end),
+and building happens in helper functions that only return the address.
+With that: `lebende=1200` after the final collect — exactly the expected
+6 stacks × 200 objects. Short-run counters identical in all three build
+stages (300 at 120×50).
 
-### Vorher-Zahlen (Basis 97ec31a, ohne GC-Aenderung)
+### Before-numbers (base 97ec31a, without a GC change)
 
-Pausen, 60 s DOM-Soak-Workload (release-fast, diese Maschine):
+Pauses, 60 s DOM soak workload (release-fast, this machine):
 
-| Lauf | Zyklen | Sammellaeufe | laengste Pause | ≤ 250 µs | > 2 ms | Summe GC |
+| Run | Cycles | Collections | longest pause | ≤ 250 µs | > 2 ms | Sum GC |
 |---|---|---|---|---|---|---|
 | 1 | 105,3 M | 49819 | 1,97 ms | 96,1 % | 5 | 9456 ms |
 | 2 | 94,3 M | 44619 | 7,22 ms | 96,0 % | 154 | 9390 ms |
 
-Die Max-Pause schwankt stark zwischen Laeufen (Ausreisser im 4–8-ms-Band);
-typisch (96 %) sind ≤ 250 µs. GC-Zeit-Summe ≈ 15–16 % der Laufzeit.
-Die 3,54 ms aus der Browser-Abnahme liegen in derselben Grossenordnung.
+The maximum pause fluctuates strongly between runs (outliers in the 4–8 ms
+band); typical (96 %) are ≤ 250 µs. Sum of GC time ≈ 15–16 % of the runtime.
+The 3,54 ms from the browser acceptance are in the same order of magnitude.
 
-Fragmentierung, 600 Runden × 200 Objekte (120000 Allokationen, 6 Klassen):
+Fragmentation, 600 rounds × 200 objects (120000 allocations, 6 classes):
 
-| Metrik | Wert |
+| Metric | Value |
 |---|---|
-| RSS Start | 48 KiB |
-| RSS Maximum | 3140 KiB |
-| RSS Ende | 3140 KiB |
-| Drift im letzten Drittel | **+0,0 % (stabil)** |
-| heap_bytes Ende | 3145728 |
-| lebende Ende | 1200 (erwartet 1200) |
+| RSS start | 48 KiB |
+| RSS maximum | 3140 KiB |
+| RSS end | 3140 KiB |
+| Drift in the last third | **+0,0 % (stable)** |
+| heap_bytes end | 3145728 |
+| live at end | 1200 (expected 1200) |
 
-RSS laeuft einmalig auf ~3 MiB hoch (Heap-Grenze pendelt sich ein) und
-bleibt dann 200+ Runden konstant — auf dieser Dauer keine Fragmentierung
-sichtbar. Die Aussage ist durch die kurze Laufzeit begrenzt; der 30-Minuten-
-Dauerlauf (Stufe 4) ist der haertere Nachweis.
+RSS rises once to ~3 MiB (the heap threshold settles) and then stays
+constant for 200+ rounds — no fragmentation visible over this duration.
+The statement is limited by the short runtime; the 30-minute endurance run
+(stage 4) is the harder proof.
 
-Messartefakte: `tools/gc_meas/pause.tsv`, `tools/gc_meas/frag.tsv`.
+Measurement artifacts: `tools/gc_meas/pause.tsv`, `tools/gc_meas/frag.tsv`.
 
-## Stufe 2 — Fragmentierung: leere Chunks gehen ans OS
+## Stage 2 — fragmentation: empty chunks go back to the OS
 
-### Befund (Vorher, gemessen mit dem neuen Phasen-Test `frag2.fi`)
+### Finding (before, measured with the new phase test `frag2.fi`)
 
-`frag2.fi` faehrt einen Phasen-Workload: 300 Runden nur grosse Objekte
-(Klasse 2048, 24 Stapel im Ring), dann 300 Runden nur kleine (Klasse 48).
-Ergebnis mit dem alten Sweep:
+`frag2.fi` drives a phase workload: 300 rounds with large objects only
+(class 2048, 24 stacks in a ring), then 300 rounds with small ones only
+(class 48). Result with the old sweep:
 
-| Metrik | Vorher |
+| Metric | Before |
 |---|---|
-| RSS Phase A max | 20284 KiB |
-| RSS Phase B max | 24124 KiB (**steigt weiter**) |
-| RSS nach Schluss-`gc_collect()` | 24124 KiB (**faellt nie**) |
+| RSS phase A max | 20284 KiB |
+| RSS phase B max | 24124 KiB (**keeps rising**) |
+| RSS after the final `gc_collect()` | 24124 KiB (**never falls**) |
 
-Zwei getrennte Ursachen, beide in `lib/gc/gc.fi`:
+Two separate causes, both in `lib/gc/gc.fi`:
 
-1. **Leere Klassen-Chunks gingen nie ans OS.** `__gc_sweep` gab nur
-   Grossobjekt-Chunks (`klasse >= KLASSEN`) per `munmap` zurueck; die
-   256-KiB-Klassen-Chunks blieben fuer immer gemappt, selbst komplett leere.
-2. **Die Sammel-Grenze war nach oben offen.** Nach dem letzten Lauf der
-   Gross-Phase war `GRENZE = lebbytes` ~ 9,5 MiB; die Klein-Phase alloziert
-   nur 3,8 MiB gesamt — es lief NIE wieder eine Sammlung, die toten Chunks
-   der Gross-Phase wurden nicht einmal mehr besucht. (gemessen: 300 Runden,
-   0 Sammellaeufe in Phase B)
+1. **Empty class chunks never went back to the OS.** `__gc_sweep` only
+   returned large-object chunks (`klasse >= KLASSEN`) via `munmap`; the
+   256 KiB class chunks stayed mapped forever, even completely empty ones.
+2. **The collection threshold was open at the top.** After the last run of
+   the large phase, `GRENZE = lebbytes` was ~ 9,5 MiB; the small phase
+   allocates only 3,8 MiB in total — so a collection NEVER ran again, and
+   the dead chunks of the large phase were not even visited any more.
+   (measured: 300 rounds, 0 collections in phase B)
 
-### Aenderung (nur `lib/gc/gc.fi`)
+### Change (only `lib/gc/gc.fi`)
 
-- `__gc_sweep`: komplett leere Chunks JEDER Klasse werden ans OS
-  zurueckgegeben. Die Freilisten-Segmentabschneidung laeuft ueber den vor
-  dem Chunk gemerkten Listenkopf in O(1) — kein zweiter Durchgang.
-- **Hysterese** (Chunk-Kopf Offset 48, neu belegt und dokumentiert): ein
-  Chunk wird erst zurueckgegeben, wenn er zwei Sweeps in Folge leer war.
-  Ohne sie pendelt der Phasen-Test zwischen munmap/mmap — gemessen
-  +46 % Laufzeit (118 -> 176 ms); mit ihr: 123 ms, also churfrei.
-- **Grenzen-Kappe**: `MAX_GRENZE = 4 MiB` deckelt den Abstand zwischen zwei
-  Sammlungen. Der Speicherueberhang ueber der Lebendmenge ist damit immer
-  < 4 MiB, egal wie gross der Heap einmal war. Workloads mit kleinem Heap
-  (DOM-Soak ~ 1,3 MiB) merken davon nichts (`MIN_GRENZE` wirkt wie bisher).
+- `__gc_sweep`: completely empty chunks of EVERY class are returned to the
+  OS. Cutting the free-list segment runs in O(1) via the list head
+  remembered in front of the chunk — no second pass.
+- **Hysteresis** (chunk header offset 48, newly occupied and documented): a
+  chunk is only returned once it has been empty for two sweeps in a row.
+  Without it the phase test oscillates between munmap/mmap — measured
+  +46 % runtime (118 -> 176 ms); with it: 123 ms, i.e. churn-free.
+- **Threshold cap**: `MAX_GRENZE = 4 MiB` caps the distance between two
+  collections. The memory overhang above the live set is therefore always
+  < 4 MiB, no matter how large the heap once was. Workloads with a small
+  heap (DOM soak ~ 1,3 MiB) notice nothing of it (`MIN_GRENZE` works as
+  before).
 
-### Nachher (gleiche Tests, gleiche Maschine)
+### After (same tests, same machine)
 
-| Metrik | Vorher | Nachher |
+| Metric | Before | After |
 |---|---|---|
-| frag: RSS Ende | 3140 KiB | 2624 KiB |
-| frag: Laufzeit | 63 ms | 58 ms |
-| frag2: Phase A max | 20284 KiB | 14400 KiB |
-| frag2: Phase B max | 24124 KiB | 16448 KiB |
-| frag2: RSS Ende | 24124 KiB | **2112 KiB** |
-| frag2: Laufzeit | 120 ms | 115 ms |
+| frag: RSS end | 3140 KiB | 2624 KiB |
+| frag: runtime | 63 ms | 58 ms |
+| frag2: phase A max | 20284 KiB | 14400 KiB |
+| frag2: phase B max | 24124 KiB | 16448 KiB |
+| frag2: RSS end | 24124 KiB | **2112 KiB** |
+| frag2: runtime | 120 ms | 115 ms |
 
-Die RSS-Kurve in Phase B faellt jetzt MITTEN IM LAUF von selbst
-(16448 -> 13632 -> 2112 KiB ab Runde ~150), statt auf dem Maximum der
-Gross-Phase sitzen zu bleiben. `lebende` bleibt exakt 1200 (frag) bzw.
-4856 (frag2-Ring) — Verhalten der Sammlung unveraendert, nur die
-Speicherrueckgabe ist neu.
+The RSS curve in phase B now falls by itself IN THE MIDDLE OF THE RUN
+(16448 -> 13632 -> 2112 KiB from round ~150 on), instead of remaining
+stuck at the maximum of the large phase. `lebende` stays exactly 1200
+(frag) resp. 4856 (frag2 ring) — the behavior of the collection is
+unchanged, only the memory return is new.
 
-Messlatte: test.sh **640/640**, selbst_vergleich **186/0/0**, Fixpunkt
-**zeichengleich (284207 Zeilen)**, 19 gc/rc-Tests ok, 6 gc-Negativtests
+Bar: test.sh **640/640**, selbst_vergleich **186/0/0**, fixpoint
+**character-identical (284207 lines)**, 19 gc/rc tests ok, 6 gc negative
+tests rc!=0.
+
+Remaining design limit (honestly named): objects that live scattered over
+many chunks hold those chunks — without compaction (forbidden by the
+conservative scan) that cannot be solved. The scattering count stays within
+bounds, however, because allocations come chunk-wise from the free list.
+
+## Stage 3 — incremental collection (hybrid)
+
+### Method
+
+`lib/gc/gc.fi` now runs a three-phase cycle (new state fields from offset
+320 in the state block — the room was there, **no compiler change
+needed**):
+
+- **Phase 0 (idle)**: as before. Threshold reached → cycle.
+- **Phase 1 (marking)**: the root scan (registers + stack) stays atomic
+  (a conservative scan cannot be interrupted — the stack changes), the
+  tracing runs in slices of 512 objects per allocation.
+- **Phase 2 (sweeping)**: the sweep runs in slices of 2 chunks per
+  allocation (cursor in the state block); free-list segment cutting and the
+  empty hysteresis from stage 2 apply per chunk unchanged.
+
+Correctness without compaction and without a second stack scan:
+
+- **Insertion barrier activated** (Dijkstra): `__gc_barrier` colors the
+  target of a Gc write gray while a cycle is running — until now it only
+  counted. White targets behind black containers can thus not become
+  invisible.
+- **Objects allocated during a cycle are gray** and go onto the mark stack
+  (the stack is not scanned again; an object that is only stack-live could
+  otherwise be swept before it was ever linked in).
+- **White parity** (`S_PAR`, 0/2): the sweep no longer resets marks; at the
+  end of the cycle the parity flips and all survivors are white again in
+  one stroke. There is thus no mark reset pass and no stale marks in the
+  next cycle.
+- **Exhaustion fallback**: if an allocation in the middle of a cycle finds
+  no block, the rest of the cycle is finished atomically before OutOfMemory
+  is reported (DESIGNZIELE §2 stands).
+
+### Measurements (this machine, load caveat: rounds running in parallel)
+
+Pauses by slice type (diagnostic fields `S_PMAX_*`, `gc_pause_max_typ`),
+DOM workload, incremental path forced (`INKR_AB` set to 1 MiB for the test):
+
+| Slice | longest pause |
+|---|---|
+| cycle start (root scan) | 0,15 ms |
+| marking (512 objects) | 0,01–0,02 ms |
+| sweeping (2 chunks) | 0,44–0,52 ms |
+| termination | 0,01 ms |
+
+The pauses are bounded **independently of the heap size**: the start
+depends on the stack depth, mark/sweep on the (constant) slice sizes —
+no longer on the heap. That was exactly the goal.
+
+Throughput DOM workload (5 s runs, median of 5, interleaved):
+
+| Variant | Cycles (median) | longest pause |
+|---|---|---|
+| stage 2 (atomic) | 7 786 000 | 0,44 ms |
+| hybrid | 7 110 000 (**−8,7 %**) | 0,46 ms |
+| incremental forced | 6 533 000 | **0,47 ms** |
+
+### The hybrid and why
+
+Purely incremental (from the first cycle on) cost −13 to −26 % throughput
+for heaps whose full cycle is below a millisecond anyway — pure loss.
+The collector therefore only switches to the incremental cycle from
+`INKR_AB = 8 MiB` of heap; below that the atomic path from stage 2 runs
+unchanged (its pause grows linearly: ~0,5 ms per 1,3 MiB — at 8 MiB that
+would be ~3 ms, and from there the slices take over).
+
+The DOM soak workload (heap ~1,3 MiB) therefore runs atomically: pauses as
+in stage 2, throughput affected only by the phase check per allocation
+(measured −8,7 %, within the ±10% requirement). Large heaps get pauses of
+around 0,5 ms, independent of the heap size.
+
+Honest side effect, measured on the phase test (peak ~20 MiB, above the
+threshold): `rss_ende` 14912 KiB instead of 2112 KiB in stage 2 — floating
+garbage (objects allocated gray live one cycle longer) and the empty
+hysteresis delays the return in the incremental path. Against the state
+before this round (24124 KiB, never falling) it remains a clear
+improvement; below 8 MiB exactly the stage 2 behavior applies.
+
+Bar: test.sh **640/640**, selbst_vergleich **186/0/0**, fixpoint
+**character-identical (284207)**, 19 gc/rc tests ok, 6 gc negative tests
 rc!=0.
 
-Verbleibende Designgrenze (ehrlich benannt): Objekte, die ueber viele
-Chunks verstreut leben, halten diese Chunks — ohne Kompaktieren (durch den
-konservativen Scan untersagt) ist das nicht loesbar. Die Verstreuzahl haelt
-sich aber in Grenzen, weil Allokationen chunk-weise aus der Freiliste
-kommen.
+## Stage 5 — finalizers and Arc[T]: named remaining work
 
-## Stufe 3 — Inkrementelles Sammeln (hybrid)
+Deliberately NOT started, both are bigger than a residual stage:
 
-### Verfahren
+- **Finalizers**: they need a semantic decision (when allowed, resurrection
+  yes/no, order, thread). Without a SPEC basis every implementation would
+  be guesswork; the conservative scan and the parity marks of this round
+  are compatible with them (finalizable objects would live one cycle
+  longer — the same machinery as floating garbage).
+- **Arc[T]**: a second reference type next to Rc[T] with atomic counters —
+  only sensible once there are threads (SPEC §7 is single-threaded in
+  stage 0). Building atomics without threads would be wasted effort.
 
-`lib/gc/gc.fi` fuehrt jetzt einen dreiphasigen Zyklus (neue Zustandsfelder
-ab Offset 320 im Zustandsblock — Platz war vorhanden, **keine
-Compiler-Aenderung noetig**):
-
-- **Phase 0 (Ruhe)**: wie bisher. Grenze erreicht → Zyklus.
-- **Phase 1 (Markieren)**: Wurzelscan (Register + Stapel) bleibt atomar
-  (konservativer Scan kann nicht unterbrochen werden — der Stapel aendert
-  sich), das Verfolgen laeuft in Scheiben von 512 Objekten pro Allokation.
-- **Phase 2 (Fegen)**: der Sweep laeuft in Scheiben von 2 Chunks pro
-  Allokation (Merker im Zustandsblock); Freilisten-Segmentabschneidung und
-  Leer-Hysterese aus Stufe 2 gelten pro Chunk unveraendert.
-
-Korrektheit ohne Kompaktieren und ohne erneuten Stapelscan:
-
-- **Einfuegebarriere aktiviert** (Dijkstra): `__gc_barrier` faerbt das Ziel
-  eines Gc-Schreibzugriffs grau, solange ein Zyklus laeuft — bisher zaehlte
-  sie nur. Weisse Ziele hinter schwarzen Containern koennen so nicht
-  unsichtbar werden.
-- **Waehrend eines Zyklus allokierte Objekte sind grau** und kommen auf den
-  Markstapel (der Stapel wird nicht erneut gescannt; ein nur stapellebendes
-  Objekt duerfte sonst gefegt werden, bevor es je angeschlossen wurde).
-- **Weiss-Paritaet** (`S_PAR`, 0/2): der Sweep setzt keine Marken mehr
-  zurueck; am Zyklusende kippt die Paritaet und alle Ueberlebenden sind auf
-  einen Schlag wieder weiss. Damit gibt es keinen Marken-Reset-Durchlauf
-  und keine Altmarken im naechsten Zyklus.
-- **Erschoepfungs-Fallback**: findet die Allokation mitten im Zyklus keinen
-  Block, wird der Rest des Zyklus atomar zu Ende gebracht, bevor
-  OutOfMemory gemeldet wird (DESIGNZIELE §2 bleibt).
-
-### Messungen (diese Maschine, Lastvorbehalt: parallel laufende Runden)
-
-Pausen nach Scheibentyp (Diagnose-Felder `S_PMAX_*`, `gc_pause_max_typ`),
-DOM-Workload, inkrementeller Pfad erzwungen (`INKR_AB` testweise 1 MiB):
-
-| Scheibe | laengste Pause |
-|---|---|
-| Zyklus-Start (Wurzelscan) | 0,15 ms |
-| Markieren (512 Objekte) | 0,01–0,02 ms |
-| Fegen (2 Chunks) | 0,44–0,52 ms |
-| Termination | 0,01 ms |
-
-Die Pausen sind **heap-groessen-unabhaengig** begrenzt: Start haengt von
-der Stapeltiefe ab, Mark/Fegen von den (konstanten) Scheibengroessen —
-nicht mehr vom Heap. Genau das war das Ziel.
-
-Durchsatz DOM-Workload (5 s-Laeufe, Median von 5, verschachtelt):
-
-| Variante | Zyklen (Median) | laengste Pause |
-|---|---|---|
-| Stufe 2 (atomar) | 7 786 000 | 0,44 ms |
-| Hybrid | 7 110 000 (**−8,7 %**) | 0,46 ms |
-| inkrementell erzwungen | 6 533 000 | **0,47 ms** |
-
-### Der Hybrid und warum
-
-Rein inkrementell (ab dem ersten Zyklus) kostete −13 bis −26 % Durchsatz
-bei Heaps, deren Vollzyklus ohnehin unter einer Millisekunde liegt — reiner
-Verlust. Deshalb schaltet der Sammler erst ab `INKR_AB = 8 MiB` Heap auf
-den inkrementellen Zyklus um; darunter laeuft der atomare Pfad aus Stufe 2
-unveraendert (seine Pause waechst linear: ~0,5 ms je 1,3 MiB — bei 8 MiB
-waeren das ~3 ms, ab dort greifen die Scheiben).
-
-Der DOM-Soak-Workload (Heap ~1,3 MiB) laeuft also atomar: Pausen wie in
-Stufe 2, Durchsatz-Einfluss nur durch den Phasen-Check je Allokation
-(gemessen −8,7 %, innerhalb der ±10%-Vorgabe). Grosse Heaps bekommen
-Pausen um 0,5 ms, unabhaengig von der Heapgroesse.
-
-Ehrliche Nebenwirkung, gemessen am Phasen-Test (Peak ~20 MiB, liegt ueber
-der Schwelle): `rss_ende` 14912 KiB statt 2112 KiB in Stufe 2 — Floating
-Garbage (grau allokierte Objekte leben einen Zyklus laenger) und die
-Leer-Hysterese verzoegert die Rueckgabe im inkrementellen Pfad. Gegen den
-Zustand vor dieser Runde (24124 KiB, nie fallend) bleibt es eine deutliche
-Verbesserung; unterhalb von 8 MiB gilt exakt das Stufe-2-Verhalten.
-
-Messlatte: test.sh **640/640**, selbst_vergleich **186/0/0**, Fixpunkt
-**zeichengleich (284207)**, 19 gc/rc-Tests ok, 6 gc-Negativtests rc!=0.
-
-## Stufe 5 — Finalisierer und Arc[T]: benannte Restarbeit
-
-Bewusst NICHT begonnen, beide sind groesser als eine Reststufe:
-
-- **Finalisierer**: brauchen eine Semantik-Entscheidung (wann erlaubt,
-  Resurrektion ja/nein, Reihenfolge, Faden). Ohne SPEC-Grundlage waere jede
-  Umsetzung ein Ratespiel; der konservative Scan und die Paritaets-Marken
-  dieser Runde sind damit vertraeglich (Finalisierbare Objekte wuerden einen
-  Zyklus laenger leben — dieselbe Maschinerie wie Floating Garbage).
-- **Arc[T]**: ein zweiter Verweis-Typ neben Rc[T] mit atomaren Zaehlern —
-  sinnvoll erst, wenn es Faden gibt (SPEC §7 ist Stufe 0 einfaedelig). Atomik
-  ohne Faden zu bauen waere toter Aufwand.
-
-Beide bleiben als Restarbeit benannt, nicht angeflickt.
+Both remain named as remaining work, not patched on.
