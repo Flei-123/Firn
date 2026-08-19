@@ -172,3 +172,43 @@ mit Instruktionszählung belegen, nie mit der Uhr.
   global, sobald **eine** ihrer Verwendungen kein Immediate zulässt. Fix:
   Konstante an der problematischen Stelle klonen statt überall aufgeben.
 - `tok_attr_value_push` 105 Mio. Ir (8 %) — noch ungeprüft.
+
+## Strang B2 — der 30-Minuten-Dauerlauf MIT großer lebender Menge
+
+Nachgeholt mit `pause_gross.fi` (120 000 lebende Knoten, Heap 13 MiB,
+1800 s). Rohdaten: `tools/gc_mess/dauer30_gross.tsv`.
+
+- 23 840 Sammelläufe, 202 453 000 Zyklen, 3 übersehene Mehrfach-Sammlungen
+- RSS über die ganze Zeit 12,9–13,9 MiB, Ende 12,89 MiB — **kein Drift**,
+  auch nicht mit permanent großer lebender Menge
+- Pausen-Histogramm:
+
+| Klasse | Anzahl | Anteil | kumuliert |
+|---|---|---|---|
+| ≤ 500 µs | 11 472 | 48,1 % | 48,1 % |
+| ≤ 1 ms | 11 663 | 48,9 % | 97,1 % |
+| ≤ 2 ms | 295 | 1,2 % | 98,3 % |
+| ≤ 4 ms | 372 | 1,6 % | 99,9 % |
+| ≤ 8 ms | 25 | 0,10 % | 99,99 % |
+| ≤ 16 ms | 9 | 0,04 % | 99,996 % |
+| > 16 ms | 1 | 0,004 % | 100 % |
+
+- längste Pause **19,34 ms**, und zwar in einer Scheibe vom Typ 1 (nicht nur
+  in der Aufbauphase, wie der Kurzlauf noch nahelegte). Die Maxima wuchsen im
+  Verlauf: 12,05 ms → 15,68 ms → 19,34 ms.
+- Summe aller Pausen 1689,9 s von 1800 s Laufzeit — das sind **93,9 %**.
+  Bei 120 000 dauerhaft lebenden Objekten und laufender Müllproduktion
+  arbeitet der Sammler also fast durchgehend.
+
+### Urteil
+
+Der inkrementelle Pfad hält den **Normalfall** klar unter 1 ms (97,1 %), aber
+er hält keine **Schranke**: 0,15 % der Pausen liegen über 4 ms, einzelne bei
+19 ms. Für ein 16-ms-Bildbudget ist das ein sichtbarer Ruckler alle paar
+Minuten. Zusammen mit dem Pausenanteil von 93,9 % ist das der klarste offene
+Punkt des GC — vor Finalisierern und `Arc[T]`.
+
+**Aufgabe für Runde 41:** herausfinden, warum eine Typ-1-Scheibe 19 ms lang
+werden kann (unbegrenzte Arbeitsmenge je Scheibe? Nachmarkierung am
+Zyklusende?), und die Scheibengröße an ein echtes Zeitbudget koppeln statt an
+eine Objektzahl.
