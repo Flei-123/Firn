@@ -101,8 +101,22 @@ const S_NOV: u64 = 432
 // Diagnose (Runde 41): wie viele Sammellaeufe waren VOLLE Stop-the-World-
 // Laeufe (Aufbauphase unter INKR_AB oder Erschoepfungs-Fallback).
 const S_VOLL: u64 = 440
+// Histogramm der EINZELNEN Scheiben (Runde 41): 16 Faecher, verdoppelnd
+// ab 1 us. Fach 0 = unter 1 us, Fach k = [2^(k-1) us, 2^k us), Fach 15 =
+// alles ab 16,384 ms. Bisher konnte das Messwerkzeug nur die laengste
+// Scheibe JE ZYKLUS sehen (S_PZYK) — damit rauschten Einzelmaxima zu
+// stark, um Scheibengroessen zu vergleichen. Hier zaehlt jede Scheibe.
+const S_HIST: u64 = 448
+const HIST_FAECHER: u64 = 16
 // Scheibengroessen: so viele Objekte pro Allokation tracen bzw. Chunks fegen.
 const SCHEIBE_TRACE: u64 = 512
+// Runde 41: Zeitbudget einer Markierscheibe (ns). Die Objektzahl allein
+// taugt nicht als Mass — ein Objekt mit vielen Zeigerfeldern kostet ein
+// Vielfaches eines Textknotens, deshalb streuten die Scheiben im Histogramm
+// ueber drei Zehnerpotenzen. Die Uhr wird nur alle ZEIT_PROBE Objekte
+// gelesen (clock_gettime kostet selbst ~25 ns).
+const ZEIT_BUDGET_NS: u64 = 100000
+const ZEIT_PROBE: u64 = 16
 const SCHEIBE_SWEEP: u64 = 2
 // Unterhalb dieser Heapgroesse bleibt der Zyklus ATOMAR (ein anhaltender
 // Lauf ist dort sowieso unter einer Millisekunde, und die laufenden Kosten
@@ -694,7 +708,54 @@ fn __gc_collect_now() -> u64 {
 
 // Eine Scheibe verbuchen: die Pausen-Zaehler messen jetzt die laengste
 // UNTERBRECHUNG (eine Scheibe), nicht mehr den ganzen Zyklus.
+fn __gc_hist_buche(dauer: u64, typ: u64) {
+    let st: u64 = __gc_state() as u64
+    var i: u64 = 0
+    var g: u64 = 1000
+    while i + 1 < HIST_FAECHER {
+        if dauer < g {
+            break
+        }
+        g = g * 2
+        i = i + 1
+    }
+    let f: u64 = st + S_HIST + (typ * HIST_FAECHER + i) * 8
+    __gc_st64(f, __gc_ld64(f) + 1)
+    let g2: u64 = st + S_HIST + (6 * HIST_FAECHER + i) * 8
+    __gc_st64(g2, __gc_ld64(g2) + 1)
+}
+
+// Diagnose: wie viele EINZELNE Scheiben fielen in Fach `i` (siehe S_HIST).
+// typ 0..4 wie gc_pause_max_typ, typ 5 = Nachtragen nach Markstapel-
+// Ueberlauf (im Pausenmaximum steckt es unter Typ 1), typ 6 = alle
+// Scheiben zusammen.
+fn gc_hist(typ: u64, i: u64) -> u64 {
+    if i >= HIST_FAECHER {
+        return 0
+    }
+    if typ > 6 {
+        return 0
+    }
+    return __gc_ld64(__gc_state() as u64 + S_HIST + (typ * HIST_FAECHER + i) * 8)
+}
+
+// Histogramm nullen (Messungen ohne Aufbauphase).
+fn gc_hist_reset() {
+    let st: u64 = __gc_state() as u64
+    var i: u64 = 0
+    while i < HIST_FAECHER * 7 {
+        __gc_st64(st + S_HIST + i * 8, 0)
+        i = i + 1
+    }
+}
+
 fn __gc_pause_buche(t0: u64, typ: u64) {
+    __gc_pause_buche_h(t0, typ, typ)
+}
+
+// Wie __gc_pause_buche, aber das Histogramm bucht auf `htyp` — damit das
+// Nachtragen (Typ 1 in den Maxima) im Histogramm getrennt sichtbar wird.
+fn __gc_pause_buche_h(t0: u64, typ: u64, htyp: u64) {
     let st: u64 = __gc_state() as u64
     let t1: u64 = __gc_jetzt_ns()
     var dauer: u64 = 0
@@ -713,6 +774,7 @@ fn __gc_pause_buche(t0: u64, typ: u64) {
     if dauer > __gc_ld64(tfeld) {
         __gc_st64(tfeld, dauer)
     }
+    __gc_hist_buche(dauer, htyp)
 }
 
 // Diagnose-Zugriff: laengste Pause je Scheibentyp (0 Start, 1 Mark, 2 Sweep,
@@ -787,12 +849,20 @@ fn __gc_zyklus_schritt() {
         // Markierscheibe: bis zu SCHEIBE_TRACE Objekte verfolgen.
         let t0: u64 = __gc_jetzt_ns()
         var n: u64 = SCHEIBE_TRACE
+        var probe: u64 = ZEIT_PROBE
         while __gc_ld64(st + S_MLEN) > 0 && n > 0 {
             let len: u64 = __gc_ld64(st + S_MLEN) - 1
             __gc_st64(st + S_MLEN, len)
             let obj: u64 = __gc_ld64(__gc_ld64(st + S_MSTACK) + len * 8)
             __gc_trace(obj)
             n = n - 1
+            probe = probe - 1
+            if probe == 0 {
+                probe = ZEIT_PROBE
+                if __gc_jetzt_ns() - t0 >= ZEIT_BUDGET_NS {
+                    n = 0
+                }
+            }
         }
         __gc_pause_buche(t0, 1)
         if __gc_ld64(st + S_MLEN) == 0 {
@@ -801,7 +871,7 @@ fn __gc_zyklus_schritt() {
             if __gc_ld64(st + S_UEBERLAUF) != 0 {
                 let t1: u64 = __gc_jetzt_ns()
                 __gc_nachtragen()
-                __gc_pause_buche(t1, 1)
+                __gc_pause_buche_h(t1, 1, 5)
             }
             if __gc_ld64(st + S_MLEN) == 0 {
                 __gc_sweep_init()

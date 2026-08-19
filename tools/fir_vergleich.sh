@@ -20,6 +20,12 @@
 # verschiedene Eingaben.
 set -uo pipefail
 cd "$(dirname "$0")/.."
+# Eigenes Temp-Verzeichnis je Lauf: zwei gleichzeitige Laeufe (z. B. Haupt-
+# repo und ein Worktree) benutzten sonst DIESELBEN /tmp-Dateien und
+# ueberschrieben sich gegenseitig die Vergleichsausgaben — das sah wie ein
+# echter Unterschied aus (Runde 41).
+TMPD=$(mktemp -d)
+trap 'rm -rf "$TMPD"' EXIT
 
 FIRNC=compiler/target/release/firnc
 DUMP=${FIRDUMP:-./.firdump}
@@ -47,20 +53,20 @@ while IFS= read -r f; do
         uebersprungen=$((uebersprungen+1))
         continue
     fi
-    if ! "$FIRNC" --emit=fir-raw "$f" > /tmp/firv_a.txt 2>/dev/null; then
+    if ! "$FIRNC" --emit=fir-raw "$f" > "$TMPD"/firv_a.txt 2>/dev/null; then
         uebersprungen=$((uebersprungen+1))
         continue
     fi
-    "$DUMP" "$f" > /tmp/firv_b.txt 2>/dev/null
+    "$DUMP" "$f" > "$TMPD"/firv_b.txt 2>/dev/null
     rc=$?
     case "$rc" in
         3) nichtkern=$((nichtkern+1)); continue;;
         4) comptime=$((comptime+1)); continue;;
         5) defer_zahl=$((defer_zahl+1)); continue;;
     esac
-    if [ "$rc" -eq 0 ] && cmp -s /tmp/firv_a.txt /tmp/firv_b.txt; then
+    if [ "$rc" -eq 0 ] && cmp -s "$TMPD"/firv_a.txt "$TMPD"/firv_b.txt; then
         gleich=$((gleich+1))
-        n=$(grep -c '^  ' /tmp/firv_a.txt)
+        n=$(grep -c '^  ' "$TMPD"/firv_a.txt)
         instruktionen=$((instruktionen + n))
         continue
     fi
