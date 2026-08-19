@@ -29,8 +29,15 @@ use crate::diag::Span;
 use crate::lexer::{TokKind, Token};
 use crate::parser::Parser;
 
-/// Anforderung an einen Typparameter.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Schranke an einem Typparameter — `T: Int`, `T: Ord`, `T: Int + Ord`.
+///
+/// `Any`, `Int` und `Scalar` sind die drei EINGEBAUTEN Schranken (Runde 30).
+/// Jeder andere Name ist der Name einer SCHNITTSTELLE (Runde 50). Ob es diese
+/// Schnittstelle gibt, steht beim Parsen noch nicht fest: `interface Ord` darf
+/// weiter unten oder in einer anderen Datei stehen. Geprueft wird deshalb bei
+/// der AUSPRAEGUNG (`mono.rs`) — dort, wo der konkrete Typ bekannt ist und die
+/// Meldung sagen kann, welche Methode fehlt.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Bound {
     /// keine Anforderung
     Any,
@@ -38,30 +45,37 @@ pub(crate) enum Bound {
     Int,
     /// Ganzzahl, bool oder Zeiger
     Scalar,
+    /// `T: I` — der Typ muss die Schnittstelle `I` umsetzen
+    Iface(String),
 }
 
 impl Bound {
-    pub(crate) fn name(self) -> &'static str {
+    pub(crate) fn name(&self) -> &str {
         match self {
             Bound::Any => "Any",
             Bound::Int => "Int",
             Bound::Scalar => "Scalar",
+            Bound::Iface(n) => n.as_str(),
         }
     }
-    fn parse(name: &str) -> Option<Bound> {
-        Some(match name {
+    /// Kein `Option`: ein unbekannter Name ist keine Fehleingabe, sondern der
+    /// Name einer Schnittstelle. Ein Tippfehler wird bei der Auspraegung als
+    /// „unbekannte schnittstelle" gemeldet — mit der Liste der bekannten.
+    fn parse(name: &str) -> Bound {
+        match name {
             "Any" => Bound::Any,
             "Int" => Bound::Int,
             "Scalar" => Bound::Scalar,
-            _ => return None,
-        })
+            _ => Bound::Iface(name.to_string()),
+        }
     }
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct TyParam {
     pub(crate) name: String,
-    pub(crate) bound: Bound,
+    /// leere Liste = keine Schranke (`[T]`)
+    pub(crate) bounds: Vec<Bound>,
 }
 
 #[derive(Clone, Debug)]
@@ -240,17 +254,24 @@ impl<'a> Parser<'a> {
             }
             let before = self.pos;
             let (name, span) = self.ident("fuer einen typparameter")?;
-            let mut bound = Bound::Any;
+            // `T: A + B + C` — die Schranken stehen mit `+` hintereinander und
+            // gelten ALLE gleichzeitig (Runde 50).
+            let mut bounds: Vec<Bound> = Vec::new();
             if self.eat(&TokKind::Colon) {
-                let (bname, bspan) = self.ident("fuer eine anforderung an den typparameter")?;
-                match Bound::parse(&bname) {
-                    Some(b) => bound = b,
-                    None => {
+                loop {
+                    let (bname, bspan) = self.ident("fuer eine schranke am typparameter")?;
+                    let b = Bound::parse(&bname);
+                    if bounds.contains(&b) {
                         self.dg.error_note(
                             bspan,
-                            format!("unbekannte anforderung '{}'", bname),
-                            "bekannt sind: Any, Int, Scalar",
+                            format!("die schranke '{}' steht zweimal an '{}'", bname, name),
+                            "jede schranke wird hoechstens einmal genannt",
                         );
+                    } else {
+                        bounds.push(b);
+                    }
+                    if !self.eat(&TokKind::Plus) {
+                        break;
                     }
                 }
             }
@@ -259,7 +280,7 @@ impl<'a> Parser<'a> {
                     .error(span, format!("typparameter '{}' ist bereits deklariert", name));
             } else {
                 let _ = span;
-                out.push(TyParam { name, bound });
+                out.push(TyParam { name, bounds });
             }
             if !self.eat(&TokKind::Comma) {
                 break;

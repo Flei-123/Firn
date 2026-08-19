@@ -21,6 +21,12 @@ use crate::sema_generic::{
 const MAX_INSTANCES: usize = 4096;
 
 pub fn expand(prog: &mut Program, dg: &mut Diags) {
+    // Alle Funktionsnamen VOR der Auspraegung — daraus liest die Schranken-
+    // pruefung, welche Methode eines Typs fehlt (`T__m`). Waehrend der
+    // Auspraegung kommen nur monomorphisierte Funktionen dazu; eine
+    // Schnittstelle wird fuer die nie umgesetzt (`impl I for Vec__i32` kann
+    // man nicht schreiben), deshalb reicht die Aufnahme von jetzt.
+    let fnamen: HashSet<String> = prog.funcs.iter().map(|f| f.name.clone()).collect();
     let mut queue: Vec<(String, Instantiation)> = sema_generic::instantiations()
         .into_iter()
         .filter(|(_, i)| !i.abstrakt)
@@ -43,9 +49,9 @@ pub fn expand(prog: &mut Program, dg: &mut Diags) {
             break;
         }
         if inst.is_fn {
-            expand_fn(prog, dg, &mangled, &inst, &mut queue, &mut next_id);
+            expand_fn(prog, dg, &fnamen, &mangled, &inst, &mut queue, &mut next_id);
         } else {
-            expand_struct(prog, dg, &mangled, &inst, &mut queue);
+            expand_struct(prog, dg, &fnamen, &mangled, &inst, &mut queue);
         }
     }
     prog.expr_count = next_id;
@@ -58,6 +64,7 @@ pub fn expand(prog: &mut Program, dg: &mut Diags) {
 
 fn bind_params(
     dg: &mut Diags,
+    fnamen: &HashSet<String>,
     params: &[sema_generic::TyParam],
     inst: &Instantiation,
     was: &str,
@@ -77,32 +84,62 @@ fn bind_params(
     }
     let mut map = HashMap::new();
     for (p, a) in params.iter().zip(inst.args.iter()) {
-        if !satisfies(a, p.bound) {
-            dg.error_note(
-                inst.span,
-                format!(
-                    "typargument '{}' erfuellt die anforderung '{}' des typparameters '{}' von '{}' nicht",
-                    sema_generic::type_tag(a),
-                    p.bound.name(),
-                    p.name,
-                    inst.base
-                ),
-                match p.bound {
-                    Bound::Int => "erlaubt sind i8..i64, u8..u64, usize, isize",
-                    Bound::Scalar => "erlaubt sind ganzzahlen, bool und zeiger",
-                    Bound::Any => "kein typ erfuellt diese anforderung",
-                },
-            );
-            return None;
+        // ALLE Schranken muessen gelten. Gemeldet wird die ERSTE verletzte —
+        // eine Kaskade aus Folgemeldungen zu demselben Typargument sagt
+        // nichts Neues.
+        for b in &p.bounds {
+            if !schranke_ok(dg, fnamen, a, b, &p.name, inst) {
+                return None;
+            }
         }
         map.insert(p.name.clone(), a.clone());
     }
     Some(map)
 }
 
+/// Eine einzelne Schranke gegen ein Typargument. `true` = erfuellt.
+///
+/// Die drei eingebauten Schranken entscheidet `satisfies` allein aus der
+/// Typform. Eine SCHNITTSTELLENSCHRANKE geht nach `iface.rs`: nur dort steht,
+/// welche Umsetzungen es gibt und welche Methode fehlt.
+fn schranke_ok(
+    dg: &mut Diags,
+    fnamen: &HashSet<String>,
+    arg: &TypeExpr,
+    b: &Bound,
+    pname: &str,
+    inst: &Instantiation,
+) -> bool {
+    if let Bound::Iface(i) = b {
+        return crate::iface::schranke_pruefen(
+            dg, fnamen, arg, i, pname, &inst.base, inst.span,
+        );
+    }
+    if satisfies(arg, b) {
+        return true;
+    }
+    dg.error_note(
+        inst.span,
+        format!(
+            "typargument '{}' erfuellt die schranke '{}' des typparameters '{}' von '{}' nicht",
+            sema_generic::type_tag(arg),
+            b.name(),
+            pname,
+            inst.base
+        ),
+        match b {
+            Bound::Int => "erlaubt sind i8..i64, u8..u64, usize, isize",
+            Bound::Scalar => "erlaubt sind ganzzahlen, bool und zeiger",
+            _ => "kein typ erfuellt diese schranke",
+        },
+    );
+    false
+}
+
 fn expand_fn(
     prog: &mut Program,
     dg: &mut Diags,
+    fnamen: &HashSet<String>,
     mangled: &str,
     inst: &Instantiation,
     queue: &mut Vec<(String, Instantiation)>,
@@ -118,7 +155,7 @@ fn expand_fn(
             return;
         }
     };
-    let map = match bind_params(dg, &tpl.params, inst, "generische funktion") {
+    let map = match bind_params(dg, fnamen, &tpl.params, inst, "generische funktion") {
         Some(m) => m,
         None => return,
     };
@@ -138,6 +175,7 @@ fn expand_fn(
 fn expand_struct(
     prog: &mut Program,
     dg: &mut Diags,
+    fnamen: &HashSet<String>,
     mangled: &str,
     inst: &Instantiation,
     queue: &mut Vec<(String, Instantiation)>,
@@ -152,7 +190,7 @@ fn expand_struct(
             return;
         }
     };
-    let map = match bind_params(dg, &tpl.params, inst, "generischer struct") {
+    let map = match bind_params(dg, fnamen, &tpl.params, inst, "generischer struct") {
         Some(m) => m,
         None => return,
     };
@@ -164,7 +202,7 @@ fn expand_struct(
     prog.structs.push(decl);
 }
 
-fn satisfies(te: &TypeExpr, b: Bound) -> bool {
+fn satisfies(te: &TypeExpr, b: &Bound) -> bool {
     match b {
         Bound::Any => true,
         Bound::Int => matches!(te, TypeExpr::Named(n, _) if is_int_name(n)),
@@ -173,6 +211,8 @@ fn satisfies(te: &TypeExpr, b: Bound) -> bool {
             TypeExpr::Named(n, _) => is_int_name(n) || n == "bool",
             TypeExpr::Array { .. } => false,
         },
+        // Schnittstellen entscheidet `iface.rs`, nicht die Typform.
+        Bound::Iface(_) => false,
     }
 }
 

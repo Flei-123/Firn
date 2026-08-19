@@ -509,6 +509,15 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
         // Zuerst die eigenen Deklarationen umbenennen ...
         let m = infos[idx].name.clone();
         for f in p.funcs.iter_mut() {
+            // METHODEN EINES GRUNDTYPS BLEIBEN UNANGETASTET (Runde 50).
+            // `impl Ord for i32` legt `i32__kleiner` an; der Typ `i32`
+            // gehoert keinem Modul, seine Methoden also auch nicht. Wuerde
+            // daraus `vec__i32__kleiner`, suchte `x.kleiner(..)` weiter
+            // `i32__kleiner` und faende nichts — dieselbe Regel wie fuer
+            // Schnittstellen, gc-Klassen und generische Vorlagen.
+            if crate::iface::ist_grundtyp_methode(&f.name) {
+                continue;
+            }
             f.name = mangle(&m, &f.name);
         }
         for s in p.structs.iter_mut() {

@@ -22,6 +22,9 @@
 #   8b. Das atomare Primitiv `__atomar_addieren` erzeugt wirklich ein
 #      `lock xadd` — in drei Baustufen und in beiden Compilern, mit
 #      Gegenprobe (tools/atomar/run.sh, Runde 47).
+#   8c. Schnittstellenschranken versenden STATISCH: kein indirekter Aufruf,
+#      keine Methodentafel — Gegenprobe mit `dyn I`, beide Compiler
+#      (tools/schranken/run.sh, Runde 50).
 #   9. HTML5-Tokenizer (lib/html/, in Firn) gegen die offizielle
 #      html5lib-Testsuite: exakte Quote aus 6.810 Faellen, Schranke in
 #      tools/tokenizer/mindestquote.txt (tools/tokenizer/run.sh).
@@ -225,6 +228,18 @@ if [ "$ATRC" -eq 0 ]; then
 else
     bad "tools/atomar/run.sh schlug fehl (siehe .test-work/atomar.log)"
     tail -20 "$WORK/atomar.log" | sed 's/^/   /'
+fi
+
+echo "== 8c. Schranken: statischer Versand ohne indirekten Aufruf (RUNDE 50) =="
+# `fn f[T: I]` ruft die Schnittstellenmethode DIREKT — belegt am erzeugten
+# Assembler und an der FIR, mit `dyn I` als Gegenprobe, in beiden Compilern.
+SCHRANKEN_MESSEN=${SCHRANKEN_MESSEN:-0} bash tools/schranken/run.sh > "$WORK/schranken.log" 2>&1 && SKRC=0 || SKRC=$?
+if [ "$SKRC" -eq 0 ]; then
+    ok
+    tail -1 "$WORK/schranken.log" | sed 's/^/   /'
+else
+    bad "tools/schranken/run.sh schlug fehl (siehe .test-work/schranken.log)"
+    tail -20 "$WORK/schranken.log" | sed 's/^/   /'
 fi
 
 echo "== 9. HTML5-Tokenizer gegen html5lib (tools/tokenizer/run.sh) =="
