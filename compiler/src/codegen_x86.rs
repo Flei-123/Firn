@@ -248,7 +248,12 @@ fn emit_block(e: &mut Emitter, f: &Func, fr: &Frame, b: &Block) -> Result<(), St
     }
     match &b.term {
         Term::Br(t) => e.line(&format!("jmp {}", block_label(&f.name, *t))),
-        Term::Switch { .. } => crate::codegen_switch::emit_switch(e, f, fr, &b.term)?,
+        Term::Switch { .. } => crate::codegen_switch::emit_switch(
+            e,
+            f,
+            crate::codegen_switch::Wertquelle::Rahmen(fr),
+            &b.term,
+        )?,
         Term::BrCond { cond, then_bb, else_bb } => {
             // SPEC §9.2: in `#[constant_time]`-Funktionen darf kein bedingter
             // Sprung von einem geheimen Wert abhaengen — harter Abbruch.
