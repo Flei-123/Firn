@@ -1,14 +1,14 @@
-//! FIR — die eigene Zwischensprache (SPEC §8.1).
+//! FIR — the intermediate language of our own (SPEC §8.1).
 //!
-//! Eigenschaften (Invarianten, siehe docs/FIR.md):
-//!  * typisiert: jede Instruktion hat einen Ergebnistyp `FTy`
-//!  * SSA-artig: jede Instruktion definiert hoechstens EINEN neuen Wert `%n`,
-//!    jeder Wert wird genau einmal definiert
-//!  * Basisbloecke mit GENAU EINEM Terminator am Ende (`br`, `brcond`, `ret`)
-//!  * keine Phi-Knoten: veraenderliche Variablen liegen in `alloca`-Slots und
-//!    werden mit `load`/`store` angesprochen
-//!  * keine x86-Eigenheiten: Register, Stackrahmen und Aufrufkonvention
-//!    entstehen erst im Backend
+//! Properties (invariants, see docs/FIR.md):
+//!  * typed: every instruction has a result type `FTy`
+//!  * SSA like: every instruction defines at most ONE new value `%n`,
+//!    every value gets defined exactly once
+//!  * basic blocks with EXACTLY ONE terminator at the end (`br`, `brcond`, `ret`)
+//!  * no phi nodes: mutable variables sit at `alloca` slots and get
+//!    addressed with `load`/`store`
+//!  * no x86 quirks: registers, stack frames and calling convention come
+//!    about at the backend only
 
 use std::fmt::Write as _;
 
@@ -26,12 +26,12 @@ pub enum FTy {
     U32,
     U64,
     Bool,
-    /// IEEE-754 binary64. Der Wert einer `Op::Const` ist das BITMUSTER als
-    /// u64 — FIR kennt keine Gleitkommaliterale, nur Bitmuster.
+    /// IEEE-754 binary64. The value of one `Op::Const` is the BIT PATTERN as
+    /// u64 — FIR knows no float literals, only bit patterns.
     F64,
-    /// Zeiger (immer 64 Bit, untypisiert in FIR)
+    /// pointer (always 64 bits, untyped within FIR)
     Ptr,
-    /// kein Wert
+    /// no value
     Void,
 }
 
@@ -67,7 +67,7 @@ impl FTy {
             FTy::Void => "void",
         }
     }
-    /// Wert auf die Breite/Signedness des Typs zurechtstutzen.
+    /// Trim a value to the width/signedness of the type.
     pub fn truncate(self, v: i128) -> i128 {
         let bits = self.bits();
         if bits == 0 || bits >= 128 {
@@ -142,86 +142,86 @@ impl CmpOp {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnOp {
-    /// arithmetische Negation
+    /// arithmetic negation
     Neg,
-    /// bitweises Nicht (Ganzzahl) bzw. logisches Nicht (bool)
+    /// bitwise not (integer) or logical not (bool)
     Not,
 }
 
 #[derive(Clone, Debug)]
 pub enum Op {
-    /// Konstante des Instruktionstyps
+    /// constant of the instruction type
     Const(i128),
     Bin(BinOp, Val, Val),
     Cmp { op: CmpOp, ty: FTy, a: Val, b: Val },
     Un(UnOp, Val),
-    /// Umwandlung; Zieltyp ist der Instruktionstyp
+    /// conversion; the target type is the instruction type
     Cast { src: Val, from: FTy },
-    /// Stackspeicher in der Funktion (nur im Eintrittsblock zulaessig)
+    /// stack storage of the function (allowed at the entry block only)
     Alloca { size: u64, align: u64 },
     Load { addr: Val },
-    /// kein Ergebniswert; `ty` der Instruktion ist der gespeicherte Typ
+    /// no result value; `ty` of the instruction is the stored type
     Store { addr: Val, val: Val },
-    /// Zeiger + Byte-Offset (Offset ist i64/u64)
+    /// pointer + byte offset (the offset is i64/u64)
     PtrAdd { base: Val, off: Val },
     Call { name: String, args: Vec<Val> },
-    /// Linux-Syscall: args[0] = Nummer, danach bis zu 6 Argumente
+    /// Linux syscall: args[0] = number, up to 6 arguments after it
     Syscall { args: Vec<Val> },
-    /// Blockweise Kopie (Structs/Arrays); kein Ergebniswert
+    /// block copy (structs/arrays); no result value
     CopyMem { dst: Val, src: Val, size: u64 },
-    /// Datenunabhaengige Auswahl (SPEC §9.3): `cond ? a : b`, im Backend `cmov`.
-    /// KEIN Durchgang darf daraus eine Verzweigung machen (SPEC §9.2).
+    /// Data independent choice (SPEC §9.3): `cond ? a : b`, `cmov` at the backend.
+    /// NO pass may turn it into a branch (SPEC §9.2).
     Select { cond: Val, a: Val, b: Val },
-    /// Undurchsichtige Sperre (`barrier(inout x)`): liefert den Wert unveraendert
-    /// zurueck, gilt aber fuer jeden Durchgang als undurchschaubar.
+    /// Opaque barrier (`barrier(inout x)`): hands the value back unchanged, yet
+    /// counts as impenetrable for every pass.
     Barrier { val: Val },
-    /// `secure_zero(inout buf)`: nullt `size` Bytes ab `addr`. Gilt NIE als tot.
+    /// `secure_zero(inout buf)`: zeroes `size` bytes from `addr`. NEVER counts as dead.
     SecureZero { addr: Val, size: Val },
-    /// **Runde 47** — atomares Lesen-Addieren-Schreiben (`atomic.rs`):
-    /// `[addr] += val` als EINE Maschineninstruktion (`lock xadd`), Ergebnis
-    /// ist der ALTE Wert. Immer 64 Bit. Grundlage des Zaehlers von `Arc[T]`
-    /// (SPEC §3.4). Niemals rein, niemals zusammenlegbar, nie ueber einen
-    /// anderen Speicherzugriff hinweg verschiebbar.
+    /// **Round 47** — atomic read-add-write (`atomic.rs`): `[addr] += val` as
+    /// ONE machine instruction (`lock xadd`), the result is the OLD value.
+    /// Always 64 bits. Foundation of the counter of `Arc[T]` (SPEC §3.4).
+    /// Never pure, never mergeable, never movable across another memory
+    /// access.
     AtomicAdd { addr: Val, val: Val },
-    /// **Runde 49** — atomarer Vergleichs-Tausch (`thread.rs`): steht in
-    /// `[addr]` der Wert `erw`, wird `neu` hineingeschrieben. Ergebnis ist
-    /// IMMER der vorgefundene Wert; der Tausch fand statt, wenn er gleich
-    /// `erw` ist. Eine Maschineninstruktion (`lock cmpxchg`). Damit lassen
-    /// sich Sperren bauen — mit `lock xadd` allein geht das nicht, weil der
-    /// Uebergang „frei -> belegt" bedingt sein muss.
+    /// **Round 49** — atomic compare-and-swap (`thread.rs`): if `[addr]` holds
+    /// the value `erw`, then `new` gets written there. The result is ALWAYS
+    /// the value found; the swap happened when it equals `erw`. One machine
+    /// instruction (`lock cmpxchg`). Locks can be built with it — with
+    /// `lock xadd` alone that does not work, because the transition
+    /// "free -> taken" must be conditional.
     AtomicCas { addr: Val, erw: Val, new: Val },
-    /// **Runde 49** — einen Faden erzeugen (`thread.rs`, `clone(2)`).
-    /// Ergebnis ist die Fadenkennung (> 0) bzw. ein negativer Fehlerwert.
-    /// Das Kind kehrt aus dem Systemaufruf mit EIGENEM `rsp` zurueck; deshalb
-    /// ist das eine Instruktionsfolge und kein `syscall`-Aufruf.
+    /// **Round 49** — create a thread (`thread.rs`, `clone(2)`). The result is
+    /// the thread id (> 0) or a negative error value. The child returns from
+    /// the system call with its OWN `rsp`; that is why this is one instruction
+    /// sequence and no `syscall` call.
     ThreadSpawn { arg: Val, stack: Val, ctid: Val },
-    /// **Runde 49** — Adresse des eigenen Fadenblocks (`fs:0`, `thread.rs`).
-    /// Ohne `arch_prctl(ARCH_SET_FS)` ist das Ergebnis unbrauchbar; die
-    /// Laufzeit setzt die Basis, bevor sie den Wert je liest.
+    /// **Round 49** — address of the own thread block (`fs:0`, `thread.rs`).
+    /// Without `arch_prctl(ARCH_SET_FS)` the result is useless; the runtime
+    /// sets the base before it ever reads the value.
     ThreadSelf,
-    /// Aufruf ueber einen ZEIGER — dynamischer Versand (`iface.rs`, Runde 46).
-    /// `target` ist die Adresse der Funktion, sonst gilt alles wie bei `Call`.
+    /// Call through a POINTER — dynamic dispatch (`iface.rs`, round 46).
+    /// `target` is the address of the function, everything else as with `Call`.
     CallIndirect { target: Val, args: Vec<Val> },
-    /// Adresse einer Methodentafel (`iface.rs`, Runde 46). `tafel` ist der
-    /// Schluessel `<Schnittstelle>.<Typ>`; das Label steht in `.rodata`.
+    /// Address of a method table (`iface.rs`, round 46). `table` is the key
+    /// `<interface>.<type>`; the label sits at `.rodata`.
     VtabAddr { table: String },
-    /// Adresse des Zustandsblocks des Sammlers (SPEC §3.5, `gc.rs`).
-    /// `regs = true`: vorher die callee-saved Register in den Block retten —
-    /// erst dadurch ist der KONSERVATIVE Registerscan ehrlich (SPEC §3.5.3).
-    /// Ohne `gc class` im Programm entsteht diese Instruktion nie.
+    /// Address of the state block of the collector (SPEC §3.5, `gc.rs`).
+    /// `regs = true`: rescue the callee-saved registers into the block first —
+    /// only that makes the CONSERVATIVE register scan honest (SPEC §3.5.3).
+    /// Without `gc class` within the program this instruction never comes about.
     GcAddr { regs: bool },
-    /// **Runde 52** — Inline-Assembler (`core.rs`, SPEC §2 `profile kernel`).
+    /// **Round 52** — inline assembler (`core.rs`, SPEC §2 `profile kernel`).
     ///
-    /// IMMER `volatile`: diese Instruktion darf **nie** entfernt, dupliziert,
-    /// zusammengelegt oder ueber einen anderen Speicherzugriff hinweg
-    /// verschoben werden. Genau das ist die Falle aus Runde 40 — der
-    /// Optimierer entfernte Code, den er nicht entfernen durfte.
+    /// ALWAYS `volatile`: this instruction may **never** be removed, duplicated,
+    /// merged or moved across another memory access. Exactly that is the trap
+    /// of round 40 — the optimizer removed code that it was not allowed to
+    /// remove.
     ///
-    /// `vorlage` ist der Assemblertext (Intel-Syntax, `\n` trennt Zeilen).
-    /// `ein_regs[i]` ist das Register, in das `ein[i]` vor dem Block gelegt
-    /// wird; `aus` ist das Register, dessen Inhalt danach das Ergebnis ist
-    /// (dann ist der Instruktionstyp `u64`, sonst `void`). `clobber` nennt
-    /// zusaetzlich zerstoerte Register bzw. `memory`.
+    /// `template` is the assembler text (Intel syntax, `\n` separates lines).
+    /// `in_regs[i]` is the register into which the i-th input value gets put
+    /// ahead of the block; `out` is the register whose content is the result
+    /// afterwards (the instruction type is `u64` then, otherwise `void`).
+    /// `clobber` states registers destroyed on top of that, or `memory`.
     Asm {
         template: String,
         out: Option<String>,
@@ -229,18 +229,18 @@ pub enum Op {
         ins: Vec<Val>,
         clobber: Vec<String>,
     },
-    /// **Runde 52** — MMIO-Lesezugriff (`core.rs`). Wie `Op::Load`, aber
-    /// **volatile**: kein Durchgang darf zwei Zugriffe zusammenlegen, einen
-    /// entfernen oder ihn verschieben. Die Breite steckt im Instruktionstyp.
+    /// **Round 52** — MMIO read (`core.rs`). Like `Op::Load`, but
+    /// **volatile**: no pass may merge two accesses, remove one
+    /// or move it. The width sits within the instruction type.
     MmioLoad { addr: Val },
-    /// **Runde 52** — MMIO-Schreibzugriff (`core.rs`). Wie `Op::Store`, aber
-    /// **volatile** (siehe `MmioLoad`).
+    /// **Round 52** — MMIO write (`core.rs`). Like `Op::Store`, but
+    /// **volatile** (see `MmioLoad`).
     MmioStore { addr: Val, val: Val },
 }
 
 impl Op {
-    /// Rein = ohne Seiteneffekt, darf entfernt werden, wenn das Ergebnis
-    /// unbenutzt ist.
+    /// Pure = without side effect, may be removed when the result is
+    /// unused.
     pub fn is_pure(&self) -> bool {
         match self {
             Op::Const(_)
@@ -252,10 +252,10 @@ impl Op {
             | Op::Load { .. }
             | Op::Alloca { .. }
             | Op::Select { .. } => true,
-            // Die Adresse einer Tafel im `.rodata` ist eine Konstante.
+            // The address of a table at `.rodata` is a constant.
             Op::VtabAddr { .. } => true,
-            // Der Zustandsblock ist immer da; das Retten der Register
-            // schreibt aber Speicher und darf nicht wegfallen.
+            // The state block is always there; rescuing the registers
+            // writes memory, though, and must not fall away.
             Op::GcAddr { regs } => !*regs,
             Op::Store { .. }
             | Op::Call { .. }
@@ -264,24 +264,24 @@ impl Op {
             | Op::CopyMem { .. }
             | Op::Barrier { .. }
             | Op::AtomicAdd { .. }
-            // RUNDE 52: volatile. Nie rein, nie entfernbar — auch dann nicht,
-            // wenn das Ergebnis unbenutzt bleibt.
+            // ROUND 52: volatile. Never pure, never removable — not even
+            // when the result stays unused.
             | Op::Asm { .. }
             | Op::MmioLoad { .. }
             | Op::MmioStore { .. }
             | Op::AtomicCas { .. }
             | Op::ThreadSpawn { .. }
             | Op::SecureZero { .. } => false,
-            // Der Selbstzeiger aendert nichts und liest nur die Fadenbasis;
-            // er darf aber NICHT ueber einen `arch_prctl` hinweg verschoben
-            // werden. Reine Instruktionen werden nur ENTFERNT (wenn ungenutzt)
-            // und von LICM hochgezogen — LICM nimmt nur die Liste oben, und
-            // `ThreadSelf` steht nicht darin.
+            // The self pointer changes nothing and reads the thread base
+            // only; it must NOT be moved across one `arch_prctl`, though.
+            // Pure instructions get REMOVED only (when unused) and hoisted
+            // by LICM — LICM takes the list above alone, and `ThreadSelf`
+            // does not stand within it.
             Op::ThreadSelf => true,
         }
     }
 
-    /// Alle gelesenen Werte.
+    /// All values read.
     pub fn uses(&self, out: &mut Vec<Val>) {
         match self {
             Op::Const(_)
@@ -363,14 +363,14 @@ pub struct Inst {
 pub enum Term {
     Br(BlockId),
     BrCond { cond: Val, then_bb: BlockId, else_bb: BlockId },
-    /// Mehrfachverzweigung ueber einen Ganzzahlwert (SPEC §6.3, `P4`).
-    /// `cases` ist nach Marke aufsteigend sortiert und duplikatfrei; jeder
-    /// nicht genannte Wert geht nach `default`. Das Backend darf daraus eine
-    /// Sprungtabelle machen, muss aber nicht.
+    /// Multi-way branch over one integer value (SPEC §6.3, `P4`).
+    /// `cases` is sorted ascending by label and free of duplicates; every
+    /// value not stated goes to `default`. The backend may turn that into a
+    /// jump table, but need not.
     Switch { val: Val, ty: FTy, cases: Vec<(i128, BlockId)>, default: BlockId },
     Ret(Option<Val>),
-    /// Nur waehrend des Aufbaus; darf am Ende des Lowerings nicht mehr
-    /// vorkommen (Invariante: jeder Block hat einen echten Terminator).
+    /// Only during the build; must not show up any more at the end of the
+    /// lowering (invariant: every block has a real terminator).
     Unset,
 }
 
@@ -402,24 +402,24 @@ pub struct Func {
     pub params: Vec<FTy>,
     pub ret: FTy,
     pub blocks: Vec<Block>,
-    /// Typ jedes jemals vergebenen Wertes, indiziert mit der Val-Id.
+    /// Type of every value ever handed out, indexed by the Val id.
     pub val_types: Vec<FTy>,
-    /// Werte, die aus `secret[T]` stammen (SPEC §9.2). Der Optimierer und der
-    /// Codegenerator behandeln sie gesondert: keine Verzweigung, kein
-    /// datenabhaengiger Zugriff, kein Entfernen von Schreibvorgaengen.
+    /// Values that stem from `secret[T]` (SPEC §9.2). The optimizer and the
+    /// code generator treat them specially: no branch, no data dependent
+    /// access, no removal of writes.
     pub secret: std::collections::HashSet<Val>,
-    /// `#[constant_time]`: der Codegenerator bricht ab, wenn ein bedingter
-    /// Sprung von einem `secret`-Wert abhaengt.
+    /// `#[constant_time]`: the code generator aborts when a conditional jump
+    /// depends on a `secret` value.
     pub constant_time: bool,
-    /// **Runde 52** — `#[interrupt]`: eigene Aufrufkonvention. Der
-    /// Codegenerator rettet ALLE Universalregister und schliesst mit `iretq`
-    /// statt `ret` ab (SPEC §2, Kernel-Profil).
+    /// **Round 52** — `#[interrupt]`: a calling convention of its own. The code
+    /// generator rescues ALL general purpose registers and closes with `iretq`
+    /// rather than `ret` (SPEC §2, kernel profile).
     pub interrupt: bool,
 }
 
 impl Func {
-    /// Legt eine Funktion mit Eintrittsblock `bb0` an. Die Parameter erhalten
-    /// die Werte `%0 .. %(n-1)`.
+    /// Creates a function with entry block `bb0`. The parameters receive the
+    /// values `%0 .. %(n-1)`.
     pub fn new(name: &str, params: Vec<FTy>, ret: FTy) -> Func {
         let val_types = params.clone();
         Func {
@@ -454,27 +454,27 @@ impl Func {
         v
     }
 
-    /// Neuer Wert ohne Instruktion — nur fuer Modultests, die einen Rumpf von
-    /// Hand aufbauen (`licm.rs`, `regalloc.rs`).
+    /// New value without instruction — for module tests only, which build a body
+    /// by hand (`licm.rs`, `regalloc.rs`).
     #[cfg(test)]
     pub fn new_val_pub(&mut self, ty: FTy) -> Val {
         self.new_val(ty)
     }
 
-    /// Haengt eine wertliefernde Instruktion an das Ende von `b` an.
+    /// Appends a value yielding instruction to the end of `b`.
     pub fn push(&mut self, b: BlockId, ty: FTy, op: Op) -> Val {
         let v = self.new_val(ty);
         self.blocks[b as usize].insts.push(Inst { dst: Some(v), ty, op });
         v
     }
 
-    /// Haengt eine Instruktion ohne Ergebnis an (`store`, `copymem`, void-Call).
+    /// Appends one instruction without result (`store`, `copymem`, void call).
     pub fn push_void(&mut self, b: BlockId, ty: FTy, op: Op) {
         self.blocks[b as usize].insts.push(Inst { dst: None, ty, op });
     }
 
-    /// Fuegt eine Alloca vorne im Eintrittsblock ein (Invariante: alle Allocas
-    /// stehen im Eintrittsblock).
+    /// Inserts one alloca at the front of the entry block (invariant: all allocas
+    /// stand at the entry block).
     pub fn alloca(&mut self, size: u64, align: u64) -> Val {
         let v = self.new_val(FTy::Ptr);
         let inst = Inst { dst: Some(v), ty: FTy::Ptr, op: Op::Alloca { size, align } };
@@ -494,13 +494,13 @@ impl Func {
         !matches!(self.blocks[b as usize].term, Term::Unset)
     }
 
-    /// Markiert einen Wert als geheim (SPEC §9.1).
+    /// Marks a value as secret (SPEC §9.1).
     ///
-    /// Es gibt bewusst KEINE Hilfsmethode dafuer, solange das Frontend keine
-    /// `secret`-Werte erzeugen kann (`secret[T]` ist nicht umgesetzt, SPEC
-    /// §14.1): eine Methode, die nur Tests aufrufen, waere toter Code. Die
-    /// Menge `secret` ist oeffentlich; Tests schreiben direkt hinein, und alle
-    /// Durchgaenge lesen sie ueber `is_secret`.
+    /// There is deliberately NO helper method for it as long as the frontend
+    /// cannot produce `secret` values (`secret[T]` is not implemented, SPEC
+    /// §14.1): a method that only tests call would be dead code. The set
+    /// `secret` is public; tests write into it directly, and all passes read
+    /// it through `is_secret`.
 
     pub fn is_secret(&self, v: Val) -> bool {
         self.secret.contains(&v)
@@ -510,7 +510,7 @@ impl Func {
         self.val_types.get(v as usize).copied().unwrap_or(FTy::Void)
     }
 
-    /// Anzahl aller Instruktionen (fuer Optimierungstests).
+    /// Count of all instructions (for optimization tests).
     pub fn inst_count(&self) -> usize {
         self.blocks.iter().map(|b| b.insts.len()).sum()
     }
@@ -532,7 +532,7 @@ impl Module {
         self.funcs.iter().map(|f| f.blocks.len()).sum()
     }
 
-    /// Menschenlesbares, stabiles Textformat (siehe docs/FIR.md).
+    /// Human readable, stable text format (see docs/FIR.md).
     pub fn to_text(&self) -> String {
         let mut s = String::new();
         let _ = writeln!(s, "; FIR v0");
@@ -561,8 +561,8 @@ fn vlist(vs: &[Val]) -> String {
     vs.iter().map(|v| format!("%{}", v)).collect::<Vec<_>>().join(", ")
 }
 
-/// Maskierung der Assembler-Vorlage in der FIR-Textform. Nur diese vier
-/// Zeichen, damit BEIDE Compiler den Text ohne Tabelle gleich schreiben.
+/// Escaping of the assembler template within the FIR text form. These four
+/// characters only, so that BOTH compilers write the text alike, tableless.
 pub(crate) fn asm_escape(v: &str) -> String {
     let mut o = String::new();
     for c in v.chars() {
