@@ -1,36 +1,36 @@
 #!/usr/bin/env bash
-# tools/fir_compare.sh — das Lowering in FIRN gegen das in RUST.
+# tools/fir_compare.sh -- the lowering in FIRN against the one in RUST.
 #
-# MASSSTAB ist `firnc0 --emit=fir-raw`: die Zwischendarstellung DIREKT nach dem
-# Lowering, ohne jede Optimierung. Verglichen wird der Text Oktett fuer Oktett,
-# und der enthaelt alles, worauf es ankommt: Wertnummern, Blocknummern,
-# Reihenfolge der Instruktionen, Terminatoren.
+# The YARDSTICK is `firnc0 --emit=fir-raw`: the intermediate representation DIRECTLY after
+# the lowering, without any optimisation. What is compared is the text octet for octet,
+# and it contains everything that matters: value numbers, block numbers,
+# the order of the instructions, terminators.
 #
-# Das ist der schaerfste Vergleich der ganzen Reihe. Zwei Wertnummern in
-# anderer Reihenfolge, ein Block zu viel oder zu wenig — und der Text stimmt
-# nicht mehr.
+# That is the sharpest comparison of the whole series. Two value numbers in
+# a different order, one block too many or too few -- and the text no longer
+# matches.
 #
-# Rueckgabewerte von `.firdump`:
-#   0 Ausgabe · 1 Fehler · 3 keine Kernsprache · 4 comptime noetig ·
-#   5 `defer`/`errdefer` (im Lowering noch nicht portiert)
+# Return values of `.firdump`:
+#   0 output * 1 error * 3 not core language * 4 comptime needed *
+#   5 `defer`/`errdefer` (not ported in the lowering yet)
 #
-# GETESTET WIRD NUR, was `firnc0` auch EINZELN uebersetzen kann: `--emit=fir-raw`
-# laeuft sonst ueber das zusammengefuehrte Modulprogramm, der Firn-Weg aber
-# ueber eine einzige Datei — das waere kein Vergleich, sondern zwei
-# verschiedene Eingaben.
+# ONLY WHAT `firnc0` can compile SEPARATELY is tested: `--emit=fir-raw`
+# otherwise runs over the merged module program, while the Firn way goes
+# over a single file -- that would be no comparison but two
+# different inputs.
 set -uo pipefail
 cd "$(dirname "$0")/.."
-# Eigenes Temp-Verzeichnis je Lauf: zwei gleichzeitige Laeufe (z. B. Haupt-
-# repo und ein Worktree) benutzten sonst DIESELBEN /tmp-Dateien und
-# ueberschrieben sich gegenseitig die Vergleichsausgaben — das sah wie ein
-# echter Unterschied aus (Runde 41).
+# A temp directory of its own per run: two simultaneous runs (e.g. the main
+# repo and a worktree) otherwise used THE SAME /tmp files and
+# overwrote each other's comparison output -- which looked like a
+# real difference (round 41).
 TMPD=$(mktemp -d)
 trap 'rm -rf "$TMPD"' EXIT
 
 FIRNC=compiler/target/release/firnc
 DUMP=${FIRDUMP:-./.firdump}
 
-# Neu bauen, wenn das Dump-Binary fehlt ODER Quellen juenger sind
+# Rebuild when the dump binary is missing OR sources are younger
 if [ ! -x "$DUMP" ] || [ -n "$(find bin lib/firnc1 -name '*.fi' -newer "$DUMP" -print -quit)" ]; then
     rm -f "$DUMP"
     "$FIRNC" bin/firdump.fi -o "$DUMP" || exit 1

@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
-# tools/gc_meas/run.sh — GC-Messwerkzeuge der Runde 38:
-#   1. Pausen-Histogramm  (pause.fi, DOM-Workload, alle Pausen in Klassen)
-#   2. Fragmentierung     (frag.fi, wechselnde Objektgroessen unter Dauerlast)
-#   3. Pausen bei GROSSER lebender Menge (pause_big.fi, Runde 40): erst
-#      dieser Lauf haelt genug am Leben, dass der Heap ueber INKR_AB (8 MiB)
-#      steigt — nur dort laeuft ueberhaupt der inkrementelle Zyklus. Der
-#      Lauf 2 misst den NICHT-inkrementellen Pfad.
+# tools/gc_meas/run.sh -- GC measuring tools of round 38:
+#   1. pause histogram   (pause.fi, DOM workload, all pauses in classes)
+#   2. fragmentation     (frag.fi, changing object sizes under continuous load)
+#   3. pauses with a LARGE live set (pause_big.fi, round 40): only
+#      this run keeps enough alive for the heap to rise above INKR_AB (8 MiB)
+#      -- only there does the incremental cycle run at all. Run 2
+#      measures the NON-incremental path.
 #
-# Beide werden in allen drei Baustufen gebaut; ein Kurzlauf vergleicht die
-# Zaehler (Sammellaeufe/lebende Objekte muessen uebereinstimmen — sonst ist
-# die Messung baustufenabhaengig und damit wertlos). Der eigentliche Messlauf
-# nutzt die Release-Baustufe.
+# Both are built in all three build stages; a short run compares the
+# counters (collections/live objects have to match -- otherwise
+# the measurement depends on the build stage and is worthless). The actual measuring run
+# uses the release build stage.
 #
-# Umgebung:
-#   GCM_PAUSE_SEK   Laufzeitbudget des Pausenlaufs (Standard 20)
-#   GCM_ROUNDS      Runden des Fragmentierungstests (Standard 600)
-#   GCM_BATCH       Objekte je Runde und Klasse (Standard 200)
-#   GCM_GROSS_SEK   Laufzeitbudget des Grosslaufs (Standard 20)
-#   GCM_CHILDREN      lebende Textknoten im Grosslauf (Standard 120000, ~10 MiB)
+# Environment:
+#   GCM_PAUSE_SEK   time budget of the pause run (default 20)
+#   GCM_ROUNDS      rounds of the fragmentation test (default 600)
+#   GCM_BATCH       objects per round and class (default 200)
+#   GCM_GROSS_SEK   time budget of the large run (default 20)
+#   GCM_CHILDREN    live text nodes in the large run (default 120000, ~10 MiB)
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
@@ -43,7 +43,7 @@ cp tools/gc_meas/pause_big.fi "$ARBEIT/"
 
 echo "== GC-Messung (Runde 38) =="
 
-# ---------------------------------------------------------- 1. Baustufen-Probe
+# ---------------------------------------------------------- 1. build stage probe
 echo
 echo "-- 1. Kurzlauf in drei Baustufen (Vergleich der Zaehler) --"
 STUFEN=("release-fast:" "no-opt:--no-opt" "dev-fast:--opt-level=dev-fast")
@@ -60,7 +60,7 @@ for prog in pause frag; do
             continue
         fi
         if [ "$prog" = pause ]; then
-            # Kurzlauf: 2 s
+            # Short run: 2 s
             sed "s|^const BUDGET_MS: i64 = .*$|const BUDGET_MS: i64 = 2000  // GCM_BUDGET_MS|" \
                 "$ARBEIT/pause.fi" > "$ARBEIT/kurz_pause.fi"
             "$FIRNC" "$ARBEIT/kurz_pause.fi" -o "$ARBEIT/kurz_pause_$name" $opt 2>/dev/null
@@ -73,7 +73,7 @@ for prog in pause frag; do
                 echo "   FEHLER: pause/$name hat Sammellaeufe uebersehen ($m) — Messung ungenau"
                 fehler=1
             fi
-            # Zeitbudget: Zyklen/Laeufe haengen von der Baustufe ab — kein Vergleich.
+            # Time budget: cycles/runs depend on the build stage -- no comparison.
             wert="ok"
         else
             sed -e "s|^const ROUNDS: u64 = .*$|const ROUNDS: u64 = 120  // GCM_ROUNDS|" \
@@ -88,9 +88,9 @@ for prog in pause frag; do
         if [ -z "$erwartet" ]; then
             erwartet="$wert"
         elif [ "$wert" != "$erwartet" ]; then
-            # Konservativer Scan: in langsameren Baustufen kleben mehr
-            # Zeiger in ungescrubten Rahmen — MEHR Lebende ist zulaessig
-            # (Retention), WENIGER waere ein echter Sammlerfehler.
+            # Conservative scan: in slower build stages more pointers stick
+            # in unscrubbed frames -- MORE live objects is allowed
+            # (retention), FEWER would be a real collector bug.
             if [ "$wert" -lt "$erwartet" ]; then
                 echo "   FEHLER: $prog/$name liefert '$wert' < '$erwartet' — lebende Objekte eingesammelt!"
                 fehler=1
@@ -105,7 +105,7 @@ if [ $fehler -ne 0 ]; then
     exit 1
 fi
 
-# ------------------------------------------------------------ 2. Pausenlauf
+# ------------------------------------------------------------ 2. pause run
 echo
 echo "-- 2. Pausen-Histogramm (${PAUSE_SEK}s) --"
 sed -e "s|^const BUDGET_MS: i64 = .*$|const BUDGET_MS: i64 = $((PAUSE_SEK * 1000))  // GCM_BUDGET_MS|" \
@@ -115,7 +115,7 @@ sed -e "s|^const BUDGET_MS: i64 = .*$|const BUDGET_MS: i64 = $((PAUSE_SEK * 1000
 "$ARBEIT/pause_lauf" > "$AUS/pause.tsv"
 grep '^#' "$AUS/pause.tsv"
 
-# ------------------------------------ 2b. Pausen bei grosser lebender Menge
+# ------------------------------------ 2b. pauses with a large live set
 echo
 echo "-- 2b. Pausen bei grosser lebender Menge (${GROSS_SEK}s, $KINDER lebende Knoten) --"
 sed -e "s|^const BUDGET_MS: i64 = .*$|const BUDGET_MS: i64 = $((GROSS_SEK * 1000))  // GCM_BUDGET_MS|" \
@@ -126,7 +126,7 @@ sed -e "s|^const BUDGET_MS: i64 = .*$|const BUDGET_MS: i64 = $((GROSS_SEK * 1000
 "$ARBEIT/gross_lauf" > "$AUS/pause_gross.tsv"
 grep '^#' "$AUS/pause_gross.tsv"
 
-# ---------------------------------------------------- 3. Fragmentierungslauf
+# ---------------------------------------------------- 3. fragmentation run
 echo
 echo "-- 3. Fragmentierungstest ($RUNDEN Runden x $BATCH Objekte) --"
 sed -e "s|^const ROUNDS: u64 = .*$|const ROUNDS: u64 = $RUNDEN  // GCM_ROUNDS|" \
@@ -137,7 +137,7 @@ sed -e "s|^const ROUNDS: u64 = .*$|const ROUNDS: u64 = $RUNDEN  // GCM_ROUNDS|" 
 "$ARBEIT/frag_lauf" > "$AUS/frag.tsv"
 grep '^#' "$AUS/frag.tsv"
 
-# ------------------------------------------------ 3b. Phasen-Fragmentierung
+# ------------------------------------------------ 3b. phase fragmentation
 echo
 echo "-- 3b. Phasen-Fragmentierung (gross -> klein) --"
 "$FIRNC" "$ARBEIT/frag2.fi" -o "$ARBEIT/frag2_lauf" 2>"$ARBEIT/bau4.err" || {
@@ -160,7 +160,7 @@ if ende is not None and a_max and ende > a_max * 0.5:
     print('   HINWEIS: RSS-Ende ueber 50 % des Phase-A-Maximums — Rueckgabe pruefen')
 PYEOF2
 
-# ------------------------------------------------------------ 4. Auswertung
+# ------------------------------------------------------------ 4. evaluation
 echo
 echo "-- 4. Auswertung --"
 python3 - "$AUS/pause.tsv" "$AUS/frag.tsv" "$AUS/pause_gross.tsv" <<'PYEOF'
@@ -194,7 +194,7 @@ print(f'     Zyklen {pk.get("zyklen","?")}, Sammellaeufe {pk.get("sammellaeufe",
 pmax = int(pk.get('pause_max_ns', 0))
 ptot = int(pk.get('pause_total_ns', 0))
 print(f'     laengste Pause {pmax} ns ({pmax/1e6:.2f} ms), Summe {ptot/1e6:.1f} ms')
-# Histogramm: die letzten 9 Datenzeilen sind (grenze, anzahl)
+# Histogram: the last 9 data lines are (limit, count)
 hist = pz[-9:]
 gesamt = sum(a for _, a in hist)
 if gesamt:
@@ -222,19 +222,19 @@ if gk:
             kum += anzahl
             if anzahl:
                 print(f'     <= {grenze:>9} ns : {anzahl:>6}  (kumuliert {kum*100.0/ggesamt:5.1f} %)')
-    # WICHTIG: pause_max_ns ist der Hoechstwert SEIT PROZESSSTART und
-    # enthaelt damit die Sammellaeufe des AUFBAUS (Heap waechst, noch kein
-    # inkrementeller Zyklus). Die Klassen oben zaehlen nur die Laeufe der
-    # Messschleife — Abweichung ist zu erwarten und kein Widerspruch.
+    # IMPORTANT: pause_max_ns is the maximum SINCE THE START OF THE PROCESS and
+    # therefore contains the collections of the BUILD-UP (the heap grows, no
+    # incremental cycle yet). The classes above only count the runs of the
+    # measuring loop -- a deviation is to be expected and is no contradiction.
 
 fk, fz = lies(sys.argv[2])
 print('   Fragmentierung:')
 rss = [z[1] for z in fz if len(z) >= 2]
 n = len(rss)
-# Fragmentierung = WACHSTUM MIT DEN RUNDEN. Ein einmaliger Hochlauf
-# (neue Groessenklasse wird erstmalig angelegt) ist kein Wachstum.
-# Gemessen wird daher die Drift innerhalb des letzten Drittels:
-# Median der ersten Haelfte des Drittels vs. Median der zweiten Haelfte.
+# Fragmentation = GROWTH WITH THE ROUNDS. A one-time rise
+# (a new size class is created for the first time) is no growth.
+# What is measured is therefore the drift within the last third:
+# the median of the first half of the third vs. the median of the second half.
 d3 = rss[2*n//3:] or rss
 h1 = d3[:len(d3)//2] or d3[:1]
 h2 = d3[len(d3)//2:] or d3[-1:]

@@ -39,7 +39,7 @@ def main():
             ziel = f"/tmp/baustufe_{name}_{st}"
             bauen(q, st, ziel)
             zeit[st], ausgabe[st] = messen(ziel)
-        # Korrektheit: alle Stufen muessen dasselbe liefern
+        # Correctness: all stages have to yield the same
         if len(set(ausgabe.values())) != 1:
             print(f"{name:<14}  ABWEICHENDE AUSGABE zwischen den Stufen: {ausgabe}")
             fehler += 1

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# tools/gen_gctext.sh — erzeugt lib/firnc1/gctext.fi aus lib/gc/gc.fi.
+# tools/gen_gctext.sh -- produces lib/firnc1/gctext.fi from lib/gc/gc.fi.
 #
-# WARUM: `firnc0` bettet die Sammler-Laufzeit per `include_str!` ein
-# (compiler/src/gc.rs, LAUFZEIT). Firn kennt kein `include_str` — die
-# ehrliche Entsprechung ist diese generierte Datei: derselbe Text, als
+# WHY: `firnc0` embeds the collector runtime with `include_str!`
+# (compiler/src/gc.rs, LAUFZEIT). Firn has no `include_str` -- the
+# honest equivalent is this generated file: the same text, packed as
 # u64-Woerter gepackt (8 Bytes je Wort, little-endian), damit der
 # Selbsthosting-Compiler ihn ohne Dateizugriff einziehen kann.
 # Nach einer Aenderung an lib/gc/gc.fi dieses Skript laufen lassen und
