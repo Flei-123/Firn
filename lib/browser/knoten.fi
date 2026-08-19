@@ -1,0 +1,714 @@
+// lib/browser/knoten.fi — DOM-KERN (Runde 54), in Firn.
+//
+// Die Datenstruktur, auf der ab hier alles aufsetzt: der Baumaufbau
+// (lib/browser/baum.fi), spaeter CSS-Zuordnung und Layout. Sie ist bewusst
+// eine ECHTE DOM-Form und keine Abkuerzung fuer den Parser:
+//
+//   * jeder Knoten kennt seine Eltern, sein erstes/letztes Kind und beide
+//     Geschwister. Alle Verweise sind STARK — der Baum ist also voller
+//     Zyklen, und genau dafuer gibt es den Tracing-Sammler (SPEC §3.5).
+//     Ein Zaehlverweis wuerde hier NIE etwas freigeben.
+//   * Namen (Element- und Attributnamen) sind ATOME: eine `u32`-Kennung in
+//     eine Tabelle (lib/browser/namen.fi). Vergleich ist ein Ganzzahlvergleich,
+//     kein Zeichenvergleich — das ist die Voraussetzung dafuer, dass der
+//     Baumaufbau seine vielen Namensfragen ueberhaupt bezahlbar stellt.
+//   * Textdaten sind KETTEN aus GC-Stuecken (`Kette`/`Strang`). Damit lebt
+//     JEDES Byte des Dokuments im GC-Heap; es gibt keine Arena, die an der
+//     Lebensdauer des Dokuments haengt. Haelt eine JS-Referenz spaeter einen
+//     einzelnen Textknoten fest, bleibt genau dieser Text am Leben und sonst
+//     nichts. Das ist der Grund fuer die Bauart, und ihr Preis ist benannt:
+//     ein Zeichen kostet 4 Byte (Codepunkt), ein Stueck fasst 28 davon.
+//   * Namensraeume sind Marker (`NS_HTML`, `NS_SVG`, `NS_MATHML`, …). Sie
+//     stehen am Element UND am Attribut, weil beide sie brauchen.
+//
+// EHRLICHE GRENZEN (Stand Runde 54):
+//   * `kette_bei` laeuft die Stueckliste ab — O(n/28). Fuer den Vergleich
+//     zweier Ketten und fuer die Ausgabe gibt es Stueck-fuer-Stueck-Wege,
+//     die das nicht tun; wer zeichenweise indiziert, zahlt.
+//   * Es gibt keine `id`/`class`-Register, keine Live-Sammlungen und keine
+//     Mutationsbeobachter. Die Verweise dafuer sind vorgesehen (der Baum
+//     traegt sie problemlos), gebaut sind sie nicht.
+//   * Kein `Node.ownerDocument` an jedem Knoten: der Baumaufbau kennt das
+//     Dokument ohnehin, und ein zusaetzlicher Verweis je Knoten kostet
+//     8 Byte, die noch niemand braucht.
+
+import html.mem
+
+export {
+    Knoten, Element, Attribut, Text, Kommentar, Doctype, Dokument, Fragment,
+    Kette, Strang,
+    NS_HTML, NS_SVG, NS_MATHML, NS_XLINK, NS_XML, NS_XMLNS,
+    K_DOKUMENT, K_ELEMENT, K_TEXT, K_KOMMENTAR, K_DOCTYPE, K_FRAGMENT,
+    MODUS_KEIN_QUIRKS, MODUS_QUIRKS, MODUS_BEGRENZT,
+    STRANG_ZEICHEN,
+    kette_neu, kette_push, kette_len, kette_bei, kette_leer,
+    kette_aus_cpbuf, kette_nach_cpbuf, kette_push_cpbuf, kette_gleich,
+    kette_gleich_ascii, kette_beginnt_ascii_klein, kette_gleich_ascii_klein,
+    dokument_neu, fragment_neu, element_neu, text_neu, kommentar_neu, doctype_neu,
+    kind_anhaengen, kind_einfuegen_vor, kind_entfernen, kinder_umhaengen,
+    knoten_index, kind_bei, knoten_ist_element, knoten_als_element,
+    element_name, element_ns, element_ist,
+    attr_setzen, attr_finden, attr_wert, attr_zahl, attr_erstes,
+    dok_modus_setzen, dok_modus,
+    knoten_tiefe, knoten_vorfahr_ist,
+}
+
+// --------------------------------------------------------------- Konstanten
+
+// Namensraeume. Als Marker, nicht als Zeichenkette — der Baumaufbau
+// vergleicht sie millionenfach.
+const NS_HTML: u32 = 1
+const NS_SVG: u32 = 2
+const NS_MATHML: u32 = 3
+const NS_XLINK: u32 = 4
+const NS_XML: u32 = 5
+const NS_XMLNS: u32 = 6
+
+// Knotenarten (`nodeType` in der DOM-Sprache, hier eigene Nummern).
+const K_DOKUMENT: u32 = 1
+const K_ELEMENT: u32 = 2
+const K_TEXT: u32 = 3
+const K_KOMMENTAR: u32 = 4
+const K_DOCTYPE: u32 = 5
+const K_FRAGMENT: u32 = 6
+
+// Dokumentmodus (WHATWG "quirks mode").
+const MODUS_KEIN_QUIRKS: u32 = 0
+const MODUS_QUIRKS: u32 = 1
+const MODUS_BEGRENZT: u32 = 2
+
+// Zeichen je Kettenstueck. 28 * 4 = 112 Byte Nutzdaten + 8 (naechster) + 4
+// (len) = 124, aufgerundet 128 — genau eine Groessenklasse des Sammlers
+// (lib/gc/gc.fi, __gc_klassen_bytes: 32/48/64/96/128/…), also kein Verschnitt.
+const STRANG_ZEICHEN: usize = 28
+
+// --------------------------------------------------------------- Klassen
+
+// Ein Stueck einer Zeichenkette. Codepunkte, nicht Bytes: der Tokenizer
+// liefert Codepunkte (mem.CpBuf), und ungepaarte Surrogate muessen erhalten
+// bleiben (SPEC §8.2) — eine UTF-8-Ablage koennte das nur mit WTF-8.
+gc class Strang {
+    naechster: Gc[Strang],
+    len: u32,
+    zeichen: [u32; 28],
+}
+
+// Der Griff auf eine Kette: Kopf, Schwanz und Gesamtlaenge. Der Schwanz ist
+// der Grund, warum Anhaengen O(1) ist — der Tokenizer haengt Zeichen einzeln
+// an, millionenfach.
+gc class Kette {
+    erstes: Gc[Strang],
+    letztes: Gc[Strang],
+    laenge: u64,
+}
+
+// Der Basisknoten. ALLE Baumverweise sind stark, in beide Richtungen.
+gc class Knoten {
+    eltern: Gc[Knoten],
+    erstes_kind: Gc[Knoten],
+    letztes_kind: Gc[Knoten],
+    vorheriges: Gc[Knoten],
+    naechstes: Gc[Knoten],
+    art: u32,
+    kinder: u32,
+}
+
+// Praefixlayout (SPEC §4.4): `Gc[Element]` ist kostenlos `Gc[Knoten]`.
+gc class Element extends Knoten {
+    erstes_attr: Gc[Attribut],
+    letztes_attr: Gc[Attribut],
+    name: u32,
+    ns: u32,
+    nattr: u32,
+}
+
+// Attribute haengen als einfach verkettete Liste am Element. Die REIHENFOLGE
+// ist bedeutsam, und Attributzahlen sind klein — eine Hashtabelle je Element
+// waere teurer als die Liste, die sie ersetzen soll.
+gc class Attribut {
+    naechstes: Gc[Attribut],
+    wert: Gc[Kette],
+    name: u32,
+    ns: u32,
+}
+
+gc class Text extends Knoten {
+    daten: Gc[Kette],
+}
+
+gc class Kommentar extends Knoten {
+    daten: Gc[Kette],
+}
+
+gc class Doctype extends Knoten {
+    name: Gc[Kette],
+    pubid: Gc[Kette],
+    sysid: Gc[Kette],
+    hat_pubid: bool,
+    hat_sysid: bool,
+}
+
+gc class Dokument extends Knoten {
+    modus: u32,
+}
+
+gc class Fragment extends Knoten {
+    wirt: u32,
+}
+
+// ------------------------------------------------------------------ Ketten
+
+fn kette_neu() -> AllocError!Gc[Kette] {
+    return try gc Kette{
+        erstes: gc_null[Strang](),
+        letztes: gc_null[Strang](),
+        laenge: 0,
+    }
+}
+
+fn strang_neu() -> AllocError!Gc[Strang] {
+    return try gc Strang{
+        naechster: gc_null[Strang](),
+        len: 0,
+        zeichen: [0; 28],
+    }
+}
+
+// Haengt einen Codepunkt an. O(1).
+fn kette_push(k: Gc[Kette], cp: u32) -> AllocError!bool {
+    var s: Gc[Strang] = k.letztes
+    if s == gc_null[Strang]() || s.len as usize >= STRANG_ZEICHEN {
+        let neu = try strang_neu()
+        if k.erstes == gc_null[Strang]() {
+            k.erstes = neu
+        } else {
+            k.letztes.naechster = neu
+        }
+        k.letztes = neu
+        s = neu
+    }
+    let i: usize = s.len as usize
+    s.zeichen[i] = cp
+    s.len = s.len + 1
+    k.laenge = k.laenge + 1
+    return true
+}
+
+fn kette_len(k: Gc[Kette]) -> u64 {
+    if k == gc_null[Kette]() {
+        return 0
+    }
+    return k.laenge
+}
+
+fn kette_leer(k: Gc[Kette]) -> bool {
+    return kette_len(k) == 0
+}
+
+// Zeichen an Stelle `i`. O(i/28) — wer eine Kette zeichenweise durchlaeuft,
+// nimmt besser `kette_nach_cpbuf`.
+fn kette_bei(k: Gc[Kette], i: u64) -> u32 {
+    if k == gc_null[Kette]() || i >= k.laenge {
+        return 0
+    }
+    var rest: u64 = i
+    var s: Gc[Strang] = k.erstes
+    while s != gc_null[Strang]() {
+        let n: u64 = s.len as u64
+        if rest < n {
+            return s.zeichen[rest as usize]
+        }
+        rest = rest - n
+        s = s.naechster
+    }
+    return 0
+}
+
+// Baut eine Kette aus einem Codepunktpuffer des Tokenizers.
+fn kette_aus_cpbuf(b: *mut mem.CpBuf) -> AllocError!Gc[Kette] {
+    let k = try kette_neu()
+    let n: usize = mem.cp_len(b)
+    var i: usize = 0
+    while i < n {
+        let ok: bool = try kette_push(k, mem.cp_at(b, i))
+        if !ok {
+            return k
+        }
+        i = i + 1
+    }
+    return k
+}
+
+fn kette_push_cpbuf(k: Gc[Kette], b: *mut mem.CpBuf) -> AllocError!bool {
+    let n: usize = mem.cp_len(b)
+    var i: usize = 0
+    while i < n {
+        let ok: bool = try kette_push(k, mem.cp_at(b, i))
+        if !ok {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Haengt den Inhalt der Kette an einen Codepunktpuffer an (Ausgabeweg).
+fn kette_nach_cpbuf(k: Gc[Kette], out: *mut mem.CpBuf) {
+    if k == gc_null[Kette]() {
+        return
+    }
+    var s: Gc[Strang] = k.erstes
+    while s != gc_null[Strang]() {
+        var i: usize = 0
+        let n: usize = s.len as usize
+        while i < n {
+            mem.cp_push(out, s.zeichen[i])
+            i = i + 1
+        }
+        s = s.naechster
+    }
+}
+
+fn kette_gleich(a: Gc[Kette], b: Gc[Kette]) -> bool {
+    let la: u64 = kette_len(a)
+    if la != kette_len(b) {
+        return false
+    }
+    if la == 0 {
+        return true
+    }
+    var sa: Gc[Strang] = a.erstes
+    var sb: Gc[Strang] = b.erstes
+    var ia: usize = 0
+    var ib: usize = 0
+    var rest: u64 = la
+    while rest > 0 {
+        while sa != gc_null[Strang]() && ia >= sa.len as usize {
+            sa = sa.naechster
+            ia = 0
+        }
+        while sb != gc_null[Strang]() && ib >= sb.len as usize {
+            sb = sb.naechster
+            ib = 0
+        }
+        if sa == gc_null[Strang]() || sb == gc_null[Strang]() {
+            return false
+        }
+        if sa.zeichen[ia] != sb.zeichen[ib] {
+            return false
+        }
+        ia = ia + 1
+        ib = ib + 1
+        rest = rest - 1
+    }
+    return true
+}
+
+// Vergleich mit einem ASCII-Literal (`[u8; N]` per Zeiger + Laenge).
+fn kette_gleich_ascii(k: Gc[Kette], p: *mut u8, n: usize) -> bool {
+    if kette_len(k) != n as u64 {
+        return false
+    }
+    var i: usize = 0
+    while i < n {
+        if kette_bei(k, i as u64) != (*((p as u64 + i as u64) as *mut u8)) as u32 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn ascii_klein(c: u32) -> u32 {
+    if c >= 65 as u32 && c <= 90 as u32 {
+        return c + 32 as u32
+    }
+    return c
+}
+
+// Wie `kette_gleich_ascii`, aber die Kette wird ASCII-kleingeschrieben
+// verglichen (DOCTYPE-Kennungen sind laut Standard ASCII-fallunempfindlich).
+fn kette_gleich_ascii_klein(k: Gc[Kette], p: *mut u8, n: usize) -> bool {
+    if kette_len(k) != n as u64 {
+        return false
+    }
+    return kette_beginnt_ascii_klein(k, p, n)
+}
+
+// Beginnt die Kette (ASCII-kleingeschrieben) mit dem Literal?
+fn kette_beginnt_ascii_klein(k: Gc[Kette], p: *mut u8, n: usize) -> bool {
+    if kette_len(k) < n as u64 {
+        return false
+    }
+    var s: Gc[Strang] = k.erstes
+    var i: usize = 0
+    var j: usize = 0
+    while j < n {
+        while s != gc_null[Strang]() && i >= s.len as usize {
+            s = s.naechster
+            i = 0
+        }
+        if s == gc_null[Strang]() {
+            return false
+        }
+        let a: u32 = ascii_klein(s.zeichen[i])
+        let b: u32 = ascii_klein((*((p as u64 + j as u64) as *mut u8)) as u32)
+        if a != b {
+            return false
+        }
+        i = i + 1
+        j = j + 1
+    }
+    return true
+}
+
+// ------------------------------------------------------------- Knoten bauen
+
+fn dokument_neu() -> AllocError!Gc[Dokument] {
+    return try gc Dokument{
+        eltern: gc_null[Knoten](),
+        erstes_kind: gc_null[Knoten](),
+        letztes_kind: gc_null[Knoten](),
+        vorheriges: gc_null[Knoten](),
+        naechstes: gc_null[Knoten](),
+        art: K_DOKUMENT,
+        kinder: 0,
+        modus: MODUS_KEIN_QUIRKS,
+    }
+}
+
+fn fragment_neu(wirt: u32) -> AllocError!Gc[Fragment] {
+    return try gc Fragment{
+        eltern: gc_null[Knoten](),
+        erstes_kind: gc_null[Knoten](),
+        letztes_kind: gc_null[Knoten](),
+        vorheriges: gc_null[Knoten](),
+        naechstes: gc_null[Knoten](),
+        art: K_FRAGMENT,
+        kinder: 0,
+        wirt: wirt,
+    }
+}
+
+fn element_neu(name: u32, ns: u32) -> AllocError!Gc[Element] {
+    return try gc Element{
+        eltern: gc_null[Knoten](),
+        erstes_kind: gc_null[Knoten](),
+        letztes_kind: gc_null[Knoten](),
+        vorheriges: gc_null[Knoten](),
+        naechstes: gc_null[Knoten](),
+        art: K_ELEMENT,
+        kinder: 0,
+        erstes_attr: gc_null[Attribut](),
+        letztes_attr: gc_null[Attribut](),
+        name: name,
+        ns: ns,
+        nattr: 0,
+    }
+}
+
+fn text_neu(daten: Gc[Kette]) -> AllocError!Gc[Text] {
+    return try gc Text{
+        eltern: gc_null[Knoten](),
+        erstes_kind: gc_null[Knoten](),
+        letztes_kind: gc_null[Knoten](),
+        vorheriges: gc_null[Knoten](),
+        naechstes: gc_null[Knoten](),
+        art: K_TEXT,
+        kinder: 0,
+        daten: daten,
+    }
+}
+
+fn kommentar_neu(daten: Gc[Kette]) -> AllocError!Gc[Kommentar] {
+    return try gc Kommentar{
+        eltern: gc_null[Knoten](),
+        erstes_kind: gc_null[Knoten](),
+        letztes_kind: gc_null[Knoten](),
+        vorheriges: gc_null[Knoten](),
+        naechstes: gc_null[Knoten](),
+        art: K_KOMMENTAR,
+        kinder: 0,
+        daten: daten,
+    }
+}
+
+fn doctype_neu(name: Gc[Kette], pubid: Gc[Kette], sysid: Gc[Kette],
+               hat_pubid: bool, hat_sysid: bool) -> AllocError!Gc[Doctype] {
+    return try gc Doctype{
+        eltern: gc_null[Knoten](),
+        erstes_kind: gc_null[Knoten](),
+        letztes_kind: gc_null[Knoten](),
+        vorheriges: gc_null[Knoten](),
+        naechstes: gc_null[Knoten](),
+        art: K_DOCTYPE,
+        kinder: 0,
+        name: name,
+        pubid: pubid,
+        sysid: sysid,
+        hat_pubid: hat_pubid,
+        hat_sysid: hat_sysid,
+    }
+}
+
+// ---------------------------------------------------------- Baumstruktur
+
+// Haengt `kind` als letztes Kind an `eltern`. Ist `kind` schon irgendwo
+// eingehaengt, wird es vorher ausgehaengt — genau die Semantik von
+// `Node.appendChild`, auf die sich das Adoption-Agency-Verfahren stuetzt.
+fn kind_anhaengen(eltern: Gc[Knoten], kind: Gc[Knoten]) {
+    if eltern == gc_null[Knoten]() || kind == gc_null[Knoten]() {
+        return
+    }
+    if kind.eltern != gc_null[Knoten]() {
+        kind_entfernen(kind)
+    }
+    kind.eltern = eltern
+    kind.vorheriges = eltern.letztes_kind
+    kind.naechstes = gc_null[Knoten]()
+    if eltern.letztes_kind == gc_null[Knoten]() {
+        eltern.erstes_kind = kind
+    } else {
+        eltern.letztes_kind.naechstes = kind
+    }
+    eltern.letztes_kind = kind
+    eltern.kinder = eltern.kinder + 1
+}
+
+// Fuegt `kind` unmittelbar VOR `referenz` ein. `referenz` muss ein Kind von
+// `eltern` sein; ist sie der Nullzeiger, wird angehaengt. Das ist der Weg,
+// den "foster parenting" und das Adoption-Agency-Verfahren brauchen.
+fn kind_einfuegen_vor(eltern: Gc[Knoten], kind: Gc[Knoten], referenz: Gc[Knoten]) {
+    if referenz == gc_null[Knoten]() {
+        kind_anhaengen(eltern, kind)
+        return
+    }
+    if eltern == gc_null[Knoten]() || kind == gc_null[Knoten]() {
+        return
+    }
+    if kind.eltern != gc_null[Knoten]() {
+        kind_entfernen(kind)
+    }
+    kind.eltern = eltern
+    kind.naechstes = referenz
+    kind.vorheriges = referenz.vorheriges
+    if referenz.vorheriges == gc_null[Knoten]() {
+        eltern.erstes_kind = kind
+    } else {
+        referenz.vorheriges.naechstes = kind
+    }
+    referenz.vorheriges = kind
+    eltern.kinder = eltern.kinder + 1
+}
+
+fn kind_entfernen(kind: Gc[Knoten]) {
+    if kind == gc_null[Knoten]() {
+        return
+    }
+    let e: Gc[Knoten] = kind.eltern
+    if e == gc_null[Knoten]() {
+        return
+    }
+    if kind.vorheriges == gc_null[Knoten]() {
+        e.erstes_kind = kind.naechstes
+    } else {
+        kind.vorheriges.naechstes = kind.naechstes
+    }
+    if kind.naechstes == gc_null[Knoten]() {
+        e.letztes_kind = kind.vorheriges
+    } else {
+        kind.naechstes.vorheriges = kind.vorheriges
+    }
+    e.kinder = e.kinder - 1
+    kind.eltern = gc_null[Knoten]()
+    kind.vorheriges = gc_null[Knoten]()
+    kind.naechstes = gc_null[Knoten]()
+}
+
+// Haengt ALLE Kinder von `von` an `nach` um, in Reihenfolge. Das
+// Adoption-Agency-Verfahren braucht genau das (Schritt 14:
+// "Take all of the child nodes of common ancestor …").
+fn kinder_umhaengen(von: Gc[Knoten], nach: Gc[Knoten]) {
+    if von == gc_null[Knoten]() || nach == gc_null[Knoten]() {
+        return
+    }
+    while von.erstes_kind != gc_null[Knoten]() {
+        let k: Gc[Knoten] = von.erstes_kind
+        kind_entfernen(k)
+        kind_anhaengen(nach, k)
+    }
+}
+
+// Stelle eines Kindes in seiner Elternliste, -1 wenn es keine Eltern hat.
+fn knoten_index(kind: Gc[Knoten]) -> i64 {
+    if kind == gc_null[Knoten]() || kind.eltern == gc_null[Knoten]() {
+        return -1
+    }
+    var i: i64 = 0
+    var c: Gc[Knoten] = kind.eltern.erstes_kind
+    while c != gc_null[Knoten]() {
+        if c == kind {
+            return i
+        }
+        i = i + 1
+        c = c.naechstes
+    }
+    return -1
+}
+
+fn kind_bei(eltern: Gc[Knoten], i: u32) -> Gc[Knoten] {
+    if eltern == gc_null[Knoten]() {
+        return gc_null[Knoten]()
+    }
+    var n: u32 = 0
+    var c: Gc[Knoten] = eltern.erstes_kind
+    while c != gc_null[Knoten]() {
+        if n == i {
+            return c
+        }
+        n = n + 1
+        c = c.naechstes
+    }
+    return gc_null[Knoten]()
+}
+
+fn knoten_tiefe(k: Gc[Knoten]) -> u32 {
+    var d: u32 = 0
+    var c: Gc[Knoten] = k
+    while c != gc_null[Knoten]() && c.eltern != gc_null[Knoten]() {
+        d = d + 1
+        c = c.eltern
+    }
+    return d
+}
+
+fn knoten_vorfahr_ist(k: Gc[Knoten], moeglicher: Gc[Knoten]) -> bool {
+    var c: Gc[Knoten] = k
+    while c != gc_null[Knoten]() {
+        if c == moeglicher {
+            return true
+        }
+        c = c.eltern
+    }
+    return false
+}
+
+// ---------------------------------------------------------------- Elemente
+
+fn knoten_ist_element(k: Gc[Knoten]) -> bool {
+    if k == gc_null[Knoten]() {
+        return false
+    }
+    return k.art == K_ELEMENT
+}
+
+fn knoten_als_element(k: Gc[Knoten]) -> Gc[Element] {
+    if k == gc_null[Knoten]() {
+        return gc_null[Element]()
+    }
+    return k.as?[Element]
+}
+
+fn element_name(k: Gc[Knoten]) -> u32 {
+    let e: Gc[Element] = knoten_als_element(k)
+    if e == gc_null[Element]() {
+        return 0
+    }
+    return e.name
+}
+
+fn element_ns(k: Gc[Knoten]) -> u32 {
+    let e: Gc[Element] = knoten_als_element(k)
+    if e == gc_null[Element]() {
+        return 0
+    }
+    return e.ns
+}
+
+// Ist `k` ein HTML-Element mit dem Namen `name`? Die mit Abstand haeufigste
+// Frage des Baumaufbaus, deshalb ein eigener Weg ohne Umwandlung.
+fn element_ist(k: Gc[Knoten], name: u32) -> bool {
+    if k == gc_null[Knoten]() || k.art != K_ELEMENT {
+        return false
+    }
+    let e: Gc[Element] = k.as?[Element]
+    if e == gc_null[Element]() {
+        return false
+    }
+    return e.name == name && e.ns == NS_HTML
+}
+
+// ---------------------------------------------------------------- Attribute
+
+// Setzt ein Attribut. Ist der Name (im selben Namensraum) schon vorhanden,
+// passiert NICHTS und die Antwort ist `false` — genau die Regel des
+// HTML-Standards fuer doppelte Attribute an einem Tag.
+fn attr_setzen(e: Gc[Element], name: u32, ns: u32, wert: Gc[Kette]) -> AllocError!bool {
+    var a: Gc[Attribut] = e.erstes_attr
+    while a != gc_null[Attribut]() {
+        if a.name == name && a.ns == ns {
+            return false
+        }
+        a = a.naechstes
+    }
+    let neu = try gc Attribut{
+        naechstes: gc_null[Attribut](),
+        wert: wert,
+        name: name,
+        ns: ns,
+    }
+    if e.erstes_attr == gc_null[Attribut]() {
+        e.erstes_attr = neu
+    } else {
+        e.letztes_attr.naechstes = neu
+    }
+    e.letztes_attr = neu
+    e.nattr = e.nattr + 1
+    return true
+}
+
+fn attr_finden(e: Gc[Element], name: u32, ns: u32) -> Gc[Attribut] {
+    if e == gc_null[Element]() {
+        return gc_null[Attribut]()
+    }
+    var a: Gc[Attribut] = e.erstes_attr
+    while a != gc_null[Attribut]() {
+        if a.name == name && a.ns == ns {
+            return a
+        }
+        a = a.naechstes
+    }
+    return gc_null[Attribut]()
+}
+
+fn attr_wert(e: Gc[Element], name: u32, ns: u32) -> Gc[Kette] {
+    let a: Gc[Attribut] = attr_finden(e, name, ns)
+    if a == gc_null[Attribut]() {
+        return gc_null[Kette]()
+    }
+    return a.wert
+}
+
+fn attr_zahl(e: Gc[Element]) -> u32 {
+    if e == gc_null[Element]() {
+        return 0
+    }
+    return e.nattr
+}
+
+fn attr_erstes(e: Gc[Element]) -> Gc[Attribut] {
+    if e == gc_null[Element]() {
+        return gc_null[Attribut]()
+    }
+    return e.erstes_attr
+}
+
+// ---------------------------------------------------------------- Dokument
+
+fn dok_modus_setzen(d: Gc[Dokument], m: u32) {
+    d.modus = m
+}
+
+fn dok_modus(d: Gc[Dokument]) -> u32 {
+    return d.modus
+}
