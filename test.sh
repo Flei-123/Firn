@@ -27,6 +27,10 @@
 #      tools/tokenizer/mindestquote.txt (tools/tokenizer/run.sh).
 #  18. Paket- und Projektsystem (tools/pakete/run.sh): Manifest, Such-
 #      reihenfolge, Sichtbarkeit, Bau-Treiber — in BEIDEN Uebersetzern.
+#  19. Freistehendes Uebersetzen (tools/freistehend/run.sh, Runde 52):
+#      `profile kernel`, Inline-Assembler, MMIO, `#[interrupt]` — das
+#      Kernel-Beispiel wird zu einer ELF-Objektdatei OHNE undefinierte
+#      Symbole, in BEIDEN Compilern, und gegen ein Linkerskript gebunden.
 #  10. DOM-Dauerlauf (tools/dom_soak/run.sh): der DOM-Prototyp in Firn baut
 #      fortlaufend echte Zyklen (Eltern/Kind, Listener, JS-Wrapper) und darf
 #      dabei nicht wachsen; die absichtlich leckende Gegenprobe mit
@@ -321,6 +325,19 @@ if [ "$FPRC" -eq 0 ]; then
 else
     bad "tools/fixpunkt.sh schlug fehl (siehe .test-work/fixpunkt.log)"
     tail -20 "$WORK/fixpunkt.log" | sed 's/^/   /'
+fi
+
+echo "== 19. Freistehend: profile kernel, Inline-Asm, MMIO, iretq (tools/freistehend/run.sh) =="
+# Runde 52. Das Kernel-Beispiel wird von BEIDEN Compilern zu einer
+# ELF-Objektdatei uebersetzt, die KEINEN undefinierten Namen hat, keinen
+# syscall enthaelt und sich gegen ein Linkerskript binden laesst.
+bash tools/freistehend/run.sh > "$WORK/freistehend.log" 2>&1 && FSRC=0 || FSRC=$?
+if [ "$FSRC" -eq 0 ]; then
+    ok
+    tail -1 "$WORK/freistehend.log" | sed 's/^/   /'
+else
+    bad "tools/freistehend/run.sh schlug fehl (siehe .test-work/freistehend.log)"
+    grep FAIL "$WORK/freistehend.log" | head -10 | sed 's/^/   /'
 fi
 
 echo "== 18. Paket- und Projektsystem (tools/pakete/run.sh) =="

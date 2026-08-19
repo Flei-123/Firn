@@ -44,6 +44,7 @@ import muster
 import fehler
 import gc
 import iface
+import kern
 
 export { Lower, low_neu, low_frei, low_lauf, low_fehler, low_fir, low_ungeeignet,
          low_mu_setzen, low_fe_setzen, low_gc_setzen, low_if_setzen }
@@ -1096,11 +1097,92 @@ fn methodenfunktion_l(l: *mut Lower, sn: u32, m: u32) -> u32 {
     return nr
 }
 
+// ---------------------------------------------- Inline-Assembler und MMIO
+//
+// RUNDE 52 (compiler/src/kern.rs::lower_hook).
+
+fn mmio_fty(w: u32) -> u32 {
+    if w == 0 {
+        return fir.T_U8
+    }
+    if w == 1 {
+        return fir.T_U16
+    }
+    if w == 2 {
+        return fir.T_U32
+    }
+    return fir.T_U64
+}
+
+fn asm_senken(l: *mut Lower, blk: u32, e: u32) -> u32 {
+    let b: *mut ast.Baum = baum(l)
+    let off: u32 = ast.e_b(b, e)
+    let anz: u32 = ast.e_c(b, e)
+    // Eingaben in Quellreihenfolge auswerten und auf 64 Bit bringen: in ein
+    // Register geht immer das ganze Wort.
+    var werte: Vec[u32] = vec_neu[u32]()
+    var k: u32 = 0
+    while k < anz {
+        let arg: u32 = ast.kind_at(b, off + k)
+        var v: u32 = wert(l, arg)
+        let ft: u32 = e_fty(l, arg)
+        if ft != fir.T_U64 && ft != fir.T_I64 && ft != fir.T_PTR {
+            v = push(l, fir.O_CAST, fir.T_U64, v, 0, ft, 0, 0, 0)
+        }
+        vec_push[u32](&werte, v)
+        k = k + 1
+    }
+    // Argumentblock: erst die Paare (Register, Wert), danach die Clobber.
+    let aoff: u32 = fir.arg_anfang(&(*l).f)
+    var k2: u32 = 0
+    while k2 < anz {
+        fir.arg_dazu(&(*l).f, ast.asm_ein_reg(b, blk, k2))
+        fir.arg_dazu(&(*l).f, vec_at[u32](&werte, k2 as usize))
+        k2 = k2 + 1
+    }
+    vec_frei[u32](&werte)
+    let cz: u32 = ast.asm_clob_anzahl(b, blk)
+    var k3: u32 = 0
+    while k3 < cz {
+        fir.arg_dazu(&(*l).f, ast.asm_clob(b, blk, k3))
+        k3 = k3 + 1
+    }
+    let vorlage: u32 = ast.asm_vorlage(b, blk)
+    var aus: u32 = ast.asm_aus(b, blk)
+    if aus == ast.NICHTS {
+        aus = fir.KEIN
+    }
+    if aus == fir.KEIN {
+        push_void(l, fir.O_ASM, fir.T_VOID, vorlage, aus, 0, cz as u64, aoff, anz)
+        return 0
+    }
+    return push(l, fir.O_ASM, fir.T_U64, vorlage, aus, 0, cz as u64, aoff, anz)
+}
+
 fn ruf_voll(l: *mut Lower, e: u32, ziel: u32) -> u32 {
     let b: *mut ast.Baum = baum(l)
     var name: u32 = ast.e_a(b, e)
     // HOOK gc (gc_lower.rs::hook_call): Allokation, Intrinsics, `as?` — und
     // `weak`/`stark` sind Laufzeitfunktionen (`echter_name`).
+    // RUNDE 52 (kern.rs): Inline-Assembler und MMIO.
+    let anr: u32 = kern.asm_nummer(namen(l), name)
+    if anr != kern.KEINE_NUMMER {
+        return asm_senken(l, anr, e)
+    }
+    if fn_nummer(l, name) == KEIN {
+        let wl: u32 = kern.mmio_lesen_breite(namen(l), name)
+        if wl != kern.KEINE_BREITE {
+            let ad: u32 = wert(l, ast.kind_at(b, ast.e_b(b, e)))
+            return push(l, fir.O_MMIOLD, mmio_fty(wl), ad, 0, 0, 0, 0, 0)
+        }
+        let ws: u32 = kern.mmio_schreiben_breite(namen(l), name)
+        if ws != kern.KEINE_BREITE {
+            let ad2: u32 = wert(l, ast.kind_at(b, ast.e_b(b, e)))
+            let wv: u32 = wert(l, ast.kind_at(b, ast.e_b(b, e) + 1))
+            push_void(l, fir.O_MMIOST, mmio_fty(ws), ad2, wv, 0, 0, 0, 0)
+            return 0
+        }
+    }
     // `__atomar_addieren(p, delta)` (atomar.rs, RUNDE 47): Op::AtomicAdd.
     var atw: [u8; 17] = "__atomar_addieren"
     if intern.intern_gleich(namen(l), name, (&atw[0]) as u64, 17) && fn_nummer(l, name) == KEIN {
@@ -2453,6 +2535,10 @@ fn low_lauf(l: *mut Lower) {
         }
         let plen: u32 = vec_len[u32](&(*l).f.p_typ) as u32 - poff
         (*l).fi = fir.fn_neu(&(*l).f, ast.fn_name(b, i), rf, poff, plen)
+        // RUNDE 52 (kern.rs): `#[interrupt]` — eigene Aufrufkonvention.
+        if ast.fn_int(b, i) != 0 {
+            fir.f_int_setzen(&(*l).f, (*l).fi, 1)
+        }
         (*l).cur = 0
         (*l).sret = KEIN
         var naechster: u32 = 0
