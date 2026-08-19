@@ -35,3 +35,15 @@ for r in lib/rc/teile/neg_*.fi; do
     erzeuge "$r" "tests/neg/$n"
     echo "  tests/neg/$n"
 done
+
+# Runde 47: dieselbe Mechanik fuer `Arc[T]` (lib/rc/arc.fi).
+MOD=lib/rc/arc.fi
+for r in lib/rc/teile/83*.fi; do
+    erzeuge "$r" "tests/$(basename "$r")"
+    echo "  tests/$(basename "$r")"
+done
+for r in lib/rc/teile/negarc_*.fi; do
+    n=$(basename "$r"); n=${n#negarc_}
+    erzeuge "$r" "tests/neg/$n"
+    echo "  tests/neg/$n"
+done
