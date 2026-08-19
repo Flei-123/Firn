@@ -27,7 +27,7 @@ export { Fir, fir_neu, fir_frei,
          T_BOOL, T_F64, T_PTR, T_VOID,
          O_CONST, O_BIN, O_CMP, O_UN, O_CAST, O_ALLOCA, O_LOAD, O_STORE,
          O_PTRADD, O_CALL, O_SYSCALL, O_COPYMEM, O_GCADDR, O_SELECT, O_SECZERO,
-         O_ATOMADD, O_CALLI, O_VTAB,
+         O_ATOMADD, O_CALLI, O_VTAB, O_ASM, O_MMIOLD, O_MMIOST,
          TERM_UNSET, TERM_BR, TERM_BRCOND, TERM_RET, TERM_SWITCH, KEIN,
          fn_neu, fn_anzahl, block_neu, block_anzahl,
          inst_dazu, inst_void_dazu, alloca_dazu, arg_dazu, arg_anfang,
@@ -36,7 +36,7 @@ export { Fir, fir_neu, fir_frei,
          inst_anzahl, inst_bei, arg_bei, i_art_von, i_ty_von, i_dst_von,
          i_a_von, i_b_von, i_c_von, i_zahl_von, i_aoff_von, i_alen_von,
          b_term_von, b_t1_von, b_t2_von, b_t3_von, f_ret_von, f_plen_von,
-         f_poff_von, p_typ_von, f_name_von,
+         f_poff_von, p_typ_von, f_name_von, f_int_von, f_int_setzen,
          term_switch, sw_anfang, sw_dazu, b_t4_von, b_t5_von,
          sw_schluessel, sw_ziel }
 
@@ -81,6 +81,19 @@ const O_ATOMADD: u32 = 15
 // Typs; das Label heisst `.L__iface.<I>.<T>`).
 const O_CALLI: u32 = 16
 const O_VTAB: u32 = 17
+// Runde 52 (kern.rs, SPEC 2): Inline-Assembler. IMMER volatile — kein
+// Durchgang darf ihn entfernen, verdoppeln, zusammenlegen oder verschieben.
+//   i_a    = Vorlage (interniert)
+//   i_b    = Ausgaberegister (interniert) oder KEIN
+//   i_zahl = Anzahl der Clobber
+//   i_aoff = Anfang des Argumentblocks, i_alen = Anzahl der EINGABEN
+// Der Argumentblock haelt erst `i_alen` Paare (Registername, Wert) und
+// danach die `i_zahl` Clobber-Namen — alle als internierte Nummern.
+const O_ASM: u32 = 50
+// Runde 52: MMIO. Wie load/store, aber volatile; die Breite steckt im
+// Instruktionstyp. i_a = Adresse, bei O_MMIOST zusaetzlich i_b = Wert.
+const O_MMIOLD: u32 = 51
+const O_MMIOST: u32 = 52
 
 const TERM_UNSET: u32 = 0
 const TERM_BR: u32 = 1
@@ -96,6 +109,8 @@ const KEIN: u32 = 4294967295
 
 struct Fir {
     f_name: Vec[u32]
+    // RUNDE 52: 1 = `#[interrupt]` (eigene Aufrufkonvention, `iretq`).
+    f_int: Vec[u32]
     f_ret: Vec[u32]
     f_poff: Vec[u32]
     f_plen: Vec[u32]
@@ -129,7 +144,7 @@ struct Fir {
 
 fn fir_neu() -> Fir {
     return Fir{
-        f_name: vec_neu[u32](), f_ret: vec_neu[u32](),
+        f_name: vec_neu[u32](), f_int: vec_neu[u32](), f_ret: vec_neu[u32](),
         f_poff: vec_neu[u32](), f_plen: vec_neu[u32](),
         f_boff: vec_neu[u32](), f_blen: vec_neu[u32](), f_werte: vec_neu[u32](),
         p_typ: vec_neu[u32](),
@@ -147,6 +162,7 @@ fn fir_neu() -> Fir {
 
 fn fir_frei(f: *mut Fir) {
     vec_frei[u32](&(*f).f_name)
+    vec_frei[u32](&(*f).f_int)
     vec_frei[u32](&(*f).f_ret)
     vec_frei[u32](&(*f).f_poff)
     vec_frei[u32](&(*f).f_plen)
@@ -219,6 +235,7 @@ fn arg_dazu(f: *mut Fir, v: u32) { vec_push[u32](&(*f).i_args, v) }
 fn fn_neu(f: *mut Fir, name: u32, ret: u32, poff: u32, plen: u32) -> u32 {
     let i: u32 = vec_len[u32](&(*f).f_name) as u32
     vec_push[u32](&(*f).f_name, name)
+    vec_push[u32](&(*f).f_int, 0)
     vec_push[u32](&(*f).f_ret, ret)
     vec_push[u32](&(*f).f_poff, poff)
     vec_push[u32](&(*f).f_plen, plen)
@@ -450,6 +467,32 @@ fn cmpop_name(b: *mut rt.Buf, op: u32) {
     }
 }
 
+// Maskierung der Assembler-Vorlage in der FIR-Textform. NUR diese vier
+// Zeichen — so schreiben beide Compiler denselben Text ohne Tabelle
+// (fir.rs::asm_escape).
+fn asm_maskiert(b: *mut rt.Buf, p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        let z: u8 = rt.ld8(p, i)
+        if z == 92 as u8 {
+            rt.buf_push(b, 92 as u8)
+            rt.buf_push(b, 92 as u8)
+        } else if z == 34 as u8 {
+            rt.buf_push(b, 92 as u8)
+            rt.buf_push(b, 34 as u8)
+        } else if z == 10 as u8 {
+            rt.buf_push(b, 92 as u8)
+            rt.buf_push(b, 110 as u8)
+        } else if z == 9 as u8 {
+            rt.buf_push(b, 92 as u8)
+            rt.buf_push(b, 116 as u8)
+        } else {
+            rt.buf_push(b, z)
+        }
+        i = i + 1
+    }
+}
+
 fn punkt_typ(b: *mut rt.Buf, t: u32) {
     rt.buf_push(b, 46 as u8)
     fty_name(b, t)
@@ -646,6 +689,75 @@ fn drucke_inst(f: *mut Fir, it: *mut intern.Interner, b: *mut rt.Buf, nr: u32) {
         wert(b, c)
         return
     }
+    if art == O_ASM {
+        // `asm.<ty> "vorlage" [out=reg] [in=[reg %v, ...]] [clobber=[a, b]]`
+        var wa: [u8; 3] = "asm"
+        rt.buf_push_bytes(b, (&wa[0]) as u64, 3)
+        punkt_typ(b, ty)
+        rt.buf_push(b, 32 as u8)
+        rt.buf_push(b, 34 as u8)
+        asm_maskiert(b, intern.intern_zeiger(it, a), intern.intern_laenge(it, a))
+        rt.buf_push(b, 34 as u8)
+        if c != KEIN {
+            var wo: [u8; 5] = " out="
+            rt.buf_push_bytes(b, (&wo[0]) as u64, 5)
+            rt.buf_push_bytes(b, intern.intern_zeiger(it, c), intern.intern_laenge(it, c))
+        }
+        let aoff: u32 = vec_at[u32](&(*f).i_aoff, nr as usize)
+        let alen: u32 = vec_at[u32](&(*f).i_alen, nr as usize)
+        var ks3: [u8; 2] = ", "
+        if alen > 0 {
+            var wi: [u8; 5] = " in=["
+            rt.buf_push_bytes(b, (&wi[0]) as u64, 5)
+            var k: u32 = 0
+            while k < alen {
+                if k > 0 {
+                    rt.buf_push_bytes(b, (&ks3[0]) as u64, 2)
+                }
+                let rn: u32 = arg_bei(f, aoff + k * 2)
+                rt.buf_push_bytes(b, intern.intern_zeiger(it, rn), intern.intern_laenge(it, rn))
+                rt.buf_push(b, 32 as u8)
+                wert(b, arg_bei(f, aoff + k * 2 + 1))
+                k = k + 1
+            }
+            rt.buf_push(b, 93 as u8)
+        }
+        let cz: u32 = vec_at[u64](&(*f).i_zahl, nr as usize) as u32
+        if cz > 0 {
+            var wc: [u8; 10] = " clobber=["
+            rt.buf_push_bytes(b, (&wc[0]) as u64, 10)
+            var k2: u32 = 0
+            while k2 < cz {
+                if k2 > 0 {
+                    rt.buf_push_bytes(b, (&ks3[0]) as u64, 2)
+                }
+                let cn: u32 = arg_bei(f, aoff + alen * 2 + k2)
+                rt.buf_push_bytes(b, intern.intern_zeiger(it, cn), intern.intern_laenge(it, cn))
+                k2 = k2 + 1
+            }
+            rt.buf_push(b, 93 as u8)
+        }
+        return
+    }
+    if art == O_MMIOLD {
+        var wml: [u8; 9] = "mmio_load"
+        rt.buf_push_bytes(b, (&wml[0]) as u64, 9)
+        punkt_typ(b, ty)
+        rt.buf_push(b, 32 as u8)
+        wert(b, a)
+        return
+    }
+    if art == O_MMIOST {
+        var wms: [u8; 10] = "mmio_store"
+        rt.buf_push_bytes(b, (&wms[0]) as u64, 10)
+        punkt_typ(b, ty)
+        rt.buf_push(b, 32 as u8)
+        wert(b, c)
+        var kms: [u8; 2] = ", "
+        rt.buf_push_bytes(b, (&kms[0]) as u64, 2)
+        wert(b, a)
+        return
+    }
     if art == O_GCADDR {
         var wg: [u8; 12] = "gc_state.ptr"
         rt.buf_push_bytes(b, (&wg[0]) as u64, 12)
@@ -793,6 +905,8 @@ fn inst_bei(f: *mut Fir, fi: u32, bb: u32, k: u32) -> u32 {
     return vec_at[u32](&(*f).b_iliste, (vec_at[u32](&(*f).b_ioff, g as usize) + k) as usize)
 }
 
+fn f_int_von(f: *mut Fir, i: u32) -> u32 { return vec_at[u32](&(*f).f_int, i as usize) }
+fn f_int_setzen(f: *mut Fir, i: u32, v: u32) { vec_setzen[u32](&(*f).f_int, i as usize, v) }
 fn arg_bei(f: *mut Fir, i: u32) -> u32 { return vec_at[u32](&(*f).i_args, i as usize) }
 fn i_art_von(f: *mut Fir, i: u32) -> u32 { return vec_at[u32](&(*f).i_art, i as usize) }
 fn i_ty_von(f: *mut Fir, i: u32) -> u32 { return vec_at[u32](&(*f).i_ty, i as usize) }
