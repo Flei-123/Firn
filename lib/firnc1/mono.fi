@@ -30,20 +30,28 @@ import intern
 import lexer
 import ast
 import typen
+import iface
 
 export { Gen, gen_neu, gen_frei, gen_vorab, gen_ist_fn, gen_ist_struct,
          gen_tiefe_auf, gen_tiefe_zu, gen_in_vorlage,
          gen_schranke, gen_tp_anfang, gen_tp_dazu, gen_tp_doppelt,
+         gen_tp_schranke_dazu, gen_if_setzen,
          gen_fn_vorlage, gen_struct_vorlage, gen_auspraegung,
          gen_size_of_name, gen_lauf, gen_fehler,
          gen_fn_anzahl, gen_struct_anzahl, gen_inst_anzahl, gen_erzeugt }
 
 const KEIN: u32 = 4294967295
 
-// Anforderungen an einen Typparameter (`T: Int`).
+// Schranken an einem Typparameter (`T: Int`, `T: Ord`, `T: Int + Ord`).
+//
+// RUNDE 50: `Any`, `Int` und `Scalar` sind die drei EINGEBAUTEN Schranken;
+// jeder andere Name ist der Name einer SCHNITTSTELLE. Ob es sie gibt, steht
+// beim Parsen noch nicht fest (eine `interface`-Deklaration darf spaeter
+// stehen) — geprueft wird bei der AUSPRAEGUNG.
 const SCHRANKE_ANY: u32 = 0
 const SCHRANKE_INT: u32 = 1
 const SCHRANKE_SCALAR: u32 = 2
+const SCHRANKE_IFACE: u32 = 3
 
 // Obergrenze gegen unendliche Auspraegungsketten (`Vec[Vec[Vec[..]]]`).
 const MAX_AUSPRAEGUNGEN: usize = 4096
@@ -59,7 +67,12 @@ struct Gen {
 
     // Typparameter aller Vorlagen, hintereinander.
     tp_name: Vec[u32],
-    tp_schranke: Vec[u32],
+    tp_soff: Vec[u32],      // Schranken dieses Parameters: Bereich in sk_*
+    tp_slen: Vec[u32],
+    sk_art: Vec[u32],       // SCHRANKE_ANY/INT/SCALAR/IFACE
+    sk_name: Vec[u32],      // bei IFACE: Name der Schnittstelle
+
+    ifr: u64,               // *mut iface.If (0 = keine Registrierung)
 
     // Funktionsvorlagen
     fv_name: Vec[u32], fv_toff: Vec[u32], fv_tlen: Vec[u32],
@@ -94,7 +107,8 @@ fn gen_neu(b: u64, it: u64) -> Gen {
     return Gen{
         b: b, it: it,
         gfn: vec_neu[u32](), gst: vec_neu[u32](),
-        tp_name: vec_neu[u32](), tp_schranke: vec_neu[u32](),
+        tp_name: vec_neu[u32](), tp_soff: vec_neu[u32](), tp_slen: vec_neu[u32](),
+        sk_art: vec_neu[u32](), sk_name: vec_neu[u32](), ifr: 0,
         fv_name: vec_neu[u32](), fv_toff: vec_neu[u32](), fv_tlen: vec_neu[u32](),
         fv_poff: vec_neu[u32](), fv_plen: vec_neu[u32](), fv_ret: vec_neu[u32](),
         fv_rumpf: vec_neu[u32](),
@@ -115,7 +129,10 @@ fn gen_frei(g: *mut Gen) {
     vec_frei[u32](&(*g).gfn)
     vec_frei[u32](&(*g).gst)
     vec_frei[u32](&(*g).tp_name)
-    vec_frei[u32](&(*g).tp_schranke)
+    vec_frei[u32](&(*g).tp_soff)
+    vec_frei[u32](&(*g).tp_slen)
+    vec_frei[u32](&(*g).sk_art)
+    vec_frei[u32](&(*g).sk_name)
     vec_frei[u32](&(*g).fv_name)
     vec_frei[u32](&(*g).fv_toff)
     vec_frei[u32](&(*g).fv_tlen)
@@ -221,7 +238,12 @@ fn gen_ist_struct(g: *mut Gen, nr: u32) -> bool {
 
 // ------------------------------------------------------- Typparameterliste
 
-// Name einer Anforderung -> Schrankennummer. KEIN heisst: unbekannt.
+// Registrierung der Schnittstellen durchreichen (Runde 50): ohne sie kann
+// eine Schnittstellenschranke nicht geprueft werden.
+fn gen_if_setzen(g: *mut Gen, f: u64) { (*g).ifr = f }
+
+// Name einer Schranke -> Art. Ein unbekannter Name ist KEIN Fehler, sondern
+// der Name einer Schnittstelle (Runde 50).
 fn gen_schranke(g: *mut Gen, nr: u32) -> u32 {
     let it: *mut intern.Interner = gnamen(g)
     var w1: [u8; 3] = "Any"
@@ -236,14 +258,39 @@ fn gen_schranke(g: *mut Gen, nr: u32) -> u32 {
     if intern.intern_gleich(it, nr, (&w3[0]) as u64, 6) {
         return SCHRANKE_SCALAR
     }
-    return KEIN
+    return SCHRANKE_IFACE
 }
 
 fn gen_tp_anfang(g: *mut Gen) -> u32 { return vec_len[u32](&(*g).tp_name) as u32 }
 
-fn gen_tp_dazu(g: *mut Gen, name: u32, schranke: u32) {
+fn gen_tp_dazu(g: *mut Gen, name: u32) {
     vec_push[u32](&(*g).tp_name, name)
-    vec_push[u32](&(*g).tp_schranke, schranke)
+    vec_push[u32](&(*g).tp_soff, vec_len[u32](&(*g).sk_art) as u32)
+    vec_push[u32](&(*g).tp_slen, 0)
+}
+
+// Eine Schranke an den ZULETZT angelegten Typparameter haengen.
+// `false` = dieselbe Schranke steht schon da.
+fn gen_tp_schranke_dazu(g: *mut Gen, art: u32, name: u32) -> bool {
+    let tp: usize = vec_len[u32](&(*g).tp_name) - 1
+    let off: u32 = vec_at[u32](&(*g).tp_soff, tp)
+    let len: u32 = vec_at[u32](&(*g).tp_slen, tp)
+    var i: u32 = 0
+    while i < len {
+        if vec_at[u32](&(*g).sk_art, (off + i) as usize) == art {
+            if art != SCHRANKE_IFACE {
+                return false
+            }
+            if vec_at[u32](&(*g).sk_name, (off + i) as usize) == name {
+                return false
+            }
+        }
+        i = i + 1
+    }
+    vec_push[u32](&(*g).sk_art, art)
+    vec_push[u32](&(*g).sk_name, name)
+    vec_setzen[u32](&(*g).tp_slen, tp, len + 1)
+    return true
 }
 
 // Steht der Name schon in der laufenden Typparameterliste?
@@ -485,7 +532,47 @@ fn bindung_finden(g: *mut Gen, nr: u32) -> u32 {
     return KEIN
 }
 
-// Erfuellt der Typ die Anforderung? (mono.rs::satisfies)
+// Erfuellt der Typ ALLE Schranken des Typparameters `tp`?
+// (mono.rs::bind_params — gemeldet wird die erste verletzte.)
+fn erfuellt_alle(g: *mut Gen, t: u32, tp: u32) -> bool {
+    let off: u32 = vec_at[u32](&(*g).tp_soff, tp as usize)
+    let len: u32 = vec_at[u32](&(*g).tp_slen, tp as usize)
+    var i: u32 = 0
+    while i < len {
+        let art: u32 = vec_at[u32](&(*g).sk_art, (off + i) as usize)
+        if art == SCHRANKE_IFACE {
+            if !erfuellt_iface(g, t, vec_at[u32](&(*g).sk_name, (off + i) as usize)) {
+                return false
+            }
+        } else {
+            if !erfuellt(g, t, art) {
+                return false
+            }
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// `T: I` — der Typ muss die Schnittstelle umsetzen (iface.rs::schranke_pruefen).
+// Eine Schnittstelle wird von einem BENANNTEN Typ umgesetzt; ein Zeiger- oder
+// Feldtyp hat keinen Namen, unter dem ein `impl`-Block stehen koennte.
+fn erfuellt_iface(g: *mut Gen, t: u32, iname: u32) -> bool {
+    if (*g).ifr == 0 {
+        return false
+    }
+    let f: *mut iface.If = (*g).ifr as *mut iface.If
+    if iface.if_index(f, iname) == KEIN {
+        return false
+    }
+    let b: *mut ast.Baum = gbaum(g)
+    if ast.t_art(b, t) != ast.T_NAME {
+        return false
+    }
+    return iface.if_umsetzung_da(f, gnamen(g), iname, ast.t_a(b, t))
+}
+
+// Erfuellt der Typ EINE eingebaute Schranke? (mono.rs::satisfies)
 fn erfuellt(g: *mut Gen, t: u32, schranke: u32) -> bool {
     if schranke == SCHRANKE_ANY {
         return true
@@ -523,7 +610,7 @@ fn binden(g: *mut Gen, toff: u32, tlen: u32, aoff: u32, alen: u32) -> bool {
     var k: u32 = 0
     while k < tlen {
         let arg: u32 = vec_at[u32](&(*g).iargs, (aoff + k) as usize)
-        if !erfuellt(g, arg, vec_at[u32](&(*g).tp_schranke, (toff + k) as usize)) {
+        if !erfuellt_alle(g, arg, toff + k) {
             (*g).fehler = (*g).fehler + 1
             return false
         }
