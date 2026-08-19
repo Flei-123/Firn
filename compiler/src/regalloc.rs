@@ -1019,71 +1019,147 @@ struct Ra<'a> {
     /// Vergleichsergebnis GENAU EINMAL gelesen wird (naemlich vom Terminator),
     /// darf das `setcc` entfallen.
     gelesen: Vec<u32>,
-    /// Adressen `base + k`, deren einzige Verwendung der UNMITTELBAR folgende
-    /// Speicherzugriff ist: ptradd -> (Basisregister, Versatz).
-    versatz: HashMap<Val, (&'static str, i64)>,
+    /// Adressen, deren einzige Verwendung der UNMITTELBAR folgende
+    /// Speicherzugriff ist — sie wandern vollstaendig in dessen Operanden.
+    versatz: HashMap<Val, Adresse>,
+    /// Instruktionen (Skalierung `shl`/`mul`), die dabei ganz entfallen.
+    uebersprungen: std::collections::HashSet<Val>,
 }
 
-/// Adressrechnungen, die in den Versatz des Speicherzugriffs wandern duerfen.
+/// Ein Speicheroperand, den der Prozessor selbst ausrechnet:
+/// `[basis + index*faktor + versatz]` (x86-64 SIB-Adressierung).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Adresse {
+    basis: &'static str,
+    /// Indexregister mit Faktor 1, 2, 4 oder 8
+    index: Option<(&'static str, i64)>,
+    versatz: i64,
+}
+
+impl Adresse {
+    fn text(&self) -> String {
+        let mut s = String::from("[");
+        s.push_str(self.basis);
+        if let Some((r, f)) = self.index {
+            s.push('+');
+            s.push_str(r);
+            if f != 1 {
+                s.push('*');
+                s.push_str(&f.to_string());
+            }
+        }
+        if self.versatz > 0 {
+            s.push('+');
+            s.push_str(&self.versatz.to_string());
+        } else if self.versatz < 0 {
+            s.push('-');
+            s.push_str(&(-self.versatz).to_string());
+        }
+        s.push(']');
+        s
+    }
+}
+
+/// Adressrechnungen, die vollstaendig in den Speicherzugriff wandern duerfen.
 ///
-/// Erzeugt wird heute
+/// Erzeugt wurde bis Runde 43
 ///     lea r9, [r8+168]
 ///     mov r9, qword ptr [r9]
 /// obwohl x86-64 den Versatz selbst kann:
 ///     mov r9, qword ptr [r8+168]
 ///
-/// Die Bedingungen sind absichtlich eng — jede Lockerung verlaengert die
-/// Lebensspanne der BASIS, und genau diese Klasse hat in Runde 40/41 den
-/// Miscompile erzeugt (docs/RUNDE41.md):
-///  * `ptradd` mit Sofortkonstante 0 <= k <= i32::MAX,
-///  * das Ergebnis wird GENAU EINMAL gelesen (Terminatoren mitgezaehlt),
-///  * dieser eine Leser ist die UNMITTELBAR folgende Instruktion desselben
-///    Blocks und ein `load`/`store` ueber genau diese Adresse,
-///  * die Basis liegt in einem Register und ist keine Rahmenadresse.
+/// **Runde 51** nimmt die beiden anderen Bestandteile der x86-Adressierung
+/// dazu — Indexregister und Faktor. Gemessen im Tokenizer (realweb,
+/// instruktionsgenaues callgrind) stand vor dieser Runde:
 ///
-/// Damit verschiebt sich der Lesezeitpunkt der Basis um GENAU eine
-/// Instruktion. Dazwischen liegt nichts; die einzigen Register, die an der
-/// neuen Stelle geschrieben werden, sind das Ziel des Zugriffs (das seine
-/// Adresse zuerst liest) und die Heimat des uebersprungenen `ptradd`, die gar
-/// nicht mehr beschrieben wird. Ein noch gebrauchter Wert kann also nicht
-/// verloren gehen.
+/// | Muster                                   |          Ir | Anteil |
+/// |------------------------------------------|------------:|-------:|
+/// | `shl k` + `lea (b,i,1)` + Zugriff        |  28.840.310 |  3,93 % |
+/// | `lea (b,i,1)` + Zugriff                  |  16.231.553 |  2,21 % |
+/// | `lea off(b)` + Zugriff                   |  14.432.184 |  1,97 % |
 ///
+/// Also wird aus
+///     mov  r8, qword ptr [rbp-416]
+///     shl  r8, 2
+///     lea  r8, [r9+r8]
+///     mov  r8d, dword ptr [r8]
+/// jetzt
+///     mov  r8, qword ptr [rbp-416]
+///     mov  r8d, dword ptr [r9+r8*4]
+///
+/// **Die Bedingungen sind absichtlich eng**, denn jede Lockerung verlaengert
+/// die Lebensspanne der Basis — genau die Klasse, die in Runde 40/41 den
+/// Miscompile erzeugt hat (docs/RUNDE41.md). Gefaltet wird nur, wenn
+///
+///  * die adressbildende Instruktion `ptradd` oder ein **64-Bit**-`add` ist
+///    (bei 32 Bit wuerde die Adressierung den Ueberlauf NICHT abschneiden),
+///  * ihr Ergebnis GENAU EINMAL gelesen wird (Terminatoren mitgezaehlt),
+///  * dieser eine Leser die UNMITTELBAR folgende Instruktion desselben
+///    Blocks ist und ein `load`/`store` ueber genau diese Adresse,
+///  * Basis (und ggf. Index) in einem Register liegen und weder Rahmen-
+///    adresse noch befoerderte Zelle noch Zellen-Alias sind,
+///  * fuer den Faktor: die Skalierung ist ein **64-Bit**-`shl` mit 0..3 bzw.
+///    `mul` mit 1/2/4/8, steht UNMITTELBAR vor der Adressbildung und ihr
+///    Ergebnis wird ebenfalls genau einmal gelesen,
+///  * kein Wert der Kette ist `secret` (SPEC §9.2: kein datenabhaengiger
+///    Zugriff).
+///
+/// Damit verschiebt sich der Lesezeitpunkt von Basis und Index um genau die
+/// ein bis zwei Instruktionen, die dabei **ganz entfallen** — dazwischen
+/// liegt danach nichts mehr, insbesondere kein `call`. Die einzigen Register,
+/// die an der neuen Stelle geschrieben werden, sind das Ziel des Zugriffs
+/// (das seine Adresse zuerst liest — `mov r8d, dword ptr [r9+r8*4]` ist
+/// korrekt) und die Heimat der uebersprungenen Instruktionen, die gar nicht
+/// mehr beschrieben wird.
+///
+/// Liefert `(Adressen je Wert, uebersprungene Skalierungen)`.
 /// Abschaltbar mit FIRN_NO_FALTUNG=1 (Fehlersuche).
-fn faltbare_versaetze(
+fn faltbare_adressen(
     f: &Func,
     a: &Alloc,
     gelesen: &[u32],
-) -> HashMap<Val, (&'static str, i64)> {
-    let mut aus: HashMap<Val, (&'static str, i64)> = HashMap::new();
+) -> (HashMap<Val, Adresse>, std::collections::HashSet<Val>) {
+    use std::collections::HashSet;
+    let mut aus: HashMap<Val, Adresse> = HashMap::new();
+    let mut weg: HashSet<Val> = HashSet::new();
     if std::env::var_os("FIRN_NO_FALTUNG").is_some() {
-        return aus;
+        return (aus, weg);
     }
+    // Liegt der Wert schlicht in einem Register — ohne Sonderbehandlung?
+    let reines_reg = |v: Val| -> Option<&'static str> {
+        if a.imm(v).is_some() || a.cell(v).is_some() || f.is_secret(v) {
+            return None;
+        }
+        if a.alias.contains_key(&v) || a.frame_addr.contains_key(&v) {
+            return None;
+        }
+        match a.ort(v) {
+            Loc::Reg(r) => Some(r),
+            Loc::Slot(_) => None,
+        }
+    };
     for b in &f.blocks {
         for (idx, i) in b.insts.iter().enumerate() {
-            let (d, base, off) = match (i.dst, &i.op) {
-                (Some(d), Op::PtrAdd { base, off }) => (d, *base, *off),
+            let d = match i.dst {
+                Some(d) => d,
+                None => continue,
+            };
+            // (1) adressbildende Instruktion
+            let (base, off) = match &i.op {
+                Op::PtrAdd { base, off } => (*base, *off),
+                // Ein `add` bildet nur dann eine Adresse, wenn es in voller
+                // Breite rechnet. Bei 32 Bit schneidet FIR das Ergebnis ab,
+                // die Adressierung taete das nicht.
+                Op::Bin(BinOp::Add, x, y) if i.ty.bits() == 64 => (*x, *y),
                 _ => continue,
             };
-            if gelesen.get(d as usize).copied() != Some(1) {
+            if gelesen.get(d as usize).copied() != Some(1) || f.is_secret(d) {
                 continue;
             }
-            if a.alias.contains_key(&d) || a.alias.contains_key(&base) {
+            if a.alias.contains_key(&d) || a.frame_addr.contains_key(&d) || a.cell(d).is_some() {
                 continue;
             }
-            if a.frame_addr.contains_key(&d) || a.frame_addr.contains_key(&base) {
-                continue;
-            }
-            if a.cell(d).is_some() || a.cell(base).is_some() {
-                continue;
-            }
-            let k = match a.imm(off) {
-                Some(k) if k >= 0 && k <= i32::MAX as i64 => k,
-                _ => continue,
-            };
-            let br = match a.ort(base) {
-                Loc::Reg(r) => r,
-                Loc::Slot(_) => continue,
-            };
+            // (2) der EINE Leser ist der unmittelbar folgende Zugriff
             let n = match b.insts.get(idx + 1) {
                 Some(n) => n,
                 None => continue,
@@ -1096,10 +1172,55 @@ fn faltbare_versaetze(
             if !passt {
                 continue;
             }
-            aus.insert(d, (br, k));
+            let br = match reines_reg(base) {
+                Some(r) => r,
+                None => continue,
+            };
+            // (3a) konstanter Versatz
+            if let Some(k) = a.imm(off) {
+                if (0..=i32::MAX as i64).contains(&k) && !f.is_secret(off) {
+                    aus.insert(d, Adresse { basis: br, index: None, versatz: k });
+                }
+                continue;
+            }
+            // (3b) Index mit Faktor: die Skalierung steht unmittelbar davor
+            if gelesen.get(off as usize).copied() == Some(1) && idx > 0 {
+                let p = &b.insts[idx - 1];
+                let skal = if p.dst == Some(off) && p.ty.bits() == 64 {
+                    match &p.op {
+                        Op::Bin(BinOp::Shl, xi, ki) => match a.imm(*ki) {
+                            Some(k) if (0..=3).contains(&k) => Some((*xi, 1i64 << k)),
+                            _ => None,
+                        },
+                        Op::Bin(BinOp::Mul, xi, ki) => match a.imm(*ki) {
+                            Some(k) if [1, 2, 4, 8].contains(&k) => Some((*xi, k)),
+                            _ => None,
+                        },
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                if let Some((xi, fak)) = skal {
+                    if !f.is_secret(off) && !a.alias.contains_key(&off) && a.cell(off).is_none() {
+                        if let Some(ir) = reines_reg(xi) {
+                            aus.insert(
+                                d,
+                                Adresse { basis: br, index: Some((ir, fak)), versatz: 0 },
+                            );
+                            weg.insert(off);
+                            continue;
+                        }
+                    }
+                }
+            }
+            // (3c) Index direkt aus einem Register (Faktor 1)
+            if let Some(ir) = reines_reg(off) {
+                aus.insert(d, Adresse { basis: br, index: Some((ir, 1)), versatz: 0 });
+            }
         }
     }
-    aus
+    (aus, weg)
 }
 
 /// Zaehlt je Wert, wie oft er als Operand vorkommt (Instruktionen + Terminatoren).
@@ -1613,8 +1734,8 @@ fn unsupported_grund(f: &Func) -> Option<String> {
 
 fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
     let gelesen = zaehle_lesezugriffe(f);
-    let versatz = faltbare_versaetze(f, a, &gelesen);
-    let ra = Ra { f, a, gelesen, versatz };
+    let (versatz, uebersprungen) = faltbare_adressen(f, a, &gelesen);
+    let ra = Ra { f, a, gelesen, versatz, uebersprungen };
     e.raw("");
     // Linker-Symbol ueber die eine Stelle (codegen_x86::label -> modules::symbol)
     e.raw(&format!(".globl {}", label(&f.name)));
@@ -2018,6 +2139,12 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
         }
         Op::Bin(op, x, y) => {
             let d = i.dst.ok_or("interner Fehler: Binaeroperation ohne Ziel")?;
+            // Runde 51: Adressrechnung, die im folgenden Speicherzugriff steht
+            // (`add` als Adressbildung, `shl`/`mul` als Skalierung des Index).
+            // Sie wird nirgends sonst gelesen und braucht keinen eigenen Code.
+            if ra.versatz.contains_key(&d) || ra.uebersprungen.contains(&d) {
+                return Ok(());
+            }
             emit_bin(e, ra, *op, ty, *x, *y, d)?;
         }
         Op::Cmp { op, ty: oty, a, b } => {
@@ -2137,7 +2264,7 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
                 }
             } else {
                 let mem = match (ra.versatz.get(addr), ra.a.frame_addr.get(addr), ra.a.ort(*addr)) {
-                    (Some((r, k)), _, _) => format!("[{}+{}]", r, k),
+                    (Some(adr), _, _) => adr.text(),
                     (None, Some(off), _) => format!("[rbp-{}]", off),
                     (None, None, Loc::Reg(r)) => format!("[{}]", r),
                     (None, None, Loc::Slot(_)) => {
@@ -2177,7 +2304,7 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
                 }
             } else {
                 let mem = match (ra.versatz.get(addr), ra.a.frame_addr.get(addr), ra.a.ort(*addr)) {
-                    (Some((r, k)), _, _) => format!("[{}+{}]", r, k),
+                    (Some(adr), _, _) => adr.text(),
                     (None, Some(off), _) => format!("[rbp-{}]", off),
                     (None, None, Loc::Reg(r)) => format!("[{}]", r),
                     (None, None, Loc::Slot(_)) => {
