@@ -1,88 +1,88 @@
-//! **Sprungfaedelung durch Bool-Zellen** (Runde 51).
+//! **Jump threading through bool cells** (round 51).
 //!
-//! SCHNITTSTELLE (fest):
+//! INTERFACE (fixed):
 //!   `pub(crate) fn thread_bool_cells(f: &mut Func) -> usize`
 //!
-//! ## Warum dieser Durchgang
+//! ## Why this pass
 //!
-//! FIR hat **keine Phi-Knoten** (fir.rs, Invariante). Die Kurzschluss-
-//! operatoren `&&` und `||` muessen ihr Ergebnis deshalb ueber eine
-//! `alloca`-Zelle zusammenfuehren. Aus `if c < 0x80 && c != 13` wird:
+//! FIR has **no phi nodes** (fir.rs, invariant). The short circuit operators
+//! `&&` and `||` must therefore merge their result through one `alloca`
+//! cell. `if c < 0x80 && c != 13` turns into:
 //!
 //! ```text
-//! bbA: %1 = cmp.lt %c, 128 ; store.bool %1, %zelle ; brcond %1, bbB, bbJ
-//! bbB: %2 = cmp.ne %c, 13  ; store.bool %2, %zelle ; br bbJ
-//! bbJ: %3 = load.bool %zelle ; brcond %3, bbT, bbE
+//! bbA: %1 = cmp.lt %c, 128 ; store.bool %1, %cell ; brcond %1, bbB, bbJ
+//! bbB: %2 = cmp.ne %c, 13  ; store.bool %2, %cell ; br bbJ
+//! bbJ: %3 = load.bool %cell ; brcond %3, bbT, bbE
 //! ```
 //!
-//! `mem2reg` kann diese Zelle nicht aufloesen — sie wird zweimal geschrieben,
-//! und ohne Phi gibt es keinen Wert, der beide Pfade vertritt. Im Maschinen-
-//! code kostet das je Durchlauf sieben Instruktionen statt zwei:
+//! `mem2reg` cannot resolve this cell — it gets written twice, and without
+//! phi there is no value that represents both paths. Within machine code
+//! that costs seven instructions per pass rather than two:
 //!
 //! ```text
-//! setb  %al                       ; Bool herstellen
+//! setb  %al                       ; produce the bool
 //! movzbl %al,%r11d
-//! mov   %r11b,-0xae1(%rbp)        ; in die Zelle
-//! test  %r11b,%r11b               ; sofort wieder pruefen
+//! mov   %r11b,-0xae1(%rbp)        ; into the cell
+//! test  %r11b,%r11b               ; check it right away
 //! jne   bbB
 //! jmp   bbJ
-//! bbJ:  movzbl -0xae1(%rbp),%r11d ; aus der Zelle
+//! bbJ:  movzbl -0xae1(%rbp),%r11d ; out of the cell
 //!       test %r11b,%r11b
 //!       je   bbE
 //! ```
 //!
-//! Gemessen im Tokenizer-Benchmark (realweb, callgrind, instruktionsgenau):
-//! die Muster „setcc+movzx+store+reload+test+jcc" and "setcc+movzx+store"
-//! zusammen **137,0 Mio von 958,0 Mio Instruktionen = 14,3 %**.
+//! Measured at the tokenizer benchmark (realweb, callgrind, instruction
+//! exact): the patterns "setcc+movzx+store+reload+test+jcc" and
+//! "setcc+movzx+store" together **137.0 M of 958.0 M instructions = 14.3 %**.
 //!
-//! ## Was der Durchgang tut
+//! ## What the pass does
 //!
-//! Er faedelt die Kante am Zusammenfluss vorbei. Ein **Weichenblock** ist ein
-//! Block, der aus GENAU EINER Instruktion `%v = load.bool %zelle` besteht und
-//! mit `brcond %v, T, E` endet. Ein Vorgaenger, der unmittelbar vor seinem
-//! Terminator `store.bool %x, %zelle` ausfuehrt, weiss den Inhalt der Zelle
-//! auf dieser Kante bereits — also darf er direkt springen:
+//! It threads the edge past the confluence. A **switch block** is a block
+//! made of EXACTLY ONE instruction `%v = load.bool %cell` that ends with
+//! `brcond %v, T, E`. A predecessor which executes `store.bool %x, %cell`
+//! right before its terminator knows the content of the cell on that edge
+//! already — so it may jump straight away:
 //!
-//! * Terminator `br J`            ->  `brcond %x, T, E`
-//! * Terminator `brcond %x, A, J` ->  `brcond %x, A, E`   (auf der J-Kante
-//!   ist `%x` falsch, der Weichenblock wuerde also nach E gehen)
-//! * Terminator `brcond %x, J, B` ->  `brcond %x, T, B`   (spiegelbildlich)
+//! * terminator `br J`            ->  `brcond %x, T, E`
+//! * terminator `brcond %x, A, J` ->  `brcond %x, A, E`   (on the J edge
+//!   `%x` is false, so the switch block would go to E)
+//! * terminator `brcond %x, J, B` ->  `brcond %x, T, B`   (mirror image)
 //!
-//! Danach steht `cmp` wieder unmittelbar vor dem Terminator, und die
-//! bestehende Verschmelzung `cmp`+`jcc` in `regalloc.rs` greift; der Rest
-//! (toter `store`, unerreichbarer Weichenblock) faellt in `mem2reg::
-//! remove_dead_stores` und der Blockbereinigung von `opt.rs`.
+//! After that `cmp` sits right before the terminator again, and the existing
+//! fusion `cmp`+`jcc` at `regalloc.rs` applies; the rest (dead `store`,
+//! unreachable switch block) falls to `mem2reg::remove_dead_stores` and the
+//! block cleanup of `opt.rs`.
 //!
-//! ## Warum das richtig ist
+//! ## Why that is correct
 //!
-//! * Der `store` ist die letzte Instruktion vor dem Terminator — zwischen ihm
-//!   und dem Sprung kann **nichts** die Zelle mehr aendern. Zugelassen sind
-//!   dazwischen nur Instruktionen ohne Speicherwirkung (kein `store`, `call`,
+//! * The `store` is the last instruction before the terminator — between it
+//!   and the jump **nothing** can change the cell any more. Allowed between
+//!   them are only instructions without memory effect (no `store`, `call`,
 //!   `syscall`, `copymem`, `atomicadd`, `securezero`).
-//! * Die Zelle ist eine `alloca`, deren Zeiger **nicht entkommt** (`simple`
-//!   aus `scan_cells`): sie ist nur Adresse von `load`/`store`. Ein fremder
-//!   Schreibzugriff ist damit ausgeschlossen.
-//! * `%x` ist im Vorgaenger verfuegbar — es ist Operand seines eigenen
-//!   `store`. Die Lebensspanne wird nicht verlaengert, sie endet nur eine
-//!   Instruktion spaeter am Terminator DESSELBEN Blocks. Damit faellt dieser
-//!   Durchgang NICHT in die Klasse aus Runde 40/41 (dort wurde eine
-//!   Lebensspanne ueber `call`-Grenzen hinweg gedehnt, ohne dass der
-//!   Registerverteiler davon wusste). Hier gibt es keine neue Spanne ueber
-//!   einen Block hinaus, und der Verteiler sieht den Terminator-Operanden
-//!   ohnehin (`Term::BrCond` ist Teil seiner Lebensdaueranalyse).
-//! * `store` und `alloca` bleiben stehen; erst `remove_dead_stores` raeumt
-//!   sie weg, und nur dann, wenn die Zelle wirklich nirgends mehr gelesen
-//!   wird. Der Durchgang ist damit debugerhaltend.
-//! * SPEC §9.2: geheime Werte (`secret`) und `#[constant_time]`-Funktionen
-//!   werden nicht angefasst — aus einem Datenfluss darf nie ein Sprung
-//!   werden.
+//! * The cell is one `alloca` whose pointer **does not escape** (`simple`
+//!   from `scan_cells`): it serves as address of `load`/`store` only. A
+//!   foreign write is thereby ruled out.
+//! * `%x` is available at the predecessor — it is operand of its own
+//!   `store`. The live range does not get extended, it merely ends one
+//!   instruction later at the terminator of the SAME block. This pass
+//!   therefore does NOT fall into the class of round 40/41 (where a live
+//!   range got stretched across `call` boundaries without the register
+//!   allocator knowing). Here no new range beyond a block comes about, and
+//!   the allocator sees the terminator operand anyway (`Term::BrCond` is
+//!   part of its liveness analysis).
+//! * `store` and `alloca` stay; only `remove_dead_stores` clears them away,
+//!   and only when the cell really is read nowhere any more. The pass is
+//!   thereby debug preserving.
+//! * SPEC §9.2: secret values (`secret`) and `#[constant_time]` functions
+//!   do not get touched — out of a data flow a jump may never be
+//!   made.
 //!
-//! Abschaltbar mit `--no-pass=thread-bool`.
+//! Switchable off with `--no-pass=thread-bool`.
 
 use crate::fir::{BlockId, FTy, Func, Op, Term, Val};
 use std::collections::HashMap;
 
-/// Aendert diese Instruktion Speicher, den wir nicht ueberblicken?
+/// Does this instruction change memory that we cannot survey?
 fn disturbs_memory(op: &Op) -> bool {
     matches!(
         op,
@@ -96,7 +96,7 @@ fn disturbs_memory(op: &Op) -> bool {
     )
 }
 
-/// Ein Weichenblock: nur `load.bool` aus einer Zelle, dann `brcond`.
+/// One switch block: just `load.bool` from a cell, then `brcond`.
 struct Fork {
     cell: Val,
     then: BlockId,
@@ -104,11 +104,11 @@ struct Fork {
 }
 
 pub(crate) fn thread_bool_cells(f: &mut Func) -> usize {
-    // SPEC §9.2: in constant-time-Funktionen entsteht hier nie ein Sprung.
+    // SPEC §9.2: within constant-time functions no jump ever comes about here.
     if f.constant_time {
         return 0;
     }
-    // Invariante blocks[i].id == i — sonst rechnen die Indizes falsch.
+    // Invariant blocks[i].id == i — otherwise the indices compute wrong.
     if f.blocks.iter().enumerate().any(|(i, b)| b.id as usize != i) {
         return 0;
     }
@@ -117,11 +117,11 @@ pub(crate) fn thread_bool_cells(f: &mut Func) -> usize {
         return 0;
     }
 
-    // 1. Weichenbloecke einsammeln.
+    // 1. Collect the switch blocks.
     let mut forks: HashMap<BlockId, Fork> = HashMap::new();
     for b in &f.blocks {
         if b.id == 0 || b.insts.len() != 1 {
-            continue; // bb0 traegt die allocas
+            continue; // bb0 carries the allocas
         }
         let i = &b.insts[0];
         let (d, addr) = match (i.dst, &i.op) {
@@ -144,16 +144,16 @@ pub(crate) fn thread_bool_cells(f: &mut Func) -> usize {
         return 0;
     }
 
-    // 2. Vorgaenger umschreiben.
+    // 2. Rewrite the predecessors.
     let mut n = 0usize;
     for pi in 0..f.blocks.len() {
         let p = &f.blocks[pi];
-        // Welcher Weichenblock ist ueberhaupt Nachfolger?
+        // Which switch block is a successor at all?
         let targets = p.term.successors();
         if !targets.iter().any(|z| forks.contains_key(z)) {
             continue;
         }
-        // Der zuletzt geschriebene Zelleninhalt am Blockende.
+        // The cell content written last at the end of the block.
         let (cell, x) = match last_bool_store(f, pi) {
             Some(v) => v,
             None => continue,
@@ -193,7 +193,7 @@ pub(crate) fn thread_bool_cells(f: &mut Func) -> usize {
     n
 }
 
-/// `alloca`s, deren Zeiger NICHT entkommt (nur Adresse von `load`/`store`).
+/// `alloca`s whose pointer does NOT escape (address of `load`/`store` only).
 fn simple_cells(f: &Func) -> std::collections::HashSet<Val> {
     use std::collections::HashSet;
     let mut cells: HashSet<Val> = HashSet::new();
@@ -212,8 +212,8 @@ fn simple_cells(f: &Func) -> std::collections::HashSet<Val> {
     for b in &f.blocks {
         for i in &b.insts {
             match &i.op {
-                // Adresse eines Zugriffs ist erlaubt; der GESPEICHERTE Wert
-                // waere ein entkommender Zeiger.
+                // The address of one access is allowed; the STORED value
+                // would be a pointer that escapes.
                 Op::Load { .. } => {}
                 Op::Store { val, .. } => {
                     if cells.contains(val) {
@@ -247,16 +247,16 @@ fn simple_cells(f: &Func) -> std::collections::HashSet<Val> {
     cells
 }
 
-/// Der Bool-Wert, der am Ende von Block `pi` garantiert in einer Zelle steht:
-/// der letzte `store.bool`, dem bis zum Terminator keine Speicherwirkung mehr
-/// folgt. Liefert `(Zelle, Wert)`.
+/// The bool value guaranteed to sit at a cell by the end of block `pi`:
+/// the last `store.bool` that is followed by no memory effect up to the
+/// terminator. Yields `(cell, value)`.
 fn last_bool_store(f: &Func, pi: usize) -> Option<(Val, Val)> {
     let insts = &f.blocks[pi].insts;
     for i in insts.iter().rev() {
         match &i.op {
             Op::Store { addr, val } => {
                 if i.ty != FTy::Bool {
-                    return None; // fremder Schreibzugriff dazwischen
+                    return None; // foreign write between them
                 }
                 return Some((*addr, *val));
             }
@@ -272,8 +272,8 @@ mod tests {
     use super::*;
     use crate::fir::{CmpOp, Module};
 
-    /// `a < b && a != c` — genau die Form, die `dekodiere` erzeugt.
-    /// bb0 = Eintritt, bb1 = rechte Seite, bb2 = Weiche, bb3/bb4 = Ziele.
+    /// `a < b && a != c` — exactly the form that the decoder produces.
+    /// bb0 = entry, bb1 = right side, bb2 = switch, bb3/bb4 = targets.
     fn and_func() -> Func {
         let mut f = Func::new("t", vec![FTy::U32, FTy::U32, FTy::U32], FTy::U32);
         let bb_b = f.add_block();
@@ -315,8 +315,8 @@ mod tests {
             }
             t => panic!("bb1: {:?}", t),
         }
-        // Der Weichenblock selbst bleibt unveraendert stehen (die
-        // Blockbereinigung in opt.rs raeumt ihn spaeter weg).
+        // The switch block itself stays unchanged (the block
+        // cleanup at opt.rs clears it away later).
         assert_eq!(f.blocks[2].insts.len(), 1);
     }
 
@@ -330,7 +330,7 @@ mod tests {
     #[test]
     fn cell_the_escapes_becomes_not_threaded() {
         let mut f = and_func();
-        let cell = 3; // %0..%2 sind Parameter, %3 die alloca
+        let cell = 3; // %0..%2 are parameters, %3 the alloca
         f.push_void(3, FTy::Void, Op::Call { name: "foreign".into(), args: vec![cell] });
         assert!(!simple_cells(&f).contains(&cell));
         assert_eq!(thread_bool_cells(&mut f), 0);
@@ -340,8 +340,8 @@ mod tests {
     fn call_between_store_and_jump_blocked() {
         let mut f = and_func();
         f.push_void(1, FTy::Void, Op::Call { name: "foreign".into(), args: vec![] });
-        // bb1 hat jetzt einen Aufruf HINTER dem store — dort darf nicht
-        // gefaedelt werden, bb0 aber schon.
+        // bb1 now has a call BEHIND the store — threading is forbidden
+        // there, yet allowed for bb0.
         assert_eq!(thread_bool_cells(&mut f), 1);
         assert!(matches!(f.blocks[1].term, Term::Br(2)));
     }
@@ -366,9 +366,9 @@ mod tests {
     #[test]
     fn secret_value_stays_untouched() {
         let mut f = and_func();
-        let c1 = 4; // %0..%2 Parameter, %3 = alloca, %4 = cmp.lt
+        let c1 = 4; // %0..%2 parameters, %3 = alloca, %4 = cmp.lt
         f.secret.insert(c1);
-        // Nur der Vorgaenger mit dem geheimen Wert bleibt stehen.
+        // Only the predecessor with the secret value stays.
         assert_eq!(thread_bool_cells(&mut f), 1);
         match &f.blocks[0].term {
             Term::BrCond { then_bb, else_bb, .. } => {
