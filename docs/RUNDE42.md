@@ -1,8 +1,16 @@
 # Runde 42: die Standardbibliothek
 
 Reine Bibliotheksarbeit. An Lexer, Parser, Sema, Lowering und Codegen ist
-**keine Zeile** geändert — die beiden Compiler sind exakt die von
-`da3b0d9`. Was hier steht, ist Firn-Code in `lib/`, dazu sieben Testprogramme.
+**keine Zeile** geändert — die beiden Compiler sind exakt die des
+Basis-Commits. Was hier steht, ist Firn-Code in `lib/`, dazu sieben
+Testprogramme.
+
+**Basis: `fe31d13` (Runde 41).** Gebaut und begonnen wurde auf `da3b0d9`;
+weil Runde 41 währenddessen einen Miscompile in `firnc0` behoben hat, der
+`test.sh` in Abschnitt 12 endlos hängen ließ (Befund D unten), ist dieser
+Zweig darauf umgesetzt (`git rebase main`) und die Abnahme **vollständig neu
+gemessen** — mit einem selbst gebauten `firnc0` und frisch gebauten
+Hilfsbinaries, ohne jeden Handgriff von außen.
 
 ---
 
@@ -514,26 +522,40 @@ betroffenen Dateien `GLEICH`, und die Programme drucken dieselbe Zeile.
 dort fällt es auf. Die Tests binden solche Werte deshalb vor der
 Interpolation an einen Namen. Behebung wäre eine Parser-Änderung.
 
-**D. `.astdump` (und jedes andere Firn-Programm, das `bin/druck.fi` benutzt)
-hängt auf main `da3b0d9` bei JEDEM `||` in einer Endlosschleife.** Das ist
-**kein** Befund dieser Runde, sondern ein Regalloc-Fehler in `firnc0`, den die
-parallel laufende Runde 41 gefunden und behoben hat
-(`compiler/src/regalloc.rs`, Kommentar dort: *„`43 - start` in `bin/druck.fi`
-(drucke_binop) wurde zu `43 - &tab[start]`, weil `lea` die Adresse in genau
-dieses Register schrieb; die Länge lief unter Null und `buf_wachse` drehte
-sich ewig (Endlosschleife in `.astdump` auf jedem `||`)"*).
+**D. `.astdump` hing auf `da3b0d9` bei JEDEM `||` in einer Endlosschleife —
+`test.sh` kam nie über Abschnitt 12 hinaus.** Hier gefunden, von Runde 41
+behoben (`fe31d13`).
 
-Nachgewiesen, dass es nicht an dieser Runde liegt: mit **zurückgesetztem**
-`lib/rt/vec.fi` und `lib/rt/map.fi` (Stand `da3b0d9`) und einem frisch
-gebauten `.astdump` hängt derselbe Aufruf genauso; mit dem `firnc0` der
-Runde 41 (nur `regalloc.rs` unterscheidet sich) läuft er durch. Minimalfall:
+Fehlerbild und Eingrenzung aus dieser Runde:
 
 ```firn
 fn f(a: bool, b: bool) -> bool { if a || b { return a } return b }
 ```
 
-Ohne diesen Fix kommt `test.sh` auf main **nie** über Schritt 12 hinaus.
-Konsequenz für die Abnahme siehe Abschnitt 7.
+`./.astdump` auf diese sechs Zeilen: läuft ewig, kein Byte Ausgabe. Damit
+hängt `tools/parser_vergleich.sh` beim ersten Quelltext mit `||` — und das
+ist praktisch jeder. Drei Messungen haben gezeigt, dass es **nicht** an
+dieser Runde liegt:
+
+1. mit auf `da3b0d9` **zurückgesetztem** `lib/rt/vec.fi` und `lib/rt/map.fi`
+   und frisch gebautem `.astdump`: hängt genauso;
+2. dasselbe `bin/astdump.fi`, gebaut mit dem `firnc0` aus dem Arbeitsbaum der
+   Runde 41 (dort unterschied sich nur `compiler/src/regalloc.rs`): läuft
+   durch;
+3. `.firnc1` selbst war nie betroffen — der Selbstvergleich und der Fixpunkt
+   liefen auch auf `da3b0d9` grün.
+
+Die Ursache steht in `fe31d13`: die Optimierung „Zellen-Alias" (Runde 40,
+`regalloc.rs`) ließ einen Load das Zellenregister direkt lesen, obwohl
+zwischen Load und Verwendung ein anderer Wert genau dieses Register
+beschrieb. In `bin/druck.fi`/`drucke_binop` wurde aus `43 - start` ein
+`43 - &tab[start]`, die Länge lief unter Null, und `rt.buf_wachse` drehte
+sich ewig. Aufgefallen ist es erst jetzt, weil die Dump-Binaries vorher
+veraltet wiederverwendet wurden — dieselbe Falle, vor der Abschnitt 7 warnt.
+
+Für diesen Zweig ist damit nichts mehr offen: er sitzt auf `fe31d13`, und
+die Abnahme in Abschnitt 7 ist mit dem eigenen, korrigierten `firnc0`
+gemessen.
 
 ---
 
@@ -567,17 +589,24 @@ Einspeisung eines fehlschlagenden `mmap` nicht auslösen.
 
 ## 7. Abnahme
 
-| Messung | Wert | Ausgangslage `da3b0d9` |
-|---|---|---|
-| `bash ./test.sh` | **PASS 670/670**, `RC=0` | 649/649 |
-| `bash tools/selbst_vergleich.sh` | **GLEICHES VERHALTEN 195 · ABWEICHEND 0 · FEHLERHAFT 0 · CODEGEN FEHLT 0**, `RC=0` | 188 / 0 / 0 |
-| `bash tools/fixpunkt.sh` | **Stufe 2 == Stufe 3, zeichengleich (289096 Zeilen Assembler)** · Korpus: `.firnc2` verhält sich wie `firnc0`, `RC=0` | zeichengleich, 289096 Zeilen |
+Gemessen auf **`fe31d13`** (Basis dieses Zweiges), mit selbst gebautem
+`firnc0` und frisch gebauten Hilfsbinaries.
 
-Die 670 sind 649 + 21: sieben neue Programme × drei Durchläufe
-(`opt` / `noopt` / `dev-fast`). Die 195 sind 188 + 7. Die **289096 Zeilen sind
+| Messung | Wert | Ausgangslage `fe31d13` |
+|---|---|---|
+| `bash ./test.sh` | **PASS 673/673**, `RC=0` | 652/652 |
+| `bash tools/selbst_vergleich.sh` | **GLEICHES VERHALTEN 196 · ABWEICHEND 0 · FEHLERHAFT 0 · CODEGEN FEHLT 0**, `RC=0` | 189 / 0 / 0 |
+| `bash tools/fixpunkt.sh` | **Stufe 2 == Stufe 3, zeichengleich (309468 Zeilen Assembler)** · Korpus: `.firnc2` verhält sich wie `firnc0`, `RC=0` | zeichengleich, 309468 Zeilen |
+
+Die 673 sind 652 + 21: sieben neue Programme × drei Durchläufe
+(`opt` / `noopt` / `dev-fast`). Die 196 sind 189 + 7. Die **309468 Zeilen sind
 unverändert** — der selbstgehostete Compiler trägt von den 32 neuen
 generischen `Vec`/`Map`-Funktionen kein einziges Byte, weil er keine davon
 benutzt (Monomorphisierung).
+
+(Zwischenstand auf der alten Basis `da3b0d9`, der Vollständigkeit halber:
+670/670, 195/0/0, Fixpunkt zeichengleich bei 289096 Zeilen. Dieselbe Aussage,
+nur vor dem Rebase.)
 
 Die Vergleichswerkzeuge im Einzelnen (aus demselben Lauf):
 
@@ -599,25 +628,19 @@ gelöscht (`.astdump`, `.lexdump`, `.firdump`, `.semadump`, `.layoutdump`,
 gelassenes `.astdump` hätte den Stand von vor dem Ausbau gemessen und wäre
 grün gewesen, ohne etwas zu beweisen.
 
-**Zwei Dinge, die zur Ehrlichkeit dieser Messung gehören:**
+**Eines gehört noch zur Ehrlichkeit dieser Messung:**
 
-1. **Die vier Dump-Binaries wurden mit dem `firnc0` der parallel laufenden
-   Runde 41 gebaut** (`.astdump`, `.semadump`, `.firdump`, `.layoutdump`) —
-   aus **unveränderten** Firn-Quellen dieses Zweiges, nur mit dem dort
-   behobenen `regalloc.rs`. Grund ist Befund D: mit dem `firnc0` von
-   `da3b0d9` hängt `.astdump` bei jedem `||` endlos, und `test.sh` kommt nie
-   über Schritt 12. Alles andere — `firnc0` selbst, `.firnc1`, `.lexdump`,
-   sämtliche Testprogramme, die drei Fixpunktstufen — ist mit dem `firnc0`
-   **dieses** Zweiges gebaut. Sobald Runde 41 in `main` ist, entfällt der
-   Handgriff ersatzlos.
-2. **Die Messung lief in einem eigenen Mount-Namensraum mit privatem `/tmp`**
+1. **Die Messung lief in einem eigenen Mount-Namensraum mit privatem `/tmp`**
    (`unshare --mount` + `tmpfs`). `tools/lex_vergleich.sh` und die anderen
    Vergleicher benutzen feste Pfade wie `/tmp/lexv_a.txt`; läuft in einem
    zweiten Arbeitsbaum gleichzeitig dieselbe Suite (hier: Runde 41), schreiben
    beide in dieselben Dateien und die Ergebnisse sind Zufall. Ohne
    Namensraum meldete `lex_vergleich` einmal 72 Abweichungen, mit Namensraum
-   genau die eine bekannte. Das ist ein Werkzeugmangel, der hier festgehalten
-   wird — die Skripte sollten `mktemp` benutzen.
+   genau die eine bekannte. Runde 41 ist derselben Falle begegnet
+   (`/tmp/parv_a.txt`, „das sah wie 148 echte Abweichungen aus"). Das ist ein
+   Werkzeugmangel, der hier festgehalten wird — die Skripte sollten `mktemp`
+   benutzen; solange sie es nicht tun, darf immer nur EINE Suite gleichzeitig
+   laufen.
 
 ## 8. Zeilen
 
