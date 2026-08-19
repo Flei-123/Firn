@@ -1,13 +1,13 @@
-//! Abstrakter Syntaxbaum der v0-Teilmenge (SPEC §10.1).
+//! Abstract syntax tree of the v0 subset (SPEC §10.1).
 //!
-//! Jeder Ausdruck traegt eine eindeutige `ExprId`; der Typpruefer legt darueber
-//! die Typtabelle (`sema::TypeInfo::expr_types`) an, die das Lowering benutzt.
+//! Every expression carries a unique `ExprId`; the type checker builds the
+//! type table over it (`sema::TypeInfo::expr_types`), which lowering uses.
 
 use crate::diag::Span;
 
 pub type ExprId = u32;
 
-/// Typ-Syntax (noch nicht aufgeloest — `Named` kann ein Struct sein).
+/// Type syntax (not yet resolved — `Named` may well be a struct).
 #[derive(Clone, Debug)]
 pub enum TypeExpr {
     Named(String, Span),
@@ -82,9 +82,9 @@ impl BinOp {
 pub enum UnOp {
     Neg,
     Not,
-    /// `&x` — Adresse von
+    /// `&x` — address of
     AddrOf,
-    /// `*p` — Dereferenzierung
+    /// `*p` — dereference
     Deref,
 }
 
@@ -97,18 +97,18 @@ pub struct Expr {
 
 #[derive(Clone, Debug)]
 pub enum ExprKind {
-    /// Gleitkommaliteral als Bitmuster eines IEEE-754 binary64.
+    /// Float literal as the bit pattern of one IEEE-754 binary64.
     Float(u64),
     Int(i128),
     Bool(bool),
     Ident(String),
     Unary(UnOp, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
-    /// Feldzugriff `base.name`
+    /// Field access `base.field`
     Field(Box<Expr>, String, Span),
     /// Index `base[idx]`
     Index(Box<Expr>, Box<Expr>),
-    /// Aufruf `name(args)` — nur direkte Funktionsnamen (Stufe 0)
+    /// Call `f(args)` — direct function identifiers only (stage 0)
     Call(String, Vec<Expr>, Span),
     /// `syscall(nr, a1..a6)`
     Syscall(Vec<Expr>),
@@ -118,7 +118,7 @@ pub enum ExprKind {
     StructLit(String, Vec<(String, Expr, Span)>, Span),
     /// `[1, 2, 3]`
     ArrayLit(Vec<Expr>),
-    /// Wiederholungsliteral `[wert; N]`; `N` ist ein konstanter Ausdruck.
+    /// Repeat literal `[value; N]`; `N` is a constant expression.
     ArrayRepeat(Box<Expr>, Box<Expr>),
 }
 
@@ -130,7 +130,7 @@ pub struct Block {
 
 #[derive(Clone, Debug)]
 pub enum Stmt {
-    /// `let`/`var`: `mutable` unterscheidet beide.
+    /// `let`/`var`: `mutable` tells the two apart.
     Let {
         name: String,
         mutable: bool,
@@ -158,31 +158,31 @@ pub enum Stmt {
         value: Option<Expr>,
         span: Span,
     },
-    /// `for name in start..end { }` (halboffener Bereich, aufsteigend).
+    /// `for`-loop over a half-open, ascending range `start..end`.
     For {
         name: String,
         start: Expr,
         end: Expr,
         body: Block,
-        /// Position des Schleifennamens (fuer Fehlermeldungen)
+        /// Position of the loop variable (for error messages)
         name_span: Span,
         span: Span,
     },
     Break(Span),
     Continue(Span),
-    /// `defer <anweisung>` bzw. `errdefer <anweisung>` — laeuft beim Verlassen
-    /// des umschliessenden Blocks, in umgekehrter Reihenfolge der Vereinbarung
-    /// (SPEC §5.1). Das `bool` ist `true` bei `errdefer`: dann laeuft die
-    /// Anweisung NUR, wenn die Funktion ueber einen Fehler verlassen wird.
+    /// `defer <stmt>` or `errdefer <stmt>` — runs when the enclosing block
+    /// gets left, reversing the order of declaration (SPEC §5.1). The `bool`
+    /// is `true` for `errdefer`: the statement then runs ONLY when the
+    /// function gets left through some error.
     Defer(Box<Stmt>, bool, Span),
     Expr(Expr),
     Block(Block),
-    /// Nur vom Parser bei Fehlerwiederherstellung erzeugt; wird ignoriert.
+    /// Produced by the parser during error recovery only; gets ignored.
     Error(Span),
 }
 
 impl Stmt {
-    /// Quellposition der Anweisung (benutzt von `--emit=ast`).
+    /// Source position of the statement (used by `--emit=ast`).
     pub fn span(&self) -> Span {
         match self {
             Stmt::Let { span, .. }
@@ -200,7 +200,7 @@ impl Stmt {
         }
     }
 
-    /// Kurzname der Anweisungsart (fuer die Uebersicht in `--emit=ast`).
+    /// Short label of the statement kind (for the overview of `--emit=ast`).
     pub fn kind_name(&self) -> &'static str {
         match self {
             Stmt::Let { mutable: false, .. } => "let",
@@ -228,8 +228,8 @@ pub struct Param {
     pub span: Span,
 }
 
-/// Ein Attribut `#[name]` bzw. `#[name(arg)]` vor einer Deklaration.
-/// Gueltige Namen stehen in `attrs.rs` — dort und nur dort.
+/// One attribute `#[attr]` or `#[attr(arg)]` ahead of a declaration.
+/// The valid spellings live within `attrs.rs` — there and nowhere else.
 #[derive(Clone, Debug)]
 pub struct Attr {
     pub name: String,
@@ -263,11 +263,11 @@ pub struct ConstDecl {
     pub span: Span,
 }
 
-/// `import pfad.modul` — Pfadteile ohne Endung, relativ zur Wurzeldatei.
+/// `import path.module` — path parts without suffix, relative to the root file.
 #[derive(Clone, Debug)]
 pub struct ImportDecl {
     pub path: Vec<String>,
-    /// Name, unter dem das Modul im Quelltext angesprochen wird (letzter Teil).
+    /// Label under which the module gets addressed by the source (last part).
     pub alias: String,
     pub span: Span,
 }
@@ -275,17 +275,17 @@ pub struct ImportDecl {
 #[derive(Clone, Debug, Default)]
 pub struct Program {
     pub profile: Option<(String, Span)>,
-    /// `import`-Deklarationen dieser Datei (Modulsystem, `modules.rs`).
+    /// `import` declarations of this file (module system, `modules.rs`).
     pub imports: Vec<ImportDecl>,
-    /// `export { a, b }` — leer heisst: alles ist sichtbar.
+    /// `export { a, b }` — empty means: everything is visible.
     pub exports: Vec<(String, Span)>,
     pub funcs: Vec<FnDecl>,
     pub structs: Vec<StructDecl>,
     pub consts: Vec<ConstDecl>,
-    /// `comptime { … }` auf oberster Ebene: laeuft VOR der Typpruefung und
-    /// kann per `emit_*` Quelltext erzeugen, den derselbe Lauf uebersetzt
+    /// `comptime { … }` at top level: runs BEFORE the type check and can
+    /// produce source text through `emit_*` that the same run compiles
     /// (SPEC §6.4).
     pub comptime_blocks: Vec<(Block, Span)>,
-    /// Anzahl vergebener ExprIds (= Groesse der Typtabelle).
+    /// Count of ExprIds handed out (= size of the type table).
     pub expr_count: u32,
 }

@@ -1,33 +1,33 @@
-//! Atomare Lese-Aenderungs-Schreib-Operation (Runde 47) — die Grundlage von
-//! `Arc[T]` (SPEC §3.4: „`Arc[T]` ist die fadensichere Variante (atomarer
-//! Zaehler). Getrennter Typ, damit einfaediger Code den atomaren Zaehler nicht
-//! bezahlt.").
+//! Atomic read-modify-write operation (round 47) — the foundation of
+//! `Arc[T]` (SPEC §3.4: "`Arc[T]` is the thread-safe variant (atomic
+//! counter). A separate type, so that single-threaded code does not pay for
+//! the atomic counter.").
 //!
-//! Genau EIN Primitiv, absichtlich das kleinste, das reicht:
+//! Exactly ONE primitive, deliberately the smallest one that suffices:
 //!
 //! ```firn
-//! __atomar_addieren(p: *mut u64, delta: u64) -> u64   // liefert den ALTEN Wert
+//! __atomic_add(p: *mut u64, delta: u64) -> u64   // yields the OLD value
 //! ```
 //!
-//! Es wird zu einer einzigen Maschineninstruktion `lock xadd qword ptr [..], r`.
-//! Damit laesst sich ein Zaehler erhoehen (Ergebnis egal) und ebenso
-//! erniedrigen und dabei erkennen, ob man der Letzte war (alter Wert == 1) —
-//! mehr braucht Referenzzaehlung nicht. Subtraktion ist die Addition des
-//! Zweierkomplements; ein eigenes Primitiv dafuer waere Ballast.
+//! It turns into a single machine instruction `lock xadd qword ptr [..], r`.
+//! That lets a counter go up (result irrelevant) and equally go down while
+//! telling whether you were the last holder (old value == 1) — reference
+//! counting needs nothing more. Subtraction is the addition of the two's
+//! complement; a primitive of its own for that would be dead weight.
 //!
-//! **Warum ein eigener Durchgriff bis in den Codegenerator und nicht einfach
-//! `*p = *p + d`?** Weil das drei Instruktionen sind (`load`, `add`, `store`)
-//! und zwischen ihnen ein anderer Faden dasselbe tun kann — genau die
-//! verlorene Erhoehung, gegen die `Arc` existiert. Firn hat in Stufe 0 keine
-//! Faeden (SPEC §7), deshalb ist der Unterschied heute NICHT durch einen
-//! Zweifaden-Lauf messbar; nachweisbar ist er an der erzeugten Instruktion
-//! (`tools/atomic/run.sh` liest den Assembler und verlangt das `lock`-Praefix).
-//! Das steht so auch in `docs/RUNDE47.md` — kein „fadensicher" ohne Beleg.
+//! **Why a dedicated path all the way down to the code generator rather than
+//! plain `*p = *p + d`?** Because that is three instructions (`load`, `add`,
+//! `store`) and between them another thread can do the very same — exactly
+//! the lost increment that `Arc` exists against. Firn has no threads at
+//! stage 0 (SPEC §7), so the difference is NOT measurable today by a
+//! two-thread run; it is provable at the emitted instruction
+//! (`tools/atomic/run.sh` reads the assembler and demands the `lock` prefix).
+//! `docs/RUNDE47.md` says the same — no "thread-safe" without proof.
 //!
-//! **Nicht hier drin:** Speicherordnungen (`acquire`/`release`/`relaxed`),
-//! Vergleichs-Tausch (`compare_exchange`), atomare Lasten/Speicherungen
-//! kleinerer Breiten. `lock xadd` hat auf x86-64 ohnehin volle Ordnung; die
-//! feineren Modelle gehoeren in die Runde, die Faeden bringt.
+//! **Not part of this:** memory orderings (`acquire`/`release`/`relaxed`),
+//! compare-and-swap (`compare_exchange`), atomic loads/stores of smaller
+//! widths. `lock xadd` carries full ordering on x86-64 anyway; the finer
+//! models belong to the round that brings threads.
 
 use crate::ast::Expr;
 use crate::diag::Span;
@@ -36,18 +36,18 @@ use crate::lower::Lower;
 use crate::sema::Checker;
 use crate::types::Type;
 
-/// Name des Primitivs im Quelltext.
+/// Identifier of the primitive within the source text.
 pub(crate) const ADD: &str = "__atomic_add";
 
-/// Ist `name` der Name des eingebauten Primitivs?
+/// Does this spelling belong to the builtin primitive?
 pub(crate) fn is_atomic_call(name: &str) -> bool {
     name == ADD
 }
 
-// ------------------------------------------------------------------- Typphase
+// ----------------------------------------------------------------- Type phase
 
-/// Hook aus `sema::call`. `None`, wenn es nicht das Primitiv ist oder im
-/// Programm eine gleichnamige Funktion steht — die gewinnt dann.
+/// Hook from `sema::call`. `None` if this is not the primitive or if the
+/// program holds a function of the same spelling — that one wins then.
 pub(crate) fn hook_call(
     ck: &mut Checker,
     name: &str,
@@ -113,9 +113,9 @@ fn fits_as_u64(t: &Type) -> bool {
     matches!(t, Type::U64 | Type::UntypedInt)
 }
 
-// ---------------------------------------------------------------- Lowerphase
+// ------------------------------------------------------------ Lowering phase
 
-/// Hook aus `lower::lower_call`.
+/// Hook from `lower::lower_call`.
 pub(crate) fn lower_atomic_call(lo: &mut Lower, name: &str, args: &[Expr], span: Span) -> Option<Option<Val>> {
     let _ = name;
     if args.len() != 2 {

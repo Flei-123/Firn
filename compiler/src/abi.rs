@@ -1,43 +1,43 @@
-//! Aufrufkonvention: System V AMD64 (SPEC §13, §14.1).
+//! Calling convention: System V AMD64 (SPEC §13, §14.1).
 //!
-//! Diese Datei ist die **einzige Wahrheit** darueber, wie ein Wert eine
-//! Funktionsgrenze ueberquert. `sema`, `lower`, `codegen_x86` und die Module
-//! `types`/`opt` fragen hier nach, statt eigene Regeln zu erfinden.
+//! This file is the **single truth** about how a value crosses a function
+//! boundary. `sema`, `lower`, `codegen_x86` and the modules `types`/`opt`
+//! ask here rather than inventing rules of their own.
 //!
-//! Klassifikation nach System V AMD64 (§3.2.3 der ABI):
-//!   * Ganzzahlen, `bool`, Zeiger -> INTEGER, ein Wort
-//!   * Aggregate bis 16 Byte      -> INTEGER, ein oder zwei Woerter
-//!   * Aggregate ueber 16 Byte    -> MEMORY
-//!   * Gleitkomma                 -> SSE (Stufe 0 hat keine Gleitkommatypen)
+//! Classification per System V AMD64 (§3.2.3 of the ABI):
+//!   * integers, `bool`, pointers -> INTEGER, one word
+//!   * aggregates up to 16 bytes  -> INTEGER, one or two words
+//!   * aggregates over 16 bytes   -> MEMORY
+//!   * floating point             -> SSE (stage 0 has no float types)
 //!
-//! UMSETZUNG (siehe SPEC §14.1 Punkt 1): INTEGER-Woerter werden wie in der ABI
-//! in `rdi, rsi, rdx, rcx, r8, r9` und danach auf dem Stapel uebergeben.
-//! MEMORY-Argumente werden **als versteckter Zeiger auf eine Kopie des
-//! Aufrufers** uebergeben statt als Stapelkopie; Rueckgaben ueber 8 Byte laufen
-//! immer ueber den versteckten Zeiger in `rdi` (`rax` liefert ihn zurueck).
-//! Beides ist in SPEC §14.1 als bewusste Abweichung festgehalten.
+//! IMPLEMENTATION (see SPEC §14.1 point 1): INTEGER words get passed as the
+//! ABI says, through `rdi, rsi, rdx, rcx, r8, r9` and after that on the stack.
+//! MEMORY arguments get passed **as a hidden pointer to a copy owned by the
+//! caller** rather than as a stack copy; returns over 8 bytes always travel
+//! through the hidden pointer held by `rdi` (`rax` hands it back).
+//! Both are recorded by SPEC §14.1 as a deliberate deviation.
 
 use crate::types::{Type, TypeCtx};
 
-/// Klasse eines Arguments/Rueckgabewertes an der Funktionsgrenze.
+/// Class of one argument/return value at the function boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArgClass {
-    /// In Ganzzahlregistern uebergeben; `u8` ist die Anzahl der 8-Byte-Woerter
-    /// (0 fuer `()`), hoechstens 2 nach System V.
+    /// Passed through integer registers; `u8` is the count of 8-byte words
+    /// (0 for `()`), at most 2 per System V.
     Integer(u8),
-    /// Ueber Speicher (Stufe 0: versteckter Zeiger auf eine Kopie).
+    /// Through memory (stage 0: hidden pointer to a copy).
     Memory,
-    // Eine Klasse `Sse` (SSE/SSEUP nach System V) gibt es hier bewusst NICHT:
-    // Stufe 0 kennt keine Gleitkommatypen, `classify` koennte sie nie liefern,
-    // und eine Variante, die niemand erzeugt, waere toter Code mit
-    // Unterdrueckungsattribut. Sie kommt zusammen mit `f32`/`f64` — dann
-    // erzwingt der Compiler selbst, dass jede Fallunterscheidung sie behandelt.
+    // A class `Sse` (SSE/SSEUP per System V) deliberately does NOT exist here:
+    // stage 0 knows no float types, `classify` could never yield it, and a
+    // variant that nobody produces would be dead code carrying a suppression
+    // attribute. It arrives together with `f32`/`f64` — then the compiler
+    // itself forces every case split to handle it.
 }
 
-/// Groesse der groessten Struktur, die noch in Registern uebergeben wird.
+/// Size of the largest structure still passed through registers.
 pub const MAX_INTEGER_AGGREGATE: u64 = 16;
 
-/// System-V-Klassifikation eines Quelltyps.
+/// System V classification of a source type.
 pub fn classify(ty: &Type, tcx: &TypeCtx) -> ArgClass {
     match ty {
         Type::Void | Type::Error => ArgClass::Integer(0),
@@ -51,19 +51,19 @@ pub fn classify(ty: &Type, tcx: &TypeCtx) -> ArgClass {
                 ArgClass::Integer(((size + 7) / 8) as u8)
             }
         }
-        // Alle skalaren Typen der Stufe 0 sind hoechstens 8 Byte breit.
+        // Every scalar type of stage 0 is at most 8 bytes wide.
         _ => ArgClass::Integer(1),
     }
 }
 
-/// Ist `ty` ein Aggregat (Struct/Array)?
+/// Is `ty` aggregate (struct/array)?
 pub fn is_aggregate(ty: &Type) -> bool {
     matches!(ty, Type::Array(..) | Type::Struct(_))
 }
 
-/// Braucht der Rueckgabetyp den versteckten Zeiger (`sret`) in `rdi`?
-/// Das gilt fuer jedes Aggregat ueber 8 Byte (SPEC §14.1: Abweichung von
-/// System V, das 9..16 Byte in `rax:rdx` zurueckgibt).
+/// Does the return type need the hidden pointer (`sret`) inside `rdi`?
+/// That holds for every aggregate over 8 bytes (SPEC §14.1: deviation from
+/// System V, which returns 9..16 bytes through `rax:rdx`).
 pub fn ret_needs_sret(ty: &Type, tcx: &TypeCtx) -> bool {
     is_aggregate(ty) && tcx.size_of(ty) > 8
 }
