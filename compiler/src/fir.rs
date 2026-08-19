@@ -194,6 +194,32 @@ pub enum Op {
     /// erst dadurch ist der KONSERVATIVE Registerscan ehrlich (SPEC §3.5.3).
     /// Ohne `gc class` im Programm entsteht diese Instruktion nie.
     GcAddr { regs: bool },
+    /// **Runde 52** — Inline-Assembler (`kern.rs`, SPEC §2 `profile kernel`).
+    ///
+    /// IMMER `volatile`: diese Instruktion darf **nie** entfernt, dupliziert,
+    /// zusammengelegt oder ueber einen anderen Speicherzugriff hinweg
+    /// verschoben werden. Genau das ist die Falle aus Runde 40 — der
+    /// Optimierer entfernte Code, den er nicht entfernen durfte.
+    ///
+    /// `vorlage` ist der Assemblertext (Intel-Syntax, `\n` trennt Zeilen).
+    /// `ein_regs[i]` ist das Register, in das `ein[i]` vor dem Block gelegt
+    /// wird; `aus` ist das Register, dessen Inhalt danach das Ergebnis ist
+    /// (dann ist der Instruktionstyp `u64`, sonst `void`). `clobber` nennt
+    /// zusaetzlich zerstoerte Register bzw. `memory`.
+    Asm {
+        vorlage: String,
+        aus: Option<String>,
+        ein_regs: Vec<String>,
+        ein: Vec<Val>,
+        clobber: Vec<String>,
+    },
+    /// **Runde 52** — MMIO-Lesezugriff (`kern.rs`). Wie `Op::Load`, aber
+    /// **volatile**: kein Durchgang darf zwei Zugriffe zusammenlegen, einen
+    /// entfernen oder ihn verschieben. Die Breite steckt im Instruktionstyp.
+    MmioLoad { addr: Val },
+    /// **Runde 52** — MMIO-Schreibzugriff (`kern.rs`). Wie `Op::Store`, aber
+    /// **volatile** (siehe `MmioLoad`).
+    MmioStore { addr: Val, val: Val },
 }
 
 impl Op {
@@ -222,6 +248,11 @@ impl Op {
             | Op::CopyMem { .. }
             | Op::Barrier { .. }
             | Op::AtomicAdd { .. }
+            // RUNDE 52: volatile. Nie rein, nie entfernbar — auch dann nicht,
+            // wenn das Ergebnis unbenutzt bleibt.
+            | Op::Asm { .. }
+            | Op::MmioLoad { .. }
+            | Op::MmioStore { .. }
             | Op::SecureZero { .. } => false,
         }
     }
@@ -271,6 +302,12 @@ impl Op {
             Op::SecureZero { addr, size } => {
                 out.push(*addr);
                 out.push(*size);
+            }
+            Op::Asm { ein, .. } => out.extend_from_slice(ein),
+            Op::MmioLoad { addr } => out.push(*addr),
+            Op::MmioStore { addr, val } => {
+                out.push(*addr);
+                out.push(*val);
             }
         }
     }
@@ -336,6 +373,10 @@ pub struct Func {
     /// `#[constant_time]`: der Codegenerator bricht ab, wenn ein bedingter
     /// Sprung von einem `secret`-Wert abhaengt.
     pub constant_time: bool,
+    /// **Runde 52** — `#[interrupt]`: eigene Aufrufkonvention. Der
+    /// Codegenerator rettet ALLE Universalregister und schliesst mit `iretq`
+    /// statt `ret` ab (SPEC §2, Kernel-Profil).
+    pub interrupt: bool,
 }
 
 impl Func {
@@ -351,6 +392,7 @@ impl Func {
             val_types,
             secret: std::collections::HashSet::new(),
             constant_time: false,
+            interrupt: false,
         }
     }
 
@@ -481,6 +523,22 @@ fn vlist(vs: &[Val]) -> String {
     vs.iter().map(|v| format!("%{}", v)).collect::<Vec<_>>().join(", ")
 }
 
+/// Maskierung der Assembler-Vorlage in der FIR-Textform. Nur diese vier
+/// Zeichen, damit BEIDE Compiler den Text ohne Tabelle gleich schreiben.
+pub(crate) fn asm_escape(v: &str) -> String {
+    let mut o = String::new();
+    for c in v.chars() {
+        match c {
+            '\\' => o.push_str("\\\\"),
+            '"' => o.push_str("\\\""),
+            '\n' => o.push_str("\\n"),
+            '\t' => o.push_str("\\t"),
+            _ => o.push(c),
+        }
+    }
+    o
+}
+
 fn fmt_inst(i: &Inst) -> String {
     let head = match i.dst {
         Some(d) => format!("%{} = ", d),
@@ -511,6 +569,26 @@ fn fmt_inst(i: &Inst) -> String {
         Op::Barrier { val } => format!("barrier.{} %{}", t, val),
         Op::SecureZero { addr, size } => format!("secure_zero %{}, %{}", addr, size),
         Op::AtomicAdd { addr, val } => format!("atomadd.{} %{}, %{}", t, addr, val),
+        Op::Asm { vorlage, aus, ein_regs, ein, clobber } => {
+            let mut o = format!("asm.{} \"{}\"", t, asm_escape(vorlage));
+            if let Some(r) = aus {
+                o.push_str(&format!(" out={}", r));
+            }
+            if !ein.is_empty() {
+                let ps: Vec<String> = ein_regs
+                    .iter()
+                    .zip(ein.iter())
+                    .map(|(r, v)| format!("{} %{}", r, v))
+                    .collect();
+                o.push_str(&format!(" in=[{}]", ps.join(", ")));
+            }
+            if !clobber.is_empty() {
+                o.push_str(&format!(" clobber=[{}]", clobber.join(", ")));
+            }
+            o
+        }
+        Op::MmioLoad { addr } => format!("mmio_load.{} %{}", t, addr),
+        Op::MmioStore { addr, val } => format!("mmio_store.{} %{}, %{}", t, val, addr),
         Op::GcAddr { regs } => {
             if *regs {
                 "gc_state.ptr regs=1".to_string()

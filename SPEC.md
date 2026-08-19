@@ -1018,8 +1018,19 @@ Code nicht auseinanderlaufen.
 4. **`const`** ist auf skalare, zur Übersetzungszeit auswertbare
    Ganzzahl-/`bool`-Ausdrücke beschränkt.
 5. **Globale Variablen** gibt es nicht (nur `const`).
-6. **`profile`-Deklaration** wird geparst und geprüft, hat aber keine Wirkung:
-   erzeugt wird immer ein freistehendes Binary mit `_start` ohne libc.
+6. ~~**`profile`-Deklaration** wird geparst und geprüft, hat aber keine
+   Wirkung.~~ **Gestrichen in Runde 52** (`compiler/src/profil.rs`,
+   `compiler/src/kern.rs`, `docs/RUNDE52.md`): `--profile=kernel` bzw.
+   `profile kernel` setzt die Tabelle aus §2 durch — kein `import std.*`,
+   kein `gc class`, kein `syscall`, kein `#[unwinds]`, Gleitkomma nur mit
+   `#[allow_fp]` — und erzeugt eine freistehende **ELF-Objektdatei** (`-c`,
+   kein `ld`, kein `_start`, kein libc-Kontakt). Dazu kamen Inline-Assembler
+   (`asm("…", in("dx") p, out("rax"), clobber("memory"))`), MMIO
+   (`__mmio_lesen/schreiben8|16|32|64`) und Interrupt-Einsprungpunkte
+   (`#[interrupt]`, rettet 14 Register und schließt mit `iretq`). Nachweis:
+   `beispiele/kernel/kern.fi` bootet in QEMU, mit **beiden** Compilern
+   (`tools/freistehend/run.sh`). Im App-Profil bleibt alles wie zuvor: ein
+   freistehendes Binary mit `_start` ohne libc.
 7. **`extern fn`** wird syntaktisch erkannt, aber mit klarem Fehler abgelehnt.
 8. **Rückgabewert des Programms.** `fn main() -> i32`; `_start` ruft `main` und
    übergibt das Ergebnis an `exit` (Exit-Code = Wert & 0xFF).
