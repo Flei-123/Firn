@@ -219,6 +219,26 @@ fn subst_name(
         if let Some(t) = map.get(n) {
             return Some(with_span(t, sp));
         }
+        // Runde 53: `Gc[T]` und `GcWeak[T]` IN EINER VORLAGE.
+        //
+        // Der Parser macht daraus die Namen `__gc#p:T` bzw. `__gc#w:T`
+        // (gc.rs::hook_type). Ohne diese Stelle sucht die Typaufloesung
+        // spaeter eine gc-Klasse namens `T` und meldet „unbekannte
+        // gc-klasse 'T'" — generische Funktionen ueber Gc-Zeiger waren
+        // damit unmoeglich, und genau die braucht die typsichere
+        // Oberflaeche von `GcVec`/`GcMap` (`gcvec_anhaengen[T]`).
+        //
+        // Ersetzt wird nur, wenn das Argument ein NAME ist: `Gc[*mut u8]`
+        // gibt es nicht, der Parser laesst dort ohnehin nur einen
+        // Bezeichner zu.
+        for pfx in [crate::gc::P_TYP_PUB, crate::gc::P_WTYP_PUB] {
+            if let Some(rest) = n.strip_prefix(pfx) {
+                if let Some(TypeExpr::Named(konkret, _)) = map.get(rest) {
+                    return Some(TypeExpr::Named(format!("{}{}", pfx, konkret), sp));
+                }
+                return None;
+            }
+        }
     }
     let inst = instantiation(n)?;
     let args: Vec<TypeExpr> = inst.args.iter().map(|a| subst_ty(a, map, queue)).collect();

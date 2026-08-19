@@ -286,11 +286,14 @@ pub(crate) fn gc_laufzeit(files: &[SourceFile]) -> Option<SourceFile> {
     // In einem Modul hiesse er `modul__gc_finalisiere` und die Laufzeit
     // faende ihn nicht mehr (siehe `module_name` weiter unten).
     let mut hat_finalisierer = false;
+    // Runde 53: `GcVec`/`GcMap` kommen nur dazu, wenn sie vorkommen.
+    let mut braucht_sammlungen = false;
     for f in files {
         let mut dg = Diags::new("<gc-suche>", &f.src);
         let toks = lexer::lex_file(&f.src, f.id, &mut dg);
         braucht |= crate::gc::quelle_braucht_gc(&toks);
         hat_allocerror |= crate::gc::quelle_hat_allocerror(&toks);
+        braucht_sammlungen |= crate::gc::quelle_braucht_sammlungen(&toks);
         if f.id == 0 {
             hat_finalisierer = crate::gc::quelle_hat_finalisierer(&toks);
         }
@@ -301,7 +304,11 @@ pub(crate) fn gc_laufzeit(files: &[SourceFile]) -> Option<SourceFile> {
     Some(SourceFile {
         id: files.len() as u32,
         path: PathBuf::from(crate::gc::LAUFZEIT_PFAD),
-        src: crate::gc::laufzeit_quelle(!hat_allocerror, !hat_finalisierer),
+        src: crate::gc::laufzeit_quelle(
+            !hat_allocerror,
+            !hat_finalisierer,
+            braucht_sammlungen,
+        ),
     })
 }
 
