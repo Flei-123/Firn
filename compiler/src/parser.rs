@@ -345,6 +345,10 @@ impl<'a> Parser<'a> {
                 if let Some(t) = crate::gc::hook_type(self, &name, sp) {
                     return Some(t);
                 }
+                // HOOK iface: `dyn I` — der Schnittstellenwert (iface.rs)
+                if let Some(t) = crate::iface::hook_type(self, &name, sp) {
+                    return Some(t);
+                }
                 if self.kind() == &TokKind::LBracket
                     && !crate::sema_generic::is_generic_struct(&name)
                 {
@@ -1506,7 +1510,15 @@ impl<'a> Parser<'a> {
                 }
                 continue;
             }
-            // HOOK impl: `impl Typ { fn … }` (impls.rs, Runde 45)
+            // HOOK iface: `interface Name { fn … }` (iface.rs, Runde 46)
+            if crate::iface::hook_item(self) {
+                if self.pos == before {
+                    self.bump();
+                }
+                continue;
+            }
+            // HOOK impl: `impl Typ { fn … }`, `impl I for Typ { fn … }`
+            // (impls.rs, Runde 45; die Schnittstellenform Runde 46)
             if crate::impls::hook_item(self, &mut prog) {
                 if self.pos == before {
                     self.bump();
@@ -1569,6 +1581,8 @@ pub fn reset_hooks() {
     crate::sizeof::hook_reset();
     // HOOK gc: dasselbe fuer die gc-Klassen (gc.rs)
     crate::gc::hook_reset();
+    // HOOK iface: dasselbe fuer Schnittstellen und ihre Umsetzungen (iface.rs)
+    crate::iface::hook_reset();
 }
 
 /// Wie `parse`, aber fuer eine Datei der Quelltextkarte: `file` ist ihre
