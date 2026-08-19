@@ -1434,6 +1434,10 @@ impl<'a> Checker<'a> {
     }
 
     fn call(&mut self, name: &str, args: &[Expr], nspan: Span, espan: Span) -> Type {
+        // HOOK impl: `x.m(args)` — Methodenaufruf (impls.rs, Runde 45)
+        if let Some(t) = crate::impls::hook_call(self, name, args, nspan, espan) {
+            return t;
+        }
         // HOOK types: `Enum::Variante(..)` und `match` (sema_match.rs)
         if let Some(t) = crate::sema_match::hook_call(self, name, args, nspan, espan) {
             return t;
@@ -1482,31 +1486,37 @@ impl<'a> Checker<'a> {
         }
         for (i, a) in args.iter().enumerate() {
             match sig.params.get(i) {
-                Some(p) => {
-                    // HOOK fehlerunionen: implizite Umwandlung (errors.rs)
-                    if crate::errors::hook_coerce(self, a, p) {
-                        continue;
-                    }
-                    let t = self.expr(a, Some(p));
-                    if !assignable(&t, p) {
-                        self.dg.error(
-                            a.span,
-                            format!(
-                                "argument {} von '{}' hat typ {}, erwartet {}",
-                                i + 1,
-                                name,
-                                self.tcx.name_of(&t),
-                                self.tcx.name_of(p)
-                            ),
-                        );
-                    }
-                }
+                Some(p) => self.pruefe_argument(name, i + 1, a, p),
                 None => {
                     self.type_out_expr(a);
                 }
             }
         }
         sig.ret
+    }
+
+    /// Ein Argument gegen seinen Parametertyp. `nr` ist die Nummer, die in
+    /// der Meldung erscheint (1-basiert). Bei einem Methodenaufruf zaehlt
+    /// sie OHNE den Empfaenger — `v.push(x)` hat ein Argument, nicht zwei
+    /// (impls.rs).
+    pub(crate) fn pruefe_argument(&mut self, wer: &str, nr: usize, a: &Expr, p: &Type) {
+        // HOOK fehlerunionen: implizite Umwandlung (errors.rs)
+        if crate::errors::hook_coerce(self, a, p) {
+            return;
+        }
+        let t = self.expr(a, Some(p));
+        if !assignable(&t, p) {
+            self.dg.error(
+                a.span,
+                format!(
+                    "argument {} von '{}' hat typ {}, erwartet {}",
+                    nr,
+                    wer,
+                    self.tcx.name_of(&t),
+                    self.tcx.name_of(p)
+                ),
+            );
+        }
     }
 
     fn struct_lit(&mut self, name: &str, fields: &[(String, Expr, Span)], nspan: Span) -> Type {
@@ -1642,6 +1652,15 @@ impl<'a> Checker<'a> {
                 if crate::errors::is_result_call(name) {
                     let inner = args.first().and_then(|a| self.probe_d(a, d + 1))?;
                     return crate::errors::success_type(&inner);
+                }
+                // HOOK impl: `x.m(..)` liefert den Rueckgabetyp der Methode.
+                // Ohne das bekaeme ein Literal daneben keinen Typ
+                // (`p.summe() != 42`) — dieselbe Aufloesung wie in `call`,
+                // nur ohne zu melden und ohne zu schreiben (impls.rs)
+                if let Some(m) = crate::impls::methodenname(name) {
+                    let et = args.first().and_then(|a| self.probe_d(a, d + 1))?;
+                    let (voll, _) = crate::impls::ziel_von(&self.tcx, &self.fns, m, &et)?;
+                    return self.fns.get(&voll).map(|s| s.ret.clone());
                 }
                 // HOOK sizeof: `size_of[T]()` ist immer `usize` — ohne das
                 // bekommt ein Literal daneben keinen Typ (`size_of[u8]() != 1`)

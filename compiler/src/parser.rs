@@ -131,7 +131,7 @@ impl<'a> Parser<'a> {
     /// Darf der Ausdruck mit dem aktuellen Token fortgesetzt werden?
     /// Ein Operator am ZEILENANFANG beendet ausserhalb von Klammern die
     /// Anweisung (SPEC §10: Semikolon optional, Zeilenende beendet sie).
-    fn cont(&self) -> bool {
+    pub(crate) fn cont(&self) -> bool {
         self.paren_depth > 0 || !self.at_line_start()
     }
 
@@ -559,6 +559,12 @@ impl<'a> Parser<'a> {
                     }
                     match self.ident("nach '.' beim feldzugriff") {
                         Some((name, sp)) => {
+                            // HOOK impl: `x.m(args)` ist ein Methodenaufruf,
+                            // kein Feldzugriff (impls.rs, Runde 45)
+                            if let Some(m) = crate::impls::hook_methodenaufruf(self, &e, &name, sp) {
+                                e = m;
+                                continue;
+                            }
                             let full = Parser::join(e.span, sp);
                             e = self.mk(full, ExprKind::Field(Box::new(e), name, sp));
                         }
@@ -1495,6 +1501,13 @@ impl<'a> Parser<'a> {
             }
             // HOOK gc: `gc class Name { … }` (gc.rs, SPEC 3.5.1)
             if crate::gc::hook_item(self) {
+                if self.pos == before {
+                    self.bump();
+                }
+                continue;
+            }
+            // HOOK impl: `impl Typ { fn … }` (impls.rs, Runde 45)
+            if crate::impls::hook_item(self, &mut prog) {
                 if self.pos == before {
                     self.bump();
                 }
