@@ -195,8 +195,7 @@ Honestly and completely (in detail in `ACCEPTANCE.md`):
   `u128`, `mul_wide`, any effect of `#[constant_time]`. Without `secret[T]`
   there is no type check for secret data. Verifiable:
   `firnc -o /tmp/x tests/neg/int_secret_not_implemented.fi` reports
-  `secret[T] and the constant-time primitives (SPEC 9) are not implemented`
-  with line/column.
+  `error: 'secret[T]' is not implemented in stage 0` with line/column.
   See `ACCEPTANCE.md` item 6.
 * **GC, `Rc`/`Gc`, DOM prototype, RSS soak test** -- not implemented. Verifiable:
   `tests/neg/int_gc_not_implemented.fi`.
