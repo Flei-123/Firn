@@ -88,7 +88,7 @@ echo
 echo "-- 1. Bau in drei Baustufen und Kurzlauf-Vergleich --"
 STUFEN=("release-fast:" "no-opt:--no-opt" "dev-fast:--opt-level=dev-fast")
 fehler=0
-for variante in gc leck; do
+for variante in gc leak; do
     stelle_um "lib/dom/soak_$variante.fi" "$ARBEIT/kurz_$variante.fi" 3000 5000 1000
     erwartet=""
     for st in "${STUFEN[@]}"; do
@@ -128,9 +128,9 @@ fi
 # ------------------------------------------------------------------ 2. Messlauf
 echo
 echo "-- 2. Dauerlauf --"
-for variante in gc leck; do
+for variante in gc leak; do
     grenze=$ZYKLEN
-    if [ "$variante" = leck ]; then
+    if [ "$variante" = leak ]; then
         # Gedeckelt: siehe Kopf der Datei. Diese Fassung leckt absichtlich.
         grenze=$LECK_ZYKLEN
     fi
@@ -141,7 +141,7 @@ for variante in gc leck; do
         exit 1
     fi
     start=$(date +%s)
-    if [ "$variante" = leck ]; then
+    if [ "$variante" = leak ]; then
         # Harte Bremse: der Adressraum ist begrenzt, damit ein Fehler in der
         # Gegenprobe niemals die Maschine mitnimmt.
         ( ulimit -v $((LECK_MB * 1024)); exec "$ARBEIT/soak_$variante" ) > "$AUS/messung-$variante.tsv"
@@ -163,7 +163,7 @@ echo
 echo "-- 3. Auswertung --"
 LECK_MINZ=$((LECK_ZYKLEN / 4))
 if [ "$LECK_MINZ" -gt "$MINZ" ]; then LECK_MINZ=$MINZ; fi
-python3 - "$AUS/messung-gc.tsv" "$AUS/messung-leck.tsv" "$MINZ" "$LECK_MINZ" <<'PYEOF'
+python3 - "$AUS/messung-gc.tsv" "$AUS/messung-leak.tsv" "$MINZ" "$LECK_MINZ" <<'PYEOF'
 import sys
 
 def lies(pfad):
@@ -258,7 +258,7 @@ rc=$?
 
 echo
 if [ $rc -eq 0 ]; then
-    echo "OK: DOM-Dauerlauf bestanden (Messreihen in $AUS/messung-gc.tsv und $AUS/messung-leck.tsv)."
+    echo "OK: DOM-Dauerlauf bestanden (Messreihen in $AUS/messung-gc.tsv und $AUS/messung-leak.tsv)."
 else
     echo "FEHLER: DOM-Dauerlauf NICHT bestanden."
 fi
