@@ -2093,3 +2093,91 @@ Runde 49, `842_gcmap_grund` tut es jetzt auch.
   `tests/modules/rc.fi` hat die erzeugte Datei verlaengert (jetzt `441:5`).
   Solche Positionen gehoeren in den Rumpf unter `lib/rc/parts/`, nicht in
   die erzeugte Datei.
+
+## 43. Runde 55: der Quelltext wird englisch (Etappe A)
+
+Justin will die Sprache allgemein zugaenglich, also faellt das Deutsche im
+Quelltext. Etappe A sind **Bezeichner, Meldungen und Dateinamen**; die
+Kommentare und die Dokumentation folgen in Etappe B.
+
+Umfang, vorher gemessen statt geschaetzt: **1 983 deutsche Bezeichner**,
+**1 036 Diagnose- und Ausgabetexte**, **237 umbenannte Dateien**, **718
+beruehrte Dateien**, 42 850 neue gegen 38 517 alte Zeilen.
+
+### Warum nicht von Hand und nicht rein mechanisch
+
+Beides waere falsch gewesen. Von Hand sind 1 983 Namen ein Tippfehlerfeld;
+rein mechanisch ist es ein Fehlergenerator, weil Wunschnamen kollidieren
+(`Art` -> `Kind`, aber `kind` gibt es schon) und weil mehrere deutsche Namen
+auf denselben englischen zeigen (`Entry`, `Store`, `First` — 34 Faelle).
+Der Weg war deshalb: eine **Morphemtabelle** mit 312 Wortteilen
+(`baum`->`tree`, `zeiger`->`ptr`, `laenge`->`length`), ein Generator, der
+jeden Namen zerlegt und einen Vorschlag macht, und eine **Konfliktliste** mit
+278 Namen, die von Hand entschieden wurden. Alles liegt in `tools/englisch/`.
+
+### Die Fallen, die dabei zuschlagen
+
+* **Byte-Felder mit fester Laenge.** Laufzeitnamen stehen im Compiler als
+  `[u8; N]`. Wer `"__faden_starten"` umbenennt und die `15` stehen laesst,
+  baut einen Fehler, der erst Wochen spaeter auffaellt. Gegenprobe:
+  `pruefe_laengen.py` haelt jede Laengenangabe gegen den Text daneben.
+* **Erzeugte Dateien.** `gctext.fi`, `lib/std/str|num.fi` und die rc/arc-Tests
+  werden erzeugt — dort wird der Erzeuger umgestellt und neu erzeugt, nicht
+  das Erzeugnis bearbeitet.
+* **GROSSGESCHRIEBENE Namen.** Die Morphemzerlegung zerlegte `ALL_CAPS` in
+  Einzelbuchstaben; erst mit gerichteter Regex fielen die restlichen 264
+  Namen (`KEIN`->`NONE`, `CHUNK_KOPF`->`CHUNK_HEADER`).
+* **Firn-Programme in Werkzeugskripten.** In `tools/thread/run.sh` und
+  Nachbarn stehen kleine Firn-Quellen als Text; die `sed`-Muster trafen sonst
+  ins Leere.
+* **Wortstellung.** firnc1 uebersetzte seine Manifest-Hinweise sinngemaess
+  statt wortgleich zu firnc0 — der Selbstvergleich haette es gemeldet, der
+  Worker hat es vorher gefunden.
+
+### Der Beweis, dass sich NUR Namen geaendert haben
+
+Testzahlen allein wuerden das nicht zeigen. Deshalb die Gegenprobe an einem
+grossen Programm: `lib/html/tokenize_main.fi`, einmal mit dem alten und
+einmal mit dem neuen Uebersetzer nach Assembler uebersetzt, ergibt **47 509
+Zeilen hier wie dort** und einen **gleichen Mnemonik-Strom von 42 820
+Befehlen**. Verschieden sind ausschliesslich Symbol-, Datei- und Textnamen.
+
+### Was die Gegenprobe uebersehen hat — und was daraus folgt
+
+`pruefe.py` sieht nur in die Bezeichner INNERHALB der Quellen. **Pfadnamen
+prueft niemand.** Uebersehen worden waren drei Testdateien
+(`841_gcvec_inkrementell.fi`, `iface_parameterzahl.fi`,
+`impl_argumentzahl.fi`) und vier Arbeitsordner (`.gc-mess-work`,
+`.baum-work`, `.selbst-work`, `messung-*.tsv`). Neue Gegenprobe:
+`pruefe_namen.py` haelt **jeden von git verwalteten Pfad** gegen die
+Morphemtabelle.
+
+Beim Nachziehen kam die naechste Lehre gleich hinterher: wer ein
+**Ignoriermuster umbenennt**, macht damit die alten Erzeugnisse sichtbar —
+`git add -A` nahm prompt `.baum-work/` und `.selbst-work/` mit ins Repo, und
+die frisch gebaute Gegenprobe meldete meinen eigenen Fehler in Abschnitt 21.
+Dazu zeigte die Ausnahme fuer den Boot-Vorspann nach dem Umzug noch auf
+`beispiele/kernel/start.s` statt `demos/kernel/start.s` — genau die Falle,
+die in Runde 52 den Kernel gekostet hat, diesmal vor dem Schaden gefunden.
+Nebenbei fiel auf, dass `.gc-meas-work/`, `.bench-ab/` und `.bench-instr/`
+ihre Messartefakte im Repo verwalteten, obwohl die Werkzeuge sie bei jedem
+Lauf neu anlegen (`gc_meas/run.sh` loescht seinen Arbeitsordner sogar als
+erste Handlung).
+
+### Abnahme im Hauptrepo, selbst gemessen
+
+`test.sh` **847/847** (846 plus die Gegenprobe als Abschnitt 21),
+Selbstvergleich **232 gleich / 0 abweichend / 0 fehlerhaft**, Fixpunkt
+zeichengleich (**557 673 Zeilen**, 3 286 024 Oktette in Stufe 2 wie Stufe 3),
+`CODEGEN FEHLT: 0`, Tokenizer **6810/6810**, Baumaufbau **150/150**,
+FREISTEHEND **41/41**, PAKETE **21/21**, FAEDEN bestanden.
+
+### Etappe B
+
+Bleiben **26 120 deutsche Kommentar- und Dokuzeilen** (docs 5 654, lib 5 627,
+Markdown in der Wurzel 4 018, tests 3 977, compiler/src 3 554, bin 2 312,
+tools 932). Massstab dafuer ist `pruefe_kommentare.py`; erkannt wird Prosa
+ueber deutsche Funktionswoerter, nicht ueber die Morphemtabelle — Fachwoerter
+heissen in beiden Sprachen gleich. Auflage fuer Etappe B: **die Zeilenzahl
+jeder Datei bleibt gleich**, sonst verschieben sich die Positionsangaben in
+den 134 Negativtests.
