@@ -1522,14 +1522,90 @@ fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
             Loc::Reg(dst) => e.line(&format!("mov {}, qword ptr [rbp+{}]", dst, von)),
         }
     }
-    for (bi, b) in f.blocks.iter().enumerate() {
+    // Runde 51: die Bloecke werden nicht mehr in ihrer FIR-Reihenfolge
+    // ausgegeben, sondern entlang von Spuren (siehe `emissionsreihenfolge`).
+    let ordnung = emissionsreihenfolge(f);
+    for (k, &bi) in ordnung.iter().enumerate() {
+        let b = &f.blocks[bi];
         e.raw(&format!("{}:", block_label(&f.name, b.id)));
         // Fallthrough: steht das Sprungziel unmittelbar dahinter, faellt der
         // Sprung weg (spart pro BrCond mit else==naechster Block ein `jmp`).
-        let next = f.blocks.get(bi + 1).map(|nb| nb.id);
+        let next = ordnung.get(k + 1).map(|&j| f.blocks[j].id);
         emit_block(e, &ra, b, next)?;
     }
     Ok(())
+}
+
+/// **Blocklayout entlang von Spuren** (Runde 51).
+///
+/// Bisher wurden die Bloecke in ihrer FIR-Nummerierung ausgegeben. Wo weder
+/// `then` noch `else` zufaellig der naechste Block war, standen hinter dem
+/// bedingten Sprung noch ein `jmp` — im Tokenizer an 641 Stellen, gemessen
+/// **28.414.304 von 775.569.867 Instruktionen (3,66 %)** allein fuer diese
+/// unbedingten Spruenge:
+///
+/// ```text
+/// cmp  -0x18(%rbp),%r8
+/// jae  40dbd4          ; then
+/// jmp  40dbe0          ; else — haette Fallthrough sein koennen
+/// ```
+///
+/// Das Verfahren ist die uebliche gierige Spurbildung: ab `bb0` wird dem
+/// bevorzugten Nachfolger gefolgt, solange der noch frei ist; reisst die Spur
+/// ab, geht es beim kleinsten noch nicht platzierten Block weiter. Bevorzugt
+/// wird der `else`-Zweig — `emit_block` dreht die Bedingung selbst um, wenn
+/// stattdessen `then` folgt, es geht also kein Fall verloren.
+///
+/// **Warum das nichts kaputt machen kann.** Die Reihenfolge betrifft
+/// ausschliesslich die AUSGABE. Jeder Block hat einen expliziten Terminator,
+/// und `emit_block` laesst einen Sprung nur dann weg, wenn sein Ziel wirklich
+/// unmittelbar folgt (`next`). Lebendigkeitsanalyse, Intervalle und
+/// Registerwahl arbeiten weiter auf der FIR-Reihenfolge und werden hier nicht
+/// angefasst — ein Wert liegt nach wie vor ueber seine ganze Lebensdauer am
+/// selben Ort.
+///
+/// Abschaltbar mit `FIRN_NO_LAYOUT=1` (Fehlersuche).
+fn emissionsreihenfolge(f: &Func) -> Vec<usize> {
+    let n = f.blocks.len();
+    if std::env::var_os("FIRN_NO_LAYOUT").is_some() {
+        return (0..n).collect();
+    }
+    let mut platziert = vec![false; n];
+    let mut aus: Vec<usize> = Vec::with_capacity(n);
+    let mut frei = 0usize;
+    let mut b = 0usize;
+    while aus.len() < n {
+        // Spur legen, solange der bevorzugte Nachfolger noch frei ist.
+        loop {
+            platziert[b] = true;
+            aus.push(b);
+            let w = match &f.blocks[b].term {
+                Term::Br(t) => Some(*t as usize),
+                Term::BrCond { then_bb, else_bb, .. } => {
+                    let el = *else_bb as usize;
+                    if el < n && !platziert[el] {
+                        Some(el)
+                    } else {
+                        Some(*then_bb as usize)
+                    }
+                }
+                Term::Switch { default, .. } => Some(*default as usize),
+                Term::Ret(_) | Term::Unset => None,
+            };
+            match w {
+                Some(t) if t < n && !platziert[t] => b = t,
+                _ => break,
+            }
+        }
+        while frei < n && platziert[frei] {
+            frei += 1;
+        }
+        if frei >= n {
+            break;
+        }
+        b = frei;
+    }
+    aus
 }
 
 /// Ist `s` ein 64-Bit-Maschinenregistername (und damit ein Operand, dessen
