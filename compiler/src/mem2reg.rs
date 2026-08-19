@@ -30,9 +30,18 @@
 use crate::fir::{BinOp, Func, Inst, Op, Term, Val};
 use std::collections::HashMap;
 
-/// Instruktionen, die der Optimierer als unantastbar behandelt (SPEC §9).
+/// Instruktionen, die der Optimierer als unantastbar behandelt (SPEC §9 und
+/// — seit Runde 52 — SPEC §2: Inline-Assembler und MMIO sind `volatile`).
 pub(crate) fn is_untouchable(op: &Op) -> bool {
-    matches!(op, Op::Select { .. } | Op::Barrier { .. } | Op::SecureZero { .. })
+    matches!(
+        op,
+        Op::Select { .. }
+            | Op::Barrier { .. }
+            | Op::SecureZero { .. }
+            | Op::Asm { .. }
+            | Op::MmioLoad { .. }
+            | Op::MmioStore { .. }
+    )
 }
 
 // ------------------------------------------------------------- Hilfsmittel ---
@@ -159,6 +168,9 @@ pub(crate) fn replace_uses(f: &mut Func, map: &HashMap<Val, Val>) -> usize {
                     rep(val, &mut n);
                 }
                 Op::Select { .. } | Op::Barrier { .. } | Op::SecureZero { .. } => {}
+                // RUNDE 52: volatile — die Operanden werden NICHT
+                // umgeschrieben (wie select/barrier/secure_zero).
+                Op::Asm { .. } | Op::MmioLoad { .. } | Op::MmioStore { .. } => {}
             }
         }
         match &mut b.term {
@@ -339,6 +351,12 @@ fn clobbers_memory(op: &Op) -> bool {
             | Op::Syscall { .. }
             | Op::CopyMem { .. }
             | Op::AtomicAdd { .. }
+            // RUNDE 52: der Inline-Assembler kann jeden Speicher anfassen
+            // (`clobber("memory")` ist die Regel, nicht die Ausnahme), und ein
+            // MMIO-Schreibzugriff ist per Definition ein Seiteneffekt.
+            | Op::Asm { .. }
+            | Op::MmioLoad { .. }
+            | Op::MmioStore { .. }
             | Op::SecureZero { .. }
     )
 }

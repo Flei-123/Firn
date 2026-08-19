@@ -55,6 +55,13 @@ pub(crate) fn size_word(bits: u32) -> &'static str {
     }
 }
 
+/// Register, die eine `#[interrupt]`-Funktion rettet — alle Universalregister
+/// ausser `rsp` (der Prozessor) und `rbp` (der gewoehnliche Prolog).
+pub(crate) const INT_SAVE: &[&str] = &[
+    "rax", "rcx", "rdx", "rbx", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12",
+    "r13", "r14", "r15",
+];
+
 fn align_up(x: u64, a: u64) -> u64 {
     if a <= 1 {
         x
@@ -143,6 +150,12 @@ pub fn emit(m: &Module) -> Result<String, String> {
         e.out.push_str(&files);
     }
     e.raw(".text");
+    // RUNDE 52 (SPEC §2): im Profil `kernel` gibt es KEINEN Einstiegspunkt und
+    // keinen Laufzeitvorspann. Das Ergebnis ist eine Objektdatei, die ein
+    // Bootlader bzw. ein Linkerskript einbindet — `_start`, das Aufsetzen von
+    // `rsp` und der `exit`-Systemaufruf waeren dort falsch.
+    let freistehend = crate::profil::ist_kernel();
+    if !freistehend {
     e.raw(".globl _start");
     e.raw("_start:");
     e.line("xor rbp, rbp");
@@ -160,8 +173,9 @@ pub fn emit(m: &Module) -> Result<String, String> {
     e.line("mov eax, 60");
     e.line("syscall");
     e.line("hlt");
+    }
 
-    if !m.funcs.iter().any(|f| f.name == "main") {
+    if !freistehend && !m.funcs.iter().any(|f| f.name == "main") {
         return Err("kein Einstiegspunkt: 'fn main() -> i32' fehlt".to_string());
     }
 
@@ -211,6 +225,16 @@ fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
     e.raw(&format!("{}:", label(&f.name)));
     if let Some((file, line)) = dwarf::fn_line(&f.name) {
         e.line(&format!(".loc {} {} 0", file + 1, line));
+    }
+    // RUNDE 52 (SPEC §2): `#[interrupt]` — eigene Aufrufkonvention. Der
+    // Prozessor hat beim Einsprung NICHTS gerettet ausser dem
+    // Unterbrechungsrahmen (ss:rsp, rflags, cs:rip); alles andere gehoert
+    // dem unterbrochenen Faden und muss hier hin und zurueck.
+    if f.interrupt {
+        e.raw("    # interrupt: alle universalregister retten");
+        for r in INT_SAVE {
+            e.line(&format!("push {}", r));
+        }
     }
     e.line("push rbp");
     e.line("mov rbp, rsp");
@@ -274,12 +298,22 @@ fn emit_block(e: &mut Emitter, f: &Func, fr: &Frame, b: &Block) -> Result<(), St
         Term::Ret(v) => {
             if let Some(v) = v {
                 e.line(&format!("mov rax, qword ptr [rbp-{}]", fr.slot[*v as usize]));
-            } else {
+            } else if !f.interrupt {
                 e.line("xor eax, eax");
             }
             e.line("mov rsp, rbp");
             e.line("pop rbp");
-            e.line("ret");
+            if f.interrupt {
+                // Rueckwaerts wiederherstellen, dann `iretq`: nur diese
+                // Instruktion stellt rflags, cs und rsp des unterbrochenen
+                // Fadens wieder her — `ret` wuerde den Rahmen verwuersteln.
+                for r in INT_SAVE.iter().rev() {
+                    e.line(&format!("pop {}", r));
+                }
+                e.line("iretq");
+            } else {
+                e.line("ret");
+            }
         }
         Term::Unset => {
             return Err(format!(
@@ -621,6 +655,50 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
             e.line(&format!("mov rcx, {}", size));
             e.line("cld");
             e.line("rep movsb");
+        }
+        // RUNDE 52 (kern.rs, SPEC §2): Inline-Assembler. IMMER volatile —
+        // die Zeilen stehen genau einmal und genau hier.
+        Op::Asm { vorlage, aus, ein_regs, ein, clobber } => {
+            e.raw("    # asm (volatile): darf weder entfernt noch verschoben werden");
+            for (r, v) in ein_regs.iter().zip(ein.iter()) {
+                let stamm = crate::kern::stamm(r)
+                    .ok_or_else(|| format!("unbekanntes asm-register '{}'", r))?;
+                load_full(e, fr, stamm, *v);
+            }
+            for zeile in vorlage.split('\n') {
+                e.line(zeile);
+            }
+            if let Some(r) = aus {
+                let stamm = crate::kern::stamm(r)
+                    .ok_or_else(|| format!("unbekanntes asm-register '{}'", r))?;
+                let d = i.dst.ok_or("interner Fehler: asm mit out ohne Ziel")?;
+                store_dst(e, fr, d, stamm);
+            }
+            if !clobber.is_empty() {
+                e.raw(&format!("    # asm clobber: {}", clobber.join(", ")));
+            }
+        }
+        // RUNDE 52: MMIO — genau EIN Speicherzugriff je Quellzeile.
+        Op::MmioLoad { addr } => {
+            let d = i.dst.ok_or("interner Fehler: mmio_load ohne Ziel")?;
+            load_full(e, fr, "rcx", *addr);
+            let bits = ty.bits();
+            match bits {
+                8 | 16 => e.line(&format!("movzx eax, {} [rcx]", size_word(bits))),
+                32 => e.line("mov eax, dword ptr [rcx]"),
+                _ => e.line("mov rax, qword ptr [rcx]"),
+            }
+            store_dst(e, fr, d, "rax");
+        }
+        Op::MmioStore { addr, val } => {
+            load_full(e, fr, "rcx", *addr);
+            load_full(e, fr, "rax", *val);
+            let bits = ty.bits();
+            e.line(&format!(
+                "mov {} [rcx], {}",
+                size_word(bits),
+                reg("rax", bits)
+            ));
         }
     }
     let _ = f;

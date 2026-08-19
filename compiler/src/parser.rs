@@ -662,6 +662,12 @@ impl<'a> Parser<'a> {
         if let Some(e) = crate::sizeof::hook_primary(self) {
             return e;
         }
+        // HOOK kern: `asm("…", in("dx") p, out("rax"), clobber("memory"))`
+        // (kern.rs, Runde 52). Nur wenn auf `asm` unmittelbar `(` und ein
+        // Zeichenkettenliteral folgen — sonst bleibt `asm` ein Bezeichner.
+        if let Some(e) = crate::kern::hook_primary(self) {
+            return e;
+        }
         // HOOK gc: `gc C{…}`, `gc_null[C]()`, `weak_null[C]()` (gc.rs)
         if let Some(e) = crate::gc::hook_primary(self) {
             return e;
