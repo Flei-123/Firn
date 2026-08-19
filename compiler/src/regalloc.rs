@@ -1019,6 +1019,87 @@ struct Ra<'a> {
     /// Vergleichsergebnis GENAU EINMAL gelesen wird (naemlich vom Terminator),
     /// darf das `setcc` entfallen.
     gelesen: Vec<u32>,
+    /// Adressen `base + k`, deren einzige Verwendung der UNMITTELBAR folgende
+    /// Speicherzugriff ist: ptradd -> (Basisregister, Versatz).
+    versatz: HashMap<Val, (&'static str, i64)>,
+}
+
+/// Adressrechnungen, die in den Versatz des Speicherzugriffs wandern duerfen.
+///
+/// Erzeugt wird heute
+///     lea r9, [r8+168]
+///     mov r9, qword ptr [r9]
+/// obwohl x86-64 den Versatz selbst kann:
+///     mov r9, qword ptr [r8+168]
+///
+/// Die Bedingungen sind absichtlich eng — jede Lockerung verlaengert die
+/// Lebensspanne der BASIS, und genau diese Klasse hat in Runde 40/41 den
+/// Miscompile erzeugt (docs/RUNDE41.md):
+///  * `ptradd` mit Sofortkonstante 0 <= k <= i32::MAX,
+///  * das Ergebnis wird GENAU EINMAL gelesen (Terminatoren mitgezaehlt),
+///  * dieser eine Leser ist die UNMITTELBAR folgende Instruktion desselben
+///    Blocks und ein `load`/`store` ueber genau diese Adresse,
+///  * die Basis liegt in einem Register und ist keine Rahmenadresse.
+///
+/// Damit verschiebt sich der Lesezeitpunkt der Basis um GENAU eine
+/// Instruktion. Dazwischen liegt nichts; die einzigen Register, die an der
+/// neuen Stelle geschrieben werden, sind das Ziel des Zugriffs (das seine
+/// Adresse zuerst liest) und die Heimat des uebersprungenen `ptradd`, die gar
+/// nicht mehr beschrieben wird. Ein noch gebrauchter Wert kann also nicht
+/// verloren gehen.
+///
+/// Abschaltbar mit FIRN_NO_FALTUNG=1 (Fehlersuche).
+fn faltbare_versaetze(
+    f: &Func,
+    a: &Alloc,
+    gelesen: &[u32],
+) -> HashMap<Val, (&'static str, i64)> {
+    let mut aus: HashMap<Val, (&'static str, i64)> = HashMap::new();
+    if std::env::var_os("FIRN_NO_FALTUNG").is_some() {
+        return aus;
+    }
+    for b in &f.blocks {
+        for (idx, i) in b.insts.iter().enumerate() {
+            let (d, base, off) = match (i.dst, &i.op) {
+                (Some(d), Op::PtrAdd { base, off }) => (d, *base, *off),
+                _ => continue,
+            };
+            if gelesen.get(d as usize).copied() != Some(1) {
+                continue;
+            }
+            if a.alias.contains_key(&d) || a.alias.contains_key(&base) {
+                continue;
+            }
+            if a.frame_addr.contains_key(&d) || a.frame_addr.contains_key(&base) {
+                continue;
+            }
+            if a.cell(d).is_some() || a.cell(base).is_some() {
+                continue;
+            }
+            let k = match a.imm(off) {
+                Some(k) if k >= 0 && k <= i32::MAX as i64 => k,
+                _ => continue,
+            };
+            let br = match a.ort(base) {
+                Loc::Reg(r) => r,
+                Loc::Slot(_) => continue,
+            };
+            let n = match b.insts.get(idx + 1) {
+                Some(n) => n,
+                None => continue,
+            };
+            let passt = match &n.op {
+                Op::Load { addr } => *addr == d,
+                Op::Store { addr, val } => *addr == d && *val != d,
+                _ => false,
+            };
+            if !passt {
+                continue;
+            }
+            aus.insert(d, (br, k));
+        }
+    }
+    aus
 }
 
 /// Zaehlt je Wert, wie oft er als Operand vorkommt (Instruktionen + Terminatoren).
@@ -1392,7 +1473,9 @@ fn unsupported_grund(f: &Func) -> Option<String> {
 }
 
 fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
-    let ra = Ra { f, a, gelesen: zaehle_lesezugriffe(f) };
+    let gelesen = zaehle_lesezugriffe(f);
+    let versatz = faltbare_versaetze(f, a, &gelesen);
+    let ra = Ra { f, a, gelesen, versatz };
     e.raw("");
     // Linker-Symbol ueber die eine Stelle (codegen_x86::label -> modules::symbol)
     e.raw(&format!(".globl {}", label(&f.name)));
@@ -1819,10 +1902,11 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
                     return Ok(());
                 }
             } else {
-                let mem = match (ra.a.frame_addr.get(addr), ra.a.ort(*addr)) {
-                    (Some(off), _) => format!("[rbp-{}]", off),
-                    (None, Loc::Reg(r)) => format!("[{}]", r),
-                    (None, Loc::Slot(_)) => {
+                let mem = match (ra.versatz.get(addr), ra.a.frame_addr.get(addr), ra.a.ort(*addr)) {
+                    (Some((r, k)), _, _) => format!("[{}+{}]", r, k),
+                    (None, Some(off), _) => format!("[rbp-{}]", off),
+                    (None, None, Loc::Reg(r)) => format!("[{}]", r),
+                    (None, None, Loc::Slot(_)) => {
                         ra.load_full(e, "rcx", *addr);
                         "[rcx]".to_string()
                     }
@@ -1858,10 +1942,11 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
                     e.line(&format!("mov {}, {}", r, o));
                 }
             } else {
-                let mem = match (ra.a.frame_addr.get(addr), ra.a.ort(*addr)) {
-                    (Some(off), _) => format!("[rbp-{}]", off),
-                    (None, Loc::Reg(r)) => format!("[{}]", r),
-                    (None, Loc::Slot(_)) => {
+                let mem = match (ra.versatz.get(addr), ra.a.frame_addr.get(addr), ra.a.ort(*addr)) {
+                    (Some((r, k)), _, _) => format!("[{}+{}]", r, k),
+                    (None, Some(off), _) => format!("[rbp-{}]", off),
+                    (None, None, Loc::Reg(r)) => format!("[{}]", r),
+                    (None, None, Loc::Slot(_)) => {
                         ra.load_full(e, "rcx", *addr);
                         "[rcx]".to_string()
                     }
@@ -1877,6 +1962,11 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
         }
         Op::PtrAdd { base, off } => {
             let d = i.dst.ok_or("interner Fehler: ptradd ohne Ziel")?;
+            if ra.versatz.contains_key(&d) {
+                // Der Versatz steht im folgenden Speicherzugriff; die Adresse
+                // selbst wird nirgends sonst gelesen und braucht kein `lea`.
+                return Ok(());
+            }
             // `lea` liest BEIDE Operanden, bevor es das Ziel schreibt — eine
             // Kollision zwischen Ziel- und Offsetregister ist dort also
             // unschaedlich. Nur der `mov`+`add`-Weg braucht den Umweg ueber
