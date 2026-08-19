@@ -18,6 +18,7 @@ mod ct;
 mod diag;
 mod dwarf;
 mod errors;
+mod faedeln;
 mod fir;
 mod gc;
 mod gc_lower;
