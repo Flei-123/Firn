@@ -25,7 +25,7 @@ export FIRNLIB="$(pwd)/lib"
 
 FIRNC=compiler/target/release/firnc
 FC1=${FIRNC1:-./.firnc1}
-WORK=.selbst-work
+WORK=.self-work
 mkdir -p "$WORK"
 
 # LEKTION (Runde 46, zum vierten Mal dieselbe Falle): NIE ein Binary

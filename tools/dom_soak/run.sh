@@ -144,18 +144,18 @@ for variante in gc leak; do
     if [ "$variante" = leak ]; then
         # Harte Bremse: der Adressraum ist begrenzt, damit ein Fehler in der
         # Gegenprobe niemals die Maschine mitnimmt.
-        ( ulimit -v $((LECK_MB * 1024)); exec "$ARBEIT/soak_$variante" ) > "$AUS/messung-$variante.tsv"
+        ( ulimit -v $((LECK_MB * 1024)); exec "$ARBEIT/soak_$variante" ) > "$AUS/measurement-$variante.tsv"
     else
-        "$ARBEIT/soak_$variante" > "$AUS/messung-$variante.tsv"
+        "$ARBEIT/soak_$variante" > "$AUS/measurement-$variante.tsv"
     fi
     rc=$?
     dauer=$(( $(date +%s) - start ))
     if [ $rc -ne 0 ]; then
         echo "   FEHLER: Lauf $variante endete mit $rc:"
-        grep '^# fehler' "$AUS/messung-$variante.tsv" | head -2
+        grep '^# fehler' "$AUS/measurement-$variante.tsv" | head -2
         exit 1
     fi
-    echo "   $variante: $(grep '^# fertig' "$AUS/messung-$variante.tsv") (${dauer}s Wanduhr)"
+    echo "   $variante: $(grep '^# fertig' "$AUS/measurement-$variante.tsv") (${dauer}s Wanduhr)"
 done
 
 # ---------------------------------------------------------------- 3. Auswertung
@@ -163,7 +163,7 @@ echo
 echo "-- 3. Auswertung --"
 LECK_MINZ=$((LECK_ZYKLEN / 4))
 if [ "$LECK_MINZ" -gt "$MINZ" ]; then LECK_MINZ=$MINZ; fi
-python3 - "$AUS/messung-gc.tsv" "$AUS/messung-leak.tsv" "$MINZ" "$LECK_MINZ" <<'PYEOF'
+python3 - "$AUS/measurement-gc.tsv" "$AUS/measurement-leak.tsv" "$MINZ" "$LECK_MINZ" <<'PYEOF'
 import sys
 
 def lies(pfad):
@@ -258,7 +258,7 @@ rc=$?
 
 echo
 if [ $rc -eq 0 ]; then
-    echo "OK: DOM-Dauerlauf bestanden (Messreihen in $AUS/messung-gc.tsv und $AUS/messung-leak.tsv)."
+    echo "OK: DOM-Dauerlauf bestanden (Messreihen in $AUS/measurement-gc.tsv und $AUS/measurement-leak.tsv)."
 else
     echo "FEHLER: DOM-Dauerlauf NICHT bestanden."
 fi
