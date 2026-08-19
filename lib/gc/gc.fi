@@ -108,6 +108,32 @@ const S_VOLL: u64 = 440
 // stark, um Scheibengroessen zu vergleichen. Hier zaehlt jede Scheibe.
 const S_HIST: u64 = 448
 const HIST_FAECHER: u64 = 16
+// Runde 44: acht Typen statt sieben. Typ 7 ist die GANZE Unterbrechung an
+// einer Allokationsstelle (Start + Markieren + Fegen + Ende, soweit sie in
+// DEMSELBEN Aufruf anfallen) — die Zahl, die ein Bild wirklich sieht. Die
+// Typen 0..5 messen nur einzelne Abschnitte und untertreiben damit, sobald
+// ein Aufruf mehrere Abschnitte enthaelt. S_HIST belegt 8*16*8 = 1024 Byte.
+const HIST_TYPEN: u64 = 8
+// Laengste ganze Unterbrechung (Typ 7).
+const S_STOPMAX: u64 = 1472
+// Diagnose der Runde 44: WO entsteht Heapwachstum und wie viele Scheiben
+// laufen ueberhaupt. Der Zustandsblock ist 4096 Byte gross (compiler/src/gc.rs,
+// STATE_SIZE), die Registerrettung liegt ab 3968 — ab 1344 ist Platz.
+const S_D_CN_RUHE: u64 = 1480
+const S_D_CN_MARK: u64 = 1488
+const S_D_CN_SWEEP: u64 = 1496
+const S_D_SCH_MARK: u64 = 1504
+const S_D_SCH_SWEEP: u64 = 1512
+const S_D_GRAU: u64 = 1520
+const S_D_ALLOK: u64 = 1528
+// Runde 44: Umschaltschwelle zur Laufzeit (Voreinstellung INKR_AB). So laesst
+// sich der atomare gegen den inkrementellen Pfad IM SELBEN PROZESS und mit
+// BITGLEICHEM Code messen — ohne Codelayout-Unterschiede, die bei Messungen
+// im Prozentbereich sonst alles ueberdecken.
+const S_INKRAB: u64 = 1536
+// Fegen: je Groessenklasse ein Merker, ob ihre Freiliste in DIESEM Fegedurchlauf
+// schon geleert wurde (13 Klassen, 1544..1648).
+const S_SWKL: u64 = 1544
 // Scheibengroessen: so viele Objekte pro Allokation tracen bzw. Chunks fegen.
 const SCHEIBE_TRACE: u64 = 512
 // Runde 41: Zeitbudget einer Markierscheibe (ns). Die Objektzahl allein
@@ -117,13 +143,34 @@ const SCHEIBE_TRACE: u64 = 512
 // gelesen (clock_gettime kostet selbst ~25 ns).
 const ZEIT_BUDGET_NS: u64 = 100000
 const ZEIT_PROBE: u64 = 16
+// Chunks je Zeitprobe im Fegen (Runde 44). Das Fegen haengt seit Runde 44
+// wie das Markieren an ZEIT_BUDGET_NS; diese Zahl sagt nur, nach wie vielen
+// Chunks die Uhr befragt wird.
 const SCHEIBE_SWEEP: u64 = 2
-// Unterhalb dieser Heapgroesse bleibt der Zyklus ATOMAR (ein anhaltender
-// Lauf ist dort sowieso unter einer Millisekunde, und die laufenden Kosten
-// der Scheiben — graue Allokation, aktive Barriere — waeren reiner Verlust).
-// Darueber schaltet der Sammler auf den inkrementellen Zyklus: dort waechst
-// die Pause eines Vollzyklus mit dem Heap, die der Scheiben nicht.
-const INKR_AB: u64 = 8388608
+// Voreinstellung der Umschaltschwelle atomar/inkrementell in Heapbytes.
+// Zur Laufzeit mit gc_set_inkr_ab() stellbar.
+//
+// RUNDE 44 — WARUM JETZT 0 (immer inkrementell):
+// Bis Runde 43 stand hier 8 MiB. Unterhalb der Schwelle lief ein ATOMARER
+// Vollzyklus, und in der AUFBAUPHASE (Heap waechst von 0 auf seine Groesse)
+// waren das gemessen drei Stop-the-World-Laeufe von 0,88 / 2,90 / 11,81 ms
+// (tools/gc_mess/aufbau.fi, 120.000 lebende Knoten). Fuer ein 16-ms-Bild ist
+// der letzte Wert allein schon zu viel.
+//
+// Die Begruendung der Schwelle (Runde 38: rein inkrementell kostete 8 bis
+// 26 % Durchsatz bei kleinem Heap) war RICHTIG GEMESSEN, aber die Ursache
+// lag nicht im inkrementellen Verfahren, sondern in __gc_sweep_init(): es
+// leerte ALLE Freilisten auf einen Schlag, und weil das Fegen in Scheiben
+// laeuft, fiel danach jede Allokation bis zum Ende des Fegens auf eine leere
+// Liste und musste einen frischen Chunk mmapen. Gemessen: 113 von 119 neuen
+// Chunks entstanden im Fegen, der Heap verdoppelte sich (1,5 -> 3,7 MiB),
+// und weil __gc_block_von die Chunkliste linear absucht, wurde damit jede
+// Markierung teurer. Seit die Freilisten klassenweise erst beim ersten Chunk
+// ihrer Klasse geleert werden und das Fegen ein Zeitbudget hat, bleibt der
+// Heap gleich gross wie im atomaren Pfad, und der inkrementelle Zyklus
+// kostet bei 2000 lebenden Knoten noch 2 % Durchsatz (A/B im selben Prozess,
+// tools/gc_mess/ab.fi) statt 26 %.
+const INKR_AB: u64 = 0
 
 const KOPF: u64 = 16
 const CHUNK_KOPF: u64 = 64
@@ -262,6 +309,20 @@ fn __gc_stapel_boden() -> u64 {
 
 // ------------------------------------------------------------ Groessenklassen
 
+fn __gc_diag_inc(off: u64) {
+    let st: u64 = __gc_state() as u64
+    __gc_st64(st + off, __gc_ld64(st + off) + 1)
+}
+
+// Diagnose 0..6: neue Chunks in Ruhe/Mark/Sweep, Mark-Scheiben, Sweep-Scheiben,
+// graue (waehrend eines Zyklus getaetigte) Allokationen, Allokationen gesamt.
+fn gc_diag(i: u64) -> u64 {
+    if i > 6 {
+        return 0
+    }
+    return __gc_ld64(__gc_state() as u64 + S_D_CN_RUHE + i * 8)
+}
+
 fn __gc_klassen_bytes(k: u64) -> u64 {
     if k == 0 {
         return 32
@@ -354,6 +415,16 @@ fn __gc_chunk_neu(klasse: u64, nutz: u64) -> u64 {
             __gc_st64(b + KOPF, __gc_ld64(kopf))
             __gc_st64(kopf, b)
             i = i + 1
+        }
+    }
+    let ph: u64 = __gc_ld64(st + S_PHASE)
+    if ph == 0 {
+        __gc_diag_inc(S_D_CN_RUHE)
+    } else {
+        if ph == 1 {
+            __gc_diag_inc(S_D_CN_MARK)
+        } else {
+            __gc_diag_inc(S_D_CN_SWEEP)
         }
     }
     return p
@@ -501,9 +572,26 @@ fn __gc_scan(lo: u64, hi: u64) {
 // Beginn des gestueckelten Fegens: Freilisten leeren, Merker setzen.
 fn __gc_sweep_init() {
     let st: u64 = __gc_state() as u64
+    // Runde 44: die Freilisten werden hier NICHT mehr geleert, sondern erst,
+    // wenn der erste Chunk der jeweiligen Klasse gefegt wird (S_SWKL).
+    //
+    // WARUM: das Fegen laeuft in Scheiben, zwischen den Scheiben alloziert
+    // das Programm weiter. Wurden alle Freilisten auf einen Schlag geleert,
+    // fiel JEDE Allokation bis zum Ende des Fegens auf eine leere Liste und
+    // musste einen frischen Chunk mmapen. Gemessen (Runde 44, Kleinlauf mit
+    // 2000 lebenden Knoten, 200.000 Runden): 113 von 119 neuen Chunks
+    // entstanden waehrend des Fegens, der Heap verdoppelte sich von 1,5 auf
+    // 3,7 MiB und die Sammelzeit stieg von 23 auf 61 ms. Genau das war der
+    // Grund, warum der inkrementelle Zyklus bei kleinem Heap teuer aussah.
+    //
+    // Sicher ist das, weil die Liste beim ERSTEN Chunk ihrer Klasse geleert
+    // wird: danach enthaelt sie nur noch Bloecke bereits gefegter Chunks
+    // derselben Klasse. Ein Block eines noch nicht gefegten Chunks kann
+    // nicht doppelt vergeben werden — er faellt beim Leeren aus der Liste
+    // und kommt erst wieder hinein, wenn sein Chunk gefegt ist.
     var k: u64 = 0
     while k < KLASSEN {
-        __gc_st64(st + S_FREI + k * 8, 0)
+        __gc_st64(st + S_SWKL + k * 8, 0)
         k = k + 1
     }
     __gc_st64(st + S_SWC, __gc_ld64(st + S_CHUNKS))
@@ -514,21 +602,27 @@ fn __gc_sweep_init() {
 
 // Eine Fegescheibe: hoechstens SCHEIBE_SWEEP Chunks ab dem Merker.
 // Rueckgabe 1 = fertig (Merker am Ende), 0 = es gibt noch Chunks.
-fn __gc_sweep_schritt() -> u64 {
+fn __gc_sweep_schritt(t0: u64) -> u64 {
     let st: u64 = __gc_state() as u64
     let weiss: u32 = __gc_ld64(st + S_PAR) as u32
     var lebende: u64 = __gc_ld64(st + S_SWLEB)
     var lebbytes: u64 = __gc_ld64(st + S_SWLEBB)
     var vorher: u64 = __gc_ld64(st + S_SWV)
     var c: u64 = __gc_ld64(st + S_SWC)
-    var budget: u64 = SCHEIBE_SWEEP
-    while c != 0 && budget > 0 {
-        budget = budget - 1
+    var probe: u64 = SCHEIBE_SWEEP
+    while c != 0 {
         let naechster: u64 = __gc_ld64(c)
         let daten: u64 = c + CHUNK_KOPF
         let block: u64 = __gc_ld64(c + 16)
         let anzahl: u64 = __gc_ld64(c + 24)
         let klasse: u64 = __gc_ld64(c + 40)
+        // Erster Chunk dieser Klasse in diesem Durchlauf: Freiliste leeren.
+        if klasse < KLASSEN {
+            if __gc_ld64(st + S_SWKL + klasse * 8) == 0 {
+                __gc_st64(st + S_SWKL + klasse * 8, 1)
+                __gc_st64(st + S_FREI + klasse * 8, 0)
+            }
+        }
         var tot: u64 = 0
         var i: u64 = 0
         // Listenkopf VOR diesem Chunk merken: die toten Bloecke werden
@@ -591,6 +685,20 @@ fn __gc_sweep_schritt() -> u64 {
             vorher = c
         }
         c = naechster
+        // Runde 44: das Fegen haengt nicht mehr an einer festen Chunkzahl,
+        // sondern am selben Zeitbudget wie das Markieren (Runde 41). Ein
+        // kleiner Heap wird damit in EINER Scheibe fertig — und nur dann
+        // sieht die ausloesende Allokation wieder volle Freilisten.
+        // t0 == 0 heisst: kein Zeitlimit (atomarer Vollsweep).
+        probe = probe - 1
+        if probe == 0 {
+            probe = SCHEIBE_SWEEP
+            if t0 != 0 {
+                if __gc_jetzt_ns() - t0 >= ZEIT_BUDGET_NS {
+                    break
+                }
+            }
+        }
     }
     __gc_st64(st + S_SWC, c)
     __gc_st64(st + S_SWV, vorher)
@@ -605,7 +713,7 @@ fn __gc_sweep_schritt() -> u64 {
 // Der ganze Sweep auf einmal (manueller Vollzyklus, Erschoepfungs-Fallback).
 fn __gc_sweep() {
     __gc_sweep_init()
-    while __gc_sweep_schritt() == 0 {
+    while __gc_sweep_schritt(0) == 0 {
     }
     let st: u64 = __gc_state() as u64
     __gc_st64(st + S_LEBENDE, __gc_ld64(st + S_SWLEB))
@@ -721,8 +829,17 @@ fn __gc_hist_buche(dauer: u64, typ: u64) {
     }
     let f: u64 = st + S_HIST + (typ * HIST_FAECHER + i) * 8
     __gc_st64(f, __gc_ld64(f) + 1)
-    let g2: u64 = st + S_HIST + (6 * HIST_FAECHER + i) * 8
-    __gc_st64(g2, __gc_ld64(g2) + 1)
+    // Typ 6 ist die Summe der SCHEIBEN; die ganze Unterbrechung (Typ 7)
+    // enthaelt dieselbe Zeit noch einmal und darf dort nicht mitzaehlen.
+    if typ < 6 {
+        let g2: u64 = st + S_HIST + (6 * HIST_FAECHER + i) * 8
+        __gc_st64(g2, __gc_ld64(g2) + 1)
+    }
+    if typ == 7 {
+        if dauer > __gc_ld64(st + S_STOPMAX) {
+            __gc_st64(st + S_STOPMAX, dauer)
+        }
+    }
 }
 
 // Diagnose: wie viele EINZELNE Scheiben fielen in Fach `i` (siehe S_HIST).
@@ -733,7 +850,7 @@ fn gc_hist(typ: u64, i: u64) -> u64 {
     if i >= HIST_FAECHER {
         return 0
     }
-    if typ > 6 {
+    if typ >= HIST_TYPEN {
         return 0
     }
     return __gc_ld64(__gc_state() as u64 + S_HIST + (typ * HIST_FAECHER + i) * 8)
@@ -743,10 +860,16 @@ fn gc_hist(typ: u64, i: u64) -> u64 {
 fn gc_hist_reset() {
     let st: u64 = __gc_state() as u64
     var i: u64 = 0
-    while i < HIST_FAECHER * 7 {
+    while i < HIST_FAECHER * HIST_TYPEN {
         __gc_st64(st + S_HIST + i * 8, 0)
         i = i + 1
     }
+    __gc_st64(st + S_STOPMAX, 0)
+}
+
+// Laengste GANZE Unterbrechung an einer Allokationsstelle (Typ 7).
+fn gc_stop_max() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_STOPMAX)
 }
 
 fn __gc_pause_buche(t0: u64, typ: u64) {
@@ -847,6 +970,7 @@ fn __gc_zyklus_schritt() {
     let phase: u64 = __gc_ld64(st + S_PHASE)
     if phase == 1 {
         // Markierscheibe: bis zu SCHEIBE_TRACE Objekte verfolgen.
+        __gc_diag_inc(S_D_SCH_MARK)
         let t0: u64 = __gc_jetzt_ns()
         var n: u64 = SCHEIBE_TRACE
         var probe: u64 = ZEIT_PROBE
@@ -881,8 +1005,9 @@ fn __gc_zyklus_schritt() {
         return
     }
     if phase == 2 {
+        __gc_diag_inc(S_D_SCH_SWEEP)
         let t0: u64 = __gc_jetzt_ns()
-        let fertig: u64 = __gc_sweep_schritt()
+        let fertig: u64 = __gc_sweep_schritt(t0)
         __gc_pause_buche(t0, 2)
         if fertig == 1 {
             __gc_zyklus_ende()
@@ -903,7 +1028,7 @@ fn __gc_zyklus_fertig() {
         __gc_st64(st + S_PHASE, 2)
     }
     if __gc_ld64(st + S_PHASE) == 2 {
-        while __gc_sweep_schritt() == 0 {
+        while __gc_sweep_schritt(0) == 0 {
         }
         __gc_zyklus_ende()
     }
@@ -920,8 +1045,14 @@ fn __gc_alloc_raw(tid: u64, size: u64) -> *mut u8 {
         return 0 as *mut u8
     }
     let klasse: u64 = __gc_klasse_fuer(size)
+    // Runde 44: die GANZE Unterbrechung an dieser Allokationsstelle messen.
+    // Ein Bild sieht nicht die einzelne Scheibe, sondern die Summe dessen,
+    // was hier hintereinander laeuft (Zyklusstart UND Scheibe UND Abschluss).
+    // Die Uhr wird nur gelesen, wenn ueberhaupt Sammlerarbeit anfaellt.
+    var tstop: u64 = 0
     if __gc_ld64(st + S_PHASE) == 0 && __gc_ld64(st + S_SEIT) >= __gc_ld64(st + S_GRENZE) {
-        if __gc_ld64(st + S_HEAP) < INKR_AB {
+        tstop = __gc_jetzt_ns()
+        if __gc_ld64(st + S_HEAP) < __gc_ld64(st + S_INKRAB) {
             __gc_scrub()
             __gc_collect_now()
         } else {
@@ -929,12 +1060,18 @@ fn __gc_alloc_raw(tid: u64, size: u64) -> *mut u8 {
         }
     }
     if __gc_ld64(st + S_PHASE) != 0 {
+        if tstop == 0 {
+            tstop = __gc_jetzt_ns()
+        }
         __gc_zyklus_schritt()
     }
     var b: u64 = __gc_hole_block(klasse, size)
     if b == 0 {
         // Erst sammeln, dann scheitern (DESIGNZIELE §2): einen laufenden
         // Zyklus zuende bringen, sonst einen kompletten Lauf erzwingen.
+        if tstop == 0 {
+            tstop = __gc_jetzt_ns()
+        }
         if __gc_ld64(st + S_PHASE) != 0 {
             __gc_zyklus_fertig()
         } else {
@@ -942,6 +1079,14 @@ fn __gc_alloc_raw(tid: u64, size: u64) -> *mut u8 {
             __gc_collect_now()
         }
         b = __gc_hole_block(klasse, size)
+    }
+    if tstop != 0 {
+        let te: u64 = __gc_jetzt_ns()
+        var dstop: u64 = 0
+        if te > tstop {
+            dstop = te - tstop
+        }
+        __gc_hist_buche(dstop, 7)
     }
     if b == 0 {
         return 0 as *mut u8
@@ -953,9 +1098,11 @@ fn __gc_alloc_raw(tid: u64, size: u64) -> *mut u8 {
     // auf den Markstapel: der Stapel wird nicht erneut gescannt, sonst
     // koennte ein nur stapellebendes Objekt gefegt werden, bevor es je an
     // ein Heapfeld angeschlossen wurde. In Ruhe: aktuelles Weiss.
+    __gc_diag_inc(S_D_ALLOK)
     if __gc_ld64(st + S_PHASE) == 0 {
         __gc_st32(b + 4, __gc_ld64(st + S_PAR) as u32)
     } else {
+        __gc_diag_inc(S_D_GRAU)
         __gc_st32(b + 4, 1)
         __gc_mark_push(b + KOPF)
     }
@@ -1108,8 +1255,20 @@ fn gc_init() -> bool {
     __gc_st64(st + S_MKAP, MARK_BYTES / 8)
     __gc_st64(st + S_MLEN, 0)
     __gc_st64(st + S_GRENZE, MIN_GRENZE)
+    __gc_st64(st + S_INKRAB, INKR_AB)
     __gc_st64(st + S_INIT, 1)
     return true
+}
+
+// Runde 44: Umschaltschwelle (Heapbytes) zwischen atomarem und inkrementellem
+// Zyklus zur Laufzeit setzen. 0 = immer inkrementell. Dient der Messung und
+// laesst sich fuer Sonderfaelle stellen; Voreinstellung ist INKR_AB.
+fn gc_set_inkr_ab(n: u64) {
+    __gc_st64(__gc_state() as u64 + S_INKRAB, n)
+}
+
+fn gc_inkr_ab() -> u64 {
+    return __gc_ld64(__gc_state() as u64 + S_INKRAB)
 }
 
 // Obergrenze des Heaps in Bytes; 0 = unbegrenzt. Wird die Grenze erreicht,
