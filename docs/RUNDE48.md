@@ -2,7 +2,7 @@
 
 **Stand vor dieser Runde:** es gab `import a.b`, `export { … }` je Datei und
 die Umgebungsvariable `FIRNLIB`. Mehr nicht — kein Projektmanifest, keine
-Abhängigkeiten, kein Bau-Werkzeug. `ABNAHME.md` Punkt 5 (`W1`,
+Abhängigkeiten, kein Bau-Werkzeug. `ACCEPTANCE.md` Punkt 5 (`W1`,
 „Paketverwaltung baut reproduzierbar") stand deshalb auf `[~]`.
 
 **Was jetzt da ist:** ein Projektmanifest `firn.paket`, eine festgelegte und
@@ -246,7 +246,7 @@ festen Fehlertexte.
 ## 10. Offen (ehrlich)
 
 * **Kein Netzwerk, keine Registry, keine Sperrdatei.** `brauche` kennt nur
-  lokale Pfade. Reproduzierbarkeit über zwei Rechner (`ABNAHME.md` Punkt 5)
+  lokale Pfade. Reproduzierbarkeit über zwei Rechner (`ACCEPTANCE.md` Punkt 5)
   ist damit **noch nicht** erfüllt; es fehlen Prüfsummen und eine
   `firn.sperre`.
 * **Kein `firn build --locked`, keine Versionsauflösung.** `version` wird

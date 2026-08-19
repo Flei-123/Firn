@@ -274,7 +274,7 @@ else
 fi
 
 echo "== 10. DOM-Dauerlauf: Zyklen ohne Leck (tools/dom_soak/run.sh) =="
-# Kurzfassung: 12 s je Variante. Der lange Lauf steht in ABNAHME.md Punkt 2;
+# Kurzfassung: 12 s je Variante. Der lange Lauf steht in ACCEPTANCE.md Punkt 2;
 # hier geht es darum, dass die Zusage bei JEDER Aenderung nachgeprueft wird.
 SOAK_SEK=${SOAK_SEK:-12} SOAK_ZYKLEN=${SOAK_ZYKLEN:-400000} \
   SOAK_STICHPROBE=${SOAK_STICHPROBE:-10000} SOAK_MIN_ZYKLEN=${SOAK_MIN_ZYKLEN:-100000} \
