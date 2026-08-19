@@ -1,60 +1,60 @@
-//! **`comptime`** — Auswertung zur Übersetzungszeit.
+//! **`comptime`** — evaluation at compile time.
 //!
-//! SCHNITTSTELLE (fest):
-//!   `pub(crate) fn ruf_auf(...) -> Result<i128, (Span, String)>`
+//! INTERFACE (fixed):
+//!   `pub(crate) fn call_on(...) -> Result<i128, (Span, String)>`
 //!
-//! ## Wozu
+//! ## What for
 //!
-//! `FIRN-ANFORDERUNGEN.md` §6 nennt Kompilierzeit-Codeerzeugung als **Pflicht**
-//! für den Browser: 697 Web-IDL-Dateien, die HTML-Entitätentabelle, die
-//! CSS-Eigenschaften und die Unicode-Daten sind erzeugter Code. Abnahmepunkt 6
-//! verlangt konkret eine Unicode-Tabelle, die zur Übersetzungszeit aus der UCD
-//! entsteht.
+//! `FIRN-ANFORDERUNGEN.md` §6 lists compile time code generation as a **must**
+//! for the browser: 697 Web IDL files, the HTML entity table, the CSS
+//! properties and the Unicode data are generated code. Acceptance point 6
+//! demands concretely a Unicode table that comes about at compile time out of
+//! the UCD.
 //!
-//! Der erste Schritt dahin ist die Fähigkeit, **eigene Funktionen zur
-//! Übersetzungszeit auszuführen** — mit Schleifen, Verzweigungen und lokalen
-//! Variablen. Genau das tut dieser Interpreter. Der zweite Schritt (`emit`,
-//! also erzeugter Quelltext) baut darauf auf und braucht zusätzlich die
-//! wiedereintrittsfähigen Prüfphasen, die seit der Fundamentarbeit stehen
+//! The first step towards that is the ability to **execute functions of your
+//! own at compile time** — with loops, branches and local variables. Exactly
+//! that is what this interpreter does. The second step (`emit`, that is
+//! generated source text) builds on it and additionally needs the reentrant
+//! check phases that stand since the foundation work
 //! (`sema::Checker::add_items`).
 //!
-//! ## Was ausgewertet werden kann
+//! ## What can be evaluated
 //!
-//! Ganzzahlen und `bool`. Anweisungen: `let`/`var`, Zuweisung an eine lokale
-//! Variable, `if`/`else`, `while`, `for`, `break`, `continue`, `return`,
-//! Blöcke, Ausdrucksanweisungen. Ausdrücke: Literale, Konstanten, lokale
-//! Namen, alle Operatoren, Umwandlungen und **Aufrufe weiterer Funktionen**
-//! (auch rekursiv).
+//! Integers and `bool`. Statements: `let`/`var`, assignment to a local
+//! variable, `if`/`else`, `while`, `for`, `break`, `continue`, `return`,
+//! blocks, expression statements. Expressions: literals, constants, local
+//! labels, all operators, conversions and **calls of further functions**
+//! (recursive ones too).
 //!
-//! ## Was bewusst NICHT geht
+//! ## What deliberately does NOT work
 //!
-//! Zeiger, Arrays, Structs, `syscall`, Gleitkomma, GC-Allokation. Alles davon
-//! bräuchte einen Speicher zur Übersetzungszeit; der kommt mit `emit`. Ein
-//! Versuch endet mit einer Meldung samt Quellposition, nicht mit falschem Code.
+//! Pointers, arrays, structs, `syscall`, floating point, GC allocation. All of
+//! that would need memory at compile time; that arrives with `emit`. One
+//! attempt ends with a message plus source position, not with wrong code.
 //!
-//! ## Grenzen, die eingehalten werden
+//! ## Limits that get honoured
 //!
-//! Ein `comptime`-Lauf darf den Compiler nicht aufhängen. Deshalb: höchstens
-//! `MAX_SCHRITTE` ausgeführte Anweisungen und `MAX_TIEFE` verschachtelte
-//! Aufrufe. Beides endet mit einer klaren Meldung.
+//! A `comptime` run must not hang the compiler. Hence: at most `MAX_STEPS`
+//! statements executed and `MAX_DEPTH` nested calls. Both end with a clear
+//! message.
 
 use crate::ast::{BinOp, Block, Expr, ExprKind, FnDecl, Program, Stmt, UnOp};
 use crate::diag::Span;
 use crate::types::Type;
 use std::collections::HashMap;
 
-/// Obergrenze ausgeführter Anweisungen je `comptime`-Auswertung.
+/// Upper bound of statements executed per `comptime` evaluation.
 const MAX_STEPS: u64 = 2_000_000;
-/// Obergrenze verschachtelter Aufrufe.
+/// Upper bound of nested calls.
 const MAX_DEPTH: u32 = 64;
 
 type Error = (Span, String);
 
-/// Ergebnis einer ausgeführten Anweisung.
+/// Result of one executed statement.
 enum Flow {
-    /// weiter mit der nächsten Anweisung
+    /// carry on with the next statement
     Next,
-    /// `return` mit Wert (bzw. 0 bei `return` ohne Wert)
+    /// `return` with value (or 0 for `return` without value)
     Back(i128),
     Abort,
     Resume,
@@ -62,17 +62,17 @@ enum Flow {
 
 pub(crate) struct Execution<'a> {
     prog: &'a Program,
-    /// Programmweite Konstanten, wie der Typprüfer sie kennt.
+    /// Program wide constants, the way the type checker knows them.
     consts: &'a HashMap<String, (Type, i128)>,
-    /// Typ jedes Ausdrucks (für die Breite bei Umwandlungen).
+    /// Type of every expression (for the width at conversions).
     expr_types: &'a [Type],
     steps: u64,
-    /// Von `emit_*` aufgebauter Quelltext.
+    /// Source text built up by `emit_*`.
     pub(crate) output: String,
-    /// Verzeichnis der Wurzelquelldatei — der EINZIGE Ort, aus dem
-    /// `datei_*` lesen darf.
+    /// Directory of the root source file — the ONLY place `file_*` is
+    /// allowed to read from.
     base: std::path::PathBuf,
-    /// Einmal gelesene Dateien; eine Tabelle wird Byte fuer Byte abgefragt.
+    /// Files read once; a table gets queried byte by byte.
     files: HashMap<String, Vec<u8>>,
 }
 
@@ -93,7 +93,7 @@ impl<'a> Execution<'a> {
         }
     }
 
-    /// Ruft `name` mit bereits ausgewerteten Argumenten auf.
+    /// Calls the given function with arguments already evaluated.
     pub(crate) fn call_on(
         &mut self,
         name: &str,
@@ -133,8 +133,8 @@ impl<'a> Execution<'a> {
         }
         match self.block(&f.body, &mut env, depth)? {
             Flow::Back(v) => Ok(v),
-            // Eine Funktion ohne `return` liefert 0 — der Typprüfer hat
-            // vorher sichergestellt, dass das nur bei `-> void` vorkommt.
+            // A function without `return` yields 0 — the type checker made
+            // sure beforehand that this happens with `-> void` only.
             _ => Ok(0),
         }
     }
@@ -278,8 +278,8 @@ impl<'a> Execution<'a> {
             }
             Stmt::Break(_) => Ok(Flow::Abort),
             Stmt::Continue(_) => Ok(Flow::Resume),
-            // Aufgeschobene Anweisungen haetten in einer reinen Rechnung keine
-            // Wirkung; sie werden abgelehnt statt still uebergangen.
+            // Deferred statements would have no effect within a pure computation;
+            // they get rejected rather than silently passed over.
             Stmt::Defer(_, _, span) => Err((
                 *span,
                 "comptime: 'defer' and 'errdefer' are not allowed at compile time"
@@ -288,20 +288,20 @@ impl<'a> Execution<'a> {
         }
     }
 
-    /// Liest eine Datendatei — EINMAL, danach aus dem Zwischenspeicher.
+    /// Reads a data file — ONCE, from the cache after that.
     ///
-    /// SICHERHEIT (DESIGNZIELE §3): Uebersetzungszeit-Dateizugriff ist ein
-    /// Einfallstor fuer Lieferketten-Angriffe — eine eingebundene Bibliothek
-    /// koennte sonst beim Bauen `/etc/passwd` lesen und in den erzeugten Code
-    /// schreiben. Deshalb gilt hier eine harte Regel:
+    /// SECURITY (DESIGNZIELE §3): compile time file access is a gateway for
+    /// supply chain attacks — some library dragged along could otherwise read
+    /// `/etc/passwd` while building and write it into the generated code.
+    /// Hence a hard rule holds here:
     ///
-    ///   * nur RELATIV zur Wurzelquelldatei,
-    ///   * kein `..` an irgendeiner Stelle,
-    ///   * kein absoluter Pfad, kein Laufwerks- oder Wurzelpraefix.
+    ///   * RELATIVE to the root source file only,
+    ///   * no `..` at any spot,
+    ///   * no absolute path, no drive or root prefix.
     ///
-    /// Das ist bewusst enger als noetig. Wenn Firn ein Modulsystem mit
-    /// Faehigkeiten bekommt (DESIGNZIELE §3), wird daraus eine Erlaubnis, die
-    /// ein Modul ausdruecklich anfordern muss.
+    /// That is deliberately tighter than needed. Once Firn gets a module system
+    /// with capabilities (DESIGNZIELE §3), it turns into a permission that a
+    /// module has to request explicitly.
     fn read_file(&mut self, path: &str, span: Span) -> Result<&Vec<u8>, Error> {
         if !self.files.contains_key(path) {
             if path.is_empty() {
@@ -364,7 +364,7 @@ impl<'a> Execution<'a> {
             }
             ExprKind::Binary(op, l, r) => {
                 let a = self.expr(l, env, depth)?;
-                // Kurzschluss beibehalten: `false && f()` ruft `f` nicht.
+                // Keep the short circuit: `false && f()` does not call `f`.
                 if matches!(op, BinOp::LAnd) && a == 0 {
                     return Ok(0);
                 }
@@ -384,20 +384,20 @@ impl<'a> Execution<'a> {
                 Ok(crate::sema::comptime_wrap(v, &target))
             }
             ExprKind::Call(name, args, _) => {
-                // EMIT: die einzigen Nebenwirkungen, die ein `comptime` haben
-                // darf — sie schreiben in den Quelltextpuffer (SPEC §6.4).
+                // EMIT: the only side effects that a `comptime` may have —
+                // they write into the source text buffer (SPEC §6.4).
                 if name == "emit_raw" {
                     let text = literal_text(args, e.span)?;
                     self.output.push_str(&text);
                     return Ok(0);
                 }
-                // DATENZUGRIFF ZUR UEBERSETZUNGSZEIT (SPEC §6.4).
+                // DATA ACCESS AT COMPILE TIME (SPEC §6.4).
                 //
-                // Genau dafuer verlangt Abnahmepunkt 6 die Unicode-Tabelle
-                // „aus der UCD": eine Datendatei wird gelesen und daraus
-                // entsteht Quelltext. Die Datei wird byteweise abgefragt —
-                // damit braucht der Interpreter weder Zeichenketten noch
-                // Arrays.
+                // Exactly for that acceptance point 6 demands the Unicode
+                // table "out of the UCD": a data file gets read and source
+                // text comes about from it. The file gets queried byte by
+                // byte — that way the interpreter needs neither strings nor
+                // arrays.
                 if name == "file_size" {
                     let path = literal_text(args, e.span)?;
                     let content = self.read_file(&path, e.span)?;
@@ -480,10 +480,10 @@ fn compute(op: BinOp, a: i128, b: i128, span: Span) -> Result<i128, Error> {
     })
 }
 
-/// Der Text eines Zeichenkettenliterals. Der Parser hat `"abc"` bereits in ein
-/// Array-Literal aus Oktetten verwandelt (SPEC §14.1.str) — hier wird es
-/// zurueckgelesen. Damit braucht `emit_roh` keine Zeichenkettenunterstuetzung
-/// im Interpreter.
+/// The text of a string literal. The parser has already turned `"abc"` into
+/// one array literal of octets (SPEC §14.1.str) — here it gets read back.
+/// That way `emit_raw` needs no string support inside the
+/// interpreter.
 fn literal_text(args: &[Expr], span: Span) -> Result<String, Error> {
     if args.len() != 1 {
         return Err((span, "comptime: 'emit_raw' expects exactly one argument".to_string()));
@@ -513,12 +513,12 @@ fn literal_text(args: &[Expr], span: Span) -> Result<String, Error> {
         .map_err(|_| (args[0].span, "comptime: 'emit_raw' needs valid UTF-8".to_string()))
 }
 
-/// Fuehrt alle `comptime { … }`-Bloecke des Programms aus und liefert den dabei
-/// erzeugten Quelltext.
+/// Executes all `comptime { … }` blocks of the program and yields the source
+/// text produced along the way.
 ///
-/// Der Lauf findet VOR der Typpruefung statt: die Bloecke duerfen deshalb keine
-/// programmweiten Konstanten benutzen, wohl aber jede Funktion des Programms
-/// aufrufen. Ehrlich benannt in SPEC §14.1.comptime.
+/// The run happens BEFORE the type check: the blocks may therefore use no
+/// program wide constants, but they may call every function of the program.
+/// Honestly stated at SPEC §14.1.comptime.
 pub(crate) fn run_blocks_out(
     prog: &Program,
     dg: &mut crate::diag::Diags,
