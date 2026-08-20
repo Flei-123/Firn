@@ -1,7 +1,7 @@
 //! **Profiles `kernel` and `app` (SPEC.md §2) — round 52.**
 //!
-//! Up to round 51 `profile` was a declaration that got parsed, checked for
-//! its label and did **nothing else** (SPEC §14, point 6). This file makes
+//! Up to round 51 `profile` was a declaration that was parsed, checked for
+//! its name and did **nothing else** (SPEC §14, point 6). This file makes
 //! it come true.
 //!
 //! ## Where the profile comes from
@@ -24,7 +24,7 @@
 //! | floating point only with `#[allow_fp]` | `f64` and float literals |
 //! | freestanding | `syscall` rejected, no `_start`, ELF object |
 //!
-//! `syscall` does not appear at the table of SPEC §2, yet belongs there
+//! `syscall` does not appear in the table of SPEC §2, but belongs there
 //! inevitably: below a freestanding kernel there is no operating system
 //! that could accept a system call. That single rule renders the whole
 //! standard library unusable under the kernel profile — every allocation
@@ -34,7 +34,7 @@
 //! ## Where the checks hang
 //!
 //! * `modules.rs::build_program` — the `import` rule (only there are the
-//!   inclusions of EVERY file known together with their position),
+//!   inclusions of EVERY file known with their position),
 //! * `sema.rs::check_profile` — all the rest,
 //! * `core.rs` — inline assembler and `#[interrupt]`,
 //! * `codegen_x86.rs` — no `_start`, no runtime prologue,
@@ -58,7 +58,7 @@ thread_local! {
     static ACTIVE: Cell<Profile> = const { Cell::new(Profile::App) };
 }
 
-/// Evaluate the `--profile=` flag. `Err` = unknown label.
+/// Evaluate the `--profile=<name>` flag. `Err` = unknown name.
 pub fn flag_set(name: &str) -> Result<(), String> {
     let p = match name {
         "kernel" => Profile::Kernel,
@@ -96,7 +96,7 @@ pub fn is_kernel() -> bool {
     active() == Profile::Kernel
 }
 
-/// Label of the active profile (error messages, `--stats`).
+/// Name of the active profile (error messages, `--stats`).
 pub fn name() -> &'static str {
     match active() {
         Profile::Kernel => "kernel",
@@ -104,8 +104,8 @@ pub fn name() -> &'static str {
     }
 }
 
-/// Reset everything — for self tests only, which compile several programs
-/// within ONE process.
+/// Reset everything — only for self tests, which compile several programs
+/// in ONE process.
 #[cfg(test)]
 pub(crate) fn reset() {
     FLAG.with(|f| f.set(None));
@@ -114,7 +114,7 @@ pub(crate) fn reset() {
 
 // ------------------------------------------------------------- import ---
 
-/// `// HOOK profil` within `modules.rs::build_program`.
+/// `// HOOK profil` in `modules.rs::build_program`.
 ///
 /// Under the kernel profile the standard library is barred: it presumes a
 /// global allocator (`mmap`) and Linux system calls. Modules of your own
@@ -139,8 +139,8 @@ pub fn hook_import(dg: &mut Diags, path: &[String], span: Span) {
 
 // ------------------------------------------------------------- sema ---
 
-/// `// HOOK profil` within `sema::check_profile`. Checks everything visible
-/// at the AST of the merged compilation unit.
+/// `// HOOK profil` in `sema::check_profile`. Checks everything visible
+/// in the AST of the merged compilation unit.
 pub fn hook_check(dg: &mut Diags, prog: &Program) {
     if let Some((n, span)) = &prog.profile {
         if n != "kernel" && n != "app" {
@@ -211,15 +211,15 @@ pub fn hook_check(dg: &mut Diags, prog: &Program) {
 /// Inline assembler and MMIO exist under BOTH profiles.
 ///
 /// That is a deliberate decision and no sloppiness: both are escape
-/// hatches to the machine, and even applications need them now and then
+/// hatches to the machine, and even an application needs them now and then
 /// (`rdtsc`, `cpuid`, a device mapped through `/dev/mem`). The price — the
-/// code is nailed to x86-64 — stands within the source text, where anybody
+/// code is nailed to x86-64 — stands in the source text, where anybody
 /// sees it. The gain is provability: only that way can the volatile
-/// promises be checked inside a program that REALLY RUNS
-/// (`tests/85x_*.fi`), rather than at the generated assembler text alone.
+/// guarantees be checked in a program that REALLY RUNS
+/// (`tests/85x_*.fi`), rather than in the generated assembler text alone.
 ///
 /// Only `#[interrupt]` stays reserved for the kernel profile (`core.rs`) —
-/// applications have no interrupt vector table.
+/// an application has no interrupt vector table.
 pub fn hook_asm(_ck: &mut crate::sema::Checker, _span: Span) {}
 
 // --------------------------------------------------------------- Guards ---
@@ -394,7 +394,7 @@ mod tests {
     #[test]
     fn app_allowed_inline_assembler() {
         // Deliberate decision (see hook_asm): only that way is the
-        // volatile promise checkable inside a running program.
+        // volatile guarantee checkable in a running program.
         let t = error_of("profile app\nfn f() { asm(\"nop\") }\nfn main() -> i32 { return 0 }\n");
         assert!(!t.contains("error"), "{}", t);
     }

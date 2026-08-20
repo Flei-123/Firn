@@ -1,6 +1,6 @@
 //! Lowering of the optional tracing GC to FIR (module `gckern`, SPEC §3.5).
 //!
-//! The language surface from `gc.rs` gets mapped here onto three things:
+//! The language surface from `gc.rs` is mapped here onto three things:
 //!
 //!  * `gc C{ … }` — call of the runtime (`__gc_alloc_raw`), after that build
 //!    the error union `AllocError!Gc[C]` and write the fields. The
@@ -12,7 +12,7 @@
 //!    the callee-saved registers get rescued there beforehand, so that the
 //!    CONSERVATIVE register scan (SPEC §3.5.3) sees them.
 //!
-//! The **insertion barrier** sits at exactly one spot: the write of a
+//! The **insertion barrier** sits in exactly one place: the write of a
 //! `Gc[T]` pointer into a heap field (`hook_assign`). At this stage it counts
 //! the writes (`gc_barriers()`); the collector stops the world, so mark-sweep
 //! needs no greying here. The slot for incremental collection (`S5`, still
@@ -25,7 +25,7 @@ use crate::lower::Lower;
 use crate::types::Type;
 
 /// Call symbol that the runtime really carries. `weak`/`strong` are no
-/// functions of the source text; they get mapped onto the runtime here.
+/// functions of the source text; they are mapped onto the runtime here.
 pub(crate) fn real_name(name: &str) -> Option<&'static str> {
     match name {
         "weak" => Some(gc::FN_WEAK),
@@ -34,8 +34,8 @@ pub(crate) fn real_name(name: &str) -> Option<&'static str> {
     }
 }
 
-/// `// HOOK gc` within `lower::lower_call`: allocation, intrinsics, `as?`.
-/// Yields `Some(...)` once the call was fully handled here.
+/// `// HOOK gc` in `lower::lower_call`: allocation, intrinsics, `as?`.
+/// Yields `Some(...)` once the call has been fully handled here.
 pub(crate) fn hook_call(
     lo: &mut Lower,
     name: &str,
@@ -144,8 +144,8 @@ fn alloc_and_init(
     Some(())
 }
 
-/// `// HOOK gc` within `lower::lower_stmt` (assignment): the insertion barrier.
-/// Gets called AFTER the write; `target` is the field written to.
+/// `// HOOK gc` in `lower::lower_stmt` (assignment): the insertion barrier.
+/// It is called AFTER the write; `target` is the field written to.
 pub(crate) fn hook_assign(lo: &mut Lower, target: &Expr) -> Option<()> {
     let t = lo.ty_of(target);
     if !gc::is_gc_ptr(&t) {

@@ -11,7 +11,7 @@
 //! own array, and the address of field `f` of element `i` reads
 //! `column_f + i * size(f)` — not `base + offset_f`.
 //!
-//! As long as `a.b` gets spelled out across the whole tree as "base plus
+//! As long as `a.b` is spelled out across the whole tree as "base plus
 //! offset", SoA cannot be retrofitted without touching every call site.
 //! That is why **every** field and element access of the lowering runs
 //! through the functions of this module. Adding a second arrangement then
@@ -19,7 +19,7 @@
 //!
 //! # Architecture rule
 //!
-//! Outside this module nobody within the lowering computes `field.offset` and
+//! Outside this module nobody in the lowering computes `field.offset` and
 //! nobody builds element addresses by hand. `tools/schichten/run.sh` checks
 //! that and is part of `test.sh`.
 //!
@@ -56,16 +56,16 @@ impl Lower<'_> {
 
     /// Address of a field whose offset is already known.
     ///
-    /// Needed by `lower_match.rs` for the payload data of one enum variant:
-    /// there the offset sits at `VariantDef::offsets`, not within a labelled
-    /// field list. This path too runs through here deliberately, so that there
-    /// is only **one** spot where some offset gets turned into a real
+    /// Needed by `lower_match.rs` for the payload data of an enum variant:
+    /// there the offset sits in `VariantDef::offsets`, not in a named
+    /// field list. This path too runs through here deliberately, so that
+    /// there is only **one** place where an offset is turned into a real
     /// address.
     pub(crate) fn field_addr_at(&mut self, base: Val, offset: u64) -> Val {
         self.ptradd_const(base, offset)
     }
 
-    /// Address of the element with the **constant** index `index` within a field
+    /// Address of the element with the **constant** index `index` in a field
     /// of elements of size `elem_size` starting at `base`.
     ///
     /// For literals (`[a, b, c]`) and unrolled repetitions.
@@ -75,7 +75,7 @@ impl Lower<'_> {
 
     /// Address of the element with the **computed** index `index`.
     ///
-    /// `index` gets brought to `u64`, multiplied by the element size and added
+    /// `index` is brought to `u64`, multiplied by the element size and added
     /// to `base`. Under SoA `base` would instead be the column base of the
     /// respective field, and the multiplication would run per field separately.
     pub(crate) fn elem_addr(

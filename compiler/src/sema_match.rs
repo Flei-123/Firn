@@ -2,7 +2,7 @@
 //!
 //! This file belongs to the module `types`. It holds
 //!  * the parser extensions (as `impl` on `parser::Parser`, wired up to the
-//!    `// HOOK types` lines within `parser.rs`),
+//!    `// HOOK types` lines in `parser.rs`),
 //!  * the registration of the enums at the type context,
 //!  * the type check of the patterns and
 //!  * the **exhaustiveness check at compile time**
@@ -18,14 +18,14 @@
 //!
 //! `payload_off = round_up(4, payload_align)`, where `payload_align` is the
 //! largest alignment of all payload fields (at least 1). The payload fields
-//! of one variant sit one after another with natural alignment, ordered by
-//! declaration; the regions of **different** variants overlap (a true
+//! of one variant sit one after another with natural alignment, in
+//! declaration order; the regions of **different** variants overlap (a true
 //! union). Size of the enum =
 //! `round_up(payload_off + max_variant_size, align)`,
 //! `align = max(4, payload_align)`.
 //!
-//! Technically the enum gets entered as a struct with the fields `__tag` and
-//! `__v<tag>_<i>` at `types::TypeCtx`; the offsets are computed here, not by
+//! Technically the enum is entered as a struct with the fields `__tag` and
+//! `__v<tag>_<i>` in `types::TypeCtx`; the offsets are computed here, not by
 //! `TypeCtx::set_fields`.
 
 use std::cell::RefCell;
@@ -38,8 +38,8 @@ use crate::parser::Parser;
 use crate::sema::Checker;
 use crate::types::{round_up, Field, StructDef, Type};
 
-/// Prefix of the internal call labels for `match` statements. It holds `#`,
-/// so it can never be some identifier out of the source text.
+/// Prefix of the internal call names for `match` statements. It contains `#`,
+/// so it can never be an identifier out of the source text.
 pub(crate) const MATCH_PREFIX: &str = "__match#";
 
 // ----------------------------------------------------------------- Data model
@@ -96,7 +96,7 @@ impl Pattern {
             Pattern::Variant { span, .. } => *span,
         }
     }
-    /// Does the pattern ALWAYS match (binding only, that is)?
+    /// Does the pattern ALWAYS match (that is, does it only bind)?
     pub(crate) fn is_irrefutable(&self) -> bool {
         matches!(self, Pattern::Wild(_) | Pattern::Bind(..))
     }
@@ -122,7 +122,7 @@ pub(crate) enum Subject {
     Enum(EnumDef),
     Bool,
     Int(Type),
-    /// Faulty expression — it got reported already.
+    /// Faulty expression — it has already been reported.
     Bad,
 }
 
@@ -175,9 +175,9 @@ pub(crate) fn match_info(idx: usize) -> Option<MatchInfo> {
 }
 
 /// `// HOOK types` for the module system (`modules.rs`): the body blocks of
-/// the `match` cases do NOT sit at the AST but at this registry. So that the
-/// module system can rewrite the labels there just like at the rest of the
-/// AST, one entry gets taken out and put back after the rewrite.
+/// the `match` cases do NOT sit in the AST but in this registry. So that the
+/// module system can rewrite the names in them just like in the rest of the
+/// AST, an entry is taken out and put back after the rewrite.
 pub(crate) fn take_match(idx: usize) -> Option<MatchInfo> {
     REG.with(|r| r.borrow().matches.get(idx).cloned())
 }
@@ -344,7 +344,7 @@ impl<'a> Parser<'a> {
     fn types_match_stmt(&mut self) -> Stmt {
         let start = self.bump(); // 'match'
         if crate::sema_generic::in_template() {
-            // The body blocks of the cases sit at the registry, not at the
+            // The body blocks of the cases sit in the registry, not in the
             // AST — a template could not replace them per instantiation.
             self.dg.error_note(
                 start,
@@ -514,7 +514,7 @@ impl<'a> Parser<'a> {
     }
 }
 
-/// `// HOOK types` within `parser.rs::program` — enums and generic
+/// `// HOOK types` in `parser.rs::program` — enums and generic
 /// templates at top level.
 pub(crate) fn hook_item(p: &mut Parser) -> bool {
     if matches!(p.kind(), TokKind::KwEnum) {
@@ -524,7 +524,7 @@ pub(crate) fn hook_item(p: &mut Parser) -> bool {
     crate::sema_generic::hook_item(p)
 }
 
-/// `// HOOK types` within `parser.rs::stmt_inner` — `match` statement.
+/// `// HOOK types` in `parser.rs::stmt_inner` — `match` statement.
 pub(crate) fn hook_stmt(p: &mut Parser) -> Option<Stmt> {
     if matches!(p.kind(), TokKind::KwMatch) {
         return Some(p.types_match_stmt());
@@ -532,7 +532,7 @@ pub(crate) fn hook_stmt(p: &mut Parser) -> Option<Stmt> {
     None
 }
 
-/// `// HOOK types` within `parser.rs::primary` — `Enum::Variant(..)`.
+/// `// HOOK types` in `parser.rs::primary` — `Enum::Variant(..)`.
 pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
     if let TokKind::Ident(name) = p.kind().clone() {
         if p.types_at_colon2(1) && matches!(p.tk(3), TokKind::Ident(_)) {
@@ -557,8 +557,8 @@ pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
 
 // ------------------------------------------- Registration at the type context
 
-/// `// HOOK types` within `sema::run` (before `collect_structs`): registers
-/// the labels of all enums, so that structs and functions can refer to them.
+/// `// HOOK types` in `sema::run` (before `collect_structs`): registers
+/// the names of all enums, so that structs and functions can refer to them.
 pub(crate) fn declare_enums(ck: &mut Checker) {
     let n = enum_count();
     for i in 0..n {
@@ -582,8 +582,8 @@ pub(crate) fn declare_enums(ck: &mut Checker) {
     }
 }
 
-/// `// HOOK types` within `sema::run` (after `collect_structs`): computes the
-/// layout of every enum and enters it as struct layout.
+/// `// HOOK types` in `sema::run` (after `collect_structs`): computes the
+/// layout of every enum and enters it as a struct layout.
 pub(crate) fn layout_enums(ck: &mut Checker, prog: &crate::ast::Program) {
     if enum_count() == 0 {
         return;
@@ -607,8 +607,8 @@ pub(crate) fn layout_enums(ck: &mut Checker, prog: &crate::ast::Program) {
         }
     }
 
-    // Ordered by dependency (one enum can hold another by value).
-    // Cycles are errors.
+    // Ordered by dependency (one enum can contain another by value).
+    // Cycles are an error.
     let n = enum_count();
     let mut deps: Vec<Vec<usize>> = vec![Vec::new(); n];
     let mut defs: Vec<EnumDef> = Vec::with_capacity(n);
@@ -726,7 +726,7 @@ pub(crate) fn layout_enums(ck: &mut Checker, prog: &crate::ast::Program) {
     }
 }
 
-/// Label of a type if it is held BY VALUE (pointers are not).
+/// Name of a type, if it is contained BY VALUE (pointers are not).
 fn value_named(te: &TypeExpr) -> Option<String> {
     match te {
         TypeExpr::Named(n, _) => Some(n.clone()),
@@ -759,9 +759,9 @@ fn toposort(i: usize, deps: &[Vec<usize>], state: &mut Vec<u8>, order: &mut Vec<
 
 // -------------------------------------------------------------- Type check
 
-/// `// HOOK types` within `sema::stmt_returns`: does a `match` return on
-/// every path? The pattern match is checked by that point, so exhaustive —
-/// it suffices that every case returns.
+/// `// HOOK types` in `sema::stmt_returns`: does a `match` return on
+/// every path? The pattern match has been checked by that point, so it is
+/// exhaustive — it suffices that every case returns.
 pub(crate) fn match_returns(e: &Expr) -> bool {
     let idx = match &e.kind {
         ExprKind::Call(name, _, _) => match match_index_of(name) {
@@ -794,7 +794,7 @@ fn stmt_returns(s: &Stmt) -> bool {
     }
 }
 
-/// `// HOOK types` within `sema::call`: catches `Enum::Variant(..)` and `match`.
+/// `// HOOK types` in `sema::call`: catches `Enum::Variant(..)` and `match`.
 pub(crate) fn hook_call(
     ck: &mut Checker,
     name: &str,
@@ -1127,7 +1127,7 @@ fn fits(v: i128, t: &Type) -> bool {
 
 /// **Exhaustiveness check at compile time** (SPEC §6.3).
 ///
-/// Yields `Err(Diag)` with line/column and the label of the missing variant
+/// Yields `Err(Diag)` with line/column and the name of the missing variant
 /// when the pattern match leaves a case uncovered. That is a hard error, not
 /// a warning — the caller reports it through `Diags`.
 pub fn check_exhaustive(subject: &Subject, arms: &[Arm], span: Span) -> Result<(), Diag> {

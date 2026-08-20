@@ -23,13 +23,13 @@
 //! Integers and `bool`. Statements: `let`/`var`, assignment to a local
 //! variable, `if`/`else`, `while`, `for`, `break`, `continue`, `return`,
 //! blocks, expression statements. Expressions: literals, constants, local
-//! labels, all operators, conversions and **calls of further functions**
+//! names, all operators, conversions and **calls of further functions**
 //! (recursive ones too).
 //!
 //! ## What deliberately does NOT work
 //!
 //! Pointers, arrays, structs, `syscall`, floating point, GC allocation. All of
-//! that would need memory at compile time; that arrives with `emit`. One
+//! that would need memory at compile time; that arrives with `emit`. An
 //! attempt ends with a message plus source position, not with wrong code.
 //!
 //! ## Limits that get honoured
@@ -72,7 +72,7 @@ pub(crate) struct Execution<'a> {
     /// Directory of the root source file — the ONLY place `file_*` is
     /// allowed to read from.
     base: std::path::PathBuf,
-    /// Files read once; a table gets queried byte by byte.
+    /// Files read once; a table is queried byte by byte.
     files: HashMap<String, Vec<u8>>,
 }
 
@@ -93,7 +93,7 @@ impl<'a> Execution<'a> {
         }
     }
 
-    /// Calls the given function with arguments already evaluated.
+    /// Calls the given function with arguments that are already evaluated.
     pub(crate) fn call_on(
         &mut self,
         name: &str,
@@ -278,8 +278,8 @@ impl<'a> Execution<'a> {
             }
             Stmt::Break(_) => Ok(Flow::Abort),
             Stmt::Continue(_) => Ok(Flow::Resume),
-            // Deferred statements would have no effect within a pure computation;
-            // they get rejected rather than silently passed over.
+            // Deferred statements would have no effect in a pure computation;
+            // they are rejected rather than silently passed over.
             Stmt::Defer(_, _, span) => Err((
                 *span,
                 "comptime: 'defer' and 'errdefer' are not allowed at compile time"
@@ -291,17 +291,17 @@ impl<'a> Execution<'a> {
     /// Reads a data file — ONCE, from the cache after that.
     ///
     /// SECURITY (DESIGN_GOALS §3): compile time file access is a gateway for
-    /// supply chain attacks — some library dragged along could otherwise read
+    /// supply chain attacks — a library dragged along could otherwise read
     /// `/etc/passwd` while building and write it into the generated code.
     /// Hence a hard rule holds here:
     ///
     ///   * RELATIVE to the root source file only,
-    ///   * no `..` at any spot,
+    ///   * no `..` at any place,
     ///   * no absolute path, no drive or root prefix.
     ///
-    /// That is deliberately tighter than needed. Once Firn gets a module system
-    /// with capabilities (DESIGN_GOALS §3), it turns into a permission that a
-    /// module has to request explicitly.
+    /// That is deliberately tighter than needed. Once Firn gets a module
+    /// system with capabilities (DESIGN_GOALS §3), it turns into a permission
+    /// that a module has to request explicitly.
     fn read_file(&mut self, path: &str, span: Span) -> Result<&Vec<u8>, Error> {
         if !self.files.contains_key(path) {
             if path.is_empty() {
@@ -393,9 +393,9 @@ impl<'a> Execution<'a> {
                 }
                 // DATA ACCESS AT COMPILE TIME (SPEC §6.4).
                 //
-                // Exactly for that acceptance point 6 demands the Unicode
-                // table "out of the UCD": a data file gets read and source
-                // text comes about from it. The file gets queried byte by
+                // Exactly for that, acceptance point 6 demands the Unicode
+                // table "from the UCD": a data file is read and source
+                // text comes about from it. The file is queried byte by
                 // byte — that way the interpreter needs neither strings nor
                 // arrays.
                 if name == "file_size" {
@@ -481,7 +481,7 @@ fn compute(op: BinOp, a: i128, b: i128, span: Span) -> Result<i128, Error> {
 }
 
 /// The text of a string literal. The parser has already turned `"abc"` into
-/// one array literal of octets (SPEC §14.1.str) — here it gets read back.
+/// an array literal of octets (SPEC §14.1.str) — here it is read back.
 /// That way `emit_raw` needs no string support inside the
 /// interpreter.
 fn literal_text(args: &[Expr], span: Span) -> Result<String, Error> {

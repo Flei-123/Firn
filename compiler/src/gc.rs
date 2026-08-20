@@ -3,22 +3,22 @@
 //! This file belongs to the module `gckern` (see PLAN.md, round "hardening
 //! test 2"). It holds
 //!  * the parser extensions for `gc class C [extends B] { … }`
-//!    (wired up through `// HOOK gc` lines within `parser.rs`),
+//!    (wired up through `// HOOK gc` lines in `parser.rs`),
 //!  * the registration of the classes, of their field layout, of their type
 //!    tag and of their ancestor chain,
 //!  * the type check of `Gc[T]`, `GcWeak[T]`, `gc C{…}`, `weak(x)`,
 //!    `strong(w)`, `x.as?[T]` and of the free upcast,
 //!  * the type table for the collector (`.rodata`, `ty_table_asm`).
 //!
-//! The lowering to FIR stands at `gc_lower.rs`, the collector runtime as
-//! readable Firn at `lib/gc/gc.fi`. That runtime gets embedded through
-//! `include_str!` and joins automatically as one more module as soon as
-//! a `gc class` shows up within the program (`runtime_source`, `modules.rs`).
+//! The lowering to FIR is in `gc_lower.rs`, the collector runtime as
+//! readable Firn in `lib/gc/gc.fi`. That runtime is embedded through
+//! `include_str!` and pulled in automatically as an extra module as soon as
+//! a `gc class` appears in the program (`runtime_source`, `modules.rs`).
 //!
 //! ## Representation (binding, `docs/GC.md`)
 //!
 //! ```text
-//! gc class C { … }   -> struct "gc C" at types::TypeCtx (prefix layout of the base)
+//! gc class C { … }   -> struct "gc C" in types::TypeCtx (prefix layout of the base)
 //! Gc[C]              -> *mut <struct "gc C">          (first class pointer)
 //! GcWeak[C]          -> struct "GcWeak[C]" { __p: u64, __s: u64 }
 //! gc C{ … }          -> AllocError!Gc[C]
@@ -26,7 +26,7 @@
 //!
 //! `GcWeak[C]` carries the pointer **veiled** (`__p = p ^ WEAK_XOR`), so that
 //! the conservative stack scan does not read it as a strong root, plus the
-//! serial number `__s` of the target block, so that a block reused does not
+//! serial number `__s` of the target block, so that a reused block does not
 //! pass as the old target.
 //!
 //! ## Contract to the outside (stable, other modules depend on it)
@@ -46,23 +46,23 @@ use crate::types::Type;
 
 // ----------------------------------------------------------------- Namespace
 
-/// Prefix of all compiler internal GC labels. It holds `#`, so it can never
-/// come about from one identifier of the source text.
-/// `gc C{…}` stands as the call `"gc C"` at the AST. The label holds a
-/// space, so it can never be one identifier of the source text — and within
-/// the `#[no_gc]` message it reads just as it stands at the source.
+/// Prefix of all compiler internal GC names. It contains `#`, so it can never
+/// arise from an identifier of the source text.
+/// `gc C{…}` appears as the call `"gc C"` in the AST. The name contains a
+/// space, so it can never be an identifier of the source text — and in the
+/// `#[no_gc]` message it reads exactly as it stands in the source.
 const P_NEW: &str = "gc ";
 const P_TY: &str = "__gc#p:";
 const P_WTYP: &str = "__gc#w:";
-/// The same prefixes for `mono.rs` (round 53: `Gc[T]` within a template).
+/// The same prefixes for `mono.rs` (round 53: `Gc[T]` in a template).
 pub(crate) const P_TY_PUB: &str = P_TY;
 pub(crate) const P_WTYP_PUB: &str = P_WTYP;
 const P_AS: &str = "__gc#as:";
 
-/// Call labels of the runtime (`lib/gc/gc.fi`) that can trigger a collection
+/// Call names of the runtime (`lib/gc/gc.fi`) that can trigger a collection
 /// run or touch the state of the collector.
 const RUNTIME_COLLECTS: [&str; 4] = ["gc_init", "gc_collect", "__gc_alloc_raw", "__gc_collect_now"];
-/// Further runtime labels: pure queries, yet part of the collector.
+/// Further runtime names: pure queries, but part of the collector.
 const RUNTIME_QUERY: [&str; 11] = [
     "gc_set_max_bytes",
     "gc_max_bytes",
@@ -97,12 +97,12 @@ pub(crate) const ERR_SET: &str = "AllocError";
 ///
 /// While collecting, the runtime calls `__gc_finalize(kind, p)`. Stage 0 has
 /// no function pointers; a dispatcher function with a tag is the honest
-/// equivalent and needs no indirect call at the code generator (R46 builds
+/// equivalent and needs no indirect call in the code generator (R46 builds
 /// that one for vtables, not this round).
 ///
-/// Should the **root file** of the program declare this function itself, the
+/// If the **root file** of the program declares this function itself, the
 /// compiler takes it; otherwise it adds the empty default. Only the root
-/// file counts, because within a module the label turns into `module__…`
+/// file counts, because inside a module the name turns into `module__…`
 /// and the runtime would no longer find it.
 pub(crate) const FN_FINAL: &str = "__gc_finalize";
 
@@ -110,7 +110,7 @@ pub(crate) const FN_FINAL: &str = "__gc_finalize";
 /// `thread_start`).
 /// The same way as with the dispatcher of the finalizers and for the same
 /// reason: stage 0 has no function pointers, so a thread carries a KIND OF
-/// WORK rather than one address. Should the root file declare the function
+/// WORK rather than an address. If the root file declares the function
 /// itself, the compiler takes it; otherwise it adds the empty default.
 pub(crate) const FN_THREAD: &str = "__thread_work";
 
@@ -129,13 +129,13 @@ struct Class {
     span: Span,
     base: Option<(String, Span)>,
     fields: Vec<Field>,
-    /// index into `types::TypeCtx` (label `"gc C"`), `usize::MAX` until registered
+    /// index into `types::TypeCtx` (name `"gc C"`), `usize::MAX` until registered
     struct_idx: usize,
     /// index of the struct `GcWeak[C]`
     weak_idx: usize,
     /// type tag, from 1 upwards by declaration order
     tid: u64,
-    /// after the registration: size as bytes
+    /// after the registration: size in bytes
     size: u64,
     /// offsets of the `Gc[T]` fields (precise heap tracing)
     strong_offs: Vec<u64>,
@@ -162,12 +162,12 @@ fn index_of(name: &str) -> Option<usize> {
     REG.with(|r| r.borrow().classes.iter().position(|k| k.name == name))
 }
 
-/// Is this label a declared `gc class`?
+/// Is this name a declared `gc class`?
 pub(crate) fn is_class(name: &str) -> bool {
     index_of(name).is_some()
 }
 
-/// Is there any `gc class` at all within this compilation?
+/// Is there any `gc class` at all in this compilation?
 pub(crate) fn has_classes() -> bool {
     REG.with(|r| !r.borrow().classes.is_empty())
 }
@@ -177,14 +177,14 @@ pub(crate) fn hook_reset() {
     REG.with(|r| *r.borrow_mut() = Registry::default());
 }
 
-/// Round 49: the runtime is part of this program. Set at `modules.rs`,
-/// where it really enters the file list — not at `runtime_source`, whose
-/// result gets built within tests too.
+/// Round 49: the runtime is part of this program. Set in `modules.rs`,
+/// where it really enters the file list — not in `runtime_source`, whose
+/// result is built in tests as well.
 pub(crate) fn runtime_remember() {
     RUNTIME_INSIDE.with(|c| c.set(true));
 }
 
-/// Reset ahead of every compilation (one process can compile several —
+/// Reset before every compilation (one process can compile several —
 /// `cargo test`).
 pub(crate) fn runtime_reset() {
     RUNTIME_INSIDE.with(|c| c.set(false));
@@ -192,16 +192,16 @@ pub(crate) fn runtime_reset() {
 
 // ------------------------------------------------------- Contract for nogc.rs
 
-/// Is this the call label of a GC allocation or of a collector function that
+/// Is this the call name of a GC allocation or of a collector function that
 /// can trigger a collection run (`gc C{…}`, `gc_collect`, …)?
 ///
-/// Exactly those calls are forbidden within a `#[no_gc]` function.
+/// Exactly those calls are forbidden inside a `#[no_gc]` function.
 pub(crate) fn is_gc_alloc_call(name: &str) -> bool {
     if name.starts_with(P_NEW) {
         return true;
     }
-    // The module path ahead of it counts as well (`module__gc_collect`),
-    // otherwise the promise could be dodged across a module boundary.
+    // The module path in front of it counts as well (`module__gc_collect`),
+    // otherwise the guarantee could be dodged across a module boundary.
     let blank = name.rsplit("__").next().unwrap_or(name);
     RUNTIME_COLLECTS.contains(&name)
         || RUNTIME_COLLECTS.contains(&blank)
@@ -216,7 +216,7 @@ pub(crate) fn is_gc_alloc_call(name: &str) -> bool {
 }
 
 /// Is `t` a GC pointer type (`Gc[T]` or `GcWeak[T]`)? Writing into a field
-/// of this type needs the insertion barrier and is forbidden within
+/// of this type needs the insertion barrier and is forbidden inside
 /// `#[no_gc]`.
 pub(crate) fn is_gc_ref(t: &Type) -> bool {
     is_gc_ptr(t) || is_gc_weak(t)
@@ -356,9 +356,9 @@ impl<'a> Parser<'a> {
     }
 
     /// Round 53: `[E]` or `[K, V]` after `GcVec`/`GcMap`. The arguments are
-    /// FULL types (`GcVec[Gc[Node]]`), get checked and then discarded — the
-    /// container is nominally one. Yields the span of the closing bracket.
-    /// schliessenden Klammer.
+    /// FULL types (`GcVec[Gc[Node]]`), are checked and then discarded — the
+    /// container is nominally one. Yields the span of the closing
+    /// bracket.
     fn gc_collection_args(&mut self, name: &str, n: usize) -> Option<Span> {
         if !self.expect(TokKind::LBracket, "after 'GcVec'/'GcMap'") {
             return None;
@@ -402,7 +402,7 @@ impl<'a> Parser<'a> {
     }
 }
 
-/// `// HOOK gc` within `parser.rs::program` — `gc class` declaration.
+/// `// HOOK gc` in `parser.rs::program` — `gc class` declaration.
 pub(crate) fn hook_item(p: &mut Parser) -> bool {
     let is_gc = matches!(p.kind(), TokKind::Ident(n) if n == "gc");
     if !is_gc {
@@ -416,20 +416,20 @@ pub(crate) fn hook_item(p: &mut Parser) -> bool {
     true
 }
 
-/// `// HOOK gc` within `parser.rs::parse_type_inner` — `Gc[C]`, `GcWeak[C]`.
-/// The label is consumed already, `sp` is its position.
+/// `// HOOK gc` in `parser.rs::parse_type_inner` — `Gc[C]`, `GcWeak[C]`.
+/// The name is consumed already, `sp` is its position.
 pub(crate) fn hook_type(p: &mut Parser, name: &str, sp: Span) -> Option<TypeExpr> {
     // Round 53: `GcVec[E]` and `GcMap[K,V]` (SPEC §3.5.2). Both are
-    // POINTERS to the runtime classes `GcVec`/`GcMap` out of lib/gc/gcvec.fi
-    // respectively lib/gc/gcmap.fi — `GcVec[Gc[Node]]` is therefore exactly
+    // POINTERS to the runtime classes `GcVec`/`GcMap` from lib/gc/gcvec.fi
+    // and lib/gc/gcmap.fi — `GcVec[Gc[Node]]` is therefore exactly
     // `Gc[GcVec]`, merely written the way the SPEC states it.
     //
     // WHAT THIS IS NOT, and that belongs here: a SEPARATE class per element
     // type. Stage 0 has no generic `gc class` — the container is nominally
-    // ONE, and the element type gets checked at the ACCESS
-    // (`gcvec_append[Node](…)`), not at the field. The type arguments get
-    // parsed here completely (`Gc[Node]` too), so that a typo shows up, yet
-    // discarded afterwards. `docs/RUNDE53.md` §6 states the price.
+    // ONE, and the element type is checked at the ACCESS
+    // (`gcvec_append[Node](…)`), not at the field. The type arguments are
+    // parsed here completely (`Gc[Node]` too), so that a typo shows up, but
+    // discarded afterwards. `docs/RUNDE53.md` §6 names the price.
     if name == "GcVec" || name == "GcMap" {
         if !p.at(&TokKind::LBracket) {
             return None;
@@ -453,7 +453,7 @@ pub(crate) fn hook_type(p: &mut Parser, name: &str, sp: Span) -> Option<TypeExpr
     Some(TypeExpr::Named(format!("{}{}", prefix, class), Parser::join(sp, ksp)))
 }
 
-/// `// HOOK gc` within `parser.rs::primary` — `gc C{…}`, `gc_null[C]()`,
+/// `// HOOK gc` in `parser.rs::primary` — `gc C{…}`, `gc_null[C]()`,
 /// `weak_null[C]()`.
 pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
     let name = match p.kind().clone() {
@@ -478,7 +478,7 @@ pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
             let lit = p.struct_lit(format!("{}{}", P_NEW, class), span);
             p.no_struct_lit = saved;
             // Wrapped as a CALL: only that way does the `#[no_gc]` check
-            // (nogc.rs, rule 1) see the allocation — it checks call labels.
+            // (nogc.rs, rule 1) see the allocation — it checks call names.
             let full = Parser::join(span, lit.span);
             Some(p.mk(full, ExprKind::Call(format!("{}{}", P_NEW, class), vec![lit], span)))
         }
@@ -526,8 +526,8 @@ pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
     }
 }
 
-/// `// HOOK gc` within `parser.rs::postfix` — `x.as?[C]`.
-/// Stands right after the consumed '.'.
+/// `// HOOK gc` in `parser.rs::postfix` — `x.as?[C]`.
+/// Sits right after the consumed '.'.
 pub(crate) fn hook_postfix(p: &mut Parser, base: &Expr) -> Option<Expr> {
     if !matches!(p.kind(), TokKind::KwAs) {
         return None;
@@ -551,9 +551,9 @@ fn weak_struct_name(class: &str) -> String {
 
 // ------------------------------------------- Registration at the type context
 
-/// `// HOOK gc` within `sema::Checker::run` (before `collect_structs`):
-/// registers every `gc class` as struct with prefix layout and computes the
-/// type tag, the ancestor chain and the offsets for precise heap tracing.
+/// `// HOOK gc` in `sema::Checker::run` (before `collect_structs`):
+/// registers every `gc class` as a struct with prefix layout and computes
+/// the type tag, the ancestor chain and the offsets for precise heap tracing.
 pub(crate) fn declare_classes(ck: &mut Checker) {
     let n = REG.with(|r| r.borrow().classes.len());
     if n == 0 {
@@ -624,10 +624,10 @@ pub(crate) fn declare_classes(ck: &mut Checker) {
     }
 }
 
-/// `// HOOK gc` within `sema::add_items_inner` (AFTER `collect_structs`):
+/// `// HOOK gc` in `sema::add_items_inner` (AFTER `collect_structs`):
 /// settles the field layout of every class. Only here are the structs of the
-/// program known — a struct field within a gc class thereby gets the right
-/// message rather than "unknown type".
+/// program known — that way a struct field in a gc class gets the right
+/// message instead of "unknown type".
 pub(crate) fn layout_classes(ck: &mut Checker) {
     let n = REG.with(|r| r.borrow().classes.len());
     // Layout by topological order (base first).
@@ -769,8 +769,8 @@ fn field_ty_allowed(t: &Type) -> bool {
 
 // --------------------------------------------------------------- Type check
 
-/// `// HOOK gc` within `sema::resolve_ty_d`: `Gc[C]`, `GcWeak[C]` and the
-/// forbidden use of a `gc class` label where a plain type belongs.
+/// `// HOOK gc` in `sema::resolve_ty_d`: `Gc[C]`, `GcWeak[C]` and the
+/// forbidden use of a `gc class` name as an ordinary type.
 pub(crate) fn hook_resolve_ty(ck: &mut Checker, te: &TypeExpr) -> Option<Type> {
     let (name, span) = match te {
         TypeExpr::Named(n, s) => (n.as_str(), *s),
@@ -819,7 +819,7 @@ fn unknown_class(ck: &mut Checker, name: &str, span: Span) {
     );
 }
 
-/// `gc C{ … }` yields `AllocError!Gc[C]` (called out of `hook_call`).
+/// `gc C{ … }` yields `AllocError!Gc[C]` (called from `hook_call`).
 fn check_new(
     ck: &mut Checker,
     name: &str,
@@ -916,7 +916,7 @@ fn alloc_union(ck: &mut Checker, val: Type, span: Span) -> Type {
     }
 }
 
-/// `// HOOK gc` within `sema::call`: `weak(g)`, `strong(w)`, `x.as?[C]` and
+/// `// HOOK gc` in `sema::call`: `weak(g)`, `strong(w)`, `x.as?[C]` and
 /// the two compiler intrinsics. Yields `None` when it is none of those.
 pub(crate) fn hook_call(
     ck: &mut Checker,
@@ -1051,7 +1051,7 @@ fn check_as(ck: &mut Checker, class: &str, args: &[Expr], nspan: Span) -> Type {
             return Type::Error;
         }
     };
-    // Checked downcast: the target must hold the source at its ancestor chain.
+    // Checked downcast: the target must have the source in its ancestor chain.
     if source != target && !is_descendant(target, source) && !is_descendant(source, target) {
         let (qn, zn) = REG.with(|r| {
             let reg = r.borrow();
@@ -1068,7 +1068,7 @@ fn check_as(ck: &mut Checker, class: &str, args: &[Expr], nspan: Span) -> Type {
     Type::ptr(Type::Struct(sidx), true)
 }
 
-/// Is `a` a descendant of `b` (the equal class excluded)?
+/// Is `a` a descendant of `b` (the same class excluded)?
 fn is_descendant(a: usize, b: usize) -> bool {
     let mut cur = a;
     for _ in 0..1024 {
@@ -1114,8 +1114,8 @@ pub(crate) fn is_related(a: &Type, b: &Type) -> bool {
     is_upward(a, b) || is_upward(b, a)
 }
 
-/// `// HOOK gc` within `sema::probe_d`: type of `weak(g)`, `strong(w)` and
-/// `x.as?[C]` WITHOUT a check — so that one integer literal next to it gets
+/// `// HOOK gc` in `sema::probe_d`: type of `weak(g)`, `strong(w)` and
+/// `x.as?[C]` WITHOUT a check — so that an integer literal beside it gets
 /// its type (`if g.field != 5`).
 pub(crate) fn probe_ty(name: &str, arg: Option<&Type>) -> Option<Type> {
     if let Some(class) = name.strip_prefix(P_AS) {
@@ -1146,7 +1146,7 @@ pub(crate) fn probe_ty(name: &str, arg: Option<&Type>) -> Option<Type> {
     }
 }
 
-/// `// HOOK gc` within `sema::field_type`: field access through `Gc[T]`.
+/// `// HOOK gc` in `sema::field_type`: field access through `Gc[T]`.
 /// Yields the struct index when `base` is a Gc pointer.
 pub(crate) fn hook_field_base(base: &Type) -> Option<usize> {
     match base {
@@ -1180,7 +1180,7 @@ pub(crate) fn union_idx(name: &str) -> Option<usize> {
     }
 }
 
-/// Label of the class behind a `__gc#neu:`/`__gc#as:` call.
+/// Name of the class behind a `gc C{…}` or `x.as?[C]` call.
 pub(crate) fn class_out_new(name: &str) -> Option<&str> {
     name.strip_prefix(P_NEW)
 }
@@ -1191,7 +1191,7 @@ pub(crate) fn class_out_as(name: &str) -> Option<&str> {
 
 // ------------------------------------------------------------ Code generator
 
-/// Offset of the register rescue area within the state block (bytes).
+/// Offset of the register rescue area in the state block (bytes).
 pub(crate) const REG_SAVE_OFF: u64 = 3968;
 /// Size of the state block (bytes).
 pub(crate) const STATE_SIZE: u64 = 4096;
@@ -1200,8 +1200,8 @@ pub(crate) const STATE_LABEL: &str = ".L__gc_state";
 /// Label of the type table (`.rodata`, file local).
 pub(crate) const TABLE_LABEL: &str = ".L__gc_typetable";
 
-/// The compiler generated type table: out of the field layout, one entry of
-/// 8 words per type (SPEC §3.5.3 — precise heap tracing).
+/// The compiler generated type table: one entry of 8 words per type, built
+/// from the field layout (SPEC §3.5.3 — precise heap tracing).
 ///
 /// ```text
 /// word 0: n_types
@@ -1264,19 +1264,19 @@ const RUNTIME: &str = include_str!("../../lib/gc/gc.fi");
 
 /// **Round 53** — the collections of variable length (`SPEC` §3.5.2).
 ///
-/// They stand within FILES OF THEIR OWN and get appended to `gc.fi`:
-/// together they are one module, so they see its labels (`KOPF`, `F_SLOTS`,
-/// `__gc_alloc_raw`, `__gc_barrier`) without `import`. Appended gets only
-/// what the program really needs — a program with `gc class` yet without
-/// collections produces the same code afterwards as before.
+/// They live in FILES OF THEIR OWN and are appended to `gc.fi`: together
+/// they are one module, so they see its names (`KOPF`, `F_SLOTS`,
+/// `__gc_alloc_raw`, `__gc_barrier`) without an `import`. They are appended
+/// only when the program really needs them — a program with `gc class` but
+/// without collections produces the same code afterwards as before.
 const RUNTIME_VEC: &str = include_str!("../../lib/gc/gcvec.fi");
 const RUNTIME_MAP: &str = include_str!("../../lib/gc/gcmap.fi");
 
-/// Path label of the loaded runtime for error messages and `.debug_line`.
+/// Path name of the runtime pulled in, for error messages and `.debug_line`.
 pub(crate) const RUNTIME_PATH: &str = "lib/gc/gc.fi";
 
-/// Does this program need the runtime? Decided at the token stream: the two
-/// identifiers `gc class` stand somewhere next to each other.
+/// Does this program need the runtime? Decided on the token stream: somewhere
+/// the two identifiers `gc class` stand next to each other.
 pub(crate) fn source_needs_gc(toks: &[crate::lexer::Token]) -> bool {
     if toks.windows(2).any(|w| {
         matches!(&w[0].kind, TokKind::Ident(a) if a == "gc")
@@ -1284,10 +1284,10 @@ pub(crate) fn source_needs_gc(toks: &[crate::lexer::Token]) -> bool {
     }) {
         return true;
     }
-    // Round 49: the thread runtime stands within the same file — it needs
-    // the same static state block, and the collector needs it. A program
-    // with threads yet without `gc class` therefore brings it along through
-    // its identifiers.
+    // Round 49: the thread runtime lives in the same file — it needs the
+    // same static state block, and the collector needs it. A program with
+    // threads but without `gc class` therefore pulls it in through its
+    // identifiers.
     toks.iter().any(|t| match &t.kind {
         TokKind::Ident(a) => a.starts_with("thread_") || a.starts_with("__thread"),
         _ => false,
@@ -1304,9 +1304,9 @@ pub(crate) fn source_has_allocerror(toks: &[crate::lexer::Token]) -> bool {
 
 /// **Round 53** — does this program need the collections (`GcVec`/`GcMap`)?
 ///
-/// Decided at the token stream like `source_needs_gc`: somewhere stands one
+/// Decided on the token stream like `source_needs_gc`: somewhere there is an
 /// identifier that begins with `GcVec`, `GcMap`, `gcvec_` or `gcmap_`.
-/// The prefix test rather than one equality test covers both — the type
+/// The prefix test instead of an equality test covers both — the type
 /// `GcVec[Gc[T]]` and the call `gcvec_append[T](…)`.
 pub(crate) fn source_needs_collections(toks: &[crate::lexer::Token]) -> bool {
     toks.iter().any(|t| match &t.kind {
@@ -1363,8 +1363,8 @@ fn finalizer_default() -> String {
 }
 
 thread_local! {
-    /// Did the runtime get pulled into this program? (Round 49: then the state
-    /// block must stand at the assembler even without `gc class`.)
+    /// Was the runtime pulled into this program? (Round 49: then the state
+    /// block has to appear in the assembler even without `gc class`.)
     static RUNTIME_INSIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -1374,7 +1374,7 @@ pub(crate) fn runtime_active() -> bool {
 }
 
 /// Source text of the runtime. `with_error_set = false` when the program
-/// declares `AllocError` itself already (error set labels are program wide).
+/// declares `AllocError` itself already (error set names are program wide).
 /// `with_finalizer = false` when the root file brings the dispatcher along
 /// itself.
 pub(crate) fn runtime_source(
@@ -1438,7 +1438,7 @@ mod tests {
         assert!(q.contains("error AllocError"));
         assert!(!runtime_source(false, true, true, false).contains("error AllocError {"));
         // Round 47: the dispatcher is there exactly ONCE — either as the
-        // default or out of the program, never twice.
+        // default or from the program, never twice.
         assert!(q.contains("fn __gc_finalize(kind: u64, p: *mut u8) {"));
         assert!(!runtime_source(true, false, true, false).contains("fn __gc_finalize(kind: u64, p: *mut u8) {"));
         // Round 49: the same for the thread dispatcher.

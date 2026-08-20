@@ -16,9 +16,9 @@
 //! code held one `imul` for it per iteration — 240 times per row,
 //! 240 × 240 × 3 times per run. LLVM pulls that out, Firn did not.
 //!
-//! ## What gets hoisted
+//! ## What is hoisted
 //!
-//! One instruction moves to the **preheader** once all of this holds:
+//! An instruction moves to the **preheader** once all of this holds:
 //!
 //! * It is **pure**: `const`, `bin`, `cmp`, `un`, `cast`, `ptradd`. No
 //!   `load` (not provable without alias analysis), no `store`, `call`,
@@ -37,10 +37,10 @@
 //!
 //! The preheader **dominates** the whole loop; every hoisted definition is
 //! therefore valid at every use site it had so far. The `Val` id stays the
-//! same, nothing gets rewritten — only the position changes.
+//! same, nothing is rewritten — only the position changes.
 //!
-//! One instruction out of a block that does **not** execute on every pass
-//! (say inside some `if` within the loop body) executes unconditionally after
+//! An instruction from a block that does **not** execute on every pass
+//! (say inside an `if` in the loop body) executes unconditionally after
 //! hoisting. For trap-free, pure computations that preserves behaviour — at
 //! worst the preheader computes something nobody reads. Exactly that is why
 //! trap freedom above is a condition and not a
@@ -48,8 +48,8 @@
 //!
 //! Nested loops need no special handling here: `opt.rs` iterates up to the
 //! fixpoint, and whatever moved from the inner loop into its preheader lies
-//! afterwards within the body of the outer one and moves on during the next
-//! round. Within `matmul` `r * n` reaches the head of the `cc` loop that way.
+//! afterwards in the body of the outer one and moves on in the next
+//! round. In `matmul` `r * n` reaches the head of the `cc` loop that way.
 
 use crate::fir::{BinOp, Func, Inst, Op, Term, Val};
 use std::collections::HashSet;
@@ -116,7 +116,7 @@ fn natural_loop(head: usize, back: usize, preds: &[Vec<usize>]) -> HashSet<usize
 }
 
 /// The one predecessor of the head outside the loop — and only if it jumps
-/// there with a plain `br`. Given several entries the loop gets skipped:
+/// there with a plain `br`. Given several entries the loop is skipped:
 /// introducing a preheader would shift the block numbers, and that is not
 /// worth this pass.
 fn preheader_of(f: &Func, head: usize, body: &HashSet<usize>, preds: &[Vec<usize>]) -> Option<usize> {
@@ -186,8 +186,8 @@ fn hoist_out(f: &mut Func, head: usize, body: &HashSet<usize>, preheader: usize)
                 if buf.iter().any(|v| in_loop.contains(v) || f.is_secret(*v)) {
                     continue;
                 }
-                // The head itself may keep its condition: one instruction that
-                // the terminator of the head needs is hoistable indeed, yet the
+                // The head itself may keep its condition: an instruction that
+                // the terminator of the head needs is hoistable indeed, but the
                 // gain is zero. We hoist it anyway — it is invariant, so the
                 // condition is invariant too.
                 let _ = head;
@@ -199,7 +199,7 @@ fn hoist_out(f: &mut Func, head: usize, body: &HashSet<usize>, preheader: usize)
             Some(x) => x,
             None => break,
         };
-        // 3. Move: to the end of the preheader, ahead of its terminator.
+        // 3. Move: to the end of the preheader, in front of its terminator.
         let inst: Inst = f.blocks[b].insts.remove(ix);
         f.blocks[preheader].insts.push(inst);
         moved += 1;

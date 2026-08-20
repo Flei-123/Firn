@@ -16,15 +16,15 @@
 //!
 //! **Deliberately not here yet:** `secret[T]` as a type qualifier, the
 //! spreading of that marker through expressions, `declassify` and the effect
-//! of `#[constant_time]`. As long as no `secret` values exist, the check at
+//! of `#[constant_time]`. As long as no `secret` values exist, the check in
 //! the code generator (`f.constant_time && f.is_secret(cond)`) is present
 //! but unfed — which is why `attrs.rs` keeps `#[constant_time]` listed as
 //! *not implemented*, reporting a clean error. Recorded by
 //! SPEC §14.1.
 //!
 //! `barrier(inout x)`/`secure_zero(inout buf)` from SPEC §9 need `inout`,
-//! which stage 0 lacks; the stage 0 form takes the value, respectively a
-//! pointer plus length. That too is written down at SPEC §14.1.
+//! which stage 0 lacks; the stage 0 form takes the value, or a
+//! pointer plus length. That too is written down in SPEC §14.1.
 
 use crate::ast::Expr;
 use crate::diag::Span;
@@ -38,7 +38,7 @@ pub(crate) const SELECT: &str = "select";
 pub(crate) const BARRIER: &str = "barrier";
 pub(crate) const SECURE_ZERO: &str = "secure_zero";
 
-/// Does this spelling belong to a builtin constant-time primitive?
+/// Is this spelling the name of a builtin constant-time primitive?
 pub(crate) fn is_ct_call(name: &str) -> bool {
     matches!(name, SELECT | BARRIER | SECURE_ZERO)
 }
@@ -52,7 +52,7 @@ fn is_scalar(t: &Type) -> bool {
 // ----------------------------------------------------------------- Type phase
 
 /// Hook from `sema::call`. Yields `None` if the spelling is no primitive or
-/// if the program holds a function of the same spelling — that one wins.
+/// if the program contains a function of the same spelling — that one wins.
 pub(crate) fn hook_call(
     ck: &mut Checker,
     name: &str,
@@ -71,7 +71,7 @@ pub(crate) fn hook_call(
 }
 
 /// Check the expected argument count; on a mismatch the arguments present
-/// still get typed, so that no ExprId is left without a type.
+/// are still typed, so that no ExprId is left without a type.
 fn digit_count(ck: &mut Checker, name: &str, args: &[Expr], should: usize, nspan: Span) -> bool {
     if args.len() == should {
         return true;
@@ -233,7 +233,7 @@ pub(crate) fn lower_ct_call(
 }
 
 /// The byte count of `secure_zero` is needed as `u64`; narrower integers
-/// get widened (sign correct per source type).
+/// are widened (sign correct per source type).
 fn align(lw: &mut Lower, arg: &Expr, v: Val) -> Option<Val> {
     let from = lw.fty_of(arg)?;
     if from == FTy::U64 || from == FTy::I64 {
@@ -280,8 +280,8 @@ mod tests {
         }
     }
 
-    /// PROOF (SPEC §9.3, `C3`): `secure_zero` stays, although the buffer never
-    /// gets read afterwards — the optimizer may not drop it as a dead memory
+    /// PROOF (SPEC §9.3, `C3`): `secure_zero` stays, although the buffer is
+    /// never read afterwards — the optimizer must not drop it as a dead
     /// access.
     #[test]
     fn secure_zero_survives_the_optimizer() {
@@ -295,8 +295,8 @@ mod tests {
         assert!(asm.contains("rep stosb"), "secure_zero removed:\n{}", asm);
     }
 
-    /// PROOF (SPEC §9.2): `barrier` survives constant folding — the value does
-    /// NOT get replaced by the constant.
+    /// PROOF (SPEC §9.2): `barrier` survives constant folding — the value is
+    /// NOT replaced by the constant.
     #[test]
     fn barrier_stays_opaque() {
         let asm = asm_of("fn main() -> i32 { let a: i32 = barrier(7 as i32)\n return a }\n");
