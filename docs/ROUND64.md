@@ -401,3 +401,18 @@ docs/DEBUGGER.md          rewritten
 docs/ROUND64.md           this file
 tests/neg/1050..1065      twelve negative tests for the suggestions
 ```
+
+
+---
+
+## 9. One thing about the numbers
+
+`tests/860_thread_basic.fi` failed once during the acceptance runs of this
+round, with exit code 14. That is case C of the test: the counter WITHOUT a
+lock has to LOSE increments, otherwise the proof that the mutex works would
+be worthless. Under extreme machine load (five test suites at the same time)
+the four threads got serialised and the unlocked counter came out exact --
+so the counter-check did not strike and the test rightly reported a failure.
+Ten runs of the same binary on a quiet machine give 0 ten times out of ten.
+It is named here because a number that only holds on a quiet machine is
+worth naming.
