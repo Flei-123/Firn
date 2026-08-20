@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# tools/englisch/erwartungen.py — zieht die Testerwartungen nach.
+# tools/english/expectations.py — zieht die Testerwartungen nach.
 #
 #   --namen       Bezeichner in `// expect_error:` / `// expect_out:` ersetzen.
 #                 Angefasst wird nur, was in 'einfachen Anfuehrungszeichen'
@@ -46,8 +46,8 @@ def dateien():
 
 
 def namen():
-    abb = tabelle('tools/englisch/namen.tsv')
-    for k, v in tabelle('tools/englisch/strings.tsv').items():
+    abb = tabelle('tools/english/names.tsv')
+    for k, v in tabelle('tools/english/strings.tsv').items():
         abb.setdefault(k, v)
     n = 0
     for p in dateien():

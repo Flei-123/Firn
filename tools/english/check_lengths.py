@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tools/englisch/pruefe_laengen.py — GEGENPROBE fuer die LAENGENANGABEN.
+"""tools/english/check_lengths.py — GEGENPROBE fuer die LAENGENANGABEN.
 
 In Firn stehen Zeichenketten als `var w: [u8; N] = "…"`. Die Laenge wird an
 der Aufrufstelle NOCH EINMAL als Zahl mitgegeben:
@@ -59,7 +59,7 @@ def main():
                     treffer.append((f, i + 1, name, zahl, echt, roh))
     for t in treffer:
         print("LAENGE %s:%d  %s uebergibt %d, Text ist %d ('%s')" % t)
-    print('falsche Laengenangaben:', len(treffer))
+    print('wrong length values:', len(treffer))
     return 1 if treffer else 0
 
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Uebersetzt die Diagnose- und Ausgabetexte beider Uebersetzer ins Englische.
 
-Die Tabelle `meldungen.tsv` bildet den EXAKTEN Rumpf eines Zeichenkettenliterals
+Die Tabelle `messages.tsv` bildet den EXAKTEN Rumpf eines Zeichenkettenliterals
 (so wie er im Quelltext zwischen den Anfuehrungszeichen steht, mit Maskierungen)
 auf den englischen Rumpf ab. Ersetzt wird nur bei VOLLSTAENDIGER Uebereinstimmung
 — nie ein Teilstueck; sonst zerfaellt der Text unkontrolliert.
@@ -53,7 +53,7 @@ def sichtbar(rumpf: str) -> str:
 
 def tabelle():
     t = {}
-    for zeile in open(os.path.join(HIER, 'meldungen.tsv'), encoding='utf-8'):
+    for zeile in open(os.path.join(HIER, 'messages.tsv'), encoding='utf-8'):
         zeile = zeile.rstrip('\n')
         if not zeile.strip() or ('\t' not in zeile and zeile.startswith('#')):
             continue

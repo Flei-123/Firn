@@ -399,16 +399,16 @@ else
     tail -20 "$WORK/packages.log" | sed 's/^/   /'
 fi
 
-echo "== 21. english migration: no German identifiers left (tools/englisch/pruefe.sh) =="
+echo "== 21. english migration: no German identifiers left (tools/english/check.sh) =="
 # Stage A (round 55): every identifier in compiler/src, lib, bin, tools,
 # tests and demos is held against the morpheme table. A hit means
 # that a German name was overlooked.
-bash tools/englisch/pruefe.sh > "$WORK/english.log" 2>&1 && ENRC=0 || ENRC=$?
+bash tools/english/check.sh > "$WORK/english.log" 2>&1 && ENRC=0 || ENRC=$?
 if [ "$ENRC" -eq 0 ]; then
     ok
     tail -1 "$WORK/english.log" | sed 's/^/   /'
 else
-    bad "tools/englisch/pruefe.sh reports German identifiers (see .test-work/english.log)"
+    bad "tools/english/check.sh reports German identifiers (see .test-work/english.log)"
     tail -20 "$WORK/english.log" | sed 's/^/   /'
 fi
 

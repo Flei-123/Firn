@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""tools/englisch/pruefe.py — GEGENPROBE zur Englisch-Umstellung.
+"""tools/english/check.py — GEGENPROBE zur Englisch-Umstellung.
 
 Sucht in ALLEN Bezeichnern (compiler/src, lib, bin, tools, tests, demos,
-examples) nach deutschen Wortteilen aus tools/englisch/morpheme.tsv.
+examples) nach deutschen Wortteilen aus tools/english/morphemes.tsv.
 Ein Treffer heisst: dieser Name ist noch deutsch.
 
 Kommentare, Zeichenketten und Dateikoepfe zaehlen NICHT — die sind Etappe B.
-Bekannte, bewusst deutsch bleibende Namen stehen in ausnahmen.txt.
+Bekannte, bewusst deutsch bleibende Namen stehen in exceptions.txt.
 """
 import os, re, sys
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.chdir(ROOT)
-sys.path.insert(0, 'tools/englisch')
-import quelltext as Q
+sys.path.insert(0, 'tools/english')
+import source as Q
 
 ROOTS = ['compiler/src', 'lib', 'bin', 'tools', 'tests', 'demos', 'examples', 'bench']
 # Ein angehaengter Zaehler versteckt das deutsche Wort: 'pfad2', 'teil1'.
@@ -22,7 +22,7 @@ TEIL = re.compile(r'[a-z0-9]+|[A-Z]+(?![a-z])|[A-Z][a-z0-9]*')
 
 def morpheme():
     t = set()
-    for z in open('tools/englisch/morpheme.tsv', encoding='utf-8'):
+    for z in open('tools/english/morphemes.tsv', encoding='utf-8'):
         if z.strip() and not z.startswith('#'):
             a, b = (z.rstrip('\n').split('\t') + [''])[:2]
             a, b = a.strip().lower(), b.strip().lower()
@@ -33,7 +33,7 @@ def morpheme():
 
 
 def ausnahmen():
-    p = 'tools/englisch/ausnahmen.txt'
+    p = 'tools/english/exceptions.txt'
     if not os.path.exists(p):
         return set()
     return {z.strip() for z in open(p, encoding='utf-8')
@@ -71,9 +71,9 @@ def main():
                 treffer.setdefault(n, (schuld, set()))[1].add(f)
     for n in sorted(treffer):
         s, fs = treffer[n]
-        print('DEUTSCH %-32s (%s)  %s' % (n, ','.join(sorted(set(s))),
+        print('GERMAN  %-32s (%s)  %s' % (n, ','.join(sorted(set(s))),
                                           ' '.join(sorted(fs)[:3])))
-    print('%d deutsche Bezeichner' % len(treffer))
+    print('German identifiers: %d' % len(treffer))
     return 1 if treffer else 0
 
 

@@ -2,7 +2,7 @@
 """Richtet die LAENGENANGABEN an den Aufrufstellen `(&x[0]) as u64, N`.
 
 Die Umbenennung aendert die Byte-Laenge der Zeichenkettenliterale. Die
-Deklaration `var x: [u8; N] = "..."` zieht laengen.py mit; die zweite Stelle,
+Deklaration `var x: [u8; N] = "..."` zieht lengths.py mit; die zweite Stelle,
 an der dieselbe Laenge NOCH EINMAL als Zahl steht (der Aufruf), nicht.
 Fehlt sie, laeuft alles scheinbar weiter und bricht spaeter.
 

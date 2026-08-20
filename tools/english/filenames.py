@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-# tools/englisch/dateinamen.py — benennt Dateien und Verzeichnisse mit
+# tools/english/filenames.py — benennt Dateien und Verzeichnisse mit
 # deutschen Namensbestandteilen um (git mv) und zieht ALLE Verweise auf den
 # alten Pfad im ganzen Baum nach.
 #
-#   python3 tools/englisch/dateinamen.py --probe [wurzel ...]
-#   python3 tools/englisch/dateinamen.py         [wurzel ...]
+#   python3 tools/english/filenames.py --probe [wurzel ...]
+#   python3 tools/english/filenames.py         [wurzel ...]
 #
 # Ersetzt werden nur VOLLE Pfade (`lib/firnc1/types.fi`) und, fuer Dateien
 # ohne Verzeichnisanteil im Verweis, der volle Dateiname (`types.fi`) —
@@ -16,8 +16,8 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.chdir(ROOT)
-sys.path.insert(0, 'tools/englisch')
-import vorschlag as V
+sys.path.insert(0, 'tools/english')
+import suggest as V
 
 AUS = ('.git', 'target', '__pycache__', '.test-work', '.gauntlet-shots',
        'testdata', '.gc-meas-work', '.dom-soak-work', 'node_modules',
@@ -50,9 +50,9 @@ def main(argv):
     probe = '--probe' in argv
     wurzeln = [a for a in argv if not a.startswith('--')] or \
         ['compiler/src', 'lib', 'bin', 'tools', 'tests', 'beispiele', 'examples', 'bench', 'testdata']
-    morph = V.tabelle('tools/englisch/morpheme.tsv')
-    hand = V.tabelle('tools/englisch/hand.tsv')
-    namen = V.tabelle('tools/englisch/namen.tsv')
+    morph = V.tabelle('tools/english/morphemes.tsv')
+    hand = V.tabelle('tools/english/manual.tsv')
+    namen = V.tabelle('tools/english/names.tsv')
     hand = dict(namen, **hand)
 
     # 1. Umbenennungen sammeln (Dateien zuerst, dann Verzeichnisse von innen)

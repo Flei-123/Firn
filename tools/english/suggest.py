@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-# tools/englisch/vorschlag.py — baut aus der Morphemtabelle und den
-# Handentscheidungen die VOLLSTAENDIGE Bezeichner-Abbildung `namen.tsv`.
+# tools/english/suggest.py — baut aus der Morphemtabelle und den
+# Handentscheidungen die VOLLSTAENDIGE Bezeichner-Abbildung `names.tsv`.
 #
-#   morpheme.tsv  deutsches Wortteil  -> englisches Wortteil
-#   hand.tsv      GANZER Bezeichner   -> englischer Bezeichner (schlaegt alles)
-#   namen.tsv     Ergebnis: alt -> neu, wird von umbenennen.py angewandt
+#   morphemes.tsv  deutsches Wortteil  -> englisches Wortteil
+#   manual.tsv      GANZER Bezeichner   -> englischer Bezeichner (schlaegt alles)
+#   names.tsv     Ergebnis: alt -> neu, wird von rename.py angewandt
 #
 # Geprueft wird dabei:
 #   * kein Zielname ist ein Schluesselwort von Rust oder Firn
@@ -12,7 +12,7 @@
 #     denselben englischen Namen fallen — sonst verdeckt einer den anderen)
 #   * kein Zielname kollidiert in DERSELBEN Datei mit einem Bezeichner,
 #     der unveraendert bleibt
-# Alles davon wird als Fehler gemeldet; `namen.tsv` entsteht trotzdem, damit
+# Alles davon wird als Fehler gemeldet; `names.tsv` entsteht trotzdem, damit
 # man die Meldungen abarbeiten kann.
 import re
 import os
@@ -21,8 +21,8 @@ import collections
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.chdir(ROOT)
-sys.path.insert(0, 'tools/englisch')
-import quelltext as Q
+sys.path.insert(0, 'tools/english')
+import source as Q
 
 RUST_KW = set("""as break const continue crate dyn else enum extern false fn for if impl in let
 loop match mod move mut pub ref return self Self static struct super trait true type unsafe use
@@ -113,12 +113,12 @@ def rumpfe(src, rust):
 
 
 def main():
-    morph = tabelle('tools/englisch/morpheme.tsv')
-    hand = tabelle('tools/englisch/hand.tsv')
-    geprueft = set(tabelle('tools/englisch/geprueft.tsv').items())
+    morph = tabelle('tools/english/morphemes.tsv')
+    hand = tabelle('tools/english/manual.tsv')
+    geprueft = set(tabelle('tools/english/checked.tsv').items())
     handd = {}
-    if os.path.exists('tools/englisch/hand_datei.tsv'):
-        for z in open('tools/englisch/hand_datei.tsv', encoding='utf-8'):
+    if os.path.exists('tools/english/manual_file.tsv'):
+        for z in open('tools/english/manual_file.tsv', encoding='utf-8'):
             if not z.strip() or z.startswith('#'):
                 continue
             d, a, n = z.rstrip('\n').split('\t')
@@ -207,13 +207,13 @@ def main():
         if n in abb:
             fehler.append(f"KETTE           {a} -> {n} -> {abb[n]}")
 
-    with open('tools/englisch/namen.tsv', 'w', encoding='utf-8') as f:
+    with open('tools/english/names.tsv', 'w', encoding='utf-8') as f:
         for k in sorted(abb):
             f.write(f"{k}\t{abb[k]}\n")
-    with open('tools/englisch/namen_datei.tsv', 'w', encoding='utf-8') as f:
+    with open('tools/english/names_file.tsv', 'w', encoding='utf-8') as f:
         for (d, a) in sorted(handd):
             f.write(f"{d}\t{a}\t{handd[(d, a)]}\n")
-    with open('tools/englisch/offen.txt', 'w', encoding='utf-8') as f:
+    with open('tools/english/open.txt', 'w', encoding='utf-8') as f:
         for w, c in offen.most_common():
             f.write(f"{c}\t{w}\n")
 

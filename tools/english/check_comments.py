@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tools/englisch/pruefe_kommentare.py — MASSSTAB fuer Etappe B.
+"""tools/english/check_comments.py — MASSSTAB fuer Etappe B.
 
 Etappe A hat Bezeichner, Meldungen und Pfadnamen englisch gemacht. Etappe B
 sind die KOMMENTARE und die Dokumentation. Prosa laesst sich nicht ueber die
@@ -12,9 +12,9 @@ gibt (in, an, am, es, man, war, hat, die, name, wert) — die erste Fassung tat
 das und hat englische Saetze als deutsch gemeldet; wer den Massstab dann
 erfuellen will, schreibt verkrampftes Englisch.
 
-  python3 tools/englisch/pruefe_kommentare.py            Bilanz je Bereich
-  python3 tools/englisch/pruefe_kommentare.py --dateien  Bilanz je Datei
-  python3 tools/englisch/pruefe_kommentare.py --zeilen <datei>   die Zeilen
+  python3 tools/english/check_comments.py            Bilanz je Bereich
+  python3 tools/english/check_comments.py --dateien  Bilanz je Datei
+  python3 tools/english/check_comments.py --zeilen <datei>   die Zeilen
 
 Rueckgabe 1, solange noch deutsche Zeilen uebrig sind.
 """
@@ -38,7 +38,7 @@ RE_WORT = re.compile(r'\b(' + '|'.join(WORTE) + r')\b', re.I)
 BEREICHE = [('compiler/src', ('.rs',)), ('lib', ('.fi',)), ('bin', ('.fi',)),
             ('tests', ('.fi',)), ('demos', ('.fi',)), ('bench', ('.fi',)),
             ('tools', ('.sh', '.py', '.fi')), ('docs', ('.md',))]
-AUS = ('testdata/', 'tools/englisch/')
+AUS = ('testdata/', 'tools/english/')
 
 
 def dateien():
@@ -99,7 +99,7 @@ def main():
     else:
         for b, n in sorted(je_bereich.items(), key=lambda x: -x[1]):
             print(f"{n:6d}  {b}")
-    print(f"deutsche Kommentar-/Dokuzeilen: {summe}")
+    print(f"German comment/doc lines: {summe}")
     return 1 if summe else 0
 
 
