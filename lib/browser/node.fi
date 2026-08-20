@@ -1,36 +1,36 @@
-// lib/browser/node.fi — DOM-KERN (Runde 54), in Firn.
+// lib/browser/node.fi -- the DOM CORE (round 54), in Firn.
 //
-// Die Datenstruktur, auf der ab hier alles aufsetzt: der Baumaufbau
-// (lib/browser/tree.fi), spaeter CSS-Zuordnung und Layout. Sie ist bewusst
-// eine ECHTE DOM-Form und keine Abkuerzung fuer den Parser:
+// The data structure everything from here on builds upon: the tree
+// construction (lib/browser/tree.fi), and later CSS matching and layout. It
+// is deliberately a REAL DOM shape and no shortcut for the parser:
 //
-//   * jeder Knoten kennt seine Eltern, sein erstes/letztes Kind und beide
-//     Geschwister. Alle Verweise sind STARK — der Baum ist also voller
-//     Zyklen, und genau dafuer gibt es den Tracing-Sammler (SPEC §3.5).
-//     Ein Zaehlverweis wuerde hier NIE etwas freigeben.
-//   * Namen (Element- und Attributnamen) sind ATOME: eine `u32`-Kennung in
-//     eine Tabelle (lib/browser/names.fi). Vergleich ist ein Ganzzahlvergleich,
-//     kein Zeichenvergleich — das ist die Voraussetzung dafuer, dass der
-//     Baumaufbau seine vielen Namensfragen ueberhaupt bezahlbar stellt.
-//   * Textdaten sind KETTEN aus GC-Stuecken (`Kette`/`Strang`). Damit lebt
-//     JEDES Byte des Dokuments im GC-Heap; es gibt keine Arena, die an der
-//     Lebensdauer des Dokuments haengt. Haelt eine JS-Referenz spaeter einen
-//     einzelnen Textknoten fest, bleibt genau dieser Text am Leben und sonst
-//     nichts. Das ist der Grund fuer die Bauart, und ihr Preis ist benannt:
-//     ein Zeichen kostet 4 Byte (Codepunkt), ein Stueck fasst 28 davon.
-//   * Namensraeume sind Marker (`NS_HTML`, `NS_SVG`, `NS_MATHML`, …). Sie
-//     stehen am Element UND am Attribut, weil beide sie brauchen.
+//   * every node knows its parent, its first/last child and both siblings.
+//     All references are STRONG -- so the tree is full of cycles, and that
+//     is exactly what the tracing collector is there for (SPEC 3.5).
+//     A reference count would NEVER release anything here.
+//   * names (element and attribute names) are ATOMS: a `u32` id into a
+//     table (lib/browser/names.fi). A comparison is an integer comparison,
+//     not a character comparison -- that is the precondition for the tree
+//     construction being able to afford its many questions about names.
+//   * text data are CHAINS of GC pieces (`Chain`/`Strand`). With that, EVERY
+//     byte of the document lives in the GC heap; there is no arena hanging
+//     on the lifetime of the document. If a JS reference later holds a
+//     single text node, exactly that text stays alive and nothing else.
+//     That is the reason for the build, and its price is named:
+//     one character costs 4 bytes (a code point), one piece holds 28 of them.
+//   * namespaces are markers (`NS_HTML`, `NS_SVG`, `NS_MATHML`, ...). They
+//     stand on the element AND on the attribute, because both need them.
 //
-// EHRLICHE GRENZEN (Stand Runde 54):
-//   * `kette_bei` laeuft die Stueckliste ab — O(n/28). Fuer den Vergleich
-//     zweier Ketten und fuer die Ausgabe gibt es Stueck-fuer-Stueck-Wege,
-//     die das nicht tun; wer zeichenweise indiziert, zahlt.
-//   * Es gibt keine `id`/`class`-Register, keine Live-Sammlungen und keine
-//     Mutationsbeobachter. Die Verweise dafuer sind vorgesehen (der Baum
-//     traegt sie problemlos), gebaut sind sie nicht.
-//   * Kein `Node.ownerDocument` an jedem Knoten: der Baumaufbau kennt das
-//     Dokument ohnehin, und ein zusaetzlicher Verweis je Knoten kostet
-//     8 Byte, die noch niemand braucht.
+// THE HONEST LIMITS (as of round 54):
+//   * `chain_at` walks the piece list -- O(n/28). For comparing two chains
+//     and for the output there are piece by piece paths that do not do
+//     that; whoever indexes character by character pays.
+//   * There are no `id`/`class` registries, no live collections and no
+//     mutation observers. The references for them are foreseen (the tree
+//     carries them without trouble), but they are not built.
+//   * No `Node.ownerDocument` on every node: the tree construction knows the
+//     document anyway, and an extra reference per node costs
+//     8 bytes that nobody needs yet.
 
 import html.mem
 
@@ -53,10 +53,10 @@ export {
     node_depth, node_ancestor_is,
 }
 
-// --------------------------------------------------------------- Konstanten
+// --------------------------------------------------------------- Constants
 
-// Namensraeume. Als Marker, nicht als Zeichenkette — der Baumaufbau
-// vergleicht sie millionenfach.
+// Namespaces. As markers, not as strings -- the tree construction
+// compares them millions of times.
 const NS_HTML: u32 = 1
 const NS_SVG: u32 = 2
 const NS_MATHML: u32 = 3
@@ -64,7 +64,7 @@ const NS_XLINK: u32 = 4
 const NS_XML: u32 = 5
 const NS_XMLNS: u32 = 6
 
-// Knotenarten (`nodeType` in der DOM-Sprache, hier eigene Nummern).
+// The node kinds (`nodeType` in DOM language, our own numbers here).
 const K_DOCUMENT: u32 = 1
 const K_ELEM: u32 = 2
 const K_TEXT: u32 = 3
@@ -72,37 +72,37 @@ const K_COMMENT: u32 = 4
 const K_DOCTYPE: u32 = 5
 const K_FRAGMENT: u32 = 6
 
-// Dokumentmodus (WHATWG "quirks mode").
+// The document mode (WHATWG "quirks mode").
 const MODE_NO_QUIRKS: u32 = 0
 const MODE_QUIRKS: u32 = 1
 const MODE_LIMITED: u32 = 2
 
-// Zeichen je Kettenstueck. 28 * 4 = 112 Byte Nutzdaten + 8 (naechster) + 4
-// (len) = 124, aufgerundet 128 — genau eine Groessenklasse des Sammlers
-// (lib/gc/gc.fi, __gc_klassen_bytes: 32/48/64/96/128/…), also kein Verschnitt.
+// Characters per chain piece. 28 * 4 = 112 bytes of payload + 8 (next) + 4
+// (len) = 124, rounded up 128 -- exactly one size class of the collector
+// (lib/gc/gc.fi, __gc_classes_bytes: 32/48/64/96/128/...), so no waste.
 const STRAND_CHAR: usize = 28
 
-// --------------------------------------------------------------- Klassen
+// ------------------------------------------------------------- The classes
 
-// Ein Stueck einer Zeichenkette. Codepunkte, nicht Bytes: der Tokenizer
-// liefert Codepunkte (mem.CpBuf), und ungepaarte Surrogate muessen erhalten
-// bleiben (SPEC §8.2) — eine UTF-8-Ablage koennte das nur mit WTF-8.
+// One piece of a string. Code points, not bytes: the tokenizer delivers code
+// points (mem.CpBuf), and unpaired surrogates have to be preserved
+// (SPEC 8.2) -- a UTF-8 storage could do that only with WTF-8.
 gc class Strand {
     next: Gc[Strand],
     len: u32,
     chars: [u32; 28],
 }
 
-// Der Griff auf eine Kette: Kopf, Schwanz und Gesamtlaenge. Der Schwanz ist
-// der Grund, warum Anhaengen O(1) ist — der Tokenizer haengt Zeichen einzeln
-// an, millionenfach.
+// The handle on a chain: head, tail and total length. The tail is the reason
+// why appending is O(1) -- the tokenizer appends characters one at a time,
+// millions of times.
 gc class Chain {
     first: Gc[Strand],
     last: Gc[Strand],
     length: u64,
 }
 
-// Der Basisknoten. ALLE Baumverweise sind stark, in beide Richtungen.
+// The base node. ALL tree references are strong, in both directions.
 gc class Node {
     parent: Gc[Node],
     first_child: Gc[Node],
@@ -113,7 +113,7 @@ gc class Node {
     children: u32,
 }
 
-// Praefixlayout (SPEC §4.4): `Gc[Element]` ist kostenlos `Gc[Knoten]`.
+// The prefix layout (SPEC 4.4): a `Gc[Elem]` is a `Gc[Node]` for free.
 gc class Elem extends Node {
     first_attr: Gc[Attr],
     last_attr: Gc[Attr],
@@ -122,9 +122,9 @@ gc class Elem extends Node {
     nattr: u32,
 }
 
-// Attribute haengen als einfach verkettete Liste am Element. Die REIHENFOLGE
-// ist bedeutsam, und Attributzahlen sind klein — eine Hashtabelle je Element
-// waere teurer als die Liste, die sie ersetzen soll.
+// Attributes hang on the element as a singly linked list. The ORDER matters,
+// and attribute counts are small -- a hash table per element would be more
+// expensive than the list it is meant to replace.
 gc class Attr {
     next: Gc[Attr],
     value: Gc[Chain],
@@ -156,7 +156,7 @@ gc class Fragment extends Node {
     host: u32,
 }
 
-// ------------------------------------------------------------------ Ketten
+// ------------------------------------------------------------------ Chains
 
 fn chain_new() -> AllocError!Gc[Chain] {
     return try gc Chain{
@@ -174,7 +174,7 @@ fn strand_new() -> AllocError!Gc[Strand] {
     }
 }
 
-// Haengt einen Codepunkt an. O(1).
+// Appends a code point. O(1).
 fn chain_push(k: Gc[Chain], cp: u32) -> AllocError!bool {
     var s: Gc[Strand] = k.last
     if s == gc_null[Strand]() || s.len as usize >= STRAND_CHAR {
@@ -205,8 +205,8 @@ fn chain_empty(k: Gc[Chain]) -> bool {
     return chain_len(k) == 0
 }
 
-// Zeichen an Stelle `i`. O(i/28) — wer eine Kette zeichenweise durchlaeuft,
-// nimmt besser `kette_nach_cpbuf`.
+// The character at position `i`. O(i/28) -- whoever walks a chain character
+// by character had better take `chain_after_cpbuf`.
 fn chain_at(k: Gc[Chain], i: u64) -> u32 {
     if k == gc_null[Chain]() || i >= k.length {
         return 0
@@ -224,7 +224,7 @@ fn chain_at(k: Gc[Chain], i: u64) -> u32 {
     return 0
 }
 
-// Baut eine Kette aus einem Codepunktpuffer des Tokenizers.
+// Builds a chain out of a code point buffer of the tokenizer.
 fn chain_out_cpbuf(b: *mut mem.CpBuf) -> AllocError!Gc[Chain] {
     let k = try chain_new()
     let n: usize = mem.cp_len(b)
@@ -252,7 +252,7 @@ fn chain_push_cpbuf(k: Gc[Chain], b: *mut mem.CpBuf) -> AllocError!bool {
     return true
 }
 
-// Haengt den Inhalt der Kette an einen Codepunktpuffer an (Ausgabeweg).
+// Appends the content of the chain to a code point buffer (the output path).
 fn chain_after_cpbuf(k: Gc[Chain], out: *mut mem.CpBuf) {
     if k == gc_null[Chain]() {
         return
@@ -304,7 +304,7 @@ fn chain_equal(a: Gc[Chain], b: Gc[Chain]) -> bool {
     return true
 }
 
-// Vergleich mit einem ASCII-Literal (`[u8; N]` per Zeiger + Laenge).
+// A comparison with an ASCII literal (`[u8; N]` as pointer + length).
 fn chain_equal_ascii(k: Gc[Chain], p: *mut u8, n: usize) -> bool {
     if chain_len(k) != n as u64 {
         return false
@@ -326,8 +326,8 @@ fn ascii_small(c: u32) -> u32 {
     return c
 }
 
-// Wie `kette_gleich_ascii`, aber die Kette wird ASCII-kleingeschrieben
-// verglichen (DOCTYPE-Kennungen sind laut Standard ASCII-fallunempfindlich).
+// Like `chain_equal_ascii`, but the chain is compared ASCII lowercased
+// (DOCTYPE identifiers are ASCII case insensitive per the standard).
 fn chain_equal_ascii_small(k: Gc[Chain], p: *mut u8, n: usize) -> bool {
     if chain_len(k) != n as u64 {
         return false
@@ -335,7 +335,7 @@ fn chain_equal_ascii_small(k: Gc[Chain], p: *mut u8, n: usize) -> bool {
     return chain_starts_ascii_small(k, p, n)
 }
 
-// Beginnt die Kette (ASCII-kleingeschrieben) mit dem Literal?
+// Does the chain (ASCII lowercased) start with the literal?
 fn chain_starts_ascii_small(k: Gc[Chain], p: *mut u8, n: usize) -> bool {
     if chain_len(k) < n as u64 {
         return false
@@ -362,7 +362,7 @@ fn chain_starts_ascii_small(k: Gc[Chain], p: *mut u8, n: usize) -> bool {
     return true
 }
 
-// ------------------------------------------------------------- Knoten bauen
+// ---------------------------------------------------------- Building nodes
 
 fn document_new() -> AllocError!Gc[Document] {
     return try gc Document{
@@ -451,11 +451,11 @@ fn doctype_new(name: Gc[Chain], pubid: Gc[Chain], sysid: Gc[Chain],
     }
 }
 
-// ---------------------------------------------------------- Baumstruktur
+// ------------------------------------------------------ The tree structure
 
-// Haengt `kind` als letztes Kind an `eltern`. Ist `kind` schon irgendwo
-// eingehaengt, wird es vorher ausgehaengt — genau die Semantik von
-// `Node.appendChild`, auf die sich das Adoption-Agency-Verfahren stuetzt.
+// Appends `child` as the last child of `parent`. If `child` is already
+// hooked in somewhere, it is unhooked first -- exactly the semantics of
+// `Node.appendChild` the adoption agency algorithm relies on.
 fn append_child(parent: Gc[Node], kind: Gc[Node]) {
     if parent == gc_null[Node]() || kind == gc_null[Node]() {
         return
@@ -475,9 +475,9 @@ fn append_child(parent: Gc[Node], kind: Gc[Node]) {
     parent.children = parent.children + 1
 }
 
-// Fuegt `kind` unmittelbar VOR `referenz` ein. `referenz` muss ein Kind von
-// `eltern` sein; ist sie der Nullzeiger, wird angehaengt. Das ist der Weg,
-// den "foster parenting" und das Adoption-Agency-Verfahren brauchen.
+// Inserts `child` immediately BEFORE `reference`. `reference` has to be a
+// child of `parent`; if it is the null pointer, it is appended. That is the
+// path "foster parenting" and the adoption agency algorithm need.
 fn kind_insert_before(parent: Gc[Node], kind: Gc[Node], reference: Gc[Node]) {
     if reference == gc_null[Node]() {
         append_child(parent, kind)
@@ -525,9 +525,9 @@ fn kind_remove(kind: Gc[Node]) {
     kind.next = gc_null[Node]()
 }
 
-// Haengt ALLE Kinder von `von` an `nach` um, in Reihenfolge. Das
-// Adoption-Agency-Verfahren braucht genau das (Schritt 14:
-// "Take all of the child nodes of common ancestor …").
+// Moves ALL children of `from` over to `to`, in order. The
+// adoption agency algorithm needs exactly that (step 14:
+// "Take all of the child nodes of common ancestor ...").
 fn relink_children(of: Gc[Node], after: Gc[Node]) {
     if of == gc_null[Node]() || after == gc_null[Node]() {
         return
@@ -539,7 +539,7 @@ fn relink_children(of: Gc[Node], after: Gc[Node]) {
     }
 }
 
-// Stelle eines Kindes in seiner Elternliste, -1 wenn es keine Eltern hat.
+// The position of a child in its parent list, -1 if it has no parent.
 fn node_index(kind: Gc[Node]) -> i64 {
     if kind == gc_null[Node]() || kind.parent == gc_null[Node]() {
         return -1
@@ -593,7 +593,7 @@ fn node_ancestor_is(k: Gc[Node], possible: Gc[Node]) -> bool {
     return false
 }
 
-// ---------------------------------------------------------------- Elemente
+// ---------------------------------------------------------------- Elements
 
 fn node_is_elem(k: Gc[Node]) -> bool {
     if k == gc_null[Node]() {
@@ -625,8 +625,8 @@ fn elem_ns(k: Gc[Node]) -> u32 {
     return e.ns
 }
 
-// Ist `k` ein HTML-Element mit dem Namen `name`? Die mit Abstand haeufigste
-// Frage des Baumaufbaus, deshalb ein eigener Weg ohne Umwandlung.
+// Is `k` an HTML element with the name `name`? By far the most frequent
+// question of the tree construction, hence its own path without conversion.
 fn elem_is(k: Gc[Node], name: u32) -> bool {
     if k == gc_null[Node]() || k.kind != K_ELEM {
         return false
@@ -638,11 +638,11 @@ fn elem_is(k: Gc[Node], name: u32) -> bool {
     return e.name == name && e.ns == NS_HTML
 }
 
-// ---------------------------------------------------------------- Attribute
+// -------------------------------------------------------------- Attributes
 
-// Setzt ein Attribut. Ist der Name (im selben Namensraum) schon vorhanden,
-// passiert NICHTS und die Antwort ist `false` — genau die Regel des
-// HTML-Standards fuer doppelte Attribute an einem Tag.
+// Sets an attribute. If the name (in the same namespace) is already there,
+// NOTHING happens and the answer is `false` -- exactly the rule of the HTML
+// standard for duplicate attributes on one tag.
 fn attr_set(e: Gc[Elem], name: u32, ns: u32, value: Gc[Chain]) -> AllocError!bool {
     var a: Gc[Attr] = e.first_attr
     while a != gc_null[Attr]() {
@@ -703,7 +703,7 @@ fn attr_first(e: Gc[Elem]) -> Gc[Attr] {
     return e.first_attr
 }
 
-// ---------------------------------------------------------------- Dokument
+// ---------------------------------------------------------------- Document
 
 fn doc_mode_set(d: Gc[Document], m: u32) {
     d.mode = m

@@ -1,70 +1,70 @@
-// lib/rt/map.fi — `Map[K, V]`: Hash-Abbildung mit offener Adressierung.
+// lib/rt/map.fi -- `Map[K, V]`: a hash map with open addressing.
 //
-// `docs/SELBSTHOSTING.md` §4 fuehrt dies als Punkt 3 der Blockerliste, direkt
-// hinter Allokator und `Vec[T]`. Der Compiler braucht sie ueberall dort, wo
-// ein Name auf etwas zeigt: `fns`, `consts`, `structs`, die Bereichsketten des
-// Namensaufloesers, die Beschriftungstabelle des Codegenerators.
+// `docs/SELBSTHOSTING.md` 4 lists this as point 3 of the blocker list, right
+// behind the allocator and `Vec[T]`. The compiler needs it everywhere a name
+// points at something: `fns`, `consts`, `structs`, the scope chains of the
+// name resolver, the label table of the code generator.
 //
-// AUFBAU — offene Adressierung mit linearer Sondierung, nicht Verkettung:
-//   * drei getrennte Felder (Schluessel, Werte, Zustand) statt eines Feldes
-//     aus Paaren. Das spart die Ausrichtungsloecher, die bei `struct { K, V }`
-//     mit ungleichen Groessen entstehen, und der Zustand liegt dicht — die
-//     Sondierschleife liest nur ein Byte je Schritt.
-//   * Kapazitaet ist immer eine Zweierpotenz, damit `hash & (kap-1)` das
-//     Modulo ersetzt (eine Und-Verknuepfung statt einer Division).
-//   * Lastgrenze 3/4. Darueber wird verdoppelt und neu eingestreut.
+// STRUCTURE -- open addressing with linear probing, not chaining:
+//   * three separate arrays (keys, values, state) instead of one array of
+//     pairs. That saves the alignment holes that `struct { K, V }` produces
+//     when the sizes differ, and the state lies densely packed -- the probe
+//     loop reads only one byte per step.
+//   * the capacity is always a power of two, so that `hash & (cap-1)` takes
+//     the place of the modulo (one bitwise and instead of a division).
+//   * a load limit of 3/4. Above it the table doubles and is rehashed.
 //
-// ZUSTAND je Platz: 0 = leer (nie belegt), 1 = belegt, 2 = geloescht.
-// Der Unterschied zwischen 0 und 2 ist wesentlich: eine Suche darf bei 2
-// NICHT abbrechen, sonst verliert sie Eintraege, die hinter einer Loeschung
-// liegen. Bei 0 darf sie abbrechen — dort war nie etwas.
+// THE STATE per slot: 0 = empty (never used), 1 = used, 2 = deleted.
+// The difference between 0 and 2 matters: a lookup must NOT stop at 2,
+// otherwise it loses entries that sit behind a deletion. At 0 it may stop --
+// nothing was ever there.
 //
-// EHRLICHE GRENZEN:
-//   * `K` und `V` sind Skalare. Zeichenketten als Schluessel gehen ueber ihre
-//     interne Nummer (`Map[u32, …]`) — genau so macht es der Rust-Compiler
-//     mit `Interner` auch.
-//   * Es gibt keinen Nullwert-Schutz: `map_hol` liefert bei fehlendem
-//     Schluessel `0 as V`. Wer 0 von "fehlt" unterscheiden muss, nimmt
-//     `map_hat` davor.
-//   * Firn hat keine Zerstoerer — `map_frei` ist Pflicht, am besten mit
-//     `defer` direkt hinter `map_neu`.
+// THE HONEST LIMITS:
+//   * `K` and `V` are scalars. Strings as keys go through their internal
+//     number (`Map[u32, ...]`) -- that is exactly how the Rust compiler does
+//     it with `Interner` too.
+//   * There is no protection against the null value: for a missing key
+//     `map_get` returns `0 as V`. Whoever has to tell 0 from "missing" puts
+//     `map_has` in front of it.
+//   * Firn has no destructors -- `map_free` is mandatory, ideally with
+//     `defer` right behind `map_new`.
 
 import rt
 
 export { Map, map_new, map_free, map_clear, map_set, map_get, map_has,
          map_delete, map_len, map_cap, map_reserve,
          map_slot_used, map_slot_key, map_slot_value, map_hash,
-         // Runde 42
+         // round 42
          map_is_empty, map_dead, map_next, map_first, map_get_or,
          map_get_if, map_value_address, map_set_if_new, map_increase,
          map_take, map_cleanup }
 
 struct Map[K, V] {
-    key: u64,   // Feld aus K, `kap` Eintraege
-    values: u64,        // Feld aus V, `kap` Eintraege
-    state: u64,      // Feld aus u8, `kap` Eintraege
-    cap: usize,        // immer Zweierpotenz oder 0
-    len: usize,        // belegte Plaetze
-    dead: usize,        // geloeschte Plaetze (Grabsteine)
+    key: u64,   // array of K, `cap` entries
+    values: u64,        // array of V, `cap` entries
+    state: u64,      // array of u8, `cap` entries
+    cap: usize,        // always a power of two, or 0
+    len: usize,        // used slots
+    dead: usize,        // deleted slots (tombstones)
 }
 
-// Streuung nach dem Vorbild von splitmix64: zwei Schiebe-Xor-Runden um eine
-// Multiplikation mit einer ungeraden Konstante.
+// Hashing modelled on splitmix64: two shift/xor rounds around one
+// multiplication with an odd constant.
 //
-// GEMESSEN, nicht behauptet (20.000 Schluessel, 32.768 Plaetze, Last 0,61;
-// mittlere Sondierschritte je Einfuegung / laengste Kette):
+// MEASURED, not claimed (20,000 keys, 32,768 slots, load 0.61;
+// average probe steps per insertion / longest chain):
 //
-//   Schluesselmuster        mit Streuung      ohne (Schluessel = Platz)
-//   fortlaufend k            1,80 /  38          1,00 /      1
-//   k * 1024 (Zeiger)        1,76 /  37        313,00 /    625
-//   k * 65536                1,62 /  39      10000,50 /  20000
-//   k << 32 (hohe Bits)      1,80 /  53      10000,50 /  20000
+//   key pattern             with hashing      without (key = slot)
+//   consecutive k            1.80 /  38          1.00 /      1
+//   k * 1024 (pointers)      1.76 /  37        313.00 /    625
+//   k * 65536                1.62 /  39      10000.50 /  20000
+//   k << 32 (high bits)      1.80 /  53      10000.50 /  20000
 //
-// Die Streuung ist also NICHT umsonst: bei fortlaufenden Nummern kostet sie
-// 0,8 Sondierschritte gegenueber dem Idealfall. Sie kauft damit die Sicherheit,
-// dass die Tabelle bei Schluesseln, die sich nur in hohen Bits unterscheiden —
-// Zeiger, ausgerichtete Adressen, verschobene Nummern — nicht zur linearen
-// Suche entartet. 0,8 gegen 10.000 ist kein knapper Abwaegungsfall.
+// So the hashing is NOT free: on consecutive numbers it costs 0.8 probe
+// steps compared to the ideal case. What it buys is the guarantee that the
+// table does not degenerate into a linear scan for keys that differ only in
+// their high bits -- pointers, aligned addresses, shifted numbers.
+// 0.8 against 10,000 is not a close call.
 fn map_hash[K: Scalar](k: K) -> u64 {
     var x: u64 = k as u64
     x = x ^ (x >> 33)
@@ -93,9 +93,9 @@ fn map_free[K: Scalar, V: Scalar](m: *mut Map[K, V]) {
     (*m).dead = 0
 }
 
-// Behaelt den Speicher, setzt nur alle Plaetze auf `leer`. Fuer eine
-// Bereichstabelle, die je Funktion neu gefuellt wird, ist das der richtige
-// Weg — kein mmap je Funktion.
+// Keeps the memory, only sets every slot to `empty`. For a scope table that
+// is filled anew per function this is the right way -- no mmap per
+// function.
 fn map_clear[K: Scalar, V: Scalar](m: *mut Map[K, V]) {
     if (*m).cap > 0 {
         rt.mem_set((*m).state, 0 as u8, (*m).cap)
@@ -135,8 +135,8 @@ fn map_slot_value[K: Scalar, V: Scalar](m: *mut Map[K, V], i: usize) -> V {
     return *(addr as *mut V)
 }
 
-// Sucht den Platz eines Schluessels. Rueckgabe `kap` = nicht vorhanden.
-// Bricht bei Zustand 0 ab, laeuft ueber Zustand 2 hinweg.
+// Looks for the slot of a key. Return value `cap` = not present.
+// It stops at state 0 and runs across state 2.
 fn map_find[K: Scalar, V: Scalar](m: *mut Map[K, V], k: K) -> usize {
     if (*m).cap == 0 {
         return 0
@@ -174,8 +174,8 @@ fn map_get[K: Scalar, V: Scalar](m: *mut Map[K, V], k: K) -> V {
     return *(addr as *mut V)
 }
 
-// Legt ein Paar ohne jede Pruefung ab. Nur fuer `map_wachse`, wo feststeht,
-// dass der Schluessel neu ist und Platz da ist.
+// Stores a pair without any check. Only for `map_grow`, where it is known
+// that the key is new and that there is room.
 fn map_raw_set[K: Scalar, V: Scalar](m: *mut Map[K, V], k: K, v: V) {
     let mask: u64 = (*m).cap as u64 - 1
     var i: u64 = map_hash[K](k) & mask
@@ -189,9 +189,9 @@ fn map_raw_set[K: Scalar, V: Scalar](m: *mut Map[K, V], k: K, v: V) {
     rt.st8((*m).state, i as usize, 1 as u8)
 }
 
-// Baut die Tabelle mit `neu_kap` Plaetzen neu auf. Das raeumt zugleich alle
-// Grabsteine weg — deshalb wird auch dann neu gebaut, wenn die Kapazitaet
-// gleich bleibt und nur `tot` zu gross geworden ist.
+// Rebuilds the table with `new_cap` slots. That also clears away every
+// tombstone -- which is why it rebuilds even when the capacity stays the
+// same and only `dead` has grown too large.
 fn map_grow[K: Scalar, V: Scalar](m: *mut Map[K, V], new_cap: usize) -> bool {
     var cap: usize = 8
     while cap < new_cap {
@@ -214,7 +214,7 @@ fn map_grow[K: Scalar, V: Scalar](m: *mut Map[K, V], new_cap: usize) -> bool {
     }
     rt.mem_set(sz, 0 as u8, cap)
 
-    // Alte Tabelle merken, neue einhaengen, dann umstreuen.
+    // Remember the old table, hang in the new one, then rehash.
     let old_k: u64 = (*m).key
     let old_v: u64 = (*m).values
     let old_z: u64 = (*m).state
@@ -247,25 +247,25 @@ fn map_grow[K: Scalar, V: Scalar](m: *mut Map[K, V], new_cap: usize) -> bool {
 }
 
 fn map_reserve[K: Scalar, V: Scalar](m: *mut Map[K, V], n: usize) -> bool {
-    // Lastgrenze 3/4: fuer `n` Eintraege braucht es mindestens 4n/3 Plaetze.
+    // Load limit 3/4: for `n` entries at least 4n/3 slots are needed.
     if (*m).cap * 3 >= (n + (*m).len) * 4 {
         return true
     }
     return map_grow[K, V](m, (n + (*m).len) * 4 / 3 + 1)
 }
 
-// Legt ab oder ueberschreibt. `false` heisst: Speicher aus.
+// Stores or overwrites. `false` means: out of memory.
 fn map_set[K: Scalar, V: Scalar](m: *mut Map[K, V], k: K, v: V) -> bool {
-    // Vorhandenen Schluessel zuerst — dann waechst nichts.
+    // An existing key first -- then nothing grows.
     let da: usize = map_find[K, V](m, k)
     if da < (*m).cap {
         let va: u64 = (*m).values + da as u64 * size_of[V]() as u64
         *(va as *mut V) = v
         return true
     }
-    // Lastgrenze 3/4, Grabsteine zaehlen mit: sie belegen einen Platz, den die
-    // Sondierschleife durchlaufen muss. Ohne das entartet eine Tabelle, in die
-    // dauernd eingefuegt und geloescht wird, zur linearen Suche.
+    // Load limit 3/4, tombstones count too: they occupy a slot the probe loop
+    // has to walk through. Without that, a table that is constantly inserted
+    // into and deleted from degenerates into a linear scan.
     if ((*m).len + (*m).dead + 1) * 4 > (*m).cap * 3 {
         if !map_grow[K, V](m, (*m).len * 2 + 8) {
             return false
@@ -276,7 +276,7 @@ fn map_set[K: Scalar, V: Scalar](m: *mut Map[K, V], k: K, v: V) -> bool {
     while rt.ld8((*m).state, i as usize) == 1 as u8 {
         i = (i + 1) & mask
     }
-    // Ein Grabstein wird ueberschrieben — er zaehlt danach nicht mehr als tot.
+    // A tombstone gets overwritten -- afterwards it no longer counts as dead.
     if rt.ld8((*m).state, i as usize) == 2 as u8 {
         (*m).dead = (*m).dead - 1
     }
@@ -289,7 +289,7 @@ fn map_set[K: Scalar, V: Scalar](m: *mut Map[K, V], k: K, v: V) -> bool {
     return true
 }
 
-// `true`, wenn wirklich etwas entfernt wurde.
+// `true` if something really was removed.
 fn map_delete[K: Scalar, V: Scalar](m: *mut Map[K, V], k: K) -> bool {
     let i: usize = map_find[K, V](m, k)
     if i >= (*m).cap {
@@ -302,41 +302,41 @@ fn map_delete[K: Scalar, V: Scalar](m: *mut Map[K, V], k: K) -> bool {
 }
 
 // =====================================================================
-// Runde 42 — der Ausbau. Wie bei `Vec[T]` ist alles GENERISCH und wird nur
-// zu Code, wenn ein Programm es benutzt.
+// Round 42 -- the build out. As with `Vec[T]`, everything is GENERIC and
+// becomes code only when a program uses it.
 //
-// ITERATION OHNE `Vec`: `lib/rt/map.fi` bindet bewusst kein `vec` ein — ein
-// zweiter Import in einem Modul, das der Compiler selbst benutzt, ist
-// Gewicht ohne Gegenwert, und `firnc1` dedupliziert Importpfade als
-// Zeichenkette (Runde 39). Statt "gib mir alle Schluessel als Feld" gibt es
-// darum einen KURSOR ueber die Plaetze:
+// ITERATION WITHOUT `Vec`: `lib/rt/map.fi` deliberately does not import
+// `vec` -- a second import inside a module the compiler itself uses is
+// weight without a return, and `firnc1` deduplicates import paths as
+// strings (round 39). Instead of "give me every key as an array" there is
+// a CURSOR over the slots:
 //
-//     var i: usize = map_naechster[K, V](&m, 0)
-//     while i < map_kap[K, V](&m) {
-//         let k: K = map_platz_schluessel[K, V](&m, i)
-//         let w: V = map_platz_wert[K, V](&m, i)
-//         i = map_naechster[K, V](&m, i + 1)
+//     var i: usize = map_next[K, V](&m, 0)
+//     while i < map_cap[K, V](&m) {
+//         let k: K = map_slot_key[K, V](&m, i)
+//         let w: V = map_slot_value[K, V](&m, i)
+//         i = map_next[K, V](&m, i + 1)
 //     }
 //
-// Wer die Schluessel doch als Feld will, schiebt sie in dieser Schleife in
-// ein `Vec[K]` — dann steht der Import beim Aufrufer, wo er hingehoert.
+// Whoever does want the keys as an array pushes them into a `Vec[K]` inside
+// this loop -- then the import sits at the caller, where it belongs.
 //
-// WARNUNG, wie sie fuer jede offene Adressierung gilt: waehrend der
-// Iteration NICHT einfuegen. Ein Einfuegen kann die Tabelle neu streuen,
-// und dann zeigt der Kursor irgendwohin. Loeschen ist unbedenklich.
+// A WARNING that holds for every open addressing scheme: do NOT insert
+// while iterating. An insertion can rehash the table, and then the cursor
+// points somewhere random. Deleting is harmless.
 // =====================================================================
 
 fn map_is_empty[K: Scalar, V: Scalar](m: *mut Map[K, V]) -> bool {
     return (*m).len == 0
 }
 
-// Zahl der Grabsteine. Diagnose: steigt sie ohne Ende, hilft
-// `map_aufraeumen`.
+// The number of tombstones. A diagnostic: if it keeps climbing,
+// `map_cleanup` helps.
 fn map_dead[K: Scalar, V: Scalar](m: *mut Map[K, V]) -> usize {
     return (*m).dead
 }
 
-// Erster belegter Platz mit Index >= `ab`; `kap`, wenn keiner mehr kommt.
+// The first used slot with index >= `ab`; `cap` if none follows.
 fn map_next[K: Scalar, V: Scalar](m: *mut Map[K, V], ab: usize) -> usize {
     var i: usize = ab
     while i < (*m).cap {
@@ -352,8 +352,8 @@ fn map_first[K: Scalar, V: Scalar](m: *mut Map[K, V]) -> usize {
     return map_next[K, V](m, 0)
 }
 
-// Wert oder Vorgabe. Der Unterschied zu `map_hol`: dort ist der Nullwert
-// die Antwort auf "fehlt", hier waehlt ihn der Aufrufer.
+// The value or a default. The difference to `map_get`: there the null value
+// is the answer to "missing", here the caller picks it.
 fn map_get_or[K: Scalar, V: Scalar](m: *mut Map[K, V], k: K, default: V) -> V {
     let i: usize = map_find[K, V](m, k)
     if i >= (*m).cap {
@@ -363,8 +363,8 @@ fn map_get_or[K: Scalar, V: Scalar](m: *mut Map[K, V], k: K, default: V) -> V {
     return *(addr as *mut V)
 }
 
-// Holen und zugleich wissen, ob es da war — spart das zweite Sondieren, das
-// `map_hat` + `map_hol` kostet.
+// Fetch and know at the same time whether it was there -- that saves the
+// second probe which `map_has` + `map_get` costs.
 fn map_get_if[K: Scalar, V: Scalar](m: *mut Map[K, V], k: K, out: *mut V) -> bool {
     let i: usize = map_find[K, V](m, k)
     if i >= (*m).cap {
@@ -375,9 +375,9 @@ fn map_get_if[K: Scalar, V: Scalar](m: *mut Map[K, V], k: K, out: *mut V) -> boo
     return true
 }
 
-// Adresse des Wertes, 0 wenn der Schluessel fehlt. Damit laesst sich ein
-// Wert AN ORT UND STELLE aendern, ohne zweimal zu sondieren.
-// NUR GUELTIG, bis die Tabelle das naechste Mal waechst.
+// The address of the value, 0 if the key is missing. With it a value can be
+// changed IN PLACE without probing twice.
+// VALID ONLY until the table grows the next time.
 fn map_value_address[K: Scalar, V: Scalar](m: *mut Map[K, V], k: K) -> u64 {
     let i: usize = map_find[K, V](m, k)
     if i >= (*m).cap {
@@ -386,9 +386,9 @@ fn map_value_address[K: Scalar, V: Scalar](m: *mut Map[K, V], k: K) -> u64 {
     return (*m).values + i as u64 * size_of[V]() as u64
 }
 
-// Nur einfuegen, wenn der Schluessel neu ist. `eingefuegt` sagt, ob wirklich
-// etwas dazukam; der Rueckgabewert sagt (wie ueberall hier), ob es an
-// Speicher fehlte.
+// Insert only if the key is new. `inserted` says whether something really
+// was added; the return value says (as everywhere here) whether memory ran
+// out.
 fn map_set_if_new[K: Scalar, V: Scalar](m: *mut Map[K, V], k: K, v: V,
                                              inserted: *mut bool) -> bool {
     *inserted = false
@@ -402,10 +402,10 @@ fn map_set_if_new[K: Scalar, V: Scalar](m: *mut Map[K, V], k: K, v: V,
     return true
 }
 
-// Das Zaehl-Muster in einem Aufruf: fehlt der Schluessel, wird `delta`
-// eingetragen, sonst wird `delta` aufaddiert. Rueckgabe ist der NEUE Wert.
-// Bei Speichermangel bleibt die Tabelle unveraendert und die Antwort ist der
-// alte Wert (bzw. der Nullwert).
+// The counting pattern in one call: if the key is missing, `delta` is
+// entered, otherwise `delta` is added on top. The return value is the NEW value.
+// On lack of memory the table stays unchanged and the answer is the old
+// value (or the null value).
 fn map_increase[K: Scalar, V: Scalar](m: *mut Map[K, V], k: K, delta: V) -> V {
     let addr: u64 = map_value_address[K, V](m, k)
     if addr != 0 {
@@ -419,7 +419,7 @@ fn map_increase[K: Scalar, V: Scalar](m: *mut Map[K, V], k: K, delta: V) -> V {
     return delta
 }
 
-// Holen und entfernen in einem Schritt.
+// Fetch and remove in one step.
 fn map_take[K: Scalar, V: Scalar](m: *mut Map[K, V], k: K, out: *mut V) -> bool {
     if !map_get_if[K, V](m, k, out) {
         return false
@@ -427,8 +427,8 @@ fn map_take[K: Scalar, V: Scalar](m: *mut Map[K, V], k: K, out: *mut V) -> bool 
     return map_delete[K, V](m, k)
 }
 
-// Grabsteine wegraeumen, Kapazitaet beibehalten. Nach vielen Loeschungen
-// wird die Sondierung sonst immer laenger, ohne dass die Tabelle waechst.
+// Clear away the tombstones, keep the capacity. After many deletions the
+// probing otherwise gets longer and longer without the table growing.
 fn map_cleanup[K: Scalar, V: Scalar](m: *mut Map[K, V]) -> bool {
     if (*m).dead == 0 || (*m).cap == 0 {
         return true
