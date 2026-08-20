@@ -18,9 +18,9 @@ instruction selection only come into being in the backend.
 Printing the textual form:
 
 ```
-firnc --emit=fir-raw datei      # FIR direkt nach dem Lowering
-firnc --emit=fir-opt datei      # FIR nach Konstantenfaltung + Entfernen toten Codes
-firnc --emit=fir     datei      # dasselbe wie --emit=fir-opt
+firnc --emit=fir-raw file       # FIR straight after the lowering
+firnc --emit=fir-opt file       # FIR after constant folding + dead code removal
+firnc --emit=fir     file       # the same as --emit=fir-opt
 ```
 
 Implementation: `compiler/src/fir.rs` (data structure + textual form),
@@ -147,7 +147,7 @@ broken.
 2. **All `alloca` stand in the entry block `bb0`**, before the first
    non-`alloca` instruction. That makes the stack frame statically
    computable in the backend; `alloca`s from deep blocks (e.g. the result
-   slot of an `&&`) also migrate there. That is why the value ids in the
+   slot of an `&&`) migrate there as well. That is why the value ids in the
    entry block are not necessarily ascending.
 3. **Every value is defined exactly once** and before every use — with
    the exception of back edges, where only values from dominating blocks
@@ -390,4 +390,4 @@ without C. The mapping is deliberately simple and thereby checkable:
 * `_start` calls `main` and passes `eax` to `exit` (freestanding, without
   libc).
 
-To be seen with `firnc --emit=asm datei.fi -o datei.s` resp. `--keep-asm`.
+To be seen with `firnc --emit=asm file.fi -o file.s` resp. `--keep-asm`.

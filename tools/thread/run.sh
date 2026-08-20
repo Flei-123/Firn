@@ -14,7 +14,7 @@
 #      proof would be worthless, because it would let everything pass.
 #   5. All of it in THREE build stages and in BOTH compilers, and the FIR of both
 #      compilers is octet-identical.
-#   6. A short run with four threads shows that the instructions also do the
+#   6. A short run with four threads shows that the instructions really do the
 #      right thing: the mutex loses no increment, the counter-check without
 #      a lock does.
 set -euo pipefail
@@ -97,7 +97,7 @@ for stage in "release-fast:" "no-opt:--no-opt" "dev-fast:--opt-level=dev-fast"; 
     fi
     grep -q 'call _F0.__thread_entry' "$W/main_$name.s" || report "firnc0/$name: the child does not call the entry point"
     # The probe program is NOT run: it starts a thread without a
-    # registered thread block. That the instructions also do the right thing
+    # registered thread block. That the instructions really do the right thing
     # is shown by the short run in section 6.
     if ! "$FIRNC" $opt -o "$W/prim_$name" "$W/prim.fi" 2>"$W/err"; then
         report "firnc0/$name: build failed"
@@ -161,7 +161,7 @@ if [ -x "$FDUMP" ]; then
     grep -q 'spawn.i64' "$W/m0.txt" || report "FIR text without 'spawn.i64'"
 fi
 
-# --- 6. short run: do the instructions also do the right thing? -------------
+# --- 6. short run: do the instructions really do the right thing? ----------
 cat > "$W/lauf.fi" <<'EOF'
 const L_SYS_MMAP: i64 = 9
 const L_WITH: u64 = 0

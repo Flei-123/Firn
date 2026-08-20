@@ -36,22 +36,22 @@ property of the method.
 The way out is **not** a special path in the collector but a second object:
 
 ```text
-Gc[GcVec] --puffer--> Gc[GcSlots] --Elemente--> Gc[T] …
-   ^ gewöhnliches            ^ Blockkopf-Bit F_SLOTS
-     starkes Feld:             -> __gc_trace_slots liest n, Schrittweite
-     Typtabelle + Barriere        und Zeigermaske AUS DEM PUFFER
-     legt der Compiler
+Gc[GcVec] --buffer--> Gc[GcSlots] --elements--> Gc[T] ...
+   ^ an ordinary              ^ block header bit F_SLOTS
+     strong field:              -> __gc_trace_slots reads n, the step width
+     type table + barrier          and the pointer mask OUT OF THE BUFFER
+     come from the compiler
 ```
 
 The slot buffer is a perfectly ordinary GC block; it only carries one more
 bit in the state word of its header. Payload:
 
 ```text
-[0..8)    u64  n            Zahl der Elemente, die verfolgt werden
-[8..16)   u64  desc         schritt | (maske << 8)
-[16..24)  u64  fortschritt  Wiederaufnahmepunkt der Markierung
-[24..32)  u64  kap          Kapazität in Elementen
-[32..)         die Elemente
+[0..8)    u64  n            the number of elements that are traced
+[8..16)   u64  desc         step | (mask << 8)
+[16..24)  u64  progress     the resumption point of the marking
+[24..32)  u64  cap          the capacity in elements
+[32..)         the elements
 ```
 
 With **one** buffer type, `desc` covers everything that is needed:
@@ -126,7 +126,7 @@ key *and* the value).
 What is **not** necessary: coloring the buffer gray by hand again when it
 grows. Every element that is ever in it has either become gray via (B3) or
 was in the old buffer before, which is traced according to (B2). This
-justification is also written in the header comment of `lib/gc/gcvec.fi` —
+justification stands in the header comment of `lib/gc/gcvec.fi` as well --
 it cannot be read off the code.
 
 ### 2.1 The first hypothesis was wrong, and that is the interesting part
@@ -145,9 +145,9 @@ The case that **really** exists is the **relinking of an object that
 already exists** — that is, exactly `appendChild`:
 
 ```text
-Ziel   schon verfolgt (schwarz)
-Quelle noch nicht verfolgt (weiß)
-dann `z` aus der Quelle heraus und in das Ziel hinein
+target  traced already (black)
+source  not traced yet (white)
+then move `z` out of the source and into the target
 ```
 
 The collector sees `z` nowhere afterwards: not in the target, because that
@@ -169,17 +169,17 @@ That is not chance but arithmetic: a marking phase lasts
 there are `GRENZE / Blockgröße` allocations. The ratio is around 1 : 512.
 **A test that waits for chance checks nothing.**
 
-That is why there are two new runtime knobs in `gc.fi` — the same trick as
+That is why there are two new runtime knobs in `gc.fi` -- the same trick as
 `S_CPUUHR` (round 44) and `S_INKRAB`: default 0, in which case the code is
 bit-identical to before, and only test programs change them.
 
 ```firn
-gc_set_scheibe(2)        // 2 Objekte je Markierscheibe statt 512
-gc_set_zeitbudget(ns)    // Zeitbudget von Markieren und Fegen
-gc_phase()               // 0 Ruhe, 1 Markieren, 2 Fegen, 3 Finalisierer
+gc_set_slice(2)          // 2 objects per marking slice instead of 512
+gc_set_time_budget(ns)   // the time budget of marking and sweeping
+gc_phase()               // 0 idle, 1 marking, 2 sweeping, 3 finalizers
 ```
 
-With `gc_set_scheibe(2)` the marking phase extends over as many
+With `gc_set_slice(2)` the marking phase extends over as many
 allocations as there are live objects. In `tests/841` **78 762
 of 78 762** relinkings thereby fall into a running marking phase.
 
@@ -193,8 +193,8 @@ of 78 762** relinkings thereby fall into a running marking phase.
 | `tests/843` **without** this barrier | **17** |
 
 The test finds a loss only if three things come together: the relinking
-falls into a running marking phase, **the same cycle is also carried
-through to the end** (otherwise the next full run finds everything again),
+falls into a running marking phase, **the very same cycle is carried
+through to the end as well** (otherwise the next full run finds everything again),
 and afterwards a wave of garbage is allocated so that a wrongly released
 block is **reused** — the content of a free block otherwise stays readable
 and the loss does not show up. All three points are stated in the test.
@@ -211,8 +211,8 @@ differently (the hash function is taken over bit-identically).
 The state per slot is **in the key**, not in a side field:
 
 ```text
-Schlüssel 0 = nie belegt   (Suche darf abbrechen)
-Schlüssel 1 = gelöscht     (Suche darf NICHT abbrechen)
+key 0 = never occupied   (a search may stop)
+key 1 = deleted          (a search may NOT stop)
 ```
 
 That is safe because `__gc_mark(1)` looks for the chunk at address 1 via

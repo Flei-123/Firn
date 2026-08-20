@@ -72,7 +72,7 @@ Sorted by „blocks the most first". `[ ]` = missing,
 | 8 | **Methods / `impl`** | `[ ]` | cosmetics, replaceable by free functions with a first parameter |
 | 9 | **Interfaces / dynamic dispatch** | `[ ]` | **not** needed for stage 1 |
 | 10 | **Error handling** (`Result`, `?`) | `[ ]` | replaceable by a sum type + `match` as soon as 6 stands |
-| 11 | **Process start** (a `fork`/`execve` wrapper) | **`[x]`** since round 28 (`rt.lauf`, `tests/700_process_start.fi`) | `firnc` calls `as` and `ld` |
+| 11 | **Process start** (a `fork`/`execve` wrapper) | **`[x]`** since round 28 (`rt.run`, `tests/700_process_start.fi`) | `firnc` calls `as` and `ld` |
 | 12 | **File access** (`open`/`read`/`write`) | **`[x]`** `lies_datei`, `lies_stdin`, `schreib_alles` in `lib/rt/` | read the source, write the `.s` |
 | 13 | **Mutable global state** | `[ ]` (only `const`) | avoidable: pass a context struct through — the Rust code does that almost everywhere already |
 | 14 | **Aggregates at function boundaries** | `[x]` since round 2 | structs as parameters/return values |
@@ -149,7 +149,7 @@ The three items that blocked the most above (1, 5, 12) now stand as
 | memory | `heap_alloc`, `heap_free`, `mem_copy`, `mem_set`, `mem_eq` |
 | buffers | `Buf` with `buf_push`, `buf_push_bytes`, `buf_reserve`, `buf_at`, `buf_len` |
 | number → text | `buf_push_dez_u64`, `buf_push_dez_i64`, `buf_push_hex_u64` |
-| input/output | `lies_datei`, `lies_stdin`, `schreib_alles`, `beende` |
+| input/output | `read_file`, `read_stdin`, `write_everything`, `finish` |
 | raw access | `ld8`/`st8` … `ld64`/`st64` |
 
 Proof: `tests/610_rt.fi` — allocation, 5.000 bytes through several
@@ -217,8 +217,8 @@ The cause was more tangible than assumed: **generic templates do not lie in
 `Program::funcs`** but in `sema_generic::REG`. The module rewriting in
 `modules::build_program` runs over `Program::funcs` — so it never reached
 the templates. A template therefore saw only the names of the root file;
-even a helper function in the same module file reported *unbekannte
-funktion*.
+even a helper function in the same module file reported *unknown
+function*.
 
 `build_program` now sends **the templates of the respective file as well**
 through the same `Renamer`. The **name** of the template stays untouched in
@@ -231,11 +231,11 @@ program-wide.
 `lib/rt/vec.fi` is the first real **generic collection as a library**:
 it includes `rt` from its own directory (B3), calls
 `rt.heap_alloc`/`rt.mem_copy` from the body of a template (B2), and the
-root file writes `var v: Vec[i32] = vec_neu[i32]()` (B1). The duplication of
+root file writes `var v: Vec[i32] = vec_new[i32]()` (B1). The duplication of
 the memory functions has disappeared again.
 
 Proof: `tests/640_vec_module.fi` (1.000 `i32`, 300 `u8`, 100 `u64`, `pop`,
-`setzen`, access beyond the end) in all three build stages.
+`vec_set`, access beyond the end) in all three build stages.
 
 **With that `lib/std/` can be written** — the next step on the list in §2.
 ---
@@ -307,7 +307,7 @@ probing, the **text** is compared, not the hash value — so two different
 identifiers with the same FNV value get different numbers. That is the
 difference between correct and „has not come up so far".
 
-One trap lies in the relocation: `intern_nummer` has to take the hash from
+One trap lies in the relocation: `intern_number` has to take the hash from
 its **own** buffer after the copying — the passed pointer may have pointed
 into the same buffer and may have become invalid when it grew.
 
@@ -388,7 +388,7 @@ the bits (`cvtsi2sd`). The path without the optimizer was right the whole
 time.
 
 Both places are fixed; `fold_cast` now computes the conversion **for real**
-(and also folds `f64 -> integer`, except for NaN, infinity and values
+(and folds `f64 -> integer` too, except for NaN, infinity and values
 outside the target range). Regression test:
 `tests/591_f64_conversion.fi`, which runs with **and** without the optimizer
 like every positive test.
@@ -444,7 +444,7 @@ is there.
 ### Side findings on the list in §4
 
 * Item 6 (**sum types**) is **completely there** without type parameters —
-  `enum Wert { Nichts, Zahl(i32), Paar(i32, i32) }` with binding in the
+  `enum Value { Nothing, Number(i32), Pair(i32, i32) }` with binding in the
   pattern has run since round 2. What is missing is `enum Name[T]`: the
   parser knows no type parameter list behind an enum name (`Option[T]`,
   `Result[T,E]`).
@@ -479,18 +479,18 @@ longer **counts** errors, it **reports** them — with the file, line, column,
 source line and marker, in the binding format from `diag.rs`:
 
 ```text
-error: in einem zeichenkettenliteral: \u{...} ist nicht abgeschlossen
+error: in a string literal: \u{...} is not terminated
   --> tests/lexneg/u_escape.fi:3:23
    |
  3 |     var b: [u8; 4] = "\u{}"
-   |                       ^ hier
+   |                       ^ here
 4 Fehler gefunden
 ```
 
 ### The comparison now checks both streams
 
-`tools/lex_compare.sh` no longer compares only the token stream but also
-the **error output** — octet by octet against `firnc0 --emit=tokens`.
+`tools/lex_compare.sh` no longer compares the token stream alone but the
+**error output** as well -- octet by octet against `firnc0 --emit=tokens`.
 
 | | |
 |---|---:|
@@ -989,8 +989,8 @@ After that the code generator remains.
 ## 16. Round 26: aggregates in the lowering
 
 The biggest open item from round 25 is closed. `lib/firnc1/lower.fi` now
-also lowers structs and arrays — as a variable, as an argument, as a return
-value and as a literal.
+lowers structs and arrays as well -- as a variable, as an argument, as a
+return value and as a literal.
 
 | | round 25 | round 26 |
 |---|---:|---:|
@@ -1161,13 +1161,13 @@ starts `/usr/bin/as` and `/usr/bin/ld` over `fork`/`execve` and waits with
 
 ```firn
 if kind == 0 {
-    syscall(SYS_EXECVE, pfad as i64, argv as i64, 0, 0, 0, 0)
-    beende(127)          // <- ohne das laeuft der Compiler zweimal
+    syscall(SYS_EXECVE, path as i64, argv as i64, 0, 0, 0, 0)
+    finish(127)          // <- without this the compiler runs twice
 }
 ```
 
-If `execve` returns, it has **failed** — and then the child runs on in the
-program of the parent. Without the `beende`, a missing `as` would make the
+If `execve` returns, it has **failed** -- and then the child runs on in the
+program of the parent. Without the `finish`, a missing `as` would make the
 whole compiler run a second time. `tests/700_process_start.fi`
 checks exactly this case with a path that does not exist.
 
@@ -1204,7 +1204,7 @@ module system is the next and second to last step.
 ## 19. Round 29: the module system — `firnc1` reads more than one file
 
 `firnc1` now resolves `import` itself. With that, the compiler written in
-Firn also compiles programs made of several files — including
+Firn compiles programs made of several files as well -- including
 `tests/610_rt.fi`, which **includes the runtime core `lib/rt/rt.fi`
 itself**.
 
@@ -1338,12 +1338,12 @@ generics in the parser and in the monomorphization of `firnc1`.
 sense: stage 2 and stage 3 are the same file octet by octet.
 
 ```
-Stufe 1   firnc0 (Rust)  übersetzt  bin/firnc1.fi  ->  .firnc1     888 ms
-Stufe 2   .firnc1        übersetzt  bin/firnc1.fi  ->  .firnc2    2070 ms
-Stufe 3   .firnc2        übersetzt  bin/firnc1.fi  ->  .firnc3
+stage 1   firnc0 (Rust)  compiles  bin/firnc1.fi  ->  .firnc1     888 ms
+stage 2   .firnc1        compiles  bin/firnc1.fi  ->  .firnc2    2070 ms
+stage 3   .firnc2        compiles  bin/firnc1.fi  ->  .firnc3
 
-.firnc2.s == .firnc3.s     147 220 Zeilen Assembler, zeichengleich
-.firnc2   == .firnc3       792 240 Oktette, binärgleich
+.firnc2.s == .firnc3.s     147 220 lines of assembly, character-identical
+.firnc2   == .firnc3       792 240 octets, binary-identical
 ```
 
 Stage 1 is **not** compared along, and it does not have to be: `firnc0` has
@@ -1484,7 +1484,7 @@ it can only carry itself.
 `firnc1` now reads enums and pattern matching — with the same
 architecture as stage 0 (`sema_match.rs`): the cases of a `match` lie
 **not** in the syntax tree but in a registry; in the tree there is only
-a call `__match#<nummer>` without arguments. The layout of an enum
+a call `__match#<number>` without arguments. The layout of an enum
 is entered into the type context as a struct with the fields `__tag` and
 `__v<tag>_<i>`, and the offsets are computed in `pattern.fi`, not by
 `types.fi`.
@@ -1580,7 +1580,7 @@ named: error unions (20), `gc`/`rc` (14), constant runtime (4),
 (`errors.rs`/`lower_errors.rs`): a registry outside the tree
 (`lib/firnc1/err.fi`), in the tree there are calls `__try#` and `__catch#`,
 and the type annotation `E!T` travels through the tree as a placeholder
-`__eu#<nummer>` until the type resolution resolves it against the registry.
+`__eu#<number>` until the type resolution resolves it against the registry.
 The union itself is an ordinary struct `{ __err: u32, __val: T }` in the
 type context — aggregate return, ABI and codegen carry it unchanged;
 the only new thing was the lowering of `try`/`catch`/conversion.
@@ -1905,9 +1905,9 @@ size but in the sliced sweep.
   the pause measurement; only that way can foreign load be separated from a
   real pause — exactly the mistake that had produced the 19 ms outliers in
   round 40.
-* New measuring tools: `build.fi` (does NOT zero the histogram, so it also
-  measures the build-up phase), `durchsatz.fi` (fixed work, measured time),
-  `ab.fi` (A/B in the same process).
+* New measuring tools: `build.fi` (does NOT zero the histogram, so it
+  measures the build-up phase too), `throughput.fi` (fixed work, measured
+  time), `ab.fi` (A/B in the same process).
 
 Result: longest interruption **11,82 ms -> 0,45 ms** (5 s run), 0,62 ms
 of pure compute time in the 10-minute endurance run. Throughput loss 2 % with
@@ -1919,7 +1919,7 @@ time comparison — that would be worthless on a loaded machine.
 
 Up to here Firn had free functions only; the prefix was the
 type, written down by hand and unchecked (`bytes_push(&b, x)`). Now:
-`b.dazu(x)`, `quelle.trimme().laenge()`.
+`b.push(x)`, `source.trim().length()`.
 
 `impl` is deliberately a **writing aid**: `a.f(b)` is resolved to
 `Typ_f(&a, b)`, there is no dynamic dispatch and no vtable. Implemented in
@@ -1945,8 +1945,8 @@ again a reused binary: `tools/self_compare.sh` built
 compiler that no longer existed.
 
 That is the same mistake as with the dump binaries (round 41, fixed there).
-`self_compare.sh` now rebuilds `.firnc1` also when firnc0 or
-any source under `bin/` or `lib/` is younger.
+`self_compare.sh` now rebuilds `.firnc1` when firnc0 or
+any source under `bin/` or `lib/` is younger, too.
 **Rule: never reuse a binary just because it exists.**
 
 **Acceptance of the merge state in the main repo, measured by ourselves:**
@@ -1963,9 +1963,9 @@ Round 45 had brought methods only as a writing aid: `x.m(a)` became
 
 ```firn
 interface Flaeche { fn flaeche(*self) -> i64 }
-impl Flaeche for Rechteck { … }
-let f: dyn Flaeche = (&r) as dyn Flaeche
-f.flaeche()      // welcher Code laeuft, steht erst zur Laufzeit fest
+impl Area for Rectangle { ... }
+let f: dyn Area = (&r) as dyn Area
+f.area()         // which code runs is settled only at run time
 ```
 
 `dyn I` is a double pointer (a data pointer + a method table). The tables
@@ -2050,9 +2050,9 @@ interrupts is moot — that is strictly stronger, not weaker.
 
 **The find while re-checking: round 52 was incomplete.**
 `tools/freestanding/run.sh` links the kernel against `demos/kernel/start.s`
-— that file never existed. The cause is line 2 of the `.gitignore`: the
-pattern `*.s`, meant for generated assembly, also swallowed
-the hand-written boot preamble. The worker saw a working file in its
+-- that file never existed. The cause is line 2 of the `.gitignore`: the
+pattern `*.s`, meant for generated assembly, swallowed the hand-written
+boot preamble as well. The worker saw
 worktree and reported green; in the main repo it was missing, and
 sections 3 and 3b (linking, the QEMU boot) failed — that is, exactly the
 proof that matters in this round.
@@ -2089,9 +2089,9 @@ character-identical, **561.666 lines** · thread endurance run 60 s:
    thread table (`S_FADEN_TAB` …). Round 53 moves to
    2120/2128/2136 (free, below `REG_SAVE_OFF` = 3968).
 2. **Bit 8 in the source scan.** `gc_quelle_scan` reported with bit 8 in
-   round 53 „the program needs GcVec/GcMap", in round 49 „the program
-   brings its own `__faden_arbeit`". Bit 8 stays with the collections (it
-   also counts from MODULES), and the thread dispatcher moves to **bit 16**
+   round 53 "the program needs GcVec/GcMap", in round 49 "the program
+   brings its own `__thread_work`". Bit 8 stays with the collections (it
+   counts from MODULES as well), and the thread dispatcher moves to **bit 16**
    (which, like bit 4, counts only from the root file).
 3. **`laufzeit_quelle`** now has **four** parameters instead of three; both
    rounds had claimed the third for themselves.
@@ -2170,7 +2170,7 @@ decomposes every name and makes a suggestion, and a **conflict list** with
   regenerated, and the product is not edited.
 * **UPPERCASE names.** The morpheme decomposition split `ALL_CAPS` into
   single letters; only with a directed regex did the remaining 264
-  names fall (`KEIN`->`NONE`, `CHUNK_KOPF`->`CHUNK_HEADER`).
+  names fall (`CHUNK_KOPF` -> `CHUNK_HEADER`, and so on).
 * **Firn programs in tool scripts.** In `tools/thread/run.sh` and
   its neighbors there are small Firn sources as text; otherwise the `sed`
   patterns hit nothing.
