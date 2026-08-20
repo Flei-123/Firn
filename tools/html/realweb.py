@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""Robustheitsprobe der Baumkonstruktion auf ECHTEN Seiten.
+"""Robustness probe of the tree construction on REAL pages.
 
-Die acht Seiten in `testdata/realweb/` sind unveraenderte Kopien echter
-Webseiten (0,03 bis 1,0 MB). Geprueft wird hier nur, was ohne fremde
-Bibliothek pruefbar ist:
+The eight pages in `testdata/realweb/` are unchanged copies of real
+web pages (0.03 to 1.0 MB). What is checked here is only what can be
+checked without a foreign library:
 
-  * das Binary laeuft durch und meldet keinen `#KAPUTT`-Abbruch,
-  * es kommt ein nichtleerer Baum heraus,
-  * die Ausgabe ist reproduzierbar (run.sh vergleicht die drei Baustufen
-    Byte fuer Byte gegeneinander).
+  * the binary runs through and reports no `#KAPUTT` abort,
+  * a non-empty tree comes out,
+  * the output is reproducible (run.sh compares the three build stages
+    byte for byte against each other).
 
-Der VERGLEICH mit einer unabhaengigen Umsetzung steht nicht hier, sondern in
-tools/html/orakel.py (braucht html5lib und damit Netz).
+The COMPARISON with an independent implementation is not here but in
+tools/html/orakel.py (which needs html5lib and therefore the network).
 
-Aufruf:  python3 tools/html/realweb.py <binary>
+Usage:  python3 tools/html/realweb.py <binary>
 """
 
 import glob
@@ -24,7 +24,7 @@ import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-KORPUS = os.path.join(ROOT, "testdata", "realweb")
+CORPUS = os.path.join(ROOT, "testdata", "realweb")
 
 
 def main():
@@ -32,42 +32,42 @@ def main():
         print(__doc__)
         return 2
     binary = sys.argv[1]
-    pfade = sorted(glob.glob(os.path.join(KORPUS, "*.html")))
-    if not pfade:
-        print("KEIN KORPUS in %s" % KORPUS)
+    paths = sorted(glob.glob(os.path.join(CORPUS, "*.html")))
+    if not paths:
+        print("NO CORPUS in %s" % CORPUS)
         return 1
-    daten = []
-    for p in pfade:
+    data = []
+    for p in paths:
         with open(p, encoding="utf-8", errors="replace") as fh:
-            daten.append(fh.read())
+            data.append(fh.read())
     payload = b""
-    for d in daten:
-        roh = d.encode("utf-8", "surrogatepass")
-        payload += struct.pack("<I", len(roh)) + roh
+    for d in data:
+        raw = d.encode("utf-8", "surrogatepass")
+        payload += struct.pack("<I", len(raw)) + raw
 
     p = subprocess.run([binary], input=payload, stdout=subprocess.PIPE,
                        stderr=subprocess.PIPE, timeout=900)
     if p.returncode != 0:
-        print("BINARY ENDETE MIT %d" % p.returncode)
+        print("THE BINARY ENDED WITH %d" % p.returncode)
         return 1
-    teile = p.stdout.decode("utf-8", "surrogatepass").split("#ENDE\n")
-    if teile and teile[-1] == "":
-        teile.pop()
-    if len(teile) != len(pfade):
-        print("ANTWORTZAHL FALSCH: %d fuer %d Seiten" % (len(teile), len(pfade)))
+    parts = p.stdout.decode("utf-8", "surrogatepass").split("#ENDE\n")
+    if parts and parts[-1] == "":
+        parts.pop()
+    if len(parts) != len(paths):
+        print("WRONG NUMBER OF ANSWERS: %d for %d pages" % (len(parts), len(paths)))
         return 1
-    schlecht = 0
-    for pfad, quelle, antwort in zip(pfade, daten, teile):
-        zeilen = antwort.count("\n")
-        kaputt = "#KAPUTT" in antwort
-        summe = hashlib.sha256(antwort.encode("utf-8", "surrogatepass")).hexdigest()[:16]
-        if kaputt or zeilen < 10:
-            schlecht += 1
-        print("%-26s %9d B ->%8d Zeilen  %s  %s"
-              % (os.path.basename(pfad), len(quelle), zeilen, summe,
-                 "KAPUTT" if kaputt else "ok"))
-    print("%d Seiten, %d beanstandet" % (len(pfade), schlecht))
-    return 1 if schlecht else 0
+    bad = 0
+    for path, source, answer in zip(paths, data, parts):
+        lines = answer.count("\n")
+        broken = "#KAPUTT" in answer
+        digest = hashlib.sha256(answer.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+        if broken or lines < 10:
+            bad += 1
+        print("%-26s %9d B ->%8d lines  %s  %s"
+              % (os.path.basename(path), len(source), lines, digest,
+                 "BROKEN" if broken else "ok"))
+    print("%d pages, %d objected to" % (len(paths), bad))
+    return 1 if bad else 0
 
 
 if __name__ == "__main__":
