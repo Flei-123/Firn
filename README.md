@@ -297,7 +297,7 @@ still missing:
   **100,000,000 cycle sets = 700,000,000 DOM objects at a constant 1,364 KiB
   RSS**; the reference-counting counter-check with an identical object graph
   needs **750,080 KiB** after 2,000,000 cycles (factor 550). Section "Memory
-  model" further down, report `docs/berichte/dom.md`.
+  model" further down, report `docs/reports/dom.md`.
   **Since round 44** collection is incremental (longest pause 0.45 ms),
   **since round 47** there are **finalizers** (`S4`), weak fields are **really
   zeroed** on collection (`S3`), there are **external root ranges** and `Arc[T]`
@@ -402,7 +402,7 @@ error: 'try' is only allowed in a function with an error union return type, this
 
 The deliberate restrictions (no inferred error set, no `defer`/`errdefer`,
 `catch |e|` binds to an expression instead of to a block, no `E!()`) are in
-`SPEC.md` 14.1.error_unions as F1-F10 and in `docs/FEHLERUNIONEN.md`.
+`SPEC.md` 14.1.error_unions as F1-F10 and in `docs/ERROR_UNIONS.md`.
 
 ## An HTML5 tokenizer in Firn against html5lib (round 3)
 
@@ -462,8 +462,8 @@ The tally was identical in every run. Both corpora receive byte for byte the
 same input on both sides.
 
 **The test data are unchanged -- verifiable:**
-`bash tools/tokenizer/verifiziere_testdaten.sh` compares the sha256 sums of the
-14 `.test` files with the frozen set (`tools/tokenizer/testdaten.sha256`,
+`bash tools/tokenizer/verify_testdata.sh` compares the sha256 sums of the
+14 `.test` files with the frozen set (`tools/tokenizer/testdata.sha256`,
 upstream commit `224991ec10db04f056a89eed8b0bd8695fd2950e` of html5lib-tests)
 and counts the 6,810 cases. `run.sh` runs that as step 0; with
 `--gegen-upstream` the script downloads the files of that commit from GitHub
@@ -508,7 +508,7 @@ Named honestly:
   `tokens.Sink`. If `mmap` fails, `entities.tabelle()` returns 0, `char_ref`
   reports `REF_UNMOEGLICH` and the tokenizer sets `nicht_unterstuetzt` -- the
   case then counts as a failure instead of being tokenized wrongly in silence.
-  Proof in Firn: `lib/html/entities_ausfall.fi` (step 1c in `run.sh`, which
+  Proof in Firn: `lib/html/entities_failure.fi` (step 1c in `run.sh`, which
   starts the program twice and demands different addresses).
 * All three build stages (`opt`, `--no-opt`, `dev-fast`) deliver the same tally;
   `run.sh` aborts if they do not.
@@ -762,7 +762,7 @@ the frame as a sequence of individual store instructions, not in `.rodata`. For
 messages and paths that makes no difference, for large tables it would.
 
 **Redeemed immediately:** the hand-written octet lists in `lib/gc/gc.fi`,
-`lib/dom/meas.fi` and `lib/html/entities_ausfall.fi` are gone -- a 63 entry row
+`lib/dom/meas.fi` and `lib/html/entities_failure.fi` are gone -- a 63 entry row
 of numbers became
 `"FEHLER: tabelle() lieferte 0, obwohl mmap moeglich sein sollte\n"`.
 
@@ -1028,7 +1028,7 @@ cycles.
 **Honestly about it:** the 24 hour run from the acceptance is outstanding,
 fragmentation with changing object sizes is unchecked, and the conservative
 stack scan has a measurable price -- an old pointer copy in a **live** frame
-keeps its object alive. `docs/berichte/dom.md` describes both with measurements.
+keeps its object alive. `docs/reports/dom.md` describes both with measurements.
 
 ## Directories
 
@@ -1054,7 +1054,7 @@ compiler/src/            29 modules: config.rs main.rs lexer.rs ast.rs parser.rs
 lib/str/, lib/num/       the Firn library: Bytes/Str/Str16/Atom, strtod/dtoa
 lib/html/                the HTML5 tokenizer IN FIRN (8,647 lines of .fi)
 tools/tokenizer/         workbench: harness against html5lib, throughput,
-                         verifiziere_testdaten.sh (sha256 of the 14 .test files)
+                         verify_testdata.sh (sha256 of the 14 .test files)
 bench/tokenizer/         html5ever as a yardstick (a Cargo project of its own)
 tests/                   122 programs + tests/opt (13) + tests/neg (46)
 examples/                hello.fi fib.fi bubblesort.fi structs.fi
@@ -1113,7 +1113,7 @@ fn main() -> i32 {
   Check it yourself:
 
   ```bash
-  compiler/target/release/firnc --emit=asm -o /tmp/zm.s tests/230_zustandsmaschine.fi
+  compiler/target/release/firnc --emit=asm -o /tmp/zm.s tests/230_state_machine.fi
   grep -c "jmp qword ptr" /tmp/zm.s     # 1  (state machine with 32 states)
   grep -c "^	cmp"        /tmp/zm.s     # 0  (no comparison chain)
   ```
@@ -1132,7 +1132,7 @@ fn main() -> i32 {
 Test programs of this module: `tests/200_enum_basic.fi`,
 `tests/201_enum_payload.fi`, `tests/202_match_int_range.fi`,
 `tests/203_match_nested.fi`, `tests/204_match_bool.fi`,
-`tests/210..212_generic_*.fi`, `tests/230_zustandsmaschine.fi`;
+`tests/210..212_generic_*.fi`, `tests/230_state_machine.fi`;
 negative tests `tests/neg/match_*.fi`, `tests/neg/generic_*.fi`.
 All of them run with **and** without `--no-opt` with the same result.
 

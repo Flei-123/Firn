@@ -32,7 +32,7 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 CASES = os.path.join(ROOT, "tools", "html", "cases")
-GAPS = os.path.join(ROOT, "tools", "html", "luecken")
+GAPS = os.path.join(ROOT, "tools", "html", "gaps")
 
 
 def load_dat(path):

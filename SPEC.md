@@ -1197,7 +1197,7 @@ Implemented and demonstrated with running code:
 observer through `GcWeak`, node<->JS wrapper. The soak test: **100,000,000
 cycle sets = 700,000,000 objects at a constant 1,364 KiB RSS**; the
 reference-counting counter-check with an identical graph needs **750,080 KiB**
-after 2,000,000 cycles. The report: `docs/berichte/dom.md`.
+after 2,000,000 cycles. The report: `docs/reports/dom.md`.
 
 **Honest limits of this implementation:**
 

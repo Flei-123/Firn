@@ -5,7 +5,7 @@
 #   1. Exactly the 14 expected .test files lie in
 #      testdata/html5lib-tokenizer/ -- no more, no fewer.
 #   2. Every file has exactly the sha256 sum from
-#      tools/tokenizer/testdaten.sha256. These sums were checked byte for
+#      tools/tokenizer/testdata.sha256. These sums were checked byte for
 #      byte against the upstream commit
 #      224991ec10db04f056a89eed8b0bd8695fd2950e of
 #      https://github.com/html5lib/html5lib-tests (path tokenizer/).
@@ -17,14 +17,14 @@
 # commit from GitHub again and compares directly (needs the network; without it
 # the switch is a clean error, not a silent success).
 #
-# Usage:  bash tools/tokenizer/verifiziere_testdaten.sh [--against-upstream]
+# Usage:  bash tools/tokenizer/verify_testdata.sh [--against-upstream]
 # Return: 0 = everything unchanged, 1 = a deviation was found.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 COMMIT="224991ec10db04f056a89eed8b0bd8695fd2950e"
 DATA="testdata/html5lib-tokenizer"
-SUMS="tools/tokenizer/testdaten.sha256"
+SUMS="tools/tokenizer/testdata.sha256"
 EXPECTED_FILES=14
 EXPECTED_CASES=6810
 AGAINST_UPSTREAM=0

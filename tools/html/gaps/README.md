@@ -1,4 +1,4 @@
-# tools/html/luecken/ -- what the tree construction can(not) do yet
+# tools/html/gaps/ -- what the tree construction can(not) do yet
 
 THESE CASES FAIL -- ON PURPOSE.
 
@@ -16,7 +16,7 @@ adjustment, integration points, breakout tags).
 6..9  `<template>`: the 23rd insertion mode and its own content tree.
 10    fragment parsing with a context element (`innerHTML`).
 
-The expected trees in `bekannte_luecken.dat` are the RIGHT ones (from the
+The expected trees in `known_gaps.dat` are the RIGHT ones (from the
 WHATWG standard). The runner drives them separately from the main quota:
 
     python3 tools/html/harness_tree.py <binary> --gaps
@@ -25,6 +25,6 @@ They are reported on their own and do NOT go into the quota of
 `tools/html/cases/`. A test suite that only contains what already works says
 nothing about what is missing -- this file is the counter-calculation.
 
-The four `<template>` cases carry `#orakel-abweichung`: html5lib 1.1 does not
+The four `<template>` cases carry `#oracle-deviation`: html5lib 1.1 does not
 put the template content into a content tree of its own and can therefore not
 confirm the expectation. It is written by hand from the standard.

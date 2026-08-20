@@ -12,7 +12,7 @@ READ ONLY: ../karstos-browser/TODO-FIRN.md block 0 (task 0.8), ../karstos-browse
 
 PRESENT and usable -- do not rebuild:
 - **Module system**: `import path.module`, `export { ... }`, several .fi files linked into one binary.
-- **enum + match** with an exhaustiveness check and a real jump table (`tests/230_zustandsmaschine.fi` has 32 states). THAT IS EXACTLY WHAT THE TOKENIZER NEEDS.
+- **enum + match** with an exhaustiveness check and a real jump table (`tests/230_state_machine.fi` has 32 states). THAT IS EXACTLY WHAT THE TOKENIZER NEEDS.
 - **Generics** by monomorphization, `Vec[T]`, `Map[K,V]`.
 - **Strings**: `Bytes`, `Str` (UTF-8), `Str16` (WTF-16, holds unpaired surrogates), `Atom` (interned). Library under `lib/str/`, numbers under `lib/num/`.
 - **Attributes**: `compiler/src/attrs.rs`, `firnc --list-attrs`. `#[must_consume]` is implemented.

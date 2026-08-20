@@ -29,7 +29,7 @@ if [ ! -x "$FIRNC" ]; then
 fi
 
 echo "== 0. test data unchanged? (sha256 against the upstream commit) =="
-bash tools/tokenizer/verifiziere_testdaten.sh | sed 's/^/   /'
+bash tools/tokenizer/verify_testdata.sh | sed 's/^/   /'
 echo
 
 echo "== 1. compile the tokenizer (Firn) =="
@@ -52,9 +52,9 @@ python3 tools/tokenizer/check_entities.py "$WORK/entities_probe"
 
 echo
 echo "== 1c. name table: no fixed address, a failure is reported =="
-"$FIRNC" -o "$WORK/entities_ausfall" lib/html/entities_ausfall.fi
-"$WORK/entities_ausfall" > "$WORK/fallback1.txt"
-"$WORK/entities_ausfall" > "$WORK/fallback2.txt"
+"$FIRNC" -o "$WORK/entities_failure" lib/html/entities_failure.fi
+"$WORK/entities_failure" > "$WORK/fallback1.txt"
+"$WORK/entities_failure" > "$WORK/fallback2.txt"
 sed 's/^/   /' "$WORK/fallback1.txt"
 A1=$(head -1 "$WORK/fallback1.txt")
 A2=$(head -1 "$WORK/fallback2.txt")
