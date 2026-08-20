@@ -1,28 +1,58 @@
-# Debugger: `.debug_line` and a real `gdb` session
+# Debugger: `.debug_info` of our own and a real `gdb` session
 
 **Requirement:** `W3` · `ACCEPTANCE.md` item 4 criterion B · `TODO-FIRN.md` 0.4
-**State:** line numbers work, variables do not yet (see „Limits").
+**State (round 64):** lines, functions, parameters, local variables **and
+their types** work. What is still open stands under „Limits", as before.
 
 ## How it is generated
 
-`compiler/src/dwarf.rs` collects the mapping *instruction → source line*
-during lowering; `compiler/src/codegen_x86.rs` writes `.file` and `.loc`
-directives into the assembly from it. From those, `as` produces the
-sections `.debug_line`, `.debug_info`, `.debug_abbrev`, `.debug_aranges`,
-`.debug_str`. **No** external tool and **no** C compiler is used — only the
-assembler, which is in the build path anyway.
+Two halves, and the split is deliberate:
+
+| Section | Who writes it | Why |
+|---|---|---|
+| `.debug_line` | the assembler, out of `.file`/`.loc` | it knows the addresses; the compiler would have to guess instruction lengths |
+| `.debug_info`, `.debug_abbrev` | **the compiler**, `compiler/src/dwarf_info.rs` | names, types and frame offsets are known only to the compiler |
+
+`compiler/src/dwarf.rs` collects during lowering: the mapping *instruction →
+source line*, and — new in round 64 — **every declared name** with its FIR
+value, its type, and the file and line of its declaration. The single hook
+for that is `lower.rs::declare_ty`, the one place where a name out of the
+source text is bound to storage. `codegen_x86.rs` adds the frame offset (it
+is only known once `layout` has partitioned the frame) and writes the two
+sections at the end of the assembly.
+
+The shape of the information (DWARF 4):
+
+```text
+DW_TAG_compile_unit             producer, language, name, comp_dir,
+                                low_pc/high_pc, stmt_list
+  DW_TAG_base_type              i8 … u64, usize, bool, f64
+  DW_TAG_pointer_type           *mut T / *const T
+  DW_TAG_array_type             [T; N]  (with DW_TAG_subrange_type)
+  DW_TAG_structure_type         struct with DW_TAG_member and offsets
+  DW_TAG_subprogram             name, decl_file/line, low_pc/high_pc,
+                                type, frame_base = DW_OP_reg6 (rbp)
+    DW_TAG_formal_parameter     name, type, location = DW_OP_fbreg -off
+    DW_TAG_variable             the same for local variables
+```
+
+**No** external tool and **no** C compiler is used — only the assembler,
+which is in the build path anyway.
 
 Precision:
 
-| Build mode | Line information |
-|---|---|
-| `firnc --no-opt file.fi` | **statement-precise** -- every statement has its source line |
-| `firnc file.fi` (with the optimizer) | the line of the `fn` declaration per function |
+| Build mode | Line information | Variables |
+|---|---|---|
+| `firnc --no-opt file.fi` | **statement-precise** | **yes**, with types |
+| `firnc file.fi` (with the optimizer) | the line of the `fn` declaration | **no** |
 
-The reason for the restriction is in `SPEC.md` §14.1 item 16: the FIR
-carries no source positions (`fir.rs` is frozen in this round), and the
-optimizer removes instructions and renumbers blocks. A wrong line
-would be worse than none.
+The reason for the restriction is the same for both and it is in `SPEC.md`
+§14.1 item 16: the FIR carries no source positions, and the optimizer removes
+instructions, renumbers blocks and pulls an `alloca` into a register
+(`mem2reg`). A frame offset recorded before that would then point at storage
+that is no longer written to. **A wrong value in the debugger is worse than
+none**, so with the optimizer the variable information is left out entirely —
+and `tools/dwarf/run.sh` checks that as a counter-check.
 
 ## Proof: the session, copied verbatim
 
@@ -44,53 +74,92 @@ fn main() -> i32 {
 }
 ```
 
-Commands (in the project directory, after `cargo build --release`):
-
 ```console
 $ compiler/target/release/firnc --no-opt -o /tmp/gdbdemo docs/gdb_example.fi
 $ readelf -S /tmp/gdbdemo | grep debug
-  [ 2] .debug_aranges    PROGBITS         0000000000000000  000000e0
-  [ 3] .debug_info       PROGBITS         0000000000000000  00000110
-  [ 4] .debug_abbrev     PROGBITS         0000000000000000  0000013e
-  [ 5] .debug_line       PROGBITS         0000000000000000  00000152
-  [ 6] .debug_str        PROGBITS         0000000000000000  00000192
+  [ 2] .debug_info       PROGBITS         0000000000000000  00000287
+  [ 3] .debug_abbrev     PROGBITS         0000000000000000  000003b2
+  [ 4] .debug_line       PROGBITS         0000000000000000  00000451
 
-$ gdb -batch -ex "break summe" -ex run -ex bt -ex "info line" \
-        -ex next -ex next -ex next -ex "info line" -ex continue /tmp/gdbdemo
-Breakpoint 1 at 0x4000c6: file docs/gdb_example.fi, line 2.
+$ gdb -batch -ex "break summe" -ex run -ex bt -ex "info args" -ex "info locals" \
+        -ex next -ex next -ex next \
+        -ex "print s" -ex "print i" -ex "print n" -ex "ptype summe" \
+        -ex continue /tmp/gdbdemo
+Breakpoint 1 at 0x40010e: file docs/gdb_example.fi, line 3.
 
-Breakpoint 1, summe () at docs/gdb_example.fi:2
-2	fn summe(n: i32) -> i32 {
-#0  summe () at docs/gdb_example.fi:2
-#1  0x0000000000400254 in main () at docs/gdb_example.fi:11
-Line 2 of "docs/gdb_example.fi" starts at address 0x4000c6 <summe> and ends at 0x40010b <summe+69>.
+Breakpoint 1, summe (n=10) at docs/gdb_example.fi:3
 3	    var s: i32 = 0
+#0  summe (n=10) at docs/gdb_example.fi:3
+#1  0x0000000000400257 in main () at docs/gdb_example.fi:11
+n = 10
+s = 0
+i = 0
 4	    for i in 1 as i32..n + 1 as i32 {
 5	        s = s + i
-Line 5 of "docs/gdb_example.fi" starts at address 0x400190 <summe+202> and ends at 0x400202 <summe+316>.
-[Inferior 1 (process 536651) exited with code 067]
+5	        s = s + i
+$1 = 1
+$2 = 2
+$3 = 10
+type = i32 (i32)
+[Inferior 1 (process 3538791) exited with code 067]
 ```
 
-What the session establishes:
+And with `tools/dwarf/probe.fi`, which contains a struct, a pointer and an
+array:
 
-* A breakpoint on a **Firn** function name hits and reports the
-  file + line of the `.fi` file.
+```console
+Breakpoint 1, shift (p=0x7fffffffeaa8, by=3) at tools/dwarf/probe.fi:12
+#0  shift (p=0x7fffffffeaa8, by=3) at tools/dwarf/probe.fi:12
+#1  0x0000000000400587 in main () at tools/dwarf/probe.fi:30
+$1 = {x = 5, y = 7}          <- print *p
+$2 = 5                       <- print p->x
+type = struct Point {
+    i32 x;
+    i32 y;
+}
+Value returned is $3 = 18    <- finish
+p = {x = 8, y = 10}          <- info locals in main
+$5 = {1, 2, 3, 4}            <- print field
+$6 = 3                       <- print field[2]
+type = i32 [4]               <- ptype field
+```
+
+What the sessions establish:
+
+* A breakpoint on a **Firn** function name hits and reports the file + line
+  of the `.fi` file.
 * `gdb` shows the **source text of the `.fi` file**, not assembly.
-* `next` steps **line by line** through the Firn program (2 → 3 → 4 → 5).
-* The **backtrace** (`bt`) names the caller `main` with the
-  right line 11.
-* Exit code `067` octal = 55 decimal — the expected result of `summe(10)`.
+* `next` steps **line by line** through the Firn program.
+* The **backtrace** names the caller with the right line, and the frame line
+  carries the **parameter values**.
+* `info args`, `info locals`, `print` and `ptype` work — for scalars, for
+  **structs with their members**, through **pointers** and over **arrays**.
+* `finish` yields the return value with the right type.
+* Exit code `067` octal = 55 decimal — the expected result.
 
-To reproduce: execute the three commands above one to one. The addresses
-may change with the code generator, the file and the lines may not.
+To reproduce: `bash tools/dwarf/run.sh`. The script runs the sessions above
+and compares the output line by line against these expectations; the
+addresses may change with the code generator, the file, the lines and the
+values may not.
 
 ## Limits (honestly)
 
-* **No variables.** `print s` does not work: there are no
-  `DW_TAG_variable` entries and no type information in the `.debug_info`.
-  For that the compiler would have to write the `.debug_info` itself
-  instead of having `as` generate it.
-* **No lines in the optimized build** apart from the function line.
-* `ACCEPTANCE.md` item 4 criterion B additionally demands that **a real
-  bug** has been found with the debugger. That is not yet the case and
-  is still listed as open there.
+* **Nothing in the optimized build** apart from the function line. See above
+  for the reason; it is a decision, not an omission.
+* **No lexical blocks.** All variables of a function hang directly under the
+  `DW_TAG_subprogram`, not under `DW_TAG_lexical_block`. If the same name is
+  declared twice in nested scopes, both entries are there and `gdb` takes the
+  later one. Right in most cases, but not by construction.
+* **No CFI** (`.eh_frame`). The backtrace works because every function has an
+  ordinary `rbp` prologue; in the middle of the prologue (before
+  `mov rbp, rsp`) a backtrace would be wrong.
+* **Function values and error unions are opaque.** They get a name and a size,
+  no members. `print` shows the raw word. A struct-like breakdown would be a
+  claim about a layout that the language does not promise.
+* **The language number is `DW_LANG_C99`.** Firn is no C, but `gdb` only reads
+  out of it how expressions and array indexing are written, and there Firn
+  follows C. A number of its own would only make `gdb` fall back to its
+  default.
+* `ACCEPTANCE.md` item 4 criterion B additionally demands that **a real bug**
+  has been found with the debugger. That is still not the case and is still
+  listed as open there.

@@ -88,6 +88,13 @@ pub(crate) struct Lower<'a> {
     pub(crate) sret: Option<Val>,
     /// Source line assigned to the next instruction produced.
     pub(crate) pending_line: Option<(u32, u32)>,
+    /// Round 64: are the parameters through? Everything declared after that
+    /// is a local variable and gets `DW_TAG_variable` instead of
+    /// `DW_TAG_formal_parameter`.
+    pub(crate) params_done: bool,
+    /// Round 64: the line of the statement being lowered -- for the
+    /// `DW_AT_decl_line` of a declared name.
+    pub(crate) decl_line: Option<(u32, u32)>,
 }
 
 impl<'a> Lower<'a> {
@@ -250,6 +257,22 @@ impl<'a> Lower<'a> {
 
     /// Round 58: declaration WITH the source type (see `Local::ty`).
     pub(crate) fn declare_ty(&mut self, name: &str, slot: Val, ty: Type) {
+        // ROUND 64 -- the hook for the debugger. This is the ONE place where
+        // a name out of the source text is bound to storage; everything
+        // `gdb` later shows about variables comes from here. The line is the
+        // one of the statement being lowered (`pending_line`).
+        if dwarf::with_variables() {
+            let (file, line) = self.decl_line.unwrap_or((0, 0));
+            dwarf::declare_var(
+                &self.fname,
+                name,
+                slot,
+                crate::dwarf_info::dtype_of(&self.info.tcx, &ty),
+                file,
+                line,
+                !self.params_done,
+            );
+        }
         if let Some(s) = self.scopes.last_mut() {
             s.insert(name.to_string(), Local { slot, ty });
         }
@@ -1045,6 +1068,10 @@ impl<'a> Lower<'a> {
         let sp = s.span();
         if !sp.is_none() {
             self.pending_line = Some((sp.file, sp.line));
+            // ROUND 64: `pending_line` is CONSUMED by the first instruction
+            // of the statement; `declare_ty` runs after it and would find
+            // nothing. `decl_line` stays.
+            self.decl_line = Some((sp.file, sp.line));
         }
         match s {
             Stmt::Error(_) => Some(()),
@@ -1283,7 +1310,10 @@ impl<'a> Lower<'a> {
 
         self.cur = body_bb;
         self.enter();
-        self.declare(name, islot);
+        // ROUND 64: with the TYPE, not without. Until now the loop variable
+        // was the only declared name without one, and in the debugger it
+        // showed up as `<error>`.
+        self.declare_ty(name, islot, ty.clone());
         self.loops.push((end_bb, step_bb, self.defers.len()));
         let r = self.lower_block(body);
         self.loops.pop();
@@ -1414,6 +1444,8 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
             defers: Vec::new(),
         sret: None,
         pending_line: None,
+        params_done: false,
+        decl_line: None,
     };
     let mut next = 0usize;
     if sret {
@@ -1421,6 +1453,10 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
         next = 1;
     }
     lo.enter();
+    // ROUND 64: the parameters carry the line of the `fn` declaration.
+    if !d.span.is_none() {
+        lo.decl_line = Some((d.span.file, d.span.line));
+    }
     // Parameters get a slot and are saved in the entry block.
     for (i, p) in d.params.iter().enumerate() {
         let ty = match sig.params.get(i) {
@@ -1464,6 +1500,12 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
             }
             None => break,
         }
+    }
+    // ROUND 64: from here on every declared name is a local variable.
+    lo.params_done = true;
+    // The result type, for `DW_AT_type` of the subprogram.
+    if dwarf::with_variables() {
+        dwarf::set_fn_type(&d.name, crate::dwarf_info::dtype_of(&info.tcx, &sig.ret));
     }
     // HOOK fnval: inside a closure body the captured values are ordinary
     // names — they lie in the record, which arrived as the last parameter

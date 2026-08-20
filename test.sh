@@ -49,6 +49,14 @@
 #      exception reports (#DE, #PF, #GP, #DF), PIC/PIT with a tick counter
 #      that runs up, memory map, frame allocator and heap, keyboard over
 #      IRQ1, ring 3 with `syscall`/`sysret`. With counter-checks.
+#  23. The formatter firnfmt (tools/fmt/run.sh, round 64): the whole tree
+#      gets formatted, the token stream and the syntax tree stay unchanged,
+#      a second run changes nothing, and the shape does not depend on
+#      blanks (random test).
+#  24. Debug information (tools/dwarf/run.sh, round 64): `.debug_info`
+#      written by the compiler itself, `gdb` driven in batch mode over two
+#      translated Firn programs -- breakpoints, backtrace, `print` of
+#      variables, structs, pointers and arrays, with counter-checks.
 #  10. DOM soak run (tools/dom_soak/run.sh): the DOM prototype in Firn builds
 #      real cycles continuously (parent/child, listener, JS wrapper) and must
 #      not grow while doing so; the deliberately leaking counter-check with
@@ -466,6 +474,36 @@ if [ "$ENRC" -eq 0 ]; then
 else
     bad "tools/english/check.sh reports German identifiers (see .test-work/english.log)"
     tail -20 "$WORK/english.log" | sed 's/^/   /'
+fi
+
+echo "== 23. the formatter: canonical shape (tools/fmt/run.sh, ROUND 64) =="
+# firnfmt, written in Firn. Proven is: the token stream and the syntax tree
+# stay unchanged over the WHOLE tree, a second run changes nothing, the
+# shape does not depend on blanks (random test), and the tree in the
+# repository IS in canonical shape. The short version; the full run is in
+# docs/ROUND64.md.
+bash tools/fmt/run.sh --fast > "$WORK/fmt.log" 2>&1 && FMRC=0 || FMRC=$?
+if [ "$FMRC" -eq 0 ]; then
+    ok
+    grep -E '^   (files formatted|token stream|syntax tree|second run)' "$WORK/fmt.log" | sed 's/^/   /'
+else
+    bad "tools/fmt/run.sh failed (see .test-work/fmt.log)"
+    grep FAIL "$WORK/fmt.log" | head -10 | sed 's/^/   /'
+fi
+
+echo "== 24. debug information: gdb in a Firn program (tools/dwarf/run.sh, ROUND 64) =="
+# `.debug_info` written by the compiler itself: functions, parameters, local
+# variables with types. `gdb` is driven in batch mode and its output held
+# against expectations -- breakpoint, backtrace, `info args`, `print` of a
+# struct, of a pointer and of an array. With counter-checks: WITH the
+# optimizer there must be no variable information.
+bash tools/dwarf/run.sh > "$WORK/dwarf.log" 2>&1 && DWRC=0 || DWRC=$?
+if [ "$DWRC" -eq 0 ]; then
+    ok
+    tail -1 "$WORK/dwarf.log" | sed 's/^/   /'
+else
+    bad "tools/dwarf/run.sh failed (see .test-work/dwarf.log)"
+    grep FAIL "$WORK/dwarf.log" | head -10 | sed 's/^/   /'
 fi
 
 TOTAL=$((PASS + FAIL))
