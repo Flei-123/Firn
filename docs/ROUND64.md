@@ -27,8 +27,8 @@ are in `test.sh`, and every number below comes out of one of them.
 | `bash tools/fixpoint.sh` | stage 2 == stage 3, **character-identical** |
 | `bash tools/english/check.sh` | **five zeros** |
 | negative tests | 159 (147 before, twelve new: 1050--1065) |
-| `bash tools/parser_compare.sh` (revived) | 296 same, 1 known deviation |
-| `bash tools/sema_compare.sh` (revived) | 156 same, 27,824 expressions, 1 known deviation |
+| `bash tools/parser_compare.sh` (revived) | 307 same, 2 known deviations |
+| `bash tools/sema_compare.sh` (revived) | 157 same, 27,824 expressions, 1 known deviation |
 | `bash tools/fir_compare.sh` (revived) | 154 same, 43,635 instructions, 2 known deviations |
 
 ---
@@ -338,16 +338,36 @@ since then.
 Revived. What they now really say:
 
 ```
-parser_compare   SAME 296   DIFFERENT 1 (known)   NOT CORE 116   SKIPPED 124
-sema_compare     SAME 156   DIFFERENT 1 (known)   EXPRESSIONS 27824
+parser_compare   SAME 307   DIFFERENT 2 (known)   NOT CORE 137   SKIPPED 91
+sema_compare     SAME 157   DIFFERENT 1 (known)   EXPRESSIONS 27824
 fir_compare      SAME 154   DIFFERENT 2 (known)   INSTRUCTIONS 43635
 ```
 
 That is a second, independent proof that the reformatting of the whole tree
-changed no program: 296 syntax trees and 156 type-annotated trees of the
+changed no program: 307 syntax trees and 157 type-annotated trees of the
 FORMATTED sources come out equal in both compilers.
 
-The revival brought ONE deviation to light that had been hidden:
+The revival brought TWO deviations to light that had been hidden. Both are
+entered in the `KNOWN` list with their reason, and both are named here so
+that they do not vanish again.
+
+**One.** `tests/911_css_parser.fi`: a generic call whose type argument is a
+user defined name (`gc_null[Cv]()`). `.astdump` runs the parser WITHOUT the
+generic table, and instead of reporting "not core language" it reports a
+syntax error. Minimal reproduction:
+
+```firn
+fn main() -> i32 {
+    let a: i32 = gc_null[Cv]()
+    return a
+}
+```
+
+The same thing with `u32` instead of `Cv` goes through. NOT a consequence of
+the reformatting: the version out of the base commit `a2a2ed4` fails in
+exactly the same way.
+
+**Two.**
 `tests/871_closure_plain.fi`. `firnc0` appends the generated closure
 functions at the END of the module and numbers them from 0; `firnc1` emits
 them where they appear and numbers them from 2. The bodies are the same and
