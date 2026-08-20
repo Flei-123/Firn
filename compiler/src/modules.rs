@@ -176,7 +176,7 @@ pub fn resolve(root: &Path, world: &World) -> Result<Vec<SourceFile>, Error> {
         // Formerly only the second rule held. With it no library could load
         // another one: `lib/rt/vec.fi` with `import rt` looked for `rt.fi`
         // next to the MAIN PROGRAM instead of next to itself
-        // (docs/SELBSTHOSTING.md §7, blocker B3).
+        // (docs/SELF_HOSTING.md §7, blocker B3).
         //
         // The fallback to the root stays, so that existing programs keep
         // running unchanged: `tests/*.fi` load `modules.mathe`, and there
@@ -447,7 +447,7 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
     // parsing it. The root file is parsed first — so it did not yet know
     // the templates of the modules, and `var v: Vec[i32]` with `Vec`
     // from a module failed in the parser
-    // (docs/SELBSTHOSTING.md §7, blocker B1).
+    // (docs/SELF_HOSTING.md §7, blocker B1).
     //
     // That is why the reset of the hooks belongs here, ONCE for the whole
     // compilation, and after that all files get scanned up front.
@@ -569,7 +569,7 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
         // `sema_generic::REG` — the rewriting above therefore never reached
         // them, and a template from a module saw the names of the ROOT
         // FILE alone. Even a helper function in the same file reported
-        // "unknown function" (docs/SELBSTHOSTING.md §7, blocker B2).
+        // "unknown function" (docs/SELF_HOSTING.md §7, blocker B2).
         //
         // The NAME of the template stays untouched: the instantiation looks
         // for it later under the original name (`mono::expand_fn` through

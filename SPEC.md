@@ -221,7 +221,7 @@ for computed style values -- Stylo does that with `Arc`).
   (`lock xadd`, `compiler/src/atomic.rs`, proof `tools/atomic/run.sh`). Named
   honestly: upgrading a weak reference needs a compare-and-swap that round 47
   does not build -- it is correct today (one thread, 7), but it is not a
-  threading promise. `docs/RUNDE47.md`.
+  threading promise. `docs/ROUND47.md`.
 * `Weak[T]` breaks cycles manually -- for cases where the cycle is obvious and
   local.
 * **Cycles leak.** That stands in the documentation as such and is the reason
@@ -280,7 +280,7 @@ fn append(parent: Gc[Node], child: Gc[Node]) {
 | **When collection happens** | **only at allocation sites** of a GC type. No preemptive collection, no signals, no safepoint polls in loops | An endless loop without GC allocation blocks a collection -- acceptable, because it then produces no garbage either |
 | **Algorithm** | mark-sweep, **incremental with tri-colour marking** from v0.5 on (`S5`), a Dijkstra insertion barrier when writing a `Gc[T]` field | The barrier costs -- but **only** when writing `Gc[T]` fields. Non-GC code never executes it (guiding principle 4) |
 | **Pause times** | measurable through `gc.stats()`, boundable through `gc.set_budget(ms)` (`S6`) | |
-| **Finalizers** | `fn finalize(inout self)` (`S4`), runs **after** collection, may **not** resurrect and may not create new GC objects. **Built since round 47**; stage 0 has no methods, hence a cleanup kind per object plus a dispatcher, and the three prohibitions are enforced at **run time** (a visible abort) instead of being checked by the compiler -- 14.1, `docs/RUNDE47.md` | restricted, but predictable |
+| **Finalizers** | `fn finalize(inout self)` (`S4`), runs **after** collection, may **not** resurrect and may not create new GC objects. **Built since round 47**; stage 0 has no methods, hence a cleanup kind per object plus a dispatcher, and the three prohibitions are enforced at **run time** (a visible abort) instead of being checked by the compiler -- 14.1, `docs/ROUND47.md` | restricted, but predictable |
 | **Threads** | One GC heap **per thread**, no hand-over of `Gc[T]` between threads (`Gc[T]` is not sendable, 7) | Parallel layout works on arena data, not on GC data. That is a real restriction and it stands here so that it is known when the layout is designed |
 
 #### 3.5.4 `#[no_gc]` -- the guarantee for hot paths
@@ -1022,7 +1022,7 @@ specification and the code do not drift apart.
 5. **Global variables** do not exist (only `const`).
 6. ~~**The `profile` declaration** is parsed and checked, but has no effect.~~
    **Struck in round 52** (`compiler/src/prof.rs`, `compiler/src/core.rs`,
-   `docs/RUNDE52.md`): `--profile=kernel` and `profile kernel` respectively
+   `docs/ROUND52.md`): `--profile=kernel` and `profile kernel` respectively
    enforce the table from 2 -- no `import std.*`, no `gc class`, no `syscall`,
    no `#[unwinds]`, floating point only with `#[allow_fp]` -- and produce a
    freestanding **ELF object file** (`-c`, no `ld`, no `_start`, no contact with
@@ -1071,7 +1071,7 @@ specification and the code do not drift apart.
     driver `firnc --paket <dir>`. Without a manifest **nothing** changes. It
     stays with whole-program compilation: no separate object files, no network,
     no lock file, no version resolution -- `W1` and ACCEPTANCE item 5 therefore
-    stay open (`docs/RUNDE48.md`).
+    stay open (`docs/ROUND48.md`).
 16. **Line numbers for the debugger (round 2, module `kern`).** The compiler
     writes `.file`/`.loc` directives; `as` produces `.debug_line` from them.
     Instruction-accurate lines exist **only without the optimizer**
@@ -1202,10 +1202,10 @@ after 2,000,000 cycles. The report: `docs/reports/dom.md`.
 **Honest limits of this implementation:**
 
 * **`GcVec`/`GcMap` have existed since round 53** (`lib/gc/gcvec.fi`,
-  `lib/gc/gcmap.fi`, `docs/RUNDE53.md`), **`virtual` has not.**
+  `lib/gc/gcmap.fi`, `docs/ROUND53.md`), **`virtual` has not.**
   *Incremental collection* came along in round 44 (the longest pause
   **0.45 ms** instead of 3.54 ms), *finalizers* (`S4`) in round 47.
-* **Collections, the stage 0 form (round 53, `docs/RUNDE53.md`):** the collector
+* **Collections, the stage 0 form (round 53, `docs/ROUND53.md`):** the collector
   traces the heap precisely through a type table with **fixed** field offsets; a
   growing collection does not fit in there. It therefore lies in a second
   object, the **slot buffer** -- an ordinary GC block that carries the bit
@@ -1222,7 +1222,7 @@ after 2,000,000 cycles. The report: `docs/reports/dom.md`.
     same decision as with the finalizers.
   * In `GcMap` the keys **0 and 1** are reserved (an empty slot and a
     tombstone).
-* **Finalizers, the stage 0 form (round 47, `docs/RUNDE47.md`):** stage 0 has no
+* **Finalizers, the stage 0 form (round 47, `docs/ROUND47.md`):** stage 0 has no
   methods and no function pointers, so `fn finalize(inout self)` has become a
   pair -- `gc_finalisierer_setzen(p, art)` enters a **cleanup kind** into the
   block header, and the program declares **one** dispatcher
@@ -1305,7 +1305,7 @@ type 'T'* as soon as the template is instantiated.
 
 **What for:** without the element size the address of the `i`-th element cannot
 be computed, and so there is no growing `Vec[T]`
-(`docs/SELBSTHOSTING.md` 4, item 2).
+(`docs/SELF_HOSTING.md` 4, item 2).
 
 #### 14.1.comptime -- evaluation at compile time (round 12)
 

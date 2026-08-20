@@ -1,7 +1,7 @@
 # Round 47 — finalizers, `Arc[T]`, weak references: the remaining work on memory management
 
 Branch `r47-arc`, base `a492d26`. This round closes the three items that had
-stood unchanged as „open" in `ACCEPTANCE.md` and `docs/RUNDE44.md` since round
+stood unchanged as „open" in `ACCEPTANCE.md` and `docs/ROUND44.md` since round
 4: **finalizers (`S4`)**, **`Arc[T]`** and **weak references that are really
 zeroed on collection (`S3`)**.
 

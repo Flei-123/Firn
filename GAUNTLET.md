@@ -7,7 +7,7 @@ The firnc compiler works and is mature enough for this job. `bash test.sh` curre
 - SPEC.md -- 5.1 error unions (the goal), 8 strings, 14 what stage 0 can do, 14.1/14.2 the deliberate restrictions.
 - ACCEPTANCE.md -- the six acceptance items. Item 3 (tokenizer) stands at **0 of 6,810 (0.0 %)**. This round is supposed to turn that into a real number.
 - DESIGN_GOALS.md 2 (fallible allocation) and 10 (which foundations are in place).
-- docs/FIR.md, docs/SELBSTHOSTING.md.
+- docs/FIR.md, docs/SELF_HOSTING.md.
 READ ONLY: ../karstos-browser/TODO-FIRN.md block 0 (task 0.8), ../karstos-browser/FIRN-ANFORDERUNGEN.md 13 item 3.
 
 PRESENT and usable -- do not rebuild:

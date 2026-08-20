@@ -173,7 +173,7 @@ it stays short).
 
 Read honestly: the **pure** dispatch costs 13 instructions per call
 (`--no-opt`, both sides without inlining — the three loads from
-docs/RUNDE46.md §4 plus the indirect jump and the register saving it
+docs/ROUND46.md §4 plus the indirect jump and the register saving it
 entails). With the optimizer the gap opens further,
 5 against 29, and **not** because the dispatch gets more expensive, but
 because the static call disappears entirely: `inline.rs` inlines it, and

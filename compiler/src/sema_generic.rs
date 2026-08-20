@@ -130,7 +130,7 @@ pub(crate) fn fn_template(name: &str) -> Option<FnTemplate> {
 /// Needed by `modules.rs`: the templates do NOT sit in `Program::funcs`
 /// but here — module rewriting therefore never reached them, and a template
 /// saw the names of the root file only
-/// (docs/SELBSTHOSTING.md §7, blocker B2).
+/// (docs/SELF_HOSTING.md §7, blocker B2).
 pub(crate) fn fn_templates_the_file(file: u32) -> Vec<String> {
     REG.with(|r| {
         r.borrow()

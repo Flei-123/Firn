@@ -43,7 +43,7 @@
 //!
 //! ## Why a compare-and-swap joins them
 //!
-//! `docs/RUNDE47.md` §3.2 names the gap: with `lock xadd` alone
+//! `docs/ROUND47.md` §3.2 names the gap: with `lock xadd` alone
 //! neither a lock can be built (the transition "free -> taken" has to be
 //! conditional) nor the atomic upgrade (weak -> strong) be closed.
 //! `lock cmpxchg` is the smallest addition that settles both.

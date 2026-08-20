@@ -310,7 +310,7 @@ touches the 6810/6810.
 Both throughput values are the best of seven runs, measured directly
 against each other on the same machine (the „before" binary built from
 `git show HEAD:`). The signs run in opposite directions — that is noise,
-not an effect. The absolute MB/s are lower than in `docs/RUNDE40.md`,
+not an effect. The absolute MB/s are lower than in `docs/ROUND40.md`,
 because four other rounds were running on this machine at the same time;
 for an A/B that is irrelevant, for a comparison with html5ever it would
 matter.
@@ -574,7 +574,7 @@ therefore core language for stage 1 as well.
    is O(k·n) instead of O(n).
 
 **Not touched, on purpose:** `compiler/src`, `lib/firnc1` and `lib/gc`
-(foreign territory — four compiler rounds ran in parallel). `SELBSTHOSTING.md`
+(foreign territory — four compiler rounds ran in parallel). `SELF_HOSTING.md`
 stays unchanged as well; the paragraph about this round belongs in the
 merge, not in the branch.
 

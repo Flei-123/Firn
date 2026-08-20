@@ -71,7 +71,7 @@ Two interruptions above 2 ms, one of them above 8 ms. `gc_stop_max` =
 
 ## 2. The justification of `INKR_AB` re-examined — and refuted
 
-`docs/RUNDE38.md` justifies the threshold like this: purely incremental
+`docs/ROUND38.md` justifies the threshold like this: purely incremental
 cost −13 to −26 % throughput with a small heap, „pure loss"; the hybrid
 costs only −8,7 % for the „phase check per allocation".
 
