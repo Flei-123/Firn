@@ -80,7 +80,7 @@ d=open('$WORK/job1.bin','rb').read()
 print(struct.unpack('<I', d[12:16])[0])")
     base=$(count "$WORK/job0.bin" "base_$name")
     full=$(count "$WORK/job1.bin" "full_$name")
-    elements=$(sed -n 's/.*elements=\([0-9]*\).*/\1/p' "$WORK/full_$name.out")
+    elements=$(sed -n 's/.*elems=\([0-9]*\).*/\1/p' "$WORK/full_$name.out")
     boxes=$(sed -n 's/.*boxes=\([0-9]*\).*/\1/p' "$WORK/full_$name.out")
     if [ -z "$base" ] || [ -z "$full" ] || [ -z "$elements" ] || [ "$elements" = "0" ]; then
         printf '%-26s   MEASUREMENT FAILED\n' "$name"
