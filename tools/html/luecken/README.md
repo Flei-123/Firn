@@ -1,30 +1,30 @@
-# tools/html/luecken/ — was die Baumkonstruktion (noch) NICHT kann
+# tools/html/luecken/ -- what the tree construction can(not) do yet
 
-DIESE FAELLE SCHLAGEN FEHL — MIT ABSICHT.
+THESE CASES FAIL -- ON PURPOSE.
 
-Sie halten fest, was die Baumkonstruktion aus Runde 54 NICHT kann. Die
-erwarteten Baeume sind die RICHTIGEN (aus dem WHATWG-Standard, gegen
-html5lib 1.1 geprueft). Der Laeufer faehrt sie getrennt von der Hauptquote
-(tools/html/harness_tree.py --luecken) und weist sie eigens aus.
+They record what the tree construction of round 54 CANNOT do. The expected
+trees are the RIGHT ones (from the WHATWG standard, checked against
+html5lib 1.1). The runner drives them separately from the main quota
+(tools/html/harness_tree.py --gaps) and reports them on their own.
 
-Warum ueberhaupt: eine Testsuite, die nur enthaelt, was schon geht, sagt
-nichts ueber das, was fehlt. Diese Datei ist die Gegenrechnung.
+Why at all: a test suite that only contains what already works says nothing
+about what is missing. This file is the counter-calculation.
 
-1..5  Fremdinhalt (SVG/MathML): Namensraum am Wurzelelement gibt es, der
-Regelsatz fuer den INHALT fehlt (Namenskorrektur, Attributanpassung,
-Integrationspunkte, Ausbruchtags).
-6..9  `<template>`: der 23. Einfuegemodus und der eigene Inhaltsbaum.
-10    Fragmentzerlegung mit Kontextelement (`innerHTML`).
+1..5  foreign content (SVG/MathML): the namespace on the root element
+exists, the rule set for the CONTENT is missing (name correction, attribute
+adjustment, integration points, breakout tags).
+6..9  `<template>`: the 23rd insertion mode and its own content tree.
+10    fragment parsing with a context element (`innerHTML`).
 
-Die erwarteten Baeume in `bekannte_luecken.dat` sind die RICHTIGEN (aus dem
-WHATWG-Standard). Der Laeufer faehrt sie getrennt von der Hauptquote:
+The expected trees in `bekannte_luecken.dat` are the RIGHT ones (from the
+WHATWG standard). The runner drives them separately from the main quota:
 
-    python3 tools/html/harness_tree.py <binary> --luecken
+    python3 tools/html/harness_tree.py <binary> --gaps
 
-Sie werden eigens ausgewiesen und gehen NICHT in die Quote von
-`tools/html/cases/` ein. Eine Testsuite, die nur enthaelt, was schon geht,
-sagt nichts ueber das, was fehlt — diese Datei ist die Gegenrechnung.
+They are reported on their own and do NOT go into the quota of
+`tools/html/cases/`. A test suite that only contains what already works says
+nothing about what is missing -- this file is the counter-calculation.
 
-Die vier `<template>`-Faelle traegt `#orakel-abweichung`: html5lib 1.1 legt
-den Template-Inhalt nicht in einem eigenen Inhaltsbaum ab, kann die Erwartung
-also nicht bestaetigen. Sie ist von Hand aus dem Standard geschrieben.
+The four `<template>` cases carry `#orakel-abweichung`: html5lib 1.1 does not
+put the template content into a content tree of its own and can therefore not
+confirm the expectation. It is written by hand from the standard.

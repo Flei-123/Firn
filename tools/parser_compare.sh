@@ -1,79 +1,79 @@
 #!/usr/bin/env bash
-# tools/parser_compare.sh — der in FIRN geschriebene Parser gegen den in
-# RUST geschriebenen, ueber das gesamte Quellkorpus.
+# tools/parser_compare.sh -- the parser written in FIRN against the one
+# written in RUST, over the whole source corpus.
 #
-# MASSSTAB ist `firnc0 --emit=ast-kanon`: eine sprachneutrale, geklammerte
-# Form des Syntaxbaums (compiler/src/ast_canon.rs). Zwei unabhaengige Parser
-# erzeugen denselben Text genau dann, wenn sie denselben Baum gebaut haben.
+# The YARDSTICK is `firnc0 --emit=ast-kanon`: a language-neutral, parenthesised
+# form of the syntax tree (compiler/src/ast_canon.rs). Two independent parsers
+# produce the same text exactly when they have built the same tree.
 #
-# Rueckgabewerte von `.astdump`:
-#   0  Ausgabe erzeugt
-#   1  Syntaxfehler
-#   3  die Datei benutzt eine Erweiterung, die der Kernparser nicht kennt
-#      (`enum`/`match`, Fehlerunionen, Generics, `gc class`, Attribute,
-#      `comptime`) — solche Dateien werden GEZAEHLT, nicht uebergangen.
+# Return values of `.astdump`:
+#   0  output produced
+#   1  syntax error
+#   3  the file uses an extension the core parser does not know
+#      (`enum`/`match`, error unions, generics, `gc class`, attributes,
+#      `comptime`) -- such files are COUNTED, not passed over.
 set -uo pipefail
 cd "$(dirname "$0")/.."
-# Eigenes Temp-Verzeichnis je Lauf: zwei gleichzeitige Laeufe (z. B. Haupt-
-# repo und ein Worktree) benutzten sonst DIESELBEN /tmp-Dateien und
-# ueberschrieben sich gegenseitig die Vergleichsausgaben — das sah wie ein
-# echter Unterschied aus (Runde 41).
+# A temp directory of its own per run: two simultaneous runs (e.g. the main
+# repo and a worktree) otherwise used THE SAME /tmp files and
+# overwrote each other's comparison output -- which looked like a
+# real difference (round 41).
 TMPD=$(mktemp -d)
 trap 'rm -rf "$TMPD"' EXIT
 
 FIRNC=compiler/target/release/firnc
 DUMP=${ASTDUMP:-./.astdump}
 
-# Neu bauen, wenn das Dump-Binary fehlt ODER Quellen juenger sind
+# Rebuild when the dump binary is missing OR sources are younger
 if [ ! -x "$DUMP" ] || [ -n "$(find bin lib/firnc1 -name '*.fi' -newer "$DUMP" -print -quit)" ]; then
     rm -f "$DUMP"
     "$FIRNC" bin/astdump.fi -o "$DUMP" || exit 1
 fi
 
-# BEKANNTE ABWEICHUNG — einzeln benannt:
-#   tests/590_f64.fi  ->  das Literal `1e308`. Das ist KEIN Parserfehler,
-#   sondern der bekannte Gleitkomma-Rundungsfall aus Runde 20
-#   (tools/lex_compare.sh); der Wert steht schon im Token falsch.
-BEKANNT="tests/590_f64.fi"
+# KNOWN DEVIATION -- named separately:
+#   tests/590_f64.fi  ->  the literal `1e308`. That is NO parser error
+#   but the known floating point rounding case from round 20
+#   (tools/lex_compare.sh); the value is already wrong in the token.
+KNOWN="tests/590_f64.fi"
 
-gleich=0
-ungleich=0
-bekannt=0
-nichtkern=0
-uebersprungen=0
-erste=""
+same=0
+different=0
+known=0
+noncore=0
+skipped=0
+first=""
 
 while IFS= read -r f; do
     if ! "$FIRNC" --emit=ast-kanon "$f" > "$TMPD"/parv_a.txt 2>/dev/null; then
-        # firnc0 kommt selbst nicht durch (Modulbruchstueck, Negativtest).
-        uebersprungen=$((uebersprungen+1))
+        # firnc0 does not get through itself (module fragment, negative test).
+        skipped=$((skipped+1))
         continue
     fi
     "$DUMP" "$f" > "$TMPD"/parv_b.txt 2>/dev/null
     rc=$?
     if [ "$rc" -eq 3 ]; then
-        nichtkern=$((nichtkern+1))
+        noncore=$((noncore+1))
         continue
     fi
     if [ "$rc" -eq 0 ] && cmp -s "$TMPD"/parv_a.txt "$TMPD"/parv_b.txt; then
-        gleich=$((gleich+1))
+        same=$((same+1))
         continue
     fi
-    ungleich=$((ungleich+1))
-    if echo "$BEKANNT" | tr ' ' '\n' | grep -qxF "$f"; then
-        bekannt=$((bekannt+1))
+    different=$((different+1))
+    if echo "$KNOWN" | tr ' ' '\n' | grep -qxF "$f"; then
+        known=$((known+1))
     else
-        [ -z "$erste" ] && erste="$f (rc=$rc)"
+        [ -z "$first" ] && first="$f (rc=$rc)"
     fi
 done < <(find tests lib bin bench -name '*.fi' -not -type l | sort)
 
-echo "GLEICH:        $gleich"
-echo "UNGLEICH:      $ungleich   (bekannt und benannt: $bekannt)"
-echo "NICHT KERN:    $nichtkern  (enum/match, Fehlerunionen, Generics, gc, Attribute, comptime)"
-echo "UEBERSPRUNGEN: $uebersprungen  (firnc0 kommt selbst nicht durch)"
-if [ -n "$erste" ]; then
-    echo "erste unerwartete Abweichung: $erste"
-    ff=${erste%% *}
+echo "SAME:          $same"
+echo "DIFFERENT:     $different   (known and named: $known)"
+echo "NOT CORE:      $noncore  (enum/match, error unions, generics, gc, attributes, comptime)"
+echo "SKIPPED:       $skipped  (firnc0 does not get through itself)"
+if [ -n "$first" ]; then
+    echo "first unexpected deviation: $first"
+    ff=${first%% *}
     "$FIRNC" --emit=ast-kanon "$ff" > "$TMPD"/parv_a.txt 2>/dev/null
     "$DUMP" "$ff" > "$TMPD"/parv_b.txt 2>/dev/null
     diff "$TMPD"/parv_a.txt "$TMPD"/parv_b.txt | head -10

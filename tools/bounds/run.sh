@@ -1,46 +1,46 @@
 #!/usr/bin/env bash
-# Nachweis des STATISCHEN VERSANDS bei Schnittstellenschranken (Runde 50).
+# Proof of STATIC DISPATCH with interface bounds (round 50).
 #
-# Die Zusage lautet: `fn f[T: I](x: *T)` ruft `x.m()` DIREKT auf, sobald die
-# Auspraegung bekannt ist — kein Umweg ueber eine Methodentafel, kein
-# indirekter Sprung. Eine Zusage dieser Art laesst sich nicht mit der Wanduhr
-# belegen (die streut), sondern nur am ERZEUGTEN CODE. Genau das tut dieses
-# Werkzeug.
+# The promise is: `fn f[T: I](x: *T)` calls `x.m()` DIRECTLY as soon as the
+# instantiation is known -- no detour over a method table, no
+# indirect jump. A promise of this kind cannot be proven with the wall clock
+# (which scatters), only on the EMITTED CODE. Exactly that is what this
+# tool does.
 #
-# Zwei Programme, dieselbe Arbeit:
+# Two programs, the same work:
 #
-#   statisch.fi   fn count[T: Order](a: *T, …)     Schranke, Auspraegung
-#   dynamisch.fi  fn count_dyn(a: dyn OrderD, …)   Methodentafel
+#   static.fi     fn count[T: Order](a: *T, ...)    bound, instantiation
+#   dynamic.fi    fn count_dyn(a: dyn OrderD, ...)  method table
 #
-# Geprueft wird:
-#   1. In `statisch` gibt es KEINEN indirekten Aufruf (`call <register>`) —
-#      und ohne Optimierer dafuer einen namentlichen `call … Dot__less`.
-#   2. In `dynamisch` gibt es mindestens einen. (Ohne diese Gegenprobe wuerde
-#      der Test auch dann bestehen, wenn er gar nichts misst.)
-#   3. Dasselbe in der FIR: `statisch` enthaelt weder `calli` noch `vtab`,
-#      `dynamisch` beides.
-#   4. `statisch` laedt auch keine Methodentafel-Adresse (`lea … .L__iface`).
-#   5. Beide Compiler (firnc0 und firnc1) verhalten sich gleich.
-#   6. Instruktionszahlen mit callgrind — deterministisch, nicht die Uhr.
+# What is checked:
+#   1. In `static` there is NO indirect call (`call <register>`) --
+#      and without the optimiser a call by name `call ... Dot__less` instead.
+#   2. In `dynamic` there is at least one. (Without this counter-check the
+#      test would pass even if it measured nothing at all.)
+#   3. The same in the FIR: `static` contains neither `calli` nor `vtab`,
+#      `dynamic` contains both.
+#   4. `static` does not load a method table address either (`lea ... .L__iface`).
+#   5. Both compilers (firnc0 and firnc1) behave the same.
+#   6. Instruction counts with callgrind -- deterministic, not the clock.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 FIRNC="compiler/target/release/firnc"
 FC1=${FIRNC1:-./.firnc1}
-W=$(mktemp -d /tmp/firn-schranken.XXXXXX)
+W=$(mktemp -d /tmp/firn-bounds.XXXXXX)
 trap 'rm -rf "$W"' EXIT
-FEHLER=0
-melde() { echo "FEHLER: $1"; FEHLER=1; }
+ERRORS=0
+report() { echo "ERROR: $1"; ERRORS=1; }
 
 export FIRNLIB="$(pwd)/lib"
 
-# Wie viele indirekte Aufrufe stehen in dieser Assemblerdatei?
+# How many indirect calls are in this assembly file?
 indirekte() {
     grep -cE '^[[:space:]]*call[[:space:]]+(\*|r[a-z0-9]+$)' "$1" || true
 }
 
-N=${SCHRANKEN_N:-2000000}
+N=${BOUNDS_N:-2000000}
 
-cat > "$W/statisch.fi" <<EOF
+cat > "$W/static.fi" <<EOF
 interface Order {
     fn less(*self, b: *Self) -> bool
 }
@@ -73,7 +73,7 @@ fn main() -> i32 {
 }
 EOF
 
-cat > "$W/dynamisch.fi" <<EOF
+cat > "$W/dynamic.fi" <<EOF
 interface OrderD {
     fn less(*self, b: *Dot) -> bool
 }
@@ -107,91 +107,91 @@ fn main() -> i32 {
 }
 EOF
 
-# --- 1./2./4. firnc0: Assembler, in allen drei Baustufen --------------------
-for stufe in "release-fast:" "no-opt:--no-opt" "dev-fast:--opt-level=dev-fast"; do
-    name=${stufe%%:*}
-    opt=${stufe#*:}
-    "$FIRNC" $opt --emit=asm -o "$W/s_$name.s" "$W/statisch.fi" 2>"$W/err" \
-        || { melde "firnc0/$name: statisch liess sich nicht uebersetzen"; head -5 "$W/err"; continue; }
-    "$FIRNC" $opt --emit=asm -o "$W/d_$name.s" "$W/dynamisch.fi" 2>"$W/err" \
-        || { melde "firnc0/$name: dynamisch liess sich nicht uebersetzen"; head -5 "$W/err"; continue; }
+# --- 1./2./4. firnc0: assembly, in all three build stages ------------------
+for stage in "release-fast:" "no-opt:--no-opt" "dev-fast:--opt-level=dev-fast"; do
+    name=${stage%%:*}
+    opt=${stage#*:}
+    "$FIRNC" $opt --emit=asm -o "$W/s_$name.s" "$W/static.fi" 2>"$W/err" \
+        || { report "firnc0/$name: the static version could not be compiled"; head -5 "$W/err"; continue; }
+    "$FIRNC" $opt --emit=asm -o "$W/d_$name.s" "$W/dynamic.fi" 2>"$W/err" \
+        || { report "firnc0/$name: the dynamic version could not be compiled"; head -5 "$W/err"; continue; }
     si=$(indirekte "$W/s_$name.s")
     di=$(indirekte "$W/d_$name.s")
-    [ "$si" -eq 0 ] || melde "firnc0/$name: die Schrankenfassung hat $si indirekte Aufrufe (erwartet 0)"
-    [ "$di" -ge 1 ] || melde "firnc0/$name: die dyn-Fassung hat keinen indirekten Aufruf — die Gegenprobe misst nichts"
+    [ "$si" -eq 0 ] || report "firnc0/$name: the bound version has $si indirect calls (0 expected)"
+    [ "$di" -ge 1 ] || report "firnc0/$name: the dyn version has no indirect call -- the counter-check measures nothing"
     if grep -qE 'lea.*\.L__iface' "$W/s_$name.s"; then
-        melde "firnc0/$name: die Schrankenfassung laedt eine Methodentafel-Adresse"
+        report "firnc0/$name: the bound version loads a method table address"
     fi
     grep -qE 'lea.*\.L__iface' "$W/d_$name.s" \
-        || melde "firnc0/$name: die dyn-Fassung laedt KEINE Methodentafel-Adresse"
+        || report "firnc0/$name: the dyn version loads NO method table address"
 done
-# Der namentliche Aufruf ist ohne Optimierer sichtbar — MIT Optimierer
-# verschwindet er ganz, und das ist der eigentliche Gewinn (siehe Messung).
+# The call by name is visible without the optimiser -- WITH the optimiser
+# it disappears completely, and that is the real gain (see the measurement).
 grep -qE '^[[:space:]]*call[[:space:]]+\S*Dot__less' "$W/s_no-opt.s" \
-    || melde "firnc0/no-opt: kein namentlicher Aufruf 'Dot__less' in der Schrankenfassung"
+    || report "firnc0/no-opt: no call by name 'Dot__less' in the bound version"
 
-# --- 3. Dieselbe Aussage in der FIR ----------------------------------------
-"$FIRNC" --emit=fir-raw "$W/statisch.fi"  > "$W/s.fir" 2>/dev/null
-"$FIRNC" --emit=fir-raw "$W/dynamisch.fi" > "$W/d.fir" 2>/dev/null
-for wort in calli vtab; do
-    n=$(grep -c "$wort" "$W/s.fir" || true)
-    [ "$n" -eq 0 ] || melde "FIR der Schrankenfassung enthaelt $n mal '$wort'"
-    n=$(grep -c "$wort" "$W/d.fir" || true)
-    [ "$n" -ge 1 ] || melde "FIR der dyn-Fassung enthaelt kein '$wort'"
+# --- 3. the same statement in the FIR --------------------------------------
+"$FIRNC" --emit=fir-raw "$W/static.fi"  > "$W/s.fir" 2>/dev/null
+"$FIRNC" --emit=fir-raw "$W/dynamic.fi" > "$W/d.fir" 2>/dev/null
+for word in calli vtab; do
+    n=$(grep -c "$word" "$W/s.fir" || true)
+    [ "$n" -eq 0 ] || report "the FIR of the bound version contains '$word' $n times"
+    n=$(grep -c "$word" "$W/d.fir" || true)
+    [ "$n" -ge 1 ] || report "the FIR of the dyn version contains no '$word'"
 done
 
-# --- 5. firnc1 sagt dasselbe -----------------------------------------------
+# --- 5. firnc1 says the same -----------------------------------------------
 if [ ! -x "$FC1" ] || [ -n "$(find bin lib/firnc1 -name '*.fi' -newer "$FC1" -print -quit)" ]; then
     rm -f "$FC1"
-    "$FIRNC" bin/firnc1.fi -o "$FC1" >/dev/null || melde "firnc1 liess sich nicht bauen"
+    "$FIRNC" bin/firnc1.fi -o "$FC1" >/dev/null || report "firnc1 could not be built"
 fi
 if [ -x "$FC1" ]; then
-    if "$FC1" "$W/statisch.fi" -o "$W/s1.bin" >/dev/null 2>"$W/e1"; then
+    if "$FC1" "$W/static.fi" -o "$W/s1.bin" >/dev/null 2>"$W/e1"; then
         si=$(indirekte "$W/s1.bin.s")
-        [ "$si" -eq 0 ] || melde "firnc1: die Schrankenfassung hat $si indirekte Aufrufe"
+        [ "$si" -eq 0 ] || report "firnc1: the bound version has $si indirect calls"
         grep -qE '^[[:space:]]*call[[:space:]]+\S*Dot__less' "$W/s1.bin.s" \
-            || melde "firnc1: kein namentlicher Aufruf 'Dot__less'"
+            || report "firnc1: no call by name 'Dot__less'"
         set +e; "$W/s1.bin"; rc=$?; set -e
-        [ "$rc" -eq 0 ] || melde "firnc1: die Schrankenfassung liefert $rc statt 0"
+        [ "$rc" -eq 0 ] || report "firnc1: the bound version yields $rc instead of 0"
     else
-        melde "firnc1: statisch liess sich nicht uebersetzen"
+        report "firnc1: the static version could not be compiled"
         head -5 "$W/e1"
     fi
-    if "$FC1" "$W/dynamisch.fi" -o "$W/d1.bin" >/dev/null 2>"$W/e2"; then
+    if "$FC1" "$W/dynamic.fi" -o "$W/d1.bin" >/dev/null 2>"$W/e2"; then
         di=$(indirekte "$W/d1.bin.s")
-        [ "$di" -ge 1 ] || melde "firnc1: die dyn-Fassung hat keinen indirekten Aufruf"
+        [ "$di" -ge 1 ] || report "firnc1: the dyn version has no indirect call"
         set +e; "$W/d1.bin"; rc=$?; set -e
-        [ "$rc" -eq 0 ] || melde "firnc1: die dyn-Fassung liefert $rc statt 0"
+        [ "$rc" -eq 0 ] || report "firnc1: the dyn version yields $rc instead of 0"
     else
-        melde "firnc1: dynamisch liess sich nicht uebersetzen"
+        report "firnc1: the dynamic version could not be compiled"
         head -5 "$W/e2"
     fi
 fi
 
-# --- 6. Instruktionen (callgrind) ------------------------------------------
-messen() {   # $1 = Binary -> Instruktionen gesamt
+# --- 6. instructions (callgrind) -------------------------------------------
+measure() {   # $1 = binary -> instructions in total
     valgrind --tool=callgrind --callgrind-out-file=/dev/null "$1" 2>&1 \
         | sed -n 's/.*I *refs: *//p' | tr -d ', '
 }
-if command -v valgrind >/dev/null 2>&1 && [ "${SCHRANKEN_MESSEN:-1}" = 1 ]; then
-    for stufe in "release-fast:" "no-opt:--no-opt"; do
-        name=${stufe%%:*}
-        opt=${stufe#*:}
-        "$FIRNC" $opt -o "$W/s_$name" "$W/statisch.fi"  2>/dev/null
-        "$FIRNC" $opt -o "$W/d_$name" "$W/dynamisch.fi" 2>/dev/null
-        a=$(messen "$W/s_$name")
-        b=$(messen "$W/d_$name")
+if command -v valgrind >/dev/null 2>&1 && [ "${BOUNDS_MEASURE:-1}" = 1 ]; then
+    for stage in "release-fast:" "no-opt:--no-opt"; do
+        name=${stage%%:*}
+        opt=${stage#*:}
+        "$FIRNC" $opt -o "$W/s_$name" "$W/static.fi"  2>/dev/null
+        "$FIRNC" $opt -o "$W/d_$name" "$W/dynamic.fi" 2>/dev/null
+        a=$(measure "$W/s_$name")
+        b=$(measure "$W/d_$name")
         if [ -n "$a" ] && [ -n "$b" ]; then
-            echo "MESSUNG[$name]: schranke $a  dyn $b  je Durchlauf: $((a / N)) gegen $((b / N))"
+            echo "MEASUREMENT[$name]: bound $a  dyn $b  per run: $((a / N)) against $((b / N))"
         fi
     done
 else
-    echo "MESSUNG: uebersprungen (kein valgrind oder SCHRANKEN_MESSEN=0)"
+    echo "MEASUREMENT: skipped (no valgrind or BOUNDS_MEASURE=0)"
 fi
 
-if [ "$FEHLER" -ne 0 ]; then
-    echo "SCHRANKEN: FEHLGESCHLAGEN"
+if [ "$ERRORS" -ne 0 ]; then
+    echo "BOUNDS: FAILED"
     exit 1
 fi
-echo "SCHRANKEN: bestanden — 0 indirekte Aufrufe unter der Schranke, >=1 unter 'dyn', in 3 Baustufen und in beiden Compilern"
+echo "BOUNDS: passed -- 0 indirect calls under the bound, >=1 under 'dyn', in 3 build stages and in both compilers"
 exit 0

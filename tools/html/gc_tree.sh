@@ -1,95 +1,95 @@
 #!/usr/bin/env bash
-# tools/html/gc_tree.sh — Dauerlauf: echte DOM-Baeume, kein Wachstum.
+# tools/html/gc_tree.sh -- soak run: real DOM trees, no growth.
 #
-# Ein DOM-Baum ist die Zyklenart, an der ein Zaehlverweis scheitert (jeder
-# Knoten haelt Eltern UND Kinder stark). Dieses Skript baut in einer Schleife
-# vollstaendige Baeume aus echtem HTML (lib/browser/soak_tree.fi) und prueft,
-# dass der Speicherverbrauch des Prozesses FLACH bleibt.
+# A DOM tree is the kind of cycle a reference count fails at (every
+# node holds parent AND children strongly). This script builds complete
+# trees from real HTML in a loop (lib/browser/soak_tree.fi) and checks
+# that the memory consumption of the process stays FLAT.
 #
-# GEGENPROBE: derselbe Lauf mit `leck=1` haelt jeden Baum fest. Er MUSS
-# wachsen — sonst kann die Messung gar kein Leck anzeigen und ist wertlos.
-# Bleibt die Gegenprobe flach, bricht dieses Skript ab.
+# COUNTER-CHECK: the same run with `leak=1` keeps every tree. It MUST
+# grow -- otherwise the measurement cannot show a leak at all and is worthless.
+# If the counter-check stays flat, this script aborts.
 #
-# Umgebung:
-#   BAUM_RUNDEN     Runden im Normallauf (Standard 20000)
-#   BAUM_MS         Zeitbudget im Normallauf in ms (Standard 8000)
-#   BAUM_LECK_RUNDEN Runden der Gegenprobe (Standard 4000)
-#   BAUM_LECK_MB    harte Speicherbremse der Gegenprobe in MiB (Standard 1024)
-#   BAUM_DRIFT_KIB  erlaubter RSS-Zuwachs im Normallauf (Standard 256)
+# Environment:
+#   BAUM_RUNDEN      rounds in the normal run (default 20000)
+#   BAUM_MS          time budget of the normal run in ms (default 8000)
+#   BAUM_LECK_RUNDEN rounds of the counter-check (default 4000)
+#   BAUM_LECK_MB     hard memory brake of the counter-check in MiB (default 1024)
+#   BAUM_DRIFT_KIB   allowed RSS increase in the normal run (default 256)
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 
 FIRNC=compiler/target/release/firnc
 export FIRNLIB="$(pwd)/lib"
-ARBEIT=.tree-work
-RUNDEN=${BAUM_RUNDEN:-20000}
+WORK=.tree-work
+ROUNDS=${BAUM_RUNDEN:-20000}
 MS=${BAUM_MS:-8000}
-LECK_RUNDEN=${BAUM_LECK_RUNDEN:-4000}
-LECK_MB=${BAUM_LECK_MB:-1024}
+LEAK_ROUNDS=${BAUM_LECK_RUNDEN:-4000}
+LEAK_MB=${BAUM_LECK_MB:-1024}
 DRIFT=${BAUM_DRIFT_KIB:-256}
 
-mkdir -p "$ARBEIT"
+mkdir -p "$WORK"
 if [ ! -x "$FIRNC" ]; then
     cargo build --release --manifest-path compiler/Cargo.toml || exit 1
 fi
-"$FIRNC" -o "$ARBEIT/soak" lib/browser/soak_tree.fi || exit 1
+"$FIRNC" -o "$WORK/soak" lib/browser/soak_tree.fi || exit 1
 
-auftrag() {   # $1 runden  $2 ms  $3 leck
+job() {   # $1 rounds  $2 ms  $3 leak
     python3 -c "import struct,sys; sys.stdout.buffer.write(struct.pack('<III',$1,$2,$3))"
 }
 
-echo "== 1. Normallauf: Baum aufbauen, verwerfen, $RUNDEN Runden =="
-auftrag "$RUNDEN" "$MS" 0 > "$ARBEIT/auftrag_a.bin"
-if ! "$ARBEIT/soak" < "$ARBEIT/auftrag_a.bin" > "$ARBEIT/normal.tsv" 2>&1; then
-    echo "   FEHLER: der Normallauf endete mit einem Fehler"
-    tail -5 "$ARBEIT/normal.tsv"
+echo "== 1. normal run: build a tree, discard it, $ROUNDS rounds =="
+job "$ROUNDS" "$MS" 0 > "$WORK/auftrag_a.bin"
+if ! "$WORK/soak" < "$WORK/auftrag_a.bin" > "$WORK/normal.tsv" 2>&1; then
+    echo "   ERROR: the normal run ended with an error"
+    tail -5 "$WORK/normal.tsv"
     exit 1
 fi
-sed -n '3p;$p' "$ARBEIT/normal.tsv" | sed 's/^/   /'
-grep '^# angelegt=' "$ARBEIT/normal.tsv" | sed 's/^/   /'
+sed -n '3p;$p' "$WORK/normal.tsv" | sed 's/^/   /'
+grep '^# angelegt=' "$WORK/normal.tsv" | sed 's/^/   /'
 
-RSS0=$(awk '!/^#/{print $4; exit}' "$ARBEIT/normal.tsv")
-RSS1=$(awk '!/^#/{v=$4} END{print v}' "$ARBEIT/normal.tsv")
-RUND=$(awk '!/^#/{v=$2} END{print v}' "$ARBEIT/normal.tsv")
-ZEILEN=$(grep -vc '^#' "$ARBEIT/normal.tsv")
-ANGELEGT=$(sed -n 's/^# angelegt=\([0-9]*\).*/\1/p' "$ARBEIT/normal.tsv")
-LEBEND=$(sed -n 's/^# angelegt=[0-9]* lebende=\([0-9]*\).*/\1/p' "$ARBEIT/normal.tsv")
+RSS0=$(awk '!/^#/{print $4; exit}' "$WORK/normal.tsv")
+RSS1=$(awk '!/^#/{v=$4} END{print v}' "$WORK/normal.tsv")
+ROUND=$(awk '!/^#/{v=$2} END{print v}' "$WORK/normal.tsv")
+LINES=$(grep -vc '^#' "$WORK/normal.tsv")
+CREATED=$(sed -n 's/^# angelegt=\([0-9]*\).*/\1/p' "$WORK/normal.tsv")
+LIVE=$(sed -n 's/^# angelegt=[0-9]* lebende=\([0-9]*\).*/\1/p' "$WORK/normal.tsv")
 
-if [ -z "$RSS0" ] || [ "$ZEILEN" -lt 5 ]; then
-    echo "   FEHLER: zu wenige Messpunkte ($ZEILEN)"
+if [ -z "$RSS0" ] || [ "$LINES" -lt 5 ]; then
+    echo "   ERROR: too few measuring points ($LINES)"
     exit 1
 fi
 DELTA=$((RSS1 - RSS0))
-echo "   RSS erste Stichprobe: ${RSS0} KiB, letzte: ${RSS1} KiB, Zuwachs: ${DELTA} KiB"
-echo "   Runden: $RUND, angelegte GC-Objekte: $ANGELEGT, davon am Ende lebendig: $LEBEND"
+echo "   RSS first sample: ${RSS0} KiB, last: ${RSS1} KiB, growth: ${DELTA} KiB"
+echo "   rounds: $ROUND, GC objects created: $CREATED, of them alive at the end: $LIVE"
 if [ "$DELTA" -gt "$DRIFT" ]; then
-    echo "   FEHLGESCHLAGEN: RSS waechst um $DELTA KiB (erlaubt: $DRIFT)"
+    echo "   FAILED: the RSS grows by $DELTA KiB (allowed: $DRIFT)"
     exit 1
 fi
 
 echo
-echo "== 2. Gegenprobe: jeder Baum wird FESTGEHALTEN — muss wachsen =="
-auftrag "$LECK_RUNDEN" "$MS" 1 > "$ARBEIT/auftrag_b.bin"
+echo "== 2. counter-check: every tree is HELD ON TO -- it has to grow =="
+job "$LEAK_ROUNDS" "$MS" 1 > "$WORK/auftrag_b.bin"
 (
-    ulimit -v $((LECK_MB * 1024))
-    "$ARBEIT/soak" < "$ARBEIT/auftrag_b.bin" > "$ARBEIT/leck.tsv" 2>&1
+    ulimit -v $((LEAK_MB * 1024))
+    "$WORK/soak" < "$WORK/auftrag_b.bin" > "$WORK/leak.tsv" 2>&1
 )
-sed -n '3p;$p' "$ARBEIT/leck.tsv" | sed 's/^/   /'
-LRSS0=$(awk '!/^#/{print $4; exit}' "$ARBEIT/leck.tsv")
-LRSS1=$(awk '!/^#/{v=$4} END{print v}' "$ARBEIT/leck.tsv")
+sed -n '3p;$p' "$WORK/leak.tsv" | sed 's/^/   /'
+LRSS0=$(awk '!/^#/{print $4; exit}' "$WORK/leak.tsv")
+LRSS1=$(awk '!/^#/{v=$4} END{print v}' "$WORK/leak.tsv")
 if [ -z "$LRSS0" ] || [ -z "$LRSS1" ]; then
-    echo "   FEHLER: die Gegenprobe lieferte keine Messpunkte"
+    echo "   ERROR: the counter-check yielded no measuring points"
     exit 1
 fi
 LDELTA=$((LRSS1 - LRSS0))
-echo "   RSS erste Stichprobe: ${LRSS0} KiB, letzte: ${LRSS1} KiB, Zuwachs: ${LDELTA} KiB"
+echo "   RSS first sample: ${LRSS0} KiB, last: ${LRSS1} KiB, growth: ${LDELTA} KiB"
 if [ "$LDELTA" -lt 4096 ]; then
-    echo "   FEHLGESCHLAGEN: die Gegenprobe waechst nur um $LDELTA KiB —"
-    echo "   die Messung koennte ein echtes Leck gar nicht anzeigen."
+    echo "   FAILED: the counter-check only grows by $LDELTA KiB --"
+    echo "   the measurement could not show a real leak at all."
     exit 1
 fi
-echo "   Gegenprobe schlaegt an (+${LDELTA} KiB): die Messung kann ein Leck sehen."
+echo "   counter-check strikes (+${LDELTA} KiB): the measurement can see a leak."
 
 echo
-echo "BESTANDEN: $RUND Runden, $ANGELEGT GC-Objekte angelegt, RSS-Zuwachs ${DELTA} KiB"
+echo "PASSED: $ROUND rounds, $CREATED GC objects created, RSS growth ${DELTA} KiB"
 exit 0
