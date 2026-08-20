@@ -2300,7 +2300,7 @@ text sites, length entries, path names, comment and documentation lines.
 The source text of Firn — compiler, runtime, library, tests, tools and
 documentation — is English.
 
-## 45. Round 59 — a kernel as a load test for the language
+## 45. Round 59 seen from the language: what a kernel demands
 
 Round 59 built a small operating system core in Firn out of nine modules
 (`demos/kernel/kmain.fi` and the files beside it): its own IDT with
@@ -2314,6 +2314,9 @@ cases (section 22 of `test.sh`).
 Not one line of the compiler was changed in that round — and the fixpoint
 has the same size as before it, to the line:
 
+At the state of the branch `r59-kernel` — before the merge with rounds
+58 and 60, whose numbers stand in section 46:
+
 `test.sh` **854/854** (847 plus 2 x 3 build stages of the new tests
 890/891 plus the new section), self-comparison **234 same / 0 differing /
 0 faulty**, fixpoint **character-identical, 554 923 lines** (exactly as in
@@ -2325,10 +2328,13 @@ What the kernel could not get out of the language is named in
 memory region whose address the prologue hands over), only ONE output
 operand per `asm` (`rdmsr` puts edx:eax together inside the template), no
 function pointers (an address is called with `asm("call rax", ...)`), no
-`~`, and no line continuation. None of that stopped the kernel; all of it
-is worth a round of its own.
+`~`, and no line continuation. None of that stopped the kernel. Two
+of those gaps are closed by now: round 58 made functions values, so
+an address no longer has to be called through `asm("call rax")`, and
+round 62 built the operating system on top of that list without
+needing a single line of the compiler either.
 
-## 45. Rounds 58, 59 and 60: functions as values, a kernel that runs, CSS
+## 46. Rounds 58, 59 and 60: functions as values, a kernel that runs, CSS
 
 Three rounds in parallel, separated territories, reserved number ranges
 (opcodes 50-59 / 60-69, slots 2200-2299 / 2300-2399, test numbers
@@ -2403,3 +2409,108 @@ One more yardstick correction, the third of its kind: `also` stood in the
 list of German function words and reported two entirely English sentences
 of `docs/ROUND59.md` as German. A word that exists in both languages does
 not belong in that list.
+
+## 47. Rounds 61, 62, 63, 64: layout, an operating system, JavaScript, tooling
+
+Four rounds in parallel on the base `a2a2ed4`, separated territories and
+reserved number ranges (test numbers 940-969 / 970-999 / 1000-1049 /
+1050-1099, opcodes 70-79 / 90-99). All four merged; the numbers below are
+measured in the main repository after the merge, not taken from the
+reports of the rounds.
+
+### Acceptance in the main repository, measured by hand
+
+`test.sh` **961/961** (from 905), self-comparison **259 same / 0
+differing / 0 faulty**, `CODEGEN MISSING: 0`, fixpoint character-identical
+(**573 568 lines** of assembly, 3 374 672 octets in stage 2 as in stage 3),
+lowering comparison 156 same / 2 known deviations, tokenizer 6810/6810,
+tree construction 150/150, CSS 305/305 + 109/109 + 840/840, FREESTANDING
+41/41, PACKAGES 21/21, THREADS passed, FNVAL passed, and all five
+counter-checks of the English migration at zero.
+
+### Round 61 — the layout, measured against Chromium
+
+Box model with margin collapsing, block flow and inline flow with line
+breaking, on top of the cascade of round 60. The proof is not made
+against expectations of its own: every box is compared with
+`getBoundingClientRect()` in headless Chromium. **705 / 705 own boxes,
+705 / 705 equal to Chromium, deviation 0.00 %** (section 23 of
+`test.sh`). The soak run does 84 100 rounds in 60 s with **16 KiB** RSS
+growth; the counter-check without collection grows by 90 076 KiB, so the
+measurement means something. Throughput 66 409 instructions per element,
+callgrind, because the wall clock scatters by more than ten percent here.
+
+### Round 62 — the kernel becomes an operating system
+
+Scheduler with context switch and preemption, processes in separate
+address spaces with real memory protection, system calls, a RAM disk with
+superblock, inodes and directories, and a small shell in ring 3. Proven in
+QEMU: **174 cases, 0 failures** in eighteen sections (section 22, up from
+the 46 of round 59). Twelve of those are counter-checks that have to
+collapse when the thing under test is switched off — without the timer
+each worker is scheduled exactly once, kernel memory touched from ring 3
+gives `#PF` at `cr2=0x100000` with the process dead and the kernel alive,
+a kernel pointer handed to `write` gives `-EFAULT` instead of being
+followed, `wait` for a foreign pid gives `-ECHILD` instead of a hang, and
+an unformatted `mount` is refused instead of reading foreign octets as
+inodes. Not one line of either compiler was changed for it.
+
+### Round 63 — JavaScript, measured against test262 without filtering
+
+Lexer with automatic semicolon insertion, parser after ESTree, an
+interpreter with scope chains, prototypes, property attributes and the
+coercions, plus the built-in objects — all in Firn, nothing borrowed.
+The measurement is the honest one: a case that uses a feature this engine
+does not have counts as a failure like every other, nothing is filtered
+out. Against tc39/test262 (63 364 cases of the manifest): **parser
+44 341 passed, 69.98 %**, **engine 32 007 passed, 50.51 %**. The failures
+by cause are in `tools/js/RESULTS.md`; the interesting column is `wrong` —
+cases that ran through and delivered the wrong value — and it holds **9**.
+The regression limits hang in `test.sh` as section 9d (3 053 / 3 493
+parser, 2 317 / 3 493 engine on the fast subset).
+
+Eight language gaps were written down instead of fixed. One of them is a
+real bug and not a gap: **the two lexers read `9007199254740991.0`
+(2^53-1) one ULP apart** — `firnc0` and the lexer written in Firn produce
+different doubles for the same literal. `tools/lex_compare.sh` exists for
+exactly that and struck the moment the constant appeared in
+`lib/js/builtin.fi`. The same literal elsewhere does not diverge, so it
+depends on the path through the number reader, not on the digits. The
+engine sidesteps it by writing the value as an integer, but a lexer that
+reads a literal differently from the one that bootstrapped it breaks the
+fixpoint promise for every program using such a constant. That is worth a
+round of its own.
+
+### Round 64 — the tooling around the language
+
+`firnfmt`, written in Firn, and its proof is the whole tree: **603 files
+formatted, 0 changed by the shape, token stream differs 0, syntax tree
+differs 0** over 507 comparable files, and the second run differs 0 —
+idempotent. Error messages with a source excerpt and suggestions in both
+compilers (twelve negative tests). Real **DWARF**, verified in actual gdb
+sessions: **48 passed, 0 failed**. And a language server, `firnc --lsp`,
+checked by a real LSP client: **25 passed, 0 failed** (sections 24, 25,
+26).
+
+### What the merge cost this time
+
+Nothing dramatic in the code — the territories held. Three things had to
+be pulled straight afterwards, and all three are the same class of
+mistake as ever: **section numbers in `test.sh` collided** (four rounds
+each appended "the next" section, so layout, formatter, debug info and
+language server had to be renumbered to 23-26), **the new sources were not
+in canonical shape** (round 64 produced the formatter, rounds 61-63 wrote
+their sources before it existed — `firnfmt -w` over the tree, line count
+per file unchanged), and the name check found **nine German paths** it had
+been blind to because a compound written as one word is ONE morpheme:
+long morphemes are now searched inside words as well.
+
+### One number that only holds on a quiet machine
+
+`tests/860_thread_basic.fi` failed once during these runs. Case C of that
+test demands that the counter WITHOUT a lock LOSES increments — otherwise
+the proof that the mutex works would be worthless. Under five test suites
+running at once the four threads got serialised, the unlocked counter came
+out exact, the counter-check did not strike, and the test rightly reported
+a failure. Ten runs on a quiet machine give ten passes. It is written down
+because a number that only holds on a quiet machine is worth writing down.
