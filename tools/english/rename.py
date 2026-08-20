@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-# tools/englisch/umbenennen.py — wendet `namen.tsv` (und `namen_datei.tsv`)
+# tools/english/rename.py — wendet `names.tsv` (und `names_file.tsv`)
 # auf den Quelltext an. Getroffen werden NUR Bezeichner im Code; Kommentare,
 # Zeichenketten und Zeichenliterale bleiben unangetastet (das ist Etappe B).
 #
-#   python3 tools/englisch/umbenennen.py            # alles
-#   python3 tools/englisch/umbenennen.py compiler/src lib/std   # nur dort
-#   python3 tools/englisch/umbenennen.py --probe ...            # nur zeigen
+#   python3 tools/english/rename.py            # alles
+#   python3 tools/english/rename.py compiler/src lib/std   # nur dort
+#   python3 tools/english/rename.py --probe ...            # nur zeigen
 #
 # Symbolische Verweise (bin/*.fi -> lib/firnc1/*.fi) werden uebersprungen,
 # sonst liefe dieselbe Datei zweimal durch.
@@ -14,8 +14,8 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.chdir(ROOT)
-sys.path.insert(0, 'tools/englisch')
-import quelltext as Q
+sys.path.insert(0, 'tools/english')
+import source as Q
 
 ROOTS = ['compiler/src', 'lib', 'bin', 'tools', 'demos', 'examples', 'tests', 'bench', 'testdata']
 
@@ -37,9 +37,9 @@ def main(argv):
     argv = [a for a in argv if not a.startswith('--')]
     wurzeln = argv or ROOTS
 
-    abb = tabelle('tools/englisch/namen.tsv')
+    abb = tabelle('tools/english/names.tsv')
     prodatei = {}
-    for z in open('tools/englisch/hand_datei.tsv', encoding='utf-8'):
+    for z in open('tools/english/manual_file.tsv', encoding='utf-8'):
         if not z.strip() or z.startswith('#'):
             continue
         d, a, n = z.rstrip('\n').split('\t')

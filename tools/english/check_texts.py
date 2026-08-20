@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tools/englisch/pruefe_texte.py — GEGENPROBE fuer die AUSGABETEXTE.
+"""tools/english/check_texts.py — GEGENPROBE fuer die AUSGABETEXTE.
 
 Sucht in allen ZEICHENKETTENLITERALEN der beiden Uebersetzer (compiler/src/*.rs,
 lib/firnc1/*.fi, bin/*.fi) nach deutschen Woertern. Ein Treffer heisst: dieser
@@ -9,12 +9,12 @@ WOHER DIE WORTLISTE KOMMT (mechanisch, nicht von Hand gepflegt): Vor der
 Umstellung (Basis-Commit) war JEDER Text deutsch. Also gilt
 
     Deutsch = {Woerter in den Literalen des Basis-Commits}
-              - {Woerter der englischen Spalte von meldungen.tsv}
+              - {Woerter der englischen Spalte von messages.tsv}
               - {englische Wortliste ENGLISCH unten}
 
 Damit faellt jedes Wort auf, das aus der alten deutschen Welt uebrig geblieben
-ist — auch solche, die in morpheme.tsv nie standen (`quelltext`, `hinweis`, …).
-Kommentare zaehlen NICHT, die sind Etappe B. Ausnahmen: texte_ausnahmen.txt.
+ist — auch solche, die in morphemes.tsv nie standen (`quelltext`, `hinweis`, …).
+Kommentare zaehlen NICHT, die sind Etappe B. Ausnahmen: text_exceptions.txt.
 """
 import os, re, subprocess, sys, glob
 
@@ -50,8 +50,8 @@ err val arr idx blk slit alit awdh zuw param fseg fmt ptrmut init alloc collect
 live objects pause barriers tokens firn""".split())
 
 def lange_morpheme():
-    """Deutsche Morpheme ab 5 Zeichen aus morpheme.tsv — fuer einwortige Literale."""
-    p = 'tools/englisch/morpheme.tsv'
+    """Deutsche Morpheme ab 5 Zeichen aus morphemes.tsv — fuer einwortige Literale."""
+    p = 'tools/english/morphemes.tsv'
     w = set()
     if os.path.exists(p):
         for z in open(p, encoding='utf-8'):
@@ -95,7 +95,7 @@ def basis_woerter():
 
 def englische_spalte():
     w = set()
-    p = 'tools/englisch/meldungen.tsv'
+    p = 'tools/english/messages.tsv'
     if os.path.exists(p):
         for z in open(p, encoding='utf-8'):
             if '\t' in z:
@@ -104,7 +104,7 @@ def englische_spalte():
 
 
 def ausnahmen():
-    p = 'tools/englisch/texte_ausnahmen.txt'
+    p = 'tools/english/text_exceptions.txt'
     if not os.path.exists(p):
         return set()
     w = set()
@@ -128,7 +128,7 @@ def main():
             for lit in literale(s):
                 # Nur PROSA pruefen: mindestens zwei durch Leerzeichen
                 # getrennte Woerter. Einzelne Bezeichner, Register- und
-                # Tokenlisten sind Sache von pruefe.py (Bezeichner).
+                # Tokenlisten sind Sache von check.py (Bezeichner).
                 # PROSA (mindestens zwei Woerter) wird immer geprueft.
                 # Einwortige Literale (`"bitgleich"`) nur dann, wenn im Wort
                 # ein deutsches Morphem ab 5 Zeichen steckt — sonst waeren
@@ -146,8 +146,8 @@ def main():
                            if lit.split('\n')[0][:40] in z), 0)
                 treffer.append((f, nr, ','.join(schlecht), lit[:70]))
     for t in treffer:
-        print('DEUTSCH %s:%d  [%s]  %s' % t)
-    print('deutsche Textstellen:', len(treffer))
+        print('GERMAN  %s:%d  [%s]  %s' % t)
+    print('German text sites:', len(treffer))
     return 1 if treffer else 0
 
 

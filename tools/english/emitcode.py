@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""tools/englisch/emitcode.py — Bezeichner in EMITTIERTEM Quelltext.
+"""tools/english/emitcode.py — Bezeichner in EMITTIERTEM Quelltext.
 
 `comptime { emit_raw("fn tab_gross(c: i64) ...") }` erzeugt Firn-Quelltext
 aus einer Zeichenkette. Der normale Umbenenner fasst Literale nicht an, die
 Aufrufstelle des erzeugten Namens aber schon — danach passt beides nicht mehr
-zusammen. Dieses Werkzeug ersetzt die Namen aus namen.tsv INNERHALB der
+zusammen. Dieses Werkzeug ersetzt die Namen aus names.tsv INNERHALB der
 Zeichenketten der Dateien, die `emit_raw`/`emit_number` benutzen.
 """
 import os, re, sys
@@ -14,7 +14,7 @@ os.chdir(ROOT)
 
 DATEIEN = sys.argv[1:]
 tab = {}
-for z in open('tools/englisch/namen.tsv', encoding='utf-8'):
+for z in open('tools/english/names.tsv', encoding='utf-8'):
     if not z.strip() or z.startswith('#'):
         continue
     a, b = z.rstrip('\n').split('\t')[:2]

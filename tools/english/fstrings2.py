@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""tools/englisch/fstrings2.py — Bezeichner in f-Zeichenketten nachziehen.
+"""tools/english/fstrings2.py — Bezeichner in f-Zeichenketten nachziehen.
 
 In `f"... {quadrat(9)} ..."` steht ein AUSDRUCK mitten im Literal. Der
 Umbenenner laesst Literale in Ruhe, die Deklaration wird aber umbenannt.
 Dieses Werkzeug ersetzt in JEDEM Klammerinhalt einer f-Zeichenkette die
-Namen aus namen.tsv. Der Text zwischen den Klammern (die Prosa) bleibt.
+Namen aus names.tsv. Der Text zwischen den Klammern (die Prosa) bleibt.
 """
 import os, re, sys
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.chdir(ROOT)
 tab = {}
-for z in open('tools/englisch/namen.tsv', encoding='utf-8'):
+for z in open('tools/english/names.tsv', encoding='utf-8'):
     if z.strip() and not z.startswith('#'):
         a, b = z.rstrip('\n').split('\t')[:2]
         tab[a] = b
