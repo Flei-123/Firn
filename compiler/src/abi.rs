@@ -10,19 +10,19 @@
 //!   * aggregates over 16 bytes   -> MEMORY
 //!   * floating point             -> SSE (stage 0 has no float types)
 //!
-//! IMPLEMENTATION (see SPEC §14.1 point 1): INTEGER words get passed as the
+//! IMPLEMENTATION (see SPEC §14.1 point 1): INTEGER words are passed as the
 //! ABI says, through `rdi, rsi, rdx, rcx, r8, r9` and after that on the stack.
-//! MEMORY arguments get passed **as a hidden pointer to a copy owned by the
+//! MEMORY arguments are passed **as a hidden pointer to a copy owned by the
 //! caller** rather than as a stack copy; returns over 8 bytes always travel
-//! through the hidden pointer held by `rdi` (`rax` hands it back).
-//! Both are recorded by SPEC §14.1 as a deliberate deviation.
+//! through the hidden pointer in `rdi` (`rax` hands it back).
+//! Both are recorded in SPEC §14.1 as a deliberate deviation.
 
 use crate::types::{Type, TypeCtx};
 
-/// Class of one argument/return value at the function boundary.
+/// Class of an argument/return value at the function boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArgClass {
-    /// Passed through integer registers; `u8` is the count of 8-byte words
+    /// Passed through integer registers; `u8` is the number of 8-byte words
     /// (0 for `()`), at most 2 per System V.
     Integer(u8),
     /// Through memory (stage 0: hidden pointer to a copy).
@@ -56,12 +56,12 @@ pub fn classify(ty: &Type, tcx: &TypeCtx) -> ArgClass {
     }
 }
 
-/// Is `ty` aggregate (struct/array)?
+/// Is `ty` an aggregate (struct/array)?
 pub fn is_aggregate(ty: &Type) -> bool {
     matches!(ty, Type::Array(..) | Type::Struct(_))
 }
 
-/// Does the return type need the hidden pointer (`sret`) inside `rdi`?
+/// Does the return type need the hidden pointer (`sret`) in `rdi`?
 /// That holds for every aggregate over 8 bytes (SPEC §14.1: deviation from
 /// System V, which returns 9..16 bytes through `rax:rdx`).
 pub fn ret_needs_sret(ty: &Type, tcx: &TypeCtx) -> bool {

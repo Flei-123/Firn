@@ -9,7 +9,7 @@
 //! until `firn.package` shows up or the file system ends
 //! (`package::SUCHTIEFE` as the emergency brake). Without a find the world
 //! is EMPTY — the compiler then behaves exactly as before round 48. That is
-//! deliberate: all that is new hangs off the manifest, nothing moves without.
+//! deliberate: everything new hangs off the manifest, nothing changes without.
 
 use crate::package::{self, Manifest};
 
@@ -18,7 +18,7 @@ pub struct Package {
     pub manifest: Manifest,
     /// Directory of the manifest, normalized and absolute.
     pub root: String,
-    /// Path of the manifest file, the way it gets reported.
+    /// Path of the manifest file, the way it is reported.
     pub manifestpfad: String,
     /// Index into `World::packages` per entry of `manifest.dependent`.
     pub edges: Vec<usize>,
@@ -38,7 +38,7 @@ fn error_with_note(text: String, note: String) -> String {
 }
 
 /// Working directory, normalized. Everything internal computes absolute, so
-/// that "does this file sit within that package" stays pure string work.
+/// that "does this file sit inside that package" stays pure string work.
 pub fn cwd() -> String {
     match std::env::current_dir() {
         Ok(p) => package::normalize(&p.display().to_string()),
@@ -140,8 +140,8 @@ impl World {
             manifestpfad: mp,
             edges: Vec::new(),
         });
-        // BREADTH-FIRST SEARCH over `needs`. A package already loaded gets
-        // recognized by its root directory — the same spot is the same package,
+        // BREADTH-FIRST SEARCH over `needs`. A package already loaded is
+        // recognized by its root directory — the same place is the same package,
         // even when two manifests spell it differently.
         let mut i = 0usize;
         while i < packages.len() {
@@ -238,7 +238,7 @@ impl World {
     }
 
     /// Which package does this file belong to? The longest matching root wins,
-    /// so that a package may sit WITHIN the directory of another.
+    /// so that a package may sit INSIDE the directory of another.
     pub fn package_of(&self, absolute_path: &str) -> Option<usize> {
         let mut hit: Option<usize> = None;
         for (i, p) in self.packages.iter().enumerate() {
@@ -270,7 +270,7 @@ impl World {
     }
 }
 
-/// Error text "module is not public" — at ONE spot, so that `firnc0` and
+/// Error text "module is not public" — at ONE place, so that `firnc0` and
 /// `firnc1` write the very same sentence.
 pub fn text_not_public(module: &str, package_name: &str, manifestpfad: &str) -> String {
     error_with_note(
@@ -287,7 +287,7 @@ pub fn text_no_dependency(target: &str, of: &str, manifestpfad: &str) -> String 
     )
 }
 
-/// Error text "two files, one module label".
+/// Error text "two files, one module name".
 pub fn text_name_clash(module: &str, a: &str, b: &str) -> String {
     error_with_note(
         format!("name conflict: module '{}' comes from two files", module),

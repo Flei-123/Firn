@@ -1,16 +1,16 @@
 //! x86_64 code generator: FIR -> GNU assembler text (Intel syntax) for `as`/`ld`.
-//! No LLVM, no Cranelift, no C — every instruction gets chosen here by hand.
+//! No LLVM, no Cranelift, no C — every instruction is chosen here by hand.
 //!
 //! INTERFACE (fixed):
 //!   `pub fn emit(m: &fir::Module) -> Result<String, String>`
 //!
 //! Model of the register allocation (deliberately naive, yet correct):
-//!   * Every FIR value `%n` gets its own 8-byte stack slot at the frame.
+//!   * Every FIR value `%n` gets its own 8-byte stack slot in the frame.
 //!   * Computing happens exclusively at the scratch registers rax/rcx (rdx for
 //!     division/remainder, rdi/rsi/rcx additionally for `copymem`).
-//!   * Thereby rbx, rbp, r12-r15 (callee-saved) stay untouched; every register
-//!     used is caller-saved, and across a `call` no value lives within a
-//!     register.
+//!   * Thereby rbx, rbp, r12-r15 (callee-saved) are never touched; every
+//!     register used is caller-saved, and across a `call` no value lives in
+//!     a register.
 //!
 //! Frame (System V AMD64):
 //!   At entry rsp % 16 == 8 holds (the return address sits on top).
@@ -27,7 +27,7 @@ pub(crate) const ARG_REGS: [&str; 6] = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
 /// Argument registers of the Linux syscall ABI (after the number at rax).
 const SYS_REGS: [&str; 6] = ["rdi", "rsi", "rdx", "r10", "r8", "r9"];
 
-/// Register label at the width `bits` (needed for rax/rcx/rdx only).
+/// Register name at the width `bits` (needed for rax/rcx/rdx only).
 pub(crate) fn reg(name: &str, bits: u32) -> &'static str {
     match (name, bits) {
         ("rax", 8) => "al",
@@ -89,7 +89,7 @@ fn layout(f: &Func) -> Frame {
     }
     let mut alloca_off: Vec<Option<u64>> = vec![None; n];
     for b in &f.blocks {
-        // Invariant of FIR: all `alloca` stand at the entry block. Anything
+        // Invariant of FIR: all `alloca` stand in the entry block. Anything
         // else would be a frame of variable size — stage 0 cannot do that.
         if b.id != f.entry() && b.insts.iter().any(|i| matches!(i.op, Op::Alloca { .. })) {
             continue;
@@ -122,12 +122,12 @@ impl Emitter {
     }
 }
 
-/// Linker symbol of a function label.
+/// Linker symbol of a function name.
 ///
-/// **The only** spot at which some internal label becomes a symbol — the
+/// **The only** place at which an internal name becomes a symbol — the
 /// scheme itself stands at `modules.rs` (`SYMBOL_SCHEMA`, DESIGN_GOALS.md §4).
 /// Internal block labels (`block_label`) deliberately do NOT pass through
-/// here: they are file local (`.L…`) and never show up at the symbol table.
+/// here: they are file local (`.L…`) and never appear in the symbol table.
 pub(crate) fn label(name: &str) -> String {
     crate::modules::symbol(name, None)
 }
@@ -151,8 +151,8 @@ pub fn emit(m: &Module) -> Result<String, String> {
     }
     e.raw(".text");
     // ROUND 52 (SPEC §2): under the profile `kernel` there is NO entry point and
-    // no runtime prologue. The result is one object file that a boot loader or
-    // a linker script pulls into place — `_start`, the setup of `rsp` and the
+    // no runtime prologue. The result is an object file that a boot loader or
+    // a linker script pulls in — `_start`, setting up `rsp` and the
     // `exit` system call would be wrong there.
     let freestanding = crate::prof::is_kernel();
     if !freestanding {
@@ -164,7 +164,7 @@ pub fn emit(m: &Module) -> Result<String, String> {
     // That pointer goes to `rdi` — that is, to the FIRST parameter of `main`.
     // A program with `fn main() -> i32` notices nothing of it (it never reads
     // `rdi`); one with `fn main(start: u64) -> i32` reaches its call arguments
-    // that way. Without it `firnc1` can accept no filename
+    // that way. Without it `firnc1` could accept no file name
     // (docs/SELBSTHOSTING.md §2, point 3).
     e.line("mov rdi, rsp");
     e.line("and rsp, -16");
@@ -183,14 +183,14 @@ pub fn emit(m: &Module) -> Result<String, String> {
         emit_func(&mut e, f)?;
     }
     // HOOK gc: type table (.rodata) and state block (.data) of the collector —
-    // only when the program holds a `gc class` at all (gc.rs).
+    // only when the program contains a `gc class` at all (gc.rs).
     // Round 49: a program WITHOUT `gc class` that uses threads needs the state
-    // block as well — the thread table and the locks sit within it.
+    // block as well — the thread table and the locks sit in it.
     if crate::gc::has_classes() || crate::gc::runtime_active() {
         e.raw(&crate::gc::ty_table_asm());
     }
     // HOOK iface: the method tables (.rodata) — only when the program
-    // implements some interface at all (iface.rs, round 46).
+    // implements an interface at all (iface.rs, round 46).
     if crate::iface::has_interfaces() {
         e.raw(&crate::iface::tables_asm());
     }
@@ -198,12 +198,12 @@ pub fn emit(m: &Module) -> Result<String, String> {
     Ok(e.out)
 }
 
-/// `Op::GcAddr` — address of the state block of the collector at `rax`.
+/// `Op::GcAddr` — address of the state block of the collector in `rax`.
 ///
 /// With `regs` the callee-saved registers get rescued into the block first.
 /// Without that step the promise "CONSERVATIVE stack AND register scan"
 /// (SPEC §3.5.3) would be false: the register allocation (`regalloc.rs`)
-/// keeps values across calls at `rbx`/`r12`–`r15`.
+/// keeps values across calls in `rbx`/`r12`–`r15`.
 pub(crate) fn emit_gc_addr(e: &mut Emitter, regs: bool) {
     e.line(&format!("lea rax, [rip + {}]", crate::gc::STATE_LABEL));
     if !regs {
@@ -228,10 +228,10 @@ fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
     if let Some((file, line)) = dwarf::fn_line(&f.name) {
         e.line(&format!(".loc {} {} 0", file + 1, line));
     }
-    // ROUND 52 (SPEC §2): `#[interrupt]` — a calling convention of its own. At
+    // ROUND 52 (SPEC §2): `#[interrupt]` — a calling convention of its own. On
     // entry the processor has rescued NOTHING except the interrupt frame
     // (ss:rsp, rflags, cs:rip); everything else belongs to the interrupted
-    // thread and must travel here and back.
+    // thread and has to travel here and back.
     if f.interrupt {
         e.raw("    # interrupt: save all general purpose registers");
         for r in INT_SAVE {
@@ -244,9 +244,9 @@ fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
         e.line(&format!("sub rsp, {}", fr.size));
     }
     // Save the parameters into their slots: the first six integer words come
-    // out of the argument registers, all further ones off the stack of the
-    // caller (System V: [rbp+16], [rbp+24], ... — ahead of those sit the saved
-    // return address and the saved rbp).
+    // from the argument registers, all further ones off the stack of the
+    // caller (System V: [rbp+16], [rbp+24], ... — in front of those sit the
+    // saved return address and the saved rbp).
     for (i, _t) in f.params.iter().enumerate() {
         if i < ARG_REGS.len() {
             e.line(&format!("mov qword ptr [rbp-{}], {}", fr.slot[i], ARG_REGS[i]));
@@ -281,8 +281,8 @@ fn emit_block(e: &mut Emitter, f: &Func, fr: &Frame, b: &Block) -> Result<(), St
             &b.term,
         )?,
         Term::BrCond { cond, then_bb, else_bb } => {
-            // SPEC §9.2: within `#[constant_time]` functions no conditional jump may
-            // depend on a secret value — hard abort.
+            // SPEC §9.2: inside `#[constant_time]` functions no conditional jump
+            // may depend on a secret value — hard abort.
             if f.constant_time && f.is_secret(*cond) {
                 return Err(format!(
                     "#[constant_time]: conditional jump in '{}' depends on a secret value (%{})",
@@ -308,9 +308,9 @@ fn emit_block(e: &mut Emitter, f: &Func, fr: &Frame, b: &Block) -> Result<(), St
             } else {
                 // Round 51: NO `xor eax, eax` any more. A function with
                 // return type `void` has no result value; System V
-                // leaves `rax` undefined for that case, and within FIR
+                // leaves `rax` undefined in that case, and in FIR
                 // nobody reads the result of a void call (`Op::Call` without
-                // `dst`). Measured at the tokenizer: 4.229.623 calls, so
+                // `dst`). Measured in the tokenizer: 4.229.623 calls, so
                 // just as many instructions for nothing.
                 //
                 // Merge R51+R52: the condition `!f.interrupt` of round 52
@@ -352,7 +352,7 @@ pub(crate) fn load_ext(e: &mut Emitter, fr: &Frame, r: &str, v: Val, ty: FTy, to
     let off = fr.slot[v as usize];
     let bits = ty.bits().max(8);
     if bits >= to_bits {
-        // Wide enough already: the lower `to_bits` bits suffice.
+        // Already at least that wide: the lower `to_bits` bits suffice.
         e.line(&format!("mov {}, {} [rbp-{}]", reg(r, to_bits), size_word(to_bits), off));
         return;
     }
@@ -391,18 +391,18 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
         }
         Op::Cmp { op, ty: oty, a, b } => {
             let d = i.dst.ok_or("internal error: comparison without target")?;
-            // FLOATING POINT: `ucomisd` sets the flags like one UNSIGNED
+            // FLOATING POINT: `ucomisd` sets the flags like an UNSIGNED
             // comparison (CF/ZF), hence `setb`/`seta` rather than `setl`/`setg`.
-            // For NaN, PF gets set and ZF/CF as well — thereby every comparison
-            // except `!=` is false, exactly as IEEE-754 demands.
+            // comparison. For NaN, PF is set and ZF/CF as well — that makes every
+            // comparison except `!=` false, exactly as IEEE-754 demands.
             if *oty == FTy::F64 {
                 // For NaN `ucomisd` sets ZF=PF=CF=1 — the unordered case
                 // therefore looks like "less or equal". IEEE-754 demands,
                 // though, that EVERY ordering comparison with NaN be false.
                 //
                 // `seta`/`setae` check `CF=0 [and ZF=0]` and are therefore
-                // right by themselves. For `<` and `<=` the OPERANDS GET
-                // SWAPPED (`a < b` becomes `b > a`) rather than computing
+                // right by themselves. For `<` and `<=` the OPERANDS ARE
+                // SWAPPED (`a < b` becomes `b > a`) instead of computing
                 // on the parity flag afterwards.
                 let swap = matches!(op, CmpOp::Lt | CmpOp::Le);
                 let (first, second) = if swap { (*b, *a) } else { (*a, *b) };
@@ -419,7 +419,7 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
                 };
                 e.line(&format!("{} al", cc));
                 if matches!(op, CmpOp::Eq) {
-                    // NaN == NaN: ZF is set, yet PF is too. `setnp`
+                    // NaN == NaN: ZF is set, but PF is too. `setnp`
                     // masks the unordered case out.
                     e.line("setnp cl");
                     e.line("and al, cl");
@@ -457,8 +457,8 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
         Op::Un(op, a) => {
             let d = i.dst.ok_or("internal error: unary operation without target")?;
             // FLOATING POINT: the sign is ONE bit. `neg` would treat the whole
-            // bit pattern as two's complement — wrong. Flipped gets bit 63
-            // alone therefore.
+            // bit pattern as two's complement — wrong. That is why only bit 63
+            // is flipped.
             if ty == FTy::F64 {
                 if !matches!(op, UnOp::Neg) {
                     return Err("internal error: '!' is not defined for f64".to_string());
@@ -489,7 +489,7 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
             if ty == FTy::F64 && *from != FTy::F64 {
                 // Integer -> f64. Signed with `cvtsi2sd`; unsigned 64-bit
                 // values above 2^63 are beyond this instruction, so the value
-                // gets brought to 64 bits beforehand and the special case is
+                // is brought to 64 bits beforehand and the special case is
                 // stated honestly (SPEC §14.1.f64).
                 load_ext(e, fr, "rax", *src, *from, 64);
                 e.line("cvtsi2sd xmm0, rax");
@@ -498,7 +498,7 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
                 return Ok(());
             }
             if *from == FTy::F64 && ty != FTy::F64 {
-                // f64 -> integer, cutting (towards zero), as within C.
+                // f64 -> integer, cutting (towards zero), as in C.
                 load_full(e, fr, "rax", *src);
                 e.line("movq xmm0, rax");
                 e.line("cvttsd2si rax, xmm0");
@@ -506,7 +506,7 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
                 return Ok(());
             }
             if ty == FTy::Bool {
-                // Safety net: bool holds 0/1 only.
+                // Safety net: bool contains 0/1 only.
                 let bits = from.bits().max(8);
                 load_full(e, fr, "rax", *src);
                 e.line(&format!("test {}, {}", reg("rax", bits), reg("rax", bits)));
@@ -554,9 +554,9 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
             store_dst(e, fr, d, "rax");
         }
         Op::Call { name, args } => {
-            // Stack arguments from the seventh word on: they sit immediately ahead
-            // of the `call` at [rsp+8k]. The 16-byte alignment survives (one odd
-            // count of words gets a padding word).
+            // Stack arguments from the seventh word on: they sit immediately in
+            // front of the `call` at [rsp+8k]. The 16-byte alignment survives (an
+            // odd number of words gets a padding word).
             let stack_args = args.len().saturating_sub(ARG_REGS.len());
             let mut adjust = 8 * stack_args as u64;
             if stack_args % 2 == 1 {
@@ -581,8 +581,8 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
             }
         }
         // Dynamic dispatch (iface.rs, round 46): like `Op::Call`, only the target
-        // sits within a register. `rax` is pure scratch register at the base path
-        // and no argument register — it gets loaded LAST.
+        // sits in a register. `rax` is a pure scratch register on the base path
+        // and no argument register — it is loaded LAST.
         Op::CallIndirect { target, args } => {
             let stack_args = args.len().saturating_sub(ARG_REGS.len());
             let mut adjust = 8 * stack_args as u64;
@@ -643,7 +643,7 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
             store_dst(e, fr, d, "rax");
         }
         Op::Barrier { val } => {
-            // Opaque: the value passes through one empty asm needle eye.
+            // Opaque: the value passes through an empty asm needle eye.
             let d = i.dst.ok_or("internal error: barrier without target")?;
             load_full(e, fr, "rax", *val);
             e.raw("    # barrier: opaque to every optimization pass");
@@ -755,9 +755,9 @@ fn emit_bin(
 ) -> Result<(), String> {
     let wide = ty.bits() > 32;
     let bits = if wide { 64 } else { 32 };
-    // FLOATING POINT runs over the SSE unit. Computing happens at xmm0/xmm1,
-    // reading and writing happens through rax — one `f64` sits at the frame
-    // as ordinary 64-bit word (its bit pattern), which is why no separate
+    // FLOATING POINT runs over the SSE unit. Computing happens in xmm0/xmm1,
+    // reading and writing happens through rax — an `f64` sits in the frame
+    // as an ordinary 64-bit word (its bit pattern), which is why no separate
     // memory path is needed here.
     if ty == FTy::F64 {
         let m = match op {
@@ -785,7 +785,7 @@ fn emit_bin(
         BinOp::Add | BinOp::Sub | BinOp::And | BinOp::Or | BinOp::Xor | BinOp::Mul => {
             // The low order bits are independent of the width for these
             // operations; that is why computing happens at 32/64 bits and the
-            // result gets cut to the type width while reading.
+            // result is cut to the type width while reading.
             load_full(e, fr, "rax", a);
             load_full(e, fr, "rcx", b);
             let m = match op {
@@ -800,8 +800,8 @@ fn emit_bin(
             store_dst(e, fr, d, "rax");
         }
         BinOp::Div | BinOp::Rem => {
-            // Bring the operands exactly to the computing width (upper bits at the
-            // slot are not guaranteed), then idiv/div to match the sign.
+            // Bring the operands exactly to the computing width (upper bits in
+            // the slot are not guaranteed), then idiv/div to match the sign.
             load_ext(e, fr, "rax", a, ty, bits);
             load_ext(e, fr, "rcx", b, ty, bits);
             if ty.signed() {
@@ -894,8 +894,8 @@ mod tests {
         m.funcs.push(g);
         let asm = emit(&m).expect("codegen");
         // Since round 43 the register path covers this case as well; the calling
-        // convention is the same at BOTH paths, which is why the test checks it
-        // alone and no longer the producing path.
+        // convention is the same on BOTH paths, which is why the test checks
+        // only that and no longer the producing path.
         assert!(asm.contains("qword ptr [rbp+16]"), "{}", asm);
         assert!(asm.contains("qword ptr [rbp+24]"), "{}", asm);
         assert!(asm.contains("sub rsp, 16"), "{}", asm);

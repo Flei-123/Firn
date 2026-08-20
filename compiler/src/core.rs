@@ -1,9 +1,9 @@
 //! **Round 52 — freestanding: inline assembler, MMIO, interrupt entry.**
 //!
-//! Everything a kernel needs and applications do not: the three spots at
-//! which Firn addresses the processor directly. `prof.rs` enforces the
-//! profile rules of `SPEC.md` §2 alongside, `main.rs` produces a freestanding
-//! ELF object file with `-c`.
+//! Everything a kernel needs and an application does not: the three places
+//! at which Firn addresses the processor directly. Alongside it `prof.rs`
+//! enforces the profile rules of `SPEC.md` §2, and `main.rs` produces a
+//! freestanding ELF object file with `-c`.
 //!
 //! ## 1. Inline assembler
 //!
@@ -24,24 +24,24 @@
 //!
 //! `asm` is **no keyword**: the parser spots the form only when the identifier
 //! `asm` is followed immediately by `(` and a string literal. That keeps `asm`
-//! usable as a plain label and leaves the token stream unchanged (the same
+//! usable as a plain name and leaves the token stream unchanged (the same
 //! decision as with `size_of[T]`, `select`, `barrier`, `secure_zero`,
 //! `__atomic_add`).
 //!
 //! **Volatile cannot be waived.** `fir::Op::Asm` counts as impure
-//! (`is_pure() == false`), has no CSE key (`opt.rs::key`), is not hoistable as
-//! loop invariant (`licm.rs`) and counts at `mem2reg.rs` as untouchable and
-//! memory changing. That is the lesson of round 40 — there the optimizer
+//! (`is_pure() == false`), has no CSE key (`opt.rs::key`), cannot be hoisted
+//! as loop invariant (`licm.rs`) and counts in `mem2reg.rs` as untouchable
+//! and memory changing. That is the lesson of round 40 — there the optimizer
 //! removed code it was not allowed to remove.
 //!
 //! **Register binding rather than placeholders.** Operands state their own
 //! register; there is no `{0}` substitution. That is the minimal honest form:
-//! the code generator puts `mov <reg>, <value>` ahead of the block and reads
-//! `out` afterwards. Allowed are exclusively the **caller-saved** registers
-//! (`rax rcx rdx rsi rdi r8..r11` together with their narrow labels) — exactly
-//! those that any ordinary `call` destroys as well. That way the register
-//! allocation needs no special rule: it treats `Op::Asm` like a call. `rbx`,
-//! `rbp`, `rsp` and `r12`–`r15` are rejected, with a message.
+//! the code generator puts `mov <reg>, <value>` in front of the block and
+//! reads `out` afterwards. Allowed are exclusively the **caller-saved**
+//! registers (`rax rcx rdx rsi rdi r8..r11` together with their narrow
+//! names) — exactly those that any ordinary `call` destroys as well. That
+//! way the register allocation needs no special rule: it treats `Op::Asm`
+//! like a call. `rbx`, `rbp`, `rsp` and `r12`–`r15` are rejected, with a message.
 //!
 //! ## 2. MMIO
 //!
@@ -50,16 +50,16 @@
 //! let z: u32 = __mmio_read32(p)
 //! ```
 //!
-//! Eight builtin labels (`8|16|32|64` × `read|write`). They become
+//! Eight builtin names (`8|16|32|64` × `read|write`). They become
 //! `fir::Op::MmioLoad` / `Op::MmioStore` — a single machine instruction that
 //! no pass may merge, move or remove. The `__` prefix is reserved (like
 //! `__atomic_add`, round 47).
 //!
 //! ## 3. Interrupt entry points
 //!
-//! `#[interrupt] fn keyboard() { … }` — see `codegen_x86.rs`. Here stands the
-//! check alone: no parameters, no return value, not callable, kernel profile
-//! only.
+//! `#[interrupt] fn keyboard() { … }` — see `codegen_x86.rs`. Here stands
+//! only the check: no parameters, no return value, not callable, kernel
+//! profile only.
 
 use std::cell::RefCell;
 
@@ -75,11 +75,11 @@ use crate::types::Type;
 
 // -------------------------------------------------------------- Labels ---
 
-/// Reserved label prefix of the inline assembler. Firn identifiers cannot
-/// hold a `$` — a collision with user code is ruled out.
+/// Reserved name prefix of the inline assembler. Firn identifiers cannot
+/// contain a `$` — a collision with user code is ruled out.
 const P_ASM: &str = "asm$";
 
-/// The eight MMIO labels. Order = width 8/16/32/64.
+/// The eight MMIO names. Order = width 8/16/32/64.
 pub(crate) const MMIO_READ: [&str; 4] = [
     "__mmio_read8",
     "__mmio_read16",
@@ -93,7 +93,7 @@ pub(crate) const MMIO_WRITE: [&str; 4] = [
     "__mmio_write64",
 ];
 
-/// Width index 0..3 of one MMIO label, or `None`.
+/// Width index 0..3 of an MMIO name, or `None`.
 fn mmio_width(name: &str, write: bool) -> Option<usize> {
     let tab = if write { &MMIO_WRITE } else { &MMIO_READ };
     tab.iter().position(|n| *n == name)
@@ -121,8 +121,8 @@ fn mmio_fty(i: usize) -> FTy {
 // -------------------------------------------------------- Register table ---
 
 /// Allowed registers: the caller-saved set of System V, at all four widths.
-/// The second entry is the 64-bit trunk — the code generator puts the input
-/// value there (the narrow labels are views onto it).
+/// The second entry is the 64-bit trunk — that is where the code generator
+/// puts the input value (the narrow names are views onto it).
 const REGISTER: &[(&str, &str)] = &[
     ("rax", "rax"), ("eax", "rax"), ("ax", "rax"), ("al", "rax"),
     ("rcx", "rcx"), ("ecx", "rcx"), ("cx", "rcx"), ("cl", "rcx"),
@@ -135,7 +135,7 @@ const REGISTER: &[(&str, &str)] = &[
     ("r11", "r11"), ("r11d", "r11"), ("r11w", "r11"), ("r11b", "r11"),
 ];
 
-/// Registers that do exist, yet the inline assembler rejects them: they are
+/// Registers that do exist, but the inline assembler rejects them: they are
 /// callee-saved or carry the frame. A separate list, so that the message can
 /// say WHY (and not merely "unknown").
 const LOCKED: &[&str] = &[
@@ -148,14 +148,14 @@ const LOCKED: &[&str] = &[
     "r15", "r15d", "r15w", "r15b",
 ];
 
-/// 64-bit trunk of one allowed register label.
+/// 64-bit trunk of an allowed register name.
 pub(crate) fn stem(r: &str) -> Option<&'static str> {
     REGISTER.iter().find(|(n, _)| *n == r).map(|(_, s)| *s)
 }
 
 // ------------------------------------------------------------ Register ---
 
-/// One `asm` block the way the parser saw it. The input EXPRESSIONS do not
+/// An `asm` block the way the parser saw it. The input EXPRESSIONS do not
 /// stand here but as arguments of the produced call — that way
 /// monomorphization, the `#[no_gc]` check and `comptime` run over it
 /// unchanged (the same build as `__match#N` at `sema_match.rs`).
@@ -189,14 +189,14 @@ pub(crate) fn block_count() -> usize {
     REG.with(|r| r.borrow().len())
 }
 
-/// Clear the register — for the self tests only, which compile several
-/// programs within ONE process.
+/// Clear the register — only for the self tests, which compile several
+/// programs in ONE process.
 #[cfg(test)]
 pub(crate) fn reset() {
     REG.with(|r| r.borrow_mut().clear());
 }
 
-/// Does the label belong to some `asm` block? Yields the number.
+/// Does the name belong to an `asm` block? Yields the number.
 fn asm_number(name: &str) -> Option<usize> {
     name.strip_prefix(P_ASM)?.parse::<usize>().ok()
 }
@@ -237,10 +237,10 @@ fn str_lit(p: &mut Parser, what_for: &str) -> Option<(String, Span)> {
     }
 }
 
-/// `// HOOK kern` within `parser::primary`.
+/// `// HOOK kern` in `parser::primary`.
 ///
 /// Spots `asm ( "…" … )`. Only that form — `asm(x)` with a non-literal
-/// stays a plain call of a function `asm`.
+/// stays an ordinary call of a function `asm`.
 pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
     match p.kind() {
         TokKind::Ident(n) if n == "asm" => {}
@@ -266,8 +266,8 @@ pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
             break;
         }
         let before = p.pos;
-        // The keyword `KwIn` (known from the for loop) versus `out`/`clobber`,
-        // which are ordinary identifiers. All three get spotted locally here.
+        // `in` is a keyword (the for loop), `out`/`clobber` are ordinary
+        // identifiers. All three are spotted locally here.
         let kind = match p.kind().clone() {
             TokKind::KwIn => {
                 p.bump();
@@ -334,7 +334,7 @@ pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
 
 // ---------------------------------------------------------- Type phase ---
 
-/// Check of a register label. `wo` shows up within the message.
+/// Check of a register name. `wo` shows up in the message.
 fn check_reg(ck: &mut Checker, reg: &str, span: Span, wo: &str) -> bool {
     if reg == "memory" && wo == "clobber" {
         return true;
@@ -361,7 +361,7 @@ fn check_reg(ck: &mut Checker, reg: &str, span: Span, wo: &str) -> bool {
     false
 }
 
-/// `// HOOK kern` within `sema::call` — `asm$N(…)` and the eight MMIO labels.
+/// `// HOOK kern` in `sema::call` — `asm$N(…)` and the eight MMIO names.
 pub(crate) fn hook_call(
     ck: &mut Checker,
     name: &str,
@@ -394,7 +394,7 @@ fn check_asm(ck: &mut Checker, nr: usize, args: &[Expr], espan: Span) -> Type {
         }
     };
     // SPEC §2: the inline assembler is kernel business. Rejected under the
-    // `app` profile, so nobody nails applications to one architecture.
+    // `app` profile, so nobody nails an application to one architecture.
     crate::prof::hook_asm(ck, b.span);
     let mut good = true;
     if let Some(r) = &b.out {
@@ -529,7 +529,7 @@ fn check_mmio_write(
 
 // ------------------------------------------------------ Lowering phase ---
 
-/// `// HOOK kern` within `lower::lower_call`.
+/// `// HOOK kern` in `lower::lower_call`.
 #[allow(clippy::option_option)]
 pub(crate) fn lower_hook(
     lw: &mut Lower,
@@ -577,8 +577,8 @@ fn lower_asm(
         Some(b) => b,
         None => return lw.ice(span, "unknown asm block in lowering"),
     };
-    // Evaluate the input values by source order, then bring them to 64 bits:
-    // into a register goes the whole word, always.
+    // Evaluate the input values in source order, then bring them to 64 bits:
+    // what goes into a register is always the whole word.
     let mut ins: Vec<Val> = Vec::with_capacity(args.len());
     for a in args {
         let v = lw.lower_expr(a)?;
@@ -613,7 +613,7 @@ pub(crate) fn has_interrupt(f: &crate::ast::FnDecl) -> bool {
     f.attrs.iter().any(|a| a.name == "interrupt")
 }
 
-/// `// HOOK kern` within `sema::run`: check the form of the `#[interrupt]`
+/// `// HOOK kern` in `sema::run`: check the form of the `#[interrupt]`
 /// functions and make sure that nobody calls them.
 pub(crate) fn check_interrupts(ck: &mut Checker, prog: &crate::ast::Program) {
     let mut names: Vec<String> = Vec::new();
@@ -659,7 +659,7 @@ pub(crate) fn check_interrupts(ck: &mut Checker, prog: &crate::ast::Program) {
     if names.is_empty() {
         return;
     }
-    // A call through `call` would end at one `iretq` and take the stack
+    // A call through `call` would end at an `iretq` and take the stack
     // apart. So forbidden — with line and column.
     for f in &prog.funcs {
         visit_calls(ck, &f.body, &names);
@@ -781,7 +781,7 @@ mod tests {
 
     #[test]
     fn asm_stays_despite_unused_result() {
-        // THE TRAP OF ROUND 40: the result never gets read. Any optimizer
+        // THE TRAP OF ROUND 40: the result is never read. Any optimizer
         // that holds `Op::Asm` for pure throws the line away.
         let (asm, _) = build(
             "profile kernel\nfn f() { let _x: u64 = asm(\"rdtsc\", out(\"rax\"), clobber(\"rdx\")) }\n",

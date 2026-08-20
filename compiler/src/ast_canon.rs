@@ -4,7 +4,7 @@
 //! ## Why a second rendering next to `--emit=ast`?
 //!
 //! `--emit=ast` is Rust's `{:#?}`: tied to the data structure, with `Box`,
-//! `Some`/`None` and field labels. A parser written for another language
+//! `Some`/`None` and field names. A parser written for another language
 //! cannot rebuild that without aping Rust's debug output — and then the
 //! comparison checks the formatting rather than the tree.
 //!
@@ -15,8 +15,8 @@
 //!
 //! ## What is NOT part of it
 //!
-//! Source positions. They belong to the tree, but how they get composed
-//! (`Parser::join` over subexpressions) is a convention of its own; it gets
+//! Source positions. They belong to the tree, but how they are composed
+//! (`Parser::join` over subexpressions) is a convention of its own; it is
 //! checked separately once the parser stands. Missing as well are the
 //! extensions that keep their tree outside of `Program` (`enum`/`match`,
 //! error unions, generics, `gc class`, attributes, `comptime`).
