@@ -1,52 +1,52 @@
-//! **Runde 49 — Faeden.** Die drei Primitive, die Nebenlaeufigkeit ueberhaupt
-//! erst moeglich machen. Alles andere (Stapel, Join, Mutex, Kanal, die
-//! Fadensicherheit des Sammlers) steht als lesbares Firn in `lib/gc/gc.fi`.
+//! **Round 49 — threads.** The three primitives that make concurrency
+//! possible at all. Everything else (stack, join, mutex, channel, the thread
+//! safety of the collector) stands as readable Firn at `lib/gc/gc.fi`.
 //!
 //! ```firn
-//! __faden_starten(arg: u64, stapel: u64, ctid: *mut u8) -> i64
-//! __faden_selbst() -> *mut u8
-//! __atomar_tauschen(p: *mut u64, erwartet: u64, neu: u64) -> u64
+//! __thread_start(arg: u64, stack: u64, ctid: *mut u8) -> i64
+//! __thread_self() -> *mut u8
+//! __atomic_swap(p: *mut u64, expected: u64, new: u64) -> u64
 //! ```
 //!
-//! ## Warum `clone(2)` und nicht pthreads
+//! ## Why `clone(2)` and not pthreads
 //!
-//! Ein Firn-Programm ist **freistehend**: eigener `_start`, keine libc, kein
-//! dynamischer Linker, jeder Systemdienst ueber `syscall` (SPEC §11).
-//! `pthread_create` haette die ganze glibc hereingezogen — Initialisierung,
-//! TLS-Modell, Signalbehandlung, `__libc_start_main` — und damit genau das
-//! aufgegeben, was die Sprache ausmacht. `clone(2)` ist ein Systemaufruf wie
-//! `mmap`; er kostet nichts ausser dieser Datei.
+//! A Firn program is **freestanding**: its own `_start`, no libc, no dynamic
+//! linker, every system service through `syscall` (SPEC §11).
+//! `pthread_create` would have dragged the whole glibc along —
+//! initialization, TLS model, signal handling, `__libc_start_main` — and
+//! thereby given up exactly what makes the language. `clone(2)` is a system
+//! call like `mmap`; it costs nothing beyond this file.
 //!
-//! ## Warum das ein eigenes Primitiv braucht und nicht `syscall(56, …)` reicht
+//! ## Why that needs a primitive of its own, `syscall(56, …)` not sufficing
 //!
-//! Das ist der Kern: `clone` kehrt **zweimal** zurueck — im Erzeuger mit der
-//! Fadenkennung, im Kind mit 0. Das Kind kehrt aber mit einem **neuen `rsp`**
-//! zurueck, waehrend `rbp` und alle callee-saved Register Kopien des Erzeugers
-//! sind. Der vom Codegenerator erzeugte Code spricht seine Rahmenplaetze ueber
-//! `[rbp-off]` an — das Kind wuerde also in den Rahmen des ERZEUGERS schreiben,
-//! auf einem Stapel, der ihm nicht gehoert. Es gibt keine Formulierung in der
-//! Sprache, die das vermeidet; der Uebergang muss in derselben
-//! Instruktionsfolge stattfinden wie der Systemaufruf. Genau das ist
-//! `Op::ThreadSpawn`: Systemaufruf, Verzweigung nach Rueckgabewert, im Kind
-//! Argument vom neuen Stapel holen, Einstieg rufen, danach `exit(2)` — **nicht**
-//! `exit_group(2)`, sonst nimmt ein endender Faden den ganzen Prozess mit.
+//! That is the core: `clone` returns **twice** — at the creator with the
+//! thread id, at the child with 0. The child returns with a **new `rsp`**,
+//! though, while `rbp` and every callee-saved register are copies of the
+//! creator. The code produced by the code generator addresses its frame
+//! slots through `[rbp-off]` — so the child would write into the frame of
+//! the CREATOR, on a stack that is not its own. No wording of the language
+//! avoids that; the transition must happen within the same instruction
+//! sequence as the system call. Exactly that is `Op::ThreadSpawn`: system
+//! call, branch by return value, at the child fetch the argument from the
+//! new stack, call the entry, after that `exit(2)` — **not**
+//! `exit_group(2)`, otherwise a thread that ends takes the whole process.
 //!
-//! ## Warum ein TLS-Selbstzeiger
+//! ## Why a TLS self pointer
 //!
-//! Der Sammler muss an jeder Allokationsstelle wissen, welcher Faden gerade
-//! alloziert (eigene Freiliste, eigener Graupuffer, eigener Stapelbereich).
-//! `gettid(2)` waere ein Systemaufruf je Allokation. Der Kern kann dem Faden
-//! stattdessen ein `fs`-Basisregister geben (`arch_prctl(ARCH_SET_FS)`); der
-//! Blockkopf des Fadens traegt an Offset 0 seine eigene Adresse, und
-//! `mov rax, fs:0` ist **eine** Instruktion ohne Speicherzugriff ausserhalb
-//! der Cachezeile des Fadens.
+//! At every allocation site the collector must know which thread allocates
+//! right now (own free list, own grey buffer, own stack region).
+//! `gettid(2)` would be a system call per allocation. The kernel can hand
+//! the thread a `fs` base register instead (`arch_prctl(ARCH_SET_FS)`); the
+//! block header of the thread carries its own address at offset 0, and
+//! `mov rax, fs:0` is **one** instruction without memory access outside
+//! the cache line of the thread.
 //!
-//! ## Warum ein Vergleichs-Tausch dazukommt
+//! ## Why a compare-and-swap joins them
 //!
-//! `docs/RUNDE47.md` §3.2 nennt die Luecke beim Namen: mit `lock xadd` allein
-//! laesst sich weder eine Sperre bauen (der Uebergang „frei -> belegt" muss
-//! bedingt sein) noch `aufwerten_atomar` schliessen. `lock cmpxchg` ist die
-//! kleinste Ergaenzung, die beides erledigt.
+//! `docs/RUNDE47.md` §3.2 calls the gap by its label: with `lock xadd` alone
+//! neither a lock can be built (the transition "free -> taken" must be
+//! conditional) nor the atomic upgrade (weak -> strong) be closed.
+//! `lock cmpxchg` is the smallest addition that settles both.
 
 use crate::ast::Expr;
 use crate::diag::Span;
@@ -55,23 +55,23 @@ use crate::lower::Lower;
 use crate::sema::Checker;
 use crate::types::Type;
 
-/// Faden erzeugen.
+/// Create a thread.
 pub(crate) const START: &str = "__thread_start";
-/// Eigener Fadenblock (TLS, `fs:0`).
+/// Own thread block (TLS, `fs:0`).
 pub(crate) const SELF: &str = "__thread_self";
-/// Atomarer Vergleichs-Tausch.
+/// Atomic compare-and-swap.
 pub(crate) const CAS: &str = "__atomic_swap";
 
-/// Name der Einstiegsfunktion, die das Kind ruft. Sie steht in der
-/// Sammler-Laufzeit (`lib/gc/gc.fi`) und bekommt den Fadenblock als einziges
-/// Argument. Ein Funktionszeiger waere die Alternative; Stufe 0 hat keine
-/// (dieselbe Entscheidung wie beim Verteiler der Finalisierer, Runde 47).
+/// Label of the entry function that the child calls. It stands within the
+/// collector runtime (`lib/gc/gc.fi`) and gets the thread block as its only
+/// argument. A function pointer would be the alternative; stage 0 has none
+/// (the same decision as with the dispatcher of the finalizers, round 47).
 pub(crate) const ENTRY: &str = "__thread_entry";
 
-/// `clone(2)`-Merker: geteilter Adressraum, geteilte Dateien, echter Faden
-/// derselben Fadengruppe, und die beiden TID-Merker, aus denen `faden_warten`
-/// gebaut ist (`CLONE_CHILD_CLEARTID` laesst den Kern beim Fadenende das Wort
-/// nullen und darauf aufwecken — genau der Mechanismus von `pthread_join`).
+/// `clone(2)` flags: shared address space, shared files, a real thread of
+/// the same thread group, and the two TID flags out of which `thread_wait`
+/// is built (`CLONE_CHILD_CLEARTID` makes the kernel zero the word at thread
+/// end and wake up on it — exactly the mechanism of `pthread_join`).
 pub(crate) const CLONE_FLAGS: u64 = 0x0000_0100  // CLONE_VM
     | 0x0000_0200                                 // CLONE_FS
     | 0x0000_0400                                 // CLONE_FILES
@@ -81,15 +81,15 @@ pub(crate) const CLONE_FLAGS: u64 = 0x0000_0100  // CLONE_VM
     | 0x0010_0000                                 // CLONE_PARENT_SETTID
     | 0x0020_0000; // CLONE_CHILD_CLEARTID
 
-/// Ist `name` eines der drei Primitive?
+/// Is this spelling one of the three primitives?
 pub(crate) fn is_thread_call(name: &str) -> bool {
     name == START || name == SELF || name == CAS
 }
 
-// ------------------------------------------------------------------- Typphase
+// ----------------------------------------------------------------- Type phase
 
-/// Hook aus `sema::call`. `None`, wenn es keines der Primitive ist oder im
-/// Programm eine gleichnamige Funktion steht — die gewinnt dann.
+/// Hook from `sema::call`. `None` if this is none of the primitives or if
+/// the program holds a function of the same spelling — that one wins then.
 pub(crate) fn hook_call(
     ck: &mut Checker,
     name: &str,
@@ -229,9 +229,9 @@ fn fits_as_u64(t: &Type) -> bool {
     matches!(t, Type::U64 | Type::UntypedInt | Type::I64 | Type::Usize)
 }
 
-// ---------------------------------------------------------------- Lowerphase
+// ------------------------------------------------------------ Lowering phase
 
-/// Hook aus `lower::lower_call`.
+/// Hook from `lower::lower_call`.
 pub(crate) fn lower_thread_call(
     lo: &mut Lower,
     name: &str,
@@ -261,20 +261,20 @@ pub(crate) fn lower_thread_call(
     }
 }
 
-// -------------------------------------------------------------- Codegenerator
+// ------------------------------------------------------------- Code generator
 
-/// Die Instruktionsfolge fuer `Op::ThreadSpawn`. Vorbedingung: `rdi` = Argument,
-/// `rsi` = obere Stapeladresse, `rdx` = Zeiger auf das TID-Wort. Nachbedingung:
-/// `rax` = Fadenkennung (> 0) bzw. negativer Fehlerwert.
+/// The instruction sequence for `Op::ThreadSpawn`. Precondition: `rdi` =
+/// argument, `rsi` = upper stack address, `rdx` = pointer to the TID word.
+/// Postcondition: `rax` = thread id (> 0) or negative error value.
 ///
-/// Die lokale Marke `1:` ist eine **numerische** Marke des Assemblers: `jnz 1f`
-/// springt zur naechsten `1:` nach vorn. Damit braucht diese Folge keinen
-/// Zaehler und kann beliebig oft im selben Modul stehen.
+/// The local label `1:` is a **numeric** label of the assembler: `jnz 1f`
+/// jumps forward to the next `1:`. That way this sequence needs no counter
+/// and may stand as often as you like within the same module.
 pub(crate) fn spawn_sequence(e: &mut crate::codegen_x86::Emitter) {
-    // Argument auf den KINDstapel legen — im Kind ist `rdi` mit den Merkern
-    // ueberschrieben, und einen anderen Weg an den Wert gibt es nicht.
-    // 16 Byte, damit der Stapel ausgerichtet bleibt (SysV: an der `call`-Stelle
-    // 16-fach ausgerichtet).
+    // Put the argument on the CHILD stack — at the child `rdi` is overwritten
+    // with the flags, and there is no other way to reach the value.
+    // 16 bytes, so that the stack stays aligned (SysV: 16-fold aligned at the
+    // `call` site).
     e.line("sub rsi, 16");
     e.line("mov qword ptr [rsi], rdi");
     e.line("mov r10, rdx");
@@ -284,12 +284,12 @@ pub(crate) fn spawn_sequence(e: &mut crate::codegen_x86::Emitter) {
     e.line("syscall");
     e.line("test rax, rax");
     e.line("jnz 1f");
-    // ---- Kind: eigener Stapel, `rbp` neu, Argument zurueckholen ----------
+    // ---- child: own stack, `rbp` fresh, fetch the argument back ----------
     e.line("mov rdi, qword ptr [rsp]");
     e.line("add rsp, 16");
     e.line("xor ebp, ebp");
     e.line(&format!("call {}", crate::codegen_x86::label(ENTRY)));
-    // exit(2), NICHT exit_group(2): nur dieser Faden endet.
+    // exit(2), NOT exit_group(2): this thread alone ends.
     e.line("mov edi, eax");
     e.line("mov eax, 60");
     e.line("syscall");
@@ -297,15 +297,15 @@ pub(crate) fn spawn_sequence(e: &mut crate::codegen_x86::Emitter) {
     e.raw("1:");
 }
 
-/// Die Instruktionsfolge fuer `Op::AtomicCas`. Vorbedingung: `rcx` = Adresse,
-/// `rax` = erwarteter Wert, `rdx` = neuer Wert. Nachbedingung: `rax` = der
-/// vorgefundene Wert (gleich `erwartet`, wenn der Tausch stattfand).
+/// The instruction sequence for `Op::AtomicCas`. Precondition: `rcx` =
+/// address, `rax` = expected value, `rdx` = new value. Postcondition:
+/// `rax` = the value found (equal to the expectation if the swap happened).
 pub(crate) fn cas_sequence(e: &mut crate::codegen_x86::Emitter) {
     e.line("lock cmpxchg qword ptr [rcx], rdx");
 }
 
-/// Die Instruktionsfolge fuer `Op::ThreadSelf`: der Selbstzeiger aus dem
-/// Fadenblock. Vorbedingung: keine. Nachbedingung: `rax` = Fadenblock.
+/// The instruction sequence for `Op::ThreadSelf`: the self pointer out of
+/// the thread block. Precondition: none. Postcondition: `rax` = thread block.
 pub(crate) fn self_sequence(e: &mut crate::codegen_x86::Emitter) {
     e.line("mov rax, qword ptr fs:0");
 }

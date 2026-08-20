@@ -1,20 +1,20 @@
-//! Diagnosen: Sammeln und Ausgeben von Fehlermeldungen mit Datei, Zeile, Spalte,
-//! Quelltextzeile und Markierung.
+//! Diagnostics: collecting and printing error messages with file, line, column,
+//! source line and marker.
 //!
-//! Ausgabeformat (verbindlich, Negativtests haengen daran):
+//! Output format (binding, the negative tests depend on it):
 //!
 //! ```text
-//! error: erwartet ')' nach Argumentliste
+//! error: expected ')' after the argument list
 //!   --> tests/neg/bad_call.fi:7:22
 //!    |
 //!  7 |     let x = add(1, 2 ;
-//!    |                      ^ hier
+//!    |                      ^ here
 //! ```
 
-/// Quelltextposition. `line`/`col` sind 1-basiert, `col` und `len` zaehlen
-/// ZEICHEN (nicht Bytes), damit die Markierung unter UTF-8 stimmt.
-/// `file` ist die Nummer der Quelldatei in der Quelltextkarte der `Diags`
-/// (0 = Wurzeldatei). Programme aus einer einzigen Datei benutzen immer 0.
+/// Source position. `line`/`col` are 1-based, `col` and `len` count
+/// CHARACTERS (not bytes), so that the marker sits right under UTF-8.
+/// `file` is the number of the source file inside the source map of `Diags`
+/// (0 = root file). Programs made of a single file always use 0.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Span {
     pub file: u32,
@@ -32,7 +32,7 @@ impl Span {
             len: if len == 0 { 1 } else { len },
         }
     }
-    /// Position in einer bestimmten Quelldatei (Modulsystem, `modules.rs`).
+    /// Position inside a particular source file (module system, `modules.rs`).
     pub fn in_file(file: u32, line: u32, col: u32, len: u32) -> Span {
         Span {
             file,
@@ -41,7 +41,7 @@ impl Span {
             len: if len == 0 { 1 } else { len },
         }
     }
-    /// Platzhalterposition fuer Diagnosen ohne echten Ort.
+    /// Placeholder position for diagnostics without a real location.
     pub fn none() -> Span {
         Span {
             file: 0,
@@ -63,18 +63,18 @@ pub struct Diag {
     pub note: Option<String>,
 }
 
-/// Eine Quelldatei in der Quelltextkarte.
+/// One source file of the source map.
 struct SourceFileEntry {
     name: String,
     lines: Vec<String>,
 }
 
-/// Sammelt Diagnosen fuer eine Uebersetzung. Seit dem Modulsystem kann eine
-/// Uebersetzung aus mehreren Dateien bestehen; `Span::file` waehlt die Datei.
+/// Collects diagnostics for one compilation. Since the module system a
+/// compilation may span several files; `Span::file` picks the file.
 pub struct Diags {
     files: Vec<SourceFileEntry>,
     items: Vec<Diag>,
-    /// Obergrenze, damit kaputte Eingaben keine Fehlerlawine erzeugen.
+    /// Upper bound, so that broken input cannot produce a flood of errors.
     max: usize,
 }
 
@@ -105,7 +105,7 @@ impl Diags {
         d
     }
 
-    /// Nimmt eine weitere Quelldatei in die Karte auf und liefert ihre Nummer.
+    /// Takes one more source file into the map and yields its number.
     pub fn add_file(&mut self, file: &str, src: &str) -> u32 {
         let id = self.files.len() as u32;
         self.files.push(SourceFileEntry {
@@ -118,7 +118,7 @@ impl Diags {
         id
     }
 
-    /// Name der Quelldatei mit der Nummer `file`.
+    /// Label of the source file carrying the number `file`.
     pub fn file_name(&self, file: u32) -> &str {
         self.files
             .get(file as usize)
@@ -126,7 +126,7 @@ impl Diags {
             .unwrap_or("<unknown>")
     }
 
-    /// Fehler mit Standardmarkierung ("here").
+    /// Error with the standard marker ("here").
     pub fn error(&mut self, span: Span, msg: impl Into<String>) {
         self.push(Diag {
             msg: msg.into(),
@@ -136,7 +136,7 @@ impl Diags {
         });
     }
 
-    /// Fehler mit zusaetzlicher Erklaerungszeile ("hinweis: ...").
+    /// Error plus one extra explanation line ("note: ...").
     pub fn error_note(&mut self, span: Span, msg: impl Into<String>, note: impl Into<String>) {
         self.push(Diag {
             msg: msg.into(),
@@ -146,13 +146,13 @@ impl Diags {
         });
     }
 
-    /// Nimmt eine anderswo gebaute Diagnose auf (z. B. aus der Modulaufloesung).
+    /// Takes up a diagnostic built elsewhere (e.g. from module resolution).
     pub fn report(&mut self, d: Diag) {
         self.push(d);
     }
 
     fn push(&mut self, d: Diag) {
-        // Doppelte Meldungen an derselben Stelle unterdruecken (Fehlerwiederherstellung).
+        // Suppress duplicate messages at the same spot (error recovery).
         if self
             .items
             .iter()
@@ -178,7 +178,7 @@ impl Diags {
         self.file_name(0)
     }
 
-    /// Die Quelltextzeile (1-basiert) einer Datei der Karte, ohne Zeilenende.
+    /// The source line (1-based) of a file of the map, without the line ending.
     pub fn source_line_in(&self, file: u32, line: u32) -> &str {
         if line == 0 {
             return "";
@@ -189,7 +189,7 @@ impl Diags {
         }
     }
 
-    /// Alle gesammelten Diagnosen als Text.
+    /// All collected diagnostics as text.
     pub fn render(&self) -> String {
         let mut out = String::new();
         for d in &self.items {
@@ -223,7 +223,7 @@ impl Diags {
         let raw = self.source_line_in(d.span.file, d.span.line);
         let shown = expand_tabs(raw);
         out.push_str(&format!("{:>w$} | {}\n", nstr, shown, w = w + 1));
-        // Spaltenversatz unter Beruecksichtigung expandierter Tabulatoren.
+        // Column offset that accounts for expanded tabs.
         let mut vis = 0usize;
         for (i, c) in raw.chars().enumerate() {
             if i + 1 >= d.span.col as usize {
@@ -245,7 +245,7 @@ impl Diags {
         out
     }
 
-    /// Ausgabe nach stderr.
+    /// Print to stderr.
     pub fn print(&self) {
         if self.has_errors() {
             eprint!("{}", self.render());

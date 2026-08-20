@@ -1,22 +1,22 @@
-//! Lowering des Opt-in-Tracing-GC nach FIR (Modul `gckern`, SPEC §3.5).
+//! Lowering of the optional tracing GC to FIR (module `gckern`, SPEC §3.5).
 //!
-//! Die Sprachoberflaeche aus `gc.rs` wird hier auf drei Dinge abgebildet:
+//! The language surface from `gc.rs` gets mapped here onto three things:
 //!
-//!  * `gc C{ … }` — Aufruf der Laufzeit (`__gc_alloc_raw`), danach die
-//!    Fehlerunion `AllocError!Gc[C]` bauen und die Felder schreiben. Der
-//!    Sammellauf steckt in `__gc_alloc_raw`: **erst sammeln, dann
+//!  * `gc C{ … }` — call of the runtime (`__gc_alloc_raw`), after that build
+//!    the error union `AllocError!Gc[C]` and write the fields. The
+//!    collection run sits inside `__gc_alloc_raw`: **collect first, then
 //!    `AllocError::OutOfMemory`** (DESIGNZIELE §2).
-//!  * `weak(g)`, `stark(w)`, `x.as?[C]` — Aufrufe der Laufzeit.
-//!  * `__gc_state()` / `__gc_save_regs()` — die beiden Compilerintrinsics.
-//!    `Op::GcAddr` liefert die Adresse des Zustandsblocks; mit `regs = true`
-//!    werden vorher die callee-saved Register dorthin gerettet, damit der
-//!    KONSERVATIVE Registerscan (SPEC §3.5.3) sie sieht.
+//!  * `weak(g)`, `strong(w)`, `x.as?[C]` — calls of the runtime.
+//!  * `__gc_state()` / `__gc_save_regs()` — the two compiler intrinsics.
+//!    `Op::GcAddr` yields the address of the state block; with `regs = true`
+//!    the callee-saved registers get rescued there beforehand, so that the
+//!    CONSERVATIVE register scan (SPEC §3.5.3) sees them.
 //!
-//! Die **Einfuegebarriere** sitzt an genau einer Stelle: dem Schreiben eines
-//! `Gc[T]`-Zeigers in ein Heapfeld (`hook_assign`). In dieser Stufe zaehlt sie
-//! die Schreibzugriffe (`gc_barriers()`); der Sammler haelt an, also braucht
-//! Mark-Sweep hier keine Graufaerbung. Der Platz fuer das inkrementelle
-//! Sammeln (`S5`, offen) ist damit vorhanden und nachweisbar durchlaufen.
+//! The **insertion barrier** sits at exactly one spot: the write of a
+//! `Gc[T]` pointer into a heap field (`hook_assign`). At this stage it counts
+//! the writes (`gc_barriers()`); the collector stops the world, so mark-sweep
+//! needs no greying here. The slot for incremental collection (`S5`, still
+//! open) is thereby present and provably exercised.
 
 use crate::ast::{Expr, ExprKind};
 use crate::fir::{CmpOp, FTy, Op, Val};
@@ -24,8 +24,8 @@ use crate::gc;
 use crate::lower::Lower;
 use crate::types::Type;
 
-/// Aufrufname, den die Laufzeit wirklich traegt. `weak`/`stark` sind keine
-/// Funktionen des Quelltextes; sie werden hier auf die Laufzeit abgebildet.
+/// Call symbol that the runtime really carries. `weak`/`strong` are no
+/// functions of the source text; they get mapped onto the runtime here.
 pub(crate) fn real_name(name: &str) -> Option<&'static str> {
     match name {
         "weak" => Some(gc::FN_WEAK),
@@ -34,8 +34,8 @@ pub(crate) fn real_name(name: &str) -> Option<&'static str> {
     }
 }
 
-/// `// HOOK gc` in `lower::lower_call`: Allokation, Intrinsics, `as?`.
-/// Liefert `Some(...)`, wenn der Aufruf hier vollstaendig erledigt wurde.
+/// `// HOOK gc` within `lower::lower_call`: allocation, intrinsics, `as?`.
+/// Yields `Some(...)` once the call was fully handled here.
 pub(crate) fn hook_call(
     lo: &mut Lower,
     name: &str,
@@ -86,7 +86,7 @@ fn alloc_and_init(
         Some(x) => x,
         None => return lo.ice(span, "gc allocation without class"),
     };
-    // Lage von `__err`/`__val` in der Fehlerunion.
+    // Position of `__err`/`__val` inside the error union.
     let union = match gc::union_idx(class).and_then(crate::errors::union_by_struct) {
         Some(u) => u,
         None => return lo.ice(span, "gc allocation without error union"),
@@ -109,7 +109,7 @@ fn alloc_and_init(
     let join = lo.new_block();
     lo.set_term(crate::fir::Term::BrCond { cond: ok, then_bb: ok_bb, else_bb: fail_bb });
 
-    // Fehlerfall: erst hat die Laufzeit gesammelt, dann ist wirklich Schluss.
+    // Error case: the runtime collected first, after that it really is over.
     lo.cur = fail_bb;
     let c = lo.constant(FTy::U32, code);
     lo.store(FTy::U32, dest, c);
@@ -118,8 +118,8 @@ fn alloc_and_init(
     lo.store(FTy::Ptr, va, z);
     lo.set_term(crate::fir::Term::Br(join));
 
-    // Erfolgsfall: Fehlerunion fuellen (damit der Zeiger sofort eine Wurzel
-    // auf dem Stapel hat), dann die Felder schreiben.
+    // Success case: fill the error union (so that the pointer immediately has
+    // a root on the stack), then write the fields.
     lo.cur = ok_bb;
     let zero = lo.constant(FTy::U32, 0);
     lo.store(FTy::U32, dest, zero);
@@ -144,15 +144,15 @@ fn alloc_and_init(
     Some(())
 }
 
-/// `// HOOK gc` in `lower::lower_stmt` (Zuweisung): die Einfuegebarriere.
-/// Wird NACH dem Schreiben gerufen; `target` ist das beschriebene Feld.
+/// `// HOOK gc` within `lower::lower_stmt` (assignment): the insertion barrier.
+/// Gets called AFTER the write; `target` is the field written to.
 pub(crate) fn hook_assign(lo: &mut Lower, target: &Expr) -> Option<()> {
     let t = lo.ty_of(target);
     if !gc::is_gc_ptr(&t) {
         return Some(());
     }
-    // Nur Schreibzugriffe IN den Heap brauchen die Barriere; eine oertliche
-    // Veraenderliche liegt auf dem Stapel.
+    // Only writes INTO the heap need the barrier; a local variable
+    // lives on the stack.
     let ins_heap = match &target.kind {
         ExprKind::Field(base, _, _) => gc::is_gc_ptr(&lo.ty_of(base)) || is_ptr(&lo.ty_of(base)),
         ExprKind::Index(base, _) => is_ptr(&lo.ty_of(base)),

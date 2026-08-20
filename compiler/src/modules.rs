@@ -1,25 +1,25 @@
-//! Minimales Modulsystem: mehrere `.fi`-Dateien werden zu EINEM Programm
-//! zusammengefuehrt und zu EINEM Binary uebersetzt.
+//! Minimal module system: several `.fi` files get merged into ONE program
+//! and compiled into ONE binary.
 //!
 //! Syntax (SPEC §12):
-//!   * `import pfad.modul` — bindet `pfad/modul.<endung>` ein. Gesucht wird
-//!     in dieser Reihenfolge: (1) relativ zur IMPORTIERENDEN Datei,
-//!     (2) relativ zum Verzeichnis der Wurzeldatei, (3) in `$FIRNLIB`,
-//!     (4) in `<Verzeichnis des Compiler-Binarys>/../lib`
-//!     (Installationsfallback; `firnc1` liest dafuer `/proc/self/exe`).
-//!     Angesprochen wird das Modul unter dem letzten Pfadteil.
-//!   * `export { a, b }` — Sichtbarkeitsliste je Modul. Fehlt sie, ist alles
-//!     sichtbar.
-//!   * `modul.name` — Zugriff auf ein Element eines eingebundenen Moduls.
+//!   * `import path.module` — loads `path/module.<suffix>`. Searched gets
+//!     with this order: (1) relative to the IMPORTING file,
+//!     (2) relative to the directory of the root file, (3) at `$FIRNLIB`,
+//!     (4) at `<directory of the compiler binary>/../lib`
+//!     (installation fallback; `firnc1` reads `/proc/self/exe` for it).
+//!     Addressed gets the module under the last path part.
+//!   * `export { a, b }` — visibility list per module. Without it everything
+//!     is visible.
+//!   * `module.item` — access to some element of a loaded module.
 //!
-//! Verfahren: jede Datei wird EINZELN geparst (eigener `ExprId`-Bereich, eigene
-//! Dateinummer in der Quelltextkarte). Danach werden die Namen der Nicht-Wurzel-
-//! module auf `modul__name` umgeschrieben und die qualifizierten Zugriffe
-//! aufgeloest. Der Typpruefer sieht ein einziges, flaches Programm.
+//! Method: every file gets parsed ON ITS OWN (own `ExprId` range, own file
+//! number at the source map). After that the labels of the non-root modules
+//! get rewritten to `module__label` and the qualified accesses get resolved.
+//! The type checker sees a single, flat program.
 //!
-//! GRENZE (ehrlich): das ist Gesamtprogramm-Uebersetzung mit getrennten
-//! Namensraeumen, kein getrenntes Objektdateiformat — es gibt keine `.o`-Datei
-//! je Modul und keine Schnittstellendateien.
+//! LIMIT (honestly): this is whole program compilation with separate
+//! namespaces, no separate object file format — there is no `.o` file per
+//! module and there are no interface files.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -32,15 +32,15 @@ use crate::package_world::{self, World};
 use crate::lexer::{self, TokKind};
 use crate::parser;
 
-/// Eine eingelesene Quelldatei der Uebersetzung.
+/// One source file of the compilation that got read.
 pub struct SourceFile {
     pub id: u32,
     pub path: PathBuf,
     pub src: String,
 }
 
-/// Baut `<basis>/<teil1>/<teil2>....<endung>` — den Pfad, den ein
-/// `import teil1.teil2` in einem Suchverzeichnis meint.
+/// Builds `<base>/<part1>/<part2>....<suffix>` — the path that one
+/// `import part1.part2` means within a search directory.
 fn module_path(base: &Path, parts: &[String]) -> PathBuf {
     let mut p = base.to_path_buf();
     for part in parts {
@@ -50,8 +50,8 @@ fn module_path(base: &Path, parts: &[String]) -> PathBuf {
     p
 }
 
-/// `$FIRNLIB` als Suchverzeichnis: gesetzt und nicht leer, sonst nichts.
-/// Reine Funktion, damit die Regel testbar bleibt.
+/// `$FIRNLIB` as search directory: set and not empty, otherwise nothing.
+/// A pure function, so that the rule stays testable.
 fn firnlib_path(value: Option<&str>) -> Option<PathBuf> {
     match value {
         Some(v) if !v.is_empty() => Some(PathBuf::from(v)),
@@ -59,12 +59,12 @@ fn firnlib_path(value: Option<&str>) -> Option<PathBuf> {
     }
 }
 
-/// Zusaetzliche Suchverzeichnisse fuer `import`, in dieser Reihenfolge:
-/// erst `$FIRNLIB`, dann `<Verzeichnis des Compiler-Binarys>/../lib`
-/// (Installationslayout `bin/firnc` + `lib/`). Beide kommen NACH den
-/// beiden bisherigen Orten (importierende Datei, Wurzeldatei), damit
-/// bestehende Aufloesungen unveraendert bleiben. `firnc1` haelt in
-/// `bin/firnc1.fi` (`imports_sammeln`) dieselbe Reihenfolge ein.
+/// Additional search directories for `import`, with this order: first
+/// `$FIRNLIB`, then `<directory of the compiler binary>/../lib`
+/// (installation layout `bin/firnc` + `lib/`). Both come AFTER the two
+/// spots that existed so far (importing file, root file), so that
+/// existing resolutions stay unchanged. `firnc1` keeps the same order at
+/// `bin/firnc1.fi` (`imports_collect`).
 fn extra_search_paths() -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     if let Some(p) = firnlib_path(std::env::var("FIRNLIB").ok().as_deref()) {
@@ -78,37 +78,37 @@ fn extra_search_paths() -> Vec<PathBuf> {
     out
 }
 
-/// Fehler der Modulaufloesung. `Diag` ist die gewohnte Meldung mit
-/// Quelltextausschnitt; `Paket` ist ein fertig formatierter Text, den
-/// `firnc0` und `firnc1` ZEICHENGLEICH ausgeben (Runde 48).
+/// Error of the module resolution. `Diag` is the familiar message with a
+/// source excerpt; `Paket` is a fully formatted text that `firnc0` and
+/// `firnc1` print CHARACTER FOR CHARACTER alike (round 48).
 pub enum Error {
     Diag(Diag),
     Package(String),
 }
 
-/// Ein Eintrag der Warteschlange: die Datei und der Ort des `import`, der
-/// sie angefordert hat. Zu welchem Paket sie gehoert, ergibt sich aus ihrem
-/// Pfad (`Welt::paket_von`) — nicht daraus, wer sie angefordert hat.
+/// One entry of the queue: the file and the spot of the `import` that
+/// requested it. Which package it belongs to follows from its path
+/// (`World::package_of`) — not from who requested it.
 struct Waiting {
     path: PathBuf,
     span: Span,
 }
 
-/// Findet die Wurzeldatei und alle ueber `import` erreichbaren Module.
-/// Die Wurzeldatei hat immer die Nummer 0.
+/// Finds the root file and all modules reachable through `import`.
+/// The root file always has the number 0.
 ///
-/// SUCHREIHENFOLGE (Runde 48, deterministisch, erster Treffer gewinnt):
-///   1. neben der importierenden Datei
-///   2. neben der Wurzeldatei
-///   3. in den `quelle`-Verzeichnissen des Pakets, zu dem die importierende
-///      Datei gehoert
-///   4. in einer `brauche`-Abhaengigkeit dieses Pakets, wenn der erste
-///      Pfadteil ihr Name ist
-///   5. in `$FIRNLIB`
-///   6. in `<Verzeichnis des Compiler-Binarys>/../lib`
+/// SEARCH ORDER (round 48, deterministic, first hit wins):
+///   1. next to the importing file
+///   2. next to the root file
+///   3. at the `source` directories of the package to which the importing
+///      file belongs
+///   4. at a `needs` dependency of that package, if the first path part is
+///      its label
+///   5. at `$FIRNLIB`
+///   6. at `<directory of the compiler binary>/../lib`
 ///
-/// Ohne Manifest ist `welt` leer, die Schritte 3 und 4 entfallen, und die
-/// Aufloesung ist Zeichen fuer Zeichen die von vor Runde 48.
+/// Without a manifest `welt` is empty, steps 3 and 4 fall away, and the
+/// resolution is character for character the one from before round 48.
 pub fn resolve(root: &Path, world: &World) -> Result<Vec<SourceFile>, Error> {
     let work_dir = package_world::cwd();
     let base = root.parent().map(|p| p.to_path_buf()).unwrap_or_default();
@@ -118,7 +118,7 @@ pub fn resolve(root: &Path, world: &World) -> Result<Vec<SourceFile>, Error> {
         path: root.to_path_buf(),
         span: Span::none(),
     }];
-    // Modulname -> zuerst gesehener Pfad, fuer die Konfliktpruefung.
+    // module label -> path seen first, for the conflict check.
     let mut names: HashMap<String, String> = HashMap::new();
     while !queue.is_empty() {
         let entry = queue.remove(0);
@@ -153,10 +153,10 @@ pub fn resolve(root: &Path, world: &World) -> Result<Vec<SourceFile>, Error> {
         } else {
             world.package_of(&abs_file)
         };
-        // NAMENSKONFLIKT: zwei verschiedene Dateien mit demselben Modulnamen
-        // wuerden auf dieselbe interne Umbenennung `modul__name` fallen und
-        // sich still ueberdecken. Nur mit Manifest geprueft — ohne Manifest
-        // bleibt alles wie bisher.
+        // LABEL CONFLICT: two different files with the same module label
+        // would fall onto the same internal renaming `module__label` and
+        // cover each other silently. Checked with a manifest only — without
+        // a manifest everything stays as before.
         if !world.is_empty() {
             let mname = package::module_name(&abs_file);
             match names.get(&mname) {
@@ -170,17 +170,17 @@ pub fn resolve(root: &Path, world: &World) -> Result<Vec<SourceFile>, Error> {
                 }
             }
         }
-        // IMPORTPFAD: zuerst relativ zur DATEI, die den Import schreibt —
-        // erst danach relativ zur Wurzeldatei.
+        // IMPORT PATH: first relative to the FILE that writes the import —
+        // only after that relative to the root file.
         //
-        // Vorher galt nur die zweite Regel. Damit konnte eine Bibliothek keine
-        // andere einbinden: `lib/rt/vec.fi` mit `import rt` suchte `rt.fi`
-        // neben dem HAUPTPROGRAMM statt neben sich selbst
-        // (docs/SELBSTHOSTING.md §7, Blocker B3).
+        // Formerly the second rule alone held. With it no library could load
+        // another one: `lib/rt/vec.fi` with `import rt` looked for `rt.fi`
+        // next to the MAIN PROGRAM rather than next to itself
+        // (docs/SELBSTHOSTING.md §7, blocker B3).
         //
-        // Der Rueckfall auf die Wurzel bleibt, damit bestehende Programme
-        // unveraendert weiterlaufen: `tests/*.fi` binden `modules.mathe` ein,
-        // und dort sind beide Wege derselbe.
+        // The fallback to the root stays, so that existing programs keep
+        // running unchanged: `tests/*.fi` load `modules.mathe`, and there
+        // both ways are the same one.
         let own = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
         let extras = extra_search_paths();
         for (parts, ispan) in scan_imports(&src, id) {
@@ -191,7 +191,7 @@ pub fn resolve(root: &Path, world: &World) -> Result<Vec<SourceFile>, Error> {
                     p = q;
                 }
             }
-            // (3) und (4): die Sicht des Pakets, zu dem diese Datei gehoert.
+            // (3) and (4): the view of the package to which this file belongs.
             if !p.exists() {
                 if let Some(pi) = my_package {
                     if let Some(q) = package_candidate(world, pi, &parts) {
@@ -208,9 +208,9 @@ pub fn resolve(root: &Path, world: &World) -> Result<Vec<SourceFile>, Error> {
                     }
                 }
             }
-            // SICHTBARKEIT: fuehrt der Treffer in ein ANDERES Paket, muss es
-            // eine eingetragene Abhaengigkeit sein und das Modul muss in
-            // dessen `oeffentlich`-Liste stehen.
+            // VISIBILITY: should the hit lead into ANOTHER package, it must be
+            // a registered dependency and the module must stand at that package's
+            // `public` list.
             if !world.is_empty() {
                 let target = package_world::absolute(&p.display().to_string(), &work_dir);
                 if let (Some(zp), Some(mp)) = (world.package_of(&target), my_package) {
@@ -237,11 +237,11 @@ pub fn resolve(root: &Path, world: &World) -> Result<Vec<SourceFile>, Error> {
         }
         out.push(SourceFile { id, path, src });
     }
-    // HOOK gc: die Sammler-Laufzeit wird automatisch eingezogen, sobald
-    // irgendwo ein `gc class` steht (gc.rs, SPEC 3.5) — kein `import`, keine
-    // zusaetzliche Kommandozeilenoption.
-    // Runde 49: HIER wird die Laufzeit wirklich Teil des Programms — und nur
-    // dann muss der Zustandsblock im Assembler stehen (codegen_x86::emit).
+    // HOOK gc: the collector runtime gets loaded automatically as soon as
+    // a `gc class` stands anywhere (gc.rs, SPEC 3.5) — no `import`, no extra
+    // command line option.
+    // Round 49: HERE the runtime really becomes part of the program — and only
+    // then must the state block stand at the assembler (codegen_x86::emit).
     if let Some(f) = gc_runtime(&out) {
         crate::gc::runtime_remember();
         out.push(f);
@@ -249,11 +249,11 @@ pub fn resolve(root: &Path, world: &World) -> Result<Vec<SourceFile>, Error> {
     Ok(out)
 }
 
-/// Schritt 3 und 4 der Suche: Projektquellen, dann Abhaengigkeiten.
-/// Liefert den ersten Pfad, der wirklich existiert.
+/// Steps 3 and 4 of the search: project sources, then dependencies.
+/// Yields the first path that really exists.
 fn package_candidate(world: &World, pi: usize, parts: &[String]) -> Option<PathBuf> {
     let p = &world.packages[pi];
-    // (3) eigene Quellverzeichnisse
+    // (3) own source directories
     for q in &p.manifest.sources {
         let base = package::join(&p.root, q);
         let cand = module_path(Path::new(&base), parts);
@@ -261,7 +261,7 @@ fn package_candidate(world: &World, pi: usize, parts: &[String]) -> Option<PathB
             return Some(cand);
         }
     }
-    // (4) Abhaengigkeit: der ERSTE Pfadteil nennt das Paket.
+    // (4) dependency: the FIRST path part states the package.
     let header = parts.first()?;
     let di = world.edge(pi, header)?;
     let dp = &world.packages[di];
@@ -280,18 +280,18 @@ fn package_candidate(world: &World, pi: usize, parts: &[String]) -> Option<PathB
     None
 }
 
-/// Pfad der eingezogenen GC-Laufzeit (Modulname bleibt leer: ihre Namen sind
-/// programmweit, genau wie die Fehlermengennamen).
+/// Path of the GC runtime that got loaded (the module label stays empty:
+/// its labels are program wide, exactly like the error set labels).
 pub(crate) fn gc_runtime(files: &[SourceFile]) -> Option<SourceFile> {
     let mut needs = false;
     let mut has_allocerror = false;
-    // Runde 47: der Finalisierer-Verteiler zaehlt NUR aus der Wurzeldatei.
-    // In einem Modul hiesse er `modul__gc_finalisiere` und die Laufzeit
-    // faende ihn nicht mehr (siehe `module_name` weiter unten).
+    // Round 47: the finalizer dispatcher counts from the root file ONLY.
+    // Within a module it would be called `module__gc_finalize` and the
+    // runtime would no longer find it (see `module_name` further down).
     let mut has_finalizer = false;
-    // Runde 53: `GcVec`/`GcMap` kommen nur dazu, wenn sie vorkommen.
+    // Round 53: `GcVec`/`GcMap` join only when they show up.
     let mut needs_collections = false;
-    // Runde 49: dasselbe fuer den Fadenverteiler.
+    // Round 49: the same for the thread dispatcher.
     let mut has_thread_work = false;
     for f in files {
         let mut dg = Diags::new("<gc-search>", &f.src);
@@ -319,7 +319,7 @@ pub(crate) fn gc_runtime(files: &[SourceFile]) -> Option<SourceFile> {
     })
 }
 
-/// Sucht `import a.b`-Deklarationen, ohne die Datei vollstaendig zu parsen.
+/// Looks for `import a.b` declarations without parsing the file fully.
 fn scan_imports(src: &str, file: u32) -> Vec<(Vec<String>, Span)> {
     let mut dg = Diags::new("<import-search>", src);
     let toks = lexer::lex_file(src, file, &mut dg);
@@ -354,14 +354,14 @@ fn scan_imports(src: &str, file: u32) -> Vec<(Vec<String>, Span)> {
     out
 }
 
-/// Modulname einer Datei = Dateiname ohne Endung. Die Wurzeldatei hat den
-/// leeren Modulnamen (ihre Namen bleiben unveraendert, `main` heisst `main`).
+/// Module label of a file = filename without suffix. The root file has the
+/// empty module label (its labels stay unchanged, `main` is called `main`).
 fn module_name(f: &SourceFile) -> String {
     if f.id == 0 {
         return String::new();
     }
-    // Die GC-Laufzeit liegt im Wurzelnamensraum: `gc_init()` heisst in jedem
-    // Modul `gc_init()`, ohne `import` und ohne Modulpraefix.
+    // The GC runtime lives at the root namespace: `gc_init()` is called
+    // `gc_init()` within every module, without `import` and without prefix.
     if f.path == Path::new(crate::gc::RUNTIME_PATH) {
         return String::new();
     }
@@ -371,42 +371,42 @@ fn module_name(f: &SourceFile) -> String {
         .unwrap_or_else(|| format!("m{}", f.id))
 }
 
-/// **Version des Symbol-Namensschemas** (DESIGNZIELE.md §4, Fundamentpunkt).
+/// **Version of the symbol naming scheme** (DESIGNZIELE.md §4, foundation).
 ///
-/// Sie steht in **jedem** erzeugten Linker-Symbol. Aendert sich das Schema,
-/// aendern sich alle Symbole — dann meldet der Linker einen fehlenden Namen,
-/// statt zwei unvertraegliche Uebersetzungsstaende still zusammenzubinden.
+/// It stands at **every** linker symbol produced. Once the scheme changes,
+/// all symbols change — then the linker reports a missing label rather than
+/// binding two incompatible compilation states together silently.
 pub const SYMBOL_SCHEMA: u32 = 0;
 
-/// Reservierter Praefix erzeugter Symbole. Firn-Bezeichner koennen ihn nicht
-/// erzeugen (sie duerfen keinen Punkt enthalten), deshalb kann Nutzercode nie
-/// versehentlich ein erzeugtes Symbol treffen.
+/// Reserved prefix of produced symbols. Firn identifiers cannot produce it
+/// (they may hold no dot), which is why user code can never hit a produced
+/// symbol by accident.
 pub const SYMBOL_PREFIX: &str = "_F";
 
-/// Der Einstiegspunkt behaelt seinen nackten Namen: `_start` ruft ihn, und das
-/// ist eine Verabredung mit dem Linker, keine Firn-Angelegenheit.
+/// The entry point keeps its bare label: `_start` calls it, and that is one
+/// agreement with the linker, no Firn matter.
 pub const ENTRY_SYMBOL: &str = "main";
 
-/// Linker-Name eines Elements aus seinem **internen** Namen.
+/// Linker label of one item out of its **internal** label.
 ///
-/// Der interne Name entsteht in `mangle` (Wurzeldatei: unveraendert, Modul:
-/// `modul__name`) und ist das, womit Typpruefer und IR arbeiten. Erst der
-/// Codegenerator macht daraus ein Symbol:
+/// The internal label comes about at `mangle` (root file: unchanged, module:
+/// `module__label`) and is what type checker and IR work with. Only the code
+/// generator turns it into a symbol:
 ///
 /// ```text
-/// _F0.add             Element der Wurzeldatei
-/// _F0.helper__square Element eines Moduls
-/// _F0.add.v3          mit ABI-Version (spaeter, #[abi_stable(3)])
-/// main                der Einstiegspunkt, unveraendert
+/// _F0.add             item of the root file
+/// _F0.helper__square item of a module
+/// _F0.add.v3          with ABI version (later, #[abi_stable(3)])
+/// main                the entry point, unchanged
 /// ```
 ///
-/// **Warum jetzt schon?** `DESIGNZIELE.md` §4: Gibt Firn heute `main` und `add`
-/// als nackte Symbole aus und braucht spaeter versionierte, ist das ein Bruch
-/// fuer alles, was bereits gebaut wurde. Der Platz fuer die Version kostet
-/// heute nichts und macht ein stabiles ABI (`#[abi_stable]`) spaeter zu einer
-/// Erweiterung statt zu einem Schnitt. Die Trennung *interner Name* <->
-/// *Linker-Symbol* ist dabei der eigentliche Gewinn: Fehlermeldungen zeigen
-/// weiter den Quelltextnamen.
+/// **Why already now?** `DESIGNZIELE.md` §4: should Firn print `main` and
+/// `add` as bare symbols today and need versioned ones later, that is a
+/// break for everything built already. The room for the version costs
+/// nothing today and makes a stable ABI (`#[abi_stable]`) later a mere
+/// extension rather than a cut. The separation *internal label* <->
+/// *linker symbol* is the real gain along the way: error messages keep
+/// showing the source label.
 pub fn symbol(interner_name: &str, abi_version: Option<u32>) -> String {
     if interner_name == ENTRY_SYMBOL {
         return interner_name.to_string();
@@ -425,32 +425,32 @@ fn mangle(module: &str, name: &str) -> String {
     }
 }
 
-/// Was ein Modul nach aussen anbietet.
+/// What a module offers to the outside.
 struct ModuleInfo {
     name: String,
-    /// alle im Modul deklarierten Namen (Funktionen, Structs, Konstanten)
+    /// all labels declared within the module (functions, structs, constants)
     items: HashSet<String>,
-    /// `export`-Liste; leer = alles sichtbar
+    /// `export` list; empty = everything visible
     exports: HashSet<String>,
 }
 
-/// Liest, parst und verschmilzt alle Module zu einem Programm.
-/// Meldet Fehler ueber `dg`; `None` heisst: es gab Fehler.
+/// Reads, parses and merges all modules into one program.
+/// Reports errors through `dg`; `None` means: there were errors.
 pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
     let mut progs: Vec<Program> = Vec::new();
     let mut base_id = 0u32;
 
-    // ZUERST ALLE DATEIEN LEXEN, DANN PARSEN.
+    // LEX ALL FILES FIRST, THEN PARSE.
     //
-    // Grund: die Vorabsuche nach generischen Vorlagen
-    // (`sema_generic::hook_prescan`) lief bisher je Datei UNMITTELBAR vor
-    // deren Parsen. Die Wurzeldatei wird zuerst geparst — sie kannte die
-    // Vorlagen der Module also noch nicht, und `var v: Vec[i32]` mit `Vec`
-    // aus einem Modul scheiterte am Parser
-    // (docs/SELBSTHOSTING.md §7, Blocker B1).
+    // Reason: the advance search for generic templates
+    // (`sema_generic::hook_prescan`) used to run per file IMMEDIATELY ahead
+    // of parsing it. The root file gets parsed first — so it did not know
+    // the templates of the modules yet, and `var v: Vec[i32]` with `Vec`
+    // out of a module failed at the parser
+    // (docs/SELBSTHOSTING.md §7, blocker B1).
     //
-    // Der Reset der Hooks gehoert deshalb hierher, EINMAL fuer die ganze
-    // Uebersetzung, und danach werden alle Dateien vorab gescannt.
+    // That is why the reset of the hooks belongs here, ONCE for the whole
+    // compilation, and after that all files get scanned up front.
     parser::reset_hooks();
     let mut all: Vec<Vec<lexer::Token>> = Vec::new();
     for f in files {
@@ -466,15 +466,15 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
     if dg.has_errors() {
         return None;
     }
-    // HOOK profil (prof.rs, Runde 52): das Profil steht in der ERSTEN Datei
-    // (der Wurzeldatei); `--profile=` gewinnt. Es muss hier schon feststehen,
-    // weil die `import`-Regel unmittelbar darunter danach fragt — der
-    // Typpruefer laeuft erst viel spaeter.
+    // HOOK profil (prof.rs, round 52): the profile stands at the FIRST file
+    // (the root file); `--profile=` wins. It must be settled here already,
+    // because the `import` rule right below asks for it — the type checker
+    // runs much later.
     if let Some(root) = progs.first() {
         crate::prof::define(root, None);
     }
 
-    // Was bietet welches Modul an?
+    // Which module offers what?
     let mut infos: Vec<ModuleInfo> = Vec::new();
     for (f, p) in files.iter().zip(progs.iter()) {
         let mut items: HashSet<String> = HashSet::new();
@@ -488,9 +488,9 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
             items.insert(x.name.clone());
         }
         for imp in &p.imports {
-            // HOOK profil (prof.rs, Runde 52): im Kernel-Profil ist die
-            // Standardbibliothek gesperrt. Die Pruefung sitzt hier, weil nur
-            // hier die Einbindungen JEDER Datei mit Position bekannt sind.
+            // HOOK profil (prof.rs, round 52): under the kernel profile the standard
+            // library is barred. The check sits here because only here are the
+            // inclusions of EVERY file known together with their position.
             crate::prof::hook_import(dg, &imp.path, imp.span);
             let target = imp.path.last().cloned().unwrap_or_default();
             let known = files.iter().any(|g| module_name(g) == target);
@@ -524,15 +524,15 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
             dg,
             locals: Vec::new(),
         };
-        // Zuerst die eigenen Deklarationen umbenennen ...
+        // First rename the own declarations ...
         let m = infos[idx].name.clone();
         for f in p.funcs.iter_mut() {
-            // METHODEN EINES GRUNDTYPS BLEIBEN UNANGETASTET (Runde 50).
-            // `impl Ord for i32` legt `i32__kleiner` an; der Typ `i32`
-            // gehoert keinem Modul, seine Methoden also auch nicht. Wuerde
-            // daraus `vec__i32__kleiner`, suchte `x.kleiner(..)` weiter
-            // `i32__kleiner` und faende nichts — dieselbe Regel wie fuer
-            // Schnittstellen, gc-Klassen und generische Vorlagen.
+            // METHODS OF A BASE TYPE STAY UNTOUCHED (round 50).
+            // `impl Ord for i32` creates `i32__less`; the type `i32`
+            // belongs to no module, so its methods do not either. Should
+            // that become `vec__i32__less`, `x.less(..)` would keep looking
+            // for `i32__less` and find nothing — the same rule as for
+            // interfaces, gc classes and generic templates.
             if crate::iface::is_base_ty_method(&f.name) {
                 continue;
             }
@@ -544,7 +544,7 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
         for c in p.consts.iter_mut() {
             c.name = mangle(&m, &c.name);
         }
-        // ... dann alle Verweise in den Rumpfen.
+        // ... then all references within the bodies.
         for f in p.funcs.iter_mut() {
             r.locals.clear();
             r.push_scope();
@@ -563,17 +563,17 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
                 r.ty(t);
             }
         }
-        // GENERISCHE VORLAGEN DIESER DATEI mit umschreiben.
+        // REWRITE THE GENERIC TEMPLATES OF THIS FILE too.
         //
-        // Sie liegen nicht in `Program::funcs`, sondern in
-        // `sema_generic::REG` — das Umschreiben oben erreichte sie deshalb
-        // nie, und eine Vorlage aus einem Modul sah nur die Namen der
-        // WURZELDATEI. Selbst eine Hilfsfunktion in derselben Datei meldete
-        // "unknown function" (docs/SELBSTHOSTING.md §7, Blocker B2).
+        // They do not sit at `Program::funcs` but at
+        // `sema_generic::REG` — the rewriting above therefore never reached
+        // them, and a template out of a module saw the labels of the ROOT
+        // FILE alone. Even a helper function within the same file reported
+        // "unknown function" (docs/SELBSTHOSTING.md §7, blocker B2).
         //
-        // Der NAME der Vorlage bleibt unangetastet: die Auspraegung sucht ihn
-        // spaeter unter dem urspruenglichen Namen (`mono::expand_fn` ueber
-        // `Instantiation::base`), und generische Namen gelten programmweit.
+        // The LABEL of the template stays untouched: the instantiation looks
+        // for it later under the original label (`mono::expand_fn` through
+        // `Instantiation::base`), and generic labels hold program wide.
         let file_id = files[idx].id;
         for name in crate::sema_generic::fn_templates_the_file(file_id) {
             crate::sema_generic::with_fn_template(&name, |decl| {
@@ -604,8 +604,8 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
         merged.funcs.append(&mut p.funcs);
         merged.structs.append(&mut p.structs);
         merged.consts.append(&mut p.consts);
-        // `comptime { … }`-Bloecke gehoeren zum zusammengefuehrten Programm —
-        // sonst laufen sie nie (SPEC §6.4).
+        // `comptime { … }` blocks belong to the merged program — otherwise
+        // they never run (SPEC §6.4).
         merged.comptime_blocks.append(&mut p.comptime_blocks);
     }
     if dg.has_errors() {
@@ -614,11 +614,11 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
     Some(merged)
 }
 
-/// Schreibt Namen im AST eines Moduls auf ihre endgueltige Form um.
+/// Rewrites labels within the AST of a module to their final form.
 struct Renamer<'a, 'b> {
     me: usize,
     infos: &'a [ModuleInfo],
-    /// Aliasname -> letzter Pfadteil (= Modulname der Zieldatei)
+    /// alias label -> last path part (= module label of the target file)
     alias: HashMap<String, String>,
     dg: &'b mut Diags,
     locals: Vec<HashSet<String>>,
@@ -640,11 +640,11 @@ impl<'a, 'b> Renamer<'a, 'b> {
         self.locals.iter().any(|s| s.contains(name))
     }
 
-    /// Loest einen Namen auf. `is_value` unterscheidet Werte (koennen von
-    /// lokalen Namen verdeckt werden) von Funktions-/Typnamen.
+    /// Resolves a label. `is_value` tells values (which local labels can cover)
+    /// apart from function/type labels.
     fn resolve(&mut self, name: &str, span: Span, is_value: bool) -> Option<String> {
         if let Some((m, rest)) = name.split_once('.') {
-            // qualifizierter Zugriff modul.name
+            // qualified access module.item
             let target = match self.alias.get(m) {
                 Some(t) => t.clone(),
                 None => return None,
@@ -684,7 +684,7 @@ impl<'a, 'b> Renamer<'a, 'b> {
         None
     }
 
-    /// Namen, die ein Muster bindet, sind im Rumpf des Falles lokal.
+    /// Labels that a pattern binds are local to the body of the case.
     fn declare_pattern(&mut self, p: &crate::sema_match::Pattern) {
         match p {
             crate::sema_match::Pattern::Bind(n, _) => self.declare(n),
@@ -719,8 +719,8 @@ impl<'a, 'b> Renamer<'a, 'b> {
 
     fn stmt(&mut self, s: &mut Stmt) {
         match s {
-            // `defer` ist nur eine Huelle: der Inhalt wird wie jede andere
-            // Anweisung umgeschrieben.
+            // `defer` is a wrapper only: its content gets rewritten like every
+            // other statement.
             Stmt::Defer(inner, _, _) => self.stmt(inner),
             Stmt::Let { name, ty, init, .. } => {
                 if let Some(t) = ty.as_mut() {
@@ -783,10 +783,10 @@ impl<'a, 'b> Renamer<'a, 'b> {
                 self.expr(i);
             }
             ExprKind::Call(name, args, nspan) => {
-                // HOOK types: die Rumpfbloecke eines `match` liegen in der
-                // Registrierung von `sema_match`, nicht im AST. Ohne diesen
-                // Zweig blieben Namen darin unumgeschrieben — `match` in einem
-                // importierten Modul waere unbenutzbar.
+                // HOOK types: the body blocks of a `match` sit at the registry of
+                // `sema_match`, not at the AST. Without this branch the labels within
+                // them would stay unrewritten — `match` inside one imported module
+                // would be unusable.
                 if let Some(idx) = name
                     .strip_prefix(crate::sema_match::MATCH_PREFIX)
                     .and_then(|s| s.parse::<usize>().ok())
@@ -855,12 +855,12 @@ mod tests {
 
     #[test]
     fn search_paths_and_module_path() {
-        // modul_pfad: teile werden zu <basis>/a/b.fi.
+        // module_path: parts become <base>/a/b.fi.
         assert_eq!(
             module_path(Path::new("x"), &["std".to_string(), "math".to_string()]),
             PathBuf::from("x/std/math.fi")
         );
-        // FIRNLIB: leer oder ungesetzt heisst "no additional path".
+        // FIRNLIB: empty or unset means "no additional path".
         assert_eq!(firnlib_path(None), None);
         assert_eq!(firnlib_path(Some("")), None);
         assert_eq!(
@@ -874,14 +874,14 @@ mod tests {
         assert_eq!(mangle("", "main"), "main");
         assert_eq!(mangle("helper", "square"), "helper__square");
         assert_eq!(mangle("", "square"), "square");
-        // Linker-Symbole: reservierter Praefix + Schemaversion (DESIGNZIELE 4)
+        // Linker symbols: reserved prefix + scheme version (DESIGNZIELE 4)
         assert_eq!(symbol("square", None), "_F0.square");
         assert_eq!(symbol("helper__square", None), "_F0.helper__square");
-        // Platz fuer die ABI-Version ist da.
+        // The room for the ABI version is there.
         assert_eq!(symbol("helper__square", Some(3)), "_F0.helper__square.v3");
-        // Der Einstiegspunkt behaelt seinen nackten Namen.
+        // The entry point keeps its bare label.
         assert_eq!(symbol("main", None), "main");
-        // Nutzercode kann den Praefix nicht erzeugen: Bezeichner haben keine Punkte.
+        // User code cannot produce the prefix: identifiers hold no dots.
         assert!(symbol("a", None).starts_with(SYMBOL_PREFIX));
     }
 }
