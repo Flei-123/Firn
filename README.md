@@ -1,50 +1,52 @@
-# firnc0 — Stufe-0-Compiler für Firn
+# firnc0 -- the stage 0 compiler for Firn
 
-`firnc0` übersetzt eine bewusst kleine Teilmenge der Sprache **Firn** (`.fi`)
-in **echten x86_64-Maschinencode**: Lexer → Parser → Typprüfer → eigene IR
-(**FIR**) → Optimierer → eigener x86_64-Codegenerator → `as` → `ld` →
-freistehendes Linux-Binary ohne libc.
+`firnc0` compiles a deliberately small subset of the language **Firn** (`.fi`)
+into **real x86_64 machine code**: lexer -> parser -> type checker -> own IR
+(**FIR**) -> optimizer -> own x86_64 code generator -> `as` -> `ld` ->
+a freestanding Linux binary without libc.
 
-* **Kein LLVM, kein Cranelift, kein C als Backend.** Der Assemblertext wird in
-  `compiler/src/codegen_x86.rs` selbst erzeugt; `as` und `ld` werden
-  ausschließlich als Assembler bzw. Linker benutzt.
-* **Keine externen Crates.** `compiler/Cargo.toml` hat einen leeren
-  `[dependencies]`-Abschnitt; es genügt `std`.
-* **Kein Parser-Generator.** Handgeschriebener Lexer und rekursiv absteigender
-  Parser mit Fehlerwiederherstellung.
+* **No LLVM, no Cranelift, no C as a backend.** The assembly text is produced
+  in `compiler/src/codegen_x86.rs` itself; `as` and `ld` are used exclusively as
+  assembler and linker.
+* **No external crates.** `compiler/Cargo.toml` has an empty `[dependencies]`
+  section; `std` is enough.
+* **No parser generator.** A hand-written lexer and a recursive descent parser
+  with error recovery.
 
-Der verbindliche Umfang steht in [SPEC.md §14](SPEC.md) (Abweichungen der
-Umsetzung in §14.1), die IR ist in [docs/FIR.md](docs/FIR.md) dokumentiert.
-Wie man alles baut, startet und **selbst nachmisst**: [RUN.md](RUN.md).
-Der Abnahmestand mit echten Zahlen: [ABNAHME.md](ABNAHME.md).
-Die Fundamententscheidungen — was jetzt ins Fundament muss, damit es später
-noch möglich ist, und was warten kann: [DESIGNZIELE.md](DESIGNZIELE.md).
+The binding scope is in [SPEC.md 14](SPEC.md) (deviations of the implementation
+in 14.1), the IR is documented in [docs/FIR.md](docs/FIR.md).
+How to build everything, run it and **measure it yourself**: [RUN.md](RUN.md).
+The acceptance status with real numbers: [ACCEPTANCE.md](ACCEPTANCE.md).
+The foundation decisions -- what has to go into the foundation now so that it
+stays possible later, and what can wait:
+[DESIGN_GOALS.md](DESIGN_GOALS.md).
 
 ---
 
-## Voraussetzungen
+## Prerequisites
 
-* `rustc` / `cargo` (getestet mit `rustc 1.99.0-nightly`, Edition 2021)
-* GNU binutils: `as` und `ld` (getestet mit Binutils 2.40)
-* Linux auf x86_64 (die erzeugten Binaries benutzen Linux-Syscalls direkt)
+* `rustc` / `cargo` (tested with `rustc 1.99.0-nightly`, edition 2021)
+* GNU binutils: `as` and `ld` (tested with binutils 2.40)
+* Linux on x86_64 (the binaries produced use Linux syscalls directly)
 
-## Bauen
+## Building
 
 ```sh
 cargo build --release --manifest-path compiler/Cargo.toml
 ```
 
-Der Compiler liegt danach unter `compiler/target/release/firnc`.
-Der Build läuft mit **null Warnungen** durch (keine `#![allow(...)]`-Sammel­unter­drückung).
+The compiler is then at `compiler/target/release/firnc`.
+The build goes through with **zero warnings** (no blanket `#![allow(...)]`
+suppression).
 
-## Schnellstart
+## Quick start
 
 ```sh
 ./compiler/target/release/firnc -o /tmp/hello examples/hello.fi
 /tmp/hello
 ```
 
-Echte Ausgabe:
+Real output:
 
 ```
 Hallo Welt aus Firn!
@@ -59,14 +61,14 @@ Hallo Welt aus Firn!
 Exit: 89
 ```
 
-## Alle Tests
+## All tests
 
 ```sh
 bash test.sh
 ```
 
-Echtes Ergebnis dieses Baustands (Auszug; selbst gemessen am 14.08.2026 nach der
-Zusammenführung von Runde 3):
+The real result of this build state (excerpt; measured in person on 2026-08-14
+after the merge of round 3):
 
 ```
 == 1. Compiler bauen ==
@@ -81,7 +83,7 @@ Zusammenführung von Runde 3):
    OK: Ergebnisort-Garantie gehalten (baue 224 B, main 1048816 B, keine Bulk-Kopie).
 == 7. Architektur: Feldzugriff <-> Speicherort getrennt ==
    OK: Feldzugriff und Speicherort getrennt (4 Zugaenge in layout.rs, keine Umgehung).
-== 8. Symbol-Namensschema (DESIGNZIELE 4) ==
+== 8. Symbol-Namensschema (DESIGN_GOALS 4) ==
    OK: Symbolschema gehalten (_F0.-Praefix, 'main' nackt, Module kollisionsfrei).
 == 9. HTML5-Tokenizer gegen html5lib (tools/tokenizer/run.sh) ==
    GESAMT                      6810 /  6810 100.00 %    6809 /  6810  99.99 %
@@ -91,28 +93,27 @@ Zusammenführung von Runde 3):
 PASS 485/485
 ```
 
-(Die drei `GESAMT`-Zeilen sind der Hauptlauf, derselbe Lauf mit gewähltem
-`--mit-fehlern` und die Gegenprobe `--ohne-xml-modus`; die linke Spalte ist der
-Tokenstrom-Vergleich, die rechte zusätzlich mit den Parse-Fehlercodes.)
+(The three `GESAMT` lines are the main run, the same run with `--mit-fehlern`
+selected and the counter-check `--ohne-xml-modus`; the left column is the token
+stream comparison, the right one additionally compares the parse error codes.)
 
-`test.sh` baut den Compiler, lässt `cargo test` laufen (122 Modultests),
-übersetzt **jedes** Programm aus `tests/`, `tests/opt/` und `examples/`
-**dreimal** (`opt`, `--no-opt`, `--opt-level=dev-fast`; alle drei müssen
-dasselbe liefern), assembliert, linkt, **führt aus** und vergleicht Exit-Code
-bzw. Standardausgabe mit der Erwartung in Zeile 1
-(`// expect_exit: N` / `// expect_out: TEXT`). Danach prüft es die 51
-Negativtests in `tests/neg/` (Compiler muss mit Exit ≠ 0 abbrechen, die
-erwartete Meldung samt `Zeile:Spalte` und Markierung ausgeben und darf **nicht**
-paniken), den Optimierernachweis (`test_opt.sh`), die Ergebnisort-Garantie, den
-Architekturwächter, das Symbolschema und zuletzt den HTML5-Tokenizer gegen die
-html5lib-Suite.
+`test.sh` builds the compiler, runs `cargo test` (122 module tests), compiles
+**every** program from `tests/`, `tests/opt/` and `examples/` **three times**
+(`opt`, `--no-opt`, `--opt-level=dev-fast`; all three have to deliver the same),
+assembles, links, **runs** it and compares the exit code and standard output
+with the expectation in line 1 (`// expect_exit: N` / `// expect_out: TEXT`).
+After that it checks the 51 negative tests in `tests/neg/` (the compiler has to
+abort with exit code != 0, print the expected message together with
+`line:column` and the marker, and must **not** panic), the optimizer proof
+(`test_opt.sh`), the result-location guarantee, the architecture guard, the
+symbol scheme and finally the HTML5 tokenizer against the html5lib suite.
 
-Bestand: 126 Testprogramme in `tests/`, 13 Optimierer-Programme in `tests/opt/`,
-4 Beispiele in `examples/`, 51 Negativtests in `tests/neg/`. Die Tests aus
-Runde 1 und 2 sind alle noch da und bestehen weiter — es wurde kein Test
-entfernt oder abgeschwächt (`tests/001…065`, `tests/opt/`, `tests/neg/`).
+Inventory: 126 test programs in `tests/`, 13 optimizer programs in `tests/opt/`,
+4 examples in `examples/`, 51 negative tests in `tests/neg/`. The tests from
+rounds 1 and 2 are all still there and still pass -- no test was removed or
+weakened (`tests/001...065`, `tests/opt/`, `tests/neg/`).
 
-Dieselbe Suite maschinenlesbar (CI):
+The same suite machine-readable (CI):
 
 ```sh
 cargo build --release --manifest-path tools/testrunner/Cargo.toml
@@ -120,30 +121,30 @@ cargo build --release --manifest-path tools/testrunner/Cargo.toml
 # {"suite":"firn","total":337,"passed":337,"failed":0,"rate":1.0, "cases":[...]}
 ```
 
-Der Testrunner läuft ohne `test.sh` und zählt jedes Programm einzeln in beiden
-Betriebsarten; er enthält den Optimierernachweis (`test_opt.sh`, 41 Prüfungen)
-nicht und auch nicht die Abschnitte 6–9, daher 337 statt 485.
+The test runner works without `test.sh` and counts every program individually in
+both modes; it does not contain the optimizer proof (`test_opt.sh`, 41 checks)
+and it does not contain sections 6-9, hence 337 instead of 485.
 
-## Kommandozeile
+## Command line
 
 ```
-firnc [OPTIONEN] datei.fi
-  -o <pfad>        Ausgabedatei
-  --emit=exe       ausführbare Datei (Standard)
-  --emit=asm       x86_64-Assembler
-  --emit=fir       FIR nach der Optimierung
-  --emit=fir-raw   FIR direkt nach dem Lowering
-  --emit=fir-opt   FIR nach dem Optimierer
-  --emit=tokens    Tokenstrom
-  --emit=ast       AST + Anweisungsübersicht
-  --no-opt         Optimierer aus
-  --stats          Größe der FIR (Funktionen/Blöcke/Instruktionen)
-  --keep-asm       erzeugte .s-Datei behalten
+firnc [OPTIONS] file.fi
+  -o <path>          output file
+  --emit=exe         produce an executable (default, calls as/ld)
+  --emit=asm         write x86_64 assembler to the output
+  --emit=fir         FIR text form (after optimization, if active)
+  --emit=fir-raw     FIR right after lowering, without optimization
+  --emit=fir-opt     FIR after the optimizer
+  --emit=tokens      token stream (troubleshooting)
+  --emit=ast         AST as debug text (troubleshooting)
+  --no-opt           switch off the optimizer (= --opt-level=dev)
+  --stats            print the size of the FIR (instructions/blocks)
+  --keep-asm         keep the generated .s file
 ```
 
 ---
 
-## Kurze Sprachtour
+## A short tour of the language
 
 ```firn
 struct Point {
@@ -151,9 +152,9 @@ struct Point {
     y: i32,
 }
 
-const LIMIT: i32 = 10          // nur skalare, konstant auswertbare Ausdrücke
+const LIMIT: i32 = 10          // only scalar, constant-evaluable expressions
 
-fn dist2(p: *Point, q: *Point) -> i32 {   // Aggregate nur per Zeiger (§12.1)
+fn dist2(p: *Point, q: *Point) -> i32 {   // aggregates only by pointer (12.1)
     let dx: i32 = (*p).x - (*q).x
     let dy: i32 = (*p).y - (*q).y
     return dx * dx + dy * dy
@@ -162,7 +163,7 @@ fn dist2(p: *Point, q: *Point) -> i32 {   // Aggregate nur per Zeiger (§12.1)
 fn main() -> i32 {
     var a: Point = Point{ x: 3, y: 4, }
     var b: Point = Point{ x: 0, y: 0, }
-    var arr: [i32; 4] = [1, 2, 3, 4]      // feste Größe, Index ist usize
+    var arr: [i32; 4] = [1, 2, 3, 4]      // fixed size, the index is usize
     var i: usize = 0
     var s: i32 = 0
     while i < 4 {
@@ -170,36 +171,36 @@ fn main() -> i32 {
         i = i + 1
     }
     if dist2(&a, &b) == 25 && s < LIMIT as i32 * 2 {
-        return s as i32                    // nur explizite Umwandlung mit 'as'
+        return s as i32                    // only explicit conversion with 'as'
     }
     return 0
 }
 ```
 
-* `let` unveränderlich, `var` veränderlich; Parameter sind `let`-artig.
-* **Keine impliziten Umwandlungen**: `i32 + i64` ist ein Fehler, `a as i64 + b`
-  ist richtig. Ganzzahlliterale brauchen einen aus dem Kontext ableitbaren Typ.
-* `&&`/`||` schließen kurz (im FIR als Verzweigung sichtbar, keine `and.bool`).
-* Ausgabe ohne libc über `syscall(nr, a1..a6)`, z. B.
+* `let` is immutable, `var` is mutable; parameters behave like `let`.
+* **No implicit conversions**: `i32 + i64` is an error, `a as i64 + b` is
+  right. Integer literals need a type that can be inferred from the context.
+* `&&`/`||` short-circuit (visible as a branch in the FIR, no `and.bool`).
+* Output without libc through `syscall(nr, a1..a6)`, for example
   `syscall(1, 1, &buf[0], 21)` = `write(1, buf, 21)`.
 
-## Fehlermeldungen
+## Error messages
 
 ```
 $ ./compiler/target/release/firnc tests/neg/implicit_cast.fi
-error: operator '+' erwartet zwei operanden desselben ganzzahltyps, gefunden i32 und i64
+error: operator '+' expects two operands of the same integer type, found i32 and i64
   --> tests/neg/implicit_cast.fi:5:18
    |
  5 |     let c: i64 = a + b
-   |                  ^^^^^ hier
-   = hinweis: es gibt keine implizite umwandlung, benutze 'as'
+   |                  ^^^^^ here
+   = note: there is no implicit conversion, use 'as'
 ```
 
-Der Parser meldet mehrere Fehler pro Durchlauf (Wiederherstellung auf
-Anweisungsebene), siehe `tests/neg/two_errors.fi`. Bei kaputter Eingabe bricht
-der Compiler mit Exit-Code 1 ab — kein Panic, kein `unwrap`-Absturz.
+The parser reports several errors per run (recovery at statement level), see
+`tests/neg/two_errors.fi`. On broken input the compiler aborts with exit code 1
+-- no panic, no `unwrap` crash.
 
-## IR und Optimierer nachprüfen
+## Checking the IR and the optimizer
 
 ```
 $ ./compiler/target/release/firnc --emit=fir-raw tests/opt/fold_arith.fi
@@ -221,26 +222,24 @@ bb1:
 }
 
 $ ./compiler/target/release/firnc --emit=fir-opt --stats tests/opt/fold_arith.fi
-fir (roh):  1 Funktionen, 2 Bloecke, 9 Instruktionen
-fir (opt):  1 Funktionen, 1 Bloecke, 4 Instruktionen
+profile:    app
+fir (raw):  1 functions, 2 blocks, 9 instructions
+fir (opt):  1 functions, 1 blocks, 1 instructions
 ; FIR v0
 fn @main() -> i32 {
 bb0:
-  %0 = alloca.ptr size=4 align=4
   %5 = const.i32 42
-  store.i32 %5, %0
-  %6 = load.i32 %0
-  ret %6
+  ret %5
 }
 ```
 
-`bash test_opt.sh` prüft für sechs Programme automatisch, dass die
-Instruktionszahl sinkt, die gefaltete Konstante wirklich im Dump steht und tote
-Blöcke verschwinden (echtes Ergebnis: `PASS 18/18`). Dass die Optimierung das
-Verhalten **nicht** ändert, prüft `test.sh`, indem es jedes Programm mit und
-ohne `--no-opt` ausführt und dasselbe Ergebnis verlangt.
+`bash test_opt.sh` automatically checks for six programs that the instruction
+count drops, that the folded constant really appears in the dump and that dead
+blocks disappear (real result: `PASS 18/18`). That optimization does **not**
+change behaviour is checked by `test.sh`, which runs every program with and
+without `--no-opt` and demands the same result.
 
-## Erzeugter Code (Auszug aus `examples/fib.fi`)
+## Generated code (excerpt from `examples/fib.fi`)
 
 ```asm
 .globl fib
@@ -255,128 +254,129 @@ fib:
     ...
 ```
 
-Registerzuteilung ist naiv (ein Stack-Slot je FIR-Wert, gerechnet in `rax`/`rcx`),
-aber korrekt: System-V-Argumentregister, Rückgabe in `rax`, callee-saved
-Register (`rbx`, `r12`–`r15`) werden nie angefasst, Rahmen immer 16-Byte-
-ausgerichtet. Ansehen mit `--emit=asm` oder `--keep-asm`.
+Register assignment is naive (one stack slot per FIR value, computed in
+`rax`/`rcx`), but correct: System V argument registers, the return value in
+`rax`, callee-saved registers (`rbx`, `r12`-`r15`) are never touched, the frame
+is always 16 byte aligned. Look at it with `--emit=asm` or `--keep-asm`.
 
 ---
 
-## Was Firn (Stufe 0) noch NICHT kann — ehrliche Liste
+## What Firn (stage 0) still can NOT do -- the honest list
 
-Stand **nach Runde 3** (14.08.2026, zusammengeführt). Was die Runden geliefert
-haben, steht weiter unten je Modul; hier steht nur, was **nicht** da ist. Jeder
-Punkt ist überprüfbar: der Compiler meldet dafür einen Fehler mit Zeile/Spalte,
-er stürzt nicht ab und tut nicht so, als könne er es.
+State **after round 3** (2026-08-14, merged). What the rounds delivered is
+further down, per module; here stands only what is **not** there. Every item is
+verifiable: the compiler reports an error with line/column for it, it does not
+crash and it does not pretend it can do the job.
 
-Runde 3 hat **Fehlerunionen `E!T`** (SPEC §5.1) und den **HTML5-Tokenizer in
-Firn** gebaut, Runde 4 den **Opt-in-Tracing-GC samt DOM-Prototyp und Dauerlauf**
-(SPEC §3.5) sowie die drei **Constant-Time-Primitive**. Was weiterhin fehlt:
+Round 3 built **error unions `E!T`** (SPEC 5.1) and the **HTML5 tokenizer in
+Firn**, round 4 the **opt-in tracing GC including the DOM prototype and the soak
+test** (SPEC 3.5) as well as the three **constant-time primitives**. What is
+still missing:
 
 * **`secret[T]`, `u128`, `mul_wide`, `declassify`, `#[constant_time]`**
-  (SPEC §9) — **nicht umgesetzt.** `fn f(a: secret[u8])` meldet
-  `'secret[T]' ist in Stufe 0 nicht umgesetzt`
-  (`tests/neg/int_secret_not_implemented.fi`), `#[constant_time]` meldet
-  `attribut 'constant_time' ist in Stufe 0 nicht umgesetzt`
-  (`tests/neg/attr_not_implemented.fi`). **Umgesetzt sind seit Runde 4 die drei
-  Primitive** `select(bedingung, a, b)` (wird `cmov`, nie ein bedingter
-  Sprung), `barrier(x)` (undurchsichtige Sperre) und
-  `secure_zero(zeiger, anzahl_bytes)` (überlebt jeden Optimierungsdurchgang,
-  wird `rep stosb`) — `compiler/src/ct.rs`, Nachweise `tests/430_ct_select.fi`
-  bis `tests/433_ct_secure_zero.fi`, fünf Negativtests `tests/neg/ct_*.fi` und
-  vier Codegen-Tests in `ct.rs`. Ohne `secret[T]` sind das Bausteine ohne
-  Typprüfung auf Geheimnisdaten; die Sperren in FIR und Optimierer
-  (`fir::Func::secret`, `constant_time`, mem2reg/DCE/CSE/Inlining) sind
-  vorhanden, bekommen aber erst mit `secret[T]` Futter (SPEC §14.1 Punkt 19).
-* **`Gc[T]`, `gc class`, Mark-Sweep, DOM-Prototyp (SPEC §3.5) — seit Runde 4
-  GEBAUT und gemessen.** Was jetzt geht: `gc class` mit Einfachvererbung und
-  Präfixlayout, `Gc[T]`/`GcWeak[T]`, geprüftes `x.as?[C]`, fehlbare Allokation
-  `AllocError!Gc[C]`, Einfügebarriere, `#[no_gc]` transitiv, Messwerte
-  (`gc_pause_ns_max` & Co.). Dauerlauf: **100.000.000 Zyklensätze =
-  700.000.000 DOM-Objekte bei konstant 1.364 KiB RSS**; die
-  Zählverweis-Gegenprobe mit identischem Objektgraphen braucht nach 2.000.000
-  Zyklen **750.080 KiB** (Faktor 550). Abschnitt „Speichermodell" weiter unten,
-  Bericht `docs/berichte/dom.md`.
-  **Seit Runde 44** ist das Sammeln inkrementell (längste Unterbrechung
-  0,45 ms), **seit Runde 47** gibt es **Finalisierer** (`S4`), schwache Felder
-  werden beim Einsammeln **wirklich genullt** (`S3`), es gibt **externe
-  Wurzelbereiche** und `Arc[T]` mit **atomarem** Zähler (`lib/rc/arc.fi`,
-  `docs/RUNDE47.md`).
-  Seit Runde 53 gibt es **`GcVec[T]` und `GcMap[K,V]`** — Sammlungen mit
-  veränderlicher Länge, die der Sammler wirklich verfolgt, auch während sie
-  wachsen (`lib/gc/gcvec.fi`, `lib/gc/gcmap.fi`, `docs/RUNDE53.md`). Der
-  DOM-Prototyp benutzt sie: 5000 Kinder an einem Knoten, beliebig viele
-  Attribute.
-  **Offen bleibt:** der 24-Stunden-Lauf aus ABNAHME.md Punkt 2, Fragmentierung
-  bei wechselnden Objektgrößen, `virtual`, und bei den Sammlungen die
-  nominale Typsicherheit des Behälters.
-  `Rc[T]`/`Weak[T]`/`Arc[T]` gibt es als **Firn-Module** (`tests/modules/rc.fi`,
-  `lib/rc/arc.fi`), nicht als Sprachtypen; `Gc[modul.Klasse]` lässt sich nicht
-  schreiben.
-* **HTML5-Tokenizer:** gebaut und gemessen — **6.810 von 6.810 (100,00 %)**
-  Tokenstrom-Vergleich und **6.809 von 6.810 (99,99 %)** mit Vergleich der
-  Parse-Fehlercodes (`--mit-fehlern`); die XML-Anpassung der
-  `xmlViolationTests` ist als optionaler Modus umgesetzt. Offen bleibt das
-  Geschwindigkeitsziel ≤ 2×. Abschnitt „HTML5-Tokenizer" weiter unten, Zahlen
-  in ABNAHME.md Punkt 3.
-* **`comptime`**, **Interfaces**, **Optionals**,
-  **Abwicklung/`throw`** (SPEC §5.3). Fehlerunionen `E!T` gibt es seit Runde 3,
-  aber ohne abgeleitete Fehlermenge, ohne `defer`/`errdefer` und mit
-  `catch |e| ausdruck` statt Block (SPEC §14.1.fehlerunionen, F1–F10)
-* **`defer`**, **`errdefer`**, **`drop`**, **Move-Prüfer**, **Arenen/Allokatoren**
-* **Referenztypen `&T` / `inout T` als geprüfte Typen** — Stufe 0 hat nur
-  Rohzeiger `*T`/`*mut T`; `mut` an Zeigern wird geparst, aber nicht geprüft
-* **Gleitkommatyp** (`f32`/`f64`) in der Sprache — `strtod`/`dtoa` in
-  `lib/num/` rechnen auf `u64`-Bitmustern (SPEC §14.1.str S2)
-* **String-/Zeichenliterale im Quelltext** — der Literalpfad ist im Compiler
-  fertig (`compiler/src/strings.rs`, prüfbar über `firnc '--strlit=u"a\uD800"'`),
-  aber **nicht an den Lexer angebunden** (SPEC §14.1.str S1)
-* **Globale Variablen** (nur `const`), **Panik-Handler**, Laufzeitprüfungen
-  (Überlauf, Division durch null, Indexgrenzen sind ungeprüft)
-* **Paketverwaltung** (`W1`) — es gibt ein Modulsystem, aber keine Registry,
-  keine Sperrdatei, keinen reproduzierbaren Zwei-Rechner-Bau
-* **aarch64**, **WASM**, **LLVM-Backend**, Selbst-Hosting (Stufen 1–3 der
-  ROADMAP; Bestandsaufnahme in `docs/SELBSTHOSTING.md`)
+  (SPEC 9) -- **not implemented.** `fn f(a: secret[u8])` reports
+  `'secret[T]' is not implemented in stage 0`
+  (`tests/neg/int_secret_not_implemented.fi`), `#[constant_time]` reports
+  `attribute 'constant_time' is not implemented in stage 0`
+  (`tests/neg/attr_not_implemented.fi`). **What has been implemented since
+  round 4 are the three primitives** `select(condition, a, b)` (becomes `cmov`,
+  never a conditional jump), `barrier(x)` (an opaque barrier) and
+  `secure_zero(pointer, number_of_bytes)` (survives every optimization pass,
+  becomes `rep stosb`) -- `compiler/src/ct.rs`, proofs
+  `tests/430_ct_select.fi` to `tests/433_ct_secure_zero.fi`, five negative tests
+  `tests/neg/ct_*.fi` and four codegen tests in `ct.rs`. Without `secret[T]`
+  these are building blocks without a type check for secret data; the locks in
+  FIR and in the optimizer (`fir::Func::secret`, `constant_time`,
+  mem2reg/DCE/CSE/inlining) are in place, but they only get something to work on
+  with `secret[T]` (SPEC 14.1 item 19).
+* **`Gc[T]`, `gc class`, mark-sweep, DOM prototype (SPEC 3.5) -- BUILT and
+  measured since round 4.** What works now: `gc class` with single inheritance
+  and a prefix layout, `Gc[T]`/`GcWeak[T]`, checked `x.as?[C]`, fallible
+  allocation `AllocError!Gc[C]`, the insertion barrier, `#[no_gc]`
+  transitively, measurements (`gc_pause_ns_max` and friends). Soak test:
+  **100,000,000 cycle sets = 700,000,000 DOM objects at a constant 1,364 KiB
+  RSS**; the reference-counting counter-check with an identical object graph
+  needs **750,080 KiB** after 2,000,000 cycles (factor 550). Section "Memory
+  model" further down, report `docs/berichte/dom.md`.
+  **Since round 44** collection is incremental (longest pause 0.45 ms),
+  **since round 47** there are **finalizers** (`S4`), weak fields are **really
+  zeroed** on collection (`S3`), there are **external root ranges** and `Arc[T]`
+  with an **atomic** counter (`lib/rc/arc.fi`, `docs/RUNDE47.md`).
+  Since round 53 there are **`GcVec[T]` and `GcMap[K,V]`** -- collections with a
+  variable length that the collector really traces, even while they grow
+  (`lib/gc/gcvec.fi`, `lib/gc/gcmap.fi`, `docs/RUNDE53.md`). The DOM prototype
+  uses them: 5000 children on one node, any number of attributes.
+  **What stays open:** the 24 hour run from ACCEPTANCE.md item 2, fragmentation
+  with changing object sizes, `virtual`, and, for the collections, the nominal
+  type safety of the container.
+  `Rc[T]`/`Weak[T]`/`Arc[T]` exist as **Firn modules** (`tests/modules/rc.fi`,
+  `lib/rc/arc.fi`), not as language types; `Gc[module.Class]` cannot be written.
+* **HTML5 tokenizer:** built and measured -- **6,810 of 6,810 (100.00 %)** in
+  the token stream comparison and **6,809 of 6,810 (99.99 %)** with the parse
+  error codes compared (`--mit-fehlern`); the XML adaptation of the
+  `xmlViolationTests` is implemented as an optional mode. What stays open is the
+  speed target of <= 2x. Section "HTML5 tokenizer" further down, the numbers in
+  ACCEPTANCE.md item 3.
+* **`comptime`**, **interfaces**, **optionals**,
+  **unwinding/`throw`** (SPEC 5.3). Error unions `E!T` have existed since
+  round 3, but without an inferred error set, without `defer`/`errdefer` and
+  with `catch |e| expression` instead of a block (SPEC 14.1.error_unions, F1-F10)
+* **`defer`**, **`errdefer`**, **`drop`**, **the move checker**,
+  **arenas/allocators**
+* **Reference types `&T` / `inout T` as checked types** -- stage 0 has only raw
+  pointers `*T`/`*mut T`; `mut` on pointers is parsed but not checked
+* **A floating point type** (`f32`/`f64`) in the language -- `strtod`/`dtoa` in
+  `lib/num/` compute on `u64` bit patterns (SPEC 14.1.str S2)
+* **String and character literals in the source text** -- the literal path is
+  finished in the compiler (`compiler/src/strings.rs`, checkable via
+  `firnc '--strlit=u"a\uD800"'`), but **not hooked up to the lexer**
+  (SPEC 14.1.str S1)
+* **Global variables** (only `const`), **a panic handler**, run-time checks
+  (overflow, division by zero, index bounds are unchecked)
+* **Package management** (`W1`) -- there is a module system, but no registry, no
+  lock file, no reproducible two-machine build
+* **aarch64**, **WASM**, **an LLVM backend**, self-hosting (stages 1-3 of the
+  ROADMAP; inventory in `docs/SELBSTHOSTING.md`)
 
-### Bekannte Schwächen, die Runde 2 NICHT behoben hat
+### Known weaknesses that round 2 did NOT fix
 
-* **Kein Stack-Probing, keine Rahmen-Obergrenze.** Der Prolog reserviert den
-  Rahmen ohne Prüfung; eine Funktion mit sehr vielen lebendigen Werten kann
-  ohne Diagnose über die Guard-Page hinauslaufen.
-* **Anweisungsgenaue Debug-Zeilen nur mit `--no-opt`.** Mit Optimierer bleibt
-  die Zeile der `fn`-Deklaration, weil die FIR keine Quellpositionen trägt
-  (SPEC §14.1 Punkt 16).
-* **Leistungsziel ≤ 2× Rust verfehlt** — gemessener Median **2,8×–3,4×**
-  (Spanne 1,6×–6,0×), siehe unten.
+* **No stack probing, no upper limit on the frame.** The prologue reserves the
+  frame without a check; a function with very many live values can run past the
+  guard page without a diagnostic.
+* **Instruction-accurate debug lines only with `--no-opt`.** With the optimizer
+  the line of the `fn` declaration remains, because the FIR does not carry
+  source positions (SPEC 14.1 item 16).
+* **The performance target of <= 2x Rust is missed** -- a measured median of
+  **2.8x-3.4x** (range 1.6x-6.0x), see below.
 
-### Was Runde 1 bemängelt hat und jetzt behoben ist
+### What round 1 criticized and what is fixed now
 
-* mem2reg, Blockverschmelzung, Copy-Propagation, CSE und Inlining gibt es
-  (`compiler/src/mem2reg.rs`, `inline.rs`, `opt.rs`; `tests/opt/`, 41 Prüfungen
-  in `test_opt.sh`).
-* Die slot-basierte Belegung ist durch eine **echte Registerzuteilung**
-  (linear scan mit Lebendigkeitsintervallen, `compiler/src/regalloc.rs`)
-  ersetzt; Faktor gegenüber `--no-opt` im Median **~10×**.
-* Höchstens 6 Parameter, keine Aggregate an Funktionsgrenzen, kein
-  `break`/`continue`/`for`, kein `[wert; N]`, kein Modulsystem: alles
-  aufgehoben, einzeln in SPEC.md §14.1 vermerkt (Punkte 1, 9, 11, 13, 15).
+* mem2reg, block merging, copy propagation, CSE and inlining exist
+  (`compiler/src/mem2reg.rs`, `inline.rs`, `opt.rs`; `tests/opt/`, 41 checks in
+  `test_opt.sh`).
+* The slot-based assignment has been replaced by a **real register allocation**
+  (linear scan with live intervals, `compiler/src/regalloc.rs`); the factor
+  against `--no-opt` is a median of **~10x**.
+* At most 6 parameters, no aggregates across function boundaries, no
+  `break`/`continue`/`for`, no `[value; N]`, no module system: all lifted, each
+  one recorded in SPEC.md 14.1 (items 1, 9, 11, 13, 15).
 
-## Fehlerunionen `E!T` (Modul `fehlerunionen`, Runde 3)
+## Error unions `E!T` (module `fehlerunionen`, round 3)
 
-SPEC §5.1 ist als Sprachmittel umgesetzt: `error`-Deklaration, Typsyntax
-`E!T`, implizite Umwandlung bei `return`, `try`, `catch` und
-`catch |e| ausdruck`. Ein `!T`-Wert ist implizit `#[must_consume]`.
+SPEC 5.1 is implemented as a language feature: the `error` declaration, the type
+syntax `E!T`, implicit conversion at `return`, `try`, `catch` and
+`catch |e| expression`. A `!T` value is implicitly `#[must_consume]`.
 
 ```firn
 error IoError { NotFound, Permission, Closed }
 
 fn hole(x: i32) -> IoError!i32 {
-    if x == 1 { return IoError::NotFound }   // Fehler
-    return x * 10                            // Erfolg — kein ok(...)
+    if x == 1 { return IoError::NotFound }   // error
+    return x * 10                            // success -- no ok(...)
 }
 
 fn kette(x: i32) -> IoError!i32 {
-    let v = try hole(x)                      // Fehler sofort nach oben
+    let v = try hole(x)                      // an error goes straight up
     return v + 1
 }
 
@@ -387,46 +387,45 @@ fn main() -> i32 {
 }
 ```
 
-Darstellung: zweivariantige getaggte Union als Struct mit `__err: u32`
-(0 = Erfolg, Codes ab 1 in Deklarationsreihenfolge) und `__val: T` — damit
-gelten Aggregat-ABI, Registerzuteilung und Codegen unverändert.
-Code: `compiler/src/errors.rs` (Prüfung) und `compiler/src/lower_errors.rs`
-(Lowering nach FIR, **ohne** neue FIR-Instruktion).
-Nachweise: `tests/400…419_*.fi` (20 Programme, alle in drei Baustufen) und
-`tests/neg/err_*.fi` (11 Negativtests). Beispiel:
+Representation: a two-variant tagged union as a struct with `__err: u32`
+(0 = success, codes from 1 upwards in declaration order) and `__val: T` -- so
+the aggregate ABI, register allocation and codegen apply unchanged.
+Code: `compiler/src/errors.rs` (checking) and `compiler/src/lower_errors.rs`
+(lowering to FIR, **without** a new FIR instruction).
+Proofs: `tests/400...419_*.fi` (20 programs, all in three build stages) and
+`tests/neg/err_*.fi` (11 negative tests). Example:
 
 ```
 $ ./compiler/target/release/firnc -o /tmp/n tests/neg/err_try_outside.fi
-error: 'try' ist nur in einer funktion mit fehlerunions-rueckgabetyp erlaubt, diese liefert i32
+error: 'try' is only allowed in a function with an error union return type, this one returns i32
 ```
 
-Die bewussten Einschränkungen (keine abgeleitete Fehlermenge, kein
-`defer`/`errdefer`, `catch |e|` bindet an einen Ausdruck statt an einen Block,
-kein `E!()`) stehen in `SPEC.md` §14.1.fehlerunionen als F1–F10 und in
-`docs/FEHLERUNIONEN.md`.
+The deliberate restrictions (no inferred error set, no `defer`/`errdefer`,
+`catch |e|` binds to an expression instead of to a block, no `E!()`) are in
+`SPEC.md` 14.1.error_unions as F1-F10 and in `docs/FEHLERUNIONEN.md`.
 
-## HTML5-Tokenizer in Firn gegen html5lib (Runde 3)
+## An HTML5 tokenizer in Firn against html5lib (round 3)
 
-Der Tokenizer nach WHATWG §13.2.5 ist **in Firn** geschrieben
-(`lib/html/*.fi`, 8.647 Zeilen, davon 4.663 Zeilen erzeugte Namenstabelle für
-Zeichenreferenzen). Die Zustandsmaschine ist ein `enum` mit **73 Zuständen**
-plus `match`; der Codegenerator macht daraus eine echte Sprungtabelle —
-selbst nachprüfbar:
+The tokenizer following WHATWG 13.2.5 is written **in Firn**
+(`lib/html/*.fi`, 8,647 lines, 4,663 of them the generated name table for
+character references). The state machine is an `enum` with **73 states** plus
+`match`; the code generator turns that into a real jump table -- verifiable in
+person:
 
 ```sh
 ./compiler/target/release/firnc --emit=asm -o /tmp/tok.s lib/html/tokenize_main.fi
 grep -n "jmp qword ptr" /tmp/tok.s     # 11005:    jmp qword ptr [rdx + rax*8]
 ```
 
-Der Harness ist eine **Werkbank** (Python, `tools/tokenizer/harness.py`,
-295 Zeilen) und enthält keine Tokenizer-Logik: er schickt Aufträge über stdin
-(Protokoll in `tools/tokenizer/LOG.md`) und vergleicht die Antwortzeile.
+The harness is a **workbench** (Python, `tools/tokenizer/harness.py`, 295 lines)
+and contains no tokenizer logic: it sends jobs over stdin (the protocol is in
+`tools/tokenizer/LOG.md`) and compares the answer line.
 
 ```sh
 bash tools/tokenizer/run.sh
 ```
 
-Echte Ausgabe (14.08.2026, selbst ausgeführt):
+Real output (2026-08-14, run in person):
 
 ```
 Datei                       ohne Fehlercodes     mit Fehlercodes
@@ -434,8 +433,8 @@ xmlViolation.test              4 /     4 100.00 %       3 /     4  75.00 %
 GESAMT                      6810 /  6810 100.00 %    6809 /  6810  99.99 %
 ```
 
-**Durchsatz auf ZWEI Korpora** (`bash tools/tokenizer/throughput.sh`, echte
-Ausgabe vom 14.08.2026, bester von je 3 Läufen):
+**Throughput on TWO corpora** (`bash tools/tokenizer/throughput.sh`, real output
+of 2026-08-14, the best of three runs each):
 
 ```
    -- Korpus 'html5lib' (Grenzfaelle der Testsuite, absichtlich pathologisch)
@@ -449,284 +448,282 @@ Ausgabe vom 14.08.2026, bester von je 3 Läufen):
       Faktor    : 5.72x langsamer als html5ever (Abnahmeziel <= 2.00x)
 ```
 
-Warum zwei Korpora: der Korpus aus den html5lib-Eingaben ist **absichtlich
-pathologisch** (fast nur Grenzfälle, sehr viele Zustandswechsel je Byte, kaum
-lange Textläufe) und misst den schlechtesten Fall — das ist in
-`tools/tokenizer/korpus.py` so dokumentiert. Korpus `realweb` sind acht am
-14.08.2026 gespeicherte echte Seiten (Wikipedia ×3, WHATWG-HTML-Standard, W3C,
-rustdoc, Hacker News; 4,70 MB, `testdata/realweb/MANIFEST.md` nennt jede URL).
-Genau dort ist html5ever am stärksten: lange Textläufe sind sein bester Fall,
-während der Firn-Tokenizer weiter Codepunkt für Codepunkt arbeitet und
-zusätzlich html5lib-JSON schreibt.
+Why two corpora: the corpus made from the html5lib inputs is **deliberately
+pathological** (almost nothing but edge cases, very many state changes per byte,
+hardly any long runs of text) and measures the worst case -- that is documented
+as such in `tools/tokenizer/korpus.py`. The corpus `realweb` consists of eight
+real pages saved on 2026-08-14 (Wikipedia x3, the WHATWG HTML standard, W3C,
+rustdoc, Hacker News; 4.70 MB, `testdata/realweb/MANIFEST.md` names every URL).
+That is exactly where html5ever is strongest: long runs of text are its best
+case, while the Firn tokenizer keeps working code point by code point and writes
+html5lib JSON on top of that.
 
-Die Bilanz war in allen Läufen identisch. Beide Korpora bekommen auf beiden
-Seiten byteweise dieselbe Eingabe.
+The tally was identical in every run. Both corpora receive byte for byte the
+same input on both sides.
 
-**Testdaten unverändert — nachprüfbar:** `bash tools/tokenizer/verifiziere_testdaten.sh`
-vergleicht die sha256-Summen der 14 `.test`-Dateien mit dem festgeschriebenen
-Satz (`tools/tokenizer/testdaten.sha256`, Upstream-Commit
-`224991ec10db04f056a89eed8b0bd8695fd2950e` von html5lib-tests) und zählt die
-6.810 Fälle nach. `run.sh` fährt das als Schritt 0 mit; mit `--gegen-upstream`
-lädt das Skript die Dateien dieses Commits erneut von GitHub und vergleicht
-direkt.
+**The test data are unchanged -- verifiable:**
+`bash tools/tokenizer/verifiziere_testdaten.sh` compares the sha256 sums of the
+14 `.test` files with the frozen set (`tools/tokenizer/testdaten.sha256`,
+upstream commit `224991ec10db04f056a89eed8b0bd8695fd2950e` of html5lib-tests)
+and counts the 6,810 cases. `run.sh` runs that as step 0; with
+`--gegen-upstream` the script downloads the files of that commit from GitHub
+again and compares directly.
 
-Ehrlich benannt:
+Named honestly:
 
-* **Die XML-Anpassung ist ein optionaler Modus, kein Sonderweg**: die vier
-  `xmlViolationTests` verlangen die Anpassungen aus „Coercing an HTML DOM into
-  an infoset". Der Treiber schaltet sie über eine Auftragsflagge zu (Bit 0,
-  `tools/tokenizer/LOG.md`), der Harness setzt sie ausschließlich für die
-  Fälle unter dem Schlüssel `xmlViolationTests`. Gegenprobe (fährt `run.sh`
-  selbst mit): `python3 tools/tokenizer/harness.py <binary> --ohne-xml-modus`
-  ergibt `6807 / 6810 (99,96 %)` — der reine HTML-Pfad ist also unverändert.
-  Es wird nichts gefiltert und nichts übersprungen.
-* **Nicht ≤ 2× — auf keinem der beiden Korpora.** Drei vollständige Messungen
-  am 14.08.2026 (bester Lauf je Seite, html5ever mit `--release`,
-  `opt-level=3`, derselbe Rechner, dieselben Bytes):
-  Korpus `html5lib` **2,25× / 2,45× / 2,79×**, Korpus `realweb`
-  **5,72× / 7,72× / 7,84×**; eine vierte Messung ergab **2,32×** bzw.
-  **7,35×**, eine fünfte (Nacharbeit Runde 4) **3,09×** bzw. **6,39×**,
-  zwei weitere bei der Zusammenführung **2,59×** bzw. **6,90×** und
-  **2,42×** bzw. **8,31×** — die Extremwerte liegen jeweils über der zuvor
-  notierten Spanne; sie lautet deshalb **2,25×–3,09×** (`html5lib`) und
-  **5,72×–8,31×** (`realweb`) und nicht der günstigste Lauf.
-  Die Messung schwankt um ~30 %; die eigene Zahl
-  der Jury kann in diesen Spannen liegen. Der schlechtere Wert auf echten
-  Seiten ist kein Ausreißer, sondern der ehrlichere: dort spielt html5ever
-  seine Stärke bei langen Textläufen aus.
-* **Die `errors`-Einträge der Suite (Parse-Fehlercodes mit Zeile/Spalte)
-  werden verglichen** — Schalter `--mit-fehlern`, in `run.sh` Schritt 2a. Der
-  Tokenizer führt Zeile und Spalte selbst mit und gibt hinter dem Tokenstrom
-  (durch Tabulator getrennt) eine zweite JSON-Liste aus, z. B.
-  `[{"code":"eof-in-tag","line":1,"col":6}]`; die Codenamen stehen in
-  `lib/html/error_codes.fi` (WHATWG §13.2 „Parse errors"). Ergebnis
-  **6.809 / 6.810 (99,99 %)**. Der eine Fehlschlag ist `xmlViolation.test #0`:
-  dort steht `U+FFFF` in der Eingabe, der Tokenizer meldet dafür korrekt
-  `noncharacter-in-input-stream`, die Datei `xmlViolation.test` führt aber gar
-  keine `errors`-Listen und erwartet die leere Liste. Der Fall wird **als
-  Fehlschlag gezählt**, nicht ausgenommen.
-* **Die Namenstabelle der Zeichenreferenzen liegt an keiner festen Adresse**:
-  `mmap` ohne `MAP_FIXED`, der Zeiger wird im `tokens.Sink` durchgereicht.
-  Schlägt `mmap` fehl, liefert `entities.tabelle()` 0, `char_ref` meldet
-  `REF_UNMOEGLICH` und der Tokenizer setzt `nicht_unterstuetzt` — der Fall
-  zählt als Fehlschlag statt still falsch tokenisiert zu werden. Nachweis in
-  Firn: `lib/html/entities_ausfall.fi` (Schritt 1c in `run.sh`, startet das
-  Programm zweimal und verlangt verschiedene Adressen).
-* Alle drei Baustufen (`opt`, `--no-opt`, `dev-fast`) liefern dieselbe Bilanz;
-  `run.sh` bricht ab, wenn nicht.
+* **The XML adaptation is an optional mode, not a special route**: the four
+  `xmlViolationTests` demand the adaptations from "Coercing an HTML DOM into an
+  infoset". The driver switches them on through a job flag (bit 0,
+  `tools/tokenizer/LOG.md`), the harness sets it exclusively for the cases under
+  the key `xmlViolationTests`. Counter-check (`run.sh` performs it itself):
+  `python3 tools/tokenizer/harness.py <binary> --ohne-xml-modus` gives
+  `6807 / 6810 (99.96 %)` -- so the pure HTML path is unchanged. Nothing is
+  filtered and nothing is skipped.
+* **Not <= 2x -- on neither of the two corpora.** Three complete measurements on
+  2026-08-14 (the best run per side, html5ever with `--release`,
+  `opt-level=3`, the same machine, the same bytes):
+  corpus `html5lib` **2.25x / 2.45x / 2.79x**, corpus `realweb`
+  **5.72x / 7.72x / 7.84x**; a fourth measurement gave **2.32x** and **7.35x**,
+  a fifth (the rework of round 4) **3.09x** and **6.39x**, two more during the
+  merge **2.59x** and **6.90x** and **2.42x** and **8.31x** -- the extreme
+  values each lie above the range noted before; the range is therefore
+  **2.25x-3.09x** (`html5lib`) and **5.72x-8.31x** (`realweb`) and not the most
+  favourable run. The measurement varies by about 30 %; the jury's own number
+  can lie inside these ranges. The worse value on real pages is not an outlier
+  but the more honest one: that is where html5ever plays out its strength on
+  long runs of text.
+* **The `errors` entries of the suite (parse error codes with line/column) are
+  compared** -- switch `--mit-fehlern`, step 2a in `run.sh`. The tokenizer keeps
+  track of line and column itself and prints a second JSON list behind the token
+  stream (separated by a tab), for example
+  `[{"code":"eof-in-tag","line":1,"col":6}]`; the code names are in
+  `lib/html/error_codes.fi` (WHATWG 13.2 "Parse errors"). Result
+  **6,809 / 6,810 (99.99 %)**. The single failure is `xmlViolation.test #0`:
+  the input contains `U+FFFF`, for which the tokenizer correctly reports
+  `noncharacter-in-input-stream`, but the file `xmlViolation.test` carries no
+  `errors` lists at all and expects the empty list. The case is **counted as a
+  failure**, not exempted.
+* **The name table of the character references lies at no fixed address**:
+  `mmap` without `MAP_FIXED`, the pointer is passed through in the
+  `tokens.Sink`. If `mmap` fails, `entities.tabelle()` returns 0, `char_ref`
+  reports `REF_UNMOEGLICH` and the tokenizer sets `nicht_unterstuetzt` -- the
+  case then counts as a failure instead of being tokenized wrongly in silence.
+  Proof in Firn: `lib/html/entities_ausfall.fi` (step 1c in `run.sh`, which
+  starts the program twice and demands different addresses).
+* All three build stages (`opt`, `--no-opt`, `dev-fast`) deliver the same tally;
+  `run.sh` aborts if they do not.
 
-## Optimierer-Runde 5: LICM, `lea` — und was der Tokenizer wirklich bremst
+## Optimizer round 5: LICM, `lea` -- and what really slows the tokenizer down
 
-**Neuer Durchgang `licm`** (`compiler/src/licm.rs`): schleifeninvariante
-Berechnungen wandern in den Vorkopf. In `bench/firn/matmul.fi` stand `r * n` in
-jeder Iteration der innersten Schleife — 240 × 240 × 3 Mal je Lauf.
+**A new pass `licm`** (`compiler/src/licm.rs`): loop-invariant computations move
+into the preheader. In `bench/firn/matmul.fi` the expression `r * n` sat in
+every iteration of the innermost loop -- 240 x 240 x 3 times per run.
 
 ```
 $ firnc --list-passes | grep licm
-licm            Funktion ja    schleifeninvariante Berechnungen in den Vorkopf ziehen
+licm            function ja              hoist loop invariant computations into the preheader
 ```
 
-**`lea` statt `mov`+`add`** im Codegenerator: Adressrechnungen brauchen eine
-Instruktion statt zwei bis drei, und der Fall „zweiter Operand liegt schon im
-Zielregister" braucht keinen Umweg über `rax` mehr. In der inneren Schleife von
-`matmul` waren **14 der 27 Instruktionen reine Registerkopien**; jetzt sind es
-21 Instruktionen insgesamt.
+**`lea` instead of `mov`+`add`** in the code generator: address computations
+need one instruction instead of two or three, and the case "the second operand
+is already in the destination register" no longer needs a detour through `rax`.
+In the inner loop of `matmul` **14 of the 27 instructions were pure register
+copies**; now there are 21 instructions in total.
 
-**Inline-Grenze für den Aufrufer** von 4.000 auf 24.000 FIR-Instruktionen: die
-heißeste Funktion des ganzen Projekts — `tokenizer__tokenize` mit 4.139
-Instruktionen — bekam vorher **keine einzige Einbettung**, obwohl
-`sink_emit_char` mit 18 Instruktionen weit unter jeder Grenze liegt. Eine große
-Funktion ist nicht automatisch kalt; bei einer Zustandsmaschine ist das
-Gegenteil der Fall.
+**The inlining limit for the caller** raised from 4,000 to 24,000 FIR
+instructions: the hottest function of the whole project -- `tokenizer__tokenize`
+with 4,139 instructions -- previously got **not a single inlining**, although
+`sink_emit_char` with 18 instructions lies far below any limit. A large function
+is not automatically a cold one; with a state machine the opposite is the case.
 
-### Gemessen — und zwar deterministisch
+### Measured -- and deterministically at that
 
-Auf dieser Maschine schwankt die Wanduhrzeit derselben Binary um bis zu **40 %**
-zwischen Läufen. Damit ist eine Codegen-Änderung von 5 % nicht bewertbar: beim
-ersten Versuch erschien dieselbe Verbesserung einmal als −18 % und einmal als
-+6 %. Seitdem misst `bench/instr.sh` die **ausgeführten Instruktionen** mit
-`valgrind --tool=callgrind` — auf die Instruktion genau reproduzierbar.
+On this machine the wall-clock time of the same binary varies by up to **40 %**
+between runs. That makes a codegen change of 5 % impossible to judge: on the
+first attempt the same improvement appeared once as -18 % and once as +6 %.
+Since then `bench/instr.sh` measures the **executed instructions** with
+`valgrind --tool=callgrind` -- reproducible down to the instruction.
 
-| Programm | vorher | nachher | Änderung |
+| Program | before | after | change |
 |---|---:|---:|---:|
-| matmul | 1.668.312.681 | 1.376.734.921 | **−17,48 %** |
-| bubblesort | 811.682.925 | 667.321.089 | **−17,79 %** |
-| bytecount | 2.579.216.109 | 2.148.310.351 | **−16,71 %** |
-| sieve | 825.458.961 | 708.292.727 | **−14,19 %** |
-| statemachine | 1.847.172.267 | 1.721.343.055 | **−6,81 %** |
-| fib | 338.351.740 | 338.353.992 | ±0,00 % |
+| matmul | 1,668,312,681 | 1,376,734,921 | **-17.48 %** |
+| bubblesort | 811,682,925 | 667,321,089 | **-17.79 %** |
+| bytecount | 2,579,216,109 | 2,148,310,351 | **-16.71 %** |
+| sieve | 825,458,961 | 708,292,727 | **-14.19 %** |
+| statemachine | 1,847,172,267 | 1,721,343,055 | **-6.81 %** |
+| fib | 338,351,740 | 338,353,992 | +/-0.00 % |
 
-`fib` ist reine Rekursion — dort gibt es für beide Durchgänge nichts zu holen.
+`fib` is pure recursion -- there is nothing for either pass to gain there.
 
-### Der Tokenizer wird davon NICHT schneller — hier ist der Beweis
+### The tokenizer does NOT get faster from it -- here is the proof
 
-| Korpus `realweb`, 4.931.819 Bytes | Instruktionen | je Byte |
+| Corpus `realweb`, 4,931,819 bytes | instructions | per byte |
 |---|---:|---:|
-| Firn-Tokenizer | 4.033.688.605 | **818** |
-| html5ever | 540.567.170 | **110** |
+| Firn tokenizer | 4,033,688,605 | **818** |
+| html5ever | 540,567,170 | **110** |
 
-Das Verhältnis **7,46×** deckt sich fast genau mit dem Zeitfaktor **7,04×**.
-Damit ist belegt, woran der Abstand **nicht** liegt: nicht an der Qualität des
-erzeugten Codes. Firn führt siebeneinhalb Mal so viel Arbeit aus, und daran
-würde auch ein perfekter Codegenerator nichts ändern.
+The ratio of **7.46x** matches the time factor of **7.04x** almost exactly.
+That proves what the distance is **not** caused by: not by the quality of the
+generated code. Firn executes seven and a half times as much work, and a perfect
+code generator would not change that.
 
-Die Ursachen liegen im Tokenizer, nicht im Compiler: er dekodiert die Eingabe
-erst vollständig nach UTF-32 (`mem.CpBuf`, vier Byte je Zeichen) und
-tokenisiert dann diesen Puffer, er hat keinen Bulk-Pfad für Textläufe (html5ever
-springt zum nächsten `<`/`&` und gibt alles dazwischen als einen Block aus), und
-er schreibt zusätzlich das html5lib-JSON, das html5ever nicht schreibt.
+The causes lie in the tokenizer, not in the compiler: it first decodes the input
+completely to UTF-32 (`mem.CpBuf`, four bytes per character) and then tokenizes
+that buffer, it has no bulk path for runs of text (html5ever jumps to the next
+`<`/`&` and emits everything in between as one block), and on top of that it
+writes the html5lib JSON, which html5ever does not write.
 
-**Deshalb ist das Abnahmeziel „≤ 2× Referenz" mit Compilerarbeit allein nicht
-erreichbar.** Der nächste Schritt gehört dem Tokenizer und einem fairen
-Messaufbau — nicht dem Optimierer. Das ist die eigentliche Erkenntnis dieser
-Runde, und sie ist mehr wert als die 16 % Instruktionen.
+**That is why the acceptance target "<= 2x the reference" is not reachable with
+compiler work alone.** The next step belongs to the tokenizer and to a fair
+measurement setup -- not to the optimizer. That is the real insight of this
+round, and it is worth more than the 16 % of instructions.
 
-## Tokenizer-Tempo: von 7,0× auf 5,0× — und was das gekostet hat (Runde 6)
+## Tokenizer speed: from 7.0x to 5.0x -- and what it cost (round 6)
 
-Nachdem die Messung gezeigt hatte, dass der Abstand **ausgeführte Arbeit** ist
-und nicht Codegen-Qualität (818 gegen 110 Instruktionen je Byte), ging diese
-Runde genau dort hin. Drei Eingriffe, jeder einzeln gemessen:
+After the measurement had shown that the distance is **work executed** and not
+codegen quality (818 against 110 instructions per byte), this round went exactly
+there. Three interventions, each measured on its own:
 
-**1. Schneller Pfad hochgezogen** (`lib/html/mem.fi`). `cp_reserve` und
-`buf_reserve` waren zusammen **33 % aller Instruktionen** — nicht das Wachsen,
-sondern die Prüfung „ist noch Platz?", die je Zeichen als Funktionsaufruf
-anfiel. Mit 71 Instruktionen und 14 Blöcken ist die volle Funktion zu groß zum
-Einbetten. Jetzt steht in `cp_push`/`buf_push` nur der Vergleich (24
-Instruktionen, 3 Blöcke → einbettbar), das Wachsen ist `cp_wachse`/`buf_wachse`.
+**1. The fast path pulled up** (`lib/html/mem.fi`). `cp_reserve` and
+`buf_reserve` together were **33 % of all instructions** -- not the growing, but
+the check "is there still room?", which occurred as a function call for every
+character. With 71 instructions and 14 blocks the full function is too large to
+inline. Now `cp_push`/`buf_push` contain only the comparison (24 instructions,
+3 blocks -> inlinable), the growing lives in `cp_wachse`/`buf_wachse`.
 
-**2. Fairer Messaufbau** (`lib/html/tokenize_bench.fi`). Der bisherige Treiber
-schrieb je Auftrag html5lib-JSON, html5ever zählt nur Token — gemessen **14,7 %
-der Instruktionen** für eine Ausgabe, die die Gegenseite gar nicht erzeugt.
-Die Messfassung zählt ebenfalls nur. **Nicht** herausgerechnet wird die
-UTF-32-Dekodierung (28 %), obwohl html5ever sie nicht braucht: das ist ein
-echter Nachteil von Firns Aufbau, keine Unfairness der Messung.
+**2. A fair measurement setup** (`lib/html/tokenize_bench.fi`). The previous
+driver wrote html5lib JSON per job, html5ever only counts tokens -- measured
+**14.7 % of the instructions** for output that the other side does not produce
+at all. The measuring version only counts as well. What is **not** subtracted is
+the UTF-32 decoding (28 %), although html5ever does not need it: that is a real
+disadvantage of Firn's design, not an unfairness of the measurement.
 
-**3. `cmp` und bedingter Sprung verschmolzen** (`compiler/src/regalloc.rs`).
-Ein Vergleich kostete **sieben** Instruktionen: `cmp`, `setcc al`,
-`movzx eax, al`, Kopie ins Zielregister, `test`, `jnz`, `jmp` — der bool-Wert
-wurde erzeugt, gespeichert und sofort wieder auf null geprüft. Jetzt sind es
-drei. Bedingung: der Vergleich ist die **letzte** Instruktion des Blocks (sonst
-könnte etwas dazwischen die Flags ändern), sein Ergebnis wird **genau einmal**
-gelesen, und es ist kein `secret`-Wert. `dekodiere` schrumpfte dadurch von 583
-auf 503 Instruktionen.
+**3. `cmp` and the conditional jump merged** (`compiler/src/regalloc.rs`).
+A comparison cost **seven** instructions: `cmp`, `setcc al`,
+`movzx eax, al`, a copy into the destination register, `test`, `jnz`, `jmp` --
+the bool value was produced, stored and immediately tested against zero again.
+Now there are three. The conditions: the comparison is the **last** instruction
+of the block (otherwise something in between could change the flags), its result
+is read **exactly once**, and it is not a `secret` value. As a result
+`dekodiere` shrank from 583 to 503 instructions.
 
-### Ergebnis, mit callgrind gemessen (Korpus `realweb`)
+### The result, measured with callgrind (corpus `realweb`)
 
-| Stand | Instruktionen | gegen html5ever |
+| State | instructions | against html5ever |
 |---|---:|---:|
-| vor dieser Runde (mit JSON) | 4.033.688.605 | 7,46× |
-| schneller Pfad in `mem.fi` | 3.931.183.909 | 7,27× |
-| fairer Aufbau + `cmp`/`jcc` | **2.655.479.880** | **4,91×** |
+| before this round (with JSON) | 4,033,688,605 | 7.46x |
+| fast path in `mem.fi` | 3,931,183,909 | 7.27x |
+| fair setup + `cmp`/`jcc` | **2,655,479,880** | **4.91x** |
 
-Nach der Uhr (bester von drei Läufen):
+By the clock (the best of three runs):
 
-| Korpus | vorher | nachher | Ziel |
+| Corpus | before | after | target |
 |---|---:|---:|---:|
-| `html5lib` (pathologisch) | 2,70× | **1,98×** | ≤ 2,00× |
-| `realweb` (echte Seiten) | 7,02× | **4,99×** | ≤ 2,00× |
+| `html5lib` (pathological) | 2.70x | **1.98x** | <= 2.00x |
+| `realweb` (real pages) | 7.02x | **4.99x** | <= 2.00x |
 
-**Ehrlich:** Auf `html5lib` ist das Ziel erreicht, auf `realweb` nicht — und
-`realweb` ist der Fall, der für einen Browser zählt. Der Wert 1,98× liegt
-außerdem so knapp an der Grenze, dass er im Rauschen der Uhr liegt; belastbar
-ist die Instruktionszahl. Die Quote blieb unverändert bei **6.810/6.810**.
+**Honestly:** on `html5lib` the target is reached, on `realweb` it is not -- and
+`realweb` is the case that counts for a browser. The value of 1.98x also lies so
+close to the limit that it is within the noise of the clock; what is solid is
+the instruction count. The rate stayed unchanged at **6,810/6,810**.
 
-**Was als Nächstes bleibt:** `dekodiere` ist mit 28 % der größte verbliebene
-Posten und braucht 225 Instruktionen je Byte — für eine UTF-8-Dekodierung
-absurd viel. Der Grund steht im Assembler: die eingebettete Bereichsprüfung von
-`buf_at` erzeugt je Zugriff eine eigene Verzweigung, und `dekodiere` greift bis
-zu fünfmal je Zeichen zu. Ohne Bereichsprüfungs-Elimination über Schleifen
-hinweg (`bce` kann das noch nicht) bleibt das stehen.
+**What remains next:** `dekodiere` is the biggest remaining item with 28 % and
+needs 225 instructions per byte -- absurdly many for a UTF-8 decoding. The
+reason is in the assembly: the inlined bounds check of `buf_at` produces a
+branch of its own per access, and `dekodiere` accesses up to five times per
+character. Without bounds check elimination across loops (`bce` cannot do that
+yet) it stays that way.
 
-## Wo der Tokenizer jetzt wirklich steht (Runde 7, Messbefund)
+## Where the tokenizer really stands now (round 7, a measurement finding)
 
-`dekodiere` war mit 28 % der größte Posten. Die naheliegende Erklärung —
-`mem.buf_at` lädt je Zugriff `(*b).ptr` und `(*b).len` neu, und der Optimierer
-darf das ohne Aliasanalyse nicht zusammenfassen — habe ich geprüft, indem beide
-Werte einmal vor die Schleife gezogen wurden (`byte_bei`, in beiden Treibern).
+`dekodiere` was the biggest item with 28 %. The obvious explanation --
+`mem.buf_at` reloads `(*b).ptr` and `(*b).len` on every access, and without
+alias analysis the optimizer is not allowed to combine them -- I checked by
+pulling both values out in front of the loop once (`byte_bei`, in both drivers).
 
-**Ergebnis: die Erklärung stimmte nur zum kleineren Teil.** `dekodiere` selbst
-wurde von 1.110 auf 814 Mio. Instruktionen kleiner (−27 %), der Gesamtlauf aber
-nur von 2.655 auf 2.631 Mio. (−0,9 %). Die These war also richtig, aber der
-Posten war kleiner als die erste Rechnung nahelegte. Das steht hier, weil eine
-widerlegte Vermutung genauso zum Ergebnis gehört wie eine bestätigte.
+**The result: the explanation was only right in the smaller part.**
+`dekodiere` itself got smaller, from 1,110 to 814 million instructions (-27 %),
+but the whole run only went from 2,655 to 2,631 million (-0.9 %). So the thesis
+was right, but the item was smaller than the first calculation suggested. This
+stands here because a refuted assumption belongs to the result just as much as a
+confirmed one.
 
-### Der eigentliche Grund, im Assembler nachgesehen
+### The real reason, looked up in the assembly
 
-Ein einziger Byte-Zugriff in `dekodiere`:
+A single byte access in `dekodiere`:
 
 ```asm
-mov rax, qword ptr [rbp-1672]    ; basis  — liegt im Rahmen, nicht im Register
+mov rax, qword ptr [rbp-1672]    ; base    -- lies in the frame, not in a register
 add rax, qword ptr [rbp-216]     ; + index
-mov qword ptr [rbp-1304], rax    ; Adresse in einen Slot
-mov rcx, qword ptr [rbp-1304]    ; und sofort wieder heraus
-movzx eax, byte ptr [rcx]        ; das eigentliche Laden
-mov qword ptr [rbp-1312], rax    ; Ergebnis in einen Slot
-movzx eax, byte ptr [rbp-1312]   ; und sofort wieder heraus
-mov qword ptr [rbp-1320], rax    ; noch einmal
-mov eax, dword ptr [rbp-1320]    ; und noch einmal
+mov qword ptr [rbp-1304], rax    ; the address into a slot
+mov rcx, qword ptr [rbp-1304]    ; and straight back out again
+movzx eax, byte ptr [rcx]        ; the actual load
+mov qword ptr [rbp-1312], rax    ; the result into a slot
+movzx eax, byte ptr [rbp-1312]   ; and straight back out again
+mov qword ptr [rbp-1320], rax    ; once more
+mov eax, dword ptr [rbp-1320]    ; and once more
 mov dword ptr [rbp-2488], eax
 ```
 
-**Zehn Instruktionen für einen Byte-Load, davon acht reines Stack-Geschiebe.**
-In der ganzen Funktion sind **170 von 469 Instruktionen Stackzugriffe**.
+**Ten instructions for one byte load, eight of them pure stack shuffling.**
+In the whole function **170 of 469 instructions are stack accesses**.
 
-Die Ursache ist nicht Faulheit des Registerzuteilers — er ist ein echter Linear
-Scan mit Lebendigkeitsintervallen und Schleifengewichten. Sie ist schlichter:
-in `dekodiere` sind neun langlebige Werte gleichzeitig am Leben (vier Parameter,
-`basis`, `ges` und die Zellen `i`, `cp`, `breite`), und es gibt elf Register.
-Für die kurzlebigen Zwischenwerte bleibt keins übrig — also bekommt **jeder
-einen eigenen Stack-Slot**, auch wenn er nur eine Instruktion später gelesen
-wird.
+The cause is not laziness on the part of the register allocator -- it is a real
+linear scan with live intervals and loop weights. It is simpler than that: in
+`dekodiere` nine long-lived values are alive at the same time (four parameters,
+`basis`, `ges` and the cells `i`, `cp`, `breite`), and there are eleven
+registers. Nothing is left for the short-lived intermediate values -- so **each
+of them gets a stack slot of its own**, even if it is read one instruction later.
 
-### Was daraus folgt
+### What follows from that
 
-Der richtige Fix ist, dass ein Wert, der im selben Block erzeugt und **genau
-einmal** gelesen wird, überhaupt keinen Ort braucht: er bleibt im
-Arbeitsregister und wird direkt weiterverwendet. Die Zählung dafür gibt es seit
-der `cmp`/`jcc`-Verschmelzung bereits (`zaehle_lesezugriffe`).
+The right fix is that a value which is produced in the same block and read
+**exactly once** needs no location at all: it stays in the working register and
+is used directly. The counting for that has existed since the `cmp`/`jcc`
+merging (`zaehle_lesezugriffe`).
 
-Die Falle dabei ist real: die nächste Instruktion darf `rax` nicht
-überschreiben, **bevor** sie den durchgereichten Wert liest. Bei
-`d = x + durchgereicht` mit `x` im Rahmen lädt der Codegenerator zuerst `x`
-nach `rax` — und der durchgereichte Wert wäre weg.
+The trap in it is real: the next instruction must not overwrite `rax` **before**
+it reads the value passed through. With `d = x + passed_through` and `x` in the
+frame the code generator first loads `x` into `rax` -- and the value passed
+through would be gone.
 
-### Der Versuch — gebaut, gemessen, verworfen
+### The attempt -- built, measured, discarded
 
-Statt über `rax` habe ich es über ein **eigenes Register** gebaut: `r11` als
-`DURCHREICH_REG`, das niemand sonst anfassen darf. Damit ist die Falle
-umgangen, und im Assembler war der Effekt sichtbar — die Stackzugriffe in
-`dekodiere` gingen von **170 auf 158** zurück:
+Instead of going through `rax` I built it through a **register of its own**:
+`r11` as `DURCHREICH_REG`, which nobody else may touch. That avoids the trap,
+and the effect was visible in the assembly -- the stack accesses in `dekodiere`
+went down from **170 to 158**:
 
 ```asm
 mov rax, qword ptr [rbp-1672]
 add rax, qword ptr [rbp-216]
-mov r11, rax                    ; statt: mov [rbp-1304], rax
-mov rcx, r11                    ; statt: mov rcx, [rbp-1304]
+mov r11, rax                    ; instead of: mov [rbp-1304], rax
+mov rcx, r11                    ; instead of: mov rcx, [rbp-1304]
 movzx eax, byte ptr [rcx]
 ```
 
-**Und es war trotzdem langsamer.** Gemessen:
+**And it was slower anyway.** Measured:
 
-| | Instruktionen | Zeit (bester von 4) |
+| | instructions | time (best of 4) |
 |---|---:|---:|
-| ohne Durchreichen | 2.630.820.292 | 0,491 s |
-| mit `r11` reserviert | 2.631.818.983 | 0,520 s |
+| without passing through | 2,630,820,292 | 0.491 s |
+| with `r11` reserved | 2,631,818,983 | 0.520 s |
 
-Die Instruktionszahl ist praktisch identisch (+0,04 %), die Zeit **rund 6 %
-schlechter**. Der Grund liegt auf der Hand, sobald man ihn sieht: `r11` für das
-Durchreichen zu reservieren nimmt dem Linear Scan **eines von elf Registern**.
-Was an kurzlebigen Werten gespart wird, geben die langlebigen an anderer Stelle
-wieder aus — und deren Zugriffe liegen in der Schleife.
+The instruction count is practically identical (+0.04 %), the time is about
+**6 % worse**. The reason is obvious once you see it: reserving `r11` for
+passing values through takes **one of eleven registers** away from the linear
+scan. What is saved on short-lived values is spent again by the long-lived ones
+elsewhere -- and their accesses lie inside the loop.
 
-Die Änderung ist deshalb **zurückgenommen**. Sie steht hier, weil ein
-negatives Ergebnis genauso zum Fortschritt gehört: der nächste Versuch muss
-ohne Registerreservierung auskommen, also die Zuteilung selbst verbessern
-(kurzlebige Intervalle bevorzugt bedienen), statt ihr ein Register wegzunehmen.
+The change has therefore been **taken back**. It stands here because a negative
+result belongs to progress just as much: the next attempt has to manage without
+reserving a register, that is, improve the allocation itself (serve short-lived
+intervals first) instead of taking a register away from it.
 
-## Zeichenkettenliterale (Runde 8) — Sprachkern statt Optimierung
+## String literals (round 8) -- language core instead of optimization
 
-Bis hierhin musste jeder Text in Firn als Oktettliste geschrieben werden. So
-sah eine Fehlermeldung in der GC-Laufzeit aus:
+Up to this point every piece of text in Firn had to be written as a list of
+octets. This is what an error message in the GC runtime looked like:
 
 ```firn
 var m: [u8; 48] = [
@@ -736,108 +733,107 @@ var m: [u8; 48] = [
 ]
 ```
 
-Und so sieht sie jetzt aus:
+And this is what it looks like now:
 
 ```firn
 var m: [u8; 42] = "firn-gc: gc_init() wurde nicht aufgerufen\n"
 ```
 
-**Drei Formen**, alle mit vollständigen Maskierungen (`\n`, `\t`, `\\`, `\0`,
+**Three forms**, all with complete escapes (`\n`, `\t`, `\\`, `\0`,
 `\xNN`, `\uXXXX`, `\u{...}`):
 
-| Form | Typ | Inhalt |
+| Form | Type | Contents |
 |---|---|---|
-| `"…"` | `[u8; N]` | UTF-8, **geprüft** |
-| `b"…"` | `[u8; N]` | rohe Oktette, ungeprüft |
-| `u"…"` | `[u16; N]` | WTF-16, ungeprüft |
+| `"..."` | `[u8; N]` | UTF-8, **checked** |
+| `b"..."` | `[u8; N]` | raw octets, unchecked |
+| `u"..."` | `[u16; N]` | WTF-16, unchecked |
 
-**WTF-16 hält ungepaarte Surrogate** — `u"a\uD800b"` ist gültig und ergibt
-`[97, 55296, 98]`. Das ist keine Nachlässigkeit, sondern Pflicht: eine Sprache,
-die nur wohlgeformtes Unicode zulässt, kann JavaScript nicht umsetzen
-(`FIRN-ANFORDERUNGEN.md` §2). Nachweis in `tests/570_string_literals.fi`.
+**WTF-16 holds unpaired surrogates** -- `u"a\uD800b"` is valid and gives
+`[97, 55296, 98]`. That is not sloppiness but a duty: a language that only
+allows well-formed Unicode cannot implement JavaScript
+(`FIRN-ANFORDERUNGEN.md` 2). Proof in `tests/570_string_literals.fi`.
 
-**Wie es gebaut ist — und warum so klein:** Die Entschlüsselung lag seit
-Runde 2 fertig in `compiler/src/strings.rs`, sie war nur nie an den Lexer
-angebunden. Der Parser wandelt ein Literal unmittelbar in ein **Array-Literal**
-um; Typprüfer, Lowering und Codegenerator sehen nie ein Literal und mussten
-nicht angefasst werden. Der Preis steht in `SPEC.md` §14.1.str S8: die Daten
-landen als Folge einzelner Speicherbefehle im Rahmen, nicht in `.rodata`. Für
-Meldungen und Pfade ist das gleichgültig, für große Tabellen wäre es das nicht.
+**How it is built -- and why so small:** the decoding had been sitting finished
+in `compiler/src/strings.rs` since round 2, it was simply never hooked up to the
+lexer. The parser converts a literal immediately into an **array literal**; the
+type checker, lowering and the code generator never see a literal and did not
+have to be touched. The price is in `SPEC.md` 14.1.str S8: the data end up in
+the frame as a sequence of individual store instructions, not in `.rodata`. For
+messages and paths that makes no difference, for large tables it would.
 
-**Sofort eingelöst:** die handgeschriebenen Oktettlisten in `lib/gc/gc.fi`,
-`lib/dom/meas.fi` und `lib/html/entities_ausfall.fi` sind verschwunden — aus
-einer 63-stelligen Zahlenreihe wurde
+**Redeemed immediately:** the hand-written octet lists in `lib/gc/gc.fi`,
+`lib/dom/meas.fi` and `lib/html/entities_ausfall.fi` are gone -- a 63 entry row
+of numbers became
 `"FEHLER: tabelle() lieferte 0, obwohl mmap moeglich sein sollte\n"`.
 
-## `defer` (Runde 9)
+## `defer` (round 9)
 
 ```firn
 fn lies(pfad: *mut u8) -> i32 {
     let fd: i32 = oeffne(pfad)
-    defer schliesse(fd)          // laeuft bei JEDEM Verlassen
+    defer schliesse(fd)          // runs on EVERY exit
     if fd < 0 {
-        return -1                 // auch hier
+        return -1                 // here as well
     }
     return verarbeite(fd)
 }
 ```
 
-* **Umgekehrte Reihenfolge** der Vereinbarung, wie bei `drop`.
-* **`return` raeumt alle Ebenen ab**, innerste zuerst. Der Rückgabewert ist
-  vorher berechnet — ein `defer` sieht ihn, kann ihn aber nicht ersetzen.
-* **`break`/`continue` raeumen genau die Ebenen ab, die innerhalb der Schleife
-  vereinbart wurden.** Dafür merkt sich `lower::loops` die Tiefe des
-  `defer`-Stapels beim Betreten der Schleife.
-* **Auswertung erst beim Verlassen — wie Zig, nicht wie Go.** Go wertet die
-  Argumente sofort aus und legt sie in versteckten Kopien ab; das widerspricht
-  „nichts Verstecktes". In Firn gilt:
+* **Reverse order** of declaration, as with `drop`.
+* **`return` clears all levels**, the innermost first. The return value is
+  computed beforehand -- a `defer` sees it but cannot replace it.
+* **`break`/`continue` clear exactly the levels that were declared inside the
+  loop.** For that, `lower::loops` remembers the depth of the `defer` stack when
+  the loop is entered.
+* **Evaluation only on exit -- like Zig, not like Go.** Go evaluates the
+  arguments immediately and stores them in hidden copies; that contradicts
+  "nothing hidden". In Firn the following holds:
 
   ```firn
   var i: i32 = 5
-  defer merke(i)    // merkt 9, nicht 5
+  defer merke(i)    // remembers 9, not 5
   i = 9
   ```
 
-* **Ein Sprung aus dem Rumpf heraus ist ein Fehler:**
+* **A jump out of the body is an error:**
 
   ```
-  error: 'return' ist in einem 'defer' nicht erlaubt
-    --> datei.fi:6:9
-     = hinweis: der aufgeschobene rumpf muss normal enden; sonst waere
-       unbestimmt, was mit den uebrigen aufgeschobenen anweisungen geschieht
+  error: 'return' is not allowed inside a 'defer'
+    --> file.fi:6:9
+     = note: the deferred body has to end normally; otherwise it would be
+       undefined what happens to the remaining deferred statements
   ```
 
-### `errdefer` (Runde 10)
+### `errdefer` (round 10)
 
 ```firn
 fn arbeit(x: i32) -> E!i32 {
-    defer aufraeumen()        // immer
-    errdefer zuruecknehmen()  // nur auf dem Fehlerpfad
+    defer aufraeumen()        // always
+    errdefer zuruecknehmen()  // only on the error path
     let w: i32 = try kann_schiefgehen(x)
     return w + 1
 }
 ```
 
-Beide teilen sich **eine** Liste je Blockebene und laufen in gemeinsamer
-umgekehrter Reihenfolge — steht das `errdefer` hinter dem `defer`, läuft es
-zuerst. Fehlerpfad ist die Weitergabe durch `try` und ein `return E::Variante`;
-ein gewöhnlicher Rückgabewert ist es nicht, auch wenn die Funktion eine
-Fehlerunion liefert.
+Both share **one** list per block level and run in a common reverse order -- if
+the `errdefer` stands behind the `defer`, it runs first. The error path is
+propagation through `try` and a `return E::Variant`; an ordinary return value is
+not, even if the function returns an error union.
 
-**Ehrliche Grenze:** wird eine *fertige* Fehlerunion weitergereicht
-(`return u`), steht erst zur Laufzeit fest, ob es der Fehlerpfad ist. Stufe 0
-**lehnt das ab**, statt `errdefer` still zu übergehen:
+**An honest limit:** if a *finished* error union is passed on (`return u`), it
+is only known at run time whether this is the error path. Stage 0 **rejects
+that** instead of silently ignoring `errdefer`:
 
 ```
-error: 'errdefer' und die weitergabe einer fertigen fehlerunion vertragen sich
-       in stufe 0 nicht: … schreibe 'return try …' oder gib den fehler mit
-       'return E::Variante' zurueck
+error: 'errdefer' and passing on a finished error union do not go together
+       in stage 0: ... write 'return try ...' or return the error with
+       'return E::Variant'
 ```
 
-Nachweise: `tests/580_defer.fi` (fünf Abschnitte, alle drei Baustufen),
+Proofs: `tests/580_defer.fi` (five sections, all three build stages),
 `tests/neg/defer_return.fi`, `tests/neg/defer_break.fi`.
 
-## `comptime` — Funktionen laufen zur Übersetzungszeit (Runde 12)
+## `comptime` -- functions run at compile time (round 12)
 
 ```firn
 fn fakultaet(n: i64) -> i64 {
@@ -847,29 +843,29 @@ fn fakultaet(n: i64) -> i64 {
     return r
 }
 
-const FAK10: i64 = fakultaet(10)     // 3628800 — vom Compiler ausgerechnet
+const FAK10: i64 = fakultaet(10)     // 3628800 -- computed by the compiler
 const GROESSE: usize = fakultaet(5) as usize
-var feld: [u8; 120] = [0 as u8; 120] // GROESSE taugt als Array-Länge
+var feld: [u8; 120] = [0 as u8; 120] // GROESSE serves as an array length
 ```
 
-Schleifen, Verzweigungen, lokale Variablen, **Rekursion** (`fib(20)` im Test).
-Das ist der erste Schritt zu Abnahmepunkt 6: die 697 Web-IDL-Dateien, die
-HTML-Entitäten, die CSS-Tabellen und die Unicode-Daten eines Browsers sind
-**erzeugter Code**.
+Loops, branches, local variables, **recursion** (`fib(20)` in the test).
+This is the first step towards acceptance item 6: the 697 Web IDL files, the
+HTML entities, the CSS tables and the Unicode data of a browser are **generated
+code**.
 
-**Grenzen, die eingehalten werden:** höchstens 2.000.000 Anweisungen und 64
-verschachtelte Aufrufe — ein `comptime` darf den Compiler nicht aufhängen:
+**Limits that are enforced:** at most 2,000,000 statements and 64 nested calls
+-- a `comptime` must not hang the compiler:
 
 ```
-error: comptime: mehr als 2000000 schritte — endlosschleife?
-  --> datei.fi:5:5
+error: comptime: more than 2000000 steps - endless loop?
+  --> file.fi:5:5
 ```
 
-**Noch nicht möglich:** Zeiger, Arrays, Structs, `syscall`, Gleitkomma. Alles
-davon braucht einen Speicher zur Übersetzungszeit. Der Versuch wird gemeldet,
-nicht still falsch übersetzt.
+**Not possible yet:** pointers, arrays, structs, `syscall`, floating point. All
+of those need memory at compile time. The attempt is reported, not compiled
+wrongly in silence.
 
-### `emit` — erzeugter Quelltext (Runde 13)
+### `emit` -- generated source text (round 13)
 
 ```firn
 comptime {
@@ -885,38 +881,38 @@ comptime {
 }
 
 fn main() -> i32 {
-    return tab_gross(97) as i32   // 65 — die Funktion gab es im Quelltext nie
+    return tab_gross(97) as i32   // 65 -- the function never existed in the source
 }
 ```
 
-Der Text wird im **selben Lauf** gelext, geparst und ans Programm angehängt.
-`firnc --emit=comptime` zeigt, was der Compiler dabei vor sich hat:
+The text is lexed, parsed and appended to the program in the **same run**.
+`firnc --emit=comptime` shows what the compiler has in front of it:
 
 ```
 fn tab_gross(c: i64) -> i64 {
     if c == 97 { return 65 }
-    …
+    ...
 ```
 
-Genau so entstehen in einem Browser die Unicode-Tabellen, die CSS-Eigenschaften
-und die Web-IDL-Bindungen.
+This is exactly how the Unicode tables, the CSS properties and the Web IDL
+bindings of a browser come about.
 
-**Ein Kniff:** `emit_roh` braucht keine Zeichenketten im Interpreter — der
-Parser hat `"abc"` schon in ein Array aus Oktetten verwandelt, der Interpreter
-liest es zurück.
+**One trick:** `emit_roh` needs no strings in the interpreter -- the parser has
+already turned `"abc"` into an array of octets, and the interpreter reads it
+back.
 
-### Daten lesen, während der Compiler läuft (Runde 14)
+### Reading data while the compiler runs (round 14)
 
 ```firn
 comptime {
     let n: i64 = datei_groesse("daten/gross_klein.txt")
-    // … Datei byteweise parsen, Zeile für Zeile Code erzeugen …
+    // ... parse the file byte by byte, generate code line by line ...
 }
 ```
 
-`tests/602_comptime_ucd.fi` liest eine Datei im Format von `UnicodeData.txt` —
-semikolongetrennte Felder, Codepunkt in Feld 0, Großschreibung in Feld 12 — und
-erzeugt daraus:
+`tests/602_comptime_ucd.fi` reads a file in the format of `UnicodeData.txt` --
+semicolon-separated fields, the code point in field 0, the upper case mapping in
+field 12 -- and produces from it:
 
 ```
 fn ucd_gross(c: i64) -> i64 {
@@ -928,25 +924,25 @@ fn ucd_gross(c: i64) -> i64 {
 const UCD_ZEILEN: i64 = 5
 ```
 
-**Das ist Abnahmepunkt 6.** Was noch fehlt, ist die Bewährung an der *echten*
-UCD (1,9 MB, alle Kategorien) und ein Bauskript, das sie holt.
+**That is acceptance item 6.** What is still missing is proving it against the
+*real* UCD (1.9 MB, all categories) and a build script that fetches it.
 
-**Sicherheit von Anfang an:** Dateizugriff zur Übersetzungszeit ist ein
-Einfallstor für Lieferketten-Angriffe — eine eingebundene Bibliothek könnte
-sonst beim Bauen `/etc/passwd` lesen und in den erzeugten Code schreiben.
-Deshalb: nur relativ zur Quelldatei, kein `..`, kein absoluter Pfad.
+**Security from the start:** file access at compile time is a way in for supply
+chain attacks -- an included library could otherwise read `/etc/passwd` during
+the build and write it into the generated code. Hence: only relative to the
+source file, no `..`, no absolute path.
 
 ```
-error: comptime: '/etc/passwd' ist ein absoluter pfad — erlaubt sind nur
-       pfade relativ zur quelldatei
-error: comptime: '../geheim.txt' enthaelt '..' — der zugriff bleibt im
-       verzeichnis der quelldatei
+error: comptime: '/etc/passwd' is an absolute path - only paths relative to
+       the source file are allowed
+error: comptime: '../geheim.txt' contains '..' - access stays inside the
+       directory of the source file
 ```
 
-Das ist enger als nötig. Bekommt Firn das Fähigkeitenmodell aus
-`DESIGNZIELE.md` §3, wird daraus eine Erlaubnis, die ein Modul anfordern muss.
+That is stricter than necessary. Once Firn gets the capability model from
+`DESIGN_GOALS.md` 3, it becomes a permission that a module has to request.
 
-## Gleitkomma `f64` (Runde 11)
+## Floating point `f64` (round 11)
 
 ```firn
 fn flaeche(r: f64) -> f64 {
@@ -954,136 +950,134 @@ fn flaeche(r: f64) -> f64 {
 }
 
 let x: f64 = 1.5e-1
-let n: i64 = (2.99 as i64)      // 2 — abschneidend Richtung null
+let n: i64 = (2.99 as i64)      // 2 -- truncating towards zero
 ```
 
-Literale (`1.5`, `1e3`, `1_000.25`), `+ - * /`, alle sechs Vergleiche, `-x`,
-Umwandlungen in beide Richtungen. **29 Prüfungen** in `tests/590_f64.fi`,
-in allen drei Baustufen — darunter NaN, Unendlich und negative Null.
+Literals (`1.5`, `1e3`, `1_000.25`), `+ - * /`, all six comparisons, `-x`,
+conversions in both directions. **29 checks** in `tests/590_f64.fi`,
+in all three build stages -- among them NaN, infinity and negative zero.
 
-**Der Fehler, den IEEE-754 verlangt:** `ucomisd` setzt bei NaN `ZF=PF=CF=1`.
-Der ungeordnete Fall sieht damit aus wie „kleiner oder gleich", und im ersten
-Versuch lieferte `nan < 1.0` **wahr**. Gelöst nicht durch Nachrechnen am
-Paritätsflag, sondern durch **Vertauschen der Operanden**: `a < b` wird als
-`b > a` mit `seta` erzeugt — und `seta`/`setae` sind von sich aus
-ungeordnet-sicher.
+**The bug that IEEE 754 demands:** `ucomisd` sets `ZF=PF=CF=1` for NaN. The
+unordered case therefore looks like "less than or equal", and on the first
+attempt `nan < 1.0` returned **true**. Solved not by recomputing from the parity
+flag, but by **swapping the operands**: `a < b` is emitted as `b > a` with
+`seta` -- and `seta`/`setae` are unordered-safe by themselves.
 
-**Zwei Einschränkungen, klar benannt:**
+**Two restrictions, clearly named:**
 
-* **Keine Registerzuteilung für `f64`** — der Linear Scan kennt nur die
-  Ganzzahlregister. Jede Funktion mit `f64` geht über den Grundpfad: korrekt,
-  aber ohne Registerzuteilung und damit langsam.
-* **Eigenes ABI** — `f64` wird als Bitmuster in Ganzzahlregistern übergeben,
-  nicht in `xmm0`–`xmm7`. Innerhalb von Firn durchgängig; für fremde
-  Bibliotheken wäre es falsch. Firn ruft heute nichts Fremdes auf.
+* **No register allocation for `f64`** -- the linear scan only knows the integer
+  registers. Every function with `f64` goes through the baseline path: correct,
+  but without register allocation and therefore slow.
+* **An ABI of its own** -- `f64` is passed as a bit pattern in integer
+  registers, not in `xmm0`-`xmm7`. Consistent within Firn; for foreign libraries
+  it would be wrong. Firn does not call anything foreign today.
 
-Beides gehört zusammen und braucht dieselbe SSE-Registerklasse.
+The two belong together and need the same SSE register class.
 
-**Kein `f32`** — deshalb sind Gleitkommaliterale nicht typlos: `1.5` ist immer
-`f64`. Kein `%` (wäre `fmod`), keine Bitoperationen auf Gleitkomma, keine
-implizite Umwandlung.
+**No `f32`** -- which is why floating point literals are not typeless: `1.5` is
+always `f64`. No `%` (that would be `fmod`), no bit operations on floating
+point, no implicit conversion.
 
-## Speichermodell: Opt-in-Tracing-GC und der DOM-Dauerlauf (Runde 4)
+## Memory model: the opt-in tracing GC and the DOM soak test (round 4)
 
-Die wichtigste offene Designfrage aus `DESIGNZIELE.md` ist entschieden **und
-belegt**: ein **Opt-in**-Tracing-GC. Opt-in heißt, dass Tokenizer, Rasterizer
-und Krypto ihn nicht bezahlen — `#[no_gc]` macht das zu einer geprüften Zusage
-statt zu einer Absichtserklärung.
+The most important open design question from `DESIGN_GOALS.md` is decided **and
+demonstrated**: an **opt-in** tracing GC. Opt-in means that the tokenizer, the
+rasterizer and the crypto code do not pay for it -- `#[no_gc]` turns that into a
+checked promise instead of a declaration of intent.
 
 ```firn
 gc class Node {
-    eltern: Gc[Node],        // stark, in BEIDE Richtungen — echter Zyklus
+    eltern: Gc[Node],        // strong, in BOTH directions -- a real cycle
     erstes_kind: Gc[Node],
     listener: Gc[Listener],
 }
 gc class Element extends Node { attr_zahl: u32 }
 
 fn baue() -> AllocError!Gc[Element] {
-    let e = try gc Element{ … }     // Allokation darf fehlschlagen
+    let e = try gc Element{ ... }   // the allocation may fail
     return e
 }
 ```
 
-Selbst nachprüfen:
+Check it yourself:
 
 ```
-$ bash tools/dom_soak/run.sh                    # Standard: 600 s je Fassung
-$ SOAK_SEK=12 SOAK_ZYKLEN=400000 bash tools/dom_soak/run.sh    # kurz
+$ bash tools/dom_soak/run.sh                    # default: 600 s per version
+$ SOAK_SEK=12 SOAK_ZYKLEN=400000 bash tools/dom_soak/run.sh    # short
 ```
 
-Der Lauf baut fortlaufend **echte DOM-Zyklen** (Eltern↔Kind, Knoten↔Listener,
-Knoten↔JS-Wrapper, live Sammlung, schwacher Observer) und misst den **echten
-Speicherverbrauch des Prozesses** aus `/proc/self/statm` — nicht die
-Selbstauskunft der Laufzeit.
+The run continuously builds **real DOM cycles** (parent<->child,
+node<->listener, node<->JS wrapper, a live collection, a weak observer) and
+measures the **real memory consumption of the process** from `/proc/self/statm`
+-- not the runtime's own account of itself.
 
-| | GC-Fassung | Zählverweis-Gegenprobe |
+| | GC version | reference-counting counter-check |
 |---|---|---|
-| Zyklensätze | 100.000.000 | 2.000.000 |
-| DOM-Objekte | 700.000.000 | 14.000.000 |
-| **RSS am Ende** | **1.364 KiB** | **750.080 KiB** |
-| RSS-Verlauf | konstant über 1.001 Stichproben | linear steigend |
-| lebende Objekte | 8–12 | 12.000.000 |
+| cycle sets | 100,000,000 | 2,000,000 |
+| DOM objects | 700,000,000 | 14,000,000 |
+| **RSS at the end** | **1,364 KiB** | **750,080 KiB** |
+| RSS curve | constant over 1,001 samples | rising linearly |
+| live objects | 8-12 | 12,000,000 |
 
-Die Gegenprobe (`lib/dom/soak_leak.fi`) läuft **bei jedem Testlauf mit** und
-**muss** lecken; bleibt sie grün, bricht `run.sh` ab. Eine Messung, die ein Leck
-gar nicht anzeigen kann, ist keine Messung. Ihr Zähler ist korrekt — sie gibt
-die eine Struktur ohne Rückverweis jedes Mal frei und scheitert ausschließlich
-an den Zyklen.
+The counter-check (`lib/dom/soak_leak.fi`) runs **on every test run** and
+**has to** leak; if it stays green, `run.sh` aborts. A measurement that cannot
+show a leak at all is not a measurement. Its counter is correct -- it frees the
+one structure without a back reference every time and fails exclusively on the
+cycles.
 
-**Ehrlich dazu:** der 24-Stunden-Lauf aus der Abnahme steht aus, Fragmentierung
-bei wechselnden Objektgrößen ist ungeprüft, und der konservative Stapelscan hat
-einen messbaren Preis — eine alte Zeigerkopie in einem **lebenden** Rahmen hält
-ihr Objekt am Leben. `docs/berichte/dom.md` beschreibt beides mit Messwerten.
+**Honestly about it:** the 24 hour run from the acceptance is outstanding,
+fragmentation with changing object sizes is unchecked, and the conservative
+stack scan has a measurable price -- an old pointer copy in a **live** frame
+keeps its object alive. `docs/berichte/dom.md` describes both with measurements.
 
-## Verzeichnisse
+## Directories
 
 ```
-RUN.md                   wie man alles baut, startet und nachmisst
-SPEC.md, ROADMAP.md      Sprachspezifikation und Fahrplan (Vertrag)
-tools/build_stages/         misst dev / dev-fast / release gegeneinander
-tools/schichten/         Architekturwaechter: Feldzugriff <-> Speicherort
-tools/ergebnisort/       prueft die Ergebnisort-Garantie am Assembler
-DESIGNZIELE.md           10 Fundamententscheidungen (async-Farben, fehlbare
-                         Allokation, Capabilities, ABI, Debug-Bau, In-Place-
-                         Init, comptime/Reflexion, SoA-Layout, Hot Reload)
-ABNAHME.md               die sechs Abnahmepunkte mit echten Messwerten
-docs/FIR.md              die eigene IR: Instruktionen, Typen, Invarianten
-docs/DEBUGGER.md         .debug_line + wörtlich kopierte gdb-Sitzung
-docs/SELBSTHOSTING.md    was heute schon in Firn geschrieben werden könnte
-compiler/src/            29 Module: config.rs main.rs lexer.rs ast.rs parser.rs
+RUN.md                   how to build everything, run it and measure it
+SPEC.md, ROADMAP.md      language specification and roadmap (the contract)
+tools/build_stages/         measures dev / dev-fast / release against each other
+tools/schichten/         architecture guard: field access <-> storage location
+tools/ergebnisort/       checks the result-location guarantee in the assembly
+DESIGN_GOALS.md          10 foundation decisions (async colours, fallible
+                         allocation, capabilities, ABI, debug build, in-place
+                         init, comptime/reflection, SoA layout, hot reload)
+ACCEPTANCE.md               the six acceptance items with real measurements
+docs/FIR.md              the own IR: instructions, types, invariants
+docs/DEBUGGER.md         .debug_line + a gdb session copied verbatim
+docs/SELBSTHOSTING.md    what could already be written in Firn today
+compiler/src/            29 modules: config.rs main.rs lexer.rs ast.rs parser.rs
                          diag.rs types.rs sema.rs sema_match.rs sema_generic.rs
                          errors.rs attrs.rs mono.rs modules.rs abi.rs fir.rs
                          layout.rs lower.rs lower_match.rs lower_errors.rs
                          ct.rs opt.rs mem2reg.rs inline.rs regalloc.rs dwarf.rs
                          strings.rs codegen_x86.rs codegen_switch.rs
-lib/str/, lib/num/       Firn-Bibliothek: Bytes/Str/Str16/Atom, strtod/dtoa
-lib/html/                HTML5-Tokenizer IN FIRN (8.647 Zeilen .fi)
-tools/tokenizer/         Werkbank: Harness gegen html5lib, Durchsatzmessung,
-                         verifiziere_testdaten.sh (sha256 der 14 .test-Dateien)
-bench/tokenizer/         html5ever als Messlatte (eigenes Cargo-Projekt)
-tests/                   122 Programme + tests/opt (13) + tests/neg (46)
+lib/str/, lib/num/       the Firn library: Bytes/Str/Str16/Atom, strtod/dtoa
+lib/html/                the HTML5 tokenizer IN FIRN (8,647 lines of .fi)
+tools/tokenizer/         workbench: harness against html5lib, throughput,
+                         verifiziere_testdaten.sh (sha256 of the 14 .test files)
+bench/tokenizer/         html5ever as a yardstick (a Cargo project of its own)
+tests/                   122 programs + tests/opt (13) + tests/neg (46)
 examples/                hello.fi fib.fi bubblesort.fi structs.fi
-bench/                   6 Mikrobenchmarks, doppelt (Firn + Rust), run.sh
-tools/testrunner/        Testrunner mit --format=json (CI)
-tools/strlib/            Einbinder für lib/*.fi (erzeugt tests/300…308)
-tools/dtoa_vectors/      100.000-Doubles-Rundlauf gegen Rust als Messlatte
-testdata/html5lib-tokenizer/  Tokenizer-Suite, unveraendert (6.810 Faelle)
-testdata/realweb/        8 gespeicherte echte Seiten (~4,7 MB) — Messkorpus B
-test.sh                  gesamte Testsuite (baut, führt aus, vergleicht)
-test_opt.sh              Vorher/Nachher-Nachweis des Optimierers
+bench/                   6 microbenchmarks, in duplicate (Firn + Rust), run.sh
+tools/testrunner/        test runner with --format=json (CI)
+tools/strlib/            generator for lib/*.fi (produces tests/300...308)
+tools/dtoa_vectors/      100,000 doubles round trip against Rust as a yardstick
+testdata/html5lib-tokenizer/  tokenizer suite, unchanged (6,810 cases)
+testdata/realweb/        8 saved real pages (~4.7 MB) -- measurement corpus B
+test.sh                  the whole test suite (builds, runs, compares)
+test_opt.sh              before/after proof of the optimizer
 ```
 
-Der Sprachname steht ausschließlich in `compiler/src/config.rs`
-(`LANG_NAME`, `LANG_NAME_LOWER`, `FILE_EXT`) — Umbenennen = drei Konstanten.
+The language name is exclusively in `compiler/src/config.rs`
+(`LANG_NAME`, `LANG_NAME_LOWER`, `FILE_EXT`) -- renaming = three constants.
 
-## Summentypen, Musterabgleich und Generics (Modul `types`, Runde 2)
+## Sum types, pattern matching and generics (module `types`, round 2)
 
-Umgesetzt sind `enum` mit Nutzdaten, `match` mit Vollständigkeitsprüfung zur
-Übersetzungszeit, Sprungtabellen im Codegenerator und Generics per
-Monomorphisierung. Die bewussten Einschränkungen stehen in `SPEC.md` §14.1
-unter `14.1.types` (T1–T8) — insbesondere: `match` ist eine **Anweisung**,
-Aufzählungen liegen nicht dem Wert nach in Structs, und generisch sind nur
-Funktionen und Structs.
+What is implemented: `enum` with payload, `match` with an exhaustiveness check at
+compile time, jump tables in the code generator and generics by
+monomorphization. The deliberate restrictions are in `SPEC.md` 14.1 under
+`14.1.types` (T1-T8) -- in particular: `match` is a **statement**, enumerations
+do not live inside structs by value, and only functions and structs are generic.
 
 ```firn
 enum Wert { Nichts, Zahl(i32), Paar(i32, i32) }
@@ -1106,162 +1100,163 @@ fn main() -> i32 {
 }
 ```
 
-* **Layout einer Aufzählung:** `__tag: u32` bei Offset 0, Nutzdaten ab
-  `round_up(4, ausrichtung)`, Varianten überlagern sich (echte Vereinigung).
-  Nachweis: `cargo test --release --manifest-path compiler/Cargo.toml
+* **Layout of an enumeration:** `__tag: u32` at offset 0, the payload from
+  `round_up(4, alignment)` on, the variants overlap (a real union).
+  Proof: `cargo test --release --manifest-path compiler/Cargo.toml
   sema_match::tests::layout_tag_und_nutzdaten`.
-* **Vollständigkeit ist ein Fehler, kein Hinweis.** `tests/neg/match_*.fi`
-  belegt: fehlende Variante (mit Namen), fehlender `_`-Fall bei Ganzzahlen,
-  unbekannte Variante, unerreichbarer Fall — jeweils mit Zeile:Spalte.
-* **Sprungtabelle:** ab 8 Marken und ≥ 40 % Dichte erzeugt
-  `compiler/src/codegen_switch.rs` eine `.rodata`-Tabelle mit
-  `jmp qword ptr [rdx + rax*8]` statt einer Vergleichskette.
-  Selbst nachprüfen:
+* **Exhaustiveness is an error, not a hint.** `tests/neg/match_*.fi` shows: a
+  missing variant (by name), a missing `_` case for integers, an unknown
+  variant, an unreachable case -- each with line:column.
+* **Jump table:** from 8 tags and a density of >= 40 % on,
+  `compiler/src/codegen_switch.rs` produces a `.rodata` table with
+  `jmp qword ptr [rdx + rax*8]` instead of a comparison chain.
+  Check it yourself:
 
   ```bash
   compiler/target/release/firnc --emit=asm -o /tmp/zm.s tests/230_zustandsmaschine.fi
-  grep -c "jmp qword ptr" /tmp/zm.s     # 1  (Zustandsmaschine mit 32 Zuständen)
-  grep -c "^	cmp"        /tmp/zm.s     # 0  (keine Vergleichskette)
+  grep -c "jmp qword ptr" /tmp/zm.s     # 1  (state machine with 32 states)
+  grep -c "^	cmp"        /tmp/zm.s     # 0  (no comparison chain)
   ```
 
-  Automatisch geprüft von
-  `codegen_switch::tests::sprungtabelle_bei_30_zustaenden`.
-* **Generics:** `fn f[T: Int](..)`, `struct Vec[T] { .. }`, Aufruf `f[i32](..)`,
-  Typ `Vec[i32]`, Literal `Vec[i32]{ .. }`. Monomorphisierung erzeugt Namen
-  nach dem Vertrag `name__T1_T2` (z. B. `vec_push__i32`, `Map__u32_i32`).
-  Beispiele: `tests/210_generic_fn.fi`, `tests/211_generic_struct.fi` (Vec[T]),
-  `tests/212_generic_map.fi` (Hash-Abbildung `Map[K, V]`, offene Adressierung).
-  Nicht erfüllte Anforderungen, falsche Anzahl Typargumente und generische
-  Namen ohne `[..]` sind Fehler mit Zeile:Spalte (`tests/neg/generic_*.fi`).
+  Checked automatically by
+  `codegen_switch::tests::jump_table_at_30_states`.
+* **Generics:** `fn f[T: Int](..)`, `struct Vec[T] { .. }`, the call `f[i32](..)`,
+  the type `Vec[i32]`, the literal `Vec[i32]{ .. }`. Monomorphization produces
+  names following the contract `name__T1_T2` (for example `vec_push__i32`,
+  `Map__u32_i32`). Examples: `tests/210_generic_fn.fi`,
+  `tests/211_generic_struct.fi` (Vec[T]), `tests/212_generic_map.fi` (the hash
+  map `Map[K, V]`, open addressing). Unmet requirements, a wrong number of type
+  arguments and generic names without `[..]` are errors with line:column
+  (`tests/neg/generic_*.fi`).
 
-Testprogramme dieses Moduls: `tests/200_enum_basic.fi`,
+Test programs of this module: `tests/200_enum_basic.fi`,
 `tests/201_enum_payload.fi`, `tests/202_match_int_range.fi`,
 `tests/203_match_nested.fi`, `tests/204_match_bool.fi`,
 `tests/210..212_generic_*.fi`, `tests/230_zustandsmaschine.fi`;
-Negativtests `tests/neg/match_*.fi`, `tests/neg/generic_*.fi`.
-Alle laufen mit **und** ohne `--no-opt` mit demselben Ergebnis.
+negative tests `tests/neg/match_*.fi`, `tests/neg/generic_*.fi`.
+All of them run with **and** without `--no-opt` with the same result.
 
 
-## Zeichenketten und Zahlen ↔ Text (Modul `str`, Runde 2)
+## Strings and numbers <-> text (module `str`, round 2)
 
-Umgesetzt ist SPEC §8 (`Z1`–`Z6`) — die vier getrennten Typen, WTF-16 **ohne
-jede Prüfung**, korrekt gerundetes `strtod` und kürzeste Double-Ausgabe mit
-Rückwandlungsgarantie. Die Bibliothek liegt in `lib/str/` und `lib/num/` und
-ist in **Firn** geschrieben; im Compiler steckt nur der Literalpfad
-(`compiler/src/strings.rs`).
+What is implemented is SPEC 8 (`Z1`-`Z6`) -- the four separate types, WTF-16
+**without any check at all**, correctly rounded `strtod` and shortest double
+output with a round-trip guarantee. The library lies in `lib/str/` and
+`lib/num/` and is written in **Firn**; only the literal path sits in the
+compiler (`compiler/src/strings.rs`).
 
-| Typ | Inhalt | geprüft? | Datei |
+| Type | Contents | checked? | File |
 |---|---|---|---|
-| `Bytes` | rohe Oktette | nein | `lib/str/bytes.fi` |
-| `Str` | UTF-8 | ja, an der Grenze (`bytes_is_str`) | `lib/str/bytes.fi` |
-| `Str16` | `u16`-Codeeinheiten (WTF-16) | **nichts** | `lib/str/str16.fi` |
-| `Atom` | `u32`, interniert | — | `lib/str/atom.fi` |
+| `Bytes` | raw octets | no | `lib/str/bytes.fi` |
+| `Str` | UTF-8 | yes, at the boundary (`bytes_is_str`) | `lib/str/bytes.fi` |
+| `Str16` | `u16` code units (WTF-16) | **nothing** | `lib/str/str16.fi` |
+| `Atom` | `u32`, interned | -- | `lib/str/atom.fi` |
 
-Layout wie in SPEC §8.1 festgelegt: `{ ptr, len, cap }`, `len`/`cap` in
-Elementen. Umwandlungen sind ausdrücklich und ihre Fehlbarkeit steht im
-Ergebnis (`lib/str/utf8.fi`): `str16_to_utf8` → `bool`,
-`str16_to_utf8_lossy` → U+FFFD, `str16_to_wtf8`/`wtf8_to_str16` → verlustfrei.
+The layout is as fixed in SPEC 8.1: `{ ptr, len, cap }`, with `len`/`cap` in
+elements. Conversions are explicit and their fallibility shows up in the result
+(`lib/str/utf8.fi`): `str16_to_utf8` -> `bool`,
+`str16_to_utf8_lossy` -> U+FFFD, `str16_to_wtf8`/`wtf8_to_str16` -> lossless.
 
-### Ungepaarte Surrogate — selbst nachprüfen
+### Unpaired surrogates -- check it yourself
 
 ```bash
 compiler/target/release/firnc -o /tmp/t300 tests/300_str16_surrogate.fi && /tmp/t300
 # 3 97 55296 98 0 0 5 97 239 191 189 98 5 97 237 160 128 98 1 55296
-#   |  |     |  |  |  |                  |                    |  ^ nach WTF-8-Rundlauf wieder 0xD800
+#   |  |     |  |  |  |                  |                    |  ^ 0xD800 again after the WTF-8 round trip
 #   |  |     |  |  |  ^ to_utf8_lossy: 'a' EF BF BD 'b'        ^ WTF-8: 'a' ED A0 80 'b'
-#   |  |     |  ^ to_utf8() liefert false und ein LEERES Ziel
-#   |  ^ das einzelne 0xD800 (55296) bleibt erhalten
-#   ^ Länge 3
+#   |  |     |  ^ to_utf8() returns false and an EMPTY target
+#   |  ^ the lone 0xD800 (55296) is preserved
+#   ^ length 3
 ```
 
-Der Literalpfad im Compiler ist ohne Quelldatei prüfbar:
+The literal path in the compiler can be checked without a source file:
 
 ```bash
-compiler/target/release/firnc '--strlit=u"a\uD800"'   # Str16: 0061 D800, to_utf8 nichts
-compiler/target/release/firnc '--strlit="a\uD800"'    # Fehler: ungepaartes Surrogat in Str
+compiler/target/release/firnc '--strlit=u"a\uD800"'   # Str16: 0061 D800, to_utf8 nothing
+compiler/target/release/firnc '--strlit="a\uD800"'    # error: unpaired surrogate in Str
 compiler/target/release/firnc '--strlit=b"AB\xff"'    # Bytes: 41 42 FF
 ```
 
-Der API-Vertrag mit dem Modul `tok` (`str16_new`, `str16_push`, `str16_len`,
-`str16_at`, `atom_intern`) steht in `tests/308_str16_api.fi`. `str16_new()`
-liefert ein Aggregat als Rückgabewert; wer ohne auskommen muss, nimmt
+The API contract with the module `tok` (`str16_new`, `str16_push`, `str16_len`,
+`str16_at`, `atom_intern`) is in `tests/308_str16_api.fi`. `str16_new()`
+returns an aggregate as its return value; whoever has to do without it takes
 `str16_init(&s)`.
 
 ### `strtod` / `dtoa`
 
-Beide liegen in `lib/num/` und rechnen in **exakter Großzahlarithmetik**
-(`lib/num/bignum.fi`): `strtod` skaliert den Bruch `D · 10^exp` so, dass der
-Quotient genau 53 bit hat, und rundet aus dem Rest zur nächsten — bei genau
-halbem Abstand zur geraden — Mantisse. `dtoa` ist Dragon4 im freien Format
-(Ryū/Grisu-Klasse: dieselbe Ziffernfolge, anderer Weg) mit
-ECMAScript-Schreibweise.
+Both live in `lib/num/` and compute in **exact big number arithmetic**
+(`lib/num/bignum.fi`): `strtod` scales the fraction `D * 10^exp` so that the
+quotient has exactly 53 bits, and rounds from the remainder to the nearest --
+at exactly half distance to the even -- mantissa. `dtoa` is Dragon4 in free
+format (Ryu/Grisu class: the same digit sequence, a different route) with
+ECMAScript notation.
 
-**Die Sprache hat noch keinen Gleitkommatyp** — beide arbeiten deshalb auf dem
-`u64`-**Bitmuster** des `binary64`. Das ist keine Abkürzung (die Rechnung ist
-ohnehin ganzzahlig), aber eine ehrlich geführte Abweichung: SPEC §14.1.str S2.
+**The language has no floating point type yet** -- which is why both work on the
+`u64` **bit pattern** of the `binary64`. That is not a shortcut (the computation
+is integer anyway), but a deviation carried honestly: SPEC 14.1.str S2.
 
-Gemessen am 13.08.2026 (dieser Rechner, `cargo build --release`):
+Measured on 2026-08-13 (this machine, `cargo build --release`):
 
-| Prüfung | Befehl | Ergebnis |
+| Check | Command | Result |
 |---|---|---|
-| 26 `strtod`-Härtefälle (0.1, 1e23, 5e-324, 9007199254740993, 2.2250738585072011e-308, …) | `tests/304_strtod_hardcases.fi` | **26/26 bitgenau** |
-| 28 `dtoa`-Härtefälle inkl. ±0, ±Infinity, NaN | `tests/305_dtoa_hardcases.fi` | **28/28 wie ECMAScript** |
-| 100.000 Zufalls-Doubles: f64 → Text → f64 | `bash tools/dtoa_vectors/run.sh 100000 12345` | **100.000/100.000 bitgleich** |
-| dieselben 100.000 gegen Rusts kürzeste Darstellung | dito, Schritt 4 | **100.000/100.000 identisch**, 13,9 s |
+| 26 `strtod` hard cases (0.1, 1e23, 5e-324, 9007199254740993, 2.2250738585072011e-308, ...) | `tests/304_strtod_hardcases.fi` | **26/26 bit-exact** |
+| 28 `dtoa` hard cases including +/-0, +/-Infinity, NaN | `tests/305_dtoa_hardcases.fi` | **28/28 as in ECMAScript** |
+| 100,000 random doubles: f64 -> text -> f64 | `bash tools/dtoa_vectors/run.sh 100000 12345` | **100,000/100,000 bit-identical** |
+| the same 100,000 against Rust's shortest representation | ditto, step 4 | **100,000/100,000 identical**, 13.9 s |
 
-`tools/dtoa_vectors/gen.rs` ist **Messlatte, nicht Abhängigkeit**: der Compiler
-selbst hat weiterhin keine einzige fremde Kiste.
+`tools/dtoa_vectors/gen.rs` is a **yardstick, not a dependency**: the compiler
+itself still has not a single foreign crate.
 
-### Wie die Testprogramme entstehen
+### How the test programs come about
 
-Stufe 0 hat kein Modulsystem und keine Zeichenkettenliterale. `tools/strlib/expand.py`
-löst `//#include lib/...` und `//#str name text` auf und erzeugt daraus die
-eigenständigen Programme `tests/300..307_*.fi`, `tests/neg/str*.fi` und
-`tools/dtoa_vectors/dtoa_stream.fi`. Die erzeugten Dateien liegen im Baum,
-`test.sh` braucht das Werkzeug also nicht:
+Stage 0 has no module system and no string literals. `tools/strlib/expand.py`
+resolves `//#include lib/...` and `//#str name text` and produces the
+self-contained programs `tests/300..307_*.fi`, `tests/neg/str*.fi` and
+`tools/dtoa_vectors/dtoa_stream.fi` from them. The generated files lie in the
+tree, so `test.sh` does not need the tool:
 
 ```bash
-python3 tools/strlib/expand.py --check   # sind die erzeugten Dateien aktuell?
-python3 tools/strlib/expand.py --all     # neu erzeugen
+python3 tools/strlib/expand.py --check   # are the generated files up to date?
+python3 tools/strlib/expand.py --all     # regenerate them
 ```
 
-### Was fehlt (ehrlich)
+### What is missing (honestly)
 
-* Zeichenkettenliterale sind im Compiler fertig, aber **nicht im Lexer
-  verdrahtet** — in `.fi`-Quelltext gibt es sie noch nicht (SPEC §14.1.str S1).
-* Kein `f64` in der Sprache (S2), kein eigener `Wtf8`-Typ (S5), kein `Rope`
-  (S6), Atomnummern erst zur Laufzeit statt zur Bauzeit (S7).
+* String literals are finished in the compiler, but **not wired into the
+  lexer** -- they do not exist in `.fi` source text yet (SPEC 14.1.str S1).
+* No `f64` in the language (S2), no `Wtf8` type of its own (S5), no `Rope`
+  (S6), atom numbers only at run time instead of at build time (S7).
 
-## Optimierer, Registerzuteilung und Leistung (Modul `opt`, Runde 2)
+## Optimizer, register allocation and performance (module `opt`, round 2)
 
-Dateien: `compiler/src/opt.rs` (Steuerung, Faltung, DCE, CSE, Bereichsprüfungen),
-`compiler/src/mem2reg.rs` (Speicher→Wert, Kopierfortpflanzung,
-Blockverschmelzung), `compiler/src/inline.rs` (Inlining),
-`compiler/src/regalloc.rs` (Registerzuteilung + registerbewusste Emission),
+Files: `compiler/src/opt.rs` (control, folding, DCE, CSE, bounds checks),
+`compiler/src/mem2reg.rs` (memory to value, copy propagation, block merging),
+`compiler/src/inline.rs` (inlining),
+`compiler/src/regalloc.rs` (register allocation + register-aware emission),
 `tests/opt/**`, `test_opt.sh`, `bench/**`.
 
-### Was der Optimierer jetzt tut
+### What the optimizer does now
 
-| Durchgang | Wirkung | selbst nachprüfen |
+| Pass | Effect | check it yourself |
 |---|---|---|
-| Konstantenfaltung | wie Runde 1, unverändert | `tests/opt/fold_*.fi` |
-| **mem2reg** | `alloca`, die **einmal** geschrieben wird und deren `store` alle `load`s **dominiert**, verschwindet | `tests/opt/mem2reg_single_store.fi`: `load.i32` 3 → 0 |
-| **tote Speicherung** | `alloca`, aus der nie gelesen wird, samt aller `store`s | `tests/opt/dead_store.fi`: `store.i32` 3 → 0, `alloca` 1 → 0 |
-| lokale Speicherweiterleitung | `store p,v; … ; load p` → `v` (blockintern, konservativ bei Aufruf/Store) | `mem2reg::tests::load_nach_store_*` |
-| Kopierfortpflanzung | Identitäts-`cast`, `x+0`, `x*1`, `x*0`, `ptradd p,0`, … | `mem2reg::tests::algebraische_identitaeten` |
-| **CSE** entlang des Dominatorbaums | gleicher reiner Ausdruck wird einmal berechnet | `tests/opt/cse_common.fi`: `mul.i32` 2 → 1 |
-| **Blockverschmelzung** + Sprungfädelung | leere `br`-Blöcke weg, Ketten verschmolzen | `tests/opt/block_merge.fi`: 8 Blöcke → 1 |
-| **Inlining** mit Größenheuristik | ≤ 40 Instruktionen, ≤ 8 Blöcke, keine Rekursion, nicht in/aus `#[constant_time]` | `tests/opt/inline_call.fi`: `call @quadrat` 1 → 0 |
-| **wiederholte Bedingungen** | `brcond` auf einer schon entschiedenen Bedingung → `br` | `tests/opt/redundant_check.fi`: `brcond` 3 → 2 |
-| **Registerzuteilung** (linear scan) | Lebendigkeitsintervalle, gewichtete Auslagerung, callee-saved korrekt gesichert | `tests/opt/regalloc_loop.fi`, siehe unten |
+| constant folding | as in round 1, unchanged | `tests/opt/fold_*.fi` |
+| **mem2reg** | an `alloca` that is written **once** and whose `store` **dominates** all `load`s disappears | `tests/opt/mem2reg_single_store.fi`: `load.i32` 3 -> 0 |
+| **dead store** | an `alloca` that is never read from, together with all its `store`s | `tests/opt/dead_store.fi`: `store.i32` 3 -> 0, `alloca` 1 -> 0 |
+| local store forwarding | `store p,v; ... ; load p` -> `v` (within a block, conservative around calls/stores) | `mem2reg::tests::load_nach_store_*` |
+| copy propagation | identity `cast`, `x+0`, `x*1`, `x*0`, `ptradd p,0`, ... | `mem2reg::tests::algebraic_identities` |
+| **CSE** along the dominator tree | the same pure expression is computed once | `tests/opt/cse_common.fi`: `mul.i32` 2 -> 1 |
+| **block merging** + jump threading | empty `br` blocks gone, chains merged | `tests/opt/block_merge.fi`: 8 blocks -> 1 |
+| **inlining** with a size heuristic | <= 40 instructions, <= 8 blocks, no recursion, not into or out of `#[constant_time]` | `tests/opt/inline_call.fi`: `call @quadrat` 1 -> 0 |
+| **repeated conditions** | a `brcond` on an already decided condition -> `br` | `tests/opt/redundant_check.fi`: `brcond` 3 -> 2 |
+| **register allocation** (linear scan) | live intervals, weighted spilling, callee-saved correctly saved | `tests/opt/regalloc_loop.fi`, see below |
 
-`Op::Select`, `Op::Barrier`, `Op::SecureZero` und jeder Wert aus `f.secret`
-werden von **keinem** Durchgang verändert, ersetzt oder entfernt; ein `select`
-wird nie zu einer Verzweigung (SPEC §9.2). Dafür gibt es eigene Tests
-(`mem2reg::tests::secret_werte_bleiben_unangetastet`,
-`select_bleibt_select`, `regalloc::tests::select_bleibt_cmov_auch_mit_registern`).
+`Op::Select`, `Op::Barrier`, `Op::SecureZero` and every value in `f.secret` are
+changed, replaced or removed by **no** pass; a `select` never becomes a branch
+(SPEC 9.2). There are tests of their own for that
+(`mem2reg::tests::secret_values_stay_untouched`,
+`select_stays_select`, `regalloc::tests::select_stays_cmov_also_with_registers`).
 
-### Registerzuteilung — der Nachweis
+### Register allocation -- the proof
 
 ```
 firnc --emit=asm -o /tmp/ra.s tests/opt/regalloc_loop.fi
@@ -1280,108 +1275,110 @@ sed -n '/^\.Lsumme__bb2:/,/^\.Lsumme__bb3:/p' /tmp/ra.s
     jmp .Lsumme__bb1
 ```
 
-Kein einziger `[rbp-…]`-Zugriff im Schleifenrumpf; Zähler und Summe liegen in
-`r9`/`r10`. `bash test_opt.sh` prüft genau das automatisch (und dass jedes
-benutzte callee-saved Register gesichert **und** zurückgeholt wird).
+Not a single `[rbp-...]` access in the loop body; the counter and the sum lie in
+`r9`/`r10`. `bash test_opt.sh` checks exactly that automatically (and that every
+callee-saved register in use is saved **and** restored).
 
-Verfahren: Lebendigkeitsanalyse je Block (`live_in`/`live_out`), daraus ein
-Intervall je Wert, **linear scan** mit aktiver Liste; reicht der Vorrat nicht,
-räumt das aktive Intervall mit dem kleinsten Gewicht (Verwendungen ×
-Schleifentiefe) das Register. Vergeben werden `rbx`, `r12`–`r15` (callee-saved,
-über Aufrufe hinweg) und `r8`–`r11` (nur für Intervalle, die keinen
-`call`/`syscall` einschließen). `rax`, `rcx`, `rdx`, `rsi`, `rdi` bleiben
-Arbeitsregister. Zusätzlich hält der Zuteiler nicht entkommende `alloca`-Zellen
-(≤ 8 Byte, einheitliche Zugriffsbreite) dauerhaft in einem Register — das
-ersetzt die Phi-Knoten, die FIR nicht hat (SPEC §14.1.opt O3).
+The method: liveness analysis per block (`live_in`/`live_out`), from it one
+interval per value, a **linear scan** with an active list; if the supply is not
+enough, the active interval with the smallest weight (uses x loop depth) gives
+up its register. Handed out are `rbx`, `r12`-`r15` (callee-saved, across calls)
+and `r8`-`r11` (only for intervals that do not enclose a `call`/`syscall`).
+`rax`, `rcx`, `rdx`, `rsi`, `rdi` stay working registers. In addition the
+allocator keeps non-escaping `alloca` cells (<= 8 bytes, uniform access width)
+permanently in a register -- that replaces the phi nodes that FIR does not have
+(SPEC 14.1.opt O3).
 
-### Leistung gegen Rust — ehrlich gemessen, Ziel **verfehlt**
+### Performance against Rust -- honestly measured, target **missed**
 
-`bash bench/run.sh` (6 Mikrobenchmarks, jeder **doppelt**: `bench/firn/*.fi`
-und `bench/rust/*.rs` mit `rustc -O` und `black_box`; beide geben ihr Ergebnis
-aus, und die Messung bricht ab, wenn die Ausgaben nicht übereinstimmen).
-Median aus 7 Läufen, AMD EPYC 7571, rustc 1.99.0-nightly, 13.08.2026:
+`bash bench/run.sh` (6 microbenchmarks, each **in duplicate**: `bench/firn/*.fi`
+and `bench/rust/*.rs` with `rustc -O` and `black_box`; both print their result,
+and the measurement aborts if the outputs do not match).
+Median of 7 runs, AMD EPYC 7571, rustc 1.99.0-nightly, 2026-08-13:
 
-| Benchmark | Firn | Firn `--no-opt` | Rust `-O` | Faktor Firn/Rust |
+| Benchmark | Firn | Firn `--no-opt` | Rust `-O` | Factor Firn/Rust |
 |---|---:|---:|---:|---:|
-| fib (rekursiv) | 0,049 s | 0,143 s | 0,031 s | **1,57×** |
-| sieve (5 Mio.) | 0,117 s | 1,115 s | 0,029 s | **4,08×** |
-| matmul 240³ | 0,122 s | 2,061 s | 0,025 s | **4,95×** |
-| bytecount 16 MiB | 0,509 s | 5,244 s | 0,181 s | **2,81×** |
-| bubblesort 6000 | 0,102 s | 1,304 s | 0,038 s | **2,68×** |
-| statemachine 8 MiB | 0,225 s | 1,247 s | 0,083 s | **2,70×** |
+| fib (recursive) | 0.049 s | 0.143 s | 0.031 s | **1.57x** |
+| sieve (5 million) | 0.117 s | 1.115 s | 0.029 s | **4.08x** |
+| matmul 240^3 | 0.122 s | 2.061 s | 0.025 s | **4.95x** |
+| bytecount 16 MiB | 0.509 s | 5.244 s | 0.181 s | **2.81x** |
+| bubblesort 6000 | 0.102 s | 1.304 s | 0.038 s | **2.68x** |
+| statemachine 8 MiB | 0.225 s | 1.247 s | 0.083 s | **2.70x** |
 
-**Nachmessung bei der Zusammenführung** (`BENCH_RUNS=5 bash bench/run.sh`,
-derselbe Rechner, 13.08.2026 abends, geteilte Maschine): fib **1,57×**,
-sieve **3,97×**, matmul **6,04×**, bytecount **1,77×**, bubblesort **5,19×**,
-statemachine **2,76×** → **Median 3,36×**. Die Streuung zwischen zwei Läufen
-derselben Suite ist also erheblich (2,8×–3,4× im Median); wer nachmisst, bekommt
-eine Zahl in dieser Spanne, nicht exakt die Tabelle oben. Die jeweils letzte
-Messung steht immer in `bench/RESULTS.md`.
+**A re-measurement during the merge** (`BENCH_RUNS=5 bash bench/run.sh`, the same
+machine, the evening of 2026-08-13, a shared machine): fib **1.57x**,
+sieve **3.97x**, matmul **6.04x**, bytecount **1.77x**, bubblesort **5.19x**,
+statemachine **2.76x** -> **median 3.36x**. The spread between two runs of the
+same suite is therefore considerable (2.8x-3.4x in the median); whoever
+re-measures gets a number inside that range, not exactly the table above. The
+most recent measurement is always in `bench/RESULTS.md`.
 
-**Median 2,75×–3,36× langsamer als Rust `-O`** (Einzelwerte 1,57× – 6,04×). Das
-Leistungsziel aus SPEC §10.3 (`P1`, ≤ 2×) ist damit **nicht erreicht** — die
-Zahl steht so auch in `ABNAHME.md` und `SPEC.md` §14.1.opt O4. Der Optimierer
-selbst bringt gegenüber `--no-opt` im Median **9,9×**. Der verbleibende Abstand
-liegt vor allem dort, wo LLVM vektorisiert (Sieb, Matrixmultiplikation): Firn
-erzeugt ausschließlich skalaren Code, SIMD (`L16`) ist offen.
+**A median of 2.75x-3.36x slower than Rust `-O`** (individual values 1.57x -
+6.04x). The performance target from SPEC 10.3 (`P1`, <= 2x) is therefore **not
+reached** -- that number stands the same way in `ACCEPTANCE.md` and in `SPEC.md`
+14.1.opt O4. Against `--no-opt` the optimizer itself brings a median of
+**9.9x**. The remaining distance lies above all where LLVM vectorizes (sieve,
+matrix multiplication): Firn produces scalar code exclusively, SIMD (`L16`) is
+open.
 
-Die Rohtabelle schreibt jeder Lauf nach `bench/RESULTS.md`.
+Every run writes the raw table to `bench/RESULTS.md`.
 
-### Was der Optimierer NICHT tut (ehrlich)
+### What the optimizer does NOT do (honestly)
 
-* **Keine Schleifenoptimierung**: kein Entrollen, kein Hochziehen invarianter
-  Berechnungen, keine Induktionsvariablen, keine Vektorisierung.
-* **Kein Intervallsplitting** in der Registerzuteilung: ein Wert liegt entweder
-  ganz in einem Register oder ganz im Stack. Bei hohem Registerdruck kostet das.
-* **Kein globales PRE/GVN** — CSE arbeitet nur entlang des Dominatorbaums und
-  fasst `load` nie zusammen (Speicher gilt als undurchsichtig).
-* **Keine Ausrichtung/Anordnung von Blöcken**, keine Sprungvorhersage-Heuristik.
-* Bereichsprüfungen kann Stufe 0 gar nicht entfernen, weil sie gar keine
-  erzeugt (SPEC §14.1 Punkt 3); der Durchgang entfernt stattdessen beweisbar
-  wiederholte Bedingungen (SPEC §14.1.opt O5).
+* **No loop optimization**: no unrolling, no hoisting of invariant computations,
+  no induction variables, no vectorization.
+* **No interval splitting** in register allocation: a value lies either
+  entirely in a register or entirely on the stack. Under high register pressure
+  that costs.
+* **No global PRE/GVN** -- CSE works only along the dominator tree and never
+  combines `load`s (memory counts as opaque).
+* **No alignment or ordering of blocks**, no branch prediction heuristic.
+* Stage 0 cannot remove bounds checks at all, because it does not produce any
+  (SPEC 14.1 item 3); instead the pass removes provably repeated conditions
+  (SPEC 14.1.opt O5).
 
-## Baustufen (DESIGNZIELE.md §5)
+## Build stages (DESIGN_GOALS.md 5)
 
-Statt eines Alles-oder-Nichts-Schalters gibt es vier Stufen. `--list-passes`
-zeigt, welcher Durchgang in welcher Stufe läuft und ob er **debugerhaltend** ist.
+Instead of an all-or-nothing switch there are four stages. `--list-passes`
+shows which pass runs in which stage and whether it is **debug-preserving**.
 
 ```
-firnc --opt-level=dev          # gar keine Optimierung (= --no-opt)
-firnc --opt-level=dev-fast     # nur debugerhaltende Durchgänge
-firnc --opt-level=release-safe # alle Durchgänge
-firnc --opt-level=release-fast # alle Durchgänge (heute identisch zu -safe)
-firnc --no-pass=inline datei.fi
+firnc --opt-level=dev          # no optimization at all (= --no-opt)
+firnc --opt-level=dev-fast     # only debug-preserving passes
+firnc --opt-level=release-safe # all passes
+firnc --opt-level=release-fast # all passes (identical to -safe today)
+firnc --no-pass=inline file.fi
 ```
 
-Gemessen mit `bash tools/build_stages/run.sh 3` (Median über sechs Benchmarks):
+Measured with `bash tools/build_stages/run.sh 3` (median over six benchmarks):
 
-* **`dev-fast`: 2,06× langsamer als `release-fast`**
-* `dev`: 10,54× langsamer — dieselbe Größenordnung wie Rusts Debug-Builds
+* **`dev-fast`: 2.06x slower than `release-fast`**
+* `dev`: 10.54x slower -- the same order of magnitude as Rust's debug builds
 
-Von neun Durchgängen ist genau einer nicht debugerhaltend: `inline`.
-`--release-safe` ist derzeit identisch mit `--release-fast`, weil es noch keine
-Laufzeitprüfungen gibt, die man behalten könnte.
+Of nine passes exactly one is not debug-preserving: `inline`.
+`--release-safe` is currently identical with `--release-fast`, because there are
+no run-time checks yet that one could keep.
 
-### Ein Fehler, den erst diese Stufe gefunden hat
+### A bug that only this stage found
 
-Der `dev-fast`-Durchlauf über die Testsuite deckte sofort einen echten
-Codegenerator-Fehler auf, den **259 grüne Tests** nicht gefunden hatten:
-`r8` und `r9` sind zugleich Argumentregister 5 und 6 **und** Arbeitsregister der
-Registerzuteilung. Der Prolog setzte sie der Reihe nach um und überschrieb dabei
-die noch ungelesenen Argumente 5 und 6 — `tests/024_six_args.fi` lieferte ohne
-Einbettung **13 statt 21**. Unsichtbar war das, weil die betroffene Funktion in
-den Release-Stufen immer eingebettet wurde.
+The `dev-fast` run over the test suite immediately uncovered a real code
+generator bug that **259 green tests** had not found: `r8` and `r9` are both
+argument registers 5 and 6 **and** working registers of the register allocator.
+The prologue moved them one after another and overwrote the arguments 5 and 6
+that had not been read yet -- `tests/024_six_args.fi` returned **13 instead of
+21** without inlining. It was invisible because the affected function was always
+inlined in the release stages.
 
-Behoben durch eine parallele Registerumsetzung (`regalloc.rs:
-parallele_reg_bewegungen`), die Zyklen über `rax` auflöst; dieselbe Fehlerklasse
-bestand an der Aufrufstelle und beim `syscall` und ist dort mitbehoben.
-Regressionstest: `tests/025_argreg_shuffle.fi`.
+Fixed by a parallel register permutation (`regalloc.rs:
+parallele_reg_bewegungen`) that resolves cycles through `rax`; the same class of
+bug existed at the call site and at `syscall` and is fixed there as well.
+Regression test: `tests/025_argreg_shuffle.fi`.
 
-## Ergebnisort-Garantie (SPEC.md §13.1)
+## The result-location guarantee (SPEC.md 13.1)
 
-`let g = baue(…)` übergibt die Adresse von `g` an `baue`; ein großes Aggregat
-entsteht **genau einmal**, direkt am Ziel — nicht erst auf dem Stapel der
-erzeugenden Funktion. Nachweis am erzeugten Assembler:
+`let g = baue(...)` passes the address of `g` to `baue`; a large aggregate comes
+into being **exactly once**, straight at its destination -- not first on the
+stack of the producing function. The proof is in the generated assembly:
 
 ```
 $ bash tools/ergebnisort/run.sh
@@ -1389,77 +1386,79 @@ Rahmen baue: 224 Byte   Rahmen main: 1048816 Byte   rep-movs: 0
 OK: Ergebnisort-Garantie gehalten (baue 224 B, main 1048816 B, keine Bulk-Kopie).
 ```
 
-Die Struktur ist 1 MB groß; `baue` hat trotzdem nur 224 Byte Rahmen.
+The structure is 1 MB in size; `baue` still has only a 224 byte frame.
 
-## Architekturschicht: Feldzugriff ≠ Speicherort (DESIGNZIELE.md §8)
+## The architecture layer: field access != storage location (DESIGN_GOALS.md 8)
 
-`a.b` bedeutet in Firn **nicht** fest „Basisadresse plus Versatz". Jeder Feld-
-und Elementzugriff des Lowerings geht durch `compiler/src/layout.rs`:
+In Firn `a.b` does **not** firmly mean "base address plus offset". Every field
+and element access in lowering goes through `compiler/src/layout.rs`:
 
-| Zugang | wofür |
+| Accessor | for what |
 |---|---|
-| `field_addr(base, sidx, name, span)` | benanntes Struct-Feld |
-| `field_addr_at(base, offset)` | bekannter Versatz (Nutzdaten einer `enum`-Variante) |
-| `elem_addr_const(base, esz, i)` | Element mit konstantem Index (Literale) |
-| `elem_addr(base, esz, i, ty)` | Element mit berechnetem Index |
+| `field_addr(base, sidx, name, span)` | a named struct field |
+| `field_addr_at(base, offset)` | a known offset (payload of an `enum` variant) |
+| `elem_addr_const(base, esz, i)` | an element with a constant index (literals) |
+| `elem_addr(base, esz, i, ty)` | an element with a computed index |
 
-Grund: Die geplante SoA-Anordnung (`SoaVec[T]`, für Rasterizer und Layout-Baum)
-hat den zusammenhängenden Wert physisch gar nicht — dort ist die Adresse
-`spalte_f + i · größe(f)`. Eine zweite Anordnung einzuführen heißt jetzt, **in
-diesem einen Modul** eine Fallunterscheidung zu ergänzen, statt dreißig
-Aufrufstellen zu suchen.
+The reason: the planned SoA arrangement (`SoaVec[T]`, for the rasterizer and the
+layout tree) does not have the contiguous value physically at all -- there the
+address is `column_f + i * size(f)`. Introducing a second arrangement now means
+adding a case distinction **in this one module**, instead of hunting down thirty
+call sites.
 
-Die Regel wird **erzwungen**, nicht nur aufgeschrieben:
+The rule is **enforced**, not merely written down:
 
 ```
 $ bash tools/schichten/run.sh
 OK: Feldzugriff und Speicherort getrennt (4 Zugaenge in layout.rs, keine Umgehung).
 ```
 
-Der Wächter läuft als Abschnitt 7 in `test.sh` und prüft, dass `Op::PtrAdd`
-außerhalb von `layout.rs` nur in der einen Hilfsfunktion `ptradd_const` gebaut
-wird, dass deren direkte Aufrufe ausschließlich als `// ABI-Wortkopie`
-gekennzeichnete Aggregatübergaben sind, und dass im Lowering kein Feld-Versatz
-mehr von Hand in eine Adresse gerechnet wird. Eine absichtlich eingebaute
-Verletzung wird mit Datei und Zeile gemeldet (gegengeprüft).
+The guard runs as section 7 in `test.sh` and checks that `Op::PtrAdd` outside
+`layout.rs` is only built in the one helper function `ptradd_const`, that the
+direct calls to it are exclusively aggregate hand-overs marked
+`// ABI-Wortkopie`, and that no field offset is computed into an address by hand
+in lowering any more. A deliberately introduced violation is reported with file
+and line (counter-checked).
 
-## Attribute (SPEC.md §14.2)
+## Attributes (SPEC.md 14.2)
 
-Firn hat ein **Attributregister** — `compiler/src/attrs.rs` ist die einzige
-Wahrheit darüber, welche Attribute es gibt, wohin sie gehören und ob Stufe 0 sie
-umsetzt:
+Firn has an **attribute registry** -- `compiler/src/attrs.rs` is the only truth
+about which attributes exist, where they belong and whether stage 0 implements
+them:
 
 ```
 $ firnc --list-attrs
-NAME            ZIEL         ARGS  STUFE 0     ZWECK
-must_consume    fn, struct   0     umgesetzt   Ergebnis darf nicht verworfen werden
-no_gc           fn           0     Fehler      kein Sammellauf in diesem Aufrufbaum
-constant_time   fn           0     Fehler      kein Sprung auf Geheimnisdaten
+Attribute
+
+NAME            TARGET       ARGS  STAGE 0     PURPOSE
+must_consume    fn, struct   0     implemented result must not be discarded (SPEC 3.3, 5.1)
+no_gc           fn           0     implemented no collection run in this call tree (SPEC 3.5.4)
+constant_time   fn           0     error       no jump on secret data, checked in the code generator (SPEC 9.2)
 ...
 ```
 
-**Die wichtigste Eigenschaft: nichts wird still ignoriert.** Ein bekanntes, aber
-noch nicht umgesetztes Attribut ist ein Übersetzungsfehler mit Zeile, Spalte und
-Hinweis auf den geplanten Zweck. Ein wirkungslos danebenstehendes
-`#[constant_time]` wäre der gefährlichste Fehler, den diese Sprache haben kann.
+**The most important property: nothing is silently ignored.** A known but not
+yet implemented attribute is a compile error with line, column and a note about
+its intended purpose. A `#[constant_time]` standing there without effect would
+be the most dangerous bug this language can have.
 
-Vier Fehlerarten, alle mit Quelltextausschnitt:
+Four kinds of error, all with a source excerpt:
 
 ```
-error: unbekanntes attribut 'must_consum'
-  --> datei.fi:3:1
-   = hinweis: meintest du 'must_consume'? '--list-attrs' zeigt alle
+error: unknown attribute 'must_consum'
+  --> file.fi:3:1
+   = note: did you mean 'must_consume'? '--list-attrs' shows all
 
-error: attribut 'constant_time' ist in Stufe 0 nicht umgesetzt
-   = hinweis: geplant: kein Sprung auf Geheimnisdaten, im Codegen geprueft (SPEC 9.2)
+error: attribute 'constant_time' is not implemented in stage 0
+   = note: geplant: no jump on secret data, checked in the code generator (SPEC 9.2)
 
-error: attribut 'packed' gehoert nicht vor eine funktion
-error: attribut 'align' erwartet 1 argument(e), gefunden 2
+error: attribute 'packed' does not belong before a function
+error: attribute 'align' expects 1 argument(s), found 2
 ```
 
 ### `#[must_consume]`
 
-Vor `fn` oder `struct`. Das Ergebnis darf nicht als Anweisung verworfen werden:
+In front of `fn` or `struct`. The result must not be discarded as a statement:
 
 ```firn
 #[must_consume]
@@ -1468,62 +1467,61 @@ struct Wache { fd: i32 }
 fn oeffne(fd: i32) -> Wache { return Wache{ fd: fd, } }
 
 fn main() -> i32 {
-    oeffne(7)        // error: das ergebnis darf nicht verworfen werden
+    oeffne(7)        // error: the result must not be discarded
     return 0
 }
 ```
 
-**Ehrlicher Umfang:** Geprüft wird die ohne Move-Prüfer entscheidbare Teilmenge —
-*ein Aufrufergebnis darf nicht als Anweisung verworfen werden*. Die volle Form
-aus SPEC §3.3 (*der Wert muss an eine verbrauchende Funktion übergeben werden*)
-kommt mit dem Move-Prüfer. `#[must_consume]` verspricht hier bewusst nicht mehr,
-als es hält.
+**The honest scope:** what is checked is the subset decidable without a move
+checker -- *the result of a call must not be discarded as a statement*. The full
+form from SPEC 3.3 (*the value has to be passed to a consuming function*) comes
+with the move checker. `#[must_consume]` deliberately does not promise more
+here than it delivers.
 
-## Symbol-Namensschema (DESIGNZIELE.md §4)
+## The symbol naming scheme (DESIGN_GOALS.md 4)
 
-Erzeugte Linker-Symbole tragen einen reservierten Präfix mit Schemaversion und
-haben Platz für eine spätere ABI-Version:
+Generated linker symbols carry a reserved prefix with the scheme version and
+have room for a later ABI version:
 
 ```text
-_F0.add              Element der Wurzeldatei
-_F0.helfer__quadrat  Element eines Moduls
-_F0.add.v3           mit ABI-Version (später, #[abi_stable(3)])
-main                 der Einstiegspunkt, unverändert
+_F0.add              an element of the root file
+_F0.helfer__quadrat  an element of a module
+_F0.add.v3           with an ABI version (later, #[abi_stable(3)])
+main                 the entry point, unchanged
 ```
 
-`SYMBOL_SCHEMA = 0` steckt in jedem Symbol: Ändert sich das Schema, meldet der
-Linker einen fehlenden Namen, statt zwei unverträgliche Übersetzungsstände still
-zusammenzubinden. Firn-Bezeichner dürfen keinen Punkt enthalten — Nutzercode kann
-den Präfix also nicht treffen.
+`SYMBOL_SCHEMA = 0` sits in every symbol: if the scheme changes, the linker
+reports a missing name instead of quietly linking two incompatible build states
+together. Firn identifiers may not contain a dot -- so user code cannot hit the
+prefix.
 
-Wichtig ist die **Trennung**: *interner Name* (Typprüfer, IR, Fehlermeldungen)
-und *Linker-Symbol* sind zwei verschiedene Dinge. Aus dem einen wird das andere
-an genau einer Stelle: `codegen_x86::label` → `modules::symbol`.
+What matters is the **separation**: the *internal name* (type checker, IR, error
+messages) and the *linker symbol* are two different things. One becomes the
+other at exactly one place: `codegen_x86::label` -> `modules::symbol`.
 
 ```
 $ bash tools/symbole/run.sh
 OK: Symbolschema gehalten (_F0.-Praefix, 'main' nackt, Module kollisionsfrei).
 ```
 
-Der Nachweis baut ein Programm aus zwei Modulen, die beide eine Funktion `hilf`
-enthalten, führt es aus und prüft an der echten Symboltabelle (`nm`).
+The proof builds a program out of two modules that both contain a function
+`hilf`, runs it and checks against the real symbol table (`nm`).
 
-## Wiedereintritt in die Prüfphasen (DESIGNZIELE.md §7)
+## Re-entering the checking phases (DESIGN_GOALS.md 7)
 
-`Checker::add_items` prüft **zusätzliche** Deklarationen mit dem bereits
-aufgebauten Zustand — dieselbe Namenstabelle, dieselbe Typtabelle, dieselben
-Diagnosen. Die Ausdruckstypen-Tabelle wächst mit; die Ganzprogramm-Prüfung
-(`main` vorhanden und richtig) läuft weiterhin genau einmal.
+`Checker::add_items` checks **additional** declarations with the state that has
+already been built up -- the same name table, the same type table, the same
+diagnostics. The table of expression types grows with it; the whole-program
+check (`main` present and correct) still runs exactly once.
 
-Gebraucht wird das von `comptime`/`emit`: dort entstehen Elemente *während* der
-Übersetzung — Web-IDL-Bindungen, CSS-Tabellen, Unicode-Daten. Ein Typprüfer, der
-als einmaliger Durchlauf über einen festen AST gebaut ist, kann das nachträglich
-nicht mehr lernen. Deshalb sitzt die Fähigkeit da, bevor es einen Erzeuger gibt —
-und ist mit drei Tests belegt statt behauptet:
+This is needed by `comptime`/`emit`: there, elements come into being *during*
+compilation -- Web IDL bindings, CSS tables, Unicode data. A type checker built
+as a single pass over a fixed AST cannot learn that afterwards. That is why the
+capability sits there before there is a generator for it -- and it is backed by
+three tests instead of claimed:
 
-* eine erst später entstandene Funktion ruft eine aus dem ersten Durchlauf auf
-  und wird korrekt getypt
-* ein Nachtrag mit unbekanntem Namen liefert **denselben** Fehler wie im ersten
-  Durchlauf — ein Nachtrag ist keine Hintertür
-* ein Nachtrag, der `main` erneut deklariert, wird als doppelte Deklaration
-  erkannt
+* a function that only came into being later calls one from the first pass and
+  is typed correctly
+* an addition with an unknown name produces **the same** error as in the first
+  pass -- an addition is not a back door
+* an addition that declares `main` again is detected as a duplicate declaration
