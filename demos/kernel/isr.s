@@ -149,22 +149,39 @@ isr_common:
  * stack is the kernel's job -- and cannot be done in a compiled function,
  * because that one would already have written to the user stack.
  *
- * Handed to Firn: rdi = number (came in rax), rsi = argument (came in
- * rdi), rdx = kernel data area. The result of `KERNEL_SYSCALL` goes back to
- * the user in rax.
+ * ROUND 62 changes two things here. There is more than one process now,
+ * so the kernel stack is no longer a single fixed one: the scheduler
+ * writes the stack of the CURRENT task into the data area, and the entry
+ * point reads it from there (`KSTACK_CUR`, see kstate.fi). A task that is
+ * in ring 3 has an empty kernel stack -- that is why its upper end may be
+ * taken without further ado. And a system call now carries three
+ * arguments instead of one.
+ *
+ * The ABI, seen from ring 3:
+ *
+ *     rax = number, rdi = arg0, rsi = arg1, rdx = arg2
+ *     rax = result (negative = error code, see sys.fi)
+ *     rcx, r11 destroyed by the processor, r8/r10 by the kernel
+ *
+ * Handed to Firn: rdi = number, rsi/rdx/rcx = the three arguments,
+ * r8 = kernel data area.
  */
+    .set KSTACK_CUR, 344            /* kstate.KSTACK_CUR -- kstate.fi */
+
     .globl syscall_entry
 syscall_entry:
     movq %rsp, %r10                 /* r10 is scratch under this ABI */
-    movq $syscall_stack_top, %rsp
+    movq $kdata, %r8
+    movq KSTACK_CUR(%r8), %rsp      /* the kernel stack of this task */
     pushq %r10                      /* user rsp */
     pushq %rcx                      /* user rip */
     pushq %r11                      /* user rflags */
     subq $8, %rsp                   /* keep the stack 16-aligned */
 
-    movq %rdi, %rsi
-    movq %rax, %rdi
-    movq $kdata, %rdx
+    movq %rdx, %rcx                 /* argument 2 */
+    movq %rsi, %rdx                 /* argument 1 */
+    movq %rdi, %rsi                 /* argument 0 */
+    movq %rax, %rdi                 /* the number */
     call KERNEL_SYSCALL
 
     addq $8, %rsp
@@ -258,6 +275,16 @@ vectors:
     .quad df_stack_top              /* 52: IST1, for the double fault */
     .quad irq_stack_top             /* 53: RSP0, for interrupts out of ring 3 */
     .quad kernel_stack_top          /* 54 */
+    /* Round 62: the scheduler, the processes and the user programs. */
+    .quad context_switch            /* 55: switch.s */
+    .quad enter_user_task           /* 56: switch.s, into ring 3 for good */
+    .quad task_guard                /* 57: switch.s, under every new task */
+    .quad USER_MAIN                 /* 58: entry point of uprog.fi */
+    .quad __user_begin              /* 59: first page of the user programs */
+    .quad __user_end                /* 60: behind their last page */
+    .quad syscall_stack_top         /* 61: the stack before the first task */
+    .quad KERNEL_TASK_MAIN          /* 62: tasks.fi, the body of a kernel task */
+    .quad KERNEL_USER_START         /* 63: proc.fi, the way into ring 3 */
 
     .section .bss, "aw", @nobits
     .align 8

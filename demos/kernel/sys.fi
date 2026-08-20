@@ -1,0 +1,484 @@
+// demos/kernel/sys.fi -- round 62: the system calls.
+//
+// Round 59 had two of them, and they were marks: "I am in ring 3", "I am
+// coming back". They returned zero, and a zero said nothing. This is the
+// table a process really lives on -- and the rule of this file is that
+// NOTHING is answered silently:
+//
+//   * every unknown number gives -ENOSYS, not zero,
+//   * every pointer out of ring 3 is checked by the kernel BEFORE it is
+//     followed (`proc.user_ok`); a bad one gives -EFAULT,
+//   * every descriptor is checked; a bad one gives -EBADF,
+//   * every error is a NEGATIVE number, the way Unix has counted since
+//     1970, and the user program can tell it apart from a result.
+//
+// The counter-check to that is a program of its own: `uprog.badptr`
+// hands the kernel an address out of the kernel, an address of zero and
+// a descriptor of 77 -- and prints the three error codes it gets back.
+// A kernel that followed the first pointer would not print anything, it
+// would be dead.
+
+import serial
+import kstate
+import mem
+import sched
+import proc
+import user
+import fs
+
+export { entry, neg, E_NOENT, E_BADF, E_CHILD, E_FAULT, E_INVAL, E_NOSYS }
+
+// The numbers. 1 and 2 are the two marks of round 59 and stay where they
+// are, so that the cases of that round keep measuring what they measured.
+const SYS_MARK: u64 = 1
+const SYS_LEAVE: u64 = 2
+const SYS_EXIT: u64 = 10
+const SYS_WRITE: u64 = 11
+const SYS_READ: u64 = 12
+const SYS_GETPID: u64 = 13
+const SYS_SLEEP: u64 = 14
+const SYS_SPAWN: u64 = 15
+const SYS_WAIT: u64 = 16
+const SYS_OPEN: u64 = 17
+const SYS_CLOSE: u64 = 18
+const SYS_UNLINK: u64 = 19
+const SYS_LIST: u64 = 20
+const SYS_MKDIR: u64 = 21
+const SYS_YIELD: u64 = 22
+const SYS_STAT: u64 = 23
+const SYS_GETPPID: u64 = 24
+
+// The errors, with the numbers of the system everybody knows.
+const E_NOENT: u64 = 2                  // no such file
+const E_BADF: u64 = 9                   // no such descriptor
+const E_CHILD: u64 = 10                 // no such child
+const E_NOMEM: u64 = 12
+const E_FAULT: u64 = 14                 // a pointer that is not the caller's
+const E_EXIST: u64 = 17
+const E_NOTDIR: u64 = 20
+const E_ISDIR: u64 = 21
+const E_INVAL: u64 = 22
+const E_MFILE: u64 = 24                 // no descriptor free
+const E_NOSPC: u64 = 28                 // the disk is full
+const E_NAMETOOLONG: u64 = 36
+const E_NOSYS: u64 = 38                 // no such call
+
+const FD_IN: u64 = 0
+const FD_OUT: u64 = 1
+const FD_ERR: u64 = 2
+const FD_FIRST: u64 = 3                 // the first real file
+
+const MAX_IO: u64 = 4096
+
+fn neg(e: u64) -> u64 {
+    return 0 - e
+}
+
+// ------------------------------------------------------------ the entry
+
+// `KERNEL_SYSCALL` out of isr.s: rdi = number, rsi/rdx/rcx = arguments,
+// r8 = the kernel data area. What is returned lands in the user's rax.
+fn entry(number: u64, a0: u64, a1: u64, a2: u64, state: u64) -> u64 {
+    kstate.add(state, kstate.SYSCALLS, 1)
+    if number == SYS_MARK || number == SYS_LEAVE {
+        return user.handle(number, a0, state)
+    }
+    let me: u64 = sched.current(state)
+    if number == SYS_EXIT {
+        sched.exit_task(state, a0)
+        return 0                        // not reached
+    }
+    if number == SYS_WRITE {
+        return do_write(state, me, a0, a1, a2)
+    }
+    if number == SYS_READ {
+        return do_read(state, me, a0, a1, a2)
+    }
+    if number == SYS_GETPID {
+        return sched.tget(state, me, sched.T_PID)
+    }
+    if number == SYS_GETPPID {
+        return sched.tget(state, sched.tget(state, me, sched.T_PARENT),
+                          sched.T_PID)
+    }
+    if number == SYS_SLEEP {
+        if a0 > 60000 {
+            return neg(E_INVAL)
+        }
+        sched.sleep_ticks(state, (a0 + 9) / 10)
+        return 0
+    }
+    if number == SYS_YIELD {
+        sched.yield_now(state)
+        return 0
+    }
+    if number == SYS_SPAWN {
+        return do_spawn(state, me, a0, a1)
+    }
+    if number == SYS_WAIT {
+        return do_wait(state, me, a0)
+    }
+    if number == SYS_OPEN {
+        return do_open(state, me, a0, a1)
+    }
+    if number == SYS_CLOSE {
+        return do_close(state, me, a0)
+    }
+    if number == SYS_UNLINK {
+        return do_unlink(state, me, a0)
+    }
+    if number == SYS_LIST {
+        return do_list(state, me, a0, a1, a2)
+    }
+    if number == SYS_MKDIR {
+        return do_mkdir(state, me, a0)
+    }
+    if number == SYS_STAT {
+        return do_stat(state, me, a0, a1)
+    }
+    return neg(E_NOSYS)
+}
+
+// --------------------------------------------------------- reading in
+
+// One octet out of the address space of the process. The kernel does not
+// switch to it -- it walks the tables and reads the frame through the
+// identity mapping.
+fn peek(state: u64, me: u64, addr: u64) -> u64 {
+    let phys: u64 = proc.translate(state, me, addr)
+    if phys == 0 {
+        return 0
+    }
+    return kstate.get8(phys)
+}
+
+fn poke(state: u64, me: u64, addr: u64, v: u64) -> bool {
+    let phys: u64 = proc.translate(state, me, addr)
+    if phys == 0 {
+        return false
+    }
+    kstate.set8(phys, v as u8)
+    return true
+}
+
+// A name out of ring 3 into the kernel's own buffer. Returns the length,
+// or an error. Nothing is read that the process does not own.
+fn fetch_name(state: u64, me: u64, addr: u64, dst: u64, max: u64) -> u64 {
+    if !proc.user_ok(state, me, addr, 1) {
+        return neg(E_FAULT)
+    }
+    var n: u64 = 0
+    while n < max {
+        if !proc.user_ok(state, me, addr + n, 1) {
+            return neg(E_FAULT)
+        }
+        let c: u64 = peek(state, me, addr + n)
+        kstate.set8(dst + n, c as u8)
+        if c == 0 {
+            return n
+        }
+        n = n + 1
+    }
+    return neg(E_NAMETOOLONG)
+}
+
+// ------------------------------------------------------------- write
+
+fn do_write(state: u64, me: u64, fd: u64, buf: u64, len: u64) -> u64 {
+    if len > MAX_IO {
+        return neg(E_INVAL)
+    }
+    if !proc.user_ok(state, me, buf, len) {
+        return neg(E_FAULT)
+    }
+    if fd == FD_OUT || fd == FD_ERR {
+        var k: u64 = 0
+        while k < len {
+            serial.put(peek(state, me, buf + k) as u8)
+            k = k + 1
+        }
+        return len
+    }
+    if fd == FD_IN {
+        return neg(E_BADF)
+    }
+    let ino: u64 = fd_inode(state, me, fd)
+    if ino == 0 {
+        return neg(E_BADF)
+    }
+    // Through the data area: the file system never sees an address of a
+    // process.
+    let bounce: u64 = state + kstate.BLOCK_OFF
+    var k: u64 = 0
+    while k < len {
+        kstate.set8(bounce + k, peek(state, me, buf + k) as u8)
+        k = k + 1
+    }
+    let off: u64 = fd_offset(state, me, fd)
+    let n: u64 = fs.write_at(state, ino, off, bounce, len)
+    fd_set_offset(state, me, fd, off + n)
+    return n
+}
+
+// -------------------------------------------------------------- read
+
+fn do_read(state: u64, me: u64, fd: u64, buf: u64, len: u64) -> u64 {
+    if len > MAX_IO {
+        return neg(E_INVAL)
+    }
+    if !proc.user_ok(state, me, buf, len) {
+        return neg(E_FAULT)
+    }
+    if fd == FD_IN {
+        return console_read(state, me, buf, len)
+    }
+    if fd == FD_OUT || fd == FD_ERR {
+        return neg(E_BADF)
+    }
+    let ino: u64 = fd_inode(state, me, fd)
+    if ino == 0 {
+        return neg(E_BADF)
+    }
+    let bounce: u64 = state + kstate.BLOCK_OFF
+    let off: u64 = fd_offset(state, me, fd)
+    let n: u64 = fs.read_at(state, ino, off, bounce, len)
+    var k: u64 = 0
+    while k < n {
+        if !poke(state, me, buf + k, kstate.get8(bounce + k)) {
+            return neg(E_FAULT)
+        }
+        k = k + 1
+    }
+    fd_set_offset(state, me, fd, off + n)
+    return n
+}
+
+// The console delivers one line at a time -- up to and including the
+// newline, like a terminal in line mode. Nothing there any more: 0, and
+// that is the end of the input, not an error.
+fn console_read(state: u64, me: u64, buf: u64, len: u64) -> u64 {
+    var pos: u64 = kstate.get(state, kstate.CONSOLE_POS)
+    let end: u64 = kstate.get(state, kstate.CONSOLE_LEN)
+    var n: u64 = 0
+    var going: bool = true
+    while going {
+        if n >= len || pos >= end {
+            going = false
+        } else {
+            let c: u64 = kstate.get8(state + kstate.CONSOLE_OFF + pos)
+            pos = pos + 1
+            if !poke(state, me, buf + n, c) {
+                return neg(E_FAULT)
+            }
+            n = n + 1
+            if c == 10 {
+                going = false
+            }
+        }
+    }
+    kstate.set(state, kstate.CONSOLE_POS, pos)
+    return n
+}
+
+// ------------------------------------------------------ spawn and wait
+
+fn do_spawn(state: u64, me: u64, prog: u64, arg: u64) -> u64 {
+    if prog == 0 || prog > 16 {
+        return neg(E_INVAL)
+    }
+    let i: u64 = proc.create(state, prog, arg, 2)
+    if i == 0 {
+        return neg(E_NOMEM)
+    }
+    return sched.tget(state, i, sched.T_PID)
+}
+
+// The index of a child, or MAX_TASKS. `pid` 0 means: any of them.
+fn find_child(state: u64, me: u64, pid: u64) -> u64 {
+    let n: u64 = kstate.get(state, kstate.TASKS)
+    var i: u64 = 0
+    while i < n {
+        if sched.tget(state, i, sched.T_STATE) != sched.S_FREE {
+            if sched.tget(state, i, sched.T_PARENT) == me {
+                if pid == 0 || sched.tget(state, i, sched.T_PID) == pid {
+                    return i
+                }
+            }
+        }
+        i = i + 1
+    }
+    return kstate.MAX_TASKS
+}
+
+// Waits for a child and returns ITS exit code. A pid that is not a child
+// of the caller gives -ECHILD -- the caller does not get to hear about
+// somebody else's processes.
+fn do_wait(state: u64, me: u64, pid: u64) -> u64 {
+    var rounds: u64 = 0
+    while rounds < 100000 {
+        let child: u64 = find_child(state, me, pid)
+        if child >= kstate.MAX_TASKS {
+            return neg(E_CHILD)
+        }
+        if sched.tget(state, child, sched.T_STATE) == sched.S_ZOMBIE {
+            let code: u64 = sched.tget(state, child, sched.T_EXIT)
+            proc.reap(state, child)
+            return code
+        }
+        sched.tset(state, me, sched.T_WAITPID, pid)
+        sched.tset(state, me, sched.T_STATE, sched.S_WAIT)
+        sched.schedule(state)
+        rounds = rounds + 1
+    }
+    return neg(E_CHILD)
+}
+
+// ------------------------------------------------------- the descriptors
+
+fn fd_inode(state: u64, me: u64, fd: u64) -> u64 {
+    if fd < FD_FIRST || fd >= FD_FIRST + sched.FD_SLOTS {
+        return 0
+    }
+    return sched.tget(state, me, sched.T_FD + (fd - FD_FIRST) * 8)
+}
+
+fn fd_offset(state: u64, me: u64, fd: u64) -> u64 {
+    return sched.tget(state, me, sched.T_FDOFF + (fd - FD_FIRST) * 8)
+}
+
+fn fd_set_offset(state: u64, me: u64, fd: u64, off: u64) {
+    sched.tset(state, me, sched.T_FDOFF + (fd - FD_FIRST) * 8, off)
+}
+
+// ------------------------------------------------------------ the files
+
+// `open(name, create)`. Returns a descriptor from 3 on.
+fn do_open(state: u64, me: u64, name: u64, create: u64) -> u64 {
+    if kstate.get(state, kstate.FS_READY) == 0 {
+        return neg(E_NOSYS)
+    }
+    let buf: u64 = state + kstate.NAME_OFF
+    let len: u64 = fetch_name(state, me, name, buf, 64)
+    if (len >> 63) != 0 {
+        return len
+    }
+    var ino: u64 = fs.path(state, buf)
+    if ino == 0 {
+        if create == 0 {
+            return neg(E_NOENT)
+        }
+        ino = fs.create_path(state, buf, fs.T_FILE)
+        if ino == 0 {
+            return neg(E_NOSPC)
+        }
+    }
+    if fs.inode_type(state, ino) == fs.T_DIR {
+        return neg(E_ISDIR)
+    }
+    var slot: u64 = 0
+    while slot < sched.FD_SLOTS {
+        if sched.tget(state, me, sched.T_FD + slot * 8) == 0 {
+            sched.tset(state, me, sched.T_FD + slot * 8, ino)
+            sched.tset(state, me, sched.T_FDOFF + slot * 8, 0)
+            return FD_FIRST + slot
+        }
+        slot = slot + 1
+    }
+    return neg(E_MFILE)
+}
+
+fn do_close(state: u64, me: u64, fd: u64) -> u64 {
+    if fd_inode(state, me, fd) == 0 {
+        return neg(E_BADF)
+    }
+    sched.tset(state, me, sched.T_FD + (fd - FD_FIRST) * 8, 0)
+    sched.tset(state, me, sched.T_FDOFF + (fd - FD_FIRST) * 8, 0)
+    return 0
+}
+
+fn do_unlink(state: u64, me: u64, name: u64) -> u64 {
+    if kstate.get(state, kstate.FS_READY) == 0 {
+        return neg(E_NOSYS)
+    }
+    let buf: u64 = state + kstate.NAME_OFF
+    let len: u64 = fetch_name(state, me, name, buf, 64)
+    if (len >> 63) != 0 {
+        return len
+    }
+    if !fs.unlink_path(state, buf) {
+        return neg(E_NOENT)
+    }
+    return 0
+}
+
+fn do_mkdir(state: u64, me: u64, name: u64) -> u64 {
+    if kstate.get(state, kstate.FS_READY) == 0 {
+        return neg(E_NOSYS)
+    }
+    let buf: u64 = state + kstate.NAME_OFF
+    let len: u64 = fetch_name(state, me, name, buf, 64)
+    if (len >> 63) != 0 {
+        return len
+    }
+    if fs.path(state, buf) != 0 {
+        return neg(E_EXIST)
+    }
+    if fs.create_path(state, buf, fs.T_DIR) == 0 {
+        return neg(E_NOSPC)
+    }
+    return 0
+}
+
+// The n-th entry of a directory into a buffer of the process: 32 octets,
+// the name terminated by a zero. Returns the type, or -ENOENT when there
+// is no n-th entry.
+fn do_list(state: u64, me: u64, name: u64, index: u64, out: u64) -> u64 {
+    if kstate.get(state, kstate.FS_READY) == 0 {
+        return neg(E_NOSYS)
+    }
+    if !proc.user_ok(state, me, out, 32) {
+        return neg(E_FAULT)
+    }
+    let buf: u64 = state + kstate.NAME_OFF
+    let len: u64 = fetch_name(state, me, name, buf, 64)
+    if (len >> 63) != 0 {
+        return len
+    }
+    let dir: u64 = fs.path(state, buf)
+    if dir == 0 {
+        return neg(E_NOENT)
+    }
+    if fs.inode_type(state, dir) != fs.T_DIR {
+        return neg(E_NOTDIR)
+    }
+    let named: u64 = state + kstate.NAME_OFF + 512
+    let ino: u64 = fs.entry_at(state, dir, index, named)
+    if ino == 0 {
+        return neg(E_NOENT)
+    }
+    var k: u64 = 0
+    while k < 32 {
+        if !poke(state, me, out + k, kstate.get8(named + k)) {
+            return neg(E_FAULT)
+        }
+        k = k + 1
+    }
+    return fs.inode_type(state, ino)
+}
+
+// Size of a file in octets, or an error.
+fn do_stat(state: u64, me: u64, name: u64, unused: u64) -> u64 {
+    if kstate.get(state, kstate.FS_READY) == 0 {
+        return neg(E_NOSYS)
+    }
+    let buf: u64 = state + kstate.NAME_OFF
+    let len: u64 = fetch_name(state, me, name, buf, 64)
+    if (len >> 63) != 0 {
+        return len
+    }
+    let ino: u64 = fs.path(state, buf)
+    if ino == 0 {
+        return neg(E_NOENT)
+    }
+    return fs.inode_size(state, ino)
+}

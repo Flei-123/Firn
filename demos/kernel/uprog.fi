@@ -1,0 +1,540 @@
+// demos/kernel/uprog.fi -- round 62: the programs that run in ring 3.
+//
+// This file is FIRN, and it is compiled into an OBJECT FILE OF ITS OWN.
+// The linker script puts its code on pages of its own between
+// `__user_begin` and `__user_end`, and the kernel sets the user bit for
+// exactly those pages. That is the whole reason for the separate
+// translation unit: a function that lay in the middle of the kernel's
+// text could not be made reachable for ring 3 without handing the kernel
+// over with it.
+//
+// Two rules follow from that, and both are checked in
+// `tools/kernel/run.sh`:
+//
+//   1. NOTHING out of the kernel may be called here. No import, no
+//      `serial.puts` -- the object file has to be free of undefined names
+//      just like the kernel's, and everything it needs it does itself.
+//   2. Everything the program says goes through a SYSTEM CALL. That is
+//      the only door out of ring 3, and it is the door this round built.
+//
+// Round 59 had its user program in assembly, in `isr.s`, and the reason
+// given was that a compiled function would sit in the middle of the
+// kernel. That reason is gone -- what is left is a linker script with
+// three lines more, and the user program is a language away from the
+// kernel instead of an instruction set.
+
+profile kernel
+
+export { u_enter }
+
+// The system call numbers, see sys.fi. 1 and 2 belong to the excursion of
+// round 59 and stay what they were.
+const SYS_EXIT: u64 = 10
+const SYS_WRITE: u64 = 11
+const SYS_READ: u64 = 12
+const SYS_GETPID: u64 = 13
+const SYS_SLEEP: u64 = 14
+const SYS_SPAWN: u64 = 15
+const SYS_WAIT: u64 = 16
+const SYS_OPEN: u64 = 17
+const SYS_CLOSE: u64 = 18
+const SYS_UNLINK: u64 = 19
+const SYS_LIST: u64 = 20
+const SYS_MKDIR: u64 = 21
+const SYS_YIELD: u64 = 22
+const SYS_STAT: u64 = 23
+const SYS_GETPPID: u64 = 24
+
+const OUT: u64 = 1                      // the console
+
+// The private page every process has at the same address and on a frame
+// of its own (proc.fi).
+const USER_DATA: u64 = 0x40000000
+
+// The programs. The number arrives in the upper half of the first
+// argument, whatever the creator wanted to say in the lower half.
+const P_HELLO: u64 = 1
+const P_MEMORY: u64 = 2
+const P_FAULT: u64 = 3
+const P_BADPTR: u64 = 4
+const P_CHILD: u64 = 5
+const P_PARENT: u64 = 6
+const P_FILES: u64 = 7
+const P_SHELL: u64 = 8
+const P_STEAL: u64 = 9
+const P_FORK: u64 = 10
+const P_FORKCHILD: u64 = 11
+
+// ------------------------------------------------------ the system call
+
+// rax = number, rdi/rsi/rdx = the three arguments, rax = result.
+// `syscall` destroys rcx and r11 -- the processor puts the return address
+// and the flags in them.
+fn u_sys(number: u64, a0: u64, a1: u64, a2: u64) -> u64 {
+    return asm("syscall", out("rax"), in("rax") number, in("rdi") a0,
+               in("rsi") a1, in("rdx") a2, clobber("rcx"), clobber("r11"),
+               clobber("memory"))
+}
+
+// ------------------------------------------------------------- output
+
+fn u_length(p: u64) -> u64 {
+    var n: u64 = 0
+    while *((p + n) as *mut u8) != 0 as u8 {
+        n = n + 1
+    }
+    return n
+}
+
+fn u_say(p: u64) -> u64 {
+    return u_sys(SYS_WRITE, OUT, p, u_length(p))
+}
+
+// A number, without a standard library: the digits are produced
+// backwards and turned around. Negative results of a system call (an
+// error code) are printed with a minus.
+fn u_say_num(v: u64) {
+    var buf: [u8; 24] = [0 as u8; 24]
+    var value: u64 = v
+    var at: u64 = 0
+    if (v >> 63) != 0 {
+        buf[0] = 45 as u8               // '-'
+        at = 1
+        value = 0 - v
+    }
+    var digits: [u8; 24] = [0 as u8; 24]
+    var n: u64 = 0
+    if value == 0 {
+        digits[0] = 48 as u8
+        n = 1
+    }
+    while value > 0 {
+        digits[n as usize] = (48 + value % 10) as u8
+        value = value / 10
+        n = n + 1
+    }
+    var i: u64 = n
+    while i > 0 {
+        i = i - 1
+        buf[at as usize] = digits[i as usize]
+        at = at + 1
+    }
+    buf[at as usize] = 0 as u8
+    u_sys(SYS_WRITE, OUT, (&buf[0]) as u64, at)
+}
+
+fn u_say_line(p: u64, v: u64) {
+    var nl: [u8; 2] = "\n\0"
+    u_say(p)
+    u_say_num(v)
+    u_say((&nl[0]) as u64)
+}
+
+// ------------------------------------------------------------- the entry
+
+// The one entry point of every user program (`USER_MAIN` in isr.s).
+// rdi = (program << 32) | argument.
+fn u_enter(packed: u64) {
+    let prog: u64 = packed >> 32
+    let arg: u64 = packed & 0xFFFFFFFF
+    if prog == P_HELLO {
+        u_hello(arg)
+    }
+    if prog == P_MEMORY {
+        u_memory(arg)
+    }
+    if prog == P_FAULT {
+        u_fault(arg)
+    }
+    if prog == P_BADPTR {
+        u_badptr(arg)
+    }
+    if prog == P_CHILD {
+        u_child(arg)
+    }
+    if prog == P_PARENT {
+        u_parent(arg)
+    }
+    if prog == P_STEAL {
+        u_steal(arg)
+    }
+    if prog == P_SHELL {
+        u_shell(arg)
+    }
+    if prog == P_FORK {
+        u_fork(arg)
+    }
+    if prog == P_FORKCHILD {
+        u_forkchild(arg)
+    }
+    u_sys(SYS_EXIT, 0, 0, 0)
+    while true {
+    }
+}
+
+// ------------------------------------------------------- the programs
+
+// The smallest one that proves anything: it says who it is, and its exit
+// code is its pid. The kernel reads that code back with `wait`.
+fn u_hello(arg: u64) {
+    var s: [u8; 15] = "user: hello #\0\0"
+    var s_pid: [u8; 12] = "user: pid=\0\0"
+    u_say_line((&s[0]) as u64, arg)
+    let pid: u64 = u_sys(SYS_GETPID, 0, 0, 0)
+    u_say_line((&s_pid[0]) as u64, pid)
+    u_sys(SYS_EXIT, pid, 0, 0)
+}
+
+// THE PROOF OF POINT 2. Two processes run this at the same time, with
+// different arguments. Both write to the SAME address, both read from it
+// afterwards -- and each one gets its own value back. If they shared a
+// frame, the second one would overwrite the first one's value, and the
+// sleep in between makes sure it would have the chance to.
+fn u_memory(arg: u64) {
+    var s_wrote: [u8; 18] = "user: wrote here \0"
+    var s_read: [u8; 17] = "user: read here \0"
+    let p: *mut u64 = USER_DATA as *mut u64
+    __mmio_write64(p, arg)
+    u_say_line((&s_wrote[0]) as u64, arg)
+    u_sys(SYS_SLEEP, 40, 0, 0)            // 40 ms: let the other one write
+    let back: u64 = __mmio_read64(p)
+    u_say_line((&s_read[0]) as u64, back)
+    var ok: u64 = 1
+    if back != arg {
+        ok = 0
+    }
+    u_sys(SYS_EXIT, ok, 0, 0)
+}
+
+// THE COUNTER-CHECK to it: whatever is not mine gives a #PF. The address
+// is the kernel's own text, 1 MiB, and it is mapped in every address
+// space -- but without the user bit. Ring 3 must not see it.
+fn u_fault(arg: u64) {
+    var s: [u8; 30] = "user: touching kernel memory\n\0"
+    u_say((&s[0]) as u64)
+    let stolen: u64 = __mmio_read64(0x100000 as *mut u64)
+    // Not reached: the process is dead by now.
+    var s_bad: [u8; 30] = "user: READ THE KERNEL, bad\n\0\0\0"
+    u_say((&s_bad[0]) as u64)
+    u_sys(SYS_EXIT, stolen, 0, 0)
+}
+
+// The same thing one storey higher: a pointer into the kernel handed to
+// a system call. The kernel must not follow it -- it has to answer with
+// -EFAULT and stay alive.
+fn u_badptr(arg: u64) {
+    var s: [u8; 22] = "user: write(kernel)=\0\0"
+    var s2: [u8; 20] = "user: write(nil)=\0\0\0"
+    var s3: [u8; 20] = "user: read(badfd)=\0\0"
+    var s4: [u8; 15] = "user: nosys=\0\0\0"
+    var s5: [u8; 20] = "user: sleep(1000s)=\0"
+    u_say_line((&s[0]) as u64, u_sys(SYS_WRITE, OUT, 0x100000, 8))
+    u_say_line((&s2[0]) as u64, u_sys(SYS_WRITE, OUT, 0, 8))
+    u_say_line((&s3[0]) as u64, u_sys(SYS_READ, 77, USER_DATA, 8))
+    u_say_line((&s4[0]) as u64, u_sys(999, 0, 0, 0))
+    u_say_line((&s5[0]) as u64, u_sys(SYS_SLEEP, 1000000, 0, 0))
+    u_sys(SYS_EXIT, 7, 0, 0)
+}
+
+// A child that says something and ends with a code of its own.
+fn u_child(arg: u64) {
+    var s: [u8; 17] = "user: child arg=\0"
+    u_say_line((&s[0]) as u64, arg)
+    u_sys(SYS_SLEEP, 20, 0, 0)
+    u_sys(SYS_EXIT, 40 + arg, 0, 0)
+}
+
+// The parent: it creates two children, waits for both and passes their
+// exit codes on. `spawn` and `wait` seen from ring 3.
+fn u_parent(arg: u64) {
+    var s_sp: [u8; 18] = "user: spawned pid\0"
+    var s_w: [u8; 18] = "user: child exit=\0"
+    var s_bad: [u8; 18] = "user: wait(bad)=\0\0"
+    let a: u64 = u_sys(SYS_SPAWN, P_CHILD, 1, 0)
+    let b: u64 = u_sys(SYS_SPAWN, P_CHILD, 2, 0)
+    u_say_line((&s_sp[0]) as u64, a)
+    u_say_line((&s_sp[0]) as u64, b)
+    u_say_line((&s_w[0]) as u64, u_sys(SYS_WAIT, a, 0, 0))
+    u_say_line((&s_w[0]) as u64, u_sys(SYS_WAIT, b, 0, 0))
+    // A child that is not one: the answer is an error, not a hang.
+    u_say_line((&s_bad[0]) as u64, u_sys(SYS_WAIT, 999, 0, 0))
+    u_sys(SYS_EXIT, 3, 0, 0)
+}
+
+// The last counter-check of point 2: an address that lies in the private
+// region but was never mapped. Between the two pages of the process and
+// the end of its region there is nothing -- and nothing is not readable.
+fn u_steal(arg: u64) {
+    var s: [u8; 28] = "user: touching 0x40010000\n\0\0"
+    u_say((&s[0]) as u64)
+    let stolen: u64 = __mmio_read64(0x40010000 as *mut u64)
+    u_sys(SYS_EXIT, stolen, 0, 0)
+}
+
+// THE FORK-LIKE HALF OF `spawn`: the child inherits the CONTENTS of the
+// parent's data page -- on a frame of its own. Both are proved here in
+// one run: the child sees the parent's value (inheritance), overwrites
+// it, and afterwards the parent still reads its own (separation).
+fn u_fork(arg: u64) {
+    var s_wrote: [u8; 20] = "user: parent wrote \0"
+    var s_still: [u8; 24] = "user: parent still has \0"
+    var s_code: [u8; 23] = "user: fork child exit=\0"
+    let p: *mut u64 = USER_DATA as *mut u64
+    __mmio_write64(p, 12345)
+    u_say_line((&s_wrote[0]) as u64, 12345)
+    let pid: u64 = u_sys(SYS_SPAWN, P_FORKCHILD, 0, 0)
+    let code: u64 = u_sys(SYS_WAIT, pid, 0, 0)
+    u_say_line((&s_code[0]) as u64, code)
+    let mine: u64 = __mmio_read64(p)
+    u_say_line((&s_still[0]) as u64, mine)
+    u_sys(SYS_EXIT, mine, 0, 0)
+}
+
+fn u_forkchild(arg: u64) {
+    var s_in: [u8; 23] = "user: child inherited \0"
+    let p: *mut u64 = USER_DATA as *mut u64
+    let got: u64 = __mmio_read64(p)
+    u_say_line((&s_in[0]) as u64, got)
+    __mmio_write64(p, 999)                  // this must NOT reach the parent
+    var code: u64 = 6
+    if got == 12345 {
+        code = 5
+    }
+    u_sys(SYS_EXIT, code, 0, 0)
+}
+
+// --------------------------------------------------------------- the shell
+//
+// POINT 5 OF THE ROUND: a command line in ring 3. It can do nothing on
+// its own -- no file, no directory, not even its own output. Every one of
+// the six commands is one or more system calls, and that is the point:
+// what the kernel built underneath is enough to write a program on top of
+// it that is useful for something.
+//
+// The input comes from descriptor 0. In the test that is what the boot
+// loader was given on the command line (`script=ls;cat /hello.txt`); on a
+// machine with a keyboard it would be the keyboard. The shell does not
+// notice the difference -- it reads a line and does what it says.
+
+fn u_streq(a: u64, b: u64) -> bool {
+    var i: u64 = 0
+    while i < 64 {
+        let x: u64 = (*((a + i) as *mut u8)) as u64
+        let y: u64 = (*((b + i) as *mut u8)) as u64
+        if x != y {
+            return false
+        }
+        if x == 0 {
+            return true
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// The next word out of `line` from `at` on into `out`. Returns the
+// position behind it; leading blanks are skipped.
+fn u_word(line: u64, at: u64, out: u64, max: u64) -> u64 {
+    var i: u64 = at
+    while *((line + i) as *mut u8) == 32 as u8 {
+        i = i + 1
+    }
+    var n: u64 = 0
+    while *((line + i) as *mut u8) != 0 as u8 {
+        if *((line + i) as *mut u8) == 32 as u8 {
+            __mmio_write8((out + n) as *mut u8, 0 as u8)
+            return i
+        }
+        if n + 1 < max {
+            __mmio_write8((out + n) as *mut u8, *((line + i) as *mut u8))
+            n = n + 1
+        }
+        i = i + 1
+    }
+    __mmio_write8((out + n) as *mut u8, 0 as u8)
+    return i
+}
+
+fn u_shell(arg: u64) {
+    var line: [u8; 128] = [0 as u8; 128]
+    var word: [u8; 32] = [0 as u8; 32]
+    var s_hi: [u8; 22] = "sh: ready, type away\n\0"
+    var s_prompt: [u8; 6] = "sh$ \0\0"
+    var s_bye: [u8; 9] = "sh: bye\n\0"
+    var s_what: [u8; 17] = "sh: what is \0\0\0\0\0"
+    var s_nl: [u8; 2] = "\n\0"
+    var c_ls: [u8; 3] = "ls\0"
+    var c_cat: [u8; 4] = "cat\0"
+    var c_echo: [u8; 5] = "echo\0"
+    var c_write: [u8; 6] = "write\0"
+    var c_rm: [u8; 3] = "rm\0"
+    var c_mkdir: [u8; 6] = "mkdir\0"
+    var c_exit: [u8; 5] = "exit\0"
+
+    u_say((&s_hi[0]) as u64)
+    var commands: u64 = 0
+    var running: bool = true
+    while running {
+        let n: u64 = u_sys(SYS_READ, 0, (&line[0]) as u64, 120)
+        if n == 0 || (n >> 63) != 0 {
+            running = false
+        } else {
+            // The newline belongs to the line, not to the command.
+            var len: u64 = n
+            while len > 0 && line[(len - 1) as usize] <= 32 as u8 {
+                len = len - 1
+            }
+            line[len as usize] = 0 as u8
+            u_say((&s_prompt[0]) as u64)
+            u_say((&line[0]) as u64)
+            u_say((&s_nl[0]) as u64)
+            if len > 0 {
+                commands = commands + 1
+                let at: u64 = u_word((&line[0]) as u64, 0, (&word[0]) as u64, 32)
+                if u_streq((&word[0]) as u64, (&c_ls[0]) as u64) {
+                    u_ls((&line[0]) as u64, at)
+                } else {
+                    if u_streq((&word[0]) as u64, (&c_cat[0]) as u64) {
+                        u_cat((&line[0]) as u64, at)
+                    } else {
+                        if u_streq((&word[0]) as u64, (&c_echo[0]) as u64) {
+                            u_echo((&line[0]) as u64, at)
+                        } else {
+                            if u_streq((&word[0]) as u64, (&c_write[0]) as u64) {
+                                u_write_file((&line[0]) as u64, at)
+                            } else {
+                                if u_streq((&word[0]) as u64, (&c_rm[0]) as u64) {
+                                    u_rm((&line[0]) as u64, at)
+                                } else {
+                                    if u_streq((&word[0]) as u64, (&c_mkdir[0]) as u64) {
+                                        u_mkdir((&line[0]) as u64, at)
+                                    } else {
+                                        if u_streq((&word[0]) as u64, (&c_exit[0]) as u64) {
+                                            running = false
+                                        } else {
+                                            u_say((&s_what[0]) as u64)
+                                            u_say((&word[0]) as u64)
+                                            u_say((&s_nl[0]) as u64)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    u_say((&s_bye[0]) as u64)
+    u_sys(SYS_EXIT, commands, 0, 0)
+}
+
+// `ls [path]` -- every entry of a directory, with `SYS_LIST`.
+fn u_ls(line: u64, at: u64) {
+    var path: [u8; 64] = [0 as u8; 64]
+    var entry: [u8; 32] = [0 as u8; 32]
+    var s_slash: [u8; 2] = "/\0"
+    var s_sp: [u8; 2] = " \0"
+    var s_nl: [u8; 2] = "\n\0"
+    var s_err: [u8; 19] = "sh: ls failed \0\0\0\0\0"
+    u_word(line, at, (&path[0]) as u64, 64)
+    if path[0] == 0 as u8 {
+        path[0] = 47 as u8
+        path[1] = 0 as u8
+    }
+    var i: u64 = 0
+    var going: bool = true
+    while going {
+        let kind: u64 = u_sys(SYS_LIST, (&path[0]) as u64, i,
+                              (&entry[0]) as u64)
+        if (kind >> 63) != 0 {
+            if i == 0 {
+                u_say_line((&s_err[0]) as u64, kind)
+                return
+            }
+            going = false
+        } else {
+            u_say((&entry[8]) as u64)
+            if kind == 2 {
+                u_say((&s_slash[0]) as u64)
+            }
+            u_say((&s_sp[0]) as u64)
+            i = i + 1
+        }
+    }
+    u_say((&s_nl[0]) as u64)
+}
+
+// `cat path` -- open, read in pieces, write out, close.
+fn u_cat(line: u64, at: u64) {
+    var path: [u8; 64] = [0 as u8; 64]
+    var buf: [u8; 64] = [0 as u8; 64]
+    var s_err: [u8; 18] = "sh: cat failed \0\0\0"
+    u_word(line, at, (&path[0]) as u64, 64)
+    let fd: u64 = u_sys(SYS_OPEN, (&path[0]) as u64, 0, 0)
+    if (fd >> 63) != 0 {
+        u_say_line((&s_err[0]) as u64, fd)
+        return
+    }
+    var going: bool = true
+    while going {
+        let n: u64 = u_sys(SYS_READ, fd, (&buf[0]) as u64, 64)
+        if n == 0 || (n >> 63) != 0 {
+            going = false
+        } else {
+            u_sys(SYS_WRITE, OUT, (&buf[0]) as u64, n)
+        }
+    }
+    u_sys(SYS_CLOSE, fd, 0, 0)
+}
+
+// `echo rest of the line`
+fn u_echo(line: u64, at: u64) {
+    var s_nl: [u8; 2] = "\n\0"
+    var i: u64 = at
+    while *((line + i) as *mut u8) == 32 as u8 {
+        i = i + 1
+    }
+    u_say(line + i)
+    u_say((&s_nl[0]) as u64)
+}
+
+// `write path text` -- creates the file if it is not there.
+fn u_write_file(line: u64, at: u64) {
+    var path: [u8; 64] = [0 as u8; 64]
+    var s_err: [u8; 20] = "sh: write failed \0\0\0"
+    var s_ok: [u8; 14] = "sh: written \0\0"
+    var s_nl: [u8; 2] = "\n\0"
+    let next: u64 = u_word(line, at, (&path[0]) as u64, 64)
+    var i: u64 = next
+    while *((line + i) as *mut u8) == 32 as u8 {
+        i = i + 1
+    }
+    let fd: u64 = u_sys(SYS_OPEN, (&path[0]) as u64, 1, 0)
+    if (fd >> 63) != 0 {
+        u_say_line((&s_err[0]) as u64, fd)
+        return
+    }
+    let len: u64 = u_length(line + i)
+    var wrote: u64 = 0
+    if len > 0 {
+        wrote = u_sys(SYS_WRITE, fd, line + i, len)
+        u_sys(SYS_WRITE, fd, (&s_nl[0]) as u64, 1)
+    }
+    u_sys(SYS_CLOSE, fd, 0, 0)
+    u_say_line((&s_ok[0]) as u64, wrote)
+}
+
+fn u_rm(line: u64, at: u64) {
+    var path: [u8; 64] = [0 as u8; 64]
+    var s: [u8; 12] = "sh: rm \0\0\0\0\0"
+    u_word(line, at, (&path[0]) as u64, 64)
+    u_say_line((&s[0]) as u64, u_sys(SYS_UNLINK, (&path[0]) as u64, 0, 0))
+}
+
+fn u_mkdir(line: u64, at: u64) {
+    var path: [u8; 64] = [0 as u8; 64]
+    var s: [u8; 14] = "sh: mkdir \0\0\0\0"
+    u_word(line, at, (&path[0]) as u64, 64)
+    u_say_line((&s[0]) as u64, u_sys(SYS_MKDIR, (&path[0]) as u64, 0, 0))
+}

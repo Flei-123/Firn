@@ -438,14 +438,19 @@ else
     grep FAIL "$WORK/fnval.log" | head -10 | sed 's/^/   /'
 fi
 
-echo "== 22. the kernel really runs: IDT, timer, memory, keyboard, ring 3 (tools/kernel/run.sh) =="
-# Round 59. `demos/kernel/kmain.fi` is booted in QEMU -- once per case,
-# each with a time limit. Checked is the SERIAL OUTPUT and the exit code:
-# exceptions with error code and register set, a tick counter that runs
-# up, frame allocator and heap with allocate/free/allocate again,
-# keys over IRQ1, and the way into ring 3 and back. With counter-checks:
-# masked IRQ0 counts zero ticks, without keys nothing appears, and `hlt`
-# in the user program yields #GP with cs=0x2b.
+echo "== 22. the kernel really runs: tasks, address spaces, system calls, files (tools/kernel/run.sh) =="
+# Round 59 and 62. `demos/kernel/kmain.fi` is booted in QEMU -- once per
+# case, each with a time limit. Checked is the SERIAL OUTPUT and the exit
+# code: exceptions with error code and register set, a tick counter that
+# runs up, frame allocator and heap, keys over IRQ1, ring 3 (round 59) --
+# and on top of that three tasks interleaved on one processor, two
+# processes with an address space of their own, system calls with real
+# error codes, a file system on a RAM disk AND on a real ATA disk, and a
+# command line in ring 3 (round 62). Every point with a counter-check:
+# masked IRQ0 counts zero ticks, `nopreempt` lets nothing interleave, a
+# process that touches kernel memory dies while the kernel lives, `mount`
+# refuses an unformatted disk, and `hlt` in ring 3 yields #GP with
+# cs=0x2b.
 bash tools/kernel/run.sh > "$WORK/kernel.log" 2>&1 && KRRC=0 || KRRC=$?
 if [ "$KRRC" -eq 0 ]; then
     ok
