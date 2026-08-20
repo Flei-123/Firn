@@ -1,0 +1,403 @@
+// demos/kernel/kmain.fi -- round 59: a small kernel, in Firn.
+//
+// Round 52 proved that `profile kernel` produces a freestanding object
+// file: no libc, no runtime, no `_start`. What booted back then said its
+// name over the serial port and stopped. This is the kernel that does
+// something:
+//
+//   * it installs an IDT of its own and reports exceptions with error
+//     code, CR2 and all sixteen registers (`trap.fi`),
+//   * it remaps the two PICs and lets the PIT tick at 100 Hz; the counter
+//     runs measurably up (`idt.fi`),
+//   * it reads the memory map of the boot loader, manages the physical
+//     memory frame by frame and puts a heap on top (`mem.fi`),
+//   * it reads the keyboard over IRQ1 (`kbd.fi`),
+//   * it goes into ring 3 and comes back through a system call
+//     (`user.fi`).
+//
+// Everything of that is Firn. Assembly is exactly where the machine is
+// not yet in a state a compiled function could run in: `boot.s` (long
+// mode) and `isr.s` (interrupt entry points).
+//
+// What runs is decided by the command line of the boot loader
+// (`-append`): without arguments the full run, with `trap=de|pf|gp|df` a
+// deliberate fault. `tools/kernel/run.sh` starts both.
+
+profile kernel
+
+import serial
+import kstate
+import idt
+import mem
+import trap
+import kbd
+import user
+import power
+
+// Indices in the table out of isr.s.
+const V_DF_STACK: u64 = 52
+const V_IRQ_STACK: u64 = 53
+
+const TICKS_WANTED: u64 = 20            // 200 ms at 100 Hz
+const KEYS_WANTED: u64 = 4
+const KEY_TIMEOUT: u64 = 250            // 2.5 s, then it goes on regardless
+
+// `KERNEL_MAIN` out of boot.s. Six arguments, System V, see boot.s.
+fn kernel_main(mbi: u64, vectors: u64, state: u64, kernel_end: u64,
+             gdt: u64, tss: u64) {
+    var s_banner: [u8; 32] = "firn kernel r59, profile kernel\0"
+    var s_mb: [u8; 11] = "mb: flags=\0"
+    var s_cmd: [u8; 8] = "  cmd=\0\0"
+    var s_none: [u8; 7] = "(none)\0"
+    var s_idt: [u8; 6] = "idt: \0"
+    var s_gates: [u8; 21] = " gates, vector 8 IST\0"
+    var s_pic: [u8; 30] = "pic: master 0x20, slave 0x28\0\0"
+    var s_pit: [u8; 6] = "pit: \0"
+    var s_hz: [u8; 20] = " Hz, divisor \0\0\0\0\0\0\0"
+    var s_done: [u8; 13] = "kernel: done\0"
+
+    serial.init()
+    serial.puts((&s_banner[0]) as u64)
+    serial.nl()
+
+    kstate.set(state, kstate.VECTORS, vectors)
+    kstate.set(state, kstate.GDT, gdt)
+    kstate.set(state, kstate.TSS, tss)
+    kstate.set(state, kstate.KERNEL_END, kernel_end)
+
+    let cmd: u64 = mem.cmdline(mbi)
+    kstate.set(state, kstate.MODE, mode_of(cmd))
+    serial.puts((&s_mb[0]) as u64)
+    serial.hex(kstate.get32(mbi))
+    serial.puts((&s_cmd[0]) as u64)
+    if cmd == 0 {
+        serial.puts((&s_none[0]) as u64)
+    } else {
+        serial.puts(cmd)
+    }
+    serial.nl()
+
+    // 1. descriptor tables. The TSS first: the IDT points into it with
+    //    IST1, and `ltr` after `lidt` would be a window in which a #DF
+    //    has no stack.
+    idt.tss_install(gdt, tss, at(vectors, V_IRQ_STACK), at(vectors, V_DF_STACK))
+    let gates: u64 = idt.build(state, vectors)
+    serial.puts((&s_idt[0]) as u64)
+    serial.dec(gates)
+    serial.puts((&s_gates[0]) as u64)
+    serial.nl()
+
+    // 2. the interrupt controllers and the timer.
+    idt.pic_remap()
+    idt.pic_mask(0xFC as u8, 0xFF as u8)    // only IRQ0 and IRQ1
+    serial.puts((&s_pic[0]) as u64)
+    serial.nl()
+    let divisor: u64 = idt.pit_init(100)
+    serial.puts((&s_pit[0]) as u64)
+    serial.dec(100)
+    serial.puts((&s_hz[0]) as u64)
+    serial.dec(divisor)
+    serial.nl()
+
+    // 3. memory.
+    memory(state, mbi, kernel_end)
+
+    // 4. a deliberate fault, when the command line asks for one. Comes
+    //    back only if the IDT is broken -- `trap.report` stops.
+    provoke(state, kstate.get(state, kstate.MODE))
+
+    // 5. interrupts on, and the proof that they arrive.
+    ticks(state)
+
+    // 6. the keyboard.
+    keyboard(state)
+
+    // 7. ring 3.
+    ring3(state)
+
+    serial.puts((&s_done[0]) as u64)
+    serial.nl()
+    power.shutdown(power.EXIT_OK)
+}
+
+fn at(vectors: u64, i: u64) -> u64 {
+    return __mmio_read64((vectors + i * 8) as *mut u64)
+}
+
+// ------------------------------------------------------------- memory
+
+fn memory(state: u64, mbi: u64, kernel_end: u64) {
+    var s_end: [u8; 13] = "kernel end: \0"
+    var s_map: [u8; 7] = "mmap: \0"
+    var s_entries: [u8; 12] = " entries, \0\0"
+    var s_usable: [u8; 18] = " KiB usable, top=\0"
+    var s_frames: [u8; 9] = "frames: \0"
+    var s_cover: [u8; 12] = " covered, \0\0"
+    var s_free: [u8; 6] = " free\0"
+    var s_heap: [u8; 7] = "heap: \0"
+    var s_size: [u8; 9] = "  size=\0\0"
+    var s_ok: [u8; 4] = "ok\0\0"
+    var s_bad: [u8; 7] = "FAILED\0"
+
+    serial.puts((&s_end[0]) as u64)
+    serial.hex(kernel_end)
+    serial.nl()
+
+    let entries: u64 = mem.scan(state, mbi, kernel_end)
+    serial.puts((&s_map[0]) as u64)
+    serial.dec(entries)
+    serial.puts((&s_entries[0]) as u64)
+    serial.dec(kstate.get(state, kstate.MEM_USABLE) / 1024)
+    serial.puts((&s_usable[0]) as u64)
+    serial.hex(kstate.get(state, kstate.MEM_TOP))
+    serial.nl()
+
+    serial.puts((&s_frames[0]) as u64)
+    serial.dec(kstate.get(state, kstate.BITMAP_FRAMES))
+    serial.puts((&s_cover[0]) as u64)
+    serial.dec(mem.frames_free(state))
+    serial.puts((&s_free[0]) as u64)
+    serial.nl()
+
+    // 256 KiB of heap out of 64 frames in a row.
+    let heap: u64 = mem.frame_run(state, 64)
+    mem.heap_init(state, heap, 64 * mem.FRAME_SIZE)
+    serial.puts((&s_heap[0]) as u64)
+    serial.hex(heap)
+    serial.puts((&s_size[0]) as u64)
+    serial.dec(64 * mem.FRAME_SIZE)
+    serial.nl()
+
+    var s_ft: [u8; 13] = "frame test: \0"
+    var s_ht: [u8; 12] = "heap test: \0"
+    if mem.frame_selftest(state) {
+        serial.puts((&s_ft[0]) as u64)
+        serial.puts((&s_ok[0]) as u64)
+    } else {
+        serial.puts((&s_ft[0]) as u64)
+        serial.puts((&s_bad[0]) as u64)
+    }
+    serial.nl()
+    if mem.heap_selftest(state) {
+        serial.puts((&s_ht[0]) as u64)
+        serial.puts((&s_ok[0]) as u64)
+    } else {
+        serial.puts((&s_ht[0]) as u64)
+        serial.puts((&s_bad[0]) as u64)
+    }
+    serial.nl()
+}
+
+// ------------------------------------------------------------- the timer
+
+fn ticks(state: u64) {
+    var s_wait: [u8; 15] = "ticks: waiting\0"
+    var s_got: [u8; 8] = "ticks: \0"
+    var s_traps: [u8; 9] = "  traps=\0"
+    var s_masked: [u8; 20] = "ticks: timer masked\0"
+    var s_spin: [u8; 14] = "spin: ticks=+\0"
+
+    // THE COUNTER-CHECK: with IRQ0 masked the same spin loop has to
+    // count exactly zero ticks. Otherwise the number below would prove
+    // nothing -- a counter that somebody increments elsewhere counts up
+    // as well.
+    if (kstate.get(state, kstate.MODE) & 1024) != 0 {
+        idt.pic_mask(0xFD as u8, 0xFF as u8)
+        idt.enable()
+        serial.puts((&s_masked[0]) as u64)
+        serial.nl()
+        serial.puts((&s_spin[0]) as u64)
+        serial.dec(spin(state))
+        serial.nl()
+        return
+    }
+
+    idt.enable()
+    serial.puts((&s_wait[0]) as u64)
+    serial.nl()
+    let start: u64 = kstate.get(state, kstate.TICKS)
+    while kstate.get(state, kstate.TICKS) - start < TICKS_WANTED {
+        idt.halt()
+    }
+    serial.puts((&s_got[0]) as u64)
+    serial.dec(kstate.get(state, kstate.TICKS))
+    serial.puts((&s_traps[0]) as u64)
+    serial.dec(kstate.get(state, kstate.TRAPS))
+    serial.nl()
+    serial.puts((&s_spin[0]) as u64)
+    serial.dec(spin(state))
+    serial.nl()
+}
+
+// A loop of a fixed length, without `hlt`: how many ticks arrive in it.
+// The same number in both directions -- with the timer it is greater than
+// zero, without it exactly zero.
+fn spin(state: u64) -> u64 {
+    let before: u64 = kstate.get(state, kstate.TICKS)
+    var i: u64 = 0
+    while i < 4000000 {
+        asm("pause")
+        i = i + 1
+    }
+    return kstate.get(state, kstate.TICKS) - before
+}
+
+// ---------------------------------------------------------- the keyboard
+
+fn keyboard(state: u64) {
+    var s_ready: [u8; 12] = "kbd: ready\0\0"
+    var s_got: [u8; 6] = "kbd: \0"
+    var s_none: [u8; 7] = "(none)\0"
+    let mode: u64 = kstate.get(state, kstate.MODE)
+    if (mode & 256) != 0 || (mode & 1024) != 0 {
+        return
+    }
+    serial.puts((&s_ready[0]) as u64)
+    serial.nl()
+    let start: u64 = kstate.get(state, kstate.TICKS)
+    var waiting: bool = true
+    while waiting {
+        if kstate.get(state, kstate.KEYLEN) >= KEYS_WANTED {
+            waiting = false
+        }
+        if kstate.get(state, kstate.TICKS) - start >= KEY_TIMEOUT {
+            waiting = false
+        }
+        if waiting {
+            idt.halt()
+        }
+    }
+    serial.puts((&s_got[0]) as u64)
+    let n: u64 = kstate.get(state, kstate.KEYLEN)
+    if n == 0 {
+        serial.puts((&s_none[0]) as u64)
+    } else {
+        serial.text(state + kstate.KEYBUF, n)
+    }
+    serial.nl()
+}
+
+// ------------------------------------------------------------- ring 3
+
+fn ring3(state: u64) {
+    var s_off: [u8; 20] = "ring3: skipped\0\0\0\0\0\0"
+    var s_bad: [u8; 15] = "ring3: FAILED\0\0"
+    if has_word(kstate.get(state, kstate.MODE), 4) {
+        serial.puts((&s_off[0]) as u64)
+        serial.nl()
+        return
+    }
+    if !user.run(state) {
+        serial.puts((&s_bad[0]) as u64)
+        serial.nl()
+    }
+}
+
+// ------------------------------------------------- the deliberate faults
+
+// The kernel provokes the fault itself, so that the report can be
+// checked. Each one of them ends in `trap.report` -- and there in
+// `power.shutdown`.
+fn provoke(state: u64, mode: u64) {
+    var s_go: [u8; 22] = "trap: provoking kind \0"
+    let kind: u64 = mode & 0xFF
+    if kind == 0 {
+        return
+    }
+    serial.puts((&s_go[0]) as u64)
+    serial.dec(kind)
+    serial.nl()
+    if kind == 1 {
+        // #DE. The divisor comes out of the data area and is zero -- an
+        // MMIO read, so that no pass can fold it away.
+        let zero: u64 = kstate.get(state, kstate.TICKS)
+        kstate.set(state, kstate.LAST_TRAP, 42 / zero)
+    }
+    if kind == 2 {
+        // #PF at exactly the first octet that boot.s did not map.
+        kstate.set(state, kstate.LAST_TRAP, __mmio_read64(0x40000000 as *mut u64))
+    }
+    if kind == 3 {
+        // #GP: an address that is not canonical.
+        __mmio_write64(0x0000800000000000 as *mut u64, 1)
+    }
+    if kind == 4 {
+        // #DF: a fault whose report faults again, because rsp is
+        // unusable. Only IST1 catches this.
+        asm("mov rsp, 0\npush rax")
+    }
+}
+
+// --------------------------------------------------------- command line
+
+// Bits 0..7 = kind of fault, bit 8 = no keyboard, bit 9 = no ring 3.
+fn mode_of(cmd: u64) -> u64 {
+    var s_trap: [u8; 6] = "trap=\0"
+    var nokbd: [u8; 6] = "nokbd\0"
+    var noring: [u8; 8] = "noring3\0"
+    var notimer: [u8; 8] = "notimer\0"
+    var r3fault: [u8; 11] = "ring3fault\0"
+    if cmd == 0 {
+        return 0
+    }
+    var mode: u64 = 0
+    let at_trap: u64 = find(cmd, (&s_trap[0]) as u64, 5)
+    if at_trap != 0 {
+        let a: u64 = kstate.get8(at_trap + 5)
+        let b: u64 = kstate.get8(at_trap + 6)
+        if a == 100 && b == 101 {
+            mode = 1                        // de
+        }
+        if a == 112 && b == 102 {
+            mode = 2                        // pf
+        }
+        if a == 103 && b == 112 {
+            mode = 3                        // gp
+        }
+        if a == 100 && b == 102 {
+            mode = 4                        // df
+        }
+    }
+    if find(cmd, (&nokbd[0]) as u64, 5) != 0 {
+        mode = mode | 256
+    }
+    if find(cmd, (&noring[0]) as u64, 7) != 0 {
+        mode = mode | 512
+    }
+    if find(cmd, (&notimer[0]) as u64, 7) != 0 {
+        mode = mode | 1024
+    }
+    if find(cmd, (&r3fault[0]) as u64, 10) != 0 {
+        mode = mode | 2048
+    }
+    return mode
+}
+
+fn has_word(mode: u64, which: u64) -> bool {
+    if which == 2 {
+        return (mode & 256) != 0
+    }
+    return (mode & 512) != 0
+}
+
+// Address of the first occurrence, or 0. The command line is a C string.
+fn find(hay: u64, needle: u64, n: u64) -> u64 {
+    var i: u64 = 0
+    while kstate.get8(hay + i) != 0 {
+        var k: u64 = 0
+        var hit: bool = true
+        while k < n {
+            if kstate.get8(hay + i + k) != kstate.get8(needle + k) {
+                hit = false
+                k = n
+            } else {
+                k = k + 1
+            }
+        }
+        if hit {
+            return hay + i
+        }
+        i = i + 1
+    }
+    return 0
+}

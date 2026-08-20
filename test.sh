@@ -37,6 +37,11 @@
 #      `profile kernel`, inline assembly, MMIO, `#[interrupt]` -- the
 #      kernel example becomes an ELF object file WITHOUT undefined
 #      symbols, in BOTH compilers, and is linked against a linker script.
+#  22. The kernel (tools/kernel/run.sh, round 59): `demos/kernel/kmain.fi`
+#      boots in QEMU and is checked over its serial output -- IDT and
+#      exception reports (#DE, #PF, #GP, #DF), PIC/PIT with a tick counter
+#      that runs up, memory map, frame allocator and heap, keyboard over
+#      IRQ1, ring 3 with `syscall`/`sysret`. With counter-checks.
 #  10. DOM soak run (tools/dom_soak/run.sh): the DOM prototype in Firn builds
 #      real cycles continuously (parent/child, listener, JS wrapper) and must
 #      not grow while doing so; the deliberately leaking counter-check with
@@ -399,7 +404,24 @@ else
     tail -20 "$WORK/packages.log" | sed 's/^/   /'
 fi
 
-echo "== 21. english migration: no German identifiers left (tools/english/check.sh) =="
+echo "== 22. the kernel really runs: IDT, timer, memory, keyboard, ring 3 (tools/kernel/run.sh) =="
+# Round 59. `demos/kernel/kmain.fi` is booted in QEMU -- once per case,
+# each with a time limit. Checked is the SERIAL OUTPUT and the exit code:
+# exceptions with error code and register set, a tick counter that runs
+# up, frame allocator and heap with allocate/free/allocate again,
+# keys over IRQ1, and the way into ring 3 and back. With counter-checks:
+# masked IRQ0 counts zero ticks, without keys nothing appears, and `hlt`
+# in the user program yields #GP with cs=0x2b.
+bash tools/kernel/run.sh > "$WORK/kernel.log" 2>&1 && KRRC=0 || KRRC=$?
+if [ "$KRRC" -eq 0 ]; then
+    ok
+    tail -1 "$WORK/kernel.log" | sed 's/^/   /'
+else
+    bad "tools/kernel/run.sh failed (see .test-work/kernel.log)"
+    grep FAIL "$WORK/kernel.log" | head -10 | sed 's/^/   /'
+fi
+
+echo "== 21. english migration: no German identifiers left (tools/english/check.sh) ==
 # Stage A (round 55): every identifier in compiler/src, lib, bin, tools,
 # tests and demos is held against the morpheme table. A hit means
 # that a German name was overlooked.

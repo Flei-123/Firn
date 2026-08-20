@@ -1,0 +1,470 @@
+// demos/kernel/mem.fi -- round 59: physical memory and a kernel heap.
+//
+// Three layers, each one built on the one below:
+//
+//   1. THE MEMORY MAP. The boot loader knows what really is there;
+//      guessing is not allowed. Multiboot puts a list of regions
+//      somewhere in memory and names its address in the information
+//      structure. Everything of type 1 is usable RAM.
+//   2. THE FRAME ALLOCATOR. One bit per 4 KiB page: set means taken. The
+//      bitmap lies in the kernel data area, 16 KiB for 512 MiB of RAM.
+//      Everything the boot loader did not report as usable stays taken
+//      forever, as does everything below `kernel_end` -- the kernel is
+//      standing in it.
+//   3. THE HEAP. Frames are 4 KiB; a kernel needs 24 octets as well.
+//      Above the frames sits an implicit free list: every block carries
+//      its size and a flag, `kfree` merges neighbours again. First fit,
+//      no size classes -- what a kernel needs at the start and no more.
+//
+// The proofs (`frame_selftest`, `heap_selftest`) run in the kernel
+// itself and print what they measured; `tools/kernel/run.sh` reads the
+// lines and compares. Allocating, freeing, allocating again -- and no two
+// blocks that overlap.
+
+import serial
+import kstate
+
+export {
+    scan, frame_alloc, frame_free, frame_run, frames_free,
+    heap_init, kalloc, kfree, heap_blocks,
+    frame_selftest, heap_selftest,
+    FRAME_SIZE, cmdline
+}
+
+const FRAME_SIZE: u64 = 4096
+const HEADER: u64 = 16                  // size + flag per heap block
+
+// ------------------------------------------------- the multiboot header
+
+// Offsets in the multiboot information structure (specification 3.3).
+const MB_FLAGS: u64 = 0
+const MB_CMDLINE: u64 = 16
+const MB_MMAP_LEN: u64 = 44
+const MB_MMAP_ADDR: u64 = 48
+
+// Address of the command line, or 0. `-append` of QEMU lands here; the
+// kernel reads out of it which fault it is supposed to provoke.
+fn cmdline(mbi: u64) -> u64 {
+    if (kstate.get32(mbi + MB_FLAGS) & 4) == 0 {
+        return 0
+    }
+    return kstate.get32(mbi + MB_CMDLINE)
+}
+
+// ------------------------------------------------------ the frame bitmap
+
+fn bit_get(bitmap: u64, i: u64) -> bool {
+    return (kstate.get8(bitmap + i / 8) & (1 << (i % 8))) != 0
+}
+
+fn bit_set(bitmap: u64, i: u64) {
+    let p: u64 = bitmap + i / 8
+    kstate.set8(p, (kstate.get8(p) | (1 << (i % 8))) as u8)
+}
+
+fn bit_clear(bitmap: u64, i: u64) {
+    let p: u64 = bitmap + i / 8
+    kstate.set8(p, (kstate.get8(p) & (255 ^ (1 << (i % 8)))) as u8)
+}
+
+// Reads the memory map, builds the bitmap, marks the kernel as taken.
+// Returns the number of map entries seen.
+fn scan(state: u64, mbi: u64, kernel_end: u64) -> u64 {
+    let bitmap: u64 = state + kstate.BITMAP_OFF
+    let frames: u64 = kstate.BITMAP_BYTES * 8
+    kstate.set(state, kstate.BITMAP, bitmap)
+    kstate.set(state, kstate.BITMAP_FRAMES, frames)
+
+    // Everything is taken until the map says otherwise.
+    var i: u64 = 0
+    while i < kstate.BITMAP_BYTES {
+        kstate.set8(bitmap + i, 0xFF as u8)
+        i = i + 1
+    }
+
+    var entries: u64 = 0
+    var usable: u64 = 0
+    var top: u64 = 0
+    if (kstate.get32(mbi + MB_FLAGS) & 64) != 0 {
+        let len: u64 = kstate.get32(mbi + MB_MMAP_LEN)
+        let addr: u64 = kstate.get32(mbi + MB_MMAP_ADDR)
+        var p: u64 = addr
+        while p < addr + len {
+            let size: u64 = kstate.get32(p)
+            let base: u64 = __mmio_read64((p + 4) as *mut u64)
+            let length: u64 = __mmio_read64((p + 12) as *mut u64)
+            let kind: u64 = kstate.get32(p + 20)
+            entries = entries + 1
+            if kind == 1 {
+                usable = usable + length
+                if base + length > top {
+                    top = base + length
+                }
+                release(bitmap, frames, base, length)
+            }
+            if size == 0 {
+                p = addr + len            // a broken map must not loop
+            } else {
+                p = p + size + 4
+            }
+        }
+    }
+    kstate.set(state, kstate.MEM_USABLE, usable)
+    kstate.set(state, kstate.MEM_TOP, top)
+
+    // The kernel itself, the first megabyte and the map are taken.
+    reserve(bitmap, frames, 0, kernel_end)
+    if (kstate.get32(mbi + MB_FLAGS) & 64) != 0 {
+        reserve(bitmap, frames, kstate.get32(mbi + MB_MMAP_ADDR),
+                kstate.get32(mbi + MB_MMAP_LEN))
+    }
+    reserve(bitmap, frames, mbi, 4096)
+
+    var free: u64 = 0
+    var f: u64 = 0
+    while f < frames {
+        if !bit_get(bitmap, f) {
+            free = free + 1
+        }
+        f = f + 1
+    }
+    kstate.set(state, kstate.FRAMES_FREE, free)
+    return entries
+}
+
+// Mark a region as free -- only whole frames that lie completely in it.
+fn release(bitmap: u64, frames: u64, base: u64, length: u64) {
+    var f: u64 = (base + FRAME_SIZE - 1) / FRAME_SIZE
+    let last: u64 = (base + length) / FRAME_SIZE
+    while f < last {
+        if f >= frames {
+            return
+        }
+        bit_clear(bitmap, f)
+        f = f + 1
+    }
+}
+
+// Mark a region as taken -- every frame it touches at all.
+fn reserve(bitmap: u64, frames: u64, base: u64, length: u64) {
+    var f: u64 = base / FRAME_SIZE
+    let last: u64 = (base + length + FRAME_SIZE - 1) / FRAME_SIZE
+    while f < last {
+        if f >= frames {
+            return
+        }
+        bit_set(bitmap, f)
+        f = f + 1
+    }
+}
+
+fn frames_free(state: u64) -> u64 {
+    return kstate.get(state, kstate.FRAMES_FREE)
+}
+
+// One frame. 0 = nothing free any more.
+fn frame_alloc(state: u64) -> u64 {
+    let bitmap: u64 = kstate.get(state, kstate.BITMAP)
+    let frames: u64 = kstate.get(state, kstate.BITMAP_FRAMES)
+    var f: u64 = 0
+    while f < frames {
+        // A full octet is skipped in one go: that is the reason for the
+        // bitmap in the first place.
+        if kstate.get8(bitmap + f / 8) == 0xFF {
+            f = f + 8 - (f % 8)
+        } else {
+            if !bit_get(bitmap, f) {
+                bit_set(bitmap, f)
+                kstate.set(state, kstate.FRAMES_FREE, frames_free(state) - 1)
+                return f * FRAME_SIZE
+            }
+            f = f + 1
+        }
+    }
+    return 0
+}
+
+fn frame_free(state: u64, addr: u64) {
+    let bitmap: u64 = kstate.get(state, kstate.BITMAP)
+    let f: u64 = addr / FRAME_SIZE
+    if f >= kstate.get(state, kstate.BITMAP_FRAMES) {
+        return
+    }
+    if bit_get(bitmap, f) {
+        bit_clear(bitmap, f)
+        kstate.set(state, kstate.FRAMES_FREE, frames_free(state) + 1)
+    }
+}
+
+// `n` frames in a row -- the heap wants a contiguous region.
+fn frame_run(state: u64, n: u64) -> u64 {
+    let bitmap: u64 = kstate.get(state, kstate.BITMAP)
+    let frames: u64 = kstate.get(state, kstate.BITMAP_FRAMES)
+    var start: u64 = 0
+    while start + n <= frames {
+        var k: u64 = 0
+        var ok: bool = true
+        while k < n {
+            if bit_get(bitmap, start + k) {
+                ok = false
+                k = n
+            } else {
+                k = k + 1
+            }
+        }
+        if ok {
+            var j: u64 = 0
+            while j < n {
+                bit_set(bitmap, start + j)
+                j = j + 1
+            }
+            kstate.set(state, kstate.FRAMES_FREE, frames_free(state) - n)
+            return start * FRAME_SIZE
+        }
+        start = start + 1
+    }
+    return 0
+}
+
+// ---------------------------------------------------------- the heap
+
+fn block_size(h: u64) -> u64 {
+    return __mmio_read64(h as *mut u64)
+}
+
+fn block_used(h: u64) -> u64 {
+    return __mmio_read64((h + 8) as *mut u64)
+}
+
+fn block_write(h: u64, size: u64, used: u64) {
+    __mmio_write64(h as *mut u64, size)
+    __mmio_write64((h + 8) as *mut u64, used)
+}
+
+// One single free block over the whole region.
+fn heap_init(state: u64, base: u64, size: u64) {
+    kstate.set(state, kstate.HEAP_BASE, base)
+    kstate.set(state, kstate.HEAP_END, base + size)
+    kstate.set(state, kstate.HEAP_HEAD, base)
+    block_write(base, size, 0)
+}
+
+// First fit. Returns the address of the payload, 0 when nothing fits.
+fn kalloc(state: u64, want: u64) -> u64 {
+    let base: u64 = kstate.get(state, kstate.HEAP_BASE)
+    let end: u64 = kstate.get(state, kstate.HEAP_END)
+    var need: u64 = (want + 15) / 16 * 16 + HEADER
+    if need < HEADER + 16 {
+        need = HEADER + 16
+    }
+    var h: u64 = base
+    while h < end {
+        let size: u64 = block_size(h)
+        if size == 0 {
+            return 0                        // broken chain, do not loop
+        }
+        if block_used(h) == 0 && size >= need {
+            if size - need >= HEADER + 16 {
+                block_write(h + need, size - need, 0)
+                block_write(h, need, 1)
+            } else {
+                block_write(h, size, 1)
+            }
+            return h + HEADER
+        }
+        h = h + size
+    }
+    return 0
+}
+
+// Free and merge with the following free neighbours. Merging only
+// forwards is enough as long as `kfree` walks the whole chain -- and it
+// costs no back pointer per block.
+fn kfree(state: u64, p: u64) {
+    if p == 0 {
+        return
+    }
+    block_write(p - HEADER, block_size(p - HEADER), 0)
+    let base: u64 = kstate.get(state, kstate.HEAP_BASE)
+    let end: u64 = kstate.get(state, kstate.HEAP_END)
+    var h: u64 = base
+    while h < end {
+        let size: u64 = block_size(h)
+        if size == 0 {
+            return
+        }
+        if block_used(h) == 0 && h + size < end && block_used(h + size) == 0 {
+            block_write(h, size + block_size(h + size), 0)
+        } else {
+            h = h + size
+        }
+    }
+}
+
+// Number of blocks, and how many of them are in use.
+fn heap_blocks(state: u64, used_only: bool) -> u64 {
+    let end: u64 = kstate.get(state, kstate.HEAP_END)
+    var h: u64 = kstate.get(state, kstate.HEAP_BASE)
+    var n: u64 = 0
+    while h < end {
+        let size: u64 = block_size(h)
+        if size == 0 {
+            return n
+        }
+        if !used_only || block_used(h) != 0 {
+            n = n + 1
+        }
+        h = h + size
+    }
+    return n
+}
+
+// --------------------------------------------------------- the proofs
+
+// Allocate three frames, free the middle one, allocate again: the same
+// frame has to come back, and no two may overlap.
+fn frame_selftest(state: u64) -> bool {
+    var head: [u8; 13] = "frame test: \0"
+    var s_a: [u8; 3] = "a=\0"
+    var s_b: [u8; 5] = "  b=\0"
+    var s_c: [u8; 5] = "  c=\0"
+    var s_again: [u8; 11] = "  again b=\0"
+    var s_free: [u8; 8] = "  free=\0"
+    let before: u64 = frames_free(state)
+    let a: u64 = frame_alloc(state)
+    let b: u64 = frame_alloc(state)
+    let c: u64 = frame_alloc(state)
+    frame_free(state, b)
+    let again: u64 = frame_alloc(state)
+    serial.puts((&head[0]) as u64)
+    serial.puts((&s_a[0]) as u64)
+    serial.hex(a)
+    serial.puts((&s_b[0]) as u64)
+    serial.hex(b)
+    serial.puts((&s_c[0]) as u64)
+    serial.hex(c)
+    serial.puts((&s_again[0]) as u64)
+    serial.hex(again)
+    serial.puts((&s_free[0]) as u64)
+    serial.dec(frames_free(state))
+    serial.nl()
+    var ok: bool = true
+    if a == 0 || b == 0 || c == 0 || again == 0 {
+        ok = false                          // nothing free
+    }
+    if a == b || b == c || a == c {
+        ok = false                          // handed out twice
+    }
+    if a % FRAME_SIZE != 0 || b % FRAME_SIZE != 0 || c % FRAME_SIZE != 0 {
+        ok = false                          // not a frame boundary
+    }
+    if again != b {
+        ok = false                          // the free frame was not reused
+    }
+    if frames_free(state) != before - 3 {
+        ok = false                          // the accounting does not add up
+    }
+    frame_free(state, a)
+    frame_free(state, again)
+    frame_free(state, c)
+    if frames_free(state) != before {
+        ok = false
+    }
+    return ok
+}
+
+// Allocate three blocks, write a pattern into each, free the middle one,
+// allocate the same size again: it has to land in the hole, and the
+// patterns of the neighbours have to be untouched.
+fn heap_selftest(state: u64) -> bool {
+    var head: [u8; 12] = "heap test: \0"
+    var s_p1: [u8; 4] = "p1=\0"
+    var s_p2: [u8; 6] = "  p2=\0"
+    var s_p3: [u8; 6] = "  p3=\0"
+    var s_reuse: [u8; 9] = "  reuse=\0"
+    var s_blocks: [u8; 11] = "  blocks=\0\0"
+    var s_refused: [u8; 14] = "  1M refused=\0"
+    let p1: u64 = kalloc(state, 24)
+    let p2: u64 = kalloc(state, 100)
+    let p3: u64 = kalloc(state, 24)
+    fill(p1, 24, 0x11)
+    fill(p2, 100, 0x22)
+    fill(p3, 24, 0x33)
+    var ok: bool = true
+    if p1 == 0 || p2 == 0 || p3 == 0 {
+        ok = false
+    }
+    if p1 % 16 != 0 || p2 % 16 != 0 || p3 % 16 != 0 {
+        ok = false
+    }
+    if p1 + 24 > p2 || p2 + 100 > p3 {
+        ok = false                          // the blocks overlap
+    }
+    if !check(p1, 24, 0x11) || !check(p2, 100, 0x22) || !check(p3, 24, 0x33) {
+        ok = false                          // somebody wrote across
+    }
+    // Counter-check: more than the heap has must be REFUSED. An
+    // allocator that hands out something here would hand out memory it
+    // does not own.
+    let toobig: u64 = kalloc(state, 1024 * 1024)
+    if toobig != 0 {
+        ok = false
+    }
+    kfree(state, p2)
+    let reuse: u64 = kalloc(state, 100)
+    if reuse != p2 {
+        ok = false                          // the hole was not used
+    }
+    if !check(p1, 24, 0x11) || !check(p3, 24, 0x33) {
+        ok = false
+    }
+    serial.puts((&head[0]) as u64)
+    serial.puts((&s_p1[0]) as u64)
+    serial.hex(p1)
+    serial.puts((&s_p2[0]) as u64)
+    serial.hex(p2)
+    serial.puts((&s_p3[0]) as u64)
+    serial.hex(p3)
+    serial.puts((&s_reuse[0]) as u64)
+    serial.hex(reuse)
+    serial.puts((&s_blocks[0]) as u64)
+    serial.dec(heap_blocks(state, false))
+    serial.puts((&s_refused[0]) as u64)
+    if toobig == 0 {
+        serial.dec(1)
+    } else {
+        serial.dec(0)
+    }
+    serial.nl()
+    // Give everything back: afterwards the heap has to be ONE block
+    // again, otherwise the merging is broken.
+    kfree(state, p1)
+    kfree(state, reuse)
+    kfree(state, p3)
+    if heap_blocks(state, false) != 1 {
+        ok = false
+    }
+    if heap_blocks(state, true) != 0 {
+        ok = false
+    }
+    return ok
+}
+
+fn fill(p: u64, n: u64, value: u64) {
+    var i: u64 = 0
+    while i < n {
+        kstate.set8(p + i, value as u8)
+        i = i + 1
+    }
+}
+
+fn check(p: u64, n: u64, value: u64) -> bool {
+    var i: u64 = 0
+    while i < n {
+        if kstate.get8(p + i) != value {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
