@@ -1,0 +1,141 @@
+// demos/kernel/trap.fi -- round 59: what happens after an interrupt.
+//
+// `isr.s` has saved the registers and knows the vector; from here on
+// everything is Firn. Three cases:
+//
+//   * vector < 32: an EXCEPTION. The processor has no intention of going
+//     on; it is reported with error code, instruction pointer, CR2 and
+//     all sixteen general purpose registers -- and then the machine
+//     stops. A kernel that silently continues after a #GP is lying.
+//   * vector 32: the timer. Counter up, end of interrupt.
+//   * vector 33: the keyboard. Read the scan code, translate, note.
+//
+// The frame is what `isr.s` built; the offsets are documented there and
+// stand once more below.
+
+import serial
+import kstate
+import kbd
+import power
+
+export { entry }
+
+// Offsets in the trap frame (see isr.s).
+const F_VECTOR: u64 = 120
+const F_ERROR: u64 = 128
+const F_RIP: u64 = 136
+const F_CS: u64 = 144
+const F_RFLAGS: u64 = 152
+const F_RSP: u64 = 160
+const F_SS: u64 = 168
+
+const VEC_TIMER: u64 = 32
+const VEC_KEYBOARD: u64 = 33
+
+fn word(frame: u64, off: u64) -> u64 {
+    return __mmio_read64((frame + off) as *mut u64)
+}
+
+// `KERNEL_TRAP` out of isr.s. rdi = frame, rsi = kernel data area.
+fn entry(frame: u64, state: u64) {
+    let vector: u64 = word(frame, F_VECTOR)
+    kstate.add(state, kstate.TRAPS, 1)
+    kstate.set(state, kstate.LAST_TRAP, vector)
+    if vector < 32 {
+        report(frame, state, vector)
+        // does not return
+    }
+    if vector == VEC_TIMER {
+        kstate.add(state, kstate.TICKS, 1)
+    }
+    if vector == VEC_KEYBOARD {
+        kbd.irq(state)
+    }
+    eoi(vector)
+}
+
+// End of interrupt to the PIC. Written out here and not called from
+// `idt.fi`, because `idt` imports `serial` and `trap` does too -- the
+// module graph stays a tree that way.
+fn eoi(vector: u64) {
+    if vector >= 40 {
+        serial.out8(0xA0 as u16, 0x20 as u8)
+    }
+    serial.out8(0x20 as u16, 0x20 as u8)
+}
+
+// ------------------------------------------------------- the exception
+
+fn cr2() -> u64 {
+    return asm("mov rax, cr2", out("rax"))
+}
+
+fn report(frame: u64, state: u64, vector: u64) {
+    // Four octets per name, so that the index is a multiplication and not
+    // a search: entry n starts at 4 * n.
+    var names: [u8; 128] = "#DE\0#DB\0NMI\0#BP\0#OF\0#BR\0#UD\0#NM\0#DF\0#CO\0#TS\0#NP\0#SS\0#GP\0#PF\0r15\0#MF\0#AC\0#MC\0#XM\0#VE\0#CP\0r22\0r23\0r24\0r25\0r26\0#HV\0#VC\0#SX\0r30\0r31\0"
+    var head: [u8; 15] = "*** EXCEPTION \0"
+    var s_err: [u8; 7] = "  err=\0"
+    var s_cr2: [u8; 7] = "  cr2=\0"
+    var s_rip: [u8; 6] = "rip=\0\0"
+    var s_cs: [u8; 6] = "  cs=\0"
+    var s_flg: [u8; 10] = "  rflags=\0"
+    var s_rsp: [u8; 8] = "  rsp=\0\0"
+    var s_ss: [u8; 6] = "  ss=\0"
+    var s_tail: [u8; 20] = "*** kernel halted\0\0\0"
+
+    serial.nl()
+    serial.puts((&head[0]) as u64)
+    serial.dec(vector)
+    serial.put(32 as u8)
+    serial.puts((&names[0]) as u64 + vector * 4)
+    serial.puts((&s_err[0]) as u64)
+    serial.hex(word(frame, F_ERROR))
+    if vector == 14 {
+        serial.puts((&s_cr2[0]) as u64)
+        serial.hex(cr2())
+    }
+    serial.nl()
+
+    serial.put(32 as u8)
+    serial.put(32 as u8)
+    serial.puts((&s_rip[0]) as u64)
+    serial.hex(word(frame, F_RIP))
+    serial.puts((&s_cs[0]) as u64)
+    serial.hex(word(frame, F_CS))
+    serial.puts((&s_flg[0]) as u64)
+    serial.hex(word(frame, F_RFLAGS))
+    serial.puts((&s_rsp[0]) as u64)
+    serial.hex(word(frame, F_RSP))
+    serial.puts((&s_ss[0]) as u64)
+    serial.hex(word(frame, F_SS))
+    serial.nl()
+
+    registers(frame)
+    serial.puts((&s_tail[0]) as u64)
+    serial.nl()
+    power.shutdown(power.EXIT_TRAP)
+}
+
+// All sixteen, four per line. `rsp` comes out of the processor's frame,
+// the other fifteen out of the pushes in isr.s.
+fn registers(frame: u64) {
+    var names: [u8; 64] = "rax\0rbx\0rcx\0rdx\0rsi\0rdi\0rbp\0rsp\0r8 \0r9 \0r10\0r11\0r12\0r13\0r14\0r15\0"
+    // Offset in the frame, divided by 8 -- see isr.s.
+    var offs: [u8; 16] = [14 as u8, 11 as u8, 13 as u8, 12 as u8,
+                          9 as u8, 8 as u8, 10 as u8, 20 as u8,
+                          7 as u8, 6 as u8, 5 as u8, 4 as u8,
+                          3 as u8, 2 as u8, 1 as u8, 0 as u8]
+    var i: u64 = 0
+    while i < 16 {
+        serial.put(32 as u8)
+        serial.put(32 as u8)
+        serial.puts((&names[0]) as u64 + i * 4)
+        serial.put(61 as u8)
+        serial.hex_width(word(frame, offs[i as usize] as u64 * 8), 16)
+        if i % 4 == 3 {
+            serial.nl()
+        }
+        i = i + 1
+    }
+}

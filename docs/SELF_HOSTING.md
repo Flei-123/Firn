@@ -2299,3 +2299,31 @@ text sites, length entries, path names, comment and documentation lines.
 
 The source text of Firn — compiler, runtime, library, tests, tools and
 documentation — is English.
+
+## 45. Round 59 — a kernel as a load test for the language
+
+Round 59 built a small operating system core in Firn out of nine modules
+(`demos/kernel/kmain.fi` and the files beside it): its own IDT with
+exception reports, PIC and PIT with a tick counter, the memory map of the
+boot loader with a frame allocator and a heap, the keyboard over IRQ1,
+and the switch into ring 3 with `syscall`/`sysret`. It boots in QEMU, and
+`tools/kernel/run.sh` holds its serial output against expectations in 46
+cases (section 22 of `test.sh`).
+
+**For self-hosting the interesting number is the one that did not move.**
+Not one line of the compiler was changed in that round — and the fixpoint
+has the same size as before it, to the line:
+
+`test.sh` **854/854** (847 plus 2 x 3 build stages of the new tests
+890/891 plus the new section), self-comparison **234 same / 0 differing /
+0 faulty**, fixpoint **character-identical, 554 923 lines** (exactly as in
+round 57), FREESTANDING **41/41**, KERNEL **46/46**, all five
+counter-checks of the English migration at zero.
+
+What the kernel could not get out of the language is named in
+`docs/ROUND59.md` 8 and 9: no `static` (the mutable state lives in a
+memory region whose address the prologue hands over), only ONE output
+operand per `asm` (`rdmsr` puts edx:eax together inside the template), no
+function pointers (an address is called with `asm("call rax", ...)`), no
+`~`, and no line continuation. None of that stopped the kernel; all of it
+is worth a round of its own.
