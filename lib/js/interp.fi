@@ -163,7 +163,7 @@ fn error_message(r: Gc[Realm], v: Gc[JsVal]) -> AllocError!Gc[JsVal] {
 
 fn to_boolean(r: Gc[Realm], v: Gc[JsVal]) -> bool {
     let t: u64 = val.val_tag(v)
-    if t == val.TAG_UNDEF || t == val.TAG_NULL || t == val.TAG_HOLE {
+    if t == val.TAG_UNDEF || t == val.TAG_NULL || t == val.TAG_GAP {
         return false
     }
     if t == val.TAG_BOOL {
@@ -268,7 +268,7 @@ fn to_number(r: Gc[Realm], v: Gc[JsVal]) -> AllocError!u64 {
     if t == val.TAG_NUM {
         return math.math_bits(val.num_value(v))
     }
-    if t == val.TAG_UNDEF || t == val.TAG_HOLE {
+    if t == val.TAG_UNDEF || t == val.TAG_GAP {
         return math.math_bits(math.math_f64(0x7FF8000000000000))
     }
     if t == val.TAG_NULL {
@@ -422,7 +422,7 @@ fn to_string(r: Gc[Realm], v: Gc[JsVal]) -> AllocError!Gc[JsVal] {
     if t == val.TAG_STR {
         return v
     }
-    if t == val.TAG_UNDEF || t == val.TAG_HOLE {
+    if t == val.TAG_UNDEF || t == val.TAG_GAP {
         var m: [u8; 9] = "undefined"
         return val.str_from_ascii(r, &m[0], 9)
     }
@@ -463,7 +463,7 @@ fn to_object(r: Gc[Realm], v: Gc[JsVal]) -> AllocError!Gc[JsObj] {
     if t == val.TAG_OBJ {
         return val.as_obj(v)
     }
-    if t == val.TAG_UNDEF || t == val.TAG_NULL || t == val.TAG_HOLE {
+    if t == val.TAG_UNDEF || t == val.TAG_NULL || t == val.TAG_GAP {
         var m: [u8; 39] = "Cannot convert undefined or null to obj"
         let x: Gc[JsVal] = try throw_type_here(r, &m[0], 39)
         return gc_null[JsObj]()
@@ -607,7 +607,7 @@ fn array_index_get(r: Gc[Realm], o: Gc[JsObj], k: u64,
         return val.realm_undefined(r)
     }
     let e: Gc[JsVal] = val.elems_get(r, o, i as u64)
-    if val.is_hole(e) {
+    if val.is_gap(e) {
         return val.realm_undefined(r)
     }
     *found = true
@@ -814,7 +814,7 @@ fn delete_prop(r: Gc[Realm], base: Gc[JsVal], k: u64,
     if o.cls == val.CLS_ARRAY || o.cls == val.CLS_ARGUMENTS {
         let i: i64 = val.index_of_key(r, k)
         if i >= 0 && (i as u64) < val.elems_len(o) {
-            let ok: bool = try val.elems_set(r, o, i as u64, val.realm_hole(r))
+            let ok: bool = try val.elems_set(r, o, i as u64, val.realm_gap(r))
             return true
         }
     }
@@ -1030,7 +1030,7 @@ fn add_values(r: Gc[Realm], a: Gc[JsVal], b: Gc[JsVal]) -> AllocError!Gc[JsVal] 
 
 fn js_typeof(r: Gc[Realm], v: Gc[JsVal]) -> AllocError!Gc[JsVal] {
     let t: u64 = val.val_tag(v)
-    if t == val.TAG_UNDEF || t == val.TAG_HOLE {
+    if t == val.TAG_UNDEF || t == val.TAG_GAP {
         var m: [u8; 9] = "undefined"
         return val.str_from_ascii(r, &m[0], 9)
     }
@@ -1191,6 +1191,20 @@ fn call_internal(r: Gc[Realm], fv: Gc[JsVal], this: Gc[JsVal], args: Gc[GcVec],
         return throw_error(r, ERR_RANGE, &m[0], 28)
     }
     var out: Gc[JsVal] = val.realm_undefined(r)
+    if f.cls == val.CLS_DEFAULT_CTOR {
+        (*c).depth = (*c).depth - 1 as u32
+        if (newtarget as u64) == 0 {
+            var m: [u8; 44] = "Class constructor cannot be invoked without "
+            return throw_type_here(r, &m[0], 43)
+        }
+        // A derived class without a constructor forwards everything.
+        if f.flags & val.F_DERIVED != 0 && (f.extra as u64) != 0 {
+            let parent: Gc[JsVal] = f.extra
+            let res: Gc[JsVal] = try call_internal(r, parent, this, args,
+                val.as_obj(parent))
+        }
+        return val.realm_undefined(r)
+    }
     if f.cls == val.CLS_NATIVE {
         let h: fn(Gc[Realm], u64, Gc[JsVal], Gc[GcVec], Gc[JsObj]) -> AllocError!Gc[JsVal] = (*c).native
         out = try h(r, f.native, this, args, newtarget)
@@ -1518,7 +1532,7 @@ fn bind_pattern(r: Gc[Realm], env: Gc[Env], pat: u32, v: Gc[JsVal],
     }
     if k == ast.N_ASSIGN_PAT {
         var use: Gc[JsVal] = v
-        if val.is_undefined(v) || val.is_hole(v) {
+        if val.is_undefined(v) || val.is_gap(v) {
             use = try eval_node(r, ast.ast_b(t, pat), env)
             if (*c).comp != C_NORMAL {
                 return false
@@ -1646,6 +1660,9 @@ fn bind_pattern(r: Gc[Realm], env: Gc[Env], pat: u32, v: Gc[JsVal],
     return false
 }
 
+// Is the code being run right now strict? The nearest enclosing FUNCTION
+// decides; outside every function it is the program (`realm.depth` carries
+// that flag, set by the driver from the directive prologue).
 fn is_strict_env(r: Gc[Realm], env: Gc[Env]) -> bool {
     var e: Gc[Env] = env
     while (e as u64) != 0 {
@@ -1705,7 +1722,7 @@ fn iterate_values(r: Gc[Realm], v: Gc[JsVal]) -> AllocError!Gc[GcVec] {
         var i: u64 = 0
         while i < o.len {
             var e: Gc[JsVal] = val.elems_get(r, o, i)
-            if val.is_hole(e) {
+            if val.is_gap(e) {
                 e = val.realm_undefined(r)
             }
             let ok: bool = try gcvec_append[JsVal](out, e)
@@ -2025,7 +2042,7 @@ fn eval_statements(r: Gc[Realm], off: u32, count: usize,
     while i < count {
         let s: u32 = ast.ast_list_at(t, off, i)
         let v: Gc[JsVal] = try eval_node(r, s, env)
-        if !val.is_hole(v) && !val.is_undefined(v) {
+        if !val.is_gap(v) && !val.is_undefined(v) {
             last = v
         }
         if (*c).comp != C_NORMAL {
@@ -2465,7 +2482,7 @@ fn bind_pattern_init(r: Gc[Realm], env: Gc[Env], pat: u32, v: Gc[JsVal],
     }
     if k == ast.N_ASSIGN_PAT {
         var use: Gc[JsVal] = v
-        if val.is_undefined(v) || val.is_hole(v) {
+        if val.is_undefined(v) || val.is_gap(v) {
             use = try eval_node(r, ast.ast_b(t, pat), env)
             if (*c).comp != C_NORMAL {
                 return false
@@ -2564,7 +2581,7 @@ fn eval_array(r: Gc[Realm], node: u32, env: Gc[Env]) -> AllocError!Gc[JsVal] {
     while i < cnt {
         let e: u32 = ast.ast_list_at(t, off, i)
         if e == 0 as u32 {
-            let ok: bool = try val.elems_push(r, a, val.realm_hole(r))
+            let ok: bool = try val.elems_push(r, a, val.realm_gap(r))
             a.len = a.len + 1
             i = i + 1
             continue
@@ -3132,10 +3149,51 @@ fn compound_base(op: u32) -> u32 {
     return lex.P_ADD
 }
 
+// The home object of the method that is running -- `super` hangs on it
+// (10.2.9 / 13.3.7). It is not `this`: `super.m()` looks the method up on
+// the PROTOTYPE OF THE OBJECT THE METHOD WAS DEFINED IN, and calls it with
+// the current `this`.
+fn home_of(r: Gc[Realm], env: Gc[Env]) -> Gc[JsObj] {
+    var e: Gc[Env] = env
+    while (e as u64) != 0 {
+        let f: Gc[JsObj] = val.env_func(e)
+        if (f as u64) != 0 {
+            return f.extra
+        }
+        e = val.env_parent(e)
+    }
+    return gc_null[JsObj]()
+}
+
 fn eval_member(r: Gc[Realm], node: u32, env: Gc[Env],
                base_out: *mut Gc[JsVal]) -> AllocError!Gc[JsVal] {
     let c: *mut Ctx = ctx_of(r)
     let t: *mut ast.Ast = val.realm_ast(r)
+    if ast.ast_kind(t, ast.ast_a(t, node)) == ast.N_SUPER {
+        let this: Gc[JsVal] = this_of(r, env)
+        *base_out = this
+        let home: Gc[JsObj] = home_of(r, env)
+        if (home as u64) == 0 {
+            var m: [u8; 27] = "'super' outside of a method"
+            return throw_type_here(r, &m[0], 27)
+        }
+        var key: u64 = 0
+        if ast.ast_c(t, node) & ast.MB_COMPUTED != 0 as u32 {
+            let kv: Gc[JsVal] = try eval_node(r, ast.ast_b(t, node), env)
+            if (*c).comp != C_NORMAL {
+                return val.realm_undefined(r)
+            }
+            key = try to_property_key(r, kv)
+        } else {
+            key = try static_key(r, ast.ast_b(t, node))
+        }
+        let proto: Gc[JsObj] = val.obj_proto(home)
+        if (proto as u64) == 0 {
+            return val.realm_undefined(r)
+        }
+        let pv: Gc[JsVal] = proto
+        return get_prop_v(r, pv, key, this)
+    }
     let base: Gc[JsVal] = try eval_node(r, ast.ast_a(t, node), env)
     *base_out = base
     if (*c).comp != C_NORMAL {
@@ -3158,7 +3216,7 @@ fn eval_member(r: Gc[Realm], node: u32, env: Gc[Env],
                 let i: u64 = x as u64
                 if (i as f64) == x && i < o.len {
                     let e: Gc[JsVal] = val.elems_get(r, o, i)
-                    if !val.is_hole(e) {
+                    if !val.is_gap(e) {
                         return e
                     }
                 }
@@ -3219,6 +3277,34 @@ fn eval_call(r: Gc[Realm], node: u32, env: Gc[Env]) -> AllocError!Gc[JsVal] {
     let calleen: u32 = ast.ast_a(t, node)
     var this: Gc[JsVal] = val.realm_undefined(r)
     var f: Gc[JsVal] = val.realm_undefined(r)
+    // `super(...)` -- call the parent constructor on the object that is
+    // being built (13.3.7.1).
+    if ast.ast_kind(t, calleen) == ast.N_SUPER {
+        let args0: Gc[GcVec] = try eval_arguments(r, ast.ast_b(t, node),
+            ast.ast_c(t, node) as usize, env)
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        var e: Gc[Env] = env
+        var me: Gc[JsObj] = gc_null[JsObj]()
+        while (e as u64) != 0 {
+            let ff: Gc[JsObj] = val.env_func(e)
+            if (ff as u64) != 0 {
+                me = ff
+                break
+            }
+            e = val.env_parent(e)
+        }
+        if (me as u64) == 0 || (me.extra as u64) == 0 {
+            var m: [u8; 32] = "'super' call outside a construct"
+            return throw_type_here(r, &m[0], 32)
+        }
+        let parent: Gc[JsVal] = me.extra
+        let this0: Gc[JsVal] = this_of(r, env)
+        let res: Gc[JsVal] = try call_internal(r, parent, this0, args0,
+            val.as_obj(parent))
+        return val.realm_undefined(r)
+    }
     if ast.ast_kind(t, calleen) == ast.N_MEMBER {
         f = try eval_member(r, calleen, env, &this)
     } else {
@@ -3490,15 +3576,17 @@ fn eval_for_labeled(r: Gc[Realm], node: u32, env: Gc[Env],
         }
     }
     var out: Gc[JsVal] = val.realm_undefined(r)
-    var guard: u64 = 0
+    // 14.7.4.3 ForBodyEvaluation: the per iteration copy is made ONCE
+    // before the loop and then again BEFORE THE INCREMENT -- not before
+    // the test. That is exactly what makes the closures of
+    // `for (let i = 0; ...)` see 0, 1, 2 instead of three times the last
+    // value.
+    if per_iteration {
+        loop_env = try copy_env(r, loop_env, env)
+    }
     while true {
-        // `let` in the head gets a fresh binding per round (14.7.4.3).
-        var body_env: Gc[Env] = loop_env
-        if per_iteration {
-            body_env = try copy_env(r, loop_env, env)
-        }
         if testn != 0 as u32 {
-            let tv: Gc[JsVal] = try eval_node(r, testn, body_env)
+            let tv: Gc[JsVal] = try eval_node(r, testn, loop_env)
             if (*c).comp != C_NORMAL {
                 return out
             }
@@ -3506,7 +3594,7 @@ fn eval_for_labeled(r: Gc[Realm], node: u32, env: Gc[Env],
                 return out
             }
         }
-        let v: Gc[JsVal] = try eval_node(r, bodyn, body_env)
+        let v: Gc[JsVal] = try eval_node(r, bodyn, loop_env)
         if !val.is_undefined(v) {
             out = v
         }
@@ -3517,14 +3605,14 @@ fn eval_for_labeled(r: Gc[Realm], node: u32, env: Gc[Env],
         if brk {
             return out
         }
+        if per_iteration {
+            loop_env = try copy_env(r, loop_env, env)
+        }
         if updn != 0 as u32 {
-            let x: Gc[JsVal] = try eval_node(r, updn, body_env)
+            let x: Gc[JsVal] = try eval_node(r, updn, loop_env)
             if (*c).comp != C_NORMAL {
                 return out
             }
-        }
-        if per_iteration {
-            loop_env = body_env
         }
     }
     return out
@@ -3836,7 +3924,7 @@ fn eval_class(r: Gc[Realm], node: u32, env: Gc[Env]) -> AllocError!Gc[JsVal] {
         // so a native one takes over that only forwards (15.7.14).
         var cn: [u8; 11] = "constructor"
         ctor = try make_native(r, 9000, 0, &cn[0], 11)
-        ctor.cls = val.CLS_NATIVE
+        ctor.cls = val.CLS_DEFAULT_CTOR
         ctor.native = 9000
         var nv: Gc[JsVal] = val.str_empty(r)
         if name != 0xFFFFFFFF as u32 {
