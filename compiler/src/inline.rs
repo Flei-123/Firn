@@ -1,21 +1,21 @@
 //! Inlining (embedding function bodies) with a size heuristic.
 //!
-//! How it works: one `Op::Call` to a function present within the same
-//! `fir::Module` gets replaced by a copy of its body.
+//! How it works: an `Op::Call` to a function present in the same
+//! `fir::Module` is replaced by a copy of its body.
 //!
-//!  * The calling block gets **split** at the call site; the body of the
-//!    called function gets inserted between as a block group of its own.
-//!  * FIR knows no phi nodes. The return value therefore travels through one
-//!    `alloca` of the entry block of the caller: every `ret v` of the body
+//!  * The calling block is **split** at the call site; the body of the
+//!    called function is inserted between as a block group of its own.
+//!  * FIR knows no phi nodes. The return value therefore travels through an
+//!    `alloca` in the entry block of the caller: every `ret v` of the body
 //!    becomes `store slot, v` + `br <continuation>`, and the original result
-//!    value gets defined at the start of the continuation with `load slot`.
+//!    value is defined at the start of the continuation with `load slot`.
 //!    Given exactly one `ret`, `mem2reg` (alloca written once) resolves this
 //!    detour straight away again.
 //!  * `alloca`s of the body move to the entry block of the caller
-//!    (FIR invariant: all `alloca` stand at `bb0`).
+//!    (FIR invariant: all `alloca` stand in `bb0`).
 //!
 //! **Module boundaries:** the module system compiles all `.fi` files into ONE
-//! `fir::Module` (separate compilation, shared module). Every call of one
+//! `fir::Module` (separate compilation, shared module). Every call of an
 //! imported function is therefore just as visible to this pass as a local
 //! one — inlining works across module boundaries.
 //!
@@ -25,9 +25,9 @@
 //!    blocks at most `MAX_CALLEE_BLOCKS`.
 //!  * caller at most `MAX_CALLER_INSTS` instructions (stop after that).
 //!  * no recursion: if the called function can reach the caller again
-//!    through the call graph, nothing gets embedded.
+//!    through the call graph, nothing is embedded.
 //!  * functions with `secret` values or `#[constant_time]` stay outside
-//!    (SPEC §9: the check at the code generator works per function).
+//!    (SPEC §9: the check in the code generator works per function).
 //!  * at most `MAX_INLINES` embeddings per module.
 
 use crate::fir::{FTy, Func, Inst, Module, Op, Term, Val};
@@ -75,13 +75,13 @@ fn reaches(m: &Module, from: &str, to: &str) -> bool {
 /// Can a function reach itself again through at least one call (direct or
 /// indirect recursion)?
 ///
-/// Such bodies get NOT embedded. Inlining unrolls one recursion level and
+/// Such bodies are NOT embedded. Inlining unrolls one recursion level and
 /// moves its frames into the caller — program code whose effect rests on the
 /// stack depth (the stack scrubbing of the conservative GC, `lib/gc`:
-/// `__gc_scrub_deep`) loses its effect that way. MEASURED at round 37: with
+/// `__gc_scrub_deep`) loses its effect that way. MEASURED in round 37: with
 /// raised bounds (60/10) `__gc_scrub_deep` (29 insts, 9 blocks, recursive)
 /// got embedded into `main` — `tests/520_gc_weak.fi` failed with exit 6,
-/// because phantom pointers within the unscrubbed stack fed the collector.
+/// because phantom pointers in the unscrubbed stack fed the collector.
 ///
 fn reaches_itself_self(m: &Module, name: &str) -> bool {
     if let Some(f) = m.funcs.iter().find(|f| f.name == name) {
@@ -100,15 +100,15 @@ fn reaches_itself_self(m: &Module, name: &str) -> bool {
 
 fn inlinable(callee: &Func) -> bool {
     // Loop free bodies WITHOUT a return value (effect through pointer
-    // arguments, say the sink mutators of the tokenizer) may hold more
+    // arguments, say the sink mutators of the tokenizer) may have more
     // blocks: their control flow is a DAG, and because `dst` is empty, not
-    // even the result alloca comes about at the caller — the frame of the
+    // even the result alloca comes about in the caller — the frame of the
     // caller stays unchanged apart from real body allocas. That is the
     // difference to value bodies: their result cell moves into the entry
-    // block of the caller and changes its frame layout — fatal for the
-    // stack scanning conservative GC (`tests/520_gc_weak.fi`, round 37:
-    // `__gc_strong_raw` embedded into `create` -> phantom pointers, exit 6).
-    // eingebettet -> Phantom-Zeiger, Exit 6).
+    // block of the caller and changes its frame layout — which is fatal
+    // for the stack scanning conservative GC (`tests/520_gc_weak.fi`,
+    // round 37: `__gc_strong_raw` inlined into `create` produced phantom
+    // pointers and exit 6).
     !callee.constant_time
         && callee.secret.is_empty()
         && callee.inst_count() <= MAX_CALLEE_INSTS
@@ -117,9 +117,9 @@ fn inlinable(callee: &Func) -> bool {
         && callee.blocks.iter().enumerate().all(|(i, b)| b.id as usize == i)
 }
 
-/// Looks for a worthwhile call site within the caller `ci`.
+/// Looks for a worthwhile call site in the caller `ci`.
 /// `self_rec`: precomputed per function (does not change through
-/// embeddings — mutated gets the caller only).
+/// embeddings — only the caller is mutated).
 fn find_site(m: &Module, ci: usize, self_rec: &[bool]) -> Option<(usize, usize, usize)> {
     let caller = &m.funcs[ci];
     if caller.constant_time || !caller.secret.is_empty() {
@@ -148,7 +148,7 @@ fn find_site(m: &Module, ci: usize, self_rec: &[bool]) -> Option<(usize, usize, 
                 if inst.dst.is_some() && callee.ret == FTy::Void {
                     continue;
                 }
-                // Recursion (indirect one too) does not get embedded.
+                // Recursion (indirect one too) is not embedded.
                 if reaches(m, &callee.name, &caller.name) {
                     continue;
                 }
@@ -171,9 +171,9 @@ fn inline_one(m: &mut Module, ci: usize, bi: usize, mut ii: usize, gi: usize) {
         _ => return,
     };
 
-    // 1. Create the result slot and the body allocas at the entry block.
+    // 1. Create the result slot and the body allocas in the entry block.
     //    `Func::alloca` inserts at the front — that shifts the call site
-    //    when it sits within bb0 itself.
+    //    when it sits in bb0 itself.
     let mut shift = 0usize;
     let result_slot = if dst.is_some() {
         shift += 1;
@@ -321,13 +321,13 @@ fn remap_op(op: &Op, mv: &dyn Fn(Val) -> Val) -> Op {
     }
 }
 
-/// Embeds as long as the heuristic allows. Yields the count of embedded
+/// Embeds as long as the heuristic allows. Yields the number of embedded
 /// calls.
 pub fn inline_module(m: &mut Module) -> usize {
     let mut n = 0usize;
     let dbg = std::env::var("FIRNC_INLINE_DEBUG").is_ok();
-    // Determined once: hangs off the body of the callee only, which never
-    // changes through embeddings (mutated gets the caller only).
+    // Determined once: it hangs off the body of the callee only, which never
+    // changes through embeddings (only the caller is mutated).
     let self_rec: Vec<bool> = m
         .funcs
         .iter()

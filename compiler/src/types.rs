@@ -1,7 +1,7 @@
 //! Type representation and memory layout (SPEC §11).
 //!
 //! Struct layout: declaration order, natural alignment, no reordering of
-//! the fields. The size gets rounded up to the alignment of the struct.
+//! the fields. The size is rounded up to the alignment of the struct.
 
 use std::collections::HashMap;
 
@@ -112,7 +112,7 @@ impl TypeCtx {
         self.by_name.get(name).copied()
     }
 
-    /// Creates a struct (the layout gets set by `finish_struct`).
+    /// Creates a struct (the layout is set by `finish_struct`).
     pub fn declare(&mut self, name: &str) -> usize {
         let idx = self.structs.len();
         self.structs.push(StructDef {
@@ -126,7 +126,7 @@ impl TypeCtx {
         idx
     }
 
-    /// Computes offsets/size/alignment from (identifier, type) pairs.
+    /// Computes offsets/size/alignment from (name, type) pairs.
     pub fn set_fields(&mut self, idx: usize, fields: Vec<(String, Type)>) {
         let mut off: u64 = 0;
         let mut max_align: u64 = 1;
@@ -171,7 +171,7 @@ impl TypeCtx {
         }
     }
 
-    /// Identifier of the gc class behind a type, if it is one.
+    /// Name of the gc class behind a type, if it is one.
     fn gc_class_name(&self, t: &Type) -> Option<&str> {
         match t {
             Type::Struct(i) => self
@@ -197,8 +197,8 @@ impl TypeCtx {
             Type::Isize => "isize".into(),
             Type::Bool => "bool".into(),
             Type::F64 => "f64".into(),
-            // A pointer to a gc class is spelled `Gc[C]` within the source text
-            // (the struct carries "gc C" as its internal label, see gc.rs).
+            // A pointer to a gc class is spelled `Gc[C]` in the source text
+            // (the struct carries "gc C" as its internal name, see gc.rs).
             Type::Ptr { inner, .. } if self.gc_class_name(inner).is_some() => {
                 match self.gc_class_name(inner) {
                     Some(n) => format!("Gc[{}]", n),

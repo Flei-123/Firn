@@ -1,11 +1,11 @@
-//! Central configuration: the language label and the file suffix live EXCLUSIVELY here.
+//! Central configuration: the language name and the file suffix live EXCLUSIVELY here.
 //! Renaming the language = adjust these three constants, nothing else.
 
 pub const LANG_NAME: &str = "Firn";
 pub const LANG_NAME_LOWER: &str = "firn";
 pub const FILE_EXT: &str = "fi";
 
-/// Label of the compiler binary, derived from the language label.
+/// Name of the compiler binary, derived from the language name.
 pub fn compiler_name() -> String {
     format!("{}c", LANG_NAME_LOWER)
 }

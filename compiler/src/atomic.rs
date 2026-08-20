@@ -36,10 +36,10 @@ use crate::lower::Lower;
 use crate::sema::Checker;
 use crate::types::Type;
 
-/// Identifier of the primitive within the source text.
+/// Identifier of the primitive in the source text.
 pub(crate) const ADD: &str = "__atomic_add";
 
-/// Does this spelling belong to the builtin primitive?
+/// Is this spelling the name of the builtin primitive?
 pub(crate) fn is_atomic_call(name: &str) -> bool {
     name == ADD
 }
@@ -47,7 +47,7 @@ pub(crate) fn is_atomic_call(name: &str) -> bool {
 // ----------------------------------------------------------------- Type phase
 
 /// Hook from `sema::call`. `None` if this is not the primitive or if the
-/// program holds a function of the same spelling — that one wins then.
+/// program contains a function of the same spelling — that one wins then.
 pub(crate) fn hook_call(
     ck: &mut Checker,
     name: &str,

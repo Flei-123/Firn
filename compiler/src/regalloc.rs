@@ -5,49 +5,49 @@
 //! instruction was `load`-`load`-compute-`store`. This file replaces that:
 //!
 //!  1. **Liveness analysis** per basic block (backward flow, `live_in`/
-//!     `live_out`), out of it ONE interval `[start, end]` per value within a
+//!     `live_out`), and from it ONE interval `[start, end]` per value in a
 //!     linear numbering of all instructions.
-//!  2. **Cell promotion:** one `alloca` whose pointer never escapes (direct
-//!     address of `load`/`store` only), that is at most 8 bytes big and that
-//!     always gets addressed at the same width, lives completely within a
-//!     register — `load` turns into a register copy, `store` into a register
-//!     write. That replaces the phi nodes which FIR lacks, and brings exactly
-//!     those loop counters into registers that `mem2reg` (cells written once
-//!     only) cannot promote.
-//!  3. **Linear scan** over the intervals sorted by `start` with the active
-//!     list; should the supply not suffice, the interval with the latest end
-//!     and the smallest weight (uses, weighted with the loop depth) gets
-//!     spilled to the stack. It does NOT get split: a value lies either
-//!     within a register over its whole lifetime or on the stack over its
-//!     whole lifetime — that way no reload logic is needed and the allocation
-//!     is provably behaviour preserving.
+//!  2. **Cell promotion:** an `alloca` whose pointer never escapes (used only
+//!     as the direct address of a `load`/`store`), that is at most 8 bytes
+//!     big and that is always accessed at the same width, lives entirely in
+//!     a register — `load` becomes a register copy, `store` a register write.
+//!     That replaces the phi nodes which FIR does not have, and it brings
+//!     exactly those loop counters into registers that `mem2reg` (cells
+//!     written only once) cannot promote.
+//!  3. **Linear scan** over the intervals sorted by `start`, with an active
+//!     list; if the supply does not suffice, the interval with the latest end
+//!     and the smallest weight (uses, weighted by loop depth) is spilled to
+//!     the stack. It is NOT split: a value lives either in a register for
+//!     its whole lifetime or on the stack for its whole lifetime — that way
+//!     no reload logic is needed and the allocation is provably behaviour
+//!     preserving.
 //!
 //! **Register choice (System V AMD64):**
-//!  * `rax`, `rcx`, `rdx`, `rsi`, `rdi` stay scratch registers and never get
-//!    handed out (they are argument/helper registers of `call`, `syscall`,
+//!  * `rax`, `rcx`, `rdx`, `rsi`, `rdi` stay scratch registers and are never
+//!    handed out (they are the argument/helper registers of `call`, `syscall`,
 //!    `div`, `rep movsb`).
-//!  * Handed out get `rbx`, `r12`, `r13`, `r14`, `r15` (callee-saved, saved
-//!    at prologue/epilogue) and `r11` (caller-saved) — `r11` only for
+//!  * Handed out are `rbx`, `r12`, `r13`, `r14`, `r15` (callee-saved, saved in
+//!    the prologue/epilogue) and `r11` (caller-saved) — `r11` only for
 //!    intervals that span no `call`/`syscall`.
-//!  * `r10`, `r8`, `r9` deliberately do NOT get handed out: they are argument
-//!    registers of `call`/`syscall` and could overwrite a value still needed
-//!    while the argument list gets built.
+//!  * `r10`, `r8`, `r9` are deliberately NOT handed out: they are argument
+//!    registers of `call`/`syscall` and could overwrite a value that is still
+//!    needed while the argument list is being built.
 //!
 //! **SPEC §9:** `Op::Select` stays `cmov`, `Op::Barrier` and `Op::SecureZero`
-//! get produced unchanged, and the check "conditional jump depends on a
-//! `secret` value" holds at this path just as at the base path.
+//! are emitted unchanged, and the check "conditional jump depends on a
+//! `secret` value" holds on this path just as on the base path.
 //!
-//! Since round 43 this path masters **more than six parameters or arguments**
-//! as well (System V: from the seventh on through the stack). Formerly every
-//! function holding such a call fell back to the base path — at the tokenizer
-//! measurement run those were `main`, `tok_emit`, `sink_flush_chars`,
+//! Since round 43 this path can handle **more than six parameters or
+//! arguments** too (System V: from the seventh one on via the stack). Before that
+//! every function containing such a call fell back to the base path — in the
+//! tokenizer measurement run those were `main`, `tok_emit`, `sink_flush_chars`,
 //! `sink_end`, `out_error_list` and `out_word`, together a quarter of all
 //! instructions executed.
 //!
-//! The emission path stays **guarded**: constructs that it does not
-//! master completely (`f64`, unknown block numbering …) make
-//! `emit_func_ra` yield `None`, so that `codegen_x86.rs` uses its
-//! proven base path.
+//! The emission path stays **guarded**: constructs that it does not handle
+//! completely (`f64`, unknown block numbering …) make `emit_func_ra` return
+//! `None`, so that `codegen_x86.rs` falls back to the base path that has
+//! proven itself.
 
 use crate::codegen_x86::{block_label, label, size_word, Emitter, Frame, ARG_REGS};
 use crate::fir::{BinOp, Block, BlockId, CmpOp, FTy, Func, Inst, Op, Term, UnOp, Val};
@@ -56,7 +56,7 @@ use std::collections::HashMap;
 /// Place of a value after the allocation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Loc {
-    /// fixed machine register (64-bit label)
+    /// fixed machine register (64-bit name)
     Reg(&'static str),
     /// stack slot: address = `rbp - off`
     Slot(u64),
@@ -76,14 +76,14 @@ fn used_register(alloc: &Alloc, v: Val, r: &'static str) -> bool {
 /// callee-saved registers that may get handed out (prologue/epilogue save).
 const CALLEE_SAVED: [&str; 5] = ["rbx", "r12", "r13", "r14", "r15"];
 /// caller-saved register for intervals that enclose NO `call`/`syscall`:
-/// then neither the call itself nor the build-up of its argument list
-/// (rdi, rsi, rdx, rcx, r8, r9, r10) can destroy the value.
+/// in that case neither the call itself nor the build-up of its argument
+/// list (rdi, rsi, rdx, rcx, r8, r9, r10) can destroy the value.
 const TEMP_REGS: [&str; 4] = ["r11", "r10", "r9", "r8"];
 /// Argument registers that become free as long as the interval crosses no
 /// `call`/`syscall` and no `copymem`/`secure_zero` (see `Iv`).
 const ARG_SPARE: [&str; 2] = ["rsi", "rdi"];
-/// `rdx` gets used by `div`/`rem`/`select` as a scratch register on top of
-/// that — intervals that cross none of it may carry it.
+/// On top of that `rdx` is used by `div`/`rem`/`select` as a scratch
+/// register — only intervals that cross none of this may carry it.
 const DIV_SPARE: [&str; 1] = ["rdx"];
 
 fn align_up(x: u64, a: u64) -> u64 {
@@ -97,13 +97,13 @@ fn align_up(x: u64, a: u64) -> u64 {
 /// Result of the register allocation of a function.
 pub struct Alloc {
     locs: Vec<Loc>,
-    /// load results that read their value straight at the cell register
+    /// load results that read their value directly from the cell register
     /// (cell alias, round 40): val -> cell register
     alias: HashMap<Val, &'static str>,
-    /// val -> promoted cell out of which it got loaded
+    /// val -> the promoted cell it was loaded from
     alias_src: HashMap<Val, Val>,
-    /// Constants that may stand as immediate operand at EVERY one of their use
-    /// sites: they need neither register nor slot.
+    /// Constants that may appear as an immediate operand at EVERY one of their
+    /// use sites: they need neither a register nor a slot.
     imms: HashMap<Val, i64>,
     /// `alloca` values with a fixed frame offset (addressing without a detour).
     frame_addr: HashMap<Val, u64>,
@@ -121,15 +121,15 @@ impl Alloc {
     pub fn loc(&self, v: Val) -> Loc {
         self.locs.get(v as usize).copied().unwrap_or(Loc::Slot(0))
     }
-    /// Place of a value as SOURCE: a load result with a cell alias lies nowhere,
-    /// its value stands at the cell register. For TARGETS `loc()` holds.
+    /// Place of a value as a SOURCE: a load result with a cell alias lies
+    /// nowhere, its value is in the cell register. For TARGETS `loc()` holds.
     pub fn place(&self, v: Val) -> Loc {
         if let Some(r) = self.alias.get(&v) {
             return Loc::Reg(r);
         }
         self.loc(v)
     }
-    /// Immediate operand of a value, should it be fit as one.
+    /// Immediate operand of a value, if it is suitable as one.
     fn imm(&self, v: Val) -> Option<i64> {
         self.imms.get(&v).copied()
     }
@@ -279,7 +279,7 @@ fn compute_live(f: &Func) -> Live {
 
 // ---------------------------------------------------------- Cell analysis ---
 
-/// Finds `alloca`s that can live completely within a register.
+/// Finds `alloca`s that can live entirely in a register.
 fn promotable_cells(f: &Func) -> HashMap<Val, FTy> {
     let mut cand: HashMap<Val, Option<FTy>> = HashMap::new();
     for b in &f.blocks {
@@ -354,21 +354,21 @@ fn promotable_cells(f: &Func) -> HashMap<Val, FTy> {
 
 // ------------------------------------ Immediate constants / direct addressing ---
 
-/// Constants that may stand as x86 immediate operand at EVERY use site.
-/// They need neither register nor slot then, and their `const` instruction
-/// falls away entirely.
+/// Constants that may appear as an x86 immediate operand at EVERY use site.
+/// They then need neither register nor slot, and their `const` instruction
+/// disappears entirely.
 fn immediate_consts(f: &Func) -> HashMap<Val, i64> {
     let mut cand: HashMap<Val, i64> = HashMap::new();
     for b in &f.blocks {
         for i in &b.insts {
             if let (Some(d), Op::Const(c)) = (i.dst, &i.op) {
                 let v = i.ty.truncate(*c);
-                // Up to 32 bits the immediate may use the whole unsigned range:
-                // `cmp $0xffffffff,%r9d` computes exactly right with 32-bit
-                // operands. Without that exactly EOF (u32 0xFFFFFFFF) falls out
-                // of the immediates, and every EOF comparison within the
-                // tokenizer loads its constant out of a frame slot (round 40:
-                // 52 such spots within `tokenize` alone).
+                // Up to 32 bits the immediate may use the whole unsigned
+                // range: `cmp $0xffffffff,%r9d` computes exactly right with
+                // 32-bit operands. Without that, EOF (u32 0xFFFFFFFF) of all
+                // things drops out of the immediates, and every EOF comparison
+                // in the tokenizer loads its constant from a frame slot
+                // (round 40: 52 such places in `tokenize` alone).
                 let fits = if i.ty.bits() <= 32 {
                     v >= i32::MIN as i128 && v <= u32::MAX as i128
                 } else {
@@ -421,9 +421,9 @@ fn immediate_consts(f: &Func) -> HashMap<Val, i64> {
     cand
 }
 
-/// `alloca`s whose address shows up as `load`/`store` address or as base of
-/// a `ptradd` only: they get addressed through `rbp` directly, the pointer
-/// never has to stand within a register.
+/// `alloca`s whose address appears only as a `load`/`store` address or as the
+/// base of a `ptradd`: they are addressed through `rbp` directly, the pointer
+/// never has to sit in a register.
 fn direct_frame_addrs(f: &Func, fr: &Frame) -> HashMap<Val, u64> {
     let mut cand: HashMap<Val, u64> = HashMap::new();
     for b in &f.blocks {
@@ -526,8 +526,8 @@ pub fn allocate(f: &Func) -> Alloc {
         saved: Vec::new(),
         frame,
     };
-    // Safety net against explosions of memory/time at huge functions:
-    // then it stays at the (correct) stack model.
+    // Safety net against an explosion of memory/time on huge functions:
+    // then it stays with the (correct) stack model.
     if nb == 0 || nv == 0 || nv.saturating_mul(nb) > 8_000_000 {
         return alloc;
     }
@@ -556,10 +556,10 @@ pub fn allocate(f: &Func) -> Alloc {
             if matches!(i.op, Op::CopyMem { .. } | Op::SecureZero { .. }) {
                 memop_pos.push(live.pos[bi][ii]);
             }
-            // Round 49: `Op::AtomicCas` uses `rdx` as third scratch register
+            // Round 49: `Op::AtomicCas` uses `rdx` as a third scratch register
             // (`lock cmpxchg [rcx], rdx`) — exactly like `div`/`rem`/`select`.
-            // Without this entry one interval living across it keeps carrying
-            // `rdx` and gets destroyed. Found at tests/820 (release-fast only).
+            // Without this entry an interval living across it keeps carrying
+            // `rdx` and is destroyed. Found in tests/820 (release-fast only).
             if matches!(
                 i.op,
                 Op::Bin(BinOp::Div | BinOp::Rem, _, _) | Op::Select { .. } | Op::AtomicCas { .. }
@@ -632,13 +632,13 @@ pub fn allocate(f: &Func) -> Alloc {
             continue; // secret values stay at the stack slot (SPEC §9.2)
         }
         if cells.contains_key(&(v as Val)) {
-            continue; // gets treated as a cell
+            continue; // is treated as a cell
         }
         if alloc.imms.contains_key(&(v as Val)) || alloc.frame_addr.contains_key(&(v as Val)) {
             continue; // needs no place at all
         }
         // Values whose place IS the memory (alloca addresses) may get a
-        // register; their content keeps lying at the frame.
+        // register; their content keeps lying in the frame.
         let (s, e) = (start[v], end[v]);
         let cc = call_pos.iter().any(|&p| s <= p && p <= e);
         let cm = memop_pos.iter().any(|&p| s <= p && p <= e);
@@ -658,8 +658,8 @@ pub fn allocate(f: &Func) -> Alloc {
         if start[cv] == usize::MAX {
             continue;
         }
-        // The cell must stand within the register from the start of the function
-        // up to the last access (its content survives blocks without access).
+        // The cell has to sit in the register from the start of the function
+        // to the last access (its content survives blocks without access).
         let s = 0usize;
         let e = end[cv];
         let cc = call_pos.iter().any(|&p| s <= p && p <= e);
@@ -680,8 +680,8 @@ pub fn allocate(f: &Func) -> Alloc {
 
     // ---- the linear scan itself ------
     //
-    // Four pools, from the most restricted to the freest register. `passt`
-    // checks whether a register tolerates the crossings of one interval.
+    // Four pools, from the most restricted to the freest register. `fits`
+    // checks whether a register tolerates the crossings of an interval.
     fn fits(iv: &Iv, r: &str) -> bool {
         if CALLEE_SAVED.contains(&r) {
             return true;
@@ -731,30 +731,30 @@ pub fn allocate(f: &Func) -> Alloc {
         //
         // The intervals are CLOSED: `crosses_call` checks `s <= p && p <= e`.
         // Two closed intervals [a,b] and [c,d] with a <= c therefore overlap
-        // exactly when c <= b — and then they may NOT get the same
+        // exactly when c <= b — and then they must NOT be given the same
         // register.
         //
-        // With `<=` one interval ending at p got released as soon as the next
-        // one BEGAN at p. At classic linear scan that is allowed, because
+        // With `<=` an interval ending at p was released as soon as the next
+        // one BEGAN at p. In a classic linear scan that is allowed, because
         // there "end" is the last USE and "start" is the DEFINITION of the
         // same instruction (read first, then write). Here that assumption
-        // does not hold: the interval bounds come out of `live_in`/`live_out`
-        // at BLOCK BOUNDARIES too. A value that lives from a block placed
-        // later across some earlier one thereby gets the block start as its
-        // beginning — and shared the register with a value defined exactly
-        // there.
+        // does not hold: the interval bounds come from `live_in`/
+        // `live_out` at BLOCK BOUNDARIES as well. A value that lives from a block
+        // placed later on across an earlier one thus gets the block start as
+        // its beginning — and shared the register with a value defined
+        // exactly there.
         //
-        // MEASURED at tests/820_gc_finalizer.fi (`release-fast` only, so with
+        // MEASURED on tests/820_gc_finalizer.fi (`release-fast` only, so with
         // register allocation only): `%355 = z + 24` had the interval
         // [175,356], `%135 = call gc_collect()` the interval [175,175].
-        // Both got `r12`; at runtime the path bb45 (definition of %355) ->
+        // Both got `r12`; at run time the path bb45 (definition of %355) ->
         // bb46 -> bb21 (`mov r12, rax`) -> ... -> bb49 (`mov r8, [r12]`) ran,
         // and the program died with a memory access fault.
         //
-        // The bug is OLDER than round 49: six lines of dummy code within
+        // The bug is OLDER than round 49: six lines of dummy code in
         // `gc_collect` suffice to trigger it with the compiler of the base
-        // (cc1710f). Round 49 merely hit it. With `<` the allocation is
-        // minimally tighter; the measurement stands at docs/RUNDE49.md §3.
+        // (cc1710f). Round 49 merely ran into it. With `<` the allocation is
+        // minimally tighter; the measurement is in docs/RUNDE49.md §3.
         let mut k = 0;
         while k < active.len() {
             if active[k].0.end < iv.start {
@@ -765,8 +765,8 @@ pub fn allocate(f: &Func) -> Alloc {
             }
         }
         // fill the restricted pools first, callee-saved last (it costs
-        // prologue/epilogue) — unless the interval crosses a call, then
-        // callee-saved ones alone qualify.
+        // prologue/epilogue) — unless the interval crosses a call, in which
+        // case only callee-saved ones come into question.
         let pick = if !iv.crosses_call {
             if !free_temp.is_empty() {
                 free_temp.pop()
@@ -819,7 +819,7 @@ pub fn allocate(f: &Func) -> Alloc {
                         continue;
                     }
                 }
-                // otherwise this value stays at the stack slot
+                // otherwise this value stays in the stack slot
             }
         }
     }
@@ -839,13 +839,13 @@ pub fn allocate(f: &Func) -> Alloc {
     let mut nbuf = Vec::new();
     if std::env::var("FIRN_NO_ALIAS").is_err() {
     // ---- cell alias (round 40) -----------------------------------------
-    // `d = load c` with exactly ONE use within the same block, before which
-    // the cell does not get written: d needs no place of its own, its value
-    // stands at the cell register already. The load falls away at the
-    // emission, the use reads the cell register through `loc()` straight —
-    // that strikes the three quarters `mov r9, r15` ahead of every use of
-    // the loop counter (hottest loop of `decode`: 3 copies per iteration,
-    // 33.5 M iterations at the realweb run).
+    // `d = load c` with exactly ONE use in the same block, before which the
+    // cell is not written: d needs no place of its own, its value is already
+    // in the cell register. The load disappears during emission, the use
+    // reads the cell register directly through `loc()` — that strikes three
+    // quarters of the `mov r9, r15` copies in front of every use of the
+    // loop counter (hottest loop of `decode`: 3 copies per iteration,
+    // 33.5 M iterations in the realweb run).
     for b in &f.blocks {
         for (ii, inst) in b.insts.iter().enumerate() {
             let (addr, d) = match (&inst.op, inst.dst) {
@@ -853,9 +853,9 @@ pub fn allocate(f: &Func) -> Alloc {
                 _ => continue,
             };
             // FULL WIDTH ONLY: at 8/16/32 bits the load pulls the relevant bits
-            // out through movzx/mov32 — the cell register holds leftovers up
-            // top, one alias would read them along (round 40, failure picture
-            // 211_generic_struct/430_ct_select/416_fehler_ausgabe).
+            // out via movzx/mov32 — the cell register contains leftovers in the
+            // upper part, and an alias would read them along (round 40, failure
+            // picture 211_generic_struct/430_ct_select/416_error_output).
             if inst.ty.bits().max(8) != 64 {
                 continue;
             }
@@ -867,21 +867,21 @@ pub fn allocate(f: &Func) -> Alloc {
             if needs == 0 {
                 continue;
             }
-            // ALL uses must lie within this block before the cell gets
-            // written again (with several uses the alias strikes every copy
+            // ALL uses must lie in this block before the cell is written
+            // again (with several uses the alias strikes every copy
             // nonetheless, say the counter as index for source AND target
-            // within the copy loop of the decoder).
+            // in the copy loop of the decoder).
             let mut found = 0usize;
             let mut ok = false;
-            // ROUND 41: the cell register may get written by NO other value
-            // between the load and the last use. The allocator did not know
-            // the lifetime extended by the alias and was allowed to hand `rc`
-            // to a value whose span does not overlap the one of the cell
-            // value — then something foreign stands within it while reading.
-            // Failure picture: `43 - start` at bin/print.fi (`print_binop`)
+            // ROUND 41: the cell register must not be written by ANY other
+            // value between the load and the last use. The allocator did not
+            // know about the lifetime extended by the alias and was allowed
+            // to hand `rc` to a value whose span does not overlap that of the
+            // cell value — then something foreign is in it when reading.
+            // Failure picture: `43 - start` in bin/print.fi (`print_binop`)
             // turned into `43 - &tab[start]`, because `lea` wrote the address
             // into exactly that register; the length ran below zero and
-            // `buf_grow` spun forever (endless loop at .astdump on every
+            // `buf_grow` spun forever (endless loop in .astdump on every
             // `||`).
             let mut destroys = false;
             for nj in b.insts.iter().skip(ii + 1) {
@@ -895,9 +895,9 @@ pub fn allocate(f: &Func) -> Alloc {
                     }
                 }
                 // A call destroys all caller-saved registers; the cell
-                // value then stands at the frame only, not at the
+                // value then sits only in the frame, not in the
                 // register. (Failure picture: bin/layoutdump.fi crashed
-                // within `intern_find` with t=0.)
+                // in `intern_find` with t=0.)
                 if matches!(nj.op, Op::Call { .. } | Op::CallIndirect { .. } | Op::Syscall { .. } | Op::ThreadSpawn { .. })
                     && !CALLEE_SAVED.contains(&rc)
                 {
@@ -914,8 +914,8 @@ pub fn allocate(f: &Func) -> Alloc {
             if found == needs {
                 ok = true;
             } else {
-                // A remaining use can sit at the terminator (brcond/ret).
-                // Switch NOT: that one expects the value at the frame
+                // A remaining use can sit in the terminator (brcond/ret).
+                // Switch NOT: that one expects the value in the frame
                 // (codegen_switch).
                 let in_term = match &b.term {
                     Term::BrCond { cond, .. } if *cond == d => 1,
@@ -936,13 +936,13 @@ pub fn allocate(f: &Func) -> Alloc {
     // ---- cell update on the spot (round 40) -----------------------------
     // `d1 = load c` (alias), `v = d1 + k`, `store c, v` with one use each:
     // v gets the cell register as its place — the emission then computes
-    // within the cell register directly (`lea r15, [r15+1]`) and the store
-    // falls away. Condition: between the definition of v and the store the
-    // cell gets neither read nor written (otherwise a reader between them
-    // would see the new value too early) and no call separates the two. No
-    // ALIAS value of the same cell may be outstanding within that window
-    // either (its use expects the old content, which would be overwritten
-    // already).
+    // directly in the cell register (`lea r15, [r15+1]`) and the store
+    // disappears. Condition: between the definition of v and the store the
+    // cell is neither read nor written (otherwise a reader in between would
+    // see the new value too early) and no call separates the two. No ALIAS
+    // value of the same cell may still be outstanding in that window either
+    // (its use expects the old content, which would already have been
+    // overwritten).
     for b in &f.blocks {
         for (ii, inst) in b.insts.iter().enumerate() {
             let (a, k, v) = match (&inst.op, inst.dst) {
@@ -973,7 +973,7 @@ pub fn allocate(f: &Func) -> Alloc {
                     | Op::ThreadSpawn { .. } => break,
                     _ => {}
                 }
-                // is the use of one alias value of the same cell still
+                // is the use of an alias value of the same cell still
                 // outstanding? That one expects the OLD content.
                 nbuf.clear();
                 nj.op.uses(&mut nbuf);
@@ -992,7 +992,7 @@ pub fn allocate(f: &Func) -> Alloc {
 
     }
 
-    // Frame including save slots for the callee-saved registers used
+    // Frame including save slots for the callee-saved registers in use
     used_saved.sort_unstable();
     let (frame, slots) = layout(f, used_saved.len() as u64);
     alloc.frame = frame;
@@ -1002,7 +1002,7 @@ pub fn allocate(f: &Func) -> Alloc {
 
 // ------------------------------------------------------------- Emission ---
 
-/// Register label at the wanted width.
+/// Register name at the wanted width.
 fn rn(name: &str, bits: u32) -> String {
     let b = match bits {
         8 => 0,
@@ -1050,18 +1050,18 @@ fn rn(name: &str, bits: u32) -> String {
 struct Ra<'a> {
     f: &'a Func,
     a: &'a Alloc,
-    /// How often does every value get read as operand? Needed for the fusion
-    /// of `cmp` and conditional jump: only when the comparison result gets
-    /// read EXACTLY ONCE (namely by the terminator) may the `setcc` fall
-    /// away.
+    /// How often is every value read as an operand? Needed for fusing `cmp`
+    /// and the conditional jump: only when the comparison result is read
+    /// EXACTLY ONCE (namely by the terminator) may the `setcc` be left
+    /// out.
     read: Vec<u32>,
     /// Addresses whose only use is the memory access following IMMEDIATELY —
-    /// they move completely into its operand.
+    /// they move entirely into its operand.
     offset: HashMap<Val, Address>,
-    /// Instructions (scaling `shl`/`mul`) that fall away entirely along the way.
+    /// Instructions (scaling `shl`/`mul`) that disappear entirely along the way.
     skipped: std::collections::HashSet<Val>,
-    /// Instructions of which only the FILLING of their register is left: value
-    /// -> source value. The rest of the computation sits within the memory
+    /// Instructions of which only the FILLING of their register is left:
+    /// value -> source value. The rest of the computation sits in the memory
     /// operand of the following access.
     preloader: HashMap<Val, Val>,
 }
@@ -1102,15 +1102,15 @@ impl Address {
 
 /// Address computations that may move completely into the memory access.
 ///
-/// Produced up to round 43 was
+/// Up to round 43 this produced
 ///     lea r9, [r8+168]
 ///     mov r9, qword ptr [r9]
 /// although x86-64 can do the offset itself:
 ///     mov r9, qword ptr [r8+168]
 ///
 /// **Round 51** adds the other two parts of the x86 addressing — index
-/// register and factor. Measured at the tokenizer (realweb, instruction
-/// exact callgrind) there stood ahead of this round:
+/// register and factor. Measured in the tokenizer (realweb, instruction
+/// exact callgrind), before this round the picture was:
 ///
 /// | pattern                                  |          Ir |  share |
 /// |------------------------------------------|------------:|-------:|
@@ -1118,42 +1118,42 @@ impl Address {
 /// | `lea (b,i,1)` + access                   |  16.231.553 |  2,21 % |
 /// | `lea off(b)` + access                    |  14.432.184 |  1,97 % |
 ///
-/// So out of
+/// So what used to be
 ///     mov  r8, qword ptr [rbp-416]
 ///     shl  r8, 2
 ///     lea  r8, [r9+r8]
 ///     mov  r8d, dword ptr [r8]
-/// there is now
+/// now becomes
 ///     mov  r8, qword ptr [rbp-416]
 ///     mov  r8d, dword ptr [r9+r8*4]
 ///
 /// **The conditions are deliberately tight**, because every loosening
 /// extends the lifetime of the base — exactly the class that produced the
-/// miscompile at round 40/41 (docs/RUNDE41.md). Folded gets only when
+/// miscompile in round 40/41 (docs/RUNDE41.md). Folding happens only when
 ///
-///  * the address forming instruction is `ptradd` or a **64-bit** `add`
+///  * the address forming instruction is a `ptradd` or a **64-bit** `add`
 ///    (at 32 bits the addressing would NOT cut the overflow off),
-///  * its result gets read EXACTLY ONCE (terminators counted along),
-///  * this one reader is the instruction following IMMEDIATELY within the
+///  * its result is read EXACTLY ONCE (terminators counted along),
+///  * this one reader is the instruction following IMMEDIATELY in the
 ///    same block and is a `load`/`store` over exactly this address,
-///  * base (and possibly index) lie within a register and are neither a
-///    frame address nor a promoted cell nor a cell alias,
-///  * for the factor: the scaling is a **64-bit** `shl` with 0..3 or a
-///    `mul` with 1/2/4/8, stands IMMEDIATELY ahead of the address forming
-///    and its result likewise gets read exactly once,
+///  * base (and index, if any) lie in a register and are neither a frame
+///    address nor a promoted cell nor a cell alias,
+///  * for the factor: the scaling is a **64-bit** `shl` by 0..3 or a
+///    `mul` by 1/2/4/8, sits IMMEDIATELY in front of the address forming
+///    instruction, and its result is likewise read exactly once,
 ///  * no value of the chain is `secret` (SPEC §9.2: no data dependent
 ///    access).
 ///
-/// The moment of reading base and index thereby shifts by exactly the one
-/// or two instructions that **fall away entirely** along the way — after
-/// that nothing lies between them any more, especially no `call`. The only
-/// registers written at the new spot are the target of the access (which
-/// reads its address first — `mov r8d, dword ptr [r9+r8*4]` is correct) and
-/// the home of the instructions skipped, which does not get written at all
-/// any more.
+/// The moment at which base and index are read thus shifts by exactly the
+/// one or two instructions that **disappear entirely** in the process —
+/// after that nothing lies between them any more, in particular no `call`.
+/// The only registers written at the new place are the target of the access
+/// (which reads its address first — `mov r8d, dword ptr [r9+r8*4]` is
+/// correct) and the home of the skipped instructions, which is not written
+/// at all any more.
 ///
 /// Yields `(addresses per value, scalings skipped)`.
-/// Switchable off with FIRN_NO_FALTUNG=1 (troubleshooting).
+/// Can be switched off with FIRN_NO_FALTUNG=1 (troubleshooting).
 fn foldable_addresses(
     f: &Func,
     a: &Alloc,
@@ -1166,7 +1166,7 @@ fn foldable_addresses(
     if std::env::var_os("FIRN_NO_FALTUNG").is_some() {
         return (out, away, before);
     }
-    // Does the value lie plainly within a register — without special handling?
+    // Does the value simply lie in a register — without special handling?
     let pure_reg = |v: Val| -> Option<&'static str> {
         if a.imm(v).is_some() || a.cell(v).is_some() || f.is_secret(v) {
             return None;
@@ -1188,7 +1188,7 @@ fn foldable_addresses(
             // (1) address forming instruction
             let (base, off) = match &i.op {
                 Op::PtrAdd { base, off } => (*base, *off),
-                // One `add` forms the address only when it computes at full
+                // An `add` forms an address only when it computes at full
                 // width. At 32 bits FIR cuts the result off, the addressing
                 // would not do that.
                 Op::Bin(BinOp::Add, x, y) if i.ty.bits() == 64 => (*x, *y),
@@ -1213,8 +1213,8 @@ fn foldable_addresses(
             if !fits {
                 continue;
             }
-            // Registers that the following access must READ itself —
-            // they may not serve as preload target.
+            // Registers that the following access still has to READ itself —
+            // they must not serve as a preload target.
             let value_reg: Option<&'static str> = match &n.op {
                 Op::Store { val, .. } => match a.place(*val) {
                     Loc::Reg(r) => Some(r),
@@ -1222,9 +1222,9 @@ fn foldable_addresses(
                 },
                 _ => None,
             };
-            // The base lies within a register already — or it gets loaded
+            // The base either lies in a register already — or it is loaded
             // into the register of the address computation, which would
-            // stay unused otherwise (case C, round 51):
+            // otherwise stay unused (case C, round 51):
             //     mov rax, qword ptr [rbp-8]      rather than   mov rax, [rbp-8]
             //     mov r9, qword ptr [rax+8]                     lea r9, [rax+8]
             //                                                   mov r9, [r9]
@@ -1252,7 +1252,7 @@ fn foldable_addresses(
                 }
                 continue;
             }
-            // (3b) index with factor: the scaling stands right ahead of it
+            // (3b) index with factor: the scaling sits right in front of it
             if read.get(off as usize).copied() == Some(1) && idx > 0 {
                 let p = &b.insts[idx - 1];
                 let skal = if p.dst == Some(off) && p.ty.bits() == 64 {
@@ -1272,8 +1272,8 @@ fn foldable_addresses(
                 };
                 if let Some((xi, fact)) = skal {
                     if !f.is_secret(off) && !a.alias.contains_key(&off) && a.cell(off).is_none() {
-                        // Case A: the index lies within a register itself —
-                        // the scaling falls away without replacement.
+                        // Case A: the index lies in a register itself —
+                        // the scaling disappears with no replacement.
                         if let Some(ir) = pure_reg(xi) {
                             if !base_preload || ir != br {
                                 out.insert(
@@ -1287,10 +1287,10 @@ fn foldable_addresses(
                                 continue;
                             }
                         }
-                        // Case B: the index lies at the frame, yet the scaling
-                        // has a register home. Then the UNSCALED value gets
-                        // loaded there and the factor gets left to the
-                        // addressing — one instruction rather than
+                        // Case B: the index lies in the frame, but the
+                        // scaling has a register home. Then the UNSCALED
+                        // value is loaded there and the factor is left to
+                        // the addressing — one instruction instead of
                         // two.
                         if let (Loc::Reg(ir), true) = (a.loc(off), base_may_read(xi)) {
                             if ir != br && Some(ir) != value_reg {
@@ -1308,7 +1308,7 @@ fn foldable_addresses(
                     }
                 }
             }
-            // (3c) index straight out of a register (factor 1)
+            // (3c) index directly from a register (factor 1)
             if let Some(ir) = pure_reg(off) {
                 if !base_preload || ir != br {
                     out.insert(d, Address { base: br, index: Some((ir, 1)), offset: 0 });
@@ -1322,7 +1322,7 @@ fn foldable_addresses(
     (out, away, before)
 }
 
-/// Counts per value how often it shows up as operand (instructions, terminators).
+/// Counts per value how often it appears as an operand (instructions, terminators).
 fn count_reads(f: &Func) -> Vec<u32> {
     let mut n = vec![0u32; f.val_types.len()];
     let mut buf = Vec::new();
@@ -1379,7 +1379,7 @@ impl<'a> Ra<'a> {
     /// Load a value sign/zero extended to `to_bits` into a scratch register.
     fn load_ext(&self, e: &mut Emitter, r: &str, v: Val, ty: FTy, to_bits: u32) {
         if let Some(k) = self.a.imm(v) {
-            // The immediate constant is trimmed to the type already.
+            // The immediate constant is already trimmed to the right type.
             e.line(&format!("mov {}, {}", rn(r, to_bits.max(32)), k));
             return;
         }
@@ -1422,9 +1422,9 @@ pub(crate) fn emit_func_ra(e: &mut Emitter, f: &Func) -> Option<Result<(), Strin
         return None;
     }
     let a = allocate(f);
-    // The function gets emitted into a buffer of its own first; after that the
-    // register descriptor post pass strikes spill stores with immediate
-    // reload of the same value (445x statically at the tokenizer run, round 37).
+    // The function is emitted into a buffer of its own first; after that the
+    // register descriptor post pass strikes spill stores with an immediate
+    // reload of the same value (445x statically in the tokenizer run, round 37).
     let mut tmp = Emitter { out: String::new() };
     match emit_with(&mut tmp, f, &a) {
         Ok(()) => {
@@ -1440,16 +1440,16 @@ pub(crate) fn emit_func_ra(e: &mut Emitter, f: &Func) -> Option<Result<(), Strin
 //
 // Post pass over the finished assembler of ONE function. The allocation
 // writes values without a register into their stack slot (`store_dst`) and
-// loads them at the next use again (`load_full`) — should the value still
-// stand unchanged within the register it got stored from, the reload is for
+// loads them again at the next use (`load_full`) — but if the value is still
+// standing unchanged in the register it was stored from, the reload is for
 // nothing: either entirely (same register) or as a memory access (other
-// target register: `mov rB, rA` rather than `mov rB, [rbp-X]`).
+// target register: `mov rB, rA` instead of `mov rB, [rbp-X]`).
 //
-// Tracked get **value slots** exclusively: their offsets lie at `8..=nv*8`
+// Tracked are **value slots** exclusively: their offsets lie at `8..=nv*8`
 // (layout() hands them out first). `alloca` places and save slots lie
-// behind those and never get tracked — writing through pointers
+// behind those and are never tracked — writing through pointers
 // (`Op::Store`/`CopyMem`/`SecureZero`) can hit them, value slots on the
-// other hand never (their address does not exist within the program).
+// other hand never (their address does not exist in the program).
 //
 // Invalidation (conservative, safety before gain):
 //  * block boundaries (label) and backward/jump lines reset the state —
@@ -1457,10 +1457,10 @@ pub(crate) fn emit_func_ra(e: &mut Emitter, f: &Func) -> Option<Result<(), Strin
 //  * `call` clears all caller-saved registers out of the descriptor,
 //    `syscall` rax/rcx/r11, `rep movsb/stosb` rdi/rsi/rcx, `div/idiv`
 //    rax/rdx, `cqo/cdq` rdx, `setcc` al (= rax).
-//  * Every other instruction that writes a tracked register as target
+//  * Every other instruction that writes a tracked register as its target
 //    operand (mov/lea/add/.../cmov) invalidates exactly that register.
 fn descriptor_peephole(asm: &str, nv: usize) -> String {
-    /// 64-bit trunk register of a register label at any width.
+    /// 64-bit trunk register of a register name at any width.
     fn stem(r: &str) -> &str {
         match r {
             "al" | "ax" | "eax" | "rax" => "rax",
@@ -1482,7 +1482,7 @@ fn descriptor_peephole(asm: &str, nv: usize) -> String {
             }
         }
     }
-    /// Bit width of a register label.
+    /// Bit width of a register name.
     fn width_of(r: &str) -> u32 {
         match r {
             "al" | "bl" | "cl" | "dl" | "sil" | "dil" | "bpl" => 8,
@@ -1511,18 +1511,18 @@ fn descriptor_peephole(asm: &str, nv: usize) -> String {
     // register -> slot_off (the reverse)
     let mut holds: HashMap<String, u64> = HashMap::new();
     // ZERO EXTENSION (round 51). `nullab[r] = k` means: all bits from k on
-    // are guaranteed zero within `r`. Without any entry nothing is known.
+    // are guaranteed zero in `r`. Without an entry nothing is known.
     //
-    // The ground is a property of x86-64 that holds throughout the post
-    // pass: EVERY write to a 32-bit register zeroes the upper 32 bits of the
-    // 64-bit register. A `movzx r32, byte ptr [..]` even says that
+    // The ground for this is a property of x86-64 that holds throughout the
+    // post pass: EVERY write to a 32-bit register zeroes the upper 32 bits
+    // of the 64-bit register. A `movzx r32, byte ptr [..]` even says that
     // everything from bit 8 on is zero.
     //
     // Only with that may a narrow reload be struck: `mov [X], r8d` followed
-    // by `mov r8d, [X]` loads back exactly the bits that stand at r8
-    // already — yet only when r8 is zero up top anyway. Exactly that
-    // condition was missing at round 43, which is why the case got deferred
-    // there (docs/RUNDE43.md §6).
+    // by `mov r8d, [X]` loads back exactly the bits that are already in r8
+    // — but only if r8 is zero up top anyway. Exactly that condition was
+    // missing in round 43, which is why the case was deferred there
+    // (docs/RUNDE43.md §6).
     let mut nullab: HashMap<String, u32> = HashMap::new();
     let kill_reg = |r: &str,
                     sync: &mut HashMap<u64, (String, u32)>,
@@ -1555,10 +1555,10 @@ fn descriptor_peephole(asm: &str, nv: usize) -> String {
         let mn = parts.next().unwrap_or("");
         let ops = parts.next().unwrap_or("").trim();
         // Target forms that we track/replace.
-        // Storing into a VALUE slot, at EVERY width (round 51: formerly `qword`
-        // only). `off <= max_slot` narrows it down to the value slots —
-        // `alloca` places lie behind those and can get written through
-        // pointers.
+        // Storing into a VALUE slot, at EVERY width (round 51: formerly
+        // `qword` only). `off <= max_slot` narrows it down to the value
+        // slots — `alloca` places lie behind those and can be written
+        // through pointers.
         let st_width = if t.starts_with("mov qword ptr [rbp-") {
             Some(64)
         } else if t.starts_with("mov dword ptr [rbp-") {
@@ -1585,7 +1585,7 @@ fn descriptor_peephole(asm: &str, nv: usize) -> String {
                     continue;
                 }
                 // Immediate constant or the like: the slot has a new content
-                // that stands within no register.
+                // that is in no register.
                 if off >= 8 && off <= max_slot {
                     if let Some((r, _)) = sync.remove(&off) {
                         holds.remove(&r);
@@ -1593,14 +1593,14 @@ fn descriptor_peephole(asm: &str, nv: usize) -> String {
                 }
             }
         }
-        // Reload out of a value slot. Four forms, each with its own
+        // Reload from a value slot. Four forms, each with its own
         // condition:
         //   mov  rY,  qword ptr [X]   needs storage width 64
         //   mov  rYd, dword ptr [X]   needs >= 32 and nullab[rY] <= 32
         //   movzx rYd, byte ptr [X]   needs >=  8 and nullab[rY] <=  8
         //   movzx rYd, word ptr [X]   needs >= 16 and nullab[rY] <= 16
-        // `movsx`/`movsxd` stay outside: sign extension cannot be proven
-        // out of `nullab`.
+        // `movsx`/`movsxd` stay outside: sign extension cannot be shown
+        // from `nullab`.
         let rlform = if mn == "mov" {
             if let Some(k) = ops.find(", qword ptr [rbp-") {
                 Some((k, 17usize, 64u32, 64u32))
@@ -1634,7 +1634,7 @@ fn descriptor_peephole(asm: &str, nv: usize) -> String {
                             let same = r2 == z;
                             let already_null = nullab.get(&z).copied().unwrap_or(64) <= ndbits;
                             if same && (min == 64 || already_null) {
-                                // The value stands at the register exactly like that already.
+                                // The value is already in the register exactly like that.
                                 kill_reg(&z, &mut sync, &mut holds);
                                 sync.insert(off, (z.clone(), min));
                                 holds.insert(z.clone(), off);
@@ -1734,8 +1734,8 @@ fn descriptor_peephole(asm: &str, nv: usize) -> String {
         ) || mn.starts_with("cmov")
         {
             let target = ops.split(',').next().unwrap_or("").trim();
-            // CAUTION: the target label can be narrow (`xor eax, eax` zeroes
-            // the whole rax) — the check must go for the TRUNK REGISTER,
+            // CAUTION: the target name can be narrow (`xor eax, eax` zeroes
+            // all of rax) — the check has to go for the TRUNK REGISTER,
             // otherwise a stale descriptor entry survives (round 40: made
             // tests/305_dtoa_hardcases compute wrong).
             let z = stem(target);
@@ -1743,7 +1743,7 @@ fn descriptor_peephole(asm: &str, nv: usize) -> String {
                 let zs = z.to_string();
                 kill_reg(&zs, &mut sync, &mut holds);
                 // Carry the zero extension forward (round 51). A write to a
-                // 32-bit register zeroes the upper 32 bits; `movzx` out of one
+                // 32-bit register zeroes the upper 32 bits; `movzx` from an
                 // 8/16-bit source says even more. Everything else makes the
                 // content up top unknown.
                 let bw = width_of(target);
@@ -1796,18 +1796,18 @@ fn supported(f: &Func) -> bool {
 /// Why does `f` fall back to the base path? `None` = allocation possible.
 fn unsupported_basic(f: &Func) -> Option<String> {
     // ROUND 52: `#[interrupt]` has a calling convention of its own (rescue all
-    // registers, `iretq`). It stands at the base path of `codegen_x86.rs`.
+    // registers, `iretq`). It sits on the base path of `codegen_x86.rs`.
     if f.interrupt {
         return Some("#[interrupt]".into());
     }
     if debug_lines_active(f) {
         return Some("debug lines active".into());
     }
-    // FLOATING POINT: this allocator knows the integer registers alone. `f64`
-    // lives at the SSE registers and needs a second register class with
-    // intervals of its own. As long as that is missing, a function holding
-    // `f64` goes over the base path at `codegen_x86.rs` — correct, yet without
-    // register allocation. Stated honestly at SPEC §14.1.f64.
+    // FLOATING POINT: this allocator knows only the integer registers. `f64`
+    // lives in the SSE registers and needs a second register class with
+    // intervals of its own. As long as that is missing, a function containing
+    // `f64` goes over the base path in `codegen_x86.rs` — correct, but without
+    // register allocation. Stated honestly in SPEC §14.1.f64.
     if f.val_types.iter().any(|t| *t == FTy::F64) {
         return Some("f64 in the value set".into());
     }
@@ -1831,11 +1831,11 @@ fn unsupported_basic(f: &Func) -> Option<String> {
                 }
                 // ROUND 52: inline assembler and MMIO go over the base
                 // path. Both bind fixed registers and are `volatile`; the
-                // allocation would have needed a special rule for it, and a
-                // special rule within the allocator is exactly the sort of
-                // code that produced the bug of round 40. Kernel code thereby
-                // runs without register allocation — slower, yet provably
-                // right. Stated honestly at docs/RUNDE52.md.
+                // allocation would have needed a special rule for that,
+                // and a special rule in the allocator is exactly the sort
+                // of code that produced the bug of round 40. Kernel code
+                // therefore runs without register allocation — slower, but
+                // provably right. Stated honestly in docs/RUNDE52.md.
                 Op::Asm { .. } => return Some("Inline-Assembler".into()),
                 Op::MmioLoad { .. } | Op::MmioStore { .. } => {
                     return Some("MMIO access".into())
@@ -1868,9 +1868,9 @@ fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
         e.line(&format!("mov qword ptr [rbp-{}], {}", off, r));
     }
     // Bring the parameters out of the argument registers into their home.
-    // CAUTION: `r8`/`r9` are argument registers 5/6 AND possible homes of
-    // earlier parameters at the same time. That is why all slot targets come
-    // first (they overwrite no register), then the register targets AT ONCE.
+    // CAUTION: `r8`/`r9` are argument registers 5/6 AND at the same time
+    // possible homes of earlier parameters. That is why all slot targets come
+    // first (they overwrite no register), then the register targets IN PARALLEL.
     let mut prolog_moves: Vec<(String, String)> = Vec::new();
     for (i, _t) in f.params.iter().enumerate().take(ARG_REGS.len()) {
         match ra.a.loc(i as Val) {
@@ -1881,12 +1881,12 @@ fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
         }
     }
     parallel_reg_moves(e, &prolog_moves);
-    // Parameters from the seventh on lie at the frame of the CALLER (System V:
-    // [rbp+16], [rbp+24], … — ahead of those stand the saved return address and
-    // the saved rbp). They get fetched ONLY AFTER the parallel moves: their
-    // target register could otherwise overwrite a source still needed.
-    // `rax` is never the home of a value, being a scratch register, and may
-    // serve as intermediate store here.
+    // Parameters from the seventh on lie in the frame of the CALLER (System V:
+    // [rbp+16], [rbp+24], … — in front of those sit the saved return address
+    // and the saved rbp). They are fetched ONLY AFTER the parallel moves: their
+    // target register could otherwise overwrite a source that is still needed.
+    // `rax`, being a scratch register, is never the home of a value and may
+    // serve as intermediate storage here.
     for (i, _t) in f.params.iter().enumerate().skip(ARG_REGS.len()) {
         let of = 16 + 8 * (i - ARG_REGS.len()) as u64;
         match ra.a.loc(i as Val) {
@@ -1897,14 +1897,14 @@ fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
             Loc::Reg(dst) => e.line(&format!("mov {}, qword ptr [rbp+{}]", dst, of)),
         }
     }
-    // Round 51: the blocks no longer get printed at their FIR order but
+    // Round 51: the blocks are no longer printed in their FIR order but
     // along traces (see `emit_order`).
     let order = emit_order(f);
     for (k, &bi) in order.iter().enumerate() {
         let b = &f.blocks[bi];
         e.raw(&format!("{}:", block_label(&f.name, b.id)));
-        // Fallthrough: should the jump target stand right behind it, the jump
-        // falls away (saves one `jmp` per BrCond with else==next block).
+        // Fallthrough: if the jump target sits right behind it, the jump
+        // disappears (saves one `jmp` per BrCond with else==next block).
         let next = order.get(k + 1).map(|&j| f.blocks[j].id);
         emit_block(e, &ra, b, next)?;
     }
@@ -1913,33 +1913,33 @@ fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
 
 /// **Block layout along traces** (round 51).
 ///
-/// So far the blocks got printed at their FIR numbering. Wherever neither
+/// So far the blocks were printed in their FIR numbering. Wherever neither
 /// `then` nor `else` happened to be the next block, another `jmp` stood
-/// behind the conditional jump — at the tokenizer at 641 spots, measured
-/// **28.414.304 of 775.569.867 instructions (3,66 %)** for those
+/// behind the conditional jump — in the tokenizer at 641 places, measured at
+/// **28.414.304 of 775.569.867 instructions (3,66 %)** for these
 /// unconditional jumps alone:
 ///
 /// ```text
 /// cmp  -0x18(%rbp),%r8
 /// jae  40dbd4          ; then
-/// jmp  40dbe0          ; else — could have been fallthrough
+/// jmp  40dbe0          ; else — could have been a fallthrough
 /// ```
 ///
 /// The method is the usual greedy trace building: from `bb0` the preferred
-/// successor gets followed as long as it is still free; once the trace
-/// breaks off, it carries on at the smallest block not placed yet.
-/// Preferred is the `else` branch — `emit_block` turns the condition around
-/// itself should `then` follow instead, so no case gets lost.
+/// successor is followed as long as it is still free; once the trace breaks
+/// off, it carries on at the smallest block not yet placed. Preferred is the
+/// `else` branch — `emit_block` turns the condition around itself if `then`
+/// follows instead, so no case gets lost.
 ///
-/// **Why that can break nothing.** The order concerns the OUTPUT
+/// **Why this cannot break anything.** The order concerns the OUTPUT
 /// exclusively. Every block has one explicit terminator, and `emit_block`
-/// leaves a jump out only when its target really follows immediately
+/// leaves a jump out only when its target really does follow immediately
 /// (`next`). Liveness analysis, intervals and register choice keep working
-/// on the FIR order and do not get touched here — a value lies at the same
-/// place over its whole lifetime as before.
-/// selben Ort.
+/// on the FIR order and are not touched here — a value still lies in the
+/// same place for its whole lifetime, exactly as it did before this
+/// change.
 ///
-/// Switchable off with `FIRN_NO_LAYOUT=1` (troubleshooting).
+/// Can be switched off with `FIRN_NO_LAYOUT=1` (troubleshooting).
 fn emit_order(f: &Func) -> Vec<usize> {
     let n = f.blocks.len();
     if std::env::var_os("FIRN_NO_LAYOUT").is_some() {
@@ -1983,7 +1983,7 @@ fn emit_order(f: &Func) -> Vec<usize> {
     out
 }
 
-/// Is `s` a 64-bit machine register label (and therefore one operand whose
+/// Is `s` a 64-bit machine register name (and therefore an operand whose
 /// content other register moves can destroy)?
 fn is_reg64(s: &str) -> bool {
     matches!(
@@ -1994,19 +1994,19 @@ fn is_reg64(s: &str) -> bool {
 }
 
 /// Emits a **parallel** register move: all pairs `(target, source)` hold
-/// AT THE SAME TIME, so a target may be the source of another pair at the
-/// same time.
+/// AT THE SAME TIME, so a target may at the same time be the source of
+/// another pair.
 ///
 /// Necessary because `r8`/`r9` are argument registers 5 and 6 as well as
 /// scratch registers of the allocation (`TEMP_REGS`). Moved naively one
-/// after another, the fifth parameter would overwrite one argument that the
+/// after another, the fifth parameter would overwrite an argument that the
 /// sixth still needs — exactly that bug made `tests/024_six_args.fi` yield
-/// 13 rather than 21 without embedding.
+/// 13 instead of 21 without inlining.
 ///
-/// Method: as long as a target exists that no open pair needs as source any
-/// more, that pair gets printed at once. Should only cycles be left, one of
-/// them gets broken open through `rax` — `rax` is never the home of a value
-/// (neither at `CALLEE_SAVED` nor at `TEMP_REGS`).
+/// Method: as long as a target exists that no open pair needs as a source
+/// any more, that pair is printed at once. If only cycles are left, one of
+/// them is broken open through `rax` — `rax` is never the home of a value
+/// (neither in `CALLEE_SAVED` nor in `TEMP_REGS`).
 fn parallel_reg_moves(e: &mut Emitter, pairs: &[(String, String)]) {
     let mut open: Vec<(String, String)> =
         pairs.iter().filter(|(z, q)| z != q).cloned().collect();
@@ -2019,9 +2019,9 @@ fn parallel_reg_moves(e: &mut Emitter, pairs: &[(String, String)]) {
             e.line(&format!("mov {}, {}", z, q));
             continue;
         }
-        // Only cycles left: rescue the old content of the target to rax, so
+        // Only cycles left: rescue the old content of the target into rax, so
         // that the target becomes free; all sources that pointed at it read
-        // out of rax from now on.
+        // from rax from now on.
         let (z, q) = open[0].clone();
         e.line(&format!("mov rax, {}", z));
         for (_, source) in open.iter_mut() {
@@ -2048,10 +2048,10 @@ fn emit_block(e: &mut Emitter, ra: &Ra, b: &Block, next: Option<BlockId>) -> Res
     //
     // Without it every comparison costs seven instructions: `cmp`, `setcc al`,
     // `movzx eax, al`, a copy into the target register, `test`, `jnz`, `jmp`.
-    // So the bool value gets produced, stored and checked against zero right
+    // So the bool value is produced, stored and checked against zero right
     // away. With the fusion there are three: `cmp`, `jcc`, `jmp`.
     //
-    // Measured at `lib/html/mem.fi`: the embedded range check of `buf_at`
+    // Measured on `lib/html/mem.fi`: the inlined range check of `buf_at`
     // produces exactly this pattern, and the decoder runs through it up to
     // five times per character.
     //
@@ -2059,7 +2059,7 @@ fn emit_block(e: &mut Emitter, ra: &Ra, b: &Block, next: Option<BlockId>) -> Res
     //   * the LAST instruction of the block is the comparison — only then can
     //     nothing change the flags between `cmp` and jump,
     //   * its result is the jump condition,
-    //   * it gets read EXACTLY ONCE (otherwise the bool value is needed),
+    //   * it is read EXACTLY ONCE (otherwise the bool value is needed),
     //   * no `secret` value (SPEC §9.2).
     let mergeable = match (&b.term, b.insts.last()) {
         (Term::BrCond { cond, .. }, Some(last)) => {
@@ -2085,17 +2085,17 @@ fn emit_block(e: &mut Emitter, ra: &Ra, b: &Block, next: Option<BlockId>) -> Res
             }
         }
         Term::Switch { val, ty, .. } => {
-            // Round 51: the value travels STRAIGHT from its place to rax.
+            // Round 51: the value travels DIRECTLY from its place to rax.
             // Formerly this path wrote it into its frame slot first, because
-            // `emit_switch` could read it from there only — two memory
+            // `emit_switch` could read it only from there — two memory
             // accesses per state change at the tokenizer (10,2 M Ir on
             // realweb).
             //
-            // Promise to `ValueSource::Loaded`: `Ra::load_ext` ALWAYS emits
+            // Guarantee to `ValueSource::Loaded`: `Ra::load_ext` ALWAYS emits
             // a write to `eax`/`rax` here. The only branch that would emit
             // nothing is "the source is the target register already" — and
-            // `rax` never gets handed out (see CALLEE_SAVED / TEMP_REGS /
-            // ARG_SPARE / DIV_SPARE). For safety exactly that gets checked
+            // `rax` is never handed out (see CALLEE_SAVED / TEMP_REGS /
+            // ARG_SPARE / DIV_SPARE). For safety exactly that is checked
             // here.
             let (v, vty) = (*val, *ty);
             if matches!(ra.a.place(v), Loc::Reg("rax")) {
@@ -2146,7 +2146,7 @@ fn emit_block(e: &mut Emitter, ra: &Ra, b: &Block, next: Option<BlockId>) -> Res
             } else {
                 // Round 51: NO `xor eax, eax` any more. A function with
                 // return type `void` has no result value; System V
-                // leaves `rax` undefined for that case, and within FIR
+                // leaves `rax` undefined in that case, and in FIR
                 // nobody reads the result of a void call (`Op::Call` without
                 // `dst`). Measured at the tokenizer: 4.229.623 calls, so
                 // just as many instructions for nothing.
@@ -2163,8 +2163,8 @@ fn emit_block(e: &mut Emitter, ra: &Ra, b: &Block, next: Option<BlockId>) -> Res
     Ok(())
 }
 
-/// `cmp` and conditional jump as one: the comparison of the last
-/// instruction of the block sets the flags, the terminator reads them at once.
+/// `cmp` and conditional jump in one: the comparison of the last instruction
+/// of the block sets the flags, the terminator reads them immediately.
 fn emit_cmp_br(e: &mut Emitter, ra: &Ra, b: &Block, next: Option<BlockId>) -> Result<(), String> {
     let f = ra.f;
     let last = b.insts.last().ok_or("internal error: empty block at cmp+jcc")?;
@@ -2254,17 +2254,17 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
         }
         Op::Bin(op, x, y) => {
             let d = i.dst.ok_or("internal error: binary operation without target")?;
-            // Round 51: address computation that sits within the following memory
+            // Round 51: address computation that sits in the following memory
             // access (`add` as address forming, `shl`/`mul` as scaling of the index).
             if let Some(src) = ra.preloader.get(&d).copied() {
-                // Of the computing only the filling of the register is left.
+                // Of the computation only filling the register is left.
                 if let Loc::Reg(r) = ra.a.loc(d) {
                     ra.load_full(e, r, src);
                     return Ok(());
                 }
             }
             if ra.offset.contains_key(&d) || ra.skipped.contains(&d) {
-                return Ok(()); // gets read nowhere else
+                return Ok(()); // is read nowhere else
             }
             emit_bin(e, ra, *op, ty, *x, *y, d)?;
         }
@@ -2273,8 +2273,8 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
             let bits = oty.bits().max(8);
             let oa = ra.opnd_w(*a, bits);
             let ob = ra.opnd_w(*b, bits);
-            // `cmp` tolerates at most one memory operand and no immediate on the
-            // left.
+            // `cmp` tolerates at most one memory operand and no immediate on
+            // the left.
             if ra.a.imm(*a).is_some() || (oa.contains('[') && ob.contains('[')) {
                 ra.load_full(e, "rax", *a);
                 e.line(&format!("cmp {}, {}", rn("rax", bits), ob));
@@ -2295,7 +2295,7 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
                 (CmpOp::Ge, false) => "setae",
             };
             e.line(&format!("{} al", cc));
-            // widen straight into the target register — `rax` never gets handed
+            // widen directly into the target register — `rax` is never handed
             // out, which is why `al` is always free here.
             match ra.a.loc(d) {
                 Loc::Reg(dr) => e.line(&format!("movzx {}, al", rn(dr, 32))),
@@ -2358,14 +2358,14 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
         Op::Load { addr } => {
             let d = i.dst.ok_or("internal error: load without target")?;
             if ra.a.alias.contains_key(&d) {
-                // Cell alias: the value stands at the cell register already,
-                // the only use reads it through loc() straight.
+                // Cell alias: the value is already in the cell register,
+                // the only use reads it directly through loc().
                 return Ok(());
             }
             let bits = ty.bits().max(8);
             if let Some((r, _)) = ra.a.cell(*addr) {
-                // Cell within the register: pull the relevant width out only,
-                // straight into the target register when possible.
+                // Cell in the register: pull out only the relevant width,
+                // directly into the target register when possible.
                 let t = match ra.a.loc(d) {
                     Loc::Reg(dr) => dr,
                     Loc::Slot(_) => "rax",
@@ -2393,11 +2393,11 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
                         "[rcx]".to_string()
                     }
                 };
-                // Load STRAIGHT into the target register rather than through rax
-                // and copying afterwards. `mov r9, qword ptr [r9]` is correct: the
-                // instruction reads the address before it writes the target.
-                // That saves one instruction per memory access — within the loop
-                // body of matmul those were two of 24.
+                // Load DIRECTLY into the target register instead of going
+                // through rax and copying afterwards. `mov r9, qword ptr [r9]`
+                // is correct: the instruction reads the address before it
+                // writes the target. That saves one instruction per memory
+                // access — in the loop body of matmul those were two of 24.
                 let zr = match ra.a.loc(d) {
                     Loc::Reg(r) => r,
                     Loc::Slot(_) => "rax",
@@ -2417,8 +2417,8 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
         Op::Store { addr, val } => {
             let bits = ty.bits().max(8);
             if let Some((r, _)) = ra.a.cell(*addr) {
-                // Copied gets the full width always; read get the lower `bits`
-                // bits alone (uniform access width).
+                // The full width is always copied; only the lower `bits`
+                // bits are read (uniform access width).
                 let o = ra.opnd(*val);
                 if o != r {
                     e.line(&format!("mov {}, {}", r, o));
@@ -2451,15 +2451,15 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
                 }
             }
             if ra.offset.contains_key(&d) {
-                // The offset sits at the following memory access; the address
-                // itself gets read nowhere else and needs no `lea`.
+                // The offset sits in the following memory access; the address
+                // itself is read nowhere else and needs no `lea`.
                 return Ok(());
             }
-            // `lea` reads BOTH operands before it writes the target — a collision
-            // between target and offset register is harmless there. Only the
-            // `mov`+`add` way needs the detour through rax; that is why the target
-            // gets chosen optimistically here and taken back at the two `add`
-            // branches alone.
+            // `lea` reads BOTH operands before it writes the target — so a
+            // collision between target and offset register is harmless there.
+            // Only the `mov`+`add` way needs the detour through rax; that is
+            // why the target is chosen optimistically here and taken back in
+            // the two `add` branches alone.
             let dreg = match ra.a.loc(d) {
                 Loc::Reg(r) => r,
                 Loc::Slot(_) => "rax",
@@ -2493,8 +2493,8 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
             } else if let (Some(x), Some(y)) = (base_reg, off_reg) {
                 e.line(&format!("lea {}, [{}+{}]", target, x, y));
             } else if target != "rax" {
-                // The base lies at the frame or is a constant: fetch it to rax
-                // once, then ONE `lea` into the target.
+                // The base lies in the frame or is a constant: fetch it to
+                // rax once, then ONE `lea` into the target.
                 ra.load_full(e, "rax", *base);
                 match (ra.a.imm(*off), off_reg) {
                     (Some(k), _) => lea_sum(e, target, "rax", k),
@@ -2514,22 +2514,22 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
             }
         }
         Op::Call { name, args } => {
-            // Arguments into the argument registers. The allocation does hand `r8`
-            // and `r9` out as home (`TEMP_REGS`), which is why the register to
-            // register moves must happen ALL AT ONCE; operands out of memory or
-            // immediate constants read no register and come
+            // Arguments into the argument registers. The allocation does hand
+            // `r8` and `r9` out as a home (`TEMP_REGS`), which is why the
+            // register to register moves have to happen IN PARALLEL; operands
+            // from memory or immediate constants read no register and come
             // afterwards.
             // Arguments from the seventh on lie on the stack at `call`
-            // ([rsp], [rsp+8], …). They get put down FIRST: after that the
-            // argument registers are free and do not get touched any more. As
-            // intermediate store serves `rax` (never the home of a value); the
-            // sources are rbp relative or registers and stay untouched by
+            // ([rsp], [rsp+8], …). They are put down FIRST: after that the
+            // argument registers are free and are not touched any more. As
+            // intermediate storage serves `rax` (never the home of a value);
+            // the sources are rbp relative or registers and stay untouched by
             // `sub rsp`.
             //
             // ALIGNMENT: at the `call` boundary `rsp` must be 16-fold aligned.
             // After `push rbp` + `sub rsp, <multiple of 16>` it is; the argument
-            // area therefore gets rounded up to 16 as well — word for word like
-            // the base path at codegen_x86.rs.
+            // area is therefore rounded up to 16 as well — word for word like
+            // the base path in codegen_x86.rs.
             let stack = args.len().saturating_sub(ARG_REGS.len());
             let space = align_up(stack as u64 * 8, 16);
             if space > 0 {
@@ -2562,10 +2562,10 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
             }
         }
         // Dynamic dispatch (iface.rs, round 46). Word for word like the `call`
-        // above, only the target stands within a register rather than within a
-        // symbol. The target gets loaded LAST, namely to `rax`: `rax` is never
+        // above, only the target sits in a register instead of in a
+        // symbol. The target is loaded LAST, namely into `rax`: `rax` is never
         // the home of a value (see the head of this file) and no argument
-        // register — so the load can destroy neither one argument set already
+        // register — so the load can destroy neither an argument already set
         // nor the target itself.
         Op::CallIndirect { target, args } => {
             let stack = args.len().saturating_sub(ARG_REGS.len());
@@ -2613,8 +2613,8 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
             if args.is_empty() {
                 return Err("internal error: syscall without number".to_string());
             }
-            // The same class of bug as at the call: `r10`, `r8` and `r9`
-            // are scratch registers of the allocation at the same time.
+            // The same class of bug as with the call: `r10`, `r8` and `r9`
+            // are at the same time scratch registers of the allocation.
             let mut sys_moves: Vec<(String, String)> = Vec::new();
             let mut sys_later: Vec<(usize, Val)> = Vec::new();
             for (k, arg) in args.iter().skip(1).enumerate() {
@@ -2659,9 +2659,9 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
             e.line("rep stosb");
         }
         // Round 49 (thread.rs). As with the atomic addition, rax/rcx/rdx are
-        // never the home of a value; `spawn` uses the system call registers on
-        // top of that and is entered above as call alike, so that no interval
-        // within a caller-saved register lives across it.
+        // never the home of a value; on top of that `spawn` uses the system
+        // call registers and is entered above as call alike, so that no
+        // interval in a caller-saved register lives across it.
         Op::AtomicCas { addr, erw, new } => {
             let d = i.dst.ok_or("internal error: atomcas without target")?;
             ra.load_full(e, "rcx", *addr);
@@ -2686,8 +2686,8 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
         Op::AtomicAdd { addr, val } => {
             // Round 47: ONE instruction, with a `lock` prefix. rax and rcx are
             // never the home of a value (neither CALLEE_SAVED nor TEMP_REGS nor
-            // ARG_SPARE/DIV_SPARE), which is why this instruction needs no entry
-            // at memop_pos/divsel_pos.
+            // ARG_SPARE/DIV_SPARE), which is why this instruction needs no
+            // entry in memop_pos/divsel_pos.
             let d = i.dst.ok_or("internal error: atomadd without target")?;
             ra.load_full(e, "rcx", *addr);
             ra.load_full(e, "rax", *val);
@@ -2702,8 +2702,8 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
             e.line("rep movsb");
         }
         // ROUND 52: unreachable — `unsupported_basic` sends every function
-        // holding inline assembler or MMIO to the base path. As one error rather
-        // than as a silent branch, so that a later loosening flies up.
+        // containing inline assembler or MMIO to the base path. As an error
+        // rather than a silent branch, so that a later loosening flies up.
         Op::Asm { .. } | Op::MmioLoad { .. } | Op::MmioStore { .. } => {
             return Err(
                 "internal error: inline assembler/MMIO in the register-allocating path".to_string(),
@@ -2714,22 +2714,22 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
 }
 
 /// `lea target, [base + offset]` — the address computation of the processor
-/// as arithmetic unit. The gain is no cosmetics: `mov d, a` + `add d, b` are
-/// two instructions and destroy `d`, `lea d, [a+b]` is one and reads only.
-/// That way half the register shuffling falls away within address
-/// computations (`base + i*width`) — at `bench/firn/matmul.fi` 14 of the 27
+/// as an arithmetic unit. The gain is no cosmetics: `mov d, a` + `add d, b`
+/// are two instructions and destroy `d`, `lea d, [a+b]` is one and only reads.
+/// That way half the register shuffling in address computations
+/// (`base + i*width`) disappears — in `bench/firn/matmul.fi` 14 of the 27
 /// instructions of the inner loop were pure register copies.
 ///
-/// **64 bits only.** At 32-bit targets `add eax, ecx` zeroes the upper 32
-/// bits, `lea rax, [rcx+rdx]` does not — the difference is visible as soon
-/// as the value gets passed on as a 64-bit value. That is why the narrow
-/// case stays at the old way.
+/// **64 bits only.** For 32-bit targets `add eax, ecx` zeroes the upper 32
+/// bits, `lea rax, [rcx+rdx]` does not — the difference becomes visible as
+/// soon as the value is passed on as a 64-bit value. That is why the narrow
+/// case stays with the old way.
 ///
-/// **Flags.** `lea` sets none, `add` does. That is harmless here: within FIR
-/// every comparison is one `Op::Cmp` of its own that produces its
-/// `cmp`/`setcc` right one after another. No `setcc`, `jcc` or `cmov` ever
-/// reads the flags of a FIR arithmetic operation.
-/// Does exactly one operand lie within a register and the other at the frame
+/// **Flags.** `lea` sets none, `add` does. That is harmless here: in FIR
+/// every comparison is an `Op::Cmp` of its own that produces its
+/// `cmp`/`setcc` immediately one after the other. No `setcc`, `jcc` or
+/// `cmov` ever reads the flags of a FIR arithmetic operation.
+/// Does exactly one operand lie in a register and the other in the frame
 /// (no immediate)? Then the way through rax with a closing `lea` pays off.
 fn add_over_rax(ra: &Ra, a: Val, b: Val) -> bool {
     let is_reg = |v: Val| ra.a.imm(v).is_none() && matches!(ra.a.place(v), Loc::Reg(_));
@@ -2740,8 +2740,8 @@ fn add_over_rax(ra: &Ra, a: Val, b: Val) -> bool {
 /// Can `d = a op b` be written as a single `lea`?
 ///
 /// 64 bits only (see `lea_sum`), only with a target register, and only when
-/// the operands really qualify as address parts: register + register,
-/// register + immediate, immediate + register. At `sub` additionally
+/// the operands really do qualify as address parts: register + register,
+/// register + immediate, immediate + register. For `sub` additionally
 /// `k != i64::MIN`, because `-k` would overflow otherwise.
 fn lea_possible(ra: &Ra, op: BinOp, ty: FTy, a: Val, b: Val, d: Val) -> bool {
     if ty.bits() <= 32 || !matches!(ra.a.loc(d), Loc::Reg(_)) {
@@ -2780,7 +2780,7 @@ fn emit_bin(
     let bits = if wide { 64 } else { 32 };
     match op {
         BinOp::Mul if ra.a.imm(b).is_some() => {
-            // `imul` knows no two operand form with immediates; powers of two
+            // `imul` has no two operand form with an immediate; powers of two
             // turn into a shift.
             let k = ra.a.imm(b).unwrap_or(1);
             let dst_reg = match (ra.a.loc(d), ra.a.loc(a)) {
@@ -2801,18 +2801,18 @@ fn emit_bin(
                 ra.store_dst(e, d, "rax");
             }
         }
-        // `lea` rather than `mov`+`add`: one instruction, no destroyed target,
-        // and it works even when the second operand lies within the target
-        // register already — there the old way fell back to the rax detour with
-        // THREE instructions.
+        // `lea` instead of `mov`+`add`: one instruction, no destroyed target,
+        // and it works even when the second operand already lies in the target
+        // register — there the old way fell back to the rax detour with THREE
+        // instructions.
         //
-        // The condition checks the lea case COMPLETELY. There deliberately is no
-        // replacement path here: everything else falls into the branch below,
-        // which brings its own protection along (should the second operand stand
-        // within the target register, computing must go through rax). A
-        // replacement path without that protection produced
-        // `mov r9, [rbp-8]` + `add r9, r9` at the first attempt — matmul ran into
-        // a memory access fault. That bug is the reason for this form.
+        // The condition checks the lea case COMPLETELY. There is deliberately no
+        // fallback path here: everything else falls into the branch below,
+        // which brings its own protection along (if the second operand sits in
+        // the target register, the computation has to go through rax). A
+        // fallback path without that protection produced
+        // `mov r9, [rbp-8]` + `add r9, r9` on the first attempt — matmul ran
+        // into a memory access fault. That bug is the reason for this form.
         BinOp::Add | BinOp::Sub if lea_possible(ra, op, ty, a, b, d) => {
             let dr = match ra.a.loc(d) {
                 Loc::Reg(r) => r,
@@ -2835,12 +2835,12 @@ fn emit_bin(
                 },
             }
         }
-        // One operand lies at the frame, the other within a register — by far the
-        // most frequent case within address computations (`base + offset`, where
-        // the base is a parameter at the frame). Fetch it to rax once, then ONE
-        // `lea` into the target. The general branch below needs three
+        // One operand lies in the frame, the other in a register — by far the
+        // most frequent case in address computations (`base + offset`, where
+        // the base is a parameter in the frame). Fetch it to rax once, then
+        // ONE `lea` into the target. The general branch below needs three
         // instructions here, because the target coincides with the register
-        // operand and it therefore must compute through rax and copy back.
+        // operand and it therefore has to compute through rax and copy back.
         BinOp::Add if wide && matches!(ra.a.loc(d), Loc::Reg(_)) && add_over_rax(ra, a, b) => {
             let dr = match ra.a.loc(d) {
                 Loc::Reg(r) => r,
@@ -2865,7 +2865,7 @@ fn emit_bin(
                 BinOp::Xor => "xor",
                 _ => "imul",
             };
-            // compute straight within the target register when possible
+            // compute directly in the target register when possible
             if let Loc::Reg(dr) = ra.a.loc(d) {
                 let ob = ra.opnd_w(b, bits);
                 if ob != rn(dr, bits) {
@@ -2909,11 +2909,11 @@ fn emit_bin(
             if let Some(k) = ra.a.imm(b) {
                 // constant distance: immediate form, no rcx build-up.
                 // Mask like the CPU (32 bits: 5 bits, 64 bits: 6 bits); FIR does
-                // not let widths >= the bit width through the optimizer at all,
-                // yet the mask keeps the assembler text within the imm8
-                // frame.
+                // not let widths >= the bit width through the optimizer in the
+                // first place, but the mask keeps the assembler text within the
+                // imm8 frame.
                 let k = k & if bits == 64 { 63 } else { 31 };
-                // shift straight within the target register when it has one
+                // shift directly in the target register when it has one
                 match ra.a.loc(d) {
                     Loc::Reg(dr) => {
                         ra.load_ext(e, dr, a, ty, bits);
@@ -2942,7 +2942,7 @@ mod tests {
     use crate::codegen_x86::emit;
     use crate::fir::{Module, Term};
 
-    /// Loop with a counter at one `alloca`: the counter must land within a
+    /// Loop with a counter in an `alloca`: the counter has to land in a
     /// register (cell promotion), not on the stack.
     fn loop_func() -> Func {
         let mut f = Func::new("main", vec![], FTy::I32);
@@ -2979,7 +2979,7 @@ mod tests {
     #[test]
     fn loop_body_without_mem_access() {
         let asm = emit(&Module { funcs: vec![loop_func()] }).expect("codegen");
-        // within the body (bb2) no [rbp- may show up any more
+        // in the body (bb2) no [rbp- may appear any more
         let body = asm.split(".Lmain__bb2:").nth(1).unwrap_or("");
         let body = body.split(".Lmain__bb3:").next().unwrap_or("");
         assert!(!body.contains("[rbp-"), "loop body still accesses the stack:\n{}", body);
@@ -3040,7 +3040,7 @@ mod tests {
     }
 
     /// Round 43: more than six parameters are NO reason for the base path any
-    /// more — the seventh comes out of [rbp+16].
+    /// more — the seventh comes from [rbp+16].
     #[test]
     fn many_parameter_stay_in_register_path() {
         let mut f = Func::new("f", vec![FTy::I64; 7], FTy::I64);
@@ -3073,7 +3073,7 @@ mod tests {
     }
     // ---------------------------------------------------------- Round 51 ---
 
-    /// `[base + index*4]` rather than `shl` + `lea` + access.
+    /// `[base + index*4]` instead of `shl` + `lea` + access.
     #[test]
     fn addressing_moves_in_the_mem_operands() {
         let mut f = Func::new("main", vec![FTy::Ptr, FTy::U64], FTy::U64);
@@ -3094,9 +3094,9 @@ mod tests {
         assert!(!body.contains("lea "), "address computation remained:\n{}", asm);
     }
 
-    /// Should the same address get read TWICE, it may not travel into the
+    /// If the same address is read TWICE, it must not travel into the
     /// memory operand — otherwise the base lives longer than the allocator
-    /// knows (the class of bug out of round 40/41).
+    /// knows about (the class of bug from round 40/41).
     #[test]
     fn twice_read_address_becomes_not_folded() {
         let mut f = Func::new("main", vec![FTy::Ptr, FTy::U64], FTy::U64);
@@ -3114,7 +3114,7 @@ mod tests {
         );
     }
 
-    /// A 32-bit `add` may NOT become addressing: there FIR cuts the result
+    /// A 32-bit `add` must NOT become addressing: there FIR cuts the result
     /// off, the addressing would not.
     #[test]
     fn narrow_add_becomes_not_to_address() {
@@ -3124,12 +3124,12 @@ mod tests {
         f.set_term(0, Term::Ret(Some(w)));
         let asm = emit(&Module { funcs: vec![f] }).expect("codegen");
         let body = asm.split("main:").nth(1).unwrap();
-        // The 32-bit addition must stand there as one instruction OF ITS OWN.
-        // Which register the allocator picks for it is its business: the narrow
-        // view is called `eax`..`edi`, yet `r8d`..`r15d` at the extended ones
-        // (the merge of round 49 shifted the choice to `r10d` — the old test
-        // looked for "add e" alone and therefore struck although the code was
-        // right).
+        // The 32-bit addition has to stand there as an instruction OF ITS OWN.
+        // Which register the allocator picks for it is its own business: the
+        // narrow view is called `eax`..`edi`, but `r8d`..`r15d` for the
+        // extended ones (the merge of round 49 shifted the choice to `r10d` —
+        // the old test looked for "add e" only and therefore struck although
+        // the code was right).
         let narrow_addition = body.lines().any(|l| {
             let l = l.trim();
             l.starts_with("add e")
@@ -3142,7 +3142,7 @@ mod tests {
         );
     }
 
-    /// The value of a `switch` comes out of its register, not through the
+    /// The value of a `switch` comes from its register, not through the
     /// frame — and the index needs no `mov eax, eax`.
     #[test]
     fn switch_reads_the_value_without_detour_over_the_frame() {
@@ -3162,7 +3162,7 @@ mod tests {
         assert!(asm.contains("jmp qword ptr [rdx + rax*8]"), "{}", asm);
         assert!(!asm.contains("mov eax, eax"), "superfluous zero extension:\n{}", asm);
         let body = asm.split("main:").nth(1).unwrap();
-        // The value does not get written into its frame slot first.
+        // The value is not written into its frame slot first.
         assert!(
             !body.lines().any(|l| l.trim().starts_with("mov qword ptr [rbp-") && l.contains(", rax")),
             "switch value went out of range:\n{}",
@@ -3171,7 +3171,7 @@ mod tests {
     }
 
     /// Block layout: behind a conditional jump no unconditional one may stand
-    /// any more when one of the two edges can be fallthrough.
+    /// any more when one of the two edges can be a fallthrough.
     #[test]
     fn blocklayout_makes_out_the_second_jump_a_fallthrough() {
         let f = loop_func();

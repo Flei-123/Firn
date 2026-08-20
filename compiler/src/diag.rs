@@ -13,7 +13,7 @@
 
 /// Source position. `line`/`col` are 1-based, `col` and `len` count
 /// CHARACTERS (not bytes), so that the marker sits right under UTF-8.
-/// `file` is the number of the source file inside the source map of `Diags`
+/// `file` is the number of the source file in the source map of `Diags`
 /// (0 = root file). Programs made of a single file always use 0.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Span {
@@ -32,7 +32,7 @@ impl Span {
             len: if len == 0 { 1 } else { len },
         }
     }
-    /// Position inside a particular source file (module system, `modules.rs`).
+    /// Position in a particular source file (module system, `modules.rs`).
     pub fn in_file(file: u32, line: u32, col: u32, len: u32) -> Span {
         Span {
             file,
@@ -118,7 +118,7 @@ impl Diags {
         id
     }
 
-    /// Label of the source file carrying the number `file`.
+    /// Name of the source file carrying the number `file`.
     pub fn file_name(&self, file: u32) -> &str {
         self.files
             .get(file as usize)
@@ -152,7 +152,7 @@ impl Diags {
     }
 
     fn push(&mut self, d: Diag) {
-        // Suppress duplicate messages at the same spot (error recovery).
+        // Suppress duplicate messages at the same place (error recovery).
         if self
             .items
             .iter()
