@@ -1,0 +1,1868 @@
+// lib/layout/flow.fi -- THE LAYOUT. From the box tree to a rectangle per box.
+//
+// Everything of round 61 that computes runs here: the box model with
+// `box-sizing`, the collapsing of adjoining margins, the block flow, the
+// inline flow with line boxes, floats, `position: relative`/`absolute` and
+// a flex container in one axis.
+//
+// THE FIVE PASSES, in this order, and the order is not free:
+//
+//   1. `layout_block`   the normal flow. Every box learns its size and its
+//                       position RELATIVE to the content corner of its
+//                       parent. Out-of-flow boxes are skipped, but their
+//                       static position is written down.
+//   2. `place_tree`     turns the relative positions into viewport
+//                       coordinates and applies `position: relative`.
+//   3. `layout_abs_pass` the absolutely positioned boxes: only now is the
+//                       rectangle of their containing block finished.
+//   4. inline boxes get their union out of their fragments.
+//
+// WHAT MARGIN COLLAPSING REALLY IS. Two adjoining margins do not add up,
+// they become the LARGEST positive plus the SMALLEST negative one -- and
+// "adjoining" reaches through boxes: the top margin of a box is adjoining
+// the top margin of its first child as long as no border, no padding and
+// no block formatting context stands in between. A box whose margins meet
+// EACH OTHER (empty, no border, no padding, no height) "collapses through"
+// and disappears from the flow while its margin stays. Those three
+// sentences are the whole of CSS 2.1, 8.3.1, and they are the reason a
+// block layout cannot simply add heights together.
+import html.mem
+import browser.node
+import css.cascade
+import layout.box
+
+export {
+    layout_document, layout_block, place_tree,
+    min_content_width, max_content_width,
+}
+
+// --------------------------------------------------------- Small helpers
+
+fn border_width(s: Gc[Style], w_slot: usize, style_slot: usize) -> f64 {
+    let bs: u32 = cascade.style_border_style(s, style_slot)
+    if bs == cascade.BS_NONE || bs == cascade.BS_HIDDEN {
+        return 0.0
+    }
+    return cascade.style_length(s, w_slot)
+}
+
+// The four rings of a box, in used values. Percentages of margin AND of
+// padding refer to the WIDTH of the containing block -- also the vertical
+// ones. That is not a mistake in the standard but the price of a layout
+// that must not depend on a height it does not know yet.
+fn resolve_edges(b: Gc[Box], cb_w: f64) {
+    let s: Gc[Style] = b.style
+    b.mt = box.resolve_or_zero(s, cascade.S_MARGIN_TOP, cb_w)
+    b.mr = box.resolve_or_zero(s, cascade.S_MARGIN_RIGHT, cb_w)
+    b.mb = box.resolve_or_zero(s, cascade.S_MARGIN_BOTTOM, cb_w)
+    b.ml = box.resolve_or_zero(s, cascade.S_MARGIN_LEFT, cb_w)
+    b.pt = box.resolve_or_zero(s, cascade.S_PADDING_TOP, cb_w)
+    b.pr = box.resolve_or_zero(s, cascade.S_PADDING_RIGHT, cb_w)
+    b.pb = box.resolve_or_zero(s, cascade.S_PADDING_BOTTOM, cb_w)
+    b.pl = box.resolve_or_zero(s, cascade.S_PADDING_LEFT, cb_w)
+    b.bt = border_width(s, cascade.S_BORDER_TOP, 0)
+    b.br = border_width(s, cascade.S_BORDER_RIGHT, 1)
+    b.bb = border_width(s, cascade.S_BORDER_BOTTOM, 2)
+    b.bl = border_width(s, cascade.S_BORDER_LEFT, 3)
+}
+
+fn h_extra(b: Gc[Box]) -> f64 {
+    return b.bl + b.pl + b.pr + b.br
+}
+
+fn v_extra(b: Gc[Box]) -> f64 {
+    return b.bt + b.pt + b.pb + b.bb
+}
+
+// `box-sizing: border-box` means the specified width already contains
+// padding and border. Subtracting them can go below zero; the standard
+// says the content width is then zero, not negative.
+fn content_from_specified(b: Gc[Box], value: f64, extra: f64) -> f64 {
+    if cascade.style_box_sizing(b.style) != cascade.BOX_BORDER {
+        return value
+    }
+    let v: f64 = value - extra
+    if v < 0.0 {
+        return 0.0
+    }
+    return v
+}
+
+fn specified_to_border(b: Gc[Box], value: f64, extra: f64) -> f64 {
+    if cascade.style_box_sizing(b.style) == cascade.BOX_BORDER {
+        return value
+    }
+    return value + extra
+}
+
+// `min-width` and `max-width` measure the same box `width` does -- with
+// `box-sizing: border-box` that is the BORDER box. Clamping the content
+// width against a border-box limit without converting is off by exactly
+// padding plus border, and only shows up when both are used together.
+fn clamp_width(b: Gc[Box], value: f64, cb_w: f64, cb_valid: bool) -> f64 {
+    return clamp_axis(b, value, cb_w, cb_valid, h_extra(b),
+                      cascade.S_MIN_WIDTH, cascade.S_MAX_WIDTH)
+}
+
+fn clamp_height(b: Gc[Box], value: f64, cb_h: f64, cb_valid: bool) -> f64 {
+    return clamp_axis(b, value, cb_h, cb_valid, v_extra(b),
+                      cascade.S_MIN_HEIGHT, cascade.S_MAX_HEIGHT)
+}
+
+fn clamp_axis(b: Gc[Box], value: f64, reference: f64, ref_valid: bool,
+              extra: f64, min_slot: usize, max_slot: usize) -> f64 {
+    let s: Gc[Style] = b.style
+    var v: f64 = value
+    var limit: f64 = 0.0
+    let mu: u32 = cascade.style_unit(s, max_slot)
+    if mu != cascade.U_NONE && (mu != cascade.U_PERCENT || ref_valid) {
+        if box.resolve(s, max_slot, reference, &limit) {
+            let top: f64 = content_from_specified(b, limit, extra)
+            if v > top {
+                v = top
+            }
+        }
+    }
+    let nu: u32 = cascade.style_unit(s, min_slot)
+    if nu != cascade.U_AUTO && (nu != cascade.U_PERCENT || ref_valid) {
+        if box.resolve(s, min_slot, reference, &limit) {
+            let bottom: f64 = content_from_specified(b, limit, extra)
+            if v < bottom {
+                v = bottom
+            }
+        }
+    }
+    return v
+}
+
+fn is_out_of_flow(b: Gc[Box]) -> bool {
+    return (b.flags & (box.F_ABS | box.F_FLOAT)) != 0 as u32
+}
+
+fn is_float(b: Gc[Box]) -> bool {
+    return (b.flags & box.F_FLOAT) != 0 as u32
+}
+
+fn is_abs(b: Gc[Box]) -> bool {
+    return (b.flags & box.F_ABS) != 0 as u32
+}
+
+fn positioned(b: Gc[Box]) -> bool {
+    let p: u32 = cascade.style_position(b.style)
+    return p != cascade.POS_STATIC
+}
+
+// ------------------------------------------------- The intrinsic widths
+
+// The widest a box wants to be if nothing wraps, and the narrowest it can
+// be without a word sticking out. Needed wherever a width is decided by
+// the CONTENT and not by the containing block: floats, inline-blocks and
+// flex items with `flex-basis: auto`.
+fn text_widths(b: Gc[Box], min_out: *mut f64, max_out: *mut f64) {
+    let t: Gc[Text] = b.elem as Gc[Text]
+    let adv: f64 = box.font_advance(cascade.style_font_size(b.style))
+    var run: f64 = 0.0
+    var total: f64 = 0.0
+    var widest: f64 = 0.0
+    var s: Gc[Strand] = t.data.first
+    while s != gc_null[Strand]() {
+        var i: usize = 0
+        let n: usize = s.len as usize
+        while i < n {
+            let c: u32 = s.chars[i]
+            if c == 32 as u32 || c == 9 as u32 || c == 10 as u32 ||
+               c == 13 as u32 || c == 12 as u32 {
+                if run > widest {
+                    widest = run
+                }
+                run = 0.0
+                total = total + adv
+            } else {
+                run = run + adv
+                total = total + adv
+            }
+            i = i + 1
+        }
+        s = s.next
+    }
+    if run > widest {
+        widest = run
+    }
+    *min_out = widest
+    *max_out = total
+}
+
+fn intrinsic_widths(b: Gc[Box], min_out: *mut f64, max_out: *mut f64) {
+    *min_out = 0.0
+    *max_out = 0.0
+    if b.kind == box.BK_TEXT {
+        text_widths(b, min_out, max_out)
+        return
+    }
+    let s: Gc[Style] = b.style
+    // A specified width in px settles the question for everything below.
+    if b.kind != box.BK_INLINE {
+        let u: u32 = cascade.style_unit(s, cascade.S_WIDTH)
+        if u == cascade.U_PX {
+            let extra: f64 = h_extra(b)
+            var v: f64 = content_from_specified(b, cascade.style_length(s, cascade.S_WIDTH), extra)
+            v = box.clamp_size(v, s, cascade.S_MIN_WIDTH, cascade.S_MAX_WIDTH, 0.0, false)
+            *min_out = v
+            *max_out = v
+            return
+        }
+    }
+    var kid_min: f64 = 0.0
+    var kid_max: f64 = 0.0
+    let n: u64 = box.box_kids(b)
+    if (b.flags & box.F_HAS_BLOCKS) != 0 as u32 || b.kind == box.BK_FLEX {
+        // Block-level children: the widest child decides, and a flex
+        // container is the sum of its items -- treated as the widest here
+        // too, which is honest only for one item (docs/ROUND61.md).
+        var i: u64 = 0
+        while i < n {
+            let c: Gc[Box] = box.box_kid(b, i)
+            if !is_abs(c) {
+                var cmin: f64 = 0.0
+                var cmax: f64 = 0.0
+                intrinsic_widths(c, &cmin, &cmax)
+                let edges: f64 = c.ml + c.mr + h_extra(c)
+                if cmin + edges > kid_min {
+                    kid_min = cmin + edges
+                }
+                if b.kind == box.BK_FLEX {
+                    kid_max = kid_max + cmax + edges
+                } else if cmax + edges > kid_max {
+                    kid_max = cmax + edges
+                }
+            }
+            i = i + 1
+        }
+    } else {
+        // Inline content: the sum is the maximum, the widest unbreakable
+        // piece is the minimum.
+        var i2: u64 = 0
+        var run: f64 = 0.0
+        while i2 < n {
+            let c: Gc[Box] = box.box_kid(b, i2)
+            if !is_abs(c) && !is_float(c) {
+                var cmin: f64 = 0.0
+                var cmax: f64 = 0.0
+                intrinsic_widths(c, &cmin, &cmax)
+                if c.kind == box.BK_TEXT {
+                    // The pieces of a text run join with what stands next
+                    // to them only across a space, and text_widths has
+                    // already accounted for that inside the run.
+                    if cmin > kid_min {
+                        kid_min = cmin
+                    }
+                } else if cmin > kid_min {
+                    kid_min = cmin
+                }
+                kid_max = kid_max + cmax
+            }
+            i2 = i2 + 1
+        }
+        let unused: f64 = run
+    }
+    var mn: f64 = kid_min
+    var mx: f64 = kid_max
+    if b.kind != box.BK_INLINE {
+        mn = box.clamp_size(mn, s, cascade.S_MIN_WIDTH, cascade.S_MAX_WIDTH, 0.0, false)
+        mx = box.clamp_size(mx, s, cascade.S_MIN_WIDTH, cascade.S_MAX_WIDTH, 0.0, false)
+    } else {
+        let inner: f64 = h_extra(b)
+        mn = mn + inner
+        mx = mx + inner
+    }
+    *min_out = mn
+    *max_out = mx
+}
+
+fn min_content_width(b: Gc[Box]) -> f64 {
+    var mn: f64 = 0.0
+    var mx: f64 = 0.0
+    intrinsic_widths(b, &mn, &mx)
+    return mn
+}
+
+fn max_content_width(b: Gc[Box]) -> f64 {
+    var mn: f64 = 0.0
+    var mx: f64 = 0.0
+    intrinsic_widths(b, &mn, &mx)
+    return mx
+}
+
+// The shrink-to-fit width of CSS 2.1, 10.3.5:
+//     min(max(preferred minimum, available), preferred)
+fn shrink_to_fit(b: Gc[Box], available: f64) -> f64 {
+    var mn: f64 = 0.0
+    var mx: f64 = 0.0
+    intrinsic_widths(b, &mn, &mx)
+    var v: f64 = available
+    if mn > v {
+        v = mn
+    }
+    if mx < v {
+        v = mx
+    }
+    return v
+}
+
+// ---------------------------------------------------------- The inline flow
+
+fn item_style_metrics(s: Gc[Style], above: *mut f64, below: *mut f64) {
+    let fs: f64 = cascade.style_font_size(s)
+    let a: f64 = box.font_ascent(fs)
+    let d: f64 = box.font_descent(fs)
+    let lh: f64 = box.used_line_height(s)
+    let half: f64 = (lh - (a + d)) / 2.0
+    *above = a + half
+    *below = d + half
+}
+
+// Turns the inline subtree into a flat vector of items. `pending_space`
+// carries the white-space state ACROSS box borders: `<span>a </span> b`
+// has one space between a and b, not two -- collapsing does not stop at an
+// elem boundary (css-text-3, 4.1.1).
+fn build_items(b: Gc[Box], items: Gc[GcVec], pending_space: *mut bool,
+               any_content: *mut bool, content_w: f64) -> AllocError!bool {
+    let n: u64 = box.box_kids(b)
+    var i: u64 = 0
+    while i < n {
+        let c: Gc[Box] = box.box_kid(b, i)
+        if is_abs(c) || is_float(c) {
+            // Out-of-flow boxes keep their place in the item stream; the
+            // line builder takes them out again. `first_char` says which
+            // kind: 1 = float, 2 = absolutely positioned.
+            let it = try box.item_new(box.IT_ATOMIC, c.style, c)
+            it.width = 0.0
+            it.chars = 1                      // marks: not in the flow
+            it.first_char = 1
+            if is_abs(c) {
+                it.first_char = 2
+            }
+            let ok: bool = try gcvec_append[Item](items, it)
+            i = i + 1
+        } else if c.kind == box.BK_TEXT {
+            let ok2: bool = try text_items(c, items, pending_space, any_content)
+            i = i + 1
+        } else if c.kind == box.BK_ATOMIC {
+            // An atomic inline is laid out HERE: it is a block container
+            // on the inside, and the line cannot be measured before its
+            // width and height stand.
+            let oka0: bool = try layout_atomic(c, content_w)
+            *pending_space = false
+            *any_content = true
+            let it2 = try box.item_new(box.IT_ATOMIC, c.style, c)
+            it2.width = c.ml + c.w + c.mr
+            let ok4: bool = try gcvec_append[Item](items, it2)
+            i = i + 1
+        } else if c.kind == box.BK_INLINE {
+            if (c.flags & box.F_REPLACED) != 0 as u32 {
+                // `<br>`
+                let br = try box.item_new(box.IT_BREAK, c.style, c)
+                let ok5: bool = try gcvec_append[Item](items, br)
+                *pending_space = false
+                i = i + 1
+            } else {
+                // The rings of an inline box: they cost width at the
+                // start and at the end, and they make its rectangle
+                // taller than the text -- but they do NOT make the line
+                // box taller. That is CSS 2.1, 10.6.1, and it is the one
+                // rule about inline boxes everybody gets wrong first.
+                resolve_edges(c, content_w)
+                resolve_relative(c, content_w)
+                let op = try box.item_new(box.IT_OPEN, c.style, c)
+                op.width = c.ml + c.bl + c.pl
+                let ok6: bool = try gcvec_append[Item](items, op)
+                let ok7: bool = try build_items(c, items, pending_space,
+                                                any_content, content_w)
+                let cl = try box.item_new(box.IT_CLOSE, c.style, c)
+                cl.width = c.pr + c.br + c.mr
+                let ok8: bool = try gcvec_append[Item](items, cl)
+                i = i + 1
+            }
+        } else {
+            i = i + 1
+        }
+    }
+    return true
+}
+
+// An inline-level box that is laid out like a block on the inside:
+// `display: inline-block`. Its width is shrink-to-fit unless it is given.
+fn layout_atomic(c: Gc[Box], available: f64) -> AllocError!bool {
+    resolve_edges(c, available)
+    var w: f64 = 0.0
+    if box.resolve(c.style, cascade.S_WIDTH, available, &w) {
+        w = content_from_specified(c, w, h_extra(c))
+    } else {
+        w = shrink_to_fit(c, available - c.ml - c.mr - h_extra(c))
+    }
+    w = clamp_width(c, w, available, true)
+    resolve_relative(c, available)
+    var own: box.FloatCtx = box.floatctx_new()
+    let oki: bool = try box.floatctx_init(&own)
+    return try layout_content(c, w, available, &own)
+}
+
+// The white-space processing of css-text-3, 4.1.1, for `normal`,
+// `nowrap`, `pre`, `pre-wrap` and `pre-line`. What matters here and is
+// easy to get wrong: a run of white space becomes ONE space, and a space
+// at the start of the whole context disappears without a trace.
+fn text_items(c: Gc[Box], items: Gc[GcVec], pending_space: *mut bool,
+              any_content: *mut bool) -> AllocError!bool {
+    let t: Gc[Text] = c.elem as Gc[Text]
+    let s: Gc[Style] = c.style
+    let ws: u32 = cascade.style_white_space(s)
+    let keep: bool = ws == cascade.WS_PRE || ws == cascade.WS_PRE_WRAP
+    let keep_newline: bool = keep || ws == cascade.WS_PRE_LINE
+    let adv: f64 = box.font_advance(cascade.style_font_size(s))
+    var word: u32 = 0
+    var strand: Gc[Strand] = t.data.first
+    while strand != gc_null[Strand]() {
+        var i: usize = 0
+        let n: usize = strand.len as usize
+        while i < n {
+            let ch: u32 = strand.chars[i]
+            let is_nl: bool = ch == 10 as u32
+            let is_space: bool = ch == 32 as u32 || ch == 9 as u32 ||
+                                 is_nl || ch == 13 as u32 || ch == 12 as u32
+            if !is_space {
+                *pending_space = false
+                word = word + 1 as u32
+            } else {
+                if word > 0 as u32 {
+                    let w = try box.item_new(box.IT_WORD, s, gc_null[Box]())
+                    w.chars = word
+                    w.width = adv * (word as f64)
+                    let ok2: bool = try gcvec_append[Item](items, w)
+                    *any_content = true
+                    word = 0
+                }
+                if is_nl && keep_newline {
+                    let br = try box.item_new(box.IT_BREAK, s, gc_null[Box]())
+                    let ok3: bool = try gcvec_append[Item](items, br)
+                    *pending_space = false
+                } else if keep {
+                    let sp2 = try box.item_new(box.IT_SPACE, s, gc_null[Box]())
+                    sp2.width = adv
+                    let ok4: bool = try gcvec_append[Item](items, sp2)
+                    *any_content = true
+                    *pending_space = false
+                } else if *any_content && !*pending_space {
+                    // The collapsed space belongs to the FIRST white space
+                    // of the run and therefore to the elem it stands
+                    // in: `<span>A </span><span> B</span>` puts it in the
+                    // first span, and its rectangle is 40 px wide, not 20.
+                    let sp3 = try box.item_new(box.IT_SPACE, s, gc_null[Box]())
+                    sp3.width = adv
+                    let ok5: bool = try gcvec_append[Item](items, sp3)
+                    *pending_space = true
+                }
+            }
+            i = i + 1
+        }
+        strand = strand.next
+    }
+    if word > 0 as u32 {
+        let w2 = try box.item_new(box.IT_WORD, s, gc_null[Box]())
+        w2.chars = word
+        w2.width = adv * (word as f64)
+        let ok5: bool = try gcvec_append[Item](items, w2)
+        *any_content = true
+    }
+    return true
+}
+
+// The height of an atomic inline: its margin box.
+fn atomic_outer_height(c: Gc[Box]) -> f64 {
+    return c.mt + c.h + c.mb
+}
+
+// Where the baseline of an atomic inline sits, measured from the TOP of
+// its margin box. An inline-block with line boxes and `overflow: visible`
+// hands out the baseline of its LAST line; anything else sits with its
+// bottom margin edge on the baseline (CSS 2.1, 10.8.1).
+fn atomic_baseline(c: Gc[Box]) -> f64 {
+    if cascade.style_overflow(c.style) == cascade.OV_VISIBLE {
+        if c.baseline > 0.0 {
+            return c.mt + c.baseline
+        }
+    }
+    return atomic_outer_height(c)
+}
+
+// One line box. Fills the geometry of everything that lies on it and
+// returns its height. `from`/`to` are item indices, `to` exclusive.
+fn place_line(b: Gc[Box], items: Gc[GcVec], from: u64, to: u64,
+              line_top: f64, left: f64, avail: f64, open: Gc[GcVec],
+              out_height: *mut f64, out_baseline: *mut f64) -> AllocError!bool {
+    // ---- 1. the vertical extent, measured from the baseline
+    var strut_above: f64 = 0.0
+    var strut_below: f64 = 0.0
+    item_style_metrics(b.style, &strut_above, &strut_below)
+    var above: f64 = strut_above
+    var below: f64 = strut_below
+    // The inline boxes that were opened on an EARLIER line keep counting.
+    var oi0: u64 = 0
+    while oi0 < gcvec_length(open) {
+        var oa: f64 = 0.0
+        var ob: f64 = 0.0
+        item_style_metrics(gcvec_read[Box](open, oi0).style, &oa, &ob)
+        if oa > above {
+            above = oa
+        }
+        if ob > below {
+            below = ob
+        }
+        oi0 = oi0 + 1
+    }
+    var i: u64 = from
+    while i < to {
+        let it: Gc[Item] = gcvec_read[Item](items, i)
+        if it.kind == box.IT_ATOMIC && it.chars == 0 as u32 {
+            let c: Gc[Box] = it.holder
+            let va: u32 = cascade.style_vertical_align(c.style)
+            let h: f64 = atomic_outer_height(c)
+            if va == cascade.VA_BASELINE {
+                let bl: f64 = atomic_baseline(c)
+                if bl > above {
+                    above = bl
+                }
+                if h - bl > below {
+                    below = h - bl
+                }
+            } else if va == cascade.VA_MIDDLE {
+                let half: f64 = box.font_xheight(cascade.style_font_size(b.style)) / 2.0
+                let top_off: f64 = half + h / 2.0
+                if top_off > above {
+                    above = top_off
+                }
+                if h - top_off > below {
+                    below = h - top_off
+                }
+            } else if va == cascade.VA_TEXT_TOP {
+                let a2: f64 = box.font_ascent(cascade.style_font_size(b.style))
+                if a2 > above {
+                    above = a2
+                }
+                if h - a2 > below {
+                    below = h - a2
+                }
+            } else if va == cascade.VA_TEXT_BOTTOM {
+                let d2: f64 = box.font_descent(cascade.style_font_size(b.style))
+                if h - d2 > above {
+                    above = h - d2
+                }
+                if d2 > below {
+                    below = d2
+                }
+            }
+        } else if it.kind != box.IT_CLOSE {
+            var a: f64 = 0.0
+            var d: f64 = 0.0
+            item_style_metrics(it.style, &a, &d)
+            if a > above {
+                above = a
+            }
+            if d > below {
+                below = d
+            }
+        }
+        i = i + 1
+    }
+    // `top` and `bottom` do not move the baseline, but they can make the
+    // line taller if they do not fit into it.
+    var i2: u64 = from
+    while i2 < to {
+        let it2: Gc[Item] = gcvec_read[Item](items, i2)
+        if it2.kind == box.IT_ATOMIC && it2.chars == 0 as u32 {
+            let c2: Gc[Box] = it2.holder
+            let va2: u32 = cascade.style_vertical_align(c2.style)
+            let h2: f64 = atomic_outer_height(c2)
+            if va2 == cascade.VA_TOP {
+                if h2 > above + below {
+                    below = h2 - above
+                }
+            } else if va2 == cascade.VA_BOTTOM {
+                if h2 > above + below {
+                    above = h2 - below
+                }
+            }
+        }
+        i2 = i2 + 1
+    }
+    let height: f64 = above + below
+    let baseline: f64 = line_top + above
+
+    // ---- 2. how wide the line really is, so that text-align can shift
+    // it. A space at the END of a line does not count -- it hangs over the
+    // edge instead of pushing the line off centre.
+    var last: u64 = to
+    while last > from {
+        let t2: Gc[Item] = gcvec_read[Item](items, last - 1)
+        if t2.kind == box.IT_SPACE {
+            last = last - 1
+        } else {
+            last = last + 0
+            break
+        }
+    }
+    var used: f64 = 0.0
+    var j: u64 = from
+    while j < last {
+        let it3: Gc[Item] = gcvec_read[Item](items, j)
+        if !(it3.kind == box.IT_ATOMIC && it3.chars != 0 as u32) {
+            used = used + it3.width
+        }
+        j = j + 1
+    }
+    var x: f64 = left
+    let align: u32 = cascade.style_text_align(b.style)
+    if align == cascade.TA_RIGHT {
+        x = left + (avail - used)
+    } else if align == cascade.TA_CENTER {
+        x = left + (avail - used) / 2.0
+    }
+
+    // ---- 3. place every item. An inline box that was already open gets
+    // a NEW fragment on this line -- an elem broken over three lines
+    // has three rectangles, and their union is what a browser reports.
+    var oi: u64 = 0
+    while oi < gcvec_length(open) {
+        let oc: Gc[Box] = gcvec_read[Box](open, oi)
+        let okn: bool = try open_fragment(oc, x, baseline)
+        oi = oi + 1
+    }
+    var k: u64 = from
+    while k < to {
+        let it4: Gc[Item] = gcvec_read[Item](items, k)
+        if it4.kind == box.IT_OPEN {
+            let c3: Gc[Box] = it4.holder
+            let okf: bool = try open_fragment(c3, x + c3.ml, baseline)
+            let oka: bool = try gcvec_append[Box](open, c3)
+            x = x + it4.width
+        } else if it4.kind == box.IT_CLOSE {
+            let c4: Gc[Box] = it4.holder
+            x = x + it4.width
+            close_fragment(c4, x - c4.mr)
+            let n_open: u64 = gcvec_length(open)
+            if n_open > 0 {
+                let okr: bool = gcvec_remove(open, n_open - 1)
+            }
+        } else if it4.kind == box.IT_ATOMIC {
+            let c5: Gc[Box] = it4.holder
+            if it4.chars != 0 as u32 {
+                // An out-of-flow box among inline content: it only notes
+                // where it would have stood.
+                c5.static_x = x
+                c5.static_y = line_top
+            } else {
+                let va3: u32 = cascade.style_vertical_align(c5.style)
+                let h3: f64 = atomic_outer_height(c5)
+                var top: f64 = baseline - atomic_baseline(c5)
+                if va3 == cascade.VA_TOP {
+                    top = line_top
+                } else if va3 == cascade.VA_BOTTOM {
+                    top = line_top + height - h3
+                } else if va3 == cascade.VA_MIDDLE {
+                    let half2: f64 = box.font_xheight(cascade.style_font_size(b.style)) / 2.0
+                    top = baseline - half2 - h3 / 2.0
+                } else if va3 == cascade.VA_TEXT_TOP {
+                    top = baseline - box.font_ascent(cascade.style_font_size(b.style))
+                } else if va3 == cascade.VA_TEXT_BOTTOM {
+                    top = baseline + box.font_descent(cascade.style_font_size(b.style)) - h3
+                }
+                c5.x = x + c5.ml
+                c5.y = top + c5.mt
+                x = x + it4.width
+            }
+        } else if it4.kind == box.IT_BREAK && it4.holder != gc_null[Box]() {
+            // A `<br>` is an elem and a browser answers
+            // `getBoundingClientRect()` for it: zero wide, as tall as the
+            // text of the line it ends.
+            let cb: Gc[Box] = it4.holder
+            let okb2: bool = try open_fragment(cb, x, baseline)
+            close_fragment(cb, x)
+        } else {
+            x = x + it4.width
+        }
+        k = k + 1
+    }
+    // Everything still open runs on to the next line and is cut off here.
+    var oc2: u64 = 0
+    while oc2 < gcvec_length(open) {
+        close_fragment(gcvec_read[Box](open, oc2), x)
+        oc2 = oc2 + 1
+    }
+    *out_height = height
+    *out_baseline = baseline
+    return true
+}
+
+// Does anything on this stretch of items justify a line box?
+fn line_has_content(items: Gc[GcVec], from: u64, to: u64) -> bool {
+    var i: u64 = from
+    while i < to {
+        let it: Gc[Item] = gcvec_read[Item](items, i)
+        if it.kind == box.IT_WORD || it.kind == box.IT_BREAK {
+            return true
+        }
+        if it.kind == box.IT_ATOMIC && it.chars == 0 as u32 {
+            return true
+        }
+        if it.kind == box.IT_SPACE {
+            let ws: u32 = cascade.style_white_space(it.style)
+            if ws == cascade.WS_PRE || ws == cascade.WS_PRE_WRAP {
+                return true
+            }
+        }
+        if it.kind == box.IT_OPEN || it.kind == box.IT_CLOSE {
+            if it.width != 0.0 {
+                return true
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn open_fragment(c: Gc[Box], x: f64, baseline: f64) -> AllocError!bool {
+    if c.frags == gc_null[GcVec]() {
+        c.frags = try gcvec_new()
+    }
+    let fr = try box.frag_new(c)
+    fr.x = x
+    let fs: f64 = cascade.style_font_size(c.style)
+    let a: f64 = box.font_ascent(fs)
+    let d: f64 = box.font_descent(fs)
+    // The CONTENT area of an inline box is ascent plus descent -- not the
+    // line height. Padding and border grow it outwards.
+    fr.y = baseline - a - c.pt - c.bt
+    fr.h = a + d + c.pt + c.pb + c.bt + c.bb
+    fr.w = 0.0
+    return try gcvec_append[Frag](c.frags, fr)
+}
+
+fn close_fragment(c: Gc[Box], x_end: f64) {
+    if c.frags == gc_null[GcVec]() {
+        return
+    }
+    let n: u64 = gcvec_length(c.frags)
+    if n == 0 {
+        return
+    }
+    let fr: Gc[Frag] = gcvec_read[Frag](c.frags, n - 1)
+    fr.w = x_end - fr.x
+}
+
+// The inline formatting context of one block container. Returns the
+// content height; `b.baseline` afterwards holds the baseline of the LAST
+// line box, measured from the border box top -- that is what an
+// inline-block hands to the line it stands on.
+// NOTE ON THE RETURN VALUE: the height leaves through a pointer and not
+// as `AllocError!f64`. An error union with an f64 payload delivers a WRONG
+// value in this compiler -- see docs/ROUND61.md, language gap 2. Every
+// place in this file where a length crosses a `try` is written this way.
+// NOTE ON THE RETURN VALUE: the height leaves through a pointer and not
+// as `AllocError!f64`. An error union with an f64 payload delivers a WRONG
+// value in this compiler -- see docs/ROUND61.md, language gap 2. Every
+// place in this file where a length crosses a `try` is written this way.
+fn layout_inline(b: Gc[Box], content_w: f64, fc: *mut box.FloatCtx,
+                 out_height: *mut f64) -> AllocError!bool {
+    // The item list is WORKING MATERIAL and is not kept: after the last
+    // line it is garbage, and holding on to it would make the live heap
+    // grow with every text run on the page. What stays are the line boxes
+    // and the fragments -- the geometry, not the way to it.
+    let items = try gcvec_new()
+    var pending_space: bool = false
+    var any_content: bool = false
+    let ok: bool = try build_items(b, items, &pending_space, &any_content,
+                                   content_w)
+    let n: u64 = gcvec_length(items)
+    *out_height = 0.0
+    if n == 0 {
+        b.baseline = 0.0
+        return true
+    }
+    b.lines = try gcvec_new()
+    let open = try gcvec_new()
+
+    var y: f64 = 0.0
+    var last_baseline: f64 = 0.0
+    var i: u64 = 0
+    let strut: f64 = box.used_line_height(b.style)
+    let ws: u32 = cascade.style_white_space(b.style)
+    let wrap: bool = ws != cascade.WS_NOWRAP && ws != cascade.WS_PRE
+    var saw_line: bool = false
+    while i < n {
+        // A space at the START of a line disappears without a trace.
+        var skipping: bool = true
+        while skipping && i < n {
+            let it: Gc[Item] = gcvec_read[Item](items, i)
+            if it.kind == box.IT_SPACE && ws != cascade.WS_PRE &&
+               ws != cascade.WS_PRE_WRAP {
+                i = i + 1
+            } else {
+                skipping = false
+            }
+        }
+        if i >= n {
+            i = n
+            break
+        }
+        // Floats that stand before any content of the line are placed
+        // FIRST -- they are what decides how wide the line may be.
+        var leading_float: bool = true
+        while leading_float && i < n {
+            let it0: Gc[Item] = gcvec_read[Item](items, i)
+            if it0.kind == box.IT_ATOMIC && it0.first_char == 1 as u32 {
+                let okp: bool = try place_float(it0.holder, content_w, y, fc)
+                it0.holder.flags = it0.holder.flags | box.F_PLACED
+                i = i + 1
+            } else if it0.kind == box.IT_ATOMIC && it0.first_char == 2 as u32 {
+                it0.holder.static_x = 0.0
+                it0.holder.static_y = y
+                i = i + 1
+            } else {
+                leading_float = false
+            }
+        }
+        if i >= n {
+            i = n
+            break
+        }
+        // How wide may the line be? The floats decide, asked with the
+        // strut height as the probe -- a line that turns out taller can
+        // therefore have been measured against too much room next to a
+        // float. Named in docs/ROUND61.md.
+        var line_y: f64 = y
+        var left: f64 = box.float_left_edge(fc, line_y, strut, 0.0)
+        var right: f64 = box.float_right_edge(fc, line_y, strut, content_w)
+        var avail: f64 = right - left
+
+        // Fill the line greedily, chunk by chunk. A chunk is what stands
+        // between two break opportunities: a space plus everything up to
+        // the next space.
+        var end: u64 = i
+        var used: f64 = 0.0
+        var running: bool = true
+        while running && end < n {
+            var chunk_end: u64 = end
+            var chunk_w: f64 = 0.0
+            var leading: f64 = 0.0
+            if gcvec_read[Item](items, chunk_end).kind == box.IT_SPACE {
+                leading = gcvec_read[Item](items, chunk_end).width
+                chunk_end = chunk_end + 1
+            }
+            var stop: bool = false
+            var content_items: u32 = 0
+            while chunk_end < n && !stop {
+                let it2: Gc[Item] = gcvec_read[Item](items, chunk_end)
+                if it2.kind == box.IT_SPACE || it2.kind == box.IT_BREAK {
+                    stop = true
+                } else if it2.kind == box.IT_ATOMIC && it2.chars == 0 as u32 {
+                    // An atomic inline is a break opportunity on BOTH
+                    // sides -- three inline-blocks without a space
+                    // between them still fall onto three lines if they
+                    // do not fit. (UAX 14 treats them like an object
+                    // replacement character.)
+                    if content_items > 0 as u32 {
+                        stop = true
+                    } else {
+                        chunk_w = chunk_w + it2.width
+                        chunk_end = chunk_end + 1
+                        content_items = content_items + 1 as u32
+                        stop = true
+                    }
+                } else {
+                    if it2.kind == box.IT_WORD {
+                        content_items = content_items + 1 as u32
+                    }
+                    if !(it2.kind == box.IT_ATOMIC && it2.chars != 0 as u32) {
+                        chunk_w = chunk_w + it2.width
+                    }
+                    chunk_end = chunk_end + 1
+                }
+            }
+            if chunk_end == end {
+                // a forced break: `<br>` or a newline in `pre`
+                end = end + 1
+                running = false
+            } else if used > 0.0 && wrap && used + leading + chunk_w > avail + 0.0001 {
+                running = false
+            } else if used == 0.0 && wrap && chunk_w > avail + 0.0001 &&
+                      box.float_next_y(fc, line_y) > line_y {
+                // Nothing on the line yet and it still does not fit: a
+                // float is in the way, so the line moves DOWN to where
+                // there is room. That is what makes an unbreakable word
+                // land below a float instead of sticking out of it.
+                line_y = box.float_next_y(fc, line_y)
+                left = box.float_left_edge(fc, line_y, strut, 0.0)
+                right = box.float_right_edge(fc, line_y, strut, content_w)
+                avail = right - left
+            } else {
+                used = used + leading + chunk_w
+                end = chunk_end
+            }
+        }
+        if end == i {
+            end = i + 1
+        }
+        if !line_has_content(items, i, end) {
+            // CSS 2.1, 9.4.2: a line box that holds no text, no preserved
+            // white space, no atomic inline and no inline box with a ring
+            // of its own is NOT generated. `<div><span></span></div>` is
+            // therefore zero pixels high, not one line.
+            i = end
+            continue
+        }
+        var height: f64 = 0.0
+        var baseline: f64 = 0.0
+        let ok2: bool = try place_line(b, items, i, end, line_y, left, avail,
+                                       open, &height, &baseline)
+        let line = try box.frag_new(b)
+        line.x = left
+        line.y = line_y
+        line.w = avail
+        line.h = height
+        let ok3: bool = try gcvec_append[Frag](b.lines, line)
+        last_baseline = baseline
+        saw_line = true
+        y = line_y + height
+        // A float in the MIDDLE of a line goes to the top of the NEXT
+        // line -- it must not push away what already stands.
+        var fi: u64 = i
+        while fi < end {
+            let itf: Gc[Item] = gcvec_read[Item](items, fi)
+            if itf.kind == box.IT_ATOMIC && itf.first_char == 1 as u32 &&
+               (itf.holder.flags & box.F_PLACED) == 0 as u32 {
+                let okp2: bool = try place_float(itf.holder, content_w, y, fc)
+                itf.holder.flags = itf.holder.flags | box.F_PLACED
+            } else if itf.kind == box.IT_ATOMIC && itf.first_char == 2 as u32 {
+                itf.holder.static_x = 0.0
+                itf.holder.static_y = line_y
+            }
+            fi = fi + 1
+        }
+        i = end
+    }
+    if saw_line {
+        b.baseline = last_baseline + b.bt + b.pt
+    } else {
+        b.baseline = 0.0
+    }
+    *out_height = y
+    return true
+}
+
+// -------------------------------------------------------- The block flow
+
+// Places a float and enters it into the float context. `y_min` is the
+// earliest y (in the content coordinates of the block) at which it may
+// sit.
+fn place_float(c: Gc[Box], parent_w: f64, y_min: f64,
+               fc: *mut box.FloatCtx) -> AllocError!bool {
+    resolve_edges(c, parent_w)
+    var w: f64 = 0.0
+    if box.resolve(c.style, cascade.S_WIDTH, parent_w, &w) {
+        w = content_from_specified(c, w, h_extra(c))
+    } else {
+        w = shrink_to_fit(c, parent_w - c.ml - c.mr - h_extra(c))
+    }
+    w = clamp_width(c, w, parent_w, true)
+    var own: box.FloatCtx = box.floatctx_new()
+    let oki: bool = try box.floatctx_init(&own)
+    let ok: bool = try layout_content(c, w, parent_w, &own)
+    let outer_w: f64 = c.ml + c.w + c.mr
+    let outer_h: f64 = c.mt + c.h + c.mb
+    let side: u32 = cascade.style_float(c.style)
+    var y: f64 = y_min
+    if cascade.style_clear(c.style) != cascade.CLEAR_NONE {
+        y = box.float_clear_y(fc, y, cascade.style_clear(c.style))
+    }
+    // Walk down until the float fits between the floats already there.
+    var guard: u32 = 0
+    while guard < 1000 as u32 {
+        let l: f64 = box.float_left_edge(fc, y, outer_h, 0.0)
+        let r: f64 = box.float_right_edge(fc, y, outer_h, parent_w)
+        if r - l >= outer_w || r - l >= parent_w {
+            if side == cascade.FLOAT_LEFT {
+                c.x = l + c.ml
+            } else {
+                c.x = r - outer_w + c.ml
+            }
+            c.y = y + c.mt
+            let ok2: bool = try box.float_add(fc, side, c.x - c.ml, y,
+                                              outer_w, outer_h)
+            return true
+        }
+        let next_y: f64 = box.float_next_y(fc, y)
+        if next_y <= y {
+            if side == cascade.FLOAT_LEFT {
+                c.x = c.ml
+            } else {
+                c.x = parent_w - outer_w + c.ml
+            }
+            c.y = y + c.mt
+            let ok3: bool = try box.float_add(fc, side, c.x - c.ml, y,
+                                              outer_w, outer_h)
+            return true
+        }
+        y = next_y
+        guard = guard + 1 as u32
+    }
+    return true
+}
+
+// The in-flow block-level children of a block container, with margin
+// collapsing. Writes `top_escape` and `bottom_escape` -- the margins that
+// leave the box at the top and at the bottom -- and returns the height of
+// the content box.
+fn layout_block_children(b: Gc[Box], content_w: f64, fc: *mut box.FloatCtx,
+                         height_auto: bool, top_escape: *mut box.MarginSet,
+                         bottom_escape: *mut box.MarginSet,
+                         all_through: *mut bool,
+                         out_height: *mut f64) -> AllocError!bool {
+    var y: f64 = 0.0
+    var pending: box.MarginSet = box.margin_empty()
+    let open_top: bool = (b.bt + b.pt) == 0.0 && !box.is_bfc_root(b)
+    var escaping: bool = open_top
+    *top_escape = box.margin_empty()
+    let n: u64 = box.box_kids(b)
+    var i: u64 = 0
+    while i < n {
+        let c: Gc[Box] = box.box_kid(b, i)
+        if is_abs(c) {
+            c.static_x = 0.0
+            c.static_y = y
+            if !escaping {
+                c.static_y = y + box.margin_value(pending)
+            }
+        } else if is_float(c) {
+            var fy: f64 = y
+            if !escaping {
+                fy = y + box.margin_value(pending)
+            }
+            let okf: bool = try place_float(c, content_w, fy, fc)
+        } else {
+            // The float context is handed DOWN, shifted by the corner
+            // where the child will come to stand: a float three levels
+            // deep still lies in the coordinates of the formatting
+            // context root, and a line box down there has to see it.
+            resolve_edges(c, content_w)
+            var est: box.MarginSet = pending
+            est = box.margin_add(est, c.mt)
+            var est_y: f64 = y
+            if !escaping {
+                est_y = y + box.margin_value(est)
+            }
+            // A box that opens its own formatting context does NOT slide
+            // under a float -- it becomes narrower and stands next to it
+            // (CSS 2.1, 9.5). Every other block-level box keeps the full
+            // width and only its LINE boxes give way.
+            var bfc_left: f64 = 0.0
+            var avail_w: f64 = content_w
+            if box.is_bfc_root(c) {
+                let l0: f64 = box.float_left_edge(fc, est_y, 1.0, 0.0)
+                let r0: f64 = box.float_right_edge(fc, est_y, 1.0, content_w)
+                if l0 > 0.0 || r0 < content_w {
+                    // The box goes as far left as the float allows -- and
+                    // its own left margin is SWALLOWED where the float
+                    // pushes further than the margin would have. A GIVEN
+                    // width stays what it is; only `auto` shrinks.
+                    var edge: f64 = l0
+                    if c.ml > edge {
+                        edge = c.ml
+                    }
+                    bfc_left = edge - c.ml
+                    if box.length_is_auto(c.style, cascade.S_WIDTH) {
+                        avail_w = r0 - edge + c.ml
+                        if avail_w < 0.0 {
+                            avail_w = 0.0
+                        }
+                    }
+                }
+            }
+            let save_dx: f64 = (*fc).dx
+            let save_dy: f64 = (*fc).dy
+            (*fc).dx = save_dx + bfc_left + c.ml + c.bl + c.pl
+            (*fc).dy = save_dy + est_y + c.bt + c.pt
+            let ok: bool = try layout_block(c, avail_w, fc)
+            (*fc).dx = save_dx
+            (*fc).dy = save_dy
+            var mine: box.MarginSet = box.margin_empty()
+            mine = box.margin_add(mine, c.top_pos)
+            mine = box.margin_add(mine, c.top_neg)
+            var joined: box.MarginSet = box.margin_join(pending, mine)
+
+            // `clear` cuts the collapsing: the box is pushed below the
+            // floats, and the margin above it stops being adjoining.
+            let clr: u32 = cascade.style_clear(c.style)
+            if clr != cascade.CLEAR_NONE {
+                var hypo: f64 = y
+                if !escaping {
+                    hypo = y + box.margin_value(joined)
+                }
+                let cleared: f64 = box.float_clear_y(fc, hypo, clr)
+                if cleared > hypo {
+                    if escaping {
+                        *top_escape = pending
+                        escaping = false
+                    }
+                    y = cleared
+                    joined = box.margin_empty()
+                    pending = box.margin_empty()
+                    c.y = y
+                    c.x = c.ml + bfc_left
+                    y = y + c.h
+                    pending = box.margin_empty()
+                    pending = box.margin_add(pending, c.bot_pos)
+                    pending = box.margin_add(pending, c.bot_neg)
+                    *all_through = false
+                    i = i + 1
+                    continue
+                }
+            }
+
+            if (c.flags & box.F_COLLAPSE_THROUGH) != 0 as u32 {
+                // The box disappears from the flow; only its margin stays.
+                // WHERE it comes to stand is decided by the margins ABOVE
+                // it alone -- its own bottom margin belongs to the set
+                // that goes on collapsing, but it does not move the box.
+                var place: box.MarginSet = pending
+                place = box.margin_add(place, c.thr_pos)
+                place = box.margin_add(place, c.thr_neg)
+                if escaping {
+                    c.y = 0.0
+                } else {
+                    c.y = y + box.margin_value(place)
+                }
+                c.x = c.ml + bfc_left
+                var below: box.MarginSet = box.margin_empty()
+                below = box.margin_add(below, c.bot_pos)
+                below = box.margin_add(below, c.bot_neg)
+                pending = box.margin_join(joined, below)
+                i = i + 1
+                continue
+            }
+            pending = joined
+            if escaping {
+                *top_escape = pending
+                pending = box.margin_empty()
+                escaping = false
+            }
+            y = y + box.margin_value(pending)
+            c.y = y
+            c.x = c.ml + bfc_left
+            y = y + c.h
+            pending = box.margin_empty()
+            pending = box.margin_add(pending, c.bot_pos)
+            pending = box.margin_add(pending, c.bot_neg)
+            *all_through = false
+        }
+        i = i + 1
+    }
+    if escaping {
+        *top_escape = pending
+        pending = box.margin_empty()
+    }
+    let open_bottom: bool = (b.bb + b.pb) == 0.0 && !box.is_bfc_root(b) &&
+                            height_auto
+    if open_bottom {
+        *bottom_escape = pending
+        *out_height = y
+        return true
+    }
+    *bottom_escape = box.margin_empty()
+    *out_height = y + box.margin_value(pending)
+    return true
+}
+
+// The content of a box whose CONTENT WIDTH is already known: either an
+// inline formatting context, or block-level children, or flex items.
+// Fills `b.h` and the collapsed margins.
+fn layout_content(b: Gc[Box], content_w: f64, cb_w: f64,
+                  parent_fc: *mut box.FloatCtx) -> AllocError!bool {
+    let s: Gc[Style] = b.style
+    var height: f64 = 0.0
+    var height_given: bool = box.resolve(s, cascade.S_HEIGHT, 0.0, &height)
+    if cascade.style_unit(s, cascade.S_HEIGHT) == cascade.U_PERCENT {
+        // A percentage height against an automatic containing block height
+        // is `auto` -- CSS 2.1, 10.5.
+        height_given = false
+    }
+    if height_given {
+        height = content_from_specified(b, height, v_extra(b))
+    }
+    var top_escape: box.MarginSet = box.margin_empty()
+    var bottom_escape: box.MarginSet = box.margin_empty()
+    var all_through: bool = true
+    var content_h: f64 = 0.0
+
+    // A block formatting context root gets a FRESH float context; every
+    // other box works in the one of its parent, which the caller has
+    // already shifted onto this box's content corner.
+    var own: box.FloatCtx = box.floatctx_new()
+    var fc: *mut box.FloatCtx = parent_fc
+    if box.is_bfc_root(b) {
+        let okc: bool = try box.floatctx_init(&own)
+        fc = &own
+    }
+    if b.kind == box.BK_FLEX {
+        let okx: bool = try layout_flex(b, content_w, height_given, height,
+                                        &content_h)
+        all_through = false
+    } else if (b.flags & box.F_HAS_BLOCKS) != 0 as u32 {
+        let okb: bool = try layout_block_children(b, content_w, fc,
+                                              !height_given,
+                                              &top_escape, &bottom_escape,
+                                              &all_through, &content_h)
+    } else {
+        let oki2: bool = try layout_inline(b, content_w, fc, &content_h)
+        if gcvec_length(b.kids) > 0 {
+            all_through = false
+        }
+    }
+    if box.is_bfc_root(b) && !height_given {
+        // The auto height of a formatting context root REACHES AROUND its
+        // floats -- CSS 2.1, 10.6.7. That is the whole reason `overflow:
+        // hidden` on a container makes the floats inside it count again.
+        let low: f64 = box.float_lowest(fc)
+        if low > content_h {
+            content_h = low
+        }
+    }
+    var used_h: f64 = content_h
+    if height_given {
+        used_h = height
+    }
+    let clamped: f64 = clamp_height(b, used_h, 0.0, false)
+    if clamped != used_h {
+        used_h = clamped
+        all_through = false
+    }
+    b.w = content_w + h_extra(b)
+    b.h = used_h + v_extra(b)
+
+    // The collapsed margins of this box.
+    var top: box.MarginSet = box.margin_empty()
+    top = box.margin_add(top, b.mt)
+    var bot: box.MarginSet = box.margin_empty()
+    bot = box.margin_add(bot, b.mb)
+    let empty: bool = all_through && used_h == 0.0 && v_extra(b) == 0.0 &&
+                      !box.is_bfc_root(b) && !height_given
+    if empty {
+        let joined: box.MarginSet = box.margin_join(box.margin_join(top, bot),
+                                                box.margin_join(top_escape,
+                                                                bottom_escape))
+        b.top_pos = joined.pos
+        b.top_neg = joined.neg
+        b.bot_pos = joined.pos
+        b.bot_neg = joined.neg
+        b.flags = b.flags | box.F_COLLAPSE_THROUGH
+    } else {
+        let t2: box.MarginSet = box.margin_join(top, top_escape)
+        let b2: box.MarginSet = box.margin_join(bot, bottom_escape)
+        b.top_pos = t2.pos
+        b.top_neg = t2.neg
+        b.bot_pos = b2.pos
+        b.bot_neg = b2.neg
+    }
+    let thr: box.MarginSet = box.margin_join(top, top_escape)
+    b.thr_pos = thr.pos
+    b.thr_neg = thr.neg
+    if box.is_bfc_root(b) || is_out_of_flow(b) {
+        // Nothing escapes out of a formatting context root.
+        b.top_pos = b.mt
+        b.top_neg = 0.0
+        if b.mt < 0.0 {
+            b.top_pos = 0.0
+            b.top_neg = b.mt
+        }
+        b.bot_pos = b.mb
+        b.bot_neg = 0.0
+        if b.mb < 0.0 {
+            b.bot_pos = 0.0
+            b.bot_neg = b.mb
+        }
+        b.flags = b.flags & (0xFFFFFFFF as u32 - box.F_COLLAPSE_THROUGH)
+    }
+    return true
+}
+
+// ONE block-level box in the normal flow. `cb_w` is the content width of
+// the containing block.
+fn layout_block(b: Gc[Box], cb_w: f64, parent_fc: *mut box.FloatCtx)
+        -> AllocError!bool {
+    let s: Gc[Style] = b.style
+    resolve_edges(b, cb_w)
+    let extra: f64 = h_extra(b)
+
+    var content_w: f64 = 0.0
+    var w_given: f64 = 0.0
+    let has_w: bool = box.resolve(s, cascade.S_WIDTH, cb_w, &w_given)
+    let ml_auto: bool = box.length_is_auto(s, cascade.S_MARGIN_LEFT)
+    let mr_auto: bool = box.length_is_auto(s, cascade.S_MARGIN_RIGHT)
+
+    if !has_w {
+        // `width: auto` eats what is left; automatic margins become zero.
+        if ml_auto {
+            b.ml = 0.0
+        }
+        if mr_auto {
+            b.mr = 0.0
+        }
+        content_w = cb_w - b.ml - b.mr - extra
+        if content_w < 0.0 {
+            content_w = 0.0
+        }
+        let cl: f64 = clamp_width(b, content_w, cb_w, true)
+        if cl != content_w {
+            content_w = cl
+            solve_margins(b, cb_w, content_w, extra, ml_auto, mr_auto)
+        }
+    } else {
+        content_w = content_from_specified(b, w_given, extra)
+        let cl2: f64 = clamp_width(b, content_w, cb_w, true)
+        content_w = cl2
+        solve_margins(b, cb_w, content_w, extra, ml_auto, mr_auto)
+    }
+    let ok: bool = try layout_content(b, content_w, cb_w, parent_fc)
+    resolve_relative(b, cb_w)
+    return true
+}
+
+// CSS 2.1, 10.3.3: the equation must come out even. Which of the three
+// unknowns gives way is decided by which of them is `auto` -- and if none
+// is, the RIGHT margin gives way (in left-to-right text).
+fn solve_margins(b: Gc[Box], cb_w: f64, content_w: f64, extra: f64,
+                 ml_auto: bool, mr_auto: bool) {
+    let rest: f64 = cb_w - content_w - extra
+    if ml_auto && mr_auto {
+        if rest < 0.0 {
+            b.ml = 0.0
+            b.mr = rest
+        } else {
+            b.ml = rest / 2.0
+            b.mr = rest - rest / 2.0
+        }
+    } else if ml_auto {
+        b.ml = rest - b.mr
+    } else if mr_auto {
+        b.mr = rest - b.ml
+    } else {
+        // over-constrained
+        b.mr = rest - b.ml
+    }
+}
+
+fn resolve_relative(b: Gc[Box], cb_w: f64) {
+    b.rel_x = 0.0
+    b.rel_y = 0.0
+    if cascade.style_position(b.style) != cascade.POS_RELATIVE {
+        return
+    }
+    var v: f64 = 0.0
+    if box.resolve(b.style, cascade.S_LEFT, cb_w, &v) {
+        b.rel_x = v
+    } else if box.resolve(b.style, cascade.S_RIGHT, cb_w, &v) {
+        b.rel_x = 0.0 - v
+    }
+    // A percentage of `top` refers to the HEIGHT of the containing block;
+    // without a definite height it is zero (CSS 2.1, 9.4.3).
+    if cascade.style_unit(b.style, cascade.S_TOP) == cascade.U_PX {
+        b.rel_y = cascade.style_length(b.style, cascade.S_TOP)
+    } else if cascade.style_unit(b.style, cascade.S_BOTTOM) == cascade.U_PX {
+        b.rel_y = 0.0 - cascade.style_length(b.style, cascade.S_BOTTOM)
+    }
+}
+
+// ---------------------------------------------------------------- Flexbox
+
+// One axis, one line, no wrapping: the part of css-flexbox-1 that carries
+// the weight in practice. Grow and shrink work as in section 9.7,
+// `align-items` is `stretch`.
+fn layout_flex(b: Gc[Box], content_w: f64, height_given: bool,
+               height: f64, out_height: *mut f64) -> AllocError!bool {
+    let column: bool = cascade.style_flex_direction(b.style) == cascade.FD_COLUMN ||
+                       cascade.style_flex_direction(b.style) == cascade.FD_COLUMN_REVERSE
+    let n: u64 = box.box_kids(b)
+    var i: u64 = 0
+    // ---- 1. the flex base size of every item
+    var total_base: f64 = 0.0
+    var total_grow: f64 = 0.0
+    var total_scaled_shrink: f64 = 0.0
+    while i < n {
+        let c: Gc[Box] = box.box_kid(b, i)
+        if !is_abs(c) {
+            resolve_edges(c, content_w)
+            var basis: f64 = 0.0
+            var have: bool = box.resolve(c.style, cascade.S_FLEX_BASIS,
+                                         content_w, &basis)
+            if !have {
+                have = box.resolve(c.style, cascade.S_WIDTH, content_w, &basis)
+                if have {
+                    basis = content_from_specified(c, basis, h_extra(c))
+                }
+            } else {
+                basis = content_from_specified(c, basis, h_extra(c))
+            }
+            if !have {
+                basis = max_content_width(c)
+            }
+            c.static_x = basis
+            total_base = total_base + basis + c.ml + c.mr + h_extra(c)
+            total_grow = total_grow + cascade.style_flex_grow(c.style)
+            total_scaled_shrink = total_scaled_shrink +
+                cascade.style_flex_shrink(c.style) * basis
+        }
+        i = i + 1
+    }
+    // ---- 2. RESOLVE THE FLEXIBLE LENGTHS (css-flexbox-1, 9.7).
+    // The loop is not decoration: distributing once and clamping
+    // afterwards LOSES the space that a clamped item gives back. With
+    // `max-width` on one of two growing items that is the difference
+    // between 300 and 500 pixels -- measured against Chromium in
+    // tools/layout/cases/56_flex_minmax.html.
+    let growing: bool = (content_w - total_base) > 0.0
+    i = 0
+    while i < n {
+        let c1: Gc[Box] = box.box_kid(b, i)
+        if !is_abs(c1) {
+            c1.flags = c1.flags & (0xFFFFFFFF as u32 - box.F_FROZEN)
+            let hypo: f64 = clamp_width(c1, c1.static_x, content_w, true)
+            c1.flex_target = c1.static_x
+            var freeze: bool = false
+            if growing && cascade.style_flex_grow(c1.style) == 0.0 {
+                freeze = true
+            }
+            if !growing && cascade.style_flex_shrink(c1.style) == 0.0 {
+                freeze = true
+            }
+            if growing && hypo < c1.static_x {
+                freeze = true
+            }
+            if !growing && hypo > c1.static_x {
+                freeze = true
+            }
+            if freeze {
+                c1.flex_target = hypo
+                c1.flags = c1.flags | box.F_FROZEN
+            }
+        }
+        i = i + 1
+    }
+    var round: u32 = 0
+    while round < 16 as u32 {
+        var any_free: bool = false
+        var used: f64 = 0.0
+        var sum_grow: f64 = 0.0
+        var sum_scaled: f64 = 0.0
+        i = 0
+        while i < n {
+            let c2: Gc[Box] = box.box_kid(b, i)
+            if !is_abs(c2) {
+                used = used + c2.ml + c2.mr + h_extra(c2)
+                if (c2.flags & box.F_FROZEN) != 0 as u32 {
+                    used = used + c2.flex_target
+                } else {
+                    any_free = true
+                    used = used + c2.static_x
+                    sum_grow = sum_grow + cascade.style_flex_grow(c2.style)
+                    sum_scaled = sum_scaled +
+                        cascade.style_flex_shrink(c2.style) * c2.static_x
+                }
+            }
+            i = i + 1
+        }
+        if !any_free {
+            round = 16
+        } else {
+            let free: f64 = content_w - used
+            var violation: f64 = 0.0
+            i = 0
+            while i < n {
+                let c3: Gc[Box] = box.box_kid(b, i)
+                if !is_abs(c3) && (c3.flags & box.F_FROZEN) == 0 as u32 {
+                    var t: f64 = c3.static_x
+                    if growing && sum_grow > 0.0 {
+                        t = t + free * cascade.style_flex_grow(c3.style) / sum_grow
+                    } else if !growing && sum_scaled > 0.0 {
+                        t = t + free *
+                            (cascade.style_flex_shrink(c3.style) * c3.static_x) /
+                            sum_scaled
+                    }
+                    if t < 0.0 {
+                        t = 0.0
+                    }
+                    let clamped: f64 = clamp_width(c3, t, content_w, true)
+                    c3.flex_target = clamped
+                    violation = violation + (clamped - t)
+                }
+                i = i + 1
+            }
+            if violation == 0.0 {
+                i = 0
+                while i < n {
+                    let c4: Gc[Box] = box.box_kid(b, i)
+                    if !is_abs(c4) {
+                        c4.flags = c4.flags | box.F_FROZEN
+                    }
+                    i = i + 1
+                }
+            } else {
+                i = 0
+                while i < n {
+                    let c5: Gc[Box] = box.box_kid(b, i)
+                    if !is_abs(c5) && (c5.flags & box.F_FROZEN) == 0 as u32 {
+                        let t2: f64 = clamp_width(c5, c5.flex_target, content_w,
+                                                  true)
+                        var mine: f64 = 0.0
+                        mine = c5.flex_target
+                        var was: f64 = 0.0
+                        was = mine
+                        // A clamped item is frozen at its limit; the space
+                        // it hands back goes to the others in the next round.
+                        if violation > 0.0 && item_clamped_up(c5, content_w) {
+                            c5.flags = c5.flags | box.F_FROZEN
+                        }
+                        if violation < 0.0 && item_clamped_down(c5, content_w) {
+                            c5.flags = c5.flags | box.F_FROZEN
+                        }
+                        let unused2: f64 = t2 + was
+                    }
+                    i = i + 1
+                }
+            }
+            round = round + 1 as u32
+        }
+    }
+    i = 0
+    var x: f64 = 0.0
+    var tallest: f64 = 0.0
+    while i < n {
+        let c6: Gc[Box] = box.box_kid(b, i)
+        if !is_abs(c6) {
+            var ownf: box.FloatCtx = box.floatctx_new()
+            let okfi: bool = try box.floatctx_init(&ownf)
+            let okc: bool = try layout_content(c6, c6.flex_target, content_w,
+                                               &ownf)
+            c6.x = x + c6.ml
+            c6.y = c6.mt
+            x = x + c6.ml + c6.w + c6.mr
+            if c6.mt + c6.h + c6.mb > tallest {
+                tallest = c6.mt + c6.h + c6.mb
+            }
+        }
+        i = i + 1
+    }
+    // ---- 3. the cross axis: `align-items: stretch`
+    var cross: f64 = tallest
+    if height_given {
+        cross = height
+    }
+    i = 0
+    while i < n {
+        let c3: Gc[Box] = box.box_kid(b, i)
+        if !is_abs(c3) {
+            if box.length_is_auto(c3.style, cascade.S_HEIGHT) {
+                let want: f64 = cross - c3.mt - c3.mb
+                if want > c3.h {
+                    let inner: f64 = want - v_extra(c3)
+                    var w2: f64 = c3.w - h_extra(c3)
+                    let okc2: bool = try layout_content_fixed(c3, w2, inner)
+                }
+            }
+        }
+        i = i + 1
+    }
+    let unused: bool = column
+    *out_height = cross
+    return true
+}
+
+// Did the clamp push the item UP (it was smaller than its minimum)?
+fn item_clamped_up(c: Gc[Box], cb_w: f64) -> bool {
+    let nu: u32 = cascade.style_unit(c.style, cascade.S_MIN_WIDTH)
+    if nu == cascade.U_AUTO {
+        return false
+    }
+    var limit: f64 = 0.0
+    if !box.resolve(c.style, cascade.S_MIN_WIDTH, cb_w, &limit) {
+        return false
+    }
+    return c.flex_target <= content_from_specified(c, limit, h_extra(c))
+}
+
+// ... or DOWN (it was bigger than its maximum)?
+fn item_clamped_down(c: Gc[Box], cb_w: f64) -> bool {
+    let mu: u32 = cascade.style_unit(c.style, cascade.S_MAX_WIDTH)
+    if mu == cascade.U_NONE {
+        return false
+    }
+    var limit: f64 = 0.0
+    if !box.resolve(c.style, cascade.S_MAX_WIDTH, cb_w, &limit) {
+        return false
+    }
+    return c.flex_target >= content_from_specified(c, limit, h_extra(c))
+}
+
+// Lays out the content and then forces a content height on top -- used by
+// the stretching of flex items, where the height comes from the container
+// and not from the content.
+fn layout_content_fixed(c: Gc[Box], content_w: f64, content_h: f64)
+        -> AllocError!bool {
+    var ownx: box.FloatCtx = box.floatctx_new()
+    let okx: bool = try box.floatctx_init(&ownx)
+    let ok: bool = try layout_content(c, content_w, content_w, &ownx)
+    c.h = content_h + v_extra(c)
+    return true
+}
+
+// ------------------------------------------------- Absolute positioning
+
+// CSS 2.1, 10.3.7 and 10.6.4 for the left-to-right case. The containing
+// block is the PADDING box of the nearest positioned ancestor.
+fn layout_absolute(c: Gc[Box], cb_x: f64, cb_y: f64, cb_w: f64,
+                   cb_h: f64) -> AllocError!bool {
+    let s: Gc[Style] = c.style
+    resolve_edges(c, cb_w)
+    let extra: f64 = h_extra(c)
+    var left: f64 = 0.0
+    var right: f64 = 0.0
+    let has_left: bool = box.resolve(s, cascade.S_LEFT, cb_w, &left)
+    let has_right: bool = box.resolve(s, cascade.S_RIGHT, cb_w, &right)
+    var w: f64 = 0.0
+    let has_w: bool = box.resolve(s, cascade.S_WIDTH, cb_w, &w)
+    if has_w {
+        w = content_from_specified(c, w, extra)
+    }
+    let ml_auto: bool = box.length_is_auto(s, cascade.S_MARGIN_LEFT)
+    let mr_auto: bool = box.length_is_auto(s, cascade.S_MARGIN_RIGHT)
+    if ml_auto {
+        c.ml = 0.0
+    }
+    if mr_auto {
+        c.mr = 0.0
+    }
+
+    if !has_left && !has_right {
+        // Both `auto`: the box stays where it would have stood.
+        if !has_w {
+            w = shrink_to_fit(c, cb_w - c.ml - c.mr - extra)
+        }
+        left = c.static_x
+    } else if has_left && has_right {
+        if !has_w {
+            w = cb_w - left - right - c.ml - c.mr - extra
+            if w < 0.0 {
+                w = 0.0
+            }
+        } else if ml_auto && mr_auto {
+            let rest: f64 = cb_w - left - right - w - extra
+            if rest > 0.0 {
+                c.ml = rest / 2.0
+                c.mr = rest - rest / 2.0
+            } else {
+                c.ml = 0.0
+                c.mr = rest
+            }
+        }
+    } else if has_left {
+        if !has_w {
+            w = shrink_to_fit(c, cb_w - left - c.ml - c.mr - extra)
+        }
+    } else {
+        if !has_w {
+            w = shrink_to_fit(c, cb_w - right - c.ml - c.mr - extra)
+        }
+        left = cb_w - right - w - c.ml - c.mr - extra
+    }
+    w = clamp_width(c, w, cb_w, true)
+
+    var top: f64 = 0.0
+    var bottom: f64 = 0.0
+    let has_top: bool = box.resolve(s, cascade.S_TOP, cb_h, &top)
+    let has_bottom: bool = box.resolve(s, cascade.S_BOTTOM, cb_h, &bottom)
+    var h: f64 = 0.0
+    let has_h: bool = box.resolve(s, cascade.S_HEIGHT, cb_h, &h)
+    if has_h {
+        h = content_from_specified(c, h, v_extra(c))
+    }
+    var owna: box.FloatCtx = box.floatctx_new()
+    let okfa: bool = try box.floatctx_init(&owna)
+    let ok: bool = try layout_content(c, w, cb_w, &owna)
+    if has_h {
+        c.h = h + v_extra(c)
+    } else if has_top && has_bottom {
+        let hh: f64 = cb_h - top - bottom - c.mt - c.mb
+        if hh > 0.0 {
+            c.h = hh
+        }
+    }
+    if !has_top {
+        if has_bottom {
+            top = cb_h - bottom - c.h - c.mt - c.mb
+        } else {
+            top = c.static_y
+        }
+    }
+    c.x = cb_x + left + c.ml
+    c.y = cb_y + top + c.mt
+    c.flags = c.flags | box.F_PLACED
+    return true
+}
+
+// --------------------------------------------------------- The placement
+
+// Turns the relative positions into viewport coordinates. An INLINE box
+// hands its parent origin straight through -- its children were laid out
+// in the coordinates of the block that opens the formatting context, not
+// in its own.
+fn place_tree(b: Gc[Box], px: f64, py: f64) {
+    let dx: f64 = b.rel_x
+    let dy: f64 = b.rel_y
+    if b.kind == box.BK_INLINE {
+        // The union of the fragments IS the rectangle of an inline box.
+        var minx: f64 = 0.0
+        var miny: f64 = 0.0
+        var maxx: f64 = 0.0
+        var maxy: f64 = 0.0
+        var first: bool = true
+        var i: u64 = 0
+        var n: u64 = 0
+        if b.frags != gc_null[GcVec]() {
+            n = gcvec_length(b.frags)
+        }
+        while i < n {
+            let f: Gc[Frag] = gcvec_read[Frag](b.frags, i)
+            f.x = px + f.x + dx
+            f.y = py + f.y + dy
+            if first || f.x < minx {
+                minx = f.x
+            }
+            if first || f.y < miny {
+                miny = f.y
+            }
+            if first || f.x + f.w > maxx {
+                maxx = f.x + f.w
+            }
+            if first || f.y + f.h > maxy {
+                maxy = f.y + f.h
+            }
+            first = false
+            i = i + 1
+        }
+        if first {
+            // No fragment at all: the box exists but has no line. A
+            // browser answers with an empty rectangle at the corner of
+            // the block the box would have stood in.
+            b.x = px + dx
+            b.y = py + dy
+            b.w = 0.0
+            b.h = 0.0
+        } else {
+            b.x = minx
+            b.y = miny
+            b.w = maxx - minx
+            b.h = maxy - miny
+        }
+        var k: u64 = 0
+        let m: u64 = box.box_kids(b)
+        while k < m {
+            place_tree(box.box_kid(b, k), px + dx, py + dy)
+            k = k + 1
+        }
+        return
+    }
+    b.x = px + b.x + dx
+    b.y = py + b.y + dy
+    b.flags = b.flags | box.F_PLACED
+    let cx: f64 = b.x + b.bl + b.pl
+    let cy: f64 = b.y + b.bt + b.pt
+    if b.lines != gc_null[GcVec]() {
+        var li: u64 = 0
+        let ln: u64 = gcvec_length(b.lines)
+        while li < ln {
+            let l: Gc[Frag] = gcvec_read[Frag](b.lines, li)
+            l.x = cx + l.x
+            l.y = cy + l.y
+            li = li + 1
+        }
+    }
+    var i2: u64 = 0
+    let n2: u64 = box.box_kids(b)
+    while i2 < n2 {
+        let c: Gc[Box] = box.box_kid(b, i2)
+        if !is_abs(c) {
+            place_tree(c, cx, cy)
+        }
+        i2 = i2 + 1
+    }
+}
+
+// The out-of-flow boxes, after everything else stands. `cb_*` is the
+// containing block: the padding box of the nearest positioned ancestor, or
+// the initial containing block.
+fn layout_abs_pass(b: Gc[Box], cb_x: f64, cb_y: f64, cb_w: f64,
+                   cb_h: f64) -> AllocError!bool {
+    var i: u64 = 0
+    let n: u64 = box.box_kids(b)
+    while i < n {
+        let c: Gc[Box] = box.box_kid(b, i)
+        if is_abs(c) {
+            let ok: bool = try layout_absolute(c, cb_x, cb_y, cb_w, cb_h)
+            // Its own content was laid out relative -- place it now.
+            var k: u64 = 0
+            let m: u64 = box.box_kids(c)
+            let ccx: f64 = c.x + c.bl + c.pl
+            let ccy: f64 = c.y + c.bt + c.pt
+            if c.lines != gc_null[GcVec]() {
+                var li: u64 = 0
+                let ln: u64 = gcvec_length(c.lines)
+                while li < ln {
+                    let l: Gc[Frag] = gcvec_read[Frag](c.lines, li)
+                    l.x = ccx + l.x
+                    l.y = ccy + l.y
+                    li = li + 1
+                }
+            }
+            while k < m {
+                let g: Gc[Box] = box.box_kid(c, k)
+                if !is_abs(g) {
+                    place_tree(g, ccx, ccy)
+                }
+                k = k + 1
+            }
+            let ok2: bool = try layout_abs_pass(c, c.x + c.bl, c.y + c.bt,
+                                                c.w - c.bl - c.br,
+                                                c.h - c.bt - c.bb)
+        } else if positioned(c) {
+            let ok3: bool = try layout_abs_pass(c, c.x + c.bl, c.y + c.bt,
+                                                c.w - c.bl - c.br,
+                                                c.h - c.bt - c.bb)
+        } else {
+            let ok4: bool = try layout_abs_pass(c, cb_x, cb_y, cb_w, cb_h)
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// ------------------------------------------------------------- The entry
+
+// The whole document. `vw`/`vh` are the viewport -- the initial containing
+// block, against which a percentage of the root elem resolves.
+fn layout_document(root: Gc[Box], vw: f64, vh: f64) -> AllocError!bool {
+    var fc: box.FloatCtx = box.floatctx_new()
+    let ok0: bool = try box.floatctx_init(&fc)
+    let ok: bool = try layout_block(root, vw, &fc)
+    place_tree(root, 0.0, 0.0)
+    let ok2: bool = try layout_abs_pass(root, root.x + root.bl, root.y + root.bt,
+                                        root.w - root.bl - root.br,
+                                        root.h - root.bt - root.bb)
+    return true
+}
