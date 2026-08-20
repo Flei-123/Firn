@@ -3,7 +3,7 @@
 //! INTERFACE (fixed):
 //!   `pub fn parse(toks: &[Token], dg: &mut Diags) -> ast::Program`
 //! The parser hands out consecutive `ExprId`s from 0 upwards and sets
-//! `Program::expr_count`. It MUST recover after errors at statement or
+//! `Program::expr_count`. It MUST recover after an error at statement or
 //! item level and report further errors.
 //!
 //! Grammar: SPEC §10.1. Precedence (weak -> strong):
@@ -29,27 +29,27 @@ pub(crate) struct Parser<'a> {
     pub(crate) dg: &'a mut Diags,
     pub(crate) next_id: u32,
     pub(crate) depth: u32,
-    /// Within the current statement some error got reported already.
+    /// An error has already been reported in the current statement.
     pub(crate) recovering: bool,
-    /// `ident {` is NO struct literal within conditions but label + block.
+    /// `ident {` is NO struct literal in conditions but a name + block.
     pub(crate) no_struct_lit: bool,
-    /// Bracket depth: inside `(...)`, `[...]`, `{...}` of one expression the
+    /// Bracket depth: inside `(...)`, `[...]`, `{...}` of an expression the
     /// expression may run across lines, outside it may not.
     pub(crate) paren_depth: u32,
     /// Number of the source file (module system, `modules.rs`).
     pub(crate) file: u32,
-    /// Known module labels out of `import`: only with those is `alias.item` a
-    /// qualified label and no field access.
+    /// Known module names from `import`: only with those is `alias.item` a
+    /// qualified name and not a field access.
     pub(crate) modules: HashSet<String>,
     /// Nesting depth of the loops — `break`/`continue` need it.
     pub(crate) loop_depth: u32,
-    /// Attributes that stood immediately ahead of the next declaration
+    /// Attributes that stood immediately in front of the next declaration
     /// (`attrs.rs`). Taken over by `fn_decl`/`struct_decl`.
     pub(crate) pending_attrs: Vec<crate::ast::Attr>,
     /// Hidden `var _fseg<N>` of the string interpolation (round 39): they get
     /// hoisted AHEAD of the next statement (`block` empties the list).
     pub(crate) hoist: Vec<Stmt>,
-    /// > 0: one interpolation runs already — nesting is not there yet.
+    /// > 0: an interpolation is already running — nesting does not exist yet.
     pub(crate) interp_depth: u32,
 }
 
@@ -92,7 +92,7 @@ impl<'a> Parser<'a> {
     // -------------------------------------------------------------------- Basics
 
     pub(crate) fn kind(&self) -> &TokKind {
-        // The stream always ends with Eof; the index never gets raised beyond it.
+        // The stream always ends with Eof; the index is never raised beyond it.
         match self.toks.get(self.pos) {
             Some(t) => &t.kind,
             None => &TokKind::Eof,
@@ -129,7 +129,7 @@ impl<'a> Parser<'a> {
     }
 
     /// May the expression be continued with the current token?
-    /// One operator at the START OF A LINE ends the statement outside of
+    /// An operator at the START OF A LINE ends the statement outside of
     /// brackets (SPEC §10: semicolon optional, the line end closes it).
     pub(crate) fn cont(&self) -> bool {
         self.paren_depth > 0 || !self.at_line_start()
@@ -174,7 +174,7 @@ impl<'a> Parser<'a> {
         false
     }
 
-    /// Like `expect`, yet reports nothing when the statement is broken already.
+    /// Like `expect`, but reports nothing when the statement is broken already.
     pub(crate) fn close(&mut self, k: TokKind, ctx: &str) -> bool {
         if self.eat(&k) {
             return true;
@@ -207,9 +207,9 @@ impl<'a> Parser<'a> {
         None
     }
 
-    /// Qualified label `module.label`: only when `module` is known through
-    /// `import` does the dot get read as module access — otherwise it stays a
-    /// field access. The label gets passed on as "module.label";
+    /// Qualified name `module.name`: only when `module` is known through
+    /// `import` is the dot read as a module access — otherwise it stays a
+    /// field access. The name is passed on as "module.name";
     /// `modules.rs` resolves it while merging.
     pub(crate) fn qualify(&mut self, name: String, sp: Span) -> (String, Span) {
         if !self.modules.contains(&name) || !self.at(&TokKind::Dot) {
@@ -230,7 +230,7 @@ impl<'a> Parser<'a> {
         Expr { id, span, kind }
     }
 
-    /// Placeholder for a broken expression (the error got reported already).
+    /// Placeholder for a broken expression (the error has already been reported).
     fn broken_expr(&mut self, span: Span) -> Expr {
         self.mk(span, ExprKind::Int(0))
     }
@@ -253,15 +253,15 @@ impl<'a> Parser<'a> {
                 MAX_DEPTH
             ));
         }
-        // Force progress, so that no endless loop comes about.
+        // Force progress, so that no endless loop arises.
         self.bump();
         true
     }
 
     // ---------------------------------------------------------------- Error recovery
 
-    /// Advance up to the end of the statement: swallow ';', stop ahead of '}' or
-    /// of a statement keyword at the start of a line.
+    /// Advance to the end of the statement: swallow ';', stop in front of '}'
+    /// or of a statement keyword at the start of a line.
     fn sync_stmt(&mut self) {
         loop {
             match self.kind() {
@@ -278,7 +278,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Advance up to the next item at top level.
+    /// Advance to the next item at top level.
     pub(crate) fn sync_item(&mut self) {
         while !self.at_eof() && !starts_item(self.kind()) {
             self.bump();
@@ -338,9 +338,9 @@ impl<'a> Parser<'a> {
             }
             TokKind::Ident(name) => {
                 let sp = self.bump();
-                // Integration: type constructors that the SPEC describes, yet stage 0
-                // does NOT implement, report a clear error here instead of a
-                // clueless syntax error (SPEC §14 "not contained").
+                // Integration: type constructors that the SPEC describes but
+                // stage 0 does NOT implement report a clear error here instead
+                // of a clueless syntax error (SPEC §14 "not contained").
                 // HOOK gc: `Gc[C]` and `GcWeak[C]` (gc.rs)
                 if let Some(t) = crate::gc::hook_type(self, &name, sp) {
                     return Some(t);
@@ -406,7 +406,7 @@ impl<'a> Parser<'a> {
         e
     }
 
-    /// Expression within brackets/arguments: struct literals are allowed there.
+    /// Expression inside brackets/arguments: struct literals are allowed there.
     pub(crate) fn nested_expr(&mut self) -> Expr {
         let saved = self.no_struct_lit;
         self.no_struct_lit = false;
@@ -623,8 +623,8 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Argument list after the '(' got consumed. Yields the arguments and the
-    /// position of the closing bracket (or of the offending token).
+    /// Argument list after the '(' has been consumed. Yields the arguments and
+    /// the position of the closing bracket (or of the offending token).
     pub(crate) fn call_args(&mut self, ctx: &str) -> (Vec<Expr>, Span) {
         let mut args = Vec::new();
         loop {
@@ -664,7 +664,7 @@ impl<'a> Parser<'a> {
         }
         // HOOK kern: `asm("…", <asm_op>, out("rax"), clobber("memory"))`
         // (core.rs, round 52). Only when `asm` is followed immediately by `(`
-        // and a string literal — otherwise `asm` stays one identifier.
+        // and a string literal — otherwise `asm` stays an identifier.
         if let Some(e) = crate::core::hook_primary(self) {
             return e;
         }
@@ -688,13 +688,13 @@ impl<'a> Parser<'a> {
             }
             // STRING LITERAL -> array literal.
             //
-            // `"abc"` becomes `[97, 98, 99]`, `u"abc"` becomes the UTF-16
-            // code units. The type is thereby `[u8; N]` or `[u16; N]`, and
+            // `"abc"` becomes `[97, 98, 99]`, `u"abc"` the UTF-16 code
+            // units. The type is therefore `[u8; N]` or `[u16; N]`, and
             // everything further — type check, lowering, code generation — is
-            // there already. The price is stated honestly (SPEC §14.1.str, S8):
-            // the data land as a sequence of single store instructions at the
-            // frame, not at `.rodata`. For the source text the gain is big
-            // nonetheless: `var m: [u8; 12] = "firn-gc: …"` rather than one
+            // there already. The price is stated honestly (SPEC §14.1.str,
+            // S8): the data land as a sequence of single store instructions
+            // in the frame, not in `.rodata`. For the source text the gain is
+            // big nonetheless: `var m: [u8; 12] = "firn-gc: …"` instead of an
             // octet list computed by hand.
             TokKind::Str(_, val) => {
                 let sp = self.bump();
@@ -809,7 +809,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `T{ field: value, ... }` — '{' still stands ahead.
+    /// `T{ field: value, ... }` — '{' is still ahead.
     pub(crate) fn struct_lit(&mut self, name: String, name_span: Span) -> Expr {
         self.bump(); // '{'
         let mut fields = Vec::new();
@@ -878,8 +878,8 @@ impl<'a> Parser<'a> {
             }
             let before = self.pos;
             let s = self.stmt();
-            // Hidden text segments of the interpolation stand AHEAD of the
-            // statement that holds their interpolation.
+            // Hidden text segments of the interpolation stand BEFORE the
+            // statement that contains their interpolation.
             if !self.hoist.is_empty() {
                 stmts.append(&mut self.hoist);
             }
@@ -928,7 +928,7 @@ impl<'a> Parser<'a> {
         s
     }
 
-    /// `defer <statement>` — the statement runs when the enclosing block gets
+    /// `defer <statement>` — the statement runs when the enclosing block is
     /// left (SPEC §5.1). Allowed is both a block (`defer { … }`) and a single
     /// statement (`defer close(fd)`).
     fn defer_stmt(&mut self, only_error: bool) -> Stmt {
@@ -1409,9 +1409,9 @@ impl<'a> Parser<'a> {
 
     /// `#[attr]` or `#[attr(arg, ...)]`, as often as you like one after another.
     ///
-    /// The parser checks the form here ONLY. Whether the label exists, where it
-    /// belongs and whether it does something at stage 0 gets decided by
-    /// `sema.rs` per the register at `attrs.rs` — with line, column, suggestion.
+    /// The parser checks the form here ONLY. Whether the name exists, where it
+    /// belongs and whether it does anything at stage 0 is decided by `sema.rs`
+    /// per the register in `attrs.rs` — with line, column and a suggestion.
     fn attributes(&mut self) -> Vec<Attr> {
         let mut out = Vec::new();
         while self.at(&TokKind::Hash) {
@@ -1592,14 +1592,14 @@ pub fn reset_hooks() {
 }
 
 /// Like `parse`, but for a file of the source map: `file` is its number,
-/// `base_id` the first `ExprId` still free. `Program::expr_count` is
-/// afterwards the first id free behind this file (absolute) — `modules.rs`
-/// lines the files up that way without overlap.
+/// `base_id` the first `ExprId` still free. Afterwards `Program::expr_count`
+/// is the first free id behind this file (absolute) — that is how
+/// `modules.rs` lines the files up without overlap.
 impl<'a> Parser<'a> {
     /// `f"..."` — the string interpolation (round 39).
     ///
-    /// The parser splits the body AT COMPILE TIME into a chain of calls on the
-    /// Fmt builder out of `std.io` — no varargs, no parsing at runtime.
+    /// The parser splits the body AT COMPILE TIME into a chain of calls on
+    /// the Fmt builder from `std.io` — no varargs, no parsing at run time.
     /// `f"x = {x}!"` becomes:
     ///
     /// ```text
@@ -1609,8 +1609,8 @@ impl<'a> Parser<'a> {
     /// ```
     ///
     /// The text segments cannot be addressed flatly (a bare array literal has
-    /// no derivable type at this spot) — they get hoisted as hidden
-    /// `let _fseg<N>: [u8; N]` ahead of the surrounding statement (`block`
+    /// no derivable type at this place) — they are hoisted as hidden
+    /// `let _fseg<N>: [u8; N]` in front of the surrounding statement (`block`
     /// empties `self.hoist`). Whoever writes `f"..."` needs `import std.io` —
     /// otherwise the resolution reports `io` as not included, exactly as with
     /// a hand written `io.`.
@@ -1639,9 +1639,9 @@ impl<'a> Parser<'a> {
             }
             if c == '\\' {
                 // The escape belongs to the text segment — the bracket scan
-                // may not misread a \" as the end of the literal (the quotes
-                // are gone here already); '{')}' does not show up escaped
-                // within the core version (docs/RUNDE39.md).
+                // must not misread a \" as the end of the literal (the quotes
+                // are already gone here); '{')}' does not appear escaped
+                // in the core version (docs/RUNDE39.md).
                 i += 2;
                 continue;
             }
@@ -1649,11 +1649,11 @@ impl<'a> Parser<'a> {
                 i += 1;
                 continue;
             }
-            // Close the text segment ahead of the bracket.
+            // Close the text segment in front of the bracket.
             if i > text_of {
                 chain = self.interp_text(chain, sp, &chars[text_of..i], text_of);
             }
-            // Look for the closing '}'; nesting of '{' counts as error.
+            // Look for the closing '}'; nesting of '{' counts as an error.
             let mut j = i + 1;
             let mut too = false;
             while j < chars.len() {
@@ -1693,7 +1693,7 @@ impl<'a> Parser<'a> {
     }
 
     /// One text segment: decode it, register it as a hidden `let _fseg<N>`
-    /// and append `io.fmt_text(chain, &label[0] as u64, N)` to the chain.
+    /// and append `io.fmt_text(chain, &name[0] as u64, N)` to the chain.
     fn interp_text(&mut self, chain: Expr, sp: Span, raw: &[char], of: usize) -> Expr {
         let bytes = match crate::strings::decode_literal(crate::strings::LitKind::Str, raw) {
             Ok(crate::strings::LitValue::Octets(v)) => v,
@@ -1746,7 +1746,7 @@ impl<'a> Parser<'a> {
     /// parse ONE expression out of it and append it to the chain as
     /// `io.fmt_number(chain, (expression) as i64)`.
     fn interp_expr(&mut self, chain: Expr, sp: Span, raw: &[char], of: usize) -> Expr {
-        // The positions are right when the fragment stands at its real spot:
+        // The positions are right when the fragment stands at its real place:
         // pad lines and columns beforehand (strings are single line, so ONE
         // line suffices).
         let mut source = String::new();
@@ -1774,18 +1774,18 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Help for the error message above: a span out of single parts.
+    /// Help for the error message above: a span built from single parts.
     fn spanned(&self, line: u32, col: u32, len: u32) -> Span {
         Span { line, col, len, file: self.file }
     }
 }
 
-/// Parses exactly ONE expression out of one interpolation segment.
+/// Parses exactly ONE expression out of an interpolation segment.
 ///
 /// The sub-parser shares diagnostics and module knowledge with the calling
 /// parser; the `ExprId`s carry on seamlessly through `next_id`.
-/// `interp_depth = 1` bars the nesting: one `f"..."` within the fragment
-/// becomes a clean error rather than silent hoist leaks.
+/// `interp_depth = 1` bars nesting: an `f"..."` in the fragment becomes a
+/// clean error rather than silent hoist leaks.
 fn in_expr(
     toks: &[Token],
     dg: &mut Diags,
@@ -1841,8 +1841,8 @@ pub fn parse_module(toks: &[Token], dg: &mut Diags, file: u32, base_id: u32) -> 
     };
     let prog = p.program();
     if !p.hoist.is_empty() {
-        // f"..." at ITEM level (say within a `const`): there is no
-        // statement ahead of which the text segments could be hoisted.
+        // f"..." at ITEM level (say in a `const`): there is no
+        // statement in front of which the text segments could be hoisted.
         p.dg.error(
             Span::none(),
             "interpolation f\"...\" outside a statement (for example in a const) cannot be expressed".to_string(),
@@ -1967,7 +1967,7 @@ mod tests {
             },
             other => panic!("expected assignment, {:?}", other),
         }
-        // One operator at the END OF A LINE continues the expression, though,
+        // An operator at the END OF A LINE continues the expression, though,
         // and inside brackets a line break does so too.
         let p2 = ok("fn f(a: i32, b: i32) -> i32 { return a }\nfn main() -> i32 {\n let s: i32 = 1 +\n 2\n let t: i32 = f(1,\n 2)\n return s + t\n}");
         assert_eq!(p2.funcs[1].body.stmts.len(), 3);
@@ -2094,7 +2094,7 @@ mod tests {
     }
 }
 
-/// Type constructors that `SPEC.md` describes, yet stage 0 does not build.
+/// Type constructors that `SPEC.md` describes but stage 0 does not build.
 /// They get a clear error of their own rather than a syntax error —
 /// `SPEC.md` §14 lists them under "not contained".
 fn not_implemented_ty(name: &str) -> Option<&'static str> {
