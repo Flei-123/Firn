@@ -1,44 +1,44 @@
-//! DWARF-Grundlagen: Zeilennummern (`.debug_line`) fuer den Debugger.
+//! DWARF basics: line numbers (`.debug_line`) for the debugger.
 //!
-//! Die FIR traegt keine Quellpositionen (`fir.rs` ist eingefroren). Deshalb
-//! sammelt das Lowering die Zuordnung *Instruktion -> Quellzeile* hier in einer
-//! Tabelle, die der Codegenerator beim Schreiben des Assemblers abfragt. Die
-//! Zeilennummern werden als `.file`/`.loc`-Direktiven ausgegeben; `as` erzeugt
-//! daraus die Abschnitte `.debug_line`, `.debug_info` und `.debug_abbrev`.
+//! FIR carries no source positions (`fir.rs` is frozen). That is why lowering
+//! collects the mapping *instruction -> source line* here as a table that the
+//! code generator queries while writing the assembler. The line numbers get
+//! emitted as `.file`/`.loc` directives; from those `as` produces the sections
+//! `.debug_line`, `.debug_info` and `.debug_abbrev`.
 //!
-//! Genauigkeit:
-//!   * **immer**: Zeile der `fn`-Deklaration (Haltepunkt auf eine Funktion
-//!     zeigt die richtige `.fi`-Datei und -Zeile)
-//!   * **ohne Optimierer**: zusaetzlich anweisungsgenaue Zeilen. Mit
-//!     Optimierer werden sie unterdrueckt, weil der Optimierer Instruktionen
-//!     entfernt, verschiebt und Bloecke neu nummeriert — falsche Zeilen waeren
-//!     schlimmer als keine.
+//! Accuracy:
+//!   * **always**: line of the `fn` declaration (a breakpoint on a function
+//!     shows the right `.fi` file and line)
+//!   * **without the optimizer**: additionally instruction-exact lines. With
+//!     the optimizer they get suppressed, because the optimizer removes and
+//!     moves instructions and renumbers blocks — wrong lines would be worse
+//!     than none.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 
 #[derive(Default)]
 struct FuncLines {
-    /// Position der `fn`-Zeile: (Dateinummer, Zeile)
+    /// Position of the `fn` line: (file number, line)
     decl: Option<(u32, u32)>,
-    /// (Block, Index der Instruktion im Block) -> (Dateinummer, Zeile)
+    /// (block, index of the instruction within the block) -> (file number, line)
     notes: HashMap<(u32, u32), (u32, u32)>,
 }
 
 #[derive(Default)]
 struct Table {
-    /// Quelldateien in der Reihenfolge ihrer Nummern (0-basiert).
+    /// Source files ordered by their numbers (0-based).
     files: Vec<String>,
     funcs: HashMap<String, FuncLines>,
-    /// Anweisungsgenaue Zeilen ausgeben?
+    /// Emit instruction-exact lines?
     statements: bool,
 }
 
 static TABLE: Mutex<Option<Table>> = Mutex::new(None);
 
 fn with<R>(f: impl FnOnce(&mut Table) -> R) -> R {
-    // Ein vergifteter Mutex ist nur nach einer Panik moeglich; dann wird der
-    // innere Wert weiterbenutzt, statt eine zweite Panik auszuloesen.
+    // A poisoned mutex is possible only after a panic; the inner value then
+    // stays usable rather than triggering a second panic.
     let mut guard = match TABLE.lock() {
         Ok(g) => g,
         Err(e) => e.into_inner(),
@@ -47,7 +47,7 @@ fn with<R>(f: impl FnOnce(&mut Table) -> R) -> R {
     f(t)
 }
 
-/// Setzt die Tabelle zurueck und traegt die Quelldateien ein.
+/// Resets the table and enters the source files.
 pub fn reset(files: Vec<String>, statements: bool) {
     with(|t| {
         t.files = files.clone();
@@ -56,10 +56,10 @@ pub fn reset(files: Vec<String>, statements: bool) {
     });
 }
 
-/// Haengt eine weitere Quelldatei an — gebraucht fuer den von `comptime`
-/// erzeugten Quelltext, der erst nach `reset` entsteht. Die Reihenfolge muss
-/// mit `Diags::add_file` uebereinstimmen, sonst zeigen die `.loc`-Direktiven
-/// auf eine Nummer, die `as` nicht kennt.
+/// Appends one more source file — needed for the source text produced by
+/// `comptime`, which appears only after `reset`. The order must agree with
+/// `Diags::add_file`, otherwise the `.loc` directives point to a number that
+/// `as` does not know.
 pub fn add_file(name: &str) {
     with(|t| {
         if !t.files.is_empty() {
@@ -68,12 +68,12 @@ pub fn add_file(name: &str) {
     });
 }
 
-/// Quelldateien in der Reihenfolge ihrer Nummern; leer = keine Debuginfo.
+/// Source files ordered by their numbers; empty = no debug info.
 pub fn files() -> Vec<String> {
     with(|t| t.files.clone())
 }
 
-/// Position der `fn`-Deklaration merken.
+/// Remember the position of the `fn` declaration.
 pub fn set_fn(name: &str, file: u32, line: u32) {
     if line == 0 {
         return;
@@ -83,7 +83,7 @@ pub fn set_fn(name: &str, file: u32, line: u32) {
     });
 }
 
-/// Quellzeile der Instruktion `idx` in Block `block` merken.
+/// Remember the source line of instruction `idx` within block `block`.
 pub fn note(name: &str, block: u32, idx: u32, file: u32, line: u32) {
     if line == 0 {
         return;
@@ -101,8 +101,8 @@ pub fn note(name: &str, block: u32, idx: u32, file: u32, line: u32) {
     });
 }
 
-/// Eine `alloca` wurde in Block `block` an Position `at` EINGEFUEGT: alle
-/// Vermerke ab dieser Position rutschen um eins nach hinten.
+/// One `alloca` got INSERTED into block `block` at position `at`: every
+/// note from that position onwards slides one step back.
 pub fn shift_after_insert(name: &str, block: u32, at: u32) {
     with(|t| {
         if !t.statements {
@@ -118,12 +118,12 @@ pub fn shift_after_insert(name: &str, block: u32, at: u32) {
     });
 }
 
-/// Zeile der `fn`-Deklaration.
+/// Line of the `fn` declaration.
 pub fn fn_line(name: &str) -> Option<(u32, u32)> {
     with(|t| t.funcs.get(name).and_then(|f| f.decl))
 }
 
-/// Zeile der Instruktion `idx` in Block `block`, sofern vermerkt.
+/// Line of instruction `idx` within block `block`, if noted.
 pub fn line_at(name: &str, block: u32, idx: u32) -> Option<(u32, u32)> {
     with(|t| {
         t.funcs
@@ -132,7 +132,7 @@ pub fn line_at(name: &str, block: u32, idx: u32) -> Option<(u32, u32)> {
     })
 }
 
-/// `.file`-Direktiven fuer alle Quelldateien (Nummern sind 1-basiert).
+/// `.file` directives for all source files (numbers are 1-based).
 pub fn file_directives() -> String {
     let mut out = String::new();
     for (i, f) in files().iter().enumerate() {
@@ -145,8 +145,8 @@ pub fn file_directives() -> String {
 mod tests {
     use super::*;
 
-    /// Die Tabelle ist globaler Zustand — deshalb EIN Test, der beides prueft
-    /// (parallele Tests wuerden sich sonst gegenseitig zuruecksetzen).
+    /// The table is global state — hence ONE test that checks both
+    /// (parallel tests would otherwise reset each other).
     #[test]
     fn notes_move_itself_and_let_itself_disable() {
         reset(vec!["a.fi".to_string()], true);

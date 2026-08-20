@@ -1,48 +1,48 @@
-//! Projektmanifest `firn.paket` — Name, Version, Einstiegspunkt,
-//! Quellverzeichnisse, oeffentliche Module, Abhaengigkeiten.
+//! Project manifest `firn.package` — label, version, entry point,
+//! source directories, public modules, dependencies.
 //!
-//! WARUM KEIN TOML (Runde 48, Entscheidung mit Begruendung)
+//! WHY NO TOML (round 48, decision with its reasoning)
 //! ---------------------------------------------------------------------
-//! TOML ist eine echte Spezifikation: maskierte und mehrzeilige
-//! Zeichenketten, Reihungen, eingebettete Tabellen, Datumswerte,
-//! Zahlensyntax. Dieser Uebersetzer hat KEINE Fremdbibliotheken, und alles
-//! muss ZWEIMAL stehen — in Rust (`firnc0`) und in Firn (`lib/firnc1/package.fi`,
-//! ohne libc, nur Puffer und `syscall`). Ein *halbes* TOML waere die
-//! schlechteste Loesung: es sieht aus wie TOML, nimmt aber gueltige
-//! TOML-Dateien nicht an oder liest sie anders. Deshalb ein eigenes,
-//! absichtlich winziges Zeilenformat mit eigener Endung — niemand erwartet
-//! davon TOML-Semantik.
+//! TOML is a real specification: escaped and multi-line strings, arrays,
+//! embedded tables, date values, number syntax. This compiler has NO
+//! foreign libraries, and everything must stand TWICE — as Rust (`firnc0`)
+//! and as Firn (`lib/firnc1/package.fi`, without libc, buffers and
+//! `syscall` only). A *half* TOML would be the worst solution: it looks
+//! like TOML, yet fails to accept valid TOML files or reads them
+//! differently. Hence a format of its own, deliberately tiny and line
+//! based, with a suffix of its own — nobody expects TOML semantics from
+//! that.
 //!
 //! FORMAT
 //! ---------------------------------------------------------------------
-//! Eine Anweisung je Zeile: `schluessel wert [wert ...]`. Trennzeichen sind
-//! Leerzeichen und Tabulator, `#` leitet einen Kommentar bis zum Zeilenende
-//! ein, Leerzeilen zaehlen nicht. Es gibt keine Anfuehrungszeichen und keine
-//! Maskierungen — ein Wert enthaelt deshalb weder Leerzeichen noch `#`.
+//! One statement per line: `key value [value ...]`. Separators are space and
+//! tab, `#` opens a comment up to the end of the line, empty lines do not
+//! count. There are no quotes and no escapes — a value therefore holds
+//! neither spaces nor `#`.
 //!
 //! ```text
-//! paket        demo            # Pflicht, genau einmal
-//! version      0.1.0           # Pflicht, genau einmal, zahl.zahl.zahl
-//! start        src/main.fi     # hoechstens einmal, relativ zum Manifest;
-//!                              #      eine Bibliothek hat keinen
-//! quelle       src             # 0..n, relativ; ohne Angabe gilt das
-//!                              #      Manifestverzeichnis selbst
-//! oeffentlich  geo punkt       # 0..n, Modulschnittstelle des Pakets;
-//!                              #      ohne Angabe ist alles oeffentlich
-//! brauche      geo ../geo      # 0..n, Name + lokaler Pfad
+//! package      demo            # required, exactly once
+//! version      0.1.0           # required, exactly once, num.num.num
+//! start        src/main.fi     # at most once, relative to the manifest;
+//!                              #      a library has none
+//! source       src             # 0..n, relative; without it the
+//!                              #      manifest directory itself counts
+//! public       geo point       # 0..n, module interface of the package;
+//!                              #      without it everything is public
+//! needs        geo ../geo      # 0..n, label + local path
 //! ```
 //!
-//! Unbekannte Schluessel sind ein FEHLER, kein stilles Ueberlesen: ein
-//! vertipptes `publi` wuerde sonst eine Schnittstelle oeffnen, die
-//! niemand oeffnen wollte.
+//! Unknown keys are ERRORS, no silent skipping: a mistyped `publi` would
+//! otherwise open up some interface that nobody ever wanted to
+//! open.
 
-/// Dateiname des Manifests. Steht ausschliesslich hier.
+/// Filename of the manifest. Stands exclusively here.
 pub const MANIFEST: &str = "firn.package";
 
-/// Wie viele Verzeichnisebenen die Suche nach oben hoechstens geht.
+/// How many directory levels the upward search covers at most.
 pub const SUCHTIEFE: usize = 64;
 
-/// Eine Abhaengigkeit: Name (wird zum Importpraefix) und lokaler Pfad.
+/// One dependency: label (becomes the import prefix) and local path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dependency {
     pub name: String,
@@ -50,24 +50,24 @@ pub struct Dependency {
     pub line: u32,
 }
 
-/// Der Inhalt eines Manifests, geprueft, aber noch ohne Bezug zum Dateisystem.
+/// The content of a manifest, checked, but still without file system ties.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Manifest {
     pub name: String,
     pub version: String,
-    /// Einstiegspunkt. LEER heisst: das Paket ist eine Bibliothek und kann
-    /// nicht mit `--paket` gebaut werden.
+    /// Entry point. EMPTY means: the package is a library and cannot be built
+    /// with `--package`.
     pub start: String,
-    /// Quellverzeichnisse, relativ zum Manifest. Nie leer (Standard: `.`).
+    /// Source directories, relative to the manifest. Never empty (default: `.`).
     pub sources: Vec<String>,
-    /// Oeffentliche Module. LEER heisst: alles ist oeffentlich — dieselbe
-    /// Regel wie bei `export { … }` innerhalb einer Datei.
+    /// Public modules. EMPTY means: everything is public — the same rule as
+    /// with `export { … }` inside a file.
     pub public: Vec<String>,
     pub dependent: Vec<Dependency>,
 }
 
-/// Fehler beim Lesen eines Manifests. `zeile` = 0 heisst: betrifft die Datei
-/// als Ganzes (fehlende Pflichtangabe).
+/// Error while reading a manifest. `line` = 0 means: concerns the file as a
+/// whole (a required entry is missing).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error {
     pub line: u32,
@@ -75,21 +75,21 @@ pub struct Error {
 }
 
 impl Manifest {
-    /// Ist `modul` von aussen sichtbar?
+    /// Is `module` visible from outside?
     pub fn is_public(&self, module: &str) -> bool {
         self.public.is_empty() || self.public.iter().any(|m| m == module)
     }
 }
 
-// --------------------------------------------------------------- Pfadrechnen
+// ----------------------------------------------------------- Path arithmetic
 //
-// REIN LEXIKALISCH, ohne Dateisystem: dieselbe Rechnung muss in Firn
-// nachvollziehbar sein, und `--paket-info` soll auf beiden Uebersetzern
-// zeichengleich ausfallen. Symbolische Verweise werden dabei NICHT aufgeloest
-// (das kann `firnc1` ohne libc nicht, und es wuerde die Ausgabe
-// rechnerabhaengig machen).
+// PURELY LEXICAL, without a file system: the same arithmetic must be
+// reproducible for Firn, and `--package-info` shall come out character for
+// character alike on both compilers. Symbolic links do NOT get resolved
+// along the way (`firnc1` cannot do that without libc, and it would make
+// the output machine dependent).
 
-/// `a/./b/../c` -> `a/c`. Fuehrender Schraegstrich bleibt erhalten.
+/// `a/./b/../c` -> `a/c`. A leading slash stays.
 pub fn normalize(path: &str) -> String {
     let absolute = path.starts_with('/');
     let mut parts: Vec<&str> = Vec::new();
@@ -122,7 +122,7 @@ pub fn normalize(path: &str) -> String {
     s
 }
 
-/// `basis` + `rel`, normalisiert. Ein absolutes `rel` gewinnt.
+/// `base` + `rel`, normalized. One absolute `rel` wins.
 pub fn join(base: &str, rel: &str) -> String {
     if rel.starts_with('/') {
         return normalize(rel);
@@ -133,7 +133,7 @@ pub fn join(base: &str, rel: &str) -> String {
     normalize(&format!("{}/{}", base, rel))
 }
 
-/// Verzeichnisteil eines Pfades (ohne den letzten Namen).
+/// Directory part of a path (without the last component).
 pub fn dirname(path: &str) -> String {
     match path.rfind('/') {
         Some(0) => "/".to_string(),
@@ -142,7 +142,7 @@ pub fn dirname(path: &str) -> String {
     }
 }
 
-/// Letzter Namensteil ohne `.fi`-Endung — der Modulname einer Datei.
+/// Last component without the `.fi` suffix — the module label of a file.
 pub fn module_name(path: &str) -> String {
     let last = match path.rfind('/') {
         Some(i) => &path[i + 1..],
@@ -154,7 +154,7 @@ pub fn module_name(path: &str) -> String {
     }
 }
 
-/// Liegt `pfad` in `wurzel` (oder IST er es)? Beide muessen normalisiert sein.
+/// Does `path` sit within `root` (or IS it that)? Both must be normalized.
 pub fn read_within(path: &str, root: &str) -> bool {
     if path == root {
         return true;
@@ -167,11 +167,11 @@ pub fn read_within(path: &str, root: &str) -> bool {
         && path.as_bytes()[root.len()] == b'/'
 }
 
-// ------------------------------------------------------------------- Pruefen
+// ------------------------------------------------------------------ Checking
 
-/// Bezeichner: Buchstabe zuerst, dann Buchstaben, Ziffern, Unterstrich.
-/// Paket- und Modulnamen werden zu Importpraefixen, deshalb dieselbe Regel
-/// wie fuer Bezeichner der Sprache.
+/// Identifier: letter first, then letters, digits, underscore.
+/// Package and module names become import prefixes, hence the same rule as
+/// for identifiers of the language.
 pub fn is_name(s: &str) -> bool {
     let b = s.as_bytes();
     if b.is_empty() {
@@ -185,7 +185,7 @@ pub fn is_name(s: &str) -> bool {
         .all(|&c| c.is_ascii_alphanumeric() || c == b'_')
 }
 
-/// `zahl.zahl.zahl`, jede Stelle mindestens eine Ziffer.
+/// `num.num.num`, every place at least one digit.
 pub fn is_version(s: &str) -> bool {
     let mut parts = 0;
     for t in s.split('.') {
@@ -197,7 +197,7 @@ pub fn is_version(s: &str) -> bool {
     parts == 3
 }
 
-/// Pfad INNERHALB des Pakets: relativ, ohne `..`, nicht leer.
+/// Path WITHIN the package: relative, without `..`, not empty.
 pub fn is_inner_path(s: &str) -> bool {
     if s.is_empty() || s.starts_with('/') {
         return false;
@@ -205,12 +205,12 @@ pub fn is_inner_path(s: &str) -> bool {
     !s.split('/').any(|t| t == "..")
 }
 
-/// Pfad einer Abhaengigkeit: darf hinausfuehren, aber nicht leer sein.
+/// Path of a dependency: may lead outside, but must not be empty.
 pub fn is_outer_path(s: &str) -> bool {
     !s.is_empty()
 }
 
-// -------------------------------------------------------------------- Lesen
+// ------------------------------------------------------------------ Reading
 
 fn words(line: &str) -> Vec<&str> {
     line
@@ -219,8 +219,8 @@ fn words(line: &str) -> Vec<&str> {
         .collect()
 }
 
-/// Liest ein Manifest aus dem Text. Reine Funktion: kein Dateisystem, damit
-/// die Regeln einzeln pruefbar bleiben.
+/// Reads a manifest from the text. Pure function: no file system, so that
+/// the rules stay checkable one by one.
 pub fn read(text: &str) -> Result<Manifest, Error> {
     let mut m = Manifest::default();
     let mut has_name = false;
@@ -376,11 +376,11 @@ pub fn read(text: &str) -> Result<Manifest, Error> {
     Ok(m)
 }
 
-// ------------------------------------------------------------------ Ausgabe
+// ------------------------------------------------------------------- Output
 
-/// Der Bericht von `--paket-info`. Zeichengleich in beiden Uebersetzern;
-/// alle Pfade sind rein lexikalisch aus `wurzel` gebaut (kein `getcwd`,
-/// keine symbolischen Verweise), damit die Ausgabe nicht vom Rechner abhaengt.
+/// The report of `--package-info`. Character for character alike on both
+/// compilers; all paths are built purely lexically from `root` (no
+/// `getcwd`, no symbolic links), so the output does not depend on the machine.
 pub fn info_text(m: &Manifest, root: &str) -> String {
     let w = normalize(root);
     let mut s = String::new();
@@ -416,11 +416,11 @@ mod tests {
         assert_eq!(x.name, "demo");
         assert_eq!(x.version, "0.1.0");
         assert_eq!(x.start, "src/main.fi");
-        // Ohne 'source' gilt das Manifestverzeichnis selbst.
+        // Without 'source' the manifest directory itself counts.
         assert_eq!(x.sources, vec![".".to_string()]);
         assert!(x.public.is_empty());
         assert!(x.dependent.is_empty());
-        // Leere Schnittstelle heisst: alles oeffentlich (wie 'export').
+        // Empty interface means: everything public (like 'export').
         assert!(x.is_public("irgendwas"));
     }
 
@@ -452,7 +452,7 @@ mod tests {
                    "the manifest needs a line 'package <name>'");
         assert_eq!(read("package a\nstart a.fi\n").unwrap_err().msg,
                    "the manifest needs a line 'version <number.number.number>'");
-        // 'start' ist KEINE Pflicht: eine Bibliothek hat keinen Einstiegspunkt.
+        // 'start' is NOT required: a library has no entry point.
         assert_eq!(read("package a\nversion 1.0.0\n").unwrap().start, "");
     }
 

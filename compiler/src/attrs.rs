@@ -1,30 +1,30 @@
-//! **Attributregister** — die einzige Wahrheit darueber, welche Attribute es
-//! gibt, wo sie stehen duerfen und welche davon in Stufe 0 wirklich etwas tun.
+//! **Attribute register** — the single truth about which attributes exist,
+//! where they may stand and which of them really do something at stage 0.
 //!
-//! Firns Spezifikation stuetzt sich an vielen Stellen auf Attribute:
+//! Firn's specification leans on attributes at many spots:
 //! `#[must_consume]` (SPEC §3.3, §5.1), `#[no_gc]` (§3.5.4),
 //! `#[constant_time]` (§9.2), `#[unwinds]` (§5.3), `#[packed]`/`#[align(n)]`
 //! (§13), `#[layout(soa)]` (DESIGNZIELE §8), `#[abi_stable]`/`#[frozen]`
 //! (DESIGNZIELE §4), `#[hot]` (DESIGNZIELE §9).
 //!
-//! Sie kommen zu sehr verschiedenen Zeitpunkten. Damit das nicht in einem
-//! Wildwuchs aus verstreuten Zeichenkettenvergleichen endet, stehen sie **hier**
-//! in einer Tabelle — mit Ziel, Umsetzungsstand und Zweck. `--list-attrs` gibt
-//! sie aus.
+//! They arrive at very different points of time. To keep that from ending up
+//! as a thicket of scattered string comparisons, they are gathered **here**
+//! as one table — with target, state of implementation and purpose.
+//! `--list-attrs` prints it.
 //!
-//! Regel des Projekts: Was nicht umgesetzt ist, meldet einen **sauberen
-//! Compilerfehler** mit Zeile und Spalte — niemals einen Absturz und niemals
-//! stillschweigendes Ignorieren. Ein ignoriertes `#[constant_time]` waere die
-//! gefaehrlichste Sorte Fehler, die es in dieser Sprache geben kann.
+//! Rule of the project: whatever is not implemented reports a **clean
+//! compiler error** with line and column — never a crash and never silent
+//! ignoring. A silently dropped `#[constant_time]` would be the most
+//! dangerous sort of error that can exist within this language.
 
-/// Worauf ein Attribut geschrieben werden darf.
+/// Where a given attribute may be written.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Target {
-    /// nur vor `fn`
+    /// only before `fn`
     Func,
-    /// nur vor `struct` (und spaeter `enum`)
+    /// only before `struct` (and later `enum`)
     Type,
-    /// vor beidem
+    /// before both
     Both,
 }
 
@@ -47,14 +47,14 @@ impl Target {
 pub struct AttrInfo {
     pub name: &'static str,
     pub target: Target,
-    /// Anzahl erwarteter Argumente in Klammern (0 = ohne Klammern).
+    /// Count of expected arguments within brackets (0 = without brackets).
     pub args: usize,
-    /// Tut es in Stufe 0 wirklich etwas?
+    /// Does it really do something at stage 0?
     pub implemented: bool,
     pub what: &'static str,
 }
 
-/// Alle Attribute, die die Sprache kennt.
+/// Every attribute the language knows.
 pub const ATTRS: &[AttrInfo] = &[
     AttrInfo {
         name: "must_consume",
@@ -153,7 +153,7 @@ pub fn search(name: &str) -> Option<&'static AttrInfo> {
     ATTRS.iter().find(|a| a.name == name)
 }
 
-/// Passt das Attribut auf dieses Ziel?
+/// Does the attribute fit this target?
 pub fn fits(a: &AttrInfo, on_func: bool) -> bool {
     if on_func {
         a.target.allowed_fn()
@@ -162,7 +162,7 @@ pub fn fits(a: &AttrInfo, on_func: bool) -> bool {
     }
 }
 
-/// Naechstliegender bekannter Name (Levenshtein-Abstand <= 3), fuer Vorschlaege.
+/// Closest known spelling (Levenshtein distance <= 3), for suggestions.
 pub fn proposal(name: &str) -> Option<&'static str> {
     let mut best: Option<(usize, &'static str)> = None;
     for a in ATTRS {
@@ -189,7 +189,7 @@ fn distance(a: &str, b: &str) -> usize {
     line[b.len()]
 }
 
-/// Register als Text (fuer `--list-attrs`).
+/// The register as text (for `--list-attrs`).
 pub fn attrs_text() -> String {
     let mut out = String::new();
     out.push_str("Attribute\n\n");
@@ -230,20 +230,20 @@ mod tests {
 
     #[test]
     fn only_must_consume_is_implemented() {
-        // Wird ein weiteres Attribut umgesetzt, MUSS dieser Test angepasst
-        // werden — das erzwingt, dass README und SPEC mitgezogen werden.
-        // Stand Runde „Haertetest 2": zusaetzlich #[no_gc] (SPEC 3.5.4,
-        // geprueft in nogc.rs, Testprogramme tests/54x_no_gc_*.fi und
+        // Once one more attribute gets implemented, this test MUST be adjusted
+        // — that forces README and SPEC to be dragged along.
+        // State of round "hardening test 2": additionally #[no_gc] (SPEC 3.5.4,
+        // checked by nogc.rs, test programs tests/54x_no_gc_*.fi and
         // tests/neg/nogc_*.fi).
-        // Runde 52: dazu #[interrupt] und #[allow_fp] (SPEC 2, core.rs/prof.rs).
+        // Round 52: plus #[interrupt] and #[allow_fp] (SPEC 2, core.rs/prof.rs).
         let u: Vec<&str> = ATTRS.iter().filter(|a| a.implemented).map(|a| a.name).collect();
         assert_eq!(u, vec!["must_consume", "no_gc", "interrupt", "allow_fp"]);
     }
 
     #[test]
     fn not_implemented_attribute_report_next_a_error() {
-        // Gegenprobe zu tests/neg/attr_not_implemented.fi: die uebrigen
-        // Attribute bleiben abgelehnt, nichts wird still ignoriert.
+        // Counter-check to tests/neg/attr_not_implemented.fi: the remaining
+        // attributes stay rejected, nothing gets silently ignored.
         for name in ["constant_time", "unwinds", "packed", "align", "layout", "no_move", "hot"] {
             let a = search(name).expect(name);
             assert!(!a.implemented, "{} unexpectedly counts as implemented", name);
