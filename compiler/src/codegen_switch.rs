@@ -260,11 +260,11 @@ mod tests {
     }
 
     /// PROOF (SPEC §6.3, `P4`): the state machine with 32 states at
-    /// `tests/230_zustandsmaschine.fi` gets a real jump table —
+    /// `tests/230_state_machine.fi` gets a real jump table —
     /// one indirect jump through `.rodata`, no chain of 32 `cmp`.
     #[test]
     fn jump_table_at_30_states() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/230_zustandsmaschine.fi");
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/230_state_machine.fi");
         let src = std::fs::read_to_string(path).expect("test program missing");
         let mut dg = crate::diag::Diags::new(path, &src);
         let toks = crate::lexer::lex(&src, &mut dg);

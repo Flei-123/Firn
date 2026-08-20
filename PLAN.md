@@ -397,7 +397,7 @@ Re-measured with `bash test.sh` -> **PASS 397/397** and
 
 | Module | May write | May only read |
 |---|---|---|
-| **fehlerunionen** | `compiler/src/errors.rs` (new), `compiler/src/lower_errors.rs` (new), hook lines in `parser.rs`, `ast.rs`, `lexer.rs`, `sema.rs`, `lower.rs`, `types.rs`, `attrs.rs`; `tests/4??_*.fi`, `tests/neg/err_*.fi`; `SPEC.md` 14.1, `docs/FEHLERUNIONEN.md` | everything else |
+| **fehlerunionen** | `compiler/src/errors.rs` (new), `compiler/src/lower_errors.rs` (new), hook lines in `parser.rs`, `ast.rs`, `lexer.rs`, `sema.rs`, `lower.rs`, `types.rs`, `attrs.rs`; `tests/4??_*.fi`, `tests/neg/err_*.fi`; `SPEC.md` 14.1, `docs/ERROR_UNIONS.md` | everything else |
 | **tokenizer-kern** | `lib/html/tokenizer.fi` | `lib/html/mem.fi`, `tokens.fi` |
 | **tokenizer-text** | `lib/html/entities.fi` (new), `lib/html/entities_data.fi` (generated), `tools/tokenizer/gen_entities.py` (new) | `lib/html/mem.fi` |
 | **tokenizer-tokens** | `lib/html/tokens.fi`, `lib/html/tokenize_main.fi`, `lib/html/mem.fi` | -- |
@@ -507,7 +507,7 @@ New in the tree (the skeleton of this round, already green):
 | `compiler/src/nogc.rs` | **new, functional.** Carries `hat_no_gc(&FnDecl)` and `hook_check(ck, prog)`: it walks all `#[no_gc]` functions, checks **rule 2** (calling a function without `#[no_gc]`) completely and **rules 1/3** through the two queries from `gc.rs`. The module `nogc` hardens the file. |
 | `compiler/src/sema.rs` | exactly **one** line inserted: `// HOOK nogc` + `crate::nogc::hook_check(self, prog)` in `Checker::run`, after `add_items_inner`, before `check_main`. |
 | `compiler/src/main.rs` | `mod gc;` and `mod nogc;` entered. |
-| `lib/gc/`, `lib/rc/`, `lib/dom/`, `tools/dom_soak/`, `docs/berichte/` | empty directories for the modules of this round. |
+| `lib/gc/`, `lib/rc/`, `lib/dom/`, `tools/dom_soak/`, `docs/reports/` | empty directories for the modules of this round. |
 
 **No module therefore has to touch `sema.rs` or `main.rs` any more to get its
 hook** -- that was the purpose of the skeleton.
@@ -516,11 +516,11 @@ hook** -- that was the purpose of the skeleton.
 
 | Module | May write | May **not** touch |
 |---|---|---|
-| **gckern** | `compiler/src/gc.rs`, `compiler/src/gc_lower.rs` (new), `lib/gc/*.fi`, and, as the **only** module, the existing compiler files `parser.rs`, `lexer.rs`, `ast.rs`, `sema.rs`, `sema_generic.rs`, `types.rs`, `layout.rs`, `lower.rs`, `lower_errors.rs`, `errors.rs`, `mono.rs`, `modules.rs`, `abi.rs`, `codegen_x86.rs`, `fir.rs`, `opt.rs`, `mem2reg.rs`, `regalloc.rs`, `main.rs`; `tests/50*_gc_*.fi` ... `tests/53*_gc_*.fi`, `tests/neg/gc_*.fi`; `docs/GC.md`, `docs/berichte/gckern.md` | `compiler/src/nogc.rs`, `compiler/src/attrs.rs`, `lib/rc/`, `lib/dom/`, `tools/`, `test.sh`, `SPEC.md`, `ACCEPTANCE.md`, `README.md` |
-| **nogc** | `compiler/src/nogc.rs`, `compiler/src/attrs.rs`, `lib/html/*.fi`, `tests/54*_no_gc_*.fi`, `tests/neg/nogc_*.fi`, `docs/berichte/nogc.md` | all other compiler files (the hook is already there), `lib/gc/`, `lib/dom/`, `test.sh`, the documents |
-| **rclib** | `lib/rc/*`, `tests/modules/rc.fi`, `tests/55*_rc_*.fi`, `tests/neg/rc_*.fi`, `docs/RC.md`, `docs/berichte/rclib.md` | the compiler sources, `lib/dom/`, `lib/gc/`, `test.sh`, the documents |
-| **dom** | `lib/dom/*.fi`, `tests/modules/dom.fi` (symlink), `tests/56*_dom_*.fi`, `docs/berichte/dom.md` | the compiler sources, `lib/rc/`, `lib/gc/`, `tools/`, `test.sh`, the documents |
-| **mess** | `tools/dom_soak/*`, `test.sh` (**appending** section 10 only), `ACCEPTANCE.md`, `README.md`, `SPEC.md` 14.1, `RUN.md`, `PLAN.md`, `docs/berichte/mess.md` | every source file in `compiler/`, `lib/` |
+| **gckern** | `compiler/src/gc.rs`, `compiler/src/gc_lower.rs` (new), `lib/gc/*.fi`, and, as the **only** module, the existing compiler files `parser.rs`, `lexer.rs`, `ast.rs`, `sema.rs`, `sema_generic.rs`, `types.rs`, `layout.rs`, `lower.rs`, `lower_errors.rs`, `errors.rs`, `mono.rs`, `modules.rs`, `abi.rs`, `codegen_x86.rs`, `fir.rs`, `opt.rs`, `mem2reg.rs`, `regalloc.rs`, `main.rs`; `tests/50*_gc_*.fi` ... `tests/53*_gc_*.fi`, `tests/neg/gc_*.fi`; `docs/GC.md`, `docs/reports/gckern.md` | `compiler/src/nogc.rs`, `compiler/src/attrs.rs`, `lib/rc/`, `lib/dom/`, `tools/`, `test.sh`, `SPEC.md`, `ACCEPTANCE.md`, `README.md` |
+| **nogc** | `compiler/src/nogc.rs`, `compiler/src/attrs.rs`, `lib/html/*.fi`, `tests/54*_no_gc_*.fi`, `tests/neg/nogc_*.fi`, `docs/reports/nogc.md` | all other compiler files (the hook is already there), `lib/gc/`, `lib/dom/`, `test.sh`, the documents |
+| **rclib** | `lib/rc/*`, `tests/modules/rc.fi`, `tests/55*_rc_*.fi`, `tests/neg/rc_*.fi`, `docs/RC.md`, `docs/reports/rclib.md` | the compiler sources, `lib/dom/`, `lib/gc/`, `test.sh`, the documents |
+| **dom** | `lib/dom/*.fi`, `tests/modules/dom.fi` (symlink), `tests/56*_dom_*.fi`, `docs/reports/dom.md` | the compiler sources, `lib/rc/`, `lib/gc/`, `tools/`, `test.sh`, the documents |
+| **mess** | `tools/dom_soak/*`, `test.sh` (**appending** section 10 only), `ACCEPTANCE.md`, `README.md`, `SPEC.md` 14.1, `RUN.md`, `PLAN.md`, `docs/reports/mess.md` | every source file in `compiler/`, `lib/` |
 
 New `tests/*.fi` are picked up by `test.sh` automatically -- nobody has to touch
 `test.sh` for that. **Only `mess`** may extend `test.sh`, and only by appending
@@ -768,7 +768,7 @@ path exists without duplicating code.
 3. Every new `tests/*.fi` runs in three build stages with the same result.
 4. No fixed memory address, no `MAP_FIXED`; a failed `mmap` fails visibly.
 5. `SPEC.md` is not rewritten -- deviations go into 14.1.
-6. Every module writes its report to `docs/berichte/<module>.md`: what was
+6. Every module writes its report to `docs/reports/<module>.md`: what was
    built, what was measured (real output), what is open. `mess` folds that
    together into `ACCEPTANCE.md` and `README.md`.
 7. A GC that cannot be shown to collect in the test is worthless. Every GC test

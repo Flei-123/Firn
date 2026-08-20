@@ -267,7 +267,7 @@ Named openly, so that it comes as no surprise:
 * **Memory model** -- an opt-in tracing GC built **and proven in a soak test**:
   100,000,000 DOM cycle sets (700 million objects) at a constant 1,364 KiB RSS,
   while the reference-counting counter-check leaks up to 750,080 KiB.
-  `docs/berichte/dom.md`. Still open are the 24 hour run and fragmentation with
+  `docs/reports/dom.md`. Still open are the 24 hour run and fragmentation with
   changing object sizes.
 * **Acid test 1** (HTML5 tokenizer): the pass rate is reached (6,810/6,810),
   **the speed is missed** (5.7x-8.3x on real pages instead of <= 2x).

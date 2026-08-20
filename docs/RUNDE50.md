@@ -259,7 +259,7 @@ second message about the same type argument would say nothing new.
 | `bound_duplicate_impl_base_ty.fi` | two `impl Ord for i32` |
 | `method_without_ty.fi` | method on an array type (which has no name) |
 
-Changed as well: `generic_anforderung.fi` (wording „anforderung" →
+Changed as well: `generic_requirement.fi` (wording „anforderung" →
 „schranke") and `impl_no_struct.fi` — whose old message („methoden gibt es
 nur fuer struct-typen") is wrong as of this round; it now checks that
 `i32.summe()` is cleanly rejected as „typ 'i32' hat keine methode 'summe'".

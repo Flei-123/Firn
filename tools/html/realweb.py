@@ -11,7 +11,7 @@ checked without a foreign library:
     byte for byte against each other).
 
 The COMPARISON with an independent implementation is not here but in
-tools/html/orakel.py (which needs html5lib and therefore the network).
+tools/html/oracle.py (which needs html5lib and therefore the network).
 
 Usage:  python3 tools/html/realweb.py <binary>
 """

@@ -15,7 +15,7 @@ IMPORTANT -- WHAT THIS IS AND WHAT IT IS NOT:
     installed in a venv of its own (tools/html/run.sh --check-expectations)
     and used only here.
 
-Usage:  python3 tools/html/orakel.py [files...]
+Usage:  python3 tools/html/oracle.py [files...]
 Return: 0 = all expectations agree with html5lib.
 """
 
@@ -25,7 +25,7 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 FAELLE = os.path.join(ROOT, "tools", "html", "cases")
-LUECKEN = os.path.join(ROOT, "tools", "html", "luecken")
+GAPS = os.path.join(ROOT, "tools", "html", "gaps")
 
 NS = {
     "http://www.w3.org/1999/xhtml": "",
@@ -67,7 +67,7 @@ def load_dat(path):
             doc.pop()
         context = "\n".join(parts.get("document-fragment", [])).strip() or None
         cases.append((data, "\n".join(doc),
-                       "orakel-abweichung" in parts, context))
+                       "oracle-deviation" in parts, context))
     return cases
 
 
@@ -136,7 +136,7 @@ def referenz(data, context=None):
 
 def main():
     files = sys.argv[1:] or (sorted(glob.glob(os.path.join(FAELLE, "*.dat")))
-                               + sorted(glob.glob(os.path.join(LUECKEN, "*.dat"))))
+                               + sorted(glob.glob(os.path.join(GAPS, "*.dat"))))
     ges = 0
     schlecht = 0
     nachlaeufer = 0
@@ -157,7 +157,7 @@ def main():
                 print()
     print("%d cases checked, %d deviations from html5lib 1.1 "
           "(%d known: html5lib 1.1 follows an older version of the "
-          "standard there, noted with '#orakel-abweichung')"
+          "standard there, noted with '#oracle-deviation')"
           % (ges, schlecht, nachlaeufer))
     return 1 if schlecht else 0
 
