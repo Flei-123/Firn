@@ -125,7 +125,7 @@ impl Emitter {
 /// Linker symbol of a function label.
 ///
 /// **The only** spot at which some internal label becomes a symbol — the
-/// scheme itself stands at `modules.rs` (`SYMBOL_SCHEMA`, DESIGNZIELE.md §4).
+/// scheme itself stands at `modules.rs` (`SYMBOL_SCHEMA`, DESIGN_GOALS.md §4).
 /// Internal block labels (`block_label`) deliberately do NOT pass through
 /// here: they are file local (`.L…`) and never show up at the symbol table.
 pub(crate) fn label(name: &str) -> String {

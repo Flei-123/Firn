@@ -1,7 +1,7 @@
 # `Rc` / `Weak` — level 2 of the memory model
 
 Reference: `SPEC.md` §3.2 (three levels), §3.4 (`Rc[T]`, `Weak[T]`,
-`Arc[T]`), §3.6 (raw pointers), `DESIGNZIELE.md` §2 (fallible allocation),
+`Arc[T]`), §3.6 (raw pointers), `DESIGN_GOALS.md` §2 (fallible allocation),
 `../karstos-browser/FIRN-ANFORDERUNGEN.md` requirement **S7**.
 
 This file describes what is in the tree, how it is used, and **what is
@@ -65,7 +65,7 @@ struct RcHeap { … }                        // Halde fester Kapazitaet
 |---|---|
 | `rc_heap_init(h, bytes) -> bool` | create the heap via `mmap`. `false` = failed — a **visible** failure, no silent substitute. No `MAP_FIXED`, no fixed address. |
 | `rc_heap_frei(h)` | `munmap` |
-| `rc_neu[T](h, wert, aus) -> AllocError!bool` | put a value on the heap, strong reference into `*aus`. **Fallible** (DESIGNZIELE §2), the result is `#[must_consume]`. |
+| `rc_neu[T](h, wert, aus) -> AllocError!bool` | put a value on the heap, strong reference into `*aus`. **Fallible** (DESIGN_GOALS §2), the result is `#[must_consume]`. |
 | `rc_lesen[T](r) -> T` | **read only** — returns a copy |
 | `rc_klonen[T](r) -> Zaehlverweis[T]` | strong counter + 1 |
 | `rc_freigeben[T](h, r)` | strong counter − 1, clears `*r`; at 0 and without a weak reference the block goes into the free list |

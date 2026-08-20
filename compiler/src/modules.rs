@@ -371,7 +371,7 @@ fn module_name(f: &SourceFile) -> String {
         .unwrap_or_else(|| format!("m{}", f.id))
 }
 
-/// **Version of the symbol naming scheme** (DESIGNZIELE.md §4, foundation).
+/// **Version of the symbol naming scheme** (DESIGN_GOALS.md §4, foundation).
 ///
 /// It stands at **every** linker symbol produced. Once the scheme changes,
 /// all symbols change — then the linker reports a missing label rather than
@@ -400,7 +400,7 @@ pub const ENTRY_SYMBOL: &str = "main";
 /// main                the entry point, unchanged
 /// ```
 ///
-/// **Why already now?** `DESIGNZIELE.md` §4: should Firn print `main` and
+/// **Why already now?** `DESIGN_GOALS.md` §4: should Firn print `main` and
 /// `add` as bare symbols today and need versioned ones later, that is a
 /// break for everything built already. The room for the version costs
 /// nothing today and makes a stable ABI (`#[abi_stable]`) later a mere
@@ -874,7 +874,7 @@ mod tests {
         assert_eq!(mangle("", "main"), "main");
         assert_eq!(mangle("helper", "square"), "helper__square");
         assert_eq!(mangle("", "square"), "square");
-        // Linker symbols: reserved prefix + scheme version (DESIGNZIELE 4)
+        // Linker symbols: reserved prefix + scheme version (DESIGN_GOALS 4)
         assert_eq!(symbol("square", None), "_F0.square");
         assert_eq!(symbol("helper__square", None), "_F0.helper__square");
         // The room for the ABI version is there.

@@ -2,7 +2,7 @@
 
 **State before this round:** there was `import a.b`, `export { … }` per file
 and the environment variable `FIRNLIB`. Nothing more — no project manifest,
-no dependencies, no build tool. `ABNAHME.md` item 5 (`W1`,
+no dependencies, no build tool. `ACCEPTANCE.md` item 5 (`W1`,
 „package management builds reproducibly") therefore stood at `[~]`.
 
 **What is there now:** a project manifest `firn.paket`, a fixed and
@@ -252,7 +252,7 @@ and the fixed error texts.
 ## 10. Open (honestly)
 
 * **No network, no registry, no lock file.** `brauche` knows only
-  local paths. Reproducibility across two machines (`ABNAHME.md` item 5)
+  local paths. Reproducibility across two machines (`ACCEPTANCE.md` item 5)
   is therefore **not yet** fulfilled; checksums and a
   `firn.sperre` are missing.
 * **No `firn build --locked`, no version resolution.** `version` is

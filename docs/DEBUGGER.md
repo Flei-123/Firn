@@ -1,6 +1,6 @@
 # Debugger: `.debug_line` and a real `gdb` session
 
-**Requirement:** `W3` · `ABNAHME.md` item 4 criterion B · `TODO-FIRN.md` 0.4
+**Requirement:** `W3` · `ACCEPTANCE.md` item 4 criterion B · `TODO-FIRN.md` 0.4
 **State:** line numbers work, variables do not yet (see „Limits").
 
 ## How it is generated
@@ -91,6 +91,6 @@ may change with the code generator, the file and the lines may not.
   For that the compiler would have to write the `.debug_info` itself
   instead of having `as` generate it.
 * **No lines in the optimized build** apart from the function line.
-* `ABNAHME.md` item 4 criterion B additionally demands that **a real
+* `ACCEPTANCE.md` item 4 criterion B additionally demands that **a real
   bug** has been found with the debugger. That is not yet the case and
   is still listed as open there.

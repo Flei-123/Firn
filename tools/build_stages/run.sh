@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Measures the BUILD STAGES against each other (DESIGNZIELE.md 5).
+# Measures the BUILD STAGES against each other (DESIGN_GOALS.md 5).
 #
 # Question: is '--opt-level=dev-fast' (only debug-preserving passes) close
-# enough to 'release-fast'? Target value per DESIGNZIELE.md 5: 2-3x, not 30x
+# enough to 'release-fast'? Target value per DESIGN_GOALS.md 5: 2-3x, not 30x
 # as with Rust's debug builds.
 #
 # Usage:  bash tools/build_stages/run.sh [RUNS]   (default 5, median)
