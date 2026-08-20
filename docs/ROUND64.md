@@ -18,7 +18,7 @@ are in `test.sh`, and every number below comes out of one of them.
 
 | Measurement | Result |
 |---|---|
-| `bash test.sh` | **907 / 907** |
+| `bash test.sh` | **920 / 920** |
 | `bash tools/fmt/run.sh` | 568 files formatted, 9 deliberately broken ones refused, token stream **0** differences, syntax tree **0** differences out of 487 comparable files, second run **0** differences |
 | `bash tools/fmt/run.sh` -- random test | 123 scrambled cases, shape differs **0**, syntax tree differs **0** out of 108 comparable cases |
 | `bash tools/dwarf/run.sh` | **48 passed, 0 failed** |
@@ -27,6 +27,9 @@ are in `test.sh`, and every number below comes out of one of them.
 | `bash tools/fixpoint.sh` | stage 2 == stage 3, **character-identical** |
 | `bash tools/english/check.sh` | **five zeros** |
 | negative tests | 159 (147 before, twelve new: 1050--1065) |
+| `bash tools/parser_compare.sh` (revived) | 296 same, 1 known deviation |
+| `bash tools/sema_compare.sh` (revived) | 156 same, 27,824 expressions, 1 known deviation |
+| `bash tools/fir_compare.sh` (revived) | 154 same, 43,635 instructions, 2 known deviations |
 
 ---
 
@@ -322,13 +325,44 @@ renamed along.
 
 ---
 
-## 6. What is in test.sh now
+## 6. Three dead comparison scripts revived
+
+`tools/parser_compare.sh`, `tools/sema_compare.sh` and `tools/fir_compare.sh`
+called `--emit=ast-kanon` resp. `--emit=typen`. Those options were renamed in
+the English migration (round 55/57) to `--emit=ast-canon` and
+`--emit=types`. The scripts caught the error, counted the file as "skipped"
+and reported **zeros** -- and `test.sh` counted them as passed. Three of the
+most important counter-checks of the self-hosting had been comparing NOTHING
+since then.
+
+Revived. What they now really say:
+
+```
+parser_compare   SAME 296   DIFFERENT 1 (known)   NOT CORE 116   SKIPPED 124
+sema_compare     SAME 156   DIFFERENT 1 (known)   EXPRESSIONS 27824
+fir_compare      SAME 154   DIFFERENT 2 (known)   INSTRUCTIONS 43635
+```
+
+That is a second, independent proof that the reformatting of the whole tree
+changed no program: 296 syntax trees and 156 type-annotated trees of the
+FORMATTED sources come out equal in both compilers.
+
+The revival brought ONE deviation to light that had been hidden:
+`tests/871_closure_plain.fi`. `firnc0` appends the generated closure
+functions at the END of the module and numbers them from 0; `firnc1` emits
+them where they appear and numbers them from 2. The bodies are the same and
+the BEHAVIOUR is the same -- `tools/self_compare.sh` compares exactly that
+and finds no difference. What differs is a name and a position in the text,
+not a program. It is entered in the `KNOWN` list of `fir_compare.sh` with
+that reason, and it is named here so that it does not vanish again.
+
+## 7. What is in test.sh now
 
 Sections 23 (formatter), 24 (debug information) and 25 (language server) are
 new. They run on every change, like everything else -- a proof that only runs
 once is not a proof.
 
-## 7. Files
+## 8. Files
 
 ```
 tools/fmt/fmt.fi          the formatter: scanner and printer, in Firn
