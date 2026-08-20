@@ -1,35 +1,35 @@
 //! `#[no_gc]` — the guarantee for hot paths, SPEC §3.5.4.
 //!
-//! Within a `#[no_gc]` function these are forbidden:
+//! In a `#[no_gc]` function these are forbidden:
 //!  1. GC allocation (and every call that can trigger a collection run),
 //!  2. calling a function **without** `#[no_gc]`,
 //!  3. writing a `Gc[T]`/`GcWeak[T]` pointer into a field or a field
 //!     element (insertion barrier).
 //!
 //! The check is **transitive**: because every function called must carry
-//! `#[no_gc]` itself, the promise holds for the whole call tree. Once the
+//! `#[no_gc]` itself, the guarantee holds for the whole call tree. Once the
 //! chain breaks — across several levels or across a module boundary too —
-//! there is one error with line and column.
+//! there is an error with line and column.
 //!
-//! Wired up through the line `// HOOK nogc` at `sema::Checker::run`. The
+//! Wired up through the line `// HOOK nogc` in `sema::Checker::run`. The
 //! GC specific queries (1 and 3) come from `gc.rs` — this file knows the GC
 //! through those two functions only and is therefore buildable without it.
 //! For the self tests at the end of the file both queries are bundled
-//! within `Rules`, so that rules 1 and 3 are provable even without a built
+//! in `Rules`, so that rules 1 and 3 are provable even without a built
 //! collector; inside the compiler **always** `Rules::real()` runs.
 //!
 //! ## Scope, honestly stated
 //!
-//! * Checked are all calls of the body, **including** the body blocks of
-//!   `match` cases (those do not sit at the AST but at the registry of
+//! * Checked are all calls in the body, **including** the body blocks of
+//!   `match` cases (those do not sit in the AST but in the registry of
 //!   `sema_match.rs`).
-//! * Compiler internal call labels (`__match#N`, `__try#`, `__catch#`,
+//! * Compiler internal call names (`__match#N`, `__try#`, `__catch#`,
 //!   `Enum::Variant`) are no function calls and trigger no error; their
-//!   arguments get searched nonetheless.
-//! * Calls of a label that does not exist at all get reported by the type
+//!   arguments are searched nonetheless.
+//! * Calls of a name that does not exist at all are reported by the type
 //!   check itself — no second, confusing error for it here.
 //! * Calls through function pointers do not exist at stage 0 (`ExprKind::Call`
-//!   always carries a label), so there is no loophole here.
+//!   always carries a name), so there is no loophole here.
 //!
 //! This file belongs to the module `nogc` (PLAN.md, round "hardening test 2").
 
@@ -64,17 +64,17 @@ pub(crate) fn has_no_gc(f: &FnDecl) -> bool {
     f.attrs.iter().any(|a| a.name == "no_gc")
 }
 
-/// Call label produced compiler internally (no function call of the source).
+/// Call name produced compiler internally (no function call in the source).
 ///
 /// `__match#N` (sema_match.rs), `__try#`/`__catch#` (errors.rs) and
-/// `Enum::Variant` (lower_match.rs) can never come about from one identifier
-/// of the source text — they hold `#` respectively `::`.
+/// `Enum::Variant` (lower_match.rs) can never arise from an identifier
+/// of the source text — they contain `#` or `::`.
 fn is_interner_name(name: &str) -> bool {
     name.contains('#') || name.contains("::")
 }
 
 /// Write `helper__square` (module system, `modules.rs`) as `helper.square`
-/// again — the message shall show the label that stands within the source.
+/// again — the message shall show the name that stands in the source.
 fn readable(name: &str) -> String {
     if name.starts_with('_') || is_interner_name(name) {
         return name.to_string();
@@ -86,7 +86,7 @@ fn readable(name: &str) -> String {
     name.to_string()
 }
 
-/// `// HOOK nogc` within `sema::Checker::run`: checks all `#[no_gc]` functions.
+/// `// HOOK nogc` in `sema::Checker::run`: checks all `#[no_gc]` functions.
 pub(crate) fn hook_check(ck: &mut Checker, prog: &Program) {
     let findings = collect_findings(prog, &ck.expr_types, Rules::real());
     for (span, msg, note) in findings {
@@ -102,7 +102,7 @@ fn collect_findings(
 ) -> Vec<(Span, String, String)> {
     let mut marked: HashMap<&str, bool> = HashMap::new();
     for f in &prog.funcs {
-        // With labels declared twice (a separate error of the type check)
+        // With names declared twice (a separate error of the type check)
         // the stricter entry counts: marked stays marked.
         let e = marked.entry(f.name.as_str()).or_insert(false);
         *e |= has_no_gc(f);
@@ -135,14 +135,14 @@ struct NoGcChecker<'a> {
     expr_types: &'a [Type],
     marked: &'a HashMap<&'a str, bool>,
     rules: Rules,
-    /// Label of the `#[no_gc]` function checked right now (for the message).
+    /// Name of the `#[no_gc]` function checked right now (for the message).
     who: String,
     /// Nesting depth of the `match` body blocks (rip cord, see below).
     depth: u32,
     out: Vec<(Span, String, String)>,
 }
 
-/// Highest nesting of `match` cases that gets looked into. The parser caps
+/// Highest nesting of `match` cases that is looked into. The parser caps
 /// the nesting at 200 anyway; this bound is the second safeguard against
 /// a recursion explosion.
 const MAX_DEPTH: u32 = 256;
@@ -167,7 +167,7 @@ impl<'a> NoGcChecker<'a> {
 
     fn check_stmt(&mut self, s: &Stmt) {
         match s {
-            // The deferred body runs within the same frame and obeys
+            // The deferred body runs in the same frame and is subject to
             // the same rules.
             Stmt::Defer(inner, _, _) => self.check_stmt(inner),
             Stmt::Let { init, .. } => self.check_expr(init),
@@ -239,8 +239,8 @@ impl<'a> NoGcChecker<'a> {
                 for a in args {
                     self.check_expr(a);
                 }
-                // `match` stands as the call `__match#N` at the AST; the
-                // body blocks of the cases sit at the registry of
+                // `match` appears as the call `__match#N` in the AST; the
+                // body blocks of the cases sit in the registry of
                 // sema_match.rs. Without this descent every state machine
                 // would be a blind spot.
                 self.check_match_cases(name);
@@ -291,11 +291,11 @@ impl<'a> NoGcChecker<'a> {
             );
             return;
         }
-        // HOOK impl: `x.m(..)` stands as `"method m"` at the tree up to the
-        // type check — which function is meant only the type checker knows.
+        // HOOK impl: up to the type check `x.m(..)` appears in the tree as
+        // `"method m"` — only the type checker knows which function is meant.
         // This check runs without a type table of the receivers, so the case
-        // gets rejected EXPLICITLY rather than passed over silently: a hole
-        // within a promise would be worse than a missing convenience
+        // is rejected EXPLICITLY rather than passed over silently: a hole
+        // in a guarantee would be worse than a missing convenience
         // (round 45, impls.rs).
         if let Some(m) = crate::impls::method_name(name) {
             self.report(
@@ -328,7 +328,7 @@ impl<'a> NoGcChecker<'a> {
                 );
             }
             // marked: fine. Unknown: the type check reports the unknown
-            // label itself, no second error here.
+            // name itself, no second error here.
             Some(true) | None => {}
         }
     }
@@ -420,7 +420,7 @@ mod tests {
         }
     }
 
-    /// Predicates for the self tests: `gc_new` allocates, `Gc[T]` gets
+    /// Predicates for the self tests: `gc_new` allocates, `Gc[T]` is
     /// represented by `Type::Ptr`.
     fn test_rules() -> Rules {
         fn alloc(n: &str) -> bool {
@@ -558,7 +558,7 @@ mod tests {
 
     #[test]
     fn depth_nesting_becomes_reaches() {
-        // The violation sits within a chain of if inside while inside if.
+        // The violation sits in a chain of if inside while inside if.
         let mut b = Build::new();
         let call = b.call("cold", span(20, 9));
         let cond1 = b.expr(span(10, 1), ExprKind::Bool(true));
