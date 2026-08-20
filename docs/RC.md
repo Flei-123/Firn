@@ -35,8 +35,8 @@ resolve generic templates across module boundaries. Both forms already fail
 in the parser:
 
 ```
-var a: rc.Zaehlverweis[Stil] = …   // error: erwartet '=' nach dem namen in einer 'var'-anweisung
-rc.rc_neu[Stil](&h, w, &a)         // error: nur direkte funktionsnamen koennen aufgerufen werden
+var a: rc.RefCount[Style] = ...    // error: expected '=' after the name in a 'var' statement
+rc.rc_new[Style](&h, w, &a)        // error: only direct function names can be called
 ```
 
 (`compiler/src/sema_generic.rs::hook_generic_call` demands a simple
@@ -56,47 +56,47 @@ bash lib/rc/gen_tests.sh
 ```firn
 error AllocError { OutOfMemory }
 
-struct Zaehlverweis[T]  { block: usize }   // = Rc[T]   aus SPEC §3.4
-struct Schwachverweis[T]{ block: usize }   // = Weak[T] aus SPEC §3.4
-struct RcHeap { … }                        // Halde fester Kapazitaet
+struct RefCount[T] { block: usize }        // = Rc[T]   from SPEC 3.4
+struct WeakRef[T]  { block: usize }        // = Weak[T] from SPEC 3.4
+struct RcHeap { ... }                      // a heap of fixed capacity
 ```
 
 | Function | Meaning |
 |---|---|
 | `rc_heap_init(h, bytes) -> bool` | create the heap via `mmap`. `false` = failed — a **visible** failure, no silent substitute. No `MAP_FIXED`, no fixed address. |
-| `rc_heap_frei(h)` | `munmap` |
-| `rc_neu[T](h, wert, aus) -> AllocError!bool` | put a value on the heap, strong reference into `*aus`. **Fallible** (DESIGN_GOALS §2), the result is `#[must_consume]`. |
-| `rc_lesen[T](r) -> T` | **read only** — returns a copy |
-| `rc_klonen[T](r) -> Zaehlverweis[T]` | strong counter + 1 |
-| `rc_freigeben[T](h, r)` | strong counter − 1, clears `*r`; at 0 and without a weak reference the block goes into the free list |
-| `rc_stark_zahl[T](r)`, `rc_schwach_zahl[T](r)` | counter values, measurable |
-| `rc_leer[T]()`, `rc_ist_leer[T](r)`, `rc_gleich[T](a,b)` | null value, test, identity |
-| `weak_von[T](r) -> Schwachverweis[T]` | weak reference, does **not** keep alive |
-| `aufwerten[T](w) -> Zaehlverweis[T]` | upgrade; **visibly empty** if the strong counter is 0 |
+| `rc_heap_free(h)` | `munmap` |
+| `rc_new[T](h, value, out) -> AllocError!bool` | put a value on the heap, strong reference into `*out`. **Fallible** (DESIGN_GOALS 2), the result is `#[must_consume]`. |
+| `rc_read[T](r) -> T` | **read only** -- returns a copy |
+| `rc_clone[T](r) -> RefCount[T]` | strong counter + 1 |
+| `rc_free[T](h, r)` | strong counter − 1, clears `*r`; at 0 and without a weak reference the block goes into the free list |
+| `rc_strong_number[T](r)`, `rc_weak_number[T](r)` | counter values, measurable |
+| `rc_empty[T]()`, `rc_is_empty[T](r)`, `rc_equal[T](a,b)` | null value, test, identity |
+| `weak_of[T](r) -> WeakRef[T]` | weak reference, does **not** keep alive |
+| `promote[T](w) -> RefCount[T]` | upgrade; **visibly empty** if the strong counter is 0 |
 | `weak_freigeben[T](h, w)` | weak counter − 1; releases the block if strong is 0 as well |
 | `rc_heap_lebende/belegte_bytes/allokationen/freigaben(h)` | real counts for tests and measurements |
 | `rc_roh_adresse`, `rc_wert_adresse`, `rc_roh_verweis` | raw access according to SPEC §3.6, explicitly for tools and the leak proof |
 
-Block layout: a 32-byte header (`stark`, `schwach`, `klasse`, free list
-links), then the value. Eight size classes 64 … 8192 bytes with one free
+Block layout: a 32-byte header (`strong`, `weak`, `class`, free list
+links), then the value. Eight size classes 64 ... 8192 bytes with one free
 list each; larger payloads are `AllocError::OutOfMemory` (demonstrated in
 `tests/553_rc_fallible.fi`).
 
 ### Example
 
 ```firn
-var h: RcHeap = heap_leer()
+var h: RcHeap = heap_empty()
 if rc_heap_init(&h, 65536 as usize) == false { return 90 }
 
-var a: Zaehlverweis[Stil] = rc_leer[Stil]()
-let ok: bool = rc_neu[Stil](&h, Stil{ farbe: 1 as u32, groesse: 16 as u32, zeilen: 3 }, &a)
+var a: RefCount[Style] = rc_empty[Style]()
+let ok: bool = rc_new[Style](&h, Style{ color: 1 as u32, size: 16 as u32, lines: 3 }, &a)
                catch false
 if ok == false { return 1 }
 
-var b: Zaehlverweis[Stil] = rc_klonen[Stil](a)   // stark = 2
-let s: Stil = rc_lesen[Stil](b)                  // nur lesen
-rc_freigeben[Stil](&h, &b)                       // stark = 1
-rc_freigeben[Stil](&h, &a)                       // stark = 0 -> Block frei
+var b: RefCount[Style] = rc_clone[Style](a)     // strong = 2
+let s: Style = rc_read[Style](b)                // read only
+rc_free[Style](&h, &b)                          // strong = 1
+rc_free[Style](&h, &a)                          // strong = 0 -> block released
 ```
 
 ---
@@ -104,12 +104,12 @@ rc_freigeben[Stil](&h, &a)                       // stark = 0 -> Block frei
 ## 4. `Rc` is ALWAYS immutable
 
 There is no `RefCell` equivalent, no interior mutability and **no writing
-function** in this module. `rc_lesen` returns a copy; the
+function** in this module. `rc_read` returns a copy; the
 attempt to modify the shared value through it is a compiler error:
 
 ```
-tests/neg/rc_unveraenderlich.fi:396:5
-error: linke seite ist kein zuweisbarer ausdruck (variable, feld, index oder '*zeiger')
+tests/neg/rc_immutable.fi:396:5
+error: left side is not an assignable expression (variable, field, index or '*pointer')
 ```
 
 Whoever wants to share **and** modify takes `Gc[T]` (SPEC §3.5) or a lock.
@@ -118,19 +118,19 @@ Whoever wants to share **and** modify takes `Gc[T]` (SPEC §3.5) or a lock.
 
 ## 5. Fallible allocation
 
-`rc_neu` returns `AllocError!bool`. A discarded result is a
+`rc_new` returns `AllocError!bool`. A discarded result is a
 compiler error:
 
 ```
 tests/neg/rc_discarded.fi:393:5
-error: das ergebnis darf nicht verworfen werden: der typ 'AllocError!bool'
-       ist mit #[must_consume] gekennzeichnet
+error: the result must not be discarded: the type 'AllocError!bool'
+       is marked with #[must_consume]
 ```
 
 `tests/553_rc_fallible.fi` establishes: a heap with one page → 64 blocks,
 the 65th allocation reports `AllocError::OutOfMemory` and the output
 reference stays empty; after one release the next allocation succeeds
-again; a payload that is too large also fails cleanly; `try` passes the
+again; a payload that is too large fails cleanly as well; `try` passes the
 error through the call chain.
 
 Unlike with the GC there is **no collection before the failure** here — the
@@ -198,10 +198,10 @@ completely and are **not** retouched away in the SPEC.
 
 | No. | Deviation | Reason |
 |---|---|---|
-| A1 | The types are called `Zaehlverweis[T]` / `Schwachverweis[T]`, not `Rc[T]` / `Weak[T]` | `Rc`, `Arc`, `Weak` are reserved in the parser as type constructors that are not yet implemented (`compiler/src/parser.rs::nicht_umgesetzter_typ`) and report „ist in Stufe 0 nicht umgesetzt". A pure Firn module cannot occupy these names; the compiler sources belong to other modules in this round. The **function names** follow the contract. |
-| A2 | `rc_neu(…)` instead of `Rc[T].neu(…)` | stage 0 knows no methods |
+| A1 | The types are called `RefCount[T]` / `WeakRef[T]`, not `Rc[T]` / `Weak[T]` | `Rc`, `Arc`, `Weak` are reserved in the parser as type constructors that are not yet implemented (`compiler/src/parser.rs`) and report "'Rc[T]' is not implemented in stage 0". A pure Firn module cannot occupy these names; the compiler sources belong to other modules in this round. The **function names** follow the contract. |
+| A2 | `rc_new(...)` instead of `Rc[T].new(...)` | stage 0 knows no methods |
 | A3 | `h: *mut RcHeap` instead of `inout alloc` | stage 0 knows no `inout` |
-| A4 | return `AllocError!bool` + output pointer instead of `AllocError!Rc[T]` | monomorphization does not substitute type arguments in the payload of an error union: `fn f[T](..) -> AllocError!Zaehlverweis[T]` reports „unbekannter typ 'Zaehlverweis__T'". The allocation stays fully fallible and `#[must_consume]`. |
+| A4 | return `AllocError!bool` + output pointer instead of `AllocError!Rc[T]` | monomorphization does not substitute type arguments in the payload of an error union: `fn f[T](..) -> AllocError!RefCount[T]` reports „unbekannter typ 'Zaehlverweis__T'". The allocation stays fully fallible and `#[must_consume]`. |
 | A5 | `Arc[T]` has been built since **round 47**: `lib/rc/arc.fi`, types `Atomverweis[T]`/`AtomSchwachverweis[T]`, counters really atomic (`__atomar_addieren` -> `lock xadd`, `compiler/src/atomic.rs`) | proof `tools/atomic/run.sh` and `tests/830`-`833`. Honestly named it remains: `aufwerten_atomar` needs a compare and exchange for real concurrency, which round 47 does not build, and stage 0 still has no threads (SPEC §7). See `docs/RUNDE47.md`. |
 | A6 | No destructors: references stored in a value have to be released by hand | `drop` (SPEC §3.3) is not built in stage 0. Affects only values that themselves contain references. |
 | A7 | Heap with a fixed capacity, no growing | it makes the allocation honestly fallible and is the basis for memory limits per job |
