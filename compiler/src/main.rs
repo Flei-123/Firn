@@ -18,6 +18,7 @@ mod config;
 mod ct;
 mod diag;
 mod dwarf;
+mod dwarf_info;
 mod errors;
 mod threading;
 mod fir;
