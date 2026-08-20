@@ -518,7 +518,7 @@ else
     tail -20 "$WORK/english.log" | sed 's/^/   /'
 fi
 
-echo "== 23. the formatter: canonical shape (tools/fmt/run.sh, ROUND 64) =="
+echo "== 24. the formatter: canonical shape (tools/fmt/run.sh, ROUND 64) =="
 # firnfmt, written in Firn. Proven is: the token stream and the syntax tree
 # stay unchanged over the WHOLE tree, a second run changes nothing, the
 # shape does not depend on blanks (random test), and the tree in the
@@ -533,7 +533,7 @@ else
     grep FAIL "$WORK/fmt.log" | head -10 | sed 's/^/   /'
 fi
 
-echo "== 24. debug information: gdb in a Firn program (tools/dwarf/run.sh, ROUND 64) =="
+echo "== 25. debug information: gdb in a Firn program (tools/dwarf/run.sh, ROUND 64) =="
 # `.debug_info` written by the compiler itself: functions, parameters, local
 # variables with types. `gdb` is driven in batch mode and its output held
 # against expectations -- breakpoint, backtrace, `info args`, `print` of a
@@ -548,7 +548,7 @@ else
     grep FAIL "$WORK/dwarf.log" | head -10 | sed 's/^/   /'
 fi
 
-echo "== 25. the language server: firnc --lsp (tools/lsp/run.sh, ROUND 64) =="
+echo "== 26. the language server: firnc --lsp (tools/lsp/run.sh, ROUND 64) =="
 # The Language Server Protocol over standard input/output, on the same
 # lexer, parser and type checker the compiler uses. tools/lsp/client.py is
 # a real client and holds the answers against expectations: diagnostics
