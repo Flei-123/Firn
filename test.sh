@@ -421,7 +421,7 @@ else
     grep FAIL "$WORK/kernel.log" | head -10 | sed 's/^/   /'
 fi
 
-echo "== 21. english migration: no German identifiers left (tools/english/check.sh) ==
+echo "== 21. english migration: no German identifiers left (tools/english/check.sh) =="
 # Stage A (round 55): every identifier in compiler/src, lib, bin, tools,
 # tests and demos is held against the morpheme table. A hit means
 # that a German name was overlooked.
