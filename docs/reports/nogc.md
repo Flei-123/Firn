@@ -119,7 +119,7 @@ reported is the place at which the chain tears.
 | File | what it shows | Result |
 |---|---|---|
 | `tests/540_no_gc_aufruftree.fi` | a marked call tree over four levels, loops, branches; an unmarked function may call a marked one | `expect_exit: 42` |
-| `tests/541_no_gc_zustandsmaschine.fi` | `#[no_gc]` + `match` with four cases, calls out of the case bodies | `expect_exit: 99` |
+| `tests/541_no_gc_state_machine.fi` | `#[no_gc]` + `match` with four cases, calls out of the case bodies | `expect_exit: 99` |
 | `tests/542_no_gc_module.fi` (+ `tests/modules/nogc_hot.fi`) | `#[no_gc]` across the module boundary | `expect_exit: 100` |
 
 All three run in `test.sh` in **three** build stages (`opt`, `--no-opt`,
@@ -141,7 +141,7 @@ carries `#[no_gc]`, including the `main` of the driver:
 | `lib/html/error_codes.fi` | 1 |
 | `lib/html/tokenize_main.fi` | 3 (with `main`) |
 | `lib/html/entities_probe.fi` | 4 |
-| `lib/html/entities_ausfall.fi` | 12 |
+| `lib/html/entities_failure.fi` | 12 |
 | **Sum** | **159** |
 
 With that it is statically established: in the whole tokenizer program no
@@ -216,7 +216,7 @@ test result: ok. 134 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
   `echte_regeln_sind_die_aus_gc_rs`).
   As soon as `gc.rs` answers, (i) and (iii) take effect without a further
   change. The two finished negative programs for that lie in
-  `tests/nogc_waits_on_gc/` including a `LIESMICH.md`; they then belong,
+  `tests/nogc_waits_on_gc/` including a `README.md`; they then belong,
   unchanged, in `tests/neg/`. They are deliberately **not** there yet:
   `test.sh` would otherwise check them against a message of the parser and
   would thereby establish something other than what it says on the label.

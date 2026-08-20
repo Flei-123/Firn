@@ -315,7 +315,7 @@ set object by object — a 128-byte object with generic reference columns, a
 child list and its buffer as objects of their own, 14 per set, of which 13
 leak (what becomes free is the collection, the only one without a back
 reference). Otherwise the same two graphs would no longer be compared, and
-the report in `docs/berichte/dom.md` would hang in the air.
+the report in `docs/reports/dom.md` would hang in the air.
 
 ### 5.1 Endurance run
 

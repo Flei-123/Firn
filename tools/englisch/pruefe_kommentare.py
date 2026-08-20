@@ -7,6 +7,11 @@ Morphemtabelle erkennen (zu viele Fachwoerter sind in beiden Sprachen gleich),
 deshalb entscheidet hier eine Liste deutscher Funktionswoerter: eine Zeile
 gilt als deutsch, sobald eines davon als ganzes Wort darin vorkommt.
 
+Die Liste enthaelt AUSDRUECKLICH keine Woerter, die es auch im Englischen
+gibt (in, an, am, es, man, war, hat, die, name, wert) — die erste Fassung tat
+das und hat englische Saetze als deutsch gemeldet; wer den Massstab dann
+erfuellen will, schreibt verkrampftes Englisch.
+
   python3 tools/englisch/pruefe_kommentare.py            Bilanz je Bereich
   python3 tools/englisch/pruefe_kommentare.py --dateien  Bilanz je Datei
   python3 tools/englisch/pruefe_kommentare.py --zeilen <datei>   die Zeilen
@@ -18,17 +23,16 @@ import os, re, subprocess, sys
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.chdir(ROOT)
 
-WORTE = """der die das den dem des ein eine einen einem einer eines und oder
+WORTE = """der das den dem des ein eine einen einem einer eines und oder
 aber nicht kein keine keinen keiner nur noch schon auch sonst also damit dass
-weil wenn dann als wie ist sind war waren wird werden wurde wurden sein hat
-haben hatte hatten kann koennen konnte muss muessen musste soll sollen darf
-duerfen fuer von vom mit ohne bei beim nach vor ueber unter zwischen durch
-gegen bis seit aus auf ins zum zur am im an in um es sie er ich wir man sich
-jede jeder jedes alle alles beide dieser diese dieses jenes hier dort dabei
-dafuer daraus davon dazu deshalb darum trotzdem immer nie oft selten mehr
-weniger sehr ganz genau erst zuerst danach spaeter zuvor wieder gleich anders
-richtig falsch wichtig moeglich noetig genug etwa etwas nichts jetzt heute
-zeile zeilen datei dateien wert werte name namen nummer nummern""".split()
+weil wenn dann als wie sind waren wird werden wurde wurden sein haben hatte
+hatten kann koennen konnte muss muessen musste soll sollen darf duerfen fuer
+von vom mit ohne bei beim nach vor ueber unter zwischen durch gegen seit aus
+zum zur sie ich wir sich jede jeder jedes alle alles beide dieser diese dieses
+jenes dabei dafuer daraus davon dazu deshalb darum trotzdem immer nie oft
+selten weniger sehr ganz genau erst zuerst danach spaeter zuvor wieder anders
+richtig falsch wichtig moeglich noetig etwa etwas nichts jetzt heute zeile
+zeilen datei dateien werte namen nummer nummern""".split()
 RE_WORT = re.compile(r'\b(' + '|'.join(WORTE) + r')\b', re.I)
 
 BEREICHE = [('compiler/src', ('.rs',)), ('lib', ('.fi',)), ('bin', ('.fi',)),

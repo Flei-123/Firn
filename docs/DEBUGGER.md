@@ -26,7 +26,7 @@ would be worse than none.
 
 ## Proof: the session, copied verbatim
 
-Program `docs/gdb_beispiel.fi`:
+Program `docs/gdb_example.fi`:
 
 ```firn
 // expect_exit: 55
@@ -47,7 +47,7 @@ fn main() -> i32 {
 Commands (in the project directory, after `cargo build --release`):
 
 ```console
-$ compiler/target/release/firnc --no-opt -o /tmp/gdbdemo docs/gdb_beispiel.fi
+$ compiler/target/release/firnc --no-opt -o /tmp/gdbdemo docs/gdb_example.fi
 $ readelf -S /tmp/gdbdemo | grep debug
   [ 2] .debug_aranges    PROGBITS         0000000000000000  000000e0
   [ 3] .debug_info       PROGBITS         0000000000000000  00000110
@@ -57,17 +57,17 @@ $ readelf -S /tmp/gdbdemo | grep debug
 
 $ gdb -batch -ex "break summe" -ex run -ex bt -ex "info line" \
         -ex next -ex next -ex next -ex "info line" -ex continue /tmp/gdbdemo
-Breakpoint 1 at 0x4000c6: file docs/gdb_beispiel.fi, line 2.
+Breakpoint 1 at 0x4000c6: file docs/gdb_example.fi, line 2.
 
-Breakpoint 1, summe () at docs/gdb_beispiel.fi:2
+Breakpoint 1, summe () at docs/gdb_example.fi:2
 2	fn summe(n: i32) -> i32 {
-#0  summe () at docs/gdb_beispiel.fi:2
-#1  0x0000000000400254 in main () at docs/gdb_beispiel.fi:11
-Line 2 of "docs/gdb_beispiel.fi" starts at address 0x4000c6 <summe> and ends at 0x40010b <summe+69>.
+#0  summe () at docs/gdb_example.fi:2
+#1  0x0000000000400254 in main () at docs/gdb_example.fi:11
+Line 2 of "docs/gdb_example.fi" starts at address 0x4000c6 <summe> and ends at 0x40010b <summe+69>.
 3	    var s: i32 = 0
 4	    for i in 1 as i32..n + 1 as i32 {
 5	        s = s + i
-Line 5 of "docs/gdb_beispiel.fi" starts at address 0x400190 <summe+202> and ends at 0x400202 <summe+316>.
+Line 5 of "docs/gdb_example.fi" starts at address 0x400190 <summe+202> and ends at 0x400202 <summe+316>.
 [Inferior 1 (process 536651) exited with code 067]
 ```
 

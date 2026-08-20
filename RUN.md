@@ -75,13 +75,13 @@ python3 -c "import json;d=json.load(open('/tmp/firn.json'));print(d['total'],d['
 | What | Command | Measured result |
 |---|---|---|
 | **Exhaustiveness check for `match`** | `firnc -o /tmp/m tests/neg/match_missing_variant.fi` | `error: 'match' is not exhaustive: ... not covered` **with line:column**, exit != 0 |
-| **Jump table for 32 states** | `firnc --emit=asm -o /tmp/zm.s tests/230_zustandsmaschine.fi && grep -c "jmp qword ptr" /tmp/zm.s` | `1` -- one indirect jump through a `.quad` table, no comparison chain |
+| **Jump table for 32 states** | `firnc --emit=asm -o /tmp/zm.s tests/230_state_machine.fi && grep -c "jmp qword ptr" /tmp/zm.s` | `1` -- one indirect jump through a `.quad` table, no comparison chain |
 | **WTF-16, unpaired surrogate** | `firnc -o /tmp/s tests/300_str16_surrogate.fi && /tmp/s` | `3 97 55296 98 0 0 5 97 239 191 189 98 5 97 237 160 128 98 1 55296` -- `0xD800` is preserved, `to_utf8()` returns nothing, `to_utf8_lossy()` returns `EF BF BD` |
 | **strtod/dtoa hard cases** | `firnc -o /tmp/h tests/304_strtod_hardcases.fi && /tmp/h` | 26 bit patterns, starting with `4591870180066957722` (= `0.1`); the expected values are given as `// expect_out:` in line 1 of the same file |
 | **100,000 doubles there and back** | `bash tools/dtoa_vectors/run.sh 100000 4242` | `OK: 100000/100000 bitgleich zurueck, 100000/100000 kuerzeste Darstellung wie Rust` (7.9 s) |
 | **Benchmarks against Rust `-O`** | `BENCH_RUNS=5 bash bench/run.sh` | median **3.36x** slower (range 1.57x-6.04x), table in `bench/RESULTS.md`. **Target <= 2x missed** |
 | **The optimizer has an effect** | `bash test_opt.sh` | `PASS 41/41` (FIR before/after) |
-| **The debugger shows `.fi` lines** | `firnc --no-opt -o /tmp/gdbdemo docs/gdb_beispiel.fi && gdb -batch -ex "break summe" -ex run -ex bt /tmp/gdbdemo` | `Breakpoint 1, summe () at docs/gdb_beispiel.fi:2` and `#1 ... main () at docs/gdb_beispiel.fi:11` |
+| **The debugger shows `.fi` lines** | `firnc --no-opt -o /tmp/gdbdemo docs/gdb_example.fi && gdb -batch -ex "break summe" -ex run -ex bt /tmp/gdbdemo` | `Breakpoint 1, summe () at docs/gdb_example.fi:2` and `#1 ... main () at docs/gdb_example.fi:11` |
 | **The generated Str tests are current** | `python3 tools/strlib/expand.py --check` | `expand.py: 0 veraltete Dateien` |
 | **Cleanliness** | `grep -rn "todo!\|unimplemented!" compiler/src` | no hits |
 
@@ -124,8 +124,8 @@ every run and in all three build stages, throughput varies by about 30 %.
 Step 0 of `run.sh` proves that the expectations were not touched:
 
 ```sh
-bash tools/tokenizer/verifiziere_testdaten.sh              # sha256 against the repo set
-bash tools/tokenizer/verifiziere_testdaten.sh --gegen-upstream   # additionally against GitHub
+bash tools/tokenizer/verify_testdata.sh              # sha256 against the repo set
+bash tools/tokenizer/verify_testdata.sh --gegen-upstream   # additionally against GitHub
 ```
 
 Step 2b of `run.sh` is the **counter-check without the XML adaptation**:

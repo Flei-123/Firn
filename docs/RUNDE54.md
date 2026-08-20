@@ -478,7 +478,7 @@ html5lib**: if the original data become available one day,
 `tools/html/harness_tree.py` runs against them without a change.
 
 By hand also means: error-prone. That is why there is
-`tools/html/orakel.py` — it runs **every expectation against html5lib 1.1**
+`tools/html/oracle.py` — it runs **every expectation against html5lib 1.1**
 (from PyPI, in a venv of its own, not part of the project) and reports every
 deviation. Result:
 
@@ -486,7 +486,7 @@ deviation. Result:
 * The one remainder is `<ruby><rb>a<rt>b</ruby>`: the current standard
   takes `rb` into the *implied end tags*, html5lib 1.1 follows the older
   version. Here the standard is authoritative; the case carries
-  `#orakel-abweichung`.
+  `#oracle-deviation`.
 * On the first pass the oracle found **eight thinking errors of our own**
   in the expectations (among them `</p>` in „after head", whitespace in
   „before head", `<body></body><frameset>`). Those cases are now correct.
@@ -510,8 +510,8 @@ this.
 
 ### 7.4 Known gaps
 
-`tools/html/luecken/bekannte_luecken.dat` records what does **not** work,
-with the **correct** expected trees. `harness_baum.py --luecken` runs them
+`tools/html/gaps/known_gaps.dat` records what does **not** work,
+with the **correct** expected trees. `harness_baum.py --gaps` runs them
 separately: **0 of 10 passed** — as expected. A test suite that contains
 only what already works says nothing about what is missing.
 
@@ -528,8 +528,8 @@ before the run):
 | `bash tools/tokenizer/run.sh` | 6810/6810 resp. 6809/6810 with error codes — unchanged |
 | `tools/fixpoint.sh` (in `test.sh`) | stage 2 == stage 3, character-identical |
 
-`tools/html/orakel.py` run separately: `faelle/` 150 checked, 0 unexpected
-deviations (1 noted); `luecken/` 10 checked, 0 unexpected deviations
+`tools/html/oracle.py` run separately: `faelle/` 150 checked, 0 unexpected
+deviations (1 noted); `gaps/` 10 checked, 0 unexpected deviations
 (4 noted — html5lib 1.1 does not put template contents into a content tree
 of their own and cannot confirm the expectation there; it is written by
 hand from the standard).
@@ -548,15 +548,15 @@ therefore core language for stage 1 as well.
 1. **„in template" and the `<template>` content.** The 23rd insertion mode
    needs a second tree per template plus a stack of insertion modes of its
    own. `<template>` is currently treated like an ordinary element.
-   (`bekannte_luecken.dat` cases 6–9.)
+   (`known_gaps.dat` cases 6–9.)
 2. **Foreign content (SVG/MathML) as a rule set.** Namespaces exist —
    `<svg>` and `<math>` create elements in the right namespace, and the
    namespace is on the node and on the attribute. The special rules for the
    *content* are missing: name correction (`clipPath`, `foreignObject`),
    attribute adjustment (`xlink:href`), integration points, breakout tags.
-   (`bekannte_luecken.dat` cases 1–5.)
+   (`known_gaps.dat` cases 1–5.)
 3. **Fragment parsing** (`innerHTML`) with a context element.
-   (`bekannte_luecken.dat` case 10.)
+   (`known_gaps.dat` case 10.)
 4. **Quirks detection** knows only the „force quirks" flag, a name
    != `html` and four public identifiers; the complete list of the
    standard (around 55 prefixes from the time before HTML5) is missing.

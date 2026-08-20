@@ -20,7 +20,7 @@ both.
 Range across all runs: `html5lib` **2.25x-3.09x**, `realweb` **5.72x-8.31x**;
 throughput varies by around 30 % between runs, the balance never does.
 The test data are demonstrably unchanged:
-`bash tools/tokenizer/verifiziere_testdaten.sh` (sha256 of the 14 `.test` files
+`bash tools/tokenizer/verify_testdata.sh` (sha256 of the 14 `.test` files
 against the upstream commit).
 
 All numbers in this file were **run in person** during the merge, not taken over
@@ -67,11 +67,11 @@ Legend: `[ ]` open - `[~]` partial, with a number - `[x]` passed and measured
 | **Criterion** | a DOM prototype with parent/child cycles **and** listener cycles runs for **24 h** without memory growth |
 | **Measurement command** | `bash tools/dom_soak/run.sh` (environment: `SOAK_SEK`, `SOAK_ZYKLEN`, `SOAK_STICHPROBE`); the measured quantity is RSS from `/proc/self/statm` over time, tolerance: no monotonic rise after the warm-up phase |
 | **Status of the decision** | **`[x]` taken and justified** -- an opt-in tracing GC in three levels, `SPEC.md` 3.2/3.5. The alternatives (arena + indices, refcount + weak) were rejected with reasons |
-| **Status of the evidence (2026-08-14, measured in person)** | **`[~]` demonstrated in a prototype, the 24 h run is still outstanding.** The GC is built (`compiler/src/gc.rs`, runtime `lib/gc/gc.fi` in Firn) and so is the DOM prototype (`lib/dom/dom.fi`, 6 kinds of cycle). **Soak test: 100,000,000 cycle sets = 700,000,000 objects in 116.5 s, RSS constant at 1,364 KiB from the first to the last of 1,001 samples, 47,300 collections, longest pause 3.54 ms.** Counter-check with reference counting (identical object graph, `lib/dom/soak_leak.fi`): **750,080 KiB after 2,000,000 cycles, 12,000,000 live objects -- factor 550.** Raw data: `tools/dom_soak/longrun/*.tsv`, report: `docs/berichte/dom.md` |
+| **Status of the evidence (2026-08-14, measured in person)** | **`[~]` demonstrated in a prototype, the 24 h run is still outstanding.** The GC is built (`compiler/src/gc.rs`, runtime `lib/gc/gc.fi` in Firn) and so is the DOM prototype (`lib/dom/dom.fi`, 6 kinds of cycle). **Soak test: 100,000,000 cycle sets = 700,000,000 objects in 116.5 s, RSS constant at 1,364 KiB from the first to the last of 1,001 samples, 47,300 collections, longest pause 3.54 ms.** Counter-check with reference counting (identical object graph, `lib/dom/soak_leak.fi`): **750,080 KiB after 2,000,000 cycles, 12,000,000 live objects -- factor 550.** Raw data: `tools/dom_soak/longrun/*.tsv`, report: `docs/reports/dom.md` |
 | **Sub-items** | `S1` deterministic by default: stage 0 has raw pointers, no move checker - `S2` GC heap: **`[x]` mark-sweep, precise heap tracing through a compiler-generated type table, conservative stack/register scan, no compaction** - `S3` weak references: **`[x]` `GcWeak[T]`, negatively tested; since round 47 weak fields are REALLY zeroed on collection (`tests/822`), not merely `strong()`-empty** - `S4` finalizers: **`[x]` since round 47** -- a cleanup kind per object, its own cycle phase in slices, resurrection impossible and enforced (abort 71/72/73), `tests/820`-`824`, `docs/RUNDE47.md` - `S5` incremental: **`[x]` since round 44**, longest pause 0.45 ms - `S6` pause times measurable: **`[x]` `gc_pause_ns_last/max/total`, `gc_hist`, `gc_stop_max`, since round 47 also `gc_fin_*`** - `S7` `Rc`/`Weak`: **`[x]` as a pure Firn module (`tests/modules/rc.fi`), cycles leak deliberately and visibly (`tests/552_rc_cycle_leak.fi`); `Arc[T]` built in round 47 (`lib/rc/arc.fi`, atomic counter, `tests/830`-`833`)** |
 | **What is missing for `[x]`** | (a) the **24 hour run**, (b) **fragmentation with changing object sizes** -- the soak test always uses the same set, which is the friendly case, (c) `virtual`, and, for the collections, the **nominal type safety of the container** (`docs/RUNDE53.md` 4.1). Incremental collection (round 44), finalizers (round 47) and `GcVec`/`GcMap` (round 53) are done |
 | **Effort according to TODO-FIRN** | 0.1 = 2 person-months (decision + prototype), 0.9 = 2 person-months (soak test) |
-| **Risk** | conservative stack scanning rules out a compacting collector -> fragmentation in the soak test remains the real risk. Also demonstrable: **an old pointer copy in a live frame keeps its object alive** (`docs/berichte/dom.md`, section "The uncomfortable spot") |
+| **Risk** | conservative stack scanning rules out a compacting collector -> fragmentation in the soak test remains the real risk. Also demonstrable: **an old pointer copy in a live frame keeps its object alive** (`docs/reports/dom.md`, section "The uncomfortable spot") |
 
 ---
 
@@ -85,7 +85,7 @@ Legend: `[ ]` open - `[~]` partial, with a number - `[x]` passed and measured
 | **Measurement command** | `bash tools/tokenizer/run.sh` -- prints the cases passed per `.test` file and the throughput in MB/s against html5ever (the originally planned name `./bench/tokenizer.sh` was not used) |
 | **Status before round 2** | **`[ ]`** no tokenizer, no strings in the language, no `match`, no register allocation |
 | **Status after round 2 (2026-08-13)** | **`[ ]` still open. Cases passed: 0 of 6,810 (0.0 %).** **No tokenizer** was written in Firn and **no harness** was built. Nothing is skipped and nothing is counted as a success -- there simply is nothing. `testdata/html5lib-tokenizer/` (14 `.test` files, 6,810 cases, counting command in `testdata/README.md`) lies there unused |
-| **What is present now** | the preconditions from ROADMAP phase 2: `enum`/`match` with a jump table (`tests/230_zustandsmaschine.fi`, 32 states), `Str16`/`Bytes`/`Atom` (`lib/str/`), aggregates across function boundaries, module system, real register allocation. The tokenizer itself is the next task, no longer blocked |
+| **What is present now** | the preconditions from ROADMAP phase 2: `enum`/`match` with a jump table (`tests/230_state_machine.fi`, 32 states), `Str16`/`Bytes`/`Atom` (`lib/str/`), aggregates across function boundaries, module system, real register allocation. The tokenizer itself is the next task, no longer blocked |
 | **Criterion B** | not measured (no tokenizer). The general distance to Rust is a median of **2.8x-3.4x** according to `bench/RESULTS.md`; the old justification "stage 0 puts every value on the stack" has been obsolete since register allocation arrived |
 | **Effort according to TODO-FIRN** | 3 person-months |
 
@@ -148,7 +148,7 @@ attributes", is already plain HTML).
 **The expectations were not touched -- verifiable:**
 
 ```sh
-bash tools/tokenizer/verifiziere_testdaten.sh
+bash tools/tokenizer/verify_testdata.sh
 # Dateien : 14 (erwartet 14)
 # sha256  : alle 14 Summen stimmen
 # Faelle  : 6810 (erwartet 6810)
@@ -156,7 +156,7 @@ bash tools/tokenizer/verifiziere_testdaten.sh
 ```
 
 The script compares the sha256 sums of the 14 `.test` files with the set frozen
-in the repository (`tools/tokenizer/testdaten.sha256`), which was checked byte
+in the repository (`tools/tokenizer/testdata.sha256`), which was checked byte
 for byte against the upstream commit
 `224991ec10db04f056a89eed8b0bd8695fd2950e` of `html5lib/html5lib-tests`; with
 `--gegen-upstream` it downloads the files of that commit from GitHub again and
@@ -194,7 +194,7 @@ no fixed address and no assumption about the memory layout. If `mmap` fails,
 `entities.tabelle()` returns the null pointer, `char_ref` reports
 `REF_UNMOEGLICH`, and the tokenizer sets `nicht_unterstuetzt` -- the case then
 counts as a **failure** instead of being tokenized wrongly in silence. Both are
-demonstrated in Firn (`lib/html/entities_ausfall.fi`, step 1c in `run.sh`): the
+demonstrated in Firn (`lib/html/entities_failure.fi`, step 1c in `run.sh`): the
 program prints the table address and forces the failure; `run.sh` starts it
 twice and aborts if both runs report the same address.
 
@@ -262,7 +262,7 @@ why three runs are given above rather than the most favourable single value.
 | **Measurement command** | `firn test --format=json` - `gdb ./program` shows `.fi` lines |
 | **Status A before round 2** | `[~]` `test.sh` ran (166/166), but as text only |
 | **Status A after round 2** | **`[x]` satisfied and run in person.** `cargo build --release --manifest-path tools/testrunner/Cargo.toml` -> `./tools/testrunner/target/release/testrunner --format=json` delivers `{"suite":"firn","total":256,"passed":256,"failed":0,"rate":1.0,"cases":[...]}` with name, mode (`opt`/`noopt`/`neg`), status and duration per case. Exit code != 0 on failure, suitable for CI. The runner is a standalone tool without external crates |
-| **Status B after round 2** | **`[~]` partial.** `.debug_line` exists: `firnc --no-opt -o /tmp/gdbdemo docs/gdb_beispiel.fi`, then `gdb -batch -ex "break summe" -ex run -ex bt /tmp/gdbdemo` -> `Breakpoint 1, summe () at docs/gdb_beispiel.fi:2` and `#1 ... in main () at docs/gdb_beispiel.fi:11` (re-run in person during the merge). **Not satisfied:** `gdb` does not show variables (no `.debug_info` for local names), with the optimizer only the line of the `fn` declaration (SPEC 14.1 item 16), and **no real bug has been found with it** -- which criterion B explicitly demands |
+| **Status B after round 2** | **`[~]` partial.** `.debug_line` exists: `firnc --no-opt -o /tmp/gdbdemo docs/gdb_example.fi`, then `gdb -batch -ex "break summe" -ex run -ex bt /tmp/gdbdemo` -> `Breakpoint 1, summe () at docs/gdb_example.fi:2` and `#1 ... in main () at docs/gdb_example.fi:11` (re-run in person during the merge). **Not satisfied:** `gdb` does not show variables (no `.debug_info` for local names), with the optimizer only the line of the `fn` declaration (SPEC 14.1 item 16), and **no real bug has been found with it** -- which criterion B explicitly demands |
 | **Item 4 overall** | **`[~]`** -- A complete, B half |
 | **Effort according to TODO-FIRN** | 0.3 = 1 person-month, 0.4 = 3 person-months |
 
@@ -315,7 +315,7 @@ jury can run itself; `RUN.md` lists them.
 | # | Goal | Status | Proof (run in person during the merge) |
 |---|---|---|---|
 | 1 | Language core: aggregates across function boundaries, stack arguments, `break`/`continue`/`for`, `[value; N]`, module system | **`[x]`** | `tests/100...111`, `tests/neg/kern_*.fi`; SPEC 14.1 items 1, 9, 11, 13, 15 struck out |
-| 2 | Sum types + pattern matching with an exhaustiveness check + jump table | **`[x]`** | a missing variant -> `error: 'match' is not exhaustive: the variant E::C is not covered` with `4:5`; `firnc --emit=asm tests/230_zustandsmaschine.fi` (32 states) contains exactly **1x** `jmp qword ptr [rdx + rax*8]` and one `.quad` table |
+| 2 | Sum types + pattern matching with an exhaustiveness check + jump table | **`[x]`** | a missing variant -> `error: 'match' is not exhaustive: the variant E::C is not covered` with `4:5`; `firnc --emit=asm tests/230_state_machine.fi` (32 states) contains exactly **1x** `jmp qword ptr [rdx + rax*8]` and one `.quad` table |
 | 3 | Generics by monomorphization, `Vec[T]`, `Map[K,V]` | **`[x]`** | `tests/210...212`, `tests/neg/generic_*.fi` |
 | 4 | Strings `Bytes`/`Str`/`Str16`/`Atom`, WTF-16, strtod/dtoa | **`[x]`** | `tests/300_str16_surrogate.fi` (a lone `0xD800` is preserved, `to_utf8()` returns nothing, `to_utf8_lossy()` returns `EF BF BD`); `bash tools/dtoa_vectors/run.sh 100000 4242` -> **100,000/100,000 bit-identical on the way back, 100,000/100,000 shortest representation as in Rust**, 7.9 s. Exception: no string literals in the lexer (SPEC 14.1.str S1) |
 | 5 | Optimizer + honest measurement | **`[~]`** | register allocation, mem2reg, inlining, CSE, block merging are real (`test_opt.sh`: 41/41). **Performance target <= 2x missed:** `BENCH_RUNS=5 bash bench/run.sh` -> fib 1.57x, sieve 3.97x, matmul 6.04x, bytecount 1.77x, bubblesort 5.19x, statemachine 2.76x, **median 3.36x** (an earlier run of the same suite: median 2.80x). Gain against `--no-opt`: median ~10x |
@@ -395,9 +395,9 @@ measured.
 | `enum` with payload, layout documented | `[x]` | `cargo test --release --manifest-path compiler/Cargo.toml sema_match::` (4 tests), `SPEC.md` 14.1.types |
 | `match` with an exhaustiveness check **at compile time** | `[x]` | `tests/neg/match_missing_variant.fi` -> `error: 'match' is not exhaustive: the variant Char::End is not covered` (7:5); further: `match_int_ohne_auffang`, `match_unbekannte_variante`, `match_unerreichbar` |
 | Kinds of pattern: variant+binding, literal, range, `_`, nested | `[x]` | `tests/200..204_*.fi` (they run with and without `--no-opt`, same result) |
-| Jump table for dense variants | `[x]` | `firnc --emit=asm tests/230_zustandsmaschine.fi` (32 states): 1x `jmp qword ptr [rdx + rax*8]`, 0x `cmp`; test `codegen_switch::tests::jump_table_at_30_states` |
+| Jump table for dense variants | `[x]` | `firnc --emit=asm tests/230_state_machine.fi` (32 states): 1x `jmp qword ptr [rdx + rax*8]`, 0x `cmp`; test `codegen_switch::tests::jump_table_at_30_states` |
 | Generics by monomorphization (`name__T1_T2`) | `[x]` | `tests/210_generic_fn.fi`, `tests/211_generic_struct.fi` (`Vec[T]`), `tests/212_generic_map.fi` (`Map[K,V]`) |
-| A clear error message when a requirement is not met | `[x]` | `tests/neg/generic_anforderung.fi` (7:13), `generic_arg_count.fi`, `generic_without_ty_args.fi` |
+| A clear error message when a requirement is not met | `[x]` | `tests/neg/generic_requirement.fi` (7:13), `generic_arg_count.fi`, `generic_without_ty_args.fi` |
 | `match` as an **expression**, generic `enum`, `modul.E::V` | `[ ]` **postponed** | recorded honestly in `SPEC.md` 14.1.types T1, T3, T6 |
 
 Measurement on 2026-08-13 (the last state of this module): all 105 programs in
