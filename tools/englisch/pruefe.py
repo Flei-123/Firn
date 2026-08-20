@@ -15,6 +15,8 @@ sys.path.insert(0, 'tools/englisch')
 import quelltext as Q
 
 ROOTS = ['compiler/src', 'lib', 'bin', 'tools', 'tests', 'demos', 'examples', 'bench']
+# Ein angehaengter Zaehler versteckt das deutsche Wort: 'pfad2', 'teil1'.
+ZIFFERNSCHWANZ = re.compile(r'[0-9]+$')
 TEIL = re.compile(r'[a-z0-9]+|[A-Z]+(?![a-z])|[A-Z][a-z0-9]*')
 
 
@@ -63,7 +65,7 @@ def main():
         for n in namen:
             if n in aus:
                 continue
-            teile = [t.lower() for t in TEIL.findall(n)]
+            teile = [ZIFFERNSCHWANZ.sub('', t.lower()) for t in TEIL.findall(n)]
             schuld = [t for t in teile if t in morph and len(t) >= 4]
             if schuld:
                 treffer.setdefault(n, (schuld, set()))[1].add(f)
