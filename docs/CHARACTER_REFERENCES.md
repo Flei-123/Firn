@@ -59,12 +59,12 @@ scalar, see SPEC §14.1). The table is therefore written as a sequence of
 u64 words into a memory area:
 
 ```
-0            u64   Kennung
-OFF_NAMEN    u8[]  alle 2.231 Namen hintereinander (16.641 Byte), sortiert
-OFF_LEN      u8[]  Laenge je Eintrag
-OFF_WERT     u64[] Ersatz: cp1 | cp2 << 32   (cp2 == 0: nur ein Zeichen)
-OFF_POS      u32[] Anfang je Name — beim ersten Zugriff berechnet
-BYTES        u32[] Verzeichnis nach erstem Zeichen (256 × Anfang/Ende)
+0            u64   the id
+OFF_NAMES    u8[]  all 2,231 names one after another (16,641 byte), sorted
+OFF_LEN      u8[]  the length per entry
+OFF_VALUE    u64[] the substitute: cp1 | cp2 << 32   (cp2 == 0: one character)
+OFF_POS      u32[] the start per name -- computed at the first access
+BYTES        u32[] index by the first character (256 x start/end)
 ```
 
 The area lies at the fixed address `0x6000_0000_0000` and is created on
@@ -100,9 +100,9 @@ Zeichenreferenzen (lib/html/entities.fi), reine Data-state-Faelle
 That is a **module proof, not a balance** — the binding number over all
 6.810 cases is delivered by `tools/tokenizer/run.sh` alone. There the
 character references contribute `namedEntities.test` 4210/4210,
-`numericEntities.test` 336/336 and `entities.test` 80/80 (the last one also
-contains the attribute value special cases that the narrow test bench does
-not cover).
+`numericEntities.test` 336/336 and `entities.test` 80/80 (the last one
+contains the attribute value special cases as well that the narrow test
+bench does not cover).
 
 ## Costs, honestly
 
