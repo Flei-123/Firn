@@ -37,11 +37,11 @@ Negative tests (real compiler output):
 
 ```
 tests/neg/rc_discarded.fi:393:5
-error: das ergebnis darf nicht verworfen werden: der typ 'AllocError!bool'
-       ist mit #[must_consume] gekennzeichnet
+error: the result must not be discarded: the type 'AllocError!bool'
+       is marked with #[must_consume]
 
-tests/neg/rc_unveraenderlich.fi:396:5
-error: linke seite ist kein zuweisbarer ausdruck (variable, feld, index oder '*zeiger')
+tests/neg/rc_immutable.fi:396:5
+error: left side is not an assignable expression (variable, field, index or '*pointer')
 ```
 
 ### State of the whole suite at the time of this report
@@ -65,11 +65,11 @@ To be able to check dependably nonetheless, I built the compiler from the
 build stages:
 
 ```
-tests/*.fi + tests/opt/*.fi + examples/*.fi (Ausgangsstand + meine 5 neuen)
-  148 Programme x 3 Baustufen -> PASS=444  FAIL=0
-tests/neg/*.fi  55/58 wie erwartet
-  (die drei Ausnahmen sind tests/neg/nogc_*.fi aus dem parallel laufenden
-   Modul 'nogc'; sie brauchen dessen Compilerstand, nicht meinen)
+tests/*.fi + tests/opt/*.fi + examples/*.fi (the starting state + my 5 new ones)
+  148 programs x 3 build stages -> PASS=444  FAIL=0
+tests/neg/*.fi  55/58 as expected
+  (the three exceptions are tests/neg/nogc_*.fi from the module 'nogc'
+   running in parallel; they need its compiler state, not mine)
 ```
 
 As soon as the tree compiles again, there is nothing to catch up on for
@@ -88,8 +88,8 @@ are **0** occupied blocks.
    `Rc[T]` / `Weak[T]`.**
    `Rc`, `Arc` and `Weak` are reserved in the parser as type constructors
    that are not yet implemented
-   (`compiler/src/parser.rs::nicht_umgesetzter_typ`,
-   error „'Rc[T]' ist in Stufe 0 nicht umgesetzt"); a pure Firn module
+   (`compiler/src/parser.rs`,
+   error "'Rc[T]' is not implemented in stage 0"); a pure Firn module
    cannot occupy the names, and the compiler sources belong to other
    modules in this round. The **function names** from the contract are
    unchanged: `rc_neu`, `rc_lesen`, `rc_klonen`, `rc_freigeben`,
@@ -124,7 +124,7 @@ are **0** occupied blocks.
 ## 4. For module `mess`: the duplication of the error set
 
 `error AllocError { OutOfMemory }` stands **in `tests/modules/rc.fi`** (and
-therefore also in the generated `tests/55*_rc_*.fi` and
+therefore in the generated `tests/55*_rc_*.fi` and
 `tests/neg/rc_*.fi`). Error set names are program-wide. As soon as the GC
 runtime (`gckern`) provides the same set program-wide, there are two
 possibilities:

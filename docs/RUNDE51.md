@@ -131,10 +131,10 @@ html5lib 8.511 / 1.
 **Observation.** 17,13 % of all instructions sat in chains of the form
 
 ```
-setb   %al                       ; Bool herstellen
+setb   %al                       ; make a bool out of it
 movzbl %al,%r11d
-mov    %r11b,-0xae1(%rbp)        ; in eine Zelle schreiben
-movzbl -0xae1(%rbp),%r11d        ; sofort wieder herausholen
+mov    %r11b,-0xae1(%rbp)        ; write it into a cell
+movzbl -0xae1(%rbp),%r11d        ; fetch it straight back out
 test   %r11b,%r11b
 je     ...
 ```
@@ -199,10 +199,10 @@ Ir to 847.126 Ir.
 5.109.380 iterations — looked like this:
 
 ```
-mov %r12d,%r9d          ; Zustand aus der Zelle
+mov %r12d,%r9d          ; the state out of the cell
 mov %r9,%rax
-mov %rax,-0x260(%rbp)   ; nur, damit emit_switch ihn findet
-mov -0x260(%rbp),%eax   ; und sofort wieder heraus
+mov %rax,-0x260(%rbp)   ; only so that emit_switch finds it
+mov -0x260(%rbp),%eax   ; and straight back out again
 cmp $0x48,%eax
 ```
 
@@ -224,7 +224,7 @@ out).
 ```
 cmp  -0x18(%rbp),%r8
 jae  40dbd4          ; then
-jmp  40dbe0          ; else — haette Fallthrough sein koennen
+jmp  40dbe0          ; else -- could have been a fallthrough
 ```
 
 The blocks were emitted in their FIR numbering; if neither `then` nor
@@ -282,9 +282,9 @@ because of this:
 ```
 movzbl (%rcx),%eax
 mov    %rax,-0x658(%rbp)
-movzbl -0x658(%rbp),%eax   <- entfaellt (rax ist schon <= 0xFF)
+movzbl -0x658(%rbp),%eax   <- dropped (rax is <= 0xFF already)
 mov    %rax,-0x660(%rbp)
-mov    -0x660(%rbp),%eax   <- entfaellt (rax ist schon nullerweitert)
+mov    -0x660(%rbp),%eax   <- dropped (rax is zero-extended already)
 ```
 
 ## 8. H6/H7 — finally using x86 addressing in full
