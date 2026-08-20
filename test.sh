@@ -31,6 +31,9 @@
 #   9b. HTML tree construction and the DOM core (lib/browser/, in Firn) against
 #      the own cases from the WHATWG standard, against real pages and
 #      in a soak run with a counter-check (tools/html/run.sh, docs/ROUND54.md).
+#   9c. CSS: syntax, selectors and cascade (lib/css/, in Firn) against the
+#      official suite css-parsing-tests, against own cases and against
+#      cssselect2 on real pages (tools/css/run.sh, docs/ROUND60.md).
 #  18. Package and project system (tools/packages/run.sh): manifest, search
 #      order, visibility, build driver -- in BOTH compilers.
 #  19. Freestanding compilation (tools/freestanding/run.sh, round 52):
@@ -271,6 +274,20 @@ if [ "$BMRC" -eq 0 ]; then
 else
     bad "tools/html/run.sh failed (see .test-work/tree.log)"
     tail -20 "$WORK/tree.log" | sed 's/^/   /'
+fi
+
+echo "== 9c. CSS: syntax, selectors, cascade (tools/css/run.sh) =="
+# The CSS path in Firn (lib/css/) against the foreign suite
+# css-parsing-tests, against the own cases for cascade and error tolerance,
+# against cssselect2 on the real pages, plus the soak run with a counter
+# check. The short version; the full run is in docs/ROUND60.md.
+CSS_SOAK_MS=${CSS_SOAK_MS:-6000} bash tools/css/run.sh --fast > "$WORK/css.log" 2>&1 && CSRC=0 || CSRC=$?
+if [ "$CSRC" -eq 0 ]; then
+    ok
+    grep -E '^TOTAL|^OK:|^match comparisons' "$WORK/css.log" | sed 's/^/   /'
+else
+    bad "tools/css/run.sh failed (see .test-work/css.log)"
+    tail -20 "$WORK/css.log" | sed 's/^/   /'
 fi
 
 echo "== 10. DOM soak run: cycles without a leak (tools/dom_soak/run.sh) =="
