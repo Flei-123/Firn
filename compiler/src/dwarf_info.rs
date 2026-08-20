@@ -590,6 +590,22 @@ fn write_type(s: &mut Section, t: &DType, types: &Types, probe: bool) {
 // SIZE of everything and the OFFSET of every member. Both come from
 // `TypeCtx`, and this is the only place where they meet.
 pub fn dtype_of(tcx: &crate::types::TypeCtx, t: &crate::types::Type) -> DType {
+    let mut open: Vec<usize> = Vec::new();
+    dtype_rec(tcx, t, &mut open)
+}
+
+/// THE CYCLE. A `gc class Node { next: Gc[Node] }` points at itself, and the
+/// straightforward recursion runs into the stack (round 64, found by
+/// `tests/500_gc_grundlagen.fi` with `--no-opt`). `open` carries the structs
+/// currently being unfolded; whoever meets himself again becomes an
+/// INCOMPLETE type -- name and size, no members. That is what
+/// `DW_AT_declaration` is for, and `gdb` joins it back to the complete DIE
+/// of the same name.
+fn dtype_rec(
+    tcx: &crate::types::TypeCtx,
+    t: &crate::types::Type,
+    open: &mut Vec<usize>,
+) -> DType {
     use crate::types::Type;
     match t {
         Type::I8 => DType::Base("i8".into(), 1, ATE_SIGNED),
@@ -607,15 +623,20 @@ pub fn dtype_of(tcx: &crate::types::TypeCtx, t: &crate::types::Type) -> DType {
         // An untyped literal never reaches storage; if it does, it is an
         // i32 -- the same rule the type checker uses.
         Type::UntypedInt => DType::Base("i32".into(), 4, ATE_SIGNED),
-        Type::Ptr { inner, .. } => DType::Ptr(Box::new(dtype_of(tcx, inner))),
-        Type::Array(inner, n) => DType::Array(Box::new(dtype_of(tcx, inner)), *n),
+        Type::Ptr { inner, .. } => DType::Ptr(Box::new(dtype_rec(tcx, inner, open))),
+        Type::Array(inner, n) => DType::Array(Box::new(dtype_rec(tcx, inner, open)), *n),
         Type::Struct(i) => match tcx.structs.get(*i) {
             Some(sd) => {
-                let members = sd
+                if open.contains(i) || open.len() > 16 {
+                    return DType::Opaque(sd.name.clone(), tcx.size_of(t).max(1));
+                }
+                open.push(*i);
+                let members: Vec<(String, u64, DType)> = sd
                     .fields
                     .iter()
-                    .map(|f| (f.name.clone(), f.offset, dtype_of(tcx, &f.ty)))
+                    .map(|f| (f.name.clone(), f.offset, dtype_rec(tcx, &f.ty, open)))
                     .collect();
+                open.pop();
                 DType::Struct(sd.name.clone(), tcx.size_of(t), members)
             }
             None => DType::Opaque("<struct>".into(), 8),
