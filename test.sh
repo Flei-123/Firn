@@ -25,6 +25,10 @@
 #   8c. Interface bounds dispatch STATICALLY: no indirect call,
 #      no method table -- counter-check with `dyn I`, both compilers
 #      (tools/bounds/run.sh, round 50).
+#   8d. Functions as values (round 58): a DIRECT call stays a direct
+#      `call`, a call through a function value is exactly one `call rax`,
+#      a closure without captures allocates nothing -- in both compilers
+#      and with counter-checks (tools/fnval/run.sh).
 #   9. HTML5 tokenizer (lib/html/, in Firn) against the official
 #      html5lib test suite: the exact quota out of 6,810 cases, the limit in
 #      tools/tokenizer/mindestquote.txt (tools/tokenizer/run.sh).
@@ -397,6 +401,19 @@ if [ "$PKRC" -eq 0 ]; then
 else
     bad "tools/packages/run.sh failed (see .test-work/packages.log)"
     tail -20 "$WORK/packages.log" | sed 's/^/   /'
+fi
+
+echo "== 8d. functions as values: direct stays direct (tools/fnval/run.sh) =="
+# Round 58. The function record costs nothing where no function value is
+# used -- that is a claim about the emitted code, so it is measured on the
+# emitted code, in both compilers and with counter-checks.
+bash tools/fnval/run.sh > "$WORK/fnval.log" 2>&1 && FVRC=0 || FVRC=$?
+if [ "$FVRC" -eq 0 ]; then
+    ok
+    tail -1 "$WORK/fnval.log" | sed 's/^/   /'
+else
+    bad "tools/fnval/run.sh failed (see .test-work/fnval.log)"
+    grep FAIL "$WORK/fnval.log" | head -10 | sed 's/^/   /'
 fi
 
 echo "== 21. english migration: no German identifiers left (tools/english/check.sh) =="

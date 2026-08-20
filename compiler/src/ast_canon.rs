@@ -95,6 +95,15 @@ fn ty(t: &TypeExpr) -> String {
             format!("(ptr {} {})", if *mutable { "mut" } else { "const" }, ty(inner))
         }
         TypeExpr::Array { elem, len, .. } => format!("(arr {} {})", len, ty(elem)),
+        // Round 58: a function type. `(fnty (arguments) result)`.
+        TypeExpr::Fn { params, ret, .. } => {
+            let ps: Vec<String> = params.iter().map(ty).collect();
+            let r = match ret {
+                Some(t) => ty(t),
+                None => "void".to_string(),
+            };
+            format!("(fnty ({}) {})", ps.join(" "), r)
+        }
     }
 }
 
@@ -171,6 +180,24 @@ fn ex_core(e: &Expr) -> String {
         ExprKind::Float(bits) => format!("(float {})", bits),
         ExprKind::Bool(b) => format!("(bool {})", b),
         ExprKind::Ident(n) => format!("(id {})", n),
+        // Round 58: a closure literal. Its body is a block like any other.
+        // NO serial number in the rendering: `lib/firnc1` numbers the
+        // generated functions differently, and the number says nothing
+        // about the tree.
+        ExprKind::Lambda(d) => format!(
+            "(closure {} ({}) {} {})",
+            if d.heap { "gc" } else { "plain" },
+            d.params
+                .iter()
+                .map(|p| format!("(param {} {})", p.name, ty(&p.ty)))
+                .collect::<Vec<String>>()
+                .join(" "),
+            match &d.ret {
+                Some(t) => ty(t),
+                None => "-".to_string(),
+            },
+            blk(&d.body)
+        ),
         ExprKind::Unary(op, a) => format!(
             "(un {} {})",
             match op {

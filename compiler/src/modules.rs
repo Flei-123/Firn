@@ -411,6 +411,12 @@ pub fn symbol(interner_name: &str, abi_version: Option<u32>) -> String {
     if interner_name == ENTRY_SYMBOL {
         return interner_name.to_string();
     }
+    // ROUND 58: the generated functions of the closures carry a `#` in their
+    // name, so that no source text can ever write them (`fnval.rs`). The
+    // assembler does not accept the character — it becomes a dot, which the
+    // naming scheme uses anyway. No other name of the compiler contains a
+    // `#` in a place where a symbol arises from it.
+    let interner_name: &str = &interner_name.replace('#', ".");
     match abi_version {
         Some(v) => format!("{}{}.{}.v{}", SYMBOL_PREFIX, SYMBOL_SCHEMA, interner_name, v),
         None => format!("{}{}.{}", SYMBOL_PREFIX, SYMBOL_SCHEMA, interner_name),
@@ -706,6 +712,16 @@ impl<'a, 'b> Renamer<'a, 'b> {
             }
             TypeExpr::Ptr { inner, .. } => self.ty(inner),
             TypeExpr::Array { elem, .. } => self.ty(elem),
+            // Round 58: the names in the signature of a function value get
+            // qualified like every other type name.
+            TypeExpr::Fn { params, ret, .. } => {
+                for p in params.iter_mut() {
+                    self.ty(p);
+                }
+                if let Some(r) = ret {
+                    self.ty(r);
+                }
+            }
         }
     }
 
@@ -767,6 +783,21 @@ impl<'a, 'b> Renamer<'a, 'b> {
         let span = e.span;
         match &mut e.kind {
             ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) => {}
+            // Round 58: the closure body is resolved INSIDE the enclosing
+            // function — only that way does a captured name stay a local one
+            // instead of being qualified into a module name.
+            ExprKind::Lambda(d) => {
+                self.push_scope();
+                for p in d.params.iter_mut() {
+                    self.ty(&mut p.ty);
+                    self.declare(&p.name);
+                }
+                if let Some(t) = d.ret.as_mut() {
+                    self.ty(t);
+                }
+                self.block(&mut d.body);
+                self.pop_scope();
+            }
             ExprKind::Ident(name) => {
                 if let Some(n) = self.resolve(name, span, true) {
                     *name = n;

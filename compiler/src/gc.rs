@@ -1215,6 +1215,60 @@ pub(crate) const TABLE_LABEL: &str = ".L__gc_typetable";
 ///   +48 type tag (for the probe)
 ///   +56 reserved
 /// ```
+/// **Round 58** (fnval.rs) — registers the class of a CAPTURE RECORD.
+///
+/// The ordinary path (`declare_classes`/`layout_classes`) runs over the
+/// items and is long finished by the time a closure is checked: only there
+/// are the types of the captured values known. So the class is built here
+/// completely, with layout, type tag and traced offsets — from then on the
+/// collector treats it like any other, through the same type table.
+///
+/// Word 0 of the record is the code address and is deliberately NOT traced:
+/// it points into `.text`, which is not a heap block.
+pub(crate) fn declare_capture_class(
+    ck: &mut Checker,
+    name: &str,
+    caps: &[Type],
+) -> (u64, u64, usize) {
+    let sidx = ck.tcx.declare(&format!("gc {}", name));
+    let mut fields: Vec<(String, Type)> = vec![("__code".to_string(), Type::U64)];
+    for (i, t) in caps.iter().enumerate() {
+        fields.push((format!("__c{}", i), t.clone()));
+    }
+    ck.tcx.set_fields(sidx, fields);
+    let mut strong = Vec::new();
+    let mut size = 0;
+    if let Some(d) = ck.tcx.structs.get(sidx) {
+        size = d.size;
+        for f in &d.fields {
+            if is_gc_ptr(&f.ty) {
+                strong.push(f.offset);
+            }
+        }
+    }
+    let tid = REG.with(|r| {
+        let mut reg = r.borrow_mut();
+        let tid = reg.classes.len() as u64 + 1;
+        reg.classes.push(Class {
+            name: name.to_string(),
+            span: Span::none(),
+            base: None,
+            fields: Vec::new(),
+            struct_idx: sidx,
+            weak_idx: usize::MAX,
+            tid,
+            size,
+            strong_offs: strong,
+            weak_offs: Vec::new(),
+            base_tid: 0,
+            union_idx: usize::MAX,
+            done: true,
+        });
+        tid
+    });
+    (tid, size, sidx)
+}
+
 pub(crate) fn ty_table_asm() -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
@@ -1281,6 +1335,16 @@ pub(crate) fn source_needs_gc(toks: &[crate::lexer::Token]) -> bool {
     if toks.windows(2).any(|w| {
         matches!(&w[0].kind, TokKind::Ident(a) if a == "gc")
             && matches!(&w[1].kind, TokKind::Ident(b) if b == "class")
+    }) {
+        return true;
+    }
+    // Round 58: `gc fn(…)` — a capturing closure. Its record is a GC
+    // object, so the same runtime has to be there. Two tokens are enough to
+    // see it, and a plain `fn(…)` closure (which captures nothing and
+    // allocates nothing) deliberately does NOT pull the collector in.
+    if toks.windows(2).any(|w| {
+        matches!(&w[0].kind, TokKind::Ident(a) if a == "gc")
+            && matches!(&w[1].kind, TokKind::KwFn)
     }) {
         return true;
     }

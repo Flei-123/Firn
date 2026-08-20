@@ -293,6 +293,7 @@ fn remap_op(op: &Op, mv: &dyn Fn(Val) -> Val) -> Op {
             args: args.iter().map(|a| mv(*a)).collect(),
         },
         Op::VtabAddr { table } => Op::VtabAddr { table: table.clone() },
+        Op::FnRef { name } => Op::FnRef { name: name.clone() },
         Op::Syscall { args } => Op::Syscall { args: args.iter().map(|a| mv(*a)).collect() },
         Op::CopyMem { dst, src, size } => {
             Op::CopyMem { dst: mv(*dst), src: mv(*src), size: *size }

@@ -13,6 +13,9 @@ pub enum TypeExpr {
     Named(String, Span),
     Ptr { mutable: bool, inner: Box<TypeExpr>, span: Span },
     Array { elem: Box<TypeExpr>, len: u64, span: Span },
+    /// **Round 58** — `fn(T1, T2) -> R`, a function as a value.
+    /// `ret == None` is the function without a result (`fn(i32)`).
+    Fn { params: Vec<TypeExpr>, ret: Option<Box<TypeExpr>>, span: Span },
 }
 
 impl TypeExpr {
@@ -21,6 +24,7 @@ impl TypeExpr {
             TypeExpr::Named(_, s) => *s,
             TypeExpr::Ptr { span, .. } => *span,
             TypeExpr::Array { span, .. } => *span,
+            TypeExpr::Fn { span, .. } => *span,
         }
     }
 }
@@ -120,6 +124,32 @@ pub enum ExprKind {
     ArrayLit(Vec<Expr>),
     /// Repeat literal `[value; N]`; `N` is a constant expression.
     ArrayRepeat(Box<Expr>, Box<Expr>),
+    /// **Round 58** — a closure literal (`fnval.rs`).
+    Lambda(Box<LambdaDecl>),
+}
+
+/// **Round 58** — an anonymous function in an expression.
+///
+/// ```text
+/// fn(a: i32) -> i32 { return a + 1 }        // captures nothing
+/// gc fn(a: i32) -> i32 { return a + n }     // captures 'n', on the GC heap
+/// ```
+///
+/// The `gc` in front is not decoration: a closure that captures values needs
+/// storage for them, and that storage is a GC object. Whoever writes it says
+/// so — and gets an `AllocError!fn(…)` in return, exactly as with
+/// `gc C{ … }`.
+#[derive(Clone, Debug)]
+pub struct LambdaDecl {
+    /// Serial number within one compilation; the generated function is
+    /// called `__closure#<id>`.
+    pub id: u32,
+    /// `true` for the form `gc fn(…)`: the record lies in the GC heap.
+    pub heap: bool,
+    pub params: Vec<Param>,
+    pub ret: Option<TypeExpr>,
+    pub body: Block,
+    pub span: Span,
 }
 
 #[derive(Clone, Debug)]

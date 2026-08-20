@@ -231,7 +231,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Placeholder for a broken expression (the error has already been reported).
-    fn broken_expr(&mut self, span: Span) -> Expr {
+    pub(crate) fn broken_expr(&mut self, span: Span) -> Expr {
         self.mk(span, ExprKind::Int(0))
     }
 
@@ -300,6 +300,40 @@ impl<'a> Parser<'a> {
 
     fn parse_type_inner(&mut self) -> Option<TypeExpr> {
         match self.kind().clone() {
+            // ROUND 58 — `fn(T1, T2) -> R`, the type of a function VALUE.
+            // Unambiguous: in a type position the keyword `fn` can mean
+            // nothing else, and a declaration always carries a name after it.
+            TokKind::KwFn => {
+                let start = self.bump();
+                if !self.expect(TokKind::LParen, "after 'fn' in a function type") {
+                    return None;
+                }
+                let mut params = Vec::new();
+                if !self.at(&TokKind::RParen) {
+                    loop {
+                        params.push(self.parse_type()?);
+                        if self.eat(&TokKind::Comma) {
+                            if self.at(&TokKind::RParen) {
+                                break;
+                            }
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                let mut end = self.span();
+                if !self.expect(TokKind::RParen, "after the parameters of a function type") {
+                    return None;
+                }
+                let mut ret = None;
+                if self.at(&TokKind::Arrow) {
+                    self.bump();
+                    let r = self.parse_type()?;
+                    end = r.span();
+                    ret = Some(Box::new(r));
+                }
+                Some(TypeExpr::Fn { params, ret, span: Parser::join(start, end) })
+            }
             TokKind::Star => {
                 let start = self.bump();
                 let mutable = self.eat(&TokKind::KwMut);
@@ -670,6 +704,11 @@ impl<'a> Parser<'a> {
         }
         // HOOK gc: `gc C{…}`, `gc_null[C]()`, `weak_null[C]()` (gc.rs)
         if let Some(e) = crate::gc::hook_primary(self) {
+            return e;
+        }
+        // HOOK fnval: the closure literal `fn(…) { … }` / `gc fn(…) { … }`
+        // (fnval.rs, round 58)
+        if let Some(e) = crate::fnval::hook_primary(self) {
             return e;
         }
         match self.kind().clone() {
@@ -1589,6 +1628,8 @@ pub fn reset_hooks() {
     crate::gc::hook_reset();
     // HOOK iface: the same for interfaces and their implementations (iface.rs)
     crate::iface::hook_reset();
+    crate::fnval::hook_reset();
+    crate::fnval::closure_reset();
 }
 
 /// Like `parse`, but for a file of the source map: `file` is its number,
@@ -1891,6 +1932,7 @@ mod tests {
             ExprKind::Float(bits) => format!("{}", f64::from_bits(*bits)),
             ExprKind::Bool(b) => format!("{}", b),
             ExprKind::Ident(n) => n.clone(),
+            ExprKind::Lambda(d) => format!("fn#{}", d.id),
             ExprKind::Unary(op, a) => format!(
                 "({}{})",
                 match op {
