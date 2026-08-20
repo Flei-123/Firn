@@ -1037,7 +1037,7 @@ RUN.md                   how to build everything, run it and measure it
 SPEC.md, ROADMAP.md      language specification and roadmap (the contract)
 tools/build_stages/         measures dev / dev-fast / release against each other
 tools/schichten/         architecture guard: field access <-> storage location
-tools/ergebnisort/       checks the result-location guarantee in the assembly
+tools/result_location/       checks the result-location guarantee in the assembly
 DESIGN_GOALS.md          10 foundation decisions (async colours, fallible
                          allocation, capabilities, ABI, debug build, in-place
                          init, comptime/reflection, SoA layout, hot reload)
@@ -1381,7 +1381,7 @@ into being **exactly once**, straight at its destination -- not first on the
 stack of the producing function. The proof is in the generated assembly:
 
 ```
-$ bash tools/ergebnisort/run.sh
+$ bash tools/result_location/run.sh
 frame build: 224 bytes   frame main: 1048816 bytes   rep-movs: 0
 OK: result-location guarantee kept (build 224 B, main 1048816 B, no bulk copy).
 ```

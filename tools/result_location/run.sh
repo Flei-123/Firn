@@ -14,8 +14,8 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 FIRNC="compiler/target/release/firnc"
-SRC="tests/120_ergebnisort.fi"
-ASM="$(mktemp /tmp/ergebnisort.XXXXXX.s)"
+SRC="tests/120_result_location.fi"
+ASM="$(mktemp /tmp/result_location.XXXXXX.s)"
 trap 'rm -f "$ASM"' EXIT
 
 MB=1048576
