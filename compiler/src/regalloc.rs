@@ -1823,7 +1823,10 @@ fn unsupported_basic(f: &Func) -> Option<String> {
         }
         for i in &b.insts {
             match &i.op {
-                Op::Call { .. } | Op::CallIndirect { .. } | Op::VtabAddr { .. } => {}
+                Op::Call { .. }
+                | Op::CallIndirect { .. }
+                | Op::VtabAddr { .. }
+                | Op::FnRef { .. } => {}
                 Op::Syscall { args } => {
                     if args.is_empty() || args.len() > 7 {
                         return Some(format!("syscall with {} arguments", args.len()));
@@ -2605,6 +2608,16 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
             e.line(&format!(
                 "lea rax, [rip + {}]",
                 crate::iface::table_label(table)
+            ));
+            ra.store_dst(e, d, "rax");
+        }
+        // Round 58 (fnval.rs), like `VtabAddr`: `rax` is never the home of a
+        // value, so the address may be built there.
+        Op::FnRef { name } => {
+            let d = i.dst.ok_or("internal error: fnref without target")?;
+            e.line(&format!(
+                "lea rax, [rip + {}]",
+                crate::fnval::record_label(name)
             ));
             ra.store_dst(e, d, "rax");
         }

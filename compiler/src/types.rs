@@ -31,6 +31,14 @@ pub enum Type {
     Void,
     /// Only to suppress follow-up errors after a reported error.
     Error,
+    /// **Round 58** — a function as a VALUE (`fn(i32, i32) -> i32`).
+    ///
+    /// One machine word wide: the pointer to a FUNCTION RECORD. Word 0 of
+    /// that record is the address of the machine code, the words after it
+    /// are the captured values of a closure (`docs/ROUND58.md`). A named
+    /// function has a record of exactly one word in `.rodata`; only a
+    /// closure that captures something needs the GC heap.
+    Fn { params: Vec<Type>, ret: Box<Type> },
 }
 
 impl Type {
@@ -54,6 +62,16 @@ impl Type {
     pub fn is_ptr(&self) -> bool {
         matches!(self, Type::Ptr { .. })
     }
+    /// Round 58 — the signature behind a function value, if it is one.
+    pub fn fn_sig(&self) -> Option<(&[Type], &Type)> {
+        match self {
+            Type::Fn { params, ret } => Some((params.as_slice(), ret)),
+            _ => None,
+        }
+    }
+    pub fn is_fn(&self) -> bool {
+        matches!(self, Type::Fn { .. })
+    }
     pub fn is_error(&self) -> bool {
         matches!(self, Type::Error)
     }
@@ -67,6 +85,7 @@ impl Type {
             Type::UntypedInt => 64,
             Type::Bool => 8,
             Type::Ptr { .. } => 64,
+            Type::Fn { .. } => 64,
             _ => 0,
         }
     }
@@ -156,6 +175,7 @@ impl TypeCtx {
             Type::I64 | Type::U64 | Type::Usize | Type::Isize | Type::UntypedInt => 8,
             Type::F64 => 8,
             Type::Ptr { .. } => 8,
+            Type::Fn { .. } => 8,
             Type::Array(e, n) => self.size_of(e) * *n,
             Type::Struct(i) => self.structs.get(*i).map(|s| s.size).unwrap_or(0),
             Type::Void | Type::Error => 0,
@@ -218,6 +238,13 @@ impl TypeCtx {
                 .get(*i)
                 .map(|s| s.name.clone())
                 .unwrap_or_else(|| "<struct>".into()),
+            Type::Fn { params, ret } => {
+                let ps: Vec<String> = params.iter().map(|p| self.name_of(p)).collect();
+                match **ret {
+                    Type::Void => format!("fn({})", ps.join(", ")),
+                    _ => format!("fn({}) -> {}", ps.join(", "), self.name_of(ret)),
+                }
+            }
             Type::UntypedInt => "{integer}".into(),
             Type::Void => "()".into(),
             Type::Error => "<error>".into(),

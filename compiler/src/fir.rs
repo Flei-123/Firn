@@ -205,6 +205,11 @@ pub enum Op {
     /// Address of a method table (`iface.rs`, round 46). `table` is the key
     /// `<interface>.<type>`; the label sits in `.rodata`.
     VtabAddr { table: String },
+    /// **Round 58** — address of a FUNCTION RECORD (`fnval.rs`). `name` is
+    /// the function whose record it is; the record holds the code address
+    /// in word 0 and sits in `.rodata`. This is how a named function
+    /// becomes a value.
+    FnRef { name: String },
     /// Address of the state block of the collector (SPEC §3.5, `gc.rs`).
     /// `regs = true`: rescue the callee-saved registers into the block first —
     /// only that makes the CONSERVATIVE register scan honest (SPEC §3.5.3).
@@ -253,7 +258,7 @@ impl Op {
             | Op::Alloca { .. }
             | Op::Select { .. } => true,
             // The address of a table in `.rodata` is a constant.
-            Op::VtabAddr { .. } => true,
+            Op::VtabAddr { .. } | Op::FnRef { .. } => true,
             // The state block is always there; rescuing the registers
             // writes memory, though, and must not fall away.
             Op::GcAddr { regs } => !*regs,
@@ -288,6 +293,7 @@ impl Op {
             | Op::Alloca { .. }
             | Op::GcAddr { .. }
             | Op::VtabAddr { .. }
+            | Op::FnRef { .. }
             | Op::ThreadSelf => {}
             Op::CallIndirect { target, args } => {
                 out.push(*target);
@@ -601,6 +607,7 @@ fn fmt_inst(i: &Inst) -> String {
             format!("calli.{} %{}({})", t, target, vlist(args))
         }
         Op::VtabAddr { table } => format!("vtab.ptr @{}", table),
+        Op::FnRef { name } => format!("fnref.ptr @{}", name),
         Op::Syscall { args } => format!("syscall.{} {}", t, vlist(args)),
         Op::CopyMem { dst, src, size } => format!("copymem %{}, %{}, size={}", dst, src, size),
         Op::Select { cond, a, b } => format!("select.{} %{}, %{}, %{}", t, cond, a, b),

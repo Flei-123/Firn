@@ -828,7 +828,9 @@ const_decl  = "const" ident ":" type "=" expr ;
 type        = "i8"|"i16"|"i32"|"i64"|"u8"|"u16"|"u32"|"u64"|"usize"|"isize"|"bool"
             | "*" [ "mut" ] type
             | "[" type ";" int_lit "]"
+            | fn_type                              (* round 58 *)
             | ident ;
+fn_type     = "fn" "(" [ type { "," type } ] ")" [ "->" type ] ;
 
 block       = "{" { stmt } "}" ;
 stmt        = let_stmt | var_stmt | assign | if_stmt | while_stmt
@@ -853,7 +855,9 @@ mul_expr    = unary   { ( "*"|"/"|"%"|"&"|"<<"|">>" ) unary } ;
 unary       = ( "-" | "!" | "&" | "*" ) unary | postfix ;
 postfix     = primary { "." ident | "[" expr "]" | "(" [ args ] ")" | "as" type } ;
 primary     = int_lit | bool_lit | qualified | "(" expr ")" | struct_lit
-            | array_lit | "syscall" "(" args ")" ;
+            | array_lit | "syscall" "(" args ")"
+            | closure ;                            (* round 58 *)
+closure     = [ "gc" ] "fn" "(" [ params ] ")" [ "->" type ] block ;
 qualified   = ident [ "." ident ]                  (* modul.name, round 2 *) ;
 struct_lit  = ident "{" { ident ":" expr "," } "}" ;
 array_lit   = "[" [ expr { "," expr } ] "]"
@@ -1222,8 +1226,8 @@ after 2,000,000 cycles. The report: `docs/reports/dom.md`.
     same decision as with the finalizers.
   * In `GcMap` the keys **0 and 1** are reserved (an empty slot and a
     tombstone).
-* **Finalizers, the stage 0 form (round 47, `docs/ROUND47.md`):** stage 0 has no
-  methods and no function pointers, so `fn finalize(inout self)` has become a
+* **Finalizers, the stage 0 form (round 47, `docs/ROUND47.md`):** stage 0 had no
+  methods and no function pointers at the time, so `fn finalize(inout self)` has become a
   pair -- `gc_finalisierer_setzen(p, art)` enters a **cleanup kind** into the
   block header, and the program declares **one** dispatcher
   `fn __gc_finalisiere(art: u64, p: *mut u8)` in its root file. The promises
