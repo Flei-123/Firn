@@ -2,20 +2,20 @@
 //!
 //! INTERFACE (fixed):
 //!   `pub fn check(prog: &ast::Program, dg: &mut Diags) -> Option<TypeInfo>`
-//! On success the PROMISE holds: for EVERY `ExprId` handed out there stands
-//! a concrete type at `TypeInfo::expr_types` (never `Type::UntypedInt`, never
-//! `Type::Error`). `lower.rs` relies on that.
+//! On success the GUARANTEE holds: for every `ExprId` ever handed out there
+//! is a concrete type in `TypeInfo::expr_types` (never `Type::UntypedInt`,
+//! never `Type::Error`). `lower.rs` relies on that.
 //!
 //! Structure:
-//!  1. create structs, resolve field types, spot recursion (direct/indirect),
-//!     compute the layout by topological order.
+//!  1. create the structs, resolve field types, detect recursion (direct and
+//!     indirect), compute the layout in topological order.
 //!  2. collect function signatures (scalar parameters/return only, SPEC §12.1).
 //!  3. check `const` declarations and evaluate them at compile time.
-//!  4. check bodies: bidirectional (context type as hint for untyped integer
-//!     literals), no implicit conversions, reachability analysis for
-//!     `return`.
+//!  4. check the bodies: bidirectional (the context type is a hint for
+//!     untyped integer literals), no implicit conversions, reachability
+//!     analysis for `return`.
 //!
-//! Collected get as many errors as possible: after one error the check runs
+//! As many errors as possible are collected: after an error the check carries
 //! on with `Type::Error`, which is compatible with everything.
 
 use std::collections::{HashMap, HashSet};
@@ -38,7 +38,7 @@ pub struct TypeInfo {
     pub tcx: TypeCtx,
     /// Type of every expression, indexed by `ExprId`.
     pub expr_types: Vec<Type>,
-    /// Evaluated `const` declarations: label -> (type, value).
+    /// Evaluated `const` declarations: name -> (type, value).
     pub consts: HashMap<String, (Type, i128)>,
     /// Signatures of all functions.
     pub fns: HashMap<String, FnSig>,
@@ -50,7 +50,7 @@ impl TypeInfo {
     }
 }
 
-/// Why one lvalue is not writable.
+/// Why an lvalue is not writable.
 #[derive(Clone, Debug)]
 enum Mutability {
     Mutable,
@@ -63,7 +63,7 @@ pub(crate) struct VarInfo {
     pub(crate) mutable: bool,
 }
 
-/// Highest nesting depth of expressions (protects against stack overflow).
+/// Maximum nesting depth of expressions (guards against stack overflow).
 const MAX_DEPTH: u32 = 200;
 
 pub(crate) struct Checker<'a> {
@@ -71,14 +71,14 @@ pub(crate) struct Checker<'a> {
     pub(crate) tcx: TypeCtx,
     pub(crate) fns: HashMap<String, FnSig>,
     pub(crate) consts: HashMap<String, (Type, i128)>,
-    /// The program of the running pass — needed by `comptime`, which executes
+    /// The program of the current pass — needed by `comptime`, which runs
     /// whole functions at compile time (`comptime.rs`).
     pub(crate) prog: Option<*const Program>,
     pub(crate) expr_types: Vec<Type>,
     pub(crate) scopes: Vec<HashMap<String, VarInfo>>,
     pub(crate) ret: Type,
     pub(crate) depth: u32,
-    /// Functions with `#[must_consume]` — their result may not get discarded
+    /// Functions marked `#[must_consume]` — their result must not be dropped
     /// as a statement (attrs.rs).
     pub(crate) must_consume_fns: HashSet<String>,
 }
@@ -100,9 +100,9 @@ pub fn check(prog: &Program, dg: &mut Diags) -> Option<TypeInfo> {
     if ck.dg.has_errors() {
         return None;
     }
-    // ExprIds handed out by the parser yet discarded (error recovery) get a
-    // concrete filler value, so that the promise holds. They are reachable
-    // within no AST node, the lowering never sees them.
+    // ExprIds handed out by the parser but then dropped (error recovery) get a
+    // concrete filler value so that the guarantee holds. They are reachable
+    // from no AST node, and lowering never sees them.
     for t in ck.expr_types.iter_mut() {
         if !matches!(t, Type::Error) {
             continue;
@@ -119,19 +119,19 @@ pub fn check(prog: &Program, dg: &mut Diags) -> Option<TypeInfo> {
 
 impl<'a> Checker<'a> {
     fn run(&mut self, prog: &Program) {
-        // SAFETY: the pointer points at the program that `check` received as a
-        // reference; the checker lives exclusively within this call. A field with
-        // a lifetime would be cleaner, yet would have burdened `check` and every
-        // caller with one more lifetime.
-        // belastet.
+        // SAFETY: the pointer refers to the program that `check` received as
+        // a reference; the checker lives entirely inside this call and never
+        // outlives it. A field with a lifetime would be cleaner, but it would
+        // have burdened `check` and every one of its callers with one more
+        // lifetime parameter.
         self.prog = Some(prog as *const Program);
         self.check_profile(prog);
-        // HOOK types: register the enum labels (sema_match.rs)
+        // HOOK types: register the enum names (sema_match.rs)
         crate::sema_match::declare_enums(self);
         // HOOK fehlerunionen: register the error sets (errors.rs)
         crate::errors::declare_error_sets(self);
-        // HOOK gc: register `gc class` as struct with prefix layout, compute the
-        // type tag and the ancestor chain (gc.rs, SPEC 3.5.1)
+        // HOOK gc: register `gc class` as a struct with prefix layout, compute
+        // the type tag and the ancestor chain (gc.rs, SPEC 3.5.1)
         crate::gc::declare_classes(self);
         self.add_items_inner(prog, true);
         // HOOK nogc: check `#[no_gc]` transitively (nogc.rs, SPEC 3.5.4).
@@ -145,25 +145,25 @@ impl<'a> Checker<'a> {
         self.check_main(prog);
     }
 
-    /// **Reentry into the check phases** (DESIGN_GOALS.md §7, foundation point
-    /// out of §10.4).
+    /// **Re-entry into the check phases** (DESIGN_GOALS.md §7, a foundation
+    /// point from §10.4).
     ///
-    /// Checks ADDITIONAL declarations with the state built already — the same
-    /// label table, the same type table, the same diagnostics. The question
-    /// "can the compiler still check a function that came about only just now?"
-    /// is thereby answered with **yes**.
+    /// Checks ADDITIONAL declarations against the state that is already built
+    /// up — the same name table, the same type table, the same diagnostics.
+    /// That answers the question "can the compiler still check a function
+    /// that has only just come into being?" with **yes**.
     ///
-    /// Needed is that by `comptime`/`emit` (SPEC §6.4): items come about
-    /// there *during* the compilation — Web IDL bindings, CSS property
-    /// tables, Unicode tables. A type checker built as a single pass over a
-    /// fixed AST cannot learn that afterwards; which is why the ability sits
-    /// here, before a producer for it
-    /// exists.
+    /// `comptime`/`emit` needs this (SPEC §6.4): there, items come into being
+    /// *during* compilation — Web IDL bindings, CSS property tables and
+    /// Unicode tables. A type checker built as a single pass over a fixed AST
+    /// cannot learn about them after the fact; which is why the ability sits
+    /// here already, before there is any producer in the compiler that would
+    /// make use of it.
     ///
-    /// **Honest scope:** addenda may hold structs, functions and constants.
-    /// Enums get laid out during the first pass only (`layout_enums`), because
-    /// their registration happens at the parser; `enum`s produced afterwards
-    /// arrive with `comptime` itself.
+    /// **Honest scope:** addenda may contain structs, functions and constants.
+    /// Enums are laid out in the first pass only (`layout_enums`), because
+    /// they are registered in the parser; `enum`s produced after the fact
+    /// arrive together with `comptime` itself.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn add_items(&mut self, prog: &Program) {
         self.add_items_inner(prog, false);
@@ -175,23 +175,23 @@ impl<'a> Checker<'a> {
         if prog.expr_count as usize > self.expr_types.len() {
             self.expr_types.resize(prog.expr_count as usize, Type::Error);
         }
-        // HOOK iface: register `dyn I` as struct — AHEAD of the structs of the
+        // HOOK iface: register `dyn I` as a struct — BEFORE the structs of the
         // program, so that a field of type `dyn I` finds its layout (iface.rs)
         crate::iface::declare_interfaces(self);
         self.collect_structs(prog);
         if layout_enums {
-            // HOOK types: lay the enums out (sema_match.rs)
+            // HOOK types: lay out the enums (sema_match.rs)
             crate::sema_match::layout_enums(self, prog);
         }
-        // HOOK gc: field layout of the gc classes (gc.rs). Only here are the
-        // structs and enums of the program known — a struct field within a gc
-        // class thereby gets the right message.
+        // HOOK gc: field layout of the gc classes (gc.rs). Only at this point
+        // are the structs and enums of the program known — that way a struct
+        // field in a gc class gets the right message.
         crate::gc::layout_classes(self);
         self.collect_fns(prog);
-        // HOOK iface: check `impl I for T` completely — all methods there, all
-        // signatures matching (iface.rs, round 46). Runs AHEAD of the bodies,
-        // so that the message of the implementation stands before the one of
-        // the call site.
+        // HOOK iface: check `impl I for T` completely — all methods present,
+        // all signatures matching (iface.rs, round 46). Runs BEFORE the bodies,
+        // so that the message about the implementation comes before the one
+        // about the call site.
         crate::iface::hook_check_impls(self);
         // Check and apply the attributes (attrs.rs)
         self.check_attrs(prog);
@@ -201,13 +201,13 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// Does a value get thrown away here that may not be thrown away?
+    /// Is a value being discarded here that must not be discarded?
     ///
-    /// **Scope at stage 0, honestly stated:** checked gets the case "the
-    /// result of a call gets discarded as a statement". The full form out of
-    /// SPEC §3.3 — *the value must be passed to a consuming function* — needs
-    /// the move checker and arrives with it (ROADMAP phase 2). What gets
-    /// checked here is the subset that is decidable without move
+    /// **Scope at stage 0, stated honestly:** what is checked is the case "the
+    /// result of a call is discarded as a statement". The full form from
+    /// SPEC §3.3 — *the value must be passed on to a consuming function* —
+    /// needs the move checker and arrives together with it (ROADMAP phase 2).
+    /// What is checked here is the subset that can be decided without move
     /// tracking.
     fn check_discard(&mut self, e: &Expr, t: &Type) {
         let name = match &e.kind {
@@ -235,15 +235,15 @@ impl<'a> Checker<'a> {
 
     // ------------------------------------------------------------ Attributes
 
-    /// Checks all attributes against the register at `attrs.rs` and applies
+    /// Checks all attributes against the register in `attrs.rs` and applies
     /// those that really do something at stage 0.
     ///
     /// Three kinds of error, all with line and column:
-    ///  * **unknown** — with a suggestion, should it be a typo
-    ///  * **wrong target** — say `#[packed]` ahead of a function
-    ///  * **known, yet not implemented at stage 0** — explicit rejection
-    ///    rather than silent ignoring. A `#[constant_time]` passed over would
-    ///    be the most dangerous error of this language.
+    ///  * **unknown** — with a suggestion, in case it is a typo
+    ///  * **wrong target** — say `#[packed]` in front of a function
+    ///  * **known, but not implemented at stage 0** — an explicit rejection
+    ///    instead of silently ignoring it. A `#[constant_time]` passed over
+    ///    in silence would be the most dangerous bug in this language.
     fn check_attrs(&mut self, prog: &Program) {
         for f in &prog.funcs {
             let attrs = f.attrs.clone();
@@ -325,9 +325,9 @@ impl<'a> Checker<'a> {
     // --------------------------------------------------------------- Profile
 
     fn check_profile(&mut self, prog: &Program) {
-        // HOOK profil (prof.rs, round 52): settle the profile AND enforce its
-        // rules. Up to round 51 the label check alone stood here — the
-        // declaration had no effect (SPEC §14, point 6).
+        // HOOK profil (prof.rs, round 52): fix the profile AND enforce its
+        // rules. Up to round 51 only the name check stood here — the
+        // declaration had no effect at all (SPEC §14, point 6).
         crate::prof::hook_check(self.dg, prog);
     }
 
@@ -336,7 +336,7 @@ impl<'a> Checker<'a> {
     fn collect_structs(&mut self, prog: &Program) {
         // HOOK fehlerunionen: report the layout phase (errors.rs)
         crate::errors::hook_struct_phase(true);
-        // 1. create all labels (allows mutual pointer references)
+        // 1. create all names (allows mutual pointer references)
         let mut idx_of: Vec<usize> = Vec::with_capacity(prog.structs.len());
         for s in &prog.structs {
             if self.tcx.lookup(&s.name).is_some() {
@@ -373,7 +373,7 @@ impl<'a> Checker<'a> {
             resolved.push(fields);
         }
 
-        // 3. spot recursion (value containment; pointers interrupt the cycle)
+        // 3. detect recursion (value containment; pointers break the cycle)
         let n = self.tcx.structs.len();
         let mut deps: Vec<Vec<usize>> = vec![Vec::new(); n];
         for (i, fields) in resolved.iter().enumerate() {
@@ -405,7 +405,7 @@ impl<'a> Checker<'a> {
             }
         }
 
-        // 4. compute the layout by topological order
+        // 4. compute the layout in topological order
         let mut fields_by_idx: Vec<Option<Vec<(String, Type)>>> = vec![None; n];
         for (i, fields) in resolved.into_iter().enumerate() {
             if let Some(t) = idx_of.get(i) {
@@ -420,8 +420,8 @@ impl<'a> Checker<'a> {
                 None => continue,
             };
             if bad.contains(&idx) {
-                // Cyclic structs get no layout (size 0), so that size_of does not
-                // run endlessly. The error got reported already.
+                // Cyclic structs get no layout (size 0), so that size_of does
+                // not run forever. The error has already been reported.
                 self.tcx.set_fields(idx, Vec::new());
                 continue;
             }
@@ -471,8 +471,8 @@ impl<'a> Checker<'a> {
         match self.fns.get("main") {
             None => {
                 // ROUND 52 (SPEC §2): the kernel profile has no entry
-                // point. There is no `_start`, no runtime prologue and
-                // nobody who would take the exit code — merely one object
+                // point at all. There is no `_start`, no runtime prologue
+                // and nobody who would take an exit code — only an object
                 // file that a boot loader or a linker script pulls into
                 // place.
                 if crate::prof::is_kernel() {
@@ -489,10 +489,10 @@ impl<'a> Checker<'a> {
                 //   fn main() -> i32
                 //   fn main(start: u64) -> i32
                 // The second one gets the START BLOCK of the process
-                // ([argc][argv..][0][envp..]); `_start` puts `rsp` for it into
-                // `rdi` (codegen_x86.rs). Without it a program written with
-                // Firn cannot read its call arguments — and `firnc1` needs a
-                // filename.
+                // ([argc][argv..][0][envp..]); for that `_start` puts `rsp`
+                // into `rdi` (codegen_x86.rs). Without it a program written
+                // in Firn cannot read its own arguments — and `firnc1`
+                // needs a file name.
                 let params_ok = sig.params.is_empty()
                     || (sig.params.len() == 1
                         && matches!(sig.params[0], Type::U64 | Type::Usize));
@@ -579,7 +579,7 @@ impl<'a> Checker<'a> {
                 }
                 Err((span, msg)) => {
                     self.dg.error(span, msg);
-                    // So that later uses report no unknown label afterwards.
+                    // So that later uses do not report an unknown name.
                     self.consts.insert(c.name.clone(), (ty.clone(), 0));
                 }
             }
@@ -628,14 +628,14 @@ impl<'a> Checker<'a> {
     fn check_stmt(&mut self, s: &Stmt) {
         match s {
             Stmt::Error(_) => {}
-            // `defer <statement>` (SPEC §5.1). The body gets checked quite
-            // normally — it sees the same labels as at the spot where it
-            // stands, and runs within the same frame.
+            // `defer <statement>` (SPEC §5.1). The body is checked entirely
+            // normally — it sees the same names as the place where it
+            // stands, and it runs in the same frame.
             //
             // FORBIDDEN is a jump out of the body: `return`, `break` and
-            // `continue` would tear the order of the remaining deferred
-            // statements apart and overwrite the return value. Zig forbids
-            // it for the same reason.
+            // `continue` would tear apart the order of the remaining
+            // deferred statements and overwrite the return value. Zig
+            // forbids it for the same reason.
             Stmt::Defer(inner, only_error, span) => {
                 let kind = if *only_error { "errdefer" } else { "defer" };
                 if let Some((bad, word)) = crate::sema::defer_jump(inner) {
@@ -726,7 +726,7 @@ impl<'a> Checker<'a> {
                 self.check_block(body, false);
             }
             Stmt::Break(_) | Stmt::Continue(_) => {
-                // The position within a loop gets checked by the parser already.
+                // The parser already checks the position inside a loop.
             }
             Stmt::For { name, start, end, body, name_span, .. } => {
                 let want = self.probe(start).or_else(|| self.probe(end));
@@ -814,7 +814,7 @@ impl<'a> Checker<'a> {
 
     // -------------------------------------------------------------- lvalues
 
-    /// Checks one assignable expression. `None` means: no lvalue (reported).
+    /// Checks an assignable expression. `None` means: not an lvalue (reported).
     fn lvalue(&mut self, e: &Expr) -> Option<(Type, Mutability)> {
         match &e.kind {
             ExprKind::Ident(name) => {
@@ -900,8 +900,8 @@ impl<'a> Checker<'a> {
     }
 
     fn field_type(&mut self, base: &Type, name: &str, nspan: Span, bspan: Span) -> Type {
-        // HOOK gc: field access through `Gc[T]` (gc.rs, SPEC 3.5.1). A Gc
-        // pointer gets followed without `(*p).field` — it is first class.
+        // HOOK gc: field access through a `Gc[T]` (gc.rs, SPEC 3.5.1). A Gc
+        // pointer is followed without `(*p).field` — it is first class.
         if let Some(i) = crate::gc::hook_field_base(base) {
             return self.field_type(&Type::Struct(i), name, nspan, bspan);
         }
@@ -978,9 +978,9 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// Gives every subexpression a concrete type without checking the content
-    /// — used after some error got reported, so that no avalanche of
-    /// consequential errors ("type of the literal ...") comes about.
+    /// Gives every subexpression a concrete type without checking it any
+    /// further — used after an error has already been reported, so that no
+    /// avalanche of follow-on errors ("type of the literal ...") arises.
     pub(crate) fn type_out_expr(&mut self, e: &Expr) {
         self.expr(e, Some(&Type::I64));
     }
@@ -1003,9 +1003,9 @@ impl<'a> Checker<'a> {
 
     fn expr_inner(&mut self, e: &Expr, hint: Option<&Type>) -> Type {
         match &e.kind {
-            // Unlike integer literals, float literals are NOT untyped: at stage 0
-            // there is `f64` alone. As soon as `f32` joins, this turns into
-            // derivation from the context (SPEC §8.6).
+            // Unlike integer literals, float literals are NOT untyped: in stage 0
+            // there is only `f64`. As soon as `f32` arrives, this turns into
+            // inference from the context (SPEC §8.6).
             ExprKind::Float(_) => Type::F64,
             ExprKind::Int(v) => match hint {
                 Some(t) if t.is_concrete_int() => {
@@ -1346,8 +1346,8 @@ impl<'a> Checker<'a> {
                 return Type::Bool;
             }
             let eq_only = matches!(op, BinOp::Eq | BinOp::Ne);
-            // `f64` compares with all six operators. NaN behaves per IEEE-754
-            // along the way: every comparison except `!=` is false.
+            // `f64` compares with all six operators. NaN follows IEEE-754
+            // in doing so: every comparison except `!=` is false.
             let ok = lt.is_concrete_int()
                 || lt == Type::F64
                 || (eq_only && (lt == Type::Bool || lt.is_ptr()));
@@ -1394,9 +1394,9 @@ impl<'a> Checker<'a> {
             return lt;
         }
         // Arithmetic and bit operations: the same integer type on both sides
-        // The type of one operand that is typed already takes precedence over the
+        // The type of an operand that is already typed takes precedence over the
         // context hint — that way `let x: i64 = a + 1` (a: i32) reports the real
-        // error at the assignment rather than a confusing operand error.
+        // error at the assignment instead of a confusing operand error.
         let want = self
             .probe(l)
             .or_else(|| self.probe(r))
@@ -1408,8 +1408,8 @@ impl<'a> Checker<'a> {
         }
         // FLOATING POINT: `+ - * /` are allowed, `%` and the bit operations are
         // not. `%` would be `fmod` and needs a library function; the bit
-        // operations would carry no sensible meaning on a bit pattern (whoever
-        // needs them converts to `u64` explicitly).
+        // operations would have no sensible meaning on a bit pattern (anyone
+        // who needs them converts to `u64` explicitly).
         if lt == Type::F64 || rt == Type::F64 {
             let allowed = matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div);
             if !allowed {
@@ -1476,7 +1476,7 @@ impl<'a> Checker<'a> {
         if let Some(t) = crate::sizeof::hook_call(self, name, args, nspan) {
             return t;
         }
-        // HOOK kern: `asm(…)` and the eight MMIO labels (core.rs, round 52)
+        // HOOK kern: `asm(…)` and the eight MMIO names (core.rs, round 52)
         if let Some(t) = crate::core::hook_call(self, name, args, nspan, espan) {
             return t;
         }
@@ -1525,9 +1525,9 @@ impl<'a> Checker<'a> {
         sig.ret
     }
 
-    /// One argument against its parameter type. `nr` is the number that shows
-    /// up within the message (1-based). At a method call it counts WITHOUT the
-    /// receiver — `v.push(x)` has one argument, not two
+    /// One argument against its parameter type. `nr` is the number that
+    /// appears in the message (1-based). For a method call it counts WITHOUT
+    /// the receiver — `v.push(x)` has one argument, not two
     /// (impls.rs).
     pub(crate) fn check_argument(&mut self, who: &str, nr: usize, a: &Expr, p: &Type) {
         // HOOK fehlerunionen: implicit conversion (errors.rs)
@@ -1621,9 +1621,9 @@ impl<'a> Checker<'a> {
         Type::Struct(idx)
     }
 
-    /// Determines the type of one expression without reporting errors and
-    /// without writing the type table. Needed to win the type of the literal
-    /// at `a + 1` out of the other operand.
+    /// Determines the type of an expression without reporting errors and
+    /// without writing to the type table. Needed to obtain the type of the
+    /// literal in `a + 1` from the other operand.
     fn probe(&self, e: &Expr) -> Option<Type> {
         self.probe_d(e, 0)
     }
@@ -1684,26 +1684,26 @@ impl<'a> Checker<'a> {
                     return crate::errors::success_type(&inner);
                 }
                 // HOOK impl: `x.m(..)` yields the return type of the method.
-                // Without it a literal next to it would get no type
-                // (`p.sum() != 42`) — the same resolution as at `call`,
+                // Without that, a literal beside it would get no type
+                // (`p.sum() != 42`) — the same resolution as in `call`,
                 // only without reporting and without writing (impls.rs)
                 if let Some(m) = crate::impls::method_name(name) {
                     let et = args.first().and_then(|a| self.probe_d(a, d + 1))?;
-                    // HOOK iface: on a `dyn I` the type stands at the
-                    // interface, not at the function table (iface.rs)
+                    // HOOK iface: on a `dyn I` the type sits in the
+                    // interface, not in the function table (iface.rs)
                     if let Some(iname) = crate::impls::dyn_interface(&self.tcx, &et) {
                         return crate::iface::ret_of(&iname, m);
                     }
                     let (full, _) = crate::impls::target_of(&self.tcx, &self.fns, m, &et)?;
                     return self.fns.get(&full).map(|s| s.ret.clone());
                 }
-                // HOOK sizeof: `size_of[T]()` is always `usize` — without it
-                // a literal next to it gets no type (`size_of[u8]() != 1`)
+                // HOOK sizeof: `size_of[T]()` is always `usize` — without that
+                // a literal beside it gets no type (`size_of[u8]() != 1`)
                 if crate::sizeof::value(name).is_some() || name.starts_with("size_of$") {
                     return Some(Type::Usize);
                 }
                 // HOOK gc: type of `weak(g)`, `strong(w)` and `x.as?[C]` WITHOUT
-                // a check, so that a literal next to it gets its type (gc.rs)
+                // a check, so that a literal beside it gets its type (gc.rs)
                 let arg0 = args.first().and_then(|a| self.probe_d(a, d + 1));
                 if let Some(t) = crate::gc::probe_ty(name, arg0.as_ref()) {
                     return Some(t);
@@ -1739,7 +1739,7 @@ impl<'a> Checker<'a> {
             return t;
         }
         // HOOK gc: `Gc[C]`, `GcWeak[C]` and the forbidden use of a
-        // `gc class` label where a plain value belongs (gc.rs)
+        // `gc class` name where an ordinary value belongs (gc.rs)
         if let Some(t) = crate::gc::hook_resolve_ty(self, te) {
             return t;
         }
@@ -1912,18 +1912,18 @@ impl<'a> Checker<'a> {
                 }
                 Ok(wrap(v, &dst))
             }
-            // COMPTIME: a call gets EXECUTED at compile time — with loops,
-            // branches and recursion (comptime.rs). Table sizes and figures
-            // are thereby computable, rather than being worked out by hand
-            // and written down as a literal.
+            // COMPTIME: a call is EXECUTED at compile time — with loops,
+            // branches and recursion (comptime.rs). That makes table sizes
+            // and key figures computable instead of working them out by hand
+            // and writing them down as a literal.
             ExprKind::Call(name, args, _) => {
                 let mut values = Vec::with_capacity(args.len());
                 for a in args {
                     values.push(self.eval_const_d(a, d + 1)?);
                 }
                 let prog = match self.prog {
-                    // SAFE: set at `run`/`add_items_inner`, holds for the duration
-                    // of this pass.
+                    // SAFE: set in `run`/`add_items_inner`, valid for the
+                    // duration of this pass.
                     Some(p) => unsafe { &*p },
                     None => return nope("comptime: the program is not available here"),
                 };
@@ -1962,13 +1962,13 @@ fn prim_type(name: &str) -> Option<Type> {
     })
 }
 
-/// Cut a value to width/signedness of the target type — for the `comptime`
-/// interpreter too (`comptime.rs`).
+/// Cut a value to the width/signedness of the target type — for the
+/// `comptime` interpreter as well (`comptime.rs`).
 pub(crate) fn comptime_wrap(v: i128, t: &Type) -> i128 {
     wrap(v, t)
 }
 
-/// Cut a value to width/signedness of the target type.
+/// Cut a value to the width/signedness of the target type.
 fn wrap(v: i128, t: &Type) -> i128 {
     let bits = t.bits();
     if bits == 0 {
@@ -1990,7 +1990,7 @@ fn wrap(v: i128, t: &Type) -> i128 {
     }
 }
 
-/// Does the literal fit the type (read signed OR unsigned)?
+/// Does the literal fit into the type (read signed OR unsigned)?
 fn lit_fits(v: i128, t: &Type) -> bool {
     let bits = t.bits() as i128;
     if bits >= 64 {
@@ -2000,20 +2000,20 @@ fn lit_fits(v: i128, t: &Type) -> bool {
     v >= -(ub / 2) && v < ub
 }
 
-/// May this type take part at one `as` conversion?
+/// May this type take part in an `as` conversion?
 fn cast_kind(t: &Type) -> bool {
     t.is_concrete_int() || *t == Type::Bool || t.is_ptr() || *t == Type::F64
 }
 
 /// Assignment compatibility — there are NO implicit conversions. The only
-/// leniency: the `mut` marking of a pointer does not get checked (stage 0
-/// has no mutability checker for pointer targets).
+/// leniency: the `mut` marking of a pointer is not checked (stage 0 has no
+/// mutability checker for pointer targets).
 fn assignable(got: &Type, want: &Type) -> bool {
     if got.is_error() || want.is_error() {
         return true;
     }
     // HOOK gc: free upcast `Gc[Derived]` -> `Gc[Base]`
-    // (gc.rs, SPEC 4.4). ONLY that direction; downwards goes exclusively
+    // (gc.rs, SPEC 4.4). ONLY in that direction; downwards goes exclusively
     // through the checked `x.as?[C]`.
     if crate::gc::is_upward(got, want) {
         return true;
@@ -2031,7 +2031,7 @@ fn compatible(a: &Type, b: &Type) -> bool {
     }
 }
 
-/// Collects all structs that `ty` holds BY VALUE (pointers do not).
+/// Collects all structs that `ty` contains BY VALUE (pointers do not count).
 fn collect_value_deps(ty: &Type, out: &mut Vec<usize>) {
     match ty {
         Type::Struct(i) => out.push(*i),
@@ -2040,7 +2040,7 @@ fn collect_value_deps(ty: &Type, out: &mut Vec<usize>) {
     }
 }
 
-/// Depth first search: spots cycles and yields a topological order
+/// Depth first search: detects cycles and yields a topological order
 /// (dependencies first) for the layout computation.
 fn find_cycles(
     i: usize,
@@ -2071,7 +2071,7 @@ fn find_cycles(
     order.push(i);
 }
 
-/// Reachability analysis: does EVERY path of the block end with 'return'?
+/// Reachability analysis: does EVERY path in the block end with 'return'?
 fn block_returns(b: &Block) -> bool {
     b.stmts.iter().any(stmt_returns)
 }
@@ -2095,8 +2095,8 @@ fn stmt_returns(s: &Stmt) -> bool {
     }
 }
 
-/// Does the block hold a `break` that leaves THIS loop (so none out of one
-/// inner loop)?
+/// Does the block contain a `break` that leaves THIS loop (so not one from
+/// an inner loop)?
 fn block_breaks(b: &Block) -> bool {
     b.stmts.iter().any(stmt_breaks)
 }
@@ -2108,7 +2108,7 @@ fn stmt_breaks(s: &Stmt) -> bool {
         Stmt::If { then, els, .. } => {
             block_breaks(then) || els.as_deref().map(stmt_breaks).unwrap_or(false)
         }
-        // 'break' within one inner loop leaves that one only.
+        // A 'break' in an inner loop leaves only that one.
         _ => false,
     }
 }
@@ -2150,10 +2150,10 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Reentry into the check phases (DESIGN_GOALS.md §7)
+    // Re-entry into the check phases (DESIGN_GOALS.md §7)
     // ------------------------------------------------------------------
 
-    /// Builds a checker at the state *after* the first pass.
+    /// Builds a checker in the state *after* the first pass.
     fn checker_after_first_run<'d>(
         dg: &'d mut Diags,
         first: &Program,
@@ -2201,8 +2201,8 @@ mod tests {
         assert!(!ck.fns.contains_key("later"));
 
         // Second pass: a function that did not exist the first time and that
-        // reaches a function of the first pass.
-        // Exactly that is what `comptime emit` must do later.
+        // reaches into a function of the first pass.
+        // That is exactly what `comptime emit` has to do later.
         let call = b.e(ExprKind::Call("base".to_string(), Vec::new(), sp()));
         let addendum = Program {
             funcs: vec![FnDecl {
@@ -2220,7 +2220,7 @@ mod tests {
 
         assert!(!ck.dg.has_errors(), "addendum must run through without errors");
         assert!(ck.fns.contains_key("later"), "the new function is missing");
-        // The call really got a type — the table grew with it.
+        // The call really did get a type — the table grew along with it.
         assert_eq!(ck.expr_types.len(), b.next as usize);
         assert_eq!(ck.fns["later"].ret, Type::I32);
     }
@@ -2239,7 +2239,7 @@ mod tests {
         assert!(!ck.dg.has_errors());
 
         // The addendum calls something that does not exist -> the same error as
-        // at the first pass. Addenda may be no back door.
+        // in the first pass. An addendum must not be a back door.
         let call = b.e(ExprKind::Call("does_not_exist".to_string(), Vec::new(), sp()));
         let addendum = Program {
             funcs: vec![FnDecl {
@@ -2304,7 +2304,7 @@ mod tests {
         (info, dg.render())
     }
 
-    /// Builds a program whose main holds `return <e>` alone.
+    /// Builds a program whose main contains nothing but `return <e>`.
     fn prog_with(b: &mut B, ret: Expr) -> Program {
         Program {
             profile: None,
@@ -2428,7 +2428,7 @@ mod tests {
             ],
             span: sp(), attrs: Vec::new(),
         };
-        // The outer struct stands AHEAD of the inner one -> topological order needed.
+        // The outer struct comes BEFORE the inner one -> topological order needed.
         let outer = StructDecl {
             name: "Outer".to_string(),
             fields: vec![
@@ -2762,8 +2762,8 @@ mod tests {
     }
 
     #[test]
-    /// Round 2: aggregates at function boundaries are ALLOWED (SPEC §14.1 point
-    /// 1 struck). The type checker accepts them, `abi.rs` classifies them.
+    /// Round 2: aggregates at function boundaries are ALLOWED (SPEC §14.1,
+    /// point 1 dropped). The type checker accepts them, `abi.rs` classifies them.
     fn aggregate_parameter_is_allowed() {
         let mut b = B::new();
         let ret = b.int(0);
@@ -2998,7 +2998,7 @@ mod tests {
 }
 
 /// Finds a jump (`return`/`break`/`continue`) that leads OUT of a `defer`
-/// body. Jumps within a loop that starts inside the body itself are
+/// body. Jumps inside a loop that begins within the body itself are
 /// allowed — they do not leave the body.
 pub(crate) fn defer_jump(s: &Stmt) -> Option<(Span, &'static str)> {
     match s {
@@ -3012,7 +3012,7 @@ pub(crate) fn defer_jump(s: &Stmt) -> Option<(Span, &'static str)> {
             .iter()
             .find_map(defer_jump)
             .or_else(|| els.as_deref().and_then(defer_jump)),
-        // Within `while`/`for` a `break`/`continue` may stand: they belong to
+        // Inside `while`/`for` a `break`/`continue` may appear: they belong to
         // this loop and do not leave the body. A `return` does.
         Stmt::While { body, .. } | Stmt::For { body, .. } => {
             body.stmts.iter().find_map(defer_return_only)
@@ -3021,8 +3021,8 @@ pub(crate) fn defer_jump(s: &Stmt) -> Option<(Span, &'static str)> {
     }
 }
 
-/// Like `defer_jump`, but `return` alone — for bodies within a loop that
-/// starts inside the `defer` itself.
+/// Like `defer_jump`, but `return` only — for bodies inside a loop that
+/// begins within the `defer` itself.
 fn defer_return_only(s: &Stmt) -> Option<(Span, &'static str)> {
     match s {
         Stmt::Return { span, .. } => Some((*span, "return")),
