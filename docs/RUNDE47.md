@@ -27,8 +27,8 @@ nor `inout` nor function pointers — and **indirect calls belong to round 46**
 function pointers is two parts:
 
 ```firn
-gc_finalisierer_setzen(p, art)      // je OBJEKT eine Aufraeumart (1..16777215)
-fn __gc_finalisiere(art: u64, p: *mut u8) { … }   // EIN Verteiler im Programm
+gc_finalizer_set(p, kind)           // one clean-up kind per OBJECT (1..16777215)
+fn __gc_finalize(kind: u64, p: *mut u8) { ... }   // ONE dispatcher in the program
 ```
 
 The cleanup kind is recorded **in the block header**, not in a side table:
@@ -36,11 +36,11 @@ the word `[4..8)` so far only carried the mark (0/1/2) and has 30 bits free.
 New:
 
 ```
-Bits 0..1   Marke        0 weiss, 1 grau, 2 schwarz
-Bit  2      F_FIN        das Objekt hat einen Finalisierer
-Bit  3      F_WART       es steht in der Warteschlange / läuft gerade
-Bit  4      F_GETAN      sein Finalisierer ist gelaufen
-Bits 8..31  Aufraeumart  24 Bit
+bits 0..1   mark          0 white, 1 gray, 2 black
+bit  2      F_FIN         the object has a finalizer
+bit  3      F_WART        it stands in the queue / is running right now
+bit  4      F_GETAN       its finalizer has run
+bits 8..31  clean-up kind 24 bit
 ```
 
 That costs **not a single byte per object** and makes the detection during
@@ -76,15 +76,16 @@ That is not only a request to the programmer but is **enforced**:
    **71**), `gc_collect()` likewise (**72**), and writing a Gc pointer
    into a heap field (**73**).
 
-The messages, verbatim:
+The three refusals:
 
 ```
-firn-gc: allokation waehrend eines finalisierers (SPEC 3.5.3 S4)
-firn-gc: gc_collect() waehrend eines finalisierers (SPEC 3.5.3 S4)
-firn-gc: wiederbelebung im finalisierer (SPEC 3.5.3 S4)
+The runtime writes one line to stderr and stops the program (the wording
+comes from `lib/gc/gc.fi`): allocation during a finalizer, `gc_collect()`
+during a finalizer, resurrection in a finalizer -- each of them with the
+rule it breaks (SPEC 3.5.3 S4).
 ```
 
-**Item 3 also solves the reentrancy question.** A finalizer that
+**Item 3 solves the reentrancy question at the same time.** A finalizer that
 allocates would start a collection in the middle of a collection:
 the queue, the free lists and the sweep markers are half finished at that
 moment. Because it cannot even allocate, the case is not handled but
@@ -154,7 +155,7 @@ name. So since this round there is **one** new FIR primitive, the smallest
 one that suffices:
 
 ```firn
-__atomar_addieren(p: *mut u64, delta: u64) -> u64    // liefert den ALTEN Wert
+__atomic_add(p: *mut u64, delta: u64) -> u64    // returns the OLD value
 ```
 
 → `lock xadd qword ptr [rcx], rax`, one instruction. Decrementing is the
@@ -435,7 +436,7 @@ problem, only shift it; that is why it was retracted.
   compiler checks that"; round 47 enforces it at **runtime**. The static
   variant would be to demand `#[no_gc]` on `__gc_finalisiere` — the check
   for it already exists (`nogc.rs`, transitive). Deliberately not done,
-  because `#[no_gc]` also forbids writing *local* Gc fields and therefore
+  because `#[no_gc]` forbids writing *local* Gc fields as well and therefore
   restricts more than the contract demands.
 * **`__gc_block_von` is linear.** With weak fields whose targets scatter
   over many chunks, the chunk list is the most expensive item of the
