@@ -112,7 +112,7 @@ impl TypeCtx {
         self.by_name.get(name).copied()
     }
 
-    /// Creates a struct (the layout gets set by `finish_struct`).
+    /// Creates a struct (the layout is set by `finish_struct`).
     pub fn declare(&mut self, name: &str) -> usize {
         let idx = self.structs.len();
         self.structs.push(StructDef {

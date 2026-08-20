@@ -5,7 +5,7 @@
 //! instruction is needed here — just `load`/`store`, one comparison and one
 //! branch.
 //!
-//! What gets produced:
+//! What is produced:
 //!  * `IoError::NotFound` — `store __err = code`
 //!  * implicit conversion at `return`/`let`/assignment — `__err = 0` plus the
 //!    value, respectively `__err = code`
