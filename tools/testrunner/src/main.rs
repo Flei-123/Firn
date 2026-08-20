@@ -1,22 +1,22 @@
-//! Testrunner mit maschinenlesbarer Ausgabe (Anforderung `W2`).
+//! Test runner with machine-readable output (requirement `W2`).
 //!
-//! Er uebersetzt und startet dieselben Testprogramme wie `test.sh`, gibt das
-//! Ergebnis aber wahlweise als Text oder als JSON aus und liefert die Quote
-//! als Zahl — damit ist er CI-tauglich.
+//! It compiles and starts the same test programs as `test.sh`, but reports the
+//! result either as text or as JSON and gives the rate
+//! as a number -- that makes it fit for CI.
 //!
-//! Aufruf:
-//!   testrunner [--root <verzeichnis>] [--compiler <pfad>] [--format=json|text]
-//!              [--filter <teilstring>] [--quiet]
+//! Usage:
+//!   testrunner [--root <directory>] [--compiler <path>] [--format=json|text]
+//!              [--filter <substring>] [--quiet]
 //!
-//! Exit-Code: 0 = alle Faelle bestanden, 1 = mindestens ein Fehlschlag,
-//! 2 = Aufrufoder Umgebungsfehler (Compiler fehlt, Verzeichnis fehlt).
+//! Exit code: 0 = every case passed, 1 = at least one failure,
+//! 2 = a usage or environment error (compiler missing, directory missing).
 //!
-//! Erwartungen stehen in Zeile 1 des Testprogramms:
-//!   `// expect_exit: N`   Exit-Code des Programms
-//!   `// expect_out: TEXT` Standardausgabe (ohne Zeilenende am Ende)
-//!   `// expect_error: Z:S TEXT` (nur unter tests/neg/) Uebersetzung MUSS
-//!                              scheitern und Position + Text melden
-//! Optional Zeile 2: `// expect_error_count: N`
+//! The expectations stand in line 1 of the test program:
+//!   `// expect_exit: N`   the exit code of the program
+//!   `// expect_out: TEXT` standard output (without a line end at the end)
+//!   `// expect_error: L:C TEXT` (only under tests/neg/) the compilation MUST
+//!                              fail and report the position + the text
+//! Optionally line 2: `// expect_error_count: N`
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
