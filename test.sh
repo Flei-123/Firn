@@ -53,6 +53,9 @@
 #      gets formatted, the token stream and the syntax tree stay unchanged,
 #      a second run changes nothing, and the shape does not depend on
 #      blanks (random test).
+#  25. The language server (tools/lsp/run.sh, round 64): `firnc --lsp`
+#      speaks the Language Server Protocol; a real client checks
+#      diagnostics, definition, hover, completion, rename and formatting.
 #  24. Debug information (tools/dwarf/run.sh, round 64): `.debug_info`
 #      written by the compiler itself, `gdb` driven in batch mode over two
 #      translated Firn programs -- breakpoints, backtrace, `print` of
@@ -504,6 +507,21 @@ if [ "$DWRC" -eq 0 ]; then
 else
     bad "tools/dwarf/run.sh failed (see .test-work/dwarf.log)"
     grep FAIL "$WORK/dwarf.log" | head -10 | sed 's/^/   /'
+fi
+
+echo "== 25. the language server: firnc --lsp (tools/lsp/run.sh, ROUND 64) =="
+# The Language Server Protocol over standard input/output, on the same
+# lexer, parser and type checker the compiler uses. tools/lsp/client.py is
+# a real client and holds the answers against expectations: diagnostics
+# with the suggestions, definition, hover, completion, rename, formatting --
+# with counter-checks.
+bash tools/lsp/run.sh > "$WORK/lsp.log" 2>&1 && LSRC=0 || LSRC=$?
+if [ "$LSRC" -eq 0 ]; then
+    ok
+    tail -1 "$WORK/lsp.log" | sed 's/^/   /'
+else
+    bad "tools/lsp/run.sh failed (see .test-work/lsp.log)"
+    grep FAIL "$WORK/lsp.log" | head -10 | sed 's/^/   /'
 fi
 
 TOTAL=$((PASS + FAIL))
