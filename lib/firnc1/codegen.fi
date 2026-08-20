@@ -1,34 +1,34 @@
-// lib/firnc1/codegen.fi — VON DER FIR ZU x86-64, IN FIRN.
+// lib/firnc1/codegen.fi -- FROM THE FIR TO x86-64, WRITTEN AS FIRN.
 //
-// Neunter Teil von Stufe 1 und der letzte vor dem Fixpunkt. Damit uebersetzt
-// die Firn-Fassung ein Programm von vorne bis hinten: Text -> Token -> Baum ->
-// Typen -> FIR -> Assembler.
+// Ninth part of stage 1 and the last one before the fixpoint. With it the
+// Firn version translates a program front to back: text -> tokens -> tree ->
+// types -> FIR -> assembly.
 //
-// BEWUSST OHNE REGISTERZUTEILUNG. `firnc0` hat dafuer `regalloc.rs` mit
-// Lebendigkeitsanalyse und Verschmelzung; hier bekommt JEDER FIR-Wert einen
-// eigenen Platz im Rahmen, und jede Instruktion laedt ihre Operanden, rechnet
-// und schreibt zurueck. Das ist langsamer Code — aber richtiger, und er ist in
-// einem Nachmittag nachvollziehbar. Der Vergleich laeuft deshalb auch NICHT
-// ueber den Assemblertext, sondern ueber das VERHALTEN: uebersetzen,
-// assemblieren, linken, laufen lassen, Rueckgabewert und Ausgabe vergleichen.
-// Fuer einen Codegenerator ist das ohnehin der ehrlichere Massstab.
+// DELIBERATELY WITHOUT REGISTER ALLOCATION. `firnc0` has `regalloc.rs` for that,
+// with liveness analysis and coalescing; here EVERY FIR value gets its
+// own slot inside the frame, and every instruction loads its operands, computes
+// and writes back. That is slow code -- but more correct, and it can be
+// followed through within one afternoon. That is why the comparison does NOT run
+// over the assembly text but over the BEHAVIOUR: translate,
+// assemble, link, run, compare return value and output.
+// For a code generator that is the more honest yardstick anyway.
 //
-// RAHMEN: `[rbp - 8*(v+1)]` ist der Platz des Wertes `%v`. Dahinter liegen die
-// Bereiche der `alloca`s. Ein Wert liegt IMMER als volle 64 Bit da, passend
-// erweitert (vorzeichen- bzw. nullerweitert) — deshalb muss nach jeder
-// Rechnung `normalisiere` laufen.
+// FRAME: `[rbp - 8*(v+1)]` is the slot of the value `%v`. Behind those sit the
+// ranges of the `alloca`s. A value always lies there as full 64 bit, suitably
+// extended (sign or zero extended) -- that is why `normalize` has to run after
+// every computation.
 //
-// GLEITKOMMA laeuft ueber `xmm0`/`xmm1`. Ein `f64`-Wert liegt im Rahmen wie
-// jeder andere — als acht Oktette; nur die Rechnung geht durch die
-// SSE-Befehle. Eine eigene Klassifikation an der Funktionsgrenze gibt es
-// NICHT: Stufe 0 uebergibt `f64` in Ganzzahlregistern (SPEC §14.1, bewusste
-// Abweichung von System V), und genau das tut dieser Codegenerator auch.
+// FLOATING POINT runs over `xmm0`/`xmm1`. One `f64` value sits inside the frame like
+// every other one -- as eight octets; only the computation goes through the
+// SSE instructions. A classification of its own at the function border does
+// NOT exist: stage 0 hands `f64` over through integer registers (SPEC 14.1,
+// deliberate deviation from System V), and exactly that is what this code generator does.
 //
-// MEHR ALS SECHS ARGUMENTE gehen nach System V ueber den Stapel, in
-// UMGEKEHRTER Reihenfolge. Beim Aufruf muss `rsp` 16-ausgerichtet sein — bei
-// ungerader Zahl von Stapelargumenten wird deshalb ein Fuellwort davor
-// gelegt. Die aufgerufene Funktion findet sie bei `[rbp+16]`, `[rbp+24]`, …;
-// davor liegen die gesicherte Ruecksprungadresse und das gesicherte `rbp`.
+// MORE THAN SIX ARGUMENTS go over the stack by System V, with
+// REVERSED order. At the call `rsp` has to be 16 aligned -- for
+// odd counts of stack arguments one filler word gets put ahead of
+// them. The called function finds them at `[rbp+16]`, `[rbp+24]`, ...;
+// ahead of those sit the saved return address and the saved `rbp`.
 
 import rt
 import vec
@@ -45,16 +45,16 @@ export { Cg, cg_new, cg_free, cg_run, cg_unsuitable, cg_text, cg_gc_set,
 const NONE: u32 = 4294967295
 
 struct Cg {
-    f: u64              // Zeiger auf die Fir
-    it: u64             // Interner
+    f: u64              // pointer to the Fir
+    it: u64             // interner
     out: rt.Buf
-    slot: Vec[u64]      // Versatz je Wert (positiv, von rbp abzuziehen)
-    aslot: Vec[u64]     // Versatz des alloca-Bereichs je Wert, 0 = keiner
+    slot: Vec[u64]      // offset per value (positive, to subtract from rbp)
+    aslot: Vec[u64]     // offset of the alloca range per value, 0 = none
     frame: u64
     unsuitable: bool
-    gcr: u64            // gc-Registrierung (Runde 34), 0 = keine Klassen
-    ifr: u64            // Schnittstellen (Runde 46), 0 = keine
-    free: bool          // RUNDE 52: freistehend — kein `_start`, kein exit
+    gcr: u64            // gc registry (round 34), 0 = no classes
+    ifr: u64            // interfaces (round 46), 0 = none
+    free: bool          // ROUND 52: freestanding -- no `_start`, no exit
 }
 
 fn cg_new(f: u64, it: u64) -> Cg {
@@ -66,17 +66,17 @@ fn cg_new(f: u64, it: u64) -> Cg {
     }
 }
 
-// Die gc-Registrierung anmelden (Runde 34): sie traegt Groesse, Typkennung
-// und Feldoffsets jeder Klasse — daraus entsteht die Typtabelle des Sammlers.
+// Register the gc registry (round 34): it carries size, type tag
+// and field offsets of every class -- out of those the type table of the collector arises.
 fn cg_gc_set(c: *mut Cg, g: u64) { (*c).gcr = g }
 
-// RUNDE 52 (SPEC 2): freistehend uebersetzen — KEIN `_start`, kein
-// Laufzeitvorspann, kein `exit`. Das Ergebnis ist eine Objektdatei, die ein
-// Bootlader bzw. ein Linkerskript einbindet.
+// ROUND 52 (SPEC 2): translate freestanding -- NO `_start`, no
+// runtime preamble, no `exit`. The result is one object file that a
+// boot loader or a linker script pulls together.
 fn cg_freestanding_set(c: *mut Cg, v: bool) { (*c).free = v }
 
-// Die Schnittstellen-Registrierung anmelden (Runde 46): aus ihr entstehen
-// die Methodentafeln in `.rodata`.
+// Register the interface registry (round 46): out of it the
+// method tables inside `.rodata` arise.
 fn cg_if_set(c: *mut Cg, f: u64) { (*c).ifr = f }
 fn ifg(c: *mut Cg) -> *mut iface.If { return (*c).ifr as *mut iface.If }
 fn has_if(c: *mut Cg) -> bool {
@@ -90,8 +90,8 @@ fn has_gc(c: *mut Cg) -> bool {
     if (*c).gcr == 0 {
         return false
     }
-    // Runde 49: auch ohne `gc class` braucht ein Programm mit Faeden den
-    // Zustandsblock (gc.rs: `hat_klassen() || laufzeit_aktiv()`).
+    // Round 49: even without `gc class` a program with threads needs the
+    // state block (gc.rs: `has_classes() || runtime_active()`).
     if gc.gc_runtime(gcg(c)) != 0 as usize {
         return true
     }
@@ -109,7 +109,7 @@ fn cg_text(c: *mut Cg) -> *mut rt.Buf { return &(*c).out }
 fn ff(c: *mut Cg) -> *mut fir.Fir { return (*c).f as *mut fir.Fir }
 fn it(c: *mut Cg) -> *mut intern.Interner { return (*c).it as *mut intern.Interner }
 
-// ------------------------------------------------------------- Textausgabe
+// ------------------------------------------------------------- text output
 
 fn t(c: *mut Cg, p: u64, n: usize) {
     rt.buf_push_bytes(&(*c).out, p, n)
@@ -127,8 +127,8 @@ fn inum(c: *mut Cg, v: i64) {
     rt.buf_push_dec_i64(&(*c).out, v)
 }
 
-// Symbolname einer Funktion: `_F1.` davor, damit nichts mit dem
-// Betriebssystem oder mit `firnc0` kollidiert.
+// Symbol label of a function: `_F1.` ahead of it, so that nothing collides
+// with the operating system or with `firnc0`.
 fn sym(c: *mut Cg, nr: u32) {
     var p: [u8; 4] = "_F1."
     t(c, (&p[0]) as u64, 4)
@@ -144,7 +144,7 @@ fn blocklabel(c: *mut Cg, fnr: u32, bb: u32) {
     number(c, bb as u64)
 }
 
-// ---------------------------------------------------------- Registernamen
+// --------------------------------------------------------- register names
 // 0=rax 1=rcx 2=rdx 3=rsi 4=rdi 5=r8 6=r9 7=r10 8=rbp 9=rsp
 const R_AX: u32 = 0
 const R_CX: u32 = 1
@@ -155,7 +155,7 @@ fn reg64(c: *mut Cg, r: u32) {
     piece(c, (&tab[0]) as u64, 29, r)
 }
 
-// Teilstueck `nr` aus einer mit '|' getrennten Tafel schreiben.
+// Write piece `nr` out of a table separated by '|'.
 fn piece(c: *mut Cg, p: u64, n: usize, nr: u32) {
     var i: usize = 0
     var k: u32 = 0
@@ -177,7 +177,7 @@ fn piece(c: *mut Cg, p: u64, n: usize, nr: u32) {
     }
 }
 
-// Registername in der Breite `bits` (8/16/32/64) fuer rax/rcx/rdx.
+// Register label with the width `bits` (8/16/32/64) for rax/rcx/rdx.
 fn regb(c: *mut Cg, r: u32, bits: u32) {
     var t8: [u8; 8] = "al|cl|dl"
     var t16: [u8; 8] = "ax|cx|dx"
@@ -217,7 +217,7 @@ fn word_size(c: *mut Cg, bits: u32) {
     t(c, (&q[0]) as u64, 6)
 }
 
-// `  ` am Zeilenanfang
+// `  ` at the start of the line
 fn ins(c: *mut Cg) {
     var s: [u8; 4] = "    "
     t(c, (&s[0]) as u64, 4)
@@ -260,8 +260,8 @@ fn load_value(c: *mut Cg, r: u32, v: u32) {
     load_slot(c, r, slot_of(c, v))
 }
 
-// Ein Wert liegt IMMER als volle 64 Bit im Rahmen, passend erweitert.
-// Nach jeder Rechnung muss das wiederhergestellt werden.
+// A value always lies inside the frame as full 64 bit, suitably extended.
+// After every computation that has to be restored.
 fn normalize(c: *mut Cg, r: u32, ty: u32) {
     let bits: u32 = fir.fty_bits(ty)
     if bits >= 64 || bits == 0 {
@@ -269,8 +269,8 @@ fn normalize(c: *mut Cg, r: u32, ty: u32) {
     }
     let sign: bool = ty == fir.T_I8 || ty == fir.T_I16 || ty == fir.T_I32
     if bits == 32 && !sign {
-        // `movzx r64, r/m32` gibt es nicht — ein `mov exx, exx` nullt die
-        // oberen 32 Bit von selbst.
+        // `movzx r64, r/m32` does not exist -- one `mov exx, exx` zeroes the
+        // upper 32 bit by itself.
         ins(c)
         var m: [u8; 4] = "mov "
         w(c, (&m[0]) as u64, 4)
@@ -296,7 +296,7 @@ fn normalize(c: *mut Cg, r: u32, ty: u32) {
     nl(c)
 }
 
-// Ein einfacher Befehl mit zwei Registeroperanden: `<op> <a>, <b>`
+// One simple instruction with two register operands: `<op> <a>, <b>`
 fn op2(c: *mut Cg, name: u64, n: usize, a: u32, b: u32) {
     ins(c)
     w(c, name, n)
@@ -324,7 +324,7 @@ fn raw(c: *mut Cg, p: u64, n: usize) {
     nl(c)
 }
 
-// ------------------------------------------------------------ Instruktionen
+// ------------------------------------------------------------- instructions
 
 fn is_sign(ty: u32) -> bool {
     return ty == fir.T_I8 || ty == fir.T_I16 || ty == fir.T_I32 || ty == fir.T_I64
@@ -357,8 +357,8 @@ fn store_xmm(c: *mut Cg, off: u64, n: u32) {
 
 fn emit_bin_f64(c: *mut Cg, op: u32, a: u32, b: u32, dst: u32) {
     if op > 3 {
-        // `%` und die Bitoperationen sind fuer f64 nicht definiert — der
-        // Typpruefer laesst sie gar nicht durch.
+        // `%` and the bit operations are undefined for f64 -- the
+        // type checker does not let them through at all.
         (*c).unsuitable = true
         return
     }
@@ -373,9 +373,9 @@ fn emit_bin_f64(c: *mut Cg, op: u32, a: u32, b: u32, dst: u32) {
     store_xmm(c, slot_of(c, dst), 0)
 }
 
-// Vergleich zweier `f64`. `comisd` setzt die Flaggen wie ein
-// UNSIGNED-Vergleich; NaN setzt zusaetzlich PF. Nach IEEE-754 ist jeder
-// Vergleich mit NaN falsch — ausser `!=`, das wahr sein muss.
+// Comparison of two `f64`. `comisd` sets the flags like one
+// UNSIGNED comparison; NaN sets PF on top. By IEEE-754 every
+// comparison with NaN is false -- except `!=`, which has to be true.
 fn emit_cmp_f64(c: *mut Cg, op: u32, a: u32, b: u32, dst: u32) {
     load_xmm(c, 0, a)
     load_xmm(c, 1, b)
@@ -389,8 +389,8 @@ fn emit_cmp_f64(c: *mut Cg, op: u32, a: u32, b: u32, dst: u32) {
     var al: [u8; 3] = " al"
     w(c, (&al[0]) as u64, 3)
     nl(c)
-    // NaN: PF ist gesetzt. Bei `==` muss das Ergebnis dann 0 sein, bei `!=`
-    // muss es 1 sein, bei den vier Ordnungsvergleichen 0.
+    // NaN: PF is set. For `==` the result then has to be 0, for `!=`
+    // it has to be 1, for the four ordering comparisons 0.
     if op == 1 {
         var sp: [u8; 7] = "setp cl"
         raw(c, (&sp[0]) as u64, 7)
@@ -427,7 +427,7 @@ fn emit_bin(c: *mut Cg, ty: u32, op: u32, a: u32, b: u32, dst: u32) {
         op2(c, (&n[0]) as u64, 4, R_AX, R_CX)
     }
     else if op == 3 || op == 4 {
-        // Division und Rest: `idiv`/`div` teilen rdx:rax.
+        // Division and remainder: `idiv`/`div` divide rdx:rax.
         if is_sign(ty) {
             var q: [u8; 3] = "cqo"
             raw(c, (&q[0]) as u64, 3)
@@ -485,7 +485,7 @@ fn emit_cmp(c: *mut Cg, ty: u32, op: u32, a: u32, b: u32, dst: u32) {
     ins(c)
     var set: [u8; 3] = "set"
     w(c, (&set[0]) as u64, 3)
-    // eq ne lt le gt ge — mit oder ohne Vorzeichen
+    // eq ne lt le gt ge -- with or without sign
     var vz: [u8; 14] = "e|ne|l|le|g|ge"
     var oz: [u8; 14] = "e|ne|b|be|a|ae"
     if is_sign(ty) {
@@ -517,7 +517,7 @@ fn emit_const(c: *mut Cg, ty: u32, raw_value: u64, dst: u32) {
     store_slot(c, slot_of(c, dst), R_AX)
 }
 
-// Zugriff auf den Speicher: `mov <reg>, <groesse> ptr [rax]` und umgekehrt.
+// Access to the memory: `mov <reg>, <size> ptr [rax]` and the other way round.
 fn emit_load(c: *mut Cg, ty: u32, addr: u32, dst: u32) {
     load_value(c, R_AX, addr)
     let bits: u32 = fir.fty_bits(ty)
@@ -534,7 +534,7 @@ fn emit_load(c: *mut Cg, ty: u32, addr: u32, dst: u32) {
             w(c, (&m3[0]) as u64, 6)
         }
         if bits == 32 && !is_sign(ty) {
-            // wieder der Sonderfall: `mov eax, dword ptr [rax]`
+            // the special case again: `mov eax, dword ptr [rax]`
             rt.buf_set_len(&(*c).out, rt.buf_len(&(*c).out) - 6)
             var m4: [u8; 4] = "mov "
             w(c, (&m4[0]) as u64, 4)
@@ -566,7 +566,7 @@ fn emit_store(c: *mut Cg, ty: u32, addr: u32, val: u32) {
     nl(c)
 }
 
-// ------------------------------------------------------- Rahmen und Bloecke
+// --------------------------------------------------------- frame and blocks
 
 fn round_up(v: u64, on: u64) -> u64 {
     let r: u64 = v % on
@@ -574,7 +574,7 @@ fn round_up(v: u64, on: u64) -> u64 {
     return v + on - r
 }
 
-// Legt fuer jeden Wert einen Platz an und danach die Bereiche der `alloca`s.
+// Creates one slot for every value and after those the ranges of the `alloca`s.
 fn frame_build(c: *mut Cg, fnr: u32) {
     let f: *mut fir.Fir = ff(c)
     let n: u32 = fir.value_count(f, fnr)
@@ -588,8 +588,8 @@ fn frame_build(c: *mut Cg, fnr: u32) {
         vec_push[u64](&(*c).aslot, 0)
         v = v + 1
     }
-    // Nur der Eintrittsblock enthaelt `alloca` — das ist eine Zusicherung der
-    // FIR und wird hier ausgenutzt.
+    // Only the entry block holds `alloca` -- that is one guarantee of the
+    // FIR and gets used here.
     let bb0: u32 = 0
     var k: u32 = 0
     while k < fir.inst_count(f, fnr, bb0) {
@@ -634,9 +634,9 @@ fn emit_cast(c: *mut Cg, of: u32, after: u32, src: u32, dst: u32) {
         return
     }
     if after == fir.T_F64 {
-        // Ganzzahl -> f64. `cvtsi2sd` rechnet VORZEICHENBEHAFTET; der Wert
-        // liegt im Rahmen bereits passend erweitert, also stimmt das auch
-        // fuer vorzeichenlose Typen bis 2^63.
+        // Integer -> f64. `cvtsi2sd` computes SIGNED; the value
+        // lies inside the frame suitably extended already, so that holds
+        // for unsigned types up to 2^63 too.
         load_value(c, R_AX, src)
         var cv: [u8; 18] = "cvtsi2sd xmm0, rax"
         raw(c, (&cv[0]) as u64, 18)
@@ -644,7 +644,7 @@ fn emit_cast(c: *mut Cg, of: u32, after: u32, src: u32, dst: u32) {
         return
     }
     if of == fir.T_F64 {
-        // f64 -> Ganzzahl, abschneidend Richtung null (wie in C).
+        // f64 -> integer, truncating toward zero (as with C).
         load_xmm(c, 0, src)
         var cv2: [u8; 19] = "cvttsd2si rax, xmm0"
         raw(c, (&cv2[0]) as u64, 19)
@@ -659,8 +659,8 @@ fn emit_cast(c: *mut Cg, of: u32, after: u32, src: u32, dst: u32) {
 
 fn emit_un(c: *mut Cg, ty: u32, op: u32, a: u32, dst: u32) {
     if ty == fir.T_F64 {
-        // Das Lowering erzeugt fuer `-x` bei f64 kein `neg` (es schreibt
-        // `0.0 - x`), aber falls doch: das Vorzeichenbit umlegen.
+        // For f64 the lowering produces no `neg` for `-x` (it writes
+        // `0.0 - x`), but should it do so: flip the sign bit.
         (*c).unsuitable = true
         return
     }
@@ -681,7 +681,7 @@ fn emit_un(c: *mut Cg, ty: u32, op: u32, a: u32, dst: u32) {
     store_slot(c, slot_of(c, dst), R_AX)
 }
 
-// Aufrufregister nach System V.
+// Call registers by System V.
 fn argreg(c: *mut Cg, k: u32) {
     var tab: [u8; 21] = "rdi|rsi|rdx|rcx|r8|r9"
     piece(c, (&tab[0]) as u64, 21, k)
@@ -690,7 +690,7 @@ fn argreg(c: *mut Cg, k: u32) {
 fn emit_call(c: *mut Cg, f: *mut fir.Fir, i: u32, fnr: u32) {
     let aoff: u32 = fir.i_aoff_of(f, i)
     let alen: u32 = fir.i_alen_of(f, i)
-    // Stapelargumente: rueckwaerts auflegen, davor bei Bedarf ein Fuellwort.
+    // Stack arguments: lay them out backwards, ahead of them one filler word when needed.
     var stack: u32 = 0
     if alen > 6 {
         stack = alen - 6
@@ -747,9 +747,9 @@ fn emit_call(c: *mut Cg, f: *mut fir.Fir, i: u32, fnr: u32) {
     }
 }
 
-// Dynamischer Versand (iface.rs, Runde 46): wie `emit_call`, nur steht das
-// Ziel in einem Wert statt in einem Symbol. Es wird ZULETZT nach `rax`
-// geladen — `rax` ist hier reines Arbeitsregister und kein Argumentregister.
+// Dynamic dispatch (iface.rs, round 46): like `emit_call`, only the
+// target sits inside a value instead of inside a symbol. It gets loaded LAST
+// into `rax` -- `rax` is pure scratch register here and no argument register.
 fn emit_calli(c: *mut Cg, f: *mut fir.Fir, i: u32, fnr: u32) {
     let aoff: u32 = fir.i_aoff_of(f, i)
     let alen: u32 = fir.i_alen_of(f, i)
@@ -807,7 +807,7 @@ fn emit_calli(c: *mut Cg, f: *mut fir.Fir, i: u32, fnr: u32) {
     }
 }
 
-// Adresse einer Methodentafel: `lea rax, [rip + .L__iface.<I>.<T>]`.
+// Address of one method table: `lea rax, [rip + .L__iface.<I>.<T>]`.
 fn emit_vtab(c: *mut Cg, iname: u32, tname: u32, dst: u32) {
     ins(c)
     var le: [u8; 20] = "lea rax, [rip + .L__"
@@ -825,9 +825,9 @@ fn emit_vtab(c: *mut Cg, iname: u32, tname: u32, dst: u32) {
     store_slot(c, slot_of(c, dst), R_AX)
 }
 
-// Die Methodentafeln (`.rodata`) — eine je vollstaendiger Umsetzung. Das
-// Format steht in iface.rs (`tafeln_asm`): Zeiger auf die Methoden, in der
-// Reihenfolge der Schnittstelle.
+// The method tables (`.rodata`) -- one per complete implementation. The
+// format stands inside iface.rs (`tables_asm`): pointers to the methods, by the
+// order of the interface.
 fn if_tables(c: *mut Cg) {
     let g: *mut iface.If = ifg(c)
     var da: bool = false
@@ -849,8 +849,8 @@ fn if_tables(c: *mut Cg) {
     nl(c)
     u = 0
     while u < iface.if_u_count(g) {
-        // Eine Tafel gibt es nur je STRUCT-Umsetzung. Fuer einen Grundtyp
-        // (Runde 50) gaebe es keinen `dyn`-Wert, der sie benutzen koennte.
+        // A table exists only per STRUCT implementation. For a base type
+        // (round 50) there would be no `dyn` value that could use it.
         if iface.if_u_ok(g, u) && iface.if_u_sidx(g, u) != NONE {
             let iname: u32 = iface.if_u_if(g, u)
             let pfx: u32 = iface.if_u_pre(g, u)
@@ -893,7 +893,7 @@ fn emit_syscall(c: *mut Cg, f: *mut fir.Fir, i: u32) {
         (*c).unsuitable = true
         return
     }
-    // rax = Nummer, danach rdi rsi rdx r10 r8 r9
+    // rax = number, after that rdi rsi rdx r10 r8 r9
     var tab: [u8; 25] = "rax|rdi|rsi|rdx|r10|r8|r9"
     var k: u32 = 0
     while k < alen {
@@ -917,10 +917,10 @@ fn emit_syscall(c: *mut Cg, f: *mut fir.Fir, i: u32) {
     }
 }
 
-// `Op::Select` (ct.rs, RUNDE 36): datenunabhaengige Auswahl als `cmov` —
-// KEIN Sprung (SPEC §9.2). Jeder Wert liegt als volle 64 Bit im Rahmen,
-// deshalb reicht die 64-Bit-Form fuer alle Breiten (es gibt ohnehin kein
-// 8-Bit-`cmov`).
+// `Op::Select` (ct.rs, ROUND 36): data independent choice as `cmov` --
+// NO branch (SPEC 9.2). Every value lies as full 64 bit inside the frame,
+// so the 64 bit form suffices for all widths (there is no
+// 8 bit `cmov` anyway).
 fn emit_select(c: *mut Cg, cond: u32, a: u32, bv: u32, dst: u32) {
     load_value(c, R_AX, bv)
     load_value(c, R_DX, a)
@@ -932,8 +932,8 @@ fn emit_select(c: *mut Cg, cond: u32, a: u32, bv: u32, dst: u32) {
     store_slot(c, slot_of(c, dst), R_AX)
 }
 
-// `Op::SecureZero` (ct.rs, RUNDE 36): nullt und gilt NIE als toter Code
-// (SPEC §9.3, C3) — `rep stosb`, wie in Stufe 0.
+// `Op::SecureZero` (ct.rs, ROUND 36): zeroes and NEVER counts as dead code
+// (SPEC 9.3, C3) -- `rep stosb`, as at stage 0.
 fn emit_seczero(c: *mut Cg, addr: u32, size: u32) {
     load_slot(c, 4, slot_of(c, addr))
     load_value(c, R_CX, size)
@@ -943,8 +943,8 @@ fn emit_seczero(c: *mut Cg, addr: u32, size: u32) {
     raw(c, (&r[0]) as u64, 9)
 }
 
-// `Op::AtomicAdd` (atomic.rs, RUNDE 47): EINE Instruktion mit `lock`-Praefix,
-// Ergebnis ist der ALTE Wert. Genau wie in Stufe 0 (regalloc.rs/codegen_x86.rs).
+// `Op::AtomicAdd` (atomic.rs, ROUND 47): ONE instruction with `lock` prefix,
+// the result is the OLD value. Exactly as at stage 0 (regalloc.rs/codegen_x86.rs).
 fn emit_atomadd(c: *mut Cg, addr: u32, val: u32, dst: u32) {
     load_value(c, R_CX, addr)
     load_value(c, R_AX, val)
@@ -953,12 +953,12 @@ fn emit_atomadd(c: *mut Cg, addr: u32, val: u32, dst: u32) {
     store_slot(c, slot_of(c, dst), R_AX)
 }
 
-// ---------------------------------------------- Inline-Assembler und MMIO
+// ----------------------------------------------- inline assembly and MMIO
 //
-// RUNDE 52 (compiler/src/core.rs, codegen_x86.rs). IMMER volatile: die
-// Zeilen stehen genau einmal und genau hier.
+// ROUND 52 (compiler/src/core.rs, codegen_x86.rs). ALWAYS volatile: the
+// lines stand exactly once and exactly here.
 
-// Eine internierte Zeichenkette in den Assemblertext schreiben.
+// Write one interned string into the assembly text.
 fn iname(c: *mut Cg, nr: u32) {
     rt.buf_push_bytes(&(*c).out, intern.intern_ptr(it(c), nr),
                       intern.intern_length(it(c), nr))
@@ -971,8 +971,8 @@ fn emit_asm(c: *mut Cg, f: *mut fir.Fir, i: u32, dst: u32) {
     let alen: u32 = fir.i_alen_of(f, i)
     var kom: [u8; 51] = "# asm (volatile): must be neither removed nor moved"
     raw(c, (&kom[0]) as u64, 51)
-    // Eingaben in ihre Register legen. Die schmalen Namen sind Sichten auf
-    // denselben 64-Bit-Stamm, deshalb geht immer das ganze Wort hinein.
+    // Put the inputs into their registers. The narrow names are views onto
+    // the same 64 bit stem, so the whole word always goes there.
     var k: u32 = 0
     while k < alen {
         let rn: u32 = fir.arg_at(f, aoff + k * 2)
@@ -989,7 +989,7 @@ fn emit_asm(c: *mut Cg, f: *mut fir.Fir, i: u32, dst: u32) {
         nl(c)
         k = k + 1
     }
-    // Die Vorlage zeilenweise, woertlich.
+    // The template line by line, word for word.
     let p: u64 = intern.intern_ptr(it(c), template)
     let n: usize = intern.intern_length(it(c), template)
     var start: usize = 0
@@ -1054,8 +1054,8 @@ fn emit_mmio_store(c: *mut Cg, ty: u32, addr: u32, val: u32) {
     nl(c)
 }
 
-// `Op::AtomicCas` (thread.rs, RUNDE 49): `lock cmpxchg [rcx], rdx` — eine
-// Instruktion. rax traegt den erwarteten Wert und danach den vorgefundenen.
+// `Op::AtomicCas` (thread.rs, ROUND 49): `lock cmpxchg [rcx], rdx` -- one
+// instruction. rax carries the expected value and afterwards the one found.
 fn emit_atomcas(c: *mut Cg, addr: u32, erw: u32, new: u32, dst: u32) {
     load_value(c, R_CX, addr)
     load_value(c, R_DX, new)
@@ -1065,22 +1065,22 @@ fn emit_atomcas(c: *mut Cg, addr: u32, erw: u32, new: u32, dst: u32) {
     store_slot(c, slot_of(c, dst), R_AX)
 }
 
-// `Op::ThreadSelf` (thread.rs, RUNDE 49): der eigene Fadenblock aus `fs:0`.
-// Vor `arch_prctl(ARCH_SET_FS)` ist das ein Zugriff auf Adresse 0 — die
-// Laufzeit setzt die Basis, bevor sie den Wert je liest (lib/gc/gc.fi).
+// `Op::ThreadSelf` (thread.rs, ROUND 49): the own thread block out of `fs:0`.
+// Before `arch_prctl(ARCH_SET_FS)` that is access to address 0 -- the
+// runtime sets the base before it ever reads the value (lib/gc/gc.fi).
 fn emit_tls(c: *mut Cg, dst: u32) {
     var x: [u8; 23] = "mov rax, qword ptr fs:0"
     raw(c, (&x[0]) as u64, 23)
     store_slot(c, slot_of(c, dst), R_AX)
 }
 
-// `Op::ThreadSpawn` (thread.rs, RUNDE 49): `clone(2)` mit Trampolin. Wort fuer
-// Wort dieselbe Folge wie in Stufe 0 (compiler/src/thread.rs::spawn_sequenz);
-// nur das Symbol des Einstiegs traegt das Praefix dieser Stufe.
+// `Op::ThreadSpawn` (thread.rs, ROUND 49): `clone(2)` with trampoline. Word for
+// word the same sequence as at stage 0 (compiler/src/thread.rs::spawn_sequence);
+// only the symbol of the entry carries the prefix of this stage.
 //
-// `1:` ist eine NUMERISCHE Marke des Assemblers — `jnz 1f` springt zur
-// naechsten `1:` nach vorn. Damit braucht die Folge keinen Zaehler und darf
-// beliebig oft im selben Modul stehen.
+// `1:` is a NUMERIC label of the assembler -- `jnz 1f` jumps to the
+// next `1:` ahead. That way the sequence needs no counter and may
+// stand as often as it likes inside the same module.
 fn emit_spawn(c: *mut Cg, arg: u32, stack: u32, ctid: u32, dst: u32) {
     load_value(c, 4, arg)
     load_value(c, 3, stack)
@@ -1136,14 +1136,14 @@ fn emit_copymem(c: *mut Cg, target: u32, source: u32, size: u64) {
     raw(c, (&r[0]) as u64, 9)
 }
 
-// ------------------------------------------------------------------- Lauf
+// ---------------------------------------------------------------- the run
 
-// `Op::GcAddr` — Adresse des Zustandsblocks des Sammlers in `rax`.
-// Mit regs=1 werden vorher die callee-saved Register in den Block gerettet
-// (Offset 3968, gc.rs REG_SAVE_OFF), sonst waere die Zusage "konservativer
-// Stapel- UND Registerscan" (SPEC 3.5.3) falsch. Diese Stufe hat keine
-// Registerzuteilung; die Rettung ist trotzdem dieselbe — sie kostet sechs
-// `mov` und haelt den Vertrag wortgleich.
+// `Op::GcAddr` -- address of the state block of the collector inside `rax`.
+// With regs=1 the callee-saved registers get saved into the block first
+// (offset 3968, gc.rs REG_SAVE_OFF), otherwise the promise "conservative
+// stack AND register scan" (SPEC 3.5.3) would be false. This stage has no
+// register allocation; the saving is the same nevertheless -- it costs six
+// `mov` and keeps the contract word for word.
 fn emit_gcaddr(c: *mut Cg, regs: u64, dst: u32) {
     ins(c)
     var m: [u8; 29] = "lea rax, [rip + .L__gc_state]"
@@ -1167,12 +1167,12 @@ fn emit_gcaddr(c: *mut Cg, regs: u64, dst: u32) {
     store_slot(c, slot_of(c, dst), R_AX)
 }
 
-// Die compilergenerierte Typtabelle des Sammlers (`.rodata`) und der
-// Zustandsblock (`.data`) — das Format steht in gc.rs (`typtabelle_asm`)
-// und ist verbindlich, weil die Laufzeit es liest:
-//   wort 0: n_typen;  eintrag(tid) = tabelle + 8 + (tid-1)*64
-//   +0 groesse · +8 basis-tid · +16 n stark · +24 offsetliste ·
-//   +32 n schwach · +40 offsetliste · +48 tid · +56 reserviert
+// The type table of the collector generated by the compiler (`.rodata`) and the
+// state block (`.data`) -- the format stands inside gc.rs (`ty_table_asm`)
+// and is binding, because the runtime reads it:
+//   word 0: n_types;  entry(tid) = table + 8 + (tid-1)*64
+//   +0 size | +8 base tid | +16 n strong | +24 offset list |
+//   +32 n weak | +40 offset list | +48 tid | +56 reserved
 fn gc_table(c: *mut Cg) {
     let g: *mut gc.Gc = gcg(c)
     var sec: [u8; 16] = ".section .rodata"
@@ -1268,7 +1268,7 @@ fn gc_table(c: *mut Cg) {
         nl(c)
         i = i + 1
     }
-    // Zustandsblock: beschreibbar, wort 0 zeigt auf die Typtabelle.
+    // State block: writable, word 0 points to the type table.
     var sd: [u8; 14] = ".section .data"
     t(c, (&sd[0]) as u64, 14)
     nl(c)
@@ -1425,11 +1425,11 @@ fn emit_term(c: *mut Cg, fnr: u32, bb: u32) {
         return
     }
     if kind == fir.TERM_SWITCH {
-        // VERGLEICHSKETTE, keine Sprungtabelle: `codegen_switch.rs` baut ab
-        // acht dichten Marken eine Tabelle in `.rodata`; beide Verfahren sind
-        // verhaltensgleich, und das Verhalten ist der Massstab dieser Stufe.
-        // Der Wert liegt normalisiert als volle 64 Bit im Rahmen — ein
-        // `cmp rax, <marke>` stimmt damit fuer jede Schluesselbreite.
+        // COMPARISON CHAIN, no jump table: `codegen_switch.rs` builds a table
+        // inside `.rodata` from eight dense marks onwards; both methods behave
+        // equally, and the behaviour is the yardstick of this stage.
+        // The value lies normalized as full 64 bit inside the frame -- one
+        // `cmp rax, <mark>` therefore holds for every key width.
         let val: u32 = fir.b_t1_of(f, fnr, bb)
         let def: u32 = fir.b_t2_of(f, fnr, bb)
         let off: u32 = fir.b_t3_of(f, fnr, bb)
@@ -1470,9 +1470,9 @@ fn emit_term(c: *mut Cg, fnr: u32, bb: u32) {
     }
     var lv: [u8; 5] = "leave"
     raw(c, (&lv[0]) as u64, 5)
-    // RUNDE 52: eine `#[interrupt]`-Funktion stellt erst alle Register her
-    // und schliesst mit `iretq` ab — nur diese Instruktion setzt rflags, cs
-    // und rsp des unterbrochenen Fadens zurueck.
+    // ROUND 52: one `#[interrupt]` function restores all registers first
+    // and closes with `iretq` -- only this instruction resets rflags, cs
+    // and rsp of the interrupted thread.
     if fir.f_int_of(f, fnr) == 1 {
         int_register(c, true)
         var iq: [u8; 5] = "iretq"
@@ -1483,9 +1483,9 @@ fn emit_term(c: *mut Cg, fnr: u32, bb: u32) {
     raw(c, (&rt2[0]) as u64, 3)
 }
 
-// RUNDE 52: die Register, die eine `#[interrupt]`-Funktion rettet — alle
-// Universalregister ausser `rsp` (der Prozessor) und `rbp` (der gewoehnliche
-// Prolog). `rueck = true` kehrt die Reihenfolge um und schreibt `pop`.
+// ROUND 52: the registers that one `#[interrupt]` function saves -- all
+// general purpose registers except `rsp` (the processor) and `rbp` (the ordinary
+// prologue). `back = true` reverses the order and writes `pop`.
 fn int_register(c: *mut Cg, back: bool) {
     var tab: [u8; 53] = "rax|rcx|rdx|rbx|rsi|rdi|r8|r9|r10|r11|r12|r13|r14|r15"
     var k: u32 = 0
@@ -1546,7 +1546,7 @@ fn cg_run(c: *mut Cg) {
             number(c, (*c).frame)
             nl(c)
         }
-        // Parameter aus den Argumentregistern in ihre Plaetze sichern.
+        // Save the parameters out of the argument registers into their slots.
         let plen: u32 = fir.f_plen_of(f, fi)
         var k: u32 = 0
         while k < plen {
@@ -1560,7 +1560,7 @@ fn cg_run(c: *mut Cg) {
                 argreg(c, k)
                 nl(c)
             } else {
-                // Vom Stapel des Aufrufers: [rbp+16], [rbp+24], …
+                // Out of the stack of the caller: [rbp+16], [rbp+24], ...
                 ins(c)
                 var m2: [u8; 24] = "mov rax, qword ptr [rbp+"
                 w(c, (&m2[0]) as u64, 24)
@@ -1591,13 +1591,13 @@ fn cg_run(c: *mut Cg) {
         }
         fi = fi + 1
     }
-    // HOOK gc: Typtabelle (.rodata) und Zustandsblock (.data) des Sammlers —
-    // nur, wenn das Programm ueberhaupt ein `gc class` enthaelt (gc.rs).
+    // HOOK gc: type table (.rodata) and state block (.data) of the collector --
+    // only when the program really holds one `gc class` (gc.rs).
     if has_gc(c) {
         gc_table(c)
     }
-    // HOOK iface: die Methodentafeln (.rodata) — nur, wenn das Programm
-    // ueberhaupt eine Schnittstelle umsetzt (iface.rs, Runde 46).
+    // HOOK iface: the method tables (.rodata) -- only when the program
+    // really implements one interface (iface.rs, round 46).
     if has_if(c) {
         if_tables(c)
     }
