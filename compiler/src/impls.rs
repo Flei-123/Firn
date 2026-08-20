@@ -3,33 +3,33 @@
 //!
 //! ## What happens here — and what explicitly does not
 //!
-//! A method is **no new kind of thing** within Firn. `impl` is a writing aid
+//! A method is **no new kind of thing** in Firn. `impl` is a writing aid
 //! with exactly two effects:
 //!
 //!  1. `impl T { fn m(*mut self, x: i32) … }` creates the ordinary function
-//!     `T__m(self: *mut T, x: i32)` — nothing more. It stands afterwards at
-//!     `Program::funcs` like every other and goes through the same type
+//!     `T__m(self: *mut T, x: i32)` — nothing more. Afterwards it stands in
+//!     `Program::funcs` like every other one and goes through the same type
 //!     check, the same lowering, the same code generator.
 //!  2. `x.m(a)` becomes the call of that function. Which function is meant
-//!     gets decided **by the static type of the receiver alone** — no vtable,
-//!     no dynamic dispatch, no lookup at runtime. Once the type is settled,
+//!     is decided **by the static type of the receiver alone** — no vtable,
+//!     no dynamic dispatch, no lookup at run time. Once the type is settled,
 //!     the jump instruction is settled.
 //!
-//! Up to the type check the call carries the label `"method m"`. The space
-//! makes it a label that can come about from no identifier of the source
-//! text — the same build as `"gc C"` at `gc.rs`. `sema.rs` resolves it,
+//! Up to the type check the call carries the name `"method m"`. The space
+//! makes it a name that can arise from no identifier of the source text —
+//! the same build as `"gc C"` in `gc.rs`. `sema.rs` resolves it, and
 //! `lower.rs` derives the very same resolution once more. Both compute from
-//! the same material (receiver type + method label); a side table between
+//! the same material (receiver type + method name); a side table between
 //! the phases deliberately does not exist, because it would have to be
-//! dragged along within `firnc1` without being able to do anything that the
+//! dragged along in `firnc1` without being able to do anything that the
 //! type does not say already.
 //!
 //! ## The receiver — why `*self` and not `&self`
 //!
 //! Firn has **no references**. It has pointers (`*T`, `*mut T`) and the
-//! address operator `&x`. A `&self` would be a new term that shows up
-//! nowhere within the rest of the language. That is why the receiver gets
-//! written the way a parameter gets written within Firn:
+//! address operator `&x`. A `&self` would be a new term that appears
+//! nowhere in the rest of the language. That is why the receiver is
+//! written the way a parameter is written in Firn:
 //!
 //! ```text
 //! impl Bytes {
@@ -42,28 +42,28 @@
 //! At the call site **one** adaptation happens, namely the one you would
 //! otherwise write by hand: if the method demands a pointer and the receiver
 //! is present as a value, the compiler takes its address (`&x`). If it is
-//! present as a pointer already, it gets passed through. More automatism
-//! does not exist: no automatic dereferencing, no chain of `*`, no detours
+//! already present as a pointer, it is passed through. There is no more
+//! automatism: no automatic dereferencing, no chain of `*`, no detours
 //! through fields. Whoever wants a copy writes `(*p).m()`.
 //!
-//! That `*self` and `*mut self` admit the **same** receiver at the type
+//! That `*self` and `*mut self` admit the **same** receiver in the type
 //! check is no sloppiness of this file but the rule of the language:
 //! `sema::compatible` compares pointers without the mutability (`*T` and
-//! `*mut T` are usable for each other). `*mut self` therefore says exactly
+//! `*mut T` can be used for each other). `*mut self` therefore says exactly
 //! what `*mut T` says as a parameter type today — intent, not constraint.
 //! Once that rule changes for parameters, it changes for the receiver
 //! along with it by itself.
 //!
-//! ## Label resolution (SPEC addendum §12.6)
+//! ## Name resolution (SPEC addendum §12.6)
 //!
-//! * Methods and free functions live within **one** namespace, yet under
-//!   different labels: the method `m` of `T` is called `T__m`. `m(x)`
+//! * Methods and free functions live in **one** namespace, but under
+//!   different names: the method `m` of `T` is called `T__m`. `m(x)`
 //!   therefore never finds a method, and `x.m()` never finds a free
 //!   function. Shadowing is thereby ruled out — there is nothing to shadow.
-//! * Within the module `str`, `T__m` becomes `str__T__m` while merging
+//! * In the module `str`, `T__m` becomes `str__T__m` while merging
 //!   (`modules.rs`), and the type `T` becomes `str__T`. The resolution
-//!   `struct label ++ "__" ++ method` still holds afterwards — it always
-//!   computes with the label that the type carries at that point.
+//!   `struct name ++ "__" ++ method` still holds afterwards — it always
+//!   computes with the name that the type carries at that point.
 //! * Generic types (`Vec[T]`) have no methods during this round; see
 //!   `docs/RUNDE45.md`, section "deliberately left out".
 
@@ -76,31 +76,31 @@ use std::collections::HashMap;
 use crate::sema::{Checker, FnSig, TypeInfo};
 use crate::types::{Type, TypeCtx};
 
-/// Prefix of the method call not yet resolved within the AST.
-/// The space makes it unreachable for the source text.
+/// Prefix of the method call not yet resolved in the AST.
+/// The space makes it unreachable from the source text.
 pub(crate) const P_CALL: &str = "method ";
-/// Separator within the label of the method function: `Type__method`.
+/// Separator in the name of the method function: `Type__method`.
 pub(crate) const SEP: &str = "__";
 
 /// Is this a method call that is not resolved yet? Yields the
-/// method label.
+/// method name.
 pub(crate) fn method_name(name: &str) -> Option<&str> {
     name.strip_prefix(P_CALL)
 }
 
-/// Label of the function behind `Type.method`.
+/// Name of the function behind `Type.method`.
 pub(crate) fn fn_name(ty: &str, method: &str) -> String {
     format!("{}{}{}", ty, SEP, method)
 }
 
 // ------------------------------------------------------------------- Parser
 
-/// `// HOOK impl` within `parser.rs::program` — `impl T { … }` and (round
+/// `// HOOK impl` in `parser.rs::program` — `impl T { … }` and (round
 /// 46) `impl Interface for T { … }`.
 ///
-/// `impl` is NO keyword (the tokenizer does not know it) but one identifier
-/// at a position where nothing else may stand — the same solution as
-/// `gc class` (gc.rs). That keeps `impl` valid as a variable label. `for`
+/// `impl` is NO keyword (the tokenizer does not know it) but an identifier
+/// in a position where nothing else may stand — the same solution as
+/// `gc class` (gc.rs). That keeps `impl` valid as a variable name. `for`
 /// on the other hand is a keyword already (the loop) and therefore
 /// unambiguous here.
 pub(crate) fn hook_item(p: &mut Parser, prog: &mut Program) -> bool {
@@ -150,7 +150,7 @@ fn impl_decl(p: &mut Parser, prog: &mut Program, is_for: bool) {
     };
     // HOOK iface: `impl Interface for T` (iface.rs, round 46). The block
     // creates THE SAME functions as `impl T` — the interface merely says
-    // additionally what MUST stand within it.
+    // in addition what MUST stand in it.
     let (ty, tsp) = if is_for {
         p.bump(); // 'for'
         match p.ident("after 'for' in 'impl … for …'") {
@@ -189,9 +189,9 @@ fn impl_decl(p: &mut Parser, prog: &mut Program, is_for: bool) {
             p.recovering = false;
             break;
         }
-        // One broken method aborts the WHOLE block. Otherwise the message
-        // proper gets followed by a cascade of consequential errors, and the
-        // first — the only one that explains something — drowns within it.
+        // One broken method aborts the WHOLE block. Otherwise the actual
+        // message is followed by a cascade of consequential errors, and the
+        // first one — the only one that explains anything — drowns in it.
         if !method(p, prog, &ty, tsp) {
             p.recovering = false;
             p.sync_item();
@@ -206,8 +206,8 @@ fn impl_decl(p: &mut Parser, prog: &mut Program, is_for: bool) {
     let _ = start;
 }
 
-/// One method: `fn label(<receiver>[, param…]) [-> T] { … }`.
-/// `false` = aborted, the surrounding `impl` block gets discarded.
+/// One method: `fn name(<receiver>[, param…]) [-> T] { … }`.
+/// `false` = aborted, the surrounding `impl` block is discarded.
 fn method(p: &mut Parser, prog: &mut Program, ty: &str, tsp: Span) -> bool {
     let start = p.bump(); // 'fn'
     let name = match p.ident("after 'fn' in an impl block") {
@@ -281,12 +281,12 @@ fn method(p: &mut Parser, prog: &mut Program, ty: &str, tsp: Span) -> bool {
 /// The receiver: `self`, `*self` or `*mut self`.
 ///
 /// FOR A `gc class` (round 46) the receiver carries the INTERNAL struct
-/// label `"gc K"`. That turns `*self` into exactly `Gc[K]` — a `gc class`
+/// name `"gc K"`. That turns `*self` into exactly `Gc[K]` — a `gc class`
 /// value exists on the heap only, a pointer to it is the only way to touch
-/// it (SPEC §3.5.1). Whether `K` is a class stands at the registry of
-/// `gc.rs`; it gets filled while parsing, which is why `gc class K` must
-/// stand BEFORE the `impl` block (docs/RUNDE46.md §9). The internal label
-/// does not get renamed by `modules.rs` — rightly so: class labels hold
+/// it (SPEC §3.5.1). Whether `K` is a class is recorded in the registry of
+/// `gc.rs`; it is filled while parsing, which is why `gc class K` has to
+/// stand BEFORE the `impl` block (docs/RUNDE46.md §9). The internal name
+/// is not renamed by `modules.rs` — rightly so: class names hold
 /// program wide.
 fn self_param(p: &mut Parser, ty: &str, tsp: Span) -> Option<Param> {
     let class = crate::gc::is_class(ty);
@@ -333,7 +333,7 @@ fn self_param(p: &mut Parser, ty: &str, tsp: Span) -> Option<Param> {
 }
 
 /// Consumes `*self` or `*mut self` and yields (mutable, position of
-/// `self`). If no `self` follows, nothing gets consumed.
+/// `self`). If no `self` follows, nothing is consumed.
 pub(crate) fn ptr_self(p: &mut Parser) -> Option<(bool, Span)> {
     let with_mut = matches!(p.toks.get(p.pos + 1).map(|t| &t.kind), Some(TokKind::KwMut));
     let idx = if with_mut { p.pos + 2 } else { p.pos + 1 };
@@ -347,19 +347,19 @@ pub(crate) fn ptr_self(p: &mut Parser) -> Option<(bool, Span)> {
     Some((with_mut, p.bump())) // 'self'
 }
 
-/// `// HOOK impl` within `parser.rs::postfix` — `x.m(args)`.
+/// `// HOOK impl` in `parser.rs::postfix` — `x.m(args)`.
 ///
-/// The field label is read already; if a bracket follows now, this is a
-/// method call and no field access. A qualified module access
-/// (`module.function(..)`) never arrives here: `Parser::qualify` turned
-/// that into ONE label at `primary` already.
+/// The field name has already been read; if a bracket follows now, this is
+/// a method call and not a field access. A qualified module access
+/// (`module.function(..)`) never arrives here: `Parser::qualify` already
+/// turned that into ONE name in `primary`.
 pub(crate) fn hook_method_call(
     p: &mut Parser,
     base: &Expr,
     name: &str,
     nsp: Span,
 ) -> Option<Expr> {
-    // The bracket must stand on the SAME line. Without that question
+    // The bracket has to stand on the SAME line. Without that question
     //     let g: usize = (*p).field
     //     (*p).field = 0
     // would be a method call `(*p).field((*p))` — the line break ends the
@@ -378,7 +378,7 @@ pub(crate) fn hook_method_call(
 
 // --------------------------------------------------------------- Type check
 
-/// Structure behind a receiver type: `(index, present as pointer already)`.
+/// Structure behind a receiver type: `(index, already present as a pointer)`.
 /// Only for the question "is that a `dyn I`?" — otherwise `receiver_prefix`.
 fn receiver_structure(tcx: &TypeCtx, t: &Type) -> Option<(usize, bool)> {
     match t {
@@ -391,13 +391,13 @@ fn receiver_structure(tcx: &TypeCtx, t: &Type) -> Option<(usize, bool)> {
     }
 }
 
-/// The label under which the methods of this receiver stand, and whether it
-/// is present as a pointer already: `(prefix, is_pointer)`.
+/// The name under which the methods of this receiver stand, and whether it
+/// is already present as a pointer: `(prefix, is_pointer)`.
 ///
 /// Since round 50 that includes a BASE TYPE as well (`impl Ord for i32`
-/// creates `i32__less`). One untyped integer literal explicitly does not
-/// belong to it: `1.m()` would have no settled type, and which `impl`
-/// block was meant nobody could say.
+/// creates `i32__less`). An untyped integer literal explicitly does not
+/// belong to it: `1.m()` would have no settled type, and nobody could say
+/// which `impl` block was meant.
 fn receiver_prefix(tcx: &TypeCtx, t: &Type) -> Option<(String, bool)> {
     fn name(tcx: &TypeCtx, t: &Type) -> Option<String> {
         match t {
@@ -421,8 +421,8 @@ pub(crate) fn dyn_interface(tcx: &TypeCtx, t: &Type) -> Option<String> {
     crate::iface::interface_of(name).map(|s| s.to_string())
 }
 
-/// Resolution: target function and whether the receiver gets passed as
-/// ADDRESS. ONE spot, three users — `sema::probe` (type hint),
+/// Resolution: target function and whether the receiver is passed as an
+/// ADDRESS. ONE place, three users — `sema::probe` (type hint),
 /// `sema::call` (check) and `lower::lower_call` (call) all compute with
 /// this, so that they cannot drift apart.
 pub(crate) fn target_of(
@@ -467,7 +467,7 @@ fn methods_of(ck: &Checker, prefix: &str) -> Vec<String> {
     out
 }
 
-/// `// HOOK impl` within `sema::Checker::call` — resolves `x.m(args)`.
+/// `// HOOK impl` in `sema::Checker::call` — resolves `x.m(args)`.
 pub(crate) fn hook_call(
     ck: &mut Checker,
     name: &str,
@@ -508,7 +508,7 @@ pub(crate) fn hook_call(
         }
     };
     // HOOK iface: `f.m(args)` on a `dyn I` — DYNAMIC DISPATCH. Which function
-    // runs is settled at runtime within the method table; checked it gets
+    // runs is settled at run time in the method table; the check is made
     // against the interface (iface.rs, round 46).
     if let Some((sidx, _)) = receiver_structure(&ck.tcx, &et) {
         let sname = ck.tcx.structs[sidx].name.clone();
