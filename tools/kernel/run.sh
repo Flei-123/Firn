@@ -505,6 +505,13 @@ if [ -f "$F" ]; then
     has "$F" "user: read here 222" "process B read back ITS value"
     sep=$(value "$F" 'separated=[0-9]+')
     num "the kernel confirms the separation" "$sep" eq 1
+    # The fork-like half of spawn: inheritance AND separation in one run.
+    has "$F" "user: parent wrote 12345" "the parent wrote a mark into its data page"
+    has "$F" "user: child inherited 12345" "the child inherited the CONTENTS of that page"
+    has "$F" "user: fork child exit=5" "the child confirmed the inherited value"
+    has "$F" "user: parent still has 12345" "the child's overwrite did not reach the parent"
+    kept=$(value "$F" 'proc: fork parent kept [0-9]+')
+    num "the kernel reads the parent's page unchanged as well" "$kept" eq 12345
 fi
 
 echo "== 13. counter-check for point 2: what is not mine gives a #PF =="
