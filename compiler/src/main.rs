@@ -19,6 +19,7 @@ mod ct;
 mod diag;
 mod dwarf;
 mod dwarf_info;
+mod lsp;
 mod errors;
 mod threading;
 mod fir;
@@ -113,6 +114,7 @@ fn usage() -> String {
          --emit=layout      memory layout and calling convention (canonical)\n  \
          --emit=types       AST with the type at every expression (canonical)\n  \
          --emit=ast         AST as debug text (troubleshooting)\n  \
+         --lsp              language server over standard input/output\n  \
          -c, --object       only assemble: ELF object file, no ld\n  \
          --profile=<name>   kernel | app (SPEC 2), forces the profile\n  \
          --no-opt           switch off the optimizer (= --opt-level=dev)\n  \
@@ -293,6 +295,12 @@ fn main() {
     if args.is_empty() {
         print!("{}", usage());
         std::process::exit(2);
+    }
+    // ROUND 64: the language server. It has no input file and no output
+    // file -- it speaks the Language Server Protocol over standard
+    // input/output and lives as long as the editor does.
+    if args.len() == 1 && args[0] == "--lsp" {
+        std::process::exit(lsp::serve());
     }
     let opts = match parse_args(&args) {
         Ok(o) => o,

@@ -283,6 +283,16 @@ impl Diags {
         out
     }
 
+    /// Round 64 -- the collected diagnostics as (position, text, suggestion)
+    /// for the language server. `render()` produces the form for the console;
+    /// an editor needs the parts.
+    pub fn items_for_lsp(&self) -> Vec<(Span, String, Option<String>)> {
+        self.items
+            .iter()
+            .map(|d| (d.span, d.msg.clone(), d.help.clone()))
+            .collect()
+    }
+
     /// Print to stderr.
     pub fn print(&self) {
         if self.has_errors() {
