@@ -608,6 +608,45 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Round 64 -- every name that could stand at the place of a VALUE:
+    /// variables in scope, constants and functions (functions are values
+    /// since round 58).
+    pub(crate) fn value_names(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for s in &self.scopes {
+            out.extend(s.keys().cloned());
+        }
+        out.extend(self.consts.keys().cloned());
+        out.extend(self.fns.keys().cloned());
+        out
+    }
+
+    /// Round 64 -- the suggestion for a misspelled value name.
+    pub(crate) fn value_hint(&self, name: &str) -> Option<String> {
+        let all = self.value_names();
+        crate::diag::nearest(name, all.iter().map(|s| s.as_str()))
+            .map(|n| crate::diag::did_you_mean(&n))
+    }
+
+    /// Round 64 -- the suggestion for a misspelled type or struct name.
+    pub(crate) fn type_hint(&self, name: &str) -> Option<String> {
+        let all: Vec<String> = self.tcx.structs.iter().map(|s| s.name.clone()).collect();
+        crate::diag::nearest(name, all.iter().map(|s| s.as_str()))
+            .map(|n| crate::diag::did_you_mean(&n))
+    }
+
+    /// Round 64 -- the suggestion for a misspelled field of struct `idx`.
+    pub(crate) fn field_hint(&self, idx: usize, name: &str) -> Option<String> {
+        let all: Vec<String> = self
+            .tcx
+            .structs
+            .get(idx)
+            .map(|s| s.fields.iter().map(|f| f.name.clone()).collect())
+            .unwrap_or_default();
+        crate::diag::nearest(name, all.iter().map(|s| s.as_str()))
+            .map(|n| crate::diag::did_you_mean(&n))
+    }
+
     pub(crate) fn lookup_var(&self, name: &str) -> Option<&VarInfo> {
         for s in self.scopes.iter().rev() {
             if let Some(v) = s.get(name) {
@@ -902,8 +941,9 @@ impl<'a> Checker<'a> {
                         )),
                     ))
                 } else {
+                    let hint = self.value_hint(name);
                     self.dg
-                        .error(e.span, format!("unknown name '{}'", name));
+                        .error_maybe_help(e.span, format!("unknown name '{}'", name), hint);
                     self.record(e.id, Type::Error);
                     Some((Type::Error, Mutability::Mutable))
                 }
@@ -976,8 +1016,12 @@ impl<'a> Checker<'a> {
                         .get(*i)
                         .map(|s| s.name.clone())
                         .unwrap_or_else(|| "<struct>".to_string());
-                    self.dg
-                        .error(nspan, format!("struct '{}' has no field '{}'", sname, name));
+                    let hint = self.field_hint(*i, name);
+                    self.dg.error_maybe_help(
+                        nspan,
+                        format!("struct '{}' has no field '{}'", sname, name),
+                        hint,
+                    );
                     Type::Error
                 }
             },
@@ -1117,8 +1161,9 @@ impl<'a> Checker<'a> {
                     // is read straight off the signature.
                     Type::Fn { params: sig.params, ret: Box::new(sig.ret) }
                 } else {
+                    let hint = self.value_hint(name);
                     self.dg
-                        .error(e.span, format!("unknown name '{}'", name));
+                        .error_maybe_help(e.span, format!("unknown name '{}'", name), hint);
                     Type::Error
                 }
             }
@@ -1596,8 +1641,9 @@ impl<'a> Checker<'a> {
                         format!("'{}' is not a function and cannot be called", name),
                     );
                 } else {
+                    let hint = self.value_hint(name);
                     self.dg
-                        .error(nspan, format!("unknown function '{}'", name));
+                        .error_maybe_help(nspan, format!("unknown function '{}'", name), hint);
                 }
                 return Type::Error;
             }
@@ -1655,8 +1701,9 @@ impl<'a> Checker<'a> {
                 for (_, e, _) in fields {
                     self.type_out_expr(e);
                 }
+                let hint = self.type_hint(name);
                 self.dg
-                    .error(nspan, format!("unknown struct type '{}'", name));
+                    .error_maybe_help(nspan, format!("unknown struct type '{}'", name), hint);
                 return Type::Error;
             }
         };
@@ -1695,9 +1742,11 @@ impl<'a> Checker<'a> {
                 }
                 None => {
                     self.type_out_expr(fexpr);
-                    self.dg.error(
+                    let hint = self.field_hint(idx, fname);
+                    self.dg.error_maybe_help(
                         *fspan,
                         format!("struct '{}' has no field '{}'", name, fname),
+                        hint,
                     );
                 }
             }
@@ -1860,7 +1909,12 @@ impl<'a> Checker<'a> {
                 None => match self.tcx.lookup(name) {
                     Some(i) => Type::Struct(i),
                     None => {
-                        self.dg.error(*span, format!("unknown type '{}'", name));
+                        let hint = self.type_hint(name);
+                        self.dg.error_maybe_help(
+                            *span,
+                            format!("unknown type '{}'", name),
+                            hint,
+                        );
                         Type::Error
                     }
                 },

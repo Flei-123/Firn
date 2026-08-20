@@ -265,7 +265,14 @@ impl<'a> Lexer<'a> {
     fn skip_trivia(&mut self) {
         loop {
             match self.peek() {
-                Some(c) if c.is_whitespace() => {
+                // ROUND 64: only ASCII blanks count, exactly as in
+                // `lib/firnc1/lexer.fi::is_empty`. `char::is_whitespace`
+                // additionally swallows U+00A0, U+2007, U+202F, U+3000 --
+                // then the two lexers disagreed, and a non-breaking blank
+                // pasted in from a document vanished without a trace. It is
+                // now what it really is: an unknown character, with a
+                // suggestion (`char_hint`).
+                Some(c) if is_ascii_blank(c) => {
                     self.bump();
                 }
                 Some('/') if self.peek2() == Some('/') => {
@@ -616,10 +623,11 @@ impl<'a> Lexer<'a> {
                 self.ident();
             } else if !self.punct() {
                 let (line, col) = (self.line, self.col);
-                self.dg.error(
-                    self.sp(line, col, 1),
-                    format!("unknown character '{}' in the source text", c),
-                );
+                let msg = format!("unknown character '{}' in the source text", c);
+                match char_hint(c) {
+                    Some(h) => self.dg.error_help(self.sp(line, col, 1), msg, h),
+                    None => self.dg.error(self.sp(line, col, 1), msg),
+                }
                 // Keep lexing: the offending character is skipped.
                 self.bump();
             }
@@ -722,5 +730,49 @@ mod tests {
     fn too_big_number() {
         let (_, n) = kinds("99999999999999999999999999");
         assert_eq!(n, 1);
+    }
+}
+
+// -------------------------------------------------- suggestions (round 64)
+//
+// "unknown character" was the message that helped the least: it named the
+// character and left the reader alone with it. Yet exactly these characters
+// come out of copying from a document or a web page -- typographic quotation
+// marks, an en dash instead of a minus, a non-breaking blank. The lexer knows
+// them and now says what to write instead.
+//
+// The twin in Firn is `lib/firnc1/lexer.fi::char_hint`; the texts have to be
+// identical octet for octet, and `tools/lex_compare.sh` compares the whole
+// error output of both lexers.
+/// The blanks of the language: ASCII, nothing else. The counterpart in Firn
+/// is `lib/firnc1/lexer.fi::is_empty`.
+pub fn is_ascii_blank(c: char) -> bool {
+    c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\u{000B}' || c == '\u{000C}'
+}
+
+pub fn char_hint(c: char) -> Option<String> {
+    match c {
+        // apostrophe and single typographic quotation marks
+        '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => Some(
+            "Firn has no character literals -- write a text literal with '\"'".to_string(),
+        ),
+        // double typographic quotation marks, guillemets, backtick
+        '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{00AB}' | '\u{00BB}' | '`' => {
+            Some("did you mean the quotation mark '\"'?".to_string())
+        }
+        // en dash, em dash, the real minus sign
+        '\u{2013}' | '\u{2014}' | '\u{2212}' => {
+            Some("did you mean the minus sign '-'?".to_string())
+        }
+        // blanks that do not look like blanks
+        '\u{00A0}' | '\u{2007}' | '\u{202F}' | '\u{3000}' => Some(format!(
+            "that is the blank U+{:04X}, not the blank U+0020",
+            c as u32
+        )),
+        '~' => Some("Firn has no '~' -- the bitwise complement is 'x ^ -1'".to_string()),
+        '@' => Some(
+            "Firn has no annotations with '@' -- an attribute is written '#[name]'".to_string(),
+        ),
+        _ => None,
     }
 }
