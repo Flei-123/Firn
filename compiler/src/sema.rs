@@ -1412,9 +1412,12 @@ impl<'a> Checker<'a> {
             let eq_only = matches!(op, BinOp::Eq | BinOp::Ne);
             // `f64` compares with all six operators. NaN follows IEEE-754
             // in doing so: every comparison except `!=` is false.
+            // ROUND 58: two function values compare like two pointers —
+            // `==` means "the same function record". Ordering does not
+            // exist for them; addresses have no meaningful order.
             let ok = lt.is_concrete_int()
                 || lt == Type::F64
-                || (eq_only && (lt == Type::Bool || lt.is_ptr()));
+                || (eq_only && (lt == Type::Bool || lt.is_ptr() || lt.is_fn()));
             if !ok {
                 self.dg.error(
                     e.span,
@@ -1773,6 +1776,13 @@ impl<'a> Checker<'a> {
                 _ => None,
             },
             ExprKind::Call(name, args, _) => {
+                // HOOK fnval: a call THROUGH a function value yields the
+                // result type of the signature. Without that a literal
+                // beside it would get no type — `f(1, 2) != 13`
+                // (fnval.rs, round 58).
+                if let Some(Type::Fn { ret, .. }) = self.lookup_var(name).map(|v| v.ty.clone()) {
+                    return Some(*ret);
+                }
                 // HOOK fehlerunionen: `try a`/`a catch b` yield the
                 // success type of the error union (errors.rs)
                 if crate::errors::is_result_call(name) {

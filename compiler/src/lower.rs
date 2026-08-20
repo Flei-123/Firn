@@ -1477,7 +1477,7 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
             }
         };
         for c in caps {
-            let a = lo.ptradd_const(env, c.off);
+            let a = lo.field_addr_at(env, c.off);
             lo.declare_ty(&c.name, a, c.ty.clone());
         }
     }
