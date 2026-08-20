@@ -124,6 +124,32 @@ pub enum ExprKind {
     ArrayLit(Vec<Expr>),
     /// Repeat literal `[value; N]`; `N` is a constant expression.
     ArrayRepeat(Box<Expr>, Box<Expr>),
+    /// **Round 58** — a closure literal (`fnval.rs`).
+    Lambda(Box<LambdaDecl>),
+}
+
+/// **Round 58** — an anonymous function in an expression.
+///
+/// ```text
+/// fn(a: i32) -> i32 { return a + 1 }        // captures nothing
+/// gc fn(a: i32) -> i32 { return a + n }     // captures 'n', on the GC heap
+/// ```
+///
+/// The `gc` in front is not decoration: a closure that captures values needs
+/// storage for them, and that storage is a GC object. Whoever writes it says
+/// so — and gets an `AllocError!fn(…)` in return, exactly as with
+/// `gc C{ … }`.
+#[derive(Clone, Debug)]
+pub struct LambdaDecl {
+    /// Serial number within one compilation; the generated function is
+    /// called `__closure#<id>`.
+    pub id: u32,
+    /// `true` for the form `gc fn(…)`: the record lies in the GC heap.
+    pub heap: bool,
+    pub params: Vec<Param>,
+    pub ret: Option<TypeExpr>,
+    pub body: Block,
+    pub span: Span,
 }
 
 #[derive(Clone, Debug)]

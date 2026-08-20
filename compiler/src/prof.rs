@@ -315,6 +315,16 @@ impl Guard<'_> {
     fn expr(&mut self, e: &Expr) {
         match &e.kind {
             ExprKind::Float(_) => self.fp(e.span, "a floating point literal"),
+            // Round 58: the body of a closure is checked like any other.
+            ExprKind::Lambda(d) => {
+                for p in &d.params {
+                    self.ty(&p.ty);
+                }
+                if let Some(t) = &d.ret {
+                    self.ty(t);
+                }
+                self.block(&d.body);
+            }
             ExprKind::Syscall(args) => {
                 self.dg.error_note(
                     e.span,
