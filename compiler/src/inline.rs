@@ -102,13 +102,13 @@ fn inlinable(callee: &Func) -> bool {
     // Loop free bodies WITHOUT a return value (effect through pointer
     // arguments, say the sink mutators of the tokenizer) may hold more
     // blocks: their control flow is a DAG, and because `dst` is empty, not
-    // even the result alloca comes about at the caller — the frame of the
+    // even the result alloca comes about in the caller — the frame of the
     // caller stays unchanged apart from real body allocas. That is the
     // difference to value bodies: their result cell moves into the entry
-    // block of the caller and changes its frame layout — fatal for the
-    // stack scanning conservative GC (`tests/520_gc_weak.fi`, round 37:
-    // `__gc_strong_raw` embedded into `create` -> phantom pointers, exit 6).
-    // eingebettet -> Phantom-Zeiger, Exit 6).
+    // block of the caller and changes its frame layout — which is fatal
+    // for the stack scanning conservative GC (`tests/520_gc_weak.fi`,
+    // round 37: `__gc_strong_raw` inlined into `create` produced phantom
+    // pointers and exit 6).
     !callee.constant_time
         && callee.secret.is_empty()
         && callee.inst_count() <= MAX_CALLEE_INSTS
