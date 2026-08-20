@@ -1,32 +1,32 @@
-# Debugger: `.debug_line` und eine echte `gdb`-Sitzung
+# Debugger: `.debug_line` and a real `gdb` session
 
-**Anforderung:** `W3` · `ABNAHME.md` Punkt 4 Kriterium B · `TODO-FIRN.md` 0.4
-**Stand:** Zeilennummern funktionieren, Variablen noch nicht (siehe „Grenzen").
+**Requirement:** `W3` · `ABNAHME.md` item 4 criterion B · `TODO-FIRN.md` 0.4
+**State:** line numbers work, variables do not yet (see „Limits").
 
-## Wie es erzeugt wird
+## How it is generated
 
-`compiler/src/dwarf.rs` sammelt beim Lowering die Zuordnung
-*Instruktion → Quellzeile*; `compiler/src/codegen_x86.rs` schreibt daraus
-`.file`- und `.loc`-Direktiven in den Assembler. `as` erzeugt daraus die
-Abschnitte `.debug_line`, `.debug_info`, `.debug_abbrev`, `.debug_aranges`,
-`.debug_str`. Es wird **kein** externes Werkzeug und **kein** C-Compiler
-benutzt — nur der Assembler, der ohnehin schon im Bauweg steht.
+`compiler/src/dwarf.rs` collects the mapping *instruction → source line*
+during lowering; `compiler/src/codegen_x86.rs` writes `.file` and `.loc`
+directives into the assembly from it. From those, `as` produces the
+sections `.debug_line`, `.debug_info`, `.debug_abbrev`, `.debug_aranges`,
+`.debug_str`. **No** external tool and **no** C compiler is used — only the
+assembler, which is in the build path anyway.
 
-Genauigkeit:
+Precision:
 
-| Bauart | Zeileninformation |
+| Build mode | Line information |
 |---|---|
-| `firnc --no-opt datei.fi` | **anweisungsgenau** — jede Anweisung hat ihre Quellzeile |
-| `firnc datei.fi` (mit Optimierer) | Zeile der `fn`-Deklaration je Funktion |
+| `firnc --no-opt datei.fi` | **statement-precise** — every statement has its source line |
+| `firnc datei.fi` (with the optimizer) | the line of the `fn` declaration per function |
 
-Der Grund für die Einschränkung steht in `SPEC.md` §14.1 Punkt 16: die FIR trägt
-keine Quellpositionen (`fir.rs` ist in dieser Runde eingefroren), und der
-Optimierer entfernt Instruktionen und nummeriert Blöcke neu. Eine falsche Zeile
-wäre schlimmer als keine.
+The reason for the restriction is in `SPEC.md` §14.1 item 16: the FIR
+carries no source positions (`fir.rs` is frozen in this round), and the
+optimizer removes instructions and renumbers blocks. A wrong line
+would be worse than none.
 
-## Nachweis: die Sitzung, wörtlich kopiert
+## Proof: the session, copied verbatim
 
-Programm `docs/gdb_beispiel.fi`:
+Program `docs/gdb_beispiel.fi`:
 
 ```firn
 // expect_exit: 55
@@ -44,7 +44,7 @@ fn main() -> i32 {
 }
 ```
 
-Befehle (im Projektverzeichnis, nach `cargo build --release`):
+Commands (in the project directory, after `cargo build --release`):
 
 ```console
 $ compiler/target/release/firnc --no-opt -o /tmp/gdbdemo docs/gdb_beispiel.fi
@@ -71,26 +71,26 @@ Line 5 of "docs/gdb_beispiel.fi" starts at address 0x400190 <summe+202> and ends
 [Inferior 1 (process 536651) exited with code 067]
 ```
 
-Was die Sitzung belegt:
+What the session establishes:
 
-* Ein Haltepunkt auf einen **Firn**-Funktionsnamen trifft und meldet
-  Datei + Zeile der `.fi`-Datei.
-* `gdb` zeigt den **Quelltext der `.fi`-Datei** an, nicht Assembler.
-* `next` läuft **zeilenweise** durch das Firn-Programm (2 → 3 → 4 → 5).
-* Der **Rückverfolgungsstapel** (`bt`) benennt den Aufrufer `main` mit der
-  richtigen Zeile 11.
-* Exit-Code `067` oktal = 55 dezimal — das erwartete Ergebnis von `summe(10)`.
+* A breakpoint on a **Firn** function name hits and reports the
+  file + line of the `.fi` file.
+* `gdb` shows the **source text of the `.fi` file**, not assembly.
+* `next` steps **line by line** through the Firn program (2 → 3 → 4 → 5).
+* The **backtrace** (`bt`) names the caller `main` with the
+  right line 11.
+* Exit code `067` octal = 55 decimal — the expected result of `summe(10)`.
 
-Reproduzieren: die drei Befehle oben eins zu eins ausführen. Die Adressen
-können sich mit dem Codegenerator ändern, Datei und Zeilen nicht.
+To reproduce: execute the three commands above one to one. The addresses
+may change with the code generator, the file and the lines may not.
 
-## Grenzen (ehrlich)
+## Limits (honestly)
 
-* **Keine Variablen.** `print s` funktioniert nicht: es gibt keine
-  `DW_TAG_variable`-Einträge und keine Typinformation im `.debug_info`.
-  Dafür müsste der Compiler das `.debug_info` selbst schreiben, statt es von
-  `as` erzeugen zu lassen.
-* **Keine Zeilen im optimierten Bau** außer der Funktionszeile.
-* `ABNAHME.md` Punkt 4 Kriterium B verlangt zusätzlich, dass **ein echter
-  Fehler** mit dem Debugger gefunden wurde. Das ist noch nicht der Fall und
-  bleibt dort als offen geführt.
+* **No variables.** `print s` does not work: there are no
+  `DW_TAG_variable` entries and no type information in the `.debug_info`.
+  For that the compiler would have to write the `.debug_info` itself
+  instead of having `as` generate it.
+* **No lines in the optimized build** apart from the function line.
+* `ABNAHME.md` item 4 criterion B additionally demands that **a real
+  bug** has been found with the debugger. That is not yet the case and
+  is still listed as open there.

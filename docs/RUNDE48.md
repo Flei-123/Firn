@@ -1,52 +1,54 @@
-# Runde 48 — Pakete, Projektmanifest, Sichtbarkeit auf Modulebene
+# Round 48 — packages, project manifest, visibility at module level
 
-**Stand vor dieser Runde:** es gab `import a.b`, `export { … }` je Datei und
-die Umgebungsvariable `FIRNLIB`. Mehr nicht — kein Projektmanifest, keine
-Abhängigkeiten, kein Bau-Werkzeug. `ABNAHME.md` Punkt 5 (`W1`,
-„Paketverwaltung baut reproduzierbar") stand deshalb auf `[~]`.
+**State before this round:** there was `import a.b`, `export { … }` per file
+and the environment variable `FIRNLIB`. Nothing more — no project manifest,
+no dependencies, no build tool. `ABNAHME.md` item 5 (`W1`,
+„package management builds reproducibly") therefore stood at `[~]`.
 
-**Was jetzt da ist:** ein Projektmanifest `firn.paket`, eine festgelegte und
-deterministische Modul-Suchreihenfolge mit Fehlermeldungen für Zyklen,
-fehlende Pakete und Namenskonflikte, Sichtbarkeit auf **Modulebene** als
-echte Paketschnittstelle, und der Bau-Treiber `--paket`. Alles in **beiden**
-Übersetzern — `firnc0` (Rust) und `firnc1` (Firn) — mit zeichengleichen
-Meldungen.
+**What is there now:** a project manifest `firn.paket`, a fixed and
+deterministic module search order with error messages for cycles,
+missing packages and name conflicts, visibility at **module level** as
+a real package interface, and the build driver `--paket`. All of it in
+**both** compilers — `firnc0` (Rust) and `firnc1` (Firn) — with
+character-identical messages.
 
 ---
 
-## 1. Warum kein TOML — die Formatentscheidung
+## 1. Why not TOML — the format decision
 
-Die Wahl stand zwischen `firn.toml` und einem eigenen Format. Entschieden
-wurde für ein eigenes, absichtlich winziges Zeilenformat namens
-**`firn.paket`**. Die Gründe, der Reihe nach:
+The choice was between `firn.toml` and a format of our own. The decision
+went to a format of our own, deliberately tiny, a line format called
+**`firn.paket`**. The reasons, in order:
 
-1. **Alles muss zweimal stehen.** Firn hostet sich selbst. Jede Zeile
-   Manifestlogik existiert in `compiler/src/package.rs` (Rust) *und* in
-   `lib/firnc1/package.fi` (Firn, **ohne libc**, nur Puffer und `syscall`).
-   Ein TOML-Leser wäre in Firn mehrere tausend Zeilen: maskierte und
-   mehrzeilige Zeichenketten, Reihungen, eingebettete Tabellen,
-   Datumswerte, Zahlensyntax mit Unterstrichen, Hex/Oktal/Binär.
-2. **Ein halbes TOML ist schlimmer als gar keins.** Eine Datei, die
-   `firn.toml` heißt, weckt die Erwartung, dass jedes gültige TOML gelesen
-   wird. Wird es nicht — dann lügt der Dateiname. Ein eigener Name mit
-   eigener Endung weckt diese Erwartung erst gar nicht.
-3. **Keine Fremdbibliotheken.** Das ist eine Grundentscheidung des Projekts
-   (`SPEC.md`); ein `toml`-Crate in `firnc0` hätte in `firnc1` kein
-   Gegenstück und die beiden Übersetzer sofort auseinanderlaufen lassen.
-4. **Das Format soll langweilig sein.** Ein Manifest wird gelesen, bevor
-   irgendetwas anderes passiert. Es darf keine überraschende Semantik haben.
+1. **Everything has to exist twice.** Firn hosts itself. Every line of
+   manifest logic exists in `compiler/src/package.rs` (Rust) *and* in
+   `lib/firnc1/package.fi` (Firn, **without libc**, only buffers and
+   `syscall`). A TOML reader would be several thousand lines in Firn:
+   escaped and multi-line strings, arrays, inline tables,
+   date values, number syntax with underscores, hex/octal/binary.
+2. **Half a TOML is worse than none.** A file that is called
+   `firn.toml` raises the expectation that every valid TOML is read.
+   It is not — and then the file name lies. A name of our own with
+   an extension of our own does not raise that expectation in the first
+   place.
+3. **No foreign libraries.** That is a basic decision of the project
+   (`SPEC.md`); a `toml` crate in `firnc0` would have had no
+   counterpart in `firnc1` and would have made the two compilers drift
+   apart immediately.
+4. **The format is supposed to be boring.** A manifest is read before
+   anything else happens. It must not have surprising semantics.
 
-Der Preis ist ehrlich zu nennen: **es gibt keine fertigen Werkzeuge** für
-`firn.paket` (kein Editor-Highlighting, keine Bibliothek in anderen
-Sprachen). Bei einem Format aus sechs Schlüsselwörtern, das mit `awk`
-lesbar ist, ist das vertretbar.
+The price has to be named honestly: **there are no ready-made tools** for
+`firn.paket` (no editor highlighting, no library in other
+languages). For a format of six keywords that is readable with `awk`,
+that is acceptable.
 
-## 2. Das Format
+## 2. The format
 
-Eine Anweisung je Zeile: `schluessel wert [wert …]`. Trennzeichen sind
-Leerzeichen und Tabulator, `#` leitet einen Kommentar bis zum Zeilenende
-ein, Leerzeilen zählen nicht. **Keine Anführungszeichen, keine
-Maskierungen** — ein Wert enthält deshalb weder Leerzeichen noch `#`.
+One statement per line: `schluessel wert [wert …]`. The separators are
+space and tab, `#` starts a comment up to the end of the line,
+and empty lines do not count. **No quotation marks, no
+escapes** — a value therefore contains neither spaces nor `#`.
 
 ```text
 paket        demo            # Pflicht, genau einmal
@@ -57,25 +59,25 @@ oeffentlich  geo punkt       # 0..n; ohne Angabe ist alles öffentlich
 brauche      geo ../geo      # 0..n; Name + lokaler Pfad
 ```
 
-Regeln, die wirklich geprüft werden:
+Rules that are really checked:
 
-| Angabe | Regel |
+| Entry | Rule |
 |---|---|
-| `paket` | Bezeichner: Buchstabe oder `_` zuerst, dann Buchstaben, Ziffern, `_` |
-| `version` | genau `zahl.zahl.zahl` |
-| `start`, `quelle` | relativ, ohne `..`, nicht leer (ein Paket bleibt in seinem Verzeichnis) |
-| `brauche` | Name wie `paket`; der Pfad **darf** hinausführen (`../geo`) |
-| doppelte Angaben | Fehler — auch doppelte `quelle`, doppelte `oeffentlich`-Namen, doppelte Abhängigkeitsnamen |
-| Abhängigkeit heißt wie das Paket selbst | Fehler |
-| unbekannter Schlüssel | **Fehler**, kein stilles Überlesen — ein vertipptes `oeffentlih` würde sonst eine Schnittstelle öffnen, die niemand öffnen wollte |
-| Name der Abhängigkeit ≠ `paket`-Zeile des Ziels | Fehler |
+| `paket` | identifier: letter or `_` first, then letters, digits, `_` |
+| `version` | exactly `zahl.zahl.zahl` |
+| `start`, `quelle` | relative, without `..`, not empty (a package stays in its directory) |
+| `brauche` | name like `paket`; the path **may** lead outside (`../geo`) |
+| duplicate entries | error — also duplicate `quelle`, duplicate `oeffentlich` names, duplicate dependency names |
+| dependency has the same name as the package itself | error |
+| unknown key | **error**, not silently skipped — a mistyped `oeffentlih` would otherwise open an interface nobody wanted to open |
+| name of the dependency ≠ `paket` line of the target | error |
 
-`start` ist **keine** Pflicht: ein Bibliothekspaket hat keinen
-Einstiegspunkt. Erst `--paket` verlangt einen.
+`start` is **not** mandatory: a library package has no
+entry point. Only `--paket` demands one.
 
-## 3. Suchreihenfolge
+## 3. Search order
 
-Für `import t1.t2…tn` in der Datei `F`, erster Treffer gewinnt:
+For `import t1.t2…tn` in the file `F`, first hit wins:
 
 ```
 1.  <verzeichnis von F>/t1/…/tn.fi          (wie bisher)
@@ -88,69 +90,71 @@ Für `import t1.t2…tn` in der Datei `F`, erster Treffer gewinnt:
 6.  <exe>/../lib/t1/…/tn.fi                  (wie bisher)
 ```
 
-Bei `import geo` (nur ein Teil) und `geo` als Abhängigkeit wird
-`<geo>/<quelle>/geo.fi` gesucht — das Modul mit dem Namen des Pakets ist
-sein Hauptmodul.
+With `import geo` (only one part) and `geo` as a dependency,
+`<geo>/<quelle>/geo.fi` is looked for — the module with the name of the
+package is its main module.
 
-**Zu welchem Paket eine Datei gehört**, entscheidet ihr Pfad: das Paket mit
-der längsten passenden Wurzel. Deshalb darf ein Paket im Verzeichnis eines
-anderen liegen. Dateien außerhalb aller Paketwurzeln (typisch: alles aus
-`$FIRNLIB`) gehören zu keinem Paket; für sie entfallen Schritt 3 und 4 und
-die Sichtbarkeitsprüfung.
+**Which package a file belongs to** is decided by its path: the package
+with the longest matching root. That is why a package may lie in the
+directory of another one. Files outside all package roots (typically:
+everything from `$FIRNLIB`) belong to no package; for them steps 3 and 4
+and the visibility check are skipped.
 
-**Das Manifest selbst** wird ohne `--paket` vom Verzeichnis der Quelldatei
-aus nach **oben** gesucht, höchstens 64 Ebenen. Wird keines gefunden, ist
-die „Paketwelt" leer, die Schritte 3 und 4 entfallen, und die Auflösung ist
-Zeichen für Zeichen die von Runde 47. **Ohne Manifest ändert sich nichts** —
-das ist der Grund, warum die 696 bestehenden Tests unverändert grün bleiben.
+**The manifest itself** is, without `--paket`, looked for **upwards** from
+the directory of the source file, at most 64 levels. If none is found, the
+„package world" is empty, steps 3 and 4 are skipped, and the resolution is
+character for character the one from round 47. **Without a manifest nothing
+changes** — that is the reason why the 696 existing tests stay green
+unchanged.
 
-Pfade werden **rein lexikalisch** normalisiert (`a/./b/../c` → `a/c`);
-symbolische Verweise werden nicht aufgelöst. Das muss so sein: `firnc1` hat
-kein `realpath`, und ohne diese Regel wäre `--paket-info` rechnerabhängig.
+Paths are normalized **purely lexically** (`a/./b/../c` → `a/c`);
+symbolic links are not resolved. That has to be so: `firnc1` has
+no `realpath`, and without this rule `--paket-info` would be
+machine-dependent.
 
-## 4. Sichtbarkeit auf Modulebene
+## 4. Visibility at module level
 
-`oeffentlich a b c` in `firn.paket` ist die **Schnittstelle des Pakets**.
-Führt ein Import in ein *anderes* Paket, gilt:
+`oeffentlich a b c` in `firn.paket` is the **interface of the package**.
+If an import leads into a *different* package, the following applies:
 
-* Das Zielpaket muss eine eingetragene Abhängigkeit sein
+* The target package must be a registered dependency
   (`paket 'x' ist keine abhaengigkeit von paket 'y'`).
-* Das Modul muss in dessen `oeffentlich`-Liste stehen
+* The module must stand in its `oeffentlich` list
   (`modul 'x' ist in paket 'p' nicht oeffentlich`).
 
-**Innerhalb** eines Pakets gibt es keine Schranke: `demos/packages/geo`
-benutzt sein privates Modul `innen` und darf das.
+**Inside** a package there is no barrier: `demos/packages/geo`
+uses its private module `innen` and is allowed to.
 
-**Fehlt `oeffentlich`, ist alles öffentlich.** Das ist bewusst dieselbe
-Regel wie bei `export { … }` innerhalb einer Datei („fehlt sie, ist alles
-sichtbar", `modules.rs`). Eine strengere Voreinstellung (ohne Liste ist
-nichts öffentlich) war in der Abwägung: sie fängt vergessene Schnittstellen,
-macht aber jedes unfertige Manifest zu einem unverständlichen Fehler und
-wäre gegenüber der bestehenden `export`-Regel inkonsistent. Wer eine echte
-Schnittstelle will, schreibt sie hin — `geo` tut es, `text` tut es nicht,
-beide Fälle stehen im Beispielprojekt.
+**If `oeffentlich` is missing, everything is public.** That is deliberately
+the same rule as with `export { … }` inside a file („if it is missing,
+everything is visible", `modules.rs`). A stricter default (without a list
+nothing is public) was under consideration: it catches forgotten
+interfaces, but it turns every unfinished manifest into an
+incomprehensible error and would be inconsistent with the existing
+`export` rule. Whoever wants a real interface writes it down — `geo` does
+it, `text` does not, and both cases are in the example project.
 
-Die beiden Ebenen greifen ineinander: `oeffentlich` sagt, **welche Module**
-ein Paket zeigt, `export { … }` sagt, **welche Namen** ein Modul zeigt.
+The two levels mesh: `oeffentlich` says **which modules**
+a package shows, `export { … }` says **which names** a module shows.
 
-## 5. Namenskonflikte
+## 5. Name conflicts
 
-Das Modulsystem benennt Namen aus Nicht-Wurzelmodulen intern in
-`modul__name` um; `modul` ist der Dateiname ohne Endung. Zwei
-**verschiedene** Dateien mit demselben Namen fielen damit auf dieselbe
-Umbenennung und hätten sich still überdeckt. Das ist jetzt ein Fehler:
+The module system internally renames names from non-root modules to
+`modul__name`; `modul` is the file name without the extension. Two
+**different** files with the same name therefore fell onto the same
+renaming and would have silently shadowed each other. That is now an error:
 
 ```
 error: namenskonflikt: modul 'hilfe' kommt aus zwei dateien
 hinweis: '/…/anwendung/src/help.fi' und '/…/geo/src/help.fi'
 ```
 
-Geprüft wird über die absoluten Pfade — zwei Schreibweisen derselben Datei
-sind kein Konflikt. Die Prüfung läuft **nur mit Manifest**; ohne Manifest
-bleibt es beim Verhalten von Runde 47 (sonst wäre die Änderung nicht
-rückwärtskompatibel).
+The check goes over the absolute paths — two spellings of the same file
+are not a conflict. The check runs **only with a manifest**; without a
+manifest the behavior of round 47 remains (otherwise the change would not
+be backwards compatible).
 
-## 6. Der Bau-Treiber
+## 6. The build driver
 
 ```
 firnc  --paket <verzeichnis> [-o ziel]     # Projekt übersetzen
@@ -159,9 +163,9 @@ firnc1 --paket <verzeichnis> [-o ziel]     # dasselbe, in Firn
 firnc1 --paket-info <verzeichnis>
 ```
 
-`--paket` liest `<verzeichnis>/firn.paket`, lädt alle Abhängigkeiten,
-prüft den Graphen auf Zyklen und übersetzt `start`. Ohne `-o` heißt das
-Ergebnis wie das Paket:
+`--paket` reads `<verzeichnis>/firn.paket`, loads all dependencies,
+checks the graph for cycles and compiles `start`. Without `-o` the
+result is named like the package:
 
 ```
 $ firnc --paket demos/packages/app
@@ -169,10 +173,10 @@ $ ./demos/packages/app/anwendung
 12 14 3
 ```
 
-`--paket-info` gibt einen maschinenlesbaren Bericht aus, rein lexikalisch
-aus dem übergebenen Verzeichnis gerechnet (kein `getcwd`, keine
-symbolischen Verweise) — deshalb ist er auf beiden Übersetzern und auf
-jedem Rechner derselbe:
+`--paket-info` prints a machine-readable report, computed purely
+lexically from the given directory (no `getcwd`, no
+symbolic links) — that is why it is the same on both compilers and on
+every machine:
 
 ```
 $ firnc --paket-info demos/packages/app
@@ -185,15 +189,15 @@ brauche geo demos/packages/geo
 brauche text demos/packages/text
 ```
 
-**Inkrementell ist es nicht.** Der Treiber übersetzt immer alles. Das war
-die bewusste Wahl aus dem Rundenziel („korrekt schlägt schnell"): ein
-falscher Frische-Vergleich baut still den Stand von gestern, und genau
-diese Falle hat dieses Projekt in den Runden 35, 45 und 46 schon dreimal
-getroffen.
+**It is not incremental.** The driver always compiles everything. That was
+the deliberate choice from the round goal („correct beats fast"): a
+wrong freshness comparison silently builds yesterday's state, and exactly
+this trap has hit this project three times already, in rounds 35, 45 and
+46.
 
-## 7. Das Beispielprojekt
+## 7. The example project
 
-`demos/packages/` — ein Programm und zwei Bibliotheken:
+`demos/packages/` — one program and two libraries:
 
 ```
 anwendung/   firn.paket   brauche geo, brauche text; quelle src
@@ -207,77 +211,80 @@ text/        firn.paket   ohne 'oeffentlich' → alles öffentlich
              src/text.fi
 ```
 
-## 8. Was geprüft wird
+## 8. What is checked
 
-`tools/packages/run.sh` (neu, in `test.sh` als Schritt 18): **21 Fälle**,
-jeder durch **beide** Übersetzer, Fehlermeldungen Oktett für Oktett
-verglichen. Positiv: Bau des Beispielprojekts (firnc0 und firnc1), Ausgabe
-`12 14 3`, Benennung nach dem Manifest, `--paket-info`-Gleichheit, privates
-Modul im eigenen Paket, Vorrang der Projektquelle, Manifestsuche nach oben,
-zweites `quelle`-Verzeichnis, Regression ohne Manifest. Negativ: privates
-Modul einer Abhängigkeit, Paket ohne `brauche`, Paketzyklus, Abhängigkeit
-ohne Manifest, falscher Paketname, ungültige Version, unbekannter
-Schlüssel, fehlende `paket`-Zeile, Namenskonflikt, Bibliothek ohne `start`,
-Verzeichnis ohne Manifest, `--paket` zusammen mit einer Quelldatei.
+`tools/packages/run.sh` (new, in `test.sh` as step 18): **21 cases**,
+each through **both** compilers, error messages compared octet by
+octet. Positive: build of the example project (firnc0 and firnc1), output
+`12 14 3`, naming after the manifest, `--paket-info` equality, private
+module in the own package, precedence of the project source, manifest
+search upwards, second `quelle` directory, regression without a manifest.
+Negative: private module of a dependency, package without `brauche`,
+package cycle, dependency without a manifest, wrong package name, invalid
+version, unknown key, missing `paket` line, name conflict, library without
+`start`, directory without a manifest, `--paket` together with a source
+file.
 
-Dazu **13 neue Rust-Modultests** in `compiler/src/package.rs` (11) und
-`compiler/src/package_world.rs` (2): Format, Pflichtangaben, doppelte Einträge,
-Stelligkeit, Pfadrechnen, Paketzugehörigkeit, `--paket-info`-Text und die
-festen Fehlertexte.
+Plus **13 new Rust module tests** in `compiler/src/package.rs` (11) and
+`compiler/src/package_world.rs` (2): format, mandatory entries, duplicate
+entries, arity, path arithmetic, package membership, `--paket-info` text
+and the fixed error texts.
 
-## 9. Migrationshinweise
+## 9. Migration notes
 
-* **Bestehende Projekte müssen nichts tun.** Ohne `firn.paket` ist alles
-  wie vorher; `FIRNLIB` gilt unverändert und wird weiterhin als Schritt 5
-  durchsucht. `test.sh`, `tools/self_compare.sh` und
-  `tools/fixpoint.sh` setzen `FIRNLIB` selbst und laufen unverändert.
-* **Ein Projekt umstellen:** `firn.paket` ins Wurzelverzeichnis legen
-  (`paket`, `version`, `start`, `quelle`), Abhängigkeiten mit `brauche`
-  eintragen, und in jeder Bibliothek `oeffentlich` schreiben. Danach baut
-  `firnc --paket <verzeichnis>`.
-* **Achtung beim Umstellen:** sobald ein Manifest existiert, greifen auch
-  die Namenskonflikt- und Sichtbarkeitsprüfungen. Zwei gleichnamige Module
-  in einer Übersetzung sind dann ein Fehler statt einer stillen
-  Überdeckung — das ist der Zweck, kann aber beim ersten Lauf auffallen.
-* **Kein Manifest im Wurzelverzeichnis dieses Repos.** Das ist Absicht: es
-  würde die Auflösung aller Testprogramme im Repo verändern. Das Beispielprojekt
-  liegt deshalb unter `demos/packages/`.
+* **Existing projects have to do nothing.** Without `firn.paket`
+  everything is as before; `FIRNLIB` applies unchanged and is still
+  searched as step 5. `test.sh`, `tools/self_compare.sh` and
+  `tools/fixpoint.sh` set `FIRNLIB` themselves and run unchanged.
+* **Converting a project:** put `firn.paket` into the root directory
+  (`paket`, `version`, `start`, `quelle`), register dependencies with
+  `brauche`, and write `oeffentlich` in every library. After that
+  `firnc --paket <verzeichnis>` builds.
+* **Careful when converting:** as soon as a manifest exists, the name
+  conflict and visibility checks take effect as well. Two modules of the
+  same name in one compilation are then an error instead of a silent
+  shadowing — that is the purpose, but it may come to light on the first
+  run.
+* **No manifest in the root directory of this repo.** That is intentional:
+  it would change the resolution of all test programs in the repo. The
+  example project therefore lies under `demos/packages/`.
 
-## 10. Offen (ehrlich)
+## 10. Open (honestly)
 
-* **Kein Netzwerk, keine Registry, keine Sperrdatei.** `brauche` kennt nur
-  lokale Pfade. Reproduzierbarkeit über zwei Rechner (`ABNAHME.md` Punkt 5)
-  ist damit **noch nicht** erfüllt; es fehlen Prüfsummen und eine
-  `firn.sperre`.
-* **Kein `firn build --locked`, keine Versionsauflösung.** `version` wird
-  geprüft, aber nicht *verglichen* — zwei Pakete können nicht verschiedene
-  Fassungen derselben Abhängigkeit verlangen.
-* **Nicht inkrementell** (siehe 6). Es gibt weiterhin keine getrennten
-  Objektdateien und keine Schnittstellendateien; übersetzt wird das
-  Gesamtprogramm.
-* **Symbolische Verweise** werden bei der Paketzugehörigkeit nicht
-  aufgelöst. Ein Paket, das über einen Symlink erreicht wird, gilt als an
-  der Symlink-Stelle liegend.
-* **Fehler im Manifest zeigen keine Quelltextzeile** mit Markierung,
-  sondern `datei:zeile: meldung`. Der Grund ist Gleichheit: `firnc1` hat
-  die Diagnose-Maschinerie von `firnc0` nicht, und für die neuen Meldungen
-  war Zeichengleichheit wichtiger als der Ausschnitt.
-* **Die Sichtbarkeitsprüfung greift erst mit Manifest.** Wer ohne Manifest
-  baut, hat keine Paketgrenzen — dann gibt es auch keine zu verletzen.
+* **No network, no registry, no lock file.** `brauche` knows only
+  local paths. Reproducibility across two machines (`ABNAHME.md` item 5)
+  is therefore **not yet** fulfilled; checksums and a
+  `firn.sperre` are missing.
+* **No `firn build --locked`, no version resolution.** `version` is
+  checked but not *compared* — two packages cannot demand different
+  versions of the same dependency.
+* **Not incremental** (see 6). There are still no separate
+  object files and no interface files; what is compiled is the
+  whole program.
+* **Symbolic links** are not resolved for package membership.
+  A package reached through a symlink counts as lying at
+  the symlink's place.
+* **Errors in the manifest show no source line** with a marker,
+  but `datei:zeile: meldung`. The reason is equality: `firnc1` does not
+  have the diagnostic machinery of `firnc0`, and for the new messages
+  character equality was more important than the excerpt.
+* **The visibility check only takes effect with a manifest.** Whoever
+  builds without a manifest has no package boundaries — then there are
+  none to violate either.
 
-## 11. Abnahme (gemessen, 19.08.2026, Branch `r48-pakete`)
+## 11. Acceptance (measured, 19.08.2026, branch `r48-pakete`)
 
-Gemessen wurde nach `rm -f .firnc1 .firnc2 .firnc3` — kein Binary aus einem
-früheren Lauf war beteiligt.
+Measurement was done after `rm -f .firnc1 .firnc2 .firnc3` — no binary from
+an earlier run was involved.
 
-| Prüfung | Ergebnis |
+| Check | Result |
 |---|---|
-| `bash ./test.sh` | **PASS 697/697**, Exit 0 (Basis 696/696; +1 = Schritt 18) |
-| ⤷ Schritt 18 `tools/packages/run.sh` | **21 bestanden, 0 fehlgeschlagen** |
-| `bash tools/self_compare.sh` | **201 gleiches Verhalten · 0 abweichend · 0 fehlerhaft**, Exit 0 |
-| `bash tools/fixpoint.sh` | **Stufe 2 == Stufe 3, zeichengleich**, 2.070.856 Oktette, 364.765 Zeilen Assembler; Korpus: `.firnc2` verhält sich wie `firnc0`, Exit 0 |
+| `bash ./test.sh` | **PASS 697/697**, exit 0 (base 696/696; +1 = step 18) |
+| ⤷ step 18 `tools/packages/run.sh` | **21 passed, 0 failed** |
+| `bash tools/self_compare.sh` | **201 identical behavior · 0 differing · 0 failing**, exit 0 |
+| `bash tools/fixpoint.sh` | **stage 2 == stage 3, character-identical**, 2.070.856 octets, 364.765 lines of assembly; corpus: `.firnc2` behaves like `firnc0`, exit 0 |
 
-Zum Vergleich der Ausgangsstand von Commit `a492d26`: `test.sh` 696/696,
-`self_compare.sh` 201/0/0, `fixpunkt.sh` zeichengleich bei 2.065.816
-Oktetten. Der Zuwachs von 5.040 Oktetten im selbst übersetzten Compiler ist
-`lib/firnc1/package.fi` plus die Änderungen in `bin/firnc1.fi`.
+For comparison the starting state of commit `a492d26`: `test.sh` 696/696,
+`self_compare.sh` 201/0/0, `fixpunkt.sh` character-identical at 2.065.816
+octets. The increase of 5.040 octets in the self-compiled compiler is
+`lib/firnc1/package.fi` plus the changes in `bin/firnc1.fi`.

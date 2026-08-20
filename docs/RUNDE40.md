@@ -1,189 +1,198 @@
-# Runde 40 — Regalloc-Angriff auf realweb, GC-Dauerlauf ehrlich gemacht
+# Round 40 — regalloc attack on realweb, GC endurance run made honest
 
-Basis: Merge-Commit `415e8b4` (Runden 37+38+39). Revier: `compiler/src/regalloc.rs`
-und `tools/gc_meas/`. Zwei getrennte Stränge, beide in dieser Datei.
+Base: merge commit `415e8b4` (rounds 37+38+39). Territory:
+`compiler/src/regalloc.rs` and `tools/gc_meas/`. Two separate tracks, both
+in this file.
 
-## Strang A — Registerzuteilung
+## Track A — register allocation
 
-Ausgangslage nach Runde 37: html5lib 1,69×, realweb 4,34× gegenüber html5ever.
-Dokumentierter Hebel: 7 391 reg→reg-`mov`s und 445 Store/Reload-Paare im
-heißen Pfad von `dekodiere`/`tokenize`.
+Starting point after round 37: html5lib 1,69×, realweb 4,34× against
+html5ever. Documented lever: 7 391 reg→reg `mov`s and 445 store/reload
+pairs in the hot path of `dekodiere`/`tokenize`.
 
-### A1 — Register-Deskriptor streicht Store→Reload (Commit `07dab2d`)
+### A1 — register descriptor deletes store→reload (commit `07dab2d`)
 
-Peephole auf Wert-Slots im Emissionspfad: ein Reload direkt nach dem Store
-desselben Slots liest stattdessen das Register weiter. Wirkung:
+Peephole on value slots in the emission path: a reload directly after the
+store of the same slot reads the register on instead. Effect:
 realweb 4,38× → 4,23×, html5lib 1,73× → 1,70×.
 
-### A2 — Zellen-Alias für Loads (Commit `f6895ea`)
+### A2 — cell alias for loads (commit `f6895ea`)
 
-`d = load c`, wobei die Zelle `c` in einem Register liegt und alle
-Verwendungen von `d` im selben Block vor dem nächsten Schreiben der Zelle
-stehen: `d` bekommt keinen eigenen Ort, die Verwendungen lesen direkt das
-Zellenregister (`Alloc::ort()`), der Load entfällt. Das streicht die drei
-`mov`-Kopien je Schleifendurchlauf im heißesten Loop von `dekodiere`
-(33,5 Mio. Iterationen im realweb-Lauf).
+`d = load c`, where the cell `c` lies in a register and all
+uses of `d` are in the same block before the next write of the cell:
+`d` gets no place of its own, the uses read the cell register directly
+(`Alloc::ort()`), the load is dropped. That deletes the three
+`mov` copies per loop iteration in the hottest loop of `dekodiere`
+(33,5 million iterations in the realweb run).
 
-**Falle, die drei Tests umgeworfen hat** (211_generic_struct, 430_ct_select,
-416_fehler_ausgabe): Bei 8/16/32-Bit-Loads holt der Load die relevanten Bits
-per `movzx`/32-Bit-`mov` heraus; das Zellenregister enthält oben noch Reste.
-Der Alias ist deshalb **nur für volle 64 Bit** zulässig.
+**The trap that knocked over three tests** (211_generic_struct,
+430_ct_select, 416_fehler_ausgabe): with 8/16/32 bit loads the load
+extracts the relevant bits via `movzx`/32 bit `mov`; the cell register
+still contains leftovers in the upper part. The alias is therefore
+**only permitted for full 64 bits**.
 
-**Messung — deterministisch statt Wanduhr.** Die Wanduhr-Messung
-(`durchsatz.sh`) schwankt um ±30 % und zeigte den Gewinn nicht (mit Alias
-10,47 MB/s, ohne 10,72 MB/s — reines Rauschen). Belastbar ist die
-Instruktionszählung mit callgrind auf demselben realweb-Korpus:
+**Measurement — deterministic instead of wall clock.** The wall clock
+measurement (`durchsatz.sh`) fluctuates by ±30 % and did not show the gain
+(with alias 10,47 MB/s, without 10,72 MB/s — pure noise). What is
+dependable is the instruction count with callgrind on the same realweb
+corpus:
 
-| Stand | I refs (realweb) |
+| State | I refs (realweb) |
 |---|---|
-| ohne Alias (`FIRN_NO_ALIAS=1`) | 2 334 236 911 |
-| mit Alias | 2 136 489 667 |
+| without alias (`FIRN_NO_ALIAS=1`) | 2 334 236 911 |
+| with alias | 2 136 489 667 |
 | | **−8,47 %** |
 
-Lehre für kommende Runden: Optimierungen **immer** mit callgrind belegen,
-`durchsatz.sh` nur zur Kontrolle der Größenordnung.
+Lesson for coming rounds: **always** back optimizations with callgrind, and
+use `durchsatz.sh` only to check the order of magnitude.
 
-Verifikation A2: `test.sh` 649/649, `selbst_vergleich` 188/0/0,
-Fixpunkt 289 096 Zeilen zeichengleich.
+Verification A2: `test.sh` 649/649, `selbst_vergleich` 188/0/0,
+fixpoint 289 096 lines character-identical.
 
-## Strang B — der GC-Dauerlauf maß den falschen Pfad
+## Track B — the GC endurance run measured the wrong path
 
-Der 30-Minuten-Dauerlauf aus Runde 38 (`tools/gc_meas/pause.fi`) lief sauber
-durch, aber die ehrliche Auswertung zeigt:
+The 30-minute endurance run from round 38 (`tools/gc_meas/pause.fi`) ran
+through cleanly, but the honest evaluation shows:
 
-- 30,0 min, 1 394 549 Sammelläufe, 2 948 276 000 Zyklen, 0 übersehene
-  Mehrfach-Sammlungen
-- RSS: Start 0,82 MiB, Maximum 1,33 MiB, Ende 0,83 MiB — **kein Drift**
-  (erstes Zehntel 1,16 MiB, letztes Zehntel 1,16 MiB): kein Leck, keine
-  Fragmentierung über die Zeit
-- mittlere Pause 127 µs, längste Pause 3,853 ms
-- Zeit in Pausen: 177,3 s von 1800 s = **9,85 %**
+- 30,0 min, 1 394 549 collections, 2 948 276 000 cycles, 0 missed
+  multiple collections
+- RSS: start 0,82 MiB, maximum 1,33 MiB, end 0,83 MiB — **no drift**
+  (first tenth 1,16 MiB, last tenth 1,16 MiB): no leak, no
+  fragmentation over time
+- mean pause 127 µs, longest pause 3,853 ms
+- time in pauses: 177,3 s of 1800 s = **9,85 %**
 
-**Aber:** `heap_bytes` blieb die ganze Zeit bei 786 432 Bytes. Der
-inkrementelle Zyklus schaltet erst ab `INKR_AB = 8 MiB` (`lib/gc/gc.fi:109`)
-ein — er wurde in diesem Lauf also **kein einziges Mal benutzt**. Der Lauf
-belegt die Stabilität des nicht-inkrementellen Pfades, über die in Runde 38
-beworbenen „~0,5 ms, heap-unabhängig" sagt er nichts.
+**But:** `heap_bytes` stayed at 786 432 bytes the whole time. The
+incremental cycle only switches on from `INKR_AB = 8 MiB` (`lib/gc/gc.fi:109`)
+— so it was **not used a single time** in this run. The run proves the
+stability of the non-incremental path; about the „~0,5 ms, heap-independent"
+advertised in round 38 it says nothing.
 
-### B1 — neuer Lauf mit großer lebender Menge (`tools/gc_meas/pause_big.fi`)
+### B1 — new run with a large live set (`tools/gc_meas/pause_big.fi`)
 
-Hält absichtlich viel am Leben: eine Wurzel mit `KINDER` (Standard 120 000)
-Textknoten als Geschwisterkette, gehalten an einer Rahmenzelle von `main`,
-am Ende per `dom_kinder_zaehlen` nachweislich noch erreichbar. Parallel läuft
-derselbe Müllstrom wie in `pause.fi`. Damit steht der Heap dauerhaft bei
-13 MiB, jeder Sammellauf muss 120 000 lebende Objekte markieren — der Fall,
-für den das inkrementelle Sammeln gebaut wurde. Eingehängt in `run.sh` als
-Stufe 2b (`GCM_GROSS_SEK`, `GCM_KINDER`), mit eigener Auswertung.
+Deliberately keeps a lot alive: one root with `KINDER` (default 120 000)
+text nodes as a sibling chain, held in a frame cell of `main`,
+and at the end demonstrably still reachable via `dom_kinder_zaehlen`. In
+parallel the same garbage stream as in `pause.fi` runs. With that the heap
+stands permanently at 13 MiB, and every collection has to mark 120 000 live
+objects — the case for which incremental collection was built. Hooked into
+`run.sh` as stage 2b (`GCM_GROSS_SEK`, `GCM_KINDER`), with its own
+evaluation.
 
-Messung (6 s Budget, 120 000 lebende Knoten, Heap 13,0 MiB, 82 Sammelläufe):
+Measurement (6 s budget, 120 000 live nodes, heap 13,0 MiB, 82 collections):
 
-| Klasse | Anzahl | kumuliert |
+| Class | Count | cumulative |
 |---|---|---|
 | ≤ 500 µs | 29 | 36,7 % |
 | ≤ 1 ms | 50 | 100,0 % |
 
-Also **alle Pausen der Messschleife unter 1 ms**, trotz 13 MiB Heap und
-120 000 lebenden Objekten — das Ziel < 2 ms hält der inkrementelle Pfad
-tatsächlich, und zwar heap-unabhängig. Scheiben-Maxima: Typ 0 159 µs,
-Typ 1 719 µs, Typ 2 183 µs, Typ 3 6 µs.
+So **all pauses of the measuring loop below 1 ms**, despite a 13 MiB heap
+and 120 000 live objects — the goal < 2 ms is actually held by the
+incremental path, and held independently of the heap. Slice maxima: type 0
+159 µs, type 1 719 µs, type 2 183 µs, type 3 6 µs.
 
-**Offener Punkt für Runde 41:** `pause_max_ns` meldet 12,0 ms. Dieser Wert
-stammt aus der **Aufbauphase**, in der der Heap erst wächst und noch
-nicht-inkrementell gesammelt wird. Ein 12-ms-Aussetzer beim Heap-Wachstum
-ist für ein 16-ms-Bildbudget zu viel: der Übergang in den inkrementellen
-Modus muss früher greifen oder das Wachstum selbst inkrementell laufen.
+**Open point for round 41:** `pause_max_ns` reports 12,0 ms. This value
+comes from the **build-up phase**, in which the heap is still growing and
+collection is still non-incremental. A 12 ms hiccup during heap growth
+is too much for a 16 ms frame budget: the transition into incremental
+mode has to take effect earlier, or the growth itself has to run
+incrementally.
 
-## Strang C — der eigentliche Durchbruch lag nicht im Compiler
+## Track C — the actual breakthrough was not in the compiler
 
-Nach A2 zeigte das callgrind-Profil des realweb-Laufs (2,14 Mrd. Ir):
+After A2 the callgrind profile of the realweb run (2,14 billion Ir) showed:
 
-| Anteil | Ir | Funktion |
+| Share | Ir | Function |
 |---|---|---|
-| 26,1 % | 557 993 466 | `dekodiere` (UTF-8 → Codepunkte) |
+| 26,1 % | 557 993 466 | `dekodiere` (UTF-8 → code points) |
 | 23,9 % | 510 486 268 | `eingabe_pruefen` |
-| 23,1 % | 492 598 522 | `tokenize` (Zustandsautomat) |
-| 15,6 % | 332 932 201 | `main` (Sammeltopf: alles ohne eigenes Symbol) |
+| 23,1 % | 492 598 522 | `tokenize` (state machine) |
+| 15,6 % | 332 932 201 | `main` (catch-all: everything without its own symbol) |
 
-Damit war klar: der teuerste Teil ist nicht der Automat, sondern die
-Vorverarbeitung je Zeichen. Drei Experimente, jeweils mit callgrind gemessen
-und mit oktettgleicher Ausgabe gegengeprüft:
+That made it clear: the most expensive part is not the state machine but
+the preprocessing per character. Three experiments, each measured with
+callgrind and counter-checked with octet-identical output:
 
-### C1 — `eingabe_pruefen`: ein Bereichstest statt zwölf Vergleichen
+### C1 — `eingabe_pruefen`: one range test instead of twelve comparisons
 
-`0x20..0x7E` ist auf echten Seiten der Normalfall und **nie** ein Fehler des
-Eingabestroms. Ein vorangestellter Bereichstest beendet die Funktion sofort.
+`0x20..0x7E` is the normal case on real pages and **never** an error of the
+input stream. A range test placed in front ends the function immediately.
 
 **2 136 489 667 → 1 793 235 323 Ir (−16,1 %)**
 
-### C2 — `dekodiere`: vorab reservieren, ASCII direkt schreiben
+### C2 — `dekodiere`: reserve in advance, write ASCII directly
 
-Ein Codepunkt kostet mindestens ein Byte, also reichen `len` Plätze immer:
-`cp_reserve(out, len)` einmal, danach direkt in den Rohspeicher schreiben
-statt `cp_push` je Zeichen (Aufruf + Kapazitätstest). Dazu ein
-ASCII-Schnellweg (`c0 < 0x80 && c0 != CR`), der die vier Breitenvergleiche
-überspringt. Neu in `lib/html/mem.fi`: `cp_ptr`, `cp_set_len` (exportiert).
+A code point costs at least one byte, so `len` slots are always enough:
+`cp_reserve(out, len)` once, then write directly into the raw memory
+instead of `cp_push` per character (call + capacity test). Plus an
+ASCII fast path (`c0 < 0x80 && c0 != CR`) that skips the four
+width comparisons. New in `lib/html/mem.fi`: `cp_ptr`, `cp_set_len`
+(exported).
 
 **1 793 235 323 → 1 427 485 223 Ir (−20,4 %)**
 
-### C3 — Schnellweg an der Aufrufstelle
+### C3 — fast path at the call site
 
-Auch der reine Funktionsaufruf von `eingabe_pruefen` kostet; derselbe
-Bereichstest direkt in `tokenize` spart ihn für ~95 % aller Zeichen.
+The plain function call of `eingabe_pruefen` costs as well; the same
+range test directly in `tokenize` saves it for ~95 % of all characters.
 
 **1 427 485 223 → 1 297 240 896 Ir (−9,1 %)**
 
-### C4 — widerlegt: „Textlauf am Stück" im Data-State
+### C4 — refuted: „text run in one piece" in the data state
 
-Hypothese: eine innere Schleife, die unbedenkliche Textzeichen ohne
-Zustandsverzweigung am Stück in den Zeichenpuffer schiebt (das, was
-html5ever aus `memchr` zieht), spart den `match`-Dispatch je Zeichen.
+Hypothesis: an inner loop that pushes harmless text characters into the
+character buffer in one piece without a state branch (what
+html5ever gets out of `memchr`) saves the `match` dispatch per character.
 
-Gemessen: **1 297 240 896 → 1 297 140 701 Ir (−0,008 %)** — also nichts. Der
-`match` über den Zustand ist bereits eine echte Sprungtabelle
-(`jmp *(%rdx,%rax,8)` im Disassemblat), der Dispatch kostet praktisch nichts.
-Die Änderung wurde **verworfen**: mehr Code ohne Gegenwert.
+Measured: **1 297 240 896 → 1 297 140 701 Ir (−0,008 %)** — i.e. nothing. The
+`match` over the state is already a real jump table
+(`jmp *(%rdx,%rax,8)` in the disassembly), the dispatch costs practically
+nothing. The change was **rejected**: more code without a return.
 
-### Ergebnis Strang C
+### Result of track C
 
-| Korpus | vor Runde 40 | nach Runde 40 | Ziel |
+| Corpus | before round 40 | after round 40 | Goal |
 |---|---|---|---|
-| html5lib (pathologisch) | 1,69× | **1,33×** | ≤ 2× ✅ |
-| realweb (echte Seiten) | 4,34× | **2,68×** | ≤ 3× ✅ (Stretch), ≤ 2× offen |
+| html5lib (pathological) | 1,69× | **1,33×** | ≤ 2× ✅ |
+| realweb (real pages) | 4,34× | **2,68×** | ≤ 3× ✅ (stretch), ≤ 2× open |
 
-Instruktionen realweb insgesamt: 2 334 236 911 → 1 297 240 896 = **−44,4 %**.
-html5lib-Konformität unverändert 6810/6810 (Fehlermeldungen 6809/6810),
-`test.sh` 649/649, `selbst_vergleich` 188/0/0, Fixpunkt 289 096 zeichengleich.
+Instructions realweb in total: 2 334 236 911 → 1 297 240 896 = **−44,4 %**.
+html5lib conformance unchanged 6810/6810 (error messages 6809/6810),
+`test.sh` 649/649, `selbst_vergleich` 188/0/0, fixpoint 289 096
+character-identical.
 
-### Lehre
+### Lesson
 
-Der Wanduhr-Vergleich hat den ersten Gewinn (A2) **nicht** gezeigt und wäre
-fast als „bringt nichts" verworfen worden; callgrind zeigte −8,47 %. Und der
-größte Hebel lag in zwei Bibliotheksfunktionen, nicht im Optimierer. Reihen-
-folge für Runde 41: erst profilieren, dann optimieren — und jede Optimierung
-mit Instruktionszählung belegen, nie mit der Uhr.
+The wall clock comparison did **not** show the first gain (A2) and it would
+almost have been rejected as „brings nothing"; callgrind showed −8,47 %. And
+the biggest lever was in two library functions, not in the optimizer. Order
+for round 41: profile first, then optimize — and back every optimization
+with an instruction count, never with the clock.
 
-### Offen für Runde 41
+### Open for round 41
 
-- `tokenize` ist jetzt mit 492 Mio. Ir (38 %) der größte Posten: ~100
-  Instruktionen je Zeichen im Automaten, überwiegend Slot-Verkehr in einer
-  Funktion mit 8 200 Assemblerzeilen → Intervall-Splitting im Regalloc.
-- 52 Vergleiche in `tokenize` laden ihre Konstante aus einem Rahmen-Slot
-  (`cmp -0x270(%rbp),%r9d`): `immediate_consts` verwirft eine Konstante
-  global, sobald **eine** ihrer Verwendungen kein Immediate zulässt. Fix:
-  Konstante an der problematischen Stelle klonen statt überall aufgeben.
-- `tok_attr_value_push` 105 Mio. Ir (8 %) — noch ungeprüft.
+- `tokenize` is now the biggest item with 492 million Ir (38 %): ~100
+  instructions per character in the state machine, predominantly slot
+  traffic in a function with 8 200 lines of assembly → interval splitting
+  in the regalloc.
+- 52 comparisons in `tokenize` load their constant from a frame slot
+  (`cmp -0x270(%rbp),%r9d`): `immediate_consts` discards a constant
+  globally as soon as **one** of its uses does not permit an immediate.
+  Fix: clone the constant at the problematic spot instead of giving up
+  everywhere.
+- `tok_attr_value_push` 105 million Ir (8 %) — not yet examined.
 
-## Strang B2 — der 30-Minuten-Dauerlauf MIT großer lebender Menge
+## Track B2 — the 30-minute endurance run WITH a large live set
 
-Nachgeholt mit `pause_big.fi` (120 000 lebende Knoten, Heap 13 MiB,
-1800 s). Rohdaten: `tools/gc_meas/duration30_big.tsv`.
+Caught up with `pause_big.fi` (120 000 live nodes, heap 13 MiB,
+1800 s). Raw data: `tools/gc_meas/duration30_big.tsv`.
 
-- 23 840 Sammelläufe, 202 453 000 Zyklen, 3 übersehene Mehrfach-Sammlungen
-- RSS über die ganze Zeit 12,9–13,9 MiB, Ende 12,89 MiB — **kein Drift**,
-  auch nicht mit permanent großer lebender Menge
-- Pausen-Histogramm:
+- 23 840 collections, 202 453 000 cycles, 3 missed multiple collections
+- RSS 12,9–13,9 MiB the whole time, end 12,89 MiB — **no drift**,
+  not even with a permanently large live set
+- pause histogram:
 
-| Klasse | Anzahl | Anteil | kumuliert |
+| Class | Count | Share | cumulative |
 |---|---|---|---|
 | ≤ 500 µs | 11 472 | 48,1 % | 48,1 % |
 | ≤ 1 ms | 11 663 | 48,9 % | 97,1 % |
@@ -193,50 +202,51 @@ Nachgeholt mit `pause_big.fi` (120 000 lebende Knoten, Heap 13 MiB,
 | ≤ 16 ms | 9 | 0,04 % | 99,996 % |
 | > 16 ms | 1 | 0,004 % | 100 % |
 
-- längste Pause **19,34 ms**, und zwar in einer Scheibe vom Typ 1 (nicht nur
-  in der Aufbauphase, wie der Kurzlauf noch nahelegte). Die Maxima wuchsen im
-  Verlauf: 12,05 ms → 15,68 ms → 19,34 ms.
-- Summe aller Pausen 1689,9 s von 1800 s Laufzeit — das sind **93,9 %**.
-  Bei 120 000 dauerhaft lebenden Objekten und laufender Müllproduktion
-  arbeitet der Sammler also fast durchgehend.
+- longest pause **19,34 ms**, and that in a slice of type 1 (not only
+  in the build-up phase, as the short run still suggested). The maxima grew
+  over the course: 12,05 ms → 15,68 ms → 19,34 ms.
+- sum of all pauses 1689,9 s of 1800 s runtime — that is **93,9 %**.
+  With 120 000 permanently live objects and ongoing garbage production
+  the collector therefore works almost continuously.
 
-### Urteil
+### Verdict
 
-Der inkrementelle Pfad hält den **Normalfall** klar unter 1 ms (97,1 %), aber
-er hält keine **Schranke**: 0,15 % der Pausen liegen über 4 ms, einzelne bei
-19 ms. Für ein 16-ms-Bildbudget ist das ein sichtbarer Ruckler alle paar
-Minuten. Zusammen mit dem Pausenanteil von 93,9 % ist das der klarste offene
-Punkt des GC — vor Finalisierern und `Arc[T]`.
+The incremental path holds the **normal case** clearly below 1 ms (97,1 %),
+but it does not hold a **bound**: 0,15 % of the pauses lie above 4 ms, single
+ones at 19 ms. For a 16 ms frame budget that is a visible stutter every few
+minutes. Together with the pause share of 93,9 % that is the clearest open
+point of the GC — ahead of finalizers and `Arc[T]`.
 
-**Aufgabe für Runde 41:** herausfinden, warum eine Typ-1-Scheibe 19 ms lang
-werden kann (unbegrenzte Arbeitsmenge je Scheibe? Nachmarkierung am
-Zyklusende?), und die Scheibengröße an ein echtes Zeitbudget koppeln statt an
-eine Objektzahl.
+**Task for round 41:** find out why a type 1 slice can become 19 ms long
+(unbounded amount of work per slice? re-marking at the end of the
+cycle?), and tie the slice size to a real time budget instead of to
+an object count.
 
-## Nachtrag (Runde 41, Vorarbeit) — die 19 ms waren nicht der Sammler
+## Addendum (round 41, preliminary work) — the 19 ms were not the collector
 
-Die Diagnose des GC war unvollständig: der **volle Stop-the-World-Lauf**
-(`__gc_collect_now`) buchte seine Dauer nur in `S_PAUSE_MAX`, aber in **keine**
-Scheibenklasse. Dadurch war das globale Maximum (11,8 ms) größer als jedes
-Typmaximum (3,6 ms) und niemand konnte sehen, woher es kam. Behoben: der
-volle Lauf ist jetzt **Typ 4**, dazu ein Zähler `gc_volle_laeufe()`.
+The diagnosis of the GC was incomplete: the **full stop-the-world run**
+(`__gc_collect_now`) booked its duration only into `S_PAUSE_MAX`, but into
+**no** slice class. Because of that the global maximum (11,8 ms) was larger
+than every type maximum (3,6 ms) and nobody could see where it came from.
+Fixed: the full run is now **type 4**, plus a counter `gc_volle_laeufe()`.
 
-Damit gemessen (`pause_big.fi`, 120 000 lebende Knoten, 13 MiB Heap):
+Measured with that (`pause_big.fi`, 120 000 live nodes, 13 MiB heap):
 
-| Lauf | Sammelläufe | davon volle | längste Scheibe (Typ 0–3) | Typ 4 |
+| Run | Collections | of those full | longest slice (type 0–3) | Type 4 |
 |---|---|---|---|---|
 | 30 s | 434 | 3 | 1,89 ms | 11,23 ms |
 | 120 s | ~1600 | **3** | 3,39 ms | 11,93 ms |
-| 600 s (ruhig) | 7 967 | **3** | 3,12 ms | 11,67 ms |
+| 600 s (quiet) | 7 967 | **3** | 3,12 ms | 11,67 ms |
 
-**Es bleiben immer genau drei volle Läufe** — alle in der Aufbauphase, solange
-der Heap noch unter `INKR_AB` (8 MiB) liegt. Im Dauerbetrieb läuft
-**ausschließlich** der inkrementelle Pfad. Der Markstapel läuft nie über
-(`ueberlaeufe = 0`), das teure Nachtragen kommt also gar nicht vor.
+**It always stays exactly three full runs** — all in the build-up phase,
+as long as the heap is still below `INKR_AB` (8 MiB). In continuous
+operation **only** the incremental path runs. The mark stack never
+overflows (`ueberlaeufe = 0`), so the expensive re-marking does not occur
+at all.
 
-Pausen im ruhigen 10-Minuten-Lauf (längste Scheibe je Zyklus):
+Pauses in the quiet 10-minute run (longest slice per cycle):
 
-| Klasse | Anzahl | kumuliert |
+| Class | Count | cumulative |
 |---|---|---|
 | ≤ 500 µs | 3 356 | 42,1 % |
 | ≤ 1 ms | 4 484 | **98,4 %** |
@@ -244,14 +254,14 @@ Pausen im ruhigen 10-Minuten-Lauf (längste Scheibe je Zyklus):
 | ≤ 4 ms | 26 | 100 % |
 | > 4 ms | 0 | — |
 
-**Korrektur zum Abschnitt B2:** die dort berichteten 19,34 ms und die 0,15 %
-über 4 ms stammen aus einem Lauf, der **gleichzeitig mit `test.sh` und
-callgrind** auf derselben Maschine lief. Ohne Fremdlast liegt nichts über
-4 ms. Lehre: Pausenmessungen nur auf einer ruhigen Maschine, und Fremdlast
-im Protokoll vermerken.
+**Correction to section B2:** the 19,34 ms reported there and the 0,15 %
+above 4 ms come from a run that ran **at the same time as `test.sh` and
+callgrind** on the same machine. Without foreign load nothing lies above
+4 ms. Lesson: measure pauses only on a quiet machine, and note foreign load
+in the protocol.
 
-**Nicht belegt:** kleinere Markierscheiben (`SCHEIBE_TRACE` 512 → 128) zeigten
-keinen sauberen Gewinn (Typ-1-Maximum 1,07 ms → 1,87 ms — im Rauschen der
-Einzelmaxima). Zurückgesetzt auf 512. Vorher fehlt das Werkzeug: ein
-Histogramm der **einzelnen Scheiben** statt nur der längsten Scheibe je
-Zyklus. Das ist die erste Aufgabe der Runde 41.
+**Not established:** smaller marking slices (`SCHEIBE_TRACE` 512 → 128)
+showed no clean gain (type 1 maximum 1,07 ms → 1,87 ms — within the noise of
+the individual maxima). Reset to 512. The tool for this is missing first: a
+histogram of the **individual slices** instead of only the longest slice per
+cycle. That is the first task of round 41.

@@ -1,21 +1,21 @@
-# FIR — die Zwischensprache von `firnc0`
+# FIR — the intermediate language of `firnc0`
 
-FIR ("Frontend Intermediate Representation") ist die eigene, typisierte
-Zwischensprache des Compilers. Sie steht zwischen dem Typprüfer und dem
-x86_64-Backend:
+FIR ("Frontend Intermediate Representation") is the compiler's own, typed
+intermediate language. It sits between the type checker and the
+x86_64 backend:
 
 ```
 Quelle -> Lexer -> Parser -> AST -> Typprüfer -> [ FIR ] -> Optimierer -> x86_64
 ```
 
-FIR ist **kein** umbenannter AST: Ausdrücke sind in Einzelinstruktionen mit
-eigenen Wert-Ids zerlegt, Kontrollfluss existiert nur noch als Basisblöcke mit
-Terminatoren, Variablen sind Speicherplätze (`alloca`) und jede Instruktion hat
-einen expliziten Maschinentyp. Umgekehrt enthält FIR nichts Maschinenspezifisches:
-Register, Stackrahmen, Aufrufkonvention und Befehlsauswahl entstehen erst im
-Backend.
+FIR is **not** a renamed AST: expressions are decomposed into individual
+instructions with value ids of their own, control flow exists only as basic
+blocks with terminators, variables are memory slots (`alloca`) and every
+instruction has an explicit machine type. Conversely, FIR contains nothing
+machine-specific: registers, stack frames, calling convention and
+instruction selection only come into being in the backend.
 
-Textform ausgeben:
+Printing the textual form:
 
 ```
 firnc --emit=fir-raw datei      # FIR direkt nach dem Lowering
@@ -23,23 +23,23 @@ firnc --emit=fir-opt datei      # FIR nach Konstantenfaltung + Entfernen toten C
 firnc --emit=fir     datei      # dasselbe wie --emit=fir-opt
 ```
 
-Implementierung: `compiler/src/fir.rs` (Datenstruktur + Textform),
-`compiler/src/lower.rs` (AST -> FIR), `compiler/src/opt.rs` (Optimierer).
+Implementation: `compiler/src/fir.rs` (data structure + textual form),
+`compiler/src/lower.rs` (AST -> FIR), `compiler/src/opt.rs` (optimizer).
 
 ---
 
-## 1. Aufbau
+## 1. Structure
 
-Ein **Modul** ist eine Liste von **Funktionen**. Eine Funktion hat einen Namen,
-eine Liste von Parametertypen, einen Rückgabetyp und eine Liste von
-**Basisblöcken**. Der erste Block (`bb0`) ist der Eintrittsblock. Ein Block ist
-eine Folge von **Instruktionen** und genau **ein Terminator** am Ende.
+A **module** is a list of **functions**. A function has a name,
+a list of parameter types, a return type and a list of
+**basic blocks**. The first block (`bb0`) is the entry block. A block is
+a sequence of **instructions** and exactly **one terminator** at the end.
 
-Jede Instruktion definiert höchstens einen Wert `%n`. Werte sind fortlaufend
-nummeriert und werden genau einmal definiert (SSA-artig). Die Parameter einer
-Funktion mit *n* Parametern belegen die Werte `%0 … %(n-1)`.
+Every instruction defines at most one value `%n`. Values are numbered
+consecutively and are defined exactly once (SSA-like). The parameters of a
+function with *n* parameters occupy the values `%0 … %(n-1)`.
 
-Textform (jede Zeile ist eine Instruktion, Blocklabels stehen in Spalte 1):
+Textual form (every line is an instruction, block labels stand in column 1):
 
 ```
 ; FIR v0
@@ -50,156 +50,163 @@ bb0:
 }
 ```
 
-Die erste Zeile `; FIR v0` ist die Formatkennung; `;` leitet keinen Kommentar
-in der Instruktionssyntax ein, sie kommt nur in dieser Kopfzeile vor.
+The first line `; FIR v0` is the format tag; `;` does not start a comment
+in the instruction syntax, it only occurs in this header line.
 
 ---
 
-## 2. Typen
+## 2. Types
 
-| FIR-Typ | Bedeutung | Breite |
+| FIR type | Meaning | Width |
 |---|---|---|
-| `i8 i16 i32 i64` | vorzeichenbehaftete Ganzzahl | 8/16/32/64 Bit |
-| `u8 u16 u32 u64` | vorzeichenlose Ganzzahl | 8/16/32/64 Bit |
-| `bool` | Wahrheitswert, ausschließlich 0 oder 1 | 8 Bit |
-| `ptr` | Adresse, in FIR untypisiert | 64 Bit |
-| `void` | kein Wert (z. B. `store`, `copymem`, Aufruf ohne Rückgabe) | – |
+| `i8 i16 i32 i64` | signed integer | 8/16/32/64 bits |
+| `u8 u16 u32 u64` | unsigned integer | 8/16/32/64 bits |
+| `bool` | truth value, exclusively 0 or 1 | 8 bits |
+| `ptr` | address, untyped in FIR | 64 bits |
+| `void` | no value (e.g. `store`, `copymem`, a call without a return) | – |
 
-Abbildung der Quelltypen (identisch in Typprüfer, Lowering und Backend):
+Mapping of the source types (identical in the type checker, the lowering
+and the backend):
 
 * `i8…i64` -> `i8…i64`, `u8…u64` -> `u8…u64`
 * `usize` -> `u64`, `isize` -> `i64`
-* `bool` -> `bool` (1 Byte, nur 0/1)
-* `*T`, `*mut T` -> `ptr` (der Zielttyp verschwindet; Elementgrößen sind beim
-  Lowering bereits in konstante Byte-Offsets aufgelöst)
+* `bool` -> `bool` (1 byte, only 0/1)
+* `*T`, `*mut T` -> `ptr` (the target type disappears; element sizes are
+  already resolved into constant byte offsets during lowering)
 
-**Aggregate (Structs, Arrays) sind keine FIR-Werte.** Sie existieren nur als
-Adresse: `alloca` legt den Platz an, `ptradd` rechnet Feld- und Elementadressen
-aus, `load`/`store` greifen auf skalare Felder zu, `copymem` kopiert ganze
-Aggregate. Deshalb gibt es in FIR keinen Aggregattyp und keine
-Aggregat-Argumente.
+**Aggregates (structs, arrays) are not FIR values.** They exist only as an
+address: `alloca` creates the space, `ptradd` computes field and element
+addresses, `load`/`store` access scalar fields, `copymem` copies whole
+aggregates. That is why there is no aggregate type and no
+aggregate arguments in FIR.
 
-Vorzeichen ist eine Eigenschaft des **Typs**, nicht des Befehls: `div.i32` ist
-vorzeichenbehaftet (`idiv`), `div.u32` nicht (`div`); `shr.i64` ist arithmetisch
-(`sar`), `shr.u64` logisch (`shr`).
+Signedness is a property of the **type**, not of the instruction: `div.i32`
+is signed (`idiv`), `div.u32` is not (`div`); `shr.i64` is arithmetic
+(`sar`), `shr.u64` logical (`shr`).
 
 ---
 
-## 3. Instruktionen
+## 3. Instructions
 
-Schreibweise unten: `%d = ` steht für den definierten Wert (fehlt bei
-`void`-Instruktionen), `T` ist der Instruktionstyp.
+Notation below: `%d = ` stands for the defined value (absent for
+`void` instructions), `T` is the instruction type.
 
-| Textform | Bedeutung |
+| Textual form | Meaning |
 |---|---|
-| `%d = const.T c` | Konstante `c`, auf `T` zurechtgestutzt |
-| `%d = add.T %a, %b` | Addition (umlaufend) |
-| `%d = sub.T %a, %b` | Subtraktion |
-| `%d = mul.T %a, %b` | Multiplikation |
-| `%d = div.T %a, %b` | Division; Vorzeichen aus `T` |
-| `%d = rem.T %a, %b` | Rest; Vorzeichen aus `T` |
-| `%d = and.T %a, %b` | bitweises Und |
-| `%d = or.T %a, %b` | bitweises Oder |
-| `%d = xor.T %a, %b` | bitweises Exklusiv-Oder |
-| `%d = shl.T %a, %b` | Linksverschiebung |
-| `%d = shr.T %a, %b` | Rechtsverschiebung; arithmetisch bei signiertem `T` |
-| `%d = cmp.OP.T %a, %b` | Vergleich, `OP` ∈ `eq ne lt le gt ge`; `T` ist der **Operandentyp**, Ergebnis ist immer `bool` |
-| `%d = neg.T %a` | arithmetische Negation |
-| `%d = not.T %a` | bitweises Nicht; bei `T = bool` logisches Nicht (0↔1) |
-| `%d = cast.FROM.TO %a` | Umwandlung: `FROM` ist der Quelltyp, `TO` der Instruktionstyp. Verbreitern erweitert nach Vorzeichen von `FROM` (signed: vorzeichen-, sonst nullerweitert), Verschmälern schneidet ab. `ptr` zählt als 64-Bit-Wert. |
-| `%d = alloca.ptr size=N align=A` | `N` Byte Stackspeicher, `A`-Byte ausgerichtet; Ergebnis ist die Adresse. **Nur im Eintrittsblock.** |
-| `%d = load.T %a` | lädt `T` von Adresse `%a` |
-| `store.T %v, %a` | speichert Wert `%v` vom Typ `T` an Adresse `%a` (kein Ergebnis) |
-| `%d = ptradd.ptr %b, %o` | Adresse `%b` + `%o` **Bytes** (`%o` ist `i64` oder `u64`) |
-| `%d = call.T @f(%a, …)` | Aufruf; `T` ist der Rückgabetyp, `void` bei Aufruf ohne Rückgabewert (dann ohne `%d = `) |
-| `%d = syscall.i64 %nr, %a1, …` | Linux-Syscall: erstes Argument ist die Nummer, danach bis zu 6 Argumente, alle `i64`; Ergebnis ist `i64` |
-| `copymem %dst, %src, size=N` | kopiert `N` Byte von `%src` nach `%dst` (kein Ergebnis, keine Überlappung) |
+| `%d = const.T c` | constant `c`, truncated to `T` |
+| `%d = add.T %a, %b` | addition (wrapping) |
+| `%d = sub.T %a, %b` | subtraction |
+| `%d = mul.T %a, %b` | multiplication |
+| `%d = div.T %a, %b` | division; signedness from `T` |
+| `%d = rem.T %a, %b` | remainder; signedness from `T` |
+| `%d = and.T %a, %b` | bitwise and |
+| `%d = or.T %a, %b` | bitwise or |
+| `%d = xor.T %a, %b` | bitwise exclusive or |
+| `%d = shl.T %a, %b` | left shift |
+| `%d = shr.T %a, %b` | right shift; arithmetic for a signed `T` |
+| `%d = cmp.OP.T %a, %b` | comparison, `OP` ∈ `eq ne lt le gt ge`; `T` is the **operand type**, the result is always `bool` |
+| `%d = neg.T %a` | arithmetic negation |
+| `%d = not.T %a` | bitwise not; with `T = bool` a logical not (0↔1) |
+| `%d = cast.FROM.TO %a` | conversion: `FROM` is the source type, `TO` the instruction type. Widening extends according to the signedness of `FROM` (signed: sign-extended, otherwise zero-extended), narrowing truncates. `ptr` counts as a 64-bit value. |
+| `%d = alloca.ptr size=N align=A` | `N` bytes of stack memory, aligned to `A` bytes; the result is the address. **Only in the entry block.** |
+| `%d = load.T %a` | loads a `T` from the address `%a` |
+| `store.T %v, %a` | stores the value `%v` of type `T` at the address `%a` (no result) |
+| `%d = ptradd.ptr %b, %o` | address `%b` + `%o` **bytes** (`%o` is `i64` or `u64`) |
+| `%d = call.T @f(%a, …)` | call; `T` is the return type, `void` for a call without a return value (then without `%d = `) |
+| `%d = syscall.i64 %nr, %a1, …` | Linux syscall: the first argument is the number, then up to 6 arguments, all `i64`; the result is `i64` |
+| `copymem %dst, %src, size=N` | copies `N` bytes from `%src` to `%dst` (no result, no overlap) |
 
-**Rein/unrein:** `const`, `add`…`shr`, `cmp`, `neg`, `not`, `cast`, `ptradd`,
-`load` und `alloca` sind rein — der Optimierer darf sie entfernen, wenn ihr
-Ergebnis unbenutzt ist. `store`, `call`, `syscall` und `copymem` haben
-Seiteneffekte und bleiben immer stehen (`Op::is_pure` in `fir.rs`).
+**Pure/impure:** `const`, `add`…`shr`, `cmp`, `neg`, `not`, `cast`,
+`ptradd`, `load` and `alloca` are pure — the optimizer may remove them if
+their result is unused. `store`, `call`, `syscall` and `copymem` have
+side effects and always stay (`Op::is_pure` in `fir.rs`).
 
-## 4. Terminatoren
+## 4. Terminators
 
-| Textform | Bedeutung |
+| Textual form | Meaning |
 |---|---|
-| `br bbN` | unbedingter Sprung |
-| `brcond %c, bbT, bbF` | Sprung nach `bbT`, wenn `%c` (Typ `bool`) ungleich 0, sonst nach `bbF` |
-| `ret %v` | Rücksprung mit Wert |
-| `ret` | Rücksprung ohne Wert |
-| `<unset>` | **darf nach dem Lowering nicht vorkommen** — nur Bauzustand |
+| `br bbN` | unconditional jump |
+| `brcond %c, bbT, bbF` | jump to `bbT` if `%c` (type `bool`) is not zero, otherwise to `bbF` |
+| `ret %v` | return with a value |
+| `ret` | return without a value |
+| `<unset>` | **must not occur after the lowering** — build state only |
 
 ---
 
-## 5. Invarianten
+## 5. Invariants
 
-Diese Zusagen macht das Lowering dem Optimierer und dem Backend; der Optimierer
-erhält sie. `lower.rs` prüft (1) und (2) am Ende selbst nach und meldet einen
-Compilerfehler statt still etwas Kaputtes weiterzureichen.
+These are the promises the lowering makes to the optimizer and the backend;
+the optimizer preserves them. `lower.rs` checks (1) and (2) itself at the
+end and reports a compiler error instead of silently passing on something
+broken.
 
-1. **Genau ein Terminator je Block**, immer am Ende. Kein `Term::Unset`.
-   Unerreichbarer Code nach `return` landet in einem neuen Block, der ebenfalls
-   ordentlich terminiert wird (`ret` mit `const 0` bzw. `ret` bei `void`).
-2. **Alle `alloca` stehen im Eintrittsblock `bb0`**, vor der ersten
-   Nicht-`alloca`-Instruktion. Damit ist der Stackrahmen im Backend statisch
-   berechenbar; auch `alloca`s aus tiefen Blöcken (z. B. der Ergebnisplatz eines
-   `&&`) wandern dorthin. Deswegen sind die Wert-Ids im Eintrittsblock nicht
-   zwingend aufsteigend.
-3. **Jeder Wert wird genau einmal definiert** und vor jeder Verwendung — mit
-   Ausnahme von Rückwärtskanten, wo nur Werte aus dominierenden Blöcken benutzt
-   werden. Werte fließen nie über einen Blockrand hinweg neu zusammen (siehe 4).
-4. **Keine Phi-Knoten.** Jede lokale Variable und jeder Parameter hat einen
-   eigenen `alloca`-Slot; Lesen ist `load`, Schreiben ist `store`. Begründung:
-   Stufe 0 soll klein und nachprüfbar sein — ohne Phis braucht das Lowering
-   weder Dominanzberechnung noch SSA-Konstruktion, und das Backend kann jeden
-   Wert einfach in einen Stack-Slot legen. Der Preis sind mehr `load`/`store`;
-   das ist bewusst so, denn die Registerzuteilung von Stufe 0 ist ohnehin naiv.
-   Eine SSA-Konstruktion (`mem2reg`) kann später ergänzt werden, ohne die
-   Instruktionsmenge zu ändern.
-5. **Typtreue:** Beide Operanden einer Binäroperation haben den Typ der
-   Instruktion (Ausnahme: der Verschiebungsbetrag wird beim Lowering auf den Typ
-   des linken Operanden gebracht); beide Operanden eines `cmp` haben den in der
-   Instruktion genannten Operandentyp; `store.T`/`load.T` passen zur Breite des
-   gespeicherten Wertes; Adressen sind immer `ptr`; `bool` enthält nur 0 oder 1.
-6. **Blocknummern sind Indizes**: `bbN` ist der `N`-te Block der Funktion.
-   Sprungziele sind immer gültige Blöcke derselben Funktion.
+1. **Exactly one terminator per block**, always at the end. No
+   `Term::Unset`. Unreachable code after a `return` ends up in a new block
+   that is properly terminated as well (`ret` with `const 0` resp. `ret`
+   for `void`).
+2. **All `alloca` stand in the entry block `bb0`**, before the first
+   non-`alloca` instruction. That makes the stack frame statically
+   computable in the backend; `alloca`s from deep blocks (e.g. the result
+   slot of an `&&`) also migrate there. That is why the value ids in the
+   entry block are not necessarily ascending.
+3. **Every value is defined exactly once** and before every use — with
+   the exception of back edges, where only values from dominating blocks
+   are used. Values never merge anew across a block boundary (see 4).
+4. **No phi nodes.** Every local variable and every parameter has an
+   `alloca` slot of its own; reading is a `load`, writing is a `store`.
+   Justification: stage 0 is supposed to be small and verifiable — without
+   phis, the lowering needs neither dominance computation nor SSA
+   construction, and the backend can simply put every value into a stack
+   slot. The price is more `load`/`store`; that is deliberate, because the
+   register allocation of stage 0 is naive anyway.
+   An SSA construction (`mem2reg`) can be added later without changing the
+   instruction set.
+5. **Type fidelity:** both operands of a binary operation have the type of
+   the instruction (exception: the shift amount is brought to the type of
+   the left operand during lowering); both operands of a `cmp` have the
+   operand type named in the instruction; `store.T`/`load.T` match the
+   width of the stored value; addresses are always `ptr`; a `bool` contains
+   only 0 or 1.
+6. **Block numbers are indices**: `bbN` is the `N`-th block of the
+   function. Jump targets are always valid blocks of the same function.
 
 ---
 
-## 6. Wie der AST nach FIR abgebildet wird
+## 6. How the AST is mapped to FIR
 
-* **Variablen/Parameter:** `alloca` im Eintrittsblock; Parameter werden dort aus
-  ihren Wert-Ids (`%0…`) in ihren Slot gestored. Jeder Zugriff ist `load`/`store`.
-* **lvalues** werden zu Adressrechnungen:
-  * Bezeichner -> Slotadresse,
-  * `a.f` -> `ptradd base, const OFFSET` (Offset aus dem Struct-Layout; Offset 0
-    erzeugt kein `ptradd`),
-  * `a[i]` -> Index nach `u64` casten, `mul.u64` mit der Elementgröße,
+* **Variables/parameters:** an `alloca` in the entry block; parameters are
+  stored there from their value ids (`%0…`) into their slot. Every access
+  is a `load`/`store`.
+* **lvalues** become address computations:
+  * an identifier -> the slot address,
+  * `a.f` -> `ptradd base, const OFFSET` (the offset from the struct
+    layout; offset 0 produces no `ptradd`),
+  * `a[i]` -> cast the index to `u64`, `mul.u64` with the element size,
     `ptradd`,
-  * `*p` -> der Zeigerwert selbst.
-* **`if`/`else`, `while`** werden zu Basisblöcken mit `brcond`/`br`.
-* **`&&`, `||`** werden **kurzschließend** aufgelöst: ein `alloca`-Slot vom Typ
-  `bool` nimmt das Ergebnis auf, der linke Operand landet im Slot und steuert
-  ein `brcond`; nur im "muss noch geprüft werden"-Zweig wird der rechte Operand
-  ausgewertet und überschreibt den Slot. Es entsteht **keine** `and.bool`- oder
-  `or.bool`-Instruktion.
-* **Struct-/Array-Literale** werden feld- bzw. elementweise in ihren Zielplatz
-  geschrieben; Zuweisung eines ganzen Aggregats (`let p2: Point = p1;`) wird zu
-  `copymem`.
-* **`as`** wird zu `cast`. Sonderfall: `x as bool` wird als `cmp.ne` gegen 0
-  gelowert, damit `bool` garantiert nur 0/1 enthält. `bool as iN` ist ein `cast`
-  (nullerweitert).
-* **`const`-Deklarationen** sind zur Übersetzungszeit ausgewertet und erscheinen
-  als `const`-Instruktion an der Verwendungsstelle.
-* **`syscall(...)`** wird zu `syscall.i64`; jedes Argument wird vorher auf `i64`
-  erweitert (signierte Quelle: vorzeichen-, sonst nullerweitert).
+  * `*p` -> the pointer value itself.
+* **`if`/`else`, `while`** become basic blocks with `brcond`/`br`.
+* **`&&`, `||`** are resolved with **short-circuiting**: an `alloca` slot of
+  type `bool` takes the result, the left operand lands in the slot and
+  controls a `brcond`; only in the "still has to be checked" branch is the
+  right operand evaluated and does it overwrite the slot. **No** `and.bool`
+  or `or.bool` instruction comes into being.
+* **Struct/array literals** are written field by field resp. element by
+  element into their target slot; the assignment of a whole aggregate
+  (`let p2: Point = p1;`) becomes a `copymem`.
+* **`as`** becomes a `cast`. Special case: `x as bool` is lowered as a
+  `cmp.ne` against 0, so that a `bool` is guaranteed to contain only 0/1.
+  `bool as iN` is a `cast` (zero-extended).
+* **`const` declarations** are evaluated at compile time and appear
+  as a `const` instruction at the place of use.
+* **`syscall(...)`** becomes a `syscall.i64`; every argument is extended to
+  `i64` beforehand (a signed source: sign-extended, otherwise
+  zero-extended).
 
 ---
 
-## 7. Vollständiges Beispiel
+## 7. A complete example
 
-Quellprogramm:
+Source program:
 
 ```
 struct Point {
@@ -229,9 +236,9 @@ fn main() -> i32 {
 }
 ```
 
-Dazugehörige Ausgabe von `--emit=fir-raw` (unoptimiert, wörtlich kopiert; der
-Test `lower::tests::doku_beispiel_stimmt` vergleicht diesen Block mit dem, was
-das Lowering wirklich erzeugt):
+The corresponding output of `--emit=fir-raw` (unoptimized, copied
+verbatim; the test `lower::tests::doku_beispiel_stimmt` compares this block
+with what the lowering really produces):
 
 ```firdump
 ; FIR v0
@@ -319,63 +326,68 @@ bb7:
 }
 ```
 
-Zeile für Zeile das Wichtigste:
+Line by line, the most important points:
 
-* `@sum` hat einen Parameter: `%0` ist der übergebene Wert, `%1` sein
-  Stack-Slot. Die drei `alloca` (`%1` Parameter, `%2` = `s`, `%4` = `i`) stehen
-  wie vorgeschrieben vorn im Eintrittsblock — dass `%3` (die Konstante `0`)
-  eine kleinere Id hat als `%4`, ist Folge von Invariante 2.
-* Die `while`-Schleife hat drei Blöcke: `bb1` Bedingung, `bb2` Rumpf (springt
-  mit `br bb1` zurück), `bb3` danach. `bb4` ist der unerreichbare Block hinter
-  dem `return`; er wird trotzdem terminiert (Invariante 1) und vom Optimierer
-  entfernt.
-* In `@main` ist `%0` der 8 Byte große `Point`; `x` liegt bei Offset 0 (deshalb
-  `store.i32 %1, %0` ohne `ptradd`), `y` bei Offset 4.
-* `%9` ist der Ergebnisplatz des `&&`. `bb1` wertet den rechten Operanden nur
-  aus, wenn der linke wahr war — echter Kurzschluss.
-* `LIMIT` erscheint als `%7 = const.i32 10`: Konstanten werden beim Lowering
-  eingesetzt.
-* `bb4`, `bb6` und `bb7` sind unerreichbar bzw. leer. Genau solche Blöcke räumt
-  das Entfernen toten Codes weg — im Vergleich `--emit=fir-raw` gegen
-  `--emit=fir-opt` gut zu sehen.
-
----
-
-## 8. Was FIR (noch) nicht hat
-
-Bewusst weggelassen in Stufe 0: Phi-Knoten und SSA-Konstruktion, Aggregate als
-Werte, Funktionszeiger/indirekte Aufrufe, globale Variablen (nur `const`, und
-die werden eingesetzt), Aliasinformation, Schleifeninformation
-(Dominanzbaum/Schleifenerkennung), Debug-Metadaten, Aufruf-Attribute,
-Gleitkommatypen und Vektortypen. Die Instruktionsmenge ist so gewählt, dass sie
-für diese Erweiterungen Platz lässt, ohne dass Bestehendes umgeschrieben werden
-muss.
+* `@sum` has one parameter: `%0` is the passed value, `%1` its
+  stack slot. The three `alloca` (`%1` the parameter, `%2` = `s`, `%4` =
+  `i`) stand at the front of the entry block as prescribed — that `%3`
+  (the constant `0`) has a smaller id than `%4` is a consequence of
+  invariant 2.
+* The `while` loop has three blocks: `bb1` the condition, `bb2` the body
+  (which jumps back with `br bb1`), `bb3` afterwards. `bb4` is the
+  unreachable block behind the `return`; it is terminated anyway
+  (invariant 1) and is removed by the optimizer.
+* In `@main`, `%0` is the 8-byte `Point`; `x` lies at offset 0 (hence
+  `store.i32 %1, %0` without a `ptradd`), `y` at offset 4.
+* `%9` is the result slot of the `&&`. `bb1` evaluates the right operand
+  only if the left one was true — a real short circuit.
+* `LIMIT` appears as `%7 = const.i32 10`: constants are substituted during
+  lowering.
+* `bb4`, `bb6` and `bb7` are unreachable resp. empty. Exactly such blocks
+  are cleared away by dead code elimination — easy to see when comparing
+  `--emit=fir-raw` with `--emit=fir-opt`.
 
 ---
 
-## 9. Vom FIR zum x86_64-Code
+## 8. What FIR does not have (yet)
 
-Das Backend (`compiler/src/codegen_x86.rs`) uebersetzt FIR direkt in
-GNU-Assembler-Text (Intel-Syntax) — ohne LLVM, ohne Cranelift, ohne C.
-Die Abbildung ist bewusst einfach und dadurch pruefbar:
+Deliberately left out in stage 0: phi nodes and SSA construction,
+aggregates as values, function pointers/indirect calls, global variables
+(only `const`, and those are substituted), alias information, loop
+information (dominator tree/loop detection), debug metadata, call
+attributes, floating point types and vector types. The instruction set is
+chosen so that it leaves room for these extensions without existing parts
+having to be rewritten.
 
-* Jeder FIR-Wert `%n` bekommt einen eigenen 8-Byte-Stack-Slot; gerechnet wird in
-  `rax`/`rcx` (`rdx` fuer Division/Rest, `rdi`/`rsi`/`rcx` fuer `copymem`).
-  Dadurch lebt ueber einen `call` hinweg nie ein Wert in einem Register und die
-  callee-saved Register `rbx`, `r12`-`r15` werden nie angefasst.
-* `alloca` wird zu einem Bereich im Stackrahmen; die Instruktion selbst ist ein
-  `lea` der Adresse in den Slot. Deshalb muessen alle `alloca` im Eintrittsblock
-  stehen (Invariante 2) — der Rahmen ist damit statisch gross.
-* Ein Basisblock `bbN` von `@f` wird zum Label `.Lf__bbN`; `br` ist `jmp`,
-  `brcond` ist `test al, al` + `jnz`/`jmp`, `ret` ist Epilog + `ret`.
-* Der Rahmen ist immer ein Vielfaches von 16 Byte. Beim Eintritt gilt
-  `rsp % 16 == 8`, `push rbp` gleicht das aus — damit ist der Stack an jeder
-  Aufrufstelle 16-ausgerichtet (System-V-AMD64).
-* Vorzeichen kommt aus dem FIR-Typ: `div.iN` -> `idiv`, `div.uN` -> `div`,
-  `shr.iN` -> `sar`, `shr.uN` -> `shr`, `cmp.lt.iN` -> `setl`,
-  `cmp.lt.uN` -> `setb`. `cast` wird zu `movsx`/`movsxd`/`movzx`/`mov`.
-* `syscall.i64` legt Argument 0 nach `rax` und die restlichen nach
-  `rdi, rsi, rdx, r10, r8, r9` — das Linux-ABI, nicht das Aufruf-ABI.
-* `_start` ruft `main` auf und uebergibt `eax` an `exit` (freistehend, ohne libc).
+---
 
-Zu sehen mit `firnc --emit=asm datei.fi -o datei.s` bzw. `--keep-asm`.
+## 9. From FIR to x86_64 code
+
+The backend (`compiler/src/codegen_x86.rs`) translates FIR directly into
+GNU assembler text (Intel syntax) — without LLVM, without Cranelift,
+without C. The mapping is deliberately simple and thereby checkable:
+
+* Every FIR value `%n` gets an 8-byte stack slot of its own; computation
+  happens in `rax`/`rcx` (`rdx` for division/remainder, `rdi`/`rsi`/`rcx`
+  for `copymem`). Because of that, no value ever lives in a register across
+  a `call` and the callee-saved registers `rbx`, `r12`-`r15` are never
+  touched.
+* An `alloca` becomes an area in the stack frame; the instruction itself is
+  a `lea` of the address into the slot. That is why all `alloca` have to
+  stand in the entry block (invariant 2) — the frame is thereby statically
+  sized.
+* A basic block `bbN` of `@f` becomes the label `.Lf__bbN`; `br` is a
+  `jmp`, `brcond` is `test al, al` + `jnz`/`jmp`, `ret` is the epilogue +
+  `ret`.
+* The frame is always a multiple of 16 bytes. On entry
+  `rsp % 16 == 8` holds, and `push rbp` evens that out — so the stack is
+  16-aligned at every call site (System V AMD64).
+* Signedness comes from the FIR type: `div.iN` -> `idiv`, `div.uN` ->
+  `div`, `shr.iN` -> `sar`, `shr.uN` -> `shr`, `cmp.lt.iN` -> `setl`,
+  `cmp.lt.uN` -> `setb`. A `cast` becomes `movsx`/`movsxd`/`movzx`/`mov`.
+* `syscall.i64` puts argument 0 into `rax` and the remaining ones into
+  `rdi, rsi, rdx, r10, r8, r9` — the Linux ABI, not the call ABI.
+* `_start` calls `main` and passes `eax` to `exit` (freestanding, without
+  libc).
+
+To be seen with `firnc --emit=asm datei.fi -o datei.s` resp. `--keep-asm`.

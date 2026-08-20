@@ -1,62 +1,66 @@
-# Runde 41 — Scheiben-Histogramm, Zeitbudget im Sammler, und ein Miscompile im Optimierer
+# Round 41 — slice histogram, time budget in the collector, and a miscompile in the optimizer
 
-Zwei geplante Punkte (Diagnose und Zeitbudget des GC) und ein ungeplanter,
-der alles andere überwog: der Optimierer von `firnc0` erzeugte seit Runde 40
-falschen Code, und der Prüfapparat hat es nicht gemeldet.
+Two planned items (diagnostics and the time budget of the GC) and one
+unplanned one that outweighed everything else: the optimizer of `firnc0`
+had been generating wrong code since round 40, and the checking apparatus
+did not report it.
 
-## 1. Histogramm der EINZELNEN Scheiben (Aufgabe 1 aus Runde 40)
+## 1. Histogram of the INDIVIDUAL slices (task 1 from round 40)
 
-Bisher buchte `__gc_pause_buche` nur Maxima: längste Pause je Zyklus, längste
-je Typ. Für die Frage „ist die Scheibe zu groß?" ist das unbrauchbar — ein
-Maximum rauscht, eine Verteilung nicht. Neu in `lib/gc/gc.fi`:
+Until now `__gc_pause_buche` only booked maxima: longest pause per cycle,
+longest per type. For the question „is the slice too large?" that is
+useless — a maximum is noisy, a distribution is not. New in `lib/gc/gc.fi`:
 
-* `S_HIST`: 7 × 16 Fächer im Zustandsblock (448…1344, Blockgröße 4096).
-  Fach 0 = unter 1 µs, Fach k = [2^(k−1) µs, 2^k µs), Fach 15 = ab 16,384 ms.
-* Typen 0–4 wie `gc_pause_max_typ` (Start/Mark/Sweep/Ende/Voll), **Typ 5 =
-  Nachtragen nach Markstapel-Überlauf** (im Maximum steckt es unter Typ 1),
-  Typ 6 = alle Scheiben zusammen.
-* Abfrage `gc_hist(typ, fach)`, Nullen mit `gc_hist_reset()`.
-  `tools/gc_meas/pause_big.fi` nullt nach dem Aufbau und gibt alle
-  besetzten Fächer aus.
+* `S_HIST`: 7 × 16 buckets in the state block (448…1344, block size 4096).
+  Bucket 0 = below 1 µs, bucket k = [2^(k−1) µs, 2^k µs), bucket 15 = from
+  16,384 ms on.
+* Types 0–4 as in `gc_pause_max_typ` (start/mark/sweep/end/full), **type 5 =
+  re-marking after a mark stack overflow** (in the maximum it hides under
+  type 1), type 6 = all slices together.
+* Query `gc_hist(typ, fach)`, zeroing with `gc_hist_reset()`.
+  `tools/gc_meas/pause_big.fi` zeroes after the build-up and prints all
+  occupied buckets.
 
-Erster Befund gleich mit dem neuen Werkzeug: Typ 5 blieb über alle Läufe
-**leer** — der Markstapel läuft nie über, das teure Nachtragen kommt im
-Dauerbetrieb nicht vor. Das war in Runde 40 nur vermutet.
+The first finding came right away with the new tool: type 5 stayed
+**empty** across all runs — the mark stack never overflows, the expensive
+re-marking does not occur in continuous operation. In round 40 that had
+only been surmised.
 
-## 2. Zeitbudget statt Objektzahl (der offene Punkt aus Runde 40)
+## 2. Time budget instead of an object count (the open point from round 40)
 
-Die Markierscheibe verfolgte bis dahin **512 Objekte**, egal wie teuer die
-sind. Ein Knoten mit vielen Zeigerfeldern kostet ein Vielfaches eines
-Textknotens — im Histogramm streuten die Scheiben deshalb über drei
-Zehnerpotenzen. Neu: `ZEIT_BUDGET_NS = 100 000` (100 µs), die Uhr wird alle
-`ZEIT_PROBE = 16` Objekte gelesen (`__gc_jetzt_ns` kostet selbst ~25 ns).
+Until then the marking slice traced **512 objects**, no matter how
+expensive they are. A node with many pointer fields costs a multiple of a
+text node — in the histogram the slices therefore scattered over three
+orders of magnitude. New: `ZEIT_BUDGET_NS = 100 000` (100 µs), and the
+clock is read every `ZEIT_PROBE = 16` objects (`__gc_jetzt_ns` itself costs
+~25 ns).
 
-Messung `pause_big.fi`, 120 000 lebende Knoten, Heap 13 MiB, je 20 s,
-Markierscheiben (Typ 1):
+Measurement `pause_big.fi`, 120 000 live nodes, heap 13 MiB, 20 s each,
+marking slices (type 1):
 
-| Fach (Scheibendauer) | vorher (nur Objektzahl) | Probe 64 | **Probe 16 (eingebaut)** |
+| Bucket (slice duration) | before (object count only) | probe 64 | **probe 16 (built in)** |
 |---|---|---|---|
 | 64–128 µs   | 0      | 122 330 | **172 824** |
 | 128–256 µs  | 10 306 | 32 268  | 137 |
 | 256–512 µs  | 50 101 | 140     | 140 |
 | ≥ 512 µs    | 458    | 3       | 2 |
 
-Durchsatz (Zyklen im selben Zeitfenster) unverändert im Rauschen
-(2 198 000 / 2 347 000 / 2 231 000), Pausensumme unverändert. Das Budget
-kostet also nichts und schneidet den Schwanz ab.
+Throughput (cycles in the same time window) unchanged within the noise
+(2 198 000 / 2 347 000 / 2 231 000), sum of pauses unchanged. The budget
+therefore costs nothing and cuts off the tail.
 
-60-Sekunden-Kontrolllauf auf dem Endstand (`tools/gc_meas/slices60.tsv`):
-518 137 Markierscheiben, davon **99,88 % in 64–128 µs**, 284 darüber, drei
-Einzelfälle über 1 ms (Ausplanen durch das Betriebssystem, nicht der
-Sammler). `pause_max_typ4 = 11,7 ms` sind weiterhin die **drei vollen
-Läufe der Aufbauphase** unter `INKR_AB` — bekannt und benannt.
+60 second control run on the final state (`tools/gc_meas/slices60.tsv`):
+518 137 marking slices, of those **99,88 % in 64–128 µs**, 284 above that,
+three individual cases above 1 ms (descheduling by the operating system,
+not the collector). `pause_max_typ4 = 11,7 ms` are still the **three full
+runs of the build-up phase** below `INKR_AB` — known and named.
 
-## 3. Der eigentliche Fund: `.astdump` hing bei jedem `||`
+## 3. The actual find: `.astdump` hung on every `||`
 
-Beim Verifizieren blieb `test.sh` in Abschnitt 12 (Parservergleich) stehen —
-nicht langsam, **hängend**: `./.astdump bin/lexdump.fi` lief 45 Minuten mit
-voller CPU und ignorierte SIGTERM. Eingegrenzt mit gdb auf den hängenden
-Prozess:
+While verifying, `test.sh` stopped in section 12 (parser comparison) —
+not slow, **hanging**: `./.astdump bin/lexdump.fi` ran for 45 minutes at
+full CPU and ignored SIGTERM. Narrowed down with gdb on the hanging
+process:
 
 ```
 #0 rt__buf_wachse (bin/rt.fi:187)   rsi = 0xffff8002d74f884b   <- Länge < 0
@@ -65,12 +69,12 @@ Prozess:
 #3 druck__drucke_binop
 ```
 
-`buf_wachse` verdoppelt `kap`, bis `kap >= noetig`; bei einer unterlaufenen
-Länge läuft `kap` über 0 und die Schleife dreht sich ewig. Minimalfall:
-**jede Datei, die `||` enthält.** `&&` war unauffällig.
+`buf_wachse` doubles `kap` until `kap >= noetig`; with an underflowed
+length `kap` overflows past 0 and the loop spins forever. Minimal case:
+**every file that contains `||`.** `&&` was inconspicuous.
 
-Ursache ist kein Parserfehler, sondern **falscher Maschinencode aus
-`firnc0`** — im Assembler von `drucke_binop`:
+The cause is not a parser bug but **wrong machine code from
+`firnc0`** — in the assembly of `drucke_binop`:
 
 ```
 lea r12, [rbp+r12-1491]   ; &tab[start]  ueberschreibt das Zellenregister von start
@@ -78,62 +82,63 @@ mov r13, 43
 sub r13, r12              ; 43 - ADRESSE statt 43 - start
 ```
 
-Schuldig ist der **Zellen-Alias aus Runde 40** (`compiler/src/regalloc.rs`):
-ein `load` darf das Zellenregister direkt lesen, statt zu laden. Die
-Verteilung war da aber längst gelaufen — sie kannte die vom Alias
-**verlängerte Lebensspanne** nicht und durfte dasselbe Register an einen
-anderen Wert vergeben. Zwei Löcher, beide jetzt geschlossen:
+The guilty party is the **cell alias from round 40**
+(`compiler/src/regalloc.rs`): a `load` may read the cell register directly
+instead of loading. But the allocation had long since run by then — it did
+not know about the **lifetime extended** by the alias and was allowed to
+hand the same register to another value. Two holes, both now closed:
 
-1. Zwischen Load und Verwendung darf **kein anderer Wert** in das
-   Zellenregister schreiben (`belegt_register`).
-2. Liegt das Zellenregister **nicht** in `CALLEE_SAVED`, beendet ein
-   dazwischenliegender `call`/`syscall` den Alias — ein Aufruf zerstört
-   caller-saved Register. (Fehlerbild: `bin/layoutdump.fi` stürzte in
-   `intern_finde` mit `t = 0` ab.)
+1. Between the load and the use **no other value** may write into the
+   cell register (`belegt_register`).
+2. If the cell register is **not** in `CALLEE_SAVED`, an intervening
+   `call`/`syscall` ends the alias — a call destroys caller-saved
+   registers. (Symptom: `bin/layoutdump.fi` crashed in
+   `intern_finde` with `t = 0`.)
 
-**Kosten der Korrektur: keine.** callgrind auf dem realweb-Korpus,
+**Cost of the correction: none.** callgrind on the realweb corpus,
 `tokenize_bench`:
 
 | Compiler | I refs realweb |
 |---|---|
-| vor der Korrektur (fehlerhaft) | 1 297 226 146 |
-| nach der Korrektur | 1 297 226 150 (+4) |
+| before the correction (faulty) | 1 297 226 146 |
+| after the correction | 1 297 226 150 (+4) |
 
-## 4. Warum 649/649 das nicht gemerkt haben
+## 4. Why 649/649 did not notice this
 
-Zwei Gründe, beide ärgerlich:
+Two reasons, both annoying:
 
-* Die Dump-Binaries (`.astdump`, `.layoutdump`, …) wurden über lange Zeit
-  **veraltet wiederverwendet**. Runde 40 hat das Neubauen zwar eingebaut —
-  die Fassung, die den Fehler enthielt, wurde aber erst danach gebaut. Der
-  erste ehrliche Lauf mit frischen Binaries war dieser hier, und er hing
-  sofort.
-* Zwei gleichzeitige Läufe (Hauptrepo + Worktree) benutzten **dieselben
-  `/tmp`-Dateien** (`/tmp/parv_a.txt`, `/tmp/lexv_a.txt`, …) und
-  überschrieben sich gegenseitig die Vergleichsausgaben. Das erzeugte
-  „148 UNGLEICH", die beim Einzelnachlauf verschwanden. Alle sechs
-  Vergleichswerkzeuge legen jetzt ein eigenes `mktemp -d` an.
+* The dump binaries (`.astdump`, `.layoutdump`, …) had been **reused in a
+  stale state** over a long time. Round 40 did build the rebuilding in —
+  but the version that contained the bug was only built afterwards. The
+  first honest run with fresh binaries was this one, and it hung
+  immediately.
+* Two simultaneous runs (main repo + worktree) used **the same
+  `/tmp` files** (`/tmp/parv_a.txt`, `/tmp/lexv_a.txt`, …) and
+  overwrote each other's comparison outputs. That produced
+  „148 UNGLEICH" which disappeared on an individual re-run. All six
+  comparison tools now create their own `mktemp -d`.
 
-Der Regressionstest `tests/opt/cells_alias_clobber.fi` beschreibt das
-Muster; **ehrlich vermerkt**: er löst den Fehler in dieser Größe nicht selbst
-aus (ob das Register überschrieben wird, hängt vom Registerdruck des ganzen
-Moduls ab). Der zuverlässige Wächter bleibt Abschnitt 12 von `test.sh`.
+The regression test `tests/opt/cells_alias_clobber.fi` describes the
+pattern; **honestly noted**: at this size it does not trigger the bug
+itself (whether the register is overwritten depends on the register
+pressure of the whole module). The reliable guard remains section 12 of
+`test.sh`.
 
-## 5. Verifikation dieser Runde
+## 5. Verification of this round
 
 * `bash ./test.sh` → **PASS 652/652**
-* `bash tools/self_compare.sh` → **189 gleiches Verhalten**, 0 Abweichungen
-* `bash tools/fixpoint.sh` → Stufe 2 == Stufe 3, zeichengleich,
-  **309 468 Zeilen** Assembler (gewachsen, weil `lib/gc/gc.fi` um Histogramm
-  und Zeitbudget größer wurde)
-* callgrind realweb unverändert (siehe oben)
+* `bash tools/self_compare.sh` → **189 identical behavior**, 0 differences
+* `bash tools/fixpoint.sh` → stage 2 == stage 3, character-identical,
+  **309 468 lines** of assembly (grown because `lib/gc/gc.fi` got bigger
+  with the histogram and the time budget)
+* callgrind realweb unchanged (see above)
 
-## 6. Offen
+## 6. Open
 
-* **realweb ≤ 2×** (aktuell 2,68×) — nächster dokumentierter Hebel:
-  Intervall-Splitting im Regalloc, `tokenize` ist mit 38 % der größte Posten,
-  `tok_attr_value_push` 8 %.
-* **Aufbauphase des GC**: drei volle Läufe mit bis zu 11,7 ms, solange der
-  Heap unter `INKR_AB` (8 MiB) liegt. Für ein 16-ms-Bild ist das zu viel;
-  Abhilfe wäre, den inkrementellen Zyklus schon beim Wachsen zu benutzen.
-* Finalisierer und `Arc[T]` weiterhin offen (Runde 38 benannt).
+* **realweb ≤ 2×** (currently 2,68×) — next documented lever:
+  interval splitting in the regalloc; `tokenize` is the biggest item with
+  38 %, `tok_attr_value_push` 8 %.
+* **Build-up phase of the GC**: three full runs of up to 11,7 ms, as long as
+  the heap is below `INKR_AB` (8 MiB). For a 16 ms frame that is too much;
+  the remedy would be to use the incremental cycle during growth already.
+* Finalizers and `Arc[T]` still open (named in round 38).
