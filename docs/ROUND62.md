@@ -22,15 +22,17 @@ when the thing is switched off.
 | `bash test.sh` | 905/905 | **911/911** |
 | `bash tools/kernel/run.sh` | 46 passed, 0 failed | **174 passed, 0 failed** |
 | `bash tools/freestanding/run.sh` | 41 passed, 0 failed | **41 passed, 0 failed** |
-| `bash tools/self_compare.sh` | 234 same / 0 differing / 0 faulty | **234 / 0 / 0** |
-| `bash tools/fixpoint.sh` | character-identical | **character-identical** |
+| `bash tools/self_compare.sh` | 246 same / 0 differing / 0 faulty | **248 / 0 / 0** |
+| `bash tools/fixpoint.sh` | character-identical, 568 341 lines | **character-identical, 568 341 lines** |
 | `bash tools/english/check.sh` | 0 0 0 0 0 | **0 0 0 0 0** |
 
 The six test cases more are the two new tests (970, 971), each in three
-build stages. **Not one line of the compiler was changed** — the two
-reserved FIR opcode numbers and the reserved state block slots stayed
-untouched, and the fixpoint is character-identical for exactly that
-reason. What the operating system needed, the language already had.
+build stages; the two more in the self-comparison are the same two files.
+The fixpoint has exactly the same number of lines as before, and that is
+the strongest single number of this round: **not one line of the compiler was
+changed.** The reserved FIR opcodes 70-79 and the reserved state block
+slots 2400-2499 stayed untouched. What the operating system needed, the
+language already had.
 
 ---
 
@@ -473,8 +475,8 @@ the number in the object file — a relation that holds for both.
 bash test.sh                    911/911
 bash tools/kernel/run.sh        174 passed, 0 failed
 bash tools/freestanding/run.sh  41 passed, 0 failed
-bash tools/self_compare.sh      234 same, 0 differing, 0 faulty
-bash tools/fixpoint.sh          character-identical
+bash tools/self_compare.sh      248 same, 0 differing, 0 faulty
+bash tools/fixpoint.sh          character-identical, 568 341 lines
 bash tools/english/check.sh     0 0 0 0 0
 ```
 
