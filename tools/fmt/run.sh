@@ -90,11 +90,25 @@ mkdir -p "$MIRROR"
 # copy would not find the packages in demos/packages/.
 tar -chf - $(all_sources) $(find . -name 'firn.package' -not -path './.git/*' | sed 's|^\./||') \
     | tar -xf - -C "$MIRROR"
-( cd "$MIRROR" && "$FMT" -w $(find . -name '*.fi') ) || { note "firnfmt -w on the copy"; }
+( cd "$MIRROR" && "$FMT" -w $(find . -name '*.fi') 2>/dev/null )
+mrc=$?
+# 3 = single sources REFUSED (unknown character, unbalanced brackets --
+# the deliberately broken negative tests). Everything else is a failure.
+[ "$mrc" -eq 0 ] || [ "$mrc" -eq 3 ] || note "firnfmt -w on the copy (exit $mrc)"
+
+# The refused files, once, by name. They are left out of the per-file
+# comparison below -- there is nothing to compare -- and are checked
+# separately in step 3: every one of them has to be a source that the
+# COMPILER rejects too.
+"$FMT" -c $(sources) > "$TMPD/shape.txt" 2> "$TMPD/refused.txt"
+sed 's/^.*: //' "$TMPD/refused.txt" | sort > "$TMPD/refused_names.txt"
 
 files=0; tokdiff=0; astdiff=0; nonidem=0; astcases=0; changed=0
 first=""
 while IFS= read -r f; do
+    if grep -qxF "$f" "$TMPD/refused_names.txt"; then
+        continue
+    fi
     files=$((files + 1))
     cmp -s "$f" "$MIRROR/$f" || changed=$((changed + 1))
     # a) the token stream
@@ -122,6 +136,7 @@ while IFS= read -r f; do
     fi
 done < <(sources)
 echo "   files formatted:        $files  (of them changed by the shape: $changed)"
+echo "   refused (deliberately broken): $(wc -l < "$TMPD/refused_names.txt")"
 echo "   token stream differs:   $tokdiff"
 echo "   syntax tree differs:    $astdiff  (out of $astcases comparable files)"
 echo "   second run differs:     $nonidem"
@@ -132,13 +147,22 @@ echo "   second run differs:     $nonidem"
 
 echo
 echo "== 3. the tree in the repository is in canonical shape =="
-if "$FMT" -c $(sources) > "$TMPD/check.txt" 2>&1; then
-    echo "   firnfmt -c: 0 files out of shape"
-else
-    echo "   firnfmt -c: $(wc -l < "$TMPD/check.txt") files out of shape"
-    head -10 "$TMPD/check.txt" | sed 's/^/     /'
+outofshape=$(grep -c 'is not formatted' "$TMPD/shape.txt")
+refusedn=$(wc -l < "$TMPD/refused_names.txt")
+echo "   out of shape: $outofshape"
+echo "   refused:      $refusedn"
+if [ "$outofshape" -ne 0 ]; then
+    head -10 "$TMPD/shape.txt" | sed 's/^/     /'
     note "the tree is not formatted (run: firnfmt -w)"
 fi
+# Every refused file has to be one that the COMPILER rejects too --
+# otherwise firnfmt would be refusing valid Firn.
+while IFS= read -r rf; do
+    [ -n "$rf" ] || continue
+    if FIRNLIB="$ROOT/lib" "$FIRNC" -o /dev/null "$rf" > /dev/null 2>&1; then
+        note "firnfmt refuses a source that the compiler accepts: $rf"
+    fi
+done < "$TMPD/refused_names.txt"
 
 echo
 echo "== 4. random test: blanks scrambled, shape has to stay =="
@@ -149,6 +173,7 @@ step=$(( ${#ALL[@]} / FUZZ ))
 fuzz_cases=0; fuzz_bad=0; fuzz_ast=0; fuzz_astcases=0
 for ((k = 0; k < ${#ALL[@]}; k += step)); do
     f="${ALL[$k]}"
+    grep -qxF "$f" "$TMPD/refused_names.txt" && continue
     dir=$(dirname "$f")
     "$FMT" "$f" > "$TMPD/base.fi" 2>/dev/null || continue
     for seed in 1 2 3; do
