@@ -217,7 +217,7 @@ else
     tail -20 "$WORK/layers.log" | sed 's/^/   /'
 fi
 
-echo "== 8. symbol naming scheme (DESIGNZIELE 4) =="
+echo "== 8. symbol naming scheme (DESIGN_GOALS 4) =="
 bash tools/symbole/run.sh > "$WORK/symbols.log" 2>&1 && SYRC=0 || SYRC=$?
 if [ "$SYRC" -eq 0 ]; then
     ok
@@ -274,7 +274,7 @@ else
 fi
 
 echo "== 10. DOM soak run: cycles without a leak (tools/dom_soak/run.sh) =="
-# The short version: 12 s per variant. The long run is in ABNAHME.md item 2;
+# The short version: 12 s per variant. The long run is in ACCEPTANCE.md item 2;
 # the point here is that the promise is re-checked at EVERY change.
 SOAK_SEC=${SOAK_SEC:-12} SOAK_CYCLES=${SOAK_CYCLES:-400000} \
   SOAK_SAMPLE=${SOAK_SAMPLE:-10000} SOAK_MIN_CYCLES=${SOAK_MIN_CYCLES:-100000} \

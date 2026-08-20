@@ -5,7 +5,7 @@
 Round 45 brought methods — but explicitly only as a writing aid: `x.m(a)`
 became `Typ__m(&x, a)`, decided solely by the **static** type. This
 round adds the other case, which `SPEC.md` §6.2 has demanded since v0.1 and
-which `DESIGNZIELE.md` §1 presumes for `Io`: **one call site, many types.**
+which `DESIGN_GOALS.md` §1 presumes for `Io`: **one call site, many types.**
 
 ```firn
 interface Flaeche {

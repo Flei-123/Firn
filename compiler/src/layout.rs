@@ -1,5 +1,5 @@
 //! Intermediate layer between **field access** and **storage location**
-//! (`DESIGNZIELE.md` §8, foundation point from §10.4).
+//! (`DESIGN_GOALS.md` §8, foundation point from §10.4).
 //!
 //! # Why this module exists
 //!

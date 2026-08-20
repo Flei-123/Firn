@@ -17,7 +17,7 @@
 //! `Span`): the lexer needs exactly one call of [`lex_string_literal`] and
 //! turns [`LitError`] into a message with line/column. That wiring inside
 //! the lexer belongs to the module `kern` and is not yet placed during this
-//! round (see `ABNAHME.md`, section `str`); through
+//! round (see `ACCEPTANCE.md`, section `str`); through
 //! `firnc --strlit <literal>` the whole path stays checkable
 //! nonetheless.
 

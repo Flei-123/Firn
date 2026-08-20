@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ARCHITECTURE CHECK: field access is separated from the memory location.
 #
-# Background: DESIGNZIELE.md 8. As long as `a.b` is written out as
+# Background: DESIGN_GOALS.md 8. As long as `a.b` is written out as
 # "base + offset" everywhere in the tree, the SoA arrangement (`SoaVec[T]`)
 # cannot be added later. That is why an offset may only become an
 # address in `layout.rs`.
@@ -59,7 +59,7 @@ grep -q 'mod layout;' "$SRC/main.rs" || report "layout is not declared in main.r
 
 if [ "$ERRORS" -ne 0 ]; then
     echo
-    echo "The separation of field access and memory location is violated (DESIGNZIELE.md 8)."
+    echo "The separation of field access and memory location is violated (DESIGN_GOALS.md 8)."
     exit 1
 fi
 

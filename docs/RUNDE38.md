@@ -189,7 +189,7 @@ Correctness without compaction and without a second stack scan:
   next cycle.
 - **Exhaustion fallback**: if an allocation in the middle of a cycle finds
   no block, the rest of the cycle is finished atomically before OutOfMemory
-  is reported (DESIGNZIELE §2 stands).
+  is reported (DESIGN_GOALS §2 stands).
 
 ### Measurements (this machine, load caveat: rounds running in parallel)
 

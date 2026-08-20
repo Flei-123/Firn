@@ -290,7 +290,7 @@ impl<'a> Execution<'a> {
 
     /// Reads a data file — ONCE, from the cache after that.
     ///
-    /// SECURITY (DESIGNZIELE §3): compile time file access is a gateway for
+    /// SECURITY (DESIGN_GOALS §3): compile time file access is a gateway for
     /// supply chain attacks — some library dragged along could otherwise read
     /// `/etc/passwd` while building and write it into the generated code.
     /// Hence a hard rule holds here:
@@ -300,7 +300,7 @@ impl<'a> Execution<'a> {
     ///   * no absolute path, no drive or root prefix.
     ///
     /// That is deliberately tighter than needed. Once Firn gets a module system
-    /// with capabilities (DESIGNZIELE §3), it turns into a permission that a
+    /// with capabilities (DESIGN_GOALS §3), it turns into a permission that a
     /// module has to request explicitly.
     fn read_file(&mut self, path: &str, span: Span) -> Result<&Vec<u8>, Error> {
         if !self.files.contains_key(path) {

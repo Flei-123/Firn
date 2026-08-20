@@ -145,7 +145,7 @@ impl<'a> Checker<'a> {
         self.check_main(prog);
     }
 
-    /// **Reentry into the check phases** (DESIGNZIELE.md §7, foundation point
+    /// **Reentry into the check phases** (DESIGN_GOALS.md §7, foundation point
     /// out of §10.4).
     ///
     /// Checks ADDITIONAL declarations with the state built already — the same
@@ -2150,7 +2150,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Reentry into the check phases (DESIGNZIELE.md §7)
+    // Reentry into the check phases (DESIGN_GOALS.md §7)
     // ------------------------------------------------------------------
 
     /// Builds a checker at the state *after* the first pass.

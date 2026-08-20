@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Proof of the SYMBOL NAMING SCHEME (DESIGNZIELE.md 4, modules.rs).
+# Proof of the SYMBOL NAMING SCHEME (DESIGN_GOALS.md 4, modules.rs).
 #
 # It is checked on a binary that was really built:
 #   1. Every symbol produced by Firn carries the reserved prefix with a

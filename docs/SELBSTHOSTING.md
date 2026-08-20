@@ -1,6 +1,6 @@
 # Self-hosting: the plan and the honest state
 
-**Requirement:** `L1` · `SPEC.md` §11 (bootstrap plan) · `ABNAHME.md` item 1
+**Requirement:** `L1` · `SPEC.md` §11 (bootstrap plan) · `ACCEPTANCE.md` item 1
 **State (round 31): the fixpoint holds.** `firnc1` — the compiler written
 in Firn — compiles **itself**, and the result is a fixpoint:
 stage 2 (produced by `firnc1`) and stage 3 (produced by stage 2) are

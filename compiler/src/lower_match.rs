@@ -92,7 +92,7 @@ pub(crate) fn write_ctor_into(
             Some(o) => *o,
             None => return lo.ice(a.span, "payload field without offset"),
         };
-        // Layer field access <-> storage location (layout.rs, DESIGNZIELE 8)
+        // Layer field access <-> storage location (layout.rs, DESIGN_GOALS 8)
         let ad = lo.field_addr_at(addr, off);
         lo.write_into(ad, a)?;
     }
