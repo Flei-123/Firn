@@ -1,29 +1,32 @@
-# Runde 35 — comptime in firnc1
+# Round 35 — comptime in firnc1
 
-## Ziel
-`comptime { ... }`-Bloecke zur Uebersetzungszeit ausfuehren: echter Interpreter in Firn
-(Vorbild `compiler/src/comptime.rs`), erzeugter Quelltext wird als weiteres Modul
-in denselben Baum geparst, bevor die Monomorphisierung laeuft.
+## Goal
+Execute `comptime { ... }` blocks at compile time: a real interpreter in Firn
+(model `compiler/src/comptime.rs`); the generated source text is parsed as a
+further module into the same tree before monomorphization runs.
 
-## Gebaut
-- `lib/firnc1/time.fi` (689 Z.): Registrierung der comptime-Bloecke + Interpreter
-  (Ausdruecke, Anweisungen, Schleifen, Aufrufe auf comptime-fn), Ausgabe in rt.Buf.
-- `ast.fi`: `ct_block`-Sammelliste in der Wurzeldatei.
-- `parser.fi`: liest `comptime { }`, Vorabsuche weicht auf (Bloecke ohne Namensbindung),
-  Flag `par_zeit_setzen`/`par_zeit_an` zur Steuerung.
-- `bin/firnc1.fi`: Treiber-Anschluss — zwischen Wurzelparser und `mono.gen_lauf`:
-  `zeit_lauf` ausfuehren, erzeugten Text ueber dieselbe Lex/Parse-Maschinerie als
-  Modul ohne Alias in denselben Baum haengen (gleicher Interner).
+## Built
+- `lib/firnc1/time.fi` (689 l.): registration of the comptime blocks +
+  interpreter (expressions, statements, loops, calls to comptime-fn), output
+  into rt.Buf.
+- `ast.fi`: `ct_block` collection list in the root file.
+- `parser.fi`: reads `comptime { }`, the pre-scan is relaxed (blocks without a
+  name binding), flag `par_zeit_setzen`/`par_zeit_an` for control.
+- `bin/firnc1.fi`: driver hookup — between the root parser and `mono.gen_lauf`:
+  run `zeit_lauf`, hang the generated text into the same tree as a module
+  without an alias via the same lex/parse machinery (same interner).
 
-## Ehrliche Grenzen (benannt, nicht verschwiegen)
-- comptime in importierten Modulen wird von `sema_braucht_comptime` weiter gemeldet
-  (nur die Wurzeldatei wird ausgefuehrt).
-- Konstanten, die zur Uebersetzungszeit ausgewertet werden muessten, aber nicht
-  koennen, bleiben ein separater bekannter Fall.
+## Honest limits (named, not concealed)
+- comptime in imported modules is still reported by `sema_braucht_comptime`
+  (only the root file is executed).
+- Constants that would have to be evaluated at compile time but cannot
+  remain a separate known case.
 
-## Messwerte (Worktree-Checkout, Branch r35-comptime)
-- test.sh: 634/634 (vorher 631)
-- tools/self_compare.sh: 169 verhaltensgleich (vorher 166), 0 abweichend, 0 fehlerhaft
-- Fixpunkt: Stufe 2 == Stufe 3, zeichengleich, 210324 Zeilen Assembler
-- Neu: tests/760_comptime_core.fi (comptime-Kernsprache)
-- Zieldateien 601/602 (u. a. UCD-Tabellen-Erzeugung) laufen identisch zu firnc0
+## Measurements (worktree checkout, branch r35-comptime)
+- test.sh: 634/634 (previously 631)
+- tools/self_compare.sh: 169 behaviorally identical (previously 166),
+  0 differing, 0 failing
+- Fixpoint: stage 2 == stage 3, character-identical, 210324 lines of assembly
+- New: tests/760_comptime_core.fi (comptime core language)
+- Target files 601/602 (among others UCD table generation) run identically
+  to firnc0

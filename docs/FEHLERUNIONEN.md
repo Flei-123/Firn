@@ -1,39 +1,39 @@
-# Fehlerunionen `E!T` in Firn
+# Error unions `E!T` in Firn
 
-Bezug: `SPEC.md` §5.1 (Vertrag), `SPEC.md` §14.1.fehlerunionen (bewusste
-Einschränkungen der Umsetzung), `PLAN.md` Runde 3.
-Umgesetzt in `compiler/src/errors.rs` (Syntax, Anmeldung, Typprüfung) und
-`compiler/src/lower_errors.rs` (Lowering nach FIR).
+Reference: `SPEC.md` §5.1 (contract), `SPEC.md` §14.1.fehlerunionen
+(deliberate restrictions of the implementation), `PLAN.md` round 3.
+Implemented in `compiler/src/errors.rs` (syntax, registration, type
+checking) and `compiler/src/lower_errors.rs` (lowering to FIR).
 Tests: `tests/400_*.fi` … `tests/419_*.fi`, `tests/neg/err_*.fi`.
 
-## 1. Wozu
+## 1. What for
 
-Ein Tokenizer, ein Parser, ein Allokator — alles, was fehlschlagen darf, ohne
-dass das Programm abstürzt — braucht einen Rückgabeweg für erwartete Fehler.
-Firn nimmt dafür den Weg von `L7`: eine zweiwertige Union aus *Fehlercode* und
-*Erfolgswert*, kein Abwickeln, keine Landing-Pads, keine versteckten Kosten auf
-dem Erfolgspfad.
+A tokenizer, a parser, an allocator — everything that may fail without
+the program crashing — needs a return path for expected errors.
+Firn takes the way of `L7` for that: a two-valued union of *error code* and
+*success value*, no unwinding, no landing pads, no hidden costs on
+the success path.
 
-## 2. Sprachumfang
+## 2. Language surface
 
-### 2.1 Fehlermenge
+### 2.1 Error set
 
 ```firn
 error IoError { NotFound, Permission, Closed }
 ```
 
-Deklaration auf oberster Ebene. Die Codes werden in Deklarationsreihenfolge ab
-`1` vergeben; `0` ist für „kein Fehler" reserviert. Eine doppelte Variante ist
-ein Fehler mit Zeile und Spalte, ebenso eine doppelt deklarierte Fehlermenge.
+Declaration at the top level. The codes are handed out in declaration order
+from `1` on; `0` is reserved for „no error". A duplicate variant is
+an error with a line and a column, and so is a doubly declared error set.
 
-Der Name `IoError` ist selbst ein **Typ**: der reine Fehlerwert.
+The name `IoError` is itself a **type**: the pure error value.
 
 ```firn
 let e: IoError = IoError::Permission
 if e == IoError::Permission { … }        // == und != je Fehlermenge
 ```
 
-### 2.2 Fehlerunion als Typ
+### 2.2 The error union as a type
 
 ```firn
 fn lies(x: i32) -> IoError!i32 { … }     // Rückgabetyp
@@ -42,7 +42,7 @@ struct Halter { r: IoError!i32 }         // Feldtyp
 fn nimm(r: IoError!i32) -> i32 { … }     // Parametertyp
 ```
 
-### 2.3 `return` wandelt implizit um
+### 2.3 `return` converts implicitly
 
 ```firn
 fn lies(x: i32) -> IoError!i32 {
@@ -53,11 +53,11 @@ fn lies(x: i32) -> IoError!i32 {
 }
 ```
 
-Kein `ok(...)`, kein `err(...)`. Dieselbe Umwandlung gilt bei `let` mit
-Typangabe, bei einer Zuweisung, beim Feld eines Struct-Literals und beim
-Argument eines Aufrufs.
+No `ok(...)`, no `err(...)`. The same conversion applies with a `let` that
+has a type annotation, with an assignment, with the field of a struct
+literal and with the argument of a call.
 
-### 2.4 `try` — Fehler nach oben durchreichen
+### 2.4 `try` — pass the error upwards
 
 ```firn
 fn kette(x: i32) -> IoError!i32 {
@@ -66,13 +66,13 @@ fn kette(x: i32) -> IoError!i32 {
 }
 ```
 
-`try` ist nur in einer Funktion erlaubt, die selbst eine Fehlerunion **derselben
-Fehlermenge** liefert. Sonst gibt es einen Fehler mit Zeile und Spalte
-(`tests/neg/err_try_outside.fi`, `tests/neg/err_wrong_set.fi`).
+`try` is only permitted in a function that itself returns an error union of
+**the same error set**. Otherwise there is an error with a line and a
+column (`tests/neg/err_try_outside.fi`, `tests/neg/err_wrong_set.fi`).
 
-`try` bindet so stark wie ein unärer Operator: `try f() + 1` ist `(try f()) + 1`.
+`try` binds as tightly as a unary operator: `try f() + 1` is `(try f()) + 1`.
 
-### 2.5 `catch` — Ersatzwert
+### 2.5 `catch` — substitute value
 
 ```firn
 let v = lies(x) catch 0                  // Ersatzwert bei Fehler
@@ -80,11 +80,12 @@ let w = lies(x) catch ersatz()           // beliebiger Ausdruck
 let z = lies(x) catch |e| deute(e)       // mit Bindung des Fehlerwertes
 ```
 
-`catch` bindet schwächer als jeder Operator: `a catch b * 2` ist
-`a catch (b * 2)`. Der Ersatzwert muss den Erfolgstyp haben; sonst Fehler mit
-Zeile und Spalte (`tests/neg/err_catch_ty.fi`).
+`catch` binds more weakly than any operator: `a catch b * 2` is
+`a catch (b * 2)`. The substitute value must have the success type;
+otherwise there is an error with a line and a column
+(`tests/neg/err_catch_ty.fi`).
 
-### 2.6 `!T` darf nicht verworfen werden
+### 2.6 `!T` must not be discarded
 
 ```firn
 fn main() -> i32 {
@@ -93,10 +94,10 @@ fn main() -> i32 {
 }
 ```
 
-Der Struct einer Fehlerunion trägt `must_consume = true`; die Prüfung ist die
-vorhandene in `sema::check_discard`.
+The struct of an error union carries `must_consume = true`; the check is
+the existing one in `sema::check_discard`.
 
-## 3. Darstellung
+## 3. Representation
 
 ```text
 error IoError { NotFound, Permission, Closed }     // Codes 1, 2, 3
@@ -107,43 +108,44 @@ IoError!i64    ->  struct { __err: u32, __val: i64 }          16 Byte
 IoError!Gross  ->  struct { __err: u32, __val: Gross }        40 Byte
 ```
 
-`__val` liegt bei `round_up(4, align(T))`. `__err == 0` heißt Erfolg.
+`__val` lies at `round_up(4, align(T))`. `__err == 0` means success.
 
-Das ist der ganze Trick: eine Fehlerunion ist ein **gewöhnlicher Struct** in
-`types::TypeCtx`. Damit tragen Aggregat-ABI (`abi.rs`), Registerzuteilung
-(`regalloc.rs`) und Codegen (`codegen_x86.rs`) sie ohne eine einzige Änderung —
-bis 8 Byte in `rax`, darüber über den versteckten Rückgabezeiger.
-Die Seitentabelle `union_by_struct` in `errors.rs` spielt dieselbe Rolle wie
-`enum_by_struct` für Aufzählungen.
+That is the whole trick: an error union is an **ordinary struct** in
+`types::TypeCtx`. Because of that, the aggregate ABI (`abi.rs`), the
+register allocation (`regalloc.rs`) and the codegen (`codegen_x86.rs`)
+carry it without a single change — up to 8 bytes in `rax`, above that over
+the hidden return pointer.
+The side table `union_by_struct` in `errors.rs` plays the same role as
+`enum_by_struct` for enums.
 
-## 4. Was das Lowering erzeugt
+## 4. What the lowering produces
 
-| Quelltext | FIR |
+| Source text | FIR |
 |---|---|
 | `IoError::NotFound` | `store.u32 [slot] = 1` |
-| `return wert` (Erfolg) | `store.u32 [ret] = 0`, danach der Wert nach `__val` |
+| `return wert` (success) | `store.u32 [ret] = 0`, then the value into `__val` |
 | `return IoError::X` | `store.u32 [ret] = code` |
-| `try a` | `cmp.ne u32 a.__err, 0` → `brcond` → Fehlerblock mit `ret`, sonst Adresse von `a.__val` |
-| `a catch b` | `cmp.eq u32 a.__err, 0` → `brcond` → `a.__val` bzw. `b`, Zusammenführung über einen Slot |
+| `try a` | `cmp.ne u32 a.__err, 0` → `brcond` → error block with `ret`, otherwise the address of `a.__val` |
+| `a catch b` | `cmp.eq u32 a.__err, 0` → `brcond` → `a.__val` resp. `b`, merged over a slot |
 | `e == IoError::X` | `cmp.eq u32 e.__err, code` |
 
-Keine neue FIR-Instruktion, kein neuer Terminator — nur `load`, `store`, `cmp`,
-`brcond` und `ret`.
+No new FIR instruction, no new terminator — only `load`, `store`, `cmp`,
+`brcond` and `ret`.
 
-## 5. Aufbau der Umsetzung
+## 5. Structure of the implementation
 
-| Datei | Inhalt |
+| File | Content |
 |---|---|
-| `compiler/src/errors.rs` | Registrierung der Fehlermengen/Fehlerunionen, Parser-Erweiterungen (`error`, `E!T`, `try`, `catch`), Typprüfung, implizite Umwandlung |
-| `compiler/src/lower_errors.rs` | Lowering nach FIR |
-| `parser.rs`, `sema.rs`, `lower.rs`, `lexer.rs` | je eine Zeile `// HOOK fehlerunionen` an den vorgesehenen Stellen |
+| `compiler/src/errors.rs` | registration of the error sets/error unions, parser extensions (`error`, `E!T`, `try`, `catch`), type checking, implicit conversion |
+| `compiler/src/lower_errors.rs` | lowering to FIR |
+| `parser.rs`, `sema.rs`, `lower.rs`, `lexer.rs` | one line `// HOOK fehlerunionen` each at the intended places |
 
-Die Aufteilung folgt dem Vorbild `sema_match.rs` / `lower_match.rs`.
+The split follows the model of `sema_match.rs` / `lower_match.rs`.
 
-## 6. Grenzen
+## 6. Limits
 
-Vollständig und nummeriert in `SPEC.md` §14.1.fehlerunionen (F1–F10). Die
-wichtigsten: keine abgeleitete Fehlermenge (`!T` ohne `E`), kein `defer`/
-`errdefer`, `catch |e|` bindet an einen Ausdruck statt an einen Block, kein
-`match` auf Fehlerwerten, keine Vereinigung von Fehlermengen, und als Feldtyp
-eines Structs nur mit skalarem Erfolgstyp.
+Complete and numbered in `SPEC.md` §14.1.fehlerunionen (F1–F10). The
+most important ones: no inferred error set (`!T` without `E`), no `defer`/
+`errdefer`, `catch |e|` binds to an expression instead of to a block, no
+`match` on error values, no union of error sets, and as the field type of a
+struct only with a scalar success type.

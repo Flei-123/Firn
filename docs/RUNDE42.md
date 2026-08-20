@@ -1,88 +1,86 @@
-# Runde 42: die Standardbibliothek
+# Round 42: the standard library
 
-Reine Bibliotheksarbeit. An Lexer, Parser, Sema, Lowering und Codegen ist
-**keine Zeile** geändert — die beiden Compiler sind exakt die des
-Basis-Commits. Was hier steht, ist Firn-Code in `lib/`, dazu sieben
-Testprogramme.
+Pure library work. **Not a single line** was changed in the lexer, parser,
+sema, lowering or codegen — the two compilers are exactly those of the
+base commit. What is described here is Firn code in `lib/`, plus seven
+test programs.
 
-**Basis: `fe31d13` (Runde 41).** Gebaut und begonnen wurde auf `da3b0d9`;
-weil Runde 41 währenddessen einen Miscompile in `firnc0` behoben hat, der
-`test.sh` in Abschnitt 12 endlos hängen ließ (Befund D unten), ist dieser
-Zweig darauf umgesetzt (`git rebase main`) und die Abnahme **vollständig neu
-gemessen** — mit einem selbst gebauten `firnc0` und frisch gebauten
-Hilfsbinaries, ohne jeden Handgriff von außen.
+**Base: `fe31d13` (round 41).** The work was built and begun on `da3b0d9`;
+because round 41 fixed a miscompile in `firnc0` in the meantime that made
+`test.sh` hang forever in section 12 (finding D below), this branch was
+moved onto it (`git rebase main`) and the acceptance was **measured
+completely anew** — with a self-built `firnc0` and freshly built helper
+binaries, without any outside intervention.
 
 ---
 
-## 1. Bestandsaufnahme: was die std vor dieser Runde konnte
+## 1. Stocktaking: what the std could do before this round
 
-`lib/std/` entstand in Runde 39 als Fassade über den vorhandenen Bausteinen.
-Sie war vollständig **in der Breite** (jedes Thema hatte ein Modul) und dünn
-**in der Tiefe** (jedes Modul hatte das Nötigste).
+`lib/std/` came into being in round 39 as a facade over the existing
+building blocks. It was complete **in breadth** (every topic had a module)
+and thin **in depth** (every module had the bare necessities).
 
-| Modul | Herkunft | Konnte vorher | Fehlte |
+| Module | Origin | Could do before | Was missing |
 |---|---|---|---|
-| `std.io` | Hand, 92 Z. | `print`, `eprint`, `read_file`, `write_file`, `Fmt` mit `fmt_neu/text/zahl/len/druck/frei` | Zeilenumbruch, C-Zeichenketten, Anhängen an Dateien, stdin, **Zeilen lesen**, Zeichen/Hex/u64/bool im Builder, Ergebnis in einen Puffer statt auf stdout |
-| `std.math` | Hand, 116 Z. | `PI`, `E`, `abs`, `min`, `max`, `clamp`, `isqrt`, `pow` (Ganzzahl), `sqrt`, `powi` (f64) | `floor/ceil/round/trunc`, `fabs/fmin/fmax/fclamp`, `fmod`, `hypot`, `ldexp/frexp`, `exp/ln/log2/log10`, Trigonometrie, `gcd/lcm`, Zweierpotenzen, `INF/NAN/EPSILON`, vorzeichenlose Varianten |
-| `std.str` | **erzeugt** aus `lib/str`, 741 Z. | `Bytes`, `Str16`, WTF-8/UTF-16-Umwandlungen, `utf8_is_valid`, `AtomTable` | alles, was man täglich mit Text macht: vergleichen, suchen, trimmen, teilen, verbinden, ersetzen, Groß/Klein, auffüllen — und eine **Iteration über Zeichen** |
-| `std.num` | **erzeugt** aus `lib/num`, 1203 Z. | `Bn` (16384-bit), `dtoa`, `strtod` — beide exakt | Ganzzahl ↔ Text in **beide** Richtungen, andere Basen, Vorzeichen, Auffüllen, Überlauferkennung, eine f64-Hülle über `dtoa`/`strtod` (die Kerne rechnen auf Bitmustern, weil sie älter sind als `f64`) |
-| `std.vec` | Symlink `lib/rt/vec.fi`, 137 Z. | `vec_neu/frei/leeren/reserve/push/at/setzen/len/kap/ptr/letztes/pop` | suchen, einfügen, entfernen, kopieren, vergleichen, umkehren, **sortieren**, binär suchen |
-| `std.map` | Symlink `lib/rt/map.fi`, 298 Z. | `map_neu/frei/leeren/setzen/hol/hat/loeschen/len/kap/reserve` + Platzzugriffe | **Iteration**, „hol oder Vorgabe", „hol und sag ob da war", herausnehmen, Zählmuster, Grabsteine aufräumen |
-| `std.mem` | Hand, 54 Z. | `alloc`/`free`, `heap_*` der rc-Halde | — (in dieser Runde nicht angefasst) |
-| `std.rt`, `std.intern`, `std.rc` | Symlinks | Laufzeitkern, Interner, Zählverweise | — (nicht angefasst) |
+| `std.io` | hand, 92 l. | `print`, `eprint`, `read_file`, `write_file`, `Fmt` with `fmt_neu/text/zahl/len/druck/frei` | line break, C strings, appending to files, stdin, **reading lines**, characters/hex/u64/bool in the builder, result into a buffer instead of stdout |
+| `std.math` | hand, 116 l. | `PI`, `E`, `abs`, `min`, `max`, `clamp`, `isqrt`, `pow` (integer), `sqrt`, `powi` (f64) | `floor/ceil/round/trunc`, `fabs/fmin/fmax/fclamp`, `fmod`, `hypot`, `ldexp/frexp`, `exp/ln/log2/log10`, trigonometry, `gcd/lcm`, powers of two, `INF/NAN/EPSILON`, unsigned variants |
+| `std.str` | **generated** from `lib/str`, 741 l. | `Bytes`, `Str16`, WTF-8/UTF-16 conversions, `utf8_is_valid`, `AtomTable` | everything one does with text daily: compare, search, trim, split, join, replace, upper/lower, pad — and an **iteration over characters** |
+| `std.num` | **generated** from `lib/num`, 1203 l. | `Bn` (16384-bit), `dtoa`, `strtod` — both exact | integer ↔ text in **both** directions, other bases, signs, padding, overflow detection, an f64 wrapper over `dtoa`/`strtod` (the cores compute on bit patterns because they are older than `f64`) |
+| `std.vec` | symlink `lib/rt/vec.fi`, 137 l. | `vec_neu/frei/leeren/reserve/push/at/setzen/len/kap/ptr/letztes/pop` | search, insert, remove, copy, compare, reverse, **sort**, binary search |
+| `std.map` | symlink `lib/rt/map.fi`, 298 l. | `map_neu/frei/leeren/setzen/hol/hat/loeschen/len/kap/reserve` + slot access | **iteration**, „get or default", „get and say whether it was there", take out, counting patterns, cleaning up tombstones |
+| `std.mem` | hand, 54 l. | `alloc`/`free`, `heap_*` of the rc heap | — (not touched in this round) |
+| `std.rt`, `std.intern`, `std.rc` | symlinks | runtime core, interner, reference counts | — (not touched) |
 
-Kurz: man konnte mit der std **rechnen und Speicher verwalten**, aber nicht
-bequem **Text verarbeiten**, nicht **sortieren** und nicht **über eine Map
-laufen**.
+In short: with the std one could **compute and manage memory**, but not
+comfortably **process text**, not **sort** and not **walk over a map**.
 
 ---
 
-## 2. Wohin der neue Code gehört — die eine Bauentscheidung dieser Runde
+## 2. Where the new code belongs — the one construction decision of this round
 
-Drei verschiedene Sorten Modul verlangen drei verschiedene Wege:
+Three different kinds of module demand three different ways:
 
-**`std.str` und `std.num` werden ERZEUGT.** `lib/str` und `lib/num` sind
-Einbindungs-Bibliotheken aus Stufe 0: ihre Dateien verweisen sich textuell
-(`//#include`) und tragen keine Modulstruktur. `tools/strlib/expand.py` setzt
-daraus je **ein** Modul zusammen und schreibt es nach `lib/std/`. Eine
-Erweiterung von Hand in `lib/std/str.fi` wäre bei der nächsten Erzeugung weg;
-eine Erweiterung in `lib/str/bytes.fi` läge auch jedem `html`/`dom`-Nutzer im
-Binary. Deshalb gibt es **zwei neue Quelldateien, die ausschließlich die
-Fassade einbindet**:
+**`std.str` and `std.num` are GENERATED.** `lib/str` and `lib/num` are
+include libraries from stage 0: their files reference each other textually
+(`//#include`) and carry no module structure. `tools/strlib/expand.py`
+assembles **one** module each from them and writes it to `lib/std/`. An
+extension by hand in `lib/std/str.fi` would be gone at the next generation;
+an extension in `lib/str/bytes.fi` would also sit in the binary of every
+`html`/`dom` user. That is why there are **two new source files that are
+included exclusively by the facade**:
 
 ```
 lib/str/std_facade.fi   <- nur aus tools/strlib/src/std_str.fi
 lib/num/std_facade.fi   <- nur aus tools/strlib/src/std_num.fi
 ```
 
-`lib/str/*.fi` und `lib/num/*.fi` sind **unverändert**; die erzeugten Tests
-300–308 bekommen kein Byte dazu.
+`lib/str/*.fi` and `lib/num/*.fi` are **unchanged**; the generated tests
+300–308 do not gain a single byte.
 
-**`std.vec` und `std.map` sind Symlinks auf `lib/rt/vec.fi` und
-`lib/rt/map.fi` — und `lib/firnc1/vec.fi` ist derselbe Symlink.** Alles, was
-dort dazukommt, ist deshalb **generisch**: eine Vorlage wird erst zu Code,
-wenn ein Programm sie für einen Typ benutzt (Monomorphisierung, Runde 2).
-Nachgemessen: der Fixpunkt (`.firnc2.s`) hat nach dem Ausbau **exakt dieselbe
-Zeilenzahl** wie vorher — der selbstgehostete Compiler trägt von den 21 neuen
-`Vec`- und 11 neuen `Map`-Funktionen nichts.
+**`std.vec` and `std.map` are symlinks to `lib/rt/vec.fi` and
+`lib/rt/map.fi` — and `lib/firnc1/vec.fi` is the same symlink.** Everything
+added there is therefore **generic**: a template only becomes code when a
+program uses it for a type (monomorphization, round 2).
+Measured afterwards: after the extension the fixpoint (`.firnc2.s`) has
+**exactly the same line count** as before — the self-hosted compiler carries
+nothing of the 21 new `Vec` and 11 new `Map` functions.
 
-**`std.math` und `std.io` sind handgeschriebene Moduldateien** und werden
-direkt erweitert; ihre `export`-Listen sind mitgewachsen und nach Runden
-gegliedert.
+**`std.math` and `std.io` are hand-written module files** and are extended
+directly; their `export` lists have grown along and are structured by round.
 
 ---
 
-## 3. Was dazugekommen ist — Modul für Modul
+## 3. What was added — module by module
 
-### 3.1 `std.str` (+863 Zeilen, `lib/str/std_facade.fi`)
+### 3.1 `std.str` (+863 lines, `lib/str/std_facade.fi`)
 
-Zwei Typen, eine Regel, an jeder Signatur ablesbar:
+Two types, one rule, readable off every signature:
 
-* **`Spanne { p: *mut u8, n: usize }`** ist die **lesende** Sicht. Sie
-  besitzt nichts, alloziert nichts, wird als Wert weitergereicht — wie
-  `ReadOnlySpan<byte>`. Jede *Frage* über Text nimmt eine `Spanne`.
-* **`Bytes`** (aus `lib/str/bytes.fi`) bleibt der **besitzende** Puffer. Jede
-  Funktion, die Text *erzeugt*, schreibt in ein `*mut Bytes`.
+* **`Spanne { p: *mut u8, n: usize }`** is the **reading** view. It
+  owns nothing, allocates nothing, is passed around as a value — like
+  `ReadOnlySpan<byte>`. Every *question* about text takes a `Spanne`.
+* **`Bytes`** (from `lib/str/bytes.fi`) remains the **owning** buffer. Every
+  function that *creates* text writes into a `*mut Bytes`.
 
 ```firn
 fn npos() -> usize                                  // "nicht gefunden"
@@ -173,37 +171,38 @@ fn utf8_teil(s: Spanne, von_zeichen: usize, anzahl: usize) -> Spanne
 fn utf8_anhaengen(aus: *mut Bytes, cp: u32)
 ```
 
-Festgelegte Regeln, damit nichts geraten werden muss:
+Rules laid down so that nothing has to be guessed:
 
-* **Teilen** folgt C# ohne `RemoveEmptyEntries`: `"a,b,,c"` mit `","` ergibt
-  vier Stücke, `""` ergibt genau ein leeres, ein leerer Trenner ergibt genau
-  ein Stück (die ganze Quelle). `teiler_leerraum` fasst Leerraumfolgen
-  zusammen und liefert nie ein leeres Stück.
-* **Ein leerer Suchtext** wird an der Startposition *gefunden* — dieselbe
-  Regel wie in C# und Rust. Sie macht `ersetze` mit leerem `alt` zu einer
-  Nulloperation statt zu einer Endlosschleife.
-* **`utf8_lies` prüft dieselben Regeln wie `utf8_is_valid`**: überlange
-  Kodierungen, Surrogate und alles über U+10FFFF sind ungültig. Ein
-  ungültiges Oktett wird als **ein** Zeichen mit `gueltig = false` und
-  `cp = U+FFFD` gemeldet — so kommt jede Schleife garantiert voran.
-* **Die erzeugenden Funktionen leeren `aus` und verlangen, dass `aus` nicht
-  im Speicher der Quelle liegt.** Wer an Ort und Stelle arbeiten will, nimmt
-  die `_hier`-Formen.
-* **`verbinde_teil` erkennt „da steht schon etwas" an der Länge des
-  Zielpuffers.** Ein *erstes* leeres Stück bekommt deshalb keinen Trenner
-  nachgestellt: `["", "a"]` mit `"-"` ergibt `"a"`, nicht `"-a"`. Für den
-  Regelfall (nicht leere Stücke, oder ein Puffer, in den vorher schon etwas
-  geschrieben wurde) ist das richtig; wer leere Stücke verbinden muss, zählt
-  selbst mit und ruft `anhaengen` mit dem Trenner. Bewusst so gelassen: die
-  Alternative wäre ein Zustand *im* Aufrufer oder ein vierter Parameter, und
-  beides wäre für den Regelfall schlechter.
+* **Splitting** follows C# without `RemoveEmptyEntries`: `"a,b,,c"` with
+  `","` gives four pieces, `""` gives exactly one empty one, an empty
+  separator gives exactly one piece (the whole source). `teiler_leerraum`
+  merges runs of whitespace and never returns an empty piece.
+* **An empty search text** is *found* at the start position — the same
+  rule as in C# and Rust. It makes `ersetze` with an empty `alt` a
+  no-op instead of an endless loop.
+* **`utf8_lies` checks the same rules as `utf8_is_valid`**: overlong
+  encodings, surrogates and everything above U+10FFFF are invalid. An
+  invalid octet is reported as **one** character with `gueltig = false` and
+  `cp = U+FFFD` — that way every loop is guaranteed to make progress.
+* **The creating functions clear `aus` and require that `aus` does not
+  lie in the memory of the source.** Whoever wants to work in place takes
+  the `_hier` forms.
+* **`verbinde_teil` recognizes „there is already something there" by the
+  length of the target buffer.** A *first* empty piece therefore does not
+  get a separator appended after it: `["", "a"]` with `"-"` gives `"a"`,
+  not `"-a"`. For the regular case (non-empty pieces, or a buffer into
+  which something was written before) that is right; whoever has to join
+  empty pieces counts along themselves and calls `anhaengen` with the
+  separator. Deliberately left this way: the alternative would be state
+  *in* the caller or a fourth parameter, and both would be worse for the
+  regular case.
 
-### 3.2 `std.num` (+422 Zeilen, `lib/num/std_facade.fi`)
+### 3.2 `std.num` (+422 lines, `lib/num/std_facade.fi`)
 
-Eine Regel für die Richtung, an jedem Namen ablesbar: `schreibe_*` hängt den
-Text einer Zahl an ein `*mut Bytes` an, `lies_*` liest Text und gibt die Zahl
-der **verbrauchten** Oktette zurück, `text_zu_*` ist die strenge Form (der
-ganze Text oder `false`).
+One rule for the direction, readable off every name: `schreibe_*` appends
+the text of a number to a `*mut Bytes`, `lies_*` reads text and returns the
+number of **consumed** octets, `text_zu_*` is the strict form (the whole
+text or `false`).
 
 ```firn
 fn u64_max() -> u64          fn i64_max() -> i64        fn i64_min() -> i64
@@ -243,19 +242,20 @@ fn text_zu_f64(p: *mut u8, n: usize, aus: *mut f64) -> bool
 fn text_zu_f64_bits(p: *mut u8, n: usize, aus: *mut u64) -> bool
 ```
 
-* **Überlauf wird gemeldet, nicht verschwiegen.** Stufe 0 prüft in der
-  Arithmetik nirgends (SPEC §14.1.3); beim Einlesen *fremder* Eingaben wäre
-  ein stiller Umbruch eine Lücke, kein Schönheitsfehler. `lies_*` setzt
-  `ueberlauf` und liest die Ziffern trotzdem zu Ende (der Aufrufer muss
-  wissen, wo der Text weitergeht), `text_zu_*` gibt `false`.
-* **Die f64-Hülle kostet zwei `mmap` je Aufruf** (14 KiB Arbeitsspeicher für
-  `dtoa`, ein Zwischenpuffer, weil `dtoa` sein Ziel leert). Das ist die
-  bequeme, nicht die schnelle Form; wer viele Zahlen schreibt, ruft `dtoa`
-  direkt mit eigenem Arbeitsspeicher. Steht so im Kopf der Funktion.
-* `f64_bits`/`bits_f64` deuten das **Bitmuster** um (über den Speicher).
-  `as` wäre eine Wert-Umwandlung: `1.0 as u64` ist `1`.
+* **Overflow is reported, not concealed.** Stage 0 checks nowhere in
+  arithmetic (SPEC §14.1.3); when reading *foreign* input a silent
+  wraparound would be a hole, not a blemish. `lies_*` sets
+  `ueberlauf` and reads the digits to the end anyway (the caller has to
+  know where the text continues), `text_zu_*` returns `false`.
+* **The f64 wrapper costs two `mmap` per call** (14 KiB of working memory
+  for `dtoa`, one intermediate buffer, because `dtoa` clears its target).
+  That is the comfortable form, not the fast one; whoever writes many
+  numbers calls `dtoa` directly with their own working memory. It says so
+  in the header of the function.
+* `f64_bits`/`bits_f64` reinterpret the **bit pattern** (via memory).
+  `as` would be a value conversion: `1.0 as u64` is `1`.
 
-### 3.3 `std.vec` (+312 Zeilen, generisch, `lib/rt/vec.fi`)
+### 3.3 `std.vec` (+312 lines, generic, `lib/rt/vec.fi`)
 
 ```firn
 fn vec_ist_leer[T](v: *mut Vec[T]) -> bool
@@ -282,18 +282,19 @@ fn vec_binaersuche[T](v: *mut Vec[T], wert: T) -> usize     // len = nicht da
 fn vec_sortiert_einfuegen[T](v: *mut Vec[T], wert: T) -> bool
 ```
 
-**Warum Heapsort und nicht Quicksort** — drei nachprüfbare Gründe:
-O(n log n) auch im schlechtesten Fall (Quicksort entartet bei bereits
-sortierter oder gleichverteilter Eingabe zu O(n²) — genau die kommen in einem
-Compiler dauernd vor), kein Zusatzspeicher (Mergesort bräuchte n Elemente),
-keine Rekursion (die Tiefe hinge sonst an der Eingabe, und Stufe 0 hat keine
-Stapelprüfung). Der Preis steht dabei: **nicht stabil**.
+**Why heapsort and not quicksort** — three verifiable reasons:
+O(n log n) even in the worst case (quicksort degenerates to O(n²) on input
+that is already sorted or uniformly distributed — exactly the kind that
+occurs constantly in a compiler), no extra memory (mergesort would need n
+elements), no recursion (its depth would otherwise hang on the input, and
+stage 0 has no stack check). The price is stated along with it: **not
+stable**.
 
-Die Ordnung ist die des Typs (`<` auf `T`) — bei `u64` also die
-vorzeichenlose. `tests/802` sortiert deshalb bewusst auch ein `Vec[u64]` mit
-2⁶³ und 2⁶⁴−1 darin.
+The order is that of the type (`<` on `T`) — for `u64` therefore the
+unsigned one. `tests/802` therefore deliberately also sorts a `Vec[u64]`
+with 2⁶³ and 2⁶⁴−1 in it.
 
-### 3.4 `std.map` (+139 Zeilen, generisch, `lib/rt/map.fi`)
+### 3.4 `std.map` (+139 lines, generic, `lib/rt/map.fi`)
 
 ```firn
 fn map_ist_leer[K, V](m: *mut Map[K, V]) -> bool
@@ -310,7 +311,7 @@ fn map_nehmen[K, V](m: *mut Map[K, V], k: K, aus: *mut V) -> bool
 fn map_aufraeumen[K, V](m: *mut Map[K, V]) -> bool
 ```
 
-Iteration als **Kursor über die Plätze**, nicht als Feld:
+Iteration as a **cursor over the slots**, not as an array:
 
 ```firn
 var i: usize = map_naechster[K, V](&m, 0)
@@ -321,17 +322,17 @@ while i < map_kap[K, V](&m) {
 }
 ```
 
-Grund: `lib/rt/map.fi` bindet bewusst kein `vec` ein. Ein zweiter Import in
-einem Modul, das der Compiler selbst benutzt, ist Gewicht ohne Gegenwert, und
-`firnc1` dedupliziert Importpfade als Zeichenkette (Runde 39) — wer `std.map`
-und `rt.vec` mischt, lädt sonst dieselbe Datei zweimal. Wer die Schlüssel doch
-als Feld will, schiebt sie in dieser Schleife in ein `Vec[K]`; dann steht der
-Import beim Aufrufer, wo er hingehört.
+Reason: `lib/rt/map.fi` deliberately does not include `vec`. A second
+import in a module the compiler itself uses is weight without a return, and
+`firnc1` deduplicates import paths as strings (round 39) — whoever mixes
+`std.map` and `rt.vec` otherwise loads the same file twice. Whoever does
+want the keys as an array pushes them into a `Vec[K]` in this loop; then
+the import is at the caller, where it belongs.
 
-Dokumentierte Warnung: **während der Iteration nicht einfügen** (ein
-Einfügen kann neu streuen). Löschen ist unbedenklich.
+Documented warning: **do not insert during the iteration** (an insertion
+can rehash). Deleting is harmless.
 
-### 3.5 `std.math` (+633 Zeilen)
+### 3.5 `std.math` (+633 lines)
 
 ```firn
 // Konstanten und Bitmuster
@@ -367,27 +368,29 @@ fn atan(x: f64) -> f64    fn atan2(y: f64, x: f64) -> f64
 fn nahe(a: f64, b: f64, eps: f64) -> bool
 ```
 
-* **`trunc/floor/ceil/round` rechnen nicht, sie schneiden Bits ab.** Damit
-  stimmen sie auch bei 2⁵² und darüber, wo jede Formel mit `+0.5` falsch ist,
-  und `round(0.49999999999999994)` ist `0.0` statt fälschlich `1.0`.
-* **`fmod` ist exakt**: der Betrag des Teilers wird verdoppelt, bis er über
-  dem Rest liegt, dann halbierend abgezogen — jede Zwischenzahl liegt auf
-  demselben Bitraster, also ist jede Subtraktion exakt.
-* **`fmin`/`fmax` übergehen NaN**, statt es weiterzureichen; sonst vergiftet
-  ein einziges NaN jedes Minimum über einem Feld.
-* **`exp/ln/sin/cos/tan/atan/atan2` sind Reihen mit Bereichsreduktion, ohne
-  Tabellen. Sie sind NICHT korrekt gerundet.** Gemessene Schranke im
-  geprüften Bereich: **relativ 1e-12**; bei `sin`/`cos` mit großem Argument
-  (|x| = 100) nur noch **1e-10** — die Reduktion rechnet in doppelter
-  Genauigkeit und verliert dort Stellen. Das ist die übliche Grenze ohne
-  Payne-Hanek-Reduktion.
-* **Namensregel, bewusst beibehalten:** mathematische Funktionen tragen ihren
-  internationalen Namen (`sqrt`, `floor`, `exp`, `sin`) — das Modul heißt
-  seit Runde 39 so, und ein `wurzel` neben dem bestehenden `sqrt` wären zwei
-  Namen für eine Sache. Alles, was kein eingebürgerter Funktionsname ist,
-  heißt deutsch (`ist_zweierpotenz`, `naechste_zweierpotenz`, `nahe`).
+* **`trunc/floor/ceil/round` do not compute, they cut off bits.** That way
+  they are also right at 2⁵² and above, where every formula with `+0.5` is
+  wrong, and `round(0.49999999999999994)` is `0.0` instead of erroneously
+  `1.0`.
+* **`fmod` is exact**: the magnitude of the divisor is doubled until it lies
+  above the remainder, then subtracted while halving — every intermediate
+  number lies on the same bit grid, so every subtraction is exact.
+* **`fmin`/`fmax` pass over NaN** instead of passing it on; otherwise a
+  single NaN poisons every minimum over an array.
+* **`exp/ln/sin/cos/tan/atan/atan2` are series with range reduction, without
+  tables. They are NOT correctly rounded.** Measured bound in the
+  checked range: **relative 1e-12**; for `sin`/`cos` with a large argument
+  (|x| = 100) only **1e-10** — the reduction computes in double
+  precision and loses digits there. That is the usual limit without
+  Payne-Hanek reduction.
+* **Naming rule, deliberately kept:** mathematical functions carry their
+  international name (`sqrt`, `floor`, `exp`, `sin`) — the module has been
+  called that since round 39, and a `wurzel` next to the existing `sqrt`
+  would be two names for one thing. Everything that is not an established
+  function name is German (`ist_zweierpotenz`, `naechste_zweierpotenz`,
+  `nahe`).
 
-### 3.6 `std.io` (+285 Zeilen)
+### 3.6 `std.io` (+285 lines)
 
 ```firn
 fn println(p: u64, n: usize)             fn eprintln(p: u64, n: usize)
@@ -413,245 +416,244 @@ fn fmt_druck_zeile(f: Fmt)               fn fmt_eprint(f: Fmt)
 fn fmt_eprint_zeile(f: Fmt)              fn fmt_in_datei(f: Fmt, pfad: u64) -> bool
 ```
 
-Damit sind die **zwei Lücken geschlossen, die `docs/RUNDE39.md` am Ende
-ausdrücklich benannt hat**: `fmt_zeichen` (ein Zeichen als *Buchstabe*, nicht
-als Dezimalzahl — `f"{c}"` zeigt sonst `65` statt `A`) und `fmt_inhalt`
-(Ergebnis in einen Puffer statt auf stdout).
+With that the **two gaps that `docs/RUNDE39.md` explicitly named at the
+end** are closed: `fmt_zeichen` (a character as a *letter*, not
+as a decimal number — `f"{c}"` otherwise shows `65` instead of `A`) and
+`fmt_inhalt` (result into a buffer instead of onto stdout).
 
-Der `Zeilenleser` ist ein Kursor über einen bereits gelesenen Block: jede
-Zeile kommt als Zeiger+Länge **innerhalb** des Blocks, ohne Kopie. Der
-Umbruch gehört nicht zur Zeile, ein vorangehendes `\r` fällt weg, und ein
-abschließendes `\n` erzeugt **keine** leere Schlusszeile — die Regel, die
-`wc -l` und jeder Editor benutzen.
-
----
-
-## 4. Was bewusst NICHT gebaut wurde — und warum
-
-1. **Keine generische `Option[T]`/`Result[T]`-Schicht.** Die
-   Monomorphisierung setzt Typargumente in der **Nutzlast einer Fehlerunion**
-   nicht ein (`docs/RC.md`, Abweichung A4: `fn f[T](..) -> AllocError!Zaehlverweis[T]`
-   meldet „unbekannter typ"), und `enum` ist nicht generisch (SPEC §14.1.types
-   T3). Ein echtes `Option[T]` braucht eine **Kernänderung** — die war für
-   diese Runde ausgeschlossen. Statt eines vierten, halben Weges nutzt die
-   Bibliothek durchgehend die drei Formen, die die Sprache heute *hat*, und
-   zwar konsequent:
-   * **Ausgabezeiger + `bool`**, wenn „da/nicht da" und der Wert beide zählen
-     (`map_hol_wenn`, `text_zu_u64`, `teiler_naechst`)
-   * **Sonderwert**, wenn ein Index gesucht wird (`npos()` in `std.str`,
-     `vec_len` in `std.vec`, `map_kap` in `std.map` — jeweils ein Index, der
-     nie ein Treffer sein kann)
-   * **Vorgabe**, wenn der Aufrufer den Ersatz kennt (`map_hol_oder`)
-2. **Kein Zahlen-Parser in `std.str`.** Text → Zahl steht ausschließlich in
-   `std.num`. Zwei Parser wären zwei Wahrheiten.
-3. **Groß/Klein nur ASCII.** Unicode-Fallabbildung braucht die UCD-Tabellen;
-   die liegen im comptime-Zweig (`tests/602_comptime_ucd.fi`) und gehören
-   nicht in die Kernfassade.
-4. **`teiler_*` liefert eine Folge, keine Liste.** `lib/str` ist eine
-   Einbindungs-Bibliothek ohne Modulstruktur und kann `Vec[T]` nicht
-   einbinden. Der Kursor ist ohnehin die Form, die nichts alloziert.
-5. **Kein Sortieren nach eigenem Vergleich.** Firn kennt keine
-   Funktionszeiger (`docs/SELBSTHOSTING.md`, Zeile 1576). `vec_sortiere`
-   ordnet nach `<` auf `T`; alles andere bräuchte ein Sprachmittel.
-6. **Kein stabiles Sortieren.** Siehe 3.3 — bei Skalaren nicht
-   unterscheidbar, bei Paaren wäre es eine Zusage, die hier fehlt.
-7. **Kein `Str`-Typ (geprüftes UTF-8) über der `Spanne`.** `Spanne` ist roh;
-   `utf8_is_valid` sagt, ob eine Folge Text ist. Ein eigener Typ ohne
-   Sprachmittel zur Erzwingung wäre eine Zusage ohne Deckung.
-8. **Keine korrekt gerundeten Elementarfunktionen.** Das braucht Tabellen und
-   ist eine eigene Runde. Die tatsächliche Schranke steht in 3.5 und wird in
-   `tests/805` gemessen.
-9. **`read_stdin` wird nicht im Test aufgerufen** — der Testläufer gibt dem
-   Programm keine Eingabe, ein Lesen würde blockieren. Die Funktion ist eine
-   Weiterleitung auf `rt.lies_stdin` (durch `bin/firnc1.fi` seit Runde 29 im
-   Einsatz).
-10. **`std.mem`, `std.rc`, `std.intern`, `std.rt` blieben unberührt.** Sie
-    sind vollständig für ihren Zweck; hinzugefügte Namen hätten nur die
-    Oberfläche vergrößert.
+The `Zeilenleser` is a cursor over an already read block: every
+line comes as pointer+length **inside** the block, without a copy. The
+line break does not belong to the line, a preceding `\r` falls away, and a
+trailing `\n` produces **no** empty final line — the rule that
+`wc -l` and every editor use.
 
 ---
 
-## 5. Zwei Befunde aus dem Bau (benannt, nicht umgebaut)
+## 4. What was deliberately NOT built — and why
 
-**A. `f"..."` in der Bedingung eines `if`.**
+1. **No generic `Option[T]`/`Result[T]` layer.** Monomorphization does not
+   substitute type arguments in the **payload of an error union**
+   (`docs/RC.md`, deviation A4: `fn f[T](..) -> AllocError!Zaehlverweis[T]`
+   reports „unbekannter typ"), and `enum` is not generic (SPEC §14.1.types
+   T3). A real `Option[T]` needs a **core change** — and that was ruled out
+   for this round. Instead of a fourth, half-finished way, the library uses
+   the three forms the language *has* today throughout, and does so
+   consistently:
+   * **output pointer + `bool`** when both „there/not there" and the value
+     matter (`map_hol_wenn`, `text_zu_u64`, `teiler_naechst`)
+   * **sentinel value** when an index is sought (`npos()` in `std.str`,
+     `vec_len` in `std.vec`, `map_kap` in `std.map` — in each case an index
+     that can never be a hit)
+   * **default** when the caller knows the substitute (`map_hol_oder`)
+2. **No number parser in `std.str`.** Text → number lives exclusively in
+   `std.num`. Two parsers would be two truths.
+3. **Upper/lower case only ASCII.** Unicode case mapping needs the UCD
+   tables; those are in the comptime branch (`tests/602_comptime_ucd.fi`)
+   and do not belong in the core facade.
+4. **`teiler_*` yields a sequence, not a list.** `lib/str` is an
+   include library without module structure and cannot include
+   `Vec[T]`. The cursor is the form that allocates nothing anyway.
+5. **No sorting by a custom comparison.** Firn has no
+   function pointers (`docs/SELBSTHOSTING.md`, line 1576). `vec_sortiere`
+   orders by `<` on `T`; anything else would need a language feature.
+6. **No stable sorting.** See 3.3 — indistinguishable for scalars,
+   for pairs it would be a promise that is missing here.
+7. **No `Str` type (checked UTF-8) on top of `Spanne`.** `Spanne` is raw;
+   `utf8_is_valid` says whether a sequence is text. A type of its own
+   without a language means of enforcing it would be a promise without
+   cover.
+8. **No correctly rounded elementary functions.** That needs tables and
+   is a round of its own. The actual bound is stated in 3.5 and is
+   measured in `tests/805`.
+9. **`read_stdin` is not called in the test** — the test runner gives the
+   program no input, and a read would block. The function is a
+   forwarding to `rt.lies_stdin` (in use by `bin/firnc1.fi` since round 29).
+10. **`std.mem`, `std.rc`, `std.intern`, `std.rt` remained untouched.** They
+    are complete for their purpose; added names would only have enlarged
+    the surface.
+
+---
+
+## 5. Two findings from the build (named, not rebuilt)
+
+**A. `f"..."` in the condition of an `if`.**
 
 ```firn
 if !io.fmt_in_datei(f"zahl {255}", pfad) { ... }
 //                  ^^^^^^^^^^^^^ error: unbekannter name '_fseg549'
 ```
 
-Der Parser hebt die versteckten Textsegmente (`let _fsegN: [u8; N]`) vor die
-umgebende **Anweisung**; bei einem `if` ist die Bedingung aber schon Teil
-dieser Anweisung, und der Name ist dort nicht sichtbar. Ein Zwischenwert löst
-es (`let inhalt: io.Fmt = f"..."`, siehe `tests/806`). Eine Behebung wäre eine
-Parser-Änderung und gehört damit nicht in diese Runde.
+The parser hoists the hidden text segments (`let _fsegN: [u8; N]`) in front
+of the surrounding **statement**; with an `if`, however, the condition is
+already part of that statement, and the name is not visible there. An
+intermediate value solves it (`let inhalt: io.Fmt = f"..."`, see
+`tests/806`). A fix would be a parser change and therefore does not belong
+in this round.
 
-**B. `firnc0` und `firnc1` runden 17-stellige Gleitkommaliterale nicht
-gleich.** Gemessen mit `num.f64_bits` auf beiden Compilern:
+**B. `firnc0` and `firnc1` do not round 17-digit floating point literals the
+same way.** Measured with `num.f64_bits` on both compilers:
 
-| Literal | `firnc0` | `firnc1` | korrekt (IEEE) |
+| Literal | `firnc0` | `firnc1` | correct (IEEE) |
 |---|---|---|---|
 | `0.30000000000000004` | 4599075939470750516 | 4599075939470750**517** | 4599075939470750516 |
 | `9007199254740993.0` | 4845873199050653696 | 4845873199050653**697** | 4845873199050653696 |
 | `0.49999999999999994` | 4602678819172646911 | 4602678819172646**909** | 4602678819172646911 |
-| `2.718281828459045` | 4613303445314885481 | 4613303445314885481 | gleich |
-| `0.1` | 4591870180066957722 | 4591870180066957722 | gleich |
+| `2.718281828459045` | 4613303445314885481 | 4613303445314885481 | identical |
+| `0.1` | 4591870180066957722 | 4591870180066957722 | identical |
 
-`firnc0` stimmt mit der korrekten Rundung überein, `firnc1` weicht um 1–2 ULP
-ab. Das ist die **eine** bekannte Abweichung, die `tools/lex_compare.sh`
-seit Langem als „UNGLEICH: 1 (bekannt und benannt: 1) / GLEITKOMMA außerhalb
-des schnellen Pfades: 1" meldet — die neue `std.num` macht sie nur zum ersten
-Mal *sichtbar*, weil sie Bitmuster ausdrucken kann. Die Tests dieser Runde
-vermeiden solche Literale bewusst und **rechnen** die Werte statt dessen
-(`0.1 + 0.2`, `ldexp(1.0, 51) + 0.5`); die Behebung gehört in eine
-Lexer-Runde.
+`firnc0` agrees with the correct rounding, `firnc1` deviates by 1–2 ULP.
+That is the **one** known deviation that `tools/lex_compare.sh`
+has long been reporting as „UNGLEICH: 1 (bekannt und benannt: 1) /
+GLEITKOMMA außerhalb des schnellen Pfades: 1" — the new `std.num` only
+makes it *visible* for the first time, because it can print bit patterns.
+The tests of this round deliberately avoid such literals and **compute**
+the values instead (`0.1 + 0.2`, `ldexp(1.0, 51) + 0.5`); the fix belongs
+in a lexer round.
 
-**C. Ein modulqualifizierter Aufruf im Ausdruck eines `f"..."` ergibt
-verschiedene Syntaxbäume.**
+**C. A module-qualified call in the expression of an `f"..."` yields
+different syntax trees.**
 
 ```text
 firnc0 --emit=ast-kanon :  (ruf str.utf8_zaehle (id u))
 ./.astdump (firnc1)     :  (ruf str__utf8_zaehle (id u))
 ```
 
-`firnc1` setzt beim Neu-Lexen des Ausdruckssegments schon den **internen**
-Namen ein (`modul__name`, SPEC §14.1.15), `firnc0` den geschriebenen. Das
-*Verhalten* ist identisch — `tools/self_compare.sh` meldet für alle
-betroffenen Dateien `GLEICH`, und die Programme drucken dieselbe Zeile.
-`tools/parser_compare.sh` vergleicht aber den Baum Oktett für Oktett, und
-dort fällt es auf. Die Tests binden solche Werte deshalb vor der
-Interpolation an einen Namen. Behebung wäre eine Parser-Änderung.
+When re-lexing the expression segment, `firnc1` already inserts the
+**internal** name (`modul__name`, SPEC §14.1.15), `firnc0` the written one.
+The *behavior* is identical — `tools/self_compare.sh` reports `GLEICH` for
+all affected files, and the programs print the same line.
+`tools/parser_compare.sh`, however, compares the tree octet by octet, and
+there it shows up. The tests therefore bind such values to a name before
+the interpolation. A fix would be a parser change.
 
-**D. `.astdump` hing auf `da3b0d9` bei JEDEM `||` in einer Endlosschleife —
-`test.sh` kam nie über Abschnitt 12 hinaus.** Hier gefunden, von Runde 41
-behoben (`fe31d13`).
+**D. `.astdump` hung in an endless loop on `da3b0d9` at EVERY `||` —
+`test.sh` never got past section 12.** Found here, fixed by round 41
+(`fe31d13`).
 
-Fehlerbild und Eingrenzung aus dieser Runde:
+Symptom and narrowing down from this round:
 
 ```firn
 fn f(a: bool, b: bool) -> bool { if a || b { return a } return b }
 ```
 
-`./.astdump` auf diese sechs Zeilen: läuft ewig, kein Byte Ausgabe. Damit
-hängt `tools/parser_compare.sh` beim ersten Quelltext mit `||` — und das
-ist praktisch jeder. Drei Messungen haben gezeigt, dass es **nicht** an
-dieser Runde liegt:
+`./.astdump` on these six lines: runs forever, not a byte of output. With
+that `tools/parser_compare.sh` hangs on the first source text with `||` —
+and that is practically every one. Three measurements have shown that it is
+**not** caused by this round:
 
-1. mit auf `da3b0d9` **zurückgesetztem** `lib/rt/vec.fi` und `lib/rt/map.fi`
-   und frisch gebautem `.astdump`: hängt genauso;
-2. dasselbe `bin/astdump.fi`, gebaut mit dem `firnc0` aus dem Arbeitsbaum der
-   Runde 41 (dort unterschied sich nur `compiler/src/regalloc.rs`): läuft
-   durch;
-3. `.firnc1` selbst war nie betroffen — der Selbstvergleich und der Fixpunkt
-   liefen auch auf `da3b0d9` grün.
+1. with `lib/rt/vec.fi` and `lib/rt/map.fi` **reset** to `da3b0d9`
+   and a freshly built `.astdump`: hangs just the same;
+2. the same `bin/astdump.fi`, built with the `firnc0` from the working tree
+   of round 41 (where only `compiler/src/regalloc.rs` differed): runs
+   through;
+3. `.firnc1` itself was never affected — the self-comparison and the
+   fixpoint were green on `da3b0d9` as well.
 
-Die Ursache steht in `fe31d13`: die Optimierung „Zellen-Alias" (Runde 40,
-`regalloc.rs`) ließ einen Load das Zellenregister direkt lesen, obwohl
-zwischen Load und Verwendung ein anderer Wert genau dieses Register
-beschrieb. In `bin/print.fi`/`drucke_binop` wurde aus `43 - start` ein
-`43 - &tab[start]`, die Länge lief unter Null, und `rt.buf_wachse` drehte
-sich ewig. Aufgefallen ist es erst jetzt, weil die Dump-Binaries vorher
-veraltet wiederverwendet wurden — dieselbe Falle, vor der Abschnitt 7 warnt.
+The cause is described in `fe31d13`: the optimization „cell alias" (round
+40, `regalloc.rs`) let a load read the cell register directly, although
+between the load and the use another value wrote to exactly that register.
+In `bin/print.fi`/`drucke_binop`, `43 - start` became
+`43 - &tab[start]`, the length underflowed, and `rt.buf_wachse` spun
+forever. It only came to light now because the dump binaries were reused in
+a stale state before — the same trap that section 7 warns about.
 
-Für diesen Zweig ist damit nichts mehr offen: er sitzt auf `fe31d13`, und
-die Abnahme in Abschnitt 7 ist mit dem eigenen, korrigierten `firnc0`
-gemessen.
+For this branch nothing is open any more: it sits on `fe31d13`, and
+the acceptance in section 7 is measured with its own, corrected `firnc0`.
 
 ---
 
-## 6. Testabdeckung
+## 6. Test coverage
 
-Sieben neue Programme in `tests/`, jedes läuft in `test.sh` **dreimal**
-(`opt` / `noopt` / `dev-fast`) und zusätzlich in `tools/self_compare.sh`
-gegen `firnc1`. Jede einzelne Erwartung steht als `return <code>` im Programm
-— schlägt eine fehl, endet der Test mit genau diesem Code und `test.sh` nennt
-ihn; die gedruckte Zeile ist zusätzlich der Vergleichspunkt zwischen den
-Compilern. Die Spalte „Fehlerausgänge" zählt genau diese `return <code>`
-(ohne das abschließende `return 0`); viele davon prüfen mit `||` mehrere
-Dinge auf einmal, die Zahl der geprüften Zusagen liegt also höher.
-Zusammen: 310.
+Seven new programs in `tests/`, each of which runs **three times** in
+`test.sh` (`opt` / `noopt` / `dev-fast`) and additionally in
+`tools/self_compare.sh` against `firnc1`. Every single expectation is a
+`return <code>` in the program — if one fails, the test ends with exactly
+that code and `test.sh` names it; the printed line is additionally the
+comparison point between the compilers. The column „error exits" counts
+exactly these `return <code>` (without the final `return 0`); many of them
+check several things at once with `||`, so the number of checked promises
+is higher. Together: 310.
 
-| Test | Inhalt | Zahlen |
+| Test | Content | Numbers |
 |---|---|---|
-| `800_std_str_core.fi` | trimmen, teilen (fester Trenner **und** Leerraum), verbinden, suchen (vorwärts/rückwärts/zählen), ersetzen, Groß/Klein, auffüllen, vergleichen, Zeichenklassen, UTF-8 vorwärts/rückwärts/nach Zeichen geschnitten, ungültiges Oktett | 49 Fehlerausgänge |
-| `801_std_num_core.fi` | Basis 2/8/10/16/36, Auffüllen, Breite, u64::MAX, **u64::MAX+1 als Überlauf**, i64::MIN, Präfixe `0x`/`0b`/`0o`, Teillesen mit Rest, dtoa/strtod-Hülle, `1e21`, Rundreise `0.1+0.2` | 43 Fehlerausgänge |
-| `802_std_vec_core.fi` | zwei Ausprägungen (`i32`, `u64`), suchen, sortieren, binär suchen, untere Schranke, einfügen/entfernen (beide Formen), kopieren/anhängen/vergleichen, 200 Elemente absteigend und 200 gleiche | 41 Fehlerausgänge |
-| `803_std_map_core.fi` | Kursor über 50 Paare (Summe der Schlüssel und Werte), Entry-Helfer, Wert an Ort und Stelle, herausnehmen, **4000 Einfügungen mit jeder dritten Löschung** und anschließendem Aufräumen, zweite Ausprägung `Map[u32, i32]` | 36 Fehlerausgänge |
-| `804_std_math_core.fi` | der **exakte** Teil, alles mit `==`: Ganzzahl-Helfer, `fabs/fmin/fmax/fclamp`, `trunc/floor/ceil/round` samt dem größten Double unter 0,5 und dem Raster bei 2⁵¹, `fmod`, `ldexp`, `frexp` (auch subnormal), `hypot`, Sonderwerte | 57 Fehlerausgänge |
-| `805_std_math_f64.fi` | der **genäherte** Teil gegen benannte Schranken; dazu zwei Schleifen: sin²+cos²=1 an 41 Stellen, `tan(atan(x)) == x` an 30 Stellen | 54 Fehlerausgänge |
-| `806_std_io_core.fi` | schreiben/anhängen/gibt-es-sie, Zeilen mit `\r\n` und ohne Schlussumbruch, der ganze `Fmt`-Ausbau; die Funktionen, die **selbst** einen Umbruch schreiben (`println`, `print_zeile`, `fmt_druck_zeile`), laufen mit über `dup2` umgebogenem Deskriptor 1 und werden aus der Datei zurückgelesen — ausgeführt, nicht behauptet | 30 Fehlerausgänge |
+| `800_std_str_core.fi` | trimming, splitting (fixed separator **and** whitespace), joining, searching (forward/backward/counting), replacing, upper/lower, padding, comparing, character classes, UTF-8 forward/backward/cut by character, invalid octet | 49 error exits |
+| `801_std_num_core.fi` | base 2/8/10/16/36, padding, width, u64::MAX, **u64::MAX+1 as overflow**, i64::MIN, prefixes `0x`/`0b`/`0o`, partial reading with a rest, dtoa/strtod wrapper, `1e21`, round trip `0.1+0.2` | 43 error exits |
+| `802_std_vec_core.fi` | two instantiations (`i32`, `u64`), searching, sorting, binary search, lower bound, inserting/removing (both forms), copying/appending/comparing, 200 elements descending and 200 identical ones | 41 error exits |
+| `803_std_map_core.fi` | cursor over 50 pairs (sum of the keys and values), entry helper, value in place, taking out, **4000 insertions with every third one deleted** and a subsequent cleanup, second instantiation `Map[u32, i32]` | 36 error exits |
+| `804_std_math_core.fi` | the **exact** part, everything with `==`: integer helpers, `fabs/fmin/fmax/fclamp`, `trunc/floor/ceil/round` including the largest double below 0,5 and the grid at 2⁵¹, `fmod`, `ldexp`, `frexp` (subnormal too), `hypot`, special values | 57 error exits |
+| `805_std_math_f64.fi` | the **approximated** part against named bounds; plus two loops: sin²+cos²=1 at 41 places, `tan(atan(x)) == x` at 30 places | 54 error exits |
+| `806_std_io_core.fi` | writing/appending/does-it-exist, lines with `\r\n` and without a final break, the whole `Fmt` extension; the functions that write a break **themselves** (`println`, `print_zeile`, `fmt_druck_zeile`) run with descriptor 1 redirected via `dup2` and are read back from the file — executed, not claimed | 30 error exits |
 
-Nicht abgedeckt und hier benannt: `read_stdin` (siehe 4.9), die
-Speichermangel-Zweige (`heap_alloc` liefert 0) — die lassen sich ohne
-Einspeisung eines fehlschlagenden `mmap` nicht auslösen.
+Not covered and named here: `read_stdin` (see 4.9), the
+out-of-memory branches (`heap_alloc` returns 0) — those cannot be triggered
+without injecting a failing `mmap`.
 
 ---
 
-## 7. Abnahme
+## 7. Acceptance
 
-Gemessen auf **`fe31d13`** (Basis dieses Zweiges), mit selbst gebautem
-`firnc0` und frisch gebauten Hilfsbinaries.
+Measured on **`fe31d13`** (base of this branch), with a self-built
+`firnc0` and freshly built helper binaries.
 
-| Messung | Wert | Ausgangslage `fe31d13` |
+| Measurement | Value | Starting point `fe31d13` |
 |---|---|---|
 | `bash ./test.sh` | **PASS 673/673**, `RC=0` | 652/652 |
 | `bash tools/self_compare.sh` | **GLEICHES VERHALTEN 196 · ABWEICHEND 0 · FEHLERHAFT 0 · CODEGEN FEHLT 0**, `RC=0` | 189 / 0 / 0 |
-| `bash tools/fixpoint.sh` | **Stufe 2 == Stufe 3, zeichengleich (309468 Zeilen Assembler)** · Korpus: `.firnc2` verhält sich wie `firnc0`, `RC=0` | zeichengleich, 309468 Zeilen |
+| `bash tools/fixpoint.sh` | **stage 2 == stage 3, character-identical (309468 lines of assembly)** · corpus: `.firnc2` behaves like `firnc0`, `RC=0` | character-identical, 309468 lines |
 
-Die 673 sind 652 + 21: sieben neue Programme × drei Durchläufe
-(`opt` / `noopt` / `dev-fast`). Die 196 sind 189 + 7. Die **309468 Zeilen sind
-unverändert** — der selbstgehostete Compiler trägt von den 32 neuen
-generischen `Vec`/`Map`-Funktionen kein einziges Byte, weil er keine davon
-benutzt (Monomorphisierung).
+The 673 are 652 + 21: seven new programs × three runs
+(`opt` / `noopt` / `dev-fast`). The 196 are 189 + 7. The **309468 lines are
+unchanged** — the self-hosted compiler carries not a single byte of the 32
+new generic `Vec`/`Map` functions, because it uses none of them
+(monomorphization).
 
-(Zwischenstand auf der alten Basis `da3b0d9`, der Vollständigkeit halber:
-670/670, 195/0/0, Fixpunkt zeichengleich bei 289096 Zeilen. Dieselbe Aussage,
-nur vor dem Rebase.)
+(Intermediate state on the old base `da3b0d9`, for the sake of
+completeness: 670/670, 195/0/0, fixpoint character-identical at 289096
+lines. The same statement, only before the rebase.)
 
-Die Vergleichswerkzeuge im Einzelnen (aus demselben Lauf):
+The comparison tools in detail (from the same run):
 
-| Werkzeug | gleich | ungleich |
+| Tool | identical | differing |
 |---|---|---|
-| `lex_vergleich` | 361 | 1 (bekannt: `tests/590_f64.fi`, Literal `1e308`) |
-| `parser_vergleich` | 235 | 1 (dieselbe bekannte) |
+| `lex_vergleich` | 361 | 1 (known: `tests/590_f64.fi`, literal `1e308`) |
+| `parser_vergleich` | 235 | 1 (the same known one) |
 | `typen_vergleich` | 185 | 0 |
-| `sema_vergleich` | 144 | 1 (dieselbe bekannte) |
-| `fir_vergleich` | 143 | 1 (dieselbe bekannte) |
+| `sema_vergleich` | 144 | 1 (the same known one) |
+| `fir_vergleich` | 143 | 1 (the same known one) |
 
-Kein Werkzeug hat eine **neue** Ausnahme bekommen: die Liste der bekannten
-Abweichungen (`BEKANNT=` in den Skripten) ist unangetastet.
+No tool got a **new** exception: the list of known
+deviations (`BEKANNT=` in the scripts) is untouched.
 
-Vor der Messung wurden **alle** Hilfsbinaries der Vergleichswerkzeuge
-gelöscht (`.astdump`, `.lexdump`, `.firdump`, `.semadump`, `.layoutdump`,
-`.firnc1..3`). `lib/firnc1/vec.fi` ist ein *Symlink* auf `lib/rt/vec.fi`, und
-`find -newer` sieht die Änderung an der Zieldatei nicht — ein stehen
-gelassenes `.astdump` hätte den Stand von vor dem Ausbau gemessen und wäre
-grün gewesen, ohne etwas zu beweisen.
+Before the measurement **all** helper binaries of the comparison tools were
+deleted (`.astdump`, `.lexdump`, `.firdump`, `.semadump`, `.layoutdump`,
+`.firnc1..3`). `lib/firnc1/vec.fi` is a *symlink* to `lib/rt/vec.fi`, and
+`find -newer` does not see the change to the target file — a leftover
+`.astdump` would have measured the state from before the extension and
+would have been green without proving anything.
 
-**Eines gehört noch zur Ehrlichkeit dieser Messung:**
+**One thing still belongs to the honesty of this measurement:**
 
-1. **Die Messung lief in einem eigenen Mount-Namensraum mit privatem `/tmp`**
-   (`unshare --mount` + `tmpfs`). `tools/lex_compare.sh` und die anderen
-   Vergleicher benutzen feste Pfade wie `/tmp/lexv_a.txt`; läuft in einem
-   zweiten Arbeitsbaum gleichzeitig dieselbe Suite (hier: Runde 41), schreiben
-   beide in dieselben Dateien und die Ergebnisse sind Zufall. Ohne
-   Namensraum meldete `lex_vergleich` einmal 72 Abweichungen, mit Namensraum
-   genau die eine bekannte. Runde 41 ist derselben Falle begegnet
-   (`/tmp/parv_a.txt`, „das sah wie 148 echte Abweichungen aus"). Das ist ein
-   Werkzeugmangel, der hier festgehalten wird — die Skripte sollten `mktemp`
-   benutzen; solange sie es nicht tun, darf immer nur EINE Suite gleichzeitig
-   laufen.
+1. **The measurement ran in its own mount namespace with a private `/tmp`**
+   (`unshare --mount` + `tmpfs`). `tools/lex_compare.sh` and the other
+   comparers use fixed paths like `/tmp/lexv_a.txt`; if the same suite runs
+   at the same time in a second working tree (here: round 41), both write
+   into the same files and the results are pure chance. Without a
+   namespace `lex_vergleich` once reported 72 deviations, with a namespace
+   exactly the one known deviation. Round 41 ran into the same trap
+   (`/tmp/parv_a.txt`, „that looked like 148 real deviations"). That is a
+   tooling deficiency, recorded here — the scripts should use `mktemp`; as
+   long as they do not, only ONE suite may ever run at a time.
 
-## 8. Zeilen
+## 8. Lines
 
-| Datei | vorher | nachher |
+| File | before | after |
 |---|---|---|
-| `lib/std/str.fi` (erzeugt) | 741 | 1604 |
-| `lib/std/num.fi` (erzeugt) | 1203 | 1625 |
+| `lib/std/str.fi` (generated) | 741 | 1604 |
+| `lib/std/num.fi` (generated) | 1203 | 1625 |
 | `lib/std/math.fi` | 116 | 749 |
 | `lib/std/io.fi` | 92 | 377 |
 | `lib/rt/vec.fi` (= `std.vec`) | 137 | 449 |
 | `lib/rt/map.fi` (= `std.map`) | 298 | 437 |
-| **Summe** | **2587** | **5241** |
+| **Sum** | **2587** | **5241** |
 
-Dazu sieben Testprogramme mit zusammen rund 1400 Zeilen.
+Plus seven test programs with around 1400 lines together.
