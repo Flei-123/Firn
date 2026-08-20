@@ -220,11 +220,36 @@ with round 58 but surprising.
 rejected although the upcast is free (SPEC 4.4). A local of the base type in
 between fixes it. Roughly 200 places in this round.
 
+**Gap 8 -- the two lexers read a decimal literal one ULP apart.**
+`9007199254740991.0` (2^53-1) is lexed by `firnc0` (Rust) and by `firnc1`
+(the lexer written in Firn) as two DIFFERENT doubles: the bit patterns
+`4845873199050653695` and `4845873199050653694`, that is 9007199254740991
+against 9007199254740990. Found by `tools/lex_compare.sh`, which exists for
+exactly this purpose and struck the moment the literal appeared in
+`lib/js/builtin.fi`. Interesting detail: the same literal in
+`lib/js/interp.fi` does NOT diverge, so the deviation depends on the path
+through the number reader ("floating point outside the fast path" in the
+report of that tool), not on the digits alone.
+
+The engine writes 2^53-1 as an INTEGER and converts (`n as f64`, exact up
+to 2^53), so the value is the same in both compilers. The bug itself
+remains and is worth a round of its own -- a lexer that reads a literal
+differently from the one that bootstrapped it breaks the fixpoint promise
+for programs that use such a constant.
+
 **A pleasant surprise, for the record:** `dtoa` in `lib/num/` already
 follows the ECMAScript rules for `Number::toString` EXACTLY -- the 21 digit
 window, the exponential form and the treatment of `-0`. `Number(0.1+0.2)`
 printed itself correctly on the first attempt. That is the payoff of round 2
 having done the number output honestly.
+
+**And one honest limit of the engine that came out of the same corner:**
+the dense element storage of an array is materialized only up to
+`DENSE_LIMIT` (4,194,304 slots). `a.length = 4294967295` is remembered but
+not laid out, and an assignment to an index above the limit is DROPPED
+instead of stored. Before that limit existed, `a.length = 2**32-1` laid out
+four billion slots and the process died -- which is why it is in here; the
+sparse fallback into the property table is the next step.
 
 ## 5. The acceptance
 
