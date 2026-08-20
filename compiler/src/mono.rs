@@ -1,12 +1,12 @@
 //! Monomorphization of generic templates (`L5`, module `types`).
 //!
 //! Runs between parser and type checker: for every type combination used by
-//! the source text a concrete function, respectively a concrete struct, comes
-//! about, spelled per the contract `name__T1_T2` (see `sema_generic.rs`).
+//! the source text a concrete function or a concrete struct comes about,
+//! named per the contract `name__T1_T2` (see `sema_generic.rs`).
 //! After that the type checker sees plain, fully concrete code only.
 //!
-//! Errors of this stage (wrong count of type arguments, unmet requirement,
-//! generic identifier without type arguments) get reported with line and
+//! Errors of this stage (wrong number of type arguments, unmet bound,
+//! generic name without type arguments) are reported with line and
 //! column; there is no crash.
 
 use std::collections::{HashMap, HashSet};
@@ -23,7 +23,7 @@ const MAX_INSTANCES: usize = 4096;
 pub fn expand(prog: &mut Program, dg: &mut Diags) {
     // All function names BEFORE instantiation — the bound check reads from
     // that which method of a type is missing (`T__m`). During instantiation
-    // only monomorphized functions join; no interface ever gets implemented
+    // only monomorphized functions join; no interface is ever implemented
     // for those (`impl I for Vec__i32` cannot be written), so the snapshot
     // taken now suffices.
     let fnames: HashSet<String> = prog.funcs.iter().map(|f| f.name.clone()).collect();
@@ -56,7 +56,7 @@ pub fn expand(prog: &mut Program, dg: &mut Diags) {
     }
     prog.expr_count = next_id;
 
-    // Generic names without type arguments are errors with line/column.
+    // Generic names without type arguments are an error with line/column.
     check_bare_uses(prog, dg);
 }
 
@@ -84,7 +84,7 @@ fn bind_params(
     }
     let mut map = HashMap::new();
     for (p, a) in params.iter().zip(inst.args.iter()) {
-        // EVERY bound must hold. Reported gets the FIRST violated one —
+        // EVERY bound must hold. What is reported is the FIRST violated one —
         // a cascade of follow-up messages about the same type argument says
         // nothing new.
         for b in &p.bounds {
@@ -97,10 +97,10 @@ fn bind_params(
     Some(map)
 }
 
-/// One single bound against one type argument. `true` = satisfied.
+/// A single bound against one type argument. `true` = satisfied.
 ///
 /// The three builtin bounds are decided by `satisfies` from the type shape
-/// alone. One INTERFACE BOUND goes to `iface.rs`: only there it is written
+/// alone. An INTERFACE BOUND goes to `iface.rs`: only there is it written
 /// which implementations exist and which method is missing.
 fn bound_ok(
     dg: &mut Diags,
@@ -246,8 +246,8 @@ fn subst_ty(
     }
 }
 
-/// Replaces one identifier: type parameter -> argument, instantiation label
-/// (`Vec__T`) -> new instantiation label (`Vec__i32`, registered on the way).
+/// Replaces one identifier: type parameter -> argument, instantiation name
+/// (`Vec__T`) -> new instantiation name (`Vec__i32`, registered on the way).
 fn subst_name(
     n: &str,
     sp: Span,
@@ -261,15 +261,15 @@ fn subst_name(
         }
         // Round 53: `Gc[T]` and `GcWeak[T]` WITHIN ONE TEMPLATE.
         //
-        // The parser turns those into the labels `__gc#p:T` and `__gc#w:T`
-        // (gc.rs::hook_type). Without this spot the type resolution later
+        // The parser turns those into the names `__gc#p:T` and `__gc#w:T`
+        // (gc.rs::hook_type). Without this place the type resolution later
         // looks for a gc class called `T` and reports "unknown gc class
         // 'T'" — generic functions over Gc pointers were impossible that
         // way, and those are exactly what the type-safe surface of
         // `GcVec`/`GcMap` needs (`gcvec_append[T]`).
         //
-        // Replaced gets only what carries a LABEL as argument: `Gc[*mut u8]`
-        // does not exist, the parser allows nothing but one identifier
+        // Replaced is only what carries a NAME as its argument: `Gc[*mut u8]`
+        // does not exist, the parser allows nothing but an identifier
         // there anyway.
         for pfx in [crate::gc::P_TY_PUB, crate::gc::P_WTYP_PUB] {
             if let Some(rest) = n.strip_prefix(pfx) {
@@ -312,7 +312,7 @@ fn with_span(t: &TypeExpr, sp: Span) -> TypeExpr {
     }
 }
 
-/// Rewrite the label of a function or struct literal inside the body.
+/// Rewrite the name of a function or struct literal inside the body.
 fn subst_call_name(
     n: &str,
     sp: Span,
@@ -320,9 +320,9 @@ fn subst_call_name(
     queue: &mut Vec<(String, Instantiation)>,
 ) -> String {
     // `size_of[T]()` inside a generic template: the type parameter sits
-    // within the CALL LABEL (`size_of$T`, see sizeof.rs) and must be
+    // in the CALL NAME (`size_of$T`, see sizeof.rs) and has to be
     // substituted here as well — otherwise the type checker reports
-    // "unknown type 'T'" as soon as the template gets instantiated.
+    // "unknown type 'T'" as soon as the template is instantiated.
     if let Some(param) = n.strip_prefix("size_of$") {
         if let Some(TypeExpr::Named(concrete, _)) = map.get(param) {
             return format!("size_of${}", concrete);
