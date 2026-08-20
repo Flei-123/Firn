@@ -78,11 +78,11 @@ python3 -c "import json;d=json.load(open('/tmp/firn.json'));print(d['total'],d['
 | **Jump table for 32 states** | `firnc --emit=asm -o /tmp/zm.s tests/230_state_machine.fi && grep -c "jmp qword ptr" /tmp/zm.s` | `1` -- one indirect jump through a `.quad` table, no comparison chain |
 | **WTF-16, unpaired surrogate** | `firnc -o /tmp/s tests/300_str16_surrogate.fi && /tmp/s` | `3 97 55296 98 0 0 5 97 239 191 189 98 5 97 237 160 128 98 1 55296` -- `0xD800` is preserved, `to_utf8()` returns nothing, `to_utf8_lossy()` returns `EF BF BD` |
 | **strtod/dtoa hard cases** | `firnc -o /tmp/h tests/304_strtod_hardcases.fi && /tmp/h` | 26 bit patterns, starting with `4591870180066957722` (= `0.1`); the expected values are given as `// expect_out:` in line 1 of the same file |
-| **100,000 doubles there and back** | `bash tools/dtoa_vectors/run.sh 100000 4242` | `OK: 100000/100000 bitgleich zurueck, 100000/100000 kuerzeste Darstellung wie Rust` (7.9 s) |
+| **100,000 doubles there and back** | `bash tools/dtoa_vectors/run.sh 100000 4242` | `OK: 100000/100000 bit-identical on the way back, 100000/100000 shortest form like Rust` (7.9 s) |
 | **Benchmarks against Rust `-O`** | `BENCH_RUNS=5 bash bench/run.sh` | median **3.36x** slower (range 1.57x-6.04x), table in `bench/RESULTS.md`. **Target <= 2x missed** |
 | **The optimizer has an effect** | `bash test_opt.sh` | `PASS 41/41` (FIR before/after) |
 | **The debugger shows `.fi` lines** | `firnc --no-opt -o /tmp/gdbdemo docs/gdb_example.fi && gdb -batch -ex "break summe" -ex run -ex bt /tmp/gdbdemo` | `Breakpoint 1, summe () at docs/gdb_example.fi:2` and `#1 ... main () at docs/gdb_example.fi:11` |
-| **The generated Str tests are current** | `python3 tools/strlib/expand.py --check` | `expand.py: 0 veraltete Dateien` |
+| **The generated Str tests are current** | `python3 tools/strlib/expand.py --check` | `expand.py: 0 files out of date` |
 | **Cleanliness** | `grep -rn "todo!\|unimplemented!" compiler/src` | no hits |
 
 
@@ -96,21 +96,21 @@ Builds the tokenizer from `lib/html/*.fi` in **three** build stages, runs all
 **6,810** html5lib cases, checks that all three build stages produce the same
 balance, and measures throughput against html5ever. **Two** rates are
 reported: token stream only (left column) and, in addition, with the parse
-error codes compared (right column, `harness.py --mit-fehlern`). Measured
+error codes compared (right column, `harness.py --with-errors`). Measured
 result (2026-08-14):
 
 ```
-GESAMT                      6810 /  6810 100.00 %    6809 /  6810  99.99 %
-   noopt: 6810 ohne / 6809 mit Fehlercodes — gleich
-   devfast: 6810 ohne / 6809 mit Fehlercodes — gleich
-   -- Korpus 'html5lib' (Grenzfaelle der Testsuite, absichtlich pathologisch)
-      Firn      :     4.59 MB/s  (0.889 s fuer 4.08 MB, bester von 3)
-      html5ever :    11.22 MB/s  (0.363 s, bester von 3)
-      Faktor    : 2.45x langsamer als html5ever (Abnahmeziel <= 2.00x)
-   -- Korpus 'realweb' (acht echte Seiten aus testdata/realweb/)
-      Firn      :     7.44 MB/s  (0.632 s fuer 4.70 MB, bester von 3)
-      html5ever :    42.60 MB/s  (0.110 s, bester von 3)
-      Faktor    : 5.72x langsamer als html5ever (Abnahmeziel <= 2.00x)
+TOTAL                       6810 /  6810 100.00 %    6809 /  6810  99.99 %
+   noopt: 6810 without / 6809 with error codes -- equal
+   devfast: 6810 without / 6809 with error codes -- equal
+   -- corpus 'html5lib' (edge cases of the test suite, deliberately pathological)
+      Firn      :     4.59 MB/s  (0.889 s for 4.08 MB, best of 3)
+      html5ever :    11.22 MB/s  (0.363 s, best of 3)
+      factor    : 2.45x slower than html5ever (acceptance goal <= 2.00x)
+   -- corpus 'realweb' (eight real pages out of testdata/realweb/)
+      Firn      :     7.44 MB/s  (0.632 s for 4.70 MB, best of 3)
+      html5ever :    42.60 MB/s  (0.110 s, best of 3)
+      factor    : 5.72x slower than html5ever (acceptance goal <= 2.00x)
 ```
 
 Measurements are taken on **two** corpora: `html5lib` (the inputs of the test
@@ -125,14 +125,14 @@ Step 0 of `run.sh` proves that the expectations were not touched:
 
 ```sh
 bash tools/tokenizer/verify_testdata.sh              # sha256 against the repo set
-bash tools/tokenizer/verify_testdata.sh --gegen-upstream   # additionally against GitHub
+bash tools/tokenizer/verify_testdata.sh --against-upstream   # additionally against GitHub
 ```
 
 Step 2b of `run.sh` is the **counter-check without the XML adaptation**:
 
 ```
-python3 tools/tokenizer/harness.py .tokenizer-work/tokenize --ohne-xml-modus
-GESAMT                           6807 /   6810    99.96 %
+python3 tools/tokenizer/harness.py .tokenizer-work/tokenize --no-xml-mode
+TOTAL                            6807 /   6810    99.96 %
 ```
 
 The XML adaptation (`xmlViolationTests`) is an optional mode of the driver
@@ -203,9 +203,9 @@ Honestly and completely (in detail in `ACCEPTANCE.md`):
   **6,810 of 6,810 (100.00 %)** in the token stream comparison and
   **6,809 of 6,810 (99.99 %)** when the `errors` entries of the suite (parse
   error code, `line`, `col`) are compared as well
-  (`harness.py --mit-fehlern`, step 2a of `run.sh`). The single failure is
+  (`harness.py --with-errors`, step 2a of `run.sh`). The single failure is
   `xmlViolation.test #0`. The XML adaptation of the four `xmlViolationTests` is
-  implemented as an optional mode (counter-check `--ohne-xml-modus`: 6,807).
+  implemented as an optional mode (counter-check `--no-xml-mode`: 6,807).
   The speed target of <= 2x is **missed**: range 2.25x-3.09x (corpus
   `html5lib`) and 5.72x-8.31x (corpus `realweb`). See section 4a.
 * **`defer` / `errdefer`, inferred error set `!T`, `catch |e| { block }`**

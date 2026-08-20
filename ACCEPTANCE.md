@@ -10,7 +10,7 @@
 field access <-> storage location, symbol scheme, HTML5 tokenizer; plus 122 Rust
 module tests). `bash tools/tokenizer/run.sh` -> **6,810 / 6,810 (100.00 %)**
 without and **6,809 / 6,810 (99.99 %)** with the parse error codes compared
-(`--mit-fehlern`; counter-check without the XML adaptation: 6,807),
+(`--with-errors`; counter-check without the XML adaptation: 6,807),
 throughput factor against html5ever on **two** corpora, three runs of our own
 each: corpus `html5lib` (edge cases of the suite, deliberately pathological)
 **2.25x/2.45x/2.79x/3.09x**, plus **2.59x** and **2.42x** during the merge;
@@ -68,10 +68,10 @@ Legend: `[ ]` open - `[~]` partial, with a number - `[x]` passed and measured
 | **Measurement command** | `bash tools/dom_soak/run.sh` (environment: `SOAK_SEK`, `SOAK_ZYKLEN`, `SOAK_STICHPROBE`); the measured quantity is RSS from `/proc/self/statm` over time, tolerance: no monotonic rise after the warm-up phase |
 | **Status of the decision** | **`[x]` taken and justified** -- an opt-in tracing GC in three levels, `SPEC.md` 3.2/3.5. The alternatives (arena + indices, refcount + weak) were rejected with reasons |
 | **Status of the evidence (2026-08-14, measured in person)** | **`[~]` demonstrated in a prototype, the 24 h run is still outstanding.** The GC is built (`compiler/src/gc.rs`, runtime `lib/gc/gc.fi` in Firn) and so is the DOM prototype (`lib/dom/dom.fi`, 6 kinds of cycle). **Soak test: 100,000,000 cycle sets = 700,000,000 objects in 116.5 s, RSS constant at 1,364 KiB from the first to the last of 1,001 samples, 47,300 collections, longest pause 3.54 ms.** Counter-check with reference counting (identical object graph, `lib/dom/soak_leak.fi`): **750,080 KiB after 2,000,000 cycles, 12,000,000 live objects -- factor 550.** Raw data: `tools/dom_soak/longrun/*.tsv`, report: `docs/reports/dom.md` |
-| **Sub-items** | `S1` deterministic by default: stage 0 has raw pointers, no move checker - `S2` GC heap: **`[x]` mark-sweep, precise heap tracing through a compiler-generated type table, conservative stack/register scan, no compaction** - `S3` weak references: **`[x]` `GcWeak[T]`, negatively tested; since round 47 weak fields are REALLY zeroed on collection (`tests/822`), not merely `strong()`-empty** - `S4` finalizers: **`[x]` since round 47** -- a cleanup kind per object, its own cycle phase in slices, resurrection impossible and enforced (abort 71/72/73), `tests/820`-`824`, `docs/RUNDE47.md` - `S5` incremental: **`[x]` since round 44**, longest pause 0.45 ms - `S6` pause times measurable: **`[x]` `gc_pause_ns_last/max/total`, `gc_hist`, `gc_stop_max`, since round 47 also `gc_fin_*`** - `S7` `Rc`/`Weak`: **`[x]` as a pure Firn module (`tests/modules/rc.fi`), cycles leak deliberately and visibly (`tests/552_rc_cycle_leak.fi`); `Arc[T]` built in round 47 (`lib/rc/arc.fi`, atomic counter, `tests/830`-`833`)** |
+| **Sub-items** | `S1` deterministic by default: stage 0 has raw pointers, no move checker - `S2` GC heap: **`[x]` mark-sweep, precise heap tracing through a compiler-generated type table, conservative stack/register scan, no compaction** - `S3` weak references: **`[x]` `GcWeak[T]`, negatively tested; since round 47 weak fields are REALLY zeroed on collection (`tests/822`), not merely `strong()`-empty** - `S4` finalizers: **`[x]` since round 47** -- a cleanup kind per object, its own cycle phase in slices, resurrection impossible and enforced (abort 71/72/73), `tests/820`-`824`, `docs/RUNDE47.md` - `S5` incremental: **`[x]` since round 44**, longest pause 0.45 ms - `S6` pause times measurable: **`[x]` `gc_pause_ns_last/max/total`, `gc_hist`, `gc_stop_max`, since round 47 `gc_fin_*` on top** - `S7` `Rc`/`Weak`: **`[x]` as a pure Firn module (`tests/modules/rc.fi`), cycles leak deliberately and visibly (`tests/552_rc_cycle_leak.fi`); `Arc[T]` built in round 47 (`lib/rc/arc.fi`, atomic counter, `tests/830`-`833`)** |
 | **What is missing for `[x]`** | (a) the **24 hour run**, (b) **fragmentation with changing object sizes** -- the soak test always uses the same set, which is the friendly case, (c) `virtual`, and, for the collections, the **nominal type safety of the container** (`docs/RUNDE53.md` 4.1). Incremental collection (round 44), finalizers (round 47) and `GcVec`/`GcMap` (round 53) are done |
 | **Effort according to TODO-FIRN** | 0.1 = 2 person-months (decision + prototype), 0.9 = 2 person-months (soak test) |
-| **Risk** | conservative stack scanning rules out a compacting collector -> fragmentation in the soak test remains the real risk. Also demonstrable: **an old pointer copy in a live frame keeps its object alive** (`docs/reports/dom.md`, section "The uncomfortable spot") |
+| **Risk** | conservative stack scanning rules out a compacting collector -> fragmentation in the soak test remains the real risk. Demonstrable on top of that: **an old pointer copy in a live frame keeps its object alive** (`docs/reports/dom.md`, section "The uncomfortable spot") |
 
 ---
 
@@ -99,7 +99,7 @@ Legend: `[ ]` open - `[~]` partial, with a number - `[x]` passed and measured
 * **with the parse error codes compared: 6,809 / 6,810 (99.99 %)** -- on top of
   that the `errors` list of every case has to match exactly: WHATWG code name,
   `line`, `col`, in the order of the expectation
-  (`python3 tools/tokenizer/harness.py ... --mit-fehlern`, step 2a in `run.sh`).
+  (`python3 tools/tokenizer/harness.py ... --with-errors`, step 2a in `run.sh`).
   The codes are produced by the tokenizer itself (`lib/html/error_codes.fi`,
   452 lines, all code names from WHATWG 13.2 Parse errors), not by the harness.
 
@@ -137,8 +137,8 @@ for **no** other case. The pure HTML path stays unchanged -- verifiable with the
 counter-check that `run.sh` performs itself:
 
 ```sh
-python3 tools/tokenizer/harness.py .tokenizer-work/tokenize --ohne-xml-modus
-# GESAMT                           6807 /   6810    99.96 %
+python3 tools/tokenizer/harness.py .tokenizer-work/tokenize --no-xml-mode
+# TOTAL                            6807 /   6810    99.96 %
 ```
 
 Without the flag exactly the three cases "Non-XML character", "Non-XML space"
@@ -149,17 +149,17 @@ attributes", is already plain HTML).
 
 ```sh
 bash tools/tokenizer/verify_testdata.sh
-# Dateien : 14 (erwartet 14)
-# sha256  : alle 14 Summen stimmen
-# Faelle  : 6810 (erwartet 6810)
-# OK: Testdaten unveraendert (14 Dateien, 6810 Faelle, sha256 wie Upstream).
+#    files   : 14 (expected 14)
+#    sha256  : all 14 sums match
+#    cases   : 6810 (expected 6810)
+# OK: test data unchanged (14 files, 6810 cases, sha256 as upstream).
 ```
 
 The script compares the sha256 sums of the 14 `.test` files with the set frozen
 in the repository (`tools/tokenizer/testdata.sha256`), which was checked byte
 for byte against the upstream commit
 `224991ec10db04f056a89eed8b0bd8695fd2950e` of `html5lib/html5lib-tests`; with
-`--gegen-upstream` it downloads the files of that commit from GitHub again and
+`--against-upstream` it downloads the files of that commit from GitHub again and
 compares directly. `run.sh` runs it as step 0 and aborts on any deviation.
 
 Honesty of the harness (verifiable in `tools/tokenizer/harness.py`):
@@ -167,10 +167,10 @@ Honesty of the harness (verifiable in `tools/tokenizer/harness.py`):
 `xmlViolationTests` are counted as well (hence 6,810, not 6,806);
 `initialStates` and `lastStartTag` are honoured (a case counts as passed only if
 it is correct in **every** one of its start states); the answer
-`["NICHT-UNTERSTUETZT"]` is a failure; there is no filter and no skipping.
+the unsupported marker of the tokenizer is a failure; there is no filter and no skipping.
 
 **The `errors` entries have been compared since round 4** (switch
-`--mit-fehlern`). The tokenizer keeps track of line and column itself and, per
+`--with-errors`). The tokenizer keeps track of line and column itself and, per
 job, prints a second JSON list behind the token stream -- separated by a tab
 character -- for example
 `[{"code":"eof-in-tag","line":1,"col":6}]`. The code names are in
@@ -199,11 +199,11 @@ program prints the table address and forces the failure; `run.sh` starts it
 twice and aborts if both runs report the same address.
 
 ```
-== 1c. Namenstabelle: keine feste Adresse, Ausfall wird gemeldet ==
+== 1c. name table: no fixed address, a failure is reported ==
    tabelle-adresse 0x7dc385150000
-   regelfall: '&amp;' tokenisiert, kein Abbruch
-   ausfall: tabelle()==0 -> nicht_unterstuetzt, Abbruch statt falscher Ausgabe
-   zweiter Lauf: tabelle-adresse 0x79988ff2c000 — andere Adresse, also vom Kern gewaehlt (kein MAP_FIXED)
+   ... the two lines of the probe program (their text is still German,
+       see lib/html/entities_failure.fi)
+   second run: 0x79988ff2c000 -- a different address, so chosen by the kernel (no MAP_FIXED)
 ```
 
 **Criterion B: `[ ]` missed -- on BOTH corpora.** Measured in person with
@@ -300,7 +300,7 @@ why three runs are given above rather than the most favourable single value.
 |---|---|---|
 | 1 | Self-hosting in three stages | `[ ]` not started; inventory in `docs/SELBSTHOSTING.md` |
 | 2 | Memory model decided **and demonstrated** | `[~]` the decision is taken **and demonstrated in a prototype**: GC built, DOM prototype with 6 kinds of cycle, **100 million cycle sets / 700 million objects at a constant 1,364 KiB RSS**, the counter-check with reference counting leaks up to 750,080 KiB (factor 550). **Open: the 24 h run and fragmentation with changing object sizes** |
-| 3 | Tokenizer 100 % html5lib **and** <= 2x | `[~]` **6,810 of 6,810 cases (100.00 %)** in the token stream comparison and **6,809 of 6,810 (99.99 %)** with the parse error codes compared (`--mit-fehlern`), tokenizer in Firn (`lib/html/*.fi`), XML adaptation as an optional mode (counter-check `--ohne-xml-modus`: 6,807); speed **2.25x-3.09x (corpus `html5lib`) and 5.72x-8.31x (corpus `realweb`, real pages) -- the target of <= 2x is missed on both** | **Addendum 2026-08-14 (optimizer round):** the cause has been measured -- Firn needs **818 instructions per byte**, html5ever **110** (callgrind, corpus `realweb`). The ratio of 7.46x matches the time factor of 7.04x: the distance is **work executed, not codegen quality**. Causes: decoding the whole input to UTF-32 before tokenizing, no bulk path for runs of text, the additional JSON output. **With compiler work alone <= 2x is not reachable** -- the optimizer was improved by 6.8-17.8 % instructions in the same round without the tokenizer factor moving | **Addendum 2 (round 6):** the target is **reached on corpus `html5lib` (1.98x)** and **missed on `realweb` (4.99x)**, previously 2.70x / 7.02x. Instructions 4.03 billion -> **2.66 billion** (callgrind). Three interventions: a fast path in `mem.fi` (the capacity check was 33 % of all instructions), a fair measurement setup (`tokenize_bench` counts only tokens, like html5ever -- the JSON output was 14.7 %), `cmp`+`jcc` merged in codegen (7 instructions per comparison -> 3). The rate is unchanged at **6,810/6,810**. Biggest remainder: `dekodiere` with 28 % and 225 instructions per byte -- bounds checks across loops are missing |
+| 3 | Tokenizer 100 % html5lib **and** <= 2x | `[~]` **6,810 of 6,810 cases (100.00 %)** in the token stream comparison and **6,809 of 6,810 (99.99 %)** with the parse error codes compared (`--with-errors`), tokenizer in Firn (`lib/html/*.fi`), XML adaptation as an optional mode (counter-check `--no-xml-mode`: 6,807); speed **2.25x-3.09x (corpus `html5lib`) and 5.72x-8.31x (corpus `realweb`, real pages) -- the target of <= 2x is missed on both** | **Addendum 2026-08-14 (optimizer round):** the cause has been measured -- Firn needs **818 instructions per byte**, html5ever **110** (callgrind, corpus `realweb`). The ratio of 7.46x matches the time factor of 7.04x: the distance is **work executed, not codegen quality**. Causes: decoding the whole input to UTF-32 before tokenizing, no bulk path for runs of text, the additional JSON output. **With compiler work alone <= 2x is not reachable** -- the optimizer was improved by 6.8-17.8 % instructions in the same round without the tokenizer factor moving | **Addendum 2 (round 6):** the target is **reached on corpus `html5lib` (1.98x)** and **missed on `realweb` (4.99x)**, previously 2.70x / 7.02x. Instructions 4.03 billion -> **2.66 billion** (callgrind). Three interventions: a fast path in `mem.fi` (the capacity check was 33 % of all instructions), a fair measurement setup (`tokenize_bench` counts only tokens, like html5ever -- the JSON output was 14.7 %), `cmp`+`jcc` merged in codegen (7 instructions per comparison -> 3). The rate is unchanged at **6,810/6,810**. Biggest remainder: `decode` with 28 % and 225 instructions per byte -- bounds checks across loops are missing |
 | 4 | Test runner **and** debugger | `[~]` the JSON runner is satisfied (**256/256, rate 1.0**), `.debug_line` demonstrated in `gdb`; variables and "a real bug was found" are missing |
 | 5 | Package management reproducible | `[~]` module system **and project system** present (round 48: manifest `firn.paket`, dependencies via local paths, visibility at module level, build driver `--paket`, in both compilers); **registry, lock file and the two-machine proof are missing** |
 | 6 | Compile-time codegen produces the UCD table | `[~]` **`comptime` built (round 12)**: own functions run at compile time, with loops, branches and recursion (`compiler/src/comptime.rs`, `tests/600_comptime.fi`). **`emit` built (round 13)**: `comptime` blocks produce Firn source text that is lexed, parsed and compiled in the same run (`tests/601_comptime_emit.fi`, `firnc --emit=comptime`). **Data access built (round 14)**: `datei_groesse`/`datei_byte` read at compile time; `tests/602_comptime_ucd.fi` produces `ucd_gross` from a file in `UnicodeData.txt` format. **In substance the item is thereby satisfied** -- what is missing is proving it against the *real* UCD (1.9 MB, all categories) and a build script that fetches it. Access is restricted to the directory of the source file (no `..`, no absolute path) |
