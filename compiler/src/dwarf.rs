@@ -1,8 +1,8 @@
 //! DWARF basics: line numbers (`.debug_line`) for the debugger.
 //!
 //! FIR carries no source positions (`fir.rs` is frozen). That is why lowering
-//! collects the mapping *instruction -> source line* here as a table that the
-//! code generator queries while writing the assembler. The line numbers get
+//! collects the mapping *instruction -> source line* here in a table that the
+//! code generator queries while writing the assembler. The line numbers are
 //! emitted as `.file`/`.loc` directives; from those `as` produces the sections
 //! `.debug_line`, `.debug_info` and `.debug_abbrev`.
 //!
@@ -10,7 +10,7 @@
 //!   * **always**: line of the `fn` declaration (a breakpoint on a function
 //!     shows the right `.fi` file and line)
 //!   * **without the optimizer**: additionally instruction-exact lines. With
-//!     the optimizer they get suppressed, because the optimizer removes and
+//!     the optimizer they are suppressed, because the optimizer removes and
 //!     moves instructions and renumbers blocks — wrong lines would be worse
 //!     than none.
 
@@ -21,7 +21,7 @@ use std::sync::Mutex;
 struct FuncLines {
     /// Position of the `fn` line: (file number, line)
     decl: Option<(u32, u32)>,
-    /// (block, index of the instruction within the block) -> (file number, line)
+    /// (block, index of the instruction in the block) -> (file number, line)
     notes: HashMap<(u32, u32), (u32, u32)>,
 }
 
@@ -83,7 +83,7 @@ pub fn set_fn(name: &str, file: u32, line: u32) {
     });
 }
 
-/// Remember the source line of instruction `idx` within block `block`.
+/// Remember the source line of instruction `idx` in block `block`.
 pub fn note(name: &str, block: u32, idx: u32, file: u32, line: u32) {
     if line == 0 {
         return;
@@ -101,7 +101,7 @@ pub fn note(name: &str, block: u32, idx: u32, file: u32, line: u32) {
     });
 }
 
-/// One `alloca` got INSERTED into block `block` at position `at`: every
+/// An `alloca` was INSERTED into block `block` at position `at`: every
 /// note from that position onwards slides one step back.
 pub fn shift_after_insert(name: &str, block: u32, at: u32) {
     with(|t| {
@@ -123,7 +123,7 @@ pub fn fn_line(name: &str) -> Option<(u32, u32)> {
     with(|t| t.funcs.get(name).and_then(|f| f.decl))
 }
 
-/// Line of instruction `idx` within block `block`, if noted.
+/// Line of instruction `idx` in block `block`, if noted.
 pub fn line_at(name: &str, block: u32, idx: u32) -> Option<(u32, u32)> {
     with(|t| {
         t.funcs

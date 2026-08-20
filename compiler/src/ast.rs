@@ -108,7 +108,7 @@ pub enum ExprKind {
     Field(Box<Expr>, String, Span),
     /// Index `base[idx]`
     Index(Box<Expr>, Box<Expr>),
-    /// Call `f(args)` — direct function identifiers only (stage 0)
+    /// Call `f(args)` — direct function names only (stage 0)
     Call(String, Vec<Expr>, Span),
     /// `syscall(nr, a1..a6)`
     Syscall(Vec<Expr>),
@@ -171,13 +171,13 @@ pub enum Stmt {
     Break(Span),
     Continue(Span),
     /// `defer <stmt>` or `errdefer <stmt>` — runs when the enclosing block
-    /// gets left, reversing the order of declaration (SPEC §5.1). The `bool`
+    /// is left, in reverse order of declaration (SPEC §5.1). The `bool`
     /// is `true` for `errdefer`: the statement then runs ONLY when the
-    /// function gets left through some error.
+    /// function is left through an error.
     Defer(Box<Stmt>, bool, Span),
     Expr(Expr),
     Block(Block),
-    /// Produced by the parser during error recovery only; gets ignored.
+    /// Produced by the parser during error recovery only; it is ignored.
     Error(Span),
 }
 
@@ -200,7 +200,7 @@ impl Stmt {
         }
     }
 
-    /// Short label of the statement kind (for the overview of `--emit=ast`).
+    /// Short name of the statement kind (for the overview of `--emit=ast`).
     pub fn kind_name(&self) -> &'static str {
         match self {
             Stmt::Let { mutable: false, .. } => "let",
@@ -228,8 +228,8 @@ pub struct Param {
     pub span: Span,
 }
 
-/// One attribute `#[attr]` or `#[attr(arg)]` ahead of a declaration.
-/// The valid spellings live within `attrs.rs` — there and nowhere else.
+/// An attribute `#[attr]` or `#[attr(arg)]` in front of a declaration.
+/// The valid spellings live in `attrs.rs` — there and nowhere else.
 #[derive(Clone, Debug)]
 pub struct Attr {
     pub name: String,
@@ -267,7 +267,7 @@ pub struct ConstDecl {
 #[derive(Clone, Debug)]
 pub struct ImportDecl {
     pub path: Vec<String>,
-    /// Label under which the module gets addressed by the source (last part).
+    /// Name under which the module is addressed by the source (last part).
     pub alias: String,
     pub span: Span,
 }
@@ -286,6 +286,6 @@ pub struct Program {
     /// produce source text through `emit_*` that the same run compiles
     /// (SPEC §6.4).
     pub comptime_blocks: Vec<(Block, Span)>,
-    /// Count of ExprIds handed out (= size of the type table).
+    /// Number of ExprIds handed out (= size of the type table).
     pub expr_count: u32,
 }

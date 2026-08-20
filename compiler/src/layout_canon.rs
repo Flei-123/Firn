@@ -3,18 +3,18 @@
 //!
 //! ## Why a rendering of its own
 //!
-//! Layout and ABI are the spots where a compiler turns quietly wrong: one
-//! field offset off by a bit, one aggregate held by registers rather than by
+//! Layout and ABI are the places where a compiler turns quietly wrong: one
+//! field offset off by a bit, one aggregate held in registers rather than in
 //! memory — and the program runs, just wrongly. Comparing two independent
 //! implementations is worth more here than any test case somebody dreams up.
 //!
 //! ## Resolution just like the Firn version
 //!
-//! Resolved gets **the root file only**: base types, pointers, arrays and the
-//! structs declared by this file. A type spelling that is missing here
+//! Resolved is **the root file only**: base types, pointers, arrays and the
+//! structs declared by this file. A type name that is missing here
 //! (say `rt.Buf` from another module) turns into the placeholder `?` with
 //! size 0 and alignment 1 — both implementations do the same, so that the
-//! comparison stays exact rather than failing over artificial uncertainty.
+//! comparison stays exact rather than failing over an artificial uncertainty.
 
 use crate::abi::{self, ArgClass};
 use crate::ast::{Program, TypeExpr};
