@@ -133,7 +133,9 @@ pub(crate) fn label(name: &str) -> String {
 }
 
 pub(crate) fn block_label(fname: &str, b: u32) -> String {
-    format!(".L{}__bb{}", fname, b)
+    // Round 58: like `symbol` — the `#` of a generated closure name is no
+    // assembler character and becomes a dot.
+    format!(".L{}__bb{}", fname.replace('#', "."), b)
 }
 
 pub fn emit(m: &Module) -> Result<String, String> {
