@@ -76,14 +76,10 @@ That is not only a request to the programmer but is **enforced**:
    **71**), `gc_collect()` likewise (**72**), and writing a Gc pointer
    into a heap field (**73**).
 
-The three refusals:
-
-```
-The runtime writes one line to stderr and stops the program (the wording
-comes from `lib/gc/gc.fi`): allocation during a finalizer, `gc_collect()`
-during a finalizer, resurrection in a finalizer -- each of them with the
-rule it breaks (SPEC 3.5.3 S4).
-```
+The three refusals: the runtime writes one line to stderr and stops the
+program. The wording stands in `lib/gc/gc.fi` and names the case together
+with the rule it breaks (SPEC 3.5.3 S4) -- allocation during a finalizer,
+`gc_collect()` during a finalizer, resurrection in a finalizer.
 
 **Item 3 solves the reentrancy question at the same time.** A finalizer that
 allocates would start a collection in the middle of a collection:
