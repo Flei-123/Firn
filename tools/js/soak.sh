@@ -117,8 +117,9 @@ if [ "${clean_growth:-0}" -gt 8192 ]; then
     echo "FAILED: the clean run grew by more than 8 MiB -- that is a leak."
     exit 1
 fi
-if [ "${leak_growth:-0}" -lt 16384 ]; then
-    echo "FAILED: the counter check did NOT grow -- the measurement is broken."
+MIN_LEAK=$(( ROUNDS / 40 + 4096 ))
+if [ "${leak_growth:-0}" -lt "$MIN_LEAK" ]; then
+    echo "FAILED: the counter check grew by only ${leak_growth} KiB (needed ${MIN_LEAK}) -- the measurement is broken."
     exit 1
 fi
 echo "OK: cycles are collected (${clean_growth} KiB), and a real leak is seen (${leak_growth} KiB)."

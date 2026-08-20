@@ -162,8 +162,8 @@ def main():
     # single crash never swallows the remaining thousands of cases.
     blocks = []
     todo = list(range(len(jobs)))
-    BATCH = 200
-    BUDGET = 90
+    BATCH = 64
+    BUDGET = 15
     while todo:
         chunk = todo[:BATCH]
         with tempfile.NamedTemporaryFile(delete=False) as tf:
