@@ -1,25 +1,25 @@
-//! Kanonische Textform des AST — der **Maßstab** für den in Firn
-//! geschriebenen Parser (`lib/firnc1/parser.fi`).
+//! Canonical text form of the AST — the **yardstick** for the parser
+//! that is written using Firn itself (`lib/firnc1/parser.fi`).
 //!
-//! ## Wozu eine zweite Ausgabe neben `--emit=ast`?
+//! ## Why a second rendering next to `--emit=ast`?
 //!
-//! `--emit=ast` ist Rusts `{:#?}`: an die Datenstruktur gebunden, mit
-//! `Box`, `Some`/`None` und Feldnamen. Ein Parser in einer anderen Sprache
-//! kann das nicht nachbauen, ohne Rusts Debug-Ausgabe nachzuäffen — und dann
-//! prüft der Vergleich die Formatierung statt den Baum.
+//! `--emit=ast` is Rust's `{:#?}`: tied to the data structure, with `Box`,
+//! `Some`/`None` and field labels. A parser written for another language
+//! cannot rebuild that without aping Rust's debug output — and then the
+//! comparison checks the formatting rather than the tree.
 //!
-//! Diese Form ist bewusst **sprachneutral**: geklammerte Listen, ein Knoten je
-//! Zeile wäre unnötig, also eine Zeile je Deklaration. Zwei unabhängige Parser
-//! können denselben Text erzeugen, wenn — und nur wenn — sie denselben Baum
-//! gebaut haben.
+//! This form is deliberately **language neutral**: bracketed lists; one
+//! node per line would be pointless, so one line per declaration. Two
+//! independent parsers can produce the same text if — and only if — they
+//! built the same tree.
 //!
-//! ## Was NICHT drinsteht
+//! ## What is NOT part of it
 //!
-//! Quellpositionen. Sie gehören zum Baum, aber ihre Zusammensetzung
-//! (`Parser::join` über Teilausdrücke) ist eine eigene Verabredung; sie wird
-//! getrennt geprüft, sobald der Parser steht. Ebenso fehlen die Erweiterungen,
-//! die ihren Baum außerhalb von `Program` halten (`enum`/`match`,
-//! Fehlerunionen, Generics, `gc class`, Attribute, `comptime`).
+//! Source positions. They belong to the tree, but how they get composed
+//! (`Parser::join` over subexpressions) is a convention of its own; it gets
+//! checked separately once the parser stands. Missing as well are the
+//! extensions that keep their tree outside of `Program` (`enum`/`match`,
+//! error unions, generics, `gc class`, attributes, `comptime`).
 
 use crate::ast::*;
 use crate::sema::TypeInfo;
@@ -27,14 +27,14 @@ use crate::types::TypeCtx;
 use std::cell::RefCell;
 
 thread_local! {
-    /// Typtabelle fuer `--emit=typen`. Ist sie gesetzt, haengt an jeden
-    /// Ausdruck sein Typ. Ein `thread_local` statt eines zusaetzlichen
-    /// Parameters durch zwoelf Funktionen: die Ausgabe ist ein
-    /// Fehlersuchwerkzeug, kein Teil des Compilerpfades.
+    /// Type table for `--emit=types`. Once it is set, every expression
+    /// carries its type. A `thread_local` rather than one extra parameter
+    /// threaded through twelve functions: this output is a troubleshooting
+    /// tool, no part of the compiler path.
     static TYPES: RefCell<Option<(Vec<crate::types::Type>, TypeCtx)>> = RefCell::new(None);
 }
 
-/// Wie `render`, aber mit dem Typ an jedem Ausdruck: `(int 5 :i32)`.
+/// Like `render`, but with the type at every expression: `(int 5 :i32)`.
 pub fn render_typed(p: &Program, info: &TypeInfo) -> String {
     TYPES.with(|t| *t.borrow_mut() = Some((info.expr_types.clone(), info.tcx.clone())));
     let out = render(p);

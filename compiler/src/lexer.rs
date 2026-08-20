@@ -1,29 +1,29 @@
-//! Handgeschriebener Lexer (kein Generator).
+//! Hand-written lexer (no generator).
 //!
-//! SCHNITTSTELLE (fest, wird von parser.rs benutzt):
+//! INTERFACE (fixed, used by parser.rs):
 //!   `pub fn lex(src: &str, dg: &mut Diags) -> Vec<Token>`
-//! Der Tokenstrom endet IMMER mit genau einem `TokKind::Eof`.
-//! Spalten zaehlen ZEICHEN (1-basiert), Zeilen 1-basiert.
+//! The token stream ALWAYS ends with exactly one `TokKind::Eof`.
+//! Columns count CHARACTERS (1-based), lines are 1-based.
 
 use crate::diag::{Diags, Span};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TokKind {
-    // Literale und Namen
+    // literals and names
     Int(i128),
     Ident(String),
-    /// Gleitkommaliteral (`1.5`, `2e10`, `1_000.25`) als **Bitmuster** eines
-    /// IEEE-754 binary64. Kein `f64`, weil `TokKind` `Eq` ableitet und
-    /// Gleitkomma keine Aequivalenzrelation hat (NaN != NaN) — und weil FIR
-    /// ohnehin nur das Bitmuster kennt.
+    /// Float literal (`1.5`, `2e10`, `1_000.25`) as the **bit pattern** of one
+    /// IEEE-754 binary64. No `f64`, because `TokKind` derives `Eq` and floats
+    /// carry no equivalence relation (NaN != NaN) — and because FIR knows the
+    /// bit pattern only anyway.
     Float(u64),
-    /// Zeichenkettenliteral: `"..."`, `b"..."` oder `u"..."`.
-    /// Der Inhalt ist bereits entschluesselt (`compiler/src/strings.rs`).
+    /// String literal: `"..."`, `b"..."` or `u"..."`.
+    /// The content is already decoded (`compiler/src/strings.rs`).
     Str(crate::strings::LitKind, crate::strings::LitValue),
-    /// `f"..."` — String-Interpolation (Runde 39). Der Inhalt ist der ROHE
-    /// Rumpf; das Zerlegen in Text- und Ausdruckssegmente macht der Parser.
+    /// `f"..."` — string interpolation (round 39). The content is the RAW
+    /// body; splitting it into text and expression segments is the parser's job.
     FStr(String),
-    // Schluesselwoerter
+    // keywords
     KwFn,
     KwLet,
     KwVar,
@@ -49,14 +49,14 @@ pub enum TokKind {
     KwIn,
     KwImport,
     KwExport,
-    /// Summentypen (SPEC §6.3) — verdrahtet vom Modul `types`.
+    /// Sum types (SPEC §6.3) — wired up by the module `types`.
     KwEnum,
     KwMatch,
-    /// Fehlerunionen (SPEC §5.1) — verdrahtet vom Modul `fehlerunionen`.
+    /// Error unions (SPEC §5.1) — wired up by the module `fehlerunionen`.
     KwError,
     KwTry,
     KwCatch,
-    // Satzzeichen
+    // punctuation
     LParen,
     RParen,
     LBrace,
@@ -83,8 +83,8 @@ pub enum TokKind {
     AndAnd,  // &&
     OrOr,    // ||
     Not,     // !
-    Question, // ? (gepruefte Abwaertsumwandlung `x.as?[T]`)
-    Hash,    // # (Attribute)
+    Question, // ? (checked downcast `x.as?[T]`)
+    Hash,    // # (attributes)
     EqEq,
     NotEq,
     Lt,
@@ -95,7 +95,7 @@ pub enum TokKind {
 }
 
 impl TokKind {
-    /// Beschreibung fuer Fehlermeldungen ("expected ')' ...").
+    /// Description for error messages ("expected ')' ...").
     pub fn text(&self) -> String {
         match self {
             TokKind::Int(v) => format!("{}", v),
@@ -178,7 +178,7 @@ pub struct Token {
     pub span: Span,
 }
 
-/// Schluesselwort oder Bezeichner.
+/// Keyword or identifier.
 fn keyword(word: &str) -> Option<TokKind> {
     Some(match word {
         "fn" => TokKind::KwFn,
@@ -225,7 +225,7 @@ fn is_ident_cont(c: char) -> bool {
 struct Lexer<'a> {
     chars: Vec<char>,
     pos: usize,
-    /// Nummer der Quelldatei in der Karte der `Diags` (Modulsystem).
+    /// Number of the source file within the map of `Diags` (module system).
     file: u32,
     line: u32,
     col: u32,
@@ -240,7 +240,7 @@ impl<'a> Lexer<'a> {
     fn peek2(&self) -> Option<char> {
         self.chars.get(self.pos + 1).copied()
     }
-    /// Ein Zeichen weiter; fuehrt Zeile/Spalte nach.
+    /// One character onwards; keeps line/column up to date.
     fn bump(&mut self) -> Option<char> {
         let c = self.chars.get(self.pos).copied()?;
         self.pos += 1;
@@ -260,8 +260,8 @@ impl<'a> Lexer<'a> {
         Span::in_file(self.file, line, col, len)
     }
 
-    /// Whitespace und Kommentare ueberspringen. Meldet nicht geschlossene
-    /// Blockkommentare, lext danach aber weiter.
+    /// Skip whitespace and comments. Reports unclosed block comments, yet keeps
+    /// lexing afterwards.
     fn skip_trivia(&mut self) {
         loop {
             match self.peek() {
@@ -311,9 +311,9 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// Zahl ab der aktuellen Position (Dezimal, 0x, 0b, '_' als Trenner).
-    /// Rest eines Gleitkommaliterals ab dem Punkt bzw. dem Exponenten.
-    /// `vorne` sind die bereits gelesenen Vorkommaziffern (ohne `_`).
+    /// Number from the current position (decimal, 0x, 0b, '_' as separator).
+    /// Rest of a float literal from the point, respectively the exponent.
+    /// `front` holds the digits before the point already read (without `_`).
     fn float_rest(&mut self, line: u32, col: u32, mut ncols: u32, front: String) {
         let mut text = front;
         if self.peek() == Some('.') {
@@ -369,8 +369,8 @@ impl<'a> Lexer<'a> {
                 return;
             }
         }
-        // `parse::<f64>` rundet korrekt (Rust nutzt dafuer denselben Algorithmus
-        // wie `strtod`); ein Ueberlauf liefert `inf`, das ist gewollt.
+        // `parse::<f64>` rounds correctly (Rust uses the same algorithm for that
+        // as `strtod`); overflow yields `inf`, which is wanted.
         let v: f64 = text.parse().unwrap_or(0.0);
         self.push(TokKind::Float(v.to_bits()), line, col, ncols.max(1));
     }
@@ -380,7 +380,7 @@ impl<'a> Lexer<'a> {
         let mut ncols = 0u32;
         let mut digits = String::new();
         let mut radix = 10u32;
-        // Praefix erkennen
+        // spot the prefix
         if self.peek() == Some('0') {
             match self.peek2() {
                 Some('x') | Some('X') => radix = 16,
@@ -401,10 +401,10 @@ impl<'a> Lexer<'a> {
                 continue;
             }
             if c.is_ascii_alphanumeric() {
-                // GLEITKOMMA-EXPONENT: bei Basis 10 beendet ein `e`/`E` mit
-                // folgender Ziffer oder Vorzeichen die Ganzzahl — sonst wuerde
-                // es hier als ungueltige Ziffer gemeldet, bevor die
-                // Gleitkommapruefung ueberhaupt drankommt (`1e3`).
+                // FLOAT EXPONENT: at base 10 one `e`/`E` followed by a digit
+                // or sign ends the integer — otherwise it would be reported
+                // here as invalid digit before the float check even gets
+                // its turn (`1e3`).
                 if radix == 10
                     && (c == 'e' || c == 'E')
                     && (self.peek2().map(|n| n.is_ascii_digit()) == Some(true)
@@ -423,9 +423,9 @@ impl<'a> Lexer<'a> {
             }
             break;
         }
-        // GLEITKOMMA (nur zur Basis 10): ein Punkt zaehlt nur dann dazu, wenn
-        // eine ZIFFER folgt — `0..10` bleibt der Bereich einer `for`-Schleife
-        // und wird nicht als `0.` gelesen.
+        // FLOAT (base 10 only): a point counts as part of it only when a
+        // DIGIT follows — `0..10` stays the range of a `for` loop and does
+        // not get read as `0.`.
         if radix == 10 && bad_digit.is_none() && !digits.is_empty() {
             let dot = self.peek() == Some('.') && self.peek2().map(|c| c.is_ascii_digit()) == Some(true);
             let expo = matches!(self.peek(), Some('e') | Some('E'))
@@ -489,7 +489,7 @@ impl<'a> Lexer<'a> {
         self.push(kind, line, col, len);
     }
 
-    /// Ein Operator/Satzzeichen. Gibt false zurueck, wenn das Zeichen unbekannt ist.
+    /// One operator/punctuation mark. Returns false when the character is unknown.
     fn punct(&mut self) -> bool {
         let (line, col) = (self.line, self.col);
         let c = match self.peek() {
@@ -541,18 +541,18 @@ impl<'a> Lexer<'a> {
         true
     }
 
-    /// Zeichenkettenliteral lexen. `false`, wenn an dieser Stelle keines steht.
+    /// Lex a string literal. `false` when none stands at this spot.
     ///
-    /// Die eigentliche Entschluesselung — Maskierungen, `\\uXXXX` samt
-    /// ungepaarter Surrogate, UTF-8-Pruefung — macht `strings.rs`. Hier wird sie
-    /// nur angebunden; genau diese Anbindung fehlte bis Runde 8 (SPEC §14.1.str,
-    /// Punkt S1).
+    /// The decoding proper — escapes, `\uXXXX` including unpaired surrogates,
+    /// UTF-8 check — is done by `strings.rs`. Here it only gets wired up;
+    /// exactly that wiring was missing until round 8 (SPEC §14.1.str,
+    /// point S1).
     ///
-    /// WICHTIG: der Aufruf steht VOR der Bezeichnererkennung, sonst frisst
-    /// `is_ident_start` das `b` bzw. `u` von `b"..."` und `u"..."`.
+    /// IMPORTANT: the call stands BEFORE identifier recognition, otherwise
+    /// `is_ident_start` eats the `b` or `u` of `b"..."` and `u"..."`.
     fn string_literal(&mut self) -> bool {
         let (line, col) = (self.line, self.col);
-        // ZUERST die Interpolation: `f"` ist sonst Bezeichner + Literal.
+        // FIRST the interpolation: `f"` would otherwise be identifier + literal.
         if let Some((res, consumed)) = crate::strings::lex_fstring_literal(&self.chars, self.pos) {
             for _ in 0..consumed {
                 self.bump();
@@ -564,7 +564,7 @@ impl<'a> Lexer<'a> {
                         self.sp(line, col + e.off, 1),
                         format!("in a string literal: {}", e.msg),
                     );
-                    // Weiterlexen mit leerem Rumpf — wie bei den anderen Literalen.
+                    // Keep lexing with empty body — as with the other literals.
                     self.push(TokKind::FStr(String::new()), line, col, consumed as u32);
                 }
             }
@@ -581,13 +581,13 @@ impl<'a> Lexer<'a> {
         match res {
             Ok(val) => self.push(TokKind::Str(kind, val), line, col, consumed as u32),
             Err(e) => {
-                // Die Spalte des Fehlers liegt `e.off` Zeichen hinter dem Anfang.
+                // The column of the error sits `e.off` characters past the start.
                 self.dg.error(
                     self.sp(line, col + e.off, 1),
                     format!("in a string literal: {}", e.msg),
                 );
-                // Weiterlexen mit einem leeren Literal, damit Folgefehler
-                // nicht auf eine kaputte Tokenfolge zurueckgehen.
+                // Keep lexing with one empty literal, so that follow-up errors
+                // do not trace back to a broken token sequence.
                 let empty = match kind {
                     crate::strings::LitKind::Str16 => {
                         crate::strings::LitValue::Units(Vec::new())
@@ -620,7 +620,7 @@ impl<'a> Lexer<'a> {
                     self.sp(line, col, 1),
                     format!("unknown character '{}' in the source text", c),
                 );
-                // Weiterlexen: das stoerende Zeichen wird uebersprungen.
+                // Keep lexing: the offending character gets skipped.
                 self.bump();
             }
         }
@@ -633,7 +633,7 @@ pub fn lex(src: &str, dg: &mut Diags) -> Vec<Token> {
     lex_file(src, 0, dg)
 }
 
-/// Wie `lex`, aber fuer eine bestimmte Quelldatei der Karte (Modulsystem).
+/// Like `lex`, but for a particular source file of the map (module system).
 pub fn lex_file(src: &str, file: u32, dg: &mut Diags) -> Vec<Token> {
     let mut lx = Lexer {
         chars: src.chars().collect(),

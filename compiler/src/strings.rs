@@ -1,54 +1,54 @@
-//! Zeichenketten im Compiler (SPEC §8) — Modul `str`.
+//! Strings within the compiler (SPEC §8) — module `str`.
 //!
-//! Diese Datei enthaelt die **Compilerseite** der vier Zeichenkettentypen:
+//! This file holds the **compiler side** of the four string types:
 //!
-//! | Typ | Inhalt | geprueft | Layout |
+//! | type | content | checked | layout |
 //! |---|---|---|---|
-//! | `Bytes` | rohe Oktette | nein | `{ ptr: *mut u8, len: usize, cap: usize }` |
-//! | `Str` | UTF-8 | ja (beim Literal) | wie `Bytes` |
-//! | `Str16` | WTF-16-Codeeinheiten | **nichts** | `{ ptr: *mut u16, len: usize, cap: usize }` |
-//! | `Atom` | interniert | — | `u32` |
+//! | `Bytes` | raw octets | no | `{ ptr: *mut u8, len: usize, cap: usize }` |
+//! | `Str` | UTF-8 | yes (at the literal) | like `Bytes` |
+//! | `Str16` | WTF-16 code units | **nothing** | `{ ptr: *mut u16, len: usize, cap: usize }` |
+//! | `Atom` | interned | — | `u32` |
 //!
-//! `Str16` prueft und normalisiert **nichts**: ein einzelnes `\uD800` bleibt als
-//! ungepaartes Surrogat erhalten (SPEC §8.2). `to_utf8` scheitert daran,
-//! `to_utf8_lossy` ersetzt es durch U+FFFD, WTF-8 haelt es verlustfrei.
+//! `Str16` checks and normalizes **nothing**: a single `\uD800` survives as
+//! the unpaired surrogate it is (SPEC §8.2). `to_utf8` fails on it,
+//! `to_utf8_lossy` replaces it by U+FFFD, WTF-8 keeps it losslessly.
 //!
-//! Die Funktionen sind bewusst frei von Compiler-Innereien (kein `Diags`,
-//! kein `Span`): der Lexer braucht genau einen Aufruf von
-//! [`lex_string_literal`] und macht aus [`LitError`] eine Meldung mit
-//! Zeile/Spalte. Diese Anbindung im Lexer gehoert dem Modul `kern` und ist in
-//! dieser Runde noch nicht gesetzt (siehe `ABNAHME.md`, Abschnitt `str`);
-//! ueber `firnc --strlit <literal>` ist der gesamte Pfad trotzdem
-//! nachpruefbar.
+//! The functions are deliberately free of compiler internals (no `Diags`, no
+//! `Span`): the lexer needs exactly one call of [`lex_string_literal`] and
+//! turns [`LitError`] into a message with line/column. That wiring inside
+//! the lexer belongs to the module `kern` and is not yet placed during this
+//! round (see `ABNAHME.md`, section `str`); through
+//! `firnc --strlit <literal>` the whole path stays checkable
+//! nonetheless.
 
 // ---------------------------------------------------------------------------
-// Speicherlayout (Vertrag mit lib/str/*.fi und dem Modul tok)
+// Memory layout (contract with lib/str/*.fi and the module tok)
 // ---------------------------------------------------------------------------
 
-/// Offset des Datenzeigers in `Bytes`/`Str`/`Str16`.
+/// Offset of the data pointer within `Bytes`/`Str`/`Str16`.
 pub const SLICE_PTR_OFF: u64 = 0;
-/// Offset der Laenge (in Elementen, nicht Bytes).
+/// Offset of the length (counted as elements, not bytes).
 pub const SLICE_LEN_OFF: u64 = 8;
-/// Offset der Kapazitaet (in Elementen).
+/// Offset of the capacity (counted as elements).
 pub const SLICE_CAP_OFF: u64 = 16;
-/// Gesamtgroesse von `Bytes`/`Str`/`Str16`.
+/// Total size of `Bytes`/`Str`/`Str16`.
 pub const SLICE_SIZE: u64 = 24;
 
-/// Ersatzzeichen U+FFFD.
+/// Replacement character U+FFFD.
 pub const REPLACEMENT: u32 = 0xFFFD;
 
 // ---------------------------------------------------------------------------
-// Literale
+// Literals
 // ---------------------------------------------------------------------------
 
-/// Welche der drei Literalformen vorliegt.
+/// Which of the three literal forms is present.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LitKind {
-    /// `b"..."` — rohe Oktette.
+    /// `b"..."` — raw octets.
     Bytes,
-    /// `"..."` — UTF-8, geprueft.
+    /// `"..."` — UTF-8, checked.
     Str,
-    /// `u"..."` — WTF-16, prueft nichts.
+    /// `u"..."` — WTF-16, checks nothing.
     Str16,
 }
 
@@ -60,7 +60,7 @@ impl LitKind {
             LitKind::Str16 => "Str16",
         }
     }
-    /// Praefix vor dem Anfuehrungszeichen.
+    /// Prefix ahead of the quote.
     pub fn prefix(self) -> &'static str {
         match self {
             LitKind::Bytes => "b",
@@ -70,17 +70,17 @@ impl LitKind {
     }
 }
 
-/// Der entschluesselte Inhalt eines Literals.
+/// The decoded content of a literal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LitValue {
-    /// Oktette (`Bytes`) bzw. geprueftes UTF-8 (`Str`).
+    /// Octets (`Bytes`) or checked UTF-8 (`Str`).
     Octets(Vec<u8>),
-    /// `u16`-Codeeinheiten, ungepruef (`Str16`).
+    /// `u16` code units, unchecked (`Str16`).
     Units(Vec<u16>),
 }
 
 impl LitValue {
-    /// Anzahl der Elemente (Oktette bzw. Codeeinheiten).
+    /// Count of elements (octets or code units).
     pub fn len(&self) -> usize {
         match self {
             LitValue::Octets(v) => v.len(),
@@ -90,7 +90,7 @@ impl LitValue {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
-    /// Assembler-Darstellung der Daten (`.byte`/`.short`), ohne Beschriftung.
+    /// Assembler rendering of the data (`.byte`/`.short`), without a label.
     pub fn asm_data(&self) -> String {
         match self {
             LitValue::Octets(v) => data_line(".byte", v.iter().map(|b| *b as u64)),
@@ -115,20 +115,20 @@ fn data_line(dir: &str, it: impl Iterator<Item = u64>) -> String {
     out
 }
 
-/// Erkennt `f"..."` — die String-Interpolation (Runde 39).
+/// Spots `f"..."` — the string interpolation (round 39).
 ///
-/// Der Rumpf bleibt ROH (Klammern und Maskierungen unangetastet): das
-/// Zerlegen in Text- und Ausdruckssegmente macht der Parser
-/// (`parser.rs::interpolation`), das Entschluesseln der Textsegmente laeuft
-/// danach ueber [`decode_literal`] wie bei jedem anderen Literal.
-/// Rueckgabe wie bei [`lex_string_literal`]: `(Inhalt-oder-Fehler,
-/// verbrauchte Zeichen)`, `None`, wenn hier kein `f"` steht.
+/// The body stays RAW (braces and escapes untouched): splitting it into text
+/// and expression segments is the parser's job
+/// (`parser.rs::interpolation`), decoding the text segments runs afterwards
+/// through [`decode_literal`] like with every other literal.
+/// Return value as with [`lex_string_literal`]: `(content-or-error,
+/// characters consumed)`, `None` when no `f"` stands here.
 pub fn lex_fstring_literal(src: &[char], pos: usize) -> Option<(Result<String, LitError>, usize)> {
     if src.get(pos) != Some(&'f') || src.get(pos + 1) != Some(&'"') {
         return None;
     }
-    // Rumpf bis zum unmaskierten Anfuehrungszeichen — dieselbe Schleife wie
-    // bei `lex_string_literal`, nur ohne Entschluesselung.
+    // Body up to the unescaped quote — the same loop as at
+    // `lex_string_literal`, just without decoding.
     let mut body: Vec<char> = Vec::new();
     let mut i = pos + 2;
     let mut closed = false;
@@ -164,10 +164,10 @@ pub fn lex_fstring_literal(src: &[char], pos: usize) -> Option<(Result<String, L
     Some((Ok(body.into_iter().collect()), used))
 }
 
-/// Fehler beim Entschluesseln eines Literals.
+/// Error while decoding a literal.
 ///
-/// `off` ist der Abstand in **Zeichen** vom oeffnenden Anfuehrungszeichen;
-/// der Lexer addiert ihn auf die Spalte des Literalanfangs.
+/// `off` is the distance counted as **characters** from the opening quote;
+/// the lexer adds it onto the column of the literal start.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LitError {
     pub off: u32,
@@ -180,12 +180,12 @@ impl LitError {
     }
 }
 
-/// Erkennt am Zeichenstrom `src` ab `pos` ein Zeichenkettenliteral.
+/// Spots a string literal at the character stream `src` from `pos`.
 ///
-/// Rueckgabe: `(Art, Inhalt-oder-Fehler, Anzahl verbrauchter Zeichen)`.
-/// `None`, wenn an dieser Stelle kein Literal beginnt. Der Lexer braucht genau
-/// diesen einen Aufruf; die verbrauchte Zeichenzahl ist zugleich die Breite der
-/// Markierung in der Fehlerausgabe.
+/// Return value: `(kind, content-or-error, count of characters consumed)`.
+/// `None` when no literal starts at this spot. The lexer needs exactly this
+/// one call; the count of characters consumed is at the same time the width
+/// of the marker within the error output.
 pub fn lex_string_literal(
     src: &[char],
     pos: usize,
@@ -196,7 +196,7 @@ pub fn lex_string_literal(
         'u' if src.get(pos + 1) == Some(&'"') => (LitKind::Str16, pos + 1),
         _ => return None,
     };
-    // Rumpf bis zum unmaskierten Anfuehrungszeichen einsammeln.
+    // Collect the body up to the unescaped quote.
     let mut body: Vec<char> = Vec::new();
     let mut i = quote_at + 1;
     let mut closed = false;
@@ -233,15 +233,15 @@ pub fn lex_string_literal(
             used,
         ));
     }
-    let lead = (quote_at - pos) + 1; // Zeichen vor dem Rumpf
+    let lead = (quote_at - pos) + 1; // characters ahead of the body
     let res = decode_literal(kind, &body).map_err(|e| LitError { off: e.off + lead as u32, ..e });
     Some((kind, res, used))
 }
 
-/// Entschluesselt den Rumpf eines Literals (ohne Anfuehrungszeichen).
+/// Decodes the body of a literal (without the quotes).
 pub fn decode_literal(kind: LitKind, body: &[char]) -> Result<LitValue, LitError> {
-    let mut units: Vec<u16> = Vec::new(); // fuer Str16
-    let mut octets: Vec<u8> = Vec::new(); // fuer Bytes/Str
+    let mut units: Vec<u16> = Vec::new(); // for Str16
+    let mut octets: Vec<u8> = Vec::new(); // for Bytes/Str
     let mut i = 0usize;
     while i < body.len() {
         let c = body[i];
@@ -266,7 +266,7 @@ pub fn decode_literal(kind: LitKind, body: &[char]) -> Result<LitValue, LitError
             }
             continue;
         }
-        // Maskierung
+        // escape
         let start = i;
         i += 1;
         let e = match body.get(i) {
@@ -354,7 +354,7 @@ pub fn decode_literal(kind: LitKind, body: &[char]) -> Result<LitValue, LitError
                         ))
                     }
                     LitKind::Str16 => {
-                        // Str16 prueft NICHTS: einzelne Surrogate bleiben erhalten.
+                        // Str16 checks NOTHING: single surrogates survive.
                         if cp > 0xFFFF {
                             push_utf16(&mut units, cp);
                         } else {
@@ -362,8 +362,8 @@ pub fn decode_literal(kind: LitKind, body: &[char]) -> Result<LitValue, LitError
                         }
                     }
                     LitKind::Str => {
-                        // In Str ist ein ungepaartes Surrogat ein Fehler; ein
-                        // Paar 😀 wird zu einem Codepunkt vereinigt.
+                        // Within Str one unpaired surrogate is a fault; a
+                        // pair 😀 gets united into one code point.
                         if is_high_surrogate(cp) {
                             if let Some((lo, w)) = peek_escaped_low(body, i) {
                                 i += w;
@@ -415,7 +415,7 @@ fn hex_fixed(body: &[char], at: usize, n: usize) -> Option<u32> {
     Some(v)
 }
 
-/// Sucht direkt hinter Position `i` ein `\uXXXX` mit tiefem Surrogat.
+/// Looks right behind position `i` for a `\uXXXX` with a low surrogate.
 fn peek_escaped_low(body: &[char], i: usize) -> Option<(u32, usize)> {
     if body.get(i) != Some(&'\\') || body.get(i + 1) != Some(&'u') {
         return None;
@@ -463,7 +463,7 @@ fn combine(hi: u32, lo: u32) -> u32 {
     0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
 }
 
-/// Haengt einen Codepunkt als UTF-8 an (Surrogate werden WTF-8-artig kodiert).
+/// Appends a code point as UTF-8 (surrogates get encoded WTF-8 style).
 pub fn push_utf8(out: &mut Vec<u8>, cp: u32) {
     if cp < 0x80 {
         out.push(cp as u8);
@@ -482,7 +482,7 @@ pub fn push_utf8(out: &mut Vec<u8>, cp: u32) {
     }
 }
 
-/// Haengt einen Codepunkt als UTF-16 an (Werte > 0xFFFF werden zum Paar).
+/// Appends a code point as UTF-16 (values > 0xFFFF become a pair).
 pub fn push_utf16(out: &mut Vec<u16>, cp: u32) {
     if cp < 0x10000 {
         out.push(cp as u16);
@@ -493,7 +493,7 @@ pub fn push_utf16(out: &mut Vec<u16>, cp: u32) {
     }
 }
 
-/// `Str -> Str16`: gelingt immer.
+/// `Str -> Str16`: always succeeds.
 pub fn utf8_to_utf16(bytes: &[u8]) -> Vec<u16> {
     let mut out = Vec::new();
     for cp in (Utf8Iter { b: bytes, i: 0 }) {
@@ -502,7 +502,7 @@ pub fn utf8_to_utf16(bytes: &[u8]) -> Vec<u16> {
     out
 }
 
-/// `Str16 -> Str`, fehlbar: `None` bei einem ungepaarten Surrogat (SPEC §8.2).
+/// `Str16 -> Str`, fallible: `None` on one unpaired surrogate (SPEC §8.2).
 pub fn to_utf8(units: &[u16]) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -525,7 +525,7 @@ pub fn to_utf8(units: &[u16]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// `Str16 -> Str`, ersetzend: ungepaarte Surrogate werden U+FFFD.
+/// `Str16 -> Str`, replacing: unpaired surrogates become U+FFFD.
 pub fn to_utf8_lossy(units: &[u16]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -553,7 +553,7 @@ pub fn to_utf8_lossy(units: &[u16]) -> Vec<u8> {
     out
 }
 
-/// WTF-8: verlustfreie Bruecke, haelt ungepaarte Surrogate (SPEC §8.2).
+/// WTF-8: lossless bridge, keeps unpaired surrogates (SPEC §8.2).
 pub fn to_wtf8(units: &[u16]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -569,13 +569,13 @@ pub fn to_wtf8(units: &[u16]) -> Vec<u8> {
                 _ => {}
             }
         }
-        push_utf8(&mut out, u); // Surrogat bleibt als 3-Byte-Folge erhalten
+        push_utf8(&mut out, u); // surrogate survives as a 3-byte sequence
         i += 1;
     }
     out
 }
 
-/// WTF-8 -> WTF-16, verlustfrei.
+/// WTF-8 -> WTF-16, lossless.
 pub fn from_wtf8(bytes: &[u8]) -> Vec<u16> {
     let mut out = Vec::new();
     for cp in (Utf8Iter { b: bytes, i: 0 }) {
@@ -588,7 +588,7 @@ pub fn from_wtf8(bytes: &[u8]) -> Vec<u16> {
     out
 }
 
-/// Prueft, ob `bytes` wohlgeformtes UTF-8 ist (ohne Surrogate, ohne Ueberlang).
+/// Checks whether `bytes` is well formed UTF-8 (no surrogates, no overlong).
 pub fn is_valid_utf8(bytes: &[u8]) -> bool {
     std::str::from_utf8(bytes).is_ok()
 }
@@ -611,7 +611,7 @@ impl<'a> Iterator for Utf8Iter<'a> {
         } else if b0 >= 0xC0 {
             2
         } else {
-            1 // fortsetzungsbyte allein: als Ersatzzeichen behandeln
+            1 // continuation byte alone: treat as replacement character
         };
         if n == 1 && b0 >= 0x80 {
             self.i += 1;
@@ -638,11 +638,11 @@ impl<'a> Iterator for Utf8Iter<'a> {
 }
 
 // ---------------------------------------------------------------------------
-// Atome (SPEC §8.3)
+// Atoms (SPEC §8.3)
 // ---------------------------------------------------------------------------
 
-/// Haeufige Namen bekommen zur **Bauzeit** feste, kleine Nummern (SPEC §8.3),
-/// damit `match` ueber Tag-Namen eine Sprungtabelle werden kann.
+/// Frequent names get fixed, small numbers at **build time** (SPEC §8.3), so
+/// that `match` over tag names can turn into a jump table.
 pub const STATIC_ATOMS: &[&str] = &[
     "", "a", "b", "br", "div", "em", "form", "h1", "h2", "h3", "head", "hr", "html", "i", "img",
     "input", "li", "link", "meta", "ol", "p", "script", "span", "strong", "style", "table", "tbody",
@@ -651,8 +651,8 @@ pub const STATIC_ATOMS: &[&str] = &[
     "data",
 ];
 
-/// Interniertabelle: Text -> `u32`. Vergleich zweier `Atom` ist ein
-/// Ganzzahlvergleich.
+/// Intern table: text -> `u32`. Comparing two `Atom` is one integer
+/// comparison.
 #[derive(Clone, Debug)]
 pub struct AtomTable {
     names: Vec<Vec<u8>>,
@@ -673,7 +673,7 @@ impl AtomTable {
         }
         t
     }
-    /// Liefert die Nummer; gleicher Text ergibt immer dieselbe Nummer.
+    /// Yields the number; equal text always gives the same number.
     pub fn intern(&mut self, text: &[u8]) -> u32 {
         if let Some(&id) = self.map.get(text) {
             return id;
@@ -695,11 +695,11 @@ impl AtomTable {
 }
 
 // ---------------------------------------------------------------------------
-// `--strlit`: Pruefwerkzeug fuer den gesamten Literalpfad
+// `--strlit`: check tool for the whole literal path
 // ---------------------------------------------------------------------------
 
-/// Entschluesselt ein Literal von der Befehlszeile und beschreibt das Ergebnis.
-/// Rueckgabe `Err(text)` bei ungueltigem Literal (Spalte im Text enthalten).
+/// Decodes a literal from the command line and describes the result.
+/// Yields `Err(text)` for one invalid literal (column held by the text).
 pub fn strlit_report(lit: &str) -> Result<String, String> {
     let src: Vec<char> = lit.chars().collect();
     let (kind, res, used) = match lex_string_literal(&src, 0) {
@@ -816,7 +816,7 @@ mod tests {
         assert_eq!(dec(LitKind::Str, "Hi"), LitValue::Octets(b"Hi".to_vec()));
         assert_eq!(dec(LitKind::Str, "\\u00e4"), LitValue::Octets(vec![0xC3, 0xA4]));
         assert_eq!(dec(LitKind::Str, "ä"), LitValue::Octets(vec![0xC3, 0xA4]));
-        // Surrogatpaar wird zu einem Codepunkt
+        // surrogate pair becomes one code point
         assert_eq!(
             dec(LitKind::Str, "\\uD83D\\uDE00"),
             LitValue::Octets(vec![0xF0, 0x9F, 0x98, 0x80])
@@ -836,21 +836,21 @@ mod tests {
         assert_eq!(v, LitValue::Units(vec![0x61, 0xD800, 0x62]));
         let u = match v {
             LitValue::Units(u) => u,
-            LitValue::Octets(_) => Vec::new(), // Str16 liefert immer Einheiten
+            LitValue::Octets(_) => Vec::new(), // Str16 always yields units
         };
         assert!(!u.is_empty(), "Str16 must yield units");
         assert_eq!(to_utf8(&u), None, "to_utf8 must fail");
         assert_eq!(to_utf8_lossy(&u), vec![0x61, 0xEF, 0xBF, 0xBD, 0x62], "U+FFFD expected");
-        // WTF-8 ist verlustfrei
+        // WTF-8 is lossless
         assert_eq!(from_wtf8(&to_wtf8(&u)), u);
     }
 
     #[test]
     fn str16_normalized_nothing() {
-        // Ein Paar bleibt ein Paar, ein Nicht-BMP-Escape wird zum Paar.
+        // A pair stays a pair, a non-BMP escape becomes a pair.
         assert_eq!(dec(LitKind::Str16, "\\uD83D\\uDE00"), LitValue::Units(vec![0xD83D, 0xDE00]));
         assert_eq!(dec(LitKind::Str16, "\\u{1F600}"), LitValue::Units(vec![0xD83D, 0xDE00]));
-        // Verdrehte Reihenfolge (low vor high) bleibt exakt erhalten.
+        // Twisted order (low before high) survives exactly.
         assert_eq!(dec(LitKind::Str16, "\\uDC00\\uD800"), LitValue::Units(vec![0xDC00, 0xD800]));
     }
 
@@ -884,7 +884,7 @@ mod tests {
         assert!(res.unwrap_err().msg.contains("without a closing"));
 
         assert!(lex_string_literal(&"abc".chars().collect::<Vec<_>>(), 0).is_none());
-        // Spalte des Fehlers zeigt auf die Maskierung im Quelltext.
+        // The column of the error points at the escape within the source.
         let src: Vec<char> = r#""a\q""#.chars().collect();
         let (_, res, _) = lex_string_literal(&src, 0).unwrap();
         assert_eq!(res.unwrap_err().off, 2);

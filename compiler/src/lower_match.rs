@@ -1,11 +1,11 @@
-//! Lowering von `match` und Aufzaehlungskonstruktoren nach FIR (Modul `types`).
+//! Lowering of `match` and enum constructors to FIR (module `types`).
 //!
-//! Ergebnis ist ein `fir::Term::Switch` ueber die Variantennummer (bzw. ueber
-//! den Ganzzahlwert), dessen Faelle **aufsteigend sortiert und duplikatfrei**
-//! sind. Untermuster (verschachtelte Varianten, Literale, Bereiche) werden als
-//! Kette von Vergleichen HINTER dem Switch geprueft; passt ein Kandidat nicht,
-//! geht es zum naechsten Kandidaten desselben Schluessels und zuletzt in die
-//! Auffangkette.
+//! The result is a `fir::Term::Switch` over the variant number (or over the
+//! integer value) whose cases are **sorted ascending and free of duplicates**.
+//! Subpatterns (nested variants, literals, ranges) get checked as a chain of
+//! comparisons BEHIND the switch; whenever a candidate does not fit, control
+//! moves to the next candidate of the same key and finally to the catch-all
+//! chain.
 
 use std::collections::BTreeMap;
 
@@ -16,8 +16,8 @@ use crate::lower::Lower;
 use crate::sema_match::{enum_by_struct, match_info, EnumDef, MatchInfo, Pattern, MATCH_PREFIX};
 use crate::types::Type;
 
-/// Bereichsmuster bis zu dieser Weite werden in einzelne Sprungmarken
-/// aufgeloest; breitere werden als Vergleich geprueft.
+/// Range patterns up to this width get resolved to separate jump labels;
+/// wider ones get checked as a comparison.
 const MAX_RANGE_KEYS: i128 = 256;
 
 pub(crate) fn is_ctor(name: &str) -> bool {
@@ -44,9 +44,9 @@ fn scalar_fty(t: &Type) -> Option<FTy> {
     })
 }
 
-// ------------------------------------------------------------- Konstruktoren
+// -------------------------------------------------------------- Constructors
 
-/// `Enum::Variante(a, b)` — legt den Wert an und liefert seine Adresse.
+/// `Enum::Variant(a, b)` — builds the value and yields its address.
 pub(crate) fn lower_ctor_addr(
     lo: &mut Lower,
     e: &Expr,
@@ -60,7 +60,7 @@ pub(crate) fn lower_ctor_addr(
     Some(slot)
 }
 
-/// Schreibt `Enum::Variante(a, b)` unmittelbar an die Adresse `addr`.
+/// Writes `Enum::Variant(a, b)` straight to the address `addr`.
 pub(crate) fn write_ctor_into(
     lo: &mut Lower,
     e: &Expr,
@@ -92,14 +92,14 @@ pub(crate) fn write_ctor_into(
             Some(o) => *o,
             None => return lo.ice(a.span, "payload field without offset"),
         };
-        // Schicht Feldzugriff <-> Speicherort (layout.rs, DESIGNZIELE 8)
+        // Layer field access <-> storage location (layout.rs, DESIGNZIELE 8)
         let ad = lo.field_addr_at(addr, off);
         lo.write_into(ad, a)?;
     }
     Some(())
 }
 
-/// `// HOOK types` in `lower::lower_expr_stmt`.
+/// `// HOOK types` within `lower::lower_expr_stmt`.
 pub(crate) fn lower_types_stmt(
     lo: &mut Lower,
     e: &Expr,
@@ -112,13 +112,13 @@ pub(crate) fn lower_types_stmt(
     lower_ctor_addr(lo, e, name, args).map(|_| ())
 }
 
-// ------------------------------------------------------------- Musterabgleich
+// ----------------------------------------------------------- Pattern matching
 
-/// Was ein Fall zum Schluessel beitraegt.
+/// What a case contributes to the key.
 struct ArmPlan {
-    /// `None` = der Fall kommt fuer JEDEN Schluessel in Frage
+    /// `None` = the case qualifies for EVERY key
     keys: Option<Vec<i128>>,
-    /// nach dem Schluessel sind noch Vergleiche noetig
+    /// after the key there are still comparisons to make
     needs_test: bool,
 }
 
@@ -165,7 +165,7 @@ fn lower_match(lo: &mut Lower, idx: usize, span: Span) -> Option<()> {
         _ => None,
     };
 
-    // Schluesselwert und Adresse des Subjekts bestimmen
+    // Determine the key value and the address of the subject
     let (base_addr, key, key_fty) = match &def {
         Some(_) => {
             let a = lo.lower_addr(&mi.subject)?;
@@ -190,7 +190,7 @@ fn lower_match(lo: &mut Lower, idx: usize, span: Span) -> Option<()> {
     let arm_body: Vec<BlockId> = mi.arms.iter().map(|_| lo.new_block()).collect();
     let join = lo.new_block();
 
-    // Schluessel einsammeln (aufsteigend, duplikatfrei)
+    // Collect the keys (ascending, free of duplicates)
     let mut keys: BTreeMap<i128, Vec<usize>> = BTreeMap::new();
     for (i, p) in plans.iter().enumerate() {
         if let Some(ks) = &p.keys {
@@ -200,7 +200,7 @@ fn lower_match(lo: &mut Lower, idx: usize, span: Span) -> Option<()> {
         }
     }
 
-    // Kandidatenlisten je Schluessel (Quelltextreihenfolge)
+    // Candidate lists per key (source text order)
     let mut cases: Vec<(i128, BlockId)> = Vec::new();
     let default_cands = candidates(&plans, None);
     let default_bb = emit_chain(lo, &mi, &plans, &default_cands, base_addr, key, key_fty, &sty, def.as_ref(), &arm_body, join)?;
@@ -219,7 +219,7 @@ fn lower_match(lo: &mut Lower, idx: usize, span: Span) -> Option<()> {
         );
     }
 
-    // Rumpf jedes Falls
+    // Body of every case
     for (i, arm) in mi.arms.iter().enumerate() {
         lo.cur = arm_body[i];
         lo.enter();
@@ -235,9 +235,9 @@ fn lower_match(lo: &mut Lower, idx: usize, span: Span) -> Option<()> {
     Some(())
 }
 
-/// Faelle, die fuer `key` (bzw. fuer die Auffangkette) in Frage kommen.
-/// Nach dem ersten Fall ohne Restpruefung ist Schluss — alles danach ist fuer
-/// diesen Schluessel unerreichbar.
+/// Cases that qualify for `key` (or for the catch-all chain).
+/// After the first case without a residual check it stops — everything past
+/// that is unreachable for this key.
 fn candidates(plans: &[ArmPlan], key: Option<i128>) -> Vec<usize> {
     let mut out = Vec::new();
     for (i, p) in plans.iter().enumerate() {
@@ -295,8 +295,8 @@ fn emit_chain(
     Some(entry)
 }
 
-/// Restpruefungen eines Musters. Bei Erfolg faellt der Ablauf in den Block
-/// `lo.cur` (nach Rueckkehr), bei Misserfolg geht es nach `fail`.
+/// Residual checks of a pattern. On success control falls through to block
+/// `lo.cur` (after the return), on failure it goes to `fail`.
 #[allow(clippy::too_many_arguments)]
 fn emit_tests(
     lo: &mut Lower,
@@ -350,7 +350,7 @@ fn emit_tests(
                     Some(t) => t.clone(),
                     None => return lo.ice(*span, "payload field without type"),
                 };
-                // Schicht Feldzugriff <-> Speicherort (layout.rs)
+                // Layer field access <-> storage location (layout.rs)
                 let addr = lo.field_addr_at(base_addr, off);
                 emit_sub_test(lo, addr, sub, &fty, fail)?;
             }
@@ -440,7 +440,7 @@ fn emit_sub_test(
                     Some(t) => t.clone(),
                     None => return lo.ice(*span, "payload field without type"),
                 };
-                // Schicht Feldzugriff <-> Speicherort (layout.rs)
+                // Layer field access <-> storage location (layout.rs)
                 let sa = lo.field_addr_at(addr, off);
                 emit_sub_test(lo, sa, sub, &ft, fail)?;
             }
@@ -449,8 +449,8 @@ fn emit_sub_test(
     }
 }
 
-/// Bindungen eines Musters: jede Bindung ist die ADRESSE des getroffenen
-/// Wertes (Aufzaehlungswerte liegen im Speicher, Bindungen sind unveraenderlich).
+/// Bindings of a pattern: every binding is the ADDRESS of the matched value
+/// (enum values live within memory, bindings are immutable).
 fn bind_pattern(lo: &mut Lower, addr: Val, pat: &Pattern, ty: &Type, def: Option<&EnumDef>) {
     match pat {
         Pattern::Wild(_) | Pattern::Int(..) | Pattern::Bool(..) | Pattern::Range { .. } => {}
@@ -478,7 +478,7 @@ fn bind_pattern(lo: &mut Lower, addr: Val, pat: &Pattern, ty: &Type, def: Option
                     Some(t) => t.clone(),
                     None => continue,
                 };
-                // Schicht Feldzugriff <-> Speicherort (layout.rs)
+                // Layer field access <-> storage location (layout.rs)
                 let sa = lo.field_addr_at(addr, off);
                 bind_pattern(lo, sa, sub, &ft, None);
             }

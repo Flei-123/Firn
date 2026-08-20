@@ -1,20 +1,20 @@
-//! Kanonische Ausgabe von **Speicherlayout und Aufrufkonvention** — der
-//! Maßstab für `lib/firnc1/types.fi`.
+//! Canonical rendering of **memory layout and calling convention** — the
+//! yardstick for `lib/firnc1/types.fi`.
 //!
-//! ## Warum eine eigene Ausgabe
+//! ## Why a rendering of its own
 //!
-//! Layout und ABI sind die Stellen, an denen ein Compiler still falsch wird:
-//! ein Feldversatz daneben, ein Aggregat in Registern statt im Speicher — und
-//! das Programm läuft, nur eben falsch. Ein Vergleich zweier unabhängiger
-//! Umsetzungen ist hier mehr wert als jeder Testfall, den man sich ausdenkt.
+//! Layout and ABI are the spots where a compiler turns quietly wrong: one
+//! field offset off by a bit, one aggregate held by registers rather than by
+//! memory — and the program runs, just wrongly. Comparing two independent
+//! implementations is worth more here than any test case somebody dreams up.
 //!
-//! ## Auflösung wie in der Firn-Fassung
+//! ## Resolution just like the Firn version
 //!
-//! Aufgelöst wird **nur die Wurzeldatei**: Grundtypen, Zeiger, Arrays und die
-//! in dieser Datei deklarierten Structs. Ein Name, den es hier nicht gibt
-//! (etwa `rt.Buf` aus einem anderen Modul), wird zu `?name` mit Größe 0 und
-//! Ausrichtung 1 — beide Umsetzungen tun dasselbe, damit der Vergleich exakt
-//! bleibt, statt an einer künstlichen Unsicherheit zu scheitern.
+//! Resolved gets **the root file only**: base types, pointers, arrays and the
+//! structs declared by this file. A type spelling that is missing here
+//! (say `rt.Buf` from another module) turns into the placeholder `?` with
+//! size 0 and alignment 1 — both implementations do the same, so that the
+//! comparison stays exact rather than failing over artificial uncertainty.
 
 use crate::abi::{self, ArgClass};
 use crate::ast::{Program, TypeExpr};
@@ -22,15 +22,15 @@ use crate::types::{Type, TypeCtx};
 use std::collections::HashMap;
 
 pub fn render(p: &Program) -> String {
-    // 1. Structs anmelden (Reihenfolge = Deklarationsreihenfolge).
+    // 1. Register the structs (order = declaration order).
     let mut tcx = TypeCtx::new();
     let mut idx: HashMap<String, usize> = HashMap::new();
     for s in &p.structs {
         let i = tcx.declare(&s.name);
         idx.insert(s.name.clone(), i);
     }
-    // 2. Felder auflösen. Reihenfolge zählt: ein Struct kann einen früher
-    //    deklarierten enthalten, und dessen Layout muss dann schon stehen.
+    // 2. Resolve the fields. Order matters: a struct may contain one declared
+    //    earlier, and that layout must already be settled by then.
     for s in &p.structs {
         let i = match idx.get(&s.name) {
             Some(i) => *i,

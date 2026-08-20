@@ -1,37 +1,37 @@
-//! Speicher -> Wert: Aufloesen von `alloca`/`store`/`load`, Kopierfortpflanzung
-//! und Blockverschmelzung.
+//! Memory -> value: resolving `alloca`/`store`/`load`, copy propagation
+//! and block merging.
 //!
-//! Diese Datei enthaelt die Durchgaenge, die in Runde 1 fehlten und zu Recht
-//! bemaengelt wurden:
+//! This file holds the passes that were missing at round 1 and got rightly
+//! criticised:
 //!
-//!  * **mem2reg (einmal geschriebene alloca):** Eine `alloca`, deren Zeiger
-//!    nirgends entkommt (nur als Adresse von `load`/`store` benutzt) und in die
-//!    GENAU EINMAL geschrieben wird, wobei der `store` alle `load`s
-//!    **dominiert**, wird aufgeloest: jeder `load` wird durch den gespeicherten
-//!    Wert ersetzt. FIR kennt keine Phi-Knoten — deshalb ist die Dominanz-
-//!    bedingung hier zwingend und nicht nur eine Optimierung (mehrfach
-//!    geschriebene Zellen bleiben im Speicher; der Registerzuteiler
-//!    (`regalloc.rs`) haelt sie dafuer dauerhaft in einem Register).
-//!  * **lokale Speicherweiterleitung:** `store p, v` gefolgt von `load p` im
-//!    selben Block ohne dazwischenliegenden Speichereffekt -> der `load` wird
-//!    zu `v`. Ebenso `load p` ... `load p` (gemeinsamer Teilausdruck).
-//!  * **Kopierfortpflanzung / algebraische Vereinfachung:** Identitaets-`cast`,
+//!  * **mem2reg (alloca written once):** one `alloca` whose pointer escapes
+//!    nowhere (used as address of `load`/`store` only) and that gets written
+//!    EXACTLY ONCE, where the `store` **dominates** every `load`, gets
+//!    resolved: every `load` gets replaced by the stored value. FIR knows no
+//!    phi nodes — that is why the dominance condition is mandatory here and
+//!    not merely one optimization (cells written several times stay at
+//!    memory; the register allocator (`regalloc.rs`) keeps those within a
+//!    register permanently instead).
+//!  * **local store forwarding:** `store p, v` followed by `load p` within
+//!    the same block without a memory effect between them -> the `load`
+//!    becomes `v`. Likewise `load p` ... `load p` (common subexpression).
+//!  * **copy propagation / algebraic simplification:** identity `cast`,
 //!    `x+0`, `x-0`, `x*1`, `x*0`, `x|0`, `x^0`, `x&-1`, `x<<0`, `x>>0`,
 //!    `x/1`, `ptradd p, 0`.
-//!  * **Blockverschmelzung:** `A: ... br B` mit B als einzigem Nachfolger und
-//!    A als einzigem Vorgaenger -> B wird an A angehaengt. Leere Bloecke mit
-//!    reinem `br C` werden ueberbrueckt (Sprungfaedelung).
+//!  * **block merging:** `A: ... br B` with B as the only successor and A as
+//!    the only predecessor -> B gets appended to A. Empty blocks holding a
+//!    pure `br C` get bridged (jump threading).
 //!
-//! HARTE REGEL (SPEC §9.2): `Op::Select`, `Op::Barrier`, `Op::SecureZero` und
-//! jeder Wert aus `f.secret` werden hier NIE veraendert, ersetzt oder entfernt.
-//! Ihre Operanden werden nicht umgeschrieben; ein `select` wird nie zu einer
-//! Verzweigung.
+//! HARD RULE (SPEC §9.2): `Op::Select`, `Op::Barrier`, `Op::SecureZero` and
+//! every value out of `f.secret` NEVER get changed, replaced or removed
+//! here. Their operands do not get rewritten; a `select` never turns into a
+//! branch.
 
 use crate::fir::{BinOp, Func, Inst, Op, Term, Val};
 use std::collections::HashMap;
 
-/// Instruktionen, die der Optimierer als unantastbar behandelt (SPEC §9 und
-/// — seit Runde 52 — SPEC §2: Inline-Assembler und MMIO sind `volatile`).
+/// Instructions that the optimizer treats as untouchable (SPEC §9 and
+/// — since round 52 — SPEC §2: inline assembler and MMIO are `volatile`).
 pub(crate) fn is_untouchable(op: &Op) -> bool {
     matches!(
         op,
@@ -44,9 +44,9 @@ pub(crate) fn is_untouchable(op: &Op) -> bool {
     )
 }
 
-// ------------------------------------------------------------- Hilfsmittel ---
+// ----------------------------------------------------------------- Helpers ---
 
-/// Vorgaengerlisten. Setzt die FIR-Invariante `blocks[i].id == i` voraus.
+/// Predecessor lists. Presumes the FIR invariant `blocks[i].id == i`.
 pub(crate) fn preds(f: &Func) -> Vec<Vec<usize>> {
     let n = f.blocks.len();
     let mut p = vec![Vec::new(); n];
@@ -61,7 +61,7 @@ pub(crate) fn preds(f: &Func) -> Vec<Vec<usize>> {
     p
 }
 
-/// `dom[b][d] == true`  <=>  Block `d` dominiert Block `b`.
+/// `dom[b][d] == true`  <=>  block `d` dominates block `b`.
 pub(crate) fn dominators(f: &Func) -> Vec<Vec<bool>> {
     let n = f.blocks.len();
     let pr = preds(f);
@@ -99,13 +99,13 @@ pub(crate) fn dominators(f: &Func) -> Vec<Vec<bool>> {
     dom
 }
 
-/// Ist der Wert `v` in `f` unantastbar (geheim)?
+/// Is the value `v` untouchable (secret) within `f`?
 fn locked(f: &Func, v: Val) -> bool {
     f.is_secret(v)
 }
 
-/// Ersetzt Verwendungen gemaess `map` (nur einfache Ersetzung, keine Kette).
-/// Liefert die Anzahl umgeschriebener Operanden.
+/// Replaces uses per `map` (plain substitution only, no chains).
+/// Yields the count of rewritten operands.
 pub(crate) fn replace_uses(f: &mut Func, map: &HashMap<Val, Val>) -> usize {
     if map.is_empty() {
         return 0;
@@ -124,7 +124,7 @@ pub(crate) fn replace_uses(f: &mut Func, map: &HashMap<Val, Val>) -> usize {
     for b in f.blocks.iter_mut() {
         for i in b.insts.iter_mut() {
             if is_untouchable(&i.op) {
-                continue; // SPEC §9.2: Operanden bleiben, wie sie sind
+                continue; // SPEC §9.2: operands stay as they are
             }
             match &mut i.op {
                 Op::Const(_) | Op::Alloca { .. } | Op::GcAddr { .. } | Op::ThreadSelf => {}
@@ -178,8 +178,8 @@ pub(crate) fn replace_uses(f: &mut Func, map: &HashMap<Val, Val>) -> usize {
                     rep(val, &mut n);
                 }
                 Op::Select { .. } | Op::Barrier { .. } | Op::SecureZero { .. } => {}
-                // RUNDE 52: volatile — die Operanden werden NICHT
-                // umgeschrieben (wie select/barrier/secure_zero).
+                // ROUND 52: volatile — the operands do NOT get
+                // rewritten (like select/barrier/secure_zero).
                 Op::Asm { .. } | Op::MmioLoad { .. } | Op::MmioStore { .. } => {}
             }
         }
@@ -195,11 +195,11 @@ pub(crate) fn replace_uses(f: &mut Func, map: &HashMap<Val, Val>) -> usize {
 
 // ------------------------------------------------------------------ mem2reg ---
 
-/// Beschreibt, wie eine `alloca` benutzt wird.
+/// Describes the way one `alloca` gets used.
 struct CellUse {
-    /// nur als Adresse von load/store (kein ptradd, kein Aufrufargument, ...)
+    /// as address of load/store only (no ptradd, no call argument, ...)
     simple: bool,
-    stores: Vec<(usize, usize)>, // (Block, Index)
+    stores: Vec<(usize, usize)>, // (block, index)
     loads: Vec<(usize, usize)>,
 }
 
@@ -226,7 +226,7 @@ fn scan_cells(f: &Func) -> HashMap<Val, CellUse> {
                         c.stores.push((bi, ii));
                     }
                     if let Some(c) = cells.get_mut(val) {
-                        c.simple = false; // Zeiger entkommt als Wert
+                        c.simple = false; // pointer escapes as a value
                     }
                 }
                 other => {
@@ -262,8 +262,8 @@ fn scan_cells(f: &Func) -> HashMap<Val, CellUse> {
     cells
 }
 
-/// Loest `alloca`s auf, in die genau einmal geschrieben wird und deren `store`
-/// alle `load`s dominiert. Liefert die Anzahl ersetzter `load`s.
+/// Resolves `alloca`s written exactly once whose `store` dominates every
+/// `load`. Yields the count of replaced `load`s.
 pub(crate) fn promote_single_store(f: &mut Func) -> usize {
     if f.blocks.iter().enumerate().any(|(i, b)| b.id as usize != i) {
         return 0;
@@ -283,7 +283,7 @@ pub(crate) fn promote_single_store(f: &mut Func) -> usize {
         if locked(f, sval) {
             continue;
         }
-        // Der gespeicherte Wert darf nicht die Zelle selbst sein.
+        // The stored value must not be the cell itself.
         if sval == *cell {
             continue;
         }
@@ -291,7 +291,7 @@ pub(crate) fn promote_single_store(f: &mut Func) -> usize {
         for &(lb, li) in &u.loads {
             let lty = f.blocks[lb].insts[li].ty;
             if lty != sty {
-                ok = false; // andere Breite: Speichersemantik, nicht anfassen
+                ok = false; // other width: memory semantics, do not touch
                 break;
             }
             let dominates = if lb == sb { li > si } else { dom[lb][sb] };
@@ -319,10 +319,10 @@ pub(crate) fn promote_single_store(f: &mut Func) -> usize {
     n
 }
 
-/// Entfernt `alloca`s, deren Zeiger nicht entkommt und die NIE gelesen werden:
-/// samt aller `store`s dorthin (tote Speicherung). Genau das bleibt uebrig,
-/// nachdem `promote_single_store` die `load`s aufgeloest hat — in Runde 1 blieb
-/// dieser Rest stehen. Liefert die Anzahl entfernter Instruktionen.
+/// Removes `alloca`s whose pointer does not escape and that NEVER get read:
+/// together with every `store` into them (dead store). Exactly that is left
+/// over after `promote_single_store` resolved the `load`s — at round 1 this
+/// remainder stayed. Yields the count of removed instructions.
 pub(crate) fn remove_dead_stores(f: &mut Func) -> usize {
     let cells = scan_cells(f);
     let dead: Vec<Val> = cells
@@ -349,9 +349,9 @@ pub(crate) fn remove_dead_stores(f: &mut Func) -> usize {
     n
 }
 
-// ----------------------------------------------- lokale Speicherweiterleitung ---
+// ----------------------------------------------------- local store forwarding ---
 
-/// Wird durch diese Instruktion Speicher veraendert (aliasfrei nicht beweisbar)?
+/// Does this instruction change memory (not provable to be alias free)?
 fn clobbers_memory(op: &Op) -> bool {
     matches!(
         op,
@@ -361,9 +361,9 @@ fn clobbers_memory(op: &Op) -> bool {
             | Op::Syscall { .. }
             | Op::CopyMem { .. }
             | Op::AtomicAdd { .. }
-            // RUNDE 52: der Inline-Assembler kann jeden Speicher anfassen
-            // (`clobber("memory")` ist die Regel, nicht die Ausnahme), und ein
-            // MMIO-Schreibzugriff ist per Definition ein Seiteneffekt.
+            // ROUND 52: the inline assembler can touch any memory
+            // (`clobber("memory")` is the rule, not the exception), and one
+            // MMIO write is a side effect by definition.
             | Op::Asm { .. }
             | Op::MmioLoad { .. }
             | Op::MmioStore { .. }
@@ -373,13 +373,13 @@ fn clobbers_memory(op: &Op) -> bool {
     )
 }
 
-/// `store p, v; ... ; load p` -> `v` und `load p; ...; load p` -> erster Wert,
-/// jeweils nur innerhalb eines Blocks und nur ohne dazwischenliegenden
-/// Speichereffekt. Liefert die Anzahl weitergeleiteter `load`s.
+/// `store p, v; ... ; load p` -> `v` and `load p; ...; load p` -> first value,
+/// each within one block only and only without a memory effect between
+/// them. Yields the count of forwarded `load`s.
 pub(crate) fn forward_local_loads(f: &mut Func) -> usize {
     let mut map: HashMap<Val, Val> = HashMap::new();
     for b in &f.blocks {
-        // bekannte Zelleninhalte: Adresswert -> (Typ, Wert)
+        // known cell contents: address value -> (type, value)
         let mut known: HashMap<Val, (crate::fir::FTy, Val)> = HashMap::new();
         for i in &b.insts {
             match &i.op {
@@ -396,7 +396,7 @@ pub(crate) fn forward_local_loads(f: &mut Func) -> usize {
                     }
                 }
                 Op::Store { addr, val } => {
-                    // jeder andere Eintrag koennte dieselbe Zelle meinen
+                    // every other entry could mean the same cell
                     known.clear();
                     known.insert(*addr, (i.ty, *val));
                 }
@@ -416,10 +416,10 @@ pub(crate) fn forward_local_loads(f: &mut Func) -> usize {
     n
 }
 
-// ------------------------------------- Kopierfortpflanzung / Vereinfachung ---
+// --------------------------------------- copy propagation / simplification ---
 
-/// Identitaeten und triviale algebraische Vereinfachungen. Liefert die Anzahl
-/// der Ersetzungen.
+/// Identities and trivial algebraic simplifications. Yields the count of
+/// substitutions.
 pub(crate) fn copy_propagate(f: &mut Func) -> usize {
     let mut consts: HashMap<Val, i128> = HashMap::new();
     for b in &f.blocks {
@@ -441,21 +441,21 @@ pub(crate) fn copy_propagate(f: &mut Func) -> usize {
             }
             let same = match &i.op {
                 Op::Cast { src, from } => {
-                    // Gleiche Breite UND gleiches Vorzeichen: reine Umdeutung
-                    // desselben Bitmusters (z. B. `usize` <-> `*mut T`).
+                    // Same width AND same sign: pure reinterpretation of the
+                    // same bit pattern (say `usize` <-> `*mut T`).
                     //
-                    // `f64` DARF HIER NICHT MITSPIELEN. Es ist 64 Bit breit und
-                    // gilt als vorzeichenlos — nach der Regel oben sah
-                    // `u64 -> f64` also wie eine reine Umdeutung aus, und die
-                    // Umwandlung verschwand ersatzlos. Aus `100 as f64` wurde
-                    // damit das Bitmuster 100 statt des Wertes 100.0. Es ist
-                    // aber genau umgekehrt: von allen Umwandlungen ist die
-                    // zwischen Ganzzahl und Gleitkomma die einzige, die die
-                    // Bits WIRKLICH aendert (`cvtsi2sd`).
+                    // `f64` MUST NOT JOIN HERE. It is 64 bits wide and counts
+                    // as unsigned — by the rule above `u64 -> f64` therefore
+                    // looked like a pure reinterpretation, and the conversion
+                    // vanished without replacement. `100 as f64` thereby became
+                    // the bit pattern 100 rather than the value 100.0. It is
+                    // exactly the other way round: of all conversions the one
+                    // between integer and floating point is the only one that
+                    // REALLY changes the bits (`cvtsi2sd`).
                     //
-                    // Gefunden beim Vergleich des in Firn geschriebenen Lexers
-                    // gegen `firnc0` (Runde 20): `10.0` ergab zwei verschiedene
-                    // Tokenstroeme, je nachdem ob der Optimierer lief.
+                    // Found while comparing the lexer written with Firn against
+                    // `firnc0` (round 20): `10.0` gave two different token
+                    // streams, depending on whether the optimizer ran.
                     let floatswitch = (*from == crate::fir::FTy::F64)
                         != (i.ty == crate::fir::FTy::F64);
                     if !floatswitch
@@ -544,7 +544,7 @@ pub(crate) fn copy_propagate(f: &mut Func) -> usize {
     if map.is_empty() {
         return 0;
     }
-    // Ketten aufloesen (a->b->c), aber ohne Zyklusgefahr.
+    // Resolve chains (a->b->c), yet without cycle risk.
     let keys: Vec<Val> = map.keys().copied().collect();
     for k in keys {
         let mut cur = map[&k];
@@ -563,17 +563,17 @@ pub(crate) fn copy_propagate(f: &mut Func) -> usize {
     n
 }
 
-// -------------------------------------------------------- Blockverschmelzung ---
+// ------------------------------------------------------------- block merging ---
 
-/// Verschmilzt `A -> B`, wenn A genau einen Nachfolger (B) und B genau einen
-/// Vorgaenger (A) hat, und ueberbrueckt leere `br`-Bloecke.
-/// Liefert die Anzahl entfernter Bloecke.
+/// Merges `A -> B` when A has exactly one successor (B) and B exactly one
+/// predecessor (A), and bridges empty `br` blocks.
+/// Yields the count of removed blocks.
 pub(crate) fn merge_blocks(f: &mut Func) -> usize {
     if f.blocks.iter().enumerate().any(|(i, b)| b.id as usize != i) {
         return 0;
     }
     let mut removed = 0usize;
-    // (1) Sprungfaedelung: leerer Block mit `br C` wird uebersprungen.
+    // (1) jump threading: one empty block with `br C` gets skipped.
     let mut rounds = 0;
     loop {
         rounds += 1;
@@ -592,7 +592,7 @@ pub(crate) fn merge_blocks(f: &mut Func) -> usize {
         if redirect.iter().all(|r| r.is_none()) {
             break;
         }
-        // Ketten aufloesen (mit Deckel gegen Zyklen)
+        // resolve chains (with a cap against cycles)
         let resolve = |mut t: u32| -> u32 {
             let mut steps = 0;
             while let Some(nt) = redirect[t as usize] {
@@ -646,12 +646,12 @@ pub(crate) fn merge_blocks(f: &mut Func) -> usize {
         }
     }
 
-    // (2) Verschmelzen: A endet mit `br B`, B hat nur A als Vorgaenger.
+    // (2) merging: A ends with `br B`, B has A as its only predecessor.
     let mut rounds = 0;
     loop {
         rounds += 1;
-        // Nur erreichbare Vorgaenger zaehlen — unerreichbare Bloecke raeumt
-        // `opt.rs` gleich danach weg.
+        // Only reachable predecessors count — unreachable blocks get cleared
+        // away by `opt.rs` right afterwards.
         let mut reach = vec![false; f.blocks.len()];
         let mut stack = vec![0usize];
         if !reach.is_empty() {
@@ -676,9 +676,9 @@ pub(crate) fn merge_blocks(f: &mut Func) -> usize {
             if let Term::Br(t) = b.term {
                 let t = t as usize;
                 if t != i && t != 0 && t < f.blocks.len() && pr[t].len() == 1 && pr[t][0] == i {
-                    // Allocas duerfen nur im Eintrittsblock stehen: beim
-                    // Verschmelzen in bb0 ist das erfuellt, sonst nur, wenn B
-                    // keine Alloca enthaelt.
+                    // Allocas may stand at the entry block only: when merging
+                    // into bb0 that holds, otherwise only when B holds no
+                    // alloca.
                     let has_alloca =
                         f.blocks[t].insts.iter().any(|x| matches!(x.op, Op::Alloca { .. }));
                     if has_alloca && i != 0 {
@@ -696,7 +696,7 @@ pub(crate) fn merge_blocks(f: &mut Func) -> usize {
         let moved = std::mem::take(&mut f.blocks[b].insts);
         let term = f.blocks[b].term.clone();
         if a == 0 {
-            // Allocas muessen vorne bleiben.
+            // Allocas must stay at the front.
             let (allocas, rest): (Vec<Inst>, Vec<Inst>) =
                 moved.into_iter().partition(|x| matches!(x.op, Op::Alloca { .. }));
             let pos = f.blocks[0]
@@ -712,9 +712,9 @@ pub(crate) fn merge_blocks(f: &mut Func) -> usize {
             f.blocks[a].insts.extend(moved);
         }
         f.blocks[a].term = term;
-        f.blocks[b].term = Term::Unset; // wird unerreichbar -> DCE raeumt auf
+        f.blocks[b].term = Term::Unset; // becomes unreachable -> DCE cleans up
         f.blocks[b].insts.clear();
-        // Block b ist jetzt ohne Vorgaenger; die Neunummerierung erledigt opt.rs.
+        // Block b now has no predecessor; the renumbering is done by opt.rs.
         removed += 1;
         if rounds > 4096 {
             break;
@@ -740,7 +740,7 @@ mod tests {
         f.set_term(b1, Term::Ret(Some(l)));
         assert_eq!(promote_single_store(&mut f), 1);
         assert!(matches!(f.blocks[1].term, Term::Ret(Some(v)) if v == c));
-        // nach der kompletten Optimierung bleibt nur noch die Konstante
+        // after the complete optimization only the constant is left
         let mut m = Module::new();
         m.funcs.push(f);
         crate::opt::optimize(&mut m);
@@ -803,7 +803,7 @@ mod tests {
         let mut m = Module::new();
         m.funcs.push(f);
         crate::opt::optimize(&mut m);
-        // uebrig bleibt nur der Aufruf (unrein) und `ret %aufruf`
+        // left over is only the call (impure) and `ret %call`
         assert!(matches!(m.funcs[0].blocks[0].term, Term::Ret(Some(v)) if v == p));
     }
 
@@ -847,7 +847,7 @@ mod tests {
         let s = f.push(0, FTy::I32, Op::Select { cond: c, a: a2, b: z });
         f.set_term(0, Term::Ret(Some(s)));
         copy_propagate(&mut f);
-        // der select-Operand wurde NICHT umgeschrieben
+        // the select operand did NOT get rewritten
         assert!(matches!(f.blocks[0].insts.last().unwrap().op, Op::Select { a, .. } if a == a2));
         let mut m = Module::new();
         m.funcs.push(f);

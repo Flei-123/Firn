@@ -1,15 +1,15 @@
-//! Handgeschriebener, rekursiv absteigender Parser (kein Generator).
+//! Hand-written, recursive descent parser (no generator).
 //!
-//! SCHNITTSTELLE (fest):
+//! INTERFACE (fixed):
 //!   `pub fn parse(toks: &[Token], dg: &mut Diags) -> ast::Program`
-//! Der Parser vergibt fortlaufende `ExprId`s ab 0 und setzt
-//! `Program::expr_count`. Er MUSS sich nach einem Fehler auf Anweisungs-
-//! bzw. Item-Ebene erholen und weitere Fehler melden.
+//! The parser hands out consecutive `ExprId`s from 0 upwards and sets
+//! `Program::expr_count`. It MUST recover after errors at statement or
+//! item level and report further errors.
 //!
-//! Grammatik: SPEC §10.1. Praezedenz (schwach -> stark):
-//!   `||` , `&&` , Vergleich (nicht assoziativ) , `+ - | ^` , `* / % & << >>` ,
-//!   unaeres `- ! & *` , postfix `. [] () as`.
-//! Semikolon ist optional: ein Zeilenwechsel beendet eine Anweisung.
+//! Grammar: SPEC §10.1. Precedence (weak -> strong):
+//!   `||` , `&&` , comparison (not associative) , `+ - | ^` , `* / % & << >>` ,
+//!   unary `- ! & *` , postfix `. [] () as`.
+//! The semicolon is optional: a line break ends a statement.
 
 use crate::ast::{
     Attr, Block, ConstDecl, Expr, ExprKind, BinOp, FnDecl, ImportDecl, Param, Program, Stmt,
@@ -19,8 +19,8 @@ use std::collections::HashSet;
 use crate::diag::{Diags, Span};
 use crate::lexer::{TokKind, Token};
 
-/// Maximale Verschachtelungstiefe (Ausdruecke, Bloecke, Typen). Darueber gibt es
-/// einen sauberen Fehler statt eines Stapelueberlaufs.
+/// Maximum nesting depth (expressions, blocks, types). Beyond it there is a
+/// clean error rather than a stack overflow.
 const MAX_DEPTH: u32 = 200;
 
 pub(crate) struct Parser<'a> {
@@ -29,27 +29,27 @@ pub(crate) struct Parser<'a> {
     pub(crate) dg: &'a mut Diags,
     pub(crate) next_id: u32,
     pub(crate) depth: u32,
-    /// Innerhalb der aktuellen Anweisung wurde bereits ein Fehler gemeldet.
+    /// Within the current statement some error got reported already.
     pub(crate) recovering: bool,
-    /// `ident {` ist in Bedingungen KEIN Struct-Literal, sondern Name + Block.
+    /// `ident {` is NO struct literal within conditions but label + block.
     pub(crate) no_struct_lit: bool,
-    /// Klammertiefe: innerhalb von `(...)`, `[...]`, `{...}` eines Ausdrucks
-    /// darf ein Ausdruck ueber Zeilen laufen, ausserhalb nicht.
+    /// Bracket depth: inside `(...)`, `[...]`, `{...}` of one expression the
+    /// expression may run across lines, outside it may not.
     pub(crate) paren_depth: u32,
-    /// Nummer der Quelldatei (Modulsystem, `modules.rs`).
+    /// Number of the source file (module system, `modules.rs`).
     pub(crate) file: u32,
-    /// Bekannte Modulnamen aus `import`: nur damit ist `alias.name` ein
-    /// qualifizierter Name und kein Feldzugriff.
+    /// Known module labels out of `import`: only with those is `alias.item` a
+    /// qualified label and no field access.
     pub(crate) modules: HashSet<String>,
-    /// Verschachtelungstiefe der Schleifen — `break`/`continue` brauchen sie.
+    /// Nesting depth of the loops — `break`/`continue` need it.
     pub(crate) loop_depth: u32,
-    /// Attribute, die unmittelbar vor der naechsten Deklaration standen
-    /// (`attrs.rs`). Werden von `fn_decl`/`struct_decl` uebernommen.
+    /// Attributes that stood immediately ahead of the next declaration
+    /// (`attrs.rs`). Taken over by `fn_decl`/`struct_decl`.
     pub(crate) pending_attrs: Vec<crate::ast::Attr>,
-    /// Versteckte `var _fseg<N>` der String-Interpolation (Runde 39): sie
-    /// werden VOR die naechste Anweisung gehoben (`block` leert die Liste).
+    /// Hidden `var _fseg<N>` of the string interpolation (round 39): they get
+    /// hoisted AHEAD of the next statement (`block` empties the list).
     pub(crate) hoist: Vec<Stmt>,
-    /// > 0: eine Interpolation laeuft bereits — Schachtelung ist noch nicht.
+    /// > 0: one interpolation runs already — nesting is not there yet.
     pub(crate) interp_depth: u32,
 }
 
@@ -89,10 +89,10 @@ fn starts_item(k: &TokKind) -> bool {
 }
 
 impl<'a> Parser<'a> {
-    // ---------------------------------------------------------------- Grundlagen
+    // -------------------------------------------------------------------- Basics
 
     pub(crate) fn kind(&self) -> &TokKind {
-        // Der Strom endet immer mit Eof; der Index wird nie darueber hinaus erhoeht.
+        // The stream always ends with Eof; the index never gets raised beyond it.
         match self.toks.get(self.pos) {
             Some(t) => &t.kind,
             None => &TokKind::Eof,
@@ -117,7 +117,7 @@ impl<'a> Parser<'a> {
         matches!(self.kind(), TokKind::Eof)
     }
 
-    /// Steht das aktuelle Token als erstes auf seiner Zeile?
+    /// Does the current token stand first on its line?
     fn at_line_start(&self) -> bool {
         if self.pos == 0 {
             return true;
@@ -128,9 +128,9 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Darf der Ausdruck mit dem aktuellen Token fortgesetzt werden?
-    /// Ein Operator am ZEILENANFANG beendet ausserhalb von Klammern die
-    /// Anweisung (SPEC §10: Semikolon optional, Zeilenende beendet sie).
+    /// May the expression be continued with the current token?
+    /// One operator at the START OF A LINE ends the statement outside of
+    /// brackets (SPEC §10: semicolon optional, the line end closes it).
     pub(crate) fn cont(&self) -> bool {
         self.paren_depth > 0 || !self.at_line_start()
     }
@@ -158,7 +158,7 @@ impl<'a> Parser<'a> {
         self.recovering = true;
     }
 
-    /// Erwartet ein bestimmtes Token; sonst Fehler am STOERENDEN Token.
+    /// Expects a particular token; otherwise the error sits at the OFFENDER.
     pub(crate) fn expect(&mut self, k: TokKind, ctx: &str) -> bool {
         if self.eat(&k) {
             return true;
@@ -174,7 +174,7 @@ impl<'a> Parser<'a> {
         false
     }
 
-    /// Wie `expect`, meldet aber nichts, wenn die Anweisung schon kaputt ist.
+    /// Like `expect`, yet reports nothing when the statement is broken already.
     pub(crate) fn close(&mut self, k: TokKind, ctx: &str) -> bool {
         if self.eat(&k) {
             return true;
@@ -207,10 +207,10 @@ impl<'a> Parser<'a> {
         None
     }
 
-    /// Qualifizierter Name `modul.name`: nur wenn `modul` per `import`
-    /// bekannt ist, wird der Punkt als Modulzugriff gelesen — sonst bleibt es
-    /// ein Feldzugriff. Der Name wird als "modul.name" weitergereicht;
-    /// `modules.rs` loest ihn beim Zusammenfuehren auf.
+    /// Qualified label `module.label`: only when `module` is known through
+    /// `import` does the dot get read as module access — otherwise it stays a
+    /// field access. The label gets passed on as "module.label";
+    /// `modules.rs` resolves it while merging.
     pub(crate) fn qualify(&mut self, name: String, sp: Span) -> (String, Span) {
         if !self.modules.contains(&name) || !self.at(&TokKind::Dot) {
             return (name, sp);
@@ -220,7 +220,7 @@ impl<'a> Parser<'a> {
             _ => return (name, sp),
         };
         self.bump(); // '.'
-        let msp = self.bump(); // name
+        let msp = self.bump(); // label
         (format!("{}.{}", name, member), Parser::join(sp, msp))
     }
 
@@ -230,7 +230,7 @@ impl<'a> Parser<'a> {
         Expr { id, span, kind }
     }
 
-    /// Platzhalter fuer einen kaputten Ausdruck (Fehler ist bereits gemeldet).
+    /// Placeholder for a broken expression (the error got reported already).
     fn broken_expr(&mut self, span: Span) -> Expr {
         self.mk(span, ExprKind::Int(0))
     }
@@ -253,15 +253,15 @@ impl<'a> Parser<'a> {
                 MAX_DEPTH
             ));
         }
-        // Fortschritt erzwingen, damit keine Endlosschleife entsteht.
+        // Force progress, so that no endless loop comes about.
         self.bump();
         true
     }
 
-    // ------------------------------------------------------- Fehlerwiederherstellung
+    // ---------------------------------------------------------------- Error recovery
 
-    /// Bis zum Ende der Anweisung vorruecken: ';' schlucken, vor '}' oder einem
-    /// Anweisungsschluesselwort am Zeilenanfang stehenbleiben.
+    /// Advance up to the end of the statement: swallow ';', stop ahead of '}' or
+    /// of a statement keyword at the start of a line.
     fn sync_stmt(&mut self) {
         loop {
             match self.kind() {
@@ -278,16 +278,16 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Bis zum naechsten Element auf oberster Ebene vorruecken.
+    /// Advance up to the next item at top level.
     pub(crate) fn sync_item(&mut self) {
         while !self.at_eof() && !starts_item(self.kind()) {
             self.bump();
         }
     }
 
-    // ------------------------------------------------------------------ Typen
+    // ------------------------------------------------------------------ Types
 
-    /// Siehe `nicht_umgesetzter_typ` am Dateiende.
+    /// See `not_implemented_ty` at the end of the file.
     pub(crate) fn parse_type(&mut self) -> Option<TypeExpr> {
         if self.too_deep() {
             return None;
@@ -338,14 +338,14 @@ impl<'a> Parser<'a> {
             }
             TokKind::Ident(name) => {
                 let sp = self.bump();
-                // Integration: Typkonstruktoren, die die SPEC beschreibt, die
-                // Stufe 0 aber NICHT umsetzt, melden hier einen klaren Fehler
-                // statt eines ratlosen Syntaxfehlers (SPEC §14 "not contained").
-                // HOOK gc: `Gc[C]` und `GcWeak[C]` (gc.rs)
+                // Integration: type constructors that the SPEC describes, yet stage 0
+                // does NOT implement, report a clear error here instead of a
+                // clueless syntax error (SPEC §14 "not contained").
+                // HOOK gc: `Gc[C]` and `GcWeak[C]` (gc.rs)
                 if let Some(t) = crate::gc::hook_type(self, &name, sp) {
                     return Some(t);
                 }
-                // HOOK iface: `dyn I` — der Schnittstellenwert (iface.rs)
+                // HOOK iface: `dyn I` — the interface value (iface.rs)
                 if let Some(t) = crate::iface::hook_type(self, &name, sp) {
                     return Some(t);
                 }
@@ -362,11 +362,11 @@ impl<'a> Parser<'a> {
                         return None;
                     }
                 }
-                // HOOK fehlerunionen: Fehlerunion `E!T` (errors.rs)
+                // HOOK fehlerunionen: error union `E!T` (errors.rs)
                 if let Some(t) = crate::errors::hook_type(self, &name, sp) {
                     return Some(t);
                 }
-                // HOOK types: generischer Typ `Vec[i32]` (sema_generic.rs)
+                // HOOK types: generic type `Vec[i32]` (sema_generic.rs)
                 if let Some(t) = crate::sema_generic::hook_generic_type(self, &name, sp) {
                     return Some(t);
                 }
@@ -382,7 +382,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // ------------------------------------------------------------- Ausdruecke
+    // ------------------------------------------------------------ Expressions
 
     pub(crate) fn expr(&mut self) -> Expr {
         if self.too_deep() {
@@ -391,13 +391,13 @@ impl<'a> Parser<'a> {
         }
         self.depth += 1;
         let e = self.or_expr();
-        // HOOK fehlerunionen: `ausdruck catch ersatzwert` (errors.rs)
+        // HOOK fehlerunionen: `expression catch alternative` (errors.rs)
         let e = crate::errors::hook_catch(self, e);
         self.depth -= 1;
         e
     }
 
-    /// Ausdruck ohne Struct-Literal auf oberster Ebene (Bedingungen).
+    /// Expression without a struct literal at top level (conditions).
     fn cond_expr(&mut self) -> Expr {
         let saved = self.no_struct_lit;
         self.no_struct_lit = true;
@@ -406,7 +406,7 @@ impl<'a> Parser<'a> {
         e
     }
 
-    /// Ausdruck in Klammern/Argumenten: Struct-Literale sind dort erlaubt.
+    /// Expression within brackets/arguments: struct literals are allowed there.
     pub(crate) fn nested_expr(&mut self) -> Expr {
         let saved = self.no_struct_lit;
         self.no_struct_lit = false;
@@ -461,7 +461,7 @@ impl<'a> Parser<'a> {
         let rhs = self.add_expr();
         let sp = Parser::join(lhs.span, rhs.span);
         let mut res = self.mk(sp, ExprKind::Binary(op, Box::new(lhs), Box::new(rhs)));
-        // Vergleiche sind nicht assoziativ (SPEC §10.1: genau ein Vergleich).
+        // Comparisons are not associative (SPEC §10.1: exactly one comparison).
         while Parser::cmp_op(self.kind()).is_some() && self.cont() {
             let op2 = match Parser::cmp_op(self.kind()) {
                 Some(o) => o,
@@ -556,15 +556,15 @@ impl<'a> Parser<'a> {
             match self.kind() {
                 TokKind::Dot => {
                     self.bump();
-                    // HOOK gc: gepruefte Abwaertsumwandlung `x.as?[C]` (gc.rs)
+                    // HOOK gc: checked downcast `x.as?[C]` (gc.rs)
                     if let Some(g) = crate::gc::hook_postfix(self, &e) {
                         e = g;
                         continue;
                     }
                     match self.ident("after '.' in the field access") {
                         Some((name, sp)) => {
-                            // HOOK impl: `x.m(args)` ist ein Methodenaufruf,
-                            // kein Feldzugriff (impls.rs, Runde 45)
+                            // HOOK impl: `x.m(args)` is a method call,
+                            // no field access (impls.rs, round 45)
                             if let Some(m) = crate::impls::hook_method_call(self, &e, &name, sp) {
                                 e = m;
                                 continue;
@@ -576,7 +576,7 @@ impl<'a> Parser<'a> {
                     }
                 }
                 TokKind::LBracket => {
-                    // HOOK types: generischer Aufruf `foo[i32](..)` (sema_generic.rs)
+                    // HOOK types: generic call `foo[i32](..)` (sema_generic.rs)
                     if let Some(g) = crate::sema_generic::hook_generic_call(self, &e) {
                         e = g;
                         continue;
@@ -623,8 +623,8 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Argumentliste nach bereits verbrauchtem '('. Liefert Argumente und die
-    /// Position der schliessenden Klammer (bzw. des stoerenden Tokens).
+    /// Argument list after the '(' got consumed. Yields the arguments and the
+    /// position of the closing bracket (or of the offending token).
     pub(crate) fn call_args(&mut self, ctx: &str) -> (Vec<Expr>, Span) {
         let mut args = Vec::new();
         loop {
@@ -650,11 +650,11 @@ impl<'a> Parser<'a> {
     }
 
     pub(crate) fn primary(&mut self) -> Expr {
-        // HOOK fehlerunionen: `try ausdruck` (errors.rs)
+        // HOOK fehlerunionen: `try expression` (errors.rs)
         if let Some(e) = crate::errors::hook_primary(self) {
             return e;
         }
-        // HOOK types: `Enum::Variante(..)` und `Vec[i32]{..}` (sema_match.rs)
+        // HOOK types: `Enum::Variant(..)` and `Vec[i32]{..}` (sema_match.rs)
         if let Some(e) = crate::sema_match::hook_primary(self) {
             return e;
         }
@@ -662,9 +662,9 @@ impl<'a> Parser<'a> {
         if let Some(e) = crate::sizeof::hook_primary(self) {
             return e;
         }
-        // HOOK kern: `asm("…", in("dx") p, out("rax"), clobber("memory"))`
-        // (core.rs, Runde 52). Nur wenn auf `asm` unmittelbar `(` und ein
-        // Zeichenkettenliteral folgen — sonst bleibt `asm` ein Bezeichner.
+        // HOOK kern: `asm("…", <asm_op>, out("rax"), clobber("memory"))`
+        // (core.rs, round 52). Only when `asm` is followed immediately by `(`
+        // and a string literal — otherwise `asm` stays one identifier.
         if let Some(e) = crate::core::hook_primary(self) {
             return e;
         }
@@ -686,16 +686,16 @@ impl<'a> Parser<'a> {
                 let raw = raw.clone();
                 self.interpolation(sp, &raw)
             }
-            // ZEICHENKETTENLITERAL -> Array-Literal.
+            // STRING LITERAL -> array literal.
             //
-            // `"abc"` wird zu `[97, 98, 99]`, `u"abc"` zu den UTF-16-
-            // Codeeinheiten. Damit ist der Typ `[u8; N]` bzw. `[u16; N]`, und
-            // alles Weitere — Typpruefung, Lowering, Codegenerierung — ist
-            // schon da. Der Preis ist ehrlich benannt (SPEC §14.1.str, S8):
-            // die Daten landen als Folge einzelner Speicherbefehle im Rahmen,
-            // nicht in `.rodata`. Fuer den Quelltext ist der Gewinn trotzdem
-            // gross: `var m: [u8; 12] = "firn-gc: …"` statt einer von Hand
-            // ausgerechneten Oktettliste.
+            // `"abc"` becomes `[97, 98, 99]`, `u"abc"` becomes the UTF-16
+            // code units. The type is thereby `[u8; N]` or `[u16; N]`, and
+            // everything further — type check, lowering, code generation — is
+            // there already. The price is stated honestly (SPEC §14.1.str, S8):
+            // the data land as a sequence of single store instructions at the
+            // frame, not at `.rodata`. For the source text the gain is big
+            // nonetheless: `var m: [u8; 12] = "firn-gc: …"` rather than one
+            // octet list computed by hand.
             TokKind::Str(_, val) => {
                 let sp = self.bump();
                 let mut elems: Vec<Expr> = Vec::new();
@@ -738,7 +738,7 @@ impl<'a> Parser<'a> {
             TokKind::LBracket => {
                 let start = self.bump();
                 let mut elems = Vec::new();
-                // `[wert; N]` — Wiederholungsliteral
+                // `[value; N]` — repeat literal
                 if !self.at(&TokKind::RBracket) && !self.at_eof() {
                     let first = self.nested_expr();
                     if self.at(&TokKind::Semi) && !self.recovering {
@@ -809,7 +809,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `Name{ feld: wert, ... }` — '{' steht noch an.
+    /// `T{ field: value, ... }` — '{' still stands ahead.
     pub(crate) fn struct_lit(&mut self, name: String, name_span: Span) -> Expr {
         self.bump(); // '{'
         let mut fields = Vec::new();
@@ -843,7 +843,7 @@ impl<'a> Parser<'a> {
         self.mk(sp, ExprKind::StructLit(name, fields, name_span))
     }
 
-    // ------------------------------------------------------------ Anweisungen
+    // ------------------------------------------------------------- Statements
 
     pub(crate) fn block(&mut self, ctx: &str) -> Block {
         let start = self.span();
@@ -870,7 +870,7 @@ impl<'a> Parser<'a> {
                 continue;
             }
             if self.dg.is_full() {
-                // Fehlerlawine vermeiden: Rest des Blocks ueberspringen.
+                // Avoid a flood of errors: skip the rest of the block.
                 while !self.at(&TokKind::RBrace) && !self.at_eof() {
                     self.bump();
                 }
@@ -878,8 +878,8 @@ impl<'a> Parser<'a> {
             }
             let before = self.pos;
             let s = self.stmt();
-            // Versteckte Textsegmente der Interpolation stehen VOR der
-            // Anweisung, die ihre Interpolation enthaelt.
+            // Hidden text segments of the interpolation stand AHEAD of the
+            // statement that holds their interpolation.
             if !self.hoist.is_empty() {
                 stmts.append(&mut self.hoist);
             }
@@ -894,7 +894,7 @@ impl<'a> Parser<'a> {
         Block { stmts, span: Parser::join(start, end) }
     }
 
-    /// Anweisungsende: ';' oder Zeilenwechsel oder '}'.
+    /// End of a statement: ';' or line break or '}'.
     pub(crate) fn end_stmt(&mut self) {
         if self.recovering {
             self.recovering = false;
@@ -928,9 +928,9 @@ impl<'a> Parser<'a> {
         s
     }
 
-    /// `defer <anweisung>` — die Anweisung laeuft beim Verlassen des
-    /// umschliessenden Blocks (SPEC §5.1). Erlaubt ist sowohl ein Block
-    /// (`defer { … }`) als auch eine einzelne Anweisung (`defer close(fd)`).
+    /// `defer <statement>` — the statement runs when the enclosing block gets
+    /// left (SPEC §5.1). Allowed is both a block (`defer { … }`) and a single
+    /// statement (`defer close(fd)`).
     fn defer_stmt(&mut self, only_error: bool) -> Stmt {
         let word = if only_error { "errdefer" } else { "defer" };
         let start = self.bump();
@@ -944,7 +944,7 @@ impl<'a> Parser<'a> {
     }
 
     fn stmt_inner(&mut self, start: Span) -> Stmt {
-        // HOOK types: `match`-Anweisung (sema_match.rs)
+        // HOOK types: `match` statement (sema_match.rs)
         if let Some(s) = crate::sema_match::hook_stmt(self) {
             return s;
         }
@@ -1070,7 +1070,7 @@ impl<'a> Parser<'a> {
         Stmt::While { cond, body, span: start }
     }
 
-    /// `for name in start..end { }` — halboffener, aufsteigender Bereich.
+    /// The `for` loop over a half-open, ascending range `start..end`.
     fn for_stmt(&mut self) -> Stmt {
         let start = self.bump(); // 'for'
         let (name, name_span) = match self.ident("after 'for'") {
@@ -1149,7 +1149,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // ---------------------------------------------------------------- Elemente
+    // ------------------------------------------------------------------- Items
 
     pub(crate) fn params(&mut self) -> Vec<Param> {
         let mut out = Vec::new();
@@ -1325,7 +1325,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `import pfad.modul`
+    /// `import path.module`
     fn import_decl(&mut self, prog: &mut Program) {
         let start = self.bump(); // 'import'
         let mut path: Vec<String> = Vec::new();
@@ -1407,11 +1407,11 @@ impl<'a> Parser<'a> {
         self.recovering = false;
     }
 
-    /// `#[name]` oder `#[name(arg, ...)]`, beliebig oft hintereinander.
+    /// `#[attr]` or `#[attr(arg, ...)]`, as often as you like one after another.
     ///
-    /// Der Parser prueft hier NUR die Form. Ob es den Namen gibt, wohin er
-    /// gehoert und ob er in Stufe 0 etwas tut, entscheidet `sema.rs` anhand
-    /// des Registers in `attrs.rs` — mit Zeile, Spalte und Vorschlag.
+    /// The parser checks the form here ONLY. Whether the label exists, where it
+    /// belongs and whether it does something at stage 0 gets decided by
+    /// `sema.rs` per the register at `attrs.rs` — with line, column, suggestion.
     fn attributes(&mut self) -> Vec<Attr> {
         let mut out = Vec::new();
         while self.at(&TokKind::Hash) {
@@ -1486,7 +1486,7 @@ impl<'a> Parser<'a> {
                 break;
             }
             let before = self.pos;
-            // Attribute gehoeren zur naechsten Deklaration (attrs.rs).
+            // Attributes belong to the next declaration (attrs.rs).
             if self.at(&TokKind::Hash) {
                 self.pending_attrs = self.attributes();
                 while self.eat(&TokKind::Semi) {}
@@ -1502,36 +1502,36 @@ impl<'a> Parser<'a> {
                 }
                 continue;
             }
-            // HOOK fehlerunionen: `error`-Deklaration (errors.rs)
+            // HOOK fehlerunionen: `error` declaration (errors.rs)
             if crate::errors::hook_item(self) {
                 if self.pos == before {
                     self.bump();
                 }
                 continue;
             }
-            // HOOK gc: `gc class Name { … }` (gc.rs, SPEC 3.5.1)
+            // HOOK gc: `gc class C { … }` (gc.rs, SPEC 3.5.1)
             if crate::gc::hook_item(self) {
                 if self.pos == before {
                     self.bump();
                 }
                 continue;
             }
-            // HOOK iface: `interface Name { fn … }` (iface.rs, Runde 46)
+            // HOOK iface: `interface I { fn … }` (iface.rs, round 46)
             if crate::iface::hook_item(self) {
                 if self.pos == before {
                     self.bump();
                 }
                 continue;
             }
-            // HOOK impl: `impl Typ { fn … }`, `impl I for Typ { fn … }`
-            // (impls.rs, Runde 45; die Schnittstellenform Runde 46)
+            // HOOK impl: `impl T { fn … }`, `impl I for T { fn … }`
+            // (impls.rs, round 45; the interface form round 46)
             if crate::impls::hook_item(self, &mut prog) {
                 if self.pos == before {
                     self.bump();
                 }
                 continue;
             }
-            // HOOK types: enum-Deklaration und generische Vorlagen (sema_match.rs)
+            // HOOK types: enum declaration and generic templates (sema_match.rs)
             if crate::sema_match::hook_item(self) {
                 if self.pos == before {
                     self.bump();
@@ -1575,45 +1575,45 @@ pub fn parse(toks: &[Token], dg: &mut Diags) -> Program {
     parse_module(toks, dg, 0, 0)
 }
 
-/// Setzt die Registrierungen der Nachbarmodule fuer EINE Uebersetzung zurueck.
-/// Bei mehreren Dateien ruft `modules.rs` das genau einmal auf — sonst
-/// verloere jede Datei die Aufzaehlungen der vorherigen.
+/// Resets the registrations of the neighbouring modules for ONE compilation.
+/// With several files `modules.rs` calls that exactly once — otherwise every
+/// file would lose the enums of the previous one.
 pub fn reset_hooks() {
-    // HOOK types: Registrierungen dieser Uebersetzung zuruecksetzen (sema_match.rs)
+    // HOOK types: reset the registrations of this compilation (sema_match.rs)
     crate::sema_match::hook_reset();
-    // HOOK fehlerunionen: dasselbe fuer Fehlermengen/Fehlerunionen (errors.rs)
+    // HOOK fehlerunionen: the same for error sets/error unions (errors.rs)
     crate::errors::hook_reset();
-    // HOOK sizeof: Groessentabelle dieser Uebersetzung leeren (sizeof.rs)
+    // HOOK sizeof: empty the size table of this compilation (sizeof.rs)
     crate::sizeof::hook_reset();
-    // HOOK gc: dasselbe fuer die gc-Klassen (gc.rs)
+    // HOOK gc: the same for the gc classes (gc.rs)
     crate::gc::hook_reset();
-    // HOOK iface: dasselbe fuer Schnittstellen und ihre Umsetzungen (iface.rs)
+    // HOOK iface: the same for interfaces and their implementations (iface.rs)
     crate::iface::hook_reset();
 }
 
-/// Wie `parse`, aber fuer eine Datei der Quelltextkarte: `file` ist ihre
-/// Nummer, `base_id` die erste noch freie `ExprId`. `Program::expr_count` ist
-/// danach die erste hinter dieser Datei freie Id (absolut) — `modules.rs`
-/// reiht die Dateien so ohne Ueberschneidung aneinander.
+/// Like `parse`, but for a file of the source map: `file` is its number,
+/// `base_id` the first `ExprId` still free. `Program::expr_count` is
+/// afterwards the first id free behind this file (absolute) — `modules.rs`
+/// lines the files up that way without overlap.
 impl<'a> Parser<'a> {
-    /// `f"..."` — die String-Interpolation (Runde 39).
+    /// `f"..."` — the string interpolation (round 39).
     ///
-    /// Der Parser zerlegt den Rumpf ZUR UEBERSETSUNGZEIT in eine Kette von
-    /// Aufrufen auf den Fmt-Builder aus `std.io` — keine Varargs, kein
-    /// Laufzeit-Parsen. Aus `f"x = {x}!"` wird:
+    /// The parser splits the body AT COMPILE TIME into a chain of calls on the
+    /// Fmt builder out of `std.io` — no varargs, no parsing at runtime.
+    /// `f"x = {x}!"` becomes:
     ///
     /// ```text
-    /// io.fmt_text(io.fmt_zahl(io.fmt_text(io.fmt_neu(), &_fseg0[0], 6),
-    ///                         (x) as i64),
+    /// io.fmt_text(io.fmt_number(io.fmt_text(io.fmt_new(), &_fseg0[0], 6),
+    ///                           (x) as i64),
     ///             &_fseg1[0], 1)
     /// ```
     ///
-    /// Die Textsegmente koennen nicht flach adressiert werden (ein nacktes
-    /// Array-Literal hat an dieser Stelle keinen ableitbaren Typ) — sie
-    /// werden als versteckte `let _fseg<N>: [u8; N]` vor die umgebende
-    /// Anweisung gehoben (`block` leert `self.hoist`). Wer `f"..."`
-    /// schreibt, braucht `import std.io` — sonst meldet die Aufloesung
-    /// `io` als nicht eingebunden, genau wie bei handgeschriebenem `io.`.
+    /// The text segments cannot be addressed flatly (a bare array literal has
+    /// no derivable type at this spot) — they get hoisted as hidden
+    /// `let _fseg<N>: [u8; N]` ahead of the surrounding statement (`block`
+    /// empties `self.hoist`). Whoever writes `f"..."` needs `import std.io` —
+    /// otherwise the resolution reports `io` as not included, exactly as with
+    /// a hand written `io.`.
     fn interpolation(&mut self, sp: Span, raw: &str) -> Expr {
         if self.interp_depth > 0 {
             self.dg.error(
@@ -1638,10 +1638,10 @@ impl<'a> Parser<'a> {
                 break;
             }
             if c == '\\' {
-                // Maskierung gehoert dem Textsegment — der Klammer-Scan
-                // darf ein \" nicht als Literalende missdeuten (hier sind
-                // die Anfuehrungszeichen schon weg); '{')}' kommt maskiert
-                // in der Kernfassung nicht vor (docs/RUNDE39.md).
+                // The escape belongs to the text segment — the bracket scan
+                // may not misread a \" as the end of the literal (the quotes
+                // are gone here already); '{')}' does not show up escaped
+                // within the core version (docs/RUNDE39.md).
                 i += 2;
                 continue;
             }
@@ -1649,11 +1649,11 @@ impl<'a> Parser<'a> {
                 i += 1;
                 continue;
             }
-            // Textsegment vor der Klammer abschliessen.
+            // Close the text segment ahead of the bracket.
             if i > text_of {
                 chain = self.interp_text(chain, sp, &chars[text_of..i], text_of);
             }
-            // Das schliessende '}' suchen; Schachtelung von '{' ist ein Fehler.
+            // Look for the closing '}'; nesting of '{' counts as error.
             let mut j = i + 1;
             let mut too = false;
             while j < chars.len() {
@@ -1692,8 +1692,8 @@ impl<'a> Parser<'a> {
         chain
     }
 
-    /// Ein Textsegment: entschluesseln, als verstecktes `let _fseg<N>`
-    /// anmelden und `io.fmt_text(kette, &name[0] as u64, N)` an die Kette.
+    /// One text segment: decode it, register it as a hidden `let _fseg<N>`
+    /// and append `io.fmt_text(chain, &label[0] as u64, N)` to the chain.
     fn interp_text(&mut self, chain: Expr, sp: Span, raw: &[char], of: usize) -> Expr {
         let bytes = match crate::strings::decode_literal(crate::strings::LitKind::Str, raw) {
             Ok(crate::strings::LitValue::Octets(v)) => v,
@@ -1742,13 +1742,13 @@ impl<'a> Parser<'a> {
         )
     }
 
-    /// Ein Ausdruckssegment: das Fragment mit aufgefuellten Positionen
-    /// neu lexen, EINEN Ausdruck daraus parsen und als
-    /// `io.fmt_zahl(kette, (ausdruck) as i64)` an die Kette haengen.
+    /// One expression segment: lex the fragment again with padded positions,
+    /// parse ONE expression out of it and append it to the chain as
+    /// `io.fmt_number(chain, (expression) as i64)`.
     fn interp_expr(&mut self, chain: Expr, sp: Span, raw: &[char], of: usize) -> Expr {
-        // Positionen stimmen, wenn das Fragment an seiner echten Stelle
-        // steht: Zeilen und Spalten vorweg auffuellen (Zeichenketten sind
-        // einzeilig, darum reicht EINE Zeile).
+        // The positions are right when the fragment stands at its real spot:
+        // pad lines and columns beforehand (strings are single line, so ONE
+        // line suffices).
         let mut source = String::new();
         for _ in 1..sp.line {
             source.push('\n');
@@ -1774,18 +1774,18 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Hilfe fuer die Fehlermeldung oben: Span aus Einzelteilen.
+    /// Help for the error message above: a span out of single parts.
     fn spanned(&self, line: u32, col: u32, len: u32) -> Span {
         Span { line, col, len, file: self.file }
     }
 }
 
-/// Parst genau EINEN Ausdruck aus einem Interpolationssegment.
+/// Parses exactly ONE expression out of one interpolation segment.
 ///
-/// Der Unter-Parser teilt sich Diagnosen und Modulkenntnis mit dem
-/// aufrufenden Parser; die `ExprId`s laufen ueber `next_id` nahtlos weiter.
-/// `interp_depth = 1` sperrt die Schachtelung: ein `f"..."` im Fragment
-/// wird ein sauberer Fehler statt stiller Hoist-Lecks.
+/// The sub-parser shares diagnostics and module knowledge with the calling
+/// parser; the `ExprId`s carry on seamlessly through `next_id`.
+/// `interp_depth = 1` bars the nesting: one `f"..."` within the fragment
+/// becomes a clean error rather than silent hoist leaks.
 fn in_expr(
     toks: &[Token],
     dg: &mut Diags,
@@ -1841,8 +1841,8 @@ pub fn parse_module(toks: &[Token], dg: &mut Diags, file: u32, base_id: u32) -> 
     };
     let prog = p.program();
     if !p.hoist.is_empty() {
-        // f"..." auf ITEM-Ebene (z. B. in einer `const`): es gibt keine
-        // Anweisung, vor die die Textsegmente gehoben werden koennten.
+        // f"..." at ITEM level (say within a `const`): there is no
+        // statement ahead of which the text segments could be hoisted.
         p.dg.error(
             Span::none(),
             "interpolation f\"...\" outside a statement (for example in a const) cannot be expressed".to_string(),
@@ -1881,7 +1881,7 @@ mod tests {
     #[test]
     fn expr_ids_are_continuous() {
         let p = ok("fn main() -> i32 { let a: i32 = 1 + 2 * 3\n return a }");
-        // 1, 2, 3, 2*3, 1+..., a  => 6 Ausdruecke
+        // 1, 2, 3, 2*3, 1+..., a  => 6 expressions
         assert_eq!(p.expr_count, 6);
     }
 
@@ -1958,7 +1958,7 @@ mod tests {
 
     #[test]
     fn line_end_finished_the_stmt() {
-        // `*p = ...` in der naechsten Zeile ist KEINE Multiplikation.
+        // `*p = ...` on the next line is NO multiplication.
         let p = ok("fn main() -> i32 {\n var a: i32 = 1\n var p: *mut i32 = &a\n *p = 2\n return a\n}");
         match &p.funcs[0].body.stmts[2] {
             Stmt::Assign { target, .. } => match &target.kind {
@@ -1967,11 +1967,11 @@ mod tests {
             },
             other => panic!("expected assignment, {:?}", other),
         }
-        // Ein Operator am ZEILENENDE setzt den Ausdruck dagegen fort,
-        // innerhalb von Klammern auch ein Zeilenumbruch.
+        // One operator at the END OF A LINE continues the expression, though,
+        // and inside brackets a line break does so too.
         let p2 = ok("fn f(a: i32, b: i32) -> i32 { return a }\nfn main() -> i32 {\n let s: i32 = 1 +\n 2\n let t: i32 = f(1,\n 2)\n return s + t\n}");
         assert_eq!(p2.funcs[1].body.stmts.len(), 3);
-        // `a` und `(b)` in zwei Zeilen sind zwei Anweisungen, kein Aufruf.
+        // `a` and `(b)` on two lines are two statements, no call.
         let p3 = ok("fn main() -> i32 {\n let a: i32 = 1\n a\n (a)\n return a\n}");
         assert_eq!(p3.funcs[0].body.stmts.len(), 4);
     }
@@ -2094,9 +2094,9 @@ mod tests {
     }
 }
 
-/// Typkonstruktoren, die `SPEC.md` beschreibt, die Stufe 0 aber nicht umsetzt.
-/// Sie bekommen einen eigenen, klaren Fehler statt eines Syntaxfehlers —
-/// `SPEC.md` §14 fuehrt sie unter "not contained".
+/// Type constructors that `SPEC.md` describes, yet stage 0 does not build.
+/// They get a clear error of their own rather than a syntax error —
+/// `SPEC.md` §14 lists them under "not contained".
 fn not_implemented_ty(name: &str) -> Option<&'static str> {
     match name {
         "secret" => Some("secret[T] and the constant-time primitives (SPEC §9) are not implemented; see ABNAHME.md"),
