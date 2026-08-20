@@ -661,7 +661,7 @@ fi
 
 echo "== 17. point 5: a command line in ring 3 =="
 if [ -f "$TMPD/k0.mb" ]; then
-    script='ls;cat /hello.txt;echo hallo welt;write /neu.txt zeile aus der shell;cat /neu.txt;ls;rm /neu.txt;ls;quatsch;exit'
+    script='ls;cat /hello.txt;echo hello world;write /new.txt a line from the shell;cat /new.txt;ls;rm /new.txt;ls;nonsense;exit'
     run_kernel "$TMPD/k0.mb" "nokbd nosched noproc noring3 script=$script" "$TMPD/sh.txt"
     rc=$?
     S="$TMPD/sh.txt"
@@ -672,16 +672,16 @@ if [ -f "$TMPD/k0.mb" ]; then
         && ok "'ls' lists the root directory, directories with a slash" \
         || { bad "'ls' says something else"; grep -A1 'sh\$ ls' "$S" | head -4 | sed 's/^/        /'; }
     has "$S" "firn round 62" "'cat /hello.txt' printed the contents of the file"
-    has "$S" "hallo welt" "'echo hallo welt' arrived"
-    has "$S" "sh: written 19" "'write' wrote 19 octets into a new file"
-    has "$S" "zeile aus der shell" "'cat' read back what 'write' had written"
-    grep -q '^\./ \.\./ hello.txt docs/ neu.txt' "$S" \
+    has "$S" "hello world" "'echo hello world' arrived"
+    has "$S" "sh: written 21" "'write' wrote 21 octets into a new file"
+    has "$S" "a line from the shell" "'cat' read back what 'write' had written"
+    grep -q '^\./ \.\./ hello.txt docs/ new.txt' "$S" \
         && ok "after 'write' the new file is in the listing" \
         || bad "the new file does not show up in 'ls'"
     has "$S" "sh: rm 0" "'rm' deleted the file"
     n=$(grep -c '^\./ \.\./ hello.txt docs/ $' "$S")
     num "listings without the deleted file" "$n" ge 2
-    has "$S" "sh: what is quatsch" "an unknown command is named"
+    has "$S" "sh: what is nonsense" "an unknown command is named"
     has "$S" "sh: bye" "'exit' ends the shell"
     cmds=$(value "$S" 'sh: commands=[0-9]+')
     num "commands carried out (the exit code of the shell)" "$cmds" eq 10

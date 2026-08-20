@@ -101,17 +101,21 @@ the priorities 1, 2 and 3 doing the same amount of work:
 ```
 sched: preempt=1
 sched: workers 3 4 5
-sched: switches=134  alternations=71  entries=134
+sched: switches=70  alternations=30  entries=70
 trace: 3 4 5 1 3 4 5 1 3 4 5 1 3 4 5 1 3 4 5 1 3 4 5 1 3 4 5 1 3 4 5 1 …
-task: pid=3  kind=2  prio=1  state=5  runs=44  ticks=43  work=40  end=401  exit=40
-task: pid=4  kind=2  prio=2  state=5  runs=26  ticks=50  work=40  end=384  exit=40
-task: pid=5  kind=2  prio=3  state=5  runs=19  ticks=55  work=40  end=365  exit=40
+task: pid=1  kind=0  prio=2  state=2  runs=25  ticks=139  work=0   end=0    exit=0
+task: pid=2  kind=1  prio=1  state=1  runs=1   ticks=1    work=0   end=0    exit=0
+task: pid=3  kind=2  prio=1  state=5  runs=25  ticks=24   work=40  end=205  exit=40
+task: pid=4  kind=2  prio=2  state=5  runs=11  ticks=21   work=40  end=192  exit=40
+task: pid=5  kind=2  prio=3  state=5  runs=8   ticks=21   work=40  end=184  exit=40
 ```
 
-`ticks/runs` is 0.98, 1.92 and 2.89 — the length of a turn **is** the
-priority, and the test checks exactly that quotient. The one with the
-highest priority is done first (365 < 384 < 401), and all three did their
-full work (`work=40`, `exit=40`).
+`ticks/runs` is 0.96, 1.91 and 2.63 — the length of a turn **is** the
+priority, and the test checks exactly that quotient (a turn of priority
+`p` has to lie within ±0.6 ticks of `p`). The one with the highest
+priority is done first (184 < 192 < 205), and all three did their full
+work (`work=40`, `exit=40`). The absolute numbers move from run to run --
+QEMU is not a stopwatch -- the three relations do not.
 
 **The counter-check** is the same kernel with `nopreempt` on the command
 line: the timer no longer switches. Then each of the three is scheduled
@@ -314,20 +318,20 @@ sh$ ls
 ./ ../ hello.txt docs/
 sh$ cat /hello.txt
 firn round 62
-sh$ echo hallo welt
-hallo welt
-sh$ write /neu.txt zeile aus der shell
-sh: written 19
-sh$ cat /neu.txt
-zeile aus der shell
+sh$ echo hello world
+hello world
+sh$ write /new.txt a line from the shell
+sh: written 21
+sh$ cat /new.txt
+a line from the shell
 sh$ ls
-./ ../ hello.txt docs/ neu.txt
-sh$ rm /neu.txt
+./ ../ hello.txt docs/ new.txt
+sh$ rm /new.txt
 sh: rm 0
 sh$ ls
 ./ ../ hello.txt docs/
-sh$ quatsch
-sh: what is quatsch
+sh$ nonsense
+sh: what is nonsense
 sh$ exit
 sh: bye
 sh: commands=10
