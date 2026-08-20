@@ -1,25 +1,26 @@
 #!/usr/bin/env python3
-"""Laeufer fuer die HTML-Baumkonstruktion aus lib/browser/ (in Firn).
+"""Runner for the HTML tree construction from lib/browser/ (in Firn).
 
-WERKBANK, KEIN PRODUKT: dieses Skript enthaelt KEINE Parserlogik. Es
-uebersetzt die Faelle in Auftraege, ruft das in Firn geschriebene Binary
-GENAU EINMAL auf und vergleicht die Antwort Zeile fuer Zeile mit der
-Erwartung.
+A WORKBENCH, NOT A PRODUCT: this script contains NO parser logic. It
+turns the cases into jobs, calls the binary written in Firn
+EXACTLY ONCE and compares the answer line by line with the
+expectation.
 
-Datenformat: das `.dat`-Format der html5lib-`tree-construction`-Tests.
-Bewusst genau dieses und kein eigenes — liegen die Originaldaten eines Tages
-vor, laeuft dieser Laeufer ohne Aenderung dagegen (siehe docs/RUNDE54.md).
+Data format: the `.dat` format of the html5lib `tree-construction` tests.
+Deliberately exactly that one and not one of our own -- once the original
+data is available, this runner runs against it without a change (see
+docs/RUNDE54.md).
 
-Ehrlichkeitsregeln:
-  * JEDER Fall aus allen .dat-Dateien wird gezaehlt. Es gibt kein
-    Ueberspringen und keine Filter.
-  * `#document-fragment`-Faelle (Zerlegung mit Kontextelement) sind NICHT
-    umgesetzt und zaehlen als FEHLSCHLAG, nicht als uebersprungen.
-  * Ein `#KAPUTT`-Vermerk des Binaries ist ein Fehlschlag.
-  * Verglichen wird der vollstaendige Baum, nicht ein Ausschnitt.
+Rules of honesty:
+  * EVERY case from all .dat files is counted. There is no
+    skipping and there are no filters.
+  * `#document-fragment` cases (parsing with a context element) are NOT
+    implemented and count as a FAILURE, not as skipped.
+  * A `#KAPUTT` note from the binary is a failure.
+  * What is compared is the complete tree, not a section of it.
 
-Aufruf: python3 tools/html/harness_tree.py <binary> [--json datei] [--zeige N]
-                                           [--nur MUSTER]
+Usage: python3 tools/html/harness_tree.py <binary> [--json file] [--show N]
+                                          [--only PATTERN]
 """
 
 import glob
@@ -30,14 +31,14 @@ import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-FAELLE = os.path.join(ROOT, "tools", "html", "cases")
-LUECKEN = os.path.join(ROOT, "tools", "html", "luecken")
+CASES = os.path.join(ROOT, "tools", "html", "cases")
+GAPS = os.path.join(ROOT, "tools", "html", "luecken")
 
 
-def lade_dat(pfad):
-    """Liest eine .dat-Datei: Liste von (data, document, fragment_kontext)."""
-    faelle = []
-    with open(pfad, encoding="utf-8") as fh:
+def load_dat(path):
+    """Reads a .dat file: a list of (data, document, fragment_context)."""
+    cases = []
+    with open(path, encoding="utf-8") as fh:
         text = fh.read()
     for block in text.split("\n#data\n"):
         block = block.lstrip("\n")
@@ -45,32 +46,32 @@ def lade_dat(pfad):
             block = block[len("#data\n"):]
         if not block.strip():
             continue
-        teile = {}
-        aktuell = "data"
-        teile[aktuell] = []
-        for zeile in block.split("\n"):
-            if zeile.startswith("#") and " " not in zeile.rstrip():
-                aktuell = zeile[1:].strip()
-                teile[aktuell] = []
+        parts = {}
+        cur = "data"
+        parts[cur] = []
+        for ln2 in block.split("\n"):
+            if ln2.startswith("#") and " " not in ln2.rstrip():
+                cur = ln2[1:].strip()
+                parts[cur] = []
                 continue
-            teile.setdefault(aktuell, []).append(zeile)
-        data = "\n".join(teile.get("data", []))
-        doc = teile.get("document", [])
+            parts.setdefault(cur, []).append(ln2)
+        data = "\n".join(parts.get("data", []))
+        doc = parts.get("document", [])
         while doc and doc[-1] == "":
             doc.pop()
-        kontext = "\n".join(teile.get("document-fragment", [])).strip() or None
-        faelle.append((data, "\n".join(doc), kontext))
-    return faelle
+        context = "\n".join(parts.get("document-fragment", [])).strip() or None
+        cases.append((data, "\n".join(doc), context))
+    return cases
 
 
-def lade_alle(muster=None, verzeichnis=None):
-    alle = []
-    for pfad in sorted(glob.glob(os.path.join(verzeichnis or FAELLE, "*.dat"))):
-        if muster and muster not in os.path.basename(pfad):
+def load_all(pattern=None, dirname=None):
+    all_cases = []
+    for path in sorted(glob.glob(os.path.join(dirname or CASES, "*.dat"))):
+        if pattern and pattern not in os.path.basename(path):
             continue
-        for i, (data, doc, kontext) in enumerate(lade_dat(pfad)):
-            alle.append((os.path.basename(pfad), i, data, doc, kontext))
-    return alle
+        for i, (data, doc, context) in enumerate(load_dat(path)):
+            all_cases.append((os.path.basename(path), i, data, doc, context))
+    return all_cases
 
 
 def main():
@@ -78,98 +79,98 @@ def main():
         print(__doc__)
         return 2
     binary = sys.argv[1]
-    json_ziel = None
-    zeige = 0
-    muster = None
-    verzeichnis = None
+    json_target = None
+    show = 0
+    pattern = None
+    dirname = None
     args = sys.argv[2:]
     i = 0
     while i < len(args):
         if args[i] == "--json":
-            json_ziel = args[i + 1]
+            json_target = args[i + 1]
             i += 2
-        elif args[i] == "--zeige":
-            zeige = int(args[i + 1])
+        elif args[i] == "--show":
+            show = int(args[i + 1])
             i += 2
-        elif args[i] == "--nur":
-            muster = args[i + 1]
+        elif args[i] == "--only":
+            pattern = args[i + 1]
             i += 2
-        elif args[i] == "--luecken":
-            verzeichnis = LUECKEN
+        elif args[i] == "--gaps":
+            dirname = GAPS
             i += 1
         else:
-            print("unbekannte option: %s" % args[i])
+            print("unknown option: %s" % args[i])
             return 2
 
-    faelle = lade_alle(muster, verzeichnis)
-    if not faelle:
-        print("KEINE FAELLE GEFUNDEN in %s" % (verzeichnis or FAELLE))
+    cases = load_all(pattern, dirname)
+    if not cases:
+        print("NO CASES FOUND in %s" % (dirname or CASES))
         return 1
 
     payload = b""
-    for _, _, data, _, _ in faelle:
+    for _, _, data, _, _ in cases:
         roh = data.encode("utf-8", "surrogatepass")
         payload += struct.pack("<I", len(roh)) + roh
 
     p = subprocess.run([binary], input=payload, stdout=subprocess.PIPE,
                        stderr=subprocess.PIPE, timeout=600)
     if p.returncode != 0:
-        print("BINARY ENDETE MIT %d" % p.returncode)
+        print("THE BINARY ENDED WITH %d" % p.returncode)
         print(p.stderr.decode("utf-8", "replace")[:2000])
         return 1
     roh = p.stdout.decode("utf-8", "surrogatepass")
-    teile = roh.split("#ENDE\n")
-    if teile and teile[-1] == "":
-        teile.pop()
-    if len(teile) != len(faelle):
-        print("ANTWORTZAHL FALSCH: %d Bloecke fuer %d Faelle" % (len(teile), len(faelle)))
+    parts = roh.split("#ENDE\n")
+    if parts and parts[-1] == "":
+        parts.pop()
+    if len(parts) != len(cases):
+        print("WRONG NUMBER OF ANSWERS: %d blocks for %d cases" % (len(parts), len(cases)))
         return 1
 
-    je_datei = {}
-    fehler = []
-    bestanden = 0
-    for (datei, idx, data, erwartet, kontext), antwort in zip(faelle, teile):
-        ist = antwort.rstrip("\n")
-        ok = (ist == erwartet) and kontext is None and "#KAPUTT" not in antwort
-        st = je_datei.setdefault(datei, [0, 0])
+    per_file = {}
+    fails = []
+    passed = 0
+    for (fname, idx, data, expected, context), answer in zip(cases, parts):
+        got = answer.rstrip("\n")
+        ok = (got == expected) and context is None and "#KAPUTT" not in answer
+        st = per_file.setdefault(fname, [0, 0])
         st[1] += 1
         if ok:
-            bestanden += 1
+            passed += 1
             st[0] += 1
         else:
-            grund = "fragment nicht umgesetzt" if kontext else "baum weicht ab"
-            if "#KAPUTT" in antwort:
-                grund = antwort.splitlines()[0]
-            fehler.append((datei, idx, data, erwartet, ist, grund))
+            reason = "fragment not implemented" if context else "tree differs"
+            if "#KAPUTT" in answer:
+                reason = answer.splitlines()[0]
+            fails.append((fname, idx, data, expected, got, reason))
 
-    breite = max(len(x) for x in je_datei) + 2
-    print("%-*s %8s %8s %8s" % (breite, "Datei", "gut", "gesamt", "Quote"))
-    print("-" * (breite + 28))
-    for datei in sorted(je_datei):
-        gut, ges = je_datei[datei]
-        print("%-*s %8d %8d %7.2f %%" % (breite, datei, gut, ges, 100.0 * gut / ges))
-    print("-" * (breite + 28))
-    ges = len(faelle)
-    print("%-*s %8d %8d %7.2f %%" % (breite, "GESAMT", bestanden, ges,
-                                     100.0 * bestanden / ges))
+    width = max(len(x) for x in per_file) + 2
+    print("%-*s %8s %8s %8s" % (width, "file", "good", "total", "quota"))
+    print("-" * (width + 28))
+    for fname in sorted(per_file):
+        good, total = per_file[fname]
+        print("%-*s %8d %8d %7.2f %%" % (width, fname, good, total, 100.0 * good / total))
+    print("-" * (width + 28))
+    total = len(cases)
+    print("%-*s %8d %8d %7.2f %%" % (width, "TOTAL", passed, total,
+                                     100.0 * passed / total))
 
-    if zeige and fehler:
-        print("\nErste %d Fehlschlaege:" % min(zeige, len(fehler)))
-        for datei, idx, data, erwartet, ist, grund in fehler[:zeige]:
-            print("\n--- %s #%d (%s)" % (datei, idx, grund))
+    if show and fails:
+        print("\nfirst %d failures:" % min(show, len(fails)))
+        for fname, idx, data, expected, got, reason in fails[:show]:
+            print("\n--- %s #%d (%s)" % (fname, idx, reason))
             print("    input: %r" % data)
-            print("    erwartet:")
-            for z in erwartet.split("\n"):
-                print("      " + z)
-            print("    bekommen:")
-            for z in ist.split("\n"):
-                print("      " + z)
+            print("    expected:")
+            for ln in expected.split("\n"):
+                print("      " + ln)
+            print("    got:")
+            for ln in got.split("\n"):
+                print("      " + ln)
 
-    if json_ziel:
-        with open(json_ziel, "w", encoding="utf-8") as fh:
-            json.dump({"passed": bestanden, "total": ges,
-                       "je_datei": je_datei}, fh, indent=1)
-    return 0 if bestanden == ges else 1
+    if json_target:
+        with open(json_target, "w", encoding="utf-8") as fh:
+            json.dump({"passed": passed, "total": total,
+                       "per_file": per_file}, fh, indent=1)
+    return 0 if passed == total else 1
 
 
 if __name__ == "__main__":

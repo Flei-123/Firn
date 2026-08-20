@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# bench/ab.sh — A/B-Vergleich ZWEIER firnc-Staende auf denselben Programmen.
+# bench/ab.sh -- A/B comparison of TWO firnc builds on the same programs.
 #
-# WARUM DIESES SKRIPT: `bench/run.sh` misst Firn gegen Rust. Der Faktor dort
-# schwankt aber mit der RUST-Zeit — auf einer geteilten Maschine um bis zu
-# 20 %. Beim Optimieren des Compilers hat das dazu gefuehrt, dass eine
-# Verbesserung als Verschlechterung erschien, obwohl die Firn-Zeiten praktisch
-# gleich blieben. Ein A/B-Vergleich zweier Firn-Staende hat dieses Problem
-# nicht: dieselben Programme, dieselbe Maschine, unmittelbar nacheinander.
+# WHY THIS SCRIPT: `bench/run.sh` measures Firn against Rust. The factor there
+# fluctuates with the RUST time, however -- by up to 20 % on a shared machine.
+# While optimising the compiler this made an improvement look like a
+# regression, although the Firn times stayed practically the same. An A/B
+# comparison of two Firn builds does not have that problem: the same programs,
+# the same machine, one right after the other.
 #
-# MINIMUM statt Median: Stoerungen machen einen Lauf nur langsamer, nie
-# schneller. Der kleinste von N Laeufen ist damit der robusteste Schaetzer
-# fuer die ungestoerte Rechenzeit.
+# MINIMUM instead of median: interference only ever makes a run slower, never
+# faster. The smallest of N runs is therefore the most robust estimator of the
+# undisturbed compute time.
 #
-# Aufruf:  bash bench/ab.sh <firnc-alt> <firnc-neu> [laeufe]
+# Usage:  bash bench/ab.sh <firnc-old> <firnc-new> [runs]
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -46,7 +46,7 @@ for src in bench/firn/*.fi; do
     if ! "$NEW" "$src" -o "$WORK/$name.new" 2>"$WORK/$name.new.err"; then
         printf '%-14s   BUILD ERROR (new)\n' "$name"; continue
     fi
-    # Gleiches Ergebnis? Sonst ist die Messung wertlos.
+    # Same result? Otherwise the measurement is worthless.
     "$WORK/$name.old" > "$WORK/$name.old.out" 2>&1
     "$WORK/$name.new" > "$WORK/$name.new.out" 2>&1
     if ! cmp -s "$WORK/$name.old.out" "$WORK/$name.new.out"; then

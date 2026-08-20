@@ -1,67 +1,67 @@
 #!/usr/bin/env bash
-# ARCHITEKTURPRUEFUNG: Feldzugriff ist vom Speicherort getrennt.
+# ARCHITECTURE CHECK: field access is separated from the memory location.
 #
-# Hintergrund: DESIGNZIELE.md §8. Solange `a.b` im ganzen Baum fest als
-# "Basis + Versatz" ausgeschrieben wird, ist die SoA-Anordnung (`SoaVec[T]`)
-# nicht nachruestbar. Deshalb darf aus einem Versatz NUR in `layout.rs` eine
-# Adresse werden.
+# Background: DESIGNZIELE.md 8. As long as `a.b` is written out as
+# "base + offset" everywhere in the tree, the SoA arrangement (`SoaVec[T]`)
+# cannot be added later. That is why an offset may only become an
+# address in `layout.rs`.
 #
-# Geprueft wird:
-#   1. `Op::PtrAdd` wird ausserhalb von layout.rs nur in der einen
-#      Hilfsfunktion `ptradd_const` gebaut.
-#   2. `ptradd_const` wird ausserhalb von layout.rs nur an Stellen gerufen,
-#      die als `// ABI-Wortkopie` gekennzeichnet sind (Aggregatuebergabe in
-#      Registern — das ist kein Feldzugriff).
-#   3. Kein Feld-Versatz (`.offset`, `offsets.get`) wird im Lowering direkt in
-#      eine Adressrechnung gesteckt.
+# What is checked:
+#   1. `Op::PtrAdd` is built outside of layout.rs only in the one
+#      helper function `ptradd_const`.
+#   2. `ptradd_const` is called outside of layout.rs only at places
+#      marked as `// ABI-Wortkopie` (aggregate passing in
+#      registers -- that is no field access).
+#   3. No field offset (`.offset`, `offsets.get`) is put directly into
+#      an address computation in the lowering.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 SRC=compiler/src
-FEHLER=0
+ERRORS=0
 
-melde() { echo "FEHLER: $1"; FEHLER=1; }
+report() { echo "ERROR: $1"; ERRORS=1; }
 
 # --- 1. Op::PtrAdd ---
-TREFFER=$(grep -rn 'Op::PtrAdd' "$SRC"/lower.rs "$SRC"/lower_match.rs 2>/dev/null || true)
-# Erlaubt ist genau eine Stelle: der Rumpf von `ptradd_const` (base + off).
-UEBRIG=$(printf '%s\n' "$TREFFER" | grep -v 'Op::PtrAdd { base, off: o }' || true)
-if [ -n "$UEBRIG" ]; then
-    melde "Op::PtrAdd wird im Lowering ausserhalb von ptradd_const/layout.rs gebaut:"
-    printf '%s\n' "$UEBRIG" | sed 's/^/        /'
+HITS=$(grep -rn 'Op::PtrAdd' "$SRC"/lower.rs "$SRC"/lower_match.rs 2>/dev/null || true)
+# Exactly one place is allowed: the body of `ptradd_const` (base + off).
+LEFT=$(printf '%s\n' "$HITS" | grep -v 'Op::PtrAdd { base, off: o }' || true)
+if [ -n "$LEFT" ]; then
+    report "Op::PtrAdd is built in the lowering outside of ptradd_const/layout.rs:"
+    printf '%s\n' "$LEFT" | sed 's/^/        /'
 fi
 
-# --- 2. ptradd_const-Aufrufe ---
-while IFS= read -r zeile; do
-    [ -z "$zeile" ] && continue
-    case "$zeile" in
-        *"fn ptradd_const"*) continue ;;      # die Definition selbst
-        *"ABI-Wortkopie"*)   continue ;;      # ausdruecklich erlaubt
+# --- 2. calls of ptradd_const ---
+while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    case "$line" in
+        *"fn ptradd_const"*) continue ;;      # the definition itself
+        *"ABI-Wortkopie"*)   continue ;;      # explicitly allowed
         *"layout.rs"*)       continue ;;
-        *"///"*)             continue ;;      # Doku-Kommentar
+        *"///"*)             continue ;;      # a doc comment
         *"//"*"ptradd_const"*) continue ;;
     esac
-    melde "ungekennzeichneter ptradd_const-Aufruf (Feldzugriff gehoert nach layout.rs):"
-    echo "        $zeile"
+    report "an unmarked ptradd_const call (field access belongs in layout.rs):"
+    echo "        $line"
 done < <(grep -rn 'ptradd_const' "$SRC"/lower.rs "$SRC"/lower_match.rs 2>/dev/null || true)
 
-# --- 3. Versatz direkt in eine Adresse ---
-for muster in '\.offset' 'offsets\.get'; do
-    T=$(grep -rn "$muster" "$SRC"/lower.rs 2>/dev/null || true)
+# --- 3. an offset directly into an address ---
+for pattern in '\.offset' 'offsets\.get'; do
+    T=$(grep -rn "$pattern" "$SRC"/lower.rs 2>/dev/null || true)
     if [ -n "$T" ]; then
-        melde "Feld-Versatz wird in lower.rs berechnet statt in layout.rs:"
+        report "a field offset is computed in lower.rs instead of in layout.rs:"
         printf '%s\n' "$T" | sed 's/^/        /'
     fi
 done
 
-# --- 4. layout.rs existiert und wird benutzt ---
-[ -f "$SRC/layout.rs" ] || melde "compiler/src/layout.rs fehlt"
-grep -q 'mod layout;' "$SRC/main.rs" || melde "layout ist in main.rs nicht angemeldet"
+# --- 4. layout.rs exists and is used ---
+[ -f "$SRC/layout.rs" ] || report "compiler/src/layout.rs is missing"
+grep -q 'mod layout;' "$SRC/main.rs" || report "layout is not declared in main.rs"
 
-if [ "$FEHLER" -ne 0 ]; then
+if [ "$ERRORS" -ne 0 ]; then
     echo
-    echo "Die Trennung Feldzugriff <-> Speicherort ist verletzt (DESIGNZIELE.md 8)."
+    echo "The separation of field access and memory location is violated (DESIGNZIELE.md 8)."
     exit 1
 fi
 
-ANZ=$(grep -c 'pub(crate) fn ' "$SRC/layout.rs")
-echo "OK: Feldzugriff und Speicherort getrennt ($ANZ Zugaenge in layout.rs, keine Umgehung)."
+CNT=$(grep -c 'pub(crate) fn ' "$SRC/layout.rs")
+echo "OK: field access and memory location separated ($CNT entry points in layout.rs, no bypass)."

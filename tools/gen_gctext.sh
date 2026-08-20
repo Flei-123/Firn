@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# tools/gen_gctext.sh — erzeugt lib/firnc1/gctext.fi aus lib/gc/gc.fi.
+# tools/gen_gctext.sh -- produces lib/firnc1/gctext.fi from lib/gc/gc.fi.
 #
-# WARUM: `firnc0` bettet die Sammler-Laufzeit per `include_str!` ein
-# (compiler/src/gc.rs, LAUFZEIT). Firn kennt kein `include_str` — die
-# ehrliche Entsprechung ist diese generierte Datei: derselbe Text, als
-# u64-Woerter gepackt (8 Bytes je Wort, little-endian), damit der
-# Selbsthosting-Compiler ihn ohne Dateizugriff einziehen kann.
-# Nach einer Aenderung an lib/gc/gc.fi dieses Skript laufen lassen und
-# lib/firnc1/gctext.fi mit committen.
+# WHY: `firnc0` embeds the collector runtime with `include_str!`
+# (compiler/src/gc.rs, LAUFZEIT). Firn has no `include_str` -- the
+# honest equivalent is this generated file: the same text, packed as
+# u64 words (8 bytes per word, little-endian), so that the
+# self-hosting compiler can pull it in without file access.
+# After a change to lib/gc/gc.fi run this script and
+# commit lib/firnc1/gctext.fi along with it.
 #
-# RUNDE 53: gepackt wird die VERKETTUNG von gc.fi + gcvec.fi + gcmap.fi,
-# genau wie `laufzeit_quelle` in gc.rs sie zusammensetzt. Die Sammlungen
-# haengen hinten dran und werden nur mit ausgepackt, wenn das Programm sie
-# braucht — deshalb gibt es zwei Laengen: GCTEXT_N (nur gc.fi) und
-# GCTEXT_ALL (mit Sammlungen).
+# ROUND 53: what is packed is the CONCATENATION of gc.fi + gcvec.fi + gcmap.fi,
+# exactly as `runtime_source` in gc.rs puts it together. The collections
+# hang at the end and are only unpacked along when the program needs
+# them -- which is why there are two lengths: GCTEXT_N (only gc.fi) and
+# GCTEXT_ALL (with the collections).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 python3 - <<'PYEOF'

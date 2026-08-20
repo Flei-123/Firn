@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
-"""Gegenprobe fuer die HANDGESCHRIEBENEN Erwartungen in tools/html/cases/.
+"""Counter-check for the HAND-WRITTEN expectations in tools/html/cases/.
 
-WOZU: die `tree-construction`-Daten von html5lib liegen diesem Projekt nicht
-vor (siehe docs/RUNDE54.md). Die Erwartungen in `tools/html/cases/*.dat`
-sind deshalb von Hand aus dem WHATWG-Standard geschrieben. Von Hand heisst
-auch: fehleranfaellig. Dieses Skript prueft sie gegen html5lib 1.1, eine
-unabhaengige, spezifikationstreue Umsetzung.
+WHAT FOR: the `tree-construction` data of html5lib is not available to this
+project (see docs/RUNDE54.md). The expectations in `tools/html/cases/*.dat`
+are therefore written by hand from the WHATWG standard. By hand also means:
+error-prone. This script checks them against html5lib 1.1, an
+independent, specification-faithful implementation.
 
-WICHTIG — WAS DAS IST UND WAS NICHT:
-  * Es ist eine PRUEFUNG der Erwartungen, keine Erzeugung. Die Erwartungen
-    stehen von Hand in den .dat-Dateien; hier wird nur gemeldet, wo sie von
-    html5lib abweichen. Jede Abweichung wird am Standard entschieden.
-  * html5lib ist NICHT Teil des Projekts und wird nicht mitgeliefert. Es wird
-    in einer eigenen venv installiert (tools/html/run.sh --pruefe-erwartungen)
-    und nur hier benutzt.
+IMPORTANT -- WHAT THIS IS AND WHAT IT IS NOT:
+  * It is a CHECK of the expectations, not a generation. The expectations
+    stand in the .dat files by hand; here it is only reported where they
+    differ from html5lib. Every deviation is decided at the standard.
+  * html5lib is NOT part of the project and is not shipped with it. It is
+    installed in a venv of its own (tools/html/run.sh --check-expectations)
+    and used only here.
 
-Aufruf:  python3 tools/html/orakel.py [dateien…]
-Rueckgabe: 0 = alle Erwartungen stimmen mit html5lib ueberein.
+Usage:  python3 tools/html/orakel.py [files...]
+Return: 0 = all expectations agree with html5lib.
 """
 
 import glob
@@ -24,7 +24,7 @@ import os
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-FAELLE = os.path.join(ROOT, "tools", "html", "faelle")
+FAELLE = os.path.join(ROOT, "tools", "html", "cases")
 LUECKEN = os.path.join(ROOT, "tools", "html", "luecken")
 
 NS = {
@@ -39,36 +39,36 @@ ATTR_NS = {
 }
 
 
-def lade_dat(pfad):
-    """Liest eine html5lib-.dat-Datei: Liste von (data, errors, document)."""
-    faelle = []
-    with open(pfad, encoding="utf-8") as fh:
+def load_dat(path):
+    """Reads an html5lib .dat file: a list of (data, errors, document)."""
+    cases = []
+    with open(path, encoding="utf-8") as fh:
         text = fh.read()
     if not text:
-        return faelle
+        return cases
     for block in text.split("\n#data\n"):
         block = block.lstrip("\n")
         if block.startswith("#data\n"):
             block = block[len("#data\n"):]
         if not block.strip():
             continue
-        teile = {}
-        aktuell = "data"
-        teile[aktuell] = []
-        for zeile in block.split("\n"):
-            if zeile.startswith("#") and " " not in zeile.rstrip():
-                aktuell = zeile[1:].strip()
-                teile[aktuell] = []
+        parts = {}
+        cur = "data"
+        parts[cur] = []
+        for line in block.split("\n"):
+            if line.startswith("#") and " " not in line.rstrip():
+                cur = line[1:].strip()
+                parts[cur] = []
                 continue
-            teile.setdefault(aktuell, []).append(zeile)
-        data = "\n".join(teile.get("data", []))
-        doc = teile.get("document", [])
+            parts.setdefault(cur, []).append(line)
+        data = "\n".join(parts.get("data", []))
+        doc = parts.get("document", [])
         while doc and doc[-1] == "":
             doc.pop()
-        kontext = "\n".join(teile.get("document-fragment", [])).strip() or None
-        faelle.append((data, "\n".join(doc),
-                       "orakel-abweichung" in teile, kontext))
-    return faelle
+        context = "\n".join(parts.get("document-fragment", [])).strip() or None
+        cases.append((data, "\n".join(doc),
+                       "orakel-abweichung" in parts, context))
+    return cases
 
 
 def serialisiere(dom):
@@ -79,8 +79,8 @@ def serialisiere(dom):
             return ATTR_NS[a.namespaceURI] + a.localName
         return a.name
 
-    def gehe(n, tiefe):
-        pre = "| " + "  " * tiefe
+    def walk(n, depth):
+        pre = "| " + "  " * depth
         t = n.nodeType
         if t == n.ELEMENT_NODE:
             praefix = NS.get(n.namespaceURI, "")
@@ -91,7 +91,7 @@ def serialisiere(dom):
                     a = n.attributes.item(i)
                     attrs.append((attr_name(a), a.value))
             for name, wert in sorted(attrs):
-                zeilen.append('| %s%s="%s"' % ("  " * (tiefe + 1), name, wert))
+                zeilen.append('| %s%s="%s"' % ("  " * (depth + 1), name, wert))
         elif t == n.TEXT_NODE:
             zeilen.append('%s"%s"' % (pre, n.data))
         elif t == n.COMMENT_NODE:
@@ -101,63 +101,63 @@ def serialisiere(dom):
             if n.publicId or n.systemId:
                 s += ' "%s" "%s"' % (n.publicId or "", n.systemId or "")
             zeilen.append(s + ">")
-        for k in verschmolzen(n.childNodes):
-            gehe(k, tiefe + 1)
+        for k in merged(n.childNodes):
+            walk(k, depth + 1)
 
-    def verschmolzen(kinder):
-        """minidom legt je Zeichentoken einen eigenen Textknoten an; das
-        .dat-Format kennt nur EINEN je Folge. Hier zusammengefasst."""
-        raus = []
-        for k in list(kinder):
-            if (raus and k.nodeType == k.TEXT_NODE
-                    and raus[-1].nodeType == k.TEXT_NODE):
-                raus[-1] = raus[-1].cloneNode(False)
-                raus[-1].data = raus[-1].data + k.data
+    def merged(children):
+        """minidom creates a text node of its own per character token; the
+        .dat format knows only ONE per run. Merged here."""
+        out = []
+        for k in list(children):
+            if (out and k.nodeType == k.TEXT_NODE
+                    and out[-1].nodeType == k.TEXT_NODE):
+                out[-1] = out[-1].cloneNode(False)
+                out[-1].data = out[-1].data + k.data
                 continue
-            raus.append(k)
-        return raus
+            out.append(k)
+        return out
 
-    for k in verschmolzen(dom.childNodes):
-        gehe(k, 0)
+    for k in merged(dom.childNodes):
+        walk(k, 0)
     return "\n".join(zeilen)
 
 
-def referenz(data, kontext=None):
+def referenz(data, context=None):
     import html5lib
     from html5lib.treebuilders import getTreeBuilder
 
     p = html5lib.HTMLParser(tree=getTreeBuilder("dom"), namespaceHTMLElements=True)
-    if kontext:
-        return serialisiere(p.parseFragment(data, container=kontext))
+    if context:
+        return serialisiere(p.parseFragment(data, container=context))
     dom = p.parse(data)
-    # `dom` ist das Wurzelelement-Dokument von minidom
+    # `dom` is the root element document of minidom
     return serialisiere(dom.ownerDocument or dom)
 
 
 def main():
-    dateien = sys.argv[1:] or (sorted(glob.glob(os.path.join(FAELLE, "*.dat")))
+    files = sys.argv[1:] or (sorted(glob.glob(os.path.join(FAELLE, "*.dat")))
                                + sorted(glob.glob(os.path.join(LUECKEN, "*.dat"))))
     ges = 0
     schlecht = 0
     nachlaeufer = 0
-    for pfad in dateien:
-        for i, (data, erwartet, bekannt, kontext) in enumerate(lade_dat(pfad)):
+    for path in files:
+        for i, (data, expected, known, context) in enumerate(load_dat(path)):
             ges += 1
-            ist = referenz(data, kontext)
-            if ist != erwartet and bekannt:
+            got = referenz(data, context)
+            if got != expected and known:
                 nachlaeufer += 1
                 continue
-            if ist != erwartet:
+            if got != expected:
                 schlecht += 1
-                print("ABWEICHUNG %s #%d  input=%r" % (os.path.basename(pfad), i, data))
+                print("DEVIATION %s #%d  input=%r" % (os.path.basename(path), i, data))
                 print("--- meine Erwartung ---")
-                print(erwartet)
+                print(expected)
                 print("--- html5lib 1.1 ---")
-                print(ist)
+                print(got)
                 print()
-    print("%d Faelle geprueft, %d Abweichungen zu html5lib 1.1 "
-          "(%d bekannte: html5lib 1.1 folgt dort einer aelteren Fassung "
-          "des Standards, mit '#orakel-abweichung' vermerkt)"
+    print("%d cases checked, %d deviations from html5lib 1.1 "
+          "(%d known: html5lib 1.1 follows an older version of the "
+          "standard there, noted with '#orakel-abweichung')"
           % (ges, schlecht, nachlaeufer))
     return 1 if schlecht else 0
 

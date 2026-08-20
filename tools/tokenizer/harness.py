@@ -1,30 +1,30 @@
 #!/usr/bin/env python3
-"""Harness fuer den HTML5-Tokenizer aus lib/html/ gegen html5lib-tests.
+"""Harness for the HTML5 tokenizer from lib/html/ against html5lib-tests.
 
-WERKBANK, KEIN PRODUKT: dieses Skript enthaelt KEINE Tokenizer-Logik. Es
-uebersetzt die Testfaelle in Auftraege, ruft das in Firn geschriebene Binary
-genau einmal auf und vergleicht die Antwort mit der Erwartung.
+A WORKBENCH, NOT A PRODUCT: this script contains NO tokenizer logic. It
+turns the test cases into jobs, calls the binary written in Firn
+exactly once and compares the answer with the expectation.
 
-Ehrlichkeitsregeln (Messlatte Punkt a):
-  * JEDER Fall aus allen .test-Dateien wird gezaehlt — auch `xmlViolationTests`.
-  * Faelle unter dem Schluessel `xmlViolationTests` erwarten laut html5lib-
-    README die XML-Anpassung ("Coercing an HTML DOM into an infoset"); sie
-    werden deshalb mit gesetzter Auftragsflagge XML_MODUS gefahren (Bit 0,
-    siehe PROTOKOLL.md). Mit `--ohne-xml-modus` bleibt die Flagge aus — dann
-    schlagen diese Faelle fehl, gezaehlt werden sie trotzdem.
-  * `doubleEscaped: true` entschluesselt input UND output zusaetzlich \\uXXXX.
-  * `initialStates` und `lastStartTag` werden beachtet; ein Fall gilt nur als
-    bestanden, wenn er in JEDEM seiner Startzustaende stimmt.
-  * Nicht unterstuetzte Faelle (Antwort ["NICHT-UNTERSTUETZT"]) sind
-    FEHLSCHLAEGE. Es gibt kein Ueberspringen und keine Filter.
-  * Mit `--mit-fehlern` muss zusaetzlich die `errors`-Liste des Falles exakt
-    stimmen (WHATWG-Codename, Zeile und Spalte, in der Reihenfolge der
-    Erwartung). Ohne den Schalter zaehlt nur der Tokenstrom. BEIDE Quoten
-    werden immer ausgewiesen — die gewaehlte entscheidet nur ueber `passed`
-    in der JSON-Bilanz und ueber den Rueckgabewert der Tabelle.
+Rules of honesty (yardstick item a):
+  * EVERY case from all .test files is counted -- `xmlViolationTests` too.
+  * Cases under the key `xmlViolationTests` expect, according to the
+    html5lib README, the XML adjustment ("Coercing an HTML DOM into an
+    infoset"); they are therefore run with the job flag XML_MODUS set
+    (bit 0, see PROTOKOLL.md). With `--no-xml-mode` the flag stays off --
+    then those cases fail, but they are counted all the same.
+  * `doubleEscaped: true` additionally unescapes \\uXXXX in input AND output.
+  * `initialStates` and `lastStartTag` are honoured; a case only counts as
+    passed when it is right in EVERY one of its start states.
+  * Unsupported cases (the answer ["NICHT-UNTERSTUETZT"]) are
+    FAILURES. There is no skipping and there are no filters.
+  * With `--with-errors` the `errors` list of the case additionally has to
+    match exactly (WHATWG code name, line and column, in the order of the
+    expectation). Without the switch only the token stream counts. BOTH
+    quotas are always reported -- the chosen one only decides about
+    `passed` in the JSON balance and about the return value of the table.
 
-Aufruf:  python3 tools/tokenizer/harness.py <binary> [--json datei] [--zeige N]
-                                            [--ohne-xml-modus] [--mit-fehlern]
+Usage:  python3 tools/tokenizer/harness.py <binary> [--json file] [--show N]
+                                           [--no-xml-mode] [--with-errors]
 """
 
 import glob
@@ -47,12 +47,12 @@ STATES = {
     "CDATA section state": 5,
 }
 
-# Auftragsflaggen (Bit 0 = XML-Anpassung), siehe tools/tokenizer/LOG.md.
+# Job flags (bit 0 = XML adjustment), see tools/tokenizer/LOG.md.
 FLAG_XML = 1
 
 
 def unescape(text):
-    """\\uXXXX-Entschluesselung fuer `doubleEscaped`-Faelle."""
+    """\\uXXXX unescaping for `doubleEscaped` cases."""
     return re.sub(
         r"\\u([0-9A-Fa-f]{4})", lambda m: chr(int(m.group(1), 16)), text
     )
@@ -68,9 +68,9 @@ def unescape_token(tok):
     return tok
 
 
-def normalisiere(tokens):
-    """Vergleichsform: Character-Token verschmelzen, ParseError entfernen,
-    StartTag auf (name, attrs, self_closing) vereinheitlichen."""
+def normalise(tokens):
+    """Comparison form: merge character tokens, remove ParseError,
+    unify StartTag to (name, attrs, self_closing)."""
     out = []
     for t in tokens:
         if t == "ParseError":
@@ -78,77 +78,77 @@ def normalisiere(tokens):
         if not isinstance(t, list):
             out.append(t)
             continue
-        art = t[0]
-        if art == "Character":
+        kind = t[0]
+        if kind == "Character":
             if out and out[-1][0] == "Character":
                 out[-1] = ["Character", out[-1][1] + t[1]]
             else:
                 out.append(["Character", t[1]])
-        elif art == "StartTag":
+        elif kind == "StartTag":
             attrs = t[2] if len(t) > 2 else {}
             self_closing = bool(t[3]) if len(t) > 3 else False
             out.append(["StartTag", t[1], attrs, self_closing])
-        elif art == "EndTag":
+        elif kind == "EndTag":
             out.append(["EndTag", t[1]])
         else:
             out.append(list(t))
     return out
 
 
-def lade_faelle(xml_modus=True):
-    """Liefert [(datei, index, beschreibung, input, erwartung, states, lasttag,
-    flaggen)]. `xml_modus` schaltet die XML-Anpassung fuer `xmlViolationTests`."""
-    faelle = []
+def load_cases(xml_mode=True):
+    """Yields [(file, index, description, input, expectation, states, lasttag,
+    flags)]. `xml_mode` switches the XML adjustment for `xmlViolationTests`."""
+    cases = []
 
-    for pfad in sorted(glob.glob(os.path.join(TESTDIR, "*.test"))):
-        with open(pfad, encoding="utf-8") as fh:
-            daten = json.load(fh)
-        liste = daten.get("tests")
-        flaggen = 0
-        if liste is None:
-            # Diese Faelle erwarten die XML-Anpassung des Tokenstroms.
-            liste = daten.get("xmlViolationTests", [])
-            if xml_modus:
-                flaggen = FLAG_XML
-        for i, t in enumerate(liste):
-            ein = t["input"]
-            erwartet = t["output"]
+    for path in sorted(glob.glob(os.path.join(TESTDIR, "*.test"))):
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        lst = data.get("tests")
+        flags = 0
+        if lst is None:
+            # These cases expect the XML adjustment of the token stream.
+            lst = data.get("xmlViolationTests", [])
+            if xml_mode:
+                flags = FLAG_XML
+        for i, t in enumerate(lst):
+            inp = t["input"]
+            expected = t["output"]
             if t.get("doubleEscaped"):
-                ein = unescape(ein)
-                erwartet = unescape_token(erwartet)
+                inp = unescape(inp)
+                expected = unescape_token(expected)
             states = t.get("initialStates") or ["Data state"]
-            faelle.append(
+            cases.append(
                 (
-                    os.path.basename(pfad),
+                    os.path.basename(path),
                     i,
                     t.get("description", ""),
-                    ein,
-                    normalisiere(erwartet),
+                    inp,
+                    normalise(expected),
                     states,
                     t.get("lastStartTag", ""),
-                    flaggen,
+                    flags,
                     t.get("errors", []),
                 )
             )
-    return faelle
+    return cases
 
 
-def auftraege(faelle):
-    roh = bytearray()
+def jobs(cases):
+    raw = bytearray()
     plan = []  # (fall_index, state_name)
-    for k, (_, _, _, ein, _, states, lasttag, flaggen, _) in enumerate(faelle):
+    for k, (_, _, _, inp, _, states, lasttag, flags, _) in enumerate(cases):
         for st in states:
             code = STATES.get(st)
             if code is None:
-                raise SystemExit("unbekannter Startzustand: %r" % st)
+                raise SystemExit("unknown start state: %r" % st)
             lt = lasttag.encode("utf-8", "surrogatepass")
-            eb = ein.encode("utf-8", "surrogatepass")
-            roh += struct.pack("<I", code)
-            roh += struct.pack("<I", flaggen)
-            roh += struct.pack("<I", len(lt)) + lt
-            roh += struct.pack("<I", len(eb)) + eb
+            eb = inp.encode("utf-8", "surrogatepass")
+            raw += struct.pack("<I", code)
+            raw += struct.pack("<I", flags)
+            raw += struct.pack("<I", len(lt)) + lt
+            raw += struct.pack("<I", len(eb)) + eb
             plan.append((k, st))
-    return bytes(roh), plan
+    return bytes(raw), plan
 
 
 def main():
@@ -156,111 +156,111 @@ def main():
         raise SystemExit(__doc__)
     binary = sys.argv[1]
     json_out = None
-    zeige = 0
-    xml_modus = True
-    mit_fehlern = False
+    show = 0
+    xml_mode = True
+    with_errors = False
     args = sys.argv[2:]
     while args:
         a = args.pop(0)
         if a == "--json":
             json_out = args.pop(0)
-        elif a == "--zeige":
-            zeige = int(args.pop(0))
-        elif a == "--ohne-xml-modus":
-            xml_modus = False
-        elif a == "--mit-fehlern":
-            mit_fehlern = True
+        elif a == "--show":
+            show = int(args.pop(0))
+        elif a == "--no-xml-mode":
+            xml_mode = False
+        elif a == "--with-errors":
+            with_errors = True
         else:
-            raise SystemExit("unbekannte Option %r" % a)
+            raise SystemExit("unknown option %r" % a)
 
-    faelle = lade_faelle(xml_modus)
-    roh, plan = auftraege(faelle)
-    p = subprocess.run([binary], input=roh, stdout=subprocess.PIPE)
-    zeilen = p.stdout.decode("ascii", "replace").splitlines()
-    if len(zeilen) != len(plan):
+    cases = load_cases(xml_mode)
+    raw, plan = jobs(cases)
+    p = subprocess.run([binary], input=raw, stdout=subprocess.PIPE)
+    lines = p.stdout.decode("ascii", "replace").splitlines()
+    if len(lines) != len(plan):
         print(
-            "FEHLER: %d Antwortzeilen fuer %d Auftraege — das Binary ist "
-            "abgebrochen (Exit %d)" % (len(zeilen), len(plan), p.returncode)
+            "ERROR: %d answer lines for %d jobs -- the binary has "
+            "stopped (exit %d)" % (len(lines), len(plan), p.returncode)
         )
-        # Alles, was fehlt, gilt als Fehlschlag: mit leeren Zeilen auffuellen.
-        zeilen += ["[]"] * (len(plan) - len(zeilen))
+        # Everything that is missing counts as a failure: pad with empty lines.
+        lines += ["[]"] * (len(plan) - len(lines))
 
-    # Zwei Bilanzen: ohne und mit Vergleich der Parse-Fehler.
-    ok_ohne = [True] * len(faelle)
-    ok_mit = [True] * len(faelle)
-    grund = [None] * len(faelle)
-    grund_mit = [None] * len(faelle)
-    for (k, st), zeile in zip(plan, zeilen):
-        teile = zeile.split("\t")
+    # Two balances: without and with a comparison of the parse errors.
+    ok_without = [True] * len(cases)
+    ok_with = [True] * len(cases)
+    reason = [None] * len(cases)
+    reason_with = [None] * len(cases)
+    for (k, st), line in zip(plan, lines):
+        parts = line.split("\t")
         try:
-            got = json.loads(teile[0])
+            got = json.loads(parts[0])
         except ValueError:
-            got = ["<unlesbar>"]
+            got = ["<unreadable>"]
         try:
-            got_fehler = json.loads(teile[1]) if len(teile) > 1 else []
+            got_errors = json.loads(parts[1]) if len(parts) > 1 else []
         except ValueError:
-            got_fehler = [{"code": "<unlesbar>"}]
+            got_errors = [{"code": "<unreadable>"}]
         if got == ["NICHT-UNTERSTUETZT"]:
-            if ok_ohne[k]:
-                grund[k] = "zustand nicht umgesetzt"
-            if ok_mit[k]:
-                grund_mit[k] = "zustand nicht umgesetzt"
-            ok_ohne[k] = False
-            ok_mit[k] = False
+            if ok_without[k]:
+                reason[k] = "state not implemented"
+            if ok_with[k]:
+                reason_with[k] = "state not implemented"
+            ok_without[k] = False
+            ok_with[k] = False
             continue
-        if normalisiere(got) != faelle[k][4]:
-            if ok_ohne[k]:
-                grund[k] = "ausgabe weicht ab (%s)" % st
-            if ok_mit[k]:
-                grund_mit[k] = "ausgabe weicht ab (%s)" % st
-            ok_ohne[k] = False
-            ok_mit[k] = False
+        if normalise(got) != cases[k][4]:
+            if ok_without[k]:
+                reason[k] = "output differs (%s)" % st
+            if ok_with[k]:
+                reason_with[k] = "output differs (%s)" % st
+            ok_without[k] = False
+            ok_with[k] = False
             continue
-        if got_fehler != faelle[k][8]:
-            if ok_mit[k]:
-                grund_mit[k] = "fehlerliste weicht ab (%s): %s statt %s" % (
-                    st, json.dumps(got_fehler), json.dumps(faelle[k][8])
+        if got_errors != cases[k][8]:
+            if ok_with[k]:
+                reason_with[k] = "error list differs (%s): %s instead of %s" % (
+                    st, json.dumps(got_errors), json.dumps(cases[k][8])
                 )
-            ok_mit[k] = False
+            ok_with[k] = False
 
-    ok_je_fall = ok_mit if mit_fehlern else ok_ohne
-    if mit_fehlern:
-        grund = grund_mit
+    ok_per_case = ok_with if with_errors else ok_without
+    if with_errors:
+        reason = reason_with
 
-    je_datei = {}
-    for k, f in enumerate(faelle):
-        d = je_datei.setdefault(f[0], [0, 0, 0])
+    per_file = {}
+    for k, f in enumerate(cases):
+        d = per_file.setdefault(f[0], [0, 0, 0])
         d[1] += 1
-        if ok_ohne[k]:
+        if ok_without[k]:
             d[0] += 1
-        if ok_mit[k]:
+        if ok_with[k]:
             d[2] += 1
 
-    gesamt = len(faelle)
-    bestanden = sum(1 for x in ok_je_fall if x)
-    bestanden_ohne = sum(1 for x in ok_ohne if x)
-    bestanden_mit = sum(1 for x in ok_mit if x)
-    kopf = " (gewaehlt: mit Fehlercodes)" if mit_fehlern else " (gewaehlt: ohne Fehlercodes)"
-    print("Datei                       ohne Fehlercodes     mit Fehlercodes" + kopf)
+    total = len(cases)
+    passed = sum(1 for x in ok_per_case if x)
+    passed_without = sum(1 for x in ok_without if x)
+    passed_with = sum(1 for x in ok_with if x)
+    head = " (chosen: with error codes)" if with_errors else " (chosen: without error codes)"
+    print("file                        without error codes  with error codes" + head)
     print("-" * 78)
-    for name in sorted(je_datei):
-        p_, g_, m_ = je_datei[name]
+    for name in sorted(per_file):
+        p_, g_, m_ = per_file[name]
         print("%-26s %5d / %5d %6.2f %%   %5d / %5d %6.2f %%"
               % (name, p_, g_, 100.0 * p_ / g_, m_, g_, 100.0 * m_ / g_))
     print("-" * 78)
     print("%-26s %5d / %5d %6.2f %%   %5d / %5d %6.2f %%"
-          % ("GESAMT", bestanden_ohne, gesamt, 100.0 * bestanden_ohne / gesamt,
-             bestanden_mit, gesamt, 100.0 * bestanden_mit / gesamt))
+          % ("TOTAL", passed_without, total, 100.0 * passed_without / total,
+             passed_with, total, 100.0 * passed_with / total))
 
-    if zeige:
-        print("\nErste %d Fehlschlaege:" % zeige)
+    if show:
+        print("\nfirst %d failures:" % show)
         n = 0
-        for k, f in enumerate(faelle):
-            if ok_je_fall[k]:
+        for k, f in enumerate(cases):
+            if ok_per_case[k]:
                 continue
-            print("  %s #%d  %s  [%s]" % (f[0], f[1], f[2][:60], grund[k]))
+            print("  %s #%d  %s  [%s]" % (f[0], f[1], f[2][:60], reason[k]))
             n += 1
-            if n >= zeige:
+            if n >= show:
                 break
 
     if json_out:
@@ -268,21 +268,21 @@ def main():
             json.dump(
                 {
                     "suite": "html5lib-tokenizer",
-                    "total": gesamt,
-                    "passed": bestanden,
-                    "failed": gesamt - bestanden,
-                    "rate": bestanden / gesamt,
-                    "xml_modus": xml_modus,
-                    "mit_fehlern": mit_fehlern,
-                    "passed_ohne_fehler": bestanden_ohne,
-                    "passed_mit_fehlern": bestanden_mit,
+                    "total": total,
+                    "passed": passed,
+                    "failed": total - passed,
+                    "rate": passed / total,
+                    "xml_mode": xml_mode,
+                    "with_errors": with_errors,
+                    "passed_without_errors": passed_without,
+                    "passed_with_errors": passed_with,
                     "files": {
                         k: {
                             "passed": v[0],
                             "total": v[1],
-                            "passed_mit_fehlern": v[2],
+                            "passed_with_errors": v[2],
                         }
-                        for k, v in je_datei.items()
+                        for k, v in per_file.items()
                     },
                 },
                 fh,
