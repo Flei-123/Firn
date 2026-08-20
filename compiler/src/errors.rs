@@ -18,7 +18,7 @@
 //! IoError!i32        -> struct { __err: u32, __val: i32 }     (0 = success)
 //! ```
 //!
-//! Technically one error union is therefore a plain struct at
+//! Technically an error union is therefore an ordinary struct in
 //! `types::TypeCtx`: aggregate return (`abi.rs`), System V ABI, register
 //! allocation and codegen carry it without any change. The side table
 //! `union_by_struct` plays the same role as `enum_by_struct` does for
@@ -37,12 +37,12 @@ use crate::parser::Parser;
 use crate::sema::Checker;
 use crate::types::Type;
 
-/// Internal call label of a `try` expression. It holds `#`, so it can never
-/// be some identifier out of the source text.
+/// Internal call name of a `try` expression. It contains `#`, so it can
+/// never be an identifier out of the source text.
 pub(crate) const TRY_NAME: &str = "__try#";
-/// Internal call label of a `catch` expression.
+/// Internal call name of a `catch` expression.
 pub(crate) const CATCH_NAME: &str = "__catch#";
-/// Prefix of the placeholder type label between parser and type checker.
+/// Prefix of the placeholder type name between parser and type checker.
 const TY_PREFIX: &str = "__eu#";
 
 // ----------------------------------------------------------------- Data model
@@ -51,7 +51,7 @@ const TY_PREFIX: &str = "__eu#";
 struct ErrSet {
     name: String,
     span: Span,
-    /// variant labels by declaration order; code = index + 1.
+    /// variant names in declaration order; code = index + 1.
     variants: Vec<String>,
     /// index into `TypeCtx::structs` (`usize::MAX` while not registered)
     struct_idx: usize,
@@ -61,7 +61,7 @@ struct ErrSet {
 #[derive(Clone, Debug)]
 pub(crate) struct UnionInfo {
     pub(crate) set: String,
-    /// index of the struct at `types::TypeCtx`
+    /// index of the struct in `types::TypeCtx`
     pub(crate) struct_idx: usize,
     pub(crate) val_ty: Type,
     pub(crate) val_off: u64,
@@ -69,7 +69,7 @@ pub(crate) struct UnionInfo {
     pub(crate) align: u64,
 }
 
-/// Which implicit conversion is needed at a `return`/`let`/assignment spot
+/// Which implicit conversion is needed at a `return`/`let`/assignment place
 /// (SPEC §5.1: no `ok(...)` ceremony).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CoerceKind {
@@ -87,9 +87,9 @@ pub(crate) struct CoerceInfo {
 
 #[derive(Clone, Debug)]
 pub(crate) struct TryInfo {
-    /// Error union of the operand. The error union of the surrounding function
-    /// is not needed by the lowering: it is settled as the return type of the
-    /// function (`Lower::sret`), checked it gets at `check_try`.
+    /// Error union of the operand. The lowering does not need the error union
+    /// of the surrounding function: that one is settled as the return type of
+    /// the function (`Lower::sret`), and it is checked in `check_try`.
     pub(crate) inner: UnionInfo,
 }
 
@@ -106,9 +106,9 @@ struct Registry {
     pending: Vec<(String, Span, TypeExpr)>,
     unions: Vec<UnionInfo>,
     by_struct: HashMap<usize, usize>,
-    /// struct index of one error set -> index into `sets`
+    /// struct index of an error set -> index into `sets`
     set_by_struct: HashMap<usize, usize>,
-    /// `catch |e| …` — label of the binding per `catch` expression
+    /// `catch |e| …` — name of the binding per `catch` expression
     catch_bind: HashMap<ExprId, String>,
     coerce: HashMap<ExprId, CoerceInfo>,
     tries: HashMap<ExprId, TryInfo>,
@@ -117,13 +117,13 @@ struct Registry {
 
 thread_local! {
     static REG: RefCell<Registry> = RefCell::new(Registry::default());
-    /// Is `sema::collect_structs` running right now? Struct layouts are not yet
-    /// computed there, so one error union over a struct could not be laid out
-    /// correctly (see `hook_struct_phase`).
+    /// Is `sema::collect_structs` running right now? Struct layouts are not
+    /// yet computed there, so an error union over a struct could not be laid
+    /// out correctly (see `hook_struct_phase`).
     static IN_STRUCTS: RefCell<bool> = const { RefCell::new(false) };
 }
 
-/// `// HOOK fehlerunionen` within `sema::collect_structs`: marks the phase at
+/// `// HOOK fehlerunionen` in `sema::collect_structs`: marks the phase in
 /// which the struct layouts are not settled yet.
 pub(crate) fn hook_struct_phase(active: bool) {
     IN_STRUCTS.with(|f| *f.borrow_mut() = active);
@@ -133,7 +133,7 @@ fn in_struct_phase() -> bool {
     IN_STRUCTS.with(|f| *f.borrow())
 }
 
-/// Does `t` hold a struct by value (pointers interrupt)?
+/// Does `t` contain a struct by value (pointers interrupt)?
 fn contains_struct(t: &Type) -> bool {
     match t {
         Type::Struct(_) => true,
@@ -151,12 +151,12 @@ fn set_index(name: &str) -> Option<usize> {
     REG.with(|r| r.borrow().by_name.get(name).copied())
 }
 
-/// Is this label a declared error set?
+/// Is this name a declared error set?
 pub(crate) fn is_error_set_name(name: &str) -> bool {
     set_index(name).is_some()
 }
 
-/// Code of one error variant (from 1 upwards), if it exists.
+/// Code of an error variant (from 1 upwards), if it exists.
 pub(crate) fn variant_code(set: &str, variant: &str) -> Option<i128> {
     REG.with(|r| {
         let reg = r.borrow();
@@ -184,12 +184,12 @@ pub(crate) fn union_by_struct(idx: usize) -> Option<UnionInfo> {
     })
 }
 
-/// Is this the internal label of a `try` or `catch` expression?
+/// Is this the internal name of a `try` or `catch` expression?
 pub(crate) fn is_result_call(name: &str) -> bool {
     name == TRY_NAME || name == CATCH_NAME
 }
 
-/// Success type of one error union (for the preview at `sema::probe_d`).
+/// Success type of an error union (for the preview in `sema::probe_d`).
 pub(crate) fn success_type(t: &Type) -> Option<Type> {
     union_of(t).map(|u| u.val_ty)
 }
@@ -225,7 +225,7 @@ pub(crate) fn try_of(id: ExprId) -> Option<TryInfo> {
     REG.with(|r| r.borrow().tries.get(&id).cloned())
 }
 
-/// Type of one error set (the pure error value).
+/// Type of an error set (the pure error value).
 fn set_type(name: &str) -> Option<Type> {
     REG.with(|r| {
         let reg = r.borrow();
@@ -238,12 +238,12 @@ fn set_type(name: &str) -> Option<Type> {
     })
 }
 
-/// Label of the error binding of a `catch |e| …`.
+/// Name of the error binding of a `catch |e| …`.
 pub(crate) fn catch_bind(id: ExprId) -> Option<String> {
     REG.with(|r| r.borrow().catch_bind.get(&id).cloned())
 }
 
-/// Label of the error set when `t` is a pure error value.
+/// Name of the error set when `t` is a pure error value.
 pub(crate) fn error_set_of(t: &Type) -> Option<String> {
     set_name_of(t)
 }
@@ -328,7 +328,7 @@ impl<'a> Parser<'a> {
     }
 }
 
-/// `// HOOK fehlerunionen` within `parser.rs::program` — `error` declaration.
+/// `// HOOK fehlerunionen` in `parser.rs::program` — `error` declaration.
 pub(crate) fn hook_item(p: &mut Parser) -> bool {
     if matches!(p.kind(), TokKind::KwError) {
         p.errors_decl();
@@ -337,8 +337,8 @@ pub(crate) fn hook_item(p: &mut Parser) -> bool {
     false
 }
 
-/// `// HOOK fehlerunionen` within `parser.rs::parse_type_inner` — `E!T`.
-/// The label is consumed already, `sp` is its position.
+/// `// HOOK fehlerunionen` in `parser.rs::parse_type_inner` — `E!T`.
+/// The name is consumed already, `sp` is its position.
 pub(crate) fn hook_type(p: &mut Parser, name: &str, sp: Span) -> Option<TypeExpr> {
     if !matches!(p.kind(), TokKind::Not) {
         return None;
@@ -355,7 +355,7 @@ pub(crate) fn hook_type(p: &mut Parser, name: &str, sp: Span) -> Option<TypeExpr
     Some(TypeExpr::Named(format!("{}{}", TY_PREFIX, idx), span))
 }
 
-/// `// HOOK fehlerunionen` within `parser.rs::primary` — `try expression`.
+/// `// HOOK fehlerunionen` in `parser.rs::primary` — `try expression`.
 pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
     if !matches!(p.kind(), TokKind::KwTry) {
         return None;
@@ -366,7 +366,7 @@ pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
     Some(p.mk(span, ExprKind::Call(TRY_NAME.to_string(), vec![inner], span)))
 }
 
-/// `// HOOK fehlerunionen` within `parser.rs::expr` — `expression catch alt`.
+/// `// HOOK fehlerunionen` in `parser.rs::expr` — `expression catch alt`.
 /// Binds weaker than every operator and is left associative.
 pub(crate) fn hook_catch(p: &mut Parser, mut lhs: Expr) -> Expr {
     while matches!(p.kind(), TokKind::KwCatch) {
@@ -395,7 +395,7 @@ pub(crate) fn hook_catch(p: &mut Parser, mut lhs: Expr) -> Expr {
     lhs
 }
 
-/// Assignment compatibility as at `sema.rs` (private there): equal types,
+/// Assignment compatibility as in `sema.rs` (private there): equal types,
 /// for pointers without regard to the `mut` marking.
 fn compatible(a: &Type, b: &Type) -> bool {
     if a.is_error() || b.is_error() {
@@ -409,7 +409,7 @@ fn compatible(a: &Type, b: &Type) -> bool {
 
 // ------------------------------------------- Registration at the type context
 
-/// `// HOOK fehlerunionen` within `sema::run` (before `collect_structs`):
+/// `// HOOK fehlerunionen` in `sema::run` (before `collect_structs`):
 /// registers every error set as a struct `{ __err: u32 }`.
 pub(crate) fn declare_error_sets(ck: &mut Checker) {
     let n = REG.with(|r| r.borrow().sets.len());
@@ -437,7 +437,7 @@ pub(crate) fn declare_error_sets(ck: &mut Checker) {
     }
 }
 
-/// `// HOOK fehlerunionen` within `sema::resolve_ty_d`: resolves `E!T` and
+/// `// HOOK fehlerunionen` in `sema::resolve_ty_d`: resolves `E!T` and
 /// creates the struct of the error union when needed.
 pub(crate) fn hook_resolve_ty(ck: &mut Checker, te: &TypeExpr) -> Option<Type> {
     let (name, span) = match te {
@@ -466,9 +466,9 @@ pub(crate) fn hook_resolve_ty(ck: &mut Checker, te: &TypeExpr) -> Option<Type> {
         return Some(Type::Error);
     }
     if in_struct_phase() && contains_struct(&val_ty) {
-        // While `collect_structs` runs the struct layouts are not settled yet;
-        // the error union would get a wrong size. Better a clear error than a
-        // silent wrong layout (SPEC §14.1.fehlerunionen F10).
+        // While `collect_structs` runs, the struct layouts are not settled
+        // yet; the error union would get a wrong size. Better a clear error
+        // than a silent wrong layout (SPEC §14.1.fehlerunionen F10).
         ck.dg.error_note(
             span,
             format!(
@@ -483,7 +483,7 @@ pub(crate) fn hook_resolve_ty(ck: &mut Checker, te: &TypeExpr) -> Option<Type> {
 }
 
 /// Create or reuse the error union `set!val_ty` — for modules that produce
-/// one error union without it standing within the source text (`gc.rs`:
+/// an error union without it standing in the source text (`gc.rs`:
 /// `gc C{…}` yields `AllocError!Gc[C]`). `None` when the error set does
 /// not exist.
 pub(crate) fn union_type(ck: &mut Checker, set: &str, val_ty: &Type) -> Option<Type> {
@@ -533,7 +533,7 @@ fn get_or_create_union(ck: &mut Checker, set: &str, val_ty: &Type) -> Type {
 
 // --------------------------------------------------------------- Type check
 
-/// `// HOOK fehlerunionen` within `sema::call`: `try`, `catch` and
+/// `// HOOK fehlerunionen` in `sema::call`: `try`, `catch` and
 /// `ErrorSet::Variant`. Yields `None` when it is none of those.
 pub(crate) fn hook_call(
     ck: &mut Checker,
@@ -664,7 +664,7 @@ fn check_catch(ck: &mut Checker, id: ExprId, args: &[Expr]) -> Type {
         }
     };
     let want = inner.val_ty.clone();
-    // `catch |e| alt`: the error value is visible within the alternative.
+    // `catch |e| alt`: the error value is visible in the alternative.
     let bind = catch_bind(id);
     if let Some(name) = &bind {
         let set_ty = match set_type(&inner.set) {
@@ -693,7 +693,7 @@ fn check_catch(ck: &mut Checker, id: ExprId, args: &[Expr]) -> Type {
     want
 }
 
-/// `// HOOK fehlerunionen` within `sema::binary`: `e == E::NotFound` compares
+/// `// HOOK fehlerunionen` in `sema::binary`: `e == E::NotFound` compares
 /// two error values of the same set. Yields `None` when it is no such
 /// comparison — the ordinary check runs then.
 pub(crate) fn hook_binary(
@@ -732,8 +732,8 @@ pub(crate) fn hook_binary(
     }
 }
 
-/// Type of one expression as far as it shows WITHOUT a check: error
-/// variant or a variable that carries some error set type already.
+/// Type of an expression as far as it is recognizable WITHOUT a check: an
+/// error variant or a variable that already carries an error set type.
 fn quiet_set(ck: &Checker, e: &Expr) -> Option<String> {
     match &e.kind {
         ExprKind::Call(name, _, _) => {
@@ -752,8 +752,8 @@ fn quiet_set(ck: &Checker, e: &Expr) -> Option<String> {
     }
 }
 
-/// `// HOOK fehlerunionen` within `sema::check_stmt` (`return`, `let`,
-/// assignment): implicit conversion into one error union. Yields `false` when
+/// `// HOOK fehlerunionen` in `sema::check_stmt` (`return`, `let`,
+/// assignment): implicit conversion into an error union. Yields `false` when
 /// `want` is no error union — the ordinary check runs then.
 pub(crate) fn hook_coerce(ck: &mut Checker, e: &Expr, want: &Type) -> bool {
     let u = match union_of(want) {
