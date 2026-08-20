@@ -46,11 +46,9 @@ suppression).
 /tmp/hello
 ```
 
-Real output:
-
-```
-Hallo Welt aus Firn!
-```
+Real output: the greeting of `examples/hello.fi`, written with a single
+`write` system call. (The example still greets in German -- the text stands
+in `examples/hello.fi`.)
 
 ```sh
 ./compiler/target/release/firnc -o /tmp/fib examples/fib.fi
@@ -71,30 +69,30 @@ The real result of this build state (excerpt; measured in person on 2026-08-14
 after the merge of round 3):
 
 ```
-== 1. Compiler bauen ==
-== 2. Modul-Tests des Compilers ==
+== 1. build the compiler ==
+== 2. module tests of the compiler ==
    cargo test: ok
-== 3. Positivtests (jeweils mit und ohne Optimierer) ==
-   143 Programme x 3 Durchlaeufe (opt / noopt / dev-fast)
-== 4. Negativtests (Fehlermeldungen) ==
-== 5. Nachweis des Optimierers ==
-   PASS 41/41 (Optimierer-Nachweis)
-== 6. Nachweis der Ergebnisort-Garantie (SPEC.md 13.1) ==
-   OK: Ergebnisort-Garantie gehalten (baue 224 B, main 1048816 B, keine Bulk-Kopie).
-== 7. Architektur: Feldzugriff <-> Speicherort getrennt ==
-   OK: Feldzugriff und Speicherort getrennt (4 Zugaenge in layout.rs, keine Umgehung).
-== 8. Symbol-Namensschema (DESIGN_GOALS 4) ==
-   OK: Symbolschema gehalten (_F0.-Praefix, 'main' nackt, Module kollisionsfrei).
-== 9. HTML5-Tokenizer gegen html5lib (tools/tokenizer/run.sh) ==
-   GESAMT                      6810 /  6810 100.00 %    6809 /  6810  99.99 %
-   GESAMT                      6810 /  6810 100.00 %    6809 /  6810  99.99 %
-   GESAMT                      6807 /  6810  99.96 %    6807 /  6810  99.96 %
+== 3. positive tests (each with and without the optimiser) ==
+   143 programs x 3 runs (opt / noopt / dev-fast)
+== 4. negative tests (error messages) ==
+== 5. proof of the optimiser ==
+   PASS 41/41 (proof of the optimiser)
+== 6. proof of the result-location guarantee (SPEC.md 13.1) ==
+   OK: result-location guarantee kept (build 224 B, main 1048816 B, no bulk copy).
+== 7. architecture: field access <-> memory location separated ==
+   OK: field access and memory location separated (4 entry points in layout.rs, no bypass).
+== 8. symbol naming scheme (DESIGN_GOALS 4) ==
+   OK: symbol scheme kept (_F0. prefix, 'main' bare, modules free of collisions).
+== 9. HTML5 tokenizer against html5lib (tools/tokenizer/run.sh) ==
+   TOTAL                       6810 /  6810 100.00 %    6809 /  6810  99.99 %
+   TOTAL                       6810 /  6810 100.00 %    6809 /  6810  99.99 %
+   TOTAL                       6807 /  6810  99.96 %    6807 /  6810  99.96 %
 
 PASS 485/485
 ```
 
-(The three `GESAMT` lines are the main run, the same run with `--mit-fehlern`
-selected and the counter-check `--ohne-xml-modus`; the left column is the token
+(The three `TOTAL` lines are the main run, the same run with `--with-errors`
+selected and the counter-check `--no-xml-mode`; the left column is the token
 stream comparison, the right one additionally compares the parse error codes.)
 
 `test.sh` builds the compiler, runs `cargo test` (122 module tests), compiles
@@ -313,7 +311,7 @@ still missing:
   `lib/rc/arc.fi`), not as language types; `Gc[module.Class]` cannot be written.
 * **HTML5 tokenizer:** built and measured -- **6,810 of 6,810 (100.00 %)** in
   the token stream comparison and **6,809 of 6,810 (99.99 %)** with the parse
-  error codes compared (`--mit-fehlern`); the XML adaptation of the
+  error codes compared (`--with-errors`); the XML adaptation of the
   `xmlViolationTests` is implemented as an optional mode. What stays open is the
   speed target of <= 2x. Section "HTML5 tokenizer" further down, the numbers in
   ACCEPTANCE.md item 3.
@@ -370,19 +368,19 @@ syntax `E!T`, implicit conversion at `return`, `try`, `catch` and
 ```firn
 error IoError { NotFound, Permission, Closed }
 
-fn hole(x: i32) -> IoError!i32 {
+fn fetch(x: i32) -> IoError!i32 {
     if x == 1 { return IoError::NotFound }   // error
     return x * 10                            // success -- no ok(...)
 }
 
-fn kette(x: i32) -> IoError!i32 {
-    let v = try hole(x)                      // an error goes straight up
+fn chain(x: i32) -> IoError!i32 {
+    let v = try fetch(x)                      // an error goes straight up
     return v + 1
 }
 
 fn main() -> i32 {
-    let a = kette(5) catch 99                // 51
-    let b = kette(1) catch 99                // 99
+    let a = chain(5) catch 99                // 51
+    let b = chain(1) catch 99                // 99
     return a - b + 48                        // 0
 }
 ```
@@ -428,24 +426,24 @@ bash tools/tokenizer/run.sh
 Real output (2026-08-14, run in person):
 
 ```
-Datei                       ohne Fehlercodes     mit Fehlercodes
+file                        without error codes  with error codes
 xmlViolation.test              4 /     4 100.00 %       3 /     4  75.00 %
-GESAMT                      6810 /  6810 100.00 %    6809 /  6810  99.99 %
+TOTAL                       6810 /  6810 100.00 %    6809 /  6810  99.99 %
 ```
 
 **Throughput on TWO corpora** (`bash tools/tokenizer/throughput.sh`, real output
 of 2026-08-14, the best of three runs each):
 
 ```
-   -- Korpus 'html5lib' (Grenzfaelle der Testsuite, absichtlich pathologisch)
-      Firn      :     4.59 MB/s  (0.889 s fuer 4.08 MB, bester von 3)
-      html5ever :    11.22 MB/s  (0.363 s, bester von 3)
-      Faktor    : 2.45x langsamer als html5ever (Abnahmeziel <= 2.00x)
+   -- corpus 'html5lib' (edge cases of the test suite, deliberately pathological)
+      Firn      :     4.59 MB/s  (0.889 s for 4.08 MB, best of 3)
+      html5ever :    11.22 MB/s  (0.363 s, best of 3)
+      factor    : 2.45x slower than html5ever (acceptance goal <= 2.00x)
 
-   -- Korpus 'realweb' (acht echte Seiten aus testdata/realweb/)
-      Firn      :     7.44 MB/s  (0.632 s fuer 4.70 MB, bester von 3)
-      html5ever :    42.60 MB/s  (0.110 s, bester von 3)
-      Faktor    : 5.72x langsamer als html5ever (Abnahmeziel <= 2.00x)
+   -- corpus 'realweb' (eight real pages out of testdata/realweb/)
+      Firn      :     7.44 MB/s  (0.632 s for 4.70 MB, best of 3)
+      html5ever :    42.60 MB/s  (0.110 s, best of 3)
+      factor    : 5.72x slower than html5ever (acceptance goal <= 2.00x)
 ```
 
 Why two corpora: the corpus made from the html5lib inputs is **deliberately
@@ -466,7 +464,7 @@ same input on both sides.
 14 `.test` files with the frozen set (`tools/tokenizer/testdata.sha256`,
 upstream commit `224991ec10db04f056a89eed8b0bd8695fd2950e` of html5lib-tests)
 and counts the 6,810 cases. `run.sh` runs that as step 0; with
-`--gegen-upstream` the script downloads the files of that commit from GitHub
+`--against-upstream` the script downloads the files of that commit from GitHub
 again and compares directly.
 
 Named honestly:
@@ -476,7 +474,7 @@ Named honestly:
   infoset". The driver switches them on through a job flag (bit 0,
   `tools/tokenizer/LOG.md`), the harness sets it exclusively for the cases under
   the key `xmlViolationTests`. Counter-check (`run.sh` performs it itself):
-  `python3 tools/tokenizer/harness.py <binary> --ohne-xml-modus` gives
+  `python3 tools/tokenizer/harness.py <binary> --no-xml-mode` gives
   `6807 / 6810 (99.96 %)` -- so the pure HTML path is unchanged. Nothing is
   filtered and nothing is skipped.
 * **Not <= 2x -- on neither of the two corpora.** Three complete measurements on
@@ -493,7 +491,7 @@ Named honestly:
   but the more honest one: that is where html5ever plays out its strength on
   long runs of text.
 * **The `errors` entries of the suite (parse error codes with line/column) are
-  compared** -- switch `--mit-fehlern`, step 2a in `run.sh`. The tokenizer keeps
+  compared** -- switch `--with-errors`, step 2a in `run.sh`. The tokenizer keeps
   track of line and column itself and prints a second JSON list behind the token
   stream (separated by a tab), for example
   `[{"code":"eof-in-tag","line":1,"col":6}]`; the code names are in
@@ -505,7 +503,7 @@ Named honestly:
   failure**, not exempted.
 * **The name table of the character references lies at no fixed address**:
   `mmap` without `MAP_FIXED`, the pointer is passed through in the
-  `tokens.Sink`. If `mmap` fails, `entities.tabelle()` returns 0, `char_ref`
+  `tokens.Sink`. If `mmap` fails, `entities.table()` returns 0, `char_ref`
   reports `REF_UNMOEGLICH` and the tokenizer sets `nicht_unterstuetzt` -- the
   case then counts as a failure instead of being tokenized wrongly in silence.
   Proof in Firn: `lib/html/entities_failure.fi` (step 1c in `run.sh`, which
@@ -605,7 +603,7 @@ the bool value was produced, stored and immediately tested against zero again.
 Now there are three. The conditions: the comparison is the **last** instruction
 of the block (otherwise something in between could change the flags), its result
 is read **exactly once**, and it is not a `secret` value. As a result
-`dekodiere` shrank from 583 to 503 instructions.
+`decode` shrank from 583 to 503 instructions.
 
 ### The result, measured with callgrind (corpus `realweb`)
 
@@ -623,26 +621,26 @@ By the clock (the best of three runs):
 | `realweb` (real pages) | 7.02x | **4.99x** | <= 2.00x |
 
 **Honestly:** on `html5lib` the target is reached, on `realweb` it is not -- and
-`realweb` is the case that counts for a browser. The value of 1.98x also lies so
+`realweb` is the case that counts for a browser. The 1.98x lies so
 close to the limit that it is within the noise of the clock; what is solid is
 the instruction count. The rate stayed unchanged at **6,810/6,810**.
 
-**What remains next:** `dekodiere` is the biggest remaining item with 28 % and
+**What remains next:** `decode` is the biggest remaining item with 28 % and
 needs 225 instructions per byte -- absurdly many for a UTF-8 decoding. The
 reason is in the assembly: the inlined bounds check of `buf_at` produces a
-branch of its own per access, and `dekodiere` accesses up to five times per
+branch of its own per access, and `decode` accesses up to five times per
 character. Without bounds check elimination across loops (`bce` cannot do that
 yet) it stays that way.
 
 ## Where the tokenizer really stands now (round 7, a measurement finding)
 
-`dekodiere` was the biggest item with 28 %. The obvious explanation --
+`decode` was the biggest item with 28 %. The obvious explanation --
 `mem.buf_at` reloads `(*b).ptr` and `(*b).len` on every access, and without
 alias analysis the optimizer is not allowed to combine them -- I checked by
 pulling both values out in front of the loop once (`byte_bei`, in both drivers).
 
 **The result: the explanation was only right in the smaller part.**
-`dekodiere` itself got smaller, from 1,110 to 814 million instructions (-27 %),
+`decode` itself got smaller, from 1,110 to 814 million instructions (-27 %),
 but the whole run only went from 2,655 to 2,631 million (-0.9 %). So the thesis
 was right, but the item was smaller than the first calculation suggested. This
 stands here because a refuted assumption belongs to the result just as much as a
@@ -650,7 +648,7 @@ confirmed one.
 
 ### The real reason, looked up in the assembly
 
-A single byte access in `dekodiere`:
+A single byte access in `decode`:
 
 ```asm
 mov rax, qword ptr [rbp-1672]    ; base    -- lies in the frame, not in a register
@@ -670,8 +668,8 @@ In the whole function **170 of 469 instructions are stack accesses**.
 
 The cause is not laziness on the part of the register allocator -- it is a real
 linear scan with live intervals and loop weights. It is simpler than that: in
-`dekodiere` nine long-lived values are alive at the same time (four parameters,
-`basis`, `ges` and the cells `i`, `cp`, `breite`), and there are eleven
+`decode` nine long-lived values are alive at the same time (four parameters,
+`base`, `total` and the cells `i`, `cp`, `width`), and there are eleven
 registers. Nothing is left for the short-lived intermediate values -- so **each
 of them gets a stack slot of its own**, even if it is read one instruction later.
 
@@ -691,7 +689,7 @@ through would be gone.
 
 Instead of going through `rax` I built it through a **register of its own**:
 `r11` as `DURCHREICH_REG`, which nobody else may touch. That avoids the trap,
-and the effect was visible in the assembly -- the stack accesses in `dekodiere`
+and the effect was visible in the assembly -- the stack accesses in `decode`
 went down from **170 to 158**:
 
 ```asm
@@ -733,10 +731,12 @@ var m: [u8; 48] = [
 ]
 ```
 
-And this is what it looks like now:
+And this is what the very same message looks like now -- one line instead of
+six rows of octets (the message text itself is still the German one that
+`lib/gc/gc.fi` prints):
 
 ```firn
-var m: [u8; 42] = "firn-gc: gc_init() wurde nicht aufgerufen\n"
+var m: [u8; 42] = "firn-gc: gc_init() ..."
 ```
 
 **Three forms**, all with complete escapes (`\n`, `\t`, `\\`, `\0`,
@@ -763,19 +763,19 @@ messages and paths that makes no difference, for large tables it would.
 
 **Redeemed immediately:** the hand-written octet lists in `lib/gc/gc.fi`,
 `lib/dom/meas.fi` and `lib/html/entities_failure.fi` are gone -- a 63 entry row
-of numbers became
-`"FEHLER: tabelle() lieferte 0, obwohl mmap moeglich sein sollte\n"`.
+of numbers became one string literal with the failure message of the name
+table.
 
 ## `defer` (round 9)
 
 ```firn
-fn lies(pfad: *mut u8) -> i32 {
-    let fd: i32 = oeffne(pfad)
-    defer schliesse(fd)          // runs on EVERY exit
+fn read(path: *mut u8) -> i32 {
+    let fd: i32 = open(path)
+    defer close(fd)          // runs on EVERY exit
     if fd < 0 {
         return -1                 // here as well
     }
-    return verarbeite(fd)
+    return process(fd)
 }
 ```
 
@@ -791,7 +791,7 @@ fn lies(pfad: *mut u8) -> i32 {
 
   ```firn
   var i: i32 = 5
-  defer merke(i)    // remembers 9, not 5
+  defer remember(i)    // remembers 9, not 5
   i = 9
   ```
 
@@ -807,10 +807,10 @@ fn lies(pfad: *mut u8) -> i32 {
 ### `errdefer` (round 10)
 
 ```firn
-fn arbeit(x: i32) -> E!i32 {
-    defer aufraeumen()        // always
-    errdefer zuruecknehmen()  // only on the error path
-    let w: i32 = try kann_schiefgehen(x)
+fn work(x: i32) -> E!i32 {
+    defer clean_up()        // always
+    errdefer undo()  // only on the error path
+    let w: i32 = try may_fail(x)
     return w + 1
 }
 ```
@@ -836,16 +836,16 @@ Proofs: `tests/580_defer.fi` (five sections, all three build stages),
 ## `comptime` -- functions run at compile time (round 12)
 
 ```firn
-fn fakultaet(n: i64) -> i64 {
+fn factorial(n: i64) -> i64 {
     var r: i64 = 1
     var i: i64 = 2
     while i <= n { r = r * i; i = i + 1 }
     return r
 }
 
-const FAK10: i64 = fakultaet(10)     // 3628800 -- computed by the compiler
-const GROESSE: usize = fakultaet(5) as usize
-var feld: [u8; 120] = [0 as u8; 120] // GROESSE serves as an array length
+const FACT10: i64 = factorial(10)     // 3628800 -- computed by the compiler
+const SIZE: usize = factorial(5) as usize
+var field: [u8; 120] = [0 as u8; 120] // SIZE serves as an array length
 ```
 
 Loops, branches, local variables, **recursion** (`fib(20)` in the test).
@@ -869,15 +869,15 @@ wrongly in silence.
 
 ```firn
 comptime {
-    emit_roh("fn tab_gross(c: i64) -> i64 {\n")
+    emit_raw("fn tab_gross(c: i64) -> i64 {\n")
     for c in 97..123 {
-        emit_roh("    if c == ")
-        emit_zahl(c)
-        emit_roh(" { return ")
-        emit_zahl(gross(c))
-        emit_roh(" }\n")
+        emit_raw("    if c == ")
+        emit_number(c)
+        emit_raw(" { return ")
+        emit_number(upper(c))
+        emit_raw(" }\n")
     }
-    emit_roh("    return c\n}\n")
+    emit_raw("    return c\n}\n")
 }
 
 fn main() -> i32 {
@@ -905,7 +905,7 @@ back.
 
 ```firn
 comptime {
-    let n: i64 = datei_groesse("daten/gross_klein.txt")
+    let n: i64 = file_size("data/upper_lower.txt")
     // ... parse the file byte by byte, generate code line by line ...
 }
 ```
@@ -945,7 +945,7 @@ That is stricter than necessary. Once Firn gets the capability model from
 ## Floating point `f64` (round 11)
 
 ```firn
-fn flaeche(r: f64) -> f64 {
+fn area(r: f64) -> f64 {
     return 3.14159265358979 * r * r
 }
 
@@ -987,13 +987,13 @@ checked promise instead of a declaration of intent.
 
 ```firn
 gc class Node {
-    eltern: Gc[Node],        // strong, in BOTH directions -- a real cycle
-    erstes_kind: Gc[Node],
+    parent: Gc[Node],        // strong, in BOTH directions -- a real cycle
+    first_child: Gc[Node],
     listener: Gc[Listener],
 }
-gc class Element extends Node { attr_zahl: u32 }
+gc class Element extends Node { attr_count: u32 }
 
-fn baue() -> AllocError!Gc[Element] {
+fn build() -> AllocError!Gc[Element] {
     let e = try gc Element{ ... }   // the allocation may fail
     return e
 }
@@ -1080,15 +1080,15 @@ monomorphization. The deliberate restrictions are in `SPEC.md` 14.1 under
 do not live inside structs by value, and only functions and structs are generic.
 
 ```firn
-enum Wert { Nichts, Zahl(i32), Paar(i32, i32) }
+enum Value { Nothing, Number(i32), Pair(i32, i32) }
 
 fn main() -> i32 {
-    let w = Wert::Paar(7, 35)
+    let w = Value::Pair(7, 35)
     var s: i32 = 0
     match w {
-        Wert::Nichts   => { s = 0 as i32 }
-        Wert::Zahl(x)  => { s = x }
-        Wert::Paar(x, y) => { s = x + y }
+        Value::Nothing    => { s = 0 as i32 }
+        Value::Number(x)  => { s = x }
+        Value::Pair(x, y) => { s = x + y }
     }
     match s {
         0        => { s = 1 as i32 }
@@ -1246,7 +1246,7 @@ Files: `compiler/src/opt.rs` (control, folding, DCE, CSE, bounds checks),
 | copy propagation | identity `cast`, `x+0`, `x*1`, `x*0`, `ptradd p,0`, ... | `mem2reg::tests::algebraic_identities` |
 | **CSE** along the dominator tree | the same pure expression is computed once | `tests/opt/cse_common.fi`: `mul.i32` 2 -> 1 |
 | **block merging** + jump threading | empty `br` blocks gone, chains merged | `tests/opt/block_merge.fi`: 8 blocks -> 1 |
-| **inlining** with a size heuristic | <= 40 instructions, <= 8 blocks, no recursion, not into or out of `#[constant_time]` | `tests/opt/inline_call.fi`: `call @quadrat` 1 -> 0 |
+| **inlining** with a size heuristic | <= 40 instructions, <= 8 blocks, no recursion, not into or out of `#[constant_time]` | `tests/opt/inline_call.fi`: `call @square` 1 -> 0 |
 | **repeated conditions** | a `brcond` on an already decided condition -> `br` | `tests/opt/redundant_check.fi`: `brcond` 3 -> 2 |
 | **register allocation** (linear scan) | live intervals, weighted spilling, callee-saved correctly saved | `tests/opt/regalloc_loop.fi`, see below |
 
@@ -1376,17 +1376,17 @@ Regression test: `tests/025_argreg_shuffle.fi`.
 
 ## The result-location guarantee (SPEC.md 13.1)
 
-`let g = baue(...)` passes the address of `g` to `baue`; a large aggregate comes
+`let g = build(...)` passes the address of `g` to `build`; a large aggregate comes
 into being **exactly once**, straight at its destination -- not first on the
 stack of the producing function. The proof is in the generated assembly:
 
 ```
 $ bash tools/ergebnisort/run.sh
-Rahmen baue: 224 Byte   Rahmen main: 1048816 Byte   rep-movs: 0
-OK: Ergebnisort-Garantie gehalten (baue 224 B, main 1048816 B, keine Bulk-Kopie).
+frame build: 224 bytes   frame main: 1048816 bytes   rep-movs: 0
+OK: result-location guarantee kept (build 224 B, main 1048816 B, no bulk copy).
 ```
 
-The structure is 1 MB in size; `baue` still has only a 224 byte frame.
+The structure is 1 MB in size; `build` still has only a 224 byte frame.
 
 ## The architecture layer: field access != storage location (DESIGN_GOALS.md 8)
 
@@ -1410,7 +1410,7 @@ The rule is **enforced**, not merely written down:
 
 ```
 $ bash tools/schichten/run.sh
-OK: Feldzugriff und Speicherort getrennt (4 Zugaenge in layout.rs, keine Umgehung).
+OK: field access and memory location separated (4 entry points in layout.rs, no bypass).
 ```
 
 The guard runs as section 7 in `test.sh` and checks that `Op::PtrAdd` outside
@@ -1462,12 +1462,12 @@ In front of `fn` or `struct`. The result must not be discarded as a statement:
 
 ```firn
 #[must_consume]
-struct Wache { fd: i32 }
+struct Guard { fd: i32 }
 
-fn oeffne(fd: i32) -> Wache { return Wache{ fd: fd, } }
+fn open(fd: i32) -> Guard { return Guard{ fd: fd, } }
 
 fn main() -> i32 {
-    oeffne(7)        // error: the result must not be discarded
+    open(7)        // error: the result must not be discarded
     return 0
 }
 ```
@@ -1485,7 +1485,7 @@ have room for a later ABI version:
 
 ```text
 _F0.add              an element of the root file
-_F0.helfer__quadrat  an element of a module
+_F0.helper__square  an element of a module
 _F0.add.v3           with an ABI version (later, #[abi_stable(3)])
 main                 the entry point, unchanged
 ```
@@ -1501,11 +1501,11 @@ other at exactly one place: `codegen_x86::label` -> `modules::symbol`.
 
 ```
 $ bash tools/symbole/run.sh
-OK: Symbolschema gehalten (_F0.-Praefix, 'main' nackt, Module kollisionsfrei).
+OK: symbol scheme kept (_F0. prefix, 'main' bare, modules free of collisions).
 ```
 
 The proof builds a program out of two modules that both contain a function
-`hilf`, runs it and checks against the real symbol table (`nm`).
+`help`, runs it and checks against the real symbol table (`nm`).
 
 ## Re-entering the checking phases (DESIGN_GOALS.md 7)
 

@@ -7,7 +7,7 @@ standard library from round 42 reads accordingly:
 
 ```firn
 bytes_push(&b, 65 as u8)
-let n: usize = laenge(trimme(quelle))
+let n: usize = length(trim(source))
 str16_set(&s, 0, 73 as u16)
 ```
 
@@ -15,9 +15,9 @@ The prefix is the type — only written down by hand and not checked by the
 compiler. This round turns that into:
 
 ```firn
-b.dazu(65 as u8)
-let n: usize = quelle.trimme().laenge()
-s.setze_bei(0, 73 as u16)
+b.add(65 as u8)
+let n: usize = source.trim().length()
+s.set_at(0, 73 as u16)
 ```
 
 ---
@@ -79,8 +79,8 @@ There is no more automatism than that:
 * **No automatic dereferencing.** If the method wants a copy and a pointer
   is present, that is an error with a suggestion: `(*z).erstes()`.
   (`tests/neg/impl_receiver_is_ptr.fi`)
-* **No silent intermediate.** `p.verschoben(1).summe()` is an error
-  if `summe` wants a pointer: the result of a call has no
+* **No silent intermediate.** `p.moved(1).sum()` is an error
+  if `sum` wants a pointer: the result of a call has no
   address. Bind first, then call. A silent intermediate value would be the
   more dangerous choice — changes to it would arrive nowhere.
   (`tests/neg/impl_receiver_without_address.fi`)
@@ -114,7 +114,7 @@ the same construction as `"gc C"` in `gc.rs`.
 | parser, item | `impl T { … }` → functions `T__m` | `impls.rs::hook_item` | `parser.fi::impl_deklaration` |
 | parser, expression | `x.m(a)` → `Aufruf("methode m", [x, a])` | `impls.rs::hook_methodenaufruf` | `parser.fi::nach_ausdruck` |
 | type checker | receiver type → struct name → `T__m`, adjust the receiver, check the arguments | `impls.rs::hook_call` | `sema.fi::methoden_ruf` |
-| type checker, `probe` | return type without reporting (otherwise `p.summe() != 42` gets no literal type) | `sema.rs::probe_d` | `sema.fi::probe_t` |
+| type checker, `probe` | return type without reporting (otherwise `p.sum() != 42` gets no literal type) | `sema.rs::probe_d` | `sema.fi::probe_t` |
 | lowering | derive the target **anew**, receiver as an address if needed | `lower.rs::lower_call` | `lower.fi::ruf_voll` |
 
 **Why no side table between the type checker and the lowering?** Because
@@ -138,17 +138,17 @@ Methods and free functions lie in **one** namespace, but under
   parameter is exactly the matching pointer
   (`tests/neg/impl_free_func_is_no_method.fi`).
 * They may therefore have the same name. `tests/810` and
-  `tests/modules/geo.fi` demonstrate it: `summe(a, b)` and `Punkt.summe()`,
-  `einheit()` and `Rechteck.einheit()` stand next to each other. In
+  `tests/modules/geo.fi` demonstrate it: `sum(a, b)` and `Dot.sum()`,
+  `unit()` and `Rect.unit()` stand next to each other. In
   `lib/str/std_impl.fi` exactly that happens in earnest: the free function
-  `laenge(s)` and the method `Spanne.laenge()` are both reachable and point
+  `length(s)` and the method `Span.length()` are both reachable and point
   at the same code.
 
-**Modules.** In the module `geo`, `Rechteck` becomes `geo__Rechteck` when
-merging, and `Rechteck__flaeche` accordingly becomes
-`geo__Rechteck__flaeche`. The resolution „struct name ++ `__` ++ method"
+**Modules.** In the module `geo`, `Rect` becomes `geo__Rect` when
+merging, and `Rect__area` accordingly becomes
+`geo__Rect__area`. The resolution "struct name ++ `__` ++ method"
 still holds afterwards, because it always computes with the name the type
-carries at that point in time. The call `r.flaeche()` therefore needs
+carries at that point in time. The call `r.area()` therefore needs
 **no** module prefix: the method belongs to the type, and the type already
 carries its module in its name.
 
@@ -229,8 +229,8 @@ new rule.
 `firnc0` renames module names **after** parsing (`modules.rs`), `firnc1`
 **during** parsing (`parser.fi`). For that, `firnc1` scans in advance for
 all names declared by the module itself — a token pass that watches for
-`fn`/`struct`/`const` + identifier. In an `impl` block it also finds
-`fn push` and would have taken `push` into the renaming list of the module;
+`fn`/`struct`/`const` + identifier. In an `impl` block it finds
+`fn push` as well and would have taken `push` into the renaming list of the module;
 `firnc0` sees only the finished function `Bytes__push` there and never
 `push`.
 
@@ -248,16 +248,16 @@ the self-comparison. The pre-scan now skips `impl` blocks entirely
 `tools/strlib/src/std_str.fi`, generates `lib/std/str.fi`) gives three
 types methods:
 
-* **`Spanne`** — the reading view, receiver by value: `laenge`, `ist_leer`,
-  `zeichen`, `teil`, `ab`, `bis`, `gleich`, `vergleiche`, `gleich_ohne_fall`,
-  `beginnt_mit`, `endet_mit`, `finde`, `finde_rueck`, `finde_zeichen`,
-  `enthaelt`, `zaehle_zeichen`, `zaehle_teil`, `trimme`, `trimme_links`,
-  `trimme_rechts`, `ohne_praefix`, `ohne_suffix`, `utf8_zeichen`, `utf8_teil`
-* **`Bytes`** — the owning buffer, `*self` resp. `*mut self`: `laenge`,
-  `bei`, `ist_text`, `gleich`, `spanne`, `schreibe`, `dazu`, `leeren`,
-  `frei`, `anhaengen`, `setze`, `wiederhole`, `gross_hier`, `klein_hier`
-* **`Str16`**: `laenge`, `bei`, `gleich`, `dazu`, `dazu_cp`, `setze_bei`,
-  `leeren`, `frei`
+* **`Span`** -- the reading view, receiver by value: `length`, `is_empty`,
+  `chars`, `part`, `ab`, `to`, `equal`, `compare`, `equal_without_case`,
+  `starts_with`, `ends_with`, `find`, `find_back`, `find_char`,
+  `contains`, `count_char`, `count_part`, `trim`, `trim_left`,
+  `trim_right`, `without_prefix`, `without_suffix`, `utf8_char`, `utf8_part`
+* **`Bytes`** -- the owning buffer, `*self` resp. `*mut self`: `length`,
+  `at`, `is_text`, `equal`, `span`, `write`, `add`, `clear`,
+  `free`, `append`, `set`, `repeat`, `big_here`, `small_here`
+* **`Str16`**: `length`, `at`, `equal`, `add`, `add_cp`, `set_at`,
+  `clear`, `free`
 
 **Wrappers exclusively.** Every method calls exactly the free function that
 already exists, and does nothing else. That makes the conversion
@@ -278,14 +278,14 @@ character-identically.
 return value: the three receivers; address taking for value receivers; a
 receiver that is already a pointer; `(*z)` for the explicit copy;
 aggregate return and binding beforehand; method calls method; aggregate as
-an argument; receiver as a **field** (`r.ecke.summe()`), as an **array
-element** (`feld[i].setze(..)`) and nested (`r.eckensumme()` calls
-`(*self).ecke.summe()`); free function and method with the same name.
+an argument; receiver as a **field** (`r.corner.sum()`), as an **array
+element** (`field[i].set(..)`) and nested (`r.corner_sum()` calls
+`(*self).corner.sum()`); free function and method with the same name.
 
 **`tests/811_impl_module_core.fi`** with **`tests/modules/geo.fi`** — 12
 points across the module boundary: method without a module prefix, a
 writing method that itself calls a method, a second `impl` block for the
-same type, the free function `einheit()` next to `Rechteck.einheit()`,
+same type, the free function `unit()` next to `Rect.unit()`,
 a receiver via a pointer.
 
 **`tests/812_impl_std_core.fi`** — 24 points on `std.str`, see above.
@@ -295,14 +295,14 @@ message and error count:
 
 | File | Message |
 |---|---|
-| `impl_no_method.fi` | `typ 'Punkt' hat keine methode 'differenz'` (the hint names the existing ones) |
-| `impl_free_func_is_no_method.fi` | the same message for `p.punkt_summe()` |
-| `impl_receiver_without_address.fi` | `der empfaenger von 'Punkt.summe' braucht eine adresse, dieser ausdruck hat keine` |
-| `impl_receiver_is_ptr.fi` | `'Punkt.erstes' erwartet den empfaenger als wert, gefunden *mut Punkt` |
-| `impl_no_struct.fi` | `methode 'summe' auf einem wert vom typ i32 — methoden gibt es nur fuer struct-typen` |
-| `impl_argument_ty.fi` | `argument 1 von 'Punkt.setze_x' hat typ bool, erwartet i32` |
-| `impl_argumentzahl.fi` | `methode 'Punkt.setze_x' erwartet 1 argument(e), gefunden 2` |
-| `impl_without_receiver.fi` | `der erste parameter einer methode ist der empfaenger: 'self', '*self' oder '*mut self'` |
+| `impl_no_method.fi` | `type 'Dot' has no method 'diff'` (the hint names the existing ones) |
+| `impl_free_func_is_no_method.fi` | the same message for `p.dot_sum()` |
+| `impl_receiver_without_address.fi` | `the receiver of 'Dot.sum' needs an address, this expression has none` |
+| `impl_receiver_is_ptr.fi` | `'Dot.first' expects the receiver as a value, found *mut Dot` |
+| `impl_no_struct.fi` | `type 'i32' has no method 'sum'` |
+| `impl_argument_ty.fi` | `argument 1 of 'Dot.set_x' has type bool, expected i32` |
+| `impl_arg_count.fi` | `method 'Dot.set_x' expects 1 argument(s), found 2` |
+| `impl_without_receiver.fi` | `the first parameter of a method is the receiver: 'self', '*self' or '*mut self'` |
 
 All eight are rejected by `firnc1` as well (exit 1). Each of them reports
 **exactly one** error: a broken method aborts the whole `impl` block, so

@@ -16,8 +16,8 @@ Precision:
 
 | Build mode | Line information |
 |---|---|
-| `firnc --no-opt datei.fi` | **statement-precise** — every statement has its source line |
-| `firnc datei.fi` (with the optimizer) | the line of the `fn` declaration per function |
+| `firnc --no-opt file.fi` | **statement-precise** -- every statement has its source line |
+| `firnc file.fi` (with the optimizer) | the line of the `fn` declaration per function |
 
 The reason for the restriction is in `SPEC.md` §14.1 item 16: the FIR
 carries no source positions (`fir.rs` is frozen in this round), and the

@@ -26,15 +26,15 @@ Result up front, all measured by ourselves (numbers in §7):
 Four new modules under `lib/browser/` and a tool directory `tools/html/`:
 
 ```
-lib/browser/node.fi       DOM-Kern: Knotenarten, Baum, Attribute, Ketten
-lib/browser/tag.fi          erzeugt — die feste Namenstabelle (124 Namen)
-lib/browser/names.fi        Atomtabelle (Element-/Attributnamen -> u32)
-lib/browser/token_stream.fi   Leser des binären Tokenprotokolls
-lib/browser/tree.fi         die Baumkonstruktion (22 Einfügemodi)
-lib/browser/write.fi    Ausgabe im html5lib-Format
-lib/browser/driver.fi      Tokenizer + Baumaufbau zu einem Weg verbunden
-lib/browser/parse_main.fi   Treiberprogramm (stdin -> stdout)
-lib/browser/soak_tree.fi    Dauerlauf mit Gegenprobe
+lib/browser/node.fi         DOM core: node kinds, tree, attributes, chains
+lib/browser/tag.fi          generated -- the fixed name table (124 names)
+lib/browser/names.fi        atom table (element/attribute names -> u32)
+lib/browser/token_stream.fi reader of the binary token protocol
+lib/browser/tree.fi         the tree construction (22 insertion modes)
+lib/browser/write.fi        output in the html5lib format
+lib/browser/driver.fi       tokenizer + tree building joined into one path
+lib/browser/parse_main.fi   driver program (stdin -> stdout)
+lib/browser/soak_tree.fi    endurance run with a counter-check
 ```
 
 What the tree construction needs was added **additively** to the tokenizer
@@ -86,7 +86,7 @@ element names, arbitrary attribute names) gets an identifier > 124 on its
 first appearance. The storage is WTF-8, not UTF-8: a tag name may contain
 unpaired surrogates (SPEC §8.2).
 
-The table is completely `#[no_gc]` and may therefore also be called from
+The table is completely `#[no_gc]` and may therefore be called from
 hot paths.
 
 ### 2.3 Text is a GC chain
@@ -105,24 +105,24 @@ and nothing points into the void when the document is cleared away. An
 arena would have hurt in exactly the place this project is headed.
 
 The price is named: one character costs 4 bytes (code point), one piece
-holds 28 of them. 28 × 4 + 8 (`naechster`) + 4 (`len`) = 124 → rounded up
+holds 28 of them. 28 x 4 + 8 (`next`) + 4 (`len`) = 124 -> rounded up
 to 128, **exactly one size class of the collector** (`lib/gc/gc.fi`,
-`__gc_klassen_bytes`), so there is no waste. Appending is O(1) (hence
-`letztes`), indexing O(n/28) — whoever walks a chain character by character
-takes `kette_nach_cpbuf`.
+`__gc_classes_bytes`), so there is no waste. Appending is O(1) (hence
+`last`), indexing O(n/28) -- whoever walks a chain character by character
+takes `chain_after_cpbuf`.
 
 ### 2.4 The state of the tree construction
 
 ```firn
-struct Baum {
-    namen, strom,                       // Umgebung
-    dok: Gc[Dokument], kopf: Gc[Element], form: Gc[Element],
-    offen: [Gc[Knoten]; 512], noffen,   // Stapel offener Elemente
-    aktiv: [Gc[Knoten]; 128], naktiv,   // aktive Formatierungselemente
-    modus, urmodus, frameset_ok, foster,
-    tt: Gc[Kette], tt_nur_space,        // "in table text"
-    umschaltung, um_pos, um_tag,        // Rückkopplung auf den Tokenizer
-    tname, fehler, kaputt,
+struct Tree {
+    names, stream,                      // the environment
+    doc: Gc[Document], header: Gc[Elem], form: Gc[Elem],
+    open: [Gc[Node]; 512], n_open,      // the stack of open elements
+    active: [Gc[Node]; 128], nactive,   // the active formatting elements
+    mode, basemode, frameset_ok, foster,
+    tt: Gc[Chain], tt_only_space,       // "in table text"
+    switching, sw_pos, sw_tag,          // the feedback onto the tokenizer
+    tname, err, broken,
 }
 ```
 
@@ -326,8 +326,8 @@ code.
 ### 6.1 `Gc[modul.Typ]` cannot be written
 
 ```firn
-fn nimm(e: Gc[knoten.Element]) -> u32 { … }
-//              ^ error: erwartet ']' nach dem typargument, gefunden '.'
+fn take(e: Gc[node.Elem]) -> u32 { ... }
+//              ^ error: expected ']' after the type argument, found '.'
 ```
 
 The position of a type argument does not take a qualified name. That it
@@ -373,9 +373,11 @@ A `const` cannot be initialized from another module. Consequence:
 ### 6.4 String literals need their length written out
 
 ```firn
-var t: [u8; 446] = "<!DOCTYPE html>…"   // 446 muss stimmen, sonst Fehler
-let a = "abc"                            // error: typ nicht ableitbar
-var a: [u8; _] = "abc"                   // error: erwartet ganzzahlige laenge
+var t: [u8; 446] = "<!DOCTYPE html>..."  // 446 has to be right, else an error
+let a = "abc"                            // error: the type of the array literal
+                                         //        cannot be inferred
+var a: [u8; _] = "abc"                   // error: expected an integer array
+                                         //        length, found '_'
 ```
 
 Every literal is an array literal with a fixed length, and a human counts
@@ -391,7 +393,7 @@ three times).
 
 ```firn
 cp = ((c0 & 0x07) << 18)
-    | ((b1 & 0x3F) << 12)      // error: erwartet einen ausdruck, gefunden '|'
+    | ((b1 & 0x3F) << 12)      // error: expected an expression, found '|'
 ```
 
 The semicolon is optional, so the statement ends at the end of the line. An
@@ -431,8 +433,8 @@ file. Consequence: `bin/astdump.fi` reports a **syntax error (rc=1)** for
 Not repaired — `lib/firnc1` is foreign territory in this round. Worked
 around in the test: `tests/900_dom_core.fi` has a function with a `Gc[…]`
 in its **signature**, and by that the parser already recognizes the case.
-For the compiler rounds: `gc_quelle_scan` should also see
-`Gc[`/`GcWeak[`/`gc_null[` in the token stream.
+For the compiler rounds: `gc_source_scan` should see
+`Gc[`/`GcWeak[`/`gc_null[` in the token stream as well.
 
 ### 6.9 No resumable call (coroutine/generator)
 
@@ -477,7 +479,7 @@ to check. The format is nevertheless **exactly the `.dat` format of
 html5lib**: if the original data become available one day,
 `tools/html/harness_tree.py` runs against them without a change.
 
-By hand also means: error-prone. That is why there is
+Doing it by hand is error-prone. That is why there is
 `tools/html/oracle.py` — it runs **every expectation against html5lib 1.1**
 (from PyPI, in a venv of its own, not part of the project) and reports every
 deviation. Result:
@@ -573,8 +575,8 @@ therefore core language for stage 1 as well.
 
 **Not touched, on purpose:** `compiler/src`, `lib/firnc1` and `lib/gc`
 (foreign territory — four compiler rounds ran in parallel). `SELBSTHOSTING.md`
-also stays unchanged; the paragraph about this round belongs in the merge,
-not in the branch.
+stays unchanged as well; the paragraph about this round belongs in the
+merge, not in the branch.
 
 **What makes sense next:** `GcVec[T]` (§6.2) clears the way for the
 stack, the formatting list and `<template>` all at once; after that the

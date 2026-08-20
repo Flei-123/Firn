@@ -82,9 +82,9 @@ no runtime parsing:
 
 ```text
 f"x = {x}!"  ==>
-io.fmt_text(                       // "x = " als verstecktes let _fsegN
-    io.fmt_zahl(                   // (x) as i64
-        io.fmt_text(io.fmt_neu(), &_fseg0[0] as u64, 4),
+io.fmt_text(                       // "x = " as a hidden let _fsegN
+    io.fmt_number(                 // (x) as i64
+        io.fmt_text(io.fmt_new(), &_fseg0[0] as u64, 4),
         (x) as i64),
     &_fseg1[0] as u64, 1)          // "!"
 ```
@@ -174,9 +174,9 @@ not resolve `std.io`); (2) the core facade only knows
 `fmt_zahl`/`fmt_text` — the spots that suggest themselves (lexer and
 parser messages) need characters (`{c}` as a letter, not as a
 decimal number) or a buffer instead of stdout; otherwise the
-message text changes and `tools/lex_compare.sh` (which also compares the
-error streams) tips over; (3) the gain would be cosmetic. What would
-unlock it: `fmt_zeichen` + `fmt_inhalt(f, &buf)` in `std.io` and
+message text changes and `tools/lex_compare.sh` (which compares the
+error streams as well) tips over; (3) the gain would be cosmetic. What would
+unlock it: `fmt_char` + `fmt_content(f, &buf)` in `std.io` and
 `FIRNLIB` in `fixpunkt.sh`.
 
 ### Measurements (final state of round 39)

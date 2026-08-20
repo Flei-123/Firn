@@ -101,13 +101,13 @@ base path without register allocation (see hypothesis 2). Every
 intermediate value went through a stack slot:
 
 ```
-mov  rcx, QWORD PTR [rbp-0xd50]     ; Zeiger auf die Zelle von i
+mov  rcx, QWORD PTR [rbp-0xd50]     ; pointer to the cell of i
 mov  rax, QWORD PTR [rcx]           ; i
-mov  QWORD PTR [rbp-0xd68], rax     ; -> Zwischenplatz
-mov  rax, QWORD PTR [rbp-0xd68]     ; <- sofort wieder zurueck
+mov  QWORD PTR [rbp-0xd68], rax     ; -> intermediate slot
+mov  rax, QWORD PTR [rbp-0xd68]     ; <- straight back again
 ...
-movzx eax, BYTE PTR [rcx]           ; ein Byte lesen
-mov  BYTE PTR [rcx], al             ; ein Byte schreiben
+movzx eax, BYTE PTR [rcx]           ; read one byte
+mov  BYTE PTR [rcx], al             ; write one byte
 ```
 
 **Is that even a permissible target?** Yes, and the question has to be
@@ -152,12 +152,12 @@ register allocator was not responsible for `main` at all.
 `FIRN_RA_WARN=1`:
 
 ```
-RA-Grundpfad: tokens__out_wort            — 10 Parameter
-RA-Grundpfad: tokens__tok_emit            — Aufruf mit 10 Argumenten
-RA-Grundpfad: tokens__sink_flush_chars    — Aufruf mit 10 Argumenten
-RA-Grundpfad: tokens__sink_end            — Aufruf mit 10 Argumenten
-RA-Grundpfad: tokens__out_fehlerliste     — Aufruf mit 10 Argumenten
-RA-Grundpfad: main                        — Aufruf mit 10 Argumenten
+RA base path: tokens__out_word            -- 10 parameters
+RA base path: tokens__tok_emit            -- a call with 10 arguments
+RA base path: tokens__sink_flush_chars    -- a call with 10 arguments
+RA base path: tokens__sink_end            -- a call with 10 arguments
+RA base path: tokens__out_error_list      -- a call with 10 arguments
+RA base path: main                        -- a call with 10 arguments
 ```
 
 **A single signature** — `tokens.out_wort(s, a, b, c, d, e, f, g, h, i)` —
@@ -204,7 +204,7 @@ miscompile. Therefore:
   stack argument that itself comes from a call, and recursion with a
   **further call after** the stack call — a shifted `rsp` would otherwise
   only show up there. Every argument has its own decimal place in the
-  result, so that a swapped order also comes to light.
+  result, so that a swapped order comes to light as well.
   `test.sh` compiles every file at three optimization levels; with
   `--no-opt` the function goes over the base path anyway because of the
   debug lines — the same test thereby checks **both** paths against each
@@ -291,8 +291,8 @@ they concern narrow widths.
 
 ```
 mov   BYTE PTR [rbp-0xae1], r11b
-movzx r11d, BYTE PTR [rbp-0xae1]      ; NUR dann ueberfluessig, wenn r11
-                                      ; bereits nullerweitert ist
+movzx r11d, BYTE PTR [rbp-0xae1]      ; superfluous ONLY when r11
+                                      ; is zero-extended already
 ```
 
 `mov eax, DWORD PTR [X]` zeroes the upper 32 bits of `rax`; deleting it

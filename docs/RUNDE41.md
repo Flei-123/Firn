@@ -69,7 +69,7 @@ process:
 #3 druck__drucke_binop
 ```
 
-`buf_wachse` doubles `kap` until `kap >= noetig`; with an underflowed
+`buf_grow` doubles `cap` until `cap >= needed`; with an underflowed
 length `kap` overflows past 0 and the loop spins forever. Minimal case:
 **every file that contains `||`.** `&&` was inconspicuous.
 
@@ -77,7 +77,7 @@ The cause is not a parser bug but **wrong machine code from
 `firnc0`** — in the assembly of `drucke_binop`:
 
 ```
-lea r12, [rbp+r12-1491]   ; &tab[start]  ueberschreibt das Zellenregister von start
+lea r12, [rbp+r12-1491]   ; &tab[start]  overwrites the cell register of start
 mov r13, 43
 sub r13, r12              ; 43 - ADRESSE statt 43 - start
 ```
