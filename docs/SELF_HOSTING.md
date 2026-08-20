@@ -1607,7 +1607,8 @@ individually — the suite checks negative tests only against `firnc0`.
 1. **The type annotation `E!T` goes through an import cycle.** `types.fi`
    resolves type expressions, but the meaning of the placeholder
    `__eu#<n>` is known only to `err.fi` — and `err.fi` needs `types.fi` in
-   order to create the union as a struct. Firn knows no function pointers,
+   order to create the union as a struct. Firn knew no function pointers at
+   the time (they arrived in round 58, `docs/ROUND58.md`),
    so the types carry a pointer to the registry (`typen_fehler_setzen`) and
    `aufloesen` calls `fehler.fehler_typ` directly — `types.fi` and
    `err.fi` importing each other. That `modules.rs` resolves cycles
