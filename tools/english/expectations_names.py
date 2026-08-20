@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""tools/englisch/erwartungen_namen.py — deutsche Namen in Erwartungen.
+"""tools/english/expectations_names.py — deutsche Namen in Erwartungen.
 
 `// expect_error:` nennt Typen und Methoden auch OHNE Anfuehrungszeichen
-("... verlangt *Punkt"). erwartungen.py fasst nur Zitiertes an. Hier wird
+("... verlangt *Punkt"). expectations.py fasst nur Zitiertes an. Hier wird
 zusaetzlich jeder ALTE Name ersetzt, dessen NEUER Name im Quelltext derselben
 Datei wirklich vorkommt — damit bleibt die Prosa der Meldung unberuehrt.
 """
 import os, re, sys, glob
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.chdir(ROOT)
-sys.path.insert(0, 'tools/englisch')
-import quelltext as Q
+sys.path.insert(0, 'tools/english')
+import source as Q
 
 tab = {}
-for z in open('tools/englisch/namen.tsv', encoding='utf-8'):
+for z in open('tools/english/names.tsv', encoding='utf-8'):
     if z.strip() and not z.startswith('#'):
         a, b = z.rstrip('\n').split('\t')[:2]
         tab[a] = b

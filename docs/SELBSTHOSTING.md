@@ -2156,14 +2156,14 @@ names point at the same English one (`Entry`, `Store`, `First` — 34 cases).
 The way was therefore: a **morpheme table** with 312 word parts
 (`baum`->`tree`, `zeiger`->`ptr`, `laenge`->`length`), a generator that
 decomposes every name and makes a suggestion, and a **conflict list** with
-278 names that were decided by hand. All of it lies in `tools/englisch/`.
+278 names that were decided by hand. All of it lies in `tools/english/`.
 
 ### The traps that snap shut in the process
 
 * **Byte arrays with a fixed length.** Runtime names stand in the compiler
   as `[u8; N]`. Whoever renames `"__faden_starten"` and leaves the `15`
   standing builds a bug that only comes to light weeks later.
-  Counter-check: `pruefe_laengen.py` holds every length entry against the
+  Counter-check: `check_lengths.py` holds every length entry against the
   text next to it.
 * **Generated files.** `gctext.fi`, `lib/std/str|num.fi` and the rc/arc
   tests are generated — there the generator is converted and things are
@@ -2188,12 +2188,12 @@ instructions**. What differs are exclusively symbol, file and text names.
 
 ### What the counter-check overlooked — and what follows from it
 
-`pruefe.py` looks only into the identifiers INSIDE the sources. **Nobody
+`check.py` looks only into the identifiers INSIDE the sources. **Nobody
 checks path names.** What had been overlooked were three test files
 (`841_gcvec_inkrementell.fi`, `iface_parameterzahl.fi`,
 `impl_argumentzahl.fi`) and four working directories (`.gc-mess-work`,
 `.baum-work`, `.selbst-work`, `messung-*.tsv`). A new counter-check:
-`pruefe_namen.py` holds **every path managed by git** against the
+`check_names.py` holds **every path managed by git** against the
 morpheme table.
 
 While catching up, the next lesson came right after it: whoever renames an
@@ -2222,7 +2222,7 @@ stage 3), `CODEGEN FEHLT: 0`, tokenizer **6810/6810**, tree construction
 What remains are **26 120 German comment and documentation lines** (docs
 5 654, lib 5 627, Markdown in the root 4 018, tests 3 977, compiler/src
 3 554, bin 2 312, tools 932). The yardstick for that is
-`pruefe_kommentare.py`; prose is recognized over German function words, not
+`check_comments.py`; prose is recognized over German function words, not
 over the morpheme table — technical terms are called the same in both
 languages. The requirement for stage B: **the line count of every file
 stays the same**, otherwise the position entries in the 134 negative tests

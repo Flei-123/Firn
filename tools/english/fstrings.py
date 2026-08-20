@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# tools/englisch/fstrings.py — in `f"...{name}..."` steht ein BEZEICHNER
+# tools/english/fstrings.py — in `f"...{name}..."` steht ein BEZEICHNER
 # mitten in einem Zeichenkettenliteral. Der normale Umbenenner laesst
 # Literale in Ruhe; dieses Werkzeug holt genau die Klammerinhalte nach.
 import os
@@ -8,8 +8,8 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.chdir(ROOT)
-sys.path.insert(0, 'tools/englisch')
-import quelltext as Q
+sys.path.insert(0, 'tools/english')
+import source as Q
 
 AUS = ('.git', 'target', '__pycache__', '.test-work', 'testdata', '.gc-meas-work')
 KLAM = re.compile(r'\{([^{}]*)\}')
@@ -18,7 +18,7 @@ IDENT = re.compile(r'[A-Za-z_][A-Za-z0-9_]*')
 
 def main():
     abb = {}
-    for z in open('tools/englisch/namen.tsv', encoding='utf-8'):
+    for z in open('tools/english/names.tsv', encoding='utf-8'):
         a, n = z.rstrip('\n').split('\t')
         abb[a] = n
     ges = 0

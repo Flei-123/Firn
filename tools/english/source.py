@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# tools/englisch/quelltext.py — winziger Lexer fuer .rs und .fi, der den
+# tools/english/source.py — winziger Lexer fuer .rs und .fi, der den
 # Quelltext in CODE und NICHT-CODE (Kommentar, Zeichenkette, Zeichenliteral)
 # zerlegt. Damit trifft eine Umbenennung nur echte Bezeichner und mangelt
 # nicht die deutsche Prosa in den Kommentaren (das ist Etappe B).

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# tools/englisch/laengen.py — prueft (und richtet) die Laengenangaben von
+# tools/english/lengths.py — prueft (und richtet) die Laengenangaben von
 # Zeichenkettenpuffern in Firn:  var m: [u8; 42] = "…"
 #
 # Firn hat kein `len(literal)`: die Groesse des Feldes steht als Zahl da. Wird
@@ -7,8 +7,8 @@
 # scheinbar und bricht spaeter. Dieses Werkzeug rechnet die Zahl aus dem
 # Literal aus.
 #
-#   python3 tools/englisch/laengen.py            # nur melden
-#   python3 tools/englisch/laengen.py --fix      # richtigstellen
+#   python3 tools/english/lengths.py            # nur melden
+#   python3 tools/english/lengths.py --fix      # richtigstellen
 #
 # Nur `[u8; N] = "…"` und `[u16; N] = u"…"` werden angefasst; Felder, die
 # absichtlich groesser sind als ihr Anfangswert, gibt es in Firn nicht (das

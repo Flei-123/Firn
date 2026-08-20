@@ -9,7 +9,7 @@ Die Zeile, in der der alte Erwartungstext steht, wird in der neuen Ausgabe an
 DERSELBEN Stelle gesucht; ihr Meldungsteil (hinter `error: ` bzw. `= note: `)
 ist der neue Erwartungstext. Die Position `Z:S` bleibt unberuehrt.
 
-Aufruf:  python3 tools/englisch/erwartungen_texte.py [<basis-worktree>]
+Aufruf:  python3 tools/english/expectations_texts.py [<basis-worktree>]
 """
 import os, re, subprocess, sys, glob
 

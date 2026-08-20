@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""tools/englisch/pruefe_namen.py — GEGENPROBE fuer DATEI- und ORDNERNAMEN.
+"""tools/english/check_names.py — GEGENPROBE fuer DATEI- und ORDNERNAMEN.
 
-pruefe.py sieht nur in die Bezeichner INNERHALB der Quellen; die drei
+check.py sieht nur in die Bezeichner INNERHALB der Quellen; die drei
 uebersehenen Dateien der Runde 55 (841_gcvec_inkrementell.fi,
 iface_parameterzahl.fi, impl_argumentzahl.fi) und die Arbeitsordner
 (.gc-mess-work, .baum-work, .selbst-work) sind ihr deshalb entgangen.
 
 Geprueft wird jeder von git verwaltete Pfad: Ordner und Dateistamm werden in
-Wortteile zerlegt, jeder Teil gegen tools/englisch/morpheme.tsv gehalten.
+Wortteile zerlegt, jeder Teil gegen tools/english/morphemes.tsv gehalten.
 Ein Treffer heisst: dieser Pfad ist noch deutsch. 0 Treffer = fertig.
 """
 import os, re, subprocess, sys
@@ -17,7 +17,7 @@ os.chdir(ROOT)
 
 # Ausgenommen: fremde Daten (testdata) und das Umstellungswerkzeug selbst,
 # das laut Arbeitsanweisung deutsch bleibt.
-AUS = ('testdata/', 'tools/englisch/', 'docs/')
+AUS = ('testdata/', 'tools/english/', 'docs/')
 # Ein angehaengter Zaehler versteckt das deutsche Wort: 'pfad2', 'teil1'.
 ZIFFERNSCHWANZ = re.compile(r'[0-9]+$')
 TEIL = re.compile(r'[a-z0-9]+|[A-Z]+(?![a-z])|[A-Z][a-z0-9]*')
@@ -28,7 +28,7 @@ ERLAUBT = {'kernel', 'start', 'core', 'min', 'max', 'lib', 'bin', 'src',
 
 def morpheme():
     t = set()
-    for z in open('tools/englisch/morpheme.tsv', encoding='utf-8'):
+    for z in open('tools/english/morphemes.tsv', encoding='utf-8'):
         if z.strip() and not z.startswith('#'):
             a, b = (z.rstrip('\n').split('\t') + [''])[:2]
             a, b = a.strip().lower(), b.strip().lower()
@@ -65,7 +65,7 @@ def main():
                     break
     for p, s, t in treffer:
         print(f"{p}\t{s}\t{t}")
-    print(f"deutsche Pfadnamen: {len(treffer)}")
+    print(f"German path names: {len(treffer)}")
     return 1 if treffer else 0
 
 

@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-# tools/englisch/zeichenketten.py — ersetzt Zeichenkettenliterale, deren
+# tools/english/strings_tool.py — ersetzt Zeichenkettenliterale, deren
 # INHALT genau ein Eintrag aus strings.tsv ist (mit oder ohne abschliessendes
-# "\0"). Prosa bleibt unberuehrt; dafuer gibt es meldungen.tsv.
+# "\0"). Prosa bleibt unberuehrt; dafuer gibt es messages.tsv.
 import os
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.chdir(ROOT)
-sys.path.insert(0, 'tools/englisch')
-import quelltext as Q
+sys.path.insert(0, 'tools/english')
+import source as Q
 
 AUS = ('.git', 'target', '__pycache__', '.test-work', 'testdata', '.gc-meas-work')
 
@@ -16,7 +16,7 @@ AUS = ('.git', 'target', '__pycache__', '.test-work', 'testdata', '.gc-meas-work
 def main(argv):
     probe = '--probe' in argv
     tab = {}
-    for z in open('tools/englisch/strings.tsv', encoding='utf-8'):
+    for z in open('tools/english/strings.tsv', encoding='utf-8'):
         if not z.strip() or z.startswith('#'):
             continue
         a, b = z.rstrip('\n').split('\t')
