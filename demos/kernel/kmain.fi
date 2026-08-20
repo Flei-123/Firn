@@ -62,6 +62,7 @@ const P_FAULT: u64 = 3
 const P_BADPTR: u64 = 4
 const P_CHILD: u64 = 5
 const P_PARENT: u64 = 6
+const P_SHELL: u64 = 8
 const P_STEAL: u64 = 9
 
 const DISK_FRAMES: u64 = 256            // 1 MiB of RAM disk
@@ -98,6 +99,7 @@ fn kernel_main(mbi: u64, vectors: u64, state: u64, kernel_end: u64,
 
     let cmd: u64 = mem.cmdline(mbi)
     kstate.set(state, kstate.MODE, mode_of(cmd))
+    console_load(state, cmd)
     serial.puts((&s_mb[0]) as u64)
     serial.hex(kstate.get32(mbi))
     serial.puts((&s_cmd[0]) as u64)
@@ -141,6 +143,11 @@ fn kernel_main(mbi: u64, vectors: u64, state: u64, kernel_end: u64,
     sched.init(state)
     kstate.set(state, kstate.IDLE,
                sched.create(state, sched.K_IDLE, 1, 0, 0))
+    // `syscall`/`sysret` need their four MSRs before the first process,
+    // not only before the excursion of round 59. Without EFER.SCE the
+    // `sysretq` of `enter_user_task` is an invalid opcode.
+    user.setup(state)
+    proc.map_programs(state)
 
     // 4. a deliberate fault, when the command line asks for one. Comes
     //    back only if the IDT is broken -- `trap.report` stops.
@@ -160,6 +167,12 @@ fn kernel_main(mbi: u64, vectors: u64, state: u64, kernel_end: u64,
 
     // 7c. the file system.
     filesystem(state)
+
+    // 7d. a command line in ring 3.
+    shell(state)
+
+    // 7e. the same file system on a real disk.
+    ata_disk(state)
 
     // 8. ring 3, the excursion of round 59.
     ring3(state)
@@ -429,9 +442,6 @@ fn processes(state: u64) {
         return
     }
     let before: u64 = mem.frames_free(state)
-    // `syscall`/`sysret` need their four MSRs before the first process,
-    // not only before the excursion of round 59.
-    user.setup(state)
     serial.puts((&s_pages[0]) as u64)
     serial.dec(proc.map_programs(state))
     serial.nl()
@@ -684,6 +694,114 @@ fn list_dir(state: u64, p: u64, label: u64) {
     serial.nl()
 }
 
+// ------------------------------------------------------------- the shell
+
+// What the console delivers on descriptor 0. In the test it comes from
+// the boot loader: `script=ls;cat /hello.txt` -- a semicolon is a line
+// break, and everything up to the end of the command line belongs to it.
+fn console_load(state: u64, cmd: u64) -> u64 {
+    var tag: [u8; 8] = "script=\0"
+    kstate.set(state, kstate.CONSOLE_LEN, 0)
+    kstate.set(state, kstate.CONSOLE_POS, 0)
+    if cmd == 0 {
+        return 0
+    }
+    let at: u64 = find(cmd, (&tag[0]) as u64, 7)
+    if at == 0 {
+        return 0
+    }
+    var p: u64 = at + 7
+    var n: u64 = 0
+    while kstate.get8(p) != 0 && n < kstate.CONSOLE_MAX - 2 {
+        var c: u64 = kstate.get8(p)
+        if c == 59 {
+            c = 10                          // ';' is a line break
+        }
+        kstate.set8(state + kstate.CONSOLE_OFF + n, c as u8)
+        n = n + 1
+        p = p + 1
+    }
+    if n > 0 && kstate.get8(state + kstate.CONSOLE_OFF + n - 1) != 10 {
+        kstate.set8(state + kstate.CONSOLE_OFF + n, 10 as u8)
+        n = n + 1
+    }
+    kstate.set(state, kstate.CONSOLE_LEN, n)
+    return n
+}
+
+// Point 5: `ls`, `cat`, `echo` and three more, in ring 3, over the system
+// calls of point 3, on the file system of point 4.
+fn shell(state: u64) {
+    var s_none: [u8; 14] = "sh: no script\0"
+    var s_in: [u8; 17] = "sh: input bytes=\0"
+    var s_out: [u8; 15] = "sh: commands=\0\0"
+    if kstate.get(state, kstate.CONSOLE_LEN) == 0 {
+        serial.puts((&s_none[0]) as u64)
+        serial.nl()
+        return
+    }
+    serial.puts((&s_in[0]) as u64)
+    serial.dec(kstate.get(state, kstate.CONSOLE_LEN))
+    serial.nl()
+    let i: u64 = proc.create(state, P_SHELL, 0, 2)
+    let code: u64 = wait_for(state, i)
+    serial.puts((&s_out[0]) as u64)
+    serial.dec(code)
+    serial.nl()
+}
+
+// ---------------------------------------------------------- a real disk
+
+// The same file system, one layer lower: not the RAM disk any more but a
+// drive over ATA PIO. `tools/kernel/run.sh` hands QEMU an image for it
+// and looks INTO that image afterwards -- what the kernel wrote has to be
+// in the file on the host.
+fn ata_disk(state: u64) {
+    var s_off: [u8; 13] = "ata: skipped\0"
+    var s_no: [u8; 14] = "ata: no drive\0"
+    var s_yes: [u8; 21] = "ata: drive present\0\0\0"
+    var s_fmt: [u8; 13] = "ata: format \0"
+    var s_mount: [u8; 10] = "  mount=\0\0"
+    var s_io: [u8; 13] = "ata: wrote=\0\0"
+    var s_read: [u8; 8] = "  read=\0"
+    var s_same: [u8; 8] = "  same=\0"
+    var s_list: [u8; 11] = "ata: list \0"
+    var p_file: [u8; 9] = "/ata.txt\0"
+    var p_root: [u8; 2] = "/\0"
+    var text: [u8; 30] = "ata disk holds this line r62\n\0"
+
+    if (kstate.get(state, kstate.MODE) & M_ATA) == 0 {
+        serial.puts((&s_off[0]) as u64)
+        serial.nl()
+        return
+    }
+    if !blk.present(state) {
+        serial.puts((&s_no[0]) as u64)
+        serial.nl()
+        return
+    }
+    blk.use_ata(state, DISK_BLOCKS)
+    serial.puts((&s_yes[0]) as u64)
+    serial.nl()
+    serial.puts((&s_fmt[0]) as u64)
+    serial.dec(yes(fs.format(state)))
+    serial.puts((&s_mount[0]) as u64)
+    serial.dec(yes(fs.mount(state)))
+    serial.nl()
+    let ino: u64 = fs.create_path(state, (&p_file[0]) as u64, fs.T_FILE)
+    let wrote: u64 = fs.write_at(state, ino, 0, (&text[0]) as u64, 29)
+    let scratch: u64 = state + kstate.BLOCK_OFF
+    let got: u64 = fs.read_at(state, ino, 0, scratch, 64)
+    serial.puts((&s_io[0]) as u64)
+    serial.dec(wrote)
+    serial.puts((&s_read[0]) as u64)
+    serial.dec(got)
+    serial.puts((&s_same[0]) as u64)
+    serial.dec(same(scratch, (&text[0]) as u64, 29))
+    serial.nl()
+    list_dir(state, (&p_root[0]) as u64, (&s_list[0]) as u64)
+}
+
 // ---------------------------------------------------------- the keyboard
 
 fn keyboard(state: u64) {
@@ -784,6 +902,7 @@ fn mode_of(cmd: u64) -> u64 {
     var noproc: [u8; 7] = "noproc\0"
     var nofs: [u8; 5] = "nofs\0"
     var ata: [u8; 4] = "ata\0"
+    var script: [u8; 8] = "script=\0"
     if cmd == 0 {
         return 0
     }
