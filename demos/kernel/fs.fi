@@ -1,0 +1,762 @@
+// demos/kernel/fs.fi -- round 62: a file system, from the block upwards.
+//
+// Not a "file system" in the sense of an array with names in it. This is
+// the real shape, the one every Unix file system has had since 1974,
+// only small:
+//
+//   block 0        THE SUPERBLOCK. Magic number, sizes, where everything
+//                  lies. Whatever does not start with the magic number is
+//                  not one of these -- `mount` refuses it, and that is
+//                  the difference between a file system and a guess.
+//   block 1        THE BLOCK BITMAP. One bit per block: taken or free.
+//   blocks 2..33   THE INODES. 128 of them, 128 octets each. An inode is
+//                  the file: type, size, twelve direct blocks and one
+//                  indirect one. The NAME is not in it -- names live in
+//                  directories, and that is why two names can mean the
+//                  same file.
+//   from block 34  THE DATA.
+//
+// A DIRECTORY is a file whose contents are entries of 32 octets: eight
+// for the inode number, twenty-four for the name. The root directory is
+// inode 1 and contains `.` and `..` like every other one.
+//
+// Everything goes through `blk.fi`, block by block, never past it. That
+// is what makes the same file system work on the RAM disk and on a real
+// ATA disk without a line of difference -- and `tools/kernel/run.sh`
+// runs it on both.
+//
+// The scratch blocks lie in the kernel data area (`kstate.FS_OFF`), not
+// on the stack: a kernel stack is 8 KiB, and six blocks of 512 octets on
+// it would be a third of it. Every entry point takes the interrupt flag
+// down while it works with them -- on one processor that is the whole
+// locking a file system needs, and it is honest about being exactly that.
+
+import serial
+import kstate
+import sched
+import blk
+
+export {
+    format, mount, path, create_path, unlink_path, entry_at, dir_entries,
+    inode_type, inode_size, read_at, write_at, root, free_blocks,
+    used_inodes, MAGIC, T_FILE, T_DIR, DIRENT, NAME_LEN, INODE_COUNT
+}
+
+const BS: u64 = 512                     // one block
+const MAGIC: u64 = 0x4649524E46533632   // "FIRNFS62"
+const INODE_SIZE: u64 = 128
+const INODES_PER_BLOCK: u64 = 4
+const INODE_COUNT: u64 = 128
+const BITMAP_BLOCK: u64 = 1
+const INODE_START: u64 = 2
+const INODE_BLOCKS: u64 = 32
+const DATA_START: u64 = 34
+const DIRENT: u64 = 32
+const NAME_LEN: u64 = 24
+const DIRECT: u64 = 12
+
+const T_FREE: u64 = 0
+const T_FILE: u64 = 1
+const T_DIR: u64 = 2
+
+// The fields of an inode.
+const I_TYPE: u64 = 0
+const I_SIZE: u64 = 8
+const I_LINKS: u64 = 16
+const I_DIRECT: u64 = 24                // twelve of them
+const I_INDIRECT: u64 = 120
+
+// The fields of the superblock.
+const SB_MAGIC: u64 = 0
+const SB_BSIZE: u64 = 8
+const SB_BLOCKS: u64 = 16
+const SB_INODES: u64 = 24
+const SB_BITMAP: u64 = 32
+const SB_ITABLE: u64 = 40
+const SB_DATA: u64 = 48
+const SB_ROOT: u64 = 56
+
+// ------------------------------------------------------ the scratch area
+
+fn buf_sb(state: u64) -> u64 {
+    return state + kstate.FS_OFF
+}
+
+fn buf_in(state: u64) -> u64 {
+    return state + kstate.FS_OFF + 512
+}
+
+fn buf_dt(state: u64) -> u64 {
+    return state + kstate.FS_OFF + 1024
+}
+
+fn buf_bm(state: u64) -> u64 {
+    return state + kstate.FS_OFF + 1536
+}
+
+fn buf_ib(state: u64) -> u64 {
+    return state + kstate.FS_OFF + 2048
+}
+
+fn buf_nm(state: u64) -> u64 {
+    return state + kstate.FS_OFF + 2560
+}
+
+fn buf_zz(state: u64) -> u64 {
+    return state + kstate.FS_OFF + 3072
+}
+
+fn zero(p: u64, n: u64) {
+    var i: u64 = 0
+    while i < n {
+        kstate.set8(p + i, 0 as u8)
+        i = i + 1
+    }
+}
+
+fn copy(from: u64, to: u64, n: u64) {
+    var i: u64 = 0
+    while i < n {
+        kstate.set8(to + i, kstate.get8(from + i) as u8)
+        i = i + 1
+    }
+}
+
+fn get64(p: u64) -> u64 {
+    return __mmio_read64(p as *mut u64)
+}
+
+fn put64(p: u64, v: u64) {
+    __mmio_write64(p as *mut u64, v)
+}
+
+fn root(state: u64) -> u64 {
+    return kstate.get(state, kstate.FS_ROOT)
+}
+
+// ---------------------------------------------------------- the inodes
+
+fn inode_block_of(ino: u64) -> u64 {
+    return INODE_START + (ino - 1) / INODES_PER_BLOCK
+}
+
+fn inode_off(ino: u64) -> u64 {
+    return ((ino - 1) % INODES_PER_BLOCK) * INODE_SIZE
+}
+
+fn inode_get(state: u64, ino: u64, field: u64) -> u64 {
+    if ino == 0 || ino > INODE_COUNT {
+        return 0
+    }
+    if !blk.read(state, inode_block_of(ino), buf_in(state)) {
+        return 0
+    }
+    return get64(buf_in(state) + inode_off(ino) + field)
+}
+
+fn inode_set(state: u64, ino: u64, field: u64, v: u64) -> bool {
+    if ino == 0 || ino > INODE_COUNT {
+        return false
+    }
+    if !blk.read(state, inode_block_of(ino), buf_in(state)) {
+        return false
+    }
+    put64(buf_in(state) + inode_off(ino) + field, v)
+    return blk.write(state, inode_block_of(ino), buf_in(state))
+}
+
+fn inode_type(state: u64, ino: u64) -> u64 {
+    return inode_get(state, ino, I_TYPE)
+}
+
+fn inode_size(state: u64, ino: u64) -> u64 {
+    return inode_get(state, ino, I_SIZE)
+}
+
+// A whole inode at once: cheaper than eighteen single writes, and it is
+// the only way a new inode gets a clean state.
+fn inode_init(state: u64, ino: u64, kind: u64) -> bool {
+    if !blk.read(state, inode_block_of(ino), buf_in(state)) {
+        return false
+    }
+    let at: u64 = buf_in(state) + inode_off(ino)
+    zero(at, INODE_SIZE)
+    put64(at + I_TYPE, kind)
+    put64(at + I_LINKS, 1)
+    return blk.write(state, inode_block_of(ino), buf_in(state))
+}
+
+fn inode_alloc(state: u64, kind: u64) -> u64 {
+    var ino: u64 = 1
+    while ino <= INODE_COUNT {
+        if inode_get(state, ino, I_TYPE) == T_FREE {
+            if inode_init(state, ino, kind) {
+                return ino
+            }
+            return 0
+        }
+        ino = ino + 1
+    }
+    return 0
+}
+
+fn used_inodes(state: u64) -> u64 {
+    var ino: u64 = 1
+    var n: u64 = 0
+    while ino <= INODE_COUNT {
+        if inode_get(state, ino, I_TYPE) != T_FREE {
+            n = n + 1
+        }
+        ino = ino + 1
+    }
+    return n
+}
+
+// ---------------------------------------------------------- the bitmap
+
+fn block_alloc(state: u64) -> u64 {
+    if !blk.read(state, BITMAP_BLOCK, buf_bm(state)) {
+        return 0
+    }
+    var b: u64 = DATA_START
+    let last: u64 = blk.blocks(state)
+    while b < last && b < BS * 8 {
+        let p: u64 = buf_bm(state) + b / 8
+        if (kstate.get8(p) & (1 << (b % 8))) == 0 {
+            kstate.set8(p, (kstate.get8(p) | (1 << (b % 8))) as u8)
+            if !blk.write(state, BITMAP_BLOCK, buf_bm(state)) {
+                return 0
+            }
+            zero(buf_zz(state), BS)
+            blk.write(state, b, buf_zz(state))
+            return b
+        }
+        b = b + 1
+    }
+    return 0
+}
+
+fn block_free(state: u64, b: u64) {
+    if b < DATA_START || b >= blk.blocks(state) {
+        return
+    }
+    if !blk.read(state, BITMAP_BLOCK, buf_bm(state)) {
+        return
+    }
+    let p: u64 = buf_bm(state) + b / 8
+    kstate.set8(p, (kstate.get8(p) & (255 ^ (1 << (b % 8)))) as u8)
+    blk.write(state, BITMAP_BLOCK, buf_bm(state))
+}
+
+fn free_blocks(state: u64) -> u64 {
+    if !blk.read(state, BITMAP_BLOCK, buf_bm(state)) {
+        return 0
+    }
+    var b: u64 = 0
+    var n: u64 = 0
+    let last: u64 = blk.blocks(state)
+    while b < last && b < BS * 8 {
+        if (kstate.get8(buf_bm(state) + b / 8) & (1 << (b % 8))) == 0 {
+            n = n + 1
+        }
+        b = b + 1
+    }
+    return n
+}
+
+// The `index`-th block of a file. With `grow` a missing one is created --
+// that is what makes a file grow.
+fn file_block(state: u64, ino: u64, index: u64, grow: bool) -> u64 {
+    if index < DIRECT {
+        let b: u64 = inode_get(state, ino, I_DIRECT + index * 8)
+        if b != 0 || !grow {
+            return b
+        }
+        let fresh: u64 = block_alloc(state)
+        if fresh == 0 {
+            return 0
+        }
+        inode_set(state, ino, I_DIRECT + index * 8, fresh)
+        return fresh
+    }
+    let k: u64 = index - DIRECT
+    if k >= BS / 8 {
+        return 0
+    }
+    var ib: u64 = inode_get(state, ino, I_INDIRECT)
+    if ib == 0 {
+        if !grow {
+            return 0
+        }
+        ib = block_alloc(state)
+        if ib == 0 {
+            return 0
+        }
+        inode_set(state, ino, I_INDIRECT, ib)
+    }
+    if !blk.read(state, ib, buf_ib(state)) {
+        return 0
+    }
+    let b: u64 = get64(buf_ib(state) + k * 8)
+    if b != 0 || !grow {
+        return b
+    }
+    let fresh: u64 = block_alloc(state)
+    if fresh == 0 {
+        return 0
+    }
+    if !blk.read(state, ib, buf_ib(state)) {
+        return 0
+    }
+    put64(buf_ib(state) + k * 8, fresh)
+    blk.write(state, ib, buf_ib(state))
+    return fresh
+}
+
+// Every block of a file back to the bitmap.
+fn file_truncate(state: u64, ino: u64) {
+    var i: u64 = 0
+    while i < DIRECT {
+        let b: u64 = inode_get(state, ino, I_DIRECT + i * 8)
+        if b != 0 {
+            block_free(state, b)
+            inode_set(state, ino, I_DIRECT + i * 8, 0)
+        }
+        i = i + 1
+    }
+    let ib: u64 = inode_get(state, ino, I_INDIRECT)
+    if ib != 0 {
+        if blk.read(state, ib, buf_ib(state)) {
+            var k: u64 = 0
+            while k < BS / 8 {
+                let b: u64 = get64(buf_ib(state) + k * 8)
+                if b != 0 {
+                    block_free(state, b)
+                }
+                k = k + 1
+            }
+        }
+        block_free(state, ib)
+        inode_set(state, ino, I_INDIRECT, 0)
+    }
+    inode_set(state, ino, I_SIZE, 0)
+}
+
+// ------------------------------------------------------ reading, writing
+
+// Both take KERNEL addresses. What comes out of ring 3 is copied into the
+// data area by `sys.fi` beforehand and checked there -- a file system
+// that followed a pointer of a process would be a hole.
+fn read_at(state: u64, ino: u64, off: u64, dst: u64, len: u64) -> u64 {
+    let flags: u64 = sched.irq_save()
+    let size: u64 = inode_get(state, ino, I_SIZE)
+    var want: u64 = len
+    if off >= size {
+        want = 0
+    } else {
+        if off + want > size {
+            want = size - off
+        }
+    }
+    var n: u64 = 0
+    while n < want {
+        let pos: u64 = off + n
+        let inb: u64 = pos % BS
+        var chunk: u64 = BS - inb
+        if chunk > want - n {
+            chunk = want - n
+        }
+        let b: u64 = file_block(state, ino, pos / BS, false)
+        if b == 0 {
+            zero(dst + n, chunk)            // a hole reads as zeros
+        } else {
+            if !blk.read(state, b, buf_dt(state)) {
+                sched.irq_restore(flags)
+                return n
+            }
+            copy(buf_dt(state) + inb, dst + n, chunk)
+        }
+        n = n + chunk
+    }
+    sched.irq_restore(flags)
+    return n
+}
+
+fn write_at(state: u64, ino: u64, off: u64, src: u64, len: u64) -> u64 {
+    let flags: u64 = sched.irq_save()
+    var n: u64 = 0
+    while n < len {
+        let pos: u64 = off + n
+        let inb: u64 = pos % BS
+        var chunk: u64 = BS - inb
+        if chunk > len - n {
+            chunk = len - n
+        }
+        let b: u64 = file_block(state, ino, pos / BS, true)
+        if b == 0 {
+            n = len                         // the disk is full
+        } else {
+            if !blk.read(state, b, buf_dt(state)) {
+                sched.irq_restore(flags)
+                return n
+            }
+            copy(src + n, buf_dt(state) + inb, chunk)
+            if !blk.write(state, b, buf_dt(state)) {
+                sched.irq_restore(flags)
+                return n
+            }
+            n = n + chunk
+        }
+    }
+    if off + n > inode_get(state, ino, I_SIZE) {
+        inode_set(state, ino, I_SIZE, off + n)
+    }
+    sched.irq_restore(flags)
+    return n
+}
+
+// ------------------------------------------------------- the directories
+
+fn name_eq(a: u64, b: u64) -> bool {
+    var i: u64 = 0
+    while i < NAME_LEN {
+        let x: u64 = kstate.get8(a + i)
+        let y: u64 = kstate.get8(b + i)
+        if x != y {
+            return false
+        }
+        if x == 0 {
+            return true
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn entry_read(state: u64, dir: u64, i: u64, out: u64) -> u64 {
+    if read_at(state, dir, i * DIRENT, out, DIRENT) != DIRENT {
+        return 0
+    }
+    return get64(out)
+}
+
+fn dir_entries(state: u64, dir: u64) -> u64 {
+    return inode_get(state, dir, I_SIZE) / DIRENT
+}
+
+fn dir_find(state: u64, dir: u64, name: u64) -> u64 {
+    let n: u64 = dir_entries(state, dir)
+    var i: u64 = 0
+    while i < n {
+        let ino: u64 = entry_read(state, dir, i, buf_nm(state))
+        if ino != 0 && name_eq(buf_nm(state) + 8, name) {
+            return ino
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// The `index`-th LIVE entry. `out` gets the 32 octets of the entry:
+// inode number and name. 0 = there is no such entry.
+fn entry_at(state: u64, dir: u64, index: u64, out: u64) -> u64 {
+    let n: u64 = dir_entries(state, dir)
+    var i: u64 = 0
+    var seen: u64 = 0
+    while i < n {
+        let ino: u64 = entry_read(state, dir, i, out)
+        if ino != 0 {
+            if seen == index {
+                return ino
+            }
+            seen = seen + 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn dir_add(state: u64, dir: u64, name: u64, ino: u64) -> bool {
+    let n: u64 = dir_entries(state, dir)
+    var slot: u64 = n
+    var i: u64 = 0
+    while i < n {
+        if entry_read(state, dir, i, buf_nm(state)) == 0 {
+            slot = i
+            i = n
+        } else {
+            i = i + 1
+        }
+    }
+    zero(buf_nm(state), DIRENT)
+    put64(buf_nm(state), ino)
+    var k: u64 = 0
+    while k < NAME_LEN - 1 && kstate.get8(name + k) != 0 {
+        kstate.set8(buf_nm(state) + 8 + k, kstate.get8(name + k) as u8)
+        k = k + 1
+    }
+    return write_at(state, dir, slot * DIRENT, buf_nm(state), DIRENT) == DIRENT
+}
+
+fn dir_remove(state: u64, dir: u64, name: u64) -> u64 {
+    let n: u64 = dir_entries(state, dir)
+    var i: u64 = 0
+    while i < n {
+        let ino: u64 = entry_read(state, dir, i, buf_nm(state))
+        if ino != 0 && name_eq(buf_nm(state) + 8, name) {
+            zero(buf_nm(state), DIRENT)
+            write_at(state, dir, i * DIRENT, buf_nm(state), DIRENT)
+            return ino
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// --------------------------------------------------------- the paths
+
+// `/a/b/c` -> inode, 0 = not there. A leading slash is optional; without
+// one it starts at the root as well, because a process has no working
+// directory of its own yet.
+fn path(state: u64, p: u64) -> u64 {
+    var name: [u8; 32] = [0 as u8; 32]
+    var ino: u64 = root(state)
+    var i: u64 = 0
+    var going: bool = true
+    while going {
+        while kstate.get8(p + i) == 47 {
+            i = i + 1
+        }
+        if kstate.get8(p + i) == 0 {
+            going = false
+        } else {
+            var n: u64 = 0
+            while kstate.get8(p + i) != 0 && kstate.get8(p + i) != 47 {
+                if n < NAME_LEN - 1 {
+                    name[n as usize] = kstate.get8(p + i) as u8
+                    n = n + 1
+                }
+                i = i + 1
+            }
+            name[n as usize] = 0 as u8
+            if inode_type(state, ino) != T_DIR {
+                return 0
+            }
+            ino = dir_find(state, ino, (&name[0]) as u64)
+            if ino == 0 {
+                return 0
+            }
+        }
+    }
+    return ino
+}
+
+// The directory a path lies in, and the last name of it. Returns the
+// inode of the directory, `out_name` gets the name.
+fn parent_of(state: u64, p: u64, out_name: u64) -> u64 {
+    var buf: [u8; 96] = [0 as u8; 96]
+    var len: u64 = 0
+    while kstate.get8(p + len) != 0 && len < 95 {
+        buf[len as usize] = kstate.get8(p + len) as u8
+        len = len + 1
+    }
+    buf[len as usize] = 0 as u8
+    if len == 0 {
+        return 0
+    }
+    var cut: u64 = len
+    var found: bool = false
+    while cut > 0 && !found {
+        cut = cut - 1
+        if buf[cut as usize] == 47 as u8 {
+            found = true
+        }
+    }
+    var dir: u64 = root(state)
+    var start: u64 = 0
+    if found {
+        buf[cut as usize] = 0 as u8
+        start = cut + 1
+        if cut > 0 {
+            dir = path(state, (&buf[0]) as u64)
+        }
+    }
+    if dir == 0 || inode_type(state, dir) != T_DIR {
+        return 0
+    }
+    var k: u64 = 0
+    while k < NAME_LEN - 1 && buf[(start + k) as usize] != 0 as u8 {
+        kstate.set8(out_name + k, buf[(start + k) as usize])
+        k = k + 1
+    }
+    kstate.set8(out_name + k, 0 as u8)
+    if k == 0 {
+        return 0
+    }
+    return dir
+}
+
+fn create_path(state: u64, p: u64, kind: u64) -> u64 {
+    let flags: u64 = sched.irq_save()
+    var name: [u8; 32] = [0 as u8; 32]
+    let dir: u64 = parent_of(state, p, (&name[0]) as u64)
+    if dir == 0 {
+        sched.irq_restore(flags)
+        return 0
+    }
+    if dir_find(state, dir, (&name[0]) as u64) != 0 {
+        sched.irq_restore(flags)
+        return 0
+    }
+    let ino: u64 = inode_alloc(state, kind)
+    if ino == 0 {
+        sched.irq_restore(flags)
+        return 0
+    }
+    if kind == T_DIR {
+        if !dir_init(state, ino, dir) {
+            inode_set(state, ino, I_TYPE, T_FREE)
+            sched.irq_restore(flags)
+            return 0
+        }
+    }
+    if !dir_add(state, dir, (&name[0]) as u64, ino) {
+        inode_set(state, ino, I_TYPE, T_FREE)
+        sched.irq_restore(flags)
+        return 0
+    }
+    sched.irq_restore(flags)
+    return ino
+}
+
+// A fresh directory gets `.` and `..` -- without them it would not be one.
+fn dir_init(state: u64, ino: u64, parent: u64) -> bool {
+    var dot: [u8; 2] = ".\0"
+    var dotdot: [u8; 3] = "..\0"
+    if !dir_add(state, ino, (&dot[0]) as u64, ino) {
+        return false
+    }
+    return dir_add(state, ino, (&dotdot[0]) as u64, parent)
+}
+
+fn unlink_path(state: u64, p: u64) -> bool {
+    let flags: u64 = sched.irq_save()
+    var name: [u8; 32] = [0 as u8; 32]
+    let dir: u64 = parent_of(state, p, (&name[0]) as u64)
+    if dir == 0 {
+        sched.irq_restore(flags)
+        return false
+    }
+    let ino: u64 = dir_find(state, dir, (&name[0]) as u64)
+    if ino == 0 {
+        sched.irq_restore(flags)
+        return false
+    }
+    // A directory only goes when nothing is in it any more -- apart from
+    // `.` and `..`, which are itself and its parent.
+    if inode_type(state, ino) == T_DIR {
+        var live: u64 = 0
+        let n: u64 = dir_entries(state, ino)
+        var i: u64 = 0
+        while i < n {
+            if entry_read(state, ino, i, buf_nm(state)) != 0 {
+                live = live + 1
+            }
+            i = i + 1
+        }
+        if live > 2 {
+            sched.irq_restore(flags)
+            return false
+        }
+    }
+    file_truncate(state, ino)
+    inode_set(state, ino, I_TYPE, T_FREE)
+    inode_set(state, ino, I_LINKS, 0)
+    dir_remove(state, dir, (&name[0]) as u64)
+    sched.irq_restore(flags)
+    return true
+}
+
+// ------------------------------------------------------ format and mount
+
+fn format(state: u64) -> bool {
+    let flags: u64 = sched.irq_save()
+    let total: u64 = blk.blocks(state)
+    if total < DATA_START + 8 {
+        sched.irq_restore(flags)
+        return false
+    }
+    // The superblock.
+    zero(buf_sb(state), BS)
+    put64(buf_sb(state) + SB_MAGIC, MAGIC)
+    put64(buf_sb(state) + SB_BSIZE, BS)
+    put64(buf_sb(state) + SB_BLOCKS, total)
+    put64(buf_sb(state) + SB_INODES, INODE_COUNT)
+    put64(buf_sb(state) + SB_BITMAP, BITMAP_BLOCK)
+    put64(buf_sb(state) + SB_ITABLE, INODE_START)
+    put64(buf_sb(state) + SB_DATA, DATA_START)
+    put64(buf_sb(state) + SB_ROOT, 1)
+    if !blk.write(state, 0, buf_sb(state)) {
+        sched.irq_restore(flags)
+        return false
+    }
+    // The bitmap: everything up to the data area is taken.
+    zero(buf_bm(state), BS)
+    var b: u64 = 0
+    while b < DATA_START {
+        let p: u64 = buf_bm(state) + b / 8
+        kstate.set8(p, (kstate.get8(p) | (1 << (b % 8))) as u8)
+        b = b + 1
+    }
+    blk.write(state, BITMAP_BLOCK, buf_bm(state))
+    // The inode table: empty.
+    zero(buf_in(state), BS)
+    var k: u64 = 0
+    while k < INODE_BLOCKS {
+        blk.write(state, INODE_START + k, buf_in(state))
+        k = k + 1
+    }
+    kstate.set(state, kstate.FS_ROOT, 1)
+    kstate.set(state, kstate.FS_READY, 1)
+    // The root directory.
+    if inode_alloc(state, T_DIR) != 1 {
+        kstate.set(state, kstate.FS_READY, 0)
+        sched.irq_restore(flags)
+        return false
+    }
+    if !dir_init(state, 1, 1) {
+        kstate.set(state, kstate.FS_READY, 0)
+        sched.irq_restore(flags)
+        return false
+    }
+    sched.irq_restore(flags)
+    return true
+}
+
+// Whatever does not carry the magic number is not a file system of this
+// kind. `mount` says so instead of interpreting foreign octets as inodes.
+fn mount(state: u64) -> bool {
+    let flags: u64 = sched.irq_save()
+    kstate.set(state, kstate.FS_READY, 0)
+    if !blk.read(state, 0, buf_sb(state)) {
+        sched.irq_restore(flags)
+        return false
+    }
+    if get64(buf_sb(state) + SB_MAGIC) != MAGIC {
+        sched.irq_restore(flags)
+        return false
+    }
+    if get64(buf_sb(state) + SB_BSIZE) != BS {
+        sched.irq_restore(flags)
+        return false
+    }
+    let r: u64 = get64(buf_sb(state) + SB_ROOT)
+    if inode_get(state, r, I_TYPE) != T_DIR {
+        sched.irq_restore(flags)
+        return false
+    }
+    kstate.set(state, kstate.FS_ROOT, r)
+    kstate.set(state, kstate.FS_READY, 1)
+    sched.irq_restore(flags)
+    return true
+}

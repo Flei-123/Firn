@@ -1,0 +1,185 @@
+// demos/kernel/blk.fi -- round 62: the block device.
+//
+// A file system does not talk to memory, it talks to BLOCKS. This file is
+// the whole interface between the two: read block n, write block n, 512
+// octets each, and nothing else. That the blocks currently lie in RAM is
+// the business of this file alone -- `fs.fi` never learns it.
+//
+// Two devices:
+//
+//   0  THE RAM DISK. A run of frames out of the frame allocator, one
+//      megabyte by default. Reading and writing is a copy; there is
+//      nothing to wait for.
+//   1  THE REAL DISK, over ATA PIO. The same 512 octets, but through four
+//      ports and a status register that has to be waited on. Whoever can
+//      read a block over PIO can read a disk -- and `fs.fi` does not have
+//      to change a line for it, which is exactly the point of the
+//      interface.
+//
+// The counter-check for the interface is in `tools/kernel/run.sh`: the
+// SAME file system test runs once on the RAM disk and once on a real
+// image that QEMU hands in as `-drive`, and afterwards the image on the
+// host has the file in it. A file system that only ever wrote to memory
+// would fail the second run.
+
+import serial
+import kstate
+
+export { ram_init, read, write, blocks, present, BLOCK_SIZE, DEV_RAM, DEV_ATA }
+
+const BLOCK_SIZE: u64 = 512
+const DEV_RAM: u64 = 0
+const DEV_ATA: u64 = 1
+
+// ------------------------------------------------------------- the RAM
+
+fn ram_init(state: u64, base: u64, blocks_n: u64) {
+    kstate.set(state, kstate.DISK, base)
+    kstate.set(state, kstate.DISK_BLOCKS, blocks_n)
+    kstate.set(state, kstate.DISK_DEV, DEV_RAM)
+}
+
+fn blocks(state: u64) -> u64 {
+    return kstate.get(state, kstate.DISK_BLOCKS)
+}
+
+fn copy(from: u64, to: u64) {
+    var i: u64 = 0
+    while i < BLOCK_SIZE / 8 {
+        __mmio_write64((to + i * 8) as *mut u64,
+                       __mmio_read64((from + i * 8) as *mut u64))
+        i = i + 1
+    }
+}
+
+// --------------------------------------------------------------- ATA
+
+// The primary bus, master drive. The ports are the ones every PC has had
+// since 1986; QEMU speaks them because everything speaks them.
+const ATA_DATA: u16 = 0x1F0
+const ATA_ERROR: u16 = 0x1F1
+const ATA_COUNT: u16 = 0x1F2
+const ATA_LBA0: u16 = 0x1F3
+const ATA_LBA1: u16 = 0x1F4
+const ATA_LBA2: u16 = 0x1F5
+const ATA_DRIVE: u16 = 0x1F6
+const ATA_CMD: u16 = 0x1F7              // write: command, read: status
+const ATA_CTRL: u16 = 0x3F6
+
+const ATA_READ: u8 = 0x20
+const ATA_WRITE: u8 = 0x30
+const ATA_FLUSH: u8 = 0xE7
+
+const ST_BSY: u64 = 0x80
+const ST_DRQ: u64 = 0x08
+const ST_ERR: u64 = 0x01
+
+fn in16(port: u16) -> u64 {
+    return asm("in ax, dx", out("rax"), in("dx") port) & 0xFFFF
+}
+
+fn out16(port: u16, value: u64) {
+    asm("out dx, ax", in("dx") port, in("ax") value as u16)
+}
+
+// Wait until the drive is no longer busy and has data. Bounded: a device
+// that never answers must not hang the kernel.
+fn ata_wait(want_drq: bool) -> bool {
+    var spin: u64 = 0
+    while spin < 4000000 {
+        let st: u64 = serial.in8(ATA_CMD) as u64
+        if (st & ST_BSY) == 0 {
+            if (st & ST_ERR) != 0 {
+                return false
+            }
+            if !want_drq {
+                return true
+            }
+            if (st & ST_DRQ) != 0 {
+                return true
+            }
+        }
+        spin = spin + 1
+    }
+    return false
+}
+
+fn ata_select(lba: u64) {
+    serial.out8(ATA_DRIVE, (0xE0 | ((lba >> 24) & 0x0F)) as u8)
+    serial.out8(ATA_COUNT, 1 as u8)
+    serial.out8(ATA_LBA0, (lba & 0xFF) as u8)
+    serial.out8(ATA_LBA1, ((lba >> 8) & 0xFF) as u8)
+    serial.out8(ATA_LBA2, ((lba >> 16) & 0xFF) as u8)
+}
+
+// Is there a drive at all? A bus without one reads 0xFF as status.
+fn present(state: u64) -> bool {
+    serial.out8(ATA_DRIVE, 0xE0 as u8)
+    serial.io_wait()
+    let st: u64 = serial.in8(ATA_CMD) as u64
+    if st == 0xFF || st == 0 {
+        return false
+    }
+    return true
+}
+
+fn ata_read(lba: u64, dst: u64) -> bool {
+    ata_select(lba)
+    serial.out8(ATA_CMD, ATA_READ)
+    if !ata_wait(true) {
+        return false
+    }
+    var i: u64 = 0
+    while i < BLOCK_SIZE / 2 {
+        __mmio_write16((dst + i * 2) as *mut u16, in16(ATA_DATA) as u16)
+        i = i + 1
+    }
+    return true
+}
+
+fn ata_write(lba: u64, src: u64) -> bool {
+    ata_select(lba)
+    serial.out8(ATA_CMD, ATA_WRITE)
+    if !ata_wait(true) {
+        return false
+    }
+    var i: u64 = 0
+    while i < BLOCK_SIZE / 2 {
+        out16(ATA_DATA, __mmio_read16((src + i * 2) as *mut u16) as u64)
+        i = i + 1
+    }
+    serial.out8(ATA_CMD, ATA_FLUSH)
+    return ata_wait(false)
+}
+
+// ------------------------------------------------------- the interface
+
+fn read(state: u64, lba: u64, dst: u64) -> bool {
+    if lba >= blocks(state) {
+        return false
+    }
+    if kstate.get(state, kstate.DISK_DEV) == DEV_ATA {
+        return ata_read(lba, dst)
+    }
+    let base: u64 = kstate.get(state, kstate.DISK)
+    if base == 0 {
+        return false
+    }
+    copy(base + lba * BLOCK_SIZE, dst)
+    return true
+}
+
+fn write(state: u64, lba: u64, src: u64) -> bool {
+    if lba >= blocks(state) {
+        return false
+    }
+    if kstate.get(state, kstate.DISK_DEV) == DEV_ATA {
+        return ata_write(lba, src)
+    }
+    let base: u64 = kstate.get(state, kstate.DISK)
+    if base == 0 {
+        return false
+    }
+    copy(src, base + lba * BLOCK_SIZE)
+    return true
+}
