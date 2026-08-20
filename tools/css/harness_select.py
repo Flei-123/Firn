@@ -62,6 +62,24 @@ def load_selectors():
     return out
 
 
+def read_document(path):
+    """A page, or the #html section of a case file."""
+    raw = open(path, "rb").read()
+    if not path.endswith(".txt"):
+        return raw
+    out = []
+    section = None
+    for line in raw.decode("utf-8").split("\n"):
+        if line.startswith("#") and line[1:].split(" ")[0] in (
+                "name", "html", "ua", "user", "author", "hover", "match",
+                "style", "spec", "end"):
+            section = line[1:].strip()
+            continue
+        if section == "html":
+            out.append(line)
+    return ("\n".join(out)).encode("utf-8")
+
+
 def build_job(html, selectors):
     job = struct.pack("<I", 0xFFFFFFFF)
     parts = [html, b"", b"", b"", ("\n".join(selectors) + "\n").encode("utf-8")]
@@ -143,7 +161,10 @@ def main():
 
     selectors = load_selectors()
     pages = sorted(glob.glob(os.path.join(CORPUS, "*.html")))
-    pages += sorted(glob.glob(os.path.join(CASES, "*.html")))
+    # The documents of the own cases run through the cross-check as well:
+    # they contain structures the real pages do not have (lists with
+    # exactly four items for nth-child, tables without tbody).
+    pages += sorted(glob.glob(os.path.join(CASES, "*.txt")))
     if max_pages:
         pages = pages[:max_pages]
 
@@ -162,7 +183,7 @@ def main():
     failures = []
     total_elements = 0
     for path in pages:
-        html = open(path, "rb").read()
+        html = read_document(path)
         p = subprocess.run([binary], input=build_job(html, selectors),
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                            timeout=900)
