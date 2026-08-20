@@ -8,17 +8,17 @@ round adds the other case, which `SPEC.md` §6.2 has demanded since v0.1 and
 which `DESIGN_GOALS.md` §1 presumes for `Io`: **one call site, many types.**
 
 ```firn
-interface Flaeche {
-    fn flaeche(*self) -> i64
-    fn skaliere(*mut self, k: i64)
+interface Area {
+    fn area(*self) -> i64
+    fn scale(*mut self, k: i64)
 }
 
-impl Flaeche for Rechteck { … }
-impl Flaeche for Kreis    { … }
+impl Area for Rect   { ... }
+impl Area for Circle { ... }
 
-let f: dyn Flaeche = (&r) as dyn Flaeche
-f.flaeche()          // über die Methodentafel — welcher Code läuft,
-                     // steht erst zur Laufzeit fest
+let f: dyn Area = (&r) as dyn Area
+f.area()             // through the method table -- which code runs is
+                     // settled only at run time
 ```
 
 ---
@@ -26,13 +26,13 @@ f.flaeche()          // über die Methodentafel — welcher Code läuft,
 ## 1. The representation — binding
 
 ```text
-interface I      -> Struct "dyn I" in types::TypeCtx, 16 Byte:
-                      daten: *mut u8   (Versatz 0) — der Wert selbst
-                      tafel: *mut u8   (Versatz 8) — die Methodentafel
-dyn I            -> genau dieser Struct (ein FETTER ZEIGER, kein Zeiger)
-impl I for T     -> Methodentafel `.L__iface.I.T` in `.rodata`:
+interface I      -> struct "dyn I" in types::TypeCtx, 16 byte:
+                      data:  *mut u8   (offset 0) -- the value itself
+                      table: *mut u8   (offset 8) -- the method table
+dyn I            -> exactly this struct (a FAT POINTER, not a pointer)
+impl I for T     -> method table `.L__iface.I.T` in `.rodata`:
                       .quad T__m1
-                      .quad T__m2      (Reihenfolge = Reihenfolge in `I`)
+                      .quad T__m2      (order = the order in `I`)
 ```
 
 The internal struct name carries a **space** (`"dyn I"`) — the same
@@ -61,13 +61,13 @@ The entire language change thereby sits in the parser, the type checker and
 | Instruction | Textual form | Meaning |
 |---|---|---|
 | `Op::CallIndirect { target, args }` | `calli.i64 %7(%3, %4)` | call via a pointer; otherwise everything is as with `Call` |
-| `Op::VtabAddr { tafel }` | `vtab.ptr @Flaeche.Kreis` | address of a method table (`.rodata`) |
+| `Op::VtabAddr { table }` | `vtab.ptr @Area.Circle` | address of a method table (`.rodata`) |
 
 Both produce the same instruction in **both** code paths of `firnc0` (base
 path and register allocation) and in `firnc1`:
 
 ```asm
-    lea rax, [rip + .L__iface.Flaeche.Kreis]
+    lea rax, [rip + .L__iface.Area.Circle]
     …
     call rax
 ```
@@ -96,7 +96,7 @@ additionally attaches a method table would be the worst place to start
 with it.
 
 ```firn
-let f: dyn Flaeche = (&r) as dyn Flaeche
+let f: dyn Area = (&r) as dyn Area
 ```
 
 The parentheses around `&r` are mandatory — `as` binds more tightly than
@@ -107,7 +107,7 @@ In the lowering that is exactly two words:
 
 ```text
 store.ptr %zeiger, [%ziel + 0]
-%t = vtab.ptr @Flaeche.Kreis
+%t = vtab.ptr @Area.Circle
 store.ptr %t,     [%ziel + 8]
 ```
 
@@ -119,11 +119,11 @@ That is the precondition for section 5.
 ## 4. The call
 
 ```text
-%b = <adresse des schnittstellenwertes>
-%d = load.ptr [%b + 0]      ; der Wert selbst
-%t = load.ptr [%b + 8]      ; die Methodentafel
-%z = load.ptr [%t + 8*k]    ; die k-te Methode der Schnittstelle
-%r = calli.i64 %z(%d, …)
+%b = <address of the interface value>
+%d = load.ptr [%b + 0]      ; the value itself
+%t = load.ptr [%b + 8]      ; the method table
+%z = load.ptr [%t + 8*k]    ; the k-th method of the interface
+%r = calli.i64 %z(%d, ...)
 ```
 
 Three loads and one indirect jump per call. The price is thereby visibly
@@ -163,12 +163,12 @@ other root left.
 chance:
 
 * 64 `gc class` cells are created and stored **exclusively** as
-  `dyn Zaehler` in an array in the frame,
-* afterwards 20.000 unreachable cells (`muell`) come into being, and the
+  `dyn Counter` in an array in the frame,
+* afterwards 20.000 unreachable cells (`garbage`) come into being, and the
   runtime collects on its own while that happens,
 * after two explicit `gc_collect()` calls **at most 200** objects are alive
   — so the 20.000 have really been swept — and the 64 values are unchanged,
-* after that a write goes through the interface (`dazu`) and is read back.
+* after that a write goes through the interface (`add`) and is read back.
 
 If the fat pointers were not roots, the 64 cells would have been swept
 along and their memory handed out to the garbage; the sum afterwards would
@@ -198,7 +198,7 @@ with a clear statement for a class.
 registration of `gc.rs`, and that is filled during **parsing**.
 `gc class K` therefore has to stand before the `impl` block (in the same
 file or in one read in earlier). If it stands after it, the type checker
-reports „'K' ist eine gc-klasse und kann kein wert sein" — understandable,
+reports "'K' is a gc class and cannot be a value" -- understandable,
 but not the message one would wish for. Both compilers behave the same way
 here, because both read the same registration at the same point in time.
 
@@ -228,9 +228,9 @@ Every message names the line, the column and, in the hint, the **expected
 signature**:
 
 ```
-error: 'Kreis' setzt die methode 'Flaeche.skaliere' nicht um
+error: 'Circle' does not implement the method 'Area.scale'
   --> tests/neg/iface_method_missing.fi:13:6
-   = hinweis: erwartet wird 'fn skaliere(*mut self, i64)' im block
+   = note: 'fn scale(*mut self, i64)' is expected in the block
 ```
 
 All 14 negative tests are rejected by `firnc1` as well. With
@@ -247,11 +247,11 @@ Methods of an interface are **ordinary functions**: `impl I for T`
 creates exactly the same `T__m` as `impl T` from round 45. The interface
 only additionally says what **must** be in there. It follows that:
 
-* The static call remains possible (`r.flaeche()`), and it is the same
+* The static call remains possible (`r.area()`), and it is the same
   code that the table names.
 * A second `impl` block without an interface for the same type is allowed.
 * A free function may still have the same name (`tests/820`:
-  `flaeche(a, b)` next to `Rechteck.flaeche()`).
+  `area(a, b)` next to `Rect.area()`).
 
 **Via `dyn` only what stands in the interface is reachable** — even when
 the concrete type can do more. Otherwise the table would not be the whole
@@ -260,8 +260,8 @@ truth.
 ### Modules
 
 `interface` names are valid **program-wide** and are not renamed — like
-enums and `gc class` (`SPEC.md` §14.1 T6). An `impl Groesse for Kreis`
-in a module, by contrast, produces `zeichnen__Kreis__groesse`, and exactly
+enums and `gc class` (`SPEC.md` §14.1 T6). An `impl Size for Circle`
+in a module, by contrast, produces `draw__Circle__size`, and exactly
 that name has to stand in the table.
 
 The type name in the registration stands there as it was written in the
@@ -318,7 +318,7 @@ comparison stays exact.
   would need a function without a type behind it and a rule for what name
   it carries. Today an error with a clear statement instead of a syntax
   error.
-* **Static resolution over interfaces** (`fn f[T: Flaeche](x: T)`,
+* **Static resolution over interfaces** (`fn f[T: Area](x: T)`,
   `SPEC.md` §6.2, first half-sentence). That is the monomorphization side
   and belongs to the requirements on type parameters (§14.1 T7) — a round
   of its own.
