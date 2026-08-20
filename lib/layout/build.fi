@@ -1,0 +1,273 @@
+// lib/layout/build.fi -- from the DOM with computed styles to the BOX TREE.
+//
+// This step is short and is nevertheless the one that decides whether the
+// numbers afterwards can be right at all, because it is where the box tree
+// stops being the DOM tree:
+//
+//   * `display: none` produces no box, and no box for any descendant.
+//   * A floated or absolutely positioned elem is BLOCKIFIED: `float:
+//     left` on a `span` makes a block box out of it (CSS 2.1, 9.7).
+//   * A block container that has BOTH block-level and inline-level
+//     children wraps every run of inline children in an ANONYMOUS BLOCK
+//     (CSS 2.1, 9.2.1.1). Without that step a `<div>text<p>x</p></div>` is
+//     one pixel high and everything below it sits wrong.
+//   * White space between two block-level boxes produces no box at all.
+//
+// What is NOT done here is named openly: a block-level box inside an
+// INLINE box has to split the inline box into three parts. Instead the
+// inline box is promoted to a block box -- see docs/ROUND61.md.
+import html.mem
+import browser.node
+import browser.names
+import css.cascade
+import layout.box
+
+export {
+    build_document, build_subtree, chain_all_space,
+}
+
+fn style_of(styles: Gc[GcMap], k: Gc[Node], fallback: Gc[Style]) -> Gc[Style] {
+    let s: Gc[Style] = gcmap_get_value[Style](styles, k as u64)
+    if s == gc_null[Style]() {
+        return fallback
+    }
+    return s
+}
+
+// Is the text node nothing but white space? Walked over the STRANDS, not
+// with `chain_at` -- the latter is O(n/28) per character and would turn
+// the check into O(n^2) on a long paragraph.
+fn chain_all_space(k: Gc[Chain]) -> bool {
+    if k == gc_null[Chain]() {
+        return true
+    }
+    var s: Gc[Strand] = k.first
+    while s != gc_null[Strand]() {
+        var i: usize = 0
+        let n: usize = s.len as usize
+        while i < n {
+            let c: u32 = s.chars[i]
+            if c != 32 as u32 && c != 9 as u32 && c != 10 as u32 &&
+               c != 13 as u32 && c != 12 as u32 {
+                return false
+            }
+            i = i + 1
+        }
+        s = s.next
+    }
+    return true
+}
+
+// The kind of box an elem makes. `out_of_flow` blockifies -- that is
+// the rule that makes `float: left` on a `span` behave like a `div`.
+fn box_kind_for(s: Gc[Style], out_of_flow: bool) -> u32 {
+    let d: u32 = cascade.style_display(s)
+    if d == cascade.D_FLEX {
+        return box.BK_FLEX
+    }
+    if d == cascade.D_INLINE_FLEX {
+        if out_of_flow {
+            return box.BK_FLEX
+        }
+        return box.BK_ATOMIC
+    }
+    if d == cascade.D_INLINE_BLOCK || d == cascade.D_INLINE_TABLE {
+        if out_of_flow {
+            return box.BK_BLOCK
+        }
+        return box.BK_ATOMIC
+    }
+    if d == cascade.D_INLINE {
+        if out_of_flow {
+            return box.BK_BLOCK
+        }
+        return box.BK_INLINE
+    }
+    return box.BK_BLOCK
+}
+
+// Does the box open its own block formatting context?
+fn bfc_for(s: Gc[Style], kind: u32, out_of_flow: bool, root: bool) -> bool {
+    if root || out_of_flow {
+        return true
+    }
+    if kind == box.BK_ATOMIC || kind == box.BK_FLEX {
+        return true
+    }
+    if cascade.style_overflow(s) != cascade.OV_VISIBLE {
+        return true
+    }
+    return false
+}
+
+fn is_br(k: Gc[Node], nm: *mut names.Names) -> bool {
+    if !node.node_is_elem(k) {
+        return false
+    }
+    var lit: [u8; 2] = "br"
+    return names.names_equal_ascii(nm, node.elem_name(k), &lit[0], 2)
+}
+
+// One node -> at most one box. Returns null for `display: none`, for
+// comments and for everything without a box.
+fn build_node(k: Gc[Node], styles: Gc[GcMap], parent_style: Gc[Style],
+              nm: *mut names.Names, root: bool) -> AllocError!Gc[Box] {
+    if k.kind == node.K_TEXT {
+        let t: Gc[Text] = k as Gc[Text]
+        let b = try box.box_new(box.BK_TEXT, parent_style, k)
+        return b
+    }
+    if k.kind != node.K_ELEM {
+        return gc_null[Box]()
+    }
+    let s: Gc[Style] = style_of(styles, k, parent_style)
+    if cascade.style_display(s) == cascade.D_NONE {
+        return gc_null[Box]()
+    }
+    let pos: u32 = cascade.style_position(s)
+    let abs: bool = pos == cascade.POS_ABSOLUTE || pos == cascade.POS_FIXED
+    var flt: u32 = cascade.style_float(s)
+    if abs {
+        flt = cascade.FLOAT_NONE      // `position: absolute` beats `float`
+    }
+    let out_of_flow: bool = abs || flt != cascade.FLOAT_NONE
+    let kind: u32 = box_kind_for(s, out_of_flow)
+    let b = try box.box_new(kind, s, k)
+    if abs {
+        b.flags = b.flags | box.F_ABS
+    }
+    if flt != cascade.FLOAT_NONE {
+        b.flags = b.flags | box.F_FLOAT
+    }
+    if bfc_for(s, kind, out_of_flow, root) {
+        b.flags = b.flags | box.F_BFC
+    }
+    if is_br(k, nm) {
+        // `<br>` is not a box but a forced break. It is kept as an empty
+        // inline box and recognized again in the inline layout.
+        b.kind = box.BK_INLINE
+        b.flags = b.flags | box.F_REPLACED
+        return b
+    }
+    let ok: bool = try build_children(b, k, styles, s, nm)
+    return b
+}
+
+// Does this elem have at least one block-level child box? Asked BEFORE
+// building, because the answer decides whether anonymous blocks are
+// needed, and an anonymous block cannot be inserted afterwards without
+// moving what has already been built.
+fn has_block_children(k: Gc[Node], styles: Gc[GcMap], parent_style: Gc[Style])
+        -> bool {
+    var c: Gc[Node] = k.first_child
+    while c != gc_null[Node]() {
+        if c.kind == node.K_ELEM {
+            let s: Gc[Style] = style_of(styles, c, parent_style)
+            if cascade.style_display(s) != cascade.D_NONE {
+                let pos: u32 = cascade.style_position(s)
+                let abs: bool = pos == cascade.POS_ABSOLUTE ||
+                                pos == cascade.POS_FIXED
+                let flt: bool = cascade.style_float(s) != cascade.FLOAT_NONE
+                if !abs && !flt {
+                    let kind: u32 = box_kind_for(s, false)
+                    if box.is_block_level(kind) {
+                        return true
+                    }
+                }
+            }
+        }
+        c = c.next
+    }
+    return false
+}
+
+fn build_children(parent: Gc[Box], k: Gc[Node], styles: Gc[GcMap],
+                  parent_style: Gc[Style], nm: *mut names.Names)
+        -> AllocError!bool {
+    let mixed: bool = has_block_children(k, styles, parent_style)
+    if mixed {
+        parent.flags = parent.flags | box.F_HAS_BLOCKS
+    }
+    var anon: Gc[Box] = gc_null[Box]()
+    var c: Gc[Node] = k.first_child
+    while c != gc_null[Node]() {
+        let kid = try build_node(c, styles, parent_style, nm, false)
+        if kid != gc_null[Box]() {
+            let out_of_flow: bool =
+                (kid.flags & (box.F_ABS | box.F_FLOAT)) != 0 as u32
+            if !mixed {
+                let ok: bool = try box.box_add(parent, kid)
+            } else if out_of_flow {
+                // A float or an absolutely positioned box is NOT inline
+                // content -- it must not land in an anonymous block, or
+                // the line box of that block would give it a height it
+                // does not have.
+                let oko: bool = try box.box_add(parent, kid)
+            } else if box.is_block_level(kid.kind) {
+                anon = gc_null[Box]()
+                let ok2: bool = try box.box_add(parent, kid)
+            } else {
+                // Inline-level content, and out-of-flow boxes that stand
+                // among it: they belong to the same anonymous block, so
+                // that a float keeps its place between two paragraphs.
+                var drop: bool = false
+                if kid.kind == box.BK_TEXT {
+                    let t: Gc[Text] = c as Gc[Text]
+                    if chain_all_space(t.data) {
+                        // White space between block-level boxes makes no
+                        // box at all -- CSS 2.1, 9.2.1.1.
+                        drop = anon == gc_null[Box]()
+                    }
+                }
+                if !drop {
+                    if anon == gc_null[Box]() {
+                        anon = try box.box_new(box.BK_ANON, parent_style,
+                                               gc_null[Node]())
+                        let ok3: bool = try box.box_add(parent, anon)
+                    }
+                    let ok4: bool = try box.box_add(anon, kid)
+                }
+            }
+            // A block-level box inside an INLINE box: the standard splits
+            // the inline box in three. Instead it is promoted to a block
+            // box here -- named in docs/ROUND61.md as a known deviation.
+            if parent.kind == box.BK_INLINE && box.is_block_level(kid.kind) &&
+               !out_of_flow {
+                parent.kind = box.BK_BLOCK
+                parent.flags = parent.flags | box.F_HAS_BLOCKS
+            }
+        }
+        c = c.next
+    }
+    return true
+}
+
+// The whole document. Returns the box of the ROOT ELEMENT (`html`), the
+// one that everything else hangs on.
+fn build_document(doc: Gc[Node], styles: Gc[GcMap], root_style: Gc[Style],
+                  nm: *mut names.Names) -> AllocError!Gc[Box] {
+    var c: Gc[Node] = doc.first_child
+    while c != gc_null[Node]() {
+        if c.kind == node.K_ELEM {
+            let s: Gc[Style] = style_of(styles, c, root_style)
+            if cascade.style_display(s) == cascade.D_NONE {
+                return gc_null[Box]()
+            }
+            let b = try box.box_new(box.BK_BLOCK, s, c)
+            // The root elem ALWAYS opens a block formatting context,
+            // and its margins never collapse with those of its children.
+            b.flags = b.flags | box.F_BFC
+            let ok: bool = try build_children(b, c, styles, s, nm)
+            return b
+        }
+        c = c.next
+    }
+    return gc_null[Box]()
+}
+
+// A subtree on its own -- used by the endurance run, which builds and
+// drops box trees without a document around them.
+fn build_subtree(k: Gc[Node], styles: Gc[GcMap], parent_style: Gc[Style],
+                 nm: *mut names.Names) -> AllocError!Gc[Box] {
+    return try build_node(k, styles, parent_style, nm, true)
+}
