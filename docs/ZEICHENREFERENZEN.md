@@ -1,20 +1,20 @@
-# Zeichenreferenzen im HTML5-Tokenizer (`lib/html/entities.fi`)
+# Character references in the HTML5 tokenizer (`lib/html/entities.fi`)
 
-Modul `tokenizer-text` aus `PLAN.md` §1. Setzt die Zeichenreferenz-Zustaende
-des WHATWG-HTML-Standards (§13.2.5.72 – §13.2.5.80) **in Firn** um und liefert
-die offizielle Namenstabelle mit **2.231** Eintraegen.
+Module `tokenizer-text` from `PLAN.md` §1. Implements the character
+reference states of the WHATWG HTML standard (§13.2.5.72 – §13.2.5.80)
+**in Firn** and provides the official name table with **2.231** entries.
 
-## Dateien
+## Files
 
-| Datei | Rolle |
+| File | Role |
 |---|---|
-| `lib/html/entities.fi` | Zustaende, Namenssuche, numerische Referenzen (Firn, ~330 Zeilen) |
-| `lib/html/entities_data.fi` | **erzeugte** Namenstabelle als u64-Woerter (Firn, ~4.660 Zeilen) |
-| `tools/tokenizer/gen_entities.py` | Erzeuger der Tabelle aus `html.entities.html5` |
-| `lib/html/entities_probe.fi` | Pruefstand: fahre nur den Zeichenreferenz-Teil (Firn) |
-| `tools/tokenizer/check_entities.py` | Werkbank: Pruefstand gegen die html5lib-Daten |
+| `lib/html/entities.fi` | states, name lookup, numeric references (Firn, ~330 lines) |
+| `lib/html/entities_data.fi` | the **generated** name table as u64 words (Firn, ~4.660 lines) |
+| `tools/tokenizer/gen_entities.py` | generator of the table from `html.entities.html5` |
+| `lib/html/entities_probe.fi` | test bench: run the character reference part only (Firn) |
+| `tools/tokenizer/check_entities.py` | workbench: test bench against the html5lib data |
 
-## Schnittstelle (Vertrag mit `lib/html/tokenizer.fi`, PLAN.md §2.3)
+## Interface (contract with `lib/html/tokenizer.fi`, PLAN.md §2.3)
 
 ```
 fn char_ref(input: *mut mem.CpBuf, pos: usize, in_attr: bool,
@@ -23,39 +23,40 @@ fn char_ref_out(input: *mut mem.CpBuf, pos: usize, in_attr: bool,
                 s: *mut tokens.Sink, out: u32) -> usize
 ```
 
-`pos` zeigt hinter das `&`. Rueckgabe ist die neue Position; ausgegeben wird
-ueber `tokens.sink_emit_char` bzw. — bei `in_attr` — ueber
-`tokens.tok_attr_value_push`. Der Aufruf kann nicht fehlschlagen: im
-schlechtesten Fall wird das `&` selbst ausgegeben. Es gibt hier **keinen**
-Zustand „nicht unterstuetzt".
+`pos` points behind the `&`. The return value is the new position; output
+goes through `tokens.sink_emit_char` resp. — with `in_attr` — through
+`tokens.tok_attr_value_push`. The call cannot fail: in the
+worst case the `&` itself is emitted. There is **no** state
+„not supported" here.
 
-`char_ref_out` ist dieselbe Funktion mit getrenntem Ausgabeschalter
-(`out == 0` -> Zeichenstrom, sonst Attributwert), falls die Sonderregel des
-Standards und das Ausgabeziel einmal auseinanderfallen sollen.
+`char_ref_out` is the same function with a separate output switch
+(`out == 0` -> character stream, otherwise attribute value), in case the
+special rule of the standard and the output target should ever come apart.
 
-## Umgesetzte Regeln
+## Implemented rules
 
-* **Character reference state**: `#` -> numerisch, alphanumerisch -> Name,
-  sonst nur `&` ausgeben.
-* **Named character reference state**: laengster Treffer zuerst, Namen mit und
-  ohne Semikolon (`&amp` genauso wie `&amp;`), Ersatz mit einem **oder zwei**
-  Codepunkten (93 der 2.231 Eintraege haben zwei).
-* **Sonderregel im Attributwert**: Name ohne Semikolon, gefolgt von `=` oder
-  einem alphanumerischen Zeichen -> nicht ersetzen, Text unveraendert.
-* **Ambiguous ampersand state**: kein Treffer -> `&` und die alphanumerische
-  Folge unveraendert; `;` wird dem aufrufenden Zustand zurueckgegeben.
-* **Numeric character reference**: dezimal und hexadezimal (`&#x…`/`&#X…`),
-  fehlendes Semikolon erlaubt, fehlende Ziffern geben `&#`/`&#x` woertlich aus,
-  Ueberlauf wird abgefangen (Zahlen > 0x10FFFF).
-* **Numeric character reference end state**: `0`, Werte > 0x10FFFF und
-  Surrogate werden zu U+FFFD; die C1-Ersetzungstabelle (0x80–0x9F, 27 Werte)
-  ist vollstaendig umgesetzt.
+* **Character reference state**: `#` -> numeric, alphanumeric -> name,
+  otherwise emit only `&`.
+* **Named character reference state**: longest match first, names with and
+  without a semicolon (`&amp` just like `&amp;`), replacement with one
+  **or two** code points (93 of the 2.231 entries have two).
+* **Special rule in an attribute value**: a name without a semicolon,
+  followed by `=` or an alphanumeric character -> do not replace, text
+  unchanged.
+* **Ambiguous ampersand state**: no match -> `&` and the alphanumeric
+  sequence unchanged; `;` is given back to the calling state.
+* **Numeric character reference**: decimal and hexadecimal (`&#x…`/`&#X…`),
+  a missing semicolon permitted, missing digits emit `&#`/`&#x` verbatim,
+  overflow is caught (numbers > 0x10FFFF).
+* **Numeric character reference end state**: `0`, values > 0x10FFFF and
+  surrogates become U+FFFD; the C1 replacement table (0x80–0x9F, 27 values)
+  is fully implemented.
 
-## Namenstabelle: warum erzeugter Quelltext
+## The name table: why generated source text
 
-Stufe 0 kennt weder Zeichenkettenliterale noch globale Felder (`const` nur
-skalar, siehe SPEC §14.1). Die Tabelle wird deshalb als Folge von
-u64-Woertern in einen Speicherbereich geschrieben:
+Stage 0 knows neither string literals nor global arrays (`const` only
+scalar, see SPEC §14.1). The table is therefore written as a sequence of
+u64 words into a memory area:
 
 ```
 0            u64   Kennung
@@ -66,59 +67,61 @@ OFF_POS      u32[] Anfang je Name — beim ersten Zugriff berechnet
 BYTES        u32[] Verzeichnis nach erstem Zeichen (256 × Anfang/Ende)
 ```
 
-Der Bereich liegt an fester Adresse `0x6000_0000_0000` und wird beim ersten
-Zugriff mit `mmap(MAP_FIXED_NOREPLACE)` angelegt; meldet der Kern `EEXIST`,
-ist er schon da (die Kennung wird geprueft). Gesucht wird mit einer
-Binaersuche innerhalb des Bereichs, den das Verzeichnis fuer das erste
-Zeichen vorgibt; der Bewerber steht in einem Feld auf dem Stapel
-(`[u32; 33]`) — eine Zeichenreferenz fordert **keinen** Speicher an.
+The area lies at the fixed address `0x6000_0000_0000` and is created on
+first access with `mmap(MAP_FIXED_NOREPLACE)`; if the kernel reports
+`EEXIST`, it is already there (the identifier is checked). The lookup is a
+binary search inside the range that the directory gives for the first
+character; the candidate stands in an array on the stack
+(`[u32; 33]`) — a character reference requests **no** memory.
 
-Die Tabelle stammt aus `html.entities.html5` der Python-Standardbibliothek
-(offizielle WHATWG-Liste), **nicht** aus den Testdaten:
+The table comes from `html.entities.html5` of the Python standard library
+(the official WHATWG list), **not** from the test data:
 
 ```
 python3 tools/tokenizer/gen_entities.py
 ```
 
-## Nachweis
+## Proof
 
 ```
 compiler/target/release/firnc -o .tokenizer-work/entities_probe lib/html/entities_probe.fi
 python3 tools/tokenizer/check_entities.py
 ```
 
-Der Pruefstand nimmt aus den offiziellen html5lib-Daten alle Faelle, die sich
-allein mit dem Zeichenreferenz-Teil entscheiden lassen (Data state, kein `<`,
-Erwartung nur Character-Token) und vergleicht Zeichen fuer Zeichen:
+The test bench takes from the official html5lib data all cases that can be
+decided with the character reference part alone (data state, no `<`,
+expectation only character tokens) and compares character by character:
 
 ```
 Zeichenreferenzen (lib/html/entities.fi), reine Data-state-Faelle
   bestanden: 4657 / 4657
 ```
 
-Das ist ein **Modulnachweis, keine Bilanz** — die verbindliche Zahl ueber alle
-6.810 Faelle liefert allein `tools/tokenizer/run.sh`. Dort schlagen die
-Zeichenreferenzen mit `namedEntities.test` 4210/4210, `numericEntities.test`
-336/336 und `entities.test` 80/80 zu Buche (letzteres enthaelt auch die
-Attributwert-Sonderfaelle, die der enge Pruefstand nicht abdeckt).
+That is a **module proof, not a balance** — the binding number over all
+6.810 cases is delivered by `tools/tokenizer/run.sh` alone. There the
+character references contribute `namedEntities.test` 4210/4210,
+`numericEntities.test` 336/336 and `entities.test` 80/80 (the last one also
+contains the attribute value special cases that the narrow test bench does
+not cover).
 
-## Kosten, ehrlich
+## Costs, honestly
 
-* Ein `mmap`-Aufruf je Zeichenreferenz (die Pruefung „liegt die Tabelle schon
-  da?" ist ohne globale Variablen nicht ohne Systemaufruf zu haben). Auf dem
-  Messrechner rund 1 µs; auf dem entity-lastigen Messkorpus (302.912 `&` in
-  4,08 MB) sind das etwa 0,12 s von rund 0,9 s Gesamtzeit. Sobald Stufe 0
-  globale Daten kennt, faellt das weg — bis dahin steht es hier.
-* Die Suche selbst kostet rund 0,9 µs je Referenz (Binaersuche im
-  Erstzeichen-Bereich).
-* Ohne Zeichenreferenzen braucht derselbe Korpus rund 0,48 s, mit ihnen rund
-  0,89 s CPU-Zeit. `html5ever` braucht fuer denselben Korpus 0,34 s — Faktor
-  2,6x fuer den gesamten Firn-Tokenizer (Messung und Messart:
-  `bench/tokenizer/README.md`).
+* One `mmap` call per character reference (the check „is the table already
+  there?" cannot be had without a system call in the absence of global
+  variables). On the measuring machine around 1 µs; on the entity-heavy
+  measuring corpus (302.912 `&` in 4,08 MB) that is about 0,12 s of around
+  0,9 s total time. As soon as stage 0 knows global data, this falls away —
+  until then it is stated here.
+* The lookup itself costs around 0,9 µs per reference (binary search in the
+  first-character range).
+* Without character references the same corpus needs around 0,48 s, with
+  them around 0,89 s of CPU time. `html5ever` needs 0,34 s for the same
+  corpus — a factor of 2,6x for the whole Firn tokenizer (measurement and
+  method: `bench/tokenizer/README.md`).
 
-## Offen
+## Open
 
-* Keine Zwischenspeicherung des Tabellenzeigers (siehe oben).
-* `char_ref` meldet keine Parse-Fehler nach aussen; die html5lib-Bilanz
-  vergleicht nur den Tokenstrom, `ParseError`-Eintraege werden im Harness
-  ohnehin entfernt.
+* No caching of the table pointer (see above).
+* `char_ref` reports no parse errors to the outside; the html5lib balance
+  compares only the token stream, and `ParseError` entries are removed in
+  the harness anyway.

@@ -1,49 +1,49 @@
-# `Rc` / `Weak` — Stufe 2 des Speichermodells
+# `Rc` / `Weak` — level 2 of the memory model
 
-Bezug: `SPEC.md` §3.2 (drei Stufen), §3.4 (`Rc[T]`, `Weak[T]`, `Arc[T]`),
-§3.6 (Rohzeiger), `DESIGNZIELE.md` §2 (fehlbare Allokation),
-`../karstos-browser/FIRN-ANFORDERUNGEN.md` Anforderung **S7**.
+Reference: `SPEC.md` §3.2 (three levels), §3.4 (`Rc[T]`, `Weak[T]`,
+`Arc[T]`), §3.6 (raw pointers), `DESIGNZIELE.md` §2 (fallible allocation),
+`../karstos-browser/FIRN-ANFORDERUNGEN.md` requirement **S7**.
 
-Diese Datei beschreibt, was im Baum steht, wie es benutzt wird, und **was
-bewusst fehlt**. Alles hier Behauptete ist mit einem Testprogramm belegt, das
-`bash test.sh` in drei Baustufen faehrt.
-
----
-
-## 1. Wozu
-
-Stufe 2 ist fuer **geteilte, unveraenderliche** Werte: berechnete Stilwerte,
-internierte Atome, Schriftdaten. Genau die Faelle, in denen Stylo `Arc` nimmt.
-Ein Wert, viele Leser, keine Aenderung, Freigabe beim letzten Leser.
-
-`Rc` ist **nicht** das Werkzeug fuer den DOM — siehe Abschnitt 6.
+This file describes what is in the tree, how it is used, and **what is
+deliberately missing**. Everything claimed here is backed by a test program
+that `bash test.sh` runs in three build stages.
 
 ---
 
-## 2. Wo es liegt
+## 1. What for
 
-| Datei | Rolle |
+Level 2 is for **shared, immutable** values: computed style values,
+interned atoms, font data. Exactly the cases in which Stylo takes `Arc`.
+One value, many readers, no modification, release at the last reader.
+
+`Rc` is **not** the tool for the DOM — see section 6.
+
+---
+
+## 2. Where it lives
+
+| File | Role |
 |---|---|
-| `tests/modules/rc.fi` | **die eine Implementierung** (Modul `rc`) |
-| `lib/rc/rc.fi` | Symlink auf genau diese Datei — der Bibliothekspfad existiert, ohne Code zu doppeln |
-| `lib/rc/parts/*.fi` | die Rumpfe der Testprogramme |
-| `lib/rc/gen_tests.sh` | setzt Rumpf + Implementierung zu `tests/55*_rc_*.fi` und `tests/neg/rc_*.fi` zusammen |
-| `tests/550_rc_basic.fi` … `554`, `tests/neg/rc_*.fi` | die erzeugten Testprogramme |
+| `tests/modules/rc.fi` | **the one implementation** (module `rc`) |
+| `lib/rc/rc.fi` | symlink to exactly this file — the library path exists without duplicating code |
+| `lib/rc/parts/*.fi` | the bodies of the test programs |
+| `lib/rc/gen_tests.sh` | assembles body + implementation into `tests/55*_rc_*.fi` and `tests/neg/rc_*.fi` |
+| `tests/550_rc_basic.fi` … `554`, `tests/neg/rc_*.fi` | the generated test programs |
 
-**Warum zusammenkopiert und nicht `import modules.rc`?** Stufe 0 loest
-generische Vorlagen nicht ueber Modulgrenzen auf. Beide Formen scheitern
-bereits im Parser:
+**Why copied together and not `import modules.rc`?** Stage 0 does not
+resolve generic templates across module boundaries. Both forms already fail
+in the parser:
 
 ```
 var a: rc.Zaehlverweis[Stil] = …   // error: erwartet '=' nach dem namen in einer 'var'-anweisung
 rc.rc_neu[Stil](&h, w, &a)         // error: nur direkte funktionsnamen koennen aufgerufen werden
 ```
 
-(`compiler/src/sema_generic.rs::hook_generic_call` verlangt einen einfachen
-`Ident`; das Modulsystem liefert an dieser Stelle einen `Field`-Ausdruck.)
-Dieselbe Loesung benutzt `lib/str` bereits seit Runde 2
-(`tools/strlib/expand.py`): die Bibliothek steht **einmal** im Baum und wird
-woertlich in die Testprogramme eingesetzt. Erzeugen mit
+(`compiler/src/sema_generic.rs::hook_generic_call` demands a simple
+`Ident`; the module system delivers a `Field` expression at this place.)
+`lib/str` has been using the same solution since round 2
+(`tools/strlib/expand.py`): the library stands **once** in the tree and is
+inserted verbatim into the test programs. Generate with
 
 ```
 bash lib/rc/gen_tests.sh
@@ -51,7 +51,7 @@ bash lib/rc/gen_tests.sh
 
 ---
 
-## 3. Schnittstelle
+## 3. Interface
 
 ```firn
 error AllocError { OutOfMemory }
@@ -61,28 +61,28 @@ struct Schwachverweis[T]{ block: usize }   // = Weak[T] aus SPEC §3.4
 struct RcHeap { … }                        // Halde fester Kapazitaet
 ```
 
-| Funktion | Bedeutung |
+| Function | Meaning |
 |---|---|
-| `rc_heap_init(h, bytes) -> bool` | Halde per `mmap` anlegen. `false` = fehlgeschlagen — **sichtbarer** Fehlschlag, kein stiller Ersatz. Kein `MAP_FIXED`, keine feste Adresse. |
+| `rc_heap_init(h, bytes) -> bool` | create the heap via `mmap`. `false` = failed — a **visible** failure, no silent substitute. No `MAP_FIXED`, no fixed address. |
 | `rc_heap_frei(h)` | `munmap` |
-| `rc_neu[T](h, wert, aus) -> AllocError!bool` | Wert auf die Halde legen, starker Verweis nach `*aus`. **Fehlbar** (DESIGNZIELE §2), Ergebnis ist `#[must_consume]`. |
-| `rc_lesen[T](r) -> T` | **nur lesen** — liefert eine Kopie |
-| `rc_klonen[T](r) -> Zaehlverweis[T]` | starker Zaehler + 1 |
-| `rc_freigeben[T](h, r)` | starker Zaehler − 1, leert `*r`; bei 0 und ohne schwachen Verweis geht der Block in die Freiliste |
-| `rc_stark_zahl[T](r)`, `rc_schwach_zahl[T](r)` | Zaehlerstaende, messbar |
-| `rc_leer[T]()`, `rc_ist_leer[T](r)`, `rc_gleich[T](a,b)` | Nullwert, Test, Identitaet |
-| `weak_von[T](r) -> Schwachverweis[T]` | schwacher Verweis, haelt **nicht** am Leben |
-| `aufwerten[T](w) -> Zaehlverweis[T]` | Aufwertung; **sichtbar leer**, wenn der starke Zaehler 0 ist |
-| `weak_freigeben[T](h, w)` | schwacher Zaehler − 1; gibt den Block frei, wenn auch stark 0 ist |
-| `rc_heap_lebende/belegte_bytes/allokationen/freigaben(h)` | echte Zaehlwerte fuer Tests und Messungen |
-| `rc_roh_adresse`, `rc_wert_adresse`, `rc_roh_verweis` | Rohzugriff nach SPEC §3.6, ausdruecklich fuer Werkzeuge und den Leck-Nachweis |
+| `rc_neu[T](h, wert, aus) -> AllocError!bool` | put a value on the heap, strong reference into `*aus`. **Fallible** (DESIGNZIELE §2), the result is `#[must_consume]`. |
+| `rc_lesen[T](r) -> T` | **read only** — returns a copy |
+| `rc_klonen[T](r) -> Zaehlverweis[T]` | strong counter + 1 |
+| `rc_freigeben[T](h, r)` | strong counter − 1, clears `*r`; at 0 and without a weak reference the block goes into the free list |
+| `rc_stark_zahl[T](r)`, `rc_schwach_zahl[T](r)` | counter values, measurable |
+| `rc_leer[T]()`, `rc_ist_leer[T](r)`, `rc_gleich[T](a,b)` | null value, test, identity |
+| `weak_von[T](r) -> Schwachverweis[T]` | weak reference, does **not** keep alive |
+| `aufwerten[T](w) -> Zaehlverweis[T]` | upgrade; **visibly empty** if the strong counter is 0 |
+| `weak_freigeben[T](h, w)` | weak counter − 1; releases the block if strong is 0 as well |
+| `rc_heap_lebende/belegte_bytes/allokationen/freigaben(h)` | real counts for tests and measurements |
+| `rc_roh_adresse`, `rc_wert_adresse`, `rc_roh_verweis` | raw access according to SPEC §3.6, explicitly for tools and the leak proof |
 
-Blocklayout: 32 Byte Kopf (`stark`, `schwach`, `klasse`, Freilisten-Verkettung),
-danach der Wert. Acht Groessenklassen 64 … 8192 Byte mit je einer Freiliste;
-groessere Nutzlasten sind `AllocError::OutOfMemory` (belegt in
+Block layout: a 32-byte header (`stark`, `schwach`, `klasse`, free list
+links), then the value. Eight size classes 64 … 8192 bytes with one free
+list each; larger payloads are `AllocError::OutOfMemory` (demonstrated in
 `tests/553_rc_fallible.fi`).
 
-### Beispiel
+### Example
 
 ```firn
 var h: RcHeap = heap_leer()
@@ -101,25 +101,25 @@ rc_freigeben[Stil](&h, &a)                       // stark = 0 -> Block frei
 
 ---
 
-## 4. `Rc` ist IMMER unveraenderlich
+## 4. `Rc` is ALWAYS immutable
 
-Es gibt kein `RefCell`-Aequivalent, keine Innenveraenderlichkeit und in diesem
-Modul **keine schreibende Funktion**. `rc_lesen` liefert eine Kopie; der
-Versuch, ueber sie den geteilten Wert zu aendern, ist ein Compilerfehler:
+There is no `RefCell` equivalent, no interior mutability and **no writing
+function** in this module. `rc_lesen` returns a copy; the
+attempt to modify the shared value through it is a compiler error:
 
 ```
 tests/neg/rc_unveraenderlich.fi:396:5
 error: linke seite ist kein zuweisbarer ausdruck (variable, feld, index oder '*zeiger')
 ```
 
-Wer teilen **und** aendern will, nimmt `Gc[T]` (SPEC §3.5) oder einen Lock.
+Whoever wants to share **and** modify takes `Gc[T]` (SPEC §3.5) or a lock.
 
 ---
 
-## 5. Fehlbare Allokation
+## 5. Fallible allocation
 
-`rc_neu` liefert `AllocError!bool`. Ein verworfenes Ergebnis ist ein
-Compilerfehler:
+`rc_neu` returns `AllocError!bool`. A discarded result is a
+compiler error:
 
 ```
 tests/neg/rc_discarded.fi:393:5
@@ -127,81 +127,81 @@ error: das ergebnis darf nicht verworfen werden: der typ 'AllocError!bool'
        ist mit #[must_consume] gekennzeichnet
 ```
 
-`tests/553_rc_fallible.fi` belegt: Halde mit einer Seite → 64 Bloecke, die 65.
-Allokation meldet `AllocError::OutOfMemory`, der Ausgabeverweis bleibt leer;
-nach einer Freigabe gelingt die naechste Allokation wieder; eine zu grosse
-Nutzlast scheitert ebenfalls sauber; `try` reicht den Fehler durch die
-Aufrufkette.
+`tests/553_rc_fallible.fi` establishes: a heap with one page → 64 blocks,
+the 65th allocation reports `AllocError::OutOfMemory` and the output
+reference stays empty; after one release the next allocation succeeds
+again; a payload that is too large also fails cleanly; `try` passes the
+error through the call chain.
 
-Anders als beim GC gibt es hier **keinen Sammellauf vor dem Fehler** — die
-Zaehlung gibt sofort frei, es gibt nichts nachzuholen.
+Unlike with the GC there is **no collection before the failure** here — the
+counting releases immediately, there is nothing to catch up on.
 
 ---
 
-## 6. Zyklen lecken — und warum `Rc` fuer den DOM nicht vorgesehen ist
+## 6. Cycles leak — and why `Rc` is not intended for the DOM
 
-**Das ist kein Fehler dieser Umsetzung, sondern die Eigenschaft der Zaehlung.**
-Halten sich zwei Werte gegenseitig stark, faellt kein Zaehler je auf 0. Der
-Speicher bleibt bis zum Programmende gehalten.
+**That is not a bug of this implementation but the property of counting.**
+If two values hold each other strongly, no counter ever falls to 0. The
+memory stays held until the end of the program.
 
-`tests/552_rc_cycle_leak.fi` macht das sichtbar statt es zu verstecken.
-Gemessene Ausgabe (in allen drei Baustufen gleich):
+`tests/552_rc_cycle_leak.fi` makes that visible instead of hiding it.
+Measured output (the same in all three build stages):
 
 ```
 1 1 2 128 200 12800 198 1 0
 ```
 
-* `1 1` — nach dem Verwerfen **beider** aeusseren Griffe stehen beide starken
-  Zaehler weiter auf 1: der Zyklus haelt sich selbst.
-* `2 128` — zwei lebende Bloecke, 128 belegte Bytes, obwohl niemand mehr
-  herankommt.
-* `200 12800` — nach 100 angelegten **und verworfenen** Zyklen sind es 200
-  Bloecke und 12.800 Bytes. Der Verbrauch waechst monoton: ein Leck.
-* `198` — von Hand aufgeloest wird nur der eine Zyklus, dessen Adressen der
-  Test noch kennt. Fuer die uebrigen 99 ist die Adresse weg — genau das ist die
-  Lage im echten Programm.
-* `1 0` — dieselbe Struktur mit `Weak` statt einem zweiten starken Verweis:
-  die Aufwertung liefert sichtbar leer (`1`) und am Ende sind **null** Bloecke
-  belegt (`0`).
+* `1 1` — after discarding **both** outer handles, both strong
+  counters still stand at 1: the cycle holds itself.
+* `2 128` — two live blocks, 128 occupied bytes, although nobody can
+  reach them any more.
+* `200 12800` — after 100 cycles created **and discarded** there are 200
+  blocks and 12.800 bytes. The consumption grows monotonically: a leak.
+* `198` — resolved by hand is only the one cycle whose addresses the
+  test still knows. For the other 99 the address is gone — that is exactly
+  the situation in a real program.
+* `1 0` — the same structure with `Weak` instead of a second strong
+  reference: the upgrade visibly returns empty (`1`) and at the end **zero**
+  blocks are occupied (`0`).
 
-Zum Vergleich `tests/554_rc_dauerlauf.fi`: 20.000 Runden mit Anlegen, Klonen,
-schwachen Verweisen und Freigeben **ohne** Zyklus enden mit
-`20000 0 0 192 1` — null lebende Objekte, null belegte Bytes, und die Halde
-waechst nie ueber 192 Byte hinaus (die Freilisten werden wiederverwendet).
-Die Zaehlung selbst leckt also nicht; nur der Zyklus tut es.
+For comparison `tests/554_rc_dauerlauf.fi`: 20.000 rounds with creating,
+cloning, weak references and releasing **without** a cycle end with
+`20000 0 0 192 1` — zero live objects, zero occupied bytes, and the heap
+never grows beyond 192 bytes (the free lists are reused).
+So the counting itself does not leak; only the cycle does.
 
-Weil `Rc` immer unveraenderlich ist, laesst sich ein Zyklus mit gewoehnlichem
-Anwendungscode nicht einmal bauen — der Test traegt den Rueckverweis ueber
-einen Rohzeiger nach (SPEC §3.6). Mit Innenveraenderlichkeit (die es hier
-bewusst nicht gibt) waere derselbe Zyklus normaler Anwendungscode.
+Because `Rc` is always immutable, a cycle cannot even be built with
+ordinary application code — the test adds the back reference over
+a raw pointer (SPEC §3.6). With interior mutability (which deliberately
+does not exist here) the same cycle would be ordinary application code.
 
-### Der DOM
+### The DOM
 
-Ein DOM besteht fast nur aus Zyklen: Elternverweis **und** Kinderliste,
-Listener, die ihren Knoten halten, waehrend der Knoten den Listener haelt,
-live `HTMLCollection`s, JS-Wrapper, die den Knoten halten, waehrend der Knoten
-seinen Wrapper haelt. Jeder dieser Zyklen leckt unter Zaehlung. Von Hand
-`Weak` zu setzen funktioniert nur, wenn der Zyklus **offensichtlich und lokal**
-ist — beim DOM ist er weder das eine noch das andere.
+A DOM consists almost entirely of cycles: parent reference **and** child
+list, listeners that hold their node while the node holds the listener,
+live `HTMLCollection`s, JS wrappers that hold the node while the node
+holds its wrapper. Every one of these cycles leaks under counting. Setting
+`Weak` by hand only works if the cycle is **obvious and local** —
+with the DOM it is neither the one nor the other.
 
-Deshalb steht in `SPEC.md` §3.4 ausdruecklich: **`Rc` ist fuer den DOM nicht
-vorgesehen.** Dafuer gibt es Stufe 3, den Opt-in-Tracing-GC aus §3.5
-(`gc class`, `Gc[T]`, `GcWeak[T]`). `Rc` bleibt fuer geteilte, unveraenderliche
-Blaetter des Graphen: Stilwerte, Atome, Schriftdaten.
+That is why `SPEC.md` §3.4 says explicitly: **`Rc` is not intended for the
+DOM.** For that there is level 3, the opt-in tracing GC from §3.5
+(`gc class`, `Gc[T]`, `GcWeak[T]`). `Rc` remains for shared, immutable
+leaves of the graph: style values, atoms, font data.
 
 ---
 
-## 7. Abweichungen von SPEC §3.4 und offene Punkte
+## 7. Deviations from SPEC §3.4 and open points
 
-Diese Punkte gehoeren nach `SPEC.md` §14.1; sie werden hier vollstaendig
-aufgezaehlt und sind **nicht** in der SPEC wegretuschiert.
+These points belong in `SPEC.md` §14.1; they are enumerated here
+completely and are **not** retouched away in the SPEC.
 
-| Nr. | Abweichung | Grund |
+| No. | Deviation | Reason |
 |---|---|---|
-| A1 | Die Typen heissen `Zaehlverweis[T]` / `Schwachverweis[T]`, nicht `Rc[T]` / `Weak[T]` | `Rc`, `Arc`, `Weak` sind im Parser als noch nicht umgesetzte Typkonstruktoren reserviert (`compiler/src/parser.rs::nicht_umgesetzter_typ`) und melden „ist in Stufe 0 nicht umgesetzt". Ein reines Firn-Modul kann diese Namen nicht belegen; die Compilerquellen gehoeren in dieser Runde anderen Modulen. Die **Funktionsnamen** folgen dem Vertrag. |
-| A2 | `rc_neu(…)` statt `Rc[T].neu(…)` | Stufe 0 kennt keine Methoden |
-| A3 | `h: *mut RcHeap` statt `inout alloc` | Stufe 0 kennt kein `inout` |
-| A4 | Rueckgabe `AllocError!bool` + Ausgabezeiger statt `AllocError!Rc[T]` | Die Monomorphisierung setzt Typargumente in der Nutzlast einer Fehlerunion nicht ein: `fn f[T](..) -> AllocError!Zaehlverweis[T]` meldet „unbekannter typ 'Zaehlverweis__T'". Die Allokation bleibt vollstaendig fehlbar und `#[must_consume]`. |
-| A5 | `Arc[T]` ist seit **Runde 47** gebaut: `lib/rc/arc.fi`, Typen `Atomverweis[T]`/`AtomSchwachverweis[T]`, Zaehler wirklich atomar (`__atomar_addieren` -> `lock xadd`, `compiler/src/atomic.rs`) | Nachweis `tools/atomic/run.sh` und `tests/830`-`833`. Ehrlich benannt bleibt: `aufwerten_atomar` braucht fuer echte Nebenlaeufigkeit einen Vergleichs-Tausch, den Runde 47 nicht baut, und Faeden hat Stufe 0 weiterhin keine (SPEC §7). Siehe `docs/RUNDE47.md`. |
-| A6 | Keine Destruktoren: in einem Wert gespeicherte Verweise muessen von Hand geloest werden | `drop` (SPEC §3.3) ist in Stufe 0 nicht gebaut. Betrifft nur Werte, die selbst Verweise enthalten. |
-| A7 | Halde mit fester Kapazitaet, kein Nachwachsen | macht die Allokation ehrlich fehlbar und ist die Grundlage fuer Speichergrenzen pro Auftrag |
+| A1 | The types are called `Zaehlverweis[T]` / `Schwachverweis[T]`, not `Rc[T]` / `Weak[T]` | `Rc`, `Arc`, `Weak` are reserved in the parser as type constructors that are not yet implemented (`compiler/src/parser.rs::nicht_umgesetzter_typ`) and report „ist in Stufe 0 nicht umgesetzt". A pure Firn module cannot occupy these names; the compiler sources belong to other modules in this round. The **function names** follow the contract. |
+| A2 | `rc_neu(…)` instead of `Rc[T].neu(…)` | stage 0 knows no methods |
+| A3 | `h: *mut RcHeap` instead of `inout alloc` | stage 0 knows no `inout` |
+| A4 | return `AllocError!bool` + output pointer instead of `AllocError!Rc[T]` | monomorphization does not substitute type arguments in the payload of an error union: `fn f[T](..) -> AllocError!Zaehlverweis[T]` reports „unbekannter typ 'Zaehlverweis__T'". The allocation stays fully fallible and `#[must_consume]`. |
+| A5 | `Arc[T]` has been built since **round 47**: `lib/rc/arc.fi`, types `Atomverweis[T]`/`AtomSchwachverweis[T]`, counters really atomic (`__atomar_addieren` -> `lock xadd`, `compiler/src/atomic.rs`) | proof `tools/atomic/run.sh` and `tests/830`-`833`. Honestly named it remains: `aufwerten_atomar` needs a compare and exchange for real concurrency, which round 47 does not build, and stage 0 still has no threads (SPEC §7). See `docs/RUNDE47.md`. |
+| A6 | No destructors: references stored in a value have to be released by hand | `drop` (SPEC §3.3) is not built in stage 0. Affects only values that themselves contain references. |
+| A7 | Heap with a fixed capacity, no growing | it makes the allocation honestly fallible and is the basis for memory limits per job |
