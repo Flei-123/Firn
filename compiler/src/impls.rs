@@ -65,7 +65,7 @@
 //!   `struct name ++ "__" ++ method` still holds afterwards — it always
 //!   computes with the name that the type carries at that point.
 //! * Generic types (`Vec[T]`) have no methods during this round; see
-//!   `docs/RUNDE45.md`, section "deliberately left out".
+//!   `docs/ROUND45.md`, section "deliberately left out".
 
 use crate::ast::{Expr, ExprKind, FnDecl, Param, Program, TypeExpr, UnOp};
 use crate::diag::Span;
@@ -285,7 +285,7 @@ fn method(p: &mut Parser, prog: &mut Program, ty: &str, tsp: Span) -> bool {
 /// value exists on the heap only, a pointer to it is the only way to touch
 /// it (SPEC §3.5.1). Whether `K` is a class is recorded in the registry of
 /// `gc.rs`; it is filled while parsing, which is why `gc class K` has to
-/// stand BEFORE the `impl` block (docs/RUNDE46.md §9). The internal name
+/// stand BEFORE the `impl` block (docs/ROUND46.md §9). The internal name
 /// is not renamed by `modules.rs` — rightly so: class names hold
 /// program wide.
 fn self_param(p: &mut Parser, ty: &str, tsp: Span) -> Option<Param> {

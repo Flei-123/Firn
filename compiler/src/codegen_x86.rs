@@ -165,7 +165,7 @@ pub fn emit(m: &Module) -> Result<String, String> {
     // A program with `fn main() -> i32` notices nothing of it (it never reads
     // `rdi`); one with `fn main(start: u64) -> i32` reaches its call arguments
     // that way. Without it `firnc1` could accept no file name
-    // (docs/SELBSTHOSTING.md §2, point 3).
+    // (docs/SELF_HOSTING.md §2, point 3).
     e.line("mov rdi, rsp");
     e.line("and rsp, -16");
     e.line(&format!("call {}", label("main")));

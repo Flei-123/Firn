@@ -53,7 +53,7 @@ html5ever and still needs less time per instruction. Both numbers are
 honest, they only measure different things. This round prints the
 instruction count because it is reproducible to the instruction — the wall
 clock scattered on this machine between 2,58× and 2,85× **for the same
-binary** (docs/RUNDE43.md). During this round two further rounds ran in
+binary** (docs/ROUND43.md). During this round two further rounds ran in
 parallel on the same machine; wall clock values are therefore **not** cited
 as evidence at all.
 

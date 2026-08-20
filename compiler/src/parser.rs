@@ -1641,7 +1641,7 @@ impl<'a> Parser<'a> {
                 // The escape belongs to the text segment — the bracket scan
                 // must not misread a \" as the end of the literal (the quotes
                 // are already gone here); '{')}' does not appear escaped
-                // in the core version (docs/RUNDE39.md).
+                // in the core version (docs/ROUND39.md).
                 i += 2;
                 continue;
             }

@@ -352,7 +352,7 @@ incremental):
 What counts is the **compute time of the thread**. Several rounds ran at
 the same time on this machine; the wall clock then measures preemption,
 not the collector (wrong finding of round 40). `callgrind` is out of the
-question — it shifts the stack (`docs/RUNDE47.md` §4.1).
+question — it shifts the stack (`docs/ROUND47.md` §4.1).
 
 ### 6.1 Run I — 7 runs of 5 s each
 
@@ -456,7 +456,7 @@ question. `r53_pausen.sh` therefore sets the threshold to 0.
 * **Coloring the buffer gray by hand when it grows.** Not necessary (§2),
   and it would have concealed the bug that `tests/841` is supposed to find.
 * **`callgrind` for the pause measurement.** It shifts the stack; known
-  since round 47 and justified in `docs/RUNDE47.md` §4.1.
+  since round 47 and justified in `docs/ROUND47.md` §4.1.
 
 ---
 

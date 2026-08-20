@@ -21,7 +21,7 @@
 # WHAT COUNTS IS THE COMPUTE TIME OF THE THREAD (K <phase> 21). On this
 # machine several rounds run at the same time; the wall clock then measures
 # preemption, not the collector (the wrong finding of round 40). callgrind
-# is out of the question: it shifts the stack (docs/RUNDE47.md 4.1).
+# is out of the question: it shifts the stack (docs/ROUND47.md 4.1).
 #
 # Environment:
 #   R53_RUNS   runs per case (default 7, the median is reported)

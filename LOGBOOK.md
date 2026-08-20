@@ -14,7 +14,7 @@ with callgrind for the first time.
 MEASUREMENTS: longest pause in CPU TIME median 460 us (baseline 469 us, 7 runs each), throughput
 unchanged, 150 s run with 48.4 million finalizers RSS constant at 1372 KiB, 0 out of 253698 pauses
 above 1 ms (CPU time). Instructions +4.6 % without weak fields, +12.1 % in the weak-heaviest case;
-the first attempt was at +21.1 % -- four measured rollbacks in the sweep loop (docs/RUNDE47.md 4.3).
+the first attempt was at +21.1 % -- four measured rollbacks in the sweep loop (docs/ROUND47.md 4.3).
 Two blocks instead of one in __gc_alloc_raw cost 3.3 million instructions on their own, because
 register allocation tipped over.
 LESSON LEARNED: tests/520 and 535 retained 1 and 126 unreachable objects respectively after the

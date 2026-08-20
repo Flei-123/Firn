@@ -9,7 +9,7 @@ expectation.
 Data format: the `.dat` format of the html5lib `tree-construction` tests.
 Deliberately exactly that one and not one of our own -- once the original
 data is available, this runner runs against it without a change (see
-docs/RUNDE54.md).
+docs/ROUND54.md).
 
 Rules of honesty:
   * EVERY case from all .dat files is counted. There is no

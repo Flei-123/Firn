@@ -299,10 +299,10 @@ still missing:
   **Since round 44** collection is incremental (longest pause 0.45 ms),
   **since round 47** there are **finalizers** (`S4`), weak fields are **really
   zeroed** on collection (`S3`), there are **external root ranges** and `Arc[T]`
-  with an **atomic** counter (`lib/rc/arc.fi`, `docs/RUNDE47.md`).
+  with an **atomic** counter (`lib/rc/arc.fi`, `docs/ROUND47.md`).
   Since round 53 there are **`GcVec[T]` and `GcMap[K,V]`** -- collections with a
   variable length that the collector really traces, even while they grow
-  (`lib/gc/gcvec.fi`, `lib/gc/gcmap.fi`, `docs/RUNDE53.md`). The DOM prototype
+  (`lib/gc/gcvec.fi`, `lib/gc/gcmap.fi`, `docs/ROUND53.md`). The DOM prototype
   uses them: 5000 children on one node, any number of attributes.
   **What stays open:** the 24 hour run from ACCEPTANCE.md item 2, fragmentation
   with changing object sizes, `virtual`, and, for the collections, the nominal
@@ -334,7 +334,7 @@ still missing:
 * **Package management** (`W1`) -- there is a module system, but no registry, no
   lock file, no reproducible two-machine build
 * **aarch64**, **WASM**, **an LLVM backend**, self-hosting (stages 1-3 of the
-  ROADMAP; inventory in `docs/SELBSTHOSTING.md`)
+  ROADMAP; inventory in `docs/SELF_HOSTING.md`)
 
 ### Known weaknesses that round 2 did NOT fix
 
@@ -1044,7 +1044,7 @@ DESIGN_GOALS.md          10 foundation decisions (async colours, fallible
 ACCEPTANCE.md               the six acceptance items with real measurements
 docs/FIR.md              the own IR: instructions, types, invariants
 docs/DEBUGGER.md         .debug_line + a gdb session copied verbatim
-docs/SELBSTHOSTING.md    what could already be written in Firn today
+docs/SELF_HOSTING.md    what could already be written in Firn today
 compiler/src/            29 modules: config.rs main.rs lexer.rs ast.rs parser.rs
                          diag.rs types.rs sema.rs sema_match.rs sema_generic.rs
                          errors.rs attrs.rs mono.rs modules.rs abi.rs fir.rs

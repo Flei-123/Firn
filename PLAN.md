@@ -189,7 +189,7 @@ foreign file, it writes it into a **file of its own** (Rust allows
 
 | Module | exclusively these files |
 |---|---|
-| **kern** | `compiler/src/lexer.rs`, `parser.rs`, `ast.rs`, `diag.rs`, `sema.rs`, `lower.rs`, `codegen_x86.rs`, new: `abi.rs`, `modules.rs`, `dwarf.rs`; `tests/1xx_*.fi`, `tests/neg/kern_*.fi`; `tools/testrunner/**`; `docs/SELBSTHOSTING.md` |
+| **kern** | `compiler/src/lexer.rs`, `parser.rs`, `ast.rs`, `diag.rs`, `sema.rs`, `lower.rs`, `codegen_x86.rs`, new: `abi.rs`, `modules.rs`, `dwarf.rs`; `tests/1xx_*.fi`, `tests/neg/kern_*.fi`; `tools/testrunner/**`; `docs/SELF_HOSTING.md` |
 | **types** | new: `compiler/src/sema_match.rs`, `sema_generic.rs`, `mono.rs`, `lower_match.rs`; the existing `codegen_switch.rs`; `tests/2xx_*.fi`, `tests/neg/match_*.fi`, `tests/neg/generic_*.fi` |
 | **str** | new: `compiler/src/strings.rs` (literals/types in the compiler), `lib/str/**.fi`, `lib/num/**.fi`; `tools/dtoa_vectors/**`; `tests/3xx_*.fi`, `tests/neg/str_*.fi` |
 | **opt** | `compiler/src/opt.rs`, new: `regalloc.rs`, `inline.rs`, `mem2reg.rs`; `tests/opt/**`, `test_opt.sh`; `bench/**` |

@@ -77,7 +77,7 @@ than the rejected change:
 
 ## The Firn side (firnc1)
 
-firnc1 deliberately contains NO optimizer (docs/SELBSTHOSTING.md: „The
+firnc1 deliberately contains NO optimizer (docs/SELF_HOSTING.md: „The
 optimizer comes last; firnc1 may work without it"). The fir comparison
 runs on `--emit=fir-raw`, i.e. BEFORE any optimization — changes to
 `opt.rs`/`inline.rs`/`regalloc.rs` do not change the compared raw FIR.

@@ -192,7 +192,7 @@ different codegen model (ROADMAP, after real register allocation).
 
 ## Addendum round 53 (19.08.2026): the prototype now uses collections
 
-`docs/RUNDE53.md` brought `GcVec`/`GcMap`, and `lib/dom/dom.fi` has been
+`docs/ROUND53.md` brought `GcVec`/`GcMap`, and `lib/dom/dom.fi` has been
 converted to them. What changed in the object graph:
 
 | before | now |
@@ -230,4 +230,4 @@ a set now leaks 13 objects of 128 bytes instead of 6 of 64, which is around
 time is at a median of **497 µs** (base before round 53: 477 µs), and not a
 single one of 538.936 measured interruptions is above 1,02 ms. Without the
 slicing of the buffer tracing it would be **2,67 ms** — the number is in
-`docs/RUNDE53.md` §1.1.
+`docs/ROUND53.md` §1.1.
