@@ -27,7 +27,7 @@ use crate::types::Type;
 const MAX_DEPTH: u32 = 200;
 
 /// Scalar FIR type for a source type; `None` for aggregates and for
-/// unresolved types (which the type check makes impossible, really).
+/// unresolved types, which after the type check should really be impossible.
 fn scalar_fty(t: &Type) -> Option<FTy> {
     Some(match t {
         Type::F64 => FTy::F64,
@@ -63,18 +63,18 @@ pub(crate) struct Lower<'a> {
     pub(crate) cur: BlockId,
     pub(crate) scopes: Vec<HashMap<String, Local>>,
     pub(crate) depth: u32,
-    /// Label of the function (key of the line table at `dwarf.rs`).
+    /// Name of the function (key of the line table in `dwarf.rs`).
     pub(crate) fname: String,
     /// Targets of `break` / `continue` per loop (outermost first), plus the
     /// depth of the `defer` stack when the loop got entered: a `break` runs
     /// exactly those deferred statements that got declared INSIDE the
     /// loop.
     pub(crate) loops: Vec<(BlockId, BlockId, usize)>,
-    /// Deferred statements per block level, ordered by their declaration;
-    /// executed gets backwards (SPEC §5.1). The `bool` is `true` for
+    /// Deferred statements per block level, in the order of their declaration;
+    /// they are executed backwards (SPEC §5.1). The `bool` is `true` for
     /// `errdefer`: the statement then runs ONLY on the error path.
     pub(crate) defers: Vec<Vec<(Stmt, bool)>>,
-    /// Hidden return pointer (`sret`), should the function yield one aggregate
+    /// Hidden return pointer (`sret`), if the function yields an aggregate
     /// over 8 bytes (see `abi.rs`).
     pub(crate) sret: Option<Val>,
     /// Source line assigned to the next instruction produced.
@@ -88,7 +88,7 @@ impl<'a> Lower<'a> {
     }
 
     /// Internal error: reachable only when the type check violates its promise.
-    /// Gets reported like any other diagnostic, never as a panic.
+    /// Reported as a normal diagnostic, never as a panic.
     pub(crate) fn ice<T>(&mut self, span: Span, what: &str) -> Option<T> {
         self.dg.error(
             span,
@@ -137,7 +137,7 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// `alloca` at the entry block. The insertion spot shifts the notes of the
+    /// `alloca` in the entry block. The insertion place shifts the notes of the
     /// line table, which is why every alloca runs through this wrapper.
     pub(crate) fn alloca(&mut self, size: u64, align: u64) -> Val {
         let at = self.f.blocks[0]
@@ -150,7 +150,7 @@ impl<'a> Lower<'a> {
         v
     }
 
-    /// Loads one aggregate as `n` 8-byte words (System V INTEGER class).
+    /// Loads an aggregate as `n` 8-byte words (System V INTEGER class).
     /// If the size is no multiple of 8, reading happens through a padded
     /// scratch buffer — otherwise the last `load` would reach partly beyond
     /// the object.
@@ -200,12 +200,12 @@ impl<'a> Lower<'a> {
         self.push_void(ty, Op::Store { addr, val })
     }
 
-    /// `base + off` bytes; a constant 0 gets left out.
+    /// `base + off` bytes; a constant 0 is left out.
     /// Raw address arithmetic `base + off`.
     ///
     /// **Do not use for field accesses** — `layout.rs` exists for that
     /// (`field_addr`, `field_addr_at`, `elem_addr`, `elem_addr_const`).
-    /// Direct calls are allowed for ABI word copies only and marked with
+    /// Direct calls are allowed for ABI word copies only and are marked with
     /// `// ABI-Wortkopie`; `tools/schichten/run.sh` checks that.
     pub(crate) fn ptradd_const(&mut self, base: Val, off: u64) -> Val {
         if off == 0 {
@@ -314,7 +314,7 @@ impl<'a> Lower<'a> {
                 Some(slot)
             }
             // HOOK iface: `((&x) as dyn I).m()` — the interface value gets
-            // a scratch place whose address stands here (iface.rs)
+            // a scratch place whose address is here (iface.rs)
             ExprKind::Cast(..) if crate::iface::is_dyn(&self.info.tcx, &self.ty_of(e)) => {
                 let t = self.ty_of(e);
                 let (size, align) = self.size_align(&t);
@@ -326,7 +326,7 @@ impl<'a> Lower<'a> {
             ExprKind::Call(name, args, _) if crate::lower_match::is_ctor(name) => {
                 crate::lower_match::lower_ctor_addr(self, e, name, args)
             }
-            // A call that yields one aggregate writes into a scratch slot;
+            // A call that yields an aggregate writes into a scratch slot;
             // its address is the result (see abi.rs).
             ExprKind::Call(name, args, span) => {
                 let t = self.ty_of(e);
@@ -405,7 +405,7 @@ impl<'a> Lower<'a> {
             ExprKind::Call(name, args, _) if crate::lower_match::is_ctor(name) => {
                 crate::lower_match::write_ctor_into(self, e, name, args, addr)
             }
-            // `x = f()` with aggregate result writes straight into the target.
+            // `x = f()` with an aggregate result writes directly into the target.
             ExprKind::Call(name, args, span) if is_agg(&t) => {
                 let name = name.clone();
                 let args = args.clone();
@@ -584,8 +584,8 @@ impl<'a> Lower<'a> {
         let av = self.lower_expr(a)?;
         let mut bv = self.lower_expr(b)?;
         if matches!(op, B::Shl | B::Shr) {
-            // The shift amount gets brought to the width of the left operand;
-            // the sort of shift follows `ft`.
+            // The shift amount is brought to the width of the left operand;
+            // the kind of shift follows `ft`.
             let bt = self.fty_of(b)?;
             if bt != ft {
                 bv = self.push(ft, Op::Cast { src: bv, from: bt });
@@ -617,7 +617,7 @@ impl<'a> Lower<'a> {
         Some(self.load(FTy::Bool, slot))
     }
 
-    /// One call following the calling convention of `abi.rs`.
+    /// A call following the calling convention of `abi.rs`.
     ///
     /// `dest` is the target address when the function yields one aggregate.
     /// Return: `Some(Some(v))` = scalar value, `Some(None)` = no value or
@@ -641,7 +641,7 @@ impl<'a> Lower<'a> {
         if crate::ct::is_ct_call(name) && !self.info.fns.contains_key(name) {
             return crate::ct::lower_ct_call(self, name, args, span);
         }
-        // HOOK sizeof: `size_of[T]()` is a constant — at runtime nothing of
+        // HOOK sizeof: `size_of[T]()` is a constant — at run time nothing of
         // it is left (sizeof.rs)
         if let Some(g) = crate::sizeof::value(name) {
             return Some(Some(self.constant(FTy::U64, g)));
@@ -660,17 +660,17 @@ impl<'a> Lower<'a> {
             Some(n) if !self.info.fns.contains_key(name) => n,
             _ => name,
         };
-        // HOOK impl: `x.m(a)` stands as `"method m"` at the tree. The resolution
-        // gets derived AFRESH here — out of the type of the receiver and the
-        // method label, exactly as at `sema` (impls.rs, round 45). Should the
-        // method demand a pointer while the receiver is present as a value,
-        // its ADDRESS gets passed.
+        // HOOK impl: `x.m(a)` appears as `"method m"` in the tree. The
+        // resolution is derived AFRESH here — from the type of the receiver
+        // and the method name, exactly as in `sema` (impls.rs, round 45). If
+        // the method demands a pointer and the receiver is present as a
+        // value, its ADDRESS is passed.
         let resolved;
         let mut receiver_address = false;
         // HOOK iface: `f.m(a)` on a `dyn I` — the dynamic dispatch
-        // (iface.rs, round 46). `dispatch` carries the CALL TARGET (out of the
+        // (iface.rs, round 46). `dispatch` carries the CALL TARGET (from the
         // method table) and the data pointer; everything else — aggregates,
-        // hidden return pointer, stack arguments — runs afterwards through
+        // hidden return pointer, stack arguments — then runs through
         // exactly the same code as any ordinary call.
         let mut dispatch: Option<(Val, Val)> = None;
         let mut dyn_sig: Option<crate::sema::FnSig> = None;
@@ -736,15 +736,15 @@ impl<'a> Lower<'a> {
             }
         }
         for (i, a) in args.iter().enumerate() {
-            // HOOK iface: the receiver is the data pointer out of the fat
-            // pointer — it got read above already (iface.rs)
+            // HOOK iface: the receiver is the data pointer from the fat
+            // pointer — it was read above already (iface.rs)
             if i == 0 {
                 if let Some((_, data)) = dispatch {
                     vals.push(data);
                     continue;
                 }
             }
-            // HOOK impl: the receiver enters as address (impls.rs)
+            // HOOK impl: the receiver goes in as an address (impls.rs)
             if i == 0 && receiver_address {
                 let addr = self.lower_addr(a)?;
                 vals.push(addr);
@@ -801,7 +801,7 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// Writes `[value; N]` to the address `addr`. The value gets evaluated
+    /// Writes `[value; N]` to the address `addr`. The value is evaluated
     /// EXACTLY ONCE and then multiplied.
     fn lower_repeat(&mut self, addr: Val, val: &Expr, et: &Type, n: u64) -> Option<()> {
         let esz = self.info.tcx.size_of(et).max(1);
@@ -899,11 +899,11 @@ impl<'a> Lower<'a> {
             r = self.lower_stmt(s);
         }
         // Deferred statements of this level, backwards. They run BEFORE
-        // `leave()`, so that the labels of the block are still visible.
+        // `leave()`, so that the names of the block are still visible.
         //
-        // Should the block have been left through `return`/`break`/`continue`,
-        // they got executed there already; whatever still gets produced here
-        // lands at the unreachable block behind the jump and falls victim to
+        // If the block was left through `return`/`break`/`continue`, they
+        // have already been executed there; whatever is still produced here
+        // lands in the unreachable block behind the jump and falls victim to
         // the code cleanup. So nothing runs twice.
         let list = self.defers.pop().unwrap_or_default();
         for (d, only_error) in list.iter().rev() {
@@ -921,10 +921,10 @@ impl<'a> Lower<'a> {
     }
 
     /// Return WITH cleanup: executes all deferred statements of the function
-    /// and sets the terminator afterwards.
+    /// and then sets the terminator.
     ///
-    /// The return value is computed by that point — that is deliberate and
-    /// matches Zig and C++: a `defer` sees the finished value and can no
+    /// The return value has been computed by that point — that is deliberate
+    /// and matches Zig and C++: a `defer` sees the finished value and can no
     /// longer replace it.
     pub(crate) fn ret_term(&mut self, v: Option<Val>) {
         self.lower_defers_to(0, false);
@@ -941,9 +941,9 @@ impl<'a> Lower<'a> {
     /// Executes the deferred statements of all levels above `depth` —
     /// innermost level first, backwards within one level.
     ///
-    /// The stack stays UNCHANGED along the way: `lower_block` clears its own
-    /// level. Should cleanup happen once more further down after a `return`,
-    /// that happens within some unreachable block.
+    /// The stack stays UNCHANGED in the process: `lower_block` clears its own
+    /// level. If cleanup happens once more further down after a `return`,
+    /// that happens in an unreachable block.
     pub(crate) fn lower_defers_to(&mut self, depth: usize, with_error: bool) -> Option<()> {
         let mut r = Some(());
         let mut i = self.defers.len();
@@ -962,7 +962,7 @@ impl<'a> Lower<'a> {
         r
     }
 
-    /// Is there any active `errdefer` within this function at all?
+    /// Is there any active `errdefer` in this function at all?
     pub(crate) fn has_errdefer(&self) -> bool {
         self.defers.iter().any(|l| l.iter().any(|(_, only_error)| *only_error))
     }
@@ -1002,13 +1002,13 @@ impl<'a> Lower<'a> {
                 match value {
                     Some(v) => {
                         let t = self.ty_of(v);
-                        // HONEST LIMIT (SPEC §14.1 F5): should a FINISHED error
-                        // union be returned — that is, neither
-                        // `return E::Variant` nor a success value that gets
-                        // converted first — then only at runtime is it settled
-                        // whether this is the error path. Stage 0 does not decide
-                        // that; rather than passing `errdefer` over silently, the
-                        // case gets rejected. With a conversion `t` is the SOURCE
+                        // HONEST LIMIT (SPEC §14.1 F5): if a FINISHED error
+                        // union is returned — neither `return E::Variant`
+                        // nor a success value that is converted first —
+                        // then only at run time is it settled whether this
+                        // is the error path. Stage 0 does not decide that;
+                        // instead of silently skipping `errdefer`, the case
+                        // is rejected. With a conversion `t` is the SOURCE
                         // type and this condition does not apply.
                         if self.has_errdefer() && crate::errors::union_of(&t).is_some() {
                             return self.err(
@@ -1021,7 +1021,7 @@ impl<'a> Lower<'a> {
                             r?;
                         } else if is_agg(&t) {
                             // Aggregate return per abi.rs: through the
-                            // hidden pointer or as one word at rax.
+                            // hidden pointer or as one word in rax.
                             let size = self.info.tcx.size_of(&t);
                             match self.sret {
                                 Some(dst) => {
@@ -1044,13 +1044,13 @@ impl<'a> Lower<'a> {
                     }
                     None => self.ret_term(None),
                 }
-                // Everything after it is unreachable: open a new block, so that the
-                // invariant "one terminator per block" holds.
+                // Everything after it is unreachable: open a new block, so that
+                // the invariant "one terminator per block" holds.
                 let dead = self.new_block();
                 self.cur = dead;
                 Some(())
             }
-            // Just note it down — executed gets it when the block gets left.
+            // Just note it down — it is executed when the block is left.
             Stmt::Defer(inner, only_error, span) => {
                 match self.defers.last_mut() {
                     Some(list) => {
@@ -1190,7 +1190,7 @@ impl<'a> Lower<'a> {
         let islot = self.alloca(bytes, bytes);
         let sv = self.lower_expr(start)?;
         self.store(ft, islot, sv);
-        // The upper bound gets evaluated ONCE.
+        // The upper bound is evaluated ONCE.
         let eslot = self.alloca(bytes, bytes);
         let ev = self.lower_expr(end)?;
         self.store(ft, eslot, ev);
@@ -1307,7 +1307,7 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
         }
     }
     let rf = if is_agg(&sig.ret) {
-        // aggregate: either pointer (sret) or one word at rax
+        // aggregate: either a pointer (sret) or one word in rax
         if sret {
             FTy::Ptr
         } else {
@@ -1324,8 +1324,8 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
     };
 
     let mut f = Func::new(&d.name, pf.clone(), rf);
-    // HOOK kern: `#[interrupt]` — own calling convention at the code generator
-    // (core.rs/codegen_x86.rs, round 52).
+    // HOOK kern: `#[interrupt]` — its own calling convention in the code
+    // generator (core.rs/codegen_x86.rs, round 52).
     f.interrupt = crate::core::has_interrupt(d);
     dwarf::set_fn(&d.name, d.span.file, d.span.line);
     let mut lo = Lower {
@@ -1347,7 +1347,7 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
         next = 1;
     }
     lo.enter();
-    // Parameters get a slot and get saved at the entry block.
+    // Parameters get a slot and are saved in the entry block.
     for (i, p) in d.params.iter().enumerate() {
         let ty = match sig.params.get(i) {
             Some(t) => t.clone(),
@@ -1365,8 +1365,8 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
             Some(ParamKind::Words(n)) => {
                 let n = *n;
                 let (size, align) = lo.size_align(&ty);
-                // The slot gets padded to full words, so that the stores of
-                // the words lie completely within the object.
+                // The slot is padded to full words, so that the stores of
+                // the words lie entirely inside the object.
                 let slot = lo.alloca(size.max(n as u64 * 8), align.max(8));
                 let ws: Vec<Val> = (0..n)
                     .map(|k| {
@@ -1412,7 +1412,7 @@ pub fn lower(prog: &Program, info: &TypeInfo, dg: &mut Diags) -> Option<Module> 
     if !ok {
         return None;
     }
-    // Check the invariant rather than merely claiming it.
+    // Check the invariant instead of merely claiming it.
     for f in &m.funcs {
         for b in &f.blocks {
             if matches!(b.term, Term::Unset) {
@@ -1749,7 +1749,7 @@ mod tests {
         assert!(t.contains("alloca.ptr size=16 align=4"), "{}", t);
         assert!(t.contains("ptradd.ptr"), "{}", t);
         assert!(t.contains("mul.u64"), "{}", t);
-        // all allocas at the entry block
+        // all allocas in the entry block
         let f0 = &m.funcs[0];
         for b2 in &f0.blocks[1..] {
             assert!(!b2.insts.iter().any(|i| matches!(i.op, Op::Alloca { .. })));

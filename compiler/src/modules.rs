@@ -2,19 +2,19 @@
 //! and compiled into ONE binary.
 //!
 //! Syntax (SPEC §12):
-//!   * `import path.module` — loads `path/module.<suffix>`. Searched gets
-//!     with this order: (1) relative to the IMPORTING file,
-//!     (2) relative to the directory of the root file, (3) at `$FIRNLIB`,
-//!     (4) at `<directory of the compiler binary>/../lib`
+//!   * `import path.module` — loads `path/module.<suffix>`. The search runs
+//!     in this order: (1) relative to the IMPORTING file,
+//!     (2) relative to the directory of the root file, (3) in `$FIRNLIB`,
+//!     (4) in `<directory of the compiler binary>/../lib`
 //!     (installation fallback; `firnc1` reads `/proc/self/exe` for it).
-//!     Addressed gets the module under the last path part.
+//!     The module is addressed under the last path part.
 //!   * `export { a, b }` — visibility list per module. Without it everything
 //!     is visible.
-//!   * `module.item` — access to some element of a loaded module.
+//!   * `module.item` — access to an element of a loaded module.
 //!
-//! Method: every file gets parsed ON ITS OWN (own `ExprId` range, own file
-//! number at the source map). After that the labels of the non-root modules
-//! get rewritten to `module__label` and the qualified accesses get resolved.
+//! Method: every file is parsed ON ITS OWN (own `ExprId` range, own file
+//! number in the source map). After that the names of the non-root modules
+//! are rewritten to `module__name` and the qualified accesses are resolved.
 //! The type checker sees a single, flat program.
 //!
 //! LIMIT (honestly): this is whole program compilation with separate
@@ -39,8 +39,8 @@ pub struct SourceFile {
     pub src: String,
 }
 
-/// Builds `<base>/<part1>/<part2>....<suffix>` — the path that one
-/// `import part1.part2` means within a search directory.
+/// Builds `<base>/<part1>/<part2>....<suffix>` — the path that an
+/// `import part1.part2` means inside a search directory.
 fn module_path(base: &Path, parts: &[String]) -> PathBuf {
     let mut p = base.to_path_buf();
     for part in parts {
@@ -59,11 +59,11 @@ fn firnlib_path(value: Option<&str>) -> Option<PathBuf> {
     }
 }
 
-/// Additional search directories for `import`, with this order: first
+/// Additional search directories for `import`, in this order: first
 /// `$FIRNLIB`, then `<directory of the compiler binary>/../lib`
 /// (installation layout `bin/firnc` + `lib/`). Both come AFTER the two
-/// spots that existed so far (importing file, root file), so that
-/// existing resolutions stay unchanged. `firnc1` keeps the same order at
+/// places that existed so far (importing file, root file), so that
+/// existing resolutions stay unchanged. `firnc1` keeps the same order in
 /// `bin/firnc1.fi` (`imports_collect`).
 fn extra_search_paths() -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
@@ -86,7 +86,7 @@ pub enum Error {
     Package(String),
 }
 
-/// One entry of the queue: the file and the spot of the `import` that
+/// One entry of the queue: the file and the place of the `import` that
 /// requested it. Which package it belongs to follows from its path
 /// (`World::package_of`) — not from who requested it.
 struct Waiting {
@@ -100,12 +100,12 @@ struct Waiting {
 /// SEARCH ORDER (round 48, deterministic, first hit wins):
 ///   1. next to the importing file
 ///   2. next to the root file
-///   3. at the `source` directories of the package to which the importing
-///      file belongs
-///   4. at a `needs` dependency of that package, if the first path part is
-///      its label
-///   5. at `$FIRNLIB`
-///   6. at `<directory of the compiler binary>/../lib`
+///   3. in the `source` directories of the package the importing file
+///      belongs to
+///   4. in a `needs` dependency of that package, if the first path part is
+///      its name
+///   5. in `$FIRNLIB`
+///   6. in `<directory of the compiler binary>/../lib`
 ///
 /// Without a manifest `welt` is empty, steps 3 and 4 fall away, and the
 /// resolution is character for character the one from before round 48.
@@ -118,7 +118,7 @@ pub fn resolve(root: &Path, world: &World) -> Result<Vec<SourceFile>, Error> {
         path: root.to_path_buf(),
         span: Span::none(),
     }];
-    // module label -> path seen first, for the conflict check.
+    // module name -> path seen first, for the conflict check.
     let mut names: HashMap<String, String> = HashMap::new();
     while !queue.is_empty() {
         let entry = queue.remove(0);
@@ -153,9 +153,9 @@ pub fn resolve(root: &Path, world: &World) -> Result<Vec<SourceFile>, Error> {
         } else {
             world.package_of(&abs_file)
         };
-        // LABEL CONFLICT: two different files with the same module label
-        // would fall onto the same internal renaming `module__label` and
-        // cover each other silently. Checked with a manifest only — without
+        // NAME CONFLICT: two different files with the same module name
+        // would fall onto the same internal renaming `module__name` and
+        // silently cover each other. Checked with a manifest only — without
         // a manifest everything stays as before.
         if !world.is_empty() {
             let mname = package::module_name(&abs_file);
@@ -173,9 +173,9 @@ pub fn resolve(root: &Path, world: &World) -> Result<Vec<SourceFile>, Error> {
         // IMPORT PATH: first relative to the FILE that writes the import —
         // only after that relative to the root file.
         //
-        // Formerly the second rule alone held. With it no library could load
+        // Formerly only the second rule held. With it no library could load
         // another one: `lib/rt/vec.fi` with `import rt` looked for `rt.fi`
-        // next to the MAIN PROGRAM rather than next to itself
+        // next to the MAIN PROGRAM instead of next to itself
         // (docs/SELBSTHOSTING.md §7, blocker B3).
         //
         // The fallback to the root stays, so that existing programs keep
@@ -208,9 +208,9 @@ pub fn resolve(root: &Path, world: &World) -> Result<Vec<SourceFile>, Error> {
                     }
                 }
             }
-            // VISIBILITY: should the hit lead into ANOTHER package, it must be
-            // a registered dependency and the module must stand at that package's
-            // `public` list.
+            // VISIBILITY: if the hit leads into ANOTHER package, it must be
+            // a registered dependency and the module must appear in that
+            // package's `public` list.
             if !world.is_empty() {
                 let target = package_world::absolute(&p.display().to_string(), &work_dir);
                 if let (Some(zp), Some(mp)) = (world.package_of(&target), my_package) {
@@ -237,11 +237,11 @@ pub fn resolve(root: &Path, world: &World) -> Result<Vec<SourceFile>, Error> {
         }
         out.push(SourceFile { id, path, src });
     }
-    // HOOK gc: the collector runtime gets loaded automatically as soon as
-    // a `gc class` stands anywhere (gc.rs, SPEC 3.5) — no `import`, no extra
+    // HOOK gc: the collector runtime is pulled in automatically as soon as
+    // a `gc class` appears anywhere (gc.rs, SPEC 3.5) — no `import`, no extra
     // command line option.
     // Round 49: HERE the runtime really becomes part of the program — and only
-    // then must the state block stand at the assembler (codegen_x86::emit).
+    // then must the state block appear in the assembler (codegen_x86::emit).
     if let Some(f) = gc_runtime(&out) {
         crate::gc::runtime_remember();
         out.push(f);
@@ -261,7 +261,7 @@ fn package_candidate(world: &World, pi: usize, parts: &[String]) -> Option<PathB
             return Some(cand);
         }
     }
-    // (4) dependency: the FIRST path part states the package.
+    // (4) dependency: the FIRST path part names the package.
     let header = parts.first()?;
     let di = world.edge(pi, header)?;
     let dp = &world.packages[di];
@@ -280,13 +280,13 @@ fn package_candidate(world: &World, pi: usize, parts: &[String]) -> Option<PathB
     None
 }
 
-/// Path of the GC runtime that got loaded (the module label stays empty:
-/// its labels are program wide, exactly like the error set labels).
+/// Path of the GC runtime pulled in (the module name stays empty: its names
+/// are program wide, exactly like the error set names).
 pub(crate) fn gc_runtime(files: &[SourceFile]) -> Option<SourceFile> {
     let mut needs = false;
     let mut has_allocerror = false;
     // Round 47: the finalizer dispatcher counts from the root file ONLY.
-    // Within a module it would be called `module__gc_finalize` and the
+    // Inside a module it would be called `module__gc_finalize` and the
     // runtime would no longer find it (see `module_name` further down).
     let mut has_finalizer = false;
     // Round 53: `GcVec`/`GcMap` join only when they show up.
@@ -354,14 +354,14 @@ fn scan_imports(src: &str, file: u32) -> Vec<(Vec<String>, Span)> {
     out
 }
 
-/// Module label of a file = filename without suffix. The root file has the
-/// empty module label (its labels stay unchanged, `main` is called `main`).
+/// Module name of a file = file name without suffix. The root file has the
+/// empty module name (its names stay unchanged, `main` is called `main`).
 fn module_name(f: &SourceFile) -> String {
     if f.id == 0 {
         return String::new();
     }
-    // The GC runtime lives at the root namespace: `gc_init()` is called
-    // `gc_init()` within every module, without `import` and without prefix.
+    // The GC runtime lives in the root namespace: `gc_init()` is called
+    // `gc_init()` in every module, without `import` and without a prefix.
     if f.path == Path::new(crate::gc::RUNTIME_PATH) {
         return String::new();
     }
@@ -373,25 +373,25 @@ fn module_name(f: &SourceFile) -> String {
 
 /// **Version of the symbol naming scheme** (DESIGN_GOALS.md §4, foundation).
 ///
-/// It stands at **every** linker symbol produced. Once the scheme changes,
-/// all symbols change — then the linker reports a missing label rather than
-/// binding two incompatible compilation states together silently.
+/// It appears in **every** linker symbol produced. Once the scheme changes,
+/// all symbols change — then the linker reports a missing name instead of
+/// silently binding two incompatible compilation states together.
 pub const SYMBOL_SCHEMA: u32 = 0;
 
 /// Reserved prefix of produced symbols. Firn identifiers cannot produce it
-/// (they may hold no dot), which is why user code can never hit a produced
-/// symbol by accident.
+/// (they may contain no dot), which is why user code can never hit a
+/// produced symbol by accident.
 pub const SYMBOL_PREFIX: &str = "_F";
 
-/// The entry point keeps its bare label: `_start` calls it, and that is one
+/// The entry point keeps its bare name: `_start` calls it, and that is an
 /// agreement with the linker, no Firn matter.
 pub const ENTRY_SYMBOL: &str = "main";
 
-/// Linker label of one item out of its **internal** label.
+/// Linker name of an item, derived from its **internal** name.
 ///
-/// The internal label comes about at `mangle` (root file: unchanged, module:
-/// `module__label`) and is what type checker and IR work with. Only the code
-/// generator turns it into a symbol:
+/// The internal name comes about in `mangle` (root file: unchanged, module:
+/// `module__name`) and is what the type checker and the IR work with. Only
+/// the code generator turns it into a symbol:
 ///
 /// ```text
 /// _F0.add             item of the root file
@@ -400,13 +400,13 @@ pub const ENTRY_SYMBOL: &str = "main";
 /// main                the entry point, unchanged
 /// ```
 ///
-/// **Why already now?** `DESIGN_GOALS.md` §4: should Firn print `main` and
-/// `add` as bare symbols today and need versioned ones later, that is a
-/// break for everything built already. The room for the version costs
+/// **Why already now?** `DESIGN_GOALS.md` §4: if Firn printed `main` and
+/// `add` as bare symbols today and needed versioned ones later, that would
+/// be a break for everything built already. The room for the version costs
 /// nothing today and makes a stable ABI (`#[abi_stable]`) later a mere
-/// extension rather than a cut. The separation *internal label* <->
+/// extension rather than a cut. The separation *internal name* <->
 /// *linker symbol* is the real gain along the way: error messages keep
-/// showing the source label.
+/// showing the source name.
 pub fn symbol(interner_name: &str, abi_version: Option<u32>) -> String {
     if interner_name == ENTRY_SYMBOL {
         return interner_name.to_string();
@@ -428,7 +428,7 @@ fn mangle(module: &str, name: &str) -> String {
 /// What a module offers to the outside.
 struct ModuleInfo {
     name: String,
-    /// all labels declared within the module (functions, structs, constants)
+    /// all names declared in the module (functions, structs, constants)
     items: HashSet<String>,
     /// `export` list; empty = everything visible
     exports: HashSet<String>,
@@ -443,10 +443,10 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
     // LEX ALL FILES FIRST, THEN PARSE.
     //
     // Reason: the advance search for generic templates
-    // (`sema_generic::hook_prescan`) used to run per file IMMEDIATELY ahead
-    // of parsing it. The root file gets parsed first — so it did not know
-    // the templates of the modules yet, and `var v: Vec[i32]` with `Vec`
-    // out of a module failed at the parser
+    // (`sema_generic::hook_prescan`) used to run per file IMMEDIATELY before
+    // parsing it. The root file is parsed first — so it did not yet know
+    // the templates of the modules, and `var v: Vec[i32]` with `Vec`
+    // from a module failed in the parser
     // (docs/SELBSTHOSTING.md §7, blocker B1).
     //
     // That is why the reset of the hooks belongs here, ONCE for the whole
@@ -466,8 +466,8 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
     if dg.has_errors() {
         return None;
     }
-    // HOOK profil (prof.rs, round 52): the profile stands at the FIRST file
-    // (the root file); `--profile=` wins. It must be settled here already,
+    // HOOK profil (prof.rs, round 52): the profile stands in the FIRST file
+    // (the root file); `--profile=` wins. It has to be settled here already,
     // because the `import` rule right below asks for it — the type checker
     // runs much later.
     if let Some(root) = progs.first() {
@@ -488,9 +488,9 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
             items.insert(x.name.clone());
         }
         for imp in &p.imports {
-            // HOOK profil (prof.rs, round 52): under the kernel profile the standard
-            // library is barred. The check sits here because only here are the
-            // inclusions of EVERY file known together with their position.
+            // HOOK profil (prof.rs, round 52): under the kernel profile the
+            // standard library is barred. The check sits here because only
+            // here are the inclusions of EVERY file known with their position.
             crate::prof::hook_import(dg, &imp.path, imp.span);
             let target = imp.path.last().cloned().unwrap_or_default();
             let known = files.iter().any(|g| module_name(g) == target);
@@ -529,10 +529,10 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
         for f in p.funcs.iter_mut() {
             // METHODS OF A BASE TYPE STAY UNTOUCHED (round 50).
             // `impl Ord for i32` creates `i32__less`; the type `i32`
-            // belongs to no module, so its methods do not either. Should
-            // that become `vec__i32__less`, `x.less(..)` would keep looking
-            // for `i32__less` and find nothing — the same rule as for
-            // interfaces, gc classes and generic templates.
+            // belongs to no module, so its methods do not either. If
+            // that became `vec__i32__less`, `x.less(..)` would keep
+            // looking for `i32__less` and find nothing — the same rule
+            // as for interfaces, gc classes and generic templates.
             if crate::iface::is_base_ty_method(&f.name) {
                 continue;
             }
@@ -544,7 +544,7 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
         for c in p.consts.iter_mut() {
             c.name = mangle(&m, &c.name);
         }
-        // ... then all references within the bodies.
+        // ... then all references in the bodies.
         for f in p.funcs.iter_mut() {
             r.locals.clear();
             r.push_scope();
@@ -565,15 +565,15 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
         }
         // REWRITE THE GENERIC TEMPLATES OF THIS FILE too.
         //
-        // They do not sit at `Program::funcs` but at
+        // They do not sit in `Program::funcs` but in
         // `sema_generic::REG` — the rewriting above therefore never reached
-        // them, and a template out of a module saw the labels of the ROOT
-        // FILE alone. Even a helper function within the same file reported
+        // them, and a template from a module saw the names of the ROOT
+        // FILE alone. Even a helper function in the same file reported
         // "unknown function" (docs/SELBSTHOSTING.md §7, blocker B2).
         //
-        // The LABEL of the template stays untouched: the instantiation looks
-        // for it later under the original label (`mono::expand_fn` through
-        // `Instantiation::base`), and generic labels hold program wide.
+        // The NAME of the template stays untouched: the instantiation looks
+        // for it later under the original name (`mono::expand_fn` through
+        // `Instantiation::base`), and generic names hold program wide.
         let file_id = files[idx].id;
         for name in crate::sema_generic::fn_templates_the_file(file_id) {
             crate::sema_generic::with_fn_template(&name, |decl| {
@@ -614,11 +614,11 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
     Some(merged)
 }
 
-/// Rewrites labels within the AST of a module to their final form.
+/// Rewrites names in the AST of a module to their final form.
 struct Renamer<'a, 'b> {
     me: usize,
     infos: &'a [ModuleInfo],
-    /// alias label -> last path part (= module label of the target file)
+    /// alias name -> last path part (= module name of the target file)
     alias: HashMap<String, String>,
     dg: &'b mut Diags,
     locals: Vec<HashSet<String>>,
@@ -640,8 +640,8 @@ impl<'a, 'b> Renamer<'a, 'b> {
         self.locals.iter().any(|s| s.contains(name))
     }
 
-    /// Resolves a label. `is_value` tells values (which local labels can cover)
-    /// apart from function/type labels.
+    /// Resolves a name. `is_value` tells values (which local names can cover)
+    /// apart from function/type names.
     fn resolve(&mut self, name: &str, span: Span, is_value: bool) -> Option<String> {
         if let Some((m, rest)) = name.split_once('.') {
             // qualified access module.item
@@ -719,7 +719,7 @@ impl<'a, 'b> Renamer<'a, 'b> {
 
     fn stmt(&mut self, s: &mut Stmt) {
         match s {
-            // `defer` is a wrapper only: its content gets rewritten like every
+            // `defer` is only a wrapper: its content is rewritten like every
             // other statement.
             Stmt::Defer(inner, _, _) => self.stmt(inner),
             Stmt::Let { name, ty, init, .. } => {
@@ -783,10 +783,10 @@ impl<'a, 'b> Renamer<'a, 'b> {
                 self.expr(i);
             }
             ExprKind::Call(name, args, nspan) => {
-                // HOOK types: the body blocks of a `match` sit at the registry of
-                // `sema_match`, not at the AST. Without this branch the labels within
-                // them would stay unrewritten — `match` inside one imported module
-                // would be unusable.
+                // HOOK types: the body blocks of a `match` sit in the registry
+                // of `sema_match`, not in the AST. Without this branch the
+                // names in them would stay unrewritten — `match` inside an
+                // imported module would be unusable.
                 if let Some(idx) = name
                     .strip_prefix(crate::sema_match::MATCH_PREFIX)
                     .and_then(|s| s.parse::<usize>().ok())
@@ -879,9 +879,9 @@ mod tests {
         assert_eq!(symbol("helper__square", None), "_F0.helper__square");
         // The room for the ABI version is there.
         assert_eq!(symbol("helper__square", Some(3)), "_F0.helper__square.v3");
-        // The entry point keeps its bare label.
+        // The entry point keeps its bare name.
         assert_eq!(symbol("main", None), "main");
-        // User code cannot produce the prefix: identifiers hold no dots.
+        // User code cannot produce the prefix: identifiers have no dots.
         assert!(symbol("a", None).starts_with(SYMBOL_PREFIX));
     }
 }
