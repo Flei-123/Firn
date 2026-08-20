@@ -8,7 +8,7 @@ deshalb entscheidet hier eine Liste deutscher Funktionswoerter: eine Zeile
 gilt als deutsch, sobald eines davon als ganzes Wort darin vorkommt.
 
 Die Liste enthaelt AUSDRUECKLICH keine Woerter, die es auch im Englischen
-gibt (in, an, am, es, man, war, hat, die, name, wert) — die erste Fassung tat
+gibt (in, an, am, es, man, war, hat, die, name, wert, also) — die erste Fassung tat
 das und hat englische Saetze als deutsch gemeldet; wer den Massstab dann
 erfuellen will, schreibt verkrampftes Englisch.
 
@@ -24,7 +24,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 os.chdir(ROOT)
 
 WORTE = """der das den dem des ein eine einen einem einer eines und oder
-aber nicht kein keine keinen keiner nur noch schon auch sonst also damit dass
+aber nicht kein keine keinen keiner nur noch schon auch sonst damit dass
 weil wenn dann als wie sind waren wird werden wurde wurden sein haben hatte
 hatten kann koennen konnte muss muessen musste soll sollen darf duerfen fuer
 von vom mit ohne bei beim nach vor ueber unter zwischen durch gegen seit aus
