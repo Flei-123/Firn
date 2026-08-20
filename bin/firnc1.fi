@@ -1,20 +1,20 @@
-// bin/firnc1.fi — DER COMPILER, GESCHRIEBEN IN FIRN.
+// bin/firnc1.fi -- THE COMPILER, WRITTEN IN FIRN.
 //
-// Die ganze Kette in einer Datei: Text -> Token -> Baum -> Typen -> FIR ->
-// x86-64-Assembler -> `as` -> `ld` -> ausfuehrbare Datei.
+// The whole chain in one file: text -> tokens -> tree -> types -> FIR ->
+// x86-64 assembly -> `as` -> `ld` -> executable.
 //
-// Aufruf:
-//     firnc1 quelle.fi            Assembler auf die Standardausgabe
-//     firnc1 quelle.fi -o ziel    ausfuehrbare Datei erzeugen
+// Usage:
+//     firnc1 source.fi            assembly on standard output
+//     firnc1 source.fi -o target  build an executable
 //
-// Mit `-o` legt `firnc1` `ziel.s` an, ruft `/usr/bin/as` und `/usr/bin/ld`
-// ueber `fork`/`execve` auf und raeumt die Zwischendateien nicht weg (sie
-// sind der beste Beleg dafuer, was wirklich erzeugt wurde). Damit ist Punkt 11
-// der Liste in docs/SELBSTHOSTING.md erledigt.
+// With `-o`, `firnc1` writes `target.s`, calls `/usr/bin/as` and `/usr/bin/ld`
+// through `fork`/`execve` and does not clean up the intermediate files (they
+// are the best evidence of what was really produced). That settles point 11
+// of the list in docs/SELBSTHOSTING.md.
 //
-// Rueckgabewerte: 0 = Assembler erzeugt · 1 = Fehler · 2 = E/A ·
-// 3 = keine Kernsprache · 4 = comptime noetig · 5 = `defer` ·
-// 6 = der Codegenerator kann diese FIR nicht (Gleitkomma, > 6 Argumente).
+// Return values: 0 = assembly produced * 1 = error * 2 = I/O *
+// 3 = not core language * 4 = comptime needed * 5 = `defer` *
+// 6 = the code generator cannot do this FIR (floating point, > 6 arguments).
 
 import rt
 import vec
@@ -36,16 +36,16 @@ import fir
 import lower
 import codegen
 
-// ------------------------------------------------------------ Modulsystem
+// ---------------------------------------------------------- module system
 //
-// `import a.b` sucht `a/b.fi` in dieser Reihenfolge: (1) neben der
-// importierenden Datei, (2) neben der Wurzeldatei, (3) in `$FIRNLIB`,
-// (4) in `<Verzeichnis des laufenden Compiler-Binarys>/../lib` —
-// dieselbe Regel wie in `firnc0` (`modules.rs::resolve`). Alle Dateien
-// landen in EINEM Baum und teilen sich EINE Namenstafel; die Umbenennung
-// mit `alias__` macht der Parser.
+// `import a.b` looks for `a/b.fi` in this order: (1) next to the importing
+// file, (2) next to the root file, (3) in `$FIRNLIB`, (4) in
+// `<directory of the running compiler binary>/../lib` -- the same rule
+// as in `firnc0` (`modules.rs::resolve`). All files end up in ONE tree
+// and share ONE name table; the renaming with `alias__` is done by the
+// parser.
 
-// Verzeichnisteil eines Pfades, einschliesslich des Schraegstrichs.
+// The directory part of a path, including the trailing slash.
 fn dirname(b: *mut rt.Buf, path: u64, n: usize) {
     var last: i64 = -1
     var i: usize = 0
@@ -60,7 +60,7 @@ fn dirname(b: *mut rt.Buf, path: u64, n: usize) {
     }
 }
 
-// Baut `<verz><teil1>/<teil2>....fi\0` in `aus`.
+// Builds `<dir><part1>/<part2>....fi\0` into `out`.
 fn module_path(out: *mut rt.Buf, dir: *mut rt.Buf, l: *mut lexer.Lexer,
              of: usize, to: usize) {
     rt.buf_clear(out)
@@ -79,9 +79,9 @@ fn module_path(out: *mut rt.Buf, dir: *mut rt.Buf, l: *mut lexer.Lexer,
     rt.buf_push_bytes(out, (&e[0]) as u64, 4)
 }
 
-// Umgebungsvariable im Startblock suchen. Hinter `argv` liegt `envp`:
+// Look up an environment variable in the start block. `envp` follows `argv`:
 //     [argc][argv0]..[argvN][0][envp0]..[0][auxv..]
-// Rueckgabe: Zeiger auf den WERT hinter `NAME=`, 0 wenn nicht gesetzt.
+// Returns a pointer to the VALUE after `NAME=`, or 0 if it is not set.
 fn env(start: u64, name: u64, name_n: usize) -> u64 {
     if start == 0 {
         return 0
@@ -109,10 +109,10 @@ fn env(start: u64, name: u64, name_n: usize) -> u64 {
     return 0
 }
 
-// Installationsfallback: Verzeichnis des laufenden Compiler-Binarys,
-// gefolgt von `../lib/`. `firnc0` liest dafuer `current_exe`; hier geht
-// es ueber `/proc/self/exe`. Bleibt der Aufruf erfolglos, ist der Puffer
-// leer und der Schritt wird uebersprungen.
+// Installation fallback: the directory of the running compiler binary,
+// followed by `../lib/`. `firnc0` reads `current_exe` for this; here it
+// goes through `/proc/self/exe`. If that call fails, the buffer stays
+// empty and the step is skipped.
 fn exe_search_path(out: *mut rt.Buf) {
     rt.buf_clear(out)
     var slf: [u8; 15] = "/proc/self/exe\0"
@@ -139,18 +139,18 @@ fn exe_search_path(out: *mut rt.Buf) {
     rt.buf_push_bytes(out, (&rest[0]) as u64, 7)
 }
 
-// ------------------------------------------------------------- Suchraum
+// --------------------------------------------------------- search space
 //
-// Alles, was die Aufloesung EINES `import` braucht. Als Struct, weil
-// `lib/firnc1/codegen.fi` hoechstens sechs Argumente kann und die Liste
-// mit dem Paketsystem (Runde 48) auf acht angewachsen waere.
+// Everything the resolution of ONE `import` needs. A struct, because
+// `lib/firnc1/codegen.fi` can do at most six arguments and the list would
+// have grown to eight with the package system (round 48).
 struct SearchSpace {
-    dir: rt.Buf,        // Verzeichnis der importierenden Datei, mit '/'
-    root_dir: rt.Buf,  // Verzeichnis der Wurzeldatei, mit '/'
+    dir: rt.Buf,        // directory of the importing file, with '/'
+    root_dir: rt.Buf,  // directory of the root file, with '/'
     firnlib: rt.Buf,
     exelib: rt.Buf,
     cwd: rt.Buf,
-    my_package: i64,     // Paket der importierenden Datei, -1 = keins
+    my_package: i64,     // package of the importing file, -1 = none
 }
 
 fn sr_new() -> SearchSpace {
@@ -174,7 +174,7 @@ fn buf_set(b: *mut rt.Buf, p: u64, n: usize) {
     rt.buf_push_bytes(b, p, n)
 }
 
-// Zu welchem Paket gehoert diese Datei? -1 = zu keinem (oder keine Welt).
+// Which package does this file belong to? -1 = none (or no world).
 fn package_of_file(w: *mut package.World, cwd: *mut rt.Buf, p: u64, n: usize) -> i64 {
     if package.world_is_empty(w) {
         return 0 - 1
@@ -186,7 +186,7 @@ fn package_of_file(w: *mut package.World, cwd: *mut rt.Buf, p: u64, n: usize) ->
     return r
 }
 
-// Ist das Argument genau diese Option?
+// Is the argument exactly this option?
 fn arg_is(a: u64, an: usize, lit: u64) -> bool {
     if an != rt.c_length(lit) {
         return false
@@ -194,16 +194,16 @@ fn arg_is(a: u64, an: usize, lit: u64) -> bool {
     return rt.mem_eq(a, lit, an)
 }
 
-// ------------------------------------------------------------ Modulliste
+// ----------------------------------------------------------- module list
 //
-// Die Warteschlange aller Dateien dieser Uebersetzung. Index 0 ist IMMER die
-// Wurzeldatei — damit ein Modul, das die Wurzel wieder einbindet, sie nicht
-// ein zweites Mal einzieht (`modules.rs::resolve` haelt es genauso).
+// The queue of all files of this translation. Index 0 is ALWAYS the root
+// file -- so that a module which imports the root again does not pull it
+// in a second time (`modules.rs::resolve` does the same).
 //
-// Alle Pfade liegen hintereinander in EINEM Puffer, je mit einer Null
-// abgeschlossen, weil `open` sie so braucht. DESHALB darf ein Zeiger aus
-// `ml_zeiger` nicht ueber ein `ml_dazu` hinweg benutzt werden: der Puffer
-// waechst und liegt danach woanders.
+// All paths lie one after another in ONE buffer, each terminated by a
+// null byte, because `open` needs them that way. THAT is why a pointer
+// from `ml_ptr` must not be used across an `ml_add`: the buffer grows
+// and afterwards lives somewhere else.
 struct ModuleList {
     text: rt.Buf,
     off: Vec[u32],
@@ -255,11 +255,11 @@ fn ml_add(m: *mut ModuleList, p: u64, n: usize, alias: u32) {
     rt.buf_push(&(*m).text, 0 as u8)
 }
 
-// NAMENSKONFLIKT (Runde 48): zwei VERSCHIEDENE Dateien mit demselben
-// Modulnamen fielen beim Zusammenfuehren auf dieselbe Umbenennung
-// `modul__name` und wuerden sich still ueberdecken. Gesucht wird ueber die
-// absoluten Pfade, damit zwei Schreibweisen derselben Datei kein Konflikt
-// sind. Rueckgabe: Index des aelteren Eintrags oder -1.
+// NAME CLASH (round 48): two DIFFERENT files with the same module name
+// were merged onto the same renaming `module__name` and would quietly
+// shadow each other. The search runs over the absolute paths, so that
+// two spellings of the same file are not a clash. Returns the index of
+// the older entry, or -1.
 fn ml_name_dup(ml: *mut ModuleList, cwd: *mut rt.Buf, new: u64, nn: usize) -> i64 {
     var an: rt.Buf = rt.buf_new()
     var bn: rt.Buf = rt.buf_new()
@@ -294,29 +294,29 @@ fn ml_name_dup(ml: *mut ModuleList, cwd: *mut rt.Buf, new: u64, nn: usize) -> i6
     return r
 }
 
-// Alle `import`-Zeilen eines Tokenstroms aufloesen und die noch unbekannten
-// Dateien hinten anhaengen. So wird die Liste zur BREITENSUCHE ueber den
-// ganzen Einbindungsgraphen: ein Modul darf ein Modul einbinden, ohne dass
-// die Wurzeldatei davon wissen muss.
+// Resolve all `import` lines of a token stream and append the files that
+// are not known yet. That turns the list into a BREADTH FIRST SEARCH over
+// the whole import graph: a module may import a module without the root
+// file having to know about it.
 //
-// Vor Runde 31 wurden nur die `import`-Zeilen der WURZELDATEI gelesen. Das
-// fiel lange nicht auf, weil `bin/firnc1.fi` seine Abhaengigkeiten ohnehin
-// alle aufzaehlt — `tests/640_vec_module.fi` dagegen scheiterte still daran,
-// dass `modules/vec.fi` sein eigenes `rt` nicht bekam.
+// Before round 31 only the `import` lines of the ROOT FILE were read. That
+// went unnoticed for a long time, because `bin/firnc1.fi` lists all its
+// dependencies anyway -- `tests/640_vec_module.fi` however failed quietly
+// because `modules/vec.fi` did not get its own `rt`.
 //
-// SUCHREIHENFOLGE (Runde 48, Zwilling von `modules.rs::resolve`):
-//   1. neben der importierenden Datei
-//   2. neben der Wurzeldatei
-//   3. in den `quelle`-Verzeichnissen des eigenen Pakets
-//   4. in einer `brauche`-Abhaengigkeit des eigenen Pakets, wenn der erste
-//      Pfadteil ihr Name ist
+// SEARCH ORDER (round 48, twin of `modules.rs::resolve`):
+//   1. next to the importing file
+//   2. next to the root file
+//   3. in the `source` directories of its own package
+//   4. in a `needs` dependency of its own package, if the first path
+//      element is its name
 //   5. in `$FIRNLIB`
 //   6. in `<exe>/../lib`
-// Ohne Manifest ist die Welt leer, 3 und 4 entfallen, und es bleibt bei der
-// Reihenfolge von Runde 39.
+// Without a manifest the world is empty, 3 and 4 drop out, and the order
+// of round 39 remains.
 //
-// Rueckgabe: 0 = gut · 2 = Modul nicht gefunden · 9 = Paketfehler, die
-// fertige Meldung steht in `paket.welt_fehler(w)`.
+// Returns: 0 = fine * 2 = module not found * 9 = package error, with the
+// finished message in `package.world_error(w)`.
 fn imports_collect(l: *mut lexer.Lexer, s: *mut SearchSpace, w: *mut package.World,
                    ml: *mut ModuleList) -> i32 {
     var path: rt.Buf = rt.buf_new()
@@ -335,7 +335,7 @@ fn imports_collect(l: *mut lexer.Lexer, s: *mut SearchSpace, w: *mut package.Wor
             i = i + 1
             continue
         }
-        // Pfadteile einsammeln: IDENT (DOT IDENT)*
+        // Collect the path elements: IDENT (DOT IDENT)*
         var j: usize = i + 1
         var alias: u32 = 0
         var parts: usize = 0
@@ -359,19 +359,19 @@ fn imports_collect(l: *mut lexer.Lexer, s: *mut SearchSpace, w: *mut package.Wor
             continue
         }
         var found: bool = false
-        // (1) neben der importierenden Datei
+        // (1) next to the importing file
         module_path(&path, &(*s).dir, l, i + 1, j)
         if package.is_file(rt.buf_ptr(&path)) {
             found = true
         }
-        // (2) neben der Wurzeldatei
+        // (2) next to the root file
         if !found {
             module_path(&path, &(*s).root_dir, l, i + 1, j)
             if package.is_file(rt.buf_ptr(&path)) {
                 found = true
             }
         }
-        // (3) die eigenen Quellverzeichnisse
+        // (3) its own source directories
         if !found {
             if (*s).my_package >= 0 {
                 let mp: usize = (*s).my_package as usize
@@ -387,7 +387,7 @@ fn imports_collect(l: *mut lexer.Lexer, s: *mut SearchSpace, w: *mut package.Wor
                 }
             }
         }
-        // (4) eine Abhaengigkeit: der ERSTE Pfadteil nennt das Paket.
+        // (4) a dependency: the FIRST path element names the package.
         if !found {
             if (*s).my_package >= 0 {
                 let mp: usize = (*s).my_package as usize
@@ -434,9 +434,9 @@ fn imports_collect(l: *mut lexer.Lexer, s: *mut SearchSpace, w: *mut package.Wor
             return 2
         }
         let n: usize = rt.buf_len(&path) - 1
-        // SICHTBARKEIT: fuehrt der Treffer in ein ANDERES Paket, muss es eine
-        // eingetragene Abhaengigkeit sein und das Modul in dessen
-        // `oeffentlich`-Liste stehen.
+        // VISIBILITY: if the hit leads into ANOTHER package, that package
+        // has to be a registered dependency and the module has to be in
+        // its `public` list.
         if !package.world_is_empty(w) {
             package.absolute(&abs, rt.buf_ptr(&path), n,
                           rt.buf_ptr(&(*s).cwd), rt.buf_len(&(*s).cwd))
@@ -484,10 +484,10 @@ fn imports_collect(l: *mut lexer.Lexer, s: *mut SearchSpace, w: *mut package.Wor
 }
 
 fn main(start: u64) -> i32 {
-    // --- Kommandozeile (Runde 48). Dieselben Optionen wie `firnc0`:
-    //     firnc1 quelle.fi [-o ziel]
-    //     firnc1 --package <verzeichnis> [-o ziel]
-    //     firnc1 --package-info <verzeichnis>
+    // --- command line (round 48). The same options as `firnc0`:
+    //     firnc1 source.fi [-o target]
+    //     firnc1 --package <directory> [-o target]
+    //     firnc1 --package-info <directory>
     var inp: u64 = 0
     var in_n: usize = 0
     var pak: u64 = 0
@@ -497,10 +497,10 @@ fn main(start: u64) -> i32 {
     var targetb: rt.Buf = rt.buf_new()
     defer rt.buf_free(&targetb)
     var has_target: bool = false
-    // RUNDE 52 (SPEC 2): `-c`/`--objekt` erzeugt eine freistehende
-    // ELF-Objektdatei — `as`, aber KEIN `ld`. `--profile=kernel` erzwingt
-    // das Kernel-Profil fuer die ganze Uebersetzungseinheit; dann ist die
-    // Objektausgabe ohnehin an.
+    // ROUND 52 (SPEC 2): `-c`/`--object` produces a freestanding ELF
+    // object file -- `as`, but NO `ld`. `--profile=kernel` forces the
+    // kernel profile for the whole translation unit; object output is
+    // then on anyway.
     var only_object: bool = false
     var kernel_flag: bool = false
     var c_opt: [u8; 3] = "-c\0"
@@ -569,9 +569,9 @@ fn main(start: u64) -> i32 {
         }
     }
 
-    // --- die Paketwelt. Mit `--package`/`--package-info` das genannte Projekt,
-    // sonst das Manifest ueber der Quelldatei; ohne Manifest bleibt sie leer
-    // und alles verhaelt sich wie vor Runde 48.
+    // --- the package world. With `--package`/`--package-info` the named
+    // project, otherwise the manifest above the source file; without a
+    // manifest it stays empty and everything behaves as before round 48.
     var w: package.World = package.world_new()
     defer package.world_free(&w)
     var startb: rt.Buf = rt.buf_new()
@@ -633,7 +633,7 @@ fn main(start: u64) -> i32 {
             return 2
         }
     }
-    // Ohne `--package` bestimmt die Quelldatei das Projekt.
+    // Without `--package` the source file determines the project.
     if pak == 0 {
         if inp != 0 {
             if !package.world_ab_file(&w, name, name_n) {
@@ -657,16 +657,16 @@ fn main(start: u64) -> i32 {
     defer ast.tree_free(&tree_s)
     let tree: *mut ast.Tree = &tree_s
 
-    // --- eingebundene Module suchen und ZUERST uebersetzen: eine Konstante
-    // darf eine aus einem anderen Modul benutzen, also muessen die
-    // Abhaengigkeiten vorher im Baum stehen.
+    // --- find the imported modules and compile them FIRST: a constant may
+    // use one from another module, so the dependencies have to be in the
+    // tree beforehand.
     var dir: rt.Buf = rt.buf_new()
     defer rt.buf_free(&dir)
     dirname(&dir, name, name_n)
 
-    // --- Zusaetzliche Modul-Suchpfade: $FIRNLIB (mit Schraegstrich
-    // abgeschlossen, `modulpfad` haengt die Teile direkt an) und
-    // `<exe>/../lib/`. Beide bleiben leer, wenn es sie nicht gibt.
+    // --- extra module search paths: $FIRNLIB (terminated with a slash,
+    // `module_path` appends the parts directly) and `<exe>/../lib/`.
+    // Both stay empty if they do not exist.
     var sr: SearchSpace = sr_new()
     defer sr_free(&sr)
     var flname: [u8; 7] = "FIRNLIB"
@@ -683,33 +683,33 @@ fn main(start: u64) -> i32 {
     package.work_dir(&sr.cwd)
     buf_set(&sr.root_dir, rt.buf_ptr(&dir), rt.buf_len(&dir))
 
-    // --- generische Vorlagen: erst wissen, WELCHE Namen generisch sind,
-    // dann parsen. Vorher ist `Vec[i32]` nicht von einer Indizierung zu
-    // unterscheiden.
+    // --- generic templates: first find out WHICH names are generic, then
+    // parse. Before that, `Vec[i32]` cannot be told apart from an
+    // indexing operation.
     var g: mono.Gen = mono.gen_new(tree as u64, it as u64)
     defer mono.gen_free(&g)
 
-    // Aufzaehlungen und Musterabgleiche: EINE Registrierung fuer alle
-    // Dateien dieser Uebersetzung (Aufzaehlungsnamen gelten programmweit).
+    // Enums and pattern matches: ONE registry for all files of this
+    // translation (enum names are visible program wide).
     var mu: pattern.Pat = pattern.pat_new()
     defer pattern.pat_free(&mu)
 
-    // Fehlermengen und -unionen: EINE Registrierung fuer alle Dateien
-    // dieser Uebersetzung (Fehlermengennamen gelten programmweit, SPEC §14.1).
+    // Error sets and unions: ONE registry for all files of this
+    // translation (error set names are visible program wide, SPEC 14.1).
     var fe: err.Error = err.error_new()
     defer err.error_free(&fe)
 
-    // gc-Klassen: EINE Registrierung fuer alle Dateien dieser Uebersetzung
-    // (Runde 34 — Klassennamen gelten programmweit, wie die Aufzaehlungen).
+    // gc classes: ONE registry for all files of this translation
+    // (round 34 -- class names are visible program wide, like enums).
     var gcreg: gc.Gc = gc.gc_new()
     defer gc.gc_free(&gcreg)
 
-    // Schnittstellen: EINE Registrierung fuer alle Dateien dieser
-    // Uebersetzung (Runde 46 — Schnittstellennamen gelten programmweit).
+    // Interfaces: ONE registry for all files of this translation
+    // (round 46 -- interface names are visible program wide).
     var ifreg: iface.If = iface.if_new()
     defer iface.if_free(&ifreg)
-    // RUNDE 50: die Schrankenpruefung bei der Auspraegung braucht die
-    // Schnittstellen — `T: Ord` gilt nur, wenn es `impl Ord for T` gibt.
+    // ROUND 50: the bound check at instantiation needs the interfaces --
+    // `T: Ord` only holds if there is an `impl Ord for T`.
     mono.gen_if_set(&g, (&ifreg) as u64)
 
     var ml: ModuleList = ml_new()
@@ -723,21 +723,21 @@ fn main(start: u64) -> i32 {
     var mdir: rt.Buf = rt.buf_new()
     defer rt.buf_free(&mdir)
 
-    // --- GC-SUCHE am Tokenstrom (quelle_braucht_gc / quelle_hat_allocerror
-    // in gc.rs): steht irgendwo `gc class`, wird die Sammler-Laufzeit
-    // (lib/gc/gc.fi, eingebettet in gctext.fi) als zusaetzliches Modul
-    // eingezogen; deklariert das Programm `AllocError` selbst, faellt die
-    // mitgelieferte Fehlermenge weg.
+    // --- GC SCAN over the token stream (source_needs_gc /
+    // source_has_allocerror in gc.rs): if a `gc class` appears anywhere,
+    // the collector runtime (lib/gc/gc.fi, embedded in gctext.fi) is pulled
+    // in as an extra module; if the program declares `AllocError` itself,
+    // the error set that ships with it is left out.
     var sgc: [u8; 2] = "gc"
     var scl: [u8; 5] = "class"
     var sae: [u8; 10] = "AllocError"
     var sfin: [u8; 13] = "__gc_finalize"
     var sfa: [u8; 13] = "__thread_work"
-    // intern_nummer statt intern_finde: die drei Woerter muessen im Interner
-    // STEHEN, sonst sucht der Scan mit -1 und findet nichts — genau dann,
-    // wenn die Wurzeldatei selbst kein `gc` enthaelt und das Schluesselwort
-    // erst in einem importierten Modul auftaucht (Runde-34-Fund: 560 lief
-    // nicht, weil nur modules/dom.fi `gc class` hat).
+    // `intern_number` rather than a plain lookup: the three words have to BE
+    // in the interner, otherwise the scan searches with -1 and finds nothing
+    // -- exactly when the root file itself contains no `gc` and the keyword
+    // only turns up in an imported module (a round 34 find: 560 did not
+    // run, because only modules/dom.fi has a `gc class`).
     let gc_nr: i64 = intern.intern_number(it, (&sgc[0]) as u64, 2) as i64
     let class_nr: i64 = intern.intern_number(it, (&scl[0]) as u64, 5) as i64
     let ae_nr: i64 = intern.intern_number(it, (&sae[0]) as u64, 10) as i64
@@ -746,11 +746,11 @@ fn main(start: u64) -> i32 {
     var gc_scan: u32 = gc.gc_source_scan((&l) as u64, it as u64, gc_nr, class_nr,
                                         ae_nr, fin_nr, fa_nr)
 
-    // --- ERSTER DURCHGANG: Warteschlange aufbauen und die generischen Namen
-    // einsammeln. Beides muss VOR dem Parsen der ersten Datei feststehen.
-    // Der Preis ist ein zweites Lexen jeder Modulquelle; das ist billiger
-    // als alle Lexer gleichzeitig offen zu halten, und es macht die
-    // Reihenfolge der `import`-Zeilen bedeutungslos.
+    // --- FIRST PASS: build the queue and collect the generic names. Both
+    // have to be settled BEFORE the first file is parsed. The price is
+    // lexing every module source a second time; that is cheaper than
+    // keeping all lexers open at once, and it makes the order of the
+    // `import` lines irrelevant.
     mono.gen_upfront(&g, (&l) as u64)
     buf_set(&sr.dir, rt.buf_ptr(&dir), rt.buf_len(&dir))
     sr.my_package = package_of_file(&w, &sr.cwd, name, name_n)
@@ -782,12 +782,12 @@ fn main(start: u64) -> i32 {
             return 1
         }
         mono.gen_upfront(&g, (&vl) as u64)
-        // Runde 47: Bit 4 (eigener Finalisierer-Verteiler) zaehlt NUR aus der
-        // Wurzeldatei — Modulergebnisse werden maskiert. Runde 53: Bit 8
-        // (Sammlungen) zaehlt sehr wohl aus jedem Modul, genau wie Bit 1
-        // und 2 — lib/dom/dom.fi benutzt GcVec, die Wurzeldatei nicht.
-        // Merge R49: Bit 16 (eigener Fadenverteiler) zaehlt wie Bit 4 NUR
-        // aus der Wurzeldatei, faellt also aus der Maske heraus.
+        // Round 47: bit 4 (a finalizer dispatcher of its own) counts ONLY
+        // in the root file -- module results are masked. Round 53: bit 8
+        // (collections) does count in every module, just like bits 1 and 2
+        // -- lib/dom/dom.fi uses GcVec, the root file does not.
+        // Merge R49: bit 16 (a thread dispatcher of its own) counts, like
+        // bit 4, ONLY in the root file, so it drops out of the mask.
         gc_scan = gc_scan | (gc.gc_source_scan((&vl) as u64, it as u64, gc_nr,
                                                class_nr, ae_nr, fin_nr, fa_nr) & 11)
         rt.buf_clear(&mdir)
@@ -808,12 +808,12 @@ fn main(start: u64) -> i32 {
         mi = mi + 1
     }
 
-    // --- RUNDE 53: die generischen Vorlagen der SAMMLER-LAUFZEIT muessen
-    // bekannt sein, BEVOR die erste Datei geparst wird. Sie steht nicht auf
-    // der Platte, sondern in gctext.fi — und sie wird erst ganz zum Schluss
-    // geparst. Ohne diesen Vorabscan sieht der Parser `gcvec_anhaengen[Z](…)`
-    // in der Wurzeldatei nicht als Auspraegung, sondern als Indizierung.
-    // Derselbe Preis wie bei den Modulen: ein zusaetzliches Lexen.
+    // --- ROUND 53: the generic templates of the COLLECTOR RUNTIME have to
+    // be known BEFORE the first file is parsed. It is not on disk but in
+    // gctext.fi -- and it is parsed only at the very end. Without this
+    // prescan the parser would read `gcvec_append[T](...)` in the root
+    // file as an indexing operation instead of an instantiation.
+    // The same price as for the modules: one extra lexing pass.
     if gc_scan & 9 == 9 {
         var vq: rt.Buf = rt.buf_new()
         gctext.gctext_write(&vq, true)
@@ -833,7 +833,7 @@ fn main(start: u64) -> i32 {
         rt.buf_free(&vq)
     }
 
-    // --- ZWEITER DURCHGANG: die Module uebersetzen.
+    // --- SECOND PASS: compile the modules.
     mi = 1
     while mi < ml_count(&ml) {
         rt.buf_clear(&mpath)
@@ -874,7 +874,7 @@ fn main(start: u64) -> i32 {
         mi = mi + 1
     }
 
-    // --- die Wurzeldatei zuletzt: ihre Namen bleiben unveraendert.
+    // --- the root file last: its names stay unchanged.
     var p: parser.Parser = parser.par_new_module((&l) as u64, tree as u64, 4294967295)
     defer parser.par_free(&p)
     parser.par_gen_set(&p, (&g) as u64)
@@ -891,10 +891,10 @@ fn main(start: u64) -> i32 {
         return 1
     }
 
-    // --- die Sammler-Laufzeit automatisch einziehen, sobald irgendwo ein
-    // `gc class` steht (Runde 34; HOOK gc in modules.rs, SPEC 3.5). Sie
-    // liegt im WURZELNAMENSRAUM: `gc_init()` heisst in jedem Modul
-    // `gc_init()`, ohne `import` und ohne Modulpraefix.
+    // --- pull in the collector runtime automatically as soon as a
+    // `gc class` appears anywhere (round 34; HOOK gc in modules.rs,
+    // SPEC 3.5). It lives in the ROOT NAMESPACE: `gc_init()` is called
+    // `gc_init()` in every module, without `import` and without a prefix.
     if gc_scan & 1 != 0 {
         gc.gc_runtime_set(&gcreg, 1 as usize)
         var gq: rt.Buf = rt.buf_new()
@@ -903,23 +903,23 @@ fn main(start: u64) -> i32 {
             var aed: [u8; 33] = "error AllocError { OutOfMemory }\n"
             rt.buf_push_bytes(&gq, (&aed[0]) as u64, 33)
         }
-        // Runde 47: die leere Voreinstellung des Finalisierer-Verteilers —
-        // nur, wenn die Wurzeldatei keinen eigenen mitbringt (Bit 4).
-        // Wortgleich mit gc.rs::finalisierer_default.
+        // Round 47: the empty default of the finalizer dispatcher -- only
+        // if the root file does not bring one of its own (bit 4).
+        // Word for word as gc.rs::finalizer_default.
         if gc_scan & 4 == 0 {
             var fdt: [u8; 201] = "// Round 47: default of the finalizer dispatcher. The program\n// declares none of its own, so cleanup does nothing.\nfn __gc_finalize(kind: u64, p: *mut u8) {\n    let _unused: u64 = kind + (p as u64)\n}\n"
             rt.buf_push_bytes(&gq, (&fdt[0]) as u64, 201)
         }
-        // Runde 49 (Merge: Bit 16): die leere Voreinstellung des
-        // Fadenverteilers — nur, wenn die Wurzeldatei keinen eigenen
-        // mitbringt. Wortgleich mit gc.rs::fadenarbeit_default.
+        // Round 49 (merge: bit 16): the empty default of the thread
+        // dispatcher -- only if the root file does not bring one of
+        // its own. Word for word as gc.rs::thread_work_default.
         if gc_scan & 16 == 0 {
             var fat: [u8; 198] = "// Round 49: default of the thread dispatcher. The program\n// declares none of its own, so a thread does nothing.\nfn __thread_work(kind: u64, arg: u64) -> u64 {\n    return kind + arg - kind - arg\n}\n"
             rt.buf_push_bytes(&gq, (&fat[0]) as u64, 198)
         }
-        // Runde 53: die Sammlungen nur dazu, wenn sie vorkommen (Bit 8) —
-        // ein Programm mit `gc class`, aber ohne GcVec/GcMap, erzeugt danach
-        // genau denselben Code wie vorher.
+        // Round 53: add the collections only if they are used (bit 8) --
+        // a program with a `gc class` but without GcVec/GcMap then produces
+        // exactly the same code as before.
         gctext.gctext_write(&gq, gc_scan & 8 != 0)
         var gpn: [u8; 12] = "lib/gc/gc.fi"
         var gl: lexer.Lexer = lexer.lex_new(rt.buf_ptr(&gq), rt.buf_len(&gq),
@@ -950,11 +950,11 @@ fn main(start: u64) -> i32 {
         }
     }
 
-    // --- comptime: die Bloecke der Wurzeldatei laufen VOR der Typpruefung.
-    // Was sie per `emit_roh`/`emit_zahl` schreiben, ist FIRN-QUELLTEXT, den
-    // derselbe Lauf lext, parst und ans Programm anhaengt — danach sieht der
-    // Typpruefer keinen Unterschied zu handgeschriebenem Quelltext
-    // (SPEC §6.4, Abnahmepunkt 6; Vorbild compiler/src/main.rs).
+    // --- comptime: the blocks of the root file run BEFORE the type check.
+    // What they write through `emit_raw`/`emit_number` is FIRN SOURCE TEXT,
+    // which the same run lexes, parses and appends to the program -- after
+    // that the type checker sees no difference to handwritten source text
+    // (SPEC 6.4, acceptance point 6; modelled on compiler/src/main.rs).
     if ast.ct_count(tree) > 0 {
         var zt: time.Time = time.time_new(tree as u64, it as u64,
                                           rt.buf_ptr(&dir), rt.buf_len(&dir))
@@ -999,18 +999,18 @@ fn main(start: u64) -> i32 {
         }
     }
 
-    // --- Monomorphisierung: jede benutzte Typkombination wird eine eigene,
-    // vollstaendig konkrete Funktion bzw. ein eigener Struct. Danach sieht
-    // der Typpruefer nur noch gewoehnlichen Code.
+    // --- monomorphization: every type combination that is used becomes a
+    // separate, fully concrete function or struct. After that the type
+    // checker sees only ordinary code.
     mono.gen_run(&g)
     if mono.gen_error(&g) > 0 {
         return 1
     }
 
-    // RUNDE 52 (SPEC 2): Profil aufloesen — `--profile=` gewinnt, sonst die
-    // Deklaration `profile kernel` in der Wurzeldatei. Im Kernel-Profil gibt
-    // es keinen `_start`, kein `syscall`, kein `gc class` und keine
-    // ausfuehrbare Datei, sondern ein ELF-Objekt.
+    // ROUND 52 (SPEC 2): resolve the profile -- `--profile=` wins, otherwise
+    // the declaration `profile kernel` in the root file. In the kernel
+    // profile there is no `_start`, no `syscall`, no `gc class` and no
+    // executable, but an ELF object instead.
     var kernel: bool = kernel_flag
     if !kernel {
         let pn: u32 = ast.prof(tree)
@@ -1063,7 +1063,7 @@ fn main(start: u64) -> i32 {
     }
     let out: *mut rt.Buf = codegen.cg_text(&cg)
 
-    // Ohne `-o` und ohne `--package`: der Assembler geht auf die Standardausgabe.
+    // Without `-o` and without `--package` the assembly goes to stdout.
     if !has_target {
         if !rt.write_everything(1, rt.buf_ptr(out), rt.buf_len(out)) {
             return 2
@@ -1073,7 +1073,7 @@ fn main(start: u64) -> i32 {
     let target: u64 = rt.buf_ptr(&targetb)
     let target_n: usize = rt.buf_len(&targetb)
 
-    // `ziel.s` und `ziel.o` als nullabgeschlossene Namen bauen.
+    // Build `target.s` and `target.o` as null terminated names.
     var sname: rt.Buf = rt.buf_new()
     defer rt.buf_free(&sname)
     rt.buf_push_bytes(&sname, target, target_n)
@@ -1083,7 +1083,7 @@ fn main(start: u64) -> i32 {
     var oname: rt.Buf = rt.buf_new()
     defer rt.buf_free(&oname)
     if object {
-        // Mit `-c` heisst das Ergebnis genau so, wie `-o` es sagt.
+        // With `-c` the result is named exactly as `-o` says.
         rt.buf_push_bytes(&oname, target, target_n)
         rt.buf_push(&oname, 0 as u8)
     } else {
@@ -1096,7 +1096,7 @@ fn main(start: u64) -> i32 {
         return 2
     }
 
-    // as --64 -o ziel.o ziel.s
+    // as --64 -o target.o target.s
     var as_path: [u8; 12] = "/usr/bin/as\0"
     var opt64: [u8; 6] = "--64\0\0"
     var minus_o: [u8; 3] = "-o\0"
@@ -1110,12 +1110,12 @@ fn main(start: u64) -> i32 {
     if rt.run((&as_path[0]) as u64, (&argv_as[0]) as u64) != 0 {
         return 7
     }
-    // RUNDE 52: freistehend heisst FREISTEHEND — hier ist Schluss, kein `ld`.
+    // ROUND 52: freestanding means FREESTANDING -- this is the end, no `ld`.
     if object {
         return 0
     }
 
-    // ld -o ziel ziel.o
+    // ld -o target target.o
     var ld_path: [u8; 12] = "/usr/bin/ld\0"
     var argv_ld: [u64; 5] = [0; 5]
     argv_ld[0] = (&ld_path[0]) as u64
