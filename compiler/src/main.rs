@@ -21,6 +21,7 @@ mod dwarf;
 mod errors;
 mod threading;
 mod fir;
+mod fnval;
 mod gc;
 mod gc_lower;
 mod iface;

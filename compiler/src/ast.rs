@@ -13,6 +13,9 @@ pub enum TypeExpr {
     Named(String, Span),
     Ptr { mutable: bool, inner: Box<TypeExpr>, span: Span },
     Array { elem: Box<TypeExpr>, len: u64, span: Span },
+    /// **Round 58** — `fn(T1, T2) -> R`, a function as a value.
+    /// `ret == None` is the function without a result (`fn(i32)`).
+    Fn { params: Vec<TypeExpr>, ret: Option<Box<TypeExpr>>, span: Span },
 }
 
 impl TypeExpr {
@@ -21,6 +24,7 @@ impl TypeExpr {
             TypeExpr::Named(_, s) => *s,
             TypeExpr::Ptr { span, .. } => *span,
             TypeExpr::Array { span, .. } => *span,
+            TypeExpr::Fn { span, .. } => *span,
         }
     }
 }
