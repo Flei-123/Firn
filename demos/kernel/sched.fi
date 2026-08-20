@@ -1,0 +1,582 @@
+// demos/kernel/sched.fi -- round 62: tasks and the scheduler.
+//
+// Round 59 had one thread of control: `kernel_main` ran from top to
+// bottom, and the only thing that ever took the processor away from it
+// was an interrupt that gave it straight back. From here on the kernel
+// has TASKS, and the timer takes the processor away for good.
+//
+// A task is 256 octets in the data area (`kstate.TASK_OFF`) plus a
+// KERNEL STACK OF ITS OWN out of the frame allocator. Everything a task
+// needs in order to be interrupted in the middle and continued later
+// lives on that stack; the task record only holds the stack pointer.
+// That is the whole trick of a context switch, and `switch.s` does the
+// six lines that a language cannot do.
+//
+// THE PLAN: weighted round robin. Every ready task gets a turn, in the
+// order of the table, and the length of the turn is its priority in timer
+// ticks. Priority 3 therefore gets three times the processor of priority
+// 1 -- and nothing starves, which is what a strict priority order would
+// do. The proof is in `tools/kernel/run.sh`: three workers with the
+// priorities 1, 2 and 3 do the same amount of work, and the one with the
+// highest priority is done first.
+//
+// THE COUNTER-CHECK belongs to it: with `nopreempt` on the command line
+// the timer does not switch, and the same three workers run one after the
+// other -- each one scheduled exactly ONCE. Interleaving that a spin loop
+// produces on its own would show up here.
+
+import serial
+import kstate
+import mem
+
+export {
+    init, create, start, schedule, on_tick, yield_now, sleep_ticks,
+    exit_task, reap,
+    kill_current, wake_pid, find_pid, current, tget, tset, task_at,
+    trace_push, trace_dump, dump_tasks, ready_count, alive_count,
+    irq_save, irq_restore, set_kernel_stack,
+    T_STATE, T_PID, T_RSP, T_KSTACK, T_KTOP, T_PRIO, T_BUDGET, T_WORK,
+    T_WAKE, T_CR3, T_PARENT, T_EXIT, T_RUNS, T_ENTRY, T_USTACK, T_KIND,
+    T_WAITPID, T_TICKS, T_PDPT, T_PD, T_PT, T_DATA, T_CWD, T_ARG,
+    T_END, T_FD, T_FDOFF, T_FAULTS, FD_SLOTS,
+    S_FREE, S_READY, S_RUN, S_SLEEP, S_WAIT, S_ZOMBIE, S_NEW,
+    K_BOOT, K_IDLE, K_WORKER, K_USER, KSTACK_FRAMES
+}
+
+// ------------------------------------------------------ the task record
+
+const T_STATE: u64 = 0          // one of the S_* below
+const T_PID: u64 = 8
+const T_RSP: u64 = 16           // where the switch left the stack pointer
+const T_KSTACK: u64 = 24        // lowest octet of the kernel stack
+const T_KTOP: u64 = 32          // upper end of it
+const T_PRIO: u64 = 40          // 1..3, also the length of a turn in ticks
+const T_BUDGET: u64 = 48        // ticks left in this turn
+const T_WORK: u64 = 56          // what the task counted up itself; in a
+                                // process before its start: its argument
+const T_WAKE: u64 = 64          // tick at which a sleeper is due
+const T_CR3: u64 = 72           // its address space
+const T_PARENT: u64 = 80        // index of the creator
+const T_EXIT: u64 = 88          // the code it left with
+const T_RUNS: u64 = 96          // how often it got the processor
+const T_ENTRY: u64 = 104        // rip in ring 3
+const T_USTACK: u64 = 112       // rsp in ring 3
+const T_KIND: u64 = 120         // K_* below
+const T_WAITPID: u64 = 128      // which child it is waiting for
+const T_TICKS: u64 = 136        // timer ticks spent in this task
+const T_PDPT: u64 = 144         // the four frames of its page tables
+const T_PD: u64 = 152
+const T_PT: u64 = 160
+const T_DATA: u64 = 168         // its private data page (physical)
+const T_CWD: u64 = 176          // inode of the working directory
+const T_ARG: u64 = 184          // which program of uprog.fi (proc.fi)
+const T_END: u64 = 192          // tick at which it ended
+const T_FD: u64 = 200           // three open files: inode + 1, 0 = closed
+const T_FDOFF: u64 = 224        // and the read/write position of each
+const T_FAULTS: u64 = 248       // faults it caused
+
+const FD_SLOTS: u64 = 3
+
+const S_FREE: u64 = 0
+const S_READY: u64 = 1
+const S_RUN: u64 = 2
+const S_SLEEP: u64 = 3
+const S_WAIT: u64 = 4
+const S_ZOMBIE: u64 = 5
+// Under construction: the record exists, the stack exists, and the
+// scheduler must NOT take it yet. Round 62 learned this the hard way --
+// `proc.create` fills in the address space and the entry point AFTER the
+// task record, and a timer interrupt in between started a process whose
+// rip was still zero. A task becomes runnable when its creator says so,
+// and not a moment earlier.
+const S_NEW: u64 = 6
+
+const K_BOOT: u64 = 0
+const K_IDLE: u64 = 1
+const K_WORKER: u64 = 2
+const K_USER: u64 = 3
+
+// Two frames = 8 KiB of kernel stack per task.
+const KSTACK_FRAMES: u64 = 2
+
+// Indices in the table out of isr.s.
+const V_SWITCH: u64 = 55
+const V_GUARD: u64 = 57
+const V_TASK_MAIN: u64 = 62
+
+fn vector(state: u64, i: u64) -> u64 {
+    return __mmio_read64((kstate.get(state, kstate.VECTORS) + i * 8) as *mut u64)
+}
+
+// ------------------------------------------------------- the accesses
+
+fn task_at(state: u64, i: u64) -> u64 {
+    return state + kstate.TASK_OFF + i * kstate.TASK_BYTES
+}
+
+fn tget(state: u64, i: u64, field: u64) -> u64 {
+    return __mmio_read64((task_at(state, i) + field) as *mut u64)
+}
+
+fn tset(state: u64, i: u64, field: u64, v: u64) {
+    __mmio_write64((task_at(state, i) + field) as *mut u64, v)
+}
+
+fn current(state: u64) -> u64 {
+    return kstate.get(state, kstate.CURRENT)
+}
+
+// ------------------------------------------------- the interrupt flag
+
+// A critical section in a kernel is not a lock -- on one processor it is
+// the interrupt flag. `irq_save` turns interrupts off AND says whether
+// they were on; `irq_restore` puts back exactly that state. Plain
+// `cli`/`sti` would switch them on in places where they have to stay off
+// (inside an interrupt handler, for instance).
+fn irq_save() -> u64 {
+    return asm("pushfq\npop rax\ncli", out("rax"))
+}
+
+fn irq_restore(flags: u64) {
+    if (flags & 0x200) != 0 {
+        asm("sti")
+    }
+}
+
+// ------------------------------------------------------------ the trace
+
+// One octet per turn: which pid got the processor. That is the evidence
+// for interleaving -- not a claim of the kernel but the list of the
+// switches it really made.
+fn trace_push(state: u64, v: u64) {
+    let n: u64 = kstate.get(state, kstate.TRACE_LEN)
+    if n < kstate.TRACE_MAX {
+        kstate.set8(state + kstate.TRACE_OFF + n, v as u8)
+        kstate.set(state, kstate.TRACE_LEN, n + 1)
+    }
+}
+
+fn trace_dump(state: u64, label: u64, limit: u64) {
+    var n: u64 = kstate.get(state, kstate.TRACE_LEN)
+    if limit != 0 && n > limit {
+        n = limit
+    }
+    serial.puts(label)
+    var i: u64 = 0
+    while i < n {
+        serial.dec(kstate.get8(state + kstate.TRACE_OFF + i))
+        serial.put(32 as u8)
+        i = i + 1
+    }
+    serial.nl()
+}
+
+// ------------------------------------------------------------ creating
+
+// Task 0 is the one that is already running: `kernel_main` itself. It
+// gets a record so that the switch has somewhere to put its stack
+// pointer -- its stack is the one out of boot.s.
+fn init(state: u64) {
+    var i: u64 = 0
+    while i < kstate.MAX_TASKS {
+        tset(state, i, T_STATE, S_FREE)
+        i = i + 1
+    }
+    kstate.set(state, kstate.TASKS, 1)
+    kstate.set(state, kstate.CURRENT, 0)
+    kstate.set(state, kstate.NEXT_PID, 2)
+    kstate.set(state, kstate.PREEMPT, 1)
+    tset(state, 0, T_STATE, S_RUN)
+    tset(state, 0, T_PID, 1)
+    tset(state, 0, T_PRIO, 2)
+    tset(state, 0, T_BUDGET, 2)
+    tset(state, 0, T_KIND, K_BOOT)
+    tset(state, 0, T_KTOP, vector(state, 61))
+    tset(state, 0, T_CR3, kstate.get(state, kstate.KPML4))
+    set_kernel_stack(state, vector(state, 61))
+    trace_push(state, 1)
+}
+
+// The initial stack of a task that has never run. It is built so that it
+// looks EXACTLY like a task the switch stepped out of a moment ago -- see
+// the layout in switch.s. That way `context_switch` needs no special case
+// for a first start.
+fn frame_build(state: u64, ktop: u64, entry: u64, a0: u64, a1: u64,
+               a2: u64) -> u64 {
+    let base: u64 = ktop - 144
+    var i: u64 = 0
+    while i < 18 {
+        __mmio_write64((base + i * 8) as *mut u64, 0)
+        i = i + 1
+    }
+    __mmio_write64(base as *mut u64, 0x202)             // rflags: IF on
+    __mmio_write64((base + 72) as *mut u64, a0)         // rdi
+    __mmio_write64((base + 80) as *mut u64, a1)         // rsi
+    __mmio_write64((base + 104) as *mut u64, a2)        // rdx
+    __mmio_write64((base + 128) as *mut u64, entry)     // where `ret` goes
+    __mmio_write64((base + 136) as *mut u64, vector(state, V_GUARD))
+    return base
+}
+
+// A new task. `entry` is the address of the Firn function it starts in
+// (out of the table in isr.s, because Firn cannot name the address of a
+// function of its own in the kernel profile); it gets `state`, its index
+// and `kind` as arguments. Returns the index, or 0 when the table is
+// full -- index 0 is `kernel_main` and can never be handed out.
+fn create(state: u64, kind: u64, prio: u64, arg: u64, entry: u64) -> u64 {
+    let flags: u64 = irq_save()
+    var i: u64 = 1
+    var slot: u64 = 0
+    while i < kstate.MAX_TASKS {
+        if tget(state, i, T_STATE) == S_FREE {
+            slot = i
+            i = kstate.MAX_TASKS
+        } else {
+            i = i + 1
+        }
+    }
+    if slot == 0 {
+        irq_restore(flags)
+        return 0
+    }
+    let stack: u64 = mem.frame_run(state, KSTACK_FRAMES)
+    if stack == 0 {
+        irq_restore(flags)
+        return 0
+    }
+    let ktop: u64 = stack + KSTACK_FRAMES * mem.FRAME_SIZE
+    var real_entry: u64 = entry
+    if real_entry == 0 {
+        real_entry = vector(state, V_TASK_MAIN)
+    }
+    var j: u64 = 0
+    while j < kstate.TASK_BYTES / 8 {
+        __mmio_write64((task_at(state, slot) + j * 8) as *mut u64, 0)
+        j = j + 1
+    }
+    tset(state, slot, T_PID, kstate.add(state, kstate.NEXT_PID, 1) - 1)
+    tset(state, slot, T_KSTACK, stack)
+    tset(state, slot, T_KTOP, ktop)
+    tset(state, slot, T_PRIO, prio)
+    tset(state, slot, T_BUDGET, prio)
+    tset(state, slot, T_KIND, kind)
+    tset(state, slot, T_ARG, arg)
+    tset(state, slot, T_PARENT, current(state))
+    tset(state, slot, T_CR3, kstate.get(state, kstate.KPML4))
+    tset(state, slot, T_CWD, kstate.get(state, kstate.FS_ROOT))
+    tset(state, slot, T_RSP, frame_build(state, ktop, real_entry, state,
+                                         slot, kind))
+    tset(state, slot, T_STATE, S_NEW)
+    if slot + 1 > kstate.get(state, kstate.TASKS) {
+        kstate.set(state, kstate.TASKS, slot + 1)
+    }
+    irq_restore(flags)
+    return slot
+}
+
+// Now it may run. Whoever created the task decides when it is complete.
+fn start(state: u64, i: u64) -> bool {
+    if tget(state, i, T_STATE) != S_NEW {
+        return false
+    }
+    tset(state, i, T_STATE, S_READY)
+    return true
+}
+
+// The kernel stack the next system call out of ring 3 has to land on.
+// Two places need it: the TSS (for interrupts) and the data area (for
+// `syscall`, which the processor does not switch stacks for).
+fn set_kernel_stack(state: u64, ktop: u64) {
+    kstate.set(state, kstate.KSTACK_CUR, ktop)
+    let tss: u64 = kstate.get(state, kstate.TSS)
+    if tss != 0 {
+        __mmio_write64((tss + 4) as *mut u64, ktop)
+    }
+}
+
+// -------------------------------------------------------- the decision
+
+fn ready_count(state: u64) -> u64 {
+    let n: u64 = kstate.get(state, kstate.TASKS)
+    let idle: u64 = kstate.get(state, kstate.IDLE)
+    var i: u64 = 0
+    var c: u64 = 0
+    while i < n {
+        if i != idle && tget(state, i, T_STATE) == S_READY {
+            c = c + 1
+        }
+        i = i + 1
+    }
+    return c
+}
+
+// Everything that is not free and not a corpse.
+fn alive_count(state: u64) -> u64 {
+    let n: u64 = kstate.get(state, kstate.TASKS)
+    var i: u64 = 0
+    var c: u64 = 0
+    while i < n {
+        let st: u64 = tget(state, i, T_STATE)
+        if st != S_FREE && st != S_ZOMBIE {
+            c = c + 1
+        }
+        i = i + 1
+    }
+    return c
+}
+
+// Round robin: from the current task onwards, the first ready one. The
+// idle task is skipped -- it only gets the processor when nobody else
+// wants it.
+fn pick(state: u64) -> u64 {
+    let n: u64 = kstate.get(state, kstate.TASKS)
+    let cur: u64 = current(state)
+    let idle: u64 = kstate.get(state, kstate.IDLE)
+    var k: u64 = 1
+    while k <= n {
+        let i: u64 = (cur + k) % n
+        if i != idle && tget(state, i, T_STATE) == S_READY {
+            return i
+        }
+        k = k + 1
+    }
+    if tget(state, cur, T_STATE) == S_RUN {
+        return cur
+    }
+    return idle
+}
+
+// The switch itself. Everything that is per task and lives outside the
+// task record is put in place here: the address space, the kernel stack
+// for the next entry out of ring 3 -- and only then the stack pointer.
+fn switch_to(state: u64, from: u64, to: u64) {
+    kstate.set(state, kstate.CURRENT, to)
+    kstate.add(state, kstate.SWITCHES, 1)
+    tset(state, to, T_RUNS, tget(state, to, T_RUNS) + 1)
+    trace_push(state, tget(state, to, T_PID))
+    let cr3: u64 = tget(state, to, T_CR3)
+    if cr3 != 0 {
+        let now: u64 = asm("mov rax, cr3", out("rax"))
+        if cr3 != now {
+            asm("mov cr3, rax", in("rax") cr3, clobber("memory"))
+        }
+    }
+    set_kernel_stack(state, tget(state, to, T_KTOP))
+    asm("call rax", in("rax") vector(state, V_SWITCH),
+        in("rdi") task_at(state, from) + T_RSP,
+        in("rsi") tget(state, to, T_RSP), clobber("memory"))
+}
+
+// Give the processor away. Comes back when this task is scheduled again
+// -- or never, if it is a corpse by then.
+fn schedule(state: u64) {
+    let flags: u64 = irq_save()
+    let cur: u64 = current(state)
+    let next: u64 = pick(state)
+    if next == cur {
+        tset(state, cur, T_BUDGET, tget(state, cur, T_PRIO))
+        irq_restore(flags)
+        return
+    }
+    if tget(state, cur, T_STATE) == S_RUN {
+        tset(state, cur, T_STATE, S_READY)
+    }
+    tset(state, next, T_STATE, S_RUN)
+    tset(state, next, T_BUDGET, tget(state, next, T_PRIO))
+    switch_to(state, cur, next)
+    irq_restore(flags)
+}
+
+fn yield_now(state: u64) {
+    schedule(state)
+}
+
+// --------------------------------------------------------- the timer
+
+// Called out of the interrupt handler, after the end-of-interrupt. Two
+// jobs: wake what is due, and take the processor away when the turn is
+// over.
+fn on_tick(state: u64) {
+    let now: u64 = kstate.get(state, kstate.TICKS)
+    let n: u64 = kstate.get(state, kstate.TASKS)
+    var i: u64 = 0
+    while i < n {
+        if tget(state, i, T_STATE) == S_SLEEP && tget(state, i, T_WAKE) <= now {
+            tset(state, i, T_STATE, S_READY)
+        }
+        i = i + 1
+    }
+    let cur: u64 = current(state)
+    tset(state, cur, T_TICKS, tget(state, cur, T_TICKS) + 1)
+    if kstate.get(state, kstate.PREEMPT) == 0 {
+        return
+    }
+    let budget: u64 = tget(state, cur, T_BUDGET)
+    if budget > 1 {
+        tset(state, cur, T_BUDGET, budget - 1)
+        return
+    }
+    tset(state, cur, T_BUDGET, 0)
+    schedule(state)
+}
+
+// ---------------------------------------------------------- blocking
+
+// `ticks` timer ticks, 10 ms each at 100 Hz. Zero is a yield.
+fn sleep_ticks(state: u64, ticks: u64) {
+    let cur: u64 = current(state)
+    if ticks == 0 {
+        yield_now(state)
+        return
+    }
+    tset(state, cur, T_WAKE, kstate.get(state, kstate.TICKS) + ticks)
+    tset(state, cur, T_STATE, S_SLEEP)
+    schedule(state)
+}
+
+// Whoever waits for this pid becomes ready again.
+fn wake_pid(state: u64, pid: u64) {
+    let n: u64 = kstate.get(state, kstate.TASKS)
+    var i: u64 = 0
+    while i < n {
+        if tget(state, i, T_STATE) == S_WAIT {
+            let w: u64 = tget(state, i, T_WAITPID)
+            if w == 0 || w == pid {
+                tset(state, i, T_STATE, S_READY)
+            }
+        }
+        i = i + 1
+    }
+}
+
+fn find_pid(state: u64, pid: u64) -> u64 {
+    let n: u64 = kstate.get(state, kstate.TASKS)
+    var i: u64 = 0
+    while i < n {
+        if tget(state, i, T_STATE) != S_FREE && tget(state, i, T_PID) == pid {
+            return i
+        }
+        i = i + 1
+    }
+    return kstate.MAX_TASKS
+}
+
+// ------------------------------------------------------------ the end
+
+// A task ends. It stays in the table as a corpse until its creator picks
+// up the exit code -- otherwise `wait` would have nothing left to read.
+// Its kernel stack is the one this function is standing on and is
+// therefore NOT freed here; that happens in the reaper.
+fn exit_task(state: u64, code: u64) {
+    let flags: u64 = irq_save()
+    let cur: u64 = current(state)
+    tset(state, cur, T_EXIT, code)
+    tset(state, cur, T_END, kstate.get(state, kstate.TICKS))
+    tset(state, cur, T_STATE, S_ZOMBIE)
+    wake_pid(state, tget(state, cur, T_PID))
+    irq_restore(flags)
+    schedule(state)
+    // The scheduler never comes back to a corpse. If it does, something
+    // is broken enough that going on would be worse.
+    while true {
+        asm("hlt")
+    }
+}
+
+// The corpse is cleared away: its kernel stack goes back to the frame
+// allocator, its slot into the table. Whoever calls this must have picked
+// up the exit code beforehand -- and must not be standing on that stack,
+// which is why a task can never reap itself.
+fn reap(state: u64, i: u64) -> bool {
+    if tget(state, i, T_STATE) != S_ZOMBIE {
+        return false
+    }
+    if i == current(state) {
+        return false
+    }
+    let stack: u64 = tget(state, i, T_KSTACK)
+    if stack != 0 {
+        var k: u64 = 0
+        while k < KSTACK_FRAMES {
+            mem.frame_free(state, stack + k * mem.FRAME_SIZE)
+            k = k + 1
+        }
+    }
+    tset(state, i, T_KSTACK, 0)
+    tset(state, i, T_STATE, S_FREE)
+    return true
+}
+
+// A fault in ring 3 kills the process, not the kernel. This is the point
+// at which an operating system differs from the kernel of round 59: there
+// the machine stopped at every exception, and rightly so -- there was
+// nobody else the fault could belong to.
+fn kill_current(state: u64, pid_vector: u64, err: u64, cr2: u64, rip: u64) {
+    var s_kill: [u8; 13] = "user fault: \0"
+    var s_pid: [u8; 6] = "pid=\0\0"
+    var s_vec: [u8; 10] = "  vector=\0"
+    var s_err: [u8; 7] = "  err=\0"
+    var s_cr2: [u8; 7] = "  cr2=\0"
+    var s_rip: [u8; 7] = "  rip=\0"
+    var s_dead: [u8; 20] = "  -- process killed\0"
+    let cur: u64 = current(state)
+    serial.puts((&s_kill[0]) as u64)
+    serial.puts((&s_pid[0]) as u64)
+    serial.dec(tget(state, cur, T_PID))
+    serial.puts((&s_vec[0]) as u64)
+    serial.dec(pid_vector)
+    serial.puts((&s_err[0]) as u64)
+    serial.hex(err)
+    serial.puts((&s_cr2[0]) as u64)
+    serial.hex(cr2)
+    serial.puts((&s_rip[0]) as u64)
+    serial.hex(rip)
+    serial.puts((&s_dead[0]) as u64)
+    serial.nl()
+    kstate.add(state, kstate.KILLED, 1)
+    tset(state, cur, T_FAULTS, tget(state, cur, T_FAULTS) + 1)
+    // 128 + vector, the way a system with signals would count it.
+    exit_task(state, 128 + pid_vector)
+}
+
+// ------------------------------------------------------------ the view
+
+fn dump_tasks(state: u64) {
+    var s_row: [u8; 7] = "task: \0"
+    var s_pid: [u8; 5] = "pid=\0"
+    var s_kind: [u8; 8] = "  kind=\0"
+    var s_prio: [u8; 8] = "  prio=\0"
+    var s_state: [u8; 9] = "  state=\0"
+    var s_runs: [u8; 8] = "  runs=\0"
+    var s_ticks: [u8; 9] = "  ticks=\0"
+    var s_work: [u8; 8] = "  work=\0"
+    var s_end: [u8; 7] = "  end=\0"
+    var s_exit: [u8; 8] = "  exit=\0"
+    let n: u64 = kstate.get(state, kstate.TASKS)
+    var i: u64 = 0
+    while i < n {
+        if tget(state, i, T_STATE) != S_FREE {
+            serial.puts((&s_row[0]) as u64)
+            serial.puts((&s_pid[0]) as u64)
+            serial.dec(tget(state, i, T_PID))
+            serial.puts((&s_kind[0]) as u64)
+            serial.dec(tget(state, i, T_KIND))
+            serial.puts((&s_prio[0]) as u64)
+            serial.dec(tget(state, i, T_PRIO))
+            serial.puts((&s_state[0]) as u64)
+            serial.dec(tget(state, i, T_STATE))
+            serial.puts((&s_runs[0]) as u64)
+            serial.dec(tget(state, i, T_RUNS))
+            serial.puts((&s_ticks[0]) as u64)
+            serial.dec(tget(state, i, T_TICKS))
+            serial.puts((&s_work[0]) as u64)
+            serial.dec(tget(state, i, T_WORK))
+            serial.puts((&s_end[0]) as u64)
+            serial.dec(tget(state, i, T_END))
+            serial.puts((&s_exit[0]) as u64)
+            serial.dec(tget(state, i, T_EXIT))
+            serial.nl()
+        }
+        i = i + 1
+    }
+}

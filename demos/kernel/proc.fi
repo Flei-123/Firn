@@ -1,0 +1,359 @@
+// demos/kernel/proc.fi -- round 62: processes with an address space.
+//
+// A task out of `sched.fi` is a thread of control: its own stack, its own
+// registers. A PROCESS is more -- it has its own view of memory. Two
+// processes may use the same address and mean something different by it,
+// and neither of them can reach what belongs to the other. That is the
+// second point of this round, and it is the point at which page tables
+// stop being decoration.
+//
+// The layout was chosen so that the difference can be MEASURED:
+//
+//   0x00000000..0x3FFFFFFF   the first gigabyte, identity mapped. This is
+//                            the kernel: its code, its data, the frames.
+//                            Shared by every address space -- and without
+//                            the user bit on the leaves, so ring 3 cannot
+//                            touch it. The switch of round 59 has one
+//                            single 4 KiB page of it open, that is where
+//                            the user programs live.
+//   0x40000000               USER_DATA: one page, private per process.
+//   0x40001000..0x40008FFF   USER_STACK: eight pages, private per process.
+//   everything else          not mapped -- a touch gives #PF.
+//
+// Both private pages lie at the SAME virtual address in every process and
+// on DIFFERENT frames. `tools/kernel/run.sh` has two processes write
+// their pid there and read it back: each one sees its own value, and the
+// kernel prints the two physical frames, which differ.
+//
+// The tables per process (the kernel's own ones are shared, they are the
+// ones out of boot.s):
+//
+//   PML4 (private) [0]   -> PDPT (private)
+//   PDPT (private) [0]   -> the kernel PD out of boot.s   (SHARED)
+//                  [1]   -> PD (private), that is 0x40000000
+//   PD   (private) [0]   -> PT (private)
+//   PT   (private) [0]   -> data frame, [1..8] -> the stack
+//
+// Four frames of tables plus nine of payload per process. `free_space`
+// walks exactly this shape back and gives every one of them back.
+
+import serial
+import kstate
+import mem
+import sched
+import user
+
+export {
+    create, user_start, free_space, reap, translate, user_ok, map_programs,
+    inherit,
+    USER_DATA, USER_STACK, USER_SPAN, USER_TOP
+}
+
+const PAGE_PRESENT: u64 = 1
+const PAGE_WRITE: u64 = 2
+const PAGE_USER: u64 = 4
+const ADDR_MASK: u64 = 0x000FFFFFFFFFF000
+
+const USER_DATA: u64 = 0x40000000
+const USER_STACK: u64 = 0x40001000      // STACK_PAGES pages
+const STACK_PAGES: u64 = 8              // 32 KiB -- the shell needs them
+const USER_TOP: u64 = 0x40009000        // the stack grows down from here
+const USER_SPAN: u64 = 0x00200000       // what the private PD covers
+
+// Indices in the table out of isr.s.
+const V_ENTER_TASK: u64 = 56
+const V_USER_MAIN: u64 = 58
+const V_USER_START: u64 = 63
+
+fn vector(state: u64, i: u64) -> u64 {
+    return __mmio_read64((kstate.get(state, kstate.VECTORS) + i * 8) as *mut u64)
+}
+
+fn read_entry(table: u64, i: u64) -> u64 {
+    return __mmio_read64((table + i * 8) as *mut u64)
+}
+
+fn write_entry(table: u64, i: u64, v: u64) {
+    __mmio_write64((table + i * 8) as *mut u64, v)
+}
+
+fn zero_frame(p: u64) {
+    var i: u64 = 0
+    while i < mem.FRAME_SIZE / 8 {
+        __mmio_write64((p + i * 8) as *mut u64, 0)
+        i = i + 1
+    }
+}
+
+// Makes the pages of `uprog.fi` reachable for ring 3 -- and only those.
+// The linker script puts them between `__user_begin` and `__user_end`,
+// the two addresses stand in the table of isr.s. Everything else of the
+// kernel keeps its 2 MiB pages without a user bit, and that is what ring
+// 3 runs into.
+fn map_programs(state: u64) -> u64 {
+    let begin: u64 = vector(state, 59)
+    let end: u64 = vector(state, 60)
+    var p: u64 = begin & 0xFFFFFFFFFFFFF000
+    var n: u64 = 0
+    while p < end {
+        if !user.map_user(state, p, false, 0) {
+            return 0
+        }
+        n = n + 1
+        p = p + mem.FRAME_SIZE
+    }
+    return n
+}
+
+// ------------------------------------------------------ the address space
+
+// Builds the four tables and the two pages. Returns the PML4, or 0.
+fn space_build(state: u64, i: u64) -> u64 {
+    let pml4: u64 = mem.frame_alloc(state)
+    let pdpt: u64 = mem.frame_alloc(state)
+    let pd: u64 = mem.frame_alloc(state)
+    let pt: u64 = mem.frame_alloc(state)
+    let data: u64 = mem.frame_alloc(state)
+    if pml4 == 0 || pdpt == 0 || pd == 0 || pt == 0 || data == 0 {
+        return 0
+    }
+    zero_frame(pml4)
+    zero_frame(pdpt)
+    zero_frame(pd)
+    zero_frame(pt)
+    zero_frame(data)
+
+    // The kernel half. Entry 0 of the kernel PML4 points at the kernel
+    // PDPT, and ITS entry 0 at the PD with the 2 MiB pages of the first
+    // gigabyte. That last entry is the one the process takes over: it
+    // then has the identity mapping of the kernel in its own tables,
+    // one level further down, and shares it with everybody else.
+    // Reachable from ring 3 it still is not -- the user bit is missing on
+    // the 2 MiB leaves, and only the page of `uprog.fi` was split out and
+    // opened (`map_programs`).
+    let kpml4: u64 = kstate.get(state, kstate.KPML4)
+    let kpdpt: u64 = read_entry(kpml4, 0) & ADDR_MASK
+    write_entry(pdpt, 0, read_entry(kpdpt, 0) | PAGE_USER)
+
+    // The private half.
+    write_entry(pml4, 0, pdpt | PAGE_PRESENT | PAGE_WRITE | PAGE_USER)
+    write_entry(pdpt, 1, pd | PAGE_PRESENT | PAGE_WRITE | PAGE_USER)
+    write_entry(pd, 0, pt | PAGE_PRESENT | PAGE_WRITE | PAGE_USER)
+    write_entry(pt, 0, data | PAGE_PRESENT | PAGE_WRITE | PAGE_USER)
+    var k: u64 = 0
+    while k < STACK_PAGES {
+        let f: u64 = mem.frame_alloc(state)
+        if f == 0 {
+            return 0
+        }
+        zero_frame(f)
+        write_entry(pt, 1 + k, f | PAGE_PRESENT | PAGE_WRITE | PAGE_USER)
+        k = k + 1
+    }
+
+    sched.tset(state, i, sched.T_PDPT, pdpt)
+    sched.tset(state, i, sched.T_PD, pd)
+    sched.tset(state, i, sched.T_PT, pt)
+    sched.tset(state, i, sched.T_DATA, data)
+    return pml4
+}
+
+// Gives back everything `space_build` took -- and nothing else. The
+// kernel PDPT hangs in entry 0 and is SHARED; freeing it would pull the
+// ground out from under every other process.
+fn free_space(state: u64, i: u64) -> u64 {
+    let pml4: u64 = sched.tget(state, i, sched.T_CR3)
+    if pml4 == 0 || pml4 == kstate.get(state, kstate.KPML4) {
+        return 0
+    }
+    var freed: u64 = 0
+    let pt: u64 = sched.tget(state, i, sched.T_PT)
+    if pt != 0 {
+        var k: u64 = 0
+        while k < 512 {
+            let e: u64 = read_entry(pt, k)
+            if (e & PAGE_PRESENT) != 0 {
+                mem.frame_free(state, e & ADDR_MASK)
+                freed = freed + 1
+            }
+            k = k + 1
+        }
+        mem.frame_free(state, pt)
+        freed = freed + 1
+    }
+    let pd: u64 = sched.tget(state, i, sched.T_PD)
+    if pd != 0 {
+        mem.frame_free(state, pd)
+        freed = freed + 1
+    }
+    let pdpt: u64 = sched.tget(state, i, sched.T_PDPT)
+    if pdpt != 0 {
+        mem.frame_free(state, pdpt)
+        freed = freed + 1
+    }
+    mem.frame_free(state, pml4)
+    freed = freed + 1
+    sched.tset(state, i, sched.T_CR3, 0)
+    sched.tset(state, i, sched.T_PT, 0)
+    sched.tset(state, i, sched.T_PD, 0)
+    sched.tset(state, i, sched.T_PDPT, 0)
+    sched.tset(state, i, sched.T_DATA, 0)
+    return freed
+}
+
+// Corpse to memory: first the address space, then the kernel stack.
+fn reap(state: u64, i: u64) -> bool {
+    free_space(state, i)
+    return sched.reap(state, i)
+}
+
+// A child gets the CONTENTS of its parent's data page -- that is the
+// `fork`-like half of `spawn`. It is not a fork: the child does not
+// continue in the parent's code, it starts in a program of its own, and
+// there is no copy-on-write. What it does inherit is memory, and on a
+// FRAME OF ITS OWN. The counter-check belongs to it and is in
+// `uprog.u_fork`: the child overwrites the inherited value, and
+// afterwards the parent still reads its own.
+fn inherit(state: u64, parent: u64, child: u64) -> bool {
+    if sched.tget(state, parent, sched.T_KIND) != sched.K_USER {
+        return false
+    }
+    let src: u64 = sched.tget(state, parent, sched.T_DATA)
+    let dst: u64 = sched.tget(state, child, sched.T_DATA)
+    if src == 0 || dst == 0 {
+        return false
+    }
+    var i: u64 = 0
+    while i < mem.FRAME_SIZE / 8 {
+        __mmio_write64((dst + i * 8) as *mut u64,
+                       __mmio_read64((src + i * 8) as *mut u64))
+        i = i + 1
+    }
+    return true
+}
+
+// ------------------------------------------------- looking into a process
+
+// Virtual address of a process -> physical address, 0 = not mapped. The
+// kernel walks the tables itself instead of switching to the address
+// space: it may be standing in a completely different process.
+fn translate(state: u64, i: u64, addr: u64) -> u64 {
+    let pml4: u64 = sched.tget(state, i, sched.T_CR3)
+    if pml4 == 0 {
+        return 0
+    }
+    let e4: u64 = read_entry(pml4, (addr >> 39) & 0x1FF)
+    if (e4 & PAGE_PRESENT) == 0 {
+        return 0
+    }
+    let e3: u64 = read_entry(e4 & ADDR_MASK, (addr >> 30) & 0x1FF)
+    if (e3 & PAGE_PRESENT) == 0 {
+        return 0
+    }
+    let e2: u64 = read_entry(e3 & ADDR_MASK, (addr >> 21) & 0x1FF)
+    if (e2 & PAGE_PRESENT) == 0 {
+        return 0
+    }
+    if (e2 & 0x80) != 0 {
+        return (e2 & ADDR_MASK) + (addr & 0x1FFFFF)
+    }
+    let e1: u64 = read_entry(e2 & ADDR_MASK, (addr >> 12) & 0x1FF)
+    if (e1 & PAGE_PRESENT) == 0 {
+        return 0
+    }
+    return (e1 & ADDR_MASK) + (addr & 0xFFF)
+}
+
+// May the process really read and write there? The kernel checks the
+// pointer of a system call ITSELF -- a kernel that simply follows a
+// pointer out of ring 3 has handed over its privilege with it. Two
+// conditions: the address lies in the private region, and the page is
+// mapped for the user.
+fn user_ok(state: u64, i: u64, addr: u64, len: u64) -> bool {
+    if len == 0 {
+        return true
+    }
+    if addr < USER_DATA {
+        return false
+    }
+    if addr + len < addr {
+        return false                    // it wrapped around
+    }
+    if addr + len > USER_DATA + USER_SPAN {
+        return false
+    }
+    var p: u64 = addr
+    let last: u64 = addr + len - 1
+    while p <= last {
+        let pml4: u64 = sched.tget(state, i, sched.T_CR3)
+        let e4: u64 = read_entry(pml4, (p >> 39) & 0x1FF)
+        if (e4 & PAGE_USER) == 0 {
+            return false
+        }
+        let e3: u64 = read_entry(e4 & ADDR_MASK, (p >> 30) & 0x1FF)
+        if (e3 & PAGE_USER) == 0 {
+            return false
+        }
+        let e2: u64 = read_entry(e3 & ADDR_MASK, (p >> 21) & 0x1FF)
+        if (e2 & PAGE_USER) == 0 {
+            return false
+        }
+        let e1: u64 = read_entry(e2 & ADDR_MASK, (p >> 12) & 0x1FF)
+        if (e1 & PAGE_USER) == 0 || (e1 & PAGE_PRESENT) == 0 {
+            return false
+        }
+        p = (p & 0xFFFFFFFFFFFFF000) + 4096
+    }
+    return true
+}
+
+// ---------------------------------------------------------- creating
+
+// A process: task plus address space. `kind_arg` is what the user program
+// gets in rdi -- which of the programs in `uprog.fi` it is supposed to be.
+fn create(state: u64, prog: u64, arg: u64, prio: u64) -> u64 {
+    // Interrupts stay down until the process is COMPLETE. Everything
+    // below is state the scheduler would read the moment it takes the
+    // task -- and a half-built process is one with rip zero.
+    let flags: u64 = sched.irq_save()
+    let i: u64 = sched.create(state, sched.K_USER, prio, arg,
+                              vector(state, V_USER_START))
+    if i == 0 {
+        sched.irq_restore(flags)
+        return 0
+    }
+    let space: u64 = space_build(state, i)
+    if space == 0 {
+        sched.tset(state, i, sched.T_STATE, sched.S_ZOMBIE)
+        free_space(state, i)
+        sched.reap(state, i)
+        sched.irq_restore(flags)
+        return 0
+    }
+    sched.tset(state, i, sched.T_CR3, space)
+    sched.tset(state, i, sched.T_ENTRY, vector(state, V_USER_MAIN))
+    sched.tset(state, i, sched.T_USTACK, USER_TOP - 16)
+    sched.tset(state, i, sched.T_ARG, prog)
+    sched.tset(state, i, sched.T_WORK, arg)
+    inherit(state, sched.tget(state, i, sched.T_PARENT), i)
+    kstate.add(state, kstate.SPAWNS, 1)
+    sched.start(state, i)
+    sched.irq_restore(flags)
+    return i
+}
+
+// `KERNEL_USER_START` out of isr.s: the first thing a process runs, still
+// in ring 0, on its own kernel stack, in its own address space. It puts
+// the two arguments in place and leaves the ring -- and does not come
+// back. The way out of a process is `exit`, a fault or the timer.
+fn user_start(state: u64, i: u64, kind: u64) {
+    let arg: u64 = sched.tget(state, i, sched.T_WORK)
+    sched.tset(state, i, sched.T_WORK, 0)
+    asm("call rax", in("rax") vector(state, V_ENTER_TASK),
+        in("rdi") sched.tget(state, i, sched.T_ENTRY),
+        in("rsi") sched.tget(state, i, sched.T_USTACK),
+        in("rdx") (sched.tget(state, i, sched.T_ARG) << 32) | arg,
+        clobber("memory"))
+    // Unreachable: `enter_user_task` ends in `sysretq`.
+    sched.exit_task(state, 0)
+}

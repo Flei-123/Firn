@@ -33,10 +33,43 @@ import trap
 import kbd
 import user
 import power
+import sched
+import tasks
+import proc
+import sys
+import blk
+import fs
 
 // Indices in the table out of isr.s.
 const V_DF_STACK: u64 = 52
 const V_IRQ_STACK: u64 = 53
+
+// The bits of the command line, see `mode_of` at the bottom.
+const M_NOKBD: u64 = 256
+const M_NORING3: u64 = 512
+const M_NOTIMER: u64 = 1024
+const M_R3FAULT: u64 = 2048
+const M_NOSCHED: u64 = 4096
+const M_NOPREEMPT: u64 = 8192
+const M_NOPROC: u64 = 16384
+const M_NOFS: u64 = 32768
+const M_ATA: u64 = 65536
+
+// The programs in uprog.fi.
+const P_HELLO: u64 = 1
+const P_MEMORY: u64 = 2
+const P_FAULT: u64 = 3
+const P_BADPTR: u64 = 4
+const P_CHILD: u64 = 5
+const P_PARENT: u64 = 6
+const P_SHELL: u64 = 8
+const P_STEAL: u64 = 9
+const P_FORK: u64 = 10
+
+const DISK_FRAMES: u64 = 256            // 1 MiB of RAM disk
+const DISK_BLOCKS: u64 = 2048
+
+const ADDR_MASK: u64 = 0x000FFFFFFFFFF000
 
 const TICKS_WANTED: u64 = 20            // 200 ms at 100 Hz
 const KEYS_WANTED: u64 = 4
@@ -45,7 +78,7 @@ const KEY_TIMEOUT: u64 = 250            // 2.5 s, then it goes on regardless
 // `KERNEL_MAIN` out of boot.s. Six arguments, System V, see boot.s.
 fn kernel_main(mbi: u64, vectors: u64, state: u64, kernel_end: u64,
              gdt: u64, tss: u64) {
-    var s_banner: [u8; 32] = "firn kernel r59, profile kernel\0"
+    var s_banner: [u8; 32] = "firn kernel r62, profile kernel\0"
     var s_mb: [u8; 11] = "mb: flags=\0"
     var s_cmd: [u8; 8] = "  cmd=\0\0"
     var s_none: [u8; 7] = "(none)\0"
@@ -67,6 +100,7 @@ fn kernel_main(mbi: u64, vectors: u64, state: u64, kernel_end: u64,
 
     let cmd: u64 = mem.cmdline(mbi)
     kstate.set(state, kstate.MODE, mode_of(cmd))
+    console_load(state, cmd)
     serial.puts((&s_mb[0]) as u64)
     serial.hex(kstate.get32(mbi))
     serial.puts((&s_cmd[0]) as u64)
@@ -102,6 +136,21 @@ fn kernel_main(mbi: u64, vectors: u64, state: u64, kernel_end: u64,
     // 3. memory.
     memory(state, mbi, kernel_end)
 
+    // 3b. the task table. From here on there is a scheduler -- it does
+    //     not switch anything yet, because there is only one task, but
+    //     the timer already counts its ticks against it.
+    kstate.set(state, kstate.KPML4,
+               asm("mov rax, cr3", out("rax")) & ADDR_MASK)
+    sched.init(state)
+    let idle: u64 = sched.create(state, sched.K_IDLE, 1, 0, 0)
+    sched.start(state, idle)
+    kstate.set(state, kstate.IDLE, idle)
+    // `syscall`/`sysret` need their four MSRs before the first process,
+    // not only before the excursion of round 59. Without EFER.SCE the
+    // `sysretq` of `enter_user_task` is an invalid opcode.
+    user.setup(state)
+    proc.map_programs(state)
+
     // 4. a deliberate fault, when the command line asks for one. Comes
     //    back only if the IDT is broken -- `trap.report` stops.
     provoke(state, kstate.get(state, kstate.MODE))
@@ -109,10 +158,25 @@ fn kernel_main(mbi: u64, vectors: u64, state: u64, kernel_end: u64,
     // 5. interrupts on, and the proof that they arrive.
     ticks(state)
 
-    // 6. the keyboard.
+    // 6. three tasks at the same time.
+    scheduler(state)
+
+    // 7. the keyboard.
     keyboard(state)
 
-    // 7. ring 3.
+    // 7b. processes with an address space of their own.
+    processes(state)
+
+    // 7c. the file system.
+    filesystem(state)
+
+    // 7d. a command line in ring 3.
+    shell(state)
+
+    // 7e. the same file system on a real disk.
+    ata_disk(state)
+
+    // 8. ring 3, the excursion of round 59.
     ring3(state)
 
     serial.puts((&s_done[0]) as u64)
@@ -242,6 +306,547 @@ fn spin(state: u64) -> u64 {
     return kstate.get(state, kstate.TICKS) - before
 }
 
+// ------------------------------------------------------- the scheduler
+
+// The proof of round 62, point 1: three tasks, one processor.
+//
+// The three workers are identical except for their priority. They are
+// started, and the boot task lies down to sleep until all three are
+// corpses -- it must not spin, or it would be taking away exactly the
+// processor time that is being measured here.
+fn scheduler(state: u64) {
+    var s_skip: [u8; 16] = "sched: skipped\0\0"
+    var s_pre: [u8; 16] = "sched: preempt=\0"
+    var s_start: [u8; 16] = "sched: workers \0"
+    var s_sw: [u8; 17] = "sched: switches=\0"
+    var s_alt: [u8; 16] = "  alternations=\0"
+    var s_len: [u8; 12] = "  entries=\0\0"
+    var s_trace: [u8; 8] = "trace: \0"
+    var s_free: [u8; 20] = "sched: frames_free=\0"
+    var s_of: [u8; 7] = " of \0\0\0"
+    var s_done: [u8; 13] = "sched: done\0\0"
+    var s_sp: [u8; 2] = " \0"
+
+    let mode: u64 = kstate.get(state, kstate.MODE)
+    if (mode & M_NOSCHED) != 0 {
+        serial.puts((&s_skip[0]) as u64)
+        serial.nl()
+        return
+    }
+    if (mode & M_NOPREEMPT) != 0 {
+        kstate.set(state, kstate.PREEMPT, 0)
+    }
+    serial.puts((&s_pre[0]) as u64)
+    serial.dec(kstate.get(state, kstate.PREEMPT))
+    serial.nl()
+
+    let before: u64 = mem.frames_free(state)
+    kstate.set(state, kstate.TRACE_LEN, 0)
+    let a: u64 = sched.create(state, sched.K_WORKER, 1, 0, 0)
+    let b: u64 = sched.create(state, sched.K_WORKER, 2, 0, 0)
+    let c: u64 = sched.create(state, sched.K_WORKER, 3, 0, 0)
+    // All three at the same moment: they are supposed to compete, not to
+    // get a head start over each other.
+    sched.start(state, a)
+    sched.start(state, b)
+    sched.start(state, c)
+    let lo: u64 = sched.tget(state, a, sched.T_PID)
+    let hi: u64 = sched.tget(state, c, sched.T_PID)
+    serial.puts((&s_start[0]) as u64)
+    serial.dec(lo)
+    serial.puts((&s_sp[0]) as u64)
+    serial.dec(sched.tget(state, b, sched.T_PID))
+    serial.puts((&s_sp[0]) as u64)
+    serial.dec(hi)
+    serial.nl()
+
+    while workers_alive(state) > 0 {
+        sched.sleep_ticks(state, 1)
+    }
+
+    serial.puts((&s_sw[0]) as u64)
+    serial.dec(kstate.get(state, kstate.SWITCHES))
+    serial.puts((&s_alt[0]) as u64)
+    serial.dec(alternations(state, lo, hi))
+    serial.puts((&s_len[0]) as u64)
+    serial.dec(kstate.get(state, kstate.TRACE_LEN))
+    serial.nl()
+    sched.trace_dump(state, (&s_trace[0]) as u64, 60)
+    sched.dump_tasks(state)
+
+    // The corpses are cleared away: three kernel stacks of two frames
+    // each have to come back, otherwise the kernel leaks memory per task.
+    sched.reap(state, a)
+    sched.reap(state, b)
+    sched.reap(state, c)
+    serial.puts((&s_free[0]) as u64)
+    serial.dec(mem.frames_free(state))
+    serial.puts((&s_of[0]) as u64)
+    serial.dec(before)
+    serial.nl()
+    serial.puts((&s_done[0]) as u64)
+    serial.nl()
+}
+
+// How many workers are still alive.
+fn workers_alive(state: u64) -> u64 {
+    var n: u64 = 0
+    var i: u64 = 0
+    while i < kstate.get(state, kstate.TASKS) {
+        let st: u64 = sched.tget(state, i, sched.T_STATE)
+        if sched.tget(state, i, sched.T_KIND) == sched.K_WORKER {
+            if st != sched.S_FREE && st != sched.S_ZOMBIE {
+                n = n + 1
+            }
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// How often the processor went from one worker to a DIFFERENT one.
+// Everything that is not a worker is left out -- otherwise the boot task
+// falling asleep would count as interleaving.
+fn alternations(state: u64, lo: u64, hi: u64) -> u64 {
+    let len: u64 = kstate.get(state, kstate.TRACE_LEN)
+    var prev: u64 = 0
+    var n: u64 = 0
+    var i: u64 = 0
+    while i < len {
+        let v: u64 = kstate.get8(state + kstate.TRACE_OFF + i)
+        if v >= lo && v <= hi {
+            if prev != 0 && v != prev {
+                n = n + 1
+            }
+            prev = v
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// -------------------------------------------------------- the processes
+
+// Point 2 and point 3 of the round: separate address spaces, and system
+// calls that say what went wrong.
+fn processes(state: u64) {
+    var s_skip: [u8; 15] = "proc: skipped\0\0"
+    var s_pages: [u8; 13] = "proc: pages=\0"
+    var s_one: [u8; 17] = "proc: hello pid=\0"
+    var s_hexit: [u8; 18] = "proc: hello exit=\0"
+    var s_exit: [u8; 8] = "  exit=\0"
+    var s_frames: [u8; 20] = "proc: frames_free=\0\0"
+    var s_of: [u8; 5] = " of \0"
+    var s_priv: [u8; 13] = "proc: data \0\0"
+    var s_vs: [u8; 5] = " vs \0"
+    var s_sep: [u8; 15] = "  separated=\0\0\0"
+    var s_kill: [u8; 15] = "proc: killed=\0\0"
+    var s_alive: [u8; 14] = "proc: alive=\0\0"
+    var s_done: [u8; 12] = "proc: done\0\0"
+    var s_fork: [u8; 24] = "proc: fork parent kept \0"
+
+    if (kstate.get(state, kstate.MODE) & M_NOPROC) != 0 {
+        serial.puts((&s_skip[0]) as u64)
+        serial.nl()
+        return
+    }
+    let before: u64 = mem.frames_free(state)
+    serial.puts((&s_pages[0]) as u64)
+    serial.dec(proc.map_programs(state))
+    serial.nl()
+
+    // 1. one process: it says who it is, and its exit code is its pid.
+    let one: u64 = proc.create(state, P_HELLO, 7, 2)
+    serial.puts((&s_one[0]) as u64)
+    serial.dec(sched.tget(state, one, sched.T_PID))
+    serial.nl()
+    let one_exit: u64 = wait_for(state, one)
+    serial.puts((&s_hexit[0]) as u64)
+    serial.dec(one_exit)
+    serial.nl()
+
+    // 2. THE PROOF: two processes, the same address, different frames.
+    let a: u64 = proc.create(state, P_MEMORY, 111, 2)
+    let b: u64 = proc.create(state, P_MEMORY, 222, 2)
+    let pa: u64 = sched.tget(state, a, sched.T_DATA)
+    let pb: u64 = sched.tget(state, b, sched.T_DATA)
+    let ea: u64 = wait_for(state, a)
+    let eb: u64 = wait_for(state, b)
+    serial.puts((&s_priv[0]) as u64)
+    serial.hex(pa)
+    serial.puts((&s_vs[0]) as u64)
+    serial.hex(pb)
+    serial.puts((&s_sep[0]) as u64)
+    var sep: u64 = 0
+    if pa != pb && ea == 1 && eb == 1 {
+        sep = 1
+    }
+    serial.dec(sep)
+    serial.nl()
+
+    // 3. THE COUNTER-CHECK: a process that touches kernel memory dies --
+    //    and the kernel does not.
+    let f: u64 = proc.create(state, P_FAULT, 0, 2)
+    let fe: u64 = wait_for(state, f)
+    let g: u64 = proc.create(state, P_STEAL, 0, 2)
+    let ge: u64 = wait_for(state, g)
+    serial.puts((&s_kill[0]) as u64)
+    serial.dec(kstate.get(state, kstate.KILLED))
+    serial.puts((&s_exit[0]) as u64)
+    serial.dec(fe)
+    serial.puts((&s_exit[0]) as u64)
+    serial.dec(ge)
+    serial.nl()
+
+    // 4. system calls with bad arguments: error codes, not silence.
+    let p4: u64 = proc.create(state, P_BADPTR, 0, 2)
+    wait_for(state, p4)
+
+    // 4b. the fork-like half of spawn: the child inherits the memory of
+    //     its parent -- and gets a frame of its own for it.
+    let pf: u64 = proc.create(state, P_FORK, 0, 2)
+    let ef: u64 = wait_for(state, pf)
+    serial.puts((&s_fork[0]) as u64)
+    serial.dec(ef)
+    serial.nl()
+
+    // 5. spawn and wait, seen from ring 3.
+    let p5: u64 = proc.create(state, P_PARENT, 0, 2)
+    let e5: u64 = wait_for(state, p5)
+    serial.puts((&s_alive[0]) as u64)
+    serial.dec(sched.alive_count(state))
+    serial.puts((&s_exit[0]) as u64)
+    serial.dec(e5)
+    serial.nl()
+
+    serial.puts((&s_frames[0]) as u64)
+    serial.dec(mem.frames_free(state))
+    serial.puts((&s_of[0]) as u64)
+    serial.dec(before)
+    serial.nl()
+    serial.puts((&s_done[0]) as u64)
+    serial.nl()
+}
+
+// The boot task waits for a task the way `wait` does it for a process:
+// sleep until it is a corpse, read the exit code, clear it away.
+fn wait_for(state: u64, i: u64) -> u64 {
+    if i == 0 {
+        return 0xFFFFFFFFFFFFFFFF
+    }
+    var rounds: u64 = 0
+    while rounds < 2000 {
+        if sched.tget(state, i, sched.T_STATE) == sched.S_ZOMBIE {
+            let code: u64 = sched.tget(state, i, sched.T_EXIT)
+            proc.reap(state, i)
+            return code
+        }
+        sched.sleep_ticks(state, 1)
+        rounds = rounds + 1
+    }
+    return 0xFFFFFFFFFFFFFFFE
+}
+
+// ------------------------------------------------------ the file system
+
+// Point 4: a RAM disk as a block device, and a real file system on it.
+fn filesystem(state: u64) {
+    var s_skip: [u8; 13] = "fs: skipped\0\0"
+    var s_disk: [u8; 11] = "fs: disk=\0\0"
+    var s_blocks: [u8; 10] = "  blocks=\0"
+    var s_pre: [u8; 22] = "fs: mount unformatted\0"
+    var s_eq: [u8; 2] = "=\0"
+    var s_fmt: [u8; 12] = "fs: format \0"
+    var s_free: [u8; 8] = "  free=\0"
+    var s_ino: [u8; 10] = "  inodes=\0"
+    var s_small: [u8; 11] = "fs: small \0"
+    var s_wrote: [u8; 8] = "wrote=\0\0"
+    var s_read: [u8; 8] = "  read=\0"
+    var s_same: [u8; 8] = "  same=\0"
+    var s_big: [u8; 9] = "fs: big \0"
+    var s_list: [u8; 10] = "fs: list \0"
+    var s_dir: [u8; 12] = "fs: subdir \0"
+    var s_unlink: [u8; 12] = "fs: unlink \0"
+    var s_after: [u8; 9] = "  after=\0"
+    var s_gone: [u8; 8] = "  gone=\0"
+    var s_done: [u8; 10] = "fs: done\0\0"
+    var s_of: [u8; 5] = " of \0"
+    var p_hello: [u8; 11] = "/hello.txt\0"
+    var p_docs: [u8; 6] = "/docs\0"
+    var p_big: [u8; 14] = "/docs/big.bin\0"
+    var p_limit: [u8; 11] = "/limit.bin\0"
+    var s_limit: [u8; 18] = "fs: limit asked=\0\0"
+    var s_wrote2: [u8; 10] = "  wrote=\0\0"
+    var s_size: [u8; 9] = "  size=\0\0"
+    var p_root: [u8; 2] = "/\0"
+    var text: [u8; 15] = "firn round 62\n\0"
+
+    if (kstate.get(state, kstate.MODE) & M_NOFS) != 0 {
+        serial.puts((&s_skip[0]) as u64)
+        serial.nl()
+        return
+    }
+    let disk: u64 = mem.frame_run(state, DISK_FRAMES)
+    if disk == 0 {
+        return
+    }
+    blk.ram_init(state, disk, DISK_BLOCKS)
+    serial.puts((&s_disk[0]) as u64)
+    serial.hex(disk)
+    serial.puts((&s_blocks[0]) as u64)
+    serial.dec(blk.blocks(state))
+    serial.nl()
+
+    // THE COUNTER-CHECK first: a disk without a magic number is not a
+    // file system, and `mount` has to say so.
+    serial.puts((&s_pre[0]) as u64)
+    serial.puts((&s_eq[0]) as u64)
+    serial.dec(yes(fs.mount(state)))
+    serial.nl()
+
+    serial.puts((&s_fmt[0]) as u64)
+    serial.dec(yes(fs.format(state)))
+    serial.puts((&s_eq[0]) as u64)
+    serial.dec(yes(fs.mount(state)))
+    serial.puts((&s_free[0]) as u64)
+    serial.dec(fs.free_blocks(state))
+    serial.puts((&s_ino[0]) as u64)
+    serial.dec(fs.used_inodes(state))
+    serial.nl()
+
+    // A small file: create, write, read back, compare.
+    let ino: u64 = fs.create_path(state, (&p_hello[0]) as u64, fs.T_FILE)
+    let wrote: u64 = fs.write_at(state, ino, 0, (&text[0]) as u64, 14)
+    let scratch: u64 = state + kstate.BLOCK_OFF
+    let got: u64 = fs.read_at(state, ino, 0, scratch, 64)
+    serial.puts((&s_small[0]) as u64)
+    serial.puts((&s_wrote[0]) as u64)
+    serial.dec(wrote)
+    serial.puts((&s_read[0]) as u64)
+    serial.dec(got)
+    serial.puts((&s_same[0]) as u64)
+    serial.dec(same(scratch, (&text[0]) as u64, 14))
+    serial.nl()
+
+    // A subdirectory and a file in it that is bigger than a block: that
+    // is where the block allocation is really tested.
+    fs.create_path(state, (&p_docs[0]) as u64, fs.T_DIR)
+    let big: u64 = fs.create_path(state, (&p_big[0]) as u64, fs.T_FILE)
+    let pattern: u64 = state + kstate.BLOCK_OFF + 2048
+    var i: u64 = 0
+    while i < 1500 {
+        kstate.set8(pattern + i, (48 + i % 10) as u8)
+        i = i + 1
+    }
+    let bw: u64 = fs.write_at(state, big, 0, pattern, 1500)
+    let br: u64 = fs.read_at(state, big, 0, scratch, 1500)
+    serial.puts((&s_big[0]) as u64)
+    serial.puts((&s_wrote[0]) as u64)
+    serial.dec(bw)
+    serial.puts((&s_read[0]) as u64)
+    serial.dec(br)
+    serial.puts((&s_same[0]) as u64)
+    serial.dec(same(scratch, pattern, 1500))
+    serial.puts((&s_free[0]) as u64)
+    serial.dec(fs.free_blocks(state))
+    serial.nl()
+
+    // THE LIMIT OF THE SHAPE. Twelve direct blocks and one indirect one
+    // is 76 blocks = 38912 octets. More does not fit into one inode --
+    // and the file system has to SAY how much it really wrote instead of
+    // answering with the length it was asked for.
+    let lim: u64 = fs.create_path(state, (&p_limit[0]) as u64, fs.T_FILE)
+    var asked: u64 = 0
+    var stored: u64 = 0
+    var chunk: u64 = 0
+    while chunk < 12 {
+        asked = asked + 4096
+        stored = stored + fs.write_at(state, lim, chunk * 4096, pattern, 4096)
+        chunk = chunk + 1
+    }
+    serial.puts((&s_limit[0]) as u64)
+    serial.dec(asked)
+    serial.puts((&s_wrote2[0]) as u64)
+    serial.dec(stored)
+    serial.puts((&s_size[0]) as u64)
+    serial.dec(fs.inode_size(state, lim))
+    serial.nl()
+    fs.unlink_path(state, (&p_limit[0]) as u64)
+
+    // What is in the root directory, and what in the subdirectory.
+    list_dir(state, (&p_root[0]) as u64, (&s_list[0]) as u64)
+    list_dir(state, (&p_docs[0]) as u64, (&s_dir[0]) as u64)
+
+    // Delete: the name goes, the blocks come back.
+    let before: u64 = fs.free_blocks(state)
+    serial.puts((&s_unlink[0]) as u64)
+    serial.dec(yes(fs.unlink_path(state, (&p_big[0]) as u64)))
+    serial.puts((&s_gone[0]) as u64)
+    serial.dec(yes(fs.path(state, (&p_big[0]) as u64) == 0))
+    serial.puts((&s_after[0]) as u64)
+    serial.dec(fs.free_blocks(state))
+    serial.puts((&s_of[0]) as u64)
+    serial.dec(before)
+    serial.nl()
+
+    serial.puts((&s_done[0]) as u64)
+    serial.nl()
+}
+
+fn yes(b: bool) -> u64 {
+    if b {
+        return 1
+    }
+    return 0
+}
+
+fn same(a: u64, b: u64, n: u64) -> u64 {
+    var i: u64 = 0
+    while i < n {
+        if kstate.get8(a + i) != kstate.get8(b + i) {
+            return 0
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+// `ls` in the kernel: every entry of a directory with its type.
+fn list_dir(state: u64, p: u64, label: u64) {
+    var s_sp: [u8; 2] = " \0"
+    var s_colon: [u8; 2] = ":\0"
+    let dir: u64 = fs.path(state, p)
+    serial.puts(label)
+    if dir == 0 {
+        serial.nl()
+        return
+    }
+    let out: u64 = state + kstate.NAME_OFF + 1024
+    var i: u64 = 0
+    var going: bool = true
+    while going {
+        let ino: u64 = fs.entry_at(state, dir, i, out)
+        if ino == 0 {
+            going = false
+        } else {
+            serial.puts(out + 8)
+            serial.puts((&s_colon[0]) as u64)
+            serial.dec(fs.inode_type(state, ino))
+            serial.puts((&s_sp[0]) as u64)
+            i = i + 1
+        }
+    }
+    serial.nl()
+}
+
+// ------------------------------------------------------------- the shell
+
+// What the console delivers on descriptor 0. In the test it comes from
+// the boot loader: `script=ls;cat /hello.txt` -- a semicolon is a line
+// break, and everything up to the end of the command line belongs to it.
+fn console_load(state: u64, cmd: u64) -> u64 {
+    var tag: [u8; 8] = "script=\0"
+    kstate.set(state, kstate.CONSOLE_LEN, 0)
+    kstate.set(state, kstate.CONSOLE_POS, 0)
+    if cmd == 0 {
+        return 0
+    }
+    let at: u64 = find(cmd, (&tag[0]) as u64, 7)
+    if at == 0 {
+        return 0
+    }
+    var p: u64 = at + 7
+    var n: u64 = 0
+    while kstate.get8(p) != 0 && n < kstate.CONSOLE_MAX - 2 {
+        var c: u64 = kstate.get8(p)
+        if c == 59 {
+            c = 10                          // ';' is a line break
+        }
+        kstate.set8(state + kstate.CONSOLE_OFF + n, c as u8)
+        n = n + 1
+        p = p + 1
+    }
+    if n > 0 && kstate.get8(state + kstate.CONSOLE_OFF + n - 1) != 10 {
+        kstate.set8(state + kstate.CONSOLE_OFF + n, 10 as u8)
+        n = n + 1
+    }
+    kstate.set(state, kstate.CONSOLE_LEN, n)
+    return n
+}
+
+// Point 5: `ls`, `cat`, `echo` and three more, in ring 3, over the system
+// calls of point 3, on the file system of point 4.
+fn shell(state: u64) {
+    var s_none: [u8; 14] = "sh: no script\0"
+    var s_in: [u8; 17] = "sh: input bytes=\0"
+    var s_out: [u8; 15] = "sh: commands=\0\0"
+    if kstate.get(state, kstate.CONSOLE_LEN) == 0 {
+        serial.puts((&s_none[0]) as u64)
+        serial.nl()
+        return
+    }
+    serial.puts((&s_in[0]) as u64)
+    serial.dec(kstate.get(state, kstate.CONSOLE_LEN))
+    serial.nl()
+    let i: u64 = proc.create(state, P_SHELL, 0, 2)
+    let code: u64 = wait_for(state, i)
+    serial.puts((&s_out[0]) as u64)
+    serial.dec(code)
+    serial.nl()
+}
+
+// ---------------------------------------------------------- a real disk
+
+// The same file system, one layer lower: not the RAM disk any more but a
+// drive over ATA PIO. `tools/kernel/run.sh` hands QEMU an image for it
+// and looks INTO that image afterwards -- what the kernel wrote has to be
+// in the file on the host.
+fn ata_disk(state: u64) {
+    var s_off: [u8; 13] = "ata: skipped\0"
+    var s_no: [u8; 14] = "ata: no drive\0"
+    var s_yes: [u8; 21] = "ata: drive present\0\0\0"
+    var s_fmt: [u8; 13] = "ata: format \0"
+    var s_mount: [u8; 10] = "  mount=\0\0"
+    var s_io: [u8; 13] = "ata: wrote=\0\0"
+    var s_read: [u8; 8] = "  read=\0"
+    var s_same: [u8; 8] = "  same=\0"
+    var s_list: [u8; 11] = "ata: list \0"
+    var p_file: [u8; 9] = "/ata.txt\0"
+    var p_root: [u8; 2] = "/\0"
+    var text: [u8; 30] = "ata disk holds this line r62\n\0"
+
+    if (kstate.get(state, kstate.MODE) & M_ATA) == 0 {
+        serial.puts((&s_off[0]) as u64)
+        serial.nl()
+        return
+    }
+    if !blk.present(state) {
+        serial.puts((&s_no[0]) as u64)
+        serial.nl()
+        return
+    }
+    blk.use_ata(state, DISK_BLOCKS)
+    serial.puts((&s_yes[0]) as u64)
+    serial.nl()
+    serial.puts((&s_fmt[0]) as u64)
+    serial.dec(yes(fs.format(state)))
+    serial.puts((&s_mount[0]) as u64)
+    serial.dec(yes(fs.mount(state)))
+    serial.nl()
+    let ino: u64 = fs.create_path(state, (&p_file[0]) as u64, fs.T_FILE)
+    let wrote: u64 = fs.write_at(state, ino, 0, (&text[0]) as u64, 29)
+    let scratch: u64 = state + kstate.BLOCK_OFF
+    let got: u64 = fs.read_at(state, ino, 0, scratch, 64)
+    serial.puts((&s_io[0]) as u64)
+    serial.dec(wrote)
+    serial.puts((&s_read[0]) as u64)
+    serial.dec(got)
+    serial.puts((&s_same[0]) as u64)
+    serial.dec(same(scratch, (&text[0]) as u64, 29))
+    serial.nl()
+    list_dir(state, (&p_root[0]) as u64, (&s_list[0]) as u64)
+}
+
 // ---------------------------------------------------------- the keyboard
 
 fn keyboard(state: u64) {
@@ -337,6 +942,12 @@ fn mode_of(cmd: u64) -> u64 {
     var noring: [u8; 8] = "noring3\0"
     var notimer: [u8; 8] = "notimer\0"
     var r3fault: [u8; 11] = "ring3fault\0"
+    var nosched: [u8; 8] = "nosched\0"
+    var nopre: [u8; 10] = "nopreempt\0"
+    var noproc: [u8; 7] = "noproc\0"
+    var nofs: [u8; 5] = "nofs\0"
+    var ata: [u8; 4] = "ata\0"
+    var script: [u8; 8] = "script=\0"
     if cmd == 0 {
         return 0
     }
@@ -368,7 +979,22 @@ fn mode_of(cmd: u64) -> u64 {
         mode = mode | 1024
     }
     if find(cmd, (&r3fault[0]) as u64, 10) != 0 {
-        mode = mode | 2048
+        mode = mode | M_R3FAULT
+    }
+    if find(cmd, (&nosched[0]) as u64, 7) != 0 {
+        mode = mode | M_NOSCHED
+    }
+    if find(cmd, (&nopre[0]) as u64, 9) != 0 {
+        mode = mode | M_NOPREEMPT
+    }
+    if find(cmd, (&noproc[0]) as u64, 6) != 0 {
+        mode = mode | M_NOPROC
+    }
+    if find(cmd, (&nofs[0]) as u64, 4) != 0 {
+        mode = mode | M_NOFS
+    }
+    if find(cmd, (&ata[0]) as u64, 3) != 0 {
+        mode = mode | M_ATA
     }
     return mode
 }

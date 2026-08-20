@@ -10,6 +10,14 @@
 //   * vector 32: the timer. Counter up, end of interrupt.
 //   * vector 33: the keyboard. Read the scan code, translate, note.
 //
+// ROUND 62 adds the two things that make an operating system out of it.
+// The timer now hands over to the SCHEDULER after the end-of-interrupt --
+// that is the point at which a task loses the processor against its will.
+// And an exception is no longer the end of the world: if it happened in
+// RING 3 and there is a process behind it, that process dies and the
+// kernel goes on. Only a fault in ring 0 still stops the machine, because
+// there is nobody it could belong to.
+//
 // The frame is what `isr.s` built; the offsets are documented there and
 // stand once more below.
 
@@ -17,6 +25,7 @@ import serial
 import kstate
 import kbd
 import power
+import sched
 
 export { entry }
 
@@ -42,16 +51,42 @@ fn entry(frame: u64, state: u64) {
     kstate.add(state, kstate.TRAPS, 1)
     kstate.set(state, kstate.LAST_TRAP, vector)
     if vector < 32 {
+        if user_fault(frame, state) {
+            // The process is dead; this never comes back.
+            sched.kill_current(state, vector, word(frame, F_ERROR), cr2(),
+                               word(frame, F_RIP))
+        }
         report(frame, state, vector)
         // does not return
     }
     if vector == VEC_TIMER {
         kstate.add(state, kstate.TICKS, 1)
+        // The end-of-interrupt has to go out BEFORE the switch: the
+        // controller lets nothing through until it has seen it, and the
+        // task that is switched to would run without a timer.
+        eoi(vector)
+        sched.on_tick(state)
+        return
     }
     if vector == VEC_KEYBOARD {
         kbd.irq(state)
+        eoi(vector)
+        return
     }
     eoi(vector)
+}
+
+// Did the fault come out of a PROCESS? Two conditions, and both have to
+// hold: the processor was in ring 3 (the two low bits of cs), and the
+// current task is a user process. The ring 3 excursion of round 59 has no
+// task behind it -- a fault in it still stops the kernel, and the
+// counter-check of that round keeps measuring what it measured.
+fn user_fault(frame: u64, state: u64) -> bool {
+    if (word(frame, F_CS) & 3) != 3 {
+        return false
+    }
+    let cur: u64 = sched.current(state)
+    return sched.tget(state, cur, sched.T_KIND) == sched.K_USER
 }
 
 // End of interrupt to the PIC. Written out here and not called from
