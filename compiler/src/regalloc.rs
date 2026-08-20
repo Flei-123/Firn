@@ -1425,7 +1425,7 @@ pub(crate) fn emit_func_ra(e: &mut Emitter, f: &Func) -> Option<Result<(), Strin
     // The function is emitted into a buffer of its own first; after that the
     // register descriptor post pass strikes spill stores with an immediate
     // reload of the same value (445x statically in the tokenizer run, round 37).
-    let mut tmp = Emitter { out: String::new() };
+    let mut tmp = Emitter { out: String::new(), debug_funcs: Vec::new() };
     match emit_with(&mut tmp, f, &a) {
         Ok(()) => {
             let nv = f.val_types.len();
@@ -3059,7 +3059,7 @@ mod tests {
         let mut f = Func::new("f", vec![FTy::I64; 7], FTy::I64);
         f.set_term(0, Term::Ret(Some(6)));
         assert!(supported(&f));
-        let mut e = Emitter { out: String::new() };
+        let mut e = Emitter { out: String::new(), debug_funcs: Vec::new() };
         emit_func_ra(&mut e, &f).expect("register path responsible").expect("codegen");
         assert!(e.out.contains("qword ptr [rbp+16]"), "{}", e.out);
     }
@@ -3077,7 +3077,7 @@ mod tests {
         let rc = g.push(0, FTy::I32, Op::Cast { src: r, from: FTy::I64 });
         g.set_term(0, Term::Ret(Some(rc)));
         assert!(supported(&g));
-        let mut e = Emitter { out: String::new() };
+        let mut e = Emitter { out: String::new(), debug_funcs: Vec::new() };
         emit_func_ra(&mut e, &g).expect("register path responsible").expect("codegen");
         assert!(e.out.contains("sub rsp, 16"), "{}", e.out);
         assert!(e.out.contains("mov qword ptr [rsp+0], rax"), "{}", e.out);

@@ -143,6 +143,7 @@ pub fn resolve(root: &Path, world: &World) -> Result<Vec<SourceFile>, Error> {
                             base.display().to_string()
                         }
                     )),
+                    help: None,
                 }));
             }
         };
