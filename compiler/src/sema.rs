@@ -81,6 +81,11 @@ pub(crate) struct Checker<'a> {
     /// Functions marked `#[must_consume]` — their result must not be dropped
     /// as a statement (attrs.rs).
     pub(crate) must_consume_fns: HashSet<String>,
+    /// **Round 58** (fnval.rs) — one entry per closure body currently being
+    /// checked: the depth of the scope stack where the closure begins, and
+    /// the values captured so far. A name found BELOW that depth is a
+    /// capture.
+    pub(crate) capture_frames: Vec<(usize, Vec<(String, Type)>)>,
 }
 
 pub fn check(prog: &Program, dg: &mut Diags) -> Option<TypeInfo> {
@@ -95,6 +100,7 @@ pub fn check(prog: &Program, dg: &mut Diags) -> Option<TypeInfo> {
         ret: Type::Void,
         depth: 0,
         must_consume_fns: HashSet::new(),
+        capture_frames: Vec::new(),
     };
     ck.run(prog);
     if ck.dg.has_errors() {
@@ -611,6 +617,48 @@ impl<'a> Checker<'a> {
         None
     }
 
+    /// Round 58: like `lookup_var`, but with the depth at which the name was
+    /// found — `note_use` decides on that whether it is a capture.
+    fn lookup_var_at(&self, name: &str) -> Option<(usize, VarInfo)> {
+        for (i, s) in self.scopes.iter().enumerate().rev() {
+            if let Some(v) = s.get(name) {
+                return Some((i, v.clone()));
+            }
+        }
+        None
+    }
+
+    /// **Round 58** (fnval.rs) — records the USE of a name inside a closure
+    /// body. Everything that lies below the closure's own scopes is
+    /// captured, ONCE, in the order of first use.
+    pub(crate) fn note_use(&mut self, name: &str) {
+        if self.capture_frames.is_empty() {
+            return;
+        }
+        let (depth, ty) = match self.lookup_var_at(name) {
+            Some((d, v)) => (d, v.ty),
+            None => return,
+        };
+        for f in self.capture_frames.iter_mut() {
+            if depth < f.0 && !f.1.iter().any(|(n, _)| n == name) {
+                f.1.push((name.to_string(), ty.clone()));
+            }
+        }
+    }
+
+    /// Round 58: is this name captured by the closure being checked?
+    pub(crate) fn is_captured(&self, name: &str) -> bool {
+        match (self.capture_frames.last(), self.lookup_var_at(name)) {
+            (Some(f), Some((d, _))) => d < f.0,
+            _ => false,
+        }
+    }
+
+    /// Round 58 (fnval.rs): the quiet type resolution, usable from outside.
+    pub(crate) fn resolve_ty_quiet_pub(&self, te: &TypeExpr) -> Option<Type> {
+        self.resolve_ty_quiet(te)
+    }
+
     // ------------------------------------------------------------ Statements
 
     pub(crate) fn check_block(&mut self, b: &Block, reuse_scope: bool) {
@@ -818,6 +866,19 @@ impl<'a> Checker<'a> {
     fn lvalue(&mut self, e: &Expr) -> Option<(Type, Mutability)> {
         match &e.kind {
             ExprKind::Ident(name) => {
+                // HOOK fnval: a captured value is a COPY — writing to it
+                // would look like an effect on the outside and be none
+                // (fnval.rs, round 58).
+                if self.is_captured(name) {
+                    self.dg.error_note(
+                        e.span,
+                        format!("'{}' is captured by value and cannot be assigned inside the closure", name),
+                        "capture a pointer or a Gc[T] if the change is meant to be visible outside",
+                    );
+                    let ty = self.lookup_var(name).map(|v| v.ty.clone()).unwrap_or(Type::Error);
+                    self.record(e.id, ty.clone());
+                    return Some((ty, Mutability::Mutable));
+                }
                 if let Some(v) = self.lookup_var(name) {
                     let ty = v.ty.clone();
                     let m = if v.mutable {
@@ -1040,18 +1101,21 @@ impl<'a> Checker<'a> {
                 }
             },
             ExprKind::Bool(_) => Type::Bool,
+            // HOOK fnval: the closure literal (fnval.rs, round 58)
+            ExprKind::Lambda(d) => crate::fnval::check_lambda(self, d),
             ExprKind::Ident(name) => {
+                // HOOK fnval: a name out of the enclosing function is a
+                // capture (fnval.rs, round 58)
+                self.note_use(name);
                 if let Some(v) = self.lookup_var(name) {
                     v.ty.clone()
                 } else if let Some((t, _)) = self.consts.get(name) {
                     t.clone()
-                } else if self.fns.contains_key(name) {
-                    self.dg.error_note(
-                        e.span,
-                        format!("'{}' is a function and not a value", name),
-                        "function pointers do not exist in stage 0, call them with '(...)'",
-                    );
-                    Type::Error
+                } else if let Some(sig) = self.fns.get(name).cloned() {
+                    // ROUND 58 (fnval.rs): a named function AS A VALUE. The
+                    // value is the address of its function record; the type
+                    // is read straight off the signature.
+                    Type::Fn { params: sig.params, ret: Box::new(sig.ret) }
                 } else {
                     self.dg
                         .error(e.span, format!("unknown name '{}'", name));
@@ -1348,9 +1412,12 @@ impl<'a> Checker<'a> {
             let eq_only = matches!(op, BinOp::Eq | BinOp::Ne);
             // `f64` compares with all six operators. NaN follows IEEE-754
             // in doing so: every comparison except `!=` is false.
+            // ROUND 58: two function values compare like two pointers —
+            // `==` means "the same function record". Ordering does not
+            // exist for them; addresses have no meaningful order.
             let ok = lt.is_concrete_int()
                 || lt == Type::F64
-                || (eq_only && (lt == Type::Bool || lt.is_ptr()));
+                || (eq_only && (lt == Type::Bool || lt.is_ptr() || lt.is_fn()));
             if !ok {
                 self.dg.error(
                     e.span,
@@ -1484,6 +1551,38 @@ impl<'a> Checker<'a> {
         // collector intrinsics (gc.rs, SPEC 3.5)
         if let Some(t) = crate::gc::hook_call(self, name, args, nspan, espan) {
             return t;
+        }
+        // ROUND 58 (fnval.rs): the name belongs to a VARIABLE that holds a
+        // function. A variable of function type wins over a function of the
+        // same name — that is ordinary scoping, and only that way does a
+        // parameter named like a global function stay callable.
+        self.note_use(name);
+        if let Some(v) = self.lookup_var(name) {
+            if let Type::Fn { params, ret } = v.ty.clone() {
+                let shown = self.tcx.name_of(&Type::Fn {
+                    params: params.clone(),
+                    ret: ret.clone(),
+                });
+                if args.len() != params.len() {
+                    self.dg.error(
+                        espan,
+                        format!(
+                            "the function value '{}' of type {} expects {} argument(s), found {}",
+                            name,
+                            shown,
+                            params.len(),
+                            args.len()
+                        ),
+                    );
+                }
+                for (i, a) in args.iter().enumerate() {
+                    match params.get(i) {
+                        Some(p) => self.check_argument(name, i + 1, a, p),
+                        None => self.type_out_expr(a),
+                    }
+                }
+                return *ret;
+            }
         }
         let sig = match self.fns.get(name) {
             Some(s) => s.clone(),
@@ -1677,6 +1776,13 @@ impl<'a> Checker<'a> {
                 _ => None,
             },
             ExprKind::Call(name, args, _) => {
+                // HOOK fnval: a call THROUGH a function value yields the
+                // result type of the signature. Without that a literal
+                // beside it would get no type — `f(1, 2) != 13`
+                // (fnval.rs, round 58).
+                if let Some(Type::Fn { ret, .. }) = self.lookup_var(name).map(|v| v.ty.clone()) {
+                    return Some(*ret);
+                }
                 // HOOK fehlerunionen: `try a`/`a catch b` yield the
                 // success type of the error union (errors.rs)
                 if crate::errors::is_result_call(name) {
@@ -1714,6 +1820,7 @@ impl<'a> Checker<'a> {
             ExprKind::Cast(_, te) => self.resolve_ty_quiet(te),
             ExprKind::StructLit(name, _, _) => self.tcx.lookup(name).map(Type::Struct),
             ExprKind::ArrayRepeat(..) => None,
+            ExprKind::Lambda(d) => crate::fnval::probe_lambda(self, d),
             ExprKind::ArrayLit(els) => {
                 let first = els.first()?;
                 let et = self.probe_d(first, d + 1)?;
@@ -1776,6 +1883,28 @@ impl<'a> Checker<'a> {
                 }
                 Type::Array(Box::new(t), *len)
             }
+            // Round 58: `fn(T1, T2) -> R` — a function as a value.
+            TypeExpr::Fn { params, ret, .. } => {
+                let mut ps = Vec::new();
+                for p in params {
+                    let t = self.resolve_ty_d(p, d + 1);
+                    if t.is_error() {
+                        return Type::Error;
+                    }
+                    ps.push(t);
+                }
+                let r = match ret {
+                    Some(t) => {
+                        let t = self.resolve_ty_d(t, d + 1);
+                        if t.is_error() {
+                            return Type::Error;
+                        }
+                        t
+                    }
+                    None => Type::Void,
+                };
+                Type::Fn { params: ps, ret: Box::new(r) }
+            }
         }
     }
 
@@ -1792,6 +1921,17 @@ impl<'a> Checker<'a> {
             TypeExpr::Array { elem, len, .. } => self
                 .resolve_ty_quiet(elem)
                 .map(|t| Type::Array(Box::new(t), *len)),
+            TypeExpr::Fn { params, ret, .. } => {
+                let mut ps = Vec::new();
+                for p in params {
+                    ps.push(self.resolve_ty_quiet(p)?);
+                }
+                let r = match ret {
+                    Some(t) => self.resolve_ty_quiet(t)?,
+                    None => Type::Void,
+                };
+                Some(Type::Fn { params: ps, ret: Box::new(r) })
+            }
         }
     }
 
@@ -2027,6 +2167,11 @@ fn compatible(a: &Type, b: &Type) -> bool {
     }
     match (a, b) {
         (Type::Ptr { inner: x, .. }, Type::Ptr { inner: y, .. }) => compatible(x, y),
+        // ROUND 58: function types are compared EXACTLY — same arity, same
+        // parameter types, same result. A pointer compares leniently here
+        // (see above); for a call target that would be wrong, because the
+        // callee reads the memory behind it.
+        (Type::Fn { .. }, Type::Fn { .. }) => a == b,
         _ => a == b,
     }
 }
@@ -2072,7 +2217,7 @@ fn find_cycles(
 }
 
 /// Reachability analysis: does EVERY path in the block end with 'return'?
-fn block_returns(b: &Block) -> bool {
+pub(crate) fn block_returns(b: &Block) -> bool {
     b.stmts.iter().any(stmt_returns)
 }
 
@@ -2168,6 +2313,7 @@ mod tests {
             ret: Type::Void,
             depth: 0,
             must_consume_fns: HashSet::new(),
+            capture_frames: Vec::new(),
             prog: None,
         };
         ck.run(first);

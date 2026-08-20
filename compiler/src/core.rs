@@ -710,6 +710,8 @@ fn visit_calls(ck: &mut Checker, b: &crate::ast::Block, names: &[String]) {
 
 fn visit_expr(ck: &mut Checker, e: &Expr, names: &[String]) {
     match &e.kind {
+        // Round 58: a closure body is code like any other.
+        ExprKind::Lambda(d) => visit_calls(ck, &d.body, names),
         ExprKind::Call(n, args, nspan) => {
             if names.iter().any(|x| x == n) {
                 ck.dg.error_note(

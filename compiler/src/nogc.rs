@@ -234,6 +234,23 @@ impl<'a> NoGcChecker<'a> {
 
     fn check_expr(&mut self, e: &Expr) {
         match &e.kind {
+            // Round 58: `gc fn(…)` allocates — inside `#[no_gc]` that has to
+            // strike, and so has everything the body does.
+            ExprKind::Lambda(d) => {
+                if d.heap {
+                    let who = self.who.clone();
+                    self.report(
+                        d.span,
+                        format!(
+                            "'{who}' is #[no_gc], but allocates on the GC heap via 'gc fn(…)'"
+                        ),
+                        "SPEC 3.5.4: no collection run may be triggered in a #[no_gc] \
+                 call tree"
+                            .to_string(),
+                    );
+                }
+                self.check_block(&d.body);
+            }
             ExprKind::Call(name, args, sp) => {
                 self.check_call(name, *sp, e.span);
                 for a in args {

@@ -42,7 +42,10 @@ export { Sema, sema_new, sema_free, sema_run, sema_error, sema_ty,
          sema_types, sema_ty_count, sema_needs_comptime, sema_const_value,
          sema_mu_set, sema_fe_set, sema_gc_set, sema_if_set,
          sema_kernel_set,
-         sema_tree }
+         sema_tree,
+         sema_closure_index, sema_closure_tid, sema_closure_size,
+         sema_closure_caps, sema_capture_name, sema_capture_ty,
+         sema_is_closure_name }
 
 const NONE: u32 = 4294967295
 
@@ -78,6 +81,18 @@ struct Sema {
     // only enforced.
     kernel: bool,
     ct_needed: bool,     // a constant needs evaluation at compile time
+    // ROUND 58 (fnval.rs): the closures of this translation. One entry per
+    // closure literal; the lowering reads the record layout off it.
+    cl_name: Vec[u32],   // the generated function `__closure#N`
+    cl_tid: Vec[u64],    // type tag of the capture class, 0 = no captures
+    cl_size: Vec[u64],   // size of the record in bytes
+    cl_coff: Vec[u32], cl_clen: Vec[u32],   // range in cc_*
+    cc_name: Vec[u32], cc_ty: Vec[u32],
+    // While a closure body is being checked: the length of the scope stack
+    // at its start. Everything found BELOW it is a capture.
+    cap_base: Vec[u32],
+    cg_name: Vec[u32], cg_ty: Vec[u32], cg_frame: Vec[u32],
+    scratch2: rt.Buf,    // builds the name of a capture class
 }
 
 fn sema_new(b: u64, it: u64) -> Sema {
@@ -90,6 +105,12 @@ fn sema_new(b: u64, it: u64) -> Sema {
         t_bool: 0, t_i64: 0, t_usize: 0, t_void: 0, t_error: 0, t_f64: 0,
         ret: 0, mu: 0, feh: 0, gc: 0, ifr: 0, mc_fname: vec_new[u32](), mc_si: vec_new[u32](),
         err: 0, kernel: false, ct_needed: false,
+        cl_name: vec_new[u32](), cl_tid: vec_new[u64](), cl_size: vec_new[u64](),
+        cl_coff: vec_new[u32](), cl_clen: vec_new[u32](),
+        cc_name: vec_new[u32](), cc_ty: vec_new[u32](),
+        cap_base: vec_new[u32](),
+        cg_name: vec_new[u32](), cg_ty: vec_new[u32](), cg_frame: vec_new[u32](),
+        scratch2: rt.buf_new(),
     }
 }
 
@@ -104,6 +125,228 @@ fn sema_free(s: *mut Sema) {
     vec_free[u64](&(*s).k_value)
     vec_free[u32](&(*s).mc_fname)
     vec_free[u32](&(*s).mc_si)
+    vec_free[u32](&(*s).cl_name)
+    vec_free[u64](&(*s).cl_tid)
+    vec_free[u64](&(*s).cl_size)
+    vec_free[u32](&(*s).cl_coff)
+    vec_free[u32](&(*s).cl_clen)
+    vec_free[u32](&(*s).cc_name)
+    vec_free[u32](&(*s).cc_ty)
+    vec_free[u32](&(*s).cap_base)
+    vec_free[u32](&(*s).cg_name)
+    vec_free[u32](&(*s).cg_ty)
+    vec_free[u32](&(*s).cg_frame)
+    rt.buf_free(&(*s).scratch2)
+}
+
+// ------------------------------------------------- closures (round 58)
+
+// Is this the name of a generated closure function?
+fn sema_is_closure_name(it: *mut intern.Interner, nr: u32) -> bool {
+    var cw: [u8; 10] = "__closure#"
+    return intern.intern_prefix(it, nr, (&cw[0]) as u64, 10)
+}
+
+// Index of a closure by the name of its generated function, or NONE.
+fn sema_closure_index(s: *mut Sema, name: u32) -> u32 {
+    var i: usize = 0
+    while i < vec_len[u32](&(*s).cl_name) {
+        if vec_at[u32](&(*s).cl_name, i) == name {
+            return i as u32
+        }
+        i = i + 1
+    }
+    return NONE
+}
+
+fn sema_closure_tid(s: *mut Sema, ci: u32) -> u64 { return vec_at[u64](&(*s).cl_tid, ci as usize) }
+fn sema_closure_size(s: *mut Sema, ci: u32) -> u64 { return vec_at[u64](&(*s).cl_size, ci as usize) }
+fn sema_closure_caps(s: *mut Sema, ci: u32) -> u32 { return vec_at[u32](&(*s).cl_clen, ci as usize) }
+fn sema_capture_name(s: *mut Sema, ci: u32, k: u32) -> u32 {
+    return vec_at[u32](&(*s).cc_name, (vec_at[u32](&(*s).cl_coff, ci as usize) + k) as usize)
+}
+fn sema_capture_ty(s: *mut Sema, ci: u32, k: u32) -> u32 {
+    return vec_at[u32](&(*s).cc_ty, (vec_at[u32](&(*s).cl_coff, ci as usize) + k) as usize)
+}
+
+// Records the USE of a name inside a closure body. Everything that lies
+// below the closure's own scopes is captured, ONCE, in the order of first
+// use.
+fn note_use(s: *mut Sema, name: u32) {
+    if vec_len[u32](&(*s).cap_base) == 0 {
+        return
+    }
+    var i: usize = vec_len[u32](&(*s).v_name)
+    var found: usize = 0
+    var ok: bool = false
+    while i > 0 && !ok {
+        i = i - 1
+        if vec_at[u32](&(*s).v_name, i) == name {
+            found = i
+            ok = true
+        }
+    }
+    if !ok {
+        return
+    }
+    let vt: u32 = vec_at[u32](&(*s).v_ty, found)
+    var fr: usize = 0
+    while fr < vec_len[u32](&(*s).cap_base) {
+        if (found as u32) < vec_at[u32](&(*s).cap_base, fr) {
+            var seen: bool = false
+            var q: usize = 0
+            while q < vec_len[u32](&(*s).cg_name) {
+                if vec_at[u32](&(*s).cg_name, q) == name {
+                    if vec_at[u32](&(*s).cg_frame, q) == fr as u32 {
+                        seen = true
+                    }
+                }
+                q = q + 1
+            }
+            if !seen {
+                vec_push[u32](&(*s).cg_name, name)
+                vec_push[u32](&(*s).cg_ty, vt)
+                vec_push[u32](&(*s).cg_frame, fr as u32)
+            }
+        }
+        fr = fr + 1
+    }
+}
+
+// Is this name captured by the closure currently being checked?
+fn is_captured(s: *mut Sema, name: u32) -> bool {
+    if vec_len[u32](&(*s).cap_base) == 0 {
+        return false
+    }
+    var i: usize = vec_len[u32](&(*s).v_name)
+    while i > 0 {
+        i = i - 1
+        if vec_at[u32](&(*s).v_name, i) == name {
+            let top: u32 = vec_at[u32](&(*s).cap_base, vec_len[u32](&(*s).cap_base) - 1)
+            return (i as u32) < top
+        }
+    }
+    return false
+}
+
+// The closure literal (`fnval.rs::check_lambda`).
+fn lambda_check(s: *mut Sema, e: u32) -> u32 {
+    let b: *mut ast.Tree = tree(s)
+    let cname: u32 = ast.e_a(b, e)
+    let poff: u32 = ast.e_b(b, e)
+    let plen: u32 = ast.e_c(b, e)
+    let packed: u64 = ast.e_number(b, e)
+    let heap: bool = (packed & 1) == 1
+    var ret: u32 = (*s).t_void
+    if (packed >> 1) != 0 {
+        ret = ast_ty(s, ((packed >> 1) - 1) as u32)
+    }
+    var par: Vec[u32] = vec_new[u32]()
+    var k: u32 = 0
+    while k < plen {
+        vec_push[u32](&par, ast_ty(s, ast.param_ty(b, poff + k)))
+        k = k + 1
+    }
+    let fty: u32 = types.fn_ty_new(table(s), &par, ret)
+
+    // The body is checked in a scope of its own; `note_use` records what
+    // comes out of the scopes below.
+    let base: u32 = vec_len[u32](&(*s).v_name) as u32
+    vec_push[u32](&(*s).cap_base, base)
+    let frame: u32 = vec_len[u32](&(*s).cap_base) as u32 - 1
+    range_on(s)
+    k = 0
+    while k < plen {
+        var_create(s, ast.param_name(b, poff + k), vec_at[u32](&par, k as usize))
+        k = k + 1
+    }
+    vec_free[u32](&par)
+    let saved_ret: u32 = (*s).ret
+    (*s).ret = ret
+    let fi: u32 = fn_search(s, cname)
+    if fi != NONE {
+        block(s, ast.fn_body(b, fi as usize), true)
+    }
+    (*s).ret = saved_ret
+    range_off(s)
+    vec_pop[u32](&(*s).cap_base)
+
+    // Captured values are COPIED into the record, so they have to fit into
+    // one word -- an aggregate would make the record a variable sized thing
+    // that the collector could no longer describe.
+    let coff: u32 = vec_len[u32](&(*s).cc_name) as u32
+    var clen: u32 = 0
+    var caps: Vec[u32] = vec_new[u32]()
+    var q: usize = 0
+    while q < vec_len[u32](&(*s).cg_name) {
+        if vec_at[u32](&(*s).cg_frame, q) == frame {
+            let ct: u32 = vec_at[u32](&(*s).cg_ty, q)
+            let ck: u32 = types.ty_kind(table(s), ct)
+            let too_big: bool = types.size_of(table(s), ct) > 8
+            let is_agg: bool = ck == types.K_ARR || ck == types.K_STRUCT
+            if too_big || is_agg {
+                complain(s)
+            } else {
+                vec_push[u32](&(*s).cc_name, vec_at[u32](&(*s).cg_name, q))
+                vec_push[u32](&(*s).cc_ty, ct)
+                vec_push[u32](&caps, ct)
+                clen = clen + 1
+            }
+            vec_set[u32](&(*s).cg_frame, q, NONE)
+        }
+        q = q + 1
+    }
+    vec_push[u32](&(*s).cl_name, cname)
+    vec_push[u32](&(*s).cl_coff, coff)
+    vec_push[u32](&(*s).cl_clen, clen)
+    if clen == 0 {
+        vec_free[u32](&caps)
+        vec_push[u64](&(*s).cl_tid, 0)
+        vec_push[u64](&(*s).cl_size, 8)
+        if heap {
+            // captures nothing and needs no GC record
+            complain(s)
+            return (*s).t_error
+        }
+        return fty
+    }
+    if !heap {
+        // captures and therefore needs storage: `gc fn(...)`
+        vec_free[u32](&caps)
+        vec_push[u64](&(*s).cl_tid, 0)
+        vec_push[u64](&(*s).cl_size, 0)
+        complain(s)
+        return (*s).t_error
+    }
+    if !has_gc(s) {
+        vec_free[u32](&caps)
+        vec_push[u64](&(*s).cl_tid, 0)
+        vec_push[u64](&(*s).cl_size, 0)
+        complain(s)
+        return (*s).t_error
+    }
+    rt.buf_clear(&(*s).scratch2)
+    var kw: [u8; 10] = "__capture#"
+    rt.buf_push_bytes(&(*s).scratch2, (&kw[0]) as u64, 10)
+    rt.buf_push_dec_u64(&(*s).scratch2, vec_len[u32](&(*s).cl_name) as u64 - 1)
+    let kname: u32 = intern.intern_number(names(s), rt.buf_ptr(&(*s).scratch2),
+                                          rt.buf_len(&(*s).scratch2)) as u32
+    let ki: u32 = gc.gc_capture_class(gcp(s), table(s), names(s), kname, &caps)
+    vec_free[u32](&caps)
+    vec_push[u64](&(*s).cl_tid, gc.gc_tid(gcp(s), ki))
+    vec_push[u64](&(*s).cl_size, gc.gc_size(gcp(s), ki))
+    if !has_fe(s) {
+        complain(s)
+        return (*s).t_error
+    }
+    var aw: [u8; 10] = "AllocError"
+    let anr: u32 = intern.intern_number(names(s), (&aw[0]) as u64, 10) as u32
+    let sm: u32 = err.error_set_find(fe(s), anr)
+    if sm == NONE {
+        complain(s)
+        return (*s).t_error
+    }
+    return err.error_union_build(fe(s), table(s), names(s), sm, fty)
 }
 
 fn sema_error(s: *mut Sema) -> usize { return (*s).err }
@@ -210,6 +453,20 @@ fn const_value(s: *mut Sema, name: u32) -> u64 {
         i = i + 1
     }
     return 0
+}
+
+// ROUND 58 (fnval.rs): the TYPE of the function `fi` as a value --
+// `fn(P1, P2) -> R` out of its declared signature.
+fn fn_value_ty(s: *mut Sema, fi: u32) -> u32 {
+    var par: Vec[u32] = vec_new[u32]()
+    var k: u32 = 0
+    while k < ast.fn_plen(tree(s), fi as usize) {
+        vec_push[u32](&par, types.param_ty_resolved(table(s), fi as usize, k))
+        k = k + 1
+    }
+    let r: u32 = types.fn_ty_new(table(s), &par, types.ret_ty_the_func(table(s), fi as usize))
+    vec_free[u32](&par)
+    return r
 }
 
 // Index of the function with this name, or NONE.
@@ -341,6 +598,15 @@ fn probe_t(s: *mut Sema, e: u32, d: u32) -> u32 {
     if a == ast.E_CALL {
         if ast.e_number(b, e) != 0 {
             return (*s).t_usize
+        }
+        // HOOK fnval: a call THROUGH a function value yields the result
+        // type of the signature. Without that a literal beside it would get
+        // no type -- `f(1, 2) != 13` (fnval.rs, round 58).
+        let cv: u32 = var_search(s, ast.e_a(b, e))
+        if cv != NONE {
+            if types.ty_kind(table(s), cv) == types.K_FN {
+                return types.ty_a(table(s), cv)
+            }
         }
         // HOOK error unions: `try a`/`a catch b` yield the success type
         // of the error union (errors.rs::success_type via probe_d).
@@ -773,7 +1039,13 @@ fn binary(s: *mut Sema, e: u32, note: u32) -> u32 {
         let only_equal: bool = op == 10 || op == 11
         var ok: bool = is_int(s, lt) || is_f64(s, lt)
         if !ok && only_equal {
+            // ROUND 58: two function values compare like two pointers --
+            // `==` means "the same function record". Ordering does not
+            // exist for them; addresses have no meaningful order.
             ok = is_bool(s, lt) || types.is_ptr(table(s), lt)
+            if !ok {
+                ok = types.ty_kind(table(s), lt) == types.K_FN
+            }
         }
         if !ok {
             complain(s)
@@ -1635,6 +1907,39 @@ fn call(s: *mut Sema, e: u32) -> u32 {
             return (*s).t_void
         }
     }
+    // ROUND 58 (fnval.rs): the name belongs to a VARIABLE that holds a
+    // function. A variable of function type wins over a function of the
+    // same name -- that is ordinary scoping, and only that way does a
+    // parameter named like a global function stay callable.
+    note_use(s, name)
+    let vt: u32 = var_search(s, name)
+    if vt != NONE {
+        if types.ty_kind(table(s), vt) == types.K_FN {
+            let plen2: u32 = types.fn_ty_len(table(s), vt)
+            if cnt != plen2 {
+                complain(s)
+            }
+            var k2: u32 = 0
+            while k2 < cnt {
+                let arg2: u32 = ast.child_at(b, off + k2)
+                if k2 < plen2 {
+                    let pt2: u32 = types.fn_ty_param(table(s), vt, k2)
+                    if has_fe(s) && coerce_check(s, arg2, pt2) {
+                        k2 = k2 + 1
+                        continue
+                    }
+                    let t2: u32 = expr(s, arg2, pt2)
+                    if !types.compatible(table(s), t2, pt2) {
+                        complain(s)
+                    }
+                } else {
+                    infer(s, arg2)
+                }
+                k2 = k2 + 1
+            }
+            return types.ty_a(table(s), vt)
+        }
+    }
     let f: u32 = fn_search(s, name)
     if f == NONE {
         var k: u32 = 0
@@ -1740,6 +2045,9 @@ fn expr_inner(s: *mut Sema, e: u32, note: u32) -> u32 {
         return (*s).t_bool
     }
     if a == ast.E_ID {
+        // HOOK fnval: a name out of the enclosing function is a capture
+        // (fnval.rs, round 58)
+        note_use(s, ast.e_a(b, e))
         let v: u32 = var_search(s, ast.e_a(b, e))
         if v != NONE {
             return v
@@ -1748,8 +2056,19 @@ fn expr_inner(s: *mut Sema, e: u32, note: u32) -> u32 {
         if k != NONE {
             return k
         }
+        // ROUND 58 (fnval.rs): a named function AS A VALUE. The value is
+        // the address of its function record; the type is read straight off
+        // the signature.
+        let fi: u32 = fn_search(s, ast.e_a(b, e))
+        if fi != NONE {
+            return fn_value_ty(s, fi)
+        }
         complain(s)
         return (*s).t_error
+    }
+    // HOOK fnval: the closure literal (fnval.rs, round 58)
+    if a == ast.E_LAMBDA {
+        return lambda_check(s, e)
     }
     if a == ast.E_UN {
         return unary(s, e, note)
@@ -2722,8 +3041,15 @@ fn sema_run(s: *mut Sema) {
     }
 
     // 5. Function bodies.
+    //    HOOK fnval (round 58): the generated functions of the closures are
+    //    left out here -- their bodies are checked AT the closure literal,
+    //    where the captured names are still in scope.
     i = 0
     while i < ast.fn_count(b) {
+        if sema_is_closure_name(names(s), ast.fn_name(b, i)) {
+            i = i + 1
+            continue
+        }
         (*s).ret = types.ret_ty_the_func(table(s), i)
         range_on(s)
         var k: u32 = 0

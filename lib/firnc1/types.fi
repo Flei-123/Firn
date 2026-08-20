@@ -30,6 +30,7 @@ import gc
 export { Types, types_new, types_free, types_resolve,
          K_I8, K_I16, K_I32, K_I64, K_U8, K_U16, K_U32, K_U64,
          K_USIZE, K_ISIZE, K_BOOL, K_F64, K_PTR, K_ARR, K_STRUCT, K_VOID, K_ERROR,
+         K_FN, fn_ty_new, fn_ty_len, fn_ty_param,
          ty_kind, ty_a, ty_n, size_of, alignment_of, round_up,
          class_of, needs_sret, is_aggregate,
          st_count, st_name, st_size, st_alignment, st_foff, st_flen,
@@ -58,6 +59,10 @@ const K_ARR: u32 = 13
 const K_STRUCT: u32 = 14
 const K_VOID: u32 = 15
 const K_ERROR: u32 = 16
+// ROUND 58 (fnval.rs): a function as a VALUE. One machine word wide -- the
+// address of a FUNCTION RECORD whose word 0 holds the code address.
+//   a = result type   n = index into `ft_off`/`ft_len` (the parameter list)
+const K_FN: u32 = 17
 
 // The largest aggregate that is still passed in registers.
 const MAX_REGISTER_AGGREGATE: u64 = 16
@@ -96,6 +101,11 @@ struct Types {
     // file calls `err.fi` directly -- the import cycle is allowed (measured:
     // modules.rs resolves it like any other).
     feh: u64,
+    // ROUND 58: the parameter lists of the FUNCTION TYPES. `n` of a K_FN
+    // entry indexes ft_off/ft_len, and those describe a range in ft_par.
+    ft_off: Vec[u32],
+    ft_len: Vec[u32],
+    ft_par: Vec[u32],
     // per function: resolved parameter types and return type
     fn_poff: Vec[u32],
     fn_plen: Vec[u32],
@@ -110,6 +120,7 @@ fn types_new() -> Types {
         s_foff: vec_new[u32](), s_flen: vec_new[u32](),
         f_name: vec_new[u32](), f_ty: vec_new[u32](), f_offset: vec_new[u64](),
         eoff: 0, gc: 0, feh: 0,
+        ft_off: vec_new[u32](), ft_len: vec_new[u32](), ft_par: vec_new[u32](),
         fn_poff: vec_new[u32](), fn_plen: vec_new[u32](), fn_ptyp: vec_new[u32](),
         fn_ret: vec_new[u32](),
     }
@@ -127,6 +138,9 @@ fn types_free(t: *mut Types) {
     vec_free[u32](&(*t).f_name)
     vec_free[u32](&(*t).f_ty)
     vec_free[u64](&(*t).f_offset)
+    vec_free[u32](&(*t).ft_off)
+    vec_free[u32](&(*t).ft_len)
+    vec_free[u32](&(*t).ft_par)
     vec_free[u32](&(*t).fn_poff)
     vec_free[u32](&(*t).fn_plen)
     vec_free[u32](&(*t).fn_ptyp)
@@ -136,6 +150,31 @@ fn types_free(t: *mut Types) {
 fn ty_kind(t: *mut Types, i: u32) -> u32 { return vec_at[u32](&(*t).kind, i as usize) }
 fn ty_a(t: *mut Types, i: u32) -> u32 { return vec_at[u32](&(*t).a, i as usize) }
 fn ty_n(t: *mut Types, i: u32) -> u64 { return vec_at[u64](&(*t).n, i as usize) }
+
+// ROUND 58: create a function type. `par` holds the resolved parameter
+// types; `ret` is the result type.
+fn fn_ty_new(t: *mut Types, par: *mut Vec[u32], ret: u32) -> u32 {
+    let li: u32 = vec_len[u32](&(*t).ft_off) as u32
+    vec_push[u32](&(*t).ft_off, vec_len[u32](&(*t).ft_par) as u32)
+    vec_push[u32](&(*t).ft_len, vec_len[u32](par) as u32)
+    var k: usize = 0
+    while k < vec_len[u32](par) {
+        vec_push[u32](&(*t).ft_par, vec_at[u32](par, k))
+        k = k + 1
+    }
+    return new_ty(t, K_FN, ret, li as u64)
+}
+
+// Number of parameters of a function type.
+fn fn_ty_len(t: *mut Types, i: u32) -> u32 {
+    return vec_at[u32](&(*t).ft_len, ty_n(t, i) as usize)
+}
+
+// The k-th parameter type of a function type.
+fn fn_ty_param(t: *mut Types, i: u32, k: u32) -> u32 {
+    let off: u32 = vec_at[u32](&(*t).ft_off, ty_n(t, i) as usize)
+    return vec_at[u32](&(*t).ft_par, (off + k) as usize)
+}
 
 fn st_count(t: *mut Types) -> usize { return vec_len[u32](&(*t).s_name) }
 fn st_name(t: *mut Types, i: usize) -> u32 { return vec_at[u32](&(*t).s_name, i) }
@@ -181,6 +220,8 @@ fn size_of(t: *mut Types, i: u32) -> u64 {
     if k == K_I64 || k == K_U64 || k == K_USIZE || k == K_ISIZE { return 8 }
     if k == K_F64 { return 8 }
     if k == K_PTR { return 8 }
+    // ROUND 58: a function value is the pointer to its function record.
+    if k == K_FN { return 8 }
     if k == K_ARR { return size_of(t, ty_a(t, i)) * ty_n(t, i) }
     if k == K_STRUCT { return st_size(t, ty_a(t, i) as usize) }
     return 0
@@ -378,6 +419,25 @@ fn resolve(t: *mut Types, b: *mut ast.Tree, it: *mut intern.Interner, te: u32) -
     if a == ast.T_ARR {
         let elem: u32 = resolve(t, b, it, ast.t_a(b, te))
         return new_ty(t, K_ARR, elem, ast.t_b(b, te))
+    }
+    // ROUND 58 (fnval.rs): `fn(T1, T2) -> R`.
+    if a == ast.T_FN {
+        let packed: u64 = ast.t_b(b, te)
+        let off: u32 = (packed >> 32) as u32
+        let cnt: u32 = (packed & 4294967295) as u32
+        var par: Vec[u32] = vec_new[u32]()
+        var k: u32 = 0
+        while k < cnt {
+            vec_push[u32](&par, resolve(t, b, it, ast.child_at(b, off + k)))
+            k = k + 1
+        }
+        var ret: u32 = new_ty(t, K_VOID, 0, 0)
+        if ast.t_a(b, te) != ast.NOTHING {
+            ret = resolve(t, b, it, ast.t_a(b, te))
+        }
+        let r: u32 = fn_ty_new(t, &par, ret)
+        vec_free[u32](&par)
+        return r
     }
     let nr: u32 = ast.t_a(b, te)
     let g: i32 = base_ty(it, nr)
@@ -584,6 +644,7 @@ fn bits_of(t: *mut Types, i: u32) -> u32 {
     if k == K_I32 || k == K_U32 { return 32 }
     if k == K_I64 || k == K_U64 || k == K_USIZE || k == K_ISIZE { return 64 }
     if k == K_PTR { return 64 }
+    if k == K_FN { return 64 }
     return 0
 }
 
@@ -610,6 +671,26 @@ fn ty_equal(t: *mut Types, a: u32, b: u32) -> bool {
     }
     if ka == K_STRUCT {
         return ty_a(t, a) == ty_a(t, b)
+    }
+    // ROUND 58: function types are compared EXACTLY -- same number of
+    // parameters, same parameter types, same result. A pointer compares
+    // leniently above; for a call target that would be wrong, because the
+    // callee reads the memory behind it.
+    if ka == K_FN {
+        if fn_ty_len(t, a) != fn_ty_len(t, b) {
+            return false
+        }
+        if !ty_equal(t, ty_a(t, a), ty_a(t, b)) {
+            return false
+        }
+        var k: u32 = 0
+        while k < fn_ty_len(t, a) {
+            if !ty_equal(t, fn_ty_param(t, a, k), fn_ty_param(t, b, k)) {
+                return false
+            }
+            k = k + 1
+        }
+        return true
     }
     return true
 }
@@ -669,6 +750,27 @@ fn name_of(t: *mut Types, it: *mut intern.Interner, b: *mut rt.Buf, i: u32) {
     if k == K_STRUCT {
         let nr: u32 = st_name(t, ty_a(t, i) as usize)
         rt.buf_push_bytes(b, intern.intern_ptr(it, nr), intern.intern_length(it, nr))
+        return
+    }
+    if k == K_FN {
+        // `fn(i32, i32) -> i32`, and `fn(i32)` without a result.
+        var fw: [u8; 3] = "fn("
+        rt.buf_push_bytes(b, (&fw[0]) as u64, 3)
+        var k2: u32 = 0
+        while k2 < fn_ty_len(t, i) {
+            if k2 > 0 {
+                var cm: [u8; 2] = ", "
+                rt.buf_push_bytes(b, (&cm[0]) as u64, 2)
+            }
+            name_of(t, it, b, fn_ty_param(t, i, k2))
+            k2 = k2 + 1
+        }
+        rt.buf_push(b, 41 as u8)
+        if ty_kind(t, ty_a(t, i)) != K_VOID {
+            var ar: [u8; 4] = " -> "
+            rt.buf_push_bytes(b, (&ar[0]) as u64, 4)
+            name_of(t, it, b, ty_a(t, i))
+        }
         return
     }
     if k == K_VOID {
