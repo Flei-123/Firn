@@ -1,4 +1,4 @@
-//! Strings within the compiler (SPEC §8) — module `str`.
+//! Strings in the compiler (SPEC §8) — module `str`.
 //!
 //! This file holds the **compiler side** of the four string types:
 //!
@@ -16,7 +16,7 @@
 //! The functions are deliberately free of compiler internals (no `Diags`, no
 //! `Span`): the lexer needs exactly one call of [`lex_string_literal`] and
 //! turns [`LitError`] into a message with line/column. That wiring inside
-//! the lexer belongs to the module `kern` and is not yet placed during this
+//! the lexer belongs to the module `kern` and is not yet in place in this
 //! round (see `ACCEPTANCE.md`, section `str`); through
 //! `firnc --strlit <literal>` the whole path stays checkable
 //! nonetheless.
@@ -25,11 +25,11 @@
 // Memory layout (contract with lib/str/*.fi and the module tok)
 // ---------------------------------------------------------------------------
 
-/// Offset of the data pointer within `Bytes`/`Str`/`Str16`.
+/// Offset of the data pointer in `Bytes`/`Str`/`Str16`.
 pub const SLICE_PTR_OFF: u64 = 0;
-/// Offset of the length (counted as elements, not bytes).
+/// Offset of the length (counted in elements, not bytes).
 pub const SLICE_LEN_OFF: u64 = 8;
-/// Offset of the capacity (counted as elements).
+/// Offset of the capacity (counted in elements).
 pub const SLICE_CAP_OFF: u64 = 16;
 /// Total size of `Bytes`/`Str`/`Str16`.
 pub const SLICE_SIZE: u64 = 24;
@@ -60,7 +60,7 @@ impl LitKind {
             LitKind::Str16 => "Str16",
         }
     }
-    /// Prefix ahead of the quote.
+    /// Prefix in front of the quote.
     pub fn prefix(self) -> &'static str {
         match self {
             LitKind::Bytes => "b",
@@ -80,7 +80,7 @@ pub enum LitValue {
 }
 
 impl LitValue {
-    /// Count of elements (octets or code units).
+    /// Number of elements (octets or code units).
     pub fn len(&self) -> usize {
         match self {
             LitValue::Octets(v) => v.len(),
@@ -119,7 +119,7 @@ fn data_line(dir: &str, it: impl Iterator<Item = u64>) -> String {
 ///
 /// The body stays RAW (braces and escapes untouched): splitting it into text
 /// and expression segments is the parser's job
-/// (`parser.rs::interpolation`), decoding the text segments runs afterwards
+/// (`parser.rs::interpolation`), and decoding the text segments runs
 /// through [`decode_literal`] like with every other literal.
 /// Return value as with [`lex_string_literal`]: `(content-or-error,
 /// characters consumed)`, `None` when no `f"` stands here.
@@ -127,7 +127,7 @@ pub fn lex_fstring_literal(src: &[char], pos: usize) -> Option<(Result<String, L
     if src.get(pos) != Some(&'f') || src.get(pos + 1) != Some(&'"') {
         return None;
     }
-    // Body up to the unescaped quote — the same loop as at
+    // Body up to the unescaped quote — the same loop as in
     // `lex_string_literal`, just without decoding.
     let mut body: Vec<char> = Vec::new();
     let mut i = pos + 2;
@@ -166,7 +166,7 @@ pub fn lex_fstring_literal(src: &[char], pos: usize) -> Option<(Result<String, L
 
 /// Error while decoding a literal.
 ///
-/// `off` is the distance counted as **characters** from the opening quote;
+/// `off` is the distance counted in **characters** from the opening quote;
 /// the lexer adds it onto the column of the literal start.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LitError {
@@ -180,12 +180,12 @@ impl LitError {
     }
 }
 
-/// Spots a string literal at the character stream `src` from `pos`.
+/// Spots a string literal in the character stream `src` from `pos` on.
 ///
-/// Return value: `(kind, content-or-error, count of characters consumed)`.
-/// `None` when no literal starts at this spot. The lexer needs exactly this
-/// one call; the count of characters consumed is at the same time the width
-/// of the marker within the error output.
+/// Return value: `(kind, content-or-error, number of characters consumed)`.
+/// `None` when no literal starts at this place. The lexer needs exactly
+/// this one call; the number of characters consumed is at the same time the
+/// width of the marker in the error output.
 pub fn lex_string_literal(
     src: &[char],
     pos: usize,
@@ -362,8 +362,8 @@ pub fn decode_literal(kind: LitKind, body: &[char]) -> Result<LitValue, LitError
                         }
                     }
                     LitKind::Str => {
-                        // Within Str one unpaired surrogate is a fault; a
-                        // pair 😀 gets united into one code point.
+                        // In `Str` an unpaired surrogate is an error; a
+                        // pair 😀 is united into one code point.
                         if is_high_surrogate(cp) {
                             if let Some((lo, w)) = peek_escaped_low(body, i) {
                                 i += w;
@@ -463,7 +463,7 @@ fn combine(hi: u32, lo: u32) -> u32 {
     0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
 }
 
-/// Appends a code point as UTF-8 (surrogates get encoded WTF-8 style).
+/// Appends a code point as UTF-8 (surrogates are encoded WTF-8 style).
 pub fn push_utf8(out: &mut Vec<u8>, cp: u32) {
     if cp < 0x80 {
         out.push(cp as u8);
@@ -502,7 +502,7 @@ pub fn utf8_to_utf16(bytes: &[u8]) -> Vec<u16> {
     out
 }
 
-/// `Str16 -> Str`, fallible: `None` on one unpaired surrogate (SPEC §8.2).
+/// `Str16 -> Str`, fallible: `None` on an unpaired surrogate (SPEC §8.2).
 pub fn to_utf8(units: &[u16]) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -651,7 +651,7 @@ pub const STATIC_ATOMS: &[&str] = &[
     "data",
 ];
 
-/// Intern table: text -> `u32`. Comparing two `Atom` is one integer
+/// Intern table: text -> `u32`. Comparing two `Atom` is a single integer
 /// comparison.
 #[derive(Clone, Debug)]
 pub struct AtomTable {
@@ -699,7 +699,7 @@ impl AtomTable {
 // ---------------------------------------------------------------------------
 
 /// Decodes a literal from the command line and describes the result.
-/// Yields `Err(text)` for one invalid literal (column held by the text).
+/// Yields `Err(text)` for an invalid literal (the column is in the text).
 pub fn strlit_report(lit: &str) -> Result<String, String> {
     let src: Vec<char> = lit.chars().collect();
     let (kind, res, used) = match lex_string_literal(&src, 0) {
@@ -884,7 +884,7 @@ mod tests {
         assert!(res.unwrap_err().msg.contains("without a closing"));
 
         assert!(lex_string_literal(&"abc".chars().collect::<Vec<_>>(), 0).is_none());
-        // The column of the error points at the escape within the source.
+        // The column of the error points at the escape in the source.
         let src: Vec<char> = r#""a\q""#.chars().collect();
         let (_, res, _) = lex_string_literal(&src, 0).unwrap();
         assert_eq!(res.unwrap_err().off, 2);
