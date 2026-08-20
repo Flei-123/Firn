@@ -37,8 +37,8 @@
 //! are emitted unchanged, and the check "conditional jump depends on a
 //! `secret` value" holds on this path just as on the base path.
 //!
-//! Since round 43 this path also handles **more than six parameters or
-//! arguments** (System V: from the seventh one on via the stack). Before that
+//! Since round 43 this path can handle **more than six parameters or
+//! arguments** too (System V: from the seventh one on via the stack). Before that
 //! every function containing such a call fell back to the base path — in the
 //! tokenizer measurement run those were `main`, `tok_emit`, `sink_flush_chars`,
 //! `sink_end`, `out_error_list` and `out_word`, together a quarter of all
@@ -738,8 +738,8 @@ pub fn allocate(f: &Func) -> Alloc {
         // one BEGAN at p. In a classic linear scan that is allowed, because
         // there "end" is the last USE and "start" is the DEFINITION of the
         // same instruction (read first, then write). Here that assumption
-        // does not hold: the interval bounds also come from `live_in`/
-        // `live_out` at BLOCK BOUNDARIES. A value that lives from a block
+        // does not hold: the interval bounds come from `live_in`/
+        // `live_out` at BLOCK BOUNDARIES as well. A value that lives from a block
         // placed later on across an earlier one thus gets the block start as
         // its beginning — and shared the register with a value defined
         // exactly there.
