@@ -45,53 +45,53 @@ that is acceptable.
 
 ## 2. The format
 
-One statement per line: `schluessel wert [wert …]`. The separators are
+One statement per line: `key value [value ...]`. The separators are
 space and tab, `#` starts a comment up to the end of the line,
 and empty lines do not count. **No quotation marks, no
-escapes** — a value therefore contains neither spaces nor `#`.
+escapes** -- a value therefore contains neither spaces nor `#`.
 
 ```text
-paket        demo            # Pflicht, genau einmal
-version      0.1.0           # Pflicht, genau einmal, zahl.zahl.zahl
-start        src/main.fi     # höchstens einmal; eine Bibliothek hat keinen
-quelle       src             # 0..n; ohne Angabe gilt das Manifestverzeichnis
-oeffentlich  geo punkt       # 0..n; ohne Angabe ist alles öffentlich
-brauche      geo ../geo      # 0..n; Name + lokaler Pfad
+package  demo            # mandatory, exactly once
+version  0.1.0           # mandatory, exactly once, number.number.number
+start    src/main.fi     # at most once; a library does not have one
+source   src             # 0..n; without one the manifest directory counts
+public   geo dot         # 0..n; without one everything is public
+needs    geo ../geo      # 0..n; name + local path
 ```
 
 Rules that are really checked:
 
 | Entry | Rule |
 |---|---|
-| `paket` | identifier: letter or `_` first, then letters, digits, `_` |
-| `version` | exactly `zahl.zahl.zahl` |
-| `start`, `quelle` | relative, without `..`, not empty (a package stays in its directory) |
-| `brauche` | name like `paket`; the path **may** lead outside (`../geo`) |
-| duplicate entries | error — also duplicate `quelle`, duplicate `oeffentlich` names, duplicate dependency names |
+| `package` | identifier: letter or `_` first, then letters, digits, `_` |
+| `version` | exactly `number.number.number` |
+| `start`, `source` | relative, without `..`, not empty (a package stays in its directory) |
+| `needs` | name like `package`; the path **may** lead outside (`../geo`) |
+| duplicate entries | error -- duplicate `source`, duplicate `public` names and duplicate dependency names included |
 | dependency has the same name as the package itself | error |
-| unknown key | **error**, not silently skipped — a mistyped `oeffentlih` would otherwise open an interface nobody wanted to open |
-| name of the dependency ≠ `paket` line of the target | error |
+| unknown key | **error**, not silently skipped -- a mistyped `publci` would otherwise open an interface nobody wanted to open |
+| name of the dependency != `package` line of the target | error |
 
 `start` is **not** mandatory: a library package has no
-entry point. Only `--paket` demands one.
+entry point. Only `--package` demands one.
 
 ## 3. Search order
 
 For `import t1.t2…tn` in the file `F`, first hit wins:
 
 ```
-1.  <verzeichnis von F>/t1/…/tn.fi          (wie bisher)
-2.  <verzeichnis der Wurzeldatei>/t1/…/tn.fi (wie bisher)
-3.  <paketwurzel>/<quelle>/t1/…/tn.fi        für jedes 'quelle' des Pakets,
-                                             zu dem F gehört            NEU
-4.  <abhängigkeit>/<quelle>/t2/…/tn.fi       wenn t1 der Name einer
-                                             'brauche'-Abhängigkeit ist NEU
-5.  $FIRNLIB/t1/…/tn.fi                      (wie bisher)
-6.  <exe>/../lib/t1/…/tn.fi                  (wie bisher)
+1.  <directory of F>/t1/.../tn.fi             (as before)
+2.  <directory of the root file>/t1/.../tn.fi (as before)
+3.  <package root>/<source>/t1/.../tn.fi      for every 'source' of the
+                                              package F belongs to      NEW
+4.  <dependency>/<source>/t2/.../tn.fi        if t1 is the name of a
+                                              'needs' dependency        NEW
+5.  $FIRNLIB/t1/.../tn.fi                     (as before)
+6.  <exe>/../lib/t1/.../tn.fi                 (as before)
 ```
 
 With `import geo` (only one part) and `geo` as a dependency,
-`<geo>/<quelle>/geo.fi` is looked for — the module with the name of the
+`<geo>/<source>/geo.fi` is looked for -- the module with the name of the
 package is its main module.
 
 **Which package a file belongs to** is decided by its path: the package
@@ -107,49 +107,49 @@ character for character the one from round 47. **Without a manifest nothing
 changes** — that is the reason why the 696 existing tests stay green
 unchanged.
 
-Paths are normalized **purely lexically** (`a/./b/../c` → `a/c`);
+Paths are normalized **purely lexically** (`a/./b/../c` -> `a/c`);
 symbolic links are not resolved. That has to be so: `firnc1` has
-no `realpath`, and without this rule `--paket-info` would be
+no `realpath`, and without this rule `--package-info` would be
 machine-dependent.
 
 ## 4. Visibility at module level
 
-`oeffentlich a b c` in `firn.paket` is the **interface of the package**.
+`public a b c` in `firn.package` is the **interface of the package**.
 If an import leads into a *different* package, the following applies:
 
 * The target package must be a registered dependency
-  (`paket 'x' ist keine abhaengigkeit von paket 'y'`).
-* The module must stand in its `oeffentlich` list
-  (`modul 'x' ist in paket 'p' nicht oeffentlich`).
+  (`package 'x' is not a dependency of package 'y'`).
+* The module must stand in its `public` list
+  (`module 'x' is not public in package 'p'`).
 
 **Inside** a package there is no barrier: `demos/packages/geo`
-uses its private module `innen` and is allowed to.
+uses its private module `inner` and is allowed to.
 
-**If `oeffentlich` is missing, everything is public.** That is deliberately
-the same rule as with `export { … }` inside a file („if it is missing,
+**If `public` is missing, everything is public.** That is deliberately
+the same rule as with `export { ... }` inside a file ("if it is missing,
 everything is visible", `modules.rs`). A stricter default (without a list
 nothing is public) was under consideration: it catches forgotten
 interfaces, but it turns every unfinished manifest into an
 incomprehensible error and would be inconsistent with the existing
-`export` rule. Whoever wants a real interface writes it down — `geo` does
+`export` rule. Whoever wants a real interface writes it down -- `geo` does
 it, `text` does not, and both cases are in the example project.
 
-The two levels mesh: `oeffentlich` says **which modules**
-a package shows, `export { … }` says **which names** a module shows.
+The two levels mesh: `public` says **which modules**
+a package shows, `export { ... }` says **which names** a module shows.
 
 ## 5. Name conflicts
 
 The module system internally renames names from non-root modules to
-`modul__name`; `modul` is the file name without the extension. Two
+`module__name`; `module` is the file name without the extension. Two
 **different** files with the same name therefore fell onto the same
 renaming and would have silently shadowed each other. That is now an error:
 
 ```
-error: namenskonflikt: modul 'hilfe' kommt aus zwei dateien
-hinweis: '/…/anwendung/src/help.fi' und '/…/geo/src/help.fi'
+error: name conflict: module 'help' comes from two files
+note: '/.../app/src/help.fi' and '/.../geo/src/help.fi'
 ```
 
-The check goes over the absolute paths — two spellings of the same file
+The check goes over
 are not a conflict. The check runs **only with a manifest**; without a
 manifest the behavior of round 47 remains (otherwise the change would not
 be backwards compatible).
@@ -157,57 +157,57 @@ be backwards compatible).
 ## 6. The build driver
 
 ```
-firnc  --paket <verzeichnis> [-o ziel]     # Projekt übersetzen
-firnc  --paket-info <verzeichnis>          # Manifest lesen und berichten
-firnc1 --paket <verzeichnis> [-o ziel]     # dasselbe, in Firn
-firnc1 --paket-info <verzeichnis>
+firnc  --package <directory> [-o target]      # compile the project
+firnc  --package-info <directory>             # read the manifest and report
+firnc1 --package <directory> [-o target]      # the same, in Firn
+firnc1 --package-info <directory>
 ```
 
-`--paket` reads `<verzeichnis>/firn.paket`, loads all dependencies,
+`--package` reads `<directory>/firn.package`, loads all dependencies,
 checks the graph for cycles and compiles `start`. Without `-o` the
 result is named like the package:
 
 ```
-$ firnc --paket demos/packages/app
-$ ./demos/packages/app/anwendung
+$ firnc --package demos/packages/app
+$ ./demos/packages/app/app
 12 14 3
 ```
 
-`--paket-info` prints a machine-readable report, computed purely
+`--package-info` prints a machine-readable report, computed purely
 lexically from the given directory (no `getcwd`, no
-symbolic links) — that is why it is the same on both compilers and on
+symbolic links) -- that is why it is the same on both compilers and on
 every machine:
 
 ```
-$ firnc --paket-info demos/packages/app
-paket anwendung
+$ firnc --package-info demos/packages/app
+package app
 version 0.1.0
-wurzel demos/packages/app
+root demos/packages/app
 start demos/packages/app/src/main.fi
-quelle demos/packages/app/src
-brauche geo demos/packages/geo
-brauche text demos/packages/text
+source demos/packages/app/src
+needs geo demos/packages/geo
+needs text demos/packages/text
 ```
 
 **It is not incremental.** The driver always compiles everything. That was
-the deliberate choice from the round goal („correct beats fast"): a
+the deliberate choice from the round goal ("correct beats fast"): a
 wrong freshness comparison silently builds yesterday's state, and exactly
 this trap has hit this project three times already, in rounds 35, 45 and
 46.
 
 ## 7. The example project
 
-`demos/packages/` — one program and two libraries:
+`demos/packages/` -- one program and two libraries:
 
 ```
-anwendung/   firn.paket   brauche geo, brauche text; quelle src
-             src/main.fi  import geo · import geo.punkt · import text · import hilfe
-             src/help.fi eigenes Modul aus 'quelle src'
-geo/         firn.paket   oeffentlich geo punkt   (KEIN start: Bibliothek)
-             src/geo.fi   öffentlich, benutzt intern 'innen'
-             src/dot.fi öffentlich
-             src/inner.fi PRIVAT — von außen nicht einbindbar
-text/        firn.paket   ohne 'oeffentlich' → alles öffentlich
+app/         firn.package  needs geo, needs text; source src
+             src/main.fi   import geo * import geo.dot * import text * import help
+             src/help.fi   own module out of 'source src'
+geo/         firn.package  public geo dot   (NO start: a library)
+             src/geo.fi    public, uses 'inner' internally
+             src/dot.fi    public
+             src/inner.fi  PRIVATE -- cannot be imported from outside
+text/        firn.package  without 'public' -> everything is public
              src/text.fi
 ```
 
@@ -265,7 +265,7 @@ and the fixed error texts.
   A package reached through a symlink counts as lying at
   the symlink's place.
 * **Errors in the manifest show no source line** with a marker,
-  but `datei:zeile: meldung`. The reason is equality: `firnc1` does not
+  but `file:line: message`. The reason is equality: `firnc1` does not
   have the diagnostic machinery of `firnc0`, and for the new messages
   character equality was more important than the excerpt.
 * **The visibility check only takes effect with a manifest.** Whoever
