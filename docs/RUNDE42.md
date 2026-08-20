@@ -45,7 +45,7 @@ include libraries from stage 0: their files reference each other textually
 (`//#include`) and carry no module structure. `tools/strlib/expand.py`
 assembles **one** module each from them and writes it to `lib/std/`. An
 extension by hand in `lib/std/str.fi` would be gone at the next generation;
-an extension in `lib/str/bytes.fi` would also sit in the binary of every
+an extension in `lib/str/bytes.fi` would sit in the binary of every
 `html`/`dom` user. That is why there are **two new source files that are
 included exclusively by the facade**:
 

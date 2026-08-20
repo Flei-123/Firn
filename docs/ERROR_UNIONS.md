@@ -30,14 +30,14 @@ The name `IoError` is itself a **type**: the pure error value.
 
 ```firn
 let e: IoError = IoError::Permission
-if e == IoError::Permission { … }        // == und != je Fehlermenge
+if e == IoError::Permission { ... }      // == and != per error set
 ```
 
 ### 2.2 The error union as a type
 
 ```firn
-fn lies(x: i32) -> IoError!i32 { … }     // Rückgabetyp
-let r: IoError!i32 = lies(3)             // Variablentyp
+fn read(x: i32) -> IoError!i32 { … }     // the return type
+let r: IoError!i32 = read(3)             // the variable type
 struct Halter { r: IoError!i32 }         // Feldtyp
 fn nimm(r: IoError!i32) -> i32 { … }     // Parametertyp
 ```
@@ -45,7 +45,7 @@ fn nimm(r: IoError!i32) -> i32 { … }     // Parametertyp
 ### 2.3 `return` converts implicitly
 
 ```firn
-fn lies(x: i32) -> IoError!i32 {
+fn read(x: i32) -> IoError!i32 {
     if x < 0 {
         return IoError::NotFound         // Fehler
     }
@@ -60,8 +60,8 @@ literal and with the argument of a call.
 ### 2.4 `try` — pass the error upwards
 
 ```firn
-fn kette(x: i32) -> IoError!i32 {
-    let v = try lies(x)                  // bei Fehler: sofort zurück, gleicher Code
+fn chain(x: i32) -> IoError!i32 {
+    let v = try read(x)                  // on an error: straight back, same code
     return v * 2
 }
 ```
@@ -75,9 +75,9 @@ column (`tests/neg/err_try_outside.fi`, `tests/neg/err_wrong_set.fi`).
 ### 2.5 `catch` — substitute value
 
 ```firn
-let v = lies(x) catch 0                  // Ersatzwert bei Fehler
-let w = lies(x) catch ersatz()           // beliebiger Ausdruck
-let z = lies(x) catch |e| deute(e)       // mit Bindung des Fehlerwertes
+let v = read(x) catch 0                  // a substitute value on an error
+let w = read(x) catch substitute()       // any expression
+let z = read(x) catch |e| explain(e)     // with the error value bound
 ```
 
 `catch` binds more weakly than any operator: `a catch b * 2` is
@@ -89,8 +89,8 @@ otherwise there is an error with a line and a column
 
 ```firn
 fn main() -> i32 {
-    lies(1)                              // Fehler: das Ergebnis darf nicht
-    return 0                             // verworfen werden (#[must_consume])
+    read(1)                              // error: the result must not be
+    return 0                             // discarded (#[must_consume])
 }
 ```
 
