@@ -132,7 +132,21 @@ fn inum(c: *mut Cg, v: i64) {
 fn sym(c: *mut Cg, nr: u32) {
     var p: [u8; 4] = "_F1."
     t(c, (&p[0]) as u64, 4)
-    rt.buf_push_bytes(&(*c).out, intern.intern_ptr(it(c), nr), intern.intern_length(it(c), nr))
+    // ROUND 58: the generated functions of the closures carry a `#` in their
+    // name, so that no source text can ever write them (fnval.rs). The
+    // assembler does not accept the character -- it becomes a dot, which the
+    // naming scheme uses anyway.
+    let q: u64 = intern.intern_ptr(it(c), nr)
+    let n: usize = intern.intern_length(it(c), nr)
+    var k: usize = 0
+    while k < n {
+        var ch: u8 = *((q + k as u64) as *mut u8)
+        if ch == 35 as u8 {
+            ch = 46 as u8
+        }
+        rt.buf_push(&(*c).out, ch)
+        k = k + 1
+    }
 }
 
 fn blocklabel(c: *mut Cg, fnr: u32, bb: u32) {
@@ -825,6 +839,83 @@ fn emit_vtab(c: *mut Cg, iname: u32, tname: u32, dst: u32) {
     store_slot(c, slot_of(c, dst), R_AX)
 }
 
+// ROUND 58 (fnval.rs): a named function AS A VALUE -- the address of its
+// function record.
+fn emit_fnref(c: *mut Cg, nr: u32, dst: u32) {
+    ins(c)
+    var le: [u8; 20] = "lea rax, [rip + .L__"
+    w(c, (&le[0]) as u64, 20)
+    var fw: [u8; 4] = "fnv."
+    w(c, (&fw[0]) as u64, 4)
+    sym(c, nr)
+    var too: [u8; 1] = "]"
+    w(c, (&too[0]) as u64, 1)
+    nl(c)
+    store_slot(c, slot_of(c, dst), R_AX)
+}
+
+// The FUNCTION RECORDS (`.rodata`, round 58). One word per function that is
+// taken as a value somewhere: the address of its machine code. Which ones
+// those are is read off the FIR itself -- every `O_FNREF` names one -- so
+// no side table is needed between lowering and code generation.
+fn fnval_records(c: *mut Cg) {
+    let f: *mut fir.Fir = ff(c)
+    var names: Vec[u32] = vec_new[u32]()
+    var fi: u32 = 0
+    while fi < fir.fn_count(f) as u32 {
+        var bb: u32 = 0
+        while bb < fir.block_count(f, fi) {
+            var n: u32 = 0
+            while n < fir.inst_count(f, fi, bb) {
+                let i: u32 = fir.inst_at(f, fi, bb, n)
+                if fir.i_kind_of(f, i) == fir.O_FNREF {
+                    let nr: u32 = fir.i_a_of(f, i)
+                    var seen: bool = false
+                    var q: usize = 0
+                    while q < vec_len[u32](&names) {
+                        if vec_at[u32](&names, q) == nr {
+                            seen = true
+                        }
+                        q = q + 1
+                    }
+                    if !seen {
+                        vec_push[u32](&names, nr)
+                    }
+                }
+                n = n + 1
+            }
+            bb = bb + 1
+        }
+        fi = fi + 1
+    }
+    if vec_len[u32](&names) == 0 {
+        vec_free[u32](&names)
+        return
+    }
+    var sec: [u8; 16] = ".section .rodata"
+    t(c, (&sec[0]) as u64, 16)
+    nl(c)
+    var al: [u8; 8] = ".align 8"
+    t(c, (&al[0]) as u64, 8)
+    nl(c)
+    var q2: usize = 0
+    while q2 < vec_len[u32](&names) {
+        let nr: u32 = vec_at[u32](&names, q2)
+        var lb: [u8; 8] = ".L__fnv."
+        t(c, (&lb[0]) as u64, 8)
+        sym(c, nr)
+        rt.buf_push(&(*c).out, 58 as u8)
+        nl(c)
+        ins(c)
+        var qd: [u8; 6] = ".quad "
+        w(c, (&qd[0]) as u64, 6)
+        sym(c, nr)
+        nl(c)
+        q2 = q2 + 1
+    }
+    vec_free[u32](&names)
+}
+
 // The method tables (`.rodata`) -- one per complete implementation. The
 // format is defined in iface.rs (`tables_asm`): pointers to the methods, in
 // the order of the interface.
@@ -1382,6 +1473,10 @@ fn emit_inst(c: *mut Cg, fnr: u32, i: u32) {
         emit_vtab(c, fir.i_a_of(f, i), fir.i_b_of(f, i), dst)
         return
     }
+    if kind == fir.O_FNREF {
+        emit_fnref(c, fir.i_a_of(f, i), dst)
+        return
+    }
     if kind == fir.O_ASM {
         emit_asm(c, f, i, dst)
         return
@@ -1601,6 +1696,9 @@ fn cg_run(c: *mut Cg) {
     if has_if(c) {
         if_tables(c)
     }
+    // HOOK fnval: the function records (.rodata) -- only when the program
+    // takes a function as a value at all (fnval.rs, round 58).
+    fnval_records(c)
     var gnu: [u8; 38] = ".section .note.GNU-stack,\"\",@progbits\n"
     t(c, (&gnu[0]) as u64, 38)
 }

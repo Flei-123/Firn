@@ -60,6 +60,9 @@ struct Lower {
     cur: u32            // current block
     v_name: Vec[u32]    // scopes: identifier -> slot
     v_slot: Vec[u32]
+    // ROUND 58 (fnval.rs): the source type of a local. `call_full` reads it
+    // to tell a CALL OF A FUNCTION VALUE apart from a direct call.
+    v_ty: Vec[u32]
     b_limit: Vec[u32]
     l_break: Vec[u32]   // loop targets
     l_cont: Vec[u32]
@@ -81,7 +84,8 @@ fn low_new(b: u64, it: u64, sm: u64) -> Lower {
         b: b, it: it, sm: sm,
         f: fir.fir_new(),
         fi: 0, cur: 0,
-        v_name: vec_new[u32](), v_slot: vec_new[u32](), b_limit: vec_new[u32](),
+        v_name: vec_new[u32](), v_slot: vec_new[u32](), v_ty: vec_new[u32](),
+        b_limit: vec_new[u32](),
         l_break: vec_new[u32](), l_cont: vec_new[u32](), l_depth: vec_new[u32](),
         d_stmt: vec_new[u32](), d_err: vec_new[u32](), d_limit: vec_new[u32](),
         sret: NONE, mu: 0, feh: 0, gcr: 0, ifr: 0, err: 0, unsuitable: false,
@@ -92,6 +96,7 @@ fn low_free(l: *mut Lower) {
     fir.fir_free(&(*l).f)
     vec_free[u32](&(*l).v_name)
     vec_free[u32](&(*l).v_slot)
+    vec_free[u32](&(*l).v_ty)
     vec_free[u32](&(*l).b_limit)
     vec_free[u32](&(*l).l_break)
     vec_free[u32](&(*l).l_cont)
@@ -160,6 +165,8 @@ fn fty(l: *mut Lower, t: u32) -> u32 {
     if k == types.K_BOOL { return fir.T_BOOL }
     if k == types.K_F64 { return fir.T_F64 }
     if k == types.K_PTR { return fir.T_PTR }
+    // ROUND 58: a function value is the pointer to its function record.
+    if k == types.K_FN { return fir.T_PTR }
     if k == types.K_VOID { return fir.T_VOID }
     return fir.NONE
 }
@@ -218,12 +225,31 @@ fn range_off(l: *mut Lower) {
     while vec_len[u32](&(*l).v_name) > g as usize {
         vec_pop[u32](&(*l).v_name)
         vec_pop[u32](&(*l).v_slot)
+        vec_pop[u32](&(*l).v_ty)
     }
 }
 
 fn create(l: *mut Lower, name: u32, slot: u32) {
+    create_ty(l, name, slot, NONE)
+}
+
+// ROUND 58: declaration WITH the source type (see `Lower::v_ty`).
+fn create_ty(l: *mut Lower, name: u32, slot: u32, t: u32) {
     vec_push[u32](&(*l).v_name, name)
     vec_push[u32](&(*l).v_slot, slot)
+    vec_push[u32](&(*l).v_ty, t)
+}
+
+// ROUND 58: the type of a local, or NONE.
+fn local_ty(l: *mut Lower, name: u32) -> u32 {
+    var i: usize = vec_len[u32](&(*l).v_name)
+    while i > 0 {
+        i = i - 1
+        if vec_at[u32](&(*l).v_name, i) == name {
+            return vec_at[u32](&(*l).v_ty, i)
+        }
+    }
+    return NONE
 }
 
 // ------------------------------------------------- deferred statements
@@ -385,6 +411,16 @@ fn address(l: *mut Lower, e: u32) -> u32 {
         let slot: u32 = alloca(l, q_size(l, t), q_align(l, t))
         write_after(l, slot, e)
         return slot
+    }
+    // HOOK fnval: `gc fn(...)` yields an error union -- an aggregate, so it
+    // needs a place of its own (fnval.rs, round 58).
+    if a == ast.E_LAMBDA {
+        let tl: u32 = sema.sema_ty(sm(l), e)
+        if is_aggregate(l, tl) {
+            let slot3: u32 = alloca(l, q_size(l, tl), q_align(l, tl))
+            write_after(l, slot3, e)
+            return slot3
+        }
     }
     // HOOK iface: `((&x) as dyn I).m()` -- the interface value gets a
     // scratch slot, and its address is the result here (iface.fi).
@@ -550,6 +586,13 @@ fn write_after(l: *mut Lower, addr: u32, e: u32) {
     }
     if a == ast.E_AWDH {
         repeat(l, addr, ast.e_a(b, e), types.ty_a(tf(l), t), types.ty_n(tf(l), t))
+        return
+    }
+    // HOOK fnval: `gc fn(...)` -- allocate the record and write the captured
+    // values into it (fnval.rs, round 58). A closure WITHOUT captures is a
+    // plain word and goes through `value` like every other scalar.
+    if a == ast.E_LAMBDA && is_aggregate(l, t) {
+        closure_lower(l, e, addr)
         return
     }
     if a == ast.E_CALL && has_mu(l) && ast.e_number(b, e) == 0 {
@@ -721,8 +764,19 @@ fn value(l: *mut Lower, e: u32) -> u32 {
         if slot != NONE {
             return load(l, ft, slot)
         }
+        // ROUND 58 (fnval.rs): a named function AS A VALUE. The value is
+        // the address of its function record, one word in `.rodata`
+        // holding the code address.
+        if types.ty_kind(tf(l), t) == types.K_FN && fn_number(l, ast.e_a(b, e)) != NONE {
+            return push(l, fir.O_FNREF, fir.T_PTR, ast.e_a(b, e), 0, 0, 0, 0, 0)
+        }
         // Constant: the type checker already holds the value.
         return constant(l, ft, sema_const(l, ast.e_a(b, e)))
+    }
+    // HOOK fnval: a closure WITHOUT captures -- its record is one word in
+    // `.rodata`, exactly like that of a named function (fnval.rs, round 58).
+    if a == ast.E_LAMBDA {
+        return push(l, fir.O_FNREF, fir.T_PTR, ast.e_a(b, e), 0, 0, 0, 0, 0)
     }
     if a == ast.E_UN {
         let op: u32 = ast.e_a(b, e)
@@ -1021,6 +1075,97 @@ fn gc_alloc_lower(l: *mut Lower, e: u32, target: u32) {
 // The insertion barrier (hook_assign in gc_lower.rs): AFTER writing a
 // `Gc[T]` pointer into a heap field. Only writes INTO the heap need it;
 // a local variable lives on the stack.
+// ROUND 58 (fnval.rs::lower_closure) -- `gc fn(...)`.
+//
+// The same shape as `gc C{ ... }`: allocate, on failure write
+// `AllocError::OutOfMemory` into the union, on success write the record
+// into the union FIRST (so that the pointer is a root on the stack straight
+// away) and only then fill in the code address and the captured values.
+fn closure_lower(l: *mut Lower, e: u32, target: u32) {
+    let b: *mut ast.Tree = tree(l)
+    let cname: u32 = ast.e_a(b, e)
+    let ci: u32 = sema.sema_closure_index(sm(l), cname)
+    if ci == NONE || !has_gc(l) || !has_fe(l) {
+        give_up(l)
+        return
+    }
+    let t: u32 = sema.sema_ty(sm(l), e)
+    let ui: u32 = err.error_union_of_ty(fel(l), tf(l), t)
+    if ui == NONE {
+        give_up(l)
+        return
+    }
+    let voff: u64 = err.error_u_voff(fel(l), ui)
+    var ae: [u8; 10] = "AllocError"
+    let aen: u32 = intern.intern_number(names(l), (&ae[0]) as u64, 10) as u32
+    let sm2: u32 = err.error_set_find(fel(l), aen)
+    var om: [u8; 11] = "OutOfMemory"
+    let omn: u32 = intern.intern_number(names(l), (&om[0]) as u64, 11) as u32
+    let code: u32 = err.error_code_of(fel(l), sm2, omn)
+    if code == 0 {
+        give_up(l)
+        return
+    }
+    var ar: [u8; 14] = "__gc_alloc_raw"
+    let arn: u32 = intern.intern_number(names(l), (&ar[0]) as u64, 14) as u32
+    let tidv: u32 = constant(l, fir.T_U64, sema.sema_closure_tid(sm(l), ci))
+    let sizev: u32 = constant(l, fir.T_U64, sema.sema_closure_size(sm(l), ci))
+    var tmp: Vec[u32] = vec_new[u32]()
+    vec_push[u32](&tmp, tidv)
+    vec_push[u32](&tmp, sizev)
+    let aoff: u32 = args_store(l, &tmp)
+    vec_free[u32](&tmp)
+    let p: u32 = push(l, fir.O_CALL, fir.T_PTR, arn, 0, 0, 0, aoff, 2)
+    let null: u32 = constant(l, fir.T_PTR, 0)
+    let ok: u32 = push(l, fir.O_CMP, fir.T_BOOL, p, null, 1, fir.T_PTR as u64, 0, 0)
+    let ok_bb: u32 = new_block(l)
+    let fail_bb: u32 = new_block(l)
+    let join: u32 = new_block(l)
+    term(l, fir.TERM_BRCOND, ok, ok_bb, fail_bb)
+
+    (*l).cur = fail_bb
+    let cv: u32 = constant(l, fir.T_U32, code as u64)
+    store(l, fir.T_U32, target, cv)
+    let va1: u32 = ptradd_const(l, target, voff)
+    let z0: u32 = constant(l, fir.T_PTR, 0)
+    store(l, fir.T_PTR, va1, z0)
+    term(l, fir.TERM_BR, join, 0, 0)
+
+    (*l).cur = ok_bb
+    let z32: u32 = constant(l, fir.T_U32, 0)
+    store(l, fir.T_U32, target, z32)
+    let va2: u32 = ptradd_const(l, target, voff)
+    store(l, fir.T_PTR, va2, p)
+    // Word 0: the code address of the generated function.
+    let rec: u32 = push(l, fir.O_FNREF, fir.T_PTR, cname, 0, 0, 0, 0, 0)
+    let cp: u32 = load(l, fir.T_PTR, rec)
+    store(l, fir.T_PTR, p, cp)
+    // The captured values, in the order of the class fields.
+    var k: u32 = 0
+    while k < sema.sema_closure_caps(sm(l), ci) {
+        let nm: u32 = sema.sema_capture_name(sm(l), ci, k)
+        let ct: u32 = sema.sema_capture_ty(sm(l), ci, k)
+        let slot: u32 = search(l, nm)
+        if slot == NONE {
+            give_up(l)
+            return
+        }
+        let cft: u32 = fty(l, ct)
+        if cft == fir.NONE || cft == fir.T_VOID {
+            give_up(l)
+            return
+        }
+        let v: u32 = load(l, cft, slot)
+        let a2: u32 = ptradd_const(l, p, 8 + k as u64 * 8)
+        store(l, cft, a2, v)
+        k = k + 1
+    }
+    if !terminated(l) {
+        term(l, fir.TERM_BR, join, 0, 0)
+    }
+    (*l).cur = join
+}
+
 fn gc_barrier(l: *mut Lower, target: u32) {
     let b: *mut ast.Tree = tree(l)
     let t: u32 = sema.sema_ty(sm(l), target)
@@ -1365,16 +1510,41 @@ fn call_full(l: *mut Lower, e: u32, target: u32) -> u32 {
             recv_addr = types.is_ptr(tf(l), p0) && !types.is_ptr(tf(l), et)
         }
     }
+    // ROUND 58 (fnval.rs): the callee sits in a VARIABLE of function type.
+    // Word 0 of the function record is the code address; the record itself
+    // goes in as the LAST argument, so that a closure body finds its
+    // captured values there (a named function never reads it).
+    var indirect: bool = false
+    var v_code: u32 = 0
+    var v_rec: u32 = 0
+    var v_fnty: u32 = NONE
     var rt2: u32 = 0
     if dispatch {
         rt2 = v_rt
     } else {
-        let fnr: u32 = fn_number(l, name)
-        if fnr == NONE {
-            give_up(l)
-            return 0
+        let lt: u32 = local_ty(l, name)
+        if lt != NONE && lt != 0 {
+            if types.ty_kind(tf(l), lt) == types.K_FN {
+                let fslot: u32 = search(l, name)
+                if fslot == NONE {
+                    give_up(l)
+                    return 0
+                }
+                v_rec = load(l, fir.T_PTR, fslot)
+                v_code = load(l, fir.T_PTR, v_rec)
+                v_fnty = lt
+                indirect = true
+                rt2 = types.ty_a(tf(l), lt)
+            }
         }
-        rt2 = types.ret_ty_the_func(tf(l), fnr as usize)
+        if !indirect {
+            let fnr: u32 = fn_number(l, name)
+            if fnr == NONE {
+                give_up(l)
+                return 0
+            }
+            rt2 = types.ret_ty_the_func(tf(l), fnr as usize)
+        }
     }
     let ret_agg: bool = is_aggregate(l, rt2)
     let sret: bool = abi_sret(l, rt2)
@@ -1434,6 +1604,9 @@ fn call_full(l: *mut Lower, e: u32, target: u32) -> u32 {
         }
         k = k + 1
     }
+    if indirect {
+        vec_push[u32](&tmp, v_rec)
+    }
     let cnt: u32 = vec_len[u32](&tmp) as u32
     let off: u32 = args_store(l, &tmp)
     vec_free[u32](&tmp)
@@ -1443,6 +1616,10 @@ fn call_full(l: *mut Lower, e: u32, target: u32) -> u32 {
     if dispatch {
         call_kind = fir.O_CALLI
         call_target = v_target
+    }
+    if indirect {
+        call_kind = fir.O_CALLI
+        call_target = v_code
     }
     if ret_agg {
         let gr: u64 = types.size_of(tf(l), rt2)
@@ -1525,7 +1702,7 @@ fn stmt(l: *mut Lower, i: u32) {
         }
         let slot: u32 = alloca(l, q_size(l, t), q_align(l, t))
         write_after(l, slot, init)
-        create(l, ast.s_a(b, i), slot)
+        create_ty(l, ast.s_a(b, i), slot, t)
         return
     }
     if a == ast.S_ZUW {
@@ -2593,7 +2770,7 @@ fn low_run(l: *mut Lower) {
                 let slot: u32 = alloca(l, by, by)
                 store(l, pf, slot, fir.param_value(&(*l).f, (*l).fi, next))
                 next = next + 1
-                create(l, pname, slot)
+                create_ty(l, pname, slot, pt)
             } else if ak == NONE {
                 // The caller has already made a copy; its address
                 // IS the parameter slot.
@@ -2623,6 +2800,27 @@ fn low_run(l: *mut Lower) {
             k = k + 1
         }
         vec_free[u32](&kind)
+        // HOOK fnval: inside a closure body the captured values are
+        // ordinary names -- they lie in the record, which arrived as the
+        // last parameter (fnval.rs, round 58).
+        let ci2: u32 = sema.sema_closure_index(sm(l), ast.fn_name(b, i))
+        if ci2 != NONE {
+            var ew2: [u8; 6] = "__env#"
+            let enr: u32 = intern.intern_number(names(l), (&ew2[0]) as u64, 6) as u32
+            let eslot: u32 = search(l, enr)
+            if eslot == NONE {
+                give_up(l)
+                return
+            }
+            let env: u32 = load(l, fir.T_PTR, eslot)
+            var ck2: u32 = 0
+            while ck2 < sema.sema_closure_caps(sm(l), ci2) {
+                let ca: u32 = ptradd_const(l, env, 8 + ck2 as u64 * 8)
+                create_ty(l, sema.sema_capture_name(sm(l), ci2, ck2), ca,
+                          sema.sema_capture_ty(sm(l), ci2, ck2))
+                ck2 = ck2 + 1
+            }
+        }
         block(l, ast.fn_body(b, i))
         range_off(l)
         if (*l).unsuitable {

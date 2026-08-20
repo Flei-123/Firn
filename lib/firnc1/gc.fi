@@ -47,7 +47,8 @@ export { Gc, gc_new, gc_free, gc_error, gc_count, gc_has_classes,
          gc_has_as_prefix, gc_class_out_as,
          gc_is_alloc_call, gc_is_weak_name, gc_is_strong_name,
          gc_state_name, gc_probe_ty, gc_source_scan,
-         gc_strong_count, gc_strong_off, gc_weak_count, gc_weak_off }
+         gc_strong_count, gc_strong_off, gc_weak_count, gc_weak_off,
+         gc_capture_class }
 
 const NONE: u32 = 4294967295
 
@@ -197,6 +198,80 @@ fn gc_class_add(g: *mut Gc, name: u32) -> u32 {
     vec_push[u32](&(*g).k_woff, 0)
     vec_push[u32](&(*g).k_wlen, 0)
     return i
+}
+
+// ROUND 58 (fnval.rs) -- the class of a CAPTURE RECORD.
+//
+// The ordinary path (`gc_register`/`gc_layout`) runs over the items and is
+// long finished by the time a closure is checked: only there are the types
+// of the captured values known. So the class is built here completely, with
+// layout, type tag and traced offsets -- from then on the collector treats
+// it like any other, through the same type table.
+//
+// Word 0 of the record is the code address and is deliberately NOT traced:
+// it points into `.text`, which is no heap block.
+//
+// `name` is the interned class name, `caps` the resolved types of the
+// captured values. Yields the index of the class.
+fn gc_capture_class(g: *mut Gc, t: *mut types.Types, it: *mut intern.Interner,
+                    name: u32, caps: *mut Vec[u32]) -> u32 {
+    let ki: u32 = gc_count(g) as u32
+    vec_push[u32](&(*g).k_name, name)
+    vec_push[u32](&(*g).k_base, 0)
+    vec_push[u32](&(*g).k_foff, vec_len[u32](&(*g).f_name) as u32)
+    vec_push[u32](&(*g).k_flen, 0)
+    vec_push[u32](&(*g).k_widx, NONE)
+    vec_push[u64](&(*g).k_btid, 0)
+    vec_push[u32](&(*g).k_union, 0)
+    vec_push[u32](&(*g).k_done, 1)
+    // The struct: `__code` at 0, the captured values one word apart.
+    rt.buf_clear(&(*g).scratch)
+    var p1: [u8; 3] = "gc "
+    rt.buf_push_bytes(&(*g).scratch, (&p1[0]) as u64, 3)
+    rt.buf_push_bytes(&(*g).scratch, intern.intern_ptr(it, name),
+                      intern.intern_length(it, name))
+    let sn: u32 = intern.intern_number(it, rt.buf_ptr(&(*g).scratch),
+                                       rt.buf_len(&(*g).scratch)) as u32
+    let sidx: u32 = types.types_struct_append(t, sn)
+    vec_push[u32](&(*g).k_sidx, sidx)
+    var fnames: Vec[u32] = vec_new[u32]()
+    var ftypes: Vec[u32] = vec_new[u32]()
+    var foffs: Vec[u64] = vec_new[u64]()
+    var cn: [u8; 6] = "__code"
+    vec_push[u32](&fnames, intern.intern_number(it, (&cn[0]) as u64, 6) as u32)
+    vec_push[u32](&ftypes, types.new_ty(t, types.K_U64, 0, 0))
+    vec_push[u64](&foffs, 0)
+    let soff: u32 = vec_len[u64](&(*g).s_offs) as u32
+    var slen: u32 = 0
+    var k: usize = 0
+    while k < vec_len[u32](caps) {
+        rt.buf_clear(&(*g).scratch)
+        var p2: [u8; 3] = "__c"
+        rt.buf_push_bytes(&(*g).scratch, (&p2[0]) as u64, 3)
+        rt.buf_push_dec_u64(&(*g).scratch, k as u64)
+        let fn2: u32 = intern.intern_number(it, rt.buf_ptr(&(*g).scratch),
+                                            rt.buf_len(&(*g).scratch)) as u32
+        let ct: u32 = vec_at[u32](caps, k)
+        vec_push[u32](&fnames, fn2)
+        vec_push[u32](&ftypes, ct)
+        vec_push[u64](&foffs, 8 + k as u64 * 8)
+        if gc_is_gc_ptr(g, t, ct) {
+            vec_push[u64](&(*g).s_offs, 8 + k as u64 * 8)
+            slen = slen + 1
+        }
+        k = k + 1
+    }
+    let size: u64 = 8 + vec_len[u32](caps) as u64 * 8
+    types.types_struct_define(t, sidx, size, 8, &fnames, &ftypes, &foffs)
+    vec_free[u32](&fnames)
+    vec_free[u32](&ftypes)
+    vec_free[u64](&foffs)
+    vec_push[u64](&(*g).k_size, size)
+    vec_push[u32](&(*g).k_soff, soff)
+    vec_push[u32](&(*g).k_slen, slen)
+    vec_push[u32](&(*g).k_woff, vec_len[u64](&(*g).w_offs) as u32)
+    vec_push[u32](&(*g).k_wlen, 0)
+    return ki
 }
 
 fn gc_base_set(g: *mut Gc, ki: u32, base: u32) {
@@ -887,6 +962,15 @@ fn gc_source_scan(l: u64, it2: u64, gc_nr: i64, class_nr: i64, ae_nr: i64,
                 if lexer.lex_nr(lx, i + 1) as i64 == class_nr {
                     out = out | 1
                 }
+            }
+            // ROUND 58 (gc.rs::source_needs_gc): `gc fn(...)` -- a capturing
+            // closure. Its record is a GC object, so the same runtime has to
+            // be there. Two tokens are enough to see it, and a plain
+            // `fn(...)` closure (which captures nothing and allocates
+            // nothing) deliberately does NOT pull the collector in.
+            // 4 = the keyword `fn` (A_KWFN in lexer.fi).
+            if lexer.lex_kind(lx, i + 1) == 4 {
+                out = out | 1
             }
         }
         // 31 = the keyword `error` (token kind from lexer.fi).
