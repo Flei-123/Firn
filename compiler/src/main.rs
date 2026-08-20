@@ -435,8 +435,8 @@ fn run(opts: &Options) -> i32 {
 
     if opts.emit == Emit::AstCanon {
         // The root file ONLY, BEFORE merging the modules and before
-        // monomorphization: the parser written in Firn also sees exactly one
-        // file. Anything else would be no comparison but a comparison with
+        // monomorphization: the parser written in Firn sees exactly one
+        // file too. Anything else would be no comparison but a comparison with
         // something else.
         let toks = lexer::lex(&root.src, &mut dg);
         let prog = parser::parse(&toks, &mut dg);
