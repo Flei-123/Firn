@@ -38,8 +38,8 @@
 // `((id + 1) << 1) | is_symbol`; the shift keeps the values 0 and 1 free,
 // which `GcMap` reserves for "empty" and "tombstone".
 //
-// ARRAY ELEMENTS lie densely in `elems`, one slot per index, holes marked
-// with the `hole` singleton. That is the shape almost every array really
+// ARRAY ELEMENTS lie densely in `elems`, one slot per index, gaps marked
+// with the `gap` singleton. That is the shape almost every array really
 // has; an array that is used sparsely pays with memory, not with wrong
 // behaviour.
 import html.mem
@@ -50,10 +50,11 @@ import js.ast
 export {
     JsVal, JsNum, JsStr, JsBool, JsSym, JsObj, Prop, Env, Realm,
     TAG_UNDEF, TAG_NULL, TAG_BOOL, TAG_NUM, TAG_STR, TAG_SYM, TAG_OBJ,
-    TAG_HOLE,
+    TAG_GAP,
     CLS_ORDINARY, CLS_ARRAY, CLS_FUNCTION, CLS_NATIVE, CLS_BOUND,
     CLS_ARGUMENTS, CLS_ERROR, CLS_BOOLEAN, CLS_NUMBER, CLS_STRING,
     CLS_MATH, CLS_JSON, CLS_MAP, CLS_SET, CLS_SYMBOL, CLS_REGEXP,
+    CLS_DEFAULT_CTOR,
     CLS_PROXY_FREE,
     A_WRITABLE, A_ENUMERABLE, A_CONFIGURABLE, A_ACCESSOR, A_DEFAULT,
     F_EXTENSIBLE, F_STRICT, F_ARROW, F_CTOR, F_CLASS_CTOR, F_DERIVED,
@@ -62,10 +63,10 @@ export {
     P_MUTABLE, P_INITIALIZED, P_STRICT_FN,
     realm_new, realm_ctx, realm_set_ctx,
     val_tag, is_undefined, is_null, is_nullish, is_bool, is_number,
-    is_string, is_symbol, is_object, is_callable, is_hole,
+    is_string, is_symbol, is_object, is_callable, is_gap,
     as_num, as_str, as_obj, as_sym, as_bool,
     num_value, bool_value,
-    realm_num, realm_bool, realm_undefined, realm_null, realm_hole,
+    realm_num, realm_bool, realm_undefined, realm_null, realm_gap,
     make_num, make_bool_val,
     str_new, str_from_ascii, str_from_ast, str_from_units, str_empty,
     str_len, str_at, str_push, str_hash, str_equal, str_compare,
@@ -106,7 +107,7 @@ const TAG_NUM: u64 = 3
 const TAG_STR: u64 = 4
 const TAG_SYM: u64 = 5
 const TAG_OBJ: u64 = 6
-const TAG_HOLE: u64 = 7          // an array hole -- never visible to JS
+const TAG_GAP: u64 = 7          // an absent array element -- never visible to JS
 
 // The kinds of an object.
 const CLS_ORDINARY: u64 = 0
@@ -126,6 +127,9 @@ const CLS_SET: u64 = 13
 const CLS_SYMBOL: u64 = 14
 const CLS_REGEXP: u64 = 15
 const CLS_PROXY_FREE: u64 = 16
+// The constructor a class WITHOUT one gets (15.7.14): it creates the
+// object and, in a derived class, forwards every argument to the parent.
+const CLS_DEFAULT_CTOR: u64 = 17
 
 // The property attributes (6.1.7.1).
 const A_WRITABLE: u64 = 1
@@ -252,7 +256,7 @@ gc class Realm {
     nul: Gc[JsVal],
     yes: Gc[JsVal],
     no: Gc[JsVal],
-    hole: Gc[JsVal],
+    gap: Gc[JsVal],
     empty_str: Gc[JsVal],
     pending: Gc[JsVal],
     ctx: *mut u8,
@@ -278,7 +282,7 @@ fn is_number(v: Gc[JsVal]) -> bool { return val_tag(v) == TAG_NUM }
 fn is_string(v: Gc[JsVal]) -> bool { return val_tag(v) == TAG_STR }
 fn is_symbol(v: Gc[JsVal]) -> bool { return val_tag(v) == TAG_SYM }
 fn is_object(v: Gc[JsVal]) -> bool { return val_tag(v) == TAG_OBJ }
-fn is_hole(v: Gc[JsVal]) -> bool { return val_tag(v) == TAG_HOLE }
+fn is_gap(v: Gc[JsVal]) -> bool { return val_tag(v) == TAG_GAP }
 
 fn is_nullish(v: Gc[JsVal]) -> bool {
     let t: u64 = val_tag(v)
@@ -313,7 +317,7 @@ fn is_callable(v: Gc[JsVal]) -> bool {
         return false
     }
     let c: u64 = o.cls
-    return c == CLS_FUNCTION || c == CLS_NATIVE || c == CLS_BOUND
+    return c == CLS_FUNCTION || c == CLS_NATIVE || c == CLS_BOUND || c == CLS_DEFAULT_CTOR
 }
 
 // ================================================================ The realm
@@ -321,7 +325,7 @@ fn is_callable(v: Gc[JsVal]) -> bool {
 fn realm_new() -> AllocError!Gc[Realm] {
     let u: Gc[JsVal] = try gc JsVal{ tag: TAG_UNDEF }
     let n: Gc[JsVal] = try gc JsVal{ tag: TAG_NULL }
-    let h: Gc[JsVal] = try gc JsVal{ tag: TAG_HOLE }
+    let h: Gc[JsVal] = try gc JsVal{ tag: TAG_GAP }
     let yb: Gc[JsBool] = try gc JsBool{ tag: TAG_BOOL, on: 1 }
     let nb: Gc[JsBool] = try gc JsBool{ tag: TAG_BOOL, on: 0 }
     let y: Gc[JsVal] = yb
@@ -347,7 +351,7 @@ fn realm_new() -> AllocError!Gc[Realm] {
         intern_vals: try gcvec_new(),
         intern_index: try gcmap_new(false, true),
         name_keys: try gcvec_new_raw(),
-        undef: u, nul: n, yes: y, no: no, hole: h,
+        undef: u, nul: n, yes: y, no: no, gap: h,
         empty_str: gc_null[JsVal](),
         pending: u,
         ctx: 0 as *mut u8, names: 0 as *mut u8, tree: 0 as *mut u8,
@@ -370,7 +374,7 @@ fn realm_set_ast(r: Gc[Realm], t: *mut ast.Ast, nm: *mut lex.Names) {
 
 fn realm_undefined(r: Gc[Realm]) -> Gc[JsVal] { return r.undef }
 fn realm_null(r: Gc[Realm]) -> Gc[JsVal] { return r.nul }
-fn realm_hole(r: Gc[Realm]) -> Gc[JsVal] { return r.hole }
+fn realm_gap(r: Gc[Realm]) -> Gc[JsVal] { return r.gap }
 
 fn realm_bool(r: Gc[Realm], on: bool) -> Gc[JsVal] {
     if on {
@@ -894,7 +898,7 @@ fn obj_own_string_keys(r: Gc[Realm], o: Gc[JsObj]) -> AllocError!Gc[GcVec] {
     var i: u64 = 0
     while i < n {
         let e: Gc[JsVal] = gcvec_read[JsVal](o.elems, i)
-        if !is_hole(e) {
+        if !is_gap(e) {
             let k: u64 = try key_for_index(r, i)
             let ok: bool = try gcvec_append_raw(out, k)
         }
@@ -938,7 +942,7 @@ fn elems_len(o: Gc[JsObj]) -> u64 {
 
 fn elems_get(r: Gc[Realm], o: Gc[JsObj], i: u64) -> Gc[JsVal] {
     if (o.elems as u64) == 0 || i >= gcvec_length(o.elems) {
-        return r.hole
+        return r.gap
     }
     return gcvec_read[JsVal](o.elems, i)
 }
@@ -948,7 +952,7 @@ fn elems_ensure(r: Gc[Realm], o: Gc[JsObj], n: u64) -> AllocError!bool {
         o.elems = try gcvec_new()
     }
     while gcvec_length(o.elems) < n {
-        let ok: bool = try gcvec_append[JsVal](o.elems, r.hole)
+        let ok: bool = try gcvec_append[JsVal](o.elems, r.gap)
     }
     return true
 }

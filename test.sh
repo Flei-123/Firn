@@ -38,6 +38,10 @@
 #   9c. CSS: syntax, selectors and cascade (lib/css/, in Firn) against the
 #      official suite css-parsing-tests, against own cases and against
 #      cssselect2 on real pages (tools/css/run.sh, docs/ROUND60.md).
+#   9d. JavaScript: lexer, parser, interpreter and the built in objects
+#      (lib/js/, in Firn) against the official suite test262, against node
+#      as a second engine, and in an endurance run with a counter check
+#      (tools/js/run.sh, docs/ROUND63.md).
 #  18. Package and project system (tools/packages/run.sh): manifest, search
 #      order, visibility, build driver -- in BOTH compilers.
 #  19. Freestanding compilation (tools/freestanding/run.sh, round 52):
@@ -410,6 +414,19 @@ if [ "$FSRC" -eq 0 ]; then
 else
     bad "tools/freestanding/run.sh failed (see .test-work/freestanding.log)"
     grep FAIL "$WORK/freestanding.log" | head -10 | sed 's/^/   /'
+fi
+
+echo "== 9d. JavaScript: lexer, parser, interpreter (tools/js/run.sh) =="
+# The JavaScript path in Firn (lib/js/) against the foreign suite test262
+# (parser AND engine), against node on the same small programs, plus the
+# endurance run with the deliberately leaking counter check.
+JS_SOAK_ROUNDS=${JS_SOAK_ROUNDS:-20000} bash tools/js/run.sh --fast > "$WORK/js.log" 2>&1 && JSRC=0 || JSRC=$?
+if [ "$JSRC" -eq 0 ]; then
+    ok
+    grep -E '^TOTAL|^OK:|^cross check' "$WORK/js.log" | sed 's/^/   /'
+else
+    bad "tools/js/run.sh failed (see .test-work/js.log)"
+    tail -20 "$WORK/js.log" | sed 's/^/   /'
 fi
 
 echo "== 18. package and project system (tools/packages/run.sh) =="
