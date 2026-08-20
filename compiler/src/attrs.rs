@@ -1,21 +1,21 @@
 //! **Attribute register** — the single truth about which attributes exist,
 //! where they may stand and which of them really do something at stage 0.
 //!
-//! Firn's specification leans on attributes at many spots:
+//! Firn's specification leans on attributes in many places:
 //! `#[must_consume]` (SPEC §3.3, §5.1), `#[no_gc]` (§3.5.4),
 //! `#[constant_time]` (§9.2), `#[unwinds]` (§5.3), `#[packed]`/`#[align(n)]`
 //! (§13), `#[layout(soa)]` (DESIGN_GOALS §8), `#[abi_stable]`/`#[frozen]`
 //! (DESIGN_GOALS §4), `#[hot]` (DESIGN_GOALS §9).
 //!
-//! They arrive at very different points of time. To keep that from ending up
+//! They arrive at very different points in time. To keep that from ending up
 //! as a thicket of scattered string comparisons, they are gathered **here**
-//! as one table — with target, state of implementation and purpose.
+//! in one table — with target, state of implementation and purpose.
 //! `--list-attrs` prints it.
 //!
 //! Rule of the project: whatever is not implemented reports a **clean
 //! compiler error** with line and column — never a crash and never silent
 //! ignoring. A silently dropped `#[constant_time]` would be the most
-//! dangerous sort of error that can exist within this language.
+//! dangerous sort of error that can exist in this language.
 
 /// Where a given attribute may be written.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -47,7 +47,7 @@ impl Target {
 pub struct AttrInfo {
     pub name: &'static str,
     pub target: Target,
-    /// Count of expected arguments within brackets (0 = without brackets).
+    /// Number of expected arguments in brackets (0 = without brackets).
     pub args: usize,
     /// Does it really do something at stage 0?
     pub implemented: bool,
@@ -230,7 +230,7 @@ mod tests {
 
     #[test]
     fn only_must_consume_is_implemented() {
-        // Once one more attribute gets implemented, this test MUST be adjusted
+        // Once one more attribute is implemented, this test MUST be adjusted
         // — that forces README and SPEC to be dragged along.
         // State of round "hardening test 2": additionally #[no_gc] (SPEC 3.5.4,
         // checked by nogc.rs, test programs tests/54x_no_gc_*.fi and
@@ -243,7 +243,7 @@ mod tests {
     #[test]
     fn not_implemented_attribute_report_next_a_error() {
         // Counter-check to tests/neg/attr_not_implemented.fi: the remaining
-        // attributes stay rejected, nothing gets silently ignored.
+        // attributes stay rejected, nothing is silently ignored.
         for name in ["constant_time", "unwinds", "packed", "align", "layout", "no_move", "hot"] {
             let a = search(name).expect(name);
             assert!(!a.implemented, "{} unexpectedly counts as implemented", name);

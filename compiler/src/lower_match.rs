@@ -2,7 +2,7 @@
 //!
 //! The result is a `fir::Term::Switch` over the variant number (or over the
 //! integer value) whose cases are **sorted ascending and free of duplicates**.
-//! Subpatterns (nested variants, literals, ranges) get checked as a chain of
+//! Subpatterns (nested variants, literals, ranges) are checked as a chain of
 //! comparisons BEHIND the switch; whenever a candidate does not fit, control
 //! moves to the next candidate of the same key and finally to the catch-all
 //! chain.
@@ -16,8 +16,8 @@ use crate::lower::Lower;
 use crate::sema_match::{enum_by_struct, match_info, EnumDef, MatchInfo, Pattern, MATCH_PREFIX};
 use crate::types::Type;
 
-/// Range patterns up to this width get resolved to separate jump labels;
-/// wider ones get checked as a comparison.
+/// Range patterns up to this width are resolved into separate jump labels;
+/// wider ones are checked as a comparison.
 const MAX_RANGE_KEYS: i128 = 256;
 
 pub(crate) fn is_ctor(name: &str) -> bool {
@@ -99,7 +99,7 @@ pub(crate) fn write_ctor_into(
     Some(())
 }
 
-/// `// HOOK types` within `lower::lower_expr_stmt`.
+/// `// HOOK types` in `lower::lower_expr_stmt`.
 pub(crate) fn lower_types_stmt(
     lo: &mut Lower,
     e: &Expr,
@@ -450,7 +450,7 @@ fn emit_sub_test(
 }
 
 /// Bindings of a pattern: every binding is the ADDRESS of the matched value
-/// (enum values live within memory, bindings are immutable).
+/// (enum values live in memory, bindings are immutable).
 fn bind_pattern(lo: &mut Lower, addr: Val, pat: &Pattern, ty: &Type, def: Option<&EnumDef>) {
     match pat {
         Pattern::Wild(_) | Pattern::Int(..) | Pattern::Bool(..) | Pattern::Range { .. } => {}

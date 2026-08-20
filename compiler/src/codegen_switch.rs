@@ -6,8 +6,8 @@
 //! Two methods:
 //!  * **jump table** — as soon as at least `MIN_TABLE_CASES` labels exist and
 //!    the density `cases.len() * 100 / (max - min + 1)` reaches at least
-//!    `MIN_DENSITY` percent. The table sits at `.rodata`, the jump is
-//!    one indirect `jmp qword ptr [...]`; outside of `[min, max]` control
+//!    `MIN_DENSITY` percent. The table sits in `.rodata`, the jump is
+//!    a single indirect `jmp qword ptr [...]`; outside of `[min, max]` control
 //!    goes to `default`.
 //!  * **comparison chain** — otherwise (few or widely scattered labels).
 //!
@@ -18,9 +18,9 @@ use crate::fir::{FTy, Func, Term};
 
 /// Where does the value branched over come from?
 ///
-/// **Round 51.** Formerly `emit_switch` could read the value from the frame
-/// only. The register path (`regalloc.rs`) therefore had to write it there
-/// first, although it already sat inside a register:
+/// **Round 51.** Formerly `emit_switch` could read the value only from the
+/// frame. The register path (`regalloc.rs`) therefore had to write it there
+/// first, although it already sat in a register:
 ///
 /// ```text
 /// mov %r12d,%r9d          ; state into a scratch register
@@ -30,17 +30,17 @@ use crate::fir::{FTy, Func, Term};
 /// cmp $0x48,%eax
 /// ```
 ///
-/// Within the tokenizer that is the state dispatch per character: 5.109.380
+/// In the tokenizer that is the state dispatch per character: 5.109.380
 /// runs times two superfluous memory accesses.
 pub(crate) enum ValueSource<'a> {
-    /// Base path: the value sits at its frame slot.
+    /// Base path: the value lies in its frame slot.
     Frame(&'a Frame),
     /// Register path: the caller loads the value to `rax` itself,
     /// widened to the given width.
     ///
-    /// **Guarantee of the caller:** the function ALWAYS emits at least one write
-    /// to `eax`/`rax`. That is the ground on which the table below may do
-    /// without `mov eax, eax`.
+    /// **Guarantee of the caller:** the function ALWAYS emits at least one
+    /// write to `eax`/`rax`. That is the ground on which the table below may
+    /// do without `mov eax, eax`.
     Loaded(&'a dyn Fn(&mut Emitter, u32)),
 }
 
@@ -146,7 +146,7 @@ fn emit_table(
         // written exactly that way for sure — either by `load_ext`
         // (each of its branches writes `eax`: `mov`, `movzx`, `movsx`,
         // `movsxd`), by the guarantee of `ValueSource::Loaded`, or by the
-        // `sub eax, min` right above. The index held by rax is thereby
+        // `sub eax, min` right above. The index in rax is thereby
         // already zero extended.
     } else {
         if min != 0 {
@@ -160,7 +160,7 @@ fn emit_table(
     e.line(&format!("lea rdx, [rip + {}]", label));
     e.line("jmp qword ptr [rdx + rax*8]");
 
-    // table at .rodata; missing labels point to the default branch.
+    // table in .rodata; missing labels point to the default branch.
     e.raw(".section .rodata");
     e.raw(".align 8");
     e.raw(&format!("{}:", label));
@@ -180,7 +180,7 @@ fn emit_table(
     e.raw(".text");
 }
 
-/// Unique label for a table within the output.
+/// Unique label for a table inside the output.
 fn table_label(e: &Emitter, fname: &str) -> String {
     let base = format!(".Ltbl_{}", fname);
     let n = e.out.matches(&format!("{}_", base)).count();
@@ -214,7 +214,7 @@ mod tests {
         assert!(!asm.contains("jmp qword ptr"), "unexpected table:\n{}", asm);
     }
 
-    /// Many dense labels: jump table at `.rodata` with indirect jump.
+    /// Many dense labels: jump table in `.rodata` with an indirect jump.
     #[test]
     fn denser_switch_generated_jump_table() {
         let mut f = Func::new("main", vec![], FTy::I32);
