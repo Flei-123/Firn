@@ -7,7 +7,7 @@ interfaces with dynamic dispatch (`interface I`, `dyn I`) since round 46.
 Between the two lay a gap that one can see in a single line:
 
 ```firn
-fn vec_sortiere[T: Scalar](v: *mut Vec[T]) { … a < b … }
+fn vec_sort[T: Scalar](v: *mut Vec[T]) { … a < b … }
 ```
 
 `Scalar` says what **shape** `T` has (integer, `bool`, pointer) — not what
@@ -19,10 +19,10 @@ This round closes the gap: **the name of an interface is a bound.**
 
 ```firn
 interface Ord {
-    fn kleiner(*self, b: *Self) -> bool
+    fn less(*self, b: *Self) -> bool
 }
 
-fn vec_sortiere[T: Ord](v: *mut Vec[T]) { … a.kleiner(b) … }
+fn vec_sort[T: Ord](v: *mut Vec[T]) { … a.less(b) … }
 ```
 
 ---
@@ -30,10 +30,10 @@ fn vec_sortiere[T: Ord](v: *mut Vec[T]) { … a.kleiner(b) … }
 ## 1. The syntax — and why exactly this one
 
 ```text
-fn f[T: Ord](…)                 eine Schranke
-fn f[T: Scalar + Ord](…)        mehrere, alle gelten gleichzeitig
-struct Paar[T: Ord] { … }       auch an einem Typ, nicht nur an einer Funktion
-fn f[K: Int, V: Ord](…)         je Parameter eigene Schranken
+fn f[T: Ord](...)               one bound
+fn f[T: Scalar + Ord](...)      several, all of them hold at once
+struct Pair[T: Ord] { ... }     on a type as well, not only on a function
+fn f[K: Int, V: Ord](...)       own bounds per parameter
 ```
 
 **No new character, no new keyword.** The place after the
@@ -64,21 +64,21 @@ method" in the middle of an instantiated copy.
 An interface from round 46 knows only concrete parameter types:
 
 ```firn
-interface Ord { fn kleiner(*self, b: *Punkt) -> bool }   // nur für Punkt
+interface Ord { fn less(*self, b: *Point) -> bool }   // only for Point
 ```
 
 An ordering, however, compares **two values of the same type**. That is why
 the signature may now name `Self` — the type that implements the interface:
 
 ```firn
-interface Ord { fn kleiner(*self, b: *Self) -> bool }
-impl Ord for Punkt { fn kleiner(*self, b: *Punkt) -> bool { … } }
-impl Ord for i32   { fn kleiner(*self, b: *i32)   -> bool { … } }
+interface Ord { fn less(*self, b: *Self) -> bool }
+impl Ord for Point { fn less(*self, b: *Point) -> bool { ... } }
+impl Ord for i32   { fn less(*self, b: *i32)   -> bool { ... } }
 ```
 
 The whole special treatment: a method whose signature names `Self` is
-**not resolved globally** but **per implementation** (`resolve_mit_self` in
-`iface.rs`, `aufloesen_self` in `iface.fi`). Globally, `Self` would have no
+**not resolved globally** but **per implementation** (`resolve_with_self` in
+`iface.rs`, `resolve_self` in `iface.fi`). Globally, `Self` would have no
 type at all.
 
 **`Self` and `dyn` exclude each other.** Over `dyn I` it is only clear at
@@ -87,8 +87,8 @@ one, and the caller could not form the argument. Such a call is
 therefore an error — with a hint towards the way that does work:
 
 ```
-error: 'Ord.kleiner' nennt 'Self' und ist deshalb nicht ueber 'dyn Ord' aufrufbar
-   = hinweis: rufe sie ueber eine schranke auf: 'fn f[T: Ord](x: *T)' — dort steht der typ fest
+error: 'Order.less' mentions 'Self' and is therefore not callable via 'dyn Order'
+    = note: call it via a bound: 'fn f[T: Order](x: *T)' -- there the type is fixed
 ```
 
 That is the object safety rule of this language, in one sentence and in one
@@ -98,25 +98,25 @@ called via `dyn`.
 
 ### `impl I for <base type>`
 
-`vec_sortiere[i32]` has to keep working. So since this round a
+`vec_sort[i32]` has to keep working. So since this round a
 **built-in type** may implement an interface as well:
 
 ```firn
-impl Ord for i32 { fn kleiner(*self, b: *i32) -> bool { return *self < *b } }
+impl Ord for i32 { fn less(*self, b: *i32) -> bool { return *self < *b } }
 ```
 
-That creates the ordinary function `i32__kleiner(self: *i32, b: *i32)` —
+That creates the ordinary function `i32__less(self: *i32, b: *i32)` —
 the same naming scheme as for a struct (round 45). Two consequences:
 
 * **Methods of a base type are valid program-wide.** `modules.rs` does not
   rename them. The type `i32` belongs to no module, so neither do its
-  methods; if the method were called `vec__i32__kleiner` in `std.vec`, the
-  resolution would still look for `i32__kleiner` and would find nothing.
-  `firnc1` always did it that way — `eigene_suchen` skips `impl` blocks —
+  methods; if the method were called `vec__i32__less` in `std.vec`, the
+  resolution would still look for `i32__less` and would find nothing.
+  `firnc1` always did it that way — `own_search` skips `impl` blocks —
   and here both compilers are now the same for the same reason.
 * **A base type gets no method table.** A table exists only per
   struct implementation, because only a struct can stand behind a `dyn I`
-  (`hook_cast` demands a pointer to a struct). `(&n) as dyn Zeigbar`
+  (`hook_cast` demands a pointer to a struct). `(&n) as dyn Showable`
   with `n: i64` is an error, `tests/neg/bound_dyn_base_ty.fi`.
 
 ---
@@ -127,19 +127,19 @@ That is the actual gain, and it cost **not a line in the code generator
 and no new FIR opcode**. After monomorphization, in
 
 ```firn
-fn kleineres[T: Ord](a: *T, b: *T) -> *T { if a.kleiner(b) { return a } … }
+fn smaller[T: Ord](a: *T, b: *T) -> *T { if a.less(b) { return a } … }
 ```
 
-for `T = Punkt` there is an ordinary method call on `*Punkt` — and
+for `T = Dot` there is an ordinary method call on `*Dot` — and
 `impls.rs` has resolved that from the static type alone since round 45.
 There is nothing to dispatch at this place.
 
 ```asm
-; fn f[T: Ord] (--no-opt)        | ; dyn OrdnungD (--no-opt)
-    mov rdi, qword ptr [rbp-40]  |     mov rcx, qword ptr [rbp-64]   ; Tafel
-    mov rsi, qword ptr [rbp-48]  |     mov rax, qword ptr [rcx]      ; Eintrag 0
-    call _F0.Punkt__kleiner      |     mov qword ptr [rbp-176], rax
-                                 |     mov rdi, qword ptr [rbp-136]  ; Datenzeiger
+; fn f[T: Ord] (--no-opt)        | ; dyn OrderD (--no-opt)
+    mov rdi, qword ptr [rbp-40]  |     mov rcx, qword ptr [rbp-64]   ; table
+    mov rsi, qword ptr [rbp-48]  |     mov rax, qword ptr [rcx]      ; entry 0
+    call _F0.Dot__less      |     mov qword ptr [rbp-176], rax
+                                 |     mov rdi, qword ptr [rbp-136]  ; data pointer
                                  |     mov rsi, qword ptr [rbp-176]
                                  |     mov rax, qword ptr [rbp-168]
                                  |     call rax
@@ -154,7 +154,7 @@ on the generated code. Two programs, the same work; what is checked is:
 | `lea … .L__iface…` (address of a method table) | **no** | yes |
 | `calli` in the FIR | **0** | ≥ 1 |
 | `vtab` in the FIR | **0** | ≥ 1 |
-| named `call … Punkt__kleiner` | yes | — |
+| named `call … Dot__less` | yes | — |
 
 in **three build stages** (`release-fast`, `--no-opt`, `dev-fast`) and in
 **both compilers**. The counter-check with `dyn` is part of the test:
@@ -193,47 +193,47 @@ The interesting ones are those that name a method.
 **No `impl` — the message says which method would be missing:**
 
 ```
-error: typ 'Kreis' setzt die schnittstelle 'Ordnung' nicht um — schranke am typparameter 'T' von 'kleineres'
-  --> tests/neg/bound_no_impl.fi:28:21
-   = hinweis: es fehlt 'fn kleiner(*self, *Self) -> bool' in 'impl Ordnung for Kreis { … }'
+error: type 'Circle' does not implement the interface 'Order' -- bound on the type parameter 'T' of 'smaller'
+   --> tests/neg/bound_no_impl.fi:28:22
+    = note: 'fn less(*self, *Self) -> bool' is missing in 'impl Order for Circle { ... }'
 ```
 
-**The type already has a part — then only the rest is listed.** `Punkt` has
-`kleiner` from an ordinary `impl` block, but no `impl Ordnung for` block;
-only `gleich` is named:
+**The type already has a part -- then only the rest is listed.** `Dot` has
+`less` from an ordinary `impl` block, but no `impl Order for` block;
+only `equal` is named:
 
 ```
-error: typ 'Punkt' setzt die schnittstelle 'Ordnung' nicht um — schranke am typparameter 'T' von 'f'
-   = hinweis: es fehlt 'fn gleich(*self, *Self) -> bool' in 'impl Ordnung for Punkt { … }'
+error: type 'Dot' does not implement the interface 'Order' -- bound on the type parameter 'T' of 'f'
+    = note: 'fn equal(*self, *Self) -> bool' is missing in 'impl Order for Dot { ... }'
 ```
 
-For that, `schranke_pruefen` reads the names of all functions of the
+For that, the bound check reads the names of all functions of the
 merged program and asks for every method of the interface whether
-`<Typ>__<Methode>` exists. If the type had **all** methods and only lacked
-the block, the message says exactly that („the block `impl … { … }` is
+`<Type>__<Method>` exists. If the type had **all** methods and only lacked
+the block, the message says exactly that ("the block `impl ... { ... }` is
 missing").
 
 **A bound on an interface that does not exist:**
 
 ```
-error: unbekannte schnittstelle 'Ordnunng' als schranke am typparameter 'T' von 'f'
-   = hinweis: bekannt sind: Ordnung (eingebaut: Any, Int, Scalar)
+error: unknown interface 'Ordr' as bound on the type parameter 'T' of 'f'
+    = note: known are: Order (built in: Any, Int, Scalar)
 ```
 
 **A pointer as a type argument** — here the cause is a different one, and
 the message says so:
 
 ```
-error: typargument '*Punkt' erfuellt die schranke 'Ordnung' des typparameters 'T' von 'f' nicht
-   = hinweis: eine schnittstelle wird mit 'impl Ordnung for <typ>' umgesetzt;
-              ein zeiger- oder feldtyp hat keinen namen, unter dem das stehen koennte
+error: type argument '*Dot' does not satisfy the bound 'Order' of the type parameter 'T' of 'f'
+    = note: an interface is implemented with 'impl Order for <type>'; a pointer
+            or field type has no name under which that could stand
 ```
 
 **The same bound twice** — during parsing, not only at the instantiation:
 
 ```
-error: die schranke 'Ordnung' steht zweimal an 'T'
-   = hinweis: jede schranke wird hoechstens einmal genannt
+error: the bound 'Order' appears twice on 'T'
+    = note: each bound is named at most once
 ```
 
 **Several bounds, one violated** — what is reported is the **first** one; a
@@ -248,8 +248,8 @@ second message about the same type argument would say nothing new.
 | `bound_base_ty_without_impl.fi` | base type without an implementation |
 | `bound_unknown.fi` | bound on an unknown interface |
 | `bound_duplicate.fi` | the same bound twice (parser) |
-| `bound_contradiction.fi` | `Int + Ordnung`, `Int` violated |
-| `bound_second_interface.fi` | `Ordnung + Anzeige`, the second one violated |
+| `bound_contradiction.fi` | `Int + Order`, `Int` violated |
+| `bound_second_interface.fi` | `Order + Anzeige`, the second one violated |
 | `bound_nested.fi` | violation only in the SECOND instantiation level |
 | `bound_struct.fi` | bound on a generic struct |
 | `bound_ptr_arg.fi` | pointer as a type argument |
@@ -259,10 +259,10 @@ second message about the same type argument would say nothing new.
 | `bound_duplicate_impl_base_ty.fi` | two `impl Ord for i32` |
 | `method_without_ty.fi` | method on an array type (which has no name) |
 
-Changed as well: `generic_requirement.fi` (wording „anforderung" →
-„schranke") and `impl_no_struct.fi` — whose old message („methoden gibt es
-nur fuer struct-typen") is wrong as of this round; it now checks that
-`i32.summe()` is cleanly rejected as „typ 'i32' hat keine methode 'summe'".
+Changed as well: `generic_requirement.fi` (wording "requirement" ->
+"bound") and `impl_no_struct.fi` -- whose old message ("methods exist
+only for struct types") is wrong as of this round; it now checks that
+`i32.sum()` is cleanly rejected as "type 'i32' has no method 'sum'".
 
 All 15 are rejected by `firnc1` as well (measured afterwards: `firnc1`
 rejects 109 of 115 negative tests; the 6 exceptions are the same as before
@@ -276,7 +276,7 @@ this round and are unaffected by it).
 
 | | before | after |
 |---|---|---|
-| `vec_sortiere` | `[T: Scalar]`, `a > b` in the body | `[T: Ord]`, `a.kleiner(b)` in the body |
+| `vec_sort` | `[T: Scalar]`, `a > b` in the body | `[T: Ord]`, `a.less(b)` in the body |
 | `vec_binaersuche` | `[T: Scalar]`, `<` and `==` | `[T: Ord]`, equality from the ordering |
 | `vec_ist_sortiert`, `vec_untere_schranke`, `vec_sortiert_einfuegen`, `vec_senken` | `[T: Scalar]` | `[T: Ord]` |
 | `vec_min`, `vec_max` | `[T: Scalar]` | `[T: Scalar + Ord]` |
@@ -286,7 +286,7 @@ this round and are unaffected by it).
 **What was needed for that — `vec_zeiger[T]`.** `vec_at[T]` returns
 `0 as T` beyond the end, and `0 as T` exists only for scalars. Exactly that
 was what the bound `T: Scalar` hung on, and exactly for that reason a
-`Vec[Punkt]` could not be sorted. A **pointer** has a null value for every
+`Vec[Dot]` could not be sorted. A **pointer** has a null value for every
 element type; everything that orders (sorting, searching, swapping,
 inserting) now works over it. `vec_at`
 remains `[T: Scalar]` unchanged — it is the comfortable version for scalars.
@@ -305,11 +305,11 @@ lines of assembly (+0,09 %)**.
 the same functions with `i32` (as before) and with
 
 ```firn
-struct Person { alter: i64, nummer: i64 }
+struct Person { age: i64, tok_nr: i64 }
 impl Ord for Person {
-    fn kleiner(*self, b: *Person) -> bool {
-        if (*self).alter != (*b).alter { return (*self).alter < (*b).alter }
-        return (*self).nummer < (*b).nummer
+    fn less(*self, b: *Person) -> bool {
+        if (*self).age != (*b).age { return (*self).age < (*b).age }
+        return (*self).tok_nr < (*b).tok_nr
     }
 }
 ```
@@ -403,8 +403,8 @@ that is the whole round, predominantly `iface.fi` and `mono.fi`.
   template; whoever wants to change it needs a checking pass over the body
   with `T` as an abstract type — a round of its own, and one that touches
   the error messages of all existing templates.
-* **Statically unsatisfiable bound sets.** `[T: Int + Ordnung]` is allowed,
-  even if no implementation of `Ordnung` is ever an integer type. It is
+* **Statically unsatisfiable bound sets.** `[T: Int + Order]` is allowed,
+  even if no implementation of `Order` is ever an integer type. It is
   reported at the instantiation, not at the declaration. To recognize that
   would mean enumerating all implementations — and more of those may still
   be added later.
@@ -427,7 +427,7 @@ that is the whole round, predominantly `iface.fi` and `mono.fi`.
 
 **Resolving bounds during parsing.** First draft: unknown name =
 error, as up to now with `Any/Int/Scalar`. Rejected as soon as
-`interface Ord` is supposed to stand below `fn vec_sortiere[T: Ord]` — and
+`interface Ord` is supposed to stand below `fn vec_sort[T: Ord]` — and
 in `lib/rt/vec.fi` it stands exactly that way, because the implementations
 for the base types lie in between. The parser always sees only one file; it
 cannot answer this question.
@@ -444,9 +444,9 @@ fails on `u64` values above `i64::MAX`, and those are already in the test
 corpus.
 
 **Renaming base type methods per module.** That would have been the rule
-`modules.rs` otherwise applies — and it would have turned `i32__kleiner`
-from `std.vec` into `vec__i32__kleiner`, while the resolution at the call
-site still looks for `i32__kleiner` (it computes from the **type**, and the
+`modules.rs` otherwise applies — and it would have turned `i32__less`
+from `std.vec` into `vec__i32__less`, while the resolution at the call
+site still looks for `i32__less` (it computes from the **type**, and the
 type is called `i32` in every module). Rejected in favor of the rule
 „program-wide type, program-wide methods" — the same one that already
 applies to `interface`, `enum`, `gc class` and generic templates.
@@ -455,13 +455,13 @@ applies to `interface`, `enum`, `gc class` and generic templates.
 long as every implementation had a struct. A base type has none; all of
 them would have carried `usize::MAX` and would have counted as the **same**
 implementation. What is compared now is the method prefix (`i32`,
-`geo__Punkt`) — it is there for both cases and is unambiguous.
+`geo__Dot`) — it is there for both cases and is unambiguous.
 
-**The suffix rule for base types as well.** `iface::typ_struct` looks, as
-its third step, for „exactly one struct whose name ends in `__<Name>`"
-(type from a module). For `i32` this rule finds `Vec__i32` — the struct
+**The suffix rule for base types as well.** `iface::ty_struct` looks, as
+its third step, for "exactly one struct whose name ends in `__<name>`"
+(a type out of a module). For `i32` this rule finds `Vec__i32` -- the struct
 `Vec[i32]`. The bug was real and appeared in the test run after five
-minutes (`'Vec__i32' setzt die methode 'Ord.kleiner' nicht um`). That is
+minutes (`'Vec__i32' does not implement the method 'Ord.less'`). That is
 why the base type is asked **first**, and the suffix rule applies only to
 names that are not one.
 
