@@ -295,6 +295,8 @@ fn scalar_fty(t: &Type) -> Option<FTy> {
         Type::U64 | Type::Usize => FTy::U64,
         Type::Bool => FTy::Bool,
         Type::Ptr { .. } => FTy::Ptr,
+        // Round 58: a function value is the pointer to its function record.
+        Type::Fn { .. } => FTy::Ptr,
         _ => return None,
     })
 }

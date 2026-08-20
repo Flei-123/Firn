@@ -180,6 +180,22 @@ fn ex_core(e: &Expr) -> String {
         ExprKind::Float(bits) => format!("(float {})", bits),
         ExprKind::Bool(b) => format!("(bool {})", b),
         ExprKind::Ident(n) => format!("(id {})", n),
+        // Round 58: a closure literal. Its body is a block like any other.
+        ExprKind::Lambda(d) => format!(
+            "(closure {} {} ({}) {} {})",
+            d.id,
+            if d.heap { "gc" } else { "plain" },
+            d.params
+                .iter()
+                .map(|p| format!("({} {})", p.name, ty(&p.ty)))
+                .collect::<Vec<String>>()
+                .join(" "),
+            match &d.ret {
+                Some(t) => ty(t),
+                None => "void".to_string(),
+            },
+            blk(&d.body)
+        ),
         ExprKind::Unary(op, a) => format!(
             "(un {} {})",
             match op {

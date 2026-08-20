@@ -159,6 +159,19 @@ fn expand_fn(
         Some(m) => m,
         None => return,
     };
+    // ROUND 58 — an honest limit (fnval.rs): a closure literal inside a
+    // template would be copied once per instantiation and would need one
+    // capture record and one generated function per copy. Function
+    // POINTERS work in a template without any restriction; only the
+    // LITERAL is refused here, and it says so at the place where it stands.
+    for sp in crate::fnval::spans_in(&tpl.decl.body) {
+        dg.error_note(
+            sp,
+            "a closure literal inside a generic function is not supported",
+            "round 58: pass the closure IN as a parameter of type 'fn(…)' \
+             instead of building it inside the template",
+        );
+    }
     let mut decl: FnDecl = tpl.decl.clone();
     decl.name = mangled.to_string();
     for p in decl.params.iter_mut() {
@@ -397,6 +410,18 @@ fn subst_expr(e: &mut Expr, map: &HashMap<String, TypeExpr>, queue: &mut Vec<(St
     match &mut e.kind {
         ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) => {}
         ExprKind::Ident(_) => {}
+        // Round 58: a closure inside a template is refused by
+        // `check_bare_expr`; the types are substituted anyway, so that a
+        // follow-up error stays readable.
+        ExprKind::Lambda(d) => {
+            for p in d.params.iter_mut() {
+                p.ty = subst_ty(&p.ty, map, queue);
+            }
+            if let Some(t) = d.ret.as_mut() {
+                *t = subst_ty(t, map, queue);
+            }
+            subst_block(&mut d.body, map, queue);
+        }
         ExprKind::Unary(_, i) => subst_expr(i, map, queue),
         ExprKind::Binary(_, a, b) => {
             subst_expr(a, map, queue);
@@ -488,6 +513,7 @@ pub(crate) fn renumber_expr(e: &mut Expr, next: &mut u32) {
     *next += 1;
     match &mut e.kind {
         ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Ident(_) => {}
+        ExprKind::Lambda(d) => renumber_block(&mut d.body, next),
         ExprKind::Unary(_, i) => renumber_expr(i, next),
         ExprKind::Binary(_, a, b) => {
             renumber_expr(a, next);
@@ -616,6 +642,16 @@ fn check_bare_stmt(s: &Stmt, out: &mut Vec<(Span, String)>) {
 fn check_bare_expr(e: &Expr, out: &mut Vec<(Span, String)>) {
     match &e.kind {
         ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Ident(_) => {}
+        // Round 58: a closure body carries types like any other body.
+        ExprKind::Lambda(d) => {
+            for p in &d.params {
+                check_bare_ty(&p.ty, out);
+            }
+            if let Some(r) = &d.ret {
+                check_bare_ty(r, out);
+            }
+            check_bare_block(&d.body, out);
+        }
         ExprKind::Unary(_, i) => check_bare_expr(i, out),
         ExprKind::Binary(_, a, b) => {
             check_bare_expr(a, out);

@@ -28,6 +28,10 @@ const MAX_DEPTH: u32 = 200;
 
 /// Scalar FIR type for a source type; `None` for aggregates and for
 /// unresolved types, which after the type check should really be impossible.
+pub(crate) fn scalar_fty_pub(t: &Type) -> Option<FTy> {
+    scalar_fty(t)
+}
+
 fn scalar_fty(t: &Type) -> Option<FTy> {
     Some(match t {
         Type::F64 => FTy::F64,
@@ -333,6 +337,15 @@ impl<'a> Lower<'a> {
                 self.write_into(slot, e)?;
                 Some(slot)
             }
+            // HOOK fnval: `gc fn(…)` yields an error union — an aggregate,
+            // so it needs a place of its own (fnval.rs, round 58).
+            ExprKind::Lambda(_) if is_agg(&self.ty_of(e)) => {
+                let t = self.ty_of(e);
+                let (size, align) = self.size_align(&t);
+                let slot = self.alloca(size, align);
+                self.write_into(slot, e)?;
+                Some(slot)
+            }
             // HOOK iface: `((&x) as dyn I).m()` — the interface value gets
             // a scratch place whose address is here (iface.rs)
             ExprKind::Cast(..) if crate::iface::is_dyn(&self.info.tcx, &self.ty_of(e)) => {
@@ -395,6 +408,11 @@ impl<'a> Lower<'a> {
                     self.write_into(fa, fexpr)?;
                 }
                 Some(())
+            }
+            // HOOK fnval: `gc fn(…)` — allocate the record and write the
+            // captured values into it (fnval.rs, round 58).
+            ExprKind::Lambda(d) if crate::errors::union_of(&t).is_some() => {
+                crate::fnval::lower_closure(self, addr, d, &t, e.span)
             }
             ExprKind::ArrayLit(elems) => {
                 let et = match &t {
@@ -478,6 +496,13 @@ impl<'a> Lower<'a> {
             // literals there, only bit patterns (fir::FTy::F64).
             ExprKind::Float(bits) => Some(self.constant(FTy::F64, *bits as i128)),
             ExprKind::Bool(b) => Some(self.constant(FTy::Bool, if *b { 1 } else { 0 })),
+            // HOOK fnval: a closure WITHOUT captures — its record is one word
+            // in `.rodata`, exactly like that of a named function
+            // (fnval.rs, round 58).
+            ExprKind::Lambda(d) => {
+                let key = crate::fnval::record_of(&crate::fnval::closure_fn(d.id));
+                Some(self.push(FTy::Ptr, Op::FnRef { name: key }))
+            }
             ExprKind::Ident(name) => {
                 if let Some(slot) = self.lookup(name) {
                     let ft = self.fty_of(e)?;
@@ -1440,6 +1465,22 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
             None => break,
         }
     }
+    // HOOK fnval: inside a closure body the captured values are ordinary
+    // names — they lie in the record, which arrived as the last parameter
+    // (fnval.rs, round 58).
+    if let Some(caps) = crate::fnval::captures_of_fn(&d.name) {
+        let env = match lo.lookup(crate::fnval::ENV_PARAM) {
+            Some(slot) => lo.load(FTy::Ptr, slot),
+            None => {
+                dg.error(d.span, "internal error while lowering to FIR: closure without record");
+                return None;
+            }
+        };
+        for c in caps {
+            let a = lo.ptradd_const(env, c.off);
+            lo.declare_ty(&c.name, a, c.ty.clone());
+        }
+    }
     let ok = lo.lower_block(&d.body).is_some();
     lo.leave();
     if !ok {
@@ -1454,6 +1495,22 @@ pub fn lower(prog: &Program, info: &TypeInfo, dg: &mut Diags) -> Option<Module> 
     let mut ok = true;
     for d in &prog.funcs {
         match lower_fn(d, info, dg) {
+            Some(f) => m.funcs.push(f),
+            None => ok = false,
+        }
+    }
+    // HOOK fnval: every closure literal becomes a function of its own
+    // (fnval.rs, round 58). Its last parameter is the record.
+    for d in crate::fnval::collect(prog) {
+        let fd = ast::FnDecl {
+            name: crate::fnval::closure_fn(d.id),
+            params: crate::fnval::closure_params(&d),
+            ret: d.ret.clone(),
+            body: d.body.clone(),
+            span: d.span,
+            attrs: Vec::new(),
+        };
+        match lower_fn(&fd, info, dg) {
             Some(f) => m.funcs.push(f),
             None => ok = false,
         }

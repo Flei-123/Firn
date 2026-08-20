@@ -231,7 +231,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Placeholder for a broken expression (the error has already been reported).
-    fn broken_expr(&mut self, span: Span) -> Expr {
+    pub(crate) fn broken_expr(&mut self, span: Span) -> Expr {
         self.mk(span, ExprKind::Int(0))
     }
 
@@ -704,6 +704,11 @@ impl<'a> Parser<'a> {
         }
         // HOOK gc: `gc C{…}`, `gc_null[C]()`, `weak_null[C]()` (gc.rs)
         if let Some(e) = crate::gc::hook_primary(self) {
+            return e;
+        }
+        // HOOK fnval: the closure literal `fn(…) { … }` / `gc fn(…) { … }`
+        // (fnval.rs, round 58)
+        if let Some(e) = crate::fnval::hook_primary(self) {
             return e;
         }
         match self.kind().clone() {
@@ -1624,6 +1629,7 @@ pub fn reset_hooks() {
     // HOOK iface: the same for interfaces and their implementations (iface.rs)
     crate::iface::hook_reset();
     crate::fnval::hook_reset();
+    crate::fnval::closure_reset();
 }
 
 /// Like `parse`, but for a file of the source map: `file` is its number,
