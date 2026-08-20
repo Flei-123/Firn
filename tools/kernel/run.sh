@@ -585,6 +585,16 @@ if [ -f "$F" ]; then
     else
         bad "block accounting: after the format $free0, after the files $free1"
     fi
+    # 12 direct blocks + 64 through the indirect one = 76 * 512 = 38912.
+    lim=$(grep -m1 '^fs: limit ' "$F")
+    la=$(echo "$lim" | grep -oE 'asked=[0-9]+' | cut -d= -f2)
+    lw=$(echo "$lim" | grep -oE 'wrote=[0-9]+' | cut -d= -f2)
+    ls_=$(echo "$lim" | grep -oE 'size=[0-9]+' | cut -d= -f2)
+    if [ "$la" = "49152" ] && [ "$lw" = "38912" ] && [ "$ls_" = "38912" ]; then
+        ok "counter-check: a file stops at 12+64 blocks and reports 38912 of 49152 written"
+    else
+        bad "the size limit: asked=$la wrote=$lw size=$ls_, expected 49152/38912/38912"
+    fi
     grep -q '^fs: list .*hello.txt:1' "$F" \
         && ok "the root directory lists the file" \
         || { bad "hello.txt is not in the listing"; grep '^fs: list' "$F" | sed 's/^/        /'; }

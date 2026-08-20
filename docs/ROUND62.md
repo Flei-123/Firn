@@ -20,7 +20,7 @@ when the thing is switched off.
 | | base `a2a2ed4` | round 62 |
 |---|---|---|
 | `bash test.sh` | 905/905 | **911/911** |
-| `bash tools/kernel/run.sh` | 46 passed, 0 failed | **173 passed, 0 failed** |
+| `bash tools/kernel/run.sh` | 46 passed, 0 failed | **174 passed, 0 failed** |
 | `bash tools/freestanding/run.sh` | 41 passed, 0 failed | **41 passed, 0 failed** |
 | `bash tools/self_compare.sh` | 234 same / 0 differing / 0 faulty | **234 / 0 / 0** |
 | `bash tools/fixpoint.sh` | character-identical | **character-identical** |
@@ -262,12 +262,15 @@ fs: small wrote=14  read=14  same=1
 fs: big wrote=1500  read=1500  same=1  free=2008
 fs: list .:2 ..:2 hello.txt:1 docs:2
 fs: subdir .:2 ..:2 big.bin:1
+fs: limit asked=49152  wrote=38912  size=38912
 fs: unlink 1  gone=1  after=2011 of 2008
 ```
 
 `mount` on an unformatted disk **has to fail** — that is the difference
 between a file system and a guess about foreign octets. Deleting gives
-the blocks back (2008 → 2011).
+the blocks back (2008 → 2011). And the shape has a limit: twelve direct
+blocks plus sixty-four through the indirect one is 38 912 octets, and a
+file that is asked to take 49 152 says how many of them really went in.
 
 **And the same file system on a real disk.** `blk.use_ata` switches the
 device to ATA PIO — primary bus, master drive, the ports every PC has had
@@ -406,6 +409,14 @@ exactly one word below the user region, i.e. the stack had run out of the
 bottom of it. That the kernel survived it and named it is what made it a
 five minute fix.
 
+**A file system that lied about its own size.** The counter-check for the
+size limit was written after the fact, and it found something: a `write`
+that could not place a single octet any more still pushed the size of the
+inode up, because the check was `off + n > size` and not `n > 0 && off +
+n > size`. The file then claimed a length whose blocks did not exist —
+`size=45056` for 38 912 written octets. Three words of a condition, and
+nothing but the test would ever have shown it.
+
 **The two compilers produce a different number of `syscall`
 instructions** (58 against 1): firnc0 inlines the wrapper at every call
 site, firnc1 leaves the call standing. The first version of the test
@@ -456,14 +467,14 @@ the number in the object file — a relation that holds for both.
 
 ```
 bash test.sh                    911/911
-bash tools/kernel/run.sh        173 passed, 0 failed
+bash tools/kernel/run.sh        174 passed, 0 failed
 bash tools/freestanding/run.sh  41 passed, 0 failed
 bash tools/self_compare.sh      234 same, 0 differing, 0 faulty
 bash tools/fixpoint.sh          character-identical
 bash tools/english/check.sh     0 0 0 0 0
 ```
 
-The 173 cases of `tools/kernel/run.sh` in eighteen sections; eleven of them
+The 174 cases of `tools/kernel/run.sh` in eighteen sections; twelve of them
 are counter-checks whose measurement has to collapse when the thing under
 test is switched off:
 
@@ -476,6 +487,7 @@ test is switched off:
 | kernel pointer to `write` | `-EFAULT`, and the kernel does not follow it |
 | `wait` for a foreign pid | `-ECHILD` instead of a hang |
 | `mount` unformatted | refused, no foreign octets read as inodes |
+| a file over its limit | 38912 of 49152 written, and the size says 38912 |
 | no drive | the kernel says so and gets to the end |
 | no `script=` | no shell starts, the kernel does not hang on an empty console |
 | `hlt` in ring 3 | `#GP` with `cs=0x2b` (round 59) |
