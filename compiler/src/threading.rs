@@ -6,7 +6,7 @@
 //! ## Why this pass
 //!
 //! FIR has **no phi nodes** (fir.rs, invariant). The short circuit operators
-//! `&&` and `||` must therefore merge their result through one `alloca`
+//! `&&` and `||` must therefore merge their result through an `alloca`
 //! cell. `if c < 0x80 && c != 13` turns into:
 //!
 //! ```text
@@ -15,8 +15,8 @@
 //! bbJ: %3 = load.bool %cell ; brcond %3, bbT, bbE
 //! ```
 //!
-//! `mem2reg` cannot resolve this cell — it gets written twice, and without
-//! phi there is no value that represents both paths. Within machine code
+//! `mem2reg` cannot resolve this cell — it is written twice, and without
+//! phi there is no value that represents both paths. In machine code
 //! that costs seven instructions per pass rather than two:
 //!
 //! ```text
@@ -39,9 +39,9 @@
 //!
 //! It threads the edge past the confluence. A **switch block** is a block
 //! made of EXACTLY ONE instruction `%v = load.bool %cell` that ends with
-//! `brcond %v, T, E`. A predecessor which executes `store.bool %x, %cell`
-//! right before its terminator knows the content of the cell on that edge
-//! already — so it may jump straight away:
+//! `brcond %v, T, E`. A predecessor that executes `store.bool %x, %cell`
+//! right before its terminator already knows the content of the cell on
+//! that edge — so it may jump straight away:
 //!
 //! * terminator `br J`            ->  `brcond %x, T, E`
 //! * terminator `brcond %x, A, J` ->  `brcond %x, A, E`   (on the J edge
@@ -49,7 +49,7 @@
 //! * terminator `brcond %x, J, B` ->  `brcond %x, T, B`   (mirror image)
 //!
 //! After that `cmp` sits right before the terminator again, and the existing
-//! fusion `cmp`+`jcc` at `regalloc.rs` applies; the rest (dead `store`,
+//! fusion `cmp`+`jcc` in `regalloc.rs` applies; the rest (dead `store`,
 //! unreachable switch block) falls to `mem2reg::remove_dead_stores` and the
 //! block cleanup of `opt.rs`.
 //!
@@ -59,14 +59,14 @@
 //!   and the jump **nothing** can change the cell any more. Allowed between
 //!   them are only instructions without memory effect (no `store`, `call`,
 //!   `syscall`, `copymem`, `atomicadd`, `securezero`).
-//! * The cell is one `alloca` whose pointer **does not escape** (`simple`
-//!   from `scan_cells`): it serves as address of `load`/`store` only. A
-//!   foreign write is thereby ruled out.
-//! * `%x` is available at the predecessor — it is operand of its own
-//!   `store`. The live range does not get extended, it merely ends one
+//! * The cell is an `alloca` whose pointer **does not escape** (`simple`
+//!   from `scan_cells`): it serves only as the address of a `load`/`store`.
+//!   A foreign write is thereby ruled out.
+//! * `%x` is available in the predecessor — it is an operand of its own
+//!   `store`. The live range is not extended, it merely ends one
 //!   instruction later at the terminator of the SAME block. This pass
 //!   therefore does NOT fall into the class of round 40/41 (where a live
-//!   range got stretched across `call` boundaries without the register
+//!   range was stretched across `call` boundaries without the register
 //!   allocator knowing). Here no new range beyond a block comes about, and
 //!   the allocator sees the terminator operand anyway (`Term::BrCond` is
 //!   part of its liveness analysis).
@@ -74,8 +74,8 @@
 //!   and only when the cell really is read nowhere any more. The pass is
 //!   thereby debug preserving.
 //! * SPEC §9.2: secret values (`secret`) and `#[constant_time]` functions
-//!   do not get touched — out of a data flow a jump may never be
-//!   made.
+//!   are not touched — a data flow may never be turned into a
+//!   jump.
 //!
 //! Switchable off with `--no-pass=thread-bool`.
 
@@ -104,7 +104,7 @@ struct Fork {
 }
 
 pub(crate) fn thread_bool_cells(f: &mut Func) -> usize {
-    // SPEC §9.2: within constant-time functions no jump ever comes about here.
+    // SPEC §9.2: in constant-time functions no jump ever comes about here.
     if f.constant_time {
         return 0;
     }
@@ -212,7 +212,7 @@ fn simple_cells(f: &Func) -> std::collections::HashSet<Val> {
     for b in &f.blocks {
         for i in &b.insts {
             match &i.op {
-                // The address of one access is allowed; the STORED value
+                // The address of an access is allowed; the STORED value
                 // would be a pointer that escapes.
                 Op::Load { .. } => {}
                 Op::Store { val, .. } => {
@@ -247,7 +247,7 @@ fn simple_cells(f: &Func) -> std::collections::HashSet<Val> {
     cells
 }
 
-/// The bool value guaranteed to sit at a cell by the end of block `pi`:
+/// The bool value guaranteed to sit in a cell by the end of block `pi`:
 /// the last `store.bool` that is followed by no memory effect up to the
 /// terminator. Yields `(cell, value)`.
 fn last_bool_store(f: &Func, pi: usize) -> Option<(Val, Val)> {
@@ -316,7 +316,7 @@ mod tests {
             t => panic!("bb1: {:?}", t),
         }
         // The switch block itself stays unchanged (the block
-        // cleanup at opt.rs clears it away later).
+        // cleanup in opt.rs clears it away later).
         assert_eq!(f.blocks[2].insts.len(), 1);
     }
 
@@ -341,7 +341,7 @@ mod tests {
         let mut f = and_func();
         f.push_void(1, FTy::Void, Op::Call { name: "foreign".into(), args: vec![] });
         // bb1 now has a call BEHIND the store — threading is forbidden
-        // there, yet allowed for bb0.
+        // there, but allowed for bb0.
         assert_eq!(thread_bool_cells(&mut f), 1);
         assert!(matches!(f.blocks[1].term, Term::Br(2)));
     }
