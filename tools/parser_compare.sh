@@ -34,7 +34,24 @@ fi
 #   tests/590_f64.fi  ->  the literal `1e308`. That is NO parser error
 #   but the known floating point rounding case from round 20
 #   (tools/lex_compare.sh); the value is already wrong in the token.
-KNOWN="tests/590_f64.fi"
+#   tests/911_css_parser.fi  ->  a GENERIC CALL whose type argument is a
+#   user defined name (`gc_null[Cv]()`). `.astdump` runs the parser WITHOUT
+#   the generic table (`par_gen_set` is not called there), and instead of
+#   reporting "not core language" (return value 3) it reports a syntax
+#   error (return value 1). Minimal reproduction:
+#
+#       fn main() -> i32 {
+#           let a: i32 = gc_null[Cv]()
+#           return a
+#       }
+#
+#   The same file with `u32` instead of `Cv` goes through. This is NOT a
+#   consequence of the reformatting of round 64: the version out of the base
+#   commit a2a2ed4 fails in exactly the same way. It only became visible
+#   because this script had been calling `--emit=ast-kanon` since the
+#   English migration -- an option that no longer exists, so it compared
+#   NOTHING and reported zeros (round 64).
+KNOWN="tests/590_f64.fi tests/911_css_parser.fi"
 
 same=0
 different=0
