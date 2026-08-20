@@ -34,16 +34,16 @@ first line of the root file. Without an entry, `app` still applies.
 | SPEC §2 says | round 52 enforces | the message names |
 |---|---|---|
 | no global allocator, no runtime | `import std.*` rejected | the module and why |
-| no `Gc[T]` (tracing collector) | `gc class` rejected | „`gc class` braucht den tracing-sammler" |
+| no `Gc[T]` (tracing collector) | `gc class` rejected | "'gc class' needs the tracing collector" |
 | no unwinding / `throw` | `#[unwinds]` rejected | the function |
-| no hidden allocation | follows from both | — |
-| floating point only with `#[allow_fp]` | `f64` **and** floating point literals | „gleitkomma (der typ f64) … #[allow_fp]" |
-| freestanding | `syscall` rejected, no `_start` | „unter einem freistehenden kernel liegt kein betriebssystem" |
+| no hidden allocation | follows from both | -- |
+| floating point only with `#[allow_fp]` | `f64` **and** floating point literals | "floating point (the type f64) ... #[allow_fp]" |
+| freestanding | `syscall` rejected, no `_start` | "under a freestanding kernel there is no operating system" |
 | target binary format ELF object | `as --64 -o x.o`, **no `ld`** | — |
 
 Every violation is a compiler error with line, column, marker and a
 hint that **names** the forbidden thing. Proof: 15 negative tests
-`tests/neg/frei_*.fi`, each with an expected position and expected text.
+`tests/neg/free_*.fi`, each with an expected position and expected text.
 
 **`syscall` does not appear in the table of SPEC §2** — it belongs there
 anyway and is the sharpest of the six rules: below a freestanding kernel
@@ -59,13 +59,13 @@ are dropped without replacement.
 ## 2. Freestanding output
 
 ```sh
-firnc -c -o /tmp/x.o datei.fi        # nur `as --64 -o /tmp/x.o`, kein `ld`
-firnc --objekt -o /tmp/x.o datei.fi  # dasselbe, ausgeschrieben
-firnc -o /tmp/x.o kernel.fi          # `profile kernel` schaltet -c selbst ein
+firnc -c -o /tmp/x.o file.fi         # only `as --64 -o /tmp/x.o`, no `ld`
+firnc --object -o /tmp/x.o file.fi   # the same, written out
+firnc -o /tmp/x.o kernel.fi          # `profile kernel` switches -c on by itself
 ```
 
 In the app profile everything stays as before (`as` + `ld` → executable
-file). `firnc1` knows the same switches (`-c`, `--objekt`,
+file). `firnc1` knows the same switches (`-c`, `--object`,
 `--profile=kernel|app`).
 
 ## 3. Inline assembly
@@ -200,24 +200,24 @@ links at 1 MiB.
 `bash tools/freestanding/run.sh` — **41 checks, 41 passed.** Excerpt:
 
 ```
-== 2. Es ist eine OBJEKTdatei, und sie ist freistehend ==
-  OK    firnc0: ELF-Typ REL (verschiebbare Objektdatei)
-  OK    firnc0: KEIN undefiniertes Symbol
-  OK    firnc0: alle definierten Symbole sind eigene
-  OK    firnc0: kein syscall im Maschinencode
-  OK    firnc1: ELF-Typ REL (verschiebbare Objektdatei)
-  OK    firnc1: KEIN undefiniertes Symbol
-  OK    firnc1: alle definierten Symbole sind eigene
-  OK    firnc1: kein syscall im Maschinencode
-== 3. Gegen das Linkerskript binden (kein libc, keine crt-Dateien) ==
-  OK    start.s assembliert (Multiboot-Kopf, Langer Modus)
-  OK    firnc0: gelinkt, Einsprung 0x10000c
-  OK    firnc0: das gebundene Abbild hat kein offenes Symbol
-  OK    firnc1: gelinkt, Einsprung 0x10000c
-  OK    firnc1: das gebundene Abbild hat kein offenes Symbol
-== 3b. In QEMU booten (der eigentliche Beweis) ==
-  OK    firnc0: gebootet, serielle Ausgabe erschienen
-  OK    firnc1: gebootet, serielle Ausgabe erschienen
+== 2. it is an OBJECT file, and it is freestanding ==
+  OK    firnc0: ELF type REL (relocatable object file)
+  OK    firnc0: NO undefined symbol
+  OK    firnc0: every defined symbol is its own
+  OK    firnc0: no syscall in the machine code
+  OK    firnc1: ELF type REL (relocatable object file)
+  OK    firnc1: NO undefined symbol
+  OK    firnc1: every defined symbol is its own
+  OK    firnc1: no syscall in the machine code
+== 3. link against the linker script (no libc, no crt files) ==
+  OK    start.s assembles (multiboot header, long mode)
+  OK    firnc0: linked, entry point 0x10000c
+  OK    firnc0: the linked image has no open symbol
+  OK    firnc1: linked, entry point 0x10000c
+  OK    firnc1: the linked image has no open symbol
+== 3b. boot in QEMU (the real proof) ==
+  OK    firnc0: booted, serial output appeared
+  OK    firnc1: booted, serial output appeared
 ```
 
 Reproducible by hand:
@@ -227,19 +227,19 @@ $ compiler/target/release/firnc -o /tmp/kern0.o demos/kernel/core.fi
 $ file /tmp/kern0.o
 /tmp/kern0.o: ELF 64-bit LSB relocatable, x86-64, version 1 (SYSV), with debug_info, not stripped
 $ nm /tmp/kern0.o
-0000000000000030 T _F0.in8
-000000000000078b T _F0.kern_start
+000000000000077d T _F0.core_start
+000000000000002e T _F0.in8
 0000000000000000 T _F0.out8
-0000000000000193 T _F0.seriell_bereit
-000000000000005e T _F0.seriell_init
-000000000000029c T _F0.seriell_text
-00000000000001f3 T _F0.seriell_zeichen
-0000000000000685 T _F0.timer_ih
-00000000000003aa T _F0.vga_leeren
-00000000000004c0 T _F0.vga_text
-000000000000030e T _F0.vga_zelle
-$ nm -u /tmp/kern0.o            # undefinierte Symbole
-$                                # — keine.
+00000000000001ef T _F0.serial_char
+000000000000005c T _F0.serial_init
+000000000000018f T _F0.serial_ready
+0000000000000296 T _F0.serial_text
+0000000000000677 T _F0.timer_ih
+0000000000000306 T _F0.vga_cell
+00000000000003a0 T _F0.vga_clear
+00000000000004b4 T _F0.vga_text
+$ nm -u /tmp/kern0.o            # undefined symbols
+$                               # -- none.
 $ readelf -h /tmp/kern0.o | grep Type
   Type:                              REL (Relocatable file)
 $ objdump -d /tmp/kern0.o | grep -c syscall
@@ -252,7 +252,7 @@ And the boot:
 $ as --64 -o /tmp/start.o demos/kernel/start.s
 $ ld -n -T demos/kernel/linker.ld --defsym=KERN_START=_F0.kern_start \
      -o /tmp/kern0.elf /tmp/start.o /tmp/kern0.o
-$ objcopy -O elf32-i386 /tmp/kern0.elf /tmp/kern0.mb   # QEMUs Multiboot nimmt nur ELF32
+$ objcopy -O elf32-i386 /tmp/kern0.elf /tmp/kern0.mb   # QEMU's multiboot takes only ELF32
 $ qemu-system-x86_64 -kernel /tmp/kern0.mb -serial stdio -display none -no-reboot
 FIRN: profile kernel ist
 freistehend.
@@ -268,7 +268,7 @@ The same with `./.firnc1 demos/kernel/core.fi -o /tmp/kern1.o` and
 | `asm(…)` with `in`/`out`/`clobber` | `compiler/src/core.rs` | `lib/firnc1/{kern,parser,sema,lower,codegen}.fi` |
 | MMIO ×8 | ✓ | ✓ |
 | `#[interrupt]` → `iretq` | ✓ | ✓ |
-| `-c` / `--objekt` | ✓ | ✓ |
+| `-c` / `--object` | ✓ | ✓ |
 | `--profile=kernel|app` | ✓ | ✓ (output format) |
 | profile prohibition `syscall` | ✓ with a message | ✓ as a rejection |
 | profile prohibition `gc class` | ✓ with a message | ✓ as a rejection |
@@ -286,9 +286,9 @@ The textual form is a **contract**: `tools/fir_compare.sh` compares
 `firnc0 --emit=fir-raw` octet by octet with `bin/firdump.fi`. For
 `tests/850`–`854` it is identical.
 
-In `firnc1` the `asm` registry lies **in the tree** (`ast.fi`, `asm_dazu`),
-not in a side table — the same construction as `__match#N` in the pattern
-registry. What remains in the tree is a call `asm$<nummer>` with the input
+In `firnc1` the `asm` registry lies **in the tree** (`ast.fi`, `asm_add`),
+not in a side table -- the same construction as `__match#N` in the pattern
+registry. What remains in the tree is a call `asm$<number>` with the input
 expressions as arguments; because of that, monomorphization, the
 `#[no_gc]` check and the canonical printing run over it unchanged, and
 `--emit=ast-kanon` yields the same text on both sides.
@@ -298,35 +298,35 @@ expressions as arguments; because of that, monomorphization, the
 ```
 $ rm -f .firnc1 .firnc2 .firnc3
 $ bash tools/fixpoint.sh
-STUFE 2: 2760 ms   2581456 Oktette
-STUFE 3: 8004 ms   2581456 Oktette
-FIXPUNKT:  Stufe 2 == Stufe 3, zeichengleich (448038 Zeilen Assembler)
-  GLEICHES VERHALTEN: 218
-  ABWEICHEND:         0
-  FEHLERHAFT:         0
-  NICHT KERN:         0
+STAGE 2: 2760 ms   2581456 octets
+STAGE 3: 8004 ms   2581456 octets
+FIXPOINT:  stage 2 == stage 3, character-identical (448038 lines of assembly)
+  SAME BEHAVIOUR:     218
+  DIFFERING:          0
+  FAULTY:             0
+  NOT CORE:           0
   DEFER:              0
   COMPTIME:           1
-  CODEGEN FEHLT:      0
-  UEBERSPRUNGEN:      18
-KORPUS:    .firnc2 verhaelt sich wie firnc0
+  CODEGEN MISSING:    0
+  SKIPPED:            18
+CORPUS:    .firnc2 behaves like firnc0
 
 $ bash tools/freestanding/run.sh
-FREISTEHEND: 41 bestanden, 0 fehlgeschlagen
+FREESTANDING: 41 passed, 0 failed
 ```
 
 ```
 $ bash ./test.sh
-…
-== 16. Der Compiler in Firn uebersetzt, das Ergebnis laeuft ==
-   GLEICHES VERHALTEN: 218
-   ABWEICHEND:         0
-   FEHLERHAFT:         0
-== 17. Der Fixpunkt: Firn uebersetzt sich selbst ==
-   FIXPUNKT:  Stufe 2 == Stufe 3, zeichengleich (448038 Zeilen Assembler)
-   KORPUS:    .firnc2 verhaelt sich wie firnc0
-== 19. Freistehend ==
-   FREISTEHEND: 41 bestanden, 0 fehlgeschlagen
+...
+== 16. the compiler in Firn compiles, the result runs ==
+   SAME BEHAVIOUR:     218
+   DIFFERING:          0
+   FAULTY:             0
+== 17. the fixpoint: Firn compiles itself ==
+   FIXPOINT:  stage 2 == stage 3, character-identical (448038 lines of assembly)
+   CORPUS:    .firnc2 behaves like firnc0
+== 19. freestanding ==
+   FREESTANDING: 41 passed, 0 failed
 
 PASS 782/782
 ```
@@ -393,19 +393,19 @@ Honestly and completely:
 ## 10. Changed files
 
 ```
-compiler/src/core.rs            neu   Inline-Assembler, MMIO, #[interrupt]
-compiler/src/prof.rs          neu   Profilauflösung und -durchsetzung
+compiler/src/core.rs            new   inline assembler, MMIO, #[interrupt]
+compiler/src/prof.rs            new   profile resolution and enforcement
 compiler/src/fir.rs                   Op::Asm/MmioLoad/MmioStore, Func.interrupt
-compiler/src/{opt,mem2reg,licm,inline,regalloc}.rs   volatile-Schutz
-compiler/src/codegen_x86.rs           kein _start im Kernel-Profil, iretq-Epilog
-compiler/src/main.rs                  -c/--objekt, --profile=
-compiler/src/{sema,lower,parser,modules,attrs}.rs    Hooks
-lib/firnc1/core.fi              neu   Registertabelle, MMIO-Namen, asm-Nummern
-lib/firnc1/{ast,parser,sema,lower,fir,codegen}.fi    dieselbe Sprache in Firn
-bin/firnc1.fi                         -c/--objekt, --profile=
-demos/kernel/{core.fi,start.s,linker.ld}   neu   der Nachweis
-tools/freestanding/{run.sh,volatile.fi}         neu   41 Prüfungen
-tests/85{0,1,2,3,4}_*.fi                       neu   laufende Programme
-tests/neg/frei_*.fi (15)                       neu   jede Verbotsmeldung
+compiler/src/{opt,mem2reg,licm,inline,regalloc}.rs   volatile protection
+compiler/src/codegen_x86.rs           no _start in the kernel profile, iretq epilogue
+compiler/src/main.rs                  -c/--object, --profile=
+compiler/src/{sema,lower,parser,modules,attrs}.rs    hooks
+lib/firnc1/core.fi              new   register table, MMIO names, asm numbers
+lib/firnc1/{ast,parser,sema,lower,fir,codegen}.fi    the same language in Firn
+bin/firnc1.fi                         -c/--object, --profile=
+demos/kernel/{core.fi,start.s,linker.ld}   new   the proof
+tools/freestanding/{run.sh,volatile.fi}         new   41 checks
+tests/85{0,1,2,3,4}_*.fi                        new   running programs
+tests/neg/free_*.fi (15)                        new   every prohibition message
 test.sh                               Abschnitt 19
 ```

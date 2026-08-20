@@ -70,17 +70,17 @@ fi
 echo "== 2. it is an OBJECT file, and it is freestanding =="
 for s in 0 1; do
     f="$TMPD/k$s.o"
-    [ -f "$f" ] || { bad "firnc$s: keine Ausgabedatei"; continue; }
+    [ -f "$f" ] || { bad "firnc$s: no output file"; continue; }
     kind=$(readelf -h "$f" | awk -F: '/^  Type:/ {print $2}' | awk '{print $1}')
-    [ "$kind" = "REL" ] && ok "firnc$s: ELF-Typ REL (verschiebbare Objektdatei)" \
+    [ "$kind" = "REL" ] && ok "firnc$s: ELF type REL (relocatable object file)" \
                        || bad "firnc$s: ELF kind '$kind', expected REL"
     undef=$(nm -u "$f" 2>/dev/null | sed '/^$/d')
     [ -z "$undef" ] && ok "firnc$s: NO undefined symbol" \
-                    || { bad "firnc$s: undefinierte Symbole"; echo "$undef" | sed 's/^/        /'; }
+                    || { bad "firnc$s: undefined symbols"; echo "$undef" | sed 's/^/        /'; }
     # Every defined symbol belongs to the program itself (prefix _F0./_F1.).
     fremd=$(nm --defined-only "$f" | awk '{print $3}' | grep -vE "^_F[01]\." || true)
-    [ -z "$fremd" ] && ok "firnc$s: alle definierten Symbole sind eigene" \
-                    || { bad "firnc$s: fremde Symbole"; echo "$fremd" | sed 's/^/        /'; }
+    [ -z "$fremd" ] && ok "firnc$s: every defined symbol is its own" \
+                    || { bad "firnc$s: foreign symbols"; echo "$fremd" | sed 's/^/        /'; }
     if objdump -d "$f" | grep -qE '^\s+[0-9a-f]+:.*\bsyscall\b'; then
         bad "firnc$s: the object file contains a syscall"
     else
@@ -98,11 +98,11 @@ for s in 0 1; do
     if ld -n -T "$LDSCRIPT" --defsym=KERN_START="_F$s.core_start" \
           -o "$TMPD/k$s.elf" "$TMPD/start.o" "$f" 2>"$TMPD/ld$s.err"; then
         ein=$(readelf -h "$TMPD/k$s.elf" | awk -F: '/Entry point/ {print $2}' | tr -d ' ')
-        ok "firnc$s: gelinkt, Einsprung $ein"
+        ok "firnc$s: linked, entry point $ein"
         # The only code that does not come from Firn is `start.s`.
         undef=$(nm -u "$TMPD/k$s.elf" 2>/dev/null | sed '/^$/d')
         [ -z "$undef" ] && ok "firnc$s: the linked image has no open symbol" \
-                        || { bad "firnc$s: offene Symbole im Abbild"; echo "$undef" | sed 's/^/        /'; }
+                        || { bad "firnc$s: open symbols in the image"; echo "$undef" | sed 's/^/        /'; }
     else
         bad "firnc$s: ld schlug fehl"; sed 's/^/        /' "$TMPD/ld$s.err" | head -5
     fi
@@ -119,9 +119,9 @@ if command -v qemu-system-x86_64 >/dev/null 2>&1; then
             -display none -no-reboot > "$TMPD/q$s.txt" 2>&1
         if grep -q "FIRN: profile kernel ist" "$TMPD/q$s.txt" \
            && grep -q "freestanding." "$TMPD/q$s.txt"; then
-            ok "firnc$s: gebootet, serielle Ausgabe erschienen"
+            ok "firnc$s: booted, serial output appeared"
         else
-            bad "firnc$s: keine serielle Ausgabe aus QEMU"
+            bad "firnc$s: no serial output out of QEMU"
             sed 's/^/        /' "$TMPD/q$s.txt" | head -6
         fi
     done
@@ -136,29 +136,29 @@ for s in 0 1; do
     objdump -d "$f" > "$TMPD/d$s.txt"
     for instr in cli hlt "out    %al,(%dx)" "in     (%dx),%al" iretq; do
         if grep -qF "$instr" "$TMPD/d$s.txt"; then
-            ok "firnc$s: '$instr' im Maschinencode"
+            ok "firnc$s: '$instr' in the machine code"
         else
             bad "firnc$s: '$instr' is missing"
         fi
     done
     # `#[interrupt]`: 14 push + 14 pop in the entry point.
     n=$(awk '/<_F'"$s"'\.timer_ih>:/,/iretq/' "$TMPD/d$s.txt" | grep -cE '\bpush\b')
-    [ "$n" -eq 15 ] && ok "firnc$s: timer_ih rettet 14 Register + rbp" \
+    [ "$n" -eq 15 ] && ok "firnc$s: timer_ih saves 14 registers + rbp" \
                     || bad "firnc$s: timer_ih has $n push, expected 15"
 done
 
-echo "== 5. volatile haelt in allen drei Baustufen =="
+echo "== 5. volatile holds in all three build stages =="
 # `cli` and `hlt` stand in `core_start`, which nobody calls -- so they cannot
 # become more through inlining either. Exactly once, in every build stage.
 for stage in "" "--no-opt" "--opt-level=dev-fast"; do
     name=${stage:---release-fast}
-    "$FIRNC" $stage --emit=asm -o "$TMPD/k.s" "$SOURCE" 2>/dev/null || { bad "asm-Ausgabe $name"; continue; }
+    "$FIRNC" $stage --emit=asm -o "$TMPD/k.s" "$SOURCE" 2>/dev/null || { bad "asm output $name"; continue; }
     c=$(grep -cE '^\s+cli$' "$TMPD/k.s")
     h=$(grep -cE '^\s+hlt$' "$TMPD/k.s")
     o=$(grep -cE '^\s+out dx, al$' "$TMPD/k.s")
     i=$(grep -cE '^\s+in al, dx$' "$TMPD/k.s")
     if [ "$c" = 1 ] && [ "$h" = 1 ] && [ "$o" -ge 1 ] && [ "$i" -ge 1 ]; then
-        ok "$name: cli=1 hlt=1 (exakt), out=$o in=$i (>=1; --release-fast bettet out8/in8 ein)"
+        ok "$name: cli=1 hlt=1 (exact), out=$o in=$i (>=1; --release-fast inlines out8/in8)"
     else
         bad "$name: cli=$c hlt=$h out=$o in=$i"
     fi
@@ -180,7 +180,7 @@ for stage in "" "--no-opt" "--opt-level=dev-fast"; do
     l=$(grep -cF 'mmio_load.u32' "$TMPD/v.fir")
     st=$(grep -cF 'mmio_store.u32' "$TMPD/v.fir")
     if [ "$a1" = 3 ] && [ "$a2" = 1 ] && [ "$l" = 2 ] && [ "$st" = 1 ]; then
-        ok "volatile.fi $name: pause=3 rdtsc=1 mmio_load=2 mmio_store=1 (exakt)"
+        ok "volatile.fi $name: pause=3 rdtsc=1 mmio_load=2 mmio_store=1 (exact)"
     else
         bad "volatile.fi $name: pause=$a1 (3) rdtsc=$a2 (1) load=$l (2) store=$st (1)"
     fi
@@ -193,7 +193,7 @@ rm -f "$TMPD/v1" "$TMPD/v1.s" "$TMPD/v1.o"
 if "$FC1" "$VOL" -o "$TMPD/v1" >/dev/null 2>&1; then
     c=$(grep -cE '^\s+pause$' "$TMPD/v1.s")
     r=$(grep -cE '^\s+rdtsc$' "$TMPD/v1.s")
-    [ "$c" = 3 ] && [ "$r" = 1 ] && ok "volatile.fi firnc1: pause=3 rdtsc=1 (exakt)" \
+    [ "$c" = 3 ] && [ "$r" = 1 ] && ok "volatile.fi firnc1: pause=3 rdtsc=1 (exact)" \
                                 || bad "volatile.fi firnc1: pause=$c (3) rdtsc=$r (1)"
     "$TMPD/v1" >/dev/null 2>&1
     [ "$?" = 6 ] && ok "volatile.fi firnc1: runs, yields 6" || bad "volatile.fi firnc1: wrong return value"
