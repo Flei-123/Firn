@@ -27,7 +27,7 @@ Scope:
   2) Type syntax `IoError!Buf` as a **return type** and as the type of local variables.
   3) Implicit conversion at `return`: `return value` yields success, `return IoError::NotFound` yields an error. No `ok(...)` ceremony.
   4) `try expression` -- on error, return from the function immediately with the same code, otherwise the value. Only allowed in functions that themselves return a matching error union; otherwise a clear error with line and column.
-  5) `expression catch fallback` -- fallback value on error. If you also manage `catch |e| { ... }`: by all means, but items 4 and 5 come first.
+  5) `expression catch fallback` -- fallback value on error. If `catch |e| { ... }` is within reach as well: by all means, but items 4 and 5 come first.
   6) A `!T` value is implicitly `#[must_consume]`: discarded as a statement is an error (the check for that already exists in `sema.rs`, `check_discard`).
   7) `defer { ... }` and `errdefer { ... }` if time is left -- otherwise leave them out and record them as open in SPEC 14.1.
 At least 15 test programs under `tests/` plus 6 negative tests (`try` outside an error-returning function, a discarded `!T`, an unknown error variant, a type error in the `catch` fallback, a duplicate error variant, mismatched error sets).
