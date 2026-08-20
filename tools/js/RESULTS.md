@@ -19,20 +19,20 @@ Every case really executed. A case that uses a feature this engine does not have
 
 | runs | passed | failed | quota |
 |---:|---:|---:|---:|
-| 51664 | 21414 | 30250 | 41.45% |
+| 63364 | 32007 | 31357 | 50.51% |
 
 ### The failures by cause
 
 | cause | cases |
 |---|---:|
-| not-reached | 12432 |
-| unsupported-syntax | 9046 |
-| throw | 7408 |
-| crash | 572 |
-| parse | 449 |
-| unsupported-builtin | 300 |
-| timeout | 40 |
-| wrong | 3 |
+| unsupported-syntax | 17390 |
+| throw | 11800 |
+| crash | 1078 |
+| parse | 633 |
+| unsupported-builtin | 304 |
+| timeout | 140 |
+| wrong | 9 |
+| unsupported-module | 3 |
 
 `unsupported-syntax` is a program that the parser rejects because the feature is deliberately absent (generators, async, BigInt, private methods). `throw` is an exception the test did not expect -- usually a built in that does not exist. `wrong` is a case that ran through without the expected exception or delivered a wrong value: that is where the real bugs are.
 
@@ -40,6 +40,7 @@ Every case really executed. A case that uses a feature this engine does not have
 
 | directory | runs | passed | quota |
 |---|---:|---:|---:|
+| built-ins/Array | 6117 | 4058 | 66.34% |
 | built-ins/Boolean | 101 | 89 | 88.12% |
 | built-ins/Error | 186 | 84 | 45.16% |
 | built-ins/Function | 893 | 351 | 39.31% |
@@ -80,8 +81,7 @@ Every case really executed. A case that uses a feature this engine does not have
 | language/rest-parameters | 22 | 22 | 100.00% |
 | language/source-text | 2 | 0 | 0.00% |
 | language/statementList | 160 | 64 | 40.00% |
+| language/statements | 18015 | 6535 | 36.28% |
 | language/types | 211 | 203 | 96.21% |
 | language/white-space | 134 | 52 | 38.81% |
-| language/statements | 9350 | 0 | not reached |
-| built-ins/Array | 3082 | 0 | not reached |
 
