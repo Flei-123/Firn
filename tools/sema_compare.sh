@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tools/sema_compare.sh -- the type checker in FIRN against the one in RUST.
 #
-# The YARDSTICK is `firnc0 --emit=typen`: the canonical syntax tree with the TYPE at
+# The YARDSTICK is `firnc0 --emit=types`: the canonical syntax tree with the TYPE at
 # every expression. `firnc0` promises that after the check every expression
 # has a concrete type -- exactly this promise is compared here.
 #
@@ -46,7 +46,7 @@ exprs=0
 first=""
 
 while IFS= read -r f; do
-    if ! "$FIRNC" --emit=typen "$f" > "$TMPD"/semv_a.txt 2>/dev/null; then
+    if ! "$FIRNC" --emit=types "$f" > "$TMPD"/semv_a.txt 2>/dev/null; then
         skipped=$((skipped+1))
         continue
     fi
@@ -84,7 +84,7 @@ echo "SKIPPED:       $skipped  (firnc0 does not check the file on its own)"
 if [ -n "$first" ]; then
     echo "first unexpected deviation: $first"
     ff=${first%% *}
-    diff <("$FIRNC" --emit=typen "$ff" 2>/dev/null) <("$DUMP" "$ff" 2>/dev/null) | head -6
+    diff <("$FIRNC" --emit=types "$ff" 2>/dev/null) <("$DUMP" "$ff" 2>/dev/null) | head -6
     exit 1
 fi
 exit 0

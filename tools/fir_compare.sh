@@ -36,7 +36,22 @@ if [ ! -x "$DUMP" ] || [ -n "$(find bin lib/firnc1 -name '*.fi' -newer "$DUMP" -
     "$FIRNC" bin/firdump.fi -o "$DUMP" || exit 1
 fi
 
-KNOWN="tests/590_f64.fi"
+# KNOWN DEVIATIONS -- each one named separately, with a reason.
+#
+#   tests/590_f64.fi  ->  the literal `1e308`, the floating point rounding
+#   case of round 20 (see tools/lex_compare.sh). The value is already wrong
+#   in the token, not in the lowering.
+#
+#   tests/871_closure_plain.fi  ->  ROUND 58, order and numbering of the
+#   GENERATED closure functions. `firnc0` appends all `__closure#N` at the
+#   END of the module and numbers them from 0; `firnc1` emits them where
+#   they appear and numbers them from 2. The bodies are the same and the
+#   BEHAVIOUR is the same -- tools/self_compare.sh compares that and finds
+#   no difference. What differs is a name and a position in the text, not a
+#   program. Found in round 64 while reviving this script (it had been
+#   calling `--emit=typen` since the English migration, an option that no
+#   longer exists -- so it compared NOTHING and reported zeros).
+KNOWN="tests/590_f64.fi tests/871_closure_plain.fi"
 
 same=0
 different=0
@@ -49,7 +64,7 @@ instructions=0
 first=""
 
 while IFS= read -r f; do
-    if ! "$FIRNC" --emit=typen "$f" >/dev/null 2>&1; then
+    if ! "$FIRNC" --emit=types "$f" >/dev/null 2>&1; then
         skipped=$((skipped+1))
         continue
     fi

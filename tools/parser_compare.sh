@@ -2,7 +2,7 @@
 # tools/parser_compare.sh -- the parser written in FIRN against the one
 # written in RUST, over the whole source corpus.
 #
-# The YARDSTICK is `firnc0 --emit=ast-kanon`: a language-neutral, parenthesised
+# The YARDSTICK is `firnc0 --emit=ast-canon`: a language-neutral, parenthesised
 # form of the syntax tree (compiler/src/ast_canon.rs). Two independent parsers
 # produce the same text exactly when they have built the same tree.
 #
@@ -44,7 +44,7 @@ skipped=0
 first=""
 
 while IFS= read -r f; do
-    if ! "$FIRNC" --emit=ast-kanon "$f" > "$TMPD"/parv_a.txt 2>/dev/null; then
+    if ! "$FIRNC" --emit=ast-canon "$f" > "$TMPD"/parv_a.txt 2>/dev/null; then
         # firnc0 does not get through itself (module fragment, negative test).
         skipped=$((skipped+1))
         continue
@@ -74,7 +74,7 @@ echo "SKIPPED:       $skipped  (firnc0 does not get through itself)"
 if [ -n "$first" ]; then
     echo "first unexpected deviation: $first"
     ff=${first%% *}
-    "$FIRNC" --emit=ast-kanon "$ff" > "$TMPD"/parv_a.txt 2>/dev/null
+    "$FIRNC" --emit=ast-canon "$ff" > "$TMPD"/parv_a.txt 2>/dev/null
     "$DUMP" "$ff" > "$TMPD"/parv_b.txt 2>/dev/null
     diff "$TMPD"/parv_a.txt "$TMPD"/parv_b.txt | head -10
     exit 1
