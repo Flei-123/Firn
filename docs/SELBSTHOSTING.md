@@ -72,7 +72,7 @@ Sorted by „blocks the most first". `[ ]` = missing,
 | 8 | **Methods / `impl`** | `[ ]` | cosmetics, replaceable by free functions with a first parameter |
 | 9 | **Interfaces / dynamic dispatch** | `[ ]` | **not** needed for stage 1 |
 | 10 | **Error handling** (`Result`, `?`) | `[ ]` | replaceable by a sum type + `match` as soon as 6 stands |
-| 11 | **Process start** (a `fork`/`execve` wrapper) | **`[x]`** since round 28 (`rt.lauf`, `tests/700_process_start.fi`) | `firnc` calls `as` and `ld` |
+| 11 | **Process start** (a `fork`/`execve` wrapper) | **`[x]`** since round 28 (`rt.run`, `tests/700_process_start.fi`) | `firnc` calls `as` and `ld` |
 | 12 | **File access** (`open`/`read`/`write`) | **`[x]`** `lies_datei`, `lies_stdin`, `schreib_alles` in `lib/rt/` | read the source, write the `.s` |
 | 13 | **Mutable global state** | `[ ]` (only `const`) | avoidable: pass a context struct through — the Rust code does that almost everywhere already |
 | 14 | **Aggregates at function boundaries** | `[x]` since round 2 | structs as parameters/return values |
@@ -149,7 +149,7 @@ The three items that blocked the most above (1, 5, 12) now stand as
 | memory | `heap_alloc`, `heap_free`, `mem_copy`, `mem_set`, `mem_eq` |
 | buffers | `Buf` with `buf_push`, `buf_push_bytes`, `buf_reserve`, `buf_at`, `buf_len` |
 | number → text | `buf_push_dez_u64`, `buf_push_dez_i64`, `buf_push_hex_u64` |
-| input/output | `lies_datei`, `lies_stdin`, `schreib_alles`, `beende` |
+| input/output | `read_file`, `read_stdin`, `write_everything`, `finish` |
 | raw access | `ld8`/`st8` … `ld64`/`st64` |
 
 Proof: `tests/610_rt.fi` — allocation, 5.000 bytes through several
@@ -217,8 +217,8 @@ The cause was more tangible than assumed: **generic templates do not lie in
 `Program::funcs`** but in `sema_generic::REG`. The module rewriting in
 `modules::build_program` runs over `Program::funcs` — so it never reached
 the templates. A template therefore saw only the names of the root file;
-even a helper function in the same module file reported *unbekannte
-funktion*.
+even a helper function in the same module file reported *unknown
+function*.
 
 `build_program` now sends **the templates of the respective file as well**
 through the same `Renamer`. The **name** of the template stays untouched in
@@ -231,11 +231,11 @@ program-wide.
 `lib/rt/vec.fi` is the first real **generic collection as a library**:
 it includes `rt` from its own directory (B3), calls
 `rt.heap_alloc`/`rt.mem_copy` from the body of a template (B2), and the
-root file writes `var v: Vec[i32] = vec_neu[i32]()` (B1). The duplication of
+root file writes `var v: Vec[i32] = vec_new[i32]()` (B1). The duplication of
 the memory functions has disappeared again.
 
 Proof: `tests/640_vec_module.fi` (1.000 `i32`, 300 `u8`, 100 `u64`, `pop`,
-`setzen`, access beyond the end) in all three build stages.
+`vec_set`, access beyond the end) in all three build stages.
 
 **With that `lib/std/` can be written** — the next step on the list in §2.
 ---
@@ -307,7 +307,7 @@ probing, the **text** is compared, not the hash value — so two different
 identifiers with the same FNV value get different numbers. That is the
 difference between correct and „has not come up so far".
 
-One trap lies in the relocation: `intern_nummer` has to take the hash from
+One trap lies in the relocation: `intern_number` has to take the hash from
 its **own** buffer after the copying — the passed pointer may have pointed
 into the same buffer and may have become invalid when it grew.
 

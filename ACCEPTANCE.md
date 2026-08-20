@@ -125,7 +125,7 @@ tokenizer logic at all**. Run in person during the merge,
 | unicodeChars.test | 323 / 323 | 100.00 % | 323 / 323 | 100.00 % |
 | unicodeCharsProblematic.test | 5 / 5 | 100.00 % | 5 / 5 | 100.00 % |
 | **xmlViolation.test** | **4 / 4** | **100.00 %** | **3 / 4** | **75.00 %** |
-| **GESAMT** | **6810 / 6810** | **100.00 %** | **6809 / 6810** | **99.99 %** |
+| **TOTAL** | **6810 / 6810** | **100.00 %** | **6809 / 6810** | **99.99 %** |
 
 The four `xmlViolationTests` demand the XML adaptation
 (`U+FFFF` -> `U+FFFD`, `U+000C` -> space, `--` -> `- -` inside a comment), which
@@ -191,7 +191,7 @@ failure.** The 2,231 named references live in a table built at run time. It is
 created with `mmap` **without** `MAP_FIXED` at an address chosen by the kernel
 and passed through as a pointer in the `tokens.Sink` (`sink_entities`); there is
 no fixed address and no assumption about the memory layout. If `mmap` fails,
-`entities.tabelle()` returns the null pointer, `char_ref` reports
+`entities.table()` returns the null pointer, `char_ref` reports
 `REF_UNMOEGLICH`, and the tokenizer sets `nicht_unterstuetzt` -- the case then
 counts as a **failure** instead of being tokenized wrongly in silence. Both are
 demonstrated in Firn (`lib/html/entities_failure.fi`, step 1c in `run.sh`): the
