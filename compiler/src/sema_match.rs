@@ -1171,6 +1171,7 @@ pub fn check_exhaustive(subject: &Subject, arms: &[Arm], span: Span) -> Result<(
                     "add an arm '{} => {{ }}' or '_ => {{ }}'",
                     missing[0]
                 )),
+                help: None,
             })
         }
         Subject::Bool => {
@@ -1199,6 +1200,7 @@ pub fn check_exhaustive(subject: &Subject, arms: &[Arm], span: Span) -> Result<(
                 span,
                 label: "here".to_string(),
                 note: Some("add the missing arm or '_ => { }'".to_string()),
+                help: None,
             })
         }
         Subject::Int(t) => {
@@ -1213,6 +1215,7 @@ pub fn check_exhaustive(subject: &Subject, arms: &[Arm], span: Span) -> Result<(
                 span,
                 label: "here".to_string(),
                 note: Some("add '_ => { }'".to_string()),
+                help: None,
             })
         }
     }
