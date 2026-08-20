@@ -378,7 +378,7 @@ that reason, and it is named here so that it does not vanish again.
 
 ## 7. What is in test.sh now
 
-Sections 23 (formatter), 24 (debug information) and 25 (language server) are
+Sections 24 (formatter), 25 (debug information) and 26 (language server) are
 new. They run on every change, like everything else -- a proof that only runs
 once is not a proof.
 
