@@ -15,9 +15,10 @@
  *   3. `kernel_end` marks the first byte behind the image. The frame
  *      allocator reads it and never hands out anything below it.
  *
- * `KERNEL_MAIN`, `KERNEL_TRAP` and `KERNEL_SYSCALL` are set by `ld --defsym`
- * when linking: firnc0 puts `_F0.` in front of every symbol, firnc1
- * `_F1.` (docs/SELF_HOSTING.md).
+ * `KERNEL_MAIN`, `KERNEL_TRAP`, `KERNEL_SYSCALL`, `KERNEL_TASK_MAIN`,
+ * `KERNEL_USER_START` and `USER_MAIN` are set by `ld --defsym` when
+ * linking: firnc0 puts `_F0.` in front of every symbol, firnc1 `_F1.`
+ * (docs/SELF_HOSTING.md).
  */
 ENTRY(_boot)
 
@@ -29,13 +30,23 @@ SECTIONS
     {
         *(.multiboot)
         *(.text.boot)
-        *(.text .text.*)
+        *(EXCLUDE_FILE(*uprog*.o) .text)
+        *(EXCLUDE_FILE(*uprog*.o) .text.*)
     }
 
+    /* Round 62: everything between `__user_begin` and `__user_end` is
+     * what ring 3 may see. That is the hand-written user program of round
+     * 59 (`.utext` out of isr.s) AND the whole code of `uprog.fi`, which
+     * is compiled into an object file of its own for exactly this reason.
+     * The kernel sets the user bit for these pages and for no others
+     * (`proc.map_programs`). */
     .utext : ALIGN(4K)
     {
+        __user_begin = .;
         *(.utext)
+        *uprog*.o(.text .text.*)
         . = ALIGN(4K);
+        __user_end = .;
     }
 
     .rodata : ALIGN(4K) { *(.rodata .rodata.*) }
