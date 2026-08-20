@@ -54,4 +54,4 @@ if [ "$RC" -ne 0 ] || [ "$CHECKRC" -ne 0 ] || [ "$BAD" != "0" ]; then
     echo "FAILED"
     exit 1
 fi
-echo "OK: $N/$N bitgleich zurueck, $N/$N kuerzeste Darstellung wie Rust"
+echo "OK: $N/$N bit-identical on the way back, $N/$N shortest form like Rust"

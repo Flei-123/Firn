@@ -73,4 +73,4 @@ R39 std and interpolation (worktree r39-std, ebc3c1e/e4fc9bd/ed0faf7): search pa
 an Fmt chain at compile time (no varargs), 790/791 core tests, 3 negative tests. Verified live from /tmp.
 TOOLING FIX (the same trap again): lex/parser/types/fir/sema_comparison built their dump binaries only
 "if missing" -- stale dumps after R39 made the comparisons fail. They are now rebuilt when the sources
-are newer (like fixpunkt.sh since R35). fixpunkt.sh now also exports FIRNLIB.
+are newer (like fixpunkt.sh since R35). fixpunkt.sh exports FIRNLIB now as well.
