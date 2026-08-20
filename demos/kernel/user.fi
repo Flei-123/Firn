@@ -1,0 +1,201 @@
+// demos/kernel/user.fi -- round 59: ring 3 and the system call.
+//
+// Everything so far ran in ring 0, where every instruction is allowed.
+// This file gives up that privilege for a moment and takes it back:
+//
+//   1. `syscall`/`sysret` need four MSRs. STAR says which segments the
+//      processor loads, LSTAR where the entry point is, SFMASK which
+//      flags are cleared on entry (IF above all -- an interrupt while
+//      rsp still points at the user stack would be fatal), and EFER.SCE
+//      switches the pair of instructions on at all.
+//   2. Ring 3 may only touch pages whose user bit is set -- at EVERY
+//      level of the table. `boot.s` maps the first gigabyte with 2 MiB
+//      pages without that bit; giving the bit to a whole 2 MiB page would
+//      hand kernel code to the user program. Therefore the page in
+//      question is SPLIT here: one page table of 512 entries of 4 KiB, and
+//      the user bit for exactly one of them.
+//   3. The way back out of ring 3 is not a `sysret` -- it is the
+//      abandonment of the user program (`leave_user` in isr.s).
+//
+// What is deliberately NOT here: an address space of its own per process,
+// a scheduler, memory protection between several user programs. This is
+// the switch, not an operating system.
+
+import serial
+import kstate
+import mem
+
+export { setup, run, handle, map_user }
+
+const MSR_EFER: u64 = 0xC0000080
+const MSR_STAR: u64 = 0xC0000081
+const MSR_LSTAR: u64 = 0xC0000082
+const MSR_SFMASK: u64 = 0xC0000084
+
+const V_SYSCALL: u64 = 48               // indices in the table out of isr.s
+const V_USER: u64 = 49
+const V_ENTER: u64 = 50
+const V_LEAVE: u64 = 51
+
+const PAGE_PRESENT: u64 = 1
+const PAGE_WRITE: u64 = 2
+const PAGE_USER: u64 = 4
+const PAGE_HUGE: u64 = 0x80
+const ADDR_MASK: u64 = 0x000FFFFFFFFFF000
+
+fn not(v: u64) -> u64 {
+    return v ^ 0xFFFFFFFFFFFFFFFF
+}
+
+fn vector(state: u64, i: u64) -> u64 {
+    return __mmio_read64((kstate.get(state, kstate.VECTORS) + i * 8) as *mut u64)
+}
+
+// ------------------------------------------------------------ the MSRs
+
+fn wrmsr(index: u64, value: u64) {
+    asm("wrmsr", in("rcx") index, in("rax") value & 0xFFFFFFFF,
+        in("rdx") value >> 32)
+}
+
+fn rdmsr(index: u64) -> u64 {
+    // Two registers in, one value out: the shift happens inside the
+    // block, because an `asm` has exactly one output operand.
+    return asm("rdmsr\nshl rdx, 32\nor rax, rdx", in("rcx") index,
+               out("rax"), clobber("rdx"))
+}
+
+// STAR[47:32] is what `syscall` loads (kernel code 0x08, stack 0x10),
+// STAR[63:48] what `sysret` loads (0x18 + 8 = user data, 0x18 + 16 =
+// user code). That the base is the unused 32-bit user segment is not a
+// mistake but the architecture -- see the GDT in boot.s.
+fn setup(state: u64) {
+    wrmsr(MSR_STAR, (0x18 << 48) | (0x08 << 32))
+    wrmsr(MSR_LSTAR, vector(state, V_SYSCALL))
+    wrmsr(MSR_SFMASK, 0x200)            // IF off during the system call
+    wrmsr(MSR_EFER, rdmsr(MSR_EFER) | 1)
+}
+
+// ----------------------------------------------------------- the paging
+
+// Makes exactly the 4 KiB page of `addr` reachable for ring 3. `slot`
+// picks one of the two page tables in the data area -- one for the code
+// page, one for the stack page.
+fn map_user(state: u64, addr: u64, writable: bool, slot: u64) -> bool {
+    let cr3: u64 = asm("mov rax, cr3", out("rax")) & ADDR_MASK
+    let i4: u64 = (addr >> 39) & 0x1FF
+    let i3: u64 = (addr >> 30) & 0x1FF
+    let i2: u64 = (addr >> 21) & 0x1FF
+    let i1: u64 = (addr >> 12) & 0x1FF
+
+    // Every level has to allow it, otherwise the bit at the bottom is
+    // worth nothing.
+    let e4: u64 = __mmio_read64((cr3 + i4 * 8) as *mut u64)
+    __mmio_write64((cr3 + i4 * 8) as *mut u64, e4 | PAGE_USER)
+    let pdpt: u64 = e4 & ADDR_MASK
+    let e3: u64 = __mmio_read64((pdpt + i3 * 8) as *mut u64)
+    __mmio_write64((pdpt + i3 * 8) as *mut u64, e3 | PAGE_USER)
+    let pd: u64 = e3 & ADDR_MASK
+
+    let e2: u64 = __mmio_read64((pd + i2 * 8) as *mut u64)
+    var pt: u64 = 0
+    if (e2 & PAGE_HUGE) != 0 {
+        // Still a 2 MiB page: split it into 512 of 4 KiB, all with the
+        // same rights as before -- only the one page gets more.
+        pt = state + kstate.PT_OFF + slot * 4096
+        let base: u64 = e2 & not(0x1FFFFF)
+        var i: u64 = 0
+        while i < 512 {
+            __mmio_write64((pt + i * 8) as *mut u64,
+                           (base + i * 4096) | PAGE_PRESENT | PAGE_WRITE)
+            i = i + 1
+        }
+        // The user bit has to stand at EVERY level -- the leaf below
+        // decides on its own whether the page is really open.
+        var flags2: u64 = PAGE_PRESENT | PAGE_WRITE | PAGE_USER
+        __mmio_write64((pd + i2 * 8) as *mut u64, pt | flags2)
+    } else {
+        pt = e2 & ADDR_MASK
+    }
+    if pt == 0 {
+        return false
+    }
+    var flags: u64 = PAGE_PRESENT | PAGE_USER
+    if writable {
+        flags = flags | PAGE_WRITE
+    }
+    let old: u64 = __mmio_read64((pt + i1 * 8) as *mut u64)
+    __mmio_write64((pt + i1 * 8) as *mut u64, (old & ADDR_MASK) | flags)
+    // The processor caches translations; a changed table without a flush
+    // is a table nobody reads.
+    asm("mov rax, cr3\nmov cr3, rax", out("rax"))
+    return true
+}
+
+// ------------------------------------------------------- the system call
+
+// `KERNEL_SYSCALL` out of isr.s: rdi = number, rsi = argument, rdx = data
+// area. What is returned lands in the user's rax.
+fn handle(number: u64, arg: u64, state: u64) -> u64 {
+    var s_call: [u8; 22] = "ring3: syscall 1 arg \0"
+    var s_exit: [u8; 26] = "ring3: syscall 2, back to\0"
+    var s_ring0: [u8; 8] = " ring 0\0"
+    if number == 1 {
+        serial.puts((&s_call[0]) as u64)
+        serial.dec(arg)
+        serial.nl()
+        // Normally zero. With `ring3fault` on the command line the user
+        // program is told to try `hlt` -- see the counter-check in isr.s.
+        if (kstate.get(state, kstate.MODE) & 2048) != 0 {
+            return 1
+        }
+        return 0
+    }
+    if number == 2 {
+        serial.puts((&s_exit[0]) as u64)
+        serial.puts((&s_ring0[0]) as u64)
+        serial.nl()
+        // Does not return: puts the kernel stack back and returns to
+        // whoever called `enter_user`.
+        asm("call rax", in("rax") vector(state, V_LEAVE), clobber("memory"))
+    }
+    return 0xFFFFFFFFFFFFFFFF
+}
+
+// --------------------------------------------------------- the switch
+
+// Prepares everything and jumps into ring 3. Comes back through
+// `leave_user`, i.e. through the system call with number 2.
+fn run(state: u64) -> bool {
+    var s_go: [u8; 24] = "ring3: entering at rip=\0"
+    var s_stack: [u8; 9] = "  stack=\0"
+    var s_back: [u8; 25] = "ring3: back in ring 0\0\0\0\0"
+    var s_fail: [u8; 26] = "ring3: no page for ring 3\0"
+    setup(state)
+    let rip: u64 = vector(state, V_USER)
+    let stack: u64 = mem.frame_alloc(state)
+    if stack == 0 {
+        return false
+    }
+    if !map_user(state, rip, false, 0) {
+        serial.puts((&s_fail[0]) as u64)
+        return false
+    }
+    if !map_user(state, stack, true, 1) {
+        serial.puts((&s_fail[0]) as u64)
+        return false
+    }
+    serial.puts((&s_go[0]) as u64)
+    serial.hex(rip)
+    serial.puts((&s_stack[0]) as u64)
+    serial.hex(stack)
+    serial.nl()
+    // enter_user(rip, rsp) -- the stack grows downwards, therefore the
+    // upper end of the page, 16-aligned.
+    asm("call rax", in("rax") vector(state, V_ENTER), in("rdi") rip,
+        in("rsi") stack + 4096 - 16, clobber("memory"))
+    serial.puts((&s_back[0]) as u64)
+    serial.nl()
+    mem.frame_free(state, stack)
+    return true
+}
