@@ -181,18 +181,20 @@ fn ex_core(e: &Expr) -> String {
         ExprKind::Bool(b) => format!("(bool {})", b),
         ExprKind::Ident(n) => format!("(id {})", n),
         // Round 58: a closure literal. Its body is a block like any other.
+        // NO serial number in the rendering: `lib/firnc1` numbers the
+        // generated functions differently, and the number says nothing
+        // about the tree.
         ExprKind::Lambda(d) => format!(
-            "(closure {} {} ({}) {} {})",
-            d.id,
+            "(closure {} ({}) {} {})",
             if d.heap { "gc" } else { "plain" },
             d.params
                 .iter()
-                .map(|p| format!("({} {})", p.name, ty(&p.ty)))
+                .map(|p| format!("(param {} {})", p.name, ty(&p.ty)))
                 .collect::<Vec<String>>()
                 .join(" "),
             match &d.ret {
                 Some(t) => ty(t),
-                None => "void".to_string(),
+                None => "-".to_string(),
             },
             blk(&d.body)
         ),

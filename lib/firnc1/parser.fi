@@ -597,6 +597,66 @@ fn ty_args(p: *mut Parser, out: *mut Vec[u32]) -> bool {
 // -------------------------------------------------------------------- types
 
 fn ty(p: *mut Parser) -> u32 {
+    // ROUND 58 (fnval.rs): `fn(T1, T2) -> R`, the type of a function VALUE.
+    // Unambiguous: in a type position the keyword `fn` can mean nothing
+    // else, and a declaration always carries a name after it.
+    if actual(p, A_KWFN) {
+        next_bump(p)
+        if !expect(p, A_LPAREN) {
+            return ast.NOTHING
+        }
+        var par: Vec[u32] = vec_new[u32]()
+        var ok: bool = true
+        if !actual(p, A_RPAREN) {
+            var more: bool = true
+            while more {
+                let pt: u32 = ty(p)
+                if pt == ast.NOTHING {
+                    ok = false
+                    more = false
+                } else {
+                    vec_push[u32](&par, pt)
+                    if actual(p, A_COMMA) {
+                        next_bump(p)
+                        if actual(p, A_RPAREN) {
+                            more = false
+                        }
+                    } else {
+                        more = false
+                    }
+                }
+            }
+        }
+        if !ok {
+            vec_free[u32](&par)
+            return ast.NOTHING
+        }
+        if !expect(p, A_RPAREN) {
+            vec_free[u32](&par)
+            return ast.NOTHING
+        }
+        var ret: u32 = ast.NOTHING
+        if actual(p, A_ARROW) {
+            next_bump(p)
+            ret = ty(p)
+            if ret == ast.NOTHING {
+                vec_free[u32](&par)
+                return ast.NOTHING
+            }
+        }
+        // The parameter types have to lie WITHOUT GAPS in `children`; a
+        // nested function type would otherwise push its own list in
+        // between, which is why they were collected first.
+        let off: u32 = ast.child_start(par_tree(p))
+        var k: usize = 0
+        while k < vec_len[u32](&par) {
+            ast.child_add(par_tree(p), vec_at[u32](&par, k))
+            k = k + 1
+        }
+        let cnt: u64 = vec_len[u32](&par) as u64
+        vec_free[u32](&par)
+        return ast.ty_new(par_tree(p), ast.T_FN, ret, ((off as u64) << 32) | cnt)
+    }
     if actual(p, A_STAR) {
         next_bump(p)
         var m: u64 = 0
@@ -1653,6 +1713,11 @@ fn basic_expr(p: *mut Parser) -> u32 {
         vec_free[u32](&tmp)
         return ast.expr_new(par_tree(p), ast.E_ALIT, 0, off, len, 0)
     }
+    // ROUND 58 (fnval.rs): the closure literal. `fn(` in an expression can
+    // be nothing else -- a DECLARATION always carries a name after `fn`.
+    if a == A_KWFN {
+        return lambda(p, false)
+    }
     if a == A_KWSYSCALL {
         next_bump(p)
         expect(p, A_LPAREN)
@@ -1678,6 +1743,10 @@ fn basic_expr(p: *mut Parser) -> u32 {
             let it3: *mut intern.Interner = lexer.lex_names(lx(p))
             var gw2: [u8; 2] = "gc"
             if intern.intern_equal(it3, nr, (&gw2[0]) as u64, 2) {
+                // ROUND 58: `gc fn(...) { ... }` -- the capturing closure.
+                if actual(p, A_KWFN) {
+                    return lambda(p, true)
+                }
                 if actual(p, A_IDENT) && kind(p, 1) == A_LBRACE {
                     var cw2: [u8; 5] = "class"
                     if !intern.intern_equal(it3, tok_nr(p, 0), (&cw2[0]) as u64, 5) {
@@ -2049,6 +2118,81 @@ fn stmt(p: *mut Parser) -> u32 {
 }
 
 // --------------------------------------------------------------- declarations
+
+// ROUND 58 (fnval.rs) -- the closure literal.
+//
+//   fn(a: i32) -> i32 { ... }        captures nothing, record in .rodata
+//   gc fn(a: i32) -> i32 { ... }     captures, record in the GC heap
+//
+// The body becomes a FUNCTION OF THE TREE straight away (`__closure#N`),
+// whose LAST parameter is the record. That way the type resolution, the
+// lowering and the code generator walk over it like over any other
+// function; only the type check runs the body a second time, in place, and
+// works out from that what is captured.
+fn lambda(p: *mut Parser, heap: bool) -> u32 {
+    let b: *mut ast.Tree = par_tree(p)
+    // The name: `__closure#<number>`. The `#` is no identifier character,
+    // so no source text can ever write it.
+    rt.buf_clear(&(*p).scratch)
+    var cw: [u8; 10] = "__closure#"
+    rt.buf_push_bytes(&(*p).scratch, (&cw[0]) as u64, 10)
+    rt.buf_push_dec_u64(&(*p).scratch, ast.fn_count(b) as u64)
+    let it: *mut intern.Interner = lexer.lex_names(lx(p))
+    let cname: u32 = intern.intern_number(it, rt.buf_ptr(&(*p).scratch),
+                                          rt.buf_len(&(*p).scratch)) as u32
+    next_bump(p)
+    if !expect(p, A_LPAREN) {
+        return ast.expr_new(b, ast.E_INT, 0, 0, 0, 0)
+    }
+    loc_on(p)
+    let poff: u32 = param_list(p)
+    expect(p, A_RPAREN)
+    let plen: u32 = ast.param_start(b) - poff
+    var ret: u32 = ast.NOTHING
+    if actual(p, A_ARROW) {
+        next_bump(p)
+        ret = ty(p)
+        if ret == ast.NOTHING {
+            loc_off(p)
+            return ast.expr_new(b, ast.E_INT, 0, 0, 0, 0)
+        }
+    }
+    if !actual(p, A_LBRACE) {
+        complain(p)
+        loc_off(p)
+        return ast.expr_new(b, ast.E_INT, 0, 0, 0, 0)
+    }
+    // The record arrives as the LAST parameter, typed `*mut u8`. It has to
+    // sit directly behind the closure parameters -- they lie contiguously
+    // in `pa_*`, and the body is parsed only afterwards.
+    var uw: [u8; 2] = "u8"
+    let unr: u32 = intern.intern_number(it, (&uw[0]) as u64, 2) as u32
+    let uty: u32 = ast.ty_new(b, ast.T_NAME, unr, 0)
+    let pty: u32 = ast.ty_new(b, ast.T_PTR, uty, 1)
+    rt.buf_clear(&(*p).scratch)
+    var ew: [u8; 6] = "__env#"
+    rt.buf_push_bytes(&(*p).scratch, (&ew[0]) as u64, 6)
+    let ename: u32 = intern.intern_number(it, rt.buf_ptr(&(*p).scratch),
+                                          rt.buf_len(&(*p).scratch)) as u32
+    ast.param_add(b, ename, pty)
+    loc_add(p, ename)
+    // The body: a struct literal state of the surrounding condition must
+    // not reach into it.
+    let saved: usize = (*p).no_slit
+    (*p).no_slit = 0
+    let body: u32 = block(p)
+    (*p).no_slit = saved
+    loc_off(p)
+    ast.fn_add(b, cname, poff, plen + 1, ret, body, 0, 0, 0)
+    var packed: u64 = 0
+    if ret != ast.NOTHING {
+        packed = (ret as u64 + 1) << 1
+    }
+    if heap {
+        packed = packed | 1
+    }
+    return ast.expr_new(b, ast.E_LAMBDA, cname, poff, plen, packed)
+}
 
 fn param_list(p: *mut Parser) -> u32 {
     let off: u32 = vec_len[u32](&(*par_tree(p)).pa_name) as u32

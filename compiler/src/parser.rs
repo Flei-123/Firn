@@ -1932,6 +1932,7 @@ mod tests {
             ExprKind::Float(bits) => format!("{}", f64::from_bits(*bits)),
             ExprKind::Bool(b) => format!("{}", b),
             ExprKind::Ident(n) => n.clone(),
+            ExprKind::Lambda(d) => format!("fn#{}", d.id),
             ExprKind::Unary(op, a) => format!(
                 "({}{})",
                 match op {
