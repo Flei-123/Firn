@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Proof of the RESULT-LOCATION GUARANTEE (SPEC.md 13.1, DESIGNZIELE.md 6).
+# Proof of the RESULT-LOCATION GUARANTEE (SPEC.md 13.1, DESIGN_GOALS.md 6).
 #
 # Claim: with `let g = build(...)` and an aggregate return type the
 # target address is passed through. The structure comes into being EXACTLY ONCE in the
@@ -22,7 +22,7 @@ MB=1048576
 "$FIRNC" --emit=asm -o "$ASM" "$SRC"
 
 # Linker symbol: 'main' keeps its bare name, everything else carries the
-# scheme from modules.rs (_F<scheme>.<name>, DESIGNZIELE 4).
+# scheme from modules.rs (_F<scheme>.<name>, DESIGN_GOALS 4).
 frame() {   # $1 = function name -> the number of bytes from 'sub rsp, N'
     awk -v n="$1" '
         $0 == n":" || $0 ~ "^_F[0-9]+\\." n ":" { inf = 1; next }

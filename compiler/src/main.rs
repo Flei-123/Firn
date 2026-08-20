@@ -82,7 +82,7 @@ struct Options {
     optimize: bool,
     keep_asm: bool,
     stats: bool,
-    /// Build level and passes switched off one by one (DESIGNZIELE.md §5)
+    /// Build level and passes switched off one by one (DESIGN_GOALS.md §5)
     optcfg: opt::OptConfig,
     /// `-c` / `--object`: only assemble, do NOT link (round 52).
     /// Always on under the `kernel` profile anyway (SPEC §2: target is ELF object code).

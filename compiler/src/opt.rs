@@ -60,13 +60,13 @@ pub struct OptStats {
 
 // ----------------------------------------------------- Pass register ---
 //
-// DESIGNZIELE.md §5 and §10.4 point 4: every optimization pass has a LABEL,
+// DESIGN_GOALS.md §5 and §10.4 point 4: every optimization pass has a LABEL,
 // a SWITCH and a TAG `debug preserving yes/no`. Only that way can the build
 // level `--dev-fast` (fast, yet debuggable) be built later without touching
 // every pass. The register is the single truth about which passes exist —
 // `--list-passes` prints it.
 
-/// Build level. `DevFast` is the default (DESIGNZIELE.md §5).
+/// Build level. `DevFast` is the default (DESIGN_GOALS.md §5).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Level {
     /// no optimization at all (`--no-opt`) — for compiler troubleshooting only

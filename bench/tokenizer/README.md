@@ -52,7 +52,7 @@ On the second corpus (`realweb`, real pages) the distance is **larger**:
 three runs on 14.08.2026 gave 5.72x / 7.72x / 7.84x (Firn 5.5-7.4 MB/s
 against html5ever 42-45 MB/s). Long runs of text are html5ever's best case,
 while the Firn tokenizer still works code point by code point and
-additionally writes the html5lib JSON. The numbers are in ABNAHME.md
+additionally writes the html5lib JSON. The numbers are in ACCEPTANCE.md
 item 3.
 
 ## What is compared -- and what is not

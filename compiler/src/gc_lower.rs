@@ -5,7 +5,7 @@
 //!  * `gc C{ … }` — call of the runtime (`__gc_alloc_raw`), after that build
 //!    the error union `AllocError!Gc[C]` and write the fields. The
 //!    collection run sits inside `__gc_alloc_raw`: **collect first, then
-//!    `AllocError::OutOfMemory`** (DESIGNZIELE §2).
+//!    `AllocError::OutOfMemory`** (DESIGN_GOALS §2).
 //!  * `weak(g)`, `strong(w)`, `x.as?[C]` — calls of the runtime.
 //!  * `__gc_state()` / `__gc_save_regs()` — the two compiler intrinsics.
 //!    `Op::GcAddr` yields the address of the state block; with `regs = true`

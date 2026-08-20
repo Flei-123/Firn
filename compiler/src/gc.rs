@@ -91,7 +91,7 @@ pub(crate) const FN_AS: &str = "__gc_as_raw";
 pub(crate) const FN_ALLOC: &str = "__gc_alloc_raw";
 /// Insertion barrier when writing a Gc pointer into the heap.
 pub(crate) const FN_BARRIER: &str = "__gc_barrier";
-/// Error set of the fallible allocation (DESIGNZIELE §2).
+/// Error set of the fallible allocation (DESIGN_GOALS §2).
 pub(crate) const ERR_SET: &str = "AllocError";
 /// **Round 47** — dispatcher of the finalizers (`SPEC` §3.5.3 `S4`).
 ///
@@ -901,7 +901,7 @@ fn check_new(
     Some(u)
 }
 
-/// `AllocError!T` — the fallible allocation (DESIGNZIELE §2).
+/// `AllocError!T` — the fallible allocation (DESIGN_GOALS §2).
 fn alloc_union(ck: &mut Checker, val: Type, span: Span) -> Type {
     match crate::errors::union_type(ck, ERR_SET, &val) {
         Some(t) => t,
