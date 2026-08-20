@@ -65,8 +65,13 @@ def kommentarzeilen(pfad):
     return aus
 
 
+# Was in Rueckwaertsstrichen steht, ist Code oder ein zitierter Bezeichner --
+# keine Prosa. `erst` in einem Satz ueber alte Namen ist kein deutscher Satz.
+CODESPAN = re.compile(r'`[^`]*`')
+
+
 def deutsch(zeilen):
-    return [(i, z) for i, z in zeilen if RE_WORT.search(z)]
+    return [(i, z) for i, z in zeilen if RE_WORT.search(CODESPAN.sub(' ', z))]
 
 
 def bereich(pfad):
