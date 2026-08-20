@@ -10,6 +10,13 @@
 //!  7 |     let x = add(1, 2 ;
 //!    |                      ^ here
 //! ```
+//!
+//! Round 64 adds a third line under the marker: `= help: …` — the
+//! SUGGESTION. `note` explains why something is wrong, `help` says what to
+//! write instead. Both texts are optional and are rendered in that order.
+//! The counterpart in Firn is `lib/firnc1/diag.fi`; the two renderings have
+//! to be identical octet for octet, and `tools/lex_compare.sh` checks
+//! exactly that over the whole corpus.
 
 /// Source position. `line`/`col` are 1-based, `col` and `len` count
 /// CHARACTERS (not bytes), so that the marker sits right under UTF-8.
@@ -61,6 +68,8 @@ pub struct Diag {
     pub span: Span,
     pub label: String,
     pub note: Option<String>,
+    /// Round 64: the suggestion, rendered as `= help: …`.
+    pub help: Option<String>,
 }
 
 /// One source file of the source map.
@@ -133,6 +142,7 @@ impl Diags {
             span,
             label: "here".to_string(),
             note: None,
+            help: None,
         });
     }
 
@@ -143,7 +153,29 @@ impl Diags {
             span,
             label: "here".to_string(),
             note: Some(note.into()),
+            help: None,
         });
+    }
+
+    /// Round 64: error plus a SUGGESTION ("help: ..."). `note` says why
+    /// something is wrong, `help` says what to write instead.
+    pub fn error_help(&mut self, span: Span, msg: impl Into<String>, help: impl Into<String>) {
+        self.push(Diag {
+            msg: msg.into(),
+            span,
+            label: "here".to_string(),
+            note: None,
+            help: Some(help.into()),
+        });
+    }
+
+    /// Round 64: error with a suggestion, if there is one -- otherwise a
+    /// plain error. Saves the `match` at every call site.
+    pub fn error_maybe_help(&mut self, span: Span, msg: impl Into<String>, help: Option<String>) {
+        match help {
+            Some(h) => self.error_help(span, msg, h),
+            None => self.error(span, msg),
+        }
     }
 
     /// Takes up a diagnostic built elsewhere (e.g. from module resolution).
@@ -210,6 +242,9 @@ impl Diags {
             if let Some(n) = &d.note {
                 out.push_str(&format!("  note: {}\n", n));
             }
+            if let Some(h) = &d.help {
+                out.push_str(&format!("  help: {}\n", h));
+            }
             return out;
         }
         let nstr = d.span.line.to_string();
@@ -242,6 +277,9 @@ impl Diags {
         if let Some(n) = &d.note {
             out.push_str(&format!("{} = note: {}\n", pad, n));
         }
+        if let Some(h) = &d.help {
+            out.push_str(&format!("{} = help: {}\n", pad, h));
+        }
         out
     }
 
@@ -251,4 +289,79 @@ impl Diags {
             eprint!("{}", self.render());
         }
     }
+}
+
+// ------------------------------------------------------------- suggestions
+//
+// Round 64. A typo in a name is the most common mistake there is, and the
+// compiler knows the right names -- it only has to say them. `nearest`
+// picks out of a set of candidates the one that is closest to the wrong
+// name, if it is close enough at all.
+//
+// THE YARDSTICK is the Levenshtein distance (insert, delete, replace, one
+// step each). A candidate counts as a suggestion when the distance is at
+// most a THIRD of the length of the wrong name, but at least 1 and at most
+// 3. Without that upper bound `x` would suggest every other one-letter name
+// and the message would become noise.
+//
+// The twin in Firn is `lib/firnc1/diag.fi::diag_nearest`; both have to
+// choose the same name, otherwise the two compilers would say different
+// things.
+pub fn distance(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let mut line: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut before = line[0];
+        line[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let replace = before + usize::from(ca != cb);
+            before = line[j + 1];
+            line[j + 1] = replace.min(line[j] + 1).min(line[j + 1] + 1);
+        }
+    }
+    line[b.len()]
+}
+
+/// The largest distance that still counts as a typo for `name`.
+pub fn tolerance(name: &str) -> usize {
+    let n = name.chars().count();
+    let t = n / 3;
+    if t < 1 {
+        1
+    } else if t > 3 {
+        3
+    } else {
+        t
+    }
+}
+
+/// The candidate closest to `name`, or `None`. Ties go to the one that
+/// comes first alphabetically, so that the answer does not depend on the
+/// order of a hash table.
+pub fn nearest<'a, I: IntoIterator<Item = &'a str>>(name: &str, candidates: I) -> Option<String> {
+    let limit = tolerance(name);
+    let mut best: Option<(usize, String)> = None;
+    for c in candidates {
+        if c == name {
+            continue;
+        }
+        let d = distance(name, c);
+        if d > limit {
+            continue;
+        }
+        let better = match &best {
+            None => true,
+            Some((bd, bn)) => d < *bd || (d == *bd && c < bn.as_str()),
+        };
+        if better {
+            best = Some((d, c.to_string()));
+        }
+    }
+    best.map(|(_, n)| n)
+}
+
+/// `did you mean 'x'?` -- the wording of a suggestion, in ONE place, so that
+/// both compilers cannot drift apart.
+pub fn did_you_mean(name: &str) -> String {
+    format!("did you mean '{}'?", name)
 }
