@@ -543,7 +543,7 @@ pub(crate) fn lower_closure(
             None => return lo.ice(span, "captured value with a non-scalar type"),
         };
         let v = lo.load(ft, slot);
-        let a = lo.ptradd_const(p, cap.off);
+        let a = lo.field_addr_at(p, cap.off);
         lo.store(ft, a, v);
     }
     lo.set_term(Term::Br(join));
