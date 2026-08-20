@@ -2327,3 +2327,79 @@ operand per `asm` (`rdmsr` puts edx:eax together inside the template), no
 function pointers (an address is called with `asm("call rax", ...)`), no
 `~`, and no line continuation. None of that stopped the kernel; all of it
 is worth a round of its own.
+
+## 45. Rounds 58, 59 and 60: functions as values, a kernel that runs, CSS
+
+Three rounds in parallel, separated territories, reserved number ranges
+(opcodes 50-59 / 60-69, slots 2200-2299 / 2300-2399, test numbers
+870-889 / 890-899 / 910-939). The only conflict was in `test.sh`, where
+round 58 and round 59 hung their section into the same place; both were
+kept.
+
+### Round 58: functions become values
+
+`Type::Fn` was missing from `compiler/src/types.rs` — until now a
+function was not a value. Now there are function pointers with strict
+typing, closures that capture their environment, and the applications
+that go with them (`vec.sort` with its own comparison, callbacks).
+
+The dangerous part is the collector: a captured value the collector does
+not see as a root gets swept while the closure is still using it.
+`tests/873_closure_gc_root.fi` proves it does not happen. The second
+claim is about the emitted code and is therefore measured on the emitted
+code: `tools/fnval/run.sh` shows that a call which is statically known
+stays a **direct** call, that there is exactly one `call rax` per
+function value, and that the function record only appears where a
+function value is actually used — in both compilers, with counter-checks.
+
+### Round 59: the kernel really runs
+
+The freestanding profile from round 52 got its purpose: IDT with real
+exceptions (#DE, #PF, #GP, #DF) that print error code, CR2 and the
+register set over the serial line, a tick counter driven by the timer, a
+physical frame allocator plus a kernel heap out of the multiboot memory
+map, keys over IRQ1, and the way into ring 3 and back over `syscall`.
+
+None of that is claimed, it is measured: `tools/kernel/run.sh` boots
+`demos/kernel/kmain.fi` in QEMU, once per case with a time limit, and
+holds the serial output and the exit code against expectations —
+**46 cases, 0 failed**, hanging as section 22 in `test.sh`. The
+counter-checks are the interesting half: a masked IRQ0 counts zero ticks,
+without keys nothing appears, and `hlt` in the user program yields a #GP
+with `cs=0x2b`, which is the proof that the processor really was in ring
+3.
+
+The trap from round 52 was named in the assignment this time: line 2 of
+`.gitignore` swallows `*.s`. `boot.s` and `isr.s` carry their own
+exception lines and are under version control.
+
+### Round 60: CSS
+
+Syntax after css-syntax-3, selectors after selectors-4 with a matcher
+that works from right to left the way the engines do, cascade with
+specificity, origin, `!important` and inheritance. Measured against
+**foreign** data, not against its own: **305/305** of the official
+`css-parsing-tests`, **109/109** own cases for cascade and error
+tolerance, and **840/840** match sets against `cssselect2` on the real
+pages, specificities included. The soak run creates 9 095 801 GC objects
+over 14 600 rounds and ends with **8 KiB** RSS growth.
+
+The compiler was off limits for this round; language gaps were written
+down instead of fixed. Throughput per page of `testdata/realweb/`:
+66 409 instructions per element, measured with callgrind, because the
+wall clock scatters by more than ten percent here.
+
+### Acceptance in the main repository, measured by hand
+
+`test.sh` **905/905** (from 847), self-comparison **246 same / 0
+differing / 0 faulty**, fixpoint character-identical (**568 341 lines**,
+3 342 224 octets in stage 2 as in stage 3), `CODEGEN MISSING: 0`,
+tokenizer **6810/6810**, tree construction **150/150**, CSS **305/305 +
+109/109 + 840/840**, KERNEL **46/46**, FREESTANDING **41/41**, PACKAGES
+**21/21**, THREADS passed, and all five counter-checks of the English
+migration at zero.
+
+One more yardstick correction, the third of its kind: `also` stood in the
+list of German function words and reported two entirely English sentences
+of `docs/ROUND59.md` as German. A word that exists in both languages does
+not belong in that list.
