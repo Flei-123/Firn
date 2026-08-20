@@ -1,0 +1,1354 @@
+// lib/css/cascade.fi -- CASCADE, INHERITANCE and the COMPUTED STYLE per node.
+//
+// This is the step that turns a parsed stylesheet plus a DOM into what
+// layout needs: one set of computed properties per element. Three things
+// happen here, and all three are the ones engines get wrong first:
+//
+//  1. THE CASCADE ORDER (css-cascade-4 6.4.1). Sorted by, in this order:
+//       origin and importance -- user agent < user < author
+//                                < author !important < user !important
+//                                < user agent !important
+//       specificity of the selector that matched
+//       order of appearance
+//     The reversal of the origins for `!important` is the point that makes
+//     a user stylesheet usable at all; it is implemented here and checked
+//     in tests/916.
+//  2. INHERITANCE. `color` and `font-size` are inherited, the box
+//     properties are not. `inherit` and `initial` work on every property.
+//  3. COMPUTED VALUES. `em` refers to the font size OF THE ELEMENT,
+//     percentages of `font-size` to the one of the PARENT. So the font
+//     size has to be computed first -- everything else builds on it.
+//
+// THE SET OF PROPERTIES is deliberately small and honest: display, color,
+// font-size, the four margins, the four paddings and the border in width,
+// style and colour. Rather few properties right than many half done. What
+// is missing is named in docs/ROUND60.md.
+import html.mem
+import browser.node
+import browser.names
+import css.tok
+import css.cv
+import css.sel
+
+export {
+    Rule, Decl, Style,
+    P_DISPLAY, P_COLOR, P_FONT_SIZE,
+    P_MARGIN_TOP, P_MARGIN_RIGHT, P_MARGIN_BOTTOM, P_MARGIN_LEFT,
+    P_PADDING_TOP, P_PADDING_RIGHT, P_PADDING_BOTTOM, P_PADDING_LEFT,
+    P_BORDER_TOP_WIDTH, P_BORDER_RIGHT_WIDTH, P_BORDER_BOTTOM_WIDTH,
+    P_BORDER_LEFT_WIDTH,
+    P_BORDER_TOP_STYLE, P_BORDER_RIGHT_STYLE, P_BORDER_BOTTOM_STYLE,
+    P_BORDER_LEFT_STYLE,
+    P_BORDER_TOP_COLOR, P_BORDER_RIGHT_COLOR, P_BORDER_BOTTOM_COLOR,
+    P_BORDER_LEFT_COLOR,
+    P_COUNT,
+    U_PX, U_PERCENT, U_AUTO,
+    D_INLINE, D_BLOCK, D_INLINE_BLOCK, D_NONE, D_LIST_ITEM, D_FLEX,
+    D_INLINE_FLEX, D_GRID, D_TABLE, D_TABLE_ROW, D_TABLE_CELL, D_INLINE_TABLE,
+    BS_NONE, BS_HIDDEN, BS_DOTTED, BS_DASHED, BS_SOLID, BS_DOUBLE,
+    BS_GROOVE, BS_RIDGE, BS_INSET, BS_OUTSET,
+    ORIGIN_UA, ORIGIN_USER, ORIGIN_AUTHOR,
+    DECL_IMPORTANT,
+    collect_rules, rules_count,
+    style_new, style_initial, style_root,
+    Winner, winner_new, cascade_element,
+    style_length, style_unit, style_color, style_border_style,
+    style_display, style_font_size,
+}
+
+// ------------------------------------------------------------- Properties
+
+const P_DISPLAY: u32 = 0
+const P_COLOR: u32 = 1
+const P_FONT_SIZE: u32 = 2
+const P_MARGIN_TOP: u32 = 3
+const P_MARGIN_RIGHT: u32 = 4
+const P_MARGIN_BOTTOM: u32 = 5
+const P_MARGIN_LEFT: u32 = 6
+const P_PADDING_TOP: u32 = 7
+const P_PADDING_RIGHT: u32 = 8
+const P_PADDING_BOTTOM: u32 = 9
+const P_PADDING_LEFT: u32 = 10
+const P_BORDER_TOP_WIDTH: u32 = 11
+const P_BORDER_RIGHT_WIDTH: u32 = 12
+const P_BORDER_BOTTOM_WIDTH: u32 = 13
+const P_BORDER_LEFT_WIDTH: u32 = 14
+const P_BORDER_TOP_STYLE: u32 = 15
+const P_BORDER_RIGHT_STYLE: u32 = 16
+const P_BORDER_BOTTOM_STYLE: u32 = 17
+const P_BORDER_LEFT_STYLE: u32 = 18
+const P_BORDER_TOP_COLOR: u32 = 19
+const P_BORDER_RIGHT_COLOR: u32 = 20
+const P_BORDER_BOTTOM_COLOR: u32 = 21
+const P_BORDER_LEFT_COLOR: u32 = 22
+const P_COUNT: u32 = 23
+const P_NONE: u32 = 99
+
+// The units of a computed length.
+const U_PX: u32 = 0
+const U_PERCENT: u32 = 1
+const U_AUTO: u32 = 2
+
+// display
+const D_INLINE: u32 = 0
+const D_BLOCK: u32 = 1
+const D_INLINE_BLOCK: u32 = 2
+const D_NONE: u32 = 3
+const D_LIST_ITEM: u32 = 4
+const D_FLEX: u32 = 5
+const D_INLINE_FLEX: u32 = 6
+const D_GRID: u32 = 7
+const D_TABLE: u32 = 8
+const D_TABLE_ROW: u32 = 9
+const D_TABLE_CELL: u32 = 10
+const D_INLINE_TABLE: u32 = 11
+
+// border-style
+const BS_NONE: u32 = 0
+const BS_HIDDEN: u32 = 1
+const BS_DOTTED: u32 = 2
+const BS_DASHED: u32 = 3
+const BS_SOLID: u32 = 4
+const BS_DOUBLE: u32 = 5
+const BS_GROOVE: u32 = 6
+const BS_RIDGE: u32 = 7
+const BS_INSET: u32 = 8
+const BS_OUTSET: u32 = 9
+
+// The origins. The order matters -- see origin_level.
+const ORIGIN_UA: u32 = 0
+const ORIGIN_USER: u32 = 1
+const ORIGIN_AUTHOR: u32 = 2
+
+const DECL_IMPORTANT: u32 = 1
+
+// The two keywords that work on every property.
+const V_NORMAL: u32 = 0
+const V_INHERIT: u32 = 1
+const V_INITIAL: u32 = 2
+
+// ------------------------------------------------------------ The classes
+
+gc class Decl {
+    value: Gc[Cv],
+    prop: u32,
+    flags: u32,
+}
+
+gc class Rule {
+    sel: Gc[Sel],
+    decls: GcVec[Gc[Decl]],
+    next: Gc[Rule],
+    origin: u32,
+    order: u32,
+}
+
+// The computed style of one element. The lengths lie in one array:
+// 0..3 margin, 4..7 padding, 8..11 border width -- exactly `prop - 3`.
+gc class Style {
+    length: [f64; 12],
+    unit: [u32; 12],
+    color: [u32; 5],
+    bstyle: [u32; 4],
+    font_size: f64,
+    display: u32,
+}
+
+fn style_new() -> AllocError!Gc[Style] {
+    return try gc Style{
+        length: [0.0; 12],
+        unit: [0; 12],
+        color: [0; 5],
+        bstyle: [0; 4],
+        font_size: 16.0,
+        display: D_INLINE,
+    }
+}
+
+// The initial values: everything zero, colour black, font size 16 px.
+fn style_initial() -> AllocError!Gc[Style] {
+    let s = try style_new()
+    var i: usize = 0
+    while i < 12 {
+        s.length[i] = 0.0
+        s.unit[i] = U_PX
+        i = i + 1
+    }
+    var c: usize = 0
+    while c < 5 {
+        s.color[c] = 0xFF000000
+        c = c + 1
+    }
+    var b: usize = 0
+    while b < 4 {
+        s.bstyle[b] = BS_NONE
+        b = b + 1
+    }
+    s.font_size = 16.0
+    s.display = D_INLINE
+    return s
+}
+
+fn style_root() -> AllocError!Gc[Style] {
+    return try style_initial()
+}
+
+fn style_length(s: Gc[Style], slot: usize) -> f64 {
+    return s.length[slot]
+}
+
+fn style_unit(s: Gc[Style], slot: usize) -> u32 {
+    return s.unit[slot]
+}
+
+fn style_color(s: Gc[Style], slot: usize) -> u32 {
+    return s.color[slot]
+}
+
+fn style_border_style(s: Gc[Style], slot: usize) -> u32 {
+    return s.bstyle[slot]
+}
+
+fn style_display(s: Gc[Style]) -> u32 {
+    return s.display
+}
+
+fn style_font_size(s: Gc[Style]) -> f64 {
+    return s.font_size
+}
+
+// ------------------------------------------------- Property names -> ids
+
+fn property_id(name: Gc[Chain]) -> u32 {
+    var p1: [u8; 7] = "display"
+    if node.chain_equal_ascii_small(name, &p1[0], 7) { return P_DISPLAY }
+    var p2: [u8; 5] = "color"
+    if node.chain_equal_ascii_small(name, &p2[0], 5) { return P_COLOR }
+    var p3: [u8; 9] = "font-size"
+    if node.chain_equal_ascii_small(name, &p3[0], 9) { return P_FONT_SIZE }
+    var p4: [u8; 10] = "margin-top"
+    if node.chain_equal_ascii_small(name, &p4[0], 10) { return P_MARGIN_TOP }
+    var p5: [u8; 12] = "margin-right"
+    if node.chain_equal_ascii_small(name, &p5[0], 12) { return P_MARGIN_RIGHT }
+    var p6: [u8; 13] = "margin-bottom"
+    if node.chain_equal_ascii_small(name, &p6[0], 13) { return P_MARGIN_BOTTOM }
+    var p7: [u8; 11] = "margin-left"
+    if node.chain_equal_ascii_small(name, &p7[0], 11) { return P_MARGIN_LEFT }
+    var p8: [u8; 11] = "padding-top"
+    if node.chain_equal_ascii_small(name, &p8[0], 11) { return P_PADDING_TOP }
+    var p9: [u8; 13] = "padding-right"
+    if node.chain_equal_ascii_small(name, &p9[0], 13) { return P_PADDING_RIGHT }
+    var p10: [u8; 14] = "padding-bottom"
+    if node.chain_equal_ascii_small(name, &p10[0], 14) { return P_PADDING_BOTTOM }
+    var p11: [u8; 12] = "padding-left"
+    if node.chain_equal_ascii_small(name, &p11[0], 12) { return P_PADDING_LEFT }
+    var p12: [u8; 16] = "border-top-width"
+    if node.chain_equal_ascii_small(name, &p12[0], 16) { return P_BORDER_TOP_WIDTH }
+    var p13: [u8; 18] = "border-right-width"
+    if node.chain_equal_ascii_small(name, &p13[0], 18) { return P_BORDER_RIGHT_WIDTH }
+    var p14: [u8; 19] = "border-bottom-width"
+    if node.chain_equal_ascii_small(name, &p14[0], 19) { return P_BORDER_BOTTOM_WIDTH }
+    var p15: [u8; 17] = "border-left-width"
+    if node.chain_equal_ascii_small(name, &p15[0], 17) { return P_BORDER_LEFT_WIDTH }
+    var p16: [u8; 16] = "border-top-style"
+    if node.chain_equal_ascii_small(name, &p16[0], 16) { return P_BORDER_TOP_STYLE }
+    var p17: [u8; 18] = "border-right-style"
+    if node.chain_equal_ascii_small(name, &p17[0], 18) { return P_BORDER_RIGHT_STYLE }
+    var p18: [u8; 19] = "border-bottom-style"
+    if node.chain_equal_ascii_small(name, &p18[0], 19) { return P_BORDER_BOTTOM_STYLE }
+    var p19: [u8; 17] = "border-left-style"
+    if node.chain_equal_ascii_small(name, &p19[0], 17) { return P_BORDER_LEFT_STYLE }
+    var p20: [u8; 16] = "border-top-color"
+    if node.chain_equal_ascii_small(name, &p20[0], 16) { return P_BORDER_TOP_COLOR }
+    var p21: [u8; 18] = "border-right-color"
+    if node.chain_equal_ascii_small(name, &p21[0], 18) { return P_BORDER_RIGHT_COLOR }
+    var p22: [u8; 19] = "border-bottom-color"
+    if node.chain_equal_ascii_small(name, &p22[0], 19) { return P_BORDER_BOTTOM_COLOR }
+    var p23: [u8; 17] = "border-left-color"
+    if node.chain_equal_ascii_small(name, &p23[0], 17) { return P_BORDER_LEFT_COLOR }
+    return P_NONE
+}
+
+// The shorthands. Returns the number of longhands (0 = not a shorthand)
+// and the first property id of the group.
+fn shorthand_group(name: Gc[Chain]) -> u32 {
+    var s1: [u8; 6] = "margin"
+    if node.chain_equal_ascii_small(name, &s1[0], 6) { return P_MARGIN_TOP }
+    var s2: [u8; 7] = "padding"
+    if node.chain_equal_ascii_small(name, &s2[0], 7) { return P_PADDING_TOP }
+    var s3: [u8; 12] = "border-width"
+    if node.chain_equal_ascii_small(name, &s3[0], 12) { return P_BORDER_TOP_WIDTH }
+    var s4: [u8; 12] = "border-style"
+    if node.chain_equal_ascii_small(name, &s4[0], 12) { return P_BORDER_TOP_STYLE }
+    var s5: [u8; 12] = "border-color"
+    if node.chain_equal_ascii_small(name, &s5[0], 12) { return P_BORDER_TOP_COLOR }
+    return P_NONE
+}
+
+fn is_border_shorthand(name: Gc[Chain]) -> bool {
+    var s: [u8; 6] = "border"
+    return node.chain_equal_ascii_small(name, &s[0], 6)
+}
+
+// ----------------------------------------------------- Declarations of a block
+
+fn decl_new(prop: u32, value: Gc[Cv], flags: u32) -> AllocError!Gc[Decl] {
+    return try gc Decl{
+        value: value,
+        prop: prop,
+        flags: flags,
+    }
+}
+
+fn decls_append(v: Gc[GcVec], d: Gc[Decl]) -> AllocError!bool {
+    return try gcvec_append[Decl](v, d)
+}
+
+// A value list with exactly one component value.
+fn single_value(v: Gc[Cv]) -> AllocError!Gc[Cv] {
+    let l = try cv.cv_new(cv.CV_LIST)
+    let ok: bool = try cv.cv_append(l, v)
+    return l
+}
+
+fn non_ws_count(list: Gc[Cv]) -> u64 {
+    var n: u64 = 0
+    var i: u64 = 0
+    while i < cv.cv_kids_count(list) {
+        if cv.cv_kid(list, i).kind != tok.T_WHITESPACE {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+fn non_ws_at(list: Gc[Cv], k: u64) -> Gc[Cv] {
+    var n: u64 = 0
+    var i: u64 = 0
+    while i < cv.cv_kids_count(list) {
+        let c: Gc[Cv] = cv.cv_kid(list, i)
+        if c.kind != tok.T_WHITESPACE {
+            if n == k {
+                return c
+            }
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return gc_null[Cv]()
+}
+
+// The 1-to-4 value rule of the box shorthands.
+fn box_index(count: u64, side: u64) -> u64 {
+    if count == 1 {
+        return 0
+    }
+    if count == 2 {
+        if side == 0 || side == 2 {
+            return 0
+        }
+        return 1
+    }
+    if count == 3 {
+        if side == 0 {
+            return 0
+        }
+        if side == 2 {
+            return 2
+        }
+        return 1
+    }
+    return side
+}
+
+// Appends the declarations of ONE parsed declaration to the vector.
+// A shorthand becomes several longhands here -- out of `margin: 1px 2px`
+// come four declarations, and only those take part in the cascade. That is
+// the reason a later `margin-left` beats an earlier `margin`.
+fn append_declaration(name: Gc[Chain], value: Gc[Cv], important: bool,
+                      out: Gc[GcVec]) -> AllocError!bool {
+    var flags: u32 = 0
+    if important {
+        flags = DECL_IMPORTANT
+    }
+    let direct: u32 = property_id(name)
+    if direct != P_NONE {
+        let d = try decl_new(direct, value, flags)
+        return try decls_append(out, d)
+    }
+    let group: u32 = shorthand_group(name)
+    if group != P_NONE {
+        let count: u64 = non_ws_count(value)
+        if count < 1 || count > 4 {
+            return false
+        }
+        var side: u64 = 0
+        while side < 4 {
+            let v: Gc[Cv] = non_ws_at(value, box_index(count, side))
+            let one = try single_value(v)
+            let d = try decl_new(group + side as u32, one, flags)
+            let ok: bool = try decls_append(out, d)
+            side = side + 1
+        }
+        return true
+    }
+    if is_border_shorthand(name) {
+        // `border: 1px solid red`, in any order.
+        let count: u64 = non_ws_count(value)
+        if count < 1 || count > 3 {
+            return false
+        }
+        var i: u64 = 0
+        while i < count {
+            let v: Gc[Cv] = non_ws_at(value, i)
+            let one = try single_value(v)
+            var group2: u32 = P_NONE
+            var w: f64 = 0.0
+            var u: u32 = U_PX
+            var col: u32 = 0
+            if value_border_style(v) != BS_NONE || is_ident_none(v) {
+                group2 = P_BORDER_TOP_STYLE
+            } else if parse_color_value(v, &col) {
+                group2 = P_BORDER_TOP_COLOR
+            } else if parse_border_width(v, &w, &u) {
+                group2 = P_BORDER_TOP_WIDTH
+            }
+            if group2 != P_NONE {
+                var side2: u64 = 0
+                while side2 < 4 {
+                    let d = try decl_new(group2 + side2 as u32, one, flags)
+                    let ok2: bool = try decls_append(out, d)
+                    side2 = side2 + 1
+                }
+            }
+            i = i + 1
+        }
+        return true
+    }
+    return false
+}
+
+// Parses the content of a `{}` block (component values) as declarations.
+// Deliberately not through lib/css/cv.fi once more: the block already IS a
+// list of component values -- nested blocks are resolved, so the only work
+// left is splitting at the semicolons.
+fn parse_block_declarations(block: Gc[Cv]) -> AllocError!Gc[GcVec] {
+    let out = try gcvec_new()
+    let n: u64 = cv.cv_kids_count(block)
+    var i: u64 = 0
+    while i < n {
+        let c: Gc[Cv] = cv.cv_kid(block, i)
+        if c.kind == tok.T_WHITESPACE || c.kind == tok.T_SEMICOLON {
+            i = i + 1
+        } else if c.kind == tok.T_AT_KEYWORD {
+            // An at-rule inside a style block is skipped up to the `;`.
+            while i < n && cv.cv_kid(block, i).kind != tok.T_SEMICOLON {
+                i = i + 1
+            }
+        } else {
+            var name: Gc[Chain] = gc_null[Chain]()
+            var good: bool = false
+            if c.kind == tok.T_IDENT {
+                name = c.text
+                i = i + 1
+                while i < n && cv.cv_kid(block, i).kind == tok.T_WHITESPACE {
+                    i = i + 1
+                }
+                if i < n && cv.cv_kid(block, i).kind == tok.T_COLON {
+                    i = i + 1
+                    good = true
+                }
+            }
+            let value = try cv.cv_new(cv.CV_LIST)
+            var state: u32 = 0
+            var bang: u64 = 0
+            while i < n && cv.cv_kid(block, i).kind != tok.T_SEMICOLON {
+                let v: Gc[Cv] = cv.cv_kid(block, i)
+                if state == 0 as u32 && is_bang_delim(v) {
+                    state = 1
+                    bang = cv.cv_kids_count(value)
+                } else if state == 1 as u32 && is_important_word(v) {
+                    state = 2
+                } else if v.kind != tok.T_WHITESPACE {
+                    state = 0
+                }
+                let ok: bool = try cv.cv_append(value, v)
+                i = i + 1
+            }
+            if i < n {
+                i = i + 1      // the semicolon
+            }
+            if good {
+                var important: bool = false
+                if state == 2 as u32 {
+                    important = true
+                    cv.cv_truncate(value, bang)
+                }
+                let ok2: bool = try append_declaration(name, value, important, out)
+            }
+        }
+    }
+    return out
+}
+
+fn is_bang_delim(c: Gc[Cv]) -> bool {
+    if c.kind != tok.T_DELIM {
+        return false
+    }
+    var lit: [u8; 1] = "!"
+    return node.chain_equal_ascii(c.text, &lit[0], 1)
+}
+
+fn is_important_word(c: Gc[Cv]) -> bool {
+    if c.kind != tok.T_IDENT {
+        return false
+    }
+    var lit: [u8; 9] = "important"
+    return node.chain_equal_ascii_small(c.text, &lit[0], 9)
+}
+
+// ------------------------------------------------------------ Rule collection
+
+// Turns a parsed stylesheet into a chain of rules. Rules with an invalid
+// selector are dropped -- that is the standard, and it is the reason an
+// unknown pseudo-class must not simply match nothing.
+fn collect_rules(sheet: Gc[Cv], origin: u32, order_start: u32,
+                 nm: *mut names.Names, tmp: *mut mem.CpBuf,
+                 order_end: *mut u32) -> AllocError!Gc[Rule] {
+    var first: Gc[Rule] = gc_null[Rule]()
+    var last: Gc[Rule] = gc_null[Rule]()
+    var order: u32 = order_start
+    let n: u64 = cv.cv_kids_count(sheet)
+    var i: u64 = 0
+    while i < n {
+        let r: Gc[Cv] = cv.cv_kid(sheet, i)
+        if r.kind == cv.CV_QUALIFIED_RULE {
+            let s = try sel.sel_parse(r, nm, tmp)
+            if s != gc_null[Sel]() {
+                let block: Gc[Cv] = try cv.cv_extra_as_list(r)
+                let d = try parse_block_declarations(block)
+                let rule = try gc Rule{
+                    sel: s,
+                    decls: d,
+                    next: gc_null[Rule](),
+                    origin: origin,
+                    order: order,
+                }
+                order = order + 1 as u32
+                if last == gc_null[Rule]() {
+                    first = rule
+                } else {
+                    last.next = rule
+                }
+                last = rule
+            }
+        }
+        i = i + 1
+    }
+    *order_end = order
+    return first
+}
+
+fn rules_count(r: Gc[Rule]) -> u32 {
+    var n: u32 = 0
+    var x: Gc[Rule] = r
+    while x != gc_null[Rule]() {
+        n = n + 1 as u32
+        x = x.next
+    }
+    return n
+}
+
+// ------------------------------------------------------------- The cascade
+
+// The rank of an origin: `!important` turns the order around.
+fn origin_level(origin: u32, important: bool) -> u32 {
+    if !important {
+        return origin
+    }
+    return 5 as u32 - origin
+}
+
+// The winners per property for ONE element.
+struct Winner {
+    best: [Gc[Decl]; 23],
+    level: [u32; 23],
+    spec: [u32; 23],
+    order: [u32; 23],
+    taken: [u32; 23],
+}
+
+fn winner_new() -> Winner {
+    return Winner{
+        best: [gc_null[Decl](); 23],
+        level: [0; 23],
+        spec: [0; 23],
+        order: [0; 23],
+        taken: [0; 23],
+    }
+}
+
+fn winner_clear(w: *mut Winner) {
+    var i: usize = 0
+    while i < 23 {
+        (*w).best[i] = gc_null[Decl]()
+        (*w).level[i] = 0
+        (*w).spec[i] = 0
+        (*w).order[i] = 0
+        (*w).taken[i] = 0
+        i = i + 1
+    }
+}
+
+fn winner_offer(w: *mut Winner, prop: u32, d: Gc[Decl], level: u32,
+                spec: u32, order: u32) {
+    let i: usize = prop as usize
+    if (*w).taken[i] != 0 as u32 {
+        if level < (*w).level[i] {
+            return
+        }
+        if level == (*w).level[i] {
+            if spec < (*w).spec[i] {
+                return
+            }
+            if spec == (*w).spec[i] && order < (*w).order[i] {
+                return
+            }
+        }
+    }
+    (*w).best[i] = d
+    (*w).level[i] = level
+    (*w).spec[i] = spec
+    (*w).order[i] = order
+    (*w).taken[i] = 1
+}
+
+// Runs the cascade for one element and computes its style.
+fn cascade_element(rules: Gc[Rule], k: Gc[Node], parent: Gc[Style],
+                   cx: *mut sel.Ctx, w: *mut Winner) -> AllocError!Gc[Style] {
+    winner_clear(w)
+    var r: Gc[Rule] = rules
+    while r != gc_null[Rule]() {
+        // The specificity of the selector THAT MATCHES -- with a group,
+        // the highest of the matching ones.
+        var best: u32 = 0
+        var hit: bool = false
+        var s: Gc[Sel] = r.sel
+        while s != gc_null[Sel]() {
+            if sel.sel_matches_one(s, k, cx) {
+                hit = true
+                if sel.sel_specificity(s) > best {
+                    best = sel.sel_specificity(s)
+                }
+            }
+            s = s.next
+        }
+        if hit {
+            var di: u64 = 0
+            while di < gcvec_length(r.decls) {
+                let d: Gc[Decl] = gcvec_read[Decl](r.decls, di)
+                let important: bool = (d.flags & DECL_IMPORTANT) != 0 as u32
+                winner_offer(w, d.prop, d, origin_level(r.origin, important),
+                             best, r.order)
+                di = di + 1
+            }
+        }
+        r = r.next
+    }
+    return try compute_style(w, parent)
+}
+
+// --------------------------------------------------------- Computed values
+
+fn is_ident_word(c: Gc[Cv], p: *mut u8, n: usize) -> bool {
+    if c == gc_null[Cv]() || c.kind != tok.T_IDENT {
+        return false
+    }
+    return node.chain_equal_ascii_small(c.text, p, n)
+}
+
+fn is_ident_none(c: Gc[Cv]) -> bool {
+    var w: [u8; 4] = "none"
+    return is_ident_word(c, &w[0], 4)
+}
+
+fn keyword_kind(c: Gc[Cv]) -> u32 {
+    var w1: [u8; 7] = "inherit"
+    if is_ident_word(c, &w1[0], 7) {
+        return V_INHERIT
+    }
+    var w2: [u8; 7] = "initial"
+    if is_ident_word(c, &w2[0], 7) {
+        return V_INITIAL
+    }
+    return V_NORMAL
+}
+
+// The factor of a unit in px. 0 means: not a length.
+fn unit_factor(c: Gc[Cv], font_size: f64, root_size: f64, ok: *mut bool) -> f64 {
+    *ok = true
+    var u1: [u8; 2] = "px"
+    if node.chain_equal_ascii_small(c.unit, &u1[0], 2) { return 1.0 }
+    var u2: [u8; 2] = "pt"
+    if node.chain_equal_ascii_small(c.unit, &u2[0], 2) { return 96.0 / 72.0 }
+    var u3: [u8; 2] = "pc"
+    if node.chain_equal_ascii_small(c.unit, &u3[0], 2) { return 16.0 }
+    var u4: [u8; 2] = "in"
+    if node.chain_equal_ascii_small(c.unit, &u4[0], 2) { return 96.0 }
+    var u5: [u8; 2] = "cm"
+    if node.chain_equal_ascii_small(c.unit, &u5[0], 2) { return 96.0 / 2.54 }
+    var u6: [u8; 2] = "mm"
+    if node.chain_equal_ascii_small(c.unit, &u6[0], 2) { return 96.0 / 25.4 }
+    var u7: [u8; 2] = "em"
+    if node.chain_equal_ascii_small(c.unit, &u7[0], 2) { return font_size }
+    var u8: [u8; 3] = "rem"
+    if node.chain_equal_ascii_small(c.unit, &u8[0], 3) { return root_size }
+    var u9: [u8; 2] = "ex"
+    if node.chain_equal_ascii_small(c.unit, &u9[0], 2) { return font_size * 0.5 }
+    var u10: [u8; 2] = "ch"
+    if node.chain_equal_ascii_small(c.unit, &u10[0], 2) { return font_size * 0.5 }
+    *ok = false
+    return 0.0
+}
+
+// The number value of a numeric component value.
+fn number_of(c: Gc[Cv]) -> f64 {
+    return chain_number(c.text)
+}
+
+fn chain_number(k: Gc[Chain]) -> f64 {
+    let n: u64 = node.chain_len(k)
+    var i: u64 = 0
+    var sign: f64 = 1.0
+    if i < n {
+        let c: u32 = node.chain_at(k, i)
+        if c == 45 as u32 {
+            sign = 0.0 - 1.0
+            i = i + 1
+        } else if c == 43 as u32 {
+            i = i + 1
+        }
+    }
+    var whole: f64 = 0.0
+    while i < n && node.chain_at(k, i) >= 48 as u32 && node.chain_at(k, i) <= 57 as u32 {
+        whole = whole * 10.0 + (node.chain_at(k, i) - 48 as u32) as f64
+        i = i + 1
+    }
+    if i < n && node.chain_at(k, i) == 46 as u32 {
+        i = i + 1
+        var scale: f64 = 0.1
+        while i < n && node.chain_at(k, i) >= 48 as u32 && node.chain_at(k, i) <= 57 as u32 {
+            whole = whole + (node.chain_at(k, i) - 48 as u32) as f64 * scale
+            scale = scale * 0.1
+            i = i + 1
+        }
+    }
+    var value: f64 = sign * whole
+    if i < n {
+        let e: u32 = node.chain_at(k, i)
+        if e == 101 as u32 || e == 69 as u32 {
+            i = i + 1
+            var negative: bool = false
+            if i < n && node.chain_at(k, i) == 45 as u32 {
+                negative = true
+                i = i + 1
+            } else if i < n && node.chain_at(k, i) == 43 as u32 {
+                i = i + 1
+            }
+            var ev: i64 = 0
+            while i < n && node.chain_at(k, i) >= 48 as u32 && node.chain_at(k, i) <= 57 as u32 {
+                if ev < 100 {
+                    ev = ev * 10 + (node.chain_at(k, i) - 48 as u32) as i64
+                }
+                i = i + 1
+            }
+            var c2: i64 = 0
+            while c2 < ev {
+                if negative {
+                    value = value / 10.0
+                } else {
+                    value = value * 10.0
+                }
+                c2 = c2 + 1
+            }
+        }
+    }
+    return value
+}
+
+// A length or a percentage. `auto` is handled by the caller.
+fn parse_length(c: Gc[Cv], font_size: f64, root_size: f64,
+                out: *mut f64, unit: *mut u32) -> bool {
+    if c == gc_null[Cv]() {
+        return false
+    }
+    if c.kind == tok.T_DIMENSION {
+        var ok: bool = false
+        let f: f64 = unit_factor(c, font_size, root_size, &ok)
+        if !ok {
+            return false
+        }
+        *out = number_of(c) * f
+        *unit = U_PX
+        return true
+    }
+    if c.kind == tok.T_PERCENTAGE {
+        *out = number_of(c)
+        *unit = U_PERCENT
+        return true
+    }
+    if c.kind == tok.T_NUMBER {
+        // Only the number zero is a length without a unit.
+        let v: f64 = number_of(c)
+        if v == 0.0 {
+            *out = 0.0
+            *unit = U_PX
+            return true
+        }
+        return false
+    }
+    return false
+}
+
+fn parse_border_width(c: Gc[Cv], out: *mut f64, unit: *mut u32) -> bool {
+    var w1: [u8; 4] = "thin"
+    if is_ident_word(c, &w1[0], 4) {
+        *out = 1.0
+        *unit = U_PX
+        return true
+    }
+    var w2: [u8; 6] = "medium"
+    if is_ident_word(c, &w2[0], 6) {
+        *out = 3.0
+        *unit = U_PX
+        return true
+    }
+    var w3: [u8; 5] = "thick"
+    if is_ident_word(c, &w3[0], 5) {
+        *out = 5.0
+        *unit = U_PX
+        return true
+    }
+    return parse_length(c, 16.0, 16.0, out, unit)
+}
+
+fn value_border_style(c: Gc[Cv]) -> u32 {
+    var w1: [u8; 6] = "hidden"
+    if is_ident_word(c, &w1[0], 6) { return BS_HIDDEN }
+    var w2: [u8; 6] = "dotted"
+    if is_ident_word(c, &w2[0], 6) { return BS_DOTTED }
+    var w3: [u8; 6] = "dashed"
+    if is_ident_word(c, &w3[0], 6) { return BS_DASHED }
+    var w4: [u8; 5] = "solid"
+    if is_ident_word(c, &w4[0], 5) { return BS_SOLID }
+    var w5: [u8; 6] = "double"
+    if is_ident_word(c, &w5[0], 6) { return BS_DOUBLE }
+    var w6: [u8; 6] = "groove"
+    if is_ident_word(c, &w6[0], 6) { return BS_GROOVE }
+    var w7: [u8; 5] = "ridge"
+    if is_ident_word(c, &w7[0], 5) { return BS_RIDGE }
+    var w8: [u8; 5] = "inset"
+    if is_ident_word(c, &w8[0], 5) { return BS_INSET }
+    var w9: [u8; 6] = "outset"
+    if is_ident_word(c, &w9[0], 6) { return BS_OUTSET }
+    return BS_NONE
+}
+
+fn value_display(c: Gc[Cv], out: *mut u32) -> bool {
+    var w1: [u8; 5] = "block"
+    if is_ident_word(c, &w1[0], 5) {
+        *out = D_BLOCK
+        return true
+    }
+    var w2: [u8; 6] = "inline"
+    if is_ident_word(c, &w2[0], 6) {
+        *out = D_INLINE
+        return true
+    }
+    var w3: [u8; 12] = "inline-block"
+    if is_ident_word(c, &w3[0], 12) {
+        *out = D_INLINE_BLOCK
+        return true
+    }
+    var w4: [u8; 4] = "none"
+    if is_ident_word(c, &w4[0], 4) {
+        *out = D_NONE
+        return true
+    }
+    var w5: [u8; 9] = "list-item"
+    if is_ident_word(c, &w5[0], 9) {
+        *out = D_LIST_ITEM
+        return true
+    }
+    var w6: [u8; 4] = "flex"
+    if is_ident_word(c, &w6[0], 4) {
+        *out = D_FLEX
+        return true
+    }
+    var w7: [u8; 11] = "inline-flex"
+    if is_ident_word(c, &w7[0], 11) {
+        *out = D_INLINE_FLEX
+        return true
+    }
+    var w8: [u8; 4] = "grid"
+    if is_ident_word(c, &w8[0], 4) {
+        *out = D_GRID
+        return true
+    }
+    var w9: [u8; 5] = "table"
+    if is_ident_word(c, &w9[0], 5) {
+        *out = D_TABLE
+        return true
+    }
+    var w10: [u8; 9] = "table-row"
+    if is_ident_word(c, &w10[0], 9) {
+        *out = D_TABLE_ROW
+        return true
+    }
+    var w11: [u8; 10] = "table-cell"
+    if is_ident_word(c, &w11[0], 10) {
+        *out = D_TABLE_CELL
+        return true
+    }
+    var w12: [u8; 12] = "inline-table"
+    if is_ident_word(c, &w12[0], 12) {
+        *out = D_INLINE_TABLE
+        return true
+    }
+    return false
+}
+
+// ---------------------------------------------------------------- Colours
+
+fn hex_value(c: u32) -> u32 {
+    if c >= 48 as u32 && c <= 57 as u32 {
+        return c - 48 as u32
+    }
+    if c >= 65 as u32 && c <= 70 as u32 {
+        return c - 55 as u32
+    }
+    if c >= 97 as u32 && c <= 102 as u32 {
+        return c - 87 as u32
+    }
+    return 16 as u32
+}
+
+fn parse_hex_color(k: Gc[Chain], out: *mut u32) -> bool {
+    let n: u64 = node.chain_len(k)
+    if n != 3 && n != 4 && n != 6 && n != 8 {
+        return false
+    }
+    var d: [u32; 8] = [0; 8]
+    var i: u64 = 0
+    while i < n {
+        let v: u32 = hex_value(node.chain_at(k, i))
+        if v > 15 as u32 {
+            return false
+        }
+        d[i as usize] = v
+        i = i + 1
+    }
+    var r: u32 = 0
+    var g: u32 = 0
+    var b: u32 = 0
+    var a: u32 = 255
+    if n == 3 || n == 4 {
+        r = d[0] * 17 as u32
+        g = d[1] * 17 as u32
+        b = d[2] * 17 as u32
+        if n == 4 {
+            a = d[3] * 17 as u32
+        }
+    } else {
+        r = d[0] * 16 as u32 + d[1]
+        g = d[2] * 16 as u32 + d[3]
+        b = d[4] * 16 as u32 + d[5]
+        if n == 8 {
+            a = d[6] * 16 as u32 + d[7]
+        }
+    }
+    *out = (a << 24) | (r << 16) | (g << 8) | b
+    return true
+}
+
+fn named_color(c: Gc[Cv], out: *mut u32) -> bool {
+    var n1: [u8; 5] = "black"
+    if is_ident_word(c, &n1[0], 5) {
+        *out = 0xFF000000
+        return true
+    }
+    var n2: [u8; 6] = "silver"
+    if is_ident_word(c, &n2[0], 6) {
+        *out = 0xFFC0C0C0
+        return true
+    }
+    var n3: [u8; 4] = "gray"
+    if is_ident_word(c, &n3[0], 4) {
+        *out = 0xFF808080
+        return true
+    }
+    var n4: [u8; 5] = "white"
+    if is_ident_word(c, &n4[0], 5) {
+        *out = 0xFFFFFFFF
+        return true
+    }
+    var n5: [u8; 6] = "maroon"
+    if is_ident_word(c, &n5[0], 6) {
+        *out = 0xFF800000
+        return true
+    }
+    var n6: [u8; 3] = "red"
+    if is_ident_word(c, &n6[0], 3) {
+        *out = 0xFFFF0000
+        return true
+    }
+    var n7: [u8; 6] = "purple"
+    if is_ident_word(c, &n7[0], 6) {
+        *out = 0xFF800080
+        return true
+    }
+    var n8: [u8; 7] = "fuchsia"
+    if is_ident_word(c, &n8[0], 7) {
+        *out = 0xFFFF00FF
+        return true
+    }
+    var n9: [u8; 5] = "green"
+    if is_ident_word(c, &n9[0], 5) {
+        *out = 0xFF008000
+        return true
+    }
+    var n10: [u8; 4] = "lime"
+    if is_ident_word(c, &n10[0], 4) {
+        *out = 0xFF00FF00
+        return true
+    }
+    var n11: [u8; 5] = "olive"
+    if is_ident_word(c, &n11[0], 5) {
+        *out = 0xFF808000
+        return true
+    }
+    var n12: [u8; 6] = "yellow"
+    if is_ident_word(c, &n12[0], 6) {
+        *out = 0xFFFFFF00
+        return true
+    }
+    var n13: [u8; 4] = "navy"
+    if is_ident_word(c, &n13[0], 4) {
+        *out = 0xFF000080
+        return true
+    }
+    var n14: [u8; 4] = "blue"
+    if is_ident_word(c, &n14[0], 4) {
+        *out = 0xFF0000FF
+        return true
+    }
+    var n15: [u8; 4] = "teal"
+    if is_ident_word(c, &n15[0], 4) {
+        *out = 0xFF008080
+        return true
+    }
+    var n16: [u8; 4] = "aqua"
+    if is_ident_word(c, &n16[0], 4) {
+        *out = 0xFF00FFFF
+        return true
+    }
+    var n17: [u8; 6] = "orange"
+    if is_ident_word(c, &n17[0], 6) {
+        *out = 0xFFFFA500
+        return true
+    }
+    var n18: [u8; 11] = "transparent"
+    if is_ident_word(c, &n18[0], 11) {
+        *out = 0
+        return true
+    }
+    return false
+}
+
+fn clamp255(v: f64) -> u32 {
+    if v <= 0.0 {
+        return 0
+    }
+    if v >= 255.0 {
+        return 255
+    }
+    return (v + 0.5) as u32
+}
+
+// `rgb()` / `rgba()` with numbers or percentages.
+fn parse_rgb_function(c: Gc[Cv], out: *mut u32) -> bool {
+    var f1: [u8; 3] = "rgb"
+    var f2: [u8; 4] = "rgba"
+    if c.kind != cv.CV_FUNCTION {
+        return false
+    }
+    if !node.chain_equal_ascii_small(c.text, &f1[0], 3) {
+        if !node.chain_equal_ascii_small(c.text, &f2[0], 4) {
+            return false
+        }
+    }
+    var part: [f64; 4] = [0.0; 4]
+    var found: usize = 0
+    var i: u64 = 0
+    let n: u64 = cv.cv_kids_count(c)
+    while i < n {
+        let v: Gc[Cv] = cv.cv_kid(c, i)
+        if v.kind == tok.T_NUMBER {
+            if found >= 4 {
+                return false
+            }
+            part[found] = number_of(v)
+            found = found + 1
+        } else if v.kind == tok.T_PERCENTAGE {
+            if found >= 4 {
+                return false
+            }
+            part[found] = number_of(v) * 255.0 / 100.0
+            found = found + 1
+        } else if v.kind != tok.T_WHITESPACE && v.kind != tok.T_COMMA {
+            var slash: [u8; 1] = "/"
+            if v.kind != tok.T_DELIM || !node.chain_equal_ascii(v.text, &slash[0], 1) {
+                return false
+            }
+        }
+        i = i + 1
+    }
+    if found < 3 {
+        return false
+    }
+    var a: u32 = 255
+    if found == 4 {
+        a = clamp255(part[3] * 255.0)
+        // The fourth part came in as a number 0..1, not as 0..255.
+        if part[3] <= 1.0 {
+            a = clamp255(part[3] * 255.0)
+        }
+    }
+    *out = (a << 24) | (clamp255(part[0]) << 16) | (clamp255(part[1]) << 8) |
+           clamp255(part[2])
+    return true
+}
+
+fn parse_color_value(c: Gc[Cv], out: *mut u32) -> bool {
+    if c == gc_null[Cv]() {
+        return false
+    }
+    if c.kind == tok.T_HASH {
+        return parse_hex_color(c.text, out)
+    }
+    if c.kind == cv.CV_FUNCTION {
+        return parse_rgb_function(c, out)
+    }
+    return named_color(c, out)
+}
+
+// ------------------------------------------------------ Applying the winners
+
+fn font_size_keyword(c: Gc[Cv], out: *mut f64) -> bool {
+    var w1: [u8; 8] = "xx-small"
+    if is_ident_word(c, &w1[0], 8) {
+        *out = 9.0
+        return true
+    }
+    var w2: [u8; 7] = "x-small"
+    if is_ident_word(c, &w2[0], 7) {
+        *out = 10.0
+        return true
+    }
+    var w3: [u8; 5] = "small"
+    if is_ident_word(c, &w3[0], 5) {
+        *out = 13.0
+        return true
+    }
+    var w4: [u8; 6] = "medium"
+    if is_ident_word(c, &w4[0], 6) {
+        *out = 16.0
+        return true
+    }
+    var w5: [u8; 5] = "large"
+    if is_ident_word(c, &w5[0], 5) {
+        *out = 18.0
+        return true
+    }
+    var w6: [u8; 7] = "x-large"
+    if is_ident_word(c, &w6[0], 7) {
+        *out = 24.0
+        return true
+    }
+    var w7: [u8; 8] = "xx-large"
+    if is_ident_word(c, &w7[0], 8) {
+        *out = 32.0
+        return true
+    }
+    return false
+}
+
+fn first_value(d: Gc[Decl]) -> Gc[Cv] {
+    return non_ws_at(d.value, 0)
+}
+
+fn compute_style(w: *mut Winner, parent: Gc[Style]) -> AllocError!Gc[Style] {
+    let s = try style_initial()
+    // 1. Inheritance: colour and font size come from the parent.
+    s.font_size = parent.font_size
+    s.color[0] = parent.color[0]
+    let root_size: f64 = 16.0
+
+    // 2. The font size first -- `em` of every other property depends on it.
+    let fd: Gc[Decl] = (*w).best[P_FONT_SIZE as usize]
+    if fd != gc_null[Decl]() {
+        let v: Gc[Cv] = first_value(fd)
+        let kw: u32 = keyword_kind(v)
+        if kw == V_INHERIT {
+            s.font_size = parent.font_size
+        } else if kw == V_INITIAL {
+            s.font_size = 16.0
+        } else {
+            var size: f64 = 0.0
+            if font_size_keyword(v, &size) {
+                s.font_size = size
+            } else if v != gc_null[Cv]() && v.kind == tok.T_PERCENTAGE {
+                s.font_size = parent.font_size * number_of(v) / 100.0
+            } else {
+                var value: f64 = 0.0
+                var unit: u32 = U_PX
+                // `em` refers to the PARENT here.
+                if parse_length(v, parent.font_size, root_size, &value, &unit) {
+                    if unit == U_PX {
+                        s.font_size = value
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. display
+    let dd: Gc[Decl] = (*w).best[P_DISPLAY as usize]
+    if dd != gc_null[Decl]() {
+        let v: Gc[Cv] = first_value(dd)
+        let kw: u32 = keyword_kind(v)
+        if kw == V_INHERIT {
+            s.display = parent.display
+        } else if kw == V_INITIAL {
+            s.display = D_INLINE
+        } else {
+            var d: u32 = D_INLINE
+            if value_display(v, &d) {
+                s.display = d
+            }
+        }
+    }
+
+    // 4. colour
+    let cd: Gc[Decl] = (*w).best[P_COLOR as usize]
+    if cd != gc_null[Decl]() {
+        let v: Gc[Cv] = first_value(cd)
+        let kw: u32 = keyword_kind(v)
+        if kw == V_INHERIT {
+            s.color[0] = parent.color[0]
+        } else if kw == V_INITIAL {
+            s.color[0] = 0xFF000000
+        } else {
+            var col: u32 = 0
+            if parse_color_value(v, &col) {
+                s.color[0] = col
+            }
+        }
+    }
+
+    // 5. the twelve lengths (margin, padding, border width)
+    var p: u32 = P_MARGIN_TOP
+    while p <= P_BORDER_LEFT_WIDTH {
+        let slot: usize = (p - P_MARGIN_TOP) as usize
+        let d: Gc[Decl] = (*w).best[p as usize]
+        if d != gc_null[Decl]() {
+            let v: Gc[Cv] = first_value(d)
+            let kw: u32 = keyword_kind(v)
+            if kw == V_INHERIT {
+                s.length[slot] = parent.length[slot]
+                s.unit[slot] = parent.unit[slot]
+            } else if kw == V_INITIAL {
+                s.length[slot] = 0.0
+                s.unit[slot] = U_PX
+            } else {
+                var auto: [u8; 4] = "auto"
+                var value: f64 = 0.0
+                var unit: u32 = U_PX
+                if p <= P_MARGIN_LEFT && is_ident_word(v, &auto[0], 4) {
+                    s.length[slot] = 0.0
+                    s.unit[slot] = U_AUTO
+                } else if p >= P_BORDER_TOP_WIDTH {
+                    if parse_border_width(v, &value, &unit) {
+                        s.length[slot] = scale_em(v, value, s.font_size, root_size)
+                        s.unit[slot] = unit
+                    }
+                } else if parse_length(v, s.font_size, root_size, &value, &unit) {
+                    s.length[slot] = value
+                    s.unit[slot] = unit
+                }
+            }
+        }
+        p = p + 1 as u32
+    }
+
+    // 6. border style and colour
+    var q: u32 = P_BORDER_TOP_STYLE
+    while q <= P_BORDER_LEFT_STYLE {
+        let slot: usize = (q - P_BORDER_TOP_STYLE) as usize
+        let d: Gc[Decl] = (*w).best[q as usize]
+        if d != gc_null[Decl]() {
+            let v: Gc[Cv] = first_value(d)
+            let kw: u32 = keyword_kind(v)
+            if kw == V_INHERIT {
+                s.bstyle[slot] = parent.bstyle[slot]
+            } else if kw == V_INITIAL {
+                s.bstyle[slot] = BS_NONE
+            } else if is_ident_none(v) {
+                s.bstyle[slot] = BS_NONE
+            } else {
+                let bs: u32 = value_border_style(v)
+                if bs != BS_NONE {
+                    s.bstyle[slot] = bs
+                }
+            }
+        }
+        q = q + 1 as u32
+    }
+    var c2: u32 = P_BORDER_TOP_COLOR
+    while c2 <= P_BORDER_LEFT_COLOR {
+        let slot: usize = (c2 - P_BORDER_TOP_COLOR) as usize + 1
+        s.color[slot] = s.color[0]
+        let d: Gc[Decl] = (*w).best[c2 as usize]
+        if d != gc_null[Decl]() {
+            let v: Gc[Cv] = first_value(d)
+            let kw: u32 = keyword_kind(v)
+            if kw == V_INHERIT {
+                s.color[slot] = parent.color[slot]
+            } else if kw == V_INITIAL {
+                s.color[slot] = s.color[0]
+            } else {
+                var col: u32 = 0
+                if parse_color_value(v, &col) {
+                    s.color[slot] = col
+                }
+            }
+        }
+        c2 = c2 + 1 as u32
+    }
+    return s
+}
+
+// A border width in `em` was computed against 16 px in parse_border_width
+// (it does not know the font size). Here it is put right.
+fn scale_em(v: Gc[Cv], value: f64, font_size: f64, root_size: f64) -> f64 {
+    if v == gc_null[Cv]() || v.kind != tok.T_DIMENSION {
+        return value
+    }
+    var ok: bool = false
+    let f: f64 = unit_factor(v, font_size, root_size, &ok)
+    if !ok {
+        return value
+    }
+    return number_of(v) * f
+}
