@@ -27,6 +27,7 @@ import os
 import re
 import struct
 import subprocess
+import tempfile
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -84,6 +85,8 @@ def classify(status, out, want, typ):
         return "throw"
     if status == "OOM":
         return "oom"
+    if status == "CRASH":
+        return "crash"
     if status == "CRASH":
         return "crash"
     if status == "TIMEOUT":
@@ -150,18 +153,35 @@ def main():
         if limit and len(index) >= limit:
             break
 
-    # The engine is run in batches. If a batch produces fewer blocks than it
-    # got jobs, the engine died on the case after the last block -- that one
-    # is recorded as CRASH and the rest is retried in a fresh process. So a
+    # The engine is run in BATCHES, and the input goes through a FILE, not
+    # through a pipe: with `input=` plus `timeout=` the writing thread of
+    # `subprocess` can hang on a dead pipe and the whole harness stands
+    # still. If a batch produces fewer blocks than it got jobs, the engine
+    # died (or ran forever) on the case after the last complete block --
+    # that one is recorded and the rest is retried in a fresh process. So a
     # single crash never swallows the remaining thousands of cases.
     blocks = []
     todo = list(range(len(jobs)))
-    BATCH = 400
+    BATCH = 200
+    BUDGET = 90
     while todo:
         chunk = todo[:BATCH]
-        proc = subprocess.run([exe], input=b"".join(jobs[i] for i in chunk),
-                              stdout=subprocess.PIPE)
-        got = proc.stdout.decode("utf-8", "replace").split("\x00\n")
+        with tempfile.NamedTemporaryFile(delete=False) as tf:
+            tf.write(b"".join(jobs[i] for i in chunk))
+            inpath = tf.name
+        raw = b""
+        marker = "CRASH"
+        try:
+            with open(inpath, "rb") as fin:
+                proc = subprocess.run([exe], stdin=fin,
+                                      stdout=subprocess.PIPE, timeout=BUDGET)
+                raw = proc.stdout
+        except subprocess.TimeoutExpired as e:
+            raw = e.stdout or b""
+            marker = "TIMEOUT"
+        finally:
+            os.unlink(inpath)
+        got = raw.decode("utf-8", "replace").split("\x00\n")
         if got and got[-1].strip() == "":
             got.pop()
         if len(got) >= len(chunk):
@@ -169,11 +189,8 @@ def main():
             todo = todo[len(chunk):]
             continue
         blocks.extend(got)
-        blocks.append("CRASH")
+        blocks.append(marker)
         todo = todo[len(got) + 1:]
-        if len(got) == 0 and BATCH == 1:
-            todo = todo[1:] if todo else todo
-        BATCH = 400
 
     passed = 0
     failed = []
