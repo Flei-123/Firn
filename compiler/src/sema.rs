@@ -2303,6 +2303,7 @@ mod tests {
             ret: Type::Void,
             depth: 0,
             must_consume_fns: HashSet::new(),
+            capture_frames: Vec::new(),
             prog: None,
         };
         ck.run(first);
