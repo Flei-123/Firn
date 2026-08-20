@@ -1045,13 +1045,11 @@ impl<'a> Checker<'a> {
                     v.ty.clone()
                 } else if let Some((t, _)) = self.consts.get(name) {
                     t.clone()
-                } else if self.fns.contains_key(name) {
-                    self.dg.error_note(
-                        e.span,
-                        format!("'{}' is a function and not a value", name),
-                        "function pointers do not exist in stage 0, call them with '(...)'",
-                    );
-                    Type::Error
+                } else if let Some(sig) = self.fns.get(name).cloned() {
+                    // ROUND 58 (fnval.rs): a named function AS A VALUE. The
+                    // value is the address of its function record; the type
+                    // is read straight off the signature.
+                    Type::Fn { params: sig.params, ret: Box::new(sig.ret) }
                 } else {
                     self.dg
                         .error(e.span, format!("unknown name '{}'", name));
@@ -1485,6 +1483,37 @@ impl<'a> Checker<'a> {
         if let Some(t) = crate::gc::hook_call(self, name, args, nspan, espan) {
             return t;
         }
+        // ROUND 58 (fnval.rs): the name belongs to a VARIABLE that holds a
+        // function. A variable of function type wins over a function of the
+        // same name — that is ordinary scoping, and only that way does a
+        // parameter named like a global function stay callable.
+        if let Some(v) = self.lookup_var(name) {
+            if let Type::Fn { params, ret } = v.ty.clone() {
+                let shown = self.tcx.name_of(&Type::Fn {
+                    params: params.clone(),
+                    ret: ret.clone(),
+                });
+                if args.len() != params.len() {
+                    self.dg.error(
+                        espan,
+                        format!(
+                            "the function value '{}' of type {} expects {} argument(s), found {}",
+                            name,
+                            shown,
+                            params.len(),
+                            args.len()
+                        ),
+                    );
+                }
+                for (i, a) in args.iter().enumerate() {
+                    match params.get(i) {
+                        Some(p) => self.check_argument(name, i + 1, a, p),
+                        None => self.type_out_expr(a),
+                    }
+                }
+                return *ret;
+            }
+        }
         let sig = match self.fns.get(name) {
             Some(s) => s.clone(),
             None => {
@@ -1776,6 +1805,28 @@ impl<'a> Checker<'a> {
                 }
                 Type::Array(Box::new(t), *len)
             }
+            // Round 58: `fn(T1, T2) -> R` — a function as a value.
+            TypeExpr::Fn { params, ret, .. } => {
+                let mut ps = Vec::new();
+                for p in params {
+                    let t = self.resolve_ty_d(p, d + 1);
+                    if t.is_error() {
+                        return Type::Error;
+                    }
+                    ps.push(t);
+                }
+                let r = match ret {
+                    Some(t) => {
+                        let t = self.resolve_ty_d(t, d + 1);
+                        if t.is_error() {
+                            return Type::Error;
+                        }
+                        t
+                    }
+                    None => Type::Void,
+                };
+                Type::Fn { params: ps, ret: Box::new(r) }
+            }
         }
     }
 
@@ -1792,6 +1843,17 @@ impl<'a> Checker<'a> {
             TypeExpr::Array { elem, len, .. } => self
                 .resolve_ty_quiet(elem)
                 .map(|t| Type::Array(Box::new(t), *len)),
+            TypeExpr::Fn { params, ret, .. } => {
+                let mut ps = Vec::new();
+                for p in params {
+                    ps.push(self.resolve_ty_quiet(p)?);
+                }
+                let r = match ret {
+                    Some(t) => self.resolve_ty_quiet(t)?,
+                    None => Type::Void,
+                };
+                Some(Type::Fn { params: ps, ret: Box::new(r) })
+            }
         }
     }
 
@@ -2027,6 +2089,11 @@ fn compatible(a: &Type, b: &Type) -> bool {
     }
     match (a, b) {
         (Type::Ptr { inner: x, .. }, Type::Ptr { inner: y, .. }) => compatible(x, y),
+        // ROUND 58: function types are compared EXACTLY — same arity, same
+        // parameter types, same result. A pointer compares leniently here
+        // (see above); for a call target that would be wrong, because the
+        // callee reads the memory behind it.
+        (Type::Fn { .. }, Type::Fn { .. }) => a == b,
         _ => a == b,
     }
 }

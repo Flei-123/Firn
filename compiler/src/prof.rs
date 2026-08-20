@@ -255,6 +255,14 @@ impl Guard<'_> {
             }
             TypeExpr::Ptr { inner, .. } => self.ty(inner),
             TypeExpr::Array { elem, .. } => self.ty(elem),
+            TypeExpr::Fn { params, ret, .. } => {
+                for p in params {
+                    self.ty(p);
+                }
+                if let Some(r) = ret {
+                    self.ty(r);
+                }
+            }
         }
     }
 

@@ -194,6 +194,11 @@ pub fn emit(m: &Module) -> Result<String, String> {
     if crate::iface::has_interfaces() {
         e.raw(&crate::iface::tables_asm());
     }
+    // HOOK fnval: the function records (.rodata) — only when the program
+    // takes a function as a value at all (fnval.rs, round 58).
+    if crate::fnval::has_records() {
+        e.raw(&crate::fnval::records_asm());
+    }
     e.raw(".section .note.GNU-stack,\"\",@progbits");
     Ok(e.out)
 }
@@ -613,6 +618,16 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
             e.line(&format!(
                 "lea rax, [rip + {}]",
                 crate::iface::table_label(table)
+            ));
+            store_dst(e, fr, d, "rax");
+        }
+        // Round 58 (fnval.rs): a named function as a value — the address of
+        // its function record.
+        Op::FnRef { name } => {
+            let d = i.dst.ok_or("internal error: fnref without target")?;
+            e.line(&format!(
+                "lea rax, [rip + {}]",
+                crate::fnval::record_label(name)
             ));
             store_dst(e, fr, d, "rax");
         }

@@ -732,6 +732,8 @@ fn value_named(te: &TypeExpr) -> Option<String> {
         TypeExpr::Named(n, _) => Some(n.clone()),
         TypeExpr::Array { elem, .. } => value_named(elem),
         TypeExpr::Ptr { .. } => None,
+        // Round 58: a function value is one word, not a struct by value.
+        TypeExpr::Fn { .. } => None,
     }
 }
 

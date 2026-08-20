@@ -300,6 +300,40 @@ impl<'a> Parser<'a> {
 
     fn parse_type_inner(&mut self) -> Option<TypeExpr> {
         match self.kind().clone() {
+            // ROUND 58 — `fn(T1, T2) -> R`, the type of a function VALUE.
+            // Unambiguous: in a type position the keyword `fn` can mean
+            // nothing else, and a declaration always carries a name after it.
+            TokKind::KwFn => {
+                let start = self.bump();
+                if !self.expect(TokKind::LParen, "after 'fn' in a function type") {
+                    return None;
+                }
+                let mut params = Vec::new();
+                if !self.at(&TokKind::RParen) {
+                    loop {
+                        params.push(self.parse_type()?);
+                        if self.eat(&TokKind::Comma) {
+                            if self.at(&TokKind::RParen) {
+                                break;
+                            }
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                let mut end = self.span();
+                if !self.expect(TokKind::RParen, "after the parameters of a function type") {
+                    return None;
+                }
+                let mut ret = None;
+                if self.at(&TokKind::Arrow) {
+                    self.bump();
+                    let r = self.parse_type()?;
+                    end = r.span();
+                    ret = Some(Box::new(r));
+                }
+                Some(TypeExpr::Fn { params, ret, span: Parser::join(start, end) })
+            }
             TokKind::Star => {
                 let start = self.bump();
                 let mutable = self.eat(&TokKind::KwMut);
@@ -1589,6 +1623,7 @@ pub fn reset_hooks() {
     crate::gc::hook_reset();
     // HOOK iface: the same for interfaces and their implementations (iface.rs)
     crate::iface::hook_reset();
+    crate::fnval::hook_reset();
 }
 
 /// Like `parse`, but for a file of the source map: `file` is its number,

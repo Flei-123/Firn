@@ -43,6 +43,8 @@ fn scalar_fty(t: &Type) -> Option<FTy> {
         Type::Usize => FTy::U64,
         Type::Bool => FTy::Bool,
         Type::Ptr { .. } => FTy::Ptr,
+        // Round 58: a function value is the pointer to its function record.
+        Type::Fn { .. } => FTy::Ptr,
         Type::Void => FTy::Void,
         Type::Array(..) | Type::Struct(_) | Type::UntypedInt | Type::Error => return None,
     })
@@ -54,6 +56,9 @@ fn is_agg(t: &Type) -> bool {
 
 pub(crate) struct Local {
     pub(crate) slot: Val,
+    /// Round 58: the source type of the local. `lower_call` reads it to
+    /// tell a CALL OF A FUNCTION VALUE apart from a direct call.
+    pub(crate) ty: Type,
 }
 
 pub(crate) struct Lower<'a> {
@@ -236,9 +241,24 @@ impl<'a> Lower<'a> {
     }
 
     pub(crate) fn declare(&mut self, name: &str, slot: Val) {
+        self.declare_ty(name, slot, Type::Error);
+    }
+
+    /// Round 58: declaration WITH the source type (see `Local::ty`).
+    pub(crate) fn declare_ty(&mut self, name: &str, slot: Val, ty: Type) {
         if let Some(s) = self.scopes.last_mut() {
-            s.insert(name.to_string(), Local { slot });
+            s.insert(name.to_string(), Local { slot, ty });
         }
+    }
+
+    /// Round 58: the type of a local, if there is one under this name.
+    pub(crate) fn local_ty(&self, name: &str) -> Option<Type> {
+        for s in self.scopes.iter().rev() {
+            if let Some(l) = s.get(name) {
+                return Some(l.ty.clone());
+            }
+        }
+        None
     }
 
     pub(crate) fn lookup(&self, name: &str) -> Option<Val> {
@@ -462,6 +482,14 @@ impl<'a> Lower<'a> {
                 if let Some(slot) = self.lookup(name) {
                     let ft = self.fty_of(e)?;
                     Some(self.load(ft, slot))
+                } else if self.info.fns.contains_key(name)
+                    && self.ty_of(e).is_fn()
+                {
+                    // ROUND 58 (fnval.rs): a named function AS A VALUE. The
+                    // value is the address of its function record, one word
+                    // in `.rodata` holding the code address.
+                    let key = crate::fnval::record_of(name);
+                    Some(self.push(FTy::Ptr, Op::FnRef { name: key }))
                 } else if let Some((ct, cv)) = self.info.consts.get(name).cloned() {
                     let ft = match scalar_fty(&ct) {
                         Some(f) => f,
@@ -708,11 +736,28 @@ impl<'a> Lower<'a> {
                 }
             }
         };
+        // ROUND 58 (fnval.rs): the callee sits in a VARIABLE of function
+        // type. Word 0 of the function record is the code address; the
+        // record itself goes in as the LAST argument, so that a closure body
+        // finds its captured values there (a named function never reads it).
+        let mut indirect: Option<(Val, Val)> = None;
         let sig = match dyn_sig {
             Some(s) => s,
-            None => match self.info.fns.get(name) {
-                Some(s) => s.clone(),
-                None => return self.ice(span, "unknown function in lowering"),
+            None => match self.local_ty(name) {
+                Some(Type::Fn { params, ret }) => {
+                    let slot = match self.lookup(name) {
+                        Some(s) => s,
+                        None => return self.ice(span, "function value without a slot"),
+                    };
+                    let rec = self.load(FTy::Ptr, slot);
+                    let code = self.load(FTy::Ptr, rec);
+                    indirect = Some((code, rec));
+                    crate::sema::FnSig { params, ret: *ret }
+                }
+                _ => match self.info.fns.get(name) {
+                    Some(s) => s.clone(),
+                    None => return self.ice(span, "unknown function in lowering"),
+                },
             },
         };
         let ret_agg = is_agg(&sig.ret);
@@ -774,9 +819,13 @@ impl<'a> Lower<'a> {
                 }
             }
         }
-        let op = match dispatch {
-            Some((target, _)) => Op::CallIndirect { target: target, args: vals },
-            None => Op::Call { name: name.to_string(), args: vals },
+        let op = match (dispatch, indirect) {
+            (Some((target, _)), _) => Op::CallIndirect { target: target, args: vals },
+            (None, Some((code, rec))) => {
+                vals.push(rec);
+                Op::CallIndirect { target: code, args: vals }
+            }
+            (None, None) => Op::Call { name: name.to_string(), args: vals },
         };
         if ret_agg {
             let d = match target {
@@ -986,7 +1035,7 @@ impl<'a> Lower<'a> {
                 let (size, align) = self.size_align(&t);
                 let slot = self.alloca(size, align);
                 self.write_into(slot, init)?;
-                self.declare(name, slot);
+                self.declare_ty(name, slot, t.clone());
                 Some(())
             }
             Stmt::Assign { target, value, .. } => {
@@ -1360,7 +1409,7 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
                 let pv = lo.f.param_val(next);
                 next += 1;
                 lo.store(ft, slot, pv);
-                lo.declare(&p.name, slot);
+                lo.declare_ty(&p.name, slot, ty.clone());
             }
             Some(ParamKind::Words(n)) => {
                 let n = *n;

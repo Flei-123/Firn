@@ -95,6 +95,15 @@ fn ty(t: &TypeExpr) -> String {
             format!("(ptr {} {})", if *mutable { "mut" } else { "const" }, ty(inner))
         }
         TypeExpr::Array { elem, len, .. } => format!("(arr {} {})", len, ty(elem)),
+        // Round 58: a function type. `(fnty (arguments) result)`.
+        TypeExpr::Fn { params, ret, .. } => {
+            let ps: Vec<String> = params.iter().map(ty).collect();
+            let r = match ret {
+                Some(t) => ty(t),
+                None => "void".to_string(),
+            };
+            format!("(fnty ({}) {})", ps.join(" "), r)
+        }
     }
 }
 
