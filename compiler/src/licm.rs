@@ -16,7 +16,7 @@
 //! code held one `imul` for it per iteration — 240 times per row,
 //! 240 × 240 × 3 times per run. LLVM pulls that out, Firn did not.
 //!
-//! ## What gets hoisted
+//! ## What is hoisted
 //!
 //! An instruction moves to the **preheader** once all of this holds:
 //!

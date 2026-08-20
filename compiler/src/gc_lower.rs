@@ -1,6 +1,6 @@
 //! Lowering of the optional tracing GC to FIR (module `gckern`, SPEC §3.5).
 //!
-//! The language surface from `gc.rs` gets mapped here onto three things:
+//! The language surface from `gc.rs` is mapped here onto three things:
 //!
 //!  * `gc C{ … }` — call of the runtime (`__gc_alloc_raw`), after that build
 //!    the error union `AllocError!Gc[C]` and write the fields. The

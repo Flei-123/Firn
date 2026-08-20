@@ -632,7 +632,7 @@ pub fn allocate(f: &Func) -> Alloc {
             continue; // secret values stay at the stack slot (SPEC §9.2)
         }
         if cells.contains_key(&(v as Val)) {
-            continue; // gets treated as a cell
+            continue; // is treated as a cell
         }
         if alloc.imms.contains_key(&(v as Val)) || alloc.frame_addr.contains_key(&(v as Val)) {
             continue; // needs no place at all
@@ -2264,7 +2264,7 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
                 }
             }
             if ra.offset.contains_key(&d) || ra.skipped.contains(&d) {
-                return Ok(()); // gets read nowhere else
+                return Ok(()); // is read nowhere else
             }
             emit_bin(e, ra, *op, ty, *x, *y, d)?;
         }
