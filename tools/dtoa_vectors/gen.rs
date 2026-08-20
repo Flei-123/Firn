@@ -1,20 +1,20 @@
-//! Testvektoren fuer lib/num/dtoa.fi und lib/num/strtod.fi (Modul str).
+//! Test vectors for lib/num/dtoa.fi and lib/num/strtod.fi (module str).
 //!
-//! Dieses Werkzeug ist die WERKBANK, nicht das Produkt: es erzeugt zufaellige
-//! Doubles und prueft, was das Firn-Programm daraus gemacht hat. Der Compiler
-//! selbst benutzt es nicht, es haengt an keiner Bibliothek ausser `std`.
+//! This tool is the WORKBENCH, not the product: it produces random
+//! doubles and checks what the Firn program made of them. The compiler
+//! itself does not use it, it hangs on no library other than `std`.
 //!
-//!   gen bits <N> <seed>     N zufaellige, endliche Doubles als 8-Byte-Muster
-//!                           (little endian) auf die Standardausgabe
-//!   gen check <N> <seed>    liest N Textzeilen (die Ausgabe des
-//!                           Firn-Programms) und vergleicht sie mit der
-//!                           kuerzesten Darstellung von Rust
+//!   gen bits <N> <seed>     N random, finite doubles as 8 byte patterns
+//!                           (little endian) on standard output
+//!   gen check <N> <seed>    reads N lines of text (the output of the
+//!                           Firn program) and compares them with the
+//!                           shortest form of Rust
 //!
-//! Uebersetzen: rustc -O -o gen gen.rs
+//! Compile with: rustc -O -o gen gen.rs
 
 use std::io::{Read, Write};
 
-/// xorshift64* — reproduzierbar, ohne fremde Bibliothek.
+/// xorshift64* -- reproducible, without a foreign library.
 struct Rng(u64);
 
 impl Rng {
@@ -28,9 +28,9 @@ impl Rng {
     }
 }
 
-/// Erzeugt die N Bitmuster der Reihe nach (dieselbe Folge in beiden Betriebsarten).
+/// Produces the N bit patterns in order (the same sequence in both modes).
 fn vectors(n: usize, seed: u64) -> Vec<u64> {
-    // Feste Haertefaelle zuerst, danach Zufall ueber den gesamten Wertebereich.
+    // The fixed hard cases first, then random over the whole value range.
     let mut out: Vec<u64> = vec![
         0x3FB999999999999A, // 0.1
         0x44B52D02C7E14AF6, // 1e23
@@ -61,7 +61,7 @@ fn vectors(n: usize, seed: u64) -> Vec<u64> {
     out
 }
 
-/// Kuerzeste Darstellung nach ECMAScript `Number::toString`.
+/// The shortest form according to ECMAScript `Number::toString`.
 fn ecma(x: f64) -> String {
     if x.is_nan() {
         return "NaN".to_string();
@@ -73,7 +73,7 @@ fn ecma(x: f64) -> String {
         return "0".to_string();
     }
     let neg = x.is_sign_negative();
-    // {:e} liefert die kuerzeste Darstellung mit Rueckwandlungsgarantie.
+    // {:e} yields the shortest form with a guarantee of conversion back.
     let s = format!("{:e}", x.abs());
     let (mant, exp) = s.split_once('e').expect("{:e} hat immer ein e");
     let exp: i64 = exp.parse().expect("exponent ist eine zahl");
@@ -146,7 +146,7 @@ fn main() {
                         eprintln!("  #{} bits={:#018x}: firn '{}' != rust '{}'", i, bits, line, want);
                     }
                 }
-                // Rueckwandlung des FIRN-Textes mit Rusts strtod
+                // Conversion of the FIRN text back with Rust's strtod
                 match line.parse::<f64>() {
                     Ok(back) if back.to_bits() == *bits => {}
                     _ => {

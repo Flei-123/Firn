@@ -134,8 +134,8 @@ Three interventions in `lib/gc/gc.fi`, all in the sweep:
    chunks of the same class. A block of a not yet swept chunk falls out of
    the list when it is cleared and only comes back in once its chunk has
    been swept — it can never be handed out twice. The return of a
-   completely dead chunk also stays valid: the jump back of the list head
-   (`alt_kopf`) still cuts off exactly its contiguous segment,
+   completely dead chunk stays valid as well: the jump back of the list head
+   (`old_head`) still cuts off exactly its contiguous segment,
    and no pointer from the old list content can point into this chunk any
    more.
 2. **Sweeping with a time budget.** The sweep now hangs on the same

@@ -668,7 +668,7 @@ Rust-for-Linux this was a real blocker: kernel structures contain self-
 referential parts (linked lists, locks with an address dependency) and are too
 large for the kernel stack (typically 8-16 KB). The answer was the library
 **`pin-init`**: `#[pin_data]`, `pin_init!`, `try_pin_init!` -- macros that
-produce an *in-place constructor* as a value. From the documentation: *"It also
+produce an *in-place constructor* as a value. From the documentation: *"[it]
 allows in-place initialization of big structs that would otherwise produce a
 stack overflow."*
 

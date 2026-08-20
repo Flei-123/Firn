@@ -35,7 +35,7 @@ echo
 echo "== 1. compile the tokenizer (Firn) =="
 "$FIRNC" -o "$WORK/tokenize" lib/html/tokenize_main.fi
 # Measuring version: it only counts tokens (a fair comparison with html5ever, which
-# also only counts). See the head of tools/tokenizer/throughput.sh.
+# counts nothing else). See the head of tools/tokenizer/throughput.sh.
 "$FIRNC" -o "$WORK/tokenize_bench" lib/html/tokenize_bench.fi
 echo "   opt      : $WORK/tokenize"
 if [ "$FAST" -eq 0 ]; then

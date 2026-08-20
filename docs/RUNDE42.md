@@ -45,13 +45,13 @@ include libraries from stage 0: their files reference each other textually
 (`//#include`) and carry no module structure. `tools/strlib/expand.py`
 assembles **one** module each from them and writes it to `lib/std/`. An
 extension by hand in `lib/std/str.fi` would be gone at the next generation;
-an extension in `lib/str/bytes.fi` would also sit in the binary of every
+an extension in `lib/str/bytes.fi` would sit in the binary of every
 `html`/`dom` user. That is why there are **two new source files that are
 included exclusively by the facade**:
 
 ```
-lib/str/std_facade.fi   <- nur aus tools/strlib/src/std_str.fi
-lib/num/std_facade.fi   <- nur aus tools/strlib/src/std_num.fi
+lib/str/std_facade.fi   <- only from tools/strlib/src/std_str.fi
+lib/num/std_facade.fi   <- only from tools/strlib/src/std_num.fi
 ```
 
 `lib/str/*.fi` and `lib/num/*.fi` are **unchanged**; the generated tests
@@ -83,170 +83,170 @@ Two types, one rule, readable off every signature:
   function that *creates* text writes into a `*mut Bytes`.
 
 ```firn
-fn npos() -> usize                                  // "nicht gefunden"
+fn npos() -> usize                                  // "not found"
 
-// Sichten
-fn spanne(p: *mut u8, n: usize) -> Spanne
-fn spanne_leer() -> Spanne
-fn spanne_von_bytes(b: *mut Bytes) -> Spanne
-fn spanne_von_c(p: *mut u8) -> Spanne
-fn c_laenge(p: *mut u8) -> usize
-fn ist_leer(s: Spanne) -> bool
-fn laenge(s: Spanne) -> usize
-fn zeichen(s: Spanne, i: usize) -> u8
-fn spanne_teil(s: Spanne, von: usize, wieviel: usize) -> Spanne
-fn spanne_ab(s: Spanne, von: usize) -> Spanne
-fn spanne_bis(s: Spanne, bis: usize) -> Spanne
+// Views
+fn span(p: *mut u8, n: usize) -> Span
+fn span_empty() -> Span
+fn span_of_bytes(b: *mut Bytes) -> Span
+fn span_of_c(p: *mut u8) -> Span
+fn c_length(p: *mut u8) -> usize
+fn is_empty(s: Span) -> bool
+fn length(s: Span) -> usize
+fn chars(s: Span, i: usize) -> u8
+fn span_part(s: Span, of: usize, how_much: usize) -> Span
+fn span_ab(s: Span, of: usize) -> Span
+fn span_to(s: Span, to: usize) -> Span
 
-// Zeichenklassen (ASCII)
-fn ist_leerraum(c: u8) -> bool          fn ist_ziffer(c: u8) -> bool
-fn ist_hexziffer(c: u8) -> bool         fn ist_grossbuchstabe(c: u8) -> bool
-fn ist_kleinbuchstabe(c: u8) -> bool    fn ist_buchstabe(c: u8) -> bool
-fn ist_alphanumerisch(c: u8) -> bool    fn hexwert(c: u8) -> i32
-fn gross_zeichen(c: u8) -> u8           fn klein_zeichen(c: u8) -> u8
+// Character classes (ASCII)
+fn is_whitespace(c: u8) -> bool         fn is_digit(c: u8) -> bool
+fn is_hex_digit(c: u8) -> bool          fn is_upper_letter(c: u8) -> bool
+fn is_lower_letter(c: u8) -> bool       fn is_letter(c: u8) -> bool
+fn is_alphanumeric(c: u8) -> bool       fn hex_value(c: u8) -> i32
+fn big_char(c: u8) -> u8                fn small_char(c: u8) -> u8
 
-// Vergleiche
-fn gleich(a: Spanne, b: Spanne) -> bool
-fn vergleiche(a: Spanne, b: Spanne) -> i32          // -1 / 0 / 1
-fn gleich_ohne_fall(a: Spanne, b: Spanne) -> bool
-fn vergleiche_ohne_fall(a: Spanne, b: Spanne) -> i32
-fn beginnt_mit(s: Spanne, teil: Spanne) -> bool
-fn endet_mit(s: Spanne, teil: Spanne) -> bool
+// Comparisons
+fn equal(a: Span, b: Span) -> bool
+fn compare(a: Span, b: Span) -> i32                 // -1 / 0 / 1
+fn equal_without_case(a: Span, b: Span) -> bool
+fn compare_without_case(a: Span, b: Span) -> i32
+fn starts_with(s: Span, part: Span) -> bool
+fn ends_with(s: Span, part: Span) -> bool
 
-// Suchen
-fn finde_zeichen(s: Spanne, c: u8) -> usize
-fn finde_zeichen_ab(s: Spanne, c: u8, ab: usize) -> usize
-fn finde_zeichen_rueck(s: Spanne, c: u8) -> usize
-fn finde(s: Spanne, teil: Spanne) -> usize
-fn finde_ab(s: Spanne, teil: Spanne, ab: usize) -> usize
-fn finde_rueck(s: Spanne, teil: Spanne) -> usize
-fn enthaelt(s: Spanne, teil: Spanne) -> bool
-fn enthaelt_zeichen(s: Spanne, c: u8) -> bool
-fn zaehle_zeichen(s: Spanne, c: u8) -> usize
-fn zaehle_teil(s: Spanne, teil: Spanne) -> usize
-fn finde_nicht_aus(s: Spanne, menge: Spanne, ab: usize) -> usize
+// Searching
+fn find_char(s: Span, c: u8) -> usize
+fn find_char_ab(s: Span, c: u8, ab: usize) -> usize
+fn find_char_back(s: Span, c: u8) -> usize
+fn find(s: Span, part: Span) -> usize
+fn find_ab(s: Span, part: Span, ab: usize) -> usize
+fn find_back(s: Span, part: Span) -> usize
+fn contains(s: Span, part: Span) -> bool
+fn contains_char(s: Span, c: u8) -> bool
+fn count_char(s: Span, c: u8) -> usize
+fn count_part(s: Span, part: Span) -> usize
+fn find_not_out(s: Span, set: Span, ab: usize) -> usize
 
-// Trimmen
-fn trimme(s: Spanne) -> Spanne
-fn trimme_links(s: Spanne) -> Spanne
-fn trimme_rechts(s: Spanne) -> Spanne
-fn trimme_menge(s: Spanne, menge: Spanne) -> Spanne
-fn ohne_praefix(s: Spanne, teil: Spanne) -> Spanne
-fn ohne_suffix(s: Spanne, teil: Spanne) -> Spanne
+// Trimming
+fn trim(s: Span) -> Span
+fn trim_left(s: Span) -> Span
+fn trim_right(s: Span) -> Span
+fn trim_set(s: Span, set: Span) -> Span
+fn without_prefix(s: Span, part: Span) -> Span
+fn without_suffix(s: Span, part: Span) -> Span
 
-// Teilen (Kursor, keine Liste)
-struct Teiler { quelle: Spanne, trenner: Spanne, i: usize, modus: u32, fertig: bool }
-fn teiler_neu(s: Spanne, trenner: Spanne) -> Teiler
-fn teiler_leerraum(s: Spanne) -> Teiler
-fn teiler_naechst(t: *mut Teiler, aus: *mut Spanne) -> bool
-fn teile_zaehle(s: Spanne, trenner: Spanne) -> usize
+// Splitting (a cursor, not a list)
+struct Divisor { source: Span, sep: Span, i: usize, mode: u32, done: bool }
+fn divisor_new(s: Span, sep: Span) -> Divisor
+fn divisor_whitespace(s: Span) -> Divisor
+fn divisor_next(t: *mut Divisor, out: *mut Span) -> bool
+fn parts_count(s: Span, sep: Span) -> usize
 
-// Text bauen
-fn anhaengen(aus: *mut Bytes, s: Spanne)
-fn anhaengen_zeichen(aus: *mut Bytes, c: u8)
-fn setze(aus: *mut Bytes, s: Spanne)
-fn wiederhole(aus: *mut Bytes, s: Spanne, mal: usize)
-fn verbinde_teil(aus: *mut Bytes, teil: Spanne, trenner: Spanne)
-fn fuelle_links(aus: *mut Bytes, s: Spanne, breite: usize, fueller: u8)
-fn fuelle_rechts(aus: *mut Bytes, s: Spanne, breite: usize, fueller: u8)
+// Building text
+fn append(out: *mut Bytes, s: Span)
+fn append_char(out: *mut Bytes, c: u8)
+fn set(out: *mut Bytes, s: Span)
+fn repeat(out: *mut Bytes, s: Span, times: usize)
+fn join_part(out: *mut Bytes, part: Span, sep: Span)
+fn fill_left(out: *mut Bytes, s: Span, width: usize, filler: u8)
+fn fill_right(out: *mut Bytes, s: Span, width: usize, filler: u8)
 
-// Groß/Klein und Ersetzen
-fn nach_gross(aus: *mut Bytes, s: Spanne)
-fn nach_klein(aus: *mut Bytes, s: Spanne)
-fn gross_hier(b: *mut Bytes)
-fn klein_hier(b: *mut Bytes)
-fn ersetze(aus: *mut Bytes, s: Spanne, alt: Spanne, neu: Spanne) -> usize
-fn ersetze_erstes(aus: *mut Bytes, s: Spanne, alt: Spanne, neu: Spanne) -> bool
-fn ersetze_zeichen_hier(b: *mut Bytes, alt: u8, neu: u8) -> usize
+// Upper/lower case and replacing
+fn after_big(out: *mut Bytes, s: Span)
+fn after_small(out: *mut Bytes, s: Span)
+fn big_here(b: *mut Bytes)
+fn small_here(b: *mut Bytes)
+fn replace(out: *mut Bytes, s: Span, old: Span, new: Span) -> usize
+fn replace_first(out: *mut Bytes, s: Span, old: Span, new: Span) -> bool
+fn replace_char_here(b: *mut Bytes, old: u8, new: u8) -> usize
 
 // UTF-8
-struct Zeichenfund { cp: u32, laenge: usize, gueltig: bool }
-fn ist_folgeoktett(c: u8) -> bool
-fn utf8_lies(s: Spanne, i: usize) -> Zeichenfund
-fn utf8_naechst(s: Spanne, i: usize) -> usize
-fn utf8_vorher(s: Spanne, i: usize) -> usize
-fn utf8_ist_grenze(s: Spanne, i: usize) -> bool
-fn utf8_zaehle(s: Spanne) -> usize
-fn utf8_teil(s: Spanne, von_zeichen: usize, anzahl: usize) -> Spanne
-fn utf8_anhaengen(aus: *mut Bytes, cp: u32)
+struct CharHit { cp: u32, length: usize, valid: bool }
+fn is_cont_byte(c: u8) -> bool
+fn utf8_read(s: Span, i: usize) -> CharHit
+fn utf8_next(s: Span, i: usize) -> usize
+fn utf8_before(s: Span, i: usize) -> usize
+fn utf8_is_limit(s: Span, i: usize) -> bool
+fn utf8_count(s: Span) -> usize
+fn utf8_part(s: Span, of_char: usize, count: usize) -> Span
+fn utf8_append(out: *mut Bytes, cp: u32)
 ```
 
 Rules laid down so that nothing has to be guessed:
 
 * **Splitting** follows C# without `RemoveEmptyEntries`: `"a,b,,c"` with
   `","` gives four pieces, `""` gives exactly one empty one, an empty
-  separator gives exactly one piece (the whole source). `teiler_leerraum`
+  separator gives exactly one piece (the whole source). `divisor_whitespace`
   merges runs of whitespace and never returns an empty piece.
-* **An empty search text** is *found* at the start position — the same
-  rule as in C# and Rust. It makes `ersetze` with an empty `alt` a
+* **An empty search text** is *found* at the start position -- the same
+  rule as in C# and Rust. It makes `replace` with an empty `old` a
   no-op instead of an endless loop.
-* **`utf8_lies` checks the same rules as `utf8_is_valid`**: overlong
+* **`utf8_read` checks the same rules as `utf8_is_valid`**: overlong
   encodings, surrogates and everything above U+10FFFF are invalid. An
-  invalid octet is reported as **one** character with `gueltig = false` and
-  `cp = U+FFFD` — that way every loop is guaranteed to make progress.
-* **The creating functions clear `aus` and require that `aus` does not
+  invalid octet is reported as **one** character with `valid = false` and
+  `cp = U+FFFD` -- that way every loop is guaranteed to make progress.
+* **The creating functions clear `out` and require that `out` does not
   lie in the memory of the source.** Whoever wants to work in place takes
-  the `_hier` forms.
-* **`verbinde_teil` recognizes „there is already something there" by the
+  the `_here` forms.
+* **`join_part` recognizes "there is already something there" by the
   length of the target buffer.** A *first* empty piece therefore does not
   get a separator appended after it: `["", "a"]` with `"-"` gives `"a"`,
   not `"-a"`. For the regular case (non-empty pieces, or a buffer into
   which something was written before) that is right; whoever has to join
-  empty pieces counts along themselves and calls `anhaengen` with the
+  empty pieces counts along themselves and calls `append` with the
   separator. Deliberately left this way: the alternative would be state
   *in* the caller or a fourth parameter, and both would be worse for the
   regular case.
 
 ### 3.2 `std.num` (+422 lines, `lib/num/std_facade.fi`)
 
-One rule for the direction, readable off every name: `schreibe_*` appends
-the text of a number to a `*mut Bytes`, `lies_*` reads text and returns the
-number of **consumed** octets, `text_zu_*` is the strict form (the whole
+One rule for the direction, readable off every name: `write_*` appends
+the text of a number to a `*mut Bytes`, `read_*` reads text and returns the
+number of **consumed** octets, `text_to_*` is the strict form (the whole
 text or `false`).
 
 ```firn
 fn u64_max() -> u64          fn i64_max() -> i64        fn i64_min() -> i64
-fn ziffernwert(c: u8) -> i32
-fn ziffernzahl(v: u64, basis: u32) -> usize
+fn digit_value(c: u8) -> i32
+fn digit_count(v: u64, base: u32) -> usize
 
-fn schreibe_basis(aus: *mut Bytes, v: u64, basis: u32, gross: bool)
-fn schreibe_u64(aus: *mut Bytes, v: u64)
-fn schreibe_i64(aus: *mut Bytes, v: i64)
-fn schreibe_hex(aus: *mut Bytes, v: u64, mindest: usize)
-fn schreibe_hex_gross(aus: *mut Bytes, v: u64, mindest: usize)
-fn schreibe_binaer(aus: *mut Bytes, v: u64, mindest: usize)
-fn schreibe_oktal(aus: *mut Bytes, v: u64, mindest: usize)
-fn schreibe_breit_u64(aus: *mut Bytes, v: u64, breite: usize, fueller: u8)
-fn schreibe_breit_i64(aus: *mut Bytes, v: i64, breite: usize, fueller: u8)
+fn write_base(out: *mut Bytes, v: u64, base: u32, big: bool)
+fn write_u64(out: *mut Bytes, v: u64)
+fn write_i64(out: *mut Bytes, v: i64)
+fn write_hex(out: *mut Bytes, v: u64, min: usize)
+fn write_hex_big(out: *mut Bytes, v: u64, min: usize)
+fn write_binary(out: *mut Bytes, v: u64, min: usize)
+fn write_octal(out: *mut Bytes, v: u64, min: usize)
+fn write_wide_u64(out: *mut Bytes, v: u64, width: usize, filler: u8)
+fn write_wide_i64(out: *mut Bytes, v: i64, width: usize, filler: u8)
 
-fn lies_u64_basis(p: *mut u8, n: usize, ab: usize, basis: u32,
-                  aus: *mut u64, ueberlauf: *mut bool) -> usize
-fn lies_u64(p: *mut u8, n: usize, ab: usize, aus: *mut u64,
-            ueberlauf: *mut bool) -> usize
-fn lies_i64(p: *mut u8, n: usize, ab: usize, aus: *mut i64,
-            ueberlauf: *mut bool) -> usize
-fn text_zu_u64_basis(p: *mut u8, n: usize, basis: u32, aus: *mut u64) -> bool
-fn text_zu_u64(p: *mut u8, n: usize, aus: *mut u64) -> bool
-fn text_zu_i64(p: *mut u8, n: usize, aus: *mut i64) -> bool
-fn text_zu_u64_auto(p: *mut u8, n: usize, aus: *mut u64) -> bool   // 0x/0b/0o
+fn read_u64_base(p: *mut u8, n: usize, ab: usize, base: u32,
+                 out: *mut u64, overflow: *mut bool) -> usize
+fn read_u64(p: *mut u8, n: usize, ab: usize, out: *mut u64,
+            overflow: *mut bool) -> usize
+fn read_i64(p: *mut u8, n: usize, ab: usize, out: *mut i64,
+            overflow: *mut bool) -> usize
+fn text_to_u64_base(p: *mut u8, n: usize, base: u32, out: *mut u64) -> bool
+fn text_to_u64(p: *mut u8, n: usize, out: *mut u64) -> bool
+fn text_to_i64(p: *mut u8, n: usize, out: *mut i64) -> bool
+fn text_to_u64_auto(p: *mut u8, n: usize, out: *mut u64) -> bool   // 0x/0b/0o
 
 fn f64_bits(x: f64) -> u64            fn bits_f64(b: u64) -> f64
-fn f64_ist_nan(x: f64) -> bool        fn f64_ist_unendlich(x: f64) -> bool
-fn f64_ist_null(x: f64) -> bool       fn f64_vorzeichen(x: f64) -> bool
-fn dtoa_arbeitsbytes() -> usize       fn strtod_arbeitsbytes() -> usize
-fn schreibe_f64(aus: *mut Bytes, x: f64) -> bool
-fn schreibe_f64_bits(aus: *mut Bytes, bits: u64) -> bool
-fn lies_f64(p: *mut u8, n: usize, aus: *mut f64) -> usize
-fn lies_f64_bits(p: *mut u8, n: usize, aus: *mut u64) -> usize
-fn text_zu_f64(p: *mut u8, n: usize, aus: *mut f64) -> bool
-fn text_zu_f64_bits(p: *mut u8, n: usize, aus: *mut u64) -> bool
+fn f64_is_nan(x: f64) -> bool         fn f64_is_infinite(x: f64) -> bool
+fn f64_is_null(x: f64) -> bool        fn f64_sign(x: f64) -> bool
+fn dtoa_work_bytes() -> usize         fn strtod_work_bytes() -> usize
+fn write_f64(out: *mut Bytes, x: f64) -> bool
+fn write_f64_bits(out: *mut Bytes, bits: u64) -> bool
+fn read_f64(p: *mut u8, n: usize, out: *mut f64) -> usize
+fn read_f64_bits(p: *mut u8, n: usize, out: *mut u64) -> usize
+fn text_to_f64(p: *mut u8, n: usize, out: *mut f64) -> bool
+fn text_to_f64_bits(p: *mut u8, n: usize, out: *mut u64) -> bool
 ```
 
 * **Overflow is reported, not concealed.** Stage 0 checks nowhere in
-  arithmetic (SPEC §14.1.3); when reading *foreign* input a silent
-  wraparound would be a hole, not a blemish. `lies_*` sets
-  `ueberlauf` and reads the digits to the end anyway (the caller has to
-  know where the text continues), `text_zu_*` returns `false`.
+  arithmetic (SPEC 14.1.3); when reading *foreign* input a silent
+  wraparound would be a hole, not a blemish. `read_*` sets
+  `overflow` and reads the digits to the end anyway (the caller has to
+  know where the text continues), `text_to_*` returns `false`.
 * **The f64 wrapper costs two `mmap` per call** (14 KiB of working memory
   for `dtoa`, one intermediate buffer, because `dtoa` clears its target).
   That is the comfortable form, not the fast one; whoever writes many
@@ -258,67 +258,67 @@ fn text_zu_f64_bits(p: *mut u8, n: usize, aus: *mut u64) -> bool
 ### 3.3 `std.vec` (+312 lines, generic, `lib/rt/vec.fi`)
 
 ```firn
-fn vec_ist_leer[T](v: *mut Vec[T]) -> bool
-fn vec_kuerzen[T](v: *mut Vec[T], n: usize)
-fn vec_fuellen[T](v: *mut Vec[T], wert: T)
-fn vec_tausche[T](v: *mut Vec[T], i: usize, j: usize) -> bool
-fn vec_umkehren[T](v: *mut Vec[T])
-fn vec_index_von[T](v: *mut Vec[T], wert: T) -> usize      // len = nicht da
-fn vec_enthaelt[T](v: *mut Vec[T], wert: T) -> bool
-fn vec_zaehle[T](v: *mut Vec[T], wert: T) -> usize
-fn vec_einfuegen[T](v: *mut Vec[T], i: usize, wert: T) -> bool
-fn vec_entfernen[T](v: *mut Vec[T], i: usize) -> T          // Reihenfolge bleibt
-fn vec_entfernen_schnell[T](v: *mut Vec[T], i: usize) -> T  // O(1)
-fn vec_anhaengen[T](ziel: *mut Vec[T], quelle: *mut Vec[T]) -> bool
-fn vec_kopie[T](quelle: *mut Vec[T], ziel: *mut Vec[T]) -> bool
-fn vec_gleich[T](a: *mut Vec[T], b: *mut Vec[T]) -> bool
+fn vec_is_empty[T](v: *mut Vec[T]) -> bool
+fn vec_shorten[T](v: *mut Vec[T], n: usize)
+fn vec_fill[T](v: *mut Vec[T], value: T)
+fn vec_swap[T](v: *mut Vec[T], i: usize, j: usize) -> bool
+fn vec_invert[T](v: *mut Vec[T])
+fn vec_index_of[T](v: *mut Vec[T], value: T) -> usize      // len = not there
+fn vec_contains[T](v: *mut Vec[T], value: T) -> bool
+fn vec_count[T](v: *mut Vec[T], value: T) -> usize
+fn vec_insert[T](v: *mut Vec[T], i: usize, value: T) -> bool
+fn vec_remove[T](v: *mut Vec[T], i: usize) -> T            // order is kept
+fn vec_remove_fast[T](v: *mut Vec[T], i: usize) -> T       // O(1)
+fn vec_append[T](target: *mut Vec[T], source: *mut Vec[T]) -> bool
+fn vec_copy[T](source: *mut Vec[T], target: *mut Vec[T]) -> bool
+fn vec_equal[T](a: *mut Vec[T], b: *mut Vec[T]) -> bool
 fn vec_min[T](v: *mut Vec[T]) -> T
 fn vec_max[T](v: *mut Vec[T]) -> T
-fn vec_senken[T](v: *mut Vec[T], wurzel: usize, ende: usize)
-fn vec_sortiere[T](v: *mut Vec[T])
-fn vec_ist_sortiert[T](v: *mut Vec[T]) -> bool
-fn vec_untere_schranke[T](v: *mut Vec[T], wert: T) -> usize
-fn vec_binaersuche[T](v: *mut Vec[T], wert: T) -> usize     // len = nicht da
-fn vec_sortiert_einfuegen[T](v: *mut Vec[T], wert: T) -> bool
+fn vec_lower[T](v: *mut Vec[T], root: usize, end: usize)
+fn vec_sort[T](v: *mut Vec[T])
+fn vec_is_sorted[T](v: *mut Vec[T]) -> bool
+fn vec_lower_bound[T](v: *mut Vec[T], value: T) -> usize
+fn vec_binary_search[T](v: *mut Vec[T], value: T) -> usize // len = not there
+fn vec_sorted_insert[T](v: *mut Vec[T], value: T) -> bool
 ```
 
-**Why heapsort and not quicksort** — three verifiable reasons:
-O(n log n) even in the worst case (quicksort degenerates to O(n²) on input
-that is already sorted or uniformly distributed — exactly the kind that
+**Why heapsort and not quicksort** -- three verifiable reasons:
+O(n log n) even in the worst case (quicksort degenerates to O(n^2) on input
+that is already sorted or uniformly distributed -- exactly the kind that
 occurs constantly in a compiler), no extra memory (mergesort would need n
 elements), no recursion (its depth would otherwise hang on the input, and
 stage 0 has no stack check). The price is stated along with it: **not
 stable**.
 
-The order is that of the type (`<` on `T`) — for `u64` therefore the
-unsigned one. `tests/802` therefore deliberately also sorts a `Vec[u64]`
-with 2⁶³ and 2⁶⁴−1 in it.
+The order is that of the type (`<` on `T`) -- for `u64` therefore the
+unsigned one. That is why `tests/802` deliberately sorts a `Vec[u64]` as
+well, with 2^63 and 2^64-1 in it.
 
 ### 3.4 `std.map` (+139 lines, generic, `lib/rt/map.fi`)
 
 ```firn
-fn map_ist_leer[K, V](m: *mut Map[K, V]) -> bool
-fn map_tot[K, V](m: *mut Map[K, V]) -> usize
-fn map_naechster[K, V](m: *mut Map[K, V], ab: usize) -> usize   // kap = Ende
-fn map_erstes[K, V](m: *mut Map[K, V]) -> usize
-fn map_hol_oder[K, V](m: *mut Map[K, V], k: K, vorgabe: V) -> V
-fn map_hol_wenn[K, V](m: *mut Map[K, V], k: K, aus: *mut V) -> bool
-fn map_wert_adresse[K, V](m: *mut Map[K, V], k: K) -> u64        // 0 = fehlt
-fn map_setzen_wenn_neu[K, V](m: *mut Map[K, V], k: K, v: V,
-                             eingefuegt: *mut bool) -> bool
-fn map_erhoehen[K, V](m: *mut Map[K, V], k: K, delta: V) -> V
-fn map_nehmen[K, V](m: *mut Map[K, V], k: K, aus: *mut V) -> bool
-fn map_aufraeumen[K, V](m: *mut Map[K, V]) -> bool
+fn map_is_empty[K, V](m: *mut Map[K, V]) -> bool
+fn map_dead[K, V](m: *mut Map[K, V]) -> usize
+fn map_next[K, V](m: *mut Map[K, V], ab: usize) -> usize   // cap = the end
+fn map_first[K, V](m: *mut Map[K, V]) -> usize
+fn map_get_or[K, V](m: *mut Map[K, V], k: K, default: V) -> V
+fn map_get_if[K, V](m: *mut Map[K, V], k: K, out: *mut V) -> bool
+fn map_value_address[K, V](m: *mut Map[K, V], k: K) -> u64  // 0 = missing
+fn map_set_if_new[K, V](m: *mut Map[K, V], k: K, v: V,
+                        inserted: *mut bool) -> bool
+fn map_increase[K, V](m: *mut Map[K, V], k: K, delta: V) -> V
+fn map_take[K, V](m: *mut Map[K, V], k: K, out: *mut V) -> bool
+fn map_cleanup[K, V](m: *mut Map[K, V]) -> bool
 ```
 
 Iteration as a **cursor over the slots**, not as an array:
 
 ```firn
-var i: usize = map_naechster[K, V](&m, 0)
-while i < map_kap[K, V](&m) {
-    let k: K = map_platz_schluessel[K, V](&m, i)
-    let w: V = map_platz_wert[K, V](&m, i)
-    i = map_naechster[K, V](&m, i + 1)
+var i: usize = map_next[K, V](&m, 0)
+while i < map_cap[K, V](&m) {
+    let k: K = map_slot_key[K, V](&m, i)
+    let w: V = map_slot_value[K, V](&m, i)
+    i = map_next[K, V](&m, i + 1)
 }
 ```
 
@@ -335,23 +335,23 @@ can rehash). Deleting is harmless.
 ### 3.5 `std.math` (+633 lines)
 
 ```firn
-// Konstanten und Bitmuster
+// Constants and bit patterns
 fn TAU() -> f64      fn SQRT2() -> f64   fn LN2() -> f64    fn LN10() -> f64
 fn INF() -> f64      fn NAN() -> f64     fn EPSILON() -> f64
 fn math_bits(x: f64) -> u64              fn math_f64(b: u64) -> f64
-fn ist_nan(x: f64) -> bool   fn ist_unendlich(x: f64) -> bool
-fn ist_endlich(x: f64) -> bool
+fn is_nan(x: f64) -> bool    fn is_infinite(x: f64) -> bool
+fn is_finite(x: f64) -> bool
 
-// Ganzzahl
+// Integers
 fn sign(x: i64) -> i64
 fn min_u(a: u64, b: u64) -> u64          fn max_u(a: u64, b: u64) -> u64
 fn clamp_u(x: u64, lo: u64, hi: u64) -> u64
 fn abs_diff(a: i64, b: i64) -> u64       fn gcd(a: u64, b: u64) -> u64
 fn lcm(a: u64, b: u64) -> u64            fn ilog2(v: u64) -> usize
-fn ilog10(v: u64) -> usize               fn ist_zweierpotenz(v: u64) -> bool
-fn naechste_zweierpotenz(v: u64) -> u64  fn pow_u(b: u64, e: u64) -> u64
+fn ilog10(v: u64) -> usize               fn is_pow_two(v: u64) -> bool
+fn next_pow_two(v: u64) -> u64           fn pow_u(b: u64, e: u64) -> u64
 
-// Gleitkomma, EXAKT
+// Floating point, EXACT
 fn fabs(x: f64) -> f64    fn fmin(a: f64, b: f64) -> f64
 fn fmax(a: f64, b: f64) -> f64            fn fclamp(x: f64, lo: f64, hi: f64) -> f64
 fn trunc(x: f64) -> f64   fn floor(x: f64) -> f64   fn ceil(x: f64) -> f64
@@ -359,18 +359,18 @@ fn round(x: f64) -> f64   fn fmod(x: f64, y: f64) -> f64
 fn hypot(x: f64, y: f64) -> f64
 fn ldexp(x: f64, k: i64) -> f64           fn frexp(x: f64, e: *mut i64) -> f64
 
-// Gleitkomma, GENÄHERT
+// Floating point, APPROXIMATE
 fn exp(x: f64) -> f64     fn ln(x: f64) -> f64
 fn log2(x: f64) -> f64    fn log10(x: f64) -> f64
 fn powf(b: f64, e: f64) -> f64
 fn sin(x: f64) -> f64     fn cos(x: f64) -> f64     fn tan(x: f64) -> f64
 fn atan(x: f64) -> f64    fn atan2(y: f64, x: f64) -> f64
-fn nahe(a: f64, b: f64, eps: f64) -> bool
+fn near(a: f64, b: f64, eps: f64) -> bool
 ```
 
 * **`trunc/floor/ceil/round` do not compute, they cut off bits.** That way
-  they are also right at 2⁵² and above, where every formula with `+0.5` is
-  wrong, and `round(0.49999999999999994)` is `0.0` instead of erroneously
+  they stay right at 2^52 and above as well, where every formula with `+0.5`
+  is wrong, and `round(0.49999999999999994)` is `0.0` instead of erroneously
   `1.0`.
 * **`fmod` is exact**: the magnitude of the divisor is doubled until it lies
   above the remainder, then subtracted while halving — every intermediate
@@ -384,47 +384,46 @@ fn nahe(a: f64, b: f64, eps: f64) -> bool
   precision and loses digits there. That is the usual limit without
   Payne-Hanek reduction.
 * **Naming rule, deliberately kept:** mathematical functions carry their
-  international name (`sqrt`, `floor`, `exp`, `sin`) — the module has been
-  called that since round 39, and a `wurzel` next to the existing `sqrt`
+  international name (`sqrt`, `floor`, `exp`, `sin`) -- the module has been
+  called that since round 39, and a second name next to the existing `sqrt`
   would be two names for one thing. Everything that is not an established
-  function name is German (`ist_zweierpotenz`, `naechste_zweierpotenz`,
-  `nahe`).
+  function name is spelled out (`is_pow_two`, `next_pow_two`, `near`).
 
 ### 3.6 `std.io` (+285 lines)
 
 ```firn
 fn println(p: u64, n: usize)             fn eprintln(p: u64, n: usize)
 fn print_c(p: u64)                       fn eprint_c(p: u64)
-fn print_zeile()                         fn print_fd(fd: i64, p: u64, n: usize) -> bool
-fn read_stdin(aus: *mut rt.Buf) -> bool
-fn append_file(pfad: u64, p: u64, n: usize) -> bool      // O_APPEND
-fn file_exists(pfad: u64) -> bool
+fn print_line()                          fn print_fd(fd: i64, p: u64, n: usize) -> bool
+fn read_stdin(out: *mut rt.Buf) -> bool
+fn append_file(path: u64, p: u64, n: usize) -> bool      // O_APPEND
+fn file_exists(path: u64) -> bool
 
-struct Zeilenleser { p: u64, n: usize, i: usize }
-fn zeilen_neu(p: u64, n: usize) -> Zeilenleser
-fn zeilen_von_buf(b: *mut rt.Buf) -> Zeilenleser
-fn zeilen_naechst(z: *mut Zeilenleser, ap: *mut u64, an: *mut usize) -> bool
-fn zeilen_zahl(p: u64, n: usize) -> usize
+struct LineReader { p: u64, n: usize, i: usize }
+fn lines_new(p: u64, n: usize) -> LineReader
+fn lines_of_buf(b: *mut rt.Buf) -> LineReader
+fn lines_next(z: *mut LineReader, ap: *mut u64, an: *mut usize) -> bool
+fn lines_number(p: u64, n: usize) -> usize
 
-fn fmt_zeichen(f: Fmt, c: u8) -> Fmt     fn fmt_bool(f: Fmt, w: bool) -> Fmt
-fn fmt_u64(f: Fmt, v: u64) -> Fmt        fn fmt_hex(f: Fmt, v: u64, mindest: usize) -> Fmt
-fn fmt_c(f: Fmt, p: u64) -> Fmt          fn fmt_wiederhole(f: Fmt, c: u8, mal: usize) -> Fmt
-fn fmt_zeile(f: Fmt) -> Fmt              fn fmt_breit(f: Fmt, v: i64, breite: usize, fueller: u8) -> Fmt
-fn fmt_anhaengen(f: Fmt, h: Fmt) -> Fmt  // h wird angehängt UND freigegeben
-fn fmt_inhalt(f: Fmt, aus: *mut rt.Buf)  // Inhalt in einen Puffer, f frei
-fn fmt_druck_zeile(f: Fmt)               fn fmt_eprint(f: Fmt)
-fn fmt_eprint_zeile(f: Fmt)              fn fmt_in_datei(f: Fmt, pfad: u64) -> bool
+fn fmt_char(f: Fmt, c: u8) -> Fmt        fn fmt_bool(f: Fmt, w: bool) -> Fmt
+fn fmt_u64(f: Fmt, v: u64) -> Fmt        fn fmt_hex(f: Fmt, v: u64, min: usize) -> Fmt
+fn fmt_c(f: Fmt, p: u64) -> Fmt          fn fmt_repeat(f: Fmt, c: u8, times: usize) -> Fmt
+fn fmt_line(f: Fmt) -> Fmt               fn fmt_wide(f: Fmt, v: i64, width: usize, filler: u8) -> Fmt
+fn fmt_append(f: Fmt, h: Fmt) -> Fmt     // h is appended AND released
+fn fmt_content(f: Fmt, out: *mut rt.Buf) // the content into a buffer, f released
+fn fmt_print_line(f: Fmt)                fn fmt_eprint(f: Fmt)
+fn fmt_eprint_line(f: Fmt)               fn fmt_in_file(f: Fmt, path: u64) -> bool
 ```
 
 With that the **two gaps that `docs/RUNDE39.md` explicitly named at the
-end** are closed: `fmt_zeichen` (a character as a *letter*, not
-as a decimal number — `f"{c}"` otherwise shows `65` instead of `A`) and
-`fmt_inhalt` (result into a buffer instead of onto stdout).
+end** are closed: `fmt_char` (a character as a *letter*, not
+as a decimal number -- `f"{c}"` otherwise shows `65` instead of `A`) and
+`fmt_content` (result into a buffer instead of onto stdout).
 
-The `Zeilenleser` is a cursor over an already read block: every
+The `LineReader` is a cursor over an already read block: every
 line comes as pointer+length **inside** the block, without a copy. The
 line break does not belong to the line, a preceding `\r` falls away, and a
-trailing `\n` produces **no** empty final line — the rule that
+trailing `\n` produces **no** empty final line -- the rule that
 `wc -l` and every editor use.
 
 ---
@@ -501,10 +500,10 @@ same way.** Measured with `num.f64_bits` on both compilers:
 | `2.718281828459045` | 4613303445314885481 | 4613303445314885481 | identical |
 | `0.1` | 4591870180066957722 | 4591870180066957722 | identical |
 
-`firnc0` agrees with the correct rounding, `firnc1` deviates by 1–2 ULP.
+`firnc0` agrees with the correct rounding, `firnc1` deviates by 1-2 ULP.
 That is the **one** known deviation that `tools/lex_compare.sh`
-has long been reporting as „UNGLEICH: 1 (bekannt und benannt: 1) /
-GLEITKOMMA außerhalb des schnellen Pfades: 1" — the new `std.num` only
+has long been reporting as "DIFFERENT: 1 (known and named: 1) /
+FLOATING POINT outside the fast path: 1" -- the new `std.num` only
 makes it *visible* for the first time, because it can print bit patterns.
 The tests of this round deliberately avoid such literals and **compute**
 the values instead (`0.1 + 0.2`, `ldexp(1.0, 51) + 0.5`); the fix belongs

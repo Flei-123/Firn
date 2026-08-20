@@ -46,7 +46,7 @@ with **exactly one** line.
 
 * The normal case: the html5lib token array, e.g.
   `[["StartTag","div",{"a":"b"}],["Character","x"],["EndTag","div"]]`
-* `["NICHT-UNTERSTUETZT"]`: the tokenizer reached a state it does not
+* the unsupported marker: the tokenizer reached a state it does not
   implement yet, or a means was not available (for example the name table of
   the character references could not be created, see
   `lib/html/entities.fi`). The harness counts such a thing as a **failure** --

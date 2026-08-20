@@ -231,10 +231,10 @@ fi
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then
-    echo "PASS $PASS/$TOTAL (Optimierer-Nachweis)"
+    echo "PASS $PASS/$TOTAL (proof of the optimiser)"
     exit 0
 else
-    echo "FAIL $FAIL/$TOTAL fehlgeschlagen:"
+    echo "FAIL $FAIL/$TOTAL failed:"
     printf "%b\n" "$FAILED"
     exit 1
 fi

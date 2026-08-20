@@ -15,19 +15,19 @@ the type table.
 $ ./compiler/target/release/firnc --list-attrs | head -5
 Attribute
 
-NAME            ZIEL         ARGS  STUFE 0     ZWECK
-must_consume    fn, struct   0     umgesetzt   Ergebnis darf nicht verworfen werden (SPEC 3.3, 5.1)
-no_gc           fn           0     umgesetzt   kein Sammellauf in diesem Aufrufbaum (SPEC 3.5.4)
+NAME            TARGET       ARGS  STAGE 0     PURPOSE
+must_consume    fn, struct   0     implemented result must not be discarded (SPEC 3.3, 5.1)
+no_gc           fn           0     implemented no collection run in this call tree (SPEC 3.5.4)
 ```
 
-The remaining attributes stay rejected as before — `constant_time`,
+The remaining attributes stay rejected as before -- `constant_time`,
 `unwinds`, `packed`, `align`, `layout`, `no_move`, `abi_stable`, `frozen`,
-`hot` still report „attribut '…' ist in Stufe 0 nicht umgesetzt"
+`hot` still report "attribute '...' is not implemented in stage 0"
 (`tests/neg/attr_not_implemented.fi` unchanged green, plus the
-module test `attrs::tests::nicht_umgesetzte_attribute_melden_weiter_einen_fehler`).
-The test `nur_must_consume_ist_umgesetzt` was pulled along and now demands
-exactly `["must_consume", "no_gc"]` — the bracket that prevents an
-attribute from silently becoming „implemented".
+module test `attrs::tests::not_implemented_attribute_report_next_a_error`).
+The test `only_must_consume_is_implemented` was pulled along and now demands
+exactly `["must_consume", "no_gc"]` -- the bracket that prevents an
+attribute from silently becoming "implemented".
 
 ### The three rules
 
@@ -78,40 +78,40 @@ arbitrarily many levels and across module boundaries.
 
 ```
 $ ./compiler/target/release/firnc -o /dev/null tests/neg/nogc_call_without_attr.fi
-error: 'heiss' ist #[no_gc], ruft aber 'langsam' ohne #[no_gc]
+error: 'hot' is #[no_gc], but calls 'slow' without #[no_gc]
    --> tests/neg/nogc_call_without_attr.fi:11:12
     |
- 11 |     return langsam(a)
-    |            ^^^^^^^ hier
-    = hinweis: SPEC 3.5.4: die Zusage gilt transitiv fuer den ganzen Aufrufbaum — schreibe #[no_gc] vor 'langsam' oder rufe es hier nicht auf
+ 11 |     return slow(a)
+    |            ^^^^ here
+    = note: SPEC 3.5.4: the promise holds transitively for the whole call tree -- write #[no_gc] before 'slow' or do not call it here
 
 $ ./compiler/target/release/firnc -o /dev/null tests/neg/nogc_transitiv.fi
-error: 'mitte' ist #[no_gc], ruft aber 'unten' ohne #[no_gc]
+error: 'mid' is #[no_gc], but calls 'below' without #[no_gc]
    --> tests/neg/nogc_transitiv.fi:21:17
     |
- 21 |         s = s + unten(a)
-    |                 ^^^^^ hier
-    = hinweis: SPEC 3.5.4: die Zusage gilt transitiv fuer den ganzen Aufrufbaum — schreibe #[no_gc] vor 'unten' oder rufe es hier nicht auf
+ 21 |         s = s + below(a)
+    |                 ^^^^^ here
+    = note: SPEC 3.5.4: the promise holds transitively for the whole call tree -- write #[no_gc] before 'below' or do not call it here
 
 $ ./compiler/target/release/firnc -o /dev/null tests/neg/nogc_match_case.fi
-error: 'schritt' ist #[no_gc], ruft aber 'protokoll' ohne #[no_gc]
-   --> tests/neg/nogc_match_case.fi:17:35
+error: 'step' is #[no_gc], but calls 'log' without #[no_gc]
+   --> tests/neg/nogc_match_case.fi:17:32
     |
- 17 |         Zustand::Ende => { return protokoll(c) }
-    |                                   ^^^^^^^^^ hier
-    = hinweis: SPEC 3.5.4: die Zusage gilt transitiv fuer den ganzen Aufrufbaum — schreibe #[no_gc] vor 'protokoll' oder rufe es hier nicht auf
+ 17 |         State::End => { return log(c) }
+    |                                ^^^ here
+    = note: SPEC 3.5.4: the promise holds transitively for the whole call tree -- write #[no_gc] before 'log' or do not call it here
 
 $ ./compiler/target/release/firnc -o /dev/null tests/neg/nogc_modulgrenze.fi
-error: 'heiss' ist #[no_gc], ruft aber 'nogc_kalt.aufwaendig' ohne #[no_gc]
+error: 'hot' is #[no_gc], but calls 'nogc_cold.costly' without #[no_gc]
    --> tests/neg/nogc_modulgrenze.fi:10:12
     |
- 10 |     return nogc_kalt.aufwaendig(a)
-    |            ^^^^^^^^^^^^^^^^^^^^ hier
-    = hinweis: SPEC 3.5.4: die Zusage gilt transitiv fuer den ganzen Aufrufbaum — schreibe #[no_gc] vor 'nogc_kalt.aufwaendig' oder rufe es hier nicht auf
+ 10 |     return nogc_cold.costly(a)
+    |            ^^^^^^^^^^^^^^^^ here
+    = note: SPEC 3.5.4: the promise holds transitively for the whole call tree -- write #[no_gc] before 'nogc_cold.costly' or do not call it here
 ```
 
 In `tests/neg/nogc_transitiv.fi` the break deliberately lies **one level
-deeper** than the marked entry (`oben` → `mitte` → `unten`): what is
+deeper** than the marked entry (`above` -> `mid` -> `below`): what is
 reported is the place at which the chain tears.
 
 ## 3. Positive tests
@@ -150,14 +150,14 @@ collection can take place, there is no barrier and no pause.
 The rate has **not** become worse (`bash tools/tokenizer/run.sh`):
 
 ```
-== 3. Gleiche Bilanz in allen drei Baustufen ==
-   noopt: 6810 ohne / 6809 mit Fehlercodes — gleich
-   devfast: 6810 ohne / 6809 mit Fehlercodes — gleich
+== 3. the same balance in all three build stages ==
+   noopt: 6810 without / 6809 with error codes -- equal
+   devfast: 6810 without / 6809 with error codes -- equal
 
-== 5. Regressionsschranke ==
-   ohne Fehlercodes: 6810 / 6810   (Schranke: 6810)
-   mit  Fehlercodes: 6809 / 6810   (Schranke: 6809)
-OK: 6810 / 6810 ohne, 6809 / 6810 mit Fehlercodes bestanden
+== 5. regression limit ==
+   without error codes: 6810 / 6810   (limit: 6810)
+   with error codes:    6809 / 6810   (limit: 6809)
+OK: 6810 / 6810 without, 6809 / 6810 with error codes passed
 ```
 
 ### Counter-check: does the marking really take effect?
@@ -168,18 +168,18 @@ immediately (restored afterwards):
 
 ```
 $ ./compiler/target/release/firnc -o .test-work/tk lib/html/tokenize_main.fi
-error: 'lies_u32' ist #[no_gc], ruft aber 'mem.buf_at' ohne #[no_gc]
+error: 'read_u32' is #[no_gc], but calls 'mem.buf_at' without #[no_gc]
    --> lib/html/tokenize_main.fi:32:19
     |
  32 |         v = v | ((mem.buf_at(b, off + i) as u32) << (8 * i as u32))
-    |                   ^^^^^^^^^^ hier
-    = hinweis: SPEC 3.5.4: die Zusage gilt transitiv fuer den ganzen Aufrufbaum — schreibe #[no_gc] vor 'mem.buf_at' oder rufe es hier nicht auf
-error: 'dekodiere' ist #[no_gc], ruft aber 'mem.buf_at' ohne #[no_gc]
+    |                   ^^^^^^^^^^ here
+    = note: SPEC 3.5.4: the promise holds transitively for the whole call tree -- write #[no_gc] before 'mem.buf_at' or do not call it here
+error: 'decode' is #[no_gc], but calls 'mem.buf_at' without #[no_gc]
    --> lib/html/tokenize_main.fi:45:23
     |
  45 |         let c0: u32 = mem.buf_at(b, off + i) as u32
-    |                       ^^^^^^^^^^ hier
-    = hinweis: SPEC 3.5.4: die Zusage gilt transitiv fuer den ganzen Aufrufbaum — schreibe #[no_gc] vor 'mem.buf_at' oder rufe es hier nicht auf
+    |                       ^^^^^^^^^^ here
+    = note: SPEC 3.5.4: the promise holds transitively for the whole call tree -- write #[no_gc] before 'mem.buf_at' or do not call it here
 ```
 
 ## 5. Module tests of the compiler
@@ -239,14 +239,14 @@ test result: ok. 134 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 cargo build --release --manifest-path compiler/Cargo.toml   # 0 Warnungen
 cargo test  --release --manifest-path compiler/Cargo.toml   # 134 passed
 bash tools/tokenizer/run.sh                                 # 6810/6810, 6809/6810
-bash test.sh                                                # Abschnitte 1-9
+bash test.sh                                                # sections 1-9
 ```
 
 Result of the complete run at the time of this completion notice:
 
 ```
-== 9. HTML5-Tokenizer gegen html5lib (tools/tokenizer/run.sh) ==
-   GESAMT                      6810 /  6810 100.00 %    6809 /  6810  99.99 %
+== 9. HTML5 tokenizer against html5lib (tools/tokenizer/run.sh) ==
+   TOTAL                       6810 /  6810 100.00 %    6809 /  6810  99.99 %
 
 PASS 510/510
 ```
