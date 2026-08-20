@@ -106,6 +106,13 @@ fn resolve(t: &TypeExpr, idx: &HashMap<String, usize>) -> Type {
     match t {
         TypeExpr::Ptr { mutable, inner, .. } => Type::ptr(resolve(inner, idx), *mutable),
         TypeExpr::Array { elem, len, .. } => Type::Array(Box::new(resolve(elem, idx)), *len),
+        TypeExpr::Fn { params, ret, .. } => Type::Fn {
+            params: params.iter().map(|x| resolve(x, idx)).collect(),
+            ret: Box::new(match ret {
+                Some(r) => resolve(r, idx),
+                None => Type::Void,
+            }),
+        },
         TypeExpr::Named(n, _) => match n.as_str() {
             "i8" => Type::I8,
             "i16" => Type::I16,
@@ -155,5 +162,12 @@ fn tyname(t: &Type, tcx: &TypeCtx) -> String {
             .get(*i)
             .map(|s| s.name.clone())
             .unwrap_or_else(|| "?".to_string()),
+        // Round 58: a function value. One word wide, so it lands in the
+        // integer class like every pointer; the rendering names the
+        // signature, so that a wrong arity shows up in the comparison.
+        Type::Fn { params, ret } => {
+            let ps: Vec<String> = params.iter().map(|x| tyname(x, tcx)).collect();
+            format!("(fn ({}) {})", ps.join(" "), tyname(ret, tcx))
+        }
     }
 }

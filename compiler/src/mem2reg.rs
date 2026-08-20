@@ -158,7 +158,7 @@ pub(crate) fn replace_uses(f: &mut Func, map: &HashMap<Val, Val>) -> usize {
                         rep(a, &mut n);
                     }
                 }
-                Op::VtabAddr { .. } => {}
+                Op::VtabAddr { .. } | Op::FnRef { .. } => {}
                 Op::CopyMem { dst, src, .. } => {
                     rep(dst, &mut n);
                     rep(src, &mut n);

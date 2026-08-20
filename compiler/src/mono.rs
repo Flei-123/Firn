@@ -210,6 +210,8 @@ fn satisfies(te: &TypeExpr, b: &Bound) -> bool {
             TypeExpr::Ptr { .. } => true,
             TypeExpr::Named(n, _) => is_int_name(n) || n == "bool",
             TypeExpr::Array { .. } => false,
+            // Round 58: a function value is one word wide, so it is a scalar.
+            TypeExpr::Fn { .. } => true,
         },
         // Interfaces are decided by `iface.rs`, not by the type shape.
         Bound::Iface(_) => false,
@@ -241,6 +243,11 @@ fn subst_ty(
         TypeExpr::Array { elem, len, span } => TypeExpr::Array {
             elem: Box::new(subst_ty(elem, map, queue)),
             len: *len,
+            span: *span,
+        },
+        TypeExpr::Fn { params, ret, span } => TypeExpr::Fn {
+            params: params.iter().map(|p| subst_ty(p, map, queue)).collect(),
+            ret: ret.as_ref().map(|r| Box::new(subst_ty(r, map, queue))),
             span: *span,
         },
     }
@@ -302,6 +309,11 @@ fn with_span(t: &TypeExpr, sp: Span) -> TypeExpr {
         TypeExpr::Ptr { mutable, inner, .. } => TypeExpr::Ptr {
             mutable: *mutable,
             inner: inner.clone(),
+            span: sp,
+        },
+        TypeExpr::Fn { params, ret, .. } => TypeExpr::Fn {
+            params: params.clone(),
+            ret: ret.clone(),
             span: sp,
         },
         TypeExpr::Array { elem, len, .. } => TypeExpr::Array {
@@ -543,6 +555,14 @@ fn check_bare_ty(te: &TypeExpr, out: &mut Vec<(Span, String)>) {
             }
         }
         TypeExpr::Ptr { inner, .. } => check_bare_ty(inner, out),
+        TypeExpr::Fn { params, ret, .. } => {
+            for p in params {
+                check_bare_ty(p, out);
+            }
+            if let Some(r) = ret {
+                check_bare_ty(r, out);
+            }
+        }
         TypeExpr::Array { elem, .. } => check_bare_ty(elem, out),
     }
 }
