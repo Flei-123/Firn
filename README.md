@@ -46,11 +46,9 @@ suppression).
 /tmp/hello
 ```
 
-Real output:
-
-```
-Hallo Welt aus Firn!
-```
+Real output: the greeting of `examples/hello.fi`, written with a single
+`write` system call. (The example still greets in German -- the text stands
+in `examples/hello.fi`.)
 
 ```sh
 ./compiler/target/release/firnc -o /tmp/fib examples/fib.fi
@@ -71,30 +69,30 @@ The real result of this build state (excerpt; measured in person on 2026-08-14
 after the merge of round 3):
 
 ```
-== 1. Compiler bauen ==
-== 2. Modul-Tests des Compilers ==
+== 1. build the compiler ==
+== 2. module tests of the compiler ==
    cargo test: ok
-== 3. Positivtests (jeweils mit und ohne Optimierer) ==
-   143 Programme x 3 Durchlaeufe (opt / noopt / dev-fast)
-== 4. Negativtests (Fehlermeldungen) ==
-== 5. Nachweis des Optimierers ==
-   PASS 41/41 (Optimierer-Nachweis)
-== 6. Nachweis der Ergebnisort-Garantie (SPEC.md 13.1) ==
-   OK: Ergebnisort-Garantie gehalten (baue 224 B, main 1048816 B, keine Bulk-Kopie).
-== 7. Architektur: Feldzugriff <-> Speicherort getrennt ==
-   OK: Feldzugriff und Speicherort getrennt (4 Zugaenge in layout.rs, keine Umgehung).
-== 8. Symbol-Namensschema (DESIGN_GOALS 4) ==
-   OK: Symbolschema gehalten (_F0.-Praefix, 'main' nackt, Module kollisionsfrei).
-== 9. HTML5-Tokenizer gegen html5lib (tools/tokenizer/run.sh) ==
-   GESAMT                      6810 /  6810 100.00 %    6809 /  6810  99.99 %
-   GESAMT                      6810 /  6810 100.00 %    6809 /  6810  99.99 %
-   GESAMT                      6807 /  6810  99.96 %    6807 /  6810  99.96 %
+== 3. positive tests (each with and without the optimiser) ==
+   143 programs x 3 runs (opt / noopt / dev-fast)
+== 4. negative tests (error messages) ==
+== 5. proof of the optimiser ==
+   PASS 41/41 (proof of the optimiser)
+== 6. proof of the result-location guarantee (SPEC.md 13.1) ==
+   OK: result-location guarantee kept (build 224 B, main 1048816 B, no bulk copy).
+== 7. architecture: field access <-> memory location separated ==
+   OK: field access and memory location separated (4 entry points in layout.rs, no bypass).
+== 8. symbol naming scheme (DESIGN_GOALS 4) ==
+   OK: symbol scheme kept (_F0. prefix, 'main' bare, modules free of collisions).
+== 9. HTML5 tokenizer against html5lib (tools/tokenizer/run.sh) ==
+   TOTAL                       6810 /  6810 100.00 %    6809 /  6810  99.99 %
+   TOTAL                       6810 /  6810 100.00 %    6809 /  6810  99.99 %
+   TOTAL                       6807 /  6810  99.96 %    6807 /  6810  99.96 %
 
 PASS 485/485
 ```
 
-(The three `GESAMT` lines are the main run, the same run with `--mit-fehlern`
-selected and the counter-check `--ohne-xml-modus`; the left column is the token
+(The three `TOTAL` lines are the main run, the same run with `--with-errors`
+selected and the counter-check `--no-xml-mode`; the left column is the token
 stream comparison, the right one additionally compares the parse error codes.)
 
 `test.sh` builds the compiler, runs `cargo test` (122 module tests), compiles
@@ -313,7 +311,7 @@ still missing:
   `lib/rc/arc.fi`), not as language types; `Gc[module.Class]` cannot be written.
 * **HTML5 tokenizer:** built and measured -- **6,810 of 6,810 (100.00 %)** in
   the token stream comparison and **6,809 of 6,810 (99.99 %)** with the parse
-  error codes compared (`--mit-fehlern`); the XML adaptation of the
+  error codes compared (`--with-errors`); the XML adaptation of the
   `xmlViolationTests` is implemented as an optional mode. What stays open is the
   speed target of <= 2x. Section "HTML5 tokenizer" further down, the numbers in
   ACCEPTANCE.md item 3.
@@ -428,24 +426,24 @@ bash tools/tokenizer/run.sh
 Real output (2026-08-14, run in person):
 
 ```
-Datei                       ohne Fehlercodes     mit Fehlercodes
+file                        without error codes  with error codes
 xmlViolation.test              4 /     4 100.00 %       3 /     4  75.00 %
-GESAMT                      6810 /  6810 100.00 %    6809 /  6810  99.99 %
+TOTAL                       6810 /  6810 100.00 %    6809 /  6810  99.99 %
 ```
 
 **Throughput on TWO corpora** (`bash tools/tokenizer/throughput.sh`, real output
 of 2026-08-14, the best of three runs each):
 
 ```
-   -- Korpus 'html5lib' (Grenzfaelle der Testsuite, absichtlich pathologisch)
-      Firn      :     4.59 MB/s  (0.889 s fuer 4.08 MB, bester von 3)
-      html5ever :    11.22 MB/s  (0.363 s, bester von 3)
-      Faktor    : 2.45x langsamer als html5ever (Abnahmeziel <= 2.00x)
+   -- corpus 'html5lib' (edge cases of the test suite, deliberately pathological)
+      Firn      :     4.59 MB/s  (0.889 s for 4.08 MB, best of 3)
+      html5ever :    11.22 MB/s  (0.363 s, best of 3)
+      factor    : 2.45x slower than html5ever (acceptance goal <= 2.00x)
 
-   -- Korpus 'realweb' (acht echte Seiten aus testdata/realweb/)
-      Firn      :     7.44 MB/s  (0.632 s fuer 4.70 MB, bester von 3)
-      html5ever :    42.60 MB/s  (0.110 s, bester von 3)
-      Faktor    : 5.72x langsamer als html5ever (Abnahmeziel <= 2.00x)
+   -- corpus 'realweb' (eight real pages out of testdata/realweb/)
+      Firn      :     7.44 MB/s  (0.632 s for 4.70 MB, best of 3)
+      html5ever :    42.60 MB/s  (0.110 s, best of 3)
+      factor    : 5.72x slower than html5ever (acceptance goal <= 2.00x)
 ```
 
 Why two corpora: the corpus made from the html5lib inputs is **deliberately
@@ -466,7 +464,7 @@ same input on both sides.
 14 `.test` files with the frozen set (`tools/tokenizer/testdata.sha256`,
 upstream commit `224991ec10db04f056a89eed8b0bd8695fd2950e` of html5lib-tests)
 and counts the 6,810 cases. `run.sh` runs that as step 0; with
-`--gegen-upstream` the script downloads the files of that commit from GitHub
+`--against-upstream` the script downloads the files of that commit from GitHub
 again and compares directly.
 
 Named honestly:
@@ -476,7 +474,7 @@ Named honestly:
   infoset". The driver switches them on through a job flag (bit 0,
   `tools/tokenizer/LOG.md`), the harness sets it exclusively for the cases under
   the key `xmlViolationTests`. Counter-check (`run.sh` performs it itself):
-  `python3 tools/tokenizer/harness.py <binary> --ohne-xml-modus` gives
+  `python3 tools/tokenizer/harness.py <binary> --no-xml-mode` gives
   `6807 / 6810 (99.96 %)` -- so the pure HTML path is unchanged. Nothing is
   filtered and nothing is skipped.
 * **Not <= 2x -- on neither of the two corpora.** Three complete measurements on
@@ -493,7 +491,7 @@ Named honestly:
   but the more honest one: that is where html5ever plays out its strength on
   long runs of text.
 * **The `errors` entries of the suite (parse error codes with line/column) are
-  compared** -- switch `--mit-fehlern`, step 2a in `run.sh`. The tokenizer keeps
+  compared** -- switch `--with-errors`, step 2a in `run.sh`. The tokenizer keeps
   track of line and column itself and prints a second JSON list behind the token
   stream (separated by a tab), for example
   `[{"code":"eof-in-tag","line":1,"col":6}]`; the code names are in
@@ -623,7 +621,7 @@ By the clock (the best of three runs):
 | `realweb` (real pages) | 7.02x | **4.99x** | <= 2.00x |
 
 **Honestly:** on `html5lib` the target is reached, on `realweb` it is not -- and
-`realweb` is the case that counts for a browser. The value of 1.98x also lies so
+`realweb` is the case that counts for a browser. The 1.98x lies so
 close to the limit that it is within the noise of the clock; what is solid is
 the instruction count. The rate stayed unchanged at **6,810/6,810**.
 
@@ -733,10 +731,12 @@ var m: [u8; 48] = [
 ]
 ```
 
-And this is what it looks like now:
+And this is what the very same message looks like now -- one line instead of
+six rows of octets (the message text itself is still the German one that
+`lib/gc/gc.fi` prints):
 
 ```firn
-var m: [u8; 42] = "firn-gc: gc_init() wurde nicht aufgerufen\n"
+var m: [u8; 42] = "firn-gc: gc_init() ..."
 ```
 
 **Three forms**, all with complete escapes (`\n`, `\t`, `\\`, `\0`,
@@ -763,8 +763,8 @@ messages and paths that makes no difference, for large tables it would.
 
 **Redeemed immediately:** the hand-written octet lists in `lib/gc/gc.fi`,
 `lib/dom/meas.fi` and `lib/html/entities_failure.fi` are gone -- a 63 entry row
-of numbers became
-`"FEHLER: tabelle() lieferte 0, obwohl mmap moeglich sein sollte\n"`.
+of numbers became one string literal with the failure message of the name
+table.
 
 ## `defer` (round 9)
 
@@ -1080,15 +1080,15 @@ monomorphization. The deliberate restrictions are in `SPEC.md` 14.1 under
 do not live inside structs by value, and only functions and structs are generic.
 
 ```firn
-enum Wert { Nichts, Zahl(i32), Paar(i32, i32) }
+enum Value { Nothing, Number(i32), Pair(i32, i32) }
 
 fn main() -> i32 {
-    let w = Wert::Paar(7, 35)
+    let w = Value::Pair(7, 35)
     var s: i32 = 0
     match w {
-        Wert::Nichts   => { s = 0 as i32 }
-        Wert::Zahl(x)  => { s = x }
-        Wert::Paar(x, y) => { s = x + y }
+        Value::Nothing    => { s = 0 as i32 }
+        Value::Number(x)  => { s = x }
+        Value::Pair(x, y) => { s = x + y }
     }
     match s {
         0        => { s = 1 as i32 }
@@ -1382,11 +1382,11 @@ stack of the producing function. The proof is in the generated assembly:
 
 ```
 $ bash tools/ergebnisort/run.sh
-Rahmen baue: 224 Byte   Rahmen main: 1048816 Byte   rep-movs: 0
-OK: Ergebnisort-Garantie gehalten (baue 224 B, main 1048816 B, keine Bulk-Kopie).
+frame build: 224 bytes   frame main: 1048816 bytes   rep-movs: 0
+OK: result-location guarantee kept (build 224 B, main 1048816 B, no bulk copy).
 ```
 
-The structure is 1 MB in size; `baue` still has only a 224 byte frame.
+The structure is 1 MB in size; `build` still has only a 224 byte frame.
 
 ## The architecture layer: field access != storage location (DESIGN_GOALS.md 8)
 
@@ -1410,7 +1410,7 @@ The rule is **enforced**, not merely written down:
 
 ```
 $ bash tools/schichten/run.sh
-OK: Feldzugriff und Speicherort getrennt (4 Zugaenge in layout.rs, keine Umgehung).
+OK: field access and memory location separated (4 entry points in layout.rs, no bypass).
 ```
 
 The guard runs as section 7 in `test.sh` and checks that `Op::PtrAdd` outside
