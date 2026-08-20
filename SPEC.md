@@ -1003,7 +1003,7 @@ specification and the code do not drift apart.
    (`ArgClass::{Integer, Memory}`, `classify`) and is the only truth about the
    calling convention. The class `Sse` is deliberately missing there as long as
    there are no floating point types (see item 20). Proof:
-   `tests/100_agg_param_8.fi` to `tests/105_agg_wertsemantik.fi`.
+   `tests/100_agg_param_8.fi` to `tests/105_agg_value_semantics.fi`.
    **Two deliberate deviations from System V remain** and are recorded here (see
    item 15 on top of that):
    * Aggregates of the MEMORY class (> 16 bytes) are passed as a *hidden pointer
@@ -1050,7 +1050,7 @@ specification and the code do not drift apart.
     (module `kern`): `[value; N]` exists, `N` is a constant expression. The
     value is evaluated exactly once; up to 8 elements lowering unrolls it,
     beyond that a loop comes into being. Proof:
-    `tests/109_wiederholungsliteral.fi`.
+    `tests/109_repeat_literal.fi`.
 12. **`as` binds more tightly than the unary operators.** `&s.a as u64` means
     `&(s.a as u64)`; what is meant is `(&s.a) as u64`.
 13. ~~**No `break`/`continue`.**~~ **Struck in round 2** (module `kern`):
@@ -1624,7 +1624,7 @@ F5. **`defer` has existed since round 9, `errdefer` had not yet.**
     (`let u: E!i32 = f()` ... `return u`), it is only known at run time whether
     the error path is taken. Stage 0 does not decide that and **rejects the
     case**, instead of silently ignoring `errdefer` -- with a note about
-    `return try ...`. Proof: `tests/neg/errdefer_union_weitergabe.fi`.
+    `return try ...`. Proof: `tests/neg/errdefer_union_propagation.fi`.
     The run-time distinction (two cleanup paths behind a branch on the error
     code) is possible and will come when it is needed.
 F6. **No success type `()`.** `E!()` cannot be written (stage 0 does not know

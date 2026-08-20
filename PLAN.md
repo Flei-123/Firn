@@ -381,7 +381,7 @@ Re-measured with `bash test.sh` -> **PASS 397/397** and
 | `tools/tokenizer/run.sh` | builds, runs three build stages against the same tally, measures throughput, checks the regression floor | finished |
 | `tools/tokenizer/throughput.sh`, `korpus.py` | 4 MB corpus + MB/s; calls `bench/tokenizer/.../html5ever_bench` when it is built | the Firn side is finished, the reference side is open |
 | `tools/tokenizer/LOG.md` | the contract between Firn and the harness | finished |
-| `test.sh` section 9 | the tokenizer run as part of the suite, floor in `tools/tokenizer/mindestquote.txt` | finished |
+| `test.sh` section 9 | the tokenizer run as part of the suite, floor in `tools/tokenizer/minquota.txt` | finished |
 | `compiler/src/modules.rs` + `sema_match.rs` | **bug fix:** `match` arm bodies live in the registry, not in the AST -- the module system had not been rewriting names inside them. `match` in an imported module was unusable. Proof: `tests/231_module_match.fi` + `tests/modules/state.fi` | done |
 
 **Known limits (honest, they belong in SPEC 14.1, not to be argued away):**
@@ -401,10 +401,10 @@ Re-measured with `bash test.sh` -> **PASS 397/397** and
 | **tokenizer-kern** | `lib/html/tokenizer.fi` | `lib/html/mem.fi`, `tokens.fi` |
 | **tokenizer-text** | `lib/html/entities.fi` (new), `lib/html/entities_data.fi` (generated), `tools/tokenizer/gen_entities.py` (new) | `lib/html/mem.fi` |
 | **tokenizer-tokens** | `lib/html/tokens.fi`, `lib/html/tokenize_main.fi`, `lib/html/mem.fi` | -- |
-| **harness-bench** | `tools/tokenizer/harness.py`, `run.sh`, `durchsatz.sh`, `korpus.py`, `mindestquote.txt`, `bench/tokenizer/**` (new), `bench/RESULTS.md`, `ACCEPTANCE.md`, `README.md` | everything else |
+| **harness-bench** | `tools/tokenizer/harness.py`, `run.sh`, `durchsatz.sh`, `korpus.py`, `minquota.txt`, `bench/tokenizer/**` (new), `bench/RESULTS.md`, `ACCEPTANCE.md`, `README.md` | everything else |
 
 **Nobody** touches `test.sh` except the lead during the merge.
-`tools/tokenizer/mindestquote.txt` is written only by **harness-bench** -- and
+`tools/tokenizer/minquota.txt` is written only by **harness-bench** -- and
 only upwards, never downwards.
 
 ## 2. Interfaces -- exact, so that work can proceed without consultation

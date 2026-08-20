@@ -457,7 +457,7 @@ access instead of another tokenization pass.
 | `01_grundgeruest.dat` | 27 | 27 |
 | `02_in_body.dat` | 31 | 31 |
 | `03_formatierung.dat` | 20 | 20 |
-| `04_tabellen.dat` | 25 | 25 |
+| `04_tables.dat` | 25 | 25 |
 | `05_rohtext.dat` | 24 | 24 |
 | `06_auswahl_rahmen.dat` | 23 | 23 |
 | **total** | **150** | **150** |

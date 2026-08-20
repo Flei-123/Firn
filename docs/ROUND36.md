@@ -34,7 +34,7 @@ ct_secure_zero_no_ptr.fi, ct_barrier_aggregate.fi.
 Implementation: `defer_bis_fehler` in parser/sema, `ret_term_fehler` in
 lowering — the defer chain is worked off at the failing return point in
 reverse order, and not on the success path. Passing on a finished union
-is correctly rejected (tests/neg/errdefer_union_weitergabe.fi, rc=1).
+is correctly rejected (tests/neg/errdefer_union_propagation.fi, rc=1).
 Commit 3144601.
 
 ## 3. #[must_consume] (model compiler/src/attrs.rs)

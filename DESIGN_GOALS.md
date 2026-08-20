@@ -1191,7 +1191,7 @@ almost nothing today, because they are architectural decisions and not features:
 6. ~~**Field access separated from the storage location** (item 8) **and the
    result location as a guarantee** (item 6).~~ **Both done on 2026-08-14.** The
    result location was already present for aggregate returns and is now written
-   down as a guarantee and secured with `tools/ergebnisort/run.sh`; the
+   down as a guarantee and secured with `tools/result_location/run.sh`; the
    separation of field access sits in `compiler/src/layout.rs` and is enforced
    by `tools/schichten/run.sh`. It was worth doing that while `lower.rs` has
    1,500 lines and not 15,000 -- the conversion came to about 30 lines.
