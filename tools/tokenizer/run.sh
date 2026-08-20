@@ -109,7 +109,7 @@ bash tools/tokenizer/throughput.sh "$WORK/tokenize" || true
 
 echo
 echo "== 5. regression limit =="
-MIN=$(cat tools/tokenizer/mindestquote.txt)
+MIN=$(cat tools/tokenizer/minquota.txt)
 MINF=$(cat tools/tokenizer/minquota_errors.txt)
 echo "   without error codes: $QUOTA / $TOTAL   (limit: $MIN)"
 echo "   with error codes:    $QUOTA_ERRORS / $TOTAL   (limit: $MINF)"

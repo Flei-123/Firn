@@ -57,7 +57,7 @@ arbitrarily many levels and across module boundaries.
 * **Module-qualified calls.** After the rewriting by `modules.rs`,
   `modul.funktion` is internally called `modul__funktion`; the message
   shows the spelling from the source text again (`nogc_kalt.aufwaendig`).
-  Proof: `tests/neg/nogc_modulgrenze.fi`.
+  Proof: `tests/neg/nogc_module_boundary.fi`.
 * **No false alarms.** Call names generated internally by the compiler
   (`__match#N`, `__try#`, `__catch#`, `Enum::Variante`) are not function
   calls and trigger nothing; their arguments are searched nonetheless.
@@ -101,9 +101,9 @@ error: 'step' is #[no_gc], but calls 'log' without #[no_gc]
     |                                ^^^ here
     = note: SPEC 3.5.4: the promise holds transitively for the whole call tree -- write #[no_gc] before 'log' or do not call it here
 
-$ ./compiler/target/release/firnc -o /dev/null tests/neg/nogc_modulgrenze.fi
+$ ./compiler/target/release/firnc -o /dev/null tests/neg/nogc_module_boundary.fi
 error: 'hot' is #[no_gc], but calls 'nogc_cold.costly' without #[no_gc]
-   --> tests/neg/nogc_modulgrenze.fi:10:12
+   --> tests/neg/nogc_module_boundary.fi:10:12
     |
  10 |     return nogc_cold.costly(a)
     |            ^^^^^^^^^^^^^^^^ here

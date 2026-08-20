@@ -36,7 +36,7 @@ Now `intern_nummer` — interning is cheap and idempotent.
 - Fixpoint: stage 2 == stage 3, character-identical, **279 201 lines** of
   assembly
 - Negative tests abort like firnc0: nogc_transitiv, nogc_aufruf_ohne_attribut,
-  nogc_modulgrenze, gc_klasse_auf_dem_stapel, gc_mehrfachvererbung,
+  nogc_module_boundary, gc_klasse_auf_dem_stapel, gc_multiple_inheritance,
   gc_as_nicht_verwandt (rc=1 on both sides in each case)
 - New: `tests/770_gc_core.fi` + `tests/modules/kern/gccore.fi` — gc class
   only in the module, cycle survives under the root, statistics checked

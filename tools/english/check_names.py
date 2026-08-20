@@ -24,6 +24,13 @@ TEIL = re.compile(r'[a-z0-9]+|[A-Z]+(?![a-z])|[A-Z][a-z0-9]*')
 # Wortteile, die in Pfaden richtig sind, obwohl die Morphemtabelle sie kennt.
 ERLAUBT = {'kernel', 'start', 'core', 'min', 'max', 'lib', 'bin', 'src',
            'demos', 'app', 'pause', 'linker', 'mess'}
+# Runde 65: englische GANZE Woerter, in denen ein deutsches Morphem als
+# Zeichenfolge steckt ('absolute' enthaelt 'absolut'). Die Suche im
+# Wortinneren darf hier nicht anschlagen; als ganzes Teil geprueft, nicht
+# als Zeichenfolge.
+ENGLISCH = {'absolute', 'relative', 'negative', 'signature',
+            'aggregate', 'profile', 'surrogate', 'parameter',
+            'alternative', 'imperative', 'declarative', 'iterative'}
 
 
 def morpheme():
@@ -45,6 +52,10 @@ def pfade():
 
 def main():
     morph = morpheme()
+    # Nur lange Morpheme taugen zur Suche im Wortinneren; kurze wie
+    # 'art' oder 'wert' stecken auch in englischen Woertern.
+    lang_morph = sorted((m for m in morph if len(m) >= 6 and m not in ERLAUBT),
+                        key=len, reverse=True)
     treffer = []
     gesehen = set()
     for p in pfade():
@@ -62,6 +73,16 @@ def main():
                     continue
                 if t in morph:
                     treffer.append((p, s, t))
+                    break
+                # Runde 65: ein ZUSAMMENGESCHRIEBENES Kompositum
+                # ('wertsemantik', 'wiederholungsliteral') ist EIN Teil und
+                # stand deshalb nie in der Tabelle. Lange Morpheme werden
+                # deshalb auch INNERHALB eines Teils gesucht.
+                if t in ENGLISCH:
+                    continue
+                d = next((m for m in lang_morph if m in t), None)
+                if d is not None:
+                    treffer.append((p, s, d))
                     break
     for p, s, t in treffer:
         print(f"{p}\t{s}\t{t}")

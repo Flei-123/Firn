@@ -13,7 +13,7 @@
 #      the expected message with a line:column (// expect_error: L:C TEXT).
 #      A Rust panic counts as a failure.
 #   5. Proof of the optimiser (test_opt.sh: FIR before/after).
-#   6. Proof of the result-location guarantee (tools/ergebnisort/run.sh:
+#   6. Proof of the result-location guarantee (tools/result_location/run.sh:
 #      frame sizes in the emitted assembly).
 #   7. Architecture check: field access is separated from the memory location
 #      (tools/schichten/run.sh, a precondition for SoA).
@@ -31,7 +31,7 @@
 #      and with counter-checks (tools/fnval/run.sh).
 #   9. HTML5 tokenizer (lib/html/, in Firn) against the official
 #      html5lib test suite: the exact quota out of 6,810 cases, the limit in
-#      tools/tokenizer/mindestquote.txt (tools/tokenizer/run.sh).
+#      tools/tokenizer/minquota.txt (tools/tokenizer/run.sh).
 #   9b. HTML tree construction and the DOM core (lib/browser/, in Firn) against
 #      the own cases from the WHATWG standard, against real pages and
 #      in a soak run with a counter-check (tools/html/run.sh, docs/ROUND54.md).
@@ -225,12 +225,12 @@ else
 fi
 
 echo "== 6. proof of the result-location guarantee (SPEC.md 13.1) =="
-bash tools/ergebnisort/run.sh > "$WORK/result_location.log" 2>&1 && EORC=0 || EORC=$?
+bash tools/result_location/run.sh > "$WORK/result_location.log" 2>&1 && EORC=0 || EORC=$?
 if [ "$EORC" -eq 0 ]; then
     ok
     tail -1 "$WORK/result_location.log" | sed 's/^/   /'
 else
-    bad "tools/ergebnisort/run.sh failed (see .test-work/result_location.log)"
+    bad "tools/result_location/run.sh failed (see .test-work/result_location.log)"
     tail -20 "$WORK/result_location.log" | sed 's/^/   /'
 fi
 
