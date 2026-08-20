@@ -1,11 +1,11 @@
 //! x86_64 code generator: FIR -> GNU assembler text (Intel syntax) for `as`/`ld`.
-//! No LLVM, no Cranelift, no C — every instruction gets chosen here by hand.
+//! No LLVM, no Cranelift, no C — every instruction is chosen here by hand.
 //!
 //! INTERFACE (fixed):
 //!   `pub fn emit(m: &fir::Module) -> Result<String, String>`
 //!
 //! Model of the register allocation (deliberately naive, yet correct):
-//!   * Every FIR value `%n` gets its own 8-byte stack slot at the frame.
+//!   * Every FIR value `%n` gets its own 8-byte stack slot in the frame.
 //!   * Computing happens exclusively at the scratch registers rax/rcx (rdx for
 //!     division/remainder, rdi/rsi/rcx additionally for `copymem`).
 //!   * Thereby rbx, rbp, r12-r15 (callee-saved) are never touched; every

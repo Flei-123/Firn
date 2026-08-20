@@ -44,7 +44,7 @@ pub(crate) enum ValueSource<'a> {
     Loaded(&'a dyn Fn(&mut Emitter, u32)),
 }
 
-/// Width at which the value gets compared and indexed.
+/// Width at which the value is compared and indexed.
 pub(crate) fn switch_bits(ty: FTy) -> u32 {
     if ty.bits() > 32 {
         64
