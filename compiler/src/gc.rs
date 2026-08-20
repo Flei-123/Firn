@@ -429,7 +429,7 @@ pub(crate) fn hook_type(p: &mut Parser, name: &str, sp: Span) -> Option<TypeExpr
     // ONE, and the element type is checked at the ACCESS
     // (`gcvec_append[Node](…)`), not at the field. The type arguments are
     // parsed here completely (`Gc[Node]` too), so that a typo shows up, but
-    // discarded afterwards. `docs/RUNDE53.md` §6 names the price.
+    // discarded afterwards. `docs/ROUND53.md` §6 names the price.
     if name == "GcVec" || name == "GcMap" {
         if !p.at(&TokKind::LBracket) {
             return None;

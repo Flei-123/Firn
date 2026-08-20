@@ -1703,7 +1703,7 @@ failing, the fixpoint holds — stage 2 == stage 3, character-identical,
 210 324 lines of assembly. Both target files (601, 602 — among them the
 UCD table generation, the hardest comptime case in the corpus) run
 identically to `firnc0`. New: `tests/760_comptime_core.fi` and
-`docs/RUNDE35.md`.
+`docs/ROUND35.md`.
 
 What remains: `gc` (9), constant runtime (4), `errdefer` (1) and the
 attributes (1).
@@ -1732,7 +1732,7 @@ resolution), 0 differing, 0 failing. The fixpoint holds: stage 2 ==
 stage 3, character-identical, 279 201 lines of assembly. All six
 gc/nogc negative tests abort like firnc0. New: `tests/770_gc_core.fi`
 (a gc class only in the module, a cycle under the root) and
-`docs/RUNDE34.md`.
+`docs/ROUND34.md`.
 
 What remains: constant runtime (4), `errdefer` (1), `must_consume` (1).
 
@@ -1746,7 +1746,7 @@ the ct barrier — each with its own detection in the sema BEFORE the
 function lookup, so that a user function of the same name wins.
 `errdefer` runs only on the error path (rejecting a finished union as in
 stage 0), `#[must_consume]` on functions and structs reports discarded
-results. Details in `docs/RUNDE36.md`, core test
+results. Details in `docs/ROUND36.md`, core test
 `tests/780_ct_core.fi`.
 
 Measurements: `test.sh` 640/640, `selbst_vergleich` 186 behaviorally
@@ -1782,7 +1782,7 @@ insertion barrier, white parity instead of a mark reset. Pauses are thereby
 around 0,5 ms independently of the heap size; below 8 MiB the atomic
 path remains (the phase check costs 8,7 % of throughput, the requirement
 was ±10 %).
-An important side finding (RUNDE38.md): the optimizer can remove a final
+An important side finding (ROUND38.md): the optimizer can remove a final
 nulling as dead — unreachability belongs in a
 helper function, and the scrubber zeroes returned frames.
 Finalizers and Arc[T] are named remaining work (a semantic resp.
@@ -2227,3 +2227,74 @@ over the morpheme table — technical terms are called the same in both
 languages. The requirement for stage B: **the line count of every file
 stays the same**, otherwise the position entries in the 134 negative tests
 shift.
+
+## 44. Rounds 56 and 57: comments, documentation — and a yardstick that lied
+
+Stage B was the prose: comments and documentation. Six rounds worked in
+parallel on separated territories (compiler/src, lib/firnc1, the rest of
+lib, tests plus tools, docs, the Markdown in the root), each with the
+requirement that **the line count of every non-Markdown file stays
+exactly the same** — 134 negative tests name positions as line:column,
+and the fixpoint compares assembly including `.file`/`.loc` entries. All
+six kept it; the merges were free of conflicts. Only the round for the
+root Markdown reached into foreign files, because it renamed documents
+(`ABNAHME.md` -> `ACCEPTANCE.md`, `DESIGNZIELE.md` -> `DESIGN_GOALS.md`,
+`LOGBUCH.md` -> `LOGBOOK.md`); it was merged last with `-X ours`, and the
+113 path references were pulled afterwards by hand.
+
+### The yardstick produced exactly what it measured
+
+`check_comments.py` counted a line as German as soon as it contained one
+of `in`, `an`, `am`, `es`, `man`, `war`, `hat`, `die`, `name`, `wert` —
+every one of those is an ordinary **English** word as well. Whoever wants
+to satisfy such a yardstick writes English that avoids those words. That
+is what happened: of **4 547 comment lines under compiler/src not a
+single one** contained the word `in`, and `lib/firnc1` had five in 2 387.
+The result reads like "foundation point out of §10.4" instead of "from
+§10.4".
+
+The mistake was mine — the yardstick went out untested. Round 57 fixed
+both: the word list no longer holds anything that exists in English, and
+three rounds rewrote the affected comments into natural English. The
+counter-check is now the other way round: the word `in` has to appear
+**often**. It does, 485 times under compiler/src and 373 under
+lib/firnc1.
+
+### Two gaps the checks had left open
+
+* **A trailing counter hides the German word.** `pfad2`, `teil1`,
+  `soll4`, `stufe0`, `lebende100` — the splitter found `pfad2` as ONE
+  word, and the morpheme table only knows `pfad`. With the digits cut off
+  first, **56 German identifiers** surfaced that round 55 had missed.
+* **Nobody checked the output of the TEST PROGRAMS.** `check_texts.py`
+  only looks at the two compilers. `tests/802` and `tests/806` were still
+  printing `erst`, `letzt`, `kap`, `zeilen`, `summe`, `gefangen`.
+
+Both gaps are closed, and `check_comments.py` now hangs in `check.sh` and
+therefore in section 21 of `test.sh`: a German comment line is a test
+failure from here on.
+
+### Finally the tool itself
+
+`tools/englisch/` had been left out deliberately in round 55 — it would
+have renamed itself. Now that it is finished, the exception falls:
+`tools/english/` with `check.sh`, `check.py`, `morphemes.tsv`,
+`suggest.py`, `rename.py`. The documents followed: `docs/RUNDEnn.md` ->
+`docs/ROUNDnn.md`, `docs/SELBSTHOSTING.md` -> `docs/SELF_HOSTING.md`.
+
+And the rename walked straight into the trap the tools warn about:
+`check_texts.py` kept looking for its exception list under the old name
+and promptly reported 44 x86 mnemonics as German text. The counter-check
+showed it within seconds.
+
+### Acceptance in the main repository, measured by hand
+
+`test.sh` **847/847**, self-comparison **232 same / 0 differing / 0
+faulty**, fixpoint character-identical (**554 923 lines**), `CODEGEN
+MISSING: 0`, tokenizer **6810/6810**, tree construction **150/150**,
+FREESTANDING **41/41**, PACKAGES **21/21**, THREADS passed. All five
+counter-checks of the English migration report **zero**: identifiers,
+text sites, length entries, path names, comment and documentation lines.
+
+The source text of Firn — compiler, runtime, library, tests, tools and
+documentation — is English.

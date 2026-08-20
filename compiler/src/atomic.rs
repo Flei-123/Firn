@@ -22,7 +22,7 @@
 //! stage 0 (SPEC §7), so the difference is NOT measurable today by a
 //! two-thread run; it is provable at the emitted instruction
 //! (`tools/atomic/run.sh` reads the assembler and demands the `lock` prefix).
-//! `docs/RUNDE47.md` says the same — no "thread-safe" without proof.
+//! `docs/ROUND47.md` says the same — no "thread-safe" without proof.
 //!
 //! **Not part of this:** memory orderings (`acquire`/`release`/`relaxed`),
 //! compare-and-swap (`compare_exchange`), atomic loads/stores of smaller

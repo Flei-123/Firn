@@ -7,7 +7,7 @@
 //!
 //! ## What for
 //!
-//! `docs/SELBSTHOSTING.md` §4 lists `Vec[T]` as the second largest blocker
+//! `docs/SELF_HOSTING.md` §4 lists `Vec[T]` as the second largest blocker
 //! on the way to stage 1. A field of **fixed** size works since round 2
 //! (`tests/211_generic_struct.fi`), a **growing** one does not: for that the
 //! address of the `i`-th element has to be computed, and that needs the

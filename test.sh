@@ -30,7 +30,7 @@
 #      tools/tokenizer/mindestquote.txt (tools/tokenizer/run.sh).
 #   9b. HTML tree construction and the DOM core (lib/browser/, in Firn) against
 #      the own cases from the WHATWG standard, against real pages and
-#      in a soak run with a counter-check (tools/html/run.sh, docs/RUNDE54.md).
+#      in a soak run with a counter-check (tools/html/run.sh, docs/ROUND54.md).
 #  18. Package and project system (tools/packages/run.sh): manifest, search
 #      order, visibility, build driver -- in BOTH compilers.
 #  19. Freestanding compilation (tools/freestanding/run.sh, round 52):
@@ -263,7 +263,7 @@ echo "== 9b. HTML tree construction + DOM core (tools/html/run.sh) =="
 # The tree building in Firn (lib/browser/) against the own cases from the
 # WHATWG standard, plus the real pages from testdata/realweb/ and the
 # soak run with a counter-check. The short version; the full run is in
-# docs/RUNDE54.md.
+# docs/ROUND54.md.
 bash tools/html/run.sh --fast > "$WORK/tree.log" 2>&1 && BMRC=0 || BMRC=$?
 if [ "$BMRC" -eq 0 ]; then
     ok

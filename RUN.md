@@ -180,7 +180,7 @@ boot of the kernel example with **both** compilers.
 | **`#[interrupt]` cannot be called** | `firnc -o /tmp/x tests/neg/free_interrupt_call.fi` | `error: 'ih' is an interrupt entry point and cannot be called` |
 | **volatile holds** | `firnc --emit=fir tools/freestanding/volatile.fi \| grep -c 'asm.void "pause"'` | `3` -- three literally identical blocks, no CSE |
 
-In detail in `docs/RUNDE52.md`.
+In detail in `docs/ROUND52.md`.
 
 ## 5. What does NOT work, because it was not built
 
@@ -211,7 +211,7 @@ Honestly and completely (in detail in `ACCEPTANCE.md`):
 * **`defer` / `errdefer`, inferred error set `!T`, `catch |e| { block }`**
   -- not implemented, see `SPEC.md` 14.1.error_unions F1-F10.
 * **Self-hosting, package management, `comptime`/UCD table** -- open,
-  see `docs/SELBSTHOSTING.md` and `ACCEPTANCE.md` items 1, 5, 6.
+  see `docs/SELF_HOSTING.md` and `ACCEPTANCE.md` items 1, 5, 6.
 
 ## 6. Cleaning up
 

@@ -8,7 +8,7 @@
  * zuerst, unmittelbar gefolgt vom 32-Bit-Vorspann.
  *
  * `KERN_START` setzt `run.sh` beim Binden (`ld --defsym`): firnc0 stellt
- * jedem Symbol `_F0.` voran, firnc1 `_F1.` (docs/SELBSTHOSTING.md).
+ * jedem Symbol `_F0.` voran, firnc1 `_F1.` (docs/SELF_HOSTING.md).
  */
 ENTRY(_boot)
 

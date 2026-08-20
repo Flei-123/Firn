@@ -754,7 +754,7 @@ pub fn allocate(f: &Func) -> Alloc {
         // The bug is OLDER than round 49: six lines of dummy code in
         // `gc_collect` suffice to trigger it with the compiler of the base
         // (cc1710f). Round 49 merely ran into it. With `<` the allocation is
-        // minimally tighter; the measurement is in docs/RUNDE49.md §3.
+        // minimally tighter; the measurement is in docs/ROUND49.md §3.
         let mut k = 0;
         while k < active.len() {
             if active[k].0.end < iv.start {
@@ -1129,7 +1129,7 @@ impl Address {
 ///
 /// **The conditions are deliberately tight**, because every loosening
 /// extends the lifetime of the base — exactly the class that produced the
-/// miscompile in round 40/41 (docs/RUNDE41.md). Folding happens only when
+/// miscompile in round 40/41 (docs/ROUND41.md). Folding happens only when
 ///
 ///  * the address forming instruction is a `ptradd` or a **64-bit** `add`
 ///    (at 32 bits the addressing would NOT cut the overflow off),
@@ -1522,7 +1522,7 @@ fn descriptor_peephole(asm: &str, nv: usize) -> String {
     // by `mov r8d, [X]` loads back exactly the bits that are already in r8
     // — but only if r8 is zero up top anyway. Exactly that condition was
     // missing in round 43, which is why the case was deferred there
-    // (docs/RUNDE43.md §6).
+    // (docs/ROUND43.md §6).
     let mut nullab: HashMap<String, u32> = HashMap::new();
     let kill_reg = |r: &str,
                     sync: &mut HashMap<u64, (String, u32)>,
@@ -1835,7 +1835,7 @@ fn unsupported_basic(f: &Func) -> Option<String> {
                 // and a special rule in the allocator is exactly the sort
                 // of code that produced the bug of round 40. Kernel code
                 // therefore runs without register allocation — slower, but
-                // provably right. Stated honestly in docs/RUNDE52.md.
+                // provably right. Stated honestly in docs/ROUND52.md.
                 Op::Asm { .. } => return Some("Inline-Assembler".into()),
                 Op::MmioLoad { .. } | Op::MmioStore { .. } => {
                     return Some("MMIO access".into())

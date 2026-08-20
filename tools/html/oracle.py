@@ -2,7 +2,7 @@
 """Counter-check for the HAND-WRITTEN expectations in tools/html/cases/.
 
 WHAT FOR: the `tree-construction` data of html5lib is not available to this
-project (see docs/RUNDE54.md). The expectations in `tools/html/cases/*.dat`
+project (see docs/ROUND54.md). The expectations in `tools/html/cases/*.dat`
 are therefore written by hand from the WHATWG standard. By hand also means:
 error-prone. This script checks them against html5lib 1.1, an
 independent, specification-faithful implementation.

@@ -415,7 +415,7 @@ fn fmt_print_line(f: Fmt)                fn fmt_eprint(f: Fmt)
 fn fmt_eprint_line(f: Fmt)               fn fmt_in_file(f: Fmt, path: u64) -> bool
 ```
 
-With that the **two gaps that `docs/RUNDE39.md` explicitly named at the
+With that the **two gaps that `docs/ROUND39.md` explicitly named at the
 end** are closed: `fmt_char` (a character as a *letter*, not
 as a decimal number -- `f"{c}"` otherwise shows `65` instead of `A`) and
 `fmt_content` (result into a buffer instead of onto stdout).
@@ -453,7 +453,7 @@ trailing `\n` produces **no** empty final line -- the rule that
    include library without module structure and cannot include
    `Vec[T]`. The cursor is the form that allocates nothing anyway.
 5. **No sorting by a custom comparison.** Firn has no
-   function pointers (`docs/SELBSTHOSTING.md`, line 1576). `vec_sortiere`
+   function pointers (`docs/SELF_HOSTING.md`, line 1576). `vec_sortiere`
    orders by `<` on `T`; anything else would need a language feature.
 6. **No stable sorting.** See 3.3 — indistinguishable for scalars,
    for pairs it would be a promise that is missing here.
