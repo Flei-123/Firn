@@ -18,7 +18,7 @@
 //! var v: Vec[i32] = Vec[i32]{ data: p, len: 0 as usize, cap: 0 as usize }
 //! ```
 //!
-//! Requirements (`T: Int`) get checked during monomorphization; a `T` left
+//! Bounds (`T: Int`) are checked during monomorphization; a `T` left
 //! unsatisfied is a plain error with line and column.
 
 use std::cell::RefCell;
@@ -32,14 +32,14 @@ use crate::parser::Parser;
 /// Bound on a type parameter — `T: Int`, `T: Ord`, `T: Int + Ord`.
 ///
 /// `Any`, `Int` and `Scalar` are the three BUILTIN bounds (round 30). Any
-/// other label spells some INTERFACE (round 50). Whether that interface
+/// other name is the name of an INTERFACE (round 50). Whether that interface
 /// exists is not yet settled while parsing: `interface Ord` may stand
-/// further down or within another file. That is why the check happens at
+/// further down or in another file. That is why the check happens at
 /// INSTANTIATION (`mono.rs`) — where the concrete type is known and the
 /// message can say which method is missing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Bound {
-    /// no requirement
+    /// no bound
     Any,
     /// integer type
     Int,
@@ -58,8 +58,8 @@ impl Bound {
             Bound::Iface(n) => n.as_str(),
         }
     }
-    /// No `Option`: one unknown label is no faulty input but the label of some
-    /// interface. A typo gets reported at instantiation as
+    /// No `Option`: an unknown name is no faulty input but the name of an
+    /// interface. A typo is reported at instantiation as
     /// "unknown interface" — together with the list of the known ones.
     fn parse(name: &str) -> Bound {
         match name {
@@ -90,13 +90,13 @@ pub(crate) struct StructTemplate {
     pub(crate) decl: StructDecl,
 }
 
-/// One type combination that got used (`Vec[i32]`, `sum[u8]`).
+/// One type combination that was used (`Vec[i32]`, `sum[u8]`).
 #[derive(Clone, Debug)]
 pub(crate) struct Instantiation {
     pub(crate) base: String,
     pub(crate) args: Vec<TypeExpr>,
     pub(crate) span: Span,
-    /// written down inside a template (may hold type parameters)
+    /// written down inside a template (may contain type parameters)
     pub(crate) is_abstract: bool,
     pub(crate) is_fn: bool,
 }
@@ -125,9 +125,9 @@ pub(crate) fn fn_template(name: &str) -> Option<FnTemplate> {
     REG.with(|r| r.borrow().fns.get(name).cloned())
 }
 
-/// Names of all generic templates declared within file `file`.
+/// Names of all generic templates declared in file `file`.
 ///
-/// Needed by `modules.rs`: the templates do NOT sit inside `Program::funcs`
+/// Needed by `modules.rs`: the templates do NOT sit in `Program::funcs`
 /// but here — module rewriting therefore never reached them, and a template
 /// saw the names of the root file only
 /// (docs/SELBSTHOSTING.md §7, blocker B2).
@@ -153,7 +153,7 @@ pub(crate) fn struct_templates_the_file(file: u32) -> Vec<String> {
     })
 }
 
-/// Changes a function template on the spot.
+/// Changes a function template in place.
 pub(crate) fn with_fn_template<F: FnOnce(&mut crate::ast::FnDecl)>(name: &str, f: F) {
     REG.with(|r| {
         if let Some(t) = r.borrow_mut().fns.get_mut(name) {
@@ -162,7 +162,7 @@ pub(crate) fn with_fn_template<F: FnOnce(&mut crate::ast::FnDecl)>(name: &str, f
     });
 }
 
-/// Changes a struct template on the spot.
+/// Changes a struct template in place.
 pub(crate) fn with_struct_template<F: FnOnce(&mut crate::ast::StructDecl)>(name: &str, f: F) {
     REG.with(|r| {
         if let Some(t) = r.borrow_mut().structs.get_mut(name) {
@@ -188,7 +188,7 @@ pub(crate) fn is_generic_struct(name: &str) -> bool {
     REG.with(|r| r.borrow().struct_names.iter().any(|n| n == name))
 }
 
-/// All uses captured while parsing, ordered by their appearance.
+/// All uses captured while parsing, in order of their appearance.
 pub(crate) fn instantiations() -> Vec<(String, Instantiation)> {
     REG.with(|r| {
         let reg = r.borrow();
@@ -533,7 +533,7 @@ pub(crate) fn hook_prescan(toks: &[Token]) {
     });
 }
 
-/// `// HOOK types` within `parser.rs::program` (via `sema_match::hook_item`).
+/// `// HOOK types` in `parser.rs::program` (via `sema_match::hook_item`).
 pub(crate) fn hook_item(p: &mut Parser) -> bool {
     let name = match p.toks.get(p.pos + 1).map(|t| t.kind.clone()) {
         Some(TokKind::Ident(n)) => n,
@@ -556,7 +556,7 @@ pub(crate) fn hook_item(p: &mut Parser) -> bool {
     }
 }
 
-/// `// HOOK types` within `parser.rs::parse_type_inner` — `Vec[i32]`.
+/// `// HOOK types` in `parser.rs::parse_type_inner` — `Vec[i32]`.
 pub(crate) fn hook_generic_type(p: &mut Parser, name: &str, sp: Span) -> Option<TypeExpr> {
     if !p.at(&TokKind::LBracket) || !is_generic_struct(name) {
         return None;
@@ -566,7 +566,7 @@ pub(crate) fn hook_generic_type(p: &mut Parser, name: &str, sp: Span) -> Option<
     Some(TypeExpr::Named(mangled, sp))
 }
 
-/// `// HOOK types` within `parser.rs::postfix` — `sum[i32](a, b)`.
+/// `// HOOK types` in `parser.rs::postfix` — `sum[i32](a, b)`.
 pub(crate) fn hook_generic_call(p: &mut Parser, base: &Expr) -> Option<Expr> {
     let name = match &base.kind {
         ExprKind::Ident(n) if is_generic_fn(n) => n.clone(),
@@ -589,7 +589,7 @@ pub(crate) fn hook_generic_call(p: &mut Parser, base: &Expr) -> Option<Expr> {
     Some(p.mk(span, ExprKind::Call(mangled, cargs, base.span)))
 }
 
-/// `// HOOK types` within `parser.rs::primary` — `Vec[i32]{ .. }`.
+/// `// HOOK types` in `parser.rs::primary` — `Vec[i32]{ .. }`.
 pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
     let name = match p.kind().clone() {
         TokKind::Ident(n) if is_generic_struct(&n) => n,

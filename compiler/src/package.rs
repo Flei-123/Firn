@@ -1,4 +1,4 @@
-//! Project manifest `firn.package` — label, version, entry point,
+//! Project manifest `firn.package` — name, version, entry point,
 //! source directories, public modules, dependencies.
 //!
 //! WHY NO TOML (round 48, decision with its reasoning)
@@ -17,7 +17,7 @@
 //! ---------------------------------------------------------------------
 //! One statement per line: `key value [value ...]`. Separators are space and
 //! tab, `#` opens a comment up to the end of the line, empty lines do not
-//! count. There are no quotes and no escapes — a value therefore holds
+//! count. There are no quotes and no escapes — a value therefore contains
 //! neither spaces nor `#`.
 //!
 //! ```text
@@ -33,16 +33,16 @@
 //! ```
 //!
 //! Unknown keys are ERRORS, no silent skipping: a mistyped `publi` would
-//! otherwise open up some interface that nobody ever wanted to
+//! otherwise open up an interface that nobody ever wanted to
 //! open.
 
-/// Filename of the manifest. Stands exclusively here.
+/// File name of the manifest. Stands exclusively here.
 pub const MANIFEST: &str = "firn.package";
 
 /// How many directory levels the upward search covers at most.
 pub const SUCHTIEFE: usize = 64;
 
-/// One dependency: label (becomes the import prefix) and local path.
+/// One dependency: name (becomes the import prefix) and local path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dependency {
     pub name: String,
@@ -83,9 +83,9 @@ impl Manifest {
 
 // ----------------------------------------------------------- Path arithmetic
 //
-// PURELY LEXICAL, without a file system: the same arithmetic must be
-// reproducible for Firn, and `--package-info` shall come out character for
-// character alike on both compilers. Symbolic links do NOT get resolved
+// PURELY LEXICAL, without a file system: the same arithmetic has to be
+// reproducible in Firn, and `--package-info` shall come out character for
+// character alike on both compilers. Symbolic links are NOT resolved
 // along the way (`firnc1` cannot do that without libc, and it would make
 // the output machine dependent).
 
@@ -122,7 +122,7 @@ pub fn normalize(path: &str) -> String {
     s
 }
 
-/// `base` + `rel`, normalized. One absolute `rel` wins.
+/// `base` + `rel`, normalized. An absolute `rel` wins.
 pub fn join(base: &str, rel: &str) -> String {
     if rel.starts_with('/') {
         return normalize(rel);
@@ -142,7 +142,7 @@ pub fn dirname(path: &str) -> String {
     }
 }
 
-/// Last component without the `.fi` suffix — the module label of a file.
+/// Last component without the `.fi` suffix — the module name of a file.
 pub fn module_name(path: &str) -> String {
     let last = match path.rfind('/') {
         Some(i) => &path[i + 1..],
@@ -154,7 +154,7 @@ pub fn module_name(path: &str) -> String {
     }
 }
 
-/// Does `path` sit within `root` (or IS it that)? Both must be normalized.
+/// Does `path` sit inside `root` (or IS it that)? Both must be normalized.
 pub fn read_within(path: &str, root: &str) -> bool {
     if path == root {
         return true;
@@ -197,7 +197,7 @@ pub fn is_version(s: &str) -> bool {
     parts == 3
 }
 
-/// Path WITHIN the package: relative, without `..`, not empty.
+/// Path INSIDE the package: relative, without `..`, not empty.
 pub fn is_inner_path(s: &str) -> bool {
     if s.is_empty() || s.starts_with('/') {
         return false;
@@ -219,7 +219,7 @@ fn words(line: &str) -> Vec<&str> {
         .collect()
 }
 
-/// Reads a manifest from the text. Pure function: no file system, so that
+/// Reads a manifest from the text. A pure function: no file system, so that
 /// the rules stay checkable one by one.
 pub fn read(text: &str) -> Result<Manifest, Error> {
     let mut m = Manifest::default();

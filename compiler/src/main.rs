@@ -307,8 +307,8 @@ fn run(opts: &Options) -> i32 {
     // Round 49: the marker "runtime included" belongs to the start of a
     // compilation (codegen_x86::emit prints the state block afterwards).
     crate::gc::runtime_reset();
-    // The sentence stands here and not at `parse_args`, because `firnc1`
-    // must write it CHARACTER FOR CHARACTER and holds no `--help` remark
+    // The sentence stands here and not in `parse_args`, because `firnc1`
+    // has to write it CHARACTER FOR CHARACTER and has no `--help` remark
     // there (round 48).
     if opts.package.is_some() && opts.input.is_some() {
         eprint!("error: --package and an input file are mutually exclusive\n");
@@ -435,8 +435,8 @@ fn run(opts: &Options) -> i32 {
 
     if opts.emit == Emit::AstCanon {
         // The root file ONLY, BEFORE merging the modules and before
-        // monomorphization: the parser written for Firn sees exactly one file
-        // as well. Anything else would be no comparison but a comparison with
+        // monomorphization: the parser written in Firn also sees exactly one
+        // file. Anything else would be no comparison but a comparison with
         // something else.
         let toks = lexer::lex(&root.src, &mut dg);
         let prog = parser::parse(&toks, &mut dg);
@@ -462,10 +462,10 @@ fn run(opts: &Options) -> i32 {
         Some(p) => p,
         None => return report(&dg),
     };
-    // --- comptime: compile the produced source text within the SAME run (SPEC §6.4)
+    // --- comptime: compile the produced source text in the SAME run (SPEC §6.4)
     //
     // The `comptime { … }` blocks run BEFORE the type check. What they write
-    // through `emit_*` gets lexed here, parsed and appended to the program —
+    // through `emit_*` is lexed here, parsed and appended to the program —
     // after that the type checker sees no difference to hand written source
     // text. Exactly that is what acceptance point 6 demands for the Unicode,
     // Web IDL and CSS tables of a browser.
@@ -477,13 +477,13 @@ fn run(opts: &Options) -> i32 {
     let generated = comptime::run_blocks_out(&prog, &mut dg, &base);
     if !generated.is_empty() && !dg.has_errors() {
         let file = dg.add_file("<comptime>", &generated);
-        // The line table must know that same file too, otherwise the code
+        // The line table has to know that same file too, otherwise the code
         // generator produces `.loc` directives with a number that `as` does
         // not know ("unassigned file number").
         dwarf::add_file("<comptime>");
         let toks = lexer::lex_file(&generated, file, &mut dg);
         let mut extra = parser::parse(&toks, &mut dg);
-        // The expression ids of the addition start at 0 and must move behind
+        // The expression ids of the addition start at 0 and have to move behind
         // those of the main program.
         let mut next = prog.expr_count;
         for f in extra.funcs.iter_mut() {
@@ -633,7 +633,7 @@ fn run(opts: &Options) -> i32 {
     }
     if object {
         // Without `-o` the result is called `<input>.o`; with `-o` exactly as
-        // written there (the label may then stay without a suffix).
+        // written there (the name may then stay without a suffix).
         let obj_path = match &opts.output {
             Some(p) => p.clone(),
             None => out.with_extension("o"),
