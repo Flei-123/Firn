@@ -22,7 +22,7 @@ engine proves that the thought was right.
 | the same cases against **Chromium**, box for box | **705 / 705** equal, deviation **0.00 %** |
 | the same quota in all three build stages | opt = --no-opt = dev-fast |
 | hand-computed checks in `tests/940` to `tests/945` | **36** boxes, all correct |
-| soak run, 60 s | RSS growth **12 KiB**, counter check strikes (+38 MiB) |
+| soak run, 60 s, 84,100 rounds | RSS growth **16 KiB**, counter check strikes (+90 MiB) |
 | cross-check on `testdata/realweb/` (60,611 boxes) | **1.64 %** to the bit -- see section 7 |
 | throughput on `testdata/realweb/` (callgrind) | **429,325** instructions per element, **5,842** per byte |
 
@@ -535,7 +535,22 @@ in parallel.
 
 ---
 
-## 10. How to run it
+## 10. The acceptance, run in full
+
+```
+bash test.sh                  PASS 924/924        (base 905/905 + 6 tests
+                                                   x 3 build stages + 1 section)
+bash tools/layout/run.sh      705/705 own boxes, 705/705 equal to Chromium,
+                              deviation 0.00 %, three build stages equal,
+                              soak 84,100 rounds in 60 s, RSS growth 16 KiB,
+                              counter check +90,076 KiB
+bash tools/self_compare.sh    SAME BEHAVIOUR 252, DIFFERING 0, FAULTY 0
+bash tools/english/check.sh   0 / 0 / 0 / 0 / 0
+```
+
+---
+
+## 11. How to run it
 
 ```bash
 export FIRNLIB=$PWD/lib
