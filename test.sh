@@ -455,6 +455,23 @@ else
     grep FAIL "$WORK/kernel.log" | head -10 | sed 's/^/   /'
 fi
 
+echo "== 23. layout: from the computed style to the box with coordinates (tools/layout/run.sh) =="
+# Round 61. The box model with margin collapsing, the block flow, the
+# inline flow with line boxes, floats, position: relative/absolute and a
+# flex container in one axis. Two proofs, and neither replaces the other:
+# the box tree against the frozen expectation (text against text), and the
+# SAME cases through a real Chromium, box against box out of
+# getBoundingClientRect(). Plus a soak run with a counter check.
+bash tools/layout/run.sh --fast > "$WORK/layout.log" 2>&1 && LYRC=0 || LYRC=$?
+if [ "$LYRC" -eq 0 ]; then
+    ok
+    tail -1 "$WORK/layout.log" | sed 's/^/   /'
+else
+    bad "tools/layout/run.sh failed (see .test-work/layout.log)"
+    grep -E 'FAILED|ERROR' "$WORK/layout.log" | head -10 | sed 's/^/   /'
+    tail -5 "$WORK/layout.log" | sed 's/^/   /'
+fi
+
 echo "== 21. english migration: no German identifiers left (tools/english/check.sh) =="
 # Stage A (round 55): every identifier in compiler/src, lib, bin, tools,
 # tests and demos is held against the morpheme table. A hit means
