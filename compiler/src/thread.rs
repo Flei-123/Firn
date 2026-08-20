@@ -17,34 +17,34 @@
 //! thereby given up exactly what makes the language. `clone(2)` is a system
 //! call like `mmap`; it costs nothing beyond this file.
 //!
-//! ## Why that needs a primitive of its own, `syscall(56, …)` not sufficing
+//! ## Why that needs a primitive of its own and `syscall(56, …)` does not do
 //!
-//! That is the core: `clone` returns **twice** — at the creator with the
-//! thread id, at the child with 0. The child returns with a **new `rsp`**,
+//! That is the core: `clone` returns **twice** — in the creator with the
+//! thread id, in the child with 0. The child returns with a **new `rsp`**,
 //! though, while `rbp` and every callee-saved register are copies of the
 //! creator. The code produced by the code generator addresses its frame
 //! slots through `[rbp-off]` — so the child would write into the frame of
-//! the CREATOR, on a stack that is not its own. No wording of the language
-//! avoids that; the transition must happen within the same instruction
-//! sequence as the system call. Exactly that is `Op::ThreadSpawn`: system
-//! call, branch by return value, at the child fetch the argument from the
-//! new stack, call the entry, after that `exit(2)` — **not**
-//! `exit_group(2)`, otherwise a thread that ends takes the whole process.
+//! the CREATOR, on a stack that is not its own. There is no wording in the
+//! language that avoids that; the transition has to happen in the same
+//! instruction sequence as the system call. Exactly that is
+//! `Op::ThreadSpawn`: system call, branch by return value, in the child
+//! fetch the argument from the new stack, call the entry, then `exit(2)` —
+//! **not** `exit_group(2)`, else an ending thread takes the whole process.
 //!
 //! ## Why a TLS self pointer
 //!
-//! At every allocation site the collector must know which thread allocates
-//! right now (own free list, own grey buffer, own stack region).
+//! At every allocation site the collector has to know which thread is
+//! allocating right now (own free list, own grey buffer, own stack region).
 //! `gettid(2)` would be a system call per allocation. The kernel can hand
-//! the thread a `fs` base register instead (`arch_prctl(ARCH_SET_FS)`); the
+//! the thread an `fs` base register instead (`arch_prctl(ARCH_SET_FS)`); the
 //! block header of the thread carries its own address at offset 0, and
-//! `mov rax, fs:0` is **one** instruction without memory access outside
+//! `mov rax, fs:0` is **one** instruction without a memory access outside
 //! the cache line of the thread.
 //!
 //! ## Why a compare-and-swap joins them
 //!
-//! `docs/RUNDE47.md` §3.2 calls the gap by its label: with `lock xadd` alone
-//! neither a lock can be built (the transition "free -> taken" must be
+//! `docs/RUNDE47.md` §3.2 names the gap: with `lock xadd` alone
+//! neither a lock can be built (the transition "free -> taken" has to be
 //! conditional) nor the atomic upgrade (weak -> strong) be closed.
 //! `lock cmpxchg` is the smallest addition that settles both.
 
@@ -62,7 +62,7 @@ pub(crate) const SELF: &str = "__thread_self";
 /// Atomic compare-and-swap.
 pub(crate) const CAS: &str = "__atomic_swap";
 
-/// Label of the entry function that the child calls. It stands within the
+/// Name of the entry function that the child calls. It sits in the
 /// collector runtime (`lib/gc/gc.fi`) and gets the thread block as its only
 /// argument. A function pointer would be the alternative; stage 0 has none
 /// (the same decision as with the dispatcher of the finalizers, round 47).
@@ -89,7 +89,7 @@ pub(crate) fn is_thread_call(name: &str) -> bool {
 // ----------------------------------------------------------------- Type phase
 
 /// Hook from `sema::call`. `None` if this is none of the primitives or if
-/// the program holds a function of the same spelling — that one wins then.
+/// the program contains a function of the same spelling — that one wins then.
 pub(crate) fn hook_call(
     ck: &mut Checker,
     name: &str,
@@ -269,9 +269,9 @@ pub(crate) fn lower_thread_call(
 ///
 /// The local label `1:` is a **numeric** label of the assembler: `jnz 1f`
 /// jumps forward to the next `1:`. That way this sequence needs no counter
-/// and may stand as often as you like within the same module.
+/// and may appear as often as you like in the same module.
 pub(crate) fn spawn_sequence(e: &mut crate::codegen_x86::Emitter) {
-    // Put the argument on the CHILD stack — at the child `rdi` is overwritten
+    // Put the argument on the CHILD stack — in the child `rdi` is overwritten
     // with the flags, and there is no other way to reach the value.
     // 16 bytes, so that the stack stays aligned (SysV: 16-fold aligned at the
     // `call` site).
@@ -284,7 +284,7 @@ pub(crate) fn spawn_sequence(e: &mut crate::codegen_x86::Emitter) {
     e.line("syscall");
     e.line("test rax, rax");
     e.line("jnz 1f");
-    // ---- child: own stack, `rbp` fresh, fetch the argument back ----------
+    // ---- child: own stack, `rbp` fresh, fetch the argument back ---------
     e.line("mov rdi, qword ptr [rsp]");
     e.line("add rsp, 16");
     e.line("xor ebp, ebp");
