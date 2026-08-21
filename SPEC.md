@@ -1260,7 +1260,24 @@ specification and the code do not drift apart.
    memory. Proof: `tests/1402`, `tests/1403`, `demos/kernel/kcore.fi` and
    the soak run in `tools/core/run.sh` (240 000 requests, exactly ONE
    system call, RSS flat, with a leaking counter-check).
-7. **`extern fn`** is recognized syntactically, but rejected with a clear error.
+7. ~~**`extern fn`** is recognized syntactically, but rejected with a clear
+   error.~~ **Struck in round 75** (SPEC 14.5, `compiler/src/extfn.rs` and,
+   for stage 1, `lib/firnc1/parser.fi`/`codegen.fi`): a declaration WITHOUT a
+   body, closed with `;` instead of `{ }` -- `extern fn strlen(p: u64) -> u64;`.
+   The call goes out under the BARE, unmangled name (no `_F0.`/`_F1.` prefix),
+   using the System V AMD64 classification round 71 already built
+   (`abi.rs`/`types.fi::word_class`). `#[link_name(c_symbol)]` overrides the
+   symbol when the Firn name and the foreign one differ; without it the bare
+   Firn name is used. The reverse direction, `#[export_c]` in front of an
+   ordinary `fn` with a body, emits that function under its bare name too, so
+   C can call it back -- proof in both directions: `tools/extfn/run.sh` links
+   the produced object file against a hand-written `strlen` in assembly (Firn
+   calling out) and against a small C driver that calls a `#[export_c]`
+   function back (C calling in), in BOTH compilers, with the exit code
+   checked. Deliberately out of scope: variadic externs (`printf`-style),
+   struct arguments across the boundary beyond what item 1 above already
+   covers, and any form of dynamic loading -- `extern fn` here means a NAME
+   the linker resolves at link time, nothing more.
 8. **The return value of the program.** `fn main() -> i32`; `_start` calls
    `main` and passes the result to `exit` (exit code = value & 0xFF).
 9. ~~**At most 6 function parameters.**~~ **Struck in round 2** (module `kern`):
