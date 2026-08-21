@@ -197,6 +197,11 @@ pub(crate) fn runtime_reset() {
 ///
 /// Exactly those calls are forbidden inside a `#[no_gc]` function.
 pub(crate) fn is_gc_alloc_call(name: &str) -> bool {
+    // ROUND 70: `a + b` on `str` allocates in the GC heap and is therefore
+    // forbidden inside a `#[no_gc]` call tree, exactly like `gc C{…}`.
+    if name == crate::strtype::FN_CONCAT {
+        return true;
+    }
     if name.starts_with(P_NEW) {
         return true;
     }
@@ -1346,6 +1351,13 @@ pub(crate) fn source_needs_gc(toks: &[crate::lexer::Token]) -> bool {
         matches!(&w[0].kind, TokKind::Ident(a) if a == "gc")
             && matches!(&w[1].kind, TokKind::KwFn)
     }) {
+        return true;
+    }
+    // ROUND 70: `str` is GC managed. `__str_eq` and `__str_concat` live in
+    // this runtime, so a program that works with `str` pulls it in — the
+    // signal is read off the tokens, as conservatively as everything else
+    // here (strtype.rs::source_uses_str).
+    if crate::strtype::source_uses_str(toks) {
         return true;
     }
     // Round 49: the thread runtime lives in the same file — it needs the

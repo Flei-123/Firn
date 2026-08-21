@@ -254,6 +254,9 @@ const S_SLOTS_TID: u64 = 2120
 // state.
 const S_SLICE: u64 = 2128
 const S_ZBUDGET: u64 = 2136
+// ROUND 70: the type tag of `StrBytes`, determined once (`__str_tid`).
+// 0 = not yet determined.
+const S_STR_TID: u64 = 2144
 
 // The state word of a block header (see the comment at the top).
 const M_MARK: u32 = 3
@@ -3553,4 +3556,122 @@ fn thread_channel_receive(k: u64) -> u64 {
 
 fn thread_channel_used(k: u64) -> u64 {
     return __gc_ld64(k + KA_USED)
+}
+
+// =====================================================================
+// ROUND 70 -- `str` (compiler/src/strtype.rs)
+//
+// A `str` is two words: `p` (the octets) and `n` (how many). It is
+// IMMUTABLE -- nothing here writes into the octets of an existing `str`;
+// `__str_concat` only ever fills a block that nobody else knows yet.
+//
+// WHY THIS LIVES HERE: the result of `a + b` outlives both operands, so it
+// needs an owner. The only owner in this language that nobody has to name
+// is the collector. The octets therefore land in the GC heap, the
+// conservative stack scan keeps them alive as long as a `str` in a frame
+// points at them, and the sweep takes them back afterwards. That is
+// exactly what the endurance run in tools/strsoak measures.
+// =====================================================================
+
+// The class of a block of octets. It has no field of pointer type, so the
+// collector traces NOTHING inside such a block -- which is right, because
+// there are octets in there, not references.
+gc class StrBytes {
+    unused: u64,
+}
+
+// The type tag of `StrBytes`, determined once and kept in the state block.
+// The same trick as `__gcslots_tid` in gcvec.fi: allocate one template
+// object, read its tag out of the header, remember it. On failure 0 -- the
+// caller then yields the empty `str`.
+fn __str_tid() -> u64 {
+    let st: u64 = __gc_state() as u64
+    let t: u64 = __gc_ld64(st + S_STR_TID)
+    if t != 0 {
+        return t
+    }
+    let template: Gc[StrBytes] = gc StrBytes { unused: 0 } catch gc_null[StrBytes]()
+    if (template as u64) == 0 {
+        return 0
+    }
+    let new: u64 = __gc_ld32((template as u64) - HEADER) as u64
+    __gc_st64(st + S_STR_TID, new)
+    return new
+}
+
+// Content comparison. Two `str` are equal when they are of the same length
+// and every octet matches. Equal ADDRESSES are the quick way out and no
+// requirement -- `"ab" == "ab"` is true even though both literals sit in
+// different places.
+fn __str_eq(a: str, b: str) -> bool {
+    if a.n != b.n {
+        return false
+    }
+    if (a.p as u64) == (b.p as u64) {
+        return true
+    }
+    var i: usize = 0
+    while i < a.n {
+        if *(((a.p as usize) + i) as *mut u8) != *(((b.p as usize) + i) as *mut u8) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// A COPY in the GC heap. Whoever holds octets in a buffer of their own and
+// wants a `str` that outlives that buffer takes this. Unlike `__str_concat`
+// it copies even when one side is empty -- that is the whole point of it.
+fn __str_copy(a: str) -> str {
+    if a.n == 0 {
+        return str { p: 0 as *mut u8, n: 0 }
+    }
+    let tid: u64 = __str_tid()
+    if tid == 0 {
+        return str { p: 0 as *mut u8, n: 0 }
+    }
+    let p: *mut u8 = __gc_alloc_raw(tid, a.n as u64)
+    if (p as u64) == 0 {
+        return str { p: 0 as *mut u8, n: 0 }
+    }
+    var i: usize = 0
+    while i < a.n {
+        *(((p as usize) + i) as *mut u8) = *(((a.p as usize) + i) as *mut u8)
+        i = i + 1
+    }
+    return str { p: p, n: a.n }
+}
+
+// Concatenation. The result is a NEW block in the GC heap; both operands
+// stay untouched (`str` is immutable). If one side is empty, the other one
+// is handed back unchanged -- that costs no allocation and is allowed
+// exactly because nobody can write into it.
+fn __str_concat(a: str, b: str) -> str {
+    if a.n == 0 {
+        return b
+    }
+    if b.n == 0 {
+        return a
+    }
+    let tid: u64 = __str_tid()
+    if tid == 0 {
+        return str { p: 0 as *mut u8, n: 0 }
+    }
+    let n: usize = a.n + b.n
+    let p: *mut u8 = __gc_alloc_raw(tid, n as u64)
+    if (p as u64) == 0 {
+        return str { p: 0 as *mut u8, n: 0 }
+    }
+    var i: usize = 0
+    while i < a.n {
+        *(((p as usize) + i) as *mut u8) = *(((a.p as usize) + i) as *mut u8)
+        i = i + 1
+    }
+    var k: usize = 0
+    while k < b.n {
+        *(((p as usize) + a.n + k) as *mut u8) = *(((b.p as usize) + k) as *mut u8)
+        k = k + 1
+    }
+    return str { p: p, n: n }
 }

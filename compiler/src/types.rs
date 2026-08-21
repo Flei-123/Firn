@@ -252,6 +252,40 @@ impl TypeCtx {
     }
 }
 
+/// **ROUND 70** -- the second spelling of a primitive type.
+///
+/// `int` is the SAME type as `i32`, not a new one: the table maps a name
+/// onto the canonical name, and everything behind it computes with `i32`
+/// exactly as before. That is why there is no conversion, no cast and no
+/// second entry in [`Type`] -- an alias that produced its own type would
+/// have to be taught to every comparison in the type checker.
+///
+/// `float` is deliberately NOT given out: `f32` arrives in round 71, and
+/// only then does `float` mean something that can be kept.
+pub fn alias_of(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "sbyte" => "i8",
+        "short" => "i16",
+        "int" => "i32",
+        "long" => "i64",
+        "byte" => "u8",
+        "ushort" => "u16",
+        "uint" => "u32",
+        "ulong" => "u64",
+        "double" => "f64",
+        _ => return None,
+    })
+}
+
+/// The canonical spelling of a type name (`int` -> `i32`); every other name
+/// passes through unchanged.
+pub fn canon_name(name: &str) -> &str {
+    match alias_of(name) {
+        Some(c) => c,
+        None => name,
+    }
+}
+
 pub fn round_up(v: u64, a: u64) -> u64 {
     if a <= 1 {
         v

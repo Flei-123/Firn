@@ -427,6 +427,8 @@ fn walk_expr(e: &Expr, out: &mut Vec<LambdaDecl>) {
             walk_block(&d.body, out);
             out.push((**d).clone());
         }
+        // ROUND 70: the text literal carries its array literal inside.
+        ExprKind::Text(_, inner) => walk_expr(inner, out),
         ExprKind::Unary(_, i) => walk_expr(i, out),
         ExprKind::Binary(_, a, b) => {
             walk_expr(a, out);

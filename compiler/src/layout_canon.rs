@@ -113,7 +113,8 @@ fn resolve(t: &TypeExpr, idx: &HashMap<String, usize>) -> Type {
                 None => Type::Void,
             }),
         },
-        TypeExpr::Named(n, _) => match n.as_str() {
+        // ROUND 70: the second spelling folds onto the canonical name.
+        TypeExpr::Named(n, _) => match crate::types::canon_name(n.as_str()) {
             "i8" => Type::I8,
             "i16" => Type::I16,
             "i32" => Type::I32,
