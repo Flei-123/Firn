@@ -1043,7 +1043,7 @@ brackets a line break has never ended anything and still does not. Proof:
   | `short` | `i16` | | `ushort` | `u16` |
   | `int` | `i32` | | `uint` | `u32` |
   | `long` | `i64` | | `ulong` | `u64` |
-  | `double` | `f64` | | | |
+  | `double` | `f64` | | `float` | `f32` |
 
   The canonical form inside this repository stays `i32`/`i64`/`u8`; error
   messages name it too.
@@ -1063,11 +1063,13 @@ brackets a line break has never ended anything and still does not. Proof:
     of a lack: Java has no unsigned types at all. The stock of this project
     says the same thing: `u8` occurs 6992 times, `i8` 13 times.
 
-  **`float` is deliberately NOT given out.** `f32` arrives in round 71; only
-  then does `float` mean something that can be kept.
+  **ROUND 71: `float` is given out and it means `f32`** -- as in C, C++, C#,
+  Java and Go. It was held back in round 70 on purpose, so that it would not
+  first mean `f64` and then something else.
 * **Literals are typeless until they are used.** Where the context says
-  something, that holds (`let y: i64 = 5`). Where nothing at all says
-  anything, `i32` holds -- the default type since round 70, as in C#, Java and
+  something, that holds (`let y: i64 = 5`, `let y: float = 2.5`). Where
+  nothing at all says anything, `i32` holds for integers and `f64` for
+  floating point (the suffix `1.5f` forces an `f32` there) -- the default type since round 70, as in C#, Java and
   Go. The overflow check is unaffected: `let x = 5000000000` is an error,
   because 5000000000 does not fit into an `i32`.
 * **Overflow semantics stated explicitly (`L9`):** `+` checks in `--debug` and
@@ -1146,7 +1148,7 @@ README as "not yet".
 
 **Not contained (stage 0), state after round 3:** `interface`, `drop`, the move
 checker, the reference types `&T`/`inout T` as checked types (raw pointers
-only), arenas, unwinding/`throw`, `f32`, `u128`, `Arc[T]`, the standard library,
+only), arenas, unwinding/`throw`, `u128`, `Arc[T]`, the standard library,
 concurrency, package management, aarch64, WASM, an LLVM backend. Type
 constructors that are not implemented report an error of their own with
 line/column instead of a syntax error (`Rc[T]`, `Weak[T]`, `Arc[T]`; proof:
@@ -1339,11 +1341,11 @@ specification and the code do not drift apart.
     five negative tests `tests/neg/ct_*.fi` and four codegen proofs in
     `compiler/src/ct.rs`.
 
-20. **No floating point types (confirmed in round 4).** `f32`/`f64` do not
-    exist; which is why `abi.rs` carries no SSE class either. It comes together
-    with the types -- then the exhaustiveness check of the compiler enforces
-    that every case distinction handles it. A variant without a producer would
-    be dead code that only stays warning-free with a suppression attribute.
+20. ~~**No floating point types (confirmed in round 4).**~~ **Both arrived:**
+    `f64` in round 11 (14.1.f64), `f32` in round 71 (14.1.f32). And the
+    sentence about `abi.rs` came true exactly as it was written down: the SSE
+    class was added together with `f32`, and the exhaustiveness check of the
+    compiler then named every case distinction that had to handle it.
 
 #### 14.1.types -- sum types, pattern matching, generics (round 2, module `types`)
 
@@ -1635,9 +1637,9 @@ unordered-safe by themselves. Only `==` and `!=` additionally need
 
 **Deliberately left out, with a justification:**
 
-* **No `f32`.** Which is why floating point literals are NOT typeless -- `1.5`
-  is always `f64`. As soon as `f32` comes along, that turns into an inference
-  from the context.
+* ~~**No `f32`.**~~ **Arrived in round 71** -- see 14.1.f32 below. With it,
+  floating point literals became typeless and `1.5` is only an `f64` where
+  nothing says otherwise.
 * **No `%`** (that would be `fmod` and needs a library function) and **no bit
   operations** on `f64` -- on a bit pattern they have no sensible meaning.
   Whoever needs them converts to `u64` explicitly. Negative test:
@@ -1652,19 +1654,91 @@ unordered-safe by themselves. Only `==` and `!=` additionally need
 
 **Two honest restrictions of the implementation:**
 
-F1. **No register allocation for `f64`.** The linear scan in `regalloc.rs` knows
-    only the integer registers; `f64` lives in the SSE registers and would need
-    a second register class with intervals of its own. As long as that is
-    missing, **every function in which an `f64` occurs goes through the baseline
-    path** in `codegen_x86.rs` -- correct, but without register allocation and
-    therefore considerably slower. The computation happens in `xmm0`/`xmm1`,
-    reading and writing through `rax`.
+F1. **No register allocation for floating point.** The linear scan in
+    `regalloc.rs` knows only the integer registers; `f32`/`f64` live in the SSE
+    registers and would need a second register class with intervals of their
+    own. As long as that is missing, **every function in which a floating point
+    value occurs goes through the baseline path** in `codegen_x86.rs` --
+    correct, but without register allocation and therefore considerably slower.
+    The computation happens in `xmm0`/`xmm1`, reading and writing through `rax`.
 
-F2. **An ABI of its own instead of System V.** An `f64` is passed and returned
-    as a bit pattern in the INTEGER registers, not in `xmm0`-`xmm7`. Within Firn
-    that is consistent and correct; for calls to foreign libraries it would be
-    wrong. Firn calls nothing foreign today (no libc), and the alignment with
-    System V belongs to F1 -- both need the same SSE register class.
+F2. ~~**An ABI of its own instead of System V.**~~ **Settled in round 71.**
+    Floating point arguments travel in `xmm0`-`xmm7`, results in `xmm0`, and
+    aggregates are classified eightbyte by eightbyte as the ABI document
+    prescribes. Measured against GCC in both directions (`tools/abi/run.sh`).
+    What is left of the deviation concerns aggregates only and has nothing to
+    do with floating point: arguments over 16 bytes travel as a hidden pointer
+    to a copy owned by the caller, and returns over 8 bytes always through the
+    hidden pointer in `rdi` (see the head of `compiler/src/abi.rs`).
+
+#### 14.1.f32 -- the second floating point width (round 71)
+
+`f32` is a language type: IEEE-754 binary32, four bytes, four of them in one
+128-bit SSE register instead of two. The reason is not tidiness. Without it
+you cannot even READ a WAV, an OBJ, a glTF, an STL, a GPU buffer or most
+network protocols -- 32-bit floats stand in all of them, and "you need
+nothing but Firn" fails at the first file.
+
+**The second spelling is `float`.** Round 70 handed out `int`, `long`, `byte`
+and `double` and deliberately held `float` back, so that it would not first
+mean `f64` and then something else (8.2).
+
+**Literals are typeless now.** Where the context says `f32`, the literal is an
+`f32`; where nothing says anything, `f64` holds -- the default type, as in
+C#. The suffix `1.5f` exists for exactly the place where there is no context
+(`let z = 2.5f`). `2f` works as well, and so do `1e3f` and `1_000.5f`. That
+is what makes the sentence in 14.1.f64 -- "floating point literals are NOT
+typeless" -- history; it was true only as long as there was one type.
+
+**Exactly ONE implicit conversion exists in the language, and this is it:**
+`f32` -> `f64`. It loses nothing, because every binary32 IS a binary64. The
+other direction throws digits away and needs `as f32`
+(`tests/neg/f32_no_narrowing.fi`). It sits in ONE place in each compiler --
+`sema::expr` marks it, `lower::lower_expr` carries it out -- so that no
+context can lose it; `expr_types` keeps the OWN type of the expression,
+because reading an `f32` variable as if it were eight bytes wide would reach
+beyond its storage.
+
+With two floating point operands of different width the WIDER one wins, and
+symmetrically: `a_f32 + b_f64` and `b_f64 + a_f32` mean the same thing. That
+is not decoration -- a meaning that depends on the order of writing is
+exactly the kind of surprise this language does not want.
+
+**THE ERROR THIS ROUND FOUND, written down so that nobody repeats it.**
+Reading a decimal as a correctly rounded binary64 and narrowing it afterwards
+is **not** correctly rounded. At the exact middle between two binary32 the
+first rounding lands ON the middle, and the tie-to-even of the second then
+decides without knowing which side the real value lay on. It is not a rarity:
+measured against glibc `strtof`, **63568 of 239064** such cases came out one
+ulp wrong. Figueroa's theorem (2p+2 bits are enough) does not carry here --
+it holds for the results of ARITHMETIC, not for an arbitrary decimal.
+
+The way that works is **round-to-odd** in between: cut off, and set the last
+bit when anything was left over. A value whose last bit is set is never
+exactly a binary32 middle, so the second rounding always has a direction and
+it is the right one (Boldo/Melquiond; 53 >= 24 + 2). `float_exact` in the
+lexer of `firnc1` and `strtod` in `lib/num` have that mode; `firnc0` reads
+the text straight into an `f32`. The float token carries BOTH bit patterns
+since round 71, because the narrowing has to happen on the TEXT and the text
+only exists in the lexer.
+
+**Text out again** has a round-trip guarantee of its own, and it is not the
+one of `write_f64`: the shortest text for an `f32` is not the shortest text
+of the double next to it (`0.1f` widened is 0.100000001490116119384765625).
+`lib/num/f32_text.fi` shortens the digits of the widened double and CHECKS
+every candidate -- read back, narrowed, compared octet for octet -- so that
+whatever comes out has led back to the same value once. Among texts of equal
+length the nearer one wins.
+
+**Proof:** `tests/1450_f32_basics.fi`, `tests/1451_f32_context.fi`,
+`tests/1452_f32_abi.fi`, `tests/1453_f32_library.fi`, four negative tests,
+`tools/abi/run.sh` (the calling convention against GCC, both directions),
+`tools/lexnum/run.sh` (four number readers, both widths) and
+`tools/f32data/run.sh` (a real WAV and a real glTF against Python).
+
+**Deliberately left out:** `f16`/`bf16`, `%` and bit operations on `f32` (the
+same rule as for `f64`), and constant folding of floating point -- that comes
+with `comptime`.
 
 #### 14.1.str -- strings and numbers <-> text (round 2, module `str`)
 

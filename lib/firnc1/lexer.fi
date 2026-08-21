@@ -35,7 +35,7 @@ export { Lexer, lex_new, lex_free, lex_run, lex_count, lex_kind, lex_line,
     lex_kw_ptr, lex_kw_len, A_FSTR,
     A_PLUSEQ, A_MINUSEQ, A_STAREQ, A_SLASHEQ, A_PERCENTEQ,
     A_AMPEQ, A_PIPEEQ, A_CARETEQ, A_SHLEQ, A_SHREQ,
-    A_PLUSPLUS, A_MINUSMINUS }
+    A_PLUSPLUS, A_MINUSMINUS, A_FLOATF32 }
 
 // ------------------------------------------------------------ token kinds
 // order = the order in `compiler/src/lexer.rs`.
@@ -125,6 +125,9 @@ const A_SHLEQ: u32 = 79
 const A_SHREQ: u32 = 80
 const A_PLUSPLUS: u32 = 81
 const A_MINUSMINUS: u32 = 82
+// ROUND 71 (lexer.rs::TokKind::FloatF32): a float literal WITH the suffix
+// `f`, as the bit pattern of an IEEE-754 binary32.
+const A_FLOATF32: u32 = 83
 
 // kind of a string literal
 const L_BYTES: u32 = 0
@@ -584,6 +587,14 @@ fn lex_name(l: *mut Lexer) {
 // pattern 4607182418800017408 -- the bug only shows up because `firnc0`
 // is there to compare against. Through `rt.ld64` on the same address it is a
 // true reinterpretation of the very same eight bytes.
+// The way back: the binary64 belonging to a bit pattern.
+fn f64_of_bits(b: u64) -> f64 {
+    var t: f64 = 0.0
+    let p: u64 = (&t) as u64
+    rt.st64(p, 0, b)
+    return *(p as *mut f64)
+}
+
 fn bits_of(x: f64) -> u64 {
     var t: f64 = 0.0
     let p: u64 = (&t) as u64
@@ -605,6 +616,30 @@ fn ten_high_whole(k: usize) -> u64 {
         i = i + 1
     }
     return t
+}
+
+// ROUND 71 -- decimal text -> `f32` bit pattern, over the correctly rounded
+// binary64 in between.
+//
+// That this is EXACT and not a double rounding is a theorem, not a hope:
+// binary64 carries 53 bits, and 2*24+2 = 50 of them are enough to make
+// decimal -> binary64 -> binary32 give the same result as decimal ->
+// binary32 directly (Figueroa 1995). `tools/lexnum/run.sh` measures it
+// against C `strtof` and `numpy.float32` on top of that.
+//
+// The detour through the ADDRESS is the same one as in `bits_of`: only a
+// read through `rt.ld32` on the same four bytes is a true reinterpretation.
+fn narrow_f32(x: f64) -> u32 {
+    var t: f32 = 0.0
+    let p: u64 = (&t) as u64
+    *(p as *mut f32) = x as f32
+    return rt.ld32(p, 0)
+}
+
+// Is the character allowed to continue an identifier? A suffix `f` must not
+// swallow the beginning of a name -- `1.5foo` stays a mistake.
+fn suffix_free(c: u32) -> bool {
+    return !(is_letter(c) || is_digit(c) || c == 95)
 }
 
 fn ten_high(k: usize) -> f64 {
@@ -921,7 +956,20 @@ fn float_quot(num0: *mut Bn, den0: *mut Bn, numw: *mut Bn, denw: *mut Bn,
 // 0..9), `exp0` is the decimal exponent that belongs to them. The result is
 // the BIT PATTERN of the correctly rounded binary64; the literal has no
 // sign, a leading minus is a unary operator of the parser.
-fn float_exact(l: *mut Lexer, exp0: i64) -> u64 {
+// ROUND 71 -- `odd = true` rounds TO ODD instead of to nearest: cut off,
+// and set the last bit when anything was left over.
+//
+// That is the one thing that makes a correct `f32` out of it. The way
+// decimal -> binary64 (nearest) -> binary32 (nearest) is NOT correctly
+// rounded: at the exact middle between two binary32 values the intermediate
+// rounding lands ON the middle, and the tie-to-even then decides without
+// knowing which side the real value lay on. Measured against C `strtof`:
+// 63568 of 239064 such cases came out one ulp wrong.
+//
+// With round-to-odd it cannot happen: a value with the last bit set is
+// never exactly a binary32 middle, so the second rounding always has a
+// direction and it is the right one (Boldo/Melquiond -- 53 >= 24 + 2).
+fn float_exact(l: *mut Lexer, exp0: i64, odd: bool) -> u64 {
     // six big numbers of 256 limbs, one behind the other
     var block: [u32; 1536] = [0 as u32; 1536]
     let mem: u64 = (&block[0]) as u64
@@ -1011,6 +1059,23 @@ fn float_exact(l: *mut Lexer, exp0: i64) -> u64 {
         q = float_quot(&num0, &den0, &numw, &denw, &tmp, s)
     }
 
+    // --- ROUND 71: round to odd, if that is what was asked for
+    if odd {
+        if !bn_is_zero(&numw) {
+            q = q | 1
+        }
+        if e2 > 971 {
+            return F_INF_BITS
+        }
+        if q == 0 {
+            return 0
+        }
+        if q >= F_TWO52 {
+            let biased_o: u64 = (e2 + 1075) as u64
+            return (biased_o << 52) + (q - F_TWO52)
+        }
+        return q
+    }
     // --- round: the remainder against half the denominator, at exactly
     // half distance towards the even mantissa
     bn_shl(&numw, 1)
@@ -1069,7 +1134,17 @@ fn float_bits(l: *mut Lexer, mant: u64, overflow: bool, e: i64) -> u64 {
         }
     }
     (*l).float_slow = (*l).float_slow + 1
-    return float_exact(l, e)
+    return float_exact(l, e, false)
+}
+
+// ROUND 71 -- the CORRECTLY ROUNDED binary32 of the same digits.
+//
+// Always the exact way, never Clinger's fast path: the fast path delivers a
+// correctly rounded binary64, and that is exactly one rounding too many
+// (see `float_exact`). The cost is a few microseconds per float literal in
+// the source text -- next to reading the file it does not show up.
+fn float32_bits(l: *mut Lexer, e: i64) -> u32 {
+    return narrow_f32(f64_of_bits(float_exact(l, e, true)))
 }
 
 fn lex_float_rest(l: *mut Lexer, line: u32, col: u32, width0: u32,
@@ -1146,9 +1221,21 @@ fn lex_float_rest(l: *mut Lexer, line: u32, col: u32, width0: u32,
         if neg { expo = 0 - expo }
     }
     let bits: u64 = float_bits(l, mant, over, expo - n_after)
+    let single: u32 = float32_bits(l, expo - n_after)
+    // ROUND 71: the suffix `f` makes an `f32` out of it.
+    if look(l, 0) == 102 && suffix_free(look(l, 1)) {
+        vor1(l)
+        width = width + 1
+        var b3: u32 = width
+        if b3 < 1 { b3 = 1 }
+        tok(l, A_FLOATF32, line, col, b3, single as u64, 0)
+        return true
+    }
     var b2: u32 = width
     if b2 < 1 { b2 = 1 }
-    tok(l, A_FLOAT, line, col, b2, bits, 0)
+    // The token carries BOTH bit patterns: `number` the binary64, `nr` the
+    // binary32 of the very same text (lexer.rs::TokKind::Float).
+    tok(l, A_FLOAT, line, col, b2, bits, single)
     return true
 }
 
@@ -1191,6 +1278,26 @@ fn lex_int(l: *mut Lexer) {
             let c2: u32 = look(l, 1)
             if is_digit(c2) || c2 == 43 || c2 == 45 {
                 break
+            }
+        }
+        // ROUND 71: `2f` -- the f32 suffix on a literal without a point and
+        // without an exponent. At base 16 `f` is a digit, which is why this
+        // only holds for base 10, and a letter must not follow.
+        if base == 10 && c == 102 && !bad && vec_len[u8](&(*l).digits) > 0 {
+            if suffix_free(look(l, 1)) {
+                vor1(l)
+                width = width + 1
+                var m2: u64 = 0
+                var i2: usize = 0
+                while i2 < vec_len[u8](&(*l).digits) {
+                    m2 = m2 * 10 + vec_at[u8](&(*l).digits, i2) as u64
+                    i2 = i2 + 1
+                }
+                var bf: u32 = width
+                if bf < 1 { bf = 1 }
+                let _ = m2
+                tok(l, A_FLOATF32, line, col, bf, float32_bits(l, 0) as u64, 0)
+                return
             }
         }
         let w: i32 = hex_value(c)

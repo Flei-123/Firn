@@ -29,6 +29,9 @@ pub enum FTy {
     /// IEEE-754 binary64. The value of an `Op::Const` is the BIT PATTERN as
     /// u64 — FIR knows no float literals, only bit patterns.
     F64,
+    /// **ROUND 71** — IEEE-754 binary32. The value of an `Op::Const` is the
+    /// BIT PATTERN as u32, in the same way.
+    F32,
     /// pointer (always 64 bits, untyped in FIR)
     Ptr,
     /// no value
@@ -40,7 +43,7 @@ impl FTy {
         match self {
             FTy::I8 | FTy::U8 | FTy::Bool => 8,
             FTy::I16 | FTy::U16 => 16,
-            FTy::I32 | FTy::U32 => 32,
+            FTy::I32 | FTy::U32 | FTy::F32 => 32,
             FTy::I64 | FTy::U64 | FTy::Ptr | FTy::F64 => 64,
             FTy::Void => 0,
         }
@@ -50,6 +53,12 @@ impl FTy {
     }
     pub fn signed(self) -> bool {
         matches!(self, FTy::I8 | FTy::I16 | FTy::I32 | FTy::I64)
+    }
+    /// **ROUND 71** — one of the two floating point types. Everything that
+    /// asked `== FTy::F64` before asks this here; that is what keeps the two
+    /// widths from drifting apart.
+    pub fn is_float(self) -> bool {
+        matches!(self, FTy::F32 | FTy::F64)
     }
     pub fn name(self) -> &'static str {
         match self {
@@ -63,6 +72,7 @@ impl FTy {
             FTy::U64 => "u64",
             FTy::Bool => "bool",
             FTy::F64 => "f64",
+            FTy::F32 => "f32",
             FTy::Ptr => "ptr",
             FTy::Void => "void",
         }

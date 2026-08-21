@@ -350,6 +350,7 @@ enum Key {
 fn tyk(t: FTy) -> u8 {
     match t {
         FTy::F64 => 12,
+        FTy::F32 => 13,
         FTy::I8 => 1,
         FTy::I16 => 2,
         FTy::I32 => 3,
@@ -548,7 +549,7 @@ fn fold_constants(f: &mut Func, st: &mut OptStats) -> bool {
             // integer wise and would turn `1.5 + 1.5` into silent nonsense.
             // Folding floating point needs its own evaluation that is
             // faithful to rounding — that comes with `comptime` (SPEC §8.6).
-            if ty == FTy::F64 || op_has_f64(&op, f) {
+            if ty.is_float() || op_has_float(&op, f) {
                 continue;
             }
             let folded = match op {
@@ -678,14 +679,51 @@ fn fold_cast(to: FTy, from: FTy, a: i128) -> Option<i128> {
     // and `firnc0` stood next to it — both token streams had to be equal,
     // and they were not. The path without the optimizer was right the
     // whole time (`cvtsi2sd`); only the folding lied.
-    if to == FTy::F64 || from == FTy::F64 {
-        if to == FTy::F64 && from == FTy::F64 {
+    if to.is_float() || from.is_float() {
+        if to == from {
             return Some(a);
+        }
+        // ROUND 71 — the two widths among each other. BOTH directions really
+        // change the bits (`cvtss2sd`/`cvtsd2ss`); the narrowing rounds to
+        // nearest-even, exactly as the instruction does.
+        if to.is_float() && from.is_float() {
+            if to == FTy::F64 {
+                return Some((f32::from_bits(bits32(a)) as f64).to_bits() as i128);
+            }
+            let n = (f64::from_bits((a as u128) as u64) as f32).to_bits();
+            return Some((n as u64) as i128);
+        }
+        if to == FTy::F32 {
+            let x = from.truncate(a);
+            let f = if from.signed() { x as f32 } else { (x as u128) as f32 };
+            return Some((f.to_bits() as u64) as i128);
         }
         if to == FTy::F64 {
             let x = from.truncate(a);
             let f = if from.signed() { x as f64 } else { (x as u128) as f64 };
             return Some(f.to_bits() as i128);
+        }
+        if from == FTy::F32 {
+            // f32 -> integer: cutting towards zero, like `cvttss2si`.
+            let f = f32::from_bits(bits32(a));
+            if !f.is_finite() {
+                return None;
+            }
+            let t = f.trunc();
+            let bits = to.bits();
+            if bits == 0 || bits > 64 {
+                return None;
+            }
+            if to.signed() {
+                if t < -9.223372036854776e18f32 || t >= 9.223372036854776e18f32 {
+                    return None;
+                }
+                return Some(to.truncate(t as i64 as i128));
+            }
+            if t < 0.0 || t >= 1.8446744073709552e19f32 {
+                return None;
+            }
+            return Some(to.truncate((t as u64) as i128));
         }
         // f64 -> integer: cutting towards zero, like `cvttsd2si`.
         // Outside the target range, for NaN and for infinity the instruction
@@ -1143,14 +1181,19 @@ mod tests {
     }
 }
 
-/// Does an `f64` show up anywhere in this instruction? For constant
-/// folding that rules it out (see `fold_constants`).
-fn op_has_f64(op: &Op, f: &Func) -> bool {
+/// Does a floating point value show up anywhere in this instruction? For
+/// constant folding that rules it out (see `fold_constants`).
+fn op_has_float(op: &Op, f: &Func) -> bool {
     match op {
-        Op::Cmp { ty, .. } => *ty == FTy::F64,
-        Op::Cast { from, .. } => *from == FTy::F64,
-        Op::Bin(_, a, b) => f.val_ty(*a) == FTy::F64 || f.val_ty(*b) == FTy::F64,
-        Op::Un(_, a) => f.val_ty(*a) == FTy::F64,
+        Op::Cmp { ty, .. } => ty.is_float(),
+        Op::Cast { from, .. } => from.is_float(),
+        Op::Bin(_, a, b) => f.val_ty(*a).is_float() || f.val_ty(*b).is_float(),
+        Op::Un(_, a) => f.val_ty(*a).is_float(),
         _ => false,
     }
+}
+
+/// **ROUND 71** — a 32-bit pattern out of the i128 an `Op::Const` carries.
+fn bits32(a: i128) -> u32 {
+    (a as u128) as u32
 }

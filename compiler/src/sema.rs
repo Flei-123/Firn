@@ -42,6 +42,13 @@ pub struct TypeInfo {
     pub consts: HashMap<String, (Type, i128)>,
     /// Signatures of all functions.
     pub fns: HashMap<String, FnSig>,
+    /// **ROUND 71** — expressions of type `f32` that stand in a place where
+    /// an `f64` is wanted. The type checker has already written `f64` into
+    /// `expr_types` for them; the lowering puts the `cvtss2sd` in
+    /// (`lower_expr`). That is the ONLY implicit conversion of the
+    /// language, and it is lossless: every binary32 is a binary64
+    /// (SPEC 8.6).
+    pub widen_f32: HashSet<crate::ast::ExprId>,
 }
 
 impl TypeInfo {
@@ -72,6 +79,8 @@ pub(crate) struct Checker<'a> {
     /// single slot: the chain of an `f"…"` is itself made of such calls, so
     /// while one is being checked the next one is already being resolved.
     widen: std::collections::HashSet<crate::ast::ExprId>,
+    /// **ROUND 71** — see `TypeInfo::widen_f32`.
+    pub(crate) widen_f32: HashSet<crate::ast::ExprId>,
     pub(crate) dg: &'a mut Diags,
     pub(crate) tcx: TypeCtx,
     pub(crate) fns: HashMap<String, FnSig>,
@@ -96,6 +105,7 @@ pub(crate) struct Checker<'a> {
 pub fn check(prog: &Program, dg: &mut Diags) -> Option<TypeInfo> {
     let mut ck = Checker {
         widen: std::collections::HashSet::new(),
+        widen_f32: HashSet::new(),
         dg,
         tcx: TypeCtx::new(),
         fns: HashMap::new(),
@@ -126,6 +136,7 @@ pub fn check(prog: &Program, dg: &mut Diags) -> Option<TypeInfo> {
         expr_types: ck.expr_types,
         consts: ck.consts,
         fns: ck.fns,
+        widen_f32: ck.widen_f32,
     })
 }
 
@@ -1168,16 +1179,47 @@ impl<'a> Checker<'a> {
         self.depth += 1;
         let t = self.expr_inner(e, hint);
         self.depth -= 1;
+        // ROUND 71 — THE ONE IMPLICIT CONVERSION.
+        //
+        // `f32` -> `f64` loses nothing: every binary32 is exactly
+        // representable as a binary64. The other direction throws digits
+        // away and therefore needs `as f32` (`tests/neg/f32_no_narrowing.fi`).
+        //
+        // It sits HERE and nowhere else. `expr` is the single funnel through
+        // which every expression with a wanted type passes -- declaration,
+        // assignment, argument, `return`, struct field, array element. That
+        // is why one place is enough, and why no context can be forgotten.
+        if t == Type::F32 && matches!(hint, Some(Type::F64)) {
+            self.widen_f32.insert(e.id);
+            // `expr_types` keeps the NATURAL type. The lowering builds the
+            // value in `f32` first and only then converts -- reading an
+            // `f32` variable as if it were eight bytes wide would reach
+            // beyond its storage.
+            self.record(e.id, t);
+            return Type::F64;
+        }
+        // The same expression can be checked twice with different context
+        // types (probe, then the real run). Whoever does NOT widen has to
+        // take the mark back, otherwise a conversion would be left standing
+        // that nobody asked for.
+        self.widen_f32.remove(&e.id);
         self.record(e.id, t.clone());
         t
     }
 
     fn expr_inner(&mut self, e: &Expr, hint: Option<&Type>) -> Type {
         match &e.kind {
-            // Unlike integer literals, float literals are NOT untyped: in stage 0
-            // there is only `f64`. As soon as `f32` arrives, this turns into
-            // inference from the context (SPEC §8.6).
-            ExprKind::Float(_) => Type::F64,
+            // ROUND 71 — the float literal is UNTYPED, like the integer
+            // literal since round 70. Where the context says `f32`, it is an
+            // `f32`; where nothing says anything, `f64` holds -- the default
+            // type, as in C#. The suffix `1.5f` is therefore only needed
+            // where there is no context at all (SPEC 8.6).
+            ExprKind::Float(..) => match hint {
+                Some(Type::F32) => Type::F32,
+                _ => Type::F64,
+            },
+            // The suffix decides on its own and lets no context talk it out.
+            ExprKind::FloatF32(_) => Type::F32,
             ExprKind::Int(v) => match hint {
                 Some(t) if t.is_concrete_int() => {
                     if !lit_fits(*v, t) {
@@ -1445,16 +1487,16 @@ impl<'a> Checker<'a> {
                 // which is what makes `-0.0` come out right.
                 let h = self
                     .probe(inner)
-                    .or_else(|| hint.filter(|t| t.is_concrete_int() || **t == Type::F64).cloned());
+                    .or_else(|| hint.filter(|t| t.is_concrete_int() || t.is_float()).cloned());
                 let t = self.expr(inner, h.as_ref());
                 if t.is_error() {
                     return Type::Error;
                 }
-                if !(t.is_concrete_int() || t == Type::F64) {
+                if !(t.is_concrete_int() || t.is_float()) {
                     self.dg.error(
                         e.span,
                         format!(
-                            "unary '-' expects an integer or f64 type, found {}",
+                            "unary '-' expects an integer or floating point type, found {}",
                             self.tcx.name_of(&t)
                         ),
                     );
@@ -1554,7 +1596,8 @@ impl<'a> Checker<'a> {
             return Type::Bool;
         }
         if op.is_cmp() {
-            let want = self.probe(l).or_else(|| self.probe(r));
+            let want = float_want(self.probe(l), self.probe(r))
+                .or_else(|| hint.filter(|t| t.is_float()).cloned());
             let lt = self.expr(l, want.as_ref());
             let rt = self.expr(r, want.as_ref());
             if lt.is_error() || rt.is_error() {
@@ -1584,7 +1627,7 @@ impl<'a> Checker<'a> {
                 return t;
             }
             let ok = lt.is_concrete_int()
-                || lt == Type::F64
+                || lt.is_float()
                 || (eq_only && (lt == Type::Bool || lt.is_ptr() || lt.is_fn()));
             if !ok {
                 self.dg.error(
@@ -1620,10 +1663,12 @@ impl<'a> Checker<'a> {
         // The type of an operand that is already typed takes precedence over the
         // context hint — that way `let x: i64 = a + 1` (a: i32) reports the real
         // error at the assignment instead of a confusing operand error.
-        let want = self
-            .probe(l)
-            .or_else(|| self.probe(r))
-            .or_else(|| hint.filter(|t| t.is_concrete_int()).cloned());
+        // ROUND 71: with two floating point operands the WIDER one wins, so
+        // that `a_f32 + b_f64` and `b_f64 + a_f32` mean the same thing. The
+        // hint may name a floating point type as well -- that is what makes
+        // `let x: f32 = 1.5 + 2.5` compute in f32.
+        let want = float_want(self.probe(l), self.probe(r))
+            .or_else(|| hint.filter(|t| t.is_concrete_int() || t.is_float()).cloned());
         let lt = self.expr(l, want.as_ref());
         let rt = self.expr(r, want.as_ref());
         if lt.is_error() || rt.is_error() {
@@ -1666,12 +1711,16 @@ impl<'a> Checker<'a> {
         // not. `%` would be `fmod` and needs a library function; the bit
         // operations would have no sensible meaning on a bit pattern (anyone
         // who needs them converts to `u64` explicitly).
-        if lt == Type::F64 || rt == Type::F64 {
+        if lt.is_float() || rt.is_float() {
             let allowed = matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div);
             if !allowed {
                 self.dg.error_note(
                     e.span,
-                    format!("operator '{}' is not defined for f64", op.text()),
+                    format!(
+                        "operator '{}' is not defined for {}",
+                        op.text(),
+                        self.tcx.name_of(if lt.is_float() { &lt } else { &rt })
+                    ),
                     "allowed are '+', '-', '*', '/' and the comparisons; for the rest convert explicitly",
                 );
                 return Type::Error;
@@ -1685,11 +1734,11 @@ impl<'a> Checker<'a> {
                         self.tcx.name_of(&lt),
                         self.tcx.name_of(&rt)
                     ),
-                    "there is no implicit conversion, use 'as f64'",
+                    "the only implicit conversion is f32 -> f64; the other way round use 'as f32'",
                 );
                 return Type::Error;
             }
-            return Type::F64;
+            return lt;
         }
         if !lt.is_concrete_int() || !rt.is_concrete_int() || lt != rt {
             self.dg.error_note(
@@ -1745,6 +1794,7 @@ impl<'a> Checker<'a> {
             _ if t.is_concrete_int() => "fmt_u64",
             Type::Bool => "fmt_bool",
             Type::F64 => "fmt_f64",
+            Type::F32 => "fmt_f32",
             _ if crate::strtype::is_str_like(&t) => "fmt_str",
             other => {
                 self.dg.error_note(
@@ -1753,7 +1803,7 @@ impl<'a> Checker<'a> {
                         "an interpolation f\"{{…}}\" cannot show a value of type {}",
                         self.tcx.name_of(other)
                     ),
-                    "integers, bool, f64 and str work; for everything else turn it into text yourself",
+                    "integers, bool, f32, f64 and str work; for everything else turn it into text yourself",
                 );
                 return None;
             }
@@ -2003,7 +2053,11 @@ impl<'a> Checker<'a> {
                     Some(crate::strtype::ty())
                 }
             }
-            ExprKind::Float(_) => Some(Type::F64),
+            // ROUND 71: an unsuffixed float literal probes as NOTHING -- it
+            // adapts, exactly like the integer literal. Only the suffix
+            // makes it speak.
+            ExprKind::Float(..) => None,
+            ExprKind::FloatF32(_) => Some(Type::F32),
             ExprKind::Bool(_) => Some(Type::Bool),
             ExprKind::Ident(n) => {
                 if let Some(v) = self.lookup_var(n) {
@@ -2028,7 +2082,12 @@ impl<'a> Checker<'a> {
                 } else if matches!(op, BinOp::Shl | BinOp::Shr) {
                     self.probe_d(l, d + 1)
                 } else {
-                    self.probe_d(l, d + 1).or_else(|| self.probe_d(r, d + 1))
+                    // ROUND 71: the same rule as in `binary` -- with two
+                    // floating point operands of different width the wider
+                    // one is what comes out. Otherwise `a_f32 + b_f64` would
+                    // probe as `f32` and the literal next to it would get
+                    // the wrong type.
+                    float_want(self.probe_d(l, d + 1), self.probe_d(r, d + 1))
                 }
             }
             ExprKind::Field(base, name, _) => {
@@ -2402,6 +2461,7 @@ fn prim_type(name: &str) -> Option<Type> {
         "isize" => Type::Isize,
         "bool" => Type::Bool,
         "f64" => Type::F64,
+        "f32" => Type::F32,
         _ => return None,
     })
 }
@@ -2446,7 +2506,23 @@ fn lit_fits(v: i128, t: &Type) -> bool {
 
 /// May this type take part in an `as` conversion?
 fn cast_kind(t: &Type) -> bool {
-    t.is_concrete_int() || *t == Type::Bool || t.is_ptr() || *t == Type::F64
+    t.is_concrete_int() || *t == Type::Bool || t.is_ptr() || t.is_float()
+}
+
+/// **ROUND 71** — the wanted type of a binary operation out of the two
+/// probes.
+///
+/// The rule is the same for arithmetic and for comparisons and it is
+/// SYMMETRIC: if both sides are floating point but of different width, the
+/// wider one wins (`f32 + f64` is an `f64` computation, and so is
+/// `f64 + f32`). Without that the meaning would depend on the order of
+/// writing, which is exactly the sort of surprise this language does not
+/// want.
+fn float_want(pl: Option<Type>, pr: Option<Type>) -> Option<Type> {
+    match (&pl, &pr) {
+        (Some(a), Some(b)) if a.is_float() && b.is_float() && a != b => Some(Type::F64),
+        _ => pl.or(pr),
+    }
 }
 
 /// Assignment compatibility — there are NO implicit conversions. The only
@@ -2615,6 +2691,7 @@ mod tests {
     ) -> Checker<'d> {
         let mut ck = Checker {
         widen: std::collections::HashSet::new(),
+        widen_f32: HashSet::new(),
             dg,
             tcx: TypeCtx::new(),
             fns: HashMap::new(),
@@ -3085,11 +3162,12 @@ mod tests {
             ("uint", "u32"),
             ("ulong", "u64"),
             ("double", "f64"),
+            // ROUND 71: `float` is given out now, and it means `f32`.
+            ("float", "f32"),
         ] {
             assert_eq!(prim_type(alias), prim_type(canonical), "{}", alias);
         }
-        // `float` is deliberately not given out before round 71.
-        assert_eq!(prim_type("float"), None);
+        assert_eq!(prim_type("float"), Some(Type::F32));
     }
 
     #[test]
@@ -3340,7 +3418,7 @@ mod tests {
         assert_eq!(sig.params[0], Type::Array(Box::new(Type::I32), 4));
         assert_eq!(
             crate::abi::classify(&sig.params[0], &info.tcx),
-            crate::abi::ArgClass::Integer(2)
+            crate::abi::ArgClass::ints(2)
         );
     }
 
