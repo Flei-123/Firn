@@ -1966,6 +1966,7 @@ mod tests {
             expr_types: b.types.clone(),
             consts: HashMap::new(),
             fns: HashMap::new(),
+            widen_f32: std::collections::HashSet::new(),
         };
         for (n, s) in fns {
             ti.fns.insert(n.to_string(), s);
