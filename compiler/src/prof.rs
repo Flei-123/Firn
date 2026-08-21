@@ -16,7 +16,8 @@
 //!
 //! | SPEC §2 says | checked here |
 //! |---|---|
-//! | no global allocator, no runtime | `import std.*` rejected |
+//! | no global allocator, no runtime | `import std.*` rejected unless the
+//! |   | module declares `profile kernel` itself (round 73) |
 //! | no `Gc[T]` (tracing collector) | `gc class` rejected |
 //! | no unwinding / `throw` | `#[unwinds]` rejected |
 //! | no hidden allocation | follows from both: the only allocation the
@@ -30,6 +31,37 @@
 //! standard library unusable under the kernel profile — every allocation
 //! there goes through `mmap`, every output through `write`. It is thereby
 //! the sharpest of the six.
+//!
+//! ## Round 73 — `import std.*` is no longer refused wholesale
+//!
+//! Up to round 72 EVERY `import std.*` was rejected. That was too coarse:
+//! `Span::trim`, `find`, `compare`, the UTF-8 reader, `text_to_i64` and the
+//! whole of `math` ask nobody for memory and make no system call. They fell
+//! under the ban only because they stood in the same FILE as the functions
+//! that call `mmap`. Round 73 pulled them out into `lib/std/core.fi`.
+//!
+//! **The rule now: a `std` module may be imported under `kernel` if it
+//! declares `profile kernel` in its own first line.** Everything else stays
+//! forbidden, with the message unchanged.
+//!
+//! That is deliberately **not** a name list in the compiler. Two reasons:
+//!
+//! 1. The declaration is a CLAIM by the module, and the claim is
+//!    **checked**, not believed. Firn compiles whole programs: an imported
+//!    module lands in the SAME compilation unit as the kernel that imports
+//!    it, so `hook_check` below walks its functions as well. A `syscall`
+//!    hidden in `lib/std/core.fi` is an error at the line where it stands
+//!    (`tests/neg/core_kernel_syscall.fi`), and so are `gc class`,
+//!    `#[unwinds]` and unmarked floating point. Nothing has to be
+//!    maintained for that — the apparatus that already guards a kernel
+//!    guards the library it imports.
+//! 2. A new freestanding module needs no compiler change. Whoever writes
+//!    one writes `profile kernel` into its first line and is done.
+//!
+//! What the claim does NOT cover, said plainly: a module may declare
+//! `profile kernel` and be imported into an APP program, where nobody
+//! checks it. That costs nothing — under `app` a `syscall` is allowed
+//! anyway. The guarantee arises exactly where it is needed.
 //!
 //! ## Where the checks hang
 //!
@@ -119,11 +151,21 @@ pub(crate) fn reset() {
 /// Under the kernel profile the standard library is barred: it presumes a
 /// global allocator (`mmap`) and Linux system calls. Modules of your own
 /// stay allowed — the kernel is made of them, after all.
-pub fn hook_import(dg: &mut Diags, path: &[String], span: Span) {
+///
+/// **Round 73:** a `std` module that declares `profile kernel` ITSELF is
+/// admitted. `module_is_kernel` says whether the module being imported
+/// carries that declaration; `modules.rs` reads it off the parsed module,
+/// so the same source text decides in both compilers. The claim is checked
+/// afterwards by `hook_check` — the module lies in the same compilation
+/// unit as its importer (see the header of this file).
+pub fn hook_import(dg: &mut Diags, path: &[String], span: Span, module_is_kernel: bool) {
     if !is_kernel() {
         return;
     }
     if path.first().map(|s| s.as_str()) != Some("std") {
+        return;
+    }
+    if module_is_kernel {
         return;
     }
     dg.error_note(
