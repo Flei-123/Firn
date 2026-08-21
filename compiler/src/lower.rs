@@ -66,6 +66,10 @@ pub(crate) struct Local {
 }
 
 pub(crate) struct Lower<'a> {
+    /// **ROUND 70** - lvalues whose address is already computed
+    /// (`lower_addr`). The compound assignment on `str` puts its target in
+    /// here so that the address is computed exactly once.
+    pub(crate) pinned: HashMap<crate::ast::ExprId, Val>,
     pub(crate) info: &'a TypeInfo,
     pub(crate) dg: &'a mut Diags,
     pub(crate) f: Func,
@@ -299,7 +303,17 @@ impl<'a> Lower<'a> {
 
     // ---- expressions: address (lvalue / aggregate) ---------------------
 
+    /// **ROUND 70** - the address of an lvalue that has already been
+    /// computed.
+    ///
+    /// The compound assignment on `str` passes its target as an ARGUMENT
+    /// (`__str_concat(s, x)`) and writes the result back into the same
+    /// place. Without this pin the address would be computed a second time
+    /// for the argument - and with `a[f()] += "x"` `f()` would run twice.
     pub(crate) fn lower_addr(&mut self, e: &Expr) -> Option<Val> {
+        if let Some(v) = self.pinned.get(&e.id) {
+            return Some(*v);
+        }
         if self.depth > MAX_DEPTH {
             return self.err(e.span, "expression nested too deeply");
         }
@@ -353,7 +367,21 @@ impl<'a> Lower<'a> {
                 // Layer field access <-> storage location (layout.rs, DESIGN_GOALS 8)
                 Some(self.elem_addr(baddr, esz, iv, ift))
             }
-            ExprKind::StructLit(..) | ExprKind::ArrayLit(_) | ExprKind::ArrayRepeat(..) => {
+            ExprKind::StructLit(..)
+            | ExprKind::ArrayLit(_)
+            | ExprKind::ArrayRepeat(..)
+            // HOOK str: a text literal and `a + b` on `str` are aggregates
+            // and therefore need a place of their own (strtype.rs, round 70)
+            | ExprKind::Text(..) => {
+                let t = self.ty_of(e);
+                let (size, align) = self.size_align(&t);
+                let slot = self.alloca(size, align);
+                self.write_into(slot, e)?;
+                Some(slot)
+            }
+            ExprKind::Binary(ast::BinOp::Add, _, _)
+                if crate::strtype::is_str_like(&self.ty_of(e)) =>
+            {
                 let t = self.ty_of(e);
                 let (size, align) = self.size_align(&t);
                 let slot = self.alloca(size, align);
@@ -437,6 +465,44 @@ impl<'a> Lower<'a> {
             ExprKind::Lambda(d) if crate::errors::union_of(&t).is_some() => {
                 crate::fnval::lower_closure(self, addr, d, &t, e.span)
             }
+            // HOOK str: THE text literal (strtype.rs, round 70).
+            //
+            // Where an array is wanted, the inner array literal is written —
+            // literally the code of round 39. Where a `str` is wanted, the
+            // octets get a place in the frame and the two words `p`/`n` are
+            // written into the target. The empty literal `""` needs no place
+            // at all: p = 0, n = 0.
+            ExprKind::Text(_, inner) => {
+                if matches!(t, Type::Array(..)) {
+                    return self.write_into(addr, inner);
+                }
+                let n = crate::strtype::literal_len(inner);
+                let sidx = match t {
+                    Type::Struct(i) => i,
+                    _ => return self.ice(e.span, "text literal without str type"),
+                };
+                let pa = self.field_addr(addr, sidx, crate::strtype::F_PTR, e.span)?;
+                let na = self.field_addr(addr, sidx, crate::strtype::F_LEN, e.span)?;
+                let p = if n == 0 {
+                    self.constant(FTy::Ptr, 0)
+                } else {
+                    let bytes = self.alloca(n, 1);
+                    self.write_into(bytes, inner)?;
+                    bytes
+                };
+                self.store(FTy::Ptr, pa, p);
+                let len = self.constant(FTy::U64, n as i128);
+                self.store(FTy::U64, na, len);
+                Some(())
+            }
+            // HOOK str: `a + b` on `str` — the result comes from the
+            // collector (strtype.rs, round 70).
+            ExprKind::Binary(ast::BinOp::Add, a, b) if crate::strtype::is_str_like(&t) => {
+                let a = (**a).clone();
+                let b = (**b).clone();
+                self.lower_call(crate::strtype::FN_CONCAT, &[a, b], Some(addr), e.span)?;
+                Some(())
+            }
             ExprKind::ArrayLit(elems) => {
                 let et = match &t {
                     Type::Array(el, _) => (**el).clone(),
@@ -515,6 +581,10 @@ impl<'a> Lower<'a> {
                 let ft = self.fty_of(e)?;
                 Some(self.constant(ft, *v))
             }
+            // ROUND 70: a text literal is an aggregate in every case (array
+            // or `str`) — `is_agg` above has already caught it. The arm
+            // exists so that the case split stays complete.
+            ExprKind::Text(..) => self.ice(e.span, "text literal as value"),
             // The BIT PATTERN travels into FIR as a constant — there are no float
             // literals there, only bit patterns (fir::FTy::F64).
             ExprKind::Float(bits) => Some(self.constant(FTy::F64, *bits as i128)),
@@ -632,6 +702,21 @@ impl<'a> Lower<'a> {
         if op.is_logic() {
             return self.lower_short_circuit(op, a, b);
         }
+        // HOOK str: `==`/`!=` compare the CONTENT — one call into the
+        // collector runtime, the same shape in both compilers
+        // (strtype.rs, round 70).
+        if matches!(op, B::Eq | B::Ne) && crate::strtype::is_str_like(&self.ty_of(a)) {
+            let x = a.clone();
+            let y = b.clone();
+            let v = match self.lower_call(crate::strtype::FN_EQ, &[x, y], None, e.span)? {
+                Some(v) => v,
+                None => return self.ice(e.span, "__str_eq without a result"),
+            };
+            if op == B::Ne {
+                return Some(self.push(FTy::Bool, Op::Un(FUn::Not, v)));
+            }
+            return Some(v);
+        }
         if op.is_cmp() {
             let ty = self.fty_of(a)?;
             let av = self.lower_expr(a)?;
@@ -696,6 +781,30 @@ impl<'a> Lower<'a> {
         Some(self.load(FTy::Bool, slot))
     }
 
+    /// **ROUND 70** — the same resolution as `sema::fmt_target`, derived
+    /// from the same material: the type of the interpolated expression.
+    fn fmt_target(&mut self, name: &str, args: &[Expr]) -> Option<String> {
+        let head = crate::sema::fmt_value_head(name)?;
+        if args.len() != 2 {
+            return None;
+        }
+        let t = self.ty_of(&args[1]);
+        let step = if crate::strtype::is_str_like(&t) {
+            "fmt_str"
+        } else if t.is_concrete_int() && t.is_signed() {
+            "fmt_number"
+        } else if t.is_concrete_int() {
+            "fmt_u64"
+        } else if t == Type::Bool {
+            "fmt_bool"
+        } else if t == Type::F64 {
+            "fmt_f64"
+        } else {
+            return None;
+        };
+        Some(format!("{}{}", head, step))
+    }
+
     /// A call following the calling convention of `abi.rs`.
     ///
     /// `dest` is the target address when the function yields one aggregate.
@@ -708,6 +817,16 @@ impl<'a> Lower<'a> {
         dest: Option<Val>,
         span: Span,
     ) -> Option<Option<Val>> {
+        // HOOK str: `f"{x}"` — the step is derived from the type of the
+        // argument, exactly as in the type check (sema::fmt_target, round 70).
+        let fmt_real;
+        let name: &str = match self.fmt_target(name, args) {
+            Some(r) => {
+                fmt_real = r;
+                &fmt_real
+            }
+            None => name,
+        };
         // HOOK constant-time: select/barrier/secure_zero (ct.rs, SPEC §9.2/§9.3)
         // HOOK faden: the three thread primitives (thread.rs, round 49)
         if crate::thread::is_thread_call(name) && !self.info.fns.contains_key(name) {
@@ -894,7 +1013,23 @@ impl<'a> Lower<'a> {
                 None => self.ty_of(a),
             };
             if !is_agg(&t) {
-                vals.push(self.lower_expr(a)?);
+                let mut v = self.lower_expr(a)?;
+                // ROUND 70: a narrower integer is widened to the width of the
+                // parameter. Until now argument and parameter always had the
+                // same type, so nothing changes here; `f"{x}"` with an i32 is
+                // the first place where an i32 meets an i64 parameter
+                // (`io.fmt_number`), and the upper half of the register has
+                // to be right for that.
+                if let (Some(pt), Some(at)) = (sig.params.get(i), scalar_fty(&t)) {
+                    if t.is_concrete_int() && pt.is_concrete_int() && pt.bits() > t.bits() {
+                        if let Some(want) = scalar_fty(pt) {
+                            if want != at {
+                                v = self.push(want, Op::Cast { src: v, from: at });
+                            }
+                        }
+                    }
+                }
+                vals.push(v);
                 continue;
             }
             let (size, align) = self.size_align(&t);
@@ -1141,6 +1276,72 @@ impl<'a> Lower<'a> {
                 // HOOK gc: insertion barrier when writing a Gc pointer into
                 // the heap (gc_lower.rs, SPEC 3.5.3)
                 crate::gc_lower::hook_assign(self, target)
+            }
+            // ROUND 70 - `x op= e`.
+            //
+            // THE POINT OF THE WHOLE THING stands in the first line: the
+            // address of the target is computed EXACTLY ONCE. With
+            // `a[f()] += 1` a rewrite into `a[f()] = a[f()] + 1` would run
+            // `f()` twice - the classic mistake of this extension.
+            // `tests/1338_assign_op_once.fi` counts the calls.
+            //
+            // Everything after that is what `x = x op e` produces anyway:
+            // load, the same FIR operation, store. So the overflow rules
+            // are the same too, because it is the same instruction.
+            Stmt::AssignOp { target, op, value, span } => {
+                let addr = self.lower_addr(target)?;
+                let t = self.ty_of(target);
+                // `s += x` on `str`: the collector builds the new octets.
+                // The target is PINNED, so that passing it as an argument
+                // does not compute its address a second time.
+                if crate::strtype::is_str_like(&t) {
+                    self.pinned.insert(target.id, addr);
+                    let a = target.clone();
+                    let b = value.clone();
+                    let r = self.lower_call(crate::strtype::FN_CONCAT, &[a, b], Some(addr), *span);
+                    self.pinned.remove(&target.id);
+                    r?;
+                    return crate::gc_lower::hook_assign(self, target);
+                }
+                let ft = self.fty_of(target)?;
+                let cur = self.load(ft, addr);
+                let mut rhs = self.lower_expr(value)?;
+                if matches!(op, ast::BinOp::Shl | ast::BinOp::Shr) {
+                    // The shift amount is brought to the width of the left
+                    // operand - the same line as in `lower_binary`.
+                    let bt = self.fty_of(value)?;
+                    if bt != ft {
+                        rhs = self.push(ft, Op::Cast { src: rhs, from: bt });
+                    }
+                }
+                let bop = match op {
+                    ast::BinOp::Add => FBin::Add,
+                    ast::BinOp::Sub => FBin::Sub,
+                    ast::BinOp::Mul => FBin::Mul,
+                    ast::BinOp::Div => FBin::Div,
+                    ast::BinOp::Rem => FBin::Rem,
+                    ast::BinOp::And => FBin::And,
+                    ast::BinOp::Or => FBin::Or,
+                    ast::BinOp::Xor => FBin::Xor,
+                    ast::BinOp::Shl => FBin::Shl,
+                    ast::BinOp::Shr => FBin::Shr,
+                    _ => return self.ice(*span, "unknown operator in a compound assignment"),
+                };
+                let res = self.push(ft, Op::Bin(bop, cur, rhs));
+                self.store(ft, addr, res);
+                crate::gc_lower::hook_assign(self, target)
+            }
+            // ROUND 70 - `x++` / `x--`: load, plus/minus one, store. The
+            // address is computed once here as well.
+            Stmt::Step { target, up, .. } => {
+                let addr = self.lower_addr(target)?;
+                let ft = self.fty_of(target)?;
+                let cur = self.load(ft, addr);
+                let one = self.constant(ft, 1);
+                let bop = if *up { FBin::Add } else { FBin::Sub };
+                let res = self.push(ft, Op::Bin(bop, cur, one));
+                self.store(ft, addr, res);
+                Some(())
             }
             Stmt::Expr(e) => self.lower_expr_stmt(e),
             Stmt::Block(b) => self.lower_block(b),
@@ -1478,6 +1679,7 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
     f.interrupt = crate::core::has_interrupt(d);
     dwarf::set_fn(&d.name, d.span.file, d.span.line);
     let mut lo = Lower {
+        pinned: HashMap::new(),
         info,
         dg,
         f,

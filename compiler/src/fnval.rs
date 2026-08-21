@@ -389,10 +389,12 @@ fn walk_stmt(s: &crate::ast::Stmt, out: &mut Vec<LambdaDecl>) {
     use crate::ast::Stmt;
     match s {
         Stmt::Let { init, .. } => walk_expr(init, out),
-        Stmt::Assign { target, value, .. } => {
+        Stmt::Assign { target, value, .. } | Stmt::AssignOp { target, value, .. } => {
             walk_expr(target, out);
             walk_expr(value, out);
         }
+        // ROUND 70: the step has no value expression.
+        Stmt::Step { target, .. } => walk_expr(target, out),
         Stmt::If { cond, then, els, .. } => {
             walk_expr(cond, out);
             walk_block(then, out);
@@ -427,6 +429,8 @@ fn walk_expr(e: &Expr, out: &mut Vec<LambdaDecl>) {
             walk_block(&d.body, out);
             out.push((**d).clone());
         }
+        // ROUND 70: the text literal carries its array literal inside.
+        ExprKind::Text(_, inner) => walk_expr(inner, out),
         ExprKind::Unary(_, i) => walk_expr(i, out),
         ExprKind::Binary(_, a, b) => {
             walk_expr(a, out);

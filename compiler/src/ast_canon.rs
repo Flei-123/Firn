@@ -134,6 +134,15 @@ fn st(s: &Stmt) -> String {
             ex(init)
         ),
         Stmt::Assign { target, value, .. } => format!("(zuw {} {})", ex(target), ex(value)),
+        // ROUND 70: the compound assignment and the step keep their OWN
+        // shape - a canonical form that printed `x += 1` as `x = x + 1`
+        // would hide exactly the difference this round is about.
+        Stmt::AssignOp { target, op, value, .. } => {
+            format!("(opassign {} {} {})", op.text(), ex(target), ex(value))
+        }
+        Stmt::Step { target, up, .. } => {
+            format!("(step {} {})", if *up { "++" } else { "--" }, ex(target))
+        }
         Stmt::If { cond, then, els, .. } => {
             let e = match els {
                 Some(b) => st(b),
@@ -249,5 +258,7 @@ fn ex_core(e: &Expr) -> String {
             o
         }
         ExprKind::ArrayRepeat(v, n) => format!("(awdh {} {})", ex(v), ex(n)),
+        // ROUND 70 — the text literal (strtype.rs). `w` = `u"…"`.
+        ExprKind::Text(wide, inner) => format!("(text {} {})", *wide as u8, ex(inner)),
     }
 }
