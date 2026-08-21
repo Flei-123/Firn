@@ -1808,7 +1808,10 @@ fn unsupported_basic(f: &Func) -> Option<String> {
     // intervals of its own. As long as that is missing, a function containing
     // `f64` goes over the base path in `codegen_x86.rs` — correct, but without
     // register allocation. Stated honestly in SPEC §14.1.f64.
-    if f.val_types.iter().any(|t| *t == FTy::F64) {
+    // ROUND 71: `f32` too. The linear scan knows only the integer registers;
+    // as long as that is so, EVERY function with floating point in it goes
+    // through the base path (SPEC 14.1.f64, restriction F1).
+    if f.val_types.iter().any(|t| t.is_float()) {
         return Some("f64 in the value set".into());
     }
     if f.blocks.is_empty() {
