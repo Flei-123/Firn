@@ -789,7 +789,9 @@ fn value(l: *mut Lower, e: u32) -> u32 {
         }
         let v: u32 = value(l, ast.e_b(b, e))
         var un: u32 = 0
-        if op == 1 {
+        // ROUND 68: `!b` and `~x` become the SAME FIR operation; the
+        // instruction type decides between `xor eax, 1` and `not`.
+        if op == 1 || op == 4 {
             un = 1
         }
         return push(l, fir.O_UN, ft, v, 0, un, 0, 0, 0)
@@ -1234,6 +1236,34 @@ fn recv_struct_l(l: *mut Lower, t: u32) -> u32 {
     return types.base_ty_name(names(l), a)
 }
 
+// ROUND 68 (impls.rs::field_fn): the struct INDEX behind a receiver, and
+// the type of a FIELD holding a function value. NONE when there is none.
+fn recv_struct_index(l: *mut Lower, t: u32) -> u32 {
+    var i: u32 = t
+    if types.ty_kind(tf(l), i) == types.K_PTR {
+        i = types.ty_a(tf(l), i)
+    }
+    if types.ty_kind(tf(l), i) != types.K_STRUCT {
+        return NONE
+    }
+    return types.ty_a(tf(l), i)
+}
+
+fn field_fn_ty_l(l: *mut Lower, t: u32, m: u32) -> u32 {
+    let si: u32 = recv_struct_index(l, t)
+    if si == NONE {
+        return NONE
+    }
+    let ft: u32 = types.st_field_ty(tf(l), si as usize, m)
+    if ft == NONE {
+        return NONE
+    }
+    if types.ty_kind(tf(l), ft) != types.K_FN {
+        return NONE
+    }
+    return ft
+}
+
 fn method_func_l(l: *mut Lower, sn: u32, m: u32) -> u32 {
     let it: *mut intern.Interner = names(l)
     var b: rt.Buf = rt.buf_new()
@@ -1269,9 +1299,11 @@ fn asm_lower(l: *mut Lower, blk: u32, e: u32) -> u32 {
     let cnt: u32 = ast.e_c(b, e)
     // Evaluate the inputs in source order and widen them to 64 bit: a register
     // always takes the whole word anyway.
+    let n_in: u32 = ast.asm_in_count(b, blk)
+    let n_out: u32 = ast.asm_out_count(b, blk)
     var values: Vec[u32] = vec_new[u32]()
     var k: u32 = 0
-    while k < cnt {
+    while k < n_in && k < cnt {
         let arg: u32 = ast.child_at(b, off + k)
         var v: u32 = value(l, arg)
         let ft: u32 = e_fty(l, arg)
@@ -1281,15 +1313,31 @@ fn asm_lower(l: *mut Lower, blk: u32, e: u32) -> u32 {
         vec_push[u32](&values, v)
         k = k + 1
     }
-    // Argument block: first the (register, value) pairs, then the clobbers.
+    // ROUND 68: the output operands are ADDRESSES -- in source order as
+    // well, after the inputs.
+    var oaddr: Vec[u32] = vec_new[u32]()
+    var ko: u32 = n_in
+    while ko < cnt {
+        vec_push[u32](&oaddr, value(l, ast.child_at(b, off + ko)))
+        ko = ko + 1
+    }
+    // Argument block: first the (input register, value) pairs, then the
+    // (output register, address) pairs, then the clobbers.
     let aoff: u32 = fir.arg_start(&(*l).f)
     var k2: u32 = 0
-    while k2 < cnt {
+    while k2 < n_in {
         fir.arg_add(&(*l).f, ast.asm_in_reg(b, blk, k2))
         fir.arg_add(&(*l).f, vec_at[u32](&values, k2 as usize))
         k2 = k2 + 1
     }
     vec_free[u32](&values)
+    var k5: u32 = 0
+    while k5 < n_out {
+        fir.arg_add(&(*l).f, ast.asm_out_reg(b, blk, k5))
+        fir.arg_add(&(*l).f, vec_at[u32](&oaddr, k5 as usize))
+        k5 = k5 + 1
+    }
+    vec_free[u32](&oaddr)
     let cz: u32 = ast.asm_clob_count(b, blk)
     var k3: u32 = 0
     while k3 < cz {
@@ -1301,11 +1349,14 @@ fn asm_lower(l: *mut Lower, blk: u32, e: u32) -> u32 {
     if out == ast.NOTHING {
         out = fir.NONE
     }
+    // The instruction has room for one number: the clobber count in the
+    // lower half, the ROUND 68 output count in the upper one.
+    let znum: u64 = cz as u64 | ((n_out as u64) << 32)
     if out == fir.NONE {
-        push_void(l, fir.O_ASM, fir.T_VOID, template, out, 0, cz as u64, aoff, cnt)
+        push_void(l, fir.O_ASM, fir.T_VOID, template, out, 0, znum, aoff, n_in)
         return 0
     }
-    return push(l, fir.O_ASM, fir.T_U64, template, out, 0, cz as u64, aoff, cnt)
+    return push(l, fir.O_ASM, fir.T_U64, template, out, 0, znum, aoff, n_in)
 }
 
 fn call_full(l: *mut Lower, e: u32, target: u32) -> u32 {
@@ -1459,6 +1510,18 @@ fn call_full(l: *mut Lower, e: u32, target: u32) -> u32 {
     // receiver and the method name, exactly as in the type checker. There is
     // deliberately no side table between the phases.
     var recv_addr: bool = false
+    // ROUND 58 (fnval.rs): the callee sits in a VARIABLE of function type.
+    // Word 0 of the function record is the code address; the record itself
+    // goes in as the LAST argument, so that a closure body finds its
+    // captured values there (a named function never reads it). ROUND 68
+    // fills the same three variables when the callee sits in a FIELD.
+    var indirect: bool = false
+    var v_code: u32 = 0
+    var v_rec: u32 = 0
+    var v_fnty: u32 = NONE
+    // ROUND 68: with a function value out of a field the receiver drops out
+    // of the argument list -- it is only the place the value is read from.
+    var skip_recv: bool = false
     // HOOK iface (iface.rs::lower_dispatch, round 46): `f.m(a)` on a
     // `dyn I`. `target` holds the address from the method table, `data` the
     // pointer to the value; everything else -- aggregates, hidden
@@ -1502,25 +1565,37 @@ fn call_full(l: *mut Lower, e: u32, target: u32) -> u32 {
         name = method_func_l(l, sn, m)
         let mf: u32 = fn_number(l, name)
         if mf == NONE {
-            give_up(l)
-            return 0
-        }
-        if ast.fn_plen(b, mf as usize) > 0 {
+            // ROUND 68 (impls.rs::field_fn): a FIELD of the receiver
+            // holding a function value. The receiver is evaluated FIRST --
+            // the same order as for an ordinary method call.
+            let fv: u32 = field_fn_ty_l(l, et, m)
+            if fv == NONE {
+                give_up(l)
+                return 0
+            }
+            let si: u32 = recv_struct_index(l, et)
+            var base2: u32 = 0
+            if types.is_ptr(tf(l), et) {
+                base2 = value(l, recv)
+            } else {
+                base2 = address(l, recv)
+            }
+            let fa: u32 = ptradd_const(l, base2, field_offset(l, si as usize, m))
+            v_rec = load(l, fir.T_PTR, fa)
+            v_code = load(l, fir.T_PTR, v_rec)
+            v_fnty = fv
+            indirect = true
+            skip_recv = true
+        } else if ast.fn_plen(b, mf as usize) > 0 {
             let p0: u32 = types.param_ty_resolved(tf(l), mf as usize, 0)
             recv_addr = types.is_ptr(tf(l), p0) && !types.is_ptr(tf(l), et)
         }
     }
-    // ROUND 58 (fnval.rs): the callee sits in a VARIABLE of function type.
-    // Word 0 of the function record is the code address; the record itself
-    // goes in as the LAST argument, so that a closure body finds its
-    // captured values there (a named function never reads it).
-    var indirect: bool = false
-    var v_code: u32 = 0
-    var v_rec: u32 = 0
-    var v_fnty: u32 = NONE
     var rt2: u32 = 0
     if dispatch {
         rt2 = v_rt
+    } else if indirect {
+        rt2 = types.ty_a(tf(l), v_fnty)
     } else {
         let lt: u32 = local_ty(l, name)
         if lt != NONE && lt != 0 {
@@ -1564,6 +1639,12 @@ fn call_full(l: *mut Lower, e: u32, target: u32) -> u32 {
     var k: u32 = 0
     while k < ast.e_c(b, e) {
         let arg: u32 = ast.child_at(b, ast.e_b(b, e) + k)
+        // ROUND 68: the receiver of a function value out of a field is no
+        // argument -- it has already been read above.
+        if k == 0 && skip_recv {
+            k = k + 1
+            continue
+        }
         // HOOK iface: the receiver is the data pointer from the fat
         // pointer -- it has already been read above (iface.fi).
         if k == 0 && dispatch {
@@ -2547,11 +2628,11 @@ fn copy_value(l: *mut Lower, dst: u32, src: u32, t: u32) {
         copymem(l, dst, src, types.size_of(tf(l), t))
         return
     }
-    // Like `scalar_fty` in lower_errors.rs: f64 is DELIBERATELY not part
-    // of the pattern there -- no program in the corpus has `E!f64`; same here.
-    if types.ty_kind(tf(l), t) == types.K_F64 {
-        return
-    }
+    // ROUND 68: up to round 67 `f64` was skipped here -- deliberately, to
+    // stay bug compatible with `scalar_fty` in lower_errors.rs, which had
+    // lost the type. Copying nothing was WRONG on both sides; the value of
+    // an `E!f64` never reached its slot (docs/ROUND63.md, gap 2). Both
+    // compilers copy it now.
     let ft: u32 = fty(l, t)
     if ft == fir.NONE || ft == fir.T_VOID {
         return

@@ -531,7 +531,7 @@ fn probe_t(s: *mut Sema, e: u32, d: u32) -> u32 {
     }
     if a == ast.E_UN {
         let op: u32 = ast.e_a(b, e)
-        if op == 0 {
+        if op == 0 || op == 4 {
             return probe_t(s, ast.e_b(b, e), d + 1)
         }
         if op == 1 {
@@ -669,7 +669,14 @@ fn probe_t(s: *mut Sema, e: u32, d: u32) -> u32 {
             }
             let mf: u32 = fn_search(s, method_func(s, sn, m))
             if mf == NONE {
-                return NONE
+                // ROUND 68: a FIELD holding a function value -- without
+                // this a literal beside it gets no type
+                // (`c.hook(3, 4) != 12`).
+                let fv: u32 = field_fn_ty(s, et, m)
+                if fv == NONE {
+                    return NONE
+                }
+                return types.ty_a(table(s), fv)
             }
             return types.ret_ty_the_func(table(s), mf as usize)
         }
@@ -749,6 +756,9 @@ fn const_eval(s: *mut Sema, e: u32, good: *mut bool) -> i64 {
         let op: u32 = ast.e_a(b, e)
         if op == 0 {
             return 0 - v
+        }
+        if op == 4 {
+            return 0 - v - 1
         }
         if op == 1 {
             if v == 0 {
@@ -934,18 +944,31 @@ fn unary(s: *mut Sema, e: u32, note: u32) -> u32 {
     let b: *mut ast.Tree = tree(s)
     let op: u32 = ast.e_a(b, e)
     let inner: u32 = ast.e_b(b, e)
-    if op == 0 {
+    // ROUND 68: `-x` and `~x` take almost the same path -- both want a
+    // number and yield its type unchanged. The one difference: `-x` works
+    // on `f64` as well (SPEC 14.1.f64), `~x` does not -- a floating point
+    // value has no bits to flip that would mean anything.
+    if op == 0 || op == 4 {
         var h: u32 = probe(s, inner)
         if h == NONE {
             if note != NONE && is_int(s, note) {
                 h = note
+            }
+            if h == NONE && op == 0 && note != NONE {
+                if types.ty_kind(table(s), note) == types.K_F64 {
+                    h = note
+                }
             }
         }
         let t: u32 = expr(s, inner, h)
         if is_error(s, t) {
             return (*s).t_error
         }
-        if !is_int(s, t) {
+        var fits: bool = is_int(s, t)
+        if !fits && op == 0 {
+            fits = types.ty_kind(table(s), t) == types.K_F64
+        }
+        if !fits {
             complain(s)
             return (*s).t_error
         }
@@ -1328,6 +1351,29 @@ fn recv_struct(s: *mut Sema, t: u32) -> u32 {
     return types.base_ty_name(names(s), a)
 }
 
+// ROUND 68 (impls.rs::field_fn): a FIELD of the receiver holding a FUNCTION
+// VALUE. `c.hook(a, b)` is not a method call -- `hook` is a field of `Ctx`
+// whose type is `fn(A, B) -> R` (round 58). The lookup runs AFTER the method
+// lookup, never before: a method of the same name keeps winning, so no
+// existing program changes its meaning. Yields the FUNCTION TYPE or NONE.
+fn field_fn_ty(s: *mut Sema, t: u32, m: u32) -> u32 {
+    var i: u32 = t
+    if types.ty_kind(table(s), i) == types.K_PTR {
+        i = types.ty_a(table(s), i)
+    }
+    if types.ty_kind(table(s), i) != types.K_STRUCT {
+        return NONE
+    }
+    let ft: u32 = types.st_field_ty(table(s), types.ty_a(table(s), i) as usize, m)
+    if ft == NONE {
+        return NONE
+    }
+    if types.ty_kind(table(s), ft) != types.K_FN {
+        return NONE
+    }
+    return ft
+}
+
 // `Type__method` -- the name of the function behind the method.
 fn method_func(s: *mut Sema, sn: u32, m: u32) -> u32 {
     let it: *mut intern.Interner = names(s)
@@ -1400,6 +1446,34 @@ fn methods_call(s: *mut Sema, e: u32) -> u32 {
     }
     let f: u32 = fn_search(s, method_func(s, sn, m))
     if f == NONE {
+        // ROUND 68 (impls.rs::field_fn): no method of that name -- but
+        // perhaps a FIELD holding a function value. The receiver is then
+        // only the place the value is read from and is NOT passed on.
+        let fv: u32 = field_fn_ty(s, et, m)
+        if fv != NONE {
+            let plen3: u32 = types.fn_ty_len(table(s), fv)
+            if cnt - 1 != plen3 {
+                complain(s)
+            }
+            while k < cnt {
+                let arg3: u32 = ast.child_at(b, off + k)
+                if k - 1 < plen3 {
+                    let pt3: u32 = types.fn_ty_param(table(s), fv, k - 1)
+                    if has_fe(s) && coerce_check(s, arg3, pt3) {
+                        k = k + 1
+                        continue
+                    }
+                    let t3: u32 = expr(s, arg3, pt3)
+                    if !types.compatible(table(s), t3, pt3) {
+                        complain(s)
+                    }
+                } else {
+                    infer(s, arg3)
+                }
+                k = k + 1
+            }
+            return types.ty_a(table(s), fv)
+        }
         while k < cnt {
             infer(s, ast.child_at(b, off + k))
             k = k + 1
@@ -1557,18 +1631,42 @@ fn asm_check(s: *mut Sema, blk: u32, e: u32) -> u32 {
         }
         k = k + 1
     }
-    var k2: u32 = 0
-    while k2 < ast.asm_clob_count(b, blk) {
-        if !asm_reg_check(s, ast.asm_clob(b, blk, k2), 2) {
+    let onum: u32 = ast.asm_out_count(b, blk)
+    var ko: u32 = 0
+    while ko < onum {
+        if !asm_reg_check(s, ast.asm_out_reg(b, blk, ko), 0) {
             good = false
         }
-        k2 = k2 + 1
+        ko = ko + 1
+    }
+    // ROUND 68: two outputs must not name the SAME register -- one of the
+    // two results would be lost without a word being said.
+    var kd: u32 = 0
+    while kd < onum {
+        let rr: u32 = core.reg_stem(names(s), ast.asm_out_reg(b, blk, kd))
+        var twice: bool = false
+        if out != ast.NOTHING {
+            twice = rr != core.NO_REG && rr == core.reg_stem(names(s), out)
+        }
+        var kx: u32 = 0
+        while kx < kd {
+            if rr != core.NO_REG && rr == core.reg_stem(names(s), ast.asm_out_reg(b, blk, kx)) {
+                twice = true
+            }
+            kx = kx + 1
+        }
+        if twice {
+            complain(s)
+            good = false
+        }
+        kd = kd + 1
     }
     // Every input value has to be scalar -- nothing else fits into a
     // register.
     let u64t: u32 = types.new_ty(table(s), types.K_U64, 0, 0)
+    let n_in: u32 = ast.asm_in_count(b, blk)
     var k3: u32 = 0
-    while k3 < cnt {
+    while k3 < n_in && k3 < cnt {
         let t: u32 = expr(s, ast.child_at(b, off + k3), u64t)
         if is_error(s, t) {
             good = false
@@ -1577,6 +1675,30 @@ fn asm_check(s: *mut Sema, blk: u32, e: u32) -> u32 {
             good = false
         }
         k3 = k3 + 1
+    }
+    // ROUND 68: an output operand is an ADDRESS. What is written there is
+    // always the WHOLE register, so the target has to be eight octets wide.
+    let pu64: u32 = types.new_ty(table(s), types.K_PTR, u64t, 1)
+    var k4: u32 = n_in
+    while k4 < cnt {
+        let t2: u32 = expr(s, ast.child_at(b, off + k4), pu64)
+        if is_error(s, t2) {
+            good = false
+        } else if !types.is_ptr(table(s), t2) {
+            complain(s)
+            good = false
+        } else {
+            let inner: u32 = types.ty_a(table(s), t2)
+            var okk: bool = is_int(s, inner) || types.is_ptr(table(s), inner)
+            if okk {
+                okk = types.size_of(table(s), inner) == 8
+            }
+            if !okk {
+                complain(s)
+                good = false
+            }
+        }
+        k4 = k4 + 1
     }
     if !good {
         return (*s).t_error

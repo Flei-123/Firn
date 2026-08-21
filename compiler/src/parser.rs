@@ -73,6 +73,34 @@ fn starts_stmt(k: &TokKind) -> bool {
     )
 }
 
+/// **ROUND 68** — the tokens that carry an expression over a line break.
+/// Every one of them is INFIX ONLY: no statement of the language may begin
+/// with it, so the reading is unambiguous. See `Parser::cont`.
+fn continues_line(k: &TokKind) -> bool {
+    matches!(
+        k,
+        TokKind::Plus
+            | TokKind::Minus
+            | TokKind::Slash
+            | TokKind::Percent
+            | TokKind::Amp
+            | TokKind::Pipe
+            | TokKind::Caret
+            | TokKind::Shl
+            | TokKind::Shr
+            | TokKind::AndAnd
+            | TokKind::OrOr
+            | TokKind::EqEq
+            | TokKind::NotEq
+            | TokKind::Lt
+            | TokKind::Le
+            | TokKind::Gt
+            | TokKind::Ge
+            | TokKind::Dot
+            | TokKind::KwAs
+    )
+}
+
 fn starts_item(k: &TokKind) -> bool {
     matches!(
         k,
@@ -129,10 +157,21 @@ impl<'a> Parser<'a> {
     }
 
     /// May the expression be continued with the current token?
-    /// An operator at the START OF A LINE ends the statement outside of
-    /// brackets (SPEC §10: semicolon optional, the line end closes it).
+    ///
+    /// Outside brackets a line break closes the statement (SPEC §10:
+    /// semicolon optional). **ROUND 68** adds the LINE CONTINUATION: a token
+    /// that can only ever CONTINUE an expression — a binary operator, the
+    /// dot of a field access, the `as` of a conversion — carries the
+    /// expression across the line break, so a long condition or a long mask
+    /// may be broken with the operator at the START of the following line.
+    ///
+    /// `*`, `(` and `[` are deliberately NOT in that set, and that is the
+    /// whole point of the list: a line may legitimately begin with
+    /// `*p = 0`, with `(*p).f = 0` or with an index, and none of those may
+    /// silently become a multiplication, a call or an index belonging to
+    /// the line before (`tests/1233_no_continuation.fi`).
     pub(crate) fn cont(&self) -> bool {
-        self.paren_depth > 0 || !self.at_line_start()
+        self.paren_depth > 0 || !self.at_line_start() || continues_line(self.kind())
     }
 
     pub(crate) fn bump(&mut self) -> Span {
@@ -560,6 +599,7 @@ impl<'a> Parser<'a> {
         let op = match self.kind() {
             TokKind::Minus => Some(UnOp::Neg),
             TokKind::Not => Some(UnOp::Not),
+            TokKind::Tilde => Some(UnOp::BitNot),
             TokKind::Amp => Some(UnOp::AddrOf),
             TokKind::Star => Some(UnOp::Deref),
             _ => None,
@@ -1938,6 +1978,7 @@ mod tests {
                 match op {
                     UnOp::Neg => "-",
                     UnOp::Not => "!",
+                    UnOp::BitNot => "~",
                     UnOp::AddrOf => "&",
                     UnOp::Deref => "*",
                 },

@@ -83,6 +83,8 @@ pub enum TokKind {
     AndAnd,  // &&
     OrOr,    // ||
     Not,     // !
+    /// `~` — the bitwise complement (round 68).
+    Tilde,   // ~
     Question, // ? (checked downcast `x.as?[T]`)
     Hash,    // # (attributes)
     EqEq,
@@ -161,6 +163,7 @@ impl TokKind {
             TokKind::AndAnd => "&&".into(),
             TokKind::OrOr => "||".into(),
             TokKind::Not => "!".into(),
+            TokKind::Tilde => "~".into(),
             TokKind::EqEq => "==".into(),
             TokKind::NotEq => "!=".into(),
             TokKind::Lt => "<".into(),
@@ -536,6 +539,7 @@ impl<'a> Lexer<'a> {
             ('^', _) => (TokKind::Caret, 1),
             ('#', _) => (TokKind::Hash, 1),
             ('!', _) => (TokKind::Not, 1),
+            ('~', _) => (TokKind::Tilde, 1),
             ('?', _) => (TokKind::Question, 1),
             ('<', _) => (TokKind::Lt, 1),
             ('>', _) => (TokKind::Gt, 1),
@@ -769,7 +773,6 @@ pub fn char_hint(c: char) -> Option<String> {
             "that is the blank U+{:04X}, not the blank U+0020",
             c as u32
         )),
-        '~' => Some("Firn has no '~' -- the bitwise complement is 'x ^ -1'".to_string()),
         '@' => Some(
             "Firn has no annotations with '@' -- an attribute is written '#[name]'".to_string(),
         ),
