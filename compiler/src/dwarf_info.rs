@@ -620,6 +620,7 @@ fn dtype_rec(
         Type::Usize => DType::Base("usize".into(), 8, ATE_UNSIGNED),
         Type::Bool => DType::Base("bool".into(), 1, ATE_BOOLEAN),
         Type::F64 => DType::Base("f64".into(), 8, ATE_FLOAT),
+        Type::F32 => DType::Base("f32".into(), 4, ATE_FLOAT),
         // An untyped literal never reaches storage; if it does, it is an
         // i32 -- the same rule the type checker uses.
         Type::UntypedInt => DType::Base("i32".into(), 4, ATE_SIGNED),

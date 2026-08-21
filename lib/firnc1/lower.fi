@@ -170,6 +170,7 @@ fn fty(l: *mut Lower, t: u32) -> u32 {
     if k == types.K_USIZE { return fir.T_U64 }
     if k == types.K_BOOL { return fir.T_BOOL }
     if k == types.K_F64 { return fir.T_F64 }
+    if k == types.K_F32 { return fir.T_F32 }
     if k == types.K_PTR { return fir.T_PTR }
     // ROUND 58: a function value is the pointer to its function record.
     if k == types.K_FN { return fir.T_PTR }
@@ -179,6 +180,27 @@ fn fty(l: *mut Lower, t: u32) -> u32 {
 
 fn e_fty(l: *mut Lower, e: u32) -> u32 {
     return fty(l, sema.sema_ty(sm(l), e))
+}
+
+// ROUND 71 (lower.rs::out_ty) -- the type an expression HANDS OUT.
+//
+// That is its own type, except where the one implicit conversion applies:
+// an `f32` in a place that wants an `f64` hands out an `f64`. `e_fty` keeps
+// giving the OWN type on purpose -- the value is built at its own width
+// first and only converted after; reading an `f32` variable as if it were
+// eight bytes wide would reach beyond its storage.
+fn out_ty(l: *mut Lower, e: u32) -> u32 {
+    if sema.sema_widen32(sm(l), e) {
+        return types.new_ty(tf(l), types.K_F64, 0, 0)
+    }
+    return sema.sema_ty(sm(l), e)
+}
+
+fn out_fty(l: *mut Lower, e: u32) -> u32 {
+    if sema.sema_widen32(sm(l), e) {
+        return fir.T_F64
+    }
+    return e_fty(l, e)
 }
 
 // ------------------------------------------------------- building blocks
@@ -690,7 +712,9 @@ fn write_after(l: *mut Lower, addr: u32, e: u32) {
         copymem(l, addr, src, types.size_of(tf(l), t))
         return
     }
-    let ft: u32 = fty(l, t)
+    // ROUND 71: the store uses the type that comes OUT of the expression --
+    // a widened `f32` is eight bytes wide by then.
+    let ft: u32 = out_fty(l, e)
     let v: u32 = value(l, e)
     store(l, ft, addr, v)
 }
@@ -815,6 +839,20 @@ fn copymem(l: *mut Lower, target: u32, source: u32, size: u64) {
 // ------------------------------------------------------------ expressions
 
 fn value(l: *mut Lower, e: u32) -> u32 {
+    let v: u32 = value_inner(l, e)
+    // ROUND 71 -- the counterpart to the widening in `sema::expr`. The type
+    // checker has noted THAT it happens, here it really happens:
+    // `cvtss2sd`. One place for it, so that no context can lose it.
+    if sema.sema_widen32(sm(l), e) {
+        if (*l).unsuitable {
+            return v
+        }
+        return push(l, fir.O_CAST, fir.T_F64, v, 0, fir.T_F32, 0, 0, 0)
+    }
+    return v
+}
+
+fn value_inner(l: *mut Lower, e: u32) -> u32 {
     let b: *mut ast.Tree = tree(l)
     let t: u32 = sema.sema_ty(sm(l), e)
     if is_aggregate(l, t) {
@@ -827,8 +865,20 @@ fn value(l: *mut Lower, e: u32) -> u32 {
     if a == ast.E_INT {
         return constant(l, ft, ast.e_number(b, e))
     }
+    // ROUND 71: WHICH bit pattern is decided by the type checker. In an
+    // `f32` context the binary64 of the lexer is narrowed here, once,
+    // correctly rounded -- exactly the value `1.5f` would have produced.
     if a == ast.E_FLOAT {
+        if ft == fir.T_F32 {
+            // ROUND 71: the CORRECTLY ROUNDED binary32, computed in the
+            // lexer on the text. Narrowing the binary64 here would be one
+            // rounding too many (lexer.fi::float32_bits).
+            return constant(l, fir.T_F32, ast.e_a(b, e) as u64)
+        }
         return constant(l, fir.T_F64, ast.e_number(b, e))
+    }
+    if a == ast.E_FLOAT32 {
+        return constant(l, fir.T_F32, ast.e_number(b, e))
     }
     if a == ast.E_BOOL {
         return constant(l, fir.T_BOOL, ast.e_a(b, e) as u64)
@@ -914,7 +964,7 @@ fn value(l: *mut Lower, e: u32) -> u32 {
         return push(l, fir.O_SYSCALL, fir.T_I64, 0, 0, 0, 0, off, ast.e_c(b, e))
     }
     if a == ast.E_AS {
-        let of: u32 = e_fty(l, ast.e_a(b, e))
+        let of: u32 = out_fty(l, ast.e_a(b, e))
         let after: u32 = ft
         let src: u32 = value(l, ast.e_a(b, e))
         if of == after {
@@ -977,7 +1027,9 @@ fn binary(l: *mut Lower, e: u32) -> u32 {
                 }
             }
         }
-        let ty: u32 = e_fty(l, li)
+        // ROUND 71: after the widening BOTH operands are `f64`. The
+        // comparison type has to be the one the values really carry.
+        let ty: u32 = out_fty(l, li)
         let av: u32 = value(l, li)
         let bv: u32 = value(l, re)
         return push(l, fir.O_CMP, fir.T_BOOL, av, bv, op - 10, ty as u64, 0, 0)
@@ -1037,6 +1089,35 @@ fn abi_sret(l: *mut Lower, t: u32) -> bool {
 // Loads an aggregate as `n` integer words. If the size is not a multiple
 // of eight, it goes through a padded scratch buffer -- otherwise the last
 // `load` would reach partly BEYOND the object.
+// ROUND 71 (lower.rs::word_fty) -- the FIR type of ONE ABI eightbyte.
+// `f64` is not the truth about the CONTENT (an SSE eightbyte can hold two
+// `f32`), it is the truth about the REGISTER: the code generator only needs
+// to know "integer register or xmm register", and it reads exactly that.
+fn word_fty(l: *mut Lower, t: u32, which: u64) -> u32 {
+    if types.word_class(tf(l), t, which) == types.W_SSE {
+        return fir.T_F64
+    }
+    return fir.T_I64
+}
+
+// Like `words_load`, but every eightbyte keeps its CLASS. That is not
+// decoration: this is what makes a `{ f32, f32 }` land in `xmm0` instead of
+// in `rdi`.
+fn words_load_cls(l: *mut Lower, addr: u32, size: u64, n: u32, t: u32, out: *mut Vec[u32]) {
+    var source: u32 = addr
+    if size % 8 != 0 {
+        let tmp: u32 = alloca(l, n as u64 * 8, 8)
+        copymem(l, tmp, addr, size)
+        source = tmp
+    }
+    var i: u32 = 0
+    while i < n {
+        let a: u32 = ptradd_const(l, source, i as u64 * 8)
+        vec_push[u32](out, load(l, word_fty(l, t, i as u64), a))
+        i = i + 1
+    }
+}
+
 fn words_load(l: *mut Lower, addr: u32, size: u64, n: u32, out: *mut Vec[u32]) {
     var source: u32 = addr
     if size % 8 != 0 {
@@ -1481,6 +1562,10 @@ fn fmt_target(l: *mut Lower, name: u32, e: u32) -> u32 {
         var w3: [u8; 7] = "fmt_f64"
         return fmt_join(l, p, n - 9, (&w3[0]) as u64, 7)
     }
+    if types.ty_kind(tf(l), t) == types.K_F32 {
+        var w6: [u8; 7] = "fmt_f32"
+        return fmt_join(l, p, n - 9, (&w6[0]) as u64, 7)
+    }
     if !types.is_int(tf(l), t) {
         return NONE
     }
@@ -1881,7 +1966,7 @@ fn call_full(l: *mut Lower, e: u32, target: u32) -> u32 {
         let kl: u32 = abi_class(l, at)
         if kl != fir.NONE {
             let addr: u32 = address(l, arg)
-            words_load(l, addr, gr, kl, &tmp)
+            words_load_cls(l, addr, gr, kl, at, &tmp)
         } else {
             // Memory class: a hidden pointer to a copy made by the caller.
             let t: u32 = alloca(l, gr, q_align(l, at))
@@ -1912,7 +1997,9 @@ fn call_full(l: *mut Lower, e: u32, target: u32) -> u32 {
         if sret {
             push(l, call_kind, fir.T_PTR, call_target, 0, 0, 0, off, cnt)
         } else {
-            let w: u32 = push(l, call_kind, fir.T_I64, call_target, 0, 0, 0, off, cnt)
+            // ROUND 71: an aggregate of at most 8 bytes comes back in
+            // `rax` -- or in `xmm0`, if its eightbyte is of the SSE class.
+            let w: u32 = push(l, call_kind, word_fty(l, rt2, 0), call_target, 0, 0, 0, off, cnt)
             words_store(l, agg_slot, gr, w)
         }
         return 0
@@ -1978,7 +2065,9 @@ fn stmt(l: *mut Lower, i: u32) {
                 return
             }
         }
-        let t: u32 = sema.sema_ty(sm(l), init)
+        // ROUND 71: `let w: f64 = x_f32` makes an f64 variable, not a four
+        // byte one -- the initialiser hands out an f64.
+        let t: u32 = out_ty(l, init)
         if !is_aggregate(l, t) {
             let ft: u32 = fty(l, t)
             if ft == fir.NONE || ft == fir.T_VOID {
@@ -2166,7 +2255,8 @@ fn stmt(l: *mut Lower, i: u32) {
                     } else {
                         let addr: u32 = address(l, wv)
                         var w: Vec[u32] = vec_new[u32]()
-                        words_load(l, addr, gr, 1, &w)
+                        // ROUND 71: the single eightbyte keeps its class.
+                        words_load_cls(l, addr, gr, 1, t, &w)
                         let w0: u32 = vec_at[u32](&w, 0)
                         vec_free[u32](&w)
                         defer_to(l, 0)
@@ -3046,7 +3136,8 @@ fn low_run(l: *mut Lower) {
             if sret {
                 rf = fir.T_PTR
             } else {
-                rf = fir.T_I64
+                // ROUND 71: `rax`, or `xmm0` for an SSE eightbyte.
+                rf = word_fty(l, rt2, 0)
             }
         } else {
             rf = fty(l, rt2)
@@ -3070,7 +3161,9 @@ fn low_run(l: *mut Lower) {
                 if kl != fir.NONE {
                     var w: u32 = 0
                     while w < kl {
-                        vec_push[u32](&(*l).f.p_ty, fir.T_I64)
+                        // ROUND 71: the class per eightbyte, exactly as at
+                        // the call site.
+                        vec_push[u32](&(*l).f.p_ty, word_fty(l, pt, w as u64))
                         w = w + 1
                     }
                     vec_push[u32](&kind, kl)

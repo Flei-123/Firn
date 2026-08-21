@@ -291,8 +291,8 @@ impl Guard<'_> {
     fn ty(&mut self, t: &TypeExpr) {
         match t {
             TypeExpr::Named(n, s) => {
-                if n == "f64" {
-                    self.fp(*s, "the type f64");
+                if crate::types::canon_name(n) == "f64" || crate::types::canon_name(n) == "f32" {
+                    self.fp(*s, if crate::types::canon_name(n) == "f32" { "the type f32" } else { "the type f64" });
                 }
             }
             TypeExpr::Ptr { inner, .. } => self.ty(inner),
@@ -359,7 +359,9 @@ impl Guard<'_> {
 
     fn expr(&mut self, e: &Expr) {
         match &e.kind {
-            ExprKind::Float(_) => self.fp(e.span, "a floating point literal"),
+            // ROUND 71: `f32` falls under the same rule as `f64` —
+            // floating point in the kernel profile only with #[allow_fp].
+            ExprKind::Float(..) | ExprKind::FloatF32(_) => self.fp(e.span, "a floating point literal"),
             // ROUND 70: the text literal carries its array literal inside.
             ExprKind::Text(_, inner) => self.expr(inner),
             // Round 58: the body of a closure is checked like any other.

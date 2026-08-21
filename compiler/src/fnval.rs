@@ -425,6 +425,7 @@ fn walk_stmt(s: &crate::ast::Stmt, out: &mut Vec<LambdaDecl>) {
 
 fn walk_expr(e: &Expr, out: &mut Vec<LambdaDecl>) {
     match &e.kind {
+        ExprKind::FloatF32(_) => {}
         ExprKind::Lambda(d) => {
             walk_block(&d.body, out);
             out.push((**d).clone());
@@ -456,7 +457,7 @@ fn walk_expr(e: &Expr, out: &mut Vec<LambdaDecl>) {
             walk_expr(a, out);
             walk_expr(b, out);
         }
-        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Ident(_) => {}
+        ExprKind::Int(_) | ExprKind::Float(..) | ExprKind::Bool(_) | ExprKind::Ident(_) => {}
     }
 }
 

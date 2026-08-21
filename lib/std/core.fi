@@ -1258,7 +1258,17 @@ fn strtod_quot(num0: *mut Bn, den0: *mut Bn, numw: *mut Bn, denw: *mut Bn, tmp: 
 
 // Text -> bit pattern. `consumed` receives the number of characters used up
 // (0 = no valid number). `ws` needs STRTOD_WS_BYTES bytes.
-fn strtod(p: *mut u8, len: usize, ws: *mut u8, consumed: *mut usize) -> u64 {
+// ROUND 71 -- `odd = true` rounds TO ODD instead of to nearest: cut off,
+// and set the last bit when anything was left over.
+//
+// That is what makes a correct `f32` possible. The way decimal -> binary64
+// (nearest) -> binary32 (nearest) is NOT correctly rounded: at the exact
+// middle between two binary32 the intermediate rounding lands ON the middle,
+// and the tie-to-even then decides without knowing which side the real value
+// lay on. Measured against C `strtof`: 63568 of 239064 such cases came out
+// one ulp wrong. With round-to-odd it cannot happen -- a value whose last
+// bit is set is never exactly a binary32 middle (Boldo/Melquiond, 53 >= 24+2).
+fn strtod_mode(p: *mut u8, len: usize, ws: *mut u8, consumed: *mut usize, odd: bool) -> u64 {
     *consumed = 0
     var d: Bn = Bn { d: 0 as *mut u8, n: 0, cap: 0, }
     var num0: Bn = Bn { d: 0 as *mut u8, n: 0, cap: 0, }
@@ -1451,6 +1461,23 @@ fn strtod(p: *mut u8, len: usize, ws: *mut u8, consumed: *mut usize) -> u64 {
         q = strtod_quot(&num0, &den0, &numw, &denw, &tmp, s)
     }
 
+    // ROUND 71: round to odd, if that is what was asked for.
+    if odd {
+        if !bn_is_zero(&numw) {
+            q = q | 1
+        }
+        if e2 > 971 {
+            return sign + D_INF_BITS
+        }
+        if q == 0 {
+            return sign
+        }
+        if q >= D_TWO52 {
+            let biased_o: u64 = (e2 + 1075) as u64
+            return sign + (biased_o << 52) + (q - D_TWO52)
+        }
+        return sign + q
+    }
     // Round: the remainder (numw) against half the denominator (denw).
     bn_shl(&numw, 1)
     let cv: i32 = bn_cmp(&numw, &denw)
@@ -1483,6 +1510,17 @@ fn strtod(p: *mut u8, len: usize, ws: *mut u8, consumed: *mut usize) -> u64 {
         bits = q
     }
     return sign + bits
+}
+
+// The two front doors: `strtod` rounds to nearest (the correctly rounded
+// binary64), `strtod_odd` rounds to odd -- the intermediate value from which
+// a correct binary32 comes out with ONE further rounding.
+fn strtod(p: *mut u8, len: usize, ws: *mut u8, consumed: *mut usize) -> u64 {
+    return strtod_mode(p, len, ws, consumed, false)
+}
+
+fn strtod_odd(p: *mut u8, len: usize, ws: *mut u8, consumed: *mut usize) -> u64 {
+    return strtod_mode(p, len, ws, consumed, true)
 }
 
 // lib/num/core_bits.fi -- reading an IEEE-754 double off its bits
@@ -1518,6 +1556,29 @@ fn dtoa_is_inf(bits: u64) -> bool {
     return dtoa_biased_exp(bits) == 0x7FF && dtoa_frac(bits) == 0
 }
 fn dtoa_is_zero(bits: u64) -> bool {
+    return (bits << 1) == 0
+}
+
+// ROUND 71 -- the same six questions for an IEEE-754 binary32. Pure integer
+// arithmetic on a `u32`: sign in bit 31, eight exponent bits, 23 mantissa
+// bits. No FPU is touched here either, which is why these lines cost a
+// kernel nothing.
+fn f32_bits_sign(bits: u32) -> bool {
+    return (bits >> 31) == 1
+}
+fn f32_bits_exp(bits: u32) -> u32 {
+    return (bits >> 23) & 255
+}
+fn f32_bits_frac(bits: u32) -> u32 {
+    return bits & 8388607
+}
+fn f32_bits_is_nan(bits: u32) -> bool {
+    return f32_bits_exp(bits) == 255 && f32_bits_frac(bits) != 0
+}
+fn f32_bits_is_inf(bits: u32) -> bool {
+    return f32_bits_exp(bits) == 255 && f32_bits_frac(bits) == 0
+}
+fn f32_bits_is_zero(bits: u32) -> bool {
     return (bits << 1) == 0
 }
 
@@ -1763,6 +1824,43 @@ fn f64_sign(x: f64) -> bool {
     return dtoa_sign(f64_bits(x))
 }
 
+// ROUND 71 -- the same four questions for an `f32`, and the reinterpretation
+// in both directions. `as` would be a VALUE conversion (1.0 as u32 = 1);
+// what is wanted here are the four octets themselves.
+
+#[allow_fp]
+fn f32_bits(x: f32) -> u32 {
+    var t: f32 = x
+    return *(((&t) as usize) as *mut u32)
+}
+
+#[allow_fp]
+fn bits_f32(b: u32) -> f32 {
+    var t: u32 = b
+    return *(((&t) as usize) as *mut f32)
+}
+
+#[allow_fp]
+fn f32_is_nan(x: f32) -> bool {
+    return f32_bits_is_nan(f32_bits(x))
+}
+
+#[allow_fp]
+fn f32_is_infinite(x: f32) -> bool {
+    return f32_bits_is_inf(f32_bits(x))
+}
+
+#[allow_fp]
+fn f32_is_null(x: f32) -> bool {
+    return f32_bits_is_zero(f32_bits(x))
+}
+
+// true = the sign bit is negative (for -0.0 as well).
+#[allow_fp]
+fn f32_sign(x: f32) -> bool {
+    return f32_bits_sign(f32_bits(x))
+}
+
 fn strtod_work_bytes() -> usize {
     return STRTOD_WS_BYTES
 }
@@ -1803,6 +1901,49 @@ fn read_f64_at(p: *mut u8, n: usize, ws: *mut u8, out: *mut f64) -> usize {
 #[allow_fp]
 fn text_to_f64_at(p: *mut u8, n: usize, ws: *mut u8, out: *mut f64) -> bool {
     let z: usize = read_f64_at(p, n, ws, out)
+    return z == n && z > 0
+}
+
+// ---------------------------------------------- Floating point, text -> f32
+//
+// ROUND 71, and the one place in this file where a comment has to say what
+// does NOT work: the way "correctly rounded binary64, then narrow" is WRONG.
+// At the exact middle between two binary32 the first rounding lands ON the
+// middle, and the tie-to-even of the second one then decides without knowing
+// which side the real value lay on. It is not a rarity either -- measured
+// against C `strtof`, 63568 of 239064 such cases came out one ulp off.
+//
+// The way that works runs over `strtod_odd`: rounding to ODD in between (cut
+// off, last bit set when anything was left over) never produces a binary32
+// middle, so the second rounding always has a direction and it is the right
+// one. `tools/lexnum/run.sh` holds the whole thing against C `strtof` and
+// against an exact reference written in Python for thousands of literals.
+
+#[allow_fp]
+fn read_f32_at(p: *mut u8, n: usize, ws: *mut u8, out: *mut f32) -> usize {
+    var used: usize = 0
+    let bits: u64 = strtod_odd(p, n, ws, &used)
+    *out = bits_f64(bits) as f32
+    return used
+}
+
+#[allow_fp]
+fn read_f32_bits_at(p: *mut u8, n: usize, ws: *mut u8, out: *mut u32) -> usize {
+    var x: f32 = 0.0
+    let z: usize = read_f32_at(p, n, ws, &x)
+    *out = f32_bits(x)
+    return z
+}
+
+#[allow_fp]
+fn text_to_f32_at(p: *mut u8, n: usize, ws: *mut u8, out: *mut f32) -> bool {
+    let z: usize = read_f32_at(p, n, ws, out)
+    return z == n && z > 0
+}
+
+#[allow_fp]
+fn text_to_f32_bits_at(p: *mut u8, n: usize, ws: *mut u8, out: *mut u32) -> bool {
+    let z: usize = read_f32_bits_at(p, n, ws, out)
     return z == n && z > 0
 }
 
@@ -2705,6 +2846,131 @@ fn near(a: f64, b: f64, eps: f64) -> bool {
         m = fabs(b)
     }
     return fabs(a - b) <= eps * m
+}
+
+// ---------------------------------------------- ROUND 71: the single width
+//
+// `f32` has no name of its own in this module; it carries the suffix `32`,
+// because Firn knows no overloading and a second `sqrt` would be a second
+// name anyway. Everything here is EXACT, and for a reason that is worth
+// writing down: a computation on a binary32 value carried out in binary64
+// and rounded back once is correctly rounded, as long as the intermediate
+// format has at least 2p+2 = 50 bits. Binary64 has 53. So `sqrt32` is not
+// an approximation of an approximation -- it is the correctly rounded
+// square root, and `floor32`/`ceil32`/`round32`/`trunc32` cannot even round
+// at all: their result is a whole number and every whole number in range is
+// exactly representable in both widths.
+
+#[allow_fp]
+fn math_bits32(x: f32) -> u32 {
+    var t: f32 = x
+    return *(((&t) as usize) as *mut u32)
+}
+
+#[allow_fp]
+fn math_f32(b: u32) -> f32 {
+    var t: u32 = b
+    return *(((&t) as usize) as *mut f32)
+}
+
+#[allow_fp]
+fn INF32() -> f32 {
+    return math_f32(2139095040)
+}
+
+#[allow_fp]
+fn NAN32() -> f32 {
+    return math_f32(2143289344)
+}
+
+// The distance from 1.0 to the next binary32: 2^-23.
+#[allow_fp]
+fn EPSILON32() -> f32 {
+    return math_f32(872415232)
+}
+
+#[allow_fp]
+fn is_nan32(x: f32) -> bool {
+    return x != x
+}
+
+#[allow_fp]
+fn is_infinite32(x: f32) -> bool {
+    return (math_bits32(x) & 2147483647) == 2139095040
+}
+
+#[allow_fp]
+fn is_finite32(x: f32) -> bool {
+    return (math_bits32(x) & 2147483647) < 2139095040
+}
+
+#[allow_fp]
+fn fabs32(x: f32) -> f32 {
+    return math_f32(math_bits32(x) & 2147483647)
+}
+
+#[allow_fp]
+fn fmin32(a: f32, b: f32) -> f32 {
+    if is_nan32(a) {
+        return b
+    }
+    if is_nan32(b) {
+        return a
+    }
+    if a < b {
+        return a
+    }
+    return b
+}
+
+#[allow_fp]
+fn fmax32(a: f32, b: f32) -> f32 {
+    if is_nan32(a) {
+        return b
+    }
+    if is_nan32(b) {
+        return a
+    }
+    if a > b {
+        return a
+    }
+    return b
+}
+
+#[allow_fp]
+fn fclamp32(x: f32, lo: f32, hi: f32) -> f32 {
+    if x < lo {
+        return lo
+    }
+    if x > hi {
+        return hi
+    }
+    return x
+}
+
+#[allow_fp]
+fn trunc32(x: f32) -> f32 {
+    return trunc(x as f64) as f32
+}
+
+#[allow_fp]
+fn floor32(x: f32) -> f32 {
+    return floor(x as f64) as f32
+}
+
+#[allow_fp]
+fn ceil32(x: f32) -> f32 {
+    return ceil(x as f64) as f32
+}
+
+#[allow_fp]
+fn round32(x: f32) -> f32 {
+    return round(x as f64) as f32
+}
+
+#[allow_fp]
+fn sqrt32(x: f32) -> f32 {
+    return sqrt(x as f64) as f32
 }
 
 // lib/mem/core_alloc.fi -- THE ALLOCATOR, PASSED BY HAND (round 73).

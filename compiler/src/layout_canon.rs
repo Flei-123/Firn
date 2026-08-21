@@ -95,10 +95,27 @@ pub fn render(p: &Program) -> String {
     o
 }
 
+/// **ROUND 71** — the class is written per eightbyte. `int1`/`int2` keep
+/// their old spelling on purpose, so that every dump of a program without
+/// floating point stays character for character what it was; only where an
+/// SSE eightbyte really occurs does a new word appear (`sse`, `int+sse`).
 fn class(c: ArgClass) -> String {
     match c {
-        ArgClass::Integer(n) => format!("int{}", n),
         ArgClass::Memory => "mem".to_string(),
+        ArgClass::Regs { n, w } => {
+            let ws = &w[..(n as usize).min(2)];
+            if ws.iter().all(|x| *x == crate::abi::Word::Int) {
+                return format!("int{}", n);
+            }
+            let names: Vec<&str> = ws
+                .iter()
+                .map(|x| match x {
+                    crate::abi::Word::Int => "int",
+                    crate::abi::Word::Sse => "sse",
+                })
+                .collect();
+            names.join("+")
+        }
     }
 }
 
@@ -127,6 +144,7 @@ fn resolve(t: &TypeExpr, idx: &HashMap<String, usize>) -> Type {
             "isize" => Type::Isize,
             "bool" => Type::Bool,
             "f64" => Type::F64,
+            "f32" => Type::F32,
             other => match idx.get(other) {
                 Some(i) => Type::Struct(*i),
                 None => Type::Error,
@@ -137,6 +155,7 @@ fn resolve(t: &TypeExpr, idx: &HashMap<String, usize>) -> Type {
 
 fn tyname(t: &Type, tcx: &TypeCtx) -> String {
     match t {
+        Type::F32 => "f32".into(),
         Type::I8 => "i8".into(),
         Type::I16 => "i16".into(),
         Type::I32 => "i32".into(),

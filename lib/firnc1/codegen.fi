@@ -344,9 +344,23 @@ fn is_sign(ty: u32) -> bool {
     return ty == fir.T_I8 || ty == fir.T_I16 || ty == fir.T_I32 || ty == fir.T_I64
 }
 
-// `movsd xmm<n>, qword ptr [rbp-<off>]`
-fn load_xmm(c: *mut Cg, n: u32, v: u32) {
+// `movsd xmm<n>, qword ptr [rbp-<off>]`, or `movss` for a binary32.
+// ROUND 71: `movss` loads FOUR bytes and zeroes the rest of the register --
+// so what stands there is exactly the bit pattern and nothing else.
+fn load_xmm_w(c: *mut Cg, n: u32, v: u32, single: bool) {
     ins(c)
+    if single {
+        var m1: [u8; 9] = "movss xmm"
+        w(c, (&m1[0]) as u64, 9)
+        number(c, n as u64)
+        var s1: [u8; 17] = ", dword ptr [rbp-"
+        w(c, (&s1[0]) as u64, 17)
+        number(c, slot_of(c, v))
+        var e1: [u8; 1] = "]"
+        w(c, (&e1[0]) as u64, 1)
+        nl(c)
+        return
+    }
     var m: [u8; 9] = "movsd xmm"
     w(c, (&m[0]) as u64, 9)
     number(c, n as u64)
@@ -358,7 +372,23 @@ fn load_xmm(c: *mut Cg, n: u32, v: u32) {
     nl(c)
 }
 
-fn store_xmm(c: *mut Cg, off: u64, n: u32) {
+fn load_xmm(c: *mut Cg, n: u32, v: u32) {
+    load_xmm_w(c, n, v, false)
+}
+
+// The way back. For an `f32` through `movd`/`eax`: that zeroes the upper
+// half of the word, so the slot holds a DEFINED value and not the leftovers
+// of an earlier instruction.
+fn store_xmm_w(c: *mut Cg, off: u64, n: u32, single: bool) {
+    if single {
+        ins(c)
+        var d1: [u8; 13] = "movd eax, xmm"
+        w(c, (&d1[0]) as u64, 13)
+        number(c, n as u64)
+        nl(c)
+        store_slot(c, off, R_AX)
+        return
+    }
     ins(c)
     var m: [u8; 21] = "movsd qword ptr [rbp-"
     w(c, (&m[0]) as u64, 21)
@@ -369,32 +399,50 @@ fn store_xmm(c: *mut Cg, off: u64, n: u32) {
     nl(c)
 }
 
-fn emit_bin_f64(c: *mut Cg, op: u32, a: u32, b: u32, dst: u32) {
+fn store_xmm(c: *mut Cg, off: u64, n: u32) {
+    store_xmm_w(c, off, n, false)
+}
+
+fn emit_bin_float(c: *mut Cg, ty: u32, op: u32, a: u32, b: u32, dst: u32) {
     if op > 3 {
-        // `%` and the bit operations are undefined for f64 -- the
-        // type checker does not let them through at all.
+        // `%` and the bit operations are undefined for floating point --
+        // the type checker does not let them through at all.
         (*c).unsuitable = true
         return
     }
-    load_xmm(c, 0, a)
-    load_xmm(c, 1, b)
+    let single: bool = ty == fir.T_F32
+    load_xmm_w(c, 0, a, single)
+    load_xmm_w(c, 1, b, single)
     ins(c)
-    var tab: [u8; 23] = "addsd|subsd|mulsd|divsd"
-    piece(c, (&tab[0]) as u64, 23, op)
+    // ROUND 71: the scalar single instructions sit right next to the double
+    // ones -- same encoding family, one letter apart.
+    if single {
+        var t2: [u8; 23] = "addss|subss|mulss|divss"
+        piece(c, (&t2[0]) as u64, 23, op)
+    } else {
+        var tab: [u8; 23] = "addsd|subsd|mulsd|divsd"
+        piece(c, (&tab[0]) as u64, 23, op)
+    }
     var r: [u8; 11] = " xmm0, xmm1"
     w(c, (&r[0]) as u64, 11)
     nl(c)
-    store_xmm(c, slot_of(c, dst), 0)
+    store_xmm_w(c, slot_of(c, dst), 0, single)
 }
 
 // Comparison of two `f64`. `comisd` sets the flags like an
 // UNSIGNED comparison, and NaN sets PF as well. Under IEEE-754 every
 // comparison with NaN is false -- except `!=`, which has to be true.
-fn emit_cmp_f64(c: *mut Cg, op: u32, a: u32, b: u32, dst: u32) {
-    load_xmm(c, 0, a)
-    load_xmm(c, 1, b)
-    var cm: [u8; 17] = "comisd xmm0, xmm1"
-    raw(c, (&cm[0]) as u64, 17)
+fn emit_cmp_float(c: *mut Cg, ty: u32, op: u32, a: u32, b: u32, dst: u32) {
+    let single: bool = ty == fir.T_F32
+    load_xmm_w(c, 0, a, single)
+    load_xmm_w(c, 1, b, single)
+    if single {
+        var cs: [u8; 17] = "comiss xmm0, xmm1"
+        raw(c, (&cs[0]) as u64, 17)
+    } else {
+        var cm: [u8; 17] = "comisd xmm0, xmm1"
+        raw(c, (&cm[0]) as u64, 17)
+    }
     ins(c)
     var set: [u8; 3] = "set"
     w(c, (&set[0]) as u64, 3)
@@ -422,8 +470,8 @@ fn emit_cmp_f64(c: *mut Cg, op: u32, a: u32, b: u32, dst: u32) {
 }
 
 fn emit_bin(c: *mut Cg, ty: u32, op: u32, a: u32, b: u32, dst: u32) {
-    if ty == fir.T_F64 {
-        emit_bin_f64(c, op, a, b, dst)
+    if fir.is_float_ty(ty) {
+        emit_bin_float(c, ty, op, a, b, dst)
         return
     }
     load_value(c, R_AX, a)
@@ -488,8 +536,8 @@ fn emit_bin(c: *mut Cg, ty: u32, op: u32, a: u32, b: u32, dst: u32) {
 }
 
 fn emit_cmp(c: *mut Cg, ty: u32, op: u32, a: u32, b: u32, dst: u32) {
-    if ty == fir.T_F64 {
-        emit_cmp_f64(c, op, a, b, dst)
+    if fir.is_float_ty(ty) {
+        emit_cmp_float(c, ty, op, a, b, dst)
         return
     }
     load_value(c, R_AX, a)
@@ -642,8 +690,39 @@ fn emit_ptradd(c: *mut Cg, base: u32, off: u32, dst: u32) {
 }
 
 fn emit_cast(c: *mut Cg, of: u32, after: u32, src: u32, dst: u32) {
-    if of == fir.T_F64 && after == fir.T_F64 {
+    if fir.is_float_ty(of) && fir.is_float_ty(after) {
+        if of == after {
+            load_value(c, R_AX, src)
+            store_slot(c, slot_of(c, dst), R_AX)
+            return
+        }
+        // ROUND 71: the two widths among each other. Neither direction is a
+        // reinterpretation -- `cvtsd2ss` really rounds.
+        load_xmm_w(c, 0, src, of == fir.T_F32)
+        if after == fir.T_F64 {
+            var u1: [u8; 19] = "cvtss2sd xmm0, xmm0"
+            raw(c, (&u1[0]) as u64, 19)
+        } else {
+            var u2: [u8; 19] = "cvtsd2ss xmm0, xmm0"
+            raw(c, (&u2[0]) as u64, 19)
+        }
+        store_xmm_w(c, slot_of(c, dst), 0, after == fir.T_F32)
+        return
+    }
+    if after == fir.T_F32 {
+        // Integer -> f32, the same reservation as with `cvtsi2sd`.
         load_value(c, R_AX, src)
+        var c3: [u8; 18] = "cvtsi2ss xmm0, rax"
+        raw(c, (&c3[0]) as u64, 18)
+        store_xmm_w(c, slot_of(c, dst), 0, true)
+        return
+    }
+    if of == fir.T_F32 {
+        // f32 -> integer, truncating toward zero (as in C).
+        load_xmm_w(c, 0, src, true)
+        var c4: [u8; 19] = "cvttss2si rax, xmm0"
+        raw(c, (&c4[0]) as u64, 19)
+        normalize(c, R_AX, after)
         store_slot(c, slot_of(c, dst), R_AX)
         return
     }
@@ -672,20 +751,29 @@ fn emit_cast(c: *mut Cg, of: u32, after: u32, src: u32, dst: u32) {
 }
 
 fn emit_un(c: *mut Cg, ty: u32, op: u32, a: u32, dst: u32) {
-    if ty == fir.T_F64 {
+    if fir.is_float_ty(ty) {
         // ROUND 68: `-x` on a floating point value flips exactly the SIGN
         // BIT. `neg` would read the whole bit pattern as two's complement --
         // and `-0.0` would be the first thing to come out wrong. `!`/`~` do
-        // not exist for f64; the type checker refuses them.
+        // not exist for floating point; the type checker refuses them.
         if op != 0 {
             (*c).unsuitable = true
             return
         }
         load_value(c, R_AX, a)
-        var mv: [u8; 29] = "mov rcx, -9223372036854775808"
-        raw(c, (&mv[0]) as u64, 29)
-        var xo: [u8; 12] = "xor rax, rcx"
-        raw(c, (&xo[0]) as u64, 12)
+        if ty == fir.T_F32 {
+            // ROUND 71: for a binary32 the sign is bit 31. The 32 bit `xor`
+            // zeroes the upper half of `rax` by itself.
+            var m3: [u8; 20] = "mov ecx, -2147483648"
+            raw(c, (&m3[0]) as u64, 20)
+            var x3: [u8; 12] = "xor eax, ecx"
+            raw(c, (&x3[0]) as u64, 12)
+        } else {
+            var mv: [u8; 29] = "mov rcx, -9223372036854775808"
+            raw(c, (&mv[0]) as u64, 29)
+            var xo: [u8; 12] = "xor rax, rcx"
+            raw(c, (&xo[0]) as u64, 12)
+        }
         store_slot(c, slot_of(c, dst), R_AX)
         return
     }
@@ -712,47 +800,137 @@ fn argreg(c: *mut Cg, k: u32) {
     piece(c, (&tab[0]) as u64, 21, k)
 }
 
+// ROUND 71 (codegen_x86.rs::place_args) -- WHERE does argument number `k`
+// sit?
+//
+// System V hands out two register files independently of each other:
+// integer words go to `rdi, rsi, rdx, rcx, r8, r9`, floating point words to
+// `xmm0`-`xmm7`. Anything for which no register of ITS class is left travels
+// on the stack. The FIR type of the argument decides the class, and nothing
+// else -- that is what makes a `{ f32, f32 }` land in `xmm0` all by itself.
+fn arg_is_sse(f: *mut fir.Fir, fnr: u32, aoff: u32, k: u32) -> bool {
+    return fir.is_float_ty(fir.val_ty(f, fnr, fir.arg_at(f, aoff + k)))
+}
+
+fn arg_is_single(f: *mut fir.Fir, fnr: u32, aoff: u32, k: u32) -> bool {
+    return fir.val_ty(f, fnr, fir.arg_at(f, aoff + k)) == fir.T_F32
+}
+
+// How many of the arguments before `k` belong to the SSE class?
+fn sse_before(f: *mut fir.Fir, fnr: u32, aoff: u32, k: u32) -> u32 {
+    var n: u32 = 0
+    var j: u32 = 0
+    while j < k {
+        if arg_is_sse(f, fnr, aoff, j) {
+            n = n + 1
+        }
+        j = j + 1
+    }
+    return n
+}
+
+// Number of the register within its class, or NONE for the stack.
+fn arg_regnum(f: *mut fir.Fir, fnr: u32, aoff: u32, k: u32) -> u32 {
+    let sn: u32 = sse_before(f, fnr, aoff, k)
+    if arg_is_sse(f, fnr, aoff, k) {
+        if sn < 8 {
+            return sn
+        }
+        return fir.NONE
+    }
+    let inr: u32 = k - sn
+    if inr < 6 {
+        return inr
+    }
+    return fir.NONE
+}
+
+// How many arguments end up on the stack in all?
+fn stack_args(f: *mut fir.Fir, fnr: u32, aoff: u32, alen: u32) -> u32 {
+    var n: u32 = 0
+    var j: u32 = 0
+    while j < alen {
+        if arg_regnum(f, fnr, aoff, j) == fir.NONE {
+            n = n + 1
+        }
+        j = j + 1
+    }
+    return n
+}
+
+// The stack arguments in REVERSE order, so that the first of them ends up
+// at [rsp+0] after the pushes.
+fn push_stack_args(c: *mut Cg, f: *mut fir.Fir, fnr: u32, aoff: u32, alen: u32) {
+    var j: u32 = alen
+    while j > 0 {
+        j = j - 1
+        if arg_regnum(f, fnr, aoff, j) != fir.NONE {
+            continue
+        }
+        ins(c)
+        var m: [u8; 20] = "push qword ptr [rbp-"
+        w(c, (&m[0]) as u64, 20)
+        number(c, slot_of(c, fir.arg_at(f, aoff + j)))
+        var e: [u8; 1] = "]"
+        w(c, (&e[0]) as u64, 1)
+        nl(c)
+    }
+}
+
+// The arguments that DO get a register. SSE first, so that `rax`, which
+// `store_xmm_w` uses as a ferry, cannot overwrite an integer argument that
+// is already in place.
+fn load_reg_args(c: *mut Cg, f: *mut fir.Fir, fnr: u32, aoff: u32, alen: u32) {
+    var k: u32 = 0
+    while k < alen {
+        let r: u32 = arg_regnum(f, fnr, aoff, k)
+        if r != fir.NONE && arg_is_sse(f, fnr, aoff, k) {
+            load_xmm_w(c, r, fir.arg_at(f, aoff + k), arg_is_single(f, fnr, aoff, k))
+        }
+        k = k + 1
+    }
+    k = 0
+    while k < alen {
+        let r2: u32 = arg_regnum(f, fnr, aoff, k)
+        if r2 != fir.NONE && !arg_is_sse(f, fnr, aoff, k) {
+            ins(c)
+            var m: [u8; 4] = "mov "
+            w(c, (&m[0]) as u64, 4)
+            argreg(c, r2)
+            var s: [u8; 17] = ", qword ptr [rbp-"
+            w(c, (&s[0]) as u64, 17)
+            number(c, slot_of(c, fir.arg_at(f, aoff + k)))
+            var e: [u8; 1] = "]"
+            w(c, (&e[0]) as u64, 1)
+            nl(c)
+        }
+        k = k + 1
+    }
+}
+
+// The result of a call: `rax`, or `xmm0` for a floating point type.
+fn call_result(c: *mut Cg, ty: u32, dst: u32) {
+    if fir.is_float_ty(ty) {
+        store_xmm_w(c, slot_of(c, dst), 0, ty == fir.T_F32)
+        return
+    }
+    normalize(c, R_AX, ty)
+    store_slot(c, slot_of(c, dst), R_AX)
+}
+
 fn emit_call(c: *mut Cg, f: *mut fir.Fir, i: u32, fnr: u32) {
     let aoff: u32 = fir.i_aoff_of(f, i)
     let alen: u32 = fir.i_alen_of(f, i)
     // Stack arguments: push them in reverse, with a filler word in front if needed.
-    var stack: u32 = 0
-    if alen > 6 {
-        stack = alen - 6
-    }
+    let stack: u32 = stack_args(f, fnr, aoff, alen)
     var fill: u32 = 0
     if stack % 2 == 1 {
         fill = 1
         var sp: [u8; 10] = "sub rsp, 8"
         raw(c, (&sp[0]) as u64, 10)
     }
-    if stack > 0 {
-        var j: u32 = alen
-        while j > 6 {
-            j = j - 1
-            ins(c)
-            var m: [u8; 20] = "push qword ptr [rbp-"
-            w(c, (&m[0]) as u64, 20)
-            number(c, slot_of(c, fir.arg_at(f, aoff + j)))
-            var e: [u8; 1] = "]"
-            w(c, (&e[0]) as u64, 1)
-            nl(c)
-        }
-    }
-    var k: u32 = 0
-    while k < 6 && k < alen {
-        ins(c)
-        var m: [u8; 4] = "mov "
-        w(c, (&m[0]) as u64, 4)
-        argreg(c, k)
-        var s: [u8; 17] = ", qword ptr [rbp-"
-        w(c, (&s[0]) as u64, 17)
-        number(c, slot_of(c, fir.arg_at(f, aoff + k)))
-        var e: [u8; 1] = "]"
-        w(c, (&e[0]) as u64, 1)
-        nl(c)
-        k = k + 1
-    }
+    push_stack_args(c, f, fnr, aoff, alen)
+    load_reg_args(c, f, fnr, aoff, alen)
     ins(c)
     var cl: [u8; 5] = "call "
     w(c, (&cl[0]) as u64, 5)
@@ -767,8 +945,7 @@ fn emit_call(c: *mut Cg, f: *mut fir.Fir, i: u32, fnr: u32) {
     }
     let dst: u32 = fir.i_dst_of(f, i)
     if dst != fir.NONE {
-        normalize(c, R_AX, fir.i_ty_of(f, i))
-        store_slot(c, slot_of(c, dst), R_AX)
+        call_result(c, fir.i_ty_of(f, i), dst)
     }
 }
 
@@ -778,43 +955,15 @@ fn emit_call(c: *mut Cg, f: *mut fir.Fir, i: u32, fnr: u32) {
 fn emit_calli(c: *mut Cg, f: *mut fir.Fir, i: u32, fnr: u32) {
     let aoff: u32 = fir.i_aoff_of(f, i)
     let alen: u32 = fir.i_alen_of(f, i)
-    var stack: u32 = 0
-    if alen > 6 {
-        stack = alen - 6
-    }
+    let stack: u32 = stack_args(f, fnr, aoff, alen)
     var fill: u32 = 0
     if stack % 2 == 1 {
         fill = 1
         var sp: [u8; 10] = "sub rsp, 8"
         raw(c, (&sp[0]) as u64, 10)
     }
-    if stack > 0 {
-        var j: u32 = alen
-        while j > 6 {
-            j = j - 1
-            ins(c)
-            var m: [u8; 20] = "push qword ptr [rbp-"
-            w(c, (&m[0]) as u64, 20)
-            number(c, slot_of(c, fir.arg_at(f, aoff + j)))
-            var e: [u8; 1] = "]"
-            w(c, (&e[0]) as u64, 1)
-            nl(c)
-        }
-    }
-    var k: u32 = 0
-    while k < 6 && k < alen {
-        ins(c)
-        var m: [u8; 4] = "mov "
-        w(c, (&m[0]) as u64, 4)
-        argreg(c, k)
-        var s: [u8; 17] = ", qword ptr [rbp-"
-        w(c, (&s[0]) as u64, 17)
-        number(c, slot_of(c, fir.arg_at(f, aoff + k)))
-        var e: [u8; 1] = "]"
-        w(c, (&e[0]) as u64, 1)
-        nl(c)
-        k = k + 1
-    }
+    push_stack_args(c, f, fnr, aoff, alen)
+    load_reg_args(c, f, fnr, aoff, alen)
     load_slot(c, R_AX, slot_of(c, fir.i_a_of(f, i)))
     var cl: [u8; 8] = "call rax"
     raw(c, (&cl[0]) as u64, 8)
@@ -827,8 +976,7 @@ fn emit_calli(c: *mut Cg, f: *mut fir.Fir, i: u32, fnr: u32) {
     }
     let dst: u32 = fir.i_dst_of(f, i)
     if dst != fir.NONE {
-        normalize(c, R_AX, fir.i_ty_of(f, i))
-        store_slot(c, slot_of(c, dst), R_AX)
+        call_result(c, fir.i_ty_of(f, i), dst)
     }
 }
 
@@ -1603,7 +1751,15 @@ fn emit_term(c: *mut Cg, fnr: u32, bb: u32) {
     }
     let v: u32 = fir.b_t1_of(f, fnr, bb)
     if v != fir.NONE {
-        load_value(c, R_AX, v)
+        // ROUND 71: a floating point result goes into `xmm0`, as System V
+        // prescribes -- and as every other compiler on this platform
+        // expects it.
+        let rty: u32 = fir.f_ret_of(f, fnr)
+        if fir.is_float_ty(rty) {
+            load_xmm_w(c, 0, v, rty == fir.T_F32)
+        } else {
+            load_value(c, R_AX, v)
+        }
     }
     var lv: [u8; 5] = "leave"
     raw(c, (&lv[0]) as u64, 5)
@@ -1685,27 +1841,51 @@ fn cg_run(c: *mut Cg) {
         }
         // Save the parameters from the argument registers into their slots.
         let plen: u32 = fir.f_plen_of(f, fi)
+        // ROUND 71: the same placement rule as at the call site, read from
+        // the other side. The parameters ARE the first values of the
+        // function, so `arg_regnum` can be asked with the parameter numbers.
+        let poff: u32 = fir.f_poff_of(f, fi)
+        var stack_i: u32 = 0
         var k: u32 = 0
         while k < plen {
-            if k < 6 {
+            let pty: u32 = fir.p_ty_of(f, poff + k)
+            let sse: bool = fir.is_float_ty(pty)
+            var sn: u32 = 0
+            var j: u32 = 0
+            while j < k {
+                if fir.is_float_ty(fir.p_ty_of(f, poff + j)) {
+                    sn = sn + 1
+                }
+                j = j + 1
+            }
+            var rnum: u32 = fir.NONE
+            if sse {
+                if sn < 8 { rnum = sn }
+            } else {
+                if k - sn < 6 { rnum = k - sn }
+            }
+            if rnum == fir.NONE {
+                // From the caller's stack: [rbp+16], [rbp+24], ...
+                ins(c)
+                var m2: [u8; 24] = "mov rax, qword ptr [rbp+"
+                w(c, (&m2[0]) as u64, 24)
+                number(c, 16 + stack_i as u64 * 8)
+                var e2: [u8; 1] = "]"
+                w(c, (&e2[0]) as u64, 1)
+                nl(c)
+                stack_i = stack_i + 1
+                store_slot(c, slot_of(c, k), R_AX)
+            } else if sse {
+                store_xmm_w(c, slot_of(c, k), rnum, pty == fir.T_F32)
+            } else {
                 ins(c)
                 var m: [u8; 19] = "mov qword ptr [rbp-"
                 w(c, (&m[0]) as u64, 19)
                 number(c, slot_of(c, k))
                 var s: [u8; 3] = "], "
                 w(c, (&s[0]) as u64, 3)
-                argreg(c, k)
+                argreg(c, rnum)
                 nl(c)
-            } else {
-                // From the caller's stack: [rbp+16], [rbp+24], ...
-                ins(c)
-                var m2: [u8; 24] = "mov rax, qword ptr [rbp+"
-                w(c, (&m2[0]) as u64, 24)
-                number(c, 16 + (k - 6) as u64 * 8)
-                var e2: [u8; 1] = "]"
-                w(c, (&e2[0]) as u64, 1)
-                nl(c)
-                store_slot(c, slot_of(c, k), R_AX)
             }
             k = k + 1
         }

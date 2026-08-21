@@ -716,7 +716,17 @@ fn strtod_quot(num0: *mut Bn, den0: *mut Bn, numw: *mut Bn, denw: *mut Bn, tmp: 
 
 // Text -> bit pattern. `consumed` receives the number of characters used up
 // (0 = no valid number). `ws` needs STRTOD_WS_BYTES bytes.
-fn strtod(p: *mut u8, len: usize, ws: *mut u8, consumed: *mut usize) -> u64 {
+// ROUND 71 -- `odd = true` rounds TO ODD instead of to nearest: cut off,
+// and set the last bit when anything was left over.
+//
+// That is what makes a correct `f32` possible. The way decimal -> binary64
+// (nearest) -> binary32 (nearest) is NOT correctly rounded: at the exact
+// middle between two binary32 the intermediate rounding lands ON the middle,
+// and the tie-to-even then decides without knowing which side the real value
+// lay on. Measured against C `strtof`: 63568 of 239064 such cases came out
+// one ulp wrong. With round-to-odd it cannot happen -- a value whose last
+// bit is set is never exactly a binary32 middle (Boldo/Melquiond, 53 >= 24+2).
+fn strtod_mode(p: *mut u8, len: usize, ws: *mut u8, consumed: *mut usize, odd: bool) -> u64 {
     *consumed = 0
     var d: Bn = Bn { d: 0 as *mut u8, n: 0, cap: 0, }
     var num0: Bn = Bn { d: 0 as *mut u8, n: 0, cap: 0, }
@@ -909,6 +919,23 @@ fn strtod(p: *mut u8, len: usize, ws: *mut u8, consumed: *mut usize) -> u64 {
         q = strtod_quot(&num0, &den0, &numw, &denw, &tmp, s)
     }
 
+    // ROUND 71: round to odd, if that is what was asked for.
+    if odd {
+        if !bn_is_zero(&numw) {
+            q = q | 1
+        }
+        if e2 > 971 {
+            return sign + D_INF_BITS
+        }
+        if q == 0 {
+            return sign
+        }
+        if q >= D_TWO52 {
+            let biased_o: u64 = (e2 + 1075) as u64
+            return sign + (biased_o << 52) + (q - D_TWO52)
+        }
+        return sign + q
+    }
     // Round: the remainder (numw) against half the denominator (denw).
     bn_shl(&numw, 1)
     let cv: i32 = bn_cmp(&numw, &denw)
@@ -941,6 +968,17 @@ fn strtod(p: *mut u8, len: usize, ws: *mut u8, consumed: *mut usize) -> u64 {
         bits = q
     }
     return sign + bits
+}
+
+// The two front doors: `strtod` rounds to nearest (the correctly rounded
+// binary64), `strtod_odd` rounds to odd -- the intermediate value from which
+// a correct binary32 comes out with ONE further rounding.
+fn strtod(p: *mut u8, len: usize, ws: *mut u8, consumed: *mut usize) -> u64 {
+    return strtod_mode(p, len, ws, consumed, false)
+}
+
+fn strtod_odd(p: *mut u8, len: usize, ws: *mut u8, consumed: *mut usize) -> u64 {
+    return strtod_mode(p, len, ws, consumed, true)
 }
 
 // lib/num/dtoa.fi -- double -> shortest text WITH A ROUND TRIP GUARANTEE
@@ -998,6 +1036,29 @@ fn dtoa_is_inf(bits: u64) -> bool {
     return dtoa_biased_exp(bits) == 0x7FF && dtoa_frac(bits) == 0
 }
 fn dtoa_is_zero(bits: u64) -> bool {
+    return (bits << 1) == 0
+}
+
+// ROUND 71 -- the same six questions for an IEEE-754 binary32. Pure integer
+// arithmetic on a `u32`: sign in bit 31, eight exponent bits, 23 mantissa
+// bits. No FPU is touched here either, which is why these lines cost a
+// kernel nothing.
+fn f32_bits_sign(bits: u32) -> bool {
+    return (bits >> 31) == 1
+}
+fn f32_bits_exp(bits: u32) -> u32 {
+    return (bits >> 23) & 255
+}
+fn f32_bits_frac(bits: u32) -> u32 {
+    return bits & 8388607
+}
+fn f32_bits_is_nan(bits: u32) -> bool {
+    return f32_bits_exp(bits) == 255 && f32_bits_frac(bits) != 0
+}
+fn f32_bits_is_inf(bits: u32) -> bool {
+    return f32_bits_exp(bits) == 255 && f32_bits_frac(bits) == 0
+}
+fn f32_bits_is_zero(bits: u32) -> bool {
     return (bits << 1) == 0
 }
 
@@ -1281,25 +1342,35 @@ fn dtoa(bits: u64, out: *mut Bytes, ws: *mut u8) {
         0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8, 0 as u8]
     var n10: i64 = 0
     let k: usize = dtoa_digits(bits, &digits[0], &n10, ws)
-    let ki: i64 = k as i64
+    dtoa_write(out, &digits[0], k, n10)
+}
 
+// ROUND 71 -- the text output following the ECMAScript rules, for a digit
+// string that somebody else produced.
+//
+// It stood inside `dtoa` up to round 71 and had to come out: `ftoa32`
+// (lib/num/f32_text.fi) shortens the digits of the widened double until the
+// text reads back as the SAME binary32, and then it wants exactly this
+// formatting -- one set of rules for both widths, not two that drift apart.
+fn dtoa_write(out: *mut Bytes, digits: *mut u8, k: usize, n10: i64) {
+    let ki: i64 = k as i64
     if ki <= n10 && n10 <= 21 {
-        dtoa_push_digits(out, &digits[0], 0, k)
+        dtoa_push_digits(out, digits, 0, k)
         dtoa_push_zeros(out, n10 - ki)
     } else if 0 < n10 && n10 <= 21 {
-        dtoa_push_digits(out, &digits[0], 0, n10 as usize)
+        dtoa_push_digits(out, digits, 0, n10 as usize)
         bytes_push(out, 46 as u8)
-        dtoa_push_digits(out, &digits[0], n10 as usize, k)
+        dtoa_push_digits(out, digits, n10 as usize, k)
     } else if -6 < n10 && n10 <= 0 {
         bytes_push(out, 48 as u8)
         bytes_push(out, 46 as u8)
         dtoa_push_zeros(out, 0 - n10)
-        dtoa_push_digits(out, &digits[0], 0, k)
+        dtoa_push_digits(out, digits, 0, k)
     } else {
-        dtoa_push_digits(out, &digits[0], 0, 1)
+        dtoa_push_digits(out, digits, 0, 1)
         if k > 1 {
             bytes_push(out, 46 as u8)
-            dtoa_push_digits(out, &digits[0], 1, k)
+            dtoa_push_digits(out, digits, 1, k)
         }
         bytes_push(out, 101 as u8) // e
         if n10 - 1 >= 0 {

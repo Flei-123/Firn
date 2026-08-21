@@ -20,6 +20,11 @@ pub enum Type {
     Bool,
     /// IEEE-754 binary64 (SPEC §8.6).
     F64,
+    /// **ROUND 71** — IEEE-754 binary32, the second floating point type.
+    /// Four bytes, four of them in one 128-bit SSE register instead of two.
+    /// Without it no WAV, no OBJ, no glTF, no STL and no GPU buffer can even
+    /// be READ — 32-bit floats stand in all of them.
+    F32,
     /// Pointer; `mutable` = `*mut T`.
     Ptr { mutable: bool, inner: Box<Type> },
     Array(Box<Type>, u64),
@@ -62,6 +67,10 @@ impl Type {
     pub fn is_ptr(&self) -> bool {
         matches!(self, Type::Ptr { .. })
     }
+    /// **ROUND 71** — one of the two floating point types.
+    pub fn is_float(&self) -> bool {
+        matches!(self, Type::F32 | Type::F64)
+    }
     /// Round 58 — the signature behind a function value, if it is one.
     pub fn fn_sig(&self) -> Option<(&[Type], &Type)> {
         match self {
@@ -83,6 +92,7 @@ impl Type {
             Type::I32 | Type::U32 => 32,
             Type::I64 | Type::U64 | Type::Usize | Type::Isize => 64,
             Type::UntypedInt => 64,
+            Type::F32 => 32,
             Type::Bool => 8,
             Type::Ptr { .. } => 64,
             Type::Fn { .. } => 64,
@@ -171,7 +181,7 @@ impl TypeCtx {
         match t {
             Type::I8 | Type::U8 | Type::Bool => 1,
             Type::I16 | Type::U16 => 2,
-            Type::I32 | Type::U32 => 4,
+            Type::I32 | Type::U32 | Type::F32 => 4,
             Type::I64 | Type::U64 | Type::Usize | Type::Isize | Type::UntypedInt => 8,
             Type::F64 => 8,
             Type::Ptr { .. } => 8,
@@ -217,6 +227,7 @@ impl TypeCtx {
             Type::Isize => "isize".into(),
             Type::Bool => "bool".into(),
             Type::F64 => "f64".into(),
+            Type::F32 => "f32".into(),
             // A pointer to a gc class is spelled `Gc[C]` in the source text
             // (the struct carries "gc C" as its internal name, see gc.rs).
             Type::Ptr { inner, .. } if self.gc_class_name(inner).is_some() => {
@@ -260,8 +271,9 @@ impl TypeCtx {
 /// second entry in [`Type`] -- an alias that produced its own type would
 /// have to be taught to every comparison in the type checker.
 ///
-/// `float` is deliberately NOT given out: `f32` arrives in round 71, and
-/// only then does `float` mean something that can be kept.
+/// **ROUND 71** — `float` is given out now and it means `f32`, exactly as in
+/// C, C++, C#, Java and Go. It was held back in round 70 on purpose so that
+/// it would not first mean `f64` and then something else.
 pub fn alias_of(name: &str) -> Option<&'static str> {
     Some(match name {
         "sbyte" => "i8",
@@ -273,6 +285,7 @@ pub fn alias_of(name: &str) -> Option<&'static str> {
         "uint" => "u32",
         "ulong" => "u64",
         "double" => "f64",
+        "float" => "f32",
         _ => return None,
     })
 }

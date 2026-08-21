@@ -456,8 +456,13 @@ pub(crate) fn copy_propagate(f: &mut Func) -> usize {
                     // Found while comparing the lexer written in Firn against
                     // `firnc0` (round 20): `10.0` gave two different token
                     // streams, depending on whether the optimizer ran.
-                    let floatswitch = (*from == crate::fir::FTy::F64)
-                        != (i.ty == crate::fir::FTy::F64);
+                    //
+                    // ROUND 71: `f32 -> f64` is such a conversion as well,
+                    // and so is `f32 -> u32` -- same width, same signedness
+                    // by the table, completely different bits. The rule is
+                    // therefore: as soon as floating point is involved on
+                    // ONE side and the types differ, nothing is dropped.
+                    let floatswitch = (from.is_float() || i.ty.is_float()) && *from != i.ty;
                     if !floatswitch
                         && (*from == i.ty
                             || (from.bits() == i.ty.bits()
