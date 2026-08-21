@@ -85,7 +85,7 @@
 #  29. The comfort layer of the standard library (tools/strlib/comfort/run.sh,
 #      round 69): demos/number_check.fi really runs -- four inputs, the
 #      whole output compared -- and the new input layer does not leak:
-#      hundreds of thousands of lines through `io.read_line()` with a flat
+#      hundreds of thousands of lines through `io.read_text()` with a flat
 #      RSS, plus the deliberately leaking counter-check that MUST strike.
 #  10. DOM soak run (tools/dom_soak/run.sh): the DOM prototype in Firn builds
 #      real cycles continuously (parent/child, listener, JS wrapper) and must

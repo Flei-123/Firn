@@ -12,7 +12,7 @@
 #     that is not a number.
 #
 #  2. THE INPUT LAYER DOES NOT LEAK. tools/strlib/comfort/soak.fi reads
-#     hundreds of thousands of lines with `io.read_line()` and releases
+#     hundreds of thousands of lines with `io.read_text()` and releases
 #     every `Text`; the resident memory (RSS, /proc/self/statm) has to stay
 #     flat while doing so. THE COUNTER-CHECK is the same program with the
 #     `free` left out -- its RSS HAS to climb, roughly one page per line. A
@@ -62,37 +62,37 @@ else
     }
 
     demo_case 144 0 <<'EOF'
-Enter a number: number    : 144
-parity    : even
-sign      : positive
-over 100  : yes
-digits    : 3
-square    : 20736
-root      : 12
+Enter a number: Number    : 144
+Even      : true
+Sign      : 1
+Digits    : 3
+Square    : 20736
+Above 100 : true
+Root      : 12
 EOF
 
     demo_case "  -7  " 0 <<'EOF'
-Enter a number: number    : -7
-parity    : odd
-sign      : negative
-over 100  : no
-digits    : 1
-square    : 49
-root      : not real (number < 0)
+Enter a number: Number    : -7
+Even      : false
+Sign      : -1
+Digits    : 1
+Square    : 49
+Above 100 : false
+Root      : not real (number < 0)
 EOF
 
     demo_case 0 0 <<'EOF'
-Enter a number: number    : 0
-parity    : even
-sign      : zero
-over 100  : no
-digits    : 1
-square    : 0
-root      : 0
+Enter a number: Number    : 0
+Even      : true
+Sign      : 0
+Digits    : 1
+Square    : 0
+Above 100 : false
+Root      : 0
 EOF
 
     demo_case abc 1 <<'EOF'
-Enter a number: That is not a whole number.
+Enter a number: That is not a number.
 EOF
 
     if [ "$FAIL" -eq 0 ]; then
