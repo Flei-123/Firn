@@ -1973,6 +1973,8 @@ mod tests {
             ExprKind::Float(bits) => format!("{}", f64::from_bits(*bits)),
             ExprKind::Bool(b) => format!("{}", b),
             ExprKind::Ident(n) => n.clone(),
+            // ROUND 70: the text literal carries its array literal inside.
+            ExprKind::Text(_, inner) => dump(inner),
             ExprKind::Lambda(d) => format!("fn#{}", d.id),
             ExprKind::Unary(op, a) => format!(
                 "({}{})",

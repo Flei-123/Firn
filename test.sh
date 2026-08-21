@@ -53,6 +53,10 @@
 #      exception reports (#DE, #PF, #GP, #DF), PIC/PIT with a tick counter
 #      that runs up, memory map, frame allocator and heap, keyboard over
 #      IRQ1, ring 3 with `syscall`/`sysret`. With counter-checks.
+#  29. `str` does not leak (tools/strsoak/run.sh, round 70): an endurance
+#      run with many short lived concatenations, the RSS of the process
+#      measured, plus the counter-check with the collector switched off --
+#      in BOTH compilers.
 #  27. Function values in a STRUCT FIELD (tools/fnfield/run.sh, round 68):
 #      `c.hook(a, b)` is exactly ONE `call rax`, a direct call stays a
 #      direct `call`, and a METHOD of the same name still wins and stays
@@ -361,6 +365,21 @@ if [ "$LNRC" -eq 0 ]; then
 else
     bad "tools/lexnum/run.sh failed (see .test-work/lexnum.log)"
     tail -20 "$WORK/lexnum.log" | sed 's/^/   /'
+fi
+
+echo "== 29. str does not leak: endurance run with a counter-check (tools/strsoak/run.sh, ROUND 70) =="
+# `a + b` on `str` allocates in the GC heap. The endurance run builds many
+# short lived strings and measures the REAL memory of the process (RSS out of
+# /proc/self/statm). The counter-check with the collection threshold set to
+# infinity runs EVERY TIME -- if that one stays flat too, the measuring method
+# is broken and the green result is worthless.
+bash tools/strsoak/run.sh > "$WORK/strsoak.log" 2>&1 && SSRC=0 || SSRC=$?
+if [ "$SSRC" -eq 0 ]; then
+    ok
+    grep -E '^  (firnc0|firnc1)|^STRSOAK' "$WORK/strsoak.log" | sed 's/^/   /'
+else
+    bad "tools/strsoak/run.sh failed (see .test-work/strsoak.log)"
+    tail -20 "$WORK/strsoak.log" | sed 's/^/   /'
 fi
 
 echo "== 12. parser in Firn against the parser in Rust (tools/parser_compare.sh) =="
