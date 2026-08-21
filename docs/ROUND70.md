@@ -42,7 +42,7 @@ Everything below was really run, in this worktree, on this machine.
 comparison and the one in the lowering comparison are the ones that were
 already known and named before this round.
 
-### The leak proof (`tools/strsoak/run.sh`, test.sh section 29)
+### The leak proof (`tools/strsoak/run.sh`, test.sh section 31)
 
 200000 rounds with 8 concatenations each = 1.6 million short lived strings,
 4000000 octets built, in BOTH compilers:
