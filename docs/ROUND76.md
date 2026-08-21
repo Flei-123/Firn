@@ -57,7 +57,7 @@ cross-checked against a **running vanilla server 1.20.4** (see 4.3).
 |---|---|
 | `nc` → Firn echo server → `nc`, 1 MiB of random octets | 1,048,576 octets back, **md5 identical**, in all three build stages |
 | `curl` against the HTTP mode | **HTTP 200**, 24 octets, body as expected, status line and `Content-Length` accepted by curl |
-| 16 connections at the same time, 1 MiB each, own data per connection | **44.8 MiB/s** payload = 89.5 MiB/s on the wire, 16 MiB in 0.36 s (`release-fast`; `no-opt` 47.2, `dev-fast` 44.2) |
+| 16 connections at the same time, 1 MiB each, own data per connection | **48.1 MiB/s** payload = 96.3 MiB/s on the wire, 16 MiB in 0.33 s (`release-fast`; `no-opt` 51.0, `dev-fast` 48.8) |
 | In-process, server thread + client, 1 MiB in 16 KiB chunks | passes in all three stages (`tests/1600_net_echo.fi`) |
 
 The throughput number is **not** a socket benchmark — the other end is a
@@ -164,8 +164,8 @@ OK nmp: the client is in the world
 ```
 
 **Load:** 16 logins at the same time — 16 threads, ~22 MiB of chunk data —
-in **0.13 s**, all 16 through. Sequentially: **2,622 pings/s** and
-**1,244 full logins/s** (each of the latter builds the registry codec anew
+in **0.13 s**, all 16 through. Sequentially: **2,529 pings/s** and
+**1,402 full logins/s** (each of the latter builds the registry codec anew
 and writes 25 chunks), RSS flat over 3,400 connections — see 4.5.
 **Ping latency**, 30 pings each: Firn **median 0.43 ms** (min 0.37, p95 0.62,
 max 2.29). The vanilla server on the same machine, idle, same harness:
@@ -340,13 +340,18 @@ Two more tests and it would have shipped.
 So the round has an endurance run now (`tools/mcserver/soak.py`, part of
 section 38), with **two** counter-checks:
 
+From the full `./test.sh` run, `release-fast`:
+
 ```
-ping : 3000 connections in 1.14 s = 2622/s, RSS 460 -> 472 KiB (+12 KiB over 2700)
-login:  400 connections in 0.32 s = 1244/s, RSS flat (-92 KiB)
+ping : 3000 connections in 1.19 s = 2529/s, RSS 460 -> 460 KiB (+0 KiB over 2700)
+login:  400 connections in 0.29 s = 1402/s, RSS 568 -> 572 KiB (+4 KiB over 360)
+soak: RSS flat (ping +0 KiB, login +4 KiB, limit 2048)
 counter-check A: the same server WITHOUT reap() dies in the sixties, as it must
 counter-check B: the same server WITHOUT the bytes_free climbs
                  RSS 2252 -> 18452 KiB over 1350 connections
 ```
+
+`--no-opt` and `dev-fast` are the same picture (+0 / +272 KiB and +0 / +8 KiB).
 
 Counter-check A is the important one: without it the endurance run would pass
 with a server that leaks thread table entries, as long as the leak is not
