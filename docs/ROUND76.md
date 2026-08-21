@@ -374,6 +374,23 @@ Worth writing down, because it was not obvious:
 
 ---
 
+### 4.6 The state of `test.sh` — and two failures that are not this round's
+
+Full run on this machine, `./test.sh`: **1,169 checks**, and the three new
+sections (36, 37, 38) pass in every build stage. Three checks failed in that
+run, and none of them belongs to round 76 — which is a claim, so here is how
+each was checked:
+
+| Failing section | Why | How that was established |
+|---|---|---|
+| **24 formatter** | `lib/std/io.fi` has one blank line too many at line 705 | The file is **byte identical to `main`** (`md5sum` on both), and `main`'s **own** compiler-built `firnfmt -c` calls it unformatted too. Section 24 was red before this branch existed. **Fixed here** — one line. |
+| **23 layout** | `no Chromium found (set FIRN_CHROMIUM)` | An environment prerequisite, like `gdb` for section 25 and QEMU for section 22. There was no Chromium on this machine at all. **Fixed here** by installing one (`chromium 151.0.7922.137`). |
+| **34 round 66** | the promise endurance run `jobs` ended with `rc=-11` (SIGSEGV) after 5.6 s | Round 76 changed exactly one thing in the compiler (4.1). To settle whether that could reach the JavaScript engine, the **whole engine was translated with both compilers and the assembly compared**: `lib/js/run_main.fi`, ~9 MB of assembly, **byte identical** once the source path is normalised (the two worktrees have different directory names). A change that produces the same octets cannot cause a different crash. |
+
+The third one therefore stays open and belongs to whoever owns `lib/js`. It
+is written down here rather than quietly left out, and the measurement that
+exonerates round 76 is written down with it.
+
 ## 5. What is NOT proven
 
 * **No real vanilla client has connected.** The Minecraft client needs a GPU
