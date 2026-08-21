@@ -299,7 +299,11 @@ fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
     for (i, _t) in f.params.iter().enumerate() {
         match spot[i] {
             Some(r) if r.starts_with("xmm") => {
-                e.line(&format!("movq rax, {}", r));
+                if f.params[i] == FTy::F32 {
+                    e.line(&format!("movd eax, {}", r));
+                } else {
+                    e.line(&format!("movq rax, {}", r));
+                }
                 e.line(&format!("mov qword ptr [rbp-{}], rax", fr.slot[i]));
             }
             Some(r) => {
@@ -391,8 +395,13 @@ fn emit_block(e: &mut Emitter, f: &Func, fr: &Frame, b: &Block) -> Result<(), St
                 // System V prescribes -- and as every other compiler on this
                 // platform expects it.
                 if f.ret.is_float() {
-                    e.line(&format!("mov rax, qword ptr [rbp-{}]", fr.slot[*v as usize]));
-                    e.line("movq xmm0, rax");
+                    if f.ret == FTy::F32 {
+                        e.line(&format!("mov eax, dword ptr [rbp-{}]", fr.slot[*v as usize]));
+                        e.line("movd xmm0, eax");
+                    } else {
+                        e.line(&format!("mov rax, qword ptr [rbp-{}]", fr.slot[*v as usize]));
+                        e.line("movq xmm0, rax");
+                    }
                 } else {
                 e.line(&format!("mov rax, qword ptr [rbp-{}]", fr.slot[*v as usize]));
                 }
@@ -467,14 +476,28 @@ pub(crate) fn store_dst(e: &mut Emitter, fr: &Frame, d: Val, r: &str) {
 /// register. `rax` is the ferry: the slot is 8 bytes wide and holds the bit
 /// pattern, `movq` brings all 8 of them over. For an `f32` only the lower 4
 /// count, and those are exactly the ones the SSE instructions read.
-fn load_xmm(e: &mut Emitter, fr: &Frame, x: &str, v: Val) {
+fn load_xmm(e: &mut Emitter, fr: &Frame, x: &str, v: Val, single: bool) {
+    if single {
+        // 32 bits: `movd` zeroes the rest of the register, so what is
+        // standing there is exactly the bit pattern and nothing else.
+        e.line(&format!("mov eax, dword ptr [rbp-{}]", fr.slot[v as usize]));
+        e.line(&format!("movd {}, eax", x));
+        return;
+    }
     load_full(e, fr, "rax", v);
     e.line(&format!("movq {}, rax", x));
 }
 
-/// The way back: xmm register -> `rax` -> frame slot of `d`.
-fn store_xmm(e: &mut Emitter, fr: &Frame, d: Val, x: &str) {
-    e.line(&format!("movq rax, {}", x));
+/// The way back: xmm register -> `rax` -> frame slot of `d`. For `f32`
+/// through `movd`/`eax`: that zeroes the upper half of the word, so the
+/// slot holds a DEFINED value and not the leftovers of an earlier
+/// instruction.
+fn store_xmm(e: &mut Emitter, fr: &Frame, d: Val, x: &str, single: bool) {
+    if single {
+        e.line(&format!("movd eax, {}", x));
+    } else {
+        e.line(&format!("movq rax, {}", x));
+    }
     store_dst(e, fr, d, "rax");
 }
 
@@ -515,11 +538,17 @@ fn place_args(f: &Func, args: &[Val]) -> (Vec<Option<&'static str>>, Vec<Val>) {
 /// Loads the arguments into their registers. SSE first: `rax` is the ferry
 /// into an xmm register and must not overwrite an integer argument that is
 /// already sitting in place.
-fn load_args(e: &mut Emitter, fr: &Frame, args: &[Val], spot: &[Option<&'static str>]) {
+fn load_args(
+    e: &mut Emitter,
+    f: &Func,
+    fr: &Frame,
+    args: &[Val],
+    spot: &[Option<&'static str>],
+) {
     for (k, a) in args.iter().enumerate() {
         if let Some(r) = spot[k] {
             if r.starts_with("xmm") {
-                load_xmm(e, fr, r, *a);
+                load_xmm(e, fr, r, *a, f.val_ty(*a) == FTy::F32);
             }
         }
     }
@@ -566,11 +595,12 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
                 // on the parity flag afterwards.
                 let swap = matches!(op, CmpOp::Lt | CmpOp::Le);
                 let (first, second) = if swap { (*b, *a) } else { (*a, *b) };
-                load_xmm(e, fr, "xmm0", first);
-                load_xmm(e, fr, "xmm1", second);
+                let single = *oty == FTy::F32;
+                load_xmm(e, fr, "xmm0", first, single);
+                load_xmm(e, fr, "xmm1", second, single);
                 // ROUND 71: `ucomiss` for binary32 — the same flag rules,
                 // the same swap trick, only the width differs.
-                e.line(if *oty == FTy::F32 {
+                e.line(if single {
                     "ucomiss xmm0, xmm1"
                 } else {
                     "ucomisd xmm0, xmm1"
@@ -671,13 +701,13 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
                     store_dst(e, fr, d, "rax");
                     return Ok(());
                 }
-                load_xmm(e, fr, "xmm0", *src);
+                load_xmm(e, fr, "xmm0", *src, *from == FTy::F32);
                 e.line(if ty == FTy::F64 {
                     "cvtss2sd xmm0, xmm0"
                 } else {
                     "cvtsd2ss xmm0, xmm0"
                 });
-                store_xmm(e, fr, d, "xmm0");
+                store_xmm(e, fr, d, "xmm0", ty == FTy::F32);
                 return Ok(());
             }
             if ty == FTy::F32 && !from.is_float() {
@@ -685,12 +715,12 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
                 // values above 2^63 as with `cvtsi2sd`.
                 load_ext(e, fr, "rax", *src, *from, 64);
                 e.line("cvtsi2ss xmm0, rax");
-                store_xmm(e, fr, d, "xmm0");
+                store_xmm(e, fr, d, "xmm0", true);
                 return Ok(());
             }
             if *from == FTy::F32 && !ty.is_float() {
                 // f32 -> integer, cutting towards zero, as in C.
-                load_xmm(e, fr, "xmm0", *src);
+                load_xmm(e, fr, "xmm0", *src, true);
                 e.line("cvttss2si rax, xmm0");
                 store_dst(e, fr, d, "rax");
                 return Ok(());
@@ -778,7 +808,7 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
                     e.line(&format!("mov qword ptr [rsp+{}], rax", 8 * k));
                 }
             }
-            load_args(e, fr, args, &spot);
+            load_args(e, f, fr, args, &spot);
             e.line(&format!("call {}", label(name)));
             if adjust > 0 {
                 e.line(&format!("add rsp, {}", adjust));
@@ -786,7 +816,7 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
             if let Some(d) = i.dst {
                 // ROUND 71: a floating point result comes back in `xmm0`.
                 if ty.is_float() {
-                    store_xmm(e, fr, d, "xmm0");
+                    store_xmm(e, fr, d, "xmm0", ty == FTy::F32);
                 } else {
                     store_dst(e, fr, d, "rax");
                 }
@@ -808,7 +838,7 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
                     e.line(&format!("mov qword ptr [rsp+{}], rax", 8 * k));
                 }
             }
-            load_args(e, fr, args, &spot);
+            load_args(e, f, fr, args, &spot);
             load_full(e, fr, "rax", *target);
             e.line("call rax");
             if adjust > 0 {
@@ -816,7 +846,7 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
             }
             if let Some(d) = i.dst {
                 if ty.is_float() {
-                    store_xmm(e, fr, d, "xmm0");
+                    store_xmm(e, fr, d, "xmm0", ty == FTy::F32);
                 } else {
                     store_dst(e, fr, d, "rax");
                 }
@@ -1023,10 +1053,11 @@ fn emit_bin(
                 ))
             }
         };
-        load_xmm(e, fr, "xmm0", a);
-        load_xmm(e, fr, "xmm1", b);
+        let single = ty == FTy::F32;
+        load_xmm(e, fr, "xmm0", a, single);
+        load_xmm(e, fr, "xmm1", b, single);
         e.line(&format!("{} xmm0, xmm1", m));
-        store_xmm(e, fr, d, "xmm0");
+        store_xmm(e, fr, d, "xmm0", single);
         return Ok(());
     }
     match op {

@@ -29,10 +29,10 @@ import gc
 
 export { Types, types_new, types_free, types_resolve,
     K_I8, K_I16, K_I32, K_I64, K_U8, K_U16, K_U32, K_U64,
-    K_USIZE, K_ISIZE, K_BOOL, K_F64, K_PTR, K_ARR, K_STRUCT, K_VOID, K_ERROR,
+    K_USIZE, K_ISIZE, K_BOOL, K_F64, K_F32, K_PTR, K_ARR, K_STRUCT, K_VOID, K_ERROR,
     K_FN, fn_ty_new, fn_ty_len, fn_ty_param,
     ty_kind, ty_a, ty_n, size_of, alignment_of, round_up,
-    class_of, needs_sret, is_aggregate,
+    class_of, needs_sret, is_aggregate, word_class, W_INT, W_SSE,
     st_count, st_name, st_size, st_alignment, st_foff, st_flen,
     sf_name, sf_ty, sf_offset, ty_the_root, ret_ty_the_func,
     param_ty_resolved, CLASS_MEM,
@@ -55,15 +55,19 @@ const K_USIZE: u32 = 8
 const K_ISIZE: u32 = 9
 const K_BOOL: u32 = 10
 const K_F64: u32 = 11
-const K_PTR: u32 = 12
-const K_ARR: u32 = 13
-const K_STRUCT: u32 = 14
-const K_VOID: u32 = 15
-const K_ERROR: u32 = 16
+// ROUND 71 (types.rs): IEEE-754 binary32, four bytes. It stands DIRECTLY
+// behind `f64` because the name table `base_ty` maps position onto kind
+// number -- the new name has to be appended, not inserted.
+const K_F32: u32 = 12
+const K_PTR: u32 = 13
+const K_ARR: u32 = 14
+const K_STRUCT: u32 = 15
+const K_VOID: u32 = 16
+const K_ERROR: u32 = 17
 // ROUND 58 (fnval.rs): a function as a VALUE. One machine word wide -- the
 // address of a FUNCTION RECORD whose word 0 holds the code address.
 //   a = result type   n = index into `ft_off`/`ft_len` (the parameter list)
-const K_FN: u32 = 17
+const K_FN: u32 = 18
 
 // The largest aggregate that is still passed in registers.
 const MAX_REGISTER_AGGREGATE: u64 = 16
@@ -217,7 +221,7 @@ fn size_of(t: *mut Types, i: u32) -> u64 {
     let k: u32 = ty_kind(t, i)
     if k == K_I8 || k == K_U8 || k == K_BOOL { return 1 }
     if k == K_I16 || k == K_U16 { return 2 }
-    if k == K_I32 || k == K_U32 { return 4 }
+    if k == K_I32 || k == K_U32 || k == K_F32 { return 4 }
     if k == K_I64 || k == K_U64 || k == K_USIZE || k == K_ISIZE { return 8 }
     if k == K_F64 { return 8 }
     if k == K_PTR { return 8 }
@@ -243,6 +247,76 @@ fn alignment_of(t: *mut Types, i: u32) -> u64 {
 fn is_aggregate(t: *mut Types, i: u32) -> bool {
     let k: u32 = ty_kind(t, i)
     return k == K_ARR || k == K_STRUCT
+}
+
+// ROUND 71 (abi.rs::Word) -- the register class of ONE eightbyte.
+// 0 = INTEGER (rdi, rsi, ...), 1 = SSE (xmm0-xmm7).
+const W_INT: u32 = 0
+const W_SSE: u32 = 1
+
+// Merge rule of System V (3.2.3): as soon as ONE integer field lies in an
+// eightbyte, the whole eightbyte counts as INTEGER. SSE only survives where
+// nothing but floating point sits. 2 stands for "nothing there yet".
+fn class_merge(cur: u32, add: u32) -> u32 {
+    if cur == 2 { return add }
+    if cur == W_SSE && add == W_SSE { return W_SSE }
+    return W_INT
+}
+
+// Walks every SCALAR leaf and enters its class into the eightbyte it lies
+// in. `which` selects the eightbyte (0 or 1); the result is W_INT, W_SSE
+// or 2 for "nothing there".
+fn class_collect(t: *mut Types, i: u32, base: u64, which: u64, cur: u32) -> u32 {
+    let k: u32 = ty_kind(t, i)
+    var out: u32 = cur
+    if k == K_STRUCT {
+        let si: usize = ty_a(t, i) as usize
+        var n: u32 = 0
+        while n < st_flen(t, si) {
+            out = class_collect(t, sf_ty(t, st_foff(t, si) + n),
+                base + sf_offset(t, st_foff(t, si) + n), which, out)
+            n = n + 1
+        }
+        return out
+    }
+    if k == K_ARR {
+        let el: u32 = ty_a(t, i)
+        let step: u64 = size_of(t, el)
+        var n2: u64 = 0
+        while n2 < ty_n(t, i) {
+            let off: u64 = base + n2 * step
+            if off >= MAX_REGISTER_AGGREGATE {
+                return out
+            }
+            out = class_collect(t, el, off, which, out)
+            n2 = n2 + 1
+        }
+        return out
+    }
+    var w: u32 = W_INT
+    if k == K_F32 || k == K_F64 { w = W_SSE }
+    var g: u64 = size_of(t, i)
+    if g < 1 { g = 1 }
+    let first: u64 = base / 8
+    let last: u64 = (base + g - 1) / 8
+    if which >= first && which <= last {
+        out = class_merge(out, w)
+    }
+    return out
+}
+
+// ROUND 71: the class of eightbyte `which` of the type -- W_INT or W_SSE.
+fn word_class(t: *mut Types, i: u32, which: u64) -> u32 {
+    let k: u32 = ty_kind(t, i)
+    if k == K_F32 || k == K_F64 {
+        return W_SSE
+    }
+    if !is_aggregate(t, i) {
+        return W_INT
+    }
+    let c: u32 = class_collect(t, i, 0, which, 2)
+    if c == 2 { return W_INT }
+    return c
 }
 
 // The number of integer words, or CLASS_MEM for the memory class.
@@ -272,14 +346,14 @@ fn needs_sret(t: *mut Types, i: u32) -> bool {
 
 // Index of a primitive type, or -1.
 fn base_ty(it: *mut intern.Interner, nr: u32) -> i32 {
-    var tab: [u8; 50] = "i8|i16|i32|i64|u8|u16|u32|u64|usize|isize|bool|f64"
+    var tab: [u8; 54] = "i8|i16|i32|i64|u8|u16|u32|u64|usize|isize|bool|f64|f32"
     let p: u64 = intern.intern_ptr(it, nr)
     let n: usize = intern.intern_length(it, nr)
     var i: usize = 0
     var k: i32 = 0
     var start: usize = 0
-    while i <= 50 {
-        var end: bool = i == 50
+    while i <= 54 {
+        var end: bool = i == 54
         if !end {
             end = tab[i] == 124 as u8
         }
@@ -305,16 +379,17 @@ fn base_ty(it: *mut intern.Interner, nr: u32) -> i32 {
 // `usize`, `isize` and `bool`, which have no second spelling; an empty
 // place can never be hit, because a name is never empty.
 //
-// `float` is deliberately missing: `f32` arrives in round 71.
+// ROUND 71: `float` is there now and it is entry 12 -- the same position
+// that `f32` has in the table above. So `float` IS `f32`, not a new type.
 fn alias_ty(it: *mut intern.Interner, nr: u32) -> i32 {
-    var tab: [u8; 53] = "sbyte|short|int|long|byte|ushort|uint|ulong||||double"
+    var tab: [u8; 59] = "sbyte|short|int|long|byte|ushort|uint|ulong||||double|float"
     let p: u64 = intern.intern_ptr(it, nr)
     let n: usize = intern.intern_length(it, nr)
     var i: usize = 0
     var k: i32 = 0
     var start: usize = 0
-    while i <= 53 {
-        var end: bool = i == 53
+    while i <= 59 {
+        var end: bool = i == 59
         if !end {
             end = tab[i] == 124 as u8
         }
@@ -340,12 +415,12 @@ fn alias_ty(it: *mut intern.Interner, nr: u32) -> i32 {
 // (`impl Ord for i32` creates `i32__less`). For that the receiver type
 // of a method call has to become a name again.
 fn base_ty_name(it: *mut intern.Interner, k: u32) -> u32 {
-    var tab: [u8; 50] = "i8|i16|i32|i64|u8|u16|u32|u64|usize|isize|bool|f64"
+    var tab: [u8; 54] = "i8|i16|i32|i64|u8|u16|u32|u64|usize|isize|bool|f64|f32"
     var idx: usize = 0
     var nr: u32 = 0
     var start: usize = 0
-    while idx <= 50 {
-        var end: bool = idx == 50
+    while idx <= 54 {
+        var end: bool = idx == 54
         if !end {
             end = tab[idx] == 124 as u8
         }
@@ -893,12 +968,12 @@ fn name_of(t: *mut Types, it: *mut intern.Interner, b: *mut rt.Buf, i: u32) {
         rt.buf_push_bytes(b, (&f[0]) as u64, 7)
         return
     }
-    var tab: [u8; 50] = "i8|i16|i32|i64|u8|u16|u32|u64|usize|isize|bool|f64"
+    var tab: [u8; 54] = "i8|i16|i32|i64|u8|u16|u32|u64|usize|isize|bool|f64|f32"
     var idx: usize = 0
     var nr2: u32 = 0
     var start: usize = 0
-    while idx <= 50 {
-        var end: bool = idx == 50
+    while idx <= 54 {
+        var end: bool = idx == 54
         if !end {
             end = tab[idx] == 124 as u8
         }
