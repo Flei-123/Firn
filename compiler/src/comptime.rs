@@ -182,6 +182,13 @@ impl<'a> Execution<'a> {
                 }
                 Ok(Flow::Next)
             }
+            // ROUND 70: the comptime interpreter knows no compound
+            // assignment. It refuses it with a message instead of
+            // computing something wrong.
+            Stmt::AssignOp { span, .. } | Stmt::Step { span, .. } => Err((
+                *span,
+                "comptime: '+=' and '++' are not available inside a comptime block".to_string(),
+            )),
             Stmt::Assign { target, value, span } => {
                 let v = self.expr(value, env, depth)?;
                 let name = match &target.kind {

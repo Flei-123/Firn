@@ -263,6 +263,92 @@ Beyond that: `lib/gc/gc.fi` (the three `str` runtime functions, `gc class
 StrBytes`, `gc_set_limit`, the state slot `S_STR_TID = 2144`) and, generated
 from it, `lib/firnc1/gctext.fi` (`tools/gen_gctext.sh`).
 
+## 5. Compound assignment and the step operators
+
+An addendum to the round, asked for while it was running -- and it fits: it
+is pure parser work on the same theme.
+
+```firn
+x += 5   x -= 5   x *= 5   x /= 5   x %= 5
+x &= m   x |= m   x ^= m   x <<= 3  x >>= 3
+x++      x--
+```
+
+### `x op= e` is exactly `x = x op e`
+
+Not almost, exactly. Both go through the SAME type check: the rules that
+`binary` used to carry inside itself now live in `sema::binop_type`
+(`binop_type` in `sema.fi`), and both callers compute with them. That is why
+`x %= 2.0` on an f64 gives the very same message as `x = x % 2.0`, and why
+`x += y` with i32 and i64 fails at exactly the same place.
+
+Lowering produces the same FIR operation as well -- so the overflow
+behaviour is not "the same by intent" but the same instruction.
+
+### The left side is evaluated ONCE
+
+This is the classic mistake of the extension: whoever implements
+`a[f()] += 1` by rewriting it in the parser into `a[f()] = a[f()] + 1` gets
+a program that calls `f()` twice. `tests/1338_assign_op_once.fi` counts:
+
+| written | calls of `f()` |
+|---|---|
+| `a[f()] += 5` | **1** |
+| `a[f()]++` | **1** |
+| `*f() += 11` (a function that hands out a pointer) | **1** |
+| `a[f()] = a[f()] + 5` (the counter-check) | **2** |
+
+The last line is not decoration: without it the test would stay green even
+if the counting were broken.
+
+`str` needed a small mechanism for it. `s += x` passes its target to
+`__str_concat` as an ARGUMENT and writes the result back into the same
+place; without a pin the address would be computed a second time for the
+argument. That is what `pinned` (`lower.rs`) resp. `pin_set` (`lower.fi`)
+is for -- an lvalue whose address is already known.
+
+### `++` and `--` are statements, never expressions
+
+`y = x++` does not exist here, and neither does `a[i++]`. Written on a line
+of its own, `x++` is unambiguous; inside an expression it is one of the most
+productive sources of error in C -- `*p++` versus `(*p)++` -- and in C++ the
+order of evaluation around it is even undefined (`i = i++ + 1` has no
+meaning). The parser reports it directly instead of leaving a puzzle:
+
+```
+error: '++' is a statement, not an expression
+  --> tests/neg/step_in_expression.fi:8:19
+   = note: write it on a line of its own; there is no 'y = x++' here,
+           because prefix and postfix inside an expression are a source of error
+```
+
+Both forms are caught -- the postfix one at the end of the statement, the
+prefix one where an expression should begin.
+
+### What the lexer had to learn
+
+Twelve new tokens, and `<<=`/`>>=` need THREE characters of lookahead -- read
+two at a time they would fall apart into `<<` and `=`. `++`/`--` are read
+greedily; `a - -b` keeps two tokens because of the blank between them. The
+whole existing source tree was checked for `--` outside comments and strings
+before: there is none.
+
+### The formatter knows the new shapes
+
+`tools/fmt/fmt.fi` has a scanner of its own and would otherwise have split
+`+=` into `+` and `=` and printed `x + = 1` -- a different token stream that
+does not scan any more. It now knows the twelve signs, sets blanks around
+`+=` like around `=`, and lets `x++` stick to its operand. **It does not
+rewrite anything**: `x += 1` stays `x += 1`, and the canonical form
+(`ast_canon.rs`, `print.fi`) prints `(opassign + (id x) (int 1))` and
+`(step ++ (id x))` instead of hiding the difference behind `zuw`.
+
+### What is deliberately not in it
+
+`+=` and `++` inside a `comptime` block. The interpreter of `comptime.rs`
+knows only assignments to a local variable; instead of computing something
+wrong it refuses them with a message.
+
 ## What this round found in passing
 
 * **`bin/astdump.fi` cannot parse `size_of[T]`.** The first version of

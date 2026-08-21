@@ -861,6 +861,44 @@ fn main() -> i32 {
 without backtracking. Semicolons are optional. Visibility through an `export`
 list per module, not on the individual element.
 
+### 12.7 Compound assignment and the step operators (round 70)
+
+```firn
+x += 5      x -= 5      x *= 5      x /= 5      x %= 5
+x &= m      x |= m      x ^= m      x <<= 3     x >>= 3
+x++         x--
+```
+
+**`x op= e` is EXACTLY `x = x op e`** -- the same type rules, the same
+message on a mismatch, the same instruction and therefore the same overflow
+behaviour (checking in `--debug`, wrapping in `--release-fast`, 13). It is
+not a second kind of arithmetic; it is a shorter way of writing the same
+one. In the compiler both go through the very same check
+(`sema::binop_type`), so that they cannot drift apart.
+
+**The left side is evaluated ONCE.** `a[f()] += 1` calls `f()` exactly once.
+That is a guarantee of the language, not a property of the optimizer: the
+compound assignment is its own statement, and the lowering computes the
+address of the target once and then loads, computes and stores through it. A
+rewrite into `a[f()] = a[f()] + 1` in the parser would be the classic
+mistake here; `tests/1338_assign_op_once.fi` counts the calls and checks the
+counting itself with the written out form as a counter-check.
+
+**`++` and `--` are STATEMENTS, never expressions.** `y = x++` does not
+exist here, and neither does `a[i++]`. The reason is not taste:
+
+* the difference between prefix and postfix inside an expression is one of
+  the most productive sources of error in C -- `*p++` and `(*p)++` mean
+  different things, and readers get it wrong;
+* in C++ the ORDER OF EVALUATION around it is even undefined: `i = i++ + 1`
+  has no defined meaning, and `f(i++, i++)` may compute anything.
+
+As a pure statement on a line of its own the meaning is unambiguous, and
+nothing is lost: whoever wants the old value writes it down.
+
+`let` stays immutable. `x += 1` on a `let` binding runs into exactly the
+same wall as `x = x + 1`, with the same message.
+
 ### 12.1 The grammar of the v0 subset (EBNF)
 
 This is the grammar that `firnc0` **really** implements. The extensions from

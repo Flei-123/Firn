@@ -374,10 +374,12 @@ fn subst_stmt(s: &mut Stmt, map: &HashMap<String, TypeExpr>, queue: &mut Vec<(St
             }
             subst_expr(init, map, queue);
         }
-        Stmt::Assign { target, value, .. } => {
+        Stmt::Assign { target, value, .. } | Stmt::AssignOp { target, value, .. } => {
             subst_expr(target, map, queue);
             subst_expr(value, map, queue);
         }
+        // ROUND 70: the step has no value expression.
+        Stmt::Step { target, .. } => subst_expr(target, map, queue),
         Stmt::If { cond, then, els, .. } => {
             subst_expr(cond, map, queue);
             subst_block(then, map, queue);
@@ -479,10 +481,12 @@ fn renumber_stmt(s: &mut Stmt, next: &mut u32) {
     match s {
         Stmt::Defer(inner, _, _) => renumber_stmt(inner, next),
         Stmt::Let { init, .. } => renumber_expr(init, next),
-        Stmt::Assign { target, value, .. } => {
+        Stmt::Assign { target, value, .. } | Stmt::AssignOp { target, value, .. } => {
             renumber_expr(target, next);
             renumber_expr(value, next);
         }
+        // ROUND 70: the step has no value expression.
+        Stmt::Step { target, .. } => renumber_expr(target, next),
         Stmt::If { cond, then, els, .. } => {
             renumber_expr(cond, next);
             renumber_block(then, next);
@@ -612,10 +616,12 @@ fn check_bare_stmt(s: &Stmt, out: &mut Vec<(Span, String)>) {
             }
             check_bare_expr(init, out);
         }
-        Stmt::Assign { target, value, .. } => {
+        Stmt::Assign { target, value, .. } | Stmt::AssignOp { target, value, .. } => {
             check_bare_expr(target, out);
             check_bare_expr(value, out);
         }
+        // ROUND 70: the step has no value expression.
+        Stmt::Step { target, .. } => check_bare_expr(target, out),
         Stmt::If { cond, then, els, .. } => {
             check_bare_expr(cond, out);
             check_bare_block(then, out);
