@@ -206,6 +206,7 @@ pub(crate) fn base_ty_of_name(n: &str) -> Option<Type> {
         "isize" => Type::Isize,
         "bool" => Type::Bool,
         "f64" => Type::F64,
+        "f32" => Type::F32,
         _ => return None,
     })
 }
@@ -225,6 +226,7 @@ pub(crate) fn base_ty_name(t: &Type) -> Option<&'static str> {
         Type::Isize => "isize",
         Type::Bool => "bool",
         Type::F64 => "f64",
+        Type::F32 => "f32",
         _ => return None,
     })
 }

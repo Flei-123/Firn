@@ -17,6 +17,11 @@ pub enum TokKind {
     /// carry no equivalence relation (NaN != NaN) — and because FIR knows the
     /// bit pattern only anyway.
     Float(u64),
+    /// **ROUND 71** — float literal with the suffix `f` (`1.5f`, `2f`,
+    /// `1e3f`) as the **bit pattern** of an IEEE-754 binary32. The suffix is
+    /// only needed where NO context says what is wanted; `let y: f32 = 2.5`
+    /// gets by without it (SPEC §8.6).
+    FloatF32(u32),
     /// String literal: `"..."`, `b"..."` or `u"..."`.
     /// The content is already decoded (`compiler/src/strings.rs`).
     Str(crate::strings::LitKind, crate::strings::LitValue),
@@ -119,6 +124,7 @@ impl TokKind {
         match self {
             TokKind::Int(v) => format!("{}", v),
             TokKind::Float(bits) => format!("{}", f64::from_bits(*bits)),
+            TokKind::FloatF32(bits) => format!("{}f", f32::from_bits(*bits)),
             TokKind::Ident(s) => s.clone(),
             TokKind::Str(k, v) => format!("{}\"…\" ({} elements)", k.prefix(), v.len()),
             TokKind::FStr(_) => "f\"…\" (interpolation)".into(),
@@ -245,6 +251,19 @@ fn keyword(word: &str) -> Option<TokKind> {
         "catch" => TokKind::KwCatch,
         _ => return None,
     })
+}
+
+/// **ROUND 71** — decimal text -> `f32` bit pattern, over the correctly
+/// rounded `f64` in between.
+///
+/// That this is EXACT and not a double rounding is a theorem, not a hope:
+/// rounding decimal -> binary64 -> binary32 gives the same result as
+/// rounding decimal -> binary32 directly, because binary64 carries 53 bits
+/// and 2*24+2 = 50 of them are enough (Figueroa 1995). It is measured on top
+/// of that: `tools/lexnum/run.sh` holds this path against C `strtof` and
+/// `numpy.float32` for thousands of literals, including the hard cases.
+pub fn narrow(v: f64) -> u32 {
+    (v as f32).to_bits()
 }
 
 fn is_ident_start(c: char) -> bool {
@@ -415,6 +434,14 @@ impl<'a> Lexer<'a> {
         // `parse::<f64>` rounds correctly (Rust uses the same algorithm for that
         // as `strtod`); an overflow yields `inf`, which is wanted.
         let v: f64 = text.parse().unwrap_or(0.0);
+        // ROUND 71: the suffix `f` makes an `f32` out of it. A LETTER may not
+        // follow, otherwise `1.5foo` would silently become `1.5f` plus `oo`.
+        if self.peek() == Some('f') && !self.peek2().map(is_ident_cont).unwrap_or(false) {
+            self.bump();
+            ncols += 1;
+            self.push(TokKind::FloatF32(narrow(v)), line, col, ncols.max(1));
+            return;
+        }
         self.push(TokKind::Float(v.to_bits()), line, col, ncols.max(1));
     }
 
@@ -454,6 +481,21 @@ impl<'a> Lexer<'a> {
                         || matches!(self.peek2(), Some('+') | Some('-')))
                 {
                     break;
+                }
+                // ROUND 71: `2f` — the f32 suffix on a literal without a
+                // point and without an exponent. Only at base 10 (at base 16
+                // `f` is a digit) and only when no letter follows.
+                if radix == 10
+                    && c == 'f'
+                    && !digits.is_empty()
+                    && bad_digit.is_none()
+                    && !self.peek2().map(is_ident_cont).unwrap_or(false)
+                {
+                    self.bump();
+                    ncols += 1;
+                    let v: f64 = digits.parse().unwrap_or(0.0);
+                    self.push(TokKind::FloatF32(narrow(v)), line, col, ncols.max(1));
+                    return;
                 }
                 if c.is_digit(radix) {
                     digits.push(c);

@@ -809,6 +809,7 @@ fn visit_calls(ck: &mut Checker, b: &crate::ast::Block, names: &[String]) {
 
 fn visit_expr(ck: &mut Checker, e: &Expr, names: &[String]) {
     match &e.kind {
+        ExprKind::FloatF32(_) => {}
         // Round 58: a closure body is code like any other.
         ExprKind::Lambda(d) => visit_calls(ck, &d.body, names),
         // ROUND 70: the text literal carries its array literal inside.

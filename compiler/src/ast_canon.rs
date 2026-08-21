@@ -187,6 +187,8 @@ fn ex_core(e: &Expr) -> String {
     match &e.kind {
         ExprKind::Int(v) => format!("(int {})", v),
         ExprKind::Float(bits) => format!("(float {})", bits),
+        // ROUND 71: the f32 literal carries its binary32 bit pattern.
+        ExprKind::FloatF32(bits) => format!("(float32 {})", bits),
         ExprKind::Bool(b) => format!("(bool {})", b),
         ExprKind::Ident(n) => format!("(id {})", n),
         // Round 58: a closure literal. Its body is a block like any other.
