@@ -147,6 +147,25 @@ fn is_abs(b: Gc[Box]) -> bool {
     return (b.flags & box.F_ABS) != 0 as u32
 }
 
+// `position: fixed`. Its containing block is NOT the nearest positioned
+// ancestor but the VIEWPORT -- that is the whole difference to
+// `absolute`, and it is a difference no `position: relative` around it
+// can take away (CSS 2.1, 10.1.3).
+// A flex container. `display: flex` makes a `BK_FLEX` box, but
+// `display: inline-flex` makes an ATOMIC inline that is a flex container
+// on the inside -- the kind alone does not tell them apart.
+fn is_flex_box(b: Gc[Box]) -> bool {
+    return b.kind == box.BK_FLEX || (b.flags & box.F_FLEX_BOX) != 0 as u32
+}
+
+fn is_fixed(b: Gc[Box]) -> bool {
+    return cascade.style_position(b.style) == cascade.POS_FIXED
+}
+
+fn is_sticky(b: Gc[Box]) -> bool {
+    return cascade.style_position(b.style) == cascade.POS_STICKY
+}
+
 fn positioned(b: Gc[Box]) -> bool {
     let p: u32 = cascade.style_position(b.style)
     return p != cascade.POS_STATIC
@@ -193,6 +212,24 @@ fn text_widths(b: Gc[Box], min_out: *mut f64, max_out: *mut f64) {
 }
 
 fn intrinsic_widths(b: Gc[Box], min_out: *mut f64, max_out: *mut f64) {
+    intrinsic_widths_in(b, min_out, max_out, true)
+}
+
+// The CONTENT-BASED minimum width: the same walk, but the box's own
+// `width` is ignored. That is what css-flexbox-1, 4.5 asks for in the
+// content size suggestion of the automatic minimum size -- an item with
+// `width: 400px` in a 200 px flex container has to be allowed to shrink
+// to its longest word, and asking `min_content_width` would hand back the
+// 400 px it was told to ignore.
+fn content_min_width(b: Gc[Box]) -> f64 {
+    var mn: f64 = 0.0
+    var mx: f64 = 0.0
+    intrinsic_widths_in(b, &mn, &mx, false)
+    return mn
+}
+
+fn intrinsic_widths_in(b: Gc[Box], min_out: *mut f64, max_out: *mut f64,
+    use_specified: bool) {
     *min_out = 0.0
     *max_out = 0.0
     if b.kind == box.BK_TEXT {
@@ -201,7 +238,7 @@ fn intrinsic_widths(b: Gc[Box], min_out: *mut f64, max_out: *mut f64) {
     }
     let s: Gc[Style] = b.style
     // A specified width in px settles the question for everything below.
-    if b.kind != box.BK_INLINE {
+    if b.kind != box.BK_INLINE && use_specified {
         let u: u32 = cascade.style_unit(s, cascade.S_WIDTH)
         if u == cascade.U_PX {
             let extra: f64 = h_extra(b)
@@ -215,7 +252,7 @@ fn intrinsic_widths(b: Gc[Box], min_out: *mut f64, max_out: *mut f64) {
     var kid_min: f64 = 0.0
     var kid_max: f64 = 0.0
     let n: u64 = box.box_kids(b)
-    if (b.flags & box.F_HAS_BLOCKS) != 0 as u32 || b.kind == box.BK_FLEX {
+    if (b.flags & box.F_HAS_BLOCKS) != 0 as u32 || is_flex_box(b) {
         // Block-level children: the widest child decides, and a flex
         // container is the sum of its items -- treated as the widest here
         // too, which is honest only for one item (docs/ROUND61.md).
@@ -225,12 +262,17 @@ fn intrinsic_widths(b: Gc[Box], min_out: *mut f64, max_out: *mut f64) {
             if !is_abs(c) {
                 var cmin: f64 = 0.0
                 var cmax: f64 = 0.0
-                intrinsic_widths(c, &cmin, &cmax)
+                intrinsic_widths_in(c, &cmin, &cmax, true)
                 let edges: f64 = c.ml + c.mr + h_extra(c)
                 if cmin + edges > kid_min {
                     kid_min = cmin + edges
                 }
-                if b.kind == box.BK_FLEX {
+                let fdx: u32 = cascade.style_flex_direction(s)
+                let colx: bool = fdx == cascade.FD_COLUMN ||
+                fdx == cascade.FD_COLUMN_REVERSE
+                if is_flex_box(b) && !colx {
+                    // A ROW of flex items is as wide as its items are
+                    // together; a COLUMN is as wide as its widest item.
                     kid_max = kid_max + cmax + edges
                 } else if cmax + edges > kid_max {
                     kid_max = cmax + edges
@@ -248,7 +290,7 @@ fn intrinsic_widths(b: Gc[Box], min_out: *mut f64, max_out: *mut f64) {
             if !is_abs(c) && !is_float(c) {
                 var cmin: f64 = 0.0
                 var cmax: f64 = 0.0
-                intrinsic_widths(c, &cmin, &cmax)
+                intrinsic_widths_in(c, &cmin, &cmax, true)
                 if c.kind == box.BK_TEXT {
                     // The pieces of a text run join with what stands next
                     // to them only across a space, and text_widths has
@@ -372,7 +414,7 @@ fn build_items(b: Gc[Box], items: Gc[GcVec], pending_space: *mut bool,
                 // box taller. That is CSS 2.1, 10.6.1, and it is the one
                 // rule about inline boxes everybody gets wrong first.
                 resolve_edges(c, content_w)
-                resolve_relative(c, content_w)
+                resolve_relative(c, content_w, 0.0, false)
                 let op = try box.item_new(box.IT_OPEN, c.style, c)
                 op.width = c.ml + c.bl + c.pl
                 let ok6: bool = try gcvec_append[Item](items, op)
@@ -401,10 +443,10 @@ fn layout_atomic(c: Gc[Box], available: f64) -> AllocError!bool {
         w = shrink_to_fit(c, available - c.ml - c.mr - h_extra(c))
     }
     w = clamp_width(c, w, available, true)
-    resolve_relative(c, available)
+    resolve_relative(c, available, 0.0, false)
     var own: box.FloatCtx = box.floatctx_new()
     let oki: bool = try box.floatctx_init(&own)
-    return try layout_content(c, w, available, &own)
+    return try layout_content(c, w, available, 0.0, false, &own)
 }
 
 // The white-space processing of css-text-3, 4.1.1, for `normal`,
@@ -494,12 +536,14 @@ fn atomic_baseline(c: Gc[Box]) -> f64 {
     return atomic_outer_height(c)
 }
 
-// One line box. Fills the geometry of everything that lies on it and
-// returns its height. `from`/`to` are item indices, `to` exclusive.
-fn place_line(b: Gc[Box], items: Gc[GcVec], from: u64, to: u64,
-    line_top: f64, left: f64, avail: f64, open: Gc[GcVec],
-    out_height: *mut f64, out_baseline: *mut f64) -> AllocError!bool {
-    // ---- 1. the vertical extent, measured from the baseline
+// HOW TALL WOULD THIS LINE BE? Measured WITHOUT placing anything, and
+// that is the whole point: the width a line may use depends on the floats
+// beside it, the floats beside it depend on how far down the line
+// reaches, and how far down it reaches depends on what fits on it. The
+// knot is cut by measuring the extent first and then asking the floats
+// again -- see `layout_inline`.
+fn line_extent(b: Gc[Box], items: Gc[GcVec], from: u64, to: u64,
+    open: Gc[GcVec], above_out: *mut f64, below_out: *mut f64) {
     var strut_above: f64 = 0.0
     var strut_below: f64 = 0.0
     item_style_metrics(b.style, &strut_above, &strut_below)
@@ -594,6 +638,18 @@ fn place_line(b: Gc[Box], items: Gc[GcVec], from: u64, to: u64,
         }
         i2 = i2 + 1
     }
+    *above_out = above
+    *below_out = below
+}
+
+// One line box. Fills the geometry of everything that lies on it and
+// returns its height. `from`/`to` are item indices, `to` exclusive.
+fn place_line(b: Gc[Box], items: Gc[GcVec], from: u64, to: u64,
+    line_top: f64, left: f64, avail: f64, open: Gc[GcVec],
+    out_height: *mut f64, out_baseline: *mut f64) -> AllocError!bool {
+    var above: f64 = 0.0
+    var below: f64 = 0.0
+    line_extent(b, items, from, to, open, &above, &below)
     let height: f64 = above + below
     let baseline: f64 = line_top + above
 
@@ -764,12 +820,9 @@ fn close_fragment(c: Gc[Box], x_end: f64) {
 // inline-block hands to the line it stands on.
 // NOTE ON THE RETURN VALUE: the height leaves through a pointer and not
 // as `AllocError!f64`. An error union with an f64 payload delivers a WRONG
-// value in this compiler -- see docs/ROUND61.md, language gap 2. Every
-// place in this file where a length crosses a `try` is written this way.
-// NOTE ON THE RETURN VALUE: the height leaves through a pointer and not
-// as `AllocError!f64`. An error union with an f64 payload delivers a WRONG
-// value in this compiler -- see docs/ROUND61.md, language gap 2. Every
-// place in this file where a length crosses a `try` is written this way.
+// value in this compiler -- see docs/ROUND61.md, language gap 2, and
+// docs/ROUND67.md, where it cost half a day again. Every place in this
+// file where a length crosses a `try` is written this way.
 fn layout_inline(b: Gc[Box], content_w: f64, fc: *mut box.FloatCtx,
     out_height: *mut f64) -> AllocError!bool {
     // The item list is WORKING MATERIAL and is not kept: after the last
@@ -843,73 +896,105 @@ fn layout_inline(b: Gc[Box], content_w: f64, fc: *mut box.FloatCtx,
         var right: f64 = box.float_right_edge(fc, line_y, strut, content_w)
         var avail: f64 = right - left
 
-        // Fill the line greedily, chunk by chunk. A chunk is what stands
-        // between two break opportunities: a space plus everything up to
-        // the next space.
+        // THE PROBE HEIGHT. The room beside a float is asked for at a
+        // HEIGHT, and the height of a line is not known before the line
+        // is full. The first ask therefore uses the STRUT -- the line
+        // cannot be shorter than that -- and if the finished line turns
+        // out TALLER and reaches into a float the strut did not touch,
+        // the ask is repeated and the line is filled again.
+        //
+        // Two rounds are enough in practice and the third is refused on
+        // purpose: a line that grows on every round would otherwise loop.
+        // Until round 67 this was a named gap (docs/ROUND61.md, 6.7) and
+        // it cost a real number: a 60 px word beside a 20 px float over a
+        // second float below it started at x = 50 instead of x = 100.
         var end: u64 = i
-        var used: f64 = 0.0
-        var running: bool = true
-        while running && end < n {
-            var chunk_end: u64 = end
-            var chunk_w: f64 = 0.0
-            var leading: f64 = 0.0
-            if gcvec_read[Item](items, chunk_end).kind == box.IT_SPACE {
-                leading = gcvec_read[Item](items, chunk_end).width
-                chunk_end = chunk_end + 1
-            }
-            var stop: bool = false
-            var content_items: u32 = 0
-            while chunk_end < n && !stop {
-                let it2: Gc[Item] = gcvec_read[Item](items, chunk_end)
-                if it2.kind == box.IT_SPACE || it2.kind == box.IT_BREAK {
-                    stop = true
-                } else if it2.kind == box.IT_ATOMIC && it2.chars == 0 as u32 {
-                    // An atomic inline is a break opportunity on BOTH
-                    // sides -- three inline-blocks without a space
-                    // between them still fall onto three lines if they
-                    // do not fit. (UAX 14 treats them like an object
-                    // replacement character.)
-                    if content_items > 0 as u32 {
-                        stop = true
-                    } else {
-                        chunk_w = chunk_w + it2.width
-                        chunk_end = chunk_end + 1
-                        content_items = content_items + 1 as u32
-                        stop = true
-                    }
-                } else {
-                    if it2.kind == box.IT_WORD {
-                        content_items = content_items + 1 as u32
-                    }
-                    if !(it2.kind == box.IT_ATOMIC && it2.chars != 0 as u32) {
-                        chunk_w = chunk_w + it2.width
-                    }
+        var probe: u32 = 0
+        var again: bool = true
+        while again {
+            again = false
+            end = i
+            var used: f64 = 0.0
+            var running: bool = true
+            while running && end < n {
+                var chunk_end: u64 = end
+                var chunk_w: f64 = 0.0
+                var leading: f64 = 0.0
+                if gcvec_read[Item](items, chunk_end).kind == box.IT_SPACE {
+                    leading = gcvec_read[Item](items, chunk_end).width
                     chunk_end = chunk_end + 1
                 }
+                var stop: bool = false
+                var content_items: u32 = 0
+                while chunk_end < n && !stop {
+                    let it2: Gc[Item] = gcvec_read[Item](items, chunk_end)
+                    if it2.kind == box.IT_SPACE || it2.kind == box.IT_BREAK {
+                        stop = true
+                    } else if it2.kind == box.IT_ATOMIC && it2.chars == 0 as u32 {
+                        // An atomic inline is a break opportunity on BOTH
+                        // sides -- three inline-blocks without a space
+                        // between them still fall onto three lines if they
+                        // do not fit. (UAX 14 treats them like an object
+                        // replacement character.)
+                        if content_items > 0 as u32 {
+                            stop = true
+                        } else {
+                            chunk_w = chunk_w + it2.width
+                            chunk_end = chunk_end + 1
+                            content_items = content_items + 1 as u32
+                            stop = true
+                        }
+                    } else {
+                        if it2.kind == box.IT_WORD {
+                            content_items = content_items + 1 as u32
+                        }
+                        if !(it2.kind == box.IT_ATOMIC && it2.chars != 0 as u32) {
+                            chunk_w = chunk_w + it2.width
+                        }
+                        chunk_end = chunk_end + 1
+                    }
+                }
+                if chunk_end == end {
+                    // a forced break: `<br>` or a newline in `pre`
+                    end = end + 1
+                    running = false
+                } else if used > 0.0 && wrap && used + leading + chunk_w > avail + 0.0001 {
+                    running = false
+                } else if used == 0.0 && wrap && chunk_w > avail + 0.0001 &&
+                box.float_next_y(fc, line_y) > line_y {
+                    // Nothing on the line yet and it still does not fit: a
+                    // float is in the way, so the line moves DOWN to where
+                    // there is room. That is what makes an unbreakable word
+                    // land below a float instead of sticking out of it.
+                    line_y = box.float_next_y(fc, line_y)
+                    left = box.float_left_edge(fc, line_y, strut, 0.0)
+                    right = box.float_right_edge(fc, line_y, strut, content_w)
+                    avail = right - left
+                } else {
+                    used = used + leading + chunk_w
+                    end = chunk_end
+                }
             }
-            if chunk_end == end {
-                // a forced break: `<br>` or a newline in `pre`
-                end = end + 1
-                running = false
-            } else if used > 0.0 && wrap && used + leading + chunk_w > avail + 0.0001 {
-                running = false
-            } else if used == 0.0 && wrap && chunk_w > avail + 0.0001 &&
-            box.float_next_y(fc, line_y) > line_y {
-                // Nothing on the line yet and it still does not fit: a
-                // float is in the way, so the line moves DOWN to where
-                // there is room. That is what makes an unbreakable word
-                // land below a float instead of sticking out of it.
-                line_y = box.float_next_y(fc, line_y)
-                left = box.float_left_edge(fc, line_y, strut, 0.0)
-                right = box.float_right_edge(fc, line_y, strut, content_w)
-                avail = right - left
-            } else {
-                used = used + leading + chunk_w
-                end = chunk_end
+            if end == i {
+                end = i + 1
             }
-        }
-        if end == i {
-            end = i + 1
+            if probe < 2 as u32 && line_has_content(items, i, end) {
+                var la: f64 = 0.0
+                var lb: f64 = 0.0
+                line_extent(b, items, i, end, open, &la, &lb)
+                if la + lb > strut {
+                    let l2: f64 = box.float_left_edge(fc, line_y, la + lb, 0.0)
+                    let r2: f64 = box.float_right_edge(fc, line_y, la + lb,
+                        content_w)
+                    if l2 != left || r2 != right {
+                        left = l2
+                        right = r2
+                        avail = r2 - l2
+                        probe = probe + 1 as u32
+                        again = true
+                    }
+                }
+            }
         }
         if !line_has_content(items, i, end) {
             // CSS 2.1, 9.4.2: a line box that holds no text, no preserved
@@ -975,7 +1060,7 @@ fn place_float(c: Gc[Box], parent_w: f64, y_min: f64,
     w = clamp_width(c, w, parent_w, true)
     var own: box.FloatCtx = box.floatctx_new()
     let oki: bool = try box.floatctx_init(&own)
-    let ok: bool = try layout_content(c, w, parent_w, &own)
+    let ok: bool = try layout_content(c, w, parent_w, 0.0, false, &own)
     let outer_w: f64 = c.ml + c.w + c.mr
     let outer_h: f64 = c.mt + c.h + c.mb
     let side: u32 = cascade.style_float(c.style)
@@ -1021,7 +1106,8 @@ fn place_float(c: Gc[Box], parent_w: f64, y_min: f64,
 // collapsing. Writes `top_escape` and `bottom_escape` -- the margins that
 // leave the box at the top and at the bottom -- and returns the height of
 // the content box.
-fn layout_block_children(b: Gc[Box], content_w: f64, fc: *mut box.FloatCtx,
+fn layout_block_children(b: Gc[Box], content_w: f64, content_h: f64,
+    content_h_ok: bool, fc: *mut box.FloatCtx,
     height_auto: bool, top_escape: *mut box.MarginSet,
     bottom_escape: *mut box.MarginSet,
     all_through: *mut bool,
@@ -1086,11 +1172,18 @@ fn layout_block_children(b: Gc[Box], content_w: f64, fc: *mut box.FloatCtx,
                     }
                 }
             }
+            // Where the floats of this child begin. The estimate above
+            // can still be moved by a margin that escapes upwards, and
+            // then the records have to move with it -- see
+            // `box.float_shift_from`.
+            let mark_l: u64 = box.float_mark(fc, cascade.FLOAT_LEFT)
+            let mark_r: u64 = box.float_mark(fc, cascade.FLOAT_RIGHT)
             let save_dx: f64 = (*fc).dx
             let save_dy: f64 = (*fc).dy
             (*fc).dx = save_dx + bfc_left + c.ml + c.bl + c.pl
             (*fc).dy = save_dy + est_y + c.bt + c.pt
-            let ok: bool = try layout_block(c, avail_w, fc)
+            let ok: bool = try layout_block(c, avail_w, content_h,
+                content_h_ok, fc)
             (*fc).dx = save_dx
             (*fc).dy = save_dy
             var mine: box.MarginSet = box.margin_empty()
@@ -1117,6 +1210,7 @@ fn layout_block_children(b: Gc[Box], content_w: f64, fc: *mut box.FloatCtx,
                     pending = box.margin_empty()
                     c.y = y
                     c.x = c.ml + bfc_left
+                    box.float_shift_from(fc, mark_l, mark_r, c.y - est_y)
                     y = y + c.h
                     pending = box.margin_empty()
                     pending = box.margin_add(pending, c.bot_pos)
@@ -1141,6 +1235,7 @@ fn layout_block_children(b: Gc[Box], content_w: f64, fc: *mut box.FloatCtx,
                     c.y = y + box.margin_value(place)
                 }
                 c.x = c.ml + bfc_left
+                box.float_shift_from(fc, mark_l, mark_r, c.y - est_y)
                 var below: box.MarginSet = box.margin_empty()
                 below = box.margin_add(below, c.bot_pos)
                 below = box.margin_add(below, c.bot_neg)
@@ -1157,6 +1252,7 @@ fn layout_block_children(b: Gc[Box], content_w: f64, fc: *mut box.FloatCtx,
             y = y + box.margin_value(pending)
             c.y = y
             c.x = c.ml + bfc_left
+            box.float_shift_from(fc, mark_l, mark_r, c.y - est_y)
             y = y + c.h
             pending = box.margin_empty()
             pending = box.margin_add(pending, c.bot_pos)
@@ -1184,18 +1280,52 @@ fn layout_block_children(b: Gc[Box], content_w: f64, fc: *mut box.FloatCtx,
 // The content of a box whose CONTENT WIDTH is already known: either an
 // inline formatting context, or block-level children, or flex items.
 // Fills `b.h` and the collapsed margins.
-fn layout_content(b: Gc[Box], content_w: f64, cb_w: f64,
-    parent_fc: *mut box.FloatCtx) -> AllocError!bool {
+fn layout_content(b: Gc[Box], content_w: f64, cb_w: f64, cb_h: f64,
+    cb_h_ok: bool, parent_fc: *mut box.FloatCtx) -> AllocError!bool {
+    var ignored: f64 = 0.0
+    return try layout_content_report(b, content_w, cb_w, cb_h, cb_h_ok,
+        0.0, false, parent_fc, &ignored)
+}
+
+// The same, with the content height SETTLED FROM THE OUTSIDE. A flex item
+// gets its main size (in a column) or its stretched cross size (in a row)
+// from the algorithm and not from its own `height` -- and the difference
+// matters as soon as something inside it asks: a percentage height, or a
+// nested column flex container whose own items want to stretch to it.
+// Without this the inner items of `tools/layout/cases/bo_flex_nested_column`
+// come out zero pixels high.
+fn layout_content_settled(b: Gc[Box], content_w: f64, cb_w: f64,
+    settled_h: f64, parent_fc: *mut box.FloatCtx) -> AllocError!bool {
+    var ignored: f64 = 0.0
+    return try layout_content_report(b, content_w, cb_w, 0.0, false,
+        settled_h, true, parent_fc, &ignored)
+}
+
+// The same, and it also reports the height the CONTENT came to -- before
+// a `height` property or a `min-height` is put on top of it. The flexbox
+// needs exactly that number for the automatic minimum size of a column
+// item: the content size suggestion of css-flexbox-1, 4.5 is the size the
+// content wants, not the size the author asked for.
+fn layout_content_report(b: Gc[Box], content_w: f64, cb_w: f64, cb_h: f64,
+    cb_h_ok: bool, settled_h: f64, settled_ok: bool,
+    parent_fc: *mut box.FloatCtx, auto_h: *mut f64) -> AllocError!bool {
     let s: Gc[Style] = b.style
     var height: f64 = 0.0
-    var height_given: bool = box.resolve(s, cascade.S_HEIGHT, 0.0, &height)
-    if cascade.style_unit(s, cascade.S_HEIGHT) == cascade.U_PERCENT {
-        // A percentage height against an automatic containing block height
-        // is `auto` -- CSS 2.1, 10.5.
+    var height_given: bool = box.resolve(s, cascade.S_HEIGHT, cb_h, &height)
+    if cascade.style_unit(s, cascade.S_HEIGHT) == cascade.U_PERCENT && !cb_h_ok {
+        // A percentage height against a containing block whose height is
+        // itself automatic IS `auto` -- CSS 2.1, 10.5. `cb_h_ok` is the
+        // whole difference between `height: 50%` being 300 pixels and
+        // being nothing at all, and it is why the height has to be
+        // handed DOWN through the flow the same way the width is.
         height_given = false
     }
     if height_given {
         height = content_from_specified(b, height, v_extra(b))
+    }
+    if settled_ok {
+        height = settled_h
+        height_given = true
     }
     var top_escape: box.MarginSet = box.margin_empty()
     var bottom_escape: box.MarginSet = box.margin_empty()
@@ -1211,18 +1341,25 @@ fn layout_content(b: Gc[Box], content_w: f64, cb_w: f64,
         let okc: bool = try box.floatctx_init(&own)
         fc = &own
     }
-    if b.kind == box.BK_FLEX {
+    if is_flex_box(b) {
         let okx: bool = try layout_flex(b, content_w, height_given, height,
             &content_h)
         all_through = false
     } else if (b.flags & box.F_HAS_BLOCKS) != 0 as u32 {
-        let okb: bool = try layout_block_children(b, content_w, fc,
+        let okb: bool = try layout_block_children(b, content_w, height,
+            height_given, fc,
             !height_given,
             &top_escape, &bottom_escape,
             &all_through, &content_h)
     } else {
         let oki2: bool = try layout_inline(b, content_w, fc, &content_h)
-        if gcvec_length(b.kids) > 0 {
+        // A box COLLAPSES THROUGH if it has no LINE BOXES -- not if it has
+        // no children. A block whose only child is a FLOAT has a child and
+        // no line, and a float is not in-flow content (CSS 2.1, 8.3.1). The
+        // difference shows up the moment a negative margin follows such a
+        // box: Chromium lets the margin escape, and until this line the
+        // engine did not.
+        if b.lines != gc_null[GcVec]() && gcvec_length(b.lines) > 0 {
             all_through = false
         }
     }
@@ -1235,11 +1372,12 @@ fn layout_content(b: Gc[Box], content_w: f64, cb_w: f64,
             content_h = low
         }
     }
+    *auto_h = content_h
     var used_h: f64 = content_h
     if height_given {
         used_h = height
     }
-    let clamped: f64 = clamp_height(b, used_h, 0.0, false)
+    let clamped: f64 = clamp_height(b, used_h, cb_h, cb_h_ok)
     if clamped != used_h {
         used_h = clamped
         all_through = false
@@ -1295,8 +1433,8 @@ fn layout_content(b: Gc[Box], content_w: f64, cb_w: f64,
 
 // ONE block-level box in the normal flow. `cb_w` is the content width of
 // the containing block.
-fn layout_block(b: Gc[Box], cb_w: f64, parent_fc: *mut box.FloatCtx)
--> AllocError!bool {
+fn layout_block(b: Gc[Box], cb_w: f64, cb_h: f64, cb_h_ok: bool,
+    parent_fc: *mut box.FloatCtx) -> AllocError!bool {
     let s: Gc[Style] = b.style
     resolve_edges(b, cb_w)
     let extra: f64 = h_extra(b)
@@ -1330,8 +1468,9 @@ fn layout_block(b: Gc[Box], cb_w: f64, parent_fc: *mut box.FloatCtx)
         content_w = cl2
         solve_margins(b, cb_w, content_w, extra, ml_auto, mr_auto)
     }
-    let ok: bool = try layout_content(b, content_w, cb_w, parent_fc)
-    resolve_relative(b, cb_w)
+    let ok: bool = try layout_content(b, content_w, cb_w, cb_h, cb_h_ok,
+        parent_fc)
+    resolve_relative(b, cb_w, cb_h, cb_h_ok)
     return true
 }
 
@@ -1359,7 +1498,7 @@ fn solve_margins(b: Gc[Box], cb_w: f64, content_w: f64, extra: f64,
     }
 }
 
-fn resolve_relative(b: Gc[Box], cb_w: f64) {
+fn resolve_relative(b: Gc[Box], cb_w: f64, cb_h: f64, cb_h_ok: bool) {
     b.rel_x = 0.0
     b.rel_y = 0.0
     if cascade.style_position(b.style) != cascade.POS_RELATIVE {
@@ -1373,252 +1512,1134 @@ fn resolve_relative(b: Gc[Box], cb_w: f64) {
     }
     // A percentage of `top` refers to the HEIGHT of the containing block;
     // without a definite height it is zero (CSS 2.1, 9.4.3).
-    if cascade.style_unit(b.style, cascade.S_TOP) == cascade.U_PX {
-        b.rel_y = cascade.style_length(b.style, cascade.S_TOP)
-    } else if cascade.style_unit(b.style, cascade.S_BOTTOM) == cascade.U_PX {
-        b.rel_y = 0.0 - cascade.style_length(b.style, cascade.S_BOTTOM)
+    let tu: u32 = cascade.style_unit(b.style, cascade.S_TOP)
+    let bu: u32 = cascade.style_unit(b.style, cascade.S_BOTTOM)
+    if tu == cascade.U_PX || (tu == cascade.U_PERCENT && cb_h_ok) {
+        var t: f64 = 0.0
+        if box.resolve(b.style, cascade.S_TOP, cb_h, &t) {
+            b.rel_y = t
+        }
+    } else if bu == cascade.U_PX || (bu == cascade.U_PERCENT && cb_h_ok) {
+        var bo: f64 = 0.0
+        if box.resolve(b.style, cascade.S_BOTTOM, cb_h, &bo) {
+            b.rel_y = 0.0 - bo
+        }
     }
 }
 
 // ---------------------------------------------------------------- Flexbox
 
-// One axis, one line, no wrapping: the part of css-flexbox-1 that carries
-// the weight in practice. Grow and shrink work as in section 9.7,
-// `align-items` is `stretch`.
-fn layout_flex(b: Gc[Box], content_w: f64, height_given: bool,
-    height: f64, out_height: *mut f64) -> AllocError!bool {
-    let column: bool = cascade.style_flex_direction(b.style) == cascade.FD_COLUMN ||
-    cascade.style_flex_direction(b.style) == cascade.FD_COLUMN_REVERSE
-    let n: u64 = box.box_kids(b)
+// css-flexbox-1, section 9, IN FULL and for BOTH axes: the flex base
+// size, the loop that resolves the flexible lengths, line breaking with
+// `flex-wrap`, `justify-content`, `align-items` / `align-self` /
+// `align-content`, `order`, automatic margins and the automatic minimum
+// size.
+//
+// THE ONE IDEA that keeps this from being two implementations: the
+// algorithm never says "width" or "height", it says MAIN and CROSS. Which
+// physical axis each of them is depends on `flex-direction` alone, so
+// every access to a size, a margin or an edge goes through one of the
+// `ax_...` helpers below, with `vertical` saying which physical axis is
+// meant. `flex-direction: column` is then not a second code path but the
+// same code with `vertical` turned around, and `row-reverse` is the
+// finished positions mirrored once at the end.
+//
+// WHAT IS EASY TO GET WRONG. Each of these cost a wrong number until a
+// case in tools/layout/cases/ caught it against Chromium:
+//
+//   * the resolution loop (9.7) has to REPEAT. Handing the free space out
+//     once and clamping afterwards loses what a clamped item gives back.
+//   * an item that is frozen keeps its target size; every UNFROZEN item
+//     starts each round again from its FLEX BASE SIZE, not from what it
+//     had in the round before.
+//   * `min-width: auto` on a flex item is not zero. It is the automatic
+//     minimum size (4.5) -- the smaller of the content-based minimum and
+//     a definite size property -- and it is the reason an item with a
+//     long word in it does not shrink to nothing.
+//   * an automatic margin in the main axis eats ALL the positive free
+//     space BEFORE `justify-content` gets to see any of it (9.6). An
+//     automatic margin in the CROSS axis beats `align-self` the same way.
+//   * a single-line container with a DEFINITE cross size hands that size
+//     straight to its one line (9.4). Only because of that does
+//     `align-items: stretch` make an item as tall as the container.
+//   * `flex: 1` is `1 1 0%`, not `1 1 auto`.
+
+// A maximum that is no maximum. The language has no f64
+// constant (lib/std/math.fi), so it is a function.
+fn flex_no_limit() -> f64 {
+    return 1000000000.0
+}
+
+// ------------------------------------------------------------- The axes
+
+fn ax_margin_start(c: Gc[Box], vertical: bool) -> f64 {
+    if vertical {
+        return c.mt
+    }
+    return c.ml
+}
+
+fn ax_margin_end(c: Gc[Box], vertical: bool) -> f64 {
+    if vertical {
+        return c.mb
+    }
+    return c.mr
+}
+
+fn ax_extra(c: Gc[Box], vertical: bool) -> f64 {
+    if vertical {
+        return v_extra(c)
+    }
+    return h_extra(c)
+}
+
+fn ax_size_slot(vertical: bool) -> usize {
+    if vertical {
+        return cascade.S_HEIGHT
+    }
+    return cascade.S_WIDTH
+}
+
+fn ax_min_slot(vertical: bool) -> usize {
+    if vertical {
+        return cascade.S_MIN_HEIGHT
+    }
+    return cascade.S_MIN_WIDTH
+}
+
+fn ax_max_slot(vertical: bool) -> usize {
+    if vertical {
+        return cascade.S_MAX_HEIGHT
+    }
+    return cascade.S_MAX_WIDTH
+}
+
+fn ax_margin_start_slot(vertical: bool) -> usize {
+    if vertical {
+        return cascade.S_MARGIN_TOP
+    }
+    return cascade.S_MARGIN_LEFT
+}
+
+fn fabs2(v: f64) -> f64 {
+    if v < 0.0 {
+        return 0.0 - v
+    }
+    return v
+}
+
+fn ax_margin_end_slot(vertical: bool) -> usize {
+    if vertical {
+        return cascade.S_MARGIN_BOTTOM
+    }
+    return cascade.S_MARGIN_RIGHT
+}
+
+// ------------------------------------------------------------ The item
+
+// One flex item, with the numbers the algorithm has to keep apart. They
+// live BESIDE the box and not in it: a real page has tens of thousands of
+// boxes and a handful of flex items, and every field added to `Box` is
+// paid for by every box on the page.
+gc class FlexItem {
+    bx: Gc[Box],
+    imin: f64, // the min-content width, walked ONCE for both users
+    imax: f64, // the max-content width, from the same walk
+    base: f64, // the flex base size (a CONTENT size, main axis)
+    hypo: f64, // the hypothetical main size: the base, clamped
+    target: f64, // the resolved main CONTENT size
+    min_main: f64, // the used minimum, automatic minimum size included
+    max_main: f64, // the used maximum, or flex_no_limit()
+    cross: f64, // the used cross CONTENT size
+    main_pos: f64, // the outer main offset in the content box
+    cross_pos: f64, // the outer cross offset in the content box
+    baseline: f64, // from the outer cross start edge to the baseline
+    viol: f64, // what the clamping took away in this round
+    order: f64,
+    frozen: u32,
+}
+
+// One flex line. With `flex-wrap: nowrap` there is exactly one of them,
+// and every step below is written so that this is not a special case.
+gc class FlexLine {
+    from: u64,
+    to: u64,
+    cross: f64, // the cross size of the line
+    cross_pos: f64, // where the line starts, in the content box
+    baseline: f64, // the largest distance to a baseline in the line
+    main: f64, // the sum of the outer main sizes
+}
+
+fn flexitem_new(c: Gc[Box]) -> AllocError!Gc[FlexItem] {
+    return try gc FlexItem {
+        bx: c,
+        imin: 0.0,
+        imax: 0.0,
+        base: 0.0,
+        hypo: 0.0,
+        target: 0.0,
+        min_main: 0.0,
+        max_main: flex_no_limit(),
+        cross: 0.0,
+        main_pos: 0.0,
+        cross_pos: 0.0,
+        baseline: 0.0,
+        viol: 0.0,
+        order: cascade.style_order(c.style),
+        frozen: 0,
+    }
+}
+
+// The items of a container, in the order `order` prescribes. The sort is
+// an insertion sort and that is a decision: it is STABLE, so two items
+// with the same `order` keep their document order -- which is what the
+// standard asks for and what a faster sort would have to be talked into.
+// A flex container with more than a few dozen items does not exist.
+fn flex_collect(b: Gc[Box]) -> AllocError!Gc[GcVec] {
+    let v = try gcvec_new()
     var i: u64 = 0
-    // ---- 1. the flex base size of every item
-    var total_base: f64 = 0.0
-    var total_grow: f64 = 0.0
-    var total_scaled_shrink: f64 = 0.0
+    let n: u64 = box.box_kids(b)
     while i < n {
         let c: Gc[Box] = box.box_kid(b, i)
         if !is_abs(c) {
-            resolve_edges(c, content_w)
-            var basis: f64 = 0.0
-            var have: bool = box.resolve(c.style, cascade.S_FLEX_BASIS,
-                content_w, &basis)
-            if !have {
-                have = box.resolve(c.style, cascade.S_WIDTH, content_w, &basis)
-                if have {
-                    basis = content_from_specified(c, basis, h_extra(c))
-                }
+            let it = try flexitem_new(c)
+            let ok: bool = try gcvec_append[FlexItem](v, it)
+        }
+        i = i + 1
+    }
+    let m: u64 = gcvec_length(v)
+    var k: u64 = 1
+    while k < m {
+        let cur: Gc[FlexItem] = gcvec_read[FlexItem](v, k)
+        var j: u64 = k
+        var moving: bool = true
+        while moving && j > 0 {
+            let prev: Gc[FlexItem] = gcvec_read[FlexItem](v, j - 1)
+            if prev.order > cur.order {
+                let ok2: bool = gcvec_set[FlexItem](v, j, prev)
+                j = j - 1
             } else {
-                basis = content_from_specified(c, basis, h_extra(c))
-            }
-            if !have {
-                basis = max_content_width(c)
-            }
-            c.static_x = basis
-            total_base = total_base + basis + c.ml + c.mr + h_extra(c)
-            total_grow = total_grow + cascade.style_flex_grow(c.style)
-            total_scaled_shrink = total_scaled_shrink +
-            cascade.style_flex_shrink(c.style) * basis
-        }
-        i = i + 1
-    }
-    // ---- 2. RESOLVE THE FLEXIBLE LENGTHS (css-flexbox-1, 9.7).
-    // The loop is not decoration: distributing once and clamping
-    // afterwards LOSES the space that a clamped item gives back. With
-    // `max-width` on one of two growing items that is the difference
-    // between 300 and 500 pixels -- measured against Chromium in
-    // tools/layout/cases/56_flex_minmax.html.
-    let growing: bool = (content_w - total_base) > 0.0
-    i = 0
-    while i < n {
-        let c1: Gc[Box] = box.box_kid(b, i)
-        if !is_abs(c1) {
-            c1.flags = c1.flags & (0xFFFFFFFF as u32 - box.F_FROZEN)
-            let hypo: f64 = clamp_width(c1, c1.static_x, content_w, true)
-            c1.flex_target = c1.static_x
-            var freeze: bool = false
-            if growing && cascade.style_flex_grow(c1.style) == 0.0 {
-                freeze = true
-            }
-            if !growing && cascade.style_flex_shrink(c1.style) == 0.0 {
-                freeze = true
-            }
-            if growing && hypo < c1.static_x {
-                freeze = true
-            }
-            if !growing && hypo > c1.static_x {
-                freeze = true
-            }
-            if freeze {
-                c1.flex_target = hypo
-                c1.flags = c1.flags | box.F_FROZEN
+                moving = false
             }
         }
-        i = i + 1
+        let ok3: bool = gcvec_set[FlexItem](v, j, cur)
+        k = k + 1
     }
-    var round: u32 = 0
-    while round < 16 as u32 {
-        var any_free: bool = false
-        var used: f64 = 0.0
-        var sum_grow: f64 = 0.0
-        var sum_scaled: f64 = 0.0
-        i = 0
-        while i < n {
-            let c2: Gc[Box] = box.box_kid(b, i)
-            if !is_abs(c2) {
-                used = used + c2.ml + c2.mr + h_extra(c2)
-                if (c2.flags & box.F_FROZEN) != 0 as u32 {
-                    used = used + c2.flex_target
+    return v
+}
+
+// `align-self: auto` means: take the `align-items` of the container
+// (css-flexbox-1, 8.3). The resolution needs both styles, so it does not
+// belong in the accessor.
+fn flex_align_self(container: Gc[Style], item: Gc[Style]) -> u32 {
+    let a: u32 = cascade.style_align_self(item)
+    if a == cascade.AL_AUTO {
+        return cascade.style_align_items(container)
+    }
+    return a
+}
+
+fn flex_outer(it: Gc[FlexItem], column: bool, main_content: f64) -> f64 {
+    let c: Gc[Box] = it.bx
+    return main_content + ax_extra(c, column) + ax_margin_start(c, column) +
+    ax_margin_end(c, column)
+}
+
+fn flex_outer_cross(it: Gc[FlexItem], column: bool) -> f64 {
+    let c: Gc[Box] = it.bx
+    if column {
+        return c.w + c.ml + c.mr
+    }
+    return c.h + c.mt + c.mb
+}
+
+fn flex_clamp(it: Gc[FlexItem], v: f64) -> f64 {
+    var x: f64 = v
+    if x > it.max_main {
+        x = it.max_main
+    }
+    if x < it.min_main {
+        x = it.min_main
+    }
+    if x < 0.0 {
+        x = 0.0
+    }
+    return x
+}
+
+// A size property of an item as a CONTENT size, or `fallback` if it is
+// not definite. A percentage against a reference that is itself not
+// definite counts as not definite -- that is the whole reason
+// `main_definite` is carried around.
+fn flex_limit(it: Gc[FlexItem], column: bool, reference: f64,
+    ref_valid: bool, slot: usize, fallback: f64) -> f64 {
+    let c: Gc[Box] = it.bx
+    let u: u32 = cascade.style_unit(c.style, slot)
+    if u == cascade.U_NONE || u == cascade.U_AUTO {
+        return fallback
+    }
+    if u == cascade.U_PERCENT && !ref_valid {
+        return fallback
+    }
+    var v: f64 = 0.0
+    if !box.resolve(c.style, slot, reference, &v) {
+        return fallback
+    }
+    return content_from_specified(c, v, ax_extra(c, column))
+}
+
+// The cross size of an item as far as it can be known BEFORE the main
+// axis is settled. In a ROW that is nothing -- the height falls out of
+// the content. In a COLUMN the width has to be settled first, because it
+// decides how tall the content becomes.
+fn flex_initial_cross(b: Gc[Box], it: Gc[FlexItem], column: bool,
+    inner_cross: f64, cross_definite: bool, multi: bool,
+    cb_w: f64) -> f64 {
+    if !column {
+        return 0.0
+    }
+    let c: Gc[Box] = it.bx
+    var v: f64 = 0.0
+    if box.resolve(c.style, cascade.S_WIDTH, cb_w, &v) {
+        return clamp_width(c, content_from_specified(c, v, h_extra(c)), cb_w,
+            true)
+    }
+    var avail: f64 = inner_cross - c.ml - c.mr - h_extra(c)
+    if avail < 0.0 {
+        avail = 0.0
+    }
+    let a: u32 = flex_align_self(b.style, c.style)
+    let start_auto: bool = box.length_is_auto(c.style, cascade.S_MARGIN_LEFT)
+    let end_auto: bool = box.length_is_auto(c.style, cascade.S_MARGIN_RIGHT)
+    if a == cascade.AL_STRETCH && cross_definite && !multi && !start_auto &&
+    !end_auto {
+        return clamp_width(c, avail, cb_w, true)
+    }
+    return clamp_width(c, shrink_to_fit(c, avail), cb_w, true)
+}
+
+// The MAX-CONTENT main size of an item. In a row that is the maximum
+// intrinsic width; in a column it is the content height at the cross size
+// the item already has, and that can only be had by laying the content
+// out once.
+// NOTE ON THE RETURN VALUE -- and this is the same trap as in
+// `layout_inline` above: a length must NEVER leave a function as
+// `AllocError!f64`. The error union over a floating point success type
+// delivers a silently WRONG number in this compiler (docs/ROUND63.md,
+// language gap 2, and docs/ROUND67.md). It compiles, it runs, and every
+// flex item comes out zero pixels wide. So: `AllocError!bool` and the
+// number through a pointer.
+fn flex_content_main(it: Gc[FlexItem], column: bool, cb_w: f64,
+    out: *mut f64) -> AllocError!bool {
+    let c: Gc[Box] = it.bx
+    if !column {
+        // Already walked: `imin` and `imax` come out of ONE pass over the
+        // subtree, and both of them are wanted here -- the maximum for the
+        // flex base size, the minimum for the automatic minimum size.
+        // Asking twice means walking the whole subtree twice.
+        *out = it.imax
+        return true
+    }
+    var own: box.FloatCtx = box.floatctx_new()
+    let oki: bool = try box.floatctx_init(&own)
+    var auto_h: f64 = 0.0
+    let ok: bool = try layout_content_report(c, it.cross, cb_w, 0.0, false,
+        0.0, false, &own, &auto_h)
+    *out = auto_h
+    return true
+}
+
+// css-flexbox-1, 9.2.3: the flex base size. `flex-basis` first, then the
+// main SIZE property, then the content.
+fn flex_base_size(it: Gc[FlexItem], column: bool, inner_main: f64,
+    main_definite: bool, cb_w: f64, out: *mut f64) -> AllocError!bool {
+    let c: Gc[Box] = it.bx
+    let s: Gc[Style] = c.style
+    let bu: u32 = cascade.style_unit(s, cascade.S_FLEX_BASIS)
+    if bu != cascade.U_AUTO && bu != cascade.U_NONE {
+        if bu != cascade.U_PERCENT || main_definite {
+            var v: f64 = 0.0
+            if box.resolve(s, cascade.S_FLEX_BASIS, inner_main, &v) {
+                *out = content_from_specified(c, v, ax_extra(c, column))
+                return true
+            }
+        }
+    }
+    let slot: usize = ax_size_slot(column)
+    let su: u32 = cascade.style_unit(s, slot)
+    if su != cascade.U_AUTO {
+        if su != cascade.U_PERCENT || main_definite {
+            var v2: f64 = 0.0
+            if box.resolve(s, slot, inner_main, &v2) {
+                *out = content_from_specified(c, v2, ax_extra(c, column))
+                return true
+            }
+        }
+    }
+    return try flex_content_main(it, column, cb_w, out)
+}
+
+// The used minimum main size. `min-width: auto` on a flex item is NOT
+// zero: it is the AUTOMATIC MINIMUM SIZE of css-flexbox-1, 4.5 -- the
+// smaller of the content-based minimum and a definite size property,
+// clamped by the maximum. Without it a row of items with text in them
+// shrinks until the words stick out of their boxes. It does not apply to
+// a scroll container, which is why `overflow: hidden` is the usual way
+// out of it.
+fn flex_min_main(it: Gc[FlexItem], column: bool, inner_main: f64,
+    main_definite: bool, cb_w: f64, out: *mut f64) -> AllocError!bool {
+    let c: Gc[Box] = it.bx
+    let slot: usize = ax_min_slot(column)
+    if cascade.style_unit(c.style, slot) != cascade.U_AUTO {
+        *out = flex_limit(it, column, inner_main, main_definite, slot, 0.0)
+        return true
+    }
+    if cascade.style_overflow(c.style) != cascade.OV_VISIBLE {
+        *out = 0.0
+        return true
+    }
+    var content_sug: f64 = 0.0
+    if column {
+        let okc: bool = try flex_content_main(it, column, cb_w, &content_sug)
+    } else {
+        content_sug = it.imin
+    }
+    var m: f64 = content_sug
+    let spec: f64 = flex_limit(it, column, inner_main, main_definite,
+        ax_size_slot(column), flex_no_limit())
+    if spec < m {
+        m = spec
+    }
+    if it.max_main < m {
+        m = it.max_main
+    }
+    *out = m
+    return true
+}
+
+// Lays the content of one item out at the main size the algorithm has
+// settled on. In a ROW the main size is the width and the height falls
+// out of the content; in a COLUMN the width is already known and the
+// height is forced on afterwards.
+fn flex_layout_item(it: Gc[FlexItem], column: bool, cb_w: f64, cross_h: f64,
+    cross_h_ok: bool, forced_h: f64, forced_ok: bool) -> AllocError!bool {
+    let c: Gc[Box] = it.bx
+    var own: box.FloatCtx = box.floatctx_new()
+    let oki: bool = try box.floatctx_init(&own)
+    if column {
+        // In a COLUMN the main size IS the height, and the algorithm has
+        // already settled it -- so it goes in as a settled height instead
+        // of being written over the finished box afterwards.
+        let ok: bool = try layout_content_settled(c, it.cross, cb_w,
+            it.target, &own)
+    } else if forced_ok {
+        let ok3: bool = try layout_content_settled(c, it.target, cb_w,
+            forced_h, &own)
+    } else {
+        let ok2: bool = try layout_content(c, it.target, cb_w, cross_h,
+            cross_h_ok, &own)
+    }
+    return true
+}
+
+// css-flexbox-1, 9.3: collect the items into lines. With `nowrap` there
+// is one line and everything is on it; with `wrap` a line is filled until
+// the next item no longer fits, and a line always holds at least one item.
+fn flex_make_lines(items: Gc[GcVec], column: bool, multi: bool,
+    inner_main: f64) -> AllocError!Gc[GcVec] {
+    let lines = try gcvec_new()
+    let n: u64 = gcvec_length(items)
+    var from: u64 = 0
+    while from < n {
+        var to: u64 = n
+        if multi {
+            let first: Gc[FlexItem] = gcvec_read[FlexItem](items, from)
+            var used: f64 = flex_outer(first, column, first.hypo)
+            to = from + 1
+            var running: bool = true
+            while running && to < n {
+                let it: Gc[FlexItem] = gcvec_read[FlexItem](items, to)
+                let w: f64 = flex_outer(it, column, it.hypo)
+                if used + w > inner_main + 0.0001 {
+                    running = false
                 } else {
-                    any_free = true
-                    used = used + c2.static_x
-                    sum_grow = sum_grow + cascade.style_flex_grow(c2.style)
-                    sum_scaled = sum_scaled +
-                    cascade.style_flex_shrink(c2.style) * c2.static_x
+                    used = used + w
+                    to = to + 1
                 }
+            }
+        }
+        let line = try gc FlexLine {
+            from: from,
+            to: to,
+            cross: 0.0,
+            cross_pos: 0.0,
+            baseline: 0.0,
+            main: 0.0,
+        }
+        let ok: bool = try gcvec_append[FlexLine](lines, line)
+        from = to
+    }
+    return lines
+}
+
+// css-flexbox-1, 9.7: RESOLVE THE FLEXIBLE LENGTHS. The loop is the whole
+// point of the section. Distributing the free space once and clamping
+// afterwards loses the space a clamped item gives back -- with
+// `max-width` on one of two growing items that is the difference between
+// 300 and 500 pixels.
+fn flex_resolve_line(items: Gc[GcVec], line: Gc[FlexLine], column: bool,
+    inner_main: f64) {
+    // ---- 1. is the line growing or shrinking?
+    var sum: f64 = 0.0
+    var i: u64 = line.from
+    while i < line.to {
+        let it: Gc[FlexItem] = gcvec_read[FlexItem](items, i)
+        sum = sum + flex_outer(it, column, it.hypo)
+        i = i + 1
+    }
+    let growing: bool = sum < inner_main
+
+    // ---- 2. freeze the items that cannot flex, or that would flex the
+    // wrong way.
+    i = line.from
+    while i < line.to {
+        let it: Gc[FlexItem] = gcvec_read[FlexItem](items, i)
+        let g: f64 = cascade.style_flex_grow(it.bx.style)
+        let sh: f64 = cascade.style_flex_shrink(it.bx.style)
+        it.frozen = 0
+        it.target = it.base
+        if growing && g == 0.0 {
+            it.frozen = 1
+        }
+        if !growing && sh == 0.0 {
+            it.frozen = 1
+        }
+        if growing && it.hypo < it.base {
+            it.frozen = 1
+        }
+        if !growing && it.hypo > it.base {
+            it.frozen = 1
+        }
+        if it.frozen != 0 as u32 {
+            it.target = it.hypo
+        }
+        i = i + 1
+    }
+
+    // ---- 3. the INITIAL free space, kept for the rule of step 4b.
+    var initial_free: f64 = inner_main
+    i = line.from
+    while i < line.to {
+        let it: Gc[FlexItem] = gcvec_read[FlexItem](items, i)
+        if it.frozen != 0 as u32 {
+            initial_free = initial_free - flex_outer(it, column, it.target)
+        } else {
+            initial_free = initial_free - flex_outer(it, column, it.base)
+        }
+        i = i + 1
+    }
+
+    // ---- 4. the loop
+    var guard: u32 = 0
+    var running: bool = true
+    while running && guard < 64 as u32 {
+        guard = guard + 1 as u32
+        var unfrozen: u64 = 0
+        var free: f64 = inner_main
+        var sum_grow: f64 = 0.0
+        var sum_shrink: f64 = 0.0
+        var sum_scaled: f64 = 0.0
+        i = line.from
+        while i < line.to {
+            let it: Gc[FlexItem] = gcvec_read[FlexItem](items, i)
+            if it.frozen != 0 as u32 {
+                free = free - flex_outer(it, column, it.target)
+            } else {
+                unfrozen = unfrozen + 1
+                free = free - flex_outer(it, column, it.base)
+                sum_grow = sum_grow + cascade.style_flex_grow(it.bx.style)
+                sum_shrink = sum_shrink + cascade.style_flex_shrink(it.bx.style)
+                sum_scaled = sum_scaled +
+                cascade.style_flex_shrink(it.bx.style) * it.base
             }
             i = i + 1
         }
-        if !any_free {
-            round = 16
+        if unfrozen == 0 {
+            running = false
         } else {
-            let free: f64 = content_w - used
+            // 9.7.4b: if the flex factors of the unfrozen items add up to
+            // LESS than one, only that fraction of the INITIAL free space
+            // may be handed out. Without it `flex-grow: 0.5` on the only
+            // item of a line would eat all of the free space instead of
+            // half of it.
+            var factors: f64 = sum_grow
+            if !growing {
+                factors = sum_shrink
+            }
+            if factors < 1.0 {
+                let capped: f64 = initial_free * factors
+                if fabs2(capped) < fabs2(free) {
+                    free = capped
+                }
+            }
             var violation: f64 = 0.0
-            i = 0
-            while i < n {
-                let c3: Gc[Box] = box.box_kid(b, i)
-                if !is_abs(c3) && (c3.flags & box.F_FROZEN) == 0 as u32 {
-                    var t: f64 = c3.static_x
+            i = line.from
+            while i < line.to {
+                let it: Gc[FlexItem] = gcvec_read[FlexItem](items, i)
+                if it.frozen == 0 as u32 {
+                    var t: f64 = it.base
                     if growing && sum_grow > 0.0 {
-                        t = t + free * cascade.style_flex_grow(c3.style) / sum_grow
+                        t = it.base + free *
+                        cascade.style_flex_grow(it.bx.style) / sum_grow
                     } else if !growing && sum_scaled > 0.0 {
-                        t = t + free *
-                        (cascade.style_flex_shrink(c3.style) * c3.static_x) /
+                        t = it.base + free *
+                        (cascade.style_flex_shrink(it.bx.style) * it.base) /
                         sum_scaled
                     }
-                    if t < 0.0 {
-                        t = 0.0
+                    let clamped: f64 = flex_clamp(it, t)
+                    it.target = clamped
+                    it.viol = clamped - t
+                    violation = violation + it.viol
+                }
+                i = i + 1
+            }
+            // 9.7.6: the sign of the TOTAL violation decides which items
+            // are frozen -- NOT the sign of each single one. An item that
+            // was pushed the other way stays flexible and picks up in the
+            // next round what the frozen ones handed back.
+            i = line.from
+            while i < line.to {
+                let it: Gc[FlexItem] = gcvec_read[FlexItem](items, i)
+                if it.frozen == 0 as u32 {
+                    if violation == 0.0 {
+                        it.frozen = 1
+                    } else if violation > 0.0 && it.viol > 0.0 {
+                        it.frozen = 1
+                    } else if violation < 0.0 && it.viol < 0.0 {
+                        it.frozen = 1
                     }
-                    let clamped: f64 = clamp_width(c3, t, content_w, true)
-                    c3.flex_target = clamped
-                    violation = violation + (clamped - t)
                 }
                 i = i + 1
             }
             if violation == 0.0 {
-                i = 0
-                while i < n {
-                    let c4: Gc[Box] = box.box_kid(b, i)
-                    if !is_abs(c4) {
-                        c4.flags = c4.flags | box.F_FROZEN
-                    }
-                    i = i + 1
+                running = false
+            }
+        }
+    }
+}
+
+fn flex_line_main(items: Gc[GcVec], line: Gc[FlexLine], column: bool) -> f64 {
+    var sum: f64 = 0.0
+    var i: u64 = line.from
+    while i < line.to {
+        let it: Gc[FlexItem] = gcvec_read[FlexItem](items, i)
+        sum = sum + flex_outer(it, column, it.target)
+        i = i + 1
+    }
+    return sum
+}
+
+fn flex_max_baseline(b: Gc[Box], items: Gc[GcVec], line: Gc[FlexLine],
+    column: bool) -> f64 {
+    if column {
+        return 0.0
+    }
+    var above: f64 = 0.0
+    var i: u64 = line.from
+    while i < line.to {
+        let it: Gc[FlexItem] = gcvec_read[FlexItem](items, i)
+        if flex_align_self(b.style, it.bx.style) == cascade.AL_BASELINE {
+            if it.baseline > above {
+                above = it.baseline
+            }
+        }
+        i = i + 1
+    }
+    return above
+}
+
+// css-flexbox-1, 9.4: the cross size of ONE line. The case that decides
+// everything else: a single-line container with a DEFINITE cross size
+// hands that size straight to its line. Only because of that does
+// `align-items: stretch` make an item as tall as the container instead of
+// as tall as the tallest item.
+fn flex_line_cross(b: Gc[Box], items: Gc[GcVec], line: Gc[FlexLine],
+    column: bool, line_count: u64, inner_cross: f64, cross_definite: bool) {
+    if line_count == 1 && cross_definite {
+        line.cross = inner_cross
+        line.baseline = flex_max_baseline(b, items, line, column)
+        return
+    }
+    var best: f64 = 0.0
+    var above: f64 = 0.0
+    var below: f64 = 0.0
+    var i: u64 = line.from
+    while i < line.to {
+        let it: Gc[FlexItem] = gcvec_read[FlexItem](items, i)
+        let outer: f64 = flex_outer_cross(it, column)
+        let a: u32 = flex_align_self(b.style, it.bx.style)
+        var by_baseline: bool = !column && a == cascade.AL_BASELINE
+        if by_baseline &&
+        box.length_is_auto(it.bx.style, cascade.S_MARGIN_TOP) {
+            by_baseline = false
+        }
+        if by_baseline {
+            // A line that holds items aligned on their baselines is as
+            // tall as the largest distance ABOVE the baseline plus the
+            // largest distance BELOW it -- which is more than the tallest
+            // single item as soon as two of them sit differently.
+            if it.baseline > above {
+                above = it.baseline
+            }
+            if outer - it.baseline > below {
+                below = outer - it.baseline
+            }
+        } else if outer > best {
+            best = outer
+        }
+        i = i + 1
+    }
+    if above + below > best {
+        best = above + below
+    }
+    line.cross = best
+    line.baseline = above
+}
+
+// css-flexbox-1, 9.6: `align-content` distributes the LINES inside the
+// container. `stretch` -- the initial value -- does not push the lines
+// apart but makes each of them bigger, which is the only reason a
+// one-line container with `flex-wrap: wrap` fills its height.
+fn flex_place_lines(lines: Gc[GcVec], ac: u32, free: f64, count: u64,
+    stretchable: bool) {
+    var pos: f64 = 0.0
+    var gap: f64 = 0.0
+    var extra: f64 = 0.0
+    var mode: u32 = ac
+    if free < 0.0 {
+        // Not enough room: the three distributing values fall back on
+        // their safe alignment (css-align-3, 4.4).
+        if mode == cascade.AL_SPACE_BETWEEN {
+            mode = cascade.AL_FLEX_START
+        } else if mode == cascade.AL_SPACE_AROUND ||
+        mode == cascade.AL_SPACE_EVENLY {
+            mode = cascade.AL_CENTER
+        }
+    }
+    if mode == cascade.AL_STRETCH && stretchable && free > 0.0 {
+        extra = free / count as f64
+    } else if mode == cascade.AL_FLEX_END {
+        pos = free
+    } else if mode == cascade.AL_CENTER {
+        pos = free / 2.0
+    } else if mode == cascade.AL_SPACE_BETWEEN {
+        if count > 1 {
+            gap = free / (count - 1) as f64
+        }
+    } else if mode == cascade.AL_SPACE_AROUND {
+        gap = free / count as f64
+        pos = gap / 2.0
+    } else if mode == cascade.AL_SPACE_EVENLY {
+        gap = free / (count + 1) as f64
+        pos = gap
+    }
+    var i: u64 = 0
+    while i < count {
+        let line: Gc[FlexLine] = gcvec_read[FlexLine](lines, i)
+        line.cross = line.cross + extra
+        line.cross_pos = pos
+        pos = pos + line.cross + gap
+        i = i + 1
+    }
+}
+
+// css-flexbox-1, 9.4 and 9.6: stretch what wants to be stretched, then
+// place every item in the cross axis. An automatic margin comes FIRST and
+// beats `align-self`.
+fn flex_align_cross(b: Gc[Box], items: Gc[GcVec], line: Gc[FlexLine],
+    column: bool, cb_w: f64, wrap_reverse: bool) -> AllocError!bool {
+    var i: u64 = line.from
+    while i < line.to {
+        let it: Gc[FlexItem] = gcvec_read[FlexItem](items, i)
+        let c: Gc[Box] = it.bx
+        let a: u32 = flex_align_self(b.style, c.style)
+        let start_auto: bool = box.length_is_auto(c.style,
+            ax_margin_start_slot(!column))
+        let end_auto: bool = box.length_is_auto(c.style,
+            ax_margin_end_slot(!column))
+        let cross_auto: bool = box.length_is_auto(c.style, ax_size_slot(!column))
+        if a == cascade.AL_STRETCH && cross_auto && !start_auto && !end_auto {
+            var want: f64 = line.cross - ax_margin_start(c, !column) -
+            ax_margin_end(c, !column) - ax_extra(c, !column)
+            if want < 0.0 {
+                want = 0.0
+            }
+            if column {
+                want = clamp_width(c, want, cb_w, true)
+                if want != it.cross {
+                    it.cross = want
+                    let ok: bool = try flex_layout_item(it, column, cb_w, 0.0,
+                        false, 0.0, false)
                 }
             } else {
-                i = 0
-                while i < n {
-                    let c5: Gc[Box] = box.box_kid(b, i)
-                    if !is_abs(c5) && (c5.flags & box.F_FROZEN) == 0 as u32 {
-                        let t2: f64 = clamp_width(c5, c5.flex_target, content_w,
-                            true)
-                        var mine: f64 = 0.0
-                        mine = c5.flex_target
-                        var was: f64 = 0.0
-                        was = mine
-                        // A clamped item is frozen at its limit; the space
-                        // it hands back goes to the others in the next round.
-                        if violation > 0.0 && item_clamped_up(c5, content_w) {
-                            c5.flags = c5.flags | box.F_FROZEN
-                        }
-                        if violation < 0.0 && item_clamped_down(c5, content_w) {
-                            c5.flags = c5.flags | box.F_FROZEN
-                        }
-                        let unused2: f64 = t2 + was
+                want = clamp_height(c, want, 0.0, false)
+                if want != it.cross &&
+                (c.flags & box.F_H_DEPENDS) != 0 as u32 {
+                    // The stretched height is a REAL height for everything
+                    // inside the item, so the content is laid out once
+                    // more against it -- but ONLY if anything under there
+                    // actually cares (`F_H_DEPENDS`, decided once while
+                    // the tree was built). A second pass over a whole
+                    // subtree is not free, and on a page with flex
+                    // containers three deep an unconditional one doubles
+                    // the work per level.
+                    it.cross = want
+                    let ok4: bool = try flex_layout_item(it, column, cb_w, 0.0,
+                        false, want, true)
+                } else {
+                    it.cross = want
+                    c.h = want + v_extra(c)
+                }
+            }
+        }
+        let outer: f64 = flex_outer_cross(it, column)
+        let free: f64 = line.cross - outer
+        if start_auto || end_auto {
+            if free > 0.0 {
+                if start_auto && end_auto {
+                    let half: f64 = free / 2.0
+                    if column {
+                        c.ml = half
+                        c.mr = free - half
+                    } else {
+                        c.mt = half
+                        c.mb = free - half
                     }
-                    i = i + 1
+                } else if start_auto {
+                    if column {
+                        c.ml = free
+                    } else {
+                        c.mt = free
+                    }
+                } else {
+                    if column {
+                        c.mr = free
+                    } else {
+                        c.mb = free
+                    }
                 }
             }
-            round = round + 1 as u32
-        }
-    }
-    i = 0
-    var x: f64 = 0.0
-    var tallest: f64 = 0.0
-    while i < n {
-        let c6: Gc[Box] = box.box_kid(b, i)
-        if !is_abs(c6) {
-            var ownf: box.FloatCtx = box.floatctx_new()
-            let okfi: bool = try box.floatctx_init(&ownf)
-            let okc: bool = try layout_content(c6, c6.flex_target, content_w,
-                &ownf)
-            c6.x = x + c6.ml
-            c6.y = c6.mt
-            x = x + c6.ml + c6.w + c6.mr
-            if c6.mt + c6.h + c6.mb > tallest {
-                tallest = c6.mt + c6.h + c6.mb
+            it.cross_pos = box.snap(line.cross_pos)
+        } else {
+            var off: f64 = 0.0
+            if a == cascade.AL_FLEX_END {
+                off = free
+            } else if a == cascade.AL_CENTER {
+                off = free / 2.0
+            } else if a == cascade.AL_BASELINE && !column {
+                off = line.baseline - it.baseline
+                if off < 0.0 {
+                    off = 0.0
+                }
             }
+            if wrap_reverse {
+                // In a reversed wrap the cross START edge is the physical
+                // bottom (or right) edge: `flex-start` and `flex-end`
+                // change places, and so does everything in between.
+                off = free - off
+            }
+            it.cross_pos = box.snap(line.cross_pos + off)
         }
         i = i + 1
     }
-    // ---- 3. the cross axis: `align-items: stretch`
-    var cross: f64 = tallest
-    if height_given {
-        cross = height
-    }
-    i = 0
-    while i < n {
-        let c3: Gc[Box] = box.box_kid(b, i)
-        if !is_abs(c3) {
-            if box.length_is_auto(c3.style, cascade.S_HEIGHT) {
-                let want: f64 = cross - c3.mt - c3.mb
-                if want > c3.h {
-                    let inner: f64 = want - v_extra(c3)
-                    var w2: f64 = c3.w - h_extra(c3)
-                    let okc2: bool = try layout_content_fixed(c3, w2, inner)
-                }
-            }
-        }
-        i = i + 1
-    }
-    let unused: bool = column
-    *out_height = cross
     return true
 }
 
-// Did the clamp push the item UP (it was smaller than its minimum)?
-fn item_clamped_up(c: Gc[Box], cb_w: f64) -> bool {
-    let nu: u32 = cascade.style_unit(c.style, cascade.S_MIN_WIDTH)
-    if nu == cascade.U_AUTO {
-        return false
+// css-flexbox-1, 9.5: the main axis. The automatic margins come first --
+// they eat ALL the positive free space and leave `justify-content`
+// nothing at all. That is the reason `margin-left: auto` on one item
+// pushes it, and only it, to the far end.
+fn flex_align_main(b: Gc[Box], items: Gc[GcVec], line: Gc[FlexLine],
+    column: bool, inner_main: f64, reverse: bool) {
+    var free: f64 = inner_main - line.main
+    var autos: u64 = 0
+    var i: u64 = line.from
+    while i < line.to {
+        let it: Gc[FlexItem] = gcvec_read[FlexItem](items, i)
+        if box.length_is_auto(it.bx.style, ax_margin_start_slot(column)) {
+            autos = autos + 1
+        }
+        if box.length_is_auto(it.bx.style, ax_margin_end_slot(column)) {
+            autos = autos + 1
+        }
+        i = i + 1
     }
-    var limit: f64 = 0.0
-    if !box.resolve(c.style, cascade.S_MIN_WIDTH, cb_w, &limit) {
-        return false
+    if autos > 0 && free > 0.0 {
+        let share: f64 = box.snap(free / autos as f64)
+        i = line.from
+        while i < line.to {
+            let it: Gc[FlexItem] = gcvec_read[FlexItem](items, i)
+            let c: Gc[Box] = it.bx
+            if box.length_is_auto(c.style, ax_margin_start_slot(column)) {
+                if column {
+                    c.mt = share
+                } else {
+                    c.ml = share
+                }
+            }
+            if box.length_is_auto(c.style, ax_margin_end_slot(column)) {
+                if column {
+                    c.mb = share
+                } else {
+                    c.mr = share
+                }
+            }
+            i = i + 1
+        }
+        free = 0.0
+        line.main = inner_main
     }
-    return c.flex_target <= content_from_specified(c, limit, h_extra(c))
+    var mode: u32 = cascade.style_justify_content(b.style)
+    if free < 0.0 {
+        if mode == cascade.AL_SPACE_BETWEEN {
+            mode = cascade.AL_FLEX_START
+        } else if mode == cascade.AL_SPACE_AROUND ||
+        mode == cascade.AL_SPACE_EVENLY {
+            mode = cascade.AL_CENTER
+        }
+    }
+    let count: u64 = line.to - line.from
+    var pos: f64 = 0.0
+    var gap: f64 = 0.0
+    if mode == cascade.AL_FLEX_END {
+        pos = free
+    } else if mode == cascade.AL_CENTER {
+        pos = free / 2.0
+    } else if mode == cascade.AL_SPACE_BETWEEN {
+        if count > 1 {
+            gap = free / (count - 1) as f64
+        }
+    } else if mode == cascade.AL_SPACE_AROUND {
+        gap = free / count as f64
+        pos = gap / 2.0
+    } else if mode == cascade.AL_SPACE_EVENLY {
+        gap = free / (count + 1) as f64
+        pos = gap
+    }
+    // THE RUNNING POSITION IS NOT SNAPPED, the position that comes OUT of
+    // it is. `space-around` with three items divides by three, and the
+    // difference between snapping every step and snapping once at the end
+    // is a whole layout unit on the third item -- measured against
+    // Chromium, which accumulates in double and lands on the grid once.
+    i = line.from
+    while i < line.to {
+        let it: Gc[FlexItem] = gcvec_read[FlexItem](items, i)
+        let outer: f64 = flex_outer(it, column, it.target)
+        if reverse {
+            // `row-reverse` / `column-reverse`: the main START edge is the
+            // physical end edge. Mirroring the running position is the
+            // same thing and saves a second code path through the section.
+            it.main_pos = box.snap(inner_main - pos - outer)
+        } else {
+            it.main_pos = box.snap(pos)
+        }
+        pos = pos + outer + gap
+        i = i + 1
+    }
 }
 
-// ... or DOWN (it was bigger than its maximum)?
-fn item_clamped_down(c: Gc[Box], cb_w: f64) -> bool {
-    let mu: u32 = cascade.style_unit(c.style, cascade.S_MAX_WIDTH)
-    if mu == cascade.U_NONE {
-        return false
-    }
-    var limit: f64 = 0.0
-    if !box.resolve(c.style, cascade.S_MAX_WIDTH, cb_w, &limit) {
-        return false
-    }
-    return c.flex_target >= content_from_specified(c, limit, h_extra(c))
-}
+// THE FLEX CONTAINER. `content_w` is its content width, `height` its
+// content height if `height_given`. Writes the content height into
+// `out_height`.
+fn layout_flex(b: Gc[Box], content_w: f64, height_given: bool,
+    height: f64, out_height: *mut f64) -> AllocError!bool {
+    let s: Gc[Style] = b.style
+    let fd: u32 = cascade.style_flex_direction(s)
+    let column: bool = fd == cascade.FD_COLUMN || fd == cascade.FD_COLUMN_REVERSE
+    let main_reverse: bool = fd == cascade.FD_ROW_REVERSE ||
+    fd == cascade.FD_COLUMN_REVERSE
+    let fwrap: u32 = cascade.style_flex_wrap(s)
+    let wrap_reverse: bool = fwrap == cascade.FW_WRAP_REVERSE
+    var multi: bool = fwrap != cascade.FW_NOWRAP
 
-// Lays out the content and then forces a content height on top -- used by
-// the stretching of flex items, where the height comes from the container
-// and not from the content.
-fn layout_content_fixed(c: Gc[Box], content_w: f64, content_h: f64)
--> AllocError!bool {
-    var ownx: box.FloatCtx = box.floatctx_new()
-    let okx: bool = try box.floatctx_init(&ownx)
-    let ok: bool = try layout_content(c, content_w, content_w, &ownx)
-    c.h = content_h + v_extra(c)
+    var inner_main: f64 = content_w
+    var inner_cross: f64 = height
+    var main_definite: bool = true
+    var cross_definite: bool = height_given
+    if column {
+        inner_main = height
+        main_definite = height_given
+        inner_cross = content_w
+        cross_definite = true
+    }
+    // A container whose MAIN size is not definite is sized by its content:
+    // everything fits on one line and there is no free space to hand out
+    // (css-flexbox-1, 9.3.1).
+    if !main_definite {
+        multi = false
+    }
+
+    *out_height = 0.0
+    let items = try flex_collect(b)
+    let n: u64 = gcvec_length(items)
+    if n == 0 {
+        return true
+    }
+
+    // ---- 1. the four rings of every item, and the cross size as far as
+    // it is known before the main axis is settled.
+    var i: u64 = 0
+    while i < n {
+        let it: Gc[FlexItem] = gcvec_read[FlexItem](items, i)
+        resolve_edges(it.bx, content_w)
+        it.cross = flex_initial_cross(b, it, column, inner_cross,
+            cross_definite, multi, content_w)
+        if !column {
+            // ONE walk over the subtree for both intrinsic widths. The
+            // box's own `width` is left out on purpose: the flex base
+            // size only asks for this when the width is `auto` anyway,
+            // and the automatic minimum size (4.5) must ignore it.
+            intrinsic_widths_in(it.bx, &it.imin, &it.imax, false)
+        }
+        i = i + 1
+    }
+
+    // ---- 2. the flex base size, the two limits and the hypothetical
+    // main size. The order matters: the automatic minimum size is clamped
+    // by the maximum, so the maximum has to stand first.
+    i = 0
+    while i < n {
+        let it: Gc[FlexItem] = gcvec_read[FlexItem](items, i)
+        var base0: f64 = 0.0
+        let okb: bool = try flex_base_size(it, column, inner_main,
+            main_definite, content_w, &base0)
+        it.base = base0
+        it.max_main = flex_limit(it, column, inner_main, main_definite,
+            ax_max_slot(column), flex_no_limit())
+        var min0: f64 = 0.0
+        let okm: bool = try flex_min_main(it, column, inner_main,
+            main_definite, content_w, &min0)
+        it.min_main = min0
+        it.hypo = flex_clamp(it, it.base)
+        i = i + 1
+    }
+
+    // ---- 3. the lines
+    let lines = try flex_make_lines(items, column, multi, inner_main)
+    let ln: u64 = gcvec_length(lines)
+
+    // ---- 4. resolve the flexible lengths, line by line
+    var li: u64 = 0
+    while li < ln {
+        flex_resolve_line(items, gcvec_read[FlexLine](lines, li), column,
+            inner_main)
+        li = li + 1
+    }
+
+    // ---- 5. lay every item out at its resolved main size and read off
+    // its hypothetical cross size.
+    i = 0
+    while i < n {
+        let it: Gc[FlexItem] = gcvec_read[FlexItem](items, i)
+        let ok: bool = try flex_layout_item(it, column, content_w,
+            inner_cross, cross_definite, 0.0, false)
+        if !column {
+            it.cross = it.bx.h - v_extra(it.bx)
+            it.baseline = atomic_baseline(it.bx)
+        }
+        i = i + 1
+    }
+
+    // ---- 6. the used main size of every line. A container with an
+    // indefinite main size takes it from here.
+    var max_line_main: f64 = 0.0
+    li = 0
+    while li < ln {
+        let line: Gc[FlexLine] = gcvec_read[FlexLine](lines, li)
+        line.main = flex_line_main(items, line, column)
+        if line.main > max_line_main {
+            max_line_main = line.main
+        }
+        li = li + 1
+    }
+    if !main_definite {
+        inner_main = max_line_main
+    }
+
+    // ---- 7. the cross size of every line, then `align-content`
+    var total_cross: f64 = 0.0
+    li = 0
+    while li < ln {
+        let line: Gc[FlexLine] = gcvec_read[FlexLine](lines, li)
+        flex_line_cross(b, items, line, column, ln, inner_cross, cross_definite)
+        total_cross = total_cross + line.cross
+        li = li + 1
+    }
+    var free_cross: f64 = 0.0
+    if cross_definite {
+        free_cross = inner_cross - total_cross
+    }
+    flex_place_lines(lines, cascade.style_align_content(s), free_cross, ln,
+        true)
+    var used_cross: f64 = total_cross
+    if cross_definite {
+        used_cross = inner_cross
+    }
+    if wrap_reverse {
+        li = 0
+        while li < ln {
+            let line: Gc[FlexLine] = gcvec_read[FlexLine](lines, li)
+            line.cross_pos = used_cross - line.cross_pos - line.cross
+            li = li + 1
+        }
+    }
+
+    // ---- 8. the cross axis of every item, then the main axis
+    li = 0
+    while li < ln {
+        let line: Gc[FlexLine] = gcvec_read[FlexLine](lines, li)
+        let okc: bool = try flex_align_cross(b, items, line, column, content_w,
+            wrap_reverse)
+        li = li + 1
+    }
+    li = 0
+    while li < ln {
+        flex_align_main(b, items, gcvec_read[FlexLine](lines, li), column,
+            inner_main, main_reverse)
+        li = li + 1
+    }
+
+    // ---- 9. write the positions into the boxes
+    i = 0
+    while i < n {
+        let it: Gc[FlexItem] = gcvec_read[FlexItem](items, i)
+        let c: Gc[Box] = it.bx
+        if column {
+            c.y = it.main_pos + c.mt
+            c.x = it.cross_pos + c.ml
+        } else {
+            c.x = it.main_pos + c.ml
+            c.y = it.cross_pos + c.mt
+        }
+        resolve_relative(c, content_w, 0.0, false)
+        i = i + 1
+    }
+
+    // ---- 10. the content height of the container
+    if column {
+        *out_height = inner_main
+    } else {
+        var low: f64 = 0.0
+        li = 0
+        while li < ln {
+            let line: Gc[FlexLine] = gcvec_read[FlexLine](lines, li)
+            if line.cross_pos + line.cross > low {
+                low = line.cross_pos + line.cross
+            }
+            li = li + 1
+        }
+        *out_height = low
+    }
     return true
 }
 
@@ -1650,11 +2671,14 @@ fn layout_absolute(c: Gc[Box], cb_x: f64, cb_y: f64, cb_w: f64,
     }
 
     if !has_left && !has_right {
-        // Both `auto`: the box stays where it would have stood.
+        // Both `auto`: the box stays where it would have stood. The
+        // static position is a VIEWPORT coordinate (see
+        // `static_to_viewport`), so the corner of the containing block
+        // comes off it again here.
         if !has_w {
             w = shrink_to_fit(c, cb_w - c.ml - c.mr - extra)
         }
-        left = c.static_x
+        left = c.static_x - cb_x - c.ml
     } else if has_left && has_right {
         if !has_w {
             w = cb_w - left - right - c.ml - c.mr - extra
@@ -1694,7 +2718,7 @@ fn layout_absolute(c: Gc[Box], cb_x: f64, cb_y: f64, cb_w: f64,
     }
     var owna: box.FloatCtx = box.floatctx_new()
     let okfa: bool = try box.floatctx_init(&owna)
-    let ok: bool = try layout_content(c, w, cb_w, &owna)
+    let ok: bool = try layout_content(c, w, cb_w, cb_h, true, &owna)
     if has_h {
         c.h = h + v_extra(c)
     } else if has_top && has_bottom {
@@ -1707,7 +2731,7 @@ fn layout_absolute(c: Gc[Box], cb_x: f64, cb_y: f64, cb_w: f64,
         if has_bottom {
             top = cb_h - bottom - c.h - c.mt - c.mb
         } else {
-            top = c.static_y
+            top = c.static_y - cb_y - c.mt
         }
     }
     c.x = cb_x + left + c.ml
@@ -1799,22 +2823,52 @@ fn place_tree(b: Gc[Box], px: f64, py: f64) {
         let c: Gc[Box] = box.box_kid(b, i2)
         if !is_abs(c) {
             place_tree(c, cx, cy)
+        } else {
+            // An out-of-flow box only noted WHERE IT WOULD HAVE STOOD,
+            // relative to the content corner of its parent. Here that
+            // note becomes a viewport coordinate -- because the box it is
+            // measured against later is a different one: for `position:
+            // fixed` the window, for `absolute` the nearest positioned
+            // ancestor, and neither of them has to be the parent.
+            static_to_viewport(c, cx, cy)
         }
         i2 = i2 + 1
     }
+}
+
+fn static_to_viewport(c: Gc[Box], cx: f64, cy: f64) {
+    if (c.flags & box.F_STATIC_ABS) != 0 as u32 {
+        return
+    }
+    c.static_x = cx + c.static_x
+    c.static_y = cy + c.static_y
+    c.flags = c.flags | box.F_STATIC_ABS
 }
 
 // The out-of-flow boxes, after everything else stands. `cb_*` is the
 // containing block: the padding box of the nearest positioned ancestor, or
 // the initial containing block.
 fn layout_abs_pass(b: Gc[Box], cb_x: f64, cb_y: f64, cb_w: f64,
-    cb_h: f64) -> AllocError!bool {
+    cb_h: f64, vw: f64, vh: f64) -> AllocError!bool {
     var i: u64 = 0
     let n: u64 = box.box_kids(b)
     while i < n {
         let c: Gc[Box] = box.box_kid(b, i)
         if is_abs(c) {
-            let ok: bool = try layout_absolute(c, cb_x, cb_y, cb_w, cb_h)
+            // A FIXED box measures against the viewport, whatever stands
+            // around it. Only a transform would change that, and this
+            // engine has none (docs/ROUND67.md).
+            var ax: f64 = cb_x
+            var ay: f64 = cb_y
+            var aw: f64 = cb_w
+            var ah: f64 = cb_h
+            if is_fixed(c) {
+                ax = 0.0
+                ay = 0.0
+                aw = vw
+                ah = vh
+            }
+            let ok: bool = try layout_absolute(c, ax, ay, aw, ah)
             // Its own content was laid out relative -- place it now.
             var k: u64 = 0
             let m: u64 = box.box_kids(c)
@@ -1834,22 +2888,169 @@ fn layout_abs_pass(b: Gc[Box], cb_x: f64, cb_y: f64, cb_w: f64,
                 let g: Gc[Box] = box.box_kid(c, k)
                 if !is_abs(g) {
                     place_tree(g, ccx, ccy)
+                } else {
+                    static_to_viewport(g, ccx, ccy)
                 }
                 k = k + 1
             }
             let ok2: bool = try layout_abs_pass(c, c.x + c.bl, c.y + c.bt,
                 c.w - c.bl - c.br,
-                c.h - c.bt - c.bb)
+                c.h - c.bt - c.bb, vw, vh)
         } else if positioned(c) {
             let ok3: bool = try layout_abs_pass(c, c.x + c.bl, c.y + c.bt,
                 c.w - c.bl - c.br,
-                c.h - c.bt - c.bb)
+                c.h - c.bt - c.bb, vw, vh)
         } else {
-            let ok4: bool = try layout_abs_pass(c, cb_x, cb_y, cb_w, cb_h)
+            let ok4: bool = try layout_abs_pass(c, cb_x, cb_y, cb_w, cb_h,
+                vw, vh)
         }
         i = i + 1
     }
     return true
+}
+
+// ------------------------------------------------------- position: sticky
+
+// Moves a box and everything under it. `position: sticky` is the only
+// thing in the layout that displaces a finished subtree, so this is the
+// only place that needs it. An absolutely positioned descendant is left
+// out: it has not been placed at all yet, and the pass that places it
+// runs after this one and sees the moved rectangle.
+fn shift_tree(b: Gc[Box], dx: f64, dy: f64) {
+    b.x = b.x + dx
+    b.y = b.y + dy
+    if b.lines != gc_null[GcVec]() {
+        var li: u64 = 0
+        let ln: u64 = gcvec_length(b.lines)
+        while li < ln {
+            let l: Gc[Frag] = gcvec_read[Frag](b.lines, li)
+            l.x = l.x + dx
+            l.y = l.y + dy
+            li = li + 1
+        }
+    }
+    if b.frags != gc_null[GcVec]() {
+        var fi: u64 = 0
+        let fn2: u64 = gcvec_length(b.frags)
+        while fi < fn2 {
+            let f: Gc[Frag] = gcvec_read[Frag](b.frags, fi)
+            f.x = f.x + dx
+            f.y = f.y + dy
+            fi = fi + 1
+        }
+    }
+    var i: u64 = 0
+    let n: u64 = box.box_kids(b)
+    while i < n {
+        let c: Gc[Box] = box.box_kid(b, i)
+        if !is_abs(c) {
+            shift_tree(c, dx, dy)
+        }
+        i = i + 1
+    }
+}
+
+// css-position-3, 6.2. A sticky box stays exactly where the flow put it
+// until the scrollport would leave it behind; then it is pulled BACK
+// into view, and never further than the edge of its containing block.
+//
+// The two halves of that sentence are the two clamps below, and the
+// direction of the first one is what everybody gets wrong: `bottom: 0`
+// does NOT push a box down to the bottom of the window. It stops the box
+// from sliding out at the bottom, and a box that is already inside the
+// window is not moved at all. Measured against Chromium: a 50 px box at
+// y = 0 in a 900 px document with `bottom: 0` stays at y = 0; the same
+// box at y = 700 moves up to 550, because 750 would be past the 600 px
+// window.
+//
+// THE SCROLL OFFSET IS ZERO here, and the scrollport is the viewport.
+// This engine renders one still picture; there is nothing to scroll, and
+// a sticky box inside an `overflow: scroll` box is measured against the
+// window instead of against that box -- a named gap, docs/ROUND67.md.
+fn apply_sticky(c: Gc[Box], cb_x: f64, cb_y: f64, cb_w: f64, cb_h: f64,
+    vw: f64, vh: f64) {
+    let s: Gc[Style] = c.style
+    // THE MARGINS HERE ARE THE SPECIFIED ONES, not the used ones, and the
+    // difference is not academic: a block with `width: 100px` in a 400 px
+    // containing block gets a USED `margin-right` of 300 out of the
+    // over-constraint rule of CSS 2.1, 10.3.3. Taking the constraint
+    // rectangle in by THAT leaves the sticky box exactly no room to move,
+    // and every horizontal case comes out unmoved -- which is what
+    // happened here until Chromium said otherwise.
+    let ml: f64 = box.resolve_or_zero(s, cascade.S_MARGIN_LEFT, cb_w)
+    let mr: f64 = box.resolve_or_zero(s, cascade.S_MARGIN_RIGHT, cb_w)
+    let mt: f64 = box.resolve_or_zero(s, cascade.S_MARGIN_TOP, cb_w)
+    let mb: f64 = box.resolve_or_zero(s, cascade.S_MARGIN_BOTTOM, cb_w)
+    // The rectangle that is held in place is the BORDER box, not the
+    // margin box -- measured against Chromium with a `margin-top: 20px`
+    // under a `top: 60px`, which comes out at y = 60 and not at y = 80.
+    // The margins appear on the other side of the sum: they take the
+    // containing block IN.
+    let mx: f64 = c.x
+    let my: f64 = c.y
+    let mw: f64 = c.w
+    let mh: f64 = c.h
+    // The sticky-constraint rectangle: the containing block, taken in by
+    // the margins of the sticky box itself.
+    let rx: f64 = cb_x + ml
+    let ry: f64 = cb_y + mt
+    let rw: f64 = cb_w - ml - mr
+    let rh: f64 = cb_h - mt - mb
+    var dx: f64 = 0.0
+    var dy: f64 = 0.0
+    var v: f64 = 0.0
+    if box.resolve(s, cascade.S_LEFT, cb_w, &v) {
+        if mx < v {
+            dx = v - mx
+        }
+    } else if box.resolve(s, cascade.S_RIGHT, cb_w, &v) {
+        if mx + mw > vw - v {
+            dx = vw - v - mx - mw
+        }
+    }
+    // If both `top` and `bottom` are given, `top` wins.
+    if box.resolve(s, cascade.S_TOP, cb_h, &v) {
+        if my < v {
+            dy = v - my
+        }
+    } else if box.resolve(s, cascade.S_BOTTOM, cb_h, &v) {
+        if my + mh > vh - v {
+            dy = vh - v - my - mh
+        }
+    }
+    if mx + dx + mw > rx + rw {
+        dx = rx + rw - mx - mw
+    }
+    if mx + dx < rx {
+        dx = rx - mx
+    }
+    if my + dy + mh > ry + rh {
+        dy = ry + rh - my - mh
+    }
+    if my + dy < ry {
+        dy = ry - my
+    }
+    if dx != 0.0 || dy != 0.0 {
+        shift_tree(c, box.snap(dx), box.snap(dy))
+    }
+}
+
+fn sticky_pass(b: Gc[Box], cb_x: f64, cb_y: f64, cb_w: f64, cb_h: f64,
+    vw: f64, vh: f64) {
+    var i: u64 = 0
+    let n: u64 = box.box_kids(b)
+    while i < n {
+        let c: Gc[Box] = box.box_kid(b, i)
+        if !is_abs(c) && c.kind != box.BK_INLINE && c.kind != box.BK_TEXT {
+            if is_sticky(c) {
+                apply_sticky(c, cb_x, cb_y, cb_w, cb_h, vw, vh)
+            }
+            sticky_pass(c, c.x + c.bl + c.pl, c.y + c.bt + c.pt,
+                c.w - c.bl - c.br - c.pl - c.pr,
+                c.h - c.bt - c.bb - c.pt - c.pb, vw, vh)
+        }
+        i = i + 1
+    }
 }
 
 // ------------------------------------------------------------- The entry
@@ -1859,10 +3060,30 @@ fn layout_abs_pass(b: Gc[Box], cb_x: f64, cb_y: f64, cb_w: f64,
 fn layout_document(root: Gc[Box], vw: f64, vh: f64) -> AllocError!bool {
     var fc: box.FloatCtx = box.floatctx_new()
     let ok0: bool = try box.floatctx_init(&fc)
-    let ok: bool = try layout_block(root, vw, &fc)
+    let ok: bool = try layout_block(root, vw, vh, true, &fc)
     place_tree(root, 0.0, 0.0)
-    let ok2: bool = try layout_abs_pass(root, root.x + root.bl, root.y + root.bt,
-        root.w - root.bl - root.br,
-        root.h - root.bt - root.bb)
+    // `position: sticky` moves boxes that are IN the flow, so it belongs
+    // after the placement and before the out-of-flow pass: an absolutely
+    // positioned box inside a sticky one has to see where the sticky one
+    // came to rest.
+    sticky_pass(root, root.x + root.bl + root.pl, root.y + root.bt + root.pt,
+        root.w - root.bl - root.br - root.pl - root.pr,
+        root.h - root.bt - root.bb - root.pt - root.pb, vw, vh)
+    // THE INITIAL CONTAINING BLOCK IS THE VIEWPORT, not the root box.
+    // Both are 800 pixels wide, and that is why the difference could hide
+    // for a whole round: it is the HEIGHT where the two part company. A
+    // box with `position: absolute; bottom: 0` in a document of 100 px
+    // sits at y = 540 in a window of 600, not at y = 40.
+    var cx: f64 = 0.0
+    var cy: f64 = 0.0
+    var cw: f64 = vw
+    var ch: f64 = vh
+    if positioned(root) {
+        cx = root.x + root.bl
+        cy = root.y + root.bt
+        cw = root.w - root.bl - root.br
+        ch = root.h - root.bt - root.bb
+    }
+    let ok2: bool = try layout_abs_pass(root, cx, cy, cw, ch, vw, vh)
     return true
 }

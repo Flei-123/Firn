@@ -526,12 +526,14 @@ else
 fi
 
 echo "== 23. layout: from the computed style to the box with coordinates (tools/layout/run.sh) =="
-# Round 61. The box model with margin collapsing, the block flow, the
-# inline flow with line boxes, floats, position: relative/absolute and a
-# flex container in one axis. Two proofs, and neither replaces the other:
-# the box tree against the frozen expectation (text against text), and the
-# SAME cases through a real Chromium, box against box out of
-# getBoundingClientRect(). Plus a soak run with a counter check.
+# Rounds 61 and 67. The box model with margin collapsing, the block flow,
+# the inline flow with line boxes, floats and `clear`, position
+# relative/absolute/fixed/sticky, the paint order with `z-index`, and the
+# full flexbox of css-flexbox-1. THREE proofs, and none of them replaces
+# another: the box tree against the frozen expectation (text against
+# text), the SAME cases through a real Chromium box against box out of
+# getBoundingClientRect(), and the PAINT ORDER against
+# document.elementFromPoint. Plus a soak run with a counter check.
 bash tools/layout/run.sh --fast > "$WORK/layout.log" 2>&1 && LYRC=0 || LYRC=$?
 if [ "$LYRC" -eq 0 ]; then
     ok
