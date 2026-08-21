@@ -24,7 +24,7 @@ import intern
 
 export { Fir, fir_new, fir_free,
     T_I8, T_I16, T_I32, T_I64, T_U8, T_U16, T_U32, T_U64,
-    T_BOOL, T_F64, T_PTR, T_VOID,
+    T_BOOL, T_F64, T_F32, T_PTR, T_VOID, val_ty, is_float_ty,
     O_CONST, O_BIN, O_CMP, O_UN, O_CAST, O_ALLOCA, O_LOAD, O_STORE,
     O_PTRADD, O_CALL, O_SYSCALL, O_COPYMEM, O_GCADDR, O_SELECT, O_SECZERO,
     O_ATOMADD, O_CALLI, O_VTAB, O_ASM, O_MMIOLD, O_MMIOST, O_FNREF,
@@ -51,8 +51,11 @@ const T_U32: u32 = 6
 const T_U64: u32 = 7
 const T_BOOL: u32 = 8
 const T_F64: u32 = 9
-const T_PTR: u32 = 10
-const T_VOID: u32 = 11
+// ROUND 71 (fir.rs): IEEE-754 binary32. The value of an `O_CONST` is the
+// BIT PATTERN as u32, exactly as with `T_F64`.
+const T_F32: u32 = 10
+const T_PTR: u32 = 11
+const T_VOID: u32 = 12
 
 const O_CONST: u32 = 0
 const O_BIN: u32 = 1
@@ -133,6 +136,13 @@ struct Fir {
     f_boff: Vec[u32]
     f_blen: Vec[u32]
     f_values: Vec[u32]
+    // ROUND 71: the type of EVERY value, per function (fir.rs::val_types).
+    // The code generator reads the register class off it -- an argument of
+    // type f32/f64 goes into an xmm register, everything else into an
+    // integer register. `f_vbase` is where the function's values start in
+    // `v_ty`.
+    f_vbase: Vec[u32]
+    v_ty: Vec[u32]
     p_ty: Vec[u32]
     b_ioff: Vec[u32]
     b_ilen: Vec[u32]
@@ -163,6 +173,7 @@ fn fir_new() -> Fir {
         f_name: vec_new[u32](), f_int: vec_new[u32](), f_ret: vec_new[u32](),
         f_poff: vec_new[u32](), f_plen: vec_new[u32](),
         f_boff: vec_new[u32](), f_blen: vec_new[u32](), f_values: vec_new[u32](),
+        f_vbase: vec_new[u32](), v_ty: vec_new[u32](),
         p_ty: vec_new[u32](),
         b_ioff: vec_new[u32](), b_ilen: vec_new[u32](),
         b_term: vec_new[u32](), b_t1: vec_new[u32](), b_t2: vec_new[u32](), b_t3: vec_new[u32](),
@@ -185,6 +196,8 @@ fn fir_free(f: *mut Fir) {
     vec_free[u32](&(*f).f_boff)
     vec_free[u32](&(*f).f_blen)
     vec_free[u32](&(*f).f_values)
+    vec_free[u32](&(*f).f_vbase)
+    vec_free[u32](&(*f).v_ty)
     vec_free[u32](&(*f).p_ty)
     vec_free[u32](&(*f).b_ioff)
     vec_free[u32](&(*f).b_ilen)
@@ -212,7 +225,7 @@ fn fir_free(f: *mut Fir) {
 fn fty_bits(t: u32) -> u32 {
     if t == T_I8 || t == T_U8 || t == T_BOOL { return 8 }
     if t == T_I16 || t == T_U16 { return 16 }
-    if t == T_I32 || t == T_U32 { return 32 }
+    if t == T_I32 || t == T_U32 || t == T_F32 { return 32 }
     if t == T_VOID { return 0 }
     return 64
 }
@@ -222,12 +235,12 @@ fn fty_bytes(t: u32) -> u64 {
 }
 
 fn fty_name(b: *mut rt.Buf, t: u32) {
-    var tab: [u8; 47] = "i8|i16|i32|i64|u8|u16|u32|u64|bool|f64|ptr|void"
+    var tab: [u8; 51] = "i8|i16|i32|i64|u8|u16|u32|u64|bool|f64|f32|ptr|void"
     var i: usize = 0
     var nr: u32 = 0
     var start: usize = 0
-    while i <= 47 {
-        var end: bool = i == 47
+    while i <= 51 {
+        var end: bool = i == 51
         if !end {
             end = tab[i] == 124 as u8
         }
@@ -258,8 +271,30 @@ fn fn_new(f: *mut Fir, name: u32, ret: u32, poff: u32, plen: u32) -> u32 {
     vec_push[u32](&(*f).f_boff, vec_len[u32](&(*f).b_term) as u32)
     vec_push[u32](&(*f).f_blen, 0)
     vec_push[u32](&(*f).f_values, plen)
+    // The parameter values are the first values of the function; their
+    // types are already known here.
+    vec_push[u32](&(*f).f_vbase, vec_len[u32](&(*f).v_ty) as u32)
+    var k: u32 = 0
+    while k < plen {
+        vec_push[u32](&(*f).v_ty, vec_at[u32](&(*f).p_ty, (poff + k) as usize))
+        k = k + 1
+    }
     block_new(f, i)
     return i
+}
+
+// ROUND 71: the type of value `v` in function `fi`.
+fn val_ty(f: *mut Fir, fi: u32, v: u32) -> u32 {
+    let base: usize = vec_at[u32](&(*f).f_vbase, fi as usize) as usize
+    let i: usize = base + v as usize
+    if i >= vec_len[u32](&(*f).v_ty) {
+        return T_I64
+    }
+    return vec_at[u32](&(*f).v_ty, i)
+}
+
+fn is_float_ty(t: u32) -> bool {
+    return t == T_F32 || t == T_F64
 }
 
 fn fn_count(f: *mut Fir) -> usize { return vec_len[u32](&(*f).f_name) }
@@ -287,6 +322,21 @@ fn new_value(f: *mut Fir, fi: u32) -> u32 {
     let v: u32 = vec_at[u32](&(*f).f_values, fi as usize)
     vec_set[u32](&(*f).f_values, fi as usize, v + 1)
     return v
+}
+
+// ROUND 71: hold the type of the new value. The functions are lowered one
+// after another, so the values of a function lie CONTIGUOUSLY behind its
+// base; the loop closes a gap should one ever come about.
+fn value_ty_note(f: *mut Fir, fi: u32, v: u32, ty: u32) {
+    let base: usize = vec_at[u32](&(*f).f_vbase, fi as usize) as usize
+    while vec_len[u32](&(*f).v_ty) < base + v as usize {
+        vec_push[u32](&(*f).v_ty, T_I64)
+    }
+    if vec_len[u32](&(*f).v_ty) == base + v as usize {
+        vec_push[u32](&(*f).v_ty, ty)
+        return
+    }
+    vec_set[u32](&(*f).v_ty, base + v as usize, ty)
 }
 
 fn inst_create(f: *mut Fir, kind: u32, ty: u32, dst: u32, a: u32, b: u32, c: u32,
@@ -332,6 +382,7 @@ fn global(f: *mut Fir, fi: u32, bb: u32) -> u32 {
 fn inst_add(f: *mut Fir, fi: u32, bb: u32, kind: u32, ty: u32,
     a: u32, b: u32, c: u32, number: u64, aoff: u32, alen: u32) -> u32 {
     let v: u32 = new_value(f, fi)
+    value_ty_note(f, fi, v, ty)
     let nr: u32 = inst_create(f, kind, ty, v, a, b, c, number, aoff, alen)
     list_append(f, global(f, fi, bb), nr)
     return v
@@ -349,6 +400,7 @@ fn inst_void_add(f: *mut Fir, fi: u32, bb: u32, kind: u32, ty: u32,
 // numbers, and `firnc0` does it exactly the same way.
 fn alloca_add(f: *mut Fir, fi: u32, size: u64, align: u64) -> u32 {
     let v: u32 = new_value(f, fi)
+    value_ty_note(f, fi, v, T_PTR)
     let nr: u32 = inst_create(f, O_ALLOCA, T_PTR, v, 0, 0, 0, size, 0, align as u32)
     let g: u32 = global(f, fi, 0)
     let off: u32 = vec_at[u32](&(*f).b_ioff, g as usize)

@@ -1177,7 +1177,7 @@ impl<'a> Checker<'a> {
             return Type::Error;
         }
         self.depth += 1;
-        let mut t = self.expr_inner(e, hint);
+        let t = self.expr_inner(e, hint);
         self.depth -= 1;
         // ROUND 71 — THE ONE IMPLICIT CONVERSION.
         //
@@ -1191,8 +1191,18 @@ impl<'a> Checker<'a> {
         // is why one place is enough, and why no context can be forgotten.
         if t == Type::F32 && matches!(hint, Some(Type::F64)) {
             self.widen_f32.insert(e.id);
-            t = Type::F64;
+            // `expr_types` keeps the NATURAL type. The lowering builds the
+            // value in `f32` first and only then converts -- reading an
+            // `f32` variable as if it were eight bytes wide would reach
+            // beyond its storage.
+            self.record(e.id, t);
+            return Type::F64;
         }
+        // The same expression can be checked twice with different context
+        // types (probe, then the real run). Whoever does NOT widen has to
+        // take the mark back, otherwise a conversion would be left standing
+        // that nobody asked for.
+        self.widen_f32.remove(&e.id);
         self.record(e.id, t.clone());
         t
     }
@@ -2072,7 +2082,12 @@ impl<'a> Checker<'a> {
                 } else if matches!(op, BinOp::Shl | BinOp::Shr) {
                     self.probe_d(l, d + 1)
                 } else {
-                    self.probe_d(l, d + 1).or_else(|| self.probe_d(r, d + 1))
+                    // ROUND 71: the same rule as in `binary` -- with two
+                    // floating point operands of different width the wider
+                    // one is what comes out. Otherwise `a_f32 + b_f64` would
+                    // probe as `f32` and the literal next to it would get
+                    // the wrong type.
+                    float_want(self.probe_d(l, d + 1), self.probe_d(r, d + 1))
                 }
             }
             ExprKind::Field(base, name, _) => {

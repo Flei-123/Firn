@@ -38,7 +38,7 @@ import iface
 import core
 import nogc
 
-export { Sema, sema_new, sema_free, sema_run, sema_error, sema_ty,
+export { Sema, sema_new, sema_free, sema_run, sema_error, sema_ty, sema_widen32,
     sema_types, sema_ty_count, sema_needs_comptime, sema_const_value,
     sema_mu_set, sema_fe_set, sema_gc_set, sema_if_set,
     sema_kernel_set,
@@ -54,6 +54,11 @@ struct Sema {
     it: u64, // pointer to the interner
     ty: types.Types,
     etyp: Vec[u32], // type per expression node
+    // ROUND 71: 1 where an `f32` expression stands in a place that wants an
+    // `f64`. The type checker has already written `f64` into `etyp` for it;
+    // the lowering puts the `cvtss2sd` in. It is the ONLY implicit
+    // conversion of the language, and it is lossless.
+    w32: Vec[u8],
     v_name: Vec[u32], // scopes: names, types and bounds
     v_ty: Vec[u32],
     b_limit: Vec[u32],
@@ -66,6 +71,7 @@ struct Sema {
     t_void: u32,
     t_error: u32,
     t_f64: u32,
+    t_f32: u32,
     // ROUND 70: the default type of an integer literal without context.
     t_i32: u32,
     ret: u32, // return type of the current function
@@ -104,10 +110,11 @@ fn sema_new(b: u64, it: u64) -> Sema {
     return Sema {
         b: b, it: it,
         ty: types.types_new(),
-        etyp: vec_new[u32](),
+        etyp: vec_new[u32](), w32: vec_new[u8](),
         v_name: vec_new[u32](), v_ty: vec_new[u32](), b_limit: vec_new[u32](),
         k_name: vec_new[u32](), k_ty: vec_new[u32](), k_value: vec_new[u64](),
         t_bool: 0, t_i64: 0, t_usize: 0, t_void: 0, t_error: 0, t_f64: 0,
+        t_f32: 0,
         t_i32: 0,
         ret: 0, mu: 0, feh: 0, gc: 0, ifr: 0, mc_fname: vec_new[u32](), mc_si: vec_new[u32](),
         err: 0, kernel: false, ct_needed: false,
@@ -125,6 +132,7 @@ fn sema_free(s: *mut Sema) {
     vec_free[u32](&(*s).widen)
     types.types_free(&(*s).ty)
     vec_free[u32](&(*s).etyp)
+    vec_free[u8](&(*s).w32)
     vec_free[u32](&(*s).v_name)
     vec_free[u32](&(*s).v_ty)
     vec_free[u32](&(*s).b_limit)
@@ -394,6 +402,13 @@ fn sema_needs_comptime(s: *mut Sema) -> bool { return (*s).ct_needed }
 fn sema_types(s: *mut Sema) -> *mut types.Types { return &(*s).ty }
 fn sema_ty_count(s: *mut Sema) -> usize { return vec_len[u32](&(*s).etyp) }
 fn sema_ty(s: *mut Sema, i: u32) -> u32 { return vec_at[u32](&(*s).etyp, i as usize) }
+// ROUND 71: does this expression have to be widened from f32 to f64?
+fn sema_widen32(s: *mut Sema, i: u32) -> bool {
+    if i as usize >= vec_len[u8](&(*s).w32) {
+        return false
+    }
+    return vec_at[u8](&(*s).w32, i as usize) == 1 as u8
+}
 
 fn tree(s: *mut Sema) -> *mut ast.Tree { return (*s).b as *mut ast.Tree }
 fn table(s: *mut Sema) -> *mut types.Types { return &(*s).ty }
@@ -495,10 +510,29 @@ fn is_int(s: *mut Sema, t: u32) -> bool { return types.is_int(table(s), t) }
 fn is_error(s: *mut Sema, t: u32) -> bool { return types.ty_kind(table(s), t) == types.K_ERROR }
 fn is_bool(s: *mut Sema, t: u32) -> bool { return types.ty_kind(table(s), t) == types.K_BOOL }
 fn is_f64(s: *mut Sema, t: u32) -> bool { return types.ty_kind(table(s), t) == types.K_F64 }
+fn is_f32(s: *mut Sema, t: u32) -> bool { return types.ty_kind(table(s), t) == types.K_F32 }
+// ROUND 71: one of the two floating point types.
+fn is_float(s: *mut Sema, t: u32) -> bool { return is_f64(s, t) || is_f32(s, t) }
+
+// ROUND 71 (sema.rs::float_want) -- the wanted type of a binary operation
+// out of the two probes. SYMMETRIC: if both sides are floating point but of
+// different width, the wider one wins, so that `a_f32 + b_f64` and
+// `b_f64 + a_f32` mean the same thing.
+fn float_want(s: *mut Sema, pl: u32, pr: u32) -> u32 {
+    if pl != NONE && pr != NONE {
+        if is_float(s, pl) && is_float(s, pr) && !types.ty_equal(table(s), pl, pr) {
+            return (*s).t_f64
+        }
+    }
+    if pl != NONE {
+        return pl
+    }
+    return pr
+}
 
 // May this type take part in an `as` conversion?
 fn convertible(s: *mut Sema, t: u32) -> bool {
-    return is_int(s, t) || is_bool(s, t) || types.is_ptr(table(s), t) || is_f64(s, t)
+    return is_int(s, t) || is_bool(s, t) || types.is_ptr(table(s), t) || is_float(s, t)
 }
 
 // Resolves a type expression of the tree.
@@ -532,8 +566,13 @@ fn probe_t(s: *mut Sema, e: u32, d: u32) -> u32 {
         }
         return str_ty(s)
     }
+    // ROUND 71: an unsuffixed float literal probes as NOTHING -- it adapts,
+    // exactly like the integer literal. Only the suffix makes it speak.
     if a == ast.E_FLOAT {
-        return (*s).t_f64
+        return NONE
+    }
+    if a == ast.E_FLOAT32 {
+        return (*s).t_f32
     }
     if a == ast.E_BOOL {
         return (*s).t_bool
@@ -577,11 +616,12 @@ fn probe_t(s: *mut Sema, e: u32, d: u32) -> u32 {
         if op == 8 || op == 9 {
             return probe_t(s, ast.e_b(b, e), d + 1)
         }
-        let l: u32 = probe_t(s, ast.e_b(b, e), d + 1)
-        if l != NONE {
-            return l
-        }
-        return probe_t(s, ast.e_c(b, e), d + 1)
+        // ROUND 71: the same rule as in `binary` -- with two floating point
+        // operands of different width the wider one is what comes out.
+        // Otherwise `a_f32 + b_f64` would probe as `f32` and the literal
+        // next to it would get the wrong type.
+        return float_want(s, probe_t(s, ast.e_b(b, e), d + 1),
+            probe_t(s, ast.e_c(b, e), d + 1))
     }
     if a == ast.E_FIELD {
         let bt: u32 = probe_t(s, ast.e_a(b, e), d + 1)
@@ -853,7 +893,22 @@ fn const_eval(s: *mut Sema, e: u32, good: *mut bool) -> i64 {
 // type; on error, the error type.
 
 fn expr(s: *mut Sema, e: u32, note: u32) -> u32 {
-    let t: u32 = expr_inner(s, e, note)
+    var t: u32 = expr_inner(s, e, note)
+    // ROUND 71 -- THE ONE IMPLICIT CONVERSION (sema.rs::expr).
+    //
+    // `f32` -> `f64` loses nothing: every binary32 is exactly representable
+    // as a binary64. The other direction throws digits away and needs
+    // `as f32`. It sits HERE and nowhere else, because `expr` is the single
+    // funnel every expression with a wanted type passes through --
+    // declaration, assignment, argument, `return`, field, array element.
+    if note != NONE {
+        if types.ty_kind(table(s), t) == types.K_F32 {
+            if types.ty_kind(table(s), note) == types.K_F64 {
+                vec_set[u8](&(*s).w32, e as usize, 1 as u8)
+                t = (*s).t_f64
+            }
+        }
+    }
     remember(s, e, t)
     return t
 }
@@ -971,7 +1026,7 @@ fn unary(s: *mut Sema, e: u32, note: u32) -> u32 {
                 h = note
             }
             if h == NONE && op == 0 && note != NONE {
-                if types.ty_kind(table(s), note) == types.K_F64 {
+                if is_float(s, note) {
                     h = note
                 }
             }
@@ -982,7 +1037,7 @@ fn unary(s: *mut Sema, e: u32, note: u32) -> u32 {
         }
         var fits: bool = is_int(s, t)
         if !fits && op == 0 {
-            fits = types.ty_kind(table(s), t) == types.K_F64
+            fits = is_float(s, t)
         }
         if !fits {
             complain(s)
@@ -1057,9 +1112,11 @@ fn binary(s: *mut Sema, e: u32, note: u32) -> u32 {
                 return (*s).t_bool
             }
         }
-        var want: u32 = probe(s, l)
+        var want: u32 = float_want(s, probe(s, l), probe(s, r))
         if want == NONE {
-            want = probe(s, r)
+            if note != NONE && is_float(s, note) {
+                want = note
+            }
         }
         let lt: u32 = expr(s, l, want)
         let rt: u32 = expr(s, r, want)
@@ -1085,7 +1142,7 @@ fn binary(s: *mut Sema, e: u32, note: u32) -> u32 {
             return (*s).t_bool
         }
         let only_equal: bool = op == 10 || op == 11
-        var ok: bool = is_int(s, lt) || is_f64(s, lt)
+        var ok: bool = is_int(s, lt) || is_float(s, lt)
         if !ok && only_equal {
             // ROUND 58: two function values compare like two pointers --
             // `==` means "the same function record". Ordering does not
@@ -1130,12 +1187,12 @@ fn binary(s: *mut Sema, e: u32, note: u32) -> u32 {
 
     // arithmetic and bit operations: the already typed operand takes
     // PRECEDENCE over the context type.
-    var want: u32 = probe(s, l)
+    // ROUND 71: with two floating point operands the WIDER one wins, and the
+    // context type may name a floating point type -- that is what makes
+    // `let x: f32 = 1.5 + 2.5` compute in f32.
+    var want: u32 = float_want(s, probe(s, l), probe(s, r))
     if want == NONE {
-        want = probe(s, r)
-    }
-    if want == NONE {
-        if note != NONE && is_int(s, note) {
+        if note != NONE && (is_int(s, note) || is_float(s, note)) {
             want = note
         }
     }
@@ -1171,8 +1228,8 @@ fn binop_type(s: *mut Sema, op: u32, lt: u32, rt: u32) -> u32 {
         complain(s)
         return (*s).t_error
     }
-    if is_f64(s, lt) || is_f64(s, rt) {
-        // `%` and the bit operations are undefined for f64.
+    if is_float(s, lt) || is_float(s, rt) {
+        // `%` and the bit operations are undefined for floating point.
         let allowed: bool = op <= 3
         if !allowed {
             complain(s)
@@ -1182,7 +1239,7 @@ fn binop_type(s: *mut Sema, op: u32, lt: u32, rt: u32) -> u32 {
             complain(s)
             return (*s).t_error
         }
-        return (*s).t_f64
+        return lt
     }
     if !is_int(s, lt) || !is_int(s, rt) || !types.ty_equal(table(s), lt, rt) {
         complain(s)
@@ -2224,8 +2281,21 @@ fn expr_inner(s: *mut Sema, e: u32, note: u32) -> u32 {
     let b: *mut ast.Tree = tree(s)
     let a: u32 = ast.e_kind(b, e)
 
+    // ROUND 71 -- the float literal is UNTYPED. Where the context says
+    // `f32`, it is an `f32`; where nothing says anything, `f64` holds --
+    // the default type, as in C#. `1.5f` is only needed where there is no
+    // context at all.
     if a == ast.E_FLOAT {
+        if note != NONE {
+            if types.ty_kind(table(s), note) == types.K_F32 {
+                return (*s).t_f32
+            }
+        }
         return (*s).t_f64
+    }
+    // The suffix decides on its own and lets no context talk it out.
+    if a == ast.E_FLOAT32 {
+        return (*s).t_f32
     }
     if a == ast.E_INT {
         // An integer literal carries NO type of its own -- it comes from outside.
@@ -3226,6 +3296,10 @@ fn fmt_target(s: *mut Sema, name: u32, e: u32) -> u32 {
         var w3: [u8; 7] = "fmt_f64"
         return fmt_join(s, p, n - 9, (&w3[0]) as u64, 7)
     }
+    if is_f32(s, t) {
+        var w4: [u8; 7] = "fmt_f32"
+        return fmt_join(s, p, n - 9, (&w4[0]) as u64, 7)
+    }
     if !is_int(s, t) {
         complain(s)
         return NONE
@@ -3426,11 +3500,14 @@ fn sema_run(s: *mut Sema) {
     // ROUND 70: created LAST on purpose -- an entry in front of the
     // existing ones would move every type number behind it.
     (*s).t_i32 = types.new_ty(table(s), types.K_I32, 0, 0)
+    // ROUND 71: appended LAST for the same reason.
+    (*s).t_f32 = types.new_ty(table(s), types.K_F32, 0, 0)
 
     // 3. Create the type table for all expressions.
     var i: usize = 0
     while i < ast.expr_count(b) {
         vec_push[u32](&(*s).etyp, (*s).t_error)
+        vec_push[u8](&(*s).w32, 0 as u8)
         i = i + 1
     }
 
