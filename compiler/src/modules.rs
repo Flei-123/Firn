@@ -800,7 +800,7 @@ impl<'a, 'b> Renamer<'a, 'b> {
     fn expr(&mut self, e: &mut Expr) {
         let span = e.span;
         match &mut e.kind {
-            ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::FloatF32(_) | ExprKind::Bool(_) => {}
+            ExprKind::Int(_) | ExprKind::Float(..) | ExprKind::FloatF32(_) | ExprKind::Bool(_) => {}
             // ROUND 70: the text literal carries its array literal inside.
             ExprKind::Text(_, inner) => self.expr(inner),
             // Round 58: the closure body is resolved INSIDE the enclosing

@@ -296,7 +296,7 @@ impl<'a> NoGcChecker<'a> {
                 self.check_expr(v);
                 self.check_expr(n);
             }
-            ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Ident(_) => {}
+            ExprKind::Int(_) | ExprKind::Float(..) | ExprKind::Bool(_) | ExprKind::Ident(_) => {}
         }
     }
 

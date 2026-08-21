@@ -640,13 +640,9 @@ impl<'a> Lower<'a> {
             // an `f32` context the binary64 of the lexer is narrowed here,
             // once, correctly rounded -- and that is exactly the same value
             // that the suffix `1.5f` would have produced.
-            ExprKind::Float(bits) => {
+            ExprKind::Float(bits, single) => {
                 let ft = self.fty_of(e)?;
-                let v = if ft == FTy::F32 {
-                    crate::lexer::narrow(f64::from_bits(*bits)) as i128
-                } else {
-                    *bits as i128
-                };
+                let v = if ft == FTy::F32 { *single as i128 } else { *bits as i128 };
                 Some(self.constant(ft, v))
             }
             ExprKind::FloatF32(bits) => Some(self.constant(FTy::F32, *bits as i128)),

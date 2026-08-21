@@ -349,7 +349,7 @@ impl<'a> Execution<'a> {
         match &e.kind {
             ExprKind::Int(v) => Ok(*v),
             ExprKind::Bool(b) => Ok(if *b { 1 } else { 0 }),
-            ExprKind::Float(_) => no("floating point is not yet possible at compile time"),
+            ExprKind::Float(..) => no("floating point is not yet possible at compile time"),
             ExprKind::Ident(n) => {
                 for level in env.iter().rev() {
                     if let Some(v) = level.get(n) {

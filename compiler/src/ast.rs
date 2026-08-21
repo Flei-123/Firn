@@ -112,7 +112,10 @@ pub enum ExprKind {
     /// otherwise `f64` (SPEC §8.6). Without a context there is no rounding
     /// twice — the bit pattern of the binary64 is only narrowed to binary32
     /// when the type checker really asks for it.
-    Float(u64),
+    /// The second number is the binary32 bit pattern of the SAME text,
+    /// correctly rounded (round 71) -- the way through the binary64 would
+    /// not be.
+    Float(u64, u32),
     /// **ROUND 71** — float literal WITH the suffix `f` (`1.5f`), as the bit
     /// pattern of one IEEE-754 binary32. It is always an `f32`, no matter
     /// what the context says.
