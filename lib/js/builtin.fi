@@ -23,6 +23,7 @@ import js.ast
 import js.val
 import js.interp
 import js.bigint
+import js.builtin2
 
 export { install, native_dispatch, native_arity_of }
 
@@ -331,6 +332,10 @@ fn native_dispatch(r: Gc[Realm], id: u64, this: Gc[JsVal], args: Gc[GcVec],
     nt: Gc[JsObj]) -> AllocError!Gc[JsVal] {
     // Round 66 lives in lib/js/gen.fi and is reached through the same
     // function value construction as this table itself.
+    // Round 74: the second table.
+    if id >= builtin2.B2_BASE && id < builtin2.B2_END {
+        return builtin2.dispatch2(r, id, this, args, nt)
+    }
     if id >= 30000 {
         let c: *mut interp.Ctx = interp.ctx_of(r)
         let h: fn(Gc[Realm], u64, Gc[JsVal], Gc[GcVec], Gc[JsObj]) -> AllocError!Gc[JsVal] = (*c).gen_native
@@ -1100,6 +1105,25 @@ fn object_to_string(r: Gc[Realm], this: Gc[JsVal]) -> AllocError!Gc[JsVal] {
     let o: Gc[JsObj] = try interp.to_object(r, this)
     var tag: [u8; 6] = "Object"
     var n: usize = 6
+    // Round 74: `Symbol.toStringTag` wins over the built in name (20.1.3.6
+    // step 15), and it is only taken when it really is a text.
+    let wk: Gc[JsVal] = val.realm_well_known(r, val.WELL_KNOWN_TOSTRINGTAG)
+    if (wk as u64) != 0 {
+        let ov: Gc[JsVal] = o
+        let tv: Gc[JsVal] = try interp.get_prop(r, ov, val.key_for_symbol(wk))
+        if thrown(r) {
+            return val.str_empty(r)
+        }
+        if val.val_tag(tv) == val.TAG_STR {
+            let head: Gc[JsVal] = try val.str_from_ascii(r, &tag[0], 0)
+            var pre: [u8; 8] = "[object "
+            var post: [u8; 1] = "]"
+            let a: Gc[JsVal] = try val.str_from_ascii(r, &pre[0], 8)
+            let b: Gc[JsVal] = try val.str_concat(r, a, tv)
+            let c: Gc[JsVal] = try val.str_from_ascii(r, &post[0], 1)
+            return val.str_concat(r, b, c)
+        }
+    }
     if o.cls == val.CLS_ARRAY {
         var t2: [u8; 5] = "Array"
         return wrap_tag(r, &t2[0], 5)
@@ -1127,6 +1151,14 @@ fn object_to_string(r: Gc[Realm], this: Gc[JsVal]) -> AllocError!Gc[JsVal] {
     if o.cls == val.CLS_ARGUMENTS {
         var t8: [u8; 9] = "Arguments"
         return wrap_tag(r, &t8[0], 9)
+    }
+    if o.cls == val.CLS_DATE {
+        var t9: [u8; 4] = "Date"
+        return wrap_tag(r, &t9[0], 4)
+    }
+    if o.cls == val.CLS_REGEXP {
+        var t10: [u8; 6] = "RegExp"
+        return wrap_tag(r, &t10[0], 6)
     }
     return wrap_tag(r, &tag[0], n)
 }
@@ -1166,101 +1198,12 @@ fn describe(r: Gc[Realm], p: Gc[Prop]) -> AllocError!Gc[JsVal] {
     return dv
 }
 
-// 10.1.6.3 ValidateAndApplyPropertyDescriptor, in the form this engine
-// needs: an existing non configurable property may not be redefined.
+// 10.1.6.3 ValidateAndApplyPropertyDescriptor. The work itself moved to
+// `lib/js/builtin2.fi` in round 74, because `Reflect.defineProperty` needs
+// exactly the same thing but ANSWERS instead of throwing.
 fn apply_descriptor(r: Gc[Realm], o: Gc[JsObj], k: u64,
     desc: Gc[JsVal]) -> AllocError!bool {
-    if val.val_tag(desc) != val.TAG_OBJ {
-        var m: [u8; 30] = "Property description must be a"
-        let x: Gc[JsVal] = try type_err(r, &m[0], 30)
-        return false
-    }
-    var vk: [u8; 5] = "value"
-    var wk: [u8; 8] = "writable"
-    var ek: [u8; 10] = "enumerable"
-    var ck: [u8; 12] = "configurable"
-    var gk: [u8; 3] = "get"
-    var sk: [u8; 3] = "set"
-    let has_value: bool = try has_key(r, desc, &vk[0], 5)
-    let has_get: bool = try has_key(r, desc, &gk[0], 3)
-    let has_set: bool = try has_key(r, desc, &sk[0], 3)
-    let old: Gc[Prop] = val.obj_get_own(o, k)
-    if (old as u64) != 0 && val.prop_attrs(old) & val.A_CONFIGURABLE == 0 {
-        // Only a value change on a writable data property stays allowed.
-        if val.prop_attrs(old) & val.A_ACCESSOR != 0 || has_get || has_set {
-            var m: [u8; 38] = "Cannot redefine a non configurable pro"
-            let x: Gc[JsVal] = try type_err(r, &m[0], 38)
-            return false
-        }
-        if val.prop_attrs(old) & val.A_WRITABLE == 0 && has_value {
-            var m: [u8; 38] = "Cannot redefine a non configurable pro"
-            let x: Gc[JsVal] = try type_err(r, &m[0], 38)
-            return false
-        }
-    }
-    var attrs: u64 = 0
-    if (old as u64) != 0 {
-        attrs = val.prop_attrs(old)
-    }
-    if try has_key(r, desc, &ek[0], 10) {
-        let v: Gc[JsVal] = try get_key(r, desc, &ek[0], 10)
-        if interp.to_boolean(r, v) {
-            attrs = attrs | val.A_ENUMERABLE
-        } else {
-            attrs = attrs & (0xFFFFFFFFFFFFFFFF - val.A_ENUMERABLE)
-        }
-    }
-    if try has_key(r, desc, &ck[0], 12) {
-        let v: Gc[JsVal] = try get_key(r, desc, &ck[0], 12)
-        if interp.to_boolean(r, v) {
-            attrs = attrs | val.A_CONFIGURABLE
-        } else {
-            attrs = attrs & (0xFFFFFFFFFFFFFFFF - val.A_CONFIGURABLE)
-        }
-    }
-    if has_get || has_set {
-        var getter: Gc[JsVal] = val.realm_undefined(r)
-        var setter: Gc[JsVal] = val.realm_undefined(r)
-        if (old as u64) != 0 && val.prop_attrs(old) & val.A_ACCESSOR != 0 {
-            getter = val.prop_value(old)
-            setter = val.prop_setter(old)
-        }
-        if has_get {
-            getter = try get_key(r, desc, &gk[0], 3)
-        }
-        if has_set {
-            setter = try get_key(r, desc, &sk[0], 3)
-        }
-        attrs = attrs & (0xFFFFFFFFFFFFFFFF - val.A_WRITABLE)
-        return interp.define_accessor(r, o, k, getter, setter, attrs)
-    }
-    if try has_key(r, desc, &wk[0], 8) {
-        let v: Gc[JsVal] = try get_key(r, desc, &wk[0], 8)
-        if interp.to_boolean(r, v) {
-            attrs = attrs | val.A_WRITABLE
-        } else {
-            attrs = attrs & (0xFFFFFFFFFFFFFFFF - val.A_WRITABLE)
-        }
-    }
-    var v: Gc[JsVal] = val.realm_undefined(r)
-    if has_value {
-        v = try get_key(r, desc, &vk[0], 5)
-    } else if (old as u64) != 0 && val.prop_attrs(old) & val.A_ACCESSOR == 0 {
-        v = val.prop_value(old)
-    }
-    attrs = attrs & (0xFFFFFFFFFFFFFFFF - val.A_ACCESSOR)
-    // On an array an index goes into the dense storage.
-    if o.cls == val.CLS_ARRAY {
-        let i: i64 = val.index_of_key(r, k)
-        if i >= 0 && attrs == val.A_DEFAULT {
-            let ok: bool = try val.elems_set(r, o, i as u64, v)
-            if (i as u64) >= o.len {
-                o.len = i as u64 + 1
-            }
-            return true
-        }
-    }
-    return interp.define_value(r, o, k, v, attrs)
+    return builtin2.apply_descriptor(r, o, k, desc, true)
 }
 
 fn has_key(r: Gc[Realm], o: Gc[JsVal], p: *mut u8, n: usize) -> AllocError!bool {
@@ -3325,6 +3268,10 @@ fn install(r: Gc[Realm]) -> AllocError!Gc[JsObj] {
     let ok6: bool = try install_misc(r, g)
     let ok7: bool = try install_errors(r, g)
     let ok8: bool = try install_collections(r, g)
+    // Round 74: the second table -- the well known symbols and their
+    // protocols, the iterators, Reflect, the weak collections, the URI
+    // functions and the long tail of Object/Math/Number/String/Array.
+    let ok9: bool = try builtin2.install2(r)
     return g
 }
 
