@@ -258,7 +258,7 @@ pub(crate) fn check_text(
         ck.dg.error_note(
             e.span,
             "a u\"…\" literal has no str type".to_string(),
-            "str holds octets; give the array type, e.g. 'var t: [u16; 3] = u\"abc\"'",
+            "str holds octets; give the array type, e.g. 'var t: [u16; 4] = u\"code\"'",
         );
         return Type::Error;
     }
