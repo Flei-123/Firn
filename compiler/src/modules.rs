@@ -481,6 +481,16 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
         crate::prof::define(root, None);
     }
 
+    // HOOK profil (prof.rs, round 73): which of the parsed modules declares
+    // `profile kernel` ITSELF? That declaration is what admits a `std`
+    // module under the kernel profile — and because the module lands in the
+    // same compilation unit, the claim gets checked by
+    // `sema::check_profile` like every other line of the program.
+    let declares_kernel: Vec<bool> = progs
+        .iter()
+        .map(|p| p.profile.as_ref().map(|(n, _)| n == "kernel").unwrap_or(false))
+        .collect();
+
     // Which module offers what?
     let mut infos: Vec<ModuleInfo> = Vec::new();
     for (f, p) in files.iter().zip(progs.iter()) {
@@ -495,12 +505,16 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
             items.insert(x.name.clone());
         }
         for imp in &p.imports {
-            // HOOK profil (prof.rs, round 52): under the kernel profile the
-            // standard library is barred. The check sits here because only
-            // here are the inclusions of EVERY file known with their position.
-            crate::prof::hook_import(dg, &imp.path, imp.span);
+            // HOOK profil (prof.rs, round 52/73): under the kernel profile the
+            // standard library is barred, unless the module being imported
+            // declares `profile kernel` itself. The check sits here because
+            // only here are the inclusions of EVERY file known with their
+            // position.
             let target = imp.path.last().cloned().unwrap_or_default();
-            let known = files.iter().any(|g| module_name(g) == target);
+            let at = files.iter().position(|g| module_name(g) == target);
+            let module_is_kernel = at.map(|i| declares_kernel[i]).unwrap_or(false);
+            crate::prof::hook_import(dg, &imp.path, imp.span, module_is_kernel);
+            let known = at.is_some();
             if !known {
                 dg.error(
                     imp.span,
