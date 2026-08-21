@@ -817,7 +817,7 @@ echo "== 38. a Minecraft client gets into the world (tools/mcserver/run.sh, ROUN
 MC_FAST=${MC_FAST:-0} bash tools/mcserver/run.sh > "$WORK/mcserver.log" 2>&1 && MCRC=0 || MCRC=$?
 if [ "$MCRC" -eq 0 ]; then
     ok
-    grep -E '^  [a-z-]+: (ping: version|OK |the UUID|dribbled|nmp: login|OK nmp|flood:|play: chunk verified|config: Registry|SKIPPED)' \
+    grep -E '^  [a-z-]+: +(ping: version|OK |the UUID|dribbled|nmp: login|OK nmp|flood:|play: chunk verified|config: Registry|SKIPPED|ping :|login:  *[0-9]|soak:|counter-check )' \
         "$WORK/mcserver.log" | sed 's/^/ /'
 else
     bad "tools/mcserver/run.sh failed (see .test-work/mcserver.log)"
