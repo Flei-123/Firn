@@ -110,6 +110,8 @@ const A_GT: u32 = 66
 const A_GE: u32 = 67
 const A_EOF: u32 = 68
 const A_FSTR: u32 = 69
+// ROUND 68: `~`, the bitwise complement.
+const A_TILDE: u32 = 70
 
 // binary operators -- in the same order as `ast::BinOp`.
 const B_ADD: u32 = 0
@@ -136,6 +138,9 @@ const U_NEG: u32 = 0
 const U_NOT: u32 = 1
 const U_ADDR: u32 = 2
 const U_DEREF: u32 = 3
+// ROUND 68: `~x`, the bitwise complement. Deliberately NOT the same
+// operator as `!`: `!` negates a bool, `~` flips every bit.
+const U_BITNOT: u32 = 4
 
 struct Parser {
     lx: u64, // pointer to the lexer
@@ -349,9 +354,40 @@ fn line_start(p: *mut Parser) -> bool {
     return line(p, (*p).pos) > line(p, (*p).pos - 1)
 }
 
+// ROUND 68 -- the tokens that carry an expression over a line break.
+// Every one of them is INFIX ONLY: no statement of the language may begin
+// with it, so the reading is unambiguous. `*`, `(` and `[` are deliberately
+// NOT in the list -- a line may legitimately begin with `*p = 0`, with
+// `(*p).f = 0` or with an index, and none of those may silently become a
+// multiplication, a call or an index belonging to the line before.
+fn continues_line(a: u32) -> bool {
+    if a == A_PLUS || a == A_MINUS || a == A_SLASH || a == A_PERCENT {
+        return true
+    }
+    if a == A_AMP || a == A_PIPE || a == A_CARET || a == A_SHL || a == A_SHR {
+        return true
+    }
+    if a == A_ANDAND || a == A_OROR {
+        return true
+    }
+    if a == A_EQEQ || a == A_NOTEQ || a == A_LT || a == A_LE || a == A_GT || a == A_GE {
+        return true
+    }
+    if a == A_DOT || a == A_KWAS {
+        return true
+    }
+    return false
+}
+
 // May the expression continue with the current token?
 fn next(p: *mut Parser) -> bool {
-    return (*p).parens > 0 || !line_start(p)
+    if (*p).parens > 0 {
+        return true
+    }
+    if !line_start(p) {
+        return true
+    }
+    return continues_line(kind(p, 0))
 }
 
 fn complain(p: *mut Parser) {
@@ -1024,6 +1060,7 @@ fn un_expr(p: *mut Parser) -> u32 {
     else if a == A_NOT { op = U_NOT as i32 }
     else if a == A_AMP { op = U_ADDR as i32 }
     else if a == A_STAR { op = U_DEREF as i32 }
+    else if a == A_TILDE { op = U_BITNOT as i32 }
     if op < 0 {
         return after_expr(p)
     }
@@ -1281,7 +1318,8 @@ fn alit_out_lit(p: *mut Parser, lx2: *mut lexer.Lexer, k: usize) -> u32 {
 //
 //   asm_expr     = "asm" "(" str_lit { "," asm_op } ")" ;
 //   asm_op       = "in"      "(" str_lit ")" expr
-//                | "out"     "(" str_lit ")"
+//                | "out"     "(" str_lit ")"            (ROUND 52: the value)
+//                | "out"     "(" str_lit ")" expr       (ROUND 68: memory)
 //                | "clobber" "(" str_lit ")" ;
 //
 // The tree holds a call `asm$<number>` with the INPUT EXPRESSIONS as its
@@ -1314,6 +1352,11 @@ fn asm_block(p: *mut Parser) -> u32 {
     var regs: Vec[u32] = vec_new[u32]()
     var clobs: Vec[u32] = vec_new[u32]()
     var args: Vec[u32] = vec_new[u32]()
+    // ROUND 68: the MEMORY outputs. Their address expressions go into the
+    // SAME argument list, behind the inputs -- type check and lowering
+    // split the list at the number of inputs.
+    var oregs: Vec[u32] = vec_new[u32]()
+    var oargs: Vec[u32] = vec_new[u32]()
     var ow: [u8; 3] = "out"
     var cw: [u8; 7] = "clobber"
     while eat(p, A_COMMA) {
@@ -1351,10 +1394,19 @@ fn asm_block(p: *mut Parser) -> u32 {
             vec_push[u32](&regs, reg)
             vec_push[u32](&args, inner_expr(p))
         } else if which == 1 {
-            if out != ast.NOTHING {
-                complain(p)
+            // ROUND 68: `out("rdx") p` -- with an expression behind it the
+            // register goes into `*p`, and of those there may be any
+            // number. Without one it stays the VALUE of the expression,
+            // and of those there is still at most one.
+            if actual(p, A_COMMA) || actual(p, A_RPAREN) || at_end(p) {
+                if out != ast.NOTHING {
+                    complain(p)
+                }
+                out = reg
+            } else {
+                vec_push[u32](&oregs, reg)
+                vec_push[u32](&oargs, inner_expr(p))
             }
-            out = reg
         } else {
             vec_push[u32](&clobs, reg)
         }
@@ -1363,8 +1415,15 @@ fn asm_block(p: *mut Parser) -> u32 {
         }
     }
     expect(p, A_RPAREN)
-    let blk: u32 = ast.asm_add(par_tree(p), template, out, &regs, &clobs)
+    var oi: usize = 0
+    while oi < vec_len[u32](&oargs) {
+        vec_push[u32](&args, vec_at[u32](&oargs, oi))
+        oi = oi + 1
+    }
+    vec_free[u32](&oargs)
+    let blk: u32 = ast.asm_add(par_tree(p), template, out, &regs, &oregs, &clobs)
     vec_free[u32](&regs)
+    vec_free[u32](&oregs)
     vec_free[u32](&clobs)
     rt.buf_clear(&(*p).scratch)
     var pw: [u8; 4] = "asm$"

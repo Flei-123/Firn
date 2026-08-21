@@ -53,6 +53,10 @@
 #      exception reports (#DE, #PF, #GP, #DF), PIC/PIT with a tick counter
 #      that runs up, memory map, frame allocator and heap, keyboard over
 #      IRQ1, ring 3 with `syscall`/`sysret`. With counter-checks.
+#  27. Function values in a STRUCT FIELD (tools/fnfield/run.sh, round 68):
+#      `c.hook(a, b)` is exactly ONE `call rax`, a direct call stays a
+#      direct `call`, and a METHOD of the same name still wins and stays
+#      direct -- in both compilers and with counter-checks.
 #  23. The formatter firnfmt (tools/fmt/run.sh, round 64): the whole tree
 #      gets formatted, the token stream and the syntax tree stay unchanged,
 #      a second run changes nothing, and the shape does not depend on
@@ -464,6 +468,20 @@ if [ "$FVRC" -eq 0 ]; then
 else
     bad "tools/fnval/run.sh failed (see .test-work/fnval.log)"
     grep FAIL "$WORK/fnval.log" | head -10 | sed 's/^/   /'
+fi
+
+echo "== 27. function values in a struct field (tools/fnfield/run.sh, ROUND 68) =="
+# Round 68 (docs/ROUND68.md). `c.hook(a, b)` may now be written directly.
+# What that costs is measured on the emitted code: exactly one `call rax`
+# per field call, a direct call stays direct, a method of the same name
+# wins and stays direct -- in both compilers and with counter-checks.
+bash tools/fnfield/run.sh > "$WORK/fnfield.log" 2>&1 && FFRC=0 || FFRC=$?
+if [ "$FFRC" -eq 0 ]; then
+    ok
+    tail -1 "$WORK/fnfield.log" | sed 's/^/   /'
+else
+    bad "tools/fnfield/run.sh failed (see .test-work/fnfield.log)"
+    grep FAIL "$WORK/fnfield.log" | head -10 | sed 's/^/   /'
 fi
 
 echo "== 22. the kernel really runs: tasks, address spaces, system calls, files (tools/kernel/run.sh) =="

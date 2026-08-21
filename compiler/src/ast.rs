@@ -86,6 +86,10 @@ impl BinOp {
 pub enum UnOp {
     Neg,
     Not,
+    /// `~x` — the bitwise complement (round 68). Separate from `Not`,
+    /// because `!` is the LOGICAL negation of a `bool` and the two must not
+    /// be confused: `!0u8` is a type error, `~0u8` is 255.
+    BitNot,
     /// `&x` — address of
     AddrOf,
     /// `*p` — dereference

@@ -310,11 +310,13 @@ fn remap_op(op: &Op, mv: &dyn Fn(Val) -> Val) -> Op {
         }
         Op::ThreadSelf => Op::ThreadSelf,
         Op::GcAddr { regs } => Op::GcAddr { regs: *regs },
-        Op::Asm { template, out, in_regs, ins, clobber } => Op::Asm {
+        Op::Asm { template, out, in_regs, ins, out_regs, outs, clobber } => Op::Asm {
             template: template.clone(),
             out: out.clone(),
             in_regs: in_regs.clone(),
             ins: ins.iter().map(|a| mv(*a)).collect(),
+            out_regs: out_regs.clone(),
+            outs: outs.iter().map(|a| mv(*a)).collect(),
             clobber: clobber.clone(),
         },
         Op::MmioLoad { addr } => Op::MmioLoad { addr: mv(*addr) },

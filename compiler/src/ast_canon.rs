@@ -203,6 +203,7 @@ fn ex_core(e: &Expr) -> String {
             match op {
                 UnOp::Neg => "-",
                 UnOp::Not => "!",
+                UnOp::BitNot => "~",
                 UnOp::AddrOf => "&",
                 UnOp::Deref => "*",
             },

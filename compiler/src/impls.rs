@@ -443,6 +443,36 @@ pub(crate) fn target(info: &TypeInfo, method: &str, recv: &Type) -> Option<(Stri
     target_of(&info.tcx, &info.fns, method, recv)
 }
 
+/// **ROUND 68** — a FIELD of the receiver that holds a FUNCTION VALUE.
+///
+/// `c.hook(a, b)` is not a method call: `hook` is a field of `Ctx` whose
+/// type is `fn(A, B) -> R` (round 58). Up to round 67 it had to be loaded
+/// into a local first — `let h = c.hook; h(a, b)` (docs/ROUND63.md, gap 6).
+///
+/// The lookup runs **after** the method lookup, never before: a method of
+/// the same name keeps winning, so no existing program changes its meaning.
+/// Yields the structure index, the parameter types and the result type.
+pub(crate) fn field_fn(
+    tcx: &TypeCtx,
+    recv: &Type,
+    name: &str,
+) -> Option<(usize, Vec<Type>, Type)> {
+    let sidx = match recv {
+        Type::Struct(i) => *i,
+        // a pointer receiver, and with it `Gc[T]` — a gc class is a struct
+        Type::Ptr { inner, .. } => match **inner {
+            Type::Struct(i) => i,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let f = tcx.structs.get(sidx)?.field(name)?;
+    match &f.ty {
+        Type::Fn { params, ret } => Some((sidx, params.clone(), (**ret).clone())),
+        _ => None,
+    }
+}
+
 /// Can the address of this expression be taken?
 /// The same set that `&x` allows and that `lower::lower_addr` masters.
 fn is_slot(e: &Expr) -> bool {
@@ -524,6 +554,37 @@ pub(crate) fn hook_call(
     let sig = match ck.fns.get(&full) {
         Some(s) => s.clone(),
         None => {
+            // HOOK fnval (ROUND 68): no method of that name — but perhaps a
+            // FIELD holding a function value. `c.hook(a, b)` then calls
+            // through that value; the receiver is only the place the value
+            // is read from and is NOT passed on.
+            if let Some((_, params, ret)) = field_fn(&ck.tcx, &et, &method) {
+                let display = format!("{}.{}", prefix, method);
+                let shown = ck.tcx.name_of(&Type::Fn {
+                    params: params.clone(),
+                    ret: Box::new(ret.clone()),
+                });
+                let found = args.len().saturating_sub(1);
+                if found != params.len() {
+                    ck.dg.error(
+                        espan,
+                        format!(
+                            "the function value '{}' of type {} expects {} argument(s), found {}",
+                            display,
+                            shown,
+                            params.len(),
+                            found
+                        ),
+                    );
+                }
+                for (i, a) in args[1..].iter().enumerate() {
+                    match params.get(i) {
+                        Some(p) => ck.check_argument(&display, i + 1, a, p),
+                        None => ck.type_out_expr(a),
+                    }
+                }
+                return Some(ret);
+            }
             for a in &args[1..] {
                 ck.type_out_expr(a);
             }
