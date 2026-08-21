@@ -61,7 +61,22 @@ fn chain_all_space(k: Gc[Chain]) -> bool {
 // The kind of box an elem makes. `out_of_flow` blockifies -- that is
 // the rule that makes `float: left` on a `span` behave like a `div`.
 fn box_kind_for(s: Gc[Style], out_of_flow: bool) -> u32 {
+    return box_kind_in(s, out_of_flow, false)
+}
+
+// The same question, but knowing whether the parent is a FLEX CONTAINER.
+// Every child of one is BLOCKIFIED (css-display-3, 2.7): `display:
+// inline` on a flex item behaves like `block`, `inline-block` like
+// `block`, `inline-flex` like `flex`. Without that a `span` in a flex
+// row would become an inline box and never see the flex algorithm.
+fn box_kind_in(s: Gc[Style], out_of_flow: bool, flex_item: bool) -> u32 {
     let d: u32 = cascade.style_display(s)
+    if flex_item {
+        if d == cascade.D_FLEX || d == cascade.D_INLINE_FLEX {
+            return box.BK_FLEX
+        }
+        return box.BK_BLOCK
+    }
     if d == cascade.D_FLEX {
         return box.BK_FLEX
     }
@@ -87,14 +102,51 @@ fn box_kind_for(s: Gc[Style], out_of_flow: bool) -> u32 {
 }
 
 // Does the box open its own block formatting context?
-fn bfc_for(s: Gc[Style], kind: u32, out_of_flow: bool, root: bool) -> bool {
-    if root || out_of_flow {
+fn bfc_for(s: Gc[Style], kind: u32, out_of_flow: bool, root: bool,
+    flex_item: bool) -> bool {
+    if root || out_of_flow || flex_item {
+        // A flex item ALWAYS establishes its own formatting context: its
+        // margins never collapse with anything, and a float inside it
+        // never sticks out. Forgetting that shows up as a margin escaping
+        // out of the first item and moving the whole container.
         return true
     }
     if kind == box.BK_ATOMIC || kind == box.BK_FLEX {
         return true
     }
     if cascade.style_overflow(s) != cascade.OV_VISIBLE {
+        return true
+    }
+    return false
+}
+
+// Does this child care what the CONTENT HEIGHT of its parent turns out to
+// be? Everything that resolves a percentage against it, everything that
+// hangs from its bottom edge, and every flex container -- whose whole
+// cross axis is decided by a definite height. The answer travels UPWARDS
+// while the tree is built, so one bit at the top answers for a whole
+// subtree.
+fn depends_on_height(k: Gc[Box]) -> bool {
+    if (k.flags & box.F_H_DEPENDS) != 0 as u32 {
+        return true
+    }
+    if (k.flags & box.F_FLEX_BOX) != 0 as u32 {
+        return true
+    }
+    let s: Gc[Style] = k.style
+    if cascade.style_unit(s, cascade.S_HEIGHT) == cascade.U_PERCENT {
+        return true
+    }
+    if cascade.style_unit(s, cascade.S_MIN_HEIGHT) == cascade.U_PERCENT {
+        return true
+    }
+    if cascade.style_unit(s, cascade.S_MAX_HEIGHT) == cascade.U_PERCENT {
+        return true
+    }
+    if cascade.style_unit(s, cascade.S_TOP) == cascade.U_PERCENT {
+        return true
+    }
+    if cascade.style_unit(s, cascade.S_BOTTOM) != cascade.U_AUTO {
         return true
     }
     return false
@@ -112,6 +164,12 @@ fn is_br(k: Gc[Node], nm: *mut names.Names) -> bool {
 // comments and for everything without a box.
 fn build_node(k: Gc[Node], styles: Gc[GcMap], parent_style: Gc[Style],
     nm: *mut names.Names, root: bool) -> AllocError!Gc[Box] {
+    return try build_node_in(k, styles, parent_style, nm, root, false)
+}
+
+fn build_node_in(k: Gc[Node], styles: Gc[GcMap], parent_style: Gc[Style],
+    nm: *mut names.Names, root: bool, flex_item: bool)
+-> AllocError!Gc[Box] {
     if k.kind == node.K_TEXT {
         let t: Gc[Text] = k as Gc[Text]
         let b = try box.box_new(box.BK_TEXT, parent_style, k)
@@ -131,7 +189,7 @@ fn build_node(k: Gc[Node], styles: Gc[GcMap], parent_style: Gc[Style],
         flt = cascade.FLOAT_NONE // `position: absolute` beats `float`
     }
     let out_of_flow: bool = abs || flt != cascade.FLOAT_NONE
-    let kind: u32 = box_kind_for(s, out_of_flow)
+    let kind: u32 = box_kind_in(s, out_of_flow, flex_item)
     let b = try box.box_new(kind, s, k)
     if abs {
         b.flags = b.flags | box.F_ABS
@@ -139,8 +197,19 @@ fn build_node(k: Gc[Node], styles: Gc[GcMap], parent_style: Gc[Style],
     if flt != cascade.FLOAT_NONE {
         b.flags = b.flags | box.F_FLOAT
     }
-    if bfc_for(s, kind, out_of_flow, root) {
+    if bfc_for(s, kind, out_of_flow, root, flex_item) {
         b.flags = b.flags | box.F_BFC
+    }
+    let disp: u32 = cascade.style_display(s)
+    if disp == cascade.D_FLEX || disp == cascade.D_INLINE_FLEX {
+        b.flags = b.flags | box.F_FLEX_BOX
+    }
+    if flex_item && !abs {
+        // Remembered because the PAINT ORDER needs it: a flex item with a
+        // `z-index` makes a stacking context although it is not
+        // positioned (css-flexbox-1, 4.3), and by the time the order is
+        // computed nobody can see any more whose child this box was.
+        b.flags = b.flags | box.F_FLEX_ITEM
     }
     if is_br(k, nm) {
         // `<br>` is not a box but a forced break. It is kept as an empty
@@ -157,8 +226,15 @@ fn build_node(k: Gc[Node], styles: Gc[GcMap], parent_style: Gc[Style],
 // building, because the answer decides whether anonymous blocks are
 // needed, and an anonymous block cannot be inserted afterwards without
 // moving what has already been built.
-fn has_block_children(k: Gc[Node], styles: Gc[GcMap], parent_style: Gc[Style])
--> bool {
+fn has_block_children(k: Gc[Node], styles: Gc[GcMap], parent_style: Gc[Style],
+    flex_parent: bool) -> bool {
+    if flex_parent {
+        // In a flex container EVERY child is block-level, and a run of
+        // text between two items becomes an anonymous flex item
+        // (css-flexbox-1, 4). Answering `true` here is what makes that
+        // anonymous box appear.
+        return true
+    }
     var c: Gc[Node] = k.first_child
     while c != gc_null[Node]() {
         if c.kind == node.K_ELEM {
@@ -169,7 +245,7 @@ fn has_block_children(k: Gc[Node], styles: Gc[GcMap], parent_style: Gc[Style])
                 pos == cascade.POS_FIXED
                 let flt: bool = cascade.style_float(s) != cascade.FLOAT_NONE
                 if !abs && !flt {
-                    let kind: u32 = box_kind_for(s, false)
+                    let kind: u32 = box_kind_in(s, false, flex_parent)
                     if box.is_block_level(kind) {
                         return true
                     }
@@ -184,15 +260,21 @@ fn has_block_children(k: Gc[Node], styles: Gc[GcMap], parent_style: Gc[Style])
 fn build_children(parent: Gc[Box], k: Gc[Node], styles: Gc[GcMap],
     parent_style: Gc[Style], nm: *mut names.Names)
 -> AllocError!bool {
-    let mixed: bool = has_block_children(k, styles, parent_style)
+    let flex_parent: bool = parent.kind == box.BK_FLEX ||
+    (parent.flags & box.F_FLEX_BOX) != 0 as u32
+    let mixed: bool = has_block_children(k, styles, parent_style, flex_parent)
     if mixed {
         parent.flags = parent.flags | box.F_HAS_BLOCKS
     }
     var anon: Gc[Box] = gc_null[Box]()
     var c: Gc[Node] = k.first_child
     while c != gc_null[Node]() {
-        let kid = try build_node(c, styles, parent_style, nm, false)
+        let kid = try build_node_in(c, styles, parent_style, nm, false,
+            flex_parent)
         if kid != gc_null[Box]() {
+            if depends_on_height(kid) {
+                parent.flags = parent.flags | box.F_H_DEPENDS
+            }
             let out_of_flow: bool =
             (kid.flags & (box.F_ABS | box.F_FLOAT)) != 0 as u32
             if !mixed {
