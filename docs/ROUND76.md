@@ -374,22 +374,42 @@ Worth writing down, because it was not obvious:
 
 ---
 
-### 4.6 The state of `test.sh` — and two failures that are not this round's
+### 4.6 The state of `test.sh` — and the two failures that are not this round's
 
-Full run on this machine, `./test.sh`: **1,169 checks**, and the three new
-sections (36, 37, 38) pass in every build stage. Three checks failed in that
-run, and none of them belongs to round 76 — which is a claim, so here is how
-each was checked:
+Full run on this machine, `./test.sh`: **1,169 checks, 2 failed**, and the
+three new sections (**36, 37, 38**) pass in **every** build stage —
+`release-fast`, `--no-opt` and `dev-fast`.
 
-| Failing section | Why | How that was established |
+Two checks fail. Neither belongs to round 76, and that is a claim, so each
+one was **reproduced on `main`**:
+
+| Section | Symptom | Established how |
 |---|---|---|
-| **24 formatter** | `lib/std/io.fi` has one blank line too many at line 705 | The file is **byte identical to `main`** (`md5sum` on both), and `main`'s **own** compiler-built `firnfmt -c` calls it unformatted too. Section 24 was red before this branch existed. **Fixed here** — one line. |
-| **23 layout** | `no Chromium found (set FIRN_CHROMIUM)` | An environment prerequisite, like `gdb` for section 25 and QEMU for section 22. There was no Chromium on this machine at all. **Fixed here** by installing one (`chromium 151.0.7922.137`). |
-| **34 round 66** | the promise endurance run `jobs` ended with `rc=-11` (SIGSEGV) after 5.6 s | Round 76 changed exactly one thing in the compiler (4.1). To settle whether that could reach the JavaScript engine, the **whole engine was translated with both compilers and the assembly compared**: `lib/js/run_main.fi`, ~9 MB of assembly, **byte identical** once the source path is normalised (the two worktrees have different directory names). A change that produces the same octets cannot cause a different crash. |
+| **34** round 66, JS | the promise endurance run `jobs` ends with `rc=-11` (SIGSEGV) | (a) round 76 changed exactly one thing in the compiler (4.1), so the **whole JavaScript engine was translated with both compilers and the assembly compared**: `lib/js/run_main.fi`, ~9 MB, **byte identical** once the source path is normalised (the two worktrees have different directory names). A change that emits the same octets cannot cause a different crash. (b) `bash tools/js/round66.sh --fast` **on `main`**: `jobs rc=-11 1.3s`, the same failure. |
+| **23** layout | `1082 of 1087 boxes equal to Chromium (0.46 % off)`, limit 1087 | `bash tools/layout/run.sh` **on `main`**: `1082 / 1087`, deviation 0.46 %, and the **same five cases** (`a4_abs_icb` 2 boxes, `a2_fixed_bottom_right`, `a3_fixed_percent`, `a7_sticky_bottom` 1 each). Round 76 touches nothing in `lib/layout` or `lib/css`. |
 
-The third one therefore stays open and belongs to whoever owns `lib/js`. It
-is written down here rather than quietly left out, and the measurement that
-exonerates round 76 is written down with it.
+Two other failures of the first run **were** fixed here, and both are
+inherited rather than caused:
+
+* **Section 24, the formatter.** `lib/std/io.fi` had one blank line too many
+  at line 705. The file is **byte identical to `main`** (`md5sum` on both)
+  and `main`'s own compiler-built `firnfmt -c` calls it unformatted too, so
+  section 24 was red before this branch existed. One line, fixed.
+* **Section 23 did not even run.** There was **no Chromium on this machine at
+  all** — an environment prerequisite like `gdb` for section 25 and QEMU for
+  section 22, and the check reported `0 / 0 boxes, deviation 100 %`. Chromium
+  151.0.7922.137 is installed now, so the section **runs** and reports a real
+  number for the first time on this machine. That number is 99.54 % against a
+  recorded limit of 100 %.
+
+**On those five boxes, honestly:** whether they are a regression in
+`lib/layout` or a change in Chromium is **not established here**. The limit
+1087 was recorded against the Chromium of the round that set it; 151 is newer
+than anything this repository has been measured against, and the four cases
+are absolute, fixed and sticky positioning — exactly where browsers have
+moved. Establishing it needs the old Chromium, and that is not round 76's
+job. What round 76 did was turn "cannot run" into "runs and disagrees by five
+boxes", which is strictly more information than the repository had before.
 
 ## 5. What is NOT proven
 
@@ -446,7 +466,7 @@ exonerates round 76 is written down with it.
 ## 7. Reproducing it
 
 ```sh
-bash test.sh                    # sections 36, 37, 38 among them
+bash test.sh                    # 1169 checks; sections 36, 37, 38 among them
 bash tools/net/run.sh           # nc, curl, 16 connections, throughput
 bash tools/nbt/run.sh           # bigtest.nbt octet for octet, Python cross-read
 MC_FAST=1 bash tools/mcserver/run.sh   # only the optimised stage, ~40 s
