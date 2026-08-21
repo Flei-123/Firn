@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# tools/layout/run.sh -- the layout path of round 61: box model, block
-# flow, inline flow, floats, positioning, flexbox.
+# tools/layout/run.sh -- the layout path of rounds 61 and 67: box model,
+# block flow, inline flow, floats, positioning with `fixed` and `sticky`,
+# the paint order with `z-index`, and the full flexbox.
 #
 #   0. build the measuring font (tools/layout/make_font.py)
 #   1. compile lib/layout/layout_main.fi in THREE build stages
@@ -10,6 +11,8 @@
 #      (tools/layout/cases/*.expected), text against text
 #   3. the CROSS-CHECK against Chromium: the same cases through a real
 #      browser, `getBoundingClientRect()` against `getBoundingClientRect()`
+#   3a. the PAINT ORDER against Chromium: who lies on top, asked with
+#      `document.elementFromPoint` (tools/layout/stack.py)
 #   4. the cross-check on the REAL pages of testdata/realweb/
 #   5. soak run with a counter check (tools/layout/gc_layout.sh)
 #   6. regression limits from tools/layout/minquota*.txt
@@ -96,6 +99,29 @@ else
     fi
 fi
 
+echo
+echo "== 3a. the paint order against Chromium (tools/layout/stack.py) =="
+# A layout can be proven with rectangles. A paint order cannot: no browser
+# has a `getPaintOrder()`. But `document.elementFromPoint(x, y)` answers
+# exactly the question the order decides -- which element is on top at
+# this point -- and that answer can be compared.
+STACK_RC=0
+python3 tools/layout/stack.py "$WORK/layout" \
+        --json "$WORK/stack.json" --show 5 | tee "$WORK/stack.txt" \
+        || STACK_RC=$?
+if [ ! -f "$WORK/stack.json" ]; then
+    echo "   NOT RUN: no Chromium found (set FIRN_CHROMIUM)."
+    ST_OK=0
+    ST_TOTAL=0
+else
+    ST_OK=$(python3 -c "import json;print(json.load(open('$WORK/stack.json'))['points_ok'])")
+    ST_TOTAL=$(python3 -c "import json;print(json.load(open('$WORK/stack.json'))['points_total'])")
+    if [ "$ST_OK" != "$ST_TOTAL" ]; then
+        echo "   FAILED: $ST_OK of $ST_TOTAL probe points equal to Chromium"
+        exit 1
+    fi
+fi
+
 if [ "$FAST" -eq 0 ]; then
     echo
     echo "== 4. cross-check on the REAL pages of testdata/realweb/ =="
@@ -121,10 +147,13 @@ echo
 echo "== 6. regression limits =="
 MIN_CASES=$(cat tools/layout/minquota_cases.txt)
 MIN_CHROME=$(cat tools/layout/minquota_chrome.txt)
+MIN_STACK=$(cat tools/layout/minquota_stack.txt)
 echo "   own cases:            $EXP_OK / $EXP_TOTAL boxes in $CASES cases   (limit: $MIN_CASES)"
 echo "   against Chromium:     $CH_OK / $CH_TOTAL boxes, deviation $CH_RATE %   (limit: $MIN_CHROME)"
-if [ "$EXP_OK" -lt "$MIN_CASES" ] || [ "$CH_OK" -lt "$MIN_CHROME" ]; then
+echo "   paint order:          $ST_OK / $ST_TOTAL probe points   (limit: $MIN_STACK)"
+if [ "$EXP_OK" -lt "$MIN_CASES" ] || [ "$CH_OK" -lt "$MIN_CHROME" ] ||
+   [ "$ST_OK" -lt "$MIN_STACK" ]; then
     echo "   FAILED: a quota has fallen below the recorded limit."
     exit 1
 fi
-echo "LAYOUT OK: $EXP_OK / $EXP_TOTAL own boxes, $CH_OK / $CH_TOTAL equal to Chromium (deviation $CH_RATE %)"
+echo "LAYOUT OK: $EXP_OK / $EXP_TOTAL own boxes, $CH_OK / $CH_TOTAL equal to Chromium (deviation $CH_RATE %), paint order $ST_OK / $ST_TOTAL"
