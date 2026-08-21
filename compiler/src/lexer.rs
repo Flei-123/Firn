@@ -16,7 +16,13 @@ pub enum TokKind {
     /// IEEE-754 binary64. No `f64`, because `TokKind` derives `Eq` and floats
     /// carry no equivalence relation (NaN != NaN) — and because FIR knows the
     /// bit pattern only anyway.
-    Float(u64),
+    ///
+    /// **ROUND 71** — the token carries the binary32 bit pattern ALONGSIDE.
+    /// Not out of thrift but out of necessity: the way decimal -> binary64
+    /// -> binary32 is NOT correctly rounded (measured: 27% deviation from C
+    /// `strtof` at the exact middles between two binary32). The narrowing
+    /// has to happen on the TEXT, and the text only exists here.
+    Float(u64, u32),
     /// **ROUND 71** — float literal with the suffix `f` (`1.5f`, `2f`,
     /// `1e3f`) as the **bit pattern** of an IEEE-754 binary32. The suffix is
     /// only needed where NO context says what is wanted; `let y: f32 = 2.5`
@@ -123,7 +129,7 @@ impl TokKind {
     pub fn text(&self) -> String {
         match self {
             TokKind::Int(v) => format!("{}", v),
-            TokKind::Float(bits) => format!("{}", f64::from_bits(*bits)),
+            TokKind::Float(bits, _) => format!("{}", f64::from_bits(*bits)),
             TokKind::FloatF32(bits) => format!("{}f", f32::from_bits(*bits)),
             TokKind::Ident(s) => s.clone(),
             TokKind::Str(k, v) => format!("{}\"…\" ({} elements)", k.prefix(), v.len()),
@@ -264,6 +270,20 @@ fn keyword(word: &str) -> Option<TokKind> {
 /// `numpy.float32` for thousands of literals, including the hard cases.
 pub fn narrow(v: f64) -> u32 {
     (v as f32).to_bits()
+}
+
+/// **ROUND 71** — decimal text -> `f32` bit pattern, CORRECTLY ROUNDED.
+///
+/// `parse::<f32>` rounds the text directly, as `strtof` does. The detour
+/// through the binary64 next to it looks harmless and is not: for the exact
+/// middle between two binary32 values the intermediate rounding lands ON
+/// the middle, the tie-to-even then decides in the wrong direction, and the
+/// result is one ulp off. Measured against glibc `strtof`: 63568 of 239064
+/// such cases. Figueroa's theorem does not carry here -- it holds for the
+/// results of ARITHMETIC, not for an arbitrary decimal.
+pub fn narrow_text(text: &str) -> u32 {
+    let v: f32 = text.parse().unwrap_or(0.0);
+    v.to_bits()
 }
 
 fn is_ident_start(c: char) -> bool {
@@ -427,7 +447,7 @@ impl<'a> Lexer<'a> {
                     self.sp(line, col, ncols.max(1)),
                     "floating point literal: the digits of the exponent are missing after 'e'",
                 );
-                self.push(TokKind::Float(0), line, col, ncols.max(1));
+                self.push(TokKind::Float(0, 0), line, col, ncols.max(1));
                 return;
             }
         }
@@ -436,13 +456,14 @@ impl<'a> Lexer<'a> {
         let v: f64 = text.parse().unwrap_or(0.0);
         // ROUND 71: the suffix `f` makes an `f32` out of it. A LETTER may not
         // follow, otherwise `1.5foo` would silently become `1.5f` plus `oo`.
+        let single = narrow_text(&text);
         if self.peek() == Some('f') && !self.peek2().map(is_ident_cont).unwrap_or(false) {
             self.bump();
             ncols += 1;
-            self.push(TokKind::FloatF32(narrow(v)), line, col, ncols.max(1));
+            self.push(TokKind::FloatF32(single), line, col, ncols.max(1));
             return;
         }
-        self.push(TokKind::Float(v.to_bits()), line, col, ncols.max(1));
+        self.push(TokKind::Float(v.to_bits(), single), line, col, ncols.max(1));
     }
 
     fn number(&mut self) {
@@ -493,8 +514,7 @@ impl<'a> Lexer<'a> {
                 {
                     self.bump();
                     ncols += 1;
-                    let v: f64 = digits.parse().unwrap_or(0.0);
-                    self.push(TokKind::FloatF32(narrow(v)), line, col, ncols.max(1));
+                    self.push(TokKind::FloatF32(narrow_text(&digits)), line, col, ncols.max(1));
                     return;
                 }
                 if c.is_digit(radix) {

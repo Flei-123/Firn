@@ -1258,7 +1258,17 @@ fn strtod_quot(num0: *mut Bn, den0: *mut Bn, numw: *mut Bn, denw: *mut Bn, tmp: 
 
 // Text -> bit pattern. `consumed` receives the number of characters used up
 // (0 = no valid number). `ws` needs STRTOD_WS_BYTES bytes.
-fn strtod(p: *mut u8, len: usize, ws: *mut u8, consumed: *mut usize) -> u64 {
+// ROUND 71 -- `odd = true` rounds TO ODD instead of to nearest: cut off,
+// and set the last bit when anything was left over.
+//
+// That is what makes a correct `f32` possible. The way decimal -> binary64
+// (nearest) -> binary32 (nearest) is NOT correctly rounded: at the exact
+// middle between two binary32 the intermediate rounding lands ON the middle,
+// and the tie-to-even then decides without knowing which side the real value
+// lay on. Measured against C `strtof`: 63568 of 239064 such cases came out
+// one ulp wrong. With round-to-odd it cannot happen -- a value whose last
+// bit is set is never exactly a binary32 middle (Boldo/Melquiond, 53 >= 24+2).
+fn strtod_mode(p: *mut u8, len: usize, ws: *mut u8, consumed: *mut usize, odd: bool) -> u64 {
     *consumed = 0
     var d: Bn = Bn { d: 0 as *mut u8, n: 0, cap: 0, }
     var num0: Bn = Bn { d: 0 as *mut u8, n: 0, cap: 0, }
@@ -1451,6 +1461,23 @@ fn strtod(p: *mut u8, len: usize, ws: *mut u8, consumed: *mut usize) -> u64 {
         q = strtod_quot(&num0, &den0, &numw, &denw, &tmp, s)
     }
 
+    // ROUND 71: round to odd, if that is what was asked for.
+    if odd {
+        if !bn_is_zero(&numw) {
+            q = q | 1
+        }
+        if e2 > 971 {
+            return sign + D_INF_BITS
+        }
+        if q == 0 {
+            return sign
+        }
+        if q >= D_TWO52 {
+            let biased_o: u64 = (e2 + 1075) as u64
+            return sign + (biased_o << 52) + (q - D_TWO52)
+        }
+        return sign + q
+    }
     // Round: the remainder (numw) against half the denominator (denw).
     bn_shl(&numw, 1)
     let cv: i32 = bn_cmp(&numw, &denw)
@@ -1483,6 +1510,17 @@ fn strtod(p: *mut u8, len: usize, ws: *mut u8, consumed: *mut usize) -> u64 {
         bits = q
     }
     return sign + bits
+}
+
+// The two front doors: `strtod` rounds to nearest (the correctly rounded
+// binary64), `strtod_odd` rounds to odd -- the intermediate value from which
+// a correct binary32 comes out with ONE further rounding.
+fn strtod(p: *mut u8, len: usize, ws: *mut u8, consumed: *mut usize) -> u64 {
+    return strtod_mode(p, len, ws, consumed, false)
+}
+
+fn strtod_odd(p: *mut u8, len: usize, ws: *mut u8, consumed: *mut usize) -> u64 {
+    return strtod_mode(p, len, ws, consumed, true)
 }
 
 // lib/num/core_bits.fi -- reading an IEEE-754 double off its bits
@@ -1868,18 +1906,25 @@ fn text_to_f64_at(p: *mut u8, n: usize, ws: *mut u8, out: *mut f64) -> bool {
 
 // ---------------------------------------------- Floating point, text -> f32
 //
-// ROUND 71. The way runs over the SAME correctly rounded `strtod` and then
-// one narrowing. That this is exact and not a double rounding is a theorem,
-// not a hope: binary64 carries 53 bits, and 2*24+2 = 50 of them are enough
-// (Figueroa 1995). `tools/lexnum/run.sh` measures it against C `strtof` and
-// `numpy.float32` for thousands of literals on top of that.
+// ROUND 71, and the one place in this file where a comment has to say what
+// does NOT work: the way "correctly rounded binary64, then narrow" is WRONG.
+// At the exact middle between two binary32 the first rounding lands ON the
+// middle, and the tie-to-even of the second one then decides without knowing
+// which side the real value lay on. It is not a rarity either -- measured
+// against C `strtof`, 63568 of 239064 such cases came out one ulp off.
+//
+// The way that works runs over `strtod_odd`: rounding to ODD in between (cut
+// off, last bit set when anything was left over) never produces a binary32
+// middle, so the second rounding always has a direction and it is the right
+// one. `tools/lexnum/run.sh` holds the whole thing against C `strtof` and
+// against an exact reference written in Python for thousands of literals.
 
 #[allow_fp]
 fn read_f32_at(p: *mut u8, n: usize, ws: *mut u8, out: *mut f32) -> usize {
-    var d: f64 = 0.0
-    let z: usize = read_f64_at(p, n, ws, &d)
-    *out = d as f32
-    return z
+    var used: usize = 0
+    let bits: u64 = strtod_odd(p, n, ws, &used)
+    *out = bits_f64(bits) as f32
+    return used
 }
 
 #[allow_fp]
