@@ -767,10 +767,13 @@ fn visit_calls(ck: &mut Checker, b: &crate::ast::Block, names: &[String]) {
     for s in &b.stmts {
         match s {
             Stmt::Let { init, .. } => visit_expr(ck, init, names),
-            Stmt::Assign { target, value, .. } => {
+            Stmt::Assign { target, value, .. }
+            | Stmt::AssignOp { target, value, .. } => {
                 visit_expr(ck, target, names);
                 visit_expr(ck, value, names);
             }
+            // ROUND 70: the step has no value expression.
+            Stmt::Step { target, .. } => visit_expr(ck, target, names),
             Stmt::If { cond, then, els, .. } => {
                 visit_expr(ck, cond, names);
                 visit_calls(ck, then, names);

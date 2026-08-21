@@ -280,10 +280,13 @@ impl Guard<'_> {
                 }
                 self.expr(init);
             }
-            Stmt::Assign { target, value, .. } => {
+            Stmt::Assign { target, value, .. }
+            | Stmt::AssignOp { target, value, .. } => {
                 self.expr(target);
                 self.expr(value);
             }
+            // ROUND 70: the step has no value expression.
+            Stmt::Step { target, .. } => self.expr(target),
             Stmt::If { cond, then, els, .. } => {
                 self.expr(cond);
                 self.block(then);

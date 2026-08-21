@@ -813,6 +813,60 @@ impl<'a> Checker<'a> {
                     );
                 }
             }
+            // ROUND 70: `x op= e` - the same lvalue check as an ordinary
+            // assignment, and afterwards EXACTLY the rules of `x = x op e`
+            // (`binop_type`). `let` stays immutable.
+            Stmt::AssignOp { target, op, value, span } => {
+                let (ty, mutability) = match self.lvalue(target) {
+                    Some(x) => x,
+                    None => {
+                        self.expr(value, Some(&Type::I64));
+                        return;
+                    }
+                };
+                if let Mutability::Fixed(reason) = mutability {
+                    self.dg.error_note(*span, reason, "use 'var' instead of 'let'");
+                }
+                // The right side gets the type of the left one as its hint -
+                // exactly what `binary` would give it (`probe(l)`).
+                let rt = self.expr(value, Some(&ty));
+                if ty.is_error() || rt.is_error() {
+                    return;
+                }
+                let got = self.binop_type(*op, &ty, &rt, *span);
+                if !assignable(&got, &ty) {
+                    self.dg.error(
+                        value.span,
+                        format!(
+                            "assignment expects type {}, found {}",
+                            self.tcx.name_of(&ty),
+                            self.tcx.name_of(&got)
+                        ),
+                    );
+                }
+            }
+            // ROUND 70: `x++` / `x--`. It is exactly `x = x + 1`, so it
+            // works on the types on which `x + 1` works - the integers.
+            Stmt::Step { target, up, span } => {
+                let (ty, mutability) = match self.lvalue(target) {
+                    Some(x) => x,
+                    None => return,
+                };
+                if let Mutability::Fixed(reason) = mutability {
+                    self.dg.error_note(*span, reason, "use 'var' instead of 'let'");
+                }
+                if !ty.is_error() && !ty.is_concrete_int() {
+                    self.dg.error_note(
+                        *span,
+                        format!(
+                            "'{}' expects an integer type, found {}",
+                            if *up { "++" } else { "--" },
+                            self.tcx.name_of(&ty)
+                        ),
+                        "'x++' is exactly 'x = x + 1', and that needs an integer type",
+                    );
+                }
+            }
             Stmt::If { cond, then, els, .. } => {
                 self.check_cond(cond, "if");
                 self.check_block(then, false);
@@ -1560,19 +1614,7 @@ impl<'a> Checker<'a> {
             if lt.is_error() || rt.is_error() {
                 return if lt.is_error() { Type::Error } else { lt };
             }
-            if !lt.is_concrete_int() || !rt.is_concrete_int() {
-                self.dg.error(
-                    e.span,
-                    format!(
-                        "operator '{}' expects integer types, found {} and {}",
-                        op.text(),
-                        self.tcx.name_of(&lt),
-                        self.tcx.name_of(&rt)
-                    ),
-                );
-                return Type::Error;
-            }
-            return lt;
+            return self.binop_type(op, &lt, &rt, e.span);
         }
         // Arithmetic and bit operations: the same integer type on both sides
         // The type of an operand that is already typed takes precedence over the
@@ -1587,10 +1629,39 @@ impl<'a> Checker<'a> {
         if lt.is_error() || rt.is_error() {
             return Type::Error;
         }
+        self.binop_type(op, &lt, &rt, e.span)
+    }
+
+    /// **ROUND 70** - the type rules of `a op b` with both operand types
+    /// already known.
+    ///
+    /// `binary` computes with it, and so does the compound assignment
+    /// (`x op= e`). That is the point: `x += e` has to mean EXACTLY
+    /// `x = x + e`, down to the wording of the message - and it does,
+    /// because there is only ONE place where the rules stand.
+    pub(crate) fn binop_type(&mut self, op: BinOp, lt: &Type, rt: &Type, span: Span) -> Type {
+        let lt = lt.clone();
+        let rt = rt.clone();
+        if matches!(op, BinOp::Shl | BinOp::Shr) {
+            if !lt.is_concrete_int() || !rt.is_concrete_int() {
+                self.dg.error(
+                    span,
+                    format!(
+                        "operator '{}' expects integer types, found {} and {}",
+                        op.text(),
+                        self.tcx.name_of(&lt),
+                        self.tcx.name_of(&rt)
+                    ),
+                );
+                return Type::Error;
+            }
+            return lt;
+        }
         // HOOK str: `+` concatenates (strtype.rs, round 70)
-        if let Some(t) = crate::strtype::hook_binary(self, op, &lt, &rt, e.span) {
+        if let Some(t) = crate::strtype::hook_binary(self, op, &lt, &rt, span) {
             return t;
         }
+        let e = SpanHolder { span };
         // FLOATING POINT: `+ - * /` are allowed, `%` and the bit operations are
         // not. `%` would be `fmod` and needs a library function; the bit
         // operations would have no sensible meaning on a bit pattern (anyone
@@ -2287,6 +2358,12 @@ impl<'a> Checker<'a> {
             _ => nope("a constant expression must be evaluable at compile time (only literals, constants, operators and calls)"),
         }
     }
+}
+
+/// Round 70: only so that the body of `binop_type`, which was moved over
+/// from `binary`, can keep writing `e.span`.
+struct SpanHolder {
+    span: Span,
 }
 
 fn bit(b: bool) -> i128 {

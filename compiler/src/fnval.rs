@@ -389,10 +389,12 @@ fn walk_stmt(s: &crate::ast::Stmt, out: &mut Vec<LambdaDecl>) {
     use crate::ast::Stmt;
     match s {
         Stmt::Let { init, .. } => walk_expr(init, out),
-        Stmt::Assign { target, value, .. } => {
+        Stmt::Assign { target, value, .. } | Stmt::AssignOp { target, value, .. } => {
             walk_expr(target, out);
             walk_expr(value, out);
         }
+        // ROUND 70: the step has no value expression.
+        Stmt::Step { target, .. } => walk_expr(target, out),
         Stmt::If { cond, then, els, .. } => {
             walk_expr(cond, out);
             walk_block(then, out);
