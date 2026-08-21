@@ -1,4 +1,9 @@
-// tools/mcserver/nmp_client.js -- a THIRD implementation of the client.
+// tools/mcserver/nmp_client.cjs -- a THIRD implementation of the client.
+//
+// The extension is `.cjs` and not `.js` on purpose: a `package.json` with
+// `"type": "module"` ANYWHERE above this directory would otherwise turn the
+// file into an ES module and `require` would stop existing. `.cjs` says
+// CommonJS regardless of what stands above.
 //
 // `tools/mcserver/harness.py` and the server share an author, and that is a
 // weakness of every self written test: two sides can be wrong in the same
@@ -13,7 +18,7 @@
 // and `position` carries the Synchronize Player Position that ends the
 // loading screen.
 //
-//     node nmp_client.js <host> <port> <name>
+//     node nmp_client.cjs <host> <port> <name>
 //
 // exit 0 = the client is in the world, everything else is a failure.
 const mc = require('minecraft-protocol')
