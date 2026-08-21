@@ -116,7 +116,7 @@ the profile for the whole compilation unit.
 
 | Property | `kernel` | `app` |
 |---|---|---|
-| Heap allocation | only through an explicitly passed `Allocator` | a global allocator is available |
+| Heap allocation | only through an explicitly passed `Allocator` (built in round 73, `lib/mem/core_alloc.fi`) | a global allocator is available |
 | Hidden allocation | forbidden (compile error) | forbidden (the same rule) |
 | `Rc[T]` (counted, acyclic) | not available | available, explicit |
 | **`Gc[T]` (tracing collector)** | **not available** | available, **opt-in per type** (3.5) |
@@ -125,6 +125,51 @@ the profile for the whole compilation unit.
 | Floating point | only with `#[allow_fp]` (the FPU state!) | free |
 | Stack depth checkable (`#[max_stack]`) | yes | yes |
 | Target binary format | ELF object, freestanding | ELF executable |
+
+### 2.1 The standard library under `kernel` (round 73)
+
+Up to round 72 EVERY `import std.*` was rejected in the kernel profile. That
+was right in intent and too coarse in effect: `Span::trim`, `find`,
+`compare`, the UTF-8 reader, `text_to_i64`, `digit_count` and the whole of
+`math` ask nobody for memory and make no system call. They fell under the
+ban only because they stood in the same FILE as the functions that call
+`mmap`.
+
+**The rule since round 73:** a module of the standard library may be
+imported under `profile kernel` if it **declares `profile kernel` in its
+own first line**. Everything else stays forbidden, with the message
+unchanged.
+
+That is not a name list in the compiler, and it is not taken on trust.
+Firn compiles whole programs (12): an imported module lands in the **same
+compilation unit** as the kernel that imports it, so every rule of this
+section is checked on it as well -- a `syscall` hidden in such a module is
+an error at the line where it stands, and so are `gc class`, `#[unwinds]`
+and unmarked floating point. Whoever writes a new freestanding module needs
+no compiler change; he writes one line and the compiler proves the rest.
+
+The library was cut along that line in round 73:
+
+| module | needs | kernel |
+|---|---|---|
+| `std.core` | nothing | **yes** -- `Span` and the whole reading text layer, `text_to_*`, `digit_count`, the UTF-8 reader, the `Allocator` interface, `Arena` |
+| `std.math` | nothing | **yes** |
+| `std.str`, `std.num` | an allocator (`Bytes`, `Str16`, `Atom`) | no |
+| `std.vec`, `std.map`, `std.rc`, `std.mem` | an allocator (`mmap`) | no |
+| `std.io`, `std.rt` | an operating system (`SYS_WRITE`, `SYS_READ`) | no |
+
+`std.str`, `std.num` and `std.math` keep answering to every name they
+answered to before: the pieces are include files (`lib/str/core_*.fi`,
+`lib/num/core_*.fi`, `lib/math/core_math.fi`) and are put together into
+both modules textually -- one source text, two front doors. The honest
+price of a stage 0 without type aliases (14): whoever imports `std.core`
+and `std.str` into one program gets `core.Span` and `str.Span` as two
+distinct types of the same shape.
+
+Proof: `demos/kernel/kcore.fi` says `import std.core`, compiles in the
+kernel profile to a freestanding ELF object without an undefined name and
+without a `syscall` instruction, and boots in QEMU
+(`tools/core/run.sh`, test.sh section 30).
 
 The browser runs in the `app` profile. The rasterizer, the tokenizer and the
 crypto library run in the `app` profile as well, but use **no** GC types and are
@@ -1071,6 +1116,18 @@ specification and the code do not drift apart.
    `demos/kernel/core.fi` boots in QEMU, with **both** compilers
    (`tools/freestanding/run.sh`). In the app profile everything stays as before:
    a freestanding binary with `_start` and without libc.
+   **Round 73** made the import rule precise (2.1): a `std` module that
+   declares `profile kernel` itself is admitted, the rest stays forbidden.
+   And the `Allocator` that this section has promised since round 52 now
+   exists -- an interface with `alloc`/`free`/`grow`, an alignment and a
+   failure case that is a VALUE (`Block { p, n, ok }`), with two
+   implementations: `core.Arena` (a bump allocator over foreign memory, no
+   system call) and `mem.PageAllocator` (`mmap`). It is passed as an
+   ordinary parameter -- `str.join(alloc, parts, ", ")` against
+   `span.find(part)` -- so that at the call site you can see what costs
+   memory. Proof: `tests/1402`, `tests/1403`, `demos/kernel/kcore.fi` and
+   the soak run in `tools/core/run.sh` (240 000 requests, exactly ONE
+   system call, RSS flat, with a leaking counter-check).
 7. **`extern fn`** is recognized syntactically, but rejected with a clear error.
 8. **The return value of the program.** `fn main() -> i32`; `_start` calls
    `main` and passes the result to `exit` (exit code = value & 0xFF).
