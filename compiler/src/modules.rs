@@ -746,10 +746,13 @@ impl<'a, 'b> Renamer<'a, 'b> {
                 self.expr(init);
                 self.declare(name);
             }
-            Stmt::Assign { target, value, .. } => {
+            Stmt::Assign { target, value, .. }
+            | Stmt::AssignOp { target, value, .. } => {
                 self.expr(target);
                 self.expr(value);
             }
+            // ROUND 70: the step has no value expression.
+            Stmt::Step { target, .. } => self.expr(target),
             Stmt::If { cond, then, els, .. } => {
                 self.expr(cond);
                 self.block(then);
@@ -784,6 +787,8 @@ impl<'a, 'b> Renamer<'a, 'b> {
         let span = e.span;
         match &mut e.kind {
             ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) => {}
+            // ROUND 70: the text literal carries its array literal inside.
+            ExprKind::Text(_, inner) => self.expr(inner),
             // Round 58: the closure body is resolved INSIDE the enclosing
             // function — only that way does a captured name stay a local one
             // instead of being qualified into a module name.

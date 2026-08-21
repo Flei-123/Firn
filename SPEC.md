@@ -532,6 +532,61 @@ Unicode tables from the UCD, CLDR data.
 `FIRN-ANFORDERUNGEN.md` 3 calls this "underestimated, but critical". Rightly so:
 the string type runs through every module and cannot be changed afterwards.
 
+### 8.0 `str` -- the language type (round 70)
+
+Everything from 8.1 on describes the LIBRARY types. Above them sits **one**
+type that the language itself knows:
+
+```firn
+let text: str = "hello"          // the literal IS a str
+if text == "quit" { ... }        // == compares the CONTENT
+let greeting: str = text + "!"   // + concatenates
+```
+
+* **What a `str` is:** two machine words, `p: *mut u8` and `n: usize` --
+  exactly the layout of `str.Span`. A `str` is a VIEW of octets that nobody
+  may change any more.
+* **Immutable.** There is no operation that writes into the octets behind a
+  `str`. Whoever wants to build text takes `Bytes`.
+* **Substrings cost nothing.** `s.trim()`, `s.part(a, b)`, `s.ab(k)` move two
+  words; the octets stay where they are. No copy.
+* **`str` and `Span` may be used for each other** -- same two words, same ABI.
+  That is why the whole library of 8.1 works on a `str` without a conversion
+  function: `s.trim()`, `s.length()`, `s.starts_with(...)`, `s.find(...)`.
+* **Who owns the octets:**
+
+  | origin | storage | freed by |
+  |---|---|---|
+  | literal `"hello"` | the frame of the enclosing function | the frame |
+  | `a + b` | the **GC heap** | the collector |
+  | out of a `Span`/`Bytes` | wherever the buffer lies | its owner |
+
+  Nothing is copied silently. The ONLY places where octets are copied are
+  `a + b` and `__str_copy` (which `io.read_line` uses so that a line survives
+  its buffer).
+* **`+` allocates and therefore needs the collector.** A program that works
+  with `str` pulls the collector runtime in automatically; the signal is read
+  off the tokens -- the type name `str`, or a text literal next to `+`, `==`,
+  `!=`. Before the first concatenation `gc_init()` has to have run, exactly
+  like for every other allocation (3.5).
+
+#### The literal -- and why nothing breaks
+
+A text literal is **decided by the context**:
+
+* where an **array type** is wanted, it is the array literal it has been since
+  round 39: `var t: [u8; 20] = "...\0"` keeps working unchanged, including the
+  null octet, the exact length and the message on a length mismatch;
+* **everywhere else** it is a `str`.
+
+That cannot change the meaning of any existing program: a text literal WITHOUT
+an array context is an error today ("the type of the array literal cannot be
+inferred"). `b"..."` and `u"..."` stay array literals -- `str` holds octets,
+and a sequence of `u16` is not that.
+
+`""` is a valid, EMPTY `str` (`p = 0`, `n = 0`); as an array literal it stays
+an error, because an array needs at least one element.
+
 ### 8.1 Four separate types
 
 | Type | Contents | Well formed? | For what |
@@ -806,6 +861,44 @@ fn main() -> i32 {
 without backtracking. Semicolons are optional. Visibility through an `export`
 list per module, not on the individual element.
 
+### 12.7 Compound assignment and the step operators (round 70)
+
+```firn
+x += 5      x -= 5      x *= 5      x /= 5      x %= 5
+x &= m      x |= m      x ^= m      x <<= 3     x >>= 3
+x++         x--
+```
+
+**`x op= e` is EXACTLY `x = x op e`** -- the same type rules, the same
+message on a mismatch, the same instruction and therefore the same overflow
+behaviour (checking in `--debug`, wrapping in `--release-fast`, 13). It is
+not a second kind of arithmetic; it is a shorter way of writing the same
+one. In the compiler both go through the very same check
+(`sema::binop_type`), so that they cannot drift apart.
+
+**The left side is evaluated ONCE.** `a[f()] += 1` calls `f()` exactly once.
+That is a guarantee of the language, not a property of the optimizer: the
+compound assignment is its own statement, and the lowering computes the
+address of the target once and then loads, computes and stores through it. A
+rewrite into `a[f()] = a[f()] + 1` in the parser would be the classic
+mistake here; `tests/1338_assign_op_once.fi` counts the calls and checks the
+counting itself with the written out form as a counter-check.
+
+**`++` and `--` are STATEMENTS, never expressions.** `y = x++` does not
+exist here, and neither does `a[i++]`. The reason is not taste:
+
+* the difference between prefix and postfix inside an expression is one of
+  the most productive sources of error in C -- `*p++` and `(*p)++` mean
+  different things, and readers get it wrong;
+* in C++ the ORDER OF EVALUATION around it is even undefined: `i = i++ + 1`
+  has no defined meaning, and `f(i++, i++)` may compute anything.
+
+As a pure statement on a line of its own the meaning is unambiguous, and
+nothing is lost: whoever wants the old value writes it down.
+
+`let` stays immutable. `x += 1` on a `let` binding runs into exactly the
+same wall as `x = x + 1`, with the same message.
+
 ### 12.1 The grammar of the v0 subset (EBNF)
 
 This is the grammar that `firnc0` **really** implements. The extensions from
@@ -893,8 +986,45 @@ brackets a line break has never ended anything and still does not. Proof:
 ## 13. Numbers, layout, ABI
 
 * Integer types with the width written out: `i8...i64`, `u8...u64`,
-  `u128`/`i128` (9.3), `usize`, `isize`. **No** `int`. Literals are typeless
-  until they are used and have to be unambiguously inferable.
+  `u128`/`i128` (9.3), `usize`, `isize`.
+* **The second spelling (round 70).** Since round 70 the same types have a
+  second, C#-flavoured name. It is an **alias, not a new type**: `int` and
+  `i32` are THE SAME type and pass into each other without a cast, and
+  `impl Ord for int` creates the very same method as `impl Ord for i32`.
+
+  | second spelling | canonical | | second spelling | canonical |
+  |---|---|---|---|---|
+  | `sbyte` | `i8` | | `byte` | `u8` |
+  | `short` | `i16` | | `ushort` | `u16` |
+  | `int` | `i32` | | `uint` | `u32` |
+  | `long` | `i64` | | `ulong` | `u64` |
+  | `double` | `f64` | | | |
+
+  The canonical form inside this repository stays `i32`/`i64`/`u8`; error
+  messages name it too.
+
+  Two promises belong to that, and they are promises on purpose:
+
+  * **`int` is ALWAYS 32 bits, `long` ALWAYS 64 -- on every platform.** In
+    C/C++ `long` is 32 bits on Windows and 64 on Linux; the same source text
+    computes differently depending on where it is translated, and that has
+    cost decades of portability bugs. That is exactly the reason why Firn
+    writes `i32`/`i64` in the first place. The second spelling inherits the
+    fixed width; it does not inherit the ambiguity.
+  * **`byte` is UNSIGNED (0..255), `sbyte` is `i8`.** A byte is a storage
+    unit -- an octet --, not a number one calculates with; the natural range
+    of an octet is 0..255. C#, Go, Rust and Zig all see it that way. Java's
+    signed `byte` is the outlier and it did not come out of a decision but out
+    of a lack: Java has no unsigned types at all. The stock of this project
+    says the same thing: `u8` occurs 6992 times, `i8` 13 times.
+
+  **`float` is deliberately NOT given out.** `f32` arrives in round 71; only
+  then does `float` mean something that can be kept.
+* **Literals are typeless until they are used.** Where the context says
+  something, that holds (`let y: i64 = 5`). Where nothing at all says
+  anything, `i32` holds -- the default type since round 70, as in C#, Java and
+  Go. The overflow check is unaffected: `let x = 5000000000` is an error,
+  because 5000000000 does not fit into an `i32`.
 * **Overflow semantics stated explicitly (`L9`):** `+` checks in `--debug` and
   wraps in `--release-fast` (defined, **not** undefined -- deliberately
   different from C). In addition there are explicit operators: `+%` wrapping,

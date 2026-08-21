@@ -164,6 +164,11 @@ fn impl_decl(p: &mut Parser, prog: &mut Program, is_for: bool) {
     } else {
         (first.clone(), esp)
     };
+    // ROUND 70: `impl Ord for int` is `impl Ord for i32`. The name is
+    // folded here, at the ONE place where it enters the function name --
+    // otherwise `int__less` and `i32__less` would both come into being and
+    // a receiver of type i32 would find only one of the two.
+    let ty = crate::types::canon_name(&ty).to_string();
     if is_for {
         crate::iface::remember_impl(first, ty.clone(), esp);
     }

@@ -751,6 +751,19 @@ impl<'a> Parser<'a> {
         if let Some(e) = crate::fnval::hook_primary(self) {
             return e;
         }
+        // ROUND 70: `++`/`--` inside an expression. Instead of a clueless
+        // "expected an expression" the message says what the language does
+        // and does not have.
+        if matches!(self.kind(), TokKind::PlusPlus | TokKind::MinusMinus) {
+            let word = self.kind().text();
+            let sp = self.bump();
+            self.dg.error_note(
+                sp,
+                format!("'{}' is a statement, not an expression", word),
+                "write it on a line of its own; there is no 'y = x++' here, because prefix and postfix inside an expression are a source of error",
+            );
+            return self.broken_expr(sp);
+        }
         match self.kind().clone() {
             TokKind::Int(v) => {
                 let sp = self.bump();
@@ -778,6 +791,7 @@ impl<'a> Parser<'a> {
             TokKind::Str(_, val) => {
                 let sp = self.bump();
                 let mut elems: Vec<Expr> = Vec::new();
+                let mut wide = false;
                 match val {
                     crate::strings::LitValue::Octets(v) => {
                         for b in v {
@@ -785,20 +799,18 @@ impl<'a> Parser<'a> {
                         }
                     }
                     crate::strings::LitValue::Units(v) => {
+                        wide = true;
                         for u in v {
                             elems.push(self.mk(sp, ExprKind::Int(u as i128)));
                         }
                     }
                 }
-                if elems.is_empty() {
-                    self.dg.error_note(
-                        sp,
-                        "empty string literal".to_string(),
-                        "an array needs at least one element; write an array of the desired length, e.g. '[0 as u8; 8]'",
-                    );
-                    return self.broken_expr(sp);
-                }
-                self.mk(sp, ExprKind::ArrayLit(elems))
+                // ROUND 70: the empty literal is no longer an error HERE —
+                // `""` is a valid, empty `str`. Where an array is wanted the
+                // same message comes from the type check, which is the only
+                // place that knows the context (strtype.rs::check_text).
+                let lit = self.mk(sp, ExprKind::ArrayLit(elems));
+                self.mk(sp, ExprKind::Text(wide, Box::new(lit)))
             }
             TokKind::KwTrue => {
                 let sp = self.bump();
@@ -988,6 +1000,22 @@ impl<'a> Parser<'a> {
         if got || self.at(&TokKind::RBrace) || self.at_eof() || self.at_line_start() {
             return;
         }
+        // ROUND 70: `let y = x++`. The statement is over, and a `++` follows
+        // - that is the postfix form inside an expression, and it does not
+        // exist here. The message says so instead of only complaining about
+        // the missing end of line.
+        if matches!(self.kind(), TokKind::PlusPlus | TokKind::MinusMinus) {
+            let word = self.kind().text();
+            let sp = self.span();
+            self.dg.error_note(
+                sp,
+                format!("'{}' is a statement, not an expression", word),
+                "write it on a line of its own; there is no 'y = x++' here, because prefix and postfix inside an expression are a source of error",
+            );
+            self.recovering = false;
+            self.sync_stmt();
+            return;
+        }
         self.error_here(format!(
             "expected ';' or an end of line after the statement, found '{}'",
             self.kind().text()
@@ -1049,6 +1077,27 @@ impl<'a> Parser<'a> {
             }
             _ => {
                 let e = self.expr();
+                // ROUND 70: `x += e` and `x++`. Both are STATEMENTS - the
+                // parser sees them only here, and that is exactly why there
+                // is no `y = x++`.
+                if let Some(op) = compound_op(self.kind()) {
+                    if !self.recovering {
+                        self.bump();
+                        let v = self.expr();
+                        let sp = Parser::join(start, v.span);
+                        self.end_stmt();
+                        return Stmt::AssignOp { target: e, op, value: v, span: sp };
+                    }
+                }
+                if matches!(self.kind(), TokKind::PlusPlus | TokKind::MinusMinus)
+                    && !self.recovering
+                {
+                    let up = matches!(self.kind(), TokKind::PlusPlus);
+                    let end = self.bump();
+                    let sp = Parser::join(start, end);
+                    self.end_stmt();
+                    return Stmt::Step { target: e, up, span: sp };
+                }
                 if self.at(&TokKind::Assign) && !self.recovering {
                     self.bump();
                     let v = self.expr();
@@ -1670,6 +1719,8 @@ pub fn reset_hooks() {
     crate::iface::hook_reset();
     crate::fnval::hook_reset();
     crate::fnval::closure_reset();
+    // HOOK str: the builtin type of round 70 (strtype.rs)
+    crate::strtype::hook_reset();
 }
 
 /// Like `parse`, but for a file of the source map: `file` is its number,
@@ -1841,16 +1892,16 @@ impl<'a> Parser<'a> {
         let toks = crate::lexer::lex_file(&source, self.file, self.dg);
         let expr = in_expr(&toks, self.dg, self.file, &self.modules, &mut self.next_id);
         match expr {
-            Some(e) => {
-                let cast = self.mk(
-                    sp,
-                    ExprKind::Cast(Box::new(e), TypeExpr::Named("i64".to_string(), sp)),
-                );
-                self.mk(
-                    sp,
-                    ExprKind::Call("io.fmt_number".to_string(), vec![chain, cast], sp),
-                )
-            }
+            // ROUND 70 — NO `as i64` any more. Which builder step is right
+            // depends on the TYPE of the expression, and only the type check
+            // knows that. `io.fmt_value` is the placeholder the type check
+            // and the lowering both resolve — out of the same material
+            // (`strtype`/`sema::call`/`lower::lower_call`), so that they
+            // cannot drift apart.
+            Some(e) => self.mk(
+                sp,
+                ExprKind::Call("io.fmt_value".to_string(), vec![chain, e], sp),
+            ),
             None => chain,
         }
     }
@@ -1900,6 +1951,29 @@ fn in_expr(
         return None;
     }
     Some(e)
+}
+
+/// **ROUND 70** - which arithmetic operator does this compound assignment
+/// carry? `None` for every other token.
+///
+/// The table is the whole definition: `x op= e` is exactly `x = x op e`,
+/// with the same type rules and the same overflow behaviour, because both
+/// end up in the very same check (`sema::binop_type`) and in the very same
+/// FIR operation.
+fn compound_op(k: &TokKind) -> Option<BinOp> {
+    Some(match k {
+        TokKind::PlusEq => BinOp::Add,
+        TokKind::MinusEq => BinOp::Sub,
+        TokKind::StarEq => BinOp::Mul,
+        TokKind::SlashEq => BinOp::Div,
+        TokKind::PercentEq => BinOp::Rem,
+        TokKind::AmpEq => BinOp::And,
+        TokKind::PipeEq => BinOp::Or,
+        TokKind::CaretEq => BinOp::Xor,
+        TokKind::ShlEq => BinOp::Shl,
+        TokKind::ShrEq => BinOp::Shr,
+        _ => return None,
+    })
 }
 
 pub fn parse_module(toks: &[Token], dg: &mut Diags, file: u32, base_id: u32) -> Program {
@@ -1972,6 +2046,8 @@ mod tests {
             ExprKind::Float(bits) => format!("{}", f64::from_bits(*bits)),
             ExprKind::Bool(b) => format!("{}", b),
             ExprKind::Ident(n) => n.clone(),
+            // ROUND 70: the text literal carries its array literal inside.
+            ExprKind::Text(_, inner) => dump(inner),
             ExprKind::Lambda(d) => format!("fn#{}", d.id),
             ExprKind::Unary(op, a) => format!(
                 "({}{})",
