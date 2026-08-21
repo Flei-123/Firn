@@ -240,6 +240,7 @@ impl<'a> NoGcChecker<'a> {
 
     fn check_expr(&mut self, e: &Expr) {
         match &e.kind {
+            ExprKind::FloatF32(_) => {}
             // ROUND 70: the text literal carries its array literal inside.
             ExprKind::Text(_, inner) => self.check_expr(inner),
             // Round 58: `gc fn(…)` allocates — inside `#[no_gc]` that has to
@@ -295,7 +296,7 @@ impl<'a> NoGcChecker<'a> {
                 self.check_expr(v);
                 self.check_expr(n);
             }
-            ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Ident(_) => {}
+            ExprKind::Int(_) | ExprKind::Float(..) | ExprKind::Bool(_) | ExprKind::Ident(_) => {}
         }
     }
 

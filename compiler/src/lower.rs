@@ -35,6 +35,7 @@ pub(crate) fn scalar_fty_pub(t: &Type) -> Option<FTy> {
 fn scalar_fty(t: &Type) -> Option<FTy> {
     Some(match t {
         Type::F64 => FTy::F64,
+        Type::F32 => FTy::F32,
         Type::I8 => FTy::I8,
         Type::I16 => FTy::I16,
         Type::I32 => FTy::I32,
@@ -56,6 +57,17 @@ fn scalar_fty(t: &Type) -> Option<FTy> {
 
 fn is_agg(t: &Type) -> bool {
     matches!(t, Type::Array(..) | Type::Struct(_))
+}
+
+/// **ROUND 71** — the FIR type of ONE ABI eightbyte. `f64` is not the truth
+/// about the content (an SSE eightbyte can hold two `f32`), it is the truth
+/// about the REGISTER: everything the code generator needs to know is
+/// "integer register or xmm register", and it reads exactly that off here.
+fn word_fty(w: abi::Word) -> FTy {
+    match w {
+        abi::Word::Int => FTy::I64,
+        abi::Word::Sse => FTy::F64,
+    }
 }
 
 pub(crate) struct Local {
@@ -123,6 +135,28 @@ impl<'a> Lower<'a> {
         self.info.expr_ty(e.id).clone()
     }
 
+    /// **ROUND 71** — the type an expression HANDS OUT.
+    ///
+    /// That is its own type, except where the one implicit conversion
+    /// applies: an `f32` in a place that wants an `f64` hands out an `f64`
+    /// (`sema::expr`). `ty_of` deliberately keeps giving the OWN type --
+    /// the value is built at its own width first and only converted after.
+    /// Whoever asks what comes OUT asks here.
+    pub(crate) fn out_ty(&self, e: &Expr) -> Type {
+        if self.info.widen_f32.contains(&e.id) {
+            return Type::F64;
+        }
+        self.ty_of(e)
+    }
+
+    pub(crate) fn out_fty(&mut self, e: &Expr) -> Option<FTy> {
+        let t = self.out_ty(e);
+        match scalar_fty(&t) {
+            Some(f) => Some(f),
+            None => self.ice(e.span, "expression has no scalar type"),
+        }
+    }
+
     pub(crate) fn fty_of(&mut self, e: &Expr) -> Option<FTy> {
         let t = self.ty_of(e);
         match scalar_fty(&t) {
@@ -174,7 +208,13 @@ impl<'a> Lower<'a> {
     /// If the size is no multiple of 8, reading happens through a padded
     /// scratch buffer — otherwise the last `load` would reach partly beyond
     /// the object.
-    fn load_words(&mut self, addr: Val, size: u64, n: usize) -> Option<Vec<Val>> {
+    /// **ROUND 71** — `words` carries the CLASS of every eightbyte. A word
+    /// of the SSE class is loaded as an `f64`; that is not decoration but
+    /// the whole point -- the code generator reads the register class off
+    /// the FIR type of the argument and therefore puts a `{ f32, f32 }`
+    /// into `xmm0` rather than into `rdi`.
+    fn load_words(&mut self, addr: Val, size: u64, words: &[abi::Word]) -> Option<Vec<Val>> {
+        let n = words.len();
         let src = if size % 8 != 0 {
             let t = self.alloca(n as u64 * 8, 8);
             self.push_void(FTy::Void, Op::CopyMem { dst: t, src: addr, size });
@@ -183,9 +223,9 @@ impl<'a> Lower<'a> {
             addr
         };
         let mut out = Vec::with_capacity(n);
-        for i in 0..n {
+        for (i, w) in words.iter().enumerate() {
             let a = self.ptradd_const(src, i as u64 * 8); // ABI-Wortkopie
-            out.push(self.load(FTy::I64, a));
+            out.push(self.load(word_fty(*w), a));
         }
         Some(out)
     }
@@ -547,7 +587,7 @@ impl<'a> Lower<'a> {
                 Some(())
             }
             _ => {
-                let ft = self.fty_of(e)?;
+                let ft = self.out_fty(e)?;
                 let v = self.lower_expr(e)?;
                 self.store(ft, addr, v);
                 Some(())
@@ -564,7 +604,15 @@ impl<'a> Lower<'a> {
         self.depth += 1;
         let r = self.lower_expr_inner(e);
         self.depth -= 1;
-        r
+        // ROUND 71 — the counterpart to the widening in `sema::expr`. The
+        // type checker has noted THAT it happens, here it really happens:
+        // `cvtss2sd`. One place for it, so that no context can lose it.
+        match r {
+            Some(v) if self.info.widen_f32.contains(&e.id) => {
+                Some(self.push(FTy::F64, Op::Cast { src: v, from: FTy::F32 }))
+            }
+            other => other,
+        }
     }
 
     fn lower_expr_inner(&mut self, e: &Expr) -> Option<Val> {
@@ -586,8 +634,18 @@ impl<'a> Lower<'a> {
             // exists so that the case split stays complete.
             ExprKind::Text(..) => self.ice(e.span, "text literal as value"),
             // The BIT PATTERN travels into FIR as a constant — there are no float
-            // literals there, only bit patterns (fir::FTy::F64).
-            ExprKind::Float(bits) => Some(self.constant(FTy::F64, *bits as i128)),
+            // literals there, only bit patterns (fir::FTy::F64/F32).
+            //
+            // ROUND 71: WHICH bit pattern is decided by the type checker. In
+            // an `f32` context the binary64 of the lexer is narrowed here,
+            // once, correctly rounded -- and that is exactly the same value
+            // that the suffix `1.5f` would have produced.
+            ExprKind::Float(bits, single) => {
+                let ft = self.fty_of(e)?;
+                let v = if ft == FTy::F32 { *single as i128 } else { *bits as i128 };
+                Some(self.constant(ft, v))
+            }
+            ExprKind::FloatF32(bits) => Some(self.constant(FTy::F32, *bits as i128)),
             ExprKind::Bool(b) => Some(self.constant(FTy::Bool, if *b { 1 } else { 0 })),
             // HOOK fnval: a closure WITHOUT captures — its record is one word
             // in `.rodata`, exactly like that of a named function
@@ -647,7 +705,7 @@ impl<'a> Lower<'a> {
                 Some(self.push(FTy::I64, Op::Syscall { args: a }))
             }
             ExprKind::Cast(inner, _) => {
-                let from = self.fty_of(inner)?;
+                let from = self.out_fty(inner)?;
                 let to = self.fty_of(e)?;
                 let src = self.lower_expr(inner)?;
                 if from == to {
@@ -718,7 +776,10 @@ impl<'a> Lower<'a> {
             return Some(v);
         }
         if op.is_cmp() {
-            let ty = self.fty_of(a)?;
+            // ROUND 71: after the widening BOTH operands are `f64`. The
+            // comparison type has to be the one the values really carry,
+            // not the one the left side started out with.
+            let ty = self.out_fty(a)?;
             let av = self.lower_expr(a)?;
             let bv = self.lower_expr(b)?;
             let c = match op {
@@ -799,6 +860,8 @@ impl<'a> Lower<'a> {
             "fmt_bool"
         } else if t == Type::F64 {
             "fmt_f64"
+        } else if t == Type::F32 {
+            "fmt_f32"
         } else {
             return None;
         };
@@ -1034,9 +1097,10 @@ impl<'a> Lower<'a> {
             }
             let (size, align) = self.size_align(&t);
             match abi::classify(&t, &self.info.tcx) {
-                ArgClass::Integer(n) => {
+                c @ ArgClass::Regs { .. } => {
                     let addr = self.lower_addr(a)?;
-                    let mut ws = self.load_words(addr, size, n as usize)?;
+                    let ws0: Vec<abi::Word> = c.words().to_vec();
+                    let mut ws = self.load_words(addr, size, &ws0)?;
                     vals.append(&mut ws);
                 }
                 // MEMORY: hidden pointer to a copy of the caller
@@ -1064,7 +1128,14 @@ impl<'a> Lower<'a> {
             if sret {
                 let _ = self.push(FTy::Ptr, op);
             } else {
-                let w = self.push(FTy::I64, op);
+                // ROUND 71: an aggregate of at most 8 bytes comes back in
+                // `rax` -- or in `xmm0`, if its single eightbyte is SSE.
+                let rw = abi::classify(&sig.ret, &self.info.tcx)
+                    .words()
+                    .first()
+                    .copied()
+                    .unwrap_or(abi::Word::Int);
+                let w = self.push(word_fty(rw), op);
                 self.store_words(d, size, &[w])?;
             }
             return Some(None);
@@ -1260,7 +1331,10 @@ impl<'a> Lower<'a> {
                 if let Some(r) = crate::lower_errors::hook_let(self, name, init) {
                     return r;
                 }
-                let t = self.ty_of(init);
+                // ROUND 71: the variable gets the type that the initialiser
+                // HANDS OUT -- `let w: f64 = x_f32` makes an f64 variable,
+                // not a four byte one.
+                let t = self.out_ty(init);
                 if matches!(t, Type::Void) {
                     return self.err(*span, "a variable cannot have a value without a type");
                 }
@@ -1377,7 +1451,12 @@ impl<'a> Lower<'a> {
                                 }
                                 None => {
                                     let addr = self.lower_addr(v)?;
-                                    let w = self.load_words(addr, size, 1)?;
+                                    // ROUND 71: the single eightbyte keeps
+                                    // its class -- `rax` or `xmm0`.
+                                    let rw: Vec<abi::Word> = abi::classify(&t, &self.info.tcx)
+                                        .words()
+                                        .to_vec();
+                                    let w = self.load_words(addr, size, &rw)?;
                                     match w.first() {
                                         Some(w0) => self.ret_term(Some(*w0)),
                                         None => return self.ice(*span, "return without word"),
@@ -1632,11 +1711,12 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
         let span = d.params.get(i).map(|p| p.span).unwrap_or(d.span);
         if is_agg(p) {
             match abi::classify(p, &info.tcx) {
-                ArgClass::Integer(n) => {
-                    for _ in 0..n {
-                        pf.push(FTy::I64);
+                c @ ArgClass::Regs { .. } => {
+                    let ws: Vec<abi::Word> = c.words().to_vec();
+                    for w in &ws {
+                        pf.push(word_fty(*w));
                     }
-                    kinds.push(ParamKind::Words(n as usize));
+                    kinds.push(ParamKind::Words(ws.len()));
                 }
                 _ => {
                     pf.push(FTy::Ptr);
@@ -1657,11 +1737,18 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
         }
     }
     let rf = if is_agg(&sig.ret) {
-        // aggregate: either a pointer (sret) or one word in rax
+        // aggregate: either a pointer (sret) or ONE word — in `rax`, or in
+        // `xmm0` when that eightbyte is of the SSE class (round 71).
         if sret {
             FTy::Ptr
         } else {
-            FTy::I64
+            word_fty(
+                abi::classify(&sig.ret, &info.tcx)
+                    .words()
+                    .first()
+                    .copied()
+                    .unwrap_or(abi::Word::Int),
+            )
         }
     } else {
         match scalar_fty(&sig.ret) {
@@ -1879,6 +1966,7 @@ mod tests {
             expr_types: b.types.clone(),
             consts: HashMap::new(),
             fns: HashMap::new(),
+            widen_f32: std::collections::HashSet::new(),
         };
         for (n, s) in fns {
             ti.fns.insert(n.to_string(), s);

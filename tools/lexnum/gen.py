@@ -257,6 +257,102 @@ def bad_cases():
     ]
 
 
+# ---------------------------------------------------------------- ROUND 71
+#
+# THE SAME EXERCISE FOR `f32`. The lexer does not read a binary32 directly:
+# it reads the correctly rounded binary64 and narrows it once. That this is
+# exact and not a double rounding is a theorem (Figueroa 1995: 53 >= 2*24+2),
+# and a theorem is worth exactly as much as its test.
+#
+# The mean cases are therefore the ones where a double rounding WOULD bite:
+# the exact middle between two neighbouring binary32 values, written out to
+# the last decimal digit, plus the subnormal range of binary32, which begins
+# at 1e-45 and where the number of mantissa bits shrinks.
+
+
+def single_of(pattern):
+    return struct.unpack("<f", struct.pack("<I", pattern))[0]
+
+
+def f32_case_shortest(rng, count):
+    """Random binary32 values in their shortest form."""
+    out = []
+    while len(out) < count:
+        pattern = rng.getrandbits(31)
+        if pattern >= 0x7F800000:
+            continue
+        out.append(repr(single_of(pattern)))
+    return out
+
+
+def f32_case_halfway(rng, count):
+    """The exact middle between two neighbouring binary32, written out.
+
+    That is the place where the rounding rule decides, and the only place
+    where an intermediate binary64 could tip the result -- if it could."""
+    out = []
+    while len(out) < count:
+        pattern = rng.getrandbits(31)
+        if pattern >= 0x7F800000 - 1:
+            continue
+        low = Decimal(single_of(pattern))
+        high = Decimal(single_of(pattern + 1))
+        if low == high:
+            continue
+        out.append(fixed((low + high) / 2))
+    return out
+
+
+def f32_case_subnormal(rng, count):
+    """Below 2^-126 a binary32 loses mantissa bits -- and with them the
+    reserve that the theorem lives on."""
+    out = []
+    for k in range(1, 40):
+        out.append(fixed(Decimal(single_of(k))))
+        low = Decimal(single_of(k))
+        high = Decimal(single_of(k + 1))
+        out.append(fixed((low + high) / 2))
+    while len(out) < count:
+        pattern = rng.randint(1, 0x007FFFFF)
+        out.append(fixed(Decimal(single_of(pattern))))
+    return out
+
+
+def f32_case_boundary():
+    """The named edges: the two smallest, the largest, the overflow and the
+    underflow, and the neighbourhood of 2^24 where a binary32 stops counting
+    whole numbers one by one."""
+    out = [
+        "1.4012984643248170709237295832899161312802619418765157717570682838897910826858606014866381e-45",
+        "2.8025969286496341418474591665798322625605238837530315435141365677795821653717212029732762e-45",
+        "1.1754943508222875079687365372222456778186655567720875215087517062784172594547271728515625e-38",
+        "1.17549421069244107548702944485e-38",
+        "3.4028234663852885981170418348451692544e+38",
+        "3.4028235677973366e+38",
+        "3.402823669209385e+38",
+        "1e-46",
+        "1e-50",
+        "1e39",
+        "1e40",
+        "0.0",
+        "1.0",
+        "0.1",
+        "0.2",
+        "0.3",
+        "16777215.0",
+        "16777216.0",
+        "16777217.0",
+        "16777218.0",
+        "123456792.0",
+        "1.0000001",
+        "0.99999994",
+        "0.999999940395355224609375",
+    ]
+    for k in range(-12, 13):
+        out.append("%d.0" % ((1 << 24) + k))
+    return out
+
+
 def main():
     count = int(sys.argv[1]) if len(sys.argv) > 1 else 5000
     seed = int(sys.argv[2]) if len(sys.argv) > 2 else 65065
@@ -291,11 +387,30 @@ def main():
     with open(work + "/int_plain.txt", "w") as handle:
         handle.write("\n".join(plain(t) for t in integers) + "\n")
 
+    # ROUND 71: the f32 stream. The literals carry the suffix `f`, so that
+    # `firnc --emit=tokens` produces `FloatF32(...)` for them; the plain form
+    # next to it is what C `strtof` and `numpy.float32` read.
+    f32_groups = [
+        ("f32 shortest", f32_case_shortest(rng, share)),
+        ("f32 halfway", f32_case_halfway(rng, max(share // 2, 1))),
+        ("f32 subnormal", f32_case_subnormal(rng, max(share // 2, 1))),
+        ("f32 boundary", f32_case_boundary()),
+        # the mean cases of the f64 stream, read as f32 as well
+        ("f32 from f64 cases", [plain(t) for t in everything[:count]]),
+    ]
+    f32_all = []
+    for _, items in f32_groups:
+        f32_all.extend(items)
+    with open(work + "/f32_cases.fi", "w") as handle:
+        handle.write("\n".join(t + "f" for t in f32_all) + "\n")
+    with open(work + "/f32_plain.txt", "w") as handle:
+        handle.write("\n".join(f32_all) + "\n")
+
     bad = bad_cases()
     with open(work + "/bad_cases.fi", "w") as handle:
         handle.write("\n".join(bad) + "\n")
 
-    for name, items in groups:
+    for name, items in groups + f32_groups:
         print("   %-16s %6d" % (name, len(items)))
     print("   %-16s %6d" % ("FLOAT TOTAL", len(everything)))
     print("   %-16s %6d" % ("integers", len(integers)))
