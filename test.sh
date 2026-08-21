@@ -64,6 +64,11 @@
 #      written by the compiler itself, `gdb` driven in batch mode over two
 #      translated Firn programs -- breakpoints, backtrace, `print` of
 #      variables, structs, pointers and arrays, with counter-checks.
+#  27. The comfort layer of the standard library (tools/strlib/comfort/run.sh,
+#      round 69): demos/number_check.fi really runs -- four inputs, the
+#      whole output compared -- and the new input layer does not leak:
+#      hundreds of thousands of lines through `io.read_line()` with a flat
+#      RSS, plus the deliberately leaking counter-check that MUST strike.
 #  10. DOM soak run (tools/dom_soak/run.sh): the DOM prototype in Firn builds
 #      real cycles continuously (parent/child, listener, JS wrapper) and must
 #      not grow while doing so; the deliberately leaking counter-check with
@@ -561,6 +566,24 @@ if [ "$LSRC" -eq 0 ]; then
 else
     bad "tools/lsp/run.sh failed (see .test-work/lsp.log)"
     grep FAIL "$WORK/lsp.log" | head -10 | sed 's/^/   /'
+fi
+
+echo "== 27. the comfort layer: demo + input soak (tools/strlib/comfort/run.sh, ROUND 69) =="
+# Two things, both with a counter-check: demos/number_check.fi really runs
+# (four inputs, the whole output compared -- it reads from standard input
+# and can therefore not lie in tests/), and the new input layer does not
+# leak. The soak run reads lines with `io.read_line()` and releases every
+# `Text`; RSS has to stay flat. The counter-check is the same program with
+# the `free` left out -- its RSS HAS to climb, otherwise the measurement is
+# broken. The short version; the long run is in docs/ROUND69.md.
+COMFORT_LINES=${COMFORT_LINES:-60000} COMFORT_LEAK_LINES=${COMFORT_LEAK_LINES:-20000} \
+  bash tools/strlib/comfort/run.sh > "$WORK/comfort.log" 2>&1 && CFRC=0 || CFRC=$?
+if [ "$CFRC" -eq 0 ]; then
+    ok
+    grep -E '^   (demo|soak|counter-check)' "$WORK/comfort.log" | sed 's/^/   /'
+else
+    bad "tools/strlib/comfort/run.sh failed (see .test-work/comfort.log)"
+    grep FAIL "$WORK/comfort.log" | head -10 | sed 's/^/   /'
 fi
 
 TOTAL=$((PASS + FAIL))
