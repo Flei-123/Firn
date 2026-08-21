@@ -52,6 +52,11 @@ export { Lower, low_new, low_free, low_run, low_error, low_fir, low_unsuitable,
 const NONE: u32 = 4294967295
 
 struct Lower {
+    // ROUND 70: an lvalue whose address is already computed (`pin_set`).
+    // The compound assignment on `str` puts its target in here so that the
+    // address is computed exactly once.
+    pin_node: u32,
+    pin_addr: u32,
     b: u64 // tree
     it: u64 // interner
     sm: u64 // sema
@@ -89,6 +94,7 @@ fn low_new(b: u64, it: u64, sm: u64) -> Lower {
         l_break: vec_new[u32](), l_cont: vec_new[u32](), l_depth: vec_new[u32](),
         d_stmt: vec_new[u32](), d_err: vec_new[u32](), d_limit: vec_new[u32](),
         sret: NONE, mu: 0, feh: 0, gcr: 0, ifr: 0, err: 0, unsuitable: false,
+        pin_node: NONE, pin_addr: 0,
     }
 }
 
@@ -336,7 +342,30 @@ fn search(l: *mut Lower, name: u32) -> u32 {
 // -------------------------------------------------------------- addresses
 
 // Address of an assignable expression.
+// ROUND 70 (lower.rs) -- the address of an lvalue that has already been
+// computed.
+//
+// The compound assignment on `str` passes its target as an ARGUMENT
+// (`__str_concat(s, x)`) and writes the result back into the same place.
+// Without this pin the address would be computed a second time for the
+// argument -- and with `a[f()] += "x"` `f()` would run twice.
+fn pin_set(l: *mut Lower, e: u32, addr: u32) {
+    (*l).pin_node = e
+    (*l).pin_addr = addr
+}
+
+fn pin_clear(l: *mut Lower) {
+    (*l).pin_node = NONE
+}
+
 fn address(l: *mut Lower, e: u32) -> u32 {
+    if (*l).pin_node != NONE && (*l).pin_node == e {
+        return (*l).pin_addr
+    }
+    return address_inner(l, e)
+}
+
+fn address_inner(l: *mut Lower, e: u32) -> u32 {
     let b: *mut ast.Tree = tree(l)
     let a: u32 = ast.e_kind(b, e)
     // HOOK error unions (lower_errors.rs::hook_addr): an expression with a
@@ -1970,6 +1999,67 @@ fn stmt(l: *mut Lower, i: u32) {
         if has_gc(l) {
             gc_barrier(l, ast.s_a(b, i))
         }
+        return
+    }
+    // ROUND 70 (lower.rs) -- `x op= e`.
+    //
+    // THE POINT OF THE WHOLE THING stands in the first line: the address of
+    // the target is computed EXACTLY ONCE. With `a[f()] += 1` a rewrite into
+    // `a[f()] = a[f()] + 1` would run `f()` twice.
+    //
+    // Everything after that is what `x = x op e` produces anyway: load, the
+    // same FIR operation, store.
+    if a == ast.S_ZUWOP {
+        let target: u32 = ast.s_a(b, i)
+        let value: u32 = ast.s_b(b, i)
+        let op: u32 = ast.s_c(b, i)
+        let addr: u32 = address(l, target)
+        let t: u32 = sema.sema_ty(sm(l), target)
+        // `s += x` on `str`: the collector builds the new octets. The
+        // target is PINNED, so that passing it as an argument does not
+        // compute its address a second time.
+        if types.str_like(tf(l), t) {
+            pin_set(l, target, addr)
+            var cargs: Vec[u32] = vec_new[u32]()
+            vec_push[u32](&cargs, target)
+            vec_push[u32](&cargs, value)
+            str_call(l, str_fn(l, 1), &cargs, addr)
+            vec_free[u32](&cargs)
+            pin_clear(l)
+            return
+        }
+        let ft: u32 = e_fty(l, target)
+        let cur: u32 = load(l, ft, addr)
+        var rhs: u32 = value(l, value)
+        if op == 8 || op == 9 {
+            // The shift amount is brought to the width of the left operand
+            // -- the same line as in `binary`.
+            let bt: u32 = e_fty(l, value)
+            if bt != ft {
+                rhs = push(l, fir.O_CAST, ft, rhs, 0, bt, 0, 0, 0)
+            }
+        }
+        let res: u32 = push(l, fir.O_BIN, ft, cur, rhs, op, 0, 0, 0)
+        store(l, ft, addr, res)
+        if has_gc(l) {
+            gc_barrier(l, target)
+        }
+        return
+    }
+    // ROUND 70 -- `x++` / `x--`: load, plus/minus one, store. The address is
+    // computed once here as well.
+    if a == ast.S_STEP {
+        let target: u32 = ast.s_a(b, i)
+        let addr: u32 = address(l, target)
+        let ft: u32 = e_fty(l, target)
+        let cur: u32 = load(l, ft, addr)
+        let one: u32 = constant(l, ft, 1)
+        var bop: u32 = 1
+        if ast.s_b(b, i) == 1 {
+            bop = 0
+        }
+        let res: u32 = push(l, fir.O_BIN, ft, cur, one, bop, 0, 0, 0)
+        store(l, ft, addr, res)
         return
     }
     if a == ast.S_EXPR {

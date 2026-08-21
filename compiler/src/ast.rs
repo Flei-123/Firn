@@ -179,6 +179,30 @@ pub enum Stmt {
         init: Expr,
         span: Span,
     },
+    /// **ROUND 70** - the compound assignment `x op= e`.
+    ///
+    /// It is its OWN statement and not a rewrite into `x = x + e`, and that
+    /// is the whole point: the left side may be evaluated only ONCE. With
+    /// `a[f()] += 1` a rewrite in the parser would run `f()` twice
+    /// (`tests/1338_assign_op_once.fi` nails it down).
+    AssignOp {
+        target: Expr,
+        op: BinOp,
+        value: Expr,
+        span: Span,
+    },
+    /// **ROUND 70** - `x++` / `x--`, `up = true` for `++`.
+    ///
+    /// A STATEMENT, never an expression. `y = x++` does not exist here: the
+    /// difference between prefix and postfix inside an expression is one of
+    /// the most productive sources of error in C, and in C++ the order of
+    /// evaluation around it is even undefined. As a pure statement the
+    /// meaning is unambiguous (SPEC 12.7).
+    Step {
+        target: Expr,
+        up: bool,
+        span: Span,
+    },
     Assign {
         target: Expr,
         value: Expr,
@@ -228,6 +252,8 @@ impl Stmt {
         match self {
             Stmt::Let { span, .. }
             | Stmt::Assign { span, .. }
+            | Stmt::AssignOp { span, .. }
+            | Stmt::Step { span, .. }
             | Stmt::If { span, .. }
             | Stmt::While { span, .. }
             | Stmt::Return { span, .. }
@@ -247,6 +273,8 @@ impl Stmt {
             Stmt::Let { mutable: false, .. } => "let",
             Stmt::Let { mutable: true, .. } => "var",
             Stmt::Assign { .. } => "assign",
+            Stmt::AssignOp { .. } => "assign",
+            Stmt::Step { .. } => "assign",
             Stmt::If { .. } => "if",
             Stmt::While { .. } => "while",
             Stmt::For { .. } => "for",
