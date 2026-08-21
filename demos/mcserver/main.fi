@@ -63,10 +63,41 @@ const SLOT_BYTES: u64 = 32
 const SLOT_FD: u64 = 0
 const SLOT_USED: u64 = 8
 const SLOT_BASE: u64 = 16
-const MAX_CONN: u64 = 64
+const SLOT_HANDLE: u64 = 24
+
+// 63 and not 64: the thread table of the runtime holds `THREAD_MAX` = 64
+// entries and the MAIN thread occupies the first one (lib/gc/gc.fi,
+// `thread_init`). A 64th worker cannot exist, so there is no point in
+// keeping a connection slot for it.
+const MAX_CONN: u64 = 63
 
 fn ld(a: u64, o: u64) -> u64 { return *((a + o) as *mut u64) }
 fn st(a: u64, o: u64, v: u64) { *((a + o) as *mut u64) = v }
+
+// A FINISHED THREAD HAS TO BE COLLECTED, or the server stops after 63
+// connections. MEASURED, not feared: without this function the 64th ping
+// got a closed socket, every time, at exactly the same number.
+//
+// The reason sits in `lib/gc/gc.fi`. `__thread_slot_new` only hands out
+// entries whose state is `Z_FREE`, and the only thing that sets `Z_FREE` is
+// `thread_wait`. A worker that runs to its end reaches `Z_DEAD` -- its
+// stack stays mapped and its table entry stays taken. `thread_wait` is
+// therefore not "wait for the result" here, it is `free`.
+//
+// It is cheap: a worker sets `SLOT_USED` to 0 as its last statement, so
+// when this runs the thread is at its final instructions and the futex is
+// about to be cleared. The scan is 63 words per accepted connection.
+fn reap(base: u64) {
+    var k: u64 = 0
+    while k < MAX_CONN {
+        let slot: u64 = base + G_SLOTS + k * SLOT_BYTES
+        if ld(slot, SLOT_USED) == 0 as u64 && ld(slot, SLOT_HANDLE) != 0 as u64 {
+            thread_wait(ld(slot, SLOT_HANDLE))
+            st(slot, SLOT_HANDLE, 0)
+        }
+        k = k + 1
+    }
+}
 
 // ------------------------------------------------------------------- Time
 
@@ -575,6 +606,8 @@ fn main(start: u64) -> i32 {
             var conn: net.Conn = net.accept(&l) catch net.conn_from_fd(0 - 1)
             thread_blocking_out()
             if net.conn_is_open(&conn) {
+                // First collect what has finished -- see `reap` above.
+                reap(base)
                 // The first free slot. The lock is `__atomic_swap`; a mutex
                 // would do too, but this is one word.
                 var k: u64 = 0
@@ -584,10 +617,13 @@ fn main(start: u64) -> i32 {
                     if __atomic_swap((slot + SLOT_USED) as *mut u64, 0 as u64, 1 as u64) == 0 as u64 {
                         st(slot, SLOT_FD, net.conn_fd(&conn) as u64)
                         st(slot, SLOT_BASE, base)
-                        if thread_start(1, slot) == 0 {
+                        st(slot, SLOT_HANDLE, 0)
+                        let h: u64 = thread_start(1, slot)
+                        if h == 0 {
                             st(slot, SLOT_USED, 0)
                             net.close(&conn)
                         } else {
+                            st(slot, SLOT_HANDLE, h)
                             __atomic_add((base + G_TOTAL) as *mut u64, 1)
                         }
                         placed = true

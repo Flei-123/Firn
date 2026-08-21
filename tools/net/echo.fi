@@ -34,7 +34,10 @@ const SLOT_BYTES: u64 = 32
 const SLOT_FD: u64 = 0
 const SLOT_USED: u64 = 8
 const SLOT_BASE: u64 = 16
-const MAX_CONN: u64 = 32
+const SLOT_HANDLE: u64 = 24
+// 63, not 64: the main thread holds the first entry of the runtime's thread
+// table (lib/gc/gc.fi, THREAD_MAX).
+const MAX_CONN: u64 = 63
 const CHUNK: usize = 65536
 
 fn ld(a: u64, o: u64) -> u64 { return *((a + o) as *mut u64) }
@@ -55,6 +58,22 @@ fn parse_dec(p: u64, n: usize, fallback: i64) -> i64 {
         i = i + 1
     }
     return v
+}
+
+// A finished thread has to be collected, or the 64th connection finds no
+// free entry in the thread table -- `__thread_slot_new` only hands out
+// entries that `thread_wait` has released. See demos/mcserver/main.fi and
+// docs/ROUND76.md 4.5.
+fn reap(base: u64) {
+    var k: u64 = 0
+    while k < MAX_CONN {
+        let slot: u64 = base + G_SLOTS + k * SLOT_BYTES
+        if ld(slot, SLOT_USED) == 0 as u64 && ld(slot, SLOT_HANDLE) != 0 as u64 {
+            thread_wait(ld(slot, SLOT_HANDLE))
+            st(slot, SLOT_HANDLE, 0)
+        }
+        k = k + 1
+    }
 }
 
 fn __thread_work(kind: u64, arg: u64) -> u64 {
@@ -182,8 +201,6 @@ fn main(start: u64) -> i32 {
     rt.write_everything(1, bytes.bytes_ptr(&out), bytes.bytes_len(&out))
     bytes.bytes_free(&out)
 
-    var handles: [u64; 32] = [0; 32]
-    var nh: usize = 0
     var served: i64 = 0
     while served < left {
         thread_blocking_an()
@@ -192,6 +209,7 @@ fn main(start: u64) -> i32 {
         if !net.conn_is_open(&conn) {
             served = left
         } else {
+            reap(base)
             var k: u64 = 0
             var placed: bool = false
             while k < MAX_CONN && !placed {
@@ -199,13 +217,13 @@ fn main(start: u64) -> i32 {
                 if __atomic_swap((slot + SLOT_USED) as *mut u64, 0 as u64, 1 as u64) == 0 as u64 {
                     st(slot, SLOT_FD, net.conn_fd(&conn) as u64)
                     st(slot, SLOT_BASE, base)
+                    st(slot, SLOT_HANDLE, 0)
                     let h: u64 = thread_start(1, slot)
                     if h == 0 {
                         st(slot, SLOT_USED, 0)
                         net.close(&conn)
-                    } else if nh < 32 {
-                        handles[nh] = h
-                        nh = nh + 1
+                    } else {
+                        st(slot, SLOT_HANDLE, h)
                     }
                     placed = true
                 }
@@ -219,10 +237,14 @@ fn main(start: u64) -> i32 {
     }
     // Wait for every worker: without the join the process would exit while
     // a thread is still writing, and `nc` would see a truncated stream.
-    var i: usize = 0
-    while i < nh {
-        thread_wait(handles[i])
-        i = i + 1
+    var k2: u64 = 0
+    while k2 < MAX_CONN {
+        let slot: u64 = base + G_SLOTS + k2 * SLOT_BYTES
+        if ld(slot, SLOT_HANDLE) != 0 as u64 {
+            thread_wait(ld(slot, SLOT_HANDLE))
+            st(slot, SLOT_HANDLE, 0)
+        }
+        k2 = k2 + 1
     }
     net.close_listener(&l)
 

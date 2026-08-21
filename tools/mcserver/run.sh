@@ -43,9 +43,13 @@ ERRORS=0
 report() { echo "  FAIL  $1"; ERRORS=$((ERRORS + 1)); }
 export FIRNLIB="$(pwd)/lib"
 
+# NOTE: this runs in a SUBSHELL (`PORT=$(start_server ...)`), so a variable
+# assigned in here does not reach the caller. The pid therefore goes through
+# a file. That cost half an hour once; it is written down so it costs
+# nobody a second one.
 start_server() {                       # $1 = binary, $2 = seconds
     "$1" 0 2 "$2" > "$W/srv.log" 2>&1 &
-    SRV=$!
+    echo $! > "$W/srv.pid"
     local i=0 p=""
     while [ $i -lt 200 ]; do
         p=$(awk '/^mcserver: listening on /{print $4; exit}' "$W/srv.log" 2>/dev/null)
@@ -69,8 +73,9 @@ for stage in $STAGES; do
         continue
     fi
 
-    PORT=$(start_server "$BIN" 180) || { report "$name: the server did not start"; continue; }
-    echo "  $name: server on port $PORT"
+    PORT=$(start_server "$BIN" 300) || { report "$name: the server did not start"; continue; }
+    SRV=$(cat "$W/srv.pid")
+    echo "  $name: server on port $PORT (pid $SRV)"
 
     # --- 1. ping -----------------------------------------------------------
     if OUT=$(timeout 60 python3 tools/mcserver/harness.py ping 127.0.0.1 "$PORT" 2>&1); then
@@ -132,6 +137,80 @@ for stage in $STAGES; do
     else
         report "$name: sixteen logins at the same time"
         echo "$OUT" | grep -E 'FAIL|flood' | sed 's/^/        /' | head -6
+    fi
+
+    # --- 6. the endurance run, and the two counter-checks ------------------
+    # Firn has no destructors. Every buffer and every socket is released by
+    # hand, and a server is exactly the place where forgetting one is
+    # invisible for a week. So the RSS of the process is read out of /proc
+    # while thousands of connections run through it.
+    SPID="$SRV"
+    if [ -n "$SPID" ] && [ -r "/proc/$SPID/status" ]; then
+        if OUT=$(timeout 300 python3 tools/mcserver/soak.py "$PORT" "$SPID" \
+                "${MC_SOAK_PINGS:-3000}" "${MC_SOAK_LOGINS:-400}" 2>&1); then
+            echo "$OUT" | sed 's/^/  '"$name"': /'
+        else
+            report "$name: the endurance run"
+            echo "$OUT" | sed 's/^/        /' | head -8
+        fi
+    else
+        report "$name: the pid of the server was not found (endurance run skipped)"
+    fi
+
+    # COUNTER-CHECK A: without `reap()` the server HAS to stop at the 64th
+    # connection. Without this the endurance run above would prove nothing --
+    # it would pass with a server that leaks thread table entries, as long as
+    # the leak is not RSS. This is the bug round 76 found.
+    sed 's/^                reap(base)$//' demos/mcserver/main.fi > "$W/noreap.fi"
+    cp demos/mcserver/proto.fi demos/mcserver/registry.fi demos/mcserver/world.fi "$W/"
+    if $FIRNC $opt -o "$W/noreap" "$W/noreap.fi" 2>"$W/err"; then
+        "$W/noreap" 0 1 60 > "$W/noreap.log" 2>&1 &
+        NRP=$!
+        NRPORT=""
+        i=0
+        while [ $i -lt 200 ]; do
+            NRPORT=$(awk '/^mcserver: listening on /{print $4; exit}' "$W/noreap.log" 2>/dev/null)
+            [ -n "$NRPORT" ] && break
+            sleep 0.05; i=$((i + 1))
+        done
+        NRC=$(timeout 60 python3 tools/mcserver/soak.py "$NRPORT" "$NRP" 300 1 2>&1 \
+              | grep -c 'FAILED at connection 6[0-9]')
+        kill -9 $NRP 2>/dev/null
+        wait $NRP 2>/dev/null
+        if [ "$NRC" -ge 1 ]; then
+            echo "  $name: counter-check -- without reap() the server dies in the sixties, as it must"
+        else
+            report "$name: WITHOUT reap() the server did NOT die -- the endurance run proves nothing"
+        fi
+    else
+        report "$name: the counter-check build (no reap) does not compile"
+    fi
+
+    # COUNTER-CHECK B: without the `bytes_free` the RSS HAS to climb.
+    sed 's/^    bytes.bytes_free(&\(body\|frame\|scratch\|json\))$//' \
+        demos/mcserver/main.fi > "$W/leak.fi"
+    if $FIRNC $opt -o "$W/leak" "$W/leak.fi" 2>"$W/err"; then
+        "$W/leak" 0 1 60 > "$W/leak.log" 2>&1 &
+        LKP=$!
+        LKPORT=""
+        i=0
+        while [ $i -lt 200 ]; do
+            LKPORT=$(awk '/^mcserver: listening on /{print $4; exit}' "$W/leak.log" 2>/dev/null)
+            [ -n "$LKPORT" ] && break
+            sleep 0.05; i=$((i + 1))
+        done
+        LOUT=$(timeout 120 python3 tools/mcserver/soak.py "$LKPORT" "$LKP" 1500 200 2>&1)
+        kill -9 $LKP 2>/dev/null
+        wait $LKP 2>/dev/null
+        if echo "$LOUT" | grep -q 'that is a leak'; then
+            echo "  $name: counter-check -- without bytes_free the RSS climbs, as it must"
+            echo "$LOUT" | grep -E '^(ping|login) ' | sed 's/^/  '"$name"':     /'
+        else
+            report "$name: WITHOUT bytes_free the RSS stayed flat -- the measurement is broken"
+            echo "$LOUT" | sed 's/^/        /' | head -6
+        fi
+    else
+        report "$name: the counter-check build (leak) does not compile"
     fi
 
     # --- the counter-checks --------------------------------------------------
