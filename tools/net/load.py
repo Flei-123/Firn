@@ -23,7 +23,7 @@ CHUNK = 65536
 
 
 def stream(seed, n):
-    """The same generator as tests/1500_net_echo.fi: Knuth's MMIX constants,
+    """The same generator as tests/1600_net_echo.fi: Knuth's MMIX constants,
     the high octet of the state."""
     x = seed
     out = bytearray(n)
