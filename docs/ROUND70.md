@@ -20,19 +20,22 @@ Everything below was really run, in this worktree, on this machine.
 
 | what | measured |
 |---|---|
-| `bash test.sh` | **PASS 1038 / 1038**, 0 failed (base: 977 / 977) |
-| `bash tools/self_compare.sh` | 278 same behaviour, **0 differing, 0 faulty**, CODEGEN MISSING **0** |
-| `bash tools/fixpoint.sh` | **stage 2 == stage 3, character-identical, 599307 lines of assembly** (3520584 octets each) |
-| lexer comparison (11) | SAME 598, DIFFERENT 0, 858960 tokens |
-| parser comparison (12) | SAME 349, DIFFERENT 1 (known and named: 1) |
-| layout/ABI comparison (13) | SAME 296, DIFFERENT 0 |
-| type check comparison (14) | SAME 171, DIFFERENT 0 |
-| lowering comparison (15) | SAME 168, DIFFERENT 1 (known and named: 1) |
+| `bash test.sh` | **PASS 1052 / 1052**, 0 failed (base: 977 / 977) |
+| `bash tools/self_compare.sh` | 281 same behaviour, **0 differing, 0 faulty**, CODEGEN MISSING **0** |
+| `bash tools/fixpoint.sh` | **stage 2 == stage 3, character-identical, 602936 lines of assembly** (3539464 octets each) |
+| lexer comparison (11) | SAME 606, DIFFERENT 0, 862260 tokens |
+| parser comparison (12) | SAME 356, DIFFERENT 1 (known and named: 1) |
+| layout/ABI comparison (13) | SAME 303, DIFFERENT 0 |
+| type check comparison (14) | SAME 173, DIFFERENT 0 |
+| lowering comparison (15) | SAME 170, DIFFERENT 1 (known and named: 1) |
 | `bash tools/kernel/run.sh` | **174 passed, 0 failed** |
 | `bash tools/freestanding/run.sh` | **41 passed, 0 failed** |
 | `bash tools/english/check.sh` | **0 0 0 0 0** |
 | `bash tools/lexnum/run.sh` | 4044 float + 1250 integer literals, 0 differing everywhere (unchanged) |
-| `bash tools/fmt/run.sh` | 641 files, 0 changed by the shape, 0 tree deviations |
+| `bash tools/fmt/run.sh` | 649 files, 0 changed by the shape, 0 tree deviations |
+| `bash tools/packages/run.sh` | 21 passed, 0 failed |
+| `bash tools/dwarf/run.sh` · `tools/lsp/run.sh` | 48 / 0 · 25 / 0 |
+| `bash tools/layout/run.sh` | 705 / 705 boxes, deviation 0.00 % against Chromium |
 | `bash tools/strsoak/run.sh` | see below |
 
 **No new deviations** in the five comparison tools: the one in the parser
@@ -45,17 +48,17 @@ already known and named before this round.
 4000000 octets built, in BOTH compilers:
 
 ```
-firnc0 collected : rss_peak_kib=1448    runs=219  heap_kib=1280
-firnc0 leaking   : rss_peak_kib=221592  runs=0    heap_kib=225280
+firnc0 collected : rss_peak_kib=1452    runs=219  heap_kib=1280
+firnc0 leaking   : rss_peak_kib=221588  runs=0    heap_kib=225280
 firnc1 collected : rss_peak_kib=1620    runs=219  heap_kib=1280
 firnc1 leaking   : rss_peak_kib=221760  runs=0    heap_kib=225280
 ```
 
-With the collector the resident memory stays at **1.4 MiB** and does not move;
-with the collection threshold set to infinity the same loop grows to **217
-MiB**. The counter-check is not decoration -- it is what makes the green
-result worth anything, and the script fails if the counter-check stays flat
-too.
+With the collector the resident memory stays at **1.4 MiB** and does not
+move; with the collection threshold set to infinity the same loop grows to
+**217 MiB**. The counter-check is not decoration -- it is what makes the
+green result worth anything, and the script fails if the counter-check stays
+flat too.
 
 ## 1. `str` -- the language type
 
@@ -362,6 +365,11 @@ wrong it refuses them with a message.
   invisible until now, because the interpolation cast every value to `i64` and
   never reached the function. Now it says `true`/`false`; four expected
   outputs in the corpus were pulled along.
+* **`bin/lexdump.fi` carries the token names as a byte array of FIXED
+  length.** The twelve new tokens of part 5 came out of the lexer in Firn
+  without a name, and the lexer comparison struck immediately (8 deviations).
+  The table went from 460 to 553 octets -- exactly the trap this project has
+  written down since round 65.
 * **The collector runtime lives in the root namespace.** As soon as a program
   pulls it in, the constants of `lib/gc/gc.fi` are program wide.
   `tests/806_std_io_core.fi` declared `SYS_CLOSE` itself and collided with it;
