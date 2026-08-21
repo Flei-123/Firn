@@ -58,11 +58,13 @@ PY
 measure() {
     local file="$1"
     local label="$2"
-    python3 - "$ENGINE" "$file" "$label" <<'PY'
+    local repeat="${3:-1}"
+    python3 - "$ENGINE" "$file" "$label" "$repeat" <<'PY'
 import os, struct, subprocess, sys, time
 engine, path, label = sys.argv[1], sys.argv[2], sys.argv[3]
+repeat = int(sys.argv[4]) if len(sys.argv) > 4 else 1
 src = open(path, "rb").read()
-blob = struct.pack("<II", 0, len(src)) + src
+blob = (struct.pack("<II", 0, len(src)) + src) * repeat
 p = subprocess.Popen([engine], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
 p.stdin.write(blob)
 p.stdin.close()
@@ -107,6 +109,107 @@ echo "== the counter check: the same graph, held onto -- RSS MUST grow =="
 LEAKR=$((ROUNDS / 10 + 2000))
 sed -i "s|^var rounds = .*;|var rounds = $LEAKR;|" "$WORK/leak.js"
 measure "$WORK/leak.js" "leak" | tee "$WORK/leak.log"
+
+# ---------------------------------------------------------------- round 66
+# The same measurement for the objects of round 66: a generator that is
+# started and then ABANDONED in the middle of its body (frames, environment
+# and closure stay behind), a promise with a reaction, and a BigInt of 600
+# bits. If the frames of a suspended body were not ordinary GC objects,
+# this run would grow without bound.
+cat > "$WORK/gen.js" <<JS
+var rounds = $ROUNDS;
+function* work(i) {
+  var acc = [i];
+  try {
+    for (var k = 0; k < 9; k++) { acc.push(k); yield k; }
+  } finally { acc.length = 0; }
+}
+var checksum = 0;
+for (var i = 0; i < rounds; i++) {
+  // Started, ONE step, then dropped: the frame stack stays behind.
+  var it = work(i);
+  checksum += it.next().value;
+  var p = new Promise(function (res) { res(i); });
+  var b = (1n << 600n) + BigInt(i);
+  checksum += Number(b & 1n);
+}
+print("gen", rounds, checksum);
+JS
+
+python3 - "$WORK/gen.js" "$WORK/genleak.js" <<'PY'
+import sys
+src = open(sys.argv[1]).read()
+src = src.replace("var checksum = 0;", "var keep = [];\nvar checksum = 0;")
+src = src.replace("  checksum += it.next().value;",
+                  "  checksum += it.next().value;\n  keep.push(it);")
+src = src.replace("  var p = new Promise(function (res) { res(i); });",
+                  "  var p = new Promise(function (res) { res(i); });\n  keep.push(p);")
+src = src.replace("  checksum += Number(b & 1n);",
+                  "  checksum += Number(b & 1n);\n  keep.push(b);")
+src = src.replace('print("gen", rounds, checksum);',
+                  'print("genleak", keep.length, checksum);')
+open(sys.argv[2], "w").write(src)
+PY
+
+echo
+echo "== round 66: abandoned generators, promises, BigInts -- RSS stays flat =="
+measure "$WORK/gen.js" "gen" | tee "$WORK/gen.log"
+echo
+echo "== the counter check: the same objects, held onto -- RSS MUST grow =="
+GENLEAKR=$((ROUNDS / 10 + 2000))
+sed -i "s|^var rounds = .*;|var rounds = $GENLEAKR;|" "$WORK/genleak.js"
+measure "$WORK/genleak.js" "genleak" | tee "$WORK/genleak.log"
+
+gen_growth=$(awk '/growth/ {print $(NF-1)}' "$WORK/gen.log" | tr -d '+')
+genleak_growth=$(awk '/growth/ {print $(NF-1)}' "$WORK/genleak.log" | tr -d '+')
+echo
+echo "gen     growth: ${gen_growth} KiB"
+echo "genleak growth: ${genleak_growth} KiB"
+if [ "${gen_growth:-0}" -gt 8192 ]; then
+    echo "FAILED: the generator run grew by more than 8 MiB -- that is a leak."
+    exit 1
+fi
+MIN_GEN_LEAK=$(( ROUNDS / 40 + 4096 ))
+if [ "${genleak_growth:-0}" -lt "$MIN_GEN_LEAK" ]; then
+    echo "FAILED: the counter check grew by only ${genleak_growth} KiB (needed ${MIN_GEN_LEAK}) -- the measurement is broken."
+    exit 1
+fi
+echo "OK: suspended generators are collected (${gen_growth} KiB), and a real leak is seen (${genleak_growth} KiB)."
+
+# ------------------------------------------------------- the reaction jobs
+# A promise reaction is a JOB, and the job queue is only drained at the END
+# of a script (9.5) -- a program that hangs 20,000 reactions up and never
+# lets them run holds them, and rightly so. So the measurement for the
+# PROMISES is a different one: the same program as MANY JOBS in ONE process.
+# Every job gets a fresh realm on the SAME heap, its queue is drained, and
+# after that nothing of it may stay alive.
+JOBR=$(( ROUNDS / 200 + 20 ))
+JOBN=200
+cat > "$WORK/jobs.js" <<JS
+var rounds = $JOBR;
+var acc = 0;
+async function step(i) {
+  var v = await i;
+  return v + 1;
+}
+for (var i = 0; i < rounds; i++) {
+  var p = new Promise(function (res) { res(i); });
+  p.then(function (v) { return v + 1; }).then(function (v) { acc += v; });
+  step(i).then(function (v) { acc += v; });
+  Promise.all([1, Promise.resolve(2)]).then(function (a) { acc += a.length; });
+}
+print("jobs", rounds, acc);
+JS
+echo
+echo "== the promises over $JOBN jobs: every queue is drained, RSS stays flat =="
+measure "$WORK/jobs.js" "jobs" "$JOBN" | tee "$WORK/jobs.log"
+jobs_growth=$(awk '/growth/ {print $(NF-1)}' "$WORK/jobs.log" | tr -d '+')
+echo "jobs    growth: ${jobs_growth} KiB"
+if [ "${jobs_growth:-0}" -gt 8192 ]; then
+    echo "FAILED: the promise run grew by more than 8 MiB -- that is a leak."
+    exit 1
+fi
+echo "OK: settled promises, reactions and async frames are collected (${jobs_growth} KiB)."
 
 clean_growth=$(awk '/growth/ {print $(NF-1)}' "$WORK/clean.log" | tr -d '+')
 leak_growth=$(awk '/growth/ {print $(NF-1)}' "$WORK/leak.log" | tr -d '+')
