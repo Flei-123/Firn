@@ -53,6 +53,12 @@
 #      exception reports (#DE, #PF, #GP, #DF), PIC/PIT with a tick counter
 #      that runs up, memory map, frame allocator and heap, keyboard over
 #      IRQ1, ring 3 with `syscall`/`sysret`. With counter-checks.
+#  30. std.core in a kernel (tools/core/run.sh, round 73): the half of the
+#      library that needs neither an allocator nor a system call became a
+#      module of its own; `demos/kernel/kcore.fi` imports it, compiles in
+#      the kernel profile to a freestanding ELF object and boots in QEMU.
+#      With counter-checks: what still allocates stays forbidden, and a
+#      module that only CLAIMS the kernel profile is caught.
 #  27. Function values in a STRUCT FIELD (tools/fnfield/run.sh, round 68):
 #      `c.hook(a, b)` is exactly ONE `call rax`, a direct call stays a
 #      direct `call`, and a METHOD of the same name still wins and stays
@@ -623,6 +629,30 @@ if [ "$CFRC" -eq 0 ]; then
 else
     bad "tools/strlib/comfort/run.sh failed (see .test-work/comfort.log)"
     grep FAIL "$WORK/comfort.log" | head -10 | sed 's/^/   /'
+fi
+
+echo "== 30. std.core in a kernel: the library without an allocator (tools/core/run.sh, ROUND 73) =="
+# Round 52 forbade `import std.*` under `profile kernel` wholesale. Round 73
+# makes the ban precise: the half of the library that needs neither an
+# allocator nor a system call moved into lib/std/core.fi, and THAT module is
+# admitted -- because it declares `profile kernel` itself and lands in the
+# same compilation unit, where the claim gets checked.
+# Proven here, with both compilers: demos/kernel/kcore.fi says
+# `import std.core`, becomes an ELF object WITHOUT an undefined name and
+# WITHOUT a syscall instruction, boots in QEMU and reports over the serial
+# line what it searched, split, read and allocated. With counter-checks:
+# std.io/str/vec/rc stay refused, a module that CLAIMS the kernel profile
+# and allocates all the same is refused, and the arena keeps RSS flat over
+# 40 000 rounds while the leaking counter-check HAS to climb.
+CORE_ROUNDS=${CORE_ROUNDS:-40000} CORE_LEAK_ROUNDS=${CORE_LEAK_ROUNDS:-20000} \
+  bash tools/core/run.sh > "$WORK/core.log" 2>&1 && CORERC=0 || CORERC=$?
+if [ "$CORERC" -eq 0 ]; then
+    ok
+    tail -1 "$WORK/core.log" | sed 's/^/   /'
+    grep -E '^  OK    (soak|counter-check|firnc0: .core\.ok)' "$WORK/core.log" | sed 's/^/   /'
+else
+    bad "tools/core/run.sh failed (see .test-work/core.log)"
+    grep FAIL "$WORK/core.log" | head -10 | sed 's/^/   /'
 fi
 
 TOTAL=$((PASS + FAIL))
