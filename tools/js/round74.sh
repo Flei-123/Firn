@@ -22,8 +22,10 @@
 #                  Date and the weak collections must not grow the RSS,
 #                  and the counter check MUST see a leak.
 #
-# The limits stand in tools/js/minquota_r74.txt (one line per group,
-# "name passed"). Falling below one of them is a FAILURE.
+# The limits stand in tools/js/minquota_r74.txt (`--fast`, what test.sh
+# runs every time) resp. tools/js/minquota_r74_full.txt (`--full`, the
+# numbers of docs/ROUND74.md) -- one line per group, "name passed".
+# Falling below one of them is a FAILURE.
 #
 # NOTHING IS FILTERED: a case that uses a feature this engine does not have
 # counts as a failure like every other one.
@@ -60,6 +62,11 @@ built-ins/Set built-ins/Map built-ins/Error"
     TEXT_DIRS="language/literals"
 fi
 
+LIMITS=tools/js/minquota_r74_full.txt
+if [ "$MODE" = "--fast" ]; then
+    LIMITS=tools/js/minquota_r74.txt
+fi
+
 FAIL=0
 
 group() {
@@ -82,7 +89,7 @@ group() {
     q=$(python3 -c "print('%.2f%%' % (100.0*$pass/$tot if $tot else 0))")
     printf "   %-10s %6d / %-6d %s" "$name" "$pass" "$tot" "$q"
     local limit
-    limit=$(awk -v k="$name" '$1==k {print $2}' tools/js/minquota_r74.txt)
+    limit=$(awk -v k="$name" '$1==k {print $2}' "$LIMITS")
     if [ -z "$limit" ]; then
         limit=0
     fi
