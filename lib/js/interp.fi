@@ -46,12 +46,12 @@ export {
     number_to_string, string_to_number,
     get_prop, get_prop_v, set_prop, has_prop, delete_prop,
     define_own, define_value, define_accessor,
-    call_function, construct, call_method,
+    call_function, construct, construct_nt, call_method,
     make_function, make_native, native_arity,
     run_program, eval_node, hoist_declarations,
     args_new, args_at, args_count,
     make_error, error_message,
-    js_typeof, is_array, throw_type_here,
+    js_typeof, is_array, throw_type_here, instance_of_ordinary,
     add_values, compare_values,
     iterate_values,
     // Round 66: what lib/js/gen.fi (the resumable evaluator) needs.
@@ -1551,6 +1551,18 @@ fn call_user(r: Gc[Realm], f: Gc[JsObj], this: Gc[JsVal], args: Gc[GcVec],
                 let ok4: bool = try define_value(r, ao, ck, cv,
                     val.A_WRITABLE | val.A_CONFIGURABLE)
             }
+            // Round 74: an arguments object is iterable -- with
+            // %Array.prototype.values% (10.4.4.6 step 6).
+            let wk: Gc[JsVal] = val.realm_well_known(r, val.WELL_KNOWN_ITERATOR)
+            if (wk as u64) != 0 {
+                let ap: Gc[JsObj] = val.realm_proto(r, val.PROTO_ARRAY)
+                let vf: Gc[JsVal] = try get_prop(r, ap, val.key_for_symbol(wk))
+                if (*c).comp == C_NORMAL && val.is_callable(vf) {
+                    let ok5: bool = try define_value(r, ao,
+                        val.key_for_symbol(wk), vf,
+                        val.A_WRITABLE | val.A_CONFIGURABLE)
+                }
+            }
             let slot: i64 = try val.env_declare(r, env, ak,
                 val.P_MUTABLE | val.P_INITIALIZED)
             let av: Gc[JsVal] = ao
@@ -1598,6 +1610,14 @@ fn call_user(r: Gc[Realm], f: Gc[JsObj], this: Gc[JsVal], args: Gc[GcVec],
 
 // 10.2.2 [[Construct]]
 fn construct(r: Gc[Realm], fv: Gc[JsVal], args: Gc[GcVec]) -> AllocError!Gc[JsVal] {
+    return construct_nt(r, fv, args, gc_null[JsObj]())
+}
+
+// 7.3.14 Construct, with an explicit NEW TARGET. `Reflect.construct` is the
+// only caller that hands in a third object; everywhere else the new target
+// is the constructor itself.
+fn construct_nt(r: Gc[Realm], fv: Gc[JsVal], args: Gc[GcVec],
+    newt: Gc[JsObj]) -> AllocError!Gc[JsVal] {
     let c: *mut Ctx = ctx_of(r)
     if !val.is_callable(fv) {
         var m: [u8; 22] = "is not a constructor  "
@@ -1608,17 +1628,23 @@ fn construct(r: Gc[Realm], fv: Gc[JsVal], args: Gc[GcVec]) -> AllocError!Gc[JsVa
         var m: [u8; 22] = "is not a constructor  "
         return throw_type_here(r, &m[0], 22)
     }
+    var nt: Gc[JsObj] = newt
+    if (nt as u64) == 0 {
+        nt = f
+    }
     if f.cls == val.CLS_NATIVE {
         let args2: Gc[GcVec] = args
         let h: fn(Gc[Realm], u64, Gc[JsVal], Gc[GcVec], Gc[JsObj]) -> AllocError!Gc[JsVal] = (*c).native
-        return h(r, f.native, val.realm_undefined(r), args2, f)
+        (*c).cur_fn = f
+        return h(r, f.native, val.realm_undefined(r), args2, nt)
     }
     if f.cls == val.CLS_BOUND {
-        return construct(r, f.prim, args)
+        return construct_nt(r, f.prim, args, newt)
     }
-    // The prototype of the new object.
+    // The prototype of the new object comes from the NEW TARGET.
     let pk: u64 = try val.key_for_name(r, lex.N_PROTOTYPE)
-    let pv: Gc[JsVal] = try get_prop(r, fv, pk)
+    let ntv: Gc[JsVal] = nt
+    let pv: Gc[JsVal] = try get_prop(r, ntv, pk)
     if (*c).comp != C_NORMAL {
         return val.realm_undefined(r)
     }
@@ -1628,7 +1654,7 @@ fn construct(r: Gc[Realm], fv: Gc[JsVal], args: Gc[GcVec]) -> AllocError!Gc[JsVa
     }
     let o: Gc[JsObj] = try val.obj_new_proto(r, proto)
     let ov: Gc[JsVal] = o
-    let res: Gc[JsVal] = try call_internal(r, fv, ov, args, f)
+    let res: Gc[JsVal] = try call_internal(r, fv, ov, args, nt)
     if (*c).comp != C_NORMAL {
         return val.realm_undefined(r)
     }
@@ -3462,7 +3488,40 @@ fn js_pow(x: f64, y: f64) -> f64 {
     return math.powf(x, y)
 }
 
+// 13.10.2 InstanceofOperator. Round 74: `Symbol.hasInstance` comes first;
+// what is left over is OrdinaryHasInstance, which is also what
+// `Function.prototype[Symbol.hasInstance]` itself does.
 fn instance_of(r: Gc[Realm], a: Gc[JsVal], b: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    let c: *mut Ctx = ctx_of(r)
+    if val.val_tag(b) != val.TAG_OBJ {
+        var m: [u8; 40] = "Right hand side of 'instanceof' is not c"
+        return throw_type_here(r, &m[0], 40)
+    }
+    let wk: Gc[JsVal] = val.realm_well_known(r, val.WELL_KNOWN_HASINSTANCE)
+    if (wk as u64) != 0 {
+        let hf: Gc[JsVal] = try get_prop(r, b, val.key_for_symbol(wk))
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        if !val.is_nullish(hf) {
+            if !val.is_callable(hf) {
+                var m: [u8; 39] = "Symbol.hasInstance is not a function   "
+                return throw_type_here(r, &m[0], 34)
+            }
+            let ca: Gc[GcVec] = try args_new(r)
+            let ok: bool = try gcvec_append[JsVal](ca, a)
+            let res: Gc[JsVal] = try call_function(r, hf, b, ca)
+            if (*c).comp != C_NORMAL {
+                return val.realm_undefined(r)
+            }
+            return val.realm_bool(r, to_boolean(r, res))
+        }
+    }
+    return instance_of_ordinary(r, a, b)
+}
+
+fn instance_of_ordinary(r: Gc[Realm], a: Gc[JsVal],
+    b: Gc[JsVal]) -> AllocError!Gc[JsVal] {
     let c: *mut Ctx = ctx_of(r)
     if !val.is_callable(b) {
         var m: [u8; 40] = "Right hand side of 'instanceof' is not c"
