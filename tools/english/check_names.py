@@ -22,7 +22,9 @@ os.chdir(ROOT)
 # anderen Stelle im Baum abgelegt (Runde 63). Ihre 32 962 Pfade sind nicht
 # unsere Bezeichner; 828 davon enthalten Zeichenfolgen wie 'hole', 'fall'
 # oder 'primitiv', die in ENGLISCHEN Testnamen stehen und dort richtig sind.
-AUS = ('testdata/', 'tools/english/', '.js-work/')
+# RUNDE 74: dasselbe gilt fuer `.test-work/` -- der Arbeitsordner von
+# test.sh, in den die Abschnitte ihre Logs und entpackte fremde Daten legen.
+AUS = ('testdata/', 'tools/english/', '.js-work/', '.test-work/')
 # Ein angehaengter Zaehler versteckt das deutsche Wort: 'pfad2', 'teil1'.
 ZIFFERNSCHWANZ = re.compile(r'[0-9]+$')
 TEIL = re.compile(r'[a-z0-9]+|[A-Z]+(?![a-z])|[A-Z][a-z0-9]*')
