@@ -68,6 +68,11 @@
 #      async/await with the job queue, the private class elements and the
 #      endurance run for the new objects -- per feature against test262,
 #      with the limits in tools/js/minquota_r66.txt.
+#  33. The features of round 74 (tools/js/round74.sh): the long tail of the
+#      built in objects, the PATTERN ENGINE (compared against node
+#      character for character) and the endurance run for the objects the
+#      round adds -- per group against test262, with the limits in
+#      tools/js/minquota_r74.txt.
 #  10. DOM soak run (tools/dom_soak/run.sh): the DOM prototype in Firn builds
 #      real cycles continuously (parent/child, listener, JS wrapper) and must
 #      not grow while doing so; the deliberately leaking counter-check with
@@ -580,6 +585,24 @@ if [ "$R66RC" -eq 0 ]; then
 else
     bad "tools/js/round66.sh failed (see .test-work/round66.log)"
     grep -E 'FAILED|BELOW' "$WORK/round66.log" | head -10 | sed 's/^/   /'
+fi
+
+echo "== 33. the features of round 74: built ins, regular expressions, dates (tools/js/round74.sh) =="
+# Section 9d measures the JavaScript path as a whole, section 27 measures
+# round 66; this one measures the groups of round 74 SEPARATELY. It holds
+# the PATTERN ENGINE against node character for character -- test262 says
+# whether a case passes, it does not say whether two engines agree on the
+# captures a pattern produces, and that is exactly where a backtracking
+# matcher goes wrong quietly. Plus the endurance run that shows that a
+# compiled pattern, an iterator in mid-flight, a Date and the weak
+# collections are ordinary objects of the collector. Nothing is filtered.
+bash tools/js/round74.sh --fast > "$WORK/round74.log" 2>&1 && R74RC=0 || R74RC=$?
+if [ "$R74RC" -eq 0 ]; then
+    ok
+    grep -E '^   (builtins|text|re_0|clean |leak )' "$WORK/round74.log" | sed 's/^/   /'
+else
+    bad "tools/js/round74.sh failed (see .test-work/round74.log)"
+    grep -E 'FAILED|BELOW|DIFFERENT' "$WORK/round74.log" | head -10 | sed 's/^/   /'
 fi
 
 TOTAL=$((PASS + FAIL))
