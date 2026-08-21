@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tools/net/run.sh -- the sockets against the OUTSIDE (round 76).
 #
-# `tests/1500_net_echo.fi` runs in section 3 of test.sh and pushes 1 MiB
+# `tests/1600_net_echo.fi` runs in section 3 of test.sh and pushes 1 MiB
 # between a server thread and a client IN THE SAME PROCESS. That is
 # necessary and it is not enough: both ends are this repository, and two
 # ends that misunderstand the same thing agree perfectly.

@@ -770,7 +770,7 @@ else
 fi
 
 echo "== 36. sockets against the outside: nc, curl, sixteen at once (tools/net/run.sh, ROUND 76) =="
-# `tests/1500_net_echo.fi` in section 3 pushes 1 MiB between a server thread
+# `tests/1600_net_echo.fi` in section 3 pushes 1 MiB between a server thread
 # and a client IN THE SAME PROCESS. That is necessary and not enough: both
 # ends are this repository, and two ends that misunderstand the same thing
 # agree perfectly. Here the other end is somebody else's -- netcat is from
