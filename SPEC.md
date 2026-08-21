@@ -1954,6 +1954,22 @@ F11. **`E!f64` carries its value** -- since round 68, and not before. Up to
     stay bug compatible. There is one table now.
     Proof: `tests/1249_error_union_f64.fi`, `tests/1004_js_f64_union.fi`.
 
+F12. **An error union over a struct of the SAME MODULE works -- since round
+    76, and not before.** `fn f() -> E!S` inside a module whose `S` is
+    declared right above it reported `unknown type 'S'`; in the root module
+    the identical code worked. The cause was not the type system:
+    `errors::hook_type` puts the success type of `E!T` ASIDE (into
+    `REG.pending`) and leaves the placeholder `__eu#<n>` in the syntax tree,
+    and `modules.rs::Resolver::ty` -- the pass that qualifies every type name
+    of a module -- walks the tree, where the payload no longer is. So `S`
+    never became `modul__S`.
+    `firnc1` never had the bug: it renames while PARSING, so the payload is
+    already qualified when it goes into the side table.
+    Found while `lib/std/net.fi` was written (`NetError!Listener`), fixed in
+    `errors::pending_inner`/`set_pending_inner`. Proof:
+    `tests/1600_net_echo.fi` and every function of `lib/std/net.fi`,
+    docs/ROUND76.md 4.1.
+
 #### 14.1.asm -- the operands of an inline assembly block (round 52, 68)
 
 ```ebnf
