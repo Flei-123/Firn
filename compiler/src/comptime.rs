@@ -359,6 +359,7 @@ impl<'a> Execution<'a> {
                 match op {
                     UnOp::Neg => Ok(-v),
                     UnOp::Not => Ok(if v == 0 { 1 } else { 0 }),
+                    UnOp::BitNot => Ok(!v),
                     _ => no("pointer operations do not exist at compile time"),
                 }
             }

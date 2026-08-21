@@ -162,8 +162,13 @@ pub(crate) fn stem(r: &str) -> Option<&'static str> {
 #[derive(Clone, Debug)]
 pub(crate) struct AsmBlock {
     pub(crate) template: String,
+    /// The VALUE form `out("rax")` without an expression — the result of the
+    /// `asm(…)` expression. At most one, as since round 52.
     pub(crate) out: Option<String>,
     pub(crate) in_regs: Vec<String>,
+    /// **ROUND 68** — the MEMORY outputs `out("rdx") p`, in source order.
+    /// Each one writes its register into `*p` after the template has run.
+    pub(crate) out_regs: Vec<String>,
     pub(crate) clobber: Vec<String>,
     pub(crate) span: Span,
 }
@@ -259,6 +264,11 @@ pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
     let mut out: Option<String> = None;
     let mut in_regs: Vec<String> = Vec::new();
     let mut ins: Vec<Expr> = Vec::new();
+    // ROUND 68: the memory outputs. They stand in the SAME argument list as
+    // the inputs, behind them — `check_asm` and `lower_asm` split the list
+    // at `in_regs.len()`.
+    let mut out_regs: Vec<String> = Vec::new();
+    let mut out_exprs: Vec<Expr> = Vec::new();
     let mut clobber: Vec<String> = Vec::new();
 
     while p.eat(&TokKind::Comma) {
@@ -305,13 +315,25 @@ pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
                 ins.push(p.nested_expr());
             }
             "out" => {
-                if out.is_some() {
-                    p.dg.error(
-                        rspan,
-                        "an asm block has at most one 'out' register".to_string(),
-                    );
+                // ROUND 68: `out("rdx") p` — with an expression behind it
+                // the register is written into `*p`; any number of those.
+                // Without one it stays the VALUE of the `asm(…)` expression,
+                // and of those there is still at most one.
+                if p.at(&TokKind::Comma) || p.at(&TokKind::RParen) || p.at_eof() {
+                    if out.is_some() {
+                        p.dg.error_note(
+                            rspan,
+                            "an asm block has at most one 'out' register WITHOUT a target"
+                                .to_string(),
+                            "write 'out(\"rdx\") p' — then the register goes into '*p' \
+                             and there may be any number of them",
+                        );
+                    }
+                    out = Some(reg);
+                } else {
+                    out_regs.push(reg);
+                    out_exprs.push(p.nested_expr());
                 }
-                out = Some(reg);
             }
             _ => clobber.push(reg),
         }
@@ -326,10 +348,13 @@ pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
         template,
         out,
         in_regs,
+        out_regs,
         clobber,
         span: Parser::join(start, vspan),
     });
-    Some(p.mk(span, ExprKind::Call(format!("{}{}", P_ASM, nr), ins, start)))
+    let mut args = ins;
+    args.extend(out_exprs);
+    Some(p.mk(span, ExprKind::Call(format!("{}{}", P_ASM, nr), args, start)))
 }
 
 // ---------------------------------------------------------- Type phase ---
@@ -403,12 +428,32 @@ fn check_asm(ck: &mut Checker, nr: usize, args: &[Expr], espan: Span) -> Type {
     for r in &b.in_regs {
         good &= check_reg(ck, r, b.span, "in");
     }
+    for r in &b.out_regs {
+        good &= check_reg(ck, r, b.span, "out");
+    }
     for r in &b.clobber {
         good &= check_reg(ck, r, b.span, "clobber");
     }
+    // ROUND 68: two outputs must not name the SAME register — one of the two
+    // results would be lost without a word being said.
+    for (i, r) in b.out_regs.iter().enumerate() {
+        let same_stem = |x: &String| stem(x) == stem(r) && stem(r).is_some();
+        let twice = b.out_regs[..i].iter().any(same_stem)
+            || b.out.as_ref().map(|o| same_stem(o)).unwrap_or(false);
+        if twice {
+            ck.dg.error_note(
+                b.span,
+                format!("the register '{}' is an output operand twice", r),
+                "every output needs a register of its own; the second one would \
+                 overwrite the first",
+            );
+            good = false;
+        }
+    }
+    let n_in = b.in_regs.len();
     // Every input value must be scalar (integer, bool, pointer): nothing else
     // fits into a register.
-    for (i, a) in args.iter().enumerate() {
+    for (i, a) in args.iter().take(n_in).enumerate() {
         let t = ck.expr(a, Some(&Type::U64));
         if t.is_error() {
             good = false;
@@ -424,6 +469,48 @@ fn check_asm(ck: &mut Checker, nr: usize, args: &[Expr], espan: Span) -> Type {
                     ck.tcx.name_of(&t)
                 ),
                 "allowed are integer, bool and pointer types",
+            );
+            good = false;
+        }
+    }
+    // ROUND 68: an output operand is an ADDRESS. What is written there is
+    // always the WHOLE register, so the target has to be eight octets wide —
+    // a narrower one would have its neighbours overwritten silently.
+    for (i, a) in args.iter().skip(n_in).enumerate() {
+        let reg = b.out_regs.get(i).map(|s| s.as_str()).unwrap_or("?");
+        let t = ck.expr(a, Some(&Type::ptr(Type::U64, true)));
+        if t.is_error() {
+            good = false;
+            continue;
+        }
+        let inner = match &t {
+            Type::Ptr { inner, .. } => (**inner).clone(),
+            _ => {
+                ck.dg.error_note(
+                    a.span,
+                    format!(
+                        "the output operand for '{}' has type {}, expected a pointer",
+                        reg,
+                        ck.tcx.name_of(&t)
+                    ),
+                    "write 'out(\"rdx\") &x' — the register goes into '*(&x)'",
+                );
+                good = false;
+                continue;
+            }
+        };
+        let ok = (inner.is_concrete_int() || inner.is_ptr())
+            && ck.tcx.size_of(&inner) == 8;
+        if !ok {
+            ck.dg.error_note(
+                a.span,
+                format!(
+                    "the output operand for '{}' points at {}, that is not eight octets wide",
+                    reg,
+                    ck.tcx.name_of(&inner)
+                ),
+                "an output operand always writes the whole register; allowed are \
+                 u64, i64, usize, isize and pointer targets",
             );
             good = false;
         }
@@ -579,8 +666,9 @@ fn lower_asm(
     };
     // Evaluate the input values in source order, then bring them to 64 bits:
     // what goes into a register is always the whole word.
-    let mut ins: Vec<Val> = Vec::with_capacity(args.len());
-    for a in args {
+    let n_in = b.in_regs.len();
+    let mut ins: Vec<Val> = Vec::with_capacity(n_in);
+    for a in args.iter().take(n_in) {
         let v = lw.lower_expr(a)?;
         let from = lw.fty_of(a)?;
         let v = if from == FTy::U64 || from == FTy::I64 || from == FTy::Ptr {
@@ -590,12 +678,20 @@ fn lower_asm(
         };
         ins.push(v);
     }
+    // ROUND 68: the output operands are ADDRESSES — evaluated in source
+    // order as well, after the inputs.
+    let mut outs: Vec<Val> = Vec::with_capacity(b.out_regs.len());
+    for a in args.iter().skip(n_in) {
+        outs.push(lw.lower_expr(a)?);
+    }
     let ty = if b.out.is_some() { FTy::U64 } else { FTy::Void };
     let op = Op::Asm {
         template: b.template.clone(),
         out: b.out.clone(),
         in_regs: b.in_regs.clone(),
         ins,
+        out_regs: b.out_regs.clone(),
+        outs,
         clobber: b.clobber.clone(),
     };
     if b.out.is_some() {

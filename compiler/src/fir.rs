@@ -232,6 +232,13 @@ pub enum Op {
         out: Option<String>,
         in_regs: Vec<String>,
         ins: Vec<Val>,
+        /// **ROUND 68** — further output operands. `out("rdx") p` writes the
+        /// register into the memory location `p` points at, AFTER the
+        /// template has run. Any number of them; the value form `out("rax")`
+        /// without an expression stays the single result of the expression.
+        out_regs: Vec<String>,
+        /// The ADDRESSES belonging to `out_regs`, in the same order.
+        outs: Vec<Val>,
         clobber: Vec<String>,
     },
     /// **Round 52** — MMIO read (`core.rs`). Like `Op::Load`, but
@@ -347,7 +354,11 @@ impl Op {
                 out.push(*addr);
                 out.push(*size);
             }
-            Op::Asm { ins, .. } => out.extend_from_slice(ins),
+            Op::Asm { ins, outs, .. } => {
+                out.extend_from_slice(ins);
+                // ROUND 68: an output operand READS an address.
+                out.extend_from_slice(outs);
+            }
             Op::MmioLoad { addr } => out.push(*addr),
             Op::MmioStore { addr, val } => {
                 out.push(*addr);
@@ -614,10 +625,18 @@ fn fmt_inst(i: &Inst) -> String {
         Op::Barrier { val } => format!("barrier.{} %{}", t, val),
         Op::SecureZero { addr, size } => format!("secure_zero %{}, %{}", addr, size),
         Op::AtomicAdd { addr, val } => format!("atomadd.{} %{}, %{}", t, addr, val),
-        Op::Asm { template, out, in_regs, ins, clobber } => {
+        Op::Asm { template, out, in_regs, ins, out_regs, outs, clobber } => {
             let mut o = format!("asm.{} \"{}\"", t, asm_escape(template));
             if let Some(r) = out {
                 o.push_str(&format!(" out={}", r));
+            }
+            if !outs.is_empty() {
+                let ps: Vec<String> = out_regs
+                    .iter()
+                    .zip(outs.iter())
+                    .map(|(r, v)| format!("{} %{}", r, v))
+                    .collect();
+                o.push_str(&format!(" out=[{}]", ps.join(", ")));
             }
             if !ins.is_empty() {
                 let ps: Vec<String> = in_regs

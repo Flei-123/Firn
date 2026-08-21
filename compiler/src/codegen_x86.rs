@@ -771,7 +771,7 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
         }
         // ROUND 52 (core.rs, SPEC §2): inline assembler. ALWAYS volatile —
         // the lines stand exactly once and exactly here.
-        Op::Asm { template, out, in_regs, ins, clobber } => {
+        Op::Asm { template, out, in_regs, ins, out_regs, outs, clobber } => {
             e.raw("    # asm (volatile): must be neither removed nor moved");
             for (r, v) in in_regs.iter().zip(ins.iter()) {
                 let stem = crate::core::stem(r)
@@ -781,11 +781,31 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
             for line in template.split('\n') {
                 e.line(line);
             }
+            // The VALUE form goes into its frame slot FIRST. `store_dst` is a
+            // plain `mov [rbp-N], reg` and needs no scratch register — after
+            // it, rax and rcx are free for the memory outputs below.
             if let Some(r) = out {
                 let stem = crate::core::stem(r)
                     .ok_or_else(|| format!("unknown asm register '{}'", r))?;
                 let d = i.dst.ok_or("internal error: asm with out but without target")?;
                 store_dst(e, fr, d, stem);
+            }
+            // ROUND 68 — the memory outputs. Every result register goes on
+            // the STACK first; only then are rax/rcx used to write them out.
+            // Doing it the other way round would destroy a result that is
+            // still to be written: an address has to be loaded into a
+            // register, and that register may itself be an output.
+            if !outs.is_empty() {
+                for r in out_regs.iter() {
+                    let stem = crate::core::stem(r)
+                        .ok_or_else(|| format!("unknown asm register '{}'", r))?;
+                    e.line(&format!("push {}", stem));
+                }
+                for k in (0..outs.len()).rev() {
+                    e.line("pop rax");
+                    load_full(e, fr, "rcx", outs[k]);
+                    e.line("mov qword ptr [rcx], rax");
+                }
             }
             if !clobber.is_empty() {
                 e.raw(&format!("    # asm clobber: {}", clobber.join(", ")));

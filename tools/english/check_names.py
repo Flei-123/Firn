@@ -17,7 +17,12 @@ os.chdir(ROOT)
 
 # Ausgenommen: fremde Daten (testdata) und das Umstellungswerkzeug selbst,
 # das laut Arbeitsanweisung deutsch bleibt.
-AUS = ('testdata/', 'tools/english/')
+# RUNDE 68: `.js-work/` ist die test262-Suite von TC39 plus die
+# Vergleichslaeufe gegen node -- FREMDE DATEN wie `testdata/`, nur an einer
+# anderen Stelle im Baum abgelegt (Runde 63). Ihre 32 962 Pfade sind nicht
+# unsere Bezeichner; 828 davon enthalten Zeichenfolgen wie 'hole', 'fall'
+# oder 'primitiv', die in ENGLISCHEN Testnamen stehen und dort richtig sind.
+AUS = ('testdata/', 'tools/english/', '.js-work/')
 # Ein angehaengter Zaehler versteckt das deutsche Wort: 'pfad2', 'teil1'.
 ZIFFERNSCHWANZ = re.compile(r'[0-9]+$')
 TEIL = re.compile(r'[a-z0-9]+|[A-Z]+(?![a-z])|[A-Z][a-z0-9]*')

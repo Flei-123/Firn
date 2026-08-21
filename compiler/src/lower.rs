@@ -612,7 +612,10 @@ impl<'a> Lower<'a> {
                 let v = self.lower_expr(inner)?;
                 Some(self.push(ft, Op::Un(FUn::Neg, v)))
             }
-            ast::UnOp::Not => {
+            // `!b` (bool) and `~x` (integer) become the SAME FIR operation;
+            // `FUn::Not` reads the instruction type and emits `xor eax, 1`
+            // for `bool` and `not` for an integer (codegen_x86.rs).
+            ast::UnOp::Not | ast::UnOp::BitNot => {
                 let ft = self.fty_of(e)?;
                 let v = self.lower_expr(inner)?;
                 Some(self.push(ft, Op::Un(FUn::Not, v)))
@@ -766,6 +769,11 @@ impl<'a> Lower<'a> {
                 dyn_sig = Some(sig);
             }
         }
+        // ROUND 68 (impls.rs::field_fn): `c.hook(a, b)` where `hook` is a
+        // FIELD of the receiver holding a function value. Word 0 of the
+        // record is the code address; the receiver itself is NOT an
+        // argument, it is only the place the value is read from.
+        let mut field_target: Option<((Val, Val), crate::sema::FnSig)> = None;
         let name: &str = match crate::impls::method_name(name) {
             None => name,
             Some(_) if dispatch.is_some() => name,
@@ -780,7 +788,29 @@ impl<'a> Lower<'a> {
                         receiver_address = addr;
                         &resolved
                     }
-                    None => return self.ice(span, "unknown method in lowering"),
+                    None => {
+                        let (sidx, params, ret) =
+                            match crate::impls::field_fn(&self.info.tcx, &et, m) {
+                                Some(x) => x,
+                                None => return self.ice(span, "unknown method in lowering"),
+                            };
+                        let recv = match args.first() {
+                            Some(e) => e.clone(),
+                            None => return self.ice(span, "method call without receiver"),
+                        };
+                        // The receiver is evaluated FIRST — same order as
+                        // for an ordinary method call.
+                        let base = match &et {
+                            Type::Struct(_) => self.lower_addr(&recv)?,
+                            _ => self.lower_expr(&recv)?,
+                        };
+                        let fa = self.field_addr(base, sidx, m, span)?;
+                        let rec = self.load(FTy::Ptr, fa);
+                        let code = self.load(FTy::Ptr, rec);
+                        field_target =
+                            Some(((code, rec), crate::sema::FnSig { params, ret }));
+                        name
+                    }
                 }
             }
         };
@@ -789,9 +819,18 @@ impl<'a> Lower<'a> {
         // record itself goes in as the LAST argument, so that a closure body
         // finds its captured values there (a named function never reads it).
         let mut indirect: Option<(Val, Val)> = None;
+        // ROUND 68: with a function value out of a field the receiver drops
+        // out of the argument list.
+        let mut skip_receiver = false;
         let sig = match dyn_sig {
             Some(s) => s,
-            None => match self.local_ty(name) {
+            None => match field_target {
+                Some((cr, s)) => {
+                    indirect = Some(cr);
+                    skip_receiver = true;
+                    s
+                }
+                None => match self.local_ty(name) {
                 Some(Type::Fn { params, ret }) => {
                     let slot = match self.lookup(name) {
                         Some(s) => s,
@@ -802,9 +841,10 @@ impl<'a> Lower<'a> {
                     indirect = Some((code, rec));
                     crate::sema::FnSig { params, ret: *ret }
                 }
-                _ => match self.info.fns.get(name) {
-                    Some(s) => s.clone(),
-                    None => return self.ice(span, "unknown function in lowering"),
+                    _ => match self.info.fns.get(name) {
+                        Some(s) => s.clone(),
+                        None => return self.ice(span, "unknown function in lowering"),
+                    },
                 },
             },
         };
@@ -829,6 +869,11 @@ impl<'a> Lower<'a> {
             }
         }
         for (i, a) in args.iter().enumerate() {
+            // ROUND 68: the receiver of a function value out of a field is
+            // no argument — it was read above already.
+            if i == 0 && skip_receiver {
+                continue;
+            }
             // HOOK iface: the receiver is the data pointer from the fat
             // pointer — it was read above already (iface.rs)
             if i == 0 {

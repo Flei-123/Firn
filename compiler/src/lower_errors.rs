@@ -283,22 +283,21 @@ fn copy_value(lo: &mut Lower, dst: Val, src: Val, t: &Type) -> Option<()> {
     Some(())
 }
 
+/// **ROUND 68** — this used to be a COPY of `lower::scalar_fty`, and the copy
+/// had lost `Type::F64`. `copy_value` therefore silently copied NOTHING for
+/// an `E!f64`: the success value never reached its slot, and what came out
+/// the other side was whatever happened to lie there
+/// (docs/ROUND63.md, gap 2 — "this bug is dangerous because it is SILENT").
+/// There is only ONE table now; a type added to the language cannot be
+/// forgotten here a second time.
 fn scalar_fty(t: &Type) -> Option<FTy> {
-    Some(match t {
-        Type::I8 => FTy::I8,
-        Type::I16 => FTy::I16,
-        Type::I32 => FTy::I32,
-        Type::I64 | Type::Isize => FTy::I64,
-        Type::U8 => FTy::U8,
-        Type::U16 => FTy::U16,
-        Type::U32 => FTy::U32,
-        Type::U64 | Type::Usize => FTy::U64,
-        Type::Bool => FTy::Bool,
-        Type::Ptr { .. } => FTy::Ptr,
-        // Round 58: a function value is the pointer to its function record.
-        Type::Fn { .. } => FTy::Ptr,
-        _ => return None,
-    })
+    match crate::lower::scalar_fty_pub(t) {
+        // `void` carries no value that could be copied. The `None` says
+        // "nothing to do", not "unknown type" — that difference is why this
+        // wrapper exists at all.
+        None | Some(FTy::Void) => None,
+        Some(f) => Some(f),
+    }
 }
 
 /// `return` with implicit conversion into the error union of the function.

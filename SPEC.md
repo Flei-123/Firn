@@ -852,7 +852,7 @@ and_expr    = cmp_expr { "&&" cmp_expr } ;
 cmp_expr    = add_expr [ ( "=="|"!="|"<"|"<="|">"|">=" ) add_expr ] ;
 add_expr    = mul_expr { ( "+"|"-"|"|"|"^" ) mul_expr } ;
 mul_expr    = unary   { ( "*"|"/"|"%"|"&"|"<<"|">>" ) unary } ;
-unary       = ( "-" | "!" | "&" | "*" ) unary | postfix ;
+unary       = ( "-" | "!" | "~" | "&" | "*" ) unary | postfix ;  (* ~ round 68 *)
 postfix     = primary { "." ident | "[" expr "]" | "(" [ args ] ")" | "as" type } ;
 primary     = int_lit | bool_lit | qualified | "(" expr ")" | struct_lit
             | array_lit | "syscall" "(" args ")"
@@ -863,6 +863,30 @@ struct_lit  = ident "{" { ident ":" expr "," } "}" ;
 array_lit   = "[" [ expr { "," expr } ] "]"
             | "[" expr ";" expr "]" ;              (* repetition, round 2 *)
 ```
+
+**The line end closes a statement -- unless the next line continues the
+expression (round 68).** A semicolon is optional; outside brackets a line
+break ends the statement. From round 68 on there is one exception, and it is
+defined by a fixed list of tokens rather than by a guess: an expression is
+CONTINUED when the first token of the following line can only ever stand
+BETWEEN two operands, that is one of
+
+```text
++  -  /  %  &  |  ^  <<  >>  &&  ||  ==  !=  <  <=  >  >=  .  as
+```
+
+so a long condition or a long mask may be broken with the operator at the
+start of the following line, and a chain of field accesses may be broken at
+the `.`. An operator at the END of a line has continued the expression since
+round 2 and goes on doing so.
+
+**`*`, `(` and `[` are deliberately NOT in that list**, and that is the
+whole point of it: a line may legitimately begin with `*p = 0`, with
+`(*p).f = 0` or with an index, and none of those may silently become a
+multiplication, a call or an index belonging to the line before. Inside
+brackets a line break has never ended anything and still does not. Proof:
+`tests/1232_line_continuation.fi` and
+`tests/neg/1233_star_is_no_continuation.fi`.
 
 ---
 
@@ -927,7 +951,11 @@ README as "not yet".
   structs with field access, arrays of fixed size with an index, functions. No
   implicit conversion.
 * Expressions: `+ - * / %`, `& | ^ << >>`, comparisons, `&& ||`
-  (short-circuiting), unary `-`, `!`, `&`, `*`.
+  (short-circuiting), unary `-`, `!`, `~` (round 68), `&`, `*`.
+  `!` is the LOGICAL negation of a `bool`, `~` the bitwise complement of an
+  integer; neither stands in for the other, in either direction
+  (`tests/1230_bitnot.fi`, `tests/neg/1064_tilde_needs_integer.fi`,
+  `tests/neg/1231_not_needs_bool.fi`).
 * Statements: `let`, `var`, assignment to a variable/field/index/dereference,
   `if`/`else`, `while`, `return`, blocks. Functions with parameters, recursion.
 * `syscall(...)` with up to 6 arguments.
@@ -1023,7 +1051,13 @@ specification and the code do not drift apart.
    corresponds to `--release-fast`.
 4. **`const`** is restricted to scalar integer and `bool` expressions evaluable
    at compile time.
-5. **Global variables** do not exist (only `const`).
+5. **Global variables** do not exist (only `const`). Looked at again in
+   round 68 and deliberately left standing: a `static` needs a data section
+   with an initialisation order, a rule for the collector (is a `static
+   Gc[T]` a root?) and one for threads. That is a round of its own, not a
+   side effect of one. What a kernel does instead is in `docs/ROUND59.md`
+   section 2, what the JavaScript engine does instead in `docs/ROUND63.md`
+   gap 5.
 6. ~~**The `profile` declaration** is parsed and checked, but has no effect.~~
    **Struck in round 52** (`compiler/src/prof.rs`, `compiler/src/core.rs`,
    `docs/ROUND52.md`): `--profile=kernel` and `profile kernel` respectively
@@ -1398,7 +1432,9 @@ explicitly.
 
 `f64` has been a language type since round 11: literals (`1.5`, `1e3`,
 `1_000.25`, `1.5e-1`), the basic operations `+ - * /`, all six comparisons, the
-sign `-x` and the conversions `integer as f64` / `f64 as integer` (truncating
+sign `-x` (**really only since round 68** -- the code generator could do it
+from the start, the type checker refused it, see 14.1.round68 R3) and the
+conversions `integer as f64` / `f64 as integer` (truncating
 towards zero, as in C). Proof: `tests/590_f64.fi` with 29 checks in all three
 build stages, among them NaN, infinity and negative zero.
 
@@ -1647,6 +1683,84 @@ F10. **An error union over a struct success type is no good as the field type of
     (`E!i32`, `E!*mut u8`) the field type is allowed
     (`tests/408_union_field.fi`), and as a return, variable and parameter type
     every success type is.
+
+F11. **`E!f64` carries its value** -- since round 68, and not before. Up to
+    round 67 the success value of an error union over `f64` was silently
+    NOT copied: `lower_errors.rs` had a table of its own for "which FIR type
+    does this source type have" and that table had lost `f64`, so the copy
+    turned into nothing and the reader got whatever lay in the slot.
+    `lib/firnc1/lower.fi` carried the same hole, written in deliberately to
+    stay bug compatible. There is one table now.
+    Proof: `tests/1249_error_union_f64.fi`, `tests/1004_js_f64_union.fi`.
+
+#### 14.1.asm -- the operands of an inline assembly block (round 52, 68)
+
+```ebnf
+asm_expr = "asm" "(" str_lit { "," asm_op } ")" ;
+asm_op   = "in"      "(" str_lit ")" expr
+         | "out"     "(" str_lit ")"              (* the VALUE, round 52 *)
+         | "out"     "(" str_lit ")" expr         (* into MEMORY, round 68 *)
+         | "clobber" "(" str_lit ")" ;
+```
+
+A1. **`out("rax")` without a target is the value of the expression.** There
+    is at most ONE of those -- an expression has one value. That is the form
+    of round 52 and it is unchanged.
+
+A2. **`out("rdx") p` writes the register into `*p`, after the template has
+    run.** Any number of those. `p` is a POINTER; what is written is always
+    the WHOLE register, so the target has to be eight octets wide (`u64`,
+    `i64`, `usize`, `isize` or a pointer). A narrower one would have its
+    neighbour overwritten silently, which is why the type checker refuses it
+    (`tests/neg/1246_asm_out_width.fi`).
+
+A3. **Every output needs a register of its own.** Two outputs on the same
+    register are an error with line and column
+    (`tests/neg/1243_asm_out_twice.fi`) -- one of the two results would be
+    lost without a word being said.
+
+A4. **Order of evaluation:** the input expressions in source order, then the
+    output ADDRESSES in source order, then the template. The register a
+    result lands in is decided by the register NAME, not by the position in
+    the operand list.
+
+A5. **The code generator saves every result register on the stack first**
+    and only then uses `rax`/`rcx` to write the results out. The other way
+    round would destroy a result that is still to be written: an address has
+    to be loaded into a register, and that register may itself be an output.
+
+A6. **A memory AREA travels as a pointer in a register** (`in("rcx") p`)
+    plus `clobber("memory")`. There is no placeholder syntax in the
+    template -- what stands in it is x86 assembly and nothing else.
+    Proof for all of it: `tests/1242_asm_multi_out.fi`, and in the kernel
+    `demos/kernel/user.fi::rdmsr`, which takes edx:eax apart the way the
+    processor delivers it.
+
+#### 14.1.round68 -- three more places where a type is accepted (round 68)
+
+R1. **`Gc[Derived]` fits into `AllocError!Gc[Base]`.** The free upcast of
+    4.4 holds at `return`, in a `let`, as an argument and behind `catch`,
+    also when the target type is an error union over the base type. Up to
+    round 67 the conversion into an error union ran through a copy of the
+    compatibility rule that did not know the upcast, and a local of the base
+    type had to be put in between (`docs/ROUND63.md`, gap 7).
+    Downwards there is still exactly one way: the checked `x.as?[C]`.
+    Proof: `tests/1236_gc_upcast_return.fi`,
+    `tests/neg/1237_gc_upcast_only_upward.fi`.
+
+R2. **A function value in a FIELD is callable.** `c.hook(a, b)` where
+    `hook` is a field of type `fn(A, B) -> R`. The receiver is NOT an
+    argument -- it is only the place the value is read from. The resolution
+    order is unchanged: a METHOD of the same name wins, the field is only
+    looked at when there is no method. What that costs is measured on the
+    emitted code, not asserted: `tools/fnfield/run.sh`.
+
+R3. **`-x` works on `f64`.** 14.1.f64 named it as implemented and it was
+    not. What the code generator does is flip BIT 63, not run `neg`, which
+    is what makes `-0.0` come out as `-0.0` -- `0.0 - x` does not
+    (`tests/1247_f64_negation.fi`). `~x` on an `f64` stays an error: a
+    floating point value has no bits whose flipping would mean anything
+    (`tests/neg/1248_f64_has_no_bitnot.fi`).
 
 
 ---

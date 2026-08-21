@@ -1345,6 +1345,31 @@ impl<'a> Checker<'a> {
     fn unary(&mut self, e: &Expr, op: UnOp, inner: &Expr, hint: Option<&Type>) -> Type {
         match op {
             UnOp::Neg => {
+                // ROUND 68: `f64` counts as well. SPEC §14.1.f64 named "the
+                // sign `-x`" as implemented and it was not
+                // (docs/ROUND63.md, gap 1). The code generator could do it
+                // all along — it flips bit 63 instead of running `neg`,
+                // which is what makes `-0.0` come out right.
+                let h = self
+                    .probe(inner)
+                    .or_else(|| hint.filter(|t| t.is_concrete_int() || **t == Type::F64).cloned());
+                let t = self.expr(inner, h.as_ref());
+                if t.is_error() {
+                    return Type::Error;
+                }
+                if !(t.is_concrete_int() || t == Type::F64) {
+                    self.dg.error(
+                        e.span,
+                        format!(
+                            "unary '-' expects an integer or f64 type, found {}",
+                            self.tcx.name_of(&t)
+                        ),
+                    );
+                    return Type::Error;
+                }
+                t
+            }
+            UnOp::BitNot => {
                 let h = self
                     .probe(inner)
                     .or_else(|| hint.filter(|t| t.is_concrete_int()).cloned());
@@ -1353,12 +1378,13 @@ impl<'a> Checker<'a> {
                     return Type::Error;
                 }
                 if !t.is_concrete_int() {
-                    self.dg.error(
+                    self.dg.error_note(
                         e.span,
                         format!(
-                            "unary '-' expects an integer type, found {}",
+                            "unary '~' expects an integer type, found {}",
                             self.tcx.name_of(&t)
                         ),
+                        "'~' flips every bit; the logical negation of a bool is '!'",
                     );
                     return Type::Error;
                 }
@@ -1376,7 +1402,7 @@ impl<'a> Checker<'a> {
                             "unary '!' expects the type bool, found {}",
                             self.tcx.name_of(&t)
                         ),
-                        "bitwise negation does not exist in stage 0, write 'x ^ -1'",
+                        "'!' is the logical negation of a bool; the bitwise one is '~'",
                     );
                     return Type::Error;
                 }
@@ -1793,6 +1819,7 @@ impl<'a> Checker<'a> {
             }
             ExprKind::Unary(op, inner) => match op {
                 UnOp::Neg => self.probe_d(inner, d + 1),
+                UnOp::BitNot => self.probe_d(inner, d + 1),
                 UnOp::Not => Some(Type::Bool),
                 UnOp::AddrOf => self.probe_d(inner, d + 1).map(|t| Type::ptr(t, true)),
                 UnOp::Deref => match self.probe_d(inner, d + 1) {
@@ -1849,8 +1876,15 @@ impl<'a> Checker<'a> {
                     if let Some(iname) = crate::impls::dyn_interface(&self.tcx, &et) {
                         return crate::iface::ret_of(&iname, m);
                     }
-                    let (full, _) = crate::impls::target_of(&self.tcx, &self.fns, m, &et)?;
-                    return self.fns.get(&full).map(|s| s.ret.clone());
+                    if let Some((full, _)) =
+                        crate::impls::target_of(&self.tcx, &self.fns, m, &et)
+                    {
+                        return self.fns.get(&full).map(|s| s.ret.clone());
+                    }
+                    // HOOK fnval (ROUND 68): a FIELD holding a function
+                    // value — `c.hook(3, 4) != 12` needs the result type
+                    // here too, otherwise the literal beside it gets none.
+                    return crate::impls::field_fn(&self.tcx, &et, m).map(|(_, _, r)| r);
                 }
                 // HOOK sizeof: `size_of[T]()` is always `usize` — without that
                 // a literal beside it gets no type (`size_of[u8]() != 1`)
@@ -2015,6 +2049,7 @@ impl<'a> Checker<'a> {
                 match op {
                     UnOp::Neg => Ok(-v),
                     UnOp::Not => Ok(if v == 0 { 1 } else { 0 }),
+                    UnOp::BitNot => Ok(!v),
                     _ => nope("a constant expression must not use pointers"),
                 }
             }

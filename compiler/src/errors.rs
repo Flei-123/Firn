@@ -397,8 +397,21 @@ pub(crate) fn hook_catch(p: &mut Parser, mut lhs: Expr) -> Expr {
 
 /// Assignment compatibility as in `sema.rs` (private there): equal types,
 /// for pointers without regard to the `mut` marking.
+///
+/// **ROUND 68** — the free upcast belongs in here as well. Without it
+/// `return derived` in a function of return type `AllocError!Gc[Base]` was
+/// rejected although `let up: Gc[Base] = derived` right beside it was
+/// allowed: the ordinary path (`sema::assignable`) knew the rule of
+/// SPEC §4.4, this copy did not (docs/ROUND63.md, gap 7 — about 200 places
+/// in `lib/js/` had to insert a local of the base type in between).
+/// `lib/firnc1/types.fi::compatible` has had the rule since round 54; the
+/// two compilers agree again only now.
 fn compatible(a: &Type, b: &Type) -> bool {
     if a.is_error() || b.is_error() {
+        return true;
+    }
+    // HOOK gc: `Gc[Derived]` -> `Gc[Base]`, and ONLY in that direction.
+    if crate::gc::is_upward(a, b) {
         return true;
     }
     match (a, b) {
