@@ -59,7 +59,7 @@ def main():
     parse = load(os.path.join(ROOT, ".js-work", "parse.json"))
 
     out = []
-    out.append("# Round 66 -- the measurements of the JavaScript path")
+    out.append("# Round 74 -- the measurements of the JavaScript path")
     out.append("")
     out.append("Produced by `bash tools/js/run.sh` / `tools/js/report.py`.")
     out.append("Nothing here is typed in by hand.")
@@ -100,10 +100,11 @@ def main():
         out.append("| %s | %d |" % (k, reasons[k]))
     out.append("")
     out.append("`unsupported-syntax` is a program that the parser rejects "
-               "because the feature is deliberately absent (after round 66: "
-               "`eval`, the `Function` constructor, regular expressions, "
-               "modules). `throw` is an exception the test did not expect -- "
-               "usually a built in that does not exist. "
+               "because the feature is deliberately absent (after round 74: "
+               "`eval`, the `Function` constructor, modules -- the regular "
+               "expressions moved into the engine in this round). `throw` is "
+               "an exception the test did not expect -- usually a built in "
+               "that does not exist. "
                "`async-incomplete` is a case with `flags: [async]` that ran "
                "through without ever printing `Test262:AsyncTestComplete`: "
                "its promise never settled. `wrong` is a case that ran "
