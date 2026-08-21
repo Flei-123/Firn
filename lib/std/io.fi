@@ -8,7 +8,12 @@
 // It contains the `Fmt` builder as well: the parser translates the string
 // interpolation `f"..."` at compile time into a chain of
 // `fmt_new/fmt_text/fmt_number` -- no varargs, no parsing at run time.
+// ROUND 69: `io` is the ONE place that sees both address worlds -- `rt`
+// carries an address as a `u64`, `str`/`num` as a `*mut u8`. That is why
+// the bridge lives here and nowhere else (docs/ROUND69.md).
 import rt
+import str
+import num
 
 export {
     // round 39
@@ -22,6 +27,13 @@ export {
     fmt_char, fmt_bool, fmt_u64, fmt_hex, fmt_c, fmt_repeat,
     fmt_line, fmt_wide, fmt_append, fmt_content, fmt_print_line,
     fmt_eprint, fmt_eprint_line, fmt_in_file,
+    // round 69 -- the comfort layer: spans instead of pointer/length pairs
+    span_of_buf, write, write_line, write_err, write_err_line,
+    write_c, write_c_line, fmt_span, fmt_f64,
+    // round 69 -- input without a buffer of your own
+    Text, text_new, text_span, text_length, text_is_ok, text_free, text_of,
+    read_line, read_all, prompt,
+    read_i64, read_f64, ask_i64, ask_f64,
 }
 
 // ------------------------------------------------------------ Input/output
@@ -257,14 +269,19 @@ fn fmt_char(f: Fmt, c: u8) -> Fmt {
     return g
 }
 
+// ROUND 69: the two words are `true` and `false` -- the same spelling the
+// language itself uses. Until then they were German (`wahr`/`falsch`), a
+// leftover of the time before the English migration; a library that prints
+// a bool in a different language than the source is written in is a seam,
+// not a feature.
 fn fmt_bool(f: Fmt, w: bool) -> Fmt {
     var g: Fmt = f
-    var ja: [u8; 4] = "wahr"
-    var no: [u8; 6] = "falsch"
+    var yes: [u8; 4] = "true"
+    var no: [u8; 5] = "false"
     if w {
-        rt.buf_push_bytes(&g.b, (&ja[0]) as u64, 4)
+        rt.buf_push_bytes(&g.b, rt.addr_of(&yes[0]), 4)
     } else {
-        rt.buf_push_bytes(&g.b, (&no[0]) as u64, 6)
+        rt.buf_push_bytes(&g.b, rt.addr_of(&no[0]), 5)
     }
     return g
 }
@@ -374,4 +391,278 @@ fn fmt_in_file(f: Fmt, path: u64) -> bool {
     let ok: bool = rt.write_file(path, rt.buf_ptr(&g.b), rt.buf_len(&g.b))
     rt.buf_free(&g.b)
     return ok
+}
+
+// =====================================================================
+// Round 69 -- the comfort layer.
+//
+// THE COMPLAINT that started this: reading one number looked like this.
+//
+//     var input: rt.Buf = rt.buf_new()
+//     if !io.read_stdin(&input) { return 1 }
+//     let s = str.span(rt.buf_ptr(&input) as *mut u8, rt.buf_len(&input)).trim()
+//     var x: i64 = 0
+//     if !num.text_to_i64(s.p, s.n, &x) { ... }
+//
+// Five lines, one cast, one buffer the caller has to manage and two loose
+// parameters where a `Span` already exists. In C# it is one line. The
+// library had everything it needed -- it was only uncomfortable and
+// disagreed with itself at the seams.
+//
+// ONE ADDRESS FORM. Outward an address is a `*mut u8`, never a bare `u64`
+// (the reasons are in docs/ROUND69.md). `str` and `num` were already like
+// that; `rt` got `rt.buf_data`/`rt.ptr_of`/`rt.addr_of` and keeps its `u64`
+// forms as thin shells. `io` is the only module that sees both worlds, so
+// every crossing happens HERE -- and never in the caller's code.
+//
+// NOTHING OLD BREAKS. Everything above this line stays exactly as it was.
+// The functions below are ADDED next to it; where the same job exists in
+// both forms, the new one is the `Span` form and the old one keeps its
+// name.
+// =====================================================================
+
+const SYS_READ: i64 = 0
+const STDIN: i64 = 0
+
+// ------------------------------------------------------- Buffer -> Span
+
+// The contents of a buffer as a reading view. Valid as long as the buffer
+// lives and does NOT grow -- growing may move it.
+fn span_of_buf(b: *mut rt.Buf) -> str.Span {
+    return str.span(rt.buf_data(b), rt.buf_len(b))
+}
+
+// ------------------------------------------------------ Output as a Span
+//
+// The `print`/`eprint` family above takes `(p: u64, n: usize)` -- the form
+// from round 39, when there was no `Span`. These four take the `Span`
+// itself, so that the caller neither casts nor takes text apart.
+
+fn write(s: str.Span) {
+    rt.write_everything(1, rt.addr_of(s.p), s.n)
+}
+
+fn write_line(s: str.Span) {
+    rt.write_everything(1, rt.addr_of(s.p), s.n)
+    print_line()
+}
+
+fn write_err(s: str.Span) {
+    rt.write_everything(2, rt.addr_of(s.p), s.n)
+}
+
+fn write_err_line(s: str.Span) {
+    rt.write_everything(2, rt.addr_of(s.p), s.n)
+    var nl: [u8; 1] = "\n"
+    rt.write_everything(2, rt.addr_of(&nl[0]), 1)
+}
+
+// A null terminated sequence with a TYPED address -- the form
+// `&literal[0]` gives you, without `as u64`.
+fn write_c(p: *mut u8) {
+    rt.write_everything(1, rt.addr_of(p), str.c_length(p))
+}
+
+fn write_c_line(p: *mut u8) {
+    write_c(p)
+    print_line()
+}
+
+// ------------------------------------------------- The builder, built out
+
+// A `Span` as a text segment -- the `Span` counterpart of `fmt_text`.
+fn fmt_span(f: Fmt, s: str.Span) -> Fmt {
+    var g: Fmt = f
+    rt.buf_push_bytes(&g.b, rt.addr_of(s.p), s.n)
+    return g
+}
+
+// A FLOATING POINT number as the shortest decimal text that reads back
+// (`num.write_f64` -> dtoa). This is the library side of `{x}` for `f64`:
+// the interpolation `f"..."` still casts every value to `i64`
+// (compiler/src/parser.rs, section interpolation), so a later compiler
+// round only has to pick this function instead of `fmt_number` -- the
+// library no longer stands in the way.
+//
+// THE COST, honestly: `num.write_f64` allocates its scratch memory per
+// call (14 KiB, one mmap) and releases it again. Whoever writes many
+// numbers in a loop calls `dtoa` directly with scratch memory of their own.
+// On failure (out of memory) NOTHING is appended -- an invented number
+// would be worse than a gap.
+fn fmt_f64(f: Fmt, x: f64) -> Fmt {
+    var g: Fmt = f
+    var b: num.Bytes = num.bytes_new()
+    if num.write_f64(&b, x) {
+        rt.buf_push_bytes(&g.b, rt.addr_of(b.ptr), b.len)
+    }
+    num.bytes_free(&b)
+    return g
+}
+
+// ================================================================= Input
+//
+// WHO OWNS THE MEMORY -- the question spelled out, because Firn answers it
+// neither with a garbage collector nor with a hidden buffer:
+//
+//   * `Text` OWNS its octets. It is the only thing that has to be released.
+//   * `Span` OWNS NOTHING. It is a view INTO a `Text` and is valid exactly
+//     as long as that `Text` lives and is not written to again.
+//
+// A reader CANNOT keep a buffer of its own somewhere: stage 0 has no global
+// variables (SPEC 14.1, item 5). Returning a `Span` alone would therefore
+// be a lie -- nobody could release the memory behind it, and a trimmed
+// `Span` does not even point at the start of the block any more. So the
+// owner is returned, and the view is one call away:
+//
+//     var line: io.Text = io.read_line()
+//     defer line.free()
+//     let s: str.Span = line.span().trim()
+//
+// And whoever only wants the NUMBER owns nothing at all: `io.read_i64()`
+// and `io.ask_i64(f"...")` read, parse and release in one step -- there is
+// nothing left to forget.
+
+struct Text {
+    b: rt.Buf,
+    ok: bool,
+}
+
+// An empty, released text.
+fn text_new() -> Text {
+    return Text { b: rt.buf_new(), ok: false }
+}
+
+// The view onto the content. Valid until `text_free` or the next write.
+fn text_span(t: *mut Text) -> str.Span {
+    return span_of_buf(&(*t).b)
+}
+
+fn text_length(t: *mut Text) -> usize {
+    return rt.buf_len(&(*t).b)
+}
+
+// false = there was nothing to read any more (end of input). An EMPTY LINE
+// is `true` with length 0 -- that is the difference between "nothing came"
+// and "an empty line came", and C# makes it too (`ReadLine() == null`).
+fn text_is_ok(t: *mut Text) -> bool {
+    return (*t).ok
+}
+
+fn text_free(t: *mut Text) {
+    rt.buf_free(&(*t).b)
+    (*t).ok = false
+}
+
+// An `f"..."` as an owned text -- the way to get a `Span` out of a string
+// LITERAL without writing out `var x: [u8; N]`. It allocates; for pure
+// output `io.fmt_print_line(f"...")` stays the cheaper way.
+fn text_of(f: Fmt) -> Text {
+    var t: Text = text_new()
+    fmt_content(f, &t.b)
+    t.ok = true
+    return t
+}
+
+impl Text {
+    fn span(*self) -> str.Span { return text_span(self) }
+    fn length(*self) -> usize { return text_length(self) }
+    fn is_ok(*self) -> bool { return text_is_ok(self) }
+    fn free(*mut self) { text_free(self) }
+}
+
+// ---------------------------------------------------------- Reading input
+
+// ONE line from standard input, without the line feed; a `\r` directly in
+// front of it is dropped as well (DOS line endings) -- the same rule
+// `LineReader` follows.
+//
+// ONE read(2) PER OCTET, and that is deliberate: a buffered reader would
+// have to keep the octets it read too much somewhere, and without global
+// variables there is no such place -- it would swallow input that belongs
+// to whoever reads next. Correctness before speed at this seam; whoever
+// reads MANY lines takes `read_all()` plus the `LineReader` cursor, which
+// reads in blocks of 64 KiB.
+fn read_line() -> Text {
+    var t: Text = text_new()
+    var got: bool = false
+    var running: bool = true
+    var c: [u8; 1] = [0 as u8; 1]
+    while running {
+        let r: i64 = syscall(SYS_READ, STDIN, rt.addr_of(&c[0]) as i64, 1, 0,
+            0, 0)
+        if r <= 0 {
+            running = false
+        } else {
+            got = true
+            if c[0] == 10 as u8 {
+                running = false
+            } else {
+                rt.buf_push(&t.b, c[0])
+            }
+        }
+    }
+    if got {
+        let n: usize = rt.buf_len(&t.b)
+        if n > 0 && rt.buf_at(&t.b, n - 1) == 13 as u8 {
+            rt.buf_set_len(&t.b, n - 1)
+        }
+        t.ok = true
+    }
+    return t
+}
+
+// EVERYTHING from standard input up to the end, as an owned text.
+fn read_all() -> Text {
+    var t: Text = text_new()
+    t.ok = rt.read_stdin(&t.b)
+    return t
+}
+
+// Ask a question and read the answer. The question is an `f"..."`, so that
+// a string literal needs neither a length nor an array of its own:
+//
+//     var name: io.Text = io.prompt(f"Your name: ")
+//
+// The builder is written out WITHOUT a line feed (a prompt stays on its
+// line) and released while doing so.
+fn prompt(question: Fmt) -> Text {
+    fmt_print(question)
+    return read_line()
+}
+
+// -------------------------------------------------- Reading numbers whole
+//
+// The common case in one call: read a line, trim it, parse it, release the
+// buffer. Nothing is left over that could be forgotten.
+
+fn read_i64() -> num.ParsedI64 {
+    var t: Text = read_line()
+    if !t.ok {
+        text_free(&t)
+        return num.parsed_i64_none()
+    }
+    let r: num.ParsedI64 = num.parse_i64(str.trim(text_span(&t)))
+    text_free(&t)
+    return r
+}
+
+fn read_f64() -> num.ParsedF64 {
+    var t: Text = read_line()
+    if !t.ok {
+        text_free(&t)
+        return num.parsed_f64_none()
+    }
+    let r: num.ParsedF64 = num.parse_f64(str.trim(text_span(&t)))
+    text_free(&t)
+    return r
+}
+
+fn ask_i64(question: Fmt) -> num.ParsedI64 {
+    fmt_print(question)
+    return read_i64()
+}
+
+fn ask_f64(question: Fmt) -> num.ParsedF64 {
+    fmt_print(question)
+    return read_f64()
 }
