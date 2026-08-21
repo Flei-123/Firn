@@ -68,6 +68,8 @@ def cases(root):
 
 def classify(status, out, want, typ):
     """Why did a run fail? Only for the breakdown, not for the quota."""
+    if status == "OK":
+        return "async-incomplete"
     if status.startswith("PARSE"):
         code = status.split()[1]
         if code == "6":
@@ -102,6 +104,7 @@ def main():
     show = 0
     sub = "test"
     limit = 0
+    details = None
     i = 0
     while i < len(args):
         if args[i] == "--json":
@@ -114,6 +117,8 @@ def main():
             root = args[i + 1]; i += 2
         elif args[i] == "--limit":
             limit = int(args[i + 1]); i += 2
+        elif args[i] == "--details":
+            details = args[i + 1]; i += 2
         else:
             i += 1
 
@@ -138,7 +143,13 @@ def main():
             variants = [(0, src, False)]
         else:
             pre = helper("assert.js") + "\n" + helper("sta.js") + "\n"
-            for inc in m["includes"]:
+            # A case with the `async` flag calls `$DONE`; test262 expects
+            # the runner to put `doneprintHandle.js` in front of it, and
+            # most of the generated cases do not name it in `includes`.
+            incs = list(m["includes"])
+            if "async" in flags and "doneprintHandle.js" not in incs:
+                incs.append("doneprintHandle.js")
+            for inc in incs:
                 pre += helper(inc) + "\n"
             variants = []
             if "onlyStrict" not in flags:
@@ -149,7 +160,7 @@ def main():
             data = text.encode("utf-8")
             jobs.append(struct.pack("<II", mode, len(data)) + data)
             index.append((path, neg.get("phase", ""), neg.get("type", ""),
-                          m["features"]))
+                          m["features"], "async" in flags))
         if limit and len(index) >= limit:
             break
 
@@ -195,7 +206,7 @@ def main():
     passed = 0
     failed = []
     reasons = {}
-    for (path, phase, typ, feats), block in zip(index, blocks):
+    for (path, phase, typ, feats, is_async), block in zip(index, blocks):
         lines = block.rstrip("\n").split("\n")
         status = lines[-1] if lines else ""
         want_parse_fail = phase in ("parse", "early")
@@ -205,6 +216,12 @@ def main():
             ok = status.startswith("PARSE")
         elif want_throw:
             ok = status.startswith("THROW") and (typ == "" or typ in status)
+        elif is_async:
+            # An ASYNC case (round 66) only counts as passed when it really
+            # reached its end: test262 demands the exact line of
+            # `doneprintHandle.js`. A run that finishes without the
+            # promise ever settling is a FAILURE.
+            ok = status == "OK" and "Test262:AsyncTestComplete" in block
         else:
             ok = status == "OK"
         if ok:
@@ -226,6 +243,10 @@ def main():
         print("--- the first %d failures ---" % show)
         for f in failed[:show]:
             print("  %-70s %s | %s" % (f[0], f[2], f[1]))
+    if details:
+        with open(details, "w") as fh:
+            for f in failed:
+                fh.write("%s\t%s\t%s\n" % (f[2], f[1].replace("\t", " "), f[0]))
     if jsonout:
         json.dump({"total": total, "passed": passed,
                    "failed": total - passed, "reasons": reasons,
