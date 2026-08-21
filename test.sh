@@ -363,7 +363,12 @@ else
     tail -20 "$WORK/lex_compare.log" | sed 's/^/   /'
 fi
 
-echo "== 28. the number reader: four readers, one bit pattern (tools/lexnum/run.sh, ROUND 65) =="
+echo "== 28. the number reader: four readers, one bit pattern (tools/lexnum/run.sh, ROUND 65/71) =="
+# ROUND 71: the same exercise for `f32`, with two references of its own --
+# C `strtof` and an exact reference in Decimal/Fraction. It was this
+# measurement that found the real error of the round: reading a decimal as a
+# correctly rounded binary64 and narrowing it afterwards is NOT correctly
+# rounded (63568 of 239064 middle cases came out one ulp wrong).
 # The corpus of the project contains a few dozen floating point literals, all
 # of them harmless. That is why the divergence at `9007199254740991.0` only
 # came to light in round 63 -- BY ACCIDENT. Here several thousand literals
@@ -672,6 +677,40 @@ if [ "$CORERC" -eq 0 ]; then
 else
     bad "tools/core/run.sh failed (see .test-work/core.log)"
     grep FAIL "$WORK/core.log" | head -10 | sed 's/^/   /'
+fi
+
+echo "== 32. the calling convention against GCC (tools/abi/run.sh, ROUND 71) =="
+# Up to round 70 an `f64` travelled as a bit pattern in an INTEGER register.
+# Within Firn that was consistent and correct; SPEC 14.1.f64 named it as
+# deviation F2. With `f32` the debt came due: whoever reads a WAV or a glTF
+# talks to code that somebody else translated, and that code follows System
+# V AMD64.
+# "We follow System V now" is a claim; this is the measurement. Firn objects
+# are linked into a C program translated by GCC and called in BOTH
+# directions -- GCC calls Firn, and Firn calls GCC (the stubs are weakened
+# with `objcopy`, so the strong definitions of the C side win).
+bash tools/abi/run.sh > "$WORK/abi.log" 2>&1 && ABIRC=0 || ABIRC=$?
+if [ "$ABIRC" -eq 0 ]; then
+    ok
+    grep -E '^abi:|^RESULT' "$WORK/abi.log" | sed 's/^/   /'
+else
+    bad "tools/abi/run.sh failed (see .test-work/abi.log)"
+    grep -E 'ERROR|FAIL' "$WORK/abi.log" | head -10 | sed 's/^/   /'
+fi
+
+echo "== 33. f32 against real data: WAV and glTF (tools/f32data/run.sh, ROUND 71) =="
+# A test in which a program writes a number and reads it back proves nothing
+# about a file format -- it proves that the program agrees with itself.
+# Here the octets come from outside: a WAV with 32-bit float PCM and a
+# binary glTF, produced by tools/f32data/gen.py, read by BOTH compilers, and
+# every value held against what Python reads out of the very same octets.
+bash tools/f32data/run.sh > "$WORK/f32data.log" 2>&1 && F32RC=0 || F32RC=$?
+if [ "$F32RC" -eq 0 ]; then
+    ok
+    grep -E 'identical|^OK' "$WORK/f32data.log" | sed 's/^/   /'
+else
+    bad "tools/f32data/run.sh failed (see .test-work/f32data.log)"
+    grep -E 'DIFFERENT|FAIL' "$WORK/f32data.log" | head -10 | sed 's/^/   /'
 fi
 
 TOTAL=$((PASS + FAIL))
