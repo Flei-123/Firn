@@ -603,19 +603,445 @@ fn ten_high(k: usize) -> f64 {
     return t
 }
 
+// ------------------------------------------------------- the value of a literal
+//
+// A decimal literal has to become the NEAREST binary64, correctly rounded,
+// at exactly half distance towards the EVEN mantissa. Round 65 found three
+// ways in which the step by step computation missed that, and every one of
+// them was a real divergence against `firnc0`:
+//
+//   * `9007199254740991.0` came out one ULP too small (4845873199050653694
+//     instead of ...695). The digits are collected into a u64
+//     (90071992547409910), that no longer fits into 2^53 -- and the
+//     division by ten afterwards rounds a SECOND time.
+//   * `2.2250738585072011e-308` came out four ULP too large: 308 single
+//     divisions by ten, each of them rounding once.
+//   * `18446744073709551616.0` became 0.0 and `1844674407370955161.9`
+//     became 0.3: the mantissa wrapped around in the u64 without anyone
+//     noticing. That is not an ULP, that is a different number.
+//
+// The exact path below holds the value as the fraction D * 10^exp of two
+// big integers, scales it until the quotient has exactly 53 bit and lets
+// the remainder decide the rounding. That is the same method as
+// `lib/num/strtod.fi` (SPEC 8.4, requirement Z5); it is written out here
+// because the lexer of the compiler must not depend on the standard
+// library.
+
+// 256 limbs of 32 bit = 8192 bit. WIDTH OF THE WORST CASE: the numerator is
+// at most 781 significant digits (2596 bit) shifted left by at most 1381
+// bit, the denominator at most 10^1181 (3924 bit) shifted by at most 63 --
+// under 4100 bit either way, so the block is twice as wide as it has to be.
+const BN_LIMBS: usize = 256
+// Significant digits that are kept; everything below is folded into a
+// sticky digit. An exact halfway case has at most 752 digits (5^1075), so
+// 780 is more than enough for correct rounding.
+const F_MAXDIG: usize = 780
+const F_INF_BITS: u64 = 9218868437227405312
+const F_TWO52: u64 = 4503599627370496
+const F_TWO53: u64 = 9007199254740992
+
+// An unsigned big number: u32 limbs, least significant first, in a block of
+// memory the caller owns. `n` counts the limbs in use, leading zero limbs
+// are cut off (`bn_norm`), so `n` is at the same time the length in limbs.
+struct Bn {
+    d: u64,
+    n: usize,
+}
+
+fn bn_limb(b: *mut Bn, i: usize) -> u32 {
+    if i >= (*b).n {
+        return 0 as u32
+    }
+    return rt.ld32((*b).d, i)
+}
+
+fn bn_setlimb(b: *mut Bn, i: usize, v: u32) {
+    if i >= BN_LIMBS {
+        return
+    }
+    rt.st32((*b).d, i, v)
+    if i >= (*b).n {
+        var k: usize = (*b).n
+        while k < i {
+            rt.st32((*b).d, k, 0 as u32)
+            k = k + 1
+        }
+        (*b).n = i + 1
+    }
+}
+
+fn bn_norm(b: *mut Bn) {
+    while (*b).n > 0 {
+        if rt.ld32((*b).d, (*b).n - 1) != 0 as u32 {
+            return
+        }
+        (*b).n = (*b).n - 1
+    }
+}
+
+fn bn_is_zero(b: *mut Bn) -> bool {
+    return (*b).n == 0
+}
+
+fn bn_set_u64(b: *mut Bn, v: u64) {
+    (*b).n = 0
+    if v == 0 {
+        return
+    }
+    rt.st32((*b).d, 0, (v & 4294967295) as u32)
+    (*b).n = 1
+    if v >= 4294967296 {
+        rt.st32((*b).d, 1, (v >> 32) as u32)
+        (*b).n = 2
+    }
+}
+
+fn bn_copy(target: *mut Bn, source: *mut Bn) {
+    var i: usize = 0
+    while i < (*source).n {
+        rt.st32((*target).d, i, rt.ld32((*source).d, i))
+        i = i + 1
+    }
+    (*target).n = (*source).n
+}
+
+fn bn_cmp(a: *mut Bn, b: *mut Bn) -> i32 {
+    if (*a).n != (*b).n {
+        if (*a).n < (*b).n {
+            return -1
+        }
+        return 1
+    }
+    var i: usize = (*a).n
+    while i > 0 {
+        i = i - 1
+        let x: u32 = rt.ld32((*a).d, i)
+        let y: u32 = rt.ld32((*b).d, i)
+        if x != y {
+            if x < y {
+                return -1
+            }
+            return 1
+        }
+    }
+    return 0
+}
+
+// a -= b, precondition a >= b
+fn bn_sub(a: *mut Bn, b: *mut Bn) {
+    var borrow: u64 = 0
+    var i: usize = 0
+    while i < (*a).n {
+        let x: u64 = bn_limb(a, i) as u64
+        let y: u64 = bn_limb(b, i) as u64 + borrow
+        if x >= y {
+            rt.st32((*a).d, i, (x - y) as u32)
+            borrow = 0
+        } else {
+            rt.st32((*a).d, i, (x + 4294967296 - y) as u32)
+            borrow = 1
+        }
+        i = i + 1
+    }
+    bn_norm(a)
+}
+
+// a *= m
+fn bn_mul_small(a: *mut Bn, m: u32) {
+    if m == 0 as u32 {
+        (*a).n = 0
+        return
+    }
+    var carry: u64 = 0
+    var i: usize = 0
+    let n: usize = (*a).n
+    while i < n {
+        let p: u64 = rt.ld32((*a).d, i) as u64 * m as u64 + carry
+        rt.st32((*a).d, i, (p & 4294967295) as u32)
+        carry = p >> 32
+        i = i + 1
+    }
+    while carry != 0 {
+        bn_setlimb(a, i, (carry & 4294967295) as u32)
+        carry = carry >> 32
+        i = i + 1
+    }
+    bn_norm(a)
+}
+
+// a += v
+fn bn_add_small(a: *mut Bn, v: u32) {
+    var carry: u64 = v as u64
+    var i: usize = 0
+    while carry != 0 {
+        let s: u64 = bn_limb(a, i) as u64 + carry
+        bn_setlimb(a, i, (s & 4294967295) as u32)
+        carry = s >> 32
+        i = i + 1
+    }
+    bn_norm(a)
+}
+
+fn bn_bitlen(a: *mut Bn) -> usize {
+    if (*a).n == 0 {
+        return 0
+    }
+    var v: u32 = rt.ld32((*a).d, (*a).n - 1)
+    var bits: usize = 0
+    while v != 0 as u32 {
+        v = v >> 1
+        bits = bits + 1
+    }
+    return ((*a).n - 1) * 32 + bits
+}
+
+// a <<= bits
+fn bn_shl(a: *mut Bn, bits: usize) {
+    if (*a).n == 0 || bits == 0 {
+        return
+    }
+    let words: usize = bits / 32
+    let sh: usize = bits % 32
+    var i: usize = (*a).n
+    if sh == 0 {
+        while i > 0 {
+            i = i - 1
+            bn_setlimb(a, i + words, rt.ld32((*a).d, i))
+        }
+    } else {
+        // the new top limb first, otherwise it would be overwritten
+        let top: u32 = rt.ld32((*a).d, (*a).n - 1) >> (32 - sh)
+        if top != 0 as u32 {
+            bn_setlimb(a, (*a).n + words, top)
+        }
+        while i > 0 {
+            i = i - 1
+            var v: u32 = rt.ld32((*a).d, i) << sh
+            if i > 0 {
+                v = v + (rt.ld32((*a).d, i - 1) >> (32 - sh))
+            }
+            bn_setlimb(a, i + words, v)
+        }
+    }
+    var k: usize = 0
+    while k < words {
+        rt.st32((*a).d, k, 0 as u32)
+        k = k + 1
+    }
+    bn_norm(a)
+}
+
+// a *= 10^e, in steps of 10^9 -- that is the largest power of ten that
+// still fits into one limb.
+fn bn_mul_pow10(a: *mut Bn, e: usize) {
+    var rest: usize = e
+    while rest >= 9 {
+        bn_mul_small(a, 1000000000 as u32)
+        rest = rest - 9
+    }
+    var m: u32 = 1 as u32
+    var k: usize = 0
+    while k < rest {
+        m = m * 10 as u32
+        k = k + 1
+    }
+    if m != 1 as u32 {
+        bn_mul_small(a, m)
+    }
+}
+
+// The whole part of the quotient as a u64; the remainder stays in `num`.
+// Precondition: the quotient fits into 64 bit -- the caller scales
+// beforehand. `tmp` is scratch memory.
+fn bn_div_q(num: *mut Bn, divisor: *mut Bn, tmp: *mut Bn) -> u64 {
+    if bn_cmp(num, divisor) < 0 {
+        return 0
+    }
+    let bn: usize = bn_bitlen(num)
+    let bd: usize = bn_bitlen(divisor)
+    let k: usize = bn - bd
+    if k > 63 {
+        // The caller scaled wrongly; a clean 0 is better than a silently
+        // wrong answer.
+        return 0
+    }
+    var q: u64 = 0
+    var i: usize = k + 1
+    while i > 0 {
+        i = i - 1
+        bn_copy(tmp, divisor)
+        bn_shl(tmp, i)
+        if bn_cmp(num, tmp) >= 0 {
+            bn_sub(num, tmp)
+            q = q + (1 << i)
+        }
+    }
+    return q
+}
+
+fn bits_in_u64(v: u64) -> usize {
+    var x: u64 = v
+    var n: usize = 0
+    while x != 0 {
+        x = x >> 1
+        n = n + 1
+    }
+    return n
+}
+
+// The quotient of 2^s * num0 / den0; the remainder stays in `numw`, the
+// scaled denominator in `denw` -- the rounding afterwards needs both.
+fn float_quot(num0: *mut Bn, den0: *mut Bn, numw: *mut Bn, denw: *mut Bn,
+    tmp: *mut Bn, s: i64) -> u64 {
+    bn_copy(numw, num0)
+    bn_copy(denw, den0)
+    if s >= 0 {
+        bn_shl(numw, s as usize)
+    } else {
+        bn_shl(denw, (0 - s) as usize)
+    }
+    return bn_div_q(numw, denw, tmp)
+}
+
+// The exact path: the digits stand in `(*l).digits` (one per element, value
+// 0..9), `exp0` is the decimal exponent that belongs to them. The result is
+// the BIT PATTERN of the correctly rounded binary64; the literal has no
+// sign, a leading minus is a unary operator of the parser.
+fn float_exact(l: *mut Lexer, exp0: i64) -> u64 {
+    // six big numbers of 256 limbs, one behind the other
+    var block: [u32; 1536] = [0 as u32; 1536]
+    let mem: u64 = (&block[0]) as u64
+    var d: Bn = Bn { d: mem, n: 0, }
+    var num0: Bn = Bn { d: mem + 1024, n: 0, }
+    var den0: Bn = Bn { d: mem + 2048, n: 0, }
+    var numw: Bn = Bn { d: mem + 3072, n: 0, }
+    var denw: Bn = Bn { d: mem + 4096, n: 0, }
+    var tmp: Bn = Bn { d: mem + 5120, n: 0, }
+
+    // --- the digits, leading zeros skipped, the tail folded into a sticky
+    // digit: a digit 1 below the last kept place is smaller than every
+    // non-zero tail and larger than none, so an exact halfway case can
+    // never come out of a tail that was cut off.
+    var exp: i64 = exp0
+    var nsig: usize = 0
+    var sticky: bool = false
+    var i: usize = 0
+    let cnt: usize = vec_len[u8](&(*l).digits)
+    while i < cnt {
+        let dig: u32 = vec_at[u8](&(*l).digits, i) as u32
+        // A leading zero carries no information and does not move the
+        // exponent either -- it is simply not a significant digit.
+        if !bn_is_zero(&d) || dig != 0 as u32 {
+            if nsig < F_MAXDIG {
+                bn_mul_small(&d, 10 as u32)
+                bn_add_small(&d, dig)
+                nsig = nsig + 1
+            } else {
+                // one digit less in front, one more in the exponent
+                exp = exp + 1
+                if dig != 0 as u32 {
+                    sticky = true
+                }
+            }
+        }
+        i = i + 1
+    }
+    if sticky {
+        bn_mul_small(&d, 10 as u32)
+        bn_add_small(&d, 1 as u32)
+        exp = exp - 1
+    }
+    if bn_is_zero(&d) {
+        return 0
+    }
+
+    // --- rough range: 10^(magnitude-1) <= value < 10^magnitude
+    let magnitude: i64 = exp + nsig as i64
+    if magnitude - 1 >= 309 {
+        return F_INF_BITS
+    }
+    if magnitude <= -400 {
+        return 0
+    }
+
+    // --- the value as a fraction of two integers
+    bn_copy(&num0, &d)
+    bn_set_u64(&den0, 1)
+    if exp > 0 {
+        bn_mul_pow10(&num0, exp as usize)
+    } else if exp < 0 {
+        bn_mul_pow10(&den0, (0 - exp) as usize)
+    }
+
+    // --- scale until the quotient has exactly 53 bit
+    var s: i64 = 53 - (bn_bitlen(&num0) as i64 - bn_bitlen(&den0) as i64)
+    var q: u64 = 0
+    var done: bool = false
+    var iter: usize = 0
+    while !done && iter < 6 {
+        q = float_quot(&num0, &den0, &numw, &denw, &tmp, s)
+        let qb: i64 = bits_in_u64(q) as i64
+        if qb == 53 {
+            done = true
+        } else {
+            s = s + (53 - qb)
+        }
+        iter = iter + 1
+    }
+    var e2: i64 = 0 - s
+    // Below 2^-1074 there is no room left for 53 bit: the number becomes
+    // subnormal and the quotient is taken at the fixed place.
+    if e2 < -1074 {
+        s = 1074
+        e2 = -1074
+        q = float_quot(&num0, &den0, &numw, &denw, &tmp, s)
+    }
+
+    // --- round: the remainder against half the denominator, at exactly
+    // half distance towards the even mantissa
+    bn_shl(&numw, 1)
+    let cv: i32 = bn_cmp(&numw, &denw)
+    var up: bool = false
+    if cv > 0 {
+        up = true
+    } else if cv == 0 {
+        if q % 2 == 1 {
+            up = true
+        }
+    }
+    if up {
+        q = q + 1
+        if q == F_TWO53 {
+            q = F_TWO52
+            e2 = e2 + 1
+        }
+    }
+    if e2 > 971 {
+        return F_INF_BITS
+    }
+    if q == 0 {
+        return 0
+    }
+    if q >= F_TWO52 {
+        let biased: u64 = (e2 + 1075) as u64
+        return (biased << 52) + (q - F_TWO52)
+    }
+    // subnormal: the exponent field stays 0, the quotient IS the mantissa
+    return q
+}
+
 // Clinger's fast path: if the mantissa fits into 2^53 and the decimal
 // exponent lies between -22 and 22, ONE multiplication or division is
 // correctly rounded in binary64 -- so the result is exact to the bit.
-// Otherwise it is computed step by step (`float_slow`), which can be one
-// ULP off. A complete algorithm (Eisel-Lemire) needs 128 bit
-// arithmetic and is still to come.
-fn float_value(l: *mut Lexer, mant: u64, overflow: bool, e: i64) -> f64 {
-    if !overflow && mant <= 9007199254740992 && e >= -22 && e <= 22 {
+// Everything else goes through `float_exact` and is exact as well; the
+// counter `float_slow` says how often that was necessary.
+fn float_bits(l: *mut Lexer, mant: u64, overflow: bool, e: i64) -> u64 {
+    if !overflow && mant <= F_TWO53 && e >= -22 && e <= 22 {
         let f: f64 = mant as f64
         if e >= 0 {
-            return f * ten_high(e as usize)
+            return bits_of(f * ten_high(e as usize))
         }
-        return f / ten_high((0 - e) as usize)
+        return bits_of(f / ten_high((0 - e) as usize))
     }
     // An extension of Clinger: if the exponent is above 22, the excess can
     // often be folded into the MANTISSA, as long as that stays exact
@@ -624,22 +1050,12 @@ fn float_value(l: *mut Lexer, mant: u64, overflow: bool, e: i64) -> f64 {
     if !overflow && e > 22 && e <= 37 {
         let excess: usize = (e - 22) as usize
         let factor: u64 = ten_high_whole(excess)
-        if factor > 0 && mant <= 9007199254740992 / factor {
-            return (mant * factor) as f64 * ten_high(22)
+        if factor > 0 && mant <= F_TWO53 / factor {
+            return bits_of((mant * factor) as f64 * ten_high(22))
         }
     }
     (*l).float_slow = (*l).float_slow + 1
-    var f: f64 = mant as f64
-    var k: i64 = e
-    while k > 0 {
-        f = f * 10.0
-        k = k - 1
-    }
-    while k < 0 {
-        f = f / 10.0
-        k = k + 1
-    }
-    return f
+    return float_exact(l, e)
 }
 
 fn lex_float_rest(l: *mut Lexer, line: u32, col: u32, width0: u32,
@@ -660,11 +1076,18 @@ fn lex_float_rest(l: *mut Lexer, line: u32, col: u32, width0: u32,
                 continue
             }
             if !is_digit(c) { break }
-            if mant > 1844674407370955161 {
+            let dig: u64 = (c - 48) as u64
+            // The limit is computed WITH the digit: `mant * 10 + dig` used
+            // to wrap around silently at the last digit, and
+            // `18446744073709551616.0` became 0.0 (round 65).
+            if mant > (18446744073709551615 - dig) / 10 {
                 over = true
             } else {
-                mant = mant * 10 + (c - 48) as u64
+                mant = mant * 10 + dig
             }
+            // The digits go into the same scratch pad as those before the
+            // point; `float_exact` reads all of them together.
+            vec_push[u8](&(*l).digits, (c - 48) as u8)
             n_after = n_after + 1
             vor1(l)
             width = width + 1
@@ -708,10 +1131,10 @@ fn lex_float_rest(l: *mut Lexer, line: u32, col: u32, width0: u32,
         }
         if neg { expo = 0 - expo }
     }
-    let f: f64 = float_value(l, mant, over, expo - n_after)
+    let bits: u64 = float_bits(l, mant, over, expo - n_after)
     var b2: u32 = width
     if b2 < 1 { b2 = 1 }
-    tok(l, A_FLOAT, line, col, b2, bits_of(f), 0)
+    tok(l, A_FLOAT, line, col, b2, bits, 0)
     return true
 }
 
@@ -785,10 +1208,13 @@ fn lex_int(l: *mut Lexer) {
             var ue: bool = false
             var i: usize = 0
             while i < cnt {
-                if m > 1844674407370955161 {
+                let dig: u64 = vec_at[u8](&(*l).digits, i) as u64
+                // WITH the digit in the limit: `m * 10 + dig` wrapped
+                // around silently before (round 65).
+                if m > (18446744073709551615 - dig) / 10 {
                     ue = true
                 } else {
-                    m = m * 10 + vec_at[u8](&(*l).digits, i) as u64
+                    m = m * 10 + dig
                 }
                 i = i + 1
             }
