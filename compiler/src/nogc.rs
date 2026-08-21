@@ -430,6 +430,7 @@ mod tests {
             } else {
                 Vec::new()
             },
+            extern_info: None,
         }
     }
 

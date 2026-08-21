@@ -217,6 +217,11 @@ impl<'a> Checker<'a> {
         // field in a gc class gets the right message.
         crate::gc::layout_classes(self);
         self.collect_fns(prog);
+        // HOOK extfn: register `extern fn` / `#[export_c]` link names
+        // (extfn.rs, SPEC §14.5, round 75). Needs to run once collect_fns
+        // has resolved names, so it runs on the SAME `FnDecl.name` values
+        // that lowering and codegen see.
+        crate::extfn::register(prog);
         // HOOK iface: check `impl I for T` completely — all methods present,
         // all signatures matching (iface.rs, round 46). Runs BEFORE the bodies,
         // so that the message about the implementation comes before the one
@@ -280,6 +285,25 @@ impl<'a> Checker<'a> {
                 if self.check_one_attr(a, true) && a.name == "must_consume" {
                     self.must_consume_fns.insert(f.name.clone());
                 }
+            }
+            // **Round 75** (SPEC §14.5) — `#[link_name(...)]` only makes
+            // sense on a body-less declaration; `#[export_c]` only on one
+            // WITH a body (there has to be something to export). Checked
+            // here rather than in `attrs.rs`, because it needs to know
+            // whether THIS declaration is `extern`.
+            let has_link_name = attrs.iter().any(|a| a.name == "link_name");
+            let has_export_c = attrs.iter().any(|a| a.name == "export_c");
+            if has_link_name && f.extern_info.is_none() {
+                self.dg.error(
+                    f.span,
+                    "'#[link_name(...)]' only belongs on an 'extern fn' declaration",
+                );
+            }
+            if has_export_c && f.extern_info.is_some() {
+                self.dg.error(
+                    f.span,
+                    "'#[export_c]' does not belong on 'extern fn' (it has no body to export)",
+                );
             }
         }
         for sd in &prog.structs {
@@ -544,6 +568,12 @@ impl<'a> Checker<'a> {
     }
 
     fn check_fn(&mut self, f: &FnDecl) {
+        // **Round 75** (SPEC §14.5) — `extern fn` has no body: nothing to
+        // type-check and no "reaches the end without return" to report
+        // (there IS no end here, the function is defined elsewhere).
+        if f.extern_info.is_some() {
+            return;
+        }
         let sig = match self.fns.get(&f.name) {
             Some(s) => s.clone(),
             None => return, // label declared twice, reported already
@@ -1362,6 +1392,39 @@ impl<'a> Checker<'a> {
                 // HOOK iface: `x as dyn I` — the interface value (iface.rs)
                 if let Some(t) = crate::iface::hook_cast(self, e.span, &src, &dst) {
                     return t;
+                }
+                // **Round 75** (SPEC §14.5) — `name as *T` / `name as *mut T`
+                // where `name` is a DIRECTLY NAMED top-level function: the
+                // result is the RAW CODE ADDRESS, so it can be handed to
+                // `extern fn` as a C callback (`qsort`'s `compar`, and
+                // similar). Restricted on purpose to a bare, directly named
+                // function — never a closure, never a value that merely
+                // HAPPENS to hold `Type::Fn` (a variable, a struct field, the
+                // result of a call): only a directly named function is
+                // guaranteed to be a one-word record with NO capture payload
+                // (SPEC/ROUND58 — closures without captures share that
+                // shape, but there is no source-level way to name one other
+                // than through the very literal this rule does not match).
+                // A variable of function type still cannot be cast to a raw
+                // pointer at all — that would silently hand out a captured
+                // closure's record as if it were a bare code pointer, which
+                // is exactly the unsound case this restriction rules out.
+                if let (Type::Fn { .. }, true) = (&src, dst.is_ptr()) {
+                    if let ExprKind::Ident(name) = &inner.kind {
+                        if self.fns.contains_key(name) && self.lookup_var(name).is_none() {
+                            return dst;
+                        }
+                    }
+                    self.dg.error_note(
+                        e.span,
+                        format!(
+                            "conversion from {} to {} is not allowed",
+                            self.tcx.name_of(&src),
+                            self.tcx.name_of(&dst)
+                        ),
+                        "only a directly named function ('name as *T') may be cast to a raw pointer, for use as a C callback (SPEC §14.5) — a value merely of a function type may be a closure with captures and has no bare code address",
+                    );
+                    return Type::Error;
                 }
                 let ok = cast_kind(&src) && cast_kind(&dst);
                 if !ok {
@@ -2720,6 +2783,7 @@ mod tests {
             body: blk(vec![Stmt::Return { value: Some(ret_base), span: sp() }]),
             span: sp(),
             attrs: Vec::new(),
+            extern_info: None,
         };
         let ret_main = b.int(0);
         let first = Program {
@@ -2746,6 +2810,7 @@ mod tests {
                 body: blk(vec![Stmt::Return { value: Some(call), span: sp() }]),
                 span: sp(),
                 attrs: Vec::new(),
+                extern_info: None,
             }],
             expr_count: b.next,
             ..Default::default()
@@ -2783,6 +2848,7 @@ mod tests {
                 body: blk(vec![Stmt::Return { value: Some(call), span: sp() }]),
                 span: sp(),
                 attrs: Vec::new(),
+                extern_info: None,
             }],
             expr_count: b.next,
             ..Default::default()
@@ -2828,7 +2894,7 @@ mod tests {
             params: Vec::new(),
             ret: Some(named("i32")),
             body: blk(body),
-            span: sp(), attrs: Vec::new(),
+            span: sp(), attrs: Vec::new(), extern_info: None,
         }
     }
 
@@ -3194,6 +3260,7 @@ mod tests {
             body: blk(vec![Stmt::Return { value: Some(fret), span: sp() }]),
             span: sp(),
             attrs: Vec::new(),
+            extern_info: None,
         };
         let prog = Program {
             profile: None,
@@ -3401,6 +3468,7 @@ mod tests {
             body: blk(Vec::new()),
             span: sp(),
             attrs: Vec::new(),
+            extern_info: None,
         };
         let prog = Program {
             profile: None,
