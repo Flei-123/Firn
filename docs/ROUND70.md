@@ -16,17 +16,46 @@ words, and whoever wants the pointer and the length writes `s.p` and `s.n`.
 
 ## The numbers of the acceptance
 
+Everything below was really run, in this worktree, on this machine.
+
 | what | measured |
 |---|---|
-| `bash test.sh` | see the section "Acceptance" below |
-| `bash tools/self_compare.sh` | 0 differing / 0 faulty / CODEGEN MISSING 0 |
-| `bash tools/fixpoint.sh` | stage 2 == stage 3, character-identical |
-| lex/parser/types/sema/fir_compare | no new deviations |
-| `bash tools/kernel/run.sh` | 174 / 0 |
-| `bash tools/freestanding/run.sh` | 41 / 0 |
-| `bash tools/english/check.sh` | 0 0 0 0 0 |
-| `bash tools/lexnum/run.sh` | unchanged |
-| `bash tools/strsoak/run.sh` | flat with the collector, growing without it |
+| `bash test.sh` | **PASS 1038 / 1038**, 0 failed (base: 977 / 977) |
+| `bash tools/self_compare.sh` | 278 same behaviour, **0 differing, 0 faulty**, CODEGEN MISSING **0** |
+| `bash tools/fixpoint.sh` | **stage 2 == stage 3, character-identical, 599307 lines of assembly** (3520584 octets each) |
+| lexer comparison (11) | SAME 598, DIFFERENT 0, 858960 tokens |
+| parser comparison (12) | SAME 349, DIFFERENT 1 (known and named: 1) |
+| layout/ABI comparison (13) | SAME 296, DIFFERENT 0 |
+| type check comparison (14) | SAME 171, DIFFERENT 0 |
+| lowering comparison (15) | SAME 168, DIFFERENT 1 (known and named: 1) |
+| `bash tools/kernel/run.sh` | **174 passed, 0 failed** |
+| `bash tools/freestanding/run.sh` | **41 passed, 0 failed** |
+| `bash tools/english/check.sh` | **0 0 0 0 0** |
+| `bash tools/lexnum/run.sh` | 4044 float + 1250 integer literals, 0 differing everywhere (unchanged) |
+| `bash tools/fmt/run.sh` | 641 files, 0 changed by the shape, 0 tree deviations |
+| `bash tools/strsoak/run.sh` | see below |
+
+**No new deviations** in the five comparison tools: the one in the parser
+comparison and the one in the lowering comparison are the ones that were
+already known and named before this round.
+
+### The leak proof (`tools/strsoak/run.sh`, test.sh section 29)
+
+200000 rounds with 8 concatenations each = 1.6 million short lived strings,
+4000000 octets built, in BOTH compilers:
+
+```
+firnc0 collected : rss_peak_kib=1448    runs=219  heap_kib=1280
+firnc0 leaking   : rss_peak_kib=221592  runs=0    heap_kib=225280
+firnc1 collected : rss_peak_kib=1620    runs=219  heap_kib=1280
+firnc1 leaking   : rss_peak_kib=221760  runs=0    heap_kib=225280
+```
+
+With the collector the resident memory stays at **1.4 MiB** and does not move;
+with the collection threshold set to infinity the same loop grows to **217
+MiB**. The counter-check is not decoration -- it is what makes the green
+result worth anything, and the script fails if the counter-check stays flat
+too.
 
 ## 1. `str` -- the language type
 
@@ -233,6 +262,26 @@ and delete the other -- the callers only need the name.
 Beyond that: `lib/gc/gc.fi` (the three `str` runtime functions, `gc class
 StrBytes`, `gc_set_limit`, the state slot `S_STR_TID = 2144`) and, generated
 from it, `lib/firnc1/gctext.fi` (`tools/gen_gctext.sh`).
+
+## What this round found in passing
+
+* **`bin/astdump.fi` cannot parse `size_of[T]`.** The first version of
+  `tests/1334_type_aliases.fi` proved the widths with `size_of`, and all four
+  tree comparison tools reported a deviation. The gap is older than this round
+  -- no test in the corpus had used `size_of` before. The test now proves the
+  widths by truncation, which says more anyway; the gap in `astdump` stays
+  open and is written down here.
+* **`io.fmt_bool` printed German.** `wahr`/`falsch` was the only place in the
+  whole project where a German word came OUT of a Firn program. It was
+  invisible until now, because the interpolation cast every value to `i64` and
+  never reached the function. Now it says `true`/`false`; four expected
+  outputs in the corpus were pulled along.
+* **The collector runtime lives in the root namespace.** As soon as a program
+  pulls it in, the constants of `lib/gc/gc.fi` are program wide.
+  `tests/806_std_io_core.fi` declared `SYS_CLOSE` itself and collided with it;
+  the test now names its three syscall numbers differently. That is a
+  pre-existing property of the runtime, made visible by this round because
+  `std.io` now hands out `str`.
 
 ## The demo, before and after
 
