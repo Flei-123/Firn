@@ -104,6 +104,7 @@ def main():
     show = 0
     sub = "test"
     limit = 0
+    details = None
     i = 0
     while i < len(args):
         if args[i] == "--json":
@@ -116,6 +117,8 @@ def main():
             root = args[i + 1]; i += 2
         elif args[i] == "--limit":
             limit = int(args[i + 1]); i += 2
+        elif args[i] == "--details":
+            details = args[i + 1]; i += 2
         else:
             i += 1
 
@@ -240,6 +243,10 @@ def main():
         print("--- the first %d failures ---" % show)
         for f in failed[:show]:
             print("  %-70s %s | %s" % (f[0], f[2], f[1]))
+    if details:
+        with open(details, "w") as fh:
+            for f in failed:
+                fh.write("%s\t%s\t%s\n" % (f[2], f[1].replace("\t", " "), f[0]))
     if jsonout:
         json.dump({"total": total, "passed": passed,
                    "failed": total - passed, "reasons": reasons,
