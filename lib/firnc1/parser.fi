@@ -112,6 +112,19 @@ const A_EOF: u32 = 68
 const A_FSTR: u32 = 69
 // ROUND 68: `~`, the bitwise complement.
 const A_TILDE: u32 = 70
+// ROUND 70 (lexer.fi): the compound assignments and the two step operators.
+const A_PLUSEQ: u32 = 71
+const A_MINUSEQ: u32 = 72
+const A_STAREQ: u32 = 73
+const A_SLASHEQ: u32 = 74
+const A_PERCENTEQ: u32 = 75
+const A_AMPEQ: u32 = 76
+const A_PIPEEQ: u32 = 77
+const A_CARETEQ: u32 = 78
+const A_SHLEQ: u32 = 79
+const A_SHREQ: u32 = 80
+const A_PLUSPLUS: u32 = 81
+const A_MINUSMINUS: u32 = 82
 
 // binary operators -- in the same order as `ast::BinOp`.
 const B_ADD: u32 = 0
@@ -1437,15 +1450,40 @@ fn asm_block(p: *mut Parser) -> u32 {
     return ast.expr_new(par_tree(p), ast.E_CALL, name, off, len, 0)
 }
 
+// ROUND 70 (parser.rs::compound_op) -- which arithmetic operator does this
+// compound assignment carry? NONE for every other token.
+//
+// The numbers are the ones of `E_BIN` (add sub mul div rem and or xor shl
+// shr = 0..9). The table is the whole definition: `x op= e` is exactly
+// `x = x op e`.
+fn compound_op(k: u32) -> u32 {
+    if k == A_PLUSEQ { return 0 }
+    if k == A_MINUSEQ { return 1 }
+    if k == A_STAREQ { return 2 }
+    if k == A_SLASHEQ { return 3 }
+    if k == A_PERCENTEQ { return 4 }
+    if k == A_AMPEQ { return 5 }
+    if k == A_PIPEEQ { return 6 }
+    if k == A_CARETEQ { return 7 }
+    if k == A_SHLEQ { return 8 }
+    if k == A_SHREQ { return 9 }
+    return NONE
+}
+
 fn text_literal(p: *mut Parser) -> u32 {
     let k: usize = tok_nr(p, 0) as usize
-    let n: usize = lexer.lex_lit_len(lx(p), k)
+    let wide: u32 = lexer.lex_lit_kind(lx(p), k)
     next_bump(p)
-    if n == 0 {
-        complain(p)
-        return ast.expr_new(par_tree(p), ast.E_INT, 0, 0, 0, 0)
+    // ROUND 70 (strtype.rs): the empty literal is no longer an error HERE --
+    // `""` is a valid, empty `str`. Where an array is wanted the same
+    // message comes from the type check, which is the only place that knows
+    // the context.
+    let alit: u32 = alit_out_lit(p, lx(p), k)
+    var w: u32 = 0
+    if wide == 2 {
+        w = 1
     }
-    return alit_out_lit(p, lx(p), k)
+    return ast.expr_new(par_tree(p), ast.E_TEXT, alit, w, 0, 0)
 }
 
 // ------------------------------------------------------------ interpolation
@@ -1579,15 +1617,15 @@ fn interp_expr(p: *mut Parser, chain: u32, io_nr: u32, k: usize, of: usize, to: 
         return chain
     }
     let it: *mut intern.Interner = lexer.lex_names(lx(p))
-    var i64t: [u8; 3] = "i64"
-    let i64nr: u32 = intern.intern_number(it, (&i64t[0]) as u64, 3) as u32
-    let i64typ: u32 = ast.ty_new(par_tree(p), ast.T_NAME, i64nr, 0)
-    let cast: u32 = ast.expr_new(par_tree(p), ast.E_AS, e, i64typ, 0, 0)
-    var fz: [u8; 10] = "fmt_number"
-    let number_nr: u32 = qualify(p, io_nr, intern.intern_number(it, (&fz[0]) as u64, 10) as u32)
+    // ROUND 70 -- NO `as i64` any more. Which builder step is right depends
+    // on the TYPE of the expression, and only the type check knows that.
+    // `io.fmt_value` is the placeholder that the type check and the lowering
+    // both resolve, out of the same material (sema::fmt_target).
+    var fz: [u8; 9] = "fmt_value"
+    let number_nr: u32 = qualify(p, io_nr, intern.intern_number(it, (&fz[0]) as u64, 9) as u32)
     let aoff: u32 = ast.child_start(par_tree(p))
     ast.child_add(par_tree(p), chain)
-    ast.child_add(par_tree(p), cast)
+    ast.child_add(par_tree(p), e)
     return ast.expr_new(par_tree(p), ast.E_CALL, number_nr, aoff, 2, 0)
 }
 
@@ -2166,6 +2204,25 @@ fn stmt(p: *mut Parser) -> u32 {
         return ast.stmt_new(par_tree(p), ast.S_BREAK, 0, 0, 0, 0)
     }
     let e: u32 = expr(p)
+    // ROUND 70 (parser.rs): `x += e` and `x++`. Both are STATEMENTS -- the
+    // parser sees them only here, and that is exactly why there is no
+    // `y = x++`.
+    let cop: u32 = compound_op(kind(p, 0))
+    if cop != NONE {
+        next_bump(p)
+        let cv: u32 = expr(p)
+        end_stmt(p)
+        return ast.stmt_new(par_tree(p), ast.S_ZUWOP, e, cv, cop, 0)
+    }
+    if actual(p, A_PLUSPLUS) || actual(p, A_MINUSMINUS) {
+        var up: u32 = 0
+        if actual(p, A_PLUSPLUS) {
+            up = 1
+        }
+        next_bump(p)
+        end_stmt(p)
+        return ast.stmt_new(par_tree(p), ast.S_STEP, e, up, 0, 0)
+    }
     if actual(p, A_ASSIGN) {
         next_bump(p)
         let v: u32 = expr(p)
@@ -3535,6 +3592,63 @@ fn interfaces_method(p: *mut Parser, ii: u32) -> bool {
     return true
 }
 
+// ROUND 70 (impls.rs::impl_decl): `impl Ord for int` means
+// `impl Ord for i32`. Only the SECOND spelling of a primitive type is
+// folded onto the canonical one, so that exactly ONE method name
+// (`i32__less`) can come into being; everything else passes through
+// untouched. The two tables stand in the same order -- entry k of the one
+// is entry k of the other (types.fi::alias_ty).
+fn canon_alias(p: *mut Parser, nr: u32) -> u32 {
+    var from: [u8; 53] = "sbyte|short|int|long|byte|ushort|uint|ulong||||double"
+    var to: [u8; 50] = "i8|i16|i32|i64|u8|u16|u32|u64|usize|isize|bool|f64"
+    let it: *mut intern.Interner = lexer.lex_names(lx(p))
+    let q: u64 = intern.intern_ptr(it, nr)
+    let n: usize = intern.intern_length(it, nr)
+    var i: usize = 0
+    var k: i32 = 0
+    var start: usize = 0
+    while i <= 53 {
+        var end: bool = i == 53
+        if !end {
+            end = from[i] == 124 as u8
+        }
+        if end {
+            if i - start == n && n > 0 {
+                if rt.mem_eq((&from[start]) as u64, q, n) {
+                    return canon_at(it, k)
+                }
+            }
+            k = k + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+    return nr
+}
+
+// The k-th name of the canonical table as an interner number.
+fn canon_at(it: *mut intern.Interner, k: i32) -> u32 {
+    var to: [u8; 50] = "i8|i16|i32|i64|u8|u16|u32|u64|usize|isize|bool|f64"
+    var j: usize = 0
+    var m: i32 = 0
+    var start: usize = 0
+    while j <= 50 {
+        var end: bool = j == 50
+        if !end {
+            end = to[j] == 124 as u8
+        }
+        if end {
+            if m == k {
+                return intern.intern_number(it, (&to[start]) as u64, j - start) as u32
+            }
+            m = m + 1
+            start = j + 1
+        }
+        j = j + 1
+    }
+    return 0
+}
+
 fn impl_decl(p: *mut Parser) {
     next_bump(p)
     let first: u32 = tok_nr(p, 0)
@@ -3556,6 +3670,8 @@ fn impl_decl(p: *mut Parser) {
         next_bump(p)
         is_for = true
     }
+    // ROUND 70: `int` -> `i32` BEFORE the module renaming.
+    raw = canon_alias(p, raw)
     let tname: u32 = renamed(p, raw)
     if is_for && has_if(p) {
         iface.if_impl_add(ifr(p), first, raw)

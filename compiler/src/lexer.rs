@@ -93,6 +93,23 @@ pub enum TokKind {
     Le,
     Gt,
     Ge,
+    /// **ROUND 70** - the compound assignments `+= -= *= /= %=` and the bit
+    /// variants `&= |= ^= <<= >>=`. They open a STATEMENT, not an operator:
+    /// `x += e` is exactly `x = x + e` (SPEC 12.7).
+    PlusEq,
+    MinusEq,
+    StarEq,
+    SlashEq,
+    PercentEq,
+    AmpEq,
+    PipeEq,
+    CaretEq,
+    ShlEq,
+    ShrEq,
+    /// **ROUND 70** - `++` and `--`. Only as a statement, never inside an
+    /// expression; the prefix/postfix difference of C does not exist here.
+    PlusPlus,
+    MinusMinus,
     Eof,
 }
 
@@ -164,6 +181,18 @@ impl TokKind {
             TokKind::OrOr => "||".into(),
             TokKind::Not => "!".into(),
             TokKind::Tilde => "~".into(),
+            TokKind::PlusEq => "+=".into(),
+            TokKind::MinusEq => "-=".into(),
+            TokKind::StarEq => "*=".into(),
+            TokKind::SlashEq => "/=".into(),
+            TokKind::PercentEq => "%=".into(),
+            TokKind::AmpEq => "&=".into(),
+            TokKind::PipeEq => "|=".into(),
+            TokKind::CaretEq => "^=".into(),
+            TokKind::ShlEq => "<<=".into(),
+            TokKind::ShrEq => ">>=".into(),
+            TokKind::PlusPlus => "++".into(),
+            TokKind::MinusMinus => "--".into(),
             TokKind::EqEq => "==".into(),
             TokKind::NotEq => "!=".into(),
             TokKind::Lt => "<".into(),
@@ -242,6 +271,10 @@ impl<'a> Lexer<'a> {
     }
     fn peek2(&self) -> Option<char> {
         self.chars.get(self.pos + 1).copied()
+    }
+    /// ROUND 70: needed for `<<=` and `>>=`.
+    fn peek3(&self) -> Option<char> {
+        self.chars.get(self.pos + 2).copied()
     }
     /// One character onwards; keeps line/column up to date.
     fn bump(&mut self) -> Option<char> {
@@ -507,8 +540,36 @@ impl<'a> Lexer<'a> {
             None => return true,
         };
         let n = self.peek2();
+        // ROUND 70: THREE characters first - `<<=` and `>>=` would otherwise
+        // be read as `<<` plus `=`, and the compound assignment would fall
+        // apart into two tokens.
+        let three = match (c, n, self.peek3()) {
+            ('<', Some('<'), Some('=')) => Some(TokKind::ShlEq),
+            ('>', Some('>'), Some('=')) => Some(TokKind::ShrEq),
+            _ => None,
+        };
+        if let Some(k) = three {
+            self.bump();
+            self.bump();
+            self.bump();
+            self.push(k, line, col, 3);
+            return true;
+        }
         let (kind, width) = match (c, n) {
             ('-', Some('>')) => (TokKind::Arrow, 2),
+            // ROUND 70: the compound assignments and the two step operators.
+            // `++`/`--` are read GREEDILY; `a - -b` stays two tokens because
+            // of the blank between them, `a --b` becomes `a`, `--`, `b`.
+            ('+', Some('=')) => (TokKind::PlusEq, 2),
+            ('-', Some('=')) => (TokKind::MinusEq, 2),
+            ('*', Some('=')) => (TokKind::StarEq, 2),
+            ('/', Some('=')) => (TokKind::SlashEq, 2),
+            ('%', Some('=')) => (TokKind::PercentEq, 2),
+            ('&', Some('=')) => (TokKind::AmpEq, 2),
+            ('|', Some('=')) => (TokKind::PipeEq, 2),
+            ('^', Some('=')) => (TokKind::CaretEq, 2),
+            ('+', Some('+')) => (TokKind::PlusPlus, 2),
+            ('-', Some('-')) => (TokKind::MinusMinus, 2),
             ('.', Some('.')) => (TokKind::DotDot, 2),
             ('<', Some('<')) => (TokKind::Shl, 2),
             ('>', Some('>')) => (TokKind::Shr, 2),

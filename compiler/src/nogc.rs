@@ -171,10 +171,16 @@ impl<'a> NoGcChecker<'a> {
             // the same rules.
             Stmt::Defer(inner, _, _) => self.check_stmt(inner),
             Stmt::Let { init, .. } => self.check_expr(init),
-            Stmt::Assign { target, value, span } => {
+            Stmt::Assign { target, value, span }
+            | Stmt::AssignOp { target, value, span, .. } => {
                 self.check_write_target(target, *span);
                 self.check_expr(target);
                 self.check_expr(value);
+            }
+            // ROUND 70: the step writes into the target as well.
+            Stmt::Step { target, span, .. } => {
+                self.check_write_target(target, *span);
+                self.check_expr(target);
             }
             Stmt::If { cond, then, els, .. } => {
                 self.check_expr(cond);
@@ -234,6 +240,8 @@ impl<'a> NoGcChecker<'a> {
 
     fn check_expr(&mut self, e: &Expr) {
         match &e.kind {
+            // ROUND 70: the text literal carries its array literal inside.
+            ExprKind::Text(_, inner) => self.check_expr(inner),
             // Round 58: `gc fn(…)` allocates — inside `#[no_gc]` that has to
             // strike, and so has everything the body does.
             ExprKind::Lambda(d) => {

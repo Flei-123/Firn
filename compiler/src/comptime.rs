@@ -182,6 +182,13 @@ impl<'a> Execution<'a> {
                 }
                 Ok(Flow::Next)
             }
+            // ROUND 70: the comptime interpreter knows no compound
+            // assignment. It refuses it with a message instead of
+            // computing something wrong.
+            Stmt::AssignOp { span, .. } | Stmt::Step { span, .. } => Err((
+                *span,
+                "comptime: '+=' and '++' are not available inside a comptime block".to_string(),
+            )),
             Stmt::Assign { target, value, span } => {
                 let v = self.expr(value, env, depth)?;
                 let name = match &target.kind {
@@ -489,7 +496,13 @@ fn literal_text(args: &[Expr], span: Span) -> Result<String, Error> {
     if args.len() != 1 {
         return Err((span, "comptime: 'emit_raw' expects exactly one argument".to_string()));
     }
-    let elems = match &args[0].kind {
+    // ROUND 70 (strtype.rs): the text literal is its own node now and
+    // carries the array literal of its octets inside.
+    let inner = match &args[0].kind {
+        ExprKind::Text(_, inner) => inner,
+        _ => &args[0],
+    };
+    let elems = match &inner.kind {
         ExprKind::ArrayLit(v) => v,
         _ => {
             return Err((

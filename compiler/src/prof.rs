@@ -280,10 +280,13 @@ impl Guard<'_> {
                 }
                 self.expr(init);
             }
-            Stmt::Assign { target, value, .. } => {
+            Stmt::Assign { target, value, .. }
+            | Stmt::AssignOp { target, value, .. } => {
                 self.expr(target);
                 self.expr(value);
             }
+            // ROUND 70: the step has no value expression.
+            Stmt::Step { target, .. } => self.expr(target),
             Stmt::If { cond, then, els, .. } => {
                 self.expr(cond);
                 self.block(then);
@@ -315,6 +318,8 @@ impl Guard<'_> {
     fn expr(&mut self, e: &Expr) {
         match &e.kind {
             ExprKind::Float(_) => self.fp(e.span, "a floating point literal"),
+            // ROUND 70: the text literal carries its array literal inside.
+            ExprKind::Text(_, inner) => self.expr(inner),
             // Round 58: the body of a closure is checked like any other.
             ExprKind::Lambda(d) => {
                 for p in &d.params {

@@ -233,7 +233,7 @@ fn satisfies(te: &TypeExpr, b: &Bound) -> bool {
 
 fn is_int_name(n: &str) -> bool {
     matches!(
-        n,
+        crate::types::canon_name(n),
         "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "usize" | "isize"
     )
 }
@@ -374,10 +374,12 @@ fn subst_stmt(s: &mut Stmt, map: &HashMap<String, TypeExpr>, queue: &mut Vec<(St
             }
             subst_expr(init, map, queue);
         }
-        Stmt::Assign { target, value, .. } => {
+        Stmt::Assign { target, value, .. } | Stmt::AssignOp { target, value, .. } => {
             subst_expr(target, map, queue);
             subst_expr(value, map, queue);
         }
+        // ROUND 70: the step has no value expression.
+        Stmt::Step { target, .. } => subst_expr(target, map, queue),
         Stmt::If { cond, then, els, .. } => {
             subst_expr(cond, map, queue);
             subst_block(then, map, queue);
@@ -410,6 +412,8 @@ fn subst_expr(e: &mut Expr, map: &HashMap<String, TypeExpr>, queue: &mut Vec<(St
     match &mut e.kind {
         ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) => {}
         ExprKind::Ident(_) => {}
+        // ROUND 70: the text literal carries its array literal inside.
+        ExprKind::Text(_, inner) => subst_expr(inner, map, queue),
         // Round 58: a closure inside a template is refused by
         // `check_bare_expr`; the types are substituted anyway, so that a
         // follow-up error stays readable.
@@ -477,10 +481,12 @@ fn renumber_stmt(s: &mut Stmt, next: &mut u32) {
     match s {
         Stmt::Defer(inner, _, _) => renumber_stmt(inner, next),
         Stmt::Let { init, .. } => renumber_expr(init, next),
-        Stmt::Assign { target, value, .. } => {
+        Stmt::Assign { target, value, .. } | Stmt::AssignOp { target, value, .. } => {
             renumber_expr(target, next);
             renumber_expr(value, next);
         }
+        // ROUND 70: the step has no value expression.
+        Stmt::Step { target, .. } => renumber_expr(target, next),
         Stmt::If { cond, then, els, .. } => {
             renumber_expr(cond, next);
             renumber_block(then, next);
@@ -513,6 +519,8 @@ pub(crate) fn renumber_expr(e: &mut Expr, next: &mut u32) {
     *next += 1;
     match &mut e.kind {
         ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Ident(_) => {}
+        // ROUND 70: the text literal carries its array literal inside.
+        ExprKind::Text(_, inner) => renumber_expr(inner, next),
         ExprKind::Lambda(d) => renumber_block(&mut d.body, next),
         ExprKind::Unary(_, i) => renumber_expr(i, next),
         ExprKind::Binary(_, a, b) => {
@@ -608,10 +616,12 @@ fn check_bare_stmt(s: &Stmt, out: &mut Vec<(Span, String)>) {
             }
             check_bare_expr(init, out);
         }
-        Stmt::Assign { target, value, .. } => {
+        Stmt::Assign { target, value, .. } | Stmt::AssignOp { target, value, .. } => {
             check_bare_expr(target, out);
             check_bare_expr(value, out);
         }
+        // ROUND 70: the step has no value expression.
+        Stmt::Step { target, .. } => check_bare_expr(target, out),
         Stmt::If { cond, then, els, .. } => {
             check_bare_expr(cond, out);
             check_bare_block(then, out);
@@ -642,6 +652,8 @@ fn check_bare_stmt(s: &Stmt, out: &mut Vec<(Span, String)>) {
 fn check_bare_expr(e: &Expr, out: &mut Vec<(Span, String)>) {
     match &e.kind {
         ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Ident(_) => {}
+        // ROUND 70: the text literal carries its array literal inside.
+        ExprKind::Text(_, inner) => check_bare_expr(inner, out),
         // Round 58: a closure body carries types like any other body.
         ExprKind::Lambda(d) => {
             for p in &d.params {

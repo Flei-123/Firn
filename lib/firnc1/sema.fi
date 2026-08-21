@@ -66,6 +66,8 @@ struct Sema {
     t_void: u32,
     t_error: u32,
     t_f64: u32,
+    // ROUND 70: the default type of an integer literal without context.
+    t_i32: u32,
     ret: u32, // return type of the current function
     mu: u64, // registry of enumerations/pattern matches (0 = none)
     feh: u64, // registry of error sets/unions (0 = none)
@@ -93,6 +95,9 @@ struct Sema {
     cap_base: Vec[u32],
     cg_name: Vec[u32], cg_ty: Vec[u32], cg_frame: Vec[u32],
     scratch2: rt.Buf, // builds the name of a capture class
+    // ROUND 70: the arguments of an interpolation that may be widened
+    // (`f"{x}"` with an i32 into `io.fmt_number(... i64)`).
+    widen: Vec[u32],
 }
 
 fn sema_new(b: u64, it: u64) -> Sema {
@@ -103,6 +108,7 @@ fn sema_new(b: u64, it: u64) -> Sema {
         v_name: vec_new[u32](), v_ty: vec_new[u32](), b_limit: vec_new[u32](),
         k_name: vec_new[u32](), k_ty: vec_new[u32](), k_value: vec_new[u64](),
         t_bool: 0, t_i64: 0, t_usize: 0, t_void: 0, t_error: 0, t_f64: 0,
+        t_i32: 0,
         ret: 0, mu: 0, feh: 0, gc: 0, ifr: 0, mc_fname: vec_new[u32](), mc_si: vec_new[u32](),
         err: 0, kernel: false, ct_needed: false,
         cl_name: vec_new[u32](), cl_tid: vec_new[u64](), cl_size: vec_new[u64](),
@@ -111,10 +117,12 @@ fn sema_new(b: u64, it: u64) -> Sema {
         cap_base: vec_new[u32](),
         cg_name: vec_new[u32](), cg_ty: vec_new[u32](), cg_frame: vec_new[u32](),
         scratch2: rt.buf_new(),
+        widen: vec_new[u32](),
     }
 }
 
 fn sema_free(s: *mut Sema) {
+    vec_free[u32](&(*s).widen)
     types.types_free(&(*s).ty)
     vec_free[u32](&(*s).etyp)
     vec_free[u32](&(*s).v_name)
@@ -515,6 +523,14 @@ fn probe_t(s: *mut Sema, e: u32, d: u32) -> u32 {
     let a: u32 = ast.e_kind(b, e)
     if a == ast.E_INT {
         return NONE
+    }
+    // ROUND 70: a text literal probes as `str` -- that is how the other side
+    // of `text == "quit"` gets its type (strtype.rs).
+    if a == ast.E_TEXT {
+        if ast.e_b(b, e) == 1 {
+            return NONE
+        }
+        return str_ty(s)
     }
     if a == ast.E_FLOAT {
         return (*s).t_f64
@@ -1059,6 +1075,15 @@ fn binary(s: *mut Sema, e: u32, note: u32) -> u32 {
             complain(s)
             return (*s).t_bool
         }
+        // HOOK str: `==`/`!=` compare the CONTENT (strtype.rs, round 70)
+        if str_like(s, lt) || str_like(s, rt) {
+            if op == 10 || op == 11 {
+                str_need(s, 0)
+                return (*s).t_bool
+            }
+            complain(s)
+            return (*s).t_bool
+        }
         let only_equal: bool = op == 10 || op == 11
         var ok: bool = is_int(s, lt) || is_f64(s, lt)
         if !ok && only_equal {
@@ -1100,11 +1125,7 @@ fn binary(s: *mut Sema, e: u32, note: u32) -> u32 {
         if is_error(s, rt) {
             return lt
         }
-        if !is_int(s, lt) || !is_int(s, rt) {
-            complain(s)
-            return (*s).t_error
-        }
-        return lt
+        return binop_type(s, op, lt, rt)
     }
 
     // arithmetic and bit operations: the already typed operand takes
@@ -1121,6 +1142,33 @@ fn binary(s: *mut Sema, e: u32, note: u32) -> u32 {
     let lt: u32 = expr(s, l, want)
     let rt: u32 = expr(s, r, want)
     if is_error(s, lt) || is_error(s, rt) {
+        return (*s).t_error
+    }
+    return binop_type(s, op, lt, rt)
+}
+
+// ROUND 70 (sema.rs::binop_type) -- the type rules of `a op b` with both
+// operand types already known.
+//
+// `binary` computes with it, and so does the compound assignment
+// (`x op= e`). That is the point: `x += e` has to mean EXACTLY `x = x + e`,
+// and it does, because there is only ONE place where the rules stand.
+fn binop_type(s: *mut Sema, op: u32, lt: u32, rt: u32) -> u32 {
+    // shift: both sides have to be integers, the left one decides
+    if op == 8 || op == 9 {
+        if !is_int(s, lt) || !is_int(s, rt) {
+            complain(s)
+            return (*s).t_error
+        }
+        return lt
+    }
+    // HOOK str: `+` concatenates (strtype.rs, round 70)
+    if str_like(s, lt) || str_like(s, rt) {
+        if op == 0 {
+            str_need(s, 1)
+            return str_ty(s)
+        }
+        complain(s)
         return (*s).t_error
     }
     if is_f64(s, lt) || is_f64(s, rt) {
@@ -1511,7 +1559,18 @@ fn methods_call(s: *mut Sema, e: u32) -> u32 {
             }
             let t: u32 = expr(s, arg, pt)
             if !types.compatible(table(s), t, pt) {
-                complain(s)
+                // ROUND 70: the ONE widening of the interpolation
+                // (sema.rs::check_argument).
+                var fine: bool = widen_ok(s, arg)
+                if fine {
+                    fine = is_int(s, t) && is_int(s, pt)
+                    if fine {
+                        fine = types.bits_of(table(s), pt) >= types.bits_of(table(s), t)
+                    }
+                }
+                if !fine {
+                    complain(s)
+                }
             }
         } else {
             infer(s, arg)
@@ -1768,9 +1827,16 @@ fn call(s: *mut Sema, e: u32) -> u32 {
         }
         return (*s).t_usize
     }
-    let name: u32 = ast.e_a(b, e)
+    var name: u32 = ast.e_a(b, e)
     let off: u32 = ast.e_b(b, e)
     let cnt: u32 = ast.e_c(b, e)
+    // HOOK str: `f"{x}"` -- which builder step is right depends on the TYPE
+    // of x (sema::fmt_target, round 70). The name is resolved here and the
+    // ordinary check runs on the resolved one.
+    let real: u32 = fmt_target(s, name, e)
+    if real != NONE {
+        name = real
+    }
     // HOOK impl (impls.rs::hook_call): `x.m(args)` -- method call.
     if is_method_call(names(s), name) {
         return methods_call(s, e)
@@ -2089,7 +2155,18 @@ fn call(s: *mut Sema, e: u32) -> u32 {
             }
             let t: u32 = expr(s, arg, pt)
             if !types.compatible(table(s), t, pt) {
-                complain(s)
+                // ROUND 70: the ONE widening of the interpolation
+                // (sema.rs::check_argument).
+                var fine: bool = widen_ok(s, arg)
+                if fine {
+                    fine = is_int(s, t) && is_int(s, pt)
+                    if fine {
+                        fine = types.bits_of(table(s), pt) >= types.bits_of(table(s), t)
+                    }
+                }
+                if !fine {
+                    complain(s)
+                }
             }
         } else {
             infer(s, arg)
@@ -2159,12 +2236,21 @@ fn expr_inner(s: *mut Sema, e: u32, note: u32) -> u32 {
             if is_error(s, note) {
                 return (*s).t_error
             }
+            complain(s)
+            return (*s).t_error
         }
-        complain(s)
-        return (*s).t_error
+        // ROUND 70 -- THE DEFAULT TYPE. Nothing outside says anything, so
+        // `i32` holds (sema.rs, the `None` branch at the integer literal).
+        // The context keeps precedence: the branch above runs FIRST.
+        return (*s).t_i32
     }
     if a == ast.E_BOOL {
         return (*s).t_bool
+    }
+    // HOOK str: a text literal -- array literal or `str`, the context
+    // decides (strtype.rs, round 70)
+    if a == ast.E_TEXT {
+        return text_check(s, e, note)
     }
     if a == ast.E_ID {
         // HOOK fnval: a name out of the enclosing function is a capture
@@ -2893,6 +2979,39 @@ fn stmt(s: *mut Sema, i: u32) {
         }
         return
     }
+    // ROUND 70 (sema.rs): `x op= e` -- the same lvalue check as an ordinary
+    // assignment, and afterwards EXACTLY the rules of `x = x op e`
+    // (`binop_type`). `let` stays immutable, because `lvalue` says so.
+    if a == ast.S_ZUWOP {
+        let t: u32 = lvalue(s, ast.s_a(b, i))
+        if t == NONE {
+            expr(s, ast.s_b(b, i), (*s).t_i64)
+            return
+        }
+        // The right side gets the type of the left one as its hint -- exactly
+        // what `binary` would give it (`probe(l)`).
+        let rt: u32 = expr(s, ast.s_b(b, i), t)
+        if is_error(s, t) || is_error(s, rt) {
+            return
+        }
+        let got: u32 = binop_type(s, ast.s_c(b, i), t, rt)
+        if !types.compatible(table(s), got, t) {
+            complain(s)
+        }
+        return
+    }
+    // ROUND 70: `x++` / `x--`. It is exactly `x = x + 1`, so it works on the
+    // types on which `x + 1` works -- the integers.
+    if a == ast.S_STEP {
+        let t: u32 = lvalue(s, ast.s_a(b, i))
+        if t == NONE {
+            return
+        }
+        if !is_error(s, t) && !is_int(s, t) {
+            complain(s)
+        }
+        return
+    }
     if a == ast.S_IF {
         cond(s, ast.s_a(b, i))
         block(s, ast.s_b(b, i), false)
@@ -3020,8 +3139,180 @@ fn block(s: *mut Sema, bi: u32, range_already_open: bool) {
 
 // ---------------------------------------------------------------- the run
 
+// ROUND 70 (strtype.rs::declare) -- the builtin struct `str`:
+// `{ p: *mut u8, n: usize }`, 16 octets, alignment 8. Exactly the layout of
+// `str.Span`, and that is the point of it: the string library of round 42
+// does not have to be written a second time.
+fn str_declare(s: *mut Sema) {
+    let t: *mut types.Types = table(s)
+    var w: [u8; 3] = "str"
+    let name: u32 = intern.intern_number(names(s), (&w[0]) as u64, 3) as u32
+    let idx: u32 = types.types_struct_reserve(t, name)
+    var pw: [u8; 1] = "p"
+    var nw: [u8; 1] = "n"
+    var fnames: Vec[u32] = vec_new[u32]()
+    var ftypes: Vec[u32] = vec_new[u32]()
+    var foffs: Vec[u64] = vec_new[u64]()
+    vec_push[u32](&fnames, intern.intern_number(names(s), (&pw[0]) as u64, 1) as u32)
+    vec_push[u32](&ftypes, types.new_ty(t, types.K_PTR,
+            types.new_ty(t, types.K_U8, 0, 0), 1))
+    vec_push[u64](&foffs, 0)
+    vec_push[u32](&fnames, intern.intern_number(names(s), (&nw[0]) as u64, 1) as u32)
+    vec_push[u32](&ftypes, types.new_ty(t, types.K_USIZE, 0, 0))
+    vec_push[u64](&foffs, 8)
+    types.types_struct_define(t, idx, 16, 8, &fnames, &ftypes, &foffs)
+    vec_free[u32](&fnames)
+    vec_free[u32](&ftypes)
+    vec_free[u64](&foffs)
+}
+
+// The runtime function has to be part of the program. It comes with the
+// collector (`__str_eq` / `__str_concat` in lib/gc/gc.fi); whoever gets here
+// without it gets an error, exactly as in stage 0 (strtype.rs::need).
+fn str_need(s: *mut Sema, which: u32) {
+    var eqw: [u8; 8] = "__str_eq"
+    var caw: [u8; 12] = "__str_concat"
+    var nr: u32 = 0
+    if which == 0 {
+        nr = intern.intern_number(names(s), (&eqw[0]) as u64, 8) as u32
+    } else {
+        nr = intern.intern_number(names(s), (&caw[0]) as u64, 12) as u32
+    }
+    if fn_search(s, nr) == NONE {
+        complain(s)
+    }
+}
+
+// ROUND 70 (sema::fmt_target) -- the target of ONE interpolation step.
+//
+// The parser writes `io.fmt_value(chain, x)`, because at parse time nobody
+// knows what `x` is. Here the type decides: an integer goes to `fmt_number`
+// (signed) resp. `fmt_u64` (unsigned), a `bool` to `fmt_bool`, an `f64` to
+// `fmt_f64`, a `str` to `fmt_str`. Only the LAST name segment is replaced,
+// so the module prefix stays untouched.
+//
+// Returns the new name or NONE.
+fn fmt_target(s: *mut Sema, name: u32, e: u32) -> u32 {
+    let b: *mut ast.Tree = tree(s)
+    let it: *mut intern.Interner = names(s)
+    var vw: [u8; 9] = "fmt_value"
+    let n: usize = intern.intern_length(it, name)
+    if n < 9 {
+        return NONE
+    }
+    let p: u64 = intern.intern_ptr(it, name)
+    if !rt.mem_eq(p + (n - 9) as u64, (&vw[0]) as u64, 9) {
+        return NONE
+    }
+    if ast.e_c(b, e) != 2 {
+        return NONE
+    }
+    let arg: u32 = ast.child_at(b, ast.e_b(b, e) + 1)
+    let t: u32 = expr(s, arg, NONE)
+    if is_error(s, t) {
+        return NONE
+    }
+    var step: [u8; 10] = "fmt_number"
+    var slen: usize = 10
+    if str_like(s, t) {
+        var w1: [u8; 7] = "fmt_str"
+        return fmt_join(s, p, n - 9, (&w1[0]) as u64, 7)
+    }
+    if is_bool(s, t) {
+        var w2: [u8; 8] = "fmt_bool"
+        return fmt_join(s, p, n - 9, (&w2[0]) as u64, 8)
+    }
+    if is_f64(s, t) {
+        var w3: [u8; 7] = "fmt_f64"
+        return fmt_join(s, p, n - 9, (&w3[0]) as u64, 7)
+    }
+    if !is_int(s, t) {
+        complain(s)
+        return NONE
+    }
+    // `io.fmt_number` takes an i64, `io.fmt_u64` a u64. Both are wider than
+    // or as wide as every integer that can arrive here; the lowering widens
+    // (lower.fi). The exception holds for exactly this one argument.
+    vec_push[u32](&(*s).widen, arg)
+    if !types.is_sign(table(s), t) {
+        var w4: [u8; 7] = "fmt_u64"
+        return fmt_join(s, p, n - 9, (&w4[0]) as u64, 7)
+    }
+    return fmt_join(s, p, n - 9, (&step[0]) as u64, slen)
+}
+
+// `<head><step>` as an interner number.
+fn fmt_join(s: *mut Sema, head: u64, hn: usize, step: u64, sn: usize) -> u32 {
+    rt.buf_clear(&(*s).scratch2)
+    rt.buf_push_bytes(&(*s).scratch2, head, hn)
+    rt.buf_push_bytes(&(*s).scratch2, step, sn)
+    return intern.intern_number(names(s), rt.buf_ptr(&(*s).scratch2),
+        rt.buf_len(&(*s).scratch2)) as u32
+}
+
+// Was this argument marked as widenable? (sema.rs::check_argument)
+fn widen_ok(s: *mut Sema, arg: u32) -> bool {
+    var i: usize = 0
+    while i < vec_len[u32](&(*s).widen) {
+        if vec_at[u32](&(*s).widen, i) == arg {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// The type `str` itself.
+fn str_ty(s: *mut Sema) -> u32 {
+    return types.new_ty(table(s), types.K_STRUCT, types.STR_INDEX, 0)
+}
+
+// Is this type a `str` or a view of the same shape? (strtype::is_str_like)
+fn str_like(s: *mut Sema, t: u32) -> bool {
+    return types.str_like(table(s), t)
+}
+
+// HOOK str (strtype.rs::check_text): a text literal.
+//
+// THE RULE: the CONTEXT decides. Where an array type is wanted, the literal
+// is the array literal it has always been -- with the same length check.
+// Everywhere else it is a `str`. Nothing can break through that: without an
+// array context a text literal is an error today.
+fn text_check(s: *mut Sema, e: u32, note: u32) -> u32 {
+    let b: *mut ast.Tree = tree(s)
+    let inner: u32 = ast.e_a(b, e)
+    let wide: bool = ast.e_b(b, e) == 1
+    let n: u32 = ast.e_c(b, inner)
+    if note != NONE {
+        if types.ty_kind(table(s), note) == types.K_ARR {
+            if n == 0 {
+                complain(s)
+                return (*s).t_error
+            }
+            return expr(s, inner, note)
+        }
+    }
+    if wide {
+        complain(s)
+        return (*s).t_error
+    }
+    if n > 0 {
+        // The octets keep their array type -- the lowering writes them into
+        // the frame with exactly the code an array literal has always got.
+        let u8t: u32 = types.new_ty(table(s), types.K_U8, 0, 0)
+        let at: u32 = types.new_ty(table(s), types.K_ARR, u8t, n as u64)
+        expr(s, inner, at)
+    }
+    return str_ty(s)
+}
+
 fn sema_run(s: *mut Sema) {
     let b: *mut ast.Tree = tree(s)
+    // HOOK str (strtype.rs, round 70): the builtin type `str`. It is
+    // declared BEFORE everything else -- enums, error sets, gc classes,
+    // interfaces -- so that its struct index is 0 in EVERY program
+    // (types.fi::STR_INDEX).
+    str_declare(s)
     // 0. Enums: register the NAMES first, so that structs and signatures can
     //    use them (before the struct layout -- exactly like `declare_enums`
     //    before `collect_structs` in stage 0).
@@ -3132,6 +3423,9 @@ fn sema_run(s: *mut Sema) {
     (*s).t_void = types.new_ty(table(s), types.K_VOID, 0, 0)
     (*s).t_error = types.new_ty(table(s), types.K_ERROR, 0, 0)
     (*s).t_f64 = types.new_ty(table(s), types.K_F64, 0, 0)
+    // ROUND 70: created LAST on purpose -- an entry in front of the
+    // existing ones would move every type number behind it.
+    (*s).t_i32 = types.new_ty(table(s), types.K_I32, 0, 0)
 
     // 3. Create the type table for all expressions.
     var i: usize = 0
