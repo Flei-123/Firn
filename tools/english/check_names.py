@@ -17,7 +17,9 @@ os.chdir(ROOT)
 
 # Ausgenommen: fremde Daten (testdata) und das Umstellungswerkzeug selbst,
 # das laut Arbeitsanweisung deutsch bleibt.
-AUS = ('testdata/', 'tools/english/')
+# `.js-work` und `.test-work` sind ARBEITSVERZEICHNISSE: dort liegt die
+# entpackte fremde Testsuite (test262), die nicht zum Projekt gehoert.
+AUS = ('testdata/', 'tools/english/', '.js-work/', '.test-work/')
 # Ein angehaengter Zaehler versteckt das deutsche Wort: 'pfad2', 'teil1'.
 ZIFFERNSCHWANZ = re.compile(r'[0-9]+$')
 TEIL = re.compile(r'[a-z0-9]+|[A-Z]+(?![a-z])|[A-Z][a-z0-9]*')

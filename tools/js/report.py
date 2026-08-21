@@ -59,7 +59,7 @@ def main():
     parse = load(os.path.join(ROOT, ".js-work", "parse.json"))
 
     out = []
-    out.append("# Round 63 -- the measurements of the JavaScript path")
+    out.append("# Round 66 -- the measurements of the JavaScript path")
     out.append("")
     out.append("Produced by `bash tools/js/run.sh` / `tools/js/report.py`.")
     out.append("Nothing here is typed in by hand.")
@@ -100,12 +100,15 @@ def main():
         out.append("| %s | %d |" % (k, reasons[k]))
     out.append("")
     out.append("`unsupported-syntax` is a program that the parser rejects "
-               "because the feature is deliberately absent (generators, "
-               "async, BigInt, private methods). `throw` is an exception "
-               "the test did not expect -- usually a built in that does not "
-               "exist. `wrong` is a case that ran through without the "
-               "expected exception or delivered a wrong value: that is where "
-               "the real bugs are.")
+               "because the feature is deliberately absent (after round 66: "
+               "`eval`, the `Function` constructor, regular expressions, "
+               "modules). `throw` is an exception the test did not expect -- "
+               "usually a built in that does not exist. "
+               "`async-incomplete` is a case with `flags: [async]` that ran "
+               "through without ever printing `Test262:AsyncTestComplete`: "
+               "its promise never settled. `wrong` is a case that ran "
+               "through without the expected exception or delivered a wrong "
+               "value: that is where the real bugs are.")
     out.append("")
     out.append("### Per directory")
     out.append("")

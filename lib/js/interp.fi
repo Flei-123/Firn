@@ -31,6 +31,7 @@ import std.num
 import js.lex
 import js.ast
 import js.val
+import js.bigint
 
 export {
     js_pow_pub, f64_to_uint16,
@@ -53,7 +54,20 @@ export {
     js_typeof, is_array, throw_type_here,
     add_values, compare_values,
     iterate_values,
+    // Round 66: what lib/js/gen.fi (the resumable evaluator) needs.
+    eval_statements, hoist_one, hoist_names, bind_pattern,
+    bind_pattern_init, init_binding, copy_env, loop_take, enumerate_keys,
+    assign_member, assign_name, binary_op, compound_base, static_key,
+    name_anonymous, this_of, eval_member, eval_arguments, call_internal,
+    is_strict_env, to_primitive_pub, current_native, private_key,
+    init_instance_fields,
+    make_error_str, ERR_NONE_MARK,
+    bigint_of_ast,
 }
+
+// A marker without a meaning of its own -- it keeps the export list of this
+// module stable when a round adds a name.
+const ERR_NONE_MARK: u64 = 0
 
 const C_NORMAL: u32 = 0
 const C_THROW: u32 = 1
@@ -76,6 +90,18 @@ struct Ctx {
     max_depth: u32,
     native: fn(Gc[Realm], u64, Gc[JsVal], Gc[GcVec], Gc[JsObj]) -> AllocError!Gc[JsVal],
     arity: fn(u64) -> u32,
+    // Round 66. A generator body is not run here but handed to the
+    // resumable evaluator; `lib/js/interp.fi` must not import it (the same
+    // reason the built ins are reached through a function value), so the
+    // driver installs the two entry points.
+    gen_start: fn(Gc[Realm], Gc[JsObj], Gc[Env]) -> AllocError!Gc[JsVal],
+    gen_native: fn(Gc[Realm], u64, Gc[JsVal], Gc[GcVec], Gc[JsObj]) -> AllocError!Gc[JsVal],
+    gen_data: *mut u8,
+    // The native function object that is running right now. A built in
+    // that carries state (the resolve function of a promise, a reaction,
+    // the continuation of an await) has to know WHICH object it is; the
+    // handler reads it as its first act.
+    cur_fn: Gc[JsObj],
 }
 
 // Until the driver installs the real table (lib/js/builtin.fi), the two
@@ -94,7 +120,14 @@ fn ctx_new() -> Ctx {
     return Ctx {
         comp: C_NORMAL, label: 0, depth: 0, max_depth: 380,
         native: native_stub, arity: arity_stub,
+        gen_start: gen_stub, gen_native: native_stub,
+        gen_data: 0 as *mut u8, cur_fn: gc_null[JsObj](),
     }
+}
+
+fn gen_stub(r: Gc[Realm], f: Gc[JsObj], env: Gc[Env]) -> AllocError!Gc[JsVal] {
+    var m: [u8; 30] = "generators are not supported h"
+    return throw_type_here(r, &m[0], 30)
 }
 
 fn ctx_init(c: *mut Ctx) {
@@ -178,6 +211,9 @@ fn to_boolean(r: Gc[Realm], v: Gc[JsVal]) -> bool {
     }
     if t == val.TAG_STR {
         return val.str_len(v) != 0
+    }
+    if t == val.TAG_BIGINT {
+        return !bigint.bi_is_zero(v)
     }
     return true
 }
@@ -264,6 +300,10 @@ fn to_primitive(r: Gc[Realm], v: Gc[JsVal], hint: u32) -> AllocError!Gc[JsVal] {
 // Every conversion that can fail therefore hands back the BIT PATTERN as a
 // `u64`, exactly as `lib/num/strtod.fi` does, and the caller unpacks it.
 fn to_number(r: Gc[Realm], v: Gc[JsVal]) -> AllocError!u64 {
+    if val.is_bigint(v) {
+        let x: Gc[JsVal] = try bigint_mix_error(r)
+        return 0
+    }
     let t: u64 = val.val_tag(v)
     if t == val.TAG_NUM {
         return math.math_bits(val.num_value(v))
@@ -446,6 +486,9 @@ fn to_string(r: Gc[Realm], v: Gc[JsVal]) -> AllocError!Gc[JsVal] {
         let x: Gc[JsVal] = try throw_type_here(r, &m[0], 33)
         return val.str_empty(r)
     }
+    if t == val.TAG_BIGINT {
+        return bigint.bi_to_string(r, v, 10)
+    }
     let p: Gc[JsVal] = try to_primitive(r, v, 1)
     let c: *mut Ctx = ctx_of(r)
     if (*c).comp != C_NORMAL {
@@ -477,6 +520,9 @@ fn to_object(r: Gc[Realm], v: Gc[JsVal]) -> AllocError!Gc[JsObj] {
     if t == val.TAG_NUM {
         which = val.PROTO_NUMBER
         cls = val.CLS_NUMBER
+    }
+    if t == val.TAG_BIGINT {
+        which = val.PROTO_BIGINT
     }
     if t == val.TAG_BOOL {
         which = val.PROTO_BOOLEAN
@@ -654,6 +700,8 @@ fn get_prop_v(r: Gc[Realm], base: Gc[JsVal], k: u64,
         o = val.realm_proto(r, val.PROTO_BOOLEAN)
     } else if t == val.TAG_SYM {
         o = val.realm_proto(r, val.PROTO_SYMBOL)
+    } else if t == val.TAG_BIGINT {
+        o = val.realm_proto(r, val.PROTO_BIGINT)
     } else {
         var m: [u8; 34] = "Cannot read a property of undefine"
         return throw_type_here(r, &m[0], 35)
@@ -886,6 +934,9 @@ fn strict_equals(r: Gc[Realm], a: Gc[JsVal], b: Gc[JsVal]) -> bool {
     if ta == val.TAG_BOOL {
         return val.bool_value(a) == val.bool_value(b)
     }
+    if ta == val.TAG_BIGINT {
+        return bigint.bi_cmp(a, b) == 0
+    }
     return (a as u64) == (b as u64)
 }
 
@@ -927,6 +978,43 @@ fn loose_equals(r: Gc[Realm], a: Gc[JsVal], b: Gc[JsVal]) -> AllocError!bool {
         return false
     }
     if tb == val.TAG_NULL || tb == val.TAG_UNDEF {
+        return false
+    }
+    // 7.2.15 with a BigInt: exact against a number, parsed against a text.
+    if ta == val.TAG_BIGINT || tb == val.TAG_BIGINT {
+        var big: Gc[JsVal] = a
+        var other: Gc[JsVal] = b
+        if tb == val.TAG_BIGINT {
+            big = b
+            other = a
+        }
+        let ot: u64 = val.val_tag(other)
+        if ot == val.TAG_STR {
+            let bx: Gc[JsVal] = try bigint.bi_parse(r, other)
+            if (bx as u64) == 0 {
+                return false
+            }
+            return bigint.bi_cmp(big, bx) == 0
+        }
+        if ot == val.TAG_NUM {
+            let d: i64 = try bigint.bi_cmp_f64(r, big, val.num_value(other))
+            return d == 0
+        }
+        if ot == val.TAG_BOOL {
+            var one: u64 = 0
+            if val.bool_value(other) {
+                one = 1
+            }
+            let bb: Gc[JsVal] = try bigint.bi_from_u64(r, one, false)
+            return bigint.bi_cmp(big, bb) == 0
+        }
+        if ot == val.TAG_OBJ {
+            let po: Gc[JsVal] = try to_primitive(r, other, 0)
+            if (*c).comp != C_NORMAL {
+                return false
+            }
+            return loose_equals(r, big, po)
+        }
         return false
     }
     if ta == val.TAG_NUM && tb == val.TAG_STR {
@@ -993,6 +1081,11 @@ fn compare_values(r: Gc[Realm], a: Gc[JsVal], b: Gc[JsVal],
         }
         return 0
     }
+    // 7.2.13 with a BigInt on one side: exact, without a detour through a
+    // double.
+    if val.is_bigint(pa) || val.is_bigint(pb) {
+        return compare_bigint(r, pa, pb)
+    }
     let x: f64 = math.math_f64(try to_number(r, pa))
     if (*c).comp != C_NORMAL {
         return -1
@@ -1011,6 +1104,66 @@ fn compare_values(r: Gc[Realm], a: Gc[JsVal], b: Gc[JsVal],
 }
 
 // 13.15.3 ApplyStringOrNumericBinaryOperator for `+`.
+// The relational comparison with at least one BigInt: 1 = true, 0 = false,
+// -1 = undefined (a NaN is involved).
+fn compare_bigint(r: Gc[Realm], pa: Gc[JsVal], pb: Gc[JsVal]) -> AllocError!i32 {
+    let c: *mut Ctx = ctx_of(r)
+    var x: Gc[JsVal] = pa
+    var y: Gc[JsVal] = pb
+    if val.is_bigint(x) && val.is_bigint(y) {
+        if bigint.bi_cmp(x, y) < 0 {
+            return 1
+        }
+        return 0
+    }
+    if val.val_tag(x) == val.TAG_STR {
+        let bx: Gc[JsVal] = try bigint.bi_parse(r, x)
+        if (bx as u64) == 0 {
+            return -1
+        }
+        x = bx
+    }
+    if val.val_tag(y) == val.TAG_STR {
+        let by: Gc[JsVal] = try bigint.bi_parse(r, y)
+        if (by as u64) == 0 {
+            return -1
+        }
+        y = by
+    }
+    if val.is_bigint(x) && val.is_bigint(y) {
+        if bigint.bi_cmp(x, y) < 0 {
+            return 1
+        }
+        return 0
+    }
+    if val.is_bigint(x) {
+        let n: u64 = try to_number(r, y)
+        if (*c).comp != C_NORMAL {
+            return -1
+        }
+        let d: i64 = try bigint.bi_cmp_f64(r, x, math.math_f64(n))
+        if d == 2 {
+            return -1
+        }
+        if d < 0 {
+            return 1
+        }
+        return 0
+    }
+    let n: u64 = try to_number(r, x)
+    if (*c).comp != C_NORMAL {
+        return -1
+    }
+    let d: i64 = try bigint.bi_cmp_f64(r, y, math.math_f64(n))
+    if d == 2 {
+        return -1
+    }
+    if d > 0 {
+        return 1
+    }
+    return 0
+}
+
 fn add_values(r: Gc[Realm], a: Gc[JsVal], b: Gc[JsVal]) -> AllocError!Gc[JsVal] {
     let c: *mut Ctx = ctx_of(r)
     let pa: Gc[JsVal] = try to_primitive(r, a, 0)
@@ -1020,6 +1173,14 @@ fn add_values(r: Gc[Realm], a: Gc[JsVal], b: Gc[JsVal]) -> AllocError!Gc[JsVal] 
     let pb: Gc[JsVal] = try to_primitive(r, b, 0)
     if (*c).comp != C_NORMAL {
         return val.realm_undefined(r)
+    }
+    if val.val_tag(pa) == val.TAG_STR || val.val_tag(pb) == val.TAG_STR {
+        // A BigInt concatenates like every other value.
+    } else if val.is_bigint(pa) || val.is_bigint(pb) {
+        if !val.is_bigint(pa) || !val.is_bigint(pb) {
+            return bigint_mix_error(r)
+        }
+        return bigint.bi_add(r, pa, pb)
     }
     if val.val_tag(pa) == val.TAG_STR || val.val_tag(pb) == val.TAG_STR {
         let sa: Gc[JsVal] = try to_string(r, pa)
@@ -1059,6 +1220,10 @@ fn js_typeof(r: Gc[Realm], v: Gc[JsVal]) -> AllocError!Gc[JsVal] {
     }
     if t == val.TAG_NUM {
         var m: [u8; 6] = "number"
+        return val.str_from_ascii(r, &m[0], 6)
+    }
+    if t == val.TAG_BIGINT {
+        var m: [u8; 6] = "bigint"
         return val.str_from_ascii(r, &m[0], 6)
     }
     if t == val.TAG_STR {
@@ -1112,6 +1277,22 @@ fn make_function(r: Gc[Realm], node: u32, env: Gc[Env],
     if fl & ast.FN_DERIVED_CTOR != 0 as u32 {
         flags = flags | val.F_DERIVED
     }
+    // A generator or an async function is NOT a constructor (15.5.3), and
+    // its own prototype chain is a different one (round 66).
+    if fl & (ast.FN_GENERATOR | ast.FN_ASYNC) != 0 as u32 {
+        flags = flags & (val.F_CTOR ^ 0xFFFFFFFFFFFFFFFF)
+        var which: u64 = val.PROTO_ASYNC_FUNCTION
+        if fl & ast.FN_GENERATOR != 0 as u32 {
+            which = val.PROTO_GENERATOR_FUNCTION
+            if fl & ast.FN_ASYNC != 0 as u32 {
+                which = val.PROTO_ASYNC_GENERATOR_FUNCTION
+            }
+        }
+        let fnp: Gc[JsObj] = val.realm_proto(r, which)
+        if (fnp as u64) != 0 {
+            val.obj_set_proto(f, fnp)
+        }
+    }
     f.flags = flags
     // `length`: the parameters up to the first default or rest (10.2.4).
     let poff: u32 = ast.ast_b(t, node)
@@ -1136,6 +1317,20 @@ fn make_function(r: Gc[Realm], node: u32, env: Gc[Env],
         nv = try val.str_of_name(r, name)
     }
     let ok2: bool = try define_value(r, f, nk, nv, val.A_CONFIGURABLE)
+    // A generator gets a `prototype` WITHOUT a `constructor` back pointer;
+    // it is the object the generator objects inherit from (27.5.1).
+    if fl & ast.FN_GENERATOR != 0 as u32 {
+        var gwhich: u64 = val.PROTO_GENERATOR
+        if fl & ast.FN_ASYNC != 0 as u32 {
+            gwhich = val.PROTO_ASYNC_GENERATOR
+        }
+        let base: Gc[JsObj] = val.realm_proto(r, gwhich)
+        let proto: Gc[JsObj] = try val.obj_new_proto(r, base)
+        let pk: u64 = try val.key_for_name(r, lex.N_PROTOTYPE)
+        let pv: Gc[JsVal] = proto
+        let ok3: bool = try define_value(r, f, pk, pv, val.A_WRITABLE)
+        return f
+    }
     // Only a real constructor gets a `prototype`.
     if flags & val.F_CTOR != 0 && flags & val.F_CLASS_CTOR == 0 {
         let proto: Gc[JsObj] = try val.obj_new(r)
@@ -1163,6 +1358,11 @@ fn make_native(r: Gc[Realm], id: u64, arity: u64,
     let nv: Gc[JsVal] = try val.str_from_ascii(r, name, n)
     let ok2: bool = try define_value(r, f, nk, nv, val.A_CONFIGURABLE)
     return f
+}
+
+fn current_native(r: Gc[Realm]) -> Gc[JsObj] {
+    let c: *mut Ctx = ctx_of(r)
+    return (*c).cur_fn
 }
 
 fn native_arity(r: Gc[Realm], id: u64) -> u32 {
@@ -1217,11 +1417,16 @@ fn call_internal(r: Gc[Realm], fv: Gc[JsVal], this: Gc[JsVal], args: Gc[GcVec],
             let parent: Gc[JsVal] = f.extra
             let res: Gc[JsVal] = try call_internal(r, parent, this, args,
                 val.as_obj(parent))
+            if (*c).comp != C_NORMAL {
+                return val.realm_undefined(r)
+            }
         }
+        let okf: bool = try init_instance_fields(r, f, this)
         return val.realm_undefined(r)
     }
     if f.cls == val.CLS_NATIVE {
         let h: fn(Gc[Realm], u64, Gc[JsVal], Gc[GcVec], Gc[JsObj]) -> AllocError!Gc[JsVal] = (*c).native
+        (*c).cur_fn = f
         out = try h(r, f.native, this, args, newtarget)
     } else if f.cls == val.CLS_BOUND {
         let target: Gc[JsVal] = f.prim
@@ -1281,6 +1486,12 @@ fn call_user(r: Gc[Realm], f: Gc[JsObj], this: Gc[JsVal], args: Gc[GcVec],
         if (newtarget as u64) != 0 {
             env.obj = newtarget
         }
+        if (newtarget as u64) != 0 && f.flags & val.F_CLASS_CTOR != 0 && f.flags & val.F_DERIVED == 0 {
+            let okf: bool = try init_instance_fields(r, f, tv)
+            if (*c).comp != C_NORMAL {
+                return val.realm_undefined(r)
+            }
+        }
     }
     // The parameters.
     let poff: u32 = ast.ast_b(t, node)
@@ -1303,9 +1514,20 @@ fn call_user(r: Gc[Realm], f: Gc[JsObj], this: Gc[JsVal], args: Gc[GcVec],
         let av: Gc[JsVal] = args_at(r, args, i as u64)
         let ok: bool = try bind_pattern(r, env, pe, av, 1)
         if (*c).comp != C_NORMAL {
-            return val.realm_undefined(r)
+            // An error while the parameters are bound REJECTS the promise
+            // of an async function (15.8.4) instead of being thrown at the
+            // caller. The hand over below does that.
+            break
         }
         i = i + 1
+    }
+    let fl0: u32 = ast.ast_e(t, node)
+    if (*c).comp != C_NORMAL {
+        if fl0 & ast.FN_ASYNC != 0 as u32 && fl0 & ast.FN_GENERATOR == 0 as u32 {
+            let g0: fn(Gc[Realm], Gc[JsObj], Gc[Env]) -> AllocError!Gc[JsVal] = (*c).gen_start
+            return g0(r, f, env)
+        }
+        return val.realm_undefined(r)
     }
     // `arguments` -- only in a non arrow function.
     if !arrow {
@@ -1338,6 +1560,13 @@ fn call_user(r: Gc[Realm], f: Gc[JsObj], this: Gc[JsVal], args: Gc[GcVec],
     // The body.
     let body: u32 = ast.ast_d(t, node)
     let fl: u32 = ast.ast_e(t, node)
+    // A generator or an async function does NOT run its body here: the
+    // parameters are bound, and everything after that belongs to the
+    // resumable evaluator of round 66 (lib/js/gen.fi).
+    if fl & (ast.FN_GENERATOR | ast.FN_ASYNC) != 0 as u32 {
+        let g: fn(Gc[Realm], Gc[JsObj], Gc[Env]) -> AllocError!Gc[JsVal] = (*c).gen_start
+        return g(r, f, env)
+    }
     var out: Gc[JsVal] = val.realm_undefined(r)
     if fl & ast.FN_EXPRESSION_BODY != 0 as u32 {
         out = try eval_node(r, body, env)
@@ -1678,6 +1907,10 @@ fn bind_pattern(r: Gc[Realm], env: Gc[Env], pat: u32, v: Gc[JsVal],
 // Is the code being run right now strict? The nearest enclosing FUNCTION
 // decides; outside every function it is the program (`realm.depth` carries
 // that flag, set by the driver from the directive prologue).
+fn to_primitive_pub(r: Gc[Realm], v: Gc[JsVal], hint: u32) -> AllocError!Gc[JsVal] {
+    return to_primitive(r, v, hint)
+}
+
 fn is_strict_env(r: Gc[Realm], env: Gc[Env]) -> bool {
     var e: Gc[Env] = env
     while (e as u64) != 0 {
@@ -1694,7 +1927,10 @@ fn is_strict_env(r: Gc[Realm], env: Gc[Env]) -> bool {
 fn static_key(r: Gc[Realm], node: u32) -> AllocError!u64 {
     let t: *mut ast.Ast = val.realm_ast(r)
     let k: u32 = ast.ast_kind(t, node)
-    if k == ast.N_IDENT || k == ast.N_PRIVATE_NAME {
+    if k == ast.N_PRIVATE_NAME {
+        return private_key(r, ast.ast_a(t, node))
+    }
+    if k == ast.N_IDENT {
         return val.key_for_name(r, ast.ast_a(t, node))
     }
     if k == ast.N_STR {
@@ -1712,6 +1948,12 @@ fn static_key(r: Gc[Realm], node: u32) -> AllocError!u64 {
 
 // 7.4: read an iterable into a plain vector. Arrays and strings take the
 // short path; everything else goes through the iterator protocol.
+// `#x`: a key of its own, invisible to every enumeration.
+fn private_key(r: Gc[Realm], name: u32) -> AllocError!u64 {
+    let desc: Gc[JsVal] = try val.str_of_name(r, name)
+    return val.realm_private_key(r, name, desc)
+}
+
 fn iterate_values(r: Gc[Realm], v: Gc[JsVal]) -> AllocError!Gc[GcVec] {
     let c: *mut Ctx = ctx_of(r)
     let out: Gc[GcVec] = try gcvec_new()
@@ -1843,6 +2085,16 @@ fn hoist_declarations(r: Gc[Realm], env: Gc[Env], off: u32, count: usize,
             if slot >= 0 {
                 val.env_set_flags(env, slot, val.P_MUTABLE | val.P_INITIALIZED)
                 val.env_set_slot(env, slot, fv)
+                // 16.1.7 CreateGlobalFunctionBinding: at the TOP LEVEL a
+                // function declaration is also a property of the global
+                // object -- `globalThis.f` has to find it.
+                if val.env_kind(env) == val.ENV_GLOBAL {
+                    let g0: Gc[JsObj] = val.env_object(env)
+                    if (g0 as u64) != 0 {
+                        let ok3: bool = try define_value(r, g0, key, fv,
+                            val.A_WRITABLE | val.A_ENUMERABLE)
+                    }
+                }
             } else {
                 let g: Gc[JsObj] = val.env_object(env)
                 if (g as u64) != 0 {
@@ -2131,6 +2383,15 @@ fn eval_node(r: Gc[Realm], node: u32, env: Gc[Env]) -> AllocError!Gc[JsVal] {
     }
     if k == ast.N_REGEXP {
         var m: [u8; 41] = "regular expressions are not supported hre"
+        return throw_type_here(r, &m[0], 38)
+    }
+    if k == ast.N_BIGINT {
+        return bigint_of_ast(r, node)
+    }
+    if k == ast.N_YIELD || k == ast.N_AWAIT {
+        // Reached only where the resumable evaluator does not carry the
+        // expression -- an honest failure instead of a wrong value.
+        var m: [u8; 41] = "yield in this position is not supported  "
         return throw_type_here(r, &m[0], 38)
     }
 
@@ -2818,6 +3079,9 @@ fn eval_unary(r: Gc[Realm], node: u32, env: Gc[Env]) -> AllocError!Gc[JsVal] {
         return val.realm_num(r, x)
     }
     if op == ast.U_MINUS {
+        if val.is_bigint(v) {
+            return bigint.bi_neg(r, v)
+        }
         let x: f64 = math.math_f64(try to_number(r, v))
         if (*c).comp != C_NORMAL {
             return val.realm_undefined(r)
@@ -2827,6 +3091,9 @@ fn eval_unary(r: Gc[Realm], node: u32, env: Gc[Env]) -> AllocError!Gc[JsVal] {
         return val.realm_num(r, math.math_f64(math.math_bits(x) ^ 0x8000000000000000))
     }
     if op == ast.U_BITNOT {
+        if val.is_bigint(v) {
+            return bigint.bi_not(r, v)
+        }
         let i: i32 = try to_int32(r, v)
         if (*c).comp != C_NORMAL {
             return val.realm_undefined(r)
@@ -2846,6 +3113,26 @@ fn eval_update(r: Gc[Realm], node: u32, env: Gc[Env]) -> AllocError!Gc[JsVal] {
     let old: Gc[JsVal] = try eval_node(r, target, env)
     if (*c).comp != C_NORMAL {
         return val.realm_undefined(r)
+    }
+    if val.is_bigint(old) {
+        let one: Gc[JsVal] = try bigint.bi_from_u64(r, 1, false)
+        var nvb: Gc[JsVal] = try bigint.bi_add(r, old, one)
+        if op == lex.P_DEC {
+            nvb = try bigint.bi_sub(r, old, one)
+        }
+        if ast.ast_kind(t, target) == ast.N_IDENT {
+            let key: u64 = try val.key_for_name(r, ast.ast_a(t, target))
+            let ok: bool = try assign_name(r, env, key, nvb, is_strict_env(r, env))
+        } else {
+            let ok: bool = try assign_member(r, env, target, nvb)
+        }
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        if prefix {
+            return nvb
+        }
+        return old
     }
     let x: f64 = math.math_f64(try to_number(r, old))
     if (*c).comp != C_NORMAL {
@@ -2873,6 +3160,30 @@ fn eval_update(r: Gc[Realm], node: u32, env: Gc[Env]) -> AllocError!Gc[JsVal] {
 }
 
 fn eval_binary(r: Gc[Realm], node: u32, env: Gc[Env]) -> AllocError!Gc[JsVal] {
+    let t0: *mut ast.Ast = val.realm_ast(r)
+    if ast.ast_a(t0, node) == ast.OP_IN && ast.ast_kind(t0, ast.ast_b(t0, node)) == ast.N_PRIVATE_NAME {
+        // 13.10.1: `#x in obj` -- the brand check, without a lookup up the
+        // prototype chain.
+        let c0: *mut Ctx = ctx_of(r)
+        let o: Gc[JsVal] = try eval_node(r, ast.ast_c(t0, node), env)
+        if (*c0).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        if val.val_tag(o) != val.TAG_OBJ {
+            var m: [u8; 32] = "the right side is not an object "
+            return throw_type_here(r, &m[0], 31)
+        }
+        let k: u64 = try private_key(r, ast.ast_a(t0, ast.ast_b(t0, node)))
+        var have: bool = val.obj_has_own(val.as_obj(o), k)
+        if !have {
+            // A private METHOD lies on the prototype in this engine.
+            var pr: Gc[JsObj] = val.obj_proto(val.as_obj(o))
+            if (pr as u64) != 0 && val.obj_has_own(pr, k) {
+                have = true
+            }
+        }
+        return val.realm_bool(r, have)
+    }
     let c: *mut Ctx = ctx_of(r)
     let t: *mut ast.Ast = val.realm_ast(r)
     let op: u32 = ast.ast_a(t, node)
@@ -2937,6 +3248,9 @@ fn binary_op(r: Gc[Realm], op: u32, a: Gc[JsVal],
     }
     if op == ast.OP_INSTANCEOF {
         return instance_of(r, a, b)
+    }
+    if val.is_bigint(a) || val.is_bigint(b) {
+        return bigint_binary(r, op, a, b)
     }
     // The bit operations and the shifts.
     if op == lex.P_AND || op == lex.P_OR || op == lex.P_XOR {
@@ -3016,6 +3330,76 @@ fn binary_op(r: Gc[Realm], op: u32, a: Gc[JsVal],
 
 // 6.1.6.1.3 Number::exponentiate -- the special cases first, because
 // `powf` of std.math is an approximation over exp/ln.
+// 6.1.6.2: mixing a BigInt with a Number is a TypeError, always.
+fn bigint_mix_error(r: Gc[Realm]) -> AllocError!Gc[JsVal] {
+    var m: [u8; 44] = "cannot mix a BigInt with another type       "
+    return throw_type_here(r, &m[0], 38)
+}
+
+// The arithmetic, the bit operations and the shifts on two BigInts.
+fn bigint_binary(r: Gc[Realm], op: u32, a: Gc[JsVal],
+    b: Gc[JsVal]) -> AllocError!Gc[JsVal] {
+    let c: *mut Ctx = ctx_of(r)
+    if !val.is_bigint(a) || !val.is_bigint(b) {
+        return bigint_mix_error(r)
+    }
+    if op == lex.P_SUB {
+        return bigint.bi_sub(r, a, b)
+    }
+    if op == lex.P_MUL {
+        return bigint.bi_mul(r, a, b)
+    }
+    if op == lex.P_DIV || op == lex.P_MOD {
+        if bigint.bi_is_zero(b) {
+            var m: [u8; 23] = "division by zero       "
+            return throw_error(r, ERR_RANGE, &m[0], 16)
+        }
+        if op == lex.P_DIV {
+            return bigint.bi_div(r, a, b)
+        }
+        return bigint.bi_rem(r, a, b)
+    }
+    if op == lex.P_POW {
+        if bigint.bi_is_neg(b) {
+            var m: [u8; 27] = "a negative exponent        "
+            return throw_error(r, ERR_RANGE, &m[0], 19)
+        }
+        return bigint.bi_pow(r, a, b)
+    }
+    if op == lex.P_AND {
+        return bigint.bi_and(r, a, b)
+    }
+    if op == lex.P_OR {
+        return bigint.bi_or(r, a, b)
+    }
+    if op == lex.P_XOR {
+        return bigint.bi_xor(r, a, b)
+    }
+    if op == lex.P_SHL || op == lex.P_SHR {
+        let bits: f64 = bigint.bi_to_f64(b)
+        var n: u64 = 0
+        if bits < 0.0 {
+            n = (0.0 - bits) as u64
+        } else {
+            n = bits as u64
+        }
+        if n > 1000000 {
+            var m: [u8; 31] = "the shift is much too large    "
+            return throw_error(r, ERR_RANGE, &m[0], 27)
+        }
+        var left: bool = op == lex.P_SHL
+        if bigint.bi_is_neg(b) {
+            left = !left
+        }
+        return bigint.bi_shl(r, a, n, left)
+    }
+    if op == lex.P_USHR {
+        var m: [u8; 43] = "BigInts have no unsigned right shift       "
+        return throw_type_here(r, &m[0], 36)
+    }
+    return val.realm_undefined(r)
+}
+
 fn js_pow(x: f64, y: f64) -> f64 {
     let nan: f64 = math.math_f64(0x7FF8000000000000)
     if math.is_nan(y) {
@@ -3344,6 +3728,11 @@ fn eval_call(r: Gc[Realm], node: u32, env: Gc[Env]) -> AllocError!Gc[JsVal] {
         let this0: Gc[JsVal] = this_of(r, env)
         let res: Gc[JsVal] = try call_internal(r, parent, this0, args0,
             val.as_obj(parent))
+        if (*c).comp != C_NORMAL {
+            return val.realm_undefined(r)
+        }
+        // 15.7.15: the fields of THIS class come right after `super()`.
+        let okf: bool = try init_instance_fields(r, me, this0)
         return val.realm_undefined(r)
     }
     if ast.ast_kind(t, calleen) == ast.N_MEMBER {
@@ -3978,6 +4367,12 @@ fn eval_class(r: Gc[Realm], node: u32, env: Gc[Env]) -> AllocError!Gc[JsVal] {
     if derived {
         ctor.flags = ctor.flags | val.F_DERIVED
     }
+    // The class node, so that `new` can run the instance fields; `len` is
+    // unused on a function object.
+    ctor.len = node as u64 + 1
+    if (ctor.env as u64) == 0 {
+        ctor.env = cenv
+    }
     ctor.extra = parent_ctor
     if (parent_ctor as u64) != 0 {
         val.obj_set_proto(ctor, parent_ctor)
@@ -4050,10 +4445,25 @@ fn eval_class(r: Gc[Realm], node: u32, env: Gc[Env]) -> AllocError!Gc[JsVal] {
         }
         i = i + 1
     }
-    // The fields (only the static ones run right away).
+    // The static part runs in source order: a static field and a static
+    // block may depend on each other (15.7.14).
     i = 0
     while i < bcount {
         let m: u32 = ast.ast_list_at(t, boff, i)
+        if ast.ast_kind(t, m) == ast.N_STATIC_BLOCK {
+            let benv: Gc[Env] = try val.env_new(r, cenv, val.ENV_FUNCTION)
+            val.env_set_this(benv, cv, ctor)
+            let okh: bool = try hoist_declarations(r, benv, ast.ast_a(t, m),
+                ast.ast_b(t, m) as usize, true)
+            let xv: Gc[JsVal] = try eval_statements(r, ast.ast_a(t, m),
+                ast.ast_b(t, m) as usize, benv)
+            if (*c).comp == C_RETURN {
+                (*c).comp = C_NORMAL
+            }
+            if (*c).comp != C_NORMAL {
+                return val.realm_undefined(r)
+            }
+        }
         if ast.ast_kind(t, m) == ast.N_FIELD && ast.ast_c(t, m) & ast.PR_STATIC != 0 as u32 {
             var key: u64 = 0
             if ast.ast_c(t, m) & ast.PR_COMPUTED != 0 as u32 {
@@ -4080,6 +4490,60 @@ fn eval_class(r: Gc[Realm], node: u32, env: Gc[Env]) -> AllocError!Gc[JsVal] {
 
 // ============================================================== Programs
 
+// 15.7.15 InitializeInstanceElements: every non static field of the class
+// gets its value on the new object -- before the constructor body of a base
+// class, and directly after `super()` in a derived one.
+fn init_instance_fields(r: Gc[Realm], ctor: Gc[JsObj],
+    this_val: Gc[JsVal]) -> AllocError!bool {
+    let c: *mut Ctx = ctx_of(r)
+    if (ctor as u64) == 0 || ctor.len == 0 {
+        return true
+    }
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let node: u32 = (ctor.len - 1) as u32
+    if ast.ast_kind(t, node) != ast.N_CLASS {
+        return true
+    }
+    let o: Gc[JsObj] = val.as_obj(this_val)
+    if (o as u64) == 0 {
+        return true
+    }
+    let boff: u32 = ast.ast_c(t, node)
+    let bcount: usize = ast.ast_d(t, node) as usize
+    var i: usize = 0
+    while i < bcount {
+        let m: u32 = ast.ast_list_at(t, boff, i)
+        if ast.ast_kind(t, m) == ast.N_FIELD && ast.ast_c(t, m) & ast.PR_STATIC == 0 as u32 {
+            var key: u64 = 0
+            if ast.ast_c(t, m) & ast.PR_COMPUTED != 0 as u32 {
+                let kv: Gc[JsVal] = try eval_node(r, ast.ast_a(t, m), ctor.env)
+                if (*c).comp != C_NORMAL {
+                    return false
+                }
+                key = try to_property_key(r, kv)
+            } else {
+                key = try static_key(r, ast.ast_a(t, m))
+            }
+            var v: Gc[JsVal] = val.realm_undefined(r)
+            if ast.ast_b(t, m) != 0 as u32 {
+                let fenv: Gc[Env] = try val.env_new(r, ctor.env, val.ENV_FUNCTION)
+                val.env_set_this(fenv, this_val, ctor)
+                v = try eval_node(r, ast.ast_b(t, m), fenv)
+                if (*c).comp != C_NORMAL {
+                    return false
+                }
+                if ast.ast_kind(t, ast.ast_a(t, m)) == ast.N_IDENT {
+                    let okn: bool = try name_anonymous(r, v,
+                        ast.ast_a(t, ast.ast_a(t, m)))
+                }
+            }
+            let ok: bool = try define_value(r, o, key, v, val.A_DEFAULT)
+        }
+        i = i + 1
+    }
+    return true
+}
+
 fn run_program(r: Gc[Realm], prog: u32, env: Gc[Env]) -> AllocError!Gc[JsVal] {
     let c: *mut Ctx = ctx_of(r)
     let t: *mut ast.Ast = val.realm_ast(r)
@@ -4093,6 +4557,19 @@ fn run_program(r: Gc[Realm], prog: u32, env: Gc[Env]) -> AllocError!Gc[JsVal] {
 }
 
 // `Math.pow` needs the same exponentiation as the `**` operator.
+// A BigInt literal: the digits stand in the string pool of the tree.
+fn bigint_of_ast(r: Gc[Realm], node: u32) -> AllocError!Gc[JsVal] {
+    let t: *mut ast.Ast = val.realm_ast(r)
+    let s: Gc[JsVal] = try val.str_from_ast(r, ast.ast_a(t, node),
+        ast.ast_b(t, node) as usize)
+    let v: Gc[JsVal] = try bigint.bi_parse(r, s)
+    if (v as u64) == 0 {
+        var m: [u8; 26] = "a bad BigInt literal      "
+        return throw_error(r, ERR_SYNTAX, &m[0], 20)
+    }
+    return v
+}
+
 fn js_pow_pub(x: f64, y: f64) -> f64 {
     return js_pow(x, y)
 }

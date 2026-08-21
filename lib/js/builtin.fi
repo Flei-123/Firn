@@ -22,6 +22,7 @@ import js.lex
 import js.ast
 import js.val
 import js.interp
+import js.bigint
 
 export { install, native_dispatch, native_arity_of }
 
@@ -260,7 +261,8 @@ fn alen(r: Gc[Realm], o: Gc[JsVal]) -> AllocError!u64 {
 
 fn aget(r: Gc[Realm], o: Gc[JsVal], i: u64) -> AllocError!Gc[JsVal] {
     let ob: Gc[JsObj] = val.as_obj(o)
-    if (ob as u64) != 0 && ob.cls == val.CLS_ARRAY && i < ob.len {
+    // Above the dense storage the element lies in the property table.
+    if (ob as u64) != 0 && ob.cls == val.CLS_ARRAY && i < ob.len && i < val.elems_len(ob) {
         let e: Gc[JsVal] = val.elems_get(r, ob, i)
         if val.is_gap(e) {
             return val.realm_undefined(r)
@@ -273,7 +275,7 @@ fn aget(r: Gc[Realm], o: Gc[JsVal], i: u64) -> AllocError!Gc[JsVal] {
 
 fn ahas(r: Gc[Realm], o: Gc[JsVal], i: u64) -> AllocError!bool {
     let ob: Gc[JsObj] = val.as_obj(o)
-    if (ob as u64) != 0 && ob.cls == val.CLS_ARRAY && i < ob.len {
+    if (ob as u64) != 0 && ob.cls == val.CLS_ARRAY && i < ob.len && i < val.elems_len(ob) {
         return !val.is_gap(val.elems_get(r, ob, i))
     }
     let k: u64 = try val.key_for_index(r, i)
@@ -282,7 +284,9 @@ fn ahas(r: Gc[Realm], o: Gc[JsVal], i: u64) -> AllocError!bool {
 
 fn aset(r: Gc[Realm], o: Gc[JsVal], i: u64, v: Gc[JsVal]) -> AllocError!bool {
     let ob: Gc[JsObj] = val.as_obj(o)
-    if (ob as u64) != 0 && ob.cls == val.CLS_ARRAY {
+    // Above the dense limit the element does NOT vanish: it goes into the
+    // property table like every other key (round 66).
+    if (ob as u64) != 0 && ob.cls == val.CLS_ARRAY && val.elems_dense_ok(i) {
         let ok: bool = try val.elems_set(r, ob, i, v)
         if i >= ob.len {
             ob.len = i + 1
@@ -325,6 +329,13 @@ fn this_prim(r: Gc[Realm], this: Gc[JsVal], want: u64) -> Gc[JsVal] {
 
 fn native_dispatch(r: Gc[Realm], id: u64, this: Gc[JsVal], args: Gc[GcVec],
     nt: Gc[JsObj]) -> AllocError!Gc[JsVal] {
+    // Round 66 lives in lib/js/gen.fi and is reached through the same
+    // function value construction as this table itself.
+    if id >= 30000 {
+        let c: *mut interp.Ctx = interp.ctx_of(r)
+        let h: fn(Gc[Realm], u64, Gc[JsVal], Gc[GcVec], Gc[JsObj]) -> AllocError!Gc[JsVal] = (*c).gen_native
+        return h(r, id, this, args, nt)
+    }
     if id >= B_MATH_BASE && id < B_MATH_BASE + M_COUNT {
         return math_fn(r, id - B_MATH_BASE, args)
     }
@@ -2412,7 +2423,23 @@ fn number_fn(r: Gc[Realm], id: u64, this: Gc[JsVal], args: Gc[GcVec],
     if id == B_NUMBER_CTOR {
         var x: f64 = 0.0
         if nargs(args) > 0 {
-            x = math.math_f64(try interp.to_number(r, arg(r, args, 0)))
+            // 21.1.1.1: `Number(aBigInt)` is allowed and gives the nearest
+            // double -- only the IMPLICIT conversion is a TypeError.
+            let a0: Gc[JsVal] = arg(r, args, 0)
+            let prim: Gc[JsVal] = try interp.to_primitive_pub(r, a0, 1)
+            if thrown(r) {
+                return val.realm_undefined(r)
+            }
+            if val.is_bigint(prim) {
+                let bv: Gc[JsVal] = try val.realm_num(r, bigint.bi_to_f64(prim))
+                if (nt as u64) == 0 {
+                    return bv
+                }
+                let bo: Gc[JsObj] = try interp.to_object(r, bv)
+                let bov: Gc[JsVal] = bo
+                return bov
+            }
+            x = math.math_f64(try interp.to_number(r, prim))
             if thrown(r) {
                 return val.realm_undefined(r)
             }
