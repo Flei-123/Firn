@@ -135,6 +135,28 @@ impl<'a> Lower<'a> {
         self.info.expr_ty(e.id).clone()
     }
 
+    /// **ROUND 71** — the type an expression HANDS OUT.
+    ///
+    /// That is its own type, except where the one implicit conversion
+    /// applies: an `f32` in a place that wants an `f64` hands out an `f64`
+    /// (`sema::expr`). `ty_of` deliberately keeps giving the OWN type --
+    /// the value is built at its own width first and only converted after.
+    /// Whoever asks what comes OUT asks here.
+    pub(crate) fn out_ty(&self, e: &Expr) -> Type {
+        if self.info.widen_f32.contains(&e.id) {
+            return Type::F64;
+        }
+        self.ty_of(e)
+    }
+
+    pub(crate) fn out_fty(&mut self, e: &Expr) -> Option<FTy> {
+        let t = self.out_ty(e);
+        match scalar_fty(&t) {
+            Some(f) => Some(f),
+            None => self.ice(e.span, "expression has no scalar type"),
+        }
+    }
+
     pub(crate) fn fty_of(&mut self, e: &Expr) -> Option<FTy> {
         let t = self.ty_of(e);
         match scalar_fty(&t) {
@@ -565,7 +587,7 @@ impl<'a> Lower<'a> {
                 Some(())
             }
             _ => {
-                let ft = self.fty_of(e)?;
+                let ft = self.out_fty(e)?;
                 let v = self.lower_expr(e)?;
                 self.store(ft, addr, v);
                 Some(())
@@ -687,7 +709,7 @@ impl<'a> Lower<'a> {
                 Some(self.push(FTy::I64, Op::Syscall { args: a }))
             }
             ExprKind::Cast(inner, _) => {
-                let from = self.fty_of(inner)?;
+                let from = self.out_fty(inner)?;
                 let to = self.fty_of(e)?;
                 let src = self.lower_expr(inner)?;
                 if from == to {
@@ -758,7 +780,10 @@ impl<'a> Lower<'a> {
             return Some(v);
         }
         if op.is_cmp() {
-            let ty = self.fty_of(a)?;
+            // ROUND 71: after the widening BOTH operands are `f64`. The
+            // comparison type has to be the one the values really carry,
+            // not the one the left side started out with.
+            let ty = self.out_fty(a)?;
             let av = self.lower_expr(a)?;
             let bv = self.lower_expr(b)?;
             let c = match op {
@@ -1310,7 +1335,10 @@ impl<'a> Lower<'a> {
                 if let Some(r) = crate::lower_errors::hook_let(self, name, init) {
                     return r;
                 }
-                let t = self.ty_of(init);
+                // ROUND 71: the variable gets the type that the initialiser
+                // HANDS OUT -- `let w: f64 = x_f32` makes an f64 variable,
+                // not a four byte one.
+                let t = self.out_ty(init);
                 if matches!(t, Type::Void) {
                     return self.err(*span, "a variable cannot have a value without a type");
                 }
