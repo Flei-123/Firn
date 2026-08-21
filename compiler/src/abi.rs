@@ -60,13 +60,6 @@ impl ArgClass {
             ArgClass::Memory => &[],
         }
     }
-    /// Number of eightbytes (0 for `()` and MEMORY).
-    pub fn word_count(&self) -> usize {
-        self.words().len()
-    }
-    pub fn is_memory(&self) -> bool {
-        matches!(self, ArgClass::Memory)
-    }
 }
 
 /// Size of the largest structure still passed through registers.
