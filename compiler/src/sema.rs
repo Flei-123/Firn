@@ -3162,11 +3162,12 @@ mod tests {
             ("uint", "u32"),
             ("ulong", "u64"),
             ("double", "f64"),
+            // ROUND 71: `float` is given out now, and it means `f32`.
+            ("float", "f32"),
         ] {
             assert_eq!(prim_type(alias), prim_type(canonical), "{}", alias);
         }
-        // `float` is deliberately not given out before round 71.
-        assert_eq!(prim_type("float"), None);
+        assert_eq!(prim_type("float"), Some(Type::F32));
     }
 
     #[test]
@@ -3417,7 +3418,7 @@ mod tests {
         assert_eq!(sig.params[0], Type::Array(Box::new(Type::I32), 4));
         assert_eq!(
             crate::abi::classify(&sig.params[0], &info.tcx),
-            crate::abi::ArgClass::Integer(2)
+            crate::abi::ArgClass::ints(2)
         );
     }
 

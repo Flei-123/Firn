@@ -259,19 +259,6 @@ fn keyword(word: &str) -> Option<TokKind> {
     })
 }
 
-/// **ROUND 71** — decimal text -> `f32` bit pattern, over the correctly
-/// rounded `f64` in between.
-///
-/// That this is EXACT and not a double rounding is a theorem, not a hope:
-/// rounding decimal -> binary64 -> binary32 gives the same result as
-/// rounding decimal -> binary32 directly, because binary64 carries 53 bits
-/// and 2*24+2 = 50 of them are enough (Figueroa 1995). It is measured on top
-/// of that: `tools/lexnum/run.sh` holds this path against C `strtof` and
-/// `numpy.float32` for thousands of literals, including the hard cases.
-pub fn narrow(v: f64) -> u32 {
-    (v as f32).to_bits()
-}
-
 /// **ROUND 71** — decimal text -> `f32` bit pattern, CORRECTLY ROUNDED.
 ///
 /// `parse::<f32>` rounds the text directly, as `strtof` does. The detour
