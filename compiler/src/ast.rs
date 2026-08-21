@@ -128,6 +128,13 @@ pub enum ExprKind {
     ArrayLit(Vec<Expr>),
     /// Repeat literal `[value; N]`; `N` is a constant expression.
     ArrayRepeat(Box<Expr>, Box<Expr>),
+    /// **ROUND 70** — a TEXT LITERAL (`"…"`, `b"…"`, `u"…"`).
+    ///
+    /// The node carries the array literal of its octets/code units inside
+    /// and lets the CONTEXT decide what it is: with an array type wanted it
+    /// is that array literal (unchanged since round 39), otherwise it is a
+    /// `str` (`strtype.rs`). `true` = `u"…"`, whose elements are `u16`.
+    Text(bool, Box<Expr>),
     /// **Round 58** — a closure literal (`fnval.rs`).
     Lambda(Box<LambdaDecl>),
 }

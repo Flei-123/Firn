@@ -784,6 +784,8 @@ impl<'a, 'b> Renamer<'a, 'b> {
         let span = e.span;
         match &mut e.kind {
             ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) => {}
+            // ROUND 70: the text literal carries its array literal inside.
+            ExprKind::Text(_, inner) => self.expr(inner),
             // Round 58: the closure body is resolved INSIDE the enclosing
             // function — only that way does a captured name stay a local one
             // instead of being qualified into a module name.

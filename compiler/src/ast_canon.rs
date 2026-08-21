@@ -249,5 +249,7 @@ fn ex_core(e: &Expr) -> String {
             o
         }
         ExprKind::ArrayRepeat(v, n) => format!("(awdh {} {})", ex(v), ex(n)),
+        // ROUND 70 — the text literal (strtype.rs). `w` = `u"…"`.
+        ExprKind::Text(wide, inner) => format!("(text {} {})", *wide as u8, ex(inner)),
     }
 }

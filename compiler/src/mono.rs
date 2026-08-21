@@ -233,7 +233,7 @@ fn satisfies(te: &TypeExpr, b: &Bound) -> bool {
 
 fn is_int_name(n: &str) -> bool {
     matches!(
-        n,
+        crate::types::canon_name(n),
         "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "usize" | "isize"
     )
 }
@@ -410,6 +410,8 @@ fn subst_expr(e: &mut Expr, map: &HashMap<String, TypeExpr>, queue: &mut Vec<(St
     match &mut e.kind {
         ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) => {}
         ExprKind::Ident(_) => {}
+        // ROUND 70: the text literal carries its array literal inside.
+        ExprKind::Text(_, inner) => subst_expr(inner, map, queue),
         // Round 58: a closure inside a template is refused by
         // `check_bare_expr`; the types are substituted anyway, so that a
         // follow-up error stays readable.
@@ -513,6 +515,8 @@ pub(crate) fn renumber_expr(e: &mut Expr, next: &mut u32) {
     *next += 1;
     match &mut e.kind {
         ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Ident(_) => {}
+        // ROUND 70: the text literal carries its array literal inside.
+        ExprKind::Text(_, inner) => renumber_expr(inner, next),
         ExprKind::Lambda(d) => renumber_block(&mut d.body, next),
         ExprKind::Unary(_, i) => renumber_expr(i, next),
         ExprKind::Binary(_, a, b) => {
@@ -642,6 +646,8 @@ fn check_bare_stmt(s: &Stmt, out: &mut Vec<(Span, String)>) {
 fn check_bare_expr(e: &Expr, out: &mut Vec<(Span, String)>) {
     match &e.kind {
         ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Ident(_) => {}
+        // ROUND 70: the text literal carries its array literal inside.
+        ExprKind::Text(_, inner) => check_bare_expr(inner, out),
         // Round 58: a closure body carries types like any other body.
         ExprKind::Lambda(d) => {
             for p in &d.params {

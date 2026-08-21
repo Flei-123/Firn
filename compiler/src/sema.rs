@@ -67,6 +67,11 @@ pub(crate) struct VarInfo {
 const MAX_DEPTH: u32 = 200;
 
 pub(crate) struct Checker<'a> {
+    /// **ROUND 70** — the arguments of an interpolation that may be widened
+    /// (`f"{x}"` with an i32 into `io.fmt_number(… i64)`). A set, not a
+    /// single slot: the chain of an `f"…"` is itself made of such calls, so
+    /// while one is being checked the next one is already being resolved.
+    widen: std::collections::HashSet<crate::ast::ExprId>,
     pub(crate) dg: &'a mut Diags,
     pub(crate) tcx: TypeCtx,
     pub(crate) fns: HashMap<String, FnSig>,
@@ -90,6 +95,7 @@ pub(crate) struct Checker<'a> {
 
 pub fn check(prog: &Program, dg: &mut Diags) -> Option<TypeInfo> {
     let mut ck = Checker {
+        widen: std::collections::HashSet::new(),
         dg,
         tcx: TypeCtx::new(),
         fns: HashMap::new(),
@@ -132,6 +138,9 @@ impl<'a> Checker<'a> {
         // lifetime parameter.
         self.prog = Some(prog as *const Program);
         self.check_profile(prog);
+        // HOOK str: the builtin type `str` — declared BEFORE everything else,
+        // so that its index is the same in every program (strtype.rs).
+        crate::strtype::declare(&mut self.tcx);
         // HOOK types: register the enum names (sema_match.rs)
         crate::sema_match::declare_enums(self);
         // HOOK fehlerunionen: register the error sets (errors.rs)
@@ -185,6 +194,9 @@ impl<'a> Checker<'a> {
         // program, so that a field of type `dyn I` finds its layout (iface.rs)
         crate::iface::declare_interfaces(self);
         self.collect_structs(prog);
+        // HOOK str: note every view of the shape `{ *mut u8, usize }` —
+        // `str` may be used for those and vice versa (strtype.rs).
+        crate::strtype::remember_views(&self.tcx);
         if layout_enums {
             // HOOK types: lay out the enums (sema_match.rs)
             crate::sema_match::layout_enums(self, prog);
@@ -1135,6 +1147,28 @@ impl<'a> Checker<'a> {
                     );
                     Type::Error
                 }
+                // ROUND 70 -- THE DEFAULT TYPE. Whoever writes `let x = 5`
+                // gets `i32`. The rule stands BEHIND the context: as soon as
+                // the surroundings prescribe a type, that one holds
+                // (`let y: i64 = 5` is unchanged). Only when nothing at all
+                // says anything does the literal fall back to `i32`, exactly
+                // as in C#, Java and Go.
+                //
+                // The overflow check does not soften: a literal that does not
+                // fit into `i32` is reported here just as it would be at an
+                // explicit `i32` -- with the note that the wider type has to
+                // be written down.
+                None => {
+                    if !lit_fits(*v, &Type::I32) {
+                        self.dg.error_note(
+                            e.span,
+                            format!("integer literal {} does not fit into the type i32", v),
+                            "i32 is the default type of an integer literal; write the wider type down, e.g. 'let x: i64 = ...'",
+                        );
+                        return Type::Error;
+                    }
+                    Type::I32
+                }
                 _ => {
                     self.dg.error_note(
                         e.span,
@@ -1145,6 +1179,11 @@ impl<'a> Checker<'a> {
                 }
             },
             ExprKind::Bool(_) => Type::Bool,
+            // HOOK str: a text literal — array literal or `str`, the context
+            // decides (strtype.rs, round 70)
+            ExprKind::Text(wide, inner) => {
+                crate::strtype::check_text(self, e, *wide, inner, hint)
+            }
             // HOOK fnval: the closure literal (fnval.rs, round 58)
             ExprKind::Lambda(d) => crate::fnval::check_lambda(self, d),
             ExprKind::Ident(name) => {
@@ -1486,6 +1525,10 @@ impl<'a> Checker<'a> {
             // ROUND 58: two function values compare like two pointers —
             // `==` means "the same function record". Ordering does not
             // exist for them; addresses have no meaningful order.
+            // HOOK str: `==`/`!=` compare the CONTENT (strtype.rs, round 70)
+            if let Some(t) = crate::strtype::hook_binary(self, op, &lt, &rt, e.span) {
+                return t;
+            }
             let ok = lt.is_concrete_int()
                 || lt == Type::F64
                 || (eq_only && (lt == Type::Bool || lt.is_ptr() || lt.is_fn()));
@@ -1544,6 +1587,10 @@ impl<'a> Checker<'a> {
         if lt.is_error() || rt.is_error() {
             return Type::Error;
         }
+        // HOOK str: `+` concatenates (strtype.rs, round 70)
+        if let Some(t) = crate::strtype::hook_binary(self, op, &lt, &rt, e.span) {
+            return t;
+        }
         // FLOATING POINT: `+ - * /` are allowed, `%` and the bit operations are
         // not. `%` would be `fmod` and needs a library function; the bit
         // operations would have no sensible meaning on a bit pattern (anyone
@@ -1589,7 +1636,67 @@ impl<'a> Checker<'a> {
         lt
     }
 
+    /// **ROUND 70** — the target of one interpolation step.
+    ///
+    /// The parser writes `io.fmt_value(chain, x)` because at parse time
+    /// nobody knows what `x` is. Here the type decides:
+    ///
+    /// | type of `x` | step |
+    /// |---|---|
+    /// | integer | `fmt_number` (widened to i64 by the lowering) |
+    /// | `bool` | `fmt_bool` |
+    /// | `f64` | `fmt_f64` |
+    /// | `str` | `fmt_str` |
+    ///
+    /// Only the LAST name segment is replaced, so that the module prefix
+    /// (`io__`, whatever the program called it) stays untouched. The
+    /// lowering derives the very same target from the very same material
+    /// (`lower::fmt_target`) — no side table between the phases.
+    pub(crate) fn fmt_target(&mut self, name: &str, args: &[Expr], span: Span) -> Option<String> {
+        let head = fmt_value_head(name)?;
+        if args.len() != 2 {
+            return None;
+        }
+        let t = self.expr(&args[1], None);
+        // `io.fmt_number` takes an i64. An i32 fits into it WITHOUT loss —
+        // the lowering widens it (lower_call). The exception holds for
+        // exactly this one argument of exactly this one call, so no general
+        // implicit conversion comes into being through the back door.
+        if t.is_concrete_int() {
+            self.widen.insert(args[1].id);
+        }
+        let step = match &t {
+            _ if t.is_error() => return None,
+            // Signed goes to `fmt_number` (i64), unsigned to `fmt_u64`.
+            // That is not decoration: a u64 above i64::MAX would wrap around
+            // in `fmt_number` and print a negative number.
+            _ if t.is_concrete_int() && t.is_signed() => "fmt_number",
+            _ if t.is_concrete_int() => "fmt_u64",
+            Type::Bool => "fmt_bool",
+            Type::F64 => "fmt_f64",
+            _ if crate::strtype::is_str_like(&t) => "fmt_str",
+            other => {
+                self.dg.error_note(
+                    span,
+                    format!(
+                        "an interpolation f\"{{…}}\" cannot show a value of type {}",
+                        self.tcx.name_of(other)
+                    ),
+                    "integers, bool, f64 and str work; for everything else turn it into text yourself",
+                );
+                return None;
+            }
+        };
+        Some(format!("{}{}", head, step))
+    }
+
     fn call(&mut self, name: &str, args: &[Expr], nspan: Span, espan: Span) -> Type {
+        // HOOK str: `f"{x}"` — which builder step is right depends on the
+        // TYPE of x (strtype.rs / fmt_target, round 70). The name is resolved
+        // here and the ordinary check runs on the resolved one.
+        if let Some(real) = self.fmt_target(name, args, espan) {
+            return self.call(&real, args, nspan, espan);
+        }
         // HOOK impl: `x.m(args)` — method call (impls.rs, round 45)
         if let Some(t) = crate::impls::hook_call(self, name, args, nspan, espan) {
             return t;
@@ -1706,6 +1813,14 @@ impl<'a> Checker<'a> {
             return;
         }
         let t = self.expr(a, Some(p));
+        // ROUND 70: the ONE widening of the interpolation (see `fmt_target`).
+        if self.widen.contains(&a.id)
+            && t.is_concrete_int()
+            && p.is_concrete_int()
+            && p.bits() >= t.bits()
+        {
+            return;
+        }
         if !assignable(&t, p) {
             self.dg.error(
                 a.span,
@@ -1808,6 +1923,15 @@ impl<'a> Checker<'a> {
         }
         match &e.kind {
             ExprKind::Int(_) => None,
+            // ROUND 70: a text literal probes as `str` — that is how the
+            // other side of `text == "quit"` gets its type (strtype.rs).
+            ExprKind::Text(wide, _) => {
+                if *wide {
+                    None
+                } else {
+                    Some(crate::strtype::ty())
+                }
+            }
             ExprKind::Float(_) => Some(Type::F64),
             ExprKind::Bool(_) => Some(Type::Bool),
             ExprKind::Ident(n) => {
@@ -2173,8 +2297,22 @@ fn bit(b: bool) -> i128 {
     }
 }
 
+/// **ROUND 70** — is this the interpolation placeholder, and what stands in
+/// front of its last segment? `io__fmt_value` -> `Some("io__")`.
+pub(crate) fn fmt_value_head(name: &str) -> Option<&str> {
+    let rest = name.strip_suffix("fmt_value")?;
+    if rest.is_empty() || rest.ends_with('_') || rest.ends_with('.') {
+        Some(rest)
+    } else {
+        None
+    }
+}
+
 fn prim_type(name: &str) -> Option<Type> {
-    Some(match name {
+    // ROUND 70: `int`/`long`/`byte`/... are only a second spelling; they
+    // are folded onto the canonical name here and are therefore THE SAME
+    // type (types.rs::canon_name).
+    Some(match crate::types::canon_name(name) {
         "i8" => Type::I8,
         "i16" => Type::I16,
         "i32" => Type::I32,
@@ -2252,6 +2390,12 @@ fn assignable(got: &Type, want: &Type) -> bool {
 
 fn compatible(a: &Type, b: &Type) -> bool {
     if a.is_error() || b.is_error() {
+        return true;
+    }
+    // HOOK str: the language type `str` and a view of the same shape
+    // (`str.Span`) may be used for each other — same two words, same ABI,
+    // no copy of the octets (strtype.rs, round 70).
+    if crate::strtype::same_view(a, b) {
         return true;
     }
     match (a, b) {
@@ -2393,6 +2537,7 @@ mod tests {
         first: &Program,
     ) -> Checker<'d> {
         let mut ck = Checker {
+        widen: std::collections::HashSet::new(),
             dg,
             tcx: TypeCtx::new(),
             fns: HashMap::new(),
@@ -2755,8 +2900,10 @@ mod tests {
         assert_eq!(info.expr_types[0], Type::I32);
     }
 
+    /// **ROUND 70** — `let x = 5` is no longer an error: without any
+    /// context the literal has the default type `i32`.
     #[test]
-    fn untyped_literal_is_error() {
+    fn untyped_literal_becomes_i32() {
         let mut b = B::new();
         let lit = b.int(5);
         let ret = b.int(0);
@@ -2779,7 +2926,90 @@ mod tests {
             comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
+        let (info, out) = run(prog, "");
+        let info = info.unwrap_or_else(|| panic!("unexpected error:\n{}", out));
+        assert_eq!(info.expr_types[0], Type::I32);
+    }
+
+    /// The literal still cannot be inferred where the context is no integer
+    /// type at all — there the default must NOT jump in.
+    #[test]
+    fn untyped_literal_at_a_pointer_is_error() {
+        let mut b = B::new();
+        let lit = b.int(5);
+        let ret = b.int(0);
+        let prog = Program {
+            profile: None,
+            imports: Vec::new(),
+            exports: Vec::new(),
+            funcs: vec![main_fn(vec![
+                Stmt::Let {
+                    name: "p".to_string(),
+                    mutable: false,
+                    ty: Some(TypeExpr::Ptr {
+                        mutable: true,
+                        inner: Box::new(named("u8")),
+                        span: sp(),
+                    }),
+                    init: lit,
+                    span: sp(),
+                },
+                Stmt::Return { value: Some(ret), span: sp() },
+            ])],
+            structs: Vec::new(),
+            consts: Vec::new(),
+            comptime_blocks: Vec::new(),
+            expr_count: b.next,
+        };
         expect_err(prog, "the type of the integer literal cannot be inferred");
+    }
+
+    /// **ROUND 70** — the overflow check does not soften at the default type.
+    #[test]
+    fn untyped_literal_over_i32_is_error() {
+        let mut b = B::new();
+        let lit = b.int(5_000_000_000);
+        let ret = b.int(0);
+        let prog = Program {
+            profile: None,
+            imports: Vec::new(),
+            exports: Vec::new(),
+            funcs: vec![main_fn(vec![
+                Stmt::Let {
+                    name: "x".to_string(),
+                    mutable: false,
+                    ty: None,
+                    init: lit,
+                    span: sp(),
+                },
+                Stmt::Return { value: Some(ret), span: sp() },
+            ])],
+            structs: Vec::new(),
+            consts: Vec::new(),
+            comptime_blocks: Vec::new(),
+            expr_count: b.next,
+        };
+        expect_err(prog, "does not fit into the type i32");
+    }
+
+    /// **ROUND 70** — `int` and `i32` are THE SAME type, not two.
+    #[test]
+    fn the_alias_is_the_same_type() {
+        for (alias, canonical) in [
+            ("sbyte", "i8"),
+            ("short", "i16"),
+            ("int", "i32"),
+            ("long", "i64"),
+            ("byte", "u8"),
+            ("ushort", "u16"),
+            ("uint", "u32"),
+            ("ulong", "u64"),
+            ("double", "f64"),
+        ] {
+            assert_eq!(prim_type(alias), prim_type(canonical), "{}", alias);
+        }
+        // `float` is deliberately not given out before round 71.
+        assert_eq!(prim_type("float"), None);
     }
 
     #[test]
