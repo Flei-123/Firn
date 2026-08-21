@@ -773,6 +773,10 @@ impl<'a> Parser<'a> {
                 let sp = self.bump();
                 self.mk(sp, ExprKind::Float(bits))
             }
+            TokKind::FloatF32(bits) => {
+                let sp = self.bump();
+                self.mk(sp, ExprKind::FloatF32(bits))
+            }
             TokKind::FStr(raw) => {
                 let sp = self.bump();
                 let raw = raw.clone();
@@ -2044,6 +2048,7 @@ mod tests {
         match &e.kind {
             ExprKind::Int(v) => format!("{}", v),
             ExprKind::Float(bits) => format!("{}", f64::from_bits(*bits)),
+            ExprKind::FloatF32(bits) => format!("{}f", f32::from_bits(*bits)),
             ExprKind::Bool(b) => format!("{}", b),
             ExprKind::Ident(n) => n.clone(),
             // ROUND 70: the text literal carries its array literal inside.

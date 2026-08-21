@@ -24,6 +24,11 @@ use std::fmt::Write as _;
 
 /// Argument registers of the System V AMD64 calling convention.
 pub(crate) const ARG_REGS: [&str; 6] = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
+/// **ROUND 71** — argument registers of the SSE class. `f32` and `f64` travel
+/// here, not in the integer registers any more (SPEC §14.1.f32).
+pub(crate) const SSE_REGS: [&str; 8] = [
+    "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
+];
 /// Argument registers of the Linux syscall ABI (after the number at rax).
 const SYS_REGS: [&str; 6] = ["rdi", "rsi", "rdx", "r10", "r8", "r9"];
 
@@ -285,13 +290,27 @@ fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
     // from the argument registers, all further ones off the stack of the
     // caller (System V: [rbp+16], [rbp+24], ... — in front of those sit the
     // saved return address and the saved rbp).
+    // ROUND 71: the same placement rule as at the call site, read from the
+    // other side. `place_args` is asked with the parameter VALUES (%0, %1,
+    // ...), whose types are exactly `f.params`.
+    let pvals: Vec<Val> = (0..f.params.len() as Val).collect();
+    let (spot, _stack) = place_args(f, &pvals);
+    let mut stack_i = 0usize;
     for (i, _t) in f.params.iter().enumerate() {
-        if i < ARG_REGS.len() {
-            e.line(&format!("mov qword ptr [rbp-{}], {}", fr.slot[i], ARG_REGS[i]));
-        } else {
-            let off = 16 + 8 * (i - ARG_REGS.len()) as u64;
-            e.line(&format!("mov rax, qword ptr [rbp+{}]", off));
-            e.line(&format!("mov qword ptr [rbp-{}], rax", fr.slot[i]));
+        match spot[i] {
+            Some(r) if r.starts_with("xmm") => {
+                e.line(&format!("movq rax, {}", r));
+                e.line(&format!("mov qword ptr [rbp-{}], rax", fr.slot[i]));
+            }
+            Some(r) => {
+                e.line(&format!("mov qword ptr [rbp-{}], {}", fr.slot[i], r));
+            }
+            None => {
+                let off = 16 + 8 * stack_i as u64;
+                stack_i += 1;
+                e.line(&format!("mov rax, qword ptr [rbp+{}]", off));
+                e.line(&format!("mov qword ptr [rbp-{}], rax", fr.slot[i]));
+            }
         }
     }
 
@@ -368,7 +387,15 @@ fn emit_block(e: &mut Emitter, f: &Func, fr: &Frame, b: &Block) -> Result<(), St
         }
         Term::Ret(v) => {
             if let Some(v) = v {
+                // ROUND 71: a floating point result goes into `xmm0`, as
+                // System V prescribes -- and as every other compiler on this
+                // platform expects it.
+                if f.ret.is_float() {
+                    e.line(&format!("mov rax, qword ptr [rbp-{}]", fr.slot[*v as usize]));
+                    e.line("movq xmm0, rax");
+                } else {
                 e.line(&format!("mov rax, qword ptr [rbp-{}]", fr.slot[*v as usize]));
+                }
             } else {
                 // Round 51: NO `xor eax, eax` any more. A function with
                 // return type `void` has no result value; System V
@@ -436,6 +463,75 @@ pub(crate) fn store_dst(e: &mut Emitter, fr: &Frame, d: Val, r: &str) {
     e.line(&format!("mov qword ptr [rbp-{}], {}", fr.slot[d as usize], r));
 }
 
+/// **ROUND 71** — a floating point value out of its frame slot into an xmm
+/// register. `rax` is the ferry: the slot is 8 bytes wide and holds the bit
+/// pattern, `movq` brings all 8 of them over. For an `f32` only the lower 4
+/// count, and those are exactly the ones the SSE instructions read.
+fn load_xmm(e: &mut Emitter, fr: &Frame, x: &str, v: Val) {
+    load_full(e, fr, "rax", v);
+    e.line(&format!("movq {}, rax", x));
+}
+
+/// The way back: xmm register -> `rax` -> frame slot of `d`.
+fn store_xmm(e: &mut Emitter, fr: &Frame, d: Val, x: &str) {
+    e.line(&format!("movq rax, {}", x));
+    store_dst(e, fr, d, "rax");
+}
+
+/// **ROUND 71** — WHERE does argument number `k` sit?
+///
+/// System V hands out two register files independently of each other:
+/// integer words go to `rdi, rsi, rdx, rcx, r8, r9`, floating point words to
+/// `xmm0`-`xmm7`. Anything for which no register of ITS class is left travels
+/// on the stack -- in the order of writing, together with the others.
+///
+/// The result is one entry per argument: `Some(register)` or `None` for the
+/// stack. The FIR type decides the class, and nothing else; that is what
+/// makes a `{ f32, f32 }` (loaded as one SSE word by the lowering) land in
+/// `xmm0` all by itself.
+fn place_args(f: &Func, args: &[Val]) -> (Vec<Option<&'static str>>, Vec<Val>) {
+    let mut int_i = 0usize;
+    let mut sse_i = 0usize;
+    let mut spot: Vec<Option<&'static str>> = Vec::with_capacity(args.len());
+    let mut stack: Vec<Val> = Vec::new();
+    for a in args {
+        if f.val_ty(*a).is_float() {
+            if sse_i < SSE_REGS.len() {
+                spot.push(Some(SSE_REGS[sse_i]));
+                sse_i += 1;
+                continue;
+            }
+        } else if int_i < ARG_REGS.len() {
+            spot.push(Some(ARG_REGS[int_i]));
+            int_i += 1;
+            continue;
+        }
+        spot.push(None);
+        stack.push(*a);
+    }
+    (spot, stack)
+}
+
+/// Loads the arguments into their registers. SSE first: `rax` is the ferry
+/// into an xmm register and must not overwrite an integer argument that is
+/// already sitting in place.
+fn load_args(e: &mut Emitter, fr: &Frame, args: &[Val], spot: &[Option<&'static str>]) {
+    for (k, a) in args.iter().enumerate() {
+        if let Some(r) = spot[k] {
+            if r.starts_with("xmm") {
+                load_xmm(e, fr, r, *a);
+            }
+        }
+    }
+    for (k, a) in args.iter().enumerate() {
+        if let Some(r) = spot[k] {
+            if !r.starts_with("xmm") {
+                load_full(e, fr, r, *a);
+            }
+        }
+    }
+}
+
 fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), String> {
     let ty = i.ty;
     match &i.op {
@@ -459,7 +555,7 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
             // comparison (CF/ZF), hence `setb`/`seta` rather than `setl`/`setg`.
             // comparison. For NaN, PF is set and ZF/CF as well — that makes every
             // comparison except `!=` false, exactly as IEEE-754 demands.
-            if *oty == FTy::F64 {
+            if oty.is_float() {
                 // For NaN `ucomisd` sets ZF=PF=CF=1 — the unordered case
                 // therefore looks like "less or equal". IEEE-754 demands,
                 // though, that EVERY ordering comparison with NaN be false.
@@ -470,11 +566,15 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
                 // on the parity flag afterwards.
                 let swap = matches!(op, CmpOp::Lt | CmpOp::Le);
                 let (first, second) = if swap { (*b, *a) } else { (*a, *b) };
-                load_full(e, fr, "rax", first);
-                e.line("movq xmm0, rax");
-                load_full(e, fr, "rax", second);
-                e.line("movq xmm1, rax");
-                e.line("ucomisd xmm0, xmm1");
+                load_xmm(e, fr, "xmm0", first);
+                load_xmm(e, fr, "xmm1", second);
+                // ROUND 71: `ucomiss` for binary32 — the same flag rules,
+                // the same swap trick, only the width differs.
+                e.line(if *oty == FTy::F32 {
+                    "ucomiss xmm0, xmm1"
+                } else {
+                    "ucomisd xmm0, xmm1"
+                });
                 let cc = match op {
                     CmpOp::Eq => "sete",
                     CmpOp::Ne => "setne",
@@ -523,13 +623,24 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
             // FLOATING POINT: the sign is ONE bit. `neg` would treat the whole
             // bit pattern as two's complement — wrong. That is why only bit 63
             // is flipped.
-            if ty == FTy::F64 {
+            if ty.is_float() {
                 if !matches!(op, UnOp::Neg) {
-                    return Err("internal error: '!' is not defined for f64".to_string());
+                    return Err(format!(
+                        "internal error: '!' is not defined for {}",
+                        ty.name()
+                    ));
                 }
                 load_full(e, fr, "rax", *a);
-                e.line("mov rcx, -9223372036854775808");
-                e.line("xor rax, rcx");
+                if ty == FTy::F32 {
+                    // ROUND 71: for binary32 the sign is bit 31. The 32-bit
+                    // `xor` zeroes the upper half of `rax` by itself, which
+                    // is what keeps the slot clean.
+                    e.line("mov ecx, -2147483648");
+                    e.line("xor eax, ecx");
+                } else {
+                    e.line("mov rcx, -9223372036854775808");
+                    e.line("xor rax, rcx");
+                }
                 store_dst(e, fr, d, "rax");
                 return Ok(());
             }
@@ -550,6 +661,40 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
         Op::Cast { src, from } => {
             let d = i.dst.ok_or("internal error: conversion without target")?;
             // FLOATING POINT CONVERSIONS
+            //
+            // ROUND 71: first the two widths among each other. They are the
+            // only pair in which BOTH sides are floating point, and neither
+            // direction is a reinterpretation -- `cvtsd2ss` really rounds.
+            if ty.is_float() && from.is_float() {
+                if ty == *from {
+                    load_full(e, fr, "rax", *src);
+                    store_dst(e, fr, d, "rax");
+                    return Ok(());
+                }
+                load_xmm(e, fr, "xmm0", *src);
+                e.line(if ty == FTy::F64 {
+                    "cvtss2sd xmm0, xmm0"
+                } else {
+                    "cvtsd2ss xmm0, xmm0"
+                });
+                store_xmm(e, fr, d, "xmm0");
+                return Ok(());
+            }
+            if ty == FTy::F32 && !from.is_float() {
+                // Integer -> f32, same reservation about unsigned 64-bit
+                // values above 2^63 as with `cvtsi2sd`.
+                load_ext(e, fr, "rax", *src, *from, 64);
+                e.line("cvtsi2ss xmm0, rax");
+                store_xmm(e, fr, d, "xmm0");
+                return Ok(());
+            }
+            if *from == FTy::F32 && !ty.is_float() {
+                // f32 -> integer, cutting towards zero, as in C.
+                load_xmm(e, fr, "xmm0", *src);
+                e.line("cvttss2si rax, xmm0");
+                store_dst(e, fr, d, "rax");
+                return Ok(());
+            }
             if ty == FTy::F64 && *from != FTy::F64 {
                 // Integer -> f64. Signed with `cvtsi2sd`; unsigned 64-bit
                 // values above 2^63 are beyond this instruction, so the value
@@ -618,58 +763,63 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
             store_dst(e, fr, d, "rax");
         }
         Op::Call { name, args } => {
-            // Stack arguments from the seventh word on: they sit immediately in
-            // front of the `call` at [rsp+8k]. The 16-byte alignment survives (an
-            // odd number of words gets a padding word).
-            let stack_args = args.len().saturating_sub(ARG_REGS.len());
-            let mut adjust = 8 * stack_args as u64;
-            if stack_args % 2 == 1 {
+            // Arguments for which no register of their class is left: they sit
+            // immediately in front of the `call` at [rsp+8k]. The 16-byte
+            // alignment survives (an odd number of words gets a padding word).
+            let (spot, stack) = place_args(f, args);
+            let mut adjust = 8 * stack.len() as u64;
+            if stack.len() % 2 == 1 {
                 adjust += 8;
             }
             if adjust > 0 {
                 e.line(&format!("sub rsp, {}", adjust));
-                for (k, a) in args.iter().skip(ARG_REGS.len()).enumerate() {
+                for (k, a) in stack.iter().enumerate() {
                     load_full(e, fr, "rax", *a);
                     e.line(&format!("mov qword ptr [rsp+{}], rax", 8 * k));
                 }
             }
-            for (k, a) in args.iter().take(ARG_REGS.len()).enumerate() {
-                load_full(e, fr, ARG_REGS[k], *a);
-            }
+            load_args(e, fr, args, &spot);
             e.line(&format!("call {}", label(name)));
             if adjust > 0 {
                 e.line(&format!("add rsp, {}", adjust));
             }
             if let Some(d) = i.dst {
-                store_dst(e, fr, d, "rax");
+                // ROUND 71: a floating point result comes back in `xmm0`.
+                if ty.is_float() {
+                    store_xmm(e, fr, d, "xmm0");
+                } else {
+                    store_dst(e, fr, d, "rax");
+                }
             }
         }
         // Dynamic dispatch (iface.rs, round 46): like `Op::Call`, only the target
         // sits in a register. `rax` is a pure scratch register on the base path
         // and no argument register — it is loaded LAST.
         Op::CallIndirect { target, args } => {
-            let stack_args = args.len().saturating_sub(ARG_REGS.len());
-            let mut adjust = 8 * stack_args as u64;
-            if stack_args % 2 == 1 {
+            let (spot, stack) = place_args(f, args);
+            let mut adjust = 8 * stack.len() as u64;
+            if stack.len() % 2 == 1 {
                 adjust += 8;
             }
             if adjust > 0 {
                 e.line(&format!("sub rsp, {}", adjust));
-                for (k, a) in args.iter().skip(ARG_REGS.len()).enumerate() {
+                for (k, a) in stack.iter().enumerate() {
                     load_full(e, fr, "rax", *a);
                     e.line(&format!("mov qword ptr [rsp+{}], rax", 8 * k));
                 }
             }
-            for (k, a) in args.iter().take(ARG_REGS.len()).enumerate() {
-                load_full(e, fr, ARG_REGS[k], *a);
-            }
+            load_args(e, fr, args, &spot);
             load_full(e, fr, "rax", *target);
             e.line("call rax");
             if adjust > 0 {
                 e.line(&format!("add rsp, {}", adjust));
             }
             if let Some(d) = i.dst {
-                store_dst(e, fr, d, "rax");
+                if ty.is_float() {
+                    store_xmm(e, fr, d, "xmm0");
+                } else {
+                    store_dst(e, fr, d, "rax");
+                }
             }
         }
         Op::VtabAddr { table } => {
@@ -853,26 +1003,30 @@ fn emit_bin(
     // reading and writing happens through rax — an `f64` sits in the frame
     // as an ordinary 64-bit word (its bit pattern), which is why no separate
     // memory path is needed here.
-    if ty == FTy::F64 {
-        let m = match op {
-            BinOp::Add => "addsd",
-            BinOp::Sub => "subsd",
-            BinOp::Mul => "mulsd",
-            BinOp::Div => "divsd",
+    if ty.is_float() {
+        // ROUND 71: the scalar single instructions sit right next to the
+        // double ones — same encoding family, one letter apart.
+        let m = match (op, ty) {
+            (BinOp::Add, FTy::F32) => "addss",
+            (BinOp::Sub, FTy::F32) => "subss",
+            (BinOp::Mul, FTy::F32) => "mulss",
+            (BinOp::Div, FTy::F32) => "divss",
+            (BinOp::Add, _) => "addsd",
+            (BinOp::Sub, _) => "subsd",
+            (BinOp::Mul, _) => "mulsd",
+            (BinOp::Div, _) => "divsd",
             _ => {
                 return Err(format!(
-                    "internal error: operator '{:?}' is not defined for f64",
-                    op
+                    "internal error: operator '{:?}' is not defined for {}",
+                    op,
+                    ty.name()
                 ))
             }
         };
-        load_full(e, fr, "rax", a);
-        e.line("movq xmm0, rax");
-        load_full(e, fr, "rax", b);
-        e.line("movq xmm1, rax");
+        load_xmm(e, fr, "xmm0", a);
+        load_xmm(e, fr, "xmm1", b);
         e.line(&format!("{} xmm0, xmm1", m));
-        e.line("movq rax, xmm0");
-        store_dst(e, fr, d, "rax");
+        store_xmm(e, fr, d, "xmm0");
         return Ok(());
     }
     match op {
