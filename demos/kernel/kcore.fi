@@ -1,0 +1,353 @@
+// demos/kernel/kcore.fi -- A KERNEL THAT USES THE STANDARD LIBRARY.
+//
+// Round 73. Until round 72 `import std.*` was forbidden wholesale under
+// `profile kernel` (SPEC 2). This file is the proof that the ban has
+// become precise instead of coarse: it imports `std.core`, compiles in the
+// kernel profile to a freestanding ELF object WITHOUT a single undefined
+// name and WITHOUT a single `syscall` instruction, boots in QEMU and says
+// over the serial line what it computed.
+//
+// WHAT IT SHOWS, and why exactly this:
+//
+//   1. TEXT SEARCH IN A KERNEL. A kernel command line is text, and every
+//      kernel has to take one apart. `trim`, `find`, `starts_with` and the
+//      splitting cursor do that on memory the kernel already holds -- no
+//      allocator anywhere.
+//   2. READING A NUMBER IN A KERNEL. `root=17` has to become the number
+//      17. That is `core.parse_i64` on a `Span`, one call, no output
+//      parameter (the shape round 69 gave the library).
+//   3. UTF-8 IN A KERNEL. The reader walks a multi octet character
+//      correctly -- a kernel that prints a device name has the same
+//      problem a browser has.
+//   4. MATHEMATICS IN A KERNEL. `isqrt`, `gcd`, `ilog2` out of `std.core`.
+//   5. THE ALLOCATOR, PASSED BY HAND. `core.Arena` over a region of
+//      physical memory that this kernel owns. Allocating, refusing,
+//      growing, freeing, resetting -- through the `Allocator` interface,
+//      that is through a method table in `.rodata`, and still without one
+//      byte from anybody.
+//
+// THE MEMORY OF THE ARENA is not a `var` -- stage 0 has no global mutable
+// data (SPEC 14, item 5). It is a REGION OF PHYSICAL MEMORY: `start.s`
+// maps the first gigabyte identically with 2 MiB pages, the image is
+// loaded at 1 MiB and is far smaller than a megabyte, so 3 MiB is free and
+// mapped. That is exactly how a kernel gives an allocator memory -- it
+// does not ask anybody, it OWNS the machine.
+//
+// Built and measured by `tools/core/run.sh` (test.sh section 30), with
+// both compilers and with counter-checks.
+
+profile kernel
+
+import std.core
+
+// The region this kernel lends to the arena: 64 KiB at 3 MiB.
+const ARENA_BASE: u64 = 3145728
+const ARENA_SIZE: usize = 65536
+
+// ------------------------------------------------------------- port I/O
+
+fn out8(port: u16, value: u8) {
+    asm("out dx, al", in("dx") port, in("al") value)
+}
+
+fn in8(port: u16) -> u8 {
+    return asm("in al, dx", out("rax"), in("dx") port) as u8
+}
+
+// ---------------------------------------------------------- serial port
+
+// 0x3F8 = COM1
+const COM1: u16 = 1016
+
+fn serial_init() {
+    out8(COM1 + 1 as u16, 0 as u8)
+    out8(COM1 + 3 as u16, 128 as u8)
+    out8(COM1 + 0 as u16, 3 as u8)
+    out8(COM1 + 1 as u16, 0 as u8)
+    out8(COM1 + 3 as u16, 3 as u8)
+    out8(COM1 + 2 as u16, 199 as u8)
+    out8(COM1 + 4 as u16, 11 as u8)
+}
+
+fn serial_ready() -> bool {
+    return (in8(COM1 + 5 as u16) & 32 as u8) != 0 as u8
+}
+
+fn serial_char(z: u8) {
+    while !serial_ready() {
+    }
+    out8(COM1, z)
+}
+
+fn serial_nl() {
+    serial_char(10 as u8)
+}
+
+// A `Span` straight out onto the wire -- the kernel's own text type IS the
+// one of the library.
+fn serial_span(s: core.Span) {
+    var i: usize = 0
+    while i < s.n {
+        serial_char(core.ld8(s.p, i))
+        i = i + 1
+    }
+}
+
+fn serial_c(p: *mut u8) {
+    serial_span(core.span_of_c(p))
+}
+
+fn serial_dec(v: u64) {
+    var digits: [u8; 24] = [0; 24]
+    var x: u64 = v
+    var n: usize = 0
+    if x == 0 {
+        serial_char(48 as u8)
+        return
+    }
+    while x > 0 {
+        digits[n] = (48 + x % 10) as u8
+        x = x / 10
+        n = n + 1
+    }
+    while n > 0 {
+        n = n - 1
+        serial_char(digits[n])
+    }
+}
+
+// name=value, and a line feed at the end of the group.
+fn say(name: *mut u8, v: u64) {
+    serial_c(name)
+    serial_dec(v)
+    serial_char(32 as u8)
+}
+
+// ------------------------------------------------------ 1..4  text work
+
+// The whole text side in one function, so that one look at the serial
+// output says whether the library really ran in the kernel.
+fn text_probe() -> bool {
+    var line: [u8; 24] = "  vga=1 root=17 quiet  \0"
+    var needle: [u8; 6] = "root=\0"
+    var blank: [u8; 2] = " \0"
+    var s_len: [u8; 5] = "len=\0"
+    var s_at: [u8; 4] = "at=\0"
+    var s_parts: [u8; 7] = "parts=\0"
+    var s_root: [u8; 6] = "root=\0"
+    var s_trim: [u8; 7] = "trim=[\0"
+    var s_close: [u8; 3] = "] \0"
+    var s_head: [u8; 7] = "text: \0"
+
+    let all: core.Span = core.span_of_c(&line[0]).trim()
+    let seek: core.Span = core.span_of_c(&needle[0])
+    let at: usize = all.find(seek)
+    var ok: bool = true
+    if all.length() != 19 {
+        ok = false
+    }
+    if at != 6 {
+        ok = false
+    }
+    // The value behind `root=`: up to the next blank, then read.
+    var value: core.Span = core.span_empty()
+    var root: i64 = 0
+    if at != core.npos() {
+        let rest: core.Span = all.ab(at + seek.length())
+        let e: usize = rest.find_char(32 as u8)
+        if e == core.npos() {
+            value = rest
+        } else {
+            value = rest.to(e)
+        }
+        let r: core.ParsedI64 = core.parse_i64(value)
+        if !r.ok {
+            ok = false
+        }
+        root = r.value
+    }
+    if root != 17 {
+        ok = false
+    }
+    // The splitting cursor: three pieces, no allocation.
+    var t: core.Divisor = core.divisor_whitespace(all)
+    var piece: core.Span = core.span_empty()
+    var parts: usize = 0
+    while core.divisor_next(&t, &piece) {
+        parts = parts + 1
+    }
+    if parts != 3 {
+        ok = false
+    }
+
+    serial_c(&s_head[0])
+    say(&s_len[0], all.length() as u64)
+    say(&s_at[0], at as u64)
+    say(&s_parts[0], parts as u64)
+    say(&s_root[0], root as u64)
+    serial_c(&s_trim[0])
+    serial_span(all)
+    serial_c(&s_close[0])
+    serial_nl()
+    return ok
+}
+
+// UTF-8: "a" + U+03BB (lambda, two octets) + "b" -- three characters, five
+// octets. A kernel that prints a device name has the same problem.
+fn utf8_probe() -> bool {
+    var text: [u8; 5] = [0; 5]
+    text[0] = 97 as u8
+    text[1] = 206 as u8
+    text[2] = 187 as u8
+    text[3] = 98 as u8
+    text[4] = 0 as u8
+    var s_head: [u8; 7] = "utf8: \0"
+    var s_bytes: [u8; 7] = "bytes=\0"
+    var s_chars: [u8; 7] = "chars=\0"
+    var s_cp: [u8; 4] = "cp=\0"
+    let s: core.Span = core.span(&text[0], 4)
+    let z: core.CharHit = core.utf8_read(s, 1)
+    var ok: bool = true
+    if s.utf8_char() != 3 {
+        ok = false
+    }
+    if !z.valid || z.cp != 955 || z.length != 2 {
+        ok = false
+    }
+    serial_c(&s_head[0])
+    say(&s_bytes[0], s.length() as u64)
+    say(&s_chars[0], s.utf8_char() as u64)
+    say(&s_cp[0], z.cp as u64)
+    serial_nl()
+    return ok
+}
+
+fn math_probe() -> bool {
+    var s_head: [u8; 7] = "math: \0"
+    var s_isqrt: [u8; 7] = "isqrt=\0"
+    var s_gcd: [u8; 5] = "gcd=\0"
+    var s_log: [u8; 7] = "ilog2=\0"
+    let a: u64 = core.isqrt(144)
+    let b: u64 = core.gcd(12, 18)
+    let c: usize = core.ilog2(1024)
+    serial_c(&s_head[0])
+    say(&s_isqrt[0], a)
+    say(&s_gcd[0], b)
+    say(&s_log[0], c as u64)
+    serial_nl()
+    return a == 12 && b == 6 && c == 10
+}
+
+// ------------------------------------------------------ 5  the allocator
+
+// Every step through the INTERFACE, that is through the method table --
+// the kernel never calls the arena directly. That is the point: the same
+// call site works with `mem.PageAllocator` in an application.
+fn arena_probe() -> bool {
+    var s_head: [u8; 8] = "arena: \0"
+    var s_used: [u8; 6] = "used=\0"
+    var s_high: [u8; 6] = "high=\0"
+    var s_given: [u8; 7] = "given=\0"
+    var s_no: [u8; 9] = "refused=\0"
+    var s_grown: [u8; 7] = "grown=\0"
+    var s_after: [u8; 7] = "after=\0"
+
+    var a: core.Arena = core.arena_new(ARENA_BASE as *mut u8, ARENA_SIZE)
+    let it: dyn Allocator = (&a) as dyn Allocator
+    var ok: bool = true
+
+    // 100 octets, 16 aligned.
+    let b1: core.Block = core.alloc(it, 100, 16)
+    if !b1.ok || (b1.p as u64) % 16 != 0 {
+        ok = false
+    }
+    // A whole page, 4096 aligned: the arena has to skip forward.
+    let b2: core.Block = core.alloc(it, 4096, 4096)
+    if !b2.ok || (b2.p as u64) % 4096 != 0 {
+        ok = false
+    }
+    if (b1.p as u64) + 100 > b2.p as u64 {
+        ok = false // the blocks overlap
+    }
+    // The memory really belongs to the kernel: write and read back.
+    core.mem_zero(b2.p, b2.n)
+    core.st8(b2.p, 0, 65 as u8)
+    core.st8(b2.p, 4095, 90 as u8)
+    if core.ld8(b2.p, 0) != 65 as u8 || core.ld8(b2.p, 4095) != 90 as u8 {
+        ok = false
+    }
+    // MORE THAN THE REGION HAS has to be REFUSED. An allocator that hands
+    // out something here hands out memory it does not own.
+    let toobig: core.Block = core.alloc(it, 1048576, 16)
+    if toobig.ok {
+        ok = false
+    }
+    // Growing in place: `b2` is the last block, so the arena can do it.
+    let grown: core.Block = core.grow(it, b2, 8192, 4096)
+    if !grown.ok || grown.p as u64 != b2.p as u64 {
+        ok = false
+    }
+    if core.ld8(grown.p, 0) != 65 as u8 {
+        ok = false // growing must not lose the contents
+    }
+    let used: usize = a.used()
+    let high: usize = a.high()
+    // Giving back the last block: an arena can do exactly that, and it
+    // says so in its used count.
+    core.free(it, grown, 4096)
+    let after: usize = a.used()
+    if after >= used {
+        ok = false
+    }
+    // And everything at once.
+    a.reset()
+    if a.used() != 0 {
+        ok = false
+    }
+    if a.high() != high {
+        ok = false // the high water mark is a memory, not a gauge
+    }
+
+    serial_c(&s_head[0])
+    say(&s_used[0], used as u64)
+    say(&s_high[0], high as u64)
+    say(&s_after[0], after as u64)
+    say(&s_given[0], core.arena_given(&a))
+    say(&s_no[0], core.arena_refused(&a))
+    say(&s_grown[0], grown.n as u64)
+    serial_nl()
+    return ok
+}
+
+// --------------------------------------------------------------- start
+
+fn kcore_start() {
+    asm("cli")
+    serial_init()
+    var greeting: [u8; 22] = "FIRN kernel + std.core"
+    var s_ok: [u8; 9] = "core.ok\n\0"
+    var s_bad: [u8; 10] = "core.bad\n\0"
+    serial_span(core.span(&greeting[0], 22))
+    serial_nl()
+    var ok: bool = true
+    if !text_probe() {
+        ok = false
+    }
+    if !utf8_probe() {
+        ok = false
+    }
+    if !math_probe() {
+        ok = false
+    }
+    if !arena_probe() {
+        ok = false
+    }
+    if ok {
+        serial_c(&s_ok[0])
+    } else {
+        serial_c(&s_bad[0])
+    }
+    while true {
+        asm("hlt")
+    }
+}

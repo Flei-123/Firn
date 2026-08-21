@@ -27,8 +27,14 @@ AUS = ('testdata/', 'tools/english/', '.js-work/')
 ZIFFERNSCHWANZ = re.compile(r'[0-9]+$')
 TEIL = re.compile(r'[a-z0-9]+|[A-Z]+(?![a-z])|[A-Z][a-z0-9]*')
 # Wortteile, die in Pfaden richtig sind, obwohl die Morphemtabelle sie kennt.
+# RUNDE 73: 'basis' steht schon seit Runde 67 in exceptions.txt (die
+# CSS-Eigenschaft `flex-basis`, css-flexbox-1 7.2.3) -- aber exceptions.txt
+# gilt nur fuer BEZEICHNER, nicht fuer Pfadnamen. Deshalb hat check_names.py
+# tools/layout/cases/br_flex_basis_percent.expected seither als deutschen
+# Pfad gemeldet und check.sh gab 0 0 0 1 0 statt fuenf Nullen. Derselbe
+# Grund, dieselbe Antwort: das englische Wort der Spezifikation.
 ERLAUBT = {'kernel', 'start', 'core', 'min', 'max', 'lib', 'bin', 'src',
-           'demos', 'app', 'pause', 'linker', 'mess'}
+           'demos', 'app', 'pause', 'linker', 'mess', 'basis'}
 # Runde 65: englische GANZE Woerter, in denen ein deutsches Morphem als
 # Zeichenfolge steckt ('absolute' enthaelt 'absolut'). Die Suche im
 # Wortinneren darf hier nicht anschlagen; als ganzes Teil geprueft, nicht
