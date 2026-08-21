@@ -406,11 +406,21 @@ fn address(l: *mut Lower, e: u32) -> u32 {
         let iv: u32 = value(l, ast.e_b(b, e))
         return elem_address(l, base, iv, ift, gr)
     }
-    if a == ast.E_SLIT || a == ast.E_ALIT || a == ast.E_AWDH {
+    if a == ast.E_SLIT || a == ast.E_ALIT || a == ast.E_AWDH || a == ast.E_TEXT {
         let t: u32 = sema.sema_ty(sm(l), e)
         let slot: u32 = alloca(l, q_size(l, t), q_align(l, t))
         write_after(l, slot, e)
         return slot
+    }
+    // HOOK str: `a + b` on `str` is an aggregate and needs a place of its
+    // own (strtype.rs, round 70).
+    if a == ast.E_BIN && ast.e_a(b, e) == 0 {
+        let tb: u32 = sema.sema_ty(sm(l), e)
+        if types.str_like(tf(l), tb) {
+            let slot2: u32 = alloca(l, q_size(l, tb), q_align(l, tb))
+            write_after(l, slot2, e)
+            return slot2
+        }
     }
     // HOOK fnval: `gc fn(...)` yields an error union -- an aggregate, so it
     // needs a place of its own (fnval.rs, round 58).
@@ -572,6 +582,41 @@ fn write_after(l: *mut Lower, addr: u32, e: u32) {
             write_after(l, fa, fexpr)
             k = k + 1
         }
+        return
+    }
+    // HOOK str: THE text literal (strtype.rs, round 70).
+    //
+    // Where an array is wanted, the inner array literal is written --
+    // literally the code of round 39. Where a `str` is wanted, the octets
+    // get a place in the frame and the two words p/n are written into the
+    // target. The empty literal `""` needs no place at all.
+    if a == ast.E_TEXT {
+        let inner: u32 = ast.e_a(b, e)
+        if types.ty_kind(tf(l), t) == types.K_ARR {
+            write_after(l, addr, inner)
+            return
+        }
+        let n: u32 = ast.e_c(b, inner)
+        var p: u32 = 0
+        if n == 0 {
+            p = constant(l, fir.T_PTR, 0)
+        } else {
+            let bytes: u32 = alloca(l, n as u64, 1)
+            write_after(l, bytes, inner)
+            p = bytes
+        }
+        store(l, fir.T_PTR, addr, p)
+        let na: u32 = ptradd_const(l, addr, 8)
+        store(l, fir.T_U64, na, constant(l, fir.T_U64, n as u64))
+        return
+    }
+    // HOOK str: `a + b` on `str` -- the result comes from the collector.
+    if a == ast.E_BIN && ast.e_a(b, e) == 0 && types.str_like(tf(l), t) {
+        var cargs: Vec[u32] = vec_new[u32]()
+        vec_push[u32](&cargs, ast.e_b(b, e))
+        vec_push[u32](&cargs, ast.e_c(b, e))
+        str_call(l, str_fn(l, 1), &cargs, addr)
+        vec_free[u32](&cargs)
         return
     }
     if a == ast.E_ALIT {
@@ -869,6 +914,22 @@ fn binary(l: *mut Lower, e: u32) -> u32 {
 
     if op == 16 || op == 17 {
         return short_circuit(l, op, li, re)
+    }
+    // HOOK str: `==`/`!=` compare the CONTENT -- one call into the collector
+    // runtime, the same shape as in stage 0 (strtype.rs, round 70).
+    if op == 10 || op == 11 {
+        let lt0: u32 = sema.sema_ty(sm(l), li)
+        if types.str_like(tf(l), lt0) {
+            var eargs: Vec[u32] = vec_new[u32]()
+            vec_push[u32](&eargs, li)
+            vec_push[u32](&eargs, re)
+            let v: u32 = str_call(l, str_fn(l, 0), &eargs, NONE)
+            vec_free[u32](&eargs)
+            if op == 11 {
+                return push(l, fir.O_UN, fir.T_BOOL, v, 0, 1, 0, 0, 0)
+            }
+            return v
+        }
     }
     if op >= 10 && op <= 15 {
         // HOOK error unions (lower_errors.rs::hook_binary): comparing two error
@@ -1359,9 +1420,104 @@ fn asm_lower(l: *mut Lower, blk: u32, e: u32) -> u32 {
     return push(l, fir.O_ASM, fir.T_U64, template, out, 0, znum, aoff, n_in)
 }
 
+// ROUND 70 (lower::fmt_target) -- the SAME resolution as in the type check,
+// derived from the same material: the type of the interpolated expression.
+// Returns the new name or NONE.
+fn fmt_target(l: *mut Lower, name: u32, e: u32) -> u32 {
+    let b: *mut ast.Tree = tree(l)
+    let it: *mut intern.Interner = names(l)
+    var vw: [u8; 9] = "fmt_value"
+    let n: usize = intern.intern_length(it, name)
+    if n < 9 {
+        return NONE
+    }
+    let p: u64 = intern.intern_ptr(it, name)
+    if !rt.mem_eq(p + (n - 9) as u64, (&vw[0]) as u64, 9) {
+        return NONE
+    }
+    if ast.e_c(b, e) != 2 {
+        return NONE
+    }
+    let arg: u32 = ast.child_at(b, ast.e_b(b, e) + 1)
+    let t: u32 = sema.sema_ty(sm(l), arg)
+    if types.str_like(tf(l), t) {
+        var w1: [u8; 7] = "fmt_str"
+        return fmt_join(l, p, n - 9, (&w1[0]) as u64, 7)
+    }
+    if types.ty_kind(tf(l), t) == types.K_BOOL {
+        var w2: [u8; 8] = "fmt_bool"
+        return fmt_join(l, p, n - 9, (&w2[0]) as u64, 8)
+    }
+    if types.ty_kind(tf(l), t) == types.K_F64 {
+        var w3: [u8; 7] = "fmt_f64"
+        return fmt_join(l, p, n - 9, (&w3[0]) as u64, 7)
+    }
+    if !types.is_int(tf(l), t) {
+        return NONE
+    }
+    if !types.is_sign(tf(l), t) {
+        var w4: [u8; 7] = "fmt_u64"
+        return fmt_join(l, p, n - 9, (&w4[0]) as u64, 7)
+    }
+    var w5: [u8; 10] = "fmt_number"
+    return fmt_join(l, p, n - 9, (&w5[0]) as u64, 10)
+}
+
+fn fmt_join(l: *mut Lower, head: u64, hn: usize, step: u64, sn: usize) -> u32 {
+    var b2: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&b2)
+    rt.buf_push_bytes(&b2, head, hn)
+    rt.buf_push_bytes(&b2, step, sn)
+    return intern.intern_number(names(l), rt.buf_ptr(&b2), rt.buf_len(&b2)) as u32
+}
+
+// ROUND 70 -- a call of a `str` runtime function.
+//
+// Both signatures are known and simple: two `str` (16 octets, System V
+// class INTEGER with two words each) go in, either a `bool` comes out
+// (`__str_eq`) or a `str` through the hidden pointer (`__str_concat`,
+// aggregate over 8 octets -> sret). The sequence is EXACTLY the one
+// `lower_call` in stage 0 produces, so the FIR of both compilers matches.
+fn str_call(l: *mut Lower, name: u32, args: *mut Vec[u32], dest: u32) -> u32 {
+    var tmp: Vec[u32] = vec_new[u32]()
+    if dest != NONE {
+        vec_push[u32](&tmp, dest)
+    }
+    var i: usize = 0
+    while i < vec_len[u32](args) {
+        let addr: u32 = address(l, vec_at[u32](args, i))
+        words_load(l, addr, 16, 2, &tmp)
+        i = i + 1
+    }
+    let cnt: u32 = vec_len[u32](&tmp) as u32
+    let off: u32 = args_store(l, &tmp)
+    vec_free[u32](&tmp)
+    if dest != NONE {
+        push(l, fir.O_CALL, fir.T_PTR, name, 0, 0, 0, off, cnt)
+        return 0
+    }
+    return push(l, fir.O_CALL, fir.T_BOOL, name, 0, 0, 0, off, cnt)
+}
+
+// ROUND 70 -- the runtime function of the `str` operators.
+fn str_fn(l: *mut Lower, which: u32) -> u32 {
+    var eqw: [u8; 8] = "__str_eq"
+    var caw: [u8; 12] = "__str_concat"
+    if which == 0 {
+        return intern.intern_number(names(l), (&eqw[0]) as u64, 8) as u32
+    }
+    return intern.intern_number(names(l), (&caw[0]) as u64, 12) as u32
+}
+
 fn call_full(l: *mut Lower, e: u32, target: u32) -> u32 {
     let b: *mut ast.Tree = tree(l)
     var name: u32 = ast.e_a(b, e)
+    // HOOK str: `f"{x}"` -- the step is derived from the type of the
+    // argument, exactly as in the type check (round 70).
+    let fmt_real: u32 = fmt_target(l, name, e)
+    if fmt_real != NONE {
+        name = fmt_real
+    }
     // HOOK gc (gc_lower.rs::hook_call): allocation, intrinsics, `as?` -- and
     // `weak`/`strong` are runtime functions (`real_name`).
     // ROUND 52 (core.rs): inline assembly and MMIO.
@@ -1668,7 +1824,27 @@ fn call_full(l: *mut Lower, e: u32, target: u32) -> u32 {
             }
         }
         if !is_aggregate(l, at) {
-            vec_push[u32](&tmp, value(l, arg))
+            var v: u32 = value(l, arg)
+            // ROUND 70: a narrower integer is widened to the width of the
+            // parameter. Until now argument and parameter always had the
+            // same type; `f"{x}"` with an i32 is the first place where an
+            // i32 meets an i64 parameter (`io.fmt_number`).
+            if !indirect && !dispatch {
+                let fnw: u32 = fn_number(l, name)
+                if fnw != NONE && k < ast.fn_plen(b, fnw as usize) {
+                    let pt: u32 = types.param_ty_resolved(tf(l), fnw as usize, k)
+                    if types.is_int(tf(l), at) && types.is_int(tf(l), pt) {
+                        if types.bits_of(tf(l), pt) > types.bits_of(tf(l), at) {
+                            let want: u32 = fty(l, pt)
+                            let have: u32 = fty(l, at)
+                            if want != fir.NONE && have != fir.NONE && want != have {
+                                v = push(l, fir.O_CAST, want, v, 0, have, 0, 0, 0)
+                            }
+                        }
+                    }
+                }
+            }
+            vec_push[u32](&tmp, v)
             k = k + 1
             continue
         }
