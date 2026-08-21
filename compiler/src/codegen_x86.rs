@@ -136,7 +136,24 @@ impl Emitter {
 /// scheme itself stands at `modules.rs` (`SYMBOL_SCHEMA`, DESIGN_GOALS.md §4).
 /// Internal block labels (`block_label`) deliberately do NOT pass through
 /// here: they are file local (`.L…`) and never appear in the symbol table.
+///
+/// **Round 75 (SPEC §14.5)** — two escape hatches from the `_F0.` scheme,
+/// both looked up in `extfn.rs`:
+///   * `name` is an `extern fn` — `Op::Call { name, .. }` reaches here from
+///     a CALLER's body and has to produce the symbol the C side defines,
+///     unmangled.
+///   * `name` carries `#[export_c]` — the function itself is emitted here
+///     (`emit_func`'s `.globl label(&f.name)` / `label(&f.name):`) and has
+///     to come out under its bare Firn name so C can call it.
+/// Every other name keeps going through `modules::symbol` exactly as
+/// before — this is additive, nothing about the existing scheme changed.
 pub(crate) fn label(name: &str) -> String {
+    if let Some(link) = crate::extfn::extern_link_name(name) {
+        return link;
+    }
+    if let Some(export) = crate::extfn::export_link_name(name) {
+        return export;
+    }
     crate::modules::symbol(name, None)
 }
 

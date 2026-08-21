@@ -78,6 +78,20 @@ pub const ATTRS: &[AttrInfo] = &[
         what: "interrupt entry point: save all registers, iretq (SPEC 2)",
     },
     AttrInfo {
+        name: "link_name",
+        target: Target::Func,
+        args: 1,
+        implemented: true,
+        what: "explicit C link name for 'extern fn', e.g. #[link_name(exit)] (SPEC 14.5)",
+    },
+    AttrInfo {
+        name: "export_c",
+        target: Target::Func,
+        args: 0,
+        implemented: true,
+        what: "make a Firn function callable under its bare name from C (SPEC 14.5)",
+    },
+    AttrInfo {
         name: "allow_fp",
         target: Target::Both,
         args: 0,
@@ -237,7 +251,10 @@ mod tests {
         // tests/neg/nogc_*.fi).
         // Round 52: plus #[interrupt] and #[allow_fp] (SPEC 2, core.rs/prof.rs).
         let u: Vec<&str> = ATTRS.iter().filter(|a| a.implemented).map(|a| a.name).collect();
-        assert_eq!(u, vec!["must_consume", "no_gc", "interrupt", "allow_fp"]);
+        assert_eq!(
+            u,
+            vec!["must_consume", "no_gc", "interrupt", "link_name", "export_c", "allow_fp"]
+        );
     }
 
     #[test]

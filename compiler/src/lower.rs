@@ -705,6 +705,19 @@ impl<'a> Lower<'a> {
                 Some(self.push(FTy::I64, Op::Syscall { args: a }))
             }
             ExprKind::Cast(inner, _) => {
+                // **Round 75** (SPEC §14.5) — `name as *T` where `name` is a
+                // directly named function (checked in `sema.rs`, which is
+                // the only place allowing `Type::Fn` -> pointer at all): the
+                // VALUE of `name` alone is the address of its one-word
+                // `.rodata` record (`Op::FnRef`, see the `Ident` arm above);
+                // what a C callback needs is the CODE ADDRESS stored INSIDE
+                // that word. So this reads through the record once more —
+                // the same `load` a `*fn` dereference would do — instead of
+                // handing out the record's own address.
+                if self.ty_of(inner).is_fn() {
+                    let record_addr = self.lower_expr(inner)?;
+                    return Some(self.load(FTy::Ptr, record_addr));
+                }
                 let from = self.out_fty(inner)?;
                 let to = self.fty_of(e)?;
                 let src = self.lower_expr(inner)?;
@@ -1870,6 +1883,15 @@ pub fn lower(prog: &Program, info: &TypeInfo, dg: &mut Diags) -> Option<Module> 
     let mut m = Module::new();
     let mut ok = true;
     for d in &prog.funcs {
+        // **Round 75** (SPEC §14.5) — `extern fn` has no Firn body: there
+        // is nothing to lower to FIR. Its signature already sits in
+        // `info.fns` (from `sema::collect_fns`, unconditionally) so every
+        // CALLER of it type-checks and lowers normally; `codegen_x86::label`
+        // resolves the call name through `extfn.rs` instead of expecting a
+        // `Func` with this name to exist in `m.funcs`.
+        if d.extern_info.is_some() {
+            continue;
+        }
         match lower_fn(d, info, dg) {
             Some(f) => m.funcs.push(f),
             None => ok = false,
@@ -1885,6 +1907,7 @@ pub fn lower(prog: &Program, info: &TypeInfo, dg: &mut Diags) -> Option<Module> 
             body: d.body.clone(),
             span: d.span,
             attrs: Vec::new(),
+            extern_info: None,
         };
         match lower_fn(&fd, info, dg) {
             Some(f) => m.funcs.push(f),
@@ -1995,6 +2018,7 @@ mod tests {
             body: blk(vec![Stmt::Return { value: Some(sum), span: Span::new(1, 1, 1) }]),
             span: Span::new(1, 1, 1),
             attrs: Vec::new(),
+            extern_info: None,
         };
         let prog = Program { funcs: vec![f], expr_count: b.next, ..Default::default() };
         let info = info_of(
@@ -2033,6 +2057,7 @@ mod tests {
             ]),
             span: Span::none(),
             attrs: Vec::new(),
+            extern_info: None,
         };
         let prog = Program { funcs: vec![f], expr_count: b.next, ..Default::default() };
         let info = info_of(
@@ -2099,6 +2124,7 @@ mod tests {
             ]),
             span: Span::none(),
             attrs: Vec::new(),
+            extern_info: None,
         };
 
         // --- fn main() -> i32 ---
@@ -2148,6 +2174,7 @@ mod tests {
             ]),
             span: Span::none(),
             attrs: Vec::new(),
+            extern_info: None,
         };
 
         let prog = Program { funcs: vec![sum_decl, mainf], expr_count: b.next, ..Default::default() };
@@ -2220,6 +2247,7 @@ mod tests {
             ]),
             span: Span::none(),
             attrs: Vec::new(),
+            extern_info: None,
         };
         let prog = Program { funcs: vec![f], expr_count: b.next, ..Default::default() };
         let info = info_of(
