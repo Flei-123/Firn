@@ -956,7 +956,20 @@ fn float_quot(num0: *mut Bn, den0: *mut Bn, numw: *mut Bn, denw: *mut Bn,
 // 0..9), `exp0` is the decimal exponent that belongs to them. The result is
 // the BIT PATTERN of the correctly rounded binary64; the literal has no
 // sign, a leading minus is a unary operator of the parser.
-fn float_exact(l: *mut Lexer, exp0: i64) -> u64 {
+// ROUND 71 -- `odd = true` rounds TO ODD instead of to nearest: cut off,
+// and set the last bit when anything was left over.
+//
+// That is the one thing that makes a correct `f32` out of it. The way
+// decimal -> binary64 (nearest) -> binary32 (nearest) is NOT correctly
+// rounded: at the exact middle between two binary32 values the intermediate
+// rounding lands ON the middle, and the tie-to-even then decides without
+// knowing which side the real value lay on. Measured against C `strtof`:
+// 63568 of 239064 such cases came out one ulp wrong.
+//
+// With round-to-odd it cannot happen: a value with the last bit set is
+// never exactly a binary32 middle, so the second rounding always has a
+// direction and it is the right one (Boldo/Melquiond -- 53 >= 24 + 2).
+fn float_exact(l: *mut Lexer, exp0: i64, odd: bool) -> u64 {
     // six big numbers of 256 limbs, one behind the other
     var block: [u32; 1536] = [0 as u32; 1536]
     let mem: u64 = (&block[0]) as u64
@@ -1046,6 +1059,23 @@ fn float_exact(l: *mut Lexer, exp0: i64) -> u64 {
         q = float_quot(&num0, &den0, &numw, &denw, &tmp, s)
     }
 
+    // --- ROUND 71: round to odd, if that is what was asked for
+    if odd {
+        if !bn_is_zero(&numw) {
+            q = q | 1
+        }
+        if e2 > 971 {
+            return F_INF_BITS
+        }
+        if q == 0 {
+            return 0
+        }
+        if q >= F_TWO52 {
+            let biased_o: u64 = (e2 + 1075) as u64
+            return (biased_o << 52) + (q - F_TWO52)
+        }
+        return q
+    }
     // --- round: the remainder against half the denominator, at exactly
     // half distance towards the even mantissa
     bn_shl(&numw, 1)
@@ -1104,7 +1134,17 @@ fn float_bits(l: *mut Lexer, mant: u64, overflow: bool, e: i64) -> u64 {
         }
     }
     (*l).float_slow = (*l).float_slow + 1
-    return float_exact(l, e)
+    return float_exact(l, e, false)
+}
+
+// ROUND 71 -- the CORRECTLY ROUNDED binary32 of the same digits.
+//
+// Always the exact way, never Clinger's fast path: the fast path delivers a
+// correctly rounded binary64, and that is exactly one rounding too many
+// (see `float_exact`). The cost is a few microseconds per float literal in
+// the source text -- next to reading the file it does not show up.
+fn float32_bits(l: *mut Lexer, e: i64) -> u32 {
+    return narrow_f32(f64_of_bits(float_exact(l, e, true)))
 }
 
 fn lex_float_rest(l: *mut Lexer, line: u32, col: u32, width0: u32,
@@ -1181,18 +1221,21 @@ fn lex_float_rest(l: *mut Lexer, line: u32, col: u32, width0: u32,
         if neg { expo = 0 - expo }
     }
     let bits: u64 = float_bits(l, mant, over, expo - n_after)
+    let single: u32 = float32_bits(l, expo - n_after)
     // ROUND 71: the suffix `f` makes an `f32` out of it.
     if look(l, 0) == 102 && suffix_free(look(l, 1)) {
         vor1(l)
         width = width + 1
         var b3: u32 = width
         if b3 < 1 { b3 = 1 }
-        tok(l, A_FLOATF32, line, col, b3, narrow_f32(f64_of_bits(bits)) as u64, 0)
+        tok(l, A_FLOATF32, line, col, b3, single as u64, 0)
         return true
     }
     var b2: u32 = width
     if b2 < 1 { b2 = 1 }
-    tok(l, A_FLOAT, line, col, b2, bits, 0)
+    // The token carries BOTH bit patterns: `number` the binary64, `nr` the
+    // binary32 of the very same text (lexer.rs::TokKind::Float).
+    tok(l, A_FLOAT, line, col, b2, bits, single)
     return true
 }
 
@@ -1252,7 +1295,8 @@ fn lex_int(l: *mut Lexer) {
                 }
                 var bf: u32 = width
                 if bf < 1 { bf = 1 }
-                tok(l, A_FLOATF32, line, col, bf, narrow_f32(m2 as f64) as u64, 0)
+                let _ = m2
+                tok(l, A_FLOATF32, line, col, bf, float32_bits(l, 0) as u64, 0)
                 return
             }
         }

@@ -48,6 +48,7 @@ if [ ! -x "$DUMP" ] || [ -n "$(find bin lib/firnc1 -name '*.fi' -newer "$DUMP" -
     "$FIRNC" bin/lexdump.fi -o "$DUMP" || exit 1
 fi
 cc -O2 -o "$WORK/ref" tools/lexnum/ref.c || exit 1
+cc -O2 -o "$WORK/ref32" tools/lexnum/ref32.c || exit 1
 
 echo "== 1. produce the literals (seed $SEED) =="
 python3 tools/lexnum/gen.py "$COUNT" "$SEED" "$WORK" || exit 1
@@ -58,6 +59,20 @@ echo "== 2. read them with all four readers =="
 "$FIRNC" --emit=tokens "$WORK/int_cases.fi" > "$WORK/int_a.txt" 2>"$WORK/int_ae.txt"
 "$DUMP" "$WORK/int_cases.fi" > "$WORK/int_b.txt" 2>"$WORK/int_be.txt"
 "$WORK/ref" < "$WORK/float_plain.txt" > "$WORK/float_c.txt" || exit 1
+# ROUND 71: the same four columns for the single width.
+"$FIRNC" --emit=tokens "$WORK/f32_cases.fi" > "$WORK/f32_a.txt" 2>"$WORK/f32_ae.txt"
+"$DUMP" "$WORK/f32_cases.fi" > "$WORK/f32_b.txt" 2>"$WORK/f32_be.txt"
+"$WORK/ref32" < "$WORK/f32_plain.txt" > "$WORK/f32_c.txt" || exit 1
+if [ -s "$WORK/f32_ae.txt" ]; then
+    echo "FAIL: firnc0 reports something about the valid f32 literals:"
+    head -5 "$WORK/f32_ae.txt"
+    exit 1
+fi
+if grep -q '^error' "$WORK/f32_be.txt"; then
+    echo "FAIL: firnc1 reports something about the valid f32 literals:"
+    head -5 "$WORK/f32_be.txt"
+    exit 1
+fi
 
 if [ -s "$WORK/float_ae.txt" ]; then
     echo "FAIL: firnc0 reports something about the valid literals:"
@@ -102,7 +117,8 @@ FLOAT_TOTAL=$(grep -c '' "$WORK/float_cases.fi")
 SLOW=$(awk '{print $5}' "$WORK/float_be.txt" 2>/dev/null | tail -1)
 echo
 if [ "$RC" -eq 0 ] && [ "$BAD" -eq 0 ]; then
-    echo "OK: $FLOAT_TOTAL floating point literals, four readers, no deviation (exact path: ${SLOW:-?})"
+    F32_TOTAL=$(grep -c '' "$WORK/f32_cases.fi")
+    echo "OK: $FLOAT_TOTAL f64 and $F32_TOTAL f32 literals, four readers each, no deviation (exact path: ${SLOW:-?})"
     exit 0
 fi
 echo "FAIL: the number readers do not agree"

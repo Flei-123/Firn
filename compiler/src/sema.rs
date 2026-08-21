@@ -1214,7 +1214,7 @@ impl<'a> Checker<'a> {
             // `f32`; where nothing says anything, `f64` holds -- the default
             // type, as in C#. The suffix `1.5f` is therefore only needed
             // where there is no context at all (SPEC 8.6).
-            ExprKind::Float(_) => match hint {
+            ExprKind::Float(..) => match hint {
                 Some(Type::F32) => Type::F32,
                 _ => Type::F64,
             },
@@ -2056,7 +2056,7 @@ impl<'a> Checker<'a> {
             // ROUND 71: an unsuffixed float literal probes as NOTHING -- it
             // adapts, exactly like the integer literal. Only the suffix
             // makes it speak.
-            ExprKind::Float(_) => None,
+            ExprKind::Float(..) => None,
             ExprKind::FloatF32(_) => Some(Type::F32),
             ExprKind::Bool(_) => Some(Type::Bool),
             ExprKind::Ident(n) => {

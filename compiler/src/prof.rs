@@ -361,7 +361,7 @@ impl Guard<'_> {
         match &e.kind {
             // ROUND 71: `f32` falls under the same rule as `f64` —
             // floating point in the kernel profile only with #[allow_fp].
-            ExprKind::Float(_) | ExprKind::FloatF32(_) => self.fp(e.span, "a floating point literal"),
+            ExprKind::Float(..) | ExprKind::FloatF32(_) => self.fp(e.span, "a floating point literal"),
             // ROUND 70: the text literal carries its array literal inside.
             ExprKind::Text(_, inner) => self.expr(inner),
             // Round 58: the body of a closure is checked like any other.

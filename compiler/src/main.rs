@@ -462,7 +462,17 @@ fn run(opts: &Options) -> i32 {
     if opts.emit == Emit::Tokens {
         let toks = lexer::lex(&root.src, &mut dg);
         for t in &toks {
-            println!("{:>4}:{:<4} {:?}", t.span.line, t.span.col, t.kind);
+            // ROUND 71: a float token carries two bit patterns since this
+            // round. The dump shows the binary64 alone, exactly as before --
+            // the token stream is a fixed interface (tools/lex_compare.sh),
+            // and the second pattern is derivable from the first one anyway
+            // for everybody who wants it.
+            match &t.kind {
+                lexer::TokKind::Float(bits, _) => {
+                    println!("{:>4}:{:<4} Float({})", t.span.line, t.span.col, bits)
+                }
+                k => println!("{:>4}:{:<4} {:?}", t.span.line, t.span.col, k),
+            }
         }
         dg.print();
         return if dg.has_errors() { 1 } else { 0 };

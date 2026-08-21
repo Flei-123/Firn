@@ -410,7 +410,7 @@ fn subst_stmt(s: &mut Stmt, map: &HashMap<String, TypeExpr>, queue: &mut Vec<(St
 fn subst_expr(e: &mut Expr, map: &HashMap<String, TypeExpr>, queue: &mut Vec<(String, Instantiation)>) {
     let sp = e.span;
     match &mut e.kind {
-        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::FloatF32(_) | ExprKind::Bool(_) => {}
+        ExprKind::Int(_) | ExprKind::Float(..) | ExprKind::FloatF32(_) | ExprKind::Bool(_) => {}
         ExprKind::Ident(_) => {}
         // ROUND 70: the text literal carries its array literal inside.
         ExprKind::Text(_, inner) => subst_expr(inner, map, queue),
@@ -518,7 +518,7 @@ pub(crate) fn renumber_expr(e: &mut Expr, next: &mut u32) {
     e.id = *next;
     *next += 1;
     match &mut e.kind {
-        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::FloatF32(_) | ExprKind::Bool(_) | ExprKind::Ident(_) => {}
+        ExprKind::Int(_) | ExprKind::Float(..) | ExprKind::FloatF32(_) | ExprKind::Bool(_) | ExprKind::Ident(_) => {}
         // ROUND 70: the text literal carries its array literal inside.
         ExprKind::Text(_, inner) => renumber_expr(inner, next),
         ExprKind::Lambda(d) => renumber_block(&mut d.body, next),
@@ -651,7 +651,7 @@ fn check_bare_stmt(s: &Stmt, out: &mut Vec<(Span, String)>) {
 
 fn check_bare_expr(e: &Expr, out: &mut Vec<(Span, String)>) {
     match &e.kind {
-        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::FloatF32(_) | ExprKind::Bool(_) | ExprKind::Ident(_) => {}
+        ExprKind::Int(_) | ExprKind::Float(..) | ExprKind::FloatF32(_) | ExprKind::Bool(_) | ExprKind::Ident(_) => {}
         // ROUND 70: the text literal carries its array literal inside.
         ExprKind::Text(_, inner) => check_bare_expr(inner, out),
         // Round 58: a closure body carries types like any other body.

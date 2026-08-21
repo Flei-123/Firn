@@ -852,7 +852,7 @@ fn visit_expr(ck: &mut Checker, e: &Expr, names: &[String]) {
             visit_expr(ck, a, names);
             visit_expr(ck, b, names);
         }
-        ExprKind::Float(_)
+        ExprKind::Float(..)
         | ExprKind::Int(_)
         | ExprKind::Bool(_)
         | ExprKind::Ident(_) => {}

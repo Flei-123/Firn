@@ -457,7 +457,7 @@ fn walk_expr(e: &Expr, out: &mut Vec<LambdaDecl>) {
             walk_expr(a, out);
             walk_expr(b, out);
         }
-        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Ident(_) => {}
+        ExprKind::Int(_) | ExprKind::Float(..) | ExprKind::Bool(_) | ExprKind::Ident(_) => {}
     }
 }
 

@@ -769,9 +769,9 @@ impl<'a> Parser<'a> {
                 let sp = self.bump();
                 self.mk(sp, ExprKind::Int(v))
             }
-            TokKind::Float(bits) => {
+            TokKind::Float(bits, single) => {
                 let sp = self.bump();
-                self.mk(sp, ExprKind::Float(bits))
+                self.mk(sp, ExprKind::Float(bits, single))
             }
             TokKind::FloatF32(bits) => {
                 let sp = self.bump();
@@ -2047,7 +2047,7 @@ mod tests {
     fn dump(e: &Expr) -> String {
         match &e.kind {
             ExprKind::Int(v) => format!("{}", v),
-            ExprKind::Float(bits) => format!("{}", f64::from_bits(*bits)),
+            ExprKind::Float(bits, _) => format!("{}", f64::from_bits(*bits)),
             ExprKind::FloatF32(bits) => format!("{}f", f32::from_bits(*bits)),
             ExprKind::Bool(b) => format!("{}", b),
             ExprKind::Ident(n) => n.clone(),
