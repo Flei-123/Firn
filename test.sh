@@ -64,6 +64,10 @@
 #      written by the compiler itself, `gdb` driven in batch mode over two
 #      translated Firn programs -- breakpoints, backtrace, `print` of
 #      variables, structs, pointers and arrays, with counter-checks.
+#  27. The number reader (tools/lexnum/run.sh, round 65): several thousand
+#      floating point literals -- halfway cases, subnormals, eight hundred
+#      digits -- read by firnc0, firnc1, C strtod and Python. Compared is
+#      the BIT PATTERN, and it has to be the same four times.
 #  10. DOM soak run (tools/dom_soak/run.sh): the DOM prototype in Firn builds
 #      real cycles continuously (parent/child, listener, JS wrapper) and must
 #      not grow while doing so; the deliberately leaking counter-check with
@@ -338,6 +342,21 @@ if [ "$LXRC" -eq 0 ]; then
 else
     bad "tools/lex_compare.sh failed (see .test-work/lex_compare.log)"
     tail -20 "$WORK/lex_compare.log" | sed 's/^/   /'
+fi
+
+echo "== 27. the number reader: four readers, one bit pattern (tools/lexnum/run.sh, ROUND 65) =="
+# The corpus of the project contains a few dozen floating point literals, all
+# of them harmless. That is why the divergence at `9007199254740991.0` only
+# came to light in round 63 -- BY ACCIDENT. Here several thousand literals
+# that are MEANT to hurt are read by four readers: the lexer in Rust, the
+# lexer in Firn, C `strtod` and Python. Compared is the bit pattern.
+bash tools/lexnum/run.sh > "$WORK/lexnum.log" 2>&1 && LNRC=0 || LNRC=$?
+if [ "$LNRC" -eq 0 ]; then
+    ok
+    grep -E '^   (float literals|integer literals|firnc0 vs|refused literals)|^OK:' "$WORK/lexnum.log" | sed 's/^/   /'
+else
+    bad "tools/lexnum/run.sh failed (see .test-work/lexnum.log)"
+    tail -20 "$WORK/lexnum.log" | sed 's/^/   /'
 fi
 
 echo "== 12. parser in Firn against the parser in Rust (tools/parser_compare.sh) =="

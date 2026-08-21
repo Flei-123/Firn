@@ -34,12 +34,13 @@ fi
 # NO free pass: it stands here so that the number of exceptions stays visible
 # and does not grow silently.
 #
-#   tests/590_f64.fi  ->  the literal `1e308`. The lexer in Firn computes
-#   floating point literals outside the fast path of Clinger
-#   (|exponent| > 22 and the mantissa does not fit into 2^53) step by step and is
-#   off by up to one ULP there. Correct would be Eisel-Lemire with
-#   128-bit arithmetic; that is still missing.
-KNOWN="tests/590_f64.fi"
+# ROUND 65: THE LIST IS EMPTY. Until then `tests/590_f64.fi` stood here,
+# because the lexer in Firn computed floating point literals outside
+# Clinger's fast path step by step and was up to one ULP off there. It no
+# longer computes them step by step: `float_exact` in lib/firnc1/lexer.fi
+# holds the value as a fraction of two big integers and rounds it correctly.
+# tools/lexnum/run.sh proves that over several thousand literals.
+KNOWN=""
 
 same=0
 different=0
