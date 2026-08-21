@@ -12,6 +12,10 @@ that is passed on are two independent numbers (docs/ROUND66.md, gap 10).
 This produces it instead.
 
 Usage:  python3 tools/js/mktest.py <out.fi> <title> <program.js>
+
+The programs live in tools/js/progs/, NOT in tools/js/cases/: the latter is
+what tools/js/compare_node.sh holds against node, and a program that uses
+an ES2024 built in does not run on every node.
 """
 import sys
 
@@ -21,7 +25,7 @@ HEAD = '''// expect_exit: 0
 // The engine runs ONE JavaScript program with numbered assertions; the
 // number of the FIRST failing one lands in the global variable `fail` and
 // comes back as the exit code, so the code names the check that broke.
-// Produced by tools/js/mktest.py out of tools/js/cases/%(case)s.
+// Produced by tools/js/mktest.py out of tools/js/progs/%(case)s.
 import html.mem
 import js.lex
 import js.ast
