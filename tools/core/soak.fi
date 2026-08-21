@@ -1,0 +1,181 @@
+// expect_exit: 0
+// tools/core/soak.fi -- the endurance run for the Allocator of round 73,
+// WITH its own counter-check.
+//
+// THE PROMISE UNDER TEST: an `Arena` (lib/mem/core_alloc.fi) owns nothing.
+// It gets ONE region once and never asks anybody for another byte -- no
+// `mmap`, no `brk`, no system call at all. A program that runs millions of
+// requests through it must therefore NOT grow, no matter how long it runs.
+//
+// A promise without a counter-check is worth nothing: a measurement that
+// never strikes proves nothing. That is why THE SAME program has both
+// behaviours, and the first line of the input chooses:
+//
+//     "arena"  -- every round through the arena, `reset` at the end
+//                 -> RSS has to stay FLAT
+//     "leak"   -- every round a fresh block from the PageAllocator, never
+//                 given back  -> RSS HAS to CLIMB
+//
+// One program, one loop, one difference: where the memory comes from and
+// whether it is given back. If the "leak" run stayed flat too, the
+// measurement would be broken and the "arena" run would prove nothing.
+//
+// The arena run also PROVES ITSELF while running: it writes a pattern into
+// every block and reads it back, and it checks that no two blocks of one
+// round overlap. An allocator that hands out the same memory twice is
+// found in the round in which it happens, not afterwards.
+//
+// RSS is read out of /proc/self/statm (field 2 = resident pages), by the
+// program itself -- no sampling from outside that could race with the run.
+import std.core
+import std.mem
+import std.io
+import std.rt
+import std.str
+import std.num
+
+const ARENA_BYTES: usize = 262144
+const PER_ROUND: usize = 12
+
+// The resident pages of this process, or 0 if /proc is not there.
+fn rss_pages() -> u64 {
+    var path: [u8; 17] = "/proc/self/statm\0"
+    var b: rt.Buf = rt.buf_new()
+    if !io.read_file(rt.addr_of(&path[0]), &b) {
+        rt.buf_free(&b)
+        return 0
+    }
+    var fields: str.Divisor = str.divisor_whitespace(io.span_of_buf(&b))
+    var part: str.Span = str.span_empty()
+    var i: usize = 0
+    var pages: u64 = 0
+    while str.divisor_next(&fields, &part) {
+        if i == 1 {
+            pages = num.parse_u64(part).value_or(0)
+        }
+        i = i + 1
+    }
+    rt.buf_free(&b)
+    return pages
+}
+
+// One round through the arena: a handful of blocks of different sizes and
+// alignments, each written and read back, then everything freed AT ONCE.
+// Returns false as soon as one block lies wrong.
+fn arena_round(a: *mut core.Arena, round: usize) -> bool {
+    let it: dyn Allocator = a as dyn Allocator
+    var last_end: u64 = 0
+    var i: usize = 0
+    var ok: bool = true
+    while i < PER_ROUND {
+        let size: usize = 24 + (round + i * 7) % 900
+        var align: usize = 16
+        if i % 4 == 3 {
+            align = 64
+        }
+        let b: core.Block = core.alloc(it, size, align)
+        if !b.ok {
+            return false
+        }
+        if (b.p as u64) % (align as u64) != 0 {
+            ok = false
+        }
+        if (b.p as u64) < last_end {
+            ok = false // two blocks of the same round overlap
+        }
+        last_end = b.p as u64 + size as u64
+        // The memory really belongs to us: write a pattern and read it back.
+        let mark: u8 = (65 + i % 26) as u8
+        core.st8(b.p, 0, mark)
+        core.st8(b.p, size - 1, mark)
+        if core.ld8(b.p, 0) != mark || core.ld8(b.p, size - 1) != mark {
+            ok = false
+        }
+        i = i + 1
+    }
+    // The whole round in one instruction -- that is what an arena is for.
+    core.arena_reset(a)
+    if core.arena_used(a) != 0 {
+        ok = false
+    }
+    return ok
+}
+
+fn main() -> i32 {
+    var mode: io.Text = io.read_line()
+    if !mode.is_ok() {
+        io.fmt_print_line(f"soak: the first line has to be 'arena' or 'leak'")
+        mode.free()
+        return 2
+    }
+    var leak_word: io.Text = io.text_of(f"leak")
+    let leak: bool = str.equal(mode.span(), leak_word.span())
+    leak_word.free()
+    mode.free()
+
+    var count: io.Text = io.read_line()
+    var rounds: usize = 0
+    if count.is_ok() {
+        rounds = num.parse_u64(count.span().trim()).value_or(0) as usize
+    }
+    count.free()
+    if rounds == 0 {
+        io.fmt_print_line(f"soak: the second line has to be the number of rounds")
+        return 2
+    }
+
+    // The ONE region of the arena. It comes from the page allocator -- an
+    // application has one, a kernel takes a frame instead. After this
+    // point not one system call is made for memory any more.
+    var pages: mem.PageAllocator = mem.pages_new()
+    let big: dyn Allocator = (&pages) as dyn Allocator
+    let region: core.Block = core.alloc(big, ARENA_BYTES, 4096)
+    if !region.ok {
+        io.fmt_print_line(f"soak: no memory for the arena")
+        return 3
+    }
+    var a: core.Arena = core.arena_new(region.p, region.n)
+
+    let start: u64 = rss_pages()
+    var first: u64 = 0
+    var last: u64 = 0
+    var bad: usize = 0
+    var leaked: usize = 0
+    var i: usize = 0
+    while i < rounds {
+        if leak {
+            // THE COUNTER-CHECK: a fresh page from the operating system in
+            // every round, and never a `free`. That HAS to grow.
+            let b: core.Block = core.alloc(big, 4096, 4096)
+            if b.ok {
+                core.st8(b.p, 0, 1 as u8)
+                leaked = leaked + 1
+            }
+        } else {
+            if !arena_round(&a, i) {
+                bad = bad + 1
+            }
+        }
+        i = i + 1
+        if i % 1000 == 0 {
+            let here: u64 = rss_pages()
+            if first == 0 {
+                first = here
+            }
+            last = here
+        }
+    }
+    if first == 0 {
+        first = start
+        last = rss_pages()
+    }
+    io.fmt_print(f"rounds {rounds} bad {bad} leaked {leaked} ")
+    io.fmt_print(f"given {core.arena_given(&a)} high {core.arena_high(&a)} ")
+    io.fmt_print(f"syscalls {mem.pages_given(&pages)} ")
+    io.fmt_print(f"rss_start {start} rss_first {first} ")
+    io.fmt_print_line(f"rss_last {last}")
+    if bad > 0 {
+        return 1
+    }
+    return 0
+}
