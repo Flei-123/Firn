@@ -190,7 +190,10 @@ fn table_key(iface: &str, ty_name: &str) -> String {
 /// sorted structs, and the standard library would have had to keep the
 /// hard wired comparison.
 pub(crate) fn base_ty_of_name(n: &str) -> Option<Type> {
-    Some(match n {
+    // ROUND 70: `impl Ord for int` means `impl Ord for i32` -- the name is
+    // folded onto the canonical spelling first (types.rs::canon_name), so
+    // that only ONE method name (`i32__less`) can ever come into being.
+    Some(match crate::types::canon_name(n) {
         "i8" => Type::I8,
         "i16" => Type::I16,
         "i32" => Type::I32,

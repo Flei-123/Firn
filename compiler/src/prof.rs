@@ -315,6 +315,8 @@ impl Guard<'_> {
     fn expr(&mut self, e: &Expr) {
         match &e.kind {
             ExprKind::Float(_) => self.fp(e.span, "a floating point literal"),
+            // ROUND 70: the text literal carries its array literal inside.
+            ExprKind::Text(_, inner) => self.expr(inner),
             // Round 58: the body of a closure is checked like any other.
             ExprKind::Lambda(d) => {
                 for p in &d.params {

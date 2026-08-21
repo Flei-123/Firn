@@ -234,6 +234,8 @@ impl<'a> NoGcChecker<'a> {
 
     fn check_expr(&mut self, e: &Expr) {
         match &e.kind {
+            // ROUND 70: the text literal carries its array literal inside.
+            ExprKind::Text(_, inner) => self.check_expr(inner),
             // Round 58: `gc fn(…)` allocates — inside `#[no_gc]` that has to
             // strike, and so has everything the body does.
             ExprKind::Lambda(d) => {

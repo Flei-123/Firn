@@ -51,6 +51,7 @@ mod sizeof;
 mod sema_generic;
 mod sema_match;
 mod strings;
+mod strtype;
 mod types;
 
 use std::path::{Path, PathBuf};

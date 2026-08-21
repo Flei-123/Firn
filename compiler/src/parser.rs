@@ -778,6 +778,7 @@ impl<'a> Parser<'a> {
             TokKind::Str(_, val) => {
                 let sp = self.bump();
                 let mut elems: Vec<Expr> = Vec::new();
+                let mut wide = false;
                 match val {
                     crate::strings::LitValue::Octets(v) => {
                         for b in v {
@@ -785,20 +786,18 @@ impl<'a> Parser<'a> {
                         }
                     }
                     crate::strings::LitValue::Units(v) => {
+                        wide = true;
                         for u in v {
                             elems.push(self.mk(sp, ExprKind::Int(u as i128)));
                         }
                     }
                 }
-                if elems.is_empty() {
-                    self.dg.error_note(
-                        sp,
-                        "empty string literal".to_string(),
-                        "an array needs at least one element; write an array of the desired length, e.g. '[0 as u8; 8]'",
-                    );
-                    return self.broken_expr(sp);
-                }
-                self.mk(sp, ExprKind::ArrayLit(elems))
+                // ROUND 70: the empty literal is no longer an error HERE —
+                // `""` is a valid, empty `str`. Where an array is wanted the
+                // same message comes from the type check, which is the only
+                // place that knows the context (strtype.rs::check_text).
+                let lit = self.mk(sp, ExprKind::ArrayLit(elems));
+                self.mk(sp, ExprKind::Text(wide, Box::new(lit)))
             }
             TokKind::KwTrue => {
                 let sp = self.bump();
@@ -1670,6 +1669,8 @@ pub fn reset_hooks() {
     crate::iface::hook_reset();
     crate::fnval::hook_reset();
     crate::fnval::closure_reset();
+    // HOOK str: the builtin type of round 70 (strtype.rs)
+    crate::strtype::hook_reset();
 }
 
 /// Like `parse`, but for a file of the source map: `file` is its number,
@@ -1841,16 +1842,16 @@ impl<'a> Parser<'a> {
         let toks = crate::lexer::lex_file(&source, self.file, self.dg);
         let expr = in_expr(&toks, self.dg, self.file, &self.modules, &mut self.next_id);
         match expr {
-            Some(e) => {
-                let cast = self.mk(
-                    sp,
-                    ExprKind::Cast(Box::new(e), TypeExpr::Named("i64".to_string(), sp)),
-                );
-                self.mk(
-                    sp,
-                    ExprKind::Call("io.fmt_number".to_string(), vec![chain, cast], sp),
-                )
-            }
+            // ROUND 70 — NO `as i64` any more. Which builder step is right
+            // depends on the TYPE of the expression, and only the type check
+            // knows that. `io.fmt_value` is the placeholder the type check
+            // and the lowering both resolve — out of the same material
+            // (`strtype`/`sema::call`/`lower::lower_call`), so that they
+            // cannot drift apart.
+            Some(e) => self.mk(
+                sp,
+                ExprKind::Call("io.fmt_value".to_string(), vec![chain, e], sp),
+            ),
             None => chain,
         }
     }
