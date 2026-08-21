@@ -209,12 +209,19 @@ struct ModuleList {
     off: Vec[u32],
     len: Vec[u32],
     alias: Vec[u32],
+    // ROUND 73: 1 = this file was reached through an `import std.<name>`.
+    // The kernel profile asks about it (`// HOOK profil` in the module
+    // loop of `main`), because only a `std` module has to declare
+    // `profile kernel` itself before a kernel may use it. `compiler/src/
+    // modules.rs` reads the same thing off the parsed import path.
+    from_std: Vec[u32],
 }
 
 fn ml_new() -> ModuleList {
     return ModuleList {
         text: rt.buf_new(),
         off: vec_new[u32](), len: vec_new[u32](), alias: vec_new[u32](),
+        from_std: vec_new[u32](),
     }
 }
 
@@ -223,6 +230,7 @@ fn ml_free(m: *mut ModuleList) {
     vec_free[u32](&(*m).off)
     vec_free[u32](&(*m).len)
     vec_free[u32](&(*m).alias)
+    vec_free[u32](&(*m).from_std)
 }
 
 fn ml_count(m: *mut ModuleList) -> usize { return vec_len[u32](&(*m).off) }
@@ -247,12 +255,71 @@ fn ml_knows(m: *mut ModuleList, p: u64, n: usize) -> bool {
     return false
 }
 
-fn ml_add(m: *mut ModuleList, p: u64, n: usize, alias: u32) {
+fn ml_add(m: *mut ModuleList, p: u64, n: usize, alias: u32, from_std: bool) {
     vec_push[u32](&(*m).off, rt.buf_len(&(*m).text) as u32)
     vec_push[u32](&(*m).len, n as u32)
     vec_push[u32](&(*m).alias, alias)
+    var f: u32 = 0
+    if from_std {
+        f = 1
+    }
+    vec_push[u32](&(*m).from_std, f)
     rt.buf_push_bytes(&(*m).text, p, n)
     rt.buf_push(&(*m).text, 0 as u8)
+}
+
+// ROUND 73: was this file reached through `import std.<name>`?
+fn ml_from_std(m: *mut ModuleList, i: usize) -> bool {
+    return vec_at[u32](&(*m).from_std, i) != 0
+}
+
+// ROUND 73 (`// HOOK profil`, twin of `compiler/src/prof.rs`).
+//
+// Does this token stream carry the declaration `profile kernel`? That is
+// the CLAIM by which a `std` module is admitted under the kernel profile.
+// It is read off the TOKENS and not off the text, because the word
+// `kernel` stands in many a comment -- the lexer has already thrown those
+// away.
+//
+// The claim is not believed: the module lands in the same compilation
+// unit as its importer, so `sema` walks its functions too and reports
+// every `syscall`, every `gc class` and every unmarked f64 in it at the
+// line where it stands.
+fn says_kernel(l: *mut lexer.Lexer) -> bool {
+    var s_kernel: [u8; 6] = "kernel"
+    var i: usize = 0
+    while i + 1 < lexer.lex_count(l) {
+        if lexer.lex_kind(l, i) == 13 {
+            if lexer.lex_kind(l, i + 1) == 1 {
+                let nr: u32 = lexer.lex_nr(l, i + 1)
+                if lexer.lex_name_length(l, nr) == 6 {
+                    if rt.mem_eq(lexer.lex_name_ptr(l, nr), (&s_kernel[0]) as u64, 6) {
+                        return true
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// The message of `compiler/src/prof.rs::hook_import`, word for word (the
+// position comes out of `firnc0`; `firnc1` has no source map for imports).
+fn complain_std_module(it: *mut intern.Interner, alias: u32) {
+    var a: [u8; 23] = "error: the module 'std."
+    var b: [u8; 75] = "' belongs to the standard library and is not available in profile 'kernel'\n"
+    var c: [u8; 125] = "note: SPEC 2: the kernel profile has no global allocator and no runtime; the standard library presupposes both (mmap, write)\n"
+    var out: rt.Buf = rt.buf_new()
+    rt.buf_push_bytes(&out, (&a[0]) as u64, 23)
+    if alias != 4294967295 {
+        rt.buf_push_bytes(&out, intern.intern_ptr(it, alias),
+            intern.intern_length(it, alias))
+    }
+    rt.buf_push_bytes(&out, (&b[0]) as u64, 75)
+    rt.buf_push_bytes(&out, (&c[0]) as u64, 125)
+    rt.write_everything(2, rt.buf_ptr(&out), rt.buf_len(&out))
+    rt.buf_free(&out)
 }
 
 // NAME CLASH (round 48): two DIFFERENT files with the same module name
@@ -357,6 +424,18 @@ fn imports_collect(l: *mut lexer.Lexer, s: *mut SearchSpace, w: *mut package.Wor
         if parts == 0 {
             i = j
             continue
+        }
+        // ROUND 73 (`// HOOK profil`): did this import say `std.<name>`?
+        // Only for those does the kernel profile ask for the declaration
+        // `profile kernel` in the module itself (`compiler/src/prof.rs`).
+        var s_std: [u8; 3] = "std"
+        var from_std: bool = false
+        if parts >= 2 {
+            let first: u32 = lexer.lex_nr(l, i + 1)
+            if lexer.lex_name_length(l, first) == 3 {
+                from_std = rt.mem_eq(lexer.lex_name_ptr(l, first),
+                    (&s_std[0]) as u64, 3)
+            }
         }
         var found: bool = false
         // (1) next to the importing file
@@ -476,7 +555,7 @@ fn imports_collect(l: *mut lexer.Lexer, s: *mut SearchSpace, w: *mut package.Wor
                     return 9
                 }
             }
-            ml_add(ml, rt.buf_ptr(&path), n, alias)
+            ml_add(ml, rt.buf_ptr(&path), n, alias, from_std)
         }
         i = j
     }
@@ -714,7 +793,7 @@ fn main(start: u64) -> i32 {
 
     var ml: ModuleList = ml_new()
     defer ml_free(&ml)
-    ml_add(&ml, name, name_n, 4294967295)
+    ml_add(&ml, name, name_n, 4294967295, false)
 
     var msource: rt.Buf = rt.buf_new()
     defer rt.buf_free(&msource)
@@ -763,6 +842,15 @@ fn main(start: u64) -> i32 {
     if wrc != 0 {
         return wrc
     }
+    // ROUND 73 (`// HOOK profil`, twin of `modules.rs::build_program`): the
+    // import rule of the kernel profile has to be settled HERE, before the
+    // modules are walked -- the type check runs much later. `--profile=`
+    // wins, otherwise the declaration in the root file decides.
+    var kernel_early: bool = kernel_flag
+    if !kernel_early {
+        kernel_early = says_kernel(&l)
+    }
+
     var mi: usize = 1
     while mi < ml_count(&ml) {
         rt.buf_clear(&mpath)
@@ -780,6 +868,19 @@ fn main(start: u64) -> i32 {
         if lexer.lex_error(&vl) > 0 {
             lexer.lex_free(&vl)
             return 1
+        }
+        // HOOK profil (prof.rs, round 52/73): under the kernel profile the
+        // standard library is barred -- unless the module declares
+        // `profile kernel` itself. Then it holds to the same rules, and
+        // because it lands in THIS compilation unit, `sema` proves it.
+        if kernel_early {
+            if ml_from_std(&ml, mi) {
+                if !says_kernel(&vl) {
+                    complain_std_module(it, ml_alias(&ml, mi))
+                    lexer.lex_free(&vl)
+                    return 1
+                }
+            }
         }
         mono.gen_upfront(&g, (&vl) as u64)
         // Round 47: bit 4 (a finalizer dispatcher of its own) counts ONLY
@@ -1011,16 +1112,17 @@ fn main(start: u64) -> i32 {
     // the declaration `profile kernel` in the root file. In the kernel
     // profile there is no `_start`, no `syscall`, no `gc class` and no
     // executable, but an ELF object instead.
-    var kernel: bool = kernel_flag
-    if !kernel {
-        let pn: u32 = ast.prof(tree)
-        if pn != ast.NOTHING {
-            var kw: [u8; 6] = "kernel"
-            if intern.intern_equal(it, pn, (&kw[0]) as u64, 6) {
-                kernel = true
-            }
-        }
-    }
+    //
+    // ROUND 73: the profile is read off the ROOT FILE, not off the merged
+    // tree. Since this round a MODULE may declare `profile kernel` too
+    // (that is the declaration by which `lib/std/core.fi` is admitted in a
+    // kernel), and `ast.profile_set` writes into the one shared tree --
+    // the module's declaration would otherwise overwrite the root's and
+    // turn every app program that imports `std.math` into an object file.
+    // `compiler/src/modules.rs` has always taken it from the root file
+    // (`merged.profile = progs.first()`); `kernel_early` is the same
+    // answer, read off the root token stream above.
+    let kernel: bool = kernel_early
     let object: bool = only_object || kernel
 
     var sm: sema.Sema = sema.sema_new(tree as u64, it as u64)
