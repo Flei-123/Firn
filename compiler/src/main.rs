@@ -21,6 +21,7 @@ mod dwarf;
 mod dwarf_info;
 mod lsp;
 mod errors;
+mod extfn;
 mod threading;
 mod fir;
 mod fnval;
