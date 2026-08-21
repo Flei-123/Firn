@@ -355,6 +355,43 @@ pub(crate) fn hook_type(p: &mut Parser, name: &str, sp: Span) -> Option<TypeExpr
     Some(TypeExpr::Named(format!("{}{}", TY_PREFIX, idx), span))
 }
 
+/// ROUND 76 — THE PAYLOAD TYPE HAS TO BE VISIBLE TO THE MODULE RESOLVER TOO.
+///
+/// `hook_type` above does not leave the success type of `E!T` standing in
+/// the syntax tree; it puts it aside into `pending` and leaves only the
+/// placeholder `__eu#<n>` behind. That is what makes the two-phase
+/// resolution work — but it also hides `T` from every pass that walks the
+/// tree. `modules.rs::Resolver::ty` is exactly such a pass: it qualifies
+/// every type name of a module with the module name, and it never saw the
+/// ones inside an error union.
+///
+/// The consequence, found in round 76 while `lib/std/net.fi` was written:
+/// a function of a MODULE could not return an error union over a struct of
+/// its own module — `fn listen_tcp(..) -> NetError!Listener` reported
+/// "unknown type 'Listener'", although the struct stood twenty lines above
+/// it. In the root module the very same code worked, which is why the gap
+/// survived seventy-five rounds: nothing outside a module had ever needed
+/// it. `firnc1` never had the bug, because it renames while parsing —
+/// there the payload is already qualified when it goes into `pending`.
+///
+/// These two functions hand the stored type expression out and take it
+/// back. Out and back rather than a `&mut` on purpose: the resolver calls
+/// itself while it works on the type, and a borrow held across that call
+/// would be a second `borrow_mut` on the same `RefCell`.
+pub(crate) fn pending_inner(name: &str) -> Option<(usize, TypeExpr)> {
+    let idx: usize = name.strip_prefix(TY_PREFIX)?.parse().ok()?;
+    let inner = REG.with(|r| r.borrow().pending.get(idx).map(|p| p.2.clone()))?;
+    Some((idx, inner))
+}
+
+pub(crate) fn set_pending_inner(idx: usize, inner: TypeExpr) {
+    REG.with(|r| {
+        if let Some(p) = r.borrow_mut().pending.get_mut(idx) {
+            p.2 = inner;
+        }
+    });
+}
+
 /// `// HOOK fehlerunionen` in `parser.rs::primary` — `try expression`.
 pub(crate) fn hook_primary(p: &mut Parser) -> Option<Expr> {
     if !matches!(p.kind(), TokKind::KwTry) {
