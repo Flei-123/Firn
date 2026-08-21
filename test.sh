@@ -64,6 +64,10 @@
 #      written by the compiler itself, `gdb` driven in batch mode over two
 #      translated Firn programs -- breakpoints, backtrace, `print` of
 #      variables, structs, pointers and arrays, with counter-checks.
+#  27. The features of round 66 (tools/js/round66.sh): generators,
+#      async/await with the job queue, the private class elements and the
+#      endurance run for the new objects -- per feature against test262,
+#      with the limits in tools/js/minquota_r66.txt.
 #  10. DOM soak run (tools/dom_soak/run.sh): the DOM prototype in Firn builds
 #      real cycles continuously (parent/child, listener, JS wrapper) and must
 #      not grow while doing so; the deliberately leaking counter-check with
@@ -561,6 +565,21 @@ if [ "$LSRC" -eq 0 ]; then
 else
     bad "tools/lsp/run.sh failed (see .test-work/lsp.log)"
     grep FAIL "$WORK/lsp.log" | head -10 | sed 's/^/   /'
+fi
+
+echo "== 27. the features of round 66: generators, async, classes (tools/js/round66.sh) =="
+# Section 9d measures the JavaScript path as a whole; this one measures the
+# four groups of round 66 SEPARATELY, so that a regression in one of them
+# cannot hide behind the total -- plus the endurance run that shows that a
+# generator abandoned in the middle of its body, a promise and a BigInt are
+# ordinary objects of the collector. Nothing is filtered.
+bash tools/js/round66.sh --fast > "$WORK/round66.log" 2>&1 && R66RC=0 || R66RC=$?
+if [ "$R66RC" -eq 0 ]; then
+    ok
+    grep -E '^   (generators|async|classes|gen |genleak|jobs )' "$WORK/round66.log" | sed 's/^/   /'
+else
+    bad "tools/js/round66.sh failed (see .test-work/round66.log)"
+    grep -E 'FAILED|BELOW' "$WORK/round66.log" | head -10 | sed 's/^/   /'
 fi
 
 TOTAL=$((PASS + FAIL))
