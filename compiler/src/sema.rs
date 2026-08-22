@@ -2291,6 +2291,19 @@ impl<'a> Checker<'a> {
                     self.dg.error(*span, "array length must be greater than zero");
                     return Type::Error;
                 }
+                // ROUND 79: `_` as the length only works where there is an
+                // initializer to take it from -- in a `let`/`var`, where the
+                // parser has already filled it in. Anywhere else (a
+                // parameter, a field, a `const`) it has to be caught, or a
+                // type of 2^64 elements would go into the layout.
+                if *len == crate::ast::LEN_INFER {
+                    self.dg.error_note(
+                        *span,
+                        "the length '_' needs an initializer to be taken from",
+                        "it works in a 'let'/'var' with a literal; a parameter, a field and a 'const' have to write the number out",
+                    );
+                    return Type::Error;
+                }
                 Type::Array(Box::new(t), *len)
             }
             // Round 58: `fn(T1, T2) -> R` — a function as a value.
