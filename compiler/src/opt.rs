@@ -362,6 +362,7 @@ fn tyk(t: FTy) -> u8 {
         FTy::Bool => 9,
         FTy::Ptr => 10,
         FTy::Void => 11,
+        FTy::V128 => 14,
     }
 }
 

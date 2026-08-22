@@ -147,6 +147,11 @@ pub(crate) fn replace_uses(f: &mut Func, map: &HashMap<Val, Val>) -> usize {
                     rep(base, &mut n);
                     rep(off, &mut n);
                 }
+                Op::Simd { args, .. } => {
+                    for a in args.iter_mut() {
+                        rep(a, &mut n);
+                    }
+                }
                 Op::Call { args, .. } | Op::Syscall { args } => {
                     for a in args.iter_mut() {
                         rep(a, &mut n);
