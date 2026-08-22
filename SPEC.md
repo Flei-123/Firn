@@ -1104,19 +1104,13 @@ brackets a line break has never ended anything and still does not. Proof:
   parsing have edge cases that the specification prescribes exactly; you
   need both of them without a detour for that.
 
-  **Known gap, round 72:** `firnc1` (`lib/firnc1/*.fi`, the compiler
-  written in Firn itself, `L1`/section 11) does not implement any of this
-  table yet -- it wraps unconditionally, in every build level, the same
-  way `firnc0` itself did before this round. The self-hosting fixpoint
-  (`firnc0`/`firnc1` bit-identical output, section 11) therefore cannot
-  hold for any program whose checked and wrapped paths would disagree
-  (which is every program with `+ - *` in it, checked at one end and
-  silently wrapped at the other). Porting this round's rules into
-  `lib/firnc1/lower.fi`/`codegen.fi` is real work of its own -- lexer,
-  parser, sema and lower all need the same `+% +|` tokens and the same
-  checked-vs-wrapped decision `firnc0` makes -- and is left to a round
-  that can give it its own full attention rather than being folded into
-  this one as an afterthought.
+  **Both compilers do this**, and that is not decoration: `firnc1`
+  (`lib/firnc1/*.fi`, the compiler written in Firn itself, `L1`/section 11)
+  reads the same six operators, makes the same checked-versus-wrapped
+  decision and prints the same message, down to the file, the line and the
+  column. It has to -- `tools/fir_compare.sh` compares the two intermediate
+  representations as TEXT, and the message is part of it. `docs/ROUND72.md`
+  has the numbers.
 * **Floating point (`L10`):** `f32`/`f64` following IEEE 754 with exact
   semantics, including the treatment of NaN. JS numbers *are* doubles, `calc()`
   computes in doubles; deviations show up as a wrong layout. No "fast maths", no
