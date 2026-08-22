@@ -74,3 +74,36 @@ an Fmt chain at compile time (no varargs), 790/791 core tests, 3 negative tests.
 TOOLING FIX (the same trap again): lex/parser/types/fir/sema_comparison built their dump binaries only
 "if missing" -- stale dumps after R39 made the comparisons fail. They are now rebuilt when the sources
 are newer (like fixpunkt.sh since R35). fixpunkt.sh exports FIRNLIB now as well.
+
+## Round 79 (2026-08-22, branch r79-life) -- a raw pointer into a local can no longer leave its frame
+Gap 9 of docs/ROUND66.md, found by round 66 while writing a JavaScript engine: `return &x` on a local
+compiled and dangled, and the compiler said nothing. Now an error at COMPILE TIME in BOTH compilers,
+with three places in the message (where the address is taken, where the local dies, where the pointer
+gets out). New: compiler/src/escape.rs (1195 lines), lib/firnc1/escape.fi (1723), tools/escape/ (36
+cases), section 40 of test.sh.
+THE MODEL: sources and sinks over the syntax tree. `&local` carries the frame it points into; casts,
+pointer arithmetic, aggregate literals and assignments to locals carry it on, a LOAD out of memory does
+NOT (that one line is what keeps `(*v).ptr` quiet and `vec_push` honest). What a PARAMETER does lands
+in a SUMMARY of the function, driven to a fixed point over the whole program and used at every call
+site -- so the check crosses function boundaries WITHOUT a single annotation. Return-through and
+keeping are told apart; without that distinction every `fn f(s: *mut S) -> *mut T { return &(*s).x }`
+in this tree would have blamed its callers.
+NO LIFETIME SYSTEM. Where it cannot decide, it allows; nine gaps named in docs/ROUND79.md 4.
+`#[allow_escape]` is the way out, stays visible in the source and empties the summary too.
+FOUND IN A GREEN TREE: lib/std/nbt.fi::nbt_type_name handed out the address of a `var` array of its own
+frame FOURTEEN times, under a comment claiming the names lay "in read only data" -- a real dangling
+pointer in a shipped library, fixed by a signature change (tests/1610). And Parser::join dropped the
+file number of every joined span, so a statement of a MODULE pointed into the root file; unnoticed for
+79 rounds because no message used those spans.
+GAP 10 CLOSED: `var m: [u8; _] = "hello"` -- the parser fills the length in from the literal, in both
+compilers, so nothing downstream ever sees a `_`. Gap 12 turned out to be closed already by round 68
+(tests/1613 measures it). Gap 11 (dispatch over a number) is a code generator feature, named and open.
+MEASUREMENTS: tools/escape/run.sh 36/36, messages identical 22/22 (whole block via cmp). test.sh
+1183/1184. fixpoint stage2 == stage3 character-identical, 648723 lines. self_compare 318 same / 0
+differing / 0 faulty. types_compare 336 / 0. english 0 0 0 0 0. firnfmt -c clean.
+THE ONE FAILURE IS INHERITED: section 23 (layout) 1082/1087 against a LIVE Chromium -- round 78 froze
+the reference and took the browser out of the acceptance, and this branch starts before round 78. Main
+with the frozen reference: 1087/1087. Round 79 touches nothing in lib/layout.
+SIDE FINDING, worth knowing: section 34 (the JS promise soak of round 66) is NOT deterministic --
+`jobs rc=-11` in 2 of 4 runs on main and 2 of 3 here, same binary. A real bug in lib/js/gen.fi waiting
+for a round of its own.
