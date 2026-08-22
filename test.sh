@@ -841,6 +841,37 @@ else
     grep -E 'FAIL' "$WORK/extfn.log" | head -10 | sed 's/^/   /'
 fi
 
+echo "== 40. the standard library of round 81 (tools/stdlib81/run.sh) =="
+# FOUR AREAS, none of them judged by this repository:
+#   * HASH AND MAP: xxHash64 against the author's own implementation
+#     (python-xxhash) and FNV-1a against its published vectors; then a
+#     MILLION entries with string keys -- time, memory and the LONGEST
+#     PROBE CHAIN, because open addressing degenerates silently. Plus an
+#     endurance run (1.2 M insert+delete, RSS flat) WITH the counter-check
+#     that leaves the deletions out and MUST grow.
+#   * DEFLATE: everything Firn packs is unpacked by python3 zlib, by gzip
+#     and by the gunzip binary, everything they pack is unpacked by Firn,
+#     over empty input, one octet, incompressible data, one repeated octet
+#     and real files -- plus four broken streams that have to be REFUSED.
+#   * JSON: JSONTestSuite (testdata/json/) -- every y_ accepted, every n_
+#     refused -- and the output against python3 -m json.tool.
+#   * CRYPTO: 1,919 NIST CAVP vectors (testdata/crypto/), the FIPS 197
+#     known answer test, multi block CBC/CFB8 against openssl (the KAT
+#     files are single block and do not test chaining at all) and python3
+#     hashlib/hmac over random data.
+# All of it in THREE build stages. STDLIB81_FAST=1 runs the optimised one.
+bash tools/stdlib81/run.sh > "$WORK/stdlib81.log" 2>&1 && STDRC=0 || STDRC=$?
+if [ "$STDRC" -eq 0 ]; then
+    ok
+    grep -E '^  (FNV-1a|hash vectors|release-fast [0-9]|probe chain|soak |counter-check |level [0-9]|y_ |n_ |i_ |json.tool|json.load|error position|python/openssl|getrandom|testdata/|sha1 |sha256 |aes |cfb8 )' \
+        "$WORK/stdlib81.log" | sed 's/^/ /'
+    grep -E '^NIST TOTAL' "$WORK/stdlib81.log" | head -1 | sed 's/^/   /'
+    grep -E '^  RESULT ok \(' "$WORK/stdlib81.log" | head -1 | sed 's/^/   deflate /'
+else
+    bad "tools/stdlib81/run.sh failed (see .test-work/stdlib81.log)"
+    grep -E 'FAIL|RESULT' "$WORK/stdlib81.log" | head -12 | sed 's/^/   /'
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then
