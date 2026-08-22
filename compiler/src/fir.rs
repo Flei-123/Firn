@@ -127,6 +127,28 @@ impl BinOp {
     }
 }
 
+/// **ROUND 72** — the explicit wrap/saturate forms (SPEC §13, `L9`). They
+/// exist next to `BinOp` rather than inside it: `BinOp::Add` computes,
+/// `WrapOp`/`SatOp` say WHICH DEFINED BEHAVIOUR is wanted when the
+/// mathematical result does not fit — a question `BinOp` never had to
+/// answer before checked arithmetic made overflow an error in most places.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WrapSatKind {
+    /// `+% -% *%` — silently keep the low order bits (two's complement).
+    Wrap,
+    /// `+| -| *|` — clamp to the type's own MIN/MAX.
+    Sat,
+}
+
+impl WrapSatKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            WrapSatKind::Wrap => "wrap",
+            WrapSatKind::Sat => "sat",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CmpOp {
     Eq,
@@ -148,6 +170,19 @@ impl CmpOp {
             CmpOp::Ge => "ge",
         }
     }
+    /// The reversed comparison — the whole point of the round 72 branch
+    /// lowering (`threading.rs`): a jump can test `!(a < b)` by testing
+    /// `a >= b` directly, without ever materializing the negation.
+    pub fn negate(self) -> CmpOp {
+        match self {
+            CmpOp::Eq => CmpOp::Ne,
+            CmpOp::Ne => CmpOp::Eq,
+            CmpOp::Lt => CmpOp::Ge,
+            CmpOp::Le => CmpOp::Gt,
+            CmpOp::Gt => CmpOp::Le,
+            CmpOp::Ge => CmpOp::Lt,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -163,10 +198,36 @@ pub enum Op {
     /// constant of the instruction type
     Const(i128),
     Bin(BinOp, Val, Val),
+    /// **ROUND 72** — `+% -% *%` / `+| -| *|` (SPEC §13, `L9`). `kind` says
+    /// whether the defined behaviour on overflow is wrapping or saturating;
+    /// `op` is restricted to `Add`/`Sub`/`Mul` by construction (`lower.rs`).
+    /// Never checked, never panics — that is the whole point of writing it
+    /// out explicitly instead of relying on the build level.
+    BinWrapSat { kind: WrapSatKind, op: BinOp, a: Val, b: Val },
     Cmp { op: CmpOp, ty: FTy, a: Val, b: Val },
     Un(UnOp, Val),
     /// conversion; the target type is the instruction type
     Cast { src: Val, from: FTy },
+    /// **ROUND 72** — checked `+ - *` (SPEC §13, `L9`). `op` is restricted to
+    /// `Add`/`Sub`/`Mul`. On overflow the program aborts through the panic
+    /// path described at `msg`: text ready to print (file, line, operator),
+    /// the two operand VALUES are appended by the backend at the point where
+    /// it already holds them in registers — FIR carries no source positions
+    /// (`dwarf.rs`), so the position is baked into `msg` at lowering time,
+    /// once, as plain text.
+    CheckedBin { op: BinOp, a: Val, b: Val, msg: String },
+    /// **ROUND 72** — checked `/` and `%`. Panics on division by zero and,
+    /// for signed types, on the `MIN / -1` (`MIN % -1`) special case that
+    /// would otherwise raise `SIGFPE` with no message at all. `op` is
+    /// restricted to `Div`/`Rem`. Two separate messages because the two
+    /// failures are unrelated questions (`b == 0` vs. `a == MIN && b == -1`)
+    /// and a reader should not have to guess which one fired from a single
+    /// merged sentence.
+    CheckedDiv { op: BinOp, a: Val, b: Val, msg_zero: String, msg_range: String },
+    /// **ROUND 72** — checked `as` (narrowing only; `lower.rs` never emits
+    /// this for a conversion that cannot lose a value). Panics when `src`,
+    /// read back after the conversion, would not equal the original value.
+    CheckedCast { src: Val, from: FTy, msg: String },
     /// stack storage of the function (allowed in the entry block only)
     Alloca { size: u64, align: u64 },
     Load { addr: Val },
@@ -267,6 +328,7 @@ impl Op {
         match self {
             Op::Const(_)
             | Op::Bin(..)
+            | Op::BinWrapSat { .. }
             | Op::Cmp { .. }
             | Op::Un(..)
             | Op::Cast { .. }
@@ -279,6 +341,11 @@ impl Op {
             // The state block is always there; rescuing the registers
             // writes memory, though, and must not fall away.
             Op::GcAddr { regs } => !*regs,
+            // ROUND 72: a checked operation may ABORT THE PROGRAM. That is
+            // an observable effect (SPEC §13, `L9`) — dead code elimination
+            // must not remove it even when the result is unused, exactly as
+            // `Syscall`/`Call` are never pure.
+            Op::CheckedBin { .. } | Op::CheckedDiv { .. } | Op::CheckedCast { .. } => false,
             Op::Store { .. }
             | Op::Call { .. }
             | Op::CallIndirect { .. }
@@ -320,6 +387,15 @@ impl Op {
                 out.push(*a);
                 out.push(*b);
             }
+            Op::BinWrapSat { a, b, .. } => {
+                out.push(*a);
+                out.push(*b);
+            }
+            Op::CheckedBin { a, b, .. } | Op::CheckedDiv { a, b, .. } => {
+                out.push(*a);
+                out.push(*b);
+            }
+            Op::CheckedCast { src, .. } => out.push(*src),
             Op::Cmp { a, b, .. } => {
                 out.push(*a);
                 out.push(*b);
@@ -613,6 +689,21 @@ fn fmt_inst(i: &Inst) -> String {
     let body = match &i.op {
         Op::Const(c) => format!("const.{} {}", t, c),
         Op::Bin(op, a, b) => format!("{}.{} %{}, %{}", op.name(), t, a, b),
+        Op::BinWrapSat { kind, op, a, b } => {
+            format!("{}_{}.{} %{}, %{}", op.name(), kind.name(), t, a, b)
+        }
+        Op::CheckedBin { op, a, b, msg } => {
+            format!("checked_{}.{} %{}, %{} \"{}\"", op.name(), t, a, b, asm_escape(msg))
+        }
+        Op::CheckedDiv { op, a, b, msg_zero, msg_range } => {
+            format!(
+                "checked_{}.{} %{}, %{} \"{}\" \"{}\"",
+                op.name(), t, a, b, asm_escape(msg_zero), asm_escape(msg_range)
+            )
+        }
+        Op::CheckedCast { src, from, msg } => {
+            format!("checked_cast.{}.{} %{} \"{}\"", from.name(), t, src, asm_escape(msg))
+        }
         Op::Cmp { op, ty, a, b } => format!("cmp.{}.{} %{}, %{}", op.name(), ty.name(), a, b),
         Op::Un(op, a) => match op {
             UnOp::Neg => format!("neg.{} %{}", t, a),
