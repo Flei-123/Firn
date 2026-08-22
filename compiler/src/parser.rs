@@ -51,6 +51,11 @@ pub(crate) struct Parser<'a> {
     pub(crate) hoist: Vec<Stmt>,
     /// > 0: an interpolation is already running — nesting does not exist yet.
     pub(crate) interp_depth: u32,
+    /// **ROUND 79** — `[T; _]` is only allowed where an initializer follows
+    /// that the length can be taken from: the type of a `let`/`var`.
+    /// `let_stmt` switches it on around exactly that call; everywhere else a
+    /// `_` is refused in the parser, so `ast::LEN_INFER` never leaves it.
+    pub(crate) infer_len_ok: bool,
 }
 
 fn starts_stmt(k: &TokKind) -> bool {
@@ -274,9 +279,16 @@ impl<'a> Parser<'a> {
         self.mk(span, ExprKind::Int(0))
     }
 
+    /// One span over both. **ROUND 79** — `Span::in_file` and no longer
+    /// `Span::new`: the latter sets the file number to 0, so every joined
+    /// span of a MODULE pointed into the root file. Nothing noticed for a
+    /// long time because the joined spans (statements, blocks) were used by
+    /// no message that a module can produce; the escape analysis of this
+    /// round is the first one, and it showed a `return` of `lib/gc/gc.fi`
+    /// under a line number of the test file.
     pub(crate) fn join(a: Span, b: Span) -> Span {
         if a.line == b.line && b.col + b.len > a.col {
-            Span::new(a.line, a.col, b.col + b.len - a.col)
+            Span::in_file(a.file, a.line, a.col, b.col + b.len - a.col)
         } else {
             a
         }
@@ -390,6 +402,27 @@ impl<'a> Parser<'a> {
                     TokKind::Int(v) if v >= 0 => {
                         self.bump();
                         v as u64
+                    }
+                    // ROUND 79 (gap 10 of docs/ROUND66.md): `[u8; _]` — the
+                    // length comes out of the initializer. `let_stmt` fills
+                    // it in as soon as it has read the initializer, so
+                    // `LEN_INFER` never reaches the type checker.
+                    TokKind::Ident(n) if n == "_" => {
+                        let sp = self.span();
+                        self.bump();
+                        if !self.infer_len_ok {
+                            self.dg.error_note(
+                                sp,
+                                "the length '_' needs an initializer to be taken from",
+                                "it works in a 'let'/'var' with a literal; a parameter, a field and a 'const' have to write the number out",
+                            );
+                            // No follow-up message for the same construct:
+                            // `expected ')' after the parameter list` would
+                            // say nothing the line above does not.
+                            self.recovering = true;
+                            return None;
+                        }
+                        crate::ast::LEN_INFER
                     }
                     _ => {
                         self.error_here(format!(
@@ -943,11 +976,11 @@ impl<'a> Parser<'a> {
     pub(crate) fn block(&mut self, ctx: &str) -> Block {
         let start = self.span();
         if self.too_deep() {
-            return Block { stmts: Vec::new(), span: start };
+            return Block { stmts: Vec::new(), span: start, end: start };
         }
         if !self.expect(TokKind::LBrace, ctx) {
             self.recovering = false;
-            return Block { stmts: Vec::new(), span: start };
+            return Block { stmts: Vec::new(), span: start, end: start };
         }
         self.depth += 1;
         let mut stmts = Vec::new();
@@ -986,7 +1019,7 @@ impl<'a> Parser<'a> {
         let end = self.span();
         self.eat(&TokKind::RBrace);
         self.depth -= 1;
-        Block { stmts, span: Parser::join(start, end) }
+        Block { stmts, span: Parser::join(start, end), end }
     }
 
     /// End of a statement: ';' or line break or '}'.
@@ -1135,7 +1168,12 @@ impl<'a> Parser<'a> {
             }
         };
         let ty = if self.eat(&TokKind::Colon) {
-            match self.parse_type() {
+            // ROUND 79: `[T; _]` is allowed HERE and only here -- an
+            // initializer is coming to take the length from.
+            self.infer_len_ok = true;
+            let parsed = self.parse_type();
+            self.infer_len_ok = false;
+            match parsed {
                 Some(t) => Some(t),
                 None => {
                     self.recovering = false;
@@ -1155,10 +1193,64 @@ impl<'a> Parser<'a> {
         let broken = self.recovering;
         let sp = Parser::join(start, init.span);
         self.end_stmt();
+        // ROUND 79: `[T; _]` — now that the initializer has been read, the
+        // length is known.
+        let ty = match ty {
+            Some(t) => match self.fill_in_length(t, &init) {
+                Some(t) => Some(t),
+                None => return Stmt::Error(start),
+            },
+            None => None,
+        };
         if broken {
             Stmt::Error(start)
         } else {
             Stmt::Let { name, mutable, ty, init, span: sp }
+        }
+    }
+
+    /// **ROUND 79** — replaces the `_` of an array length with the number of
+    /// elements of the initializer (gap 10 of `docs/ROUND66.md`).
+    ///
+    /// Only the OUTERMOST length: `[[u8; _]; 3]` stays an error, because the
+    /// inner one would have to come out of the elements of the elements and
+    /// nothing in this language writes that down today.
+    fn fill_in_length(&mut self, t: TypeExpr, init: &Expr) -> Option<TypeExpr> {
+        let (elem, len, span) = match t {
+            TypeExpr::Array { elem, len, span } => (elem, len, span),
+            other => return Some(other),
+        };
+        if len != crate::ast::LEN_INFER {
+            return Some(TypeExpr::Array { elem, len, span });
+        }
+        match Parser::literal_length(init) {
+            Some(n) => Some(TypeExpr::Array { elem, len: n, span }),
+            None => {
+                self.dg.error_note(
+                    span,
+                    "the length '_' can only be taken from a literal",
+                    "write the number out, or initialise with a text literal, an array literal or '[v; n]'",
+                );
+                self.recovering = false;
+                self.sync_stmt();
+                None
+            }
+        }
+    }
+
+    /// How many elements does this initializer have? `None` = not a literal.
+    fn literal_length(e: &Expr) -> Option<u64> {
+        match &e.kind {
+            // A text literal carries its array literal of octets inside
+            // (round 70); its length is the one that counts, including a
+            // written `\0`.
+            ExprKind::Text(_, inner) => Parser::literal_length(inner),
+            ExprKind::ArrayLit(v) => Some(v.len() as u64),
+            ExprKind::ArrayRepeat(_, n) => match &n.kind {
+                ExprKind::Int(v) if *v >= 0 => Some(*v as u64),
+                _ => None,
+            },
+            _ => None,
         }
     }
 
@@ -1374,7 +1466,7 @@ impl<'a> Parser<'a> {
             self.recovering = false;
             let link_name = attrs.iter().find(|a| a.name == "link_name")
                 .and_then(|a| a.args.first().cloned());
-            let body = Block { stmts: Vec::new(), span: start };
+            let body = Block { stmts: Vec::new(), span: start, end: start };
             prog.funcs.push(FnDecl {
                 name,
                 params,
@@ -1972,6 +2064,7 @@ fn in_expr(
         pending_attrs: Vec::new(),
         hoist: Vec::new(),
         interp_depth: 1,
+        infer_len_ok: false,
     };
     let e = p.nested_expr();
     *next_id = p.next_id;
@@ -2025,6 +2118,7 @@ pub fn parse_module(toks: &[Token], dg: &mut Diags, file: u32, base_id: u32) -> 
         pending_attrs: Vec::new(),
         hoist: Vec::new(),
         interp_depth: 0,
+        infer_len_ok: false,
     };
     let prog = p.program();
     if !p.hoist.is_empty() {

@@ -164,6 +164,11 @@ impl<'a> Checker<'a> {
         // Runs AFTER the type check, because rule 3 (writing into a
         // Gc[T] field) needs the type table.
         crate::nogc::hook_check(self, prog);
+        // HOOK escape: a raw pointer into a local must not outlive its frame
+        // (escape.rs, round 79, gap 9 of docs/ROUND66.md). Runs AFTER the
+        // type check as well: it has to tell `a[i]` on an ARRAY from `p[i]`
+        // on a pointer, and only the type table knows which is which.
+        crate::escape::hook_check(self, prog);
         // HOOK kern: `#[interrupt]` — check the form and forbid calls
         // (core.rs, round 52).
         crate::core::check_interrupts(self, prog);
@@ -2286,6 +2291,19 @@ impl<'a> Checker<'a> {
                     self.dg.error(*span, "array length must be greater than zero");
                     return Type::Error;
                 }
+                // ROUND 79: `_` as the length only works where there is an
+                // initializer to take it from -- in a `let`/`var`, where the
+                // parser has already filled it in. Anywhere else (a
+                // parameter, a field, a `const`) it has to be caught, or a
+                // type of 2^64 elements would go into the layout.
+                if *len == crate::ast::LEN_INFER {
+                    self.dg.error_note(
+                        *span,
+                        "the length '_' needs an initializer to be taken from",
+                        "it works in a 'let'/'var' with a literal; a parameter, a field and a 'const' have to write the number out",
+                    );
+                    return Type::Error;
+                }
                 Type::Array(Box::new(t), *len)
             }
             // Round 58: `fn(T1, T2) -> R` — a function as a value.
@@ -2884,7 +2902,7 @@ mod tests {
     }
 
     fn blk(stmts: Vec<Stmt>) -> Block {
-        Block { stmts, span: sp() }
+        Block { stmts, span: sp(), end: sp() }
     }
 
     /// main function with the given body and `return <ret>`.
