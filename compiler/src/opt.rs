@@ -566,6 +566,42 @@ fn fold_constants(f: &mut Func, st: &mut OptStats) -> bool {
                     (Some(&x), Some(&y)) => Some(fold_cmp(oty, op, x, y)),
                     _ => None,
                 },
+                // ROUND 72, second pass -- the checked and the explicitly
+                // unchecked forms fold too. Without this, `release-safe`
+                // ran every pass and folded NOTHING: the folder matched
+                // `Op::Bin` and the very arithmetic it was there for had
+                // become `Op::CheckedBin` one round earlier
+                // (`tests/opt/fold_arith.fi` measured it: folded at
+                // `release-fast`, not folded at `release-safe`).
+                //
+                // A checked operation folds ONLY when the result really
+                // fits. One that does not is left standing, because it is
+                // supposed to abort at run time -- replacing it with a
+                // constant would delete a panic the program promised.
+                Op::CheckedBin { op: bop, a, b, .. } => {
+                    match (consts.get(&a), consts.get(&b)) {
+                        (Some(&x), Some(&y)) => fold_checked_bin(ty, bop, x, y),
+                        _ => None,
+                    }
+                }
+                // `fold_bin` already refuses `b == 0` and `MIN / -1`, which
+                // are exactly the two cases this operation exists to catch.
+                Op::CheckedDiv { op: bop, a, b, .. } => {
+                    match (consts.get(&a), consts.get(&b)) {
+                        (Some(&x), Some(&y)) => fold_bin(ty, bop, x, y),
+                        _ => None,
+                    }
+                }
+                Op::CheckedCast { src, from, .. } => match consts.get(&src) {
+                    Some(&x) => fold_checked_cast(ty, from, x),
+                    None => None,
+                },
+                Op::BinWrapSat { kind, op: bop, a, b } => {
+                    match (consts.get(&a), consts.get(&b)) {
+                        (Some(&x), Some(&y)) => fold_wrap_sat(ty, kind, bop, x, y),
+                        _ => None,
+                    }
+                }
                 Op::Un(uop, a) => consts.get(&a).map(|&x| fold_un(ty, uop, x)),
                 Op::Cast { src, from } => match consts.get(&src) {
                     Some(&x) => fold_cast(ty, from, x),
@@ -628,6 +664,86 @@ fn fold_bin(ty: FTy, op: BinOp, a: i128, b: i128) -> Option<i128> {
         }
     };
     Some(ty.truncate(r))
+}
+
+/// **ROUND 72** - the range of `ty` as `(MIN, MAX)` in `i128`, which holds
+/// every one of them exactly, `u64::MAX` included.
+fn ty_range(ty: FTy) -> (i128, i128) {
+    let bits = ty.bits();
+    if ty.signed() {
+        (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
+    } else {
+        (0, (1i128 << bits) - 1)
+    }
+}
+
+/// **ROUND 72** - a CHECKED `+ - *` of two constants. `None` means "leave
+/// the instruction where it is": either the operator is not one of the
+/// three, or the result does not fit and the program is supposed to abort.
+fn fold_checked_bin(ty: FTy, op: BinOp, a: i128, b: i128) -> Option<i128> {
+    if ty == FTy::Void || ty.bits() == 0 || ty.is_float() {
+        return None;
+    }
+    let a = ty.truncate(a);
+    let b = ty.truncate(b);
+    // `i128` holds every product of two 64 bit values, so the arithmetic
+    // here is the MATHEMATICAL one and the range test below is the real
+    // question, not an approximation of it.
+    let r = match op {
+        BinOp::Add => a + b,
+        BinOp::Sub => a - b,
+        BinOp::Mul => a * b,
+        _ => return None,
+    };
+    let (lo, hi) = ty_range(ty);
+    if r < lo || r > hi {
+        return None;
+    }
+    Some(r)
+}
+
+/// **ROUND 72** - a CHECKED narrowing `as` of a constant. Folds only when
+/// the value survives the conversion; otherwise the check has to run.
+fn fold_checked_cast(to: FTy, from: FTy, a: i128) -> Option<i128> {
+    if to.is_float() || from.is_float() || to == FTy::Void || from == FTy::Void {
+        return None;
+    }
+    let v = from.truncate(a);
+    let (lo, hi) = ty_range(to);
+    if v < lo || v > hi {
+        return None;
+    }
+    Some(v)
+}
+
+/// **ROUND 72** - `+% -% *%` and `+| -| *|` of two constants. Neither can
+/// fail, so both always fold: wrapping keeps the low order bits, saturating
+/// clamps to the type's own MIN/MAX.
+fn fold_wrap_sat(
+    ty: FTy,
+    kind: crate::fir::WrapSatKind,
+    op: BinOp,
+    a: i128,
+    b: i128,
+) -> Option<i128> {
+    if ty == FTy::Void || ty.bits() == 0 || ty.is_float() {
+        return None;
+    }
+    let a = ty.truncate(a);
+    let b = ty.truncate(b);
+    let r = match op {
+        BinOp::Add => a + b,
+        BinOp::Sub => a - b,
+        BinOp::Mul => a * b,
+        _ => return None,
+    };
+    match kind {
+        crate::fir::WrapSatKind::Wrap => Some(ty.truncate(r)),
+        crate::fir::WrapSatKind::Sat => {
+            let (lo, hi) = ty_range(ty);
+            Some(r.clamp(lo, hi))
+        }
+    }
 }
 
 fn fold_cmp(ty: FTy, op: CmpOp, a: i128, b: i128) -> i128 {
