@@ -506,9 +506,10 @@ impl Func {
         v
     }
 
-    /// New value without an instruction — only for module tests, which build
-    /// a body by hand (`licm.rs`, `regalloc.rs`).
-    #[cfg(test)]
+    /// New value without an instruction. The module tests build a body by
+    /// hand with it (`licm.rs`, `regalloc.rs`), and since ROUND 82
+    /// `strength.rs` uses it to insert the shift amount of a division that
+    /// has become a shift.
     pub fn new_val_pub(&mut self, ty: FTy) -> Val {
         self.new_val(ty)
     }
