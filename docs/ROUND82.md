@@ -53,14 +53,14 @@ Measured with `tools/bench82/run.sh`, best of five, buffers of 8 MiB
 
 | workload | before this round | after | OpenSSL / gzip | behind by |
 |---|---|---|---|---|
-| **SHA-256** | 26.5 MiB/s | **833.2 MiB/s** | 1365.9 MiB/s | **1.64x** |
-| **AES-128-CBC encrypt** | 7.2 MiB/s | **538.1 MiB/s** | 1009.8 MiB/s | **1.88x** |
-| **AES-128-CBC decrypt** | 4.6 MiB/s | **604.5 MiB/s** | 1009.8 MiB/s | **1.67x** |
-| **AES-128-CFB8** | 0.5 MiB/s | **23.4 MiB/s** | 36.1 MiB/s | **1.54x** |
-| DEFLATE level 6 | 11.0 MiB/s | 11.0 MiB/s | `gzip -6` 20.1 MiB/s | **1.83x** |
+| **SHA-256** | 27.6 MiB/s | **968.3 MiB/s** | 1372.6 MiB/s | **1.42x** |
+| **AES-128-CBC encrypt** | 7.4 MiB/s | **582.0 MiB/s** | 1056.4 MiB/s | **1.82x** |
+| **AES-128-CBC decrypt** | 4.7 MiB/s | **691.8 MiB/s** | 1056.4 MiB/s | **1.53x** |
+| **AES-128-CFB8** | 0.5 MiB/s | **26.9 MiB/s** | 37.1 MiB/s | **1.38x** |
+| DEFLATE level 6 | — | 11.2 MiB/s | `gzip -6` 21.0 MiB/s | **1.88x** |
 
-The gain over the scalar path is **31.4x** for SHA-256, **74.7x** for AES-CBC
-encryption, **131.4x** for AES-CBC decryption and **46.8x** for CFB8. (Those
+The gain over the scalar path is **35.1x** for SHA-256, **78.6x** for AES-CBC
+encryption, **147.2x** for AES-CBC decryption and **53.8x** for CFB8. (Those
 are the ratios of one and the same run of `tools/bench82/run.sh`; the scalar
 figures there are measured over smaller buffers, which is why they differ a
 little from the isolated measurements quoted elsewhere in this file. Every
@@ -70,8 +70,8 @@ The round asked for "factor 2 instead of 60 resp. 190". **All four are at
 1.4 to 1.8.** The target is met, and CFB8 — the one at 3000x — is now the
 closest of the four.
 
-**Why the "before" figures differ from the round's table** (26.5 against 22.6,
-7.2 against 5.50, 0.5 against 0.34): those are the SAME implementations,
+**Why the "before" figures differ from the round's table** (27.6 against 22.6,
+7.4 against 5.50, 0.5 against 0.34): those are the SAME implementations,
 measured with a different harness. `tools/stdlib81/run.sh` measures 8 MiB in
 one call and includes the key schedule; `tools/bench82/run.sh` takes the best
 of five and starts the clock after the schedule is built. The difference is
@@ -93,7 +93,7 @@ and correctly.
 Two roads were open. The round said "decide and write down why". Both halves
 were taken, deliberately:
 
-**`v128` as a value type** (SPEC §8.7, `compiler/src/types.rs`,
+**`v128` as a value type** (SPEC §8.6, `compiler/src/types.rs`,
 `compiler/src/fir.rs`). Sixteen octets, sixteen byte aligned, at home in an
 `xmm` register. Without it every instruction would have to take and give its
 operands through memory, and the compiler could never keep an intermediate in
@@ -296,9 +296,9 @@ exactly as written.
 
 | | Firn | `gzip -6` | behind by |
 |---|---|---|---|
-| DEFLATE level 6 | **11.0 MiB/s** | 20.1 MiB/s | **1.83x** |
-| inflate | 20.0 MiB/s | | — |
-| CRC-32 (table driven, scalar) | 167.4 MiB/s | | — |
+| DEFLATE level 6 | **11.2 MiB/s** | 21.0 MiB/s | **1.88x** |
+| inflate | 20.2 MiB/s | | — |
+| CRC-32 (table driven, scalar) | 188.4 MiB/s | | — |
 
 **On literally the same octets**: `tools/bench82/speed.fi dump` writes the test
 data out and `gzip -6` gets that file. A comparison against different input is
@@ -306,7 +306,7 @@ not a comparison, and DEFLATE is more sensitive to its input than anything
 else in this table — the same implementation measures 11 MiB/s on structured
 data and several hundred on a stream of one repeated octet.
 
-**Nothing was done to DEFLATE in this round, deliberately.** A factor of 1.83
+**Nothing was done to DEFLATE in this round, deliberately.** A factor of 1.88
 against thirty years of tuned C, in a language whose compiler has no vector
 unit for it and hands out ten integer registers, is the honest number the
 round called it. The two things that would move it are a better match finder
@@ -508,9 +508,9 @@ work; making it substantially cheaper means changing the fixpoint itself
 round of its own.
 
 For Justin's six hour acceptance the relevant number is a different one:
-`tools/fixpoint.sh` measured **stage 2 in 13,017 ms and stage 3 in 39,800 ms**
-in this round's run, stage 2 and stage 3 character-identical over 648,723
-lines of assembly. Stage 3 is `firnc1` compiling itself, and `firnc1` has no
+`tools/fixpoint.sh` measured **stage 2 in 12,685 ms and stage 3 in 36,750 ms**
+in the acceptance run of this round, stage 2 and stage 3 character-identical
+over 649,720 lines of assembly. Stage 3 is `firnc1` compiling itself, and `firnc1` has no
 register allocation at all (`lib/firnc1/codegen.fi`, every value in a frame
 slot). That factor of three is where the acceptance time sits, and closing it
 means giving the self-hosted code generator registers — not making `firnc0`
@@ -608,4 +608,75 @@ compiler/src/{inline,mem2reg,layout_canon}.rs   the new Op/Type in their matches
 lib/std/crypto/sha256.fi        the dispatch, sha256_soft, block bulk
 lib/std/crypto/aes.fi           the dispatch, the *_soft names
 test.sh                         section 45
+```
+
+---
+## 9. The acceptance
+
+Run at the end of this round, on the machine named at the top, `bash test.sh`
+from an empty `.test-work` and with `.firnc1`/`.firnc2`/`.firnc3` deleted
+first, so that every stage was really rebuilt.
+
+```
+PASS 1197 / 1198          one failure, and it is not this round's (below)
+```
+
+| proof | result |
+|---|---|
+| positive tests, three build stages each | all pass, no `FAIL` in section 3 |
+| negative tests (error messages) | all pass |
+| the optimizer proof (`test_opt.sh`) | **PASS 45/45** |
+| `tools/self_compare.sh` (section 16) | **321 the same, 0 differing, 0 faulty** |
+| `tools/fixpoint.sh` (section 17) | **stage 2 == stage 3, character-identical**, 649,720 lines of assembly |
+| `tools/stdlib81/run.sh` (section 41) | NIST **1919 ok, 0 wrong**; python/openssl 106 of 106 |
+| `tools/bench82/run.sh` (section 45, new) | `RESULT ok`, every limit met |
+| `tools/english/check.sh` | 0 German identifiers, 0 paths, 0 comment lines |
+| `firnfmt -c` over the whole tree | everything in canonical shape |
+| `cargo test` | 216 passed, 0 failed |
+
+### The one failure, and why it is not this round's
+
+```
+== 9d. JavaScript: lexer, parser, interpreter (tools/js/run.sh) ==
+  FAIL  tools/js/run.sh failed
+      jobs   rc=-11    6.7s  RSS first 11332 KiB  max 12356 KiB  growth +1024 KiB
+             output: jobs 120 0 | OK
+```
+
+`rc=-11` is SIGSEGV in the promise endurance run. The program produces its
+CORRECT output and then dies. `docs/ROUND76.md` §4.6 recorded it on `main`,
+`docs/ROUND78.md` established it again there, and it is **intermittent**.
+
+Established a third time here, because "inherited" is a claim and not an
+excuse. The same job blob (200 realms of the promise program in one process),
+eight runs on each tree, same machine, same minute:
+
+| tree | SIGSEGV |
+|---|---|
+| `main` (`d87113b3`) | **6 of 8** |
+| `r82-speed` | **6 of 8** |
+
+Identical. The two engines were built from the same `lib/js/` with the
+respective compiler of each tree.
+
+The crash deserves a round of its own — it is an abandoned promise queue
+under the collector, which is exactly where a dangling reference would show.
+Section 45 of this round cannot see it and does not claim to.
+
+### Reproducing the numbers
+
+```sh
+bash tools/bench82/run.sh                  # the table of §2 and §5.1
+BENCH82_FULL=1 bash tools/bench82/run.sh   # the same with bigger buffers
+
+firnc --timings --opt-level=release-fast -o /tmp/a bin/firnc1.fi   # §5.4
+FIRN_PASS_TIMINGS=1 firnc --opt-level=release-fast --emit=fir \
+    -o /dev/null bin/firnc1.fi                                     # per pass
+
+FIRN_RA_STATS=1 firnc --opt-level=release-fast -o /tmp/b lib/js/run_main.fi \
+    2>&1 >/dev/null | python3 tools/bench82/ra_report.py --hot 8   # §5.3
+
+FIRN_NO_XMM_CACHE=1  firnc ...   # the xmm cache off  (§3.3)
+FIRN_NO_XMM_RETIRE=1 firnc ...   # the retirement off (§3.3)
+firnc --no-pass=strength ...     # the new optimizer pass off (§5.2)
 ```

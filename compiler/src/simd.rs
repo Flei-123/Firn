@@ -1,5 +1,5 @@
 //! **ROUND 82** — the vector and crypto instructions of the processor
-//! (SPEC §8.7, §14.6).
+//! (SPEC §8.6).
 //!
 //! ## Why this file exists
 //!

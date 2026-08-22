@@ -36,7 +36,7 @@ pub enum Type {
     Void,
     /// Only to suppress follow-up errors after a reported error.
     Error,
-    /// **ROUND 82** — the 128-bit vector register (SPEC §8.7).
+    /// **ROUND 82** — the 128-bit vector register (SPEC §8.6).
     ///
     /// Sixteen octets, sixteen byte aligned, at home in one `xmm` register.
     /// It carries NO element type: what the sixteen octets mean is decided
