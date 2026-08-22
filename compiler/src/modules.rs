@@ -721,6 +721,17 @@ impl<'a, 'b> Renamer<'a, 'b> {
     fn ty(&mut self, t: &mut TypeExpr) {
         match t {
             TypeExpr::Named(name, span) => {
+                // HOOK fehlerunionen (round 76): `E!T` leaves only the
+                // placeholder `__eu#<n>` in the tree, the success type `T`
+                // lies aside in `errors::REG`. Without this branch a module
+                // never qualified it, and a function could not return an
+                // error union over a struct of its own module
+                // (`errors::pending_inner`).
+                if let Some((idx, mut inner)) = crate::errors::pending_inner(name) {
+                    self.ty(&mut inner);
+                    crate::errors::set_pending_inner(idx, inner);
+                    return;
+                }
                 if let Some(n) = self.resolve(name, *span, false) {
                     *name = n;
                 }
