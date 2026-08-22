@@ -423,7 +423,7 @@ mod tests {
             name: name.to_string(),
             params: Vec::new(),
             ret: None,
-            body: Block { stmts, span: span(1, 1) },
+            body: Block { stmts, span: span(1, 1), end: span(1, 1) },
             span: span(1, 1),
             attrs: if no_gc {
                 vec![Attr { name: "no_gc".to_string(), args: Vec::new(), span: span(1, 1) }]
@@ -592,19 +592,19 @@ mod tests {
         let cond2 = b.expr(span(11, 1), ExprKind::Bool(true));
         let inner = Stmt::If {
             cond: cond2,
-            then: Block { stmts: vec![Stmt::Expr(call)], span: span(11, 1) },
+            then: Block { stmts: vec![Stmt::Expr(call)], span: span(11, 1), end: span(11, 1) },
             els: None,
             span: span(11, 1),
         };
         let mid = Stmt::While {
             cond: cond1,
-            body: Block { stmts: vec![inner], span: span(10, 1) },
+            body: Block { stmts: vec![inner], span: span(10, 1), end: span(10, 1) },
             span: span(10, 1),
         };
         let n = b.next;
         let prog = program(
             vec![
-                fndecl("hot", true, vec![Stmt::Block(Block { stmts: vec![mid], span: span(9, 1) })]),
+                fndecl("hot", true, vec![Stmt::Block(Block { stmts: vec![mid], span: span(9, 1), end: span(9, 1) })]),
                 fndecl("cold", false, Vec::new()),
             ],
             n,

@@ -164,6 +164,11 @@ impl<'a> Checker<'a> {
         // Runs AFTER the type check, because rule 3 (writing into a
         // Gc[T] field) needs the type table.
         crate::nogc::hook_check(self, prog);
+        // HOOK escape: a raw pointer into a local must not outlive its frame
+        // (escape.rs, round 79, gap 9 of docs/ROUND66.md). Runs AFTER the
+        // type check as well: it has to tell `a[i]` on an ARRAY from `p[i]`
+        // on a pointer, and only the type table knows which is which.
+        crate::escape::hook_check(self, prog);
         // HOOK kern: `#[interrupt]` — check the form and forbid calls
         // (core.rs, round 52).
         crate::core::check_interrupts(self, prog);
@@ -2884,7 +2889,7 @@ mod tests {
     }
 
     fn blk(stmts: Vec<Stmt>) -> Block {
-        Block { stmts, span: sp() }
+        Block { stmts, span: sp(), end: sp() }
     }
 
     /// main function with the given body and `return <ret>`.

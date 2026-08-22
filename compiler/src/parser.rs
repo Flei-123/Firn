@@ -274,9 +274,16 @@ impl<'a> Parser<'a> {
         self.mk(span, ExprKind::Int(0))
     }
 
+    /// One span over both. **ROUND 79** — `Span::in_file` and no longer
+    /// `Span::new`: the latter sets the file number to 0, so every joined
+    /// span of a MODULE pointed into the root file. Nothing noticed for a
+    /// long time because the joined spans (statements, blocks) were used by
+    /// no message that a module can produce; the escape analysis of this
+    /// round is the first one, and it showed a `return` of `lib/gc/gc.fi`
+    /// under a line number of the test file.
     pub(crate) fn join(a: Span, b: Span) -> Span {
         if a.line == b.line && b.col + b.len > a.col {
-            Span::new(a.line, a.col, b.col + b.len - a.col)
+            Span::in_file(a.file, a.line, a.col, b.col + b.len - a.col)
         } else {
             a
         }
@@ -943,11 +950,11 @@ impl<'a> Parser<'a> {
     pub(crate) fn block(&mut self, ctx: &str) -> Block {
         let start = self.span();
         if self.too_deep() {
-            return Block { stmts: Vec::new(), span: start };
+            return Block { stmts: Vec::new(), span: start, end: start };
         }
         if !self.expect(TokKind::LBrace, ctx) {
             self.recovering = false;
-            return Block { stmts: Vec::new(), span: start };
+            return Block { stmts: Vec::new(), span: start, end: start };
         }
         self.depth += 1;
         let mut stmts = Vec::new();
@@ -986,7 +993,7 @@ impl<'a> Parser<'a> {
         let end = self.span();
         self.eat(&TokKind::RBrace);
         self.depth -= 1;
-        Block { stmts, span: Parser::join(start, end) }
+        Block { stmts, span: Parser::join(start, end), end }
     }
 
     /// End of a statement: ';' or line break or '}'.
@@ -1374,7 +1381,7 @@ impl<'a> Parser<'a> {
             self.recovering = false;
             let link_name = attrs.iter().find(|a| a.name == "link_name")
                 .and_then(|a| a.args.first().cloned());
-            let body = Block { stmts: Vec::new(), span: start };
+            let body = Block { stmts: Vec::new(), span: start, end: start };
             prog.funcs.push(FnDecl {
                 name,
                 params,
