@@ -110,6 +110,14 @@
 #      character for character) and the endurance run for the objects the
 #      round adds -- per group against test262, with the limits in
 #      tools/js/minquota_r74.txt.
+#  40. Checked integer arithmetic (tools/checked/run.sh, round 72): a
+#      program that goes out of range ABORTS in dev/dev-fast/release-safe
+#      and WRAPS in release-fast -- in BOTH compilers, with the same
+#      message octet for octet (file, line, column, operator). Plus the
+#      explicit `+% -% *%` / `+| -| *|`, which are never checked in any
+#      level, and two counter-checks: what stays in range behaves exactly
+#      as it always did, and a program without a checked operation carries
+#      neither the message table nor the trampoline.
 #  10. DOM soak run (tools/dom_soak/run.sh): the DOM prototype in Firn builds
 #      real cycles continuously (parent/child, listener, JS wrapper) and must
 #      not grow while doing so; the deliberately leaking counter-check with
@@ -148,8 +156,28 @@ run_case() {          # $1 = file, $2 = "opt" | "noopt" | "devfast"
     local file="$1" mode="$2"
     local base ext bin flags hdr exp out rc
     base=$(basename "$file" .fi)
+    # ROUND 72: a handful of programs exist SPECIFICALLY to prove that
+    # `--opt-level=release-fast` wraps/truncates instead of checking (SPEC
+    # section 13, `L9`) -- by construction they cast a value that DOES go
+    # out of range, which is exactly what dev/dev-fast/release-safe now
+    # correctly panic on. `// only_mode: opt` on line 2 opts a program out
+    # of the other two modes instead of hiding the truncation it exists
+    # to demonstrate behind some other operator.
+    if [ "$mode" != "opt" ] && head -5 "$file" | grep -q '^// only_mode: opt$'; then
+        return
+    fi
     bin="$WORK/${base}.${mode}"
-    flags=""
+    # ROUND 72: `mode=opt` used to mean "no flag at all", which quietly
+    # meant `release-fast` ONLY as long as `OptConfig::default()` itself
+    # happened to be `release-fast` -- the very default this round found
+    # wrong and fixed to `dev-fast` (DESIGN_GOALS.md line 554, `opt.rs`).
+    # After that fix "no flag" stopped exercising `release-fast` at all,
+    # silently leaving this suite's own header comment (line 8: "--opt-
+    # level=release-fast, --no-opt and --opt-level=dev-fast") untrue and
+    # `release-fast`'s unchecked-arithmetic promise (SPEC section 13, `L9`)
+    # completely untested by `mode=opt` -- made explicit here instead of
+    # relying on whatever the CLI default happens to be today.
+    flags="--opt-level=release-fast"
     [ "$mode" = "noopt" ]   && flags="--no-opt"
     [ "$mode" = "devfast" ] && flags="--opt-level=dev-fast"
 
@@ -839,6 +867,26 @@ if [ "$EXTRC" -eq 0 ]; then
 else
     bad "tools/extfn/run.sh failed (see .test-work/extfn.log)"
     grep -E 'FAIL' "$WORK/extfn.log" | head -10 | sed 's/^/   /'
+fi
+
+echo "== 40. checked integer arithmetic (tools/checked/run.sh, ROUND 72) =="
+# SPEC section 13, item L9. The number 40 and not 36: 1 to 39 are taken
+# (39 = tools/extfn from round 75, 36 to 38 from round 76), and section
+# numbers have collided in this project often enough that the next free one
+# is worth checking with `grep -n 'echo "== ' test.sh` before it is used.
+#
+# What this measures cannot be seen anywhere else in the suite: section 3
+# runs every test program in three build levels, but a program that PANICS
+# is a failure there, never a result. Here the panic IS the result -- and
+# the message it prints has to come out of BOTH compilers identically,
+# which is the part that made the self-hosting fixpoint hold again.
+bash tools/checked/run.sh > "$WORK/checked.log" 2>&1 && CHKRC=0 || CHKRC=$?
+if [ "$CHKRC" -eq 0 ]; then
+    ok
+    grep -E '^(CHECKS|  compiler)' "$WORK/checked.log" | sed 's/^/   /'
+else
+    bad "tools/checked/run.sh failed (see .test-work/checked.log)"
+    grep -E '  FAIL|CHECKS' "$WORK/checked.log" | head -12 | sed 's/^/   /'
 fi
 
 TOTAL=$((PASS + FAIL))

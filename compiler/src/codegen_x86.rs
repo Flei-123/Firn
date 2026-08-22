@@ -19,7 +19,7 @@
 
 use crate::config;
 use crate::dwarf;
-use crate::fir::{BinOp, Block, CmpOp, FTy, Func, Inst, Module, Op, Term, UnOp, Val};
+use crate::fir::{BinOp, Block, CmpOp, FTy, Func, Inst, Module, Op, Term, UnOp, Val, WrapSatKind};
 use std::fmt::Write as _;
 
 /// Argument registers of the System V AMD64 calling convention.
@@ -230,6 +230,15 @@ pub fn emit(m: &Module) -> Result<String, String> {
     if crate::fnval::has_records() {
         e.raw(&crate::fnval::records_asm());
     }
+    // HOOK panic_rt: the shared out-of-line panic trampoline and its message
+    // table (round 72, SPEC §13) — only when the program contains at least
+    // one checked arithmetic operation at all. A program built
+    // `--opt-level=release-fast`, or one that never reached a checked path
+    // in lowering, carries neither one byte of this.
+    if crate::panic_rt::any_registered() {
+        e.raw(&crate::panic_rt::rodata_asm());
+        e.raw(&crate::panic_rt::trampoline_asm());
+    }
     // ROUND 64: `.debug_abbrev` and `.debug_info` of our own -- names, types
     // and variables. The line table stays with the assembler (`.loc`).
     if dwarf::with_variables() && !e.debug_funcs.is_empty() {
@@ -335,9 +344,12 @@ fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
         }
     }
 
+    // ROUND 72: one label counter per function, so every checked site in
+    // it gets its own label pair (`panic_rt.rs::SiteCounter`).
+    let mut site = crate::panic_rt::SiteCounter::new(&f.name);
     for b in &f.blocks {
         e.raw(&format!("{}:", block_label(&f.name, b.id)));
-        emit_block(e, f, &fr, b)?;
+        emit_block(e, f, &fr, b, &mut site)?;
     }
     // ROUND 64: `DW_AT_high_pc` needs an address at the end of the function,
     // and the frame offsets of the declared names are only known HERE --
@@ -368,13 +380,19 @@ fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
     Ok(())
 }
 
-fn emit_block(e: &mut Emitter, f: &Func, fr: &Frame, b: &Block) -> Result<(), String> {
+fn emit_block(
+    e: &mut Emitter,
+    f: &Func,
+    fr: &Frame,
+    b: &Block,
+    site: &mut crate::panic_rt::SiteCounter,
+) -> Result<(), String> {
     for (idx, i) in b.insts.iter().enumerate() {
         // Instruction exact source line (only without the optimizer, see dwarf.rs)
         if let Some((file, line)) = dwarf::line_at(&f.name, b.id, idx as u32) {
             e.line(&format!(".loc {} {} 0", file + 1, line));
         }
-        emit_inst(e, f, fr, i)?;
+        emit_inst(e, f, fr, i, site)?;
     }
     match &b.term {
         Term::Br(t) => e.line(&format!("jmp {}", block_label(&f.name, *t))),
@@ -578,7 +596,13 @@ fn load_args(
     }
 }
 
-fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), String> {
+fn emit_inst(
+    e: &mut Emitter,
+    f: &Func,
+    fr: &Frame,
+    i: &Inst,
+    site: &mut crate::panic_rt::SiteCounter,
+) -> Result<(), String> {
     let ty = i.ty;
     match &i.op {
         Op::Const(c) => {
@@ -594,6 +618,41 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
         Op::Bin(op, a, b) => {
             let d = i.dst.ok_or("internal error: binary operation without target")?;
             emit_bin(e, fr, *op, ty, *a, *b, d)?;
+        }
+        // ROUND 72 -- checked "+ - *" (SPEC section 13, item L9). Both
+        // operands sign/zero extended to a full 64 bits first (`load_ext`
+        // with `to_bits=64` already produces exactly that for any `ty`);
+        // the actual check computes at `ty`'s own bit width inside
+        // `panic_rt.rs`, so a value that only fits into 8 or 16 bits is
+        // caught even though the registers underneath are wider.
+        Op::CheckedBin { op, a, b, msg } => {
+            let d = i.dst.ok_or("internal error: checked binary operation without target")?;
+            load_ext(e, fr, "rax", *a, ty, 64);
+            load_ext(e, fr, "rcx", *b, ty, 64);
+            crate::panic_rt::emit_checked_bin(e, *op, ty, msg, site);
+            store_dst(e, fr, d, "rax");
+        }
+        Op::CheckedDiv { op, a, b, msg_zero, msg_range } => {
+            let d = i.dst.ok_or("internal error: checked division without target")?;
+            load_ext(e, fr, "rax", *a, ty, 64);
+            load_ext(e, fr, "rcx", *b, ty, 64);
+            crate::panic_rt::emit_checked_div(e, *op, ty, msg_zero, msg_range, site);
+            let res = if *op == BinOp::Div { "rax" } else { "rdx" };
+            store_dst(e, fr, d, res);
+        }
+        Op::CheckedCast { src, from, msg } => {
+            let d = i.dst.ok_or("internal error: checked cast without target")?;
+            load_ext(e, fr, "rax", *src, *from, 64);
+            crate::panic_rt::emit_checked_cast(e, *from, ty, msg, site);
+            store_dst(e, fr, d, "rax");
+        }
+        // ROUND 72 -- explicit "+% -% *%" / "+| -| *|" (SPEC section 13,
+        // item L9). Never checked, always the caller's own well-defined
+        // fallback for when overflow is the point (hashes, checksums,
+        // timestamps).
+        Op::BinWrapSat { kind, op, a, b } => {
+            let d = i.dst.ok_or("internal error: wrap/sat binary operation without target")?;
+            emit_wrap_sat(e, fr, *kind, *op, ty, *a, *b, d, site)?;
         }
         Op::Cmp { op, ty: oty, a, b } => {
             let d = i.dst.ok_or("internal error: comparison without target")?;
@@ -1133,6 +1192,143 @@ fn emit_bin(
             store_dst(e, fr, d, "rax");
         }
     }
+    Ok(())
+}
+
+/// **ROUND 72** — `+% -% *%` (wrapping) and `+| -| *|` (saturating), SPEC
+/// §13 item L9. Precondition/postcondition exactly like `emit_bin`'s
+/// `Add`/`Sub`/`Mul` arm (compute at 32/64 bits, narrow on store) — wrapping
+/// needs nothing else at all: two's complement wrapping IS what `add`/
+/// `sub`/`imul` already do when nobody looks at the flag, so `Wrap` reuses
+/// the unchecked instruction sequence outright. Saturating clamps the
+/// wrapped result back into range with `cmov` when the flag fired — the
+/// same overflow test `panic_rt.rs` uses, only the ending differs.
+#[allow(clippy::too_many_arguments)]
+fn emit_wrap_sat(
+    e: &mut Emitter,
+    fr: &Frame,
+    kind: WrapSatKind,
+    op: BinOp,
+    ty: FTy,
+    a: Val,
+    b: Val,
+    d: Val,
+    site: &mut crate::panic_rt::SiteCounter,
+) -> Result<(), String> {
+    if kind == WrapSatKind::Wrap {
+        // Bit for bit the unchecked path: wrapping on overflow is exactly
+        // what plain two's complement arithmetic already means.
+        return emit_bin(e, fr, op, ty, a, b, d);
+    }
+    let bits = ty.bits();
+    load_ext(e, fr, "rax", a, ty, 64);
+    load_ext(e, fr, "rcx", b, ty, 64);
+    e.line("mov r10, rax");
+    e.line("mov r11, rcx");
+    let narrow = |name: &str, bits: u32| -> &'static str {
+        match (name, bits) {
+            ("rax", 8) => "al",
+            ("rax", 16) => "ax",
+            ("rax", 32) => "eax",
+            ("rax", _) => "rax",
+            ("rcx", 8) => "cl",
+            ("rcx", 16) => "cx",
+            ("rcx", 32) => "ecx",
+            (_, _) => "rcx",
+        }
+    };
+    match op {
+        BinOp::Add => e.line(&format!("add {}, {}", narrow("rax", bits), narrow("rcx", bits))),
+        BinOp::Sub => e.line(&format!("sub {}, {}", narrow("rax", bits), narrow("rcx", bits))),
+        // 8 bit has no two operand `imul` (see panic_rt.rs::emit_checked_bin).
+        BinOp::Mul if ty.signed() && bits == 8 => e.line("imul cl"),
+        BinOp::Mul if ty.signed() => {
+            e.line(&format!("imul {}, {}", narrow("rax", bits), narrow("rcx", bits)))
+        }
+        BinOp::Mul => e.line(&format!("mul {}", narrow("rcx", bits))),
+        _ => return Err("internal error: wrap/sat only defined for + - *".to_string()),
+    }
+    // Same reasoning as panic_rt.rs::emit_checked_bin: unsigned overflow
+    // is a CF condition for every one of + - *, not only Mul -- `200u8 +
+    // 100u8` sets CF but leaves OF clear (as i8 the sum still fits), so an
+    // `Add`/`Sub` clamp gated on OF alone silently returned the wrapped
+    // value instead of saturating (round 72's own bug, found testing
+    // `+|` on `u8`).
+    let jcc = if ty.signed() { "jo" } else { "jc" };
+    // ROUND 72, second pass: the label suffix comes from the FUNCTION's own
+    // site counter, not from the three value numbers. Value numbers restart
+    // at 0 in every function, so `.Lsatclamp0_1_6` was emitted twice the
+    // moment two functions saturated at the same place in their own
+    // numbering and `as` refused the file ("symbol already defined") --
+    // exactly the collision `SiteCounter` was introduced for on the checked
+    // side, missed here (found compiling five one-line `+|` functions).
+    let uid = site.next();
+    let clamp = format!(".Lsatclamp{}", uid);
+    let done = format!(".Lsatdone{}", uid);
+    e.line(&format!("{} {}", jcc, clamp));
+    e.line(&format!("jmp {}", done));
+    e.raw(&format!("{}:", clamp));
+    // Which bound? For `Sub` a negative result that overflowed a signed
+    // type means the true result was below MIN — the ONE case where the
+    // "did it go negative" test alone is not enough (unsigned subtraction
+    // always saturates to 0 on overflow, no sign question at all).
+    let (min_lit, max_lit): (i128, i128) = match ty {
+        FTy::I8 => (i8::MIN as i128, i8::MAX as i128),
+        FTy::I16 => (i16::MIN as i128, i16::MAX as i128),
+        FTy::I32 => (i32::MIN as i128, i32::MAX as i128),
+        FTy::I64 => (i64::MIN as i128, i64::MAX as i128),
+        FTy::U8 => (0, u8::MAX as i128),
+        FTy::U16 => (0, u16::MAX as i128),
+        FTy::U32 => (0, u32::MAX as i128),
+        _ => (0, u64::MAX as i128),
+    };
+    if !ty.signed() {
+        // Unsigned: `Add`/`Mul` overflow means "too big" (clamp to MAX);
+        // `Sub` overflow means "went below zero" (clamp to 0).
+        if op == BinOp::Sub {
+            e.line(&format!("mov rax, {}", min_lit as u64));
+        } else {
+            e.line(&format!("mov rax, {}", max_lit as u64));
+        }
+    } else {
+        // Signed: the sign of ONE original operand (for Add/Sub) or the
+        // XOR of both signs (for Mul) says which bound was crossed.
+        match op {
+            BinOp::Add => {
+                // a + b overflowed: if a is negative, the true sum was
+                // below MIN; otherwise above MAX.
+                e.line("cmp r10, 0");
+                e.line(&format!("mov rax, {}", max_lit));
+                e.line(&format!("mov rdx, {}", min_lit));
+                e.line("cmovl rax, rdx");
+            }
+            BinOp::Sub => {
+                // a - b overflowed: if a is negative and b positive, below
+                // MIN; if a positive and b negative, above MAX. Equivalent
+                // to: sign of a differs from sign of (a - b)'s true value,
+                // which is exactly sign of b for this purpose — if b is
+                // negative the true difference is larger, so it is the
+                // ABOVE-MAX case.
+                e.line("cmp r11, 0");
+                e.line(&format!("mov rax, {}", min_lit));
+                e.line(&format!("mov rdx, {}", max_lit));
+                e.line("cmovl rax, rdx");
+            }
+            BinOp::Mul => {
+                // a * b overflowed: same sign -> above MAX, different sign
+                // -> below MIN.
+                e.line("mov rax, r10");
+                e.line("xor rax, r11");
+                e.line("cmp rax, 0");
+                e.line(&format!("mov rax, {}", max_lit));
+                e.line(&format!("mov rdx, {}", min_lit));
+                e.line("cmovl rax, rdx");
+            }
+            _ => unreachable!("guarded above"),
+        }
+    }
+    e.raw(&format!("{}:", done));
+    store_dst(e, fr, d, "rax");
     Ok(())
 }
 

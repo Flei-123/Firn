@@ -560,9 +560,30 @@ pub fn allocate(f: &Func) -> Alloc {
             // (`lock cmpxchg [rcx], rdx`) — exactly like `div`/`rem`/`select`.
             // Without this entry an interval living across it keeps carrying
             // `rdx` and is destroyed. Found in tests/820 (release-fast only).
+            //
+            // Round 72 adds its own four: `CheckedBin`/`CheckedDiv`/
+            // `CheckedCast`/`BinWrapSat` all go through `push rax`/`push
+            // rcx` .. `pop`/`div`/`idiv` in `panic_rt.rs`/`emit_wrap_sat*`,
+            // which clobbers `rdx` (division's own remainder register) the
+            // exact same way `Div`/`Rem` always did. Missing here, a value
+            // the allocator had parked in `rdx` for reuse across a LOOP
+            // survived textually but not really: `lib/std/core.fi`'s
+            // `digit_count` cached `base` in `rdx` for its `while x > 0 {
+            // x = x / b }` loop, and the checked division's own `div`
+            // silently overwrote it with the remainder after the first
+            // iteration -- the loop kept dividing by whatever was left
+            // over from the PREVIOUS step instead of the real base, until
+            // that happened to be zero (found running `tests/1401_core_
+            // number.fi`: `digit_count(999, 10)` divided by 9, then by 0).
             if matches!(
                 i.op,
-                Op::Bin(BinOp::Div | BinOp::Rem, _, _) | Op::Select { .. } | Op::AtomicCas { .. }
+                Op::Bin(BinOp::Div | BinOp::Rem, _, _)
+                    | Op::Select { .. }
+                    | Op::AtomicCas { .. }
+                    | Op::CheckedBin { .. }
+                    | Op::CheckedDiv { .. }
+                    | Op::CheckedCast { .. }
+                    | Op::BinWrapSat { .. }
             ) {
                 divsel_pos.push(live.pos[bi][ii]);
             }
@@ -1857,6 +1878,8 @@ fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
     let read = count_reads(f);
     let (offset, skipped, preloader) = foldable_addresses(f, a, &read);
     let ra = Ra { f, a, read, offset, skipped, preloader };
+    // ROUND 72: one label counter per function (panic_rt.rs::SiteCounter).
+    let mut site = crate::panic_rt::SiteCounter::new(&f.name);
     e.raw("");
     // Linker symbol through the one spot (codegen_x86::label -> modules::symbol)
     e.raw(&format!(".globl {}", label(&f.name)));
@@ -1912,7 +1935,7 @@ fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
         // Fallthrough: if the jump target sits right behind it, the jump
         // disappears (saves one `jmp` per BrCond with else==next block).
         let next = order.get(k + 1).map(|&j| f.blocks[j].id);
-        emit_block(e, &ra, b, next)?;
+        emit_block(e, &ra, b, next, &mut site)?;
     }
     Ok(())
 }
@@ -2049,7 +2072,13 @@ fn epilogue(e: &mut Emitter, a: &Alloc) {
     e.line("ret");
 }
 
-fn emit_block(e: &mut Emitter, ra: &Ra, b: &Block, next: Option<BlockId>) -> Result<(), String> {
+fn emit_block(
+    e: &mut Emitter,
+    ra: &Ra,
+    b: &Block,
+    next: Option<BlockId>,
+    site: &mut crate::panic_rt::SiteCounter,
+) -> Result<(), String> {
     // FUSION of `cmp` + conditional jump.
     //
     // Without it every comparison costs seven instructions: `cmp`, `setcc al`,
@@ -2078,7 +2107,7 @@ fn emit_block(e: &mut Emitter, ra: &Ra, b: &Block, next: Option<BlockId>) -> Res
     };
     let n = if mergeable { b.insts.len() - 1 } else { b.insts.len() };
     for i in &b.insts[..n] {
-        emit_inst(e, ra, i)?;
+        emit_inst(e, ra, i, site)?;
     }
     if mergeable {
         return emit_cmp_br(e, ra, b, next);
@@ -2231,7 +2260,12 @@ fn jcc_inverse(jcc: &str) -> &'static str {
     }
 }
 
-fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
+fn emit_inst(
+    e: &mut Emitter,
+    ra: &Ra,
+    i: &Inst,
+    site: &mut crate::panic_rt::SiteCounter,
+) -> Result<(), String> {
     let ty = i.ty;
     match &i.op {
         Op::Const(c) => {
@@ -2273,6 +2307,38 @@ fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
                 return Ok(()); // is read nowhere else
             }
             emit_bin(e, ra, *op, ty, *x, *y, d)?;
+        }
+        // ROUND 72 -- checked "+ - *" (SPEC section 13, item L9). Loaded
+        // fresh into rax/rcx here (unlike the preloader path above, which
+        // this instruction never takes -- the caller's overflow test needs
+        // BOTH operands sitting in known registers, so nothing about this
+        // one may be folded into an address computation).
+        Op::CheckedBin { op, a, b, msg } => {
+            let d = i.dst.ok_or("internal error: checked binary operation without target")?;
+            ra.load_ext(e, "rax", *a, ty, 64);
+            ra.load_ext(e, "rcx", *b, ty, 64);
+            crate::panic_rt::emit_checked_bin(e, *op, ty, msg, site);
+            ra.store_dst(e, d, "rax");
+        }
+        Op::CheckedDiv { op, a, b, msg_zero, msg_range } => {
+            let d = i.dst.ok_or("internal error: checked division without target")?;
+            ra.load_ext(e, "rax", *a, ty, 64);
+            ra.load_ext(e, "rcx", *b, ty, 64);
+            crate::panic_rt::emit_checked_div(e, *op, ty, msg_zero, msg_range, site);
+            let res = if *op == BinOp::Div { "rax" } else { "rdx" };
+            ra.store_dst(e, d, res);
+        }
+        Op::CheckedCast { src, from, msg } => {
+            let d = i.dst.ok_or("internal error: checked cast without target")?;
+            ra.load_ext(e, "rax", *src, *from, 64);
+            crate::panic_rt::emit_checked_cast(e, *from, ty, msg, site);
+            ra.store_dst(e, d, "rax");
+        }
+        // ROUND 72 -- explicit "+% -% *%" / "+| -| *|" (SPEC section 13,
+        // item L9): never checked, the caller's own well-defined fallback.
+        Op::BinWrapSat { kind, op, a, b } => {
+            let d = i.dst.ok_or("internal error: wrap/sat binary operation without target")?;
+            emit_wrap_sat_ra(e, ra, *kind, *op, ty, *a, *b, d, site)?;
         }
         Op::Cmp { op, ty: oty, a, b } => {
             let d = i.dst.ok_or("internal error: comparison without target")?;
@@ -2949,6 +3015,110 @@ fn emit_bin(
             }
         }
     }
+    Ok(())
+}
+
+/// **ROUND 72** -- `+% -% *%` (wrapping) and `+| -| *|` (saturating), SPEC
+/// section 13 item L9, register allocator aware path. Mirrors
+/// `codegen_x86.rs::emit_wrap_sat` instruction for instruction; the two
+/// exist separately because the two backends load operands through
+/// different APIs (`ra.load_ext` here, the free function `load_ext` there)
+/// and neither can call into the other's private frame representation.
+#[allow(clippy::too_many_arguments)]
+fn emit_wrap_sat_ra(
+    e: &mut Emitter,
+    ra: &Ra,
+    kind: crate::fir::WrapSatKind,
+    op: BinOp,
+    ty: FTy,
+    a: Val,
+    b: Val,
+    d: Val,
+    site: &mut crate::panic_rt::SiteCounter,
+) -> Result<(), String> {
+    if kind == crate::fir::WrapSatKind::Wrap {
+        // Bit for bit the unchecked path: wrapping on overflow is exactly
+        // what plain two's complement arithmetic already means.
+        return emit_bin(e, ra, op, ty, a, b, d);
+    }
+    let bits = ty.bits();
+    ra.load_ext(e, "rax", a, ty, 64);
+    ra.load_ext(e, "rcx", b, ty, 64);
+    e.line("push rax");
+    e.line("push rcx");
+    match op {
+        BinOp::Add => e.line(&format!("add {}, {}", rn("rax", bits), rn("rcx", bits))),
+        BinOp::Sub => e.line(&format!("sub {}, {}", rn("rax", bits), rn("rcx", bits))),
+        // 8 bit has no two operand `imul` (see panic_rt.rs::emit_checked_bin).
+        BinOp::Mul if ty.signed() && bits == 8 => e.line("imul cl"),
+        BinOp::Mul if ty.signed() => {
+            e.line(&format!("imul {}, {}", rn("rax", bits), rn("rcx", bits)))
+        }
+        BinOp::Mul => e.line(&format!("mul {}", rn("rcx", bits))),
+        _ => return Err("internal error: wrap/sat only defined for + - *".to_string()),
+    }
+    // Same reasoning as panic_rt.rs::emit_checked_bin: unsigned overflow
+    // is a CF condition for every one of + - *, not only Mul -- `200u8 +
+    // 100u8` sets CF but leaves OF clear (as i8 the sum still fits), so an
+    // `Add`/`Sub` clamp gated on OF alone silently returned the wrapped
+    // value instead of saturating (round 72's own bug, found testing
+    // `+|` on `u8`).
+    let jcc = if ty.signed() { "jo" } else { "jc" };
+    // ROUND 72, second pass: unique per FUNCTION, not per value number --
+    // see codegen_x86.rs::emit_wrap_sat for the collision this replaces.
+    let uid = site.next();
+    let clamp = format!(".Lsatclamp{}", uid);
+    let done = format!(".Lsatdone{}", uid);
+    e.line(&format!("{} {}", jcc, clamp));
+    // Success: the two rescued words are not needed again, drop them.
+    e.line("add rsp, 16");
+    e.line(&format!("jmp {}", done));
+    e.raw(&format!("{}:", clamp));
+    // Recover the two ORIGINAL operands for the sign tests below.
+    e.line("pop rcx");
+    e.line("pop rax");
+    let (min_lit, max_lit): (i128, i128) = match ty {
+        FTy::I8 => (i8::MIN as i128, i8::MAX as i128),
+        FTy::I16 => (i16::MIN as i128, i16::MAX as i128),
+        FTy::I32 => (i32::MIN as i128, i32::MAX as i128),
+        FTy::I64 => (i64::MIN as i128, i64::MAX as i128),
+        FTy::U8 => (0, u8::MAX as i128),
+        FTy::U16 => (0, u16::MAX as i128),
+        FTy::U32 => (0, u32::MAX as i128),
+        _ => (0, u64::MAX as i128),
+    };
+    if !ty.signed() {
+        if op == BinOp::Sub {
+            e.line(&format!("mov rax, {}", min_lit as u64));
+        } else {
+            e.line(&format!("mov rax, {}", max_lit as u64));
+        }
+    } else {
+        match op {
+            BinOp::Add => {
+                e.line("cmp rax, 0");
+                e.line(&format!("mov rax, {}", max_lit));
+                e.line(&format!("mov rdx, {}", min_lit));
+                e.line("cmovl rax, rdx");
+            }
+            BinOp::Sub => {
+                e.line("cmp rcx, 0");
+                e.line(&format!("mov rax, {}", min_lit));
+                e.line(&format!("mov rdx, {}", max_lit));
+                e.line("cmovl rax, rdx");
+            }
+            BinOp::Mul => {
+                e.line("xor rax, rcx");
+                e.line("cmp rax, 0");
+                e.line(&format!("mov rax, {}", max_lit));
+                e.line(&format!("mov rdx, {}", min_lit));
+                e.line("cmovl rax, rdx");
+            }
+            _ => unreachable!("guarded above"),
+        }
+    }
+    e.raw(&format!("{}:", done));
+    ra.store_dst(e, d, "rax");
     Ok(())
 }
 
