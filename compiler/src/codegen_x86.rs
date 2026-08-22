@@ -635,7 +635,7 @@ fn emit_inst(
         // timestamps).
         Op::BinWrapSat { kind, op, a, b } => {
             let d = i.dst.ok_or("internal error: wrap/sat binary operation without target")?;
-            emit_wrap_sat(e, fr, *kind, *op, ty, *a, *b, d)?;
+            emit_wrap_sat(e, fr, *kind, *op, ty, *a, *b, d, site)?;
         }
         Op::Cmp { op, ty: oty, a, b } => {
             let d = i.dst.ok_or("internal error: comparison without target")?;
@@ -1186,6 +1186,7 @@ fn emit_bin(
 /// the unchecked instruction sequence outright. Saturating clamps the
 /// wrapped result back into range with `cmov` when the flag fired — the
 /// same overflow test `panic_rt.rs` uses, only the ending differs.
+#[allow(clippy::too_many_arguments)]
 fn emit_wrap_sat(
     e: &mut Emitter,
     fr: &Frame,
@@ -1195,6 +1196,7 @@ fn emit_wrap_sat(
     a: Val,
     b: Val,
     d: Val,
+    site: &mut crate::panic_rt::SiteCounter,
 ) -> Result<(), String> {
     if kind == WrapSatKind::Wrap {
         // Bit for bit the unchecked path: wrapping on overflow is exactly
@@ -1221,6 +1223,8 @@ fn emit_wrap_sat(
     match op {
         BinOp::Add => e.line(&format!("add {}, {}", narrow("rax", bits), narrow("rcx", bits))),
         BinOp::Sub => e.line(&format!("sub {}, {}", narrow("rax", bits), narrow("rcx", bits))),
+        // 8 bit has no two operand `imul` (see panic_rt.rs::emit_checked_bin).
+        BinOp::Mul if ty.signed() && bits == 8 => e.line("imul cl"),
         BinOp::Mul if ty.signed() => {
             e.line(&format!("imul {}, {}", narrow("rax", bits), narrow("rcx", bits)))
         }
@@ -1234,8 +1238,16 @@ fn emit_wrap_sat(
     // value instead of saturating (round 72's own bug, found testing
     // `+|` on `u8`).
     let jcc = if ty.signed() { "jo" } else { "jc" };
-    let clamp = format!(".Lsatclamp{}_{}_{}", a, b, d);
-    let done = format!(".Lsatdone{}_{}_{}", a, b, d);
+    // ROUND 72, second pass: the label suffix comes from the FUNCTION's own
+    // site counter, not from the three value numbers. Value numbers restart
+    // at 0 in every function, so `.Lsatclamp0_1_6` was emitted twice the
+    // moment two functions saturated at the same place in their own
+    // numbering and `as` refused the file ("symbol already defined") --
+    // exactly the collision `SiteCounter` was introduced for on the checked
+    // side, missed here (found compiling five one-line `+|` functions).
+    let uid = site.next();
+    let clamp = format!(".Lsatclamp{}", uid);
+    let done = format!(".Lsatdone{}", uid);
     e.line(&format!("{} {}", jcc, clamp));
     e.line(&format!("jmp {}", done));
     e.raw(&format!("{}:", clamp));

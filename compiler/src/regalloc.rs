@@ -2338,7 +2338,7 @@ fn emit_inst(
         // item L9): never checked, the caller's own well-defined fallback.
         Op::BinWrapSat { kind, op, a, b } => {
             let d = i.dst.ok_or("internal error: wrap/sat binary operation without target")?;
-            emit_wrap_sat_ra(e, ra, *kind, *op, ty, *a, *b, d)?;
+            emit_wrap_sat_ra(e, ra, *kind, *op, ty, *a, *b, d, site)?;
         }
         Op::Cmp { op, ty: oty, a, b } => {
             let d = i.dst.ok_or("internal error: comparison without target")?;
@@ -3034,6 +3034,7 @@ fn emit_wrap_sat_ra(
     a: Val,
     b: Val,
     d: Val,
+    site: &mut crate::panic_rt::SiteCounter,
 ) -> Result<(), String> {
     if kind == crate::fir::WrapSatKind::Wrap {
         // Bit for bit the unchecked path: wrapping on overflow is exactly
@@ -3048,6 +3049,8 @@ fn emit_wrap_sat_ra(
     match op {
         BinOp::Add => e.line(&format!("add {}, {}", rn("rax", bits), rn("rcx", bits))),
         BinOp::Sub => e.line(&format!("sub {}, {}", rn("rax", bits), rn("rcx", bits))),
+        // 8 bit has no two operand `imul` (see panic_rt.rs::emit_checked_bin).
+        BinOp::Mul if ty.signed() && bits == 8 => e.line("imul cl"),
         BinOp::Mul if ty.signed() => {
             e.line(&format!("imul {}, {}", rn("rax", bits), rn("rcx", bits)))
         }
@@ -3061,11 +3064,11 @@ fn emit_wrap_sat_ra(
     // value instead of saturating (round 72's own bug, found testing
     // `+|` on `u8`).
     let jcc = if ty.signed() { "jo" } else { "jc" };
-    let uid_a = a;
-    let uid_b = b;
-    let uid_d = d;
-    let clamp = format!(".Lsatclamp{}_{}_{}", uid_a, uid_b, uid_d);
-    let done = format!(".Lsatdone{}_{}_{}", uid_a, uid_b, uid_d);
+    // ROUND 72, second pass: unique per FUNCTION, not per value number --
+    // see codegen_x86.rs::emit_wrap_sat for the collision this replaces.
+    let uid = site.next();
+    let clamp = format!(".Lsatclamp{}", uid);
+    let done = format!(".Lsatdone{}", uid);
     e.line(&format!("{} {}", jcc, clamp));
     // Success: the two rescued words are not needed again, drop them.
     e.line("add rsp, 16");
