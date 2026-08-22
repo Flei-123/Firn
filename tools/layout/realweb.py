@@ -19,6 +19,13 @@ sides get the same preparation:
     everything, so that the width of a letter is the same on both sides
 
 What is left is a comparison of the LAYOUT, and every deviation is one.
+
+ROUND 78: the browser side is FROZEN in
+`tools/layout/reference/realweb.json` (`--reference`, the default of
+tools/layout/run.sh). `--write-reference` asks a live browser once and
+writes the file. The pages do not change, the browser's answer to them
+does not change either -- what changes is the Firn engine, and that is the
+only thing this number is supposed to be about.
 """
 
 import json
@@ -90,6 +97,8 @@ def main():
     binary = sys.argv[1]
     limit = None
     json_out = None
+    use_reference = False
+    write_reference = False
     args = sys.argv[2:]
     i = 0
     while i < len(args):
@@ -99,6 +108,12 @@ def main():
         elif args[i] == "--limit":
             limit = int(args[i + 1])
             i += 2
+        elif args[i] == "--reference":
+            use_reference = True
+            i += 1
+        elif args[i] == "--write-reference":
+            write_reference = True
+            i += 1
         else:
             i += 1
 
@@ -117,12 +132,31 @@ def main():
 
     blocks = H.run_engine(binary, [(t, ua, "") for _n, t in pages])
     got = [H.parse_block(b) for b in blocks]
-    measured = C.measure_many(pages, timeout=180)
+
+    import reference as R
+    ref_head = None
+    if use_reference and not write_reference:
+        ref_head, data = R.load("realweb")
+        print(R.describe(ref_head))
+        measured = dict((n, data.get(n)) for n, _t in pages)
+    else:
+        measured = C.measure_many(pages, timeout=180)
+        if write_reference:
+            ref_head = R.header(
+                "the boxes of testdata/realweb/*.html out of "
+                "getBoundingClientRect(), scripts and <link> removed",
+                C.LAST_EXE, C.LAST_WINDOW, (800, 600))
+            out = R.save("realweb", ref_head,
+                         dict((n, v) for n, v in measured.items()
+                              if v is not None))
+            print("written: %s (%d pages)" % (out, len(measured)))
 
     total = 0
     equal = 0
     deviations = []
     report = {"pages": []}
+    if ref_head is not None:
+        report["reference"] = ref_head
     for idx, (name, _t) in enumerate(pages):
         rows = measured.get(name)
         if rows is None:
