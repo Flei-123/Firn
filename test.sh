@@ -824,6 +824,23 @@ else
     grep -E 'FAIL|RESULT' "$WORK/mcserver.log" | head -10 | sed 's/^/   /'
 fi
 
+echo "== 39. foreign functions in both directions (tools/extfn/run.sh, ROUND 75) =="
+# Round 75 built `extern fn` and a proof script for it, and then did not
+# hang the proof into this suite -- so a later round could have broken the
+# C ABI without anything going red. It is hung in here now. Six cases,
+# both compilers (firnc0 and firnc1): Firn calls a C function
+# (`callout`), Firn calls a symbol under a different name
+# (`#[link_name]`), and C calls back into Firn through a function address
+# it was handed (`#[export_c]` plus a callback).
+bash tools/extfn/run.sh > "$WORK/extfn.log" 2>&1 && EXTRC=0 || EXTRC=$?
+if [ "$EXTRC" -eq 0 ]; then
+    ok
+    grep -E '^(PASS|FAIL):? ' "$WORK/extfn.log" | sed 's/^/   /'
+else
+    bad "tools/extfn/run.sh failed (see .test-work/extfn.log)"
+    grep -E 'FAIL' "$WORK/extfn.log" | head -10 | sed 's/^/   /'
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then
