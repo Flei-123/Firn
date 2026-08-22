@@ -59,6 +59,7 @@ mod strtype;
 mod types;
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 use std::process::Command;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -95,6 +96,59 @@ struct Options {
     /// `-c` / `--object`: only assemble, do NOT link (round 52).
     /// Always on under the `kernel` profile anyway (SPEC §2: target is ELF object code).
     only_object: bool,
+    /// **ROUND 82** — `--timings`: wall clock per phase to stderr.
+    timings: bool,
+}
+
+/// **ROUND 82** — the wall clock per compiler phase (`--timings`).
+///
+/// The round asked where the time of the self compile goes. `perf` answers a
+/// different question (which instruction), is not installed everywhere, and
+/// needs permissions that a container does not always have. The question here
+/// is about the PIPELINE, and one `Instant` per phase answers it exactly,
+/// costs nothing and needs no tool.
+///
+/// The output goes to stderr, sorted by cost, so that
+/// `tools/bench82/run.sh` can grep it and a regression limit can hang on it.
+struct Timings {
+    on: bool,
+    start: Instant,
+    last: Instant,
+    rows: Vec<(&'static str, f64)>,
+}
+
+impl Timings {
+    fn new(on: bool) -> Timings {
+        let now = Instant::now();
+        Timings { on, start: now, last: now, rows: Vec::new() }
+    }
+    /// Closes the phase that has just run. Several passes through the same
+    /// name add up — that is what makes `as`/`ld` comparable with the rest.
+    fn mark(&mut self, what: &'static str) {
+        if !self.on {
+            return;
+        }
+        let now = Instant::now();
+        let ms = now.duration_since(self.last).as_secs_f64() * 1000.0;
+        self.last = now;
+        match self.rows.iter_mut().find(|r| r.0 == what) {
+            Some(r) => r.1 += ms,
+            None => self.rows.push((what, ms)),
+        }
+    }
+    fn print(&self) {
+        if !self.on {
+            return;
+        }
+        let total = self.start.elapsed().as_secs_f64() * 1000.0;
+        let mut rows = self.rows.clone();
+        rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        eprintln!("phase timings (milliseconds, sorted by cost)");
+        for (name, ms) in &rows {
+            eprintln!("  {:<18} {:9.1} ms  {:5.1} %", name, ms, ms / total * 100.0);
+        }
+        eprintln!("total {:.1} ms", total);
+    }
 }
 
 fn usage() -> String {
@@ -130,6 +184,7 @@ fn usage() -> String {
          --list-attrs       print the known attributes and their state\n  \
          --strlit=<lit>     decode a string literal (\"..\", b\"..\", u\"..\")\n  \
          --stats            print the size of the FIR (instructions/blocks)\n  \
+         --timings          wall clock per compiler phase (ROUND 82)\n  \
          --keep-asm         keep the generated .s file\n  \
          --version          print the version\n  \
          -h, --help         this help\n",
@@ -152,6 +207,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut stats = false;
     let mut optcfg = opt::OptConfig::default();
     let mut only_object = false;
+    let mut timings = false;
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -223,6 +279,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             }
             "--keep-asm" => keep_asm = true,
             "--stats" => stats = true,
+            "--timings" => timings = true,
             "-o" => {
                 i += 1;
                 match args.get(i) {
@@ -292,6 +349,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         stats,
         optcfg,
         only_object,
+        timings,
     })
 }
 
@@ -482,6 +540,8 @@ fn run(opts: &Options) -> i32 {
         return if dg.has_errors() { 1 } else { 0 };
     }
 
+    // ROUND 82: from here on the phases are measured (`--timings`).
+    let mut tm = Timings::new(opts.timings);
     // --- Lexer + parser per module, merged afterwards ---
     let mut prog = match modules::build_program(&files, &mut dg) {
         Some(p) => p,
@@ -494,6 +554,7 @@ fn run(opts: &Options) -> i32 {
     // after that the type checker sees no difference to hand written source
     // text. Exactly that is what acceptance point 6 demands for the Unicode,
     // Web IDL and CSS tables of a browser.
+    tm.mark("lex+parse");
     let base = root
         .path
         .parent()
@@ -527,8 +588,10 @@ fn run(opts: &Options) -> i32 {
         }
     }
 
+    tm.mark("comptime");
     // --- Monomorphization of generic templates (module types) ---
     mono::expand(&mut prog, &mut dg);
+    tm.mark("mono");
     if opts.emit == Emit::Ast && !dg.has_errors() {
         println!("{:#?}", prog);
         println!("\n// statement overview (line:column kind)");
@@ -556,6 +619,7 @@ fn run(opts: &Options) -> i32 {
             return report(&dg);
         }
     };
+    tm.mark("sema");
     if dg.has_errors() {
         return report(&dg);
     }
@@ -575,6 +639,7 @@ fn run(opts: &Options) -> i32 {
         return report(&dg);
     }
 
+    tm.mark("lower");
     if opts.stats {
         eprintln!(
             "profile:    {}{}",
@@ -609,6 +674,7 @@ fn run(opts: &Options) -> i32 {
         }
     }
 
+    tm.mark("optimizer");
     if opts.stats {
         eprintln!(
             "fir (opt):  {} functions, {} blocks, {} instructions",
@@ -632,6 +698,7 @@ fn run(opts: &Options) -> i32 {
         }
     };
 
+    tm.mark("codegen");
     let out = opts
         .output
         .clone()
@@ -672,13 +739,16 @@ fn run(opts: &Options) -> i32 {
         return 0;
     }
     let obj_path = out.with_extension("o");
+    tm.mark("write .s");
     if let Err(code) = assemble_and_link(&asm_path, &obj_path, &out) {
         return code;
     }
+    tm.mark("as + ld");
     let _ = std::fs::remove_file(&obj_path);
     if !opts.keep_asm {
         let _ = std::fs::remove_file(&asm_path);
     }
+    tm.print();
     0
 }
 

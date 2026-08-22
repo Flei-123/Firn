@@ -1422,6 +1422,25 @@ pub(crate) fn emit_func_ra(e: &mut Emitter, f: &Func) -> Option<Result<(), Strin
         return None;
     }
     let a = allocate(f);
+    // ROUND 82 (`FIRN_RA_STATS=1`): how good IS this allocation? One line per
+    // function: how many values it has, how many of them got a register, how
+    // many stayed on the stack, and how many `alloca` cells were promoted.
+    // Everything else in this round measured throughput; this measures the
+    // allocator itself, and `tools/bench82/ra_report.py` adds it up over a
+    // whole library.
+    if std::env::var_os("FIRN_RA_STATS").is_some() {
+        let nv = f.val_types.len();
+        let regs = a.locs.iter().filter(|l| matches!(l, Loc::Reg(_))).count();
+        let imm = a.imms.len();
+        let addr = a.frame_addr.len();
+        // Values that neither sit in a register nor are an immediate nor a
+        // frame address: those are the ones that really cost a memory access.
+        let spilled = nv.saturating_sub(regs + imm + addr);
+        eprintln!(
+            "RA {} values={} regs={} imm={} frameaddr={} spilled={} cells={} insts={}",
+            f.name, nv, regs, imm, addr, spilled, a.cells.len(), f.inst_count()
+        );
+    }
     // The function is emitted into a buffer of its own first; after that the
     // register descriptor post pass strikes spill stores with an immediate
     // reload of the same value (445x statically in the tokenizer run, round 37).
@@ -1785,8 +1804,10 @@ fn debug_lines_active(f: &Func) -> bool {
 fn supported(f: &Func) -> bool {
     let basic = unsupported_basic(f);
     if let Some(g) = basic {
-        if std::env::var_os("FIRN_RA_WARN").is_some() {
-            eprintln!("RA base path: {} — {}", f.name, g);
+        if std::env::var_os("FIRN_RA_WARN").is_some()
+            || std::env::var_os("FIRN_RA_STATS").is_some()
+        {
+            eprintln!("RA-BASE {} reason={} insts={}", f.name, g, f.inst_count());
         }
         return false;
     }
