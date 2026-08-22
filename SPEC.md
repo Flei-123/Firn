@@ -1072,11 +1072,45 @@ brackets a line break has never ended anything and still does not. Proof:
   floating point (the suffix `1.5f` forces an `f32` there) -- the default type since round 70, as in C#, Java and
   Go. The overflow check is unaffected: `let x = 5000000000` is an error,
   because 5000000000 does not fit into an `i32`.
-* **Overflow semantics stated explicitly (`L9`):** `+` checks in `--debug` and
-  wraps in `--release-fast` (defined, **not** undefined -- deliberately
-  different from C). In addition there are explicit operators: `+%` wrapping,
-  `+|` saturating. HTML and CSS parsing have edge cases that the specification
-  prescribes exactly; you need both of them without a detour for that.
+* **Overflow semantics stated explicitly (`L9`):** `+ - *`, `/ %` and a
+  narrowing `as` check in `dev`/`dev-fast`/`release-safe` and wrap in
+  `--release-fast` (defined, **not** undefined -- deliberately different
+  from C). **Round 72** is what makes this table true rather than aspirational
+  -- until then `release-safe` ran every optimization pass and left the
+  arithmetic underneath exactly as unchecked as `release-fast`, and the CLI
+  default (no `--opt-level=` at all) silently built `release-fast`, not
+  `dev-fast` as documented, so `firnc -o x file.fi` never checked anything
+  either:
+
+  | level | checks `+ - * / % as` |
+  |---|---|
+  | `dev` (`--no-opt`) | yes |
+  | `dev-fast` (**the CLI default**) | yes |
+  | `release-safe` | yes |
+  | `release-fast` | no -- wraps, silently and by definition |
+
+  In addition there are explicit operators that are NEVER checked, in any
+  level, on purpose: `+% -% *%` (wrapping) and `+| -| *|` (saturating) --
+  written where the wrap-around itself is the point (a hash function's own
+  multiplication, a checksum, a millisecond counter that is allowed to
+  roll over), so a program does not have to switch off checking everywhere
+  else just to get that one line. `profile kernel` (2) has no runtime of
+  its own to fall back on: a checked operation that goes out of range
+  there calls an EXTERNAL symbol `karst_panic` that the kernel author
+  must define -- an undefined reference at the final link (not at
+  compile time, since the object file is freestanding on its own) is the
+  honest outcome for a kernel that never does; `demos/kernel/start.s`
+  shows a minimal one (write the message to COM1, halt). HTML and CSS
+  parsing have edge cases that the specification prescribes exactly; you
+  need both of them without a detour for that.
+
+  **Both compilers do this**, and that is not decoration: `firnc1`
+  (`lib/firnc1/*.fi`, the compiler written in Firn itself, `L1`/section 11)
+  reads the same six operators, makes the same checked-versus-wrapped
+  decision and prints the same message, down to the file, the line and the
+  column. It has to -- `tools/fir_compare.sh` compares the two intermediate
+  representations as TEXT, and the message is part of it. `docs/ROUND72.md`
+  has the numbers.
 * **Floating point (`L10`):** `f32`/`f64` following IEEE 754 with exact
   semantics, including the treatment of NaN. JS numbers *are* doubles, `calc()`
   computes in doubles; deviations show up as a wrong layout. No "fast maths", no

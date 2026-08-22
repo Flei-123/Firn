@@ -132,6 +132,15 @@ pub(crate) fn replace_uses(f: &mut Func, map: &HashMap<Val, Val>) -> usize {
                     rep(a, &mut n);
                     rep(b2, &mut n);
                 }
+                // ROUND 72: same shape as `Op::Bin` — two operands, no
+                // special casing needed for copy propagation.
+                Op::BinWrapSat { a, b: b2, .. }
+                | Op::CheckedBin { a, b: b2, .. }
+                | Op::CheckedDiv { a, b: b2, .. } => {
+                    rep(a, &mut n);
+                    rep(b2, &mut n);
+                }
+                Op::CheckedCast { src, .. } => rep(src, &mut n),
                 Op::Cmp { a, b: b2, .. } => {
                     rep(a, &mut n);
                     rep(b2, &mut n);

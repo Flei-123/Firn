@@ -162,8 +162,14 @@ for f in k0 k1 uprog0 uprog1; do
     kind=$(readelf -h "$o" | awk -F: '/^  Type:/ {print $2}' | awk '{print $1}')
     [ "$kind" = "REL" ] && ok "$f.o: ELF type REL (object file, not an executable)" \
                         || bad "$f.o: ELF kind '$kind', expected REL"
-    undef=$(nm -u "$o" 2>/dev/null | sed '/^$/d')
-    [ -z "$undef" ] && ok "$f.o: no undefined symbol (no libc, no runtime)" \
+    # ROUND 72: `karst_panic` is the ONE name allowed to stay undefined in an
+    # object file. Checked arithmetic (SPEC section 13, item L9) calls it
+    # under `profile kernel` when a value goes out of range, on purpose;
+    # `demos/kernel/isr.s` defines it and the link step above resolves it.
+    # Anything ELSE undefined is still a hard failure. The same exception is
+    # made in tools/freestanding/run.sh; this file was missed there.
+    undef=$(nm -u "$o" 2>/dev/null | awk '{print $NF}' | sed '/^$/d' | grep -vxF karst_panic)
+    [ -z "$undef" ] && ok "$f.o: no undefined symbol other than karst_panic (no libc, no runtime)" \
                     || { bad "$f.o: undefined symbols"; echo "$undef" | sed 's/^/        /'; }
     foreign=$(nm --defined-only "$o" | awk '{print $3}' | grep -vE "^_F[01]\." || true)
     [ -z "$foreign" ] && ok "$f.o: every defined symbol is its own" \
