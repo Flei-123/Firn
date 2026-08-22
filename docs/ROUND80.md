@@ -36,6 +36,10 @@ machines, and the four that do not are all the same thing (inline assembler,
 all: the ELF header, the relocation types, the disassembly, and the calling
 convention against `aarch64-linux-gnu-gcc`. All 16 pass.
 
+Both scripts are hung into `test.sh` as section 41, and the suite as a whole
+stands at **PASS 1171, FAIL 2 of 1173** — the two failures being the ones
+that are red on `main` too (§9).
+
 The five cases that are not SAME are named, one by one, in §5. None of them
 is filtered out of the corpus; the tool refuses to exit 0 if a case ever
 lands in DIFFERENT.
@@ -362,11 +366,14 @@ Unchanged, and checked rather than claimed:
   (3,621,184 octets, 617,667 lines of assembly), and `.firnc2` behaves like
   `firnc0` over the whole corpus.
 * `tools/self_compare.sh` — 315 same behaviour, **0 differing, 0 faulty**.
-* `./test.sh` — green except for two sections that are **red on `main` as
-  well** and were measured there, not assumed:
-  * section 23 (layout): 1082 of 1087 boxes equal to Chromium, 0.46 % off —
-    the identical number and the identical five cases round 76 recorded on
-    main (`docs/ROUND76.md`).
+* `./test.sh` — **PASS 1171, FAIL 2 of 1173**, and both failures are red on
+  `main` as well, measured there rather than assumed:
+  * section 23 (layout): 1082 of 1087 boxes equal to Chromium, 0.46 % off.
+    `bash tools/layout/run.sh` was run in the **`main` worktree** in this
+    same session and gives the same number and the same four worst cases
+    (`a4_abs_icb` 2 of 7, `a2_fixed_bottom_right` 1 of 5, `a3_fixed_percent`
+    1 of 5, `a7_sticky_bottom` 1 of 7) — which is also exactly what round 76
+    recorded (`docs/ROUND76.md`). Round 80 touches nothing in `lib/layout`.
   * section 24 (formatter): `lib/firnc1/parser.fi is not formatted`.
     `firnfmt -c lib/firnc1/parser.fi` says the same thing in the `main`
     worktree. Round 80 adds two `.fi` files of its own
