@@ -292,6 +292,9 @@ fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
         return r;
     }
     let fr = layout(f);
+    // ROUND 82: which vector value may lose its register when, without
+    // being written back (simd.rs). One pass over the instructions.
+    crate::simd::xplan(e, f, &fr);
     e.raw("");
     e.raw(&format!(".globl {}", label(&f.name)));
     e.raw(&format!("{}:", label(&f.name)));
@@ -394,6 +397,7 @@ fn emit_block(e: &mut Emitter, f: &Func, fr: &Frame, b: &Block) -> Result<(), St
             e.line(&format!(".loc {} {} 0", file + 1, line));
         }
         emit_inst(e, f, fr, i)?;
+        crate::simd::xretire(e, b.id, idx as u32);
     }
     // ROUND 82: everything the xmm cache still holds goes into its home slot
     // before the block is left — the successor knows nothing of it.
@@ -819,6 +823,12 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
             let d = i.dst.ok_or("internal error: load without target")?;
             // ROUND 82: sixteen octets through a pointer out of the program.
             if ty == FTy::V128 {
+                // ...unless the pointer is a promoted cell, and then it is a
+                // register move.
+                if let Some(off) = crate::simd::cell_of(e, *addr) {
+                    crate::simd::emit_cell_load(e, fr, d, *addr, off);
+                    return Ok(());
+                }
                 crate::simd::emit_ptr_load(e, fr, d, *addr);
                 return Ok(());
             }
@@ -834,6 +844,10 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
         }
         Op::Store { addr, val } => {
             if ty == FTy::V128 {
+                if let Some(off) = crate::simd::cell_of(e, *addr) {
+                    crate::simd::emit_cell_store(e, fr, *addr, off, *val);
+                    return Ok(());
+                }
                 crate::simd::emit_ptr_store(e, fr, *addr, *val);
                 return Ok(());
             }

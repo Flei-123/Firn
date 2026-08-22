@@ -104,7 +104,7 @@
 use crate::ast::{Expr, ExprKind};
 use crate::codegen_x86::{load_full, store_dst, Emitter, Frame};
 use crate::diag::Span;
-use crate::fir::{FTy, Inst, Op, Val};
+use crate::fir::{BlockId, FTy, Func, Inst, Op, Term, Val};
 use crate::lower::Lower;
 use crate::sema::Checker;
 use crate::types::Type;
@@ -498,23 +498,199 @@ const POOL: [&str; 12] = [
 /// own state, and a method would borrow the emitter twice.
 pub(crate) struct XmmCache {
     val: [Option<Val>; 12],
+    /// Where the entry belongs when it is written back. For an ordinary
+    /// value that is its frame slot, for a promoted cell the storage of its
+    /// `alloca` — two different tables, so the offset travels with the entry.
+    off: [u64; 12],
     dirty: [bool; 12],
     used: [u64; 12],
     /// locked for the instruction currently being emitted
     lock: [bool; 12],
     tick: u64,
     pub(crate) on: bool,
+    /// **The retirement plan** (per function, built by `xplan`).
+    ///
+    /// `home[v] = (b, i)` means: EVERY use of the value `v` lies in block `b`,
+    /// and the last of them is the instruction with index `i`. After that
+    /// instruction the register may be taken away from `v` WITHOUT writing it
+    /// back — nobody will ever read it again.
+    ///
+    /// Why that is right even in a loop: if `v` is defined in `b` too, the
+    /// next pass through `b` defines it afresh. If `v` comes from another
+    /// block, its home slot holds it (every block flushes in front of its
+    /// terminator), so the reload finds the right value. And if a use lay in
+    /// a second block, `home[v]` is `(u32::MAX, 0)` and nothing is retired.
+    ///
+    /// `u32::MAX` also covers the terminator: a value the `brcond`/`ret`
+    /// reads is recorded with the index `insts.len()`, which `xretire` is
+    /// never called with.
+    home: Vec<(u32, u32)>,
+    retire_on: bool,
+    /// **Promoted cells.** `cell[d] = Some(offset)` means: the `alloca` value
+    /// `d` is sixteen octets big, sixteen byte aligned, and its pointer is
+    /// used NOWHERE except as the direct address of a `load`/`store` of the
+    /// type `v128`. Then the cell itself may live in an `xmm` register, and
+    /// `load`/`store` become register moves.
+    ///
+    /// Without this a `var s: v128` costs two memory accesses PLUS the
+    /// pointer load per read — measured in `sha256_ni_blocks`: 277 `movdqu`
+    /// and 304 `mov` per 64 octet block. `mem2reg` cannot help there; it only
+    /// promotes cells written ONCE, and a loop variable is written in every
+    /// pass.
+    cell: Vec<Option<u64>>,
 }
 
 impl Default for XmmCache {
     fn default() -> Self {
         XmmCache {
             val: [None; 12],
+            off: [0; 12],
             dirty: [false; 12],
             used: [0; 12],
             lock: [false; 12],
             tick: 0,
             on: std::env::var_os("FIRN_NO_XMM_CACHE").is_none(),
+            home: Vec::new(),
+            retire_on: std::env::var_os("FIRN_NO_XMM_RETIRE").is_none(),
+            cell: Vec::new(),
+        }
+    }
+}
+
+/// Build the retirement plan of ONE function. Called by `codegen_x86::emit_func`
+/// before the first block; costs one pass over the instructions.
+pub(crate) fn xplan(e: &mut Emitter, f: &Func, fr: &Frame) {
+    let n = f.val_types.len();
+    let mut home = vec![(u32::MAX, 0u32); n];
+    // -1 = not yet seen, -2 = used in more than one block, else the block id
+    let mut seen: Vec<i64> = vec![-1; n];
+    let mut note = |v: Val, b: BlockId, i: u32, home: &mut Vec<(u32, u32)>, seen: &mut Vec<i64>| {
+        let k = v as usize;
+        if k >= seen.len() {
+            return;
+        }
+        match seen[k] {
+            -2 => {}
+            -1 => {
+                seen[k] = b as i64;
+                home[k] = (b, i);
+            }
+            other if other == b as i64 => {
+                if i > home[k].1 {
+                    home[k].1 = i;
+                }
+            }
+            _ => {
+                seen[k] = -2;
+                home[k] = (u32::MAX, 0);
+            }
+        }
+    };
+    let mut uses: Vec<Val> = Vec::new();
+    for b in &f.blocks {
+        for (i, inst) in b.insts.iter().enumerate() {
+            uses.clear();
+            inst.op.uses(&mut uses);
+            for v in uses.iter() {
+                note(*v, b.id, i as u32, &mut home, &mut seen);
+            }
+        }
+        // The terminator counts as a use AFTER the last instruction. The
+        // index `insts.len()` never reaches `xretire`, so such a value stays
+        // until the flush — which is exactly right, the terminator reads it.
+        let last = b.insts.len() as u32;
+        match &b.term {
+            Term::BrCond { cond, .. } => note(*cond, b.id, last, &mut home, &mut seen),
+            Term::Switch { val, .. } => note(*val, b.id, last, &mut home, &mut seen),
+            Term::Ret(Some(v)) => note(*v, b.id, last, &mut home, &mut seen),
+            _ => {}
+        }
+    }
+    e.xmm.home = home;
+    e.xmm.cell = promote_cells(f, fr);
+}
+
+/// Which `alloca` may live in a register? The conditions are deliberately
+/// narrow, because the reward for being wrong here is silently wrong code:
+///
+///  * sixteen octets big and sixteen byte aligned (so a `v128` fits exactly),
+///  * the `alloca` value has a known frame offset,
+///  * and EVERY use of its pointer is the `addr` of a `load` or a `store`
+///    whose type is `v128`. One `ptradd`, one call argument, one `copymem`,
+///    one pointer stored away — and the cell stays in memory.
+fn promote_cells(f: &Func, fr: &Frame) -> Vec<Option<u64>> {
+    let n = f.val_types.len();
+    let mut cand: Vec<Option<u64>> = vec![None; n];
+    for b in &f.blocks {
+        for i in &b.insts {
+            if let (Some(d), Op::Alloca { size: 16, align: 16 }) = (i.dst, &i.op) {
+                if let Some(Some(off)) = fr.alloca_off.get(d as usize) {
+                    cand[d as usize] = Some(*off);
+                }
+            }
+        }
+    }
+    if cand.iter().all(|c| c.is_none()) {
+        return vec![None; n];
+    }
+    let mut uses: Vec<Val> = Vec::new();
+    for b in &f.blocks {
+        for inst in &b.insts {
+            let ok_addr = match (&inst.op, inst.ty) {
+                (Op::Load { addr }, FTy::V128) => Some(*addr),
+                (Op::Store { addr, val }, FTy::V128) => {
+                    // The pointer must be the ADDRESS, never the value.
+                    if cand.get(*val as usize).map(|c| c.is_some()).unwrap_or(false) {
+                        cand[*val as usize] = None;
+                    }
+                    Some(*addr)
+                }
+                _ => None,
+            };
+            uses.clear();
+            inst.op.uses(&mut uses);
+            for v in uses.iter() {
+                if Some(*v) == ok_addr {
+                    continue;
+                }
+                if let Some(slot) = cand.get_mut(*v as usize) {
+                    *slot = None;
+                }
+            }
+        }
+        let t = match &b.term {
+            Term::BrCond { cond, .. } => Some(*cond),
+            Term::Switch { val, .. } => Some(*val),
+            Term::Ret(Some(v)) => Some(*v),
+            _ => None,
+        };
+        if let Some(v) = t {
+            if let Some(slot) = cand.get_mut(v as usize) {
+                *slot = None;
+            }
+        }
+    }
+    cand
+}
+
+/// Is this `alloca` value a promoted cell? Then its storage offset.
+pub(crate) fn cell_of(e: &Emitter, v: Val) -> Option<u64> {
+    e.xmm.cell.get(v as usize).copied().flatten()
+}
+
+/// After the instruction with index `idx` in block `bid`: give up every
+/// register whose value will never be read again. No write back — that is
+/// the whole point.
+pub(crate) fn xretire(e: &mut Emitter, bid: BlockId, idx: u32) {
+    if !e.xmm.retire_on || e.xmm.home.is_empty() {
+        return;
+    }
+    for k in 0..POOL.len() {
+        if let Some(v) = e.xmm.val[k] {
+            if e.xmm.home.get(v as usize) == Some(&(bid, idx)) {
+                e.xmm.val[k] = None;
+                e.xmm.dirty[k] = false;
+            }
         }
     }
 }
@@ -523,18 +699,19 @@ fn slot_at(fr: &Frame, v: Val) -> String {
     format!("xmmword ptr [rbp-{}]", fr.slot[v as usize])
 }
 
+fn at(off: u64) -> String {
+    format!("xmmword ptr [rbp-{}]", off)
+}
+
 /// Write every dirty register back into its home slot and forget everything.
 /// Called at the end of every basic block and in front of every `call`,
 /// `syscall`, `asm` and thread instruction.
 pub(crate) fn xflush(e: &mut Emitter, fr: &Frame) {
+    let _ = fr;
     for k in 0..POOL.len() {
-        let write = match (e.xmm.val[k], e.xmm.dirty[k]) {
-            (Some(v), true) => Some(v),
-            _ => None,
-        };
-        if let Some(v) = write {
-            let at = slot_at(fr, v);
-            e.line(&format!("movdqa {}, {}", at, POOL[k]));
+        if e.xmm.val[k].is_some() && e.xmm.dirty[k] {
+            let home = at(e.xmm.off[k]);
+            e.line(&format!("movdqa {}, {}", home, POOL[k]));
         }
         e.xmm.val[k] = None;
         e.xmm.dirty[k] = false;
@@ -551,6 +728,7 @@ pub(crate) fn xclear(e: &mut Emitter) {
 }
 
 fn xpick(e: &mut Emitter, fr: &Frame) -> usize {
+    let _ = fr;
     for k in 0..POOL.len() {
         if e.xmm.val[k].is_none() && !e.xmm.lock[k] {
             return k;
@@ -568,13 +746,9 @@ fn xpick(e: &mut Emitter, fr: &Frame) -> usize {
     // Cannot happen: at most four operands are locked at a time, the pool
     // holds twelve. The fallback keeps the generator total all the same.
     let k = if best == usize::MAX { 0 } else { best };
-    let write = match (e.xmm.val[k], e.xmm.dirty[k]) {
-        (Some(v), true) => Some(v),
-        _ => None,
-    };
-    if let Some(v) = write {
-        let at = slot_at(fr, v);
-        e.line(&format!("movdqa {}, {}", at, POOL[k]));
+    if e.xmm.val[k].is_some() && e.xmm.dirty[k] {
+        let home = at(e.xmm.off[k]);
+        e.line(&format!("movdqa {}, {}", home, POOL[k]));
     }
     e.xmm.val[k] = None;
     e.xmm.dirty[k] = false;
@@ -590,6 +764,20 @@ fn xtouch(e: &mut Emitter, k: usize) {
 /// The register the value `v` stands in — loaded from its slot if it is not
 /// there yet. Locked until the end of the current instruction.
 fn xget(e: &mut Emitter, fr: &Frame, v: Val) -> &'static str {
+    let off = fr.slot[v as usize];
+    xget_at(e, fr, v, off)
+}
+
+/// The same for a promoted cell, whose home is its `alloca` storage.
+pub(crate) fn xget_cell(e: &mut Emitter, fr: &Frame, c: Val, off: u64) -> &'static str {
+    xget_at(e, fr, c, off)
+}
+
+pub(crate) fn xdef_cell(e: &mut Emitter, fr: &Frame, c: Val, off: u64) -> &'static str {
+    xdef_at(e, fr, c, off)
+}
+
+fn xget_at(e: &mut Emitter, fr: &Frame, v: Val, off: u64) -> &'static str {
     if e.xmm.on {
         for k in 0..POOL.len() {
             if e.xmm.val[k] == Some(v) {
@@ -598,9 +786,10 @@ fn xget(e: &mut Emitter, fr: &Frame, v: Val) -> &'static str {
             }
         }
         let k = xpick(e, fr);
-        let at = slot_at(fr, v);
-        e.line(&format!("movdqa {}, {}", POOL[k], at));
+        let home = at(off);
+        e.line(&format!("movdqa {}, {}", POOL[k], home));
         e.xmm.val[k] = Some(v);
+        e.xmm.off[k] = off;
         e.xmm.dirty[k] = false;
         xtouch(e, k);
         return POOL[k];
@@ -610,8 +799,8 @@ fn xget(e: &mut Emitter, fr: &Frame, v: Val) -> &'static str {
     let k = (e.xmm.tick % 3) as usize;
     e.xmm.tick += 1;
     let r = ["xmm1", "xmm2", "xmm3"][k];
-    let at = slot_at(fr, v);
-    e.line(&format!("movdqa {}, {}", r, at));
+    let home = at(off);
+    e.line(&format!("movdqa {}, {}", r, home));
     r
 }
 
@@ -619,6 +808,11 @@ fn xget(e: &mut Emitter, fr: &Frame, v: Val) -> &'static str {
 /// happens at the next flush; with it off, `xstore` puts it in the slot at
 /// once.
 fn xdef(e: &mut Emitter, fr: &Frame, d: Val) -> &'static str {
+    let off = fr.slot[d as usize];
+    xdef_at(e, fr, d, off)
+}
+
+fn xdef_at(e: &mut Emitter, fr: &Frame, d: Val, off: u64) -> &'static str {
     if e.xmm.on {
         for k in 0..POOL.len() {
             if e.xmm.val[k] == Some(d) {
@@ -628,6 +822,7 @@ fn xdef(e: &mut Emitter, fr: &Frame, d: Val) -> &'static str {
         }
         let k = xpick(e, fr);
         e.xmm.val[k] = Some(d);
+        e.xmm.off[k] = off;
         e.xmm.dirty[k] = true;
         xtouch(e, k);
         return POOL[k];
@@ -638,8 +833,33 @@ fn xdef(e: &mut Emitter, fr: &Frame, d: Val) -> &'static str {
 /// The counterpart of `xdef` for the switched off cache.
 fn xstore(e: &mut Emitter, fr: &Frame, d: Val, r: &str) {
     if !e.xmm.on {
-        let at = slot_at(fr, d);
-        e.line(&format!("movdqa {}, {}", at, r));
+        let home = slot_at(fr, d);
+        e.line(&format!("movdqa {}, {}", home, r));
+    }
+}
+
+/// `Op::Load` out of a promoted cell: a register move, no memory at all.
+pub(crate) fn emit_cell_load(e: &mut Emitter, fr: &Frame, d: Val, c: Val, off: u64) {
+    xunlock(e);
+    let rc = xget_cell(e, fr, c, off);
+    let rd = xdef(e, fr, d);
+    if rd != rc {
+        e.line(&format!("movdqa {}, {}", rd, rc));
+    }
+    xstore(e, fr, d, rd);
+}
+
+/// `Op::Store` into a promoted cell: likewise.
+pub(crate) fn emit_cell_store(e: &mut Emitter, fr: &Frame, c: Val, off: u64, v: Val) {
+    xunlock(e);
+    let rv = xget(e, fr, v);
+    let rc = xdef_cell(e, fr, c, off);
+    if rc != rv {
+        e.line(&format!("movdqa {}, {}", rc, rv));
+    }
+    if !e.xmm.on {
+        let home = at(off);
+        e.line(&format!("movdqa {}, {}", home, rc));
     }
 }
 
