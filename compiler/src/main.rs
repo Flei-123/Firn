@@ -11,6 +11,7 @@ mod layout_canon;
 mod atomic;
 mod thread;
 mod attrs;
+mod codegen_a64;
 mod codegen_switch;
 mod codegen_x86;
 mod comptime;
@@ -53,6 +54,8 @@ mod sema_generic;
 mod sema_match;
 mod strings;
 mod strtype;
+mod syscalls;
+mod target;
 mod types;
 
 use std::path::{Path, PathBuf};
@@ -119,6 +122,7 @@ fn usage() -> String {
          --lsp              language server over standard input/output\n  \
          -c, --object       only assemble: ELF object file, no ld\n  \
          --profile=<name>   kernel | app (SPEC 2), forces the profile\n  \
+         --target=<name>    x86_64-linux (default) | aarch64-linux (round 80)\n  \
          --no-opt           switch off the optimizer (= --opt-level=dev)\n  \
          --opt-level=<lvl>  dev | dev-fast | release-safe | release-fast\n  \
                               (\'dev-fast\' = only debug preserving passes)\n  \
@@ -215,6 +219,14 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             "-c" | "--object" => only_object = true,
             _ if a.starts_with("--profile=") => {
                 if let Err(e) = prof::flag_set(&a["--profile=".len()..]) {
+                    return Err(e);
+                }
+            }
+            // ROUND 80: the second machine. Without this option nothing
+            // changes -- `target::active()` answers `x86_64-linux` and every
+            // path below is the one that has always been walked.
+            _ if a.starts_with("--target=") => {
+                if let Err(e) = target::flag_set(&a["--target=".len()..]) {
                     return Err(e);
                 }
             }
@@ -621,7 +633,16 @@ fn run(opts: &Options) -> i32 {
     }
 
     // --- Codegen ---
-    let asm = match codegen_x86::emit(&module) {
+    //
+    // ROUND 80: the ONE place at which the machine is chosen. Everything
+    // above this line -- lexer, parser, checker, lowering, optimizer -- has
+    // no idea which machine it is working for, and that is the whole point
+    // of the round.
+    let emitted = match target::active() {
+        target::Target::X86_64 => codegen_x86::emit(&module),
+        target::Target::Aarch64 => codegen_a64::emit(&module),
+    };
+    let asm = match emitted {
         Ok(a) => a,
         Err(e) => {
             eprintln!("error: {}", e);
@@ -703,42 +724,46 @@ fn default_output(input: &Path) -> PathBuf {
 
 /// Assemble only (`as --64 -o x.o x.s`) — the freestanding output.
 fn assemble(asm: &Path, obj: &Path) -> Result<(), i32> {
-    let st = Command::new("as").arg("--64").arg("-o").arg(obj).arg(asm).status();
+    let t = target::active();
+    let st = Command::new(t.assembler())
+        .args(t.as_flags())
+        .arg("-o")
+        .arg(obj)
+        .arg(asm)
+        .status();
     match st {
         Ok(s) if s.success() => Ok(()),
         Ok(s) => {
-            eprintln!("error: 'as' failed ({})", s);
+            eprintln!("error: '{}' failed ({})", t.assembler(), s);
             Err(3)
         }
         Err(e) => {
-            eprintln!("error: cannot run 'as': {} (binutils installed?)", e);
+            eprintln!(
+                "error: cannot run '{}': {} (binutils installed?)",
+                t.assembler(),
+                e
+            );
             Err(3)
         }
     }
 }
 
 fn assemble_and_link(asm: &Path, obj: &Path, out: &Path) -> Result<(), i32> {
-    let st = Command::new("as").arg("--64").arg("-o").arg(obj).arg(asm).status();
-    match st {
-        Ok(s) if s.success() => {}
-        Ok(s) => {
-            eprintln!("error: 'as' failed ({})", s);
-            return Err(3);
-        }
-        Err(e) => {
-            eprintln!("error: cannot run 'as': {} (binutils installed?)", e);
-            return Err(3);
-        }
-    }
-    let st = Command::new("ld").arg("-n").arg("-o").arg(out).arg(obj).status();
+    let t = target::active();
+    assemble(asm, obj)?;
+    let st = Command::new(t.linker()).arg("-n").arg("-o").arg(out).arg(obj).status();
     match st {
         Ok(s) if s.success() => Ok(()),
         Ok(s) => {
-            eprintln!("error: 'ld' failed ({})", s);
+            eprintln!("error: '{}' failed ({})", t.linker(), s);
             Err(3)
         }
         Err(e) => {
-            eprintln!("error: cannot run 'ld': {} (binutils installed?)", e);
+            eprintln!(
+                "error: cannot run '{}': {} (binutils installed?)",
+                t.linker(),
+                e
+            );
             Err(3)
         }
     }
