@@ -62,10 +62,31 @@
 // A4 NO GCM, NO AUTHENTICATION. CBC and CFB8 are confidentiality only. A
 //    message that must not be MODIFIED needs a MAC on top --
 //    `std.crypto.hmac` is right here, and encrypt-then-MAC is the order.
+// ================================================================= ROUND 82
+//
+// A5 THE SECOND PATH. On a processor with AES-NI the round becomes ONE
+//    instruction (`aesenc`), and `lib/std/crypto/accel.fi` runs instead of
+//    everything below. The decision is made ONCE, in `aes128_new`, by asking
+//    `cpuid`; the same binary keeps working on a machine without AES-NI,
+//    over the code in this file.
+//
+//    NOTE ON A3: the hardware path is CONSTANT TIME by construction. `aesenc`
+//    has no data dependent timing and touches no table, so the cache leak of
+//    the S-box implementation is simply not there. On this machine the
+//    concern of A3 therefore does not apply -- it applies on a processor
+//    without AES-NI, and there it applies exactly as written.
+//
+//    Every `*_soft` function is the scalar one under its own name.
+//    `tools/bench82/run.sh` sends the same 1,919 NIST vectors through both
+//    and demands the same answer.
 import std.rt
+import std.crypto.accel
 
-export { Aes, aes128_new, aes_encrypt_block, aes_decrypt_block,
+export { Aes, aes128_new, aes128_new_soft,
+    aes_encrypt_block, aes_decrypt_block, aes_encrypt_block_soft,
     aes_cbc_encrypt, aes_cbc_decrypt, aes_cfb8_encrypt, aes_cfb8_decrypt,
+    aes_cbc_encrypt_soft, aes_cbc_decrypt_soft,
+    aes_cfb8_encrypt_soft, aes_cfb8_decrypt_soft,
     AES_BLOCK }
 
 const AES_BLOCK: usize = 16
@@ -85,6 +106,8 @@ struct Aes {
     m11: [u8; 256],
     m13: [u8; 256],
     m14: [u8; 256],
+    // ROUND 82: has this processor AES-NI, and may it be used?
+    ni: bool,
 }
 
 fn sbox_table() -> [u8; 256] {
@@ -143,7 +166,7 @@ fn gmul(a0: u8, b0: u8) -> u8 {
 fn aes128_new(key: u64) -> Aes {
     var a: Aes = Aes { rk: [0; 176], sbox: sbox_table(), isbox: [0; 256],
         m2: [0; 256], m3: [0; 256], m9: [0; 256], m11: [0; 256],
-        m13: [0; 256], m14: [0; 256] }
+        m13: [0; 256], m14: [0; 256], ni: accel.accel_aes() }
     var i: usize = 0
     while i < 256 {
         a.isbox[a.sbox[i] as usize] = i as u8
@@ -197,7 +220,7 @@ fn add_round_key(st: *mut [u8; 16], a: *mut Aes, round: usize) {
     }
 }
 
-fn aes_encrypt_block(a: *mut Aes, inp: u64, out: u64) {
+fn aes_encrypt_block_soft(a: *mut Aes, inp: u64, out: u64) {
     var st: [u8; 16] = [0; 16]
     var i: usize = 0
     while i < 16 {
@@ -321,7 +344,7 @@ fn aes_decrypt_block(a: *mut Aes, inp: u64, out: u64) {
 // block, so a second call continues the same stream. `n` must be a
 // multiple of 16 (A2).
 
-fn aes_cbc_encrypt(a: *mut Aes, iv: u64, p: u64, n: usize, out: u64) -> bool {
+fn aes_cbc_encrypt_soft(a: *mut Aes, iv: u64, p: u64, n: usize, out: u64) -> bool {
     if n % 16 != 0 {
         return false
     }
@@ -333,7 +356,7 @@ fn aes_cbc_encrypt(a: *mut Aes, iv: u64, p: u64, n: usize, out: u64) -> bool {
             blk[i] = rt.ld8(p, at + i) ^ rt.ld8(iv, i)
             i = i + 1
         }
-        aes_encrypt_block(a, (&blk[0]) as u64, out + at as u64)
+        aes_encrypt_block_soft(a, (&blk[0]) as u64, out + at as u64)
         i = 0
         while i < 16 {
             rt.st8(iv, i, rt.ld8(out + at as u64, i))
@@ -344,7 +367,7 @@ fn aes_cbc_encrypt(a: *mut Aes, iv: u64, p: u64, n: usize, out: u64) -> bool {
     return true
 }
 
-fn aes_cbc_decrypt(a: *mut Aes, iv: u64, p: u64, n: usize, out: u64) -> bool {
+fn aes_cbc_decrypt_soft(a: *mut Aes, iv: u64, p: u64, n: usize, out: u64) -> bool {
     if n % 16 != 0 {
         return false
     }
@@ -381,11 +404,11 @@ fn aes_cbc_decrypt(a: *mut Aes, iv: u64, p: u64, n: usize, out: u64) -> bool {
 // updated, so a connection keeps ONE register for its whole life -- which
 // is exactly what the Minecraft protocol does.
 
-fn aes_cfb8_encrypt(a: *mut Aes, iv: u64, p: u64, n: usize, out: u64) {
+fn aes_cfb8_encrypt_soft(a: *mut Aes, iv: u64, p: u64, n: usize, out: u64) {
     var keystream: [u8; 16] = [0; 16]
     var i: usize = 0
     while i < n {
-        aes_encrypt_block(a, iv, (&keystream[0]) as u64)
+        aes_encrypt_block_soft(a, iv, (&keystream[0]) as u64)
         let c: u8 = rt.ld8(p, i) ^ keystream[0]
         rt.st8(out, i, c)
         // shift the register left by one octet, append the CIPHERTEXT
@@ -399,11 +422,11 @@ fn aes_cfb8_encrypt(a: *mut Aes, iv: u64, p: u64, n: usize, out: u64) {
     }
 }
 
-fn aes_cfb8_decrypt(a: *mut Aes, iv: u64, p: u64, n: usize, out: u64) {
+fn aes_cfb8_decrypt_soft(a: *mut Aes, iv: u64, p: u64, n: usize, out: u64) {
     var keystream: [u8; 16] = [0; 16]
     var i: usize = 0
     while i < n {
-        aes_encrypt_block(a, iv, (&keystream[0]) as u64)
+        aes_encrypt_block_soft(a, iv, (&keystream[0]) as u64)
         let c: u8 = rt.ld8(p, i)
         rt.st8(out, i, c ^ keystream[0])
         var j: usize = 0
@@ -414,4 +437,60 @@ fn aes_cfb8_decrypt(a: *mut Aes, iv: u64, p: u64, n: usize, out: u64) {
         rt.st8(iv, 15, c)
         i = i + 1
     }
+}
+
+// ------------------------------------------------- ROUND 82: the dispatch
+//
+// One `if` per CALL, not per block. `(*a).ni` was settled in `aes128_new`.
+
+fn aes128_new_soft(key: u64) -> Aes {
+    var a: Aes = aes128_new(key)
+    a.ni = false
+    return a
+}
+
+fn aes_encrypt_block(a: *mut Aes, inp: u64, out: u64) {
+    if (*a).ni {
+        accel.aes128_ni_encrypt_block((&(*a).rk[0]) as u64, inp, out)
+        return
+    }
+    aes_encrypt_block_soft(a, inp, out)
+}
+
+fn aes_cbc_encrypt(a: *mut Aes, iv: u64, p: u64, n: usize, out: u64) -> bool {
+    if n % 16 != 0 {
+        return false
+    }
+    if (*a).ni {
+        accel.aes128_ni_cbc_encrypt((&(*a).rk[0]) as u64, iv, p, n, out)
+        return true
+    }
+    return aes_cbc_encrypt_soft(a, iv, p, n, out)
+}
+
+fn aes_cbc_decrypt(a: *mut Aes, iv: u64, p: u64, n: usize, out: u64) -> bool {
+    if n % 16 != 0 {
+        return false
+    }
+    if (*a).ni {
+        accel.aes128_ni_cbc_decrypt((&(*a).rk[0]) as u64, iv, p, n, out)
+        return true
+    }
+    return aes_cbc_decrypt_soft(a, iv, p, n, out)
+}
+
+fn aes_cfb8_encrypt(a: *mut Aes, iv: u64, p: u64, n: usize, out: u64) {
+    if (*a).ni {
+        accel.aes128_ni_cfb8_encrypt((&(*a).rk[0]) as u64, iv, p, n, out)
+        return
+    }
+    aes_cfb8_encrypt_soft(a, iv, p, n, out)
+}
+
+fn aes_cfb8_decrypt(a: *mut Aes, iv: u64, p: u64, n: usize, out: u64) {
+    if (*a).ni {
+        accel.aes128_ni_cfb8_decrypt((&(*a).rk[0]) as u64, iv, p, n, out)
+        return
+    }
+    aes_cfb8_decrypt_soft(a, iv, p, n, out)
 }
