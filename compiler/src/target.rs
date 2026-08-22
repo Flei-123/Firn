@@ -95,10 +95,6 @@ pub fn active() -> Target {
     ACTIVE.with(|a| a.get())
 }
 
-pub fn is_aarch64() -> bool {
-    active() == Target::Aarch64
-}
-
 /// `.align`/`.balign` of the active machine (see `Target::align_directive`).
 pub fn align(bytes: u64) -> String {
     active().align_directive(bytes)

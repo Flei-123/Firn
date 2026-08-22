@@ -1280,7 +1280,7 @@ pub(crate) fn ty_table_asm() -> String {
     REG.with(|r| {
         let reg = r.borrow();
         let _ = writeln!(out, ".section .rodata");
-        let _ = writeln!(out, ".align 8");
+        let _ = writeln!(out, "{}", crate::target::align(8));
         let _ = writeln!(out, "{}:", TABLE_LABEL);
         let _ = writeln!(out, "    .quad {}", reg.classes.len());
         for k in &reg.classes {
@@ -1307,7 +1307,7 @@ pub(crate) fn ty_table_asm() -> String {
         }
         // State block: writable, word 0 points to the type table.
         let _ = writeln!(out, ".section .data");
-        let _ = writeln!(out, ".align 16");
+        let _ = writeln!(out, "{}", crate::target::align(16));
         let _ = writeln!(out, "{}:", STATE_LABEL);
         let _ = writeln!(out, "    .quad {}", TABLE_LABEL);
         let _ = writeln!(out, "    .zero {}", STATE_SIZE - 8);
