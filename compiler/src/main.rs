@@ -53,6 +53,7 @@ mod simd;
 mod sizeof;
 mod sema_generic;
 mod sema_match;
+mod strength;
 mod strings;
 mod strtype;
 mod types;

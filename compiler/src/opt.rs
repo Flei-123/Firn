@@ -56,6 +56,8 @@ pub struct OptStats {
     pub hoisted: usize,
     /// edges threaded past a bool confluence
     pub threaded: usize,
+    /// ROUND 82: places at which `strength.rs` replaced an instruction
+    pub strength: usize,
 }
 
 // ----------------------------------------------------- Pass register ---
@@ -136,6 +138,12 @@ pub const PASSES: &[PassInfo] = &[
         scope: Scope::Func,
         debug_preserving: true,
         what: "propagate copies, algebraic identities",
+    },
+    PassInfo {
+        name: "strength",
+        scope: Scope::Func,
+        debug_preserving: true,
+        what: "negated comparison, brcond over a negation, unsigned / and % by a power of two",
     },
     PassInfo {
         name: "cse",
@@ -294,6 +302,11 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig) {
             let c = crate::mem2reg::copy_propagate(f);
             st.copies += c;
             changed |= c > 0;
+        }
+        if cfg.runs("strength") {
+            let n = crate::strength::run(f);
+            st.strength += n;
+            changed |= n > 0;
         }
         if cfg.runs("cse") {
             let e = cse(f);
