@@ -2,7 +2,7 @@
 
 Reference: `SPEC.md` §3.2 (three levels), §3.4 (`Rc[T]`, `Weak[T]`,
 `Arc[T]`), §3.6 (raw pointers), `DESIGN_GOALS.md` §2 (fallible allocation),
-`../karstos-browser/FIRN-ANFORDERUNGEN.md` requirement **S7**.
+`../osum-browser/FIRN-ANFORDERUNGEN.md` requirement **S7**.
 
 This file describes what is in the tree, how it is used, and **what is
 deliberately missing**. Everything claimed here is backed by a test program
