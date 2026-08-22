@@ -25,6 +25,18 @@ cd "$(dirname "$0")"
 ROOT=$(pwd)
 # FIRNC_BIN kann auf einen anderen Compiler zeigen (Selbstpruefung des Skripts).
 FIRNC="${FIRNC_BIN:-$ROOT/compiler/target/release/firnc}"
+# ROUND 72: the build level this script proves, made explicit.
+#
+# Every check below is about a pass that runs at the FULL level only
+# (`opt::Level::allows_all`) -- constant folding, dead code, inlining, CSE,
+# LICM, register allocation. Without a flag that used to be `release-fast`,
+# because `OptConfig::default()` happened to say so; round 72 corrected the
+# default to `dev-fast` (which runs only the debug preserving passes) and
+# this script silently started measuring a compiler that was not supposed
+# to fold anything at all -- ten of its checks failed for that reason and
+# not one of them was about the round. Exactly the same trap `test.sh`'s
+# `mode=opt` fell into, in the file next door.
+LVL="--opt-level=release-fast"
 WORK="$ROOT/.opt-work"
 
 echo "== baue Compiler =="
@@ -74,11 +86,11 @@ while IFS='|' read -r FILE WANT MARK; do
     raw="$WORK/$base.raw.fir"
     opt="$WORK/$base.opt.fir"
     echo "-- $FILE"
-    if ! "$FIRNC" --emit=fir-raw "$FILE" > "$raw"; then
+    if ! "$FIRNC" $LVL --emit=fir-raw "$FILE" > "$raw"; then
         bad "$FILE: --emit=fir-raw schlug fehl"
         continue
     fi
-    if ! "$FIRNC" --emit=fir-opt "$FILE" > "$opt"; then
+    if ! "$FIRNC" $LVL --emit=fir-opt "$FILE" > "$opt"; then
         bad "$FILE: --emit=fir-opt schlug fehl"
         continue
     fi
@@ -136,8 +148,8 @@ while IFS='|' read -r FILE PAT RMIN OMAX; do
     base=$(basename "$FILE" .fi)
     raw="$WORK/$base.raw.fir"
     opt="$WORK/$base.opt.fir"
-    "$FIRNC" --emit=fir-raw "$FILE" > "$raw"
-    "$FIRNC" --emit=fir-opt "$FILE" > "$opt"
+    "$FIRNC" $LVL --emit=fir-raw "$FILE" > "$raw"
+    "$FIRNC" $LVL --emit=fir-opt "$FILE" > "$opt"
     n_raw=$(grep -cF "$PAT" "$raw" || true)
     n_opt=$(grep -cF "$PAT" "$opt" || true)
     if [ "$n_raw" -ge "$RMIN" ] && [ "$n_opt" -le "$OMAX" ]; then
@@ -150,7 +162,7 @@ done <<< "$PATTERNS"
 # ------------------------------------------------------------------ (e) ---
 echo "== Registerzuteilung im Assembler =="
 ASM="$WORK/regalloc_loop.s"
-"$FIRNC" --emit=asm -o "$ASM" tests/opt/regalloc_loop.fi
+"$FIRNC" $LVL --emit=asm -o "$ASM" tests/opt/regalloc_loop.fi
 BODY=$(awk '/^\.Lsum__bb2:/{f=1;next} /^\.Lsum__bb3:/{f=0} f' "$ASM")
 if [ -z "$BODY" ]; then
     bad "regalloc: Schleifenblock .Lsum__bb2 nicht gefunden"
@@ -205,9 +217,9 @@ done
 # gar nicht bemerken.
 echo "== LICM: schleifeninvariante Rechnung im Vorkopf =="
 LIC="$WORK/licm_hoist.opt.fir"
-"$FIRNC" --emit=fir-opt tests/opt/licm_hoist.fi > "$LIC"
+"$FIRNC" $LVL --emit=fir-opt tests/opt/licm_hoist.fi > "$LIC"
 RAW="$WORK/licm_hoist.raw.fir"
-"$FIRNC" --emit=fir-raw tests/opt/licm_hoist.fi > "$RAW"
+"$FIRNC" $LVL --emit=fir-raw tests/opt/licm_hoist.fi > "$RAW"
 rumpf_roh=$(awk '/^bb2:/{f=1;next} /^bb3:/{f=0} f' "$RAW" | grep -c 'mul\.u64' || true)
 rumpf_opt=$(awk '/^bb2:/{f=1;next} /^bb3:/{f=0} f' "$LIC" | grep -c 'mul\.u64' || true)
 vorkopf_opt=$(awk '/^bb0:/{f=1;next} /^bb1:/{f=0} f' "$LIC" | grep -c 'mul\.u64' || true)
