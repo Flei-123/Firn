@@ -53,21 +53,25 @@ Measured with `tools/bench82/run.sh`, best of five, buffers of 8 MiB
 
 | workload | before this round | after | OpenSSL / gzip | behind by |
 |---|---|---|---|---|
-| **SHA-256** | 26.7 MiB/s | **894.1 MiB/s** | 1374 MiB/s | **1.54x** |
-| **AES-128-CBC encrypt** | 6.33 MiB/s | **575.7 MiB/s** | 1013 MiB/s | **1.76x** |
-| **AES-128-CBC decrypt** | 4.71 MiB/s | **692.8 MiB/s** | 1013 MiB/s | **1.46x** |
-| **AES-128-CFB8** | 0.38 MiB/s | **26.9 MiB/s** | 36.6 MiB/s | **1.36x** |
-| DEFLATE level 6 | see §5 | see §5 | see §5 | see §5 |
+| **SHA-256** | 26.5 MiB/s | **833.2 MiB/s** | 1365.9 MiB/s | **1.64x** |
+| **AES-128-CBC encrypt** | 7.2 MiB/s | **538.1 MiB/s** | 1009.8 MiB/s | **1.88x** |
+| **AES-128-CBC decrypt** | 4.6 MiB/s | **604.5 MiB/s** | 1009.8 MiB/s | **1.67x** |
+| **AES-128-CFB8** | 0.5 MiB/s | **23.4 MiB/s** | 36.1 MiB/s | **1.54x** |
+| DEFLATE level 6 | 11.0 MiB/s | 11.0 MiB/s | `gzip -6` 20.1 MiB/s | **1.83x** |
 
-The gain over the scalar path is **33x** for SHA-256, **91x** for AES-CBC
-encryption, **147x** for AES-CBC decryption and **71x** for CFB8.
+The gain over the scalar path is **31.4x** for SHA-256, **74.7x** for AES-CBC
+encryption, **131.4x** for AES-CBC decryption and **46.8x** for CFB8. (Those
+are the ratios of one and the same run of `tools/bench82/run.sh`; the scalar
+figures there are measured over smaller buffers, which is why they differ a
+little from the isolated measurements quoted elsewhere in this file. Every
+number in this table comes from the same run.)
 
 The round asked for "factor 2 instead of 60 resp. 190". **All four are at
 1.4 to 1.8.** The target is met, and CFB8 — the one at 3000x — is now the
 closest of the four.
 
-**Why the "before" figures differ from the round's table** (26.7 against 22.6,
-6.33 against 5.50, 0.38 against 0.34): those are the SAME implementations,
+**Why the "before" figures differ from the round's table** (26.5 against 22.6,
+7.2 against 5.50, 0.5 against 0.34): those are the SAME implementations,
 measured with a different harness. `tools/stdlib81/run.sh` measures 8 MiB in
 one call and includes the key schedule; `tools/bench82/run.sh` takes the best
 of five and starts the clock after the schedule is built. The difference is
@@ -288,8 +292,229 @@ exactly as written.
 
 ## 5. DEFLATE, the optimizer, the register allocation, the self compile
 
-*(measured numbers in §5.1–§5.4 below; the sections are filled in from the
-runs of this round)*
+### 5.1 DEFLATE — the honest factor of two, unchanged
+
+| | Firn | `gzip -6` | behind by |
+|---|---|---|---|
+| DEFLATE level 6 | **11.0 MiB/s** | 20.1 MiB/s | **1.83x** |
+| inflate | 20.0 MiB/s | | — |
+| CRC-32 (table driven, scalar) | 167.4 MiB/s | | — |
+
+**On literally the same octets**: `tools/bench82/speed.fi dump` writes the test
+data out and `gzip -6` gets that file. A comparison against different input is
+not a comparison, and DEFLATE is more sensitive to its input than anything
+else in this table — the same implementation measures 11 MiB/s on structured
+data and several hundred on a stream of one repeated octet.
+
+**Nothing was done to DEFLATE in this round, deliberately.** A factor of 1.83
+against thirty years of tuned C, in a language whose compiler has no vector
+unit for it and hands out ten integer registers, is the honest number the
+round called it. The two things that would move it are a better match finder
+(lazy matching over more chain steps) and `pclmulqdq` for the CRC — the second
+one is now *possible* (`__pclmulqdq` exists), and it is not this round's work.
+
+`crc32` is listed because the intrinsic `__crc32_u64` (SSE4.2) now exists and
+the table driven implementation of `lib/std/deflate.fi` does **not** use it:
+`crc32` the instruction computes CRC-32**C** (Castagnoli polynomial), gzip
+needs CRC-32 (IEEE). They are different functions and one cannot stand in for
+the other. Written down here so that nobody "optimises" it later and breaks
+every gzip file this library ever writes.
+
+### 5.2 The optimizer — three cases it was leaving
+
+Found the way the round asked: small Firn programs, `objdump -d`, and
+`gcc -O2` on the same C next to it. Three differences were real. Everything
+else the existing passes already had — `lea` for address arithmetic, `imul` by
+a power of two as `shl`, common subexpressions, and the fusion of `cmp` with
+`jcc` when a `brcond` reads a comparison directly.
+
+The new pass is `compiler/src/peephole.rs`, registered as `strength` and
+debug preserving, so it runs at `dev-fast` too.
+
+**1. A negated comparison.** `if !(a < b)`, block `bb0` of the function:
+
+```
+before (8 instructions)                after (2)
+    cmp r8, r9                             cmp r8, r9
+    setl al                                jl .Lnegcmp__bb2
+    movzx r10d, al
+    mov rax, r10
+    xor eax, 1
+    mov r9, rax
+    test r9b, r9b
+    jnz .Lnegcmp__bb1
+```
+
+`gcc -O2` writes `cmp rdi, rsi ; setge al` for the same thing. The `not` of a
+comparison IS a comparison, with the opposite operator.
+
+**Floating point does not join in**, and this is the one trap in the
+transformation: `!(a < b)` and `a >= b` are the same for integers and
+DIFFERENT for IEEE-754. With a NaN on either side `a < b` is false, so
+`!(a < b)` is true, while `a >= b` is false as well — every ordering
+comparison with NaN is false. The guard is `!ty.is_float()`, and there is a
+module test for it (`a_float_comparison_stays_as_it_is`).
+
+**2. `brcond` over a negation.** `if !flag` for a `flag` that is not a
+comparison stayed `xor 1 ; test ; jnz`. A branch that swaps its two targets
+does the same thing without the negation, and the negation then falls to dead
+code elimination. This also catches the case where the negated thing is a call
+result or a loaded octet.
+
+**3. Unsigned `/` and `%` by a power of two.**
+
+```
+a / 8, before (5)              after (2)      gcc -O2
+    mov r9, 8                      mov r9, r8     mov rax, rdi
+    mov rax, r8                    shr r9, 3      shr rax, 0x3
+    mov rcx, r9
+    xor edx, edx
+    div rcx
+```
+
+`div r64` costs some 20 to 40 cycles on this processor against one for `shr`.
+`a % 8` was the same instruction reading `rdx`, and becomes `and r9, 7`.
+
+**Only unsigned.** For a signed type the two are not the same: Firn rounds
+towards zero, an arithmetic right shift towards minus infinity, so `-1 / 2` is
+`0` and `-1 >> 1` is `-1`. There is a module test for that too
+(`signed_division_stays_a_division`). The correct signed sequence needs a bias
+and three more instructions; it is §7 point 3.
+
+**Measured, on a program and not on a listing.** A 200,000,000 pass loop with
+`i % 1024`, `i / 256` and one negated comparison in it
+(`--no-pass=strength` switches the pass off, everything else identical):
+
+```
+without the pass   3041 ms      21 instructions in the loop function
+with the pass       341 ms      13 instructions
+                   8.9x         same result (138)
+```
+
+On the compiler's own source the pass costs 33.9 ms of 3120 ms (1.1 % of the
+optimizer) and is worth its place.
+
+### 5.3 The register allocation — measured, and one clear finding
+
+`FIRN_RA_STATS=1` makes `regalloc.rs` write one line per function;
+`tools/bench82/ra_report.py` adds them up. Three real workloads:
+
+| | functions | on the base path | values | in registers | SPILLED |
+|---|---|---|---|---|---|
+| DEFLATE (`tools/stdlib81/deflate_cli.fi`) | 667 | 37 (**5.3 %** of the code) | 35,640 | 38.1 % | **45.2 %** |
+| the JS engine (`lib/js/run_main.fi`) | 1,561 | 222 (**23.6 %** of the code) | 148,127 | 29.3 % | **50.4 %** |
+| the compiler itself (`bin/firnc1.fi`) | 1,308 | 6 (**0.1 %**) | 174,459 | 19.0 % | **57.2 %** |
+
+("Spilled" is what is left after the values that need no storage at all are
+taken out: constants that stand as an immediate at every use site, and
+`alloca` addresses folded into the operand. Those are counted separately and
+are not spills.)
+
+**The finding, and it is a number the round did not have before: 23.6 % of the
+JavaScript engine's code gets NO register allocation at all.** 222 functions,
+32,819 instructions, every value in a frame slot, every use a memory access.
+The reason is a single line in `regalloc.rs::unsupported_basic`: *"f64 in the
+value set"*. That is restriction F1 of round 71 — the linear scan knows only
+the integer registers, so one `f64` anywhere in a function puts the WHOLE
+function on the base path, integer code and all. In a JavaScript engine, where
+every number is an `f64`, that is a quarter of the code.
+
+For comparison: the compiler itself has almost no floating point and reaches
+0.1 %. DEFLATE sits between the two at 5.3 %.
+
+That is the single biggest thing an "optimizer round" could still buy, and it
+is not this round's work — it is a second register class in the linear scan
+(§7 point 5). Round 82 made the same restriction apply to `v128` and then
+built the xmm cache of §3.3 so that vector code does not pay for it; the
+floating point side has no such cache and pays in full.
+
+The hottest single functions, for scale:
+
+```
+gctext__gctext_write      68657 instructions, 56359 values, 463 in registers, 65.9 % spilled
+unicode_id__id_continue_fill   2906 instructions, 3018 values,   1 in registers, 53.6 % spilled
+deflate__emit_block             689 instructions, 1000 values, 396 in registers, 49.4 % spilled
+```
+
+`unicode_id__id_continue_fill` getting exactly ONE register out of 3,018
+values is not a typo and not explained by this round. It is a generated table
+filler; the intervals in it apparently cross something the allocator will not
+hand a register across. Named here, not fixed.
+
+### 5.4 The compiler on itself — where the time goes
+
+`firnc --timings` (new in this round) prints the wall clock per phase.
+`bin/firnc1.fi`, 30,643 lines of Firn, `--opt-level=release-fast`:
+
+```
+  optimizer             3120.3 ms   61.1 %
+  codegen                975.4 ms   19.1 %
+  as + ld                668.5 ms   13.1 %
+  sema                   157.4 ms    3.1 %
+  lex+parse              106.7 ms    2.1 %
+  lower                   73.1 ms    1.4 %
+  mono                     5.0 ms    0.1 %
+  write .s                 2.8 ms    0.1 %
+  comptime                 0.0 ms    0.0 %
+total 5110.3 ms
+```
+
+**The three most expensive phases are the optimizer (61 %), the code generator
+(19 %) and the assembler/linker (13 %).** Everything the front end does
+together is 7 %.
+
+`FIRN_PASS_TIMINGS=1` goes one level deeper, into the optimizer:
+
+```
+  mem2reg             834.0 ms   26.5 %      5,840 fixpoint rounds in all
+  licm                802.4 ms   25.5 %      (over ~1,300 functions, so
+  merge-blocks        604.3 ms   19.2 %       about 4.5 rounds per function)
+  inline              291.9 ms    9.3 %
+  cse                 182.1 ms    5.8 %
+  dce                 175.0 ms    5.6 %
+  fold                110.4 ms    3.5 %
+  copyprop             37.9 ms    1.2 %
+  thread-bool          35.6 ms    1.1 %
+  strength             33.9 ms    1.1 %   <- the new pass of §5.2
+  simplify-term        27.6 ms    0.9 %
+  bce                  15.8 ms    0.5 %
+```
+
+**The cheap improvement that came out of it**, and it is cheap in both senses:
+`licm` and `mem2reg::promote_single_store` both built a **dominator matrix**
+before they had established that there was anything to do. `licm` did it for
+every function, including the ones without a loop; `promote_single_store` did
+it for every function, including the ones without an `alloca`. Two guards:
+
+* `licm`: if EVERY control flow edge goes strictly forward in the block
+  numbering, the graph is acyclic and there is no natural loop. Sufficient,
+  not necessary — a function numbered differently still takes the long way.
+* `promote_single_store`: no cells, no dominators.
+
+Measured, best of three, same machine, and **the emitted assembler is
+character-identical** (that is the point — this is a pure cost saving, not a
+change of behaviour):
+
+```
+without the two guards   4919 / 5033 ms
+with them                4725 / 4720 ms      -5.1 %
+```
+
+Five percent is not a revolution. It is what an honest measurement of a
+lightly instrumented compiler gives, and it is reported as such. The 61 % that
+the optimizer costs is not waste — it is 5,840 fixpoint rounds doing real
+work; making it substantially cheaper means changing the fixpoint itself
+(running a pass only when something it depends on changed), and that is a
+round of its own.
+
+For Justin's six hour acceptance the relevant number is a different one:
+`tools/fixpoint.sh` measured **stage 2 in 13,017 ms and stage 3 in 39,800 ms**
+in this round's run, stage 2 and stage 3 character-identical over 648,723
+lines of assembly. Stage 3 is `firnc1` compiling itself, and `firnc1` has no
+register allocation at all (`lib/firnc1/codegen.fi`, every value in a frame
+slot). That factor of three is where the acceptance time sits, and closing it
+means giving the self-hosted code generator registers — not making `firnc0`
+faster.
 
 ---
 
@@ -328,7 +553,7 @@ the one place that would have to learn it.
 2. **GCM.** It needs `pclmulqdq` — which this round DOES expose
    (`__pclmulqdq`) — plus an authentication design, a tag comparison that must
    be constant time, and nonce discipline. Half a GCM is worse than none.
-3. **Signed division by a power of two.** `strength.rs` converts the unsigned
+3. **Signed division by a power of two.** `peephole.rs` converts the unsigned
    case to `shr`/`and`. Signed is not the same thing: Firn rounds towards zero,
    an arithmetic shift towards minus infinity, so `-1 / 2` is `0` and
    `-1 >> 1` is `-1`. The correct sequence needs a bias (`sar`/`add`/`sar`) and
@@ -358,7 +583,7 @@ New:
 
 ```
 compiler/src/simd.rs            the 42 intrinsics, cpuid, the xmm register cache
-compiler/src/strength.rs        the three optimizer cases of §5.2
+compiler/src/peephole.rs        the three optimizer cases of §5.2
 lib/std/cpu.fi                  the feature bits with names
 lib/std/crypto/accel.fi         AES-NI and SHA-NI, and nothing else
 tools/bench82/speed.fi          the stopwatch

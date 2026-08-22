@@ -274,6 +274,11 @@ pub(crate) fn promote_single_store(f: &mut Func) -> usize {
         return 0;
     }
     let cells = scan_cells(f);
+    // ROUND 82: no cell, nothing to promote — and above all no dominator
+    // matrix to build. A function without an `alloca` paid for it before.
+    if cells.is_empty() {
+        return 0;
+    }
     let dom = dominators(f);
     let mut map: HashMap<Val, Val> = HashMap::new();
     for (cell, u) in cells.iter() {
