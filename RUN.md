@@ -172,7 +172,7 @@ boot of the kernel example with **both** compilers.
 | What | Command | Measured result |
 |---|---|---|
 | **ELF object instead of a binary** | `firnc -o /tmp/k.o demos/kernel/core.fi && readelf -h /tmp/k.o \| grep Type` | `REL (Relocatable file)` -- no `ld`, no `_start` |
-| **No undefined symbols (except `karst_panic`)** | `nm -u /tmp/k.o` | empty, or exactly `karst_panic` if the program uses checked arithmetic (round 72, SPEC section 13) -- `demos/kernel/start.s` defines it, resolved when the object is actually linked (next row) |
+| **No undefined symbols (except `osum_panic`)** | `nm -u /tmp/k.o` | empty, or exactly `osum_panic` if the program uses checked arithmetic (round 72, SPEC section 13) -- `demos/kernel/start.s` defines it, resolved when the object is actually linked (next row) |
 | **No system call in the code** | `objdump -d /tmp/k.o \| grep -c syscall` | `0` |
 | **It boots** | `ld -n -T demos/kernel/linker.ld --defsym=KERN_START=_F0.kern_start -o /tmp/k.elf /tmp/start.o /tmp/k.o && objcopy -O elf32-i386 /tmp/k.elf /tmp/k.mb && qemu-system-x86_64 -kernel /tmp/k.mb -serial stdio -display none` | `FIRN: profile kernel ist` / `freestanding.` |
 | **`syscall` in the kernel profile** | `firnc -o /tmp/x tests/neg/free_syscall_in_kernel.fi` | `error: 'syscall' does not exist in profile 'kernel'` with line:column |

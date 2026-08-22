@@ -1,8 +1,8 @@
 # Firn -- language specification
 
 **Working title:** Firn - **File extension:** `.fi` - **As of:** v0.2 (2026-08-13)
-**Author:** Justin (GitHub: Flei123) - **Target systems:** Karstos / the karst
-kernel **and the Karstos browser engine**, x86_64
+**Author:** Justin (GitHub: Flei123) - **Target systems:** Osum / the osum
+kernel **and the Osum browser engine**, x86_64
 
 > **A companion document.** `DESIGN_GOALS.md` deals with ten known weak spots of
 > today's languages (function colours, fallible allocation, capability modules, a
@@ -24,12 +24,12 @@ kernel **and the Karstos browser engine**, x86_64
 
 ### v0.2 (2026-08-13) -- the browser requirements worked in
 
-The trigger: decision **B1** in the project `karstos-browser` -- *every line of
+The trigger: decision **B1** in the project `osum-browser` -- *every line of
 executable code in the browser engine is Firn.* With that, Firn is no longer a
 language for a kernel but **critical path number 1** of an ecosystem that
 comprises the DOM, layout, a JavaScript engine, TLS/crypto and a rasterizer.
 The authoritative requirements document:
-`../karstos-browser/FIRN-ANFORDERUNGEN.md` (13 sections, acceptance in 13).
+`../osum-browser/FIRN-ANFORDERUNGEN.md` (13 sections, acceptance in 13).
 
 Four decisions from v0.1 are **revised** as a result. They stand here openly,
 because a specification that hides its about-turns is worthless:
@@ -58,7 +58,7 @@ A language for kernels and applications, the prototype `firnc0` built and tested
 
 ## 0. Why a language of our own at all
 
-Karstos is written in Rust today. That works, but it produces a dependency that
+Osum is written in Rust today. That works, but it produces a dependency that
 Justin does not want in the long run: Rust decides what the kernel may do (Rust
 editions, `no_std` limits, LLVM target support, compiler bugs, project politics).
 Whoever builds an operating system of their own but obtains the compiler from
@@ -121,7 +121,7 @@ the profile for the whole compilation unit.
 | `Rc[T]` (counted, acyclic) | not available | available, explicit |
 | **`Gc[T]` (tracing collector)** | **not available** | available, **opt-in per type** (3.5) |
 | **Unwinding / `throw`** (5.3) | **forbidden** | allowed in `#[unwinds]` functions |
-| Panic on an out-of-range index | calls `karst_panic`, configurable | run-time panic handler |
+| Panic on an out-of-range index | calls `osum_panic`, configurable | run-time panic handler |
 | Floating point | only with `#[allow_fp]` (the FPU state!) | free |
 | Stack depth checkable (`#[max_stack]`) | yes | yes |
 | Target binary format | ELF object, freestanding | ELF executable |
@@ -415,7 +415,7 @@ never sees a vtable.
 | Automatic dereferencing | `p.*.field`, not `p.field`. The exception: `Gc[T]` is dereferenced automatically, because `node.*.children.*` would be unreadable -- that is deliberate and it stands here |
 | A preprocessor | `comptime if` replaces `#ifdef` |
 | **JIT / code generation at run time** | `FIRN-ANFORDERUNGEN.md` 11: the JS engine is a bytecode interpreter. Ladybird removed its JIT again in 2024, V8 has a jitless mode |
-| **Dynamic libraries** | linked statically; saves `dlopen` in Karstos entirely (`R5`) |
+| **Dynamic libraries** | linked statically; saves `dlopen` in Osum entirely (`R5`) |
 | **C++ interop** | at B1 there is no C++ code. That is exactly what cost Ladybird 1.5 years with Swift |
 
 ---
@@ -449,7 +449,7 @@ walks a million times.
 ### 5.2 Programming errors -- `panic`
 
 An index out of range, division by zero, a violated assertion. Not handleable,
-calls a handler (`app`: a message plus abort; `kernel`: `karst_panic`).
+calls a handler (`app`: a message plus abort; `kernel`: `osum_panic`).
 `--release-fast` switches the checks off; the case is then undefined and that
 stands in the documentation as such.
 
@@ -845,7 +845,7 @@ attack surface at B1 and there is no hardened foreign library.
 
 `FIRN-ANFORDERUNGEN.md` 11 makes clear what is **not** needed:
 
-* **no aarch64 backend**, until Karstos targets ARM
+* **no aarch64 backend**, until Osum targets ARM
 * **no WASM backend** -- WASM *execution* in the browser is an interpreter
   written in Firn, not a compiler backend
 * **no JIT**, no code generation at run time
@@ -1096,7 +1096,7 @@ brackets a line break has never ended anything and still does not. Proof:
   roll over), so a program does not have to switch off checking everywhere
   else just to get that one line. `profile kernel` (2) has no runtime of
   its own to fall back on: a checked operation that goes out of range
-  there calls an EXTERNAL symbol `karst_panic` that the kernel author
+  there calls an EXTERNAL symbol `osum_panic` that the kernel author
   must define -- an undefined reference at the final link (not at
   compile time, since the object file is freestanding on its own) is the
   honest outcome for a kernel that never does; `demos/kernel/start.s`
@@ -1123,7 +1123,7 @@ brackets a line break has never ended anything and still does not. Proof:
   return value in `rax`, 16 byte alignment, `rbx, rbp, r12-r15` preserved).
   `extern "C"` is the same. In addition (`L13`): a documented, stable
   **Firn-to-Firn ABI** across component boundaries, because the browser consists
-  of separate Karstos components that talk to each other.
+  of separate Osum components that talk to each other.
 * `syscall(nr, a1, ..., a6)` is built in and maps directly onto `syscall`
   (`rax, rdi, rsi, rdx, r10, r8, r9`).
 
@@ -2108,8 +2108,8 @@ R3. **`-x` works on `f64`.** 14.1.f64 named it as implemented and it was
 5. **Conditional moves.** Reject conservatively (the current choice) or use
    run-time flags like Rust's drop flags?
 6. **Package management** (`W1`, a MUST) -- the design is still outstanding.
-7. **Alignment with Karstos.** As soon as `firnc` compiles kernel modules, the
-   calling convention has to be checked against the existing Rust code in karst.
+7. **Alignment with Osum.** As soon as `firnc` compiles kernel modules, the
+   calling convention has to be checked against the existing Rust code in osum.
 
 ---
 
@@ -2141,7 +2141,7 @@ quietly fallen off the table. The state of the implementation is in
 | `G1`-`G4` compile-time code generation | 6.4 |
 | `C1`-`C7` crypto and constant time | 9 |
 | `B1`-`B13` the standard library | 8, 3.4 -- the rest in ROADMAP phase 3 |
-| `R1`-`R6` the runtime on Karstos | ROADMAP phase 6 |
+| `R1`-`R6` the runtime on Osum | ROADMAP phase 6 |
 | `W1`-`W10` tools | 10.4 |
 
 ---

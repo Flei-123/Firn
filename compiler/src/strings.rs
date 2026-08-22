@@ -905,8 +905,8 @@ mod tests {
         assert_eq!(div, t.intern(b"div"));
         assert!(div < 64, "frequent atoms have small numbers");
         assert_ne!(div, t.intern(b"span"));
-        let new = t.intern(b"karstos");
-        assert_eq!(t.text(new), Some(&b"karstos"[..]));
+        let new = t.intern(b"osum");
+        assert_eq!(t.text(new), Some(&b"osum"[..]));
         assert_eq!(t.len(), STATIC_ATOMS.len() + 1);
     }
 

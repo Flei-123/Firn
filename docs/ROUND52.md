@@ -386,7 +386,7 @@ Honestly and completely:
    `firnc0`; and that is exactly where the 15 negative tests check them.
 10. **No `#[max_stack]`.** SPEC §2 lists it for both profiles; it still
     does not exist.
-11. **A panic calls no `karst_panic`.** SPEC §2 names that for the
+11. **A panic calls no `osum_panic`.** SPEC §2 names that for the
     kernel profile; stage 0 has no bounds checking at all (SPEC §14,
     item 3).
 

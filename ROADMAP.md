@@ -1,14 +1,14 @@
 # Firn -- roadmap
 
 **As of:** 2026-08-14 (v0.2) - **Related:** `SPEC.md`, `DESIGN_GOALS.md`, `ACCEPTANCE.md`,
-`../karstos-browser/FIRN-ANFORDERUNGEN.md`, `../karstos-browser/PLAN-FIRN.md`
+`../osum-browser/FIRN-ANFORDERUNGEN.md`, `../osum-browser/PLAN-FIRN.md`
 Time figures = the effort of one person with AI support, not calendar time.
 
 ---
 
 ## What has changed since v0.1
 
-Since the browser decision (**B1**: every line of executable code in the Karstos
+Since the browser decision (**B1**: every line of executable code in the Osum
 browser engine is Firn), Firn is **critical path number 1** of the whole
 ecosystem. That changes the roadmap in three places:
 
@@ -64,7 +64,7 @@ type checker, codegen for a subset) shrink from months to days. The late phases
 (self-hosting, an optimizer within <= 2x of Rust, a GC in a soak test,
 stability) hardly shrink at all.
 
-**Honest expectation:** *usable for small Karstos system programs* in 6-12
+**Honest expectation:** *usable for small Osum system programs* in 6-12
 months. *Self-hosting compiler* in 1-2 years. *Acceptance according to
 `FIRN-ANFORDERUNGEN.md` 13 passed* -- that is, ready for the first browser
 library -- realistically **2-4 years**. `PLAN-FIRN.md` budgets 27 person-months
@@ -191,17 +191,17 @@ The numbers and commands are in `ACCEPTANCE.md`, the reproduction in `RUN.md`.
 All six items from `ACCEPTANCE.md` green. Only after that may block 1 start in
 the browser project. **That is the actual goal of this roadmap.**
 
-## Phase 6 -- runtime on Karstos (`R1`-`R6`)
+## Phase 6 -- runtime on Osum (`R1`-`R6`)
 
 * The Firn runtime ported: memory, threads, files, time, I/O
-* Separation of runtime <-> platform layer, cross-compiler to Karstos in CI
-* Firn's own test suite passes **on Karstos** (`R6`)
-* Runs in parallel with the Karstos kernel work (K1-K10)
+* Separation of runtime <-> platform layer, cross-compiler to Osum in CI
+* Firn's own test suite passes **on Osum** (`R6`)
+* Runs in parallel with the Osum kernel work (K1-K10)
 
-## Phase 7 -- Karstos kernel modules in Firn
+## Phase 7 -- Osum kernel modules in Firn
 
-* Check the kernel profile against real karst code (ABI, inline assembly, MMIO)
-* First Karstos module in Firn (candidate: a small, isolated driver)
+* Check the kernel profile against real osum code (ABI, inline assembly, MMIO)
+* First Osum module in Firn (candidate: a small, isolated driver)
 * Then step-by-step replacement -- **no big rewrite**
 
 ## Phase 8 -- v1.0: stability
@@ -213,7 +213,7 @@ the browser project. **That is the actual goal of this roadmap.**
 
 ## Without a date (deliberately dropped)
 
-* **aarch64 backend** -- only once Karstos targets ARM
+* **aarch64 backend** -- only once Osum targets ARM
 * **WASM backend** -- not needed for the browser; "Firn instead of JavaScript in
   the browser" stays a distant goal, but it blocks nothing
 * **JIT**, dynamic libraries, C++ interop -- permanently excluded
@@ -221,7 +221,7 @@ the browser project. **That is the actual goal of this roadmap.**
   collides with static linking (`R5`) and with inlining across module boundaries
   (`P1`). Honest assessment: not worth it. The door stays open through
   `#[hot]`, no more than that
-* **Stable ABI** (`#[abi_stable]`, `#[frozen]`) -- only once Karstos needs
+* **Stable ABI** (`#[abi_stable]`, `#[frozen]`) -- only once Osum needs
   interchangeable system components, phase 7/8. Until then IPC is the better
   route
 
@@ -243,8 +243,8 @@ Named openly, so that it comes as no surprise:
 4. **Self-reference.** A compiler that compiles itself is excellent at hiding
    its own bugs. Countermeasure: the fixpoint check and a test suite that is
    taken seriously.
-5. **Three building sites at once.** Karstos, Firn *and* the browser is a lot.
-   Firn must not slow Karstos down -- which is why Rust stays in the kernel
+5. **Three building sites at once.** Osum, Firn *and* the browser is a lot.
+   Firn must not slow Osum down -- which is why Rust stays in the kernel
    until Firn demonstrably fits better.
 6. **Foundations built shut.** If the foundation work from `DESIGN_GOALS.md`
    10 is skipped, the SoA layout, `comptime` `emit` and the `--dev-fast` stage

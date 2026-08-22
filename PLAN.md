@@ -142,7 +142,7 @@ tests, 18 optimizer proofs), `cargo build --release` without warnings.
 **Related:** `SPEC.md` v0.2 (3 memory model, 4.4 inheritance, 6.3 match,
 8 strings/WTF-16, 9 constant time, 10.3 performance target, 14/14.1),
 `ROADMAP.md` phase 2, `ACCEPTANCE.md` (six items),
-`../karstos-browser/FIRN-ANFORDERUNGEN.md` (read only).
+`../osum-browser/FIRN-ANFORDERUNGEN.md` (read only).
 
 **Principle of this round:** `SPEC.md` is the contract. Whoever deliberately
 builds something narrower records it in **14.1** as a numbered item and does NOT

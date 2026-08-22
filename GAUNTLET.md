@@ -8,7 +8,7 @@ The firnc compiler works and is mature enough for this job. `bash test.sh` curre
 - ACCEPTANCE.md -- the six acceptance items. Item 3 (tokenizer) stands at **0 of 6,810 (0.0 %)**. This round is supposed to turn that into a real number.
 - DESIGN_GOALS.md 2 (fallible allocation) and 10 (which foundations are in place).
 - docs/FIR.md, docs/SELF_HOSTING.md.
-READ ONLY: ../karstos-browser/TODO-FIRN.md block 0 (task 0.8), ../karstos-browser/FIRN-ANFORDERUNGEN.md 13 item 3.
+READ ONLY: ../osum-browser/TODO-FIRN.md block 0 (task 0.8), ../osum-browser/FIRN-ANFORDERUNGEN.md 13 item 3.
 
 PRESENT and usable -- do not rebuild:
 - **Module system**: `import path.module`, `export { ... }`, several .fi files linked into one binary.
