@@ -23,8 +23,17 @@ its own centre and four points just inside its corners -- exactly where an
 overlap is decided -- and a coarse grid is added on top so that the empty
 places are covered too.
 
+ROUND 78: the browser side is FROZEN. `--reference` reads the probe points
+AND Chromium's answer at each of them out of
+`tools/layout/reference/stack.json` -- no browser, no network. The points
+are frozen along with the answers on purpose: a probe point is a fixed
+place on the page, and freezing both makes the question as well as the
+answer independent of today's engine. `--write-reference` asks a live
+browser once and writes the file.
+
 Usage:
     python3 tools/layout/stack.py <binary> [--json out.json] [--show N]
+                                 [--reference] [--write-reference]
                                  [--dir tools/layout/stackcases]
 """
 
@@ -94,8 +103,13 @@ RESULT = re.compile(
     r'<script type="application/json" id="firn-stack">(.*?)</script>', re.S)
 
 
+LAST_EXE = None
+LAST_WINDOW = (0, 0)
+
+
 def measure(cases, timeout=60):
     """cases: [(name, html, points)] -> {name: {'boxes':…, 'hits':…}}"""
+    global LAST_EXE, LAST_WINDOW
     exe = chrome_mod.find_chromium()
     if exe is None:
         raise RuntimeError("no Chromium found (set FIRN_CHROMIUM)")
@@ -103,6 +117,14 @@ def measure(cases, timeout=60):
     try:
         shutil.copyfile(FONT, os.path.join(work, "FirnMetric.ttf"))
         out = {}
+        # ROUND 72/78: `--window-size` is the WINDOW, not the layout
+        # viewport. Ask the browser what it really hands out and correct
+        # for it -- the same probe harness.py uses. Without this the
+        # probe points near the bottom edge are 87 px off on the Chromium
+        # of Debian 12, and that error would be FROZEN into the reference.
+        win_w, win_h = chrome_mod.window_size_for(exe, work, VIEWPORT_W,
+                                                  VIEWPORT_H, timeout)
+        LAST_EXE, LAST_WINDOW = exe, (win_w, win_h)
         for i, (name, text, points) in enumerate(cases):
             path = os.path.join(work, "case%04d.html" % i)
             probe = PROBE.replace("__POINTS__", json.dumps(points))
@@ -111,7 +133,7 @@ def measure(cases, timeout=60):
                 fh.write(probe)
             cmd = [exe, "--headless", "--no-sandbox", "--disable-gpu",
                    "--disable-dev-shm-usage", "--hide-scrollbars",
-                   "--window-size=%d,%d" % (VIEWPORT_W, VIEWPORT_H),
+                   "--window-size=%d,%d" % (win_w, win_h),
                    "--force-device-scale-factor=1",
                    "--allow-file-access-from-files",
                    "--host-resolver-rules=MAP * ~NOTFOUND",
@@ -186,6 +208,8 @@ def main():
     args = sys.argv[1:]
     binary = args[0]
     json_out, show, cases_dir = None, 5, DEFAULT_CASES
+    use_reference = False
+    write_reference = False
     i = 1
     while i < len(args):
         if args[i] == "--json":
@@ -197,6 +221,12 @@ def main():
         elif args[i] == "--dir":
             cases_dir = args[i + 1]
             i += 2
+        elif args[i] == "--reference":
+            use_reference = True
+            i += 1
+        elif args[i] == "--write-reference":
+            write_reference = True
+            i += 1
         else:
             i += 1
 
@@ -214,11 +244,50 @@ def main():
                                                           len(htmls)))
         return 1
     parsed = [parse_engine(b) for b in blocks]
-    jobs = [(names[i], htmls[i], sample_points(parsed[i][0]))
-            for i in range(len(names))]
-    measured = measure(jobs)
+
+    sys.path.insert(0, HERE)
+    import reference as ref_mod
+    ref_head = None
+    if use_reference and not write_reference:
+        ref_head, data = ref_mod.load("stack")
+        print("   %s" % ref_mod.describe(ref_head))
+        jobs = []
+        measured = {}
+        for i, name in enumerate(names):
+            entry = data.get(name)
+            if entry is None:
+                jobs.append((name, htmls[i], []))
+                measured[name] = None
+                continue
+            jobs.append((name, htmls[i],
+                         [(int(p[0]), int(p[1])) for p in entry["points"]]))
+            measured[name] = {"boxes": entry["boxes"], "hits": entry["hits"]}
+        missing = [n for n in names if data.get(n) is None]
+        if missing:
+            print("   NOT IN THE REFERENCE (%d): %s"
+                  % (len(missing), ", ".join(missing[:5])))
+    else:
+        jobs = [(names[i], htmls[i], sample_points(parsed[i][0]))
+                for i in range(len(names))]
+        measured = measure(jobs)
+        if write_reference:
+            ref_head = ref_mod.header(
+                "the topmost element at each probe point out of "
+                "document.elementFromPoint()",
+                LAST_EXE, LAST_WINDOW, (VIEWPORT_W, VIEWPORT_H))
+            data = {}
+            for i, name in enumerate(names):
+                got = measured.get(name)
+                if got is None:
+                    continue
+                data[name] = {"points": [list(p) for p in jobs[i][2]],
+                              "boxes": got["boxes"], "hits": got["hits"]}
+            out = ref_mod.save("stack", ref_head, data)
+            print("   written: %s (%d cases)" % (out, len(data)))
 
     report = {"cases": [], "points_ok": 0, "points_total": 0}
+    if ref_head is not None:
+        report["reference"] = ref_head
     complaints = []
     for i, name in enumerate(names):
         rows, order = parsed[i]
