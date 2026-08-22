@@ -189,6 +189,35 @@ for cc in 0 1; do
     echo "  compiler $cc: release-fast $(wc -c < "$TMPD/cost.f$cc.s") octets of assembly, dev-fast $(wc -c < "$TMPD/cost.d$cc.s")"
 done
 
+# ---------------------------------------------------------------------------
+echo "== 6. the optimiser sees the checked arithmetic =="
+# ROUND 72, second pass. `release-safe` is the level that CHECKS and runs
+# every optimisation pass. Between the two passes of this round it ran the
+# passes and folded nothing at all, because the constant folder matched
+# `Op::Bin` and the arithmetic had become `Op::CheckedBin`. Two numbers, not
+# one: everything foldable has to be GONE after the optimiser, and a checked
+# operation that really goes out of range has to still be THERE -- folding
+# that one away would delete a panic the program promised.
+before=$("$FIRNC" --opt-level=release-safe --emit=fir-raw tools/checked/fold.fi 2>/dev/null | grep -cE 'checked_|_wrap|_sat')
+after=$("$FIRNC" --opt-level=release-safe --emit=fir-opt tools/checked/fold.fi 2>/dev/null | grep -cE 'checked_|_wrap|_sat')
+if [ "$before" -lt 5 ]; then bad "fold: only $before checked/wrap/sat operations before the optimiser"; else ok; fi
+if [ "$after" -ne 0 ]; then bad "fold: $after checked/wrap/sat operations survive the optimiser, expected 0"; else ok; fi
+echo "  foldable arithmetic: $before operations before the optimiser, $after after"
+kept=$("$FIRNC" --opt-level=release-safe --emit=fir-opt tools/checked/add_i32.fi 2>/dev/null | grep -c 'checked_add')
+if [ "$kept" -lt 1 ]; then bad "fold: the out-of-range addition was folded away"; else ok; fi
+for lvl in $LEVELS_CHECKED $LEVEL_FAST; do
+    for cc in 0 1; do
+        [ "$cc" = 0 ] && C="$FIRNC" || C="$FC1"
+        if ! build "$C" "$lvl" tools/checked/fold.fi "$TMPD/fold.$cc"; then
+            bad "fold [$lvl] compiler $cc did not build"
+            continue
+        fi
+        "$TMPD/fold.$cc" > /dev/null 2>&1
+        rc=$?
+        if [ "$rc" -ne 42 ]; then bad "fold [$lvl] compiler $cc exit $rc, expected 42"; else ok; fi
+    done
+done
+
 echo
 echo "CHECKS PASSED: $PASS"
 echo "CHECKS FAILED: $FAIL"
