@@ -140,19 +140,6 @@ pub fn aarch64(n: i64) -> Option<A64> {
     TABLE.iter().find(|(k, _)| *k == n).map(|(_, v)| *v)
 }
 
-/// The number a `svc #0` really has to carry, for the messages of the code
-/// generator: `Some(number)` when it is one, `None` when the call has no
-/// equivalent.
-pub fn aarch64_number(n: i64) -> Option<u32> {
-    match aarch64(n) {
-        Some(A64::Direct(x))
-        | Some(A64::AtFdcwd(x))
-        | Some(A64::ForkClone(x))
-        | Some(A64::Dup3(x)) => Some(x),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,8 +155,8 @@ mod tests {
 
     #[test]
     fn write_is_not_the_same_number_on_both_machines() {
-        assert_eq!(aarch64_number(1), Some(64));
-        assert_eq!(aarch64_number(60), Some(93));
+        assert_eq!(aarch64(1), Some(A64::Direct(64)));
+        assert_eq!(aarch64(60), Some(A64::Direct(93)));
     }
 
     #[test]
