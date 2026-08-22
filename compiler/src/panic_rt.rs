@@ -17,6 +17,11 @@
 //!     print: file, line, the operator, English words),
 //!   * `esi` = length of that text,
 //!   * `rdx` = the first operand's value (sign extended to 64 bits),
+//!   * `r9` = 1 when the two values are to be read as UNSIGNED, 0 when
+//!     signed. Round 72 shipped without it and printed every value through
+//!     the SIGNED digit routine, so `u64::MAX + 1` reported `(a=-1 b=1)` --
+//!     a number that does not occur anywhere in the program the reader is
+//!     looking at. Found while making `tests/690_lowering_core.fi` pass.
 //!   * `rcx` = the second operand's value -- for a checked cast (`as`)
 //!     there IS only one value, so `rcx` carries the same one again
 //!     rather than a misleading 0 (`emit_checked_cast` below jumps in
@@ -183,8 +188,14 @@ pub fn trampoline_asm() -> String {
         s.push_str("    push r12\n");
         s.push_str("    push r13\n");
         s.push_str("    push r14\n");
+        s.push_str("    push r15\n");
         s.push_str("    mov r12, rdi\n");
         s.push_str("    mov r13, rsi\n");
+        // ROUND 72, second pass: `r9` says whether the two numbers are to be
+        // read as unsigned. It has to survive both calls to
+        // `.Lpanic_i64_dec` (which clobbers rax/rcx/rdx/r8/r9), so it moves
+        // into a register the trampoline saved itself.
+        s.push_str("    mov r15, r9\n");
         // `b` (rcx) is rescued BEFORE the first call to `.Lpanic_i64_dec`:
         // that routine uses rcx/rdx itself as its own division scratch, so
         // reading rcx again after the FIRST call (for `a`) would read
@@ -223,6 +234,7 @@ pub fn trampoline_asm() -> String {
         // shift rsp by 8 while rbx (the buffer's fixed base) stays where it
         // was, throwing the second write's start address and length off by
         // exactly that much (the bug this comment replaces).
+        s.push_str("    pop r15\n");
         s.push_str("    pop r14\n");
         s.push_str("    mov rax, 231\n");
         s.push_str("    mov rdi, 101\n");
@@ -235,6 +247,10 @@ pub fn trampoline_asm() -> String {
         // unsigned `div` afterwards is correct for every possible `i64`,
         // that one value included.
         s.push_str(".Lpanic_i64_dec:\n");
+        // An UNSIGNED type never has a minus sign and never negates: its
+        // bit pattern IS the number. Only the signed reading looks at bit 63.
+        s.push_str("    test r15, r15\n");
+        s.push_str("    jnz .Lpanic_dec_nonneg\n");
         s.push_str("    test rax, rax\n");
         s.push_str("    jns .Lpanic_dec_nonneg\n");
         s.push_str("    mov byte ptr [rbx], 45\n");
@@ -340,6 +356,7 @@ impl SiteCounter {
 /// `code` is one of the `PANIC_*` constants; `msg_label` names a string
 /// already interned with [`intern`]; `a_reg`/`b_reg` hold the two original
 /// (64-bit sign extended) operand values.
+#[allow(clippy::too_many_arguments)]
 fn emit_trampoline_jump(
     e: &mut Emitter,
     code: u64,
@@ -347,6 +364,7 @@ fn emit_trampoline_jump(
     msg_text: &str,
     a_reg: &str,
     b_reg: &str,
+    unsigned: bool,
 ) {
     if a_reg != "rdx" {
         e.line(&format!("mov rdx, {}", a_reg));
@@ -357,6 +375,7 @@ fn emit_trampoline_jump(
     e.line(&format!("lea rdi, [rip + {}]", msg_label));
     e.line(&format!("mov esi, {}", msg_len(msg_text)));
     e.line(&format!("mov r8, {}", code));
+    e.line(&format!("mov r9, {}", u32::from(unsigned)));
     e.line(&format!("jmp {}", TRAMPOLINE));
 }
 
@@ -416,6 +435,15 @@ pub(crate) fn emit_checked_bin(
     match op {
         BinOp::Add => e.line(&format!("add {}, {}", narrow("rax", bits), narrow("rcx", bits))),
         BinOp::Sub => e.line(&format!("sub {}, {}", narrow("rax", bits), narrow("rcx", bits))),
+        // `imul r, r/m` (the two operand form) exists for 16, 32 and 64
+        // bits ONLY -- `imul al, cl` is not an instruction, and `as`
+        // rejected the whole file the first time a program multiplied two
+        // `i8` under a checked build level (round 72 shipped that way; no
+        // test happened to do it). The ONE operand form is the 8 bit
+        // answer: `imul cl` computes ax = al * cl and sets OF exactly when
+        // the product does not fit back into al -- which is the question
+        // being asked.
+        BinOp::Mul if ty.signed() && bits == 8 => e.line("imul cl"),
         BinOp::Mul if ty.signed() => {
             e.line(&format!("imul {}, {}", narrow("rax", bits), narrow("rcx", bits)))
         }
@@ -444,7 +472,7 @@ pub(crate) fn emit_checked_bin(
     e.raw(&format!("{}:", site_label));
     e.line("pop rcx");
     e.line("pop rdx");
-    emit_trampoline_jump(e, panic_code_of(op), &label, msg, "rdx", "rcx");
+    emit_trampoline_jump(e, panic_code_of(op), &label, msg, "rdx", "rcx", !ty.signed());
     e.raw(&format!("{}:", ok));
 }
 
@@ -480,7 +508,7 @@ pub(crate) fn emit_checked_div(
     e.line("pop rcx");
     e.line("pop rdx");
     let label0 = intern(msg_zero);
-    emit_trampoline_jump(e, PANIC_DIV0, &label0, msg_zero, "rdx", "rcx");
+    emit_trampoline_jump(e, PANIC_DIV0, &label0, msg_zero, "rdx", "rcx", !ty.signed());
     e.raw(&format!("{}:", past_zero));
     if ty.signed() {
         // MIN / -1: two compares with a shared "definitely fine" target —
@@ -516,7 +544,7 @@ pub(crate) fn emit_checked_div(
         e.line("pop rcx");
         e.line("pop rdx");
         let label_r = intern(msg_range);
-        emit_trampoline_jump(e, PANIC_DIV_OVERFLOW, &label_r, msg_range, "rdx", "rcx");
+        emit_trampoline_jump(e, PANIC_DIV_OVERFLOW, &label_r, msg_range, "rdx", "rcx", false);
     }
     e.raw(&format!("{}:", past_range));
     // Nothing went out of range: the stack still holds the two rescued
@@ -592,7 +620,7 @@ pub(crate) fn emit_checked_cast(
     e.raw(&format!("{}:", site_label));
     e.line("pop rdx");
     let label = intern(msg);
-    emit_trampoline_jump(e, PANIC_CAST, &label, msg, "rdx", "rdx");
+    emit_trampoline_jump(e, PANIC_CAST, &label, msg, "rdx", "rdx", !from.signed());
     e.raw(&format!("{}:", ok));
     // Nothing was lost: restore the ORIGINAL value from the stack (the
     // comparison above widened it past `to`'s own width again) and narrow
