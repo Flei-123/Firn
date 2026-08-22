@@ -42,6 +42,20 @@
 #      (lib/js/, in Firn) against the official suite test262, against node
 #      as a second engine, and in an endurance run with a counter check
 #      (tools/js/run.sh, docs/ROUND63.md).
+#  36. Sockets against the OUTSIDE (tools/net/run.sh, round 76): `nc`
+#      pushes 1 MiB through an echo server written in Firn and the checksums
+#      are compared, `curl` fetches an HTTP answer, sixteen connections run
+#      at the same time -- plus the counter-checks (a closed port refuses, a
+#      killed server does not leave the client hanging).
+#  37. NBT against Notch's reference file (tools/nbt/run.sh, round 76):
+#      `bigtest.nbt` is rebuilt out of lib/std/nbt.fi and compared OCTET FOR
+#      OCTET, and a second parser in Python reads the same files field for
+#      field, in both directions.
+#  38. A Minecraft client really gets into the world (tools/mcserver/run.sh,
+#      round 76): server list ping, the whole login through to Join Game,
+#      the same login dribbled out ONE OCTET PER WRITE, sixteen logins at
+#      the same time -- and, if node is there, node-minecraft-protocol as a
+#      third implementation nobody here wrote.
 #  18. Package and project system (tools/packages/run.sh): manifest, search
 #      order, visibility, build driver -- in BOTH compilers.
 #  19. Freestanding compilation (tools/freestanding/run.sh, round 52):
@@ -753,6 +767,61 @@ if [ "$R74RC" -eq 0 ]; then
 else
     bad "tools/js/round74.sh failed (see .test-work/round74.log)"
     grep -E 'FAILED|BELOW|DIFFERENT' "$WORK/round74.log" | head -10 | sed 's/^/   /'
+fi
+
+echo "== 36. sockets against the outside: nc, curl, sixteen at once (tools/net/run.sh, ROUND 76) =="
+# `tests/1600_net_echo.fi` in section 3 pushes 1 MiB between a server thread
+# and a client IN THE SAME PROCESS. That is necessary and not enough: both
+# ends are this repository, and two ends that misunderstand the same thing
+# agree perfectly. Here the other end is somebody else's -- netcat is from
+# 1996 and curl checks a status line, headers and Content-Length and says so
+# when they are wrong. Plus the throughput as a NUMBER and the
+# counter-checks: a port on which nothing listens has to refuse, and a
+# server killed mid transfer must not leave its client hanging.
+NET_MB=${NET_MB:-1} bash tools/net/run.sh > "$WORK/net.log" 2>&1 && NETRC=0 || NETRC=$?
+if [ "$NETRC" -eq 0 ]; then
+    ok
+    grep -E '^  (release-fast|no-opt|dev-fast):' "$WORK/net.log" | sed 's/^/ /'
+else
+    bad "tools/net/run.sh failed (see .test-work/net.log)"
+    grep -E 'FAIL|RESULT' "$WORK/net.log" | head -10 | sed 's/^/   /'
+fi
+
+echo "== 37. NBT against Notch's reference file (tools/nbt/run.sh, ROUND 76) =="
+# `bigtest.nbt` is the example of the NBT specification. `tools/nbt/bigtest.fi`
+# rebuilds it out of `lib/std/nbt.fi`, and the first 1,543 octets have to be
+# IDENTICAL to the published file -- not "parses the same", identical. That
+# cannot be satisfied by a reader and a writer that are wrong in the same
+# way. On top of it a second parser in Python turns the same files into the
+# same canonical text, in BOTH directions, and the counter-checks (truncated,
+# tag 13, negative length, 256 levels of nesting) all have to be refused.
+bash tools/nbt/run.sh > "$WORK/nbt.log" 2>&1 && NBTRC=0 || NBTRC=$?
+if [ "$NBTRC" -eq 0 ]; then
+    ok
+    grep -E '^  (reference|release-fast|no-opt|dev-fast)' "$WORK/nbt.log" | sed 's/^/ /'
+else
+    bad "tools/nbt/run.sh failed (see .test-work/nbt.log)"
+    grep -E 'FAIL|RESULT' "$WORK/nbt.log" | head -10 | sed 's/^/   /'
+fi
+
+echo "== 38. a Minecraft client gets into the world (tools/mcserver/run.sh, ROUND 76) =="
+# `demos/mcserver` speaks protocol 765 (1.20.4) in offline mode. Three
+# clients check it and none of them takes its word for anything:
+# `tools/mcserver/harness.py` (own VarInt reader, own framing, own NBT
+# parser -- and it logs into the VANILLA server too, so a failure here is
+# this server's fault), the same harness with ONE OCTET PER WRITE, and
+# node-minecraft-protocol, which validates every field against
+# `minecraft-data` and throws when something does not fit. The UUID for
+# 'Notch' has to be the one the real vanilla server derives.
+# MC_FAST=1 runs only the optimised build stage.
+MC_FAST=${MC_FAST:-0} bash tools/mcserver/run.sh > "$WORK/mcserver.log" 2>&1 && MCRC=0 || MCRC=$?
+if [ "$MCRC" -eq 0 ]; then
+    ok
+    grep -E '^  [a-z-]+: +(ping: version|OK |the UUID|dribbled|nmp: login|OK nmp|flood:|play: chunk verified|config: Registry|SKIPPED|ping :|login:  *[0-9]|soak:|counter-check )' \
+        "$WORK/mcserver.log" | sed 's/^/ /'
+else
+    bad "tools/mcserver/run.sh failed (see .test-work/mcserver.log)"
+    grep -E 'FAIL|RESULT' "$WORK/mcserver.log" | head -10 | sed 's/^/   /'
 fi
 
 TOTAL=$((PASS + FAIL))
