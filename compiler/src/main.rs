@@ -49,6 +49,7 @@ mod prof;
 mod parser;
 mod regalloc;
 mod sema;
+mod simd;
 mod sizeof;
 mod sema_generic;
 mod sema_match;

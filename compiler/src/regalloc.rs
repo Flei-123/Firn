@@ -1425,7 +1425,7 @@ pub(crate) fn emit_func_ra(e: &mut Emitter, f: &Func) -> Option<Result<(), Strin
     // The function is emitted into a buffer of its own first; after that the
     // register descriptor post pass strikes spill stores with an immediate
     // reload of the same value (445x statically in the tokenizer run, round 37).
-    let mut tmp = Emitter { out: String::new(), debug_funcs: Vec::new() };
+    let mut tmp = Emitter { out: String::new(), debug_funcs: Vec::new(), xmm: Default::default() };
     match emit_with(&mut tmp, f, &a) {
         Ok(()) => {
             let nv = f.val_types.len();
@@ -1814,6 +1814,15 @@ fn unsupported_basic(f: &Func) -> Option<String> {
     if f.val_types.iter().any(|t| t.is_float()) {
         return Some("f64 in the value set".into());
     }
+    // ROUND 82: `v128` is a second register class of its own (xmm) with
+    // sixteen byte slots. The linear scan hands out integer registers only —
+    // a function with a vector value therefore goes over the base path of
+    // `codegen_x86.rs`, which has the xmm value cache of `simd.rs`.
+    if f.val_types.iter().any(|t| *t == FTy::V128) || f.params.iter().any(|t| *t == FTy::V128)
+        || f.ret == FTy::V128
+    {
+        return Some("v128 in the value set".into());
+    }
     if f.blocks.is_empty() {
         return Some("no blocks".into());
     }
@@ -1843,6 +1852,23 @@ fn unsupported_basic(f: &Func) -> Option<String> {
                 // therefore runs without register allocation — slower, but
                 // provably right. Stated honestly in docs/ROUND52.md.
                 Op::Asm { .. } => return Some("Inline-Assembler".into()),
+                // ROUND 82: of the vector instructions exactly the three with
+                // a SCALAR result get through here (`crc32`, `cpu_features`) —
+                // they touch no xmm register and need no cache. Everything
+                // that produces or consumes a `v128` goes over the base path;
+                // `f.val_types` has already caught that above, but an
+                // instruction whose result is scalar while an operand is a
+                // vector would slip through, so it is named here too.
+                Op::Simd { kind, .. } => {
+                    if !matches!(
+                        kind,
+                        crate::simd::SimdKind::Crc32U8
+                            | crate::simd::SimdKind::Crc32U64
+                            | crate::simd::SimdKind::CpuFeatures
+                    ) {
+                        return Some("vector instruction".into());
+                    }
+                }
                 Op::MmioLoad { .. } | Op::MmioStore { .. } => {
                     return Some("MMIO access".into())
                 }
@@ -2234,6 +2260,31 @@ fn jcc_inverse(jcc: &str) -> &'static str {
 fn emit_inst(e: &mut Emitter, ra: &Ra, i: &Inst) -> Result<(), String> {
     let ty = i.ty;
     match &i.op {
+        // ROUND 82: only the three vector instructions with a SCALAR result
+        // reach this path (`supported()` keeps the rest away). They compute in
+        // rax/rcx, which are never the home of a value here.
+        Op::Simd { kind, args, .. } => match kind {
+            crate::simd::SimdKind::Crc32U8 => {
+                let d = i.dst.ok_or("internal error: crc32 without target")?;
+                ra.load_full(e, "rax", args[0]);
+                ra.load_full(e, "rcx", args[1]);
+                e.line("crc32 eax, cl");
+                ra.store_dst(e, d, "rax");
+            }
+            crate::simd::SimdKind::Crc32U64 => {
+                let d = i.dst.ok_or("internal error: crc32 without target")?;
+                ra.load_full(e, "rax", args[0]);
+                ra.load_full(e, "rcx", args[1]);
+                e.line("crc32 rax, rcx");
+                ra.store_dst(e, d, "rax");
+            }
+            crate::simd::SimdKind::CpuFeatures => {
+                let d = i.dst.ok_or("internal error: cpu_features without target")?;
+                crate::simd::emit_cpuid_pub(e);
+                ra.store_dst(e, d, "rax");
+            }
+            _ => return Err("internal error: v128 reached the register path".to_string()),
+        },
         Op::Const(c) => {
             let d = i.dst.ok_or("internal error: const without target")?;
             if ra.a.imm(d).is_some() {
@@ -3062,7 +3113,7 @@ mod tests {
         let mut f = Func::new("f", vec![FTy::I64; 7], FTy::I64);
         f.set_term(0, Term::Ret(Some(6)));
         assert!(supported(&f));
-        let mut e = Emitter { out: String::new(), debug_funcs: Vec::new() };
+        let mut e = Emitter { out: String::new(), debug_funcs: Vec::new(), xmm: Default::default() };
         emit_func_ra(&mut e, &f).expect("register path responsible").expect("codegen");
         assert!(e.out.contains("qword ptr [rbp+16]"), "{}", e.out);
     }
@@ -3080,7 +3131,7 @@ mod tests {
         let rc = g.push(0, FTy::I32, Op::Cast { src: r, from: FTy::I64 });
         g.set_term(0, Term::Ret(Some(rc)));
         assert!(supported(&g));
-        let mut e = Emitter { out: String::new(), debug_funcs: Vec::new() };
+        let mut e = Emitter { out: String::new(), debug_funcs: Vec::new(), xmm: Default::default() };
         emit_func_ra(&mut e, &g).expect("register path responsible").expect("codegen");
         assert!(e.out.contains("sub rsp, 16"), "{}", e.out);
         assert!(e.out.contains("mov qword ptr [rsp+0], rax"), "{}", e.out);
