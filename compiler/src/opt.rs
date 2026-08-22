@@ -197,7 +197,12 @@ pub struct OptConfig {
 
 impl Default for OptConfig {
     fn default() -> Self {
-        OptConfig { level: Level::ReleaseFast, disabled: Vec::new() }
+        // DESIGN_GOALS.md line 554: "--dev-fast (default)" -- the CLI default
+        // WITHOUT --opt-level=/--no-opt has to be `DevFast`, not `ReleaseFast`.
+        // Round 72 found this line lying: `firnc -o x file.fi` silently built
+        // release-fast (unchecked arithmetic) while every doc and the `Level`
+        // enum comment above said dev-fast is the default.
+        OptConfig { level: Level::DevFast, disabled: Vec::new() }
     }
 }
 

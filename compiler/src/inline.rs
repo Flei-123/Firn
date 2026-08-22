@@ -279,6 +279,25 @@ fn remap_op(op: &Op, mv: &dyn Fn(Val) -> Val) -> Op {
         Op::Const(c) => Op::Const(*c),
         Op::Alloca { size, align } => Op::Alloca { size: *size, align: *align },
         Op::Bin(o, a, b) => Op::Bin(*o, mv(*a), mv(*b)),
+        // ROUND 72 — checked/wrap/sat arithmetic: same operand shape as
+        // `Op::Bin`, the message text travels unchanged (it names no FIR
+        // value, only file/line/operator text baked in at lowering time).
+        Op::BinWrapSat { kind, op, a, b } => {
+            Op::BinWrapSat { kind: *kind, op: *op, a: mv(*a), b: mv(*b) }
+        }
+        Op::CheckedBin { op, a, b, msg } => {
+            Op::CheckedBin { op: *op, a: mv(*a), b: mv(*b), msg: msg.clone() }
+        }
+        Op::CheckedDiv { op, a, b, msg_zero, msg_range } => Op::CheckedDiv {
+            op: *op,
+            a: mv(*a),
+            b: mv(*b),
+            msg_zero: msg_zero.clone(),
+            msg_range: msg_range.clone(),
+        },
+        Op::CheckedCast { src, from, msg } => {
+            Op::CheckedCast { src: mv(*src), from: *from, msg: msg.clone() }
+        }
         Op::Cmp { op, ty, a, b } => Op::Cmp { op: *op, ty: *ty, a: mv(*a), b: mv(*b) },
         Op::Un(o, a) => Op::Un(*o, mv(*a)),
         Op::Cast { src, from } => Op::Cast { src: mv(*src), from: *from },
