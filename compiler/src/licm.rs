@@ -60,6 +60,26 @@ pub(crate) fn hoist_loop_invariants(f: &mut Func) -> usize {
     if n < 2 {
         return 0;
     }
+    // ROUND 82 — the cheap pre-check. Measured on `bin/firnc1.fi`: this pass
+    // was 25.5 % of the optimizer, and the optimizer 61 % of the whole
+    // compile. Most of that went on functions WITHOUT A LOOP, which still
+    // paid for `preds` and the dominator matrix before the back edge search
+    // found nothing.
+    //
+    // If EVERY edge goes strictly forward in the block numbering, the control
+    // flow graph is acyclic and there is no natural loop to find. That is a
+    // sufficient condition, not a necessary one: a function whose numbering
+    // is not in reverse post order may have a backward edge without a loop,
+    // and then the full search runs as before. Cheap, sound, and it never
+    // changes the result.
+    let any_backward = f
+        .blocks
+        .iter()
+        .enumerate()
+        .any(|(b, blk)| blk.term.successors().into_iter().any(|s| (s as usize) <= b));
+    if !any_backward {
+        return 0;
+    }
     let preds = crate::mem2reg::preds(f);
     let dom = crate::mem2reg::dominators(f);
     let mut moved = 0;

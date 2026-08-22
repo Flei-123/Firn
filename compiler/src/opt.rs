@@ -56,7 +56,7 @@ pub struct OptStats {
     pub hoisted: usize,
     /// edges threaded past a bool confluence
     pub threaded: usize,
-    /// ROUND 82: places at which `strength.rs` replaced an instruction
+    /// ROUND 82: places at which `peephole.rs` replaced an instruction
     pub strength: usize,
 }
 
@@ -356,7 +356,7 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut Pas
         }
         if cfg.runs("strength") {
             let t = std::time::Instant::now();
-            let n = crate::strength::run(f);
+            let n = crate::peephole::run(f);
             st.strength += n;
             changed |= n > 0;
             clk.add("strength", t);
