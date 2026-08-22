@@ -33,6 +33,7 @@ import gc
 import iface
 
 export { Parser, par_new, par_new_module, par_free, par_run, par_error, par_tree,
+    par_file_set,
     par_not_core, par_tree_take, par_gen_set, par_mu_set,
     par_fe_set, par_time_set, par_gc_set, par_if_set }
 
@@ -235,6 +236,18 @@ struct Parser {
     hoist: Vec[u32],
     // > 0: an interpolation is already running -- nesting is not supported yet.
     interp: u32,
+    // ROUND 79: the number of the file being parsed, in the file table of
+    // the TREE (`ast.file_add`). It goes into the packed position of every
+    // node this parser makes, so that a message out of a module names the
+    // module and not the root file.
+    file: u32,
+    // ROUND 79: `#[allow_escape]` in front of the next function (attrs.rs).
+    esc_pending: u32,
+    // ROUND 79: `[T; _]` is only allowed where an initializer follows that
+    // the length can be taken from -- the type of a `let`/`var`. `let_stmt`
+    // switches this on around exactly that call; everywhere else a `_` is
+    // refused right here, so `ast.LEN_INFER` never leaves the parser.
+    infer_len_ok: bool,
 }
 
 fn par_new(lx: u64) -> Parser {
@@ -249,6 +262,7 @@ fn par_new(lx: u64) -> Parser {
         link_pending: 0, link_pending_set: false, export_pending: 0, tpoff: 0, sonr: -1,
         local: vec_new[u32](), llimit: vec_new[u32](),
         hoist: vec_new[u32](), interp: 0,
+        file: 0, esc_pending: 0, infer_len_ok: false,
     }
     p.n = lexer.lex_count(lx as *mut lexer.Lexer)
     return p
@@ -261,6 +275,24 @@ fn par_new_module(lx: u64, tree: u64, alias: u32) -> Parser {
     p.foreign = tree
     p.alias = alias
     return p
+}
+
+// ROUND 79: which file of the tree's file table this parser reads. Again
+// BEFORE `par_run`.
+fn par_file_set(p: *mut Parser, f: u32) { (*p).file = f }
+
+// The packed position of the token `k` ahead (round 79). At the end of the
+// stream the position of the last token, so that a message never loses its
+// place.
+fn at_pos(p: *mut Parser, k: usize) -> u64 {
+    var i: usize = (*p).pos + k
+    if i >= (*p).n {
+        if (*p).n == 0 {
+            return ast.pos_pack((*p).file, 1, 1)
+        }
+        i = (*p).n - 1
+    }
+    return ast.pos_pack((*p).file, lexer.lex_line(lx(p), i), lexer.lex_col(lx(p), i))
 }
 
 // Register the store for the generic templates. MUST happen before `par_run`.
@@ -738,11 +770,31 @@ fn ty(p: *mut Parser) -> u32 {
         if !expect(p, A_SEMI) {
             return ast.NOTHING
         }
-        if !actual(p, A_INT) {
-            complain(p)
-            return ast.NOTHING
+        // ROUND 79 (gap 10 of docs/ROUND66.md): `[u8; _]` -- the length comes
+        // out of the initializer. `let_stmt` fills it in as soon as it has
+        // read the initializer, so `LEN_INFER` never reaches the type
+        // resolution.
+        var len: u64 = ast.LEN_INFER
+        if actual(p, A_IDENT) {
+            var us: [u8; 1] = "_"
+            let itn: *mut intern.Interner = lexer.lex_names(lx(p))
+            if !intern.intern_equal(itn, tok_nr(p, 0), (&us[0]) as u64, 1) {
+                complain(p)
+                return ast.NOTHING
+            }
+            // Only where an initializer follows -- a parameter, a field and
+            // a `const` have to write the number out.
+            if !(*p).infer_len_ok {
+                complain(p)
+                return ast.NOTHING
+            }
+        } else {
+            if !actual(p, A_INT) {
+                complain(p)
+                return ast.NOTHING
+            }
+            len = number(p)
         }
-        let len: u64 = number(p)
         next_bump(p)
         if !expect(p, A_RBRACKET) {
             return ast.NOTHING
@@ -1077,7 +1129,21 @@ fn mul_expr(p: *mut Parser) -> u32 {
     return left
 }
 
+// ROUND 79 -- the position of every OPERAND. `un_expr` is the point every
+// operand of an expression goes through, so one wrapper here gives `&x`,
+// `f(a)`, `x` and every literal the place of its FIRST token -- exactly
+// what `Expr::span` is in `firnc0`. Binary nodes get none and need none:
+// no message of the escape analysis points at one.
 fn un_expr(p: *mut Parser) -> u32 {
+    let at: u64 = at_pos(p, 0)
+    let e: u32 = un_expr_inner(p)
+    if ast.expr_pos(par_tree(p), e) == 0 {
+        ast.expr_pos_set(par_tree(p), e, at)
+    }
+    return e
+}
+
+fn un_expr_inner(p: *mut Parser) -> u32 {
     let a: u32 = kind(p, 0)
     var op: i32 = -1
     if a == A_MINUS { op = U_NEG as i32 }
@@ -2066,6 +2132,9 @@ fn block(p: *mut Parser) -> u32 {
             next_bump(p)
         }
     }
+    // ROUND 79: the closing brace is where the frame of this block dies --
+    // the escape analysis has to name that place.
+    let closing: u64 = at_pos(p, 0)
     eat(p, A_RBRACE)
     let off: u32 = vec_len[u32](&(*par_tree(p)).slist) as u32
     var i: usize = 0
@@ -2076,7 +2145,9 @@ fn block(p: *mut Parser) -> u32 {
     let len: u32 = vec_len[u32](&own) as u32
     vec_free[u32](&own)
     loc_off(p)
-    return ast.block_new(par_tree(p), off, len)
+    let bi: u32 = ast.block_new(par_tree(p), off, len)
+    ast.block_end_set(par_tree(p), bi, closing)
+    return bi
 }
 
 fn let_stmt(p: *mut Parser) -> u32 {
@@ -2093,7 +2164,10 @@ fn let_stmt(p: *mut Parser) -> u32 {
     next_bump(p)
     var t: u32 = ast.NOTHING
     if eat(p, A_COLON) {
+        // ROUND 79: `[T; _]` is allowed HERE and only here.
+        (*p).infer_len_ok = true
         t = ty(p)
+        (*p).infer_len_ok = false
         if t == ast.NOTHING {
             return ast.stmt_new(par_tree(p), ast.S_BREAK, 0, 0, 0, 0)
         }
@@ -2103,9 +2177,46 @@ fn let_stmt(p: *mut Parser) -> u32 {
     }
     let init: u32 = expr(p)
     end_stmt(p)
+    // ROUND 79: `[T; _]` -- now that the initializer has been read, the
+    // length is known. Only the OUTERMOST one; `[[u8; _]; 3]` stays an error.
+    if t != ast.NOTHING {
+        let b: *mut ast.Tree = par_tree(p)
+        if ast.t_kind(b, t) == ast.T_ARR && ast.t_b(b, t) == ast.LEN_INFER {
+            let n: u64 = literal_length(p, init)
+            if n == ast.LEN_INFER {
+                complain(p)
+                return ast.stmt_new(par_tree(p), ast.S_BREAK, 0, 0, 0, 0)
+            }
+            ast.ty_b_set(b, t, n)
+        }
+    }
     // Visible ONLY FROM NOW ON: `let x = x + 1` means the outer `x` on the right.
     loc_add(p, name)
     return ast.stmt_new(par_tree(p), kind_s, name, t, init, 0)
+}
+
+// ROUND 79: how many elements does this initializer have? `LEN_INFER` means
+// "not a literal". Twin of `Parser::literal_length` in
+// `compiler/src/parser.rs`.
+fn literal_length(p: *mut Parser, e: u32) -> u64 {
+    let b: *mut ast.Tree = par_tree(p)
+    let a: u32 = ast.e_kind(b, e)
+    // A text literal carries its array literal of octets inside (round 70);
+    // its length is the one that counts, a written `\0` included.
+    if a == ast.E_TEXT {
+        return literal_length(p, ast.e_a(b, e))
+    }
+    if a == ast.E_ALIT {
+        return ast.e_c(b, e) as u64
+    }
+    if a == ast.E_AWDH {
+        let n: u32 = ast.e_b(b, e)
+        if ast.e_kind(b, n) == ast.E_INT {
+            return ast.e_number(b, n)
+        }
+        return ast.LEN_INFER
+    }
+    return ast.LEN_INFER
 }
 
 fn if_stmt(p: *mut Parser) -> u32 {
@@ -2169,7 +2280,17 @@ fn return_stmt(p: *mut Parser) -> u32 {
     return ast.stmt_new(par_tree(p), ast.S_RET, value, 0, 0, 0)
 }
 
+// ROUND 79 -- the position of every statement, taken at its FIRST token.
+// `Stmt::span` in `firnc0` is the same place (`Parser::join` starts there),
+// so `return &x` gets reported at the `return` in both compilers.
 fn stmt(p: *mut Parser) -> u32 {
+    let at: u64 = at_pos(p, 0)
+    let s: u32 = stmt_inner(p)
+    ast.stmt_pos_set(par_tree(p), s, at)
+    return s
+}
+
+fn stmt_inner(p: *mut Parser) -> u32 {
     let a: u32 = kind(p, 0)
     if a == A_KWLET || a == A_KWVAR {
         return let_stmt(p)
@@ -2342,6 +2463,9 @@ fn param_list(p: *mut Parser) -> u32 {
             break
         }
         let name: u32 = tok_nr(p, 0)
+        // ROUND 79 (escape.fi): where the parameter stands. Its slot lies in
+        // the frame like any local, so `&p` can escape too.
+        let pat: u64 = at_pos(p, 0)
         next_bump(p)
         if !expect(p, A_COLON) {
             break
@@ -2350,7 +2474,8 @@ fn param_list(p: *mut Parser) -> u32 {
         if t == ast.NOTHING {
             break
         }
-        ast.param_add(par_tree(p), name, t)
+        let pidx: u32 = ast.param_add(par_tree(p), name, t)
+        ast.param_pos_set(par_tree(p), pidx, pat)
         loc_add(p, name)
         if !eat(p, A_COMMA) {
             break
@@ -2509,12 +2634,18 @@ fn fn_decl(p: *mut Parser) {
         (*p).mc_pending = 0
         (*p).int_pending = 0
         (*p).export_pending = 0
+        (*p).esc_pending = 0
         return
     }
     let body: u32 = block(p)
     loc_off(p)
     ast.fn_add(par_tree(p), name, poff, plen, ret, body, (*p).nogc_pending,
         (*p).mc_pending, (*p).int_pending, 0, 0, 0, (*p).export_pending)
+    // ROUND 79 (escape.fi): the way out and the place the frame dies.
+    let fi: usize = ast.fn_count(par_tree(p)) - 1
+    ast.fn_esc_set(par_tree(p), fi, (*p).esc_pending)
+    ast.fn_end_set(par_tree(p), fi, ast.block_end(par_tree(p), body))
+    (*p).esc_pending = 0
     (*p).nogc_pending = 0
     (*p).mc_pending = 0
     (*p).int_pending = 0
@@ -3109,12 +3240,15 @@ fn extensions_search(p: *mut Parser) {
                         // has one argument and is shaped differently --
                         // checked separately below).
                         var ec: [u8; 8] = "export_c"
+                        // Round 79: plus `#[allow_escape]` (escape.fi).
+                        var esw: [u8; 12] = "allow_escape"
                         let anr: u32 = lexer.lex_nr(lx(p), i + 2)
                         let itn: *mut intern.Interner = lexer.lex_names(lx(p))
                         ok_attr = intern.intern_equal(itn, anr, (&an[0]) as u64, 5) ||
                         intern.intern_equal(itn, anr, (&mc[0]) as u64, 12) ||
                         intern.intern_equal(itn, anr, (&iw[0]) as u64, 9) ||
                         intern.intern_equal(itn, anr, (&fw[0]) as u64, 8) ||
+                        intern.intern_equal(itn, anr, (&esw[0]) as u64, 12) ||
                         intern.intern_equal(itn, anr, (&ec[0]) as u64, 8)
                     }
                 }
@@ -3804,6 +3938,9 @@ fn attr(p: *mut Parser) {
     // ROUND 75 (attrs.rs, SPEC 14.5): `#[link_name(...)]` and `#[export_c]`.
     var ln: [u8; 9] = "link_name"
     var ec: [u8; 8] = "export_c"
+    // ROUND 79 (attrs.rs): `#[allow_escape]` -- the way out of the escape
+    // analysis, 0 arguments.
+    var esw: [u8; 12] = "allow_escape"
     let it: *mut intern.Interner = lexer.lex_names(lx(p))
     let is_nogc: bool = intern.intern_equal(it, tok_nr(p, 0), (&an[0]) as u64, 5)
     let is_mc: bool = intern.intern_equal(it, tok_nr(p, 0), (&mc[0]) as u64, 12)
@@ -3811,7 +3948,8 @@ fn attr(p: *mut Parser) {
     let is_fp: bool = intern.intern_equal(it, tok_nr(p, 0), (&fw[0]) as u64, 8)
     let is_link: bool = intern.intern_equal(it, tok_nr(p, 0), (&ln[0]) as u64, 9)
     let is_export: bool = intern.intern_equal(it, tok_nr(p, 0), (&ec[0]) as u64, 8)
-    if !is_nogc && !is_mc && !is_int && !is_fp && !is_link && !is_export {
+    let is_esc: bool = intern.intern_equal(it, tok_nr(p, 0), (&esw[0]) as u64, 12)
+    if !is_nogc && !is_mc && !is_int && !is_fp && !is_link && !is_export && !is_esc {
         complain(p)
         return
     }
@@ -3850,6 +3988,8 @@ fn attr(p: *mut Parser) {
         // `link_pending` is already set above.
     } else if is_export {
         (*p).export_pending = 1
+    } else if is_esc {
+        (*p).esc_pending = 1
     } else {
         (*p).nogc_pending = 1
     }

@@ -358,6 +358,38 @@ justification as a comment (`--deny=undocumented-unsafe`, the default in the
 `kernel` profile). Satisfies `L3` -- the rasterizer cannot be written fast
 without this exception.
 
+#### 3.6.1 A raw pointer must not outlive its frame (round 79)
+
+The address of a LOCAL -- a `let`/`var`, an array or a field of one, or a
+parameter, whose slot lies in the frame too -- must not leave the frame that
+local lives in:
+
+```firn
+fn bad() -> *mut i64 {
+    var x: i64 = 5
+    return &x          // error: x is dead on return, the pointer is not
+}
+```
+
+Checked at compile time by `compiler/src/escape.rs` and its twin
+`lib/firnc1/escape.fi`. Caught are: the return value, a write through a
+pointer that is not this frame's (an out parameter included), a store into a
+struct or an array that is returned, the argument of the thread primitive,
+and the handover to a function that KEEPS what it is given -- the last one
+without any annotation, because the compiler works that property out of the
+callee's body and drives it to a fixed point over the whole program.
+
+**This is not a lifetime system.** Where the analysis cannot decide, it
+allows; every such case is named in `docs/ROUND79.md` 4 instead of being
+guessed at. A false alarm would cost more than a missed case: it makes
+correct programs unbuildable and teaches everybody to switch the check off.
+
+**The way out** is `#[allow_escape]` in front of a function (14.2). A
+hardware address, a page table, a stack a thread is handed, and the stack
+pointer the collector needs for its conservative scan (3.5.3) do have to
+leave the frame. The attribute stays visible in the source and switches the
+check off for exactly that function -- never globally and never silently.
+
 ---
 
 ## 4. Where the ideas come from -- and what is deliberately missing
@@ -631,6 +663,28 @@ and a sequence of `u16` is not that.
 
 `""` is a valid, EMPTY `str` (`p = 0`, `n = 0`); as an array literal it stays
 an error, because an array needs at least one element.
+
+#### `[T; _]` -- the length comes out of the literal (round 79)
+
+```firn
+var greeting: [u8; _] = "hello"        // 5
+var terminated: [u8; _] = "abc\0"      // 4, the null octet counts
+var numbers: [i64; _] = [10, 20, 30]   // 3
+var zeros: [u8; _] = [7 as u8; 5]      // 5
+```
+
+Writing the count out by hand is a source of error that the compiler cannot
+catch: too small a count is an error, but the usual reaction is to pad the
+text with blanks until it fits -- and then the LENGTH passed on afterwards is
+a second, independent number that no reader can check. `_` removes the whole
+class.
+
+Scope, binding: **the outermost length only** (`[[u8; _]; 3]` is an error)
+and **only out of a literal** -- a text literal, an array literal or
+`[v; n]`. A parameter, a field and a `const` have no initializer to take a
+length from and have to write the number out. Both refusals are compile
+errors with line and column. The PARSER fills the length in as soon as it has
+read the initializer, so nothing after it ever sees a `_`.
 
 ### 8.1 Four separate types
 
@@ -1188,6 +1242,11 @@ thicket, the following applies:
 * **Unknown attributes** deliver a suggestion if it is a typo.
 * **The wrong target** (for example `#[packed]` in front of a function) is an
   error.
+
+**`#[allow_escape]`** (round 79, 3.6.1) belongs to the registry as well: in
+front of `fn`, no arguments, implemented in both compilers. It switches the
+escape analysis off for that function's body and empties its summary, so a
+vouched-for function does not send its callers red instead.
 
 Exactly one is implemented in stage 0: **`#[must_consume]`**, in front of `fn`
 and in front of `struct`. What is checked is the subset decidable without a move

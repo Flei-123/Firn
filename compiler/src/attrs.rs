@@ -92,6 +92,13 @@ pub const ATTRS: &[AttrInfo] = &[
         what: "make a Firn function callable under its bare name from C (SPEC 14.5)",
     },
     AttrInfo {
+        name: "allow_escape",
+        target: Target::Func,
+        args: 0,
+        implemented: true,
+        what: "the address of a local may leave this frame (SPEC 3.6, round 79)",
+    },
+    AttrInfo {
         name: "allow_fp",
         target: Target::Both,
         args: 0,
@@ -250,10 +257,20 @@ mod tests {
         // checked by nogc.rs, test programs tests/54x_no_gc_*.fi and
         // tests/neg/nogc_*.fi).
         // Round 52: plus #[interrupt] and #[allow_fp] (SPEC 2, core.rs/prof.rs).
+        // Round 79: plus #[allow_escape] -- the way out of the escape analysis
+        // (escape.rs, docs/ROUND79.md 3).
         let u: Vec<&str> = ATTRS.iter().filter(|a| a.implemented).map(|a| a.name).collect();
         assert_eq!(
             u,
-            vec!["must_consume", "no_gc", "interrupt", "link_name", "export_c", "allow_fp"]
+            vec![
+                "must_consume",
+                "no_gc",
+                "interrupt",
+                "link_name",
+                "export_c",
+                "allow_escape",
+                "allow_fp"
+            ]
         );
     }
 
