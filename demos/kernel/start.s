@@ -99,15 +99,15 @@ lang:
     hlt
     jmp 2b
 
-    /* --------------------------------------------------- karst_panic ---
+    /* --------------------------------------------------- osum_panic ---
      * ROUND 72: `demos/kernel/core.fi` now uses CHECKED arithmetic
      * (`old + 1 as u16` in `timer_ih`) -- the whole point of round 72 is
      * that the checked build levels catch an out-of-range value instead
      * of wrapping past it silently. Under `profile kernel`
      * (`panic_rt.rs::trampoline_asm`) that check ends in a `call
-     * karst_panic`, an EXTERNAL symbol the kernel author must define --
+     * osum_panic`, an EXTERNAL symbol the kernel author must define --
      * intentionally left undefined by the compiler itself (SPEC section 2:
-     * "calls karst_panic, configurable"). This is that definition: the
+     * "calls osum_panic, configurable"). This is that definition: the
      * smallest one that is still HONEST about what happened, not a
      * silent `ret` back into code that already proved its own value was
      * wrong.
@@ -127,8 +127,8 @@ lang:
      * continue, and guessing one back here would defeat the entire point
      * of checking in the first place.
      */
-    .globl karst_panic
-karst_panic:
+    .globl osum_panic
+osum_panic:
     /* rdi/esi (message pointer/length) are exactly what `out8`'s COM1
      * write loop below needs; a/b/code (rdx/rcx/r8) are not printed here
      * -- decimal formatting is `panic_rt.rs`'s own hand-rolled routine

@@ -43,7 +43,7 @@ The name `release-safe` was making a promise the compiler did not keep.
 | `compiler/src/lower.rs` | +134 | The decision, and the four message texts. The position is baked into the message as plain text at lowering time, because FIR carries no source positions at all. |
 | `compiler/src/lexer.rs`, `parser.rs`, `ast.rs` | +86 | `+% -% *%` (wrapping) and `+| -| *|` (saturating): read greedily, same precedence as the operators they are spelled after, **never** checked in any level. |
 | `compiler/src/codegen_x86.rs`, `regalloc.rs` | +371 | Both backends; the saturating clamp is written twice because the two load their operands through different APIs. |
-| `demos/kernel/start.s` | +65 | A minimal `karst_panic`: writes the message to COM1 and halts. |
+| `demos/kernel/start.s` | +65 | A minimal `osum_panic`: writes the message to COM1 and halts. |
 
 ### The shape of a checked site
 
@@ -84,7 +84,7 @@ path already computes in.
 ### `profile kernel`
 
 There is no runtime to fall back on: no `write`, no `exit_group`. The
-trampoline hands off to an **external** symbol `karst_panic(msg, len, a, b,
+trampoline hands off to an **external** symbol `osum_panic(msg, len, a, b,
 code)` that the kernel author defines. Leaving it undefined is a **link
 error**, not a quiet no-op — which is the honest outcome for a kernel that
 never defines it. `demos/kernel/start.s` shows a minimal one.
@@ -390,7 +390,7 @@ not because it was inconvenient.
   there is only one value and `rcx` carries the same one twice, so the
   message reads `(a=313 b=313)`. `panic_rt.rs` says so in its own header;
   there was no natural second number to put there instead.
-* **`karst_panic` gets the message, not the numbers.** The kernel branch of
+* **`osum_panic` gets the message, not the numbers.** The kernel branch of
   the trampoline hands over `rdi`/`esi`/`rdx`/`rcx`/`r8`/`r9` faithfully,
   but `demos/kernel/start.s`'s own definition prints only the text —
   duplicating the decimal formatter in hand-written assembly for a demo
