@@ -419,7 +419,7 @@ impl<'a> Parser<'a> {
         }
         let body = self.block("at the start of the function body");
         self.recovering = false;
-        Some(FnDecl { name, params, ret, body, span: start, attrs: Vec::new() })
+        Some(FnDecl { name, params, ret, body, span: start, attrs: Vec::new(), extern_info: None })
     }
 
     fn generic_struct_template(&mut self) {

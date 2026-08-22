@@ -279,6 +279,7 @@ fn method(p: &mut Parser, prog: &mut Program, ty: &str, tsp: Span) -> bool {
         body,
         span: start,
         attrs,
+        extern_info: None,
     });
     true
 }

@@ -319,14 +319,31 @@ pub struct Attr {
     pub span: Span,
 }
 
+/// **Round 75** — `extern fn`: a declaration without a Firn body that
+/// names a function defined elsewhere (SPEC §14.5). `link_name` is the
+/// symbol the linker looks for: `None` means the bare Firn name (no
+/// `_F0.` mangling — that is the whole point, see `modules::symbol`),
+/// `Some(n)` an explicitly different C symbol
+/// (`extern fn foo(...) -> T = "c_name"`).
+#[derive(Clone, Debug)]
+pub struct ExternInfo {
+    pub link_name: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct FnDecl {
     pub name: String,
     pub params: Vec<Param>,
     pub ret: Option<TypeExpr>,
+    /// Empty for `extern fn` (`extern` below is `Some`) — the parser
+    /// enforces that syntactically (no `{ ... }` after an `extern fn`
+    /// header, a `;` closes it instead).
     pub body: Block,
     pub span: Span,
     pub attrs: Vec<Attr>,
+    /// **Round 75** — `Some` marks the declaration as `extern fn`
+    /// (SPEC §14.5). `None` is an ordinary Firn function with a real body.
+    pub extern_info: Option<ExternInfo>,
 }
 
 #[derive(Clone, Debug)]
