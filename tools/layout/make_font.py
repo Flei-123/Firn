@@ -34,6 +34,9 @@ ASCENT = 800
 DESCENT = 200
 ADVANCE = 1000
 
+# A fixed date, so the file is REPRODUCIBLE (see build()).
+FONT_EPOCH = 3553891200
+
 # Every code point that the cases use.  More would not hurt, but this keeps
 # the file small and the table readable.
 CHARS = [chr(c) for c in range(0x20, 0x7F)]
@@ -90,6 +93,16 @@ def build(path):
     )
     fb.setupPost(isFixedPitch=1, underlinePosition=-DESCENT // 2,
                  underlineThickness=50)
+    # ROUND 78: the same input has to give the same file. fontTools stamps
+    # `head.created`/`head.modified` with the CURRENT time, so every run
+    # produced twelve different octets (the two dates and the checksums
+    # over them) and `git status` was dirty after every layout run -- which
+    # trains everybody to ignore a dirty tree. The date is pinned instead.
+    # TrueType counts seconds since 1904-01-01; 3,553,891,200 is
+    # 2016-08-24, the day the font's metrics were fixed and not a second
+    # of it matters for layout.
+    fb.font["head"].created = FONT_EPOCH
+    fb.font["head"].modified = FONT_EPOCH
     fb.save(path)
     return path
 
