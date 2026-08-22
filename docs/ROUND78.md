@@ -213,7 +213,7 @@ was unset:
 
 ```
 PATH=/tmp/nochrome
-kein chromium im PATH
+no chromium in PATH
 find_chromium() -> None
 …
 LAYOUT OK: 1087 / 1087 own boxes, 1087 / 1087 equal to Chromium (deviation 0.00 %),
@@ -377,16 +377,62 @@ rounds have not been held against yet — and now there is a list.
 
 ## 6. Acceptance of this round
 
+Every number below was run, none was estimated.
+
 | Check | Result |
 | --- | --- |
 | `grep -ric <old name> .` (without `.git`, `target`, work dirs) | **0** |
 | `find . -iname '*<old name>*'` | **0** |
-| `python3 tools/english/check_lengths.py` | 0 wrong length values |
+| `bash tools/english/check.sh` | 0 identifiers, 0 text sites, 0 lengths, 0 path names, 0 comment lines |
 | `cargo test --release` | 202 passed, 0 failed |
-| layout, frozen reference | 1087 / 1087 boxes, 5171 / 5171 probe points, deviation 0.00 % |
+| `tools/fixpoint.sh` | **stage 2 == stage 3, character-identical**, 617 667 lines of assembly, 3 621 184 octets each |
+| `tools/self_compare.sh` | 315 same behaviour, **0 differing, 0 faulty**, 0 codegen missing |
+| layout, frozen reference | **1087 / 1087** boxes, **5171 / 5171** probe points, deviation **0.00 %** |
 | layout, live Chromium 151 | identical |
 | layout with no browser in `PATH` | RC 0, `find_chromium() -> None` |
 | `make_font.py` run twice | byte-identical |
-| `tools/fixpoint.sh` | see the branch's final commit message |
-| `tools/self_compare.sh` | see the branch's final commit message |
-| `MC_FAST=1 ./test.sh` | see the branch's final commit message |
+| kernel (`tools/kernel/run.sh`) | 174 passed, 0 failed |
+| freestanding (`tools/freestanding/run.sh`) | 41 passed, 0 failed |
+| core (`tools/core/run.sh`) | 46 proofs, 0 failures |
+| `MC_FAST=1 ./test.sh` | **1169 of 1170** — one failure, and it is not this branch's (below) |
+
+### The one failure: `tools/js/round66.sh`, the promise endurance run
+
+```
+jobs   rc=-11    RSS first 10080 KiB  max 11628 KiB  growth +1548 KiB
+```
+
+`rc=-11` is SIGSEGV, and it is **intermittent**. `docs/ROUND76.md` §4.6
+already recorded it as a failure of `main`. It was established again here,
+because "inherited" is a claim:
+
+* **The same soak, eight runs on each tree, same machine, same minute:**
+
+  | Tree | SIGSEGV |
+  | --- | --- |
+  | `main` (`cbff66ca`) | **5 of 8** |
+  | `r78-osum` | **2 of 8** |
+
+  The branch crashes LESS often than `main`. Both crash. It is one bug,
+  and it is older than this branch.
+
+* **It cannot come from here.** Against `main` this branch changes exactly
+  two files outside documentation and `tools/layout`:
+  `compiler/src/strings.rs` (a string literal inside a `#[test]`) and
+  `lib/firnc1/parser.fi` (the indentation of five continuation lines). The
+  crashing program is `.js-work/jsrun.r66`, built by `firnc0` out of
+  `lib/js/` — neither file is on that path.
+
+The crash itself is worth a round of its own: an abandoned promise queue
+under the collector, which is where a dangling reference would show.
+
+### The layout section got BETTER, not just browser-free
+
+`docs/ROUND76.md` §4.6 recorded section 23 on `main` as **1082 of 1087
+boxes, 0.46 % off**, with five boxes wrong in four cases
+(`a4_abs_icb`, `a2_fixed_bottom_right`, `a3_fixed_percent`,
+`a7_sticky_bottom`). Those five are exactly the cases that ask where the
+BOTTOM of the viewport is — the 87 px window/viewport confusion. Taking
+`window_size_for()` over from `r72-arith` fixes them: **1087 of 1087,
+0.00 %**, live as well as frozen. The frozen reference therefore records a
+comparison that is more correct than the one `main` performs today.
