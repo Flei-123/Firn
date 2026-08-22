@@ -617,9 +617,16 @@ echo "== 23. layout: from the computed style to the box with coordinates (tools/
 # relative/absolute/fixed/sticky, the paint order with `z-index`, and the
 # full flexbox of css-flexbox-1. THREE proofs, and none of them replaces
 # another: the box tree against the frozen expectation (text against
-# text), the SAME cases through a real Chromium box against box out of
-# getBoundingClientRect(), and the PAINT ORDER against
-# document.elementFromPoint. Plus a soak run with a counter check.
+# text), the SAME cases box against box out of getBoundingClientRect(),
+# and the PAINT ORDER against document.elementFromPoint. Plus a soak run
+# with a counter check.
+#
+# ROUND 78: the two browser comparisons run against the FROZEN measurement
+# in tools/layout/reference/*.json -- Chromium was asked once, its answer
+# is in the repository, and this section starts no foreign program and
+# opens no socket. `bash tools/layout/run.sh --live-chromium` still asks a
+# live browser, and `--refresh-reference` rewrites the frozen files; both
+# are for a person at a keyboard and must never be called from here.
 bash tools/layout/run.sh --fast > "$WORK/layout.log" 2>&1 && LYRC=0 || LYRC=$?
 if [ "$LYRC" -eq 0 ]; then
     ok

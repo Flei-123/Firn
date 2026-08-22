@@ -19,9 +19,16 @@ wrong in the same way; the browser catches the case where the expectation
 was wrong -- which happens more often, because a number thought up by the
 author of the code is not a measurement.
 
+ROUND 78: the browser side is FROZEN by default. `--reference` reads the
+boxes out of `tools/layout/reference/cases.json` instead of starting a
+browser, so the acceptance needs no foreign program; `--write-reference`
+measures live once and writes that file. `--no-chrome` still means: do not
+compare against the browser at all.
+
 Usage:
     python3 tools/layout/harness.py <binary> [--json out.json] [--show N]
-                                   [--no-chrome] [--write-expected]
+                                   [--no-chrome] [--reference]
+                                   [--write-reference] [--write-expected]
                                    [--only NAME]
 """
 
@@ -136,6 +143,8 @@ def main():
     json_out = None
     show = 3
     use_chrome = True
+    use_reference = False
+    write_reference = False
     write_expected = False
     only = None
     i = 1
@@ -148,6 +157,12 @@ def main():
             i += 2
         elif args[i] == "--no-chrome":
             use_chrome = False
+            i += 1
+        elif args[i] == "--reference":
+            use_reference = True
+            i += 1
+        elif args[i] == "--write-reference":
+            write_reference = True
             i += 1
         elif args[i] == "--write-expected":
             write_expected = True
@@ -176,10 +191,31 @@ def main():
     got = [parse_block(b) for b in blocks]
 
     chrome = {}
+    ref_head = None
     if use_chrome:
         sys.path.insert(0, HERE)
-        import chrome as chrome_mod
-        measured = chrome_mod.measure_many(list(zip(names, htmls)))
+        import reference as ref_mod
+        if use_reference and not write_reference:
+            # NO browser, NO network: the answer Chromium gave once, read
+            # out of the repository. A missing file raises -- a reference
+            # that is not there has to be a failure, not a skipped section.
+            ref_head, data = ref_mod.load("cases")
+            print("   %s" % ref_mod.describe(ref_head))
+            measured = dict((n, data.get(n)) for n in names)
+            missing = [n for n in names if data.get(n) is None]
+            if missing:
+                print("   NOT IN THE REFERENCE (%d): %s"
+                      % (len(missing), ", ".join(missing[:5])))
+        else:
+            import chrome as chrome_mod
+            measured = chrome_mod.measure_many(list(zip(names, htmls)))
+            if write_reference:
+                ref_head = ref_mod.header(
+                    "the boxes of tools/layout/cases/*.html out of "
+                    "getBoundingClientRect()",
+                    chrome_mod.LAST_EXE, chrome_mod.LAST_WINDOW, (800, 600))
+                out = ref_mod.save("cases", ref_head, measured)
+                print("   written: %s (%d cases)" % (out, len(measured)))
         for name, rows in measured.items():
             if rows is None:
                 chrome[name] = None
@@ -189,6 +225,8 @@ def main():
 
     report = {"cases": [], "expected_ok": 0, "expected_total": 0,
               "chrome_ok": 0, "chrome_total": 0, "chrome_cases_run": 0}
+    if ref_head is not None:
+        report["reference"] = ref_head
     complaints = []
     for idx, name in enumerate(names):
         exp_path = os.path.join(CASES, name + ".expected")

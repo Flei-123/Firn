@@ -63,6 +63,22 @@ def find_chromium():
     return None
 
 
+
+def chromium_version(exe=None):
+    """The version string of the browser -- so a frozen measurement can say
+    WHO measured it (round 78, tools/layout/reference.py)."""
+    exe = exe or find_chromium()
+    if exe is None:
+        return None
+    try:
+        out = subprocess.run([exe, "--version"], capture_output=True,
+                             timeout=60).stdout.decode("utf-8", "replace")
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    out = out.strip().splitlines()
+    return out[0].strip() if out else None
+
+
 PROBE = """
 <script>
 (function () {
@@ -172,8 +188,18 @@ def window_size_for(exe, work, want_w, want_h, timeout=60):
     return want_w, want_h
 
 
+# ROUND 78: what the LAST live measurement really used -- the browser and
+# the window size that produced the 800x600 layout viewport. The frozen
+# reference writes both into its header, and a header that is reconstructed
+# afterwards would be a guess.
+LAST_EXE = None
+LAST_WINDOW = (0, 0)
+LAST_VIEWPORT = (800, 600)
+
+
 def measure_many(cases, timeout=60):
     """cases: list of (name, html).  Returns {name: [[tag,x,y,w,h], ...]}."""
+    global LAST_EXE, LAST_WINDOW
     exe = find_chromium()
     if exe is None:
         raise RuntimeError("no Chromium found (set FIRN_CHROMIUM)")
@@ -195,6 +221,7 @@ def measure_many(cases, timeout=60):
         # ROUND 72: what window size gives a LAYOUT VIEWPORT of 800x600 on
         # THIS browser? Asked once, used for every case.
         win_w, win_h = window_size_for(exe, work, 800, 600, timeout)
+        LAST_EXE, LAST_WINDOW = exe, (win_w, win_h)
         for name, path in files:
             cmd = _chrome_cmd(exe, win_w, win_h, path)
             try:
