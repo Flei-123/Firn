@@ -110,6 +110,11 @@
 #      character for character) and the endurance run for the objects the
 #      round adds -- per group against test262, with the limits in
 #      tools/js/minquota_r74.txt.
+#  40. A pointer into a local cannot leave its frame (tools/escape/run.sh,
+#      round 79): the escape analysis of `compiler/src/escape.rs` and
+#      `lib/firnc1/escape.fi` against 22 programs that have to be REFUSED and
+#      14 counter-checks that have to keep building -- in both compilers, with
+#      the whole message compared character for character.
 #  10. DOM soak run (tools/dom_soak/run.sh): the DOM prototype in Firn builds
 #      real cycles continuously (parent/child, listener, JS wrapper) and must
 #      not grow while doing so; the deliberately leaking counter-check with
@@ -839,6 +844,25 @@ if [ "$EXTRC" -eq 0 ]; then
 else
     bad "tools/extfn/run.sh failed (see .test-work/extfn.log)"
     grep -E 'FAIL' "$WORK/extfn.log" | head -10 | sed 's/^/   /'
+fi
+
+echo "== 40. a pointer into a local cannot leave its frame (tools/escape/run.sh, ROUND 79) =="
+# Round 66 found the gap while writing a JavaScript engine: a raw pointer into
+# a LOCAL survived its frame and the compiler said nothing. Round 79 makes it
+# an error at compile time -- in BOTH compilers, with the same text.
+# 36 cases: 22 programs in which the address really gets out (return, an out
+# parameter, a struct that is returned, a callee that keeps it, a thread) and
+# 14 COUNTER-CHECKS -- correct programs with pointers that have to keep
+# building. The counter-checks are the half that matters more: a checker that
+# refuses everything catches every error. Every false alarm counts as a
+# failure. The whole message block of firnc0 and firnc1 is compared with `cmp`.
+bash tools/escape/run.sh > "$WORK/escape.log" 2>&1 && ESCRC=0 || ESCRC=$?
+if [ "$ESCRC" -eq 0 ]; then
+    ok
+    grep -E '^  (cases|messages identical):|^PASS:' "$WORK/escape.log" | sed 's/^/ /'
+else
+    bad "tools/escape/run.sh failed (see .test-work/escape.log)"
+    grep -E '^FAIL' "$WORK/escape.log" | head -10 | sed 's/^/   /'
 fi
 
 TOTAL=$((PASS + FAIL))

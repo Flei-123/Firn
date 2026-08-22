@@ -398,6 +398,14 @@ impl<'a> Parser<'a> {
                         self.bump();
                         v as u64
                     }
+                    // ROUND 79 (gap 10 of docs/ROUND66.md): `[u8; _]` — the
+                    // length comes out of the initializer. `let_stmt` fills
+                    // it in as soon as it has read the initializer, so
+                    // `LEN_INFER` never reaches the type checker.
+                    TokKind::Ident(n) if n == "_" => {
+                        self.bump();
+                        crate::ast::LEN_INFER
+                    }
                     _ => {
                         self.error_here(format!(
                             "expected an integer array length, found '{}'",
@@ -1162,10 +1170,64 @@ impl<'a> Parser<'a> {
         let broken = self.recovering;
         let sp = Parser::join(start, init.span);
         self.end_stmt();
+        // ROUND 79: `[T; _]` — now that the initializer has been read, the
+        // length is known.
+        let ty = match ty {
+            Some(t) => match self.fill_in_length(t, &init) {
+                Some(t) => Some(t),
+                None => return Stmt::Error(start),
+            },
+            None => None,
+        };
         if broken {
             Stmt::Error(start)
         } else {
             Stmt::Let { name, mutable, ty, init, span: sp }
+        }
+    }
+
+    /// **ROUND 79** — replaces the `_` of an array length with the number of
+    /// elements of the initializer (gap 10 of `docs/ROUND66.md`).
+    ///
+    /// Only the OUTERMOST length: `[[u8; _]; 3]` stays an error, because the
+    /// inner one would have to come out of the elements of the elements and
+    /// nothing in this language writes that down today.
+    fn fill_in_length(&mut self, t: TypeExpr, init: &Expr) -> Option<TypeExpr> {
+        let (elem, len, span) = match t {
+            TypeExpr::Array { elem, len, span } => (elem, len, span),
+            other => return Some(other),
+        };
+        if len != crate::ast::LEN_INFER {
+            return Some(TypeExpr::Array { elem, len, span });
+        }
+        match Parser::literal_length(init) {
+            Some(n) => Some(TypeExpr::Array { elem, len: n, span }),
+            None => {
+                self.dg.error_note(
+                    span,
+                    "the length '_' can only be taken from a literal",
+                    "write the number out, or initialise with a text literal, an array literal or '[v; n]'",
+                );
+                self.recovering = false;
+                self.sync_stmt();
+                None
+            }
+        }
+    }
+
+    /// How many elements does this initializer have? `None` = not a literal.
+    fn literal_length(e: &Expr) -> Option<u64> {
+        match &e.kind {
+            // A text literal carries its array literal of octets inside
+            // (round 70); its length is the one that counts, including a
+            // written `\0`.
+            ExprKind::Text(_, inner) => Parser::literal_length(inner),
+            ExprKind::ArrayLit(v) => Some(v.len() as u64),
+            ExprKind::ArrayRepeat(_, n) => match &n.kind {
+                ExprKind::Int(v) if *v >= 0 => Some(*v as u64),
+                _ => None,
+            },
+            _ => None,
         }
     }
 

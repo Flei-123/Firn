@@ -8,6 +8,15 @@ use crate::diag::Span;
 pub type ExprId = u32;
 
 /// Type syntax (not yet resolved — `Named` may well be a struct).
+/// **ROUND 79** — the length written as `_`: it is taken from the
+/// initializer (`var m: [u8; _] = "hello"`). Gap 10 of `docs/ROUND66.md`:
+/// round 66 counted about two hundred message texts by hand, and an
+/// off-by-one there is not a compile error but a silently padded text with a
+/// second, independent length beside it. The parser replaces this value with
+/// the real length as soon as it has seen the initializer; it can therefore
+/// never reach the type checker.
+pub const LEN_INFER: u64 = u64::MAX;
+
 #[derive(Clone, Debug)]
 pub enum TypeExpr {
     Named(String, Span),
