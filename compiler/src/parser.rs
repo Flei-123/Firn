@@ -12,7 +12,7 @@
 //! The semicolon is optional: a line break ends a statement.
 
 use crate::ast::{
-    Attr, Block, ConstDecl, Expr, ExprKind, BinOp, FnDecl, ImportDecl, Param, Program, Stmt,
+    Attr, Block, ConstDecl, Expr, ExprKind, BinOp, ExternInfo, FnDecl, ImportDecl, Param, Program, Stmt,
     StructDecl, TypeExpr, UnOp,
 };
 use std::collections::HashSet;
@@ -1317,10 +1317,6 @@ impl<'a> Parser<'a> {
         let is_extern = self.at(&TokKind::KwExtern);
         if is_extern {
             self.bump();
-            self.dg.error(
-                start,
-                "'extern fn' is not supported in stage 0",
-            );
         }
         if !self.expect(TokKind::KwFn, "at the start of a function declaration") {
             self.recovering = false;
@@ -1355,6 +1351,41 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        let attrs = std::mem::take(&mut self.pending_attrs);
+        // **Round 75** — `extern fn` (SPEC §14.5): a declaration WITHOUT a
+        // body, closed with ';' instead of a block. The link name comes
+        // from `#[link_name(c_symbol)]` if present, otherwise the bare
+        // Firn name (no `_F0.` mangling — `modules::symbol`).
+        if is_extern {
+            if self.at(&TokKind::LBrace) {
+                self.error_here(
+                    "'extern fn' has no body; end the declaration with ';' instead of '{'"
+                        .to_string(),
+                );
+                self.recovering = false;
+                self.sync_item();
+                return;
+            }
+            if !self.expect(TokKind::Semi, "after an 'extern fn' declaration") {
+                self.recovering = false;
+                self.sync_item();
+                return;
+            }
+            self.recovering = false;
+            let link_name = attrs.iter().find(|a| a.name == "link_name")
+                .and_then(|a| a.args.first().cloned());
+            let body = Block { stmts: Vec::new(), span: start };
+            prog.funcs.push(FnDecl {
+                name,
+                params,
+                ret,
+                body,
+                span: start,
+                attrs,
+                extern_info: Some(ExternInfo { link_name }),
+            });
+            return;
+        }
         if !self.at(&TokKind::LBrace) {
             self.error_here(format!(
                 "expected '{{' at the start of the function body, found '{}'",
@@ -1366,10 +1397,7 @@ impl<'a> Parser<'a> {
         }
         let body = self.block("at the start of the function body");
         self.recovering = false;
-        if !is_extern {
-            let attrs = std::mem::take(&mut self.pending_attrs);
-            prog.funcs.push(FnDecl { name, params, ret, body, span: start, attrs });
-        }
+        prog.funcs.push(FnDecl { name, params, ret, body, span: start, attrs, extern_info: None });
     }
 
     fn struct_decl(&mut self, prog: &mut Program) {
@@ -2238,11 +2266,34 @@ mod tests {
     }
 
     #[test]
-    fn extern_becomes_rejected() {
-        let (p, n, text) = parse_src("extern fn write(fd: i32) -> i32 { return 0 }\nfn main() -> i32 { return 0 }");
+    fn extern_with_body_is_rejected() {
+        // Round 75: `extern fn` no longer means "unsupported" — but it still
+        // MUST NOT have a body (that would defeat the point of a declaration
+        // without one).
+        let (_p, n, text) = parse_src("extern fn write(fd: i32) -> i32 { return 0 }\nfn main() -> i32 { return 0 }");
         assert!(n >= 1);
-        assert!(text.contains("stage 0"), "{}", text);
-        assert_eq!(p.funcs.len(), 1);
+        assert!(text.contains("no body"), "{}", text);
+    }
+
+    #[test]
+    fn extern_fn_is_parsed_without_a_body() {
+        // Round 75 (SPEC §14.5): `extern fn` IS supported now — a
+        // declaration terminated with ';', no block, no FIR body.
+        let p = ok("extern fn write(fd: i32, buf: *u8, n: usize) -> i64;\nfn main() -> i32 { return 0 }");
+        assert_eq!(p.funcs.len(), 2);
+        let ext = &p.funcs[0];
+        assert_eq!(ext.name, "write");
+        assert!(ext.body.stmts.is_empty());
+        assert!(ext.extern_info.is_some());
+        assert_eq!(ext.extern_info.as_ref().unwrap().link_name, None);
+    }
+
+    #[test]
+    fn extern_fn_with_link_name() {
+        let p = ok("#[link_name(exit)]\nextern fn c_exit(code: i32) -> i32;\nfn main() -> i32 { return 0 }");
+        let ext = &p.funcs[0];
+        assert_eq!(ext.name, "c_exit");
+        assert_eq!(ext.extern_info.as_ref().unwrap().link_name.as_deref(), Some("exit"));
     }
 
     #[test]

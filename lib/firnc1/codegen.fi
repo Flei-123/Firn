@@ -37,10 +37,11 @@ import fir
 import gc
 import iface
 import core
+import ast
 
 export { Cg, cg_new, cg_free, cg_run, cg_unsuitable, cg_text, cg_gc_set,
     cg_freestanding_set,
-    cg_if_set }
+    cg_if_set, cg_tree_set }
 
 const NONE: u32 = 4294967295
 
@@ -55,6 +56,15 @@ struct Cg {
     gcr: u64 // gc registry (round 34), 0 = no classes
     ifr: u64 // interfaces (round 46), 0 = none
     free: bool // ROUND 52: freestanding -- no `_start`, no exit
+    // ROUND 75 (SPEC 14.5): the AST tree, so that `sym` can look up
+    // `extern fn` / `#[link_name(...)]` / `#[export_c]` by function name --
+    // the same shape as `gcr`/`ifr` (a registry set once, read many times).
+    tr: u64,
+    // Scratch output of `extern_link_of`/`export_c_of`: the intern number
+    // to write out when either of them answers `true`. A found/not-found
+    // BOOLEAN return plus this side channel, rather than packing both into
+    // one `u32` with 0 as "not found" -- 0 is an ordinary intern number.
+    ext_out: u32,
 }
 
 fn cg_new(f: u64, it: u64) -> Cg {
@@ -63,8 +73,13 @@ fn cg_new(f: u64, it: u64) -> Cg {
         out: rt.buf_new(),
         slot: vec_new[u64](), aslot: vec_new[u64](),
         frame: 0, unsuitable: false, gcr: 0, ifr: 0, free: false,
+        tr: 0, ext_out: 0,
     }
 }
+
+// ROUND 75 (SPEC 14.5): register the AST tree, so `sym` can resolve
+// `extern fn` / `#[export_c]` link names.
+fn cg_tree_set(c: *mut Cg, t: u64) { (*c).tr = t }
 
 // Register the gc registry (round 34): it carries size, type tag
 // and field offsets of every class -- the collector's type table grows out of it.
@@ -127,9 +142,93 @@ fn inum(c: *mut Cg, v: i64) {
     rt.buf_push_dec_i64(&(*c).out, v)
 }
 
+// ROUND 75 (SPEC 14.5) -- is `nr` (an internal call/function name) an
+// `extern fn`? If so, the interned LINK NAME to write out instead (its own
+// name if `#[link_name(...)]` was not given). Returns `intern.NONE`-style
+// 0 when `nr` is not an extern declaration at all (0 can never be a valid
+// intern number -- `intern.intern_new` starts counting at 1, the same
+// convention `ast.NOTHING` relies on elsewhere in this compiler).
+// **Round 75, the intern-number-0 trap.** `intern.intern_number` hands out
+// numbers starting at 0 (`Interner.cnt` before the first insertion) -- so
+// intern number 0 is a perfectly ordinary, valid name whenever it happens
+// to be the FIRST identifier ever interned in the whole program (which it
+// very often is: `strlen` in a one-function test file, for instance). A
+// single `u32` return value with "0 means not found" is therefore UNSOUND
+// here, unlike `ast.NOTHING` (4294967295) elsewhere in this compiler, which
+// intern numbers can never collide with. `(*c).ext_found`/`(*c).ext_out`
+// carry the two pieces of information SEPARATELY instead of packing them
+// into one sentinel-prone value.
+fn extern_link_of(c: *mut Cg, nr: u32) -> bool {
+    if (*c).tr == 0 {
+        return false
+    }
+    let b: *mut ast.Tree = (*c).tr as *mut ast.Tree
+    var i: usize = 0
+    while i < ast.fn_count(b) {
+        if ast.fn_name(b, i) == nr && ast.fn_extern(b, i) != 0 {
+            // `ast.fn_link_set` (round 75) answers "was `#[link_name(...)]`
+            // written at all", SEPARATELY from the link name's own intern
+            // number -- because that number can legitimately be 0.
+            if ast.fn_link_set(b, i) {
+                (*c).ext_out = ast.fn_link(b, i)
+            } else {
+                (*c).ext_out = nr
+            }
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// ROUND 75 (SPEC 14.5) -- is `nr` marked `#[export_c]`? (found/not-found,
+// same reasoning as `extern_link_of` above.)
+fn export_c_of(c: *mut Cg, nr: u32) -> bool {
+    if (*c).tr == 0 {
+        return false
+    }
+    let b: *mut ast.Tree = (*c).tr as *mut ast.Tree
+    var i: usize = 0
+    while i < ast.fn_count(b) {
+        if ast.fn_name(b, i) == nr && ast.fn_export(b, i) != 0 {
+            (*c).ext_out = nr
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// Writes the RAW (unmangled) spelling of intern number `nr` -- used by both
+// escape hatches below, and nowhere else (an ordinary symbol always goes
+// through the `_F1.` prefix).
+fn sym_raw(c: *mut Cg, nr: u32) {
+    let q: u64 = intern.intern_ptr(it(c), nr)
+    let n: usize = intern.intern_length(it(c), nr)
+    rt.buf_push_bytes(&(*c).out, q, n)
+}
+
 // Symbol name of a function: prefixed with `_F1.`, so that nothing collides
 // with the operating system or with `firnc0`.
+//
+// **ROUND 75** (SPEC 14.5) -- two escape hatches from the `_F1.` scheme,
+// both resolved through the AST tree registered with `cg_tree_set`:
+//   * `nr` is an `extern fn` -- a CALLER reaches here wanting the symbol
+//     the foreign definition uses, unmangled (`#[link_name]` or the bare
+//     name).
+//   * `nr` carries `#[export_c]` -- the function itself is being emitted
+//     here and has to come out under its bare Firn name so C can call it.
+// Every other name keeps going through the `_F1.` prefix exactly as
+// before -- this is additive, nothing about the existing scheme changed.
 fn sym(c: *mut Cg, nr: u32) {
+    if extern_link_of(c, nr) {
+        sym_raw(c, (*c).ext_out)
+        return
+    }
+    if export_c_of(c, nr) {
+        sym_raw(c, (*c).ext_out)
+        return
+    }
     var p: [u8; 4] = "_F1."
     t(c, (&p[0]) as u64, 4)
     // ROUND 58: the generated functions of the closures carry a `#` in their

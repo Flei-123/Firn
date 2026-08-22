@@ -214,6 +214,14 @@ struct Parser {
     // The `#[must_consume]` attribute in front of the next fn or struct
     // declaration (round 36, attrs.rs -- Target::Both).
     mc_pending: u32,
+    // ROUND 75 (SPEC 14.5): the interned argument of `#[link_name(...)]`
+    // in front of the next 'extern fn'; MEANINGFUL only when
+    // `link_pending_set` is true (0 is a perfectly ordinary intern number,
+    // not a sentinel -- see `codegen.fi`'s `extern_link_of`).
+    link_pending: u32,
+    link_pending_set: bool,
+    // ROUND 75 (SPEC 14.5): `#[export_c]` in front of the next fn.
+    export_pending: u32,
     tpoff: u32, // start of the current type parameter list
     // Intern number of `size_of`, or -1. `size_of` is NOT a keyword
     // (sizeof.rs) -- it can only be recognised by its spelling.
@@ -237,7 +245,8 @@ fn par_new(lx: u64) -> Parser {
         module: vec_new[u32](),
         scratch: rt.buf_new(),
         parens: 0, no_slit: 0, err: 0, not_core: false,
-        gen: 0, mu: 0, feh: 0, time: false, gcr: 0, ifr: 0, nogc_pending: 0, int_pending: 0, mc_pending: 0, tpoff: 0, sonr: -1,
+        gen: 0, mu: 0, feh: 0, time: false, gcr: 0, ifr: 0, nogc_pending: 0, int_pending: 0, mc_pending: 0,
+        link_pending: 0, link_pending_set: false, export_pending: 0, tpoff: 0, sonr: -1,
         local: vec_new[u32](), llimit: vec_new[u32](),
         hoist: vec_new[u32](), interp: 0,
     }
@@ -2310,7 +2319,7 @@ fn lambda(p: *mut Parser, heap: bool) -> u32 {
     let body: u32 = block(p)
     (*p).no_slit = saved
     loc_off(p)
-    ast.fn_add(b, cname, poff, plen + 1, ret, body, 0, 0, 0)
+    ast.fn_add(b, cname, poff, plen + 1, ret, body, 0, 0, 0, 0, 0, 0, 0)
     var packed: u64 = 0
     if ret != ast.NOTHING {
         packed = (ret as u64 + 1) << 1
@@ -2437,7 +2446,15 @@ fn struct_template(p: *mut Parser, name: u32) {
 }
 
 fn fn_decl(p: *mut Parser) {
-    next_bump(p)
+    // ROUND 75 (SPEC 14.5): 'extern fn' -- a declaration WITHOUT a body,
+    // closed with ';' instead of a block.
+    let is_extern: bool = actual(p, A_KWEXTERN)
+    if is_extern {
+        next_bump(p)
+    }
+    if !expect(p, A_KWFN) {
+        return
+    }
     if !actual(p, A_IDENT) {
         complain(p)
         return
@@ -2448,6 +2465,14 @@ fn fn_decl(p: *mut Parser) {
     if actual(p, A_LBRACKET) {
         if !has_gen(p) {
             (*p).not_core = true
+            complain(p)
+            return
+        }
+        if is_extern {
+            // 'extern fn name[T](...)' does not exist -- an extern
+            // declaration names a concrete, foreign symbol, and there is
+            // nothing to monomorphize. Treated as a plain syntax error,
+            // the same shape every other place here uses.
             complain(p)
             return
         }
@@ -2470,13 +2495,38 @@ fn fn_decl(p: *mut Parser) {
             return
         }
     }
+    if is_extern {
+        loc_off(p)
+        expect(p, A_SEMI)
+        let empty_body: u32 = ast.block_new(par_tree(p), 0, 0)
+        var ls: u32 = 0
+        if (*p).link_pending_set { ls = 1 }
+        ast.fn_add(par_tree(p), name, poff, plen, ret, empty_body, 0, 0, 0,
+            1, (*p).link_pending, ls, 0)
+        (*p).link_pending = 0
+        (*p).link_pending_set = false
+        (*p).nogc_pending = 0
+        (*p).mc_pending = 0
+        (*p).int_pending = 0
+        (*p).export_pending = 0
+        return
+    }
     let body: u32 = block(p)
     loc_off(p)
     ast.fn_add(par_tree(p), name, poff, plen, ret, body, (*p).nogc_pending,
-        (*p).mc_pending, (*p).int_pending)
+        (*p).mc_pending, (*p).int_pending, 0, 0, 0, (*p).export_pending)
     (*p).nogc_pending = 0
     (*p).mc_pending = 0
     (*p).int_pending = 0
+    (*p).export_pending = 0
+    if (*p).link_pending_set {
+        // '#[link_name(...)]' in front of a function WITH a body: caught
+        // here rather than in the prescan, since only fn_decl knows
+        // whether the declaration turned out to be 'extern'.
+        complain(p)
+        (*p).link_pending = 0
+        (*p).link_pending_set = false
+    }
 }
 
 fn struct_decl(p: *mut Parser) {
@@ -3055,13 +3105,34 @@ fn extensions_search(p: *mut Parser) {
                         // Round 52: plus `#[interrupt]` and `#[allow_fp]`.
                         var iw: [u8; 9] = "interrupt"
                         var fw: [u8; 8] = "allow_fp"
+                        // Round 75: plus `#[export_c]` (`#[link_name(...)]`
+                        // has one argument and is shaped differently --
+                        // checked separately below).
+                        var ec: [u8; 8] = "export_c"
                         let anr: u32 = lexer.lex_nr(lx(p), i + 2)
                         let itn: *mut intern.Interner = lexer.lex_names(lx(p))
                         ok_attr = intern.intern_equal(itn, anr, (&an[0]) as u64, 5) ||
                         intern.intern_equal(itn, anr, (&mc[0]) as u64, 12) ||
                         intern.intern_equal(itn, anr, (&iw[0]) as u64, 9) ||
-                        intern.intern_equal(itn, anr, (&fw[0]) as u64, 8)
+                        intern.intern_equal(itn, anr, (&fw[0]) as u64, 8) ||
+                        intern.intern_equal(itn, anr, (&ec[0]) as u64, 8)
                     }
+                }
+            }
+            // Round 75: `#[link_name(c_symbol)]` -- '#' '[' IDENT '(' IDENT ')' ']',
+            // six tokens instead of four.
+            if !ok_attr && has_gc(p) && i + 6 < (*p).n {
+                if lexer.lex_kind(lx(p), i + 1) == A_LBRACKET
+                    && lexer.lex_kind(lx(p), i + 2) == A_IDENT
+                    && lexer.lex_kind(lx(p), i + 3) == A_LPAREN
+                    && lexer.lex_kind(lx(p), i + 4) == A_IDENT
+                    && lexer.lex_kind(lx(p), i + 5) == A_RPAREN
+                    && lexer.lex_kind(lx(p), i + 6) == A_RBRACKET
+                {
+                    var ln: [u8; 9] = "link_name"
+                    let anr: u32 = lexer.lex_nr(lx(p), i + 2)
+                    let itn: *mut intern.Interner = lexer.lex_names(lx(p))
+                    ok_attr = intern.intern_equal(itn, anr, (&ln[0]) as u64, 9)
                 }
             }
             if !ok_attr {
@@ -3444,7 +3515,7 @@ fn methods_decl(p: *mut Parser, tname: u32) {
     }
     let body: u32 = block(p)
     loc_off(p)
-    ast.fn_add(par_tree(p), name, poff, plen, ret, body, 0, 0, 0)
+    ast.fn_add(par_tree(p), name, poff, plen, ret, body, 0, 0, 0, 0, 0, 0, 0)
 }
 
 // ROUND 46 (iface.rs::interface_decl): `interface I { fn m(*self) -> T ... }`.
@@ -3711,10 +3782,11 @@ fn impl_decl(p: *mut Parser) {
     expect(p, A_RBRACE)
 }
 
-// `#[no_gc]` and `#[must_consume]` -- the two implemented attributes
-// (attrs.rs: exactly these two are `implemented: true`). Parentheses
-// with arguments are an error (both take 0 arguments, attrs.rs);
-// any other name is caught by the prescan as not core beforehand.
+// `#[no_gc]`, `#[must_consume]`, `#[link_name(...)]` and `#[export_c]` --
+// the implemented attributes (attrs.rs). `no_gc`/`must_consume`/
+// `interrupt`/`allow_fp` take 0 arguments (parentheses are an error);
+// `link_name` takes exactly 1 (an identifier); `export_c` takes 0.
+// Any other name is caught by the prescan as not core beforehand.
 fn attr(p: *mut Parser) {
     next_bump(p)
     if !expect(p, A_LBRACKET) {
@@ -3729,17 +3801,36 @@ fn attr(p: *mut Parser) {
     // ROUND 52 (attrs.rs): `#[interrupt]` and `#[allow_fp]` (SPEC 2).
     var iw: [u8; 9] = "interrupt"
     var fw: [u8; 8] = "allow_fp"
+    // ROUND 75 (attrs.rs, SPEC 14.5): `#[link_name(...)]` and `#[export_c]`.
+    var ln: [u8; 9] = "link_name"
+    var ec: [u8; 8] = "export_c"
     let it: *mut intern.Interner = lexer.lex_names(lx(p))
     let is_nogc: bool = intern.intern_equal(it, tok_nr(p, 0), (&an[0]) as u64, 5)
     let is_mc: bool = intern.intern_equal(it, tok_nr(p, 0), (&mc[0]) as u64, 12)
     let is_int: bool = intern.intern_equal(it, tok_nr(p, 0), (&iw[0]) as u64, 9)
     let is_fp: bool = intern.intern_equal(it, tok_nr(p, 0), (&fw[0]) as u64, 8)
-    if !is_nogc && !is_mc && !is_int && !is_fp {
+    let is_link: bool = intern.intern_equal(it, tok_nr(p, 0), (&ln[0]) as u64, 9)
+    let is_export: bool = intern.intern_equal(it, tok_nr(p, 0), (&ec[0]) as u64, 8)
+    if !is_nogc && !is_mc && !is_int && !is_fp && !is_link && !is_export {
         complain(p)
         return
     }
     next_bump(p)
-    if actual(p, A_LPAREN) {
+    if is_link {
+        if !expect(p, A_LPAREN) {
+            return
+        }
+        if !actual(p, A_IDENT) {
+            complain(p)
+            return
+        }
+        (*p).link_pending = tok_nr(p, 0)
+        (*p).link_pending_set = true
+        next_bump(p)
+        if !expect(p, A_RPAREN) {
+            return
+        }
+    } else if actual(p, A_LPAREN) {
         complain(p)
         return
     }
@@ -3755,6 +3846,10 @@ fn attr(p: *mut Parser) {
         // of it is left in the tree, because this stage does not enforce the
         // profile bans (docs/ROUND52.md, "Open points").
         (*p).nogc_pending = (*p).nogc_pending
+    } else if is_link {
+        // `link_pending` is already set above.
+    } else if is_export {
+        (*p).export_pending = 1
     } else {
         (*p).nogc_pending = 1
     }
@@ -3859,13 +3954,24 @@ fn par_run(p: *mut Parser) {
         let a: u32 = kind(p, 0)
         // `#[no_gc]` belongs in front of a FUNCTION (attrs.rs, Target::Func),
         // `#[must_consume]` in front of either (attrs.rs, Target::Both), round 36.
-        if (*p).nogc_pending == 1 && a != A_KWFN && a != A_HASH {
+        if (*p).nogc_pending == 1 && a != A_KWFN && a != A_KWEXTERN && a != A_HASH {
             complain(p)
             (*p).nogc_pending = 0
         }
-        if (*p).mc_pending == 1 && a != A_KWFN && a != A_KWSTRUCT && a != A_HASH {
+        if (*p).mc_pending == 1 && a != A_KWFN && a != A_KWEXTERN && a != A_KWSTRUCT && a != A_HASH {
             complain(p)
             (*p).mc_pending = 0
+        }
+        // ROUND 75: `#[link_name(...)]` and `#[export_c]` belong in front
+        // of a function (or another attribute) exactly like `#[no_gc]`.
+        if (*p).link_pending_set && a != A_KWFN && a != A_KWEXTERN && a != A_HASH {
+            complain(p)
+            (*p).link_pending = 0
+            (*p).link_pending_set = false
+        }
+        if (*p).export_pending == 1 && a != A_KWFN && a != A_KWEXTERN && a != A_HASH {
+            complain(p)
+            (*p).export_pending = 0
         }
         if a == A_HASH && has_gc(p) {
             // `#[no_gc]` in front of a function (round 34, SPEC 3.5.4),
@@ -3878,7 +3984,7 @@ fn par_run(p: *mut Parser) {
             interface_decl(p)
         } else if a == A_IDENT && is_impl(p) {
             impl_decl(p)
-        } else if a == A_KWFN {
+        } else if a == A_KWFN || a == A_KWEXTERN {
             fn_decl(p)
         } else if a == A_KWSTRUCT {
             struct_decl(p)
