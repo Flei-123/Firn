@@ -32,6 +32,10 @@ pub enum FTy {
     /// **ROUND 71** — IEEE-754 binary32. The value of an `Op::Const` is the
     /// BIT PATTERN as u32, in the same way.
     F32,
+    /// **ROUND 82** — the 128-bit vector value. Sixteen octets without an
+    /// element type; it lives in an `xmm` register and has a sixteen byte
+    /// aligned home in the frame.
+    V128,
     /// pointer (always 64 bits, untyped in FIR)
     Ptr,
     /// no value
@@ -45,6 +49,7 @@ impl FTy {
             FTy::I16 | FTy::U16 => 16,
             FTy::I32 | FTy::U32 | FTy::F32 => 32,
             FTy::I64 | FTy::U64 | FTy::Ptr | FTy::F64 => 64,
+            FTy::V128 => 128,
             FTy::Void => 0,
         }
     }
@@ -73,6 +78,7 @@ impl FTy {
             FTy::Bool => "bool",
             FTy::F64 => "f64",
             FTy::F32 => "f32",
+            FTy::V128 => "v128",
             FTy::Ptr => "ptr",
             FTy::Void => "void",
         }
@@ -258,6 +264,19 @@ pub enum Op {
     /// **Round 52** — MMIO write (`core.rs`). Like `Op::Store`, but
     /// **volatile** (see `MmioLoad`).
     MmioStore { addr: Val, val: Val },
+    /// **ROUND 82** — ONE vector or crypto machine instruction (`simd.rs`).
+    ///
+    /// `kind` says which one; `args` are its operands in source order, `imm`
+    /// is the 8-bit immediate of the instructions that have one (0 for all
+    /// others). The result type of the instruction is the `ty` of the `Inst`
+    /// — `V128` for most, `U64`/`U32` for the extractors and `crc32`,
+    /// `Void` for `__v128_store`.
+    ///
+    /// Why ONE variant instead of forty: every one of these instructions is
+    /// the same thing to every pass — pure (or, for load/store, memory
+    /// touching), not foldable, not reassociable. A pass that had to
+    /// enumerate forty variants would be forty chances to forget one.
+    Simd { kind: crate::simd::SimdKind, args: Vec<Val>, imm: u8 },
 }
 
 impl Op {
@@ -276,6 +295,11 @@ impl Op {
             | Op::Select { .. } => true,
             // The address of a table in `.rodata` is a constant.
             Op::VtabAddr { .. } | Op::FnRef { .. } => true,
+            // ROUND 82: everything except the two memory instructions is a
+            // pure register computation and may be removed when unused; CSE
+            // may merge two of them. `__v128_load` reads memory and
+            // `__v128_store` writes it — those two never.
+            Op::Simd { kind, .. } => kind.is_pure(),
             // The state block is always there; rescuing the registers
             // writes memory, though, and must not fall away.
             Op::GcAddr { regs } => !*regs,
@@ -374,6 +398,7 @@ impl Op {
                 out.push(*addr);
                 out.push(*val);
             }
+            Op::Simd { args, .. } => out.extend_from_slice(args),
         }
     }
 
@@ -633,6 +658,11 @@ fn fmt_inst(i: &Inst) -> String {
         Op::CopyMem { dst, src, size } => format!("copymem %{}, %{}, size={}", dst, src, size),
         Op::Select { cond, a, b } => format!("select.{} %{}, %{}, %{}", t, cond, a, b),
         Op::Barrier { val } => format!("barrier.{} %{}", t, val),
+        // ROUND 82: `simd.<kind>.<type> %a, %b, imm=N` — one line per
+        // machine instruction, readable in `--emit=fir` like everything else.
+        Op::Simd { kind, args, imm } => {
+            format!("simd.{:?}.{} {} imm={}", kind, t, vlist(args), imm)
+        }
         Op::SecureZero { addr, size } => format!("secure_zero %{}, %{}", addr, size),
         Op::AtomicAdd { addr, val } => format!("atomadd.{} %{}, %{}", t, addr, val),
         Op::Asm { template, out, in_regs, ins, out_regs, outs, clobber } => {

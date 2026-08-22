@@ -47,6 +47,10 @@ fn scalar_fty(t: &Type) -> Option<FTy> {
         Type::U64 => FTy::U64,
         Type::Usize => FTy::U64,
         Type::Bool => FTy::Bool,
+        // ROUND 82 (simd.rs): the vector register is a SCALAR value in FIR —
+        // one value, one slot, no fields. That it is sixteen octets wide only
+        // the frame layout and the code generator care about.
+        Type::V128 => FTy::V128,
         Type::Ptr { .. } => FTy::Ptr,
         // Round 58: a function value is the pointer to its function record.
         Type::Fn { .. } => FTy::Ptr,
@@ -909,6 +913,10 @@ impl<'a> Lower<'a> {
             return crate::thread::lower_thread_call(self, name, args, span);
         }
         // HOOK atomar: the atomic primitive (atomic.rs, round 47)
+        // HOOK simd (round 82): the vector and crypto instructions.
+        if crate::simd::is_simd_call(name) && !self.info.fns.contains_key(name) {
+            return crate::simd::lower_call(self, name, args, span);
+        }
         if crate::atomic::is_atomic_call(name) && !self.info.fns.contains_key(name) {
             return crate::atomic::lower_atomic_call(self, name, args, span);
         }

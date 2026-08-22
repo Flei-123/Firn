@@ -1903,6 +1903,10 @@ impl<'a> Checker<'a> {
         if let Some(t) = crate::atomic::hook_call(self, name, args, nspan, espan) {
             return t;
         }
+        // HOOK simd: the vector and crypto instructions (simd.rs, round 82)
+        if let Some(t) = crate::simd::hook_call(self, name, args, nspan, espan) {
+            return t;
+        }
         if let Some(t) = crate::ct::hook_call(self, name, args, nspan, espan) {
             return t;
         }
@@ -2543,6 +2547,8 @@ fn prim_type(name: &str) -> Option<Type> {
         "bool" => Type::Bool,
         "f64" => Type::F64,
         "f32" => Type::F32,
+        // ROUND 82 (simd.rs, SPEC 8.7): the 128-bit vector register.
+        "v128" => Type::V128,
         _ => return None,
     })
 }
