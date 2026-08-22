@@ -9,8 +9,8 @@
 #      boxes, to the bit
 #   2. the own cases: the box tree against the frozen expectation
 #      (tools/layout/cases/*.expected), text against text
-#   3. the CROSS-CHECK against Chromium: the same cases through a real
-#      browser, `getBoundingClientRect()` against `getBoundingClientRect()`
+#   3. the CROSS-CHECK against Chromium: the same cases, box against box
+#      out of `getBoundingClientRect()`
 #   3a. the PAINT ORDER against Chromium: who lies on top, asked with
 #      `document.elementFromPoint` (tools/layout/stack.py)
 #   4. the cross-check on the REAL pages of testdata/realweb/
@@ -19,7 +19,35 @@
 #
 # Cases that do not pass count as a FAILURE. Nothing is filtered.
 #
-# Usage:  bash tools/layout/run.sh [--fast]
+# ROUND 78 -- THE BROWSER IS NOT A DEPENDENCY ANY MORE.
+# Sections 3, 3a and 4 used to START a Chromium, and a passing suite
+# therefore required a 200 MB foreign program to be installed. Firn is
+# supposed to stand on its own, so the browser is asked ONCE and its
+# answer lives in the repository as data:
+#
+#     tools/layout/reference/cases.json     boxes of tools/layout/cases
+#     tools/layout/reference/stack.json     probe points + topmost element
+#     tools/layout/reference/realweb.json   boxes of testdata/realweb
+#
+# Every file names the browser version, the date and the layout viewport it
+# was measured with. The comparison itself did not get weaker: it is still
+# box against box against a foreign engine written by other people from the
+# specification. Only the moment of asking moved -- and a deviation now has
+# exactly ONE possible cause (this engine), because the other side can no
+# longer silently become a different browser version between two runs.
+#
+# Usage:
+#   bash tools/layout/run.sh [--fast]        against the frozen reference
+#                                            (the default; no browser needed)
+#   bash tools/layout/run.sh --live-chromium  against a live browser, for a
+#                                            cross-check against a newer one
+#   bash tools/layout/run.sh --refresh-reference
+#                                            measure live AND rewrite the
+#                                            frozen files under
+#                                            tools/layout/reference/
+#
+# `--live-chromium` and `--refresh-reference` must never be called from
+# test.sh: the acceptance has to run without foreign software.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
@@ -27,7 +55,25 @@ FIRNC="compiler/target/release/firnc"
 export FIRNLIB="$(pwd)/lib"
 WORK=".layout-work"
 FAST=0
-[ "${1:-}" = "--fast" ] && FAST=1
+MODE=frozen
+for a in "$@"; do
+    case "$a" in
+        --fast)               FAST=1 ;;
+        --live-chromium|--live) MODE=live ;;
+        --refresh-reference)  MODE=refresh ;;
+        *) echo "unknown option: $a"; exit 2 ;;
+    esac
+done
+
+# The browser argument the three cross-checks are called with, and whether a
+# deviation stops the run. While REFRESHING, a deviation must not stop it:
+# the point of that run is to write all three reference files, and the
+# numbers it prints are the live ones the caller wanted to see.
+case "$MODE" in
+    frozen)  CHARG="--reference"       ; HARD=1 ; WHO="the frozen reference" ;;
+    live)    CHARG=""                  ; HARD=1 ; WHO="a LIVE Chromium" ;;
+    refresh) CHARG="--write-reference" ; HARD=0 ; WHO="a LIVE Chromium (rewriting the reference)" ;;
+esac
 
 mkdir -p "$WORK"
 if [ ! -x "$FIRNC" ]; then
@@ -80,23 +126,24 @@ if [ "$FAST" -eq 0 ]; then
 fi
 
 echo
-echo "== 3. cross-check against Chromium (the same cases in a real browser) =="
+echo "== 3. cross-check against Chromium -- $WHO =="
+rm -f "$WORK/chrome.json"
 CHROME_RC=0
-python3 tools/layout/harness.py "$WORK/layout" \
+python3 tools/layout/harness.py "$WORK/layout" $CHARG \
         --json "$WORK/chrome.json" --show 5 | tee "$WORK/chrome.txt" || CHROME_RC=$?
 if [ ! -f "$WORK/chrome.json" ]; then
-    echo "   NOT RUN: no Chromium found (set FIRN_CHROMIUM)."
-    CH_OK=0
-    CH_TOTAL=0
-    CH_RATE=100
-else
-    CH_OK=$(python3 -c "import json;print(json.load(open('$WORK/chrome.json'))['chrome_ok'])")
-    CH_TOTAL=$(python3 -c "import json;print(json.load(open('$WORK/chrome.json'))['chrome_total'])")
-    CH_RATE=$(python3 -c "import json;d=json.load(open('$WORK/chrome.json'));print('%.2f'%d.get('chrome_deviation_percent',100.0))")
-    if [ "$CH_OK" != "$CH_TOTAL" ]; then
-        echo "   FAILED: $CH_OK of $CH_TOTAL boxes equal to Chromium ($CH_RATE %% off)"
-        exit 1
-    fi
+    # In every mode this is a FAILURE. Before round 78 a missing browser
+    # silently turned the section off and the run still said OK -- which is
+    # how a cross-check quietly stops being one.
+    echo "   FAILED: no measurement (mode $MODE)."
+    exit 1
+fi
+CH_OK=$(python3 -c "import json;print(json.load(open('$WORK/chrome.json'))['chrome_ok'])")
+CH_TOTAL=$(python3 -c "import json;print(json.load(open('$WORK/chrome.json'))['chrome_total'])")
+CH_RATE=$(python3 -c "import json;d=json.load(open('$WORK/chrome.json'));print('%.2f'%d.get('chrome_deviation_percent',100.0))")
+if [ "$CH_OK" != "$CH_TOTAL" ]; then
+    echo "   FAILED: $CH_OK of $CH_TOTAL boxes equal to Chromium ($CH_RATE % off)"
+    if [ "$HARD" -eq 1 ]; then exit 1; fi
 fi
 
 echo
@@ -104,32 +151,33 @@ echo "== 3a. the paint order against Chromium (tools/layout/stack.py) =="
 # A layout can be proven with rectangles. A paint order cannot: no browser
 # has a `getPaintOrder()`. But `document.elementFromPoint(x, y)` answers
 # exactly the question the order decides -- which element is on top at
-# this point -- and that answer can be compared.
+# this point -- and that answer can be compared. The probe points are
+# frozen together with the answers (round 78): a point is a fixed place on
+# the page, so the QUESTION stays the same even when the engine moves a box.
+rm -f "$WORK/stack.json"
 STACK_RC=0
-python3 tools/layout/stack.py "$WORK/layout" \
+python3 tools/layout/stack.py "$WORK/layout" $CHARG \
         --json "$WORK/stack.json" --show 5 | tee "$WORK/stack.txt" \
         || STACK_RC=$?
 if [ ! -f "$WORK/stack.json" ]; then
-    echo "   NOT RUN: no Chromium found (set FIRN_CHROMIUM)."
-    ST_OK=0
-    ST_TOTAL=0
-else
-    ST_OK=$(python3 -c "import json;print(json.load(open('$WORK/stack.json'))['points_ok'])")
-    ST_TOTAL=$(python3 -c "import json;print(json.load(open('$WORK/stack.json'))['points_total'])")
-    if [ "$ST_OK" != "$ST_TOTAL" ]; then
-        echo "   FAILED: $ST_OK of $ST_TOTAL probe points equal to Chromium"
-        exit 1
-    fi
+    echo "   FAILED: no measurement (mode $MODE)."
+    exit 1
+fi
+ST_OK=$(python3 -c "import json;print(json.load(open('$WORK/stack.json'))['points_ok'])")
+ST_TOTAL=$(python3 -c "import json;print(json.load(open('$WORK/stack.json'))['points_total'])")
+if [ "$ST_OK" != "$ST_TOTAL" ]; then
+    echo "   FAILED: $ST_OK of $ST_TOTAL probe points equal to Chromium"
+    if [ "$HARD" -eq 1 ]; then exit 1; fi
 fi
 
-if [ "$FAST" -eq 0 ]; then
+if [ "$FAST" -eq 0 ] || [ "$MODE" = refresh ]; then
     echo
     echo "== 4. cross-check on the REAL pages of testdata/realweb/ =="
     # This number is NOT a pass criterion and is not meant to be one: the
     # pages need tables, replaced elements with an intrinsic size and
     # presentational attributes, and none of that exists yet. It is
     # reported so that the gap is a MEASUREMENT and not an opinion.
-    python3 tools/layout/realweb.py "$WORK/layout" \
+    python3 tools/layout/realweb.py "$WORK/layout" $CHARG \
             --json "$WORK/realweb.json" | tee "$WORK/realweb.txt" || true
 fi
 
@@ -154,6 +202,6 @@ echo "   paint order:          $ST_OK / $ST_TOTAL probe points   (limit: $MIN_ST
 if [ "$EXP_OK" -lt "$MIN_CASES" ] || [ "$CH_OK" -lt "$MIN_CHROME" ] ||
    [ "$ST_OK" -lt "$MIN_STACK" ]; then
     echo "   FAILED: a quota has fallen below the recorded limit."
-    exit 1
+    if [ "$HARD" -eq 1 ]; then exit 1; fi
 fi
-echo "LAYOUT OK: $EXP_OK / $EXP_TOTAL own boxes, $CH_OK / $CH_TOTAL equal to Chromium (deviation $CH_RATE %), paint order $ST_OK / $ST_TOTAL"
+echo "LAYOUT OK: $EXP_OK / $EXP_TOTAL own boxes, $CH_OK / $CH_TOTAL equal to Chromium (deviation $CH_RATE %), paint order $ST_OK / $ST_TOTAL -- $WHO"
