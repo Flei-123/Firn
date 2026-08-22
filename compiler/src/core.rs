@@ -778,7 +778,7 @@ fn visit_calls(ck: &mut Checker, b: &crate::ast::Block, names: &[String]) {
                 visit_expr(ck, cond, names);
                 visit_calls(ck, then, names);
                 if let Some(e) = els {
-                    visit_calls(ck, &crate::ast::Block { stmts: vec![(**e).clone()], span: b.span }, names);
+                    visit_calls(ck, &crate::ast::Block { stmts: vec![(**e).clone()], span: b.span, end: b.end }, names);
                 }
             }
             Stmt::While { cond, body, .. } => {
@@ -797,7 +797,7 @@ fn visit_calls(ck: &mut Checker, b: &crate::ast::Block, names: &[String]) {
             }
             Stmt::Defer(inner, _, _) => visit_calls(
                 ck,
-                &crate::ast::Block { stmts: vec![(**inner).clone()], span: b.span },
+                &crate::ast::Block { stmts: vec![(**inner).clone()], span: b.span, end: b.end },
                 names,
             ),
             Stmt::Expr(e) => visit_expr(ck, e, names),
