@@ -153,6 +153,24 @@ looking at. The trampoline now takes `r9 = 1` for an unsigned type and skips
 the sign test; the same overflow now reads
 `(a=18446744073709551615 b=1)`.
 
+**The optimiser had stopped seeing the arithmetic.** `release-safe` is the
+level that checks **and** runs every pass. It ran the passes and folded
+nothing at all, because `fold_constants` matches `Op::Bin` and every
+`+ - * / %` had become `Op::CheckedBin` one round earlier. Measured on
+`tests/opt/fold_arith.fi`: folded at `release-fast`, **not** folded at
+`release-safe`. `fold_constants` now folds all four new instructions — a
+checked one **only when the result really fits**, because folding an
+out-of-range one away would delete a panic the program promised.
+
+**And `test_opt.sh` fell into the trap the round had just found next door.**
+Every one of its 46 checks is about a pass that runs at the FULL level only;
+"no flag" meant `release-fast` exactly as long as the default happened to be
+`release-fast`. Ten of them failed after the default was corrected — none of
+them about arithmetic. The level it proves is written down now. Measured:
+`FAIL 10/46` before, **`PASS 45/45`** after. (The total is not the same
+number in both runs; a few of these checks only run at all when the
+assembly they inspect contains what they are looking for.)
+
 ### 5.2 What `firnc1` did not have at all: source positions
 
 The syntax tree in `lib/firnc1/ast.fi` carried **no position of any kind** —
@@ -285,7 +303,7 @@ character:
 
 ### 6.4 The new section (`tools/checked/run.sh`, test.sh section 40)
 
-**139 checks, 0 failures.** Eleven programs, five groups, both compilers:
+**150 checks, 0 failures.** Twelve programs, six groups, both compilers:
 
 * a program that goes out of range aborts with exit code **101** in `dev`,
   `dev-fast` and `release-safe`, and **wraps** (returns 7) in
@@ -304,7 +322,12 @@ character:
 * counter-checks: `widths.fi` stays in range at every integer width and
   behaves exactly as it always did; and a program built `release-fast`
   contains **zero** mentions of the trampoline while the same program at
-  `dev-fast` contains several.
+  `dev-fast` contains several;
+* the optimiser really sees the checked arithmetic (`fold.fi`): **seven**
+  checked/wrapping/saturating operations before the optimiser at
+  `release-safe`, **zero** after — and the out-of-range addition of
+  `add_i32.fi` is still there, because folding that one away would delete
+  a promised panic.
 
 ### 6.5 What it costs
 
@@ -377,6 +400,12 @@ not because it was inconvenient.
   analysis of any kind runs before lowering, so an addition the optimiser
   could prove in range still pays. That is the single biggest lever left on
   the 6.67× above.
+* **Only constant folding was taught the new instructions, not CSE and not
+  LICM.** Two identical `a * b` in one function stay two checked
+  multiplications at `release-safe` and become one at `release-fast`
+  (measured). For CSE that is simply missing work. For LICM it is more than
+  that: hoisting a checked operation out of a loop would make a loop that
+  never runs panic, so it needs an argument, not just a match arm.
 * **`firnc1`'s assembly is not `firnc0`'s assembly**, and it never was —
   `firnc1` has no register allocation, every value lives in the frame. What
   is compared is the FIR text (6.3) and the behaviour (6.2), which is
