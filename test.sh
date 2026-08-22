@@ -56,6 +56,13 @@
 #      the same login dribbled out ONE OCTET PER WRITE, sixteen logins at
 #      the same time -- and, if node is there, node-minecraft-protocol as a
 #      third implementation nobody here wrote.
+#  40. The standard library of round 81 (tools/stdlib81/run.sh): the hash
+#      and the octet keys of the map (a million entries, the longest probe
+#      chain MEASURED, an endurance run with a counter-check that must
+#      grow), DEFLATE/zlib/gzip in BOTH directions against python3 zlib,
+#      gzip and the gunzip binary, JSON against JSONTestSuite and
+#      python3 -m json.tool, and lib/std/crypto against 1,919 NIST CAVP
+#      vectors, the openssl binary and python3 hashlib. Three build stages.
 #  18. Package and project system (tools/packages/run.sh): manifest, search
 #      order, visibility, build driver -- in BOTH compilers.
 #  19. Freestanding compilation (tools/freestanding/run.sh, round 52):
