@@ -1980,7 +1980,7 @@ mod tests {
     }
 
     fn blk(stmts: Vec<Stmt>) -> ast::Block {
-        ast::Block { stmts, span: Span::new(1, 1, 1) }
+        ast::Block { stmts, span: Span::new(1, 1, 1), end: Span::new(1, 1, 1) }
     }
 
     fn info_of(b: &B, tcx: TypeCtx, fns: Vec<(&str, FnSig)>) -> TypeInfo {

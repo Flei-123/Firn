@@ -180,6 +180,11 @@ pub struct LambdaDecl {
 pub struct Block {
     pub stmts: Vec<Stmt>,
     pub span: Span,
+    /// **ROUND 79** — position of the closing `}`. That is where the frame
+    /// of a function dies, and the escape analysis (`escape.rs`) has to name
+    /// that place in its message: a pointer that outlives the frame is only
+    /// understandable when the reader is shown where the frame ends.
+    pub end: Span,
 }
 
 #[derive(Clone, Debug)]

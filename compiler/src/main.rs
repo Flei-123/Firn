@@ -40,6 +40,7 @@ mod lower_match;
 mod modules;
 mod mono;
 mod mem2reg;
+mod escape;
 mod nogc;
 mod opt;
 mod package;
