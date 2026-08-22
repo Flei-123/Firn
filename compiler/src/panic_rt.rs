@@ -39,11 +39,11 @@
 //!   `exit_group(101)`. No allocation, no `std.*` — this has to run inside
 //!   a plain `app` program that imports nothing at all.
 //! * **`kernel`** — there is neither. SPEC §2's own table already promises
-//!   *"Panic on an out-of-range index: calls `karst_panic`, configurable"*
+//!   *"Panic on an out-of-range index: calls `osum_panic`, configurable"*
 //!   for the one runtime panic that already existed on paper (bounds
 //!   checks, not yet built). Checked arithmetic is the very same shape of
 //!   problem and gets the same answer: the trampoline hands off to an
-//!   EXTERNAL symbol `karst_panic(msg_ptr, msg_len, a, b, code)` that the
+//!   EXTERNAL symbol `osum_panic(msg_ptr, msg_len, a, b, code)` that the
 //!   kernel must define itself — the freestanding profile has no `write`,
 //!   no `exit`, and this file cannot invent an ending on its own behalf.
 //!   Leaving it undefined is a **link error**, not a quiet no-op: `ld`
@@ -124,7 +124,7 @@ pub fn any_registered() -> bool {
     TABLE.with(|t| !t.borrow().msgs.is_empty())
 }
 
-/// Panic kind codes handed to `karst_panic` under `profile kernel`. Stable
+/// Panic kind codes handed to `osum_panic` under `profile kernel`. Stable
 /// numbers (part of the ABI a kernel author codes against), not FIR-facing.
 pub const PANIC_ADD: u64 = 1;
 pub const PANIC_SUB: u64 = 2;
@@ -136,7 +136,7 @@ pub const PANIC_CAST: u64 = 6;
 /// Label of the shared trampoline.
 pub const TRAMPOLINE: &str = ".Lpanic_arith";
 /// External symbol a `profile kernel` program must define itself.
-pub const KARST_PANIC: &str = "karst_panic";
+pub const OSUM_PANIC: &str = "osum_panic";
 
 /// `.rodata` — every distinct message text as raw octets (no NUL
 /// terminator, exactly the SPEC §8 `Str` convention: length travels
@@ -166,13 +166,13 @@ pub fn rodata_asm() -> String {
 pub fn trampoline_asm() -> String {
     if crate::prof::is_kernel() {
         // No runtime at all. Somebody else decides what a panic means —
-        // that is exactly the SPEC §2 promise ("karst_panic, configurable").
-        // `karst_panic` is an external symbol; an undefined reference at
+        // that is exactly the SPEC §2 promise ("osum_panic, configurable").
+        // `osum_panic` is an external symbol; an undefined reference at
         // link time is the honest outcome when a kernel never defines it.
         let mut s = String::new();
         s.push_str(&format!("{}:\n", TRAMPOLINE));
-        s.push_str(&format!("    call {}\n", KARST_PANIC));
-        s.push_str("    # karst_panic is not supposed to come back; running\n");
+        s.push_str(&format!("    call {}\n", OSUM_PANIC));
+        s.push_str("    # osum_panic is not supposed to come back; running\n");
         s.push_str("    # into whatever comes next in .text would be silently\n");
         s.push_str("    # wrong, so this traps instead of guessing.\n");
         s.push_str("    ud2\n");

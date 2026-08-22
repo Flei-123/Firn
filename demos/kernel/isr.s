@@ -304,12 +304,12 @@ saved_r15:
     .skip 8
 
     .text
-    /* --------------------------------------------------- karst_panic ---
+    /* --------------------------------------------------- osum_panic ---
      * ROUND 72: the kernel's own Firn code (`fs.fi::fs__mount`, `uprog.fi::
      * u_mkdir`) now uses CHECKED arithmetic (SPEC section 13, `L9`) --
      * under `profile kernel` a checked site that goes out of range ends in
-     * `call karst_panic`, an EXTERNAL symbol the compiler deliberately
-     * leaves undefined (SPEC section 2: "calls karst_panic, configurable").
+     * `call osum_panic`, an EXTERNAL symbol the compiler deliberately
+     * leaves undefined (SPEC section 2: "calls osum_panic, configurable").
      * This is that definition, same shape as `demos/kernel/start.s`'s
      * (the smaller kernel demo): write the message to COM1 -- already
      * initialised by `kmain.fi`'s own `serial.init()`, which runs before
@@ -321,29 +321,29 @@ saved_r15:
      *   own comment on why: decimal formatting is `app`-profile-only
      *   machinery this is not worth duplicating for a two-line message).
      */
-    .globl karst_panic
-karst_panic:
+    .globl osum_panic
+osum_panic:
     movq %rdi, %r10
     movl %esi, %r11d
-.Lkarst_loop:
+.Losum_loop:
     testl %r11d, %r11d
-    jz .Lkarst_nl
+    jz .Losum_nl
     movw $0x3FD, %dx
-.Lkarst_wait:
+.Losum_wait:
     inb %dx, %al
     testb $0x20, %al
-    jz .Lkarst_wait
+    jz .Losum_wait
     movb (%r10), %al
     movw $0x3F8, %dx
     outb %al, %dx
     incq %r10
     decl %r11d
-    jmp .Lkarst_loop
-.Lkarst_nl:
+    jmp .Losum_loop
+.Losum_nl:
     movb $10, %al
     movw $0x3F8, %dx
     outb %al, %dx
-.Lkarst_halt:
+.Losum_halt:
     cli
     hlt
-    jmp .Lkarst_halt
+    jmp .Losum_halt

@@ -1,6 +1,6 @@
 # ACCEPTANCE.md -- is Firn ready for the browser engine?
 
-**Authoritative:** `../karstos-browser/FIRN-ANFORDERUNGEN.md` 13
+**Authoritative:** `../osum-browser/FIRN-ANFORDERUNGEN.md` 13
 **State of this file:** 2026-08-14, **after the merge of round 3**
 **Overall result: 0 of 6 passed**, 3 partial (items 3, 4, 5),
 3 open (items 1, 2, 6).

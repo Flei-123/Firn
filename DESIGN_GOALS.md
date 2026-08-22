@@ -110,7 +110,7 @@ The core points of the Firn version:
 5. **Implementations in the `app` profile:** `Io.Threaded` (threads, first),
    `Io.SingleThread` (deterministic, for reproducible reftests -- satisfies
    `N7`), later `Io.Evented` with stackful coroutines. In the `kernel` profile
-   there is a version of `Io` of its own that maps onto karst primitives.
+   there is a version of `Io` of its own that maps onto osum primitives.
 6. **Stackful coroutines instead of state machines.** That is the price (see
    below), but it keeps the code generator small and allows *every* function to
    run inside a coroutine -- including deeply recursive ones such as the HTML
@@ -300,13 +300,13 @@ input from the network -- it must **never** be allowed to open a file.
 * **WASI / the WebAssembly component model:** capability-based and thought
   through correctly -- but it is a sandbox around foreign code, with marshalling
   costs at every boundary.
-* **Karstos itself:** capability-based. **This is exactly where Firn's
+* **Osum itself:** capability-based. **This is exactly where Firn's
   opportunity lies.**
 
 ### Firn's approach
 
 **One model for the language and the operating system.** A capability in Firn is
-**the same thing** as a capability in Karstos: an unforgeable handle that can be
+**the same thing** as a capability in Osum: an unforgeable handle that can be
 owned or passed on, but not invented.
 
 The trick: **Firn needs almost no new mechanism for it** -- the `Io` value from
@@ -352,15 +352,15 @@ build script has to declare it (`skript = true`). The package manager shows that
 when the package is added.
 
 **(d) Enforcement at run time.** Static checking covers everything the compiler
-sees. For dynamically loaded components (Karstos processes, browser tabs)
-**Karstos** enforces the same capabilities -- the language model and the kernel
+sees. For dynamically loaded components (Osum processes, browser tabs)
+**Osum** enforces the same capabilities -- the language model and the kernel
 model are congruent, there is no translation layer.
 
 ### Conflict of goals
 
 * **`unsafe` undercuts all of it.** A module with `unsafe` and inline assembly
   can issue a syscall directly. The honest answer: **the capability check of the
-  language only applies to safe code.** For unsafe code Karstos has to enforce
+  language only applies to safe code.** For unsafe code Osum has to enforce
   it. The package manager therefore has to count and show the `unsafe` blocks
   per package -- that is the only warning that carries weight.
 * **Ergonomics.** Passing capabilities through is the same effort as passing
@@ -384,7 +384,7 @@ model are congruent, there is no translation layer.
 
 **FOUNDATION (as a rule, not as code).** The rule "no ambient authority" has to
 hold from phase 3 on. Declaration and checking in the package manager:
-**phase 3**. Enforcement against `unsafe` through Karstos: **phase 6**.
+**phase 3**. Enforcement against `unsafe` through Osum: **phase 6**.
 
 ---
 
@@ -427,7 +427,7 @@ within a module and resilient at library boundaries; Firn is fast everywhere,
 **except** where `#[abi_stable]` stands.
 
 ```firn
-// An interchangeable Karstos component:
+// An interchangeable Osum component:
 #[abi_stable(version = 1)]
 interface FensterManager {
     fn erzeuge(io: Io, breite: u32, hoehe: u32) -> !FensterId
@@ -455,7 +455,7 @@ The rules:
 
 * **The browser does not need it.** It is linked statically (`R5`), blocks talk
   over IPC with serialized messages -- not over an ABI.
-* **Karstos needs it** as soon as system components are supposed to be
+* **Osum needs it** as soon as system components are supposed to be
   interchangeable (drivers, window manager, services) or an app model with
   extensions loaded later comes into being.
 * **IPC beats an ABI wherever it can.** A serialized message channel is more
@@ -509,7 +509,7 @@ The rules:
 ### Priority and phase
 
 **CAN BE RETROFITTED** -- with cheap groundwork (the symbol scheme).
-The groundwork in **phase 3**, the implementation in **phase 7/8**, when Karstos
+The groundwork in **phase 3**, the implementation in **phase 7/8**, when Osum
 needs interchangeable components. Not before.
 
 ---
@@ -1079,12 +1079,12 @@ one collides with another goal of this document:
    is only "half" a hot reload) or you need a migration function per type --
    which somebody has to write.
 4. **Dynamic loading.** You need loadable units (`.so`-like), a loader,
-   relocations -- exactly what Firn and Karstos explicitly **abolished**
+   relocations -- exactly what Firn and Osum explicitly **abolished**
    (`R5`: link statically, no `dlopen`; `SPEC.md` 4.5: "no dynamic libraries").
 
 **The collision finding is unambiguous:** item 2 demands a **stable ABI**
 (section 4) or indirection everywhere; item 4 demands **dynamic loading**, which
-was deliberately removed from the Karstos design; and both stand against the
+was deliberately removed from the Osum design; and both stand against the
 performance target of <= 2x Rust (10.3 of the SPEC), because indirection at
 module boundaries prevents exactly the inlining that `P1` demands.
 
@@ -1128,7 +1128,7 @@ The reasons:
   ABI and a discipline about state -- three large building sites -- for an
   advantage that stages A and B deliver to ~80 % without any language change.
 * It **collides directly** with two decisions that were taken for good reasons:
-  static linking (`R5`, which saves Karstos the entire loader) and inlining
+  static linking (`R5`, which saves Osum the entire loader) and inlining
   across module boundaries (`P1`, needed for <= 2x Rust).
 * The languages where hot reload really works well (Erlang, Elixir) have
   **paid dearly** for it: immutable data, process isolation, message passing
