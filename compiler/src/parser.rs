@@ -51,6 +51,11 @@ pub(crate) struct Parser<'a> {
     pub(crate) hoist: Vec<Stmt>,
     /// > 0: an interpolation is already running — nesting does not exist yet.
     pub(crate) interp_depth: u32,
+    /// **ROUND 79** — `[T; _]` is only allowed where an initializer follows
+    /// that the length can be taken from: the type of a `let`/`var`.
+    /// `let_stmt` switches it on around exactly that call; everywhere else a
+    /// `_` is refused in the parser, so `ast::LEN_INFER` never leaves it.
+    pub(crate) infer_len_ok: bool,
 }
 
 fn starts_stmt(k: &TokKind) -> bool {
@@ -403,7 +408,20 @@ impl<'a> Parser<'a> {
                     // it in as soon as it has read the initializer, so
                     // `LEN_INFER` never reaches the type checker.
                     TokKind::Ident(n) if n == "_" => {
+                        let sp = self.span();
                         self.bump();
+                        if !self.infer_len_ok {
+                            self.dg.error_note(
+                                sp,
+                                "the length '_' needs an initializer to be taken from",
+                                "it works in a 'let'/'var' with a literal; a parameter, a field and a 'const' have to write the number out",
+                            );
+                            // No follow-up message for the same construct:
+                            // `expected ')' after the parameter list` would
+                            // say nothing the line above does not.
+                            self.recovering = true;
+                            return None;
+                        }
                         crate::ast::LEN_INFER
                     }
                     _ => {
@@ -1150,7 +1168,12 @@ impl<'a> Parser<'a> {
             }
         };
         let ty = if self.eat(&TokKind::Colon) {
-            match self.parse_type() {
+            // ROUND 79: `[T; _]` is allowed HERE and only here -- an
+            // initializer is coming to take the length from.
+            self.infer_len_ok = true;
+            let parsed = self.parse_type();
+            self.infer_len_ok = false;
+            match parsed {
                 Some(t) => Some(t),
                 None => {
                     self.recovering = false;
@@ -2041,6 +2064,7 @@ fn in_expr(
         pending_attrs: Vec::new(),
         hoist: Vec::new(),
         interp_depth: 1,
+        infer_len_ok: false,
     };
     let e = p.nested_expr();
     *next_id = p.next_id;
@@ -2094,6 +2118,7 @@ pub fn parse_module(toks: &[Token], dg: &mut Diags, file: u32, base_id: u32) -> 
         pending_attrs: Vec::new(),
         hoist: Vec::new(),
         interp_depth: 0,
+        infer_len_ok: false,
     };
     let prog = p.program();
     if !p.hoist.is_empty() {
