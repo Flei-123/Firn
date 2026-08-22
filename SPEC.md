@@ -740,6 +740,59 @@ Two requirements that are guaranteed to be wrong if implemented naively:
 Both belong in the standard library, not in the compiler, and are checked
 against the public test vectors.
 
+### 8.6 `v128` -- the vector register (round 82)
+
+A **primitive type of the language**: 128 bits, sixteen octets, sixteen byte
+aligned, at home in one SSE register. It is what makes the vector and crypto
+instructions of the processor reachable from Firn at all -- without it
+`aesenc` and `sha256rnds2` cannot be emitted, and a scalar AES loses a factor
+of a hundred and ninety against one that uses them (9.4, docs/ROUND82.md).
+
+**`v128` carries NO element type.** Sixteen octets mean whatever the
+instruction applied to them says they mean; `__v128_add32` reads them as four
+`u32`, `__aesenc` as one AES state. A type per reading (`u8x16`, `u32x4`)
+would only produce conversions that generate no code.
+
+**`v128` has NO operators.** No `+`, no `^`, no `<<`, no `==`. `a + b` would
+have to mean one of `paddb`/`paddw`/`paddd`/`paddq`, and any choice is wrong
+three times out of four. Everything happens through named intrinsics whose
+name says which machine instruction comes out.
+
+**The intrinsics** are spelled `__name(...)`, like every other primitive of
+this language (`__atomic_add`, `__mmio_read32`, `__gc_state`). The set of
+round 82: `__v128_load`/`store`/`zero`/`from_u64`/`get_u64`/`get_u32`/
+`set_u32`, `__v128_xor`/`and`/`or`/`andnot`, `__v128_add8`/`add32`/`add64`/
+`sub32`, `__v128_shuffle8`/`shuffle32`/`alignr`/`unpacklo32`/`unpackhi32`/
+`unpacklo64`/`unpackhi64`/`shl_bytes`/`shr_bytes`/`shl32`/`shr32`/`shl64`/
+`shr64`/`blend16`, `__aesenc`/`aesenclast`/`aesdec`/`aesdeclast`/`aesimc`/
+`aeskeygenassist`, `__sha256rnds2`/`sha256msg1`/`sha256msg2`, `__pclmulqdq`,
+`__crc32_u8`/`__crc32_u64` and `__cpu_features`.
+
+An immediate operand (`__v128_shuffle32`, `__v128_alignr`, `__v128_blend16`,
+`__aeskeygenassist`, `__pclmulqdq`, the byte and bit shifts, the extractors)
+**must be an integer literal** and is range checked at compile time. It is
+encoded into the instruction; there is no register form of it.
+
+**The calling convention:** a `v128` parameter travels in the SSE class of
+System V AMD64 (`xmm0`-`xmm7`, then the stack), a `v128` result comes back in
+`xmm0` -- exactly like `f32`/`f64`. All sixteen `xmm` registers are caller
+saved, so nothing is rescued in a prologue.
+
+**Availability is a RUN TIME question.** `__cpu_features() -> u64` asks `cpuid`
+and yields a bit set (`lib/std/cpu.fi` names the bits). The compiler inserts
+no check by itself: it cannot know which two implementations you consider
+equivalent. Whoever uses AES-NI asks first and keeps a path that does not.
+`lib/std/crypto/accel.fi` is the worked example, and both of its paths are
+held against the same NIST vectors (`tools/bench82/run.sh`).
+
+**Deliberately not in round 82:** 256 and 512 bit vectors (`v256`/`v512`, they
+need `vzeroupper` discipline), a second register class in the linear scan (a
+function with a `v128` in it goes over the base path of the code generator,
+as one with an `f64` has since round 71), and the aarch64 equivalents
+(`aese`/`aesmc`, `sha256h`) -- see docs/ROUND82.md §6 and §7.
+
+---
+
 ### 8.5 Ropes (`Z3`)
 
 `document.write` and JS concatenation in loops produce quadratic costs if every
