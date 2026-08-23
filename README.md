@@ -41,8 +41,9 @@ hello, Firn -- dist2 25, dist 5, box 12, sum 10
 
 `FIRNLIB` tells the compiler where the standard library lives; a program that
 imports nothing does not need it. `bash test.sh` runs the whole acceptance
-suite (it takes a while — it builds the compiler, then compiles and runs every
-program in the tree three times, in both compilers).
+suite — it builds the compiler, compiles and runs every program in the tree at
+three optimisation levels, and then works through about forty section proofs.
+It takes a while.
 
 ---
 
@@ -59,7 +60,7 @@ the numbers, together with the command for each one, are in
 | **Language** | structs, arrays, `enum` + `match` with exhaustiveness check, generics, interfaces, closures and function values, error unions `E!T`, `defer`/`errdefer`, `comptime` + `emit`, `f32`/`f64`, `str` with `f"…"` interpolation, threads, `extern fn` in both directions | `tests/` (three build levels each) |
 | **Garbage collector** | opt-in, incremental mark-sweep, **longest pause 0.45 ms** at 120,000 live nodes; weak refs, finalizers, `GcVec`/`GcMap` | `tools/dom_soak/run.sh` |
 | **Tooling** | formatter, DWARF line info + `gdb`, language server (`firnc --lsp`), package/project system, test runner with JSON output | `tools/fmt`, `tools/dwarf`, `tools/lsp`, `tools/packages` |
-| **HTML** | tokenizer written in Firn, **6,810 / 6,810 html5lib cases (100.00 %)**; against html5ever **1.17x** on real pages and **0.80x** (ahead) on the pathological corpus | `tools/tokenizer/run.sh`, `throughput.sh` |
+| **HTML** | tokenizer written in Firn, **6,810 / 6,810 html5lib cases (100.00 %)**; against html5ever **1.18x** on real pages and **0.80x** (ahead) on the pathological corpus | `tools/tokenizer/run.sh`, `throughput.sh` |
 | **CSS + layout** | against Chromium: **1,087 / 1,087 boxes, deviation 0.00 %**, paint order 5,171 / 5,171 probe points | `tools/layout/run.sh` |
 | **JavaScript** | test262, **63,364 cases, nothing filtered**: parser **91.94 %**, engine **76.00 %** | `tools/js/run.sh` |
 | **Cryptography, compression** | SHA-256, AES, DEFLATE — written in Firn, held against OpenSSL/zlib and the NIST vectors; behind by 1.38x–1.88x | `tools/stdlib81/run.sh`, `tools/bench82/run.sh` |
@@ -71,9 +72,10 @@ the numbers, together with the command for each one, are in
 
 ## A tour of the language
 
-This is [`examples/tour.fi`](examples/tour.fi) verbatim. It is part of the
-acceptance suite, so it is compiled and run three times (with the optimizer,
-without it, and at `dev-fast`) on every `bash test.sh`.
+This is [`examples/tour.fi`](examples/tour.fi) verbatim, minus the
+`// expect_exit: 0` line in which the test harness records what it expects. The
+file is part of the acceptance suite, so it is compiled and run three times
+(with the optimizer, without it, and at `dev-fast`) on every `bash test.sh`.
 
 ```firn
 import std.io
@@ -140,10 +142,9 @@ hello, Firn -- dist2 25, dist 5, box 12, sum 10
   allocates — which is why `gc_init()` stands at the top. `&&`/`||`
   short-circuit; output without libc also works raw, via `syscall(nr, a1..a6)`.
 
-More: [`examples/hello.fi`](examples/hello.fi) (one `write` syscall, no library
-at all), [`fib.fi`](examples/fib.fi), [`structs.fi`](examples/structs.fi),
-[`bubblesort.fi`](examples/bubblesort.fi),
-[`demos/number_check.fi`](demos/number_check.fi).
+More: [`hello.fi`](examples/hello.fi) (one `write` syscall, no library at all),
+[`fib.fi`](examples/fib.fi), [`structs.fi`](examples/structs.fi),
+[`bubblesort.fi`](examples/bubblesort.fi), [`number_check.fi`](demos/number_check.fi).
 
 ---
 
@@ -251,7 +252,7 @@ and a `line:column` — it does not crash and it does not pretend.
   1.43x–4.16x. Three of the six programs are inside the target; `sieve` is
   the outlier that carries the median, and the distance is where LLVM
   vectorizes. The same target **is** met for the HTML tokenizer against
-  html5ever (1.17x on real pages, 0.80x on the pathological corpus).
+  html5ever (1.18x on real pages, 0.80x on the pathological corpus).
   Raw tables: [bench/RESULTS.md](bench/RESULTS.md).
 
 ---
