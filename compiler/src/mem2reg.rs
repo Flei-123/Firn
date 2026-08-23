@@ -147,6 +147,11 @@ pub(crate) fn replace_uses(f: &mut Func, map: &HashMap<Val, Val>) -> usize {
                     rep(base, &mut n);
                     rep(off, &mut n);
                 }
+                Op::Simd { args, .. } => {
+                    for a in args.iter_mut() {
+                        rep(a, &mut n);
+                    }
+                }
                 Op::Call { args, .. } | Op::Syscall { args } => {
                     for a in args.iter_mut() {
                         rep(a, &mut n);
@@ -269,6 +274,11 @@ pub(crate) fn promote_single_store(f: &mut Func) -> usize {
         return 0;
     }
     let cells = scan_cells(f);
+    // ROUND 82: no cell, nothing to promote — and above all no dominator
+    // matrix to build. A function without an `alloca` paid for it before.
+    if cells.is_empty() {
+        return 0;
+    }
     let dom = dominators(f);
     let mut map: HashMap<Val, Val> = HashMap::new();
     for (cell, u) in cells.iter() {

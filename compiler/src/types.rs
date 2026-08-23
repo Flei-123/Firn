@@ -36,6 +36,20 @@ pub enum Type {
     Void,
     /// Only to suppress follow-up errors after a reported error.
     Error,
+    /// **ROUND 82** — the 128-bit vector register (SPEC §8.6).
+    ///
+    /// Sixteen octets, sixteen byte aligned, at home in one `xmm` register.
+    /// It carries NO element type: what the sixteen octets mean is decided
+    /// by the instruction that is applied to them (`__v128_add32` reads them
+    /// as four `u32`, `__aesenc` as one AES state). That is deliberately
+    /// different from `f32x4`-style types — the crypto instructions of the
+    /// processor have no element type either, and a type per reading would
+    /// only produce conversions that generate no code.
+    ///
+    /// `v128` has NO operators. Everything happens through the `__v128_*`
+    /// intrinsics of `simd.rs`; that keeps `+` from silently meaning four
+    /// different machine instructions.
+    V128,
     /// **Round 58** — a function as a VALUE (`fn(i32, i32) -> i32`).
     ///
     /// One machine word wide: the pointer to a FUNCTION RECORD. Word 0 of
@@ -184,6 +198,9 @@ impl TypeCtx {
             Type::I32 | Type::U32 | Type::F32 => 4,
             Type::I64 | Type::U64 | Type::Usize | Type::Isize | Type::UntypedInt => 8,
             Type::F64 => 8,
+            // ROUND 82: sixteen octets, and sixteen byte aligned (align_of
+            // asks size_of for everything that is not array/struct).
+            Type::V128 => 16,
             Type::Ptr { .. } => 8,
             Type::Fn { .. } => 8,
             Type::Array(e, n) => self.size_of(e) * *n,
@@ -228,6 +245,7 @@ impl TypeCtx {
             Type::Bool => "bool".into(),
             Type::F64 => "f64".into(),
             Type::F32 => "f32".into(),
+            Type::V128 => "v128".into(),
             // A pointer to a gc class is spelled `Gc[C]` in the source text
             // (the struct carries "gc C" as its internal name, see gc.rs).
             Type::Ptr { inner, .. } if self.gc_class_name(inner).is_some() => {

@@ -56,6 +56,8 @@ pub struct OptStats {
     pub hoisted: usize,
     /// edges threaded past a bool confluence
     pub threaded: usize,
+    /// ROUND 82: places at which `peephole.rs` replaced an instruction
+    pub strength: usize,
 }
 
 // ----------------------------------------------------- Pass register ---
@@ -136,6 +138,12 @@ pub const PASSES: &[PassInfo] = &[
         scope: Scope::Func,
         debug_preserving: true,
         what: "propagate copies, algebraic identities",
+    },
+    PassInfo {
+        name: "strength",
+        scope: Scope::Func,
+        debug_preserving: true,
+        what: "negated comparison, brcond over a negation, unsigned / and % by a power of two",
     },
     PassInfo {
         name: "cse",
@@ -254,34 +262,82 @@ pub fn optimize(m: &mut Module) -> OptStats {
     optimize_with(m, &OptConfig::default())
 }
 
+/// **ROUND 82** — milliseconds per pass, summed over all functions.
+///
+/// Switched on with `FIRN_PASS_TIMINGS=1`. Why an environment variable and
+/// not a flag: this is a measurement of the COMPILER, not of the program, and
+/// it belongs next to `--timings` without giving the command line a second
+/// switch that nobody uses twice a year.
+#[derive(Default)]
+pub struct PassClock {
+    pub rows: Vec<(&'static str, f64)>,
+    pub on: bool,
+    pub rounds: usize,
+}
+
+impl PassClock {
+    fn add(&mut self, name: &'static str, t: std::time::Instant) {
+        if !self.on {
+            return;
+        }
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        match self.rows.iter_mut().find(|r| r.0 == name) {
+            Some(r) => r.1 += ms,
+            None => self.rows.push((name, ms)),
+        }
+    }
+    fn print(&self) {
+        if !self.on {
+            return;
+        }
+        let total: f64 = self.rows.iter().map(|r| r.1).sum();
+        let mut rows = self.rows.clone();
+        rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        eprintln!("optimizer passes (milliseconds, {} fixpoint rounds in all)", self.rounds);
+        for (n, ms) in &rows {
+            eprintln!("  {:<16} {:8.1} ms  {:5.1} %", n, ms, ms / total * 100.0);
+        }
+    }
+}
+
 pub fn optimize_with(m: &mut Module, cfg: &OptConfig) -> OptStats {
     let mut st = OptStats::default();
     if cfg.level == Level::Dev {
         return st;
     }
+    let mut clk = PassClock {
+        on: std::env::var_os("FIRN_PASS_TIMINGS").is_some(),
+        ..Default::default()
+    };
     // Clean up per function first, so that the size heuristic of the inliner
     // works on bodies that are already simplified.
     for f in m.funcs.iter_mut() {
-        optimize_func(f, &mut st, cfg);
+        optimize_func(f, &mut st, cfg, &mut clk);
     }
     if cfg.runs("inline") {
+        let t = std::time::Instant::now();
         st.inlined += crate::inline::inline_module(m);
+        clk.add("inline", t);
         for f in m.funcs.iter_mut() {
-            optimize_func(f, &mut st, cfg);
+            optimize_func(f, &mut st, cfg, &mut clk);
         }
     }
+    clk.print();
     st
 }
 
-fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig) {
+fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut PassClock) {
     let mut round = 0;
     loop {
         round += 1;
         let mut changed = false;
         if cfg.runs("fold") {
+            let t = std::time::Instant::now();
             changed |= fold_constants(f, st);
+            clk.add("fold", t);
         }
         if cfg.runs("mem2reg") {
+            let t = std::time::Instant::now();
             let p =
                 crate::mem2reg::promote_single_store(f) + crate::mem2reg::forward_local_loads(f);
             let ds = crate::mem2reg::remove_dead_stores(f);
@@ -289,44 +345,69 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig) {
             changed |= ds > 0;
             st.promoted_loads += p;
             changed |= p > 0;
+            clk.add("mem2reg", t);
         }
         if cfg.runs("copyprop") {
+            let t = std::time::Instant::now();
             let c = crate::mem2reg::copy_propagate(f);
             st.copies += c;
             changed |= c > 0;
+            clk.add("copyprop", t);
+        }
+        if cfg.runs("strength") {
+            let t = std::time::Instant::now();
+            let n = crate::peephole::run(f);
+            st.strength += n;
+            changed |= n > 0;
+            clk.add("strength", t);
         }
         if cfg.runs("cse") {
+            let t = std::time::Instant::now();
             let e = cse(f);
             st.cse += e;
             changed |= e > 0;
+            clk.add("cse", t);
         }
         if cfg.runs("licm") {
+            let t = std::time::Instant::now();
             let h = crate::licm::hoist_loop_invariants(f);
             st.hoisted += h;
             changed |= h > 0;
+            clk.add("licm", t);
         }
         if cfg.runs("bce") {
+            let t = std::time::Instant::now();
             let r = remove_redundant_checks(f);
             st.removed_checks += r;
             changed |= r > 0;
+            clk.add("bce", t);
         }
         if cfg.runs("thread-bool") {
+            let clock = std::time::Instant::now();
             let t = crate::threading::thread_bool_cells(f);
             st.threaded += t;
             changed |= t > 0;
+            clk.add("thread-bool", clock);
         }
         if cfg.runs("simplify-term") {
+            let t = std::time::Instant::now();
             changed |= simplify_terminators(f);
+            clk.add("simplify-term", t);
         }
         if cfg.runs("merge-blocks") {
+            let t = std::time::Instant::now();
             let mb = crate::mem2reg::merge_blocks(f);
             st.merged_blocks += mb;
             changed |= mb > 0;
+            clk.add("merge-blocks", t);
         }
         if cfg.runs("dce") {
+            let t = std::time::Instant::now();
             changed |= remove_unreachable_blocks(f, st);
             changed |= remove_dead_insts(f, st);
+            clk.add("dce", t);
         }
+        clk.rounds += 1;
         if !changed || round >= MAX_ROUNDS {
             break;
         }
@@ -362,6 +443,7 @@ fn tyk(t: FTy) -> u8 {
         FTy::Bool => 9,
         FTy::Ptr => 10,
         FTy::Void => 11,
+        FTy::V128 => 14,
     }
 }
 
