@@ -82,7 +82,9 @@ echo "-- 2. compare --"
 same=0
 different=0
 missing=0
-for f in stage1 stage1.s stage2 stage2.s package_bin package_bin.s; do
+# `firnc0` deletes its `.s` after linking, the compiler in Firn keeps it --
+# hence only stage2.s is in the list.
+for f in stage1 stage2 stage2.s package_bin; do
     if [ ! -f "$A/$f" ] || [ ! -f "$B/$f" ]; then
         printf '   %-14s MISSING\n' "$f"
         missing=$((missing + 1))
@@ -103,6 +105,28 @@ for f in stage1 stage1.s stage2 stage2.s package_bin package_bin.s; do
         different=$((different + 1))
     fi
 done
+
+# --- the diagnosis, so that "DIFFERENT" is not the end of the sentence ------
+if [ "$different" -ne 0 ] && command -v readelf > /dev/null; then
+    echo
+    echo "-- 3. where the difference sits --"
+    for f in stage1 package_bin; do
+        [ -f "$A/$f" ] && [ -f "$B/$f" ] || continue
+        ca=$(readelf --debug-dump=info "$A/$f" 2>/dev/null | grep -m1 'DW_AT_comp_dir' | sed 's/.*: *//')
+        cb=$(readelf --debug-dump=info "$B/$f" 2>/dev/null | grep -m1 'DW_AT_comp_dir' | sed 's/.*: *//')
+        if [ -n "$ca$cb" ] && [ "$ca" != "$cb" ]; then
+            printf '   %-14s DW_AT_comp_dir  A: %s\n' "$f" "$ca"
+            printf '   %-14s DW_AT_comp_dir  B: %s\n' "" "$cb"
+        fi
+        # How many octets really differ?
+        n=$(cmp -l "$A/$f" "$B/$f" 2>/dev/null | wc -l)
+        t=$(stat -c%s "$A/$f")
+        printf '   %-14s %s of %s octets differ\n' "" "$n" "$t"
+    done
+    echo "   The absolute working directory ends up in .debug_str as"
+    echo "   DW_AT_comp_dir (compiler/src/dwarf_info.rs). The compiler written"
+    echo "   in Firn writes no .debug_info -- which is why stage2 is identical."
+fi
 
 # The compiler out of Rust is checked too -- but its result is NOT part of
 # the claim: `rustc` writes the build path into the binary, and that is
