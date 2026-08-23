@@ -168,6 +168,7 @@ fn tyname(t: &Type, tcx: &TypeCtx) -> String {
         Type::Isize => "isize".into(),
         Type::Bool => "bool".into(),
         Type::F64 => "f64".into(),
+        Type::V128 => "v128".into(),
         Type::Void => "void".into(),
         Type::UntypedInt => "untyped".into(),
         Type::Error => "?".into(),

@@ -56,6 +56,13 @@
 #      the same login dribbled out ONE OCTET PER WRITE, sixteen logins at
 #      the same time -- and, if node is there, node-minecraft-protocol as a
 #      third implementation nobody here wrote.
+#  40. The standard library of round 81 (tools/stdlib81/run.sh): the hash
+#      and the octet keys of the map (a million entries, the longest probe
+#      chain MEASURED, an endurance run with a counter-check that must
+#      grow), DEFLATE/zlib/gzip in BOTH directions against python3 zlib,
+#      gzip and the gunzip binary, JSON against JSONTestSuite and
+#      python3 -m json.tool, and lib/std/crypto against 1,919 NIST CAVP
+#      vectors, the openssl binary and python3 hashlib. Three build stages.
 #  18. Package and project system (tools/packages/run.sh): manifest, search
 #      order, visibility, build driver -- in BOTH compilers.
 #  19. Freestanding compilation (tools/freestanding/run.sh, round 52):
@@ -871,6 +878,70 @@ else
     bad "tools/escape/run.sh failed (see .test-work/escape.log)"
     grep -E '^FAIL' "$WORK/escape.log" | head -10 | sed 's/^/   /'
 fi
+
+echo "== 41. the standard library of round 81 (tools/stdlib81/run.sh) =="
+# FOUR AREAS, none of them judged by this repository:
+#   * HASH AND MAP: xxHash64 against the author's own implementation
+#     (python-xxhash) and FNV-1a against its published vectors; then a
+#     MILLION entries with string keys -- time, memory and the LONGEST
+#     PROBE CHAIN, because open addressing degenerates silently. Plus an
+#     endurance run (1.2 M insert+delete, RSS flat) WITH the counter-check
+#     that leaves the deletions out and MUST grow.
+#   * DEFLATE: everything Firn packs is unpacked by python3 zlib, by gzip
+#     and by the gunzip binary, everything they pack is unpacked by Firn,
+#     over empty input, one octet, incompressible data, one repeated octet
+#     and real files -- plus four broken streams that have to be REFUSED.
+#   * JSON: JSONTestSuite (testdata/json/) -- every y_ accepted, every n_
+#     refused -- and the output against python3 -m json.tool.
+#   * CRYPTO: 1,919 NIST CAVP vectors (testdata/crypto/), the FIPS 197
+#     known answer test, multi block CBC/CFB8 against openssl (the KAT
+#     files are single block and do not test chaining at all) and python3
+#     hashlib/hmac over random data.
+# All of it in THREE build stages. STDLIB81_FAST=1 runs the optimised one.
+bash tools/stdlib81/run.sh > "$WORK/stdlib81.log" 2>&1 && STDRC=0 || STDRC=$?
+if [ "$STDRC" -eq 0 ]; then
+    ok
+    grep -E '^  (FNV-1a|hash vectors|release-fast [0-9]|probe chain|soak |counter-check |level [0-9]|y_ |n_ |i_ |json.tool|json.load|error position|python/openssl|getrandom|testdata/|sha1 |sha256 |aes |cfb8 )' \
+        "$WORK/stdlib81.log" | sed 's/^/ /'
+    grep -E '^NIST TOTAL' "$WORK/stdlib81.log" | head -1 | sed 's/^/   /'
+    grep -E '^  RESULT ok \(' "$WORK/stdlib81.log" | head -1 | sed 's/^/   deflate /'
+else
+    bad "tools/stdlib81/run.sh failed (see .test-work/stdlib81.log)"
+    grep -E 'FAIL|RESULT' "$WORK/stdlib81.log" | head -12 | sed 's/^/   /'
+fi
+
+echo "== 45. the speed of round 82 (tools/bench82/run.sh) =="
+# THREE THINGS IN ONE SECTION, and the first one is not a measurement:
+#
+#   * BOTH PATHS, THE SAME ANSWER. `lib/std/crypto/accel.fi` is a SECOND
+#     implementation of SHA-256 and AES-128, on the processor's own
+#     instructions (`sha256rnds2`, `aesenc`). Every length from 0 to 300
+#     octets goes through it AND through the scalar path, and the two have to
+#     agree octet for octet -- plus the FIPS 197 and FIPS 180-4 known answers,
+#     which come from outside this repository. That check runs BEFORE the
+#     stopwatch, because a fast cipher that is wrong is worth less than a
+#     slow one that is right.
+#   * THE THROUGHPUT, against `openssl speed` and `gzip -6` ON THE SAME
+#     MACHINE and, for DEFLATE, on literally the same octets. A number
+#     without a yardstick next to it says nothing.
+#   * THE REGRESSION LIMITS (`tools/bench82/minquota_*.txt`, and one CEILING
+#     for the self compile). They sit at roughly half of what was measured:
+#     this is a shared virtual machine and the same binary varies by a factor
+#     of two depending on the neighbours. That catches a real regression and
+#     not the noise.
+#
+# BENCH82_FULL=1 measures with bigger buffers; what runs here is the fast
+# variant.
+bash tools/bench82/run.sh > "$WORK/bench82.log" 2>&1 && B82RC=0 || B82RC=$?
+if [ "$B82RC" -eq 0 ]; then
+    ok
+    grep -E '^  (SHA-256|AES-128-CBC|AES-CBC dec|AES-128-CFB8|DEFLATE|inflate|FIPS|processor|total:)' \
+        "$WORK/bench82.log" | sed 's/^/ /'
+else
+    bad "tools/bench82/run.sh failed (see .test-work/bench82.log)"
+    grep -E 'FAIL|MISMATCH|BELOW|ABOVE|RESULT' "$WORK/bench82.log" | head -12 | sed 's/^/   /'
+fi
+echo
 
 TOTAL=$((PASS + FAIL))
 echo

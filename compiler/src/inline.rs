@@ -292,6 +292,11 @@ fn remap_op(op: &Op, mv: &dyn Fn(Val) -> Val) -> Op {
             target: mv(*target),
             args: args.iter().map(|a| mv(*a)).collect(),
         },
+        Op::Simd { kind, args, imm } => Op::Simd {
+            kind: *kind,
+            args: args.iter().map(|a| mv(*a)).collect(),
+            imm: *imm,
+        },
         Op::VtabAddr { table } => Op::VtabAddr { table: table.clone() },
         Op::FnRef { name } => Op::FnRef { name: name.clone() },
         Op::Syscall { args } => Op::Syscall { args: args.iter().map(|a| mv(*a)).collect() },
