@@ -154,7 +154,7 @@ fi
 
 echo
 echo "== 6. counter-check C: profile kernel keeps its hands off =="
-cat > "$WORK/kern.fi" <<'EOF'
+cat > "$WORK/kernel_probe.fi" <<'EOF'
 profile kernel
 
 fn kmain(p: *mut u32) -> u32 {
@@ -167,13 +167,13 @@ fn kmain(p: *mut u32) -> u32 {
     return s
 }
 EOF
-"$FIRNC" --emit=asm "$WORK/kern.fi" -o "$WORK/kern.s" > "$WORK/kern.build" 2>&1
-if [ ! -s "$WORK/kern.s" ]; then
+"$FIRNC" --emit=asm "$WORK/kernel_probe.fi" -o "$WORK/kernel_probe.s" > "$WORK/kernel_probe.build" 2>&1
+if [ ! -s "$WORK/kernel_probe.s" ]; then
     bad "the kernel profile did not compile"
-    sed 's/^/       /' "$WORK/kern.build" | head -5
-elif grep -q '_start' "$WORK/kern.s"; then
+    sed 's/^/       /' "$WORK/kernel_probe.build" | head -5
+elif grep -q '_start' "$WORK/kernel_probe.s"; then
     bad "the kernel profile has an entry point -- that is new and wrong"
-elif grep -q 'gc_init' "$WORK/kern.s"; then
+elif grep -q 'gc_init' "$WORK/kernel_probe.s"; then
     bad "the kernel profile carries a gc_init"
 else
     ok "no _start, no gc_init -- unchanged since round 52"
