@@ -72,5 +72,5 @@ out.append('        i = i + 1')
 out.append('    }')
 out.append('}')
 open('lib/firnc1/gctext.fi','w').write('\n'.join(out) + '\n')
-print('lib/firnc1/gctext.fi:', alle, 'Bytes (kern', n, ') als', len(words), 'Woerter')
+print('lib/firnc1/gctext.fi:', alle, 'bytes (core', n, ') as', len(words), 'words')
 PYEOF

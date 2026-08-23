@@ -196,6 +196,27 @@ pub fn emit(m: &Module) -> Result<String, String> {
     e.raw(".globl _start");
     e.raw("_start:");
     e.line("xor rbp, rbp");
+    // HOOK gc (ROUND 88): THE COLLECTOR STARTS ITSELF.
+    //
+    // Whoever writes `let b = a + " and more"` allocates on the GC heap --
+    // and up to round 87 the program then died with exit code 70 and
+    // `firn-gc: gc_init() was not called`, because the collector waited for
+    // a call the beginner had never read about anywhere. The compiler knows
+    // at this point that it has linked the runtime in (gc.rs, the token
+    // signal of SPEC 8.0); so it also writes the setup.
+    //
+    // HERE and not in `main`: this is the first instruction of the process,
+    // before the first instruction of the user, exactly once, and no source
+    // text has to be rewritten for it. `gc_init` is idempotent (`S_INIT` in
+    // lib/gc/gc.fi) -- an explicit `if !gc_init() { … }` in the program
+    // keeps working and just gets `true` back. `gc_set_max_bytes` afterwards
+    // keeps working too; it writes its own word of the state block.
+    //
+    // Under the kernel profile nothing of this arises: there is no `_start`
+    // there at all (`freestanding` above), and hence no collector.
+    if crate::gc::runtime_active() {
+        e.line(&format!("call {}", label(crate::gc::FN_INIT)));
+    }
     // START BLOCK AT `main`: at process start `rsp` points to
     //   [argc][argv0]..[argvN][0][envp0]..[0][auxv..]
     // That pointer goes to `rdi` — that is, to the FIRST parameter of `main`.

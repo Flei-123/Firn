@@ -65,7 +65,12 @@ LANGE_MORPHEME = lange_morpheme()
 
 LIT = re.compile(r'"((?:[^"\\\n]|\\.)*)"', re.S)
 WORT = re.compile(r'[A-Za-z]{3,}')
-DATEIEN = ('compiler/src', 'lib/firnc1', 'bin')
+# ROUND 88: `lib/` joined the list. Until then only the two COMPILERS were
+# checked -- and that is exactly why `firn-gc: gc_init() wurde nicht
+# aufgerufen` (lib/gc/gc.fi) survived every check since round 55: it is a
+# RUN TIME text, it lives in the library, and nobody looked there. Whoever
+# writes a message in `lib/**.fi` is now caught by the same net.
+DATEIEN = ('compiler/src', 'lib/firnc1', 'bin', 'lib')
 
 
 def literale(text):
@@ -79,6 +84,10 @@ def basis_woerter():
                          capture_output=True, text=True).stdout.split('\n')
     w = set()
     for f in aus:
+        # Die WORTLISTE kommt weiter nur aus den beiden Uebersetzern: sie
+        # bestimmt, was ueberhaupt als deutsch gilt. Wuerde lib/ mitzaehlen,
+        # kaemen aus HTML-Testdaten Woerter wie `frame` oder `style` hinein
+        # und jeder englische Satz mit `frame` waere ein Fehlalarm.
         if not (f.startswith('compiler/src/') or f.startswith('lib/firnc1/')
                 or f.startswith('bin/')):
             continue
@@ -114,11 +123,20 @@ def ausnahmen():
     return w
 
 
+def quelldateien():
+    """Alle Quellen der beiden Uebersetzer UND der Bibliothek, rekursiv."""
+    aus = []
+    for wurzel in DATEIEN:
+        for ordner, _, namen in os.walk(wurzel):
+            for n in sorted(namen):
+                aus.append(os.path.join(ordner, n))
+    return sorted(set(aus))
+
+
 def main():
     de = basis_woerter() - englische_spalte() - ENGLISCH - ausnahmen()
     treffer = []
-    for wurzel in DATEIEN:
-        for f in sorted(glob.glob(wurzel + '/*')):
+    for f in quelldateien():
             if os.path.islink(f) or f.endswith('gctext.fi'):
                 continue
             if not (f.endswith('.rs') or f.endswith('.fi')):
