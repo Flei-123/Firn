@@ -58,6 +58,14 @@ use std::cell::RefCell;
 /// the ordinary "already declared" message.
 pub(crate) const NAME: &str = "str";
 
+/// **ROUND 88** — the second spelling, out of the C# flavoured alias family
+/// of round 70/71 (`types.rs::alias_of`). `string` IS `str`: the name is
+/// folded onto `NAME` before the struct lookup (`sema.rs::resolve_ty`), so
+/// there is only ever ONE type. It has to stand here as well, because the
+/// trigger below reads the TOKENS — a program that only ever writes
+/// `string` needs the collector just as much as one that writes `str`.
+pub(crate) const NAME_ALIAS: &str = "string";
+
 /// Content comparison of two `str` (`lib/gc/gc.fi`).
 pub(crate) const FN_EQ: &str = "__str_eq";
 /// Concatenation of two `str` in the GC heap (`lib/gc/gc.fi`).
@@ -150,6 +158,31 @@ pub(crate) fn remember_views(tcx: &TypeCtx) {
     REG.with(|r| r.borrow_mut().views = views);
 }
 
+/// **ROUND 88** — the names of the structs a `str` may take its methods
+/// from: every registered view (`{ *mut u8, usize }` — that is `str.Span`),
+/// in the order in which they were declared, so that the choice is settled
+/// and does not depend on a hash table.
+///
+/// WHY THIS EXISTS. Up to round 87 `a.length()` and `a.starts_with("te")`
+/// worked on a `str` and `a.part(0, 4)` did not — and the reason was an
+/// ACCIDENT: the builtin type is called `str`, the module of the string
+/// library is called `str` too, so `a.length()` found the FREE function
+/// `str.length(s: Span)` under the very name (`str__length`) that the
+/// method resolution builds. Everything for which the module happens to
+/// have a free function of the same name looked like a method; `part` has
+/// none (it is called `span_part` there) and therefore did not exist.
+/// SPEC 8.1 promises the whole library on a `str`, so the resolution now
+/// really asks `impl Span` as well.
+pub(crate) fn view_names(tcx: &TypeCtx) -> Vec<String> {
+    REG.with(|r| {
+        r.borrow()
+            .views
+            .iter()
+            .filter_map(|i| tcx.structs.get(*i).map(|s| s.name.clone()))
+            .collect()
+    })
+}
+
 /// May these two types be used for each other?
 ///
 /// True exactly when ONE of them is the builtin `str` and the other is a
@@ -180,7 +213,7 @@ pub(crate) fn same_view(a: &Type, b: &Type) -> bool {
 ///
 /// Two signals, both purely syntactic:
 ///
-///  1. the identifier `str` NOT next to a `.` — that is the TYPE name
+///  1. the identifier `str` — since round 88 `string` too — NOT next to a `.` — that is the TYPE name
 ///     (`let s: str`, `-> str`, `str { … }`). `import std.str` and
 ///     `str.trim(x)` are excluded by the dot.
 ///  2. a text literal directly next to `+`, `==` or `!=` — the two
@@ -192,7 +225,7 @@ pub(crate) fn same_view(a: &Type, b: &Type) -> bool {
 pub(crate) fn source_uses_str(toks: &[crate::lexer::Token]) -> bool {
     for (i, t) in toks.iter().enumerate() {
         if let TokKind::Ident(n) = &t.kind {
-            if n == NAME {
+            if n == NAME || n == NAME_ALIAS {
                 let before_dot = i > 0 && matches!(toks[i - 1].kind, TokKind::Dot);
                 let after_dot = matches!(toks.get(i + 1).map(|x| &x.kind), Some(TokKind::Dot));
                 if !before_dot && !after_dot {
