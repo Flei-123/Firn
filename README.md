@@ -1563,3 +1563,9 @@ three tests instead of claimed:
 * an addition with an unknown name produces **the same** error as in the first
   pass -- an addition is not a back door
 * an addition that declares `main` again is detected as a duplicate declaration
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).
