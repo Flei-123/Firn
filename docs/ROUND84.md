@@ -208,6 +208,29 @@ FIPS vectors, including the million-`a` case and chunked input, and the
 proof that the length prefix makes the feed unambiguous) and in
 `compiler/src/lexer.rs` (the shebang, and that `#` in line 2 stays a `Hash`).
 
+## 5.1 The state of `test.sh` in this round -- honestly
+
+`./test.sh` on this branch: **1199 of 1202**, and the three that are not
+green have nothing to do with round 84:
+
+* `tools/aarch64/run.sh` (twice, once per build stage):
+  `tests/1613_crypto.fi` cannot be built for aarch64 -- *"cannot emit the
+  vector instruction yet (round 82 built them for x86-64)"*. That is the
+  leftover of the r80/r82 merge and it fails **on `main` in exactly the same
+  way**: checked by running `tools/aarch64/run.sh` in the untouched main
+  worktree (`598f2061`), same case, same message, `RESULT: 296 of 301`.
+* `tools/js/round66.sh`: the promise soak died with SIGSEGV in the run that
+  had four full test suites on the same 8 vCPU at once. Run again on its own
+  it passes (`OK: the features of round 66 hold their limits`, exit 0). A
+  load flake, not a regression.
+
+What round 84 touches is green: section 45 (17/17), section 24 (the
+formatter, 5/5 pinned cases and the whole tree in shape), section 21 (the
+English check), `tools/self_compare.sh` (321 the same, 0 differing, 0
+faulty) and `tools/fixpoint.sh` (stage 2 == stage 3, character-identical,
+649,903 lines of assembly) -- the last one is the one that matters here,
+because the shebang rule had to go into BOTH lexers.
+
 ## 6. What this round is NOT
 
 No interpreter, no JIT, no incremental compilation. `firnc run` compiles the
