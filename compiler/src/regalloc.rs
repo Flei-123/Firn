@@ -989,6 +989,7 @@ fn loop_depth(f: &Func) -> Vec<u32> {
 /// registers -- five of them lost and went to the stack, among them the
 /// counters of the innermost loop. Measured with `FIRN_RA_STATS=1`:
 /// `cellivs=9 cellslost=5`.
+#[allow(dead_code)]
 fn loop_ranges(f: &Func, block_start: &[usize], block_end: &[usize]) -> Vec<(usize, usize)> {
     let nb = f.blocks.len();
     let mut out: Vec<(usize, usize)> = Vec::new();
@@ -1012,6 +1013,7 @@ fn loop_ranges(f: &Func, block_start: &[usize], block_end: &[usize]) -> Vec<(usi
 /// the caller falls back to the interval that was always safe (`[0, last
 /// access]`). Never a half widened range: that would be a wrong-code bug of
 /// exactly the kind this round exists to stop making.
+#[allow(dead_code)]
 fn widen_to_loops(mut s: usize, mut e: usize, loops: &[(usize, usize)]) -> Option<(usize, usize)> {
     for _ in 0..=loops.len() {
         let mut changed = false;
@@ -1208,45 +1210,35 @@ pub fn allocate(f: &Func) -> Alloc {
         }
         ivs.push(Iv { val: v as Val, start: s, end: e, weight: weight[v], killed, is_cell: false });
     }
-    // ROUND 90: where is a cell really touched? `start[cv]` is the position
-    // of the `alloca` itself, which stands at the top of the function and
-    // says nothing; what counts is the first and the last LOAD or STORE
-    // through it.
-    let mut cell_first: HashMap<Val, usize> = HashMap::new();
-    let mut cell_last: HashMap<Val, usize> = HashMap::new();
-    for (bi, b) in f.blocks.iter().enumerate() {
-        for (ii, i) in b.insts.iter().enumerate() {
-            let addr = match &i.op {
-                Op::Load { addr } => *addr,
-                Op::Store { addr, .. } => *addr,
-                _ => continue,
-            };
-            if !cells.contains_key(&addr) {
-                continue;
-            }
-            let p = live.pos[bi][ii];
-            cell_first.entry(addr).and_modify(|x| *x = (*x).min(p)).or_insert(p);
-            cell_last.entry(addr).and_modify(|x| *x = (*x).max(p)).or_insert(p);
-        }
-    }
-    let loops = loop_ranges(f, &live.block_start, &live.block_end);
     for (&c, _) in cells.iter() {
         let cv = c as usize;
         if start[cv] == usize::MAX {
             continue;
         }
-        // The cell has to sit in the register from its first access to its
-        // last -- and, because a variable in a loop is read again after the
-        // back edge, over every loop those accesses lie in. That is strictly
-        // more than the accesses and strictly less than "from position 0",
-        // and it is the whole point of `loop_ranges` above.
-        let widened = match (cell_first.get(&c), cell_last.get(&c)) {
-            (Some(&a), Some(&b)) => widen_to_loops(a, b, &loops),
-            _ => None,
-        };
-        // The fallback is the interval of every round before this one.
-        let (s, e) = widened.unwrap_or((0usize, end[cv]));
-        let e = e.max(end[cv]);
+        // The cell has to sit in the register from the start of the function
+        // to the last access (its content survives blocks without access).
+        //
+        // ROUND 90 TRIED THE TIGHTER ANSWER and threw it away again. A cell
+        // does not live before its first access, and a variable in a loop is
+        // read again after the back edge, so `[first access, last access]`
+        // widened over the enclosing loops (`loop_ranges`/`widen_to_loops`
+        // above, still there and still used by nothing else) is both correct
+        // and much shorter: in `bench/firn/matmul.fi` it took `main` from
+        // four promoted cells to six and from five lost to three, because
+        // the three `alloc()` calls in the first ten instructions stopped
+        // counting as "crossed" for counters that appear much later.
+        //
+        // It did not pay. Measured over eight benchmarks at `release-fast`
+        // (`tools/bench90/icount.py`, instructions really executed):
+        // statemachine -4.6 %, bytecount -0.9 %, matmul +5.8 %, everything
+        // else identical to the instruction -- total -0.16 %. More cells in
+        // registers, the same amount of work, and one clear loser. Round 90
+        // is a round about a wrong-code bug; a register allocation change
+        // that buys nothing is exactly the kind of thing that should not
+        // ride along with it, so `release-fast` comes out of this round
+        // BIT-IDENTICAL to what went in.
+        let s = 0usize;
+        let e = end[cv];
         let killed = rough(s, e);
         // Cells are almost always the hottest values: double the weight.
         // (Round 87: they are counted apart. A cell has to survive from the
