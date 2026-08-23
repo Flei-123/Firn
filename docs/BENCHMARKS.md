@@ -187,20 +187,161 @@ the crypto case was not yet in the corpus.
 | measurement | result |
 |---|---:|
 | `bash test.sh` | **PASS 1184 / 1184** (state after round 79) |
-| `tools/self_compare.sh` | **321 the same, 0 differing, 0 faulty** |
-| `tools/fixpoint.sh` | **stage 2 == stage 3, character-identical**, 649,720 lines of assembly |
-| `cargo test --release` | 229 passed, 0 failed |
+| the positive corpus in ALL FOUR build levels (round 90) | **320 / 320 in each** — before round 90 `release-safe` failed 117 of them and `dev-fast` 25 |
+| `tools/optlevels/run.sh` (round 90) | the four levels agree, in both compilers |
+| `tools/checked/run.sh` | **150 / 150** |
+| `tools/self_compare.sh` | **328 the same, 0 differing, 0 faulty** (re-measured 23.08.2026) |
+| `tools/fixpoint.sh` | **stage 2 == stage 3, character-identical**, 728,292 lines of assembly (re-measured 23.08.2026) |
+| `cargo test --release` | **232 passed, 0 failed** |
+
+---
+
+## 12. Firn against Rust, with the build level named (round 90)
+
+**Read this before the table.** Until round 90 `bench/bench.py` compiled the
+Firn side with `firnc -o x y.fi` — no build level at all — and labelled the
+column "Firn". The default level has been `dev-fast` since round 72, and
+`dev-fast` **checks** integer arithmetic. Every number in `bench/RESULTS.md`
+therefore holds a *checked* Firn build against an *unchecked* `rustc -O`
+one. `sieve` stands there at 4.16x; at `release-fast` it is 1.30x.
+
+So there are two questions, and they are asked separately:
+
+* **the code generator** — `firnc --opt-level=release-fast` against
+  `rustc -O -C overflow-checks=no`;
+* **the price of safety** — `firnc --opt-level=release-safe` against
+  `rustc -O -C overflow-checks=yes`, the same guarantee on both sides.
+
+Every benchmark exists twice (`bench/firn/<n>.fi`, `bench/rust/<n>.rs`),
+computes the same thing and **prints its result**; the harness stops if the
+outputs are not identical, so nothing can be optimised away on either side.
+Median of 9 runs, the four binaries measured in one alternating pass so that
+machine drift cancels instead of landing on one of them.
+
+    python3 tools/bench90/bench.py
+
+| benchmark | what it stresses | Firn `release-fast` | `rustc -O` | behind by | Firn `release-safe` | `rustc -O` +checks | behind by |
+|---|---|---:|---:|---:|---:|---:|---:|
+| **fib** | recursion / call overhead | 0.044 s | 0.027 s | **1.62x** | 0.044 s | 0.027 s | **1.63x** |
+| **sieve** | memory, byte writes in a loop | 0.036 s | 0.027 s | **1.30x** | 0.052 s | 0.025 s | **2.12x** |
+| **matmul** | nested loops, index arithmetic | 0.060 s | 0.021 s | **2.84x** | 0.182 s | 0.070 s | **2.60x** |
+| **bytecount** | memory, sequential read | 0.325 s | 0.173 s | **1.88x** | 0.324 s | 0.119 s | **2.72x** |
+| **bubblesort** | memory + branch | 0.082 s | 0.035 s | **2.38x** | 0.104 s | 0.062 s | **1.69x** |
+| **statemachine** | branches, table dispatch | 0.161 s | 0.079 s | **2.06x** | 0.157 s | 0.072 s | **2.20x** |
+| **bitmap** | the osum frame allocator | 0.066 s | 0.032 s | **2.04x** | 0.080 s | 0.031 s | **2.63x** |
+| **xxhash** | xxHash64 over 64 MiB | 0.186 s | 0.174 s | **1.07x** | 0.232 s | 0.174 s | **1.34x** |
+| **jsonscan** | JSON scanner, generated document | 0.120 s | 0.067 s | **1.81x** | 0.144 s | 0.078 s | **1.84x** |
+| **memstride** | memory bound, cache-hostile stride | 0.224 s | 0.197 s | **1.14x** | 0.234 s | 0.197 s | **1.19x** |
+| **branchy** | unpredictable branches | 0.530 s | 0.465 s | **1.14x** | 0.523 s | 0.477 s | **1.10x** |
+
+| | before round 90 | after round 90 |
+|---|---:|---:|
+| median, `release-fast` vs `rustc -O` | 1.82x | **1.81x** |
+| median, `release-safe` vs `rustc -O` +checks | 3.18x | **1.84x** |
+| median price of the checks inside Firn | 1.97x | **1.19x** |
+
+"before" here is round 90 **stage 1** — the compiler with the wrong-code bug
+already fixed. Against `main` itself there is no speed comparison to make:
+**all eleven of these programs segfault** when `main`'s compiler builds them
+with `--opt-level=release-safe`. That is the bug, and it is measured in
+§1 of `docs/ROUND90.md`.
+
+`release-fast` is not merely "about the same" — the emitted assembly of all
+eleven programs is **character-identical** to what went into the round.
+Round 90 changed only what the checked levels emit.
+
+### What the checks cost, per program
+
+| benchmark | `release-safe` before | `release-safe` after | the checks cost, before | after |
+|---|---:|---:|---:|---:|
+| fib | 0.051 s | **0.044 s** | 1.14x | **0.99x** |
+| sieve | 0.094 s | **0.052 s** | 2.60x | **1.47x** |
+| matmul | 0.416 s | **0.182 s** | 6.96x | **3.04x** |
+| bytecount | 0.506 s | **0.324 s** | 1.55x | **1.00x** |
+| bubblesort | 0.234 s | **0.104 s** | 2.89x | **1.27x** |
+| statemachine | 0.227 s | **0.157 s** | 1.41x | **0.98x** |
+| bitmap | 0.131 s | **0.080 s** | 1.97x | **1.22x** |
+| xxhash | 0.363 s | **0.232 s** | 1.97x | **1.25x** |
+| jsonscan | 0.243 s | **0.144 s** | 2.01x | **1.19x** |
+| memstride | 0.283 s | **0.234 s** | 1.27x | **1.05x** |
+| branchy | 0.605 s | **0.523 s** | 1.14x | **0.99x** |
+
+### The same thing counted instead of timed
+
+This machine is shared, and a wall clock median still moves by several
+percent between two passes — enough to hide a real five percent and to
+invent one that is not there. `valgrind --tool=callgrind` counts the
+instructions the program really executed and is deterministic to the last
+digit. It says nothing about cache misses; for "did the loop get shorter" it
+is the honest answer.
+
+    python3 tools/bench90/icount.py
+
+| benchmark | `release-safe` before | `release-safe` after | change | `rustc -O` +checks |
+|---|---:|---:|---:|---:|
+| fib | 429,999,174 | **303,114,113** | **-29.5 %** | 204,721,288 |
+| sieve | 1,095,032,655 | **526,329,353** | **-51.9 %** | 212,271,744 |
+| matmul | 4,456,691,599 | **2,125,360,125** | **-52.3 %** | 670,142,765 |
+| bytecount | 5,682,464,133 | **2,974,915,175** | **-47.6 %** | 1,278,372,613 |
+| bubblesort | 1,885,661,378 | **857,315,966** | **-54.5 %** | 244,006,830 |
+| statemachine | 1,548,537,886 | **971,401,368** | **-37.3 %** | 505,290,506 |
+| bitmap | 1,494,353,935 | **1,004,558,579** | **-32.8 %** | 372,239,225 |
+| jsonscan | 2,264,001,094 | **1,202,000,710** | **-46.9 %** | 382,796,317 |
+
+Where it came from: every checked operation used to rescue its two operands
+on the stack for a message that is almost never printed, and carried the
+message-building arm inline in the hot instruction stream. It now reloads
+the operands out of line and a checked `+`/`-` computes in the target
+register (`docs/ROUND90.md` §2.2).
 
 ---
 
 ## Where Firn is honestly behind
 
+Everything here is measured, and the command is next to it.
+
+* **The code generator is 1.81x behind `rustc -O` in the median** of the
+  eleven programs in §12 (range 1.07x – 2.84x). Three named
+  causes, in the order of what they cost — the disassembly is in
+  `docs/ROUND90.md` §4:
+  1. **Loop counters live in memory in FIR.** `mem2reg` promotes only cells
+     written once, FIR has no phi nodes, and the register allocator promotes
+     cells at the very end — after the optimiser has already given up. So
+     `licm` cannot hoist a loop-invariant `r * n` out of the inner loop (it
+     depends on a `load`), and no induction-variable analysis can turn
+     `k * n` into an addition. Largest item left, and an architectural one.
+  2. **The allocator does not split intervals.** A value that crosses a call
+     sits on the stack for its whole life, not just across the call.
+     `matmul`'s `main`: 88 values in registers, 87 on the stack, worst
+     overlap 15 against twelve registers (`FIRN_RA_STATS=1`).
+  3. **No auto-vectorisation.** `rustc` turns `matmul`'s inner loop into
+     SSE; Firn never vectorises on its own. `lib/std` uses the vector
+     instructions by hand where it matters (round 82).
+* **Checked arithmetic still costs 1.19x in the median** (`release-safe`
+  against `release-fast`), worst `matmul` at 3.04x, where `rustc` pays
+  almost nothing for the same guarantee. The reason is not the check any
+  more — round 90 took it down from 1.97x — it is that **LLVM proves
+  most of its checks away and Firn proves none of them away**. Firn has no
+  range analysis; `i + 1` with `i < 240` known from the loop guard is still
+  a full checked addition. That is the next step, and it is the one that
+  makes "fast AND safe" true rather than nearly true.
 * **DEFLATE at 1.88x of `gzip`** — the match search is the whole story, and
   it is scalar.
-* **Register allocation spills more than half the values** of the compiler
-  itself to the stack. That is the largest single lever left.
 * **The optimizer is 61 % of the compile time** and does not earn all of it.
 * **No vector instructions on aarch64** — round 82 built them for x86-64
   only; on ARM the scalar path runs.
 * **JSON with floats collapses to 1.4 MiB/s**, ten times slower than with
   integers. The float parser is the reason, and it is known.
+
+### Where Firn is level or ahead
+
+* **xxHash64, `release-fast`: 1.07x** — a hash written with the wrapping
+  operators is the code generator with nothing in the way.
+* **unpredictable branches 1.14x, memory bound stride 1.14x** — where
+  the processor and not the compiler decides, Firn is level. At
+  `release-safe` those two are 1.10x and 1.19x: the safety is
+  nearly free where the machine is the bottleneck.
+* **`fib`, `bytecount`, `statemachine` and `branchy` cost NOTHING for being
+  checked** (price 0.99x, 1.00x, 0.98x, 0.99x) — the
+  checked build is as fast as the unchecked one there.
+* **HTML tokenizer on the html5lib corpus: 0.95x** — faster than html5ever.
