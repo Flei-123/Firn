@@ -312,13 +312,54 @@ one thing the two could not agree on. It says nothing the position does not.
 
 ## 8. The acceptance — the real numbers
 
+Every number below comes out of a run on this machine, not out of an
+estimate.
+
 | what | result |
 | --- | --- |
 | `bash tools/escape/run.sh` | 36 cases, **36 PASS, 0 FAIL** — 22 refused, 14 counter-checks |
-| messages identical in both compilers | **22 / 22**, compared with `cmp` |
-| `bash test.sh` | see section 40; the whole suite green |
-| `bash tools/fixpoint.sh` | stage 2 == stage 3, character-identical, 648,049 lines of assembly |
-| `bash tools/self_compare.sh` | 0 differing, 0 faulty |
-| the tree against the new check | 374 files, 0 remaining findings |
-| deliberate `#[allow_escape]` | 15, each with its reason at the place |
+| messages identical in both compilers | **22 / 22**, the whole block compared with `cmp` |
+| `bash test.sh` | **1,183 of 1,184** — section 40 among them with 36/36. The one failure is section 23 and is INHERITED, see below |
+| `bash tools/fixpoint.sh` | stage 2 == stage 3, **character-identical**, 648,723 lines of assembly (stage 2 13.1 s, stage 3 40.4 s, 3,791,936 octets each) |
+| `bash tools/self_compare.sh` | **318 same behaviour, 0 differing, 0 faulty**, 0 not core |
+| `bash tools/types_compare.sh` | 336 same, **0 different** |
+| `bash tools/english/check.sh` | 0 0 0 0 0 |
+| `firnfmt -c` over the tree | 0 files out of shape |
+| the tree against the new check | 374 programs of `tests/`, `bench/`, `examples/`, `demos/`, `bin/`, `lib/` — **0 remaining findings** |
+| deliberate `#[allow_escape]` | 15, each with its reason written at the place |
 | real bugs found | 2 (`nbt_type_name`, `Parser::join`) |
+| new lines | `compiler/src/escape.rs` 1,195, `lib/firnc1/escape.fi` 1,723 |
+
+### The one failure, and why it is not this round's
+
+Section 23, `tools/layout/run.sh`: **1,082 of 1,087 boxes equal to Chromium
+(0.46 % off)**, always the same five in the same four cases (`a4_abs_icb`,
+`a2_fixed_bottom_right`, `a3_fixed_percent`, `a7_sticky_bottom`). Round 79
+touches nothing in `lib/layout`, `lib/css` or `tools/layout` — `git diff` on
+those paths against the branch point is empty.
+
+It is the failure round 76 already recorded (`docs/ROUND76.md` §4.6) and
+reproduced on `main`. Round 78 then took the live browser out of the
+mandatory acceptance and froze Chromium's answer into the repository
+(`tools/layout/reference/`), which is why `main` says 1,087 / 1,087 today
+while this branch, which starts BEFORE round 78, still asks a live Chromium
+and gets the old five. Measured, both sides, today: `main` with the frozen
+reference **1,087 / 1,087, RC=0**; this branch against the live browser
+**1,082 / 1,087**. Nothing in between belongs to round 79.
+
+Two more failures turned up in an earlier run of the suite and are gone:
+`tools/english/check.sh` found `ende` (a German identifier this round had
+introduced in `lib/firnc1/parser.fi`) and the path name
+`02_return_array_element.fi` — both renamed. And `tools/self_compare.sh`
+reported one deviation in `tests/1001_js_parse.fi` while three test suites
+were running on the machine at once; standalone it is 318 / 0 / 0, and the
+fixpoint run confirms it.
+
+A word on section 34 (the JS promise endurance run of round 66), because it
+is worth knowing: it is **not deterministic**. Measured today, four runs on
+`main` and three on this branch, same binary each: `main` 2 of 4 with
+`jobs rc=-11` (SIGSEGV), this branch 2 of 3. It struck in one of the two full
+runs here and did not in the other. That is a real bug in `lib/js/gen.fi`
+waiting for a round of its own; it is neither this round's nor a measurement
+artefact, and it is written down here so the next person does not spend the
+evening on it.
