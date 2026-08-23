@@ -46,14 +46,14 @@ if ! "$WORK/soak" < "$WORK/auftrag_a.bin" > "$WORK/normal.tsv" 2>&1; then
     exit 1
 fi
 sed -n '3p;$p' "$WORK/normal.tsv" | sed 's/^/   /'
-grep '^# angelegt=' "$WORK/normal.tsv" | sed 's/^/   /'
+grep '^# created=' "$WORK/normal.tsv" | sed 's/^/   /'
 
 RSS0=$(awk '!/^#/{print $4; exit}' "$WORK/normal.tsv")
 RSS1=$(awk '!/^#/{v=$4} END{print v}' "$WORK/normal.tsv")
 ROUND=$(awk '!/^#/{v=$2} END{print v}' "$WORK/normal.tsv")
 LINES=$(grep -vc '^#' "$WORK/normal.tsv")
-CREATED=$(sed -n 's/^# angelegt=\([0-9]*\).*/\1/p' "$WORK/normal.tsv")
-LIVE=$(sed -n 's/^# angelegt=[0-9]* lebende=\([0-9]*\).*/\1/p' "$WORK/normal.tsv")
+CREATED=$(sed -n 's/^# created=\([0-9]*\).*/\1/p' "$WORK/normal.tsv")
+LIVE=$(sed -n 's/^# created=[0-9]* live=\([0-9]*\).*/\1/p' "$WORK/normal.tsv")
 
 if [ -z "$RSS0" ] || [ "$LINES" -lt 5 ]; then
     echo "   ERROR: too few measuring points ($LINES)"
