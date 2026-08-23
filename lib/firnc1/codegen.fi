@@ -38,10 +38,11 @@ import gc
 import iface
 import core
 import ast
+import sema
 
 export { Cg, cg_new, cg_free, cg_run, cg_unsuitable, cg_text, cg_gc_set,
     cg_freestanding_set,
-    cg_if_set, cg_tree_set }
+    cg_if_set, cg_tree_set, cg_sema_set }
 
 const NONE: u32 = 4294967295
 
@@ -71,6 +72,13 @@ struct Cg {
     // means the program contains no checked operation at all and pays not
     // one octet for the feature.
     pmsg: Vec[u32]
+    // ROUND 89 (statics.rs): the type checker, so that the data section
+    // of the global variables can be written -- their finished octets live
+    // there (`sema.sema_static_*`). 0 = not registered.
+    sm: u64,
+    // ROUND 89: has this object file a bounds check in it? Only then is
+    // the second trampoline entry point written out.
+    idx_used: bool,
     // Label counter of the CURRENT function. Value numbers restart at 0 in
     // every function, so a label built from them alone collides across
     // functions -- the function's own name is folded in as well.
@@ -84,13 +92,24 @@ fn cg_new(f: u64, it: u64) -> Cg {
         slot: vec_new[u64](), aslot: vec_new[u64](),
         frame: 0, unsuitable: false, gcr: 0, ifr: 0, free: false,
         tr: 0, ext_out: 0,
-        pmsg: vec_new[u32](), site: 0,
+        pmsg: vec_new[u32](), site: 0, sm: 0, idx_used: false,
     }
 }
 
 // ROUND 75 (SPEC 14.5): register the AST tree, so `sym` can resolve
 // `extern fn` / `#[export_c]` link names.
 fn cg_tree_set(c: *mut Cg, t: u64) { (*c).tr = t }
+
+// ROUND 89 (statics.rs): register the type checker -- the initial values of
+// the global variables are finished octets there.
+fn cg_sema_set(c: *mut Cg, s: u64) { (*c).sm = s }
+fn cgsm(c: *mut Cg) -> *mut sema.Sema { return (*c).sm as *mut sema.Sema }
+fn has_statics(c: *mut Cg) -> bool {
+    if (*c).sm == 0 {
+        return false
+    }
+    return sema.sema_static_count(cgsm(c)) > 0
+}
 
 // Register the gc registry (round 34): it carries size, type tag
 // and field offsets of every class -- the collector's type table grows out of it.
@@ -1124,6 +1143,118 @@ fn emit_fnref(c: *mut Cg, nr: u32, dst: u32) {
     store_slot(c, slot_of(c, dst), R_AX)
 }
 
+// ROUND 89 (statics.rs) -- `.Lstatic_<name>`.
+fn static_label(c: *mut Cg, nr: u32) {
+    var p: [u8; 8] = ".Lstatic"
+    t(c, (&p[0]) as u64, 8)
+    rt.buf_push(&(*c).out, 95 as u8)
+    let q: u64 = intern.intern_ptr(it(c), nr)
+    let n: usize = intern.intern_length(it(c), nr)
+    var k: usize = 0
+    while k < n {
+        var ch: u8 = rt.ld8(q, k)
+        if ch == 35 as u8 {
+            ch = 46 as u8
+        }
+        rt.buf_push(&(*c).out, ch)
+        k = k + 1
+    }
+}
+
+// The address of a global variable -- a link time constant, exactly like a
+// function record (round 89, SPEC 14.1.statics).
+fn emit_global(c: *mut Cg, nr: u32, dst: u32) {
+    ins(c)
+    var le: [u8; 16] = "lea rax, [rip + "
+    w(c, (&le[0]) as u64, 16)
+    static_label(c, nr)
+    rt.buf_push(&(*c).out, 93 as u8)
+    nl(c)
+    store_slot(c, slot_of(c, dst), R_AX)
+}
+
+// The DATA SECTION of the global variables (round 89, SPEC 14.1.statics).
+//
+//   `mut` and all zero  -> `.bss`     (`.zero n`, no space in the file)
+//   `mut` and a value   -> `.data`
+//   without `mut`       -> `.rodata`  (the loader maps it read-only)
+//
+// An immutable all-zero `static` deliberately does NOT go to `.bss`:
+// `.bss` is writable, and putting a value there that the program promised
+// not to change would give away the guarantee the missing `mut` buys.
+fn statics_data(c: *mut Cg) {
+    let s: *mut sema.Sema = cgsm(c)
+    var i: usize = 0
+    while i < sema.sema_static_count(s) {
+        let p: u64 = sema.sema_static_bytes(s, i)
+        let n: usize = sema.sema_static_size(s, i)
+        var zero: bool = true
+        var k: usize = 0
+        while k < n {
+            if rt.ld8(p, k) != 0 as u8 {
+                zero = false
+            }
+            k = k + 1
+        }
+        let writable: bool = sema.sema_static_mut(s, i)
+        if !writable {
+            var sr: [u8; 17] = ".section .rodata\n"
+            t(c, (&sr[0]) as u64, 17)
+        } else if zero {
+            var sb: [u8; 27] = ".section .bss,\"aw\",@nobits\n"
+            t(c, (&sb[0]) as u64, 27)
+        } else {
+            var sd: [u8; 15] = ".section .data\n"
+            t(c, (&sd[0]) as u64, 15)
+        }
+        var al: [u8; 13] = "    .p2align "
+        t(c, (&al[0]) as u64, 13)
+        var a: u64 = sema.sema_static_align(s, i)
+        var e: u64 = 0
+        var v: u64 = 1
+        while v < a && e < 16 {
+            v = v * 2
+            e = e + 1
+        }
+        number(c, e)
+        nl(c)
+        static_label(c, sema.sema_static_name(s, i))
+        rt.buf_push(&(*c).out, 58 as u8)
+        nl(c)
+        if writable && zero {
+            var zw: [u8; 10] = "    .zero "
+            t(c, (&zw[0]) as u64, 10)
+            var nn: usize = n
+            if nn == 0 { nn = 1 }
+            number(c, nn as u64)
+            nl(c)
+        } else if n == 0 {
+            var zw2: [u8; 12] = "    .zero 1\n"
+            t(c, (&zw2[0]) as u64, 12)
+        } else {
+            var q: usize = 0
+            while q < n {
+                var bw: [u8; 10] = "    .byte "
+                t(c, (&bw[0]) as u64, 10)
+                var col: usize = 0
+                while col < 16 && q < n {
+                    if col > 0 {
+                        var cm: [u8; 2] = ", "
+                        t(c, (&cm[0]) as u64, 2)
+                    }
+                    number(c, rt.ld8(p, q) as u64)
+                    col = col + 1
+                    q = q + 1
+                }
+                nl(c)
+            }
+        }
+        i = i + 1
+    }
+    var tx: [u8; 6] = ".text\n"
+    t(c, (&tx[0]) as u64, 6)
+}
+
 // The FUNCTION RECORDS (`.rodata`, round 58). One word per function that is
 // taken as a value somewhere: the address of its machine code. Which ones
 // those are is read off the FIR itself -- every `O_FNREF` names one -- so
@@ -1707,6 +1838,8 @@ const PANIC_MUL: u64 = 3
 const PANIC_DIV0: u64 = 4
 const PANIC_DIV_OVERFLOW: u64 = 5
 const PANIC_CAST: u64 = 6
+// ROUND 89 -- an array index outside `0 .. len` (SPEC 13, item L9).
+const PANIC_INDEX: u64 = 7
 
 fn panic_msg_index(c: *mut Cg, id: u32) -> u32 {
     var i: usize = 0
@@ -1739,7 +1872,8 @@ fn panic_collect(c: *mut Cg) {
             while n < fir.inst_count(f, fi, bb) {
                 let i: u32 = fir.inst_at(f, fi, bb, n)
                 let k: u32 = fir.i_kind_of(f, i)
-                if k == fir.O_CHECKEDBIN || k == fir.O_CHECKEDCAST {
+                if k == fir.O_CHECKEDBIN || k == fir.O_CHECKEDCAST
+                || k == fir.O_CHECKEDIDX {
                     panic_msg_add(c, fir.i_number_of(f, i) as u32)
                 }
                 if k == fir.O_CHECKEDDIV {
@@ -1811,35 +1945,105 @@ fn panic_rodata(c: *mut Cg) {
     t(c, (&tx[0]) as u64, 6)
 }
 
+// ROUND 89 -- the octets of one literal word into the buffer at `[rbx]`,
+// then `add rbx, <n>`. Generated instead of written out so that the two
+// entry points cannot say different things about the same buffer.
+fn lit_store(c: *mut Cg, p: u64, n: usize) {
+    var k: usize = 0
+    while k < n {
+        ins(c)
+        var mb: [u8; 17] = "mov byte ptr [rbx"
+        w(c, (&mb[0]) as u64, 17)
+        if k > 0 {
+            rt.buf_push(&(*c).out, 43 as u8)
+            number(c, k as u64)
+        }
+        var cl: [u8; 3] = "], "
+        w(c, (&cl[0]) as u64, 3)
+        number(c, rt.ld8(p, k) as u64)
+        nl(c)
+        k = k + 1
+    }
+    ins(c)
+    var ar: [u8; 9] = "add rbx, "
+    w(c, (&ar[0]) as u64, 9)
+    number(c, n as u64)
+    nl(c)
+}
+
+// ROUND 89 -- ONE entry point of the trampoline. `open`/`mid` are the two
+// literal words it differs in: `" (a="`/`" b="` for the arithmetic one,
+// `" (index="`/`" len="` for the bounds one.
+fn panic_entry(c: *mut Cg, label: u64, labeln: usize, open: u64, openn: usize,
+    mid: u64, midn: usize) {
+    t(c, label, labeln)
+    var h1: [u8; 101] = ":\n    push rbx\n    push r12\n    push r13\n    push r14\n    push r15\n    mov r12, rdi\n    mov r13, rsi\n"
+    t(c, (&h1[0]) as u64, 101)
+    var h2: [u8; 67] = "    mov r14, rcx\n    mov r15, r9\n    sub rsp, 160\n    mov rbx, rsp\n"
+    t(c, (&h2[0]) as u64, 67)
+    lit_store(c, open, openn)
+    var h3: [u8; 42] = "    mov rax, rdx\n    call .Lpanic_i64_dec\n"
+    t(c, (&h3[0]) as u64, 42)
+    lit_store(c, mid, midn)
+    var h4: [u8; 42] = "    mov rax, r14\n    call .Lpanic_i64_dec\n"
+    t(c, (&h4[0]) as u64, 42)
+    var cls: [u8; 2] = ")\n"
+    lit_store(c, (&cls[0]) as u64, 2)
+    var h5: [u8; 106] = "    mov rax, 1\n    mov rdi, 2\n    mov rsi, r12\n    mov rdx, r13\n    syscall\n    mov rax, 1\n    mov rdi, 2\n"
+    t(c, (&h5[0]) as u64, 106)
+    var h6: [u8; 143] = "    lea rsi, [rsp]\n    mov rdx, rbx\n    sub rdx, rsp\n    syscall\n    pop r15\n    pop r14\n    mov rax, 231\n    mov rdi, 101\n    syscall\n    hlt\n"
+    t(c, (&h6[0]) as u64, 143)
+}
+
 fn panic_trampoline(c: *mut Cg) {
+    var la: [u8; 13] = ".Lpanic_arith"
+    var li: [u8; 13] = ".Lpanic_index"
+    var wa: [u8; 4] = " (a="
+    var wb: [u8; 3] = " b="
+    var wi: [u8; 8] = " (index="
+    var wl: [u8; 5] = " len="
+    // ROUND 89 -- a program that brought its OWN ending. Both entry points
+    // hand over to it; nothing of the formatter below is written at all
+    // then. The trampoline's register convention (rdi, rsi, rdx, rcx, r8)
+    // IS the System V one for five arguments, so there is nothing to
+    // shuffle: the handler receives the message (which already carries
+    // file, line and column -- that is how round 72 built it), its length,
+    // the two numbers and the panic kind code.
+    let ph: u32 = panic_handler_name(c)
+    if ph != NONE {
+        panic_handoff(c, (&la[0]) as u64, 13, ph)
+        if (*c).idx_used {
+            panic_handoff(c, (&li[0]) as u64, 13, ph)
+        }
+        return
+    }
     if (*c).free {
         // No runtime at all. Somebody else decides what a panic means --
         // exactly the SPEC 2 promise ("osum_panic, configurable"). An
         // undefined reference at link time is the honest outcome for a
-        // kernel that never defines it.
-        var kt: [u8; 146] = ".Lpanic_arith:\n    call osum_panic\n    # osum_panic is not supposed to come back; running\n    # into .text below would be silently wrong.\n    ud2\n"
-        t(c, (&kt[0]) as u64, 146)
+        // kernel that never defines it. ROUND 89 gives a kernel the nicer
+        // option of a `#[panic_handler]` written in Firn (above); this
+        // stays for the kernels that already define the symbol.
+        panic_extern(c, (&la[0]) as u64, 13)
+        if (*c).idx_used {
+            panic_extern(c, (&li[0]) as u64, 13)
+        }
         return
     }
     // `app`: build "<message> (a=<N> b=<M>)\n" on the stack, write it to
     // file descriptor 2 and call exit_group(101). No allocator, no `std.*`
     // -- this has to run inside a program that imports nothing at all.
-    var h1: [u8; 114] = ".Lpanic_arith:\n    push rbx\n    push r12\n    push r13\n    push r14\n    push r15\n    mov r12, rdi\n    mov r13, rsi\n"
-    t(c, (&h1[0]) as u64, 114)
-    var h2: [u8; 181] = "    mov r14, rcx\n    mov r15, r9\n    sub rsp, 160\n    mov rbx, rsp\n    mov byte ptr [rbx], 32\n    mov byte ptr [rbx+1], 40\n    mov byte ptr [rbx+2], 97\n    mov byte ptr [rbx+3], 61\n"
-    t(c, (&h2[0]) as u64, 181)
-    var h3: [u8; 174] = "    add rbx, 4\n    mov rax, rdx\n    call .Lpanic_i64_dec\n    mov byte ptr [rbx], 32\n    mov byte ptr [rbx+1], 98\n    mov byte ptr [rbx+2], 61\n    add rbx, 3\n    mov rax, r14\n"
-    t(c, (&h3[0]) as u64, 174)
-    var h4: [u8; 202] = "    call .Lpanic_i64_dec\n    mov byte ptr [rbx], 41\n    mov byte ptr [rbx+1], 10\n    add rbx, 2\n    mov rax, 1\n    mov rdi, 2\n    mov rsi, r12\n    mov rdx, r13\n    syscall\n    mov rax, 1\n    mov rdi, 2\n"
-    t(c, (&h4[0]) as u64, 202)
-    var h5: [u8; 143] = "    lea rsi, [rsp]\n    mov rdx, rbx\n    sub rdx, rsp\n    syscall\n    pop r15\n    pop r14\n    mov rax, 231\n    mov rdi, 101\n    syscall\n    hlt\n"
-    t(c, (&h5[0]) as u64, 143)
+    panic_entry(c, (&la[0]) as u64, 13, (&wa[0]) as u64, 4, (&wb[0]) as u64, 3)
+    if (*c).idx_used {
+        panic_entry(c, (&li[0]) as u64, 13, (&wi[0]) as u64, 8, (&wl[0]) as u64, 5)
+    }
     // The decimal writer: append the text of `rax` at `[rbx]` and move
     // `rbx` past it. An UNSIGNED type (r15 != 0) never has a minus sign
     // and never negates -- its bit pattern IS the number. For a signed one
     // two's complement makes `neg` on i64::MIN produce the right MAGNITUDE
     // as an unsigned pattern, so the unsigned `div` afterwards is correct
-    // for every possible i64, that one included.
+    // for every possible i64, that one included. ONE copy, shared by both
+    // entry points.
     var d1: [u8; 178] = ".Lpanic_i64_dec:\n    test r15, r15\n    jnz .Lpanic_dec_nonneg\n    test rax, rax\n    jns .Lpanic_dec_nonneg\n    mov byte ptr [rbx], 45\n    inc rbx\n    neg rax\n.Lpanic_dec_nonneg:\n"
     t(c, (&d1[0]) as u64, 178)
     var d2: [u8; 174] = "    mov r8, rbx\n    mov rcx, 10\n    test rax, rax\n    jnz .Lpanic_dec_loop\n    mov byte ptr [rbx], 48\n    inc rbx\n    jmp .Lpanic_dec_rev\n.Lpanic_dec_loop:\n    test rax, rax\n"
@@ -1848,6 +2052,44 @@ fn panic_trampoline(c: *mut Cg) {
     t(c, (&d3[0]) as u64, 178)
     var d4: [u8; 245] = ".Lpanic_dec_revloop:\n    cmp r8, rcx\n    jge .Lpanic_dec_done\n    mov al, byte ptr [r8]\n    mov dl, byte ptr [rcx]\n    mov byte ptr [r8], dl\n    mov byte ptr [rcx], al\n    inc r8\n    dec rcx\n    jmp .Lpanic_dec_revloop\n.Lpanic_dec_done:\n    ret\n"
     t(c, (&d4[0]) as u64, 245)
+}
+
+// The interned name of the `#[panic_handler]`, or NONE.
+fn panic_handler_name(c: *mut Cg) -> u32 {
+    if (*c).tr == 0 {
+        return NONE
+    }
+    return ast.panic_handler((*c).tr as *mut ast.Tree)
+}
+
+// One entry point that hands over to a `#[panic_handler]` written in Firn.
+fn panic_handoff(c: *mut Cg, label: u64, labeln: usize, ph: u32) {
+    t(c, label, labeln)
+    var dp: [u8; 2] = ":\n"
+    t(c, (&dp[0]) as u64, 2)
+    ins(c)
+    var cw: [u8; 5] = "call "
+    w(c, (&cw[0]) as u64, 5)
+    sym(c, ph)
+    nl(c)
+    if (*c).free {
+        var kt: [u8; 4] = "ud2\n"
+        ins(c)
+        t(c, (&kt[0]) as u64, 4)
+    } else {
+        // It came back anyway. The program said something has gone wrong;
+        // carrying on as if it had not is the one answer that is certainly
+        // false.
+        var ex: [u8; 54] = "    mov rax, 231\n    mov rdi, 101\n    syscall\n    hlt\n"
+        t(c, (&ex[0]) as u64, 54)
+    }
+}
+
+// One entry point that hands over to the external symbol `osum_panic`.
+fn panic_extern(c: *mut Cg, label: u64, labeln: usize) {
+    t(c, label, labeln)
+    var kt: [u8; 133] = ":\n    call osum_panic\n    # osum_panic is not supposed to come back; running\n    # into .text below would be silently wrong.\n    ud2\n"
+    t(c, (&kt[0]) as u64, 133)
 }
 
 // `.L<tag><function>_<n>` -- unique inside the function through the
@@ -1908,6 +2150,66 @@ fn trampoline_jump(c: *mut Cg, code: u64, msgid: u32, unsigned: bool) {
     nl(c)
     var jp: [u8; 17] = "jmp .Lpanic_arith"
     raw(c, (&jp[0]) as u64, 17)
+}
+
+// ROUND 89 -- into the SECOND entry point of the trampoline, the one that
+// prints `(index=<N> len=<M>)` instead of `(a=<N> b=<M>)`. The alternative
+// was to hand `a` and `b` to the reader of a bounds panic and let them
+// guess which is which, which is not an alternative.
+fn trampoline_jump_index(c: *mut Cg, msgid: u32) {
+    ins(c)
+    var le: [u8; 16] = "lea rdi, [rip + "
+    w(c, (&le[0]) as u64, 16)
+    panic_label(c, panic_msg_index(c, msgid))
+    rt.buf_push(&(*c).out, 93 as u8)
+    nl(c)
+    ins(c)
+    var ms: [u8; 9] = "mov esi, "
+    w(c, (&ms[0]) as u64, 9)
+    number(c, intern.intern_length(it(c), msgid) as u64)
+    nl(c)
+    ins(c)
+    var m8: [u8; 8] = "mov r8, "
+    w(c, (&m8[0]) as u64, 8)
+    number(c, PANIC_INDEX)
+    nl(c)
+    var m9: [u8; 9] = "mov r9, 1"
+    raw(c, (&m9[0]) as u64, 9)
+    var jp2: [u8; 17] = "jmp .Lpanic_index"
+    raw(c, (&jp2[0]) as u64, 17)
+}
+
+// ROUND 89 -- the checked ARRAY INDEX (SPEC 13, item L9).
+//
+// Two instructions when nothing is wrong -- one `cmp` and one not-taken
+// `jb`. That is the whole run time cost of the promise; `docs/ROUND89.md`
+// measures what it comes to in a hot loop. The index is left in `rax` and
+// stored exactly as an unchecked one would be.
+//
+// The comparison is UNSIGNED: an index is a `usize`, so "below zero" is
+// not a state it can be in and one comparison decides both ends.
+fn emit_checked_idx(c: *mut Cg, ty: u32, idx: u32, len: u64, dst: u32,
+    msgid: u32, fnr: u32) {
+    (*c).idx_used = true
+    let uid: u64 = (*c).site
+    (*c).site = (*c).site + 1
+    var tok: [u8; 6] = "chkidx"
+    load_value(c, R_AX, idx)
+    normalize(c, R_AX, ty)
+    ins(c)
+    var mc: [u8; 9] = "mov rcx, "
+    w(c, (&mc[0]) as u64, 9)
+    number(c, len)
+    nl(c)
+    var cm: [u8; 12] = "cmp rax, rcx"
+    raw(c, (&cm[0]) as u64, 12)
+    var jb: [u8; 2] = "jb"
+    site_jump(c, (&jb[0]) as u64, 2, (&tok[0]) as u64, 6, fnr, uid)
+    var md: [u8; 12] = "mov rdx, rax"
+    raw(c, (&md[0]) as u64, 12)
+    trampoline_jump_index(c, msgid)
+    site_here(c, (&tok[0]) as u64, 6, fnr, uid)
+    store_slot(c, slot_of(c, dst), R_AX)
 }
 
 // `<op> <a>, <b>` at the width of `bits` (8/16/32/64).
@@ -2310,6 +2612,12 @@ fn emit_inst(c: *mut Cg, fnr: u32, i: u32) {
             fir.i_number_of(f, i) as u32, fir.f_name_of(f, fnr))
         return
     }
+    // ROUND 89 -- the checked ARRAY INDEX (SPEC 13, item L9).
+    if kind == fir.O_CHECKEDIDX {
+        emit_checked_idx(c, ty, fir.i_a_of(f, i), fir.i_c_of(f, i) as u64, dst,
+            fir.i_number_of(f, i) as u32, fir.f_name_of(f, fnr))
+        return
+    }
     if kind == fir.O_CMP {
         emit_cmp(c, fir.i_number_of(f, i) as u32, fir.i_c_of(f, i), fir.i_a_of(f, i), fir.i_b_of(f, i), dst)
         return
@@ -2388,6 +2696,11 @@ fn emit_inst(c: *mut Cg, fnr: u32, i: u32) {
     }
     if kind == fir.O_FNREF {
         emit_fnref(c, fir.i_a_of(f, i), dst)
+        return
+    }
+    // ROUND 89 (statics.rs): the address of a global variable.
+    if kind == fir.O_GLOBAL {
+        emit_global(c, fir.i_a_of(f, i), dst)
         return
     }
     if kind == fir.O_ASM {
@@ -2672,6 +2985,12 @@ fn cg_run(c: *mut Cg) {
     if has_panic(c) {
         panic_rodata(c)
         panic_trampoline(c)
+    }
+    // HOOK statics: `.bss`/`.data`/`.rodata` of the global variables
+    // (round 89, SPEC 14.1.statics) -- only when the program declares a
+    // `static` at all.
+    if has_statics(c) {
+        statics_data(c)
     }
     var gnu: [u8; 38] = ".section .note.GNU-stack,\"\",@progbits\n"
     t(c, (&gnu[0]) as u64, 38)

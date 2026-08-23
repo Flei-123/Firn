@@ -46,7 +46,10 @@ export { Sema, sema_new, sema_free, sema_run, sema_error, sema_ty, sema_widen32,
     sema_tree,
     sema_closure_index, sema_closure_tid, sema_closure_size,
     sema_closure_caps, sema_capture_name, sema_capture_ty,
-    sema_is_closure_name }
+    sema_is_closure_name,
+    // ROUND 89 (statics.rs, SPEC 14.1.statics) -- the global variables.
+    sema_static_index, sema_static_count, sema_static_name, sema_static_mut,
+    sema_static_align, sema_static_bytes, sema_static_size }
 
 const NONE: u32 = 4294967295
 
@@ -66,6 +69,14 @@ struct Sema {
     k_name: Vec[u32], // constants
     k_ty: Vec[u32],
     k_value: Vec[u64],
+    // ROUND 89 -- global variables (`static`, SPEC 14.1.statics). A
+    // constant is a NUMBER and lives in `k_value`; a `static` is a PLACE
+    // and what lives here is the finished sequence of octets that goes
+    // into the object file, plus the one bit that says whether it may be
+    // written to.
+    g_name: Vec[u32], g_ty: Vec[u32], g_mut: Vec[u32],
+    g_off: Vec[u32], g_len: Vec[u32], g_align: Vec[u32],
+    g_data: rt.Buf,
     t_bool: u32, // prebuilt types
     t_i64: u32,
     t_usize: u32,
@@ -114,6 +125,9 @@ fn sema_new(b: u64, it: u64) -> Sema {
         etyp: vec_new[u32](), w32: vec_new[u8](),
         v_name: vec_new[u32](), v_ty: vec_new[u32](), b_limit: vec_new[u32](),
         k_name: vec_new[u32](), k_ty: vec_new[u32](), k_value: vec_new[u64](),
+        g_name: vec_new[u32](), g_ty: vec_new[u32](), g_mut: vec_new[u32](),
+        g_off: vec_new[u32](), g_len: vec_new[u32](), g_align: vec_new[u32](),
+        g_data: rt.buf_new(),
         t_bool: 0, t_i64: 0, t_usize: 0, t_void: 0, t_error: 0, t_f64: 0,
         t_f32: 0,
         t_i32: 0,
@@ -137,6 +151,13 @@ fn sema_free(s: *mut Sema) {
     vec_free[u32](&(*s).v_name)
     vec_free[u32](&(*s).v_ty)
     vec_free[u32](&(*s).b_limit)
+    vec_free[u32](&(*s).g_name)
+    vec_free[u32](&(*s).g_ty)
+    vec_free[u32](&(*s).g_mut)
+    vec_free[u32](&(*s).g_off)
+    vec_free[u32](&(*s).g_len)
+    vec_free[u32](&(*s).g_align)
+    rt.buf_free(&(*s).g_data)
     vec_free[u32](&(*s).k_name)
     vec_free[u32](&(*s).k_ty)
     vec_free[u64](&(*s).k_value)
@@ -479,6 +500,53 @@ fn const_value(s: *mut Sema, name: u32) -> u64 {
     return 0
 }
 
+// ROUND 89 -- the type of a global variable, or NONE if there is none
+// under this name (SPEC 14.1.statics).
+fn static_search(s: *mut Sema, name: u32) -> u32 {
+    var i: usize = 0
+    while i < vec_len[u32](&(*s).g_name) {
+        if vec_at[u32](&(*s).g_name, i) == name {
+            return vec_at[u32](&(*s).g_ty, i)
+        }
+        i = i + 1
+    }
+    return NONE
+}
+
+fn static_writable(s: *mut Sema, name: u32) -> bool {
+    var i: usize = 0
+    while i < vec_len[u32](&(*s).g_name) {
+        if vec_at[u32](&(*s).g_name, i) == name {
+            return vec_at[u32](&(*s).g_mut, i) == 1
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// The index of a global variable, or NONE. `lower.fi` asks this to decide
+// whether a name is a place in the data section.
+fn sema_static_index(s: *mut Sema, name: u32) -> u32 {
+    var i: usize = 0
+    while i < vec_len[u32](&(*s).g_name) {
+        if vec_at[u32](&(*s).g_name, i) == name {
+            return i as u32
+        }
+        i = i + 1
+    }
+    return NONE
+}
+
+fn sema_static_count(s: *mut Sema) -> usize { return vec_len[u32](&(*s).g_name) }
+fn sema_static_name(s: *mut Sema, i: usize) -> u32 { return vec_at[u32](&(*s).g_name, i) }
+fn sema_static_mut(s: *mut Sema, i: usize) -> bool { return vec_at[u32](&(*s).g_mut, i) == 1 }
+fn sema_static_align(s: *mut Sema, i: usize) -> u64 { return vec_at[u32](&(*s).g_align, i) as u64 }
+fn sema_static_size(s: *mut Sema, i: usize) -> usize { return vec_at[u32](&(*s).g_len, i) as usize }
+// The first octet of the initial value of the i-th global variable.
+fn sema_static_bytes(s: *mut Sema, i: usize) -> u64 {
+    return rt.buf_ptr(&(*s).g_data) + vec_at[u32](&(*s).g_off, i) as u64
+}
+
 // ROUND 58 (fnval.rs): the TYPE of the function `fi` as a value --
 // `fn(P1, P2) -> R` out of its declared signature.
 fn fn_value_ty(s: *mut Sema, fi: u32) -> u32 {
@@ -583,7 +651,12 @@ fn probe_t(s: *mut Sema, e: u32, d: u32) -> u32 {
         if v != NONE {
             return v
         }
-        return const_search(s, ast.e_a(b, e))
+        let k0: u32 = const_search(s, ast.e_a(b, e))
+        if k0 != NONE {
+            return k0
+        }
+        // ROUND 89 -- a global variable (SPEC 14.1.statics).
+        return static_search(s, ast.e_a(b, e))
     }
     if a == ast.E_UN {
         let op: u32 = ast.e_a(b, e)
@@ -793,6 +866,226 @@ fn wrap(s: *mut Sema, v: i64, t: u32) -> i64 {
     return m
 }
 
+// ROUND 89 -- does a value of this type contain something the collector
+// owns? A `static Gc[T]` is refused for the reason in `statics.rs`.
+fn gc_reachable(s: *mut Sema, t: u32) -> bool {
+    let tt: *mut types.Types = table(s)
+    let k: u32 = types.ty_kind(tt, t)
+    if k == types.K_PTR {
+        let inner: u32 = types.ty_a(tt, t)
+        if types.ty_kind(tt, inner) == types.K_STRUCT {
+            if gc_class_struct(s, types.ty_a(tt, inner)) {
+                return true
+            }
+        }
+        return gc_reachable(s, inner)
+    }
+    if k == types.K_ARR {
+        return gc_reachable(s, types.ty_a(tt, t))
+    }
+    if k == types.K_STRUCT {
+        let si: u32 = types.ty_a(tt, t)
+        if gc_class_struct(s, si) {
+            return true
+        }
+        var n: u32 = 0
+        while n < types.st_flen(tt, si as usize) {
+            if gc_reachable(s, types.sf_ty(tt, types.st_foff(tt, si as usize) + n)) {
+                return true
+            }
+            n = n + 1
+        }
+    }
+    return false
+}
+
+// Is this struct index a `gc class`? Its name begins with "gc " -- the
+// same marker `firnc0` reads (types.rs::gc_class_name).
+fn gc_class_struct(s: *mut Sema, si: u32) -> bool {
+    let tt: *mut types.Types = table(s)
+    let nr: u32 = types.st_name(tt, si as usize)
+    let q: u64 = intern.intern_ptr(names(s), nr)
+    let n: usize = intern.intern_length(names(s), nr)
+    if n < 3 {
+        return false
+    }
+    return rt.ld8(q, 0) == 103 as u8 && rt.ld8(q, 1) == 99 as u8 && rt.ld8(q, 2) == 32 as u8
+}
+
+// ROUND 89 -- the initial value of a `static`, as the exact octets that go
+// into the object file (little endian, `size_of(t)` of them). Its own walk
+// and not a second use of `const_eval`: that one answers "which NUMBER is
+// this", which is the wrong question for an array of 256 octets or a
+// struct with three fields. The two meet at the LEAVES -- every scalar in
+// here goes through `const_eval` and through nothing else, so a `const`
+// and a `static` can never disagree about what `1 << 12` is.
+fn static_bytes(s: *mut Sema, e: u32, t: u32, good: *mut bool) {
+    let b: *mut ast.Tree = tree(s)
+    let tt: *mut types.Types = table(s)
+    let want: usize = types.size_of(tt, t) as usize
+    let start: usize = rt.buf_len(&(*s).g_data)
+    let k: u32 = types.ty_kind(tt, t)
+    let a: u32 = ast.e_kind(b, e)
+    if k == types.K_ARR {
+        let el: u32 = types.ty_a(tt, t)
+        let n: u64 = types.ty_n(tt, t)
+        // A text literal carries the array literal of its octets inside
+        // (ast.fi::E_TEXT, round 70).
+        var lit: u32 = e
+        if a == ast.E_TEXT {
+            lit = ast.e_a(b, e)
+        }
+        let lk: u32 = ast.e_kind(b, lit)
+        if lk == ast.E_ALIT {
+            let off: u32 = ast.e_b(b, lit)
+            let cnt: u32 = ast.e_c(b, lit)
+            if cnt as u64 != n {
+                *good = false
+            } else {
+                var q: u32 = 0
+                while q < cnt {
+                    static_bytes(s, ast.child_at(b, off + q), el, good)
+                    q = q + 1
+                }
+            }
+        } else if lk == ast.E_AWDH {
+            // `[v; N]` -- the length is already IN the type; the same
+            // reading `lower.fi::write_after` uses.
+            var q2: u64 = 0
+            while q2 < n {
+                static_bytes(s, ast.e_a(b, lit), el, good)
+                q2 = q2 + 1
+            }
+        } else {
+            *good = false
+        }
+    } else if k == types.K_STRUCT {
+        if a != ast.E_SLIT {
+            *good = false
+        } else {
+            // Padding is zero, not whatever was in the buffer.
+            var z: usize = 0
+            while z < want {
+                rt.buf_push(&(*s).g_data, 0 as u8)
+                z = z + 1
+            }
+            let si: u32 = types.ty_a(tt, t)
+            let foff: u32 = types.st_foff(tt, si as usize)
+            let flen: u32 = types.st_flen(tt, si as usize)
+            let loff: u32 = ast.e_b(b, e)
+            let llen: u32 = ast.e_c(b, e)
+            var fi: u32 = 0
+            while fi < flen {
+                let fname: u32 = types.sf_name(tt, foff + fi)
+                let fty: u32 = types.sf_ty(tt, foff + fi)
+                let fpos: u64 = types.sf_offset(tt, foff + fi)
+                var found: u32 = NONE
+                var q3: u32 = 0
+                while q3 < llen {
+                    if ast.child_at(b, loff + q3 * 2) == fname {
+                        found = ast.child_at(b, loff + q3 * 2 + 1)
+                    }
+                    q3 = q3 + 1
+                }
+                if found == NONE {
+                    *good = false
+                } else {
+                    // The field's octets are built at the END of the
+                    // buffer and then copied into their place.
+                    let fstart: usize = rt.buf_len(&(*s).g_data)
+                    static_bytes(s, found, fty, good)
+                    let flen2: usize = rt.buf_len(&(*s).g_data) - fstart
+                    var q4: usize = 0
+                    while q4 < flen2 {
+                        rt.st8(rt.buf_ptr(&(*s).g_data), start + fpos as usize + q4,
+                            rt.ld8(rt.buf_ptr(&(*s).g_data), fstart + q4))
+                        q4 = q4 + 1
+                    }
+                    rt.buf_set_len(&(*s).g_data, fstart)
+                }
+                fi = fi + 1
+            }
+        }
+    } else if k == types.K_F64 || k == types.K_F32 {
+        var bits: u64 = 0
+        if !static_float(s, e, k == types.K_F32, &bits) {
+            *good = false
+        }
+        var q5: usize = 0
+        while q5 < want {
+            rt.buf_push(&(*s).g_data, ((bits >> (q5 * 8) as u64) & 255) as u8)
+            q5 = q5 + 1
+        }
+    } else if types.is_ptr(tt, t) {
+        var g3: bool = true
+        let v3: i64 = const_eval(s, e, &g3)
+        if !g3 || v3 != 0 {
+            // There is no ADDRESS at compile time; the only pointer that
+            // can be written into a data section is the null one.
+            *good = false
+        }
+        var q6: usize = 0
+        while q6 < want {
+            rt.buf_push(&(*s).g_data, 0 as u8)
+            q6 = q6 + 1
+        }
+    } else {
+        var g4: bool = true
+        let v4: i64 = const_eval(s, e, &g4)
+        if !g4 {
+            *good = false
+        }
+        let w: i64 = wrap(s, v4, t)
+        var q7: usize = 0
+        while q7 < want {
+            rt.buf_push(&(*s).g_data, ((w as u64 >> (q7 * 8) as u64) & 255) as u8)
+            q7 = q7 + 1
+        }
+    }
+    // Whatever happened, the entry is exactly `want` octets long.
+    while (rt.buf_len(&(*s).g_data) - start) < want {
+        rt.buf_push(&(*s).g_data, 0 as u8)
+    }
+    rt.buf_set_len(&(*s).g_data, start + want)
+}
+
+// The bit pattern of a floating point initial value. Only a literal, with
+// an optional minus in front: `0.1 + 0.2` at compile time would need a
+// second evaluator that is exactly IEEE-754 faithful, and one that is only
+// ALMOST right is worse than none.
+fn static_float(s: *mut Sema, e: u32, single: bool, out: *mut u64) -> bool {
+    let b: *mut ast.Tree = tree(s)
+    let a: u32 = ast.e_kind(b, e)
+    if a == ast.E_FLOAT {
+        // ROUND 71: the CORRECTLY ROUNDED binary32 was computed in the
+        // lexer on the TEXT and sits in `e_a`; narrowing the binary64 here
+        // would be one rounding too many (lower.fi says the same).
+        if single {
+            *out = ast.e_a(b, e) as u64
+        } else {
+            *out = ast.e_number(b, e)
+        }
+        return true
+    }
+    if a == ast.E_FLOAT32 {
+        *out = ast.e_number(b, e)
+        return true
+    }
+    if a == ast.E_UN && ast.e_a(b, e) == 0 {
+        var inner: u64 = 0
+        if !static_float(s, ast.e_b(b, e), single, &inner) {
+            return false
+        }
+        if single {
+            *out = inner ^ 2147483648
+        } else {
+            *out = inner ^ 9223372036854775808
+        }
+        return true
+    }
+    return false
+}
+
 fn const_eval(s: *mut Sema, e: u32, good: *mut bool) -> i64 {
     let b: *mut ast.Tree = tree(s)
     let a: u32 = ast.e_kind(b, e)
@@ -976,6 +1269,16 @@ fn index_ty(s: *mut Sema, bt: u32, idx: u32) -> u32 {
         complain(s)
     }
     if types.ty_kind(table(s), bt) == types.K_ARR {
+        // ROUND 89 (SPEC 13, item L9): an index that is a NUMBER in the
+        // source and a length that is a number in the type is a question
+        // with an answer right here. It is reported at EVERY build level,
+        // `release-fast` included, where there is no run time check at all.
+        var lv: i64 = 0
+        if literal_index(s, idx, &lv) {
+            if lv < 0 || lv as u64 >= types.ty_n(table(s), bt) {
+                complain(s)
+            }
+        }
         return types.ty_a(table(s), bt)
     }
     if is_error(s, bt) {
@@ -983,6 +1286,41 @@ fn index_ty(s: *mut Sema, bt: u32, idx: u32) -> u32 {
     }
     complain(s)
     return (*s).t_error
+}
+
+// ROUND 89 -- the index as a number, if it IS one in the source text.
+//
+// Deliberately NOT `const_eval`: that one may run a whole function at
+// compile time, and asking it about every index expression of a program
+// would make the type checker run the program. What is recognised here is
+// what a reader would call a constant index: a literal, a `const`, a cast
+// or a negation of one.
+fn literal_index(s: *mut Sema, e: u32, out: *mut i64) -> bool {
+    let b: *mut ast.Tree = tree(s)
+    let a: u32 = ast.e_kind(b, e)
+    if a == ast.E_INT {
+        *out = ast.e_number(b, e) as i64
+        return true
+    }
+    if a == ast.E_AS {
+        return literal_index(s, ast.e_a(b, e), out)
+    }
+    if a == ast.E_UN && ast.e_a(b, e) == 0 {
+        var inner: i64 = 0
+        if !literal_index(s, ast.e_b(b, e), &inner) {
+            return false
+        }
+        *out = 0 - inner
+        return true
+    }
+    if a == ast.E_ID {
+        if const_search(s, ast.e_a(b, e)) == NONE {
+            return false
+        }
+        *out = const_value(s, ast.e_a(b, e)) as i64
+        return true
+    }
+    return false
 }
 
 // Assignable expression: yields the type or NONE.
@@ -999,6 +1337,16 @@ fn lvalue(s: *mut Sema, e: u32) -> u32 {
         if k != NONE {
             remember(s, e, k)
             return k
+        }
+        // ROUND 89 -- a `static` IS a place, but only `static mut` may be
+        // written to (SPEC 14.1.statics).
+        let g: u32 = static_search(s, ast.e_a(b, e))
+        if g != NONE {
+            if !static_writable(s, ast.e_a(b, e)) {
+                complain(s)
+            }
+            remember(s, e, g)
+            return g
         }
         complain(s)
         remember(s, e, (*s).t_error)
@@ -2402,6 +2750,11 @@ fn expr_inner(s: *mut Sema, e: u32, note: u32) -> u32 {
         if k != NONE {
             return k
         }
+        // ROUND 89 -- a global variable read as a value.
+        let g: u32 = static_search(s, ast.e_a(b, e))
+        if g != NONE {
+            return g
+        }
         // ROUND 58 (fnval.rs): a named function AS A VALUE. The value is
         // the address of its function record; the type is read straight off
         // the signature.
@@ -3598,6 +3951,63 @@ fn sema_run(s: *mut Sema) {
             vec_push[u64](&(*s).k_value, 0)
             complain(s)
         }
+        i = i + 1
+    }
+
+    // 4b. ROUND 89 -- the global variables (SPEC 14.1.statics). AFTER the
+    //     constants, because a `static`'s initial value may name a `const`
+    //     and never the other way round: a `const` is a number, a `static`
+    //     is a place, and a place has no value at compile time.
+    i = 0
+    while i < ast.static_count(b) {
+        let gt: u32 = ast_ty(s, ast.static_ty(b, i))
+        let gname: u32 = ast.static_name(b, i)
+        var bad: bool = false
+        if gc_reachable(s, gt) {
+            // The root set of the collector is the stack and the callee
+            // saved registers (SPEC 3.5.3); a data section entry is
+            // neither, so a collected value kept here would be freed under
+            // the program's feet.
+            complain(s)
+            bad = true
+        }
+        if types.size_of(table(s), gt) == 0 {
+            complain(s)
+            bad = true
+        }
+        let gv: u32 = expr(s, ast.static_value(b, i), gt)
+        if !types.compatible(table(s), gv, gt) {
+            complain(s)
+            bad = true
+        }
+        if static_search(s, gname) != NONE || const_search(s, gname) != NONE {
+            complain(s)
+            bad = true
+        }
+        let at: u32 = rt.buf_len(&(*s).g_data) as u32
+        if !bad {
+            var good2: bool = true
+            static_bytes(s, ast.static_value(b, i), gt, &good2)
+            if !good2 {
+                complain(s)
+            }
+        }
+        // Even a refused declaration keeps its NAME, so that a use of it
+        // further down does not report a second, misleading error.
+        let want: usize = types.size_of(table(s), gt) as usize
+        while (rt.buf_len(&(*s).g_data) - at as usize) < want {
+            rt.buf_push(&(*s).g_data, 0 as u8)
+        }
+        vec_push[u32](&(*s).g_name, gname)
+        vec_push[u32](&(*s).g_ty, gt)
+        var mflag: u32 = 0
+        if ast.static_mut(b, i) { mflag = 1 }
+        vec_push[u32](&(*s).g_mut, mflag)
+        vec_push[u32](&(*s).g_off, at)
+        vec_push[u32](&(*s).g_len, want as u32)
+        var al: u64 = types.alignment_of(table(s), gt)
+        if al == 0 { al = 1 }
+        vec_push[u32](&(*s).g_align, al as u32)
         i = i + 1
     }
 
