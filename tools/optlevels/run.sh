@@ -97,14 +97,27 @@ tests/1403_core_page_allocator.fi
 # ---------------------------------------------------------------- 1 + 2 -----
 run_all_levels() {          # $1 = compiler, $2 = tag
     local cc="$1" tag="$2"
-    local f base lvl bin out rc ref_out ref_rc hdr exp n=0
+    local f base lvl bin out rc crc ref_out ref_rc hdr exp n=0 skipped=0
     for f in $PROGS; do
         [ -f "$f" ] || { bad "$tag: $f does not exist"; continue; }
         base=$(basename "$f" .fi)
         ref_out=""; ref_rc=""
         for lvl in $LEVELS; do
             bin="$TMPD/$tag.$base.$lvl"
-            if ! "$cc" --opt-level="$lvl" -o "$bin" "$f" >"$TMPD/c.err" 2>&1; then
+            set +e
+            "$cc" --opt-level="$lvl" -o "$bin" "$f" >"$TMPD/c.err" 2>&1
+            crc=$?
+            set -e
+            # firnc1's own "I cannot do this" codes (tools/self_compare.sh):
+            # 3 = not core language, 4 = comptime, 5 = defer, 6 = this FIR.
+            # They are a KNOWN limit of the self-hosted compiler, not a
+            # difference between build levels -- but the program is then
+            # skipped for firnc1 in EVERY level, never in only some.
+            if [ "$tag" = firnc1 ] && [ "$crc" -ge 3 ] && [ "$crc" -le 6 ]; then
+                skipped=$((skipped + 1))
+                continue 2
+            fi
+            if [ "$crc" -ne 0 ]; then
                 bad "$tag $f [$lvl]: compilation failed -- $(head -2 "$TMPD/c.err" | tr '\n' ' ')"
                 continue 2
             fi
@@ -134,7 +147,7 @@ run_all_levels() {          # $1 = compiler, $2 = tag
         esac
         n=$((n + 1))
     done
-    note "$tag: $n programs x 4 levels"
+    note "$tag: $n programs x 4 levels, $skipped outside the self-hosted subset"
 }
 
 echo "1. firnc0 -- every program in all four levels"
