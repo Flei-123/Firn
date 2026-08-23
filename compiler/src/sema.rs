@@ -40,6 +40,10 @@ pub struct TypeInfo {
     pub expr_types: Vec<Type>,
     /// Evaluated `const` declarations: name -> (type, value).
     pub consts: HashMap<String, (Type, i128)>,
+    /// **ROUND 89** — `static` declarations: name -> (type, `mut`?).
+    /// Unlike a `const`, a `static` has an ADDRESS; the initial value does
+    /// not live here but in `statics.rs`, already turned into octets.
+    pub statics: HashMap<String, (Type, bool)>,
     /// Signatures of all functions.
     pub fns: HashMap<String, FnSig>,
     /// **ROUND 71** — expressions of type `f32` that stand in a place where
@@ -85,6 +89,8 @@ pub(crate) struct Checker<'a> {
     pub(crate) tcx: TypeCtx,
     pub(crate) fns: HashMap<String, FnSig>,
     pub(crate) consts: HashMap<String, (Type, i128)>,
+    /// **ROUND 89** — see `TypeInfo::statics`.
+    pub(crate) statics: HashMap<String, (Type, bool)>,
     /// The program of the current pass — needed by `comptime`, which runs
     /// whole functions at compile time (`comptime.rs`).
     pub(crate) prog: Option<*const Program>,
@@ -110,6 +116,7 @@ pub fn check(prog: &Program, dg: &mut Diags) -> Option<TypeInfo> {
         tcx: TypeCtx::new(),
         fns: HashMap::new(),
         consts: HashMap::new(),
+        statics: HashMap::new(),
         prog: None,
         expr_types: vec![Type::Error; prog.expr_count as usize],
         scopes: Vec::new(),
@@ -135,6 +142,7 @@ pub fn check(prog: &Program, dg: &mut Diags) -> Option<TypeInfo> {
         tcx: ck.tcx,
         expr_types: ck.expr_types,
         consts: ck.consts,
+        statics: ck.statics,
         fns: ck.fns,
         widen_f32: ck.widen_f32,
     })
@@ -235,6 +243,11 @@ impl<'a> Checker<'a> {
         // Check and apply the attributes (attrs.rs)
         self.check_attrs(prog);
         self.check_consts(prog);
+        // ROUND 89: after the constants, because a `static`'s initial value
+        // may name a `const` (`static mut BUF: [u8; SIZE] = [0; SIZE]`),
+        // and never the other way round -- a `const` is a number, a
+        // `static` is a place, and a place has no value at compile time.
+        self.check_statics(prog);
         for f in &prog.funcs {
             self.check_fn(f);
         }
@@ -296,6 +309,14 @@ impl<'a> Checker<'a> {
             // WITH a body (there has to be something to export). Checked
             // here rather than in `attrs.rs`, because it needs to know
             // whether THIS declaration is `extern`.
+            // ROUND 89 (SPEC 13): `#[panic_handler]`. The signature is
+            // FIXED, because the trampoline calls it with five values in
+            // five registers and cannot negotiate. Checked here, where the
+            // signature is known, rather than at the call site, which is
+            // hand written assembly and has no type checker of its own.
+            if attrs.iter().any(|a| a.name == "panic_handler") {
+                self.check_panic_handler(f);
+            }
             let has_link_name = attrs.iter().any(|a| a.name == "link_name");
             let has_export_c = attrs.iter().any(|a| a.name == "export_c");
             if has_link_name && f.extern_info.is_none() {
@@ -323,6 +344,56 @@ impl<'a> Checker<'a> {
                 }
             }
         }
+    }
+
+    /// ROUND 89 — the one function a program may mark `#[panic_handler]`,
+    /// and what its signature has to be.
+    fn check_panic_handler(&mut self, f: &crate::ast::FnDecl) {
+        if f.extern_info.is_some() {
+            self.dg.error(
+                f.span,
+                "'#[panic_handler]' needs a body ('extern fn' has none)",
+            );
+            return;
+        }
+        let want: [Type; 5] = [
+            Type::ptr(Type::U8, false),
+            Type::U64,
+            Type::I64,
+            Type::I64,
+            Type::U64,
+        ];
+        let ok = f.ret.is_none()
+            && f.params.len() == want.len()
+            && f
+                .params
+                .iter()
+                .zip(want.iter())
+                .all(|(p, w)| self.resolve_ty_quiet(&p.ty).as_ref() == Some(w));
+        if !ok {
+            self.dg.error_note(
+                f.span,
+                format!(
+                    "'#[panic_handler]' has a fixed signature, '{}' does not match it",
+                    f.name
+                ),
+                format!("write '{}'", crate::panic_rt::HANDLER_SIG),
+            );
+            return;
+        }
+        if let Some(other) = crate::panic_rt::handler() {
+            if other != f.name {
+                self.dg.error(
+                    f.span,
+                    format!(
+                        "'#[panic_handler]' is already taken by '{}' — a program has exactly one ending",
+                        other
+                    ),
+                );
+                return;
+            }
+        }
+        crate::panic_rt::set_handler(Some(f.name.clone()));
     }
 
     /// `true` = the attribute is valid AND implemented at stage 0.
@@ -650,6 +721,307 @@ impl<'a> Checker<'a> {
         }
     }
 
+    // -------------------------------------------------- Global variables
+
+    /// **ROUND 89** — `static` / `static mut` (SPEC §14.1.statics).
+    ///
+    /// Three things happen per declaration, in this order, and each one can
+    /// stop the next:
+    ///
+    /// 1. The TYPE is resolved and refused if the collector could not see
+    ///    through it (`Gc[T]`, a `gc class` pointer). The reasoning is in
+    ///    `statics.rs`; the message says it out loud rather than producing a
+    ///    root the collector never scans.
+    /// 2. The VALUE is type checked against that type, exactly as an
+    ///    initialiser of a local would be -- so a text literal becomes the
+    ///    array of its octets and `[0; 256]` gets its element type from the
+    ///    left hand side, both for free.
+    /// 3. The value is EVALUATED to a finished sequence of octets
+    ///    (`static_bytes`). Anything that is not evaluable at compile time
+    ///    is an error HERE, with the position of the offending
+    ///    subexpression -- that is what makes an initialisation order
+    ///    unnecessary instead of merely undocumented.
+    fn check_statics(&mut self, prog: &Program) {
+        for d in &prog.statics {
+            let ty = self.resolve_ty(&d.ty);
+            if ty.is_error() {
+                self.type_out_expr(&d.value);
+                continue;
+            }
+            if let Some(what) = self.gc_reachable(&ty) {
+                self.dg.error_note(
+                    d.ty.span(),
+                    format!(
+                        "a 'static' must not hold a collected value ({} in '{}')",
+                        what,
+                        self.tcx.name_of(&ty)
+                    ),
+                    "the root set of the collector is the stack and the callee-saved \
+registers (SPEC 3.5.3); a data section entry is neither, so the collector \
+would free an object this 'static' still points at. Keep the handle in a \
+local, or use 'profile kernel', which has no collector at all",
+                );
+                self.type_out_expr(&d.value);
+                continue;
+            }
+            if self.tcx.size_of(&ty) == 0 {
+                self.dg.error(
+                    d.ty.span(),
+                    format!(
+                        "a 'static' of type {} has no storage",
+                        self.tcx.name_of(&ty)
+                    ),
+                );
+                self.type_out_expr(&d.value);
+                continue;
+            }
+            let t = self.expr(&d.value, Some(&ty));
+            if !t.is_error() && !assignable(&t, &ty) {
+                self.dg.error(
+                    d.value.span,
+                    format!(
+                        "the global variable '{}' has type {}, the value is of type {}",
+                        d.name,
+                        self.tcx.name_of(&ty),
+                        self.tcx.name_of(&t)
+                    ),
+                );
+                continue;
+            }
+            if self.statics.contains_key(&d.name) || self.consts.contains_key(&d.name) {
+                self.dg.error(
+                    d.span,
+                    format!("'{}' is already declared", d.name),
+                );
+                continue;
+            }
+            let mut bytes: Vec<u8> = Vec::new();
+            match self.static_bytes(&d.value, &ty, &mut bytes) {
+                Ok(()) => {
+                    crate::statics::register(
+                        &d.name,
+                        d.mutable,
+                        bytes,
+                        self.tcx.align_of(&ty).max(1),
+                    );
+                }
+                Err((span, msg)) => {
+                    self.dg.error_note(
+                        span,
+                        msg,
+                        "the initial value of a 'static' is written into the object file, \
+so it has to be known while compiling -- there is no code that runs before \
+'main' to compute it (SPEC 14.1.statics)",
+                    );
+                }
+            }
+            // Even after a failed evaluation the NAME is known, so that a
+            // use of it further down does not report a second, misleading
+            // "unknown name".
+            self.statics.insert(d.name.clone(), (ty, d.mutable));
+        }
+    }
+
+    /// Does a value of this type contain something the collector owns?
+    /// Returns the offending spelling for the message, or `None`.
+    fn gc_reachable(&self, t: &Type) -> Option<String> {
+        match t {
+            Type::Ptr { inner, .. } => match &**inner {
+                Type::Struct(i) => {
+                    let n = self.tcx.structs.get(*i).map(|s| s.name.as_str()).unwrap_or("");
+                    if let Some(c) = n.strip_prefix("gc ") {
+                        Some(format!("Gc[{}]", c))
+                    } else {
+                        self.gc_reachable(inner)
+                    }
+                }
+                other => self.gc_reachable(other),
+            },
+            Type::Array(e, _) => self.gc_reachable(e),
+            Type::Struct(i) => {
+                let d = self.tcx.structs.get(*i)?;
+                if d.name.starts_with("gc ") {
+                    return Some(format!("gc class {}", &d.name[3..]));
+                }
+                for f in &d.fields {
+                    if let Some(w) = self.gc_reachable(&f.ty) {
+                        return Some(w);
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// **ROUND 89** — the initial value of a `static`, as the exact octets
+    /// that go into the object file (little endian, `size_of(ty)` of them).
+    ///
+    /// Deliberately its own walk and not a second use of `eval_const`:
+    /// `eval_const` answers "which NUMBER is this", which is the wrong
+    /// question for an array of 256 octets or a struct with three fields.
+    /// The two meet at the leaves -- every scalar in here is evaluated by
+    /// `eval_const` and by nothing else, so a `const` and a `static` can
+    /// never disagree about what `1 << 12` is.
+    fn static_bytes(
+        &self,
+        e: &Expr,
+        ty: &Type,
+        out: &mut Vec<u8>,
+    ) -> Result<(), (Span, String)> {
+        let want = self.tcx.size_of(ty) as usize;
+        let start = out.len();
+        match ty {
+            Type::Array(el, n) => {
+                let esz = self.tcx.size_of(el) as usize;
+                match &e.kind {
+                    // A text literal carries the array literal of its
+                    // octets inside (ast.rs::Text, round 70).
+                    ExprKind::Text(_, inner) => {
+                        self.static_bytes(inner, ty, out)?;
+                    }
+                    ExprKind::ArrayLit(items) => {
+                        if items.len() as u64 != *n {
+                            return Err((
+                                e.span,
+                                format!(
+                                    "the array has {} elements, the value has {}",
+                                    n,
+                                    items.len()
+                                ),
+                            ));
+                        }
+                        for it in items {
+                            self.static_bytes(it, el, out)?;
+                        }
+                    }
+                    ExprKind::ArrayRepeat(v, cnt) => {
+                        let c = self.eval_const(cnt)?;
+                        if c < 0 || c as u64 != *n {
+                            return Err((
+                                cnt.span,
+                                format!("the array has {} elements, the repetition says {}", n, c),
+                            ));
+                        }
+                        let mut one: Vec<u8> = Vec::new();
+                        self.static_bytes(v, el, &mut one)?;
+                        for _ in 0..*n {
+                            out.extend_from_slice(&one);
+                        }
+                    }
+                    _ => {
+                        return Err((
+                            e.span,
+                            "the initial value of an array 'static' must be an array literal \
+('[a, b, c]', '[0; n]' or a text literal)"
+                                .to_string(),
+                        ))
+                    }
+                }
+                let _ = esz;
+            }
+            Type::Struct(i) => {
+                let def = match self.tcx.structs.get(*i) {
+                    Some(d) => d.clone(),
+                    None => return Err((e.span, "unknown struct type".to_string())),
+                };
+                let (lit_fields, lspan) = match &e.kind {
+                    ExprKind::StructLit(_, fs, sp) => (fs, *sp),
+                    _ => {
+                        return Err((
+                            e.span,
+                            "the initial value of a struct 'static' must be a struct literal"
+                                .to_string(),
+                        ))
+                    }
+                };
+                // Padding is zero, not whatever was on the compiler's heap.
+                out.resize(start + want, 0);
+                for f in &def.fields {
+                    let given = match lit_fields.iter().find(|(n, _, _)| *n == f.name) {
+                        Some((_, v, _)) => v,
+                        None => {
+                            return Err((
+                                lspan,
+                                format!("the field '{}' is missing", f.name),
+                            ))
+                        }
+                    };
+                    let mut fb: Vec<u8> = Vec::new();
+                    self.static_bytes(given, &f.ty, &mut fb)?;
+                    let at = start + f.offset as usize;
+                    out[at..at + fb.len()].copy_from_slice(&fb);
+                }
+            }
+            Type::F64 => {
+                let bits = self.eval_static_float(e, false)?;
+                out.extend_from_slice(&bits.to_le_bytes());
+            }
+            Type::F32 => {
+                let bits = self.eval_static_float(e, true)? as u32;
+                out.extend_from_slice(&bits.to_le_bytes());
+            }
+            Type::Ptr { .. } | Type::Fn { .. } => {
+                // A pointer that is known at compile time can only be the
+                // null pointer -- every other address is decided by the
+                // linker or by `mmap`, neither of which has happened yet.
+                let v = self.eval_const(e)?;
+                if v != 0 {
+                    return Err((
+                        e.span,
+                        "a pointer 'static' can only start as 0 (there is no address at \
+compile time)"
+                            .to_string(),
+                    ));
+                }
+                out.extend_from_slice(&0u64.to_le_bytes());
+            }
+            t if t.is_concrete_int() || *t == Type::Bool => {
+                let v = wrap(self.eval_const(e)?, t);
+                let b = (v as u128).to_le_bytes();
+                out.extend_from_slice(&b[..want.min(16)]);
+            }
+            other => {
+                return Err((
+                    e.span,
+                    format!(
+                        "a 'static' of type {} is not supported in stage 0",
+                        self.tcx.name_of(other)
+                    ),
+                ))
+            }
+        }
+        if out.len() - start != want {
+            out.resize(start + want, 0);
+        }
+        Ok(())
+    }
+
+    /// The bit pattern of a floating point initial value. Only a literal
+    /// (with an optional minus in front) -- `0.1 + 0.2` at compile time
+    /// would need a second, exactly IEEE-754 conforming evaluator, and one
+    /// that is only ALMOST right is worse than none.
+    fn eval_static_float(&self, e: &Expr, single: bool) -> Result<u64, (Span, String)> {
+        match &e.kind {
+            ExprKind::Float(bits, s32) => {
+                Ok(if single { *s32 as u64 } else { *bits })
+            }
+            ExprKind::FloatF32(b) => Ok(*b as u64),
+            ExprKind::Unary(UnOp::Neg, inner) => {
+                let v = self.eval_static_float(inner, single)?;
+                Ok(if single {
+                    (v as u32 ^ 0x8000_0000) as u64
+                } else {
+                    v ^ 0x8000_0000_0000_0000
+                })
+            }
+            _ => Err((
+                e.span,
+                "a floating point 'static' starts from a literal ('1.5', '-0.25')".to_string(),
+            )),
+        }
+    }
+
     // ---------------------------------------------------------------- Ranges
 
     pub(crate) fn declare_var(&mut self, name: &str, ty: Type, mutable: bool, span: Span) {
@@ -675,6 +1047,7 @@ impl<'a> Checker<'a> {
             out.extend(s.keys().cloned());
         }
         out.extend(self.consts.keys().cloned());
+        out.extend(self.statics.keys().cloned());
         out.extend(self.fns.keys().cloned());
         out
     }
@@ -841,7 +1214,8 @@ impl<'a> Checker<'a> {
                     }
                 };
                 if let Mutability::Fixed(reason) = mutability {
-                    self.dg.error_note(*span, reason, "use 'var' instead of 'let'");
+                    let note = fixed_note(&reason);
+                    self.dg.error_note(*span, reason, note);
                 }
                 // HOOK fehlerunionen: implicit conversion (errors.rs)
                 if crate::errors::hook_coerce(self, value, &ty) {
@@ -871,7 +1245,8 @@ impl<'a> Checker<'a> {
                     }
                 };
                 if let Mutability::Fixed(reason) = mutability {
-                    self.dg.error_note(*span, reason, "use 'var' instead of 'let'");
+                    let note = fixed_note(&reason);
+                    self.dg.error_note(*span, reason, note);
                 }
                 // The right side gets the type of the left one as its hint -
                 // exactly what `binary` would give it (`probe(l)`).
@@ -899,7 +1274,8 @@ impl<'a> Checker<'a> {
                     None => return,
                 };
                 if let Mutability::Fixed(reason) = mutability {
-                    self.dg.error_note(*span, reason, "use 'var' instead of 'let'");
+                    let note = fixed_note(&reason);
+                    self.dg.error_note(*span, reason, note);
                 }
                 if !ty.is_error() && !ty.is_concrete_int() {
                     self.dg.error_note(
@@ -1052,6 +1428,20 @@ impl<'a> Checker<'a> {
                             name
                         )),
                     ))
+                } else if let Some((ty, mutable)) = self.statics.get(name) {
+                    // ROUND 89: a `static` is a PLACE, so it can stand on
+                    // the left of an assignment -- but only with `mut`.
+                    let (ty, mutable) = (ty.clone(), *mutable);
+                    self.record(e.id, ty.clone());
+                    let m = if mutable {
+                        Mutability::Mutable
+                    } else {
+                        Mutability::Fixed(format!(
+                            "'{}' is a 'static' without 'mut' and cannot be modified",
+                            name
+                        ))
+                    };
+                    Some((ty, m))
                 } else {
                     let hint = self.value_hint(name);
                     self.dg
@@ -1175,7 +1565,28 @@ impl<'a> Checker<'a> {
             );
         }
         match base {
-            Type::Array(e, _) => (**e).clone(),
+            Type::Array(e, n) => {
+                // ROUND 89 (SPEC 13, item L9): an index that is a NUMBER
+                // in the source and a length that is a number in the type
+                // is a question with an answer right here. Reporting it at
+                // compile time is not an optimisation of the run time
+                // check -- it holds at EVERY build level, `release-fast`
+                // included, where there is no run time check at all.
+                if let Some(v) = self.literal_index(idx) {
+                    if v < 0 || v as u64 >= *n {
+                        self.dg.error(
+                            idx.span,
+                            format!(
+                                "index {} is outside '{}' (valid: 0 to {})",
+                                v,
+                                self.tcx.name_of(base),
+                                n.saturating_sub(1)
+                            ),
+                        );
+                    }
+                }
+                (**e).clone()
+            }
             Type::Error => Type::Error,
             other => {
                 self.dg.error(
@@ -1184,6 +1595,23 @@ impl<'a> Checker<'a> {
                 );
                 Type::Error
             }
+        }
+    }
+
+    /// ROUND 89 — the index as a number, if it IS one in the source text.
+    ///
+    /// Deliberately NOT `eval_const`: that one runs whole functions at
+    /// compile time (`comptime.rs`), and asking it about every index
+    /// expression of a program would make the type checker run the program.
+    /// What is recognised here is what a reader would call a constant index:
+    /// a literal, a `const`, a cast or a negation of one.
+    fn literal_index(&self, e: &Expr) -> Option<i128> {
+        match &e.kind {
+            ExprKind::Int(v) => Some(*v),
+            ExprKind::Cast(inner, _) => self.literal_index(inner),
+            ExprKind::Unary(UnOp::Neg, inner) => self.literal_index(inner).map(|v| -v),
+            ExprKind::Ident(n) => self.consts.get(n).map(|(_, v)| *v),
+            _ => None,
         }
     }
 
@@ -1324,6 +1752,9 @@ impl<'a> Checker<'a> {
                 if let Some(v) = self.lookup_var(name) {
                     v.ty.clone()
                 } else if let Some((t, _)) = self.consts.get(name) {
+                    t.clone()
+                } else if let Some((t, _)) = self.statics.get(name) {
+                    // ROUND 89 -- a global variable read as a value.
                     t.clone()
                 } else if let Some(sig) = self.fns.get(name).cloned() {
                     // ROUND 58 (fnval.rs): a named function AS A VALUE. The
@@ -1961,7 +2392,10 @@ impl<'a> Checker<'a> {
                 for a in args {
                     self.type_out_expr(a);
                 }
-                if self.lookup_var(name).is_some() || self.consts.contains_key(name) {
+                if self.lookup_var(name).is_some()
+                    || self.consts.contains_key(name)
+                    || self.statics.contains_key(name)
+                {
                     self.dg.error(
                         nspan,
                         format!("'{}' is not a function and cannot be called", name),
@@ -2134,8 +2568,10 @@ impl<'a> Checker<'a> {
             ExprKind::Ident(n) => {
                 if let Some(v) = self.lookup_var(n) {
                     Some(v.ty.clone())
+                } else if let Some((t, _)) = self.consts.get(n) {
+                    Some(t.clone())
                 } else {
-                    self.consts.get(n).map(|(t, _)| t.clone())
+                    self.statics.get(n).map(|(t, _)| t.clone())
                 }
             }
             ExprKind::Unary(op, inner) => match op {
@@ -2581,6 +3017,20 @@ pub(crate) fn comptime_wrap(v: i128, t: &Type) -> i128 {
 }
 
 /// Cut a value to the width/signedness of the target type.
+/// ROUND 89 — which advice fits the refusal. `let`/`var` is the right
+/// answer for a local and a nonsense one for a global: a `static` is never
+/// a `var`, it grows a `mut` instead. One place decides, so the three call
+/// sites of `Mutability::Fixed` cannot drift apart.
+fn fixed_note(reason: &str) -> &'static str {
+    if reason.contains("'static' without 'mut'") {
+        "write 'static mut NAME: T = ...' if it is meant to change (SPEC 14.1.statics)"
+    } else if reason.contains("is a constant") {
+        "a 'const' is a number folded into every use site; use 'static mut' for a place that changes"
+    } else {
+        "use 'var' instead of 'let'"
+    }
+}
+
 fn wrap(v: i128, t: &Type) -> i128 {
     let bits = t.bits();
     if bits == 0 {
@@ -2804,6 +3254,7 @@ mod tests {
             tcx: TypeCtx::new(),
             fns: HashMap::new(),
             consts: HashMap::new(),
+            statics: HashMap::new(),
             expr_types: vec![Type::Error; first.expr_count as usize],
             scopes: Vec::new(),
             ret: Type::Void,
@@ -2956,6 +3407,7 @@ mod tests {
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(ret), span: sp() }])],
             structs: Vec::new(),
             consts: Vec::new(),
+            statics: Vec::new(),
             imports: Vec::new(),
             exports: Vec::new(),
             expr_count: b.next,
@@ -2994,6 +3446,7 @@ mod tests {
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(ret), span: sp() }])],
             structs: vec![sd],
             consts: Vec::new(),
+            statics: Vec::new(),
             comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
@@ -3049,6 +3502,7 @@ mod tests {
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(ret), span: sp() }])],
             structs: vec![sd],
             consts: Vec::new(),
+            statics: Vec::new(),
             comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
@@ -3091,6 +3545,7 @@ mod tests {
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(ret), span: sp() }])],
             structs: vec![outer, inner],
             consts: Vec::new(),
+            statics: Vec::new(),
             comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
@@ -3125,6 +3580,7 @@ mod tests {
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(ret), span: sp() }])],
             structs: vec![a, bs],
             consts: Vec::new(),
+            statics: Vec::new(),
             comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
@@ -3154,6 +3610,7 @@ mod tests {
             ])],
             structs: Vec::new(),
             consts: Vec::new(),
+            statics: Vec::new(),
             imports: Vec::new(),
             exports: Vec::new(),
             expr_count: b.next,
@@ -3191,6 +3648,7 @@ mod tests {
             ])],
             structs: Vec::new(),
             consts: Vec::new(),
+            statics: Vec::new(),
             comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
@@ -3226,6 +3684,7 @@ mod tests {
             ])],
             structs: Vec::new(),
             consts: Vec::new(),
+            statics: Vec::new(),
             comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
@@ -3254,6 +3713,7 @@ mod tests {
             ])],
             structs: Vec::new(),
             consts: Vec::new(),
+            statics: Vec::new(),
             comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
@@ -3323,6 +3783,7 @@ mod tests {
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(call), span: sp() }]), f],
             structs: Vec::new(),
             consts: Vec::new(),
+            statics: Vec::new(),
             comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
@@ -3338,6 +3799,7 @@ mod tests {
             funcs: vec![main_fn(Vec::new())],
             structs: Vec::new(),
             consts: Vec::new(),
+            statics: Vec::new(),
             comptime_blocks: Vec::new(),
             expr_count: 0,
         };
@@ -3368,6 +3830,7 @@ mod tests {
             ])],
             structs: Vec::new(),
             consts: Vec::new(),
+            statics: Vec::new(),
             comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
@@ -3397,6 +3860,7 @@ mod tests {
             ])],
             structs: Vec::new(),
             consts: Vec::new(),
+            statics: Vec::new(),
             comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
@@ -3425,6 +3889,7 @@ mod tests {
             ])],
             structs: Vec::new(),
             consts: Vec::new(),
+            statics: Vec::new(),
             comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
@@ -3453,6 +3918,7 @@ mod tests {
             ])],
             structs: Vec::new(),
             consts: Vec::new(),
+            statics: Vec::new(),
             comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
@@ -3474,6 +3940,7 @@ mod tests {
             ])],
             structs: Vec::new(),
             consts: Vec::new(),
+            statics: Vec::new(),
             comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
@@ -3499,6 +3966,7 @@ mod tests {
             ])],
             structs: Vec::new(),
             consts: Vec::new(),
+            statics: Vec::new(),
             comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
@@ -3531,6 +3999,7 @@ mod tests {
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(ret), span: sp() }]), f],
             structs: Vec::new(),
             consts: Vec::new(),
+            statics: Vec::new(),
             comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
@@ -3572,6 +4041,7 @@ mod tests {
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(c), span: sp() }])],
             structs: vec![sd],
             consts: Vec::new(),
+            statics: Vec::new(),
             comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
@@ -3606,6 +4076,7 @@ mod tests {
             ])],
             structs: vec![sd],
             consts: Vec::new(),
+            statics: Vec::new(),
             comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
@@ -3625,6 +4096,7 @@ mod tests {
             exports: Vec::new(),
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(k), span: sp() }])],
             structs: Vec::new(),
+            statics: Vec::new(),
             consts: vec![ConstDecl {
                 name: "K".to_string(),
                 ty: named("i32"),
@@ -3652,6 +4124,7 @@ mod tests {
             exports: Vec::new(),
             funcs: vec![main_fn(vec![Stmt::Return { value: Some(ret), span: sp() }])],
             structs: Vec::new(),
+            statics: Vec::new(),
             consts: vec![ConstDecl {
                 name: "K".to_string(),
                 ty: named("i32"),
@@ -3687,6 +4160,7 @@ mod tests {
             ])],
             structs: Vec::new(),
             consts: Vec::new(),
+            statics: Vec::new(),
             comptime_blocks: Vec::new(),
             expr_count: b.next,
         };
@@ -3735,6 +4209,7 @@ mod tests {
             ])],
             structs: Vec::new(),
             consts: Vec::new(),
+            statics: Vec::new(),
             comptime_blocks: Vec::new(),
             expr_count: b.next,
         };

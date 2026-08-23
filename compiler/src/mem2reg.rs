@@ -179,6 +179,7 @@ pub(crate) fn replace_uses(f: &mut Func, map: &HashMap<Val, Val>) -> usize {
                     rep(b2, &mut n);
                 }
                 Op::CheckedCast { src, .. } => rep(src, &mut n),
+                Op::CheckedIdx { idx, .. } => rep(idx, &mut n),
                 Op::Cmp { a, b: b2, .. } => {
                     rep(a, &mut n);
                     rep(b2, &mut n);
@@ -210,7 +211,7 @@ pub(crate) fn replace_uses(f: &mut Func, map: &HashMap<Val, Val>) -> usize {
                         rep(a, &mut n);
                     }
                 }
-                Op::VtabAddr { .. } | Op::FnRef { .. } => {}
+                Op::VtabAddr { .. } | Op::FnRef { .. } | Op::GlobalAddr { .. } => {}
                 Op::CopyMem { dst, src, .. } => {
                     rep(dst, &mut n);
                     rep(src, &mut n);

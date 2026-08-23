@@ -65,7 +65,7 @@
 //! failure case) rather than in a spare register: the stack is the one
 //! storage neither backend's allocator ever hands out to a FIR value.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use crate::codegen_x86::Emitter;
 use crate::fir::{BinOp, FTy};
@@ -87,6 +87,8 @@ thread_local! {
 /// process (module tests, `--package`).
 pub fn reset() {
     TABLE.with(|t| *t.borrow_mut() = Table::default());
+    INDEX_USED.with(|c| c.set(false));
+    HANDLER.with(|h| *h.borrow_mut() = None);
 }
 
 /// Registers a message text and returns its `.rodata` label
@@ -132,11 +134,55 @@ pub const PANIC_MUL: u64 = 3;
 pub const PANIC_DIV0: u64 = 4;
 pub const PANIC_DIV_OVERFLOW: u64 = 5;
 pub const PANIC_CAST: u64 = 6;
+/// **ROUND 89** — an array index outside `0 .. len` (SPEC §13, `L9`).
+pub const PANIC_INDEX: u64 = 7;
 
 /// Label of the shared trampoline.
 pub const TRAMPOLINE: &str = ".Lpanic_arith";
+/// **ROUND 89** — the second entry point of the trampoline. Identical to
+/// [`TRAMPOLINE`] except for two literal words: it prints
+/// `(index=<N> len=<M>)` where the arithmetic one prints `(a=<N> b=<M>)`.
+/// The alternative was to hand `a` and `b` to the reader of a bounds panic
+/// and let them guess which is which, which is not an alternative.
+pub const TRAMPOLINE_INDEX: &str = ".Lpanic_index";
 /// External symbol a `profile kernel` program must define itself.
 pub const OSUM_PANIC: &str = "osum_panic";
+
+thread_local! {
+    /// Does this object file contain a bounds check at all? Only then is
+    /// the second entry point written out — a program without one pays
+    /// nothing for it, the same rule `any_registered` already follows.
+    static INDEX_USED: Cell<bool> = const { Cell::new(false) };
+    /// **ROUND 89** — the function marked `#[panic_handler]`, if the
+    /// program has one (its name AFTER module mangling, i.e. the symbol
+    /// the code generator emits it under).
+    static HANDLER: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Notes that a bounds check has been emitted (`emit_checked_idx`, and its
+/// aarch64 twin).
+pub(crate) fn note_index_site() {
+    INDEX_USED.with(|c| c.set(true));
+}
+
+pub fn index_used() -> bool {
+    INDEX_USED.with(|c| c.get())
+}
+
+/// **ROUND 89** — registers the `#[panic_handler]` of this compilation
+/// (`sema.rs::check_attrs`). `None` clears it.
+pub fn set_handler(name: Option<String>) {
+    HANDLER.with(|h| *h.borrow_mut() = name);
+}
+
+pub fn handler() -> Option<String> {
+    HANDLER.with(|h| h.borrow().clone())
+}
+
+/// The five arguments a `#[panic_handler]` takes, in Firn spelling. Kept
+/// here and nowhere else so the type check (`sema.rs`) and the code that
+/// calls it (the trampoline below) cannot drift apart.
+pub const HANDLER_SIG: &str = "fn(msg: *u8, len: u64, a: i64, b: i64, code: u64)";
 
 /// `.rodata` — every distinct message text as raw octets (no NUL
 /// terminator, exactly the SPEC §8 `Str` convention: length travels
@@ -158,32 +204,93 @@ pub fn rodata_asm() -> String {
     out
 }
 
+/// The literal words the two entry points differ in.
+/// `(entry label, opening word, middle word)`.
+fn entries() -> Vec<(&'static str, &'static str, &'static str)> {
+    let mut v = vec![(TRAMPOLINE, " (a=", " b=")];
+    if index_used() {
+        v.push((TRAMPOLINE_INDEX, " (index=", " len="));
+    }
+    v
+}
+
+/// `mov byte ptr [rbx+k], <octet>` for every character of `lit`, then
+/// `add rbx, <len>`. Generated instead of written out so that the two entry
+/// points cannot say different things about the same buffer.
+fn lit_store(s: &mut String, lit: &str) {
+    for (k, c) in lit.bytes().enumerate() {
+        if k == 0 {
+            s.push_str(&format!("    mov byte ptr [rbx], {}\n", c));
+        } else {
+            s.push_str(&format!("    mov byte ptr [rbx+{}], {}\n", k, c));
+        }
+    }
+    s.push_str(&format!("    add rbx, {}\n", lit.len()));
+}
+
 /// The shared out-of-line trampoline, written ONCE per object file
 /// (`codegen_x86.rs::emit`, guarded by [`any_registered`]).
 ///
 /// Calling convention on entry: `rdi`=msg ptr, `esi`=msg len, `rdx`=a,
-/// `rcx`=b, `r8`=panic kind code.
+/// `rcx`=b, `r8`=panic kind code, `r9`=1 when a/b are unsigned.
+///
+/// **ROUND 89** — that convention is deliberately the System V one for
+/// five arguments (`rdi, rsi, rdx, rcx, r8`). A program with a
+/// `#[panic_handler]` therefore needs no shuffling at all: the trampoline
+/// is one `call` and the handler receives exactly
+/// `HANDLER_SIG` — the message (which already carries file, line and
+/// column, because that is how round 72 built it and how
+/// `tools/checked/run.sh` proves both compilers agree), its length, the
+/// two numbers, and the kind code.
 pub fn trampoline_asm() -> String {
+    // ROUND 89: a program that brought its own ending. Both entry points
+    // hand over to it; the formatter below is not emitted at all then.
+    if let Some(h) = handler() {
+        let mut s = String::new();
+        for (label, _, _) in entries() {
+            s.push_str(&format!("{}:\n", label));
+            s.push_str(&format!("    call {}\n", crate::codegen_x86::label(&h)));
+            if crate::prof::is_kernel() {
+                s.push_str("    # a panic handler is not supposed to come back.\n");
+                s.push_str("    ud2\n");
+            } else {
+                // It came back anyway. The program said something has gone
+                // wrong; carrying on as if it had not is the one answer
+                // that is certainly false.
+                s.push_str("    mov rax, 231\n");
+                s.push_str("    mov rdi, 101\n");
+                s.push_str("    syscall\n");
+                s.push_str("    hlt\n");
+            }
+        }
+        return s;
+    }
     if crate::prof::is_kernel() {
         // No runtime at all. Somebody else decides what a panic means —
         // that is exactly the SPEC §2 promise ("osum_panic, configurable").
         // `osum_panic` is an external symbol; an undefined reference at
         // link time is the honest outcome when a kernel never defines it.
+        // ROUND 89 gives a kernel the nicer option of a `#[panic_handler]`
+        // written in Firn (above); this stays for the kernels that already
+        // define the symbol in assembly.
         let mut s = String::new();
-        s.push_str(&format!("{}:\n", TRAMPOLINE));
-        s.push_str(&format!("    call {}\n", OSUM_PANIC));
-        s.push_str("    # osum_panic is not supposed to come back; running\n");
-        s.push_str("    # into whatever comes next in .text would be silently\n");
-        s.push_str("    # wrong, so this traps instead of guessing.\n");
-        s.push_str("    ud2\n");
-        s
-    } else {
-        // `app`: build "<msg> (a=<N> b=<M>)\n" on the stack and write(2, ., .)
-        // then exit_group(101). No malloc, no std.* — this is the one place
-        // in the compiler allowed to hand-roll a decimal formatter, because
-        // it must work even in a program that imports nothing at all.
-        let mut s = String::new();
-        s.push_str(&format!("{}:\n", TRAMPOLINE));
+        for (label, _, _) in entries() {
+            s.push_str(&format!("{}:\n", label));
+            s.push_str(&format!("    call {}\n", OSUM_PANIC));
+            s.push_str("    # osum_panic is not supposed to come back; running\n");
+            s.push_str("    # into whatever comes next in .text would be silently\n");
+            s.push_str("    # wrong, so this traps instead of guessing.\n");
+            s.push_str("    ud2\n");
+        }
+        return s;
+    }
+    // `app`: build "<msg> (a=<N> b=<M>)\n" on the stack and write(2, ., .)
+    // then exit_group(101). No malloc, no std.* — this is the one place
+    // in the compiler allowed to hand-roll a decimal formatter, because
+    // it must work even in a program that imports nothing at all.
+    let mut s = String::new();
+    for (label, open, mid) in entries() {
+        s.push_str(&format!("{}:\n", label));
         s.push_str("    push rbx\n");
         s.push_str("    push r12\n");
         s.push_str("    push r13\n");
@@ -203,22 +310,13 @@ pub fn trampoline_asm() -> String {
         s.push_str("    mov r14, rcx\n");
         s.push_str("    sub rsp, 160\n");
         s.push_str("    mov rbx, rsp\n");
-        s.push_str("    mov byte ptr [rbx], 32\n");
-        s.push_str("    mov byte ptr [rbx+1], 40\n");
-        s.push_str("    mov byte ptr [rbx+2], 97\n");
-        s.push_str("    mov byte ptr [rbx+3], 61\n");
-        s.push_str("    add rbx, 4\n");
+        lit_store(&mut s, open);
         s.push_str("    mov rax, rdx\n");
         s.push_str("    call .Lpanic_i64_dec\n");
-        s.push_str("    mov byte ptr [rbx], 32\n");
-        s.push_str("    mov byte ptr [rbx+1], 98\n");
-        s.push_str("    mov byte ptr [rbx+2], 61\n");
-        s.push_str("    add rbx, 3\n");
+        lit_store(&mut s, mid);
         s.push_str("    mov rax, r14\n");
         s.push_str("    call .Lpanic_i64_dec\n");
-        s.push_str("    mov byte ptr [rbx], 41\n");
-        s.push_str("    mov byte ptr [rbx+1], 10\n");
-        s.push_str("    add rbx, 2\n");
+        lit_store(&mut s, ")\n");
         s.push_str("    mov rax, 1\n");
         s.push_str("    mov rdi, 2\n");
         s.push_str("    mov rsi, r12\n");
@@ -240,56 +338,56 @@ pub fn trampoline_asm() -> String {
         s.push_str("    mov rdi, 101\n");
         s.push_str("    syscall\n");
         s.push_str("    hlt\n");
-        // Helper: append the decimal (signed) text of `rax` at `[rbx]`,
-        // advance `rbx` past it. Clobbers rax/rcx/rdx/r8/r9. Two's
-        // complement makes `neg` on `i64::MIN` produce the right MAGNITUDE
-        // as an unsigned bit pattern (`-MIN mod 2^64 == 2^63`), so an
-        // unsigned `div` afterwards is correct for every possible `i64`,
-        // that one value included.
-        s.push_str(".Lpanic_i64_dec:\n");
-        // An UNSIGNED type never has a minus sign and never negates: its
-        // bit pattern IS the number. Only the signed reading looks at bit 63.
-        s.push_str("    test r15, r15\n");
-        s.push_str("    jnz .Lpanic_dec_nonneg\n");
-        s.push_str("    test rax, rax\n");
-        s.push_str("    jns .Lpanic_dec_nonneg\n");
-        s.push_str("    mov byte ptr [rbx], 45\n");
-        s.push_str("    inc rbx\n");
-        s.push_str("    neg rax\n");
-        s.push_str(".Lpanic_dec_nonneg:\n");
-        s.push_str("    mov r8, rbx\n");
-        s.push_str("    mov rcx, 10\n");
-        s.push_str("    test rax, rax\n");
-        s.push_str("    jnz .Lpanic_dec_loop\n");
-        s.push_str("    mov byte ptr [rbx], 48\n");
-        s.push_str("    inc rbx\n");
-        s.push_str("    jmp .Lpanic_dec_rev\n");
-        s.push_str(".Lpanic_dec_loop:\n");
-        s.push_str("    test rax, rax\n");
-        s.push_str("    jz .Lpanic_dec_rev\n");
-        s.push_str("    xor rdx, rdx\n");
-        s.push_str("    div rcx\n");
-        s.push_str("    add rdx, 48\n");
-        s.push_str("    mov byte ptr [rbx], dl\n");
-        s.push_str("    inc rbx\n");
-        s.push_str("    jmp .Lpanic_dec_loop\n");
-        s.push_str(".Lpanic_dec_rev:\n");
-        s.push_str("    mov rcx, rbx\n");
-        s.push_str("    dec rcx\n");
-        s.push_str(".Lpanic_dec_revloop:\n");
-        s.push_str("    cmp r8, rcx\n");
-        s.push_str("    jge .Lpanic_dec_done\n");
-        s.push_str("    mov al, byte ptr [r8]\n");
-        s.push_str("    mov dl, byte ptr [rcx]\n");
-        s.push_str("    mov byte ptr [r8], dl\n");
-        s.push_str("    mov byte ptr [rcx], al\n");
-        s.push_str("    inc r8\n");
-        s.push_str("    dec rcx\n");
-        s.push_str("    jmp .Lpanic_dec_revloop\n");
-        s.push_str(".Lpanic_dec_done:\n");
-        s.push_str("    ret\n");
-        s
     }
+    // Helper: append the decimal (signed) text of `rax` at `[rbx]`,
+    // advance `rbx` past it. Clobbers rax/rcx/rdx/r8/r9. Two's
+    // complement makes `neg` on `i64::MIN` produce the right MAGNITUDE
+    // as an unsigned bit pattern (`-MIN mod 2^64 == 2^63`), so an
+    // unsigned `div` afterwards is correct for every possible `i64`,
+    // that one value included. ONE copy, shared by both entry points.
+    s.push_str(".Lpanic_i64_dec:\n");
+    // An UNSIGNED type never has a minus sign and never negates: its
+    // bit pattern IS the number. Only the signed reading looks at bit 63.
+    s.push_str("    test r15, r15\n");
+    s.push_str("    jnz .Lpanic_dec_nonneg\n");
+    s.push_str("    test rax, rax\n");
+    s.push_str("    jns .Lpanic_dec_nonneg\n");
+    s.push_str("    mov byte ptr [rbx], 45\n");
+    s.push_str("    inc rbx\n");
+    s.push_str("    neg rax\n");
+    s.push_str(".Lpanic_dec_nonneg:\n");
+    s.push_str("    mov r8, rbx\n");
+    s.push_str("    mov rcx, 10\n");
+    s.push_str("    test rax, rax\n");
+    s.push_str("    jnz .Lpanic_dec_loop\n");
+    s.push_str("    mov byte ptr [rbx], 48\n");
+    s.push_str("    inc rbx\n");
+    s.push_str("    jmp .Lpanic_dec_rev\n");
+    s.push_str(".Lpanic_dec_loop:\n");
+    s.push_str("    test rax, rax\n");
+    s.push_str("    jz .Lpanic_dec_rev\n");
+    s.push_str("    xor rdx, rdx\n");
+    s.push_str("    div rcx\n");
+    s.push_str("    add rdx, 48\n");
+    s.push_str("    mov byte ptr [rbx], dl\n");
+    s.push_str("    inc rbx\n");
+    s.push_str("    jmp .Lpanic_dec_loop\n");
+    s.push_str(".Lpanic_dec_rev:\n");
+    s.push_str("    mov rcx, rbx\n");
+    s.push_str("    dec rcx\n");
+    s.push_str(".Lpanic_dec_revloop:\n");
+    s.push_str("    cmp r8, rcx\n");
+    s.push_str("    jge .Lpanic_dec_done\n");
+    s.push_str("    mov al, byte ptr [r8]\n");
+    s.push_str("    mov dl, byte ptr [rcx]\n");
+    s.push_str("    mov byte ptr [r8], dl\n");
+    s.push_str("    mov byte ptr [rcx], al\n");
+    s.push_str("    inc r8\n");
+    s.push_str("    dec rcx\n");
+    s.push_str("    jmp .Lpanic_dec_revloop\n");
+    s.push_str(".Lpanic_dec_done:\n");
+    s.push_str("    ret\n");
+    s
 }
 
 // --------------------------------------------------------- shared codegen ---
@@ -639,4 +737,79 @@ pub(crate) fn emit_checked_cast(
             e.line(&format!("{} rax, {}", ext, narrow("rax", to_bits)));
         }
     }
+}
+
+/// **ROUND 89** — the checked ARRAY INDEX (SPEC §13, `L9`).
+///
+/// Precondition: `rax` = the index, ZERO extended to 64 bits (an index is a
+/// `usize`, so that is what `load_ext` already produces). `len` is a
+/// compile time number, so it is materialised here rather than asked for.
+///
+/// Two instructions when nothing is wrong — `cmp` and a not-taken `jb`.
+/// That is the whole run time cost of the promise, and `docs/ROUND89.md`
+/// measures what it comes to in a hot loop. The index is left in `rax`
+/// untouched; the caller stores it exactly as for an unchecked one.
+pub(crate) fn emit_checked_idx(e: &mut Emitter, len: u64, msg: &str, site: &mut SiteCounter) {
+    note_index_site();
+    let label = intern(msg);
+    let uid = site.next();
+    let ok = format!(".Lchkidx{}", uid);
+    // TWO instructions on the path that is taken, not three: `cmp r64,
+    // imm32` exists, so the length does not have to be materialised in a
+    // register first. It is loaded into `rcx` only on the way OUT, where
+    // the trampoline wants it and where the cost no longer matters --
+    // measured on `bench/firn/bytecount.fi`, which indexes a fixed size
+    // table in its innermost loop (docs/ROUND89.md).
+    //
+    // The assembler sign-extends a 32-bit literal, so a length that does
+    // not fit into a positive `imm32` keeps the old two-instruction form.
+    let immediate = len < 0x8000_0000;
+    if immediate {
+        e.line(&format!("cmp rax, {}", len));
+    } else {
+        e.line(&format!("mov rcx, {}", len));
+        e.line("cmp rax, rcx");
+    }
+    e.line(&format!("jb {}", ok));
+    if immediate {
+        e.line(&format!("mov rcx, {}", len));
+    }
+    emit_trampoline_jump_to(
+        e,
+        TRAMPOLINE_INDEX,
+        PANIC_INDEX,
+        &label,
+        msg,
+        "rax",
+        "rcx",
+        true,
+    );
+    e.raw(&format!("{}:", ok));
+}
+
+/// Like [`emit_trampoline_jump`], but into a NAMED entry point — round 89
+/// gave the trampoline a second one so that a bounds panic can say
+/// `index=`/`len=` instead of `a=`/`b=`.
+#[allow(clippy::too_many_arguments)]
+fn emit_trampoline_jump_to(
+    e: &mut Emitter,
+    entry: &str,
+    code: u64,
+    msg_label: &str,
+    msg_text: &str,
+    a_reg: &str,
+    b_reg: &str,
+    unsigned: bool,
+) {
+    if a_reg != "rdx" {
+        e.line(&format!("mov rdx, {}", a_reg));
+    }
+    if b_reg != "rcx" {
+        e.line(&format!("mov rcx, {}", b_reg));
+    }
+    e.line(&format!("lea rdi, [rip + {}]", msg_label));
+    e.line(&format!("mov esi, {}", msg_len(msg_text)));
+    e.line(&format!("mov r8, {}", code));
+    e.line(&format!("mov r9, {}", u32::from(unsigned)));
+    e.line(&format!("jmp {}", entry));
 }

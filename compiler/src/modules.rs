@@ -504,6 +504,11 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
         for x in &p.consts {
             items.insert(x.name.clone());
         }
+        // ROUND 89: a `static` is an item of the module like any other, so
+        // `export { COUNT }` and `mod.COUNT` work without a rule of their own.
+        for x in &p.statics {
+            items.insert(x.name.clone());
+        }
         for imp in &p.imports {
             // HOOK profil (prof.rs, round 52/73): under the kernel profile the
             // standard library is barred, unless the module being imported
@@ -565,6 +570,9 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
         for c in p.consts.iter_mut() {
             c.name = mangle(&m, &c.name);
         }
+        for g in p.statics.iter_mut() {
+            g.name = mangle(&m, &g.name);
+        }
         // ... then all references in the bodies.
         for f in p.funcs.iter_mut() {
             r.locals.clear();
@@ -622,9 +630,14 @@ pub fn build_program(files: &[SourceFile], dg: &mut Diags) -> Option<Program> {
             r.ty(&mut c.ty);
             r.expr(&mut c.value);
         }
+        for g in p.statics.iter_mut() {
+            r.ty(&mut g.ty);
+            r.expr(&mut g.value);
+        }
         merged.funcs.append(&mut p.funcs);
         merged.structs.append(&mut p.structs);
         merged.consts.append(&mut p.consts);
+        merged.statics.append(&mut p.statics);
         // `comptime { … }` blocks belong to the merged program — otherwise
         // they never run (SPEC §6.4).
         merged.comptime_blocks.append(&mut p.comptime_blocks);
