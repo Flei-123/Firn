@@ -91,6 +91,17 @@ impl Level {
             _ => None,
         }
     }
+    /// The name as it is written on the command line. **ROUND 84** — the
+    /// cache key of `firnc run` has to name the level, and a `Debug`
+    /// rendering would be a different word from the one the user typed.
+    pub fn name(self) -> &'static str {
+        match self {
+            Level::Dev => "dev",
+            Level::DevFast => "dev-fast",
+            Level::ReleaseSafe => "release-safe",
+            Level::ReleaseFast => "release-fast",
+        }
+    }
     /// Does non-debug-preserving work run at this level too?
     fn allows_all(self) -> bool {
         matches!(self, Level::ReleaseSafe | Level::ReleaseFast)

@@ -49,6 +49,7 @@ mod package_world;
 mod prof;
 mod parser;
 mod regalloc;
+mod runcmd;
 mod sema;
 mod simd;
 mod sizeof;
@@ -160,6 +161,7 @@ fn usage() -> String {
         "{name} {ver} — compiler for {lang} (.{ext})\n\
          \n\
          Usage: {c} [OPTIONS] file.{ext}\n\
+                {c} run [OPTIONS] file.{ext} [ARGUMENTS...]\n\
          \n\
          Options:\n  \
          -o <path>          output file (default: input name without extension)\n  \
@@ -191,7 +193,14 @@ fn usage() -> String {
          --timings          wall clock per compiler phase (ROUND 82)\n  \
          --keep-asm         keep the generated .s file\n  \
          --version          print the version\n  \
-         -h, --help         this help\n",
+         -h, --help         this help\n\
+         \n\
+         Subcommand (ROUND 84):\n  \
+         run <file.{ext}> [args...]  compile and start straight away; everything\n  \
+                              after the file name goes to the PROGRAM, its exit\n  \
+                              code becomes the exit code of '{c} run'.\n  \
+                              Default level 'dev-fast'; the result is cached under\n  \
+                              ~/.cache/firn. '{c} run --help' says more.\n",
         name = c,
         c = c,
         ver = config::VERSION,
@@ -377,6 +386,12 @@ fn main() {
     if args.len() == 1 && args[0] == "--lsp" {
         std::process::exit(lsp::serve());
     }
+    // ROUND 84: `firnc run file.fi [args...]`. It has to be caught HERE and
+    // not in `parse_args`, because everything after the file name belongs to
+    // the program and must not be read as a compiler option.
+    if args[0] == "run" {
+        std::process::exit(run_subcommand(&args[1..]));
+    }
     let opts = match parse_args(&args) {
         Ok(o) => o,
         Err(e) => {
@@ -386,6 +401,225 @@ fn main() {
         }
     };
     std::process::exit(run(&opts));
+}
+
+
+/// **ROUND 84** — the help of the subcommand.
+fn run_usage() -> String {
+    let c = config::compiler_name();
+    format!(
+        "Usage: {c} run [OPTIONS] file.{ext} [ARGUMENTS...]\n\
+         \n\
+         Compiles the file and starts the result straight away — the two step\n\
+         cycle 'compile, then call the binary' in one command.\n\
+         \n\
+         EVERYTHING after the file name goes to the PROGRAM, unchanged, also\n\
+         '--help' and '-o'. Standard input, output and error pass through, and\n\
+         the exit code of {c} run IS the exit code of the program.\n\
+         \n\
+         Options (they have to stand BEFORE the file name):\n  \
+         --no-cache         always compile, do not read and do not write the cache\n  \
+         --clear-cache      empty the cache and (without a file) stop\n  \
+         --opt-level=<lvl>  dev | dev-fast | release-safe | release-fast\n  \
+                              (default here: dev-fast — the short cycle)\n  \
+         --target=, --profile=, --no-pass=, --timings, --stats, --keep-asm\n  \
+                            as in a plain compilation\n  \
+         -h, --help         this text\n\
+         \n\
+         THE CACHE lives in $FIRN_CACHE, else $XDG_CACHE_HOME/firn, else\n\
+         $HOME/.cache/firn. Its key covers the source text of the root file AND\n\
+         of every imported module, every package manifest, the compiler binary,\n\
+         the build level, the target and the profile: change any of them and the\n\
+         file is compiled again.\n\
+         \n\
+         FIRN_RUN_TRACE=1 says on standard error whether the cache was hit.\n\
+         \n\
+         A file starting with '#!/usr/bin/env firnc-run' and marked executable\n\
+         starts directly: ./program.{ext}\n",
+        c = c,
+        ext = config::FILE_EXT
+    )
+}
+
+/// **ROUND 84** — `firnc run <file.fi> [args...]`: compile and start.
+///
+/// The order of the arguments carries the meaning. Up to and including the
+/// FIRST argument that is not an option, the words belong to the compiler;
+/// everything after it belongs to the program and is never looked at again.
+/// That is what makes `firnc run tool.fi --help` possible at all.
+fn run_subcommand(args: &[String]) -> i32 {
+    let mut clear = false;
+    let mut no_cache = false;
+    let mut copts: Vec<String> = Vec::new();
+    let mut file: Option<String> = None;
+    let mut prog: Vec<String> = Vec::new();
+    for a in args {
+        if file.is_some() {
+            prog.push(a.clone());
+            continue;
+        }
+        match a.as_str() {
+            "--clear-cache" => clear = true,
+            "--no-cache" => no_cache = true,
+            "-h" | "--help" => {
+                print!("{}", run_usage());
+                return 0;
+            }
+            _ if a == "-c" || a == "--object" || a.starts_with("--emit=") => {
+                eprintln!(
+                    "error: 'run' always builds an executable and starts it — '{}' does not belong here",
+                    a
+                );
+                eprintln!("note: without 'run' the compiler writes whatever you ask for");
+                return 2;
+            }
+            _ if a.starts_with("-o") => {
+                eprintln!("error: 'run' does not write an output file, '-o' has no place before the file name");
+                eprintln!("note: an '-o' AFTER the file name is passed on to the program");
+                return 2;
+            }
+            _ if a.starts_with('-') => copts.push(a.clone()),
+            _ => file = Some(a.clone()),
+        }
+    }
+    if clear {
+        match runcmd::clear_cache() {
+            Ok(n) => println!(
+                "cache emptied: {} entries removed from {}",
+                n,
+                runcmd::cache_dir().display()
+            ),
+            Err(e) => {
+                eprintln!("error: cannot empty the cache: {}", e);
+                return 2;
+            }
+        }
+        if file.is_none() {
+            return 0;
+        }
+    }
+    let file = match file {
+        Some(f) => f,
+        None => {
+            eprintln!("error: 'run' expects a source file (.{})", config::FILE_EXT);
+            eprintln!("note: '{} run --help' shows the options", config::compiler_name());
+            return 2;
+        }
+    };
+    // 'dev-fast' stands FIRST, so that a --opt-level= from the command line
+    // is read afterwards and wins. The short cycle is the default here; a
+    // program that is started once does not want the whole optimizer.
+    let mut cargs: Vec<String> = vec!["--opt-level=dev-fast".to_string()];
+    cargs.extend(copts);
+    cargs.push(file.clone());
+    let mut opts = match parse_args(&cargs) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            eprintln!("note: '{} run --help' shows the options", config::compiler_name());
+            return 2;
+        }
+    };
+    let path = PathBuf::from(&file);
+    if !path.exists() {
+        eprintln!("error: cannot read '{}': no such file", path.display());
+        return 2;
+    }
+    let trace = std::env::var("FIRN_RUN_TRACE").map(|v| v == "1").unwrap_or(false);
+
+    // --- the cache key. No key means: compile, do not cache. ---
+    let key = if no_cache {
+        None
+    } else {
+        runcmd::key_for(
+            &path,
+            opts.optcfg.level.name(),
+            target::active().name(),
+            prof::name(),
+        )
+    };
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "program".to_string());
+    let cached: Option<PathBuf> = key
+        .as_ref()
+        .map(|k| runcmd::cache_dir().join(format!("{}-{}", stem, &k[..32])));
+
+    let mut throwaway: Option<PathBuf> = None;
+    let binary: PathBuf = match &cached {
+        Some(c) if c.exists() => {
+            if trace {
+                eprintln!("{} run: cache hit {}", config::compiler_name(), c.display());
+            }
+            c.clone()
+        }
+        _ => {
+            // Compile beside the final name and rename afterwards: a reader
+            // never sees half a binary, not even with two runs at once.
+            let out = match &cached {
+                Some(c) => {
+                    if let Some(d) = c.parent() {
+                        if let Err(e) = std::fs::create_dir_all(d) {
+                            eprintln!("error: cannot create the cache directory '{}': {}", d.display(), e);
+                            return 2;
+                        }
+                    }
+                    PathBuf::from(format!("{}.tmp{}", c.display(), std::process::id()))
+                }
+                None => std::env::temp_dir()
+                    .join(format!("firnc-run-{}-{}", stem, std::process::id())),
+            };
+            if trace {
+                eprintln!(
+                    "{} run: cache miss, compiling {}",
+                    config::compiler_name(),
+                    path.display()
+                );
+            }
+            opts.output = Some(out.clone());
+            let rc = run(&opts);
+            if rc != 0 {
+                let _ = std::fs::remove_file(&out);
+                return rc;
+            }
+            match &cached {
+                Some(c) => {
+                    if let Err(e) = std::fs::rename(&out, c) {
+                        eprintln!("error: cannot move the result into the cache: {}", e);
+                        let _ = std::fs::remove_file(&out);
+                        return 2;
+                    }
+                    c.clone()
+                }
+                None => {
+                    throwaway = Some(out.clone());
+                    out
+                }
+            }
+        }
+    };
+
+    // --- start it. Standard input/output/error are inherited, so a pipe
+    // stays a pipe and a terminal stays a terminal. ---
+    let status = std::process::Command::new(&binary).args(&prog).status();
+    if let Some(t) = throwaway {
+        let _ = std::fs::remove_file(t);
+    }
+    match status {
+        Ok(st) => match st.code() {
+            Some(c) => c,
+            None => {
+                // Killed by a signal: the shell's convention, 128 + number.
+                use std::os::unix::process::ExitStatusExt;
+                128 + st.signal().unwrap_or(0)
+            }
+        },
+        Err(e) => {
+            eprintln!("error: cannot start '{}': {}", binary.display(), e);
+            126
+        }
+    }
 }
 
 fn run(opts: &Options) -> i32 {

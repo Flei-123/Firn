@@ -22,6 +22,51 @@ Expected: **zero warnings**, binary at `compiler/target/release/firnc`.
 
 ## 2. Compile and run a program
 
+The short way -- one command, the way `python test.py` works (round 84):
+
+```sh
+compiler/target/release/firnc run examples/hello.fi ; echo "exit=$?"
+```
+
+prints the greeting of `examples/hello.fi` (the text there is still German)
+and then `exit=0`.
+
+Everything after the file name goes to the **program**, unchanged, including
+`--help` and `-o`; the exit code of `firnc run` is the exit code of the
+program; standard input/output/error pass through. The default build level
+is `dev-fast` (the short cycle), `--opt-level=` overrides it.
+
+The result is cached under `~/.cache/firn` (or `$FIRN_CACHE`), keyed by the
+source text of the root file AND of every imported module, the manifests,
+the compiler binary, the level, the target and the profile. Measured on this
+machine, median of five (`bash tools/run/bench.sh 5`):
+
+| program | cold | warm |
+|---|---:|---:|
+| `examples/hello.fi` | 10 ms | 3 ms |
+| `demos/number_check.fi` (4 modules) | 339 ms | 16 ms |
+| `lib/js/run_main.fi` (the JavaScript engine) | 2543 ms | 87 ms |
+
+For comparison on the same machine: `python3 -c pass` takes 16 ms.
+
+```sh
+firnc run --no-cache file.fi        # always compile
+firnc run --clear-cache             # empty the cache
+firnc run --opt-level=release-fast file.fi
+firnc run --help
+```
+
+**As a script.** With `tools/run/firnc-run` on the `PATH`, a file whose first
+line is `#!/usr/bin/env firnc-run` starts directly:
+
+```sh
+ln -s "$PWD/tools/run/firnc-run" ~/.local/bin/firnc-run
+./demos/hello_run.fi
+# hello from a shebang
+```
+
+The two step way -- when you want to keep the binary:
+
 ```sh
 compiler/target/release/firnc -o /tmp/hello examples/hello.fi
 /tmp/hello ; echo "exit=$?"
