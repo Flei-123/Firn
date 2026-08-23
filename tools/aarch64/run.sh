@@ -48,7 +48,13 @@ QEMU=${QEMU:-qemu-aarch64}
 WORK="$ROOT/.a64-work"
 JOBS=${JOBS:-8}
 FLAGS=""
-LABEL="release-fast"
+# ROUND 83: the label says what the compiler REALLY builds without a
+# flag. Round 72 found the command line default lying (`OptConfig::
+# default` returned `release-fast` while every document said `dev-fast`)
+# and fixed it; this line kept repeating the old answer. It matters here
+# of all places, because `dev-fast` is a level that CHECKS the arithmetic
+# -- what this stage compares is the checked build, not the fast one.
+LABEL="dev-fast"
 if [ "${1:-}" = "--no-opt" ]; then
     FLAGS="--no-opt"
     LABEL="no-opt"

@@ -94,6 +94,14 @@ export {
 
     varint_size, varlong_size, zigzag_encode, zigzag_decode,
     zigzag_encode64, zigzag_decode64,
+
+    // ROUND 83: the signed/unsigned REINTERPRETATION of the wire (see the
+    // comment at `bits_u8`). Exported because every caller that builds a
+    // packet by hand needs the same thing, and each one writing its own
+    // mask is how the checked arithmetic of round 72 gets worked around
+    // instead of served.
+    bits_u8, bits_u16, bits_u32, bits_u64,
+    bits_i8, bits_i16, bits_i32, bits_i64,
 }
 
 error BytesError {
@@ -267,6 +275,44 @@ fn bytes_patch_u32(b: *mut Bytes, off: usize, v: u32) {
 
 // ------------------------------------------------------------------ Writing
 
+// ------------------------------------------- ROUND 83: the wire is BITS
+//
+// The protocol writes a signed number as its two's complement bit pattern
+// and reads it back the same way. `v as u32` says something else: SPEC 13
+// (item L9) calls a cast between two types of the SAME width and different
+// sign a narrowing one and checks it, so `-1 as u32` aborts under
+// dev/dev-fast/release-safe -- correctly, because the VALUE -1 is not a
+// `u32`. What the wire needs is the REINTERPRETATION, and the language has
+// no `as%` for that yet (docs/ROUND72.md section 7). So it is spelled once,
+// here, in arithmetic that never leaves its range, instead of at fourteen
+// call sites.
+fn bits_u8(v: i8) -> u8 { return ((v as i64) & 255) as u8 }
+fn bits_u16(v: i16) -> u16 { return ((v as i64) & 65535) as u16 }
+fn bits_u32(v: i32) -> u32 { return ((v as i64) & 4294967295) as u32 }
+fn bits_u64(v: i64) -> u64 {
+    return ((((v >> 32) & 4294967295) as u64) << 32) | ((v & 4294967295) as u64)
+}
+fn bits_i8(v: u8) -> i8 {
+    if v < 128 as u8 { return v as i8 }
+    return ((v as i64) - 256) as i8
+}
+fn bits_i16(v: u16) -> i16 {
+    if v < 32768 as u16 { return v as i16 }
+    return ((v as i64) - 65536) as i16
+}
+fn bits_i32(v: u32) -> i32 {
+    if v < 2147483648 as u32 { return v as i32 }
+    return ((v as i64) - 4294967296) as i32
+}
+fn bits_i64(v: u64) -> i64 {
+    // The top bit apart, the number is its own value; the top bit is worth
+    // exactly `i64::MIN`, and adding that to a non-negative `i64` cannot
+    // leave the range.
+    let low: i64 = (v & 9223372036854775807 as u64) as i64
+    if (v >> 63) == 0 as u64 { return low }
+    return low + (0 - 9223372036854775807 - 1)
+}
+
 fn put_u8(b: *mut Bytes, v: u8) {
     bytes_reserve(b, 1)
     if (*b).bad {
@@ -277,7 +323,7 @@ fn put_u8(b: *mut Bytes, v: u8) {
 }
 
 fn put_i8(b: *mut Bytes, v: i8) {
-    put_u8(b, v as u8)
+    put_u8(b, bits_u8(v))
 }
 
 fn put_bool(b: *mut Bytes, v: bool) {
@@ -296,7 +342,7 @@ fn put_u16(b: *mut Bytes, v: u16) {
 }
 
 fn put_i16(b: *mut Bytes, v: i16) {
-    put_u16(b, v as u16)
+    put_u16(b, bits_u16(v))
 }
 
 fn put_u32(b: *mut Bytes, v: u32) {
@@ -307,7 +353,7 @@ fn put_u32(b: *mut Bytes, v: u32) {
 }
 
 fn put_i32(b: *mut Bytes, v: i32) {
-    put_u32(b, v as u32)
+    put_u32(b, bits_u32(v))
 }
 
 fn put_u64(b: *mut Bytes, v: u64) {
@@ -316,7 +362,7 @@ fn put_u64(b: *mut Bytes, v: u64) {
 }
 
 fn put_i64(b: *mut Bytes, v: i64) {
-    put_u64(b, v as u64)
+    put_u64(b, bits_u64(v))
 }
 
 // IEEE 754, the bit pattern in big endian -- exactly what the protocol
@@ -370,7 +416,7 @@ fn put_c(b: *mut Bytes, p: u64) {
 // Minecraft packet begins with the VarInt length of everything that
 // follows, so the length has to be known without writing it twice.
 fn varint_size(v: i32) -> usize {
-    var x: u32 = v as u32
+    var x: u32 = bits_u32(v)
     var n: usize = 1
     while x >= 128 as u32 {
         x = x >> 7
@@ -390,7 +436,10 @@ fn varlong_size(v: i64) -> usize {
 }
 
 fn put_varint(b: *mut Bytes, v: i32) {
-    var x: u32 = v as u32
+    // A varint encodes the BIT PATTERN of a negative number, not its
+    // value -- `-1` is `0xFFFFFFFF` and takes five octets, which is what
+    // the protocol says (see `bits_u32` above).
+    var x: u32 = bits_u32(v)
     var running: bool = true
     while running {
         if x < 128 as u32 {
@@ -404,7 +453,7 @@ fn put_varint(b: *mut Bytes, v: i32) {
 }
 
 fn put_varlong(b: *mut Bytes, v: i64) {
-    var x: u64 = v as u64
+    var x: u64 = bits_u64(v)
     var running: bool = true
     while running {
         if x < 128 as u64 {
@@ -429,7 +478,7 @@ fn get_varint(b: *mut Bytes) -> BytesError!i32 {
         result = result | (((by & 127 as u8) as u32) << shift)
         n = n + 1
         if (by & 128 as u8) == 0 as u8 {
-            return result as i32
+            return bits_i32(result)
         }
         shift = shift + 7 as u32
     }
@@ -445,7 +494,7 @@ fn get_varlong(b: *mut Bytes) -> BytesError!i64 {
         result = result | (((by & 127 as u8) as u64) << shift)
         n = n + 1
         if (by & 128 as u8) == 0 as u8 {
-            return result as i64
+            return bits_i64(result)
         }
         shift = shift + 7 as u64
     }
@@ -455,7 +504,7 @@ fn get_varlong(b: *mut Bytes) -> BytesError!i64 {
 // ZigZag -- here for the comparison, NOT used by the Java protocol. See the
 // header: Java Edition encodes negative VarInts as two's complement.
 fn zigzag_encode(v: i32) -> u32 {
-    return ((v << 1) as u32) ^ ((v >> 31) as u32)
+    return bits_u32(v << 1) ^ bits_u32(v >> 31)
 }
 
 fn zigzag_decode(v: u32) -> i32 {
@@ -463,7 +512,7 @@ fn zigzag_decode(v: u32) -> i32 {
 }
 
 fn zigzag_encode64(v: i64) -> u64 {
-    return ((v << 1) as u64) ^ ((v >> 63) as u64)
+    return bits_u64(v << 1) ^ bits_u64(v >> 63)
 }
 
 fn zigzag_decode64(v: u64) -> i64 {
@@ -525,9 +574,9 @@ fn bytes_span_eq(a: u64, an: usize, c: u64, cn: usize) -> bool {
 // The protocol type `Position` (since 1.14): x in the upper 26 bits, then z
 // in 26, y in the lowest 12. NOT zigzag, NOT three separate numbers.
 fn put_position(b: *mut Bytes, x: i32, y: i32, z: i32) {
-    let ux: u64 = (x as i64 as u64) & 67108863 as u64
-    let uz: u64 = (z as i64 as u64) & 67108863 as u64
-    let uy: u64 = (y as i64 as u64) & 4095 as u64
+    let ux: u64 = bits_u64(x as i64) & 67108863 as u64
+    let uz: u64 = bits_u64(z as i64) & 67108863 as u64
+    let uy: u64 = bits_u64(y as i64) & 4095 as u64
     put_u64(b, (ux << 38) | (uz << 12) | uy)
 }
 
@@ -578,7 +627,7 @@ fn get_u8(b: *mut Bytes) -> BytesError!u8 {
 
 fn get_i8(b: *mut Bytes) -> BytesError!i8 {
     let v: u8 = try get_u8(b)
-    return v as i8
+    return bits_i8(v)
 }
 
 fn get_bool(b: *mut Bytes) -> BytesError!bool {
@@ -594,7 +643,7 @@ fn get_u16(b: *mut Bytes) -> BytesError!u16 {
 
 fn get_i16(b: *mut Bytes) -> BytesError!i16 {
     let v: u16 = try get_u16(b)
-    return v as i16
+    return bits_i16(v)
 }
 
 fn get_u32(b: *mut Bytes) -> BytesError!u32 {
@@ -605,7 +654,7 @@ fn get_u32(b: *mut Bytes) -> BytesError!u32 {
 
 fn get_i32(b: *mut Bytes) -> BytesError!i32 {
     let v: u32 = try get_u32(b)
-    return v as i32
+    return bits_i32(v)
 }
 
 fn get_u64(b: *mut Bytes) -> BytesError!u64 {
@@ -616,7 +665,7 @@ fn get_u64(b: *mut Bytes) -> BytesError!u64 {
 
 fn get_i64(b: *mut Bytes) -> BytesError!i64 {
     let v: u64 = try get_u64(b)
-    return v as i64
+    return bits_i64(v)
 }
 
 fn get_f32(b: *mut Bytes) -> BytesError!f32 {
