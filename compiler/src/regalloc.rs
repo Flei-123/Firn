@@ -460,9 +460,35 @@ fn exact_crossings(f: &Func, live: &Live) -> (Bits, Bits, Bits) {
                 Op::Call { .. } | Op::CallIndirect { .. } | Op::Syscall { .. } | Op::ThreadSpawn { .. }
             ) || is_cpuid(&i.op);
             let is_mem = matches!(i.op, Op::CopyMem { .. } | Op::SecureZero { .. });
+            // ROUND 89 — A BUG OF ROUND 72, found by this round's index
+            // check and older than it.
+            //
+            // The ROUGH question (`divsel_pos`, further down) has listed
+            // the four checked operations since round 72: they all end up
+            // in `push rax`/`push rcx` .. `div`/`idiv` inside
+            // `panic_rt.rs`, which clobbers `rdx` exactly as a plain
+            // `Div`/`Rem` does. The EXACT question here did not, so a value
+            // the allocator had parked in `rdx` was declared to survive
+            // them after all and the rough answer was overruled.
+            //
+            // It stayed invisible because it needs a value to live in `rdx`
+            // ACROSS a checked division — `tests/048_print_number.fi` grew
+            // exactly that the moment its `buf[0] = 48` lost its bounds
+            // check and the buffer address became worth keeping in a
+            // register (`x / 10` then wrote the remainder over it and the
+            // next `buf[n] = ..` stored to address 6). Same list as the
+            // rough question, in one place, so the two cannot disagree
+            // again.
             let is_dv = matches!(
                 i.op,
-                Op::Bin(BinOp::Div | BinOp::Rem, _, _) | Op::Select { .. } | Op::AtomicCas { .. }
+                Op::Bin(BinOp::Div | BinOp::Rem, _, _)
+                    | Op::Select { .. }
+                    | Op::AtomicCas { .. }
+                    | Op::CheckedBin { .. }
+                    | Op::CheckedDiv { .. }
+                    | Op::CheckedCast { .. }
+                    | Op::CheckedIdx { .. }
+                    | Op::BinWrapSat { .. }
             );
             let interesting = is_call || is_mem || is_dv;
             if interesting {
@@ -880,6 +906,7 @@ pub fn allocate(f: &Func) -> Alloc {
                     | Op::CheckedBin { .. }
                     | Op::CheckedDiv { .. }
                     | Op::CheckedCast { .. }
+                    | Op::CheckedIdx { .. }
                     | Op::BinWrapSat { .. }
             ) {
                 divsel_pos.push(live.pos[bi][ii]);
@@ -2244,7 +2271,8 @@ fn unsupported_basic(f: &Func) -> Option<String> {
                 Op::Call { .. }
                 | Op::CallIndirect { .. }
                 | Op::VtabAddr { .. }
-                | Op::FnRef { .. } => {}
+                | Op::FnRef { .. }
+                | Op::GlobalAddr { .. } => {}
                 Op::Syscall { args } => {
                     if args.is_empty() || args.len() > 7 {
                         return Some(format!("syscall with {} arguments", args.len()));
@@ -2770,6 +2798,15 @@ fn emit_inst(
             crate::panic_rt::emit_checked_cast(e, *from, ty, msg, site);
             ra.store_dst(e, d, "rax");
         }
+        // ROUND 89 -- the checked ARRAY INDEX (SPEC section 13, item L9).
+        // The index is a `usize`, so ONE unsigned comparison against the
+        // length decides both ends at once.
+        Op::CheckedIdx { idx, len, msg } => {
+            let d = i.dst.ok_or("internal error: checked index without target")?;
+            ra.load_ext(e, "rax", *idx, ty, 64);
+            crate::panic_rt::emit_checked_idx(e, *len, msg, site);
+            ra.store_dst(e, d, "rax");
+        }
         // ROUND 72 -- explicit "+% -% *%" / "+| -| *|" (SPEC section 13,
         // item L9): never checked, the caller's own well-defined fallback.
         Op::BinWrapSat { kind, op, a, b } => {
@@ -3123,6 +3160,15 @@ fn emit_inst(
             e.line(&format!(
                 "lea rax, [rip + {}]",
                 crate::fnval::record_label(name)
+            ));
+            ra.store_dst(e, d, "rax");
+        }
+        // Round 89 (statics.rs), like `FnRef`: a link time constant address.
+        Op::GlobalAddr { name } => {
+            let d = i.dst.ok_or("internal error: globaladdr without target")?;
+            e.line(&format!(
+                "lea rax, [rip + {}]",
+                crate::statics::label_of(name)
             ));
             ra.store_dst(e, d, "rax");
         }

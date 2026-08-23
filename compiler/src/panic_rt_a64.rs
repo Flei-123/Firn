@@ -83,55 +83,71 @@ fn rw(r: &str, bits: u32) -> String {
 /// kept the promise.
 pub(crate) fn trampoline_asm() -> String {
     let mut s = String::new();
-    s.push_str(&format!("{}:\n", TRAMPOLINE));
-    // Nothing is saved: this never returns. x19/x20 are callee-saved and
-    // are used all the same — the process is already dying.
-    s.push_str("    mov x19, x0\n"); // message pointer
-    s.push_str("    mov x20, x1\n"); // message length
-    s.push_str("    mov x21, x2\n"); // a
-    s.push_str("    mov x22, x3\n"); // b
-    s.push_str("    mov x23, x5\n"); // 1 = read the two values as unsigned
-    // 176 octets of buffer: the longest possible tail is
-    // " (a=-9223372036854775808 b=-9223372036854775808)\n", 49 octets.
-    s.push_str("    sub sp, sp, #176\n");
-    s.push_str("    mov x24, sp\n"); // start of the buffer
-    s.push_str("    mov x25, sp\n"); // write pointer
-    for c in [32u32, 40, 97, 61] {
-        // " (a="
-        s.push_str(&format!("    mov w26, #{}\n", c));
-        s.push_str("    strb w26, [x25], #1\n");
+    // ROUND 89: a program with a `#[panic_handler]` gets one `call` per
+    // entry point and none of the formatter below. The trampoline's
+    // register convention (x0..x4) IS the AAPCS64 one for five arguments,
+    // so there is nothing to shuffle.
+    if let Some(h) = crate::panic_rt::handler() {
+        for (label, _, _) in entries() {
+            s.push_str(&format!("{}:\n", label));
+            s.push_str(&format!("    bl {}\n", crate::codegen_x86::label(&h)));
+            s.push_str("    mov x0, #101\n");
+            s.push_str("    mov x8, #94\n");
+            s.push_str("    svc #0\n");
+            s.push_str("    brk #0\n");
+        }
+        return s;
     }
-    s.push_str("    mov x0, x21\n");
-    s.push_str("    bl .Lpanic_a64_dec\n");
-    for c in [32u32, 98, 61] {
-        // " b="
-        s.push_str(&format!("    mov w26, #{}\n", c));
-        s.push_str("    strb w26, [x25], #1\n");
+    for (label, open, mid) in entries() {
+
+        s.push_str(&format!("{}:\n", label));
+        // Nothing is saved: this never returns. x19/x20 are callee-saved and
+        // are used all the same — the process is already dying.
+        s.push_str("    mov x19, x0\n"); // message pointer
+        s.push_str("    mov x20, x1\n"); // message length
+        s.push_str("    mov x21, x2\n"); // a
+        s.push_str("    mov x22, x3\n"); // b
+        s.push_str("    mov x23, x5\n"); // 1 = read the two values as unsigned
+        // 176 octets of buffer: the longest possible tail is
+        // " (a=-9223372036854775808 b=-9223372036854775808)\n", 49 octets.
+        s.push_str("    sub sp, sp, #176\n");
+        s.push_str("    mov x24, sp\n"); // start of the buffer
+        s.push_str("    mov x25, sp\n"); // write pointer
+        for c in open.bytes().map(u32::from) {
+            s.push_str(&format!("    mov w26, #{}\n", c));
+            s.push_str("    strb w26, [x25], #1\n");
+        }
+        s.push_str("    mov x0, x21\n");
+        s.push_str("    bl .Lpanic_a64_dec\n");
+        for c in mid.bytes().map(u32::from) {
+            s.push_str(&format!("    mov w26, #{}\n", c));
+            s.push_str("    strb w26, [x25], #1\n");
+        }
+        s.push_str("    mov x0, x22\n");
+        s.push_str("    bl .Lpanic_a64_dec\n");
+        for c in [41u32, 10] {
+            // ")\n"
+            s.push_str(&format!("    mov w26, #{}\n", c));
+            s.push_str("    strb w26, [x25], #1\n");
+        }
+        // write(2, message, length)
+        s.push_str("    mov x0, #2\n");
+        s.push_str("    mov x1, x19\n");
+        s.push_str("    mov x2, x20\n");
+        s.push_str("    mov x8, #64\n");
+        s.push_str("    svc #0\n");
+        // write(2, buffer, write pointer - start)
+        s.push_str("    mov x0, #2\n");
+        s.push_str("    mov x1, x24\n");
+        s.push_str("    sub x2, x25, x24\n");
+        s.push_str("    mov x8, #64\n");
+        s.push_str("    svc #0\n");
+        // exit_group(101) — the same number the x86 trampoline exits with.
+        s.push_str("    mov x0, #101\n");
+        s.push_str("    mov x8, #94\n");
+        s.push_str("    svc #0\n");
+        s.push_str("    brk #0\n");
     }
-    s.push_str("    mov x0, x22\n");
-    s.push_str("    bl .Lpanic_a64_dec\n");
-    for c in [41u32, 10] {
-        // ")\n"
-        s.push_str(&format!("    mov w26, #{}\n", c));
-        s.push_str("    strb w26, [x25], #1\n");
-    }
-    // write(2, message, length)
-    s.push_str("    mov x0, #2\n");
-    s.push_str("    mov x1, x19\n");
-    s.push_str("    mov x2, x20\n");
-    s.push_str("    mov x8, #64\n");
-    s.push_str("    svc #0\n");
-    // write(2, buffer, write pointer - start)
-    s.push_str("    mov x0, #2\n");
-    s.push_str("    mov x1, x24\n");
-    s.push_str("    sub x2, x25, x24\n");
-    s.push_str("    mov x8, #64\n");
-    s.push_str("    svc #0\n");
-    // exit_group(101) — the same number the x86 trampoline exits with.
-    s.push_str("    mov x0, #101\n");
-    s.push_str("    mov x8, #94\n");
-    s.push_str("    svc #0\n");
-    s.push_str("    brk #0\n");
     // ---------------------------------------------------------------
     // Appends the decimal text of `x0` at `[x25]` and advances `x25`.
     // `x23` = 1 means the value is UNSIGNED and never gets a sign.
@@ -178,6 +194,17 @@ pub(crate) fn trampoline_asm() -> String {
     s
 }
 
+/// The two entry points and the literal words they differ in — the same
+/// list the x86 side builds (`panic_rt::TRAMPOLINE`/`TRAMPOLINE_INDEX`), so
+/// a bounds panic reads `index=`/`len=` on both machines.
+fn entries() -> Vec<(&'static str, &'static str, &'static str)> {
+    let mut v = vec![(TRAMPOLINE, " (a=", " b=")];
+    if crate::panic_rt::index_used() {
+        v.push((crate::panic_rt::TRAMPOLINE_INDEX, " (index=", " len="));
+    }
+    v
+}
+
 /// Branches into the trampoline with the convention it expects. `a_reg`
 /// and `b_reg` hold the two ORIGINAL operand values (64 bits, extended
 /// the way the type reads them).
@@ -202,6 +229,28 @@ fn trampoline_jump(
     crate::codegen_a64::imm_into(e, "x4", code as i64);
     crate::codegen_a64::imm_into(e, "x5", i64::from(unsigned));
     e.line(&format!("b {}", TRAMPOLINE));
+}
+
+/// Like `trampoline_jump`, into a NAMED entry point (round 89).
+#[allow(clippy::too_many_arguments)]
+fn trampoline_jump_to(
+    e: &mut Emitter,
+    entry: &str,
+    code: u64,
+    msg_label: &str,
+    msg_len: usize,
+    a_reg: &str,
+    b_reg: &str,
+    unsigned: bool,
+) {
+    e.line(&format!("mov x2, {}", a_reg));
+    e.line(&format!("mov x3, {}", b_reg));
+    e.line(&format!("adrp x0, {}", msg_label));
+    e.line(&format!("add x0, x0, :lo12:{}", msg_label));
+    crate::codegen_a64::imm_into(e, "x1", msg_len as i64);
+    crate::codegen_a64::imm_into(e, "x4", code as i64);
+    crate::codegen_a64::imm_into(e, "x5", i64::from(unsigned));
+    e.line(&format!("b {}", entry));
 }
 
 fn panic_code_of(op: BinOp) -> u64 {
@@ -555,4 +604,32 @@ fn clamp_arm(e: &mut Emitter, clamp: &str, op: BinOp, ty: FTy, min_lit: i64, max
         _ => unreachable!("guarded by the caller"),
     }
     e.line(&format!("csel {}, {}, {}, lt", A, U, T));
+}
+
+/// **ROUND 89** — the checked ARRAY INDEX on aarch64 (SPEC §13, `L9`).
+///
+/// Precondition: `x9` = the index, zero extended to 64 bits. The same two
+/// instructions the x86 side needs when nothing is wrong: one `cmp` and one
+/// not-taken `b.lo` (unsigned "below"). `len` is a compile time number and
+/// goes into `x10` through the backend's own immediate builder, which
+/// already knows how to make a 64-bit constant out of `movz`/`movk`.
+pub(crate) fn emit_checked_idx(e: &mut Emitter, len: u64, msg: &str, site: &mut SiteCounter) {
+    crate::panic_rt::note_index_site();
+    let label = intern(msg);
+    let uid = site.next();
+    let ok = format!(".Lchkidx{}", uid);
+    crate::codegen_a64::imm_into(e, B, len as i64);
+    e.line(&format!("cmp {}, {}", A, B));
+    e.line(&format!("b.lo {}", ok));
+    trampoline_jump_to(
+        e,
+        crate::panic_rt::TRAMPOLINE_INDEX,
+        crate::panic_rt::PANIC_INDEX,
+        &label,
+        msg.len(),
+        A,
+        B,
+        true,
+    );
+    e.raw(&format!("{}:", ok));
 }

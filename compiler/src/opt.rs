@@ -161,7 +161,7 @@ pub const PASSES: &[PassInfo] = &[
         name: "bce",
         scope: Scope::Func,
         debug_preserving: true,
-        what: "remove provably always satisfied bounds checks",
+        what: "remove provably always satisfied range and index checks",
     },
     PassInfo {
         name: "thread-bool",
@@ -463,7 +463,7 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut Pas
         }
         if cfg.runs("bce") && fx.due(6) {
             let t = std::time::Instant::now();
-            let r = remove_redundant_checks(f);
+            let r = remove_redundant_checks(f) + remove_provable_index_checks(f);
             st.removed_checks += r;
             clk.add2("bce", t, r > 0);
             fx.note(6, r > 0);
@@ -640,16 +640,19 @@ fn cse(f: &mut Func) -> usize {
 /// the duplicate check vanishes that arises when a field is accessed inside
 /// a loop that has already been checked.
 /// Yields the number of checks removed.
-fn remove_redundant_checks(f: &mut Func) -> usize {
-    if f.blocks.len() > 512 || f.blocks.iter().enumerate().any(|(i, b)| b.id as usize != i) {
-        return 0;
-    }
+/// Which conditions are already decided when a block is entered.
+///
+/// Knowledge is carried forward exclusively along chains with EXACTLY ONE
+/// predecessor. Such a chain can contain no cycle (a block entered again
+/// would have a second predecessor), so the value of the condition is
+/// unchanged on the path actually taken.
+///
+/// ROUND 89: split out of `remove_redundant_checks`, because the index
+/// checks need the same facts and computing them twice, differently, is how
+/// two passes end up disagreeing about what is known.
+fn known_facts(f: &Func) -> Vec<HashMap<Val, bool>> {
     let preds = crate::mem2reg::preds(f);
     let n = f.blocks.len();
-    // Knowledge is carried forward exclusively along chains with EXACTLY ONE
-    // predecessor. Such a chain can contain no cycle (a block entered again
-    // would have a second predecessor), so the value of the condition is
-    // unchanged on the path actually taken.
     let mut known: Vec<HashMap<Val, bool>> = vec![HashMap::new(); n];
     for bi in 0..n {
         let mut cur = bi;
@@ -671,6 +674,15 @@ fn remove_redundant_checks(f: &mut Func) -> usize {
         }
         known[bi] = facts;
     }
+    known
+}
+
+fn remove_redundant_checks(f: &mut Func) -> usize {
+    if f.blocks.len() > 512 || f.blocks.iter().enumerate().any(|(i, b)| b.id as usize != i) {
+        return 0;
+    }
+    let n = f.blocks.len();
+    let known = known_facts(f);
     let mut removed = 0usize;
     for bi in 0..n {
         if let Term::BrCond { cond, then_bb, else_bb } = f.blocks[bi].term {
@@ -684,6 +696,199 @@ fn remove_redundant_checks(f: &mut Func) -> usize {
         }
     }
     removed
+}
+
+/// **ROUND 89** — throws away the index checks the optimiser can PROVE are
+/// satisfied (SPEC §13, item `L9`).
+///
+/// Two proofs, and no third one that "looks safe":
+///
+/// 1. **The index is a constant** inside the array. Then the check is a
+///    comparison of two numbers the compiler already knows.
+/// 2. **A dominating branch has already decided it.** The single
+///    predecessor chain (`known_facts`) says which conditions hold on the
+///    way into this block. If one of them is `i < k` (or `i <= k`) with a
+///    constant `k` that does not reach past the array, then `i < len`
+///    holds too. That is exactly the shape `for i in 0..n` lowers to
+///    (`lower.rs::lower_for` builds a `while i < n` around the body), so
+///    the loop the SPEC promises would not pay for the check does not pay
+///    for it.
+///
+/// An index is a `usize`, so there is no lower bound to prove.
+///
+/// The instruction is not deleted here: its uses are pointed at the index
+/// value and the now dead (pure) `const` that is left behind is removed by
+/// `dce` in the same run. That way this pass does not have to renumber
+/// anything.
+/// Could this instruction have changed what is behind a pointer?
+/// Deliberately generous: everything that is not obviously pure counts as
+/// a write, because the question being answered ("is the value I loaded
+/// still the value I am about to index with") must not be answered
+/// optimistically.
+fn writes_memory(op: &Op) -> bool {
+    !matches!(
+        op,
+        Op::Const(_)
+            | Op::Bin(..)
+            | Op::BinWrapSat { .. }
+            | Op::Cmp { .. }
+            | Op::Un(..)
+            | Op::Cast { .. }
+            | Op::PtrAdd { .. }
+            | Op::Load { .. }
+            | Op::Alloca { .. }
+            | Op::Select { .. }
+            | Op::VtabAddr { .. }
+            | Op::FnRef { .. }
+            | Op::GlobalAddr { .. }
+            | Op::CheckedBin { .. }
+            | Op::CheckedDiv { .. }
+            | Op::CheckedCast { .. }
+            | Op::CheckedIdx { .. }
+    )
+}
+
+fn remove_provable_index_checks(f: &mut Func) -> usize {
+    if f.blocks.len() > 512 || f.blocks.iter().enumerate().any(|(i, b)| b.id as usize != i) {
+        return 0;
+    }
+    let has_any = f
+        .blocks
+        .iter()
+        .any(|b| b.insts.iter().any(|i| matches!(i.op, Op::CheckedIdx { .. })));
+    if !has_any {
+        return 0;
+    }
+    let consts = const_map(f);
+    // Every comparison in the function, by the value it produces.
+    let mut cmps: HashMap<Val, (CmpOp, Val, Val)> = HashMap::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            if let (Some(d), Op::Cmp { op, a, b: rhs, .. }) = (i.dst, &i.op) {
+                cmps.insert(d, (*op, *a, *rhs));
+            }
+        }
+    }
+    let known = known_facts(f);
+    let preds = crate::mem2reg::preds(f);
+    // Where every value is defined: (block, position in that block).
+    let mut site: HashMap<Val, (usize, usize)> = HashMap::new();
+    // The address a value was LOADED from, if it is a load.
+    let mut loaded_from: HashMap<Val, Val> = HashMap::new();
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for (ii, i) in b.insts.iter().enumerate() {
+            if let Some(d) = i.dst {
+                site.insert(d, (bi, ii));
+                if let Op::Load { addr } = i.op {
+                    loaded_from.insert(d, addr);
+                }
+            }
+        }
+    }
+    // THE SAME VALUE, written twice.
+    //
+    // `while i < n { a[i] }` compares a load of `i` in the loop header and
+    // indexes with a SECOND load of the same `i` in the body — two FIR
+    // values, one variable. Firn's FIR has no phi nodes (mem2reg promotes
+    // only what does not cross a block), so without this the proof would
+    // fail on the very loop shape the SPEC promises it would succeed on.
+    //
+    // Sound because it is narrow: the two loads must read the SAME
+    // address, the compare must sit in the IMMEDIATE single predecessor,
+    // and between the first load and the index there must be no
+    // instruction that writes memory at all — no store, no call, nothing
+    // that could have changed what is in there.
+    let same_place = |a: Val, idx: Val, bi: usize, ii: usize| -> bool {
+        if a == idx {
+            return true;
+        }
+        let (aa, ia) = match (loaded_from.get(&a), loaded_from.get(&idx)) {
+            (Some(x), Some(y)) if x == y => (*x, *y),
+            _ => return false,
+        };
+        let _ = (aa, ia);
+        let (ab, ai) = match site.get(&a) {
+            Some(x) => *x,
+            None => return false,
+        };
+        if preds[bi].len() != 1 || preds[bi][0] != ab {
+            return false;
+        }
+        for k in (ai + 1)..f.blocks[ab].insts.len() {
+            if writes_memory(&f.blocks[ab].insts[k].op) {
+                return false;
+            }
+        }
+        for k in 0..ii {
+            if writes_memory(&f.blocks[bi].insts[k].op) {
+                return false;
+            }
+        }
+        true
+    };
+    // An upper bound known for `idx` from the branches on the way in.
+    let bound_ok = |facts: &HashMap<Val, bool>, idx: Val, len: u64, bi: usize, ii: usize| -> bool {
+        for (cond, truth) in facts.iter() {
+            if !*truth {
+                continue;
+            }
+            let (op, a, b) = match cmps.get(cond) {
+                Some(x) => *x,
+                None => continue,
+            };
+            // `idx < k` and `idx <= k`, plus the mirrored spellings
+            // `k > idx` / `k >= idx` — the same fact written the other way
+            // round.
+            let (limit, strict) = match (op, same_place(a, idx, bi, ii), same_place(b, idx, bi, ii)) {
+                (CmpOp::Lt, true, _) => (b, true),
+                (CmpOp::Le, true, _) => (b, false),
+                (CmpOp::Gt, _, true) => (a, true),
+                (CmpOp::Ge, _, true) => (a, false),
+                _ => continue,
+            };
+            let k = match consts.get(&limit) {
+                Some(&k) => k,
+                None => continue,
+            };
+            if k < 0 {
+                continue;
+            }
+            let k = k as u128;
+            if (strict && k <= len as u128) || (!strict && k < len as u128) {
+                return true;
+            }
+        }
+        false
+    };
+    // The decision is taken with `f` read only (the proof above walks it),
+    // and only then written back — one pass cannot both look and change.
+    let mut hits: Vec<(usize, usize, Val, Val)> = Vec::new();
+    for bi in 0..f.blocks.len() {
+        for ii in 0..f.blocks[bi].insts.len() {
+            let (dst, idx, len) = match (&f.blocks[bi].insts[ii].dst, &f.blocks[bi].insts[ii].op) {
+                (Some(d), Op::CheckedIdx { idx, len, .. }) => (*d, *idx, *len),
+                _ => continue,
+            };
+            let inside = match consts.get(&idx) {
+                Some(&v) => v >= 0 && (v as u128) < len as u128,
+                None => bound_ok(&known[bi], idx, len, bi, ii),
+            };
+            if inside {
+                hits.push((bi, ii, dst, idx));
+            }
+        }
+    }
+    if hits.is_empty() {
+        return 0;
+    }
+    let mut map: HashMap<Val, Val> = HashMap::new();
+    for (bi, ii, dst, idx) in hits {
+        f.blocks[bi].insts[ii].op = Op::Const(0);
+        map.insert(dst, idx);
+    }
+    let cnt = map.len();
+    crate::mem2reg::replace_uses(f, &map);
+    cnt
 }
 
 // ---------------------------------------------------------------- Folding ---
