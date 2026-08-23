@@ -7,7 +7,11 @@
 #   1. `demos/kernel/core.fi` compiles with BOTH compilers to an
 #      ELF object file (`ET_REL`), not to an executable.
 #   2. The object file has NO undefined name -- no libc, no
-#      `_start`, no runtime. (`nm -u` yields nothing.)
+#      `_start`, no runtime -- EXCEPT `osum_panic` (round 72: `core.fi`
+#      now uses checked arithmetic, and `profile kernel` calls that one
+#      external symbol on an out-of-range value on purpose, SPEC section
+#      13; `demos/kernel/start.s` defines it, resolved at the link step
+#      in part 3 below). (`nm -u` yields at most that one name.)
 #   3. It contains not a single `syscall` instruction (`objdump -d`).
 #   4. It can be linked with `ld -T demos/kernel/linker.ld` into an image
 #      and BOOTED in QEMU: the serial output of the kernel appears.
@@ -74,8 +78,16 @@ for s in 0 1; do
     kind=$(readelf -h "$f" | awk -F: '/^  Type:/ {print $2}' | awk '{print $1}')
     [ "$kind" = "REL" ] && ok "firnc$s: ELF type REL (relocatable object file)" \
                        || bad "firnc$s: ELF kind '$kind', expected REL"
-    undef=$(nm -u "$f" 2>/dev/null | sed '/^$/d')
-    [ -z "$undef" ] && ok "firnc$s: NO undefined symbol" \
+    # ROUND 72: `osum_panic` is the ONE name allowed to stay undefined
+    # here -- `core.fi` now uses checked arithmetic (`timer_ih`'s `old + 1
+    # as u16`), and under `profile kernel` a checked site that goes out of
+    # range calls that external symbol on purpose (SPEC section 13, `L9`);
+    # this object file is freestanding and has not been linked against
+    # `demos/kernel/start.s`'s own definition of it yet (section 3 below
+    # is where that happens, and where the reference gets resolved for
+    # real). Anything ELSE undefined is still a hard failure.
+    undef=$(nm -u "$f" 2>/dev/null | awk '{print $NF}' | sed '/^$/d' | grep -vxF osum_panic)
+    [ -z "$undef" ] && ok "firnc$s: NO undefined symbol (other than osum_panic, resolved at link time)" \
                     || { bad "firnc$s: undefined symbols"; echo "$undef" | sed 's/^/        /'; }
     # Every defined symbol belongs to the program itself (prefix _F0./_F1.).
     fremd=$(nm --defined-only "$f" | awk '{print $3}' | grep -vE "^_F[01]\." || true)
@@ -141,8 +153,16 @@ for s in 0 1; do
             bad "firnc$s: '$instr' is missing"
         fi
     done
-    # `#[interrupt]`: 14 push + 14 pop in the entry point.
-    n=$(awk '/<_F'"$s"'\.timer_ih>:/,/iretq/' "$TMPD/d$s.txt" | grep -cE '\bpush\b')
+    # `#[interrupt]`: 14 push + 14 pop in the entry point, THEN the frame
+    # is allocated (`sub ..., %rsp`) -- that instruction is the reliable
+    # end-of-prolog marker. ROUND 72: counting `push` over the WHOLE
+    # function body (as this used to) broke the moment `timer_ih` itself
+    # contained checked arithmetic (`old + 1` in `demos/kernel/core.fi`)
+    # -- `emit_checked_bin` rescues its own two operands with a balanced
+    # `push`/`push` .. `pop`/`pop` pair around every checked site, which is
+    # correct generated code, not a wrong register save count; this test
+    # was simply never taught the difference between the two.
+    n=$(awk '/<_F'"$s"'\.timer_ih>:/{f=1} f{print; if ($0 ~ /sub.*%rsp/) exit}' "$TMPD/d$s.txt" | grep -cE '\bpush\b')
     [ "$n" -eq 15 ] && ok "firnc$s: timer_ih saves 14 registers + rbp" \
                     || bad "firnc$s: timer_ih has $n push, expected 15"
 done

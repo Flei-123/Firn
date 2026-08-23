@@ -485,6 +485,23 @@ fn compute(op: BinOp, a: i128, b: i128, span: Span) -> Result<i128, Error> {
         BinOp::Ge => bit(a >= b),
         BinOp::LAnd => bit(a != 0 && b != 0),
         BinOp::LOr => bit(a != 0 || b != 0),
+        // ROUND 72 -- explicit wrap/saturate (SPEC section 13, item L9).
+        // `comptime` has no destination type of its own at this point (its
+        // values are untyped i128 until a later cast narrows them, exactly
+        // like every other operator here), so wrapping is the only one of
+        // the two that has an honest answer: it is what the SAME narrowing
+        // step every other arithmetic result already goes through already
+        // means.
+        BinOp::AddWrap => a + b,
+        BinOp::SubWrap => a - b,
+        BinOp::MulWrap => a * b,
+        BinOp::AddSat | BinOp::SubSat | BinOp::MulSat => {
+            return Err((
+                span,
+                "'+|'/'-|'/'*|' (saturating arithmetic) is not supported inside                  'comptime' yet -- use it at run time"
+                    .to_string(),
+            ));
+        }
     })
 }
 

@@ -47,7 +47,7 @@ import iface
 import core
 
 export { Lower, low_new, low_free, low_run, low_error, low_fir, low_unsuitable,
-    low_mu_set, low_fe_set, low_gc_set, low_if_set }
+    low_mu_set, low_fe_set, low_gc_set, low_if_set, low_checked_set }
 
 const NONE: u32 = 4294967295
 
@@ -82,6 +82,15 @@ struct Lower {
     ifr: u64 // registry of the interfaces (round 46; 0 = none)
     err: usize
     unsuitable: bool // aggregate or `defer` found
+    // ROUND 72 (checkmode.rs, SPEC 13 item L9): does THIS build level check
+    // `+ - * / %` and a narrowing `as`? `dev`, `dev-fast` and
+    // `release-safe` do, `release-fast` does not. Set once by the driver
+    // before lowering starts, read for every arithmetic expression.
+    checked: bool
+    // The current file, for the panic message. It comes out of the
+    // expression's own position (`ast.expr_pos`), so nothing needs to be
+    // tracked here -- only the scratch buffer that builds the sentence.
+    msg: rt.Buf
 }
 
 fn low_new(b: u64, it: u64, sm: u64) -> Lower {
@@ -95,8 +104,13 @@ fn low_new(b: u64, it: u64, sm: u64) -> Lower {
         d_stmt: vec_new[u32](), d_err: vec_new[u32](), d_limit: vec_new[u32](),
         sret: NONE, mu: 0, feh: 0, gcr: 0, ifr: 0, err: 0, unsuitable: false,
         pin_node: NONE, pin_addr: 0,
+        checked: true, msg: rt.buf_new(),
     }
 }
+
+// ROUND 72: `firnc1 --opt-level=release-fast` switches the checks off, every
+// other level leaves them on -- the same table as `checkmode.rs`.
+fn low_checked_set(l: *mut Lower, v: bool) { (*l).checked = v }
 
 fn low_free(l: *mut Lower) {
     fir.fir_free(&(*l).f)
@@ -110,6 +124,7 @@ fn low_free(l: *mut Lower) {
     vec_free[u32](&(*l).d_stmt)
     vec_free[u32](&(*l).d_err)
     vec_free[u32](&(*l).d_limit)
+    rt.buf_free(&(*l).msg)
 }
 
 fn low_error(l: *mut Lower) -> usize { return (*l).err }
@@ -211,6 +226,137 @@ fn push(l: *mut Lower, kind: u32, ty: u32, a: u32, b: u32, c: u32, z: u64, aoff:
 
 fn push_void(l: *mut Lower, kind: u32, ty: u32, a: u32, b: u32, c: u32, z: u64, aoff: u32, alen: u32) {
     fir.inst_void_add(&(*l).f, (*l).fi, (*l).cur, kind, ty, a, b, c, z, aoff, alen)
+}
+
+// --------------------------------------------- ROUND 72: panic messages
+//
+// The sentence a checked operation prints when it goes out of range
+// (SPEC 13, item L9). It is built HERE, during lowering, because this is
+// the last place that knows where in the source the operation stood --
+// FIR carries no positions at all (docs/FIR.md). It has to read octet for
+// octet like the one `lower.rs` builds: `tools/fir_compare.sh` compares
+// the two intermediate representations as TEXT, and the message is part
+// of it.
+
+// The spelling of an `ast::BinOp` -- only the five that ever reach a
+// checked operation (`ast.rs::BinOp::text`).
+fn op_text(b: *mut rt.Buf, op: u32) {
+    var tab: [u8; 9] = "+|-|*|/|%"
+    var i: usize = 0
+    var nr: u32 = 0
+    var start: usize = 0
+    while i <= 9 {
+        var end: bool = i == 9
+        if !end {
+            end = tab[i] == 124 as u8
+        }
+        if end {
+            if nr == op {
+                rt.buf_push_bytes(b, (&tab[start]) as u64, i - start)
+                return
+            }
+            nr = nr + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+}
+
+// ` at <file>:<line>:<column>`, closing every one of the four messages.
+fn msg_at(l: *mut Lower, pos: u64) {
+    var at: [u8; 4] = " at "
+    rt.buf_push_bytes(&(*l).msg, (&at[0]) as u64, 4)
+    // ROUND 83: the file number is the one of the TREE's file table
+    // (round 79, `ast.file_add`) -- `firnc1.fi` registers every file there
+    // under the same name `firnc0` prints, and the parser packs THAT number
+    // into every position. Round 72 carried the intern number of the name
+    // instead; two meanings in the same twelve bits is one too many.
+    let b0: *mut ast.Tree = tree(l)
+    let fnr: u32 = ast.pos_file(pos)
+    if (fnr as usize) < ast.file_count(b0) {
+        rt.buf_push_bytes(&(*l).msg, ast.file_ptr(b0, fnr), ast.file_length(b0, fnr))
+    }
+    rt.buf_push(&(*l).msg, 58 as u8)
+    rt.buf_push_dec_u64(&(*l).msg, ast.pos_line(pos) as u64)
+    rt.buf_push(&(*l).msg, 58 as u8)
+    rt.buf_push_dec_u64(&(*l).msg, ast.pos_col(pos) as u64)
+}
+
+fn msg_keep(l: *mut Lower) -> u32 {
+    return intern.intern_number(names(l), rt.buf_ptr(&(*l).msg),
+        rt.buf_len(&(*l).msg)) as u32
+}
+
+// `panic: integer overflow in 'i32 + i32' at file:line:column`
+fn overflow_msg(l: *mut Lower, pos: u64, op: u32, ft: u32) -> u32 {
+    rt.buf_clear(&(*l).msg)
+    var w: [u8; 28] = "panic: integer overflow in '"
+    rt.buf_push_bytes(&(*l).msg, (&w[0]) as u64, 28)
+    fir.fty_name(&(*l).msg, ft)
+    rt.buf_push(&(*l).msg, 32 as u8)
+    op_text(&(*l).msg, op)
+    rt.buf_push(&(*l).msg, 32 as u8)
+    fir.fty_name(&(*l).msg, ft)
+    rt.buf_push(&(*l).msg, 39 as u8)
+    msg_at(l, pos)
+    return msg_keep(l)
+}
+
+// `panic: division by zero in 'i32 / i32' at file:line:column`
+fn div_zero_msg(l: *mut Lower, pos: u64, op: u32, ft: u32) -> u32 {
+    rt.buf_clear(&(*l).msg)
+    var w: [u8; 28] = "panic: division by zero in '"
+    rt.buf_push_bytes(&(*l).msg, (&w[0]) as u64, 28)
+    fir.fty_name(&(*l).msg, ft)
+    rt.buf_push(&(*l).msg, 32 as u8)
+    op_text(&(*l).msg, op)
+    rt.buf_push(&(*l).msg, 32 as u8)
+    fir.fty_name(&(*l).msg, ft)
+    rt.buf_push(&(*l).msg, 39 as u8)
+    msg_at(l, pos)
+    return msg_keep(l)
+}
+
+// `panic: integer overflow (i32 MIN / -1) at file:line:column`
+fn div_range_msg(l: *mut Lower, pos: u64, op: u32, ft: u32) -> u32 {
+    rt.buf_clear(&(*l).msg)
+    var w: [u8; 25] = "panic: integer overflow ("
+    rt.buf_push_bytes(&(*l).msg, (&w[0]) as u64, 25)
+    fir.fty_name(&(*l).msg, ft)
+    var mi: [u8; 5] = " MIN "
+    rt.buf_push_bytes(&(*l).msg, (&mi[0]) as u64, 5)
+    op_text(&(*l).msg, op)
+    var e1: [u8; 4] = " -1)"
+    rt.buf_push_bytes(&(*l).msg, (&e1[0]) as u64, 4)
+    msg_at(l, pos)
+    return msg_keep(l)
+}
+
+// `panic: integer overflow casting 'i32 as u8' at file:line:column`
+fn cast_msg(l: *mut Lower, pos: u64, from: u32, to: u32) -> u32 {
+    rt.buf_clear(&(*l).msg)
+    var w: [u8; 33] = "panic: integer overflow casting '"
+    rt.buf_push_bytes(&(*l).msg, (&w[0]) as u64, 33)
+    fir.fty_name(&(*l).msg, from)
+    var asw: [u8; 4] = " as "
+    rt.buf_push_bytes(&(*l).msg, (&asw[0]) as u64, 4)
+    fir.fty_name(&(*l).msg, to)
+    rt.buf_push(&(*l).msg, 39 as u8)
+    msg_at(l, pos)
+    return msg_keep(l)
+}
+
+// Is a value of THIS type checked at all? Floating point overflow is a
+// defined IEEE-754 value (infinity, SPEC 14.1), and `bool`/`ptr` never
+// reach `+ - * / %` through the parser in the first place.
+fn checkable(l: *mut Lower, ft: u32) -> bool {
+    if !(*l).checked {
+        return false
+    }
+    if ft == fir.T_BOOL || ft == fir.T_PTR || ft == fir.T_VOID {
+        return false
+    }
+    return !fir.is_float_ty(ft)
 }
 
 fn constant(l: *mut Lower, ty: u32, v: u64) -> u32 {
@@ -974,6 +1120,17 @@ fn value_inner(l: *mut Lower, e: u32) -> u32 {
             let z: u32 = constant(l, of, 0)
             return push(l, fir.O_CMP, fir.T_BOOL, src, z, 1, of as u64, 0, 0)
         }
+        // ROUND 72 -- a checked narrowing `as` (SPEC 13, item L9). Only a
+        // narrowing between two INTEGER types is checked: fewer bits can
+        // lose the value outright, and the same width with a signedness
+        // flip can too (`i32 as u32` on a negative value). A WIDENING cast
+        // is lossless and stays `O_CAST`; so does every float on either
+        // side (SPEC 14.1 defines that one as truncating, not checked).
+        if checkable(l, of) && checkable(l, after)
+        && fir.fty_bits(after) <= fir.fty_bits(of) {
+            let m: u32 = cast_msg(l, ast.expr_pos(b, e), of, after)
+            return push(l, fir.O_CHECKEDCAST, after, src, 0, of, m as u64, 0, 0)
+        }
         return push(l, fir.O_CAST, after, src, 0, of, 0, 0, 0)
     }
     give_up(l)
@@ -1043,6 +1200,40 @@ fn binary(l: *mut Lower, e: u32) -> u32 {
         let bt: u32 = e_fty(l, re)
         if bt != ft {
             bv = push(l, fir.O_CAST, ft, bv, 0, bt, 0, 0, 0)
+        }
+    }
+    // ROUND 72 -- the explicit `+% -% *%` / `+| -| *|` (SPEC 13, item L9).
+    // NEVER checked, whatever the build level says: these spellings exist
+    // exactly so that overflow can be opted INTO where it is the point
+    // (a hash function's multiplication, a checksum, a counter that rolls
+    // over), instead of forcing a program to switch checking off
+    // everywhere else to get that one line.
+    if op >= 18 {
+        var fbop: u32 = 0
+        var wkind: u64 = fir.WS_WRAP
+        if op == 19 || op == 22 {
+            fbop = 1
+        }
+        if op == 20 || op == 23 {
+            fbop = 2
+        }
+        if op >= 21 {
+            wkind = fir.WS_SAT
+        }
+        return push(l, fir.O_BINWRAPSAT, ft, av, bv, fbop, wkind, 0, 0)
+    }
+    // ROUND 72 -- checked `+ - *` and `/ %`.
+    if checkable(l, ft) {
+        let pos: u64 = ast.expr_pos(b, e)
+        if op <= 2 {
+            let m: u32 = overflow_msg(l, pos, op, ft)
+            return push(l, fir.O_CHECKEDBIN, ft, av, bv, op, m as u64, 0, 0)
+        }
+        if op == 3 || op == 4 {
+            let mz: u32 = div_zero_msg(l, pos, op, ft)
+            let mr: u32 = div_range_msg(l, pos, op, ft)
+            return push(l, fir.O_CHECKEDDIV, ft, av, bv, op,
+                (mz as u64) | ((mr as u64) << 32), 0, 0)
         }
     }
     return push(l, fir.O_BIN, ft, av, bv, bop, 0, 0, 0)

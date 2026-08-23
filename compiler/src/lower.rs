@@ -63,6 +63,23 @@ fn is_agg(t: &Type) -> bool {
     matches!(t, Type::Array(..) | Type::Struct(_))
 }
 
+/// **ROUND 72** -- `ast::BinOp` -> `fir::BinOp` for exactly the five
+/// operators `Op::CheckedBin`/`Op::CheckedDiv` ever carry (`+ - * / %`).
+/// A separate, narrow function rather than reusing a general-purpose
+/// mapping: the panic message building code above must never be handed an
+/// operator it was not written for, and this function's return type says
+/// nothing else is possible without a caller reading the source.
+fn bin_of(op: ast::BinOp) -> FBin {
+    match op {
+        ast::BinOp::Add => FBin::Add,
+        ast::BinOp::Sub => FBin::Sub,
+        ast::BinOp::Mul => FBin::Mul,
+        ast::BinOp::Div => FBin::Div,
+        ast::BinOp::Rem => FBin::Rem,
+        _ => unreachable!("bin_of only ever sees Add/Sub/Mul/Div/Rem"),
+    }
+}
+
 /// **ROUND 71** — the FIR type of ONE ABI eightbyte. `f64` is not the truth
 /// about the content (an SSE eightbyte can hold two `f32`), it is the truth
 /// about the REGISTER: everything the code generator needs to know is
@@ -736,6 +753,31 @@ impl<'a> Lower<'a> {
                         Op::Cmp { op: CmpOp::Ne, ty: from, a: src, b: z },
                     ));
                 }
+                // ROUND 72 -- checked narrowing `as` (SPEC section 13, item
+                // L9). Only a SOURCE-visible narrowing between two INTEGER
+                // types is a checked cast: `to` holding fewer bits than
+                // `from` can already lose the value outright, and an EQUAL
+                // width with a signedness flip can too (`i32 as u32` on a
+                // negative value, `u32 as i32` above `i32::MAX`) -- the
+                // shared test `panic_rt::emit_checked_cast` runs (narrow to
+                // `to`, widen back to `from`, compare) catches both shapes
+                // the same way. A WIDENING cast (`to.bits() > from.bits()`)
+                // is always lossless and stays `Op::Cast`; so does every
+                // float on either side, which SPEC section 14.1 already
+                // defines as truncating, not checked, and `bool`/`Ptr`,
+                // neither of which a narrowing `as` between them exists for.
+                let narrowing_int_cast = crate::checkmode::is_checked()
+                    && !from.is_float()
+                    && !to.is_float()
+                    && from != FTy::Bool
+                    && to != FTy::Bool
+                    && from != FTy::Ptr
+                    && to != FTy::Ptr
+                    && to.bits() <= from.bits();
+                if narrowing_int_cast {
+                    let msg = self.cast_msg(e.span, from, to);
+                    return Some(self.push(to, Op::CheckedCast { src, from, msg }));
+                }
                 Some(self.push(to, Op::Cast { src, from }))
             }
             ExprKind::StructLit(..) | ExprKind::ArrayLit(_) | ExprKind::ArrayRepeat(..) => {
@@ -810,6 +852,42 @@ impl<'a> Lower<'a> {
             return Some(self.push(FTy::Bool, Op::Cmp { op: c, ty, a: av, b: bv }));
         }
         let ft = self.fty_of(e)?;
+        // ROUND 72 -- explicit "+% -% *%" / "+| -| *|" (SPEC section 13,
+        // item L9). Never checked, regardless of the build level: these
+        // spellings exist exactly so overflow can be OPTED INTO where it is
+        // the point (hashes, checksums, timestamps), rather than forcing a
+        // program to switch off checking everywhere else to get there.
+        if let Some((kind, fbop)) = op.wrap_sat() {
+            let av = self.lower_expr(a)?;
+            let bv = self.lower_expr(b)?;
+            return Some(self.push(ft, Op::BinWrapSat { kind, op: fbop, a: av, b: bv }));
+        }
+        // ROUND 72 -- checked "+ - * /" (SPEC section 13, item L9). Only
+        // integer types are checked (bool/pointer never reach `Add`/`Sub`/
+        // `Mul`/`Div`/`Rem` through the parser in the first place; floating
+        // point overflow is a defined IEEE-754 value -- infinity -- and
+        // stays exactly as SPEC section 14.1.f64 always described it).
+        if crate::checkmode::is_checked() && ft != FTy::Bool && ft != FTy::Ptr && !ft.is_float() {
+            match op {
+                B::Add | B::Sub | B::Mul => {
+                    let av = self.lower_expr(a)?;
+                    let bv = self.lower_expr(b)?;
+                    let msg = self.overflow_msg(e.span, op, ft);
+                    return Some(self.push(ft, Op::CheckedBin { op: bin_of(op), a: av, b: bv, msg }));
+                }
+                B::Div | B::Rem => {
+                    let av = self.lower_expr(a)?;
+                    let bv = self.lower_expr(b)?;
+                    let msg_zero = self.div_zero_msg(e.span, op, ft);
+                    let msg_range = self.div_range_msg(e.span, op, ft);
+                    return Some(self.push(
+                        ft,
+                        Op::CheckedDiv { op: bin_of(op), a: av, b: bv, msg_zero, msg_range },
+                    ));
+                }
+                _ => {}
+            }
+        }
         let bop = match op {
             B::Add => FBin::Add,
             B::Sub => FBin::Sub,
@@ -834,6 +912,62 @@ impl<'a> Lower<'a> {
             }
         }
         Some(self.push(ft, Op::Bin(bop, av, bv)))
+    }
+
+    /// The message text baked into a checked `+ - *` at LOWERING time (SPEC
+    /// §13, `L9`): file, line, the type, the operator — everything that is
+    /// known here and nowhere later, because FIR carries no source
+    /// positions (`dwarf.rs`). The two operand VALUES are appended by the
+    /// backend at the panic site, where they sit in registers.
+    fn overflow_msg(&self, span: Span, op: ast::BinOp, ft: FTy) -> String {
+        format!(
+            "panic: integer overflow in '{} {} {}' at {}:{}:{}",
+            ft.name(),
+            op.text(),
+            ft.name(),
+            self.dg.file_name(span.file),
+            span.line,
+            span.col,
+        )
+    }
+
+    fn div_zero_msg(&self, span: Span, op: ast::BinOp, ft: FTy) -> String {
+        format!(
+            "panic: division by zero in '{} {} {}' at {}:{}:{}",
+            ft.name(),
+            op.text(),
+            ft.name(),
+            self.dg.file_name(span.file),
+            span.line,
+            span.col,
+        )
+    }
+
+    fn div_range_msg(&self, span: Span, op: ast::BinOp, ft: FTy) -> String {
+        format!(
+            "panic: integer overflow ({} MIN {} -1) at {}:{}:{}",
+            ft.name(),
+            op.text(),
+            self.dg.file_name(span.file),
+            span.line,
+            span.col,
+        )
+    }
+
+    /// ROUND 72 -- message for a checked narrowing `as` (SPEC section 13,
+    /// item L9). Same three-part shape as the arithmetic messages above:
+    /// what went wrong, the two types the SOURCE program actually wrote,
+    /// where. `from`/`to` (not `ft`) because a cast is the one checked
+    /// operation with two DIFFERENT types on either side of the operator.
+    fn cast_msg(&self, span: Span, from: FTy, to: FTy) -> String {
+        format!(
+            "panic: integer overflow casting '{} as {}' at {}:{}:{}",
+            from.name(),
+            to.name(),
+            self.dg.file_name(span.file),
+            span.line,
+            span.col,
+        )
     }
 
     /// `&&` / `||` short circuiting: result slot + branch, no arithmetic

@@ -302,3 +302,48 @@ saved_r14:
     .skip 8
 saved_r15:
     .skip 8
+
+    .text
+    /* --------------------------------------------------- osum_panic ---
+     * ROUND 72: the kernel's own Firn code (`fs.fi::fs__mount`, `uprog.fi::
+     * u_mkdir`) now uses CHECKED arithmetic (SPEC section 13, `L9`) --
+     * under `profile kernel` a checked site that goes out of range ends in
+     * `call osum_panic`, an EXTERNAL symbol the compiler deliberately
+     * leaves undefined (SPEC section 2: "calls osum_panic, configurable").
+     * This is that definition, same shape as `demos/kernel/start.s`'s
+     * (the smaller kernel demo): write the message to COM1 -- already
+     * initialised by `kmain.fi`'s own `serial.init()`, which runs before
+     * anything that could trigger a checked panic -- then halt for good.
+     *
+     * ABI at the call site (panic_rt.rs::trampoline_asm, kernel branch):
+     *   rdi = message pointer, esi = message length, rdx/rcx = the two
+     *   operand values, r8 = panic kind code (unused here, see start.s's
+     *   own comment on why: decimal formatting is `app`-profile-only
+     *   machinery this is not worth duplicating for a two-line message).
+     */
+    .globl osum_panic
+osum_panic:
+    movq %rdi, %r10
+    movl %esi, %r11d
+.Losum_loop:
+    testl %r11d, %r11d
+    jz .Losum_nl
+    movw $0x3FD, %dx
+.Losum_wait:
+    inb %dx, %al
+    testb $0x20, %al
+    jz .Losum_wait
+    movb (%r10), %al
+    movw $0x3F8, %dx
+    outb %al, %dx
+    incq %r10
+    decl %r11d
+    jmp .Losum_loop
+.Losum_nl:
+    movb $10, %al
+    movw $0x3F8, %dx
+    outb %al, %dx
+.Losum_halt:
+    cli
+    hlt
+    jmp .Losum_halt
