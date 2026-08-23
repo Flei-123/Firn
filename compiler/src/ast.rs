@@ -58,6 +58,17 @@ pub enum BinOp {
     Ge,
     LAnd,
     LOr,
+    /// **ROUND 72** — `+%` `-%` `*%` (SPEC §13, `L9`): explicit wrapping,
+    /// wanted on purpose (hashes, checksums, timestamps) rather than
+    /// accepted as an escape hatch from checked arithmetic.
+    AddWrap,
+    SubWrap,
+    MulWrap,
+    /// **ROUND 72** — `+|` `-|` `*|`: explicit saturating (clamped to the
+    /// type's own MIN/MAX rather than wrapping around).
+    AddSat,
+    SubSat,
+    MulSat,
 }
 
 impl BinOp {
@@ -66,6 +77,21 @@ impl BinOp {
     }
     pub fn is_logic(self) -> bool {
         matches!(self, BinOp::LAnd | BinOp::LOr)
+    }
+    /// **ROUND 72** — is this one of the six explicit wrap/saturate forms?
+    /// `lower.rs` uses this to route straight to `Op::BinWrapSat` — these
+    /// operators are never checked, regardless of the build level.
+    pub fn wrap_sat(self) -> Option<(crate::fir::WrapSatKind, crate::fir::BinOp)> {
+        use crate::fir::{BinOp as F, WrapSatKind as K};
+        match self {
+            BinOp::AddWrap => Some((K::Wrap, F::Add)),
+            BinOp::SubWrap => Some((K::Wrap, F::Sub)),
+            BinOp::MulWrap => Some((K::Wrap, F::Mul)),
+            BinOp::AddSat => Some((K::Sat, F::Add)),
+            BinOp::SubSat => Some((K::Sat, F::Sub)),
+            BinOp::MulSat => Some((K::Sat, F::Mul)),
+            _ => None,
+        }
     }
     pub fn text(self) -> &'static str {
         match self {
@@ -87,6 +113,12 @@ impl BinOp {
             BinOp::Ge => ">=",
             BinOp::LAnd => "&&",
             BinOp::LOr => "||",
+            BinOp::AddWrap => "+%",
+            BinOp::SubWrap => "-%",
+            BinOp::MulWrap => "*%",
+            BinOp::AddSat => "+|",
+            BinOp::SubSat => "-|",
+            BinOp::MulSat => "*|",
         }
     }
 }

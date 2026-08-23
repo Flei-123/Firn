@@ -121,6 +121,15 @@ pub enum TokKind {
     /// expression; the prefix/postfix difference of C does not exist here.
     PlusPlus,
     MinusMinus,
+    /// **ROUND 72** — explicit wrapping arithmetic (SPEC §13, `L9`):
+    /// `+% -% *%`. Never checked, regardless of the build level.
+    PlusPercent,
+    MinusPercent,
+    StarPercent,
+    /// **ROUND 72** — explicit saturating arithmetic: `+| -| *|`.
+    PlusPipe,
+    MinusPipe,
+    StarPipe,
     Eof,
 }
 
@@ -205,6 +214,12 @@ impl TokKind {
             TokKind::ShrEq => ">>=".into(),
             TokKind::PlusPlus => "++".into(),
             TokKind::MinusMinus => "--".into(),
+            TokKind::PlusPercent => "+%".into(),
+            TokKind::MinusPercent => "-%".into(),
+            TokKind::StarPercent => "*%".into(),
+            TokKind::PlusPipe => "+|".into(),
+            TokKind::MinusPipe => "-|".into(),
+            TokKind::StarPipe => "*|".into(),
             TokKind::EqEq => "==".into(),
             TokKind::NotEq => "!=".into(),
             TokKind::Lt => "<".into(),
@@ -619,6 +634,15 @@ impl<'a> Lexer<'a> {
             ('^', Some('=')) => (TokKind::CaretEq, 2),
             ('+', Some('+')) => (TokKind::PlusPlus, 2),
             ('-', Some('-')) => (TokKind::MinusMinus, 2),
+            // ROUND 72: explicit wrap/saturate arithmetic (SPEC section 13,
+            // item L9) -- read GREEDILY like the pairs above them, before
+            // the one-character '+'/'-'/'*' fallback further down.
+            ('+', Some('%')) => (TokKind::PlusPercent, 2),
+            ('-', Some('%')) => (TokKind::MinusPercent, 2),
+            ('*', Some('%')) => (TokKind::StarPercent, 2),
+            ('+', Some('|')) => (TokKind::PlusPipe, 2),
+            ('-', Some('|')) => (TokKind::MinusPipe, 2),
+            ('*', Some('|')) => (TokKind::StarPipe, 2),
             ('.', Some('.')) => (TokKind::DotDot, 2),
             ('<', Some('<')) => (TokKind::Shl, 2),
             ('>', Some('>')) => (TokKind::Shr, 2),

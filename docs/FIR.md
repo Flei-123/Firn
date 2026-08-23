@@ -237,8 +237,12 @@ fn main() -> i32 {
 ```
 
 The corresponding output of `--emit=fir-raw` (unoptimized, copied
-verbatim; the test `lower::tests::doku_beispiel_stimmt` compares this block
-with what the lowering really produces):
+verbatim; the test `lower::tests::doc_example_matches` compares this block
+with what the lowering really produces). `+` shows up as `checked_add`, not
+plain `add` (round 72, SPEC section 13, `L9`) -- the default build level
+(`dev-fast`) checks integer arithmetic, and `Op::CheckedBin` carries its own
+panic message text right in the FIR, ready for the backend to jump to on
+overflow without asking `lower.rs` again:
 
 ```firdump
 ; FIR v0
@@ -261,11 +265,11 @@ bb1:
 bb2:
   %9 = load.i32 %2
   %10 = load.i32 %4
-  %11 = add.i32 %9, %10
+  %11 = checked_add.i32 %9, %10 "panic: integer overflow in 'i32 + i32' at test:1:1"
   store.i32 %11, %2
   %12 = load.i32 %4
   %13 = const.i32 1
-  %14 = add.i32 %12, %13
+  %14 = checked_add.i32 %12, %13 "panic: integer overflow in 'i32 + i32' at test:1:1"
   store.i32 %14, %4
   br bb1
 bb3:
@@ -311,7 +315,7 @@ bb3:
   %20 = const.i64 4
   %21 = ptradd.ptr %0, %20
   %22 = load.i32 %21
-  %23 = add.i32 %19, %22
+  %23 = checked_add.i32 %19, %22 "panic: integer overflow in 'i32 + i32' at test:1:1"
   ret %23
 bb4:
   br bb5

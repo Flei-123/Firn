@@ -279,8 +279,18 @@ mod tests {
         assert!(asm.contains(".section .rodata"), "table not in .rodata:\n{}", asm);
         let entries = asm.matches(".quad .Lmain__bb").count();
         assert!(entries >= 32, "only {} table entries", entries);
+        // ROUND 72: `sum % 251 as i32` (line 48 of the source) is now a
+        // CHECKED `%` -- the signed `MIN % -1` special case (SPEC section
+        // 13, `L9`) adds its own two `cmp`s (`panic_rt.rs::emit_checked_div`)
+        // on top of the switch's own bounds check and the loop condition,
+        // none of which have anything to do with whether the match itself
+        // became a jump table (checked above by `jmp qword ptr [`,
+        // `.rodata` and >=32 table entries) -- raised from 4 to 6, not
+        // loosened into meaninglessness: still far short of one `cmp` per
+        // state, which is what a comparison CHAIN instead of a table would
+        // produce here.
         let compare = asm.lines().filter(|l| l.trim().starts_with("cmp ")).count();
-        assert!(compare <= 4, "{} comparisons instead of table:\n{}", compare, asm);
+        assert!(compare <= 6, "{} comparisons instead of table:\n{}", compare, asm);
     }
 
     /// `select` must become a `cmov` — never a jump (SPEC §9.2).
