@@ -56,7 +56,7 @@
 #      the same login dribbled out ONE OCTET PER WRITE, sixteen logins at
 #      the same time -- and, if node is there, node-minecraft-protocol as a
 #      third implementation nobody here wrote.
-#  40. The standard library of round 81 (tools/stdlib81/run.sh): the hash
+#  41. The standard library of round 81 (tools/stdlib81/run.sh): the hash
 #      and the octet keys of the map (a million entries, the longest probe
 #      chain MEASURED, an endurance run with a counter-check that must
 #      grow), DEFLATE/zlib/gzip in BOTH directions against python3 zlib,
@@ -122,6 +122,15 @@
 #      `lib/firnc1/escape.fi` against 22 programs that have to be REFUSED and
 #      14 counter-checks that have to keep building -- in both compilers, with
 #      the whole message compared character for character.
+#  43. THE SECOND MACHINE (tools/aarch64/, round 80): the same Firn program
+#      compiled for x86-64 AND for aarch64, both RUN, and the standard
+#      output compared character for character (tools/aarch64/run.sh, in
+#      both build stages). On top of that the object file itself:
+#      EM_AARCH64 with an x86 counter-check, the four promised relocation
+#      types, the disassembly, and the calling convention against
+#      aarch64-linux-gnu-gcc in both directions past the end of the
+#      register file (tools/aarch64/machine.sh). What aarch64 cannot do is
+#      counted and named, not filtered out.
 #  10. DOM soak run (tools/dom_soak/run.sh): the DOM prototype in Firn builds
 #      real cycles continuously (parent/child, listener, JS wrapper) and must
 #      not grow while doing so; the deliberately leaking counter-check with
@@ -942,6 +951,50 @@ else
     grep -E 'FAIL|MISMATCH|BELOW|ABOVE|RESULT' "$WORK/bench82.log" | head -12 | sed 's/^/   /'
 fi
 echo
+echo "== 43. the second machine: aarch64 (tools/aarch64/, ROUND 80) =="
+# Round 80 gave the compiler a second target. The proof is not that the
+# code generator exists -- it is that the SAME source does the same thing on
+# both machines. `run.sh` compiles every case of tests/*.fi twice, runs the
+# x86-64 build natively and the aarch64 build under qemu-aarch64, and
+# compares the standard output character for character and the exit code.
+# Four buckets, all of them counted: SAME, DIFFERENT (the script fails if
+# this is not 0), NOT SUPPORTED (the code generator REFUSED the program and
+# said why) and ENVIRONMENT (the difference is the runner's -- and a C
+# probe has to prove that in the same run, or the case counts as
+# DIFFERENT again).
+#
+# `machine.sh` looks at the object file rather than at the behaviour:
+# EM_AARCH64 with the x86 counter-check, R_AARCH64_CALL26 /
+# ADR_PREL_PG_HI21 / ADD_ABS_LO12_NC / ABS64, the disassembly, and AAPCS64
+# against aarch64-linux-gnu-gcc -- ten integer words and nine floating
+# point words, so the stack part of the convention is exercised too.
+#
+# Without the cross toolchain both scripts say SKIP and the suite stays
+# green. A64_FAST=1 runs only the optimised build stage.
+bash tools/aarch64/machine.sh > "$WORK/a64_machine.log" 2>&1 && A64MRC=0 || A64MRC=$?
+if [ "$A64MRC" -eq 0 ]; then
+    ok
+    grep -E '^(  ok |  aapcs64|SKIP)' "$WORK/a64_machine.log" | sed 's/^/ /'
+else
+    bad "tools/aarch64/machine.sh failed (see .test-work/a64_machine.log)"
+    grep -E '^  FAIL' "$WORK/a64_machine.log" | head -10 | sed 's/^/   /'
+fi
+
+A64_RC=0
+for stage in "" "--no-opt"; do
+    [ -n "$stage" ] && [ "${A64_FAST:-0}" = "1" ] && continue
+    tag=${stage:-opt}
+    bash tools/aarch64/run.sh $stage > "$WORK/a64_run.$tag.log" 2>&1 && rc=0 || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        ok
+        grep -E '^(  (build stage|SAME|DIFFERENT|NOT SUPPORTED|ENVIRONMENT|x86 already|RESULT)|SKIP)' \
+            "$WORK/a64_run.$tag.log" | sed 's/^/ /'
+    else
+        A64_RC=1
+        bad "tools/aarch64/run.sh $stage failed (see .test-work/a64_run.$tag.log)"
+        grep -E '^  DIFF |^FAIL' "$WORK/a64_run.$tag.log" | head -10 | sed 's/^/   /'
+    fi
+done
 
 TOTAL=$((PASS + FAIL))
 echo

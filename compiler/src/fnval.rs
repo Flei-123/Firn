@@ -88,7 +88,7 @@ pub(crate) fn records_asm() -> String {
         return out;
     }
     let _ = writeln!(out, ".section .rodata");
-    let _ = writeln!(out, ".align 8");
+    let _ = writeln!(out, "{}", crate::target::align(8));
     for k in recs {
         let sym = crate::codegen_x86::label(&k);
         let _ = writeln!(out, "{}{}:", RECORD_LABEL, sym);

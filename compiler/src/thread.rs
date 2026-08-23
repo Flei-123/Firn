@@ -297,6 +297,50 @@ pub(crate) fn spawn_sequence(e: &mut crate::codegen_x86::Emitter) {
     e.raw("1:");
 }
 
+/// The same for AArch64. Precondition: `x0` = argument, `x1` = child stack,
+/// `x2` = the TID word. Postcondition: `x0` = thread id (creator) resp. the
+/// child never comes back.
+///
+/// **The one real difference to x86-64** and the reason `syscalls.rs` refuses
+/// to translate `clone` by its number alone: the generic system call table
+/// swaps two of the arguments.
+///
+/// ```text
+/// x86-64   clone(flags, stack, parent_tid, child_tid, tls)
+/// aarch64  clone(flags, stack, parent_tid, tls, child_tid)
+/// ```
+///
+/// `tls` stays 0 here; the child sets its own thread pointer as its first
+/// act (`__thread_entry` -> `arch_prctl(ARCH_SET_FS)` -> `msr tpidr_el0`).
+pub(crate) fn spawn_sequence_a64(e: &mut crate::codegen_x86::Emitter) {
+    let back = format!(".La64_spawn_{}", e.out.len());
+    // The argument goes onto the CHILD stack: in the child `x0` is the
+    // return value of the system call, and there is no other way to reach
+    // the value. 16 bytes, so the stack stays 16-aligned (AAPCS64 §6.2.2).
+    e.line("sub x1, x1, #16");
+    e.line("str x0, [x1]");
+    // x2 already holds the TID word and is the parent_tid argument; the
+    // child_tid argument is the same word (CLONE_PARENT_SETTID and
+    // CLONE_CHILD_CLEARTID both point at it, exactly as on x86).
+    e.line("mov x4, x2"); // child_tid
+    e.line("mov x3, xzr"); // tls -- the child sets its own
+    crate::codegen_a64::imm_into(e, "x0", CLONE_FLAGS as i64);
+    crate::codegen_a64::imm_into(e, "x8", 220);
+    e.line("svc #0");
+    e.line(&format!("cbnz x0, {}", back));
+    // ---- child: own stack, fetch the argument back ----------------------
+    e.line("ldr x0, [sp]");
+    e.line("add sp, sp, #16");
+    e.line("mov x29, xzr");
+    e.line(&format!("bl {}", crate::codegen_x86::label(ENTRY)));
+    // exit(2), NOT exit_group(2): this thread alone ends.
+    e.line("mov w0, w0");
+    e.line("mov x8, #93");
+    e.line("svc #0");
+    e.line("brk #0");
+    e.raw(&format!("{}:", back));
+}
+
 /// The instruction sequence for `Op::AtomicCas`. Precondition: `rcx` =
 /// address, `rax` = expected value, `rdx` = new value. Postcondition:
 /// `rax` = the value found (equal to the expectation if the swap happened).
