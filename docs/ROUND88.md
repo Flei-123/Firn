@@ -24,6 +24,11 @@ any more, because he has long since learned to walk around it.
 That is the whole content of this round: walking the first five minutes once,
 with a stranger's eyes, and clearing away what lies in the way.
 
+A fifth find came in from the owner while the round was being written up
+(`let x: string = "test"` said "unknown type"), and a sixth fell out on the
+way and is deliberately left standing. Both are at the bottom, after the
+four.
+
 ---
 
 ## The four finds
@@ -308,6 +313,163 @@ because a check that only ever says yes proves nothing:
 PASS 31/31 first-run checks
 ```
 
+## The fifth find, handed in by the owner: `let x: string = "test"`
+
+The round was already written up when the question came in whether `string`
+works as well. It did not:
+
+```
+error: unknown type 'string'
+```
+
+Nobody had decided that. Rounds 70 and 71 handed out a whole family of
+second spellings, and the list is recognisably the one of C#:
+
+| second spelling | canonical | | second spelling | canonical |
+|---|---|---|---|---|
+| `sbyte` | `i8` | | `byte` | `u8` |
+| `short` | `i16` | | `ushort` | `u16` |
+| `int` | `i32` | | `uint` | `u32` |
+| `long` | `i64` | | `ulong` | `u64` |
+| `double` | `f64` | | `float` | `f32` |
+
+In that family the text type is called `string`. It was the only one
+missing — a gap, not a decision, and it sat on exactly the line a stranger
+writes first.
+
+### Why it could not simply be added to the table
+
+The obvious move — one more entry in `types.rs::alias_of` and in the two
+tables of `firnc1` — is right for one half and wrong for the other. All ten
+pairs above map a name onto a **primitive type**, and `firnc1` exploits that
+literally: `types.fi::alias_ty` holds the second spellings in a text of
+fixed length, in the SAME ORDER as the canonical table above it, so that a
+hit yields the KIND NUMBER directly (`int` is entry 2, and entry 2 of the
+other table is `i32`). The three empty fields `||||` are the places of
+`usize`, `isize` and `bool`, which have no second spelling; they can never
+be hit, because a name is never empty.
+
+`str` has no kind number. It is not a primitive type but the **builtin
+struct** of `strtype.rs` — two machine words, declared once at the start of
+the type check. An entry in `alias_ty` would have handed out kind 13, which
+does not exist, and the type checker would have computed with a type that
+is not there.
+
+So the fold happens ONE STEP LATER, in both compilers at the same place: not
+where a name becomes a primitive type, but where a name becomes a struct.
+
+| place | what stands there now |
+|---|---|
+| `compiler/src/types.rs::alias_of` | `"string" => "str"` — plus the note why it may not go into the primitive tables of `layout_canon.rs`/`iface.rs` (they match on the canonical name and let `str` fall through to the struct lookup by themselves) |
+| `compiler/src/sema.rs::resolve_ty`, `resolve_ty_quiet` | the struct lookup asks for `canon_name(name)` |
+| `compiler/src/strtype.rs` | `NAME_ALIAS`, and `source_uses_str` knows both names |
+| `lib/firnc1/types.fi::canon_str` | the same fold in Firn, called in `resolve` right before `struct_index` |
+| `lib/firnc1/types.fi::alias_ty` | a note saying why `string` is NOT in this table |
+| `lib/firnc1/parser.fi::canon_alias` | there it DOES belong — that table works on NAMES, not on kind numbers, so `impl Ord for string` creates the same method as `impl Ord for str`. `from` grew from 59 to 66 octets, `to` from 54 to 58, `string`/`str` are entry 13 in both |
+| `lib/firnc1/gc.fi::gc_source_scan` | the trigger reads tokens and now knows both names |
+
+The token trigger is the part that is easy to forget. `source_uses_str`
+decides on the raw token stream whether the collector runtime has to be
+linked in. A program that never writes `str`, only `string`, needs it just
+as much — without that line it would compile and then fall over at run time
+with the message from find 1. Counter-check D1 measures exactly that.
+
+### What was checked before, not after
+
+`grep -rnw string` over the whole repository: not a single **identifier**
+carries that name. Every hit is inside a comment, inside a text literal
+(`"the string does not end"`, `lib/std/json.fi`) or in test data. Nothing
+was run over.
+
+### The proof
+
+`tools/firstrun/run.sh` grew case `08_string_alias.fi` and counter-check D.
+The case does not merely show that both spellings compile — that would prove
+nothing about them being ONE type. It hands each into the other's function,
+assigns each to the other's variable, compares them, joins them across the
+two spellings, and calls the library of 8.1 on both:
+
+```firn
+fn takes_str(s: str) -> usize { return s.length() }
+fn takes_string(s: string) -> usize { return s.length() }
+
+let x: string = "test"
+let y: str = "test"
+io.fmt_print_line(f"{takes_str(x)} {takes_string(y)}")
+let a: str = x
+let b: string = y
+let c: string = x + " and " + b
+```
+
+Counter-check D adds the three things a case cannot show:
+
+* **D1** a program that only ever writes `string` carries the collector
+  setup in `_start` exactly once,
+* **D2** a type error names the SAME canonical type in both spellings
+  (`expected type i32, found str` — whoever read `found string` here would
+  go looking for a second type),
+* **D3** a method written on `str` is reachable through `string`.
+
+The round test `sema.rs::the_alias_is_the_same_type` was extended too, but
+deliberately not with `prim_type("string") == prim_type("str")`: both are
+`None`, and the test would pass without a single line of the change. It now
+holds `canon_name("string") == "str"` and says in its comment that the real
+proof is the end to end one in `firstrun`.
+
+---
+
+## A sixth thing, found on the way — and NOT repaired here
+
+While case 08 was being written, this fell out:
+
+```firn
+import std.io
+fn a1() -> str { return "AAAA" }
+fn main() -> i32 {
+    io.print_line(a1())
+    return 0
+}
+```
+
+With the optimizer it prints `AAAA`. With `--no-opt` it prints **four
+spaces**. The length is right, the content is gone.
+
+The assembly says why. A text literal is built OCTET BY OCTET into a stack
+slot of the function it stands in, and the returned `str` points at it:
+
+```
+_F0.a1:
+    sub rsp, 144
+    lea rax, [rbp-132]        ; the literal gets a slot in THIS frame
+    ...
+    mov byte ptr [rcx], al    ; 'A', four times
+    mov rcx, qword ptr [rbp-8]
+    mov rax, qword ptr [rbp-32]
+    mov qword ptr [rcx], rax  ; p = rbp-132 -- a pointer into a dead frame
+```
+
+On `ret` the frame is gone; what the caller reads is whatever ran over it.
+With the optimizer the literal is folded into read-only data and the bug
+disappears — which is why it has never shown up.
+
+Three things about it:
+
+* It is **inherited, not of this round.** The same four spaces come out on
+  `main` (`6cf62949`), with the round 87 spelling of the program. It was
+  measured, not assumed.
+* It is **not the collector's doing.** The pointer never was a heap pointer.
+* It is **not a small repair.** A text literal would have to land in
+  read-only data instead of the frame, in the lowering of BOTH compilers.
+  That is a round of its own, and it needs its own tests; hanging it onto
+  this one would put the fixpoint at risk for a change that has nothing to
+  do with the five finds above.
+
+So it is written down here rather than half done: **the first item for the
+next round.** Case 08 avoids the pattern on purpose, so that the first-run
+suite measures what this round changed and not what it did not.
+
+---
+
 ## Acceptance of the round
 
 * `./test.sh` — the run came back `FAIL 3/1204`. Two of the three are the
@@ -358,3 +520,11 @@ nothing at all (counter-check B).
 | `tools/firstrun/` | new |
 | `tests/neg/1620`, `1621` | the two messages |
 | `SPEC.md` §8.0 | the setup and the methods written down |
+| `compiler/src/types.rs` | `alias_of`: `string` -> `str` (the fifth find) |
+| `compiler/src/sema.rs` | the struct lookup asks for the canonical name; the round test |
+| `compiler/src/strtype.rs` | `NAME_ALIAS`, the token trigger knows both names |
+| `lib/firnc1/types.fi` | `canon_str`, and the note at `alias_ty` |
+| `lib/firnc1/parser.fi` | `canon_alias`/`canon_at`: entry 13 is `string`/`str` |
+| `lib/firnc1/gc.fi` | `gc_source_scan` knows both names |
+| `tools/firstrun/cases/08_string_alias.fi` | new, plus counter-check D |
+| `SPEC.md` §13 | `string` in the table of second spellings |
