@@ -148,21 +148,23 @@ More: [`hello.fi`](examples/hello.fi) (one `write` syscall, no library at all),
 
 ## What Firn can NOT do — the honest list
 
-State: **2026-08-23**, branch `r86-readme` on top of `main`. Every entry below
+State: **2026-08-23**, on `main`. Every entry below
 was checked by handing a small program to *this* build of the compiler, not by
 reading an old report. Where the compiler refuses, it refuses with a message
 and a `line:column` — it does not crash and it does not pretend.
 
 ### Not in the language
 
-* **No run-time checks.** This is the biggest one, and it is worth being blunt
-  about. `2147483647 + 1` wraps silently, at **every** build level including
-  `--opt-level=release-safe`; `a[9]` on an `[i32; 4]` reads past the end
-  without a word; division by zero is not caught by the compiler at all, the
-  processor traps it (`SIGFPE`, exit 136) and there is **no panic handler** to
-  say what happened or where. SPEC 14.1 item 3 describes the target state,
-  SPEC 13 the intended `+%` (wrapping) and `+|` (saturating) operators — on
-  this branch neither operator parses.
+* **Overflow is checked, the index is not.** `2147483647 + 1` **aborts** in
+  `dev`, `dev-fast` and `release-safe` with the file, the line, the column,
+  the operator and both operands (`panic: integer overflow in 'i32 + i32' at
+  f.fi:3:9 (a=2147483647 b=1)`), and wraps only in `release-fast`, where the
+  name says so. `+%` (wrapping) and `+|` (saturating) are there for the cases
+  where wrapping is the intent, at every level. What is **not** checked:
+  `a[9]` on an `[i32; 4]` reads past the end without a word, and division by
+  zero is not caught by the compiler at all — the processor traps it
+  (`SIGFPE`, exit 136) and no handler says what happened or where.
+
 * **No global variables.** Only `const`, restricted to scalar integer and
   `bool` expressions that can be evaluated at compile time. `var G: i32 = 7`
   and `static G: i32 = 7` at the top level are both rejected with *"expected
