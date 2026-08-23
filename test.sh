@@ -910,7 +910,7 @@ else
     grep -E 'FAIL|RESULT' "$WORK/stdlib81.log" | head -12 | sed 's/^/   /'
 fi
 
-echo "== 45. the speed of round 82 (tools/bench82/run.sh) =="
+echo "== 42. the speed of round 82 (tools/bench82/run.sh) =="
 # THREE THINGS IN ONE SECTION, and the first one is not a measurement:
 #
 #   * BOTH PATHS, THE SAME ANSWER. `lib/std/crypto/accel.fi` is a SECOND
