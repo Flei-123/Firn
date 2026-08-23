@@ -36,6 +36,11 @@ SECS=${FRAG_SEC:-900}
 ROUNDS=${FRAG_ROUNDS:-100000000}
 SAMPLE=${FRAG_SAMPLE:-500}
 LEAK_SECS=${FRAG_LEAK_SEC:-60}
+# Below this many rounds mode 0 is still in its warm-up and the curve rises
+# for that reason alone -- a verdict then would be a measuring artefact, not
+# a leak. Measured in round 85: at 5 s the run reports GROWS, at 40 min it
+# reports bounded. So the run refuses to judge instead of judging wrongly.
+MIN_ROUNDS=${FRAG_MIN_ROUNDS:-1000000}
 LEAK_MB=${FRAG_LEAK_MB:-3072}
 
 export FIRNLIB="$(pwd)/lib"
@@ -133,7 +138,7 @@ done
 # ------------------------------------------------------------ 3. evaluation
 echo
 echo "-- 3. evaluation --"
-python3 - "$OUT/measurement-0.tsv" "$OUT/measurement-1.tsv" <<'PYEOF'
+python3 - "$OUT/measurement-0.tsv" "$OUT/measurement-1.tsv" "$MIN_ROUNDS" <<'PYEOF'
 import sys
 
 
@@ -194,6 +199,12 @@ def look(path):
 
 a = look(sys.argv[1])
 b = look(sys.argv[2])
+min_rounds = int(sys.argv[3])
+if a['rounds'] < min_rounds:
+    raise SystemExit('   ABORT: mode 0 got only %d rounds, %d are needed for a verdict.\n'
+                     '          The warm-up alone makes the curve rise -- raise FRAG_SEC\n'
+                     '          (or lower FRAG_MIN_ROUNDS if you really want to judge this).'
+                     % (a['rounds'], min_rounds))
 
 
 def show(u, name):
