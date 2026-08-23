@@ -114,6 +114,42 @@ pub struct Alloc {
     /// callee-saved registers used and their save slot
     saved: Vec<(&'static str, u64)>,
     frame: Frame,
+    /// Round 87: why did the values that got no register not get one? Only
+    /// filled when `FIRN_RA_STATS` is set -- the counting costs nothing, but
+    /// the exact crossings do, and nobody should pay for them in a normal
+    /// build.
+    stats: Option<RaStats>,
+}
+
+/// ROUND 87 -- the cause distribution behind the one number "spilled".
+///
+/// `docs/BENCHMARKS.md` said "spills more than half the values" and left it
+/// at that. Half of what, and WHY, decides what has to be built. These are
+/// the four possible answers, and they are counted separately:
+///
+///   * `no_interval` -- the value is never touched. Dead code that no pass
+///     removed. It has a slot and never sees it; that is not a spill.
+///   * `secret` -- must stay in memory, SPEC 9.2. Not a spill either.
+///   * `lost_call` -- the interval crosses a call, so only the five
+///     callee-saved registers were possible, and all five were taken.
+///   * `lost_plain` -- crosses no call, and all twelve were taken anyway.
+///   * `evicted` -- had a register and lost it to a heavier interval.
+///
+/// `cross_call` against `cross_call_exact` is the finding of the round: how
+/// many of the intervals that the allocator BELIEVES cross a call really do.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct RaStats {
+    pub ivs: usize,
+    pub cross_call: usize,
+    pub cross_call_exact: usize,
+    pub no_interval: usize,
+    pub secret: usize,
+    pub lost_call: usize,
+    pub lost_plain: usize,
+    pub evicted: usize,
+    pub cells_lost: usize,
+    pub cell_ivs: usize,
+    pub max_live: usize,
 }
 
 impl Alloc {
@@ -189,6 +225,10 @@ struct Live {
     pos: Vec<Vec<usize>>,
     live_in: Vec<Vec<bool>>,
     live_out: Vec<Vec<bool>>,
+    /// Did the data flow reach its fixed point? (round 87 -- the loop has a
+    /// round limit, and below that limit the sets may be TOO SMALL. Anything
+    /// finer than the interval bounds may then not be derived from them.)
+    converged: bool,
 }
 
 fn compute_live(f: &Func) -> Live {
@@ -244,6 +284,7 @@ fn compute_live(f: &Func) -> Live {
     let mut live_in = vec![vec![false; nv]; nb];
     let mut live_out = vec![vec![false; nv]; nb];
     let mut rounds = 0usize;
+    let mut converged = true;
     loop {
         rounds += 1;
         let mut changed = false;
@@ -270,11 +311,161 @@ fn compute_live(f: &Func) -> Live {
                 changed = true;
             }
         }
-        if !changed || rounds > nb + 4 {
+        if !changed {
+            break;
+        }
+        if rounds > nb + 4 {
+            // Did NOT converge. The caller must not draw any conclusion from
+            // these sets that is finer than the interval bounds (round 87).
+            converged = false;
             break;
         }
     }
-    Live { block_start, block_end, pos, live_in, live_out }
+    Live { block_start, block_end, pos, live_in, live_out, converged }
+}
+
+// ------------------------------------------------- exact crossings (r87) ---
+//
+// ROUND 87 -- WHY THIS EXISTS, and it is the finding of the round.
+//
+// `crosses_call` used to be asked as "does a call position lie between the
+// first and the last touch of the value". That is the INTERVAL, and the
+// interval is a straight line through a graph: the blocks are numbered, and
+// everything numbered in between counts as "in between" even when no path
+// from the definition to the use runs through it at all.
+//
+// A value that crosses a call may only have one of the five callee-saved
+// registers. Every false positive here therefore costs seven of twelve
+// registers and pushes the value onto the stack once those five are taken.
+//
+// This function asks the question exactly: a value crosses the call at `p`
+// exactly when it is live BEFORE `p` and live AFTER `p`. That is what
+// "survives the call" means, it is the textbook definition of live-through,
+// and it follows the control flow instead of the block numbering. An
+// argument that dies at the call is live before and dead after -- it does
+// not survive it. The result of the call is dead before and live after --
+// it does not survive it either.
+//
+// Sound in the other direction as well: two intervals that both hold `r10`
+// still never overlap, because the linear scan keeps using the CLOSED
+// interval `[start,end]` for that. This function only ever removes a
+// RESTRICTION, it never shortens a lifetime.
+//
+// The bitsets are words, not `Vec<bool>`: `gctext__gctext_write` has 56,359
+// values, and one pass over a `Vec<bool>` per call instruction would have
+// cost more than the whole allocation.
+struct Bits {
+    w: Vec<u64>,
+}
+
+impl Bits {
+    fn new(n: usize) -> Bits {
+        Bits { w: vec![0u64; n / 64 + 1] }
+    }
+    fn from_bools(b: &[bool]) -> Bits {
+        let mut s = Bits::new(b.len());
+        for (i, &x) in b.iter().enumerate() {
+            if x {
+                s.w[i >> 6] |= 1u64 << (i & 63);
+            }
+        }
+        s
+    }
+    fn set(&mut self, i: usize) {
+        self.w[i >> 6] |= 1u64 << (i & 63);
+    }
+    fn clear(&mut self, i: usize) {
+        self.w[i >> 6] &= !(1u64 << (i & 63));
+    }
+    fn get(&self, i: usize) -> bool {
+        self.w[i >> 6] & (1u64 << (i & 63)) != 0
+    }
+    fn copy_from(&mut self, o: &Bits) {
+        self.w.copy_from_slice(&o.w);
+    }
+    fn fill_from_bools(&mut self, b: &[bool]) {
+        for x in self.w.iter_mut() {
+            *x = 0;
+        }
+        for (i, &x) in b.iter().enumerate() {
+            if x {
+                self.w[i >> 6] |= 1u64 << (i & 63);
+            }
+        }
+    }
+    /// `self |= a & b`
+    fn or_and(&mut self, a: &Bits, b: &Bits) {
+        for i in 0..self.w.len() {
+            self.w[i] |= a.w[i] & b.w[i];
+        }
+    }
+}
+
+/// For every value: does it really survive a `call` / a `copymem` / a
+/// `div`-`select`-`cmpxchg`? Exact, along the control flow.
+fn exact_crossings(f: &Func, live: &Live) -> (Bits, Bits, Bits) {
+    let nv = f.val_types.len();
+    let mut cc = Bits::new(nv);
+    let mut cm = Bits::new(nv);
+    let mut cd = Bits::new(nv);
+    let mut after = Bits::new(nv);
+    let mut cur = Bits::new(nv);
+    let mut buf = Vec::new();
+    for (bi, b) in f.blocks.iter().enumerate() {
+        cur.fill_from_bools(&live.live_out[bi]);
+        // The terminator runs AFTER the last instruction and reads its value
+        // there; `live_out` is the state after the terminator.
+        let tv = match &b.term {
+            Term::BrCond { cond, .. } => Some(*cond),
+            Term::Switch { val, .. } => Some(*val),
+            Term::Ret(Some(v)) => Some(*v),
+            _ => None,
+        };
+        if let Some(v) = tv {
+            if (v as usize) < nv {
+                cur.set(v as usize);
+            }
+        }
+        for i in b.insts.iter().rev() {
+            let is_call = matches!(
+                i.op,
+                Op::Call { .. } | Op::CallIndirect { .. } | Op::Syscall { .. } | Op::ThreadSpawn { .. }
+            );
+            let is_mem = matches!(i.op, Op::CopyMem { .. } | Op::SecureZero { .. });
+            let is_dv = matches!(
+                i.op,
+                Op::Bin(BinOp::Div | BinOp::Rem, _, _) | Op::Select { .. } | Op::AtomicCas { .. }
+            );
+            let interesting = is_call || is_mem || is_dv;
+            if interesting {
+                after.copy_from(&cur);
+            }
+            if let Some(d) = i.dst {
+                if (d as usize) < nv {
+                    cur.clear(d as usize);
+                }
+            }
+            buf.clear();
+            i.op.uses(&mut buf);
+            for &u in buf.iter() {
+                if (u as usize) < nv {
+                    cur.set(u as usize);
+                }
+            }
+            if interesting {
+                if is_call {
+                    cc.or_and(&cur, &after);
+                }
+                if is_mem {
+                    cm.or_and(&cur, &after);
+                }
+                if is_dv {
+                    cd.or_and(&cur, &after);
+                }
+            }
+        }
+    }
+    (cc, cm, cd)
 }
 
 // ---------------------------------------------------------- Cell analysis ---
@@ -525,6 +716,7 @@ pub fn allocate(f: &Func) -> Alloc {
         cell_ty: HashMap::new(),
         saved: Vec::new(),
         frame,
+        stats: None,
     };
     // Safety net against an explosion of memory/time on huge functions:
     // then it stays with the (correct) stack model.
@@ -536,6 +728,14 @@ pub fn allocate(f: &Func) -> Alloc {
     }
 
     let live = compute_live(f);
+    // ROUND 87: the cause distribution, only when it is asked for.
+    let mut st = RaStats::default();
+    let want_stats = std::env::var_os("FIRN_RA_STATS").is_some();
+    let exact = if want_stats && live.converged {
+        Some(exact_crossings(f, &live))
+    } else {
+        None
+    };
     let depth = loop_depth(f);
     let cells = promotable_cells(f);
     alloc.imms = immediate_consts(f);
@@ -626,9 +826,11 @@ pub fn allocate(f: &Func) -> Alloc {
     let mut ivs: Vec<Iv> = Vec::new();
     for v in 0..nv {
         if start[v] == usize::MAX {
+            st.no_interval += 1;
             continue;
         }
         if f.is_secret(v as Val) {
+            st.secret += 1;
             continue; // secret values stay at the stack slot (SPEC §9.2)
         }
         if cells.contains_key(&(v as Val)) {
@@ -643,6 +845,17 @@ pub fn allocate(f: &Func) -> Alloc {
         let cc = call_pos.iter().any(|&p| s <= p && p <= e);
         let cm = memop_pos.iter().any(|&p| s <= p && p <= e);
         let cd = divsel_pos.iter().any(|&p| s <= p && p <= e);
+        if want_stats {
+            st.ivs += 1;
+            if cc {
+                st.cross_call += 1;
+            }
+            if let Some((xc, _, _)) = &exact {
+                if xc.get(v) {
+                    st.cross_call_exact += 1;
+                }
+            }
+        }
         ivs.push(Iv {
             val: v as Val,
             start: s,
@@ -666,6 +879,12 @@ pub fn allocate(f: &Func) -> Alloc {
         let cm = memop_pos.iter().any(|&p| s <= p && p <= e);
         let cd = divsel_pos.iter().any(|&p| s <= p && p <= e);
         // Cells are almost always the hottest values: double the weight.
+        // (Round 87: they are counted apart. A cell has to survive from the
+        // start of the function to its last access, so `crosses_call` is
+        // almost always true for it and always CORRECTLY so -- counting it
+        // in with the value intervals would make the false-positive rate
+        // look better than it is.)
+        st.cell_ivs += 1;
         ivs.push(Iv {
             val: c,
             start: s,
@@ -677,6 +896,27 @@ pub fn allocate(f: &Func) -> Alloc {
         });
     }
     ivs.sort_by_key(|i| (i.start, i.end, i.val));
+
+    // ROUND 87: the real register pressure. NOT `active.len()` -- `active`
+    // only holds the intervals that got a register, so it can never exceed
+    // twelve and would report "pressure 12" for a function that needs 900.
+    // This is a sweep over the interval ends: how many intervals overlap at
+    // the worst position of the function.
+    if want_stats {
+        let mut ev: Vec<(usize, i32)> = Vec::with_capacity(ivs.len() * 2);
+        for i in ivs.iter() {
+            ev.push((i.start, 1));
+            ev.push((i.end + 1, -1));
+        }
+        ev.sort_unstable();
+        let mut cur = 0i32;
+        for (_, d) in ev {
+            cur += d;
+            if cur as usize > st.max_live {
+                st.max_live = cur as usize;
+            }
+        }
+    }
 
     // ---- the linear scan itself ------
     //
@@ -816,14 +1056,28 @@ pub fn allocate(f: &Func) -> Alloc {
                         assign.remove(&old.val);
                         assign.insert(iv.val, r);
                         active.push((iv, r));
+                        st.evicted += 1;
                         continue;
                     }
                 }
                 // otherwise this value stays in the stack slot
+                if iv.crosses_call {
+                    st.lost_call += 1;
+                } else {
+                    st.lost_plain += 1;
+                }
             }
         }
     }
 
+    if want_stats {
+        for c in cells.keys() {
+            if !assign.contains_key(c) {
+                st.cells_lost += 1;
+            }
+        }
+        alloc.stats = Some(st);
+    }
     // enter the result
     for (v, r) in assign.iter() {
         if cells.contains_key(v) {
@@ -1440,6 +1694,15 @@ pub(crate) fn emit_func_ra(e: &mut Emitter, f: &Func) -> Option<Result<(), Strin
             "RA {} values={} regs={} imm={} frameaddr={} spilled={} cells={} insts={}",
             f.name, nv, regs, imm, addr, spilled, a.cells.len(), f.inst_count()
         );
+        // ROUND 87: and WHY. One line more per function, same format.
+        if let Some(t) = a.stats {
+            eprintln!(
+                "RA-WHY {} ivs={} crosscall={} crosscall_exact={} noiv={} secret={}                  lostcall={} lostplain={} evicted={} cellslost={} cellivs={} maxlive={}",
+                f.name, t.ivs, t.cross_call, t.cross_call_exact, t.no_interval,
+                t.secret, t.lost_call, t.lost_plain, t.evicted, t.cells_lost,
+                t.cell_ivs, t.max_live
+            );
+        }
     }
     // The function is emitted into a buffer of its own first; after that the
     // register descriptor post pass strikes spill stores with an immediate
