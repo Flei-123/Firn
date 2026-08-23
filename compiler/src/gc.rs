@@ -1331,6 +1331,11 @@ const RUNTIME: &str = include_str!("../../lib/gc/gc.fi");
 const RUNTIME_VEC: &str = include_str!("../../lib/gc/gcvec.fi");
 const RUNTIME_MAP: &str = include_str!("../../lib/gc/gcmap.fi");
 
+/// **ROUND 88** — the name of the setup the two code generators write into
+/// `_start` when the runtime is part of the program. It lies in the root
+/// namespace like everything in `lib/gc/gc.fi`.
+pub(crate) const FN_INIT: &str = "gc_init";
+
 /// Path name of the runtime pulled in, for error messages and `.debug_line`.
 pub(crate) const RUNTIME_PATH: &str = "lib/gc/gc.fi";
 
