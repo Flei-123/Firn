@@ -75,6 +75,18 @@ because without it every `import std.*` fails with *"cannot read
 '<dir>/std/io.fi'"* -- that was a real stumbling block and the old README never
 mentioned it.
 
+**Two sections were rescued.** The split first dropped
+"Checking the IR and the optimizer" and "Generated code (excerpt from
+`examples/fib.fi`)" -- they sat above the cut line and would have been lost.
+Both are now at the top of `MODULE_REPORTS.md`, and the assembly one was
+**re-generated**: the version that stood there was round 1 output and claimed
+"register assignment is naive, one stack slot per FIR value". That has not been
+true since round 43. Today `fib` keeps `n` in `r15` across both recursive
+calls and touches memory only to park the callee-saved registers. The FIR
+listing was re-run and still matches instruction for instruction
+(`--emit=fir-raw`: 9 instructions in 2 blocks, `--emit=fir-opt`: 1 instruction
+in 1 block, `const.i32 42`).
+
 **A link checker.** `tools/mdlinks/check.py` resolves every relative Markdown
 link against the directory of the file it stands in, ignoring fenced code
 blocks and inline code spans. Result for the whole repository:
