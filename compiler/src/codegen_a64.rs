@@ -456,6 +456,12 @@ pub fn emit(m: &Module) -> Result<String, String> {
     // pointer becomes the FIRST parameter of `main` — the same start block
     // rule the x86 path follows, so `fn main(start: u64)` reads its command
     // line on both machines out of the same place.
+    // HOOK gc (ROUND 88): the collector starts itself -- the same rule as on
+    // x86-64 (codegen_x86.rs). It stands BEFORE `mov x30, xzr`, because `bl`
+    // writes the return address into x30 and would undo the zeroing.
+    if crate::gc::runtime_active() {
+        e.line(&format!("bl {}", label(crate::gc::FN_INIT)));
+    }
     e.line("mov x29, xzr");
     e.line("mov x30, xzr");
     e.line("mov x0, sp");
