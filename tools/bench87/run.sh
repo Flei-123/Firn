@@ -57,6 +57,7 @@ for L in 1 4 6 9; do
         if [ "$us" -lt "$best" ]; then best=$us; packed=$pk; fi
     done
     python3 tools/bench87/gzip_row.py "$L" "$SIZE" "$REPS" "$best" "$packed" "$F" "$RUNS"
+    [ "$L" = "6" ] && PACKED6=$packed
 done
 echo
 
@@ -65,10 +66,11 @@ echo "== JSON reading =="
 python3 tools/bench87/gen_json.py "$W/json" 20000 | sed 's/^/  /'
 "$FIRNC" --opt-level=release-fast -o "$W/jsonspeed" tools/bench87/jsonspeed.fi \
     2>>"$W/build.log" || { echo "FAIL: jsonspeed"; tail -20 "$W/build.log"; exit 1; }
-json_row() { # <name> <file> <reps>
+json_row() { # <name> <file> <reps>  -- prints the table line to stderr,
+             #                            the bare MiB/s to stdout
     local name="$1" f="$2" reps="$3" best=999999999 v r
     for r in $(seq 1 $RUNS); do
-        "$W/jsonspeed" "$f" "$reps" "$W/t.txt" >/dev/null 2>&1 || { echo "  FAIL $name"; return 1; }
+        "$W/jsonspeed" "$f" "$reps" "$W/t.txt" >/dev/null 2>&1 || { echo "  FAIL $name" >&2; echo 0; return 1; }
         v=$(cat "$W/t.txt")
         [ "$v" -lt "$best" ] && best=$v
     done
@@ -76,13 +78,49 @@ json_row() { # <name> <file> <reps>
 import sys, os
 name, f, reps, us = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
 mb = os.path.getsize(f) * reps / 1048576.0
-print("  %-12s %8.2f MiB/s   (%d bytes x %d in %.1f ms)"
-      % (name, mb / (us / 1e6), os.path.getsize(f), reps, us / 1000.0))
+sys.stderr.write("  %-12s %8.2f MiB/s   (%d bytes x %d in %.1f ms)\n"
+                 % (name, mb / (us / 1e6), os.path.getsize(f), reps, us / 1000.0))
+print("%.2f" % (mb / (us / 1e6)))
 PY
 }
-json_row "integers" "$W/json/int.json" 5
-json_row "floats"   "$W/json/float.json" 5
+json_row "integers" "$W/json/int.json" 5 >/dev/null
+FLOATMB=$(json_row "floats" "$W/json/float.json" 5)
 python3 - "$W/json/int.json" "$W/json/float.json" <<'PY'
 import sys
 print("  (the two documents have the same shape; only the numbers differ)")
 PY
+
+# --------------------------------------------------- 3. the two limits
+#
+# One of them is not a time at all. The compression ratio is a number the
+# program COMPUTES, not a number the stopwatch reads -- it does not
+# fluctuate, so its limit does not have to. One octet more and this fails.
+echo
+echo "== the regression limits =="
+ERRORS=0
+python3 - "${PACKED6:-0}" "$(cat tools/bench87/maxsize_deflate6.txt)" <<'PY'
+import sys
+got, mx = int(sys.argv[1]), int(sys.argv[2])
+if got == 0:
+    print("  %-20s NO MEASUREMENT" % "DEFLATE -6 size"); sys.exit(1)
+if got > mx:
+    print("  %-20s %8d  ABOVE THE LIMIT %d -- the ratio got worse"
+          % ("DEFLATE -6 size", got, mx)); sys.exit(1)
+print("  %-20s %8d  <= %d  ok" % ("DEFLATE -6 size", got, mx))
+PY
+[ $? -eq 0 ] || ERRORS=$((ERRORS + 1))
+python3 - "${FLOATMB:-0}" "$(cat tools/bench87/minquota_json_float.txt)" <<'PY'
+import sys
+got, mn = float(sys.argv[1]), float(sys.argv[2])
+if got < mn:
+    print("  %-20s %8.2f  BELOW THE LIMIT %.1f MiB/s" % ("JSON floats", got, mn)); sys.exit(1)
+print("  %-20s %8.2f  >= %.1f MiB/s  ok" % ("JSON floats", got, mn))
+PY
+[ $? -eq 0 ] || ERRORS=$((ERRORS + 1))
+echo
+if [ "$ERRORS" -eq 0 ]; then
+    echo "RESULT ok"
+    exit 0
+fi
+echo "RESULT $ERRORS failed"
+exit 1
