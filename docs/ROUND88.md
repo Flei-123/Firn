@@ -7,9 +7,9 @@ import std.io
 
 fn main() -> i32 {
     let a = "test"
-    let b = a + " und mehr"
+    let b = a + " and more"
     io.fmt_print_line(f"b={b} len={a.length()}")
-    if a.starts_with("te") { io.print_line("faengt mit te an") }
+    if a.starts_with("te") { io.print_line("starts with te") }
     return 0
 }
 ```
@@ -34,14 +34,8 @@ with a stranger's eyes, and clearing away what lies in the way.
 operands, they need an owner, and the only owner in this language that nobody
 has to name is the collector (SPEC §3.5). So far, so right.
 
-What the program did:
-
-```
-$ ./a
-firn-gc: gc_init() wurde nicht aufgerufen
-$ echo $?
-70
-```
+What the program did: it wrote `firn-gc: gc_init() wurde nicht aufgerufen`
+onto standard error and ended with exit code 70.
 
 For anybody who has read nothing about a collector this is a riddle. He
 wanted to join two pieces of text.
@@ -79,9 +73,7 @@ for it. `gc_init` finds the bottom of the stack out of `/proc/self/maps`
 
 ### 2. The last German run time text
 
-```
-firn-gc: gc_init() wurde nicht aufgerufen
-```
+The message `firn-gc: gc_init() wurde nicht aufgerufen`, word for word.
 
 It stood in `lib/gc/gc.fi:402` since round 47 and survived the whole English
 changeover of rounds 55 and 57 — and it was precisely the message a beginner
@@ -249,9 +241,9 @@ import std.io
 
 fn main() -> i32 {
     let a = "test"
-    let b = a + " und mehr"
+    let b = a + " and more"
     io.fmt_print_line(f"b={b} len={a.length()}")
-    if a.starts_with("te") { io.print_line("faengt mit te an") }
+    if a.starts_with("te") { io.print_line("starts with te") }
     return 0
 }
 ```
@@ -263,11 +255,8 @@ error: function 'io__print_line' expects 0 argument(s), found 1
 ```
 
 Take the argument away and write `io.write_line(...)` instead, and it
-compiles — and then dies:
-
-```
-firn-gc: gc_init() wurde nicht aufgerufen        exit code 70
-```
+compiles — and then dies with exit code 70 and
+`firn-gc: gc_init() wurde nicht aufgerufen`.
 
 Put `if !gc_init() { return 90 }` in front of it, and it runs. Three changes
 to eight lines, and two of them are about a collector the program never
@@ -277,8 +266,8 @@ mentions.
 
 ```
 $ firnc first.fi -o first && ./first
-b=test und mehr len=4
-faengt mit te an
+b=test and more len=4
+starts with te
 ```
 
 And what round 87 refused entirely:
@@ -321,10 +310,27 @@ PASS 31/31 first-run checks
 
 ## Acceptance of the round
 
-* `./test.sh` — green, section 46 new.
-* `tools/fixpoint.sh` — stage 2 == stage 3, character for character.
-* `tools/self_compare.sh` — 0 different / 0 faulty.
+* `./test.sh` — `FAIL 2/1204`, and both are the SAME INHERITED case, not
+  this round: `tools/aarch64/run.sh` (section 43) in its two build stages.
+  `tests/1613_crypto.fi` has not compiled for aarch64 since the r80/r82
+  merge — `--target=aarch64-linux cannot emit the vector instruction
+  CpuFeatures yet`; round 82 built the intrinsics for x86-64 only. It was
+  established against `main` while round 86 was running and is written down
+  in the README and in `docs/BENCHMARKS.md` (296 of 301, 1 differing). It is
+  named here rather than filtered out.
+  Everything else green, including the new section 46.
+* `tools/fixpoint.sh` — stage 2 == stage 3, character for character
+  (650,711 lines of assembly), and `.firnc2` behaves like `firnc0` over the
+  whole corpus.
+* `tools/self_compare.sh` — 321 the same, **0 differing, 0 faulty**.
 * `tools/english/check.sh` — 0 / 0 / 0 / 0 / 0, now including `lib/**`.
+* `tools/firstrun/run.sh` — `PASS 31/31`.
+
+One number belongs here honestly: the setup in `_start` costs every program
+that uses text one `mmap` of the mark stack and one read of
+`/proc/self/maps` at startup — the price `gc_init()` has always cost,
+only now nobody has to remember to pay it. A program without text pays
+nothing at all (counter-check B).
 
 ## Files
 
