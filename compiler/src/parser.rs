@@ -287,6 +287,24 @@ impl<'a> Parser<'a> {
     /// round is the first one, and it showed a `return` of `lib/gc/gc.fi`
     /// under a line number of the test file.
     pub(crate) fn join(a: Span, b: Span) -> Span {
+        // ROUND 72 FOUND THIS: `Span::new` always sets `file: 0` (the doc
+        // comment on it says as much -- `Span::in_file` is the one that
+        // takes a real file number, `diag.rs`). `a`/`b` are on the same
+        // line here BY DEFINITION (the condition below requires it), which
+        // for a module-system program means the same FILE too -- but
+        // building the joined span with `Span::new` silently threw `a`'s
+        // own `file` away and replaced it with 0 regardless, so every
+        // compound expression (`a op b`, a call, anything `join` merges)
+        // inside an IMPORTED file reported itself as living in the ROOT
+        // file at whatever line/column happened to share this span's
+        // shape. Nothing printed that number to a human before this round
+        // -- `firnc0`'s own compile-time diagnostics apparently never hit
+        // this exact path with a genuinely multi-file span, or always hit
+        // the `else` branch instead; a CHECKED PANIC MESSAGE (SPEC section
+        // 13, `L9`) is the first thing that put `span.file` in front of a
+        // user for a RUNTIME event, and it printed the wrong file the
+        // first time it had more than one to choose from (found running
+        // `tests/1180_layout_position.fi`, a multi-module program).
         if a.line == b.line && b.col + b.len > a.col {
             Span::in_file(a.file, a.line, a.col, b.col + b.len - a.col)
         } else {
@@ -590,6 +608,12 @@ impl<'a> Parser<'a> {
             TokKind::Minus => BinOp::Sub,
             TokKind::Pipe => BinOp::Or,
             TokKind::Caret => BinOp::Xor,
+            // ROUND 72: explicit wrap/saturate, same precedence as '+'/'-'
+            // (SPEC section 13, item L9).
+            TokKind::PlusPercent => BinOp::AddWrap,
+            TokKind::MinusPercent => BinOp::SubWrap,
+            TokKind::PlusPipe => BinOp::AddSat,
+            TokKind::MinusPipe => BinOp::SubSat,
             _ => return None,
         })
     }
@@ -613,6 +637,10 @@ impl<'a> Parser<'a> {
             TokKind::Amp => BinOp::And,
             TokKind::Shl => BinOp::Shl,
             TokKind::Shr => BinOp::Shr,
+            // ROUND 72: explicit wrap/saturate multiply, same precedence
+            // as '*' (SPEC section 13, item L9).
+            TokKind::StarPercent => BinOp::MulWrap,
+            TokKind::StarPipe => BinOp::MulSat,
             _ => return None,
         })
     }

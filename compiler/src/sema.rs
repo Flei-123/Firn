@@ -2457,6 +2457,21 @@ impl<'a> Checker<'a> {
                     BinOp::Ge => bit(a >= b),
                     BinOp::LAnd => bit(b != 0),
                     BinOp::LOr => bit(b != 0),
+                    // ROUND 72 -- explicit wrap/saturate (SPEC section 13,
+                    // item L9). Wrapping needs nothing beyond plain
+                    // arithmetic: the `wrap(v, &rty)` call right below this
+                    // match already narrows to the destination type, which
+                    // IS two's complement wrapping.
+                    BinOp::AddWrap => a + b,
+                    BinOp::SubWrap => a - b,
+                    BinOp::MulWrap => a * b,
+                    BinOp::AddSat | BinOp::SubSat | BinOp::MulSat => {
+                        return Err((
+                            e.span,
+                            "'+|'/'-|'/'*|' (saturating arithmetic) is not                              supported in a constant expression yet -- use it                              at run time"
+                                .to_string(),
+                        ));
+                    }
                 };
                 let rty = self
                     .expr_types
