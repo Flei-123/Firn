@@ -1074,6 +1074,39 @@ else
     grep -E '^  FAIL|^FAIL' "$WORK/firstrun.log" | head -10 | sed 's/^/   /'
 fi
 
+echo "== 46. global variables: 'static' and 'static mut' (tools/state/run.sh, ROUND 89) =="
+# SPEC 14.1.statics. The one thing the kernel migration hung on: without a
+# place that survives the function that wrote it there is no scheduler, no
+# page allocator, no interrupt table and no device driver. What is measured
+# here is not that a `static` compiles but WHERE it lands -- `readelf` says
+# which section the linker really put it in -- that it is ONE place across
+# module boundaries, that the kernel profile carries no undefined name of
+# ours, and that both machines and both compilers agree.
+bash tools/state/run.sh > "$WORK/state.log" 2>&1 && STRC=0 || STRC=$?
+if [ "$STRC" -eq 0 ]; then
+    ok
+    grep -E '^state:|^   SKIPPED' "$WORK/state.log" | sed 's/^/   /'
+else
+    bad "tools/state/run.sh failed (see .test-work/state.log)"
+    grep -E '^  FAIL|^state:' "$WORK/state.log" | head -12 | sed 's/^/   /'
+fi
+
+echo "== 47. the checked index, the checked division, the panic handler (tools/checkidx/run.sh, ROUND 89) =="
+# SPEC section 13, item L9 -- the same shape as section 44 and for the
+# same reason: the ABORT is the result, and a program that panics counts as
+# a failure in section 3, never as a measurement. On top of the message
+# (which has to come out of both compilers octet for octet), this section
+# measures what the promise COSTS: `release-fast` carries no comparison at
+# all, and a loop the optimiser can prove is inside loses its check again.
+bash tools/checkidx/run.sh > "$WORK/checkidx.log" 2>&1 && CIRC=0 || CIRC=$?
+if [ "$CIRC" -eq 0 ]; then
+    ok
+    grep -E '^checkidx:' "$WORK/checkidx.log" | sed 's/^/   /'
+else
+    bad "tools/checkidx/run.sh failed (see .test-work/checkidx.log)"
+    grep -E '^  FAIL|^checkidx:' "$WORK/checkidx.log" | head -12 | sed 's/^/   /'
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then
