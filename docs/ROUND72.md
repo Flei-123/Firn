@@ -433,3 +433,142 @@ echo $?     # 7 -- it wrapped
 
 `.firnc1` is built by `tools/self_compare.sh` and by
 `tools/checked/run.sh`; neither reuses an older one than its sources.
+
+---
+
+# Round 83 — the same round, eleven rounds later
+
+**Branch** `r83-arith` · **Date** 2026-08-23 · same machine.
+
+Round 72 was finished and never merged. In the meantime `main` grew round
+78 (the operating system is called **Osum** now, and the layout acceptance
+runs against a frozen reference instead of Chromium), round 79 (escape
+analysis), round 80 (the aarch64 backend), round 81 (the standard library:
+deflate, JSON, crypto, hash) and round 82 (v128, AES-NI/SHA-NI, the
+peephole pass). A `git merge r72-arith` produced 13 conflicts in 8 files.
+This round is the merge, done properly.
+
+## 9. Merge, not rebase
+
+Six commits that touch the same lines over and over, against five rounds of
+change: a rebase means resolving the same thirteen collisions up to six
+times, once against every intermediate state — and the intermediate states
+of a round are not states anybody wants to bisect through. One merge commit
+resolves each collision ONCE, against the state that gets tested.
+
+### 9.1 The collision that git did not report
+
+`lib/firnc1/ast.fi`. Round 72 and round 79 BOTH gave the tree source
+positions, independently, and neither knew about the other. git merged the
+two additions on top of each other without a word:
+
+| | Round 72 | Round 79 |
+|---|---|---|
+| Field | `e_pos: Vec[u64]` | `e_pos: Vec[u64]`, `s_pos: Vec[u64]` |
+| Packing | file 20 bits, line 22, column 22 | file 16 bits, line 24, column 24 |
+| File number | the INTERN number of the file NAME | the number in the TREE's file table (`ast.file_add`) |
+| Accessors | `e_pos`/`e_pos_set` | `expr_pos`/`expr_pos_set` |
+| Written by | `pos_now`/`pos_default`/`pos_from` | `at_pos` in `un_expr` |
+| Read by | `lower.fi` (the panic message) | `escape.fi` (the refusal message) |
+
+The result compiled as text and was nonsense as a program: two `e_pos`
+vectors in one struct, two `pos_pack`, the vector freed twice in
+`tree_free` and pushed twice per node in `expr_new`. **Round 79's is the
+one that stayed** — `firnc1.fi` and `escape.fi` already feed it — and round
+72's readers were moved onto it. `lower.fi::msg_at` therefore prints the
+file name out of `ast.file_ptr` instead of out of the interner; it is the
+same text, because `firnc1.fi` registers every file under the name
+`firnc0` prints.
+
+That last sentence had a hole in it, and `tools/atomic/run.sh` found it
+within the hour: `bin/firdump.fi` and the other small drivers never call
+`par_file_set`, because nothing they did needed a file name before. Their
+tree had an EMPTY file table, so the panic message read `at :13:13` where
+`firnc0` wrote the path. Round 72 could not run into this — it carried the
+name's intern number in the position itself and needed no table. The fix is
+in `par_new`, for the tree a parser owns, where it cannot be forgotten
+again.
+
+### 9.2 The rest of the thirteen
+
+| File | Settled |
+|---|---|
+| `compiler/src/codegen_x86.rs` | Round 82's xmm cache (`xclear`/`xretire`) and round 72's `SiteCounter` parameter are both in `emit_block`. Neither replaces the other. |
+| `lib/firnc1/codegen.fi` | Round 75's `tr`/`ext_out` and round 72's `pmsg`/`site` are both fields of `Cg`. |
+| `lib/firnc1/mono.fi` | Round 79's `copy_expr_inner`, which already does what round 72's `copy_expr_at` did. |
+| `lib/firnc1/parser.fi` | `fileid` gone, `pos_now` is `at_pos`. |
+| `tools/layout/chrome.py` | Round 78's frozen reference wins; round 72's viewport probe stays, because `--refresh-reference` needs it. |
+| `tools/layout/FirnMetric.ttf` | Regenerated with `make_font.py`. Byte-identical to the one on `main` — the script pins `head.created`/`modified`. |
+| `lib/firnc1/gctext.fi` | Regenerated with `tools/gen_gctext.sh` (GCTEXT_ALL 150,167 → 150,285). |
+| `test.sh` | Both sections; the number is now 44 (see 9.4). |
+
+### 9.3 `karst_panic` → `osum_panic`
+
+Round 78 renamed the operating system and cleared the old name out of the
+repository; round 72 was written before that and carried it back in.
+`karst_panic`, `KARST_PANIC`, `.Lkarst_loop`, `.Lkarst_nl`, `.Lkarst_wait`,
+`.Lkarst_halt` — in `panic_rt.rs`, `lib/firnc1/codegen.fi`,
+`demos/kernel/isr.s`, `demos/kernel/start.s`, the three `run.sh` that check
+for undefined symbols, `SPEC.md`, `RUN.md` and this document.
+`grep -ric karst` over the tree (without `.git` and `target`) is **0**.
+`lib/firnc1/codegen.fi` also needed its literal length adjusted, 148 → 146
+octets: the name is two characters shorter, twice.
+
+### 9.4 Section 40 → section 44
+
+Round 72 took section 40 while it stood on an older `main`. 40 went to the
+escape analysis (round 79), 41 to the library (round 81), 42 to the speed
+(round 82) and 43 to the second machine (round 80) in the meantime.
+Checked arithmetic is **section 44**. Head comment and section both; the
+numbers 1 to 44 each occur exactly once.
+
+## 10. What `main` looked like underneath
+
+`main` **did not build**. The merges of round 80 and round 82 crossed:
+`codegen_a64.rs` builds an `Emitter` without round 82's `xmm` field and its
+`match` has no arm for `Op::Simd`. `cargo build --release` fails with two
+errors, `./test.sh` therefore dies in its first section, and that is the
+`RC=101` the last acceptance run left behind. Repaired here, because
+nothing else can be measured otherwise: the aarch64 backend REFUSES
+`Op::Simd` by name (NEON is a different instruction set, not a different
+spelling of SSE), and two more `Emitter` literals in the module tests of
+`codegen_a64.rs` needed the same field.
+
+## 11. The second machine (`compiler/src/panic_rt_a64.rs`)
+
+`docs/ROUND80.md` §7 described what checked arithmetic on aarch64 would
+take and left it undone. This round built it — see that section for the
+detail. It was not a free choice: the command line default is `dev-fast`,
+`dev-fast` checks, and `tools/aarch64/run.sh` compiles without a flag, so a
+backend that refused the four new operations would have refused nearly
+every program in `tests/`.
+
+## 12. The wraparounds rounds 76 and 81 wrote
+
+§5.5 above is the list round 72 made for the code that existed THEN. Five
+test programs and three library files that arrived AFTER it aborted under a
+checking build level, every one of them for a good reason:
+
+| Where | What, and why it is right that it struck |
+|---|---|
+| `lib/std/hash.fi` (round 81) | FNV-1a, xxHash64 and splitmix64 are arithmetic modulo 2^64 BY DEFINITION — nineteen operations, now `*%` / `+%` / `-%`. |
+| `lib/std/bytes.fi` (round 76) | The wire writes the BIT PATTERN of a signed number; `v as u32` is a checked narrowing cast (same width, other sign) and `-1` is not a `u32`. Eight functions `bits_u8`..`bits_i64` spell the reinterpretation once, in arithmetic that never leaves its range, and are EXPORTED: every caller building a packet by hand needs the same thing, and each one writing its own mask is how a check gets worked around instead of served. |
+| `tests/1600`, `tests/1601`, `tests/1611`, `tools/bench82/cross.fi` | The MMIX/PCG generator is modulo 2^64; `(x >> 33) as u8` means the low octet, and the mask says so. |
+| `tests/1602_nbt_roundtrip.fi` | `i8::MIN` … `i64::MIN` written as the numbers they are, instead of as a cast that does not fit. |
+| `tools/stdlib81/hashprobe.fi` | A counting sequence that runs past 255 and is MEANT to start over. |
+| `demos/kernel/kmain.fi` | The deliberate `#DE` was `42 / zero`, with the divisor read out of the data area so no pass could fold it. The checked division catches it BEFORE the processor does, hands it to `osum_panic`, and the kernel never returns — QEMU ran into its time limit. What that test wants is the CPU's own exception, so the division moved into `asm(...)`, past the language. The round working, not the round breaking the kernel. |
+
+Every `tests/*.fi`, `tests/opt/*.fi` and `examples/*.fi` compiled at
+`dev-fast` and run: **0 programs abort** (they were 5). Every program under
+`tools/`: 0 (they were 2).
+
+## 13. What this round did NOT do
+
+* **`as%` still does not exist.** §7 above wanted it in round 72 and wanted
+  it again here: three files now spell a reinterpretation as
+  `((v as i64) & 4294967295) as u32`, which says the same thing in
+  arithmetic and says it worse. It is the one language gap this merge made
+  visible twice.
+* **`profile kernel` on aarch64** is still refused (round 80 §2), so
+  `osum_panic` has no A64 form.
+* **The optimiser still does not hoist or CSE a checked operation** (§7).

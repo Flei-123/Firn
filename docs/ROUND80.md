@@ -303,23 +303,55 @@ classifier.
 
 ---
 
-## 7. Checked arithmetic (round 72)
+## 7. Checked arithmetic (round 72) — BUILT IN ROUND 83
 
 The round description asked for the checked arithmetic of round 72 to come
 along, with the overflow branch on the condition flags (`b.vs` / `b.cs`).
-**It is not on `main`.** `git merge-base --is-ancestor d589d26e main` says
-no; the work sits on the unmerged branches `r72-arit` (and the follow-up
-`94b4fce4`). There is no `Op` in the FIR of `main` that carries an overflow
-check, so there was nothing to port.
+When this round ran it was **not on `main`**: the work sat on the unmerged
+branch `r72-arith`, and there was no `Op` in the FIR of `main` that carried
+an overflow check, so there was nothing to port.
 
-What it will take when those branches land: the A64 side is the *easier*
-one. `adds`/`subs`/`negs` set V and C exactly like their x86 counterparts,
-so a checked add is `adds` + `b.vs <panic>` (signed) or `adds` + `b.cs
-<panic>` (unsigned), and a checked multiplication is `mul` plus `smulh`/
-`umulh` and a comparison of the high half — where x86 gets the flag for free
-out of `imul`. The place it goes is `emit_bin` in `codegen_a64.rs`; the
-branch target is the same panic label the x86 path uses, because that label
-comes out of the lowering and not out of the code generator.
+**Round 83 merged that branch and built this half.** It turned out not to
+be optional: the command line default is `dev-fast`, `dev-fast` CHECKS, and
+`tools/aarch64/run.sh` compiles every case without a flag — an aarch64
+backend that refused `Op::CheckedBin` would have refused nearly every test
+program in the suite and the comparison above would have collapsed to a
+handful of cases.
+
+The estimate above held. `compiler/src/panic_rt_a64.rs` (about 550 lines)
+does what it said: `adds`/`subs` with `b.vs` for a signed type, and for an
+unsigned one `b.cs` after an addition and `b.cc` after a subtraction — A64
+spells the borrow the other way round from x86, which is the one place the
+symmetry breaks. A 64-bit multiplication asks `smulh`/`umulh` for the upper
+half and compares it against the sign extension of the lower one. Two
+things the estimate did not mention:
+
+* **8 and 16 bits have no arithmetic on this machine at all.** There is no
+  `adds w9, w9, w10` that means `i8`. The operation happens at 32 bits,
+  where two 8-bit values cannot overflow, and what is checked is the RANGE
+  of the exact result (`sxtb`/`uxtb`/`sxth`/`uxth`, compare, `b.ne`). The
+  32-bit multiplication is the same thought at 64 bits.
+* **The trampoline had to be written a second time.** The message TABLE is
+  shared with x86 (`panic_rt::intern`/`rodata_asm` produce `.ascii`, which
+  is not machine specific), so the panic text is the same octet sequence on
+  both machines — but everything that prints it is instructions: the
+  decimal formatter, `write` (system call 64 here, 1 there) and
+  `exit_group` (94 here, 231 there) with the same exit code 101.
+
+Measured, `tools/aarch64/run.sh`, build stage `dev-fast` (the checking one):
+**288 of 293 comparable cases identical on both machines, DIFFERENT 0**,
+NOT SUPPORTED 5 — four inline assembler and one `v128` of round 82.
+
+The twelve programs of `tools/checked/` compiled for both targets in all
+four build levels: 49 of 52 runs identical. The three that differ are
+`release-fast` (the level that does NOT check) division by zero and
+`MIN / -1`: x86 raises `SIGFPE` and dies with 136, while A64's `sdiv`
+quietly yields 0 resp. `MIN`. That is the machine, and it belongs in the
+list of §6 rather than in this one.
+
+`profile kernel` is still refused on aarch64 (§2), so the `osum_panic`
+hand-off has no A64 form yet — this file does not invent an ending for a
+kernel that cannot be built for this target in the first place.
 
 ---
 
