@@ -62,7 +62,7 @@
 //   * a hash over THREE octets (the shortest match the format has) selects
 //     a bucket; `head[bucket]` is the most recent position with that hash,
 //     `prev[pos & 32767]` chains backwards through the older ones.
-//   * the chain is walked with a LIMIT (`good`), because the last 1% of
+//   * the chain is walked with a LIMIT (`chain`), because the last 1% of
 //     compression costs 90% of the time. `level` sets it.
 //   * LAZY MATCHING (levels 4 and up): after a match is found at `pos`, the
 //     compressor looks at `pos+1` too, and if the match there is longer it
@@ -1063,9 +1063,40 @@ fn hash3(d: *mut Deflater, pos: usize) -> usize {
     return (((a << 10) ^ (b << 5) ^ c) & HASHMASK) as usize
 }
 
+// An UNALIGNED 64 bit read at an octet offset. `rt.ld64` counts in units of
+// eight, which is exactly what is not wanted here: the two positions being
+// compared have any offset at all against each other.
+fn ldu64(p: u64, off: usize) -> u64 {
+    return *((p + off as u64) as *mut u64)
+}
+
+// ROUND 87 -- EIGHT OCTETS PER COMPARISON INSTEAD OF ONE.
+//
+// This loop is the hot spot of the whole compressor: for every position the
+// hash chain is walked, and for every link in it this function runs. Octet
+// by octet that is one load, one comparison and one branch per octet, and
+// the branch is unpredictable by nature -- it is data.
+//
+// Eight at a time is one load, one comparison and one branch per EIGHT
+// octets, and the tail is at most seven single octets. Deliberately NOT
+// with `bsf` on the exclusive or: after the wide loop breaks, the octet loop
+// simply carries on from `k` and finds the same place. That costs at most
+// seven comparisons ONCE per call, needs no instruction the language does
+// not have, and stays correct on a big endian machine, where the lowest
+// differing octet would not be the first one.
+//
+// The reads never leave the buffer: `limit` is at most `n - b`, and `a < b`,
+// so `a + k + 8 <= a + limit < n` and `b + k + 8 <= n`.
 fn match_len(d: *mut Deflater, a: usize, b: usize, limit: usize) -> usize {
+    let src: u64 = (*d).src
     var k: usize = 0
-    while k < limit && rt.ld8((*d).src, a + k) == rt.ld8((*d).src, b + k) {
+    while k + 8 <= limit {
+        if ldu64(src, a + k) != ldu64(src, b + k) {
+            break
+        }
+        k = k + 8
+    }
+    while k < limit && rt.ld8(src, a + k) == rt.ld8(src, b + k) {
         k = k + 1
     }
     return k
@@ -1089,6 +1120,7 @@ fn find_match(d: *mut Deflater, pos: usize, out_dist: *mut usize) -> usize {
     var left: usize = (*d).chain
     var best: usize = 0
     var bestd: usize = 0
+    let src: u64 = (*d).src
     while cur != NIL && left > 0 {
         let cp: usize = cur as usize
         if cp >= pos {
@@ -1100,7 +1132,12 @@ fn find_match(d: *mut Deflater, pos: usize, out_dist: *mut usize) -> usize {
         }
         // Only compare when the octet behind the current best differs --
         // that one test throws out most candidates before the loop starts.
-        if best == 0 || rt.ld8((*d).src, cp + best) == rt.ld8((*d).src, pos + best) {
+        // ROUND 87: and the one BEFORE it as well, exactly as zlib does. A
+        // candidate has to beat the current best, so both of those octets
+        // have to fit; two comparisons here save a whole call.
+        if best == 0
+        || (rt.ld8(src, cp + best) == rt.ld8(src, pos + best)
+            && rt.ld8(src, cp + best - 1) == rt.ld8(src, pos + best - 1)) {
             let l: usize = match_len(d, cp, pos, limit)
             if l > best {
                 best = l
@@ -1481,6 +1518,19 @@ fn deflate(src: u64, n: usize, level: usize, out: *mut rt.Buf) -> DeflateError!u
     }
 
     // The chain limit per level -- measured in tools/stdlib81/run.sh.
+    // The chain limit per level -- measured in tools/stdlib81/run.sh.
+    //
+    // ROUND 87 TRIED zlib's other two limits here and THREW THEM OUT again;
+    // the numbers are in docs/ROUND87.md 2. `nice_length` (stop the walk at
+    // a match of 128) bought 4.5 % of speed at level 6 and cost 0.15
+    // percentage points of ratio; `good_length` (walk only a quarter of the
+    // chain once a match of 8 has been found) bought 26 % and cost 1.4
+    // points -- and at level 1, where the chain is 8 links long anyway,
+    // quartering it made the output 168,715 -> 185,005 octets, nearly ten
+    // percent worse. The mandate for the round was that the ratio must NOT
+    // get worse, so neither of them is in here. What made the compressor
+    // faster is in `match_len` and in the pre-check of `find_match`, and
+    // both of those produce bit-identical output.
     if level <= 2 {
         d.chain = 8
         d.lazy = false

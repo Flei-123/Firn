@@ -170,26 +170,41 @@ fn hoistable_op(op: &Op) -> bool {
     }
 }
 
+// ROUND 87 -- THE SAME QUADRATIC SHAPE AS IN `merge_blocks`.
+//
+// This function used to rebuild, FOR EVERY SINGLE HOISTED INSTRUCTION, the
+// set of all values defined inside the loop (a hash set over every
+// instruction of the body) and to sort and CLONE the block list of the body
+// twice per search step. A loop from which twenty instructions move
+// therefore walked its own body twenty times and allocated forty vectors.
+//
+// The set is now built once and kept up to date: an instruction that moves
+// into the preheader defines its value OUTSIDE the loop from then on, so its
+// `dst` leaves the set -- which is exactly what makes the instructions that
+// depended on it movable in the next step. The block order of the body is
+// sorted once.
+//
+// The search still starts at the beginning after every hoist, so the ORDER
+// in which instructions move is unchanged and the result is the same
+// instruction sequence as before. Measured over bin/firnc1.fi, the assembler
+// is octet-identical.
 fn hoist_out(f: &mut Func, head: usize, body: &HashSet<usize>, preheader: usize) -> usize {
     let mut moved = 0;
     let mut buf: Vec<Val> = Vec::new();
-    loop {
-        // 1. Which values come about inside the loop?
-        let mut in_loop: HashSet<Val> = HashSet::new();
-        for &b in body {
-            for i in &f.blocks[b].insts {
-                if let Some(d) = i.dst {
-                    in_loop.insert(d);
-                }
+    let mut order: Vec<usize> = body.iter().copied().collect();
+    order.sort_unstable();
+    let mut in_loop: HashSet<Val> = HashSet::new();
+    for &b in &order {
+        for i in &f.blocks[b].insts {
+            if let Some(d) = i.dst {
+                in_loop.insert(d);
             }
         }
-        // 2. Look for the first movable instruction (by block order).
+    }
+    loop {
+        // Look for the first movable instruction (by block order).
         let mut hit: Option<(usize, usize)> = None;
-        'search: for &b in {
-            let mut v: Vec<usize> = body.iter().copied().collect();
-            v.sort_unstable();
-            &v.clone()
-        } {
+        'search: for &b in &order {
             for (ix, i) in f.blocks[b].insts.iter().enumerate() {
                 if !hoistable_op(&i.op) {
                     continue;
@@ -208,7 +223,7 @@ fn hoist_out(f: &mut Func, head: usize, body: &HashSet<usize>, preheader: usize)
                 }
                 // The head itself may keep its condition: an instruction that
                 // the terminator of the head needs is hoistable indeed, but the
-                // gain is zero. We hoist it anyway — it is invariant, so the
+                // gain is zero. We hoist it anyway -- it is invariant, so the
                 // condition is invariant too.
                 let _ = head;
                 hit = Some((b, ix));
@@ -219,8 +234,11 @@ fn hoist_out(f: &mut Func, head: usize, body: &HashSet<usize>, preheader: usize)
             Some(x) => x,
             None => break,
         };
-        // 3. Move: to the end of the preheader, in front of its terminator.
+        // Move: to the end of the preheader, in front of its terminator.
         let inst: Inst = f.blocks[b].insts.remove(ix);
+        if let Some(d) = inst.dst {
+            in_loop.remove(&d);
+        }
         f.blocks[preheader].insts.push(inst);
         moved += 1;
         if moved > 10_000 {
