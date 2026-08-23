@@ -298,6 +298,9 @@ fn remap_op(op: &Op, mv: &dyn Fn(Val) -> Val) -> Op {
         Op::CheckedCast { src, from, msg } => {
             Op::CheckedCast { src: mv(*src), from: *from, msg: msg.clone() }
         }
+        Op::CheckedIdx { idx, len, msg } => {
+            Op::CheckedIdx { idx: mv(*idx), len: *len, msg: msg.clone() }
+        }
         Op::Cmp { op, ty, a, b } => Op::Cmp { op: *op, ty: *ty, a: mv(*a), b: mv(*b) },
         Op::Un(o, a) => Op::Un(*o, mv(*a)),
         Op::Cast { src, from } => Op::Cast { src: mv(*src), from: *from },
@@ -318,6 +321,7 @@ fn remap_op(op: &Op, mv: &dyn Fn(Val) -> Val) -> Op {
         },
         Op::VtabAddr { table } => Op::VtabAddr { table: table.clone() },
         Op::FnRef { name } => Op::FnRef { name: name.clone() },
+        Op::GlobalAddr { name } => Op::GlobalAddr { name: name.clone() },
         Op::Syscall { args } => Op::Syscall { args: args.iter().map(|a| mv(*a)).collect() },
         Op::CopyMem { dst, src, size } => {
             Op::CopyMem { dst: mv(*dst), src: mv(*src), size: *size }

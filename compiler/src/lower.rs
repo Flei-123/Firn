@@ -392,6 +392,14 @@ impl<'a> Lower<'a> {
         match &e.kind {
             ExprKind::Ident(name) => match self.lookup(name) {
                 Some(slot) => Some(slot),
+                // ROUND 89 (statics.rs): a `static` HAS an address, and it
+                // is the same one everywhere -- a link time constant, not a
+                // stack slot. From here on every path that already worked
+                // for a local (field, index, assignment, `&x`) works for a
+                // global without knowing the difference.
+                None if self.info.statics.contains_key(name) => {
+                    Some(self.push(FTy::Ptr, Op::GlobalAddr { name: name.clone() }))
+                }
                 None => {
                     if self.info.consts.contains_key(name) {
                         self.err(e.span, "a constant has no address")
@@ -423,8 +431,21 @@ impl<'a> Lower<'a> {
                     _ => return self.ice(e.span, "index on a non-indexable type"),
                 };
                 let esz = self.info.tcx.size_of(&elem).max(1);
-                let iv = self.lower_expr(idx)?;
+                let mut iv = self.lower_expr(idx)?;
                 let ift = self.fty_of(idx)?;
+                // ROUND 89 -- the checked index (SPEC section 13, item L9).
+                // Only a FIXED SIZE ARRAY gets one: `*T` carries no length,
+                // so there is nothing to compare against and this compiler
+                // does not invent one. The check sits HERE and not in
+                // `elem_addr`, so that the array literals and struct copies
+                // the compiler generates for itself (whose indices it just
+                // computed and knows to be inside) do not pay for it.
+                if let Type::Array(_, n) = &bt {
+                    if crate::checkmode::is_checked() {
+                        let msg = self.index_msg(idx.span, &bt);
+                        iv = self.push(ift, Op::CheckedIdx { idx: iv, len: *n, msg });
+                    }
+                }
                 // Layer field access <-> storage location (layout.rs, DESIGN_GOALS 8)
                 Some(self.elem_addr(baddr, esz, iv, ift))
             }
@@ -693,6 +714,12 @@ impl<'a> Lower<'a> {
                         None => return self.ice(e.span, "constant with a non-scalar type"),
                     };
                     Some(self.constant(ft, cv))
+                } else if self.info.statics.contains_key(name) {
+                    // ROUND 89: read a global variable -- its address, then
+                    // a load, exactly as for a local.
+                    let ft = self.fty_of(e)?;
+                    let addr = self.push(FTy::Ptr, Op::GlobalAddr { name: name.clone() });
+                    Some(self.load(ft, addr))
                 } else {
                     self.ice(e.span, "unknown name in lowering")
                 }
@@ -925,6 +952,23 @@ impl<'a> Lower<'a> {
             ft.name(),
             op.text(),
             ft.name(),
+            self.dg.file_name(span.file),
+            span.line,
+            span.col,
+        )
+    }
+
+    /// ROUND 89 -- the message baked into a checked index at LOWERING
+    /// time, in the same three-part shape as the arithmetic messages
+    /// above: what went wrong, what the source program actually wrote,
+    /// where. The two NUMBERS (the index and the length) are appended by
+    /// the backend at the panic site, where it holds them in registers --
+    /// under the words `index=` and `len=`, not `a=`/`b=`
+    /// (`panic_rt.rs::TRAMPOLINE_INDEX`).
+    fn index_msg(&self, span: Span, arr: &Type) -> String {
+        format!(
+            "panic: index out of bounds in '{}' at {}:{}:{}",
+            self.info.tcx.name_of(arr),
             self.dg.file_name(span.file),
             span.line,
             span.col,
@@ -2130,6 +2174,7 @@ mod tests {
             tcx,
             expr_types: b.types.clone(),
             consts: HashMap::new(),
+            statics: HashMap::new(),
             fns: HashMap::new(),
             widen_f32: std::collections::HashSet::new(),
         };

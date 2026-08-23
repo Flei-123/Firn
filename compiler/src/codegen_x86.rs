@@ -270,6 +270,12 @@ pub fn emit(m: &Module) -> Result<String, String> {
         e.raw(&crate::panic_rt::rodata_asm());
         e.raw(&crate::panic_rt::trampoline_asm());
     }
+    // HOOK statics: `.bss`/`.data`/`.rodata` of the global variables
+    // (round 89, SPEC 14.1.statics) — only when the program declares a
+    // `static` at all.
+    if crate::statics::any() {
+        e.raw(&crate::statics::data_asm());
+    }
     // ROUND 64: `.debug_abbrev` and `.debug_info` of our own -- names, types
     // and variables. The line table stays with the assembler (`.loc`).
     if dwarf::with_variables() && !e.debug_funcs.is_empty() {
@@ -706,6 +712,15 @@ fn emit_inst(
         // item L9). Never checked, always the caller's own well-defined
         // fallback for when overflow is the point (hashes, checksums,
         // timestamps).
+        // ROUND 89 -- the checked ARRAY INDEX (SPEC section 13, item L9).
+        // The index is a `usize`, so ONE unsigned comparison against the
+        // length decides both ends at once.
+        Op::CheckedIdx { idx, len, msg } => {
+            let d = i.dst.ok_or("internal error: checked index without target")?;
+            load_ext(e, fr, "rax", *idx, ty, 64);
+            crate::panic_rt::emit_checked_idx(e, *len, msg, site);
+            store_dst(e, fr, d, "rax");
+        }
         Op::BinWrapSat { kind, op, a, b } => {
             let d = i.dst.ok_or("internal error: wrap/sat binary operation without target")?;
             emit_wrap_sat(e, fr, *kind, *op, ty, *a, *b, d, site)?;
@@ -1027,6 +1042,15 @@ fn emit_inst(
             e.line(&format!(
                 "lea rax, [rip + {}]",
                 crate::fnval::record_label(name)
+            ));
+            store_dst(e, fr, d, "rax");
+        }
+        // Round 89 (statics.rs): the address of a global variable.
+        Op::GlobalAddr { name } => {
+            let d = i.dst.ok_or("internal error: globaladdr without target")?;
+            e.line(&format!(
+                "lea rax, [rip + {}]",
+                crate::statics::label_of(name)
             ));
             store_dst(e, fr, d, "rax");
         }
