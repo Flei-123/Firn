@@ -56,6 +56,14 @@
 #      the same login dribbled out ONE OCTET PER WRITE, sixteen logins at
 #      the same time -- and, if node is there, node-minecraft-protocol as a
 #      third implementation nobody here wrote.
+#  45. Compile and start in ONE command (tools/run/run.sh, round 84):
+#      `firnc run file.fi [args...]` builds into a cache under ~/.cache/firn
+#      and starts the result. 17 cases: the exit code is the program's, the
+#      arguments (including `--help` and `-o`) arrive unchanged, standard
+#      input passes through, a compile error stays an error -- and the cache
+#      is invalidated by a changed MODULE while the main file keeps its
+#      content and its timestamp. Plus the shebang line, which both lexers
+#      skip in line 1 and nowhere else.
 #  41. The standard library of round 81 (tools/stdlib81/run.sh): the hash
 #      and the octet keys of the map (a million entries, the longest probe
 #      chain MEASURED, an endurance run with a counter-check that must
@@ -995,6 +1003,40 @@ for stage in "" "--no-opt"; do
         grep -E '^  DIFF |^FAIL' "$WORK/a64_run.$tag.log" | head -10 | sed 's/^/   /'
     fi
 done
+
+echo
+echo "== 45. compile and start in one command (tools/run/run.sh, ROUND 84) =="
+# The round gave the compiler what `python test.py` has: `firnc run
+# file.fi [args...]` compiles into a cache and starts the result.
+#
+# What run.sh checks is not that it works once, but that it behaves like the
+# binary itself: the exit code of the program IS the exit code of the
+# command, the arguments after the file name arrive UNCHANGED (including
+# `--help` and `-o`, which a compiler would otherwise eat), standard input
+# goes through, and standard error stays standard error.
+#
+# The half that matters more is the cache. It may never hand back a wrong
+# answer, so its key covers the source text of the root file AND of every
+# module the import resolution finds, every package manifest, the compiler
+# binary, the build level, the target and the profile. The counter-check is
+# case 9: a MODULE is changed while the main file keeps its content and its
+# timestamp -- and the file has to be compiled again.
+#
+# Plus the shebang: `#!/usr/bin/env firnc-run` in line 1 is skipped by BOTH
+# lexers (that is why the fixpoint below still holds), and case 13 shows
+# that a `#!` in line 2 is still the tokens it always was -- `#` does not
+# become a comment character.
+#
+# 17 cases; the stopwatch is not among them (tools/run/bench.sh does the
+# measuring, RUN84_BENCH=1 runs it too).
+bash tools/run/run.sh > "$WORK/run84.log" 2>&1 && RUN84RC=0 || RUN84RC=$?
+if [ "$RUN84RC" -eq 0 ]; then
+    ok
+    grep -E '^(  cases:|PASS: )' "$WORK/run84.log" | sed 's/^/ /'
+else
+    bad "tools/run/run.sh failed (see .test-work/run84.log)"
+    grep -E '^FAIL' "$WORK/run84.log" | head -10 | sed 's/^/   /'
+fi
 
 TOTAL=$((PASS + FAIL))
 echo

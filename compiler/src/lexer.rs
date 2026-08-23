@@ -722,6 +722,24 @@ impl<'a> Lexer<'a> {
     }
 
     fn run(&mut self) {
+        // ROUND 84: the shebang. A file that starts with `#!` in its FIRST
+        // line is meant to be started directly (`./program.fi`), and the
+        // kernel hands that line to the interpreter, not to us. So the line
+        // is skipped -- and ONLY it. `#` does NOT become a comment
+        // character: everywhere else it stays the `Hash` token that opens an
+        // attribute (`#[inline]`), and a `#` in line 2 ends up in front of
+        // the parser exactly as before. The newline itself stays, `bump`
+        // counts it, and the first real token sits on line 2 with the right
+        // column. `lib/firnc1/lexer.fi::lex_run` carries the same rule,
+        // otherwise the fixpoint would break.
+        if self.pos == 0 && self.peek() == Some('#') && self.peek2() == Some('!') {
+            while let Some(c) = self.peek() {
+                if c == '\n' {
+                    break;
+                }
+                self.bump();
+            }
+        }
         loop {
             self.skip_trivia();
             let c = match self.peek() {
@@ -778,6 +796,30 @@ mod tests {
         let mut dg = Diags::new("test", src);
         let toks = lex(src, &mut dg);
         (toks.into_iter().map(|t| t.kind).collect(), dg.count())
+    }
+
+    /// ROUND 84: the shebang line is skipped, and only in line 1.
+    #[test]
+    fn shebang_first_line_only() {
+        let (k, n) = kinds("#!/usr/bin/env firnc-run\n42");
+        assert_eq!(n, 0);
+        assert_eq!(k, vec![TokKind::Int(42), TokKind::Eof]);
+        // The token really sits on line 2, column 1.
+        let src = "#!/usr/bin/env firnc-run\n42";
+        let mut dg = Diags::new("test", src);
+        let t = lex(src, &mut dg);
+        assert_eq!((t[0].span.line, t[0].span.col), (2, 1));
+        // `#` anywhere else stays the `Hash` token: Firn has no comment
+        // starting with `#`, and this round does not give it one. In line 2
+        // the shebang is simply a sequence of tokens (and the parser then
+        // says what it thinks of it).
+        let (k2, _) = kinds("42\n#!/bin/sh\n");
+        assert_eq!(k2[0], TokKind::Int(42));
+        assert_eq!(k2[1], TokKind::Hash);
+        // And in line 1 it takes BOTH characters: a lone `#` is not a
+        // shebang.
+        let (k3, _) = kinds("#[inline]\n42");
+        assert_eq!(k3[0], TokKind::Hash);
     }
 
     #[test]

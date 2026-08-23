@@ -1476,6 +1476,45 @@ specification and the code do not drift apart.
     class was added together with `f32`, and the exhaustiveness check of the
     compiler then named every case distinction that had to handle it.
 
+21. **The command line of the driver (round 84).** Two shapes, and the
+    order of the words carries the meaning:
+
+    ```
+    firnc [OPTIONS] file.fi                     compile
+    firnc run [OPTIONS] file.fi [ARGUMENTS...]  compile and start
+    ```
+
+    In the first shape every argument is a compiler argument. In the second,
+    everything up to and including the FIRST non-option belongs to the
+    compiler and everything after the file name belongs to the PROGRAM --
+    unchanged, including `--help` and `-o`. That is not a convenience; it is
+    the only way `firnc run tool.fi --help` can mean the program's help
+    rather than the compiler's.
+
+    Binding for `run`:
+    * the exit code of `firnc run` **is** the exit code of the program
+      (killed by a signal: 128 + number),
+    * standard input, output and error are **inherited**, not copied,
+    * the default build level is `dev-fast`; `--opt-level=` wins over it,
+    * `-o`, `--emit=` and `-c` before the file name are an **error**, not a
+      silent no-op: they ask for something other than "start it",
+    * the result is cached in `$FIRN_CACHE`, else `$XDG_CACHE_HOME/firn`,
+      else `$HOME/.cache/firn`. The key is a SHA-256 over the source text
+      and the path of the root file AND of every module the import
+      resolution finds, every package manifest of the world, the compiler
+      binary (version, size, mtime), the build level, the target and the
+      profile. **The cache may never hand back a wrong answer**; where the
+      fingerprint cannot be taken, the file is compiled without a cache.
+      `--no-cache` switches it off, `--clear-cache` empties it.
+
+    **A shebang line** (`#!...`) in the FIRST line of a `.fi` file is skipped
+    by the lexer -- only there, only when the first two characters are `#!`.
+    `#` does not become a comment character; everywhere else it stays the
+    token that opens an attribute. With `tools/run/firnc-run` on the `PATH`
+    a file that starts with `#!/usr/bin/env firnc-run` and is marked
+    executable runs as `./file.fi`. Proof: `tools/run/run.sh` (17 cases,
+    `test.sh` section 45), `docs/ROUND84.md`.
+
 #### 14.1.types -- sum types, pattern matching, generics (round 2, module `types`)
 
 With round 2 `firnc0` implements 6.3 (`L4`) and generics (`L5`): `enum` with
