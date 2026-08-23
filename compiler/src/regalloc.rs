@@ -222,8 +222,11 @@ fn inst_clobbers(i: &Inst) -> RegMask {
         // wider touches rdx. THIS is the instruction of the bug.
         Op::CheckedBin { op: BinOp::Mul, .. } if !ty.signed() && ty.bits() >= 16 => M_RDX,
         Op::CheckedBin { .. } => 0,
-        // Checked `as`: push/narrow/widen/compare/pop — rax only.
-        Op::CheckedCast { .. } => 0,
+        // Checked `as` — ROUND 90: `mov rdx, rax` instead of `push rax`,
+        // so the round trip has something to compare against without
+        // touching memory. That makes rdx a clobber where round 72 had
+        // none; the stack traffic it replaces was two accesses per cast.
+        Op::CheckedCast { .. } => M_RDX,
         // `+% -% *%` is bit for bit the unchecked path (two operand `imul`).
         // `+| -| *|` clamps with `mov rdx, <bound>` + `cmovl` for the signed
         // types, and multiplies through the one-operand `mul` for the
@@ -282,6 +285,22 @@ fn op_pins(op: &Op, out: &mut Vec<Val>) {
             out.push(*addr);
             out.push(*erw);
             out.push(*new);
+        }
+        // ROUND 90 — the checked operations. Their failure arm RELOADS the
+        // two original values from wherever they live (`panic_rt.rs`), so
+        // those homes have to survive the instruction: an operand may not
+        // sit in a register the instruction itself destroys. Only matters
+        // where the mask is non-empty (the unsigned one-operand `mul`, the
+        // divisions, the saturating clamp, the cast's compare register) --
+        // `exact_crossings` never asks for pins where nothing is clobbered.
+        Op::CheckedBin { a, b, .. } | Op::CheckedDiv { a, b, .. } => {
+            out.push(*a);
+            out.push(*b);
+        }
+        Op::CheckedCast { src, .. } => out.push(*src),
+        Op::BinWrapSat { a, b, .. } => {
+            out.push(*a);
+            out.push(*b);
         }
         _ => {}
     }
@@ -1937,9 +1956,14 @@ pub(crate) fn emit_func_ra(e: &mut Emitter, f: &Func) -> Option<Result<(), Strin
     // The function is emitted into a buffer of its own first; after that the
     // register descriptor post pass strikes spill stores with an immediate
     // reload of the same value (445x statically in the tokenizer run, round 37).
-    let mut tmp = Emitter { out: String::new(), debug_funcs: Vec::new(), xmm: Default::default() };
+    let mut tmp = Emitter { out: String::new(), cold: String::new(), debug_funcs: Vec::new(), xmm: Default::default() };
     match emit_with(&mut tmp, f, &a) {
         Ok(()) => {
+            // ROUND 90: the panic arms of the checked operations, behind the
+            // function they belong to. They go through the descriptor pass
+            // with the rest -- every one of them starts with a `.L` label,
+            // which resets the descriptor, so they can believe nothing.
+            tmp.flush_cold();
             let nv = f.val_types.len();
             e.out.push_str(&descriptor_peephole(&tmp.out, nv));
             Some(Ok(()))
@@ -2920,21 +2944,33 @@ fn emit_inst(
             let d = i.dst.ok_or("internal error: checked binary operation without target")?;
             ra.load_ext(e, "rax", *a, ty, 64);
             ra.load_ext(e, "rcx", *b, ty, 64);
-            crate::panic_rt::emit_checked_bin(e, *op, ty, msg, site);
+            crate::panic_rt::emit_checked_bin(e, *op, ty, msg, site, &|e: &mut Emitter| {
+                // ROUND 90: the failure arm reloads instead of finding the
+                // values on the stack. `rcx` before `rdx`: if `b` lives in
+                // rdx the first load rescues it, and `a` can never live in
+                // rdx at a checked operation (`op_pins`).
+                ra.load_ext(e, "rcx", *b, ty, 64);
+                ra.load_ext(e, "rdx", *a, ty, 64);
+            });
             ra.store_dst(e, d, "rax");
         }
         Op::CheckedDiv { op, a, b, msg_zero, msg_range } => {
             let d = i.dst.ok_or("internal error: checked division without target")?;
             ra.load_ext(e, "rax", *a, ty, 64);
             ra.load_ext(e, "rcx", *b, ty, 64);
-            crate::panic_rt::emit_checked_div(e, *op, ty, msg_zero, msg_range, site);
+            crate::panic_rt::emit_checked_div(e, *op, ty, msg_zero, msg_range, site, &|e: &mut Emitter| {
+                ra.load_ext(e, "rcx", *b, ty, 64);
+                ra.load_ext(e, "rdx", *a, ty, 64);
+            });
             let res = if *op == BinOp::Div { "rax" } else { "rdx" };
             ra.store_dst(e, d, res);
         }
         Op::CheckedCast { src, from, msg } => {
             let d = i.dst.ok_or("internal error: checked cast without target")?;
             ra.load_ext(e, "rax", *src, *from, 64);
-            crate::panic_rt::emit_checked_cast(e, *from, ty, msg, site);
+            crate::panic_rt::emit_checked_cast(e, *from, ty, msg, site, &|e: &mut Emitter| {
+                ra.load_ext(e, "rdx", *src, *from, 64);
+            });
             ra.store_dst(e, d, "rax");
         }
         // ROUND 72 -- explicit "+% -% *%" / "+| -| *|" (SPEC section 13,
@@ -3835,7 +3871,7 @@ mod tests {
         let mut f = Func::new("f", vec![FTy::I64; 7], FTy::I64);
         f.set_term(0, Term::Ret(Some(6)));
         assert!(supported(&f));
-        let mut e = Emitter { out: String::new(), debug_funcs: Vec::new(), xmm: Default::default() };
+        let mut e = Emitter { out: String::new(), cold: String::new(), debug_funcs: Vec::new(), xmm: Default::default() };
         emit_func_ra(&mut e, &f).expect("register path responsible").expect("codegen");
         assert!(e.out.contains("qword ptr [rbp+16]"), "{}", e.out);
     }
@@ -3853,7 +3889,7 @@ mod tests {
         let rc = g.push(0, FTy::I32, Op::Cast { src: r, from: FTy::I64 });
         g.set_term(0, Term::Ret(Some(rc)));
         assert!(supported(&g));
-        let mut e = Emitter { out: String::new(), debug_funcs: Vec::new(), xmm: Default::default() };
+        let mut e = Emitter { out: String::new(), cold: String::new(), debug_funcs: Vec::new(), xmm: Default::default() };
         emit_func_ra(&mut e, &g).expect("register path responsible").expect("codegen");
         assert!(e.out.contains("sub rsp, 16"), "{}", e.out);
         assert!(e.out.contains("mov qword ptr [rsp+0], rax"), "{}", e.out);
@@ -4023,14 +4059,16 @@ mod tests {
             inst_clobbers(&inst(FTy::I64, Op::CheckedBin { op: BinOp::Mul, a: 1, b: 2, msg: msg() })),
             0
         );
-        // Checked `+`/`-` and a checked `as` write nothing but rax. Before
-        // round 90 all three banned rdx wholesale through `crosses_divsel`.
+        // Checked `+`/`-` write nothing but rax. Before round 90 they banned
+        // rdx wholesale through `crosses_divsel`.
         for op in [BinOp::Add, BinOp::Sub] {
             assert_eq!(inst_clobbers(&inst(FTy::U64, Op::CheckedBin { op, a: 1, b: 2, msg: msg() })), 0);
         }
+        // A checked `as` keeps the original in rdx to compare the round trip
+        // against (round 90; round 72 pushed it on the stack instead).
         assert_eq!(
             inst_clobbers(&inst(FTy::U8, Op::CheckedCast { src: 1, from: FTy::U64, msg: msg() })),
-            0
+            M_RDX
         );
         // Division, checked and unchecked: the remainder register.
         for op in [BinOp::Div, BinOp::Rem] {
