@@ -301,7 +301,7 @@ character:
   %9 = checked_add.i32 %7, %8 "panic: integer overflow in 'i32 + i32' at tools/checked/add_i32.fi:10:18"
 ```
 
-### 6.4 The new section (`tools/checked/run.sh`, test.sh section 40)
+### 6.4 The new section (`tools/checked/run.sh`, test.sh section 44)
 
 **150 checks, 0 failures.** Twelve programs, six groups, both compilers:
 
@@ -416,7 +416,7 @@ not because it was inconvenient.
 ## 8. Reproducing it
 
 ```sh
-bash test.sh                       # everything; section 40 is this round
+bash test.sh                       # everything; section 44 is this round
 bash tools/checked/run.sh          # 139 checks, both compilers
 bash tools/fixpoint.sh             # stage 2 == stage 3
 bash tools/self_compare.sh         # 312 same, 0 differing, 0 faulty
