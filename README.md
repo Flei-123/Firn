@@ -23,6 +23,44 @@ stays possible later, and what can wait:
 
 ---
 
+## Numbers
+
+Firn is written against measurements, not against opinions. Every figure
+below was run on an AMD EPYC 7571 (8 vCPU, Debian 12) with the command named
+in [docs/BENCHMARKS.md](docs/BENCHMARKS.md), where the full tables live —
+including the places where Firn loses.
+
+The cryptography and the compression are **written in Firn**, not bound to
+OpenSSL or zlib. "Behind by" is the reference divided by Firn.
+
+| workload | Firn | reference | behind by |
+|---|---:|---:|---:|
+| **SHA-256** | 968.3 MiB/s | OpenSSL 1372.6 MiB/s | **1.42x** |
+| **AES-128-CBC** encrypt | 582.0 MiB/s | OpenSSL 1056.4 MiB/s | **1.82x** |
+| **AES-128-CBC** decrypt | 691.8 MiB/s | OpenSSL 1056.4 MiB/s | **1.53x** |
+| **AES-128-CFB8** | 26.9 MiB/s | OpenSSL 37.1 MiB/s | **1.38x** |
+| **DEFLATE** level 6 | 11.2 MiB/s | `gzip -6` 21.0 MiB/s | **1.88x** |
+| xxHash64 | 5,591 MiB/s | — | — |
+| HTML tokenizer, `realweb` | 29.25 MB/s | html5ever (Rust) | **1.54x** |
+| HTML tokenizer, `html5lib` | — | html5ever (Rust) | **0.95x — ahead** |
+
+| what is checked | result |
+|---|---:|
+| **CSS layout against Chromium** | **1,087 / 1,087 boxes, deviation 0.00 %** |
+| paint order against Chromium | 5,171 / 5,171 probe points |
+| **HTML tokenizer**, html5lib-tests | **6,810 / 6,810 (100.00 %)** |
+| **JavaScript**, test262 (63,364 cases, unfiltered) | parser **91.94 %**, engine **76.00 %** |
+| **the same program on x86-64 and aarch64** | **290 / 294 identical output, 0 differing** |
+| garbage collector, longest pause | **0.45 ms** at 120,000 live nodes |
+| arena, 480,000 allocations | **one** system call, RSS drift **0 pages** |
+| Minecraft server, 16 connections at once | 48.1 MiB/s payload |
+| NBT against Notch's `bigtest.nbt` | 1,543 octets identical |
+| `bash test.sh` | **PASS 1184 / 1184** |
+| `tools/fixpoint.sh` | **stage 2 == stage 3, character-identical** |
+| `tools/self_compare.sh` | 321 the same, **0 differing, 0 faulty** |
+
+---
+
 ## Prerequisites
 
 * `rustc` / `cargo` (tested with `rustc 1.99.0-nightly`, edition 2021)
