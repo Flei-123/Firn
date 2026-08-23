@@ -120,12 +120,65 @@ its output table -- another reason not to let it own the file.)
 
 | what | measured |
 |---|---|
-| `bash test.sh` | see below |
+| `bash test.sh` | **FAIL 6 / 1204** -- broken down below |
 | `python3 tools/mdlinks/check.py` | 61 files, 33 local links, **0 dead** |
 | `BENCH_RUNS=9 bash bench/run.sh` (2x) | median **2.08x** / **2.19x** of `rustc -O` |
 | `bash tools/tokenizer/throughput.sh` (2x) | `realweb` **1.18x** / **1.17x**, `html5lib` **0.80x** / **0.76x** |
 | `examples/tour.fi` in 3 build levels | identical output, exit 0 each time |
 | README | 1,571 -> **380** lines |
+
+## `bash test.sh`: 6 of 1204, and where they come from
+
+This has to be said plainly, because the whole point of the round is not
+publishing numbers that flatter. The run came back **`FAIL 6/1204`**. None of
+the six is caused by anything this round changed -- `git diff main` touches
+`README.md`, `bench/RESULTS.md`, `docs/`, `examples/tour.fi` and two checker
+scripts, and not one file under `compiler/`, `lib/`, `bin/` or `tests/`.
+
+### Two are real, reproducible and pre-existing on `main`
+
+    tools/aarch64/run.sh           (release-fast)
+    tools/aarch64/run.sh --no-opt
+
+    DIFF tests/1613_crypto.fi :: aarch64 compilation failed:
+      --target=aarch64-linux cannot emit the vector instruction CpuFeatures yet
+
+    build stage: release-fast     SAME: 296   DIFFERENT: 1
+                 no-opt           SAME: 296   DIFFERENT: 1
+
+Round 82 built the vector instructions for x86-64 only. Commit `40dd563e` on
+`main` made the aarch64 emitter *say so* instead of failing to build -- which
+is the right call, but it turns one case of the cross-machine corpus into a
+`DIFF`, and `tools/aarch64/run.sh` fails on a `DIFF`. Fixing it means either
+implementing the aarch64 form of the instruction or reclassifying the case the
+way the four inline-assembly cases are already reclassified (`NOTSUP`). Both
+are decisions for whoever owns the round 82 / round 80 work; a README round
+does not get to make them quietly, and it certainly does not get to hide the
+number. `docs/BENCHMARKS.md` §10 and the README both now say **296 of 301, 1
+differing** instead of the old **290 of 294, 0 differing**.
+
+### Four are load flakes, and each one was re-run alone and passed
+
+The machine was running **five** copies of `test.sh` at the same time
+(rounds 83, 84, 85, 87 and this one), eight cores, load average 7-12.
+
+| section | what failed | re-run alone |
+|---|---|---|
+| `tools/thread/run.sh` | the deliberate counter-check "the counter WITHOUT a lock MUST lose increments" -- with the cores oversubscribed the four threads simply do not overlap, so nothing is lost and the proof is declared worthless | **passed** (`THREADS: passed`) |
+| `tools/fixpoint.sh` | the same test, reached through the corpus comparison: `first deviation: tests/860_thread_basic.fi (firnc0: 14, firnc1: 0)` -- exit 14 is that very counter-check. The **fixpoint itself held**: `stage 2 == stage 3, character-identical, 649720 lines of assembly` | the test program returned **0 in 12 of 12** direct runs |
+| `tools/js/run.sh` | the promise soak crashed: `jobs rc=-11` (SIGSEGV) with 96 MiB of free memory on the machine | **passed** (`jobs rc=0`, growth 2504 KiB) |
+| `tools/js/round66.sh` | the same soak, same crash | same re-run |
+
+Both counter-checks are good tests -- a thread test that passes when the
+threads never overlap would prove nothing. They are simply not safe to run on
+a machine that is five times oversubscribed. Noted here rather than papered
+over.
+
+Everything else in the run was green, including the parts this round makes
+claims about: `examples/tour.fi` in all three build levels, `self_compare` 321
+same / 0 differing / 0 faulty, the layout against Chromium 1087 / 1087 at
+0.00 %, the tokenizer 6810 / 6810, the kernel 174 / 174, packages 21 / 21, and
+`tools/english/check.sh` back at `0 0 0 0 0`.
 
 ## What is left open
 
@@ -138,6 +191,9 @@ its output table -- another reason not to let it own the file.)
   Item 3 ("no run-time checks") is correct today but will need striking the
   moment round 83 lands. Neither was touched here: the README round should not
   edit the specification behind another round's back.
+* The two aarch64 failures above. They are `main`'s, not this round's, but
+  somebody has to decide between implementing the instruction and
+  reclassifying the case.
 * `examples/hello.fi`, `fib.fi` and `structs.fi` still carry **German**
   comments, and `hello.fi` greets in German. `tools/english/check.sh` does not
   reach into `examples/`. Left as it is on purpose -- changing the expected

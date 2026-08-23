@@ -56,7 +56,7 @@ the numbers, together with the command for each one, are in
 | | state | proof |
 |---|---|---|
 | **Self-hosting** | `firnc1` is written in Firn, compiles itself, **stage 2 == stage 3 character-identical** | `tools/fixpoint.sh`, `tools/self_compare.sh` |
-| **Two machines** | x86-64 and aarch64, same source, **290 of 294 programs byte-identical output**, 0 differing | `tools/aarch64/run.sh` |
+| **Two machines** | x86-64 and aarch64, same source, **296 of 301 programs byte-identical output**; 1 differs, and it is named below | `tools/aarch64/run.sh` |
 | **Language** | structs, arrays, `enum` + `match` with exhaustiveness check, generics, interfaces, closures and function values, error unions `E!T`, `defer`/`errdefer`, `comptime` + `emit`, `f32`/`f64`, `str` with `f"…"` interpolation, threads, `extern fn` in both directions | `tests/` (three build levels each) |
 | **Garbage collector** | opt-in, incremental mark-sweep, **longest pause 0.45 ms** at 120,000 live nodes; weak refs, finalizers, `GcVec`/`GcMap` | `tools/dom_soak/run.sh` |
 | **Tooling** | formatter, DWARF line info + `gdb`, language server (`firnc --lsp`), package/project system, test runner with JSON output | `tools/fmt`, `tools/dwarf`, `tools/lsp`, `tools/packages` |
@@ -210,11 +210,16 @@ and a `line:column` — it does not crash and it does not pretend.
   x86_64-linux, aarch64-linux)"*.
 * **No LLVM backend, and there will not be one** — that is the point of the
   project, not a gap. It is listed here because people ask.
-* **No vector instructions on aarch64.** Round 82 built AES-NI, SHA-NI and SSE
-  for x86-64 behind a `cpuid` check; on ARM the scalar path runs
-  (`compiler/src/codegen_a64.rs`, the comment at the `Simd` arm). The scalar
-  path computes the same results, only slowly (35x–147x slower for the
-  cryptography, see docs/BENCHMARKS.md §1).
+* **No vector instructions on aarch64 — and this currently makes `test.sh`
+  red.** Round 82 built AES-NI, SHA-NI and SSE for x86-64 behind a `cpuid`
+  check (`compiler/src/codegen_a64.rs`, the comment at the `Simd` arm). One
+  program in the corpus, `tests/1613_crypto.fi`, therefore does not compile for
+  the second machine at all: *"--target=aarch64-linux cannot emit the vector
+  instruction CpuFeatures yet"*. `bash tools/aarch64/run.sh` reports
+  **296 of 301 identical, 1 differing** and fails, in both build stages. The
+  scalar path computes the same results everywhere, only slowly (35x–147x
+  slower for the cryptography, docs/BENCHMARKS.md §1); what is missing is the
+  aarch64 form of the instruction, not the algorithm.
 * **No package registry, no lock file, no reproducible two-machine build.**
   There is a module system and a project manifest (`firn.package`,
   `firnc --package <dir>`), but `compiler/src/package.rs` and
@@ -317,6 +322,24 @@ layout/ABI, type checker, lowering), the self-hosting fixpoint, threads, the
 freestanding kernel profile, JavaScript, packages, the formatter, DWARF, the
 language server, the calling convention against `gcc`, sockets, NBT, the
 Minecraft server, `extern fn` in both directions, and aarch64.
+
+**The state of `bash test.sh` on this branch, 2026-08-23: `FAIL 6/1204`.**
+Not one of the six comes from anything this round changed (`git diff main`
+touches `README.md`, `bench/RESULTS.md`, `docs/`, `examples/tour.fi` and two
+checker scripts — no compiler, no library, no test program):
+
+* **two are real and reproducible** — `tools/aarch64/run.sh` in both build
+  stages, on `tests/1613_crypto.fi`, for the reason given in the "can not"
+  list above;
+* **four are load flakes** on a machine that was running five copies of this
+  suite at once, and every one of them was re-run on its own and passed:
+  `tools/thread/run.sh` (the deliberate counter-check "the unlocked counter
+  MUST lose increments" — with the cores oversubscribed the four threads do not
+  overlap; the test program itself returned 0 in 12 of 12 direct runs),
+  `tools/fixpoint.sh` (same test, reached through the corpus comparison; the
+  fixpoint itself was **character-identical**, stage 2 == stage 3), and
+  `tools/js/run.sh` + `tools/js/round66.sh` (the promise soak segfaulted under
+  memory pressure and returned 0 on the re-run).
 
 A machine-readable subset for CI, without the section proofs:
 
