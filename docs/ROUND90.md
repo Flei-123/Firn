@@ -209,63 +209,96 @@ register — it does not have to: for `+` the original is `d - b`, for `-` it
 is `d + b`, both exact in two's complement, recomputed out of line on the
 path that never returns.
 
-**Stage 2c:** a promoted `alloca` cell used to get the interval
-`[0, last access]` — from the *start of the function*. In `matmul`'s `main`
-that meant three `alloc()` calls in the first ten instructions, so all nine
-cells "crossed a call" and all nine competed for the five callee-saved
-registers; five lost and went to the stack, among them the counters of the
-innermost loop (`FIRN_RA_STATS=1`: `cellivs=9 cellslost=5`). A cell now
-lives from its **first access to its last, widened over the loops those
-accesses lie in** — strictly more than the accesses, strictly less than the
-whole function. `cellslost` 5 -> 3, cells in registers 4 -> 6.
-
 ### 2.3 What it measured
 
-Wall clock, median of 7 runs, both sides on the same machine:
+Wall clock, median of **9** runs, the four binaries measured in ONE
+alternating pass so that machine drift cancels instead of landing on one of
+them. "before" is round 90 **stage 1** — the compiler with the wrong-code
+bug already fixed; against `main` there is no speed comparison to make,
+because all eleven of these programs **segfault** when `main` builds them
+with `--opt-level=release-safe`.
 
-    python3 tools/bench90/bench.py
+    RUNS=9 python3 tools/bench90/bench.py
 
-| | before (main) | after |
+| | before (stage 1) | after |
 |---|---:|---:|
-| median release-fast vs `rustc -O` | 1.82x | 1.80x |
-| **median release-safe vs `rustc -O +checks`** | **3.24x** | **~1.9x** |
-| **median price of the checks inside Firn** | **1.90x** | **~1.2x** |
+| median release-fast vs `rustc -O` | 1.82x | **1.81x** |
+| **median release-safe vs `rustc -O +checks`** | **3.18x** | **1.84x** |
+| **median price of the checks inside Firn** | **1.97x** | **1.19x** |
+
+| benchmark | release-safe before | release-safe after | the checks cost, before -> after |
+|---|---:|---:|---:|
+| fib | 0.051 s | **0.044 s** | 1.14x -> **0.99x** |
+| sieve | 0.094 s | **0.052 s** | 2.60x -> **1.47x** |
+| matmul | 0.416 s | **0.182 s** | 6.96x -> **3.04x** |
+| bytecount | 0.506 s | **0.324 s** | 1.55x -> **1.00x** |
+| bubblesort | 0.234 s | **0.104 s** | 2.89x -> **1.27x** |
+| statemachine | 0.227 s | **0.157 s** | 1.41x -> **0.98x** |
+| bitmap | 0.131 s | **0.080 s** | 1.97x -> **1.22x** |
+| xxhash | 0.363 s | **0.232 s** | 1.97x -> **1.25x** |
+| jsonscan | 0.243 s | **0.144 s** | 2.01x -> **1.19x** |
+| memstride | 0.283 s | **0.234 s** | 1.27x -> **1.05x** |
+| branchy | 0.605 s | **0.523 s** | 1.14x -> **0.99x** |
 
 Instructions really executed (`valgrind --tool=callgrind`, deterministic —
-the wall clock on this shared machine still moves by ten percent between two
-passes, which is enough to hide a real five percent and to invent one that
-is not there):
+the wall clock on this shared machine still moves by several percent between
+two passes, which is enough to hide a real five percent and to invent one
+that is not there):
 
     python3 tools/bench90/icount.py
 
 | benchmark | release-safe before | release-safe after | change |
 |---|---:|---:|---:|
-| matmul | 2,624,875,071 | 2,125,013,804 | **-19.0 %** |
-| statemachine | 1,152,595,372 | 946,235,543 | **-17.9 %** |
+| fib | 429,999,174 | **303,114,113** | **-29.5 %** |
+| sieve | 1,095,032,655 | **526,329,353** | **-51.9 %** |
+| matmul | 4,456,691,599 | **2,125,360,125** | **-52.3 %** |
+| bytecount | 5,682,464,133 | **2,974,915,175** | **-47.6 %** |
+| bubblesort | 1,885,661,378 | **857,315,966** | **-54.5 %** |
+| statemachine | 1,548,537,886 | **971,401,368** | **-37.3 %** |
+| bitmap | 1,494,353,935 | **1,004,558,579** | **-32.8 %** |
+| jsonscan | 2,264,001,094 | **1,202,000,710** | **-46.9 %** |
 
-`release-fast` is untouched by all of this, as it must be: it has no checks.
+**`release-fast` is untouched, and not in the "about the same" sense**: the
+emitted assembly of all eleven benchmark programs is character-identical to
+what went into the round.
 
 ---
 
 ## 3. What did not work, and is written down so nobody repeats it
 
-* **Cells first into the callee-saved pool.** A cell lives long and the four
-  temp registers are what the short lived values around it have; letting a
-  cell ask `rbx`/`r12`–`r15` first reads well. Measured: `statemachine`
-  691.2 -> 699.6 million instructions, `matmul` unchanged. Reverted, with
-  the measurement in the comment.
-* **The tighter cell interval is not free.** It helps `statemachine`
-  (-4.6 %) and `bytecount` (-0.9 %) and costs `matmul` (+5.8 %) at
-  `release-fast`; over the eight measured programs the instruction total
-  moves by -0.16 %. It is kept because it removes a real conservatism (a
-  value does not live before it exists), not because it was a win.
+Two register allocation ideas were built, measured and **thrown away**. Both
+are still in the file as dead code with the measurement in the comment,
+because the next person will have the same idea.
+
+* **A promoted cell does not live from the start of the function.** A cell
+  had the interval `[0, last access]`; in `matmul`'s `main` that meant three
+  `alloc()` calls in the first ten instructions, so all nine cells "crossed
+  a call", all nine competed for the five callee-saved registers, and five
+  lost and went to the stack — among them the counters of the innermost loop
+  (`FIRN_RA_STATS=1`: `cellivs=9 cellslost=5`). `loop_ranges` /
+  `widen_to_loops` compute the honest interval instead: first access to last
+  access, widened over the enclosing loops (a variable in a loop is read
+  again after the back edge). It works — cells in registers 4 -> 6,
+  `cellslost` 5 -> 3 — and it buys nothing: `statemachine` -4.6 %,
+  `bytecount` -0.9 %, `matmul` **+5.8 %**, everything else identical to the
+  instruction, total -0.16 % over eight programs. More values in registers,
+  the same amount of work, one clear loser. Reverted, so that `release-fast`
+  comes out of this round bit-identical.
+* **Cells first into the callee-saved pool.** A cell lives long, and the
+  four temp registers are what the short lived values around it have.
+  Measured: `statemachine` 691.2 -> 699.6 million instructions, `matmul`
+  unchanged. Reverted.
+
+The lesson both times: a register allocation change that reads well and
+measures at zero is still a change. A round about a wrong-code bug is the
+worst possible place to carry one.
 
 ---
 
 ## 4. Where Firn is still behind, and why
 
 Measured, not guessed. `bench/firn/matmul.fi`, `release-fast`, the innermost
-loop, next to `rustc -O` on the same source:
+loop:
 
 ```
 mov r10d, r13d                    ; s
@@ -277,7 +310,9 @@ imul rdx, r15, 240                ; k*n   -- no strength reduction
 ...
 ```
 
-Three named causes, in the order of what they cost:
+**The code generator**, median 1.81x behind `rustc -O` over the eleven
+programs (range 1.07x – 2.84x). Three named causes, in the order of what
+they cost:
 
 1. **Loop counters live in memory in FIR.** `mem2reg` promotes only cells
    written once, FIR has no phi nodes, and `regalloc.rs` promotes cells to
@@ -288,14 +323,23 @@ Three named causes, in the order of what they cost:
    architectural one: real SSA with phis, or cell promotion moved in front
    of the optimiser.
 2. **The allocator does not split intervals.** A value that crosses a call
-   is on the stack for its *whole* life, not just across the call. `matmul`'s
-   `main`: 88 values in registers, 87 on the stack, `maxlive=15` against
-   twelve registers.
+   is on the stack for its *whole* life, not just across the call.
+   `matmul`'s `main`: 88 values in registers, 87 on the stack, `maxlive=15`
+   against twelve registers.
 3. **No auto-vectorisation.** `rustc` turns `matmul`'s inner loop into SSE;
    Firn does not vectorise at all. `lib/std` uses the vector instructions by
    hand where it matters (round 82), the code generator never on its own.
 
----
+**The checks**, median 1.19x (was 1.97x), worst `matmul` at 3.04x. The
+reason is no longer the check — round 90 made the check itself as cheap as
+x86 allows: one instruction and one not-taken forward branch. The reason is
+that **LLVM proves most of its checks away and Firn proves none of them
+away**. `i + 1` inside `while i < 240` is still a full checked addition in
+Firn, and it cannot be anything else until Firn has a range analysis. That
+is the next round's work, and it is the one that turns "fast AND safe" from
+nearly true into true — and it wants item 1 above first, because the fact
+that would prove the check redundant lives in the loop guard, and the loop
+counter is in memory.
 
 ## 5. Acceptance
 
