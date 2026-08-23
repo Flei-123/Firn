@@ -69,9 +69,17 @@ def kommentarzeilen(pfad):
 # keine Prosa. `erst` in einem Satz ueber alte Namen ist kein deutscher Satz.
 CODESPAN = re.compile(r'`[^`]*`')
 
+# Runde 88: EIGENNAMEN, die zufaellig wie ein deutsches Funktionswort
+# aussehen. `MIT` ist der Name der Lizenz, nicht die Praeposition `mit` --
+# und weil RE_WORT ohne Ruecksicht auf Gross- und Kleinschreibung sucht,
+# meldete `MIT -- see [LICENSE](LICENSE)` eine deutsche Zeile. Die Liste
+# wird GROSS/KLEIN GENAU angewendet: `mit` faellt weiter auf.
+NAMEN = re.compile(r'\b(?:MIT)\b')
+
 
 def deutsch(zeilen):
-    return [(i, z) for i, z in zeilen if RE_WORT.search(CODESPAN.sub(' ', z))]
+    return [(i, z) for i, z in zeilen
+            if RE_WORT.search(NAMEN.sub(' ', CODESPAN.sub(' ', z)))]
 
 
 def bereich(pfad):
