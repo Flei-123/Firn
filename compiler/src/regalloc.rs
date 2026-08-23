@@ -942,6 +942,10 @@ struct Iv {
     /// (round 90; see `inst_clobbers`). A register may be handed to the
     /// value exactly when its bit is NOT in here.
     killed: RegMask,
+    /// ROUND 90 — is this a promoted `alloca` cell? Only measured with, not
+    /// acted on: see the note at the hand-out below.
+    #[allow(dead_code)]
+    is_cell: bool,
 }
 
 /// Loop depth per block (approximation: back edge u->v with v <= u spans
@@ -965,6 +969,70 @@ fn loop_depth(f: &Func) -> Vec<u32> {
         }
     }
     depth
+}
+
+/// The instruction ranges of the loops (round 90). A back edge `u -> v` with
+/// `v <= u` makes every position from the start of block `v` to the end of
+/// block `u` part of one loop.
+///
+/// It exists for the promoted cells. A cell holds a variable, and a variable
+/// in a loop is read again AFTER the back edge: its register has to survive
+/// the whole loop, not just the stretch between its first and its last
+/// access. Until round 90 that was answered by giving every cell the
+/// interval `[0, last access]` -- which covers every loop that starts after
+/// the beginning of the function, and covers it at the price of ALSO
+/// crossing everything that happens before the cell is ever touched.
+///
+/// In `bench/firn/matmul.fi` that was three calls to `alloc()` in the first
+/// ten instructions of `main`. Nine cells, all of them "crossing a call"
+/// because of those three, all nine competing for the five callee-saved
+/// registers -- five of them lost and went to the stack, among them the
+/// counters of the innermost loop. Measured with `FIRN_RA_STATS=1`:
+/// `cellivs=9 cellslost=5`.
+fn loop_ranges(f: &Func, block_start: &[usize], block_end: &[usize]) -> Vec<(usize, usize)> {
+    let nb = f.blocks.len();
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    for (u, b) in f.blocks.iter().enumerate() {
+        for sbb in b.term.successors() {
+            let v = sbb as usize;
+            if v <= u && v < nb {
+                out.push((block_start[v], block_end[u]));
+            }
+        }
+    }
+    out
+}
+
+/// Widens `[s, e]` until it contains every loop it touches, or gives up.
+///
+/// Monotone: `s` only falls, `e` only rises, both bounded by the function,
+/// and a pass that changes nothing is the fixpoint. A pass that DOES change
+/// something has absorbed at least one range, so `loops.len() + 1` passes
+/// are enough -- and if that is somehow not enough, the answer is `None` and
+/// the caller falls back to the interval that was always safe (`[0, last
+/// access]`). Never a half widened range: that would be a wrong-code bug of
+/// exactly the kind this round exists to stop making.
+fn widen_to_loops(mut s: usize, mut e: usize, loops: &[(usize, usize)]) -> Option<(usize, usize)> {
+    for _ in 0..=loops.len() {
+        let mut changed = false;
+        for &(ls, le) in loops {
+            // ranges that OVERLAP the interval pull it out to their own ends
+            if ls <= e && s <= le {
+                if ls < s {
+                    s = ls;
+                    changed = true;
+                }
+                if le > e {
+                    e = le;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            return Some((s, e));
+        }
+    }
+    None
 }
 
 /// Carries out the complete allocation.
@@ -1138,17 +1206,47 @@ pub fn allocate(f: &Func) -> Alloc {
                 st.cross_call_exact += 1;
             }
         }
-        ivs.push(Iv { val: v as Val, start: s, end: e, weight: weight[v], killed });
+        ivs.push(Iv { val: v as Val, start: s, end: e, weight: weight[v], killed, is_cell: false });
     }
+    // ROUND 90: where is a cell really touched? `start[cv]` is the position
+    // of the `alloca` itself, which stands at the top of the function and
+    // says nothing; what counts is the first and the last LOAD or STORE
+    // through it.
+    let mut cell_first: HashMap<Val, usize> = HashMap::new();
+    let mut cell_last: HashMap<Val, usize> = HashMap::new();
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for (ii, i) in b.insts.iter().enumerate() {
+            let addr = match &i.op {
+                Op::Load { addr } => *addr,
+                Op::Store { addr, .. } => *addr,
+                _ => continue,
+            };
+            if !cells.contains_key(&addr) {
+                continue;
+            }
+            let p = live.pos[bi][ii];
+            cell_first.entry(addr).and_modify(|x| *x = (*x).min(p)).or_insert(p);
+            cell_last.entry(addr).and_modify(|x| *x = (*x).max(p)).or_insert(p);
+        }
+    }
+    let loops = loop_ranges(f, &live.block_start, &live.block_end);
     for (&c, _) in cells.iter() {
         let cv = c as usize;
         if start[cv] == usize::MAX {
             continue;
         }
-        // The cell has to sit in the register from the start of the function
-        // to the last access (its content survives blocks without access).
-        let s = 0usize;
-        let e = end[cv];
+        // The cell has to sit in the register from its first access to its
+        // last -- and, because a variable in a loop is read again after the
+        // back edge, over every loop those accesses lie in. That is strictly
+        // more than the accesses and strictly less than "from position 0",
+        // and it is the whole point of `loop_ranges` above.
+        let widened = match (cell_first.get(&c), cell_last.get(&c)) {
+            (Some(&a), Some(&b)) => widen_to_loops(a, b, &loops),
+            _ => None,
+        };
+        // The fallback is the interval of every round before this one.
+        let (s, e) = widened.unwrap_or((0usize, end[cv]));
+        let e = e.max(end[cv]);
         let killed = rough(s, e);
         // Cells are almost always the hottest values: double the weight.
         // (Round 87: they are counted apart. A cell has to survive from the
@@ -1163,6 +1261,7 @@ pub fn allocate(f: &Func) -> Alloc {
             end: e,
             weight: weight[cv].saturating_mul(2).max(1),
             killed,
+            is_cell: true,
         });
     }
     ivs.sort_by_key(|i| (i.start, i.end, i.val));
@@ -1269,6 +1368,13 @@ pub fn allocate(f: &Func) -> Alloc {
         let take = |pool: &mut Vec<&'static str>| -> Option<&'static str> {
             pool.iter().rposition(|r| fits(&iv, r)).map(|k| pool.remove(k))
         };
+        // MEASURED, round 90: letting a cell ask the callee-saved pool FIRST
+        // (it lives long, and the four temp registers are what the short
+        // lived values around it have) reads well and does nothing --
+        // statemachine 691.2 -> 699.6 million instructions, matmul unchanged
+        // (tools/bench90/icount.py). So the order stays one order for
+        // everybody: the cheap registers first, the ones that cost a push
+        // and a pop last.
         let pick = take(&mut free_temp)
             .or_else(|| take(&mut free_div))
             .or_else(|| take(&mut free_arg))
@@ -2942,6 +3048,10 @@ fn emit_inst(
         // one may be folded into an address computation).
         Op::CheckedBin { op, a, b, msg } => {
             let d = i.dst.ok_or("internal error: checked binary operation without target")?;
+            // ROUND 90, stage 2d -- the DIRECT form. See `checked_direct`.
+            if checked_direct(e, ra, *op, ty, *a, *b, d, msg, site) {
+                return Ok(());
+            }
             ra.load_ext(e, "rax", *a, ty, 64);
             ra.load_ext(e, "rcx", *b, ty, 64);
             crate::panic_rt::emit_checked_bin(e, *op, ty, msg, site, &|e: &mut Emitter| {
@@ -3655,6 +3765,101 @@ fn emit_bin(
         }
     }
     Ok(())
+}
+
+/// **ROUND 90, STAGE 2d** — a checked `+` or `-` computed IN THE TARGET
+/// REGISTER, with the second operand as an immediate or a memory operand.
+///
+/// The unchecked path has done this since round 51 (`emit_bin` below): if
+/// the result has a register, `add r13, 1` is the whole instruction. The
+/// checked path did not — it loaded BOTH operands into rax/rcx first,
+/// because the failure arm has to print them and `panic_rt` was written
+/// around that pair of registers. So `k = k + 1` inside a loop cost
+///
+///     mov rax, r12 / mov rcx, 1 / add rax, rcx / jc site / mov r12, rax
+///
+/// where `release-fast` needs `lea r12, [r12+1]`. Four instructions of
+/// difference on the counter of every loop in the program, and nothing in
+/// them was the check.
+///
+/// This is the same shape as the unchecked one plus the branch:
+///
+///     add r12, 1 / jc site
+///
+/// The failure arm cannot reload `a` any more when `a` lived in the target
+/// register — it has just been overwritten. It does not have to: for `+`
+/// the original is `d - b`, for `-` it is `d + b`, both exact in two's
+/// complement at the width the operation was carried out in. The arm
+/// recomputes it, out of line, on the path that never returns.
+///
+/// Returns `false` when the shape does not fit (no target register, the
+/// second operand living in the target register, a multiplication); the
+/// caller then emits the rax/rcx form exactly as before.
+#[allow(clippy::too_many_arguments)]
+fn checked_direct(
+    e: &mut Emitter,
+    ra: &Ra,
+    op: BinOp,
+    ty: FTy,
+    a: Val,
+    b: Val,
+    d: Val,
+    msg: &str,
+    site: &mut crate::panic_rt::SiteCounter,
+) -> bool {
+    if !matches!(op, BinOp::Add | BinOp::Sub) {
+        return false;
+    }
+    if std::env::var_os("FIRN_NO_CHECKED_DIRECT").is_some() {
+        return false;
+    }
+    let dr = match ra.a.loc(d) {
+        Loc::Reg(r) => r,
+        Loc::Slot(_) => return false,
+    };
+    // The second operand may not live where the result is about to be
+    // written: `add r12, r12` would read the half finished value, and the
+    // failure arm could not reload it either.
+    if matches!(ra.a.place(b), Loc::Reg(r) if r == dr) {
+        return false;
+    }
+    let bits = ty.bits().max(8);
+    let ob = ra.opnd_w(b, bits);
+    if ob == rn(dr, bits) {
+        return false;
+    }
+    // An immediate wider than 32 bits has no `add r64, imm` form.
+    if let Some(k) = ra.a.imm(b) {
+        if i32::try_from(k).is_err() {
+            return false;
+        }
+    }
+    ra.load_ext(e, dr, a, ty, bits);
+    let m = if op == BinOp::Add { "add" } else { "sub" };
+    e.line(&format!("{} {}, {}", m, rn(dr, bits), ob));
+    crate::panic_rt::emit_checked_tail(e, op, ty, msg, site, &|e: &mut Emitter| {
+        // rcx first: `b` still lives where it did, the operation touched
+        // only `dr`.
+        ra.load_ext(e, "rcx", b, ty, 64);
+        // and `a` back out of the result -- the one thing the stack rescue
+        // of round 72 was really for.
+        e.line(&format!("mov rdx, {}", dr));
+        let inv = if op == BinOp::Add { "sub" } else { "add" };
+        e.line(&format!("{} {}, {}", inv, rn("rdx", bits), rn("rcx", bits)));
+        if bits < 64 {
+            if bits == 32 {
+                if ty.signed() {
+                    e.line("movsxd rdx, edx");
+                } else {
+                    e.line("mov edx, edx");
+                }
+            } else {
+                let ext = if ty.signed() { "movsx" } else { "movzx" };
+                e.line(&format!("{} rdx, {}", ext, rn("rdx", bits)));
+            }
+        }
+    });
+    true
 }
 
 /// **ROUND 72** -- `+% -% *%` (wrapping) and `+| -| *|` (saturating), SPEC
