@@ -310,14 +310,23 @@ PASS 31/31 first-run checks
 
 ## Acceptance of the round
 
-* `./test.sh` — `FAIL 2/1204`, and both are the SAME INHERITED case, not
-  this round: `tools/aarch64/run.sh` (section 43) in its two build stages.
+* `./test.sh` — the run came back `FAIL 3/1204`. Two of the three are the
+  SAME INHERITED case, not this round: `tools/aarch64/run.sh` (section 43)
+  in its two build stages.
   `tests/1613_crypto.fi` has not compiled for aarch64 since the r80/r82
   merge — `--target=aarch64-linux cannot emit the vector instruction
   CpuFeatures yet`; round 82 built the intrinsics for x86-64 only. It was
   established against `main` while round 86 was running and is written down
   in the README and in `docs/BENCHMARKS.md` (296 of 301, 1 differing). It is
   named here rather than filtered out.
+
+  The third was THIS REPORT: it quoted the German program and the German
+  message of round 87 inside fenced blocks, and `check_comments.py` counts
+  every line of a `.md` file as prose — nine German lines, section 21 red.
+  The quotes now stand in backticks, which the check treats as code, and
+  `tools/english/check.sh` was run again on its own: five zeros. No compiler
+  and no library file changed in between.
+
   Everything else green, including the new section 46.
 * `tools/fixpoint.sh` — stage 2 == stage 3, character for character
   (650,711 lines of assembly), and `.firnc2` behaves like `firnc0` over the
