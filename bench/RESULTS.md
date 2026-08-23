@@ -1,6 +1,7 @@
 # Benchmark results (really measured)
 
-Produced by `bench/run.sh` (`bench/bench.py`), 5 runs per program, **median**.
+Produced by `bench/run.sh` (`bench/bench.py`), **median** of the runs per
+program (`BENCH_RUNS=9` for the round 86 table below).
 Every benchmark exists twice -- `bench/firn/<name>.fi` and `bench/rust/<name>.rs` -- and both print their result; the outputs have to match, otherwise the measurement stops.
 The Rust side uses `std::hint::black_box` and the same unchecked pointer accesses as the Firn side, so that the same work is measured.
 
@@ -8,6 +9,29 @@ The Rust side uses `std::hint::black_box` and the same unchecked pointer accesse
 * system: Linux 7.0.14-5-pve x86_64
 * rustc 1.99.0-nightly (c98d0cb27 2026-08-12)
 * Firn: its own code generator, no external crates
+
+## Round 86 (23.08.2026), 9 runs per program, two independent passes
+
+Re-measured after the optimiser work of rounds 51 and 82 and the register
+allocation. Both passes are printed, because the Rust side scatters (see the
+note further down); the honest statement is the pair, not one of them.
+
+| benchmark | Firn (pass 1) | Firn (pass 2) | Rust `-O` (1 / 2) | factor Firn/Rust (1 / 2) | gain through the optimiser (1) | result |
+|---|---:|---:|---:|---:|---:|---:|
+| fib | 0.044 s | 0.047 s | 0.029 / 0.032 s | **1.52x / 1.47x** | 2.99x | 4356618 |
+| sieve | 0.125 s | 0.118 s | 0.030 / 0.031 s | **4.16x / 3.76x** | 10.78x | 697026 |
+| matmul | 0.067 s | 0.070 s | 0.023 / 0.026 s | **2.90x / 2.74x** | 30.29x | 8291727 |
+| bytecount | 0.296 s | 0.334 s | 0.207 / 0.177 s | **1.43x / 1.89x** | 18.94x | 1604208 |
+| bubblesort | 0.090 s | 0.093 s | 0.041 / 0.037 s | **2.17x / 2.50x** | 16.88x | 12021846167 |
+| statemachine | 0.189 s | 0.158 s | 0.095 / 0.091 s | **1.99x / 1.74x** | 7.47x | 6710880 |
+
+Median over all benchmarks: **2.08x** (pass 1) and **2.19x** (pass 2) slower
+than Rust `-O`; range over both passes **1.43x - 4.16x**. The target of
+`<= 2x` is therefore **still missed, but only just** -- three of the six
+programs are inside it, `sieve` is the outlier that carries the median.
+The optimiser brings **13.8x** in the median compared with `--no-opt`.
+
+## Round 5 (14.08.2026), 5 runs per program -- the state this replaced
 
 | benchmark | Firn | Firn `--no-opt` | Rust `-O` | factor Firn/Rust | gain through the optimiser | result |
 |---|---:|---:|---:|---:|---:|---:|
@@ -19,7 +43,6 @@ The Rust side uses `std::hint::black_box` and the same unchecked pointer accesse
 | statemachine | 0.253 s | 1.286 s | 0.085 s | **3.00x** | 5.08x | 6710880 |
 
 Median over all benchmarks: **2.82x** slower than Rust `-O` (range 1.75x - 4.48x).
-The optimiser (mem2reg, CSE, inlining, register allocation) brings **11.57x** in the median compared with `--no-opt`.
 
 ---
 
