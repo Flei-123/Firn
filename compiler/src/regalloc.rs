@@ -401,6 +401,34 @@ impl Bits {
     }
 }
 
+/// `__cpu_features()` -- ROUND 87, A BUG OF ROUND 82.
+///
+/// `unsupported_basic` lets three vector instructions through to this
+/// allocating path, among them `__cpu_features()`. Its `cpuid` sequence in
+/// `simd.rs` writes `r9`, `r10` and `r11` and says so in its own comment:
+/// "carry no value ON THE BASE PATH of the code generator". On THIS path
+/// they do -- all three are `TEMP_REGS`.
+///
+/// Found in tests/1613_crypto.fi: `sha256_new` held the address of its
+/// `accel` flag in `r9` across the sequence, `xor r9d, r9d` erased it, and
+/// the write afterwards went to address 0. The bug is older than this round;
+/// the exact crossing question merely made it happen every time instead of
+/// depending on the day. Values that survive the sequence therefore count as
+/// surviving a call, and only the callee-saved registers remain -- `rbx` is
+/// pushed and popped by the sequence itself.
+fn is_cpuid(op: &Op) -> bool {
+    matches!(op, Op::Simd { kind: crate::simd::SimdKind::CpuFeatures, .. })
+}
+
+/// An operand that an instruction fetches into a fixed register while
+/// another fixed register is already occupied -- see the long note in
+/// `exact_crossings`.
+fn pin(b: &mut Bits, v: Val, nv: usize) {
+    if (v as usize) < nv {
+        b.set(v as usize);
+    }
+}
+
 /// For every value: does it really survive a `call` / a `copymem` / a
 /// `div`-`select`-`cmpxchg`? Exact, along the control flow.
 fn exact_crossings(f: &Func, live: &Live) -> (Bits, Bits, Bits) {
@@ -430,7 +458,7 @@ fn exact_crossings(f: &Func, live: &Live) -> (Bits, Bits, Bits) {
             let is_call = matches!(
                 i.op,
                 Op::Call { .. } | Op::CallIndirect { .. } | Op::Syscall { .. } | Op::ThreadSpawn { .. }
-            );
+            ) || is_cpuid(&i.op);
             let is_mem = matches!(i.op, Op::CopyMem { .. } | Op::SecureZero { .. });
             let is_dv = matches!(
                 i.op,
@@ -462,6 +490,64 @@ fn exact_crossings(f: &Func, live: &Live) -> (Bits, Bits, Bits) {
                 if is_dv {
                     cd.or_and(&cur, &after);
                 }
+            }
+            // THE OTHER HALF, and it cost a segmentation fault to find:
+            // "does not survive the instruction" is not the same as "may
+            // stand in any register at it". A few instructions fetch their
+            // operands into FIXED registers ONE AFTER THE OTHER, and the
+            // second fetch then overwrites the home of the first operand.
+            //
+            //   call rax          the target is loaded LAST, after rdi..r9
+            //                     have been set -- a target living in `rdi`
+            //                     is gone by then (measured: tests/1402
+            //                     jumped to 0x10, `core__alloc`).
+            //   syscall           the number goes into rax last, likewise.
+            //   rep movsb         rdi, then rsi: a source living in `rdi` is
+            //                     overwritten by the destination.
+            //   cmov / cmpxchg    rdx is written before the other two
+            //                     operands are read.
+            //
+            // Until this round the interval question hid all of that: an
+            // operand's interval ENDS at the instruction, so it counted as
+            // crossing it anyway. The exact question sees it die there and
+            // would hand it exactly the register that is about to be
+            // overwritten. So these operands are pinned by hand.
+            //
+            // Deliberately NOT in the list: the arguments of a normal `call`
+            // and of a `syscall`. Those go through `parallel_reg_moves`,
+            // which resolves any permutation and breaks cycles over `rax` --
+            // and they are the big group, several thousand values.
+            match &i.op {
+                Op::CallIndirect { target, .. } => pin(&mut cc, *target, nv),
+                Op::Syscall { args } => {
+                    if let Some(a0) = args.first() {
+                        pin(&mut cc, *a0, nv);
+                    }
+                }
+                Op::ThreadSpawn { arg, stack, ctid } => {
+                    pin(&mut cc, *arg, nv);
+                    pin(&mut cc, *stack, nv);
+                    pin(&mut cc, *ctid, nv);
+                }
+                Op::CopyMem { dst, src, .. } => {
+                    pin(&mut cm, *dst, nv);
+                    pin(&mut cm, *src, nv);
+                }
+                Op::SecureZero { addr, size } => {
+                    pin(&mut cm, *addr, nv);
+                    pin(&mut cm, *size, nv);
+                }
+                Op::Select { cond, a, b } => {
+                    pin(&mut cd, *cond, nv);
+                    pin(&mut cd, *a, nv);
+                    pin(&mut cd, *b, nv);
+                }
+                Op::AtomicCas { addr, erw, new } => {
+                    pin(&mut cd, *addr, nv);
+                    pin(&mut cd, *erw, nv);
+                    pin(&mut cd, *new, nv);
+                }
+                _ => {}
             }
         }
     }
@@ -731,7 +817,16 @@ pub fn allocate(f: &Func) -> Alloc {
     // ROUND 87: the cause distribution, only when it is asked for.
     let mut st = RaStats::default();
     let want_stats = std::env::var_os("FIRN_RA_STATS").is_some();
-    let exact = if want_stats && live.converged {
+    // ROUND 87, STAGE 2 -- the exact crossings are no longer just a
+    // measurement, they are the answer the allocator works with.
+    //
+    // Only when the data flow reached its fixed point: below the round limit
+    // of `compute_live` the live sets may be TOO SMALL, and a value that is
+    // wrongly thought not to survive a call would get `r10` and be destroyed
+    // by that call. Then the conservative interval question stands again,
+    // exactly as before this round. `FIRN_RA_ROUGH=1` forces that state for
+    // troubleshooting.
+    let exact = if live.converged && std::env::var_os("FIRN_RA_ROUGH").is_none() {
         Some(exact_crossings(f, &live))
     } else {
         None
@@ -750,7 +845,9 @@ pub fn allocate(f: &Func) -> Alloc {
     let mut divsel_pos: Vec<usize> = Vec::new();
     for (bi, b) in f.blocks.iter().enumerate() {
         for (ii, i) in b.insts.iter().enumerate() {
-            if matches!(i.op, Op::Call { .. } | Op::CallIndirect { .. } | Op::Syscall { .. } | Op::ThreadSpawn { .. }) {
+            if matches!(i.op, Op::Call { .. } | Op::CallIndirect { .. } | Op::Syscall { .. } | Op::ThreadSpawn { .. })
+                || is_cpuid(&i.op)
+            {
                 call_pos.push(live.pos[bi][ii]);
             }
             if matches!(i.op, Op::CopyMem { .. } | Op::SecureZero { .. }) {
@@ -842,18 +939,22 @@ pub fn allocate(f: &Func) -> Alloc {
         // Values whose place IS the memory (alloca addresses) may get a
         // register; their content keeps lying in the frame.
         let (s, e) = (start[v], end[v]);
-        let cc = call_pos.iter().any(|&p| s <= p && p <= e);
-        let cm = memop_pos.iter().any(|&p| s <= p && p <= e);
-        let cd = divsel_pos.iter().any(|&p| s <= p && p <= e);
+        let rough_cc = call_pos.iter().any(|&p| s <= p && p <= e);
+        let rough_cm = memop_pos.iter().any(|&p| s <= p && p <= e);
+        let rough_cd = divsel_pos.iter().any(|&p| s <= p && p <= e);
+        // The exact answer where it exists, the interval answer otherwise.
+        // Both are safe; the exact one is only narrower.
+        let (cc, cm, cd) = match &exact {
+            Some((xc, xm, xd)) => (xc.get(v), xm.get(v), xd.get(v)),
+            None => (rough_cc, rough_cm, rough_cd),
+        };
         if want_stats {
             st.ivs += 1;
-            if cc {
+            if rough_cc {
                 st.cross_call += 1;
             }
-            if let Some((xc, _, _)) = &exact {
-                if xc.get(v) {
-                    st.cross_call_exact += 1;
-                }
+            if cc {
+                st.cross_call_exact += 1;
             }
         }
         ivs.push(Iv {
