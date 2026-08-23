@@ -770,11 +770,10 @@ var m: [u8; 48] = [
 ```
 
 And this is what the very same message looks like now -- one line instead of
-six rows of octets (the message text itself is still the German one that
-`lib/gc/gc.fi` prints):
+six rows of octets:
 
 ```firn
-var m: [u8; 42] = "firn-gc: gc_init() ..."
+var m: [u8; 34] = "firn-gc: gc_init() ..."
 ```
 
 **Three forms**, all with complete escapes (`\n`, `\t`, `\\`, `\0`,
