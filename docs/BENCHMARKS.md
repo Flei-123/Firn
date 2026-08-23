@@ -162,14 +162,25 @@ The official TC39 suite, **63,364 cases, nothing filtered out**.
 The same Firn program compiled for x86-64 **and** for aarch64, both **run**,
 the standard output compared character for character.
 
+**Re-measured on 2026-08-23** (round 86). The corpus grew to 302 cases since
+the table below was first written, and **one case now differs**: since the
+r80/r82 merge, `tests/1613_crypto.fi` cannot be compiled for aarch64 at all --
+`--target=aarch64-linux cannot emit the vector instruction CpuFeatures yet`.
+Round 82 built the vector instructions for x86-64 only, and the aarch64
+emitter says so instead of producing wrong code. It makes
+`bash tools/aarch64/run.sh` **fail**, in both build stages.
+
 | | optimised | unoptimised |
 |---|---:|---:|
-| **identical output** | **290 of 294 (98 %)** | **290 of 294 (98 %)** |
-| differing | **0** | **0** |
+| **identical output** | **296 of 301 (98 %)** | **296 of 301 (98 %)** |
+| **differing** | **1** (`tests/1613_crypto.fi`, see above) | **1** |
 | not supported (inline x86 assembler) | 4 | 4 |
 | environment (proven with a C probe) | 1 | 1 |
 
     bash tools/aarch64/run.sh
+
+Earlier state, round 80: 290 of 294 identical, **0** differing -- at that point
+the crypto case was not yet in the corpus.
 
 ## 11. The acceptance as a whole
 
