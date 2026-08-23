@@ -55,6 +55,7 @@ mod regalloc;
 mod sema;
 mod simd;
 mod sizeof;
+mod statics;
 mod sema_generic;
 mod sema_match;
 mod peephole;
@@ -395,6 +396,9 @@ fn run(opts: &Options) -> i32 {
     // Round 49: the marker "runtime included" belongs to the start of a
     // compilation (codegen_x86::emit prints the state block afterwards).
     crate::gc::runtime_reset();
+    // ROUND 89: the table of global variables belongs to ONE compilation
+    // (statics.rs), like the panic message table of round 72.
+    crate::statics::reset();
     // ROUND 72 (SPEC section 13, item L9): does THIS build level check
     // integer arithmetic? Set once, read by `lower.rs` for every "+ - * /"
     // and narrowing "as".
@@ -831,7 +835,24 @@ fn assemble(asm: &Path, obj: &Path) -> Result<(), i32> {
 fn assemble_and_link(asm: &Path, obj: &Path, out: &Path) -> Result<(), i32> {
     let t = target::active();
     assemble(asm, obj)?;
-    let st = Command::new(t.linker()).arg("-n").arg("-o").arg(out).arg(obj).status();
+    // `-n` (`--nmagic`) switches OFF the page alignment of the sections and
+    // puts everything into ONE loadable segment. That was free as long as
+    // a Firn program had nothing but `.text` and `.rodata`: one segment,
+    // read + execute, smaller image.
+    //
+    // ROUND 89 ends that for programs with a `static`. A writable `.data`
+    // in the same segment makes the WHOLE segment writable AND executable
+    // -- `ld` says so out loud ("LOAD segment with RWX permissions"), and
+    // worse, it would make the `.rodata` of an immutable `static`
+    // writable, which is exactly the guarantee the missing `mut` is
+    // supposed to buy. So: a program with a global variable is linked with
+    // page aligned segments, everything else stays bit for bit what it was
+    // (`tools/repro`).
+    let mut cmd = Command::new(t.linker());
+    if !crate::statics::any() {
+        cmd.arg("-n");
+    }
+    let st = cmd.arg("-o").arg(out).arg(obj).status();
     match st {
         Ok(s) if s.success() => Ok(()),
         Ok(s) => {

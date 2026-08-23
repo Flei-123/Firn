@@ -1051,6 +1051,7 @@ mod tests {
             funcs,
             structs: Vec::new(),
             consts: Vec::new(),
+            statics: Vec::new(),
             comptime_blocks: Vec::new(),
             expr_count: n,
         }

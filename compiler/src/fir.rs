@@ -234,6 +234,16 @@ pub enum Op {
     /// this for a conversion that cannot lose a value). Panics when `src`,
     /// read back after the conversion, would not equal the original value.
     CheckedCast { src: Val, from: FTy, msg: String },
+    /// **ROUND 89** — the checked ARRAY INDEX (SPEC §13, `L9`). Hands the
+    /// index back unchanged when `idx < len` and panics otherwise, through
+    /// the same message path as the checked arithmetic. `len` is the length
+    /// of the array, known at compile time — a `*T` has no length and
+    /// therefore never grows one of these.
+    ///
+    /// The comparison is UNSIGNED, which is why one instead of two is
+    /// enough: an index is a `usize` (SPEC §14.1 item 2), so "below zero"
+    /// is not a state it can be in.
+    CheckedIdx { idx: Val, len: u64, msg: String },
     /// stack storage of the function (allowed in the entry block only)
     Alloca { size: u64, align: u64 },
     Load { addr: Val },
@@ -287,6 +297,11 @@ pub enum Op {
     /// in word 0 and sits in `.rodata`. This is how a named function
     /// becomes a value.
     FnRef { name: String },
+    /// **ROUND 89** — the ADDRESS of a global variable (`statics.rs`).
+    /// `name` is the `static` after module mangling; the place itself sits
+    /// in `.bss`, `.data` or `.rodata`. Pure and without operands, exactly
+    /// like `FnRef`: the address is a link time constant.
+    GlobalAddr { name: String },
     /// Address of the state block of the collector (SPEC §3.5, `gc.rs`).
     /// `regs = true`: rescue the callee-saved registers into the block first —
     /// only that makes the CONSERVATIVE register scan honest (SPEC §3.5.3).
@@ -356,7 +371,7 @@ impl Op {
             | Op::Alloca { .. }
             | Op::Select { .. } => true,
             // The address of a table in `.rodata` is a constant.
-            Op::VtabAddr { .. } | Op::FnRef { .. } => true,
+            Op::VtabAddr { .. } | Op::FnRef { .. } | Op::GlobalAddr { .. } => true,
             // ROUND 82: everything except the two memory instructions is a
             // pure register computation and may be removed when unused; CSE
             // may merge two of them. `__v128_load` reads memory and
@@ -369,7 +384,10 @@ impl Op {
             // an observable effect (SPEC §13, `L9`) — dead code elimination
             // must not remove it even when the result is unused, exactly as
             // `Syscall`/`Call` are never pure.
-            Op::CheckedBin { .. } | Op::CheckedDiv { .. } | Op::CheckedCast { .. } => false,
+            Op::CheckedBin { .. }
+            | Op::CheckedDiv { .. }
+            | Op::CheckedCast { .. }
+            | Op::CheckedIdx { .. } => false,
             Op::Store { .. }
             | Op::Call { .. }
             | Op::CallIndirect { .. }
@@ -402,6 +420,7 @@ impl Op {
             | Op::GcAddr { .. }
             | Op::VtabAddr { .. }
             | Op::FnRef { .. }
+            | Op::GlobalAddr { .. }
             | Op::ThreadSelf => {}
             Op::CallIndirect { target, args } => {
                 out.push(*target);
@@ -420,6 +439,7 @@ impl Op {
                 out.push(*b);
             }
             Op::CheckedCast { src, .. } => out.push(*src),
+            Op::CheckedIdx { idx, .. } => out.push(*idx),
             Op::Cmp { a, b, .. } => {
                 out.push(*a);
                 out.push(*b);
@@ -730,6 +750,9 @@ fn fmt_inst(i: &Inst) -> String {
         Op::CheckedCast { src, from, msg } => {
             format!("checked_cast.{}.{} %{} \"{}\"", from.name(), t, src, asm_escape(msg))
         }
+        Op::CheckedIdx { idx, len, msg } => {
+            format!("checked_idx.{} %{}, len={} \"{}\"", t, idx, len, asm_escape(msg))
+        }
         Op::Cmp { op, ty, a, b } => format!("cmp.{}.{} %{}, %{}", op.name(), ty.name(), a, b),
         Op::Un(op, a) => match op {
             UnOp::Neg => format!("neg.{} %{}", t, a),
@@ -746,6 +769,7 @@ fn fmt_inst(i: &Inst) -> String {
         }
         Op::VtabAddr { table } => format!("vtab.ptr @{}", table),
         Op::FnRef { name } => format!("fnref.ptr @{}", name),
+        Op::GlobalAddr { name } => format!("globaladdr.ptr @{}", name),
         Op::Syscall { args } => format!("syscall.{} {}", t, vlist(args)),
         Op::CopyMem { dst, src, size } => format!("copymem %{}, %{}, size={}", dst, src, size),
         Op::Select { cond, a, b } => format!("select.{} %{}, %{}, %{}", t, cond, a, b),
