@@ -1605,6 +1605,55 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// **ROUND 89** — `static NAME: T = value` / `static mut NAME: T = value`
+    /// (SPEC §14.1.statics). Same shape as `const_decl` right above, with
+    /// exactly one extra token; the difference is not in the syntax but in
+    /// what the back end does with it (a place in `.bss`/`.data`/`.rodata`
+    /// instead of a number folded into every use site).
+    fn static_decl(&mut self, prog: &mut Program) {
+        let start = self.bump(); // 'static'
+        let mutable = self.eat(&TokKind::KwMut);
+        let name = match self.ident("after 'static'") {
+            Some((n, _)) => n,
+            None => {
+                self.recovering = false;
+                self.sync_item();
+                return;
+            }
+        };
+        if !self.expect(TokKind::Colon, "after the name of a global variable") {
+            self.recovering = false;
+            self.sync_item();
+            return;
+        }
+        let ty = match self.parse_type() {
+            Some(t) => t,
+            None => {
+                self.recovering = false;
+                self.sync_item();
+                return;
+            }
+        };
+        if !self.expect(TokKind::Assign, "after the type of a global variable") {
+            self.recovering = false;
+            self.sync_item();
+            return;
+        }
+        let value = self.expr();
+        let broken = self.recovering;
+        self.end_stmt();
+        self.recovering = false;
+        if !broken {
+            prog.statics.push(crate::ast::StaticDecl {
+                name,
+                ty,
+                value,
+                mutable,
+                span: start,
+            });
+        }
+    }
+
     /// `import path.module`
     fn import_decl(&mut self, prog: &mut Program) {
         let start = self.bump(); // 'import'
@@ -1828,12 +1877,13 @@ impl<'a> Parser<'a> {
                 TokKind::KwFn | TokKind::KwExtern => self.fn_decl(&mut prog),
                 TokKind::KwStruct => self.struct_decl(&mut prog),
                 TokKind::KwConst => self.const_decl(&mut prog),
+                TokKind::KwStatic => self.static_decl(&mut prog),
                 TokKind::KwProfile => self.profile_decl(&mut prog),
                 TokKind::KwImport => self.import_decl(&mut prog),
                 TokKind::KwExport => self.export_decl(&mut prog),
                 other => {
                     let msg = format!(
-                        "expected 'fn', 'struct', 'const', 'comptime', 'import', 'export' or 'profile' at top level, found '{}'",
+                        "expected 'fn', 'struct', 'const', 'static', 'comptime', 'import', 'export' or 'profile' at top level, found '{}'",
                         other.text()
                     );
                     self.error_here(msg);

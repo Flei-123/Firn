@@ -400,6 +400,21 @@ pub struct StructDecl {
     pub attrs: Vec<Attr>,
 }
 
+/// **ROUND 89** — a global variable (SPEC §14.1.statics).
+///
+/// `static mut COUNT: u64 = 0` / `static TABLE: [u8; 256] = [...]`. The
+/// value must be evaluable at COMPILE TIME; there is no run time
+/// initialisation and therefore no initialisation order (`statics.rs`).
+#[derive(Clone, Debug)]
+pub struct StaticDecl {
+    pub name: String,
+    pub ty: TypeExpr,
+    pub value: Expr,
+    /// `static mut` — may be assigned to.
+    pub mutable: bool,
+    pub span: Span,
+}
+
 #[derive(Clone, Debug)]
 pub struct ConstDecl {
     pub name: String,
@@ -427,6 +442,8 @@ pub struct Program {
     pub funcs: Vec<FnDecl>,
     pub structs: Vec<StructDecl>,
     pub consts: Vec<ConstDecl>,
+    /// **ROUND 89** — `static` declarations of this file (`statics.rs`).
+    pub statics: Vec<StaticDecl>,
     /// `comptime { … }` at top level: runs BEFORE the type check and can
     /// produce source text through `emit_*` that the same run compiles
     /// (SPEC §6.4).

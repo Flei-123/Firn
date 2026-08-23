@@ -506,6 +506,13 @@ pub fn emit(m: &Module) -> Result<String, String> {
         e.raw(&crate::panic_rt::rodata_asm());
         e.raw(&crate::panic_rt_a64::trampoline_asm());
     }
+    // ROUND 89 (statics.rs): the data section of the global variables. The
+    // text is identical to the x86-64 one -- `.byte`/`.zero` in
+    // `.bss`/`.data`/`.rodata` say the same thing on both machines; only
+    // the two instructions that ADDRESS it differ (`Op::GlobalAddr`).
+    if crate::statics::any() {
+        e.raw(&crate::statics::data_asm());
+    }
     e.raw(".section .note.GNU-stack,\"\",%progbits");
     Ok(e.out)
 }
@@ -969,6 +976,18 @@ fn emit_inst(
             e.line(&format!("add {}, {}, :lo12:{}", A, A, l));
             store_dst(e, fr, d, A);
         }
+        // ROUND 89 (statics.rs): aarch64 has no rip-relative addressing
+        // mode — the address of a global is built out of a PAGE
+        // (`adrp`, +/-4 GiB, 4 KiB granular) and the offset inside that
+        // page (`add ..., :lo12:`). Two instructions, one address; the
+        // linker fills both relocations.
+        Op::GlobalAddr { name } => {
+            let d = i.dst.ok_or("internal error: globaladdr without target")?;
+            let l = crate::statics::label_of(name);
+            e.line(&format!("adrp {}, {}", A, l));
+            e.line(&format!("add {}, {}, :lo12:{}", A, A, l));
+            store_dst(e, fr, d, A);
+        }
         Op::Syscall { args } => emit_syscall(e, fr, i, args)?,
         Op::Select { cond, a, b } => {
             // Data independent choice: `csel`, never a branch (SPEC §9.2).
@@ -1096,6 +1115,15 @@ fn emit_inst(
             load_ext(e, fr, A, *a, ty, 64);
             load_ext(e, fr, B, *b, ty, 64);
             crate::panic_rt_a64::emit_checked_div(e, *op, ty, msg_zero, msg_range, site);
+            store_dst(e, fr, d, A);
+        }
+        // ROUND 89 -- the checked ARRAY INDEX (SPEC section 13, item L9).
+        // The index is a `usize`, so ONE unsigned comparison against the
+        // length decides both ends at once.
+        Op::CheckedIdx { idx, len, msg } => {
+            let d = i.dst.ok_or("internal error: checked index without target")?;
+            load_ext(e, fr, A, *idx, ty, 64);
+            crate::panic_rt_a64::emit_checked_idx(e, *len, msg, site);
             store_dst(e, fr, d, A);
         }
         Op::CheckedCast { src, from, msg } => {

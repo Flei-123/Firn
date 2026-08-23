@@ -99,6 +99,13 @@ pub const ATTRS: &[AttrInfo] = &[
         what: "the address of a local may leave this frame (SPEC 3.6, round 79)",
     },
     AttrInfo {
+        name: "panic_handler",
+        target: Target::Func,
+        args: 0,
+        implemented: true,
+        what: "this function ends every panic: fn(msg: *u8, len: u64, a: i64, b: i64, code: u64) (SPEC 13, round 89)",
+    },
+    AttrInfo {
         name: "allow_fp",
         target: Target::Both,
         args: 0,
@@ -259,6 +266,8 @@ mod tests {
         // Round 52: plus #[interrupt] and #[allow_fp] (SPEC 2, core.rs/prof.rs).
         // Round 79: plus #[allow_escape] -- the way out of the escape analysis
         // (escape.rs, docs/ROUND79.md 3).
+        // Round 89: plus #[panic_handler] -- the program's own ending for
+        // every run time abort (SPEC 13, panic_rt.rs, docs/ROUND89.md).
         let u: Vec<&str> = ATTRS.iter().filter(|a| a.implemented).map(|a| a.name).collect();
         assert_eq!(
             u,
@@ -269,6 +278,7 @@ mod tests {
                 "link_name",
                 "export_c",
                 "allow_escape",
+                "panic_handler",
                 "allow_fp"
             ]
         );
