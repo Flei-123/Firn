@@ -630,6 +630,12 @@ let greeting: str = text + "!"   // + concatenates
 * **`str` and `Span` may be used for each other** -- same two words, same ABI.
   That is why the whole library of 8.1 works on a `str` without a conversion
   function: `s.trim()`, `s.length()`, `s.starts_with(...)`, `s.find(...)`.
+  **Since round 88 that holds for the METHODS as well:** where `Type__method`
+  finds nothing, the method resolution asks the layout compatible views --
+  every one of the 22 methods of `impl Span` (`part`, `ab`, `to`, `find_back`,
+  `utf8_part`, ...) is reachable on a `str`. Up to round 87 only those
+  resolved for which the module `str` happened to have a FREE function of the
+  same name; that was an accident of the naming scheme, not a rule.
 * **Who owns the octets:**
 
   | origin | storage | freed by |
@@ -644,8 +650,15 @@ let greeting: str = text + "!"   // + concatenates
 * **`+` allocates and therefore needs the collector.** A program that works
   with `str` pulls the collector runtime in automatically; the signal is read
   off the tokens -- the type name `str`, or a text literal next to `+`, `==`,
-  `!=`. Before the first concatenation `gc_init()` has to have run, exactly
-  like for every other allocation (3.5).
+  `!=`. **Since round 88 the compiler also writes the setup:** where it links
+  the runtime in, `gc_init()` stands as the first instruction of the process,
+  in `_start`, before the first instruction of the user, exactly once. Nobody
+  has to call it any more to join two pieces of text.
+
+  An explicit `gc_init()` in the source text keeps working and sets up
+  nothing a second time (it is idempotent); `gc_set_max_bytes` afterwards
+  keeps working too. Under the profile `kernel` nothing of this arises --
+  there is no `_start` there and no collector (2).
 
 #### The literal -- and why nothing breaks
 
