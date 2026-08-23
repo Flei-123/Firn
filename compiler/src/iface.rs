@@ -1351,7 +1351,7 @@ pub(crate) fn tables_asm() -> String {
         return out;
     }
     let _ = writeln!(out, ".section .rodata");
-    let _ = writeln!(out, ".align 8");
+    let _ = writeln!(out, "{}", crate::target::align(8));
     for (key, targets) in tables {
         let _ = writeln!(out, "{}{}:", TABLE_LABEL, key);
         for z in targets {
