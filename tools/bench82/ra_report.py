@@ -34,6 +34,14 @@ RA = re.compile(
     r"spilled=(\d+) cells=(\d+) insts=(\d+)"
 )
 BASE = re.compile(r"^RA-BASE (\S+) reason=(.+) insts=(\d+)")
+# round 87: the cause distribution behind the one number "spilled"
+WHY = re.compile(
+    r"^RA-WHY (\S+) ivs=(\d+) crosscall=(\d+) crosscall_exact=(\d+) "
+    r"noiv=(\d+) secret=(\d+)\s+lostcall=(\d+) lostplain=(\d+) "
+    r"evicted=(\d+) cellslost=(\d+) cellivs=(\d+) maxlive=(\d+)"
+)
+WHY_KEYS = ("ivs", "crosscall", "crosscall_exact", "noiv", "secret",
+            "lostcall", "lostplain", "evicted", "cellslost", "cellivs", "maxlive")
 
 
 def main() -> int:
@@ -43,8 +51,20 @@ def main() -> int:
 
     rows = []
     base = []
+    why = {k: 0 for k in WHY_KEYS}
+    why_n = 0
     for line in sys.stdin:
         line = line.strip()
+        m = WHY.match(line)
+        if m:
+            vals = [int(x) for x in m.groups()[1:]]
+            why_n += 1
+            for k, v in zip(WHY_KEYS, vals):
+                if k == "maxlive":
+                    why[k] = max(why[k], v)
+                else:
+                    why[k] += v
+            continue
         m = RA.match(line)
         if m:
             name = m.group(1)
@@ -78,6 +98,34 @@ def main() -> int:
               "%d SPILLED (%.1f %%)"
               % (tv, tr, 100.0 * tr / tv, ti, ta, ts, 100.0 * ts / tv))
         print("  promoted alloca cells: %d" % tc)
+
+    if why_n:
+        # `spilled` above is nv - regs - imm - frameaddr. Below is what the
+        # allocator itself did, and the two do not have to add up to the same
+        # thing: a promoted cell keeps its slot in `locs` and is counted above
+        # as spilled, although its content sits in a register.
+        lost = why["lostcall"] + why["lostplain"] + why["evicted"]
+        print("  WHY (round 87), over %d allocated functions:" % why_n)
+        print("    value intervals entering the scan: %7d  (+ %d promoted cells)"
+              % (why["ivs"], why["cellivs"]))
+        print("    ... believed to cross a call: %7d (%.1f %%)"
+              % (why["crosscall"], 100.0 * why["crosscall"] / max(1, why["ivs"])))
+        print("    ... REALLY cross a call:      %7d (%.1f %%)   <- the false ones: %d"
+              % (why["crosscall_exact"],
+                 100.0 * why["crosscall_exact"] / max(1, why["ivs"]),
+                 why["crosscall"] - why["crosscall_exact"]))
+        print("    values without an interval:   %7d  (dead, not a spill)" % why["noiv"])
+        print("    secret values:                %7d  (SPEC 9.2, must stay in memory)"
+              % why["secret"])
+        print("    lost the scan:                %7d" % lost)
+        print("      no callee-saved left:       %7d (%.1f %% of the losses)"
+              % (why["lostcall"], 100.0 * why["lostcall"] / max(1, lost)))
+        print("      no register at all left:    %7d (%.1f %%)"
+              % (why["lostplain"], 100.0 * why["lostplain"] / max(1, lost)))
+        print("      evicted by a heavier one:   %7d (%.1f %%)"
+              % (why["evicted"], 100.0 * why["evicted"] / max(1, lost)))
+        print("    cells that got no register:   %7d" % why["cellslost"])
+        print("    widest overlap of intervals (worst function): %d" % why["maxlive"])
 
     if base:
         why = {}

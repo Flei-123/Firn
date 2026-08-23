@@ -275,20 +275,37 @@ pub fn optimize(m: &mut Module) -> OptStats {
 /// switch that nobody uses twice a year.
 #[derive(Default)]
 pub struct PassClock {
-    pub rows: Vec<(&'static str, f64)>,
+    /// name, ms in all, ms of them for nothing, productive runs, idle runs
+    pub rows: Vec<(&'static str, f64, f64, usize, usize)>,
     pub on: bool,
     pub rounds: usize,
 }
 
 impl PassClock {
     fn add(&mut self, name: &'static str, t: std::time::Instant) {
+        self.add2(name, t, true)
+    }
+    /// ROUND 87: and whether the pass found anything. A pass that runs and
+    /// changes nothing has still cost its full run time, and THAT is the
+    /// number this round is about.
+    fn add2(&mut self, name: &'static str, t: std::time::Instant, useful: bool) {
         if !self.on {
             return;
         }
         let ms = t.elapsed().as_secs_f64() * 1000.0;
-        match self.rows.iter_mut().find(|r| r.0 == name) {
-            Some(r) => r.1 += ms,
-            None => self.rows.push((name, ms)),
+        let row = match self.rows.iter_mut().position(|r| r.0 == name) {
+            Some(i) => &mut self.rows[i],
+            None => {
+                self.rows.push((name, 0.0, 0.0, 0, 0));
+                self.rows.last_mut().unwrap()
+            }
+        };
+        row.1 += ms;
+        if useful {
+            row.3 += 1;
+        } else {
+            row.2 += ms;
+            row.4 += 1;
         }
     }
     fn print(&self) {
@@ -296,12 +313,18 @@ impl PassClock {
             return;
         }
         let total: f64 = self.rows.iter().map(|r| r.1).sum();
+        let waste: f64 = self.rows.iter().map(|r| r.2).sum();
         let mut rows = self.rows.clone();
         rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         eprintln!("optimizer passes (milliseconds, {} fixpoint rounds in all)", self.rounds);
-        for (n, ms) in &rows {
-            eprintln!("  {:<16} {:8.1} ms  {:5.1} %", n, ms, ms / total * 100.0);
+        eprintln!("  {:<16} {:>9} {:>7}   {:>9} {:>8} {:>8}",
+                  "pass", "total ms", "share", "for nix ms", "runs", "of them 0");
+        for (n, ms, idle, runs, nix) in &rows {
+            eprintln!("  {:<16} {:8.1} {:6.1} %   {:9.1} {:8} {:8}",
+                      n, ms, ms / total * 100.0, idle, runs + nix, nix);
         }
+        eprintln!("  {:<16} {:8.1} ms of {:.1} ms ({:.1} %) went into passes that changed nothing",
+                  "IN VAIN:", waste, total, waste / total * 100.0);
     }
 }
 
@@ -331,89 +354,149 @@ pub fn optimize_with(m: &mut Module, cfg: &OptConfig) -> OptStats {
     st
 }
 
+// ROUND 87 -- WHY THE SAME PASS DOES NOT RUN TWICE OVER THE SAME CODE.
+//
+// The loop below runs all twelve passes until NOTHING changes any more. The
+// last round of every function is therefore pure confirmation: twelve passes
+// look at the code and all twelve say "nothing to do". With 1,308 functions
+// in bin/firnc1.fi that is 1,308 rounds of the 5,840 measured -- and it is
+// not only the last round. `bce` and `thread-bool` are usually finished
+// after the first one and still look again four times.
+//
+// The rule that gets rid of it is simple and it is EXACT, not a heuristic:
+//
+//   a pass is deterministic. If it looked at exactly this code once and
+//   changed nothing, then it will change nothing this time either.
+//
+// So the code carries a VERSION, counted up by every pass that changes
+// something. A pass that reports "no change" writes down the version it saw.
+// As long as the version has not moved on, the pass is skipped. The moment
+// any other pass changes anything the version moves and everybody looks
+// again. Nothing is left out that would have found something; the fixpoint
+// reached is the same one, and the assembler it produces is octet-identical
+// (measured over bin/firnc1.fi, 649,720 lines).
+//
+// The counting is not free -- one comparison per pass and round -- but the
+// comparison costs nothing against `licm`, which walks the dominator tree.
+struct Fix {
+    /// version of the code, counted up by every change
+    version: u64,
+    /// per pass: the version at which it last found NOTHING.
+    /// `u64::MAX` = it has not said that yet.
+    quiet: [u64; PASS_SLOTS],
+    changed: bool,
+    /// rounds in which at least one pass really ran (for the statistics)
+    ran: usize,
+}
+
+/// as many slots as there are passes in `PASSES`
+const PASS_SLOTS: usize = 12;
+
+impl Fix {
+    fn new() -> Fix {
+        Fix { version: 0, quiet: [u64::MAX; PASS_SLOTS], changed: false, ran: 0 }
+    }
+    /// Does slot `k` have to look at all?
+    fn due(&self, k: usize) -> bool {
+        self.quiet[k] != self.version
+    }
+    /// Report the outcome of a pass.
+    fn note(&mut self, k: usize, changed: bool) {
+        if changed {
+            self.version += 1;
+            self.changed = true;
+        } else {
+            self.quiet[k] = self.version;
+        }
+    }
+}
+
 fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut PassClock) {
     let mut round = 0;
+    let mut fx = Fix::new();
     loop {
         round += 1;
-        let mut changed = false;
-        if cfg.runs("fold") {
+        fx.changed = false;
+        if cfg.runs("fold") && fx.due(0) {
             let t = std::time::Instant::now();
-            changed |= fold_constants(f, st);
-            clk.add("fold", t);
+            let c = fold_constants(f, st);
+            clk.add2("fold", t, c);
+            fx.note(0, c);
         }
-        if cfg.runs("mem2reg") {
+        if cfg.runs("mem2reg") && fx.due(1) {
             let t = std::time::Instant::now();
             let p =
                 crate::mem2reg::promote_single_store(f) + crate::mem2reg::forward_local_loads(f);
             let ds = crate::mem2reg::remove_dead_stores(f);
             st.removed_insts += ds;
-            changed |= ds > 0;
             st.promoted_loads += p;
-            changed |= p > 0;
-            clk.add("mem2reg", t);
+            clk.add2("mem2reg", t, p > 0 || ds > 0);
+            fx.note(1, p > 0 || ds > 0);
         }
-        if cfg.runs("copyprop") {
+        if cfg.runs("copyprop") && fx.due(2) {
             let t = std::time::Instant::now();
             let c = crate::mem2reg::copy_propagate(f);
             st.copies += c;
-            changed |= c > 0;
-            clk.add("copyprop", t);
+            clk.add2("copyprop", t, c > 0);
+            fx.note(2, c > 0);
         }
-        if cfg.runs("strength") {
+        if cfg.runs("strength") && fx.due(3) {
             let t = std::time::Instant::now();
             let n = crate::peephole::run(f);
             st.strength += n;
-            changed |= n > 0;
-            clk.add("strength", t);
+            clk.add2("strength", t, n > 0);
+            fx.note(3, n > 0);
         }
-        if cfg.runs("cse") {
+        if cfg.runs("cse") && fx.due(4) {
             let t = std::time::Instant::now();
             let e = cse(f);
             st.cse += e;
-            changed |= e > 0;
-            clk.add("cse", t);
+            clk.add2("cse", t, e > 0);
+            fx.note(4, e > 0);
         }
-        if cfg.runs("licm") {
+        if cfg.runs("licm") && fx.due(5) {
             let t = std::time::Instant::now();
             let h = crate::licm::hoist_loop_invariants(f);
             st.hoisted += h;
-            changed |= h > 0;
-            clk.add("licm", t);
+            clk.add2("licm", t, h > 0);
+            fx.note(5, h > 0);
         }
-        if cfg.runs("bce") {
+        if cfg.runs("bce") && fx.due(6) {
             let t = std::time::Instant::now();
             let r = remove_redundant_checks(f);
             st.removed_checks += r;
-            changed |= r > 0;
-            clk.add("bce", t);
+            clk.add2("bce", t, r > 0);
+            fx.note(6, r > 0);
         }
-        if cfg.runs("thread-bool") {
+        if cfg.runs("thread-bool") && fx.due(7) {
             let clock = std::time::Instant::now();
             let t = crate::threading::thread_bool_cells(f);
             st.threaded += t;
-            changed |= t > 0;
-            clk.add("thread-bool", clock);
+            clk.add2("thread-bool", clock, t > 0);
+            fx.note(7, t > 0);
         }
-        if cfg.runs("simplify-term") {
+        if cfg.runs("simplify-term") && fx.due(8) {
             let t = std::time::Instant::now();
-            changed |= simplify_terminators(f);
-            clk.add("simplify-term", t);
+            let c = simplify_terminators(f);
+            clk.add2("simplify-term", t, c);
+            fx.note(8, c);
         }
-        if cfg.runs("merge-blocks") {
+        if cfg.runs("merge-blocks") && fx.due(9) {
             let t = std::time::Instant::now();
             let mb = crate::mem2reg::merge_blocks(f);
             st.merged_blocks += mb;
-            changed |= mb > 0;
-            clk.add("merge-blocks", t);
+            clk.add2("merge-blocks", t, mb > 0);
+            fx.note(9, mb > 0);
         }
-        if cfg.runs("dce") {
+        if cfg.runs("dce") && fx.due(10) {
             let t = std::time::Instant::now();
-            changed |= remove_unreachable_blocks(f, st);
-            changed |= remove_dead_insts(f, st);
-            clk.add("dce", t);
+            let a = remove_unreachable_blocks(f, st);
+            let b = remove_dead_insts(f, st);
+            clk.add2("dce", t, a || b);
+            fx.note(10, a || b);
         }
         clk.rounds += 1;
-        if !changed || round >= MAX_ROUNDS {
+        if !fx.changed || round >= MAX_ROUNDS {
             break;
         }
     }

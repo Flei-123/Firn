@@ -1111,12 +1111,73 @@ fn emit_inst(
             crate::panic_rt_a64::emit_wrap_sat(e, *kind, *op, ty, site)?;
             store_dst(e, fr, d, A);
         }
-        Op::Simd { .. } => {
-            return Err(
-                "aarch64: the v128 intrinsics of round 82 are x86 vector instructions and are not supported on aarch64"
-                    .to_string(),
-            )
-        }
+        // ROUND 82 on ROUND 80, corrected in ROUND 87.
+        //
+        // The vector instructions of round 82 exist for x86-64 only; aarch64
+        // has its counterparts (`aese`/`aesmc`, `sha256h`) and they are not
+        // emitted yet. Refusing them is right.
+        //
+        // BUT ROUND 87 FOUND THAT THE REFUSAL WENT TOO FAR, and the message
+        // itself said something that was not true: "the scalar path of
+        // lib/std/crypto works on both machines". It did not. `sha256_new()`
+        // asks `__cpu_features()` ONCE, unconditionally, to decide which path
+        // to take -- so the question alone made the WHOLE crypto library
+        // uncompilable for aarch64. Measured: tests/1613_crypto.fi did not
+        // get through --target=aarch64-linux at all.
+        //
+        // `__cpu_features()` is not a vector instruction; it is a QUESTION
+        // about the machine. On aarch64 the honest answer today is "none of
+        // the bits this compiler knows how to use", and that answer is zero.
+        // Every dispatch in lib/std/crypto then takes the scalar path, which
+        // is exactly what round 82 promised.
+        //
+        // That is NOT the whole repair, and round 87 says so rather than
+        // claiming it: lib/std/crypto/accel.fi still MENTIONS `v128`, and a
+        // mention is enough to stop this code generator. tests/1613_crypto.fi
+        // therefore still does not compile for aarch64 -- it now fails on
+        // `Load` instead of on `CpuFeatures`. What compiles now is every
+        // program that only ASKS what the machine can do (lib/std/cpu.fi),
+        // and that was uncompilable before for no reason at all.
+        //
+        // The two CRC-32 intrinsics get their real instruction: SSE 4.2's
+        // `crc32` computes the CASTAGNOLI polynomial, and A64 has it as
+        // `crc32cb`/`crc32cx`. Same polynomial, same result -- so this is
+        // not an approximation but the counterpart.
+        Op::Simd { kind, args, .. } => match kind {
+            crate::simd::SimdKind::CpuFeatures => {
+                let d = i.dst.ok_or("internal error: cpu_features without target")?;
+                e.line("// __cpu_features(): aarch64 knows no accelerated path here yet");
+                imm_into(e, A, 0);
+                store_dst(e, fr, d, A);
+            }
+            crate::simd::SimdKind::Crc32U8 => {
+                let d = i.dst.ok_or("internal error: crc32_u8 without target")?;
+                load_full(e, fr, A, args[0]);
+                load_full(e, fr, B, args[1]);
+                e.line(&format!("crc32cb {}, {}, {}", w(A), w(A), w(B)));
+                store_dst(e, fr, d, A);
+            }
+            crate::simd::SimdKind::Crc32U64 => {
+                let d = i.dst.ok_or("internal error: crc32_u64 without target")?;
+                load_full(e, fr, A, args[0]);
+                load_full(e, fr, B, args[1]);
+                e.line(&format!("crc32cx {}, {}, {}", w(A), w(A), B));
+                store_dst(e, fr, d, A);
+            }
+            _ => {
+                return Err(format!(
+                    "--target=aarch64-linux cannot emit the vector instruction {:?} yet. \
+                     Round 82 built the 42 intrinsics for x86-64; aarch64 has counterparts \
+                     (aese/aesmc for AES, sha256h/sha256h2 for SHA-256) but no 'v128' value \
+                     model in this code generator yet, so a program that MENTIONS one of \
+                     them does not compile here, even where it would not execute it. \
+                     __cpu_features() answers 0 on this machine, so every dispatch in \
+                     lib/std/crypto picks its scalar path -- but lib/std/crypto/accel.fi \
+                     itself still has to be compilable, and it is not. docs/ROUND87.md 5.",
+                    kind
+                ));
+            }
+        },
     }
     Ok(())
 }
