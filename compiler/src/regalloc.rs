@@ -86,6 +86,233 @@ const ARG_SPARE: [&str; 2] = ["rsi", "rdi"];
 /// register — only intervals that cross none of this may carry it.
 const DIV_SPARE: [&str; 1] = ["rdx"];
 
+// ------------------------------------------- implicit clobbers (round 90) ---
+//
+// ROUND 90 — THE BUG THIS SECTION EXISTS FOR, AND WHY IT IS A SECTION.
+//
+// `firnc --opt-level=release-safe` produced WRONG CODE. The minimal case is
+// `tests/1900_mul_clobbers_rdx.fi`; it was found by the osum kernel, whose
+// bitmap frame allocator failed 19 of 23 of its own cases on that build
+// level and on no other:
+//
+//     a6:  mov  %rcx,%rdx      # the fourth parameter lives in rdx from here
+//     df:  mul  %rcx           # <-- writes RDX:RAX. rdx is gone.
+//
+// x86 has instructions that write registers their operand list never
+// mentions. `mul`/`imul` in the ONE operand form put the full product in
+// `rdx:rax`, `div`/`idiv` take their dividend from there and leave the
+// remainder in `rdx`, `cqo`/`cdq` sign-extend into `rdx`. The allocator hands
+// `rdx` out as a value register. If it does not know that an instruction
+// destroys it, the value is destroyed.
+//
+// It DID know for `div`/`rem`/`select`/`cmpxchg` (`divsel_pos` below) — and
+// round 72, which introduced checked arithmetic, added its four new
+// instructions to that list. Round 87 then built `exact_crossings`, a second,
+// finer answer to the same question, and listed only the ops round 49 knew
+// about. Two lists, one question, and the finer one silently won: everything
+// round 72 added became invisible again. `--opt-level=release-safe` is the
+// only level that has both halves at once (checked arithmetic makes the
+// `mul`, register allocation makes the victim), which is why it alone broke —
+// and it is exactly the level one ships with.
+//
+// The answer is not a third list. It is ONE function, [`inst_clobbers`],
+// that says for every instruction which registers OUT OF THE POOL its code
+// destroys, and one representation, a bit mask, that every consumer uses.
+// The rough interval answer and the exact control-flow answer are now two
+// ways of summing the SAME masks, and `fits` is one line: does this register
+// appear in what dies while the value is alive. A new instruction that
+// clobbers something can be forgotten in exactly one place instead of three,
+// and forgetting it there is a compile error at the `match` if it is a new
+// `Op` variant.
+//
+// The masks are also NARROWER than the three booleans they replace, which is
+// worth registers on `release-safe`: a checked `+` or `-` writes no `rdx` at
+// all (only the unsigned one-operand `mul` does), a checked `as` writes none
+// either, and `copymem` writes `rdi`/`rsi` but not `rdx` — all three used to
+// ban `rdx` wholesale through `crosses_divsel`/`crosses_memop`.
+//
+/// The registers this allocator ever hands to a value, in one order that
+/// every mask in this file uses. `rax`/`rcx` are NOT in it: they are pure
+/// scratch at every emission site and can never hold a FIR value.
+const POOL: [&str; 12] = [
+    "rbx", "r12", "r13", "r14", "r15", "r11", "r10", "r9", "r8", "rsi", "rdi", "rdx",
+];
+
+/// A set of [`POOL`] registers.
+type RegMask = u16;
+
+const M_RBX: RegMask = 1 << 0;
+const M_R12: RegMask = 1 << 1;
+const M_R13: RegMask = 1 << 2;
+const M_R14: RegMask = 1 << 3;
+const M_R15: RegMask = 1 << 4;
+const M_R11: RegMask = 1 << 5;
+const M_R10: RegMask = 1 << 6;
+const M_R9: RegMask = 1 << 7;
+const M_R8: RegMask = 1 << 8;
+const M_RSI: RegMask = 1 << 9;
+const M_RDI: RegMask = 1 << 10;
+const M_RDX: RegMask = 1 << 11;
+
+/// Everything a `call` destroys. The five callee-saved ones survive it (the
+/// prologue/epilogue of the callee saves them), which is why they are not in
+/// here and why an interval that crosses a call can still get one.
+const M_CALL: RegMask = M_R11 | M_R10 | M_R9 | M_R8 | M_RSI | M_RDI | M_RDX;
+/// `rep movsb`/`rep stosb`: `rdi`, `rsi` (and `rcx`, which is not in the pool).
+const M_MEMOP: RegMask = M_RDI | M_RSI;
+
+/// Bit of a pool register; 0 for anything that is not in the pool.
+fn reg_bit(r: &str) -> RegMask {
+    match r {
+        "rbx" => M_RBX,
+        "r12" => M_R12,
+        "r13" => M_R13,
+        "r14" => M_R14,
+        "r15" => M_R15,
+        "r11" => M_R11,
+        "r10" => M_R10,
+        "r9" => M_R9,
+        "r8" => M_R8,
+        "rsi" => M_RSI,
+        "rdi" => M_RDI,
+        "rdx" => M_RDX,
+        _ => 0,
+    }
+}
+
+/// **THE SINGLE SOURCE OF TRUTH** — which pool registers does the code that
+/// this backend emits for `i` destroy?
+///
+/// Only the path that RETURNS counts. A checked operation's overflow arm
+/// jumps to the panic trampoline and never comes back, so the `pop rdx` it
+/// does on the way out is not a clobber anybody can observe.
+///
+/// The width and signedness questions are not cosmetic: `mul cl` (8 bit
+/// unsigned) puts its product in `ax` and leaves `rdx` alone, `imul rax, rcx`
+/// (the two operand form, every signed multiplication at 16 bits and wider)
+/// writes only its target, and only `mul cx`/`ecx`/`rcx` really splits the
+/// product across `rdx:rax`.
+fn inst_clobbers(i: &Inst) -> RegMask {
+    let ty = i.ty;
+    match &i.op {
+        // A call and everything shaped like one. `syscall` itself only
+        // destroys rax/rcx/r11 architecturally, but building its argument
+        // list writes rdi, rsi, rdx, r10, r8 and r9 first.
+        Op::Call { .. } | Op::CallIndirect { .. } | Op::Syscall { .. } | Op::ThreadSpawn { .. } => {
+            M_CALL
+        }
+        // `__cpu_features()` — `cpuid` writes rax/rbx/rcx/rdx and the sequence
+        // in `simd.rs` uses r9/r10/r11 on top (it saves and restores rbx
+        // itself). See `is_cpuid`: it counts as a call, which is what round 87
+        // already decided after tests/1613_crypto.fi died of it.
+        Op::Simd { .. } if is_cpuid(&i.op) => M_CALL,
+        // `rep movsb` / `rep stosb`.
+        Op::CopyMem { .. } | Op::SecureZero { .. } => M_MEMOP,
+        // `cqo`/`cdq` + `div`/`idiv`: the remainder register.
+        Op::Bin(BinOp::Div | BinOp::Rem, _, _) => M_RDX,
+        // `test dl, dl` + `cmovnz` — the condition is fetched into rdx BEFORE
+        // the two arms are read (see `Op::Select` in the emission below).
+        Op::Select { .. } => M_RDX,
+        // `lock cmpxchg [rcx], rdx` (round 49, found in tests/820).
+        Op::AtomicCas { .. } => M_RDX,
+        // Checked `/` and `%` always divide in the end, and the signed
+        // 64-bit range test parks `i64::MIN` in rdx to compare against.
+        Op::CheckedDiv { .. } => M_RDX,
+        // Checked `+ - *`: ONLY the unsigned one-operand `mul` at 16 bits and
+        // wider touches rdx. THIS is the instruction of the bug.
+        Op::CheckedBin { op: BinOp::Mul, .. } if !ty.signed() && ty.bits() >= 16 => M_RDX,
+        Op::CheckedBin { .. } => 0,
+        // Checked `as` — ROUND 90: `mov rdx, rax` instead of `push rax`,
+        // so the round trip has something to compare against without
+        // touching memory. That makes rdx a clobber where round 72 had
+        // none; the stack traffic it replaces was two accesses per cast.
+        Op::CheckedCast { .. } => M_RDX,
+        // ROUND 89's checked index, merged into round 90's single list.
+        // `emit_checked_idx` is `cmp rax, imm32` / `jb` / `mov rcx, len`
+        // and the failure arm never returns -- rax and rcx are the two
+        // scratch registers, rdx is untouched. Written out rather than
+        // left to the `_` arm so the next reader does not have to go and
+        // look it up in panic_rt.rs.
+        Op::CheckedIdx { .. } => 0,
+        // `+% -% *%` is bit for bit the unchecked path (two operand `imul`).
+        // `+| -| *|` clamps with `mov rdx, <bound>` + `cmovl` for the signed
+        // types, and multiplies through the one-operand `mul` for the
+        // unsigned ones.
+        Op::BinWrapSat { kind, op, .. } => {
+            if *kind == crate::fir::WrapSatKind::Wrap {
+                0
+            } else if ty.signed() {
+                M_RDX
+            } else if *op == BinOp::Mul && ty.bits() >= 16 {
+                M_RDX
+            } else {
+                0
+            }
+        }
+        // Everything else computes in rax/rcx or in the target register.
+        // `lock xadd [rcx], rax`, `crc32 eax, cl`, `setcc al`, the shifts
+        // (count in cl), `Op::Cmp`, loads, stores, `lea` — none of them
+        // reaches past the two scratch registers.
+        _ => 0,
+    }
+}
+
+/// Operands that an instruction fetches into a FIXED register while another
+/// fixed register it writes is still to be read — see the long note in
+/// [`exact_crossings`]. They must be treated as living ACROSS the
+/// instruction even though their interval ends at it.
+fn op_pins(op: &Op, out: &mut Vec<Val>) {
+    out.clear();
+    match op {
+        Op::CallIndirect { target, .. } => out.push(*target),
+        Op::Syscall { args } => {
+            if let Some(a0) = args.first() {
+                out.push(*a0);
+            }
+        }
+        Op::ThreadSpawn { arg, stack, ctid } => {
+            out.push(*arg);
+            out.push(*stack);
+            out.push(*ctid);
+        }
+        Op::CopyMem { dst, src, .. } => {
+            out.push(*dst);
+            out.push(*src);
+        }
+        Op::SecureZero { addr, size } => {
+            out.push(*addr);
+            out.push(*size);
+        }
+        Op::Select { cond, a, b } => {
+            out.push(*cond);
+            out.push(*a);
+            out.push(*b);
+        }
+        Op::AtomicCas { addr, erw, new } => {
+            out.push(*addr);
+            out.push(*erw);
+            out.push(*new);
+        }
+        // ROUND 90 — the checked operations. Their failure arm RELOADS the
+        // two original values from wherever they live (`panic_rt.rs`), so
+        // those homes have to survive the instruction: an operand may not
+        // sit in a register the instruction itself destroys. Only matters
+        // where the mask is non-empty (the unsigned one-operand `mul`, the
+        // divisions, the saturating clamp, the cast's compare register) --
+        // `exact_crossings` never asks for pins where nothing is clobbered.
+        Op::CheckedBin { a, b, .. } | Op::CheckedDiv { a, b, .. } => {
+            out.push(*a);
+            out.push(*b);
+        }
+        Op::CheckedCast { src, .. } => out.push(*src),
+        Op::BinWrapSat { a, b, .. } => {
+            out.push(*a);
+            out.push(*b);
+        }
+        _ => {}
+    }
+}
+
 fn align_up(x: u64, a: u64) -> u64 {
     if a <= 1 {
         x
@@ -394,6 +621,7 @@ impl Bits {
         }
     }
     /// `self |= a & b`
+    #[allow(dead_code)]
     fn or_and(&mut self, a: &Bits, b: &Bits) {
         for i in 0..self.w.len() {
             self.w[i] |= a.w[i] & b.w[i];
@@ -420,25 +648,28 @@ fn is_cpuid(op: &Op) -> bool {
     matches!(op, Op::Simd { kind: crate::simd::SimdKind::CpuFeatures, .. })
 }
 
-/// An operand that an instruction fetches into a fixed register while
-/// another fixed register is already occupied -- see the long note in
-/// `exact_crossings`.
-fn pin(b: &mut Bits, v: Val, nv: usize) {
-    if (v as usize) < nv {
-        b.set(v as usize);
+/// Calls `f` for every index that is set in BOTH bitsets. Word by word:
+/// `gctext__gctext_write` has 56,359 values, and a pass over a `Vec<bool>`
+/// per clobbering instruction would cost more than the whole allocation.
+fn each_and(a: &Bits, b: &Bits, mut f: impl FnMut(usize)) {
+    for (i, (x, y)) in a.w.iter().zip(b.w.iter()).enumerate() {
+        let mut m = x & y;
+        while m != 0 {
+            f(i * 64 + m.trailing_zeros() as usize);
+            m &= m - 1;
+        }
     }
 }
 
-/// For every value: does it really survive a `call` / a `copymem` / a
-/// `div`-`select`-`cmpxchg`? Exact, along the control flow.
-fn exact_crossings(f: &Func, live: &Live) -> (Bits, Bits, Bits) {
+/// For every value: WHICH pool registers really die while it is alive?
+/// Exact, along the control flow, using [`inst_clobbers`] as its only table.
+fn exact_crossings(f: &Func, live: &Live) -> Vec<RegMask> {
     let nv = f.val_types.len();
-    let mut cc = Bits::new(nv);
-    let mut cm = Bits::new(nv);
-    let mut cd = Bits::new(nv);
+    let mut killed = vec![0 as RegMask; nv];
     let mut after = Bits::new(nv);
     let mut cur = Bits::new(nv);
     let mut buf = Vec::new();
+    let mut pins = Vec::new();
     for (bi, b) in f.blocks.iter().enumerate() {
         cur.fill_from_bools(&live.live_out[bi]);
         // The terminator runs AFTER the last instruction and reads its value
@@ -455,43 +686,8 @@ fn exact_crossings(f: &Func, live: &Live) -> (Bits, Bits, Bits) {
             }
         }
         for i in b.insts.iter().rev() {
-            let is_call = matches!(
-                i.op,
-                Op::Call { .. } | Op::CallIndirect { .. } | Op::Syscall { .. } | Op::ThreadSpawn { .. }
-            ) || is_cpuid(&i.op);
-            let is_mem = matches!(i.op, Op::CopyMem { .. } | Op::SecureZero { .. });
-            // ROUND 89 — A BUG OF ROUND 72, found by this round's index
-            // check and older than it.
-            //
-            // The ROUGH question (`divsel_pos`, further down) has listed
-            // the four checked operations since round 72: they all end up
-            // in `push rax`/`push rcx` .. `div`/`idiv` inside
-            // `panic_rt.rs`, which clobbers `rdx` exactly as a plain
-            // `Div`/`Rem` does. The EXACT question here did not, so a value
-            // the allocator had parked in `rdx` was declared to survive
-            // them after all and the rough answer was overruled.
-            //
-            // It stayed invisible because it needs a value to live in `rdx`
-            // ACROSS a checked division — `tests/048_print_number.fi` grew
-            // exactly that the moment its `buf[0] = 48` lost its bounds
-            // check and the buffer address became worth keeping in a
-            // register (`x / 10` then wrote the remainder over it and the
-            // next `buf[n] = ..` stored to address 6). Same list as the
-            // rough question, in one place, so the two cannot disagree
-            // again.
-            let is_dv = matches!(
-                i.op,
-                Op::Bin(BinOp::Div | BinOp::Rem, _, _)
-                    | Op::Select { .. }
-                    | Op::AtomicCas { .. }
-                    | Op::CheckedBin { .. }
-                    | Op::CheckedDiv { .. }
-                    | Op::CheckedCast { .. }
-                    | Op::CheckedIdx { .. }
-                    | Op::BinWrapSat { .. }
-            );
-            let interesting = is_call || is_mem || is_dv;
-            if interesting {
+            let m = inst_clobbers(i);
+            if m != 0 {
                 after.copy_from(&cur);
             }
             if let Some(d) = i.dst {
@@ -506,78 +702,48 @@ fn exact_crossings(f: &Func, live: &Live) -> (Bits, Bits, Bits) {
                     cur.set(u as usize);
                 }
             }
-            if interesting {
-                if is_call {
-                    cc.or_and(&cur, &after);
-                }
-                if is_mem {
-                    cm.or_and(&cur, &after);
-                }
-                if is_dv {
-                    cd.or_and(&cur, &after);
-                }
-            }
-            // THE OTHER HALF, and it cost a segmentation fault to find:
-            // "does not survive the instruction" is not the same as "may
-            // stand in any register at it". A few instructions fetch their
-            // operands into FIXED registers ONE AFTER THE OTHER, and the
-            // second fetch then overwrites the home of the first operand.
-            //
-            //   call rax          the target is loaded LAST, after rdi..r9
-            //                     have been set -- a target living in `rdi`
-            //                     is gone by then (measured: tests/1402
-            //                     jumped to 0x10, `core__alloc`).
-            //   syscall           the number goes into rax last, likewise.
-            //   rep movsb         rdi, then rsi: a source living in `rdi` is
-            //                     overwritten by the destination.
-            //   cmov / cmpxchg    rdx is written before the other two
-            //                     operands are read.
-            //
-            // Until this round the interval question hid all of that: an
-            // operand's interval ENDS at the instruction, so it counted as
-            // crossing it anyway. The exact question sees it die there and
-            // would hand it exactly the register that is about to be
-            // overwritten. So these operands are pinned by hand.
-            //
-            // Deliberately NOT in the list: the arguments of a normal `call`
-            // and of a `syscall`. Those go through `parallel_reg_moves`,
-            // which resolves any permutation and breaks cycles over `rax` --
-            // and they are the big group, several thousand values.
-            match &i.op {
-                Op::CallIndirect { target, .. } => pin(&mut cc, *target, nv),
-                Op::Syscall { args } => {
-                    if let Some(a0) = args.first() {
-                        pin(&mut cc, *a0, nv);
+            if m != 0 {
+                // Live BEFORE and live AFTER is the textbook definition of
+                // live-through: an operand that dies here does not survive
+                // the instruction, the result does not exist before it.
+                each_and(&cur, &after, |v| killed[v] |= m);
+                // THE OTHER HALF, and it cost a segmentation fault to find:
+                // "does not survive the instruction" is not the same as "may
+                // stand in any register at it". A few instructions fetch
+                // their operands into FIXED registers ONE AFTER THE OTHER,
+                // and the second fetch overwrites the home of the first.
+                //
+                //   call rax          the target is loaded LAST, after
+                //                     rdi..r9 have been set -- a target
+                //                     living in `rdi` is gone by then
+                //                     (measured: tests/1402 jumped to 0x10).
+                //   syscall           the number goes into rax last, likewise.
+                //   rep movsb         rdi, then rsi: a source living in `rdi`
+                //                     is overwritten by the destination.
+                //   cmov / cmpxchg    rdx is written before the other two
+                //                     operands are read.
+                //
+                // The interval question used to hide all of that: an
+                // operand's interval ENDS at the instruction, so it counted
+                // as crossing it anyway. The exact question sees it die there
+                // and would hand it exactly the register about to be
+                // overwritten. So these operands are pinned by hand.
+                //
+                // Deliberately NOT in the list: the arguments of a normal
+                // `call` and of a `syscall`. Those go through
+                // `parallel_reg_moves`, which resolves any permutation and
+                // breaks cycles over `rax` -- and they are the big group,
+                // several thousand values.
+                op_pins(&i.op, &mut pins);
+                for &pv in pins.iter() {
+                    if (pv as usize) < nv {
+                        killed[pv as usize] |= m;
                     }
                 }
-                Op::ThreadSpawn { arg, stack, ctid } => {
-                    pin(&mut cc, *arg, nv);
-                    pin(&mut cc, *stack, nv);
-                    pin(&mut cc, *ctid, nv);
-                }
-                Op::CopyMem { dst, src, .. } => {
-                    pin(&mut cm, *dst, nv);
-                    pin(&mut cm, *src, nv);
-                }
-                Op::SecureZero { addr, size } => {
-                    pin(&mut cm, *addr, nv);
-                    pin(&mut cm, *size, nv);
-                }
-                Op::Select { cond, a, b } => {
-                    pin(&mut cd, *cond, nv);
-                    pin(&mut cd, *a, nv);
-                    pin(&mut cd, *b, nv);
-                }
-                Op::AtomicCas { addr, erw, new } => {
-                    pin(&mut cd, *addr, nv);
-                    pin(&mut cd, *erw, nv);
-                    pin(&mut cd, *new, nv);
-                }
-                _ => {}
             }
         }
     }
-    (cc, cm, cd)
+    killed
 }
 
 // ---------------------------------------------------------- Cell analysis ---
@@ -779,11 +945,14 @@ struct Iv {
     start: usize,
     end: usize,
     weight: u64,
-    crosses_call: bool,
-    /// crosses `copymem`/`secure_zero` (they write `rdi`, `rsi`, `rcx`)
-    crosses_memop: bool,
-    /// crosses `div`/`rem`/`select` (they write `rdx` respectively `rcx`)
-    crosses_divsel: bool,
+    /// Pool registers that are destroyed while this value is alive
+    /// (round 90; see `inst_clobbers`). A register may be handed to the
+    /// value exactly when its bit is NOT in here.
+    killed: RegMask,
+    /// ROUND 90 — is this a promoted `alloca` cell? Only measured with, not
+    /// acted on: see the note at the hand-out below.
+    #[allow(dead_code)]
+    is_cell: bool,
 }
 
 /// Loop depth per block (approximation: back edge u->v with v <= u spans
@@ -807,6 +976,72 @@ fn loop_depth(f: &Func) -> Vec<u32> {
         }
     }
     depth
+}
+
+/// The instruction ranges of the loops (round 90). A back edge `u -> v` with
+/// `v <= u` makes every position from the start of block `v` to the end of
+/// block `u` part of one loop.
+///
+/// It exists for the promoted cells. A cell holds a variable, and a variable
+/// in a loop is read again AFTER the back edge: its register has to survive
+/// the whole loop, not just the stretch between its first and its last
+/// access. Until round 90 that was answered by giving every cell the
+/// interval `[0, last access]` -- which covers every loop that starts after
+/// the beginning of the function, and covers it at the price of ALSO
+/// crossing everything that happens before the cell is ever touched.
+///
+/// In `bench/firn/matmul.fi` that was three calls to `alloc()` in the first
+/// ten instructions of `main`. Nine cells, all of them "crossing a call"
+/// because of those three, all nine competing for the five callee-saved
+/// registers -- five of them lost and went to the stack, among them the
+/// counters of the innermost loop. Measured with `FIRN_RA_STATS=1`:
+/// `cellivs=9 cellslost=5`.
+#[allow(dead_code)]
+fn loop_ranges(f: &Func, block_start: &[usize], block_end: &[usize]) -> Vec<(usize, usize)> {
+    let nb = f.blocks.len();
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    for (u, b) in f.blocks.iter().enumerate() {
+        for sbb in b.term.successors() {
+            let v = sbb as usize;
+            if v <= u && v < nb {
+                out.push((block_start[v], block_end[u]));
+            }
+        }
+    }
+    out
+}
+
+/// Widens `[s, e]` until it contains every loop it touches, or gives up.
+///
+/// Monotone: `s` only falls, `e` only rises, both bounded by the function,
+/// and a pass that changes nothing is the fixpoint. A pass that DOES change
+/// something has absorbed at least one range, so `loops.len() + 1` passes
+/// are enough -- and if that is somehow not enough, the answer is `None` and
+/// the caller falls back to the interval that was always safe (`[0, last
+/// access]`). Never a half widened range: that would be a wrong-code bug of
+/// exactly the kind this round exists to stop making.
+#[allow(dead_code)]
+fn widen_to_loops(mut s: usize, mut e: usize, loops: &[(usize, usize)]) -> Option<(usize, usize)> {
+    for _ in 0..=loops.len() {
+        let mut changed = false;
+        for &(ls, le) in loops {
+            // ranges that OVERLAP the interval pull it out to their own ends
+            if ls <= e && s <= le {
+                if ls < s {
+                    s = ls;
+                    changed = true;
+                }
+                if le > e {
+                    e = le;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            return Some((s, e));
+        }
+    }
+    None
 }
 
 /// Carries out the complete allocation.
@@ -865,54 +1100,32 @@ pub fn allocate(f: &Func) -> Alloc {
         alloc.locs[*v as usize] = Loc::Slot(0);
     }
 
-    // call positions (for `crosses_call`)
-    let mut call_pos: Vec<usize> = Vec::new();
-    let mut memop_pos: Vec<usize> = Vec::new();
-    let mut divsel_pos: Vec<usize> = Vec::new();
+    // Where does something get destroyed, and what (round 90). ONE list, from
+    // ONE table -- see `inst_clobbers`. The rough answer below sums the masks
+    // over the interval, the exact one over the control flow; before round 90
+    // these were two lists with two different op sets, and the difference was
+    // the bug of this round.
+    let mut clob_pos: Vec<(usize, RegMask)> = Vec::new();
     for (bi, b) in f.blocks.iter().enumerate() {
         for (ii, i) in b.insts.iter().enumerate() {
-            if matches!(i.op, Op::Call { .. } | Op::CallIndirect { .. } | Op::Syscall { .. } | Op::ThreadSpawn { .. })
-                || is_cpuid(&i.op)
-            {
-                call_pos.push(live.pos[bi][ii]);
-            }
-            if matches!(i.op, Op::CopyMem { .. } | Op::SecureZero { .. }) {
-                memop_pos.push(live.pos[bi][ii]);
-            }
-            // Round 49: `Op::AtomicCas` uses `rdx` as a third scratch register
-            // (`lock cmpxchg [rcx], rdx`) — exactly like `div`/`rem`/`select`.
-            // Without this entry an interval living across it keeps carrying
-            // `rdx` and is destroyed. Found in tests/820 (release-fast only).
-            //
-            // Round 72 adds its own four: `CheckedBin`/`CheckedDiv`/
-            // `CheckedCast`/`BinWrapSat` all go through `push rax`/`push
-            // rcx` .. `pop`/`div`/`idiv` in `panic_rt.rs`/`emit_wrap_sat*`,
-            // which clobbers `rdx` (division's own remainder register) the
-            // exact same way `Div`/`Rem` always did. Missing here, a value
-            // the allocator had parked in `rdx` for reuse across a LOOP
-            // survived textually but not really: `lib/std/core.fi`'s
-            // `digit_count` cached `base` in `rdx` for its `while x > 0 {
-            // x = x / b }` loop, and the checked division's own `div`
-            // silently overwrote it with the remainder after the first
-            // iteration -- the loop kept dividing by whatever was left
-            // over from the PREVIOUS step instead of the real base, until
-            // that happened to be zero (found running `tests/1401_core_
-            // number.fi`: `digit_count(999, 10)` divided by 9, then by 0).
-            if matches!(
-                i.op,
-                Op::Bin(BinOp::Div | BinOp::Rem, _, _)
-                    | Op::Select { .. }
-                    | Op::AtomicCas { .. }
-                    | Op::CheckedBin { .. }
-                    | Op::CheckedDiv { .. }
-                    | Op::CheckedCast { .. }
-                    | Op::CheckedIdx { .. }
-                    | Op::BinWrapSat { .. }
-            ) {
-                divsel_pos.push(live.pos[bi][ii]);
+            let m = inst_clobbers(i);
+            if m != 0 {
+                clob_pos.push((live.pos[bi][ii], m));
             }
         }
     }
+    // The interval answer: everything destroyed anywhere between the first
+    // and the last touch of the value. Always safe, never finer than the
+    // control flow.
+    let rough = |sp: usize, ep: usize| -> RegMask {
+        let mut m: RegMask = 0;
+        for &(p, k) in clob_pos.iter() {
+            if sp <= p && p <= ep {
+                m |= k;
+            }
+        }
+        m
+    };
 
     // intervals + weights
     let mut start = vec![usize::MAX; nv];
@@ -987,33 +1200,22 @@ pub fn allocate(f: &Func) -> Alloc {
         // Values whose place IS the memory (alloca addresses) may get a
         // register; their content keeps lying in the frame.
         let (s, e) = (start[v], end[v]);
-        let rough_cc = call_pos.iter().any(|&p| s <= p && p <= e);
-        let rough_cm = memop_pos.iter().any(|&p| s <= p && p <= e);
-        let rough_cd = divsel_pos.iter().any(|&p| s <= p && p <= e);
         // The exact answer where it exists, the interval answer otherwise.
         // Both are safe; the exact one is only narrower.
-        let (cc, cm, cd) = match &exact {
-            Some((xc, xm, xd)) => (xc.get(v), xm.get(v), xd.get(v)),
-            None => (rough_cc, rough_cm, rough_cd),
+        let killed = match &exact {
+            Some(x) => x[v],
+            None => rough(s, e),
         };
         if want_stats {
             st.ivs += 1;
-            if rough_cc {
+            if rough(s, e) & M_CALL != 0 {
                 st.cross_call += 1;
             }
-            if cc {
+            if killed & M_CALL != 0 {
                 st.cross_call_exact += 1;
             }
         }
-        ivs.push(Iv {
-            val: v as Val,
-            start: s,
-            end: e,
-            weight: weight[v],
-            crosses_call: cc,
-            crosses_memop: cm,
-            crosses_divsel: cd,
-        });
+        ivs.push(Iv { val: v as Val, start: s, end: e, weight: weight[v], killed, is_cell: false });
     }
     for (&c, _) in cells.iter() {
         let cv = c as usize;
@@ -1022,11 +1224,29 @@ pub fn allocate(f: &Func) -> Alloc {
         }
         // The cell has to sit in the register from the start of the function
         // to the last access (its content survives blocks without access).
+        //
+        // ROUND 90 TRIED THE TIGHTER ANSWER and threw it away again. A cell
+        // does not live before its first access, and a variable in a loop is
+        // read again after the back edge, so `[first access, last access]`
+        // widened over the enclosing loops (`loop_ranges`/`widen_to_loops`
+        // above, still there and still used by nothing else) is both correct
+        // and much shorter: in `bench/firn/matmul.fi` it took `main` from
+        // four promoted cells to six and from five lost to three, because
+        // the three `alloc()` calls in the first ten instructions stopped
+        // counting as "crossed" for counters that appear much later.
+        //
+        // It did not pay. Measured over eight benchmarks at `release-fast`
+        // (`tools/bench90/icount.py`, instructions really executed):
+        // statemachine -4.6 %, bytecount -0.9 %, matmul +5.8 %, everything
+        // else identical to the instruction -- total -0.16 %. More cells in
+        // registers, the same amount of work, and one clear loser. Round 90
+        // is a round about a wrong-code bug; a register allocation change
+        // that buys nothing is exactly the kind of thing that should not
+        // ride along with it, so `release-fast` comes out of this round
+        // BIT-IDENTICAL to what went in.
         let s = 0usize;
         let e = end[cv];
-        let cc = call_pos.iter().any(|&p| s <= p && p <= e);
-        let cm = memop_pos.iter().any(|&p| s <= p && p <= e);
-        let cd = divsel_pos.iter().any(|&p| s <= p && p <= e);
+        let killed = rough(s, e);
         // Cells are almost always the hottest values: double the weight.
         // (Round 87: they are counted apart. A cell has to survive from the
         // start of the function to its last access, so `crosses_call` is
@@ -1039,9 +1259,8 @@ pub fn allocate(f: &Func) -> Alloc {
             start: s,
             end: e,
             weight: weight[cv].saturating_mul(2).max(1),
-            crosses_call: cc,
-            crosses_memop: cm,
-            crosses_divsel: cd,
+            killed,
+            is_cell: true,
         });
     }
     ivs.sort_by_key(|i| (i.start, i.end, i.val));
@@ -1072,22 +1291,8 @@ pub fn allocate(f: &Func) -> Alloc {
     // Four pools, from the most restricted to the freest register. `fits`
     // checks whether a register tolerates the crossings of an interval.
     fn fits(iv: &Iv, r: &str) -> bool {
-        if CALLEE_SAVED.contains(&r) {
-            return true;
-        }
-        if iv.crosses_call {
-            return false;
-        }
-        if TEMP_REGS.contains(&r) {
-            return true;
-        }
-        if ARG_SPARE.contains(&r) {
-            return !iv.crosses_memop;
-        }
-        if DIV_SPARE.contains(&r) {
-            return !iv.crosses_memop && !iv.crosses_divsel;
-        }
-        false
+        let b = reg_bit(r);
+        b != 0 && iv.killed & b == 0
     }
     let mut free_saved: Vec<&'static str> = CALLEE_SAVED.to_vec();
     let mut free_temp: Vec<&'static str> = TEMP_REGS.to_vec();
@@ -1156,23 +1361,23 @@ pub fn allocate(f: &Func) -> Alloc {
         // fill the restricted pools first, callee-saved last (it costs
         // prologue/epilogue) — unless the interval crosses a call, in which
         // case only callee-saved ones come into question.
-        let pick = if !iv.crosses_call {
-            if !free_temp.is_empty() {
-                free_temp.pop()
-            } else if !iv.crosses_memop && !iv.crosses_divsel && !free_div.is_empty() {
-                free_div.pop()
-            } else if !iv.crosses_memop && !free_arg.is_empty() {
-                free_arg.pop()
-            } else if !free_saved.is_empty() {
-                free_saved.pop()
-            } else {
-                None
-            }
-        } else if !free_saved.is_empty() {
-            free_saved.pop()
-        } else {
-            None
+        // `rposition` keeps the old `pop()` preference (the last free
+        // register of a pool) wherever the whole pool fits, and skips exactly
+        // the registers this interval may not have.
+        let take = |pool: &mut Vec<&'static str>| -> Option<&'static str> {
+            pool.iter().rposition(|r| fits(&iv, r)).map(|k| pool.remove(k))
         };
+        // MEASURED, round 90: letting a cell ask the callee-saved pool FIRST
+        // (it lives long, and the four temp registers are what the short
+        // lived values around it have) reads well and does nothing --
+        // statemachine 691.2 -> 699.6 million instructions, matmul unchanged
+        // (tools/bench90/icount.py). So the order stays one order for
+        // everybody: the cheap registers first, the ones that cost a push
+        // and a pop last.
+        let pick = take(&mut free_temp)
+            .or_else(|| take(&mut free_div))
+            .or_else(|| take(&mut free_arg))
+            .or_else(|| take(&mut free_saved));
         match pick {
             Some(r) => {
                 if CALLEE_SAVED.contains(&r) && !used_saved.contains(&r) {
@@ -1210,7 +1415,7 @@ pub fn allocate(f: &Func) -> Alloc {
                     }
                 }
                 // otherwise this value stays in the stack slot
-                if iv.crosses_call {
+                if iv.killed & M_CALL != 0 {
                     st.lost_call += 1;
                 } else {
                     st.lost_plain += 1;
@@ -1856,9 +2061,14 @@ pub(crate) fn emit_func_ra(e: &mut Emitter, f: &Func) -> Option<Result<(), Strin
     // The function is emitted into a buffer of its own first; after that the
     // register descriptor post pass strikes spill stores with an immediate
     // reload of the same value (445x statically in the tokenizer run, round 37).
-    let mut tmp = Emitter { out: String::new(), debug_funcs: Vec::new(), xmm: Default::default() };
+    let mut tmp = Emitter { out: String::new(), cold: String::new(), debug_funcs: Vec::new(), xmm: Default::default() };
     match emit_with(&mut tmp, f, &a) {
         Ok(()) => {
+            // ROUND 90: the panic arms of the checked operations, behind the
+            // function they belong to. They go through the descriptor pass
+            // with the rest -- every one of them starts with a `.L` label,
+            // which resets the descriptor, so they can believe nothing.
+            tmp.flush_cold();
             let nv = f.val_types.len();
             e.out.push_str(&descriptor_peephole(&tmp.out, nv));
             Some(Ok(()))
@@ -1888,8 +2098,19 @@ pub(crate) fn emit_func_ra(e: &mut Emitter, f: &Func) -> Option<Result<(), Strin
 //  * `call` clears all caller-saved registers out of the descriptor,
 //    `syscall` rax/rcx/r11, `rep movsb/stosb` rdi/rsi/rcx, `div/idiv`
 //    rax/rdx, `cqo/cdq` rdx, `setcc` al (= rax).
+//  * ROUND 90: the ONE OPERAND `mul`/`imul` clear rax and rdx. They write
+//    `rdx:rax` while naming neither register, so the old allowlist below
+//    saw `mul rcx` and invalidated NOTHING -- the same blind spot in the
+//    same file that made the allocator hand `rdx` to a live value
+//    (`inst_clobbers` above). `cpuid` (rax/rbx/rcx/rdx), the `lock`
+//    prefixed read-modify-writes and `crc32` had the same hole.
 //  * Every other instruction that writes a tracked register as its target
 //    operand (mov/lea/add/.../cmov) invalidates exactly that register.
+//  * ROUND 90, AND THIS IS THE PART THAT MATTERS: anything NOT recognised
+//    here throws the whole descriptor away instead of being ignored. The
+//    old code fell through silently, so every instruction somebody adds to
+//    the backend without touching this table was a latent wrong-code bug.
+//    Now the worst a new instruction can cost is a missed reload.
 fn descriptor_peephole(asm: &str, nv: usize) -> String {
     /// 64-bit trunk register of a register name at any width.
     fn stem(r: &str) -> &str {
@@ -2157,11 +2378,44 @@ fn descriptor_peephole(asm: &str, nv: usize) -> String {
             out.push('\n');
             continue;
         }
+        // ROUND 90 -- the ONE OPERAND forms of `mul`/`imul`: the product is
+        // `rdx:rax` (`dx:ax`, `high:low`) and neither register is written
+        // down. `mul cl` alone stays inside `ax`, but clearing rdx as well
+        // costs nothing and needs no width case.
+        if mn == "mul" || (mn == "imul" && !ops.contains(',')) {
+            kill_reg("rax", &mut sync, &mut holds);
+            kill_reg("rdx", &mut sync, &mut holds);
+            nullab.remove("rax");
+            nullab.remove("rdx");
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        if mn == "cpuid" {
+            for r in ["rax", "rbx", "rcx", "rdx"] {
+                kill_reg(r, &mut sync, &mut holds);
+                nullab.remove(r);
+            }
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        // `lock xadd [rcx], rax` / `lock cmpxchg [rcx], rdx`: a register AND
+        // a memory cell at an address the descriptor cannot follow.
+        if mn == "lock" {
+            sync.clear();
+            holds.clear();
+            nullab.clear();
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
         // Instructions that write their first operand register.
         if matches!(
             mn,
             "mov" | "movzx" | "movsx" | "movsxd" | "lea" | "add" | "sub" | "and" | "or" | "xor"
-                | "imul" | "shl" | "sar" | "shr" | "neg" | "not" | "pop"
+                | "imul" | "shl" | "sar" | "shr" | "neg" | "not" | "pop" | "crc32" | "adc"
+                | "sbb" | "bswap" | "rol" | "ror" | "bsr" | "bsf" | "popcnt" | "tzcnt" | "lzcnt"
         ) || mn.starts_with("cmov")
         {
             let target = ops.split(',').next().unwrap_or("").trim();
@@ -2198,6 +2452,21 @@ fn descriptor_peephole(asm: &str, nv: usize) -> String {
                     nullab.remove(&zs);
                 }
             }
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        // ROUND 90 -- THE CATCH-ALL. Reaching here means the mnemonic is not
+        // in any table above. Read-only instructions are listed by name;
+        // everything else is unknown, and an unknown instruction may write
+        // anything, so the descriptor is emptied rather than kept.
+        if !matches!(mn, "cmp" | "test" | "push" | "cld" | "std" | "nop" | "ud2" | "int3" | "hlt")
+            && !mn.starts_with('#')
+            && !mn.starts_with('.')
+        {
+            sync.clear();
+            holds.clear();
+            nullab.clear();
         }
         out.push_str(line);
         out.push('\n');
@@ -2779,23 +3048,39 @@ fn emit_inst(
         // one may be folded into an address computation).
         Op::CheckedBin { op, a, b, msg } => {
             let d = i.dst.ok_or("internal error: checked binary operation without target")?;
+            // ROUND 90, stage 2d -- the DIRECT form. See `checked_direct`.
+            if checked_direct(e, ra, *op, ty, *a, *b, d, msg, site) {
+                return Ok(());
+            }
             ra.load_ext(e, "rax", *a, ty, 64);
             ra.load_ext(e, "rcx", *b, ty, 64);
-            crate::panic_rt::emit_checked_bin(e, *op, ty, msg, site);
+            crate::panic_rt::emit_checked_bin(e, *op, ty, msg, site, &|e: &mut Emitter| {
+                // ROUND 90: the failure arm reloads instead of finding the
+                // values on the stack. `rcx` before `rdx`: if `b` lives in
+                // rdx the first load rescues it, and `a` can never live in
+                // rdx at a checked operation (`op_pins`).
+                ra.load_ext(e, "rcx", *b, ty, 64);
+                ra.load_ext(e, "rdx", *a, ty, 64);
+            });
             ra.store_dst(e, d, "rax");
         }
         Op::CheckedDiv { op, a, b, msg_zero, msg_range } => {
             let d = i.dst.ok_or("internal error: checked division without target")?;
             ra.load_ext(e, "rax", *a, ty, 64);
             ra.load_ext(e, "rcx", *b, ty, 64);
-            crate::panic_rt::emit_checked_div(e, *op, ty, msg_zero, msg_range, site);
+            crate::panic_rt::emit_checked_div(e, *op, ty, msg_zero, msg_range, site, &|e: &mut Emitter| {
+                ra.load_ext(e, "rcx", *b, ty, 64);
+                ra.load_ext(e, "rdx", *a, ty, 64);
+            });
             let res = if *op == BinOp::Div { "rax" } else { "rdx" };
             ra.store_dst(e, d, res);
         }
         Op::CheckedCast { src, from, msg } => {
             let d = i.dst.ok_or("internal error: checked cast without target")?;
             ra.load_ext(e, "rax", *src, *from, 64);
-            crate::panic_rt::emit_checked_cast(e, *from, ty, msg, site);
+            crate::panic_rt::emit_checked_cast(e, *from, ty, msg, site, &|e: &mut Emitter| {
+                ra.load_ext(e, "rdx", *src, *from, 64);
+            });
             ra.store_dst(e, d, "rax");
         }
         // ROUND 89 -- the checked ARRAY INDEX (SPEC section 13, item L9).
@@ -3500,6 +3785,101 @@ fn emit_bin(
     Ok(())
 }
 
+/// **ROUND 90, STAGE 2d** — a checked `+` or `-` computed IN THE TARGET
+/// REGISTER, with the second operand as an immediate or a memory operand.
+///
+/// The unchecked path has done this since round 51 (`emit_bin` below): if
+/// the result has a register, `add r13, 1` is the whole instruction. The
+/// checked path did not — it loaded BOTH operands into rax/rcx first,
+/// because the failure arm has to print them and `panic_rt` was written
+/// around that pair of registers. So `k = k + 1` inside a loop cost
+///
+///     mov rax, r12 / mov rcx, 1 / add rax, rcx / jc site / mov r12, rax
+///
+/// where `release-fast` needs `lea r12, [r12+1]`. Four instructions of
+/// difference on the counter of every loop in the program, and nothing in
+/// them was the check.
+///
+/// This is the same shape as the unchecked one plus the branch:
+///
+///     add r12, 1 / jc site
+///
+/// The failure arm cannot reload `a` any more when `a` lived in the target
+/// register — it has just been overwritten. It does not have to: for `+`
+/// the original is `d - b`, for `-` it is `d + b`, both exact in two's
+/// complement at the width the operation was carried out in. The arm
+/// recomputes it, out of line, on the path that never returns.
+///
+/// Returns `false` when the shape does not fit (no target register, the
+/// second operand living in the target register, a multiplication); the
+/// caller then emits the rax/rcx form exactly as before.
+#[allow(clippy::too_many_arguments)]
+fn checked_direct(
+    e: &mut Emitter,
+    ra: &Ra,
+    op: BinOp,
+    ty: FTy,
+    a: Val,
+    b: Val,
+    d: Val,
+    msg: &str,
+    site: &mut crate::panic_rt::SiteCounter,
+) -> bool {
+    if !matches!(op, BinOp::Add | BinOp::Sub) {
+        return false;
+    }
+    if std::env::var_os("FIRN_NO_CHECKED_DIRECT").is_some() {
+        return false;
+    }
+    let dr = match ra.a.loc(d) {
+        Loc::Reg(r) => r,
+        Loc::Slot(_) => return false,
+    };
+    // The second operand may not live where the result is about to be
+    // written: `add r12, r12` would read the half finished value, and the
+    // failure arm could not reload it either.
+    if matches!(ra.a.place(b), Loc::Reg(r) if r == dr) {
+        return false;
+    }
+    let bits = ty.bits().max(8);
+    let ob = ra.opnd_w(b, bits);
+    if ob == rn(dr, bits) {
+        return false;
+    }
+    // An immediate wider than 32 bits has no `add r64, imm` form.
+    if let Some(k) = ra.a.imm(b) {
+        if i32::try_from(k).is_err() {
+            return false;
+        }
+    }
+    ra.load_ext(e, dr, a, ty, bits);
+    let m = if op == BinOp::Add { "add" } else { "sub" };
+    e.line(&format!("{} {}, {}", m, rn(dr, bits), ob));
+    crate::panic_rt::emit_checked_tail(e, op, ty, msg, site, &|e: &mut Emitter| {
+        // rcx first: `b` still lives where it did, the operation touched
+        // only `dr`.
+        ra.load_ext(e, "rcx", b, ty, 64);
+        // and `a` back out of the result -- the one thing the stack rescue
+        // of round 72 was really for.
+        e.line(&format!("mov rdx, {}", dr));
+        let inv = if op == BinOp::Add { "sub" } else { "add" };
+        e.line(&format!("{} {}, {}", inv, rn("rdx", bits), rn("rcx", bits)));
+        if bits < 64 {
+            if bits == 32 {
+                if ty.signed() {
+                    e.line("movsxd rdx, edx");
+                } else {
+                    e.line("mov edx, edx");
+                }
+            } else {
+                let ext = if ty.signed() { "movsx" } else { "movzx" };
+                e.line(&format!("{} rdx, {}", ext, rn("rdx", bits)));
+            }
+        }
+    });
+    true
+}
+
 /// **ROUND 72** -- `+% -% *%` (wrapping) and `+| -| *|` (saturating), SPEC
 /// section 13 item L9, register allocator aware path. Mirrors
 /// `codegen_x86.rs::emit_wrap_sat` instruction for instruction; the two
@@ -3714,7 +4094,7 @@ mod tests {
         let mut f = Func::new("f", vec![FTy::I64; 7], FTy::I64);
         f.set_term(0, Term::Ret(Some(6)));
         assert!(supported(&f));
-        let mut e = Emitter { out: String::new(), debug_funcs: Vec::new(), xmm: Default::default() };
+        let mut e = Emitter { out: String::new(), cold: String::new(), debug_funcs: Vec::new(), xmm: Default::default() };
         emit_func_ra(&mut e, &f).expect("register path responsible").expect("codegen");
         assert!(e.out.contains("qword ptr [rbp+16]"), "{}", e.out);
     }
@@ -3732,7 +4112,7 @@ mod tests {
         let rc = g.push(0, FTy::I32, Op::Cast { src: r, from: FTy::I64 });
         g.set_term(0, Term::Ret(Some(rc)));
         assert!(supported(&g));
-        let mut e = Emitter { out: String::new(), debug_funcs: Vec::new(), xmm: Default::default() };
+        let mut e = Emitter { out: String::new(), cold: String::new(), debug_funcs: Vec::new(), xmm: Default::default() };
         emit_func_ra(&mut e, &g).expect("register path responsible").expect("codegen");
         assert!(e.out.contains("sub rsp, 16"), "{}", e.out);
         assert!(e.out.contains("mov qword ptr [rsp+0], rax"), "{}", e.out);
@@ -3874,4 +4254,144 @@ mod tests {
         assert!(body.contains("ret"), "{}", asm);
     }
 
+    // ---------------------------------------------- ROUND 90: the clobbers ---
+
+    fn inst(ty: FTy, op: Op) -> Inst {
+        Inst { dst: Some(0), ty, op }
+    }
+
+    /// THE TABLE OF ROUND 90. Every entry is an instruction whose emitted
+    /// code writes a register its operand list does not name, or one that
+    /// deliberately does NOT. Getting a single line of this wrong is a
+    /// wrong-code bug on `release-safe` and `dev-fast`, which is what
+    /// happened: see the module note at `inst_clobbers`.
+    #[test]
+    fn implicit_clobbers_are_modelled() {
+        let msg = || "m".to_string();
+        // The instruction of the bug: one-operand `mul rcx` -> rdx:rax.
+        for ty in [FTy::U16, FTy::U32, FTy::U64] {
+            let i = inst(ty, Op::CheckedBin { op: BinOp::Mul, a: 1, b: 2, msg: msg() });
+            assert!(inst_clobbers(&i) & M_RDX != 0, "checked u{} `*` must claim rdx", ty.bits());
+        }
+        // `mul cl` computes in ax alone, `imul rax, rcx` writes its target.
+        assert_eq!(
+            inst_clobbers(&inst(FTy::U8, Op::CheckedBin { op: BinOp::Mul, a: 1, b: 2, msg: msg() })),
+            0
+        );
+        assert_eq!(
+            inst_clobbers(&inst(FTy::I64, Op::CheckedBin { op: BinOp::Mul, a: 1, b: 2, msg: msg() })),
+            0
+        );
+        // Checked `+`/`-` write nothing but rax. Before round 90 they banned
+        // rdx wholesale through `crosses_divsel`.
+        for op in [BinOp::Add, BinOp::Sub] {
+            assert_eq!(inst_clobbers(&inst(FTy::U64, Op::CheckedBin { op, a: 1, b: 2, msg: msg() })), 0);
+        }
+        // A checked `as` keeps the original in rdx to compare the round trip
+        // against (round 90; round 72 pushed it on the stack instead).
+        assert_eq!(
+            inst_clobbers(&inst(FTy::U8, Op::CheckedCast { src: 1, from: FTy::U64, msg: msg() })),
+            M_RDX
+        );
+        // Division, checked and unchecked: the remainder register.
+        for op in [BinOp::Div, BinOp::Rem] {
+            assert_eq!(inst_clobbers(&inst(FTy::U64, Op::Bin(op, 1, 2))), M_RDX);
+            let d = Op::CheckedDiv { op, a: 1, b: 2, msg_zero: msg(), msg_range: msg() };
+            assert_eq!(inst_clobbers(&inst(FTy::I64, d)), M_RDX);
+        }
+        // `cmov` fetches the condition into rdx first, `cmpxchg` uses it as
+        // its third operand.
+        assert_eq!(inst_clobbers(&inst(FTy::U64, Op::Select { cond: 1, a: 2, b: 3 })), M_RDX);
+        assert_eq!(inst_clobbers(&inst(FTy::U64, Op::AtomicCas { addr: 1, erw: 2, new: 3 })), M_RDX);
+        // `rep movsb`/`rep stosb`: rdi and rsi -- and NOT rdx.
+        assert_eq!(
+            inst_clobbers(&inst(FTy::U64, Op::CopyMem { dst: 1, src: 2, size: 8 })),
+            M_RDI | M_RSI
+        );
+        assert_eq!(inst_clobbers(&inst(FTy::U64, Op::CopyMem { dst: 1, src: 2, size: 8 })) & M_RDX, 0);
+        // Wrapping is the unchecked path bit for bit; saturating clamps
+        // through rdx (signed) or multiplies through `mul` (unsigned).
+        use crate::fir::WrapSatKind;
+        assert_eq!(
+            inst_clobbers(&inst(
+                FTy::U64,
+                Op::BinWrapSat { kind: WrapSatKind::Wrap, op: BinOp::Mul, a: 1, b: 2 }
+            )),
+            0
+        );
+        assert_eq!(
+            inst_clobbers(&inst(
+                FTy::I64,
+                Op::BinWrapSat { kind: WrapSatKind::Sat, op: BinOp::Add, a: 1, b: 2 }
+            )),
+            M_RDX
+        );
+        assert_eq!(
+            inst_clobbers(&inst(
+                FTy::U64,
+                Op::BinWrapSat { kind: WrapSatKind::Sat, op: BinOp::Mul, a: 1, b: 2 }
+            )),
+            M_RDX
+        );
+        // A call destroys every caller-saved register and NO callee-saved
+        // one -- that is what makes an interval across a call allocatable at
+        // all.
+        let c = inst(FTy::U64, Op::Call { name: "f".into(), args: vec![] });
+        assert_eq!(inst_clobbers(&c), M_CALL);
+        for r in ["rbx", "r12", "r13", "r14", "r15"] {
+            assert_eq!(inst_clobbers(&c) & reg_bit(r), 0, "a call must not claim {}", r);
+        }
+        for r in ["rdx", "rsi", "rdi", "r8", "r9", "r10", "r11"] {
+            assert!(inst_clobbers(&c) & reg_bit(r) != 0, "a call must claim {}", r);
+        }
+    }
+
+    /// `POOL` and `reg_bit` have to describe the same twelve registers as
+    /// the four hand-out pools -- and rax/rcx must be in none of them.
+    #[test]
+    fn the_pool_is_the_four_pools() {
+        let mut seen: RegMask = 0;
+        for r in CALLEE_SAVED.iter().chain(TEMP_REGS.iter()).chain(ARG_SPARE.iter()).chain(DIV_SPARE.iter()) {
+            let b = reg_bit(r);
+            assert!(b != 0, "{} is handed out but has no bit", r);
+            assert_eq!(seen & b, 0, "{} lies in two pools", r);
+            seen |= b;
+        }
+        assert_eq!(seen, (1 << POOL.len()) - 1, "pool and hand-out pools disagree");
+        assert_eq!(reg_bit("rax"), 0);
+        assert_eq!(reg_bit("rcx"), 0);
+    }
+
+    /// The end of the bug, at the level of the allocation: a value that
+    /// lives ACROSS a checked unsigned multiplication may not be in rdx,
+    /// and one that only lives across a checked ADDITION may.
+    #[test]
+    fn a_value_across_a_checked_mul_loses_rdx() {
+        // Enough long-lived values that the four temp registers are gone
+        // and rdx is really the next one in line.
+        let build = |op: BinOp| -> Vec<Loc> {
+            let mut f = Func::new("m", vec![FTy::U64; 6], FTy::U64);
+            let x = f.push(0, FTy::U64, Op::CheckedBin { op, a: 0, b: 1, msg: "m".into() });
+            // every parameter is read again AFTER the checked operation
+            let mut acc = x;
+            for p in 0..6u32 {
+                acc = f.push(0, FTy::U64, Op::Bin(BinOp::Add, acc, p));
+            }
+            f.set_term(0, Term::Ret(Some(acc)));
+            let a = allocate(&f);
+            (0..6).map(|v| a.loc(v as Val)).collect()
+        };
+        let mul = build(BinOp::Mul);
+        assert!(
+            !mul.iter().any(|l| *l == Loc::Reg("rdx")),
+            "a value survives `mul` in rdx: {:?}",
+            mul
+        );
+        let add = build(BinOp::Add);
+        assert!(
+            add.iter().any(|l| *l == Loc::Reg("rdx")),
+            "a checked `+` writes no rdx, so rdx must still be handed out: {:?}",
+            add
+        );
+    }
 }

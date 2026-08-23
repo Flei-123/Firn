@@ -53,17 +53,36 @@
 //! recover differently (`PANIC_ADD` .. `PANIC_CAST` below); an `app`
 //! program never sees the number, only the text.
 //!
-//! ## A register that is not free to use
+//! ## Where the two operand values come from — ROUND 90
 //!
-//! `regalloc.rs`'s `TEMP_REGS` includes `r10`/`r11` as ordinary VALUE
-//! registers — a live value can sit there across the checked instruction,
-//! to be read again afterwards. Only `rax`/`rcx`/`rdx` are ever pure
-//! scratch at a checked site (the same three the UNCHECKED arithmetic path
-//! already computes in). That is why the two original operand values are
-//! rescued on the STACK (`push`/`push`, popped back in the success case
-//! with a plain `add rsp, 16`, or popped INTO the message registers in the
-//! failure case) rather than in a spare register: the stack is the one
-//! storage neither backend's allocator ever hands out to a FIR value.
+//! The message names both operands, so the failure arm needs them after the
+//! instruction has already overwritten `rax` (and, for `mul`, `rdx`).
+//! Round 72 solved that by rescuing them on the STACK: `push rax` / `push
+//! rcx` before the operation, `add rsp, 16` in the success case, `pop` in
+//! the failure case. It works, and it costs two memory writes and a stack
+//! adjustment ON THE PATH THAT NEVER FAILS — plus the `jmp` over the
+//! failure arm, which sat inline in the instruction stream. Four
+//! instructions of overhead per arithmetic operation. Measured with
+//! `tools/bench90`, the checks cost **1.90x** in the median, `matmul`
+//! **7.01x**.
+//!
+//! Round 90 does not rescue them. It RELOADS them, in the failure arm, from
+//! wherever they already live — the caller hands in a `Restore` closure that
+//! emits exactly the loads it used to fill `rax`/`rcx` in the first place
+//! (`ra.load_ext` on the register path, `load_ext` on the base path). The
+//! home of an operand is by definition still intact at the instruction that
+//! reads it, and the failure arm is reached only from there.
+//!
+//! The one thing that had to be paid for it: an operand may no longer live
+//! in a register the instruction itself destroys. For the one-operand `mul`
+//! that is `rdx`, and `regalloc.rs::op_pins` now pins the operands of the
+//! checked operations for exactly that reason. It costs at most one register
+//! at one instruction; the stack traffic it replaces was paid every
+//! iteration.
+//!
+//! And the whole failure arm now goes into `Emitter::cold`, behind the
+//! function. The hot path of a checked operation is the operation and ONE
+//! forward conditional branch that is not taken.
 
 use std::cell::{Cell, RefCell};
 
@@ -519,17 +538,12 @@ pub(crate) fn emit_checked_bin(
     ty: FTy,
     msg: &str,
     site: &mut SiteCounter,
+    restore: &dyn Fn(&mut Emitter),
 ) {
     let bits = ty.bits();
     let label = intern(msg);
     let uid = site.next();
-    let ok = format!(".Lchkok{}", uid);
     let site_label = format!(".Lchksite{}", uid);
-    // The two ORIGINAL values go on the stack — neither backend's register
-    // allocator ever spills a live FIR value there behind our back at this
-    // exact point, unlike r10/r11 (see the module header).
-    e.line("push rax");
-    e.line("push rcx");
     match op {
         BinOp::Add => e.line(&format!("add {}, {}", narrow("rax", bits), narrow("rcx", bits))),
         BinOp::Sub => e.line(&format!("sub {}, {}", narrow("rax", bits), narrow("rcx", bits))),
@@ -558,20 +572,55 @@ pub(crate) fn emit_checked_bin(
     // one-operand `mul` form sets CF=OF together for unsigned overflow, so
     // testing CF for every unsigned op (not just Mul) is correct across
     // the board; signed stays on OF, its own meaning of "out of range".
+    //
+    // ROUND 90: this is the WHOLE hot path now. One forward conditional
+    // branch, not taken, into the cold half of the function.
+    emit_check_branch(e, op, ty, msg, uid, restore);
+}
+
+/// ROUND 90 — the branch and the out-of-line arm of a checked `+ - *`, on
+/// its own so that `regalloc.rs::checked_direct` can use exactly the same
+/// ending after computing the operation its own way.
+pub(crate) fn emit_checked_tail(
+    e: &mut Emitter,
+    op: BinOp,
+    ty: FTy,
+    msg: &str,
+    site: &mut SiteCounter,
+    restore: &dyn Fn(&mut Emitter),
+) {
+    let uid = site.next();
+    emit_check_branch(e, op, ty, msg, uid, restore);
+}
+
+fn emit_check_branch(
+    e: &mut Emitter,
+    op: BinOp,
+    ty: FTy,
+    msg: &str,
+    uid: String,
+    restore: &dyn Fn(&mut Emitter),
+) {
+    let label = intern(msg);
+    let site_label = format!(".Lchksite{}", uid);
     e.line(&format!(
         "j{} {}",
         if ty.signed() { "o" } else { "c" },
         site_label
     ));
-    // Success: drop the two rescued words (their values are not needed
-    // again — the caller already has the answer in rax) and continue.
-    e.line("add rsp, 16");
-    e.line(&format!("jmp {}", ok));
-    e.raw(&format!("{}:", site_label));
-    e.line("pop rcx");
-    e.line("pop rdx");
-    emit_trampoline_jump(e, panic_code_of(op), &label, msg, "rdx", "rcx", !ty.signed());
-    e.raw(&format!("{}:", ok));
+    e.cold_raw(&format!("{}:", site_label));
+    let mut cold = std::mem::take(&mut e.cold);
+    // The failure arm reloads the two originals instead of finding them on
+    // the stack. `restore` writes into `e.out`, so it is caught and moved
+    // over -- that keeps every caller's loading code (and only its loading
+    // code) usable here without a second implementation of it.
+    let mut tmp = Emitter { out: String::new(), cold: String::new(), xmm: Default::default(), debug_funcs: Vec::new() };
+    restore(&mut tmp);
+    cold.push_str(&tmp.out);
+    e.cold = cold;
+    let mut arm = Emitter { out: String::new(), cold: String::new(), xmm: Default::default(), debug_funcs: Vec::new() };
+    emit_trampoline_jump(&mut arm, panic_code_of(op), &label, msg, "rdx", "rcx", !ty.signed());
+    e.cold.push_str(&arm.out);
 }
 
 /// Emits `/` and `%`, CHECKED (SPEC §13, `L9`): division by zero, and for
@@ -584,30 +633,31 @@ pub(crate) fn emit_checked_bin(
 /// destroy `rdx`).
 pub(crate) fn emit_checked_div(
     e: &mut Emitter,
-    op: BinOp,
+    _op: BinOp,
     ty: FTy,
     msg_zero: &str,
     msg_range: &str,
     site: &mut SiteCounter,
+    restore: &dyn Fn(&mut Emitter),
 ) {
     let bits = ty.bits().max(32);
     let wide = ty.bits() > 32;
     let uid = site.next();
-    let past_zero = format!(".Lchkdivz{}", uid);
-    let past_range = format!(".Lchkdivr{}", uid);
     let site_zero = format!(".Lchksitez{}", uid);
     let site_range = format!(".Lchksiter{}", uid);
-    e.line("push rax");
-    e.line("push rcx");
+    // ROUND 90: no rescue on the stack. Both failure arms reload.
+    let cold_arm = |e: &mut Emitter, lbl: &str, code: u64, msg: &str, unsigned: bool| {
+        let label = intern(msg);
+        e.cold_raw(&format!("{}:", lbl));
+        let mut tmp = Emitter { out: String::new(), cold: String::new(), xmm: Default::default(), debug_funcs: Vec::new() };
+        restore(&mut tmp);
+        emit_trampoline_jump(&mut tmp, code, &label, msg, "rdx", "rcx", unsigned);
+        let arm = tmp.out;
+        e.cold.push_str(&arm);
+    };
     e.line(&format!("test {}, {}", narrow("rcx", bits), narrow("rcx", bits)));
     e.line(&format!("jz {}", site_zero));
-    e.line(&format!("jmp {}", past_zero));
-    e.raw(&format!("{}:", site_zero));
-    e.line("pop rcx");
-    e.line("pop rdx");
-    let label0 = intern(msg_zero);
-    emit_trampoline_jump(e, PANIC_DIV0, &label0, msg_zero, "rdx", "rcx", !ty.signed());
-    e.raw(&format!("{}:", past_zero));
+    cold_arm(e, &site_zero, PANIC_DIV0, msg_zero, !ty.signed());
     if ty.signed() {
         // MIN / -1: two compares with a shared "definitely fine" target —
         // either one failing to match already rules the special case out.
@@ -617,17 +667,15 @@ pub(crate) fn emit_checked_div(
             FTy::I32 => i32::MIN as i64,
             _ => i64::MIN,
         };
+        let past_range = format!(".Lchkdivr{}", uid);
         // `cmp r64, imm32` is the only immediate FORM x86-64 has for a
         // 64-bit register compare -- the assembler sign-extends a 32-bit
         // literal, which cannot represent `i64::MIN` at all (found
-        // compiling firnc1.fi itself: `as` rejected "operand type
-        // mismatch" the moment an actual `i64` division reached this
-        // path, something none of this round's own hand-written `.fi`
-        // test files happened to exercise at 64 bits). `rdx` is free
-        // scratch here regardless of width: the rescued pair still sits
-        // on the stack UNTOUCHED (the `add rsp, 16` below is the first
-        // thing to consume it), and the `site_range` arm below already
-        // overwrites `rdx` with `pop rdx` before it is read again.
+        // compiling firnc1.fi itself). ROUND 90: `rdx` is no longer free
+        // scratch here, because nothing is rescued on the stack any more
+        // and an operand may live in it -- `regalloc.rs::inst_clobbers`
+        // says `CheckedDiv` claims rdx and `op_pins` keeps the operands out
+        // of it, so it IS free, but only because both say so.
         if bits > 32 {
             e.line(&format!("mov rdx, {}", min_val));
             e.line("cmp rax, rdx");
@@ -636,18 +684,10 @@ pub(crate) fn emit_checked_div(
         }
         e.line(&format!("jne {}", past_range));
         e.line(&format!("cmp {}, -1", narrow("rcx", bits)));
-        e.line(&format!("jne {}", past_range));
-        e.line(&format!("jmp {}", site_range));
-        e.raw(&format!("{}:", site_range));
-        e.line("pop rcx");
-        e.line("pop rdx");
-        let label_r = intern(msg_range);
-        emit_trampoline_jump(e, PANIC_DIV_OVERFLOW, &label_r, msg_range, "rdx", "rcx", false);
+        e.line(&format!("je {}", site_range));
+        e.raw(&format!("{}:", past_range));
+        cold_arm(e, &site_range, PANIC_DIV_OVERFLOW, msg_range, false);
     }
-    e.raw(&format!("{}:", past_range));
-    // Nothing went out of range: the stack still holds the two rescued
-    // words underneath the (untouched) rax/rcx — drop them and divide.
-    e.line("add rsp, 16");
     if ty.signed() {
         if wide {
             e.line("cqo");
@@ -678,13 +718,16 @@ pub(crate) fn emit_checked_cast(
     to: FTy,
     msg: &str,
     site: &mut SiteCounter,
+    restore: &dyn Fn(&mut Emitter),
 ) {
     let uid = site.next();
-    let ok = format!(".Lchkcast{}", uid);
     let site_label = format!(".Lchksitec{}", uid);
     let from_bits = from.bits();
     let to_bits = to.bits();
-    e.line("push rax");
+    // ROUND 90: no `push rax`. The round trip is compared against the
+    // original in `rdx` -- which `regalloc.rs` now knows a checked cast
+    // claims, and which `op_pins` keeps the source value out of.
+    e.line("mov rdx, rax");
     let narrow_to_then_widen_from = |e: &mut Emitter| {
         if to_bits < 64 {
             if to_bits == 32 {
@@ -712,19 +755,11 @@ pub(crate) fn emit_checked_cast(
         }
     };
     narrow_to_then_widen_from(e);
-    e.line("cmp qword ptr [rsp], rax");
-    e.line(&format!("je {}", ok));
-    e.line(&format!("jmp {}", site_label));
-    e.raw(&format!("{}:", site_label));
-    e.line("pop rdx");
-    let label = intern(msg);
-    emit_trampoline_jump(e, PANIC_CAST, &label, msg, "rdx", "rdx", !from.signed());
-    e.raw(&format!("{}:", ok));
-    // Nothing was lost: restore the ORIGINAL value from the stack (the
-    // comparison above widened it past `to`'s own width again) and narrow
-    // it once more, cleanly, to `to`'s width — the caller's `store_dst`
-    // takes it from there exactly as the unchecked `Op::Cast` path does.
-    e.line("pop rax");
+    e.line("cmp rax, rdx");
+    e.line(&format!("jne {}", site_label));
+    // Nothing was lost. `rax` holds the value widened back to `from`'s own
+    // width; narrowing it to `to` once more is what the caller's `store_dst`
+    // expects, exactly as the unchecked `Op::Cast` path does.
     if to_bits < 64 {
         if to_bits == 32 {
             if to.signed() {
@@ -737,6 +772,15 @@ pub(crate) fn emit_checked_cast(
             e.line(&format!("{} rax, {}", ext, narrow("rax", to_bits)));
         }
     }
+    let label = intern(msg);
+    e.cold_raw(&format!("{}:", site_label));
+    let mut tmp = Emitter { out: String::new(), cold: String::new(), xmm: Default::default(), debug_funcs: Vec::new() };
+    restore(&mut tmp);
+    // A cast has ONE value; the message never prints "b=" for it, the
+    // repeated number is a harmless redundancy (see the module note).
+    emit_trampoline_jump(&mut tmp, PANIC_CAST, &label, msg, "rdx", "rdx", !from.signed());
+    let arm = tmp.out;
+    e.cold.push_str(&arm);
 }
 
 /// **ROUND 89** — the checked ARRAY INDEX (SPEC §13, `L9`).
