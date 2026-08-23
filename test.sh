@@ -131,16 +131,18 @@
 #      aarch64-linux-gnu-gcc in both directions past the end of the
 #      register file (tools/aarch64/machine.sh). What aarch64 cannot do is
 #      counted and named, not filtered out.
-#  46. THE FIRST FIVE MINUTES (tools/firstrun/run.sh, round 88): seven
+#  46. THE FIRST FIVE MINUTES (tools/firstrun/run.sh, round 88): eight
 #      programs of the kind a stranger writes before he has read anything --
 #      join text, compare, print, take pieces out, put a number into a
-#      sentence, read a file, and forty thousand joins as a real load on the
-#      collector. Not one of them says a word about a collector; each has to
-#      COMPILE, RUN and print exactly its `.out` file, with the optimizer,
-#      without it, and through firnc1. Three counter-checks: a program
-#      without text gets NO setup in `_start`, the joining one gets it
-#      EXACTLY once, and `profile kernel` gets neither an entry point nor a
-#      collector.
+#      sentence, read a file, forty thousand joins as a real load on the
+#      collector, and `string`/`str` as ONE type. Not one of them says a
+#      word about a collector; each has to COMPILE, RUN and print exactly
+#      its `.out` file, with the optimizer, without it, and through firnc1.
+#      Four counter-checks: a program without text gets NO setup in
+#      `_start`, the joining one gets it EXACTLY once, `profile kernel` gets
+#      neither an entry point nor a collector, and both spellings of the
+#      text type pull in the same runtime and name the same canonical type
+#      in an error message.
 #  10. DOM soak run (tools/dom_soak/run.sh): the DOM prototype in Firn builds
 #      real cycles continuously (parent/child, listener, JS wrapper) and must
 #      not grow while doing so; the deliberately leaking counter-check with
