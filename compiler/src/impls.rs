@@ -437,8 +437,11 @@ pub(crate) fn target_of(
     method: &str,
     recv: &Type,
 ) -> Option<(String, bool)> {
-    let (prefix, is_ptr) = receiver_prefix(tcx, recv)?;
-    let full = fn_name(&prefix, method);
+    let (prefixes, is_ptr) = receiver_prefixes(tcx, recv)?;
+    let full = prefixes
+        .iter()
+        .map(|p| fn_name(p, method))
+        .find(|f| fns.contains_key(f))?;
     let sig = fns.get(&full)?;
     let will_ptr = sig.params.first().map(|t| t.is_ptr()).unwrap_or(false);
     Some((full, will_ptr && !is_ptr))
@@ -489,6 +492,86 @@ fn is_slot(e: &Expr) -> bool {
     }
 }
 
+/// **ROUND 88** — every name under which the methods of this receiver may
+/// stand, most specific FIRST, plus whether the receiver is already present
+/// as a pointer.
+///
+/// For every ordinary type that is exactly one name, as before. Only the
+/// builtin `str` gets a second chance: it is layout compatible with
+/// `str.Span` (strtype.rs), and SPEC 8.1 promises the whole string library
+/// on a `str` without a conversion function — so after its own name the
+/// views follow, in the order in which they were declared.
+///
+/// THE ORDER IS THE COMPATIBILITY. `str` stays in front, so everything that
+/// resolved up to round 87 resolves to exactly the same function today
+/// (`a.length()` -> `str__length`, the free function of the module `str`).
+/// Only what found NOTHING there — `part`, `ab`, `to`, `utf8_part` — now
+/// reaches `impl Span`.
+fn receiver_prefixes(tcx: &TypeCtx, t: &Type) -> Option<(Vec<String>, bool)> {
+    let (name, is_ptr) = receiver_prefix(tcx, t)?;
+    let mut out = vec![name];
+    let bare = match t {
+        Type::Ptr { inner, .. } => (**inner).clone(),
+        other => other.clone(),
+    };
+    if crate::strtype::is_str(&bare) {
+        for v in crate::strtype::view_names(tcx) {
+            if !out.contains(&v) {
+                out.push(v);
+            }
+        }
+    }
+    Some((out, is_ptr))
+}
+
+/// Edit distance (Levenshtein), two rows — the material for "did you mean".
+fn distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for i in 1..=a.len() {
+        cur[0] = i;
+        for j in 1..=b.len() {
+            let c = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + c);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// Length of the common beginning — a wrong `part` is closer to `parts_count`
+/// than the pure edit distance says.
+fn common_prefix(a: &str, b: &str) -> usize {
+    a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
+}
+
+/// **ROUND 88** — the note under "type 'T' has no method 'm'".
+///
+/// Up to round 87 this line printed EVERY name the type had. On a `str` that
+/// was a list of over 200 entries in ONE line, and the one that was meant
+/// (`Span__part`) stood in the middle of it. Now the five CLOSEST names come
+/// first and the rest is counted: sorted by edit distance, ties broken by
+/// the longer common beginning and then alphabetically, so the order is
+/// settled and the message is reproducible.
+fn nearest_note(sname: &str, method: &str, mut present: Vec<String>) -> String {
+    if present.is_empty() {
+        return format!("no 'impl' block is declared for '{}'", sname);
+    }
+    let total = present.len();
+    present.sort_by(|a, b| {
+        distance(method, a)
+            .cmp(&distance(method, b))
+            .then(common_prefix(method, b).cmp(&common_prefix(method, a)))
+            .then(a.cmp(b))
+    });
+    if total <= 5 {
+        return format!("'{}' has: {}", sname, present.join(", "));
+    }
+    format!("'{}' has: {} … and {} more", sname, present[..5].join(", "), total - 5)
+}
+
 /// All methods of a type, alphabetically — for the error message.
 fn methods_of(ck: &Checker, prefix: &str) -> Vec<String> {
     let prefix = format!("{}{}", prefix, SEP);
@@ -524,7 +607,7 @@ pub(crate) fn hook_call(
         }
         return Some(Type::Error);
     }
-    let (prefix, is_ptr) = match receiver_prefix(&ck.tcx, &et) {
+    let (prefixes, is_ptr) = match receiver_prefixes(&ck.tcx, &et) {
         Some(x) => x,
         None => {
             for a in &args[1..] {
@@ -555,9 +638,16 @@ pub(crate) fn hook_call(
             ));
         }
     }
+    // The name the RECEIVER carries — that is what the message talks about,
+    // even when the function is found under `str__Span__…`.
+    let prefix = prefixes[0].clone();
     let sname = prefix.clone();
-    let full = fn_name(&prefix, &method);
-    let sig = match ck.fns.get(&full) {
+    let hit = prefixes
+        .iter()
+        .map(|p| fn_name(p, &method))
+        .find(|full| ck.fns.contains_key(full));
+    let full = hit.clone().unwrap_or_else(|| fn_name(&prefix, &method));
+    let sig = match hit.and_then(|f| ck.fns.get(&f)) {
         Some(s) => s.clone(),
         None => {
             // HOOK fnval (ROUND 68): no method of that name — but perhaps a
@@ -594,16 +684,40 @@ pub(crate) fn hook_call(
             for a in &args[1..] {
                 ck.type_out_expr(a);
             }
-            let present = methods_of(ck, &prefix);
-            let note = if present.is_empty() {
-                format!("no 'impl' block is declared for '{}'", sname)
-            } else {
-                format!("'{}' has: {}", sname, present.join(", "))
-            };
+            let mut present: Vec<String> = Vec::new();
+            for p in &prefixes {
+                for m in methods_of(ck, p) {
+                    if !present.contains(&m) {
+                        present.push(m);
+                    }
+                }
+            }
+            // ROUND 88: does the name exist, only on a DIFFERENT type of the
+            // same module? Then say THAT instead of claiming it does not
+            // exist. On a `str` that is exactly the honest answer for
+            // everything that WRITES: `str` is a view of octets that nobody
+            // may change any more (SPEC 8.0), the buffer that can be written
+            // to is `Bytes`.
+            let tail = format!("{}{}", SEP, method);
+            let elsewhere = present.iter().find(|n| n.ends_with(&tail)).cloned();
+            if let Some(other) = elsewhere {
+                let owner = other[..other.len() - tail.len()].to_string();
+                ck.dg.error_note(
+                    nspan,
+                    format!("type '{}' has no method '{}'", sname, method),
+                    format!(
+                        "'{}' has it — '{}' does not, and cannot: it is a view of \
+                         octets that nobody may change any more (SPEC 8.0). Build \
+                         the text in a '{}' and hand out its view",
+                        owner, sname, owner
+                    ),
+                );
+                return Some(Type::Error);
+            }
             ck.dg.error_note(
                 nspan,
                 format!("type '{}' has no method '{}'", sname, method),
-                note,
+                nearest_note(&sname, &method, present),
             );
             return Some(Type::Error);
         }
