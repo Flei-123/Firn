@@ -150,6 +150,31 @@ pub(crate) fn remember_views(tcx: &TypeCtx) {
     REG.with(|r| r.borrow_mut().views = views);
 }
 
+/// **ROUND 88** — the names of the structs a `str` may take its methods
+/// from: every registered view (`{ *mut u8, usize }` — that is `str.Span`),
+/// in the order in which they were declared, so that the choice is settled
+/// and does not depend on a hash table.
+///
+/// WHY THIS EXISTS. Up to round 87 `a.length()` and `a.starts_with("te")`
+/// worked on a `str` and `a.part(0, 4)` did not — and the reason was an
+/// ACCIDENT: the builtin type is called `str`, the module of the string
+/// library is called `str` too, so `a.length()` found the FREE function
+/// `str.length(s: Span)` under the very name (`str__length`) that the
+/// method resolution builds. Everything for which the module happens to
+/// have a free function of the same name looked like a method; `part` has
+/// none (it is called `span_part` there) and therefore did not exist.
+/// SPEC 8.1 promises the whole library on a `str`, so the resolution now
+/// really asks `impl Span` as well.
+pub(crate) fn view_names(tcx: &TypeCtx) -> Vec<String> {
+    REG.with(|r| {
+        r.borrow()
+            .views
+            .iter()
+            .filter_map(|i| tcx.structs.get(*i).map(|s| s.name.clone()))
+            .collect()
+    })
+}
+
 /// May these two types be used for each other?
 ///
 /// True exactly when ONE of them is the builtin `str` and the other is a
