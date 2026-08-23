@@ -16,6 +16,7 @@ mod codegen_switch;
 mod codegen_x86;
 mod comptime;
 mod config;
+mod checkmode;
 mod ct;
 mod diag;
 mod dwarf;
@@ -44,6 +45,7 @@ mod mem2reg;
 mod escape;
 mod nogc;
 mod opt;
+mod panic_rt;
 mod package;
 mod package_world;
 mod prof;
@@ -392,6 +394,10 @@ fn run(opts: &Options) -> i32 {
     // Round 49: the marker "runtime included" belongs to the start of a
     // compilation (codegen_x86::emit prints the state block afterwards).
     crate::gc::runtime_reset();
+    // ROUND 72 (SPEC section 13, item L9): does THIS build level check
+    // integer arithmetic? Set once, read by `lower.rs` for every "+ - * /"
+    // and narrowing "as".
+    crate::checkmode::set_from_level(opts.optcfg.level);
     // The sentence stands here and not in `parse_args`, because `firnc1`
     // has to write it CHARACTER FOR CHARACTER and has no `--help` remark
     // there (round 48).
