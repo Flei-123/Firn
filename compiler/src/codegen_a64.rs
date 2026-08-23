@@ -1459,10 +1459,18 @@ mod tests {
         assert_eq!(e.out.matches("movk").count(), 3, "{}", e.out);
         // -1 is the case in which NO chunk differs from 0xffff -- one
         // instruction, and it was four before the case was noticed.
-        let mut e2 = Emitter { out: String::new(), debug_funcs: Vec::new() };
+        let mut e2 = Emitter {
+            out: String::new(),
+            xmm: crate::simd::XmmCache::default(),
+            debug_funcs: Vec::new(),
+        };
         imm_into(&mut e2, "x9", -1);
         assert_eq!(e2.out.trim(), "movn x9, #0", "{}", e2.out);
-        let mut e3 = Emitter { out: String::new(), debug_funcs: Vec::new() };
+        let mut e3 = Emitter {
+            out: String::new(),
+            xmm: crate::simd::XmmCache::default(),
+            debug_funcs: Vec::new(),
+        };
         imm_into(&mut e3, "x9", -65537);
         assert_eq!(e3.out.trim(), "movn x9, #1, lsl #16", "{}", e3.out);
     }
