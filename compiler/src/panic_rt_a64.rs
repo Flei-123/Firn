@@ -140,12 +140,12 @@ pub(crate) fn trampoline_asm() -> String {
     // afterwards is correct for that value too — the same argument the
     // x86 routine makes.
     s.push_str(".Lpanic_a64_dec:\n");
-    s.push_str("    cbnz x23, .Lpanic_a64_dec_abs\n");
-    s.push_str("    tbz x0, #63, .Lpanic_a64_dec_abs\n");
+    s.push_str("    cbnz x23, .Lpanic_a64_dec_digits\n");
+    s.push_str("    tbz x0, #63, .Lpanic_a64_dec_digits\n");
     s.push_str("    mov w26, #45\n");
     s.push_str("    strb w26, [x25], #1\n");
     s.push_str("    neg x0, x0\n");
-    s.push_str(".Lpanic_a64_dec_abs:\n");
+    s.push_str(".Lpanic_a64_dec_digits:\n");
     s.push_str("    mov x27, x25\n"); // first digit written
     s.push_str("    mov x28, #10\n");
     s.push_str("    cbnz x0, .Lpanic_a64_dec_loop\n");
