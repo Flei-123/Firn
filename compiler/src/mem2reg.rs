@@ -62,33 +62,65 @@ pub(crate) fn preds(f: &Func) -> Vec<Vec<usize>> {
 }
 
 /// `dom[b][d] == true`  <=>  block `d` dominates block `b`.
+///
+/// ROUND 87 -- THE SAME SET, IN WORDS INSTEAD OF OCTETS.
+///
+/// The data flow underneath is unchanged (dom(b) = {b} + the intersection of
+/// dom over all predecessors, iterated to the fixed point), and so is the
+/// result. What changed is what one round costs: the sets used to be
+/// `Vec<bool>` -- one OCTET per block -- and every block allocated two fresh
+/// ones per round. A function with 500 blocks moved a quarter of a megabyte
+/// per round through the cache and allocated a thousand vectors.
+///
+/// Now the sets are words: 64 blocks per `u64`, the intersection is an `&`
+/// over `n/64` words, and nothing is allocated inside the loop. For 500
+/// blocks that is eight words instead of 500 octets per intersection, and
+/// the allocations are gone entirely.
+///
+/// The `Vec<Vec<bool>>` at the end stays, because that is what the callers
+/// read; building it costs one pass over the result, which is the size of
+/// the result anyway.
 pub(crate) fn dominators(f: &Func) -> Vec<Vec<bool>> {
     let n = f.blocks.len();
-    let pr = preds(f);
-    let mut dom = vec![vec![true; n]; n];
     if n == 0 {
-        return dom;
+        return Vec::new();
     }
-    for (d, v) in dom[0].iter_mut().enumerate() {
-        *v = d == 0;
+    let pr = preds(f);
+    let w = n.div_ceil(64);
+    // dom[b] as words. Start: block 0 is dominated by itself alone,
+    // everything else provisionally by everybody.
+    let mut dom = vec![0u64; n * w];
+    let full_last = if n % 64 == 0 { !0u64 } else { (1u64 << (n % 64)) - 1 };
+    for b in 1..n {
+        for k in 0..w {
+            dom[b * w + k] = if k + 1 == w { full_last } else { !0u64 };
+        }
     }
+    dom[0] = 1; // block 0: only itself
+    let mut new = vec![0u64; w];
     let mut rounds = 0;
     loop {
         rounds += 1;
         let mut changed = false;
         for b in 1..n {
-            let mut new = vec![false; n];
-            if !pr[b].is_empty() {
-                new = vec![true; n];
-                for &p in &pr[b] {
-                    for d in 0..n {
-                        new[d] &= dom[p][d];
+            if pr[b].is_empty() {
+                // unreachable: dominated by nothing but itself
+                for k in 0..w {
+                    new[k] = 0;
+                }
+            } else {
+                let first = pr[b][0] * w;
+                new[..w].copy_from_slice(&dom[first..first + w]);
+                for &p in &pr[b][1..] {
+                    let base = p * w;
+                    for k in 0..w {
+                        new[k] &= dom[base + k];
                     }
                 }
             }
-            new[b] = true;
-            if new != dom[b] {
-                dom[b] = new;
+            new[b >> 6] |= 1u64 << (b & 63);
+            if new[..w] != dom[b * w..b * w + w] {
+                dom[b * w..b * w + w].copy_from_slice(&new[..w]);
                 changed = true;
             }
         }
@@ -96,7 +128,13 @@ pub(crate) fn dominators(f: &Func) -> Vec<Vec<bool>> {
             break;
         }
     }
-    dom
+    let mut out = vec![vec![false; n]; n];
+    for b in 0..n {
+        for d in 0..n {
+            out[b][d] = dom[b * w + (d >> 6)] & (1u64 << (d & 63)) != 0;
+        }
+    }
+    out
 }
 
 /// Is the value `v` untouchable (secret) in `f`?
@@ -671,33 +709,59 @@ pub(crate) fn merge_blocks(f: &mut Func) -> usize {
     }
 
     // (2) merging: A ends with `br B`, B has A as its only predecessor.
+    //
+    // ROUND 87 -- THE QUADRATIC LOOP.
+    //
+    // This used to recompute the reachability AND the whole predecessor
+    // table from scratch for EVERY SINGLE merged block, find exactly one
+    // pair, merge it, and start again. A function with a hundred mergeable
+    // blocks paid a hundred passes over its own control flow graph, each of
+    // them with fresh allocations. Measured over bin/firnc1.fi: 628
+    // productive calls of this pass cost 670 of the optimizer's 3,460 ms --
+    // 1.07 ms each, for a pass that copies instruction lists around.
+    //
+    // Both tables are now built ONCE and kept up to date by hand. Merging A
+    // and B changes exactly two things: B becomes unreachable, and wherever
+    // B was a predecessor, A now stands. The update is a walk over the
+    // successors of the terminator that has just moved.
+    //
+    // The update may be TOO COARSE in one place, and deliberately so: if a
+    // block s had both A and B as predecessors, `pr[s]` afterwards holds A
+    // twice, and `pr[s].len() == 1` is then false although there is really
+    // only one predecessor left. That prevents a merge, it never causes a
+    // wrong one -- and the fixpoint loop in opt.rs calls this pass again with
+    // freshly built tables, which catches it.
+    let n0 = f.blocks.len();
+    let mut reach = vec![false; n0];
+    let mut stack = vec![0usize];
+    if !reach.is_empty() {
+        reach[0] = true;
+    }
+    while let Some(bi) = stack.pop() {
+        for sblk in f.blocks[bi].term.successors() {
+            let sblk = sblk as usize;
+            if sblk < reach.len() && !reach[sblk] {
+                reach[sblk] = true;
+                stack.push(sblk);
+            }
+        }
+    }
+    let mut pr = preds(f);
+    for p in pr.iter_mut() {
+        p.retain(|&x| reach[x]);
+    }
+    let mut scan = 0usize;
     let mut rounds = 0;
     loop {
         rounds += 1;
-        // Only reachable predecessors count — unreachable blocks are cleared
-        // away by `opt.rs` right afterwards.
-        let mut reach = vec![false; f.blocks.len()];
-        let mut stack = vec![0usize];
-        if !reach.is_empty() {
-            reach[0] = true;
-        }
-        while let Some(bi) = stack.pop() {
-            for sblk in f.blocks[bi].term.successors() {
-                let sblk = sblk as usize;
-                if sblk < reach.len() && !reach[sblk] {
-                    reach[sblk] = true;
-                    stack.push(sblk);
-                }
-            }
-        }
-        let mut pr = preds(f);
-        for (i, p) in pr.iter_mut().enumerate() {
-            let _ = i;
-            p.retain(|&x| reach[x]);
-        }
         let mut target: Option<(usize, usize)> = None;
-        for (i, b) in f.blocks.iter().enumerate() {
-            if let Term::Br(t) = b.term {
+        while scan < f.blocks.len() {
+            let i = scan;
+            scan += 1;
+            if !reach[i] {
+                continue;
+            }
+            if let Term::Br(t) = f.blocks[i].term {
                 let t = t as usize;
                 if t != i && t != 0 && t < f.blocks.len() && pr[t].len() == 1 && pr[t][0] == i {
                     // Allocas may stand in the entry block only: when merging
@@ -735,10 +799,25 @@ pub(crate) fn merge_blocks(f: &mut Func) -> usize {
         } else {
             f.blocks[a].insts.extend(moved);
         }
+        // B's successors now have A as their predecessor instead of B.
+        for sblk in term.successors() {
+            let sblk = sblk as usize;
+            if sblk < pr.len() {
+                for x in pr[sblk].iter_mut() {
+                    if *x == b {
+                        *x = a;
+                    }
+                }
+            }
+        }
         f.blocks[a].term = term;
         f.blocks[b].term = Term::Unset; // becomes unreachable -> DCE cleans up
         f.blocks[b].insts.clear();
-        // Block b now has no predecessor; the renumbering is done by opt.rs.
+        reach[b] = false;
+        pr[b].clear();
+        // A has taken over B's terminator, so A itself may now be mergeable
+        // with B's successor: look at A again.
+        scan = a;
         removed += 1;
         if rounds > 4096 {
             break;
