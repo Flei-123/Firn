@@ -25,6 +25,101 @@ now links here.
 
 ---
 
+## Checking the IR and the optimizer
+
+```
+$ ./compiler/target/release/firnc --emit=fir-raw tests/opt/fold_arith.fi
+; FIR v0
+fn @main() -> i32 {
+bb0:
+  %0 = alloca.ptr size=4 align=4
+  %1 = const.i32 20
+  %2 = const.i32 2
+  %3 = mul.i32 %1, %2
+  %4 = const.i32 2
+  %5 = add.i32 %3, %4
+  store.i32 %5, %0
+  %6 = load.i32 %0
+  ret %6
+bb1:
+  %7 = const.i32 0
+  ret %7
+}
+
+$ ./compiler/target/release/firnc --emit=fir-opt --stats tests/opt/fold_arith.fi
+profile:    app
+fir (raw):  1 functions, 2 blocks, 9 instructions
+fir (opt):  1 functions, 1 blocks, 1 instructions
+; FIR v0
+fn @main() -> i32 {
+bb0:
+  %5 = const.i32 42
+  ret %5
+}
+```
+
+`bash test_opt.sh` automatically checks for six programs that the instruction
+count drops, that the folded constant really appears in the dump and that dead
+blocks disappear (real result: `PASS 18/18`). That optimization does **not**
+change behaviour is checked by `test.sh`, which runs every program with and
+without `--no-opt` and demands the same result.
+
+## Generated code (excerpt from `examples/fib.fi`)
+
+**Re-generated on 2026-08-23** (round 86). The version that used to stand here
+was the round 1 output and described a register assignment that no longer
+exists: one stack slot per FIR value, everything computed in `rax`/`rcx`. Since
+round 43 there is a real linear-scan allocation with live intervals
+(`compiler/src/regalloc.rs`), and it shows -- `n` lives in `r15` across both
+recursive calls, and the only traffic to memory is the callee-saved registers
+being parked in the prologue.
+
+```sh
+./compiler/target/release/firnc --emit=asm -o /tmp/fib.s examples/fib.fi
+```
+
+```asm
+_F0.fib:
+    .loc 1 4 0
+    push rbp
+    mov rbp, rsp
+    sub rsp, 160
+    mov qword ptr [rbp-136], r13
+    mov qword ptr [rbp-144], r14
+    mov qword ptr [rbp-152], r15
+    mov r15, rdi
+.Lfib__bb0:
+    cmp r15d, 2
+    jl .Lfib__bb1
+.Lfib__bb2:
+    mov r14, r15
+    sub r14d, 1
+    mov rdi, r14
+    call _F0.fib
+    mov r13, rax
+    mov r14, r15
+    sub r14d, 2
+    mov rdi, r14
+    call _F0.fib
+    mov r15, rax
+    mov r8, r13
+    add r8d, r15d
+    mov rax, r8
+    mov r13, qword ptr [rbp-136]
+    mov r14, qword ptr [rbp-144]
+    mov r15, qword ptr [rbp-152]
+    mov rsp, rbp
+    pop rbp
+    ret
+```
+
+The rules the code generator keeps, and which `test.sh` checks: the System V
+argument registers, the return value in `rax`, the callee-saved registers
+(`rbx`, `r12`-`r15`) restored before every `ret`, the frame always 16 byte
+aligned, and the symbol scheme of DESIGN_GOALS 4 -- an ordinary function goes
+out as `_F0.name`, only `main` and an `#[export_c]`/`extern` name stay bare.
+Look at it yourself with `--emit=asm` or `--keep-asm`.
+
 ## Error unions `E!T` (module `fehlerunionen`, round 3)
 
 SPEC 5.1 is implemented as a language feature: the `error` declaration, the type
