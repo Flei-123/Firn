@@ -58,6 +58,14 @@ use std::cell::RefCell;
 /// the ordinary "already declared" message.
 pub(crate) const NAME: &str = "str";
 
+/// **ROUND 88** — the second spelling, out of the C# flavoured alias family
+/// of round 70/71 (`types.rs::alias_of`). `string` IS `str`: the name is
+/// folded onto `NAME` before the struct lookup (`sema.rs::resolve_ty`), so
+/// there is only ever ONE type. It has to stand here as well, because the
+/// trigger below reads the TOKENS — a program that only ever writes
+/// `string` needs the collector just as much as one that writes `str`.
+pub(crate) const NAME_ALIAS: &str = "string";
+
 /// Content comparison of two `str` (`lib/gc/gc.fi`).
 pub(crate) const FN_EQ: &str = "__str_eq";
 /// Concatenation of two `str` in the GC heap (`lib/gc/gc.fi`).
@@ -205,7 +213,7 @@ pub(crate) fn same_view(a: &Type, b: &Type) -> bool {
 ///
 /// Two signals, both purely syntactic:
 ///
-///  1. the identifier `str` NOT next to a `.` — that is the TYPE name
+///  1. the identifier `str` — since round 88 `string` too — NOT next to a `.` — that is the TYPE name
 ///     (`let s: str`, `-> str`, `str { … }`). `import std.str` and
 ///     `str.trim(x)` are excluded by the dot.
 ///  2. a text literal directly next to `+`, `==` or `!=` — the two
@@ -217,7 +225,7 @@ pub(crate) fn same_view(a: &Type, b: &Type) -> bool {
 pub(crate) fn source_uses_str(toks: &[crate::lexer::Token]) -> bool {
     for (i, t) in toks.iter().enumerate() {
         if let TokKind::Ident(n) = &t.kind {
-            if n == NAME {
+            if n == NAME || n == NAME_ALIAS {
                 let before_dot = i > 0 && matches!(toks[i - 1].kind, TokKind::Dot);
                 let after_dot = matches!(toks.get(i + 1).map(|x| &x.kind), Some(TokKind::Dot));
                 if !before_dot && !after_dot {
