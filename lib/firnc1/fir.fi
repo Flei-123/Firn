@@ -29,6 +29,8 @@ export { Fir, fir_new, fir_free,
     O_PTRADD, O_CALL, O_SYSCALL, O_COPYMEM, O_GCADDR, O_SELECT, O_SECZERO,
     O_ATOMADD, O_CALLI, O_VTAB, O_ASM, O_MMIOLD, O_MMIOST, O_FNREF,
     O_SPAWN, O_TLS, O_ATOMCAS,
+    O_BINWRAPSAT, O_CHECKEDBIN, O_CHECKEDDIV, O_CHECKEDCAST,
+    WS_WRAP, WS_SAT,
     TERM_UNSET, TERM_BR, TERM_BRCOND, TERM_RET, TERM_SWITCH, NONE,
     fn_new, fn_count, block_new, block_count,
     inst_add, inst_void_add, alloca_add, arg_add, arg_start,
@@ -113,6 +115,31 @@ const O_FNREF: u32 = 53
 const O_SPAWN: u32 = 20
 const O_TLS: u32 = 21
 const O_ATOMCAS: u32 = 22
+
+// ROUND 72 (fir.rs, SPEC 13 item L9) -- checked and explicitly unchecked
+// integer arithmetic.
+//
+//   O_BINWRAPSAT   i_a = a, i_b = b, i_c = the operation (0 add, 1 sub,
+//                  2 mul), i_number = WS_WRAP or WS_SAT. Never checked,
+//                  never panics -- that is the point of writing `+%`/`+|`
+//                  out instead of relying on the build level.
+//   O_CHECKEDBIN   i_a = a, i_b = b, i_c = the operation (0/1/2),
+//                  i_number = the intern number of the ready made message.
+//   O_CHECKEDDIV   i_a = a, i_b = b, i_c = the operation (3 div, 4 rem),
+//                  i_number = the message for "divided by zero" in the low
+//                  word, the one for MIN / -1 in the high word.
+//   O_CHECKEDCAST  i_a = src, i_c = the SOURCE type, i_number = message.
+//
+// THE MESSAGE IS TEXT, not a position: FIR carries no source positions at
+// all (docs/FIR.md), so the sentence is built once during lowering and
+// travels as an interned string, exactly as in `firnc0`.
+const O_BINWRAPSAT: u32 = 23
+const O_CHECKEDBIN: u32 = 24
+const O_CHECKEDDIV: u32 = 25
+const O_CHECKEDCAST: u32 = 26
+
+const WS_WRAP: u64 = 0
+const WS_SAT: u64 = 1
 
 const TERM_UNSET: u32 = 0
 const TERM_BR: u32 = 1
@@ -561,6 +588,15 @@ fn asm_masked(b: *mut rt.Buf, p: u64, n: usize) {
     }
 }
 
+// ROUND 72: an interned text in quotation marks, escaped like an assembly
+// template (`asm_masked`) -- the panic messages of the checked operations
+// travel through the FIR text this way.
+fn quoted(b: *mut rt.Buf, it: *mut intern.Interner, nr: u32) {
+    rt.buf_push(b, 34 as u8)
+    asm_masked(b, intern.intern_ptr(it, nr), intern.intern_length(it, nr))
+    rt.buf_push(b, 34 as u8)
+}
+
 fn dot_ty(b: *mut rt.Buf, t: u32) {
     rt.buf_push(b, 46 as u8)
     fty_name(b, t)
@@ -603,6 +639,71 @@ fn print_inst(f: *mut Fir, it: *mut intern.Interner, b: *mut rt.Buf, nr: u32) {
         var comma: [u8; 2] = ", "
         rt.buf_push_bytes(b, (&comma[0]) as u64, 2)
         value(b, c)
+        return
+    }
+    // ROUND 72 -- `add_wrap.u64 %1, %2` / `mul_sat.i32 %1, %2`
+    // (fir.rs::fmt_inst).
+    if kind == O_BINWRAPSAT {
+        binop_name(b, vec_at[u32](&(*f).i_c, nr as usize))
+        rt.buf_push(b, 95 as u8)
+        if vec_at[u64](&(*f).i_number, nr as usize) == WS_SAT {
+            var ws: [u8; 3] = "sat"
+            rt.buf_push_bytes(b, (&ws[0]) as u64, 3)
+        } else {
+            var ww: [u8; 4] = "wrap"
+            rt.buf_push_bytes(b, (&ww[0]) as u64, 4)
+        }
+        dot_ty(b, ty)
+        rt.buf_push(b, 32 as u8)
+        value(b, a)
+        var comma: [u8; 2] = ", "
+        rt.buf_push_bytes(b, (&comma[0]) as u64, 2)
+        value(b, c)
+        return
+    }
+    // ROUND 72 -- `checked_add.i32 %5, %6 "panic: ..."` (fir.rs::fmt_inst).
+    if kind == O_CHECKEDBIN {
+        var wc: [u8; 8] = "checked_"
+        rt.buf_push_bytes(b, (&wc[0]) as u64, 8)
+        binop_name(b, vec_at[u32](&(*f).i_c, nr as usize))
+        dot_ty(b, ty)
+        rt.buf_push(b, 32 as u8)
+        value(b, a)
+        var comma: [u8; 2] = ", "
+        rt.buf_push_bytes(b, (&comma[0]) as u64, 2)
+        value(b, c)
+        rt.buf_push(b, 32 as u8)
+        quoted(b, it, vec_at[u64](&(*f).i_number, nr as usize) as u32)
+        return
+    }
+    // ROUND 72 -- `checked_div.i32 %5, %6 "zero" "range"`.
+    if kind == O_CHECKEDDIV {
+        var wc: [u8; 8] = "checked_"
+        rt.buf_push_bytes(b, (&wc[0]) as u64, 8)
+        binop_name(b, vec_at[u32](&(*f).i_c, nr as usize))
+        dot_ty(b, ty)
+        rt.buf_push(b, 32 as u8)
+        value(b, a)
+        var comma: [u8; 2] = ", "
+        rt.buf_push_bytes(b, (&comma[0]) as u64, 2)
+        value(b, c)
+        let both: u64 = vec_at[u64](&(*f).i_number, nr as usize)
+        rt.buf_push(b, 32 as u8)
+        quoted(b, it, (both & 4294967295) as u32)
+        rt.buf_push(b, 32 as u8)
+        quoted(b, it, (both >> 32) as u32)
+        return
+    }
+    // ROUND 72 -- `checked_cast.i32.u8 %5 "panic: ..."`.
+    if kind == O_CHECKEDCAST {
+        var wc: [u8; 12] = "checked_cast"
+        rt.buf_push_bytes(b, (&wc[0]) as u64, 12)
+        dot_ty(b, vec_at[u32](&(*f).i_c, nr as usize))
+        dot_ty(b, ty)
+        rt.buf_push(b, 32 as u8)
+        value(b, a)
+        rt.buf_push(b, 32 as u8)
+        quoted(b, it, vec_at[u64](&(*f).i_number, nr as usize) as u32)
         return
     }
     if kind == O_CMP {
@@ -816,7 +917,11 @@ fn print_inst(f: *mut Fir, it: *mut intern.Interner, b: *mut rt.Buf, nr: u32) {
             rt.buf_push(b, 93 as u8)
         }
         let znum: u64 = vec_at[u64](&(*f).i_number, nr as usize)
-        let cz: u32 = znum as u32
+        // ROUND 72: `znum as u32` is a NARROWING cast and would now
+        // (correctly) panic -- the upper half really is set, it holds
+        // `n_out`. Masking first says "the low half, on purpose" in a way
+        // the checked `as` can agree with; there is no `as%`.
+        let cz: u32 = (znum & 4294967295) as u32
         // ROUND 68: the count of the MEMORY outputs sits in the upper half.
         let n_out: u32 = (znum >> 32) as u32
         if cz > 0 {

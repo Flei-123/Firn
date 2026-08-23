@@ -65,6 +65,16 @@ struct Cg {
     // BOOLEAN return plus this side channel, rather than packing both into
     // one `u32` with 0 as "not found" -- 0 is an ordinary intern number.
     ext_out: u32,
+    // ROUND 72 (panic_rt.rs, SPEC 13 item L9): the panic messages of the
+    // checked operations, interned once each, in the order of their first
+    // appearance. The index in here IS the `.Lpanicmsg<n>` label. Empty
+    // means the program contains no checked operation at all and pays not
+    // one octet for the feature.
+    pmsg: Vec[u32]
+    // Label counter of the CURRENT function. Value numbers restart at 0 in
+    // every function, so a label built from them alone collides across
+    // functions -- the function's own name is folded in as well.
+    site: u64
 }
 
 fn cg_new(f: u64, it: u64) -> Cg {
@@ -74,6 +84,7 @@ fn cg_new(f: u64, it: u64) -> Cg {
         slot: vec_new[u64](), aslot: vec_new[u64](),
         frame: 0, unsuitable: false, gcr: 0, ifr: 0, free: false,
         tr: 0, ext_out: 0,
+        pmsg: vec_new[u32](), site: 0,
     }
 }
 
@@ -117,6 +128,7 @@ fn cg_free(c: *mut Cg) {
     rt.buf_free(&(*c).out)
     vec_free[u64](&(*c).slot)
     vec_free[u64](&(*c).aslot)
+    vec_free[u32](&(*c).pmsg)
 }
 
 fn cg_unsuitable(c: *mut Cg) -> bool { return (*c).unsuitable }
@@ -1673,6 +1685,594 @@ fn gc_table(c: *mut Cg) {
     nl(c)
 }
 
+// ------------------------------------------- ROUND 72: checked arithmetic
+//
+// The port of `compiler/src/panic_rt.rs` (SPEC 13, item L9). Same shape,
+// same ending, same message: one shared out-of-line trampoline per object
+// file, entered with
+//   rdi = message address, esi = its length, rdx = the first operand,
+//   rcx = the second, r8 = the panic kind, r9 = 1 when the two numbers
+//   are to be read as UNSIGNED.
+// In `profile kernel` there is no runtime to fall back on and the
+// trampoline hands off to the external symbol `osum_panic`, which the
+// kernel author defines (`demos/kernel/start.s` has a minimal one).
+//
+// The assembly text does NOT have to match `firnc0`'s -- it never did
+// (`tools/self_compare.sh` explains why: no register allocation here).
+// What has to match is the BEHAVIOUR and the message, octet for octet.
+
+const PANIC_ADD: u64 = 1
+const PANIC_SUB: u64 = 2
+const PANIC_MUL: u64 = 3
+const PANIC_DIV0: u64 = 4
+const PANIC_DIV_OVERFLOW: u64 = 5
+const PANIC_CAST: u64 = 6
+
+fn panic_msg_index(c: *mut Cg, id: u32) -> u32 {
+    var i: usize = 0
+    while i < vec_len[u32](&(*c).pmsg) {
+        if vec_at[u32](&(*c).pmsg, i) == id {
+            return i as u32
+        }
+        i = i + 1
+    }
+    return NONE
+}
+
+fn panic_msg_add(c: *mut Cg, id: u32) {
+    if panic_msg_index(c, id) == NONE {
+        vec_push[u32](&(*c).pmsg, id)
+    }
+}
+
+// Every message the program really uses, in the order of its first
+// appearance -- the index IS the `.Lpanicmsg<n>` label. A program without
+// a single checked operation ends up with an empty list and gets neither
+// the table nor the trampoline.
+fn panic_collect(c: *mut Cg) {
+    let f: *mut fir.Fir = ff(c)
+    var fi: u32 = 0
+    while fi < fir.fn_count(f) as u32 {
+        var bb: u32 = 0
+        while bb < fir.block_count(f, fi) {
+            var n: u32 = 0
+            while n < fir.inst_count(f, fi, bb) {
+                let i: u32 = fir.inst_at(f, fi, bb, n)
+                let k: u32 = fir.i_kind_of(f, i)
+                if k == fir.O_CHECKEDBIN || k == fir.O_CHECKEDCAST {
+                    panic_msg_add(c, fir.i_number_of(f, i) as u32)
+                }
+                if k == fir.O_CHECKEDDIV {
+                    let both: u64 = fir.i_number_of(f, i)
+                    panic_msg_add(c, (both & 4294967295) as u32)
+                    panic_msg_add(c, (both >> 32) as u32)
+                }
+                n = n + 1
+            }
+            bb = bb + 1
+        }
+        fi = fi + 1
+    }
+}
+
+fn has_panic(c: *mut Cg) -> bool {
+    return vec_len[u32](&(*c).pmsg) > 0
+}
+
+// `.Lpanicmsg<n>`
+fn panic_label(c: *mut Cg, k: u32) {
+    var p: [u8; 10] = ".Lpanicmsg"
+    t(c, (&p[0]) as u64, 10)
+    number(c, k as u64)
+}
+
+// The message text, escaped for `.ascii` exactly like the assembly
+// template of an `asm` block (fir.rs::asm_escape) -- four characters and
+// no table, so that both compilers write the same octets.
+fn ascii_masked(c: *mut Cg, p: u64, n: usize) {
+    var i: usize = 0
+    while i < n {
+        let z: u8 = rt.ld8(p, i)
+        if z == 92 as u8 || z == 34 as u8 {
+            rt.buf_push(&(*c).out, 92 as u8)
+            rt.buf_push(&(*c).out, z)
+        } else if z == 10 as u8 {
+            rt.buf_push(&(*c).out, 92 as u8)
+            rt.buf_push(&(*c).out, 110 as u8)
+        } else if z == 9 as u8 {
+            rt.buf_push(&(*c).out, 92 as u8)
+            rt.buf_push(&(*c).out, 116 as u8)
+        } else {
+            rt.buf_push(&(*c).out, z)
+        }
+        i = i + 1
+    }
+}
+
+// `.rodata`: every distinct message as raw octets, no NUL terminator --
+// the length travels in `esi` (SPEC 8, the `Str` convention).
+fn panic_rodata(c: *mut Cg) {
+    var sec: [u8; 17] = ".section .rodata\n"
+    t(c, (&sec[0]) as u64, 17)
+    var k: u32 = 0
+    while k < vec_len[u32](&(*c).pmsg) as u32 {
+        panic_label(c, k)
+        var dp: [u8; 2] = ":\n"
+        t(c, (&dp[0]) as u64, 2)
+        var asc: [u8; 12] = "    .ascii \""
+        t(c, (&asc[0]) as u64, 12)
+        let id: u32 = vec_at[u32](&(*c).pmsg, k as usize)
+        ascii_masked(c, intern.intern_ptr(it(c), id), intern.intern_length(it(c), id))
+        var e: [u8; 2] = "\"\n"
+        t(c, (&e[0]) as u64, 2)
+        k = k + 1
+    }
+    var tx: [u8; 6] = ".text\n"
+    t(c, (&tx[0]) as u64, 6)
+}
+
+fn panic_trampoline(c: *mut Cg) {
+    if (*c).free {
+        // No runtime at all. Somebody else decides what a panic means --
+        // exactly the SPEC 2 promise ("osum_panic, configurable"). An
+        // undefined reference at link time is the honest outcome for a
+        // kernel that never defines it.
+        var kt: [u8; 146] = ".Lpanic_arith:\n    call osum_panic\n    # osum_panic is not supposed to come back; running\n    # into .text below would be silently wrong.\n    ud2\n"
+        t(c, (&kt[0]) as u64, 146)
+        return
+    }
+    // `app`: build "<message> (a=<N> b=<M>)\n" on the stack, write it to
+    // file descriptor 2 and call exit_group(101). No allocator, no `std.*`
+    // -- this has to run inside a program that imports nothing at all.
+    var h1: [u8; 114] = ".Lpanic_arith:\n    push rbx\n    push r12\n    push r13\n    push r14\n    push r15\n    mov r12, rdi\n    mov r13, rsi\n"
+    t(c, (&h1[0]) as u64, 114)
+    var h2: [u8; 181] = "    mov r14, rcx\n    mov r15, r9\n    sub rsp, 160\n    mov rbx, rsp\n    mov byte ptr [rbx], 32\n    mov byte ptr [rbx+1], 40\n    mov byte ptr [rbx+2], 97\n    mov byte ptr [rbx+3], 61\n"
+    t(c, (&h2[0]) as u64, 181)
+    var h3: [u8; 174] = "    add rbx, 4\n    mov rax, rdx\n    call .Lpanic_i64_dec\n    mov byte ptr [rbx], 32\n    mov byte ptr [rbx+1], 98\n    mov byte ptr [rbx+2], 61\n    add rbx, 3\n    mov rax, r14\n"
+    t(c, (&h3[0]) as u64, 174)
+    var h4: [u8; 202] = "    call .Lpanic_i64_dec\n    mov byte ptr [rbx], 41\n    mov byte ptr [rbx+1], 10\n    add rbx, 2\n    mov rax, 1\n    mov rdi, 2\n    mov rsi, r12\n    mov rdx, r13\n    syscall\n    mov rax, 1\n    mov rdi, 2\n"
+    t(c, (&h4[0]) as u64, 202)
+    var h5: [u8; 143] = "    lea rsi, [rsp]\n    mov rdx, rbx\n    sub rdx, rsp\n    syscall\n    pop r15\n    pop r14\n    mov rax, 231\n    mov rdi, 101\n    syscall\n    hlt\n"
+    t(c, (&h5[0]) as u64, 143)
+    // The decimal writer: append the text of `rax` at `[rbx]` and move
+    // `rbx` past it. An UNSIGNED type (r15 != 0) never has a minus sign
+    // and never negates -- its bit pattern IS the number. For a signed one
+    // two's complement makes `neg` on i64::MIN produce the right MAGNITUDE
+    // as an unsigned pattern, so the unsigned `div` afterwards is correct
+    // for every possible i64, that one included.
+    var d1: [u8; 178] = ".Lpanic_i64_dec:\n    test r15, r15\n    jnz .Lpanic_dec_nonneg\n    test rax, rax\n    jns .Lpanic_dec_nonneg\n    mov byte ptr [rbx], 45\n    inc rbx\n    neg rax\n.Lpanic_dec_nonneg:\n"
+    t(c, (&d1[0]) as u64, 178)
+    var d2: [u8; 174] = "    mov r8, rbx\n    mov rcx, 10\n    test rax, rax\n    jnz .Lpanic_dec_loop\n    mov byte ptr [rbx], 48\n    inc rbx\n    jmp .Lpanic_dec_rev\n.Lpanic_dec_loop:\n    test rax, rax\n"
+    t(c, (&d2[0]) as u64, 174)
+    var d3: [u8; 178] = "    jz .Lpanic_dec_rev\n    xor rdx, rdx\n    div rcx\n    add rdx, 48\n    mov byte ptr [rbx], dl\n    inc rbx\n    jmp .Lpanic_dec_loop\n.Lpanic_dec_rev:\n    mov rcx, rbx\n    dec rcx\n"
+    t(c, (&d3[0]) as u64, 178)
+    var d4: [u8; 245] = ".Lpanic_dec_revloop:\n    cmp r8, rcx\n    jge .Lpanic_dec_done\n    mov al, byte ptr [r8]\n    mov dl, byte ptr [rcx]\n    mov byte ptr [r8], dl\n    mov byte ptr [rcx], al\n    inc r8\n    dec rcx\n    jmp .Lpanic_dec_revloop\n.Lpanic_dec_done:\n    ret\n"
+    t(c, (&d4[0]) as u64, 245)
+}
+
+// `.L<tag><function>_<n>` -- unique inside the function through the
+// counter and across functions through the name, the same rule
+// `blocklabel` already follows. ROUND 58's `#` in a generated closure name
+// is a COMMENT character to the assembler; `sym` turns it into a dot.
+fn sitelabel(c: *mut Cg, tag: u64, tagn: usize, fnr: u32, uid: u64) {
+    var p: [u8; 2] = ".L"
+    t(c, (&p[0]) as u64, 2)
+    t(c, tag, tagn)
+    sym(c, fnr)
+    rt.buf_push(&(*c).out, 95 as u8)
+    number(c, uid)
+}
+
+// `<mnemonic> .L<tag><function>_<n>`
+fn site_jump(c: *mut Cg, mn: u64, mnn: usize, tag: u64, tagn: usize, fnr: u32, uid: u64) {
+    ins(c)
+    w(c, mn, mnn)
+    rt.buf_push(&(*c).out, 32 as u8)
+    sitelabel(c, tag, tagn, fnr, uid)
+    nl(c)
+}
+
+fn site_here(c: *mut Cg, tag: u64, tagn: usize, fnr: u32, uid: u64) {
+    sitelabel(c, tag, tagn, fnr, uid)
+    rt.buf_push(&(*c).out, 58 as u8)
+    nl(c)
+}
+
+// Into the trampoline with the calling convention it expects. `rdx`/`rcx`
+// already hold the two original values.
+fn trampoline_jump(c: *mut Cg, code: u64, msgid: u32, unsigned: bool) {
+    ins(c)
+    var le: [u8; 16] = "lea rdi, [rip + "
+    w(c, (&le[0]) as u64, 16)
+    panic_label(c, panic_msg_index(c, msgid))
+    rt.buf_push(&(*c).out, 93 as u8)
+    nl(c)
+    ins(c)
+    var ms: [u8; 9] = "mov esi, "
+    w(c, (&ms[0]) as u64, 9)
+    number(c, intern.intern_length(it(c), msgid) as u64)
+    nl(c)
+    ins(c)
+    var m8: [u8; 8] = "mov r8, "
+    w(c, (&m8[0]) as u64, 8)
+    number(c, code)
+    nl(c)
+    ins(c)
+    var m9: [u8; 8] = "mov r9, "
+    w(c, (&m9[0]) as u64, 8)
+    if unsigned {
+        number(c, 1)
+    } else {
+        number(c, 0)
+    }
+    nl(c)
+    var jp: [u8; 17] = "jmp .Lpanic_arith"
+    raw(c, (&jp[0]) as u64, 17)
+}
+
+// `<op> <a>, <b>` at the width of `bits` (8/16/32/64).
+fn op2_bits(c: *mut Cg, name: u64, n: usize, a: u32, b: u32, bits: u32) {
+    ins(c)
+    w(c, name, n)
+    rt.buf_push(&(*c).out, 32 as u8)
+    regb(c, a, bits)
+    var k: [u8; 2] = ", "
+    w(c, (&k[0]) as u64, 2)
+    regb(c, b, bits)
+    nl(c)
+}
+
+// The smallest value of a signed FIR type, the largest of any of them.
+fn ty_min(ty: u32) -> i64 {
+    if ty == fir.T_I8 { return 0 - 128 }
+    if ty == fir.T_I16 { return 0 - 32768 }
+    if ty == fir.T_I32 { return 0 - 2147483648 }
+    if ty == fir.T_I64 { return -9223372036854775808 }
+    return 0
+}
+
+fn ty_max_u(ty: u32) -> u64 {
+    if ty == fir.T_I8 { return 127 }
+    if ty == fir.T_I16 { return 32767 }
+    if ty == fir.T_I32 { return 2147483647 }
+    if ty == fir.T_I64 { return 9223372036854775807 }
+    if ty == fir.T_U8 { return 255 }
+    if ty == fir.T_U16 { return 65535 }
+    if ty == fir.T_U32 { return 4294967295 }
+    return 18446744073709551615
+}
+
+// `movabs <reg>, <v>` -- the only form that carries a full 64 bit literal.
+fn movabs_u(c: *mut Cg, r: u32, v: u64) {
+    ins(c)
+    var m: [u8; 7] = "movabs "
+    w(c, (&m[0]) as u64, 7)
+    reg64(c, r)
+    var k: [u8; 2] = ", "
+    w(c, (&k[0]) as u64, 2)
+    number(c, v)
+    nl(c)
+}
+
+fn movabs_i(c: *mut Cg, r: u32, v: i64) {
+    ins(c)
+    var m: [u8; 7] = "movabs "
+    w(c, (&m[0]) as u64, 7)
+    reg64(c, r)
+    var k: [u8; 2] = ", "
+    w(c, (&k[0]) as u64, 2)
+    inum(c, v)
+    nl(c)
+}
+
+// The multiplication of a checked or saturating `*`. `imul r, r/m` (the
+// two operand form) exists for 16, 32 and 64 bits ONLY -- at 8 bits the
+// ONE operand form is the answer: `imul cl` computes ax = al * cl and sets
+// OF exactly when the product does not fit back into al.
+fn emit_mul_flagged(c: *mut Cg, ty: u32, bits: u32) {
+    if is_sign(ty) {
+        if bits == 8 {
+            var i1: [u8; 7] = "imul cl"
+            raw(c, (&i1[0]) as u64, 7)
+            return
+        }
+        var i2: [u8; 4] = "imul"
+        op2_bits(c, (&i2[0]) as u64, 4, R_AX, R_CX, bits)
+        return
+    }
+    // Unsigned: the one operand `mul` puts the FULL product in the upper
+    // half as well and sets CF=OF exactly when that half is not zero.
+    ins(c)
+    var m: [u8; 4] = "mul "
+    w(c, (&m[0]) as u64, 4)
+    regb(c, R_CX, bits)
+    nl(c)
+}
+
+// `add`/`sub` set OF for the SIGNED reading only; an unsigned type that
+// leaves its width sets CF instead (`200u8 + 100u8` sets CF and leaves OF
+// clear -- as i8 that sum still fits). The one operand `mul` sets CF and
+// OF together, so CF is the right question for every unsigned operation.
+fn overflow_jump(c: *mut Cg, ty: u32, tag: u64, tagn: usize, fnr: u32, uid: u64) {
+    var js: [u8; 2] = "jo"
+    var ju: [u8; 2] = "jc"
+    if is_sign(ty) {
+        site_jump(c, (&js[0]) as u64, 2, tag, tagn, fnr, uid)
+    } else {
+        site_jump(c, (&ju[0]) as u64, 2, tag, tagn, fnr, uid)
+    }
+}
+
+fn panic_code_of(op: u32) -> u64 {
+    if op == 0 { return PANIC_ADD }
+    if op == 1 { return PANIC_SUB }
+    return PANIC_MUL
+}
+
+// ROUND 72 -- checked `+ - *` (SPEC 13, item L9). The two operands sit in
+// their frame slots already extended to a full 64 bits; the arithmetic
+// runs at the TYPE's own width, so the flag means what the type means and
+// a value that only fits into 8 or 16 bits is caught as well.
+fn emit_checked_bin(c: *mut Cg, ty: u32, op: u32, a: u32, b: u32, dst: u32, msgid: u32, fnr: u32) {
+    let bits: u32 = fir.fty_bits(ty)
+    let uid: u64 = (*c).site
+    (*c).site = (*c).site + 1
+    var tsite: [u8; 7] = "chksite"
+    var tok: [u8; 5] = "chkok"
+    load_value(c, R_AX, a)
+    load_value(c, R_CX, b)
+    // The two ORIGINAL values go on the STACK: the panic path needs them
+    // for the message, and the arithmetic below overwrites rax.
+    var pa: [u8; 8] = "push rax"
+    raw(c, (&pa[0]) as u64, 8)
+    var pc: [u8; 8] = "push rcx"
+    raw(c, (&pc[0]) as u64, 8)
+    if op == 0 {
+        var n: [u8; 3] = "add"
+        op2_bits(c, (&n[0]) as u64, 3, R_AX, R_CX, bits)
+    } else if op == 1 {
+        var n2: [u8; 3] = "sub"
+        op2_bits(c, (&n2[0]) as u64, 3, R_AX, R_CX, bits)
+    } else {
+        emit_mul_flagged(c, ty, bits)
+    }
+    overflow_jump(c, ty, (&tsite[0]) as u64, 7, fnr, uid)
+    var drop: [u8; 11] = "add rsp, 16"
+    raw(c, (&drop[0]) as u64, 11)
+    var jm: [u8; 3] = "jmp"
+    site_jump(c, (&jm[0]) as u64, 3, (&tok[0]) as u64, 5, fnr, uid)
+    site_here(c, (&tsite[0]) as u64, 7, fnr, uid)
+    var poc: [u8; 7] = "pop rcx"
+    raw(c, (&poc[0]) as u64, 7)
+    var pod: [u8; 7] = "pop rdx"
+    raw(c, (&pod[0]) as u64, 7)
+    trampoline_jump(c, panic_code_of(op), msgid, !is_sign(ty))
+    site_here(c, (&tok[0]) as u64, 5, fnr, uid)
+    normalize(c, R_AX, ty)
+    store_slot(c, slot_of(c, dst), R_AX)
+}
+
+// ROUND 72 -- checked `/` and `%`: division by zero, and for a SIGNED type
+// the `MIN / -1` case that would otherwise raise SIGFPE with no message of
+// our own at all.
+fn emit_checked_div(c: *mut Cg, ty: u32, op: u32, a: u32, b: u32, dst: u32,
+    mzero: u32, mrange: u32, fnr: u32) {
+    var bits: u32 = fir.fty_bits(ty)
+    if bits < 32 {
+        bits = 32
+    }
+    let wide: bool = fir.fty_bits(ty) > 32
+    let uid: u64 = (*c).site
+    (*c).site = (*c).site + 1
+    var tz: [u8; 7] = "chkdivz"
+    var tr: [u8; 7] = "chkdivr"
+    var sz: [u8; 8] = "chksitez"
+    var sr: [u8; 8] = "chksiter"
+    load_value(c, R_AX, a)
+    load_value(c, R_CX, b)
+    var pa: [u8; 8] = "push rax"
+    raw(c, (&pa[0]) as u64, 8)
+    var pc: [u8; 8] = "push rcx"
+    raw(c, (&pc[0]) as u64, 8)
+    var ts: [u8; 4] = "test"
+    op2_bits(c, (&ts[0]) as u64, 4, R_CX, R_CX, bits)
+    var jz: [u8; 2] = "jz"
+    site_jump(c, (&jz[0]) as u64, 2, (&sz[0]) as u64, 8, fnr, uid)
+    var jm: [u8; 3] = "jmp"
+    site_jump(c, (&jm[0]) as u64, 3, (&tz[0]) as u64, 7, fnr, uid)
+    site_here(c, (&sz[0]) as u64, 8, fnr, uid)
+    var poc: [u8; 7] = "pop rcx"
+    raw(c, (&poc[0]) as u64, 7)
+    var pod: [u8; 7] = "pop rdx"
+    raw(c, (&pod[0]) as u64, 7)
+    trampoline_jump(c, PANIC_DIV0, mzero, !is_sign(ty))
+    site_here(c, (&tz[0]) as u64, 7, fnr, uid)
+    if is_sign(ty) {
+        // MIN / -1: two comparisons with a shared "definitely fine" target.
+        // `cmp r64, imm32` is the only immediate FORM a 64 bit register
+        // compare has, and a sign extended 32 bit literal cannot represent
+        // i64::MIN at all -- hence the detour through rdx, which is free
+        // scratch here (the rescued pair still sits untouched on the stack).
+        if wide {
+            movabs_i(c, R_DX, ty_min(ty))
+            var cm: [u8; 3] = "cmp"
+            op2(c, (&cm[0]) as u64, 3, R_AX, R_DX)
+        } else {
+            ins(c)
+            var cm2: [u8; 4] = "cmp "
+            w(c, (&cm2[0]) as u64, 4)
+            regb(c, R_AX, bits)
+            var k: [u8; 2] = ", "
+            w(c, (&k[0]) as u64, 2)
+            inum(c, ty_min(ty))
+            nl(c)
+        }
+        var jn: [u8; 3] = "jne"
+        site_jump(c, (&jn[0]) as u64, 3, (&tr[0]) as u64, 7, fnr, uid)
+        ins(c)
+        var cm3: [u8; 4] = "cmp "
+        w(c, (&cm3[0]) as u64, 4)
+        regb(c, R_CX, bits)
+        var mo: [u8; 4] = ", -1"
+        w(c, (&mo[0]) as u64, 4)
+        nl(c)
+        site_jump(c, (&jn[0]) as u64, 3, (&tr[0]) as u64, 7, fnr, uid)
+        site_jump(c, (&jm[0]) as u64, 3, (&sr[0]) as u64, 8, fnr, uid)
+        site_here(c, (&sr[0]) as u64, 8, fnr, uid)
+        raw(c, (&poc[0]) as u64, 7)
+        raw(c, (&pod[0]) as u64, 7)
+        trampoline_jump(c, PANIC_DIV_OVERFLOW, mrange, false)
+    }
+    site_here(c, (&tr[0]) as u64, 7, fnr, uid)
+    var drop: [u8; 11] = "add rsp, 16"
+    raw(c, (&drop[0]) as u64, 11)
+    if is_sign(ty) {
+        if wide {
+            var q: [u8; 3] = "cqo"
+            raw(c, (&q[0]) as u64, 3)
+            var d: [u8; 8] = "idiv rcx"
+            raw(c, (&d[0]) as u64, 8)
+        } else {
+            var q2: [u8; 3] = "cdq"
+            raw(c, (&q2[0]) as u64, 3)
+            var d2: [u8; 8] = "idiv ecx"
+            raw(c, (&d2[0]) as u64, 8)
+        }
+    } else {
+        var z: [u8; 12] = "xor edx, edx"
+        raw(c, (&z[0]) as u64, 12)
+        if wide {
+            var d3: [u8; 7] = "div rcx"
+            raw(c, (&d3[0]) as u64, 7)
+        } else {
+            var d4: [u8; 7] = "div ecx"
+            raw(c, (&d4[0]) as u64, 7)
+        }
+    }
+    if op == 4 {
+        var m: [u8; 12] = "mov rax, rdx"
+        raw(c, (&m[0]) as u64, 12)
+    }
+    normalize(c, R_AX, ty)
+    store_slot(c, slot_of(c, dst), R_AX)
+}
+
+// ROUND 72 -- a checked (narrowing) `as`. Narrow into the target width,
+// widen the result BACK the way the value arrived and compare against the
+// untouched original: any difference means the conversion lost something.
+fn emit_checked_cast(c: *mut Cg, of: u32, after: u32, src: u32, dst: u32, msgid: u32, fnr: u32) {
+    let uid: u64 = (*c).site
+    (*c).site = (*c).site + 1
+    var tok: [u8; 8] = "chkcastk"
+    var ts: [u8; 8] = "chksitec"
+    load_value(c, R_AX, src)
+    var pa: [u8; 8] = "push rax"
+    raw(c, (&pa[0]) as u64, 8)
+    normalize(c, R_AX, after)
+    if fir.fty_bits(of) > fir.fty_bits(after) {
+        normalize(c, R_AX, of)
+    }
+    var cm: [u8; 24] = "cmp qword ptr [rsp], rax"
+    raw(c, (&cm[0]) as u64, 24)
+    var je: [u8; 2] = "je"
+    site_jump(c, (&je[0]) as u64, 2, (&tok[0]) as u64, 8, fnr, uid)
+    var jm: [u8; 3] = "jmp"
+    site_jump(c, (&jm[0]) as u64, 3, (&ts[0]) as u64, 8, fnr, uid)
+    site_here(c, (&ts[0]) as u64, 8, fnr, uid)
+    var pod: [u8; 7] = "pop rdx"
+    raw(c, (&pod[0]) as u64, 7)
+    var mc: [u8; 12] = "mov rcx, rdx"
+    raw(c, (&mc[0]) as u64, 12)
+    trampoline_jump(c, PANIC_CAST, msgid, !is_sign(of))
+    site_here(c, (&tok[0]) as u64, 8, fnr, uid)
+    // Nothing was lost: take the ORIGINAL back off the stack (the
+    // comparison above widened it past the target width again) and narrow
+    // it once more, cleanly.
+    var poa: [u8; 7] = "pop rax"
+    raw(c, (&poa[0]) as u64, 7)
+    normalize(c, R_AX, after)
+    store_slot(c, slot_of(c, dst), R_AX)
+}
+
+// ROUND 72 -- `+% -% *%` and `+| -| *|`. Wrapping needs nothing at all
+// beyond plain arithmetic: two's complement wrapping IS what `add`/`sub`/
+// `imul` already do when nobody looks at the flag. Saturating clamps the
+// wrapped result back into range when the flag did fire.
+fn emit_wrapsat(c: *mut Cg, ty: u32, kind: u64, op: u32, a: u32, b: u32, dst: u32, fnr: u32) {
+    if kind == fir.WS_WRAP {
+        emit_bin(c, ty, op, a, b, dst)
+        return
+    }
+    let bits: u32 = fir.fty_bits(ty)
+    let uid: u64 = (*c).site
+    (*c).site = (*c).site + 1
+    var tcl: [u8; 8] = "satclamp"
+    var tdn: [u8; 7] = "satdone"
+    load_value(c, R_AX, a)
+    load_value(c, R_CX, b)
+    var pa: [u8; 8] = "push rax"
+    raw(c, (&pa[0]) as u64, 8)
+    var pc: [u8; 8] = "push rcx"
+    raw(c, (&pc[0]) as u64, 8)
+    if op == 0 {
+        var n: [u8; 3] = "add"
+        op2_bits(c, (&n[0]) as u64, 3, R_AX, R_CX, bits)
+    } else if op == 1 {
+        var n2: [u8; 3] = "sub"
+        op2_bits(c, (&n2[0]) as u64, 3, R_AX, R_CX, bits)
+    } else {
+        emit_mul_flagged(c, ty, bits)
+    }
+    overflow_jump(c, ty, (&tcl[0]) as u64, 8, fnr, uid)
+    var drop: [u8; 11] = "add rsp, 16"
+    raw(c, (&drop[0]) as u64, 11)
+    var jm: [u8; 3] = "jmp"
+    site_jump(c, (&jm[0]) as u64, 3, (&tdn[0]) as u64, 7, fnr, uid)
+    site_here(c, (&tcl[0]) as u64, 8, fnr, uid)
+    // The two ORIGINAL operands back, for the sign tests below.
+    var poc: [u8; 7] = "pop rcx"
+    raw(c, (&poc[0]) as u64, 7)
+    var poa: [u8; 7] = "pop rax"
+    raw(c, (&poa[0]) as u64, 7)
+    if !is_sign(ty) {
+        // Unsigned: `+`/`*` overflowing means "too big" (clamp to MAX),
+        // `-` overflowing means "went below zero" (clamp to 0).
+        if op == 1 {
+            movabs_u(c, R_AX, 0)
+        } else {
+            movabs_u(c, R_AX, ty_max_u(ty))
+        }
+    } else {
+        // Signed: the sign of ONE original operand (`+`/`-`) or the XOR of
+        // both (`*`) says which bound was crossed.
+        if op == 2 {
+            var xr: [u8; 3] = "xor"
+            op2(c, (&xr[0]) as u64, 3, R_AX, R_CX)
+        }
+        ins(c)
+        if op == 1 {
+            var c1: [u8; 10] = "cmp rcx, 0"
+            w(c, (&c1[0]) as u64, 10)
+        } else {
+            var c2: [u8; 10] = "cmp rax, 0"
+            w(c, (&c2[0]) as u64, 10)
+        }
+        nl(c)
+        if op == 1 {
+            movabs_i(c, R_AX, ty_min(ty))
+            movabs_u(c, R_DX, ty_max_u(ty))
+        } else {
+            movabs_u(c, R_AX, ty_max_u(ty))
+            movabs_i(c, R_DX, ty_min(ty))
+        }
+        var cv: [u8; 14] = "cmovl rax, rdx"
+        raw(c, (&cv[0]) as u64, 14)
+    }
+    site_here(c, (&tdn[0]) as u64, 7, fnr, uid)
+    normalize(c, R_AX, ty)
+    store_slot(c, slot_of(c, dst), R_AX)
+}
+
 fn emit_inst(c: *mut Cg, fnr: u32, i: u32) {
     let f: *mut fir.Fir = ff(c)
     let kind: u32 = fir.i_kind_of(f, i)
@@ -1684,6 +2284,30 @@ fn emit_inst(c: *mut Cg, fnr: u32, i: u32) {
     }
     if kind == fir.O_BIN {
         emit_bin(c, ty, fir.i_c_of(f, i), fir.i_a_of(f, i), fir.i_b_of(f, i), dst)
+        return
+    }
+    // ROUND 72 (SPEC 13, item L9) -- checked and explicitly unchecked
+    // integer arithmetic.
+    if kind == fir.O_BINWRAPSAT {
+        emit_wrapsat(c, ty, fir.i_number_of(f, i), fir.i_c_of(f, i),
+            fir.i_a_of(f, i), fir.i_b_of(f, i), dst, fir.f_name_of(f, fnr))
+        return
+    }
+    if kind == fir.O_CHECKEDBIN {
+        emit_checked_bin(c, ty, fir.i_c_of(f, i), fir.i_a_of(f, i), fir.i_b_of(f, i),
+            dst, fir.i_number_of(f, i) as u32, fir.f_name_of(f, fnr))
+        return
+    }
+    if kind == fir.O_CHECKEDDIV {
+        let both: u64 = fir.i_number_of(f, i)
+        emit_checked_div(c, ty, fir.i_c_of(f, i), fir.i_a_of(f, i), fir.i_b_of(f, i),
+            dst, (both & 4294967295) as u32, (both >> 32) as u32,
+            fir.f_name_of(f, fnr))
+        return
+    }
+    if kind == fir.O_CHECKEDCAST {
+        emit_checked_cast(c, fir.i_c_of(f, i), ty, fir.i_a_of(f, i), dst,
+            fir.i_number_of(f, i) as u32, fir.f_name_of(f, fnr))
         return
     }
     if kind == fir.O_CMP {
@@ -1902,6 +2526,10 @@ fn int_register(c: *mut Cg, back: bool) {
 
 fn cg_run(c: *mut Cg) {
     let f: *mut fir.Fir = ff(c)
+    // ROUND 72: which panic messages does this program need? Collected
+    // BEFORE the first instruction is written, because a checked site
+    // refers to its message by the label the table gives it.
+    panic_collect(c)
     var header: [u8; 29] = ".intel_syntax noprefix\n.text\n"
     t(c, (&header[0]) as u64, 29)
     if !(*c).free {
@@ -1914,6 +2542,8 @@ fn cg_run(c: *mut Cg) {
     var fi: u32 = 0
     while fi < fir.fn_count(f) as u32 {
         frame_build(c, fi)
+        // ROUND 72: one label counter per function (panic_rt.rs::SiteCounter).
+        (*c).site = 0
         nl(c)
         var g: [u8; 7] = ".globl "
         t(c, (&g[0]) as u64, 7)
@@ -2020,6 +2650,14 @@ fn cg_run(c: *mut Cg) {
     // HOOK fnval: the function records (.rodata) -- only when the program
     // takes a function as a value at all (fnval.rs, round 58).
     fnval_records(c)
+    // HOOK panic_rt: the message table (.rodata) and the shared out of line
+    // trampoline (round 72, SPEC 13) -- only if the program really contains
+    // a checked operation. `--opt-level=release-fast`, or a program that
+    // never reaches a checked path, carries not one octet of it.
+    if has_panic(c) {
+        panic_rodata(c)
+        panic_trampoline(c)
+    }
     var gnu: [u8; 38] = ".section .note.GNU-stack,\"\",@progbits\n"
     t(c, (&gnu[0]) as u64, 38)
 }

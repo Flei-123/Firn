@@ -82,8 +82,14 @@ for s in 0 1; do
     kind=$(readelf -h "$f" | awk -F: '/^  Type:/ {print $2}' | awk '{print $1}')
     [ "$kind" = "REL" ] && ok "firnc$s: ELF type REL (relocatable object file)" \
                         || bad "firnc$s: ELF kind '$kind', expected REL"
-    undef=$(nm -u "$f" 2>/dev/null | sed '/^$/d')
-    [ -z "$undef" ] && ok "firnc$s: NO undefined symbol" \
+    # ROUND 72: `osum_panic` is the ONE name allowed to stay undefined here.
+    # Checked arithmetic (SPEC section 13, item L9) calls that external
+    # symbol under `profile kernel` when a value goes out of range, on
+    # purpose; `demos/kernel/start.s` defines it and the link step resolves
+    # it. Anything ELSE undefined is still a hard failure. The same
+    # exception is made in tools/freestanding/run.sh and tools/kernel/run.sh.
+    undef=$(nm -u "$f" 2>/dev/null | awk '{print $NF}' | sed '/^$/d' | grep -vxF osum_panic)
+    [ -z "$undef" ] && ok "firnc$s: NO undefined symbol other than osum_panic" \
                     || { bad "firnc$s: undefined symbols"; echo "$undef" | sed 's/^/        /'; }
     # NOTE: no `... | grep -q` here. `grep -q` leaves the pipe as soon as it
     # has its hit, the producer dies of SIGPIPE, and with `set -o pipefail`
