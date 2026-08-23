@@ -297,20 +297,23 @@ a stranger writes, in `tools/firstrun/cases/`:
 | `05_file` | read a file by its name |
 | `06_many` | 40,000 joins — a real load, `gc_collections() > 0` |
 | `07_gc_init_by_hand` | COUNTER-CHECK: the explicit setup still works |
+| `08_string_alias` | `string` and `str` are ONE type (the fifth find, below) |
 
-Not one of `01`..`06` says a word about a collector. Each has to compile, run
-and print exactly its `.out` file — with the optimizer, without it, and
-through the self hosted compiler `firnc1`. Three counter-checks on top,
-because a check that only ever says yes proves nothing:
+Not one of `01`..`06` and `08` says a word about a collector. Each has to
+compile, run and print exactly its `.out` file — with the optimizer, without
+it, and through the self hosted compiler `firnc1`. Four counter-checks on
+top, because a check that only ever says yes proves nothing:
 
-* **A** the sources of `01`..`06` really contain no `gc_init` (a check that
-  measures a program which sets up by hand would be empty),
+* **A** the sources of `01`..`06` and `08` really contain no `gc_init` (a
+  check that measures a program which sets up by hand would be empty),
 * **B** a program without text gets NO setup in `_start`, and the joining one
   gets it EXACTLY once,
-* **C** `profile kernel` gets neither an entry point nor a collector.
+* **C** `profile kernel` gets neither an entry point nor a collector,
+* **D** both spellings of the text type pull the same runtime in and name
+  the same canonical type in an error message (the fifth find).
 
 ```
-PASS 31/31 first-run checks
+PASS 38/38 first-run checks
 ```
 
 ## The fifth find, handed in by the owner: `let x: string = "test"`
@@ -472,6 +475,9 @@ suite measures what this round changed and not what it did not.
 
 ## Acceptance of the round
 
+*(Re-measured in full after the fifth find; the numbers below are the ones
+of that run, not of the run before it.)*
+
 * `./test.sh` — the run came back `FAIL 3/1204`. Two of the three are the
   SAME INHERITED case, not this round: `tools/aarch64/run.sh` (section 43)
   in its two build stages.
@@ -482,20 +488,52 @@ suite measures what this round changed and not what it did not.
   in the README and in `docs/BENCHMARKS.md` (296 of 301, 1 differing). It is
   named here rather than filtered out.
 
-  The third was THIS REPORT: it quoted the German program and the German
-  message of round 87 inside fenced blocks, and `check_comments.py` counts
-  every line of a `.md` file as prose — nine German lines, section 21 red.
-  The quotes now stand in backticks, which the check treats as code, and
-  `tools/english/check.sh` was run again on its own: five zeros. No compiler
-  and no library file changed in between.
+  In the run BEFORE the fifth find the third failure was this report itself:
+  it quoted the German program and the German message of round 87 inside
+  fenced blocks, and `check_comments.py` counts every line of a `.md` file
+  as prose — nine German lines, section 21 red. The quotes now stand in
+  backticks, which the check treats as code. In the re-measured run
+  section 21 is green.
+
+  The third failure of the re-measured run is a different one and it is
+  named here rather than swept away: **`tools/js/round66.sh` (section 34)
+  struck once, and only inside the full run.** The cause is written in
+  `.js-work/r66/soak.txt`:
+
+  ```
+  jobs   rc=-11    4.7s  RSS first 9532 KiB  max 11380 KiB  growth +1848 KiB
+         output: jobs 60 0 | OK
+  ```
+
+  The program ran to the end and printed its result (`jobs 60 0 | OK`), and
+  the growth of 1,848 KiB is far under the limit of 8,192; the process was
+  then killed by SIGSEGV (`rc=-11`) while the machine was swapping (1.4 GiB
+  of swap in use, `test.sh` and the JS engine at the same time). Run on its
+  own, on the same commit and the same binary, the group comes back
+  **`RC=0`**:
+
+  ```
+  generators    872 / 1056   82.58%
+  async        4267 / 4681   91.16%
+  classes     11793 / 16689  70.66%
+  gen     growth: 0 KiB      genleak growth: 24508 KiB
+  jobs    growth: 2340 KiB   clean 4 KiB / leak 19008 KiB
+  OK: the features of round 66 hold their limits.
+  ```
+
+  It cannot come from this round either way: nothing in the five finds
+  touches the JS engine, and the name `string` appears in `lib/js/` only
+  inside TEXT LITERALS (`typeof` results), never as an identifier or a type.
+  It is a flake under memory pressure, written down with its evidence.
 
   Everything else green, including the new section 46.
 * `tools/fixpoint.sh` — stage 2 == stage 3, character for character
-  (650,711 lines of assembly), and `.firnc2` behaves like `firnc0` over the
-  whole corpus.
+  (651,251 lines of assembly, 3,806,336 octets each), and `.firnc2` behaves
+  like `firnc0` over the whole corpus.
 * `tools/self_compare.sh` — 321 the same, **0 differing, 0 faulty**.
 * `tools/english/check.sh` — 0 / 0 / 0 / 0 / 0, now including `lib/**`.
-* `tools/firstrun/run.sh` — `PASS 31/31`.
+* `tools/firstrun/run.sh` — `PASS 38/38` (31 before the fifth find, seven
+  more for case 08 across the three compilers and counter-check D).
 
 One number belongs here honestly: the setup in `_start` costs every program
 that uses text one `mmap` of the mark stack and one read of
