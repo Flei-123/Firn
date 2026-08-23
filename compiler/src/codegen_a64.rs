@@ -448,6 +448,7 @@ pub fn emit(m: &Module) -> Result<String, String> {
     // the honest initial value, not a special case.
     let mut e = Emitter {
         out: String::new(),
+        cold: String::new(),
         xmm: crate::simd::XmmCache::default(),
         debug_funcs: Vec::new(),
     };
@@ -1518,6 +1519,7 @@ mod tests {
     // the honest initial value, not a special case.
     let mut e = Emitter {
         out: String::new(),
+        cold: String::new(),
         xmm: crate::simd::XmmCache::default(),
         debug_funcs: Vec::new(),
     };
@@ -1528,6 +1530,7 @@ mod tests {
         // instruction, and it was four before the case was noticed.
         let mut e2 = Emitter {
             out: String::new(),
+            cold: String::new(),
             xmm: crate::simd::XmmCache::default(),
             debug_funcs: Vec::new(),
         };
@@ -1535,6 +1538,7 @@ mod tests {
         assert_eq!(e2.out.trim(), "movn x9, #0", "{}", e2.out);
         let mut e3 = Emitter {
             out: String::new(),
+            cold: String::new(),
             xmm: crate::simd::XmmCache::default(),
             debug_funcs: Vec::new(),
         };
