@@ -16,10 +16,9 @@ reads `.fi` source text and writes **real machine code** for **x86-64** and
   its own source text, and the result is a fixpoint — stage 2 and stage 3 are
   character-identical (`tools/fixpoint.sh`).
 
-This is stage 0 plus everything the rounds after it added. The specification
-is [SPEC.md](SPEC.md) (the deviations of the implementation in 14.1), the IR is
-[docs/FIR.md](docs/FIR.md), how to build and **measure** everything yourself is
-[RUN.md](RUN.md), and every figure below with the command that produced it is
+Specification: [SPEC.md](SPEC.md) (deviations of the implementation in 14.1).
+IR: [docs/FIR.md](docs/FIR.md). Build and **measure** it yourself:
+[RUN.md](RUN.md). Every figure below with the command behind it:
 [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ---
@@ -40,18 +39,19 @@ hello, Firn -- dist2 25, dist 5, box 12, sum 10
 ```
 
 `FIRNLIB` tells the compiler where the standard library lives; a program that
-imports nothing does not need it. `bash test.sh` runs the whole acceptance
-suite — it builds the compiler, compiles and runs every program in the tree at
-three optimisation levels, and then works through about forty section proofs.
-It takes a while.
+imports nothing does not need it. `ld` prints one warning while linking --
+`LOAD segment with RWX permissions` -- because the binary is freestanding and
+carries no separate read-only segment yet; it is not an error and the program
+runs. `bash test.sh` runs the whole acceptance suite — it builds the compiler,
+compiles and runs every program in the tree at three optimisation levels, and
+then works through about forty section proofs. It takes a while.
 
 ---
 
 ## What Firn can do today
 
 Every line here is checked by a script in this repository; the tables behind
-the numbers, together with the command for each one, are in
-[docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+the numbers are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 | | state | proof |
 |---|---|---|
@@ -124,12 +124,12 @@ hello, Firn -- dist2 25, dist 5, box 12, sum 10
 
 * **`int` is an alias for `i32`, not a second type** — and so are `long` =
   `i64`, `short` = `i16`, `byte` = `u8` (unsigned), `sbyte` = `i8`, `uint`,
-  `ulong`, `ushort` and `double` = `f64`. Both spellings pass into each other
+  `ulong`, `ushort`, `double` = `f64`. Both spellings pass into each other
   without a cast, and `impl Ord for int` produces the very same method as
-  `impl Ord for i32`. If you come from Rust, write `i32` — it is exactly the
-  same type. The widths are fixed on every platform (`int` is *always* 32 bits,
-  `long` *always* 64); that is the trap of C's `long` that Firn avoids on
-  purpose (SPEC 13, `tests/1334_type_aliases.fi`).
+  `impl Ord for i32` — if you come from Rust, write `i32`, it is the same type.
+  The widths are fixed on every platform (`int` *always* 32 bits, `long`
+  *always* 64): the trap of C's `long`, avoided on purpose (SPEC 13,
+  `tests/1334_type_aliases.fi`).
 * **Type inference where the context says something**: `let dx = …` takes the
   type of the expression, `var sum = 0` falls back to `i32` when nothing says
   otherwise. `let x: i32 = 5` still works and still means the same.
@@ -145,8 +145,6 @@ hello, Firn -- dist2 25, dist 5, box 12, sum 10
 More: [`hello.fi`](examples/hello.fi) (one `write` syscall, no library at all),
 [`fib.fi`](examples/fib.fi), [`structs.fi`](examples/structs.fi),
 [`bubblesort.fi`](examples/bubblesort.fi), [`number_check.fi`](demos/number_check.fi).
-
----
 
 ## What Firn can NOT do — the honest list
 
@@ -184,7 +182,7 @@ and a `line:column` — it does not crash and it does not pretend.
   `defer` and `errdefer` **do** exist (`tests/580_defer.fi`,
   `tests/581_errdefer.fi`) and are the tool for cleanup today.
   `#[must_consume]` catches the discarded-result case, and since round 79 an
-  escape checker refuses to let the address of a local leave its frame.
+  escape checker refuses to let a local's address leave its frame.
 * **No `secret[T]`, `u128`, `mul_wide`, `declassify`, `#[constant_time]`**
   (SPEC 9). `fn f(a: secret[u8])` reports *"'secret[T]' is not implemented in
   stage 0"*, `u128` is an *"unknown type"*, `#[constant_time]` reports
