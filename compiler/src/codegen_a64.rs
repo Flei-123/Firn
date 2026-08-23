@@ -492,6 +492,14 @@ pub fn emit(m: &Module) -> Result<String, String> {
     if crate::fnval::has_records() {
         e.raw(&crate::fnval::records_asm());
     }
+    // ROUND 83: the message table and the trampoline of the checked
+    // arithmetic, once per object file and only when the program contains
+    // a checked operation at all (`panic_rt::any_registered`) -- the same
+    // guard the x86 path uses, so `release-fast` still pays nothing.
+    if crate::panic_rt::any_registered() {
+        e.raw(&crate::panic_rt::rodata_asm());
+        e.raw(&crate::panic_rt_a64::trampoline_asm());
+    }
     e.raw(".section .note.GNU-stack,\"\",%progbits");
     Ok(e.out)
 }
@@ -539,9 +547,13 @@ fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
             }
         }
     }
+    // ROUND 83: one counter per function, so that two checked sites in
+    // the same function get two label pairs and two functions never
+    // collide -- the same rule (and the same struct) the x86 side uses.
+    let mut site = crate::panic_rt::SiteCounter::new(&f.name);
     for b in &f.blocks {
         e.raw(&format!("{}:", block_label(&f.name, b.id)));
-        emit_block(e, f, &fr, b)?;
+        emit_block(e, f, &fr, b, &mut site)?;
     }
     Ok(())
 }
@@ -559,9 +571,15 @@ fn emit_epilogue(e: &mut Emitter, fr: &Frame) {
     e.line("ret");
 }
 
-fn emit_block(e: &mut Emitter, f: &Func, fr: &Frame, b: &Block) -> Result<(), String> {
+fn emit_block(
+    e: &mut Emitter,
+    f: &Func,
+    fr: &Frame,
+    b: &Block,
+    site: &mut crate::panic_rt::SiteCounter,
+) -> Result<(), String> {
     for i in &b.insts {
-        emit_inst(e, f, fr, i)?;
+        emit_inst(e, f, fr, i, site)?;
     }
     match &b.term {
         Term::Br(t) => e.line(&format!("b {}", block_label(&f.name, *t))),
@@ -692,7 +710,13 @@ fn emit_switch(e: &mut Emitter, f: &Func, fr: &Frame, term: &Term) -> Result<(),
 
 // -------------------------------------------------------------- instructions
 
-fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), String> {
+fn emit_inst(
+    e: &mut Emitter,
+    f: &Func,
+    fr: &Frame,
+    i: &Inst,
+    site: &mut crate::panic_rt::SiteCounter,
+) -> Result<(), String> {
     let ty = i.ty;
     match &i.op {
         Op::Const(c) => {
@@ -1050,21 +1074,36 @@ fn emit_inst(e: &mut Emitter, f: &Func, fr: &Frame, i: &Inst) -> Result<(), Stri
                 "inline assembler is x86 text and has no meaning on aarch64 (round 80)".to_string(),
             )
         }
-        // ROUND 83 -- the checked arithmetic of round 72 on this machine.
-        // NOT YET IMPLEMENTED (docs/ROUND80.md section 7 has the recipe:
-        // `adds`/`subs` with `b.vs`/`b.cs`, `smulh`/`umulh` for the
-        // multiplication, and a trampoline of this machine's own).
-        Op::CheckedBin { .. } | Op::CheckedDiv { .. } | Op::CheckedCast { .. } => {
-            return Err(
-                "aarch64: checked integer arithmetic (round 72) is not implemented on this target yet"
-                    .to_string(),
-            )
+        // ROUND 83 -- the checked arithmetic of round 72 on this machine
+        // (docs/ROUND80.md section 7, panic_rt_a64.rs). Both operands are
+        // read extended to a full 64 bits, exactly as the x86 path reads
+        // them; the check itself computes at the type's own width.
+        Op::CheckedBin { op, a, b, msg } => {
+            let d = i.dst.ok_or("internal error: checked binary operation without target")?;
+            load_ext(e, fr, A, *a, ty, 64);
+            load_ext(e, fr, B, *b, ty, 64);
+            crate::panic_rt_a64::emit_checked_bin(e, *op, ty, msg, site);
+            store_dst(e, fr, d, A);
         }
-        Op::BinWrapSat { .. } => {
-            return Err(
-                "aarch64: the explicit '+% -% *%' / '+| -| *|' of round 72 are not implemented on this target yet"
-                    .to_string(),
-            )
+        Op::CheckedDiv { op, a, b, msg_zero, msg_range } => {
+            let d = i.dst.ok_or("internal error: checked division without target")?;
+            load_ext(e, fr, A, *a, ty, 64);
+            load_ext(e, fr, B, *b, ty, 64);
+            crate::panic_rt_a64::emit_checked_div(e, *op, ty, msg_zero, msg_range, site);
+            store_dst(e, fr, d, A);
+        }
+        Op::CheckedCast { src, from, msg } => {
+            let d = i.dst.ok_or("internal error: checked cast without target")?;
+            load_ext(e, fr, A, *src, *from, 64);
+            crate::panic_rt_a64::emit_checked_cast(e, *from, ty, msg, site);
+            store_dst(e, fr, d, A);
+        }
+        Op::BinWrapSat { kind, op, a, b } => {
+            let d = i.dst.ok_or("internal error: wrap/sat binary operation without target")?;
+            load_ext(e, fr, A, *a, ty, 64);
+            load_ext(e, fr, B, *b, ty, 64);
+            crate::panic_rt_a64::emit_wrap_sat(e, *kind, *op, ty, site)?;
+            store_dst(e, fr, d, A);
         }
         Op::Simd { .. } => {
             return Err(

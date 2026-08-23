@@ -46,6 +46,7 @@ mod escape;
 mod nogc;
 mod opt;
 mod panic_rt;
+mod panic_rt_a64;
 mod package;
 mod package_world;
 mod prof;
