@@ -70,8 +70,20 @@ def kommentarzeilen(pfad):
 CODESPAN = re.compile(r'`[^`]*`')
 
 
+# Ein GROSSGESCHRIEBENER Treffer ist ein Eigenname oder eine Abkuerzung, kein
+# deutsches Funktionswort: `MIT` ist der Name der Lizenz, nicht die
+# Praeposition `mit`. Deutsche Funktionswoerter stehen in Prosa nie in
+# Versalien -- die Ausnahme kostet also keine echte Fundstelle.
+def _echter_treffer(zeile):
+    for t in RE_WORT.finditer(zeile):
+        if t.group(1).isupper():
+            continue
+        return True
+    return False
+
+
 def deutsch(zeilen):
-    return [(i, z) for i, z in zeilen if RE_WORT.search(CODESPAN.sub(' ', z))]
+    return [(i, z) for i, z in zeilen if _echter_treffer(CODESPAN.sub(' ', z))]
 
 
 def bereich(pfad):
