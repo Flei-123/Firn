@@ -21,6 +21,22 @@ The foundation decisions -- what has to go into the foundation now so that it
 stays possible later, and what can wait:
 [DESIGN_GOALS.md](DESIGN_GOALS.md).
 
+## The shortest way in
+
+```sh
+cargo build --release --manifest-path compiler/Cargo.toml
+compiler/target/release/firnc run examples/hello.fi
+```
+
+`firnc run` compiles the file and starts it straight away -- the way
+`python test.py` does it. Everything after the file name goes to the
+PROGRAM (`firnc run tool.fi --input data.csv`), the exit code of the program
+becomes the exit code of the command, and the result is cached under
+`~/.cache/firn`, so the second start skips the compiler: the JavaScript
+engine of this repository goes from **2543 ms to 87 ms**. A file with
+`#!/usr/bin/env firnc-run` in line 1 starts as `./program.fi`.
+Details and the measurements: [docs/ROUND84.md](docs/ROUND84.md).
+
 ---
 
 ## Numbers
@@ -80,8 +96,7 @@ suppression).
 ## Quick start
 
 ```sh
-./compiler/target/release/firnc -o /tmp/hello examples/hello.fi
-/tmp/hello
+./compiler/target/release/firnc run examples/hello.fi
 ```
 
 Real output: the greeting of `examples/hello.fi`, written with a single
@@ -89,13 +104,23 @@ Real output: the greeting of `examples/hello.fi`, written with a single
 in `examples/hello.fi`.)
 
 ```sh
-./compiler/target/release/firnc -o /tmp/fib examples/fib.fi
-/tmp/fib; echo "Exit: $?"
+./compiler/target/release/firnc run examples/fib.fi; echo "Exit: $?"
 ```
 
 ```
 Exit: 89
 ```
+
+The two step form is still there and is what `run` does under the hood --
+use it when you want to keep the binary:
+
+```sh
+./compiler/target/release/firnc -o /tmp/fib examples/fib.fi
+/tmp/fib; echo "Exit: $?"
+```
+
+More about `run`, the cache and the shebang line:
+[`firnc run --help`](docs/ROUND84.md), [RUN.md](RUN.md) §2.
 
 ## All tests
 
