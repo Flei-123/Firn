@@ -139,6 +139,18 @@
 #      level, and two counter-checks: what stays in range behaves exactly
 #      as it always did, and a program without a checked operation carries
 #      neither the message table nor the trampoline.
+#  45. THE FIRST FIVE MINUTES (tools/firstrun/run.sh, round 88): eight
+#      programs of the kind a stranger writes before he has read anything --
+#      join text, compare, print, take pieces out, put a number into a
+#      sentence, read a file, forty thousand joins as a real load on the
+#      collector, and `string`/`str` as ONE type. Not one of them says a
+#      word about a collector; each has to COMPILE, RUN and print exactly
+#      its `.out` file, with the optimizer, without it, and through firnc1.
+#      Four counter-checks: a program without text gets NO setup in
+#      `_start`, the joining one gets it EXACTLY once, `profile kernel` gets
+#      neither an entry point nor a collector, and both spellings of the
+#      text type pull in the same runtime and name the same canonical type
+#      in an error message.
 #  10. DOM soak run (tools/dom_soak/run.sh): the DOM prototype in Firn builds
 #      real cycles continuously (parent/child, listener, JS wrapper) and must
 #      not grow while doing so; the deliberately leaking counter-check with
@@ -1044,6 +1056,22 @@ if [ "$CHKRC" -eq 0 ]; then
 else
     bad "tools/checked/run.sh failed (see .test-work/checked.log)"
     grep -E '  FAIL|CHECKS' "$WORK/checked.log" | head -12 | sed 's/^/   /'
+fi
+
+echo "== 45. the first five minutes with the language (tools/firstrun/run.sh, ROUND 88) =="
+# Every other section here proves that something DIFFICULT works. This one
+# proves that the EASY thing works: the programs anybody writes first. Round
+# 87 failed four of the seven, for four different reasons -- the collector
+# had to be started by hand, `str` reached only half of the methods of
+# `Span`, `io.print_line("x")` took no argument, and the message that came
+# out of it was German (docs/ROUND88.md).
+bash tools/firstrun/run.sh > "$WORK/firstrun.log" 2>&1 && FRRC=0 || FRRC=$?
+if [ "$FRRC" -eq 0 ]; then
+    ok
+    grep -E '^(PASS|  SKIP)' "$WORK/firstrun.log" | sed 's/^/   /'
+else
+    bad "tools/firstrun/run.sh failed (see .test-work/firstrun.log)"
+    grep -E '^  FAIL|^FAIL' "$WORK/firstrun.log" | head -10 | sed 's/^/   /'
 fi
 
 TOTAL=$((PASS + FAIL))

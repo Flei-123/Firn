@@ -620,6 +620,13 @@ if text == "quit" { ... }        // == compares the CONTENT
 let greeting: str = text + "!"   // + concatenates
 ```
 
+**Since round 88 the type has a second spelling: `string`** -- out of the
+C# flavoured alias family of round 70/71 (13). It is an alias, not a second
+type: `let x: string = "test"` and `let y: str = "test"` mean exactly the
+same thing, pass into each other's functions without a cast, and every error
+message names the canonical `str`. Proof: `tools/firstrun/run.sh` case 08
+and counter-check D.
+
 * **What a `str` is:** two machine words, `p: *mut u8` and `n: usize` --
   exactly the layout of `str.Span`. A `str` is a VIEW of octets that nobody
   may change any more.
@@ -630,6 +637,12 @@ let greeting: str = text + "!"   // + concatenates
 * **`str` and `Span` may be used for each other** -- same two words, same ABI.
   That is why the whole library of 8.1 works on a `str` without a conversion
   function: `s.trim()`, `s.length()`, `s.starts_with(...)`, `s.find(...)`.
+  **Since round 88 that holds for the METHODS as well:** where `Type__method`
+  finds nothing, the method resolution asks the layout compatible views --
+  every one of the 22 methods of `impl Span` (`part`, `ab`, `to`, `find_back`,
+  `utf8_part`, ...) is reachable on a `str`. Up to round 87 only those
+  resolved for which the module `str` happened to have a FREE function of the
+  same name; that was an accident of the naming scheme, not a rule.
 * **Who owns the octets:**
 
   | origin | storage | freed by |
@@ -644,8 +657,15 @@ let greeting: str = text + "!"   // + concatenates
 * **`+` allocates and therefore needs the collector.** A program that works
   with `str` pulls the collector runtime in automatically; the signal is read
   off the tokens -- the type name `str`, or a text literal next to `+`, `==`,
-  `!=`. Before the first concatenation `gc_init()` has to have run, exactly
-  like for every other allocation (3.5).
+  `!=`. **Since round 88 the compiler also writes the setup:** where it links
+  the runtime in, `gc_init()` stands as the first instruction of the process,
+  in `_start`, before the first instruction of the user, exactly once. Nobody
+  has to call it any more to join two pieces of text.
+
+  An explicit `gc_init()` in the source text keeps working and sets up
+  nothing a second time (it is idempotent); `gc_set_max_bytes` afterwards
+  keeps working too. Under the profile `kernel` nothing of this arises --
+  there is no `_start` there and no collector (2).
 
 #### The literal -- and why nothing breaks
 
@@ -1151,6 +1171,7 @@ brackets a line break has never ended anything and still does not. Proof:
   | `int` | `i32` | | `uint` | `u32` |
   | `long` | `i64` | | `ulong` | `u64` |
   | `double` | `f64` | | `float` | `f32` |
+  | `string` | `str` | | | |
 
   The canonical form inside this repository stays `i32`/`i64`/`u8`; error
   messages name it too.
@@ -1173,6 +1194,23 @@ brackets a line break has never ended anything and still does not. Proof:
   **ROUND 71: `float` is given out and it means `f32`** -- as in C, C++, C#,
   Java and Go. It was held back in round 70 on purpose, so that it would not
   first mean `f64` and then something else.
+
+  **ROUND 88: `string` closes the family.** The list is the one of C#, and
+  there the text type is called `string`; it was the only name missing, so
+  the most obvious line a stranger writes, `let x: string = "test"`, was
+  answered with "unknown type 'string'" -- for no reason anybody could
+  name. `string` and `str` (8.0) are ONE type: the same layout, the same
+  methods, they pass into each other without a cast, `impl ... for string`
+  creates the same method as `impl ... for str`, and a type error names
+  `str` in both spellings. **The canonical form stays `str`**, and the
+  repository writes `str` throughout -- as it writes `i32` and not `int`.
+
+  One difference to all the pairs above, and it matters for whoever reads
+  the compiler: `str` is not a primitive type but the builtin STRUCT
+  (`compiler/src/strtype.rs`). That is why `string` may not go into the
+  tables that map onto primitive KINDS (`types.fi::alias_ty`); the name is
+  folded one step later, right before the struct is looked up
+  (`sema.rs::resolve_ty`, `types.fi::canon_str`).
 * **Literals are typeless until they are used.** Where the context says
   something, that holds (`let y: i64 = 5`, `let y: float = 2.5`). Where
   nothing at all says anything, `i32` holds for integers and `f64` for

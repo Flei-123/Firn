@@ -292,6 +292,17 @@ impl TypeCtx {
 /// **ROUND 71** — `float` is given out now and it means `f32`, exactly as in
 /// C, C++, C#, Java and Go. It was held back in round 70 on purpose so that
 /// it would not first mean `f64` and then something else.
+///
+/// **ROUND 88** — `string` closes the family. The list above is the one of
+/// C#, and there the text type is called `string`; it was the only name
+/// missing, and `let x: string = "test"` answered with "unknown type".
+/// CAUTION, the one difference to all the others: `str` is NOT a primitive
+/// type, it is the builtin STRUCT of `strtype.rs`. So `prim_type("string")`
+/// stays `None` on purpose — the fold happens one step later, where a name
+/// becomes a struct (`sema.rs::resolve_ty`). That is why `string` may not be
+/// written into the primitive tables of `layout_canon.rs`/`iface.rs`: they
+/// match on the canonical name and let `str` fall through to the struct
+/// lookup all by themselves.
 pub fn alias_of(name: &str) -> Option<&'static str> {
     Some(match name {
         "sbyte" => "i8",
@@ -304,6 +315,9 @@ pub fn alias_of(name: &str) -> Option<&'static str> {
         "ulong" => "u64",
         "double" => "f64",
         "float" => "f32",
+        // ROUND 88: the text type of the same family. `str` is a struct,
+        // not a primitive -- see the note above.
+        "string" => "str",
         _ => return None,
     })
 }
