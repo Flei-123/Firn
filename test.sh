@@ -4,8 +4,9 @@
 # Sequence:
 #   1. Build the compiler (cargo build --release) -- warnings are reported.
 #   2. Module tests of the compiler (cargo test --release).
-#   3. Every program in tests/, tests/opt/ and examples/ is compiled TWICE
-#      (--opt-level=release-fast, --no-opt and --opt-level=dev-fast),
+#   3. Every program in tests/, tests/opt/ and examples/ is compiled in ALL
+#      FOUR build levels plus --no-opt (--opt-level=release-fast,
+#      --opt-level=release-safe, --opt-level=dev-fast, --no-opt),
 #      assembled, linked,
 #      RUN, and the exit code resp. the standard output is checked against the
 #      expectation in line 1 (// expect_exit: N  resp.  // expect_out: TEXT).
@@ -139,6 +140,15 @@
 #      level, and two counter-checks: what stays in range behaves exactly
 #      as it always did, and a program without a checked operation carries
 #      neither the message table nor the trampoline.
+#  46. THE FOUR BUILD LEVELS AGREE (tools/optlevels/run.sh, round 90):
+#      fourteen programs through BOTH compilers in all four levels, and
+#      every level has to produce the same exit code and the same output --
+#      the question that would have caught round 90's wrong-code bug
+#      (`mul` writes rdx, the allocator did not know) on the day it was
+#      merged. With three counter-checks: an overflowing program MUST
+#      differ between release-fast and the checked levels, and the exact
+#      crossing analysis has to agree with the coarse one
+#      (`FIRN_RA_ROUGH=1`).
 #  45. THE FIRST FIVE MINUTES (tools/firstrun/run.sh, round 88): eight
 #      programs of the kind a stranger writes before he has read anything --
 #      join text, compare, print, take pieces out, put a number into a
@@ -185,7 +195,14 @@ echo "   cargo test: ok"
 rm -rf "$WORK"
 mkdir -p "$WORK"
 
-run_case() {          # $1 = file, $2 = "opt" | "noopt" | "devfast"
+# ROUND 90: `safe` is the fourth mode, and it is not decoration. The bug of
+# that round (regalloc.rs::inst_clobbers) made 117 of these programs fail
+# under `--opt-level=release-safe` and 25 under `--opt-level=dev-fast` --
+# the DEFAULT level -- and this suite did not notice, because it never ran
+# `release-safe` at all and had been green the last time somebody ran it
+# before the round that broke it. A build level nobody runs is a build level
+# nobody can ship.
+run_case() {          # $1 = file, $2 = "opt" | "noopt" | "devfast" | "safe"
     local file="$1" mode="$2"
     local base ext bin flags hdr exp out rc
     base=$(basename "$file" .fi)
@@ -213,6 +230,7 @@ run_case() {          # $1 = file, $2 = "opt" | "noopt" | "devfast"
     flags="--opt-level=release-fast"
     [ "$mode" = "noopt" ]   && flags="--no-opt"
     [ "$mode" = "devfast" ] && flags="--opt-level=dev-fast"
+    [ "$mode" = "safe" ]    && flags="--opt-level=release-safe"
 
     if ! "$FIRNC" $flags -o "$bin" "$file" >"$WORK/$base.$mode.cerr" 2>&1; then
         bad "$file [$mode]: compilation failed"
@@ -253,7 +271,7 @@ run_case() {          # $1 = file, $2 = "opt" | "noopt" | "devfast"
     esac
 }
 
-echo "== 3. positive tests (each with and without the optimiser) =="
+echo "== 3. positive tests (in every build level) =="
 PROGS=$(ls tests/*.fi tests/opt/*.fi examples/*.fi)
 NPROG=0
 for f in $PROGS; do
@@ -262,9 +280,10 @@ for f in $PROGS; do
     run_case "$f" opt
     run_case "$f" noopt
     run_case "$f" devfast
-    echo "  [opt+noopt+devfast]"
+    run_case "$f" safe
+    echo "  [opt+noopt+devfast+safe]"
 done
-echo "   $NPROG programs x 3 runs (opt / noopt / dev-fast)"
+echo "   $NPROG programs x 4 runs (release-fast / no-opt / dev-fast / release-safe)"
 
 echo "== 4. negative tests (error messages) =="
 for f in tests/neg/*.fi; do
@@ -1105,6 +1124,16 @@ if [ "$CIRC" -eq 0 ]; then
 else
     bad "tools/checkidx/run.sh failed (see .test-work/checkidx.log)"
     grep -E '^  FAIL|^checkidx:' "$WORK/checkidx.log" | head -12 | sed 's/^/   /'
+fi
+
+echo "== 48. the four build levels agree (tools/optlevels/run.sh, ROUND 90) =="
+bash tools/optlevels/run.sh > "$WORK/optlevels.log" 2>&1 && OLRC=0 || OLRC=$?
+grep -E '^  (firnc0|firnc1|overflow|exact)' "$WORK/optlevels.log" | sed 's/^/ /'
+if [ "$OLRC" -eq 0 ]; then
+    ok
+else
+    bad "tools/optlevels/run.sh failed (see .test-work/optlevels.log)"
+    sed 's/^/        /' "$WORK/optlevels.log" | grep FAIL | head -12
 fi
 
 TOTAL=$((PASS + FAIL))
