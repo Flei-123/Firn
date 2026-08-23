@@ -2264,9 +2264,13 @@ impl<'a> Checker<'a> {
             return t;
         }
         match te {
+            // ROUND 88: the struct lookup asks for the CANONICAL name, so
+            // that `string` finds the one builtin `str` (types.rs::alias_of).
+            // For the primitive aliases nothing changes -- `prim_type` has
+            // already caught `int` and friends one line above.
             TypeExpr::Named(name, span) => match prim_type(name) {
                 Some(t) => t,
-                None => match self.tcx.lookup(name) {
+                None => match self.tcx.lookup(crate::types::canon_name(name)) {
                     Some(i) => Type::Struct(i),
                     None => {
                         let hint = self.type_hint(name);
@@ -2340,7 +2344,9 @@ impl<'a> Checker<'a> {
         match te {
             TypeExpr::Named(name, _) => match prim_type(name) {
                 Some(t) => Some(t),
-                None => self.tcx.lookup(name).map(Type::Struct),
+                None => {
+                    self.tcx.lookup(crate::types::canon_name(name)).map(Type::Struct)
+                }
             },
             TypeExpr::Ptr { mutable, inner, .. } => {
                 self.resolve_ty_quiet(inner).map(|t| Type::ptr(t, *mutable))
@@ -3258,6 +3264,15 @@ mod tests {
             assert_eq!(prim_type(alias), prim_type(canonical), "{}", alias);
         }
         assert_eq!(prim_type("float"), Some(Type::F32));
+        // ROUND 88: `string` belongs to the same family, but it cannot be
+        // checked with `prim_type` -- `str` is the builtin STRUCT, not a
+        // primitive. So the pair is checked one level lower, on the name;
+        // `resolve_ty` looks the struct up under exactly that name, and
+        // `tools/firstrun/run.sh` case 08 proves end to end that a function
+        // taking a `str` accepts a `string` and the other way round.
+        assert_eq!(crate::types::canon_name("string"), "str");
+        assert_eq!(prim_type("string"), None);
+        assert_eq!(prim_type("str"), None);
     }
 
     #[test]

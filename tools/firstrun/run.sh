@@ -13,8 +13,9 @@
 #   05  read a file by its name
 #   06  forty thousand joins -- a real load on the collector
 #   07  COUNTER-CHECK: the explicit `gc_init()` keeps working
+#   08  `string` and `str` are ONE type (the addendum to round 88)
 #
-# THE RULE FOR EVERY CASE 01..06: not one line about a collector, not one
+# THE RULE FOR EVERY CASE 01..06 AND 08: not one line about a collector, not one
 # `gc_init()`, not one `[u8; N]`. It has to COMPILE, RUN and print exactly
 # what stands next to it in the `.out` file. That is the whole measure of
 # this round -- round 87 failed four of the seven for four different reasons
@@ -28,10 +29,13 @@
 # Three counter-checks at the end, because a check that only ever says yes
 # proves nothing:
 #
-#   A  the sources of 01..06 really contain no `gc_init`
+#   A  the sources of 01..06 and 08 really contain no `gc_init`
 #   B  a program WITHOUT text gets NO setup in `_start` -- whoever does not
 #      use the collector pays nothing for it
 #   C  under `profile kernel` there is neither `_start` nor a setup
+#   D  `string` is not a second type: a program that only ever writes
+#      `string` pulls the collector in just the same, and a type error
+#      names the SAME canonical type in both spellings
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 
@@ -86,15 +90,15 @@ run_all() {
     done
 }
 
-echo "== 1. the seven programs, WITH the optimizer =="
+echo "== 1. the eight programs, WITH the optimizer =="
 run_all opt "$FIRNC"
 
 echo
-echo "== 2. the same seven WITHOUT the optimizer =="
+echo "== 2. the same eight WITHOUT the optimizer =="
 run_all noopt "$FIRNC" --no-opt
 
 echo
-echo "== 3. the same seven through the self hosted compiler (firnc1) =="
+echo "== 3. the same eight through the self hosted compiler (firnc1) =="
 if [ -x "$FC1" ]; then
     run_all fc1 "$FC1"
 else
@@ -105,7 +109,7 @@ fi
 
 echo
 echo "== 4. counter-check A: no case mentions the collector =="
-for q in "$CASES"/0[1-6]_*.fi; do
+for q in "$CASES"/0[1-6]_*.fi "$CASES"/08_*.fi; do
     n=$(basename "$q" .fi)
     if grep -q 'gc_init\|gc_set_\|#\[no_gc\]' "$q"; then
         bad "$n names the collector -- then it proves nothing"
@@ -177,6 +181,80 @@ elif grep -q 'gc_init' "$WORK/kernel_probe.s"; then
     bad "the kernel profile carries a gc_init"
 else
     ok "no _start, no gc_init -- unchanged since round 52"
+fi
+
+echo
+echo "== 7. counter-check D: 'string' is the same type as 'str' =="
+# D1 -- the trigger. `source_uses_str` reads the TOKENS; a program that
+# never writes `str`, only `string`, has to pull the runtime in just the
+# same, otherwise it would end in `gc_init() was not called`.
+cat > "$WORK/only_string.fi" <<'EOF'
+fn take(s: string) -> u64 { return s.n as u64 }
+
+fn main() -> i32 {
+    let x: string = "ab"
+    return take(x) as i32
+}
+EOF
+"$FIRNC" --emit=asm "$WORK/only_string.fi" -o "$WORK/only_string.s" > "$WORK/only_string.build" 2>&1
+if [ ! -s "$WORK/only_string.s" ]; then
+    bad "a program with 'string' alone does not compile"
+    sed 's/^/       /' "$WORK/only_string.build" | head -5
+else
+    sed -n '/^_start:/,/^    hlt$/p' "$WORK/only_string.s" > "$WORK/only_string.start"
+    N=$(grep -c 'call .*gc_init' "$WORK/only_string.start")
+    if [ "$N" = "1" ]; then
+        ok "'string' alone pulls the collector in, exactly once"
+    else
+        bad "'string' alone carries the setup $N times in _start (expected 1)"
+    fi
+fi
+# D2 -- the error message. Both spellings are ONE type, so the type checker
+# has to name the SAME canonical one. Whoever reads `found string` here
+# would go looking for a second type.
+for spelling in str string; do
+    cat > "$WORK/mismatch_$spelling.fi" <<EOF
+fn main() -> i32 {
+    let x: $spelling = "test"
+    let n: i32 = x
+    return n
+}
+EOF
+    "$FIRNC" "$WORK/mismatch_$spelling.fi" -o "$WORK/mismatch_$spelling.bin"         > "$WORK/mismatch_$spelling.log" 2>&1
+    head -1 "$WORK/mismatch_$spelling.log" > "$WORK/mismatch_$spelling.msg"
+done
+if [ ! -s "$WORK/mismatch_str.msg" ]; then
+    bad "the mismatch with 'str' produced no message at all"
+elif ! grep -q "found str$" "$WORK/mismatch_str.msg"; then
+    bad "the message for 'str' is not the expected one: $(cat "$WORK/mismatch_str.msg")"
+elif ! cmp -s "$WORK/mismatch_str.msg" "$WORK/mismatch_string.msg"; then
+    bad "the two spellings report different types"
+    echo "       str:    $(cat "$WORK/mismatch_str.msg")"
+    echo "       string: $(cat "$WORK/mismatch_string.msg")"
+else
+    ok "both spellings report the same canonical type: $(cat "$WORK/mismatch_str.msg")"
+fi
+# D3 -- `impl ... for string` has to create the SAME method as for `str`,
+# not a second one (parser.fi::canon_alias, impls.rs::impl_decl).
+cat > "$WORK/impl_both.fi" <<'EOF'
+import std.io
+
+impl str {
+    fn shout(self) -> usize { return self.n }
+}
+
+fn main() -> i32 {
+    let a: string = "abcd"
+    let b: str = "abcdef"
+    io.fmt_print_line(f"{a.shout()} {b.shout()}")
+    return 0
+}
+EOF
+if "$FIRNC" "$WORK/impl_both.fi" -o "$WORK/impl_both.bin" > "$WORK/impl_both.log" 2>&1     && [ "$("$WORK/impl_both.bin")" = "4 6" ]; then
+    ok "a method written on 'str' is reachable through 'string'"
+else
+    bad "a method on 'str' is not reachable through 'string'"
+    sed 's/^/       /' "$WORK/impl_both.log" | head -5
 fi
 
 echo
