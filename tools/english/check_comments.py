@@ -69,9 +69,19 @@ def kommentarzeilen(pfad):
 # keine Prosa. `erst` in einem Satz ueber alte Namen ist kein deutscher Satz.
 CODESPAN = re.compile(r'`[^`]*`')
 
+# `MIT` in Grossbuchstaben ist die Lizenz, nicht das deutsche `mit`. Die
+# Wortliste wird absichtlich ohne Ruecksicht auf Gross/Klein geprueft (ein
+# Satz kann mit `Mit` anfangen), deshalb muss das Akronym VOR dem Vergleich
+# heraus -- sonst gilt jede Datei als deutsch, die die Lizenz nennt
+# (README.md, seit die Lizenz am 23.08.2026 dazukam). Runde 85, gefunden
+# beim Nachmessen von test.sh: ein Massstab, der falsch Alarm schlaegt,
+# misst nichts.
+AKRONYM = re.compile(r'\bMIT\b')
+
 
 def deutsch(zeilen):
-    return [(i, z) for i, z in zeilen if RE_WORT.search(CODESPAN.sub(' ', z))]
+    return [(i, z) for i, z in zeilen
+            if RE_WORT.search(AKRONYM.sub(' ', CODESPAN.sub(' ', z)))]
 
 
 def bereich(pfad):
