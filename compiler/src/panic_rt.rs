@@ -477,6 +477,34 @@ pub(crate) fn emit_checked_bin(
     //
     // ROUND 90: this is the WHOLE hot path now. One forward conditional
     // branch, not taken, into the cold half of the function.
+    emit_check_branch(e, op, ty, msg, uid, restore);
+}
+
+/// ROUND 90 — the branch and the out-of-line arm of a checked `+ - *`, on
+/// its own so that `regalloc.rs::checked_direct` can use exactly the same
+/// ending after computing the operation its own way.
+pub(crate) fn emit_checked_tail(
+    e: &mut Emitter,
+    op: BinOp,
+    ty: FTy,
+    msg: &str,
+    site: &mut SiteCounter,
+    restore: &dyn Fn(&mut Emitter),
+) {
+    let uid = site.next();
+    emit_check_branch(e, op, ty, msg, uid, restore);
+}
+
+fn emit_check_branch(
+    e: &mut Emitter,
+    op: BinOp,
+    ty: FTy,
+    msg: &str,
+    uid: String,
+    restore: &dyn Fn(&mut Emitter),
+) {
+    let label = intern(msg);
+    let site_label = format!(".Lchksite{}", uid);
     e.line(&format!(
         "j{} {}",
         if ty.signed() { "o" } else { "c" },
