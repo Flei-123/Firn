@@ -149,6 +149,18 @@ pub fn resolve(root: &Path, world: &World) -> Result<Vec<SourceFile>, Error> {
         };
         let id = out.len() as u32;
         let abs_file = package_world::absolute(&path.display().to_string(), &work_dir);
+        // ROUND 93: from here on the file is known under the spelling that
+        // does NOT name this machine -- relative to the working directory if
+        // it lies inside it. The path travels into the diagnostics, into
+        // `.file`/`.debug_line` AND into the message table of the checked
+        // arithmetic, which the program prints at runtime. The package
+        // search hands out absolute paths for every dependency, so without
+        // this line the artifact of a package build depends on where the
+        // checkout sits (`ACCEPTANCE.md` item 5).
+        let path = PathBuf::from(package_world::build_path(
+            &path.display().to_string(),
+            &work_dir,
+        ));
         let my_package = if world.is_empty() {
             None
         } else {
