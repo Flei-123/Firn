@@ -36,6 +36,7 @@ mod inline;
 mod layout;
 mod lexer;
 mod licm;
+mod phi;
 mod lower;
 mod lower_errors;
 mod lower_match;
@@ -698,6 +699,20 @@ fn run(opts: &Options) -> i32 {
         }
     }
 
+    // ROUND 92 -- the phi invariants, on demand. `FIRN_VERIFY_PHI=1` makes
+    // every function say whether its phi entry lists still match its control
+    // flow graph. It is off by default because it costs a predecessor table
+    // per function; `test.sh` section 49 turns it on for the whole corpus,
+    // which is the only place where it has to be paid.
+    if std::env::var_os("FIRN_VERIFY_PHI").is_some() {
+        for f in module.funcs.iter() {
+            if let Err(e) = f.verify_phis() {
+                eprintln!("error: phi invariant broken: {}", e);
+                return 1;
+            }
+        }
+    }
+
     tm.mark("optimizer");
     if opts.stats {
         eprintln!(
@@ -719,6 +734,18 @@ fn run(opts: &Options) -> i32 {
     // above this line -- lexer, parser, checker, lowering, optimizer -- has
     // no idea which machine it is working for, and that is the whole point
     // of the round.
+    // ROUND 92 -- PHI ELIMINATION, and it happens exactly once, here.
+    //
+    // `mem2reg.rs` builds phi nodes; no machine has one. Every backend could
+    // take them apart for itself, and there are three of them -- that is the
+    // shape round 90's bug had (one question, three answers, two of them
+    // silently out of date). So the phis become copies ONCE, on FIR, and
+    // every code generator below this line reads the same phi-free
+    // instruction list it read before round 92.
+    if let Err(e) = phi::eliminate(&mut module) {
+        eprintln!("error: {}", e);
+        return 1;
+    }
     let emitted = match target::active() {
         target::Target::X86_64 => codegen_x86::emit(&module),
         target::Target::Aarch64 => codegen_a64::emit(&module),

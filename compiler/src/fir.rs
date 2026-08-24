@@ -5,8 +5,20 @@
 //!  * SSA like: every instruction defines at most ONE new value `%n`,
 //!    and every value is defined exactly once
 //!  * basic blocks with EXACTLY ONE terminator at the end (`br`, `brcond`, `ret`)
-//!  * no phi nodes: mutable variables sit in `alloca` slots and are
-//!    addressed with `load`/`store`
+//!  * **ROUND 92** — real phi nodes. The LOWERING still puts every mutable
+//!    variable into an `alloca` slot and addresses it with `load`/`store`;
+//!    `mem2reg.rs` is what turns those slots into values, and where two
+//!    paths bring two different values to the same place it writes an
+//!    `Op::Phi`. Phi instructions stand at the START of a block, before
+//!    every other instruction, and carry exactly one entry per DISTINCT
+//!    predecessor, sorted by block number. Every pass that changes the
+//!    control flow graph has to keep that true; `mem2reg::simplify_phis`
+//!    is the repair shop, `fir::Func::verify_phis` the assertion.
+//!  * `Op::Phi` never comes out of the lowering and never reaches a
+//!    backend: `phi.rs` eliminates it into `Op::Copy` right before the code
+//!    generator, so `--emit=fir-raw` is phi free (that is what
+//!    `tools/fir_compare.sh` compares against the compiler written in Firn)
+//!    and every backend stays a straight-line reader of instructions.
 //!  * no x86 quirks: registers, stack frames and calling convention come
 //!    about in the backend only
 
@@ -340,6 +352,35 @@ pub enum Op {
     /// **Round 52** — MMIO write (`core.rs`). Like `Op::Store`, but
     /// **volatile** (see `MmioLoad`).
     MmioStore { addr: Val, val: Val },
+    /// **ROUND 92** — the PHI NODE (SPEC §8.1). `incoming` holds one pair
+    /// `(predecessor block, value)` per DISTINCT predecessor of the block
+    /// this instruction stands in, sorted ascending by block number. The
+    /// value of the instruction is the entry belonging to the edge the
+    /// control flow actually came in on.
+    ///
+    /// WHY IT EXISTS. Without it `mem2reg.rs` could only resolve `alloca`s
+    /// written EXACTLY ONCE — every loop counter is written again on every
+    /// pass and therefore stayed in MEMORY. And a value in memory is
+    /// invisible to everything that comes after: no induction variables, no
+    /// range analysis across a back edge, no loop invariant motion of
+    /// anything that touches the counter. This one instruction is what makes
+    /// those possible; it is the whole point of round 92.
+    ///
+    /// INVARIANTS (see `Func::verify_phis`):
+    ///   * phis stand at the beginning of their block, before every other
+    ///     instruction
+    ///   * exactly one entry per distinct predecessor, none for a block that
+    ///     is not a predecessor
+    ///   * the entry list is sorted by block number, so that two runs of the
+    ///     compiler write the same text
+    Phi { incoming: Vec<(BlockId, Val)> },
+    /// **ROUND 92** — `dst = src`, nothing else. The ONLY producer is
+    /// `phi.rs`: eliminating a phi means putting a copy at the end of every
+    /// predecessor, and the copies of one edge happen SIMULTANEOUSLY (all
+    /// reads before all writes), which is why `phi.rs` has to sequentialize
+    /// them and break cycles over a temporary. Nothing else in the compiler
+    /// ever creates one, and no optimizer pass ever sees one.
+    Copy { src: Val },
     /// **ROUND 82** — ONE vector or crypto machine instruction (`simd.rs`).
     ///
     /// `kind` says which one; `args` are its operands in source order, `imm`
@@ -369,6 +410,12 @@ impl Op {
             | Op::PtrAdd { .. }
             | Op::Load { .. }
             | Op::Alloca { .. }
+            // ROUND 92: a phi computes nothing and a copy computes nothing;
+            // both may fall away the moment their result is unused. Careful
+            // in `opt.rs`, though: two phis can hold each OTHER alive in a
+            // loop, so the dead code pass counts phi uses separately.
+            | Op::Phi { .. }
+            | Op::Copy { .. }
             | Op::Select { .. } => true,
             // The address of a table in `.rodata` is a constant.
             Op::VtabAddr { .. } | Op::FnRef { .. } | Op::GlobalAddr { .. } => true,
@@ -495,9 +542,29 @@ impl Op {
                 out.push(*val);
             }
             Op::Simd { args, .. } => out.extend_from_slice(args),
+            // ROUND 92. NOTE FOR EVERY LIVENESS ANALYSIS: a phi operand is
+            // read at the END OF ITS PREDECESSOR, not at the top of the
+            // block the phi stands in. This function cannot express that —
+            // it only lists values. `regalloc.rs` never has to care because
+            // `phi.rs` has already turned every phi into copies by then;
+            // any future consumer that computes liveness on FIR WITH phis
+            // in it must special case them here.
+            Op::Phi { incoming } => {
+                for (_, v) in incoming.iter() {
+                    out.push(*v);
+                }
+            }
+            Op::Copy { src } => out.push(*src),
         }
     }
 
+    /// ROUND 92 — the phi entry belonging to the edge coming from `pred`.
+    pub fn phi_value(&self, pred: BlockId) -> Option<Val> {
+        match self {
+            Op::Phi { incoming } => incoming.iter().find(|(b, _)| *b == pred).map(|(_, v)| *v),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -542,6 +609,19 @@ pub struct Block {
     pub id: BlockId,
     pub insts: Vec<Inst>,
     pub term: Term,
+}
+
+impl Block {
+    /// ROUND 92 — how many phi instructions stand at the front of the block.
+    /// The invariant "phis first" makes this a prefix count, so anybody who
+    /// wants to insert an ordinary instruction "at the top" inserts at this
+    /// index and not at 0.
+    pub fn phi_count(&self) -> usize {
+        self.insts.iter().take_while(|i| matches!(i.op, Op::Phi { .. })).count()
+    }
+    pub fn has_phi(&self) -> bool {
+        matches!(self.insts.first().map(|i| &i.op), Some(Op::Phi { .. }))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -659,6 +739,71 @@ impl Func {
         self.val_types.get(v as usize).copied().unwrap_or(FTy::Void)
     }
 
+    /// **ROUND 92** — the phi invariants, checked rather than believed.
+    ///
+    /// Every pass that touches the control flow graph can break one of the
+    /// three, and every one of them breaks the program in a way that only
+    /// shows up as a wrong number much later. So they are stated once, here,
+    /// and the module tests plus `FIRN_VERIFY_PHI=1` ask for them:
+    ///
+    ///   1. phis stand at the FRONT of their block
+    ///   2. one entry per DISTINCT predecessor, and no entry for a block
+    ///      that is not a predecessor
+    ///   3. the entries are sorted by block number (determinism: two runs of
+    ///      the compiler have to write the same text, and a `HashMap` walk
+    ///      does not)
+    pub fn verify_phis(&self) -> Result<(), String> {
+        let n = self.blocks.len();
+        let mut preds: Vec<Vec<BlockId>> = vec![Vec::new(); n];
+        for b in &self.blocks {
+            for s in b.term.successors() {
+                if (s as usize) < n && !preds[s as usize].contains(&b.id) {
+                    preds[s as usize].push(b.id);
+                }
+            }
+        }
+        for (bi, b) in self.blocks.iter().enumerate() {
+            let np = b.phi_count();
+            for (ii, i) in b.insts.iter().enumerate() {
+                if matches!(i.op, Op::Phi { .. }) && ii >= np {
+                    return Err(format!("@{} bb{}: phi at position {}, not at the front",
+                                       self.name, b.id, ii));
+                }
+            }
+            for i in b.insts.iter().take(np) {
+                let inc = match &i.op {
+                    Op::Phi { incoming } => incoming,
+                    _ => continue,
+                };
+                let mut sorted = inc.clone();
+                sorted.sort_by_key(|(p, _)| *p);
+                if sorted != *inc {
+                    return Err(format!("@{} bb{}: phi entries not sorted", self.name, b.id));
+                }
+                if inc.len() != preds[bi].len() {
+                    return Err(format!(
+                        "@{} bb{}: phi has {} entries, the block has {} predecessors",
+                        self.name, b.id, inc.len(), preds[bi].len()
+                    ));
+                }
+                for (p, _) in inc.iter() {
+                    if !preds[bi].contains(p) {
+                        return Err(format!(
+                            "@{} bb{}: phi entry for bb{}, which is no predecessor",
+                            self.name, b.id, p
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Does any block of this function carry a phi?
+    pub fn has_phi(&self) -> bool {
+        self.blocks.iter().any(|b| b.has_phi())
+    }
+
     /// Count of all instructions (for optimization tests).
     pub fn inst_count(&self) -> usize {
         self.blocks.iter().map(|b| b.insts.len()).sum()
@@ -773,6 +918,14 @@ fn fmt_inst(i: &Inst) -> String {
         Op::Syscall { args } => format!("syscall.{} {}", t, vlist(args)),
         Op::CopyMem { dst, src, size } => format!("copymem %{}, %{}, size={}", dst, src, size),
         Op::Select { cond, a, b } => format!("select.{} %{}, %{}, %{}", t, cond, a, b),
+        // ROUND 92: `%7 = phi.i64 [bb1 %3, bb4 %9]` — the entries in block
+        // order, which is the order the list is kept in anyway.
+        Op::Phi { incoming } => {
+            let ps: Vec<String> =
+                incoming.iter().map(|(b, v)| format!("bb{} %{}", b, v)).collect();
+            format!("phi.{} [{}]", t, ps.join(", "))
+        }
+        Op::Copy { src } => format!("copy.{} %{}", t, src),
         Op::Barrier { val } => format!("barrier.{} %{}", t, val),
         // ROUND 82: `simd.<kind>.<type> %a, %b, imm=N` — one line per
         // machine instruction, readable in `--emit=fir` like everything else.
