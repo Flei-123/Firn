@@ -699,19 +699,20 @@ fn run(opts: &Options) -> i32 {
         }
     }
 
-    // ROUND 92 -- the phi invariants, on demand. `FIRN_VERIFY_PHI=1` makes
-    // every function say whether its phi entry lists still match its control
-    // flow graph. It is off by default because it costs a predecessor table
-    // per function; `test.sh` section 49 turns it on for the whole corpus,
-    // which is the only place where it has to be paid.
-    if std::env::var_os("FIRN_VERIFY_PHI").is_some() {
-        for f in module.funcs.iter() {
-            if let Err(e) = f.verify_phis() {
-                eprintln!("error: phi invariant broken: {}", e);
-                return 1;
-            }
-        }
-    }
+    // ROUND 92 -- there is deliberately NO phi check here.
+    //
+    // Between two passes the entry lists are allowed to be out of date: a
+    // `brcond` that `simplify-term` turns into a `br` removes an edge and
+    // leaves an entry behind, and the next `mem2reg` round trims it. Making
+    // that an error here would report normal work as a fault.
+    //
+    // The check that BINDS sits in `phi.rs`, after `simplify_phis` and
+    // before a single instruction is emitted, and it runs in every build,
+    // not behind an environment variable. `FIRN_VERIFY_PHI=2` is the
+    // debugging aid on top of it (`opt.rs::phi_check`): it names the pass
+    // that broke something, and a "TWO entries for bb..." line from it is
+    // always a bug, while a count mismatch may be one of the transients
+    // described above.
 
     tm.mark("optimizer");
     if opts.stats {

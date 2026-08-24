@@ -1499,13 +1499,29 @@ pub(crate) fn merge_blocks(f: &mut Func) -> usize {
                     }
                 }
             }
-            // ROUND 92: and so do their phi entries. A's only successor was
-            // B (its terminator was `br B`), so A cannot already have an
-            // entry there and no two answers can collide.
+            // ROUND 92 -- AND SO DO THEIR PHI ENTRIES, WITH ONE TRAP IN IT.
+            //
+            // A's terminator was `br B`, so B was A's ONLY successor: an
+            // entry naming A in a block that B jumps to cannot be a live
+            // edge, it is a leftover from a `brcond` that `simplify-term`
+            // turned into a `br` earlier in this same round. Re-keying B to
+            // A without throwing that leftover away gives the phi TWO
+            // entries for A, and `phi.rs` then puts two copies of two
+            // different values at the end of the same block -- the second
+            // one wins, and which one that is depends on the order the
+            // entries happen to stand in.
+            //
+            // Measured: `tests/800_std_str_core.fi` printed nothing at all
+            // at `release-safe` and `release-fast` and was right at `dev`
+            // and `dev-fast`. `FIRN_VERIFY_PHI=2` named the pass; the entry
+            // was `%1585 = phi.bool [bb55 %1582, bb55 %1584]`.
             if sblk < f.blocks.len() {
                 let np = f.blocks[sblk].phi_count();
                 for i in f.blocks[sblk].insts[..np].iter_mut() {
                     if let Op::Phi { incoming } = &mut i.op {
+                        if incoming.iter().any(|(p, _)| *p as usize == b) {
+                            incoming.retain(|(p, _)| *p as usize != a);
+                        }
                         for e in incoming.iter_mut() {
                             if e.0 as usize == b {
                                 e.0 = a as u32;
