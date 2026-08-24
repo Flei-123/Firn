@@ -45,8 +45,9 @@ import user
 
 export {
     create, user_start, free_space, reap, translate, user_ok, map_programs,
-    inherit,
-    USER_DATA, USER_STACK, USER_SPAN, USER_TOP
+    inherit, create_bare, discard, page_free, page_exec, map_page, nx,
+    USER_DATA, USER_STACK, USER_SPAN, USER_TOP,
+    IMAGE_BASE, IMAGE_END, ARGS_BASE, MAX_ARGS
 }
 
 const PAGE_PRESENT: u64 = 1
@@ -60,6 +61,31 @@ const STACK_PAGES: u64 = 8 // 32 KiB -- the shell needs them
 const USER_TOP: u64 = 0x40009000 // the stack grows down from here
 const USER_SPAN: u64 = 0x00200000 // what the private PD covers
 
+// ROUND K1. The private page table covers 512 pages from USER_DATA on;
+// nine of them were spoken for (data page and eight stack pages) and the
+// other 503 lay unused. An image off the disk goes into them:
+//
+//   0x40000000  the data page                       (rw, no execute)
+//   0x40001000  eight stack pages                   (rw, no execute)
+//   0x40008000  the top one of those, the arguments (rw, no execute)
+//   0x40100000  IMAGE_BASE: where a program is linked
+//   0x401FFFFF  IMAGE_END - 1: the end of the private region
+//
+// The gap between the stack and IMAGE_BASE is deliberate: a stack that
+// grew into the image would be a bug that only shows up under load, and
+// 0xF7000 of unmapped pages between them turn it into an immediate #PF.
+const IMAGE_BASE: u64 = 0x40100000
+const IMAGE_END: u64 = 0x40200000 // = USER_DATA + USER_SPAN
+const ARGS_BASE: u64 = 0x40008000 // the top stack page holds argc/argv
+const MAX_ARGS: u64 = 8
+
+// Bit 63 of a page table entry: this page may not be executed. It only
+// means that when EFER.NXE is on, and `user.setup` turns it on only when
+// CPUID says the processor knows it -- otherwise the bit is RESERVED and
+// every access through such an entry would fault. `nx` is therefore the
+// only place the bit comes from.
+const PAGE_NX: u64 = 0x8000000000000000
+
 // Indices in the table out of isr.s.
 const V_ENTER_TASK: u64 = 56
 const V_USER_MAIN: u64 = 58
@@ -67,6 +93,13 @@ const V_USER_START: u64 = 63
 
 fn vector(state: u64, i: u64) -> u64 {
     return __mmio_read64((kstate.get(state, kstate.VECTORS) + i * 8) as *mut u64)
+}
+
+fn nx(state: u64) -> u64 {
+    if kstate.get(state, kstate.NX_OK) != 0 {
+        return PAGE_NX
+    }
+    return 0
 }
 
 fn read_entry(table: u64, i: u64) -> u64 {
@@ -139,7 +172,12 @@ fn space_build(state: u64, i: u64) -> u64 {
     write_entry(pml4, 0, pdpt | PAGE_PRESENT | PAGE_WRITE | PAGE_USER)
     write_entry(pdpt, 1, pd | PAGE_PRESENT | PAGE_WRITE | PAGE_USER)
     write_entry(pd, 0, pt | PAGE_PRESENT | PAGE_WRITE | PAGE_USER)
-    write_entry(pt, 0, data | PAGE_PRESENT | PAGE_WRITE | PAGE_USER)
+    // ROUND K1: data and stack get the no-execute bit. Nothing ever ran
+    // from them -- the programs of round 62 execute out of `.utext` in
+    // the kernel image -- and a stack a program can jump into is the
+    // oldest hole there is. The counter-check is a program that tries it
+    // (`/bin/jump`): #PF with the instruction-fetch flag set.
+    write_entry(pt, 0, data | PAGE_PRESENT | PAGE_WRITE | PAGE_USER | nx(state))
     var k: u64 = 0
     while k < STACK_PAGES {
         let f: u64 = mem.frame_alloc(state)
@@ -147,7 +185,8 @@ fn space_build(state: u64, i: u64) -> u64 {
             return 0
         }
         zero_frame(f)
-        write_entry(pt, 1 + k, f | PAGE_PRESENT | PAGE_WRITE | PAGE_USER)
+        write_entry(pt, 1 + k,
+            f | PAGE_PRESENT | PAGE_WRITE | PAGE_USER | nx(state))
         k = k + 1
     }
 
@@ -232,6 +271,84 @@ fn inherit(state: u64, parent: u64, child: u64) -> bool {
     return true
 }
 
+// ------------------------------------------------------ the image pages
+
+// ROUND K1. Which entry of the private page table an address belongs to.
+// 512 = it does not belong to this process at all.
+fn pt_slot(addr: u64) -> u64 {
+    if addr < USER_DATA {
+        return 512
+    }
+    if addr >= USER_DATA + USER_SPAN {
+        return 512
+    }
+    return (addr - USER_DATA) >> 12
+}
+
+// May this page still be taken? Outside the region: no. Already there:
+// no -- and that is what makes two segments of one file that want the
+// same page a refusal instead of a silent merge of their rights.
+fn page_free(state: u64, i: u64, addr: u64) -> bool {
+    let pt: u64 = sched.tget(state, i, sched.T_PT)
+    let s: u64 = pt_slot(addr)
+    if pt == 0 || s >= 512 {
+        return false
+    }
+    return (read_entry(pt, s) & PAGE_PRESENT) == 0
+}
+
+// One page of an image: a fresh frame with exactly the rights the
+// program header asked for. Returns the PHYSICAL address, so that the
+// loader can fill it through the identity mapping -- the process it
+// belongs to is not running and its tables are not the ones in cr3.
+fn map_page(state: u64, i: u64, addr: u64, writable: bool,
+    runnable: bool) -> u64 {
+    let pt: u64 = sched.tget(state, i, sched.T_PT)
+    let s: u64 = pt_slot(addr)
+    if pt == 0 || s >= 512 {
+        return 0
+    }
+    if (read_entry(pt, s) & PAGE_PRESENT) != 0 {
+        return 0
+    }
+    let frame: u64 = mem.frame_alloc(state)
+    if frame == 0 {
+        return 0
+    }
+    var bits: u64 = PAGE_PRESENT | PAGE_USER
+    if writable {
+        bits = bits | PAGE_WRITE
+    }
+    if !runnable {
+        bits = bits | nx(state)
+    }
+    write_entry(pt, s, frame | bits)
+    // No `invlpg` and no cr3 reload: these tables are not loaded. The
+    // process gets them at its first context switch, and THAT writes cr3
+    // and flushes everything.
+    return frame
+}
+
+// May ring 3 fetch an instruction from this address? Present, open to the
+// user, and without the no-execute bit. This is the last check of the
+// loader: an `e_entry` that lands anywhere else would be a jump into
+// nothing, reported as a fault at an address nobody can explain.
+fn page_exec(state: u64, i: u64, addr: u64) -> bool {
+    let pt: u64 = sched.tget(state, i, sched.T_PT)
+    let s: u64 = pt_slot(addr)
+    if pt == 0 || s >= 512 {
+        return false
+    }
+    let e: u64 = read_entry(pt, s)
+    if (e & PAGE_PRESENT) == 0 {
+        return false
+    }
+    if (e & PAGE_USER) == 0 {
+        return false
+    }
+    return (e & PAGE_NX) == 0
+}
+
 // ------------------------------------------------- looking into a process
 
 // Virtual address of a process -> physical address, 0 = not mapped. The
@@ -309,6 +426,32 @@ fn user_ok(state: u64, i: u64, addr: u64, len: u64) -> bool {
 
 // ---------------------------------------------------------- creating
 
+// ROUND K1. A task plus an address space and nothing in it: the thing an
+// image has to be poured into. `create` below is this plus the entry
+// point of `uprog.fi`; `elf.spawn` is this plus a file.
+fn create_bare(state: u64, prio: u64) -> u64 {
+    let i: u64 = sched.create(state, sched.K_USER, prio, 0,
+        vector(state, V_USER_START))
+    if i == 0 {
+        return 0
+    }
+    let space: u64 = space_build(state, i)
+    if space == 0 {
+        discard(state, i)
+        return 0
+    }
+    sched.tset(state, i, sched.T_CR3, space)
+    return i
+}
+
+// A process that was never started, back to nothing. The order matters:
+// the address space first (it hangs on the task record), the record last.
+fn discard(state: u64, i: u64) {
+    sched.tset(state, i, sched.T_STATE, sched.S_ZOMBIE)
+    free_space(state, i)
+    sched.reap(state, i)
+}
+
 // A process: task plus address space. `kind_arg` is what the user program
 // gets in rdi -- which of the programs in `uprog.fi` it is supposed to be.
 fn create(state: u64, prog: u64, arg: u64, prio: u64) -> u64 {
@@ -316,21 +459,11 @@ fn create(state: u64, prog: u64, arg: u64, prio: u64) -> u64 {
     // below is state the scheduler would read the moment it takes the
     // task -- and a half-built process is one with rip zero.
     let flags: u64 = sched.irq_save()
-    let i: u64 = sched.create(state, sched.K_USER, prio, arg,
-        vector(state, V_USER_START))
+    let i: u64 = create_bare(state, prio)
     if i == 0 {
         sched.irq_restore(flags)
         return 0
     }
-    let space: u64 = space_build(state, i)
-    if space == 0 {
-        sched.tset(state, i, sched.T_STATE, sched.S_ZOMBIE)
-        free_space(state, i)
-        sched.reap(state, i)
-        sched.irq_restore(flags)
-        return 0
-    }
-    sched.tset(state, i, sched.T_CR3, space)
     sched.tset(state, i, sched.T_ENTRY, vector(state, V_USER_MAIN))
     sched.tset(state, i, sched.T_USTACK, USER_TOP - 16)
     sched.tset(state, i, sched.T_ARG, prog)

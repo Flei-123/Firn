@@ -1,0 +1,138 @@
+// demos/kernel/user/sh.fi -- round K1: the shell, and it is a FILE.
+//
+// Round 62 had a shell too, and every command in it was a branch in
+// `uprog.u_shell`: `ls` was an `if`, and adding a command meant compiling
+// a new kernel. This one knows exactly one thing -- how to start a
+// program -- and everything else it can do it can do because there is a
+// file on the disk with that name:
+//
+//     read a line   ->   split it into words   ->   /bin/<word>
+//     exec(path, argv, argc)   ->   wait(pid)   ->   say the code
+//
+// `exit` is the only word it handles itself, because leaving is the one
+// thing no child process can do on its parent's behalf.
+//
+// It runs in ring 3 like every other program, it was loaded off the disk
+// by `elf.spawn` like every other program, and the kernel has no idea
+// that it is a shell. `tools/osum/run.sh` proves the last point by
+// putting the octets of `/bin/echo` at the path `/bin/ls` -- and `ls`
+// then echoes, without a line of the kernel or of this file changing.
+
+profile kernel
+
+import ulib
+
+export { u_start }
+
+const MAX_ARGS: u64 = 8
+const WORD_MAX: u64 = 32
+
+fn u_start(args: u64) -> u64 {
+    var line: [u8; 128] = [0 as u8; 128]
+    var words: [u8; 320] = [0 as u8; 320]
+    var slots: [u64; 8] = [0 as u64; 8]
+    var path: [u8; 96] = [0 as u8; 96]
+    var s_hi: [u8; 19] = "sh: ready, osum\n\0\0\0"
+    var s_prompt: [u8; 7] = "osum$ \0"
+    var s_bye: [u8; 9] = "sh: bye\n\0"
+    var s_arrow: [u8; 5] = " -> \0"
+    var s_no: [u8; 16] = "sh: cannot run \0"
+    var s_sp: [u8; 2] = " \0"
+    var c_exit: [u8; 5] = "exit\0"
+    var b_bin: [u8; 6] = "/bin/\0"
+
+    ulib.say((&s_hi[0]) as u64)
+    var commands: u64 = 0
+    var running: bool = true
+    while running {
+        let n: u64 = ulib.sys(ulib.SYS_READ, ulib.IN, (&line[0]) as u64, 120)
+        if n == 0 || (n >> 63) != 0 {
+            running = false
+        } else {
+            // The newline belongs to the line, not to the command.
+            var len: u64 = n
+            while len > 0 && line[(len - 1) as usize] <= 32 as u8 {
+                len = len - 1
+            }
+            line[len as usize] = 0 as u8
+            ulib.say((&s_prompt[0]) as u64)
+            ulib.say((&line[0]) as u64)
+            ulib.nl()
+            if len > 0 {
+                commands = commands + 1
+                // Split the line. `words` holds the strings back to back,
+                // `slots` the pointers into it -- that is exactly the
+                // shape `exec` wants, and building it here is what makes
+                // argv the shell's business and not the kernel's.
+                let base: u64 = (&words[0]) as u64
+                var argc: u64 = 0
+                var at: u64 = 0
+                var wat: u64 = 0
+                var more: bool = true
+                while more {
+                    if argc >= MAX_ARGS {
+                        more = false
+                    } else {
+                        let next: u64 = ulib.word((&line[0]) as u64, at,
+                            base + wat, WORD_MAX)
+                        if ulib.length(base + wat) == 0 {
+                            more = false
+                        } else {
+                            slots[argc as usize] = base + wat
+                            wat = wat + ulib.length(base + wat) + 1
+                            argc = argc + 1
+                            at = next
+                        }
+                    }
+                }
+                if argc == 0 {
+                    commands = commands - 1
+                } else {
+                    if ulib.streq(slots[0], (&c_exit[0]) as u64) {
+                        running = false
+                    } else {
+                        make_path(slots[0], (&path[0]) as u64,
+                            (&b_bin[0]) as u64)
+                        let pid: u64 = ulib.sys(ulib.SYS_EXEC,
+                            (&path[0]) as u64, (&slots[0]) as u64, argc)
+                        if (pid >> 63) != 0 {
+                            ulib.say((&s_no[0]) as u64)
+                            ulib.say(slots[0])
+                            ulib.say((&s_arrow[0]) as u64)
+                            ulib.sayn(pid)
+                            ulib.nl()
+                        } else {
+                            let code: u64 = ulib.sys(ulib.SYS_WAIT, pid, 0, 0)
+                            ulib.say((&s_prompt[0]) as u64)
+                            ulib.say(slots[0])
+                            ulib.say((&s_arrow[0]) as u64)
+                            ulib.sayn(code)
+                            ulib.nl()
+                        }
+                    }
+                }
+            }
+        }
+    }
+    ulib.say((&s_bye[0]) as u64)
+    return commands
+}
+
+// `ls` means `/bin/ls`, and `/bin/ls` means itself. Two lines, and they
+// are the whole of what a system calls a search path -- one directory,
+// and it is named in the shell and not in the kernel.
+fn make_path(cmd: u64, out: u64, prefix: u64) {
+    var at: u64 = 0
+    if *((cmd) as *mut u8) != 47 as u8 {
+        while *((prefix + at) as *mut u8) != 0 as u8 {
+            __mmio_write8((out + at) as *mut u8, *((prefix + at) as *mut u8))
+            at = at + 1
+        }
+    }
+    var i: u64 = 0
+    while *((cmd + i) as *mut u8) != 0 as u8 {
+        __mmio_write8((out + at + i) as *mut u8, *((cmd + i) as *mut u8))
+        i = i + 1
+    }
+    __mmio_write8((out + at + i) as *mut u8, 0 as u8)
+}

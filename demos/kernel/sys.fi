@@ -25,8 +25,13 @@ import sched
 import proc
 import user
 import fs
+import kbd
+import elf
 
-export { entry, neg, E_NOENT, E_BADF, E_CHILD, E_FAULT, E_INVAL, E_NOSYS }
+export {
+    entry, neg, E_NOENT, E_BADF, E_CHILD, E_FAULT, E_INVAL, E_NOSYS,
+    E_NOEXEC, E_2BIG
+}
 
 // The numbers. 1 and 2 are the two marks of round 59 and stay where they
 // are, so that the cases of that round keep measuring what they measured.
@@ -47,11 +52,15 @@ const SYS_MKDIR: u64 = 21
 const SYS_YIELD: u64 = 22
 const SYS_STAT: u64 = 23
 const SYS_GETPPID: u64 = 24
+// ROUND K1: a program off the disk. `exec(path, argv, argc)` -> pid.
+const SYS_EXEC: u64 = 25
 
 // The errors, with the numbers of the system everybody knows.
 const E_NOENT: u64 = 2 // no such file
 const E_BADF: u64 = 9 // no such descriptor
 const E_CHILD: u64 = 10 // no such child
+const E_2BIG: u64 = 7 // too many arguments, or too long
+const E_NOEXEC: u64 = 8 // the file is not a program of this machine
 const E_NOMEM: u64 = 12
 const E_FAULT: u64 = 14 // a pointer that is not the caller's
 const E_EXIST: u64 = 17
@@ -139,6 +148,9 @@ fn entry(number: u64, a0: u64, a1: u64, a2: u64, state: u64) -> u64 {
     }
     if number == SYS_STAT {
         return do_stat(state, me, a0, a1)
+    }
+    if number == SYS_EXEC {
+        return do_exec(state, me, a0, a1, a2)
     }
     return neg(E_NOSYS)
 }
@@ -257,10 +269,83 @@ fn do_read(state: u64, me: u64, fd: u64, buf: u64, len: u64) -> u64 {
     return n
 }
 
-// The console delivers one line at a time -- up to and including the
-// newline, like a terminal in line mode. Nothing there any more: 0, and
-// that is the end of the input, not an error.
+// The console has TWO sources since round K1, and they are tried in this
+// order:
+//
+//   1. what the boot loader put there (`script=ls;cat /x` in the tests),
+//   2. the KEYBOARD, when the run has one.
+//
+// The script comes first so that every measurement of round 62 keeps
+// measuring what it measured; when it is used up and the run was started
+// with `nokbd`, the answer is 0, and 0 is the end of the input, not an
+// error. Only a run with a real keyboard waits.
 fn console_read(state: u64, me: u64, buf: u64, len: u64) -> u64 {
+    let n: u64 = script_read(state, me, buf, len)
+    if n != 0 {
+        return n
+    }
+    if (kstate.get(state, kstate.MODE) & kstate.M_NOKBD) != 0 {
+        return 0
+    }
+    return keyboard_read(state, me, buf, len)
+}
+
+// How long the console waits for a key before it calls the input ended.
+// 100 Hz, so four seconds. A shell that waited forever would be right on
+// a machine with a person in front of it and wrong in a test run: the
+// kernel could never shut itself down, and a measurement that ends in a
+// time limit measures nothing. Four seconds is long enough for a person
+// to think and short enough for `tools/osum/run.sh` to finish.
+const KEY_IDLE: u64 = 400
+
+// A LINE OFF THE KEYBOARD. The producer is the interrupt handler in
+// `kbd.fi`, the consumer is this function, and between them lies a ring
+// of 64 octets -- so the ring is read with interrupts off and the waiting
+// happens with them on. `sleep_ticks` is what turns them back on: it
+// hands the processor to the idle task, and IRQ1 arrives there.
+//
+// Backspace (8) takes the last octet back instead of being one. There is
+// no echo here on purpose: `kbd.fi` already reports every key it saw, and
+// the shell prints the line it got. A kernel that echoed as well would be
+// deciding what a terminal looks like.
+fn keyboard_read(state: u64, me: u64, buf: u64, len: u64) -> u64 {
+    var n: u64 = 0
+    var idle: u64 = 0
+    var going: bool = true
+    while going {
+        let flags: u64 = sched.irq_save()
+        let c: u64 = kbd.take(state)
+        sched.irq_restore(flags)
+        if c == 0 {
+            if idle >= KEY_IDLE {
+                going = false
+            } else {
+                idle = idle + 1
+                sched.sleep_ticks(state, 1)
+            }
+        } else {
+            idle = 0
+            if c == 8 {
+                if n > 0 {
+                    n = n - 1
+                }
+            } else {
+                if n < len {
+                    if !poke(state, me, buf + n, c) {
+                        return neg(E_FAULT)
+                    }
+                    n = n + 1
+                }
+                if c == 10 {
+                    going = false
+                }
+            }
+        }
+    }
+    return n
+}
+
+fn script_read(state: u64, me: u64, buf: u64, len: u64) -> u64 {
     var pos: u64 = kstate.get(state, kstate.CONSOLE_POS)
     let end: u64 = kstate.get(state, kstate.CONSOLE_LEN)
     var n: u64 = 0
@@ -282,6 +367,70 @@ fn console_read(state: u64, me: u64, buf: u64, len: u64) -> u64 {
     }
     kstate.set(state, kstate.CONSOLE_POS, pos)
     return n
+}
+
+// ------------------------------------------------------------- exec
+
+// Eight octets out of the caller's memory, one at a time. A pointer of
+// ring 3 may straddle a page boundary, and `peek` is the only reader that
+// checks every page it touches.
+fn user_word(state: u64, me: u64, addr: u64) -> u64 {
+    var v: u64 = 0
+    var i: u64 = 0
+    while i < 8 {
+        v = v | (peek(state, me, addr + i) << (i * 8))
+        i = i + 1
+    }
+    return v
+}
+
+// `exec(path, argv, argc)` -- a program off the disk, in a process of its
+// own. Returns its pid; the caller waits for it with `wait` and gets its
+// exit code. Why this is not a Unix `exec` that replaces the caller is
+// argued in `demos/kernel/elf.fi`.
+//
+// Everything the process will need is copied into the KERNEL before a
+// single frame is taken: the path and every argument. `elf.spawn` builds
+// an address space and pours the file into it, and it may not be holding
+// a pointer of ring 3 while it does that -- the caller could be swapped
+// out, killed, or simply lying.
+fn do_exec(state: u64, me: u64, path: u64, argv: u64, argc: u64) -> u64 {
+    if kstate.get(state, kstate.FS_READY) == 0 {
+        return neg(E_NOSYS)
+    }
+    if argc > proc.MAX_ARGS {
+        return neg(E_2BIG)
+    }
+    let name: u64 = state + kstate.NAME_OFF
+    let len: u64 = fetch_name(state, me, path, name, 64)
+    if (len >> 63) != 0 {
+        return len
+    }
+    if len == 0 {
+        return neg(E_INVAL)
+    }
+    let abuf: u64 = state + kstate.EARG_OFF
+    var at: u64 = 0
+    var k: u64 = 0
+    while k < argc {
+        if !proc.user_ok(state, me, argv + k * 8, 8) {
+            return neg(E_FAULT)
+        }
+        let n: u64 = fetch_name(state, me,
+            user_word(state, me, argv + k * 8), abuf + at, 64)
+        if (n >> 63) != 0 {
+            return n
+        }
+        at = at + n + 1
+        k = k + 1
+    }
+    let t: u64 = elf.spawn(state, name, abuf, argc, 2)
+    if t == 0 {
+        let why: u64 = kstate.get(state, kstate.ELF_ERR)
+        elf.say_reason(why)
+        return neg(elf.errno_of(why))
+    }
+    return sched.tget(state, t, sched.T_PID)
 }
 
 // ------------------------------------------------------ spawn and wait

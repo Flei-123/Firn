@@ -33,6 +33,7 @@ export {
     init, create, start, schedule, on_tick, yield_now, sleep_ticks,
     exit_task, reap,
     kill_current, wake_pid, find_pid, current, tget, tset, task_at,
+    stack_high, STACK_PAINT,
     trace_push, trace_dump, dump_tasks, ready_count, alive_count,
     irq_save, irq_restore, set_kernel_stack,
     T_STATE, T_PID, T_RSP, T_KSTACK, T_KTOP, T_PRIO, T_BUDGET, T_WORK,
@@ -96,8 +97,33 @@ const K_IDLE: u64 = 1
 const K_WORKER: u64 = 2
 const K_USER: u64 = 3
 
-// Two frames = 8 KiB of kernel stack per task.
-const KSTACK_FRAMES: u64 = 2
+// FOUR frames = 16 KiB of kernel stack per task.
+//
+// ROUND 62 had two, and two were enough for what a system call did then:
+// write an octet, look up an inode, hand a page back. ROUND K1 made the
+// deepest system call much deeper --
+//
+//   syscall_entry -> sys.entry -> do_exec -> elf.spawn -> elf.load
+//                 -> elf.segment -> fs.read_at -> blk.read -> ata_read
+//
+// -- and it overflowed, in a way worth writing down because it is the
+// kind of bug that looks like something else: the stack ran off its lower
+// end into the frame below, a `ret` picked up an octet of a neighbouring
+// page as a return address, and the machine died at a #GP or a #UD whose
+// rip was an address in its own stack, with a register dump that pointed
+// at the ATA driver. The driver was innocent. It was simply the deepest
+// thing on the stack when it broke.
+//
+// So the number is not a guess any more. `stack_high` below paints every
+// kernel stack and reads the high-water mark back off it, `kmain.osum`
+// reports it, and `tools/osum/run.sh` checks BOTH bounds: the deepest
+// call has to stay under 16 KiB, and it has to be OVER 8 KiB -- which is
+// the counter-check, because that is exactly the number that says the two
+// frames of round 62 were not enough and this line had to change.
+const KSTACK_FRAMES: u64 = 4
+
+// What an untouched octet of kernel stack looks like.
+const STACK_PAINT: u64 = 0x5A5A5A5A5A5A5A5A
 
 // Indices in the table out of isr.s.
 const V_SWITCH: u64 = 55
@@ -245,6 +271,14 @@ fn create(state: u64, kind: u64, prio: u64, arg: u64, entry: u64) -> u64 {
         return 0
     }
     let ktop: u64 = stack + KSTACK_FRAMES * mem.FRAME_SIZE
+    // ROUND K1: paint it, so that afterwards it can be said how much of
+    // it was ever used. `frame_build` writes over the top 136 octets of
+    // this in a moment; everything below is the measurement.
+    var w: u64 = stack
+    while w < ktop {
+        __mmio_write64(w as *mut u64, STACK_PAINT)
+        w = w + 8
+    }
     var real_entry: u64 = entry
     if real_entry == 0 {
         real_entry = vector(state, V_TASK_MAIN)
@@ -272,6 +306,27 @@ fn create(state: u64, kind: u64, prio: u64, arg: u64, entry: u64) -> u64 {
     }
     irq_restore(flags)
     return slot
+}
+
+// ROUND K1: the deepest this task's kernel stack has ever been, in
+// octets. The paint of `create` is looked for from the LOWER end
+// upwards; the first octet that is not paint any more is the deepest
+// point anything ever wrote to. A task that overflowed its stack reports
+// the full size -- and that is the number that has to stay below it.
+fn stack_high(state: u64, i: u64) -> u64 {
+    let base: u64 = tget(state, i, T_KSTACK)
+    let ktop: u64 = tget(state, i, T_KTOP)
+    if base == 0 || ktop <= base {
+        return 0
+    }
+    var p: u64 = base
+    while p < ktop {
+        if __mmio_read64(p as *mut u64) != STACK_PAINT {
+            return ktop - p
+        }
+        p = p + 8
+    }
+    return 0
 }
 
 // Now it may run. Whoever created the task decides when it is complete.
