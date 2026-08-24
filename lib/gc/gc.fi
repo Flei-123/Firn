@@ -1570,6 +1570,50 @@ fn __gc_cycle_end() {
 }
 
 // One step of the running cycle, called at an allocation site.
+// ROUND 91 -- THE RESCAN OF THE ROOTS BEFORE THE SWEEP.
+//
+// The incremental cycle scans the stack and the registers ONCE, at
+// `__gc_cycle_start`. The Dijkstra insertion barrier then keeps the
+// invariant for everything that is WRITTEN into a heap field afterwards.
+// It does NOT keep it for the other direction, and that is the hole this
+// function closes:
+//
+//   1. object X is white and hangs only in the heap field F
+//   2. the mutator READS X out of F -- X now lives in a register or in a
+//      stack slot, and neither is looked at again during this cycle
+//   3. the mutator overwrites F (or removes the element from the vector)
+//   4. nothing has been written INTO a heap field, so no barrier fired;
+//      X stays white and the sweep releases it -- while the mutator is
+//      still working with it
+//
+// `lib/js/gen.fi` does exactly this in `realm_job_shift`: it reads the
+// reaction out of `r.jobs` and removes it from the vector in the next
+// line. Under load, three runs in ten died of it (a `Gc[JsObj]` whose
+// block had already been handed out again, so `as?` was reading a type id
+// of 4).
+//
+// The fix is the one every incremental collector with a conservative stack
+// needs: at the END of the marking phase, once the mark stack has run
+// empty, look at the roots A SECOND TIME and trace what turned up. The
+// world stands still here (both callers run between `__gc_stw_an` and
+// `__gc_stw_out`), so one pass is enough -- the stack cannot change under
+// us. It costs one stack scan per cycle, not one per pointer write, which
+// is why this is cheaper than the deletion barrier (Yuasa) that would be
+// the other way to close the same hole.
+fn __gc_roots_rescan() {
+    let st: u64 = __gc_state() as u64
+    __thread_lock_raw(st + S_REGSPERRE)
+    let regs: u64 = __gc_save_regs() as u64
+    __gc_scan(regs + S_REGS, regs + S_REGS + 48)
+    __thread_unlock_raw(st + S_REGSPERRE)
+    let sp: u64 = __gc_sp_below(0)
+    __gc_scan(sp, __gc_own_bottom(st))
+    __gc_roots_scan()
+    __gc_threads_scan()
+    __gc_drain()
+    __gc_catchup()
+}
+
 fn __gc_cycle_step() {
     let st: u64 = __gc_state() as u64
     let phase: u64 = __gc_ld64(st + S_PHASE)
@@ -1610,6 +1654,11 @@ fn __gc_cycle_step() {
                 __gc_pause_record_h(t1, 1, 5)
             }
             if __gc_ld64(st + S_MLEN) == 0 {
+                // ROUND 91: the roots a second time before anything is
+                // released -- see __gc_roots_rescan.
+                __gc_roots_rescan()
+            }
+            if __gc_ld64(st + S_MLEN) == 0 {
                 __gc_sweep_init()
                 __gc_st64(st + S_PHASE, 2)
             }
@@ -1647,6 +1696,8 @@ fn __gc_cycle_done() {
     if phase == 1 {
         __gc_drain()
         __gc_catchup()
+        // ROUND 91: same place, the other way into the sweep.
+        __gc_roots_rescan()
         __gc_sweep_init()
         __gc_st64(st + S_PHASE, 2)
     }
