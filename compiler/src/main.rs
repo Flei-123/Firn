@@ -535,8 +535,10 @@ fn run(opts: &Options) -> i32 {
                     return 2;
                 }
             }
-        } else if let Err(e) = std::fs::write(&lockpath, computed.as_bytes()) {
-            eprintln!("error: cannot write '{}': {}", lockpath, e);
+        } else if std::fs::write(&lockpath, computed.as_bytes()).is_err() {
+            // Without the reason of the operating system: `firnc1` has no
+            // `strerror`, and the two compilers have to say the same sentence.
+            eprint!("error: cannot write '{}'\n", lockpath);
             return 2;
         }
     }
