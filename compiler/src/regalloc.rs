@@ -3494,6 +3494,32 @@ fn emit_inst(
             e.line("cmovnz rax, rcx");
             ra.store_dst(e, d, "rax");
         }
+        // ROUND 92 -- THE INSTRUCTION THE WHOLE PHI ELIMINATION COMES DOWN TO.
+        //
+        // `phi.rs` puts one of these at the end of every predecessor of a
+        // block that had a phi. How much it costs is decided HERE: when the
+        // allocator gave both ends the same register the copy is free and
+        // disappears completely, when it gave them two registers it is one
+        // `mov`, and only when one end sits in the frame does it touch
+        // memory. That is why the loop counter of round 92 costs nothing
+        // even though FIR now writes a copy per back edge.
+        Op::Copy { src } => {
+            let d = i.dst.ok_or("internal error: copy without target")?;
+            let sp = if ra.a.imm(*src).is_some() { None } else { Some(ra.a.place(*src)) };
+            match (sp, ra.a.loc(d)) {
+                (Some(Loc::Reg(a2)), Loc::Reg(b2)) if a2 == b2 => {} // already home
+                (Some(Loc::Reg(a2)), Loc::Reg(b2)) => {
+                    e.line(&format!("mov {}, {}", b2, a2));
+                }
+                _ => {
+                    ra.load_full(e, "rax", *src);
+                    ra.store_dst(e, d, "rax");
+                }
+            }
+        }
+        Op::Phi { .. } => {
+            return Err("internal error: phi in the code generator (phi.rs did not run)".into())
+        }
         Op::Barrier { val } => {
             let d = i.dst.ok_or("internal error: barrier without target")?;
             ra.load_full(e, "rax", *val);
