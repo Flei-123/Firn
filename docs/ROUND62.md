@@ -248,7 +248,9 @@ read block n, write block n, 512 octets. That the blocks lie in RAM is the
 business of that file alone.
 
 ```
-block 0        superblock: magic "FIRNFS62", sizes, where everything lies
+block 0        superblock: magic "OSUM-OFS", sizes, where everything lies
+               (round 62 wrote "FIRNFS62" here; round 96 gave the file
+               system its name, OFS -- the Osum File System)
 block 1        block bitmap, one bit per block
 blocks 2..33   128 inodes of 128 octets: type, size, links,
                twelve direct blocks, one indirect one
