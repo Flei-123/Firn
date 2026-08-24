@@ -30,7 +30,7 @@ This round replaces three of those certainties with questions:
 
 And one number that says whether it was worth it.
 
-The guard is `tools/pci/run.sh` (95 checks, section 53 of `test.sh`).
+The guard is `tools/pci/run.sh` (96 checks, section 53 of `test.sh`).
 `tools/kernel/run.sh` keeps measuring what it measured — 174 checks, and
 the three workers of round 62 still interleave, only on a different clock.
 
@@ -464,7 +464,7 @@ measuring against. It belongs to whoever owns `mem.fi` next.
 | `demos/kernel/blk.fi` | +30 | the third device — dispatch, nothing else |
 | `demos/kernel/trap.fi` | +30 | which controller gets the end-of-interrupt, two more vectors |
 | `demos/kernel/kmain.fi` | +14 | three calls |
-| `tools/pci/run.sh` | 540 | 95 checks, section 53 of `test.sh` |
+| `tools/pci/run.sh` | 546 | 96 checks, section 53 of `test.sh` |
 
 `fs.fi` changed by zero lines. That was the point of `blk.fi`.
 
