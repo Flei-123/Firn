@@ -261,8 +261,9 @@ nvme: wrote=30  read=30  same=1  irqs=5  waits=0
 nvme: list .:2 ..:2 nvme.txt:1
 ```
 
-And afterwards the **image on the host** contains the file system magic
-number, the directory entry `nvme.txt` and the line the kernel wrote.
+And afterwards the **image on the host** contains the magic number of
+OFS (`OSUM-OFS`, little-endian `SFO-MUSO` in the raw image), the
+directory entry `nvme.txt` and the line the kernel wrote.
 Nothing in the kernel ever copied those octets.
 
 ### The three counter-checks
