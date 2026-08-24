@@ -780,6 +780,14 @@ impl Func {
                 if sorted != *inc {
                     return Err(format!("@{} bb{}: phi entries not sorted", self.name, b.id));
                 }
+                for k in 1..inc.len() {
+                    if inc[k].0 == inc[k - 1].0 {
+                        return Err(format!(
+                            "@{} bb{}: phi %{:?} has TWO entries for bb{}",
+                            self.name, b.id, i.dst, inc[k].0
+                        ));
+                    }
+                }
                 if inc.len() != preds[bi].len() {
                     return Err(format!(
                         "@{} bb{}: phi has {} entries, the block has {} predecessors",

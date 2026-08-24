@@ -348,6 +348,9 @@ pub fn optimize_with(m: &mut Module, cfg: &OptConfig) -> OptStats {
         let t = std::time::Instant::now();
         st.inlined += crate::inline::inline_module(m);
         clk.add("inline", t);
+        for f in m.funcs.iter() {
+            phi_check(f, "inline");
+        }
         for f in m.funcs.iter_mut() {
             optimize_func(f, &mut st, cfg, &mut clk);
         }
@@ -413,6 +416,25 @@ impl Fix {
     }
 }
 
+/// ROUND 92 -- `FIRN_VERIFY_PHI=2` checks the phi invariants after EVERY
+/// pass and names the one that broke them. That is how the duplicate entry
+/// of `tests/800_std_str_core.fi` was found; it costs a predecessor table
+/// per pass and is therefore off unless asked for.
+///
+/// HOW TO READ ITS OUTPUT. A line saying "TWO entries for bbN" is ALWAYS a
+/// bug: one predecessor cannot bring two different values. A line saying
+/// "phi has N entries, the block has M predecessors" may be a transient --
+/// `simplify-term` removes an edge and the next `mem2reg` round trims the
+/// entry that stood for it -- so what matters there is whether it survives
+/// the next `mem2reg`.
+fn phi_check(f: &Func, pass: &str) {
+    if std::env::var_os("FIRN_VERIFY_PHI").map(|v| v == "2").unwrap_or(false) {
+        if let Err(e) = f.verify_phis() {
+            eprintln!("PHI BROKEN after '{}': {}", pass, e);
+        }
+    }
+}
+
 fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut PassClock) {
     let mut round = 0;
     let mut fx = Fix::new();
@@ -424,6 +446,7 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut Pas
             let c = fold_constants(f, st);
             clk.add2("fold", t, c);
             fx.note(0, c);
+            phi_check(f, "fold");
         }
         if cfg.runs("mem2reg") && fx.due(1) {
             let t = std::time::Instant::now();
@@ -442,6 +465,7 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut Pas
             st.phis_folded += sp;
             clk.add2("mem2reg", t, p > 0 || ds > 0 || sp > 0);
             fx.note(1, p > 0 || ds > 0 || sp > 0);
+            phi_check(f, "mem2reg");
         }
         if cfg.runs("copyprop") && fx.due(2) {
             let t = std::time::Instant::now();
@@ -449,6 +473,7 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut Pas
             st.copies += c;
             clk.add2("copyprop", t, c > 0);
             fx.note(2, c > 0);
+            phi_check(f, "copyprop");
         }
         if cfg.runs("strength") && fx.due(3) {
             let t = std::time::Instant::now();
@@ -456,6 +481,7 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut Pas
             st.strength += n;
             clk.add2("strength", t, n > 0);
             fx.note(3, n > 0);
+            phi_check(f, "strength");
         }
         if cfg.runs("cse") && fx.due(4) {
             let t = std::time::Instant::now();
@@ -463,6 +489,7 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut Pas
             st.cse += e;
             clk.add2("cse", t, e > 0);
             fx.note(4, e > 0);
+            phi_check(f, "cse");
         }
         if cfg.runs("licm") && fx.due(5) {
             let t = std::time::Instant::now();
@@ -470,6 +497,7 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut Pas
             st.hoisted += h;
             clk.add2("licm", t, h > 0);
             fx.note(5, h > 0);
+            phi_check(f, "licm");
         }
         if cfg.runs("bce") && fx.due(6) {
             let t = std::time::Instant::now();
@@ -477,6 +505,7 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut Pas
             st.removed_checks += r;
             clk.add2("bce", t, r > 0);
             fx.note(6, r > 0);
+            phi_check(f, "bce");
         }
         if cfg.runs("thread-bool") && fx.due(7) {
             let clock = std::time::Instant::now();
@@ -484,12 +513,14 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut Pas
             st.threaded += t;
             clk.add2("thread-bool", clock, t > 0);
             fx.note(7, t > 0);
+            phi_check(f, "thread-bool");
         }
         if cfg.runs("simplify-term") && fx.due(8) {
             let t = std::time::Instant::now();
             let c = simplify_terminators(f);
             clk.add2("simplify-term", t, c);
             fx.note(8, c);
+            phi_check(f, "simplify-term");
         }
         if cfg.runs("merge-blocks") && fx.due(9) {
             let t = std::time::Instant::now();
@@ -497,6 +528,7 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut Pas
             st.merged_blocks += mb;
             clk.add2("merge-blocks", t, mb > 0);
             fx.note(9, mb > 0);
+            phi_check(f, "merge-blocks");
         }
         if cfg.runs("dce") && fx.due(10) {
             let t = std::time::Instant::now();
@@ -504,6 +536,7 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut Pas
             let b = remove_dead_insts(f, st);
             clk.add2("dce", t, a || b);
             fx.note(10, a || b);
+            phi_check(f, "dce");
         }
         clk.rounds += 1;
         if !fx.changed || round >= MAX_ROUNDS {
