@@ -1,0 +1,591 @@
+// demos/kernel/pci.fi -- round K2: the bus the machine really has.
+//
+// Everything the kernel touched until now it knew by heart: 0x3F8 is the
+// serial port, 0x60 the keyboard, 0x1F0 the disk. Those numbers are true
+// because they were true in 1986 and nobody dared change them. They say
+// nothing about the machine this kernel is actually running on.
+//
+// PCI is the first place where the machine ANSWERS. Every device carries
+// a 256-octet configuration space with its vendor, its number, its class,
+// and -- the part that matters -- the addresses at which it wants to be
+// spoken to. A kernel that reads that space stops guessing.
+//
+// Two doors lead into that space. This file uses the older one, the pair
+// of ports 0xCF8/0xCFC, because it needs no table from the firmware and
+// works on every PC since 1993:
+//
+//     0xCF8 <- 0x80000000 | bus<<16 | device<<11 | function<<8 | reg
+//     0xCFC <-> the four octets of that register
+//
+// The newer door (ECAM, the whole space mapped flat into memory) needs
+// the MCFG table out of ACPI to know WHERE it is mapped. Under QEMU's
+// default machine there is no MCFG at all -- `pc` has no ECAM window --
+// so a kernel that only spoke ECAM would find nothing here. The ports are
+// not the old way, they are the way that always works; ECAM is the
+// optimisation for machines that announce it. That is written down here
+// rather than silently omitted.
+//
+// WHAT IS MEASURED, in tools/pci/run.sh: the list this file prints is
+// held against the `-device` arguments QEMU was started with. Start QEMU
+// with an NVMe controller and the line with class 01:08:02 has to appear;
+// start it without and that line must NOT be there. A list that came out
+// of a table in the kernel would pass the first half and fail the second.
+//
+// THE DATA AREA. Round 59 decided that kernel state lives at offsets in
+// the region `boot.s` hands over, not in global variables (`kstate.fi`).
+// Round K2 keeps to that and takes the part of the region that was still
+// free -- from 0x10000 up; everything below belongs to rounds 59 and 62.
+// The offsets stand here and not in `kstate.fi` so that the hardware
+// layer stays one file, and because several rounds are working on that
+// file at the same time.
+
+import serial
+import kstate
+
+export {
+    scan, count, get, list, find_class,
+    bar, bar_size, bar_flags, bar_is_io,
+    enable_master, disable_master, master_on, cap_find,
+    cfg_read32, cfg_write32, cfg_read16, cfg_write16, cfg_read8,
+    hexn, bdf_bus, bdf_dev, bdf_fn,
+    E_BDF, E_VENDOR, E_DEVICE, E_CLASS, E_SUBCLASS, E_PROGIF, E_HDR,
+    E_IRQLINE, E_IRQPIN, E_MSI, E_MSIX, E_BARS,
+    K2_OFF, K2_SCALARS, TABLE_OFF, ENTRY_BYTES, MAX_DEV,
+    CAP_MSI, CAP_MSIX,
+    CLASS_STORAGE, SUB_IDE, SUB_SATA, SUB_NVM, PROGIF_AHCI, PROGIF_NVME
+}
+
+// ------------------------------------------------- the K2 data area
+
+// The first free page of the region out of boot.s (kstate.fi: 0x0F000
+// upwards is unused, KDATA_SIZE is 0x20000).
+const K2_OFF: u64 = 0x10000
+const TABLE_OFF: u64 = 0x10000 // 32 * 256 octets = 8 KiB
+const K2_SCALARS: u64 = 0x12000 // one page of counters, K2 only
+
+const ENTRY_BYTES: u64 = 256
+const MAX_DEV: u64 = 32
+
+// Offsets inside one entry. Every field is a whole word; a device table
+// is read a thousand times and written once, so nothing is packed.
+const E_BDF: u64 = 0
+const E_VENDOR: u64 = 8
+const E_DEVICE: u64 = 16
+const E_CLASS: u64 = 24
+const E_SUBCLASS: u64 = 32
+const E_PROGIF: u64 = 40
+const E_HDR: u64 = 48
+const E_IRQLINE: u64 = 56
+const E_IRQPIN: u64 = 64
+const E_MSI: u64 = 72 // offset of the capability, 0 = none
+const E_MSIX: u64 = 80
+// Six BARs of three words each: address, size, the low four flag bits.
+const E_BARS: u64 = 96
+
+const S_COUNT: u64 = 0 // in the scalar page: how many devices were found
+
+// ------------------------------------------------------- the two ports
+
+const ADDR_PORT: u16 = 0xCF8
+const DATA_PORT: u16 = 0xCFC
+
+const CFG_VENDOR: u64 = 0x00
+const CFG_DEVICE: u64 = 0x02
+const CFG_COMMAND: u64 = 0x04
+const CFG_STATUS: u64 = 0x06
+const CFG_PROGIF: u64 = 0x09
+const CFG_SUBCLASS: u64 = 0x0A
+const CFG_CLASS: u64 = 0x0B
+const CFG_HDRTYPE: u64 = 0x0E
+const CFG_BAR0: u64 = 0x10
+const CFG_CAPPTR: u64 = 0x34
+const CFG_IRQLINE: u64 = 0x3C
+const CFG_IRQPIN: u64 = 0x3D
+const CFG_SECBUS: u64 = 0x19 // only on a bridge (header type 1)
+
+const CMD_IO: u64 = 0x1
+const CMD_MEM: u64 = 0x2
+const CMD_MASTER: u64 = 0x4
+
+const CAP_MSI: u64 = 0x05
+const CAP_MSIX: u64 = 0x11
+
+const CLASS_STORAGE: u64 = 0x01
+const SUB_IDE: u64 = 0x01
+const SUB_SATA: u64 = 0x06
+const SUB_NVM: u64 = 0x08
+const PROGIF_AHCI: u64 = 0x01
+const PROGIF_NVME: u64 = 0x02
+
+// 32 bits at a time -- that is the width of a configuration register,
+// and the only width the address port can address.
+fn in32(port: u16) -> u64 {
+    // `in eax, dx` zero extends into rax on its own; the mask below is
+    // there so the promise of the type does not depend on that.
+    return asm("in eax, dx", out("rax"), in("dx") port) & 0xFFFFFFFF
+}
+
+fn out32(port: u16, value: u64) {
+    asm("out dx, eax", in("dx") port, in("eax") (value & 0xFFFFFFFF) as u32)
+}
+
+// bdf = bus<<8 | device<<3 | function. Shifted up by 8 that is exactly
+// the layout the address port wants -- bus<<16, device<<11, function<<8.
+fn addr_of(bdf: u64, off: u64) -> u64 {
+    return 0x80000000 | ((bdf & 0xFFFF) << 8) | (off & 0xFC)
+}
+
+fn bdf_bus(bdf: u64) -> u64 {
+    return (bdf >> 8) & 0xFF
+}
+
+fn bdf_dev(bdf: u64) -> u64 {
+    return (bdf >> 3) & 0x1F
+}
+
+fn bdf_fn(bdf: u64) -> u64 {
+    return bdf & 0x7
+}
+
+fn cfg_read32(bdf: u64, off: u64) -> u64 {
+    out32(ADDR_PORT, addr_of(bdf, off))
+    return in32(DATA_PORT)
+}
+
+fn cfg_write32(bdf: u64, off: u64, v: u64) {
+    out32(ADDR_PORT, addr_of(bdf, off))
+    out32(DATA_PORT, v & 0xFFFFFFFF)
+}
+
+fn cfg_read16(bdf: u64, off: u64) -> u64 {
+    return (cfg_read32(bdf, off) >> ((off & 2) * 8)) & 0xFFFF
+}
+
+fn cfg_read8(bdf: u64, off: u64) -> u64 {
+    return (cfg_read32(bdf, off) >> ((off & 3) * 8)) & 0xFF
+}
+
+// Read, replace the half word, write back: the data port has no width
+// below four octets when it is reached through 0xCF8.
+fn cfg_write16(bdf: u64, off: u64, v: u64) {
+    let shift: u64 = (off & 2) * 8
+    let old: u64 = cfg_read32(bdf, off)
+    let mask: u64 = (0xFFFF << shift) & 0xFFFFFFFF
+    cfg_write32(bdf, off, (old & (~mask) & 0xFFFFFFFF) | ((v & 0xFFFF) << shift))
+}
+
+// ------------------------------------------------------------ the table
+
+fn entry(state: u64, i: u64) -> u64 {
+    return state + TABLE_OFF + i * ENTRY_BYTES
+}
+
+fn eset(e: u64, off: u64, v: u64) {
+    __mmio_write64((e + off) as *mut u64, v)
+}
+
+fn eget(e: u64, off: u64) -> u64 {
+    return __mmio_read64((e + off) as *mut u64)
+}
+
+fn count(state: u64) -> u64 {
+    return kstate.get(state, K2_SCALARS + S_COUNT)
+}
+
+fn get(state: u64, i: u64, off: u64) -> u64 {
+    return eget(entry(state, i), off)
+}
+
+// The three words of BAR `n` of device `i`.
+fn bar(state: u64, i: u64, n: u64) -> u64 {
+    return eget(entry(state, i), E_BARS + n * 24)
+}
+
+fn bar_size(state: u64, i: u64, n: u64) -> u64 {
+    return eget(entry(state, i), E_BARS + n * 24 + 8)
+}
+
+fn bar_flags(state: u64, i: u64, n: u64) -> u64 {
+    return eget(entry(state, i), E_BARS + n * 24 + 16)
+}
+
+fn bar_is_io(state: u64, i: u64, n: u64) -> bool {
+    return (bar_flags(state, i, n) & 1) != 0
+}
+
+// ------------------------------------------------------------- the scan
+
+// Bus 0 downwards, bridges followed. `MAX_DEV` entries at most; a machine
+// with more devices than that is not one this kernel runs on.
+fn scan(state: u64) -> u64 {
+    kstate.set(state, K2_SCALARS + S_COUNT, 0)
+    scan_bus(state, 0)
+    return count(state)
+}
+
+fn scan_bus(state: u64, bus: u64) {
+    var dev: u64 = 0
+    while dev < 32 {
+        scan_dev(state, bus, dev)
+        dev = dev + 1
+    }
+}
+
+fn scan_dev(state: u64, bus: u64, dev: u64) {
+    let bdf0: u64 = (bus << 8) | (dev << 3)
+    // A slot without a device answers 0xFFFF -- nobody drives the bus.
+    if cfg_read16(bdf0, CFG_VENDOR) == 0xFFFF {
+        return
+    }
+    var last: u64 = 0
+    if (cfg_read8(bdf0, CFG_HDRTYPE) & 0x80) != 0 {
+        last = 7 // multi function: seven more can be behind it
+    }
+    var f: u64 = 0
+    while f <= last {
+        let bdf: u64 = bdf0 | f
+        if cfg_read16(bdf, CFG_VENDOR) != 0xFFFF {
+            record(state, bdf)
+            // A PCI-to-PCI bridge carries a whole bus behind it. Its
+            // secondary bus number stands in its own configuration space,
+            // which is why this scan does not have to know the topology.
+            if cfg_read8(bdf, CFG_CLASS) == 0x06 && cfg_read8(bdf, CFG_SUBCLASS) == 0x04 {
+                let sec: u64 = cfg_read8(bdf, CFG_SECBUS)
+                if sec > bus {
+                    scan_bus(state, sec)
+                }
+            }
+        }
+        f = f + 1
+    }
+}
+
+fn record(state: u64, bdf: u64) {
+    let n: u64 = count(state)
+    if n >= MAX_DEV {
+        return
+    }
+    let e: u64 = entry(state, n)
+    let hdr: u64 = cfg_read8(bdf, CFG_HDRTYPE)
+    eset(e, E_BDF, bdf)
+    eset(e, E_VENDOR, cfg_read16(bdf, CFG_VENDOR))
+    eset(e, E_DEVICE, cfg_read16(bdf, CFG_DEVICE))
+    eset(e, E_CLASS, cfg_read8(bdf, CFG_CLASS))
+    eset(e, E_SUBCLASS, cfg_read8(bdf, CFG_SUBCLASS))
+    eset(e, E_PROGIF, cfg_read8(bdf, CFG_PROGIF))
+    eset(e, E_HDR, hdr)
+    eset(e, E_IRQLINE, cfg_read8(bdf, CFG_IRQLINE))
+    eset(e, E_IRQPIN, cfg_read8(bdf, CFG_IRQPIN))
+    eset(e, E_MSI, cap_find(bdf, CAP_MSI))
+    eset(e, E_MSIX, cap_find(bdf, CAP_MSIX))
+    var nbars: u64 = 6
+    if (hdr & 0x7F) != 0 {
+        nbars = 2 // a bridge has two of them and a lot of bus numbers
+    }
+    size_bars(e, bdf, nbars)
+    kstate.set(state, K2_SCALARS + S_COUNT, n + 1)
+}
+
+// ---------------------------------------------------- how big a BAR is
+
+// A BAR does not say how much room it wants. It only answers when all
+// ones are written into it: the bits that stay zero are the ones the
+// device does not decode, and the lowest bit that stays one is the size.
+// The register has to be put back afterwards, and the device's decoders
+// have to be OFF while it happens -- for the length of two port accesses
+// the BAR reads as 0xFFFFFFF0, and a device that decoded that address
+// would answer for the whole upper end of memory.
+fn size_bars(e: u64, bdf: u64, nbars: u64) {
+    let cmd: u64 = cfg_read16(bdf, CFG_COMMAND)
+    cfg_write16(bdf, CFG_COMMAND, cmd & (~(CMD_IO | CMD_MEM)) & 0xFFFF)
+    var i: u64 = 0
+    while i < nbars {
+        let off: u64 = CFG_BAR0 + i * 4
+        let orig: u64 = cfg_read32(bdf, off)
+        var addr: u64 = 0
+        var size: u64 = 0
+        let flags: u64 = orig & 0xF
+        var wide: bool = false
+        if (orig & 1) != 0 {
+            // A port range. Sixteen bits wide, the low two are flags.
+            cfg_write32(bdf, off, 0xFFFFFFFF)
+            let probe: u64 = cfg_read32(bdf, off) & 0xFFFC & 0xFFFF
+            cfg_write32(bdf, off, orig)
+            addr = orig & 0xFFFC
+            if probe != 0 {
+                size = ((~probe) & 0xFFFF) + 1
+            }
+        } else {
+            wide = ((orig >> 1) & 3) == 2
+            if wide {
+                let orig_hi: u64 = cfg_read32(bdf, off + 4)
+                cfg_write32(bdf, off, 0xFFFFFFFF)
+                cfg_write32(bdf, off + 4, 0xFFFFFFFF)
+                let lo: u64 = cfg_read32(bdf, off) & 0xFFFFFFF0
+                let hi: u64 = cfg_read32(bdf, off + 4)
+                cfg_write32(bdf, off, orig)
+                cfg_write32(bdf, off + 4, orig_hi)
+                addr = (orig & 0xFFFFFFF0) | (orig_hi << 32)
+                let probe: u64 = lo | (hi << 32)
+                if probe != 0 {
+                    size = (~probe) + 1
+                }
+            } else {
+                cfg_write32(bdf, off, 0xFFFFFFFF)
+                let probe: u64 = cfg_read32(bdf, off) & 0xFFFFFFF0
+                cfg_write32(bdf, off, orig)
+                addr = orig & 0xFFFFFFF0
+                if probe != 0 {
+                    size = ((~probe) & 0xFFFFFFFF) + 1
+                }
+            }
+        }
+        eset(e, E_BARS + i * 24, addr)
+        eset(e, E_BARS + i * 24 + 8, size)
+        eset(e, E_BARS + i * 24 + 16, flags)
+        if wide {
+            // The upper half is not a BAR of its own.
+            eset(e, E_BARS + (i + 1) * 24, 0)
+            eset(e, E_BARS + (i + 1) * 24 + 8, 0)
+            eset(e, E_BARS + (i + 1) * 24 + 16, 0)
+            i = i + 1
+        }
+        i = i + 1
+    }
+    cfg_write16(bdf, CFG_COMMAND, cmd)
+}
+
+// ------------------------------------------------------ capabilities
+
+// The chain that starts at 0x34: one octet identity, one octet the offset
+// of the next. Bounded, because a device with a cycle in its chain must
+// not hang the kernel.
+fn cap_find(bdf: u64, want: u64) -> u64 {
+    if (cfg_read16(bdf, CFG_STATUS) & 0x10) == 0 {
+        return 0 // the device says it has no capability list
+    }
+    var off: u64 = cfg_read8(bdf, CFG_CAPPTR) & 0xFC
+    var guard: u64 = 0
+    while off >= 0x40 && guard < 48 {
+        if cfg_read8(bdf, off) == want {
+            return off
+        }
+        off = cfg_read8(bdf, off + 1) & 0xFC
+        guard = guard + 1
+    }
+    return 0
+}
+
+// -------------------------------------------------------- the master bit
+
+// Without this bit a device may answer but may not START a transfer of
+// its own -- and every DMA is a transfer of the device's own. This is the
+// one line that separates a driver that copies through the processor
+// from one that does not. `tools/pci/run.sh` runs the disk driver once
+// with it and once without; without it nothing arrives.
+fn enable_master(bdf: u64) {
+    let cmd: u64 = cfg_read16(bdf, CFG_COMMAND)
+    cfg_write16(bdf, CFG_COMMAND, cmd | CMD_MEM | CMD_MASTER)
+}
+
+fn disable_master(bdf: u64) {
+    let cmd: u64 = cfg_read16(bdf, CFG_COMMAND)
+    cfg_write16(bdf, CFG_COMMAND, (cmd & (~CMD_MASTER)) | CMD_MEM)
+}
+
+fn master_on(bdf: u64) -> bool {
+    return (cfg_read16(bdf, CFG_COMMAND) & CMD_MASTER) != 0
+}
+
+// ------------------------------------------------------------- finding
+
+// The first device with this class. `pif` of 0x100 means: do not care.
+fn find_class(state: u64, cls: u64, sub: u64, pif: u64) -> u64 {
+    let n: u64 = count(state)
+    var i: u64 = 0
+    while i < n {
+        if get(state, i, E_CLASS) == cls && get(state, i, E_SUBCLASS) == sub {
+            if pif > 0xFF || get(state, i, E_PROGIF) == pif {
+                return i
+            }
+        }
+        i = i + 1
+    }
+    return MAX_DEV
+}
+
+fn find_bdf(state: u64, bdf: u64) -> u64 {
+    let n: u64 = count(state)
+    var i: u64 = 0
+    while i < n {
+        if get(state, i, E_BDF) == bdf {
+            return i
+        }
+        i = i + 1
+    }
+    return MAX_DEV
+}
+
+// -------------------------------------------------------- the listing
+
+// `n` hex digits, no prefix -- the shape `lspci` prints and the shape the
+// guard greps for.
+fn hexn(v: u64, n: u64) {
+    var i: u64 = n
+    while i > 0 {
+        i = i - 1
+        let d: u64 = (v >> (i * 4)) & 15
+        if d < 10 {
+            serial.put((48 + d) as u8)
+        } else {
+            serial.put((87 + d) as u8)
+        }
+    }
+}
+
+fn list(state: u64) {
+    var s_pci: [u8; 6] = "pci: \0"
+    var s_class: [u8; 8] = " class=\0"
+    var s_bar: [u8; 6] = "  bar\0"
+    var s_irq: [u8; 6] = "  irq\0"
+    var s_msi: [u8; 7] = "  msi\0\0"
+    var s_msix: [u8; 7] = "  msix\0"
+    var s_io: [u8; 4] = "io\0\0"
+    var s_total: [u8; 15] = "pci: devices=\0\0"
+
+    let n: u64 = count(state)
+    var i: u64 = 0
+    while i < n {
+        let bdf: u64 = get(state, i, E_BDF)
+        serial.puts((&s_pci[0]) as u64)
+        hexn(bdf_bus(bdf), 2)
+        serial.put(58 as u8) // ':'
+        hexn(bdf_dev(bdf), 2)
+        serial.put(46 as u8) // '.'
+        hexn(bdf_fn(bdf), 1)
+        serial.put(32 as u8)
+        hexn(get(state, i, E_VENDOR), 4)
+        serial.put(58 as u8)
+        hexn(get(state, i, E_DEVICE), 4)
+        serial.puts((&s_class[0]) as u64)
+        hexn(get(state, i, E_CLASS), 2)
+        serial.put(58 as u8)
+        hexn(get(state, i, E_SUBCLASS), 2)
+        serial.put(58 as u8)
+        hexn(get(state, i, E_PROGIF), 2)
+        serial.put(32 as u8)
+        kind(get(state, i, E_CLASS), get(state, i, E_SUBCLASS),
+            get(state, i, E_PROGIF))
+        var b: u64 = 0
+        while b < 6 {
+            let sz: u64 = bar_size(state, i, b)
+            if sz != 0 {
+                serial.puts((&s_bar[0]) as u64)
+                serial.dec(b)
+                serial.put(61 as u8) // '='
+                if bar_is_io(state, i, b) {
+                    serial.puts((&s_io[0]) as u64)
+                }
+                serial.hex(bar(state, i, b))
+                serial.put(47 as u8) // '/'
+                serial.hex(sz)
+            }
+            b = b + 1
+        }
+        if get(state, i, E_IRQPIN) != 0 {
+            serial.puts((&s_irq[0]) as u64)
+            serial.put(61 as u8)
+            serial.dec(get(state, i, E_IRQLINE))
+        }
+        if get(state, i, E_MSI) != 0 {
+            serial.puts((&s_msi[0]) as u64)
+        }
+        if get(state, i, E_MSIX) != 0 {
+            serial.puts((&s_msix[0]) as u64)
+        }
+        serial.nl()
+        i = i + 1
+    }
+    serial.puts((&s_total[0]) as u64)
+    serial.dec(n)
+    serial.nl()
+}
+
+// The name is not decoration: the guard greps for it, and a name that
+// came out of the class code of the device is a statement ABOUT the
+// device -- a fixed list would be a statement about the kernel.
+fn kind(cls: u64, sub: u64, pif: u64) {
+    var s_host: [u8; 12] = "host-bridge\0"
+    var s_isa: [u8; 11] = "isa-bridge\0"
+    var s_pci: [u8; 11] = "pci-bridge\0"
+    var s_other: [u8; 7] = "bridge\0"
+    var s_ide: [u8; 4] = "ide\0"
+    var s_ahci: [u8; 5] = "ahci\0"
+    var s_nvme: [u8; 5] = "nvme\0"
+    var s_scsi: [u8; 5] = "scsi\0"
+    var s_stor: [u8; 8] = "storage\0"
+    var s_net: [u8; 8] = "network\0"
+    var s_vga: [u8; 4] = "vga\0"
+    var s_disp: [u8; 8] = "display\0"
+    var s_usb: [u8; 4] = "usb\0"
+    var s_ser: [u8; 11] = "serial-bus\0"
+    var s_unk: [u8; 8] = "unknown\0"
+
+    if cls == 0x06 {
+        if sub == 0x00 {
+            serial.puts((&s_host[0]) as u64)
+            return
+        }
+        if sub == 0x01 {
+            serial.puts((&s_isa[0]) as u64)
+            return
+        }
+        if sub == 0x04 {
+            serial.puts((&s_pci[0]) as u64)
+            return
+        }
+        serial.puts((&s_other[0]) as u64)
+        return
+    }
+    if cls == CLASS_STORAGE {
+        if sub == SUB_IDE {
+            serial.puts((&s_ide[0]) as u64)
+            return
+        }
+        if sub == SUB_SATA && pif == PROGIF_AHCI {
+            serial.puts((&s_ahci[0]) as u64)
+            return
+        }
+        if sub == SUB_NVM && pif == PROGIF_NVME {
+            serial.puts((&s_nvme[0]) as u64)
+            return
+        }
+        if sub == 0x00 {
+            serial.puts((&s_scsi[0]) as u64)
+            return
+        }
+        serial.puts((&s_stor[0]) as u64)
+        return
+    }
+    if cls == 0x02 {
+        serial.puts((&s_net[0]) as u64)
+        return
+    }
+    if cls == 0x03 {
+        if sub == 0x00 {
+            serial.puts((&s_vga[0]) as u64)
+            return
+        }
+        serial.puts((&s_disp[0]) as u64)
+        return
+    }
+    if cls == 0x0C {
+        if sub == 0x03 {
+            serial.puts((&s_usb[0]) as u64)
+            return
+        }
+        serial.puts((&s_ser[0]) as u64)
+        return
+    }
+    serial.puts((&s_unk[0]) as u64)
+}
