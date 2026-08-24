@@ -47,6 +47,7 @@ mod nogc;
 mod opt;
 mod panic_rt;
 mod panic_rt_a64;
+mod lock;
 mod package;
 mod package_world;
 mod prof;
@@ -95,6 +96,10 @@ struct Options {
     package: Option<String>,
     /// `--package-info <dir>`: read the manifest and report.
     package_info: Option<String>,
+    /// ROUND 93: `--lock` writes `firn.lock`, `--locked` demands that it
+    /// fits. Both only together with `--package`.
+    lock: bool,
+    locked: bool,
     emit: Emit,
     optimize: bool,
     keep_asm: bool,
@@ -170,6 +175,8 @@ fn usage() -> String {
          -o <path>          output file (default: input name without extension)\n  \
          --package <dir>      compile the project from <dir>/firn.package\n  \
          --package-info <dir> read the manifest of <dir> and report\n  \
+         --lock             write <dir>/firn.lock (only with --package)\n  \
+         --locked           build only if firn.lock fits (only with --package)\n  \
          --emit=exe         produce an executable (default, calls as/ld)\n  \
          --emit=asm         write x86_64 assembler to the output\n  \
          --emit=fir         FIR text form (after optimization, if active)\n  \
@@ -210,6 +217,8 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut output: Option<PathBuf> = None;
     let mut package: Option<String> = None;
     let mut package_info: Option<String> = None;
+    let mut lock_write = false;
+    let mut lock_check = false;
     let mut emit = Emit::Exe;
     let mut optimize = true;
     let mut keep_asm = false;
@@ -314,6 +323,10 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
                     None => return Err("--package expects a directory".to_string()),
                 }
             }
+            // ROUND 93: the two lock options take no value — they belong to
+            // the `--package` build and are read the same way in `firnc1`.
+            "--lock" => lock_write = true,
+            "--locked" => lock_check = true,
             "--package-info" => {
                 i += 1;
                 match args.get(i) {
@@ -358,6 +371,8 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     Ok(Options {
         input,
         output,
+        lock: lock_write,
+        locked: lock_check,
         package,
         package_info,
         emit,
@@ -409,6 +424,15 @@ fn run(opts: &Options) -> i32 {
     // there (round 48).
     if opts.package.is_some() && opts.input.is_some() {
         eprint!("error: --package and an input file are mutually exclusive\n");
+        return 2;
+    }
+    // ROUND 93: `--lock`/`--locked` are options OF THE BUILD DRIVER. Without
+    // `--package` there is no manifest that a lock file could belong to, and
+    // silently doing nothing would be the worst of the three possible
+    // answers.
+    if opts.package.is_none() && (opts.lock || opts.locked) {
+        let which = if opts.locked { "--locked" } else { "--lock" };
+        eprint!("{}", lock::text_needs_package(which));
         return 2;
     }
     // --- `--package-info`: read the manifest, check it, report (round 48) ---
@@ -482,6 +506,42 @@ fn run(opts: &Options) -> i32 {
             return report(&dg);
         }
     };
+    // --- ROUND 93: the lock file. It sits HERE, between resolving and
+    // compiling: the input of the build is complete (every module is found
+    // and read), and not one instruction has been emitted yet. So
+    // `--locked` refuses BEFORE the work, the way `cargo build --locked`
+    // does, and never silently builds something else than the file says.
+    if opts.lock || opts.locked {
+        let dir = opts.package.clone().unwrap_or_default();
+        let lockpath = package::join(&dir, lock::LOCKFILE);
+        let cwd = package_world::cwd();
+        let computed = match lock::text(&world, &files, &cwd) {
+            Ok(t) => t,
+            Err(e) => {
+                eprint!("{}", e);
+                return 2;
+            }
+        };
+        if opts.locked {
+            match std::fs::read_to_string(&lockpath) {
+                Ok(found) => {
+                    if let Some(note) = lock::difference(&found, &computed) {
+                        eprint!("{}", lock::text_mismatch(&lockpath, &note));
+                        return 2;
+                    }
+                }
+                Err(_) => {
+                    eprint!("{}", lock::text_missing(&lockpath));
+                    return 2;
+                }
+            }
+        } else if std::fs::write(&lockpath, computed.as_bytes()).is_err() {
+            // Without the reason of the operating system: `firnc1` has no
+            // `strerror`, and the two compilers have to say the same sentence.
+            eprint!("error: cannot write '{}'\n", lockpath);
+            return 2;
+        }
+    }
     let root = match files.first() {
         Some(f) => f,
         None => {
@@ -494,6 +554,10 @@ fn run(opts: &Options) -> i32 {
         dg.add_file(&f.path.display().to_string(), &f.src);
     }
     // Line table for .debug_line: instruction-exact only without the optimizer.
+    // The file names come out of `modules::resolve` and are, since round 93,
+    // already relative to the working directory
+    // (`package_world::build_path`) — the artifact must not name the
+    // machine it was built on.
     dwarf::reset(
         files.iter().map(|f| f.path.display().to_string()).collect(),
         !opts.optimize,
@@ -810,8 +874,19 @@ fn default_output(input: &Path) -> PathBuf {
 /// Assemble only (`as --64 -o x.o x.s`) — the freestanding output.
 fn assemble(asm: &Path, obj: &Path) -> Result<(), i32> {
     let t = target::active();
+    // ROUND 93 (reproducibility, ACCEPTANCE item 5): `as` builds a
+    // `.debug_line` out of our `.file`/`.loc` directives and puts ITS OWN
+    // working directory into it as `DW_AT_comp_dir`. Two checkouts at
+    // different places therefore produced binaries that differed in
+    // thousands of octets — measured with `tools/repro/run.sh`: 3,562 of
+    // 6,840 octets in `package_bin`. `--debug-prefix-map` (binutils, also
+    // on the aarch64 side) maps that directory to `.`, and with it the
+    // artifact stops knowing where it was built.
+    let map = format!("{}=.", package_world::cwd());
     let st = Command::new(t.assembler())
         .args(t.as_flags())
+        .arg("--debug-prefix-map")
+        .arg(&map)
         .arg("-o")
         .arg(obj)
         .arg(asm)
