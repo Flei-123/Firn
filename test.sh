@@ -93,6 +93,16 @@
 #      gets formatted, the token stream and the syntax tree stay unchanged,
 #      a second run changes nothing, and the shape does not depend on
 #      blanks (random test).
+#  49. Phi nodes (tools/phi/run.sh, ROUND 92): a loop counter is written on
+#      every pass, and until round 92 that meant it stayed in MEMORY -- FIR
+#      had no phi nodes, so `mem2reg` could only resolve cells written once.
+#      Checked here: the counter really is a phi and its function has no
+#      alloca/load/store left; the x86 code did not get LONGER (the copy per
+#      back edge has to be folded into the instruction that computes the
+#      value, or the round is a regression); aarch64, which has no register
+#      allocation to rescue the counter, loses two thirds of the memory
+#      accesses in that loop; and three variables rotating in a circle come
+#      out right, which is the parallel copy of `phi.rs` doing its job.
 #  25. The language server (tools/lsp/run.sh, round 64): `firnc --lsp`
 #      speaks the Language Server Protocol; a real client checks
 #      diagnostics, definition, hover, completion, rename and formatting.
@@ -1174,6 +1184,16 @@ if [ "$TMRC" -eq 0 ]; then
 else
     bad "tools/repro/two_machines.sh failed (see .test-work/twomachines.log)"
     grep -E 'DIFFERENT|FAILED|MISSING|failed' "$WORK/twomachines.log" | head -12 | sed 's/^/   /'
+fi
+
+echo "== 52. phi nodes: the loop counter leaves the frame (tools/phi/run.sh, ROUND 92) =="
+bash tools/phi/run.sh > "$WORK/phi.log" 2>&1 && PHRC=0 || PHRC=$?
+grep -E '^  (@sum_to|without the pass|sum_to|rotate|swap_n|frame|aarch64|four levels|firnc1)' "$WORK/phi.log" | sed 's/^/ /'
+if [ "$PHRC" -eq 0 ]; then
+    ok
+else
+    bad "tools/phi/run.sh failed (see .test-work/phi.log)"
+    grep -E '^  FAIL|^phi:' "$WORK/phi.log" | head -12 | sed 's/^/   /'
 fi
 
 TOTAL=$((PASS + FAIL))

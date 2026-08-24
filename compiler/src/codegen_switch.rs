@@ -274,6 +274,9 @@ mod tests {
         let mut m = crate::lower::lower(&prog, &info, &mut dg).expect("lowering");
         assert!(!dg.has_errors(), "{}", dg.render());
         crate::opt::optimize(&mut m);
+        // ROUND 92: exactly what `main.rs` does between the optimizer and
+        // the code generator -- a backend never sees a phi.
+        crate::phi::eliminate(&mut m).expect("phi elimination");
         let asm = emit(&m).expect("codegen");
         assert!(asm.contains("jmp qword ptr ["), "no jump table:\n{}", asm);
         assert!(asm.contains(".section .rodata"), "table not in .rodata:\n{}", asm);

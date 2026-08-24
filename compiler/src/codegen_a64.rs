@@ -207,10 +207,23 @@ fn layout(f: &Func) -> Frame {
             }
         }
     }
+    // ROUND 92: only a value with EXACTLY ONE definition is the constant its
+    // `const` instruction names. After `phi.rs` a value can be written from
+    // several blocks -- see the long note in `regalloc.rs::immediate_consts`.
+    let mut defs: HashMap<Val, u32> = HashMap::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            if let Some(d) = i.dst {
+                *defs.entry(d).or_insert(0) += 1;
+            }
+        }
+    }
     for b in &f.blocks {
         for i in &b.insts {
             if let (Some(d), Op::Const(c)) = (i.dst, &i.op) {
-                consts.insert(d, i.ty.truncate(*c));
+                if defs.get(&d).copied().unwrap_or(0) == 1 {
+                    consts.insert(d, i.ty.truncate(*c));
+                }
             }
             let args = match &i.op {
                 Op::Call { args, .. } | Op::CallIndirect { args, .. } => args.as_slice(),
@@ -1080,6 +1093,17 @@ fn emit_inst(
             e.line(&format!("tst {}, #255", C));
             e.line(&format!("csel {}, {}, {}, ne", A, B, A));
             store_dst(e, fr, d, A);
+        }
+        // ROUND 92 -- see the same arm in `codegen_x86.rs`. This machine has
+        // no register allocation at all, so every value lives in the frame
+        // and a copy is one `ldr` plus one `str`.
+        Op::Copy { src } => {
+            let d = i.dst.ok_or("internal error: copy without target")?;
+            load_full(e, fr, A, *src);
+            store_dst(e, fr, d, A);
+        }
+        Op::Phi { .. } => {
+            return Err("internal error: phi in the code generator (phi.rs did not run)".into())
         }
         Op::Barrier { val } => {
             let d = i.dst.ok_or("internal error: barrier without target")?;
