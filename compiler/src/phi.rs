@@ -292,8 +292,12 @@ pub(crate) fn eliminate_func(f: &mut Func) -> Result<(), String> {
 ///  * `%X` has exactly ONE reader in the whole function, that entry. A phi
 ///    entry naming the phi's own value does not count as a reader — that is
 ///    what a collapsed chain leaves behind;
-///  * nothing in `B` reads `%Y`, and no phi in `B` has `%Y` as an incoming
-///    value: both would read it after it has been overwritten;
+///  * no ORDINARY instruction of `B` reads `%Y` — it would read the new
+///    content where it wanted the old. A phi of `B` reading `%Y` is fine and
+///    is the case this exists for: after the merge that entry is either the
+///    phi's own value (no copy at all) or one copy among several on the same
+///    edge, and `sequentialize` orders a parallel copy so that every source
+///    is read before it is overwritten;
 ///  * neither value is `secret` (SPEC §9.2).
 ///
 /// Merges are applied in rounds, and inside one round no merge whose target
@@ -384,23 +388,26 @@ fn coalesce_chains(f: &mut Func) {
                     {
                         continue;
                     }
+                    // Only ORDINARY instructions of B are asked. A phi of B
+                    // that reads %Y is fine and is in fact the case this
+                    // whole thing exists for: after the merge that entry is
+                    // either the phi's own value (no copy at all) or one
+                    // copy among several on the same edge, and
+                    // `sequentialize` already knows how to order a parallel
+                    // copy so that every source is read before it is
+                    // overwritten. An ordinary instruction is different: it
+                    // sits INSIDE B, after the copies at the end of B's
+                    // predecessors have already run, and would read the new
+                    // content where it wanted the old.
                     let mut reads_y = false;
                     for k in f.blocks[bi].insts.iter() {
-                        match &k.op {
-                            Op::Phi { incoming } => {
-                                if incoming.iter().any(|(_, v)| *v == y) {
-                                    reads_y = true;
-                                }
-                            }
-                            other => {
-                                buf.clear();
-                                other.uses(&mut buf);
-                                if buf.contains(&y) {
-                                    reads_y = true;
-                                }
-                            }
+                        if matches!(k.op, Op::Phi { .. }) {
+                            continue;
                         }
-                        if reads_y {
+                        buf.clear();
+                        k.op.uses(&mut buf);
+                        if buf.contains(&y) {
+                            reads_y = true;
                             break;
                         }
                     }
@@ -411,19 +418,39 @@ fn coalesce_chains(f: &mut Func) {
             }
         }
         if pairs.is_empty() {
+            if std::env::var_os("FIRN_PHI_STATS").is_some() && _round == 0 {
+                eprintln!("coalesce @{}: no pair at all", f.name);
+            }
             return;
         }
-        let targets: std::collections::HashSet<Val> = pairs.iter().map(|(_, y)| *y).collect();
-        let sources: std::collections::HashSet<Val> = pairs.iter().map(|(x, _)| *x).collect();
+        // A GREEDY MATCHING, not a filter. The first version refused every
+        // pair whose target was another pair's source -- and in a real chain
+        // `x1 -> x2 -> x3` EVERY pair is of that kind, so it refused all of
+        // them and coalesced nothing at all (measured: `@main` of
+        // `bench/firn/statemachine.fi`, five pairs found, none applied).
+        // What is needed is a maximal set of pairs that do not chain WITH
+        // EACH OTHER: take a pair unless one of its ends has already been
+        // used at the other end. `x1 -> x2` and `x3 -> x4` go in one round,
+        // `x2 -> x4` follows in the next, and the chain is gone in two.
+        let mut chosen_x: std::collections::HashSet<Val> = std::collections::HashSet::new();
+        let mut chosen_y: std::collections::HashSet<Val> = std::collections::HashSet::new();
         let mut map: std::collections::HashMap<Val, Val> = std::collections::HashMap::new();
         for (x, y) in pairs.iter() {
-            if sources.contains(y) || targets.contains(x) {
-                continue; // no chaining inside one round
+            if chosen_y.contains(x) || chosen_x.contains(y) {
+                continue;
             }
-            map.entry(*x).or_insert(*y);
+            if map.contains_key(x) {
+                continue;
+            }
+            map.insert(*x, *y);
+            chosen_x.insert(*x);
+            chosen_y.insert(*y);
         }
         if map.is_empty() {
             return;
+        }
+        if std::env::var_os("FIRN_PHI_STATS").is_some() {
+            eprintln!("coalesce @{} round {}: {} pairs, {} applied", f.name, _round, pairs.len(), map.len());
         }
         // %X stands in exactly two places: as the dst of its phi and as the
         // single entry that reads it. Both become %Y.
