@@ -16,7 +16,7 @@
 import serial
 import kstate
 
-export { irq, translate, MAX_KEYS }
+export { irq, translate, take, waiting, MAX_KEYS }
 
 // How many octets fit into the buffer in the data area.
 const MAX_KEYS: u64 = 64
@@ -35,9 +35,15 @@ fn irq(state: u64) {
         return
     }
     kstate.add(state, kstate.KEYS, 1)
+    // ROUND K1: KEYLEN counts every key that ever arrived and KEYBUF is a
+    // RING of MAX_KEYS octets. Round 59 stopped at 64 keys because
+    // nothing read the buffer; a shell reads it, and a buffer that fills
+    // up once and then stays full is a keyboard that dies after 64
+    // characters. What overruns an unread ring is dropped -- the writer
+    // is an interrupt handler and has nowhere to wait.
     let n: u64 = kstate.get(state, kstate.KEYLEN)
-    if n < MAX_KEYS {
-        kstate.set8(state + kstate.KEYBUF + n, c)
+    if n - kstate.get(state, kstate.KEYPOS) < MAX_KEYS {
+        kstate.set8(state + kstate.KEYBUF + n % MAX_KEYS, c)
         kstate.set(state, kstate.KEYLEN, n + 1)
     }
     var label: [u8; 6] = "key: \0"
@@ -51,9 +57,34 @@ fn irq(state: u64) {
     serial.nl()
 }
 
+// ROUND K1: how many keys are waiting to be read.
+fn waiting(state: u64) -> u64 {
+    return kstate.get(state, kstate.KEYLEN) - kstate.get(state, kstate.KEYPOS)
+}
+
+// ROUND K1: the next key, or 0 when there is none. This is the consumer
+// side of the ring, and it is called from a system call -- `sys.fi` turns
+// the interrupt flag off around it, because the producer is an interrupt.
+fn take(state: u64) -> u64 {
+    let pos: u64 = kstate.get(state, kstate.KEYPOS)
+    if pos >= kstate.get(state, kstate.KEYLEN) {
+        return 0
+    }
+    kstate.set(state, kstate.KEYPOS, pos + 1)
+    return kstate.get8(state + kstate.KEYBUF + pos % MAX_KEYS)
+}
+
 // Scan code -> character, 0 = nothing printable. The table covers
 // 0x00..0x39; everything above that is a modifier or a function key.
+//
+// ROUND K1: 0x0E is the backspace. Round 59 had no line to correct and
+// left it silent; a shell has one, and 8 is what the correction is
+// called. Nothing else in the table changed -- the four keys of round
+// 59's case still come out as `firn`.
 fn translate(code: u64) -> u8 {
+    if code == 14 {
+        return 8 as u8
+    }
     var table: [u8; 58] = "\0\01234567890-=\0\0qwertyuiop[]\n\0asdfghjkl;'`\0\\zxcvbnm,./\0*\0 "
     if code >= 58 {
         return 0 as u8

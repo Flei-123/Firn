@@ -1136,6 +1136,16 @@ else
     sed 's/^/        /' "$WORK/optlevels.log" | grep FAIL | head -12
 fi
 
+echo "== 49. a program off the disk: the ELF loader, exec, /bin/sh (tools/osum/run.sh, ROUND K1) =="
+bash tools/osum/run.sh > "$WORK/osum.log" 2>&1 && OSRC=0 || OSRC=$?
+grep -E '^OSUM:|deepest|biggest program|refusals in one run' "$WORK/osum.log" | sed 's/^/ /'
+if [ "$OSRC" -eq 0 ]; then
+    ok
+else
+    bad "tools/osum/run.sh failed (see .test-work/osum.log)"
+    grep -E '^  FAIL' "$WORK/osum.log" | head -12 | sed 's/^/        /'
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then

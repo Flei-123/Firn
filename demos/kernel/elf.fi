@@ -1,0 +1,762 @@
+// demos/kernel/elf.fi -- round K1: a program comes off the disk.
+//
+// Everything the kernel could run until this round was LINKED INTO IT.
+// `demos/kernel/uprog.fi` is a translation unit of its own and lies on
+// pages of its own, but it travels in the same image, and the number of
+// programs the system knows was decided when the kernel was compiled.
+// That is not an operating system; that is a demonstration with a fixed
+// programme.
+//
+// This file closes the gap. It reads an ELF64 file out of the file system
+// (`fs.fi`, on the RAM disk or on a real drive over ATA PIO), lays its
+// segments into the address space of a NEW process with the rights the
+// file asks for, zeroes what the file does not fill, builds an argument
+// block on the top stack page and starts the thing. `/bin/sh` is loaded
+// exactly like every program it starts itself -- there is no second path.
+//
+// THREE RULES, and every one of them has a counter-check in
+// `tools/osum/run.sh` that makes the measurement collapse:
+//
+//   1. WHAT IS WRONG IS REFUSED, AND THE KERNEL LIVES ON. Twenty-one
+//      named reasons below, from a wrong magic number to a segment that
+//      claims more room than the private region has. Every one of them
+//      leaves the kernel standing and the caller with an error code. The
+//      run `tools/osum/run.sh` feeds the kernel eleven deliberately
+//      broken files and reads the reason back off the serial port.
+//   2. NOTHING IS ADDED UP THAT COULD OVERFLOW. Under `profile kernel`
+//      arithmetic is CHECKED (SPEC section 13, item L9) -- `off + filesz`
+//      with a hostile `off` does not wrap silently, it calls
+//      `osum_panic`, and the kernel is dead. Every bound in this file is
+//      therefore written as a SUBTRACTION on the side that is known to be
+//      big enough: `size - off < filesz` instead of `off + filesz > size`.
+//      That is not style, it is the difference between a refusal and a
+//      halted machine, and `bad_huge` in the guard is the case that
+//      proves it.
+//   3. ONE PAGE HAS ONE SET OF RIGHTS. A page table entry cannot be read
+//      only for the first half of a page and writable for the second, so
+//      the loader demands page aligned segments and refuses a file whose
+//      segments share a page (`R_ALIGN`, `R_OVERLAP`). A loader that
+//      quietly gave the shared page the union of both rights would have
+//      made the constants writable and the data executable without ever
+//      saying so. `demos/kernel/user/user.ld` produces the three
+//      segments; `ld -n` produces the counter-example.
+//
+// THE ADDRESS SPACE the image lands in is the one `proc.fi` builds: one
+// private page table over 0x40000000..0x401FFFFF. Below live the data
+// page and the eight stack pages, from `proc.IMAGE_BASE` (0x40100000) on
+// there is room for the image. `proc.free_space` walks that table when
+// the process dies and gives every frame back -- the image frames are not
+// a special case, and `tools/osum/run.sh` measures that the free frame
+// count is the same before and after.
+
+import serial
+import kstate
+import mem
+import sched
+import proc
+import fs
+
+export {
+    spawn, load, say_reason, errno_of,
+    R_OK, R_NOFILE, R_ISDIR, R_SHORT, R_MAGIC, R_CLASS, R_ENDIAN,
+    R_VERSION, R_TYPE, R_MACHINE, R_SIZES, R_PHNUM, R_PHOFF, R_SEGFILE,
+    R_MEMSZ, R_RANGE, R_ALIGN, R_OVERLAP, R_NOMEM, R_ENTRY, R_READ,
+    R_NOLOAD, R_ARGS
+}
+
+// -------------------------------------------------------- the reasons
+
+const R_OK: u64 = 0
+const R_NOFILE: u64 = 1 // there is no such path
+const R_ISDIR: u64 = 2 // it is not a file
+const R_SHORT: u64 = 3 // shorter than an ELF header
+const R_MAGIC: u64 = 4 // 0x7F E L F is missing
+const R_CLASS: u64 = 5 // not ELFCLASS64
+const R_ENDIAN: u64 = 6 // not little endian
+const R_VERSION: u64 = 7 // not version 1
+const R_TYPE: u64 = 8 // not ET_EXEC
+const R_MACHINE: u64 = 9 // not x86-64
+const R_SIZES: u64 = 10 // e_ehsize or e_phentsize is wrong
+const R_PHNUM: u64 = 11 // no program headers, or too many
+const R_PHOFF: u64 = 12 // the program headers lie outside the file
+const R_SEGFILE: u64 = 13 // a segment lies outside the file
+const R_MEMSZ: u64 = 14 // p_filesz is bigger than p_memsz
+const R_RANGE: u64 = 15 // outside the region a process owns
+const R_ALIGN: u64 = 16 // not page aligned
+const R_OVERLAP: u64 = 17 // two segments want the same page
+const R_NOMEM: u64 = 18 // no frame left
+const R_ENTRY: u64 = 19 // the entry point is on no executable page
+const R_READ: u64 = 20 // the disk gave less than was asked for
+const R_NOLOAD: u64 = 21 // not a single PT_LOAD
+const R_ARGS: u64 = 22 // the arguments do not fit on the page
+
+// ---------------------------------------------------------- the format
+
+const PT_LOAD: u64 = 1
+const PF_X: u64 = 1
+const PF_W: u64 = 2
+
+const ET_EXEC: u64 = 2
+const EM_X86_64: u64 = 62
+
+const EHSIZE: u64 = 64 // e_ehsize, and the size of the header
+const PHENTSIZE: u64 = 56 // e_phentsize
+const MAX_PH: u64 = 16 // more than that is not a program of ours
+
+// The fields, as offsets. ELF64 is little endian on this machine, which
+// is why they can simply be read.
+const E_TYPE: u64 = 16
+const E_MACHINE: u64 = 18
+const E_EVERSION: u64 = 20
+const E_ENTRY: u64 = 24
+const E_PHOFF: u64 = 32
+const E_EHSIZE: u64 = 52
+const E_PHENTSIZE: u64 = 54
+const E_PHNUM: u64 = 56
+
+const P_TYPE: u64 = 0
+const P_FLAGS: u64 = 4
+const P_OFFSET: u64 = 8
+const P_VADDR: u64 = 16
+const P_FILESZ: u64 = 32
+const P_MEMSZ: u64 = 40
+
+const PAGE: u64 = 4096
+const PAGE_MASK: u64 = 4095
+
+// What a freshly taken frame is filled with before the file goes in.
+// Whatever the program reads that it did not put there itself is this
+// pattern, and `nobss` on the command line leaves it standing on purpose
+// -- that is the counter-check for "the loader zeroes the .bss".
+const POISON: u64 = 0xAAAAAAAAAAAAAAAA
+
+// Where the strings of the argument block start on the page. Eight
+// pointers plus the closing zero is nine words, and the count is the
+// tenth.
+const STR_OFF: u64 = 80
+
+// ---------------------------------------------------------- the reading
+
+fn get64(p: u64) -> u64 {
+    return __mmio_read64(p as *mut u64)
+}
+
+fn put64(p: u64, v: u64) {
+    __mmio_write64(p as *mut u64, v)
+}
+
+fn head(state: u64) -> u64 {
+    return state + kstate.ELF_OFF
+}
+
+fn fill(p: u64, n: u64, v: u64) {
+    var i: u64 = 0
+    while i < n / 8 {
+        put64(p + i * 8, v)
+        i = i + 1
+    }
+}
+
+fn copy(from: u64, to: u64, n: u64) {
+    var i: u64 = 0
+    while i < n {
+        kstate.set8(to + i, kstate.get8(from + i) as u8)
+        i = i + 1
+    }
+}
+
+fn fail(state: u64, r: u64) -> u64 {
+    kstate.set(state, kstate.ELF_ERR, r)
+    return r
+}
+
+// ------------------------------------------------------- the header
+
+// Reads the ELF header and every program header into the data area and
+// says what is wrong. R_OK = nothing.
+//
+// The order of the checks is the order in which a file gets less
+// trustworthy: what is not even an ELF file is not looked at any
+// further, and no number out of the file is used before the field that
+// says how long it is has been believed.
+fn read_header(state: u64, ino: u64) -> u64 {
+    let h: u64 = head(state)
+    let size: u64 = fs.inode_size(state, ino)
+    if size < EHSIZE {
+        return R_SHORT
+    }
+    if fs.read_at(state, ino, 0, h, EHSIZE) != EHSIZE {
+        return R_READ
+    }
+    if kstate.get8(h) != 0x7F {
+        return R_MAGIC
+    }
+    if kstate.get8(h + 1) != 69 {
+        return R_MAGIC
+    }
+    if kstate.get8(h + 2) != 76 {
+        return R_MAGIC
+    }
+    if kstate.get8(h + 3) != 70 {
+        return R_MAGIC
+    }
+    if kstate.get8(h + 4) != 2 {
+        return R_CLASS
+    }
+    if kstate.get8(h + 5) != 1 {
+        return R_ENDIAN
+    }
+    if kstate.get8(h + 6) != 1 {
+        return R_VERSION
+    }
+    if kstate.get16(h + E_TYPE) != ET_EXEC {
+        return R_TYPE
+    }
+    if kstate.get16(h + E_MACHINE) != EM_X86_64 {
+        return R_MACHINE
+    }
+    if kstate.get32(h + E_EVERSION) != 1 {
+        return R_VERSION
+    }
+    if kstate.get16(h + E_EHSIZE) != EHSIZE {
+        return R_SIZES
+    }
+    if kstate.get16(h + E_PHENTSIZE) != PHENTSIZE {
+        return R_SIZES
+    }
+    let n: u64 = kstate.get16(h + E_PHNUM)
+    if n == 0 {
+        return R_PHNUM
+    }
+    if n > MAX_PH {
+        return R_PHNUM
+    }
+    // n <= 16, so this product cannot run away.
+    let need: u64 = n * PHENTSIZE
+    let off: u64 = get64(h + E_PHOFF)
+    if off < EHSIZE {
+        return R_PHOFF
+    }
+    // NOT `off + need > size`: `off` comes out of the file and may be
+    // 0xFFFFFFFFFFFFFFF0. Checked addition would call `osum_panic` and
+    // the kernel would be gone -- see the head of this file.
+    if off > size {
+        return R_PHOFF
+    }
+    if size - off < need {
+        return R_PHOFF
+    }
+    if fs.read_at(state, ino, off, h + EHSIZE, need) != need {
+        return R_READ
+    }
+    return R_OK
+}
+
+// ------------------------------------------------------- one segment
+
+// Lays one PT_LOAD into the address space of task `t`. Every page is
+// taken fresh, filled with the poison pattern, then filled from the file
+// as far as `p_filesz` reaches, and the rest of the page is zeroed --
+// that last step is what makes the `.bss` zero, and `nobss` leaves it
+// out.
+fn segment(state: u64, t: u64, ino: u64, ph: u64, size: u64) -> u64 {
+    let flags: u64 = kstate.get32(ph + P_FLAGS)
+    let off: u64 = get64(ph + P_OFFSET)
+    let vaddr: u64 = get64(ph + P_VADDR)
+    let filesz: u64 = get64(ph + P_FILESZ)
+    let memsz: u64 = get64(ph + P_MEMSZ)
+    if memsz == 0 {
+        return R_OK // nothing to map, and nothing to complain about
+    }
+    if filesz > memsz {
+        return R_MEMSZ
+    }
+    if off > size {
+        return R_SEGFILE
+    }
+    if size - off < filesz {
+        return R_SEGFILE
+    }
+    if vaddr < proc.IMAGE_BASE {
+        return R_RANGE
+    }
+    if vaddr >= proc.IMAGE_END {
+        return R_RANGE
+    }
+    if proc.IMAGE_END - vaddr < memsz {
+        return R_RANGE
+    }
+    if (vaddr & PAGE_MASK) != 0 {
+        return R_ALIGN
+    }
+    if (off & PAGE_MASK) != 0 {
+        return R_ALIGN
+    }
+    let writable: bool = (flags & PF_W) != 0
+    let runnable: bool = (flags & PF_X) != 0
+    let zeroing: bool = (kstate.get(state, kstate.MODE) & kstate.M_NOBSS) == 0
+    var done: u64 = 0
+    while done < memsz {
+        let page: u64 = vaddr + done
+        if !proc.page_free(state, t, page) {
+            return R_OVERLAP
+        }
+        let frame: u64 = proc.map_page(state, t, page, writable, runnable)
+        if frame == 0 {
+            return R_NOMEM
+        }
+        fill(frame, PAGE, POISON)
+        var take: u64 = 0
+        if filesz > done {
+            take = filesz - done
+            if take > PAGE {
+                take = PAGE
+            }
+        }
+        if take > 0 {
+            let sc: u64 = state + kstate.LOAD_OFF
+            if fs.read_at(state, ino, off + done, sc, take) != take {
+                return R_READ
+            }
+            copy(sc, frame, take)
+        }
+        if zeroing {
+            fill_bytes(frame + take, PAGE - take, 0)
+        }
+        done = done + PAGE
+    }
+    return R_OK
+}
+
+fn fill_bytes(p: u64, n: u64, v: u64) {
+    var i: u64 = 0
+    while i < n {
+        kstate.set8(p + i, v as u8)
+        i = i + 1
+    }
+}
+
+// --------------------------------------------------------- the whole file
+
+// Reads the file into the address space of task `t`. The task must be
+// built and its page table empty above `proc.IMAGE_BASE`; on a refusal
+// the caller throws the whole process away, which gives every frame that
+// was already mapped back with it.
+fn load(state: u64, t: u64, ino: u64) -> u64 {
+    let r: u64 = read_header(state, ino)
+    if r != R_OK {
+        return r
+    }
+    let h: u64 = head(state)
+    let size: u64 = fs.inode_size(state, ino)
+    let n: u64 = kstate.get16(h + E_PHNUM)
+    var loads: u64 = 0
+    var bytes: u64 = 0
+    var pages: u64 = 0
+    var seg: u64 = 0
+    while seg < n {
+        let ph: u64 = h + EHSIZE + seg * PHENTSIZE
+        if kstate.get32(ph + P_TYPE) == PT_LOAD {
+            if get64(ph + P_MEMSZ) > 0 {
+                let bad: u64 = segment(state, t, ino, ph, size)
+                if bad != R_OK {
+                    return bad
+                }
+                loads = loads + 1
+                bytes = bytes + get64(ph + P_FILESZ)
+                pages = pages + (get64(ph + P_MEMSZ) + PAGE_MASK) / PAGE
+                say_segment(state, t, ph)
+            }
+        }
+        seg = seg + 1
+    }
+    if loads == 0 {
+        return R_NOLOAD
+    }
+    // The last check, and it is the one that catches a file whose header
+    // and whose segments each look fine on their own: `e_entry` has to
+    // land on a page that was really mapped and is really executable.
+    if !proc.page_exec(state, t, get64(h + E_ENTRY)) {
+        return R_ENTRY
+    }
+    kstate.set(state, kstate.ELF_BYTES, bytes)
+    kstate.set(state, kstate.ELF_PAGES, pages)
+    kstate.set(state, kstate.ELF_LOADS, loads)
+    return R_OK
+}
+
+// One line per segment, and it is the ONLY way to see from outside what
+// rights a page really got: the numbers come out of the PAGE TABLE the
+// loader just wrote, not out of the file it read. `w=` and `x=` are what
+// `proc.page_free`/`proc.page_exec` see, `f=` is the frame the first page
+// landed on.
+fn say_segment(state: u64, t: u64, ph: u64) {
+    var s_seg: [u8; 10] = "elf: seg \0"
+    var s_v: [u8; 4] = " v=\0"
+    var s_f: [u8; 4] = " f=\0"
+    var s_file: [u8; 9] = " filesz=\0"
+    var s_mem: [u8; 8] = " memsz=\0"
+    var s_w: [u8; 4] = " w=\0"
+    var s_x: [u8; 4] = " x=\0"
+    let vaddr: u64 = get64(ph + P_VADDR)
+    let flags: u64 = kstate.get32(ph + P_FLAGS)
+    serial.puts((&s_seg[0]) as u64)
+    serial.dec(flags)
+    serial.puts((&s_v[0]) as u64)
+    serial.hex(vaddr)
+    serial.puts((&s_f[0]) as u64)
+    serial.hex(proc.translate(state, t, vaddr))
+    serial.puts((&s_file[0]) as u64)
+    serial.dec(get64(ph + P_FILESZ))
+    serial.puts((&s_mem[0]) as u64)
+    serial.dec(get64(ph + P_MEMSZ))
+    serial.puts((&s_w[0]) as u64)
+    serial.dec(yes((flags & PF_W) != 0))
+    serial.puts((&s_x[0]) as u64)
+    serial.dec(yes(proc.page_exec(state, t, vaddr)))
+    serial.nl()
+}
+
+fn yes(b: bool) -> u64 {
+    if b {
+        return 1
+    }
+    return 0
+}
+
+// ------------------------------------------------------ the arguments
+
+// The block the program finds in rdi. It lies on the TOP stack page of
+// the process, and the stack pointer is set below it -- so it costs no
+// frame of its own and it is gone with the process.
+//
+//     +0   argc
+//     +8   argv[0..argc-1], then a zero
+//     +80  the strings, each one ended by a zero
+fn write_args(state: u64, t: u64, args: u64, argc: u64) -> bool {
+    if argc > proc.MAX_ARGS {
+        return false
+    }
+    let frame: u64 = proc.translate(state, t, proc.ARGS_BASE)
+    if frame == 0 {
+        return false
+    }
+    fill_bytes(frame, PAGE, 0)
+    put64(frame, argc)
+    var at: u64 = STR_OFF
+    var src: u64 = args
+    var k: u64 = 0
+    while k < argc {
+        put64(frame + 8 + k * 8, proc.ARGS_BASE + at)
+        var going: bool = true
+        while going {
+            if at >= PAGE - 1 {
+                return false
+            }
+            let c: u64 = kstate.get8(src)
+            kstate.set8(frame + at, c as u8)
+            at = at + 1
+            src = src + 1
+            if c == 0 {
+                going = false
+            }
+        }
+        k = k + 1
+    }
+    put64(frame + 8 + argc * 8, 0)
+    return true
+}
+
+// ------------------------------------------------------------- spawn
+
+// THE CALL EVERYTHING ELSE GOES THROUGH. `path` and `args` are KERNEL
+// addresses: `args` holds `argc` strings one after the other, each ended
+// by a zero. Returns the task index, or 0 -- and then `kstate.ELF_ERR`
+// says why.
+//
+// WHY THIS IS A `spawn` AND NOT A UNIX `exec`. Unix replaces the image of
+// the CALLING process, and it needs `fork` in front of it to have a
+// process to throw away. `fork` without copy-on-write means copying an
+// image that the very next instruction discards, and copy-on-write means
+// a fault handler that shares frames and counts references -- that is a
+// round of its own in `mem.fi` and `proc.fi`, and none of the four things
+// `fork` is really used for (a redirection between fork and exec, a
+// process that goes on running as itself, a shell job, a daemon) exists
+// in this system. What DOES exist is `proc.create_bare`: a task plus an
+// empty address space, exactly the thing an image has to be poured into.
+// So the loader fills a NEW process and hands its pid back, the way
+// `posix_spawn` does, and the caller waits for it with `wait`. The old
+// `spawn` of round 62 (a program compiled into the kernel, with the
+// parent's data page inherited) stays where it is and keeps its meaning;
+// an image off the disk gets a ZEROED data page, because there is nothing
+// sensible for it to inherit.
+fn spawn(state: u64, path: u64, args: u64, argc: u64, prio: u64) -> u64 {
+    fail(state, R_OK)
+    if kstate.get(state, kstate.FS_READY) == 0 {
+        fail(state, R_NOFILE)
+        return 0
+    }
+    let ino: u64 = fs.path(state, path)
+    if ino == 0 {
+        fail(state, R_NOFILE)
+        return 0
+    }
+    if fs.inode_type(state, ino) != fs.T_FILE {
+        fail(state, R_ISDIR)
+        return 0
+    }
+    // Interrupts stay down until the process is COMPLETE -- the same rule
+    // as in `proc.create`, and for the same reason: a task the scheduler
+    // takes while its page table is half full has an rip that points into
+    // a page that is not there yet.
+    let flags: u64 = sched.irq_save()
+    let t: u64 = proc.create_bare(state, prio)
+    if t == 0 {
+        sched.irq_restore(flags)
+        fail(state, R_NOMEM)
+        return 0
+    }
+    let r: u64 = load(state, t, ino)
+    if r != R_OK {
+        proc.discard(state, t)
+        sched.irq_restore(flags)
+        fail(state, r)
+        return 0
+    }
+    if !write_args(state, t, args, argc) {
+        proc.discard(state, t)
+        sched.irq_restore(flags)
+        fail(state, R_ARGS)
+        return 0
+    }
+    let h: u64 = head(state)
+    sched.tset(state, t, sched.T_ENTRY, get64(h + E_ENTRY))
+    sched.tset(state, t, sched.T_USTACK, proc.ARGS_BASE - 16)
+    sched.tset(state, t, sched.T_ARG, 0)
+    sched.tset(state, t, sched.T_WORK, proc.ARGS_BASE)
+    kstate.add(state, kstate.SPAWNS, 1)
+    kstate.add(state, kstate.EXECS, 1)
+    say_start(state, t)
+    sched.start(state, t)
+    sched.irq_restore(flags)
+    return t
+}
+
+fn say_start(state: u64, t: u64) {
+    var s_go: [u8; 12] = "elf: start \0"
+    var s_e: [u8; 8] = " entry=\0"
+    var s_u: [u8; 9] = " ustack=\0"
+    var s_k: [u8; 9] = " kstack=\0"
+    var s_b: [u8; 8] = " bytes=\0"
+    var s_p: [u8; 8] = " pages=\0"
+    serial.puts((&s_go[0]) as u64)
+    serial.dec(sched.tget(state, t, sched.T_PID))
+    serial.puts((&s_e[0]) as u64)
+    serial.hex(sched.tget(state, t, sched.T_ENTRY))
+    serial.puts((&s_u[0]) as u64)
+    serial.hex(sched.tget(state, t, sched.T_USTACK))
+    serial.puts((&s_k[0]) as u64)
+    serial.hex(sched.tget(state, t, sched.T_KSTACK))
+    serial.puts((&s_b[0]) as u64)
+    serial.dec(kstate.get(state, kstate.ELF_BYTES))
+    serial.puts((&s_p[0]) as u64)
+    serial.dec(kstate.get(state, kstate.ELF_PAGES))
+    serial.nl()
+}
+
+// ---------------------------------------------------------- the errno
+
+// What ring 3 gets to see. Everything that is not a missing file, a
+// directory or a lack of memory is the same thing to a program: the file
+// is not a program of this machine.
+fn errno_of(r: u64) -> u64 {
+    if r == R_NOFILE {
+        return 2 // ENOENT
+    }
+    if r == R_ISDIR {
+        return 21 // EISDIR
+    }
+    if r == R_NOMEM {
+        return 12 // ENOMEM
+    }
+    if r == R_ARGS {
+        return 7 // E2BIG
+    }
+    return 8 // ENOEXEC
+}
+
+// ---------------------------------------------------------- the report
+
+// One line on the serial port for every refusal. The number is what the
+// guard reads, the text is what a person reads.
+//
+// WHY THIS IS FIVE FUNCTIONS AND NOT ONE. Written as one function the
+// twenty-two texts are twenty-two local arrays in ONE stack frame, some
+// 500 octets -- and this frame sits at the DEEPEST point the kernel ever
+// reaches: a refusal happens inside `sys.do_exec`, under `elf.spawn`,
+// under `fs.read_at`, under the ATA driver. Round K1 measured 16240
+// octets of kernel stack that way, out of the 16384 a task has; the same
+// run with the texts split across five functions that are called one
+// AFTER the other -- never one inside the other -- measures 9216.
+//
+// The obvious answer, `static` texts in `.rodata` (round 89), is not
+// available here: firnc1 compiles a `static` array and reads out of it,
+// but it cannot take its ADDRESS -- `(&MSG[0]) as u64` and `(&MSG) as
+// u64` both make it stop, while `(&X) as u64` on a scalar `static` is
+// fine. Both compilers have to build this kernel, so the texts stay
+// locals. Measured on 2026-08-24 against `.firnc1`; when that gap closes,
+// twenty-two `static`s and one function are the better shape.
+fn say_reason(r: u64) {
+    var head_t: [u8; 22] = "elf: refused, reason \0"
+    var gap: [u8; 3] = "  \0"
+    serial.puts((&head_t[0]) as u64)
+    serial.dec(r)
+    serial.puts((&gap[0]) as u64)
+    say_text(r)
+    serial.nl()
+}
+
+fn say_text(r: u64) {
+    if r <= 4 {
+        say_text_a(r)
+        return
+    }
+    if r <= 9 {
+        say_text_b(r)
+        return
+    }
+    if r <= 14 {
+        say_text_c(r)
+        return
+    }
+    if r <= 18 {
+        say_text_d(r)
+        return
+    }
+    say_text_e(r)
+}
+
+fn say_text_a(r: u64) {
+    var t1: [u8; 13] = "no such file\0"
+    var t2: [u8; 17] = "not a plain file\0"
+    var t3: [u8; 22] = "shorter than a header\0"
+    var t4: [u8; 13] = "no ELF magic\0"
+    var tx: [u8; 8] = "unknown\0"
+    if r == R_NOFILE {
+        serial.puts((&t1[0]) as u64)
+        return
+    }
+    if r == R_ISDIR {
+        serial.puts((&t2[0]) as u64)
+        return
+    }
+    if r == R_SHORT {
+        serial.puts((&t3[0]) as u64)
+        return
+    }
+    if r == R_MAGIC {
+        serial.puts((&t4[0]) as u64)
+        return
+    }
+    serial.puts((&tx[0]) as u64)
+}
+
+fn say_text_b(r: u64) {
+    var t5: [u8; 15] = "not ELFCLASS64\0"
+    var t6: [u8; 18] = "not little endian\0"
+    var t7: [u8; 14] = "wrong version\0"
+    var t8: [u8; 12] = "not ET_EXEC\0"
+    var t9: [u8; 11] = "not x86-64\0"
+    if r == R_CLASS {
+        serial.puts((&t5[0]) as u64)
+        return
+    }
+    if r == R_ENDIAN {
+        serial.puts((&t6[0]) as u64)
+        return
+    }
+    if r == R_VERSION {
+        serial.puts((&t7[0]) as u64)
+        return
+    }
+    if r == R_TYPE {
+        serial.puts((&t8[0]) as u64)
+        return
+    }
+    serial.puts((&t9[0]) as u64)
+}
+
+fn say_text_c(r: u64) {
+    var t10: [u8; 19] = "wrong header sizes\0"
+    var t11: [u8; 24] = "no or too many segments\0"
+    var t12: [u8; 29] = "program headers past the end\0"
+    var t13: [u8; 21] = "segment past the end\0"
+    var t14: [u8; 19] = "filesz above memsz\0"
+    if r == R_SIZES {
+        serial.puts((&t10[0]) as u64)
+        return
+    }
+    if r == R_PHNUM {
+        serial.puts((&t11[0]) as u64)
+        return
+    }
+    if r == R_PHOFF {
+        serial.puts((&t12[0]) as u64)
+        return
+    }
+    if r == R_SEGFILE {
+        serial.puts((&t13[0]) as u64)
+        return
+    }
+    serial.puts((&t14[0]) as u64)
+}
+
+fn say_text_d(r: u64) {
+    var t15: [u8; 24] = "outside the user region\0"
+    var t16: [u8; 17] = "not page aligned\0"
+    var t17: [u8; 22] = "two segments one page\0"
+    var t18: [u8; 14] = "out of frames\0"
+    var tx: [u8; 8] = "unknown\0"
+    if r == R_RANGE {
+        serial.puts((&t15[0]) as u64)
+        return
+    }
+    if r == R_ALIGN {
+        serial.puts((&t16[0]) as u64)
+        return
+    }
+    if r == R_OVERLAP {
+        serial.puts((&t17[0]) as u64)
+        return
+    }
+    if r == R_NOMEM {
+        serial.puts((&t18[0]) as u64)
+        return
+    }
+    serial.puts((&tx[0]) as u64)
+}
+
+fn say_text_e(r: u64) {
+    var t19: [u8; 22] = "entry on no exec page\0"
+    var t20: [u8; 16] = "short disk read\0"
+    var t21: [u8; 11] = "no PT_LOAD\0"
+    var t22: [u8; 19] = "arguments too long\0"
+    var tx: [u8; 8] = "unknown\0"
+    if r == R_ENTRY {
+        serial.puts((&t19[0]) as u64)
+        return
+    }
+    if r == R_READ {
+        serial.puts((&t20[0]) as u64)
+        return
+    }
+    if r == R_NOLOAD {
+        serial.puts((&t21[0]) as u64)
+        return
+    }
+    if r == R_ARGS {
+        serial.puts((&t22[0]) as u64)
+        return
+    }
+    serial.puts((&tx[0]) as u64)
+}
