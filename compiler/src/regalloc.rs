@@ -827,10 +827,37 @@ fn promotable_cells(f: &Func) -> HashMap<Val, FTy> {
 /// They then need neither register nor slot, and their `const` instruction
 /// disappears entirely.
 fn immediate_consts(f: &Func) -> HashMap<Val, i64> {
+    // ROUND 92 -- A VALUE MAY BE WRITTEN MORE THAN ONCE DOWN HERE.
+    //
+    // Above the code generator FIR is SSA: one definition per value, so
+    // "this value is defined by a `const`" and "this value IS that constant"
+    // were the same sentence. `phi.rs` ends that. Eliminating a phi means
+    // writing ONE value from several places -- one per incoming edge -- and
+    // where the incoming value is computed in the predecessor itself the
+    // computation writes the phi's value directly. A loop counter that
+    // starts at 0 therefore has a `const.i32 0` writing it in the preheader
+    // and an `add` writing it on the back edge.
+    //
+    // Measured, and that is what this note is for: without the count below
+    // `tests/018_while_sum.fi` returned 0 instead of 55, because every read
+    // of the sum was replaced by the immediate `0` of its FIRST definition
+    // and the `add` on the back edge wrote a value nobody looked at again.
+    // The same trap sits in `codegen_a64.rs::layout`.
+    let mut defs: HashMap<Val, u32> = HashMap::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            if let Some(d) = i.dst {
+                *defs.entry(d).or_insert(0) += 1;
+            }
+        }
+    }
     let mut cand: HashMap<Val, i64> = HashMap::new();
     for b in &f.blocks {
         for i in &b.insts {
             if let (Some(d), Op::Const(c)) = (i.dst, &i.op) {
+                if defs.get(&d).copied().unwrap_or(0) != 1 {
+                    continue;
+                }
                 let v = i.ty.truncate(*c);
                 // Up to 32 bits the immediate may use the whole unsigned
                 // range: `cmp $0xffffffff,%r9d` computes exactly right with
@@ -3505,13 +3532,12 @@ fn emit_inst(
         // even though FIR now writes a copy per back edge.
         Op::Copy { src } => {
             let d = i.dst.ok_or("internal error: copy without target")?;
-            let sp = if ra.a.imm(*src).is_some() { None } else { Some(ra.a.place(*src)) };
-            match (sp, ra.a.loc(d)) {
-                (Some(Loc::Reg(a2)), Loc::Reg(b2)) if a2 == b2 => {} // already home
-                (Some(Loc::Reg(a2)), Loc::Reg(b2)) => {
-                    e.line(&format!("mov {}, {}", b2, a2));
-                }
-                _ => {
+            match ra.a.loc(d) {
+                // Straight into its home. `load_full` writes nothing at all
+                // when the value already stands there, so a copy the
+                // allocator has coalesced by accident costs no instruction.
+                Loc::Reg(r) => ra.load_full(e, r, *src),
+                Loc::Slot(_) => {
                     ra.load_full(e, "rax", *src);
                     ra.store_dst(e, d, "rax");
                 }

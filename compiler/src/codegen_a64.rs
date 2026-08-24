@@ -207,10 +207,23 @@ fn layout(f: &Func) -> Frame {
             }
         }
     }
+    // ROUND 92: only a value with EXACTLY ONE definition is the constant its
+    // `const` instruction names. After `phi.rs` a value can be written from
+    // several blocks -- see the long note in `regalloc.rs::immediate_consts`.
+    let mut defs: HashMap<Val, u32> = HashMap::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            if let Some(d) = i.dst {
+                *defs.entry(d).or_insert(0) += 1;
+            }
+        }
+    }
     for b in &f.blocks {
         for i in &b.insts {
             if let (Some(d), Op::Const(c)) = (i.dst, &i.op) {
-                consts.insert(d, i.ty.truncate(*c));
+                if defs.get(&d).copied().unwrap_or(0) == 1 {
+                    consts.insert(d, i.ty.truncate(*c));
+                }
             }
             let args = match &i.op {
                 Op::Call { args, .. } | Op::CallIndirect { args, .. } => args.as_slice(),
