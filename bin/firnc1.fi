@@ -29,6 +29,7 @@ import gc
 import gctext
 import iface
 import package
+import lock
 import parser
 import types
 import sema
@@ -512,6 +513,17 @@ fn imports_collect(l: *mut lexer.Lexer, s: *mut SearchSpace, w: *mut package.Wor
         if !found {
             return 2
         }
+        // ROUND 93: from here on the module is known under the spelling
+        // that does not name this machine (`package.build_path`). It has to
+        // happen BEFORE `ml_knows`, otherwise the same file would land in
+        // the queue twice under two spellings.
+        var shortp: rt.Buf = rt.buf_new()
+        package.build_path(&shortp, rt.buf_ptr(&path), rt.buf_len(&path) - 1,
+            rt.buf_ptr(&(*s).cwd), rt.buf_len(&(*s).cwd))
+        rt.buf_clear(&path)
+        rt.buf_push_bytes(&path, rt.buf_ptr(&shortp), rt.buf_len(&shortp))
+        rt.buf_push(&path, 0 as u8)
+        rt.buf_free(&shortp)
         let n: usize = rt.buf_len(&path) - 1
         // VISIBILITY: if the hit leads into ANOTHER package, that package
         // has to be a registered dependency and the module has to be in
@@ -597,6 +609,11 @@ fn main(start: u64) -> i32 {
     var o_opt: [u8; 3] = "-o\0"
     var p_opt: [u8; 10] = "--package\0"
     var i_opt: [u8; 15] = "--package-info\0"
+    // ROUND 93: the two lock options of the build driver.
+    var lk_opt: [u8; 7] = "--lock\0"
+    var lkd_opt: [u8; 9] = "--locked\0"
+    var lock_write: bool = false
+    var lock_check: bool = false
     var no_opt: [u8; 9] = "--no-opt\0"
     var lv_dev: [u8; 16] = "--opt-level=dev\0"
     var lv_devfast: [u8; 21] = "--opt-level=dev-fast\0"
@@ -613,6 +630,10 @@ fn main(start: u64) -> i32 {
             checked = false
         } else if arg_is(a, an, (&c_opt[0]) as u64) || arg_is(a, an, (&ob_opt[0]) as u64) {
             only_object = true
+        } else if arg_is(a, an, (&lk_opt[0]) as u64) {
+            lock_write = true
+        } else if arg_is(a, an, (&lkd_opt[0]) as u64) {
+            lock_check = true
         } else {
             if arg_is(a, an, (&pk_opt[0]) as u64) {
                 kernel_flag = true
@@ -665,6 +686,22 @@ fn main(start: u64) -> i32 {
             return 2
         }
     }
+    // ROUND 93: `--lock`/`--locked` are options OF THE BUILD DRIVER. Without
+    // `--package` there is no manifest a lock file could belong to, and
+    // silently doing nothing would be the worst of the three answers.
+    if pak == 0 {
+        if lock_write || lock_check {
+            var lk0: lock.Lock = lock.lock_new()
+            var which: u64 = (&lk_opt[0]) as u64
+            if lock_check {
+                which = (&lkd_opt[0]) as u64
+            }
+            lock.lock_error_needs_package(&lk0, which)
+            rt.write_everything(2, rt.buf_ptr(lock.lock_error(&lk0)),
+                rt.buf_len(lock.lock_error(&lk0)))
+            return 2
+        }
+    }
 
     // --- the package world. With `--package`/`--package-info` the named
     // project, otherwise the manifest above the source file; without a
@@ -710,6 +747,20 @@ fn main(start: u64) -> i32 {
             package.join(&targetb, pak, pak_n, np, rt.c_length(np))
             has_target = true
         }
+    }
+
+    // ROUND 93: the root file too is known under the spelling that does not
+    // name this machine -- `modules::resolve` in `firnc0` does the same to
+    // every file, and the two have to agree in every message.
+    var nameb: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&nameb)
+    if inp != 0 {
+        var cwd0: rt.Buf = rt.buf_new()
+        package.work_dir(&cwd0)
+        package.build_path(&nameb, inp, in_n, rt.buf_ptr(&cwd0), rt.buf_len(&cwd0))
+        rt.buf_free(&cwd0)
+        inp = rt.buf_ptr(&nameb)
+        in_n = rt.buf_len(&nameb)
     }
 
     var source: rt.Buf = rt.buf_new()
@@ -925,6 +976,57 @@ fn main(start: u64) -> i32 {
             return irc
         }
         mi = mi + 1
+    }
+
+    // --- ROUND 93: the lock file. The queue is complete here -- every
+    // module is found and read -- and nothing has been parsed yet. That is
+    // the same place `firnc0` does it, so `--locked` refuses at the same
+    // moment in both compilers, before any work.
+    if lock_write || lock_check {
+        var lk: lock.Lock = lock.lock_new()
+        var mj: usize = 0
+        while mj < ml_count(&ml) {
+            lock.lock_add(&lk, ml_ptr(&ml, mj), ml_length(&ml, mj))
+            mj = mj + 1
+        }
+        var lpath: rt.Buf = rt.buf_new()
+        var lfile: [u8; 10] = "firn.lock\0"
+        package.join(&lpath, pak, pak_n, (&lfile[0]) as u64, 9)
+        if !lock.lock_finish(&lk, &w, rt.buf_ptr(&sr.cwd), rt.buf_len(&sr.cwd)) {
+            rt.write_everything(2, rt.buf_ptr(lock.lock_error(&lk)),
+                rt.buf_len(lock.lock_error(&lk)))
+            return 2
+        }
+        if lock_check {
+            var lfound: rt.Buf = rt.buf_new()
+            if !rt.read_file(rt.buf_ptr(&lpath), &lfound) {
+                lock.lock_error_missing(&lk, rt.buf_ptr(&lpath), rt.buf_len(&lpath))
+                rt.write_everything(2, rt.buf_ptr(lock.lock_error(&lk)),
+                    rt.buf_len(lock.lock_error(&lk)))
+                return 2
+            }
+            if !lock.lock_error_mismatch(&lk, rt.buf_ptr(&lpath), rt.buf_len(&lpath),
+                rt.buf_ptr(&lfound), rt.buf_len(&lfound)) {
+                rt.write_everything(2, rt.buf_ptr(lock.lock_error(&lk)),
+                    rt.buf_len(lock.lock_error(&lk)))
+                return 2
+            }
+            rt.buf_free(&lfound)
+        } else {
+            if !rt.write_file(rt.buf_ptr(&lpath),
+                rt.buf_ptr(lock.lock_out(&lk)), rt.buf_len(lock.lock_out(&lk))) {
+                var m_w1: [u8; 22] = "error: cannot write '\0"
+                var m_w2: [u8; 3] = "'\n\0"
+                var eb: rt.Buf = rt.buf_new()
+                package.ptext(&eb, (&m_w1[0]) as u64)
+                rt.buf_push_bytes(&eb, rt.buf_ptr(&lpath), rt.buf_len(&lpath))
+                package.ptext(&eb, (&m_w2[0]) as u64)
+                rt.write_everything(2, rt.buf_ptr(&eb), rt.buf_len(&eb))
+                return 2
+            }
+        }
+        rt.buf_free(&lpath)
+        lock.lock_free(&lk)
     }
 
     // --- ROUND 53: the generic templates of the COLLECTOR RUNTIME have to
