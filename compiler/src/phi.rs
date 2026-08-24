@@ -151,6 +151,9 @@ pub(crate) fn eliminate_func(f: &mut Func) -> Result<(), String> {
     // wrong answer.
     f.verify_phis()?;
 
+    // ROUND 92 -- collapse the chains of phis first; see `coalesce_chains`.
+    coalesce_chains(f);
+
     let nb = f.blocks.len();
     let mut preds: Vec<Vec<usize>> = vec![Vec::new(); nb];
     for (i, b) in f.blocks.iter().enumerate() {
@@ -245,6 +248,202 @@ pub(crate) fn eliminate_func(f: &mut Func) -> Result<(), String> {
         b.insts.retain(|i| !matches!(i.op, Op::Phi { .. }));
     }
     Ok(())
+}
+
+/// **ROUND 92 — the chains of phis, and why they have to go.**
+///
+/// A nested `if`/`else` does not make ONE join, it makes a cascade of them,
+/// and SSA construction puts a phi in every one. `bench/firn/statemachine.fi`
+/// has a six-deep tree over four variables, and its inner loop came out of
+/// the first version of this round like this:
+///
+/// ```text
+/// .Lmain__bb13:  lea r9, [rdi+1]     <- text = text + 1
+///                mov rbx, r8         <- state, unchanged, copied
+/// .Lmain__bb14:  mov r15, rbx        <- and copied again
+///                mov r13, rdx
+///                mov r12, r9
+/// .Lmain__bb11:  lea rsi, [rsi+1]    <- k = k + 1
+///                mov r8, r15         <- and a third time
+///                mov rdx, r13
+///                mov rdi, r12
+/// ```
+///
+/// Six register-to-register moves per octet of input that only shuffle three
+/// variables through three join blocks. Counted with callgrind, that was
+/// **+43 % executed instructions** against round 91 on that program. A
+/// foundation that makes branch-heavy code half as slow again is not a
+/// foundation.
+///
+/// The values in such a chain never coexist: `%X` in `bb14` is read by
+/// exactly one thing, the phi in `bb11`, and is dead the moment it is read.
+/// So they can share ONE name, every copy between them becomes `x = x` and
+/// disappears. That is register coalescing, done on the phi graph where it
+/// needs no interference graph — the congruence-class idea, cut down to the
+/// shape a chain of joins actually has.
+///
+/// `%X` (a phi in `B`) is merged into `%Y` (a phi in `C`) when ALL of:
+///
+///  * `B` ends in `br C`, so everything leaving `B` arrives at `C`;
+///  * every predecessor of `B` ends in `br B` — this is the critical-edge
+///    condition. Without it, writing `%Y` at the end of a predecessor would
+///    also write it on a path that never goes to `C`, where the old content
+///    may still be wanted;
+///  * `%X` has exactly ONE reader in the whole function, that entry. A phi
+///    entry naming the phi's own value does not count as a reader — that is
+///    what a collapsed chain leaves behind;
+///  * nothing in `B` reads `%Y`, and no phi in `B` has `%Y` as an incoming
+///    value: both would read it after it has been overwritten;
+///  * neither value is `secret` (SPEC §9.2).
+///
+/// Merges are applied in rounds, and inside one round no merge whose target
+/// is another merge's source is taken: the conditions were checked against
+/// the graph as it stands, and chaining two of them at once would use one of
+/// them out of date. A chain of three joins therefore collapses in three
+/// rounds; the loop is bounded at sixteen.
+fn coalesce_chains(f: &mut Func) {
+    let mut buf: Vec<Val> = Vec::new();
+    for _round in 0..16 {
+        let nb = f.blocks.len();
+        // Uses per value. A phi entry naming the phi's own value is not one.
+        let mut uses: std::collections::HashMap<Val, usize> = std::collections::HashMap::new();
+        for b in f.blocks.iter() {
+            for i in b.insts.iter() {
+                if let (Some(d), Op::Phi { incoming }) = (i.dst, &i.op) {
+                    for (_, v) in incoming.iter() {
+                        if *v != d {
+                            *uses.entry(*v).or_insert(0) += 1;
+                        }
+                    }
+                    continue;
+                }
+                buf.clear();
+                i.op.uses(&mut buf);
+                for v in buf.iter() {
+                    *uses.entry(*v).or_insert(0) += 1;
+                }
+            }
+            let t = match &b.term {
+                Term::BrCond { cond, .. } => Some(*cond),
+                Term::Switch { val, .. } => Some(*val),
+                Term::Ret(Some(v)) => Some(*v),
+                _ => None,
+            };
+            if let Some(v) = t {
+                *uses.entry(v).or_insert(0) += 1;
+            }
+        }
+        let mut phi_block: std::collections::HashMap<Val, usize> = std::collections::HashMap::new();
+        for (bi, b) in f.blocks.iter().enumerate() {
+            let np = b.phi_count();
+            for i in b.insts[..np].iter() {
+                if let Some(d) = i.dst {
+                    phi_block.insert(d, bi);
+                }
+            }
+        }
+        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); nb];
+        for (i, b) in f.blocks.iter().enumerate() {
+            for sb in b.term.successors() {
+                let sb = sb as usize;
+                if sb < nb && !preds[sb].contains(&i) {
+                    preds[sb].push(i);
+                }
+            }
+        }
+
+        let mut pairs: Vec<(Val, Val)> = Vec::new();
+        for (ci, c) in f.blocks.iter().enumerate() {
+            let np = c.phi_count();
+            for i in c.insts[..np].iter() {
+                let y = match i.dst {
+                    Some(d) => d,
+                    None => continue,
+                };
+                let inc = match &i.op {
+                    Op::Phi { incoming } => incoming.clone(),
+                    _ => continue,
+                };
+                for (bb, x) in inc.into_iter() {
+                    let bi = bb as usize;
+                    if x == y || bi >= nb || f.is_secret(x) || f.is_secret(y) {
+                        continue;
+                    }
+                    if phi_block.get(&x) != Some(&bi) {
+                        continue; // %X is not a phi of that very block
+                    }
+                    if uses.get(&x).copied().unwrap_or(0) != 1 {
+                        continue;
+                    }
+                    if !matches!(f.blocks[bi].term, Term::Br(t) if t as usize == ci) {
+                        continue;
+                    }
+                    if !preds[bi]
+                        .iter()
+                        .all(|&q| matches!(f.blocks[q].term, Term::Br(t) if t as usize == bi))
+                    {
+                        continue;
+                    }
+                    let mut reads_y = false;
+                    for k in f.blocks[bi].insts.iter() {
+                        match &k.op {
+                            Op::Phi { incoming } => {
+                                if incoming.iter().any(|(_, v)| *v == y) {
+                                    reads_y = true;
+                                }
+                            }
+                            other => {
+                                buf.clear();
+                                other.uses(&mut buf);
+                                if buf.contains(&y) {
+                                    reads_y = true;
+                                }
+                            }
+                        }
+                        if reads_y {
+                            break;
+                        }
+                    }
+                    if !reads_y {
+                        pairs.push((x, y));
+                    }
+                }
+            }
+        }
+        if pairs.is_empty() {
+            return;
+        }
+        let targets: std::collections::HashSet<Val> = pairs.iter().map(|(_, y)| *y).collect();
+        let sources: std::collections::HashSet<Val> = pairs.iter().map(|(x, _)| *x).collect();
+        let mut map: std::collections::HashMap<Val, Val> = std::collections::HashMap::new();
+        for (x, y) in pairs.iter() {
+            if sources.contains(y) || targets.contains(x) {
+                continue; // no chaining inside one round
+            }
+            map.entry(*x).or_insert(*y);
+        }
+        if map.is_empty() {
+            return;
+        }
+        // %X stands in exactly two places: as the dst of its phi and as the
+        // single entry that reads it. Both become %Y.
+        for b in f.blocks.iter_mut() {
+            for i in b.insts.iter_mut() {
+                if let Some(d) = i.dst {
+                    if let Some(&ny) = map.get(&d) {
+                        i.dst = Some(ny);
+                    }
+                }
+                if let Op::Phi { incoming } = &mut i.op {
+                    for e in incoming.iter_mut() {
+                        if let Some(&ny) = map.get(&e.1) {
+                            e.1 = ny;
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// May THIS instruction be made to write a value that other instructions
