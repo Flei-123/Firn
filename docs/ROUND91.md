@@ -16,11 +16,16 @@ Everything below was **run**. Every number has the command next to it.
 ## 1. What was measured before the round
 
 ```
-$ A64_FILTER=1613 bash tools/aarch64/run.sh
+$ bash tools/aarch64/run.sh                       # main at 458e48e2
   DIFF tests/1613_crypto.fi :: aarch64 compilation failed:
        --target=aarch64-linux cannot emit the vector instruction Load yet.
-  SAME:           1
+  SAME:           294
   DIFFERENT:      1
+  NOT SUPPORTED:  4
+  ENVIRONMENT:    1
+  x86 already:    4
+  RESULT: 294 of 299 comparable cases identical on both machines (98%)
+FAIL 1 case(s) differ between the two machines
 ```
 
 One case. It was the only one left: everything else in the corpus already did
