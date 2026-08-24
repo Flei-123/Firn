@@ -1146,6 +1146,19 @@ else
     grep -E '^  FAIL' "$WORK/osum.log" | head -12 | sed 's/^/        /'
 fi
 
+# ROUND K2. Round K1 took 49; of the rounds that were running in
+# parallel only K1 landed, so this one is 50 and not 53.
+echo "== 50. the kernel reads its own machine: PCI, APIC, NVMe over DMA (tools/pci/run.sh, ROUND K2) =="
+bash tools/pci/run.sh > "$WORK/pci.log" 2>&1 && PCIRC=0 || PCIRC=$?
+grep -E '^        bench: ' "$WORK/pci.log" | sed 's/^ */ /'
+grep -E '^PCI: ' "$WORK/pci.log" | sed 's/^/ /'
+if [ "$PCIRC" -eq 0 ]; then
+    ok
+else
+    bad "tools/pci/run.sh failed (see .test-work/pci.log)"
+    grep -E '^  FAIL' "$WORK/pci.log" | head -12 | sed 's/^/   /'
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then

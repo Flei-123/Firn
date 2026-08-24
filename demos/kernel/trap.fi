@@ -26,6 +26,8 @@ import kstate
 import kbd
 import power
 import sched
+import apic
+import nvme
 
 export { entry }
 
@@ -40,6 +42,14 @@ const F_SS: u64 = 168
 
 const VEC_TIMER: u64 = 32
 const VEC_KEYBOARD: u64 = 33
+// ROUND K2. The disk controller signals its completion on 44 -- over
+// MSI-X, where it writes the vector as data to 0xFEE00000, or over its
+// interrupt pin through the I/O APIC. Both paths end here, which is what
+// makes the two comparable. 47 is what the local APIC delivers when it
+// has nothing to deliver: a spurious interrupt gets NO end-of-interrupt,
+// because the controller never began one.
+const VEC_NVME: u64 = 44
+const VEC_SPURIOUS: u64 = 47
 
 fn word(frame: u64, off: u64) -> u64 {
     return __mmio_read64((frame + off) as *mut u64)
@@ -59,21 +69,30 @@ fn entry(frame: u64, state: u64) {
         report(frame, state, vector)
         // does not return
     }
+    if vector == VEC_SPURIOUS && apic.active(state) {
+        apic.spurious_hit(state)
+        return
+    }
     if vector == VEC_TIMER {
         kstate.add(state, kstate.TICKS, 1)
         // The end-of-interrupt has to go out BEFORE the switch: the
         // controller lets nothing through until it has seen it, and the
         // task that is switched to would run without a timer.
-        eoi(vector)
+        eoi(state, vector)
         sched.on_tick(state)
         return
     }
     if vector == VEC_KEYBOARD {
         kbd.irq(state)
-        eoi(vector)
+        eoi(state, vector)
         return
     }
-    eoi(vector)
+    if vector == VEC_NVME {
+        nvme.irq(state)
+        eoi(state, vector)
+        return
+    }
+    eoi(state, vector)
 }
 
 // Did the fault come out of a PROCESS? Two conditions, and both have to
@@ -92,7 +111,14 @@ fn user_fault(frame: u64, state: u64) -> bool {
 // End of interrupt to the PIC. Written out here and not called from
 // `idt.fi`, because `idt` imports `serial` and `trap` does too -- the
 // module graph stays a tree that way.
-fn eoi(vector: u64) {
+// ROUND K2: which controller gets told depends on which one is running.
+// The local APIC needs one word and no distinction between master and
+// slave -- the two 8259s needed both.
+fn eoi(state: u64, vector: u64) {
+    if apic.active(state) {
+        apic.eoi(state)
+        return
+    }
     if vector >= 40 {
         serial.out8(0xA0 as u16, 0x20 as u8)
     }
