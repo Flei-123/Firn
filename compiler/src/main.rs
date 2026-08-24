@@ -54,6 +54,7 @@ mod parser;
 mod regalloc;
 mod sema;
 mod simd;
+mod simd_a64;
 mod sizeof;
 mod statics;
 mod sema_generic;

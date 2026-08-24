@@ -86,9 +86,9 @@ const FARG_REGS: [&str; 8] = ["d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7"];
 const SYS_REGS: [&str; 6] = ["x0", "x1", "x2", "x3", "x4", "x5"];
 
 /// first operand / result
-const A: &str = "x9";
+pub(crate) const A: &str = "x9";
 /// second operand
-const B: &str = "x10";
+pub(crate) const B: &str = "x10";
 /// third operand
 const C: &str = "x11";
 /// addresses only — never a value
@@ -99,7 +99,7 @@ const T1: &str = "x13";
 const T2: &str = "x14";
 
 /// The 32-bit name of a 64-bit register.
-fn w(r: &str) -> String {
+pub(crate) fn w(r: &str) -> String {
     format!("w{}", &r[1..])
 }
 
@@ -115,6 +115,29 @@ fn rw(r: &str, bits: u32) -> String {
 /// The `s` name of a `d` register (the same register, single precision).
 fn sreg(d: &str) -> String {
     format!("s{}", &d[1..])
+}
+
+/// The `v` name of the same register — that is how a 128-bit value addresses
+/// the argument registers of AAPCS64 (`d3` and `v3` are one register).
+fn vreg(d: &str) -> String {
+    format!("v{}", &d[1..])
+}
+
+/// AAPCS64 gives a stack-passed 128-bit vector sixteen octets AND a sixteen
+/// octet boundary; the outgoing area of this backend counts in words of
+/// eight. Nothing in this repository passes more than eight vector arguments,
+/// so the ninth is REFUSED rather than laid out wrong.
+fn check_v128_stack(f: &Func, args: &[Val], spot: &[Option<&'static str>]) -> Result<(), String> {
+    for (k, a) in args.iter().enumerate() {
+        if spot[k].is_none() && f.val_ty(*a) == FTy::V128 {
+            return Err(format!(
+                "aarch64: a ninth 'v128' argument in '{}' would travel on the stack, \
+                 and this code generator does not lay that out yet (round 91)",
+                f.name
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn align_up(x: u64, a: u64) -> u64 {
@@ -154,8 +177,17 @@ fn layout(f: &Func) -> Frame {
     let n = f.val_types.len();
     let mut slot = vec![0u64; n];
     let mut cursor = 0u64;
-    for s in slot.iter_mut() {
-        cursor += 8;
+    for (idx, s) in slot.iter_mut().enumerate() {
+        // ROUND 91: a `v128` value needs SIXTEEN octets, and it wants them at
+        // a sixteen octet boundary so that `ldr q`/`str q` reach the slot in
+        // ONE instruction (their immediate is scaled by sixteen). `sp` stays
+        // put and `size` is rounded up to sixteen, so an offset that is a
+        // multiple of sixteen stays one.
+        if f.val_types.get(idx) == Some(&FTy::V128) {
+            cursor = align_up(cursor + 16, 16);
+        } else {
+            cursor += 8;
+        }
         *s = cursor;
     }
     let mut alloca_off: Vec<Option<u64>> = vec![None; n];
@@ -271,13 +303,13 @@ fn at_base(e: &mut Emitter, base: &str, off: u64, scale: u64) -> String {
 }
 
 /// The slot of a value as a memory operand.
-fn at(e: &mut Emitter, fr: &Frame, v: Val, scale: u64) -> String {
+pub(crate) fn at(e: &mut Emitter, fr: &Frame, v: Val, scale: u64) -> String {
     let off = fr.off(v);
     at_base(e, "sp", off, scale)
 }
 
 /// Loads the complete 8-byte slot of a value.
-fn load_full(e: &mut Emitter, fr: &Frame, r: &str, v: Val) {
+pub(crate) fn load_full(e: &mut Emitter, fr: &Frame, r: &str, v: Val) {
     let m = at(e, fr, v, 8);
     e.line(&format!("ldr {}, {}", r, m));
 }
@@ -326,7 +358,7 @@ fn load_ext(e: &mut Emitter, fr: &Frame, r: &str, v: Val, ty: FTy, to_bits: u32)
 }
 
 /// Writes a register (full 64 bits) into the slot of the target value.
-fn store_dst(e: &mut Emitter, fr: &Frame, d: Val, r: &str) {
+pub(crate) fn store_dst(e: &mut Emitter, fr: &Frame, d: Val, r: &str) {
     let m = at(e, fr, d, 8);
     e.line(&format!("str {}, {}", r, m));
 }
@@ -370,7 +402,7 @@ fn cmp_imm(e: &mut Emitter, r: &str, bits: u32, v: i64) {
 
 /// A label that appears exactly once in the output. `e.out` only ever grows,
 /// so its length is a running number that costs no state.
-fn uniq(e: &Emitter, tag: &str) -> String {
+pub(crate) fn uniq(e: &Emitter, tag: &str) -> String {
     format!(".La64_{}_{}", tag, e.out.len())
 }
 
@@ -387,7 +419,10 @@ fn place_args(f: &Func, args: &[Val]) -> (Vec<Option<&'static str>>, Vec<Val>) {
     let mut spot: Vec<Option<&'static str>> = Vec::with_capacity(args.len());
     let mut stack: Vec<Val> = Vec::new();
     for a in args {
-        if f.val_ty(*a).is_float() {
+        // ROUND 91: AAPCS64 §6.4 knows ONE floating point/SIMD class. A
+        // 128-bit vector queues up in it exactly like an `f64` — v0-v7, then
+        // the stack.
+        if f.val_ty(*a).is_float() || f.val_ty(*a) == FTy::V128 {
             if fp_i < FARG_REGS.len() {
                 spot.push(Some(FARG_REGS[fp_i]));
                 fp_i += 1;
@@ -421,7 +456,11 @@ fn load_args(e: &mut Emitter, f: &Func, fr: &Frame, args: &[Val], spot: &[Option
     for (k, a) in args.iter().enumerate() {
         if let Some(r) = spot[k] {
             if r.starts_with('d') {
-                load_fp(e, fr, r, *a, f.val_ty(*a) == FTy::F32);
+                if f.val_ty(*a) == FTy::V128 {
+                    crate::simd_a64::vload(e, fr, &vreg(r), *a);
+                } else {
+                    load_fp(e, fr, r, *a, f.val_ty(*a) == FTy::F32);
+                }
             }
         }
     }
@@ -457,6 +496,15 @@ pub fn emit(m: &Module) -> Result<String, String> {
         crate::config::compiler_name(),
         crate::config::VERSION
     ));
+    // ROUND 91: `aese`, `sha256su0`, `crc32cb` and `pmull` are OPTIONAL
+    // extensions of armv8-a, and GNU as refuses them without being told --
+    // "selected processor does not support `aese ...'". Round 87 emitted
+    // `crc32cb` without this line; no test in the suite reached that path,
+    // so nobody found out. The line is the whole fix, and it costs an
+    // unused program nothing: it selects what the ASSEMBLER accepts, not
+    // what the processor has. What the processor has is a run time question
+    // and `__cpu_features()` answers it.
+    e.raw(".arch armv8-a+crypto+crc");
     e.raw(".text");
     e.raw(".globl _start");
     e.raw("_start:");
@@ -467,6 +515,13 @@ pub fn emit(m: &Module) -> Result<String, String> {
     // HOOK gc (ROUND 88): the collector starts itself -- the same rule as on
     // x86-64 (codegen_x86.rs). It stands BEFORE `mov x30, xzr`, because `bl`
     // writes the return address into x30 and would undo the zeroing.
+    // ROUND 91: the auxiliary vector, BEFORE anything else. `sp` still
+    // points at it here; four instructions keep the pointer so that
+    // `__cpu_features()` can read AT_HWCAP later (simd_a64.rs).
+    let auxv = crate::simd_a64::needs_auxv(m);
+    if auxv {
+        crate::simd_a64::emit_auxv_save(&mut e);
+    }
     if crate::gc::runtime_active() {
         e.line(&format!("bl {}", label(crate::gc::FN_INIT)));
     }
@@ -514,6 +569,9 @@ pub fn emit(m: &Module) -> Result<String, String> {
     if crate::statics::any() {
         e.raw(&crate::statics::data_asm());
     }
+    if auxv {
+        e.raw(&crate::simd_a64::auxv_data_asm());
+    }
     e.raw(".section .note.GNU-stack,\"\",%progbits");
     Ok(e.out)
 }
@@ -544,11 +602,16 @@ fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
     // literally the same function.
     let pvals: Vec<Val> = (0..f.params.len() as Val).collect();
     let (spot, _stack) = place_args(f, &pvals);
+    check_v128_stack(f, &pvals, &spot)?;
     let mut stack_i = 0usize;
     for (i, _t) in f.params.iter().enumerate() {
         match spot[i] {
             Some(r) if r.starts_with('d') => {
-                store_fp(e, &fr, i as Val, r, f.params[i] == FTy::F32);
+                if f.params[i] == FTy::V128 {
+                    crate::simd_a64::vstore(e, &fr, i as Val, &vreg(r));
+                } else {
+                    store_fp(e, &fr, i as Val, r, f.params[i] == FTy::F32);
+                }
             }
             Some(r) => store_dst(e, &fr, i as Val, r),
             None => {
@@ -622,7 +685,10 @@ fn emit_block(
         }
         Term::Ret(v) => {
             if let Some(v) = v {
-                if f.ret.is_float() {
+                if f.ret == FTy::V128 {
+                    // AAPCS64 hands a 128-bit vector back in v0.
+                    crate::simd_a64::vload(e, fr, "v0", *v);
+                } else if f.ret.is_float() {
                     load_fp(e, fr, "d0", *v, f.ret == FTy::F32);
                 } else {
                     load_full(e, fr, "x0", *v);
@@ -908,6 +974,11 @@ fn emit_inst(
         }
         Op::Load { addr } | Op::MmioLoad { addr } => {
             let d = i.dst.ok_or("internal error: load without target")?;
+            // ROUND 91: sixteen octets through a pointer out of the program.
+            if ty == FTy::V128 {
+                crate::simd_a64::emit_ptr_load(e, fr, d, *addr);
+                return Ok(());
+            }
             load_full(e, fr, B, *addr);
             let bits = ty.bits().max(8);
             match bits {
@@ -919,6 +990,10 @@ fn emit_inst(
             store_dst(e, fr, d, A);
         }
         Op::Store { addr, val } | Op::MmioStore { addr, val } => {
+            if ty == FTy::V128 {
+                crate::simd_a64::emit_ptr_store(e, fr, *addr, *val);
+                return Ok(());
+            }
             load_full(e, fr, B, *addr);
             load_full(e, fr, A, *val);
             let bits = ty.bits().max(8);
@@ -938,10 +1013,13 @@ fn emit_inst(
         }
         Op::Call { name, args } => {
             let (spot, _stack) = place_args(f, args);
+            check_v128_stack(f, args, &spot)?;
             load_args(e, f, fr, args, &spot);
             e.line(&format!("bl {}", label(name)));
             if let Some(d) = i.dst {
-                if ty.is_float() {
+                if ty == FTy::V128 {
+                    crate::simd_a64::vstore(e, fr, d, "v0");
+                } else if ty.is_float() {
                     store_fp(e, fr, d, "d0", ty == FTy::F32);
                 } else {
                     store_dst(e, fr, d, "x0");
@@ -950,13 +1028,16 @@ fn emit_inst(
         }
         Op::CallIndirect { target, args } => {
             let (spot, _stack) = place_args(f, args);
+            check_v128_stack(f, args, &spot)?;
             load_args(e, f, fr, args, &spot);
             // x9 is no argument register — the target may be loaded last
             // without destroying anything that is already in place.
             load_full(e, fr, A, *target);
             e.line(&format!("blr {}", A));
             if let Some(d) = i.dst {
-                if ty.is_float() {
+                if ty == FTy::V128 {
+                    crate::simd_a64::vstore(e, fr, d, "v0");
+                } else if ty.is_float() {
                     store_fp(e, fr, d, "d0", ty == FTy::F32);
                 } else {
                     store_dst(e, fr, d, "x0");
@@ -1140,73 +1221,19 @@ fn emit_inst(
             crate::panic_rt_a64::emit_wrap_sat(e, *kind, *op, ty, site)?;
             store_dst(e, fr, d, A);
         }
-        // ROUND 82 on ROUND 80, corrected in ROUND 87.
+        // ROUND 82 on ROUND 80, corrected in ROUND 87, FINISHED IN ROUND 91.
         //
-        // The vector instructions of round 82 exist for x86-64 only; aarch64
-        // has its counterparts (`aese`/`aesmc`, `sha256h`) and they are not
-        // emitted yet. Refusing them is right.
+        // Round 82 gave the language `v128` and 42 intrinsics and wrote them
+        // for x86-64. Round 80's code generator refused every one of them,
+        // which made `lib/std/crypto/accel.fi` -- and with it the whole
+        // crypto library -- uncompilable for this machine: `tests/1613_
+        // crypto.fi` was the LAST case of `tools/aarch64/run.sh` that
+        // differed between the two machines.
         //
-        // BUT ROUND 87 FOUND THAT THE REFUSAL WENT TOO FAR, and the message
-        // itself said something that was not true: "the scalar path of
-        // lib/std/crypto works on both machines". It did not. `sha256_new()`
-        // asks `__cpu_features()` ONCE, unconditionally, to decide which path
-        // to take -- so the question alone made the WHOLE crypto library
-        // uncompilable for aarch64. Measured: tests/1613_crypto.fi did not
-        // get through --target=aarch64-linux at all.
-        //
-        // `__cpu_features()` is not a vector instruction; it is a QUESTION
-        // about the machine. On aarch64 the honest answer today is "none of
-        // the bits this compiler knows how to use", and that answer is zero.
-        // Every dispatch in lib/std/crypto then takes the scalar path, which
-        // is exactly what round 82 promised.
-        //
-        // That is NOT the whole repair, and round 87 says so rather than
-        // claiming it: lib/std/crypto/accel.fi still MENTIONS `v128`, and a
-        // mention is enough to stop this code generator. tests/1613_crypto.fi
-        // therefore still does not compile for aarch64 -- it now fails on
-        // `Load` instead of on `CpuFeatures`. What compiles now is every
-        // program that only ASKS what the machine can do (lib/std/cpu.fi),
-        // and that was uncompilable before for no reason at all.
-        //
-        // The two CRC-32 intrinsics get their real instruction: SSE 4.2's
-        // `crc32` computes the CASTAGNOLI polynomial, and A64 has it as
-        // `crc32cb`/`crc32cx`. Same polynomial, same result -- so this is
-        // not an approximation but the counterpart.
-        Op::Simd { kind, args, .. } => match kind {
-            crate::simd::SimdKind::CpuFeatures => {
-                let d = i.dst.ok_or("internal error: cpu_features without target")?;
-                e.line("// __cpu_features(): aarch64 knows no accelerated path here yet");
-                imm_into(e, A, 0);
-                store_dst(e, fr, d, A);
-            }
-            crate::simd::SimdKind::Crc32U8 => {
-                let d = i.dst.ok_or("internal error: crc32_u8 without target")?;
-                load_full(e, fr, A, args[0]);
-                load_full(e, fr, B, args[1]);
-                e.line(&format!("crc32cb {}, {}, {}", w(A), w(A), w(B)));
-                store_dst(e, fr, d, A);
-            }
-            crate::simd::SimdKind::Crc32U64 => {
-                let d = i.dst.ok_or("internal error: crc32_u64 without target")?;
-                load_full(e, fr, A, args[0]);
-                load_full(e, fr, B, args[1]);
-                e.line(&format!("crc32cx {}, {}, {}", w(A), w(A), B));
-                store_dst(e, fr, d, A);
-            }
-            _ => {
-                return Err(format!(
-                    "--target=aarch64-linux cannot emit the vector instruction {:?} yet. \
-                     Round 82 built the 42 intrinsics for x86-64; aarch64 has counterparts \
-                     (aese/aesmc for AES, sha256h/sha256h2 for SHA-256) but no 'v128' value \
-                     model in this code generator yet, so a program that MENTIONS one of \
-                     them does not compile here, even where it would not execute it. \
-                     __cpu_features() answers 0 on this machine, so every dispatch in \
-                     lib/std/crypto picks its scalar path -- but lib/std/crypto/accel.fi \
-                     itself still has to be compilable, and it is not. docs/ROUND87.md 5.",
-                    kind
-                ));
-            }
-        },
+        // `simd_a64.rs` is the other half. It stands to this file as
+        // `simd.rs` stands to `codegen_x86.rs`, and this match is exhaustive:
+        // there is no vector instruction left that this backend refuses.
+        Op::Simd { .. } => crate::simd_a64::emit(e, fr, i)?,
     }
     Ok(())
 }
