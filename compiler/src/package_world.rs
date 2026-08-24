@@ -55,19 +55,27 @@ pub fn absolute(path: &str, cwd: &str) -> String {
     }
 }
 
-/// The path as it goes into the DEBUG INFORMATION of the artifact
-/// (round 93). A path that lies inside the working directory becomes
-/// relative to it; anything else stays what it was.
+/// The spelling under which a source file appears IN THIS BUILD
+/// (round 93). A path inside the working directory becomes relative to it,
+/// anything else stays what it was.
 ///
-/// WHY: `.file` directives end up in `.debug_line` of the binary. The
-/// module search of a package build hands out ABSOLUTE paths for the
-/// dependencies (they are computed from `cwd`), so the artifact carried the
-/// name of the checkout directory — and two machines with different
-/// checkout paths could not produce the same octets, no matter how equal
-/// their sources were. Relative to the working directory the name is the
-/// same on both, and a path outside stays visible instead of turning into
-/// a chain of `..`.
-pub fn debug_path(path: &str, cwd: &str) -> String {
+/// WHY, measured on `demos/packages/app`: the module search of a package
+/// build hands out ABSOLUTE paths for every dependency — they are computed
+/// from `cwd` in this very file. Those paths do not stay inside the
+/// compiler. They end up
+///
+///   * in `.file` directives, hence in `.debug_line` of the artifact, and
+///   * in the message table of the checked arithmetic (round 72), hence in
+///     `.rodata` — that is TEXT THE PROGRAM PRINTS: "panic: integer
+///     overflow in 'i32 * i32' at /root/…/firn/demos/packages/geo/src/
+///     geo.fi:16:12".
+///
+/// So the artifact carried the name of the checkout directory twice over,
+/// and two machines could not produce the same octets however equal their
+/// sources were. Relative to the working directory the name is the same on
+/// both machines; a path OUTSIDE the working directory stays visible
+/// instead of turning into a chain of `..`.
+pub fn build_path(path: &str, cwd: &str) -> String {
     let abs = absolute(path, cwd);
     if package::read_within(&abs, cwd) {
         package::relative(cwd, &abs)
@@ -477,16 +485,16 @@ mod tests {
     }
 
     #[test]
-    fn debug_paths_do_not_name_the_machine() {
-        assert_eq!(debug_path("/w/x/demos/a.fi", "/w/x"), "demos/a.fi");
-        assert_eq!(debug_path("demos/a.fi", "/w/x"), "demos/a.fi");
-        assert_eq!(debug_path("/w/x", "/w/x"), ".");
+    fn build_paths_do_not_name_the_machine() {
+        assert_eq!(build_path("/w/x/demos/a.fi", "/w/x"), "demos/a.fi");
+        assert_eq!(build_path("demos/a.fi", "/w/x"), "demos/a.fi");
+        assert_eq!(build_path("/w/x", "/w/x"), ".");
         // Outside the working directory: unchanged, and NOT a chain of '..'.
-        assert_eq!(debug_path("/usr/lib/firn/std.fi", "/w/x"), "/usr/lib/firn/std.fi");
+        assert_eq!(build_path("/usr/lib/firn/std.fi", "/w/x"), "/usr/lib/firn/std.fi");
         // The same source under two checkouts gives the same name.
         assert_eq!(
-            debug_path("/home/a/firn/demos/packages/geo/src/geo.fi", "/home/a/firn"),
-            debug_path("/tmp/b/firn/demos/packages/geo/src/geo.fi", "/tmp/b/firn")
+            build_path("/home/a/firn/demos/packages/geo/src/geo.fi", "/home/a/firn"),
+            build_path("/tmp/b/firn/demos/packages/geo/src/geo.fi", "/tmp/b/firn")
         );
     }
 

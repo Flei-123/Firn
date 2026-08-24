@@ -552,20 +552,12 @@ fn run(opts: &Options) -> i32 {
         dg.add_file(&f.path.display().to_string(), &f.src);
     }
     // Line table for .debug_line: instruction-exact only without the optimizer.
-    // ROUND 93 (reproducibility, ACCEPTANCE item 5): the file names of the
-    // debug information are written RELATIVE TO THE WORKING DIRECTORY. They
-    // land in `.debug_line` of the artifact, and the module search of a
-    // package build delivers ABSOLUTE paths for every dependency
-    // (`package_world` computes them from `cwd`) — measured on
-    // `demos/packages/app`: four of six `.file` entries carried
-    // `/root/.../firn/...`. That made the binary depend on where the
-    // checkout sits, which is exactly what item 5 forbids.
-    let cwd_for_debug = package_world::cwd();
+    // The file names come out of `modules::resolve` and are, since round 93,
+    // already relative to the working directory
+    // (`package_world::build_path`) — the artifact must not name the
+    // machine it was built on.
     dwarf::reset(
-        files
-            .iter()
-            .map(|f| package_world::debug_path(&f.path.display().to_string(), &cwd_for_debug))
-            .collect(),
+        files.iter().map(|f| f.path.display().to_string()).collect(),
         !opts.optimize,
     );
 
