@@ -8,7 +8,11 @@
 #   2. Every error situation (private module, foreign package, cycle, broken
 #      manifest, name conflict) is recognised -- exit code 2 and a
 #      message that names the reason.
-#   3. `firnc0` (Rust) and `firnc1` (Firn) behave THE SAME: every case
+#   3. ROUND 93: the lock file `firn.lock` -- its checksums are the ones
+#      of coreutils' `sha256sum`, both compilers write the same octets,
+#      `--locked` refuses every deviation, and the version wish of a
+#      `needs` line is resolved the same way in both.
+#   4. `firnc0` (Rust) and `firnc1` (Firn) behave THE SAME: every case
 #      runs through BOTH compilers, and their messages are compared octet for
 #      octet. A package system that is only right in one of the two
 #      compilers would be none.
@@ -392,6 +396,251 @@ fi
 check "--package together with a source file is rejected"
 beide beides --package demos/packages/app tests/110_module.fi -o "$WORK/f_beides.bin"
 expect_error beides "--package and an input file are mutually exclusive"
+
+
+# =========================================================================
+# ROUND 93: the lock file, the version wish, and what they promise
+# =========================================================================
+
+# The checksum of one package, computed with coreutils and nothing else.
+# The same stream `lock.rs` hashes: per file `key \n length \n content \n`,
+# sorted by key, the manifest among them. A third implementation of the
+# format -- if this one and the two compilers agree, the format is not
+# whatever the compiler happens to do.
+sum_pkg() {
+    local d=$1 list f
+    list=$( (cd "$d" && printf 'firn.package\n' && find . -name '*.fi' -type f \
+             | sed 's|^\./||') | LC_ALL=C sort )
+    ( cd "$d" || exit 1
+      for f in $list; do
+          printf '%s\n%s\n' "$f" "$(stat -c%s "$f")"
+          cat "$f"
+          printf '\n'
+      done ) | sha256sum | cut -d' ' -f1
+}
+
+# --- 22: both compilers write the same lock file --------------------------
+
+check "--lock writes the same firn.lock in both compilers"
+P=$(kopie l_lock)
+rm -f "$P/app/firn.lock" "$WORK/lock.0" "$WORK/lock.1"
+"$FIRNC" --package "$P/app" -o "$WORK/l0.bin" --lock > "$WORK/l0.log" 2>&1 \
+    && cp "$P/app/firn.lock" "$WORK/lock.0"
+rm -f "$P/app/firn.lock"
+"$FC1" --package "$P/app" -o "$WORK/l1.bin" --lock > "$WORK/l1.log" 2>&1 \
+    && cp "$P/app/firn.lock" "$WORK/lock.1"
+if [ ! -f "$WORK/lock.0" ] || [ ! -f "$WORK/lock.1" ]; then
+    bad "no lock file was written" "$(head -3 "$WORK/l0.log")" "$(head -3 "$WORK/l1.log")"
+elif ! cmp -s "$WORK/lock.0" "$WORK/lock.1"; then
+    bad "the two lock files differ" "$(diff "$WORK/lock.0" "$WORK/lock.1" | head -4)"
+elif [ "$(head -1 "$WORK/lock.0")" != "lock 1" ]; then
+    bad "the first line is '$(head -1 "$WORK/lock.0")', expected 'lock 1'"
+else
+    good
+fi
+
+# --- 23: the checksums are the ones of sha256sum --------------------------
+
+check "the checksums are the ones of coreutils' sha256sum"
+if [ ! -f "$WORK/lock.0" ]; then
+    bad "no lock file out of case 22"
+else
+    fault=""
+    for pk in app geo text; do
+        want=$(sum_pkg "$P/$pk")
+        have=$(awk -v n="$pk" '$1=="package" && $2==n {print $5}' "$WORK/lock.0")
+        [ "$want" = "$have" ] || fault="$fault $pk($have != $want)"
+    done
+    tot_have=$(awk '$1=="total" {print $2}' "$WORK/lock.0")
+    tot_want=$(grep -v '^total ' "$WORK/lock.0" | sha256sum | cut -d' ' -f1)
+    [ "$tot_have" = "$tot_want" ] || fault="$fault total($tot_have != $tot_want)"
+    # `outside` has to be the checksum of the empty stream here: the demo
+    # project uses no module out of $FIRNLIB.
+    out_have=$(awk '$1=="outside" {print $2" "$3}' "$WORK/lock.0")
+    empty=$(printf '' | sha256sum | cut -d' ' -f1)
+    [ "$out_have" = "0 $empty" ] || fault="$fault outside($out_have)"
+    if [ -n "$fault" ]; then
+        bad "$fault"
+    else
+        good
+    fi
+fi
+
+# --- 24: --locked builds when the lock file fits --------------------------
+
+check "--locked builds when the lock file fits"
+cp "$WORK/lock.0" "$P/app/firn.lock"
+beide lockok --package "$P/app" -o "$WORK/lockok.bin" --locked
+if [ "$(cat "$WORK/lockok.0.rc")" != 0 ] || [ "$(cat "$WORK/lockok.1.rc")" != 0 ]; then
+    bad "exit $(cat "$WORK/lockok.0.rc")/$(cat "$WORK/lockok.1.rc")" \
+        "$(head -3 "$WORK/lockok.0.err")" "$(head -3 "$WORK/lockok.1.err")"
+elif [ "$("$WORK/lockok.bin")" != "12 14 3" ]; then
+    bad "the program does not print '12 14 3'"
+else
+    good
+fi
+
+# --- 25: --locked refuses a changed source file ---------------------------
+#
+# The message has to name the LINE of the lock file and both checksums --
+# a "does not fit" without a place is of no use to anybody.
+
+check "--locked refuses a changed source file"
+printf '\n// one more line\n' >> "$P/app/src/help.fi"
+beide locknew --package "$P/app" -o "$WORK/locknew.bin" --locked
+expect_error locknew "the lock file does not match the sources"
+
+check "and the message names the line and both checksums"
+if grep -q "^note: line 3 of the file:  'package app 0.1.0 \." "$WORK/locknew.0.err" \
+   && grep -q "^note: line 3 of the build: 'package app 0.1.0 \." "$WORK/locknew.0.err"; then
+    good
+else
+    bad "message without the two note lines" "$(cat "$WORK/locknew.0.err")"
+fi
+# put the file back
+P2=$(kopie l_lock2)
+cp "$WORK/lock.0" "$P2/app/firn.lock"
+
+# --- 26: --locked without a lock file ------------------------------------
+
+check "--locked without a lock file is an error"
+P3=$(kopie l_nolock)
+rm -f "$P3/app/firn.lock"
+beide nolock --package "$P3/app" -o "$WORK/nolock.bin" --locked
+expect_error nolock "the lock file is missing"
+
+# --- 27: a lock file edited by hand --------------------------------------
+#
+# The total checksum is over the lines above it, so an edited line is caught
+# even when the sources did not change at all.
+
+check "a lock file edited by hand is caught"
+P4=$(kopie l_hand)
+sed 's/^total ./total 0/' "$WORK/lock.0" > "$P4/app/firn.lock"
+beide handlock --package "$P4/app" -o "$WORK/handlock.bin" --locked
+expect_error handlock "the lock file does not match the sources"
+
+# --- 28: --lock/--locked only together with --package --------------------
+
+check "--locked without --package is rejected"
+beide lockalone tests/110_module.fi -o "$WORK/lockalone.bin" --locked
+expect_error lockalone "--locked works only together with --package"
+
+check "--lock without --package is rejected"
+beide lockalone2 tests/110_module.fi -o "$WORK/lockalone2.bin" --lock
+expect_error lockalone2 "--lock works only together with --package"
+
+# --- 29: a version wish that is met --------------------------------------
+
+check "a version wish that is met changes nothing"
+P5=$(kopie l_wish)
+sed -i 's|^needs    geo   ../geo$|needs    geo   ../geo 0.2.0|' "$P5/app/firn.package"
+"$FIRNC" --package "$P5/app" -o "$WORK/wish0.bin" > "$WORK/wish0.log" 2>&1
+w0=$?
+"$FC1" --package "$P5/app" -o "$WORK/wish1.bin" >> "$WORK/wish0.log" 2>&1
+w1=$?
+if [ "$w0" -ne 0 ] || [ "$w1" -ne 0 ]; then
+    bad "exit $w0/$w1" "$(head -3 "$WORK/wish0.log")"
+elif [ "$("$WORK/wish0.bin")" != "12 14 3" ] || [ "$("$WORK/wish1.bin")" != "12 14 3" ]; then
+    bad "the program does not print '12 14 3'"
+else
+    good
+fi
+
+check "--package-info shows the version wish, in both compilers"
+beide wishinfo --package-info "$P5/app"
+if ! cmp -s "$WORK/wishinfo.0.out" "$WORK/wishinfo.1.out"; then
+    bad "the reports differ" "$(diff "$WORK/wishinfo.0.out" "$WORK/wishinfo.1.out" | head -4)"
+elif ! grep -q ' 0.2.0$' "$WORK/wishinfo.0.out"; then
+    bad "the wish is missing from the report" "$(cat "$WORK/wishinfo.0.out")"
+else
+    good
+fi
+
+# --- 30: a version wish that is not met ----------------------------------
+
+check "a version wish that is not met is an error"
+P6=$(kopie l_wish_bad)
+sed -i 's|^needs    geo   ../geo$|needs    geo   ../geo 0.3.0|' "$P6/app/firn.package"
+beide wishbad --package "$P6/app" -o "$WORK/wishbad.bin" --locked
+expect_error wishbad "dependency 'geo' is version 0.2.0, needed is 0.3.0 or higher with the same first number"
+
+# --- 31: one name, two directories, one version --------------------------
+
+check "the same package out of two directories is an error"
+P7=$(kopie l_twice)
+cp -r "$P7/geo" "$P7/geo2"
+printf 'needs    geo   ../geo2\n' >> "$P7/text/firn.package"
+beide twice --package "$P7/app" -o "$WORK/twice.bin"
+expect_error twice "package 'geo' comes from two directories with version 0.2.0"
+
+# --- 32: the higher version wins -----------------------------------------
+#
+# THE resolution case: two directories offer `geo`, one of them is newer.
+# Both compilers have to pick the same one, the build has to run, and the
+# lock file has to say which directory it was.
+
+check "of two versions the higher one wins, in both compilers"
+P8=$(kopie l_higher)
+cp -r "$P8/geo" "$P8/geo2"
+sed -i 's/^version  0.2.0$/version  0.3.0/' "$P8/geo2/firn.package"
+printf 'needs    geo   ../geo2\n' >> "$P8/text/firn.package"
+sed -i 's|^needs    geo   ../geo$|needs    geo   ../geo 0.2.0|' "$P8/app/firn.package"
+rm -f "$P8/app/firn.lock"
+"$FIRNC" --package "$P8/app" -o "$WORK/high0.bin" --lock > "$WORK/high.log" 2>&1
+h0=$?
+cp "$P8/app/firn.lock" "$WORK/high.lock.0" 2>/dev/null
+rm -f "$P8/app/firn.lock"
+"$FC1" --package "$P8/app" -o "$WORK/high1.bin" --lock >> "$WORK/high.log" 2>&1
+h1=$?
+cp "$P8/app/firn.lock" "$WORK/high.lock.1" 2>/dev/null
+if [ "$h0" -ne 0 ] || [ "$h1" -ne 0 ]; then
+    bad "exit $h0/$h1" "$(head -4 "$WORK/high.log")"
+elif ! cmp -s "$WORK/high.lock.0" "$WORK/high.lock.1"; then
+    bad "the lock files differ" "$(diff "$WORK/high.lock.0" "$WORK/high.lock.1" | head -4)"
+elif ! grep -q '^package geo 0.3.0 ../geo2 ' "$WORK/high.lock.0"; then
+    bad "the lock file does not name geo 0.3.0 out of ../geo2" \
+        "$(grep '^package geo' "$WORK/high.lock.0")"
+elif [ "$("$WORK/high0.bin")" != "12 14 3" ] || [ "$("$WORK/high1.bin")" != "12 14 3" ]; then
+    bad "the program does not print '12 14 3'"
+else
+    good
+fi
+
+check "and a wish the winner cannot meet is a conflict"
+sed -i 's|^needs    geo   ../geo2$|needs    geo   ../geo2 1.0.0|' "$P8/text/firn.package"
+beide conflict --package "$P8/app" -o "$WORK/conflict.bin"
+expect_error conflict "dependency 'geo' is version 0.3.0, needed is 1.0.0 or higher with the same first number"
+
+# --- 33/34: the two ways to get the fourth word wrong --------------------
+
+check "a broken version in 'needs' is reported"
+P9=$(kopie l_wish_broken)
+sed -i 's|^needs    geo   ../geo$|needs    geo   ../geo 0.3|' "$P9/app/firn.package"
+beide wishbroken --package "$P9/app" -o "$WORK/wishbroken.bin"
+expect_error wishbroken "invalid version '0.3' (expected number.number.number)"
+
+check "a fifth word in 'needs' is reported"
+PA=$(kopie l_wish_extra)
+sed -i 's|^needs    geo   ../geo$|needs    geo   ../geo 0.3.0 x|' "$PA/app/firn.package"
+beide wishextra --package "$PA/app" -o "$WORK/wishextra.bin"
+expect_error wishextra "'needs' expects at most one version behind the path"
+
+# --- 35: the lock file that lies in the repository still fits ------------
+#
+# `demos/packages/app/firn.lock` is checked in. If somebody changes the
+# demo project, this case goes red and says so -- which is the point of a
+# lock file.
+
+check "the checked in firn.lock of demos/packages/app still fits"
+beide repolock --package demos/packages/app -o "$WORK/repolock.bin" --locked
+if [ "$(cat "$WORK/repolock.0.rc")" != 0 ] || [ "$(cat "$WORK/repolock.1.rc")" != 0 ]; then
+    bad "exit $(cat "$WORK/repolock.0.rc")/$(cat "$WORK/repolock.1.rc")" \
+        "$(head -4 "$WORK/repolock.0.err")" \
+        "run 'firnc --package demos/packages/app --lock' after a change to the demo"
+else
+    good
+fi
 
 echo
 echo "PACKAGES: $OK passed, $BAD failed"
