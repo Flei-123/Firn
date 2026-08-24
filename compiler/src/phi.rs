@@ -140,6 +140,16 @@ pub(crate) fn eliminate_func(f: &mut Func) -> Result<(), String> {
     if !f.has_phi() {
         return Ok(());
     }
+    // ROUND 92 -- THE LAST GATE. Everything above this line has had its
+    // chance to keep the entry lists in step with the control flow graph;
+    // from here on a wrong list becomes wrong MACHINE CODE, and a wrong
+    // number in a program is the most expensive thing this compiler can
+    // produce. So the invariants are checked once, here, for every function
+    // and in every build -- one predecessor table against a list that is
+    // already in memory. A failure stops the compilation with a message
+    // that names the block instead of shipping a program that computes the
+    // wrong answer.
+    f.verify_phis()?;
 
     let nb = f.blocks.len();
     let mut preds: Vec<Vec<usize>> = vec![Vec::new(); nb];
