@@ -1,0 +1,507 @@
+// demos/kernel/apic.fi -- round K2: the interrupt controller of this century.
+//
+// Round 59 remapped the two 8259 chips and let the PIT tick. Both are
+// from 1981, both talk through single octets on ports, and both have one
+// property that ends every attempt at a second processor: an IRQ line
+// goes to ONE chip, and that chip interrupts ONE processor.
+//
+// The APIC is two devices with one name:
+//
+//   * the LOCAL APIC sits IN the processor, one per core. It takes
+//     interrupts, prioritises them, and has a timer of its own -- which
+//     is why the PIT can go. Its registers lie in memory at 0xFEE00000,
+//     not on ports.
+//   * the I/O APIC sits on the board and is the thing the device lines
+//     really hang on. For every line there is a REDIRECTION ENTRY that
+//     says: which vector, which processor, edge or level. A line without
+//     an entry delivers nothing -- and that is the counter-check of this
+//     file.
+//
+// THE PART THAT HAS TO BE MEASURED, not assumed: how fast the local
+// timer counts. Nobody knows. On real hardware it is the bus clock, under
+// QEMU it is the host clock divided by the divisor. So it is CALIBRATED
+// against the one clock whose frequency is written down in the
+// architecture -- the PIT at 1193182 Hz. Channel 2 of the PIT is used for
+// it, the one whose output can be READ on port 0x61 instead of raising an
+// interrupt; the counter runs a known 10 ms, and what the local timer
+// counted down in that span is its frequency.
+//
+// WHY THE ADDRESSES NEED A PAGE TABLE, AND WHY IT IS THE ONE THE KERNEL
+// ALREADY HAS. `boot.s` maps the first gigabyte with 2 MiB pages.
+// 0xFEE00000 is not in the first gigabyte, and neither is the I/O APIC,
+// and neither is anything the firmware assigned to a PCI device.
+//
+// The obvious answer -- hang a second page directory into the fourth
+// slot of the PDPT and map 3..4 GiB there -- was written first and was
+// WRONG, and the way it failed is worth writing down. A process has an
+// address space of its own (`proc.space_build`); it inherits exactly ONE
+// thing from the kernel, entry 0 of the kernel PDPT, which is the page
+// directory of the first gigabyte. Everything else of the kernel's own
+// tables is not in a process address space. So the mapping worked --
+// until the first interrupt arrived while a process was running and the
+// handler tried to write the end-of-interrupt:
+//
+//     *** EXCEPTION 14 #PF  err=0x2  cr2=0xfee000b0
+//
+// Device memory therefore goes where the kernel already shares memory: it
+// is ALIASED into the top of the identity mapped gigabyte. The last eight
+// 2 MiB slots of the kernel page directory cover 0x3F000000..0x3FFFFFFF,
+// far above the RAM this machine has, and they are repointed at the
+// physical addresses of the devices. Uncached, because a device register
+// answered out of the cache is a register that is read once and then
+// never again. And shared by every address space for free, because that
+// page directory is the one thing every address space shares.
+
+import serial
+import kstate
+import pci
+
+export {
+    present, init, active, hz, id,
+    eoi, timer_stop, map_device, window_slots, lapic_phys,
+    route, mask_gsi, ioapic_entries, pic_off,
+    spurious, spurious_hit, tsc, tsc_hz, VEC_SPURIOUS
+}
+
+// ------------------------------------------------ the K2 scalar page
+
+// Offsets in `pci.K2_SCALARS`. 0x000 belongs to pci.fi, 0x100 upwards to
+// the disk driver.
+const S_ACTIVE: u64 = 0x008 // 1 = the APIC is the controller now
+const S_LAPIC: u64 = 0x010 // its base address
+const S_IOAPIC: u64 = 0x018
+const S_HZ: u64 = 0x020 // measured counts per second of the local timer
+const S_SPUR: u64 = 0x028 // spurious interrupts seen
+const S_LAPIC_PHYS: u64 = 0x030 // its address on the BUS, which is not its address
+const S_DIVISOR: u64 = 0x038 // what was written into the initial count
+const S_TSCHZ: u64 = 0x040 // cycles of the processor's own counter per second
+
+
+// ----------------------------------------------------------- registers
+
+const MSR_APIC_BASE: u64 = 0x1B
+const APIC_BASE_ENABLE: u64 = 0x800
+const IOAPIC_DEFAULT: u64 = 0xFEC00000
+
+const R_ID: u64 = 0x020
+const R_VERSION: u64 = 0x030
+const R_TPR: u64 = 0x080
+const R_EOI: u64 = 0x0B0
+const R_LDR: u64 = 0x0D0
+const R_DFR: u64 = 0x0E0
+const R_SVR: u64 = 0x0F0
+const R_ESR: u64 = 0x280
+const R_LVT_TIMER: u64 = 0x320
+const R_LVT_LINT0: u64 = 0x350
+const R_LVT_LINT1: u64 = 0x360
+const R_LVT_ERROR: u64 = 0x370
+const R_TIMER_INIT: u64 = 0x380
+const R_TIMER_CUR: u64 = 0x390
+const R_TIMER_DIV: u64 = 0x3E0
+
+const LVT_MASKED: u64 = 0x10000
+const LVT_PERIODIC: u64 = 0x20000
+
+// Vector 47 is the last one `isr.s` provides, and its low four bits are
+// all ones -- which the old P6 cores demanded of a spurious vector. It
+// costs nothing to keep to that.
+const VEC_SPURIOUS: u64 = 47
+const VEC_TIMER: u64 = 32
+
+// Divisor 16. The register encodes it in three bits spread over four:
+// 0b0011 = divide by 16.
+const DIV_16: u64 = 0x3
+const DIV_VALUE: u64 = 16
+
+const PAGE_PRESENT: u64 = 1
+const PAGE_WRITE: u64 = 2
+const PAGE_PWT: u64 = 8
+const PAGE_PCD: u64 = 16
+const PAGE_HUGE: u64 = 0x80
+const ADDR_MASK: u64 = 0x000FFFFFFFFFF000
+const WINDOW_BASE: u64 = 0xC0000000
+
+// --------------------------------------------------------------- MSRs
+
+fn wrmsr(index: u64, value: u64) {
+    asm("wrmsr", in("rcx") index, in("rax") value & 0xFFFFFFFF,
+        in("rdx") value >> 32)
+}
+
+fn rdmsr(index: u64) -> u64 {
+    var lo: u64 = 0
+    var hi: u64 = 0
+    asm("rdmsr", in("rcx") index, out("rax") & lo, out("rdx") & hi)
+    return (hi << 32) | (lo & 0xFFFFFFFF)
+}
+
+// --------------------------------------------------------- the window
+
+// Where the alias window lies: the last eight 2 MiB slots of the kernel
+// page directory. 504 * 2 MiB = 0x3F000000, and the machine this kernel
+// runs on has its memory far below that.
+const WIN_SLOTS: u64 = 8
+const WIN_FIRST: u64 = 504
+const WIN_VIRT: u64 = 504 * 0x200000
+const HUGE_SIZE: u64 = 0x200000
+const S_WIN: u64 = 0x080 // eight words: which physical block sits in slot i
+
+// The page directory of the first gigabyte -- the one `boot.s` filled and
+// every process inherits.
+fn kernel_pd(state: u64) -> u64 {
+    var pml4: u64 = kstate.get(state, kstate.KPML4)
+    if pml4 == 0 {
+        pml4 = asm("mov rax, cr3", out("rax")) & ADDR_MASK
+    }
+    let pdpt: u64 = __mmio_read64(pml4 as *mut u64) & ADDR_MASK
+    if pdpt == 0 {
+        return 0
+    }
+    return __mmio_read64(pdpt as *mut u64) & ADDR_MASK
+}
+
+// Makes the 2 MiB block that holds `phys` readable and writable at an
+// address in the first gigabyte, and returns THAT address. Returns 0 when
+// all eight slots are taken -- eight is enough for two APICs and a
+// controller, and a kernel that needs more should say so rather than
+// overwrite a slot somebody is using.
+fn map_device(state: u64, phys: u64) -> u64 {
+    let block: u64 = phys & (~(HUGE_SIZE - 1))
+    let inner: u64 = phys - block
+    var i: u64 = 0
+    while i < WIN_SLOTS {
+        if kstate.get(state, pci.K2_SCALARS + S_WIN + i * 8) == block + 1 {
+            return WIN_VIRT + i * HUGE_SIZE + inner
+        }
+        i = i + 1
+    }
+    let pd: u64 = kernel_pd(state)
+    if pd == 0 {
+        return 0
+    }
+    i = 0
+    while i < WIN_SLOTS {
+        if kstate.get(state, pci.K2_SCALARS + S_WIN + i * 8) == 0 {
+            __mmio_write64((pd + (WIN_FIRST + i) * 8) as *mut u64,
+                block | PAGE_PRESENT | PAGE_WRITE | PAGE_PCD | PAGE_PWT
+                    | PAGE_HUGE)
+            kstate.set(state, pci.K2_SCALARS + S_WIN + i * 8, block + 1)
+            // The processor caches translations; a changed table without
+            // a flush is a table nobody reads.
+            let c: u64 = asm("mov rax, cr3", out("rax"))
+            asm("mov cr3, rax", in("rax") c)
+            return WIN_VIRT + i * HUGE_SIZE + inner
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn window_slots(state: u64) -> u64 {
+    var n: u64 = 0
+    var i: u64 = 0
+    while i < WIN_SLOTS {
+        if kstate.get(state, pci.K2_SCALARS + S_WIN + i * 8) != 0 {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// ---------------------------------------------------- the local APIC
+
+// The address the KERNEL uses to reach the local APIC -- an alias in the
+// first gigabyte, not the address the chip has on the bus.
+fn lapic(state: u64) -> u64 {
+    return kstate.get(state, pci.K2_SCALARS + S_LAPIC)
+}
+
+// The address the DEVICE has to write to when it signals an interrupt by
+// message. A device does not walk page tables; it puts a physical address
+// on the bus. Confusing the two is the classic way to make MSI silently
+// do nothing.
+fn lapic_phys(state: u64) -> u64 {
+    return kstate.get(state, pci.K2_SCALARS + S_LAPIC_PHYS)
+}
+
+fn ioapic(state: u64) -> u64 {
+    return kstate.get(state, pci.K2_SCALARS + S_IOAPIC)
+}
+
+fn active(state: u64) -> bool {
+    return kstate.get(state, pci.K2_SCALARS + S_ACTIVE) != 0
+}
+
+fn hz(state: u64) -> u64 {
+    return kstate.get(state, pci.K2_SCALARS + S_HZ)
+}
+
+fn spurious(state: u64) -> u64 {
+    return kstate.get(state, pci.K2_SCALARS + S_SPUR)
+}
+
+// A spurious interrupt is the local APIC withdrawing an interrupt it had
+// already announced. It is counted and NOT acknowledged -- the controller
+// never started this one, and an end-of-interrupt for it would end the
+// real interrupt underneath.
+fn spurious_hit(state: u64) {
+    kstate.add(state, pci.K2_SCALARS + S_SPUR, 1)
+}
+
+fn lread(base: u64, reg: u64) -> u64 {
+    return __mmio_read32((base + reg) as *mut u32) as u64
+}
+
+fn lwrite(base: u64, reg: u64, v: u64) {
+    __mmio_write32((base + reg) as *mut u32, (v & 0xFFFFFFFF) as u32)
+}
+
+// Does this processor have a local APIC? CPUID leaf 1, bit 9 of edx.
+// Asking is cheap; assuming is what breaks on the machine that has none.
+fn present() -> bool {
+    var d: u64 = 0
+    // `cpuid` writes all four of eax..edx, and rbx is the one register
+    // the language will not hand out (it carries the frame). Saving it
+    // around the instruction inside the template is the honest way --
+    // the alternative would be a promise to the compiler that is false.
+    asm("push rbx\nmov eax, 1\ncpuid\npop rbx",
+        out("rdx") & d, clobber("rax"), clobber("rcx"))
+    return (d & 0x200) != 0
+}
+
+fn id(state: u64) -> u64 {
+    return (lread(lapic(state), R_ID) >> 24) & 0xFF
+}
+
+// -------------------------------------------------------- calibration
+
+// Channel 2 of the PIT, mode 0: the counter runs down once and then
+// raises its output line -- which is not wired to an interrupt but to bit
+// 5 of port 0x61, where it can be read. That makes it the one timer a
+// kernel can use to measure another timer without needing interrupts.
+fn pit_arm() {
+    let counts: u64 = 11932 // 1193182 / 100, rounded: ten milliseconds
+    // Gate of channel 2 on, speaker off (bit 1) -- otherwise a real PC
+    // would beep for ten milliseconds.
+    let port61: u64 = serial.in8(0x61 as u16) as u64
+    serial.out8(0x61 as u16, ((port61 & 0xFC) | 1) as u8)
+    serial.out8(0x43 as u16, 0xB0 as u8) // channel 2, lo/hi, mode 0
+    serial.out8(0x42 as u16, (counts & 0xFF) as u8)
+    serial.out8(0x42 as u16, ((counts >> 8) & 0xFF) as u8)
+}
+
+// True when the counter really ran out. A machine whose channel 2 is not
+// wired to port 0x61 answers `false` here after about a second instead
+// of hanging -- and then the PIC keeps the machine, which is the point of
+// giving up rather than waiting.
+fn pit_wait() -> bool {
+    var guard: u64 = 0
+    while guard < 2000000 {
+        if (serial.in8(0x61 as u16) as u64 & 0x20) != 0 {
+            return true
+        }
+        guard = guard + 1
+    }
+    return false
+}
+
+// How many counts the local timer does in a second. Measured, never
+// assumed: on real hardware this is the bus clock, under QEMU the host
+// clock, and the two differ by more than an order of magnitude.
+fn calibrate(state: u64) -> u64 {
+    let base: u64 = lapic(state)
+    lwrite(base, R_TIMER_DIV, DIV_16)
+    lwrite(base, R_LVT_TIMER, LVT_MASKED)
+    // Both counters are read across the SAME 10 ms window: the local
+    // timer, which this kernel is about to run on, and the processor's
+    // own cycle counter, which every measurement in this round is given
+    // in. Two clocks calibrated against one third clock whose frequency
+    // is written down in the architecture.
+    pit_arm()
+    lwrite(base, R_TIMER_INIT, 0xFFFFFFFF)
+    let t0: u64 = tsc()
+    let done: bool = pit_wait()
+    let left: u64 = lread(base, R_TIMER_CUR)
+    let t1: u64 = tsc()
+    lwrite(base, R_TIMER_INIT, 0)
+    if !done {
+        return 0 // no PIT, no calibration, no APIC timer
+    }
+    var elapsed: u64 = 0
+    if left <= 0xFFFFFFFF {
+        elapsed = 0xFFFFFFFF - left
+    }
+    let per_sec: u64 = elapsed * 100
+    kstate.set(state, pci.K2_SCALARS + S_HZ, per_sec)
+    kstate.set(state, pci.K2_SCALARS + S_TSCHZ, (t1 - t0) * 100)
+    return per_sec
+}
+
+// The cycle counter of the processor. Not a clock -- it says nothing
+// about seconds until it has been held against one, which is what
+// `calibrate` does.
+fn tsc() -> u64 {
+    var lo: u64 = 0
+    var hi: u64 = 0
+    asm("rdtsc", out("rax") & lo, out("rdx") & hi)
+    return (hi << 32) | (lo & 0xFFFFFFFF)
+}
+
+fn tsc_hz(state: u64) -> u64 {
+    return kstate.get(state, pci.K2_SCALARS + S_TSCHZ)
+}
+
+// ------------------------------------------------------------- bring-up
+
+// Returns true when the APIC is the controller from here on. Everything
+// that can go wrong is answered with false and the PIC keeps running --
+// a kernel that switches off the working controller before the new one
+// answers has no way back.
+fn init(state: u64, want_hz: u64) -> bool {
+    if !present() {
+        return false
+    }
+    var base_msr: u64 = rdmsr(MSR_APIC_BASE)
+    if (base_msr & APIC_BASE_ENABLE) == 0 {
+        base_msr = base_msr | APIC_BASE_ENABLE
+        wrmsr(MSR_APIC_BASE, base_msr)
+    }
+    let phys: u64 = base_msr & 0xFFFFF000
+    if phys == 0 {
+        return false
+    }
+    let base: u64 = map_device(state, phys)
+    let io: u64 = map_device(state, IOAPIC_DEFAULT)
+    if base == 0 || io == 0 {
+        return false
+    }
+    kstate.set(state, pci.K2_SCALARS + S_LAPIC_PHYS, phys)
+    kstate.set(state, pci.K2_SCALARS + S_LAPIC, base)
+    kstate.set(state, pci.K2_SCALARS + S_IOAPIC, io)
+
+    // A version register that reads as all ones means: nothing answered
+    // at that address. Better to find that out here than in the first
+    // interrupt that never comes.
+    let ver: u64 = lread(base, R_VERSION)
+    if ver == 0xFFFFFFFF || ver == 0 {
+        return false
+    }
+
+    lwrite(base, R_TPR, 0) // no priority is refused
+    lwrite(base, R_DFR, 0xFFFFFFFF) // flat model
+    lwrite(base, R_LDR, 1 << 24) // this processor is logical 1
+    lwrite(base, R_LVT_LINT0, LVT_MASKED)
+    lwrite(base, R_LVT_LINT1, LVT_MASKED)
+    lwrite(base, R_LVT_ERROR, LVT_MASKED)
+    lwrite(base, R_ESR, 0)
+    lwrite(base, R_ESR, 0)
+    // Bit 8 switches the whole local APIC on. Without it nothing here
+    // has any effect at all.
+    lwrite(base, R_SVR, 0x100 | VEC_SPURIOUS)
+
+    let per_sec: u64 = calibrate(state)
+    if per_sec == 0 {
+        return false
+    }
+    kstate.set(state, pci.K2_SCALARS + S_ACTIVE, 1)
+    timer_start(state, want_hz)
+    return true
+}
+
+// The local timer, periodic, on the vector round 59 already gave the
+// timer. Nothing above this file has to learn that the clock changed --
+// which is the point: `sched.on_tick` counts what it counted.
+fn timer_start(state: u64, want_hz: u64) {
+    let base: u64 = lapic(state)
+    var init_count: u64 = hz(state) / want_hz
+    if init_count == 0 {
+        init_count = 1
+    }
+    if init_count > 0xFFFFFFFF {
+        init_count = 0xFFFFFFFF
+    }
+    kstate.set(state, pci.K2_SCALARS + S_DIVISOR, init_count)
+    lwrite(base, R_TIMER_DIV, DIV_16)
+    lwrite(base, R_LVT_TIMER, VEC_TIMER | LVT_PERIODIC)
+    lwrite(base, R_TIMER_INIT, init_count)
+}
+
+// The counter-check of round 59 lives on this: with the timer off the
+// same spin loop has to count exactly zero ticks.
+fn timer_stop(state: u64) {
+    let base: u64 = lapic(state)
+    lwrite(base, R_LVT_TIMER, LVT_MASKED)
+    lwrite(base, R_TIMER_INIT, 0)
+}
+
+// End of interrupt. One word, no port, no distinction between master and
+// slave -- the 8259 needed all three.
+fn eoi(state: u64) {
+    lwrite(lapic(state), R_EOI, 0)
+}
+
+// ---------------------------------------------------------- the I/O APIC
+
+fn ioread(base: u64, reg: u64) -> u64 {
+    __mmio_write32(base as *mut u32, (reg & 0xFF) as u32)
+    return __mmio_read32((base + 0x10) as *mut u32) as u64
+}
+
+fn iowrite(base: u64, reg: u64, v: u64) {
+    __mmio_write32(base as *mut u32, (reg & 0xFF) as u32)
+    __mmio_write32((base + 0x10) as *mut u32, (v & 0xFFFFFFFF) as u32)
+}
+
+// How many lines this I/O APIC has. Read out of it, not guessed: the
+// version register carries the highest entry in bits 16..23.
+fn ioapic_entries(state: u64) -> u64 {
+    let v: u64 = ioread(ioapic(state), 0x01)
+    if v == 0xFFFFFFFF {
+        return 0
+    }
+    return ((v >> 16) & 0xFF) + 1
+}
+
+// One line, one vector, one processor. `level` and `low` are what a PCI
+// interrupt pin needs (level triggered, active low) and what an ISA line
+// must not have (edge, active high) -- a keyboard routed as level would
+// interrupt for ever.
+fn route(state: u64, gsi: u64, vector: u64, dest: u64, level: bool, low: bool) {
+    let base: u64 = ioapic(state)
+    var lo: u64 = vector & 0xFF
+    if low {
+        lo = lo | (1 << 13)
+    }
+    if level {
+        lo = lo | (1 << 15)
+    }
+    // The high word first, and the entry unmasked only afterwards: a line
+    // that fires between the two writes would go to processor zero of an
+    // entry that is not finished.
+    iowrite(base, 0x11 + gsi * 2, (dest & 0xFF) << 24)
+    iowrite(base, 0x10 + gsi * 2, lo)
+}
+
+fn mask_gsi(state: u64, gsi: u64) {
+    let base: u64 = ioapic(state)
+    let lo: u64 = ioread(base, 0x10 + gsi * 2)
+    iowrite(base, 0x10 + gsi * 2, lo | (1 << 16))
+}
+
+// ------------------------------------------------------- the old chips
+
+// Masking both 8259s is what makes the switch real. The write to
+// 0x22/0x23 is the IMCR of the MP specification: it disconnects the
+// interrupt line of the PIC from the processor entirely. QEMU has no
+// IMCR and ignores the write; a real board of the last thirty years does
+// not, and a kernel that skips it gets every interrupt twice there.
+fn pic_off() {
+    serial.out8(0x21 as u16, 0xFF as u8)
+    serial.io_wait()
+    serial.out8(0xA1 as u16, 0xFF as u8)
+    serial.io_wait()
+    serial.out8(0x22 as u16, 0x70 as u8)
+    serial.out8(0x23 as u16, 0x01 as u8)
+}
+

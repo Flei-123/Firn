@@ -1136,6 +1136,21 @@ else
     sed 's/^/        /' "$WORK/optlevels.log" | grep FAIL | head -12
 fi
 
+# ROUND K2. Section 49..52 are taken by the rounds running in parallel
+# (ELF loader, packages, debugger, Unicode); this one takes 53. The rule
+# above still stands: `grep -n 'echo "== ' test.sh` before a number is
+# used.
+echo "== 53. the kernel reads its own machine: PCI, APIC, NVMe over DMA (tools/pci/run.sh, ROUND K2) =="
+bash tools/pci/run.sh > "$WORK/pci.log" 2>&1 && PCIRC=0 || PCIRC=$?
+grep -E '^        bench: ' "$WORK/pci.log" | sed 's/^ */ /'
+grep -E '^PCI: ' "$WORK/pci.log" | sed 's/^/ /'
+if [ "$PCIRC" -eq 0 ]; then
+    ok
+else
+    bad "tools/pci/run.sh failed (see .test-work/pci.log)"
+    grep -E '^  FAIL' "$WORK/pci.log" | head -12 | sed 's/^/   /'
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then
