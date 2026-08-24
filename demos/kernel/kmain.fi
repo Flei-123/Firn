@@ -39,6 +39,7 @@ import proc
 import sys
 import blk
 import fs
+import elf
 
 // Indices in the table out of isr.s.
 const V_DF_STACK: u64 = 52
@@ -54,6 +55,11 @@ const M_NOPREEMPT: u64 = 8192
 const M_NOPROC: u64 = 16384
 const M_NOFS: u64 = 32768
 const M_ATA: u64 = 65536
+// Round K1. The two of them live in `kstate.fi`, because `sys.fi` and
+// `elf.fi` read them too; the names are repeated here so that this file
+// reads like the rest of the list.
+const M_OSUM: u64 = 131072 // mount the drive and start /bin/sh off it
+const M_NOBSS: u64 = 262144 // and do NOT zero what the file leaves open
 
 // The programs in uprog.fi.
 const P_HELLO: u64 = 1
@@ -175,6 +181,10 @@ fn kernel_main(mbi: u64, vectors: u64, state: u64, kernel_end: u64,
 
     // 7e. the same file system on a real disk.
     ata_disk(state)
+
+    // 7f. round K1: a system on that disk. Mount what the host built,
+    //     load /bin/sh out of it, and let it run until it is done.
+    osum(state)
 
     // 8. ring 3, the excursion of round 59.
     ring3(state)
@@ -780,6 +790,11 @@ fn shell(state: u64) {
     var s_none: [u8; 14] = "sh: no script\0"
     var s_in: [u8; 17] = "sh: input bytes=\0"
     var s_out: [u8; 15] = "sh: commands=\0\0"
+    // ROUND K1: with `osum` the shell comes off the disk, and the one
+    // compiled into the kernel would eat the script before it.
+    if (kstate.get(state, kstate.MODE) & M_OSUM) != 0 {
+        return
+    }
     if kstate.get(state, kstate.CONSOLE_LEN) == 0 {
         serial.puts((&s_none[0]) as u64)
         serial.nl()
@@ -793,6 +808,119 @@ fn shell(state: u64) {
     serial.puts((&s_out[0]) as u64)
     serial.dec(code)
     serial.nl()
+}
+
+// ------------------------------------------------------------- osum
+
+// ROUND K1: THE POINT OF THE ROUND, IN ONE FUNCTION.
+//
+// Everything above starts a program the kernel was compiled with. This
+// one starts a program the kernel has never seen: it mounts the drive
+// QEMU was handed, looks up `/bin/sh` in it, reads that file, lays its
+// segments into a fresh address space with the rights the file asks for,
+// and waits for it. What the shell then does -- `ls`, `cat`, `echo` --
+// it does by loading FURTHER files off the same disk through `exec`.
+//
+// The kernel therefore has no list of programs any more. `tools/osum/
+// run.sh` proves that by putting a DIFFERENT file at `/bin/ls` and
+// watching the output change without a line of the kernel changing.
+fn osum(state: u64) {
+    var s_off: [u8; 14] = "osum: skipped\0"
+    var s_no: [u8; 15] = "osum: no drive\0"
+    var s_mount: [u8; 14] = "osum: mount=\0\0"
+    var s_bin: [u8; 12] = "osum: bin \0\0"
+    var s_fail: [u8; 22] = "osum: sh did not load\0"
+    var s_exit: [u8; 16] = "osum: sh exit=\0\0"
+    var s_free: [u8; 20] = "osum: frames_free=\0\0"
+    var s_of: [u8; 5] = " of \0"
+    var p_sh: [u8; 8] = "/bin/sh\0"
+    var p_bin: [u8; 5] = "/bin\0"
+    var a_sh: [u8; 3] = "sh\0"
+
+    if (kstate.get(state, kstate.MODE) & M_OSUM) == 0 {
+        serial.puts((&s_off[0]) as u64)
+        serial.nl()
+        return
+    }
+    if !blk.present(state) {
+        serial.puts((&s_no[0]) as u64)
+        serial.nl()
+        return
+    }
+    blk.use_ata(state, DISK_BLOCKS)
+    let mounted: bool = fs.mount(state)
+    serial.puts((&s_mount[0]) as u64)
+    serial.dec(yes(mounted))
+    serial.nl()
+    if !mounted {
+        return
+    }
+    list_dir(state, (&p_bin[0]) as u64, (&s_bin[0]) as u64)
+
+    // argv[0] is the name of the program, the way every system has done
+    // it since 1975 -- and the way `/bin/sh` finds out what it is called.
+    let abuf: u64 = state + kstate.EARG_OFF
+    var k: u64 = 0
+    while k < 3 {
+        kstate.set8(abuf + k, a_sh[k as usize])
+        k = k + 1
+    }
+    let before: u64 = mem.frames_free(state)
+    let t: u64 = elf.spawn(state, (&p_sh[0]) as u64, abuf, 1, 2)
+    if t == 0 {
+        serial.puts((&s_fail[0]) as u64)
+        serial.nl()
+        elf.say_reason(kstate.get(state, kstate.ELF_ERR))
+        return
+    }
+    // No line of its own for the pid: `elf.spawn` printed it BEFORE the
+    // task became runnable (`elf: start ...`), and anything this task
+    // prints afterwards races with the shell, which is already running.
+    // Round K1 had that race in the measurement for a while -- the two
+    // compilers produced the same system and different transcripts.
+    let code: u64 = wait_long(state, t)
+    serial.puts((&s_exit[0]) as u64)
+    serial.dec(code)
+    serial.nl()
+    // Every frame the image took has to come back with the process. The
+    // guard compares these two numbers -- a loader that leaked a page per
+    // program would show up here and nowhere else.
+    serial.puts((&s_free[0]) as u64)
+    serial.dec(mem.frames_free(state))
+    serial.puts((&s_of[0]) as u64)
+    serial.dec(before)
+    serial.nl()
+}
+
+// `wait_for` gives a process twenty seconds, which is right for a program
+// that only computes. A shell waits for a person. This one waits ten
+// times as long; what ends the run is the console going quiet
+// (`sys.KEY_IDLE`), not this bound.
+fn wait_long(state: u64, i: u64) -> u64 {
+    if i == 0 {
+        return 0xFFFFFFFFFFFFFFFF
+    }
+    var s_deep: [u8; 22] = "osum: kstack deepest=\0"
+    var s_of: [u8; 5] = " of \0"
+    var rounds: u64 = 0
+    while rounds < 20000 {
+        if sched.tget(state, i, sched.T_STATE) == sched.S_ZOMBIE {
+            let code: u64 = sched.tget(state, i, sched.T_EXIT)
+            // Before the stack goes back to the frame allocator: how much
+            // of it was ever touched. The deepest system call of this
+            // round runs on exactly this stack.
+            serial.puts((&s_deep[0]) as u64)
+            serial.dec(sched.stack_high(state, i))
+            serial.puts((&s_of[0]) as u64)
+            serial.dec(sched.KSTACK_FRAMES * mem.FRAME_SIZE)
+            serial.nl()
+            proc.reap(state, i)
+            return code
+        }
+        sched.sleep_ticks(state, 1)
+        rounds = rounds + 1
+    }
+    return 0xFFFFFFFFFFFFFFFE
 }
 
 // ---------------------------------------------------------- a real disk
@@ -815,7 +943,10 @@ fn ata_disk(state: u64) {
     var p_root: [u8; 2] = "/\0"
     var text: [u8; 30] = "ata disk holds this line r62\n\0"
 
-    if (kstate.get(state, kstate.MODE) & M_ATA) == 0 {
+    // ROUND K1: `ata_disk` FORMATS the drive. With `osum` the drive
+    // carries the file system the host built, and formatting it would
+    // throw the whole userland away before the first program runs.
+    if (kstate.get(state, kstate.MODE) & (M_ATA | M_OSUM)) != M_ATA {
         serial.puts((&s_off[0]) as u64)
         serial.nl()
         return
@@ -855,6 +986,12 @@ fn keyboard(state: u64) {
     var s_none: [u8; 7] = "(none)\0"
     let mode: u64 = kstate.get(state, kstate.MODE)
     if (mode & 256) != 0 || (mode & 1024) != 0 {
+        return
+    }
+    // ROUND K1: with `osum` the keys belong to the shell, not to this
+    // demonstration -- and waiting 2.5 seconds for four of them here
+    // would only delay it.
+    if (mode & M_OSUM) != 0 {
         return
     }
     serial.puts((&s_ready[0]) as u64)
@@ -976,6 +1113,14 @@ fn mode_of(cmd: u64) -> u64 {
         if a == 100 && b == 102 {
             mode = 4 // df
         }
+    }
+    var osumw: [u8; 5] = "osum\0"
+    var nobss: [u8; 6] = "nobss\0"
+    if find(cmd, (&osumw[0]) as u64, 4) != 0 {
+        mode = mode | M_OSUM
+    }
+    if find(cmd, (&nobss[0]) as u64, 5) != 0 {
+        mode = mode | M_NOBSS
     }
     if find(cmd, (&nokbd[0]) as u64, 5) != 0 {
         mode = mode | 256
