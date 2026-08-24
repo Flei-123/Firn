@@ -42,11 +42,16 @@ pub const MANIFEST: &str = "firn.package";
 /// How many directory levels the upward search covers at most.
 pub const SUCHTIEFE: usize = 64;
 
-/// One dependency: name (becomes the import prefix) and local path.
+/// One dependency: name (becomes the import prefix), local path and the
+/// version WISH. `want` empty means: any version will do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dependency {
     pub name: String,
     pub path: String,
+    /// Round 93: `needs geo ../geo 0.2.0` — empty when the line has no
+    /// fourth word. A wish is met by the SAME first number and at least
+    /// this version (see `version_at_least`).
+    pub want: String,
     pub line: u32,
 }
 
@@ -154,6 +159,32 @@ pub fn module_name(path: &str) -> String {
     }
 }
 
+/// Path from `from` to `to`, purely lexical. Both must be normalized and
+/// both absolute (or both relative to the same place). The answer is what
+/// goes into the lock file, so it must NOT contain a piece of this machine:
+/// `relative("/p/app", "/p/geo")` is `../geo` here and on the second
+/// machine, whatever the checkout is called there.
+pub fn relative(from: &str, to: &str) -> String {
+    let f: Vec<&str> = from.split('/').filter(|x| !x.is_empty() && *x != ".").collect();
+    let t: Vec<&str> = to.split('/').filter(|x| !x.is_empty() && *x != ".").collect();
+    let mut i = 0;
+    while i < f.len() && i < t.len() && f[i] == t[i] {
+        i += 1;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for _ in i..f.len() {
+        parts.push("..".to_string());
+    }
+    for k in i..t.len() {
+        parts.push(t[k].to_string());
+    }
+    if parts.is_empty() {
+        ".".to_string()
+    } else {
+        parts.join("/")
+    }
+}
+
 /// Does `path` sit inside `root` (or IS it that)? Both must be normalized.
 pub fn read_within(path: &str, root: &str) -> bool {
     if path == root {
@@ -195,6 +226,60 @@ pub fn is_version(s: &str) -> bool {
         }
     }
     parts == 3
+}
+
+/// The three numbers of a version. Only ever called on a text that
+/// `is_version` accepted.
+pub fn version_parts(s: &str) -> (u32, u32, u32) {
+    let mut n = [0u32; 3];
+    for (i, t) in s.split('.').enumerate() {
+        if i > 2 {
+            break;
+        }
+        let mut v: u32 = 0;
+        for c in t.bytes() {
+            // A version out of a manifest is short; a text that would
+            // overflow here is nonsense and gets pinned instead of wrapping.
+            v = v.saturating_mul(10).saturating_add((c - b'0') as u32);
+        }
+        n[i] = v;
+    }
+    (n[0], n[1], n[2])
+}
+
+/// Is `have` at least `want`, WITH THE SAME first number?
+///
+/// ONE rule, and cargo's special case for `0.x` is deliberately NOT copied:
+/// there, `0.2.0` means "< 0.3.0" and `1.2.0` means "< 2.0.0", which is two
+/// rules where one will do. Here the first number is the compatibility
+/// promise, always — `needs geo ../geo 0.2.0` is met by 0.2.0 and by
+/// 0.9.1, and never by 0.1.9 or 1.0.0. Local path dependencies have no
+/// registry to negotiate with; a rule that fits on one line is worth more
+/// than one that matches somebody else's tool.
+pub fn version_at_least(have: &str, want: &str) -> bool {
+    let (h0, h1, h2) = version_parts(have);
+    let (w0, w1, w2) = version_parts(want);
+    if h0 != w0 {
+        return false;
+    }
+    if h1 != w1 {
+        return h1 > w1;
+    }
+    h2 >= w2
+}
+
+/// Is `a` a higher version than `b`? The order in which the resolution
+/// picks a winner among several directories with the same package name.
+pub fn version_higher(a: &str, b: &str) -> bool {
+    let (a0, a1, a2) = version_parts(a);
+    let (b0, b1, b2) = version_parts(b);
+    if a0 != b0 {
+        return a0 > b0;
+    }
+    if a1 != b1 {
+        return a1 > b1;
+    }
+    a2 > b2
 }
 
 /// Path INSIDE the package: relative, without `..`, not empty.
@@ -325,8 +410,20 @@ pub fn read(text: &str) -> Result<Manifest, Error> {
                 }
             }
             "needs" => {
-                if w.len() != 3 {
+                if w.len() < 3 {
                     return Err(err("'needs' expects a name and a path"));
+                }
+                if w.len() > 4 {
+                    return Err(err("'needs' expects at most one version behind the path"));
+                }
+                // ROUND 93: the fourth word is the version wish. It is
+                // checked HERE for its shape, and in `package_world` against
+                // what the package really offers.
+                if w.len() == 4 && !is_version(w[3]) {
+                    return Err(err(&format!(
+                        "invalid version '{}' (expected number.number.number)",
+                        w[3]
+                    )));
                 }
                 if !is_name(w[1]) {
                     return Err(err(&format!(
@@ -346,6 +443,7 @@ pub fn read(text: &str) -> Result<Manifest, Error> {
                 m.dependent.push(Dependency {
                     name: w[1].to_string(),
                     path: w[2].to_string(),
+                    want: if w.len() == 4 { w[3].to_string() } else { String::new() },
                     line: nr,
                 });
             }
@@ -397,7 +495,13 @@ pub fn info_text(m: &Manifest, root: &str) -> String {
         s.push_str(&format!("public {}\n", o));
     }
     for a in &m.dependent {
-        s.push_str(&format!("needs {} {}\n", a.name, join(&w, &a.path)));
+        if a.want.is_empty() {
+            s.push_str(&format!("needs {} {}\n", a.name, join(&w, &a.path)));
+        } else {
+            // A report that hid the version wish would be a lie about the
+            // manifest — `firnc1` writes the same line (`world_info`).
+            s.push_str(&format!("needs {} {} {}\n", a.name, join(&w, &a.path), a.want));
+        }
     }
     s
 }
@@ -512,6 +616,71 @@ mod tests {
         assert_eq!(dirname("c.fi"), ".");
         assert_eq!(module_name("/a/b/geo.fi"), "geo");
         assert_eq!(module_name("geo"), "geo");
+    }
+
+    /// ROUND 93: the path arithmetic of the lock file. `relative` is the
+    /// one function whose result ends up IN a file that a second machine
+    /// reads — a mistake here would only show up there.
+    #[test]
+    fn relative_paths_are_purely_lexical() {
+        assert_eq!(relative("/p/app", "/p/geo"), "../geo");
+        assert_eq!(relative("/p/app", "/p/app"), ".");
+        assert_eq!(relative("/p/app", "/p/app/src"), "src");
+        assert_eq!(relative("/p/app/src", "/p"), "../..");
+        assert_eq!(relative("/p/app", "/q/geo"), "../../q/geo");
+        assert_eq!(relative("/p/./app", "/p/app/x"), "x");
+        // Different checkouts, same answer — that IS the requirement.
+        assert_eq!(
+            relative("/home/a/firn/demos/packages/app", "/home/a/firn/demos/packages/geo"),
+            relative("/tmp/x/firn/demos/packages/app", "/tmp/x/firn/demos/packages/geo")
+        );
+    }
+
+    /// ROUND 93: one rule for the version wish, and it is the same one for
+    /// `0.x` as for `1.x`.
+    #[test]
+    fn version_wishes_have_exactly_one_rule() {
+        assert_eq!(version_parts("1.20.3"), (1, 20, 3));
+        assert!(version_at_least("0.2.0", "0.2.0"));
+        assert!(version_at_least("0.2.7", "0.2.0"));
+        assert!(version_at_least("0.9.1", "0.2.0"));
+        assert!(!version_at_least("0.1.9", "0.2.0"));
+        assert!(!version_at_least("1.0.0", "0.2.0"));
+        assert!(!version_at_least("0.2.0", "1.0.0"));
+        assert!(version_at_least("1.2.3", "1.2.3"));
+        assert!(!version_at_least("1.2.2", "1.2.3"));
+        assert!(version_higher("0.3.0", "0.2.9"));
+        assert!(version_higher("1.0.0", "0.99.99"));
+        assert!(!version_higher("0.2.0", "0.2.0"));
+        // Two places with more digits than a version ever has: the
+        // comparison must not wrap around.
+        assert!(version_higher("1.10.0", "1.9.0"));
+    }
+
+    /// The fourth word of `needs`, and the two ways to get it wrong.
+    #[test]
+    fn the_version_wish_of_a_dependency() {
+        let x = m("package app\nversion 0.1.0\nstart s.fi\nneeds geo ../geo 0.2.0\nneeds t ../t\n");
+        assert_eq!(x.dependent[0].want, "0.2.0");
+        assert_eq!(x.dependent[1].want, "");
+        assert!(read("package a\nversion 1.0.0\nneeds g ../g 0.2\n")
+            .unwrap_err()
+            .msg
+            .contains("invalid version '0.2'"));
+        assert!(read("package a\nversion 1.0.0\nneeds g ../g 0.2.0 x\n")
+            .unwrap_err()
+            .msg
+            .contains("'needs' expects at most one version behind the path"));
+        // And the old message for a line that is too short stays what it was.
+        assert!(read("package a\nversion 1.0.0\nneeds g\n")
+            .unwrap_err()
+            .msg
+            .contains("'needs' expects a name and a path"));
+        assert_eq!(
+            info_text(&x, "/p/app"),
+            "package app\nversion 0.1.0\nroot /p/app\nstart /p/app/s.fi\nsource /p/app\n\
+             needs geo /p/geo 0.2.0\nneeds t /p/t\n"
+        );
     }
 
     #[test]

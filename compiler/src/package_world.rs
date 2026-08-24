@@ -55,6 +55,27 @@ pub fn absolute(path: &str, cwd: &str) -> String {
     }
 }
 
+/// The path as it goes into the DEBUG INFORMATION of the artifact
+/// (round 93). A path that lies inside the working directory becomes
+/// relative to it; anything else stays what it was.
+///
+/// WHY: `.file` directives end up in `.debug_line` of the binary. The
+/// module search of a package build hands out ABSOLUTE paths for the
+/// dependencies (they are computed from `cwd`), so the artifact carried the
+/// name of the checkout directory — and two machines with different
+/// checkout paths could not produce the same octets, no matter how equal
+/// their sources were. Relative to the working directory the name is the
+/// same on both, and a path outside stays visible instead of turning into
+/// a chain of `..`.
+pub fn debug_path(path: &str, cwd: &str) -> String {
+    let abs = absolute(path, cwd);
+    if package::read_within(&abs, cwd) {
+        package::relative(cwd, &abs)
+    } else {
+        path.to_string()
+    }
+}
+
 fn is_file(p: &str) -> bool {
     std::path::Path::new(p).is_file()
 }
@@ -188,9 +209,134 @@ impl World {
             packages[i].edges = edges;
             i += 1;
         }
-        let world = World { packages };
+        let mut world = World { packages };
+        // ROUND 93, IN THIS ORDER: first pick one version per package name
+        // and bend the edges onto it, only then look for cycles. The other
+        // way round the check would run on edges that the resolution is
+        // about to change.
+        world.resolve_versions()?;
         world.check_cycles()?;
         Ok(world)
+    }
+
+    /// ONE VERSION PER PACKAGE NAME (round 93).
+    ///
+    /// The breadth first search above keys a package by its ROOT DIRECTORY:
+    /// two directories that call themselves `geo` are two packages to it.
+    /// They must not be — the module system renames a module of a
+    /// non-root file to `module__name`, so two `geo` in one build collide
+    /// (round 48 turned that into an error). And `import geo` in two
+    /// different packages has to mean the same thing anyway.
+    ///
+    /// So: per name the HIGHEST version wins, every edge is bent onto the
+    /// winner, and afterwards every version wish is measured against it.
+    /// Deterministic, without a network and without a solver — with local
+    /// path dependencies there is nothing to search, only something to
+    /// decide.
+    fn resolve_versions(&mut self) -> Result<(), String> {
+        // The winner per name. Names are short and few; a scan beats a map
+        // here and keeps the order of the answer independent of any hash.
+        let n = self.packages.len();
+        let mut winner: Vec<usize> = Vec::new();
+        for i in 0..n {
+            let name = self.packages[i].manifest.name.clone();
+            let mut place: Option<usize> = None;
+            for &k in winner.iter() {
+                if self.packages[k].manifest.name == name {
+                    place = Some(k);
+                    break;
+                }
+            }
+            match place {
+                None => winner.push(i),
+                Some(k) => {
+                    let old = self.packages[k].manifest.version.clone();
+                    let new = self.packages[i].manifest.version.clone();
+                    if package::version_higher(&new, &old) {
+                        // Replace the loser in the list of winners.
+                        for w in winner.iter_mut() {
+                            if *w == k {
+                                *w = i;
+                            }
+                        }
+                    } else if !package::version_higher(&old, &new) {
+                        // Same name, same version, two directories. There is
+                        // no reason to prefer one, so nothing gets guessed.
+                        let (a, b) = if self.packages[k].root <= self.packages[i].root {
+                            (k, i)
+                        } else {
+                            (i, k)
+                        };
+                        return Err(text_two_directories(
+                            &name,
+                            &new,
+                            &self.packages[a].root,
+                            &self.packages[b].root,
+                        ));
+                    }
+                }
+            }
+        }
+        // Bend every edge onto the winner of its name.
+        for i in 0..n {
+            let mut edges = self.packages[i].edges.clone();
+            for e in edges.iter_mut() {
+                let name = self.packages[*e].manifest.name.clone();
+                for &k in winner.iter() {
+                    if self.packages[k].manifest.name == name {
+                        *e = k;
+                        break;
+                    }
+                }
+            }
+            self.packages[i].edges = edges;
+        }
+        // And now the wishes, against what really got picked.
+        for i in 0..n {
+            let deps = self.packages[i].manifest.dependent.clone();
+            let mpath = self.packages[i].manifestpfad.clone();
+            for (k, a) in deps.iter().enumerate() {
+                if a.want.is_empty() {
+                    continue;
+                }
+                let t = match self.packages[i].edges.get(k) {
+                    Some(t) => *t,
+                    None => continue,
+                };
+                let have = self.packages[t].manifest.version.clone();
+                if !package::version_at_least(&have, &a.want) {
+                    return Err(text_version_wish(
+                        &mpath, a.line, &a.name, &have, &a.want,
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Every package that can be REACHED from the root package. After the
+    /// resolution a superseded directory can still sit in the world with
+    /// nobody pointing at it; it is not part of this build (see `lock.rs`).
+    pub fn reachable(&self) -> Vec<usize> {
+        let mut seen = vec![false; self.packages.len()];
+        let mut stack: Vec<usize> = Vec::new();
+        let mut out: Vec<usize> = Vec::new();
+        if self.packages.is_empty() {
+            return out;
+        }
+        stack.push(0);
+        seen[0] = true;
+        while let Some(i) = stack.pop() {
+            out.push(i);
+            for &k in &self.packages[i].edges {
+                if !seen[k] {
+                    seen[k] = true;
+                    stack.push(k);
+                }
+            }
+        }
+        out.sort();
+        out
     }
 
     /// Depth-first search with three colors: 0 = unseen, 1 = on the path,
@@ -287,6 +433,29 @@ pub fn text_no_dependency(target: &str, of: &str, manifestpfad: &str) -> String 
     )
 }
 
+/// Error text "the version wish is not met" (round 93). The line of the
+/// `needs` entry is in it, because that is the place to change.
+pub fn text_version_wish(
+    manifestpfad: &str,
+    line: u32,
+    name: &str,
+    have: &str,
+    want: &str,
+) -> String {
+    err(format!(
+        "{}:{}: dependency '{}' is version {}, needed is {} or higher with the same first number",
+        manifestpfad, line, name, have, want
+    ))
+}
+
+/// Error text "one name, two directories, one version" (round 93).
+pub fn text_two_directories(name: &str, version: &str, a: &str, b: &str) -> String {
+    error_with_note(
+        format!("package '{}' comes from two directories with version {}", name, version),
+        format!("'{}' and '{}'", a, b),
+    )
+}
+
 /// Error text "two files, one module name".
 pub fn text_name_clash(module: &str, a: &str, b: &str) -> String {
     error_with_note(
@@ -305,6 +474,34 @@ mod tests {
         assert_eq!(absolute("a/b", "/x"), "/x/a/b");
         assert_eq!(absolute("../a", "/x/y"), "/x/a");
         assert!(cwd().starts_with('/'));
+    }
+
+    #[test]
+    fn debug_paths_do_not_name_the_machine() {
+        assert_eq!(debug_path("/w/x/demos/a.fi", "/w/x"), "demos/a.fi");
+        assert_eq!(debug_path("demos/a.fi", "/w/x"), "demos/a.fi");
+        assert_eq!(debug_path("/w/x", "/w/x"), ".");
+        // Outside the working directory: unchanged, and NOT a chain of '..'.
+        assert_eq!(debug_path("/usr/lib/firn/std.fi", "/w/x"), "/usr/lib/firn/std.fi");
+        // The same source under two checkouts gives the same name.
+        assert_eq!(
+            debug_path("/home/a/firn/demos/packages/geo/src/geo.fi", "/home/a/firn"),
+            debug_path("/tmp/b/firn/demos/packages/geo/src/geo.fi", "/tmp/b/firn")
+        );
+    }
+
+    #[test]
+    fn the_new_texts_of_round_93_are_fixed() {
+        assert_eq!(
+            text_version_wish("/p/app/firn.package", 7, "geo", "0.1.0", "0.2.0"),
+            "error: /p/app/firn.package:7: dependency 'geo' is version 0.1.0, \
+             needed is 0.2.0 or higher with the same first number\n"
+        );
+        assert_eq!(
+            text_two_directories("geo", "0.2.0", "/p/a/geo", "/p/b/geo"),
+            "error: package 'geo' comes from two directories with version 0.2.0\n\
+             note: '/p/a/geo' and '/p/b/geo'\n"
+        );
     }
 
     #[test]
