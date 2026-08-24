@@ -206,6 +206,18 @@ written into the header of `phi.rs` so it is not rediscovered.
   ever.
 * **`remove_unreachable_blocks`** renumbers the phi entries with the blocks.
 
+### 2.6 `coalesce_chains` — giving the copies back
+
+A phi is a copy per edge, and a nested `if`/`else` makes a cascade of joins
+with a phi in every one. Left alone that is **+43 % instructions** on
+`bench/firn/statemachine.fi` (4.6). `phi.rs::coalesce_chains` merges a phi
+whose single reader is one entry of the next phi in the chain into that phi:
+they never coexist, so they can share a name, and every copy between them
+becomes `x = x`. It is register coalescing done on the phi graph, where the
+shape is simple enough that no interference graph is needed. What it does
+NOT cover is a value that is read somewhere else as well — that is real
+coalescing, and it is section 7.
+
 ---
 
 ## 3. Measured: the counter really does leave the frame
@@ -387,11 +399,127 @@ Deliberately **not** in `main.rs` after the optimizer: between two passes the
 entry lists are *allowed* to be out of date, and making that an error would
 report normal work as a fault.
 
+### 4.6 `bench/firn/statemachine.fi` got 43 % slower, and why
+
+Not wrong — slower, which for a round whose whole result is "a foundation"
+is the more dangerous failure, because nothing goes red. Counted with
+callgrind: **+43.3 % executed instructions** against round 91. The inner
+loop, `--opt-level=release-fast`:
+
+```
+.Lmain__bb13:  lea r9, [rdi+1]     <- text = text + 1
+               mov rbx, r8         <- state, unchanged, copied
+.Lmain__bb14:  mov r15, rbx        <- and copied again
+               mov r13, rdx
+               mov r12, r9
+.Lmain__bb11:  lea rsi, [rsi+1]    <- k = k + 1
+               mov r8, r15         <- and a third time
+               mov rdx, r13
+               mov rdi, r12
+```
+
+Six register-to-register moves per octet of input that shuffle three
+variables through three join blocks. The cause is not a bug, it is what SSA
+destruction costs: a six-deep `if`/`else` tree makes a cascade of joins, SSA
+construction puts a phi in every one of them, and every phi is a copy per
+edge. Round 91 had no joins to pay for — the variable was one memory cell
+that `regalloc.rs` kept in one register, and an assignment was a register
+write.
+
+The values in such a chain never coexist. `%X` in `bb14` is read by exactly
+one thing, the phi in `bb11`, and is dead the moment it is read. So they can
+share one name and every copy between them becomes `x = x`.
+`phi.rs::coalesce_chains` does that, on the phi graph, where it needs no
+interference graph. The conditions are in its header; the one that is easy to
+get wrong is the critical edge — every predecessor of `B` must end in
+`br B`, or the early write reaches a path that never goes to `C` at all.
+
+Two attempts before it worked, and both are worth writing down:
+
+1. **Bridging the empty join blocks away instead.** `merge_blocks` does not
+   bridge into a block with phis (2.5), and the first idea was to teach it
+   the re-keying so it could. It works and it is **worse**: the copies then
+   move into a predecessor that has several successors, so they run on paths
+   that do not need them. `main` went from 154 instructions to 173 while
+   losing six blocks. The empty join block is exactly the right place for a
+   copy — which is the same argument as "critical edges are not split"
+   (2.4), seen from the other end. Reverted.
+2. **A filter instead of a matching.** The first coalescing refused every
+   pair whose target was another pair's source, to keep the conditions from
+   going stale inside one round. In a real chain `x1 -> x2 -> x3` *every*
+   pair is of that kind, so it refused all of them: five pairs found in
+   `@main`, none applied, and the measurement did not move by one
+   instruction. A greedy **matching** takes `x1 -> x2` and `x3 -> x4` in one
+   round and `x2 -> x4` in the next; the chain is gone in two.
+
+Afterwards `@main` is **131 instructions where round 91 had 133**, and the
+program costs +4.2 % instead of +43.3 %. The rest is the copies that are not
+in a chain, and those need real coalescing (section 7).
+
 ---
 
 ## 5. Speed
 
-<!--BENCHTABLE-->
+**Why instructions and not seconds.** Two other full acceptance passes ran on
+this machine for the whole session; the load average sat between 10 and 26.
+A wall clock median of seven runs is worth nothing under that.
+`tools/bench90/icount.py` counts the instructions the program really executes
+with callgrind: deterministic to the last digit, indifferent to the
+neighbours, and exactly the right question for "did this change make the loop
+shorter". It says nothing about cache misses — for those the wall clock stays
+the measurement, and section 5.3 says what is known and what is not.
+
+```
+python3 tools/bench90/icount.py --firnc <round 91 build> --tag before \
+    --only fib,sieve,matmul,bubblesort,bitmap,statemachine
+python3 tools/bench90/icount.py --tag after --only <the same six>
+```
+
+The six are the ones that fit into callgrind's budget (it is about fifty
+times slower than the machine); `xxhash`, `memstride`, `branchy`,
+`bytecount` and `jsonscan` move hundreds of megabytes and were left out.
+
+### 5.1 `--opt-level=release-fast`
+
+| benchmark | round 91 | round 92 | change | vs `rustc -O` before | after |
+|---|---:|---:|---:|---:|---:|
+| fib | 281,966,500 | 281,966,451 | −0.0 % | 1.81x | 1.81x |
+| sieve | 316,748,507 | **241,974,999** | **−23.6 %** | 1.70x | **1.30x** |
+| matmul | 709,305,973 | **501,309,945** | **−29.3 %** | 4.10x | **2.90x** |
+| bubblesort | 315,882,787 | **306,584,277** | −2.9 % | 1.59x | 1.54x |
+| bitmap | 782,265,538 | **656,270,449** | **−16.1 %** | 1.86x | **1.56x** |
+| statemachine | 724,776,148 | 754,975,101 | +4.2 % | 1.19x | 1.24x |
+| **median vs `rustc -O`** | | | | **1.76x** | **1.55x** |
+
+`fib` is recursion with no loop counter at all and does not move by a single
+instruction — which is the right answer and a good check that nothing is
+being measured that is not there.
+
+### 5.2 `--opt-level=release-safe`
+
+| benchmark | round 91 | round 92 | change |
+|---|---:|---:|---:|
+| fib | 303,114,193 | 303,114,138 | −0.0 % |
+| sieve | 526,329,429 | 421,552,109 | −19.9 % |
+| matmul | 2,125,360,205 | 1,917,012,576 | −9.8 % |
+| bubblesort | 857,316,094 | 821,260,528 | −4.2 % |
+| bitmap | 1,004,558,731 | 826,728,098 | −17.7 % |
+| statemachine | 1,004,955,880 | 983,145,470 | −2.2 % |
+
+Every one of the six is at worst unchanged at the checked level.
+
+### 5.3 What is NOT claimed
+
+* **No wall clock number from this session.** The load made it meaningless;
+  `docs/ROUND90.md`'s 1.81x median stands as the last honest wall clock
+  figure and this round did not re-measure it. Instruction counts are not
+  seconds: `matmul` writes to memory in a cache-hostile order, and 29 % fewer
+  instructions there will not be 29 % less time.
+* **`statemachine` is 4.2 % worse at `release-fast`**, and that is the one
+  number in this table that went the wrong way. It is the cost of SSA
+  destruction on code that is nothing but joins — see 4.6 for what it was
+  (43 %) before the coalescing, and section 7 for what would take the rest.
+
 
 ---
 
