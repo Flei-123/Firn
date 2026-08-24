@@ -387,7 +387,7 @@ if grep -qa "nvme wrote this line over DMA" "$TMPD/nv.img"; then
 else
     bad "the image on the host does not contain the text"
 fi
-grep -qa "26SFNRIF" "$TMPD/nv.img" \
+grep -qa "SFO-MUSO" "$TMPD/nv.img" \
     && ok "the image on the host starts with the magic number of the file system" \
     || bad "no magic number in the NVMe image"
 grep -qa "nvme.txt" "$TMPD/nv.img" \
