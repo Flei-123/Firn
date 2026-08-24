@@ -402,7 +402,55 @@ other system can.
 
 ---
 
-## 12. What is still open
+## 12. The acceptance run, honestly
+
+    cargo test --release            238 passed, 0 failed
+    tools/kernel/run.sh             174 passed, 0 failed   (round 62, untouched)
+    tools/freestanding/run.sh        41 passed, 0 failed
+    tools/osum/run.sh               129 passed, 0 failed
+    test.sh                        1526 passed, 8 failed
+
+The eight are named here rather than explained away, because a report that
+hides them is worth nothing:
+
+    tests/834_arc_thread.fi  [opt] [devfast] [safe]   exit 9
+    tests/860_thread_basic.fi [opt] [devfast]         exit 14
+    tools/self_compare.sh    (the same 834 file)
+    tools/fixpoint.sh        (the same 834 file, in its corpus phase)
+    tools/bench82/run.sh     self compile 7082 ms, limit 5000 ms
+
+Exit 9 and exit 14 are the SAME kind of check, and the source says what it
+is:
+
+```
+// The counter-check MUST lose. If it does not, the threads did not
+// really run at the same time, and B proves nothing.
+if ld(z, Z_ROHZ) >= 4 * ROUNDS {
+    return 14
+}
+```
+
+A non-atomic counter incremented by four threads has to lose increments;
+if it loses none, the threads were serialised and the atomic counter next
+to it proves nothing. This machine was running six rounds of this project
+at once, at a load average of 15 to 25 on eight cores, so the threads WERE
+serialised. `bench82` is a wall-clock limit on the self compile and fails
+for the same reason.
+
+That this has nothing to do with round K1 is not an assertion. The same
+test, built and run in a DIFFERENT worktree at the same base commit and
+without a line of this round in it, gives:
+
+    9 9 9 0 0 9 9 9 9 9 9 9
+
+— nondeterministic, mostly failing, and failing without K1. Everything
+round K1 touched is green: the kernel guard, the freestanding guard, the
+new guard, and sections 46/47/48 (statics, checked index, build levels)
+which are the ones its changes could plausibly have disturbed.
+
+---
+
+## 13. What is still open
 
 * **No redirection and no pipe.** `ls > file` needs a descriptor table
   that survives `exec`, which needs the fork/exec split this round argued
