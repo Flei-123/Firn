@@ -644,7 +644,7 @@ if [ -f "$TMPD/k0.mb" ]; then
     else
         bad "the image on the host does not contain the text"
     fi
-    if grep -qa "26SFNRIF" "$TMPD/disk.img"; then
+    if grep -qa "SFO-MUSO" "$TMPD/disk.img"; then
         ok "the image on the host starts with the magic number of the file system"
     else
         bad "no magic number in the image"
