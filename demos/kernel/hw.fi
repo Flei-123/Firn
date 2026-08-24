@@ -1,0 +1,551 @@
+// demos/kernel/hw.fi -- round K2: the hardware stage of the kernel.
+//
+// This file is the seam between the kernel of rounds 59/62 and the three
+// files this round added. It exists so that `kmain.fi` gains three lines
+// and not thirty: several rounds are working on that file at the same
+// time, and a seam is cheaper to merge than a diff spread over a
+// thousand lines.
+//
+// It does three things, in the order the machine needs them:
+//
+//   1. `stage`  -- read the bus (pci.fi), then move the interrupts from
+//      the two 8259s to the APIC (apic.fi). This happens BEFORE the first
+//      `sti`, because a controller must not be changed while it is
+//      delivering.
+//   2. `disk`   -- bring up the NVMe controller (nvme.fi), put the SAME
+//      file system on it that ran on the RAM disk and on ATA, and then
+//      measure PIO against DMA.
+//   3. `timer_off` -- what the counter-check of round 59 needs: whichever
+//      timer is running has to be silenceable, and after this round that
+//      is not necessarily the PIT any more.
+//
+// EVERY SWITCH HERE HAS A COUNTER-CHECK IN `tools/pci/run.sh`, and every
+// one of them is a run in which the measurement collapses:
+//
+//   noapic    the PIC keeps the machine -- the ticks still have to arrive
+//   noioapic  APIC on, keyboard line NOT entered -- no key may arrive
+//   nobm      no bus master bit -- the controller may not fetch its own
+//             commands, and the driver has to report that instead of hang
+//   noirq     the message vector stays masked -- the transfer works, the
+//             interrupt does not, and the difference is measurable
+//   nomsix    the same completion over the interrupt pin and the I/O APIC
+
+import serial
+import kstate
+import pci
+import apic
+import nvme
+import blk
+import fs
+import idt
+
+export { parse, stage, disk, timer_off, mode_of, M_NOPCI, M_NOAPIC, M_NVME, M_BENCH }
+
+// The words of the command line this round understands. They are read
+// here and not in `kmain.mode_of` for the same reason the stage exists.
+const M_NOPCI: u64 = 1
+const M_NOAPIC: u64 = 2
+const M_NOIOAPIC: u64 = 4
+const M_NVME: u64 = 8
+const M_NOBM: u64 = 16
+const M_NOMSIX: u64 = 32
+const M_NOIRQ: u64 = 64
+const M_BENCH: u64 = 128
+const M_NVPOLL: u64 = 256
+
+const S_MODE: u64 = 0x0F0 // in the K2 scalar page, between apic and nvme
+
+const TIMER_HZ: u64 = 100
+const GSI_KEYBOARD: u64 = 1
+const VEC_KEYBOARD: u64 = 33
+
+const FS_BLOCKS: u64 = 2048 // the same 1 MiB the RAM disk and ATA use
+const BENCH_BLOCKS: u64 = 256 // 128 KiB, read once per path
+const BENCH_BATCH: u64 = 16 // blocks in ONE command, 8 KiB, two PRPs
+
+fn mode(state: u64) -> u64 {
+    return kstate.get(state, pci.K2_SCALARS + S_MODE)
+}
+
+fn on(state: u64, bit: u64) -> bool {
+    return (mode(state) & bit) != 0
+}
+
+// ---------------------------------------------------------- stage zero
+
+// Reads the command line and NOTHING else, and it has to happen before
+// the frame allocator exists.
+//
+// This cost half an hour and belongs in a comment. QEMU puts the
+// multiboot command line directly BEHIND the kernel image -- in this
+// build at 0x184000, with `kernel_end` at 0x183038. `mem.scan` reserves
+// the kernel up to `kernel_end` and everything above it is free memory
+// as far as the frame allocator is concerned. The first thing the kernel
+// asks for is 64 frames for the heap, and it gets 0x184000. From then on
+// the command line reads as a heap block header. Round 62 never noticed
+// because it read the command line at the top of `kernel_main`; this
+// round wanted to read it again further down and found a string that had
+// turned into a number.
+fn parse(state: u64, cmd: u64) {
+    kstate.set(state, pci.K2_SCALARS + S_MODE, mode_of(cmd))
+}
+
+// ---------------------------------------------------------- stage one
+
+fn stage(state: u64) {
+    var s_off: [u8; 13] = "pci: skipped\0"
+    var s_none: [u8; 16] = "apic: not there\0"
+    var s_old: [u8; 21] = "apic: off, pic keeps\0"
+    var s_on: [u8; 8] = "apic: \0\0"
+    var s_id: [u8; 6] = "id=\0\0\0"
+    var s_hz: [u8; 8] = "  hz=\0\0\0"
+    var s_ent: [u8; 12] = "  ioapic=\0\0\0"
+    var s_tick: [u8; 11] = "  tick=\0\0\0\0"
+    var s_win: [u8; 10] = "  window=\0"
+    var s_kbd: [u8; 24] = "apic: keyboard gsi 1 ->\0"
+    var s_nokbd: [u8; 26] = "apic: keyboard NOT routed\0"
+
+
+    if on(state, M_NOPCI) {
+        serial.puts((&s_off[0]) as u64)
+        serial.nl()
+    } else {
+        pci.scan(state)
+        pci.list(state)
+    }
+
+    if on(state, M_NOAPIC) {
+        serial.puts((&s_old[0]) as u64)
+        serial.nl()
+        return
+    }
+    if !apic.present() {
+        serial.puts((&s_none[0]) as u64)
+        serial.nl()
+        return
+    }
+    if !apic.init(state, TIMER_HZ) {
+        serial.puts((&s_none[0]) as u64)
+        serial.nl()
+        return
+    }
+    // Only now, with the new controller answering, is the old one shut
+    // up. The other order leaves a window with no controller at all.
+    apic.pic_off()
+    serial.puts((&s_on[0]) as u64)
+    serial.puts((&s_id[0]) as u64)
+    serial.dec(apic.id(state))
+    serial.puts((&s_hz[0]) as u64)
+    serial.dec(apic.hz(state))
+    serial.puts((&s_ent[0]) as u64)
+    serial.dec(apic.ioapic_entries(state))
+    serial.puts((&s_tick[0]) as u64)
+    serial.dec(TIMER_HZ)
+    serial.puts((&s_win[0]) as u64)
+    serial.dec(apic.window_slots(state))
+    serial.nl()
+
+    // The keyboard is the one device line this kernel still has, and it
+    // is therefore the proof that the I/O APIC delivers at all. With
+    // `noioapic` the entry is deliberately left out: the PIC is mute, the
+    // line goes nowhere, and no key may arrive.
+    if on(state, M_NOIOAPIC) {
+        serial.puts((&s_nokbd[0]) as u64)
+        serial.nl()
+    } else {
+        apic.route(state, GSI_KEYBOARD, VEC_KEYBOARD, apic.id(state), false, false)
+        serial.puts((&s_kbd[0]) as u64)
+        serial.dec(VEC_KEYBOARD)
+        serial.nl()
+    }
+}
+
+// Whichever clock is running has to be silenceable. Round 59 masked
+// IRQ0 at the PIC for that; after this round the timer may be inside the
+// processor, where the PIC cannot reach it.
+fn timer_off(state: u64) {
+    if apic.active(state) {
+        apic.timer_stop(state)
+        return
+    }
+    idt.pic_mask(0xFD as u8, 0xFF as u8)
+}
+
+// ---------------------------------------------------------- stage two
+
+fn disk(state: u64) {
+    var s_off: [u8; 14] = "nvme: skipped\0"
+    var s_no: [u8; 16] = "nvme: no device\0"
+    var s_fail: [u8; 20] = "nvme: init failed\0\0\0"
+    var s_up: [u8; 8] = "nvme: \0\0"
+    var s_blk: [u8; 8] = "blocks=\0"
+    var s_sz: [u8; 10] = "  lbasz=\0\0"
+    var s_irq: [u8; 8] = "  irq=\0\0"
+    var s_msix: [u8; 6] = "msix\0\0"
+    var s_intx: [u8; 6] = "intx\0\0"
+    var s_masked: [u8; 9] = " masked\0\0"
+    var s_bm: [u8; 12] = "  master=\0\0\0"
+
+    if !on(state, M_NVME) {
+        serial.puts((&s_off[0]) as u64)
+        serial.nl()
+        return
+    }
+    if !nvme.present(state) {
+        serial.puts((&s_no[0]) as u64)
+        serial.nl()
+        return
+    }
+    if on(state, M_NVPOLL) {
+        nvme.arm_polling(state)
+    }
+    let use_msix: bool = !on(state, M_NOMSIX)
+    let armed: bool = !on(state, M_NOIRQ)
+    let ok: bool = nvme.init(state, use_msix, armed)
+    // The bus master bit is taken away AFTER the controller was set up,
+    // when the counter-check asks for it: `init` itself needs to fetch
+    // one command out of memory to learn how big the disk is, and a run
+    // that cannot even do that would prove nothing about DMA.
+    if on(state, M_NOBM) {
+        pci.disable_master(nvme.bdf(state))
+    }
+    if !ok {
+        serial.puts((&s_fail[0]) as u64)
+        serial.nl()
+        return
+    }
+    serial.puts((&s_up[0]) as u64)
+    serial.puts((&s_blk[0]) as u64)
+    serial.dec(nvme.blocks(state))
+    serial.puts((&s_sz[0]) as u64)
+    serial.dec(1 << nvme.block_shift(state))
+    serial.puts((&s_irq[0]) as u64)
+    if use_msix {
+        serial.puts((&s_msix[0]) as u64)
+    } else {
+        serial.puts((&s_intx[0]) as u64)
+    }
+    if !armed {
+        serial.puts((&s_masked[0]) as u64)
+    }
+    serial.puts((&s_bm[0]) as u64)
+    serial.dec(yes(pci.master_on(nvme.bdf(state))))
+    serial.nl()
+
+    if on(state, M_NOIRQ) {
+        // The counter-check that separates the two halves of a DMA
+        // driver. The message vector is masked, so the completion
+        // interrupt cannot arrive -- but the controller still fetches the
+        // command and still moves the data. The first read therefore has
+        // to FAIL (it waits three seconds and gives up), the completion
+        // has to be lying in the queue afterwards all the same, and the
+        // same read has to succeed the moment the driver stops waiting to
+        // be told and looks for itself.
+        var n1: [u8; 20] = "nvme: noirq  onirq=\0"
+        var n2: [u8; 10] = "  found=\0\0"
+        var n3: [u8; 11] = "  polled=\0\0"
+        var n4: [u8; 8] = "  irqs=\0"
+        let buf: u64 = nvme.buffer(state, 0)
+        serial.puts((&n1[0]) as u64)
+        serial.dec(yes(nvme.read_block(state, 0, buf)))
+        serial.puts((&n2[0]) as u64)
+        serial.dec(nvme.drain(state))
+        nvme.arm_polling(state)
+        serial.puts((&n3[0]) as u64)
+        serial.dec(yes(nvme.read_block(state, 0, buf)))
+        serial.puts((&n4[0]) as u64)
+        serial.dec(nvme.irqs(state))
+        serial.nl()
+        return
+    }
+
+    filesystem(state)
+    if on(state, M_BENCH) {
+        bench(state)
+    }
+}
+
+// The whole point of `blk.fi`: the file system does not learn that the
+// blocks now come out of a controller that fetches its own commands. Not
+// one line of `fs.fi` changed for this round.
+fn filesystem(state: u64) {
+    var s_fmt: [u8; 14] = "nvme: format \0"
+    var s_mount: [u8; 10] = "  mount=\0\0"
+    var s_io: [u8; 14] = "nvme: wrote=\0\0"
+    var s_read: [u8; 8] = "  read=\0"
+    var s_same: [u8; 8] = "  same=\0"
+    var s_list: [u8; 12] = "nvme: list \0"
+    var s_irqs: [u8; 8] = "  irqs=\0"
+    var s_wait: [u8; 9] = "  waits=\0"
+    var p_file: [u8; 10] = "/nvme.txt\0"
+    var p_root: [u8; 2] = "/\0"
+    var text: [u8; 31] = "nvme wrote this line over DMA\n\0"
+
+    blk.use_nvme(state, FS_BLOCKS)
+    let before: u64 = nvme.irqs(state)
+    serial.puts((&s_fmt[0]) as u64)
+    serial.dec(yes(fs.format(state)))
+    serial.puts((&s_mount[0]) as u64)
+    serial.dec(yes(fs.mount(state)))
+    serial.nl()
+    let ino: u64 = fs.create_path(state, (&p_file[0]) as u64, fs.T_FILE)
+    let wrote: u64 = fs.write_at(state, ino, 0, (&text[0]) as u64, 30)
+    let scratch: u64 = state + kstate.BLOCK_OFF
+    let got: u64 = fs.read_at(state, ino, 0, scratch, 64)
+    serial.puts((&s_io[0]) as u64)
+    serial.dec(wrote)
+    serial.puts((&s_read[0]) as u64)
+    serial.dec(got)
+    serial.puts((&s_same[0]) as u64)
+    serial.dec(same(scratch, (&text[0]) as u64, 30))
+    // How many completion interrupts the file system cost. Zero would
+    // mean the driver polled after all.
+    serial.puts((&s_irqs[0]) as u64)
+    serial.dec(nvme.irqs(state) - before)
+    serial.puts((&s_wait[0]) as u64)
+    serial.dec(nvme.waits(state))
+    serial.nl()
+    list_dir(state, (&p_root[0]) as u64, (&s_list[0]) as u64)
+}
+
+// --------------------------------------------------------- the number
+
+// The measurement that justifies this round. The SAME amount of data over
+// the SAME interface -- `blk.read`, block by block, 512 octets -- once
+// through the processor and once past it. Then once more with sixteen
+// blocks in one command, which is what the per-block interface costs.
+fn bench(state: u64) {
+    var s_ata: [u8; 12] = "bench: ata \0"
+    var s_nv: [u8; 13] = "bench: nvme \0"
+    var s_many: [u8; 15] = "bench: nvme16 \0"
+    var s_blocks: [u8; 8] = "blocks=\0"
+    var s_cyc: [u8; 10] = "  cycles=\0"
+    var s_us: [u8; 6] = "  us=\0"
+    var s_kb: [u8; 11] = "  KiB_s=\0\0\0"
+    var s_in: [u8; 12] = "  inwords=\0\0"
+    var s_halt: [u8; 10] = "  halts=\0\0"
+    var s_ok: [u8; 7] = "  ok=\0\0"
+    var s_none: [u8; 26] = "bench: no ata drive, skip\0"
+    var s_cmp: [u8; 15] = "bench: faster=\0"
+    var s_pm: [u8; 8] = " permil\0"
+    var s_hz: [u8; 12] = "bench: tsc=\0"
+
+    let buf: u64 = nvme.buffer(state, 0)
+    serial.puts((&s_hz[0]) as u64)
+    serial.dec(apic.tsc_hz(state))
+    serial.nl()
+
+    if !blk.present(state) {
+        serial.puts((&s_none[0]) as u64)
+        serial.nl()
+        return
+    }
+    // ---- ATA PIO, through the processor.
+    blk.use_ata(state, BENCH_BLOCKS)
+    let a0: u64 = apic.tsc()
+    let aok: u64 = read_run(state, BENCH_BLOCKS, buf)
+    let a1: u64 = apic.tsc()
+    line(state, (&s_ata[0]) as u64, (&s_blocks[0]) as u64, (&s_cyc[0]) as u64,
+        (&s_us[0]) as u64, (&s_kb[0]) as u64, (&s_in[0]) as u64,
+        (&s_halt[0]) as u64, (&s_ok[0]) as u64,
+        BENCH_BLOCKS, a1 - a0, BENCH_BLOCKS * 256, 0, aok)
+
+    // ---- NVMe, one block per command, the same interface.
+    blk.use_nvme(state, BENCH_BLOCKS)
+    let h0: u64 = nvme.waits(state)
+    let n0: u64 = apic.tsc()
+    let nok: u64 = read_run(state, BENCH_BLOCKS, buf)
+    let n1: u64 = apic.tsc()
+    line(state, (&s_nv[0]) as u64, (&s_blocks[0]) as u64, (&s_cyc[0]) as u64,
+        (&s_us[0]) as u64, (&s_kb[0]) as u64, (&s_in[0]) as u64,
+        (&s_halt[0]) as u64, (&s_ok[0]) as u64,
+        BENCH_BLOCKS, n1 - n0, 0, nvme.waits(state) - h0, nok)
+
+    // ---- NVMe, sixteen blocks per command.
+    let m0: u64 = apic.tsc()
+    var done: u64 = 0
+    var lba: u64 = 0
+    while lba < BENCH_BLOCKS {
+        if nvme.read_many(state, lba, BENCH_BATCH, buf) {
+            done = done + BENCH_BATCH
+        }
+        lba = lba + BENCH_BATCH
+    }
+    let m1: u64 = apic.tsc()
+    line(state, (&s_many[0]) as u64, (&s_blocks[0]) as u64, (&s_cyc[0]) as u64,
+        (&s_us[0]) as u64, (&s_kb[0]) as u64, (&s_in[0]) as u64,
+        (&s_halt[0]) as u64, (&s_ok[0]) as u64,
+        BENCH_BLOCKS, m1 - m0, 0, 0, done)
+
+    // How much faster, in thousandths, so that a factor below two is
+    // still a number and not a rounded-down 1.
+    serial.puts((&s_cmp[0]) as u64)
+    var factor: u64 = 0
+    if (n1 - n0) > 0 {
+        factor = (a1 - a0) * 1000 / (n1 - n0)
+    }
+    serial.dec(factor)
+    serial.puts((&s_pm[0]) as u64)
+    serial.nl()
+}
+
+fn read_run(state: u64, n: u64, buf: u64) -> u64 {
+    var i: u64 = 0
+    var ok: u64 = 0
+    while i < n {
+        if blk.read(state, i, buf) {
+            ok = ok + 1
+        }
+        i = i + 1
+    }
+    return ok
+}
+
+// One line of the measurement. Eight labels as arguments because the
+// kernel profile has no string type and a local array per label in three
+// places would be three places to keep in step.
+fn line(state: u64, head: u64, l_blocks: u64, l_cyc: u64, l_us: u64,
+    l_kb: u64, l_in: u64, l_halt: u64, l_ok: u64,
+    blocks_n: u64, cycles: u64, inwords: u64, halts: u64, ok: u64) {
+    let hz: u64 = apic.tsc_hz(state)
+    serial.puts(head)
+    serial.puts(l_blocks)
+    serial.dec(blocks_n)
+    serial.puts(l_cyc)
+    serial.dec(cycles)
+    var us: u64 = 0
+    var kib: u64 = 0
+    if hz > 0 && cycles > 0 {
+        us = cycles * 1000000 / hz
+        kib = blocks_n * 512 * hz / cycles / 1024
+    }
+    serial.puts(l_us)
+    serial.dec(us)
+    serial.puts(l_kb)
+    serial.dec(kib)
+    serial.puts(l_in)
+    serial.dec(inwords)
+    serial.puts(l_halt)
+    serial.dec(halts)
+    serial.puts(l_ok)
+    serial.dec(ok)
+    serial.nl()
+}
+
+// --------------------------------------------------------- the helpers
+
+fn yes(b: bool) -> u64 {
+    if b {
+        return 1
+    }
+    return 0
+}
+
+fn same(a: u64, b: u64, n: u64) -> u64 {
+    var i: u64 = 0
+    while i < n {
+        if kstate.get8(a + i) != kstate.get8(b + i) {
+            return 0
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+fn list_dir(state: u64, p: u64, label: u64) {
+    var s_sp: [u8; 2] = " \0"
+    var s_colon: [u8; 2] = ":\0"
+    let dir: u64 = fs.path(state, p)
+    serial.puts(label)
+    if dir == 0 {
+        serial.nl()
+        return
+    }
+    let out: u64 = state + kstate.NAME_OFF + 1024
+    var i: u64 = 0
+    var going: bool = true
+    while going {
+        let ino: u64 = fs.entry_at(state, dir, i, out)
+        if ino == 0 {
+            going = false
+        } else {
+            serial.puts(out + 8)
+            serial.puts((&s_colon[0]) as u64)
+            serial.dec(fs.inode_type(state, ino))
+            serial.puts((&s_sp[0]) as u64)
+            i = i + 1
+        }
+    }
+    serial.nl()
+}
+
+// ------------------------------------------------------ the command line
+
+// The same shape as `kmain.mode_of`, for the words this round adds. A
+// word that is not there leaves its bit at zero, so a kernel started
+// without any of them behaves exactly as round 62 left it -- except that
+// the interrupts now come from the APIC, which is the point.
+fn mode_of(cmd: u64) -> u64 {
+    var w_nopci: [u8; 6] = "nopci\0"
+    var w_noapic: [u8; 7] = "noapic\0"
+    var w_noio: [u8; 9] = "noioapic\0"
+    var w_nvme: [u8; 5] = "nvme\0"
+    var w_nobm: [u8; 5] = "nobm\0"
+    var w_nomsix: [u8; 7] = "nomsix\0"
+    var w_noirq: [u8; 6] = "noirq\0"
+    var w_bench: [u8; 6] = "bench\0"
+    var w_poll: [u8; 7] = "nvpoll\0"
+    if cmd == 0 {
+        return 0
+    }
+    var m: u64 = 0
+    if find(cmd, (&w_nopci[0]) as u64, 5) != 0 {
+        m = m | M_NOPCI
+    }
+    if find(cmd, (&w_noapic[0]) as u64, 6) != 0 {
+        m = m | M_NOAPIC
+    }
+    if find(cmd, (&w_noio[0]) as u64, 8) != 0 {
+        m = m | M_NOIOAPIC
+    }
+    if find(cmd, (&w_nvme[0]) as u64, 4) != 0 {
+        m = m | M_NVME
+    }
+    if find(cmd, (&w_nobm[0]) as u64, 4) != 0 {
+        m = m | M_NOBM
+    }
+    if find(cmd, (&w_nomsix[0]) as u64, 6) != 0 {
+        m = m | M_NOMSIX
+    }
+    if find(cmd, (&w_noirq[0]) as u64, 5) != 0 {
+        m = m | M_NOIRQ
+    }
+    if find(cmd, (&w_bench[0]) as u64, 5) != 0 {
+        m = m | M_BENCH
+    }
+    if find(cmd, (&w_poll[0]) as u64, 6) != 0 {
+        m = m | M_NVPOLL
+    }
+    return m
+}
+
+fn find(hay: u64, needle: u64, n: u64) -> u64 {
+    var i: u64 = 0
+    while kstate.get8(hay + i) != 0 {
+        var k: u64 = 0
+        var hit: bool = true
+        while k < n {
+            if kstate.get8(hay + i + k) != kstate.get8(needle + k) {
+                hit = false
+                k = n
+            } else {
+                k = k + 1
+            }
+        }
+        if hit {
+            return hay + i
+        }
+        i = i + 1
+    }
+    return 0
+}
