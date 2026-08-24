@@ -3,10 +3,10 @@
 # from the same source state, the same artifact, octet for octet.
 #
 # The criterion of item 5 is "two different machines produce a bit-identical
-# artifact from the same source state", and it also demands a registry and a
-# lock file. Neither exists (round 48 built the module and project system,
-# nothing more). So this script does NOT claim to satisfy item 5. What it
-# measures is the CORE of it, and the core alone:
+# artifact from the same source state". This script measures the CORE of it,
+# and the core alone (round 93 added the rest: the lock file with checksums
+# in `--lock`/`--locked`, and the second machine in
+# `tools/repro/two_machines.sh`):
 #
 #   the same commit, unpacked into TWO working directories with different
 #   paths, built from scratch in both -- and the results compared with
@@ -123,9 +123,13 @@ if [ "$different" -ne 0 ] && command -v readelf > /dev/null; then
         t=$(stat -c%s "$A/$f")
         printf '   %-14s %s of %s octets differ\n' "" "$n" "$t"
     done
-    echo "   The absolute working directory ends up in .debug_str as"
-    echo "   DW_AT_comp_dir (compiler/src/dwarf_info.rs). The compiler written"
-    echo "   in Firn writes no .debug_info -- which is why stage2 is identical."
+    echo "   ROUND 93 found three ways for the working directory to get into"
+    echo "   the artifact: DW_AT_comp_dir written by 'as' out of the .file/.loc"
+    echo "   directives (fixed with --debug-prefix-map, main.rs::assemble), the"
+    echo "   absolute module paths of the package search in .debug_line, and the"
+    echo "   same paths in the panic message table in .rodata (both fixed with"
+    echo "   package_world::build_path). If this line appears again, a FOURTH way"
+    echo "   was found -- look at .debug_str and at the strings of the binary."
 fi
 
 # The compiler out of Rust is checked too -- but its result is NOT part of
@@ -148,6 +152,7 @@ if [ "$different" -ne 0 ] || [ "$missing" -ne 0 ]; then
     exit 1
 fi
 echo "OK: $same artifacts identical octet for octet, out of two working directories."
-echo "    That is the CORE of item 5 -- item 5 itself stays open: no registry,"
-echo "    no lock file with checksums, no second machine."
+echo "    That is the CORE of item 5. The whole of item 5 is measured by"
+echo "    tools/repro/two_machines.sh (round 93); what is still missing there"
+echo "    is a registry, and nothing else."
 exit 0
