@@ -2023,13 +2023,19 @@ O2. **Two codegen paths.** The register-aware path takes over only what it
     14.1 item 16). So: `--no-opt` produces code from the baseline path, without
     `--no-opt` code from the register path. Both paths deliver the same result
     for every test program -- which is exactly what `test.sh` checks.
-O3. **Cells in a register instead of phi nodes.** FIR has no phi nodes (8.1),
-    which is why `mem2reg` can only resolve `alloca`s that are written to
-    **exactly once** and whose `store` dominates all `load`s. Cells written
-    several times (loop counters!) are resolved by the register allocator
-    instead: a non-escaping `alloca` up to 8 bytes with a uniform access width
-    lives in a register for the whole function. That is functionally equivalent,
-    but more local than real SSA.
+O3. **Phi nodes -- CLOSED IN ROUND 92.** This entry used to say that FIR has
+    none, that `mem2reg` could therefore only resolve `alloca`s written
+    **exactly once**, and that cells written several times (loop counters!)
+    were left to the register allocator, which keeps a non-escaping cell of
+    up to 8 bytes in a register for the whole function -- "functionally
+    equivalent, but more local than real SSA".
+    Since round 92 `mem2reg` is the real SSA construction (dominator tree,
+    dominance frontiers, renaming) and writes `fir::Op::Phi`; `phi.rs` takes
+    the phis apart into copies again before code generation, so no backend
+    sees one. The lowering is unchanged and `--emit=fir-raw` stays phi-free.
+    The register allocator's cell promotion stays as well -- it still catches
+    what `mem2reg` deliberately leaves in memory (mixed access widths,
+    escaping addresses, `secret`). See `docs/ROUND92.md`.
 O4. **The performance target 10.3 (`P1`, <= 2x Rust) not reached yet.** Measured
     on 2026-08-13 with `bash bench/run.sh` (6 microbenchmarks, each in duplicate
     in Firn and in Rust `-O`, the median of 7 runs): **median 2.75x**, range

@@ -827,10 +827,37 @@ fn promotable_cells(f: &Func) -> HashMap<Val, FTy> {
 /// They then need neither register nor slot, and their `const` instruction
 /// disappears entirely.
 fn immediate_consts(f: &Func) -> HashMap<Val, i64> {
+    // ROUND 92 -- A VALUE MAY BE WRITTEN MORE THAN ONCE DOWN HERE.
+    //
+    // Above the code generator FIR is SSA: one definition per value, so
+    // "this value is defined by a `const`" and "this value IS that constant"
+    // were the same sentence. `phi.rs` ends that. Eliminating a phi means
+    // writing ONE value from several places -- one per incoming edge -- and
+    // where the incoming value is computed in the predecessor itself the
+    // computation writes the phi's value directly. A loop counter that
+    // starts at 0 therefore has a `const.i32 0` writing it in the preheader
+    // and an `add` writing it on the back edge.
+    //
+    // Measured, and that is what this note is for: without the count below
+    // `tests/018_while_sum.fi` returned 0 instead of 55, because every read
+    // of the sum was replaced by the immediate `0` of its FIRST definition
+    // and the `add` on the back edge wrote a value nobody looked at again.
+    // The same trap sits in `codegen_a64.rs::layout`.
+    let mut defs: HashMap<Val, u32> = HashMap::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            if let Some(d) = i.dst {
+                *defs.entry(d).or_insert(0) += 1;
+            }
+        }
+    }
     let mut cand: HashMap<Val, i64> = HashMap::new();
     for b in &f.blocks {
         for i in &b.insts {
             if let (Some(d), Op::Const(c)) = (i.dst, &i.op) {
+                if defs.get(&d).copied().unwrap_or(0) != 1 {
+                    continue;
+                }
                 let v = i.ty.truncate(*c);
                 // Up to 32 bits the immediate may use the whole unsigned
                 // range: `cmp $0xffffffff,%r9d` computes exactly right with
@@ -3493,6 +3520,31 @@ fn emit_inst(
             e.line("test dl, dl");
             e.line("cmovnz rax, rcx");
             ra.store_dst(e, d, "rax");
+        }
+        // ROUND 92 -- THE INSTRUCTION THE WHOLE PHI ELIMINATION COMES DOWN TO.
+        //
+        // `phi.rs` puts one of these at the end of every predecessor of a
+        // block that had a phi. How much it costs is decided HERE: when the
+        // allocator gave both ends the same register the copy is free and
+        // disappears completely, when it gave them two registers it is one
+        // `mov`, and only when one end sits in the frame does it touch
+        // memory. That is why the loop counter of round 92 costs nothing
+        // even though FIR now writes a copy per back edge.
+        Op::Copy { src } => {
+            let d = i.dst.ok_or("internal error: copy without target")?;
+            match ra.a.loc(d) {
+                // Straight into its home. `load_full` writes nothing at all
+                // when the value already stands there, so a copy the
+                // allocator has coalesced by accident costs no instruction.
+                Loc::Reg(r) => ra.load_full(e, r, *src),
+                Loc::Slot(_) => {
+                    ra.load_full(e, "rax", *src);
+                    ra.store_dst(e, d, "rax");
+                }
+            }
+        }
+        Op::Phi { .. } => {
+            return Err("internal error: phi in the code generator (phi.rs did not run)".into())
         }
         Op::Barrier { val } => {
             let d = i.dst.ok_or("internal error: barrier without target")?;
