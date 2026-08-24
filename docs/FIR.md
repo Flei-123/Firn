@@ -152,15 +152,28 @@ broken.
 3. **Every value is defined exactly once** and before every use — with
    the exception of back edges, where only values from dominating blocks
    are used. Values never merge anew across a block boundary (see 4).
-4. **No phi nodes.** Every local variable and every parameter has an
-   `alloca` slot of its own; reading is a `load`, writing is a `store`.
-   Justification: stage 0 is supposed to be small and verifiable — without
-   phis, the lowering needs neither dominance computation nor SSA
-   construction, and the backend can simply put every value into a stack
-   slot. The price is more `load`/`store`; that is deliberate, because the
-   register allocation of stage 0 is naive anyway.
-   An SSA construction (`mem2reg`) can be added later without changing the
-   instruction set.
+4. **Phi nodes — since ROUND 92, and only in the middle.** The LOWERING is
+   unchanged: every local variable and every parameter still gets an
+   `alloca` slot of its own, reading is a `load`, writing is a `store`. So
+   `--emit=fir-raw` is phi-free, the lowering needs neither dominance
+   computation nor SSA construction, and `tools/fir_compare.sh` can go on
+   comparing that text octet for octet against the compiler written in Firn.
+
+   What changed is what happens afterwards. `mem2reg.rs` now does the real
+   SSA construction (dominator tree, dominance frontiers, renaming — Cytron
+   et al.) and writes `Op::Phi` where two paths bring two different values
+   to the same block. That is what a variable written SEVERAL times needs;
+   before round 92 only cells written exactly once could be resolved, so
+   every loop counter stayed in memory and nothing above the backend could
+   reason about it.
+
+   `Op::Phi` never reaches a code generator: `phi.rs` turns every phi back
+   into copies at the ends of its predecessors (`Op::Copy`) as the last step
+   before code generation. The invariants — phis at the front of their
+   block, one entry per distinct predecessor, sorted by block number — are
+   checked by `Func::verify_phis` in every build.
+
+   See `docs/ROUND92.md`.
 5. **Type fidelity:** both operands of a binary operation have the type of
    the instruction (exception: the shift amount is brought to the type of
    the left operand during lowering); both operands of a `cmp` have the
@@ -355,7 +368,8 @@ Line by line, the most important points:
 
 ## 8. What FIR does not have (yet)
 
-Deliberately left out in stage 0: phi nodes and SSA construction,
+Deliberately left out in stage 0 (phi nodes and SSA construction came in
+round 92 and are described in section 1 item 4):
 aggregates as values, function pointers/indirect calls, global variables
 (only `const`, and those are substituted), alias information, loop
 information (dominator tree/loop detection), debug metadata, call
