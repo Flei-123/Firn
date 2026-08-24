@@ -1136,6 +1136,23 @@ else
     sed 's/^/        /' "$WORK/optlevels.log" | grep FAIL | head -12
 fi
 
+echo "== 49. the same package on two machines (tools/repro/two_machines.sh, ROUND 93) =="
+# ACCEPTANCE item 5. Not "two directories" like `tools/repro/run.sh` of round
+# 48, but a second run that differs in everything a second machine differs
+# in: working directory, $HOME, $TMPDIR, $TZ, $LANG, $PATH, umask, the
+# clock, the file time stamps, the ORDER the sources were written in, the
+# path of the compiler binary -- and, if qemu-x86_64 is installed, the CPU
+# implementation. Measured on BOTH compilers, plus the lock file.
+bash tools/repro/two_machines.sh > "$WORK/twomachines.log" 2>&1 && TMRC=0 || TMRC=$?
+grep -E '^   (sources|binary|assembly|firn\.lock|the program)' "$WORK/twomachines.log" \
+    | cut -c1-110 | sed 's/^/ /'
+if [ "$TMRC" -eq 0 ]; then
+    ok
+else
+    bad "tools/repro/two_machines.sh failed (see .test-work/twomachines.log)"
+    grep -E 'DIFFERENT|FAILED|MISSING|failed' "$WORK/twomachines.log" | head -12 | sed 's/^/   /'
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then

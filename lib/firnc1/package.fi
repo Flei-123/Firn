@@ -34,6 +34,10 @@ export {
     world_text_name_clash, world_text_no_start,
     normalize, join, dir_of, module_name, absolute, read_within,
     work_dir, is_file, ptext,
+    // ROUND 93 (the lock file, lib/firnc1/lock.fi)
+    relative, build_path, str_less,
+    world_version_ptr, world_root_ptr, world_mpath_ptr,
+    world_dep_count, world_dep_target,
 }
 
 // "no entry" -- offsets into the string store would otherwise be valid.
@@ -267,6 +271,189 @@ fn read_within(ap: u64, an: usize, wp: u64, wn: usize) -> bool {
     return rt.ld8(ap, wn) == 47 as u8
 }
 
+// ROUND 93: is (ap, an) smaller than (bp, bn), octet for octet? The
+// comparison of the lock file: shorter wins when it is a prefix. The same
+// rule as `String::cmp` in `compiler/src/lock.rs`, so both compilers sort
+// a lock file the same way.
+fn str_less(ap: u64, an: usize, bp: u64, bn: usize) -> bool {
+    var i: usize = 0
+    while i < an {
+        if i >= bn {
+            return false
+        }
+        let x: u8 = rt.ld8(ap, i)
+        let y: u8 = rt.ld8(bp, i)
+        if x != y {
+            return x < y
+        }
+        i = i + 1
+    }
+    return an < bn
+}
+
+// ROUND 93: the path from `from` to `to`, purely lexical. Both must be
+// normalized. This is what goes INTO the lock file, so it must not contain
+// a piece of this machine: `relative("/p/app", "/p/geo")` is `../geo` here
+// and on the second machine, whatever the checkout is called there.
+fn relative(out: *mut rt.Buf, fp: u64, fn_: usize, tp: u64, tn: usize) {
+    // 1. how far do the two agree, element by element?
+    var fi: usize = 0
+    var ti: usize = 0
+    while true {
+        var fs: usize = fi
+        while fs < fn_ {
+            if rt.ld8(fp, fs) != 47 as u8 {
+                break
+            }
+            fs = fs + 1
+        }
+        var fe: usize = fs
+        while fe < fn_ {
+            if rt.ld8(fp, fe) == 47 as u8 {
+                break
+            }
+            fe = fe + 1
+        }
+        var ts: usize = ti
+        while ts < tn {
+            if rt.ld8(tp, ts) != 47 as u8 {
+                break
+            }
+            ts = ts + 1
+        }
+        var te: usize = ts
+        while te < tn {
+            if rt.ld8(tp, te) == 47 as u8 {
+                break
+            }
+            te = te + 1
+        }
+        if fe == fs {
+            break
+        }
+        if te == ts {
+            break
+        }
+        if fe - fs != te - ts {
+            break
+        }
+        if !rt.mem_eq(fp + fs as u64, tp + ts as u64, fe - fs) {
+            break
+        }
+        fi = fe
+        ti = te
+    }
+    // 2. every element of `from` that is left becomes one `..`
+    var back: usize = 0
+    var k: usize = fi
+    while k < fn_ {
+        while k < fn_ {
+            if rt.ld8(fp, k) != 47 as u8 {
+                break
+            }
+            k = k + 1
+        }
+        var e: usize = k
+        while e < fn_ {
+            if rt.ld8(fp, e) == 47 as u8 {
+                break
+            }
+            e = e + 1
+        }
+        if e > k {
+            back = back + 1
+        }
+        k = e
+    }
+    // 3. the rest of `to` follows behind
+    var rs: usize = ti
+    while rs < tn {
+        if rt.ld8(tp, rs) != 47 as u8 {
+            break
+        }
+        rs = rs + 1
+    }
+    rt.buf_clear(out)
+    var first: bool = true
+    var pp: [u8; 2] = ".."
+    var b: usize = 0
+    while b < back {
+        if !first {
+            rt.buf_push(out, 47 as u8)
+        }
+        rt.buf_push_bytes(out, (&pp[0]) as u64, 2)
+        first = false
+        b = b + 1
+    }
+    if rs < tn {
+        if !first {
+            rt.buf_push(out, 47 as u8)
+        }
+        rt.buf_push_bytes(out, tp + rs as u64, tn - rs)
+        first = false
+    }
+    if first {
+        rt.buf_push(out, 46 as u8)
+    }
+    null_behind(out)
+}
+
+// ROUND 93: the spelling under which a source file appears IN THIS BUILD.
+// A path inside the working directory becomes relative to it, anything
+// else stays what it was. Twin of `package_world::build_path` -- the reason
+// stands there: the paths of the package search end up in `.debug_line`
+// AND in the message table of the checked arithmetic, so an absolute one
+// makes the artifact depend on where the checkout sits.
+fn build_path(out: *mut rt.Buf, p: u64, n: usize, cp: u64, cn: usize) {
+    var abs: rt.Buf = rt.buf_new()
+    absolute(&abs, p, n, cp, cn)
+    if read_within(rt.buf_ptr(&abs), rt.buf_len(&abs), cp, cn) {
+        relative(out, cp, cn, rt.buf_ptr(&abs), rt.buf_len(&abs))
+    } else {
+        rt.buf_clear(out)
+        rt.buf_push_bytes(out, p, n)
+        null_behind(out)
+    }
+    rt.buf_free(&abs)
+}
+
+// ROUND 93: the three numbers of a version, as one 64 bit number
+// (major * 2^40 + minor * 2^20 + patch) -- that makes comparing them one
+// comparison. Only ever called on a text that `is_version_b` accepted.
+fn version_key(p: u64, n: usize) -> u64 {
+    var part: u64 = 0
+    var k: u64 = 0
+    var i: usize = 0
+    var seen: usize = 0
+    while i < n {
+        let c: u8 = rt.ld8(p, i)
+        if c == 46 as u8 {
+            k = k * 1048576 + part
+            part = 0
+            seen = seen + 1
+        } else {
+            if part < 100000 {
+                part = part * 10 + (c as u64 - 48)
+            }
+        }
+        i = i + 1
+    }
+    k = k * 1048576 + part
+    return k
+}
+
+// Is `have` at least `want`, WITH THE SAME first number? One rule, and
+// cargo's special case for `0.x` is deliberately not copied -- the reason
+// stands in `compiler/src/package.rs::version_at_least`.
+fn version_at_least(hp: u64, hn: usize, wp: u64, wn: usize) -> bool {
+    let h: u64 = version_key(hp, hn)
+    let v: u64 = version_key(wp, wn)
+    if h / 1099511627776 != v / 1099511627776 {
+        return false
+    }
+    return h >= v
+}
+
 // Working directory (getcwd). If that fails, "/" is used.
 fn work_dir(out: *mut rt.Buf) {
     var b: [u8; 4096] = [0 as u8; 4096]
@@ -328,6 +515,13 @@ struct World {
     a_name: Vec[u32],
     a_path: Vec[u32],
     a_line: Vec[u32],
+    // ROUND 93: the version wish of the `needs` line (NONE = none) and the
+    // package it was resolved to. Before this round an edge was recomputed
+    // from its path every time it was needed; since the resolution may bend
+    // an edge onto ANOTHER directory, it has to be written down.
+    a_want: Vec[u32],
+    a_target: Vec[u32],
+    win: Vec[u32],
 
     color: Vec[u32],
     away: Vec[u32],
@@ -347,6 +541,7 @@ fn world_new() -> World {
         p_a0: vec_new[u32](), p_a1: vec_new[u32](),
         q: vec_new[u32](), o: vec_new[u32](),
         a_name: vec_new[u32](), a_path: vec_new[u32](), a_line: vec_new[u32](),
+        a_want: vec_new[u32](), a_target: vec_new[u32](), win: vec_new[u32](),
         color: vec_new[u32](), away: vec_new[u32](),
         last_name: NONE, last_ver: NONE, last_start: NONE,
     }
@@ -372,6 +567,9 @@ fn world_free(w: *mut World) {
     vec_free[u32](&(*w).a_name)
     vec_free[u32](&(*w).a_path)
     vec_free[u32](&(*w).a_line)
+    vec_free[u32](&(*w).a_want)
+    vec_free[u32](&(*w).a_target)
+    vec_free[u32](&(*w).win)
     vec_free[u32](&(*w).color)
     vec_free[u32](&(*w).away)
 }
@@ -636,6 +834,7 @@ fn manifest_read(w: *mut World, txt: u64, tn: usize, mp: u64, mpn: usize) -> boo
     var m_source1: [u8; 34] = "'source' expects exactly one path\0"
     var m_open1: [u8; 42] = "'public' expects at least one module name\0"
     var m_need1: [u8; 34] = "'needs' expects a name and a path\0"
+    var m_need2: [u8; 52] = "'needs' expects at most one version behind the path\0"
     var v_name: [u8; 14] = "invalid name \0"
     var h_name: [u8; 50] = " (letter first, then letters, digits, underscore)\0"
     var v_ver: [u8; 17] = "invalid version \0"
@@ -790,8 +989,21 @@ fn manifest_read(w: *mut World, txt: u64, tn: usize, mp: u64, mpn: usize) -> boo
                                     if !word(txt, end, &pos, &vo2, &vn2) {
                                         return fail(w, mp, mpn, line, (&m_need1[0]) as u64)
                                     }
+                                    // ROUND 93: an optional FOURTH word, the
+                                    // version wish. The order of the checks is
+                                    // the one of `package.rs`: arity first, then
+                                    // the shape of the version, then the name.
+                                    var wo3: usize = 0
+                                    var wn3: usize = 0
+                                    let has_want: bool = word(txt, end, &pos, &wo3, &wn3)
                                     if word(txt, end, &pos, &rest, &rn) {
-                                        return fail(w, mp, mpn, line, (&m_need1[0]) as u64)
+                                        return fail(w, mp, mpn, line, (&m_need2[0]) as u64)
+                                    }
+                                    if has_want {
+                                        if !is_version_b(txt + wo3 as u64, wn3) {
+                                            value_set(w, txt + wo3 as u64, wn3)
+                                            return fail_value(w, mp, mpn, line, (&v_ver[0]) as u64, (&h_ver[0]) as u64)
+                                        }
                                     }
                                     if !is_name_b(txt + vo as u64, vn) {
                                         value_set(w, txt + vo as u64, vn)
@@ -803,9 +1015,14 @@ fn manifest_read(w: *mut World, txt: u64, tn: usize, mp: u64, mpn: usize) -> boo
                                     }
                                     let noff: u32 = s_add(w, txt + vo as u64, vn)
                                     let poff: u32 = s_add(w, txt + vo2 as u64, vn2)
+                                    var woff: u32 = NONE
+                                    if has_want {
+                                        woff = s_add(w, txt + wo3 as u64, wn3)
+                                    }
                                     vec_push[u32](&(*w).a_name, noff)
                                     vec_push[u32](&(*w).a_path, poff)
                                     vec_push[u32](&(*w).a_line, line)
+                                    vec_push[u32](&(*w).a_want, woff)
                                 } else {
                                     value_set(w, txt + ko as u64, kn)
                                     return fail_value(w, mp, mpn, line, (&v_schl[0]) as u64, (&h_schl[0]) as u64)
@@ -933,6 +1150,176 @@ fn dep_root(w: *mut World, p: usize, k: usize, out: *mut rt.Buf) {
     rt.buf_free(&pf)
 }
 
+// ROUND 93: write down, for every `needs` entry, WHICH package it means.
+// Up to now every place recomputed that from the path; the resolution below
+// may bend an edge onto another directory, so it has to be stored.
+fn targets_fill(w: *mut World) {
+    vec_clear[u32](&(*w).a_target)
+    var k: usize = 0
+    while k < vec_len[u32](&(*w).a_name) {
+        vec_push[u32](&(*w).a_target, NONE)
+        k = k + 1
+    }
+    var i: usize = 0
+    while i < world_count(w) {
+        var j: usize = vec_at[u32](&(*w).p_a0, i) as usize
+        let to: usize = vec_at[u32](&(*w).p_a1, i) as usize
+        while j < to {
+            var dw: rt.Buf = rt.buf_new()
+            dep_root(w, i, j, &dw)
+            let z: i64 = world_find_root(w, rt.buf_ptr(&dw), rt.buf_len(&dw))
+            rt.buf_free(&dw)
+            if z >= 0 {
+                vec_set[u32](&(*w).a_target, j, z as u32)
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+}
+
+fn version_key_of(w: *mut World, p: usize) -> u64 {
+    let z: u64 = s_ptr(w, vec_at[u32](&(*w).p_ver, p))
+    return version_key(z, rt.c_length(z))
+}
+
+// Index in `win` of the package with the same name as `p`, otherwise -1.
+fn win_place(w: *mut World, p: usize) -> i64 {
+    let np: u64 = s_ptr(w, vec_at[u32](&(*w).p_name, p))
+    let nn: usize = rt.c_length(np)
+    var t: usize = 0
+    while t < vec_len[u32](&(*w).win) {
+        let k: usize = vec_at[u32](&(*w).win, t) as usize
+        let kp: u64 = s_ptr(w, vec_at[u32](&(*w).p_name, k))
+        if rt.c_length(kp) == nn {
+            if rt.mem_eq(kp, np, nn) {
+                return t as i64
+            }
+        }
+        t = t + 1
+    }
+    return 0 - 1
+}
+
+// "package 'x' comes from two directories with version v" -- the two roots
+// in the order of their names, so that both compilers write the same note.
+fn text_two_directories(w: *mut World, i: usize, k: usize) {
+    var t1: [u8; 9] = "package \0"
+    var t2: [u8; 42] = " comes from two directories with version \0"
+    var t3: [u8; 6] = " and \0"
+    var a: usize = i
+    var b: usize = k
+    let ra: u64 = s_ptr(w, vec_at[u32](&(*w).p_root, k))
+    let rb: u64 = s_ptr(w, vec_at[u32](&(*w).p_root, i))
+    if str_less(ra, rt.c_length(ra), rb, rt.c_length(rb)) {
+        a = k
+        b = i
+    }
+    error_begin(w)
+    ptext(&(*w).err, (&t1[0]) as u64)
+    rt.buf_push(&(*w).err, 39 as u8)
+    ptext(&(*w).err, s_ptr(w, vec_at[u32](&(*w).p_name, i)))
+    rt.buf_push(&(*w).err, 39 as u8)
+    ptext(&(*w).err, (&t2[0]) as u64)
+    ptext(&(*w).err, s_ptr(w, vec_at[u32](&(*w).p_ver, i)))
+    error_final(w)
+    error_note(w)
+    rt.buf_push(&(*w).err, 39 as u8)
+    ptext(&(*w).err, s_ptr(w, vec_at[u32](&(*w).p_root, a)))
+    rt.buf_push(&(*w).err, 39 as u8)
+    ptext(&(*w).err, (&t3[0]) as u64)
+    rt.buf_push(&(*w).err, 39 as u8)
+    ptext(&(*w).err, s_ptr(w, vec_at[u32](&(*w).p_root, b)))
+    rt.buf_push(&(*w).err, 39 as u8)
+    error_final(w)
+}
+
+// "dependency 'x' is version a, needed is b or higher with the same first
+// number" -- at the line of the `needs` entry, because that is what to change.
+fn text_version_wish(w: *mut World, p: usize, k: usize, target: usize) {
+    var t1: [u8; 12] = "dependency \0"
+    var t2: [u8; 13] = " is version \0"
+    var t3: [u8; 13] = ", needed is \0"
+    var t4: [u8; 38] = " or higher with the same first number\0"
+    let mz: u64 = s_ptr(w, vec_at[u32](&(*w).p_mpath, p))
+    error_begin(w)
+    error_place(w, mz, rt.c_length(mz), vec_at[u32](&(*w).a_line, k))
+    ptext(&(*w).err, (&t1[0]) as u64)
+    rt.buf_push(&(*w).err, 39 as u8)
+    ptext(&(*w).err, s_ptr(w, vec_at[u32](&(*w).a_name, k)))
+    rt.buf_push(&(*w).err, 39 as u8)
+    ptext(&(*w).err, (&t2[0]) as u64)
+    ptext(&(*w).err, s_ptr(w, vec_at[u32](&(*w).p_ver, target)))
+    ptext(&(*w).err, (&t3[0]) as u64)
+    ptext(&(*w).err, s_ptr(w, vec_at[u32](&(*w).a_want, k)))
+    ptext(&(*w).err, (&t4[0]) as u64)
+    error_final(w)
+}
+
+// ONE VERSION PER PACKAGE NAME (round 93). Twin of
+// `package_world::resolve_versions` -- the reasoning stands there: two
+// directories that call themselves the same thing are not two packages, and
+// `import geo` has to mean the same thing everywhere. The highest version
+// wins, every edge is bent onto it, and afterwards every wish is measured
+// against what really got picked.
+fn versions_resolve(w: *mut World) -> bool {
+    vec_clear[u32](&(*w).win)
+    var i: usize = 0
+    while i < world_count(w) {
+        let place: i64 = win_place(w, i)
+        if place < 0 {
+            vec_push[u32](&(*w).win, i as u32)
+        } else {
+            let k: usize = vec_at[u32](&(*w).win, place as usize) as usize
+            let a: u64 = version_key_of(w, i)
+            let b: u64 = version_key_of(w, k)
+            if a > b {
+                vec_set[u32](&(*w).win, place as usize, i as u32)
+            } else {
+                if a == b {
+                    text_two_directories(w, i, k)
+                    return false
+                }
+            }
+        }
+        i = i + 1
+    }
+    var j: usize = 0
+    while j < vec_len[u32](&(*w).a_target) {
+        let tg: u32 = vec_at[u32](&(*w).a_target, j)
+        if tg != NONE {
+            let place: i64 = win_place(w, tg as usize)
+            if place >= 0 {
+                vec_set[u32](&(*w).a_target, j,
+                    vec_at[u32](&(*w).win, place as usize))
+            }
+        }
+        j = j + 1
+    }
+    var pi: usize = 0
+    while pi < world_count(w) {
+        var k2: usize = vec_at[u32](&(*w).p_a0, pi) as usize
+        let to: usize = vec_at[u32](&(*w).p_a1, pi) as usize
+        while k2 < to {
+            let wo: u32 = vec_at[u32](&(*w).a_want, k2)
+            if wo != NONE {
+                let tg: u32 = vec_at[u32](&(*w).a_target, k2)
+                if tg != NONE {
+                    let hp: u64 = s_ptr(w, vec_at[u32](&(*w).p_ver, tg as usize))
+                    let vp: u64 = s_ptr(w, wo)
+                    if !version_at_least(hp, rt.c_length(hp), vp, rt.c_length(vp)) {
+                        text_version_wish(w, pi, k2, tg as usize)
+                        return false
+                    }
+                }
+            }
+            k2 = k2 + 1
+        }
+        pi = pi + 1
+    }
+    return true
+}
+
 // Depth first search with three colours: 0 = unseen, 1 = in progress, 2 = done.
 fn cycle_dfs(w: *mut World, i: usize) -> bool {
     vec_set[u32](&(*w).color, i, 1)
@@ -940,10 +1327,10 @@ fn cycle_dfs(w: *mut World, i: usize) -> bool {
     var k: usize = vec_at[u32](&(*w).p_a0, i) as usize
     let to: usize = vec_at[u32](&(*w).p_a1, i) as usize
     while k < to {
-        var dw: rt.Buf = rt.buf_new()
-        dep_root(w, i, k, &dw)
-        let z: i64 = world_find_root(w, rt.buf_ptr(&dw), rt.buf_len(&dw))
-        rt.buf_free(&dw)
+        // ROUND 93: the edge as the RESOLUTION left it, not as the path
+        // spells it -- otherwise the check would look at edges that the
+        // version resolution has just bent somewhere else.
+        let z: i64 = world_dep_target(w, i, k - vec_at[u32](&(*w).p_a0, i) as usize)
         if z >= 0 {
             let zi: usize = z as usize
             if vec_at[u32](&(*w).color, zi) == 1 {
@@ -1094,6 +1481,13 @@ fn world_build(w: *mut World, wp: u64, wn: usize) -> bool {
         }
         i = i + 1
     }
+    // ROUND 93, IN THIS ORDER: write down every edge, pick one version per
+    // name, and only THEN look for cycles -- the check has to see the edges
+    // the build will really walk.
+    targets_fill(w)
+    if !versions_resolve(w) {
+        return false
+    }
     return cycles_check(w)
 }
 
@@ -1224,11 +1618,11 @@ fn world_edge(w: *mut World, p: usize, np: u64, nn: usize) -> i64 {
         let z: u64 = s_ptr(w, vec_at[u32](&(*w).a_name, k))
         if rt.c_length(z) == nn {
             if rt.mem_eq(z, np, nn) {
-                var dw: rt.Buf = rt.buf_new()
-                dep_root(w, p, k, &dw)
-                let idx: i64 = world_find_root(w, rt.buf_ptr(&dw), rt.buf_len(&dw))
-                rt.buf_free(&dw)
-                return idx
+                let tg: u32 = vec_at[u32](&(*w).a_target, k)
+                if tg == NONE {
+                    return 0 - 1
+                }
+                return tg as i64
             }
         }
         k = k + 1
@@ -1274,6 +1668,37 @@ fn world_source_base(w: *mut World, p: usize, i: usize, out: *mut rt.Buf) {
     null_behind(out)
     rt.buf_free(&wz)
     rt.buf_free(&qs)
+}
+
+// ROUND 93, for lib/firnc1/lock.fi: version, root directory, manifest path,
+// and the edges as the resolution left them.
+fn world_version_ptr(w: *mut World, p: usize) -> u64 {
+    return s_ptr(w, vec_at[u32](&(*w).p_ver, p))
+}
+
+fn world_root_ptr(w: *mut World, p: usize) -> u64 {
+    return s_ptr(w, vec_at[u32](&(*w).p_root, p))
+}
+
+fn world_mpath_ptr(w: *mut World, p: usize) -> u64 {
+    return s_ptr(w, vec_at[u32](&(*w).p_mpath, p))
+}
+
+fn world_dep_count(w: *mut World, p: usize) -> usize {
+    return vec_at[u32](&(*w).p_a1, p) as usize - vec_at[u32](&(*w).p_a0, p) as usize
+}
+
+// The i-th dependency of package `p`, as the resolution left it. -1 = none.
+fn world_dep_target(w: *mut World, p: usize, i: usize) -> i64 {
+    let k: usize = vec_at[u32](&(*w).p_a0, p) as usize + i
+    if k >= vec_len[u32](&(*w).a_target) {
+        return 0 - 1
+    }
+    let tg: u32 = vec_at[u32](&(*w).a_target, k)
+    if tg == NONE {
+        return 0 - 1
+    }
+    return tg as i64
 }
 
 // The name of the package, null terminated.
@@ -1434,6 +1859,12 @@ fn world_info(w: *mut World, vp: u64, vn: usize, out: *mut rt.Buf) {
         ptext(out, s_ptr(w, vec_at[u32](&(*w).a_name, i)))
         rt.buf_push(out, 32 as u8)
         ptext(out, rt.buf_ptr(&t))
+        // ROUND 93: a report that hid the version wish would be a lie about
+        // the manifest (`package::info_text` writes the same line).
+        if vec_at[u32](&(*w).a_want, i) != NONE {
+            rt.buf_push(out, 32 as u8)
+            ptext(out, s_ptr(w, vec_at[u32](&(*w).a_want, i)))
+        }
         rt.buf_push(out, 10 as u8)
         rt.buf_free(&ps)
         i = i + 1
