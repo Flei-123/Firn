@@ -36,6 +36,7 @@ mod inline;
 mod layout;
 mod lexer;
 mod licm;
+mod phi;
 mod lower;
 mod lower_errors;
 mod lower_match;
@@ -762,6 +763,21 @@ fn run(opts: &Options) -> i32 {
         }
     }
 
+    // ROUND 92 -- there is deliberately NO phi check here.
+    //
+    // Between two passes the entry lists are allowed to be out of date: a
+    // `brcond` that `simplify-term` turns into a `br` removes an edge and
+    // leaves an entry behind, and the next `mem2reg` round trims it. Making
+    // that an error here would report normal work as a fault.
+    //
+    // The check that BINDS sits in `phi.rs`, after `simplify_phis` and
+    // before a single instruction is emitted, and it runs in every build,
+    // not behind an environment variable. `FIRN_VERIFY_PHI=2` is the
+    // debugging aid on top of it (`opt.rs::phi_check`): it names the pass
+    // that broke something, and a "TWO entries for bb..." line from it is
+    // always a bug, while a count mismatch may be one of the transients
+    // described above.
+
     tm.mark("optimizer");
     if opts.stats {
         eprintln!(
@@ -783,6 +799,18 @@ fn run(opts: &Options) -> i32 {
     // above this line -- lexer, parser, checker, lowering, optimizer -- has
     // no idea which machine it is working for, and that is the whole point
     // of the round.
+    // ROUND 92 -- PHI ELIMINATION, and it happens exactly once, here.
+    //
+    // `mem2reg.rs` builds phi nodes; no machine has one. Every backend could
+    // take them apart for itself, and there are three of them -- that is the
+    // shape round 90's bug had (one question, three answers, two of them
+    // silently out of date). So the phis become copies ONCE, on FIR, and
+    // every code generator below this line reads the same phi-free
+    // instruction list it read before round 92.
+    if let Err(e) = phi::eliminate(&mut module) {
+        eprintln!("error: {}", e);
+        return 1;
+    }
     let emitted = match target::active() {
         target::Target::X86_64 => codegen_x86::emit(&module),
         target::Target::Aarch64 => codegen_a64::emit(&module),

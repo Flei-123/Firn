@@ -58,6 +58,8 @@ pub struct OptStats {
     pub threaded: usize,
     /// ROUND 82: places at which `peephole.rs` replaced an instruction
     pub strength: usize,
+    /// ROUND 92: phi entries dropped or phis folded back into one value
+    pub phis_folded: usize,
 }
 
 // ----------------------------------------------------- Pass register ---
@@ -346,6 +348,9 @@ pub fn optimize_with(m: &mut Module, cfg: &OptConfig) -> OptStats {
         let t = std::time::Instant::now();
         st.inlined += crate::inline::inline_module(m);
         clk.add("inline", t);
+        for f in m.funcs.iter() {
+            phi_check(f, "inline");
+        }
         for f in m.funcs.iter_mut() {
             optimize_func(f, &mut st, cfg, &mut clk);
         }
@@ -411,6 +416,25 @@ impl Fix {
     }
 }
 
+/// ROUND 92 -- `FIRN_VERIFY_PHI=2` checks the phi invariants after EVERY
+/// pass and names the one that broke them. That is how the duplicate entry
+/// of `tests/800_std_str_core.fi` was found; it costs a predecessor table
+/// per pass and is therefore off unless asked for.
+///
+/// HOW TO READ ITS OUTPUT. A line saying "TWO entries for bbN" is ALWAYS a
+/// bug: one predecessor cannot bring two different values. A line saying
+/// "phi has N entries, the block has M predecessors" may be a transient --
+/// `simplify-term` removes an edge and the next `mem2reg` round trims the
+/// entry that stood for it -- so what matters there is whether it survives
+/// the next `mem2reg`.
+fn phi_check(f: &Func, pass: &str) {
+    if std::env::var_os("FIRN_VERIFY_PHI").map(|v| v == "2").unwrap_or(false) {
+        if let Err(e) = f.verify_phis() {
+            eprintln!("PHI BROKEN after '{}': {}", pass, e);
+        }
+    }
+}
+
 fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut PassClock) {
     let mut round = 0;
     let mut fx = Fix::new();
@@ -422,16 +446,26 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut Pas
             let c = fold_constants(f, st);
             clk.add2("fold", t, c);
             fx.note(0, c);
+            phi_check(f, "fold");
         }
         if cfg.runs("mem2reg") && fx.due(1) {
             let t = std::time::Instant::now();
-            let p =
-                crate::mem2reg::promote_single_store(f) + crate::mem2reg::forward_local_loads(f);
+            // ROUND 92: `promote_allocas` is the real thing now (dominance
+            // frontiers, phi nodes, renaming) and subsumes what
+            // `promote_single_store` did until round 91 -- a cell written
+            // once is just the case in which no phi is needed.
+            // `simplify_phis` is the hygiene that keeps the entry lists in
+            // step with a control flow graph the other passes keep changing.
+            let p = crate::mem2reg::promote_allocas(f)
+                + crate::mem2reg::forward_local_loads(f);
+            let sp = crate::mem2reg::simplify_phis(f);
             let ds = crate::mem2reg::remove_dead_stores(f);
             st.removed_insts += ds;
             st.promoted_loads += p;
-            clk.add2("mem2reg", t, p > 0 || ds > 0);
-            fx.note(1, p > 0 || ds > 0);
+            st.phis_folded += sp;
+            clk.add2("mem2reg", t, p > 0 || ds > 0 || sp > 0);
+            fx.note(1, p > 0 || ds > 0 || sp > 0);
+            phi_check(f, "mem2reg");
         }
         if cfg.runs("copyprop") && fx.due(2) {
             let t = std::time::Instant::now();
@@ -439,6 +473,7 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut Pas
             st.copies += c;
             clk.add2("copyprop", t, c > 0);
             fx.note(2, c > 0);
+            phi_check(f, "copyprop");
         }
         if cfg.runs("strength") && fx.due(3) {
             let t = std::time::Instant::now();
@@ -446,6 +481,7 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut Pas
             st.strength += n;
             clk.add2("strength", t, n > 0);
             fx.note(3, n > 0);
+            phi_check(f, "strength");
         }
         if cfg.runs("cse") && fx.due(4) {
             let t = std::time::Instant::now();
@@ -453,6 +489,7 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut Pas
             st.cse += e;
             clk.add2("cse", t, e > 0);
             fx.note(4, e > 0);
+            phi_check(f, "cse");
         }
         if cfg.runs("licm") && fx.due(5) {
             let t = std::time::Instant::now();
@@ -460,6 +497,7 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut Pas
             st.hoisted += h;
             clk.add2("licm", t, h > 0);
             fx.note(5, h > 0);
+            phi_check(f, "licm");
         }
         if cfg.runs("bce") && fx.due(6) {
             let t = std::time::Instant::now();
@@ -467,6 +505,7 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut Pas
             st.removed_checks += r;
             clk.add2("bce", t, r > 0);
             fx.note(6, r > 0);
+            phi_check(f, "bce");
         }
         if cfg.runs("thread-bool") && fx.due(7) {
             let clock = std::time::Instant::now();
@@ -474,12 +513,14 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut Pas
             st.threaded += t;
             clk.add2("thread-bool", clock, t > 0);
             fx.note(7, t > 0);
+            phi_check(f, "thread-bool");
         }
         if cfg.runs("simplify-term") && fx.due(8) {
             let t = std::time::Instant::now();
             let c = simplify_terminators(f);
             clk.add2("simplify-term", t, c);
             fx.note(8, c);
+            phi_check(f, "simplify-term");
         }
         if cfg.runs("merge-blocks") && fx.due(9) {
             let t = std::time::Instant::now();
@@ -487,6 +528,7 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut Pas
             st.merged_blocks += mb;
             clk.add2("merge-blocks", t, mb > 0);
             fx.note(9, mb > 0);
+            phi_check(f, "merge-blocks");
         }
         if cfg.runs("dce") && fx.due(10) {
             let t = std::time::Instant::now();
@@ -494,6 +536,7 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut Pas
             let b = remove_dead_insts(f, st);
             clk.add2("dce", t, a || b);
             fx.note(10, a || b);
+            phi_check(f, "dce");
         }
         clk.rounds += 1;
         if !fx.changed || round >= MAX_ROUNDS {
@@ -1274,32 +1317,76 @@ fn simplify_terminators(f: &mut Func) -> bool {
 
 // -------------------------------------------------------------- dead code ---
 
-fn collect_uses(f: &Func, blocks: &[usize]) -> HashSet<Val> {
-    let mut used = HashSet::new();
+/// Every value that is really read.
+///
+/// ROUND 92 -- A PHI DOES NOT KEEP ITS OPERANDS ALIVE ON ITS OWN.
+///
+/// Counting phi operands like any other use looks harmless and is not: two
+/// phis in a loop read each other, so a loop counter nobody uses any more
+/// holds ITSELF alive for ever and the dead code pass never gets rid of it.
+/// The answer is the standard one: seed the set from what NON-phi code
+/// reads, and let a phi hand its "used" on to its operands only once the phi
+/// itself has been reached. A ring of phis nothing else touches is then
+/// never reached and falls away completely.
+///
+/// `phi_edge` decides which entries count at all. `remove_unreachable_blocks`
+/// passes a filter that ignores entries coming out of blocks it is about to
+/// delete -- without it a phi would hold a value of a dead block alive and
+/// block its own removal (measured: `dce` stopped dead on the first `while`
+/// loop with a `break` in it).
+fn collect_uses_filtered(
+    f: &Func,
+    blocks: &[usize],
+    phi_edge: &dyn Fn(crate::fir::BlockId) -> bool,
+) -> HashSet<Val> {
+    let mut used: HashSet<Val> = HashSet::new();
+    let mut phi_args: HashMap<Val, Vec<Val>> = HashMap::new();
+    let mut work: Vec<Val> = Vec::new();
     let mut buf = Vec::new();
     for &bi in blocks {
         let b = &f.blocks[bi];
         for i in &b.insts {
+            if let (Some(d), Op::Phi { incoming }) = (i.dst, &i.op) {
+                phi_args.insert(
+                    d,
+                    incoming.iter().filter(|(p, _)| phi_edge(*p)).map(|(_, v)| *v).collect(),
+                );
+                continue;
+            }
             buf.clear();
             i.op.uses(&mut buf);
             for v in buf.iter() {
-                used.insert(*v);
+                if used.insert(*v) {
+                    work.push(*v);
+                }
             }
         }
-        match &b.term {
-            Term::BrCond { cond, .. } => {
-                used.insert(*cond);
+        let t = match &b.term {
+            Term::BrCond { cond, .. } => Some(*cond),
+            Term::Ret(Some(v)) => Some(*v),
+            Term::Switch { val, .. } => Some(*val),
+            Term::Br(_) | Term::Ret(None) | Term::Unset => None,
+        };
+        if let Some(v) = t {
+            if used.insert(v) {
+                work.push(v);
             }
-            Term::Ret(Some(v)) => {
-                used.insert(*v);
+        }
+    }
+    while let Some(v) = work.pop() {
+        if let Some(args) = phi_args.get(&v) {
+            for a in args.clone() {
+                if used.insert(a) {
+                    work.push(a);
+                }
             }
-            Term::Switch { val, .. } => {
-                used.insert(*val);
-            }
-            Term::Br(_) | Term::Ret(None) | Term::Unset => {}
         }
     }
     used
+}
+
+fn collect_uses(f: &Func, blocks: &[usize]) -> HashSet<Val> {
+    collect_uses_filtered(f, blocks, &|_| true)
 }
 
 fn remove_unreachable_blocks(f: &mut Func, st: &mut OptStats) -> bool {
@@ -1333,7 +1420,10 @@ fn remove_unreachable_blocks(f: &mut Func, st: &mut OptStats) -> bool {
     // NOTHING is removed — better dead code than a dangling
     // Val id.
     let live_idx: Vec<usize> = (0..f.blocks.len()).filter(|&i| reachable[i]).collect();
-    let used = collect_uses(f, &live_idx);
+    let reach_of = reachable.clone();
+    let used = collect_uses_filtered(f, &live_idx, &|p| {
+        index_of.get(&p).map(|&i| reach_of[i]).unwrap_or(false)
+    });
     for (i, b) in f.blocks.iter().enumerate() {
         if reachable[i] {
             continue;
@@ -1360,6 +1450,19 @@ fn remove_unreachable_blocks(f: &mut Func, st: &mut OptStats) -> bool {
     }
     for (n, b) in kept.iter_mut().enumerate() {
         b.id = n as BlockId;
+        // ROUND 92: the phi entries name BLOCKS, and the blocks have just
+        // been renumbered. An entry whose block is gone goes with it -- the
+        // edge it stood for does not exist any more.
+        let np = b.phi_count();
+        for i in b.insts[..np].iter_mut() {
+            if let Op::Phi { incoming } = &mut i.op {
+                incoming.retain(|(p, _)| new_id.contains_key(p));
+                for e in incoming.iter_mut() {
+                    e.0 = new_id[&e.0];
+                }
+                incoming.sort_by_key(|(p, _)| *p);
+            }
+        }
         b.term = match &b.term {
             Term::Br(t) => Term::Br(new_id[t]),
             Term::BrCond { cond, then_bb, else_bb } => {
@@ -1619,10 +1722,23 @@ mod tests {
         assert_eq!(st.removed_insts, 4);
     }
 
+    /// ROUND 92 -- THIS TEST USED TO SAY THE OPPOSITE, AND IT WAS RIGHT TO.
+    ///
+    /// Until round 91 it was called `loop_stays_untouched_and_terminated`
+    /// and it asserted that the optimizer removes NOTHING here: `i` is
+    /// written on every pass, FIR had no phi nodes, so `mem2reg` could not
+    /// touch the cell and the `load`/`store` pair stayed in the loop for
+    /// ever. That was not a wish, it was the honest description of what the
+    /// compiler did -- and it is exactly the wall round 92 was opened to
+    /// take down.
+    ///
+    /// The same eleven instructions now come out as six, with the counter in
+    /// a phi and not one memory access left in the body. What the test still
+    /// insists on is the other half of the old name: the optimizer HALTS,
+    /// and the loop is still a loop afterwards.
     #[test]
-    fn loop_stays_untouched_and_terminated() {
-        // while (i < 10) { i = i + 1 }  — nothing of that is constant foldable,
-        // the optimizer may remove nothing here and must halt.
+    fn loop_counter_becomes_a_phi() {
+        // while (i < 10) { i = i + 1 }
         let mut f = Func::new("t", vec![], FTy::I32);
         let head = f.add_block();
         let body = f.add_block();
@@ -1646,12 +1762,27 @@ mod tests {
         let blocks = f.blocks.len();
         let mut m = Module::new();
         m.funcs.push(f);
-        let st = optimize(&mut m);
-        assert_eq!(st.folded, 0);
-        assert_eq!(st.removed_insts, 0);
-        assert_eq!(st.removed_blocks, 0);
-        assert_eq!(m.funcs[0].inst_count(), before);
-        assert_eq!(m.funcs[0].blocks.len(), blocks);
+        optimize(&mut m);
+        let g = &m.funcs[0];
+        assert_eq!(g.blocks.len(), blocks, "the loop is still a loop");
+        assert!(g.inst_count() < before, "{} instructions, was {}", g.inst_count(), before);
+        // Nothing touches memory any more.
+        for b in &g.blocks {
+            for i in &b.insts {
+                assert!(
+                    !matches!(i.op, Op::Alloca { .. } | Op::Load { .. } | Op::Store { .. }),
+                    "the counter is still in the frame:\n{}",
+                    m.to_text()
+                );
+            }
+        }
+        // ... and the counter really is a phi in the loop head.
+        assert!(
+            m.funcs[0].blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i.op, Op::Phi { .. }))),
+            "{}",
+            m.to_text()
+        );
+        assert!(m.funcs[0].verify_phis().is_ok(), "{:?}", m.funcs[0].verify_phis());
     }
 
     #[test]
