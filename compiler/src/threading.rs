@@ -103,9 +103,54 @@ struct Fork {
     els: BlockId,
 }
 
+/// **ROUND 92** — the cells this pass is about to fold into jumps.
+///
+/// `mem2reg.rs` asks before it promotes anything. Without that question the
+/// two passes race: `mem2reg` runs first in the round, would turn the bool
+/// cell into a phi, and the short circuit of `&&`/`||` that this pass has
+/// been folding into two jumps since round 74 would silently stop
+/// happening — no test would fail, the code would just get longer. So a
+/// cell that stands in a fork block is left in memory for exactly one more
+/// round; afterwards the fork block is unreachable, this list is empty, and
+/// the cell is promoted like any other.
+pub(crate) fn fork_cells(f: &Func) -> std::collections::HashSet<Val> {
+    let mut out = std::collections::HashSet::new();
+    if f.constant_time || f.blocks.iter().enumerate().any(|(i, b)| b.id as usize != i) {
+        return out;
+    }
+    for b in &f.blocks {
+        if b.id == 0 || b.insts.len() != 1 {
+            continue;
+        }
+        let i = &b.insts[0];
+        let (d, addr) = match (i.dst, &i.op) {
+            (Some(d), Op::Load { addr }) => (d, *addr),
+            _ => continue,
+        };
+        if i.ty != FTy::Bool {
+            continue;
+        }
+        if let Term::BrCond { cond, .. } = &b.term {
+            if *cond == d {
+                out.insert(addr);
+            }
+        }
+    }
+    out
+}
+
 pub(crate) fn thread_bool_cells(f: &mut Func) -> usize {
     // SPEC §9.2: in constant-time functions no jump ever comes about here.
     if f.constant_time {
+        return 0;
+    }
+    // ROUND 92: this pass REDIRECTS edges — it makes a predecessor jump
+    // straight past the fork block into its two arms. A block with a phi
+    // would then have a predecessor its entry list never heard of, and no
+    // pass can invent the value that travels along a new edge. So a function
+    // that already carries phis is left alone; by then `mem2reg.rs` has
+    // taken over the cells anyway (see `fork_cells`).
+    if f.has_phi() {
         return 0;
     }
     // Invariant blocks[i].id == i — otherwise the indices compute wrong.

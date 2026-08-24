@@ -1081,6 +1081,17 @@ fn emit_inst(
             e.line(&format!("csel {}, {}, {}, ne", A, B, A));
             store_dst(e, fr, d, A);
         }
+        // ROUND 92 -- see the same arm in `codegen_x86.rs`. This machine has
+        // no register allocation at all, so every value lives in the frame
+        // and a copy is one `ldr` plus one `str`.
+        Op::Copy { src } => {
+            let d = i.dst.ok_or("internal error: copy without target")?;
+            load_full(e, fr, A, *src);
+            store_dst(e, fr, d, A);
+        }
+        Op::Phi { .. } => {
+            return Err("internal error: phi in the code generator (phi.rs did not run)".into())
+        }
         Op::Barrier { val } => {
             let d = i.dst.ok_or("internal error: barrier without target")?;
             load_full(e, fr, A, *val);

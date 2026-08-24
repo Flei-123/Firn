@@ -1135,6 +1135,21 @@ fn emit_inst(
             e.line("cmovnz rax, rcx");
             store_dst(e, fr, d, "rax");
         }
+        // ROUND 92 -- the copy that `phi.rs` leaves behind. On the base path
+        // every value lives in the frame, so this is one load and one store;
+        // the register aware path in `regalloc.rs` turns it into a single
+        // `mov` between registers, or into nothing at all when both ends
+        // already share one.
+        Op::Copy { src } => {
+            let d = i.dst.ok_or("internal error: copy without target")?;
+            load_full(e, fr, "rax", *src);
+            store_dst(e, fr, d, "rax");
+        }
+        // ROUND 92 -- `phi.rs` runs before every backend, so a phi can only
+        // get here if somebody wired a new code path past it.
+        Op::Phi { .. } => {
+            return Err("internal error: phi in the code generator (phi.rs did not run)".into())
+        }
         Op::Barrier { val } => {
             // Opaque: the value passes through an empty asm needle eye.
             let d = i.dst.ok_or("internal error: barrier without target")?;

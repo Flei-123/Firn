@@ -243,7 +243,7 @@ fn inline_one(m: &mut Module, ci: usize, bi: usize, mut ii: usize, gi: usize) {
             if matches!(i.op, Op::Alloca { .. }) {
                 continue; // stands at the entry block already
             }
-            let op = remap_op(&i.op, &mv);
+            let op = remap_op(&i.op, &mv, Some(&blockmap));
             f.blocks[nb].insts.push(Inst { dst: i.dst.map(&mv), ty: i.ty, op });
         }
         f.blocks[nb].term = match &b.term {
@@ -274,9 +274,22 @@ fn inline_one(m: &mut Module, ci: usize, bi: usize, mut ii: usize, gi: usize) {
     }
 }
 
-fn remap_op(op: &Op, mv: &dyn Fn(Val) -> Val) -> Op {
+/// ROUND 92 -- `blockmap` is the callee's block numbering translated into
+/// the caller's. Only `Op::Phi` needs it: its entries name BLOCKS, and a
+/// block of the callee has a different number inside the caller. Everything
+/// else names values alone and passes `None`.
+fn remap_op(op: &Op, mv: &dyn Fn(Val) -> Val, blockmap: Option<&HashMap<u32, u32>>) -> Op {
     match op {
         Op::Const(c) => Op::Const(*c),
+        Op::Phi { incoming } => {
+            let mut inc: Vec<(crate::fir::BlockId, Val)> = incoming
+                .iter()
+                .map(|(b, v)| (blockmap.map(|m| m[b]).unwrap_or(*b), mv(*v)))
+                .collect();
+            inc.sort_by_key(|(b, _)| *b);
+            Op::Phi { incoming: inc }
+        }
+        Op::Copy { src } => Op::Copy { src: mv(*src) },
         Op::Alloca { size, align } => Op::Alloca { size: *size, align: *align },
         Op::Bin(o, a, b) => Op::Bin(*o, mv(*a), mv(*b)),
         // ROUND 72 — checked/wrap/sat arithmetic: same operand shape as
