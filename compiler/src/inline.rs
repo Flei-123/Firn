@@ -227,7 +227,38 @@ fn inline_one(m: &mut Module, ci: usize, bi: usize, mut ii: usize, gi: usize) {
     f.blocks[bi].insts.pop(); // the `call` itself falls away
     let old_term = std::mem::replace(&mut f.blocks[bi].term, Term::Br(blockmap[&callee.entry()]));
     f.blocks[cont as usize].insts = tail;
-    f.blocks[cont as usize].term = old_term;
+    f.blocks[cont as usize].term = old_term.clone();
+
+    // ROUND 92 -- THE CALLING BLOCK IS NOT THE PREDECESSOR ANY MORE.
+    //
+    // Splitting `bi` at the call site moves its TERMINATOR into `cont`. So
+    // everything `bi` used to jump to is now jumped to by `cont`, and a phi
+    // in one of those blocks still names `bi` as the edge its value comes
+    // in on. Re-key it.
+    //
+    // Found by `tests/303_wtf8_roundtrip.fi`, which printed
+    // `0 0 0 0 2048 1112064` instead of `65536 2048 2049 0 1114112 0` at
+    // `release-safe` and `release-fast` -- the two levels that inline -- and
+    // was right at `dev` and `dev-fast`, which do not. `phi.rs` then put the
+    // copy for that edge at the end of a block the control flow no longer
+    // takes, so the phi's value was whatever the other edge had left behind.
+    for sb in old_term.successors() {
+        let sb = sb as usize;
+        if sb >= f.blocks.len() {
+            continue;
+        }
+        let np = f.blocks[sb].phi_count();
+        for i in f.blocks[sb].insts[..np].iter_mut() {
+            if let Op::Phi { incoming } = &mut i.op {
+                for e in incoming.iter_mut() {
+                    if e.0 as usize == bi {
+                        e.0 = cont;
+                    }
+                }
+                incoming.sort_by_key(|(p, _)| *p);
+            }
+        }
+    }
 
     // 5. Define the result value at the start of the continuation.
     if let (Some(d), Some(slot)) = (dst, result_slot) {
