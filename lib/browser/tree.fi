@@ -60,13 +60,14 @@ export {
     EM_INITIAL, EM_BEFORE_HTML, EM_BEFORE_HEAD, EM_IN_HEAD, EM_IN_HEAD_NOSCRIPT,
     EM_AFTER_HEAD, EM_IN_BODY, EM_TEXT, EM_IN_TABLE, EM_IN_TABLE_TEXT,
     EM_IN_CAPTION, EM_IN_COLGROUP, EM_IN_TABLE_BODY, EM_IN_ROW, EM_IN_CELL,
-    EM_IN_SELECT, EM_IN_SELECT_IN_TABLE, EM_AFTER_BODY, EM_IN_FRAMESET,
+    EM_AFTER_BODY, EM_IN_FRAMESET,
     EM_AFTER_FRAMESET, EM_AFTER_AFTER_BODY, EM_AFTER_AFTER_FRAMESET,
     EM_IN_TEMPLATE,
     tree_new, tree_buffer_init, tree_init, tree_fragment_init, tree_free,
     tree_token, tree_eof, tree_document, tree_root,
     tree_error, tree_broken, tree_release,
     tree_switching, tree_sw_pos, tree_sw_tag, tree_sw_delete, tree_input_set,
+    tree_scripting_set, tree_scripting,
     tree_mode, tree_open_number,
 }
 
@@ -87,8 +88,8 @@ const EM_IN_COLGROUP: u32 = 12
 const EM_IN_TABLE_BODY: u32 = 13
 const EM_IN_ROW: u32 = 14
 const EM_IN_CELL: u32 = 15
-const EM_IN_SELECT: u32 = 16
-const EM_IN_SELECT_IN_TABLE: u32 = 17
+// 16 and 17 were "in select" and "in select in table". WHATWG dropped both
+// insertion modes; the numbers stay free so the rest keeps its value.
 const EM_AFTER_BODY: u32 = 18
 const EM_IN_FRAMESET: u32 = 19
 const EM_AFTER_FRAMESET: u32 = 20
@@ -102,7 +103,6 @@ const SC_NORMAL: u32 = 0
 const SC_LIST: u32 = 1
 const SC_BUTTON: u32 = 2
 const SC_TABLE: u32 = 3
-const SC_SELECT: u32 = 4
 
 const MAX_OPEN: usize = 512
 const MAX_ACTIVE: usize = 128
@@ -164,6 +164,10 @@ struct Tree {
     adj: foreign.Adjust, // the name correction tables of WHATWG 13.2.6.5
     context: Gc[Elem], // the context element of a fragment (else null)
     fragment: bool, // is this the fragment parsing algorithm?
+    // The SCRIPTING FLAG (WHATWG 13.2). It does NOT execute scripts -- it
+    // only decides how `noscript` is parsed: with scripting its content is
+    // raw text, without it, it is markup.
+    scripting: bool,
 
     // the bookkeeping
     tname: u32, // the atom of the current tag name
@@ -195,6 +199,7 @@ fn tree_new() -> Tree {
         adj: foreign.adjust_new(),
         context: gc_null[Elem](),
         fragment: false,
+        scripting: false,
         switching: 0,
         sw_pos: 0,
         sw_tag: mem.cp_new(),
@@ -360,6 +365,16 @@ fn tree_broken(b: *mut Tree) -> u32 {
 // as a CDATA section the tree has to know whether the comment ended at a
 // `>` or at the end of the input -- one character difference in the
 // restart position.
+#[no_gc]
+fn tree_scripting_set(b: *mut Tree, on: bool) {
+    (*b).scripting = on
+}
+
+#[no_gc]
+fn tree_scripting(b: *mut Tree) -> bool {
+    return (*b).scripting
+}
+
 #[no_gc]
 fn tree_input_set(b: *mut Tree, t: *mut mem.CpBuf) {
     (*b).input = t
@@ -571,9 +586,13 @@ fn template_on_stack(b: *mut Tree) -> bool {
 // scope"). Everything except the three foreign content groups is HTML.
 fn scope_base_list(name: u32, ns: u32) -> bool {
     if ns == node.NS_HTML {
+        // ROUND B1: `select` stands in this list since the standard dropped
+        // the insertion mode "in select" -- it is what keeps an end tag
+        // from reaching out of a select (webkit02 #48).
         return name == tag.M_APPLET || name == tag.M_CAPTION || name == tag.M_HTML ||
         name == tag.M_TABLE || name == tag.M_TD || name == tag.M_TH ||
-        name == tag.M_MARQUEE || name == tag.M_OBJECT || name == tag.M_TEMPLATE
+        name == tag.M_MARQUEE || name == tag.M_OBJECT || name == tag.M_TEMPLATE ||
+        name == tag.M_SELECT
     }
     if ns == node.NS_MATHML {
         return name == tag.M_MI || name == tag.M_MO || name == tag.M_MN ||
@@ -591,14 +610,6 @@ fn scope_end(name: u32, ns: u32, kind: u32) -> bool {
             return false
         }
         return name == tag.M_HTML || name == tag.M_TABLE || name == tag.M_TEMPLATE
-    }
-    if kind == SC_SELECT {
-        // "has an element in select scope" is phrased the other way round:
-        // everything EXCEPT optgroup/option ends the search.
-        if ns != node.NS_HTML {
-            return true
-        }
-        return !(name == tag.M_OPTGROUP || name == tag.M_OPTION)
     }
     if scope_base_list(name, ns) {
         return true
@@ -744,7 +755,7 @@ fn end_block_group(name: u32) -> bool {
         return false
     }
     return is_block_group(name) || name == tag.M_BUTTON ||
-    name == tag.M_LISTING || name == tag.M_PRE
+    name == tag.M_LISTING || name == tag.M_PRE || name == tag.M_SELECT
 }
 
 fn is_whitespace(c: u32) -> bool {
@@ -1337,23 +1348,6 @@ fn insert_mode_reset(b: *mut Tree) {
             continue
         }
         let n: u32 = e.name
-        if n == tag.M_SELECT {
-            // Here the standard looks for a surrounding table.
-            var j: usize = i
-            while j > 0 {
-                j = j - 1
-                let a: Gc[Node] = (*b).open[j]
-                if node.elem_is(a, tag.M_TEMPLATE) {
-                    break
-                }
-                if node.elem_is(a, tag.M_TABLE) {
-                    (*b).mode = EM_IN_SELECT_IN_TABLE
-                    return
-                }
-            }
-            (*b).mode = EM_IN_SELECT
-            return
-        }
         if (n == tag.M_TD || n == tag.M_TH) && !last {
             (*b).mode = EM_IN_CELL
             return
@@ -1880,14 +1874,6 @@ fn char_html(b: *mut Tree, cp: u32) -> AllocError!u32 {
         (*b).mode = EM_IN_TABLE
         return A_ERNEUT
     }
-    if m == EM_IN_SELECT || m == EM_IN_SELECT_IN_TABLE {
-        if cp == 0 as u32 {
-            parse_error(b)
-            return A_DONE
-        }
-        let ok: bool = try char_insert(b, cp)
-        return A_DONE
-    }
     if m == EM_AFTER_BODY || m == EM_AFTER_AFTER_BODY {
         if is_whitespace(cp) {
             return try char_in_body(b, cp)
@@ -2108,7 +2094,10 @@ fn m_in_head(b: *mut Tree) -> AllocError!u32 {
             return A_DONE
         }
         if n == tag.M_NOSCRIPT {
-            // The scripting flag is OFF (no scripting, see the top of the file).
+            if (*b).scripting {
+                let ok: bool = try raw_text_elem(b, ZST_RAWTEXT)
+                return A_DONE
+            }
             let e = try elem_insert_for_token(b, node.NS_HTML)
             (*b).mode = EM_IN_HEAD_NOSCRIPT
             return A_DONE
@@ -2508,6 +2497,14 @@ fn in_body_start(b: *mut Tree) -> AllocError!u32 {
         return A_DONE
     }
     if n == tag.M_INPUT {
+        if context_is(b, tag.M_SELECT) {
+            parse_error(b)
+            return A_DONE
+        }
+        if in_scope(b, tag.M_SELECT, SC_NORMAL) {
+            parse_error(b)
+            stack_pop_to_name(b, tag.M_SELECT)
+        }
         let ok: bool = try active_restore(b)
         var lit_hidden: [u8; 6] = "hidden"
         let hidden: bool = tok_type_is(b, &lit_hidden[0], 6)
@@ -2524,6 +2521,13 @@ fn in_body_start(b: *mut Tree) -> AllocError!u32 {
     if n == tag.M_HR {
         if in_scope(b, tag.M_P, SC_BUTTON) {
             p_close(b)
+        }
+        if in_scope(b, tag.M_SELECT, SC_NORMAL) {
+            implicit_close(b, 0)
+            if in_scope(b, tag.M_OPTION, SC_NORMAL) ||
+            in_scope(b, tag.M_OPTGROUP, SC_NORMAL) {
+                parse_error(b)
+            }
         }
         let ok: bool = try empty_elem(b)
         (*b).frameset_ok = false
@@ -2561,25 +2565,50 @@ fn in_body_start(b: *mut Tree) -> AllocError!u32 {
         let ok: bool = try raw_text_elem(b, ZST_RAWTEXT)
         return A_DONE
     }
-    if n == tag.M_NOEMBED {
+    if n == tag.M_NOEMBED || (n == tag.M_NOSCRIPT && (*b).scripting) {
         let ok: bool = try raw_text_elem(b, ZST_RAWTEXT)
         return A_DONE
     }
+    // ROUND B1: `select` no longer has an insertion mode of its own. The
+    // WHATWG standard dropped "in select" and "in select in table"
+    // ("relaxed select parsing"); everything now happens in "in body", and
+    // a `select` takes arbitrary content.
     if n == tag.M_SELECT {
+        if context_is(b, tag.M_SELECT) {
+            parse_error(b)
+            return A_DONE
+        }
+        if in_scope(b, tag.M_SELECT, SC_NORMAL) {
+            parse_error(b)
+            stack_pop_to_name(b, tag.M_SELECT)
+            return A_DONE
+        }
         let ok: bool = try active_restore(b)
         let e = try elem_insert_for_token(b, node.NS_HTML)
         (*b).frameset_ok = false
-        let m: u32 = (*b).mode
-        if m == EM_IN_TABLE || m == EM_IN_CAPTION || m == EM_IN_TABLE_BODY ||
-        m == EM_IN_ROW || m == EM_IN_CELL {
-            (*b).mode = EM_IN_SELECT_IN_TABLE
-        } else {
-            (*b).mode = EM_IN_SELECT
-        }
         return A_DONE
     }
-    if n == tag.M_OPTGROUP || n == tag.M_OPTION {
-        if node.elem_is(current(b), tag.M_OPTION) {
+    if n == tag.M_OPTION {
+        if in_scope(b, tag.M_SELECT, SC_NORMAL) {
+            implicit_close(b, tag.M_OPTGROUP)
+            if in_scope(b, tag.M_OPTION, SC_NORMAL) {
+                parse_error(b)
+            }
+        } else if node.elem_is(current(b), tag.M_OPTION) {
+            stack_pop(b)
+        }
+        let ok: bool = try active_restore(b)
+        let e = try elem_insert_for_token(b, node.NS_HTML)
+        return A_DONE
+    }
+    if n == tag.M_OPTGROUP {
+        if in_scope(b, tag.M_SELECT, SC_NORMAL) {
+            implicit_close(b, 0)
+            if in_scope(b, tag.M_OPTION, SC_NORMAL) ||
+            in_scope(b, tag.M_OPTGROUP, SC_NORMAL) {
+                parse_error(b)
+            }
+        } else if node.elem_is(current(b), tag.M_OPTION) {
             stack_pop(b)
         }
         let ok: bool = try active_restore(b)
@@ -3174,134 +3203,6 @@ fn m_in_cell(b: *mut Tree) -> AllocError!u32 {
     return try m_in_body(b)
 }
 
-// ------------------------------------------------------------- "in select"
-
-fn m_in_select(b: *mut Tree) -> AllocError!u32 {
-    let kind: u32 = token_stream.stream_kind((*b).stream)
-    let n: u32 = (*b).tname
-    if kind == tokens.TB_COMMENT {
-        let ok: bool = try comment_insert(b, gc_null[Node]())
-        return A_DONE
-    }
-    if kind == tokens.TB_DOCTYPE {
-        parse_error(b)
-        return A_DONE
-    }
-    if kind == tokens.TB_START {
-        if n == tag.M_HTML {
-            return try m_in_body(b)
-        }
-        if n == tag.M_OPTION {
-            if node.elem_is(current(b), tag.M_OPTION) {
-                stack_pop(b)
-            }
-            let e = try elem_insert_for_token(b, node.NS_HTML)
-            return A_DONE
-        }
-        if n == tag.M_OPTGROUP {
-            if node.elem_is(current(b), tag.M_OPTION) {
-                stack_pop(b)
-            }
-            if node.elem_is(current(b), tag.M_OPTGROUP) {
-                stack_pop(b)
-            }
-            let e = try elem_insert_for_token(b, node.NS_HTML)
-            return A_DONE
-        }
-        if n == tag.M_HR {
-            if node.elem_is(current(b), tag.M_OPTION) {
-                stack_pop(b)
-            }
-            if node.elem_is(current(b), tag.M_OPTGROUP) {
-                stack_pop(b)
-            }
-            let ok: bool = try empty_elem(b)
-            return A_DONE
-        }
-        if n == tag.M_SELECT {
-            parse_error(b)
-            if !in_scope(b, tag.M_SELECT, SC_SELECT) {
-                return A_DONE
-            }
-            stack_pop_to_name(b, tag.M_SELECT)
-            insert_mode_reset(b)
-            return A_DONE
-        }
-        if n == tag.M_INPUT || n == tag.M_KEYGEN || n == tag.M_TEXTAREA {
-            parse_error(b)
-            if !in_scope(b, tag.M_SELECT, SC_SELECT) {
-                return A_DONE
-            }
-            stack_pop_to_name(b, tag.M_SELECT)
-            insert_mode_reset(b)
-            return A_ERNEUT
-        }
-        if n == tag.M_SCRIPT || n == tag.M_TEMPLATE {
-            return try m_in_head(b)
-        }
-    }
-    if kind == tokens.TB_END {
-        if n == tag.M_OPTGROUP {
-            if node.elem_is(current(b), tag.M_OPTION) && (*b).n_open >= 2 &&
-            node.elem_is((*b).open[(*b).n_open - 2], tag.M_OPTGROUP) {
-                stack_pop(b)
-            }
-            if node.elem_is(current(b), tag.M_OPTGROUP) {
-                stack_pop(b)
-            } else {
-                parse_error(b)
-            }
-            return A_DONE
-        }
-        if n == tag.M_OPTION {
-            if node.elem_is(current(b), tag.M_OPTION) {
-                stack_pop(b)
-            } else {
-                parse_error(b)
-            }
-            return A_DONE
-        }
-        if n == tag.M_SELECT {
-            if !in_scope(b, tag.M_SELECT, SC_SELECT) {
-                parse_error(b)
-                return A_DONE
-            }
-            stack_pop_to_name(b, tag.M_SELECT)
-            insert_mode_reset(b)
-            return A_DONE
-        }
-        if n == tag.M_TEMPLATE {
-            return try m_in_head(b)
-        }
-    }
-    parse_error(b)
-    return A_DONE
-}
-
-fn m_in_select_in_table(b: *mut Tree) -> AllocError!u32 {
-    let kind: u32 = token_stream.stream_kind((*b).stream)
-    let n: u32 = (*b).tname
-    let affected: bool = n == tag.M_CAPTION || n == tag.M_TABLE || n == tag.M_TBODY ||
-    n == tag.M_TFOOT || n == tag.M_THEAD || n == tag.M_TR || n == tag.M_TD ||
-    n == tag.M_TH
-    if kind == tokens.TB_START && affected {
-        parse_error(b)
-        stack_pop_to_name(b, tag.M_SELECT)
-        insert_mode_reset(b)
-        return A_ERNEUT
-    }
-    if kind == tokens.TB_END && affected {
-        parse_error(b)
-        if !in_scope(b, n, SC_TABLE) {
-            return A_DONE
-        }
-        stack_pop_to_name(b, tag.M_SELECT)
-        insert_mode_reset(b)
-        return A_ERNEUT
-    }
-    return try m_in_select(b)
-}
-
 // ------------------------------------------------------------ "in template"
 
 fn m_in_template(b: *mut Tree) -> AllocError!u32 {
@@ -3488,6 +3389,15 @@ fn m_after_after_frameset(b: *mut Tree) -> AllocError!u32 {
 // "adjusted current node": in a fragment with exactly one element on the
 // stack it is the CONTEXT element, otherwise the current node. Without that
 // `<svg path>` as a fragment context would never reach the foreign rules.
+// "the parser was created as part of the fragment parsing algorithm and the
+// context element is a ... element".
+fn context_is(b: *mut Tree, name: u32) -> bool {
+    if !(*b).fragment || (*b).context == gc_null[Elem]() {
+        return false
+    }
+    return (*b).context.ns == node.NS_HTML && (*b).context.name == name
+}
+
 fn adjusted_current(b: *mut Tree) -> Gc[Node] {
     if (*b).fragment && (*b).n_open == 1 {
         return (*b).context
@@ -3843,12 +3753,6 @@ fn mark_html(b: *mut Tree) -> AllocError!u32 {
     if m == EM_IN_CELL {
         return try m_in_cell(b)
     }
-    if m == EM_IN_SELECT {
-        return try m_in_select(b)
-    }
-    if m == EM_IN_SELECT_IN_TABLE {
-        return try m_in_select_in_table(b)
-    }
     if m == EM_IN_TEMPLATE {
         return try m_in_template(b)
     }
@@ -3928,7 +3832,14 @@ fn eof_mode(b: *mut Tree) -> AllocError!u32 {
         insert_mode_reset(b)
         return A_ERNEUT
     }
-    if m == EM_IN_CAPTION || m == EM_IN_CELL {
+    if m == EM_IN_BODY || m == EM_IN_CAPTION || m == EM_IN_CELL {
+        // WHATWG "in body", end-of-file: with a non empty stack of template
+        // insertion modes the token goes to "in template" -- that is what
+        // makes the missing `body` appear after `<template><div>`.
+        if m == EM_IN_BODY && (*b).n_tmpl > 0 {
+            (*b).mode = EM_IN_TEMPLATE
+            return A_ERNEUT
+        }
         return A_DONE
     }
     if m == EM_IN_COLGROUP {
