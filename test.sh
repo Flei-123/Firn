@@ -43,6 +43,17 @@
 #      (lib/js/, in Firn) against the official suite test262, against node
 #      as a second engine, and in an endurance run with a counter check
 #      (tools/js/run.sh, docs/ROUND63.md).
+#  55. A TCP/IP STACK OF ITS OWN (tools/k3net/run.sh, round K3): Ethernet,
+#      ARP, IPv4 with checksum and fragment refusal, ICMP, UDP and TCP with
+#      all eleven states -- written in Firn, without an allocator, and
+#      measured against the LINUX kernel over a veth pair: `ping` answered,
+#      `nc` pushing a megaoctet in and back with the same md5, `curl`
+#      fetching an HTTP answer, the stack connecting ACTIVELY to a python
+#      server, and `tc netem` dropping 5 % in both directions. With the
+#      counter-checks: a wrong checksum has to be dropped, an
+#      acknowledgement for octets never sent has to be refused, and
+#      WITHOUT retransmission the transfer under loss has to stay
+#      incomplete.
 #  36. Sockets against the OUTSIDE (tools/net/run.sh, round 76): `nc`
 #      pushes 1 MiB through an echo server written in Firn and the checksums
 #      are compared, `curl` fetches an HTTP answer, sixteen connections run
@@ -1194,6 +1205,19 @@ if [ "$PHRC" -eq 0 ]; then
 else
     bad "tools/phi/run.sh failed (see .test-work/phi.log)"
     grep -E '^  FAIL|^phi:' "$WORK/phi.log" | head -12 | sed 's/^/   /'
+fi
+
+# ROUND K3. Sections 53 and 54 belong to the rounds running in parallel;
+# this one was assigned 55 and takes it whether or not those land.
+echo "== 55. a TCP/IP stack of its own, measured against Linux (tools/k3net/run.sh, ROUND K3) =="
+bash tools/k3net/run.sh > "$WORK/k3net.log" 2>&1 && K3RC=0 || K3RC=$?
+grep -E '^        (throughput|rtt|md5|retransmissions|out-of-order|sent |symbols|udp_back|body:)' "$WORK/k3net.log" | sed 's/^ */ /'
+grep -E '^K3NET: ' "$WORK/k3net.log" | sed 's/^/ /'
+if [ "$K3RC" -eq 0 ]; then
+    ok
+else
+    bad "tools/k3net/run.sh failed (see .test-work/k3net.log)"
+    grep -E '^  FAIL' "$WORK/k3net.log" | head -12 | sed 's/^/   /'
 fi
 
 TOTAL=$((PASS + FAIL))
