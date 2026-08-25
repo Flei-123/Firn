@@ -1231,7 +1231,7 @@ if [ "$UCDRC" -eq 0 ]; then
     grep -E 'IDENTICAL|DIFFERENT|compared' "$WORK/ucd_verify.log" | cut -c1-110 | sed 's/^/ /'
 fi
 SOAKRC=0
-SOAK_SEC=${TEST_SOAK_SEC:-60} SOAK_LEAK_SEC=${TEST_SOAK_LEAK_SEC:-30} \
+SOAK_SEC=${TEST_SOAK_SEC:-90} SOAK_LEAK_SEC=${TEST_SOAK_LEAK_SEC:-30} \
     SOAK_SAMPLE_MS=1000 SOAK_MIN_MS=1000000000 \
     bash tools/gc_soak/run.sh > "$WORK/gc_soak.log" 2>&1 || SOAKRC=$?
 grep -E '^   (PASSED|FAILED|Counter-check|Overhead)|^     (duration|rounds|heap/live 2nd|pause per window|PASSED|FAILED)|^     throughput' \
