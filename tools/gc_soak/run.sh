@@ -27,6 +27,7 @@
 #   SOAK_SAMPLE_MS milliseconds per data line (default 2000)
 #   SOAK_LEAK_MB   hard memory brake for the counter-check (default 3072)
 #   SOAK_MIN_MS    below this mode 0 is still warming up (default 60000)
+#   SOAK_LONG_MIN_MS  the same for the long series (default 600000)
 #
 # Usage:  bash tools/gc_soak/run.sh [--ab SECONDS]
 set -uo pipefail
@@ -172,7 +173,8 @@ rc=$?
 if [ -f "$LONG/soak-24h-mode0.tsv" ]; then
     echo
     echo "-- 4. the endurance run of the round (tools/gc_soak/longrun/) --"
-    python3 tools/gc_soak/evaluate.py --single "$LONG/soak-24h-mode0.tsv" "$MIN_MS" || rc=1
+    python3 tools/gc_soak/evaluate.py --single "$LONG/soak-24h-mode0.tsv" \
+        "${SOAK_LONG_MIN_MS:-600000}" || rc=1
 fi
 if [ -f "$LONG/rescan-on.tsv" ] && [ -f "$LONG/rescan-off.tsv" ]; then
     echo
