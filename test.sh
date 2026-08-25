@@ -1196,6 +1196,19 @@ else
     grep -E '^  FAIL|^phi:' "$WORK/phi.log" | head -12 | sed 's/^/   /'
 fi
 
+# ROUND K6. 53 to 57 belong to the rounds that were running beside this
+# one; this section is 58 and stays 58.
+echo "== 58. a userland: a shell, twenty-three tools, pipes and redirection (tools/userland/run.sh, ROUND K6) =="
+bash tools/userland/run.sh > "$WORK/userland.log" 2>&1 && ULRC=0 || ULRC=$?
+grep -E '^USERLAND:|the whole userland in octets|the biggest program|programs loaded off the disk' \
+    "$WORK/userland.log" | sed 's/^ */ /'
+if [ "$ULRC" -eq 0 ]; then
+    ok
+else
+    bad "tools/userland/run.sh failed (see .test-work/userland.log)"
+    grep -E '^  FAIL' "$WORK/userland.log" | head -12 | sed 's/^/   /'
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then

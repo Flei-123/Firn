@@ -295,10 +295,17 @@ has "$F" "hello: bss 0" "the .bss of the program is zero -- the loader zeroed it
 has "$F" "hello: data 3735928559" "the .data of the program arrived unchanged"
 has "$F" "hello: ro 424242" "the .rodata of the program is readable"
 has "$F" "osum\$ hello -> 43" "wait() delivered the exit code of the program (40 + argc)"
-has "$F" "osum\$ ls -> 4" "wait() delivered the exit code of ls (four entries)"
-has "$F" "osum\$ cat -> 45" "wait() delivered the exit code of cat (45 octets)"
-has "$F" "osum\$ echo -> 3" "wait() delivered the exit code of echo (three words)"
-has "$F" "osum\$ rm -> 1" "'rm' deleted one name"
+# ROUND K6: `ls`, `cat`, `echo` and `rm` returned a COUNT in round K1 --
+# four entries, forty-five octets, three words. A userland cannot work
+# that way: `grep` says "found" with 0 and `false` says 1, so `$?` has to
+# mean the same thing in every program. They return 0 or 1 now, and what
+# this round measures is that `wait` delivers what the process really
+# returned -- which `hello` above (40 + argc) still shows with a number
+# nobody could have made up.
+has "$F" "osum\$ ls -> 0" "wait() delivered the exit code of ls"
+has "$F" "osum\$ cat -> 0" "wait() delivered the exit code of cat"
+has "$F" "osum\$ echo -> 0" "wait() delivered the exit code of echo"
+has "$F" "osum\$ rm -> 0" "'rm' deleted the name and said so with 0"
 grep -q '^\./ \.\./ bin/ $' "$F" \
     && ok "after 'rm' the file is gone from the listing" \
     || bad "'rm' did not change what 'ls' sees"
@@ -462,17 +469,18 @@ echo "== 8. THE counter-check: another file at the same path =="
 # Nothing about the kernel changes here. The image gets the octets of
 # /bin/echo under the name /bin/ls, and the same command in the same shell
 # does something else. That is what "the program comes off the disk" MEANS.
-SWAP="/bin/ /bin/sh=$TMPD/sh0.elf /bin/ls=$TMPD/echo0.elf"
+SWAP="/bin/ /bin/sh=$TMPD/sh0.elf /bin/ls=$TMPD/echo0.elf /bin/cat=$TMPD/hello0.elf"
 python3 tools/osum/mkfs.py build "$TMPD/swap.img" $BLOCKS $SWAP >/dev/null 2>&1 \
     && ok "an image whose /bin/ls holds the octets of /bin/echo" \
     || bad "mkfs for the swapped image failed"
-run_disk "$TMPD/k0.mb" "osum $QUIET script=ls one two;exit" "$TMPD/swap.txt" "$TMPD/swap.img"
+run_disk "$TMPD/k0.mb" "osum $QUIET script=ls one two;cat x;exit" "$TMPD/swap.txt" "$TMPD/swap.img"
 rc=$?
 S="$TMPD/swap.txt"
 [ "$rc" -eq 21 ] && ok "the swapped run gets to the end (exit 21)" || bad "swap run: exit $rc"
 has "$S" "one two" "'ls one two' ECHOED its arguments -- the file decides, not the name"
 hasnot "$S" "bin/" "and it did not list a directory, because it is not ls any more"
-has "$S" "osum\$ ls -> 2" "even the exit code is echo's (two words)"
+has "$S" "hello: argc2" "and /bin/cat holds the octets of /bin/hello"
+has "$S" "osum\$ cat -> 42" "even the exit code is hello's (40 + argc), not cat's 0"
 # And the same shell against the honest image lists instead of echoing.
 grep -q '^\./ \.\./ bin/ readme.txt $' "$F" \
     && ok "the SAME kernel with the honest image lists the directory" \
