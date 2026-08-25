@@ -75,7 +75,7 @@ pub const ATTRS: &[AttrInfo] = &[
         target: Target::Func,
         args: 0,
         implemented: true,
-        what: "a test case: found and run by `firnc --test` (ROUND 94, testrun.rs)",
+        what: "a test case: found and run with --test (ROUND 94, testrun.rs)",
     },
     AttrInfo {
         name: "interrupt",
