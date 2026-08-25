@@ -47,6 +47,7 @@ import kbd
 import elf
 import errno
 import file
+import uio
 
 export {
     entry, neg, STAT_BYTES, DIRENT_HEAD,
@@ -57,7 +58,8 @@ export {
     SYS_LSEEK, SYS_MMAP, SYS_MUNMAP, SYS_BRK, SYS_PIPE, SYS_YIELD,
     SYS_DUP, SYS_DUP2, SYS_NANOSLEEP, SYS_GETPID, SYS_FORK, SYS_EXECVE,
     SYS_EXIT, SYS_WAIT4, SYS_GETCWD, SYS_MKDIR, SYS_UNLINK, SYS_GETPPID,
-    SYS_GETDENTS64, SYS_EXIT_GROUP, SYS_OSUM_SPAWN, SYS_OSUM_EXEC
+    SYS_GETDENTS64, SYS_EXIT_GROUP, SYS_OSUM_SPAWN, SYS_OSUM_EXEC,
+    SYS_CHDIR, SYS_OSUM_SYSINFO, SYS_OSUM_PSTAT, SYS_OSUM_KILL
 }
 
 // ---------------------------------------------------------- the numbers
@@ -83,6 +85,10 @@ const SYS_EXECVE: u64 = 59
 const SYS_EXIT: u64 = 60
 const SYS_WAIT4: u64 = 61
 const SYS_GETCWD: u64 = 79
+// ROUND K6. Linux's number and Linux's meaning: a working directory
+// per process, and `getcwd` above answers out of it now instead of
+// answering "/".
+const SYS_CHDIR: u64 = 80
 const SYS_MKDIR: u64 = 83
 const SYS_UNLINK: u64 = 87
 const SYS_GETPPID: u64 = 110
@@ -105,6 +111,25 @@ const SYS_LEAVE: u64 = 2
 //        system with 16 KiB of kernel stack per task has a use for that.
 const SYS_OSUM_SPAWN: u64 = 1000
 const SYS_OSUM_EXEC: u64 = 1001
+// ROUND K6. Three that Linux HAS NO NUMBER FOR, in the shape this
+// kernel can answer them, and therefore above 1000 by the rule of
+// round K4 -- round K6 itself had picked 44, 45 and 46, which are
+// `semget`, `semop` and `shmdt` on Linux and would be a trap for the
+// stage that runs a Linux binary.
+//
+//   1002 sysinfo(what) -> one number about the machine. Linux's 99
+//        fills a struct with a different set of fields; this is not
+//        that call and does not take its number.
+//   1003 pstat(index, field) -> one field of one slot of the task
+//        table. There is no `/proc` here, and `ps` may not hold a
+//        pointer into the kernel.
+//   1004 kill(pid, code). NOT Linux's 62: there are no signals in
+//        this system, so the second argument is the exit code the
+//        process is made to leave with, not a signal number. The day
+//        signals exist, 62 becomes the real `kill` and this one goes.
+const SYS_OSUM_SYSINFO: u64 = 1002
+const SYS_OSUM_PSTAT: u64 = 1003
+const SYS_OSUM_KILL: u64 = 1004
 
 // ------------------------------------------------------------ the frame
 
@@ -303,6 +328,19 @@ fn entry(number: u64, frame: u64, state: u64) -> u64 {
     }
     if number == SYS_OSUM_EXEC {
         return do_exec(state, me, a0, a1, a2)
+    }
+    // ROUND K6.
+    if number == SYS_CHDIR {
+        return do_chdir(state, me, a0)
+    }
+    if number == SYS_OSUM_SYSINFO {
+        return uio.sysinfo(state, a0)
+    }
+    if number == SYS_OSUM_PSTAT {
+        return uio.pstat(state, a0, a1)
+    }
+    if number == SYS_OSUM_KILL {
+        return uio.kill_pid(state, a0, a1)
     }
     return neg(errno.E_NOSYS)
 }
@@ -774,7 +812,7 @@ fn do_open(state: u64, me: u64, name: u64, flags: u64) -> u64 {
         return neg(errno.E_NOSYS)
     }
     let buf: u64 = state + kstate.NAME_OFF
-    let len: u64 = fetch_name(state, me, name, buf, MAX_NAME)
+    let len: u64 = fetch_path(state, me, name, buf, MAX_NAME)
     if errno.is_error(len) {
         return len
     }
@@ -918,7 +956,7 @@ fn do_unlink(state: u64, me: u64, name: u64) -> u64 {
         return neg(errno.E_NOSYS)
     }
     let buf: u64 = state + kstate.NAME_OFF
-    let len: u64 = fetch_name(state, me, name, buf, MAX_NAME)
+    let len: u64 = fetch_path(state, me, name, buf, MAX_NAME)
     if errno.is_error(len) {
         return len
     }
@@ -940,7 +978,7 @@ fn do_mkdir(state: u64, me: u64, name: u64) -> u64 {
         return neg(errno.E_NOSYS)
     }
     let buf: u64 = state + kstate.NAME_OFF
-    let len: u64 = fetch_name(state, me, name, buf, MAX_NAME)
+    let len: u64 = fetch_path(state, me, name, buf, MAX_NAME)
     if errno.is_error(len) {
         return len
     }
@@ -951,25 +989,6 @@ fn do_mkdir(state: u64, me: u64, name: u64) -> u64 {
         return neg(errno.E_NOSPC)
     }
     return 0
-}
-
-// Osum has no working directory yet -- every path is absolute, and the
-// honest answer is the root. Written down in docs/ROUNDK4.md as the gap it
-// is; a program that asks and gets "/" is not lied to.
-fn do_getcwd(state: u64, me: u64, buf: u64, size: u64) -> u64 {
-    if size < 2 {
-        return neg(errno.E_INVAL)
-    }
-    if !proc.user_ok(state, me, buf, 2) {
-        return neg(errno.E_FAULT)
-    }
-    if !poke(state, me, buf, 47) {
-        return neg(errno.E_FAULT)
-    }
-    if !poke(state, me, buf + 1, 0) {
-        return neg(errno.E_FAULT)
-    }
-    return 2
 }
 
 // ------------------------------------------------------------- stat
@@ -1016,7 +1035,7 @@ fn do_stat(state: u64, me: u64, name: u64, out: u64) -> u64 {
         return neg(errno.E_FAULT)
     }
     let buf: u64 = state + kstate.NAME_OFF
-    let len: u64 = fetch_name(state, me, name, buf, MAX_NAME)
+    let len: u64 = fetch_path(state, me, name, buf, MAX_NAME)
     if errno.is_error(len) {
         return len
     }
@@ -1345,6 +1364,9 @@ fn do_fork(state: u64, me: u64, frame: u64) -> u64 {
     }
     file.inherit_task(state, me, child)
     sched.tset(state, child, sched.T_CWD, sched.tget(state, me, sched.T_CWD))
+    // ROUND K6: and the working directory as TEXT, which is what `getcwd`
+    // prints and what a relative path is completed with.
+    uio.adopt(state, me, child)
     sched.tset(state, child, sched.T_BRK, brk_of(state, me))
     sched.tset(state, child, sched.T_MMAP, map_bottom(state, me))
     // The context the child comes back on. `proc.resume_start` hands this
@@ -1383,7 +1405,7 @@ fn do_execve(state: u64, me: u64, frame: u64, path: u64, argv: u64) -> u64 {
         return neg(errno.E_NOSYS)
     }
     let name: u64 = state + kstate.NAME_OFF
-    let len: u64 = fetch_name(state, me, path, name, MAX_NAME)
+    let len: u64 = fetch_path(state, me, path, name, MAX_NAME)
     if errno.is_error(len) {
         return len
     }
@@ -1544,7 +1566,7 @@ fn do_exec(state: u64, me: u64, path: u64, argv: u64, argc: u64) -> u64 {
         return neg(errno.E_2BIG)
     }
     let name: u64 = state + kstate.NAME_OFF
-    let len: u64 = fetch_name(state, me, path, name, MAX_NAME)
+    let len: u64 = fetch_path(state, me, path, name, MAX_NAME)
     if errno.is_error(len) {
         return len
     }
@@ -1573,4 +1595,78 @@ fn do_exec(state: u64, me: u64, path: u64, argv: u64, argc: u64) -> u64 {
         return neg(elf.errno_of(why))
     }
     return sched.tget(state, t, sched.T_PID)
+}
+
+// ============================================================ round K6
+//
+// A USERLAND, ON TOP OF THE POSIX LAYER OF ROUND K4. The two rounds were
+// written at the same time and against different kernels, and this is
+// where the difference was settled:
+//
+//   * ROUND K6'S DESCRIPTORS ARE GONE. It carried three standard
+//      descriptors of its own with a position each, plus a `dup2` and a
+//      `seek` for them, because the kernel of round K1 had no table of
+//      open files. Round K4 built one, with reference counts and
+//      sixteen descriptors per process (`demos/kernel/file.fi`), and
+//      `dup2` is 33 and `lseek` is 8 -- Linux's numbers, the ones every
+//      program of this system already uses. K6's 40 and 41 were dropped
+//      rather than kept as a second door onto the same thing.
+//   * WHAT IS LEFT IS WHAT ROUND K4 DOES NOT HAVE: a working directory
+//      that can be PRINTED (`sched.T_CWD` is an inode; `pwd` needs a
+//      path), and three questions about the machine that `ps`, `df`,
+//      `date` and `uname` may not answer by reading a kernel variable.
+//
+// The state is in `demos/kernel/uio.fi`, one slot of 128 octets per task.
+
+// A name out of ring 3 that is meant to be a PATH. The difference to
+// `fetch_name` is one line and it is the whole of the working directory:
+// a name that does not start with a slash is completed with it before the
+// file system sees it. `exec` uses this for the program and `fetch_name`
+// for the arguments -- an argument is not a path.
+fn fetch_path(state: u64, me: u64, addr: u64, dst: u64, max: u64) -> u64 {
+    let n: u64 = fetch_name(state, me, addr, dst, max)
+    if errno.is_error(n) {
+        return n
+    }
+    return uio.resolve(state, me, dst, n)
+}
+
+// `chdir(path)` -- Linux's number 80, and Linux's meaning. What is stored
+// is the path with `.` and `..` folded away, because `getcwd` prints this
+// string back and `/bin/../bin` is not a name anybody wants to read.
+fn do_chdir(state: u64, me: u64, name: u64) -> u64 {
+    if kstate.get(state, kstate.FS_READY) == 0 {
+        return neg(errno.E_NOSYS)
+    }
+    let buf: u64 = state + kstate.NAME_OFF
+    let len: u64 = fetch_path(state, me, name, buf, MAX_NAME)
+    if errno.is_error(len) {
+        return len
+    }
+    return uio.chdir_to(state, me, buf)
+}
+
+// `getcwd(buf, size)`. ROUND K4 ANSWERED "/" HERE and wrote in its own
+// comment that this was the gap: there was no working directory to
+// report. There is one now. Linux returns the length INCLUDING the zero,
+// and so does this.
+fn do_getcwd(state: u64, me: u64, out: u64, size: u64) -> u64 {
+    let n: u64 = uio.cwd_len(state, me)
+    if size <= n {
+        return neg(errno.E_RANGE)
+    }
+    if !proc.user_ok(state, me, out, n + 1) {
+        return neg(errno.E_FAULT)
+    }
+    var i: u64 = 0
+    while i < n {
+        if !poke(state, me, out + i, uio.cwd_at(state, me, i)) {
+            return neg(errno.E_FAULT)
+        }
+        i = i + 1
+    }
+    if !poke(state, me, out + n, 0) {
+        return neg(errno.E_FAULT)
+    }
+    return n + 1
 }
