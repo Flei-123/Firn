@@ -317,6 +317,22 @@ impl<'a> Checker<'a> {
             if attrs.iter().any(|a| a.name == "panic_handler") {
                 self.check_panic_handler(f);
             }
+            // ROUND 94: a test takes nothing and gives nothing back. It says
+            // what it thinks by RUNNING -- it panics, it crashes or it comes
+            // back (`testrun.rs`). A return value would be a second, silent
+            // channel that the runner does not read, so it is refused here
+            // rather than ignored.
+            if attrs.iter().any(|a| a.name == "test") {
+                if f.extern_info.is_some() {
+                    self.dg.error(f.span, "'#[test]' needs a body ('extern fn' has none)");
+                } else if !f.params.is_empty() || f.ret.is_some() {
+                    self.dg.error_note(
+                        f.span,
+                        format!("'#[test]' takes no parameters and returns nothing, '{}' does", f.name),
+                        format!("write 'fn {}()'", f.name),
+                    );
+                }
+            }
             let has_link_name = attrs.iter().any(|a| a.name == "link_name");
             let has_export_c = attrs.iter().any(|a| a.name == "export_c");
             if has_link_name && f.extern_info.is_none() {
