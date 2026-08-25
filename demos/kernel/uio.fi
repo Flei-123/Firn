@@ -1,0 +1,500 @@
+// demos/kernel/uio.fi -- round K6: the little a userland needs and a
+// single program does not.
+//
+// Round K1 put a program on a disk and started it. Round K6 puts a SHELL
+// on that disk, and a shell is the first program that is not alone: it
+// runs other programs, and it decides where their output goes. Four
+// things follow from that, and they are the whole of this file.
+//
+//   1. THE THREE STANDARD DESCRIPTORS ARE STATE, NOT A CONSTANT. Round
+//      K1 answered descriptor 1 with the serial port -- always, for
+//      everybody. `ls > /out` means that one process, and only that one,
+//      writes somewhere else. So every task carries three descriptors of
+//      its own, `dup2` moves one onto another, and `exec` hands them to
+//      the child. Closing one gives it back to the console.
+//   2. A WORKING DIRECTORY. `cd /bin` is a lie if the next program still
+//      reads `.` as the root. A path out of ring 3 is completed HERE, in
+//      one place, before the file system ever sees it -- and `..` and `.`
+//      are folded away textually so that `pwd` has something to print.
+//   3. A POSITION IN A FILE. `>>` is `>` plus a seek, and nothing else.
+//   4. NUMBERS ABOUT THE MACHINE. `ps`, `df`, `date` and `uname` are
+//      programs like every other one. They may not read a kernel
+//      variable, so they ask, and the answer is one system call.
+//
+// The state is 128 octets per task in a page of the kernel data area that
+// nothing else uses (`kstate.UIO_OFF`): three handles, three positions,
+// and eighty octets of path. 32 tasks make exactly one page.
+//
+// WHY THIS FILE EXISTS AT ALL, and why it is not in `sys.fi`: round K4 is
+// rewriting `sys.fi` into a POSIX layer at the same time. Everything of
+// round K6 that the kernel had to grow lies here, so that the two rounds
+// touch the same file in as few lines as possible. The system call
+// numbers are 40..46 for the same reason -- K4 counts up from 26.
+
+import kstate
+import sched
+import fs
+import serial
+
+export {
+    reset, adopt, handle, offset, set_handle, set_offset,
+    resolve, chdir_to, cwd_len, cwd_at, sysinfo, pstat, kill_pid,
+    SLOT, CWD_MAX, PATH_MAX,
+    I_TICKS, I_UPTIME, I_FRAMES_FREE, I_FRAMES_ALL, I_BLOCKS, I_BFREE,
+    I_INODES, I_IUSED, I_BSIZE, I_TASKS, I_SYSCALLS, I_VERSION,
+    I_YEAR, I_MONTH, I_DAY, I_HOUR, I_MIN, I_SEC,
+    P_STATE, P_PID, P_PPID, P_KIND, P_PRIO, P_TICKS, P_EXIT, P_FAULTS
+}
+
+// ------------------------------------------------------------ the slot
+
+const SLOT: u64 = 128 // octets per task
+const O_STD: u64 = 0 // three handles, 0 = the console
+const O_OFF: u64 = 24 // three positions in a file
+const O_CWD: u64 = 48 // the working directory, zero terminated
+const CWD_MAX: u64 = 78 // what fits in the slot, minus the zero
+
+// `fs.parent_of` carries a path in 96 octets. A path longer than this
+// would be cut there and would then name a file nobody asked for -- so it
+// is refused here instead.
+const PATH_MAX: u64 = 90
+
+const STD_COUNT: u64 = 3
+
+// The errors this file hands back. The numbers are the ones of `sys.fi`;
+// the two files agree on them the way every Unix agrees on them.
+const E_PERM: u64 = 1
+const E_NOENT: u64 = 2
+const E_SRCH: u64 = 3
+const E_INVAL: u64 = 22
+const E_NOTDIR: u64 = 20
+const E_NAMETOOLONG: u64 = 36
+
+fn err(e: u64) -> u64 {
+    return 0 -% e
+}
+
+fn slot_off(t: u64, extra: u64) -> u64 {
+    return kstate.UIO_OFF + t * SLOT + extra
+}
+
+fn cwd_addr(state: u64, t: u64) -> u64 {
+    return state + slot_off(t, O_CWD)
+}
+
+// A fresh task: everything to the console, the position at the start, the
+// working directory the root. Every user process goes through
+// `proc.create_bare`, and that is where this is called -- a slot that a
+// dead process left behind must not hand its open files to its successor.
+fn reset(state: u64, t: u64) {
+    if t >= kstate.MAX_TASKS {
+        return
+    }
+    let p: u64 = state + slot_off(t, 0)
+    var i: u64 = 0
+    while i < SLOT {
+        kstate.set8(p + i, 0 as u8)
+        i = i + 1
+    }
+    kstate.set8(p + O_CWD, 47 as u8)
+}
+
+// What `fork` would inherit, without a fork: the child of an `exec` gets
+// the descriptors and the working directory of the caller. This is the
+// line that makes `ls > /out` work at all -- the shell redirects ITSELF
+// and the child is born into it.
+fn adopt(state: u64, parent: u64, child: u64) {
+    if parent >= kstate.MAX_TASKS || child >= kstate.MAX_TASKS {
+        return
+    }
+    let a: u64 = state + slot_off(parent, 0)
+    let b: u64 = state + slot_off(child, 0)
+    var i: u64 = 0
+    while i < SLOT {
+        kstate.set8(b + i, kstate.get8(a + i) as u8)
+        i = i + 1
+    }
+}
+
+// The inode behind one of the three, or 0 for the console.
+fn handle(state: u64, t: u64, fd: u64) -> u64 {
+    if fd >= STD_COUNT || t >= kstate.MAX_TASKS {
+        return 0
+    }
+    return kstate.get(state, slot_off(t, O_STD + fd * 8))
+}
+
+fn offset(state: u64, t: u64, fd: u64) -> u64 {
+    if fd >= STD_COUNT || t >= kstate.MAX_TASKS {
+        return 0
+    }
+    return kstate.get(state, slot_off(t, O_OFF + fd * 8))
+}
+
+fn set_handle(state: u64, t: u64, fd: u64, ino: u64) {
+    if fd >= STD_COUNT || t >= kstate.MAX_TASKS {
+        return
+    }
+    kstate.set(state, slot_off(t, O_STD + fd * 8), ino)
+}
+
+fn set_offset(state: u64, t: u64, fd: u64, off: u64) {
+    if fd >= STD_COUNT || t >= kstate.MAX_TASKS {
+        return
+    }
+    kstate.set(state, slot_off(t, O_OFF + fd * 8), off)
+}
+
+// ------------------------------------------------------- the paths
+
+fn cwd_len(state: u64, t: u64) -> u64 {
+    let c: u64 = cwd_addr(state, t)
+    var n: u64 = 0
+    while n < CWD_MAX && kstate.get8(c + n) != 0 {
+        n = n + 1
+    }
+    return n
+}
+
+fn cwd_at(state: u64, t: u64, i: u64) -> u64 {
+    if i >= CWD_MAX {
+        return 0
+    }
+    return kstate.get8(cwd_addr(state, t) + i)
+}
+
+// A path out of ring 3, completed. An absolute one is left alone; a
+// relative one gets the working directory in front of it. `buf` is a
+// buffer OF THE KERNEL (`kstate.NAME_OFF`), never one of the process --
+// by the time this runs the name has already been copied in.
+//
+// The work happens in a scratch area and is copied back, because source
+// and destination are the same buffer.
+fn resolve(state: u64, t: u64, buf: u64, len: u64) -> u64 {
+    if len > 0 && kstate.get8(buf) == 47 {
+        if len >= PATH_MAX {
+            return err(E_NAMETOOLONG)
+        }
+        return len
+    }
+    let c: u64 = cwd_addr(state, t)
+    let n: u64 = cwd_len(state, t)
+    let s: u64 = state + kstate.NAME_OFF + 2048
+    var at: u64 = 0
+    var i: u64 = 0
+    while i < n {
+        kstate.set8(s + at, kstate.get8(c + i) as u8)
+        at = at + 1
+        i = i + 1
+    }
+    if at == 0 || kstate.get8(s + at - 1) != 47 {
+        kstate.set8(s + at, 47 as u8)
+        at = at + 1
+    }
+    if at + len >= PATH_MAX {
+        return err(E_NAMETOOLONG)
+    }
+    i = 0
+    while i < len {
+        kstate.set8(s + at + i, kstate.get8(buf + i) as u8)
+        i = i + 1
+    }
+    at = at + len
+    kstate.set8(s + at, 0 as u8)
+    i = 0
+    while i <= at {
+        kstate.set8(buf + i, kstate.get8(s + i) as u8)
+        i = i + 1
+    }
+    return at
+}
+
+// `cd`. `buf` holds an absolute path that `resolve` has already made one.
+// The file system says whether it exists and whether it is a directory;
+// what is stored is the path with `.` and `..` folded away, because `pwd`
+// prints this string and `/bin/../bin` is not a name anybody wants to
+// read back.
+fn chdir_to(state: u64, t: u64, buf: u64) -> u64 {
+    let ino: u64 = fs.path(state, buf)
+    if ino == 0 {
+        return err(E_NOENT)
+    }
+    if fs.inode_type(state, ino) != fs.T_DIR {
+        return err(E_NOTDIR)
+    }
+    let c: u64 = cwd_addr(state, t)
+    var comp: [u8; 32] = [0 as u8; 32]
+    var at: u64 = 0
+    var i: u64 = 0
+    var going: bool = true
+    while going {
+        while kstate.get8(buf + i) == 47 {
+            i = i + 1
+        }
+        if kstate.get8(buf + i) == 0 {
+            going = false
+        } else {
+            var n: u64 = 0
+            while kstate.get8(buf + i) != 0 && kstate.get8(buf + i) != 47 {
+                if n < 24 {
+                    comp[n as usize] = kstate.get8(buf + i) as u8
+                    n = n + 1
+                }
+                i = i + 1
+            }
+            comp[n as usize] = 0 as u8
+            if n == 1 && comp[0 as usize] == 46 as u8 {
+                going = true // "." is where we already are
+            } else {
+                if n == 2 && comp[0 as usize] == 46 as u8
+                    && comp[1 as usize] == 46 as u8 {
+                    while at > 0 && kstate.get8(c + at - 1) != 47 {
+                        at = at - 1
+                    }
+                    if at > 0 {
+                        at = at - 1
+                    }
+                } else {
+                    if at + n + 2 >= CWD_MAX {
+                        return err(E_NAMETOOLONG)
+                    }
+                    kstate.set8(c + at, 47 as u8)
+                    at = at + 1
+                    var k: u64 = 0
+                    while k < n {
+                        kstate.set8(c + at, comp[k as usize])
+                        at = at + 1
+                        k = k + 1
+                    }
+                }
+            }
+        }
+    }
+    if at == 0 {
+        kstate.set8(c + at, 47 as u8)
+        at = at + 1
+    }
+    kstate.set8(c + at, 0 as u8)
+    sched.tset(state, t, sched.T_CWD, ino)
+    return 0
+}
+
+// ------------------------------------------------- numbers of the machine
+
+const I_TICKS: u64 = 0
+const I_UPTIME: u64 = 1 // milliseconds since the timer started
+const I_FRAMES_FREE: u64 = 2
+const I_FRAMES_ALL: u64 = 3
+const I_BLOCKS: u64 = 4 // blocks on the drive
+const I_BFREE: u64 = 5 // data blocks still free
+const I_INODES: u64 = 6
+const I_IUSED: u64 = 7
+const I_BSIZE: u64 = 8
+const I_TASKS: u64 = 9 // tasks that are neither free nor corpses
+const I_SYSCALLS: u64 = 10
+const I_VERSION: u64 = 11 // the round this kernel is from
+const I_YEAR: u64 = 12
+const I_MONTH: u64 = 13
+const I_DAY: u64 = 14
+const I_HOUR: u64 = 15
+const I_MIN: u64 = 16
+const I_SEC: u64 = 17
+
+const VERSION: u64 = 6 // osum, round K6
+
+// The clock of the machine, over the two ports every PC has had since
+// 1984. Status register B says whether the fields are BCD and whether the
+// hour is counted to twelve; both are read instead of assumed, because
+// QEMU and a real board do not agree on the defaults.
+fn cmos(reg: u64) -> u64 {
+    serial.out8(0x70 as u16, reg as u8)
+    return serial.in8(0x71 as u16) as u64
+}
+
+fn rtc(what: u64) -> u64 {
+    // Bit 7 of status A is up while the chip is carrying seconds into
+    // minutes. Reading then gives a time that never was. The loop is
+    // bounded: a chip that is not there must not hang the kernel.
+    var guard: u64 = 0
+    while guard < 100000 && (cmos(0x0A) & 0x80) != 0 {
+        guard = guard + 1
+    }
+    var reg: u64 = 0
+    if what == I_YEAR {
+        reg = 9
+    }
+    if what == I_MONTH {
+        reg = 8
+    }
+    if what == I_DAY {
+        reg = 7
+    }
+    if what == I_HOUR {
+        reg = 4
+    }
+    if what == I_MIN {
+        reg = 2
+    }
+    if what == I_SEC {
+        reg = 0
+    }
+    let b: u64 = cmos(0x0B)
+    var raw: u64 = cmos(reg)
+    var pm: bool = false
+    if what == I_HOUR && (b & 2) == 0 && (raw & 0x80) != 0 {
+        pm = true
+        raw = raw & 0x7F
+    }
+    var v: u64 = raw
+    if (b & 4) == 0 {
+        v = (raw & 15) + (raw >> 4) * 10
+    }
+    if what == I_HOUR && pm && v < 12 {
+        v = v + 12
+    }
+    if what == I_YEAR {
+        v = v + 2000
+    }
+    return v
+}
+
+fn sysinfo(state: u64, what: u64) -> u64 {
+    if what == I_TICKS {
+        return kstate.get(state, kstate.TICKS)
+    }
+    if what == I_UPTIME {
+        return kstate.get(state, kstate.TICKS) * 10
+    }
+    if what == I_FRAMES_FREE {
+        return kstate.get(state, kstate.FRAMES_FREE)
+    }
+    if what == I_FRAMES_ALL {
+        return kstate.get(state, kstate.BITMAP_FRAMES)
+    }
+    if what == I_BLOCKS {
+        return kstate.get(state, kstate.DISK_BLOCKS)
+    }
+    if what == I_BFREE {
+        if kstate.get(state, kstate.FS_READY) == 0 {
+            return 0
+        }
+        return fs.free_blocks(state)
+    }
+    if what == I_INODES {
+        return fs.INODE_COUNT
+    }
+    if what == I_IUSED {
+        if kstate.get(state, kstate.FS_READY) == 0 {
+            return 0
+        }
+        return fs.used_inodes(state)
+    }
+    if what == I_BSIZE {
+        return 512
+    }
+    if what == I_TASKS {
+        return sched.alive_count(state)
+    }
+    if what == I_SYSCALLS {
+        return kstate.get(state, kstate.SYSCALLS)
+    }
+    if what == I_VERSION {
+        return VERSION
+    }
+    if what >= I_YEAR && what <= I_SEC {
+        return rtc(what)
+    }
+    return err(E_INVAL)
+}
+
+// ------------------------------------------------------- the task table
+
+const P_STATE: u64 = 0 // 0 = the slot is empty
+const P_PID: u64 = 1
+const P_PPID: u64 = 2
+const P_KIND: u64 = 3
+const P_PRIO: u64 = 4
+const P_TICKS: u64 = 5
+const P_EXIT: u64 = 6
+const P_FAULTS: u64 = 7
+
+// One field of one slot of the task table. `ps` asks eight times per
+// task, which is eight system calls and no buffer -- a table that a
+// program may read but not hold a pointer into.
+fn pstat(state: u64, index: u64, field: u64) -> u64 {
+    if index >= kstate.MAX_TASKS {
+        return err(E_INVAL)
+    }
+    if index >= kstate.get(state, kstate.TASKS) {
+        return 0
+    }
+    if field == P_STATE {
+        return sched.tget(state, index, sched.T_STATE)
+    }
+    if sched.tget(state, index, sched.T_STATE) == sched.S_FREE {
+        return 0
+    }
+    if field == P_PID {
+        return sched.tget(state, index, sched.T_PID)
+    }
+    if field == P_PPID {
+        let p: u64 = sched.tget(state, index, sched.T_PARENT)
+        if p >= kstate.MAX_TASKS {
+            return 0
+        }
+        return sched.tget(state, p, sched.T_PID)
+    }
+    if field == P_KIND {
+        return sched.tget(state, index, sched.T_KIND)
+    }
+    if field == P_PRIO {
+        return sched.tget(state, index, sched.T_PRIO)
+    }
+    if field == P_TICKS {
+        return sched.tget(state, index, sched.T_TICKS)
+    }
+    if field == P_EXIT {
+        return sched.tget(state, index, sched.T_EXIT)
+    }
+    if field == P_FAULTS {
+        return sched.tget(state, index, sched.T_FAULTS)
+    }
+    return err(E_INVAL)
+}
+
+// `kill`. There are no signals in this system, so there is one thing to
+// do to a process and this is it: it becomes a corpse with the code it
+// was given, and whoever is waiting for it is woken. The FRAMES come back
+// when its parent picks the corpse up -- `sys.do_wait` reaps, and that is
+// the same path a process that ended by itself takes.
+//
+// A task that is not a user process is refused: the idle task and the
+// boot task are the machine itself.
+fn kill_pid(state: u64, pid: u64, code: u64) -> u64 {
+    let flags: u64 = sched.irq_save()
+    let i: u64 = sched.find_pid(state, pid)
+    if i >= kstate.MAX_TASKS {
+        sched.irq_restore(flags)
+        return err(E_SRCH)
+    }
+    let st: u64 = sched.tget(state, i, sched.T_STATE)
+    if st == sched.S_FREE || st == sched.S_ZOMBIE {
+        sched.irq_restore(flags)
+        return err(E_SRCH)
+    }
+    if sched.tget(state, i, sched.T_KIND) != sched.K_USER {
+        sched.irq_restore(flags)
+        return err(E_PERM)
+    }
+    if i == sched.current(state) {
+        sched.irq_restore(flags)
+        sched.exit_task(state, code)
+        return 0 // not reached
+    }
+    sched.tset(state, i, sched.T_EXIT, code)
+    sched.tset(state, i, sched.T_END, kstate.get(state, kstate.TICKS))
+    sched.tset(state, i, sched.T_STATE, sched.S_ZOMBIE)
+    sched.wake_pid(state, pid)
+    sched.irq_restore(flags)
+    return 0
+}
