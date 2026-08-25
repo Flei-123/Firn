@@ -297,7 +297,24 @@ keyword. The line and the column are right, the marker is shorter. It shows
 only where a `let` whose initializer runs over a line break is declared
 twice, and there is no such program in the corpus.
 
-## 8. Files
+## 8. Found on the way: `test.sh` did not parse to its end
+
+Four `if` blocks in `test.sh` had lost their `fi` — sections 55 (K3, the
+TCP/IP stack), 54 (round 95, the Unicode table and the collector soak),
+56 (K4, the POSIX layer) and 57 (K5, the four processors). Four rounds ran
+next to one another and each merge dropped one closing keyword. `bash`
+reads a script command by command, so nothing complained until the very end:
+the run produced output for all the sections, printed
+`syntax error: unexpected end of file` after the last one, and exited with
+**2** instead of reporting `PASS n/n`. Whoever read the section output and
+not the exit code saw a suite that looked complete.
+
+The four `fi` are put back. It is the same accident as commit
+`60ace2bd test.sh: the five 'fi' that four parallel rounds lost` — the third
+time in this repository that parallel rounds have eaten a closing keyword,
+and it is worth a `bash -n test.sh` in whatever runs the merges.
+
+## 9. Files
 
 New:
 
