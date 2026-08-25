@@ -121,6 +121,10 @@ struct Par {
     dst: Val,
     ty: crate::fir::FTy,
     src: Val,
+    /// ROUND 94 -- the position of the phi this copy resolves. The copy is
+    /// the assignment the source program wrote at that place, so it belongs
+    /// to that line and to no other.
+    loc: crate::fir::Loc,
 }
 
 pub(crate) fn eliminate_func(f: &mut Func) -> Result<(), String> {
@@ -185,7 +189,7 @@ pub(crate) fn eliminate_func(f: &mut Func) -> Result<(), String> {
                     _ => continue,
                 };
                 match inc.iter().find(|(q, _)| *q as usize == p) {
-                    Some((_, v)) => par.push(Par { dst: d, ty: i.ty, src: *v }),
+                    Some((_, v)) => par.push(Par { dst: d, ty: i.ty, src: *v, loc: i.loc }),
                     None => {
                         return Err(format!(
                             "internal error: @{} bb{}: the phi %{} has no entry for its \
@@ -619,14 +623,15 @@ fn sequentialize(f: &mut Func, mut par: Vec<Par>) -> Vec<Inst> {
         match free {
             Some(k) => {
                 let c = par.remove(k);
-                out.push(Inst { dst: Some(c.dst), ty: c.ty, op: Op::Copy { src: c.src } });
+                out.push(Inst::like(Some(c.dst), c.ty, Op::Copy { src: c.src }, c.loc));
             }
             None => {
                 // 3. everything left is a cycle: rescue one target
                 let ty = par[0].ty;
                 let victim = par[0].dst;
                 let tmp = f.new_val_pub(ty);
-                out.push(Inst { dst: Some(tmp), ty, op: Op::Copy { src: victim } });
+                let vloc = par[0].loc;
+                out.push(Inst::like(Some(tmp), ty, Op::Copy { src: victim }, vloc));
                 for c in par.iter_mut() {
                     if c.src == victim {
                         c.src = tmp;
@@ -675,11 +680,13 @@ mod tests {
             dst: Some(a),
             ty: FTy::I64,
             op: Op::Phi { incoming: vec![(0, 0), (body, b)] },
+            loc: crate::fir::Loc::NONE,
         });
         f.blocks[head as usize].insts.push(Inst {
             dst: Some(b),
             ty: FTy::I64,
             op: Op::Phi { incoming: vec![(0, 1), (body, a)] },
+            loc: crate::fir::Loc::NONE,
         });
         let c = f.push(head, FTy::Bool, Op::Cmp { op: CmpOp::Lt, ty: FTy::I64, a, b });
         f.set_term(head, Term::BrCond { cond: c, then_bb: body, else_bb: done });
@@ -732,11 +739,13 @@ mod tests {
             dst: Some(x),
             ty: FTy::I64,
             op: Op::Phi { incoming: vec![(0, 0), (body, y)] },
+            loc: crate::fir::Loc::NONE,
         });
         f.blocks[head as usize].insts.push(Inst {
             dst: Some(y),
             ty: FTy::I64,
             op: Op::Phi { incoming: vec![(0, 1), (body, 0)] },
+            loc: crate::fir::Loc::NONE,
         });
         let c = f.push(head, FTy::Bool, Op::Cmp { op: CmpOp::Lt, ty: FTy::I64, a: x, b: y });
         f.set_term(head, Term::BrCond { cond: c, then_bb: body, else_bb: done });
@@ -782,17 +791,19 @@ mod tests {
             dst: Some(g),
             ty: FTy::I64,
             op: Op::Phi { incoming: vec![(0, 0), (latch, gnew)] },
+            loc: crate::fir::Loc::NONE,
         });
         f.blocks[head as usize].insts.push(Inst {
             dst: Some(old),
             ty: FTy::I64,
             op: Op::Phi { incoming: vec![(0, 1), (latch, g)] },
+            loc: crate::fir::Loc::NONE,
         });
         let c = f.push(head, FTy::Bool, Op::Cmp { op: CmpOp::Ne, ty: FTy::I64, a: g, b: old });
         f.set_term(head, Term::BrCond { cond: c, then_bb: latch, else_bb: done });
         f.blocks[latch as usize]
             .insts
-            .push(Inst { dst: Some(gnew), ty: FTy::I64, op: Op::Bin(BinOp::Add, g, g) });
+            .push(Inst::new(Some(gnew), FTy::I64, Op::Bin(BinOp::Add, g, g)));
         f.set_term(latch, Term::Br(head));
         f.set_term(done, Term::Ret(Some(g)));
         assert!(f.verify_phis().is_ok(), "{:?}", f.verify_phis());
@@ -834,13 +845,14 @@ mod tests {
             dst: Some(i),
             ty: FTy::I64,
             op: Op::Phi { incoming: vec![(0, 0), (latch, inext)] },
+            loc: crate::fir::Loc::NONE,
         });
         let c = f.push(head, FTy::Bool, Op::Cmp { op: CmpOp::Lt, ty: FTy::I64, a: i, b: 0 });
         f.set_term(head, Term::BrCond { cond: c, then_bb: latch, else_bb: done });
         let one = f.push(latch, FTy::I64, Op::Const(1));
         f.blocks[latch as usize]
             .insts
-            .push(Inst { dst: Some(inext), ty: FTy::I64, op: Op::Bin(BinOp::Add, i, one) });
+            .push(Inst::new(Some(inext), FTy::I64, Op::Bin(BinOp::Add, i, one)));
         f.set_term(latch, Term::Br(head));
         f.set_term(done, Term::Ret(Some(i)));
         eliminate_func(&mut f).unwrap();

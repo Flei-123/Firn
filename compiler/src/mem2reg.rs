@@ -761,7 +761,7 @@ pub(crate) fn promote_allocas(f: &mut Func) -> usize {
             let ty = f.val_ty(*v);
             f.blocks[b]
                 .insts
-                .insert(n, Inst { dst: Some(*v), ty, op: Op::Phi { incoming: Vec::new() } });
+                .insert(n, Inst::new(Some(*v), ty, Op::Phi { incoming: Vec::new() }));
         }
     }
 
@@ -943,7 +943,7 @@ pub(crate) fn promote_allocas(f: &mut Func) -> usize {
                 .iter()
                 .take_while(|x| matches!(x.op, Op::Alloca { .. }))
                 .count();
-            f.blocks[0].insts.insert(pos, Inst { dst: Some(v), ty, op: Op::Const(0) });
+            f.blocks[0].insts.insert(pos, Inst::new(Some(v), ty, Op::Const(0)));
         }
     }
     for b in f.blocks.iter_mut() {

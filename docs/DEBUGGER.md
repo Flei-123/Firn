@@ -1,8 +1,11 @@
 # Debugger: `.debug_info` of our own and a real `gdb` session
 
 **Requirement:** `W3` · `ACCEPTANCE.md` item 4 criterion B · `TODO-FIRN.md` 0.4
-**State (round 64):** lines, functions, parameters, local variables **and
-their types** work. What is still open stands under „Limits", as before.
+**State (round 94):** lines, functions, parameters, local variables **and
+their types** work. **New in round 94:** the line information is right at
+**every** build level, not only under `--no-opt` — the position travels on
+the instruction (`fir::Inst.loc`) instead of in a side table that the
+optimizer invalidated. What is still open stands under „Limits", as before.
 
 ## How it is generated
 
@@ -39,20 +42,33 @@ DW_TAG_compile_unit             producer, language, name, comp_dir,
 **No** external tool and **no** C compiler is used — only the assembler,
 which is in the build path anyway.
 
-Precision:
+Precision (**round 94**):
 
 | Build mode | Line information | Variables |
 |---|---|---|
 | `firnc --no-opt file.fi` | **statement-precise** | **yes**, with types |
-| `firnc file.fi` (with the optimizer) | the line of the `fn` declaration | **no** |
+| `--opt-level=dev-fast` | **statement-precise**, embedded code keeps the callee's line | **no** |
+| `--opt-level=release-safe` | **statement-precise**, coarser (fewer lines survive) | **no** |
+| `--opt-level=release-fast` | coarser still, but never a line the program does not have | **no** |
 
-The reason for the restriction is the same for both and it is in `SPEC.md`
-§14.1 item 16: the FIR carries no source positions, and the optimizer removes
-instructions, renumbers blocks and pulls an `alloca` into a register
-(`mem2reg`). A frame offset recorded before that would then point at storage
-that is no longer written to. **A wrong value in the debugger is worse than
-none**, so with the optimizer the variable information is left out entirely —
-and `tools/dwarf/run.sh` checks that as a counter-check.
+Measured on `tools/dwarf/inline_probe.fi`, distinct source lines covered:
+**dev 10, dev-fast 7, release-safe 5, release-fast 5** — before round 94 the
+three optimized levels covered exactly **one** line per function, the one of
+its `fn`. `tools/dwarf/run.sh` sections 7 and 8 hold the table against the
+panic message the program prints itself and insist that a coarser level never
+invents a line that `--no-opt` does not have.
+
+The **variables** are a different promise and they stay tied to `--no-opt`.
+The reason is in `SPEC.md` §14.1 item 16 and in round 92: the optimizer pulls
+an `alloca` into a register (`mem2reg` — 9 of 11 slots in
+`tools/dwarf/probe.fi`, all of them in `docs/gdb_example.fi`), the register
+allocator promotes surviving cells itself, and `remove_dead_stores` leaves a
+frame slot stale. A frame offset recorded before all that would point at
+storage that is no longer written to. **A wrong value in the debugger is
+worse than none**, so with the optimizer the variable information is left out
+entirely — and `tools/dwarf/run.sh` checks that as a counter-check. What it
+would take is written down in `docs/ROUND94.md` section 6: DWARF location
+lists.
 
 ## Proof: the session, copied verbatim
 
@@ -144,8 +160,9 @@ values may not.
 
 ## Limits (honestly)
 
-* **Nothing in the optimized build** apart from the function line. See above
-  for the reason; it is a decision, not an omission.
+* **No variables in the optimized build.** Lines are there since round 94,
+  variables are not. See above for the reason; it is a decision, not an
+  omission.
 * **No lexical blocks.** All variables of a function hang directly under the
   `DW_TAG_subprogram`, not under `DW_TAG_lexical_block`. If the same name is
   declared twice in nested scopes, both entries are there and `gdb` takes the
