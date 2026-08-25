@@ -87,6 +87,7 @@ const S_FAILED: u64 = 312
 const S_TRAMP: u64 = 320
 const S_DUPS: u64 = 328
 const S_MODE: u64 = 336
+const S_CLAIM: u64 = 344 // the next unit of work nobody has taken yet
 const S_FRAMES: u64 = 1024 // 8 cores * 16 frames * 8 octets
 
 // The phases. A started core watches S_PHASE and does what it says; the
@@ -420,20 +421,38 @@ fn step_size(state: u64) -> u64 {
     return STEP
 }
 
+// THE WORK IS CLAIMED, NOT DEALT OUT, and the difference is the whole
+// measurement. Handing every core a fixed third of the work makes the
+// total time the time of the SLOWEST core -- and on a build machine that
+// has other work on it, one of four emulated cores is regularly starved
+// by the host for a while. The number then says more about the host than
+// about the kernel.
+//
+// So there is one counter of units nobody has taken yet, and every core
+// takes the next one with `lock xadd` until there are none left. A core
+// that is slow simply does fewer units; the total work is the same to the
+// unit either way, which is what makes the one-core and four-core runs
+// comparable at all. It is also the smallest honest work queue there is,
+// and it needs exactly the primitive round 47 built.
 fn bench_core(state: u64, index: u64) {
-    let units: u64 = sget(state, S_UNITS)
+    let total: u64 = sget(state, S_UNITS)
     let step: u64 = step_size(state)
     let t0: u64 = apic.tsc()
     var acc: u64 = 0
-    var u: u64 = 0
-    while u < units {
-        acc = acc ^ grind(step)
-        u = u + 1
+    var mine: u64 = 0
+    var going: bool = true
+    while going {
+        if atomic.fetch_add(sp(state, S_CLAIM), 1) >= total {
+            going = false
+        } else {
+            acc = acc ^ grind(step)
+            mine = mine + 1
+        }
     }
     let t1: u64 = apic.tsc()
     cpu.set(state, index, cpu.C_SUM, acc)
     cpu.set(state, index, cpu.C_CYCLES, t1 - t0)
-    cpu.set(state, index, cpu.C_WORK, units)
+    cpu.set(state, index, cpu.C_WORK, mine)
 }
 
 // The three steps a lock exists for: read, change, write. They are NOT
@@ -590,13 +609,12 @@ fn bench(state: u64) {
     var s_per: [u8; 13] = "smp: percore\0"
     var s_c: [u8; 4] = "  c\0"
     var s_eq: [u8; 2] = "=\0"
+    var s_work: [u8; 12] = "smp: shares\0"
+    var s_sl: [u8; 2] = "/\0"
 
     let online: u64 = cpu.online_count(state)
-    var units: u64 = TOTAL_UNITS / online
-    if units == 0 {
-        units = 1
-    }
-    sset(state, S_UNITS, units)
+    sset(state, S_UNITS, TOTAL_UNITS)
+    atomic.store(sp(state, S_CLAIM), 0)
 
     // Both sides of the comparison have to be measured under the same
     // conditions. The started cores have no timer yet, so the boot
@@ -616,7 +634,7 @@ fn bench(state: u64) {
     serial.puts((&s_cores[0]) as u64)
     serial.dec(online)
     serial.puts((&s_units[0]) as u64)
-    serial.dec(units * online)
+    serial.dec(TOTAL_UNITS)
     serial.puts((&s_step[0]) as u64)
     serial.dec(step_size(state))
     serial.puts((&s_cyc[0]) as u64)
@@ -638,6 +656,25 @@ fn bench(state: u64) {
         serial.dec(cpu.get(state, i, cpu.C_CYCLES))
         i = i + 1
     }
+    serial.nl()
+
+    // How many of the twelve units each core ended up taking. Their sum
+    // is twelve in every run -- that is what makes the two runs the same
+    // work -- but the split is whatever the machine allowed.
+    serial.puts((&s_work[0]) as u64)
+    var w: u64 = 0
+    var sum: u64 = 0
+    while w < cpu.count(state) {
+        serial.puts((&s_c[0]) as u64)
+        serial.dec(w)
+        serial.puts((&s_eq[0]) as u64)
+        serial.dec(cpu.get(state, w, cpu.C_WORK))
+        sum = sum + cpu.get(state, w, cpu.C_WORK)
+        w = w + 1
+    }
+    serial.puts((&s_c[0]) as u64)
+    serial.puts((&s_sl[0]) as u64)
+    serial.dec(sum)
     serial.nl()
 }
 
@@ -783,7 +820,7 @@ fn schedule_demo(state: u64) {
     var made: u64 = 0
     var i: u64 = 0
     while i < want {
-        let t: u64 = sched.create(state, sched.K_WORKER, 1, 0, 0)
+        let t: u64 = sched.create(state, sched.K_GRIND, 1, 0, 0)
         if t != 0 {
             sched.start(state, t)
             made = made + 1
@@ -794,7 +831,7 @@ fn schedule_demo(state: u64) {
     var guard: u64 = 0
     var done: u64 = 0
     while guard < 30000 {
-        done = sched.zombies(state, sched.K_WORKER)
+        done = sched.zombies(state, sched.K_GRIND)
         if done >= made {
             guard = 30000
         } else {
