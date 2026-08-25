@@ -657,6 +657,57 @@ has "$K" "hello: bss 0" "round K1: the loader still zeroes the .bss"
 has "$K" "sh: cannot run nothing -> -2" "round K1: an unknown command is -ENOENT"
 has "$K" "sh: bye" "round K1: 'exit' ends the shell"
 
+echo "== 11. the line editor on a REAL keyboard =="
+# The other half of case 5. There the two octets came out of a file; here
+# they come out of the PS/2 controller: `l`, `s`, return -- and then the UP
+# ARROW, which arrives as `E0 48`, is translated to 14 in
+# `demos/kernel/kbd.fi` and reaches the shell as "the line before this
+# one". Two listings out of five keys is the whole measurement.
+rm -f "$TMPD/mon.sock" "$TMPD/kbd.txt" "$TMPD/kbd.rc"
+cp "$TMPD/disk0.img" "$TMPD/kbd.img"
+( timeout 120 qemu-system-x86_64 -kernel "$TMPD/k0.mb" -m 128 \
+    -append "osum nosched noproc nofs noring3" \
+    -serial "file:$TMPD/kbd.txt" -display none -no-reboot \
+    -drive "file=$TMPD/kbd.img,format=raw,if=ide,index=0" \
+    -monitor "unix:$TMPD/mon.sock,server,nowait" \
+    -device isa-debug-exit,iobase=0xf4,iosize=0x04 >/dev/null 2>&1
+  echo $? > "$TMPD/kbd.rc" ) &
+qemu_pid=$!
+for _ in $(seq 1 200); do
+    [ -f "$TMPD/kbd.txt" ] && grep -q "sh: ready, osum" "$TMPD/kbd.txt" && break
+    sleep 0.2
+done
+if [ -S "$TMPD/mon.sock" ] && grep -q "sh: ready, osum" "$TMPD/kbd.txt" 2>/dev/null; then
+    python3 - "$TMPD/mon.sock" <<'PY'
+import socket, sys, time
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sys.argv[1])
+time.sleep(0.4)
+for key in ["l", "s", "ret", "up", "ret"]:
+    s.sendall(("sendkey %s\n" % key).encode())
+    time.sleep(0.3)
+s.close()
+PY
+    wait $qemu_pid 2>/dev/null
+    rc=$(cat "$TMPD/kbd.rc" 2>/dev/null || echo 99)
+    K="$TMPD/kbd.txt"
+    [ "$rc" -eq 21 ] && ok "the interactive run ends by itself (exit 21) -- a quiet console is the end of the input" \
+                     || { bad "keyboard run: exit code $rc"; tail -6 "$K" | sed 's/^/        /'; }
+    n=$(grep -c '^key: ' "$K")
+    num "keys that arrived over IRQ1 (l, s, return, up, return)" "$n" eq 5
+    n=$(grep -c '^\./ \.\./ bin/ d/ t/ $' "$K")
+    if [ "$n" -eq 2 ]; then
+        ok "THE UP ARROW FETCHED THE LINE BACK: two listings out of one typed 'ls'"
+    else
+        bad "the recalled line produced $n listings, expected 2"
+        grep -n 'osum\$' "$K" | head -6 | sed 's/^/        /'
+    fi
+    has "$K" "sh: bye" "and the shell ended when the keyboard went quiet"
+else
+    kill $qemu_pid 2>/dev/null
+    bad "keyboard run: the shell never said it was ready"
+fi
+
 echo
 echo "USERLAND: $pass passed, $fail failed"
 [ "$fail" -eq 0 ] || exit 1
