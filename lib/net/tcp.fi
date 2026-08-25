@@ -138,6 +138,13 @@ struct Tcb {
     iss: u32,
     snd_una: u32,
     snd_nxt: u32,
+    // The HIGHEST sequence number ever put on the wire. `snd_nxt` is only
+    // the cursor and is wound BACK on a retransmission; `snd_max` is not.
+    // Without the distinction a stack rejects the peer's perfectly good
+    // acknowledgements as "for octets never sent" the moment it has
+    // retransmitted once -- and then the connection dies of its own
+    // recovery. That is what round K3 measured before this line existed.
+    snd_max: u32,
     snd_end: u32,
     snd_wnd: u32,
     snd_wl1: u32,
@@ -151,6 +158,7 @@ struct Tcb {
     rcv_nxt: u32,
     rcv_rd: u32,
     fin_rcvd: u32,
+    fin_at: u32,
 
     // reassembly: the ranges beyond rcv_nxt that have already arrived.
     // The octets themselves are already lying in `rcv_buf` at their own
@@ -277,6 +285,7 @@ fn clear(c: *mut Tcb) {
     (*c).iss = 0
     (*c).snd_una = 0
     (*c).snd_nxt = 0
+    (*c).snd_max = 0
     (*c).snd_end = 0
     (*c).snd_wnd = 0
     (*c).snd_wl1 = 0
@@ -288,6 +297,7 @@ fn clear(c: *mut Tcb) {
     (*c).rcv_nxt = 0
     (*c).rcv_rd = 0
     (*c).fin_rcvd = 0
+    (*c).fin_at = 0
     (*c).ooo_n = 0
     (*c).mss = MSS_DEFAULT
     (*c).cwnd = MSS_DEFAULT * 10
@@ -376,7 +386,12 @@ fn tcp_connect(t: *mut Tcp, lip: u32, lport: u16, rip: u32, rport: u16, now: u64
     (*c).iss = iss
     (*c).snd_una = iss
     (*c).snd_nxt = iss
-    (*c).snd_end = iss
+    (*c).snd_max = iss
+    // The SYN occupies `iss`; the DATA space starts one further on, and
+    // `snd_end` names the end of the data space. Starting it at `iss`
+    // instead makes `snd_end -% snd_una` wrap to 2^32-1 the moment the
+    // SYN is acknowledged, and the send buffer looks full for ever.
+    (*c).snd_end = iss +% 1
     (*c).snd_wnd = 1
     (*c).cwnd = MSS_DEFAULT * 10
     arm_rt(t, c, now)
@@ -453,6 +468,7 @@ fn tcp_dbg(t: *mut Tcp, h: i32, which: u32) -> u64 {
     if which == 13 { return (*c).state as u64 }
     if which == 14 { return (*c).used as u64 }
     if which == 15 { return (*c).rttvar }
+    if which == 16 { return (*c).snd_max as u64 }
     return 0
 }
 
@@ -511,10 +527,20 @@ fn rcv_window(c: *mut Tcb) -> u32 {
     return w
 }
 
+// The FIN occupies a sequence number, but it is NOT an octet of data.
+// Counting it as one hands the application one octet more than the peer
+// ever sent -- and that octet is whatever happened to lie in the ring.
+fn rcv_avail(c: *mut Tcb) -> u32 {
+    if (*c).fin_rcvd == 1 && wire.seq_ge((*c).rcv_nxt, (*c).fin_at) {
+        return (*c).fin_at -% (*c).rcv_rd
+    }
+    return (*c).rcv_nxt -% (*c).rcv_rd
+}
+
 fn tcp_readable(t: *mut Tcp, h: i32) -> usize {
     if h < 0 { return 0 }
     let c: *mut Tcb = tcb(t, h as usize)
-    return ((*c).rcv_nxt -% (*c).rcv_rd) as usize
+    return rcv_avail(c) as usize
 }
 
 fn tcp_writable(t: *mut Tcp, h: i32) -> usize {
@@ -544,7 +570,7 @@ fn tcp_recv(t: *mut Tcp, h: i32, dst: *mut u8, cap: usize) -> usize {
     if h < 0 { return 0 }
     let c: *mut Tcb = tcb(t, h as usize)
     if (*c).used == 0 { return 0 }
-    let avail: usize = ((*c).rcv_nxt -% (*c).rcv_rd) as usize
+    let avail: usize = rcv_avail(c) as usize
     let k: usize = umin(avail, cap)
     var i: usize = 0
     while i < k {
@@ -823,7 +849,8 @@ fn listen_step(t: *mut Tcp, l: i32, iph: *mut u8, seg: *mut u8, now: u64) {
     (*c).iss = iss
     (*c).snd_una = iss
     (*c).snd_nxt = iss
-    (*c).snd_end = iss
+    (*c).snd_max = iss
+    (*c).snd_end = iss +% 1
     (*c).snd_wnd = wire.tcp_wnd(seg)
     (*c).snd_wl1 = wire.tcp_seq(seg)
     (*c).snd_wl2 = iss
@@ -842,7 +869,7 @@ fn syn_sent_step(t: *mut Tcp, c: *mut Tcb, seg: *mut u8, now: u64) {
     let ack: u32 = wire.tcp_ack(seg)
     var ack_ok: bool = false
     if (fl & wire.F_ACK) != 0 {
-        if wire.seq_le(ack, (*c).iss) || wire.seq_gt(ack, (*c).snd_nxt) {
+        if wire.seq_le(ack, (*c).iss) || wire.seq_gt(ack, (*c).snd_max) {
             bump(t, ST_BAD_ACK)
             if (fl & wire.F_RST) == 0 {
                 queue_rst(t, (*c).lip, (*c).lport, (*c).rip, (*c).rport, ack, 0, wire.F_RST)
@@ -932,6 +959,11 @@ fn dead(c: *mut Tcb, why: i32) {
     (*c).fin_sent = 0
     (*c).reset_req = 0
     (*c).ooo_n = 0
+}
+
+fn advance_nxt(c: *mut Tcb, v: u32) {
+    (*c).snd_nxt = v
+    if wire.seq_gt(v, (*c).snd_max) { (*c).snd_max = v }
 }
 
 fn start_rtt(c: *mut Tcb, seq: u32, now: u64) {
@@ -1031,7 +1063,7 @@ fn step(t: *mut Tcp, h: i32, iph: *mut u8, seg: *mut u8, data: *mut u8, dlen: us
     if (fl & wire.F_ACK) == 0 { return }
 
     if (*c).state == S_SYN_RECEIVED {
-        if wire.seq_gt(ack, (*c).snd_una) && wire.seq_le(ack, (*c).snd_nxt) {
+        if wire.seq_gt(ack, (*c).snd_una) && wire.seq_le(ack, (*c).snd_max) {
             (*c).state = S_ESTABLISHED
             (*c).snd_wnd = wire.tcp_wnd(seg)
             (*c).snd_wl1 = seq
@@ -1048,7 +1080,7 @@ fn step(t: *mut Tcp, h: i32, iph: *mut u8, seg: *mut u8, data: *mut u8, dlen: us
     // counter-check of the round and not a formality: a stack that
     // believes it would move `snd_una` past `snd_nxt`, and from then on
     // every length it computes is a wrapped difference near 2^32.
-    if wire.seq_gt(ack, (*c).snd_nxt) {
+    if wire.seq_gt(ack, (*c).snd_max) {
         bump(t, ST_BAD_ACK)
         (*c).ack_now = 1
         return
@@ -1073,7 +1105,7 @@ fn step(t: *mut Tcp, h: i32, iph: *mut u8, seg: *mut u8, data: *mut u8, dlen: us
         (*c).rt_shift = 0
         (*c).rto = (*c).srtt + 4 * (*c).rttvar
         if (*c).rto < (*t).rto_min { (*c).rto = (*t).rto_min }
-        if wire.seq_lt((*c).snd_una, (*c).snd_nxt) {
+        if wire.seq_lt((*c).snd_una, (*c).snd_max) {
             arm_rt(t, c, now)
         } else {
             (*c).rt_on = 0
@@ -1081,13 +1113,13 @@ fn step(t: *mut Tcp, h: i32, iph: *mut u8, seg: *mut u8, data: *mut u8, dlen: us
     } else if ack == (*c).snd_una && dlen == 0
               && (fl & (wire.F_SYN | wire.F_FIN)) == 0
               && wire.tcp_wnd(seg) == (*c).snd_wnd
-              && wire.seq_lt((*c).snd_una, (*c).snd_nxt) {
+              && wire.seq_lt((*c).snd_una, (*c).snd_max) {
         // Three duplicates say that segments AFTER the hole are arriving
         // -- so the hole is a loss and not a reordering, and waiting for
         // the timer would waste a whole RTO.
         (*c).dupacks = (*c).dupacks +% 1
         if (*c).dupacks == 3 && (*t).no_rexmit == 0 {
-            let flight: u32 = (*c).snd_nxt -% (*c).snd_una
+            let flight: u32 = (*c).snd_max -% (*c).snd_una
             (*c).ssthresh = u32max(flight / 2, 2 * (*c).mss)
             (*c).snd_nxt = (*c).snd_una
             (*c).fin_sent = 0
@@ -1143,6 +1175,7 @@ fn step(t: *mut Tcp, h: i32, iph: *mut u8, seg: *mut u8, data: *mut u8, dlen: us
     if (fl & wire.F_FIN) != 0 {
         let fin_seq: u32 = seq +% (dlen as u32)
         if fin_seq == (*c).rcv_nxt {
+            (*c).fin_at = (*c).rcv_nxt
             (*c).rcv_nxt = (*c).rcv_nxt +% 1
             (*c).fin_rcvd = 1
             (*c).ack_now = 1
@@ -1263,7 +1296,7 @@ fn emit(t: *mut Tcp, i: usize, buf: *mut u8, cap: usize, now: u64, dstip: *mut u
         (*c).rto = (*c).rto * 2
         if (*c).rto > RTO_MAX { (*c).rto = RTO_MAX }
         (*c).rtt_on = 0 // Karn: no sample out of a retransmitted segment
-        let flight: u32 = (*c).snd_nxt -% (*c).snd_una
+        let flight: u32 = (*c).snd_max -% (*c).snd_una
         (*c).ssthresh = u32max(flight / 2, 2 * (*c).mss)
         (*c).cwnd = (*c).mss
         (*c).dupacks = 0
@@ -1286,7 +1319,7 @@ fn emit(t: *mut Tcp, i: usize, buf: *mut u8, cap: usize, now: u64, dstip: *mut u
         if (*c).snd_nxt == (*c).iss {
             let n: usize = seg_build(t, c, buf, cap, wire.F_SYN, (*c).iss, 0, true)
             if n == 0 { return 0 }
-            (*c).snd_nxt = (*c).iss +% 1
+            advance_nxt(c, (*c).iss +% 1)
             start_rtt(c, (*c).iss, now)
             arm_rt(t, c, now)
             return n
@@ -1298,7 +1331,7 @@ fn emit(t: *mut Tcp, i: usize, buf: *mut u8, cap: usize, now: u64, dstip: *mut u
         if (*c).snd_nxt == (*c).iss {
             let n: usize = seg_build(t, c, buf, cap, wire.F_SYN | wire.F_ACK, (*c).iss, 0, true)
             if n == 0 { return 0 }
-            (*c).snd_nxt = (*c).iss +% 1
+            advance_nxt(c, (*c).iss +% 1)
             (*c).ack_now = 0
             (*c).ack_on = 0
             (*c).seg_since_ack = 0
@@ -1356,7 +1389,7 @@ fn emit(t: *mut Tcp, i: usize, buf: *mut u8, cap: usize, now: u64, dstip: *mut u
         // unacknowledged -- unless it is the last one and the connection
         // is being closed, because then nothing will ever come after it
         // to fill it up.
-        let unacked: bool = wire.seq_lt((*c).snd_una, (*c).snd_nxt)
+        let unacked: bool = wire.seq_lt((*c).snd_una, (*c).snd_max)
         let all: bool = ((*c).snd_nxt +% can) == (*c).snd_end
         if unacked {
             if !((*c).close_req == 1 && all) { send_now = false }
@@ -1376,10 +1409,10 @@ fn emit(t: *mut Tcp, i: usize, buf: *mut u8, cap: usize, now: u64, dstip: *mut u
         }
         let n: usize = seg_build(t, c, buf, cap, flags, seq0, can as usize, false)
         if n == 0 { return 0 }
-        (*c).snd_nxt = seq0 +% can
+        advance_nxt(c, seq0 +% can)
         if fin {
             (*c).fin_sent = 1
-            (*c).snd_nxt = (*c).snd_nxt +% 1
+            advance_nxt(c, (*c).snd_nxt +% 1)
             advance_fin_state(c)
         }
         start_rtt(c, (*c).snd_nxt, now)
@@ -1410,7 +1443,7 @@ fn emit(t: *mut Tcp, i: usize, buf: *mut u8, cap: usize, now: u64, dstip: *mut u
         let n: usize = seg_build(t, c, buf, cap, wire.F_FIN | wire.F_ACK, (*c).snd_nxt, 0, false)
         if n == 0 { return 0 }
         (*c).fin_sent = 1
-        (*c).snd_nxt = (*c).snd_nxt +% 1
+        advance_nxt(c, (*c).snd_nxt +% 1)
         advance_fin_state(c)
         start_rtt(c, (*c).snd_nxt, now)
         arm_rt(t, c, now)
