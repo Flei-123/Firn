@@ -105,24 +105,43 @@ fn move_out(w: *mut World, from: *mut stack.Stack, l: *mut link.Link, now: u64) 
     }
 }
 
-fn deliver(w: *mut World, l: *mut link.Link, to: *mut stack.Stack, now: u64) {
-    var guard: usize = 0
-    var k: i32 = link.link_ready(l, now)
-    while k >= 0 && guard < 256 {
-        let n: usize = link.link_pump_out(l, k, &(*w).tmp[0], 2048)
-        stack.net_input(to, &(*w).tmp[0], n, now)
-        guard = guard + 1
-        k = link.link_ready(l, now)
-    }
+fn deliver_one(w: *mut World, l: *mut link.Link, k: i32, to: *mut stack.Stack, now: u64) {
+    let n: usize = link.link_pump_out(l, k, &(*w).tmp[0], 2048)
+    stack.net_input(to, &(*w).tmp[0], n, now)
 }
 
+// ONE FRAME AT A TIME, and the receiver gets to answer before the next
+// one arrives. Delivering a whole burst and only then letting the
+// receiver run is not a faster simulation, it is a DIFFERENT one: the
+// duplicate acknowledgements that fast retransmit lives on all collapse
+// into a single one, and the measurement then says that fast retransmit
+// does not work when in fact it was never given the chance. A real card
+// hands over one frame per interrupt; so does this.
 fn tick(w: *mut World, now: u64) {
     stack.net_poll(&(*w).a, now)
-    stack.net_poll(&(*w).b, now)
     move_out(w, &(*w).a, &(*w).la, now)
+    stack.net_poll(&(*w).b, now)
     move_out(w, &(*w).b, &(*w).lb, now)
-    deliver(w, &(*w).la, &(*w).b, now)
-    deliver(w, &(*w).lb, &(*w).a, now)
+    var guard: usize = 0
+    var go: bool = true
+    while go && guard < 512 {
+        go = false
+        let ka: i32 = link.link_ready(&(*w).la, now)
+        if ka >= 0 {
+            deliver_one(w, &(*w).la, ka, &(*w).b, now)
+            stack.net_poll(&(*w).b, now)
+            move_out(w, &(*w).b, &(*w).lb, now)
+            go = true
+        }
+        let kb: i32 = link.link_ready(&(*w).lb, now)
+        if kb >= 0 {
+            deliver_one(w, &(*w).lb, kb, &(*w).a, now)
+            stack.net_poll(&(*w).a, now)
+            move_out(w, &(*w).a, &(*w).la, now)
+            go = true
+        }
+        guard = guard + 1
+    }
 }
 
 // ===================================================================
@@ -287,8 +306,11 @@ fn case_corrupt(w: *mut World) -> bool {
 fn transfer(w: *mut World, total: usize, loss: u32, reorder: u32,
             no_rexmit: bool, rounds: usize) -> usize {
     setup(w, 987654321, 200)
-    link.link_set(&(*w).la, loss, reorder, 0)
-    link.link_set(&(*w).lb, loss / 2, reorder, 0)
+    // `la` carries A -> B, that is the ACKNOWLEDGEMENTS; `lb` carries
+    // B -> A, that is the DATA. The data direction gets the higher loss,
+    // because that is what the retransmission has to survive.
+    link.link_set(&(*w).la, loss / 2, reorder, 0)
+    link.link_set(&(*w).lb, loss, reorder, 0)
     if no_rexmit {
         tcp.tcp_set_no_rexmit(stack.net_tcp(&(*w).a), true)
         tcp.tcp_set_no_rexmit(stack.net_tcp(&(*w).b), true)
@@ -349,6 +371,7 @@ fn case_loss(w: *mut World) -> bool {
     f = kv(f, "rexmit", rex)
     f = kv(f, "fast_rexmit", frx)
     f = kv(f, "out_of_order", ooo)
+    f = kv(f, "dupacks", tcp.tcp_stat(stack.net_tcp(&(*w).b), tcp.ST_DUPACK))
     done(f)
 
     let without: usize = transfer(w, TOTAL, 50, 30, true, 200000)
