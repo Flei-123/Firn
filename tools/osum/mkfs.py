@@ -42,10 +42,12 @@ INODE_BLOCKS = 32
 DATA_START = 34
 DIRENT = 32
 NAME_LEN = 24
-DIRECT = 12
+DIRECT = 11   # round K6: 112..119 became the double indirect block
 
 T_FREE, T_FILE, T_DIR = 0, 1, 2
 I_TYPE, I_SIZE, I_NLINK, I_DIRECT, I_INDIRECT = 0, 8, 16, 24, 120
+I_DINDIRECT = 112
+PER_BLOCK = BS // 8
 SB = dict(MAGIC=0, BSIZE=8, BLOCKS=16, INODES=24, BITMAP=32, ITABLE=40,
           DATA=48, ROOT=56)
 
@@ -120,22 +122,48 @@ class Fs:
             self.iset(ino, I_DIRECT + index * 8, b)
             return b
         k = index - DIRECT
-        if k >= BS // 8:
+        if k < PER_BLOCK:
+            ib = self.iget(ino, I_INDIRECT)
+            if not ib:
+                if not grow:
+                    return 0
+                ib = self.block_alloc()
+                self.iset(ino, I_INDIRECT, ib)
+            b = self.g64(ib * BS + k * 8)
+            if b or not grow:
+                return b
+            b = self.block_alloc()
+            self.p64(ib * BS + k * 8, b)
+            return b
+        # ROUND K6: the double indirect block, the same shape as in
+        # demos/kernel/fs.fi -- 64 blocks of 64 block numbers.
+        j = k - PER_BLOCK
+        if j >= PER_BLOCK * PER_BLOCK:
             raise SystemExit(
                 "mkfs: a file may hold %d octets in this format (%d direct "
-                "blocks + %d through the indirect one, see fs.fi); this one "
-                "is bigger" % ((DIRECT + BS // 8) * BS, DIRECT, BS // 8))
-        ib = self.iget(ino, I_INDIRECT)
-        if not ib:
+                "blocks + %d through the indirect one + %d through the "
+                "double one, see fs.fi); this one is bigger"
+                % ((DIRECT + PER_BLOCK + PER_BLOCK * PER_BLOCK) * BS,
+                   DIRECT, PER_BLOCK, PER_BLOCK * PER_BLOCK))
+        db = self.iget(ino, I_DINDIRECT)
+        if not db:
             if not grow:
                 return 0
-            ib = self.block_alloc()
-            self.iset(ino, I_INDIRECT, ib)
-        b = self.g64(ib * BS + k * 8)
+            db = self.block_alloc()
+            self.iset(ino, I_DINDIRECT, db)
+        outer = j // PER_BLOCK
+        mid = self.g64(db * BS + outer * 8)
+        if not mid:
+            if not grow:
+                return 0
+            mid = self.block_alloc()
+            self.p64(db * BS + outer * 8, mid)
+        inner = j % PER_BLOCK
+        b = self.g64(mid * BS + inner * 8)
         if b or not grow:
             return b
         b = self.block_alloc()
-        self.p64(ib * BS + k * 8, b)
+        self.p64(mid * BS + inner * 8, b)
         return b
 
     def write_at(self, ino, off, data):

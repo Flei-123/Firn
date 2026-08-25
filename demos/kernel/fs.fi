@@ -57,7 +57,14 @@ const INODE_BLOCKS: u64 = 32
 const DATA_START: u64 = 34
 const DIRENT: u64 = 32
 const NAME_LEN: u64 = 24
-const DIRECT: u64 = 12
+// ROUND K6: eleven direct blocks and not twelve. The octets 112..119 of
+// an inode were the twelfth; they are the DOUBLE indirect block now, and
+// what a file may hold went from 38912 octets to 2135552 -- eleven direct
+// blocks, sixty-four through the indirect one, and 64 * 64 through the
+// double one. A userland is what needed it: a shell of round K6 built by
+// firnc1 is over 38912 octets, and a program that does not fit on the
+// disk is not a program.
+const DIRECT: u64 = 11
 
 const T_FREE: u64 = 0
 const T_FILE: u64 = 1
@@ -68,6 +75,7 @@ const I_TYPE: u64 = 0
 const I_SIZE: u64 = 8
 const I_NLINK: u64 = 16
 const I_DIRECT: u64 = 24 // twelve of them
+const I_DINDIRECT: u64 = 112 // a block of blocks of blocks (round K6)
 const I_INDIRECT: u64 = 120
 
 // The fields of the superblock.
@@ -108,6 +116,13 @@ fn buf_nm(state: u64) -> u64 {
 
 fn buf_zz(state: u64) -> u64 {
     return state + kstate.FS_OFF + 3072
+}
+
+// ROUND K6: the eighth and last scratch block of the page. The double
+// indirect block needs a buffer of its own -- `buf_ib` holds the level
+// under it at the same time.
+fn buf_i2(state: u64) -> u64 {
+    return state + kstate.FS_OFF + 3584
 }
 
 fn zero(p: u64, n: u64) {
@@ -284,37 +299,93 @@ fn file_block(state: u64, ino: u64, index: u64, grow: bool) -> u64 {
         return fresh
     }
     let k: u64 = index - DIRECT
-    if k >= BS / 8 {
+    if k < BS / 8 {
+        var ib: u64 = inode_get(state, ino, I_INDIRECT)
+        if ib == 0 {
+            if !grow {
+                return 0
+            }
+            ib = block_alloc(state)
+            if ib == 0 {
+                return 0
+            }
+            inode_set(state, ino, I_INDIRECT, ib)
+        }
+        if !blk.read(state, ib, buf_ib(state)) {
+            return 0
+        }
+        let b: u64 = get64(buf_ib(state) + k * 8)
+        if b != 0 || !grow {
+            return b
+        }
+        let fresh: u64 = block_alloc(state)
+        if fresh == 0 {
+            return 0
+        }
+        if !blk.read(state, ib, buf_ib(state)) {
+            return 0
+        }
+        put64(buf_ib(state) + k * 8, fresh)
+        blk.write(state, ib, buf_ib(state))
+        return fresh
+    }
+    // ROUND K6: the second level. The block at I_DINDIRECT holds 64 block
+    // numbers, and each of those holds 64 more -- 4096 data blocks, and
+    // the file may be 2 MiB. Every step allocates only under `grow`, and
+    // `block_alloc` hands out a ZEROED block, which is what makes an
+    // empty slot readable as a zero and not as whatever was there before.
+    let j: u64 = k - BS / 8
+    if j >= (BS / 8) * (BS / 8) {
         return 0
     }
-    var ib: u64 = inode_get(state, ino, I_INDIRECT)
-    if ib == 0 {
+    var db: u64 = inode_get(state, ino, I_DINDIRECT)
+    if db == 0 {
         if !grow {
             return 0
         }
-        ib = block_alloc(state)
-        if ib == 0 {
+        db = block_alloc(state)
+        if db == 0 {
             return 0
         }
-        inode_set(state, ino, I_INDIRECT, ib)
+        inode_set(state, ino, I_DINDIRECT, db)
     }
-    if !blk.read(state, ib, buf_ib(state)) {
+    if !blk.read(state, db, buf_i2(state)) {
         return 0
     }
-    let b: u64 = get64(buf_ib(state) + k * 8)
-    if b != 0 || !grow {
-        return b
+    let outer: u64 = j / (BS / 8)
+    var mid: u64 = get64(buf_i2(state) + outer * 8)
+    if mid == 0 {
+        if !grow {
+            return 0
+        }
+        mid = block_alloc(state)
+        if mid == 0 {
+            return 0
+        }
+        if !blk.read(state, db, buf_i2(state)) {
+            return 0
+        }
+        put64(buf_i2(state) + outer * 8, mid)
+        blk.write(state, db, buf_i2(state))
     }
-    let fresh: u64 = block_alloc(state)
-    if fresh == 0 {
+    if !blk.read(state, mid, buf_ib(state)) {
         return 0
     }
-    if !blk.read(state, ib, buf_ib(state)) {
+    let inner: u64 = j % (BS / 8)
+    let b2: u64 = get64(buf_ib(state) + inner * 8)
+    if b2 != 0 || !grow {
+        return b2
+    }
+    let f2: u64 = block_alloc(state)
+    if f2 == 0 {
         return 0
     }
-    put64(buf_ib(state) + k * 8, fresh)
-    blk.write(state, ib, buf_ib(state))
-    return fresh
+    if !blk.read(state, mid, buf_ib(state)) {
+        return 0
+    }
+    put64(buf_ib(state) + inner * 8, f2)
+    blk.write(state, mid, buf_ib(state))
+    return f2
 }
 
 // Every block of a file back to the bitmap.
@@ -342,6 +413,33 @@ fn file_truncate(state: u64, ino: u64) {
         }
         block_free(state, ib)
         inode_set(state, ino, I_INDIRECT, 0)
+    }
+    // ROUND K6: and the second level, from the bottom up -- a block that
+    // is freed before the block that names it is a block nobody can find.
+    let db: u64 = inode_get(state, ino, I_DINDIRECT)
+    if db != 0 {
+        if blk.read(state, db, buf_i2(state)) {
+            var outer: u64 = 0
+            while outer < BS / 8 {
+                let mid: u64 = get64(buf_i2(state) + outer * 8)
+                if mid != 0 {
+                    if blk.read(state, mid, buf_ib(state)) {
+                        var inner: u64 = 0
+                        while inner < BS / 8 {
+                            let b: u64 = get64(buf_ib(state) + inner * 8)
+                            if b != 0 {
+                                block_free(state, b)
+                            }
+                            inner = inner + 1
+                        }
+                    }
+                    block_free(state, mid)
+                }
+                outer = outer + 1
+            }
+        }
+        block_free(state, db)
+        inode_set(state, ino, I_DINDIRECT, 0)
     }
     inode_set(state, ino, I_SIZE, 0)
 }

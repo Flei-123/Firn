@@ -217,10 +217,11 @@ else
     bad "hello: no NOBITS .bss, so nothing measures the zeroing"
 fi
 
-# The file system stops a file at 12 direct + 64 indirect blocks
-# (`demos/kernel/fs.fi`). The programs have to fit into that, and the
-# margin is worth a number: this is the check that speaks up first if a
-# later compiler makes them fatter.
+# The file system stops a file at 11 direct + 64 indirect + 64 * 64
+# double indirect blocks (`demos/kernel/fs.fi`, widened in round K6 --
+# the shell of that round is over the old 38912 octets). The programs
+# have to fit into that, and the margin is worth a number: this is the
+# check that speaks up first if a later compiler makes them fatter.
 biggest=0
 for p in $PROGS; do
     for s in 0 1; do
@@ -229,8 +230,8 @@ for p in $PROGS; do
         [ "$z" -gt "$biggest" ] && biggest=$z
     done
 done
-num "the biggest program on the disk, against the 38912 octets a file may hold" \
-    "$biggest" lt 38912
+num "the biggest program on the disk, against the 2135552 octets a file may hold" \
+    "$biggest" lt 2135552
 
 echo "== 3. the disk image, built on the host and read back =="
 printf 'firn round K1: this file lies on a real disk\n' > "$TMPD/readme.txt"
