@@ -1,0 +1,309 @@
+// demos/kernel/acpi.fi -- round K5: asking the firmware how many
+// processors this machine has.
+//
+// A kernel cannot count cores by looking. There is no register that says
+// "four", no port that answers with a number; the only place the
+// information exists is a table the firmware left in memory, and the only
+// way to it is a chain of four steps, each of which has to be checked
+// because a wrong turn ends in reading random memory as a table:
+//
+//   1. THE RSDP, "RSD PTR ", eight characters somewhere in two places the
+//      specification allows: the first kilobyte of the EBDA (whose
+//      segment stands as a 16-bit word at 0x40E) and 0x000E0000 ..
+//      0x000FFFFF. Aligned to 16. Its first twenty octets have to sum to
+//      zero modulo 256, which is what separates the real one from the
+//      same eight characters standing in a BIOS string.
+//   2. THE RSDT or, from ACPI 2.0 on, the XSDT -- a header plus an array
+//      of pointers to every other table. Four octets per entry in the
+//      RSDT, eight in the XSDT, and which one is valid is decided by the
+//      revision in the RSDP, not by which pointer looks nicer.
+//   3. THE MADT, signature "APIC", found by walking that array. It
+//      carries the address of the local APIC and then a list of records
+//      of varying length, each with a type and its own length.
+//   4. THE RECORDS of type 0 (a local APIC = a processor) and type 9 (the
+//      same in the x2APIC form). Flag bit 0 says the processor is usable.
+//      A record of type 0 whose flags are zero is a socket that is empty
+//      or a core the firmware disabled -- starting it would hang.
+//
+// EVERY step above is checksummed and every length is taken out of the
+// table itself. The counter-check that this is really being read and not
+// guessed is in `tools/kernel/run.sh`: the same kernel under `-smp 1`,
+// `-smp 2` and `-smp 4` has to report one, two and four processors, and
+// nothing in the kernel knows the number beforehand.
+
+import serial
+import kstate
+
+export { find, cpus, ioapic_addr, lapic_addr, revision, oem, valid }
+
+// ------------------------------------------------------ the search area
+
+const EBDA_PTR: u64 = 0x40E
+const BIOS_LOW: u64 = 0x000E0000
+const BIOS_HIGH: u64 = 0x00100000
+
+// Offsets in the RSDP.
+const P_REVISION: u64 = 15
+const P_RSDT: u64 = 16
+const P_LENGTH: u64 = 20
+const P_XSDT: u64 = 24
+
+// Offsets in every table header.
+const H_LENGTH: u64 = 4
+const H_REVISION: u64 = 8
+const H_OEM: u64 = 10
+const H_SIZE: u64 = 36
+
+// Offsets in the MADT.
+const M_LAPIC: u64 = 36
+const M_ENTRIES: u64 = 44
+
+// Record types inside the MADT.
+const E_LAPIC: u64 = 0
+const E_IOAPIC: u64 = 1
+const E_X2APIC: u64 = 9
+
+// Where what was found is kept: the SMP scalar page, behind the words
+// `cpu.fi` uses.
+const S_RSDP: u64 = 64
+const S_MADT: u64 = 72
+const S_LAPIC: u64 = 80
+const S_IOAPIC: u64 = 88
+const S_REV: u64 = 96
+const S_OEM: u64 = 104
+const S_VALID: u64 = 112
+
+fn sget(state: u64, off: u64) -> u64 {
+    return kstate.get(state, kstate.SMP_OFF + off)
+}
+
+fn sset(state: u64, off: u64, v: u64) {
+    kstate.set(state, kstate.SMP_OFF + off, v)
+}
+
+// --------------------------------------------------------- the checksum
+
+// A valid ACPI structure sums to zero over its whole length, one octet at
+// a time. Wrapping addition is meant here, not the checked one -- the sum
+// of 36 octets goes past 255 on purpose.
+fn sum_zero(p: u64, n: u64) -> bool {
+    var i: u64 = 0
+    var s: u64 = 0
+    while i < n {
+        s = (s + kstate.get8(p + i)) & 0xFF
+        i = i + 1
+    }
+    return s == 0
+}
+
+// Four or eight characters, compared without a string type.
+fn tag(p: u64, a: u64, n: u64) -> bool {
+    var i: u64 = 0
+    while i < n {
+        if kstate.get8(p + i) != kstate.get8(a + i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// --------------------------------------------------------- step 1: RSDP
+
+fn scan_for(from: u64, to: u64, want: u64) -> u64 {
+    var p: u64 = from
+    while p < to {
+        if tag(p, want, 8) {
+            if sum_zero(p, 20) {
+                return p
+            }
+        }
+        p = p + 16
+    }
+    return 0
+}
+
+fn find_rsdp() -> u64 {
+    var want: [u8; 9] = "RSD PTR \0"
+    let w: u64 = (&want[0]) as u64
+    // The EBDA. Its segment stands in the BIOS data area as a paragraph
+    // number; a machine without one has a zero there.
+    let seg: u64 = kstate.get16(EBDA_PTR)
+    if seg != 0 {
+        let base: u64 = seg * 16
+        let hit: u64 = scan_for(base, base + 1024, w)
+        if hit != 0 {
+            return hit
+        }
+    }
+    return scan_for(BIOS_LOW, BIOS_HIGH, w)
+}
+
+// ---------------------------------------------- step 2 and 3: the tables
+
+fn header_ok(p: u64) -> bool {
+    if p == 0 {
+        return false
+    }
+    let len: u64 = kstate.get32(p + H_LENGTH)
+    if len < H_SIZE || len > 0x100000 {
+        return false
+    }
+    return sum_zero(p, len)
+}
+
+// Walks the pointer array of the RSDT or XSDT and returns the table with
+// the wanted signature. `width` is 4 for the RSDT and 8 for the XSDT.
+fn table_in(root: u64, width: u64, want: u64) -> u64 {
+    if !header_ok(root) {
+        return 0
+    }
+    let len: u64 = kstate.get32(root + H_LENGTH)
+    let n: u64 = (len - H_SIZE) / width
+    var i: u64 = 0
+    while i < n {
+        var t: u64 = 0
+        if width == 4 {
+            t = kstate.get32(root + H_SIZE + i * 4)
+        } else {
+            t = __mmio_read64((root + H_SIZE + i * 8) as *mut u64)
+        }
+        if header_ok(t) && tag(t, want, 4) {
+            return t
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ------------------------------------------------------------ the whole
+
+// Reads the chain and enters every usable processor. Returns how many
+// there are, or 0 when the firmware said nothing -- and then the caller
+// keeps the one processor it is standing on, which is the right answer
+// for a machine without ACPI.
+fn find(state: u64) -> u64 {
+    var w_apic: [u8; 5] = "APIC\0"
+    let rsdp: u64 = find_rsdp()
+    sset(state, S_VALID, 0)
+    if rsdp == 0 {
+        return 0
+    }
+    sset(state, S_RSDP, rsdp)
+    let rev: u64 = kstate.get8(rsdp + P_REVISION)
+    sset(state, S_REV, rev)
+    sset(state, S_OEM, rsdp + H_OEM - 1)
+    var madt: u64 = 0
+    if rev >= 2 {
+        let len: u64 = kstate.get32(rsdp + P_LENGTH)
+        if len >= 33 && sum_zero(rsdp, len) {
+            madt = table_in(__mmio_read64((rsdp + P_XSDT) as *mut u64), 8,
+                (&w_apic[0]) as u64)
+        }
+    }
+    if madt == 0 {
+        madt = table_in(kstate.get32(rsdp + P_RSDT), 4, (&w_apic[0]) as u64)
+    }
+    if madt == 0 {
+        return 0
+    }
+    sset(state, S_MADT, madt)
+    sset(state, S_LAPIC, kstate.get32(madt + M_LAPIC))
+    sset(state, S_VALID, 1)
+    return walk(state, madt)
+}
+
+// The records. Every one carries its own length in its second octet; a
+// length of zero would be an endless loop and is what ends the walk.
+fn walk(state: u64, madt: u64) -> u64 {
+    let end: u64 = madt + kstate.get32(madt + H_LENGTH)
+    var p: u64 = madt + M_ENTRIES
+    var n: u64 = 0
+    while p + 2 <= end {
+        let kind: u64 = kstate.get8(p)
+        let len: u64 = kstate.get8(p + 1)
+        if len < 2 {
+            return n
+        }
+        if kind == E_LAPIC && len >= 8 {
+            let flags: u64 = kstate.get32(p + 4)
+            if (flags & 1) != 0 && n < kstate.MAX_CPUS {
+                store_cpu(state, n, kstate.get8(p + 3))
+                n = n + 1
+            }
+        }
+        if kind == E_X2APIC && len >= 16 {
+            let id: u64 = kstate.get32(p + 4)
+            let flags: u64 = kstate.get32(p + 8)
+            // This kernel addresses the APIC through its 8-bit id; an
+            // x2APIC id above 255 needs the x2APIC mode it does not have.
+            if (flags & 1) != 0 && id < 255 && n < kstate.MAX_CPUS {
+                if !known(state, n, id) {
+                    store_cpu(state, n, id)
+                    n = n + 1
+                }
+            }
+        }
+        if kind == E_IOAPIC && len >= 12 {
+            if sget(state, S_IOAPIC) == 0 {
+                sset(state, S_IOAPIC, kstate.get32(p + 4))
+            }
+        }
+        p = p + len
+    }
+    return n
+}
+
+// The found ids are parked in the SMP page until `smp.probe` copies them
+// into the processor table -- this file must not import `cpu.fi`, so that
+// the direction of the module graph stays "who reads the hardware" ->
+// "who keeps the state" and not the other way round.
+const S_IDS: u64 = 128 // eight words
+
+fn store_cpu(state: u64, i: u64, apid: u64) {
+    kstate.set(state, kstate.SMP_OFF + S_IDS + i * 8, apid + 1)
+}
+
+fn known(state: u64, n: u64, apid: u64) -> bool {
+    var i: u64 = 0
+    while i < n {
+        if kstate.get(state, kstate.SMP_OFF + S_IDS + i * 8) == apid + 1 {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// The id of the i-th processor the firmware reported, or 256 when there
+// is none -- 256 is not an 8-bit APIC id, so it cannot be mistaken for
+// processor zero.
+fn cpus(state: u64, i: u64) -> u64 {
+    let v: u64 = kstate.get(state, kstate.SMP_OFF + S_IDS + i * 8)
+    if v == 0 {
+        return 256
+    }
+    return v - 1
+}
+
+fn lapic_addr(state: u64) -> u64 {
+    return sget(state, S_LAPIC)
+}
+
+fn ioapic_addr(state: u64) -> u64 {
+    return sget(state, S_IOAPIC)
+}
+
+fn revision(state: u64) -> u64 {
+    return sget(state, S_REV)
+}
+
+fn valid(state: u64) -> bool {
+    return sget(state, S_VALID) != 0
+}
+
+// The six characters of the OEM id, for the line that shows the table was
+// really read and not invented.
+fn oem(state: u64) -> u64 {
+    return sget(state, S_OEM)
+}

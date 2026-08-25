@@ -28,6 +28,8 @@
 import serial
 import kstate
 import mem
+import atomic
+import cpu
 
 export {
     init, create, start, schedule, on_tick, yield_now, sleep_ticks,
@@ -36,12 +38,14 @@ export {
     stack_high, STACK_PAINT,
     trace_push, trace_dump, dump_tasks, ready_count, alive_count,
     irq_save, irq_restore, set_kernel_stack,
+    adopt, enter_task, set_idle, zombies, reap_all, cpu_of, cpu_mask,
+    set_affinity, affinity, ANY_CPU,
     T_STATE, T_PID, T_RSP, T_KSTACK, T_KTOP, T_PRIO, T_BUDGET, T_WORK,
     T_WAKE, T_CR3, T_PARENT, T_EXIT, T_RUNS, T_ENTRY, T_USTACK, T_KIND,
     T_WAITPID, T_TICKS, T_PDPT, T_PD, T_PT, T_DATA, T_CWD, T_ARG,
     T_END, T_FD, T_FDOFF, T_FAULTS, FD_SLOTS, T_BRK, T_MMAP,
     S_FREE, S_READY, S_RUN, S_SLEEP, S_WAIT, S_ZOMBIE, S_NEW,
-    K_BOOT, K_IDLE, K_WORKER, K_USER, KSTACK_FRAMES
+    K_BOOT, K_IDLE, K_WORKER, K_USER, K_GRIND, KSTACK_FRAMES
 }
 
 // ------------------------------------------------------ the task record
@@ -108,6 +112,13 @@ const K_BOOT: u64 = 0
 const K_IDLE: u64 = 1
 const K_WORKER: u64 = 2
 const K_USER: u64 = 3
+// ROUND K5. A kernel task that does ARITHMETIC and nothing else. The
+// worker of round 62 spins on `pause`, which is the right instruction for
+// showing that a task is interruptible and the wrong one for measuring
+// how fast four cores are: QEMU's translator leaves the emulation loop at
+// every `pause`, so eight such tasks on four cores are eight tasks
+// waiting on the emulator, not on the processor.
+const K_GRIND: u64 = 4
 
 // FOUR frames = 16 KiB of kernel stack per task.
 //
@@ -160,8 +171,59 @@ fn tset(state: u64, i: u64, field: u64, v: u64) {
     __mmio_write64((task_at(state, i) + field) as *mut u64, v)
 }
 
+// ROUND K5. This used to be one word for the whole machine
+// (`kstate.CURRENT`). With four cores it has to be one word PER CORE --
+// a scheduler that reads a single global "the running task" hands the
+// same task to two processors, and then two stacks are one stack.
 fn current(state: u64) -> u64 {
-    return kstate.get(state, kstate.CURRENT)
+    return cpu.get(state, cpu.here(state), cpu.C_CUR)
+}
+
+// The second table round K5 needs: which core last ran a task, and which
+// cores have ever run it. It lies beside the task table rather than in it
+// because the task record is exactly full (248 + 8 = 256 = TASK_BYTES).
+const TC_CPU: u64 = 0
+const TC_MASK: u64 = 8
+const TC_AFF: u64 = 16 // the only core that may run this task
+const ANY_CPU: u64 = 99 // ... or this, when any of them may
+
+fn tc_set(state: u64, i: u64, field: u64, v: u64) {
+    __mmio_write64((state + kstate.TCPU_OFF + i * kstate.TCPU_BYTES + field)
+        as *mut u64, v)
+}
+
+fn tc_get(state: u64, i: u64, field: u64) -> u64 {
+    return __mmio_read64((state + kstate.TCPU_OFF + i * kstate.TCPU_BYTES
+            +field) as *mut u64)
+}
+
+fn cpu_of(state: u64, i: u64) -> u64 {
+    return tc_get(state, i, TC_CPU)
+}
+
+fn cpu_mask(state: u64, i: u64) -> u64 {
+    return tc_get(state, i, TC_MASK)
+}
+
+// AFFINITY, and round K5 needs exactly one of it. Task 0 is
+// `kernel_main` itself, and three things it does afterwards belong to the
+// BOOT processor and to no other: the excursion into ring 3 (whose MSRs
+// `user.setup` wrote on the boot processor alone), the word `isr.s` reads
+// the kernel stack out of, and the two static save slots of `enter_user`.
+// Without this, `kernel_main` migrates to whichever core happens to be
+// free -- which is what a scheduler is supposed to do, and which broke
+// the run in one attempt out of six until the reason was found.
+fn set_affinity(state: u64, i: u64, c: u64) {
+    tc_set(state, i, TC_AFF, c)
+}
+
+fn affinity(state: u64, i: u64) -> u64 {
+    return tc_get(state, i, TC_AFF)
+}
+
+fn may_run(state: u64, i: u64, me: u64) -> bool {
+    let a: u64 = tc_get(state, i, TC_AFF)
+    return a == ANY_CPU || a == me
 }
 
 // ------------------------------------------------- the interrupt flag
@@ -171,6 +233,12 @@ fn current(state: u64) -> u64 {
 // they were on; `irq_restore` puts back exactly that state. Plain
 // `cli`/`sti` would switch them on in places where they have to stay off
 // (inside an interrupt handler, for instance).
+// ROUND K5: still true, and no longer SUFFICIENT. Turning interrupts off
+// keeps the OTHER cores out of nothing at all; what it protects is this
+// core against its own interrupt handler. Every place that used to make
+// do with it and touches shared state now takes a lock as well -- and
+// takes it with interrupts already off, because a handler that waits for
+// a lock its own core holds waits for ever.
 fn irq_save() -> u64 {
     return asm("pushfq\npop rax\ncli", out("rax"))
 }
@@ -221,8 +289,17 @@ fn init(state: u64) {
         i = i + 1
     }
     kstate.set(state, kstate.TASKS, 1)
-    kstate.set(state, kstate.CURRENT, 0)
     kstate.set(state, kstate.NEXT_PID, 2)
+    var l: u64 = 0
+    while l < kstate.LOCK_COUNT {
+        atomic.lock_init(state, l)
+        l = l + 1
+    }
+    var c: u64 = 0
+    while c < kstate.MAX_CPUS {
+        cpu.set(state, c, cpu.C_CUR, 0)
+        c = c + 1
+    }
     kstate.set(state, kstate.PREEMPT, 1)
     tset(state, 0, T_STATE, S_RUN)
     tset(state, 0, T_PID, 1)
@@ -231,8 +308,68 @@ fn init(state: u64) {
     tset(state, 0, T_KIND, K_BOOT)
     tset(state, 0, T_KTOP, vector(state, 61))
     tset(state, 0, T_CR3, kstate.get(state, kstate.KPML4))
+    var t: u64 = 0
+    while t < kstate.MAX_TASKS {
+        tc_set(state, t, TC_AFF, ANY_CPU)
+        t = t + 1
+    }
+    // The one task in this kernel that is not allowed to move.
+    tc_set(state, 0, TC_AFF, 0)
     set_kernel_stack(state, vector(state, 61))
     trace_push(state, 1)
+}
+
+// The idle task of the BOOT processor. Kept in `kstate.IDLE` as before
+// (several counters read it) and in the per-core record, because from
+// round K5 on every core has one of its own.
+fn set_idle(state: u64, i: u64) {
+    kstate.set(state, kstate.IDLE, i)
+    cpu.set(state, cpu.here(state), cpu.C_IDLE, i)
+}
+
+// A record for a context that is ALREADY running -- the way `init` gives
+// task 0 to `kernel_main`, only later and for a core that has just come
+// up. Its stack is not one the frame allocator handed out for a task, so
+// T_KSTACK stays zero and `reap` will not give it back.
+fn adopt(state: u64, kind: u64, prio: u64, ktop: u64) -> u64 {
+    let flags: u64 = irq_save()
+    atomic.lock_take(state, atomic.L_SCHED, cpu.here(state))
+    var i: u64 = 1
+    var slot: u64 = 0
+    while i < kstate.MAX_TASKS {
+        if tget(state, i, T_STATE) == S_FREE {
+            slot = i
+            i = kstate.MAX_TASKS
+        } else {
+            i = i + 1
+        }
+    }
+    if slot == 0 {
+        atomic.lock_give(state, atomic.L_SCHED)
+        irq_restore(flags)
+        return 0
+    }
+    var j: u64 = 0
+    while j < kstate.TASK_BYTES / 8 {
+        __mmio_write64((task_at(state, slot) + j * 8) as *mut u64, 0)
+        j = j + 1
+    }
+    tset(state, slot, T_PID, kstate.add(state, kstate.NEXT_PID, 1) - 1)
+    tset(state, slot, T_KTOP, ktop)
+    tset(state, slot, T_PRIO, prio)
+    tset(state, slot, T_BUDGET, prio)
+    tset(state, slot, T_KIND, kind)
+    tset(state, slot, T_CR3, kstate.get(state, kstate.KPML4))
+    tset(state, slot, T_STATE, S_RUN)
+    tc_set(state, slot, TC_CPU, cpu.here(state))
+    tc_set(state, slot, TC_MASK, 1 << cpu.here(state))
+    tc_set(state, slot, TC_AFF, cpu.here(state))
+    if slot + 1 > kstate.get(state, kstate.TASKS) {
+        kstate.set(state, kstate.TASKS, slot + 1)
+    }
+    atomic.lock_give(state, atomic.L_SCHED)
+    irq_restore(flags)
+    return slot
 }
 
 // The initial stack of a task that has never run. It is built so that it
@@ -247,7 +384,15 @@ fn frame_build(state: u64, ktop: u64, entry: u64, a0: u64, a1: u64,
         __mmio_write64((base + i * 8) as *mut u64, 0)
         i = i + 1
     }
-    __mmio_write64(base as *mut u64, 0x202) // rflags: IF on
+    // ROUND K5: IF OFF, not on. A task that has never run starts with
+    // the run queue lock held -- the core that switched to it took it and
+    // could not give it back, because giving it back before the switch
+    // would let a third core pick up a task whose registers are not saved
+    // yet. `enter_task`, the first line of every task body, gives the
+    // lock back and only THEN switches interrupts on. Starting with them
+    // on would let this core's own timer interrupt run into a lock this
+    // core holds.
+    __mmio_write64(base as *mut u64, 0x002) // rflags: IF off until enter_task
     __mmio_write64((base + 72) as *mut u64, a0) // rdi
     __mmio_write64((base + 80) as *mut u64, a1) // rsi
     __mmio_write64((base + 104) as *mut u64, a2) // rdx
@@ -261,8 +406,20 @@ fn frame_build(state: u64, ktop: u64, entry: u64, a0: u64, a1: u64,
 // function of its own in the kernel profile); it gets `state`, its index
 // and `kind` as arguments. Returns the index, or 0 when the table is
 // full -- index 0 is `kernel_main` and can never be handed out.
+// ROUND K5: the stack is fetched BEFORE the run queue lock is taken, and
+// that order is not cosmetic. The frame allocator has a lock of its own
+// now; a core that held the run queue and then asked for a frame would be
+// holding two locks in an order that another core takes the other way
+// round the moment it faults in an interrupt. The rule this kernel keeps
+// is the simplest one that cannot deadlock: NO LOCK IS EVER HELD WHILE
+// ANOTHER IS TAKEN.
 fn create(state: u64, kind: u64, prio: u64, arg: u64, entry: u64) -> u64 {
+    let stack: u64 = mem.frame_run(state, KSTACK_FRAMES)
+    if stack == 0 {
+        return 0
+    }
     let flags: u64 = irq_save()
+    atomic.lock_take(state, atomic.L_SCHED, cpu.here(state))
     var i: u64 = 1
     var slot: u64 = 0
     while i < kstate.MAX_TASKS {
@@ -274,12 +431,9 @@ fn create(state: u64, kind: u64, prio: u64, arg: u64, entry: u64) -> u64 {
         }
     }
     if slot == 0 {
+        atomic.lock_give(state, atomic.L_SCHED)
         irq_restore(flags)
-        return 0
-    }
-    let stack: u64 = mem.frame_run(state, KSTACK_FRAMES)
-    if stack == 0 {
-        irq_restore(flags)
+        free_stack(state, stack)
         return 0
     }
     let ktop: u64 = stack + KSTACK_FRAMES * mem.FRAME_SIZE
@@ -316,8 +470,20 @@ fn create(state: u64, kind: u64, prio: u64, arg: u64, entry: u64) -> u64 {
     if slot + 1 > kstate.get(state, kstate.TASKS) {
         kstate.set(state, kstate.TASKS, slot + 1)
     }
+    tc_set(state, slot, TC_CPU, kstate.MAX_CPUS)
+    tc_set(state, slot, TC_MASK, 0)
+    tc_set(state, slot, TC_AFF, ANY_CPU)
+    atomic.lock_give(state, atomic.L_SCHED)
     irq_restore(flags)
     return slot
+}
+
+fn free_stack(state: u64, stack: u64) {
+    var k: u64 = 0
+    while k < KSTACK_FRAMES {
+        mem.frame_free(state, stack + k * mem.FRAME_SIZE)
+        k = k + 1
+    }
 }
 
 // ROUND K1: the deepest this task's kernel stack has ever been, in
@@ -343,17 +509,33 @@ fn stack_high(state: u64, i: u64) -> u64 {
 
 // Now it may run. Whoever created the task decides when it is complete.
 fn start(state: u64, i: u64) -> bool {
+    let flags: u64 = irq_save()
+    atomic.lock_take(state, atomic.L_SCHED, cpu.here(state))
     if tget(state, i, T_STATE) != S_NEW {
+        atomic.lock_give(state, atomic.L_SCHED)
+        irq_restore(flags)
         return false
     }
     tset(state, i, T_STATE, S_READY)
+    atomic.lock_give(state, atomic.L_SCHED)
+    irq_restore(flags)
     return true
 }
 
 // The kernel stack the next system call out of ring 3 has to land on.
 // Two places need it: the TSS (for interrupts) and the data area (for
 // `syscall`, which the processor does not switch stacks for).
+// ROUND K5: only the BOOT processor writes these two. `KSTACK_CUR` is
+// read by `syscall_entry` in isr.s out of ONE fixed offset in the data
+// area, and the TSS the boot processor loaded is its own -- a started
+// core has a TSS of its own and never leaves ring 0 in this round. A core
+// that wrote its kernel task's stack into that word would send the next
+// system call of a ring 3 process onto a stack somebody else is standing
+// on.
 fn set_kernel_stack(state: u64, ktop: u64) {
+    if cpu.here(state) != 0 {
+        return
+    }
     kstate.set(state, kstate.KSTACK_CUR, ktop)
     let tss: u64 = kstate.get(state, kstate.TSS)
     if tss != 0 {
@@ -361,15 +543,49 @@ fn set_kernel_stack(state: u64, ktop: u64) {
     }
 }
 
+// The first line of every task body (`tasks.main`, `proc.user_start`).
+// See `frame_build`: the lock comes from the core that started this task.
+fn enter_task(state: u64) {
+    atomic.lock_give(state, atomic.L_SCHED)
+    asm("sti")
+}
+
 // -------------------------------------------------------- the decision
 
 fn ready_count(state: u64) -> u64 {
     let n: u64 = kstate.get(state, kstate.TASKS)
-    let idle: u64 = kstate.get(state, kstate.IDLE)
     var i: u64 = 0
     var c: u64 = 0
     while i < n {
-        if i != idle && tget(state, i, T_STATE) == S_READY {
+        if tget(state, i, T_KIND) != K_IDLE && tget(state, i, T_STATE) == S_READY {
+            c = c + 1
+        }
+        i = i + 1
+    }
+    return c
+}
+
+// How many corpses of a kind are lying about. The boot processor waits on
+// this while the other cores work the tasks off.
+fn zombies(state: u64, kind: u64) -> u64 {
+    let n: u64 = kstate.get(state, kstate.TASKS)
+    var i: u64 = 0
+    var c: u64 = 0
+    while i < n {
+        if tget(state, i, T_KIND) == kind && tget(state, i, T_STATE) == S_ZOMBIE {
+            c = c + 1
+        }
+        i = i + 1
+    }
+    return c
+}
+
+fn reap_all(state: u64) -> u64 {
+    let n: u64 = kstate.get(state, kstate.TASKS)
+    var i: u64 = 1
+    var c: u64 = 0
+    while i < n {
+        if reap(state, i) {
             c = c + 1
         }
         i = i + 1
@@ -395,14 +611,25 @@ fn alive_count(state: u64) -> u64 {
 // Round robin: from the current task onwards, the first ready one. The
 // idle task is skipped -- it only gets the processor when nobody else
 // wants it.
+// ROUND K5: two changes, both forced by the second core. EVERY idle task
+// is skipped, not only the one whose index stood in `kstate.IDLE` -- each
+// core has one now. And what is returned when nothing is ready is THIS
+// core's idle task, not the boot processor's; two cores on one idle task
+// would be two cores on one stack.
+//
+// Only the caller of this function under the run queue lock may act on
+// the answer. A task that is S_READY here is claimed by the caller before
+// the lock is given up, which is what keeps two cores from taking it.
 fn pick(state: u64) -> u64 {
     let n: u64 = kstate.get(state, kstate.TASKS)
     let cur: u64 = current(state)
-    let idle: u64 = kstate.get(state, kstate.IDLE)
+    let me: u64 = cpu.here(state)
+    let myidle: u64 = cpu.get(state, me, cpu.C_IDLE)
     var k: u64 = 1
     while k <= n {
         let i: u64 = (cur + k) % n
-        if i != idle && tget(state, i, T_STATE) == S_READY {
+        if tget(state, i, T_KIND) != K_IDLE && tget(state, i, T_STATE) == S_READY
+        && may_run(state, i, me) {
             return i
         }
         k = k + 1
@@ -410,14 +637,21 @@ fn pick(state: u64) -> u64 {
     if tget(state, cur, T_STATE) == S_RUN {
         return cur
     }
-    return idle
+    return myidle
 }
 
 // The switch itself. Everything that is per task and lives outside the
 // task record is put in place here: the address space, the kernel stack
 // for the next entry out of ring 3 -- and only then the stack pointer.
 fn switch_to(state: u64, from: u64, to: u64) {
-    kstate.set(state, kstate.CURRENT, to)
+    let me: u64 = cpu.here(state)
+    cpu.set(state, me, cpu.C_CUR, to)
+    cpu.add(state, me, cpu.C_SWITCHES, 1)
+    if tget(state, to, T_KIND) != K_IDLE {
+        cpu.add(state, me, cpu.C_PICKS, 1)
+    }
+    tc_set(state, to, TC_CPU, me)
+    tc_set(state, to, TC_MASK, tc_get(state, to, TC_MASK) | (1 << me))
     kstate.add(state, kstate.SWITCHES, 1)
     tset(state, to, T_RUNS, tget(state, to, T_RUNS) + 1)
     trace_push(state, tget(state, to, T_PID))
@@ -436,13 +670,35 @@ fn switch_to(state: u64, from: u64, to: u64) {
 
 // Give the processor away. Comes back when this task is scheduled again
 // -- or never, if it is a corpse by then.
+//
+// ROUND K5, AND THIS IS THE HEART OF IT. The run queue lock is taken here
+// and is NOT given back here: it is given back by whoever the processor
+// switches TO, in that task's own `schedule_locked` right after its
+// `switch_to` came back, or -- for a task that has never run -- in
+// `enter_task`, its first line.
+//
+// The reason is one race and there is no cheaper cure. If the lock were
+// given back before `switch_to`, another core could pick up the task this
+// core has just marked S_READY -- while this core is still executing on
+// that task's stack, inside `context_switch`, with its registers not yet
+// written down. Two cores, one stack. Holding the lock across the switch
+// means: while any core is between "I have chosen" and "the registers are
+// saved", no other core is choosing anything.
 fn schedule(state: u64) {
     let flags: u64 = irq_save()
+    atomic.lock_take(state, atomic.L_SCHED, cpu.here(state))
+    schedule_locked(state)
+    irq_restore(flags)
+}
+
+// The run queue lock must be held. On return it is held again -- by this
+// task, on whichever core resumed it.
+fn schedule_locked(state: u64) {
     let cur: u64 = current(state)
     let next: u64 = pick(state)
     if next == cur {
         tset(state, cur, T_BUDGET, tget(state, cur, T_PRIO))
-        irq_restore(flags)
+        atomic.lock_give(state, atomic.L_SCHED)
         return
     }
     if tget(state, cur, T_STATE) == S_RUN {
@@ -451,7 +707,7 @@ fn schedule(state: u64) {
     tset(state, next, T_STATE, S_RUN)
     tset(state, next, T_BUDGET, tget(state, next, T_PRIO))
     switch_to(state, cur, next)
-    irq_restore(flags)
+    atomic.lock_give(state, atomic.L_SCHED)
 }
 
 fn yield_now(state: u64) {
@@ -463,7 +719,12 @@ fn yield_now(state: u64) {
 // Called out of the interrupt handler, after the end-of-interrupt. Two
 // jobs: wake what is due, and take the processor away when the turn is
 // over.
+// Called out of the interrupt handler, on EVERY core, with interrupts
+// already off -- which is why the lock may be taken here at all.
 fn on_tick(state: u64) {
+    let me: u64 = cpu.here(state)
+    cpu.add(state, me, cpu.C_TICKS, 1)
+    atomic.lock_take(state, atomic.L_SCHED, me)
     let now: u64 = kstate.get(state, kstate.TICKS)
     let n: u64 = kstate.get(state, kstate.TASKS)
     var i: u64 = 0
@@ -476,29 +737,34 @@ fn on_tick(state: u64) {
     let cur: u64 = current(state)
     tset(state, cur, T_TICKS, tget(state, cur, T_TICKS) + 1)
     if kstate.get(state, kstate.PREEMPT) == 0 {
+        atomic.lock_give(state, atomic.L_SCHED)
         return
     }
     let budget: u64 = tget(state, cur, T_BUDGET)
     if budget > 1 {
         tset(state, cur, T_BUDGET, budget - 1)
+        atomic.lock_give(state, atomic.L_SCHED)
         return
     }
     tset(state, cur, T_BUDGET, 0)
-    schedule(state)
+    schedule_locked(state)
 }
 
 // ---------------------------------------------------------- blocking
 
 // `ticks` timer ticks, 10 ms each at 100 Hz. Zero is a yield.
 fn sleep_ticks(state: u64, ticks: u64) {
-    let cur: u64 = current(state)
     if ticks == 0 {
         yield_now(state)
         return
     }
+    let flags: u64 = irq_save()
+    atomic.lock_take(state, atomic.L_SCHED, cpu.here(state))
+    let cur: u64 = current(state)
     tset(state, cur, T_WAKE, kstate.get(state, kstate.TICKS) + ticks)
     tset(state, cur, T_STATE, S_SLEEP)
-    schedule(state)
+    schedule_locked(state)
+    irq_restore(flags)
 }
 
 // Whoever waits for this pid becomes ready again.
@@ -536,13 +802,14 @@ fn find_pid(state: u64, pid: u64) -> u64 {
 // therefore NOT freed here; that happens in the reaper.
 fn exit_task(state: u64, code: u64) {
     let flags: u64 = irq_save()
+    atomic.lock_take(state, atomic.L_SCHED, cpu.here(state))
     let cur: u64 = current(state)
     tset(state, cur, T_EXIT, code)
     tset(state, cur, T_END, kstate.get(state, kstate.TICKS))
     tset(state, cur, T_STATE, S_ZOMBIE)
     wake_pid(state, tget(state, cur, T_PID))
+    schedule_locked(state)
     irq_restore(flags)
-    schedule(state)
     // The scheduler never comes back to a corpse. If it does, something
     // is broken enough that going on would be worse.
     while true {
@@ -554,23 +821,25 @@ fn exit_task(state: u64, code: u64) {
 // allocator, its slot into the table. Whoever calls this must have picked
 // up the exit code beforehand -- and must not be standing on that stack,
 // which is why a task can never reap itself.
+// ROUND K5: the slot is released under the run queue lock, the FRAMES
+// are given back afterwards, outside it. Same rule as in `create` and for
+// the same reason -- the two locks of this kernel are never nested.
 fn reap(state: u64, i: u64) -> bool {
-    if tget(state, i, T_STATE) != S_ZOMBIE {
-        return false
-    }
-    if i == current(state) {
+    let flags: u64 = irq_save()
+    atomic.lock_take(state, atomic.L_SCHED, cpu.here(state))
+    if tget(state, i, T_STATE) != S_ZOMBIE || i == current(state) {
+        atomic.lock_give(state, atomic.L_SCHED)
+        irq_restore(flags)
         return false
     }
     let stack: u64 = tget(state, i, T_KSTACK)
-    if stack != 0 {
-        var k: u64 = 0
-        while k < KSTACK_FRAMES {
-            mem.frame_free(state, stack + k * mem.FRAME_SIZE)
-            k = k + 1
-        }
-    }
     tset(state, i, T_KSTACK, 0)
     tset(state, i, T_STATE, S_FREE)
+    atomic.lock_give(state, atomic.L_SCHED)
+    irq_restore(flags)
+    if stack != 0 {
+        free_stack(state, stack)
+    }
     return true
 }
 

@@ -1,0 +1,163 @@
+// demos/kernel/cpu.fi -- round K5: which processor am I, and what is mine?
+//
+// Up to round K2 the answer was "the only one", and the state of the
+// running kernel therefore stood in `kstate.fi` as single words: CURRENT
+// is the running task, IDLE the task that runs when nothing else wants
+// to. With four processors those two words are wrong four times over --
+// each core has a task of its own and an idle task of its own, and a
+// scheduler that reads one global word hands the same task to two cores.
+//
+// So the per-core state moves into a table: `kstate.CPU_OFF`, one record
+// of 256 octets per processor, and everything a core owns alone lives in
+// its own record. What stays global is what is genuinely shared: the task
+// TABLE, the frame bitmap, the file system -- and each of those gets a
+// lock (atomic.fi).
+//
+// HOW A CORE FINDS ITS OWN RECORD. There are three usual ways and this
+// kernel takes the plainest one. `swapgs` with a per-core GS base is the
+// one a big kernel takes, and it needs the entry points in assembly to
+// cooperate; `cpuid` leaf 1 gives the initial APIC id in ebx, and ebx is
+// the one register `asm` in Firn will not hand out (it carries the
+// frame). What is left is the ID register of the local APIC: one 32-bit
+// read at a fixed address, and the address is the SAME for every core --
+// the page is a window onto the core's own APIC, so each core reads its
+// own number out of it. That is one memory access plus a lookup over at
+// most eight entries, which is cheap enough for the scheduler path and
+// needs nothing from the assembler files.
+//
+// Before the APIC is up there is no such register. `here` then answers 0,
+// which is right: before the APIC is up there is only the boot processor.
+
+import kstate
+
+export {
+    set_lapic, lapic_base, register, count, here, apic_id, online,
+    set_online, online_count, get, set, add, record,
+    C_APICID, C_ONLINE, C_CUR, C_IDLE, C_TICKS, C_SWITCHES, C_STACK,
+    C_GDT, C_TSS, C_WORK, C_GO, C_SUM, C_CYCLES, C_PICKS, C_STARTED,
+    C_IDLERUNS, C_LAPIC
+}
+
+// ---------------------------------------------------- the record fields
+
+const C_APICID: u64 = 0 // what the local APIC of this core calls itself
+const C_ONLINE: u64 = 8 // 1 = this core has reached Firn code
+const C_CUR: u64 = 16 // index of the task running on it
+const C_IDLE: u64 = 24 // index of ITS idle task
+const C_TICKS: u64 = 32 // timer interrupts it took
+const C_SWITCHES: u64 = 40 // context switches it made
+const C_STACK: u64 = 48 // the stack it came up on
+const C_GDT: u64 = 56 // its own descriptor table page
+const C_TSS: u64 = 64 // its own task state segment
+const C_WORK: u64 = 72 // units of the parallel workload it finished
+const C_GO: u64 = 80 // the word the boot processor sets to start it
+const C_SUM: u64 = 88 // its part of the result
+const C_CYCLES: u64 = 96 // cycles it spent in the workload
+const C_PICKS: u64 = 104 // tasks it took out of the run queue
+const C_STARTED: u64 = 112 // cycle count at which it began
+const C_IDLERUNS: u64 = 120 // turns of its idle loop
+
+// Where the address of the local APIC window is kept. It is written once,
+// by `smp.probe`, out of what `apic.fi` measured -- this file does not
+// import apic, so that the scheduler can import this one without pulling
+// the whole bus scan in behind it.
+const C_LAPIC: u64 = 0 // in the SMP scalar page, see kstate.SMP_LAPIC
+
+// The ID register of a local APIC, and the number of records in use.
+const R_ID: u64 = 0x020
+
+fn record(state: u64, i: u64) -> u64 {
+    return state + kstate.CPU_OFF + i * kstate.CPU_BYTES
+}
+
+fn get(state: u64, i: u64, field: u64) -> u64 {
+    return __mmio_read64((record(state, i) + field) as *mut u64)
+}
+
+fn set(state: u64, i: u64, field: u64, v: u64) {
+    __mmio_write64((record(state, i) + field) as *mut u64, v)
+}
+
+// Atomic, because two cores may count into their neighbour's line and a
+// counter that loses increments proves nothing.
+fn add(state: u64, i: u64, field: u64, v: u64) -> u64 {
+    return __atomic_add((record(state, i) + field) as *mut u64, v) + v
+}
+
+// ------------------------------------------------------------ the table
+
+fn set_lapic(state: u64, base: u64) {
+    kstate.set(state, kstate.SMP_OFF + kstate.SMP_LAPIC, base)
+}
+
+fn lapic_base(state: u64) -> u64 {
+    return kstate.get(state, kstate.SMP_OFF + kstate.SMP_LAPIC)
+}
+
+fn count(state: u64) -> u64 {
+    return kstate.get(state, kstate.SMP_OFF + kstate.SMP_COUNT)
+}
+
+// Enters a processor the firmware reported. Returns its index, or
+// `kstate.MAX_CPUS` when the table is full -- a machine with more cores
+// than this kernel has room for uses the ones it has and says so.
+fn register(state: u64, apid: u64) -> u64 {
+    let n: u64 = count(state)
+    if n >= kstate.MAX_CPUS {
+        return kstate.MAX_CPUS
+    }
+    var i: u64 = 0
+    while i < kstate.CPU_BYTES / 8 {
+        __mmio_write64((record(state, n) + i * 8) as *mut u64, 0)
+        i = i + 1
+    }
+    set(state, n, C_APICID, apid)
+    kstate.set(state, kstate.SMP_OFF + kstate.SMP_COUNT, n + 1)
+    return n
+}
+
+fn apic_id(state: u64, i: u64) -> u64 {
+    return get(state, i, C_APICID)
+}
+
+// WHICH CORE IS EXECUTING THIS. See the head of the file.
+fn here(state: u64) -> u64 {
+    let base: u64 = lapic_base(state)
+    if base == 0 {
+        return 0
+    }
+    let apid: u64 = (kstate.get32(base + R_ID) >> 24) & 0xFF
+    let n: u64 = count(state)
+    var i: u64 = 0
+    while i < n {
+        if get(state, i, C_APICID) == apid {
+            return i
+        }
+        i = i + 1
+    }
+    // A core the firmware did not report is not a core this kernel
+    // started. Answering 0 keeps it from writing into a record that
+    // belongs to somebody; it cannot happen unless the MADT lied.
+    return 0
+}
+
+fn online(state: u64, i: u64) -> bool {
+    return get(state, i, C_ONLINE) != 0
+}
+
+fn set_online(state: u64, i: u64, v: u64) {
+    set(state, i, C_ONLINE, v)
+}
+
+fn online_count(state: u64) -> u64 {
+    let n: u64 = count(state)
+    var i: u64 = 0
+    var c: u64 = 0
+    while i < n {
+        if get(state, i, C_ONLINE) != 0 {
+            c = c + 1
+        }
+        i = i + 1
+    }
+    return c
+}

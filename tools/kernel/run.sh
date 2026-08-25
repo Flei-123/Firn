@@ -121,6 +121,9 @@ as --64 -o "$TMPD/isr.o" demos/kernel/isr.s 2>"$TMPD/as2.err" \
 as --64 -o "$TMPD/switch.o" demos/kernel/switch.s 2>"$TMPD/as3.err" \
     && ok "switch.s assembles (context switch, into ring 3)" \
     || { bad "switch.s"; sed 's/^/        /' "$TMPD/as3.err" | head -5; }
+as --64 -o "$TMPD/smp.o" demos/kernel/smp.s 2>"$TMPD/as4.err" \
+    && ok "smp.s assembles (the trampoline of the other processors)" \
+    || { bad "smp.s"; sed 's/^/        /' "$TMPD/as4.err" | head -5; }
 
 "$FIRNC" -o "$TMPD/k0.o" "$SOURCE" 2>"$TMPD/e0" \
     && ok "firnc0: $SOURCE -> k0.o" \
@@ -144,8 +147,10 @@ for s in 0 1; do
           --defsym=KERNEL_SYSCALL="_F$s.sys__entry" \
           --defsym=KERNEL_TASK_MAIN="_F$s.tasks__main" \
           --defsym=KERNEL_USER_START="_F$s.proc__user_start" \
+          --defsym=KERNEL_AP_MAIN="_F$s.smp__ap_main" \
           --defsym=USER_MAIN="_F$s.u_enter" \
           -o "$TMPD/k$s.elf" "$TMPD/boot.o" "$TMPD/isr.o" "$TMPD/switch.o" \
+          "$TMPD/smp.o" \
           "$TMPD/k$s.o" "$TMPD/uprog$s.o" 2>"$TMPD/ld$s.err"; then
         objcopy -O elf32-i386 "$TMPD/k$s.elf" "$TMPD/k$s.mb" 2>/dev/null
         ok "firnc$s: linked and turned into a multiboot image"
