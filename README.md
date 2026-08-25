@@ -65,6 +65,7 @@ the numbers are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 | **JavaScript** | test262, **63,364 cases, nothing filtered**: parser **91.94 %**, engine **76.00 %** | `tools/js/run.sh` |
 | **Cryptography, compression** | SHA-256, AES, DEFLATE — written in Firn, held against OpenSSL/zlib and the NIST vectors; behind by 1.38x–1.88x | `tools/stdlib81/run.sh`, `tools/bench82/run.sh` |
 | **An operating system** | `profile kernel` produces a freestanding object file; `demos/kernel` boots in QEMU with tasks, address spaces, system calls and files | `tools/kernel/run.sh`, `tools/freestanding/run.sh` |
+| **A userland** | osum reads `/bin/sh` off a disk and runs it: a shell with `>` `>>` `<` `|` `&` `$?`, a working directory and a line editor, plus **23 standard tools** as separate ELF files -- measured by comparing whole shell transcripts octet for octet | `tools/osum/run.sh`, `tools/userland/run.sh` |
 | **Network** | sockets against `nc`/`curl`, NBT identical to Notch's `bigtest.nbt`, and a **Minecraft server a real vanilla client logs into** | `tools/net`, `tools/nbt`, `tools/mcserver` |
 | **Speed against Rust** | six microbenchmarks, median **2.08x / 2.19x** of `rustc -O` (two passes of nine runs), range 1.43x–4.16x | `BENCH_RUNS=9 bash bench/run.sh` |
 
