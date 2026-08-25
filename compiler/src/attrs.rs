@@ -71,6 +71,13 @@ pub const ATTRS: &[AttrInfo] = &[
         what: "no collection run in this call tree (SPEC 3.5.4)",
     },
     AttrInfo {
+        name: "test",
+        target: Target::Func,
+        args: 0,
+        implemented: true,
+        what: "a test case: found and run with --test (ROUND 94, testrun.rs)",
+    },
+    AttrInfo {
         name: "interrupt",
         target: Target::Func,
         args: 0,
@@ -268,12 +275,15 @@ mod tests {
         // (escape.rs, docs/ROUND79.md 3).
         // Round 89: plus #[panic_handler] -- the program's own ending for
         // every run time abort (SPEC 13, panic_rt.rs, docs/ROUND89.md).
+        // Round 94: plus #[test] -- the test runner finds its cases by it
+        // (testrun.rs, lib/test/runner.fi, docs/ROUND94.md).
         let u: Vec<&str> = ATTRS.iter().filter(|a| a.implemented).map(|a| a.name).collect();
         assert_eq!(
             u,
             vec![
                 "must_consume",
                 "no_gc",
+                "test",
                 "interrupt",
                 "link_name",
                 "export_c",
