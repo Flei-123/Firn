@@ -813,6 +813,359 @@ fn case_udp(w: *mut World) -> bool {
     return good
 }
 
+
+// ===================================================================
+// case 9 -- Nagle. A thousand single octets, once with the algorithm and
+// once without. The measurement is the NUMBER OF FRAMES, and the two
+// numbers have to be far apart -- otherwise the switch does nothing.
+// ===================================================================
+
+fn dribble(w: *mut World, nodelay: bool, count: usize) -> u64 {
+    var ca: i32 = 0
+    var cb: i32 = 0
+    var now: u64 = 0
+    establish(w, 5150, &ca, &cb, &now)
+    if ca < 0 { return 0 }
+    tcp.tcp_set_nodelay(stack.net_tcp(&(*w).b), cb, nodelay)
+    let before: u64 = link.link_seen(&(*w).lb)
+    var sent: usize = 0
+    var got: usize = 0
+    var r: usize = 0
+    while r < 40000 {
+        if sent < count {
+            (*w).io[0] = (sent & 255) as u8
+            if stack.net_send(&(*w).b, cb, &(*w).io[0], 1) == 1 { sent = sent + 1 }
+        }
+        got = got + stack.net_recv(&(*w).a, ca, &(*w).io2[0], 65536)
+        if got >= count { r = 40000 } else { r = r + 1 }
+        tick(w, now)
+        now = now + 200
+    }
+    if got != count { return 0 }
+    return link.link_seen(&(*w).lb) - before
+}
+
+fn case_nagle(w: *mut World) -> bool {
+    let with_nagle: u64 = dribble(w, false, 1000)
+    let without: u64 = dribble(w, true, 1000)
+    let good: bool = with_nagle > 0 && without > 0 && without > with_nagle * 3
+    var f: io.Fmt = verdict("Nagle collects: 1000 single octets in far fewer frames", good)
+    f = kv(f, "frames_with_nagle", with_nagle)
+    f = kv(f, "frames_without", without)
+    done(f)
+    return good
+}
+
+// ===================================================================
+// case 10 -- the delayed acknowledgement. A pure receiver must not
+// answer every single segment; the counter is the proof.
+// ===================================================================
+
+fn case_delack(w: *mut World) -> bool {
+    var ca: i32 = 0
+    var cb: i32 = 0
+    var now: u64 = 0
+    establish(w, 8080, &ca, &cb, &now)
+    if ca < 0 { return false }
+    var sent: usize = 0
+    var got: usize = 0
+    let TOTAL: usize = 60000
+    var xs: u64 = 5
+    var r: usize = 0
+    while r < 60000 {
+        if sent < TOTAL {
+            var chunk: usize = TOTAL - sent
+            if chunk > 1000 { chunk = 1000 }
+            let room: usize = stack.net_writable(&(*w).b, cb)
+            if room < chunk { chunk = room }
+            if chunk > 0 {
+                xs = gen(xs, &(*w).io[0], chunk)
+                sent = sent + stack.net_send(&(*w).b, cb, &(*w).io[0], chunk)
+            }
+        }
+        got = got + stack.net_recv(&(*w).a, ca, &(*w).io2[0], 65536)
+        if got >= TOTAL { r = 60000 } else { r = r + 1 }
+        tick(w, now)
+        now = now + 200
+    }
+    let rx: u64 = tcp.tcp_stat(stack.net_tcp(&(*w).a), tcp.ST_RX)
+    let tx: u64 = tcp.tcp_stat(stack.net_tcp(&(*w).a), tcp.ST_TX)
+    let del: u64 = tcp.tcp_stat(stack.net_tcp(&(*w).a), tcp.ST_DELACK)
+    // Fewer acknowledgements than segments -- that IS the delay, and the
+    // number says by how much.
+    let good: bool = got == TOTAL && rx > 20 && tx * 3 < rx * 2
+    var f: io.Fmt = verdict("delayed acknowledgement: fewer answers than segments", good)
+    f = kv(f, "segments_in", rx)
+    f = kv(f, "answers_out", tx)
+    f = kv(f, "answers_that_waited", del)
+    f = kv(f, "octets", got as u64)
+    done(f)
+    return good
+}
+
+// ===================================================================
+// case 11 -- a window that closes. The receiver reads nothing until its
+// buffer is full; the sender has to stop, probe, and go on when the
+// window opens again.
+// ===================================================================
+
+fn case_zero_window(w: *mut World) -> bool {
+    var ca: i32 = 0
+    var cb: i32 = 0
+    var now: u64 = 0
+    establish(w, 606060, &ca, &cb, &now)
+    if ca < 0 { return false }
+    let TOTAL: usize = 200000
+    var sent: usize = 0
+    var got: usize = 0
+    var xs: u64 = 17
+    var xr: u64 = 17
+    var bad: usize = 0
+    var closed_wnd: bool = false
+
+    // Phase 1: A reads NOTHING. B fills the pipe until the window is shut.
+    var r: usize = 0
+    while r < 20000 {
+        if sent < TOTAL {
+            var chunk: usize = TOTAL - sent
+            if chunk > 8192 { chunk = 8192 }
+            let room: usize = stack.net_writable(&(*w).b, cb)
+            if room < chunk { chunk = room }
+            if chunk > 0 {
+                xs = gen(xs, &(*w).io[0], chunk)
+                sent = sent + stack.net_send(&(*w).b, cb, &(*w).io[0], chunk)
+            }
+        }
+        if tcp.tcp_dbg(stack.net_tcp(&(*w).b), cb, 7) == 0 { closed_wnd = true }
+        tick(w, now)
+        now = now + 200
+        r = r + 1
+    }
+    let probes: u64 = tcp.tcp_stat(stack.net_tcp(&(*w).b), tcp.ST_PROBE)
+
+    // Phase 2: A starts reading. Everything has to arrive after all.
+    r = 0
+    while r < 200000 {
+        if sent < TOTAL {
+            var chunk: usize = TOTAL - sent
+            if chunk > 8192 { chunk = 8192 }
+            let room: usize = stack.net_writable(&(*w).b, cb)
+            if room < chunk { chunk = room }
+            if chunk > 0 {
+                xs = gen(xs, &(*w).io[0], chunk)
+                sent = sent + stack.net_send(&(*w).b, cb, &(*w).io[0], chunk)
+            }
+        }
+        let n: usize = stack.net_recv(&(*w).a, ca, &(*w).io2[0], 4096)
+        if n > 0 {
+            xr = gen(xr, &(*w).io[0], n)
+            var i: usize = 0
+            while i < n {
+                if (*w).io[i] != (*w).io2[i] { bad = bad + 1 }
+                i = i + 1
+            }
+            got = got + n
+        }
+        if got >= TOTAL { r = 200000 } else { r = r + 1 }
+        tick(w, now)
+        now = now + 200
+    }
+    let good: bool = closed_wnd && probes > 0 && got == TOTAL && bad == 0
+    var f: io.Fmt = verdict("a window that closes: the sender waits, probes, and goes on", good)
+    f = kv(f, "window_was_shut", closed_wnd as u64)
+    f = kv(f, "probes", probes)
+    f = kv(f, "octets", got as u64)
+    f = kv(f, "wrong", bad as u64)
+    done(f)
+    return good
+}
+
+// ===================================================================
+// case 12 -- two hundred thousand random frames. Nothing may crash, and
+// the parsers have to refuse the overwhelming majority.
+// ===================================================================
+
+fn case_fuzz(w: *mut World) -> bool {
+    setup(w, 424242, 200)
+    var maca: [u8; 6] = [0 as u8; 6]
+    maca[0] = 2 as u8
+    maca[5] = 10 as u8
+    let l: i32 = stack.net_listen(&(*w).a, PORT)
+    let u: i32 = stack.udp_bind(&(*w).a, 53 as u16)
+    var now: u64 = 1000000
+    var x: u64 = 90210
+    let ROUNDS: usize = 200000
+    var r: usize = 0
+    while r < ROUNDS {
+        x = wire.next_random(x)
+        var n: usize = 14 + ((x >> 20) % 200) as usize
+        x = gen(x, &(*w).tmp[0], n)
+        // Half of them are addressed to us and carry a plausible
+        // ethertype, so that the deeper layers are reached at all.
+        if (x & 1) == 1 {
+            wire.copy(&(*w).tmp[0], &maca[0], 6)
+            if (x & 2) == 2 {
+                wire.put16(&(*w).tmp[0], 12, wire.ETYPE_IP4)
+                wire.st8(&(*w).tmp[0], 14, 0x45 as u8)
+                wire.put16(&(*w).tmp[0], 16, ((n - 14) & 0xFFFF) as u16)
+                if (x & 4) == 4 {
+                    wire.put16(&(*w).tmp[0], 24, 0 as u16)
+                    wire.put16(&(*w).tmp[0], 24, wire.checksum(&(*w).tmp[14], 20))
+                }
+            } else {
+                wire.put16(&(*w).tmp[0], 12, wire.ETYPE_ARP)
+            }
+        }
+        stack.net_input(&(*w).a, &(*w).tmp[0], n, now)
+        if (r & 63) == 0 {
+            stack.net_poll(&(*w).a, now)
+            var m: usize = stack.net_output(&(*w).a, &(*w).io2[0], 2048, now)
+            var g: usize = 0
+            while m > 0 && g < 64 {
+                m = stack.net_output(&(*w).a, &(*w).io2[0], 2048, now)
+                g = g + 1
+            }
+        }
+        now = now + 37
+        r = r + 1
+    }
+    let seen: u64 = stack.net_stat(&(*w).a, stack.NS_RX)
+    let accepted: u64 = stack.net_stat(&(*w).a, stack.NS_IP_RX)
+    let refused: u64 = stack.net_stat(&(*w).a, stack.NS_IP_BAD)
+    let good: bool = seen == ROUNDS as u64 && refused > 0 && stack.net_state(&(*w).a, l) == tcp.S_LISTEN
+    var f: io.Fmt = verdict("200 000 random frames: nothing falls over", good)
+    f = kv(f, "frames", seen)
+    f = kv(f, "ipv4_accepted", accepted)
+    f = kv(f, "ipv4_refused", refused)
+    f = kv(f, "arp_seen", stack.net_stat(&(*w).a, stack.NS_ARP_RX))
+    f = kv(f, "tcp_csum_refused", tcp.tcp_stat(stack.net_tcp(&(*w).a), tcp.ST_CSUM))
+    f = kv(f, "udp_refused", stack.net_stat(&(*w).a, stack.NS_UDP_BAD))
+    f = kv(f, "listener_alive", (stack.net_state(&(*w).a, l) == tcp.S_LISTEN) as u64)
+    f = kv(f, "udp_socket", (u >= 0) as u64)
+    done(f)
+    return good
+}
+
+// ===================================================================
+// case 13 -- were all eleven states really entered? The bit set says so,
+// and a claim without it would be worth nothing.
+// ===================================================================
+
+fn simul_close(w: *mut World) {
+    // Both sides close at the same moment: that is the only way through
+    // CLOSING, and without it the state machine has a corner nobody ever
+    // walked into.
+    var ca: i32 = 0
+    var cb: i32 = 0
+    var now: u64 = 0
+    establish(w, 909090, &ca, &cb, &now)
+    if ca < 0 { return }
+    stack.net_close(&(*w).a, ca)
+    stack.net_close(&(*w).b, cb)
+    var r: usize = 0
+    while r < 4000 {
+        tick(w, now)
+        now = now + 200
+        r = r + 1
+    }
+}
+
+fn reset_peer(w: *mut World) {
+    var ca: i32 = 0
+    var cb: i32 = 0
+    var now: u64 = 0
+    establish(w, 121212, &ca, &cb, &now)
+    if ca < 0 { return }
+    stack.net_abort(&(*w).b, cb)
+    var r: usize = 0
+    while r < 400 {
+        tick(w, now)
+        now = now + 200
+        r = r + 1
+    }
+}
+
+// One side closes, the other answers: FIN_WAIT_1 -> FIN_WAIT_2 ->
+// TIME_WAIT on one, CLOSE_WAIT -> LAST_ACK on the other.
+fn normal_close(w: *mut World) {
+    var ca: i32 = 0
+    var cb: i32 = 0
+    var now: u64 = 0
+    establish(w, 343434, &ca, &cb, &now)
+    if ca < 0 { return }
+    stack.net_close(&(*w).b, cb)
+    var r: usize = 0
+    while r < 6000 {
+        if stack.net_state(&(*w).a, ca) == tcp.S_CLOSE_WAIT { stack.net_close(&(*w).a, ca) }
+        tick(w, now)
+        now = now + 200
+        r = r + 1
+    }
+}
+
+fn case_states(w: *mut World) -> bool {
+    // The two runs above leave their traces in ONE stack each, so the
+    // bit sets are collected here rather than in a single connection.
+    var seen: u32 = 0
+    normal_close(w)
+    seen = seen | tcp.tcp_seen(stack.net_tcp(&(*w).a)) | tcp.tcp_seen(stack.net_tcp(&(*w).b))
+    simul_close(w)
+    seen = seen | tcp.tcp_seen(stack.net_tcp(&(*w).a)) | tcp.tcp_seen(stack.net_tcp(&(*w).b))
+    reset_peer(w)
+    seen = seen | tcp.tcp_seen(stack.net_tcp(&(*w).a)) | tcp.tcp_seen(stack.net_tcp(&(*w).b))
+    let closing: bool = (seen & (1 << tcp.S_CLOSING)) != 0
+    // and everything the first three cases walked through
+    let good: bool = seen == 2047 && closing
+    var f: io.Fmt = verdict("all eleven states were entered, not just described", good)
+    f = kv(f, "bitset", seen as u64)
+    f = kv(f, "of", 2047)
+    f = kv(f, "closing_reached", closing as u64)
+    f = kv(f, "last_ack", ((seen & (1 << tcp.S_LAST_ACK)) != 0) as u64)
+    f = kv(f, "time_wait", ((seen & (1 << tcp.S_TIME_WAIT)) != 0) as u64)
+    f = kv(f, "fin_wait_2", ((seen & (1 << tcp.S_FIN_WAIT_2)) != 0) as u64)
+    done(f)
+    return good
+}
+
+// ===================================================================
+// case 14 -- a connection to a port nobody listens on has to be REFUSED,
+// not left hanging. Without this the whole listen path would pass with a
+// stack that answers every port.
+// ===================================================================
+
+fn case_refused(w: *mut World) -> bool {
+    setup(w, 777777, 200)
+    var now: u64 = 1000000
+    let l: i32 = stack.net_listen(&(*w).a, PORT)
+    let cb: i32 = stack.net_connect(&(*w).b, IPA, 4712 as u16, now)
+    var r: usize = 0
+    var refused: bool = false
+    while r < 4000 {
+        if stack.net_error(&(*w).b, cb) == tcp.E_REFUSED { refused = true }
+        tick(w, now)
+        now = now + 200
+        r = r + 1
+    }
+    let rst: u64 = tcp.tcp_stat(stack.net_tcp(&(*w).a), tcp.ST_RST_TX)
+    // And the counter-check: the port that IS open comes up.
+    let cb2: i32 = stack.net_connect(&(*w).b, IPA, PORT, now)
+    var up: bool = false
+    r = 0
+    while r < 4000 {
+        if stack.net_state(&(*w).b, cb2) == tcp.S_ESTABLISHED { up = true }
+        tick(w, now)
+        now = now + 200
+        r = r + 1
+    }
+    let good: bool = refused && rst > 0 && up && l >= 0
+    var f: io.Fmt = verdict("a closed port refuses, an open one answers", good)
+    f = kv(f, "refused", refused as u64)
+    f = kv(f, "resets_sent", rst)
+    f = kv(f, "open_port_established", up as u64)
+    done(f)
+    return good
+}
+
 fn main() -> i32 {
     let p: u64 = rt.heap_alloc(size_of[World]())
     if p == 0 {
@@ -829,6 +1182,12 @@ fn main() -> i32 {
     if !case_icmp(w) { fails = fails + 1 }
     if !case_arp_and_ip(w) { fails = fails + 1 }
     if !case_udp(w) { fails = fails + 1 }
+    if !case_nagle(w) { fails = fails + 1 }
+    if !case_delack(w) { fails = fails + 1 }
+    if !case_zero_window(w) { fails = fails + 1 }
+    if !case_refused(w) { fails = fails + 1 }
+    if !case_fuzz(w) { fails = fails + 1 }
+    if !case_states(w) { fails = fails + 1 }
     var f: io.Fmt = io.fmt_new()
     f = io.fmt_str(f, "unit: ")
     f = io.fmt_u64(f, fails as u64)
