@@ -591,15 +591,29 @@ if [ -f "$F" ]; then
     else
         bad "block accounting: after the format $free0, after the files $free1"
     fi
-    # 12 direct blocks + 64 through the indirect one = 76 * 512 = 38912.
+    # ROUND K6: 11 direct blocks + 64 through the indirect one + 64 * 64
+    # through the double indirect one = 4171 * 512 = 2135552. The 49152
+    # octets below therefore all go in now; in round K1 the same write
+    # stopped at 38912, which is the number that made the shell of round
+    # K6 too big for its own disk.
     lim=$(grep -m1 '^fs: limit ' "$F")
     la=$(echo "$lim" | grep -oE 'asked=[0-9]+' | cut -d= -f2)
     lw=$(echo "$lim" | grep -oE 'wrote=[0-9]+' | cut -d= -f2)
     ls_=$(echo "$lim" | grep -oE 'size=[0-9]+' | cut -d= -f2)
-    if [ "$la" = "49152" ] && [ "$lw" = "38912" ] && [ "$ls_" = "38912" ]; then
-        ok "counter-check: a file stops at 12+64 blocks and reports 38912 of 49152 written"
+    if [ "$la" = "49152" ] && [ "$lw" = "49152" ] && [ "$ls_" = "49152" ]; then
+        ok "49152 octets go into one file -- past the 38912 of round K1, through the double indirect block"
     else
-        bad "the size limit: asked=$la wrote=$lw size=$ls_, expected 49152/38912/38912"
+        bad "the size limit: asked=$la wrote=$lw size=$ls_, expected 49152/49152/49152"
+    fi
+    # And the ceiling of the shape is still a ceiling: one block past the
+    # last one it can name, nothing is written and the file system says 0.
+    over=$(grep -m1 '^fs: over ' "$F")
+    ow=$(echo "$over" | grep -oE 'wrote=[0-9]+' | cut -d= -f2)
+    os_=$(echo "$over" | grep -oE 'size=[0-9]+' | cut -d= -f2)
+    if [ "$ow" = "0" ] && [ "$os_" = "49152" ]; then
+        ok "counter-check: a write past 2135552 octets places nothing and does not grow the file"
+    else
+        bad "the ceiling: wrote=$ow size=$os_, expected 0/49152"
     fi
     grep -q '^fs: list .*hello.txt:1' "$F" \
         && ok "the root directory lists the file" \
