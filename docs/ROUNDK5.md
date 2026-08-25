@@ -27,12 +27,13 @@ three cores or leaves them asleep (`nosmp` on the command line).
 
 | run | cores working | cycles | ms |
 |---|---|---|---|
-| `-smp 4 nosmp` | 1 | 2 095 609 252 | 957 |
-| `-smp 4` | 4 | 596 460 942 | 272 |
-| **speed-up** | | | **3.52×** |
+| `-smp 4 nosmp` | 1 | 2 103 871 836 | 962 |
+| `-smp 4` | 4 | 716 643 158 | 327 |
+| **speed-up** | | | **2.94×** |
 
-That is one pair out of five measured back to back; the whole series with
-its spread is in section 8, and its median is 2.48×.
+Those two lines come out of `test.sh` section 57 itself, on a build host
+that was running six other acceptance suites at the time. A repeated,
+strictly sequential series is in section 8.
 
 And the control that turns that into evidence — the same guest, the same
 four cores, but QEMU emulating all of them in ONE host thread
@@ -40,10 +41,11 @@ four cores, but QEMU emulating all of them in ONE host thread
 
 | run | cycles | against one core |
 |---|---|---|
-| four guest cores, one host thread | 1 798 405 950 | **1.04×** |
+| four guest cores, one host thread | 2 231 483 298 | **0.94×** |
 
-Four cores in one host thread are not faster, because they are not
-parallel. That is what says the 2.07 above is parallelism and not a
+Four cores in one host thread are not faster — they are slightly slower,
+because the emulator now has four cores' worth of bookkeeping to do in one
+thread. That is what says the 2.94 above is parallelism and not a
 measurement artefact.
 
 And the second measurement, which is the one that says the SCHEDULER
@@ -53,18 +55,19 @@ free.
 
 | run | ms | cores that took tasks |
 |---|---|---|
-| `-smp 4 nosmp` | 655 | 1 |
-| `-smp 4` | 176 | 4 |
-| **speed-up** | **3.72×** | |
+| `-smp 4 nosmp` | 650 | 1 |
+| `-smp 4` | 162 | 4 |
+| **speed-up** | **4.01×** | |
 
 **On the numbers not being 4.0.** The machine this was measured on is a
 shared build host that had a load average around ten on twelve cores
-while the series ran, with other rounds compiling and running QEMU
-throughout. The spread over five pairs is 1.88× to 3.52×. The threshold
-in `tools/smp/run.sh` is set at 1.6× and not at 3.0×: a test that fails
-when the build machine is busy is a test that gets switched off. What
-carries the claim is not the size of the number but the distance to the
-counter-check — the same guest in one host thread stays at 1.04.
+throughout, with five other rounds running their full acceptance suites.
+The spread over a sequential series of five pairs is 1.88× to 3.52×; an
+earlier, quieter run of the same benchmark gave 4.24×. The threshold in
+`tools/smp/run.sh` is set at 1.6× and not at 3.0×: a test that fails when
+the build machine is busy is a test that gets switched off. What carries
+the claim is not the size of the number but the distance to the
+counter-check — the same guest in one host thread stays under 1.0.
 
 ---
 
@@ -266,7 +269,7 @@ smp: online=1 of 4  failed=0
 ```
 
 **`-accel tcg,thread=single` — four guest cores in one host thread.**
-1.04× against one core, where the parallel run gets 2.07×. Nothing in the
+0.94× against one core, where the parallel run gets 2.94×. Nothing in the
 guest differs.
 
 **`nolock` — the locks switched off.** One bit per lock, not one flag for
@@ -285,8 +288,8 @@ instructions so that the result is a measurement and not a coin toss.
 | | with the lock | without |
 |---|---|---|
 | increments wanted | 6000 | 6000 |
-| increments counted | **6000** | **1630** |
-| lost | 0 | **4370** |
+| increments counted | **6000** | **1479** |
+| lost | 0 | **4521** |
 
 And the same run for the frame allocator, where nothing is widened and
 nothing is arranged — this is the allocator every other part of the
@@ -296,7 +299,7 @@ it, count down. Every core takes sixteen frames:
 | | with the lock | without |
 |---|---|---|
 | frames handed out | 64 | 64 |
-| **the same frame in two cores' hands** | **0** | **5** |
+| **the same frame in two cores' hands** | **0** | **4** |
 
 A frame handed out twice is a frame two parts of the kernel now believe
 is theirs alone. Nothing reports it; the kernel simply starts writing two
@@ -305,8 +308,8 @@ things into one page.
 **The scheduler across cores**, from the same run:
 
 ```
-smp: sched tasks=8  done=8  cores_used=4  switches=755  ms=1649
-smp: picks  c0=187 c1=151 c2=150 c3=153
+smp: sched tasks=8  done=8  cores_used=4  switches=186  ms=162
+smp: picks  c0=23 c1=14 c2=13 c3=13
 ```
 
 Eight kernel tasks in one queue, taken by all four cores, all eight run to
@@ -459,7 +462,7 @@ Named, because a limit that is not named is a claim.
 | `tools/smp/run.sh` | all of the above, measured, with the counter-checks |
 
 ```
-bash tools/smp/run.sh          # 55 checks, the numbers of section 1
+bash tools/smp/run.sh          # 58 checks, the numbers of section 1
 bash tools/kernel/run.sh       # round 59/62 on one core, unchanged
 ./test.sh                      # section 57 is this round
 ```
