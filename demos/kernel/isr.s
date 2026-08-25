@@ -170,25 +170,100 @@ isr_common:
 
     .globl syscall_entry
 syscall_entry:
-    movq %rsp, %r10                 /* r10 is scratch under this ABI */
-    movq $kdata, %r8
-    movq KSTACK_CUR(%r8), %rsp      /* the kernel stack of this task */
-    pushq %r10                      /* user rsp */
-    pushq %rcx                      /* user rip */
+    /* ROUND K4. Two things changed here, and both are the reason this
+     * round exists.
+     *
+     * FIRST: r10 is NOT scratch any more. Linux x86-64 passes the fourth
+     * argument of a system call in r10 (`syscall` destroys rcx, so the C
+     * argument in rcx moves one register aside), the fifth in r8 and the
+     * sixth in r9. `mmap` has six of them. The old entry point wrote the
+     * user stack pointer over r10 before anybody could look at it. It goes
+     * into `sys_rsp` instead -- interrupts are off between the store and
+     * the push that reads it back, because MSR_SFMASK masks IF for the
+     * whole system call (`demos/kernel/user.fi`, `setup`).
+     *
+     * SECOND: what is saved is a COMPLETE user context -- sixteen words on
+     * the kernel stack of the calling task -- and its ADDRESS is what the
+     * kernel gets. Three calls need that and cannot be written without it:
+     *
+     *   * `fork` gives the child the register set of the parent, rbx, rbp
+     *     and r12..r15 included -- registers a `call` preserves and that
+     *     therefore never appear in a Firn argument,
+     *   * `execve` returns to a DIFFERENT rip with a DIFFERENT rsp in the
+     *     SAME task: it writes both into the frame and lets the ordinary
+     *     way out run,
+     *   * a signal handler, when there is one, needs exactly the same.
+     *
+     * The layout, as offsets from the pointer Firn receives (the F_*
+     * constants at the top of `demos/kernel/sys.fi`):
+     *
+     *   +0   r15  +8  r14  +16 r13  +24 r12  +32 rbp  +40 rbx
+     *   +48  r9   +56 r8   +64 r10  +72 rdx  +80 rsi  +88 rdi
+     *   +96  rax (the number on the way in, the result on the way out)
+     *   +104 rip  +112 rflags  +120 user rsp
+     *
+     * Sixteen words are 128 octets, so the 16-alignment of the kernel
+     * stack survives them and the `call` below gets what System V wants.
+     *
+     * Handed to Firn: rdi = the number, rsi = the frame, rdx = the kernel
+     * data area.
+     */
+    movq %rsp, sys_rsp(%rip)        /* the user stack -- no register is free */
+    movq kdata + KSTACK_CUR(%rip), %rsp
+    pushq sys_rsp(%rip)             /* user rsp */
     pushq %r11                      /* user rflags */
-    subq $8, %rsp                   /* keep the stack 16-aligned */
+    pushq %rcx                      /* user rip */
+    pushq %rax                      /* the number */
+    pushq %rdi                      /* argument 0 */
+    pushq %rsi                      /* argument 1 */
+    pushq %rdx                      /* argument 2 */
+    pushq %r10                      /* argument 3 */
+    pushq %r8                       /* argument 4 */
+    pushq %r9                       /* argument 5 */
+    pushq %rbx
+    pushq %rbp
+    pushq %r12
+    pushq %r13
+    pushq %r14
+    pushq %r15
 
-    movq %rdx, %rcx                 /* argument 2 */
-    movq %rsi, %rdx                 /* argument 1 */
-    movq %rdi, %rsi                 /* argument 0 */
     movq %rax, %rdi                 /* the number */
+    movq %rsp, %rsi                 /* the frame */
+    movq $kdata, %rdx               /* the data area */
     call KERNEL_SYSCALL
+    movq %rax, 96(%rsp)             /* the result belongs in the frame */
+    jmp user_return
 
-    addq $8, %rsp
-    popq %r11
-    popq %rcx
+/* `user_resume(rdi = frame)` -- a context that does NOT lie on the stack
+ * this processor is standing on. `proc.resume_start` starts the child of a
+ * `fork` with it: the frame was copied into the data area, the rax in it
+ * is zero, and from here the child is indistinguishable from a process
+ * that has just come back out of a system call. `cli`, because rsp walks
+ * through that copy for sixteen instructions and an interrupt would push
+ * its own frame into the middle of it; `sysretq` puts the flags back out
+ * of r11, IF included.
+ */
+    .globl user_resume
+user_resume:
+    cli
+    movq %rdi, %rsp
+user_return:
+    popq %r15
+    popq %r14
+    popq %r13
+    popq %r12
+    popq %rbp
+    popq %rbx
+    popq %r9
+    popq %r8
     popq %r10
-    movq %r10, %rsp
+    popq %rdx
+    popq %rsi
+    popq %rdi
+    popq %rax
+    popq %rcx                       /* the rip `sysret` returns to */
+    popq %r11                       /* the flags it puts back */
+    popq %rsp                       /* the user stack */
     sysretq
 
 /* ------------------------------------------------- ring 3 and back ---
@@ -285,10 +360,17 @@ vectors:
     .quad syscall_stack_top         /* 61: the stack before the first task */
     .quad KERNEL_TASK_MAIN          /* 62: tasks.fi, the body of a kernel task */
     .quad KERNEL_USER_START         /* 63: proc.fi, the way into ring 3 */
+    /* Round K4: back into ring 3 with a context the kernel wrote itself. */
+    .quad user_resume               /* 64: fork and execve */
 
     .section .bss, "aw", @nobits
     .align 8
 saved_rsp:
+    .skip 8
+/* Round K4: where `syscall_entry` parks the user stack pointer for the two
+ * instructions before it can push it. One processor, and IF masked by
+ * MSR_SFMASK -- nothing can get in between. */
+sys_rsp:
     .skip 8
 saved_rbx:
     .skip 8

@@ -42,10 +42,12 @@ import kstate
 import mem
 import sched
 import user
+import file
 
 export {
     create, user_start, free_space, reap, translate, user_ok, map_programs,
     inherit, create_bare, discard, page_free, page_exec, map_page, nx,
+    copy_space, swap_space, use_space, page_drop, ARG_RESUME,
     USER_DATA, USER_STACK, USER_SPAN, USER_TOP,
     IMAGE_BASE, IMAGE_END, ARGS_BASE, MAX_ARGS
 }
@@ -90,6 +92,13 @@ const PAGE_NX: u64 = 0x8000000000000000
 const V_ENTER_TASK: u64 = 56
 const V_USER_MAIN: u64 = 58
 const V_USER_START: u64 = 63
+const V_USER_RESUME: u64 = 64
+
+// ROUND K4. What stands in `T_ARG` when a task is not a program of
+// `uprog.fi` but the CHILD OF A FORK: `user_start` then does not enter a
+// program at its first instruction, it puts a saved context back. A number
+// no program index can be -- `uprog.fi` has eleven of them.
+const ARG_RESUME: u64 = 0xF04B
 
 fn vector(state: u64, i: u64) -> u64 {
     return __mmio_read64((kstate.get(state, kstate.VECTORS) + i * 8) as *mut u64)
@@ -441,6 +450,10 @@ fn create_bare(state: u64, prio: u64) -> u64 {
         return 0
     }
     sched.tset(state, i, sched.T_CR3, space)
+    // Round K4: standard input, output and error, before the first
+    // instruction of the process runs. A process without them would have
+    // to open the console itself, and there is no name for it.
+    file.init_task(state, i)
     return i
 }
 
@@ -475,11 +488,124 @@ fn create(state: u64, prog: u64, arg: u64, prio: u64) -> u64 {
     return i
 }
 
+// ---------------------------------------------------- round K4: pages
+
+// A page of a process back to the frame allocator. The counterpart of
+// `map_page`, and the reason `brk` can shrink and `munmap` can give
+// something back at all.
+fn page_drop(state: u64, i: u64, addr: u64) -> bool {
+    let pt: u64 = sched.tget(state, i, sched.T_PT)
+    let s: u64 = pt_slot(addr)
+    if pt == 0 || s >= 512 {
+        return false
+    }
+    let e: u64 = read_entry(pt, s)
+    if (e & PAGE_PRESENT) == 0 {
+        return false
+    }
+    write_entry(pt, s, 0)
+    mem.frame_free(state, e & ADDR_MASK)
+    // The tables of the CURRENT process are the ones the processor has
+    // cached. A page that is gone from the table but still in the TLB is a
+    // page a program can go on writing to -- so the cache goes, the way
+    // `user.map_user` does it: writing cr3 with its own value.
+    let now: u64 = asm("mov rax, cr3", out("rax"))
+    if sched.tget(state, i, sched.T_CR3) == now {
+        asm("mov rax, cr3\nmov cr3, rax", out("rax"))
+    }
+    return true
+}
+
+// EVERY MAPPED PAGE OF `from`, COPIED INTO `to`. This is `fork`, and it is
+// deliberately the dumb version: 4096 octets per page, no copy-on-write,
+// no sharing. `to` comes out of `create_bare` and therefore already has
+// its data page and its eight stack pages -- those are filled, the rest is
+// mapped with the SAME rights the parent had, down to the no-execute bit.
+// Returns how many pages it copied, or 0.
+fn copy_space(state: u64, from: u64, to: u64) -> u64 {
+    let src: u64 = sched.tget(state, from, sched.T_PT)
+    let dst: u64 = sched.tget(state, to, sched.T_PT)
+    if src == 0 || dst == 0 {
+        return 0
+    }
+    var n: u64 = 0
+    var k: u64 = 0
+    while k < 512 {
+        let e: u64 = read_entry(src, k)
+        if (e & PAGE_PRESENT) != 0 {
+            var d: u64 = read_entry(dst, k)
+            if (d & PAGE_PRESENT) == 0 {
+                let f: u64 = mem.frame_alloc(state)
+                if f == 0 {
+                    return 0
+                }
+                write_entry(dst, k, f | (e & 0xFFF) | (e & PAGE_NX))
+                d = read_entry(dst, k)
+            }
+            let a: u64 = e & ADDR_MASK
+            let b: u64 = d & ADDR_MASK
+            var w: u64 = 0
+            while w < mem.FRAME_SIZE / 8 {
+                __mmio_write64((b + w * 8) as *mut u64,
+                    __mmio_read64((a + w * 8) as *mut u64))
+                w = w + 1
+            }
+            n = n + 1
+        }
+        k = k + 1
+    }
+    return n
+}
+
+// The five numbers that ARE an address space, exchanged between two
+// tasks. `execve` is written with it: the loader builds a whole new
+// process for the file, the caller takes its space, and what the caller
+// had is now hanging on a task that gets discarded -- which frees exactly
+// the old image, with no second copy of `free_space` anywhere.
+fn swap_space(state: u64, a: u64, b: u64) {
+    let cr3: u64 = sched.tget(state, a, sched.T_CR3)
+    let pdpt: u64 = sched.tget(state, a, sched.T_PDPT)
+    let pd: u64 = sched.tget(state, a, sched.T_PD)
+    let pt: u64 = sched.tget(state, a, sched.T_PT)
+    let data: u64 = sched.tget(state, a, sched.T_DATA)
+    sched.tset(state, a, sched.T_CR3, sched.tget(state, b, sched.T_CR3))
+    sched.tset(state, a, sched.T_PDPT, sched.tget(state, b, sched.T_PDPT))
+    sched.tset(state, a, sched.T_PD, sched.tget(state, b, sched.T_PD))
+    sched.tset(state, a, sched.T_PT, sched.tget(state, b, sched.T_PT))
+    sched.tset(state, a, sched.T_DATA, sched.tget(state, b, sched.T_DATA))
+    sched.tset(state, b, sched.T_CR3, cr3)
+    sched.tset(state, b, sched.T_PDPT, pdpt)
+    sched.tset(state, b, sched.T_PD, pd)
+    sched.tset(state, b, sched.T_PT, pt)
+    sched.tset(state, b, sched.T_DATA, data)
+}
+
+// Put the tables of this task into cr3. Only `execve` needs it: everywhere
+// else the context switch does it, and there the task that gets the
+// processor is not the one that is running.
+fn use_space(state: u64, i: u64) {
+    let cr3: u64 = sched.tget(state, i, sched.T_CR3)
+    if cr3 != 0 {
+        asm("mov cr3, rax", in("rax") cr3, clobber("memory"))
+    }
+}
+
 // `KERNEL_USER_START` out of isr.s: the first thing a process runs, still
 // in ring 0, on its own kernel stack, in its own address space. It puts
 // the two arguments in place and leaves the ring -- and does not come
 // back. The way out of a process is `exit`, a fault or the timer.
 fn user_start(state: u64, i: u64, kind: u64) {
+    // ROUND K4: the child of a `fork` does not START, it CONTINUES. Its
+    // context lies in the data area, `rax` in it is zero, and
+    // `user_resume` in isr.s puts all sixteen words back and returns to
+    // ring 3 at the instruction after the parent's `syscall`.
+    if sched.tget(state, i, sched.T_ARG) == ARG_RESUME {
+        sched.tset(state, i, sched.T_ARG, 0)
+        asm("call rax", in("rax") vector(state, V_USER_RESUME),
+            in("rdi") state + kstate.CTX_OFF + i * 128, clobber("memory"))
+        sched.exit_task(state, 0)
+        return
+    }
     let arg: u64 = sched.tget(state, i, sched.T_WORK)
     sched.tset(state, i, sched.T_WORK, 0)
     asm("call rax", in("rax") vector(state, V_ENTER_TASK),

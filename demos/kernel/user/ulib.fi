@@ -1,56 +1,41 @@
 // demos/kernel/user/ulib.fi -- round K1: what a program on the disk has
-// instead of a standard library.
+// instead of a standard library. ROUND K4: it HAS one now.
 //
-// Every program under `demos/kernel/user/` is compiled into an ELF FILE
-// OF ITS OWN and lands on the disk, not in the kernel image. It therefore
-// has nothing: no allocator, no collector, no libc, no kernel it could
-// call into. The only door out of a process is `syscall`, and this file
-// is that door plus the four routines that are needed to say anything at
-// all.
+// Round K1 wrote this file because there was nothing: no allocator, no
+// collector, no libc, no kernel to call into -- the only door out of a
+// process was `syscall`, and this file was that door plus the four
+// routines needed to say anything at all.
 //
-// Two rules, and `tools/osum/run.sh` checks both on the finished file:
+// Round K4 built the library that belongs under it (`lib/osum/libc/`), and
+// this file is now what it should have been from the start: a THIN LAYER,
+// four lines per function, that keeps the names the programs of round K1
+// use while everything underneath goes through the libc. Nothing here has
+// its own idea of how a number is printed or how long a text is any more.
 //
-//   1. NO UNDEFINED NAME apart from the ones crt.s defines itself. What
-//      is not here does not exist down here.
-//   2. EVERY output and every look at the disk is a system call. The
-//      numbers are the ones in `demos/kernel/sys.fi`.
+// The two rules of round K1 still hold, and `tools/osum/run.sh` still
+// checks both on the finished file:
 //
-// The argument block is the second thing that is new in this round. The
-// kernel builds it on the top stack page of the process before the first
-// instruction runs (`demos/kernel/elf.fi`, `write_args`) and hands its
-// address in rdi:
+//   1. NO UNDEFINED NAME apart from the ones crt.s defines itself.
+//   2. EVERY output and every look at the disk is a system call.
+//
+// The argument block is unchanged. The kernel builds it on the top stack
+// page of the process before the first instruction runs
+// (`demos/kernel/elf.fi`, `write_args`) and hands its address in rdi:
 //
 //     +0   argc
 //     +8   argv[0] .. argv[argc-1], then a zero
 //     +80  the strings themselves, each one ended by a zero
-//
-// `arg_count` and `arg_at` are the two lines that read it.
+
+import osum.libc.kcall
+import osum.libc.errno
+import osum.libc.text
+import osum.libc.io
 
 export {
     sys, say, put, sayn, sayu, say_line, nl, length, streq, word, digits,
-    arg_count, arg_at,
-    SYS_EXIT, SYS_WRITE, SYS_READ, SYS_GETPID, SYS_SLEEP, SYS_SPAWN,
-    SYS_WAIT, SYS_OPEN, SYS_CLOSE, SYS_UNLINK, SYS_LIST, SYS_MKDIR,
-    SYS_YIELD, SYS_STAT, SYS_GETPPID, SYS_EXEC,
+    arg_count, arg_at, failed,
     IN, OUT, ERR
 }
-
-const SYS_EXIT: u64 = 10
-const SYS_WRITE: u64 = 11
-const SYS_READ: u64 = 12
-const SYS_GETPID: u64 = 13
-const SYS_SLEEP: u64 = 14
-const SYS_SPAWN: u64 = 15
-const SYS_WAIT: u64 = 16
-const SYS_OPEN: u64 = 17
-const SYS_CLOSE: u64 = 18
-const SYS_UNLINK: u64 = 19
-const SYS_LIST: u64 = 20
-const SYS_MKDIR: u64 = 21
-const SYS_YIELD: u64 = 22
-const SYS_STAT: u64 = 23
-const SYS_GETPPID: u64 = 24
-const SYS_EXEC: u64 = 25
 
 const IN: u64 = 0
 const OUT: u64 = 1
@@ -58,31 +43,35 @@ const ERR: u64 = 2
 
 // ------------------------------------------------------ the system call
 
-// rax = number, rdi/rsi/rdx = the three arguments, rax = result.
-// `syscall` destroys rcx and r11 -- the processor puts the return address
-// and the flags in them.
+// The raw door, kept because the programs of round K1 use it by name and
+// because a test of a system call should be able to make one WITHOUT a
+// library in between (`/bin/posix` does exactly that for its error cases).
 fn sys(number: u64, a0: u64, a1: u64, a2: u64) -> u64 {
-    return asm("syscall", out("rax"), in("rax") number, in("rdi") a0,
-        in("rsi") a1, in("rdx") a2, clobber("rcx"), clobber("r11"),
-        clobber("memory"))
+    return kcall.sys3(number, a0, a1, a2)
+}
+
+// Did a call fail? A negative answer is an error, and the top 4096 values
+// are the errors -- the same rule the kernel uses.
+fn failed(v: u64) -> bool {
+    return errno.is_error(v)
 }
 
 // ------------------------------------------------------------- output
 
+// Unbuffered on purpose. `osum.libc.stdio` has the buffered output, and
+// what a program of round K1 does is print a line and then possibly walk
+// into a page fault (`/bin/hurt`) -- a buffer would swallow exactly the
+// line that says what it was about to do.
 fn length(p: u64) -> u64 {
-    var n: u64 = 0
-    while *((p + n) as *mut u8) != 0 as u8 {
-        n = n + 1
-    }
-    return n
+    return text.length(p)
 }
 
 fn say(p: u64) -> u64 {
-    return sys(SYS_WRITE, OUT, p, length(p))
+    return io.write_text(OUT, p)
 }
 
 fn put(p: u64, n: u64) -> u64 {
-    return sys(SYS_WRITE, OUT, p, n)
+    return io.write_all(OUT, p, n)
 }
 
 fn nl() {
@@ -90,72 +79,24 @@ fn nl() {
     say((&s[0]) as u64)
 }
 
-// A number without a standard library: the digits come out backwards and
-// are turned around. A NEGATIVE result of a system call is an error code,
-// and the minus is a REINTERPRETATION, not a subtraction -- what arrives
-// is the bit pattern of an `i64` in a `u64` register, and `0 -% v` is the
-// two's complement negation. Plain `-` is checked since round 72 and
-// would call `osum_panic` for every value this branch ever sees.
 fn digits(v: u64, out: u64) -> u64 {
-    var value: u64 = v
-    var at: u64 = 0
-    if (v >> 63) != 0 {
-        __mmio_write8(out as *mut u8, 45 as u8)
-        at = 1
-        value = 0 -% v
-    }
-    var back: [u8; 24] = [0 as u8; 24]
-    var n: u64 = 0
-    if value == 0 {
-        back[0] = 48 as u8
-        n = 1
-    }
-    while value > 0 {
-        back[n as usize] = (48 + value % 10) as u8
-        value = value / 10
-        n = n + 1
-    }
-    var i: u64 = n
-    while i > 0 {
-        i = i - 1
-        __mmio_write8((out + at) as *mut u8, back[i as usize])
-        at = at + 1
-    }
-    __mmio_write8((out + at) as *mut u8, 0 as u8)
-    return at
+    return text.digits(v, out, true)
 }
 
+// A number that may be an error code: the top bit is a minus.
 fn sayn(v: u64) {
     var buf: [u8; 26] = [0 as u8; 26]
-    let n: u64 = digits(v, (&buf[0]) as u64)
+    let n: u64 = text.digits(v, (&buf[0]) as u64, true)
     put((&buf[0]) as u64, n)
 }
 
-// The same without the sign. A value that is not a result of a system
-// call is not an error code, and reading its top bit as a minus would
-// turn the poison pattern of the loader into a riddle.
+// The same without the sign. A value that is not a result of a system call
+// is not an error code, and reading its top bit as a minus would turn the
+// poison pattern of the loader into a riddle.
 fn sayu(v: u64) {
     var buf: [u8; 26] = [0 as u8; 26]
-    var back: [u8; 24] = [0 as u8; 24]
-    var value: u64 = v
-    var n: u64 = 0
-    if value == 0 {
-        back[0] = 48 as u8
-        n = 1
-    }
-    while value > 0 {
-        back[n as usize] = (48 + value % 10) as u8
-        value = value / 10
-        n = n + 1
-    }
-    var at: u64 = 0
-    var i: u64 = n
-    while i > 0 {
-        i = i - 1
-        buf[at as usize] = back[i as usize]
-        at = at + 1
-    }
-    put((&buf[0]) as u64, at)
+    let n: u64 = text.digits(v, (&buf[0]) as u64, false)
+    put((&buf[0]) as u64, n)
 }
 
 fn say_line(p: u64, v: u64) {
@@ -167,19 +108,7 @@ fn say_line(p: u64, v: u64) {
 // ------------------------------------------------------------ strings
 
 fn streq(a: u64, b: u64) -> bool {
-    var i: u64 = 0
-    while i < 64 {
-        let x: u64 = (*((a + i) as *mut u8)) as u64
-        let y: u64 = (*((b + i) as *mut u8)) as u64
-        if x != y {
-            return false
-        }
-        if x == 0 {
-            return true
-        }
-        i = i + 1
-    }
-    return true
+    return text.equal(a, b)
 }
 
 // The next word of `line` from `at` on into `out`; returns where the word
