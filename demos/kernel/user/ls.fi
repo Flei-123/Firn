@@ -1,13 +1,19 @@
-// demos/kernel/user/ls.fi -- round K1: the directory, from outside.
+// demos/kernel/user/ls.fi -- round K6: the directory, from outside.
 //
 // `ls` cannot read a block, cannot see an inode and does not know what a
 // directory looks like. It asks: SYS_LIST(path, index, buffer) hands back
 // the index-th entry as 32 octets -- inode number, then the name -- and
 // the return value is the KIND. A directory therefore gets a slash after
-// it, and that is the only interpretation this program makes.
+// it, and that is the only interpretation the short form makes.
 //
-// The exit code is the number of entries it found, so that the shell has
-// a number to show and `tools/osum/run.sh` a number to check.
+// `-l` is one system call more per entry: SYS_STAT on the finished path
+// says how big the file is. The kernel has no owner, no rights and no
+// clock on a file, so there is nothing else a long form could show --
+// what is missing here is missing in the file system, not in `ls`.
+//
+// Round K1 returned the NUMBER OF ENTRIES as its exit code. Round K6 does
+// not: a userland in which `grep` says "found" with 0 and `ls` says
+// "four entries" with 4 has no `$?` anybody can use. 0 is success.
 
 profile kernel
 
@@ -17,34 +23,136 @@ export { u_start }
 
 fn u_start(args: u64) -> u64 {
     var root: [u8; 2] = "/\0"
+    var full: [u8; 128] = [0 as u8; 128]
     var entry: [u8; 32] = [0 as u8; 32]
     var s_slash: [u8; 2] = "/\0"
     var s_sp: [u8; 2] = " \0"
-    var s_err: [u8; 12] = "ls: failed \0"
+    var s_err: [u8; 17] = "ls: cannot list \0"
+    var s_dash: [u8; 2] = "-\0"
+    var s_dir: [u8; 2] = "d\0"
 
-    var p: u64 = ulib.arg_at(args, 1)
-    if p == 0 {
-        p = (&root[0]) as u64
+    let argc: u64 = ulib.arg_count(args)
+    var long: bool = false
+    var paths: u64 = 0
+    var i: u64 = 1
+    while i < argc {
+        let a: u64 = ulib.arg_at(args, i)
+        if *((a) as *mut u8) == 45 as u8 {
+            if *((a + 1) as *mut u8) == 108 as u8 {
+                long = true
+            }
+        } else {
+            paths = paths + 1
+        }
+        i = i + 1
+    }
+    var code: u64 = 0
+    var seen: u64 = 0
+    i = 1
+    var going: bool = true
+    while going {
+        var p: u64 = (&root[0 as usize]) as u64
+        if paths > 0 {
+            // The next argument that is not an option.
+            var found: bool = false
+            while i < argc && !found {
+                let a: u64 = ulib.arg_at(args, i)
+                if *((a) as *mut u8) != 45 as u8 {
+                    p = a
+                    found = true
+                }
+                i = i + 1
+            }
+            if !found {
+                going = false
+            }
+        } else {
+            going = seen == 0
+        }
+        if going {
+            seen = seen + 1
+            if !one(p, long, (&full[0 as usize]) as u64,
+                (&entry[0 as usize]) as u64, (&s_slash[0 as usize]) as u64,
+                (&s_sp[0 as usize]) as u64, (&s_dash[0 as usize]) as u64,
+                (&s_dir[0 as usize]) as u64) {
+                ulib.esay_line((&s_err[0 as usize]) as u64, p)
+                code = 1
+            }
+            if paths == 0 {
+                going = false
+            }
+        }
+    }
+    return code
+}
+
+// One path. A plain file is not an error -- `ls readme.txt` names it,
+// the way it does on every other system.
+fn one(p: u64, long: bool, full: u64, entry: u64, slash: u64, sp: u64,
+    dash: u64, dir: u64) -> bool {
+    if !ulib.is_dir(p) {
+        if ulib.bad(ulib.sys(ulib.SYS_STAT, p, 0, 0)) {
+            return false
+        }
+        if long {
+            ulib.say(dash)
+            ulib.pad(ulib.sys(ulib.SYS_STAT, p, 0, 0), 9)
+            ulib.say(sp)
+        }
+        ulib.say(p)
+        if !long {
+            ulib.say(sp)
+        }
+        ulib.nl()
+        return true
     }
     var i: u64 = 0
     var going: bool = true
     while going {
-        let kind: u64 = ulib.sys(ulib.SYS_LIST, p, i, (&entry[0]) as u64)
-        if (kind >> 63) != 0 {
-            if i == 0 {
-                ulib.say_line((&s_err[0]) as u64, kind)
-                return 1
-            }
+        let kind: u64 = ulib.sys(ulib.SYS_LIST, p, i, entry)
+        if ulib.bad(kind) {
             going = false
         } else {
-            ulib.say((&entry[8]) as u64)
-            if kind == 2 {
-                ulib.say((&s_slash[0]) as u64)
+            if long {
+                if kind == 2 {
+                    ulib.say(dir)
+                } else {
+                    ulib.say(dash)
+                }
+                join(full, p, entry + 8)
+                ulib.pad(size_of(full), 9)
+                ulib.say(sp)
+                ulib.say(entry + 8)
+                ulib.nl()
+            } else {
+                ulib.say(entry + 8)
+                if kind == 2 {
+                    ulib.say(slash)
+                }
+                ulib.say(sp)
             }
-            ulib.say((&s_sp[0]) as u64)
             i = i + 1
         }
     }
-    ulib.nl()
-    return i
+    if !long {
+        ulib.nl()
+    }
+    return true
+}
+
+fn size_of(full: u64) -> u64 {
+    let n: u64 = ulib.sys(ulib.SYS_STAT, full, 0, 0)
+    if ulib.bad(n) {
+        return 0
+    }
+    return n
+}
+
+// `dir` + `/` + `name`. Two slashes in a row are no mistake -- the path
+// walker skips them (`demos/kernel/fs.fi`).
+fn join(out: u64, dir: u64, name: u64) {
+    var sl: [u8; 2] = "/\0"
+    ulib.strcpy(out, dir)
+    ulib.strcat(out, (&sl[0 as usize]) as u64)
+    ulib.strcat(out, name)
 }
