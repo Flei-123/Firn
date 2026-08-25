@@ -76,6 +76,12 @@ parsing. **All three are closed.**
   The position is COMPUTED (token end minus data length minus 2 or 3,
   depending on whether a `>` closed it), not guessed.
 
+Round 54's own gap file `tools/html/gaps/known_gaps.dat` goes from
+**0 of 10** to **9 of 10** closed. The tenth is not a parser gap: it is a
+fragment case, and the driver of round 54 (`lib/browser/parse_main.fi`) has
+no field for the context element in its job format. One expectation in that
+file was corrected while doing it (see the README there).
+
 **`<template>`** — the 23rd insertion mode, the stack of template insertion
 modes, the content fragment (`Elem.content`), the redirection of the
 insertion point into the template contents, the template rule of foster
