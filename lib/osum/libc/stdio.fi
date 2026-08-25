@@ -1,0 +1,180 @@
+// lib/osum/libc/stdio.fi -- round K4: output that is not one call per
+// octet, and a line of input.
+//
+// `write` is a system call, and a system call is a trip through ring 0.
+// A program that prints a number digit by digit pays for every digit;
+// round K1's `/bin/ls` did exactly that, and the whole shell of round 62
+// consisted of little else. So this is the buffer C calls `stdout`:
+// everything lands in it, and it goes out when it is full, when a line
+// ends, or when somebody says so.
+//
+// THE TRAP THAT COMES WITH IT, written down because it is the classic one:
+// a buffer that is not empty when `fork` runs is COPIED, and both
+// processes print it. `proc.split` in this library flushes before it
+// forks, and `exit` flushes before it leaves. A program that calls the
+// system call itself has to think of it.
+//
+// The buffer is not a `static` array: firnc1 compiles a `static` array and
+// reads out of it, but it cannot take its ADDRESS, and a `write` needs
+// one. So the buffer is the first thing this libc allocates -- out of its
+// own heap, which is the honest answer anyway.
+
+import osum.libc.syscall
+import osum.libc.errno
+import osum.libc.io
+import osum.libc.mem
+import osum.libc.text
+
+export {
+    put, say, say_bytes, say_num, say_uint, line, nl, flush, to,
+    complain, complain_num, read_line, buffered
+}
+
+const CAP: u64 = 512
+
+static mut place: u64 = 0 // the buffer, 0 = not there yet
+static mut used: u64 = 0
+static mut fd: u64 = 1 // where it goes
+
+// The buffer, made on first use. When there is no memory at all the whole
+// thing falls back to one call per piece -- printing has to work even when
+// allocating does not, otherwise a program cannot say why it failed.
+fn ready() -> bool {
+    if place != 0 {
+        return true
+    }
+    let p: u64 = mem.alloc(CAP)
+    if p == 0 {
+        return false
+    }
+    place = p
+    used = 0
+    return true
+}
+
+// Which descriptor the buffer goes to. `to(2)` makes the next output an
+// error message; what was already in the buffer goes out first.
+fn to(target: u64) {
+    flush()
+    fd = target
+}
+
+fn buffered() -> u64 {
+    return used
+}
+
+fn flush() {
+    if place == 0 || used == 0 {
+        used = 0
+        return
+    }
+    io.write_all(fd, place, used)
+    used = 0
+}
+
+fn put(c: u64) {
+    if !ready() {
+        var one: [u8; 1] = [0 as u8; 1]
+        one[0] = c as u8
+        io.write(fd, (&one[0]) as u64, 1)
+        return
+    }
+    __mmio_write8((place + used) as *mut u8, c as u8)
+    used = used + 1
+    if used >= CAP {
+        flush()
+    }
+    if c == 10 {
+        flush() // a line that is written stays written
+    }
+}
+
+fn say_bytes(p: u64, n: u64) {
+    var i: u64 = 0
+    while i < n {
+        put((*((p + i) as *mut u8)) as u64)
+        i = i + 1
+    }
+}
+
+fn say(p: u64) {
+    say_bytes(p, text.length(p))
+}
+
+fn nl() {
+    put(10)
+}
+
+// A number that may be a result of a system call: the top bit is a minus.
+fn say_num(v: u64) {
+    var buf: [u8; 26] = [0 as u8; 26]
+    let n: u64 = text.digits(v, (&buf[0]) as u64, true)
+    say_bytes((&buf[0]) as u64, n)
+}
+
+// A number that is a number: no sign, whatever the top bit says.
+fn say_uint(v: u64) {
+    var buf: [u8; 26] = [0 as u8; 26]
+    let n: u64 = text.digits(v, (&buf[0]) as u64, false)
+    say_bytes((&buf[0]) as u64, n)
+}
+
+fn line(p: u64, v: u64) {
+    say(p)
+    say_num(v)
+    nl()
+}
+
+// Straight to descriptor 2, past the buffer. An error message that waits
+// in a buffer is an error message that a crash swallows.
+fn complain(p: u64) {
+    flush()
+    io.write_text(syscall.ERR, p)
+}
+
+fn complain_num(p: u64, v: u64) {
+    var buf: [u8; 26] = [0 as u8; 26]
+    flush()
+    io.write_text(syscall.ERR, p)
+    let n: u64 = text.digits(v, (&buf[0]) as u64, true)
+    io.write_all(syscall.ERR, (&buf[0]) as u64, n)
+    var end: [u8; 2] = "\n\0"
+    io.write_text(syscall.ERR, (&end[0]) as u64)
+}
+
+// A LINE FROM DESCRIPTOR 0, ended by a zero and without the newline.
+// Returns how many octets it is, 0 at the end of the input, -1 on an
+// error. The console of Osum hands out one line per `read`, so this is one
+// call in the normal case -- but it does not RELY on that, because a pipe
+// does not do it and a file certainly does not.
+fn read_line(buf: u64, max: u64) -> u64 {
+    if max == 0 {
+        return 0
+    }
+    flush() // whatever asked the question should be visible first
+    var n: u64 = 0
+    var going: bool = true
+    while going {
+        if n + 1 >= max {
+            going = false
+        } else {
+            var one: [u8; 1] = [0 as u8; 1]
+            let r: u64 = io.read(syscall.IN, (&one[0]) as u64, 1)
+            if errno.failed(r) {
+                return r
+            }
+            if r == 0 {
+                going = false
+            } else {
+                if one[0] == 10 as u8 {
+                    going = false
+                } else {
+                    __mmio_write8((buf + n) as *mut u8, one[0])
+                    n = n + 1
+                }
+            }
+        }
+    }
+    __mmio_write8((buf + n) as *mut u8, 0 as u8)
+    return n
+}

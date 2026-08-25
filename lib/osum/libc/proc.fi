@@ -1,0 +1,147 @@
+// lib/osum/libc/proc.fi -- round K4: processes.
+//
+// `fork` is the call this round exists for, and it is worth saying plainly
+// what it does, because it is the one call in Unix that returns twice:
+//
+//     let who: u64 = proc.split()
+//     if who == 0 { ... this is the CHILD ... }
+//     else        { ... this is the parent, `who` is the child's pid ... }
+//
+// Both processes go on at the same instruction with the same memory --
+// the child has a COPY of every page (`proc.copy_space` in the kernel, no
+// copy-on-write, 4096 octets per page). What the child then usually does
+// is `enter`, which replaces its image with a program off the disk; that
+// pair, `fork` + `execve`, is how every Unix has started a program since
+// 1975, and `run` below is the two of them plus the wait.
+//
+// The other way is still there and is cheaper: `spawn_file` is ONE call
+// (`SYS_OSUM_EXEC`, round K1) that builds the new process directly. It
+// cannot do what `fork` can -- redirect a descriptor between the split and
+// the program -- and that is exactly what `run_with_output` uses `fork`
+// for.
+
+import osum.libc.syscall
+import osum.libc.errno
+import osum.libc.stdio
+
+export {
+    pid, parent, split, enter, wait_for, wait_code, run, run_to_file,
+    leave, sleep, give_way, spawn_program, spawn_file, exit_code_of
+}
+
+fn pid() -> u64 {
+    return syscall.sys0(syscall.SYS_GETPID)
+}
+
+fn parent() -> u64 {
+    return syscall.sys0(syscall.SYS_GETPPID)
+}
+
+// `fork`. 0 in the child, the child's pid in the parent, -1 on failure.
+// The buffer goes out FIRST: what is still in it would otherwise be
+// printed twice, once by each process.
+fn split() -> u64 {
+    stdio.flush()
+    return errno.check(syscall.sys0(syscall.SYS_FORK))
+}
+
+// `execve`. Comes back only when it FAILED -- on success there is nothing
+// left to come back to, the image is gone.
+fn enter(path: u64, argv: u64) -> u64 {
+    stdio.flush()
+    return errno.check(syscall.sys3(syscall.SYS_EXECVE, path, argv, 0))
+}
+
+// `wait4`. Returns the pid that ended and writes the STATUS (four octets)
+// where `status` points, or -1. `status` may be 0.
+fn wait_for(who: u64, status: u64) -> u64 {
+    return errno.check(syscall.sys4(syscall.SYS_WAIT4, who, status, 0, 0))
+}
+
+// The exit code out of a status word: POSIX puts it in bits 8..15.
+fn exit_code_of(status: u64) -> u64 {
+    return (status >> 8) & 255
+}
+
+// Waits and hands back the CODE the child left with. -1 when there is no
+// such child.
+fn wait_code(who: u64) -> u64 {
+    var status: [u64; 1] = [0 as u64; 1]
+    let r: u64 = wait_for(who, (&status[0]) as u64)
+    if errno.failed(r) {
+        return r
+    }
+    return exit_code_of(status[0])
+}
+
+// THE THREE OF THEM TOGETHER: fork, execve, wait -- `system()` without a
+// shell in the middle. Returns the exit code of the program, or -1.
+fn run(path: u64, argv: u64) -> u64 {
+    let who: u64 = split()
+    if errno.failed(who) {
+        return who
+    }
+    if who == 0 {
+        enter(path, argv)
+        // Still here: the image did not load. The child must not return
+        // into the caller's code -- it IS the caller's code.
+        leave(127)
+    }
+    return wait_code(who)
+}
+
+// The same, with the output of the program pointed at a descriptor. This
+// is what `fork` is FOR: between the split and the image the child is
+// still ours, and what it changes about itself is what the new program
+// finds. A `posix_spawn` cannot do it.
+fn run_to_file(path: u64, argv: u64, target: u64) -> u64 {
+    let who: u64 = split()
+    if errno.failed(who) {
+        return who
+    }
+    if who == 0 {
+        syscall.sys2(syscall.SYS_DUP2, target, syscall.OUT)
+        syscall.sys1(syscall.SYS_CLOSE, target)
+        enter(path, argv)
+        leave(127)
+    }
+    return wait_code(who)
+}
+
+// `exit`. The buffer goes out first -- a program whose last line is still
+// in a buffer has not printed it.
+fn leave(code: u64) {
+    stdio.flush()
+    syscall.sys1(syscall.SYS_EXIT, code)
+    // Not reached. `exit` does not come back.
+    while true {
+    }
+}
+
+// Seconds and milliseconds. More than sixty seconds is refused by the
+// kernel on purpose (`demos/kernel/sys.fi`, `do_nanosleep`).
+fn sleep(sec: u64, ms: u64) -> u64 {
+    var ts: [u64; 2] = [0 as u64; 2]
+    ts[0] = sec
+    ts[1] = ms * 1000000
+    return errno.check(syscall.sys2(syscall.SYS_NANOSLEEP,
+            (&ts[0]) as u64, 0))
+}
+
+fn give_way() {
+    syscall.sys0(syscall.SYS_YIELD)
+}
+
+// The two Osum calls. `spawn_program` starts one of the programs that
+// travel in the kernel image (there is no file behind them), `spawn_file`
+// is round K1's one-call start of a program off the disk.
+fn spawn_program(which: u64, argument: u64) -> u64 {
+    return errno.check(syscall.sys2(syscall.SYS_OSUM_SPAWN, which,
+            argument))
+}
+
+fn spawn_file(path: u64, argv: u64, argc: u64) -> u64 {
+    stdio.flush()
+    return errno.check(syscall.sys3(syscall.SYS_OSUM_EXEC, path, argv,
+            argc))
+}
