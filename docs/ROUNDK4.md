@@ -71,7 +71,7 @@ has to write and keep right.
 | 59 | `execve(path, argv, envp)` | the caller becomes the program |
 | 60 | `exit(code)` | |
 | 61 | `wait4(pid, status, opts, ru)` | returns the pid, status POSIX-shaped |
-| 79 | `getcwd(buf, size)` | always `/`, see the gaps |
+| 79 | `getcwd(buf, size)` | the real path since round K6 landed on top of this layer |
 | 83 | `mkdir(path, mode)` | |
 | 87 | `unlink(path)` | a directory gives -EISDIR |
 | 110 | `getppid()` | |
@@ -190,7 +190,10 @@ Nothing here is an oversight; the oversights are in section 7.
 3. **`munmap` gives the pages back but not the address space.** The bump
    pointer does not move back; a hole in the middle of a bump allocator is
    a free list, and that is the libc's business.
-4. **`getcwd` always answers `/`.** There is no working directory yet (see
+4. **`getcwd` always answers `/`.** ROUND K6 CLOSED THIS: there is a
+   working directory now, `chdir` is 80, and `getcwd` prints the path
+   (`demos/kernel/uio.fi`). The paragraph is kept because the rest of it
+   is still what this round decided. -- There is no working directory yet (see
    the gaps) and the honest answer is the root, not a lie.
 5. **`wait4` ignores `rusage`** and understands only `WNOHANG` of the
    options. `WUNTRACED` and friends need job control, which needs signals.
@@ -219,7 +222,10 @@ Nothing here is an oversight; the oversights are in section 7.
 
 ## 7. What is still missing — the honest list
 
-* **No working directory.** Every path is absolute; `chdir` does not
+* **No working directory.** CLOSED BY ROUND K6 -- `chdir` is 80,
+  `getcwd` answers with the real path, and a relative name is completed
+  before the file system sees it (`sys.fetch_path`). What follows is what
+  this round left behind: every path is absolute; `chdir` does not
   exist and `getcwd` answers `/`. The task record has had a `T_CWD` field
   since round 62 and nothing writes it.
 * **No signals.** No `kill`, no handlers, no job control, and therefore no
