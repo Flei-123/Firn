@@ -1276,6 +1276,8 @@ if [ "$K3RC" -eq 0 ]; then
 else
     bad "tools/k3net/run.sh failed (see .test-work/k3net.log)"
     grep -E '^  FAIL' "$WORK/k3net.log" | head -12 | sed 's/^/   /'
+fi
+
 echo "== 54. the Unicode table out of the UCD and the endurance run of the collector (ROUND 95) =="
 # ACCEPTANCE items 6 and 2.
 #
@@ -1314,6 +1316,8 @@ if [ "$UCDRC" -eq 0 ] && [ "$SOAKRC" -eq 0 ]; then
 else
     bad "round 95 failed (ucd $UCDRC, soak $SOAKRC -- see .test-work/ucd_build.log, .test-work/gc_soak.log)"
     grep -E 'FAILED|ERROR|error' "$WORK/ucd_build.log" "$WORK/ucd_verify.log" "$WORK/gc_soak.log" 2>/dev/null | head -10 | sed 's/^/   /'
+fi
+
 echo "== 56. the POSIX system call layer and the libc (tools/posix/run.sh, ROUND K4) =="
 # Stage 1 of the plan: the kernel had seventeen calls of its own invention
 # and a program written for Unix could not use one of them. Now there are
@@ -1329,6 +1333,8 @@ if [ "$PXRC" -eq 0 ]; then
 else
     bad "tools/posix/run.sh failed (see .test-work/posix.log)"
     grep -aE '^  FAIL' "$WORK/posix.log" | head -12 | sed 's/^/   /'
+fi
+
 echo "== 57. four processors, and the lock that makes them one kernel (tools/smp/run.sh, ROUND K5) =="
 # The kernel starts the other cores out of the ACPI MADT, gives each one a
 # stack, a descriptor table and a local APIC of its own, and puts a spin
@@ -1346,6 +1352,8 @@ if [ "$SMPRC" -eq 0 ]; then
 else
     bad "tools/smp/run.sh failed (see .test-work/smp.log)"
     grep -E '^  FAIL' "$WORK/smp.log" | head -12 | sed 's/^/   /'
+fi
+
 echo "== 59. the official html5lib tests, the DOM and the style tree (tools/domb1/run.sh, ROUND B1) =="
 # The number 59 is fixed for this round; 53 to 58 belong to the rounds that
 # were running next to it.
