@@ -329,90 +329,104 @@ PYEOF
     fi
 
     # --- 3f. tc netem, both directions --------------------------------
-    L tc qdisc add dev "$LIF" root netem loss 5% >/dev/null 2>&1
-    F sink 4711 $((LOSSKB * 1024)) 60 > "$W/lossin.out" 2>&1 &
+    #
+    # `netem` gets read back rather than trusted: the number of frames it
+    # threw away is its own counter, and a run in which it dropped nothing
+    # proves nothing about retransmission. Ten per cent over ~190 frames
+    # makes "it dropped none" a one-in-a-billion event; the counter is
+    # printed either way, so a reader can see which it was.
+    netem_drops() { # namespace interface
+        ip netns exec "$1" tc -s qdisc show dev "$2" 2>/dev/null \
+            | tr ',' ' ' | awk '/dropped/{for(i=1;i<=NF;i++) if($i=="dropped"){print $(i+1)+0; exit}}'
+    }
+    head -c $((LOSSKB * 1024)) "$W/in.bin" > "$W/small.bin"
+
+    if ! L tc qdisc add dev "$LIF" root netem loss 10% 2>"$W/tc1.err"; then
+        echo "  (tc netem is not available: $(head -1 "$W/tc1.err") -- the loss measurement is skipped)"
+    else
+        F sink 4711 $((LOSSKB * 1024)) 60 > "$W/lossin.out" 2>&1 &
+        DRV=$!
+        sleep 0.7
+        L timeout 60 nc -q 3 "$FIP" 4711 < "$W/small.bin" > /dev/null 2>&1
+        wait $DRV 2>/dev/null
+        LRC=$?
+        DIN=$(netem_drops "$LNS" "$LIF")
+        L tc qdisc del dev "$LIF" root >/dev/null 2>&1
+        n=$(val "$W/lossin.out" octets)
+        ooo=$(val "$W/lossin.out" out_of_order)
+        if [ "$LRC" -eq 0 ] && [ "${n:-0}" = "$((LOSSKB * 1024))" ] && [ "${DIN:-0}" -gt 0 ] && [ "${ooo:-0}" -gt 0 ]; then
+            ok "10 % of the frames from Linux dropped: all $LOSSKB KiB arrive, in order"
+            num "netem threw away ${DIN:-0} frames, out-of-order segments reassembled: $ooo"
+        else
+            bad "netem in: ${n:-0} of $((LOSSKB * 1024)) octets, netem dropped ${DIN:-0}, out of order ${ooo:-0}"
+            sed 's/^/        /' "$W/lossin.out"
+        fi
+
+        ip netns exec "$FNS" tc qdisc add dev "$FIF" root netem loss 10% >/dev/null 2>&1
+        L python3 "$W/echo_srv.py" "$LIP" 9001 tcp > "$W/py2.out" 2>&1 &
+        PY=$!
+        sleep 0.9
+        F send "$LIP" 9001 $((LOSSKB * 1024)) 50 > "$W/lossout.out" 2>&1
+        ORC=$?
+        wait $PY 2>/dev/null
+        DOUT=$(netem_drops "$FNS" "$FIF")
+        b=$(val "$W/lossout.out" echoed_back)
+        wr=$(val "$W/lossout.out" wrong_octets)
+        rex=$(val "$W/lossout.out" rexmit)
+        frex=$(val "$W/lossout.out" fast_rexmit)
+        tot=$(( ${rex:-0} + ${frex:-0} ))
+        if [ "$ORC" -eq 0 ] && [ "${wr:-1}" = 0 ] && [ "${b:-0}" = "$((LOSSKB * 1024))" ] && [ "$tot" -gt 0 ]; then
+            ok "10 % of OUR frames dropped: the stack sends them again and everything arrives"
+            num "netem threw away ${DOUT:-0} frames; retransmissions: $rex on the timer, $frex on three duplicate acknowledgements"
+        else
+            bad "netem out: back ${b:-0} of $((LOSSKB * 1024)), wrong ${wr:-?}, netem dropped ${DOUT:-0}, retransmissions $tot"
+            sed 's/^/        /' "$W/lossout.out" "$W/py2.out" 2>/dev/null | head -12
+        fi
+
+        # THE COUNTER-CHECK, and it is the sharpest one in this file: the
+        # very same run with retransmission switched off HAS to fail.
+        L python3 "$W/echo_srv.py" "$LIP" 9002 tcp > "$W/py3.out" 2>&1 &
+        PY=$!
+        sleep 0.9
+        F send "$LIP" 9002 $((LOSSKB * 1024)) 12 norexmit > "$W/norex.out" 2>&1
+        NRC=$?
+        wait $PY 2>/dev/null
+        ip netns exec "$FNS" tc qdisc del dev "$FIF" root >/dev/null 2>&1
+        nb=$(val "$W/norex.out" echoed_back)
+        if [ "$NRC" -ne 0 ] && [ "${nb:-0}" -lt "$((LOSSKB * 1024))" ]; then
+            ok "COUNTER-CHECK: without retransmission only ${nb:-0} of $((LOSSKB * 1024)) octets arrive"
+        else
+            bad "the counter-check does NOT strike: ${nb:-0} octets came through WITHOUT retransmission -- then the test above measured nothing"
+            sed 's/^/        /' "$W/norex.out"
+        fi
+    fi
+
+    # --- 3g. UDP there and back against a python socket ---------------
+    F udpecho 53 6 > "$W/udp.out" 2>&1 &
     DRV=$!
     sleep 0.7
-    head -c $((LOSSKB * 1024)) "$W/in.bin" > "$W/small.bin"
-    L timeout 60 nc -q 3 "$FIP" 4711 < "$W/small.bin" > /dev/null 2>&1
-    wait $DRV 2>/dev/null
-    LRC=$?
-    L tc qdisc del dev "$LIF" root >/dev/null 2>&1
-    n=$(val "$W/lossin.out" octets)
-    ooo=$(val "$W/lossin.out" out_of_order)
-    if [ "$LRC" -eq 0 ] && [ "${n:-0}" = "$((LOSSKB * 1024))" ] && [ "${ooo:-0}" -gt 0 ]; then
-        ok "5 % of the frames from Linux dropped: all $LOSSKB KiB arrive, in order"
-        num "out-of-order segments reassembled: $ooo"
-    else
-        bad "netem in: ${n:-0} of $((LOSSKB * 1024)) octets, out of order ${ooo:-0}"
-        sed 's/^/        /' "$W/lossin.out"
-    fi
-
-    ip netns exec "$FNS" tc qdisc add dev "$FIF" root netem loss 5% >/dev/null 2>&1
-    L python3 "$W/echo_srv.py" "$LIP" 9001 tcp > "$W/py2.out" 2>&1 &
-    PY=$!
-    sleep 0.9
-    F send "$LIP" 9001 $((LOSSKB * 1024)) 40 > "$W/lossout.out" 2>&1
-    ORC=$?
-    wait $PY 2>/dev/null
-    b=$(val "$W/lossout.out" echoed_back)
-    wr=$(val "$W/lossout.out" wrong_octets)
-    rex=$(val "$W/lossout.out" rexmit)
-    frex=$(val "$W/lossout.out" fast_rexmit)
-    tot=$(( ${rex:-0} + ${frex:-0} ))
-    if [ "$ORC" -eq 0 ] && [ "${wr:-1}" = 0 ] && [ "${b:-0}" = "$((LOSSKB * 1024))" ] && [ "$tot" -gt 0 ]; then
-        ok "5 % of OUR frames dropped: the stack sends them again and everything arrives"
-        num "retransmissions: $rex on the timer, $frex on three duplicate acknowledgements"
-    else
-        bad "netem out: back ${b:-0} of $((LOSSKB * 1024)), wrong ${wr:-?}, retransmissions $tot"
-        sed 's/^/        /' "$W/lossout.out" "$W/py2.out" 2>/dev/null | head -12
-    fi
-
-    # THE COUNTER-CHECK, and it is the sharpest one in this file: the very
-    # same run with retransmission switched off HAS to fail.
-    L python3 "$W/echo_srv.py" "$LIP" 9002 tcp > "$W/py3.out" 2>&1 &
-    PY=$!
-    sleep 0.9
-    F send "$LIP" 9002 $((LOSSKB * 1024)) 30 norexmit > "$W/norex.out" 2>&1
-    NRC=$?
-    wait $PY 2>/dev/null
-    ip netns exec "$FNS" tc qdisc del dev "$FIF" root >/dev/null 2>&1
-    nb=$(val "$W/norex.out" echoed_back)
-    if [ "$NRC" -ne 0 ] && [ "${nb:-0}" -lt "$((LOSSKB * 1024))" ]; then
-        ok "COUNTER-CHECK: without retransmission only ${nb:-0} of $((LOSSKB * 1024)) octets arrive"
-    else
-        bad "the counter-check does NOT strike: ${nb:-0} octets came through WITHOUT retransmission -- then the test above measured nothing"
-        sed 's/^/        /' "$W/norex.out"
-    fi
-
-    # --- 3g. UDP -------------------------------------------------------
-    L python3 "$W/echo_srv.py" "$LIP" 9100 udp > "$W/py4.out" 2>&1 &
-    PY=$!
-    sleep 0.9
-    # The idle mode answers ARP and ICMP; a UDP datagram is sent from the
-    # Linux side and the counter in the stack has to see it.
-    F idle 4 > "$W/udp.out" 2>&1 &
-    DRV=$!
-    sleep 0.5
     L python3 -c "
-import socket
+import socket, hashlib
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.settimeout(2)
-s.sendto(b'x' * 512, ('$FIP', 53))
-" >/dev/null 2>&1
+s.settimeout(4)
+payload = bytes((i * 37 + 11) & 255 for i in range(1400))
+s.sendto(payload, ('$FIP', 53))
+try:
+    d, a = s.recvfrom(4096)
+    print('udp_back', len(d), 'reversed_ok', int(d == payload[::-1]), 'from', a[0])
+except Exception as e:
+    print('udp_back 0 reversed_ok 0 err', e)
+" > "$W/udpcli.out" 2>&1
     wait $DRV 2>/dev/null
-    kill $PY 2>/dev/null
-    uin=$(val "$W/udp.out" udp_in)
-    # `idle` binds no port, so the datagram is counted as an IPv4 datagram
-    # that reached the UDP layer and found no socket -- which is exactly
-    # what a stack without a listener has to do: nothing, and not crash.
-    fin=$(val "$W/udp.out" frames_in)
-    if [ "${fin:-0}" -ge 1 ]; then
-        ok "a UDP datagram from Linux reaches the stack and is dropped without a listener"
-        num "frames in $fin, udp delivered $uin"
+    ub=$(awk '/^udp_back/{print $2}' "$W/udpcli.out")
+    ur=$(awk '/^udp_back/{print $4}' "$W/udpcli.out")
+    ua=$(val "$W/udp.out" udp_answered)
+    if [ "${ub:-0}" = 1400 ] && [ "${ur:-0}" = 1 ] && [ "${ua:-0}" -ge 1 ]; then
+        ok "UDP: 1400 octets to the Firn stack and back, reversed, checksums intact"
+        num "$(cat "$W/udpcli.out"), datagrams seen $(val "$W/udp.out" udp_datagrams)"
     else
-        bad "UDP: nothing arrived"
-        sed 's/^/        /' "$W/udp.out"
+        bad "UDP: ${ub:-0} octets back, reversed ${ur:-0}"
+        sed 's/^/        /' "$W/udp.out" "$W/udpcli.out" 2>/dev/null | head -8
     fi
 
     # --- 3h. a port nobody listens on ----------------------------------
