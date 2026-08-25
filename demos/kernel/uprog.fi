@@ -29,21 +29,32 @@ export { u_enter }
 
 // The system call numbers, see sys.fi. 1 and 2 belong to the excursion of
 // round 59 and stay what they were.
-const SYS_EXIT: u64 = 10
-const SYS_WRITE: u64 = 11
-const SYS_READ: u64 = 12
-const SYS_GETPID: u64 = 13
-const SYS_SLEEP: u64 = 14
-const SYS_SPAWN: u64 = 15
-const SYS_WAIT: u64 = 16
-const SYS_OPEN: u64 = 17
-const SYS_CLOSE: u64 = 18
-const SYS_UNLINK: u64 = 19
-const SYS_LIST: u64 = 20
-const SYS_MKDIR: u64 = 21
-const SYS_YIELD: u64 = 22
-const SYS_STAT: u64 = 23
-const SYS_GETPPID: u64 = 24
+// ROUND K4: the numbers of Linux x86-64 (`demos/kernel/sys.fi`). What
+// round 62 called 11 is 1 now, and what it called 20 does not exist any
+// more -- a directory is read with `getdents64` out of a descriptor, the
+// way every Unix has read one since 1986.
+const SYS_READ: u64 = 0
+const SYS_WRITE: u64 = 1
+const SYS_OPEN: u64 = 2
+const SYS_CLOSE: u64 = 3
+const SYS_GETDENTS64: u64 = 217
+const SYS_MKDIR: u64 = 83
+const SYS_UNLINK: u64 = 87
+const SYS_GETPID: u64 = 39
+const SYS_GETPPID: u64 = 110
+const SYS_YIELD: u64 = 24
+const SYS_NANOSLEEP: u64 = 35
+const SYS_WAIT4: u64 = 61
+const SYS_EXIT: u64 = 60
+// The two Osum has of its own: a program that travels in the kernel image
+// has no file, so no `execve` can start it.
+const SYS_SPAWN: u64 = 1000
+
+const O_WRONLY: u64 = 1
+const O_CREAT: u64 = 64
+const O_DIRECTORY: u64 = 65536
+
+const DT_DIR: u64 = 4
 
 const OUT: u64 = 1 // the console
 
@@ -138,6 +149,17 @@ fn u_say_num(v: u64) {
     u_sys(SYS_WRITE, OUT, (&buf[0]) as u64, at)
 }
 
+// `nanosleep` takes a `struct timespec`: eight octets of seconds, eight of
+// nanoseconds. Everything in this file used to say milliseconds, so this
+// is the one place that converts -- and the one place that can hand the
+// kernel an absurd number on purpose (`u_badptr`).
+fn u_sleep(sec: u64, ms: u64) -> u64 {
+    var ts: [u64; 2] = [0 as u64; 2]
+    ts[0] = sec
+    ts[1] = ms * 1000000
+    return u_sys(SYS_NANOSLEEP, (&ts[0]) as u64, 0, 0)
+}
+
 fn u_say_line(p: u64, v: u64) {
     var nl: [u8; 2] = "\n\0"
     u_say(p)
@@ -211,7 +233,7 @@ fn u_memory(arg: u64) {
     let p: *mut u64 = USER_DATA as *mut u64
     __mmio_write64(p, arg)
     u_say_line((&s_wrote[0]) as u64, arg)
-    u_sys(SYS_SLEEP, 40, 0, 0) // 40 ms: let the other one write
+    u_sleep(0, 40) // 40 ms: let the other one write
     let back: u64 = __mmio_read64(p)
     u_say_line((&s_read[0]) as u64, back)
     var ok: u64 = 1
@@ -247,7 +269,7 @@ fn u_badptr(arg: u64) {
     u_say_line((&s2[0]) as u64, u_sys(SYS_WRITE, OUT, 0, 8))
     u_say_line((&s3[0]) as u64, u_sys(SYS_READ, 77, USER_DATA, 8))
     u_say_line((&s4[0]) as u64, u_sys(999, 0, 0, 0))
-    u_say_line((&s5[0]) as u64, u_sys(SYS_SLEEP, 1000000, 0, 0))
+    u_say_line((&s5[0]) as u64, u_sleep(1000, 0))
     u_sys(SYS_EXIT, 7, 0, 0)
 }
 
@@ -255,7 +277,7 @@ fn u_badptr(arg: u64) {
 fn u_child(arg: u64) {
     var s: [u8; 17] = "user: child arg=\0"
     u_say_line((&s[0]) as u64, arg)
-    u_sys(SYS_SLEEP, 20, 0, 0)
+    u_sleep(0, 20)
     u_sys(SYS_EXIT, 40 + arg, 0, 0)
 }
 
@@ -269,11 +291,26 @@ fn u_parent(arg: u64) {
     let b: u64 = u_sys(SYS_SPAWN, P_CHILD, 2, 0)
     u_say_line((&s_sp[0]) as u64, a)
     u_say_line((&s_sp[0]) as u64, b)
-    u_say_line((&s_w[0]) as u64, u_sys(SYS_WAIT, a, 0, 0))
-    u_say_line((&s_w[0]) as u64, u_sys(SYS_WAIT, b, 0, 0))
+    u_say_line((&s_w[0]) as u64, u_wait(a))
+    u_say_line((&s_w[0]) as u64, u_wait(b))
     // A child that is not one: the answer is an error, not a hang.
-    u_say_line((&s_bad[0]) as u64, u_sys(SYS_WAIT, 999, 0, 0))
+    u_say_line((&s_bad[0]) as u64, u_wait(999))
     u_sys(SYS_EXIT, 3, 0, 0)
+}
+
+// ROUND K4. `wait4` hands back the PID and writes a STATUS, the way Linux
+// does -- round 62's `wait` returned the exit code itself, and a caller
+// could not tell -1 from a child that left with 255. The code sits in bits
+// 8..15 of the status; what this function returns is what the old one
+// returned, so that the measurements of round 62 go on measuring the same
+// thing.
+fn u_wait(pid: u64) -> u64 {
+    var status: [u64; 1] = [0 as u64; 1]
+    let r: u64 = u_sys(SYS_WAIT4, pid, (&status[0]) as u64, 0)
+    if (r >> 63) != 0 {
+        return r
+    }
+    return (status[0] >> 8) & 255
 }
 
 // The last counter-check of point 2: an address that lies in the private
@@ -298,7 +335,7 @@ fn u_fork(arg: u64) {
     __mmio_write64(p, 12345)
     u_say_line((&s_wrote[0]) as u64, 12345)
     let pid: u64 = u_sys(SYS_SPAWN, P_FORKCHILD, 0, 0)
-    let code: u64 = u_sys(SYS_WAIT, pid, 0, 0)
+    let code: u64 = u_wait(pid)
     u_say_line((&s_code[0]) as u64, code)
     let mine: u64 = __mmio_read64(p)
     u_say_line((&s_still[0]) as u64, mine)
@@ -444,10 +481,17 @@ fn u_shell(arg: u64) {
     u_sys(SYS_EXIT, commands, 0, 0)
 }
 
-// `ls [path]` -- every entry of a directory, with `SYS_LIST`.
+// `ls [path]` -- every entry of a directory. ROUND K4: a directory is
+// OPENED and read with `getdents64`, entry after entry, out of a buffer
+// that holds as many records as fit. The record is Linux's:
+//
+//     +0 d_ino  +8 d_off  +16 d_reclen  +18 d_type  +19 the name
+//
+// `d_reclen` is what walks the buffer -- a reader that counted on a fixed
+// size would be wrong at the first long name.
 fn u_ls(line: u64, at: u64) {
     var path: [u8; 64] = [0 as u8; 64]
-    var entry: [u8; 32] = [0 as u8; 32]
+    var buf: [u8; 512] = [0 as u8; 512]
     var s_slash: [u8; 2] = "/\0"
     var s_sp: [u8; 2] = " \0"
     var s_nl: [u8; 2] = "\n\0"
@@ -457,26 +501,32 @@ fn u_ls(line: u64, at: u64) {
         path[0] = 47 as u8
         path[1] = 0 as u8
     }
-    var i: u64 = 0
+    let fd: u64 = u_sys(SYS_OPEN, (&path[0]) as u64, O_DIRECTORY, 0)
+    if (fd >> 63) != 0 {
+        u_say_line((&s_err[0]) as u64, fd)
+        return
+    }
     var going: bool = true
     while going {
-        let kind: u64 = u_sys(SYS_LIST, (&path[0]) as u64, i,
-            (&entry[0]) as u64)
-        if (kind >> 63) != 0 {
-            if i == 0 {
-                u_say_line((&s_err[0]) as u64, kind)
-                return
-            }
+        let n: u64 = u_sys(SYS_GETDENTS64, fd, (&buf[0]) as u64, 512)
+        if n == 0 || (n >> 63) != 0 {
             going = false
         } else {
-            u_say((&entry[8]) as u64)
-            if kind == 2 {
-                u_say((&s_slash[0]) as u64)
+            var seen: u64 = 0
+            while seen < n {
+                let rec: u64 = ((&buf[0]) as u64) + seen
+                let reclen: u64 = __mmio_read16((rec + 16) as *mut u16) as u64
+                let kind: u64 = __mmio_read8((rec + 18) as *mut u8) as u64
+                u_say(rec + 19)
+                if kind == DT_DIR {
+                    u_say((&s_slash[0]) as u64)
+                }
+                u_say((&s_sp[0]) as u64)
+                seen = seen + reclen
             }
-            u_say((&s_sp[0]) as u64)
-            i = i + 1
         }
     }
+    u_sys(SYS_CLOSE, fd, 0, 0)
     u_say((&s_nl[0]) as u64)
 }
 
@@ -525,7 +575,7 @@ fn u_write_file(line: u64, at: u64) {
     while *((line + i) as *mut u8) == 32 as u8 {
         i = i + 1
     }
-    let fd: u64 = u_sys(SYS_OPEN, (&path[0]) as u64, 1, 0)
+    let fd: u64 = u_sys(SYS_OPEN, (&path[0]) as u64, O_CREAT | O_WRONLY, 0)
     if (fd >> 63) != 0 {
         u_say_line((&s_err[0]) as u64, fd)
         return
