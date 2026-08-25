@@ -1,0 +1,466 @@
+// demos/kernel/user/posix.fi -- round K4: the program that measures the
+// system call table.
+//
+// Every other program on this disk exists to DO something. This one exists
+// to be measured: it makes every call the kernel has, prints the answer as
+// a line of the shape
+//
+//     posix: <name> = <number>
+//
+// and `tools/posix/run.sh` reads those lines back. That is the whole
+// design, and it has one rule behind it: EVERY CALL IS MEASURED WITH ITS
+// ERRORS. A `read` that works proves that `read` works on a good day; a
+// `read` on descriptor 77, on a directory and into a pointer that is not
+// the caller's proves that the kernel knows what it is doing on the other
+// days -- and those are the days a bug lives on.
+//
+// The error cases go through `ulib.sys` and NOT through the libc: the libc
+// turns a negative answer into -1 and an errno, which is what a program
+// wants and exactly not what a test wants. What is measured here is the
+// number the kernel really returned.
+//
+// The exit code is the number of lines it printed, so that even a run in
+// which the serial output is lost has one number left over.
+
+profile kernel
+
+import ulib
+import osum.libc.kcall
+import osum.libc.errno
+import osum.libc.io
+import osum.libc.mem
+import osum.libc.stdio
+import osum.libc.text
+import osum.libc.proc
+
+export { u_start }
+
+static mut lines: u64 = 0
+
+// One measurement. The name, the value, and a newline -- through the
+// BUFFERED output of the libc, which is itself one of the things under
+// test: nothing appears twice, nothing is lost, and the order is the order
+// the program wrote in.
+fn tell(name: u64, v: u64) {
+    var head: [u8; 8] = "posix: \0"
+    var mid: [u8; 4] = " = \0"
+    stdio.say((&head[0]) as u64)
+    stdio.say(name)
+    stdio.say((&mid[0]) as u64)
+    stdio.say_num(v)
+    stdio.nl()
+    lines = lines + 1
+}
+
+fn u_start(args: u64) -> u64 {
+    write_and_read()
+    seek_and_stat()
+    directories()
+    descriptors()
+    memory()
+    pipes()
+    children()
+    errors()
+    var done: [u8; 21] = "posix: lines = \0\0\0\0\0\0"
+    stdio.say((&done[0]) as u64)
+    stdio.say_uint(lines)
+    stdio.nl()
+    stdio.flush()
+    return lines
+}
+
+// ------------------------------------------- open, write, read, close
+
+fn write_and_read() {
+    var path: [u8; 11] = "/posix.txt\0"
+    var text_out: [u8; 12] = "abcdefghijk\0"
+    var buf: [u8; 32] = [0 as u8; 32]
+    var n_open: [u8; 5] = "open\0"
+    var n_write: [u8; 6] = "write\0"
+    var n_read: [u8; 5] = "read\0"
+    var n_close: [u8; 6] = "close\0"
+    var n_again: [u8; 11] = "read again\0"
+    var n_same: [u8; 5] = "same\0"
+
+    let fd: u64 = io.create((&path[0]) as u64)
+    tell((&n_open[0]) as u64, fd)
+    tell((&n_write[0]) as u64, io.write_all(fd, (&text_out[0]) as u64, 11))
+    tell((&n_close[0]) as u64, io.close(fd))
+
+    let rd: u64 = io.open((&path[0]) as u64, kcall.O_RDONLY)
+    tell((&n_read[0]) as u64, io.read(rd, (&buf[0]) as u64, 32))
+    // At the end of the file a `read` gives 0 -- the end, not an error.
+    tell((&n_again[0]) as u64, io.read(rd, (&buf[0]) as u64, 32))
+    var same: u64 = 0
+    if text.equal_n((&buf[0]) as u64, (&text_out[0]) as u64, 11) {
+        same = 1
+    }
+    tell((&n_same[0]) as u64, same)
+    io.close(rd)
+}
+
+// --------------------------------------------------- lseek, stat, fstat
+
+fn seek_and_stat() {
+    var path: [u8; 11] = "/posix.txt\0"
+    var one: [u8; 2] = [0 as u8; 2]
+    var n_seek: [u8; 5] = "seek\0"
+    var n_seekc: [u8; 9] = "seek cur\0"
+    var n_seeke: [u8; 9] = "seek end\0"
+    var n_char: [u8; 10] = "seek char\0"
+    var n_stat: [u8; 10] = "stat size\0"
+    var n_mode: [u8; 10] = "stat mode\0"
+    var n_fstat: [u8; 11] = "fstat size\0"
+    var n_dir: [u8; 9] = "stat dir\0"
+    var root: [u8; 2] = "/\0"
+
+    let fd: u64 = io.open((&path[0]) as u64, kcall.O_RDONLY)
+    tell((&n_seek[0]) as u64, io.seek(fd, 4, kcall.SEEK_SET))
+    io.read(fd, (&one[0]) as u64, 1)
+    tell((&n_char[0]) as u64, (one[0]) as u64) // 'e' = 101
+    tell((&n_seekc[0]) as u64, io.seek(fd, 2, kcall.SEEK_CUR))
+    tell((&n_seeke[0]) as u64, io.seek(fd, 0, kcall.SEEK_END))
+    tell((&n_fstat[0]) as u64, fstat_size(fd))
+    io.close(fd)
+
+    tell((&n_stat[0]) as u64, io.size_of((&path[0]) as u64))
+    let mode: u64 = io.stat_mode((&path[0]) as u64)
+    var kind: u64 = 0
+    if (mode & io.S_IFMT) == io.S_IFREG {
+        kind = 1
+    }
+    tell((&n_mode[0]) as u64, kind)
+    var isdir: u64 = 0
+    if io.is_dir_mode(io.stat_mode((&root[0]) as u64)) {
+        isdir = 1
+    }
+    tell((&n_dir[0]) as u64, isdir)
+}
+
+fn fstat_size(fd: u64) -> u64 {
+    var st: [u8; 144] = [0 as u8; 144]
+    let r: u64 = io.fstat_into(fd, (&st[0]) as u64)
+    if ulib.failed(r) {
+        return r
+    }
+    return io.stat_size((&st[0]) as u64)
+}
+
+// ------------------------------------------------- getdents64, mkdir
+
+fn directories() {
+    var root: [u8; 2] = "/\0"
+    var dir: [u8; 12] = "/posixdir\0\0\0"
+    var buf: [u8; 512] = [0 as u8; 512]
+    var n_mkdir: [u8; 6] = "mkdir\0"
+    var n_twice: [u8; 12] = "mkdir twice\0"
+    var n_ents: [u8; 8] = "entries\0"
+    var n_dot: [u8; 8] = "dot dir\0"
+    var n_found: [u8; 10] = "found dir\0"
+    var n_short: [u8; 12] = "dents short\0"
+    var name: [u8; 10] = "posixdir\0\0"
+
+    tell((&n_mkdir[0]) as u64, io.make_dir((&dir[0]) as u64))
+    tell((&n_twice[0]) as u64, ulib.sys(kcall.SYS_MKDIR,
+            (&dir[0]) as u64, 493, 0))
+
+    let fd: u64 = io.dir_open((&root[0]) as u64)
+    var count: u64 = 0
+    var dots: u64 = 0
+    var found: u64 = 0
+    var going: bool = true
+    while going {
+        let n: u64 = io.dir_read(fd, (&buf[0]) as u64, 512)
+        if n == 0 || ulib.failed(n) {
+            going = false
+        } else {
+            var at: u64 = 0
+            while at < n {
+                let rec: u64 = ((&buf[0]) as u64) + at
+                if io.dir_kind(rec) == io.DT_DIR {
+                    dots = dots + 1
+                }
+                if text.equal(io.dir_name(rec), (&name[0]) as u64) {
+                    found = 1
+                }
+                at = at + io.dir_reclen(rec)
+                count = count + 1
+            }
+        }
+    }
+    tell((&n_ents[0]) as u64, count)
+    tell((&n_dot[0]) as u64, dots)
+    tell((&n_found[0]) as u64, found)
+    io.close(fd)
+
+    // A buffer too short for even ONE record is -EINVAL. Not a short
+    // answer: a short answer would be indistinguishable from the end.
+    let fd2: u64 = io.dir_open((&root[0]) as u64)
+    tell((&n_short[0]) as u64, ulib.sys(kcall.SYS_GETDENTS64, fd2,
+            (&buf[0]) as u64, 8))
+    io.close(fd2)
+}
+
+// -------------------------------------------------------- dup and dup2
+
+fn descriptors() {
+    var path: [u8; 11] = "/posix.txt\0"
+    var buf: [u8; 8] = [0 as u8; 8]
+    var n_dup: [u8; 4] = "dup\0"
+    var n_shared: [u8; 14] = "dup positions\0"
+    var n_dup2: [u8; 5] = "dup2\0"
+    var n_closed: [u8; 11] = "dup2 close\0"
+
+    let fd: u64 = io.open((&path[0]) as u64, kcall.O_RDONLY)
+    let copy: u64 = io.dup(fd)
+    tell((&n_dup[0]) as u64, copy)
+    // THE POINT OF THE OPEN FILE TABLE: two descriptors, ONE position.
+    // Reading four octets on one moves the other one along.
+    io.read(fd, (&buf[0]) as u64, 4)
+    tell((&n_shared[0]) as u64, io.tell(copy))
+    io.close(copy)
+    // The original still works after the copy is gone -- the entry has
+    // two references and only one of them went.
+    tell((&n_dup2[0]) as u64, io.read(fd, (&buf[0]) as u64, 1))
+    io.close(fd)
+    tell((&n_closed[0]) as u64, ulib.sys(kcall.SYS_READ, fd,
+            (&buf[0]) as u64, 1))
+}
+
+// ------------------------------------------------------- brk and mmap
+
+fn memory() {
+    var n_brk: [u8; 4] = "brk\0"
+    var n_grow: [u8; 9] = "brk grew\0"
+    var n_alloc: [u8; 6] = "alloc\0"
+    var n_write: [u8; 12] = "heap holds\0\0"
+    var n_reuse: [u8; 12] = "alloc reuse\0"
+    var n_map: [u8; 5] = "mmap\0"
+    var n_mapw: [u8; 11] = "mmap holds\0"
+    var n_unmap: [u8; 7] = "munmap\0"
+    var n_bad: [u8; 9] = "mmap bad\0"
+
+    let start: u64 = mem.brk(0)
+    var moved: u64 = 0
+    if start > 0 {
+        moved = 1
+    }
+    tell((&n_brk[0]) as u64, moved)
+    let a: u64 = mem.alloc(64)
+    var got: u64 = 0
+    if a != 0 {
+        got = 1
+    }
+    tell((&n_alloc[0]) as u64, got)
+    let mark: u64 = 0x1234567890ABCDEF as u64
+    __mmio_write64(a as *mut u64, mark)
+    var holds: u64 = 0
+    if __mmio_read64(a as *mut u64) == mark {
+        holds = 1
+    }
+    tell((&n_write[0]) as u64, holds)
+    let after: u64 = mem.brk(0)
+    var grew: u64 = 0
+    if after > start {
+        grew = 1
+    }
+    tell((&n_grow[0]) as u64, grew)
+    // Given back and asked for again: the same block comes back, which is
+    // what says the free list really is one.
+    mem.release(a)
+    let b: u64 = mem.alloc(64)
+    var same: u64 = 0
+    if b == a {
+        same = 1
+    }
+    tell((&n_reuse[0]) as u64, same)
+    mem.release(b)
+
+    let page: u64 = mem.map_pages(8192)
+    var mapped: u64 = 0
+    if !ulib.failed(page) {
+        mapped = 1
+    }
+    tell((&n_map[0]) as u64, mapped)
+    let value: u64 = 4242
+    __mmio_write64((page + 4096) as *mut u64, value)
+    var kept: u64 = 0
+    if __mmio_read64((page + 4096) as *mut u64) == value {
+        kept = 1
+    }
+    tell((&n_mapw[0]) as u64, kept)
+    tell((&n_unmap[0]) as u64, mem.unmap_pages(page, 8192))
+    // Without MAP_ANONYMOUS there is nothing to map: this system has no
+    // page cache, and it says so instead of pretending.
+    tell((&n_bad[0]) as u64, kcall.map_anon(4096, 3, kcall.MAP_PRIVATE))
+}
+
+// -------------------------------------------------------------- pipes
+
+fn pipes() {
+    var fds: [u64; 1] = [0 as u64; 1]
+    var out: [u8; 6] = "hello\0"
+    var buf: [u8; 16] = [0 as u8; 16]
+    var n_pipe: [u8; 5] = "pipe\0"
+    var n_wrote: [u8; 11] = "pipe wrote\0"
+    var n_read: [u8; 10] = "pipe read\0"
+    var n_same: [u8; 10] = "pipe same\0"
+    var n_end: [u8; 9] = "pipe end\0"
+    var n_seek: [u8; 10] = "pipe seek\0"
+
+    let r: u64 = io.pipe((&fds[0]) as u64)
+    tell((&n_pipe[0]) as u64, r)
+    let rd: u64 = (fds[0]) & 0xFFFFFFFF
+    let wr: u64 = (fds[0]) >> 32
+    tell((&n_wrote[0]) as u64, io.write_all(wr, (&out[0]) as u64, 5))
+    tell((&n_read[0]) as u64, io.read(rd, (&buf[0]) as u64, 16))
+    var same: u64 = 0
+    if text.equal_n((&buf[0]) as u64, (&out[0]) as u64, 5) {
+        same = 1
+    }
+    tell((&n_same[0]) as u64, same)
+    // A pipe cannot be seeked, and it says so with the error POSIX names.
+    tell((&n_seek[0]) as u64, ulib.sys(kcall.SYS_LSEEK, rd, 0,
+            kcall.SEEK_SET))
+    // The last writer gone means the READER sees the end of the input.
+    io.close(wr)
+    tell((&n_end[0]) as u64, io.read(rd, (&buf[0]) as u64, 16))
+    io.close(rd)
+}
+
+// ------------------------------------------- fork, execve, wait4, pipe
+
+fn children() {
+    var n_pid: [u8; 4] = "pid\0"
+    var n_ppid: [u8; 5] = "ppid\0"
+    var n_fork: [u8; 5] = "fork\0"
+    var n_code: [u8; 10] = "fork code\0"
+    var n_seen: [u8; 10] = "fork sees\0"
+    var n_run: [u8; 4] = "run\0"
+    var n_pipefork: [u8; 15] = "fork pipe text\0"
+    var n_nochild: [u8; 9] = "no child\0"
+    var echo: [u8; 10] = "/bin/echo\0"
+    var word: [u8; 6] = "osum\0\0"
+    var argv: [u64; 4] = [0 as u64; 4]
+    var fds: [u64; 1] = [0 as u64; 1]
+    var buf: [u8; 16] = [0 as u8; 16]
+
+    let me: u64 = proc.pid()
+    var ok: u64 = 0
+    if me > 1 {
+        ok = 1
+    }
+    tell((&n_pid[0]) as u64, ok)
+    var parent_ok: u64 = 0
+    if proc.parent() != me {
+        parent_ok = 1
+    }
+    tell((&n_ppid[0]) as u64, parent_ok)
+
+    // 1. A CHILD THAT IS A COPY. It writes into a pipe what it sees of the
+    //    parent's memory, and leaves with a code of its own.
+    io.pipe((&fds[0]) as u64)
+    let rd: u64 = (fds[0]) & 0xFFFFFFFF
+    let wr: u64 = (fds[0]) >> 32
+    let marker: u64 = 20260825
+    let who: u64 = proc.split()
+    if who == 0 {
+        var mine: [u8; 5] = "here\0"
+        io.write_all(wr, (&mine[0]) as u64, 4)
+        io.close(wr)
+        io.close(rd)
+        proc.leave(marker & 255)
+    }
+    tell((&n_fork[0]) as u64, who)
+    io.close(wr)
+    let got: u64 = io.read(rd, (&buf[0]) as u64, 16)
+    io.close(rd)
+    tell((&n_pipefork[0]) as u64, got)
+    tell((&n_code[0]) as u64, proc.wait_code(who))
+    var sees: u64 = 0
+    var word_here: [u8; 5] = "here\0"
+    if text.equal_n((&buf[0]) as u64, (&word_here[0]) as u64, 4) {
+        sees = 1
+    }
+    tell((&n_seen[0]) as u64, sees)
+
+    // 2. FORK + EXECVE + WAIT4: a program off the disk, started the way
+    //    Unix starts one.
+    argv[0] = (&echo[0]) as u64
+    argv[1] = (&word[0]) as u64
+    argv[2] = 0
+    tell((&n_run[0]) as u64, proc.run((&echo[0]) as u64, (&argv[0]) as u64))
+
+    // 3. Waiting for a child that is not one.
+    tell((&n_nochild[0]) as u64, ulib.sys(kcall.SYS_WAIT4, 999, 0, 0))
+}
+
+// --------------------------------------------------------- the errors
+
+// The part of the round that matters most. Every one of these is a way a
+// program can be wrong, and every one of them has to come back as a NUMBER
+// -- not as a hang, not as a dead kernel, not as a zero.
+fn errors() {
+    var buf: [u8; 16] = [0 as u8; 16]
+    var missing: [u8; 11] = "/nowhere.x\0"
+    var here: [u8; 11] = "/posix.txt\0"
+    var root: [u8; 2] = "/\0"
+    var n_noent: [u8; 11] = "err noent\0\0"
+    var n_badfd: [u8; 10] = "err badfd\0"
+    var n_fault: [u8; 10] = "err fault\0"
+    var n_nil: [u8; 8] = "err nil\0"
+    var n_nosys: [u8; 10] = "err nosys\0"
+    var n_isdir: [u8; 10] = "err isdir\0"
+    var n_notdir: [u8; 11] = "err notdir\0"
+    var n_wrdir: [u8; 10] = "err wrdir\0"
+    var n_seek: [u8; 12] = "err seekneg\0"
+    var n_unlink: [u8; 11] = "err unldir\0"
+    var n_exec: [u8; 12] = "err execmis\0"
+    var n_sleep: [u8; 11] = "err sleep\0\0"
+    var n_errno: [u8; 6] = "errno\0"
+    var n_closed: [u8; 11] = "err closed\0"
+
+    tell((&n_noent[0]) as u64, ulib.sys(kcall.SYS_OPEN,
+            (&missing[0]) as u64, 0, 0))
+    tell((&n_badfd[0]) as u64, ulib.sys(kcall.SYS_READ, 77,
+            (&buf[0]) as u64, 8))
+    // A pointer into the kernel, and a pointer of nothing.
+    tell((&n_fault[0]) as u64, ulib.sys(kcall.SYS_WRITE, 1, 0x100000, 8))
+    tell((&n_nil[0]) as u64, ulib.sys(kcall.SYS_OPEN, 0, 0, 0))
+    tell((&n_nosys[0]) as u64, ulib.sys(999, 0, 0, 0))
+    // A directory is not a file: reading it as one is -EISDIR, opening it
+    // for writing is the same, and a file opened as a directory is
+    // -ENOTDIR.
+    let dirfd: u64 = io.dir_open((&root[0]) as u64)
+    tell((&n_isdir[0]) as u64, ulib.sys(kcall.SYS_READ, dirfd,
+            (&buf[0]) as u64, 8))
+    io.close(dirfd)
+    // A FILE opened as a directory: -ENOTDIR, and the path exists -- a
+    // missing one would answer -ENOENT and measure nothing.
+    tell((&n_notdir[0]) as u64, ulib.sys(kcall.SYS_OPEN,
+            (&here[0]) as u64, kcall.O_DIRECTORY, 0))
+    tell((&n_wrdir[0]) as u64, ulib.sys(kcall.SYS_OPEN,
+            (&root[0]) as u64, kcall.O_WRONLY, 0))
+    tell((&n_unlink[0]) as u64, ulib.sys(kcall.SYS_UNLINK,
+            (&root[0]) as u64, 0, 0))
+    // A position before the start of a file.
+    let fd: u64 = io.open((&root[0]) as u64, kcall.O_DIRECTORY)
+    tell((&n_seek[0]) as u64, ulib.sys(kcall.SYS_LSEEK, fd, 0 -% 4,
+            kcall.SEEK_SET))
+    io.close(fd)
+    tell((&n_closed[0]) as u64, ulib.sys(kcall.SYS_CLOSE, fd, 0, 0))
+    tell((&n_exec[0]) as u64, ulib.sys(kcall.SYS_EXECVE,
+            (&missing[0]) as u64, 0, 0))
+    var ts: [u64; 2] = [0 as u64; 2]
+    ts[0] = 1000
+    tell((&n_sleep[0]) as u64, ulib.sys(kcall.SYS_NANOSLEEP,
+            (&ts[0]) as u64, 0, 0))
+    // AND THE LIBC SIDE OF IT: the same failure, seen the way a C program
+    // sees it -- -1, and the reason in `errno`.
+    let bad: u64 = io.open((&missing[0]) as u64, 0)
+    var shape: u64 = 0
+    if errno.failed(bad) {
+        shape = errno.errno()
+    }
+    tell((&n_errno[0]) as u64, shape)
+}

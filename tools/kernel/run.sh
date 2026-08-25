@@ -591,15 +591,21 @@ if [ -f "$F" ]; then
     else
         bad "block accounting: after the format $free0, after the files $free1"
     fi
-    # 12 direct blocks + 64 through the indirect one = 76 * 512 = 38912.
+    # ROUND K4: 11 direct + 64 indirect + 64*64 double indirect blocks.
+    # Round 62 measured the old ceiling here (38912 octets, and the
+    # thirteenth chunk had nowhere to go); the round that put a libc into
+    # every program had to raise it, and what is measured now is that the
+    # file really grows PAST that number and stops when the RAM DISK is
+    # full -- while still saying how much it wrote.
     lim=$(grep -m1 '^fs: limit ' "$F")
     la=$(echo "$lim" | grep -oE 'asked=[0-9]+' | cut -d= -f2)
     lw=$(echo "$lim" | grep -oE 'wrote=[0-9]+' | cut -d= -f2)
     ls_=$(echo "$lim" | grep -oE 'size=[0-9]+' | cut -d= -f2)
-    if [ "$la" = "49152" ] && [ "$lw" = "38912" ] && [ "$ls_" = "38912" ]; then
-        ok "counter-check: a file stops at 12+64 blocks and reports 38912 of 49152 written"
+    if [ "$la" = "1228800" ] && [ "$lw" -gt 38912 ] && [ "$lw" -lt "$la" ] \
+       && [ "$ls_" = "$lw" ]; then
+        ok "counter-check: a file grows past the old 38912 and stops at the full disk ($lw of $la)"
     else
-        bad "the size limit: asked=$la wrote=$lw size=$ls_, expected 49152/38912/38912"
+        bad "the size limit: asked=$la wrote=$lw size=$ls_, expected 1228800/>38912/=wrote"
     fi
     grep -q '^fs: list .*hello.txt:1' "$F" \
         && ok "the root directory lists the file" \
