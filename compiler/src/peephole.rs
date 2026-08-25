@@ -193,14 +193,15 @@ pub(crate) fn run(f: &mut Func) -> usize {
         edits.sort_by(|x, y| (y.block, y.at).cmp(&(x.block, x.at)));
         for e in edits {
             let cv = f.new_val_pub(e.ty);
-            let cinst = Inst { dst: Some(cv), ty: e.ty, op: Op::Const(e.imm) };
+            let here = f.blocks[e.block].insts[e.at].loc;
+            let cinst = Inst::like(Some(cv), e.ty, Op::Const(e.imm), here);
             let newop = if e.shift {
                 Op::Bin(BinOp::Shr, e.a, cv)
             } else {
                 Op::Bin(BinOp::And, e.a, cv)
             };
             let blk = &mut f.blocks[e.block];
-            blk.insts[e.at] = Inst { dst: Some(e.dst), ty: e.ty, op: newop };
+            blk.insts[e.at] = Inst::like(Some(e.dst), e.ty, newop, here);
             blk.insts.insert(e.at, cinst);
             changed += 1;
         }

@@ -80,8 +80,6 @@ pub struct VarNote {
 struct FuncLines {
     /// Position of the `fn` line: (file number, line)
     decl: Option<(u32, u32)>,
-    /// (block, index of the instruction in the block) -> (file number, line)
-    notes: HashMap<(u32, u32), (u32, u32)>,
     /// Round 64: the declared names, in the order of their declaration.
     vars: Vec<VarNote>,
     /// Round 64: the result type of the function.
@@ -93,8 +91,12 @@ struct Table {
     /// Source files ordered by their numbers (0-based).
     files: Vec<String>,
     funcs: HashMap<String, FuncLines>,
-    /// Emit instruction-exact lines?
-    statements: bool,
+    /// Emit VARIABLE information (names, types, frame offsets)? Since round
+    /// 94 the line table no longer hangs on this flag -- lines travel on the
+    /// instructions themselves (`fir::Loc`) and are therefore right at every
+    /// build level. Variables still need the frame, so they stay tied to
+    /// `--no-opt`.
+    variables: bool,
 }
 
 static TABLE: Mutex<Option<Table>> = Mutex::new(None);
@@ -111,11 +113,11 @@ fn with<R>(f: impl FnOnce(&mut Table) -> R) -> R {
 }
 
 /// Resets the table and enters the source files.
-pub fn reset(files: Vec<String>, statements: bool) {
+pub fn reset(files: Vec<String>, variables: bool) {
     with(|t| {
         t.files = files.clone();
         t.funcs.clear();
-        t.statements = statements;
+        t.variables = variables;
     });
 }
 
@@ -146,41 +148,6 @@ pub fn set_fn(name: &str, file: u32, line: u32) {
     });
 }
 
-/// Remember the source line of instruction `idx` in block `block`.
-pub fn note(name: &str, block: u32, idx: u32, file: u32, line: u32) {
-    if line == 0 {
-        return;
-    }
-    with(|t| {
-        if !t.statements {
-            return;
-        }
-        t.funcs
-            .entry(name.to_string())
-            .or_default()
-            .notes
-            .entry((block, idx))
-            .or_insert((file, line));
-    });
-}
-
-/// An `alloca` was INSERTED into block `block` at position `at`: every
-/// note from that position onwards slides one step back.
-pub fn shift_after_insert(name: &str, block: u32, at: u32) {
-    with(|t| {
-        if !t.statements {
-            return;
-        }
-        if let Some(f) = t.funcs.get_mut(name) {
-            let old = std::mem::take(&mut f.notes);
-            for ((b, i), v) in old {
-                let i2 = if b == block && i >= at { i + 1 } else { i };
-                f.notes.insert((b, i2), v);
-            }
-        }
-    });
-}
-
 /// Line of the `fn` declaration.
 pub fn fn_line(name: &str) -> Option<(u32, u32)> {
     with(|t| t.funcs.get(name).and_then(|f| f.decl))
@@ -191,7 +158,7 @@ pub fn fn_line(name: &str) -> Option<(u32, u32)> {
 /// shows comes from there.
 pub fn declare_var(name: &str, var: &str, val: u32, ty: DType, file: u32, line: u32, param: bool) {
     with(|t| {
-        if !t.statements {
+        if !t.variables {
             return;
         }
         let f = t.funcs.entry(name.to_string()).or_default();
@@ -212,7 +179,7 @@ pub fn declare_var(name: &str, var: &str, val: u32, ty: DType, file: u32, line: 
 /// Round 64: the result type of a function.
 pub fn set_fn_type(name: &str, ret: DType) {
     with(|t| {
-        if !t.statements {
+        if !t.variables {
             return;
         }
         t.funcs.entry(name.to_string()).or_default().ret = Some(ret);
@@ -231,16 +198,14 @@ pub fn ret_of(name: &str) -> Option<DType> {
 
 /// Round 64: is debug information for variables being produced at all?
 pub fn with_variables() -> bool {
-    with(|t| t.statements && !t.files.is_empty())
+    with(|t| t.variables && !t.files.is_empty())
 }
 
-/// Line of instruction `idx` in block `block`, if noted.
-pub fn line_at(name: &str, block: u32, idx: u32) -> Option<(u32, u32)> {
-    with(|t| {
-        t.funcs
-            .get(name)
-            .and_then(|f| f.notes.get(&(block, idx)).copied())
-    })
+/// ROUND 94: is a line table being produced at all? True as soon as there
+/// are source files -- at EVERY build level, because the positions sit on
+/// the instructions and survive the optimizer (`fir::Loc`).
+pub fn with_lines() -> bool {
+    with(|t| !t.files.is_empty())
 }
 
 /// `.file` directives for all source files (numbers are 1-based).
@@ -256,22 +221,35 @@ pub fn file_directives() -> String {
 mod tests {
     use super::*;
 
-    /// The table is global state — hence ONE test that checks both
+    /// The table is global state — hence ONE test that checks all of it
     /// (parallel tests would otherwise reset each other).
+    ///
+    /// ROUND 94: the line NOTES are gone from here; they sit on the
+    /// instructions (`fir::Loc`) and are tested in `fir.rs`. What is left in
+    /// this table is what really is per function and not per instruction: the
+    /// `fn` line, the declared names, the file list.
     #[test]
-    fn notes_move_itself_and_let_itself_disable() {
+    fn the_table_carries_function_and_variables() {
         reset(vec!["a.fi".to_string()], true);
         set_fn("f", 0, 3);
-        note("f", 0, 2, 0, 10);
-        shift_after_insert("f", 0, 1);
-        assert_eq!(line_at("f", 0, 3), Some((0, 10)));
-        assert_eq!(line_at("f", 0, 2), None);
         assert_eq!(fn_line("f"), Some((0, 3)));
+        assert!(with_variables());
+        assert!(with_lines());
+        declare_var("f", "x", 7, DType::Base("i32".into(), 4, ATE_SIGNED), 0, 4, false);
+        assert_eq!(vars_of("f").len(), 1);
         assert!(file_directives().contains(".file 1 \"a.fi\""));
 
+        // Without variable information the names stay away -- the lines do not.
         reset(vec!["a.fi".to_string()], false);
-        note("g", 0, 0, 0, 7);
-        assert_eq!(line_at("g", 0, 0), None);
+        set_fn("g", 0, 9);
+        declare_var("g", "y", 1, DType::Void, 0, 9, false);
+        assert!(vars_of("g").is_empty());
+        assert!(!with_variables());
+        assert!(with_lines());
+        assert_eq!(fn_line("g"), Some((0, 9)));
+
+        // No files at all = no debug information at all.
         reset(Vec::new(), false);
+        assert!(!with_lines());
     }
 }

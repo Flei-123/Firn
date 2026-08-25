@@ -263,16 +263,16 @@ mod tests {
             Block { id: 0, insts: vec![], term: Term::Br(1) },
             Block {
                 id: 1,
-                insts: vec![Inst {
-                    dst: Some(c),
-                    ty: FTy::Bool,
-                    op: Op::Cmp { op: crate::fir::CmpOp::Lt, ty: FTy::U64, a: 0, b: 1 },
-                }],
+                insts: vec![Inst::new(
+                    Some(c),
+                    FTy::Bool,
+                    Op::Cmp { op: crate::fir::CmpOp::Lt, ty: FTy::U64, a: 0, b: 1 },
+                )],
                 term: Term::BrCond { cond: c, then_bb: 2, else_bb: 3 },
             },
             Block {
                 id: 2,
-                insts: vec![Inst { dst: Some(m), ty: FTy::U64, op: Op::Bin(BinOp::Mul, 0, 1) }],
+                insts: vec![Inst::new(Some(m), FTy::U64, Op::Bin(BinOp::Mul, 0, 1))],
                 term: Term::Br(1),
             },
             Block { id: 3, insts: vec![], term: Term::Ret(Some(0)) },
@@ -315,7 +315,7 @@ mod tests {
         let l = f.new_val_pub(FTy::U64);
         f.blocks[2].insts.insert(
             0,
-            Inst { dst: Some(l), ty: FTy::U64, op: Op::Load { addr: 0 } },
+            Inst::new(Some(l), FTy::U64, Op::Load { addr: 0 }),
         );
         f.blocks[2].insts[1].op = Op::Bin(BinOp::Mul, l, 1);
         hoist_loop_invariants(&mut f);

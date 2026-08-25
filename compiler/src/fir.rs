@@ -567,11 +567,61 @@ impl Op {
     }
 }
 
+/// **ROUND 94** -- the source position of ONE instruction.
+///
+/// Until this round FIR carried no positions at all: `dwarf.rs` kept a side
+/// table keyed by *(function, block, instruction index)*. That table is right
+/// exactly as long as nobody moves an instruction -- and moving instructions
+/// is what an optimizer does. After inlining, the copied body of the callee
+/// sat in the caller's blocks and the side table knew nothing about it, so
+/// the debugger reported the line of the CALLER's `fn` for code that came
+/// from a completely different place. Measured in this round: `gdb` said
+/// `inl.fi:7` for an `add` whose own panic message said `inl.fi:3:18`.
+///
+/// The position therefore travels WITH the instruction. Every pass that
+/// clones, moves or lifts an instruction carries it along for free; one that
+/// builds a new instruction has to say where it comes from.
+///
+/// `line == 0` means "no position" (runtime code, compiler bookkeeping). That
+/// is not a lie, it is a gap, and the code generator emits nothing for it
+/// rather than letting the previous line stick.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Loc {
+    /// index into `dwarf::files()` (0 based; `.loc` counts from 1)
+    pub file: u32,
+    pub line: u32,
+    pub col: u32,
+}
+
+impl Loc {
+    pub const NONE: Loc = Loc { file: 0, line: 0, col: 0 };
+    pub fn is_none(&self) -> bool {
+        self.line == 0
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Inst {
     pub dst: Option<Val>,
     pub ty: FTy,
     pub op: Op,
+    /// ROUND 94 -- where this instruction comes from (see [`Loc`]).
+    pub loc: Loc,
+}
+
+impl Inst {
+    /// An instruction without a source position -- for everything a pass
+    /// invents out of nothing (a spill copy, an `undef` constant).
+    pub fn new(dst: Option<Val>, ty: FTy, op: Op) -> Inst {
+        Inst { dst, ty, op, loc: Loc::NONE }
+    }
+    /// An instruction that INHERITS its position from another one. This is
+    /// the constructor a pass should reach for: a value folded out of an
+    /// instruction belongs to the same source line as the instruction it came
+    /// from.
+    pub fn like(dst: Option<Val>, ty: FTy, op: Op, from: Loc) -> Inst {
+        Inst { dst, ty, op, loc: from }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -643,6 +693,12 @@ pub struct Func {
     /// generator rescues ALL general purpose registers and closes with `iretq`
     /// rather than `ret` (SPEC §2, kernel profile).
     pub interrupt: bool,
+    /// **ROUND 94** -- the position every newly pushed instruction is stamped
+    /// with. `lower.rs` sets it per statement and per expression; everything
+    /// else leaves it alone. It belongs to the FUNCTION and not to a global:
+    /// functions are lowered one after another, and a stale stamp would
+    /// attribute the prologue of the second to the last line of the first.
+    pub loc_stamp: Loc,
 }
 
 impl Func {
@@ -659,6 +715,7 @@ impl Func {
             secret: std::collections::HashSet::new(),
             constant_time: false,
             interrupt: false,
+            loc_stamp: Loc::NONE,
         }
     }
 
@@ -693,20 +750,23 @@ impl Func {
     /// Appends a value yielding instruction to the end of `b`.
     pub fn push(&mut self, b: BlockId, ty: FTy, op: Op) -> Val {
         let v = self.new_val(ty);
-        self.blocks[b as usize].insts.push(Inst { dst: Some(v), ty, op });
+        let loc = self.loc_stamp;
+        self.blocks[b as usize].insts.push(Inst { dst: Some(v), ty, op, loc });
         v
     }
 
     /// Appends an instruction without a result (`store`, `copymem`, void call).
     pub fn push_void(&mut self, b: BlockId, ty: FTy, op: Op) {
-        self.blocks[b as usize].insts.push(Inst { dst: None, ty, op });
+        let loc = self.loc_stamp;
+        self.blocks[b as usize].insts.push(Inst { dst: None, ty, op, loc });
     }
 
     /// Inserts an alloca at the front of the entry block (invariant: all
     /// allocas stand in the entry block).
     pub fn alloca(&mut self, size: u64, align: u64) -> Val {
         let v = self.new_val(FTy::Ptr);
-        let inst = Inst { dst: Some(v), ty: FTy::Ptr, op: Op::Alloca { size, align } };
+        let inst =
+            Inst { dst: Some(v), ty: FTy::Ptr, op: Op::Alloca { size, align }, loc: self.loc_stamp };
         let n = self.blocks[0].insts.iter().take_while(|i| matches!(i.op, Op::Alloca { .. })).count();
         self.blocks[0].insts.insert(n, inst);
         v
