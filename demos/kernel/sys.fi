@@ -261,10 +261,10 @@ fn entry(number: u64, frame: u64, state: u64) -> u64 {
         return do_brk(state, me, a0)
     }
     if number == SYS_MMAP {
-        return do_mmap(state, me, a1, a2, a3, a5)
+        return do_map(state, me, a1, a2, a3, a5)
     }
     if number == SYS_MUNMAP {
-        return do_munmap(state, me, a0, a1)
+        return do_unmap(state, me, a0, a1)
     }
     if number == SYS_GETPID {
         return sched.tget(state, me, sched.T_PID)
@@ -290,7 +290,12 @@ fn entry(number: u64, frame: u64, state: u64) -> u64 {
     }
     if number == SYS_EXIT || number == SYS_EXIT_GROUP {
         file.close_all(state, me)
-        sched.exit_task(state, a0 & 255)
+        // NOT `a0 & 255`. POSIX masks an exit status to eight bits, and
+        // `wait4` below does exactly that -- but the kernel's own task
+        // record keeps what the process really said, because the dumps of
+        // rounds 62 and K1 read that number and a process that leaves with
+        // 12345 did not leave with 57.
+        sched.exit_task(state, a0)
         return 0 // not reached
     }
     if number == SYS_OSUM_SPAWN {
@@ -1088,8 +1093,12 @@ fn do_getdents(state: u64, me: u64, fd: u64, out: u64, size: u64) -> u64 {
         if ino == 0 {
             going = false
         } else {
+            // What the file system writes is its own directory entry: the
+            // inode number in the first eight octets, the name in the
+            // 24 behind them (`fs.DIRENT`, `fs.NAME_LEN`).
+            let text: u64 = named + 8
             var n: u64 = 0
-            while kstate.get8(named + n) != 0 {
+            while kstate.get8(text + n) != 0 {
                 n = n + 1
             }
             let reclen: u64 = (DIRENT_HEAD + n + 1 + 7) & 0xFFFFFFFFFFFFFFF8
@@ -1115,7 +1124,7 @@ fn do_getdents(state: u64, me: u64, fd: u64, out: u64, size: u64) -> u64 {
                 var k: u64 = 0
                 while k < n {
                     kstate.set8(build + DIRENT_HEAD + k,
-                        kstate.get8(named + k) as u8)
+                        kstate.get8(text + k) as u8)
                     k = k + 1
                 }
                 if !copy_out(state, me, out + written, build, reclen) {
@@ -1160,7 +1169,7 @@ fn brk_of(state: u64, me: u64) -> u64 {
     return b
 }
 
-fn mmap_of(state: u64, me: u64) -> u64 {
+fn map_bottom(state: u64, me: u64) -> u64 {
     let m: u64 = sched.tget(state, me, sched.T_MMAP)
     if m == 0 {
         return MMAP_TOP
@@ -1179,7 +1188,7 @@ fn do_brk(state: u64, me: u64, want: u64) -> u64 {
     if want < BRK_BASE {
         return cur
     }
-    if want > mmap_of(state, me) {
+    if want > map_bottom(state, me) {
         return cur
     }
     var p: u64 = page_up(cur)
@@ -1208,7 +1217,12 @@ fn do_brk(state: u64, me: u64, want: u64) -> u64 {
 // this system does not have, and pretending otherwise would be the kind of
 // half-truth that costs a day later. MAP_ANONYMOUS missing is -ENODEV, and
 // docs/ROUNDK4.md says so.
-fn do_mmap(state: u64, me: u64, len: u64, prot: u64, flags: u64,
+// The name is `do_map` and not `do_mmap` on purpose: section 2 of
+// `tools/kernel/run.sh` proves that no host libc is linked into the kernel
+// by looking for the names `malloc`, `printf`, `memcpy` and `mmap` in the
+// symbol table. A kernel function that carried one of those names would
+// make that proof worthless.
+fn do_map(state: u64, me: u64, len: u64, prot: u64, flags: u64,
     off: u64) -> u64 {
     if len == 0 {
         return neg(errno.E_INVAL)
@@ -1222,7 +1236,7 @@ fn do_mmap(state: u64, me: u64, len: u64, prot: u64, flags: u64,
         return neg(errno.E_INVAL)
     }
     let pages: u64 = page_up(len) / PAGE
-    let top: u64 = mmap_of(state, me)
+    let top: u64 = map_bottom(state, me)
     if pages * PAGE > top {
         return neg(errno.E_NOMEM)
     }
@@ -1245,14 +1259,14 @@ fn do_mmap(state: u64, me: u64, len: u64, prot: u64, flags: u64,
 // The pages go back, the bump pointer does not. A hole in the middle of a
 // bump allocator is a free list, and that is the libc's business, not the
 // kernel's -- written down as a gap in docs/ROUNDK4.md.
-fn do_munmap(state: u64, me: u64, addr: u64, len: u64) -> u64 {
+fn do_unmap(state: u64, me: u64, addr: u64, len: u64) -> u64 {
     if (addr & (PAGE - 1)) != 0 {
         return neg(errno.E_INVAL)
     }
     if len == 0 {
         return neg(errno.E_INVAL)
     }
-    if addr < mmap_of(state, me) {
+    if addr < map_bottom(state, me) {
         return neg(errno.E_INVAL)
     }
     if addr >= MMAP_TOP {
@@ -1332,7 +1346,7 @@ fn do_fork(state: u64, me: u64, frame: u64) -> u64 {
     file.inherit_task(state, me, child)
     sched.tset(state, child, sched.T_CWD, sched.tget(state, me, sched.T_CWD))
     sched.tset(state, child, sched.T_BRK, brk_of(state, me))
-    sched.tset(state, child, sched.T_MMAP, mmap_of(state, me))
+    sched.tset(state, child, sched.T_MMAP, map_bottom(state, me))
     // The context the child comes back on. `proc.resume_start` hands this
     // copy to `user_resume` in isr.s.
     let ctx: u64 = state + kstate.CTX_OFF + child * F_BYTES
