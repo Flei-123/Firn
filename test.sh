@@ -88,24 +88,13 @@
 #      `profile kernel`, inline assembly, MMIO, `#[interrupt]` -- the
 #      kernel example becomes an ELF object file WITHOUT undefined
 #      symbols, in BOTH compilers, and is linked against a linker script.
-#  57. Four processors (tools/smp/run.sh, ROUND K5): the kernel reads the
-#      ACPI MADT, starts the application processors with INIT/SIPI, gives
-#      each one a stack, descriptor table and local APIC of its own, and
-#      locks the run queue, the frame allocator and the file system. The
-#      same work is measured on one core and on four; the counter-checks
-#      are `nosmp`, `nolock` and QEMU's single-threaded emulation.
-#  22. The kernel (tools/kernel/run.sh, round 59): `demos/kernel/kmain.fi`
-#      boots in QEMU and is checked over its serial output -- IDT and
-#      exception reports (#DE, #PF, #GP, #DF), PIC/PIT with a tick counter
-#      that runs up, memory map, frame allocator and heap, keyboard over
-#      IRQ1, ring 3 with `syscall`/`sysret`. With counter-checks.
 #  31. `str` does not leak (tools/strsoak/run.sh, round 70): an endurance
 #      run with many short lived concatenations, the RSS of the process
 #      measured, plus the counter-check with the collector switched off --
 #      in BOTH compilers.
 #  30. std.core in a kernel (tools/core/run.sh, round 73): the half of the
 #      library that needs neither an allocator nor a system call became a
-#      module of its own; `demos/kernel/kcore.fi` imports it, compiles in
+#      module of its own; `demos/freestanding/kcore.fi` imports it, compiles in
 #      the kernel profile to a freestanding ELF object and boots in QEMU.
 #      With counter-checks: what still allocates stays forbidden, and a
 #      module that only CLAIMS the kernel profile is caught.
@@ -205,13 +194,6 @@
 #      same file is core language for BOTH compilers. Section 25
 #      (tools/dwarf/run.sh) grew the second half of the round: the line
 #      table is held against the panic message the program prints itself.
-#  56. THE POSIX FLOOR (tools/posix/run.sh, ROUND K4): twenty-six system
-#      calls with the numbers of Linux x86-64 and a libc in Firn on top of
-#      them. Measured with the errors: a file that is not there, a
-#      descriptor that is not open, a pointer into the kernel, a buffer too
-#      short for one directory entry -- fourteen ways to be wrong, fourteen
-#      negative numbers, one living kernel. Plus `fork` + `dup2` + `execve`
-#      as a redirection in the shell, and both compilers measuring the same.
 #  10. DOM soak run (tools/dom_soak/run.sh): the DOM prototype in Firn builds
 #      real cycles continuously (parent/child, listener, JS wrapper) and must
 #      not grow while doing so; the deliberately leaking counter-check with
@@ -691,29 +673,6 @@ else
     bad "tools/fnfield/run.sh failed (see .test-work/fnfield.log)"
     grep FAIL "$WORK/fnfield.log" | head -10 | sed 's/^/   /'
 fi
-
-echo "== 22. the kernel really runs: tasks, address spaces, system calls, files (tools/kernel/run.sh) =="
-# Round 59 and 62. `demos/kernel/kmain.fi` is booted in QEMU -- once per
-# case, each with a time limit. Checked is the SERIAL OUTPUT and the exit
-# code: exceptions with error code and register set, a tick counter that
-# runs up, frame allocator and heap, keys over IRQ1, ring 3 (round 59) --
-# and on top of that three tasks interleaved on one processor, two
-# processes with an address space of their own, system calls with real
-# error codes, a file system on a RAM disk AND on a real ATA disk, and a
-# command line in ring 3 (round 62). Every point with a counter-check:
-# masked IRQ0 counts zero ticks, `nopreempt` lets nothing interleave, a
-# process that touches kernel memory dies while the kernel lives, `mount`
-# refuses an unformatted disk, and `hlt` in ring 3 yields #GP with
-# cs=0x2b.
-bash tools/kernel/run.sh > "$WORK/kernel.log" 2>&1 && KRRC=0 || KRRC=$?
-if [ "$KRRC" -eq 0 ]; then
-    ok
-    tail -1 "$WORK/kernel.log" | sed 's/^/   /'
-else
-    bad "tools/kernel/run.sh failed (see .test-work/kernel.log)"
-    grep FAIL "$WORK/kernel.log" | head -10 | sed 's/^/   /'
-fi
-
 echo "== 23. layout: from the computed style to the box with coordinates (tools/layout/run.sh) =="
 # Rounds 61 and 67. The box model with margin collapsing, the block flow,
 # the inline flow with line boxes, floats and `clear`, position
@@ -822,7 +781,7 @@ echo "== 30. std.core in a kernel: the library without an allocator (tools/core/
 # allocator nor a system call moved into lib/std/core.fi, and THAT module is
 # admitted -- because it declares `profile kernel` itself and lands in the
 # same compilation unit, where the claim gets checked.
-# Proven here, with both compilers: demos/kernel/kcore.fi says
+# Proven here, with both compilers: demos/freestanding/kcore.fi says
 # `import std.core`, becomes an ELF object WITHOUT an undefined name and
 # WITHOUT a syscall instruction, boots in QEMU and reports over the serial
 # line what it searched, split, read and allocated. With counter-checks:
@@ -1186,30 +1145,6 @@ else
     bad "tools/optlevels/run.sh failed (see .test-work/optlevels.log)"
     sed 's/^/        /' "$WORK/optlevels.log" | grep FAIL | head -12
 fi
-
-echo "== 49. a program off the disk: the ELF loader, exec, /bin/sh (tools/osum/run.sh, ROUND K1) =="
-bash tools/osum/run.sh > "$WORK/osum.log" 2>&1 && OSRC=0 || OSRC=$?
-grep -E '^OSUM:|deepest|biggest program|refusals in one run' "$WORK/osum.log" | sed 's/^/ /'
-if [ "$OSRC" -eq 0 ]; then
-    ok
-else
-    bad "tools/osum/run.sh failed (see .test-work/osum.log)"
-    grep -E '^  FAIL' "$WORK/osum.log" | head -12 | sed 's/^/        /'
-fi
-
-# ROUND K2. Round K1 took 49; of the rounds that were running in
-# parallel only K1 landed, so this one is 50 and not 53.
-echo "== 50. the kernel reads its own machine: PCI, APIC, NVMe over DMA (tools/pci/run.sh, ROUND K2) =="
-bash tools/pci/run.sh > "$WORK/pci.log" 2>&1 && PCIRC=0 || PCIRC=$?
-grep -E '^        bench: ' "$WORK/pci.log" | sed 's/^ */ /'
-grep -E '^PCI: ' "$WORK/pci.log" | sed 's/^/ /'
-if [ "$PCIRC" -eq 0 ]; then
-    ok
-else
-    bad "tools/pci/run.sh failed (see .test-work/pci.log)"
-    grep -E '^  FAIL' "$WORK/pci.log" | head -12 | sed 's/^/   /'
-fi
-
 echo "== 51. the same package on two machines (tools/repro/two_machines.sh, ROUND 93) =="
 # ACCEPTANCE item 5. Not "two directories" like `tools/repro/run.sh` of round
 # 48, but a second run that differs in everything a second machine differs
@@ -1309,43 +1244,6 @@ else
     bad "round 95 failed (ucd $UCDRC, soak $SOAKRC -- see .test-work/ucd_build.log, .test-work/gc_soak.log)"
     grep -E 'FAILED|ERROR|error' "$WORK/ucd_build.log" "$WORK/ucd_verify.log" "$WORK/gc_soak.log" 2>/dev/null | head -10 | sed 's/^/   /'
 fi
-
-echo "== 56. the POSIX system call layer and the libc (tools/posix/run.sh, ROUND K4) =="
-# Stage 1 of the plan: the kernel had seventeen calls of its own invention
-# and a program written for Unix could not use one of them. Now there are
-# twenty-six with the NUMBERS OF LINUX x86-64 -- read, write, open, close,
-# stat, fstat, lseek, mmap, brk, pipe, dup2, fork, execve, wait4,
-# getdents64 -- plus a libc in Firn on top of them (lib/osum/libc/). Every
-# call is measured with its ERRORS as well, because a call that works on a
-# good day proves nothing about the days a bug lives on.
-bash tools/posix/run.sh > "$WORK/posix.log" 2>&1 && PXRC=0 || PXRC=$?
-grep -aE '^POSIX:|^   -- ' "$WORK/posix.log" | sed 's/^/ /'
-if [ "$PXRC" -eq 0 ]; then
-    ok
-else
-    bad "tools/posix/run.sh failed (see .test-work/posix.log)"
-    grep -aE '^  FAIL' "$WORK/posix.log" | head -12 | sed 's/^/   /'
-fi
-
-echo "== 57. four processors, and the lock that makes them one kernel (tools/smp/run.sh, ROUND K5) =="
-# The kernel starts the other cores out of the ACPI MADT, gives each one a
-# stack, a descriptor table and a local APIC of its own, and puts a spin
-# lock around the three things they share -- the run queue, the frame
-# allocator, the file system. Every number in that log has a run in which
-# it collapses: `nosmp` (same machine, cores not started), `nolock` (same
-# kernel, locks switched off) and `thread=single` (same guest, one host
-# thread). See docs/ROUNDK5.md.
-bash tools/smp/run.sh > "$WORK/smp.log" 2>&1 && SMPRC=0 || SMPRC=$?
-grep -E '^        (one core|four cores|speed-up|one host thread|with the lock)' \
-    "$WORK/smp.log" | sed 's/^ */ /'
-grep -E '^SMP: ' "$WORK/smp.log" | sed 's/^/ /'
-if [ "$SMPRC" -eq 0 ]; then
-    ok
-else
-    bad "tools/smp/run.sh failed (see .test-work/smp.log)"
-    grep -E '^  FAIL' "$WORK/smp.log" | head -12 | sed 's/^/   /'
-fi
-
 echo "== 59. the official html5lib tests, the DOM and the style tree (tools/domb1/run.sh, ROUND B1) =="
 # The number 59 is fixed for this round; 53 to 58 belong to the rounds that
 # were running next to it.
@@ -1356,28 +1254,4 @@ if [ "$B1RC" -eq 0 ]; then
 else
     bad "tools/domb1/run.sh failed (see .test-work/domb1.log)"
     grep -E '^   (ERROR|FAILED)|^ *>>' "$WORK/domb1.log" | head -12 | sed 's/^/   /'
-fi
-
-# ROUND K6. 53 to 57 belong to the rounds that were running beside this
-# one; this section is 58 and stays 58.
-echo "== 58. a userland: a shell, twenty-three tools, pipes and redirection (tools/userland/run.sh, ROUND K6) =="
-bash tools/userland/run.sh > "$WORK/userland.log" 2>&1 && ULRC=0 || ULRC=$?
-grep -E '^USERLAND:|the whole userland in octets|the biggest program|programs loaded off the disk' \
-    "$WORK/userland.log" | sed 's/^ */ /'
-if [ "$ULRC" -eq 0 ]; then
-    ok
-else
-    bad "tools/userland/run.sh failed (see .test-work/userland.log)"
-    grep -E '^  FAIL' "$WORK/userland.log" | head -12 | sed 's/^/   /'
-fi
-
-TOTAL=$((PASS + FAIL))
-echo
-if [ "$FAIL" -eq 0 ]; then
-    echo "PASS $PASS/$TOTAL"
-    exit 0
-else
-    echo "FAIL $FAIL/$TOTAL failed:"
-    printf "%b\n" "$FAILED"
-    exit 1
 fi

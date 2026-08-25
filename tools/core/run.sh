@@ -9,7 +9,7 @@
 # file and off a machine that really boots -- not what the compiler claims
 # about itself.
 #
-#   1. `demos/kernel/kcore.fi` compiles with BOTH compilers in the kernel
+#   1. `demos/freestanding/kcore.fi` compiles with BOTH compilers in the kernel
 #      profile to an ELF OBJECT FILE, although it says `import std.core`.
 #   2. The object file has NO undefined name and contains NOT ONE `syscall`
 #      instruction. That is the hard form of "this library asks nobody for
@@ -39,8 +39,8 @@ ROOT=$(pwd)
 export FIRNLIB="$ROOT/lib"
 FIRNC=compiler/target/release/firnc
 FC1=${FIRNC1:-./.firnc1}
-SOURCE=demos/kernel/kcore.fi
-LDSCRIPT=demos/kernel/linker.ld
+SOURCE=demos/freestanding/kcore.fi
+LDSCRIPT=demos/freestanding/linker.ld
 ROUNDS=${CORE_ROUNDS:-40000}
 LEAK_ROUNDS=${CORE_LEAK_ROUNDS:-20000}
 SLACK=${CORE_SLACK:-64}
@@ -85,7 +85,7 @@ for s in 0 1; do
     # ROUND 72: `osum_panic` is the ONE name allowed to stay undefined here.
     # Checked arithmetic (SPEC section 13, item L9) calls that external
     # symbol under `profile kernel` when a value goes out of range, on
-    # purpose; `demos/kernel/start.s` defines it and the link step resolves
+    # purpose; `demos/freestanding/start.s` defines it and the link step resolves
     # it. Anything ELSE undefined is still a hard failure. The same
     # exception is made in tools/freestanding/run.sh and tools/kernel/run.sh.
     undef=$(nm -u "$f" 2>/dev/null | awk '{print $NF}' | sed '/^$/d' | grep -vxF osum_panic)
@@ -116,7 +116,7 @@ for s in 0 1; do
 done
 
 echo "== 3. it boots, and it says what it computed =="
-as --64 -o "$TMPD/start.o" demos/kernel/start.s 2>"$TMPD/as.err" \
+as --64 -o "$TMPD/start.o" demos/freestanding/start.s 2>"$TMPD/as.err" \
     && ok "start.s assembles" \
     || { bad "start.s"; sed 's/^/        /' "$TMPD/as.err" | head -5; }
 if ! command -v qemu-system-x86_64 >/dev/null 2>&1; then
