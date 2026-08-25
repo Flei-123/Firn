@@ -107,3 +107,56 @@ with the frozen reference: 1087/1087. Round 79 touches nothing in lib/layout.
 SIDE FINDING, worth knowing: section 34 (the JS promise soak of round 66) is NOT deterministic --
 `jobs rc=-11` in 2 of 4 runs on main and 2 of 3 here, same binary. A real bug in lib/js/gen.fi waiting
 for a round of its own.
+
+## Round B1 (2026-08-25, branch b1-dom) -- the clamp: tree, DOM, computed style
+The browser parts were big and NOT connected: the tokeniser made tokens, the CSS cascade had no
+elements to point at, and lib/dom/ was the GC experiment of round 53, not a DOM. This round is the
+clamp -- one path from bytes of HTML to a tree with a computed style on every element.
+THE NUMBER, measured and not claimed: the OFFICIAL html5lib tree-construction suite, complete and
+unfiltered, 1936 cases in tests/data/html5lib/. Before 1323 (68.34 %), after 1837 (94.89 %). The suite
+is not in html5lib/html5lib-tests any more -- commit 224991ec10 of 26 June 2026 deleted the directory
+and points at web-platform-tests/wpt html/syntax/parsing/resources/. That is where these files come
+from; PROVENANCE.md says so on the spot.
+THE THREE GAPS ROUND 54 NAMED ARE CLOSED. Foreign content: the tree construction dispatcher of
+13.2.6, the integration points, the four correction tables of 13.2.6.5 (37 SVG element names, 58 SVG
+attributes, definitionURL, 11 foreign attributes with prefix and namespace), the breakout tags
+including the END tags br and p, and CDATA -- the tokeniser knows no tree, so the tree computes the
+position of the CDATA content out of the bogus comment and restarts the tokeniser there. `<template>`:
+the 23rd insertion mode, the stack of template insertion modes, the content fragment, the redirection
+of the insertion point, the template rule of foster parenting. Fragment parsing: the context element,
+the tokeniser start state that belongs to it, and the fragment case of "after body". Round 54's own
+known_gaps.dat goes from 0/10 to 9/10; the tenth is not a parser gap but a driver without a context
+field. One expectation in that file was WRONG (`<template><td>` does not drop the td) and was
+corrected against the official suite.
+THE STANDARD MOVED WHILE WE WERE AWAY. "in select" and "in select in table" are GONE from WHATWG
+(relaxed select parsing): select takes arbitrary content, joined the scope list and the end tag group,
+and select/option/optgroup/hr/input got new rules in "in body". One case of round 54 was rewritten to
+the new rule, with the reason in tools/html/LOG.md. Also new here: the scripting flag (it executes
+nothing, it decides whether noscript holds raw text), and the COMPLETE quirks lists -- 55 public
+identifier prefixes instead of the four round 54 built in and named.
+THE DOM: lib/dom/api.fi. The node classes stay in lib/browser/node.fi, because the tree construction
+builds them and a second node type would be a second DOM; they gained Attr.prefix (an attribute has
+three name parts, and `xmlns` lies in the XMLNS namespace WITHOUT a prefix) and Elem.content. New is
+the ACCESS: getElementById, getElementsByTagName/ClassName, querySelector and querySelectorAll over
+the matcher of lib/css/sel.fi, textContent, innerHTML and outerHTML reading (the fragment
+serialisation algorithm with its escaping rules, the void elements and the raw text elements). A
+template behaves as in a browser: its content is a tree of its own, so getElementById does not find
+anything in it and textContent is empty.
+THE STYLE TREE: lib/dom/style.fi. What was missing was not the cascade but the two sources a test
+harness hands in and a browser does not: the DEFAULT STYLESHEET (lib/dom/ua.css, built in) and the
+`<style>` elements of the document itself, in document order, as origin AUTHOR. Plus the walk in
+document order, so the parent's computed style is always finished first -- inheritance and `em` need
+it. Eleven cases pin down inheritance, specificity, order of appearance, the three origins, the
+reversal by !important, the style attribute, em/%, inherit/initial and the foreign namespace.
+FOUND ON THE WAY, in lib/css/sel.fi: a type selector without a namespace prefix matched ONLY HTML
+elements. selectors-4 5.1 says every namespace. Invisible as long as the tree carried no SVG. The
+cross-check of the CSS round against cssselect2 on 14 real pages stays 840/840 after the fix.
+WHAT IS MISSING, named: 99 cases. 88 of them are PROCESSING INSTRUCTIONS -- WHATWG made
+`<?target data?>` a ProcessingInstruction node in June 2026 (PR 12118), this parser still makes the
+old bogus comment. Doing it right means a tokeniser flag, because the frozen html5lib TOKENISER suite
+of section 9 contains 38 `<?` cases that expect a comment; a shortcut that reinterprets the bogus
+comment would pass most of them and be wrong on `<?t d > ?>`. 6 cases need a parser that EXECUTES
+document.write, 4 need the selectedcontent element, 1 is an adoption agency case that was not chased.
+MEASUREMENTS: tools/domb1/run.sh 1837/1936 (94.89 %), same in all three build stages, 17/17 DOM and
+style cases. Section 9b 150/150 own cases, 8 real pages byte-identical across build stages, GC soak
+20000 rounds at +4 KiB. Section 9c 305/305 + 109/109 + 840/840. english 0 0 0 0 0. firnfmt -c clean.
