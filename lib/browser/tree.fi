@@ -66,7 +66,7 @@ export {
     tree_new, tree_buffer_init, tree_init, tree_fragment_init, tree_free,
     tree_token, tree_eof, tree_document, tree_root,
     tree_error, tree_broken, tree_release,
-    tree_switching, tree_sw_pos, tree_sw_tag, tree_sw_delete,
+    tree_switching, tree_sw_pos, tree_sw_tag, tree_sw_delete, tree_input_set,
     tree_mode, tree_open_number,
 }
 
@@ -113,6 +113,7 @@ const ZST_PLAINTEXT: u32 = 1
 const ZST_RCDATA: u32 = 2
 const ZST_RAWTEXT: u32 = 3
 const ZST_SCRIPT: u32 = 4
+const ZST_CDATA: u32 = 5
 
 // --------------------------------------------------------------- The state
 
@@ -146,6 +147,7 @@ struct Tree {
     tt_only_space: bool,
 
     // the feedback onto the tokenizer
+    input: *mut mem.CpBuf, // the text of the current tokenizer run (for CDATA)
     switching: u32, // 0 = none, otherwise ZST_*
     sw_pos: usize, // the source position (relative to the current run)
     sw_tag: mem.CpBuf, // the lastStartTag for the restart
@@ -187,6 +189,7 @@ fn tree_new() -> Tree {
         foster: false,
         tt: gc_null[Chain](),
         tt_only_space: true,
+        input: 0 as *mut mem.CpBuf,
         tmpl: [0; 64],
         n_tmpl: 0,
         adj: foreign.adjust_new(),
@@ -351,6 +354,17 @@ fn tree_broken(b: *mut Tree) -> u32 {
 }
 
 #[no_gc]
+// The driver hands the text of the CURRENT tokenizer run in. The tree
+// construction needs it for exactly one question: a `<![CDATA[` inside
+// foreign content is a bogus comment for the tokenizer, and to restart it
+// as a CDATA section the tree has to know whether the comment ended at a
+// `>` or at the end of the input -- one character difference in the
+// restart position.
+#[no_gc]
+fn tree_input_set(b: *mut Tree, t: *mut mem.CpBuf) {
+    (*b).input = t
+}
+
 fn tree_mode(b: *mut Tree) -> u32 {
     return (*b).mode
 }
@@ -2274,6 +2288,11 @@ fn in_body_start(b: *mut Tree) -> AllocError!u32 {
     let n: u32 = (*b).tname
     if n == tag.M_HTML {
         parse_error(b)
+        // Inside a `template` the token is dropped: the attributes must not
+        // reach the `html` element outside it.
+        if template_on_stack(b) {
+            return A_DONE
+        }
         if (*b).n_open > 0 {
             let ok: bool = try attribute_amend(b, node.node_as_elem((*b).open[0]))
         }
@@ -2287,7 +2306,8 @@ fn in_body_start(b: *mut Tree) -> AllocError!u32 {
     }
     if n == tag.M_BODY {
         parse_error(b)
-        if (*b).n_open < 2 || !node.elem_is((*b).open[1], tag.M_BODY) {
+        if (*b).n_open < 2 || !node.elem_is((*b).open[1], tag.M_BODY) ||
+        template_on_stack(b) {
             return A_DONE
         }
         (*b).frameset_ok = false
@@ -3631,10 +3651,53 @@ fn foreign_unwind(b: *mut Tree) {
     }
 }
 
+// A `<![CDATA[` in foreign content. The tokenizer knows no tree and
+// therefore made a bogus comment `[CDATA[...` out of it. Here it is turned
+// back: the tokenizer is restarted at the first character of the CDATA
+// CONTENT with the start state `CDATA section`, and the comment is dropped.
+//
+// The restart position is computed, not guessed. A bogus comment covers
+// `<!` + data + `>`, so the `<` lies `data + 3` characters before the end
+// position of the token -- and `data + 2` before it when the input ended
+// without a `>`. Nine characters further (`<![CDATA[`) the content begins.
+fn cdata_restart(b: *mut Tree) -> bool {
+    let st: *mut token_stream.Stream = (*b).stream
+    let off: usize = token_stream.stream_data(st)
+    let n: usize = token_stream.chain_length(st, off)
+    if n < 7 {
+        return false
+    }
+    if token_stream.chain_cp(st, off, 0) != 91 as u32 ||
+    token_stream.chain_cp(st, off, 1) != 67 as u32 ||
+    token_stream.chain_cp(st, off, 2) != 68 as u32 ||
+    token_stream.chain_cp(st, off, 3) != 65 as u32 ||
+    token_stream.chain_cp(st, off, 4) != 84 as u32 ||
+    token_stream.chain_cp(st, off, 5) != 65 as u32 ||
+    token_stream.chain_cp(st, off, 6) != 91 as u32 {
+        return false
+    }
+    let ende: usize = token_stream.stream_pos(st)
+    var before: usize = 3
+    if (*b).input == 0 as *mut mem.CpBuf || ende == 0 ||
+    mem.cp_at((*b).input, ende - 1) != 62 as u32 {
+        before = 2
+    }
+    if ende + 9 < n + before {
+        return false
+    }
+    (*b).switching = ZST_CDATA
+    (*b).sw_pos = ende + 9 - n - before
+    mem.cp_clear(&(*b).sw_tag)
+    return true
+}
+
 fn mark_foreign(b: *mut Tree) -> AllocError!u32 {
     let st: *mut token_stream.Stream = (*b).stream
     let kind: u32 = token_stream.stream_kind(st)
     if kind == tokens.TB_COMMENT {
+        if cdata_restart(b) {
+            return A_DONE
+        }
         let ok: bool = try comment_insert(b, gc_null[Node]())
         if !ok {
             return A_OUT
