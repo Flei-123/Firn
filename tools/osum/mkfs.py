@@ -20,7 +20,8 @@ The format, from `demos/kernel/fs.fi`:
     block 1        the block bitmap, bit b in octet b/8
     blocks 2..33   the inode table, 128 octets each, four per block
     block 34..     data
-    an inode       type, size, nlink, twelve direct blocks, one indirect
+    an inode       type, size, nlink, eleven direct blocks, one indirect,
+                   one double indirect (round K4)
     a dirent       32 octets: inode number, then 24 for the name
 
 Usage:
@@ -42,10 +43,15 @@ INODE_BLOCKS = 32
 DATA_START = 34
 DIRENT = 32
 NAME_LEN = 24
-DIRECT = 12
+DIRECT = 11
 
 T_FREE, T_FILE, T_DIR = 0, 1, 2
-I_TYPE, I_SIZE, I_NLINK, I_DIRECT, I_INDIRECT = 0, 8, 16, 24, 120
+I_TYPE, I_SIZE, I_NLINK, I_DIRECT, I_INDIRECT = 0, 8, 16, 24, 112
+# ROUND K4: the twelfth direct slot became the double indirect pointer --
+# 11 + 64 + 64 * 64 blocks instead of 12 + 64. `demos/kernel/fs.fi` has the
+# same three constants and the same two levels; the two must agree octet
+# for octet, and section 3 of tools/posix/run.sh checks that they do.
+I_DINDIRECT = 120
 SB = dict(MAGIC=0, BSIZE=8, BLOCKS=16, INODES=24, BITMAP=32, ITABLE=40,
           DATA=48, ROOT=56)
 
@@ -120,11 +126,19 @@ class Fs:
             self.iset(ino, I_DIRECT + index * 8, b)
             return b
         k = index - DIRECT
-        if k >= BS // 8:
+        if k < BS // 8:
+            return self.single_block(ino, k, grow)
+        d = k - BS // 8
+        if d >= (BS // 8) * (BS // 8):
             raise SystemExit(
                 "mkfs: a file may hold %d octets in this format (%d direct "
-                "blocks + %d through the indirect one, see fs.fi); this one "
-                "is bigger" % ((DIRECT + BS // 8) * BS, DIRECT, BS // 8))
+                "blocks, %d through the indirect one and %d through the "
+                "double indirect one, see fs.fi); this one is bigger"
+                % ((DIRECT + BS // 8 + (BS // 8) ** 2) * BS, DIRECT,
+                   BS // 8, (BS // 8) ** 2))
+        return self.double_block(ino, d, grow)
+
+    def single_block(self, ino, k, grow):
         ib = self.iget(ino, I_INDIRECT)
         if not ib:
             if not grow:
@@ -136,6 +150,28 @@ class Fs:
             return b
         b = self.block_alloc()
         self.p64(ib * BS + k * 8, b)
+        return b
+
+    def double_block(self, ino, d, grow):
+        l1 = self.iget(ino, I_DINDIRECT)
+        if not l1:
+            if not grow:
+                return 0
+            l1 = self.block_alloc()
+            self.iset(ino, I_DINDIRECT, l1)
+        slot = d // (BS // 8)
+        l2 = self.g64(l1 * BS + slot * 8)
+        if not l2:
+            if not grow:
+                return 0
+            l2 = self.block_alloc()
+            self.p64(l1 * BS + slot * 8, l2)
+        at = d % (BS // 8)
+        b = self.g64(l2 * BS + at * 8)
+        if b or not grow:
+            return b
+        b = self.block_alloc()
+        self.p64(l2 * BS + at * 8, b)
         return b
 
     def write_at(self, ino, off, data):

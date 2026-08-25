@@ -21,8 +21,12 @@
  *      and leave with 70. Without this definition every user program
  *      would carry an undefined symbol, and `ld` would refuse it.
  *
- * The system call numbers are the ones in `demos/kernel/sys.fi`:
- * 10 = exit, 11 = write.
+ * The system call numbers are the ones in `demos/kernel/sys.fi`, and since
+ * ROUND K4 those are Linux's: 60 = exit, 1 = write. Round K1 had 10 and 11
+ * here, and the day the table changed underneath them this file was the
+ * one that went quiet -- a program that printed everything it had and then
+ * spun in the loop under `exit`, because `exit` had become a call the
+ * kernel does not have and -ENOSYS does not stop anybody.
  */
 
     .section .text
@@ -32,7 +36,7 @@ _start:
     andq $-16, %rsp                 /* System V: aligned before the call */
     call USER_ENTRY                 /* rdi already holds the arguments */
     movq %rax, %rdi                 /* the return value is the exit code */
-    movq $10, %rax
+    movq $60, %rax                  /* exit */
     syscall
 1:  jmp 1b                          /* exit does not come back */
 
@@ -42,10 +46,10 @@ osum_panic:
     movq %rsi, %rdx
     movq %rdi, %rsi
     movq $2, %rdi                   /* descriptor 2 */
-    movq $11, %rax                  /* write */
+    movq $1, %rax                   /* write */
     syscall
     movq $70, %rdi                  /* and out, with a code of its own */
-    movq $10, %rax
+    movq $60, %rax                  /* exit */
     syscall
 2:  jmp 2b
 
