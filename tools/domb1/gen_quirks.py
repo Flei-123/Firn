@@ -143,7 +143,7 @@ export {
     both_prefix_bytes, limited_prefix_bytes,
 }
 '''
-    parts = [head]
+    parts = [head.rstrip('\n')]
     parts.append(literal("quirks_exact_bytes", QUIRKS_EXACT,
                          "Public identifiers: an exact match means quirks."))
     parts.append(literal("quirks_system_bytes", QUIRKS_SYSTEM,
