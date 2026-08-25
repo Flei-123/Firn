@@ -396,6 +396,12 @@ out of the queue, not distinct tasks — a task that is preempted and
 picked up again counts twice. The boot processor is ahead because it also
 runs the loop that waits for the eight to finish.)
 
+`tools/smp/run.sh` takes the FASTER of two runs on each side — the same
+treatment for one core and for four — because a run in which the host
+took an emulated core away for a while measures the host. The spread that
+removes is the table above; it is written down rather than smoothed
+away.
+
 On an earlier, quieter series the same benchmark gave **959 ms against
 226 ms, 4.24×**. Neither that number nor the 1.88 is the "true" one; the
 honest statement is that on this host, under load, four cores finish the

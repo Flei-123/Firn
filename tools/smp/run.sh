@@ -168,10 +168,27 @@ echo "== 4. THE MEASUREMENT: the same work on one core and on four =="
 # The two runs are the same image, the same machine and the same work --
 # `-smp 4` in both cases, so that QEMU builds exactly the same guest. The
 # only difference is whether the kernel starts the other three cores.
-t1=$(value "$TMPD/nosmp.txt" 'smp: bench cores=1  units=12  step=[0-9]+  cycles=[0-9]+')
-t4=$(value "$TMPD/c4.txt" 'smp: bench cores=4  units=12  step=[0-9]+  cycles=[0-9]+')
-m1=$(grep -oE 'smp: bench .*ms=[0-9]+' "$TMPD/nosmp.txt" | grep -oE '[0-9]+$')
-m4=$(grep -oE 'smp: bench .*ms=[0-9]+' "$TMPD/c4.txt" | grep -oE '[0-9]+$')
+#
+# BEST OF TWO, on both sides, and said out loud rather than hidden: this
+# is an emulated machine on a shared build host, and a run in which the
+# host took a core away for a while measures the host. Taking the faster
+# of two runs on EACH side keeps the comparison symmetric -- it is the
+# same treatment for one core and for four -- and the spread it removes is
+# written down in docs/ROUNDK5.md 8 instead of being smoothed away.
+run 4 "" "$TMPD/c4b.txt"
+run 4 "nosmp" "$TMPD/nosmpb.txt"
+best() { # pattern file file -> the smaller of the two numbers
+    local a b
+    a=$(value "$2" "$1"); b=$(value "$3" "$1")
+    [ -z "$a" ] && { echo "$b"; return; }
+    [ -z "$b" ] && { echo "$a"; return; }
+    [ "$b" -lt "$a" ] && a=$b
+    echo "$a"
+}
+t1=$(best 'smp: bench cores=1  units=12  step=[0-9]+  cycles=[0-9]+' "$TMPD/nosmp.txt" "$TMPD/nosmpb.txt")
+t4=$(best 'smp: bench cores=4  units=12  step=[0-9]+  cycles=[0-9]+' "$TMPD/c4.txt" "$TMPD/c4b.txt")
+m1=$(grep -hoE 'smp: bench .*ms=[0-9]+' "$TMPD/nosmp.txt" "$TMPD/nosmpb.txt" | grep -oE '[0-9]+$' | sort -n | head -1)
+m4=$(grep -hoE 'smp: bench .*ms=[0-9]+' "$TMPD/c4.txt" "$TMPD/c4b.txt" | grep -oE '[0-9]+$' | sort -n | head -1)
 printf '        one core:   %s cycles, %s ms\n' "${t1:-?}" "${m1:-?}"
 printf '        four cores: %s cycles, %s ms\n' "${t4:-?}" "${m4:-?}"
 if [ -n "$t1" ] && [ -n "$t4" ] && [ "$t4" -gt 0 ]; then
@@ -222,8 +239,8 @@ echo "== 5b. the second measurement: the same work THROUGH THE SCHEDULER =="
 # Eight kernel tasks of arithmetic in one run queue. Nothing hands them
 # out; every core takes what is ready. This is the number that says the
 # SCHEDULER distributes work, not just that four cores exist.
-q1=$(grep -oE 'smp: sched .*ms=[0-9]+' "$TMPD/nosmp.txt" | grep -oE '[0-9]+$')
-q4=$(grep -oE 'smp: sched .*ms=[0-9]+' "$TMPD/c4.txt" | grep -oE '[0-9]+$')
+q1=$(grep -hoE 'smp: sched .*ms=[0-9]+' "$TMPD/nosmp.txt" "$TMPD/nosmpb.txt" | grep -oE '[0-9]+$' | sort -n | head -1)
+q4=$(grep -hoE 'smp: sched .*ms=[0-9]+' "$TMPD/c4.txt" "$TMPD/c4b.txt" | grep -oE '[0-9]+$' | sort -n | head -1)
 printf '        eight tasks on one core: %s ms   on four: %s ms\n' "${q1:-?}" "${q4:-?}"
 if [ -n "$q1" ] && [ -n "$q4" ] && [ "$q4" -gt 0 ]; then
     permil=$((q1 * 1000 / q4))
