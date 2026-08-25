@@ -1,0 +1,925 @@
+// demos/kernel/smp.fi -- round K5: the other processors.
+//
+// Up to round K2 this kernel used one core of a machine that has four.
+// Not because it decided to: because a processor that is not started
+// stays in the halt state the firmware left it in, and starting one is a
+// procedure with no shortcut. This file is that procedure, and then the
+// four measurements that say whether it worked.
+//
+// WHAT HAPPENS, IN ORDER:
+//
+//   1. `probe`  -- ask the firmware. `acpi.fi` reads the MADT and hands
+//      over the APIC id of every usable processor. Nothing here guesses a
+//      number; under `-smp 1` the answer is one and under `-smp 4` it is
+//      four, out of the same kernel image.
+//   2. `start`  -- for every processor except the one we are standing on:
+//      a stack of its own, a descriptor table of its own, a double fault
+//      stack of its own, then INIT and twice STARTUP over the local APIC,
+//      then wait until the core has said it is there. One at a time.
+//   3. `ap_main` -- what a started core does: load its tables, switch on
+//      its own local APIC, report in, and then take part.
+//   4. the measurements, each with the counter-check that makes it one:
+//      * BENCH  -- the same total amount of arithmetic, once on one core
+//        and once spread over all of them. The counter-check is the run
+//        with `-smp 1`: the same kernel, the same work, and the time has
+//        to be about as many times longer as there are cores.
+//      * STRESS -- every core raises the same counter, under a lock. With
+//        `nolock` on the command line every lock in this kernel is a
+//        no-op, and the counter has to come out TOO SMALL. A lock that is
+//        never tested against its own absence is decoration.
+//      * FRAMES -- every core takes frames out of the one allocator. With
+//        the lock every frame is handed out once; without it two cores
+//        get the SAME frame, which is the bug that eats a kernel from the
+//        inside, and it is counted here rather than asserted away.
+//      * SCHED  -- kernel tasks in the one run queue, taken by whichever
+//        core is free. The number that matters is how many DIFFERENT
+//        cores ran them.
+//
+// WHAT THIS ROUND DELIBERATELY DOES NOT DO. Ring 3 stays on the boot
+// processor. A process entering the kernel through `syscall` lands on the
+// stack that `isr.s` reads out of ONE fixed offset in the data area
+// (`KSTACK_CUR`, see isr.s) -- one word for the whole machine. Making
+// that per core means either a per-core GS base or a second table lookup
+// in the system call entry point, in assembly, before there is a stack;
+// that is a round of its own. Until then the application processors run
+// kernel tasks, `sched.set_kernel_stack` only writes the word when it is
+// the boot processor writing it, and nothing about ring 3 changes.
+
+import serial
+import kstate
+import mem
+import idt
+import apic
+import atomic
+import cpu
+import acpi
+import sched
+
+export {
+    stage, ap_main, parse, mode_of, present, M_NOSMP, M_NOLOCK, M_SMPLONG
+}
+
+// ------------------------------------------------------- the parameters
+
+// Indices in the table out of isr.s.
+const V_SMP: u64 = 64 // `smp_vectors` in smp.s
+const V_AP_MAIN: u64 = 65 // this file's `ap_main`
+
+// Fields of the parameter block, see smp.s.
+const P_CR3: u64 = 0x00
+const P_STACK: u64 = 0x08
+const P_ENTRY: u64 = 0x10
+const P_KDATA: u64 = 0x18
+const P_CPU: u64 = 0x20
+const P_FLAG: u64 = 0x28
+
+// The scalars of this file, offsets in the SMP page (kstate.SMP_OFF).
+// 0..128 belong to cpu.fi and acpi.fi, 128..192 to the list of APIC ids.
+const S_PHASE: u64 = 256 // what the started cores are to do
+const S_DONE: u64 = 264 // how many have finished the phase
+const S_COUNTER: u64 = 272 // the counter of the stress test
+const S_UNITS: u64 = 280 // units of work per core
+const S_T0: u64 = 288
+const S_T1: u64 = 296
+const S_STARTED: u64 = 304
+const S_FAILED: u64 = 312
+const S_TRAMP: u64 = 320
+const S_DUPS: u64 = 328
+const S_MODE: u64 = 336
+const S_FRAMES: u64 = 1024 // 8 cores * 16 frames * 8 octets
+
+// The phases. A started core watches S_PHASE and does what it says; the
+// boot processor waits until S_DONE has reached the number of cores.
+const PH_WAIT: u64 = 0
+const PH_BENCH: u64 = 1
+const PH_STRESS: u64 = 2
+const PH_FRAMES: u64 = 3
+const PH_SCHED: u64 = 4
+
+// The words of the command line this file reads.
+const M_NOSMP: u64 = 1 // do not start the other cores
+const M_NOLOCK: u64 = 2 // every lock is a no-op -- the counter-check
+const M_SMPLONG: u64 = 4 // the long version of the benchmark
+
+// How much work the benchmark is. TOTAL is divided by the number of
+// cores, so both runs do the SAME arithmetic -- that is the whole point
+// of the comparison. 12 divides by 1, 2, 3, 4 and 6.
+const TOTAL_UNITS: u64 = 12
+const STEP: u64 = 8000000 // turns of the inner loop in one unit
+const STEP_LONG: u64 = 32000000
+
+// The stress test.
+const STRESS_ITER: u64 = 1500
+const STRESS_GAP: u64 = 6 // how wide the window inside the lock is
+
+// The frame test.
+const FR_PER: u64 = 16
+
+const AP_STACK_FRAMES: u64 = 4 // 16 KiB, as a task gets
+const GDT_IN_PAGE: u64 = 0x000
+const GDTR_IN_PAGE: u64 = 0x040
+const TSS_IN_PAGE: u64 = 0x080
+
+// ---------------------------------------------------------- the scalars
+
+fn sp(state: u64, off: u64) -> u64 {
+    return state + kstate.SMP_OFF + off
+}
+
+fn sget(state: u64, off: u64) -> u64 {
+    return kstate.get(state, kstate.SMP_OFF + off)
+}
+
+fn sset(state: u64, off: u64, v: u64) {
+    kstate.set(state, kstate.SMP_OFF + off, v)
+}
+
+fn at(vectors: u64, i: u64) -> u64 {
+    return __mmio_read64((vectors + i * 8) as *mut u64)
+}
+
+fn tv(table: u64, i: u64) -> u64 {
+    return __mmio_read64((table + i * 8) as *mut u64)
+}
+
+fn mode(state: u64) -> u64 {
+    return sget(state, S_MODE)
+}
+
+fn on(state: u64, bit: u64) -> bool {
+    return (mode(state) & bit) != 0
+}
+
+fn yes(b: bool) -> u64 {
+    if b {
+        return 1
+    }
+    return 0
+}
+
+// ------------------------------------------------------------ step one
+
+// Reads the firmware tables and enters every processor it reports.
+// Returns how many there are; 1 when there is no MADT, because the core
+// this is running on exists whatever the firmware says.
+fn probe(state: u64) -> u64 {
+    cpu.set_lapic(state, apic.window(state))
+    let n: u64 = acpi.find(state)
+    if n == 0 {
+        cpu.register(state, apic.id(state))
+        cpu.set_online(state, 0, 1)
+        return 1
+    }
+    // The core we are standing on has to become index 0, whatever
+    // position the table put it in -- everything else in this kernel
+    // calls the boot processor zero.
+    let me: u64 = apic.id(state)
+    cpu.register(state, me)
+    var i: u64 = 0
+    while i < n {
+        let id: u64 = acpi.cpus(state, i)
+        if id != me && id != 256 {
+            cpu.register(state, id)
+        }
+        i = i + 1
+    }
+    cpu.set_online(state, 0, 1)
+    return cpu.count(state)
+}
+
+fn present(state: u64) -> u64 {
+    return cpu.count(state)
+}
+
+// ------------------------------------------------------------ step two
+
+// A pause of `us` microseconds, measured on the cycle counter that
+// `apic.calibrate` held against the PIT. Interrupts are not needed for
+// it, which matters: the cores are started before they have a timer.
+fn udelay(state: u64, us: u64) {
+    let hz: u64 = apic.tsc_hz(state)
+    if hz == 0 {
+        var i: u64 = 0
+        while i < us * 100 {
+            atomic.pause()
+            i = i + 1
+        }
+        return
+    }
+    let want: u64 = hz / 1000000 * us
+    let t0: u64 = apic.tsc()
+    while apic.tsc() - t0 < want {
+        atomic.pause()
+    }
+}
+
+// The sequence out of the MP specification: INIT, then STARTUP twice. The
+// second STARTUP is not superstition -- the specification asks for it,
+// and a core that came up on the first one ignores the second because it
+// is no longer in the wait-for-startup state.
+const ICR_INIT: u64 = 0x00000500
+const ICR_STARTUP: u64 = 0x00000600
+const ICR_ASSERT: u64 = 0x00004000
+const ICR_LEVEL: u64 = 0x00008000
+
+fn wake(state: u64, apid: u64, vector: u64) {
+    apic.ipi(state, apid, ICR_INIT | ICR_LEVEL | ICR_ASSERT)
+    udelay(state, 200)
+    apic.ipi(state, apid, ICR_INIT | ICR_LEVEL)
+    udelay(state, 10000)
+    apic.ipi(state, apid, ICR_STARTUP | vector)
+    udelay(state, 200)
+    apic.ipi(state, apid, ICR_STARTUP | vector)
+    udelay(state, 200)
+}
+
+// Copies the blob out of the kernel image down to where a STARTUP message
+// can point at it, and starts every core but this one.
+fn start(state: u64) {
+    let vectors: u64 = kstate.get(state, kstate.VECTORS)
+    let table: u64 = at(vectors, V_SMP)
+    let blob: u64 = tv(table, 0)
+    let blob_end: u64 = tv(table, 1)
+    let base: u64 = tv(table, 2)
+    let param: u64 = tv(table, 3)
+    sset(state, S_TRAMP, base)
+
+    var i: u64 = 0
+    while blob + i < blob_end {
+        kstate.set8(base + i, kstate.get8(blob + i) as u8)
+        i = i + 1
+    }
+
+    // What every core needs and what is the same for all of them.
+    atomic.store(param + P_CR3, kstate.get(state, kstate.KPML4))
+    atomic.store(param + P_KDATA, state)
+    atomic.store(param + P_ENTRY, at(vectors, V_AP_MAIN))
+
+    let n: u64 = cpu.count(state)
+    var k: u64 = 1
+    while k < n {
+        one(state, k, param, base)
+        k = k + 1
+    }
+}
+
+fn one(state: u64, k: u64, param: u64, base: u64) {
+    let stack: u64 = mem.frame_run(state, AP_STACK_FRAMES)
+    let page: u64 = mem.frame_alloc(state)
+    let dfst: u64 = mem.frame_alloc(state)
+    if stack == 0 || page == 0 || dfst == 0 {
+        kstate.add(state, kstate.SMP_OFF + S_FAILED, 1)
+        return
+    }
+    let top: u64 = stack + AP_STACK_FRAMES * mem.FRAME_SIZE
+    cpu.set(state, k, cpu.C_STACK, top)
+    cpu.set(state, k, cpu.C_GDT, page)
+    cpu.set(state, k, cpu.C_TSS, dfst + mem.FRAME_SIZE)
+
+    atomic.store(param + P_STACK, top)
+    atomic.store(param + P_CPU, k)
+    atomic.store(param + P_FLAG, 0)
+    kstate.add(state, kstate.SMP_OFF + S_STARTED, 1)
+
+    wake(state, cpu.apic_id(state, k), base >> 12)
+
+    // Wait for the core to have taken the block -- only then may the next
+    // one have it. Half a second is a lot on a machine that answers in
+    // microseconds; a core that needs longer is a core that is not there.
+    var guard: u64 = 0
+    while guard < 500 {
+        if atomic.load(param + P_FLAG) != 0 {
+            guard = 500
+        } else {
+            udelay(state, 1000)
+            guard = guard + 1
+        }
+    }
+    if atomic.load(param + P_FLAG) == 0 {
+        kstate.add(state, kstate.SMP_OFF + S_FAILED, 1)
+        return
+    }
+    guard = 0
+    while guard < 500 {
+        if cpu.online(state, k) {
+            guard = 500
+        } else {
+            udelay(state, 1000)
+            guard = guard + 1
+        }
+    }
+    if !cpu.online(state, k) {
+        kstate.add(state, kstate.SMP_OFF + S_FAILED, 1)
+    }
+}
+
+// ---------------------------------------------------------- step three
+
+// `KERNEL_AP_MAIN` out of isr.s: where a started core lands. It arrives
+// in long mode with the tables of the trampoline, on the stack the boot
+// processor allocated for it, and with interrupts off.
+fn ap_main(state: u64, index: u64) {
+    tables(state, index)
+    apic.core_init(state, index)
+    cpu.set(state, index, cpu.C_ONLINE, 1)
+    atomic.barrier()
+    phases(state, index)
+    // The scheduler loop never returns; if it ever did, stopping is the
+    // only honest thing left.
+    while true {
+        asm("cli")
+        asm("hlt")
+    }
+}
+
+// A descriptor table and a task state segment OF ITS OWN. Sharing the
+// boot processor's would mean sharing its RSP0 and its IST1 -- two cores
+// that fault at the same moment would then land on the same stack, and
+// the report of the first fault would be written over by the second.
+//
+// The selectors stay the ones out of boot.s, which is why the table can
+// be exchanged from a compiled function at all: cs keeps its number and
+// the descriptor behind that number is the same one.
+fn tables(state: u64, index: u64) {
+    let page: u64 = cpu.get(state, index, cpu.C_GDT)
+    let src: u64 = kstate.get(state, kstate.GDT)
+    var i: u64 = 0
+    while i < 8 {
+        __mmio_write64((page + GDT_IN_PAGE + i * 8) as *mut u64,
+            __mmio_read64((src + i * 8) as *mut u64))
+        i = i + 1
+    }
+    let gdtr: u64 = page + GDTR_IN_PAGE
+    __mmio_write16(gdtr as *mut u16, (8 * 8 - 1) as u16)
+    __mmio_write64((gdtr + 2) as *mut u64, page + GDT_IN_PAGE)
+    asm("lgdt [rax]", in("rax") gdtr, clobber("memory"))
+    // The descriptor of its own segment and `ltr`, then the shared
+    // interrupt table: 256 gates that point into isr.s, and a gate is the
+    // same on every core.
+    idt.tss_install(page + GDT_IN_PAGE, page + TSS_IN_PAGE,
+        cpu.get(state, index, cpu.C_STACK), cpu.get(state, index, cpu.C_TSS))
+    asm("lidt [rax]", in("rax") state + kstate.IDTR, clobber("memory"))
+}
+
+// What a started core does. It watches one word; the boot processor
+// writes a number into it and waits until every core has counted itself
+// done. That is the plainest barrier there is, and it needs nothing but
+// the atomic add.
+fn phases(state: u64, index: u64) {
+    var seen: u64 = PH_WAIT
+    while true {
+        let ph: u64 = atomic.load(sp(state, S_PHASE))
+        if ph != seen {
+            seen = ph
+            if ph == PH_BENCH {
+                bench_core(state, index)
+                atomic.fetch_add(sp(state, S_DONE), 1)
+            }
+            if ph == PH_STRESS {
+                stress_core(state, index)
+                atomic.fetch_add(sp(state, S_DONE), 1)
+            }
+            if ph == PH_FRAMES {
+                frames_core(state, index)
+                atomic.fetch_add(sp(state, S_DONE), 1)
+            }
+            if ph == PH_SCHED {
+                scheduler_core(state, index)
+                return
+            }
+        }
+        atomic.pause()
+    }
+}
+
+// ----------------------------------------------------- the work itself
+
+// Arithmetic and nothing else: no memory the other cores touch, no
+// interrupt, no lock. Whatever difference the measurement shows was made
+// by the number of cores and by nothing in this loop. The wrapping forms
+// `*%` and `+%` are meant -- a hash that does not overflow is not a hash
+// (round 72: the plain operators are checked and would panic).
+fn grind(steps: u64) -> u64 {
+    var acc: u64 = 0x243F6A8885A308D3
+    var i: u64 = 0
+    while i < steps {
+        acc = acc *% 6364136223846793005
+        acc = acc +% 1442695040888963407
+        acc = acc ^ (acc >> 33)
+        i = i + 1
+    }
+    return acc
+}
+
+fn step_size(state: u64) -> u64 {
+    if on(state, M_SMPLONG) {
+        return STEP_LONG
+    }
+    return STEP
+}
+
+fn bench_core(state: u64, index: u64) {
+    let units: u64 = sget(state, S_UNITS)
+    let step: u64 = step_size(state)
+    let t0: u64 = apic.tsc()
+    var acc: u64 = 0
+    var u: u64 = 0
+    while u < units {
+        acc = acc ^ grind(step)
+        u = u + 1
+    }
+    let t1: u64 = apic.tsc()
+    cpu.set(state, index, cpu.C_SUM, acc)
+    cpu.set(state, index, cpu.C_CYCLES, t1 - t0)
+    cpu.set(state, index, cpu.C_WORK, units)
+}
+
+// The three steps a lock exists for: read, change, write. They are NOT
+// written as one atomic instruction here on purpose -- an atomic add
+// would make the lock unnecessary and would prove nothing about it. The
+// gap between reading and writing is widened by a handful of `pause`
+// instructions so that the counter-check is a MEASUREMENT and not a coin
+// toss: without the lock the loss has to show in every run, not in one
+// out of ten.
+fn stress_core(state: u64, index: u64) {
+    let p: u64 = sp(state, S_COUNTER)
+    var i: u64 = 0
+    while i < STRESS_ITER {
+        atomic.lock_take(state, atomic.L_STRESS, index)
+        let v: u64 = atomic.load(p)
+        var k: u64 = 0
+        while k < STRESS_GAP {
+            atomic.pause()
+            k = k + 1
+        }
+        atomic.store(p, v + 1)
+        atomic.lock_give(state, atomic.L_STRESS)
+        i = i + 1
+    }
+}
+
+// Every core takes frames out of the ONE allocator and writes down what
+// it got. Nothing is widened here and nothing is arranged: this is the
+// allocator every other part of the kernel uses, and the race is the one
+// it really has -- find a free bit, set it, count down. Two cores that
+// find the same bit both come back with the same frame.
+fn frames_core(state: u64, index: u64) {
+    let row: u64 = sp(state, S_FRAMES) + index * FR_PER * 8
+    var i: u64 = 0
+    while i < FR_PER {
+        atomic.store(row + i * 8, mem.frame_alloc(state))
+        i = i + 1
+    }
+}
+
+// -------------------------------------------------------- the barrier
+
+fn run_phase(state: u64, index: u64, ph: u64) {
+    let n: u64 = cpu.online_count(state)
+    atomic.store(sp(state, S_DONE), 0)
+    atomic.barrier()
+    atomic.store(sp(state, S_PHASE), ph)
+    if ph == PH_BENCH {
+        bench_core(state, index)
+    }
+    if ph == PH_STRESS {
+        stress_core(state, index)
+    }
+    if ph == PH_FRAMES {
+        frames_core(state, index)
+    }
+    atomic.fetch_add(sp(state, S_DONE), 1)
+    var guard: u64 = 0
+    while atomic.load(sp(state, S_DONE)) < n {
+        atomic.pause()
+        guard = guard + 1
+        if guard > 4000000000 {
+            return
+        }
+    }
+}
+
+// ------------------------------------------------------------ the stage
+
+// What `kmain.fi` calls. Everything above happens here, in order, and
+// every number that comes out of it is printed rather than believed.
+fn stage(state: u64) {
+    var s_none: [u8; 26] = "smp: no local APIC, alone\0"
+    var s_cpus: [u8; 11] = "smp: cpus=\0"
+    var s_acpi: [u8; 8] = "  acpi=\0"
+    var s_rev: [u8; 7] = "  rev=\0"
+    var s_ids: [u8; 8] = "  apic=\0"
+    var s_off: [u8; 27] = "smp: nosmp, one core only\0\0"
+    var s_on: [u8; 13] = "smp: online=\0"
+    var s_of: [u8; 5] = " of \0"
+    var s_fail: [u8; 10] = "  failed=\0"
+    var s_lock: [u8; 24] = "smp: locks OFF (nolock)\0"
+    var s_sp: [u8; 2] = " \0"
+
+    if !apic.active(state) {
+        serial.puts((&s_none[0]) as u64)
+        serial.nl()
+        return
+    }
+    if on(state, M_NOLOCK) {
+        atomic.set_off(state, 1)
+        serial.puts((&s_lock[0]) as u64)
+        serial.nl()
+    }
+    let n: u64 = probe(state)
+    serial.puts((&s_cpus[0]) as u64)
+    serial.dec(n)
+    serial.puts((&s_acpi[0]) as u64)
+    serial.dec(yes(acpi.valid(state)))
+    serial.puts((&s_rev[0]) as u64)
+    serial.dec(acpi.revision(state))
+    serial.puts((&s_ids[0]) as u64)
+    var i: u64 = 0
+    while i < n {
+        serial.dec(cpu.apic_id(state, i))
+        serial.puts((&s_sp[0]) as u64)
+        i = i + 1
+    }
+    serial.nl()
+
+    if on(state, M_NOSMP) {
+        serial.puts((&s_off[0]) as u64)
+        serial.nl()
+    } else {
+        start(state)
+    }
+    serial.puts((&s_on[0]) as u64)
+    serial.dec(cpu.online_count(state))
+    serial.puts((&s_of[0]) as u64)
+    serial.dec(n)
+    serial.puts((&s_fail[0]) as u64)
+    serial.dec(sget(state, S_FAILED))
+    serial.nl()
+
+    bench(state)
+    stress(state)
+    frames(state)
+    schedule_demo(state)
+    locks(state)
+}
+
+// --------------------------------------------------------- measurement 1
+
+fn bench(state: u64) {
+    var s_head: [u8; 12] = "smp: bench \0"
+    var s_cores: [u8; 7] = "cores=\0"
+    var s_units: [u8; 9] = "  units=\0"
+    var s_step: [u8; 8] = "  step=\0"
+    var s_cyc: [u8; 10] = "  cycles=\0"
+    var s_ms: [u8; 7] = "  ms=\0\0"
+    var s_per: [u8; 13] = "smp: percore\0"
+    var s_c: [u8; 4] = "  c\0"
+    var s_eq: [u8; 2] = "=\0"
+
+    let online: u64 = cpu.online_count(state)
+    var units: u64 = TOTAL_UNITS / online
+    if units == 0 {
+        units = 1
+    }
+    sset(state, S_UNITS, units)
+
+    // Both sides of the comparison have to be measured under the same
+    // conditions. The started cores have no timer yet, so the boot
+    // processor gives its own up for the length of the measurement --
+    // otherwise the single-core run would carry a hundred interrupts a
+    // second that the four-core run only carries on one of its four.
+    apic.timer_stop(state)
+    let t0: u64 = apic.tsc()
+    run_phase(state, 0, PH_BENCH)
+    let t1: u64 = apic.tsc()
+    apic.timer_start(state, 100)
+    sset(state, S_T0, t0)
+    sset(state, S_T1, t1)
+
+    let hz: u64 = apic.tsc_hz(state)
+    serial.puts((&s_head[0]) as u64)
+    serial.puts((&s_cores[0]) as u64)
+    serial.dec(online)
+    serial.puts((&s_units[0]) as u64)
+    serial.dec(units * online)
+    serial.puts((&s_step[0]) as u64)
+    serial.dec(step_size(state))
+    serial.puts((&s_cyc[0]) as u64)
+    serial.dec(t1 - t0)
+    serial.puts((&s_ms[0]) as u64)
+    if hz > 0 {
+        serial.dec((t1 - t0) / (hz / 1000))
+    } else {
+        serial.dec(0)
+    }
+    serial.nl()
+
+    serial.puts((&s_per[0]) as u64)
+    var i: u64 = 0
+    while i < cpu.count(state) {
+        serial.puts((&s_c[0]) as u64)
+        serial.dec(i)
+        serial.puts((&s_eq[0]) as u64)
+        serial.dec(cpu.get(state, i, cpu.C_CYCLES))
+        i = i + 1
+    }
+    serial.nl()
+}
+
+// --------------------------------------------------------- measurement 2
+
+fn stress(state: u64) {
+    var s_head: [u8; 13] = "smp: stress \0"
+    var s_want: [u8; 6] = "want=\0"
+    var s_got: [u8; 7] = "  got=\0"
+    var s_lost: [u8; 8] = "  lost=\0"
+    var s_lk: [u8; 9] = "  locks=\0"
+    var s_sp: [u8; 9] = "  spins=\0"
+
+    atomic.store(sp(state, S_COUNTER), 0)
+    run_phase(state, 0, PH_STRESS)
+    let online: u64 = cpu.online_count(state)
+    let want: u64 = online * STRESS_ITER
+    let got: u64 = atomic.load(sp(state, S_COUNTER))
+    serial.puts((&s_head[0]) as u64)
+    serial.puts((&s_want[0]) as u64)
+    serial.dec(want)
+    serial.puts((&s_got[0]) as u64)
+    serial.dec(got)
+    serial.puts((&s_lost[0]) as u64)
+    if got > want {
+        serial.dec(0)
+    } else {
+        serial.dec(want - got)
+    }
+    serial.puts((&s_lk[0]) as u64)
+    serial.dec(atomic.lock_takes(state, atomic.L_STRESS))
+    serial.puts((&s_sp[0]) as u64)
+    serial.dec(atomic.lock_spins(state, atomic.L_STRESS))
+    serial.nl()
+}
+
+// --------------------------------------------------------- measurement 3
+
+fn frames(state: u64) {
+    var s_head: [u8; 13] = "smp: frames \0"
+    var s_got: [u8; 5] = "got=\0"
+    var s_dup: [u8; 8] = "  dups=\0"
+    var s_zero: [u8; 8] = "  zero=\0"
+    var s_free: [u8; 9] = "  freed=\0"
+
+    let online: u64 = cpu.online_count(state)
+    let total: u64 = online * FR_PER
+    var i: u64 = 0
+    while i < kstate.MAX_CPUS * FR_PER {
+        atomic.store(sp(state, S_FRAMES) + i * 8, 0)
+        i = i + 1
+    }
+    run_phase(state, 0, PH_FRAMES)
+
+    // Every frame that was handed out twice is a frame two parts of the
+    // kernel now believe is theirs alone.
+    var dups: u64 = 0
+    var zero: u64 = 0
+    i = 0
+    while i < total {
+        let a: u64 = atomic.load(sp(state, S_FRAMES) + i * 8)
+        if a == 0 {
+            zero = zero + 1
+        } else {
+            var k: u64 = 0
+            while k < i {
+                if atomic.load(sp(state, S_FRAMES) + k * 8) == a {
+                    dups = dups + 1
+                    k = i
+                } else {
+                    k = k + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    sset(state, S_DUPS, dups)
+
+    // Give them back. A frame that came twice is freed once -- the
+    // allocator would otherwise count it free twice over, which is the
+    // second half of the same bug.
+    var freed: u64 = 0
+    i = 0
+    while i < total {
+        let a: u64 = atomic.load(sp(state, S_FRAMES) + i * 8)
+        if a != 0 {
+            var seen: bool = false
+            var k: u64 = 0
+            while k < i {
+                if atomic.load(sp(state, S_FRAMES) + k * 8) == a {
+                    seen = true
+                    k = i
+                } else {
+                    k = k + 1
+                }
+            }
+            if !seen {
+                mem.frame_free(state, a)
+                freed = freed + 1
+            }
+        }
+        i = i + 1
+    }
+
+    serial.puts((&s_head[0]) as u64)
+    serial.puts((&s_got[0]) as u64)
+    serial.dec(total)
+    serial.puts((&s_dup[0]) as u64)
+    serial.dec(dups)
+    serial.puts((&s_zero[0]) as u64)
+    serial.dec(zero)
+    serial.puts((&s_free[0]) as u64)
+    serial.dec(freed)
+    serial.nl()
+}
+
+// --------------------------------------------------------- measurement 4
+
+// The scheduler across cores. The started cores stop being workers and
+// become schedulers: each takes an idle task of its own, switches its
+// timer on, and from then on takes whatever is ready out of the one run
+// queue. The boot processor puts eight kernel tasks in and waits.
+fn schedule_demo(state: u64) {
+    var s_head: [u8; 12] = "smp: sched \0"
+    var s_tasks: [u8; 7] = "tasks=\0"
+    var s_done: [u8; 8] = "  done=\0"
+    var s_cores: [u8; 14] = "  cores_used=\0"
+    var s_sw: [u8; 12] = "  switches=\0"
+    var s_ms: [u8; 7] = "  ms=\0\0"
+    var s_per: [u8; 12] = "smp: picks \0"
+    var s_c: [u8; 3] = " c\0"
+    var s_eq: [u8; 2] = "=\0"
+
+    run_phase(state, 0, PH_SCHED)
+    // Give the started cores a moment to reach their idle task before the
+    // work goes in; a task that is ready before there is a core to take
+    // it simply waits, but the picture is cleaner this way.
+    udelay(state, 20000)
+
+    let hz: u64 = apic.tsc_hz(state)
+    let t0: u64 = apic.tsc()
+    let want: u64 = 8
+    var made: u64 = 0
+    var i: u64 = 0
+    while i < want {
+        let t: u64 = sched.create(state, sched.K_WORKER, 1, 0, 0)
+        if t != 0 {
+            sched.start(state, t)
+            made = made + 1
+        }
+        i = i + 1
+    }
+    // Wait until they are all corpses, then clear them away.
+    var guard: u64 = 0
+    var done: u64 = 0
+    while guard < 30000 {
+        done = sched.zombies(state, sched.K_WORKER)
+        if done >= made {
+            guard = 30000
+        } else {
+            sched.yield_now(state)
+            udelay(state, 1000)
+            guard = guard + 1
+        }
+    }
+    let t1: u64 = apic.tsc()
+
+    var used: u64 = 0
+    var c: u64 = 0
+    while c < cpu.count(state) {
+        if cpu.get(state, c, cpu.C_PICKS) > 0 {
+            used = used + 1
+        }
+        c = c + 1
+    }
+
+    serial.puts((&s_head[0]) as u64)
+    serial.puts((&s_tasks[0]) as u64)
+    serial.dec(made)
+    serial.puts((&s_done[0]) as u64)
+    serial.dec(done)
+    serial.puts((&s_cores[0]) as u64)
+    serial.dec(used)
+    serial.puts((&s_sw[0]) as u64)
+    serial.dec(kstate.get(state, kstate.SWITCHES))
+    serial.puts((&s_ms[0]) as u64)
+    if hz > 0 {
+        serial.dec((t1 - t0) / (hz / 1000))
+    } else {
+        serial.dec(0)
+    }
+    serial.nl()
+
+    serial.puts((&s_per[0]) as u64)
+    c = 0
+    while c < cpu.count(state) {
+        serial.puts((&s_c[0]) as u64)
+        serial.dec(c)
+        serial.puts((&s_eq[0]) as u64)
+        serial.dec(cpu.get(state, c, cpu.C_PICKS))
+        c = c + 1
+    }
+    serial.nl()
+    sched.reap_all(state)
+}
+
+// What a started core becomes once the measurements are over.
+fn scheduler_core(state: u64, index: u64) {
+    let idle: u64 = sched.adopt(state, sched.K_IDLE, 1,
+        cpu.get(state, index, cpu.C_STACK))
+    cpu.set(state, index, cpu.C_CUR, idle)
+    cpu.set(state, index, cpu.C_IDLE, idle)
+    atomic.barrier()
+    // This phase is the one a core does not come back from, so it counts
+    // itself done BEFORE it starts rather than after.
+    atomic.fetch_add(sp(state, S_DONE), 1)
+    apic.timer_start(state, 100)
+    idt.enable()
+    while true {
+        cpu.add(state, index, cpu.C_IDLERUNS, 1)
+        sched.yield_now(state)
+        idt.halt()
+    }
+}
+
+// ------------------------------------------------------------ the locks
+
+fn locks(state: u64) {
+    var s_head: [u8; 12] = "smp: locks \0"
+    var s_n: [u8; 3] = " l\0"
+    var s_eq: [u8; 2] = "=\0"
+    var s_sl: [u8; 2] = "/\0"
+    var s_off: [u8; 8] = "  off=\0\0"
+    serial.puts((&s_head[0]) as u64)
+    var i: u64 = 0
+    while i < kstate.LOCK_COUNT {
+        if atomic.lock_takes(state, i) > 0 {
+            serial.puts((&s_n[0]) as u64)
+            serial.dec(i)
+            serial.puts((&s_eq[0]) as u64)
+            serial.dec(atomic.lock_takes(state, i))
+            serial.puts((&s_sl[0]) as u64)
+            serial.dec(atomic.lock_spins(state, i))
+        }
+        i = i + 1
+    }
+    serial.puts((&s_off[0]) as u64)
+    serial.dec(yes(atomic.off(state)))
+    serial.nl()
+}
+
+// ------------------------------------------------------ the command line
+
+// The same shape as `kmain.mode_of` and `hw.mode_of`. Read once, in
+// `kmain`, before the frame allocator can hand the command line out as
+// heap (the trap that cost round K2 half an hour, see hw.fi).
+fn mode_of(cmd: u64) -> u64 {
+    var w_nosmp: [u8; 6] = "nosmp\0"
+    var w_nolock: [u8; 7] = "nolock\0"
+    var w_long: [u8; 8] = "smplong\0"
+    if cmd == 0 {
+        return 0
+    }
+    var m: u64 = 0
+    if find(cmd, (&w_nosmp[0]) as u64, 5) != 0 {
+        m = m | M_NOSMP
+    }
+    if find(cmd, (&w_nolock[0]) as u64, 6) != 0 {
+        m = m | M_NOLOCK
+    }
+    if find(cmd, (&w_long[0]) as u64, 7) != 0 {
+        m = m | M_SMPLONG
+    }
+    return m
+}
+
+fn parse(state: u64, cmd: u64) {
+    sset(state, S_MODE, mode_of(cmd))
+}
+
+fn find(hay: u64, needle: u64, n: u64) -> u64 {
+    var i: u64 = 0
+    while kstate.get8(hay + i) != 0 {
+        var k: u64 = 0
+        var hit: bool = true
+        while k < n {
+            if kstate.get8(hay + i + k) != kstate.get8(needle + k) {
+                hit = false
+                k = n
+            } else {
+                k = k + 1
+            }
+        }
+        if hit {
+            return hay + i
+        }
+        i = i + 1
+    }
+    return 0
+}

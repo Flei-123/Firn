@@ -285,6 +285,9 @@ vectors:
     .quad syscall_stack_top         /* 61: the stack before the first task */
     .quad KERNEL_TASK_MAIN          /* 62: tasks.fi, the body of a kernel task */
     .quad KERNEL_USER_START         /* 63: proc.fi, the way into ring 3 */
+    /* Round K5: the other processors (demos/kernel/smp.s, smp.fi). */
+    .quad smp_vectors               /* 64: the table of the trampoline */
+    .quad KERNEL_AP_MAIN            /* 65: where a started core lands */
 
     .section .bss, "aw", @nobits
     .align 8
