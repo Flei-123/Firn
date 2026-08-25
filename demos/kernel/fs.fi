@@ -39,6 +39,8 @@ import serial
 import kstate
 import sched
 import blk
+import atomic
+import cpu
 
 export {
     format, mount, path, create_path, unlink_path, entry_at, dir_entries,
@@ -81,6 +83,55 @@ const SB_DATA: u64 = 48
 const SB_ROOT: u64 = 56
 
 // ------------------------------------------------------ the scratch area
+
+
+// ------------------------------------------------------------ round K5
+//
+// EVERY CRITICAL SECTION OF THIS FILE GETS A LOCK. Up to round K2 the six
+// places below made do with `sched.irq_save` -- turning interrupts off,
+// which keeps this core's own handlers out of a half-written superblock
+// and keeps NOTHING out on a machine with four cores. The pairs were
+// already there and already correct, so the change is one word each: the
+// same places now take `atomic.L_FS` as well.
+//
+// The lock is never held while another lock is taken. `blk.fi` and the
+// two drivers under it have none of their own, and nothing in this file
+// calls the scheduler between `enter` and `leave` -- which is the rule
+// that makes this kernel's locks unable to deadlock (see
+// sched.fi::create).
+//
+// IT IS HELD WHILE THE SAME LOCK IS TAKEN AGAIN, THOUGH, and the first
+// version of this round deadlocked on exactly that: `format` writes the
+// root directory through `dir_init`, which writes through `write_at`,
+// which is one of the six entry points that take the lock. The core sat
+// waiting for a lock it was holding itself, with interrupts off, and the
+// machine went quiet at "fs: format ".
+//
+// So the pair below is RE-ENTRANT on the same core: if the lock already
+// belongs to this core, the nested call only notes that it must not give
+// it back. That is safe to decide by reading the owner word, because
+// interrupts are off from the line above -- no other core can have
+// written THIS core's number into it. Bit 63 of the saved flags carries
+// the note; the processor never sets it, and `sched.irq_restore` only
+// looks at bit 9.
+const NESTED: u64 = 0x8000000000000000
+
+fn enter(state: u64) -> u64 {
+    let flags: u64 = sched.irq_save()
+    let me: u64 = cpu.here(state)
+    if atomic.lock_owner(state, atomic.L_FS) == me + 1 {
+        return flags | NESTED
+    }
+    atomic.lock_take(state, atomic.L_FS, me)
+    return flags
+}
+
+fn leave(state: u64, flags: u64) {
+    if (flags & NESTED) == 0 {
+        atomic.lock_give(state, atomic.L_FS)
+    }
+    sched.irq_restore(flags)
+}
 
 fn buf_sb(state: u64) -> u64 {
     return state + kstate.FS_OFF
@@ -352,7 +403,7 @@ fn file_truncate(state: u64, ino: u64) {
 // data area by `sys.fi` beforehand and checked there -- a file system
 // that followed a pointer of a process would be a hole.
 fn read_at(state: u64, ino: u64, off: u64, dst: u64, len: u64) -> u64 {
-    let flags: u64 = sched.irq_save()
+    let flags: u64 = enter(state)
     let size: u64 = inode_get(state, ino, I_SIZE)
     var want: u64 = len
     if off >= size {
@@ -375,19 +426,19 @@ fn read_at(state: u64, ino: u64, off: u64, dst: u64, len: u64) -> u64 {
             zero(dst + n, chunk) // a hole reads as zeros
         } else {
             if !blk.read(state, b, buf_dt(state)) {
-                sched.irq_restore(flags)
+                leave(state, flags)
                 return n
             }
             copy(buf_dt(state) + inb, dst + n, chunk)
         }
         n = n + chunk
     }
-    sched.irq_restore(flags)
+    leave(state, flags)
     return n
 }
 
 fn write_at(state: u64, ino: u64, off: u64, src: u64, len: u64) -> u64 {
-    let flags: u64 = sched.irq_save()
+    let flags: u64 = enter(state)
     var n: u64 = 0
     // A full disk stops the writing and is REPORTED as the number of
     // octets that really went in -- a file system that answered with the
@@ -405,12 +456,12 @@ fn write_at(state: u64, ino: u64, off: u64, src: u64, len: u64) -> u64 {
             stop = true
         } else {
             if !blk.read(state, b, buf_dt(state)) {
-                sched.irq_restore(flags)
+                leave(state, flags)
                 return n
             }
             copy(src + n, buf_dt(state) + inb, chunk)
             if !blk.write(state, b, buf_dt(state)) {
-                sched.irq_restore(flags)
+                leave(state, flags)
                 return n
             }
             n = n + chunk
@@ -422,7 +473,7 @@ fn write_at(state: u64, ino: u64, off: u64, src: u64, len: u64) -> u64 {
     if n > 0 && off + n > inode_get(state, ino, I_SIZE) {
         inode_set(state, ino, I_SIZE, off + n)
     }
-    sched.irq_restore(flags)
+    leave(state, flags)
     return n
 }
 
@@ -608,35 +659,35 @@ fn parent_of(state: u64, p: u64, out_name: u64) -> u64 {
 }
 
 fn create_path(state: u64, p: u64, kind: u64) -> u64 {
-    let flags: u64 = sched.irq_save()
+    let flags: u64 = enter(state)
     var name: [u8; 32] = [0 as u8; 32]
     let dir: u64 = parent_of(state, p, (&name[0]) as u64)
     if dir == 0 {
-        sched.irq_restore(flags)
+        leave(state, flags)
         return 0
     }
     if dir_find(state, dir, (&name[0]) as u64) != 0 {
-        sched.irq_restore(flags)
+        leave(state, flags)
         return 0
     }
     let ino: u64 = inode_alloc(state, kind)
     if ino == 0 {
-        sched.irq_restore(flags)
+        leave(state, flags)
         return 0
     }
     if kind == T_DIR {
         if !dir_init(state, ino, dir) {
             inode_set(state, ino, I_TYPE, T_FREE)
-            sched.irq_restore(flags)
+            leave(state, flags)
             return 0
         }
     }
     if !dir_add(state, dir, (&name[0]) as u64, ino) {
         inode_set(state, ino, I_TYPE, T_FREE)
-        sched.irq_restore(flags)
+        leave(state, flags)
         return 0
     }
-    sched.irq_restore(flags)
+    leave(state, flags)
     return ino
 }
 
@@ -651,16 +702,16 @@ fn dir_init(state: u64, ino: u64, parent: u64) -> bool {
 }
 
 fn unlink_path(state: u64, p: u64) -> bool {
-    let flags: u64 = sched.irq_save()
+    let flags: u64 = enter(state)
     var name: [u8; 32] = [0 as u8; 32]
     let dir: u64 = parent_of(state, p, (&name[0]) as u64)
     if dir == 0 {
-        sched.irq_restore(flags)
+        leave(state, flags)
         return false
     }
     let ino: u64 = dir_find(state, dir, (&name[0]) as u64)
     if ino == 0 {
-        sched.irq_restore(flags)
+        leave(state, flags)
         return false
     }
     // A directory only goes when nothing is in it any more -- apart from
@@ -676,7 +727,7 @@ fn unlink_path(state: u64, p: u64) -> bool {
             i = i + 1
         }
         if live > 2 {
-            sched.irq_restore(flags)
+            leave(state, flags)
             return false
         }
     }
@@ -684,17 +735,17 @@ fn unlink_path(state: u64, p: u64) -> bool {
     inode_set(state, ino, I_TYPE, T_FREE)
     inode_set(state, ino, I_NLINK, 0)
     dir_remove(state, dir, (&name[0]) as u64)
-    sched.irq_restore(flags)
+    leave(state, flags)
     return true
 }
 
 // ------------------------------------------------------ format and mount
 
 fn format(state: u64) -> bool {
-    let flags: u64 = sched.irq_save()
+    let flags: u64 = enter(state)
     let total: u64 = blk.blocks(state)
     if total < DATA_START + 8 {
-        sched.irq_restore(flags)
+        leave(state, flags)
         return false
     }
     // The superblock.
@@ -708,7 +759,7 @@ fn format(state: u64) -> bool {
     put64(buf_sb(state) + SB_DATA, DATA_START)
     put64(buf_sb(state) + SB_ROOT, 1)
     if !blk.write(state, 0, buf_sb(state)) {
-        sched.irq_restore(flags)
+        leave(state, flags)
         return false
     }
     // The bitmap: everything up to the data area is taken.
@@ -732,42 +783,42 @@ fn format(state: u64) -> bool {
     // The root directory.
     if inode_alloc(state, T_DIR) != 1 {
         kstate.set(state, kstate.FS_READY, 0)
-        sched.irq_restore(flags)
+        leave(state, flags)
         return false
     }
     if !dir_init(state, 1, 1) {
         kstate.set(state, kstate.FS_READY, 0)
-        sched.irq_restore(flags)
+        leave(state, flags)
         return false
     }
-    sched.irq_restore(flags)
+    leave(state, flags)
     return true
 }
 
 // Whatever does not carry the magic number is not a file system of this
 // kind. `mount` says so instead of interpreting foreign octets as inodes.
 fn mount(state: u64) -> bool {
-    let flags: u64 = sched.irq_save()
+    let flags: u64 = enter(state)
     kstate.set(state, kstate.FS_READY, 0)
     if !blk.read(state, 0, buf_sb(state)) {
-        sched.irq_restore(flags)
+        leave(state, flags)
         return false
     }
     if get64(buf_sb(state) + SB_MAGIC) != MAGIC {
-        sched.irq_restore(flags)
+        leave(state, flags)
         return false
     }
     if get64(buf_sb(state) + SB_BSIZE) != BS {
-        sched.irq_restore(flags)
+        leave(state, flags)
         return false
     }
     let r: u64 = get64(buf_sb(state) + SB_ROOT)
     if inode_get(state, r, I_TYPE) != T_DIR {
-        sched.irq_restore(flags)
+        leave(state, flags)
         return false
     }
     kstate.set(state, kstate.FS_ROOT, r)
     kstate.set(state, kstate.FS_READY, 1)
-    sched.irq_restore(flags)
+    leave(state, flags)
     return true
 }
