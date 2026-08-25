@@ -12,6 +12,22 @@
 // `exit` is the only word it handles itself, because leaving is the one
 // thing no child process can do on its parent's behalf.
 //
+// ROUND K4 ADDS THE SECOND WORD IT UNDERSTANDS: `>`. `ls > /out.txt`
+// writes the output of the program into a file, and that one line is the
+// reason `fork` had to exist:
+//
+//     fork()                  now there are two of us
+//     the child: open the file, dup2 it onto descriptor 1, close the
+//                spare -- and only THEN execve the program
+//     the parent: wait4
+//
+// A `posix_spawn` cannot do it. Between the split and the image the child
+// is still the shell, and what it changes about itself is what the new
+// program finds -- that gap is the whole point of the call. Without a
+// redirection the shell still uses the one-call start of round K1
+// (`SYS_OSUM_EXEC`), because it is cheaper and nothing is gained by
+// copying an image that is thrown away in the next instruction.
+//
 // It runs in ring 3 like every other program, it was loaded off the disk
 // by `elf.spawn` like every other program, and the kernel has no idea
 // that it is a shell. `tools/osum/run.sh` proves the last point by
@@ -21,6 +37,10 @@
 profile kernel
 
 import ulib
+import osum.libc.io
+import osum.libc.proc
+import osum.libc.errno
+import osum.libc.kcall
 
 export { u_start }
 
@@ -39,13 +59,14 @@ fn u_start(args: u64) -> u64 {
     var s_no: [u8; 16] = "sh: cannot run \0"
     var s_sp: [u8; 2] = " \0"
     var c_exit: [u8; 5] = "exit\0"
+    var c_to: [u8; 2] = ">\0"
     var b_bin: [u8; 6] = "/bin/\0"
 
     ulib.say((&s_hi[0]) as u64)
     var commands: u64 = 0
     var running: bool = true
     while running {
-        let n: u64 = ulib.sys(ulib.SYS_READ, ulib.IN, (&line[0]) as u64, 120)
+        let n: u64 = io.read(ulib.IN, (&line[0]) as u64, 120)
         if n == 0 || (n >> 63) != 0 {
             running = false
         } else {
@@ -91,18 +112,51 @@ fn u_start(args: u64) -> u64 {
                     if ulib.streq(slots[0], (&c_exit[0]) as u64) {
                         running = false
                     } else {
+                        // `>` and what follows it are not arguments of the
+                        // program: they are what its output is pointed at.
+                        var target: u64 = 0
+                        var real: u64 = argc
+                        var k: u64 = 0
+                        while k < argc {
+                            if ulib.streq(slots[k as usize],
+                                (&c_to[0]) as u64) {
+                                if k + 1 < argc {
+                                    target = slots[(k + 1) as usize]
+                                }
+                                if real > k {
+                                    real = k
+                                }
+                            }
+                            k = k + 1
+                        }
+                        slots[real as usize] = 0 // argv ends in a zero
                         make_path(slots[0], (&path[0]) as u64,
                             (&b_bin[0]) as u64)
-                        let pid: u64 = ulib.sys(ulib.SYS_EXEC,
-                            (&path[0]) as u64, (&slots[0]) as u64, argc)
-                        if (pid >> 63) != 0 {
+                        var code: u64 = 0
+                        if target == 0 {
+                            let pid: u64 = proc.spawn_file(
+                                (&path[0]) as u64, (&slots[0]) as u64, real)
+                            if errno.failed(pid) {
+                                // The libc answers a refusal with -1 and
+                                // the reason in `errno`. What the shell
+                                // shows is the REASON -- "cannot run
+                                // nothing -> -1" would tell nobody that
+                                // there is no such file.
+                                code = errno.negated(errno.errno())
+                            } else {
+                                code = proc.wait_code(pid)
+                            }
+                        } else {
+                            code = redirect((&path[0]) as u64,
+                                (&slots[0]) as u64, target)
+                        }
+                        if ulib.failed(code) {
                             ulib.say((&s_no[0]) as u64)
                             ulib.say(slots[0])
                             ulib.say((&s_arrow[0]) as u64)
-                            ulib.sayn(pid)
+                            ulib.sayn(code)
                             ulib.nl()
                         } else {
-                            let code: u64 = ulib.sys(ulib.SYS_WAIT, pid, 0, 0)
                             ulib.say((&s_prompt[0]) as u64)
                             ulib.say(slots[0])
                             ulib.say((&s_arrow[0]) as u64)
@@ -116,6 +170,32 @@ fn u_start(args: u64) -> u64 {
     }
     ulib.say((&s_bye[0]) as u64)
     return commands
+}
+
+// FORK, DUP2, EXECVE, WAIT4 -- the four calls of a redirection, in the
+// order every Unix shell has used them in for fifty years. Returns the
+// exit code of the program, or a negative number when something on the way
+// there failed.
+//
+// The child does not return from here. If `execve` comes back, the image
+// did not load, and a child that went on running the shell's own code
+// would be a second shell reading the same input.
+fn redirect(path: u64, argv: u64, target: u64) -> u64 {
+    let who: u64 = proc.split()
+    if ulib.failed(who) {
+        return who
+    }
+    if who == 0 {
+        let fd: u64 = io.create(target)
+        if ulib.failed(fd) {
+            proc.leave(126)
+        }
+        io.dup2(fd, ulib.OUT)
+        io.close(fd)
+        proc.enter(path, argv)
+        proc.leave(127)
+    }
+    return proc.wait_code(who)
 }
 
 // `ls` means `/bin/ls`, and `/bin/ls` means itself. Two lines, and they

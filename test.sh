@@ -199,6 +199,13 @@
 #      same file is core language for BOTH compilers. Section 25
 #      (tools/dwarf/run.sh) grew the second half of the round: the line
 #      table is held against the panic message the program prints itself.
+#  56. THE POSIX FLOOR (tools/posix/run.sh, ROUND K4): twenty-six system
+#      calls with the numbers of Linux x86-64 and a libc in Firn on top of
+#      them. Measured with the errors: a file that is not there, a
+#      descriptor that is not open, a pointer into the kernel, a buffer too
+#      short for one directory entry -- fourteen ways to be wrong, fourteen
+#      negative numbers, one living kernel. Plus `fork` + `dup2` + `execve`
+#      as a redirection in the shell, and both compilers measuring the same.
 #  10. DOM soak run (tools/dom_soak/run.sh): the DOM prototype in Firn builds
 #      real cycles continuously (parent/child, listener, JS wrapper) and must
 #      not grow while doing so; the deliberately leaking counter-check with
@@ -1293,6 +1300,21 @@ if [ "$UCDRC" -eq 0 ] && [ "$SOAKRC" -eq 0 ]; then
 else
     bad "round 95 failed (ucd $UCDRC, soak $SOAKRC -- see .test-work/ucd_build.log, .test-work/gc_soak.log)"
     grep -E 'FAILED|ERROR|error' "$WORK/ucd_build.log" "$WORK/ucd_verify.log" "$WORK/gc_soak.log" 2>/dev/null | head -10 | sed 's/^/   /'
+echo "== 56. the POSIX system call layer and the libc (tools/posix/run.sh, ROUND K4) =="
+# Stage 1 of the plan: the kernel had seventeen calls of its own invention
+# and a program written for Unix could not use one of them. Now there are
+# twenty-six with the NUMBERS OF LINUX x86-64 -- read, write, open, close,
+# stat, fstat, lseek, mmap, brk, pipe, dup2, fork, execve, wait4,
+# getdents64 -- plus a libc in Firn on top of them (lib/osum/libc/). Every
+# call is measured with its ERRORS as well, because a call that works on a
+# good day proves nothing about the days a bug lives on.
+bash tools/posix/run.sh > "$WORK/posix.log" 2>&1 && PXRC=0 || PXRC=$?
+grep -aE '^POSIX:|^   -- ' "$WORK/posix.log" | sed 's/^/ /'
+if [ "$PXRC" -eq 0 ]; then
+    ok
+else
+    bad "tools/posix/run.sh failed (see .test-work/posix.log)"
+    grep -aE '^  FAIL' "$WORK/posix.log" | head -12 | sed 's/^/   /'
 fi
 
 TOTAL=$((PASS + FAIL))

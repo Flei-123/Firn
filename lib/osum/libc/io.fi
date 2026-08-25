@@ -1,0 +1,224 @@
+// lib/osum/libc/io.fi -- round K4: files, descriptors and directories.
+//
+// One layer above the raw call, and what it adds is the behaviour a Unix
+// program takes for granted and a raw system call does not give:
+//
+//   * `write` MAY write less than it was asked to. Every program that
+//     ignores that has a bug that shows up on the day a pipe fills up.
+//     `write_all` is the loop, written once.
+//   * `read` may give less as well, and 0 means the END, not an error.
+//     `read_full` is the other loop.
+//   * a failed call returns -1 and the reason is in `errno`
+//     (`osum.libc.errno`), instead of a negative number the caller has to
+//     decode itself.
+//   * a directory is READ, not listed: `dir_read` hands out one entry per
+//     call out of a buffer it refills from `getdents64`.
+
+import osum.libc.kcall
+import osum.libc.errno
+import osum.libc.text
+
+export {
+    open, create, close, read, write, write_all, read_full, write_text,
+    seek, tell, size_of, stat_into, stat_size, stat_mode, is_dir_mode,
+    fstat_into, unlink, make_dir, dup, dup2, pipe, dir_open, dir_read,
+    dir_name, dir_kind, dir_reclen, cwd,
+    STAT_BYTES, ST_MODE, ST_SIZE, ST_INO, S_IFMT, S_IFREG, S_IFDIR,
+    S_IFIFO, S_IFCHR, DT_DIR, DT_REG, D_RECLEN, D_TYPE, D_NAME
+}
+
+const STAT_BYTES: u64 = 144
+const ST_INO: u64 = 8
+const ST_MODE: u64 = 24
+const ST_SIZE: u64 = 48
+
+const S_IFMT: u64 = 61440 // 0o170000
+const S_IFREG: u64 = 32768
+const S_IFDIR: u64 = 16384
+const S_IFIFO: u64 = 4096
+const S_IFCHR: u64 = 8192
+
+const DT_DIR: u64 = 4
+const DT_REG: u64 = 8
+
+// `struct linux_dirent64`: the name begins at 19, the record length at 16.
+const D_RECLEN: u64 = 16
+const D_TYPE: u64 = 18
+const D_NAME: u64 = 19
+
+// -------------------------------------------------------- descriptors
+
+fn open(path: u64, flags: u64) -> u64 {
+    return errno.check(kcall.sys2(kcall.SYS_OPEN, path, flags))
+}
+
+// The two flags every "write me a file" wants: make it if it is not there,
+// throw away what is in it if it is.
+fn create(path: u64) -> u64 {
+    let flags: u64 = kcall.O_WRONLY | kcall.O_CREAT | kcall.O_TRUNC
+    return errno.check(kcall.sys2(kcall.SYS_OPEN, path, flags))
+}
+
+fn close(fd: u64) -> u64 {
+    return errno.check(kcall.sys1(kcall.SYS_CLOSE, fd))
+}
+
+fn read(fd: u64, buf: u64, n: u64) -> u64 {
+    return errno.check(kcall.sys3(kcall.SYS_READ, fd, buf, n))
+}
+
+fn write(fd: u64, buf: u64, n: u64) -> u64 {
+    return errno.check(kcall.sys3(kcall.SYS_WRITE, fd, buf, n))
+}
+
+// Everything, or -1. A short write is not an error and not the end: it is
+// the normal case on a pipe, and this is the loop that deals with it.
+fn write_all(fd: u64, buf: u64, n: u64) -> u64 {
+    var done: u64 = 0
+    while done < n {
+        let r: u64 = write(fd, buf + done, n - done)
+        if errno.failed(r) {
+            return r
+        }
+        if r == 0 {
+            return done
+        }
+        done = done + r
+    }
+    return done
+}
+
+// Reads until the buffer is full or the source is at its end. Returns how
+// many octets arrived -- 0 is the end of the file, not a failure.
+fn read_full(fd: u64, buf: u64, n: u64) -> u64 {
+    var done: u64 = 0
+    var going: bool = true
+    while going {
+        if done >= n {
+            going = false
+        } else {
+            let r: u64 = read(fd, buf + done, n - done)
+            if errno.failed(r) {
+                return r
+            }
+            if r == 0 {
+                going = false
+            } else {
+                done = done + r
+            }
+        }
+    }
+    return done
+}
+
+fn write_text(fd: u64, p: u64) -> u64 {
+    return write_all(fd, p, text.length(p))
+}
+
+fn seek(fd: u64, off: u64, whence: u64) -> u64 {
+    return errno.check(kcall.sys3(kcall.SYS_LSEEK, fd, off, whence))
+}
+
+fn tell(fd: u64) -> u64 {
+    return seek(fd, 0, kcall.SEEK_CUR)
+}
+
+fn dup(fd: u64) -> u64 {
+    return errno.check(kcall.sys1(kcall.SYS_DUP, fd))
+}
+
+fn dup2(from: u64, to: u64) -> u64 {
+    return errno.check(kcall.sys2(kcall.SYS_DUP2, from, to))
+}
+
+// `out` takes two `int`s: the reading end first, the writing end second.
+fn pipe(out: u64) -> u64 {
+    return errno.check(kcall.sys1(kcall.SYS_PIPE, out))
+}
+
+fn unlink(path: u64) -> u64 {
+    return errno.check(kcall.sys1(kcall.SYS_UNLINK, path))
+}
+
+fn make_dir(path: u64) -> u64 {
+    return errno.check(kcall.sys2(kcall.SYS_MKDIR, path, 493))
+}
+
+fn cwd(buf: u64, n: u64) -> u64 {
+    return errno.check(kcall.sys2(kcall.SYS_GETCWD, buf, n))
+}
+
+// --------------------------------------------------------------- stat
+
+fn stat_into(path: u64, buf: u64) -> u64 {
+    return errno.check(kcall.sys2(kcall.SYS_STAT, path, buf))
+}
+
+fn fstat_into(fd: u64, buf: u64) -> u64 {
+    return errno.check(kcall.sys2(kcall.SYS_FSTAT, fd, buf))
+}
+
+// How big the file is, or -1. The structure lives on the stack for the
+// length of the call -- a program that only wants the size should not have
+// to know that a `struct stat` is 144 octets.
+fn size_of(path: u64) -> u64 {
+    var st: [u8; 144] = [0 as u8; 144]
+    let r: u64 = stat_into(path, (&st[0]) as u64)
+    if errno.failed(r) {
+        return r
+    }
+    return __mmio_read64(((&st[0]) as u64 + ST_SIZE) as *mut u64)
+}
+
+fn stat_mode(path: u64) -> u64 {
+    var st: [u8; 144] = [0 as u8; 144]
+    let r: u64 = stat_into(path, (&st[0]) as u64)
+    if errno.failed(r) {
+        return r
+    }
+    return __mmio_read32(((&st[0]) as u64 + ST_MODE) as *mut u32) as u64
+}
+
+fn stat_size(buf: u64) -> u64 {
+    return __mmio_read64((buf + ST_SIZE) as *mut u64)
+}
+
+fn is_dir_mode(mode: u64) -> bool {
+    return (mode & S_IFMT) == S_IFDIR
+}
+
+// ---------------------------------------------------------- directories
+
+// A directory is opened like a file, with the flag that says it must be
+// one. Reading it is `getdents64`, and the caller walks the records with
+// `dir_name` and `dir_kind`.
+fn dir_open(path: u64) -> u64 {
+    return errno.check(kcall.sys2(kcall.SYS_OPEN, path,
+            kcall.O_DIRECTORY))
+}
+
+// Fills `buf` with as many records as fit. 0 = the directory is at its
+// end. The caller walks the records itself:
+//
+//     var at: u64 = 0
+//     while at < n {
+//         say(io.dir_name(base + at))
+//         at = at + io.dir_reclen(base + at)
+//     }
+fn dir_read(fd: u64, buf: u64, n: u64) -> u64 {
+    return errno.check(kcall.sys3(kcall.SYS_GETDENTS64, fd, buf, n))
+}
+
+fn dir_name(rec: u64) -> u64 {
+    return rec + D_NAME
+}
+
+fn dir_kind(rec: u64) -> u64 {
+    return (*((rec + D_TYPE) as *mut u8)) as u64
+}
+
+// How long this record is. What walks the buffer -- a reader that counted
+// on a fixed size would be wrong at the first long name.
+fn dir_reclen(rec: u64) -> u64 {
+    return __mmio_read16((rec + D_RECLEN) as *mut u16) as u64
+}
