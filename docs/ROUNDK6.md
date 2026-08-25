@@ -17,7 +17,7 @@ Round K6 is the round that turns those programs into a userland.
     12
 
 Everything in this file is measured in `tools/userland/run.sh`
-(section 58 of `./test.sh`): 83 checks, of which the transcripts of six
+(section 58 of `./test.sh`): 91 checks, of which the transcripts of seven
 whole scripts are compared **octet for octet** against a file written by
 hand -- not "it started without crashing".
 
@@ -92,7 +92,10 @@ So the twelfth direct block became a **double indirect** block: the octets
 `file_truncate`, one more scratch buffer `buf_i2`) and in
 `tools/osum/mkfs.py`, which has to write exactly the same shape -- the
 host builds the image and the kernel reads it, and a format they disagree
-on is a file that is silently short.
+on is a file that is silently short. The size check of round 62
+(`tools/kernel/run.sh`, section 15) moved with it: 49152 octets now go
+into one file, and the ceiling is measured where it is now -- a write past
+2135552 octets places nothing and does not grow the file.
 
 The ceiling above that one is the **block bitmap**: it is one block, 4096
 bits, so an OFS volume stops at 4096 blocks = 2 MiB. The whole userland
@@ -204,13 +207,22 @@ transcript is compared with `diff`:
 * **t6** the disk: `mkdir`, `touch`, `cp`, `mv`, `rm`, `rmdir` -- and
   afterwards the **host** reads the image back and finds exactly what the
   userland left there.
+* **t8** everything a line can be that is not a command: a comment, a
+  lone `;`, `>` without a name, `cd` without an argument, ten arguments
+  where eight fit, an argument of two hundred octets (`-ENAMETOOLONG` out
+  of the kernel, and the shell says so and lives), five pipe stages where
+  four fit, and `sh /nope`.
 
 Plus: `ps`/`df`/`date`/`uname`/`kill` against patterns (their output
 cannot be written down in advance), the interactive path over the console
 the way round K1 drives it, the counter-check that `>` really moves
 descriptor 1 (the same line, once on the serial port and once not), the
-frame count before and after every run, and the **same six transcripts out
-of the userland built by firnc1**.
+frame count before and after every run, the **same four transcripts out of
+the userland built by firnc1** -- and the line editor a second time on a
+REAL keyboard: five keys through the QEMU monitor (`l`, `s`, return, **up
+arrow**, return) produce two listings, which is the whole path from scan
+code 0x48 through `kbd.translate` and `sys.keyboard_read` into the
+shell.
 
 ## 6. What is missing, honestly
 
