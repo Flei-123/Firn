@@ -58,7 +58,12 @@ def load_dat(path):
         while doc and doc[-1] == "":
             doc.pop()
         context = "\n".join(parts.get("document-fragment", [])).strip() or None
-        cases.append((data, "\n".join(doc), context))
+        # WHATWG 13.2 knows a SCRIPTING FLAG. It is not script execution:
+        # with the flag on, `noscript` holds raw text, with it off, markup.
+        # The `.dat` format marks it per case; the `scripted_*` files are
+        # script-on throughout.
+        script = "script-on" in parts
+        cases.append((data, "\n".join(doc), context, script))
     return cases
 
 
@@ -67,8 +72,10 @@ def load_all(pattern=None, dirname=None):
     for path in sorted(glob.glob(os.path.join(dirname or DATA, "*.dat"))):
         if pattern and pattern not in os.path.basename(path):
             continue
-        for i, (data, doc, context) in enumerate(load_dat(path)):
-            all_cases.append((os.path.basename(path), i, data, doc, context))
+        base = os.path.basename(path)
+        for i, (data, doc, context, script) in enumerate(load_dat(path)):
+            all_cases.append((base, i, data, doc, context,
+                              script or base.startswith("scripted_")))
     return all_cases
 
 
@@ -110,11 +117,12 @@ def main():
         return 1
 
     payload = b""
-    for _, _, data, _, context in cases:
+    for _, _, data, _, context, script in cases:
         raw = data.encode("utf-8", "surrogatepass")
         ctx = (context or "").encode("utf-8", "surrogatepass")
         payload += struct.pack("<I", len(raw)) + raw
         payload += struct.pack("<I", len(ctx)) + ctx
+        payload += struct.pack("<I", 1 if script else 0)
 
     p = subprocess.run([binary], input=payload, stdout=subprocess.PIPE,
                        stderr=subprocess.PIPE, timeout=1200)
@@ -135,7 +143,7 @@ def main():
     fails = []
     passed = 0
     good_names = []
-    for (fname, idx, data, expected, context), answer in zip(cases, parts):
+    for (fname, idx, data, expected, context, script), answer in zip(cases, parts):
         got = answer.rstrip("\n")
         ok = (got == expected) and "#KAPUTT" not in answer
         st = per_file.setdefault(fname, [0, 0])
