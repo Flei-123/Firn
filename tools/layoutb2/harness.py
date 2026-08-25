@@ -203,9 +203,10 @@ def encode_job(html, ua, author, vw=VIEWPORT_W, vh=VIEWPORT_H):
     return struct.pack("<II", vw, vh) + blob(html) + blob(ua) + blob(author)
 
 
-def run_engine(binary, jobs, timeout=300):
+def run_engine(binary, jobs, timeout=300, extra=()):
     payload = b"".join(encode_job(h, u, a) for h, u, a in jobs)
-    proc = subprocess.run([binary], input=payload, stdout=subprocess.PIPE,
+    proc = subprocess.run([binary] + list(extra), input=payload,
+                          stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE, timeout=timeout)
     if proc.returncode != 0:
         raise RuntimeError("engine exited with %d: %s"
@@ -326,6 +327,49 @@ def measure(binary, tests, ua_text, chunk=20, verbose=False):
     return results
 
 
+def reflow_check(binary, tests, ua_text, chunk=20):
+    """THE PROOF OF THE SPLIT: a second layout of the same tree at another
+    width and back has to give the very same tree as the first one.
+
+    The engine keeps the box tree, the styles and the intrinsic widths
+    across a reflow and throws every used value away
+    (`flow.relayout_document`). If anything the window width decides
+    survived by accident, the second run at 800 differs from the first --
+    and this comparison is the only place where that shows up."""
+    same, differ, first_bad = 0, 0, []
+    for start in range(0, len(tests), chunk):
+        part = tests[start:start + chunk]
+        jobs = [(t["text"], ua_text,
+                 "\n".join(linked_sheets(t["path"], t["text"])))
+                for t in part]
+        try:
+            plain = run_engine(binary, jobs)
+            again = run_engine(binary, jobs, extra=("--reflow",))
+        except Exception as exc:
+            if len(part) == 1:
+                differ += 1
+                first_bad.append((part[0]["name"], str(exc)[:100]))
+                continue
+            for one in part:
+                sub = reflow_check(binary, [one], ua_text, 1)
+                same += sub[0]
+                differ += sub[1]
+            continue
+        for t, a, b in zip(part, plain, again):
+            if a == b:
+                same += 1
+            else:
+                differ += 1
+                if len(first_bad) < 5:
+                    diff = [(x, y) for x, y in zip(a, b) if x != y][:2]
+                    first_bad.append((t["name"], diff))
+    print("REFLOW: %d of %d documents identical after 800 -> 400 -> 800"
+          % (same, same + differ))
+    for name, d in first_bad:
+        print("   DIFFERS %s %s" % (name, d))
+    return 0 if differ == 0 else 1
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("binary")
@@ -334,6 +378,9 @@ def main():
     ap.add_argument("--only")
     ap.add_argument("--group")
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--reflow-check", action="store_true",
+                    help="lay every document out three times (800, 400, 800) "
+                         "and compare against the single layout")
     args = ap.parse_args()
 
     ua_text = open(UA, encoding="utf-8").read()
@@ -345,6 +392,9 @@ def main():
     if not tests:
         print("no tests found")
         return 2
+
+    if args.reflow_check:
+        return reflow_check(args.binary, tests, ua_text)
 
     results = measure(args.binary, tests, ua_text, verbose=args.verbose)
 
