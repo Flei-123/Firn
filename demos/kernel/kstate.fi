@@ -46,6 +46,9 @@ export {
     KEYPOS, NX_OK, EXECS, ELF_ERR, ELF_BYTES, ELF_PAGES, ELF_LOADS,
     ELF_OFF, ELF_MAX, EARG_OFF, EARG_MAX, LOAD_OFF, LOAD_MAX,
     M_NOKBD, M_OSUM, M_NOBSS,
+    CPU_OFF, CPU_BYTES, MAX_CPUS, LOCK_OFF, LOCK_BYTES, LOCK_COUNT,
+    SMP_OFF, SMP_LAPIC, SMP_COUNT, SMP_NOLOCK, SMP_MODE, SMP_MAX,
+    TCPU_OFF, TCPU_BYTES,
     get, set, add, get32, get16, get8, set8
 }
 
@@ -138,6 +141,45 @@ const EARG_MAX: u64 = 4096
 const LOAD_OFF: u64 = 0x11000 // one page of file data while loading
 const LOAD_MAX: u64 = 4096
 
+// Round K5. Everything a SECOND processor makes necessary.
+//
+// WHERE THESE FOUR LIE AND WHY IT COST AN HOUR. The list at the head of
+// this file stops at 0x0F000, and the obvious reading is that everything
+// above it is free. It is not: `pci.fi` puts its device table at 0x10000
+// and its counters at 0x12000, and `nvme.fi` puts four queues, an
+// identify page and two measurement buffers between 0x14000 and 0x1B000
+// -- all of them offsets in this same area, none of them named here. The
+// first version of round K5 put the per-core records at 0x12000, wrote
+// the index of the running task over the address of the local APIC, and
+// the machine stopped after exactly one timer interrupt: the
+// end-of-interrupt went to address zero. So: 0x1B000 upwards, which is
+// what is really left, and the map below now says so.
+//
+//   0x10000  pci.fi: the device table (8 KiB)
+//   0x12000  pci.fi: the counters of round K2, and apic.fi/nvme.fi in it
+//   0x14000  nvme.fi: admin and I/O queues, identify, two buffers
+//   0x1B000  round K5, from here on
+const CPU_OFF: u64 = 0x1B000 // one record per processor
+const CPU_BYTES: u64 = 256
+const MAX_CPUS: u64 = 8 // 8 * 256 = 2 KiB
+const LOCK_OFF: u64 = 0x1B800 // the spin locks, see atomic.fi
+const LOCK_BYTES: u64 = 64 // one cache line each, on purpose
+const LOCK_COUNT: u64 = 8
+const SMP_OFF: u64 = 0x1C000 // the scalars of smp.fi and cpu.fi
+const SMP_MAX: u64 = 4096
+// The task table is full: 248 + 8 = 256, and TASK_BYTES is 256. What
+// round K5 has to note per TASK therefore goes into a second, parallel
+// table rather than into a bigger record -- growing the record to 512
+// would push the task table into the trace at 0xA000.
+const TCPU_OFF: u64 = 0x1BA00 // 32 slots of 32: which core runs this task
+const TCPU_BYTES: u64 = 32
+
+// The scalars inside SMP_OFF.
+const SMP_LAPIC: u64 = 0 // address of the local APIC window
+const SMP_COUNT: u64 = 8 // processors the firmware reported
+const SMP_NOLOCK: u64 = 16 // 1 = every lock is a no-op (counter-check)
+const SMP_MODE: u64 = 24 // the words of the command line this round reads
+
 const KDATA_SIZE: u64 = 0x20000
 
 // ------------------------------------------------------ the command line
@@ -160,13 +202,20 @@ fn set(state: u64, off: u64, v: u64) {
     __mmio_write64((state + off) as *mut u64, v)
 }
 
-// Read, add, write back. NOT atomic -- it does not have to be: the kernel
-// runs on one processor, and the only writer of a counter is either the
-// interrupt handler or the main loop, never both.
+// Read, add, write back -- as ONE instruction, `lock xadd`.
+//
+// ROUND K5 changed this line and the sentence that used to stand over it:
+// "NOT atomic -- it does not have to be: the kernel runs on one
+// processor". From the round with the second processor on, the three
+// steps of a read-modify-write are three chances for another core to do
+// exactly the same in between, and one of the two increments is then gone
+// without a word. Every counter in this kernel goes through this
+// function, so making this one line atomic makes all of them safe --
+// TICKS, TRAPS, SWITCHES, NEXT_PID, the spurious count of the APIC.
+// `__atomic_add` yields the OLD value; the callers of `add` want the new
+// one, which is why the delta is added back on.
 fn add(state: u64, off: u64, v: u64) -> u64 {
-    let n: u64 = get(state, off) + v
-    set(state, off, n)
-    return n
+    return __atomic_add((state + off) as *mut u64, v) + v
 }
 
 fn get32(p: u64) -> u64 {
