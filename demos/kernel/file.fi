@@ -1,0 +1,385 @@
+// demos/kernel/file.fi -- round K4: descriptors, open files and pipes.
+//
+// Round 62 gave a process three descriptors, and a descriptor WAS an
+// inode: `T_FD + slot * 8` held the inode number, `T_FDOFF + slot * 8` the
+// position, and that was the whole of it. Three things are impossible in
+// that shape, and all three are things Unix programs do every day:
+//
+//   1. `dup2(fd, 1)` -- two descriptors that are ONE open file. With the
+//      inode in the descriptor, two descriptors are two positions, and a
+//      shell that points the output of a program at a file gets two
+//      writers that overwrite each other.
+//   2. `fork` -- parent and child SHARE the file they had open. A child
+//      that reads on the inherited descriptor must move the parent's
+//      position, otherwise the two read the same octets twice.
+//   3. a PIPE has no inode at all.
+//
+// So this file introduces the layer Unix has had since 1975: the process
+// holds a small array of descriptors, a descriptor points into the OPEN
+// FILE TABLE of the system, and THAT entry holds the kind, the position,
+// the flags and a reference count. `dup2` is then one line, `fork` is one
+// loop, and a pipe is an entry whose "inode" is a ring buffer.
+//
+// The three console descriptors are entries 0, 1 and 2 of that table and
+// belong to nobody: they carry no reference count that could reach zero,
+// because a process that closes its standard output must not take the
+// serial port away from every other process.
+//
+// Everything lives in the kernel data area (`kstate.fi`), because stage 0
+// of Firn has no global mutable state -- an address is handed in, and an
+// offset is what a global variable is here.
+
+import kstate
+
+export {
+    init, init_task, clear_task, close_all, inherit_task,
+    fd_of, fd_set, fd_alloc, fd_free,
+    open_alloc, open_ref, open_unref, open_kind, open_ino, open_off,
+    open_set_off, open_flags, open_set_flags, open_used,
+    pipe_new, pipe_get, pipe_put, pipe_room, pipe_bytes, pipe_writers,
+    pipe_readers,
+    K_FREE, K_FILE, K_DIR, K_CONIN, K_CONOUT, K_PIPER, K_PIPEW,
+    MAX_FD, MAX_OPEN, MAX_PIPES, PIPE_CAP, CON_IN, CON_OUT, CON_ERR
+}
+
+// ------------------------------------------------------------ the shapes
+
+const OF_BYTES: u64 = 64
+const MAX_OPEN: u64 = 64 // 64 * 64 = one page
+
+const OF_KIND: u64 = 0
+const OF_INO: u64 = 8 // inode, or the number of the pipe
+const OF_OFF: u64 = 16 // read/write position, or the entry of a directory
+const OF_REF: u64 = 24 // how many descriptors point here
+const OF_FLAGS: u64 = 32 // what `open` was asked for
+
+const K_FREE: u64 = 0
+const K_FILE: u64 = 1
+const K_DIR: u64 = 2
+const K_CONIN: u64 = 3 // the console, reading
+const K_CONOUT: u64 = 4 // the console, writing
+const K_PIPER: u64 = 5 // the reading end of a pipe
+const K_PIPEW: u64 = 6 // the writing end of a pipe
+
+// The three that are there before the first process is.
+const CON_IN: u64 = 0
+const CON_OUT: u64 = 1
+const CON_ERR: u64 = 2
+
+const MAX_FD: u64 = 16 // descriptors per process
+
+const MAX_PIPES: u64 = 8
+const PIPE_CAP: u64 = 512
+const PH_BYTES: u64 = 64
+const PH_READ: u64 = 0
+const PH_WRITE: u64 = 8
+const PH_READERS: u64 = 16
+const PH_WRITERS: u64 = 24
+const PH_USED: u64 = 32
+
+fn of_at(i: u64) -> u64 {
+    return kstate.OFILE_OFF + i * OF_BYTES
+}
+
+fn ph_at(i: u64) -> u64 {
+    return kstate.PIPEHDR_OFF + i * PH_BYTES
+}
+
+// ---------------------------------------------------------- the console
+
+// Called once, before the first task. The data area is zeroed by `boot.s`,
+// so everything else is already free; only the three console entries have
+// to exist, and they exist for good.
+fn init(state: u64) {
+    kstate.set(state, of_at(CON_IN) + OF_KIND, K_CONIN)
+    kstate.set(state, of_at(CON_IN) + OF_REF, 1)
+    kstate.set(state, of_at(CON_OUT) + OF_KIND, K_CONOUT)
+    kstate.set(state, of_at(CON_OUT) + OF_REF, 1)
+    kstate.set(state, of_at(CON_ERR) + OF_KIND, K_CONOUT)
+    kstate.set(state, of_at(CON_ERR) + OF_REF, 1)
+}
+
+// ------------------------------------------------------ the descriptors
+
+// A descriptor holds the index of the open file PLUS ONE, so that a zero
+// can go on meaning "closed" in a table that starts out zeroed.
+fn slot_at(task: u64, fd: u64) -> u64 {
+    return kstate.FDTAB_OFF + (task * MAX_FD + fd) * 8
+}
+
+// The open file behind a descriptor, or MAX_OPEN when there is none.
+fn fd_of(state: u64, task: u64, fd: u64) -> u64 {
+    if fd >= MAX_FD || task >= kstate.MAX_TASKS {
+        return MAX_OPEN
+    }
+    let v: u64 = kstate.get(state, slot_at(task, fd))
+    if v == 0 {
+        return MAX_OPEN
+    }
+    return v - 1
+}
+
+fn fd_set(state: u64, task: u64, fd: u64, open: u64) {
+    if fd >= MAX_FD || task >= kstate.MAX_TASKS {
+        return
+    }
+    kstate.set(state, slot_at(task, fd), open + 1)
+}
+
+fn fd_free(state: u64, task: u64, fd: u64) {
+    if fd >= MAX_FD || task >= kstate.MAX_TASKS {
+        return
+    }
+    kstate.set(state, slot_at(task, fd), 0)
+}
+
+// The lowest free descriptor -- the rule every Unix program relies on when
+// it closes 0 and opens a file to get 0 back. MAX_FD = none free.
+fn fd_alloc(state: u64, task: u64, from: u64) -> u64 {
+    var fd: u64 = from
+    while fd < MAX_FD {
+        if kstate.get(state, slot_at(task, fd)) == 0 {
+            return fd
+        }
+        fd = fd + 1
+    }
+    return MAX_FD
+}
+
+// A new process: the three standard descriptors and nothing else.
+fn init_task(state: u64, task: u64) {
+    clear_task(state, task)
+    fd_set(state, task, 0, CON_IN)
+    fd_set(state, task, 1, CON_OUT)
+    fd_set(state, task, 2, CON_ERR)
+}
+
+fn clear_task(state: u64, task: u64) {
+    if task >= kstate.MAX_TASKS {
+        return
+    }
+    var fd: u64 = 0
+    while fd < MAX_FD {
+        kstate.set(state, slot_at(task, fd), 0)
+        fd = fd + 1
+    }
+}
+
+// `fork`: the child gets the SAME open files, not copies of them. Every
+// entry one more reference -- that is what makes a position shared and a
+// pipe that stays open as long as one of the two still holds it.
+fn inherit_task(state: u64, parent: u64, child: u64) {
+    clear_task(state, child)
+    var fd: u64 = 0
+    while fd < MAX_FD {
+        let of: u64 = fd_of(state, parent, fd)
+        if of < MAX_OPEN {
+            open_ref(state, of)
+            fd_set(state, child, fd, of)
+        }
+        fd = fd + 1
+    }
+}
+
+// The end of a process. Every descriptor it still holds is one reference
+// less -- and a pipe whose last writer ends is what makes the reader at
+// the other end see the end of the input instead of waiting forever.
+fn close_all(state: u64, task: u64) {
+    if task >= kstate.MAX_TASKS {
+        return
+    }
+    var fd: u64 = 0
+    while fd < MAX_FD {
+        let of: u64 = fd_of(state, task, fd)
+        if of < MAX_OPEN {
+            open_unref(state, of)
+        }
+        kstate.set(state, slot_at(task, fd), 0)
+        fd = fd + 1
+    }
+}
+
+// ------------------------------------------------------ the open files
+
+fn open_used(state: u64, i: u64) -> bool {
+    if i >= MAX_OPEN {
+        return false
+    }
+    return kstate.get(state, of_at(i) + OF_KIND) != K_FREE
+}
+
+// A free entry, with one reference. The three console entries are never
+// handed out: the search starts behind them.
+fn open_alloc(state: u64, kind: u64, ino: u64, flags: u64) -> u64 {
+    var i: u64 = CON_ERR + 1
+    while i < MAX_OPEN {
+        if kstate.get(state, of_at(i) + OF_KIND) == K_FREE {
+            kstate.set(state, of_at(i) + OF_KIND, kind)
+            kstate.set(state, of_at(i) + OF_INO, ino)
+            kstate.set(state, of_at(i) + OF_OFF, 0)
+            kstate.set(state, of_at(i) + OF_REF, 1)
+            kstate.set(state, of_at(i) + OF_FLAGS, flags)
+            kstate.add(state, kstate.OPENS, 1)
+            return i
+        }
+        i = i + 1
+    }
+    return MAX_OPEN
+}
+
+fn open_ref(state: u64, i: u64) {
+    if i >= MAX_OPEN || i <= CON_ERR {
+        return // the console has no count that could run out
+    }
+    kstate.add(state, of_at(i) + OF_REF, 1)
+}
+
+// One reference less. At zero the entry is free again -- and if it was one
+// end of a pipe, that end is now closed for good.
+fn open_unref(state: u64, i: u64) {
+    if i >= MAX_OPEN || i <= CON_ERR {
+        return
+    }
+    let r: u64 = kstate.get(state, of_at(i) + OF_REF)
+    if r > 1 {
+        kstate.set(state, of_at(i) + OF_REF, r - 1)
+        return
+    }
+    let kind: u64 = kstate.get(state, of_at(i) + OF_KIND)
+    let p: u64 = kstate.get(state, of_at(i) + OF_INO)
+    if kind == K_PIPER {
+        pipe_drop(state, p, true)
+    }
+    if kind == K_PIPEW {
+        pipe_drop(state, p, false)
+    }
+    kstate.set(state, of_at(i) + OF_KIND, K_FREE)
+    kstate.set(state, of_at(i) + OF_INO, 0)
+    kstate.set(state, of_at(i) + OF_OFF, 0)
+    kstate.set(state, of_at(i) + OF_REF, 0)
+    kstate.set(state, of_at(i) + OF_FLAGS, 0)
+}
+
+fn open_kind(state: u64, i: u64) -> u64 {
+    if i >= MAX_OPEN {
+        return K_FREE
+    }
+    return kstate.get(state, of_at(i) + OF_KIND)
+}
+
+fn open_ino(state: u64, i: u64) -> u64 {
+    return kstate.get(state, of_at(i) + OF_INO)
+}
+
+fn open_off(state: u64, i: u64) -> u64 {
+    return kstate.get(state, of_at(i) + OF_OFF)
+}
+
+fn open_set_off(state: u64, i: u64, off: u64) {
+    kstate.set(state, of_at(i) + OF_OFF, off)
+}
+
+fn open_flags(state: u64, i: u64) -> u64 {
+    return kstate.get(state, of_at(i) + OF_FLAGS)
+}
+
+fn open_set_flags(state: u64, i: u64, f: u64) {
+    kstate.set(state, of_at(i) + OF_FLAGS, f)
+}
+
+// ------------------------------------------------------------- the pipes
+
+// A pipe is 512 octets and two positions that only ever grow; what is in
+// it is the difference between them, and that makes the empty case and the
+// full case one comparison each instead of a flag nobody updates.
+fn pipe_new(state: u64) -> u64 {
+    var i: u64 = 0
+    while i < MAX_PIPES {
+        if kstate.get(state, ph_at(i) + PH_USED) == 0 {
+            kstate.set(state, ph_at(i) + PH_USED, 1)
+            kstate.set(state, ph_at(i) + PH_READ, 0)
+            kstate.set(state, ph_at(i) + PH_WRITE, 0)
+            kstate.set(state, ph_at(i) + PH_READERS, 1)
+            kstate.set(state, ph_at(i) + PH_WRITERS, 1)
+            kstate.add(state, kstate.PIPES, 1)
+            return i
+        }
+        i = i + 1
+    }
+    return MAX_PIPES
+}
+
+// One end of it closed. When both are gone the pipe is free again.
+fn pipe_drop(state: u64, i: u64, reader: bool) {
+    if i >= MAX_PIPES {
+        return
+    }
+    if reader {
+        let r: u64 = kstate.get(state, ph_at(i) + PH_READERS)
+        if r > 0 {
+            kstate.set(state, ph_at(i) + PH_READERS, r - 1)
+        }
+    } else {
+        let w: u64 = kstate.get(state, ph_at(i) + PH_WRITERS)
+        if w > 0 {
+            kstate.set(state, ph_at(i) + PH_WRITERS, w - 1)
+        }
+    }
+    let rd: u64 = kstate.get(state, ph_at(i) + PH_READERS)
+    let wr: u64 = kstate.get(state, ph_at(i) + PH_WRITERS)
+    if rd == 0 && wr == 0 {
+        kstate.set(state, ph_at(i) + PH_USED, 0)
+    }
+}
+
+fn pipe_bytes(state: u64, i: u64) -> u64 {
+    if i >= MAX_PIPES {
+        return 0
+    }
+    return kstate.get(state, ph_at(i) + PH_WRITE)
+        - kstate.get(state, ph_at(i) + PH_READ)
+}
+
+fn pipe_room(state: u64, i: u64) -> u64 {
+    return PIPE_CAP - pipe_bytes(state, i)
+}
+
+fn pipe_writers(state: u64, i: u64) -> u64 {
+    if i >= MAX_PIPES {
+        return 0
+    }
+    return kstate.get(state, ph_at(i) + PH_WRITERS)
+}
+
+fn pipe_readers(state: u64, i: u64) -> u64 {
+    if i >= MAX_PIPES {
+        return 0
+    }
+    return kstate.get(state, ph_at(i) + PH_READERS)
+}
+
+// One octet in, one octet out. The positions grow without end and only the
+// low nine bits pick the place -- so nothing has to be moved when the ring
+// wraps around.
+fn pipe_put(state: u64, i: u64, v: u64) -> bool {
+    if pipe_room(state, i) == 0 {
+        return false
+    }
+    let w: u64 = kstate.get(state, ph_at(i) + PH_WRITE)
+    let at: u64 = state + kstate.PIPEBUF_OFF + i * PIPE_CAP + (w % PIPE_CAP)
+    kstate.set8(at, v as u8)
+    kstate.set(state, ph_at(i) + PH_WRITE, w + 1)
+    return true
+}
+
+// The octet, or 256 when there is none -- a value no octet has.
+fn pipe_get(state: u64, i: u64) -> u64 {
+    if pipe_bytes(state, i) == 0 {
+        return 256
+    }
+    let r: u64 = kstate.get(state, ph_at(i) + PH_READ)
+    let at: u64 = state + kstate.PIPEBUF_OFF + i * PIPE_CAP + (r % PIPE_CAP)
+    let v: u64 = kstate.get8(at)
+    kstate.set(state, ph_at(i) + PH_READ, r + 1)
+    return v
+}
