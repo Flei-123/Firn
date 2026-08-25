@@ -27,6 +27,7 @@ import user
 import fs
 import kbd
 import elf
+import uio
 
 export {
     entry, neg, E_NOENT, E_BADF, E_CHILD, E_FAULT, E_INVAL, E_NOSYS,
@@ -54,6 +55,19 @@ const SYS_STAT: u64 = 23
 const SYS_GETPPID: u64 = 24
 // ROUND K1: a program off the disk. `exec(path, argv, argc)` -> pid.
 const SYS_EXEC: u64 = 25
+// ROUND K6: what a userland needs on top of a single program -- a shell
+// that redirects, a working directory, a position in a file, and four
+// programs that want to know something about the machine. The numbers
+// start at 40 and not at 26 because round K4 is filling 26.. with the
+// POSIX layer at the same time; every one of them is answered in
+// `demos/kernel/uio.fi`.
+const SYS_DUP2: u64 = 40
+const SYS_SEEK: u64 = 41
+const SYS_CHDIR: u64 = 42
+const SYS_GETCWD: u64 = 43
+const SYS_SYSINFO: u64 = 44
+const SYS_PSTAT: u64 = 45
+const SYS_KILL: u64 = 46
 
 // The errors, with the numbers of the system everybody knows.
 const E_NOENT: u64 = 2 // no such file
@@ -152,6 +166,27 @@ fn entry(number: u64, a0: u64, a1: u64, a2: u64, state: u64) -> u64 {
     if number == SYS_EXEC {
         return do_exec(state, me, a0, a1, a2)
     }
+    if number == SYS_DUP2 {
+        return do_dup2(state, me, a0, a1)
+    }
+    if number == SYS_SEEK {
+        return do_seek(state, me, a0, a1, a2)
+    }
+    if number == SYS_CHDIR {
+        return do_chdir(state, me, a0)
+    }
+    if number == SYS_GETCWD {
+        return do_getcwd(state, me, a0, a1)
+    }
+    if number == SYS_SYSINFO {
+        return uio.sysinfo(state, a0)
+    }
+    if number == SYS_PSTAT {
+        return uio.pstat(state, a0, a1)
+    }
+    if number == SYS_KILL {
+        return uio.kill_pid(state, a0, a1)
+    }
     return neg(E_NOSYS)
 }
 
@@ -207,19 +242,19 @@ fn do_write(state: u64, me: u64, fd: u64, buf: u64, len: u64) -> u64 {
     if !proc.user_ok(state, me, buf, len) {
         return neg(E_FAULT)
     }
-    if fd == FD_OUT || fd == FD_ERR {
-        var k: u64 = 0
-        while k < len {
-            serial.put(peek(state, me, buf + k) as u8)
-            k = k + 1
-        }
-        return len
-    }
-    if fd == FD_IN {
-        return neg(E_BADF)
-    }
-    let ino: u64 = fd_inode(state, me, fd)
+    // ROUND K6: the three standard descriptors are STATE now
+    // (`demos/kernel/uio.fi`). A descriptor that names no inode is the
+    // console, and the console is an answer for 1 and 2 only.
+    let ino: u64 = res_inode(state, me, fd)
     if ino == 0 {
+        if fd == FD_OUT || fd == FD_ERR {
+            var k: u64 = 0
+            while k < len {
+                serial.put(peek(state, me, buf + k) as u8)
+                k = k + 1
+            }
+            return len
+        }
         return neg(E_BADF)
     }
     // Through the data area: the file system never sees an address of a
@@ -230,9 +265,9 @@ fn do_write(state: u64, me: u64, fd: u64, buf: u64, len: u64) -> u64 {
         kstate.set8(bounce + k, peek(state, me, buf + k) as u8)
         k = k + 1
     }
-    let off: u64 = fd_offset(state, me, fd)
+    let off: u64 = res_offset(state, me, fd)
     let n: u64 = fs.write_at(state, ino, off, bounce, len)
-    fd_set_offset(state, me, fd, off + n)
+    res_set_offset(state, me, fd, off + n)
     return n
 }
 
@@ -245,18 +280,15 @@ fn do_read(state: u64, me: u64, fd: u64, buf: u64, len: u64) -> u64 {
     if !proc.user_ok(state, me, buf, len) {
         return neg(E_FAULT)
     }
-    if fd == FD_IN {
-        return console_read(state, me, buf, len)
-    }
-    if fd == FD_OUT || fd == FD_ERR {
-        return neg(E_BADF)
-    }
-    let ino: u64 = fd_inode(state, me, fd)
+    let ino: u64 = res_inode(state, me, fd)
     if ino == 0 {
+        if fd == FD_IN {
+            return console_read(state, me, buf, len)
+        }
         return neg(E_BADF)
     }
     let bounce: u64 = state + kstate.BLOCK_OFF
-    let off: u64 = fd_offset(state, me, fd)
+    let off: u64 = res_offset(state, me, fd)
     let n: u64 = fs.read_at(state, ino, off, bounce, len)
     var k: u64 = 0
     while k < n {
@@ -265,7 +297,7 @@ fn do_read(state: u64, me: u64, fd: u64, buf: u64, len: u64) -> u64 {
         }
         k = k + 1
     }
-    fd_set_offset(state, me, fd, off + n)
+    res_set_offset(state, me, fd, off + n)
     return n
 }
 
@@ -402,7 +434,7 @@ fn do_exec(state: u64, me: u64, path: u64, argv: u64, argc: u64) -> u64 {
         return neg(E_2BIG)
     }
     let name: u64 = state + kstate.NAME_OFF
-    let len: u64 = fetch_name(state, me, path, name, 64)
+    let len: u64 = fetch_path(state, me, path, name, 64)
     if (len >> 63) != 0 {
         return len
     }
@@ -511,7 +543,7 @@ fn do_open(state: u64, me: u64, name: u64, create: u64) -> u64 {
         return neg(E_NOSYS)
     }
     let buf: u64 = state + kstate.NAME_OFF
-    let len: u64 = fetch_name(state, me, name, buf, 64)
+    let len: u64 = fetch_path(state, me, name, buf, 64)
     if (len >> 63) != 0 {
         return len
     }
@@ -541,6 +573,15 @@ fn do_open(state: u64, me: u64, name: u64, create: u64) -> u64 {
 }
 
 fn do_close(state: u64, me: u64, fd: u64) -> u64 {
+    // ROUND K6: closing one of the three standard descriptors does not
+    // take it away, it gives it back to the console. A shell that has
+    // just pointed its own output at a file needs exactly that to get it
+    // back afterwards.
+    if fd < FD_FIRST {
+        uio.set_handle(state, me, fd, 0)
+        uio.set_offset(state, me, fd, 0)
+        return 0
+    }
     if fd_inode(state, me, fd) == 0 {
         return neg(E_BADF)
     }
@@ -554,7 +595,7 @@ fn do_unlink(state: u64, me: u64, name: u64) -> u64 {
         return neg(E_NOSYS)
     }
     let buf: u64 = state + kstate.NAME_OFF
-    let len: u64 = fetch_name(state, me, name, buf, 64)
+    let len: u64 = fetch_path(state, me, name, buf, 64)
     if (len >> 63) != 0 {
         return len
     }
@@ -569,7 +610,7 @@ fn do_mkdir(state: u64, me: u64, name: u64) -> u64 {
         return neg(E_NOSYS)
     }
     let buf: u64 = state + kstate.NAME_OFF
-    let len: u64 = fetch_name(state, me, name, buf, 64)
+    let len: u64 = fetch_path(state, me, name, buf, 64)
     if (len >> 63) != 0 {
         return len
     }
@@ -593,7 +634,7 @@ fn do_list(state: u64, me: u64, name: u64, index: u64, out: u64) -> u64 {
         return neg(E_FAULT)
     }
     let buf: u64 = state + kstate.NAME_OFF
-    let len: u64 = fetch_name(state, me, name, buf, 64)
+    let len: u64 = fetch_path(state, me, name, buf, 64)
     if (len >> 63) != 0 {
         return len
     }
@@ -625,7 +666,7 @@ fn do_stat(state: u64, me: u64, name: u64, unused: u64) -> u64 {
         return neg(E_NOSYS)
     }
     let buf: u64 = state + kstate.NAME_OFF
-    let len: u64 = fetch_name(state, me, name, buf, 64)
+    let len: u64 = fetch_path(state, me, name, buf, 64)
     if (len >> 63) != 0 {
         return len
     }
@@ -634,4 +675,134 @@ fn do_stat(state: u64, me: u64, name: u64, unused: u64) -> u64 {
         return neg(E_NOENT)
     }
     return fs.inode_size(state, ino)
+}
+
+// ============================================================ round K6
+//
+// A userland. Everything below is what a SHELL needs of a kernel and a
+// single program does not, and the state it works on lies in
+// `demos/kernel/uio.fi` -- one slot of 128 octets per task.
+
+// The three standard descriptors and the table of open files, under one
+// pair of accessors. Below 3 the handle is inherited by a child; from 3
+// on it belongs to the task alone.
+fn res_inode(state: u64, me: u64, fd: u64) -> u64 {
+    if fd < FD_FIRST {
+        return uio.handle(state, me, fd)
+    }
+    return fd_inode(state, me, fd)
+}
+
+fn res_offset(state: u64, me: u64, fd: u64) -> u64 {
+    if fd < FD_FIRST {
+        return uio.offset(state, me, fd)
+    }
+    return fd_offset(state, me, fd)
+}
+
+fn res_set_offset(state: u64, me: u64, fd: u64, off: u64) {
+    if fd < FD_FIRST {
+        uio.set_offset(state, me, fd, off)
+        return
+    }
+    fd_set_offset(state, me, fd, off)
+}
+
+// A name out of ring 3 that is meant to be a PATH. The difference to
+// `fetch_name` is one line and it is the whole of the working directory:
+// a name that does not start with a slash is completed with it before
+// the file system sees it. `exec` uses this for the program and
+// `fetch_name` for the arguments -- an argument is not a path.
+fn fetch_path(state: u64, me: u64, addr: u64, dst: u64, max: u64) -> u64 {
+    let n: u64 = fetch_name(state, me, addr, dst, max)
+    if (n >> 63) != 0 {
+        return n
+    }
+    return uio.resolve(state, me, dst, n)
+}
+
+fn fd_valid(state: u64, me: u64, fd: u64) -> bool {
+    if fd < FD_FIRST {
+        return true
+    }
+    return fd_inode(state, me, fd) != 0
+}
+
+// `dup2(old, new)`: afterwards `new` says what `old` says. The console is
+// a handle like any other (inode 0), so `dup2(2, 1)` is how a shell whose
+// error output is still the console takes its output back.
+fn do_dup2(state: u64, me: u64, old: u64, new: u64) -> u64 {
+    if !fd_valid(state, me, old) {
+        return neg(E_BADF)
+    }
+    if new >= FD_FIRST + sched.FD_SLOTS {
+        return neg(E_BADF)
+    }
+    let ino: u64 = res_inode(state, me, old)
+    let off: u64 = res_offset(state, me, old)
+    if new < FD_FIRST {
+        uio.set_handle(state, me, new, ino)
+        uio.set_offset(state, me, new, off)
+        return new
+    }
+    sched.tset(state, me, sched.T_FD + (new - FD_FIRST) * 8, ino)
+    sched.tset(state, me, sched.T_FDOFF + (new - FD_FIRST) * 8, off)
+    return new
+}
+
+// `seek(fd, off, whence)`: 0 = from the start, 1 = from here, 2 = from
+// the end. The console has no position and is refused. Only a FORWARD
+// offset is taken -- a negative one would arrive as a huge unsigned
+// number, and the checked arithmetic of round 72 would rightly panic on
+// it instead of counting backwards.
+fn do_seek(state: u64, me: u64, fd: u64, off: u64, whence: u64) -> u64 {
+    let ino: u64 = res_inode(state, me, fd)
+    if ino == 0 {
+        return neg(E_BADF)
+    }
+    if off > 0xFFFFFFFF || whence > 2 {
+        return neg(E_INVAL)
+    }
+    var at: u64 = off
+    if whence == 1 {
+        at = res_offset(state, me, fd) + off
+    }
+    if whence == 2 {
+        at = fs.inode_size(state, ino) + off
+    }
+    res_set_offset(state, me, fd, at)
+    return at
+}
+
+fn do_chdir(state: u64, me: u64, name: u64) -> u64 {
+    if kstate.get(state, kstate.FS_READY) == 0 {
+        return neg(E_NOSYS)
+    }
+    let buf: u64 = state + kstate.NAME_OFF
+    let len: u64 = fetch_path(state, me, name, buf, 64)
+    if (len >> 63) != 0 {
+        return len
+    }
+    return uio.chdir_to(state, me, buf)
+}
+
+fn do_getcwd(state: u64, me: u64, out: u64, len: u64) -> u64 {
+    let n: u64 = uio.cwd_len(state, me)
+    if len <= n {
+        return neg(E_INVAL)
+    }
+    if !proc.user_ok(state, me, out, n + 1) {
+        return neg(E_FAULT)
+    }
+    var i: u64 = 0
+    while i < n {
+        if !poke(state, me, out + i, uio.cwd_at(state, me, i)) {
+            return neg(E_FAULT)
+        }
+        i = i + 1
+    }
+    if !poke(state, me, out + n, 0) {
+        return neg(E_FAULT)
+    }
+    return n
 }
