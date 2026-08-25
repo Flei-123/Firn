@@ -198,7 +198,7 @@ const EXTRA_COUNT: usize = %d
 ''' % (len(SVG_TAGS), len(SVG_ATTRS), len(MATH_ATTRS), len(FOREIGN_ATTRS),
        len(EXTRA))
 
-    parts = [head]
+    parts = [head.rstrip('\n')]
     parts.append(literal(
         "svg_tag_bytes",
         [w for pair in SVG_TAGS for w in pair],
