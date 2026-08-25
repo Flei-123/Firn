@@ -91,6 +91,14 @@ fi
 [ "$fresh" -eq 1 ] && { rm -f "$FC1"; "$FIRNC" bin/firnc1.fi -o "$FC1" || exit 1; }
 
 # The value of one measurement out of the run: `posix: <name> = <number>`.
+# The value of a `const NAME: u64 = <number>` -- the line may carry a
+# comment behind it, so the number is taken from the middle and not from
+# the end.
+number_in() { # file name
+    grep -aE "^const $2: u64 = [0-9]+" "$1" | head -1 \
+        | sed -E 's/^const [A-Za-z0-9_]+: u64 = ([0-9]+).*/\1/'
+}
+
 value_of() { # file name
     grep -a -m1 "^posix: $2 = " "$1" | sed 's/.* = //'
 }
@@ -109,8 +117,7 @@ say() { # file name expected description
 echo "== 1. the numbers are the numbers of Linux x86-64 =="
 check_number() { # name expected
     local got
-    got=$(grep -aE "^const SYS_$1: u64 = [0-9]+" demos/kernel/sys.fi \
-        | head -1 | grep -oE '[0-9]+$')
+    got=$(number_in demos/kernel/sys.fi "SYS_$1")
     if [ "$got" = "$2" ]; then ok "SYS_$1 = $2"
     else bad "SYS_$1 = ${got:-missing}, Linux says $2"; fi
 }
@@ -143,35 +150,38 @@ check_number EXIT_GROUP 231
 # What Osum has of its own lives far above the Linux table on purpose: a
 # number that could one day BE a Linux call would be a trap for stage 2.
 own=$(grep -aoE "^const SYS_OSUM_[A-Z]+: u64 = [0-9]+" demos/kernel/sys.fi \
-    | grep -oE '[0-9]+$' | sort -n | head -1)
+    | sed -E 's/.*= ([0-9]+).*/\1/' | sort -n | head -1)
 num "the lowest number Osum invented for itself" "${own:-0}" ge 1000
 
 # The libc says the same numbers. Two tables that disagree would be a
 # program that asks for `fstat` and gets `lseek`.
 diffs=0
 while read -r name value; do
-    other=$(grep -aE "^const $name: u64 = [0-9]+$" lib/osum/libc/kcall.fi \
-        | head -1 | grep -oE '[0-9]+$')
+    other=$(number_in lib/osum/libc/kcall.fi "$name")
     [ "$other" = "$value" ] || { diffs=$((diffs+1)); echo "        $name: kernel $value, libc ${other:-missing}"; }
-done < <(grep -aoE "^const SYS_[A-Z0-9_]+: u64 = [0-9]+$" demos/kernel/sys.fi \
-    | sed -E 's/^const ([A-Z0-9_]+): u64 = ([0-9]+)$/\1 \2/')
+done < <(grep -aoE "^const SYS_[A-Z0-9_]+: u64 = [0-9]+" demos/kernel/sys.fi \
+    | sed -E 's/^const ([A-Z0-9_]+): u64 = ([0-9]+).*/\1 \2/' \
+    | grep -vE '^SYS_(MARK|LEAVE) ')
+# SYS_MARK and SYS_LEAVE are not in that comparison: they are the two
+# marks of round 59, they live only while the ring 3 excursion of
+# `user.fi` runs, and no program can reach them -- a libc that offered
+# them would be offering something that does not exist.
 num "system call numbers on which kernel and libc disagree" "$diffs" eq 0
 
 ediffs=0
 ecount=0
 while read -r name value; do
     ecount=$((ecount+1))
-    other=$(grep -aE "^const $name: u64 = [0-9]+$" lib/osum/libc/errno.fi \
-        | head -1 | grep -oE '[0-9]+$')
+    other=$(number_in lib/osum/libc/errno.fi "$name")
     [ "$other" = "$value" ] || { ediffs=$((ediffs+1)); echo "        $name: kernel $value, libc ${other:-missing}"; }
 done < <(grep -aoE "^const E_[A-Z0-9_]+: u64 = [0-9]+" demos/kernel/errno.fi \
-    | sed -E 's/^const ([A-Z0-9_]+): u64 = ([0-9]+)$/\1 \2/')
+    | sed -E 's/^const ([A-Z0-9_]+): u64 = ([0-9]+).*/\1 \2/')
 num "error numbers the kernel defines" "$ecount" ge 30
 num "error numbers on which kernel and libc disagree" "$ediffs" eq 0
 for pair in "E_NOENT 2" "E_BADF 9" "E_CHILD 10" "E_FAULT 14" "E_INVAL 22" \
             "E_NOSYS 38" "E_ISDIR 21" "E_NOTDIR 20" "E_SPIPE 29" "E_PIPE 32"; do
     set -- $pair
-    got=$(grep -aE "^const $1: u64 = [0-9]+" demos/kernel/errno.fi | head -1 | grep -oE '[0-9]+$')
+    got=$(number_in demos/kernel/errno.fi "$1")
     [ "$got" = "$2" ] && ok "$1 = $2 (the number Linux uses)" \
                       || bad "$1 = ${got:-missing}, expected $2"
 done
@@ -411,7 +421,7 @@ if grep -aq '^\./ \.\./ bin/ readme.txt $' "$N"; then
 else
     bad "counter-check: the plain listing is missing"
 fi
-hasnot "$N" "out.txt" "counter-check: and /out.txt was never made"
+has "$N" "cat: failed -2" "counter-check: and /out.txt was never made -- cat says -ENOENT"
 
 # ------------------------------------------------------------- section 6
 
@@ -430,6 +440,11 @@ num "the deepest kernel stack of the run (octets)" "$deep" lt "${cap:-0}"
 hasnot "$F" "*** EXCEPTION" "not one exception in a run that provokes fourteen errors"
 calls=$(grep -a -o -E 'syscalls=[0-9]+' "$F" | head -1 | cut -d= -f2)
 num "system calls answered in the run" "${calls:-0}" ge 100
+num "processes split by fork" "$(grep -a -o -E 'forks=[0-9]+' "$F" | head -1 | cut -d= -f2)" ge 2
+num "images replaced in place by execve" "$(grep -a -o -E 'execves=[0-9]+' "$F" | head -1 | cut -d= -f2)" ge 1
+num "pipes made" "$(grep -a -o -E 'pipes=[0-9]+' "$F" | head -1 | cut -d= -f2)" ge 2
+num "pages handed out by brk and mmap" "$(grep -a -o -E 'maps=[0-9]+' "$F" | head -1 | cut -d= -f2)" ge 3
+num "descriptors opened" "$(grep -a -o -E 'opens=[0-9]+' "$F" | head -1 | cut -d= -f2)" ge 10
 
 # ------------------------------------------------------------- section 7
 
