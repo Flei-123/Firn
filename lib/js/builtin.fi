@@ -16,6 +16,7 @@
 // (a pattern engine is a round of its own), `Date`, `Promise`, `Proxy`,
 // `Reflect`, typed arrays and everything that needs generators.
 import html.mem
+import str.ucd
 import std.math
 import std.num
 import js.lex
@@ -472,7 +473,7 @@ fn parse_int(r: Gc[Realm], args: Gc[GcVec]) -> AllocError!Gc[JsVal] {
     }
     let n: u64 = val.str_len(s)
     var i: u64 = 0
-    while i < n && is_ws(val.str_at(s, i)) {
+    while i < n && is_ws(r.ucdtab, val.str_at(s, i)) {
         i = i + 1
     }
     var neg: bool = false
@@ -531,20 +532,22 @@ fn dig(c: u32) -> u32 {
     return 99
 }
 
-fn is_ws(c: u32) -> bool {
+// ECMA-262 white space and line terminators: TAB, LF, VT, FF, CR, ZWNBSP,
+// the general category Zs, and Zl/Zp (U+2028, U+2029). Since round 95 the
+// Unicode part comes out of the generated table
+// (generated/unicode_tables.fi) instead of a hand written list.
+fn is_ws(t: u64, c: u32) -> bool {
     if c == 9 as u32 || c == 10 as u32 || c == 11 as u32 || c == 12 as u32 {
         return true
     }
-    if c == 13 as u32 || c == 32 as u32 || c == 0xA0 as u32 || c == 0xFEFF as u32 {
+    if c == 13 as u32 || c == 32 as u32 || c == 0xFEFF as u32 {
         return true
     }
-    if c == 0x2028 as u32 || c == 0x2029 as u32 {
-        return true
+    if c < 0x80 as u32 {
+        return false
     }
-    if c >= 0x2000 as u32 && c <= 0x200A as u32 {
-        return true
-    }
-    return c == 0x1680 as u32 || c == 0x202F as u32 || c == 0x205F as u32 || c == 0x3000 as u32
+    let k: u8 = ucd.ucd_category(t, c)
+    return k == ucd.CAT_ZS || k == ucd.CAT_ZL || k == ucd.CAT_ZP
 }
 
 fn parse_float(r: Gc[Realm], args: Gc[GcVec]) -> AllocError!Gc[JsVal] {
@@ -555,7 +558,7 @@ fn parse_float(r: Gc[Realm], args: Gc[GcVec]) -> AllocError!Gc[JsVal] {
     }
     let n: u64 = val.str_len(s)
     var i: u64 = 0
-    while i < n && is_ws(val.str_at(s, i)) {
+    while i < n && is_ws(r.ucdtab, val.str_at(s, i)) {
         i = i + 1
     }
     // `Infinity` with a sign.
@@ -2199,23 +2202,40 @@ fn string_fn(r: Gc[Realm], id: u64, this: Gc[JsVal], args: Gc[GcVec],
         let out: Gc[JsStr] = try val.str_new(r)
         var i: u64 = 0
         while i < n {
+            // Round 95: the simple case mappings of the UCD out of the
+            // generated table. Until round 94 this was ASCII plus Latin-1.
+            // What is still missing is SpecialCasing.txt, where one code
+            // point becomes several ("STRASSE"); UnicodeData leaves the
+            // field empty for those, so they stay as they are instead of
+            // becoming something wrong.
+            // Round 95: a code POINT, not a code unit -- a surrogate pair
+            // is put together, mapped and written out again. Without that
+            // the Deseret block (U+10400) came out unchanged.
             var c: u32 = val.str_at(s, i)
-            // ASCII plus Latin-1: a full case table is a round of its own.
-            if id == B_SP_TOUPPER {
-                if c >= 97 as u32 && c <= 122 as u32 {
-                    c = c - 32 as u32
-                } else if c >= 0xE0 as u32 && c <= 0xFE as u32 && c != 0xF7 as u32 {
-                    c = c - 32 as u32
-                }
-            } else {
-                if c >= 65 as u32 && c <= 90 as u32 {
-                    c = c + 32 as u32
-                } else if c >= 0xC0 as u32 && c <= 0xDE as u32 && c != 0xD7 as u32 {
-                    c = c + 32 as u32
+            var step: u64 = 1
+            if c >= 0xD800 as u32 && c <= 0xDBFF as u32 && i + 1 < n {
+                let lo: u32 = val.str_at(s, i + 1)
+                if lo >= 0xDC00 as u32 && lo <= 0xDFFF as u32 {
+                    let top: u32 = (c - 0xD800 as u32) * 1024 as u32
+                    c = 0x10000 as u32 + top + (lo - 0xDC00 as u32)
+                    step = 2
                 }
             }
-            let ok: bool = try val.str_push(out, c)
-            i = i + 1
+            var m: u32 = c
+            if id == B_SP_TOUPPER {
+                m = ucd.ucd_to_upper(r.ucdtab, c)
+            } else {
+                m = ucd.ucd_to_lower(r.ucdtab, c)
+            }
+            if m >= 0x10000 as u32 {
+                let hi: u32 = 0xD800 as u32 + (m - 0x10000 as u32) / 1024 as u32
+                let lo2: u32 = 0xDC00 as u32 + (m - 0x10000 as u32) % 1024 as u32
+                let o1: bool = try val.str_push(out, hi)
+                let o2: bool = try val.str_push(out, lo2)
+            } else {
+                let ok: bool = try val.str_push(out, m)
+            }
+            i = i + step
         }
         let ov: Gc[JsVal] = out
         return ov
@@ -2223,10 +2243,10 @@ fn string_fn(r: Gc[Realm], id: u64, this: Gc[JsVal], args: Gc[GcVec],
     if id == B_SP_TRIM {
         var a: u64 = 0
         var b: u64 = n
-        while a < b && is_ws(val.str_at(s, a)) {
+        while a < b && is_ws(r.ucdtab, val.str_at(s, a)) {
             a = a + 1
         }
-        while b > a && is_ws(val.str_at(s, b - 1)) {
+        while b > a && is_ws(r.ucdtab, val.str_at(s, b - 1)) {
             b = b - 1
         }
         return val.str_slice(r, s, a, b)
