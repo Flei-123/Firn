@@ -690,14 +690,36 @@ fn arm_rt(t: *mut Tcp, c: *mut Tcb, now: u64) {
     (*c).rt_at = now + rto_of(t, c)
 }
 
+// `srtt` and `rttvar` are smoothed averages of a measured time; they
+// cannot grow past the largest timeout there is, and clamping them here
+// is what keeps the multiplication below from ever going out of range.
+fn clamp_rtt(c: *mut Tcb) {
+    if (*c).srtt > RTO_MAX { (*c).srtt = RTO_MAX }
+    if (*c).rttvar > RTO_MAX { (*c).rttvar = RTO_MAX }
+}
+
 // Jacobson/Karn, RFC 6298. The sample is only taken when the segment it
 // belongs to was sent EXACTLY ONCE -- that is Karn's rule, and without
 // it a retransmission makes the estimate collapse: the acknowledgement
 // could belong to either of the two copies, and the wrong choice halves
 // or doubles the measured time.
+// A CLOCK IS NOT A PROMISE. `now` comes in from outside -- from a kernel
+// timer, from `clock_gettime`, from a caller that computed it once and
+// used it twice. It can stand still and it can go BACKWARDS, and when it
+// does, `now - rtt_at` is a number close to 2^64 and every checked
+// addition after it aborts the process. That is not theory: it is what
+// tools/k3net/drv.fi did on its first run against the Linux kernel, and
+// the panic came out of this function. A sample out of a clock that went
+// backwards is thrown away rather than believed.
+fn rtt_sample(now: u64, then: u64) -> u64 {
+    if now <= then { return 0 }
+    return now - then
+}
+
 fn rtt_update(t: *mut Tcp, c: *mut Tcb, sample: u64) {
     var m: u64 = sample
-    if m == 0 { m = 1 }
+    if m == 0 { return }
+    if m > RTO_MAX { m = RTO_MAX }
     if (*c).srtt == 0 {
         (*c).srtt = m
         (*c).rttvar = m / 2
@@ -707,6 +729,7 @@ fn rtt_update(t: *mut Tcp, c: *mut Tcb, sample: u64) {
         (*c).rttvar = ((*c).rttvar * 3 + d) / 4
         (*c).srtt = ((*c).srtt * 7 + m) / 8
     }
+    clamp_rtt(c)
     var r: u64 = (*c).srtt + 4 * (*c).rttvar
     if r < (*t).rto_min { r = (*t).rto_min }
     if r > RTO_MAX { r = RTO_MAX }
@@ -1121,7 +1144,7 @@ fn step(t: *mut Tcp, h: i32, iph: *mut u8, seg: *mut u8, data: *mut u8, dlen: us
         if wire.seq_lt((*c).snd_nxt, (*c).snd_una) { (*c).snd_nxt = (*c).snd_una }
         if (*c).rtt_on == 1 && wire.seq_ge(ack, (*c).rtt_seq) {
             (*c).rtt_on = 0
-            rtt_update(t, c, now -% (*c).rtt_at)
+            rtt_update(t, c, rtt_sample(now, (*c).rtt_at))
         }
         if (*c).cwnd < (*c).ssthresh {
             (*c).cwnd = (*c).cwnd +% u32min(acked, (*c).mss)
@@ -1131,8 +1154,10 @@ fn step(t: *mut Tcp, h: i32, iph: *mut u8, seg: *mut u8, data: *mut u8, dlen: us
         }
         if (*c).cwnd > 1048576 { (*c).cwnd = 1048576 }
         (*c).rt_shift = 0
+        clamp_rtt(c)
         (*c).rto = (*c).srtt + 4 * (*c).rttvar
         if (*c).rto < (*t).rto_min { (*c).rto = (*t).rto_min }
+        if (*c).rto > RTO_MAX { (*c).rto = RTO_MAX }
         if wire.seq_lt((*c).snd_una, (*c).snd_max) {
             arm_rt(t, c, now)
         } else {
