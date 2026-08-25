@@ -337,7 +337,7 @@ PYEOF
     # printed either way, so a reader can see which it was.
     netem_drops() { # namespace interface
         ip netns exec "$1" tc -s qdisc show dev "$2" 2>/dev/null \
-            | tr ',' ' ' | awk '/dropped/{for(i=1;i<=NF;i++) if($i=="dropped"){print $(i+1)+0; exit}}'
+            | tr ',()' '   ' | awk '/dropped/{for(i=1;i<=NF;i++) if($i=="dropped"){print $(i+1)+0; exit}}'
     }
     head -c $((LOSSKB * 1024)) "$W/in.bin" > "$W/small.bin"
 
