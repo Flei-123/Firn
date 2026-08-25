@@ -181,17 +181,37 @@ comes zeroed from the kernel.
 in the same order. The old table is kept as `tools/ucd/flat_baseline.fi` —
 a comparison whose other side has been deleted is not a comparison.
 
-BENCH_TABLE
+| measurement | run 1 | run 2 | run 3 | run 4 |
+|---|---:|---:|---:|---:|
+| set up, flat (2,802 pushes into a heap buffer) | 162.7 us | 171.1 us | 183.4 us | 161.2 us |
+| set up, table (`mmap` + 2,898 words) | 56.5 us | 52.2 us | 52.9 us | 49.9 us |
+| the loop alone (random number + branch) | 11.7 ns | 11.9 ns | 20.3 ns | 12.7 ns |
+| `latin`, flat (binary search) | 78.3 ns | 82.5 ns | 90.5 ns | 93.7 ns |
+| `latin`, table (three loads) | 22.9 ns | 24.1 ns | 37.8 ns | 28.7 ns |
+| `wide`, flat | 84.0 ns | 163.6 ns | 90.5 ns | 103.5 ns |
+| `wide`, table | 19.7 ns | 40.9 ns | 21.4 ns | 32.5 ns |
+| upper case mapping, table (the flat one cannot) | 14.8 ns | 30.7 ns | 15.8 ns | 27.8 ns |
 
-The loop itself (the pseudo random number and the branch) is measured too and
-can be subtracted: LOOP_NS ns. The two distributions differ on purpose:
+**The machine was busy** while these ran — the endurance run of section 6 the
+whole time, and two other rounds building in their own worktrees; the load
+average was around 10 on 8 cores. That is why four runs stand here instead of
+one number, and why the spread is wide (`wide`, flat: 84 to 164 ns). The
+RATIO is what survives it: the flat list costs **3.4x to 4.3x** of the table
+in every single run, and no run has it the other way round.
+
+Taking the least loaded run and subtracting the loop: **66.6 ns against
+11.2 ns** on `latin` and **72.3 ns against 8.0 ns** on `wide` — 5.9x and
+9.0x. The table is also **3.1x to 3.5x faster to set up**, which matters
+because it happens once per `Lexer` and once per `Realm`.
+
+The two distributions differ on purpose:
 `latin` (0x80…0x24F) is what a lexer really meets, and the binary search
 stays in its hottest entries there; `wide` walks the whole code space and the
 binary search touches cold cache lines.
 
 **The other number in that table is the one that matters more.** Over 20
-million random code points the old table answers `ID_Start` HITS_FLAT times, the
-new one HITS_TABLE times. That is not noise — it is three Unicode versions of
+million random code points the old table answers `ID_Start` **2,369,251** times, the
+new one **2,620,597** times. That is not noise — it is three Unicode versions of
 characters that the JavaScript lexer did not know.
 
 ## 5. What the engine does with it
