@@ -189,7 +189,12 @@ done
 # ------------------------------------------------------------- section 2
 
 echo "== 2. build: the kernel, the libc and a program that measures it =="
-for f in boot isr switch; do
+# ROUND K5 ADDED A FOURTH ASSEMBLY FILE, and this file was written
+# before it landed: `isr.s` names `smp_vectors` and `KERNEL_AP_MAIN`, and
+# a link without `smp.s` and without that symbol stops with two undefined
+# references. `tools/osum/run.sh` already links it; these three lines are
+# the same three.
+for f in boot isr switch smp; do
     as --64 -o "$TMPD/$f.o" "demos/kernel/$f.s" 2>"$TMPD/as.err" \
         || { bad "$f.s does not assemble"; sed 's/^/        /' "$TMPD/as.err" | head -5; }
 done
@@ -210,8 +215,9 @@ build_stage() { # 0 = firnc0, 1 = firnc1
         --defsym=KERNEL_SYSCALL="_F$s.sys__entry" \
         --defsym=KERNEL_TASK_MAIN="_F$s.tasks__main" \
         --defsym=KERNEL_USER_START="_F$s.proc__user_start" \
+        --defsym=KERNEL_AP_MAIN="_F$s.smp__ap_main" \
         --defsym=USER_MAIN="_F$s.u_enter" \
-        -o "$TMPD/k$s.elf" "$TMPD/boot.o" "$TMPD/isr.o" "$TMPD/switch.o" \
+        -o "$TMPD/k$s.elf" "$TMPD/boot.o" "$TMPD/isr.o" "$TMPD/switch.o" "$TMPD/smp.o" \
         "$TMPD/k$s.o" "$TMPD/u$s.o" 2>"$TMPD/ld$s.err" \
         || { bad "firnc$s: ld failed on the kernel"; grep -v 'GNU-stack\|RWX\|deprecated' "$TMPD/ld$s.err" | sed 's/^/        /' | head -5; return 1; }
     objcopy -O elf32-i386 "$TMPD/k$s.elf" "$TMPD/k$s.mb" 2>/dev/null
@@ -365,7 +371,7 @@ num "fork gave the parent the pid of the child" "$(value_of "$F" fork)" ge 1
 say "$F" "fork pipe text" 4 "the child wrote through the pipe it inherited"
 say "$F" "fork sees" 1 "and what it wrote is what the PARENT had in its memory"
 say "$F" "fork code" 217 "wait4 delivered the exit code of the child"
-say "$F" "run" 1 "fork + execve + wait4 ran a program off the disk"
+say "$F" "run" 42 "fork + execve + wait4 ran a program off the disk (40 + argc, out of /bin/hello)"
 say "$F" "no child" -10 "waiting for a foreign pid is -ECHILD"
 
 echo "   -- and every way to be wrong"
@@ -421,7 +427,9 @@ if grep -aq '^\./ \.\./ bin/ readme.txt $' "$N"; then
 else
     bad "counter-check: the plain listing is missing"
 fi
-has "$N" "cat: failed -2" "counter-check: and /out.txt was never made -- cat says -ENOENT"
+# ROUND K6 REPLACED `cat`: it names the file it could not open instead of
+# printing the raw error number, and it says so on descriptor 2.
+has "$N" "cat: cannot open /out.txt" "counter-check: and /out.txt was never made -- cat says so"
 
 # ------------------------------------------------------------- section 6
 

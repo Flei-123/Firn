@@ -1,218 +1,920 @@
-// demos/kernel/user/sh.fi -- round K1: the shell, and it is a FILE.
+// demos/kernel/user/sh.fi -- round K6: a shell that is one.
 //
-// Round 62 had a shell too, and every command in it was a branch in
-// `uprog.u_shell`: `ls` was an `if`, and adding a command meant compiling
-// a new kernel. This one knows exactly one thing -- how to start a
-// program -- and everything else it can do it can do because there is a
-// file on the disk with that name:
+// Round K1 made the shell a FILE: it read a line, split it into words and
+// started `/bin/<word>`. That was the point of that round and it was
+// enough for it. It is not a shell. A shell is the program that decides
+// WHERE a program's output goes and WHAT it reads, and round K1 had no
+// answer to either: every program wrote to the serial port and read the
+// console, because the kernel had one of each.
 //
-//     read a line   ->   split it into words   ->   /bin/<word>
-//     exec(path, argv, argc)   ->   wait(pid)   ->   say the code
+// What this one can do, and every one of them is measured in
+// `tools/userland/run.sh`:
 //
-// `exit` is the only word it handles itself, because leaving is the one
-// thing no child process can do on its parent's behalf.
-//
-// ROUND K4 ADDS THE SECOND WORD IT UNDERSTANDS: `>`. `ls > /out.txt`
-// writes the output of the program into a file, and that one line is the
-// reason `fork` had to exist:
-//
-//     fork()                  now there are two of us
-//     the child: open the file, dup2 it onto descriptor 1, close the
-//                spare -- and only THEN execve the program
-//     the parent: wait4
-//
-// A `posix_spawn` cannot do it. Between the split and the image the child
-// is still the shell, and what it changes about itself is what the new
-// program finds -- that gap is the whole point of the call. Without a
-// redirection the shell still uses the one-call start of round K1
-// (`SYS_OSUM_EXEC`), because it is cheaper and nothing is gained by
-// copying an image that is thrown away in the next instruction.
-//
-// It runs in ring 3 like every other program, it was loaded off the disk
-// by `elf.spawn` like every other program, and the kernel has no idea
-// that it is a shell. `tools/osum/run.sh` proves the last point by
-// putting the octets of `/bin/echo` at the path `/bin/ls` -- and `ls`
-// then echoes, without a line of the kernel or of this file changing.
+//   * `cmd a b c`, and the words may be quoted: 'a b' and "a b" are one
+//     argument, and "$X" is one argument even when the value has a space
+//     in it.
+//   * `> file`, `>> file`, `< file`, `2> file`. The shell redirects
+//     ITSELF and the child is born into it (`demos/kernel/uio.fi`,
+//     `exec` hands the three descriptors on) -- which is why redirection
+//     also works for the built-in commands, without one line for it.
+//   * `a | b | c`. THE HONEST PART: there is no `pipe()` in this kernel
+//     yet -- round K4 is building it -- so a pipe is STAGED THROUGH A
+//     FILE: `a > /tmp/sh0`, then `b < /tmp/sh0 > /tmp/sh1`, and so on.
+//     The output is the same, the two ends do not run at the same time,
+//     and a program that never ends would fill the disk instead of
+//     blocking its writer. It says so in docs/ROUNDK6.md.
+//   * `cmd &`: the child is not waited for. `wait` picks the corpses up,
+//     and `exit` waits for what is left -- a shell that left zombies
+//     behind would leak a page table per background job.
+//   * `$?`, `NAME=value`, `$NAME`, `${...}` is NOT there.
+//   * `cd`, `pwd`, `export`, `exit`, `wait` as built-in commands, because
+//     none of them can be a program: a child cannot change its parent's
+//     working directory.
+//   * A LINE EDITOR: 8 takes the last octet back, 14 (the up arrow, see
+//     `demos/kernel/kbd.fi`) fetches the line before this one back. The
+//     kernel eats the backspace itself when the input is a keyboard; in a
+//     SCRIPT both of them arrive here, which is how the editor is
+//     measured without a person in front of the machine.
+//   * `sh /path/to/script`: the commands come out of a file, and then the
+//     shell is quiet -- no banner, no prompt, no exit code per command.
+//     Round K1's chatter is what an INTERACTIVE shell does, and
+//     `tools/osum/run.sh` still measures exactly that.
 
 profile kernel
 
 import ulib
-import osum.libc.io
-import osum.libc.proc
-import osum.libc.errno
-import osum.libc.kcall
 
 export { u_start }
 
-const MAX_ARGS: u64 = 8
-const WORD_MAX: u64 = 32
+const LINE: u64 = 256
+const MAX_TOK: u64 = 48
+const MAX_ARGS: u64 = 8 // what `exec` takes (proc.MAX_ARGS)
+const WORD_SPACE: u64 = 768
+const NVAR: u64 = 8
+const VNAME: u64 = 16
+const VVAL: u64 = 64
+const NBG: u64 = 8
+const MAX_STAGE: u64 = 4
+
+// The kinds of token. Everything that is not one of the operators is a
+// word, and a word has been through the quotes and the variables already.
+const K_WORD: u64 = 0
+const K_PIPE: u64 = 1
+const K_IN: u64 = 2
+const K_OUT: u64 = 3
+const K_APP: u64 = 4
+const K_ERR: u64 = 5
+const K_AMP: u64 = 6
+const K_SEMI: u64 = 7
+
+// A program on this system has no allocator. Everything the shell needs
+// while it works stands here, in the .bss the loader zeroed.
+static mut line: [u8; 256] = [0 as u8; 256]
+static mut prev: [u8; 256] = [0 as u8; 256]
+static mut words: [u8; 768] = [0 as u8; 768]
+static mut tok_kind: [u64; 48] = [0 as u64; 48]
+static mut tok_at: [u64; 48] = [0 as u64; 48]
+static mut ntok: u64 = 0
+static mut wat: u64 = 0
+static mut vname: [u8; 128] = [0 as u8; 128]
+static mut vval: [u8; 512] = [0 as u8; 512]
+static mut vexp: [u64; 8] = [0 as u64; 8]
+static mut nvar: u64 = 0
+static mut status: u64 = 0
+static mut bg_pid: [u64; 8] = [0 as u64; 8]
+static mut nbg: u64 = 0
+static mut argv: [u64; 8] = [0 as u64; 8]
+static mut argc: u64 = 0
+static mut path: [u8; 128] = [0 as u8; 128]
+static mut rctx: [u8; 528] = [0 as u8; 528]
+static mut interactive: u64 = 0
+static mut in_fd: u64 = 0
+static mut commands: u64 = 0
+static mut tmp_ready: u64 = 0
+static mut scratch: [u8; 128] = [0 as u8; 128]
+static mut leaving: u64 = 0
+static mut did_run: u64 = 0
+static mut last_bg: u64 = 0
+// ROUND K4 CHANGED WHAT `close` MEANS, and this is the whole of what it
+// cost. Round K6 was written against a kernel in which the three standard
+// descriptors were a piece of per-task state and `close(1)` gave 1 back
+// to the console -- which is how this shell used to take its output back
+// after `ls > /out`. Round K4 built a real table of open files, in which
+// `close(1)` frees the slot and the next `open` gets it: the second
+// redirection of a run would have landed on descriptor 1 by accident.
+// So the shell does what every Unix shell has done since 1979 -- it keeps
+// a COPY of its own three and points them back with `dup2`.
+static mut save_in: u64 = 0
+static mut save_out: u64 = 0
+static mut save_err: u64 = 0
 
 fn u_start(args: u64) -> u64 {
-    var line: [u8; 128] = [0 as u8; 128]
-    var words: [u8; 320] = [0 as u8; 320]
-    var slots: [u64; 8] = [0 as u64; 8]
-    var path: [u8; 96] = [0 as u8; 96]
-    var s_hi: [u8; 19] = "sh: ready, osum\n\0\0\0"
-    var s_prompt: [u8; 7] = "osum$ \0"
+    var s_hi: [u8; 17] = "sh: ready, osum\n\0"
     var s_bye: [u8; 9] = "sh: bye\n\0"
-    var s_arrow: [u8; 5] = " -> \0"
-    var s_no: [u8; 16] = "sh: cannot run \0"
-    var s_sp: [u8; 2] = " \0"
-    var c_exit: [u8; 5] = "exit\0"
-    var c_to: [u8; 2] = ">\0"
-    var b_bin: [u8; 6] = "/bin/\0"
+    var s_nofile: [u8; 19] = "sh: cannot read \0\0\0"
 
-    ulib.say((&s_hi[0]) as u64)
-    var commands: u64 = 0
+    // Before the script is opened, so that the copies get the low numbers
+    // and nothing that comes later can be handed one of them.
+    save_in = ulib.sys(ulib.SYS_DUP, ulib.IN, 0, 0)
+    save_out = ulib.sys(ulib.SYS_DUP, ulib.OUT, 0, 0)
+    save_err = ulib.sys(ulib.SYS_DUP, ulib.ERR, 0, 0)
+    ulib.rd_init((&rctx[0 as usize]) as u64)
+    in_fd = ulib.IN
+    interactive = 1
+    if ulib.arg_count(args) > 1 {
+        let p: u64 = ulib.arg_at(args, 1)
+        let fd: u64 = ulib.sys(ulib.SYS_OPEN, p, 0, 0)
+        if ulib.bad(fd) {
+            ulib.esay_line((&s_nofile[0 as usize]) as u64, p)
+            return 127
+        }
+        in_fd = fd
+        interactive = 0
+    }
+    if interactive == 1 {
+        ulib.say((&s_hi[0 as usize]) as u64)
+    }
     var running: bool = true
     while running {
-        let n: u64 = io.read(ulib.IN, (&line[0]) as u64, 120)
-        if n == 0 || (n >> 63) != 0 {
+        let n: u64 = get_line(in_fd)
+        if ulib.bad(n) {
             running = false
         } else {
-            // The newline belongs to the line, not to the command.
-            var len: u64 = n
-            while len > 0 && line[(len - 1) as usize] <= 32 as u8 {
-                len = len - 1
+            if interactive == 1 {
+                prompt()
+                ulib.say((&line[0 as usize]) as u64)
+                ulib.nl()
             }
-            line[len as usize] = 0 as u8
-            ulib.say((&s_prompt[0]) as u64)
-            ulib.say((&line[0]) as u64)
-            ulib.nl()
-            if len > 0 {
-                commands = commands + 1
-                // Split the line. `words` holds the strings back to back,
-                // `slots` the pointers into it -- that is exactly the
-                // shape `exec` wants, and building it here is what makes
-                // argv the shell's business and not the kernel's.
-                let base: u64 = (&words[0]) as u64
-                var argc: u64 = 0
-                var at: u64 = 0
-                var wat: u64 = 0
-                var more: bool = true
-                while more {
-                    if argc >= MAX_ARGS {
-                        more = false
-                    } else {
-                        let next: u64 = ulib.word((&line[0]) as u64, at,
-                            base + wat, WORD_MAX)
-                        if ulib.length(base + wat) == 0 {
-                            more = false
-                        } else {
-                            slots[argc as usize] = base + wat
-                            wat = wat + ulib.length(base + wat) + 1
-                            argc = argc + 1
-                            at = next
-                        }
-                    }
-                }
-                if argc == 0 {
-                    commands = commands - 1
-                } else {
-                    if ulib.streq(slots[0], (&c_exit[0]) as u64) {
-                        running = false
-                    } else {
-                        // `>` and what follows it are not arguments of the
-                        // program: they are what its output is pointed at.
-                        var target: u64 = 0
-                        var real: u64 = argc
-                        var k: u64 = 0
-                        while k < argc {
-                            if ulib.streq(slots[k as usize],
-                                (&c_to[0]) as u64) {
-                                if k + 1 < argc {
-                                    target = slots[(k + 1) as usize]
-                                }
-                                if real > k {
-                                    real = k
-                                }
-                            }
-                            k = k + 1
-                        }
-                        slots[real as usize] = 0 // argv ends in a zero
-                        make_path(slots[0], (&path[0]) as u64,
-                            (&b_bin[0]) as u64)
-                        var code: u64 = 0
-                        if target == 0 {
-                            let pid: u64 = proc.spawn_file(
-                                (&path[0]) as u64, (&slots[0]) as u64, real)
-                            if errno.failed(pid) {
-                                // The libc answers a refusal with -1 and
-                                // the reason in `errno`. What the shell
-                                // shows is the REASON -- "cannot run
-                                // nothing -> -1" would tell nobody that
-                                // there is no such file.
-                                code = errno.negated(errno.errno())
-                            } else {
-                                code = proc.wait_code(pid)
-                            }
-                        } else {
-                            code = redirect((&path[0]) as u64,
-                                (&slots[0]) as u64, target)
-                        }
-                        if ulib.failed(code) {
-                            ulib.say((&s_no[0]) as u64)
-                            ulib.say(slots[0])
-                            ulib.say((&s_arrow[0]) as u64)
-                            ulib.sayn(code)
-                            ulib.nl()
-                        } else {
-                            ulib.say((&s_prompt[0]) as u64)
-                            ulib.say(slots[0])
-                            ulib.say((&s_arrow[0]) as u64)
-                            ulib.sayn(code)
-                            ulib.nl()
-                        }
-                    }
+            if n > 0 {
+                if !run_line() {
+                    running = false
                 }
             }
         }
     }
-    ulib.say((&s_bye[0]) as u64)
-    return commands
-}
-
-// FORK, DUP2, EXECVE, WAIT4 -- the four calls of a redirection, in the
-// order every Unix shell has used them in for fifty years. Returns the
-// exit code of the program, or a negative number when something on the way
-// there failed.
-//
-// The child does not return from here. If `execve` comes back, the image
-// did not load, and a child that went on running the shell's own code
-// would be a second shell reading the same input.
-fn redirect(path: u64, argv: u64, target: u64) -> u64 {
-    let who: u64 = proc.split()
-    if ulib.failed(who) {
-        return who
-    }
-    if who == 0 {
-        let fd: u64 = io.create(target)
-        if ulib.failed(fd) {
-            proc.leave(126)
-        }
-        io.dup2(fd, ulib.OUT)
-        io.close(fd)
-        proc.enter(path, argv)
-        proc.leave(127)
-    }
-    return proc.wait_code(who)
-}
-
-// `ls` means `/bin/ls`, and `/bin/ls` means itself. Two lines, and they
-// are the whole of what a system calls a search path -- one directory,
-// and it is named in the shell and not in the kernel.
-fn make_path(cmd: u64, out: u64, prefix: u64) {
-    var at: u64 = 0
-    if *((cmd) as *mut u8) != 47 as u8 {
-        while *((prefix + at) as *mut u8) != 0 as u8 {
-            __mmio_write8((out + at) as *mut u8, *((prefix + at) as *mut u8))
-            at = at + 1
+    reap_all()
+    if interactive == 1 {
+        ulib.say((&s_bye[0 as usize]) as u64)
+        if leaving == 0 {
+            return commands
         }
     }
+    // A shell that ran a script ends with the code of the last command in
+    // it, and `exit 3` means 3. Only the interactive shell of round K1
+    // still counts its commands.
+    return status
+}
+
+fn prompt() {
+    var s_p: [u8; 7] = "osum$ \0"
+    ulib.say((&s_p[0 as usize]) as u64)
+}
+
+// --------------------------------------------------------- the line
+
+// One line, with the two keys of a line editor in it. The kernel already
+// takes the backspace back when the input is a real keyboard
+// (`sys.keyboard_read`); everything that comes out of a FILE arrives
+// here untouched, and that is where the measurement gets at it.
+fn get_line(fd: u64) -> u64 {
+    var c: u64 = ulib.rd_byte(fd, (&rctx[0 as usize]) as u64)
+    if c == 256 {
+        return ulib.EOF
+    }
+    var n: u64 = 0
+    while c != 256 && c != 10 {
+        if c == 8 {
+            if n > 0 {
+                n = n - 1
+            }
+        } else if c == 14 {
+            n = 0
+            while prev[n as usize] != 0 as u8 && n + 1 < LINE {
+                line[n as usize] = prev[n as usize]
+                n = n + 1
+            }
+        } else {
+            if n + 1 < LINE {
+                line[n as usize] = c as u8
+                n = n + 1
+            }
+        }
+        c = ulib.rd_byte(fd, (&rctx[0 as usize]) as u64)
+    }
+    line[n as usize] = 0 as u8
+    if n > 0 {
+        var i: u64 = 0
+        while i <= n {
+            prev[i as usize] = line[i as usize]
+            i = i + 1
+        }
+    }
+    return n
+}
+
+// ------------------------------------------------------ the variables
+
+fn var_find(name: u64) -> u64 {
     var i: u64 = 0
-    while *((cmd + i) as *mut u8) != 0 as u8 {
-        __mmio_write8((out + at + i) as *mut u8, *((cmd + i) as *mut u8))
+    while i < nvar {
+        if ulib.streq((&vname[(i * VNAME) as usize]) as u64, name) {
+            return i
+        }
         i = i + 1
     }
-    __mmio_write8((out + at + i) as *mut u8, 0 as u8)
+    return NVAR
+}
+
+fn var_get(name: u64) -> u64 {
+    let i: u64 = var_find(name)
+    if i >= NVAR {
+        return 0
+    }
+    return (&vval[(i * VVAL) as usize]) as u64
+}
+
+fn var_set(name: u64, value: u64) {
+    var i: u64 = var_find(name)
+    if i >= NVAR {
+        if nvar >= NVAR {
+            return
+        }
+        i = nvar
+        nvar = nvar + 1
+        ulib.strncpy((&vname[(i * VNAME) as usize]) as u64, name, VNAME)
+        vexp[i as usize] = 0
+    }
+    var k: u64 = 0
+    while k + 1 < VVAL && *((value + k) as *mut u8) != 0 as u8 {
+        vval[(i * VVAL + k) as usize] = *((value + k) as *mut u8)
+        k = k + 1
+    }
+    vval[(i * VVAL + k) as usize] = 0 as u8
+}
+
+// ------------------------------------------------------- the tokenizer
+
+fn ch(i: u64) -> u64 {
+    if i >= LINE {
+        return 0
+    }
+    return (line[i as usize]) as u64
+}
+
+fn put_word(c: u64) {
+    if wat + 1 < WORD_SPACE {
+        words[wat as usize] = c as u8
+        wat = wat + 1
+    }
+}
+
+fn push_tok(kind: u64, at: u64) {
+    if ntok >= MAX_TOK {
+        return
+    }
+    tok_kind[ntok as usize] = kind
+    tok_at[ntok as usize] = at
+    ntok = ntok + 1
+}
+
+fn is_name(c: u64) -> bool {
+    if c >= 48 && c <= 57 {
+        return true
+    }
+    if c >= 65 && c <= 90 {
+        return true
+    }
+    if c >= 97 && c <= 122 {
+        return true
+    }
+    return c == 95
+}
+
+// `$?` is the code of the last command, `$NAME` a variable, and a `$` in
+// front of anything else is a `$`. The value is written into the word
+// that is being built, so a variable with a space in it stays ONE
+// argument only inside quotes -- which is exactly the rule every shell
+// has, and the reason "$X" and $X are different.
+fn expand(i: u64) -> u64 {
+    var name: [u8; 20] = [0 as u8; 20]
+    if ch(i + 1) == 33 {
+        var buf: [u8; 26] = [0 as u8; 26]
+        let n: u64 = ulib.digits(last_bg, (&buf[0 as usize]) as u64)
+        var k: u64 = 0
+        while k < n {
+            put_word((buf[k as usize]) as u64)
+            k = k + 1
+        }
+        return i + 2
+    }
+    if ch(i + 1) == 63 {
+        var buf: [u8; 26] = [0 as u8; 26]
+        let n: u64 = ulib.digits(status, (&buf[0 as usize]) as u64)
+        var k: u64 = 0
+        while k < n {
+            put_word((buf[k as usize]) as u64)
+            k = k + 1
+        }
+        return i + 2
+    }
+    if !is_name(ch(i + 1)) {
+        put_word(36)
+        return i + 1
+    }
+    var at: u64 = i + 1
+    var n: u64 = 0
+    while is_name(ch(at)) && n + 1 < 20 {
+        name[n as usize] = ch(at) as u8
+        n = n + 1
+        at = at + 1
+    }
+    name[n as usize] = 0 as u8
+    let v: u64 = var_get((&name[0 as usize]) as u64)
+    if v != 0 {
+        var k: u64 = 0
+        while *((v + k) as *mut u8) != 0 as u8 {
+            put_word((*((v + k) as *mut u8)) as u64)
+            k = k + 1
+        }
+    }
+    return at
+}
+
+fn is_break(c: u64) -> bool {
+    if c == 0 || c == 32 || c == 9 {
+        return true
+    }
+    return c == 124 || c == 60 || c == 62 || c == 38 || c == 59
+}
+
+// The whole line into tokens. Returns false when it is broken -- an
+// unterminated quote is the only way that happens.
+fn tokenize() -> bool {
+    var s_quote: [u8; 26] = "sh: unterminated quote\0\0\0\0"
+    ntok = 0
+    wat = 0
+    var i: u64 = 0
+    var going: bool = true
+    while going {
+        while ch(i) == 32 || ch(i) == 9 {
+            i = i + 1
+        }
+        let c: u64 = ch(i)
+        if c == 0 || c == 35 {
+            going = false
+        } else if c == 124 {
+            push_tok(K_PIPE, 0)
+            i = i + 1
+        } else if c == 60 {
+            push_tok(K_IN, 0)
+            i = i + 1
+        } else if c == 38 {
+            push_tok(K_AMP, 0)
+            i = i + 1
+        } else if c == 59 {
+            push_tok(K_SEMI, 0)
+            i = i + 1
+        } else if c == 62 {
+            if ch(i + 1) == 62 {
+                push_tok(K_APP, 0)
+                i = i + 2
+            } else {
+                push_tok(K_OUT, 0)
+                i = i + 1
+            }
+        } else if c == 50 && ch(i + 1) == 62 {
+            push_tok(K_ERR, 0)
+            i = i + 2
+        } else {
+            let start: u64 = wat
+            var open: bool = true
+            while open {
+                let d: u64 = ch(i)
+                if is_break(d) {
+                    open = false
+                } else if d == 39 {
+                    i = i + 1
+                    while ch(i) != 39 && ch(i) != 0 {
+                        put_word(ch(i))
+                        i = i + 1
+                    }
+                    if ch(i) == 0 {
+                        ulib.esay_line((&s_quote[0 as usize]) as u64, 0)
+                        return false
+                    }
+                    i = i + 1
+                } else if d == 34 {
+                    i = i + 1
+                    while ch(i) != 34 && ch(i) != 0 {
+                        if ch(i) == 36 {
+                            i = expand(i)
+                        } else {
+                            put_word(ch(i))
+                            i = i + 1
+                        }
+                    }
+                    if ch(i) == 0 {
+                        ulib.esay_line((&s_quote[0 as usize]) as u64, 0)
+                        return false
+                    }
+                    i = i + 1
+                } else if d == 36 {
+                    i = expand(i)
+                } else {
+                    put_word(d)
+                    i = i + 1
+                }
+            }
+            put_word(0)
+            push_tok(K_WORD, start)
+        }
+    }
+    return true
+}
+
+fn word_at(t: u64) -> u64 {
+    return (&words[(tok_at[t as usize]) as usize]) as u64
+}
+
+// ------------------------------------------------------------ running
+
+// One line: split at `;` and `&`, and run each piece. Returns false when
+// `exit` was one of them.
+fn run_line() -> bool {
+    if !tokenize() {
+        status = 2
+        return true
+    }
+    var i: u64 = 0
+    while i < ntok {
+        var j: u64 = i
+        var bg: bool = false
+        while j < ntok && tok_kind[j as usize] != K_SEMI
+        && tok_kind[j as usize] != K_AMP {
+            j = j + 1
+        }
+        if j < ntok && tok_kind[j as usize] == K_AMP {
+            bg = true
+        }
+        if j > i {
+            commands = commands + 1
+            if !run_pipeline(i, j, bg) {
+                return false
+            }
+        }
+        i = j + 1
+    }
+    return true
+}
+
+// The temporary files a pipe is staged through. They are made when the
+// first pipe of the run needs them and not before: an image without a
+// pipe in it must look exactly the way round K1 left it.
+fn tmp_path(k: u64) -> u64 {
+    var t0: [u8; 9] = "/tmp/sh0\0"
+    var t1: [u8; 9] = "/tmp/sh1\0"
+    var dir: [u8; 5] = "/tmp\0"
+    if tmp_ready == 0 {
+        ulib.sys(ulib.SYS_MKDIR, (&dir[0 as usize]) as u64, 0, 0)
+        tmp_ready = 1
+    }
+    if k % 2 == 0 {
+        ulib.strcpy((&scratch[0 as usize]) as u64, (&t0[0 as usize]) as u64)
+    } else {
+        ulib.strcpy((&scratch[0 as usize]) as u64, (&t1[0 as usize]) as u64)
+    }
+    return (&scratch[0 as usize]) as u64
+}
+
+// `a | b | c` between the tokens `from` and `to`. Every stage but the
+// last writes into a file that the next one reads.
+fn run_pipeline(from: u64, to: u64, bg: bool) -> bool {
+    var stage_in: [u8; 128] = [0 as u8; 128]
+    var stage_out: [u8; 128] = [0 as u8; 128]
+    var stages: u64 = 1
+    var t: u64 = from
+    while t < to {
+        if tok_kind[t as usize] == K_PIPE {
+            stages = stages + 1
+        }
+        t = t + 1
+    }
+    if stages > MAX_STAGE {
+        var s_deep: [u8; 24] = "sh: too many stages\0\0\0\0\0"
+        ulib.esay_line((&s_deep[0 as usize]) as u64, 0)
+        status = 2
+        return true
+    }
+    var start: u64 = from
+    var k: u64 = 0
+    var alive: bool = true
+    while k < stages {
+        var end: u64 = start
+        while end < to && tok_kind[end as usize] != K_PIPE {
+            end = end + 1
+        }
+        stage_in[0 as usize] = 0 as u8
+        stage_out[0 as usize] = 0 as u8
+        if k > 0 {
+            ulib.strcpy((&stage_in[0 as usize]) as u64, tmp_path(k - 1))
+        }
+        if k + 1 < stages {
+            ulib.strcpy((&stage_out[0 as usize]) as u64, tmp_path(k))
+        }
+        let last: bool = k + 1 == stages
+        if !run_stage(start, end, (&stage_in[0 as usize]) as u64,
+            (&stage_out[0 as usize]) as u64, bg && last) {
+            alive = false
+        }
+        start = end + 1
+        k = k + 1
+    }
+    if stages > 1 {
+        var d: u64 = 0
+        while d + 1 < stages {
+            ulib.sys(ulib.SYS_UNLINK, tmp_path(d), 0, 0)
+            d = d + 1
+        }
+    }
+    return alive
+}
+
+// One command: the words are the arguments, everything after a `<`, `>`,
+// `>>` or `2>` is a file name. `pin`/`pout` are what the pipeline asks
+// for and an explicit redirection wins over them.
+fn run_stage(from: u64, to: u64, pin: u64, pout: u64, bg: bool) -> bool {
+    var f_in: [u8; 96] = [0 as u8; 96]
+    var f_out: [u8; 96] = [0 as u8; 96]
+    var f_err: [u8; 96] = [0 as u8; 96]
+    var s_what: [u8; 22] = "sh: missing file name\0"
+    var s_many: [u8; 26] = "sh: too many arguments\0\0\0\0"
+    var append: bool = false
+    argc = 0
+    ulib.strncpy((&f_in[0 as usize]) as u64, pin, 96)
+    ulib.strncpy((&f_out[0 as usize]) as u64, pout, 96)
+    f_err[0 as usize] = 0 as u8
+    var t: u64 = from
+    while t < to {
+        let kind: u64 = tok_kind[t as usize]
+        if kind == K_WORD {
+            if argc >= MAX_ARGS {
+                ulib.esay_line((&s_many[0 as usize]) as u64, 0)
+                status = 2
+                return true
+            }
+            argv[argc as usize] = word_at(t)
+            argc = argc + 1
+            t = t + 1
+        } else {
+            if t + 1 >= to || tok_kind[(t + 1) as usize] != K_WORD {
+                ulib.esay_line((&s_what[0 as usize]) as u64, 0)
+                status = 2
+                return true
+            }
+            if kind == K_IN {
+                ulib.strncpy((&f_in[0 as usize]) as u64, word_at(t + 1), 96)
+            } else if kind == K_ERR {
+                ulib.strncpy((&f_err[0 as usize]) as u64, word_at(t + 1), 96)
+            } else {
+                ulib.strncpy((&f_out[0 as usize]) as u64, word_at(t + 1), 96)
+                append = kind == K_APP
+            }
+            t = t + 2
+        }
+    }
+    if argc == 0 {
+        // Only assignments, or nothing at all.
+        return true
+    }
+    if assignments() {
+        status = 0
+        return true
+    }
+    if !redirect(0, (&f_in[0 as usize]) as u64, false) {
+        return true
+    }
+    if !redirect(1, (&f_out[0 as usize]) as u64, append) {
+        undo()
+        return true
+    }
+    if !redirect(2, (&f_err[0 as usize]) as u64, false) {
+        undo()
+        return true
+    }
+    did_run = 0
+    let alive: bool = execute(bg)
+    undo()
+    if interactive == 1 && did_run == 1 {
+        var s_arrow: [u8; 5] = " -> \0"
+        prompt()
+        ulib.say(argv[0 as usize])
+        ulib.say((&s_arrow[0 as usize]) as u64)
+        ulib.sayn(status)
+        ulib.nl()
+    }
+    return alive
+}
+
+// `NAME=value` in front of a command. A real shell would hand it to the
+// child as an environment; `exec` has none in this kernel (round K4),
+// so it is set here and stays set. docs/ROUNDK6.md says so.
+fn eq_at(w: u64) -> u64 {
+    let first: u64 = (*((w) as *mut u8)) as u64
+    if !is_name(first) || (first >= 48 && first <= 57) {
+        return 0
+    }
+    var n: u64 = 0
+    while *((w + n) as *mut u8) != 0 as u8 {
+        if *((w + n) as *mut u8) == 61 as u8 {
+            if n == 0 {
+                return 0
+            }
+            return n + 1
+        }
+        if !is_name((*((w + n) as *mut u8)) as u64) {
+            return 0
+        }
+        n = n + 1
+    }
+    return 0
+}
+
+fn assignments() -> bool {
+    var name: [u8; 20] = [0 as u8; 20]
+    var done: u64 = 0
+    var going: bool = true
+    while going && done < argc {
+        let w: u64 = argv[done as usize]
+        let eq: u64 = eq_at(w)
+        if eq == 0 {
+            going = false
+        } else {
+            var k: u64 = 0
+            while k + 1 < eq && k + 1 < 20 {
+                name[k as usize] = *((w + k) as *mut u8)
+                k = k + 1
+            }
+            name[k as usize] = 0 as u8
+            var_set((&name[0 as usize]) as u64, w + eq)
+            done = done + 1
+        }
+    }
+    if done == argc {
+        return true
+    }
+    if done > 0 {
+        var k: u64 = 0
+        while done + k < argc {
+            argv[k as usize] = argv[(done + k) as usize]
+            k = k + 1
+        }
+        argc = k
+    }
+    return false
+}
+
+// One of the three standard descriptors onto a file, or left alone when
+// the name is empty. `>` unlinks first, which is this file system's
+// truncate; `>>` seeks to the end.
+fn redirect(fd: u64, name: u64, append: bool) -> bool {
+    var s_open: [u8; 20] = "sh: cannot open \0\0\0\0"
+    if *((name) as *mut u8) == 0 as u8 {
+        return true
+    }
+    if fd == 0 {
+        let r: u64 = ulib.sys(ulib.SYS_OPEN, name, 0, 0)
+        if ulib.bad(r) {
+            ulib.esay_line((&s_open[0 as usize]) as u64, name)
+            status = 2
+            return false
+        }
+        ulib.sys(ulib.SYS_DUP2, r, 0, 0)
+        ulib.sys(ulib.SYS_CLOSE, r, 0, 0)
+        return true
+    }
+    // ROUND K4'S FLAGS. Round K6 took the name away to empty the file,
+    // because the file system of round K1 could not shorten one and
+    // `open` took a boolean "make it". Both are gone: `>` is
+    // O_WRONLY|O_CREAT|O_TRUNC and `>>` is O_WRONLY|O_CREAT|O_APPEND, and
+    // the kernel puts an appending write at the end of the file itself --
+    // no seek, and no gap between the seek and the write.
+    var flags: u64 = ulib.O_MAKE
+    if append {
+        flags = 1089 // O_WRONLY | O_CREAT | O_APPEND
+    }
+    let w: u64 = ulib.sys(ulib.SYS_OPEN, name, flags, 0)
+    if ulib.bad(w) {
+        ulib.esay_line((&s_open[0 as usize]) as u64, name)
+        status = 2
+        return false
+    }
+    ulib.sys(ulib.SYS_DUP2, w, fd, 0)
+    ulib.sys(ulib.SYS_CLOSE, w, 0, 0)
+    return true
+}
+
+// Every redirection back to where it was. The copies made in `u_start`
+// are the "where it was" -- not the console: a shell whose own output was
+// already pointed somewhere has to go back THERE.
+fn undo() {
+    if !ulib.bad(save_in) {
+        ulib.sys(ulib.SYS_DUP2, save_in, 0, 0)
+    }
+    if !ulib.bad(save_out) {
+        ulib.sys(ulib.SYS_DUP2, save_out, 1, 0)
+    }
+    if !ulib.bad(save_err) {
+        ulib.sys(ulib.SYS_DUP2, save_err, 2, 0)
+    }
+}
+
+// `ls` means `/bin/ls`; a name with a slash in it means itself. Two
+// lines, and they are the whole of what a bigger system calls a search
+// path -- one directory, and it is named in the shell and not in the
+// kernel.
+fn make_path(cmd: u64) {
+    var b_bin: [u8; 6] = "/bin/\0"
+    var slash: bool = false
+    var i: u64 = 0
+    while *((cmd + i) as *mut u8) != 0 as u8 {
+        if *((cmd + i) as *mut u8) == 47 as u8 {
+            slash = true
+        }
+        i = i + 1
+    }
+    if slash {
+        ulib.strncpy((&path[0 as usize]) as u64, cmd, 128)
+        return
+    }
+    ulib.strcpy((&path[0 as usize]) as u64, (&b_bin[0 as usize]) as u64)
+    ulib.strncpy((&path[0 as usize]) as u64 + 5, cmd, 123)
+}
+
+// The command itself. Returns false only for `exit`.
+fn execute(bg: bool) -> bool {
+    var s_no: [u8; 16] = "sh: cannot run \0"
+    var s_arrow: [u8; 5] = " -> \0"
+    var s_job: [u8; 3] = "[\0\0"
+    var s_jend: [u8; 3] = "] \0"
+    if builtin() {
+        return leaving == 0
+    }
+    make_path(argv[0 as usize])
+    let pid: u64 = ulib.sys(ulib.SYS_EXEC, (&path[0 as usize]) as u64,
+        (&argv[0 as usize]) as u64, argc)
+    if ulib.bad(pid) {
+        ulib.eput((&s_no[0 as usize]) as u64)
+        ulib.eput(argv[0 as usize])
+        ulib.eput((&s_arrow[0 as usize]) as u64)
+        say_err(pid)
+        status = 127
+        return true
+    }
+    if bg {
+        if nbg < NBG {
+            bg_pid[nbg as usize] = pid
+            nbg = nbg + 1
+        }
+        last_bg = pid
+        ulib.say((&s_job[0 as usize]) as u64)
+        ulib.sayu(nbg)
+        ulib.say((&s_jend[0 as usize]) as u64)
+        ulib.sayu(pid)
+        ulib.nl()
+        status = 0
+        return true
+    }
+    status = ulib.wait_code(pid)
+    did_run = 1
+    return true
+}
+
+// A negative number on descriptor 2. `ulib.sayn` writes on 1, and an
+// error that went to 1 would land in the file of `cmd > file`.
+fn say_err(v: u64) {
+    var buf: [u8; 26] = [0 as u8; 26]
+    ulib.digits(v, (&buf[0 as usize]) as u64)
+    ulib.eput((&buf[0 as usize]) as u64)
+    var nlc: [u8; 2] = "\n\0"
+    ulib.eput((&nlc[0 as usize]) as u64)
+}
+
+// ---------------------------------------------------------- built-ins
+
+// The commands that cannot be programs: a child process cannot change
+// its parent's working directory, cannot set its variables and cannot
+// end it. Everything else on this system IS a program.
+fn builtin() -> bool {
+    var c_cd: [u8; 3] = "cd\0"
+    var c_pwd: [u8; 4] = "pwd\0"
+    var c_exit: [u8; 5] = "exit\0"
+    var c_export: [u8; 7] = "export\0"
+    var c_wait: [u8; 5] = "wait\0"
+    let w: u64 = argv[0 as usize]
+    if ulib.streq(w, (&c_cd[0 as usize]) as u64) {
+        do_cd()
+        return true
+    }
+    if ulib.streq(w, (&c_pwd[0 as usize]) as u64) {
+        do_pwd()
+        return true
+    }
+    if ulib.streq(w, (&c_exit[0 as usize]) as u64) {
+        leaving = 1
+        if argc > 1 {
+            status = ulib.to_num(argv[1 as usize])
+        }
+        return true
+    }
+    if ulib.streq(w, (&c_export[0 as usize]) as u64) {
+        do_export()
+        return true
+    }
+    if ulib.streq(w, (&c_wait[0 as usize]) as u64) {
+        reap_all()
+        status = 0
+        return true
+    }
+    return false
+}
+
+fn do_cd() {
+    var home: [u8; 2] = "/\0"
+    var s_no: [u8; 20] = "sh: cannot cd to \0\0\0"
+    var target: u64 = (&home[0 as usize]) as u64
+    if argc > 1 {
+        target = argv[1 as usize]
+    }
+    let r: u64 = ulib.sys(ulib.SYS_CHDIR, target, 0, 0)
+    if ulib.bad(r) {
+        ulib.esay_line((&s_no[0 as usize]) as u64, target)
+        status = 1
+        return
+    }
+    status = 0
+}
+
+fn do_pwd() {
+    var buf: [u8; 96] = [0 as u8; 96]
+    // Linux's `getcwd` counts the terminating zero, and so does this
+    // kernel now that round K6 sits on round K4's layer -- what is
+    // PRINTED is one octet less.
+    let n: u64 = ulib.sys(ulib.SYS_GETCWD, (&buf[0 as usize]) as u64, 96, 0)
+    if ulib.bad(n) || n == 0 {
+        status = 1
+        return
+    }
+    ulib.put((&buf[0 as usize]) as u64, n - 1)
+    ulib.nl()
+    status = 0
+}
+
+// `export NAME` marks a variable, `export` alone lists what is marked.
+// The mark reaches no child yet: `exec` has no environment in this
+// kernel. It is here so that the shell has the word and the round after
+// this one has somewhere to hang it.
+fn do_export() {
+    var s_eq: [u8; 2] = "=\0"
+    if argc == 1 {
+        var i: u64 = 0
+        while i < nvar {
+            if vexp[i as usize] == 1 {
+                ulib.say((&vname[(i * VNAME) as usize]) as u64)
+                ulib.say((&s_eq[0 as usize]) as u64)
+                ulib.say((&vval[(i * VVAL) as usize]) as u64)
+                ulib.nl()
+            }
+            i = i + 1
+        }
+        status = 0
+        return
+    }
+    var k: u64 = 1
+    while k < argc {
+        let i: u64 = var_find(argv[k as usize])
+        if i < NVAR {
+            vexp[i as usize] = 1
+        }
+        k = k + 1
+    }
+    status = 0
+}
+
+// Every background child that is still a corpse. A shell that walked
+// away from them would leave a page table and a kernel stack per job
+// behind, and `tools/osum/run.sh` counts exactly those frames.
+fn reap_all() {
+    var s_done: [u8; 2] = "[\0"
+    var s_arrow: [u8; 6] = "] -> \0"
+    var i: u64 = 0
+    while i < nbg {
+        let code: u64 = ulib.wait_code(bg_pid[i as usize])
+        ulib.say((&s_done[0 as usize]) as u64)
+        ulib.sayu(bg_pid[i as usize])
+        ulib.say((&s_arrow[0 as usize]) as u64)
+        ulib.sayn(code)
+        ulib.nl()
+        i = i + 1
+    }
+    nbg = 0
 }
