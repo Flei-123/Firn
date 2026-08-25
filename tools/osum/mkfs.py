@@ -334,6 +334,27 @@ def main(argv):
         for line in fs.tree():
             print(line)
         return 0
+    if cmd == "cat":
+        # ROUND K4: read a file back OFF an image, on the host. The
+        # counter-check to the double indirect block lives on it
+        # (tools/posix/run.sh, section 3): a file of 100000 octets is
+        # written and has to come back octet for octet -- the old format
+        # stopped at 38912, and a reader that still walked only one level
+        # would give back the first 38912 and call it a file.
+        raw = open(argv[2], "rb").read()
+        fs = Fs(max(len(raw) // BS, DATA_START + 8))
+        fs.d[:len(raw)] = raw
+        if fs.g64(SB["MAGIC"]) != MAGIC:
+            print("no OSUM-OFS magic")
+            return 1
+        fs.root = fs.g64(SB["ROOT"])
+        ino = fs.resolve(argv[3])
+        if not ino:
+            print("mkfs: no such path '%s'" % argv[3])
+            return 1
+        size = fs.iget(ino, I_SIZE)
+        sys.stdout.buffer.write(fs.read_at(ino, 0, size))
+        return 0
     if cmd != "build":
         print("mkfs: unknown command '%s'" % cmd)
         return 2
