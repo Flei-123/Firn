@@ -2088,7 +2088,7 @@ pub(crate) fn emit_func_ra(e: &mut Emitter, f: &Func) -> Option<Result<(), Strin
     // The function is emitted into a buffer of its own first; after that the
     // register descriptor post pass strikes spill stores with an immediate
     // reload of the same value (445x statically in the tokenizer run, round 37).
-    let mut tmp = Emitter { out: String::new(), cold: String::new(), debug_funcs: Vec::new(), xmm: Default::default() };
+    let mut tmp = Emitter::default();
     match emit_with(&mut tmp, f, &a) {
         Ok(()) => {
             // ROUND 90: the panic arms of the checked operations, behind the
@@ -2501,12 +2501,18 @@ fn descriptor_peephole(asm: &str, nv: usize) -> String {
     out
 }
 
-/// Are instruction exact debug lines active (`--no-opt`, see `dwarf.rs`)?
-/// Then the base path takes over, so that `.loc` per instruction survives.
-fn debug_lines_active(f: &Func) -> bool {
-    f.blocks.iter().any(|b| {
-        (0..b.insts.len()).any(|i| crate::dwarf::line_at(&f.name, b.id, i as u32).is_some())
-    })
+/// Is VARIABLE information being produced (`--no-opt`, see `dwarf.rs`)?
+/// Then the base path takes over: the debugger is told that every local sits
+/// at a fixed frame offset, and that is true only while nothing lives in a
+/// register.
+///
+/// ROUND 94: this used to ask for debug LINES, which now exist at every
+/// build level (`fir::Loc`) -- asking that question would have sent every
+/// optimized function down the base path and thrown the register allocation
+/// away. Lines and variables are two different promises, and only the second
+/// one needs the frame.
+fn debug_vars_active(_f: &Func) -> bool {
+    crate::dwarf::with_variables()
 }
 
 fn supported(f: &Func) -> bool {
@@ -2529,8 +2535,8 @@ fn unsupported_basic(f: &Func) -> Option<String> {
     if f.interrupt {
         return Some("#[interrupt]".into());
     }
-    if debug_lines_active(f) {
-        return Some("debug lines active".into());
+    if debug_vars_active(f) {
+        return Some("variable debug information active".into());
     }
     // FLOATING POINT: this allocator knows only the integer registers. `f64`
     // lives in the SSE registers and needs a second register class with
@@ -2620,8 +2626,9 @@ fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
     e.raw(&format!(".globl {}", label(&f.name)));
     e.raw(&format!("{}:", label(&f.name)));
     // Line of the `fn` declaration for the debugger (dwarf.rs).
+    e.forget_loc();
     if let Some((file, line)) = crate::dwarf::fn_line(&f.name) {
-        e.line(&format!(".loc {} {} 0", file + 1, line));
+        e.loc_at(crate::fir::Loc { file, line, col: 0 });
     }
     e.line("push rbp");
     e.line("mov rbp, rsp");
@@ -2842,9 +2849,17 @@ fn emit_block(
     };
     let n = if mergeable { b.insts.len() - 1 } else { b.insts.len() };
     for i in &b.insts[..n] {
+        // ROUND 94 -- the register allocated path carries the line table too.
+        // Before this round it emitted only the `fn` line, which is why an
+        // optimized build claimed the function's first line for its whole
+        // body (measured: `inl.fi:7` for code out of `inl.fi:3`).
+        e.loc_at(i.loc);
         emit_inst(e, ra, i, site)?;
     }
     if mergeable {
+        if let Some(last) = b.insts.last() {
+            e.loc_at(last.loc);
+        }
         return emit_cmp_br(e, ra, b, next);
     }
     let f = ra.f;
@@ -4146,7 +4161,7 @@ mod tests {
         let mut f = Func::new("f", vec![FTy::I64; 7], FTy::I64);
         f.set_term(0, Term::Ret(Some(6)));
         assert!(supported(&f));
-        let mut e = Emitter { out: String::new(), cold: String::new(), debug_funcs: Vec::new(), xmm: Default::default() };
+        let mut e = Emitter::default();
         emit_func_ra(&mut e, &f).expect("register path responsible").expect("codegen");
         assert!(e.out.contains("qword ptr [rbp+16]"), "{}", e.out);
     }
@@ -4164,7 +4179,7 @@ mod tests {
         let rc = g.push(0, FTy::I32, Op::Cast { src: r, from: FTy::I64 });
         g.set_term(0, Term::Ret(Some(rc)));
         assert!(supported(&g));
-        let mut e = Emitter { out: String::new(), cold: String::new(), debug_funcs: Vec::new(), xmm: Default::default() };
+        let mut e = Emitter::default();
         emit_func_ra(&mut e, &g).expect("register path responsible").expect("codegen");
         assert!(e.out.contains("sub rsp, 16"), "{}", e.out);
         assert!(e.out.contains("mov qword ptr [rsp+0], rax"), "{}", e.out);
@@ -4309,7 +4324,7 @@ mod tests {
     // ---------------------------------------------- ROUND 90: the clobbers ---
 
     fn inst(ty: FTy, op: Op) -> Inst {
-        Inst { dst: Some(0), ty, op }
+        Inst::new(Some(0), ty, op)
     }
 
     /// THE TABLE OF ROUND 90. Every entry is an instruction whose emitted
