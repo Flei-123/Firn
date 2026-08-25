@@ -4,16 +4,16 @@
 # Round 52. What is checked is what can be READ OFF the produced file, not
 # what the compiler claims about itself:
 #
-#   1. `demos/kernel/core.fi` compiles with BOTH compilers to an
+#   1. `demos/freestanding/core.fi` compiles with BOTH compilers to an
 #      ELF object file (`ET_REL`), not to an executable.
 #   2. The object file has NO undefined name -- no libc, no
 #      `_start`, no runtime -- EXCEPT `osum_panic` (round 72: `core.fi`
 #      now uses checked arithmetic, and `profile kernel` calls that one
 #      external symbol on an out-of-range value on purpose, SPEC section
-#      13; `demos/kernel/start.s` defines it, resolved at the link step
+#      13; `demos/freestanding/start.s` defines it, resolved at the link step
 #      in part 3 below). (`nm -u` yields at most that one name.)
 #   3. It contains not a single `syscall` instruction (`objdump -d`).
-#   4. It can be linked with `ld -T demos/kernel/linker.ld` into an image
+#   4. It can be linked with `ld -T demos/freestanding/linker.ld` into an image
 #      and BOOTED in QEMU: the serial output of the kernel appears.
 #   5. The inline assembly is really in there (`in`/`out`, `hlt`, `cli`),
 #      the interrupt entry point ends with `iretq` and saves 14 registers.
@@ -30,8 +30,8 @@ cd "$(dirname "$0")/../.."
 export FIRNLIB="$(pwd)/lib"
 FIRNC=compiler/target/release/firnc
 FC1=${FIRNC1:-./.firnc1}
-SOURCE=demos/kernel/core.fi
-LDSCRIPT=demos/kernel/linker.ld
+SOURCE=demos/freestanding/core.fi
+LDSCRIPT=demos/freestanding/linker.ld
 # A temp directory of its own per run (several rounds run in parallel).
 TMPD=$(mktemp -d)
 trap 'rm -rf "$TMPD"' EXIT
@@ -83,7 +83,7 @@ for s in 0 1; do
     # as u16`), and under `profile kernel` a checked site that goes out of
     # range calls that external symbol on purpose (SPEC section 13, `L9`);
     # this object file is freestanding and has not been linked against
-    # `demos/kernel/start.s`'s own definition of it yet (section 3 below
+    # `demos/freestanding/start.s`'s own definition of it yet (section 3 below
     # is where that happens, and where the reference gets resolved for
     # real). Anything ELSE undefined is still a hard failure.
     undef=$(nm -u "$f" 2>/dev/null | awk '{print $NF}' | sed '/^$/d' | grep -vxF osum_panic)
@@ -101,7 +101,7 @@ for s in 0 1; do
 done
 
 echo "== 3. link against the linker script (no libc, no crt files) =="
-as --64 -o "$TMPD/start.o" demos/kernel/start.s 2>"$TMPD/as.err" \
+as --64 -o "$TMPD/start.o" demos/freestanding/start.s 2>"$TMPD/as.err" \
     && ok "start.s assembles (multiboot header, long mode)" \
     || { bad "start.s"; sed 's/^/        /' "$TMPD/as.err" | head -5; }
 for s in 0 1; do
@@ -157,7 +157,7 @@ for s in 0 1; do
     # is allocated (`sub ..., %rsp`) -- that instruction is the reliable
     # end-of-prolog marker. ROUND 72: counting `push` over the WHOLE
     # function body (as this used to) broke the moment `timer_ih` itself
-    # contained checked arithmetic (`old + 1` in `demos/kernel/core.fi`)
+    # contained checked arithmetic (`old + 1` in `demos/freestanding/core.fi`)
     # -- `emit_checked_bin` rescues its own two operands with a balanced
     # `push`/`push` .. `pop`/`pop` pair around every checked site, which is
     # correct generated code, not a wrong register save count; this test
