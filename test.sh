@@ -57,6 +57,13 @@
 #      the same login dribbled out ONE OCTET PER WRITE, sixteen logins at
 #      the same time -- and, if node is there, node-minecraft-protocol as a
 #      third implementation nobody here wrote.
+#  54. ACCEPTANCE items 6 and 2 (round 95): the build step that reads the
+#      Unicode Character Database and produces generated/unicode_tables.fi
+#      out of it -- reproducible octet for octet, and checked against an
+#      independent parser over all 1,114,112 code points -- and the
+#      endurance run of the collector with CHANGING object sizes, with the
+#      counter-check that has to grow (tools/ucd/build.sh,
+#      tools/gc_soak/run.sh).
 #  41. The standard library of round 81 (tools/stdlib81/run.sh): the hash
 #      and the octet keys of the map (a million entries, the longest probe
 #      chain MEASURED, an endurance run with a counter-check that must
@@ -1194,6 +1201,46 @@ if [ "$PHRC" -eq 0 ]; then
 else
     bad "tools/phi/run.sh failed (see .test-work/phi.log)"
     grep -E '^  FAIL|^phi:' "$WORK/phi.log" | head -12 | sed 's/^/   /'
+fi
+
+echo "== 54. the Unicode table out of the UCD and the endurance run of the collector (ROUND 95) =="
+# ACCEPTANCE items 6 and 2.
+#
+# (a) tools/ucd/build.sh --verify: the build step reads UnicodeData.txt and
+#     DerivedCoreProperties.txt (sha256 pinned), the COMPILER parses them in
+#     `comptime` blocks, tools/ucd/pack.fi packs the result into the three
+#     stage table -- and the outcome has to be octet for octet the file that
+#     lies in the repository. That is what keeps round 93's reproducibility
+#     intact: a generated file that is not reproducible would break it.
+# (b) tools/ucd/probe_tables asks the table about every one of the 1,114,112
+#     code points and tools/ucd/verify_tables.py holds the answers against a
+#     parser of its own over both UCD files.
+# (c) tools/gc_soak/run.sh: the endurance run with CHANGING object sizes,
+#     with the counter-check that has to grow, plus the evaluation of the
+#     long series and of the rescan A/B in tools/gc_soak/longrun/.
+UCDRC=0
+bash tools/ucd/build.sh --verify > "$WORK/ucd_build.log" 2>&1 || UCDRC=$?
+grep -E '^   (the table at run time|level [123]|case mappings|identical|Unicode version|the generated source)' \
+    "$WORK/ucd_build.log" | cut -c1-110 | sed 's/^/ /'
+if [ "$UCDRC" -eq 0 ]; then
+    FIRNLIB="$(pwd)/lib" compiler/target/release/firnc tools/ucd/probe_tables.fi \
+        -o "$WORK/probe_tables" 2>> "$WORK/ucd_build.log" \
+        && "$WORK/probe_tables" > "$WORK/ucd_answers.txt" \
+        && python3 tools/ucd/verify_tables.py "$WORK/ucd_answers.txt" > "$WORK/ucd_verify.log" 2>&1 \
+        || UCDRC=9
+    grep -E 'IDENTICAL|DIFFERENT|compared' "$WORK/ucd_verify.log" | cut -c1-110 | sed 's/^/ /'
+fi
+SOAKRC=0
+SOAK_SEC=${TEST_SOAK_SEC:-60} SOAK_LEAK_SEC=${TEST_SOAK_LEAK_SEC:-30} \
+    SOAK_SAMPLE_MS=1000 SOAK_MIN_MS=1000000000 \
+    bash tools/gc_soak/run.sh > "$WORK/gc_soak.log" 2>&1 || SOAKRC=$?
+grep -E '^   (PASSED|FAILED|Counter-check|Overhead)|^     (duration|rounds|heap/live 2nd|pause per window|PASSED|FAILED)|^     throughput' \
+    "$WORK/gc_soak.log" | cut -c1-110 | sed 's/^/ /'
+if [ "$UCDRC" -eq 0 ] && [ "$SOAKRC" -eq 0 ]; then
+    ok
+else
+    bad "round 95 failed (ucd $UCDRC, soak $SOAKRC -- see .test-work/ucd_build.log, .test-work/gc_soak.log)"
+    grep -E 'FAILED|ERROR|error' "$WORK/ucd_build.log" "$WORK/ucd_verify.log" "$WORK/gc_soak.log" 2>/dev/null | head -10 | sed 's/^/   /'
 fi
 
 TOTAL=$((PASS + FAIL))
