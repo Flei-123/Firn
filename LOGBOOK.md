@@ -39,7 +39,7 @@ back by whoever the processor switched TO -- releasing it earlier lets a second 
 task whose registers are not saved yet.
 NOT DONE, NAMED: ring 3 stays on the boot processor (one KSTACK_CUR for the machine), no IPIs
 beyond INIT/STARTUP, no TLB shootdown, no load balancing beyond "whoever is free takes the next".
-MEASUREMENTS: tools/smp/run.sh 55/55 (test.sh section 57), tools/kernel/run.sh 175/175,
+MEASUREMENTS: tools/smp/run.sh 58/58 (test.sh section 57), tools/kernel/run.sh 175/175,
 english 0 0 0 0 0, firnfmt -c clean.
 
 ## Round 47 (2026-08-19) -- finalizers, Arc[T], weak references; branch r47-arc
