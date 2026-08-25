@@ -58,7 +58,15 @@ const INODE_BLOCKS: u64 = 32
 const DATA_START: u64 = 34
 const DIRENT: u64 = 32
 const NAME_LEN: u64 = 24
-const DIRECT: u64 = 12
+// ROUND K4: eleven direct blocks and not twelve, because the twelfth slot
+// of the inode became the DOUBLE indirect one. What a file could hold
+// before was 12 + 64 blocks = 38912 octets, and that was the ceiling of
+// the whole system: `/bin/sh` built by firnc1 was 35656 octets on the day
+// this round started, and a program that carries a libc does not fit under
+// it. Now it is 11 + 64 + 64 * 64 blocks -- 2135552 octets, more than the
+// 1 MiB image itself. The inode did not grow: 128 octets, as before.
+const DIRECT: u64 = 11
+const PER_BLOCK: u64 = BS / 8 // pointers in one block: 64
 
 const T_FREE: u64 = 0
 const T_FILE: u64 = 1
@@ -68,8 +76,9 @@ const T_DIR: u64 = 2
 const I_TYPE: u64 = 0
 const I_SIZE: u64 = 8
 const I_NLINK: u64 = 16
-const I_DIRECT: u64 = 24 // twelve of them
-const I_INDIRECT: u64 = 120
+const I_DIRECT: u64 = 24 // eleven of them
+const I_INDIRECT: u64 = 112
+const I_DINDIRECT: u64 = 120 // round K4: 64 blocks of 64 pointers
 
 // The fields of the superblock.
 const SB_MAGIC: u64 = 0
@@ -109,6 +118,14 @@ fn buf_nm(state: u64) -> u64 {
 
 fn buf_zz(state: u64) -> u64 {
     return state + kstate.FS_OFF + 3072
+}
+
+// Round K4: the SECOND level of the double indirect block. It cannot share
+// a buffer with `buf_ib` -- walking two levels means holding both -- and it
+// cannot be `buf_zz` either, because `block_alloc` writes into that one to
+// zero a fresh block.
+fn buf_i2(state: u64) -> u64 {
+    return state + kstate.FS_OFF + 3584
 }
 
 fn zero(p: u64, n: u64) {
@@ -285,9 +302,18 @@ fn file_block(state: u64, ino: u64, index: u64, grow: bool) -> u64 {
         return fresh
     }
     let k: u64 = index - DIRECT
-    if k >= BS / 8 {
+    if k < PER_BLOCK {
+        return single_block(state, ino, k, grow)
+    }
+    let d: u64 = k - PER_BLOCK
+    if d >= PER_BLOCK * PER_BLOCK {
         return 0
     }
+    return double_block(state, ino, d, grow)
+}
+
+// The block behind the ONE indirect pointer of the inode: 64 of them.
+fn single_block(state: u64, ino: u64, k: u64, grow: bool) -> u64 {
     var ib: u64 = inode_get(state, ino, I_INDIRECT)
     if ib == 0 {
         if !grow {
@@ -318,6 +344,63 @@ fn file_block(state: u64, ino: u64, index: u64, grow: bool) -> u64 {
     return fresh
 }
 
+// ROUND K4: two levels. The block of the inode holds 64 pointers to
+// blocks, and each of THOSE holds 64 pointers to data -- 4096 blocks, and
+// with them the ceiling that made this round necessary is gone. Every
+// allocation happens BEFORE the buffer it belongs in is read: `block_alloc`
+// writes a block of its own, and a buffer held across it would come back
+// changed.
+fn double_block(state: u64, ino: u64, d: u64, grow: bool) -> u64 {
+    var l1: u64 = inode_get(state, ino, I_DINDIRECT)
+    if l1 == 0 {
+        if !grow {
+            return 0
+        }
+        l1 = block_alloc(state)
+        if l1 == 0 {
+            return 0
+        }
+        inode_set(state, ino, I_DINDIRECT, l1)
+    }
+    if !blk.read(state, l1, buf_ib(state)) {
+        return 0
+    }
+    let slot: u64 = d / PER_BLOCK
+    var l2: u64 = get64(buf_ib(state) + slot * 8)
+    if l2 == 0 {
+        if !grow {
+            return 0
+        }
+        l2 = block_alloc(state)
+        if l2 == 0 {
+            return 0
+        }
+        if !blk.read(state, l1, buf_ib(state)) {
+            return 0
+        }
+        put64(buf_ib(state) + slot * 8, l2)
+        blk.write(state, l1, buf_ib(state))
+    }
+    if !blk.read(state, l2, buf_i2(state)) {
+        return 0
+    }
+    let at: u64 = d % PER_BLOCK
+    let b: u64 = get64(buf_i2(state) + at * 8)
+    if b != 0 || !grow {
+        return b
+    }
+    let fresh: u64 = block_alloc(state)
+    if fresh == 0 {
+        return 0
+    }
+    if !blk.read(state, l2, buf_i2(state)) {
+        return 0
+    }
+    put64(buf_i2(state) + at * 8, fresh)
+    blk.write(state, l2, buf_i2(state))
+    return fresh
+}
+
 // Every block of a file back to the bitmap.
 fn file_truncate(state: u64, ino: u64) {
     var i: u64 = 0
@@ -331,20 +414,48 @@ fn file_truncate(state: u64, ino: u64) {
     }
     let ib: u64 = inode_get(state, ino, I_INDIRECT)
     if ib != 0 {
-        if blk.read(state, ib, buf_ib(state)) {
+        free_pointers(state, ib)
+        block_free(state, ib)
+        inode_set(state, ino, I_INDIRECT, 0)
+    }
+    // ROUND K4: and the two levels under the double indirect pointer.
+    let l1: u64 = inode_get(state, ino, I_DINDIRECT)
+    if l1 != 0 {
+        if blk.read(state, l1, buf_ib(state)) {
             var k: u64 = 0
-            while k < BS / 8 {
-                let b: u64 = get64(buf_ib(state) + k * 8)
-                if b != 0 {
-                    block_free(state, b)
+            while k < PER_BLOCK {
+                let l2: u64 = get64(buf_ib(state) + k * 8)
+                if l2 != 0 {
+                    free_pointers(state, l2)
+                    block_free(state, l2)
+                    // `free_pointers` read over the buffer this loop walks.
+                    if !blk.read(state, l1, buf_ib(state)) {
+                        k = PER_BLOCK
+                    }
                 }
                 k = k + 1
             }
         }
-        block_free(state, ib)
-        inode_set(state, ino, I_INDIRECT, 0)
+        block_free(state, l1)
+        inode_set(state, ino, I_DINDIRECT, 0)
     }
     inode_set(state, ino, I_SIZE, 0)
+}
+
+// Every block a pointer block points at, back to the bitmap. Reads through
+// `buf_i2`, so that a caller walking `buf_ib` keeps what it is holding.
+fn free_pointers(state: u64, block: u64) {
+    if !blk.read(state, block, buf_i2(state)) {
+        return
+    }
+    var k: u64 = 0
+    while k < PER_BLOCK {
+        let b: u64 = get64(buf_i2(state) + k * 8)
+        if b != 0 {
+            block_free(state, b)
+        }
+        k = k + 1
+    }
 }
 
 // ------------------------------------------------------ reading, writing
