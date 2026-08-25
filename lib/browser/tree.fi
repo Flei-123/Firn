@@ -62,8 +62,10 @@ export {
     EM_IN_CAPTION, EM_IN_COLGROUP, EM_IN_TABLE_BODY, EM_IN_ROW, EM_IN_CELL,
     EM_IN_SELECT, EM_IN_SELECT_IN_TABLE, EM_AFTER_BODY, EM_IN_FRAMESET,
     EM_AFTER_FRAMESET, EM_AFTER_AFTER_BODY, EM_AFTER_AFTER_FRAMESET,
-    tree_new, tree_buffer_init, tree_init, tree_free,
-    tree_token, tree_eof, tree_document, tree_error, tree_broken, tree_release,
+    EM_IN_TEMPLATE,
+    tree_new, tree_buffer_init, tree_init, tree_fragment_init, tree_free,
+    tree_token, tree_eof, tree_document, tree_root,
+    tree_error, tree_broken, tree_release,
     tree_switching, tree_sw_pos, tree_sw_tag, tree_sw_delete,
     tree_mode, tree_open_number,
 }
@@ -92,6 +94,8 @@ const EM_IN_FRAMESET: u32 = 19
 const EM_AFTER_FRAMESET: u32 = 20
 const EM_AFTER_AFTER_BODY: u32 = 21
 const EM_AFTER_AFTER_FRAMESET: u32 = 22
+// ROUND B1: the 23rd insertion mode.
+const EM_IN_TEMPLATE: u32 = 23
 
 // The scopes of the stack (WHATWG 13.2.4.2).
 const SC_NORMAL: u32 = 0
@@ -149,6 +153,12 @@ struct Tree {
     nl_skip: bool, // discard the next U+000A (pre/textarea)
 
     // ROUND B1: foreign content (SVG/MathML) and fragment parsing.
+    // The stack of template insertion modes (WHATWG 13.2.4.4). A template
+    // has to remember in which mode its CONTENT is parsed -- nesting is
+    // allowed, hence a stack and not a single value.
+    tmpl: [u32; 64],
+    n_tmpl: usize,
+
     adj: foreign.Adjust, // the name correction tables of WHATWG 13.2.6.5
     context: Gc[Elem], // the context element of a fragment (else null)
     fragment: bool, // is this the fragment parsing algorithm?
@@ -177,6 +187,8 @@ fn tree_new() -> Tree {
         foster: false,
         tt: gc_null[Chain](),
         tt_only_space: true,
+        tmpl: [0; 64],
+        n_tmpl: 0,
         adj: foreign.adjust_new(),
         context: gc_null[Elem](),
         fragment: false,
@@ -211,6 +223,7 @@ fn tree_init(b: *mut Tree, nm: *mut names.Names, st: *mut token_stream.Stream) -
     }
     (*b).context = gc_null[Elem]()
     (*b).fragment = false
+    (*b).n_tmpl = 0
     mem.cp_clear(&(*b).sw_tag)
     mem.cp_clear(&(*b).help)
     (*b).nl_skip = false
@@ -246,6 +259,52 @@ fn tree_init(b: *mut Tree, nm: *mut names.Names, st: *mut token_stream.Stream) -
     (*b).err = 0
     (*b).broken = 0
     return true
+}
+
+// WHATWG 13.2.5 "HTML fragment parsing algorithm", steps 3 to 8. The
+// document and the state come from `tree_init`; on top of that comes an
+// `html` root element (the fragment case of "the topmost element"), the
+// context element and the insertion mode that fits it.
+//
+// The RESULT of a fragment parse is not the document but the children of
+// that root element -- `tree_root` hands it out.
+fn tree_fragment_init(b: *mut Tree, nm: *mut names.Names,
+    st: *mut token_stream.Stream, name: u32, ns: u32) -> bool {
+    if !tree_init(b, nm, st) {
+        return false
+    }
+    let ctx: Gc[Elem] = node.elem_new(name, ns) catch gc_null[Elem]()
+    if ctx == gc_null[Elem]() {
+        return false
+    }
+    let root: Gc[Elem] = node.elem_new(tag.M_HTML, node.NS_HTML) catch gc_null[Elem]()
+    if root == gc_null[Elem]() {
+        return false
+    }
+    node.append_child((*b).doc, root)
+    stack_push(b, root)
+    (*b).fragment = true
+    (*b).context = ctx
+    // `template` as a context: the fragment is parsed straight in "in
+    // template", so the template insertion mode stack starts filled.
+    if ns == node.NS_HTML && name == tag.M_TEMPLATE {
+        template_mode_push(b, EM_IN_TEMPLATE)
+    }
+    insert_mode_reset(b)
+    // The form element pointer would point at the nearest `form` ancestor of
+    // the context element. A fragment out of a .dat file has no ancestors,
+    // so it stays empty -- that is the same case as `innerHTML` on a
+    // free standing element.
+    return true
+}
+
+// The node whose children are the result: the root element in the fragment
+// case, otherwise the document itself.
+fn tree_root(b: *mut Tree) -> Gc[Node] {
+    if (*b).fragment && (*b).n_open > 0 {
+        return (*b).open[0]
+    }
+    return (*b).doc
 }
 
 // Lets go of the tree built last: every Gc field of the state is nulled.
@@ -455,6 +514,43 @@ fn stack_pop_to_name(b: *mut Tree, name: u32) {
     }
 }
 
+// ------------------------------------------ The template insertion modes
+
+const MAX_TMPL: usize = 64
+
+fn template_mode_push(b: *mut Tree, m: u32) {
+    if (*b).n_tmpl >= MAX_TMPL {
+        (*b).broken = 5
+        return
+    }
+    (*b).tmpl[(*b).n_tmpl] = m
+    (*b).n_tmpl = (*b).n_tmpl + 1
+}
+
+fn template_mode_pop(b: *mut Tree) {
+    if (*b).n_tmpl > 0 {
+        (*b).n_tmpl = (*b).n_tmpl - 1
+    }
+}
+
+fn template_mode_top(b: *mut Tree) -> u32 {
+    if (*b).n_tmpl == 0 {
+        return EM_IN_BODY
+    }
+    return (*b).tmpl[(*b).n_tmpl - 1]
+}
+
+fn template_on_stack(b: *mut Tree) -> bool {
+    var i: usize = (*b).n_open
+    while i > 0 {
+        i = i - 1
+        if node.elem_is((*b).open[i], tag.M_TEMPLATE) {
+            return true
+        }
+    }
+    return false
+}
+
 // -------------------------------------------------------------- The scopes
 
 // The base list of the scope (WHATWG 13.2.4.2 "has an element in
@@ -648,6 +744,21 @@ fn is_whitespace(c: u32) -> bool {
 // including "foster parenting". The result is TWO values (the parent node
 // and the node the insertion happens BEFORE; a null pointer = append) --
 // Firn has no tuples, so they go out through pointers.
+// ROUND B1: the last step of the algorithm -- a `template` element never
+// takes children itself, they go into its template contents.
+fn site_through_template(parent_out: *mut Gc[Node], ref_out: *mut Gc[Node]) {
+    let e: Gc[Elem] = node.node_as_elem(*parent_out)
+    if e == gc_null[Elem]() || e.ns != node.NS_HTML || e.name != tag.M_TEMPLATE {
+        return
+    }
+    let f: Gc[Fragment] = node.elem_content_read(e)
+    if f == gc_null[Fragment]() {
+        return
+    }
+    *parent_out = f
+    *ref_out = gc_null[Node]()
+}
+
 fn matching_site(b: *mut Tree, overriding: Gc[Node],
     parent_out: *mut Gc[Node], ref_out: *mut Gc[Node]) {
     var target: Gc[Node] = overriding
@@ -657,33 +768,49 @@ fn matching_site(b: *mut Tree, overriding: Gc[Node],
     *parent_out = target
     *ref_out = gc_null[Node]()
     if !(*b).foster {
+        site_through_template(parent_out, ref_out)
         return
     }
     let e: Gc[Elem] = node.node_as_elem(target)
     if e == gc_null[Elem]() || e.ns != node.NS_HTML {
+        site_through_template(parent_out, ref_out)
         return
     }
     if !(e.name == tag.M_TABLE || e.name == tag.M_TBODY || e.name == tag.M_TFOOT ||
         e.name == tag.M_THEAD || e.name == tag.M_TR) {
+        site_through_template(parent_out, ref_out)
         return
     }
-    // Look for the last `table` in the stack.
+    // Look for the last `table` and the last `template` in the stack.
     var i: usize = (*b).n_open
     var table: Gc[Node] = gc_null[Node]()
     var tidx: usize = 0
+    var tmpl: Gc[Node] = gc_null[Node]()
+    var midx: usize = 0
     while i > 0 {
         i = i - 1
-        if node.elem_is((*b).open[i], tag.M_TABLE) {
+        if table == gc_null[Node]() && node.elem_is((*b).open[i], tag.M_TABLE) {
             table = (*b).open[i]
             tidx = i
-            break
         }
+        if tmpl == gc_null[Node]() && node.elem_is((*b).open[i], tag.M_TEMPLATE) {
+            tmpl = (*b).open[i]
+            midx = i
+        }
+    }
+    // A `template` LOWER in the stack than the last table swallows the
+    // foster parented node -- it never leaves the template contents.
+    if tmpl != gc_null[Node]() && (table == gc_null[Node]() || midx > tidx) {
+        *parent_out = tmpl
+        site_through_template(parent_out, ref_out)
+        return
     }
     if table == gc_null[Node]() {
         // The fragment case: into the lowest element of the stack.
         if (*b).n_open > 0 {
             *parent_out = (*b).open[0]
         }
+        site_through_template(parent_out, ref_out)
         return
     }
     if table.parent != gc_null[Node]() {
@@ -694,6 +821,7 @@ fn matching_site(b: *mut Tree, overriding: Gc[Node],
     if tidx > 0 {
         *parent_out = (*b).open[tidx - 1]
     }
+    site_through_template(parent_out, ref_out)
 }
 
 // The three adjustment modes of WHATWG 13.2.6.5.
@@ -1181,7 +1309,12 @@ fn insert_mode_reset(b: *mut Tree) {
         i = i - 1
         let k: Gc[Node] = (*b).open[i]
         let last: bool = i == 0
-        let e: Gc[Elem] = node.node_as_elem(k)
+        // The fragment case: for the topmost entry the standard asks the
+        // CONTEXT element, not the `html` root that only carries the tree.
+        var e: Gc[Elem] = node.node_as_elem(k)
+        if last && (*b).fragment {
+            e = (*b).context
+        }
         if e == gc_null[Elem]() || e.ns != node.NS_HTML {
             if last {
                 (*b).mode = EM_IN_BODY
@@ -1229,6 +1362,10 @@ fn insert_mode_reset(b: *mut Tree) {
         }
         if n == tag.M_TABLE {
             (*b).mode = EM_IN_TABLE
+            return
+        }
+        if n == tag.M_TEMPLATE {
+            (*b).mode = template_mode_top(b)
             return
         }
         if n == tag.M_HEAD && !last {
@@ -1674,7 +1811,8 @@ fn char_html(b: *mut Tree, cp: u32) -> AllocError!u32 {
         (*b).mode = EM_IN_BODY
         return A_ERNEUT
     }
-    if m == EM_IN_BODY || m == EM_IN_CAPTION || m == EM_IN_CELL {
+    if m == EM_IN_BODY || m == EM_IN_CAPTION || m == EM_IN_CELL ||
+    m == EM_IN_TEMPLATE {
         return try char_in_body(b, cp)
     }
     if m == EM_TEXT {
@@ -1965,12 +2103,41 @@ fn m_in_head(b: *mut Tree) -> AllocError!u32 {
             let ok: bool = try raw_text_elem(b, ZST_SCRIPT)
             return A_DONE
         }
+        if n == tag.M_TEMPLATE {
+            let e = try elem_insert_for_token(b, node.NS_HTML)
+            if e == gc_null[Elem]() {
+                return A_OUT
+            }
+            // The content fragment is created RIGHT AWAY: the insertion
+            // point algorithm has to find it, and it must not allocate.
+            let f = try node.elem_content(e)
+            active_push_mark(b)
+            (*b).frameset_ok = false
+            (*b).mode = EM_IN_TEMPLATE
+            template_mode_push(b, EM_IN_TEMPLATE)
+            return A_DONE
+        }
         if n == tag.M_HEAD {
             parse_error(b)
             return A_DONE
         }
     }
     if kind == tokens.TB_END {
+        if n == tag.M_TEMPLATE {
+            if !template_on_stack(b) {
+                parse_error(b)
+                return A_DONE
+            }
+            implicit_close_thorough(b)
+            if !node.elem_is(current(b), tag.M_TEMPLATE) {
+                parse_error(b)
+            }
+            stack_pop_to_name(b, tag.M_TEMPLATE)
+            active_to_mark_clear(b)
+            template_mode_pop(b)
+            insert_mode_reset(b)
+            return A_DONE
+        }
         if n == tag.M_HEAD {
             stack_pop(b)
             (*b).mode = EM_AFTER_HEAD
@@ -3115,6 +3282,47 @@ fn m_in_select_in_table(b: *mut Tree) -> AllocError!u32 {
     return try m_in_select(b)
 }
 
+// ------------------------------------------------------------ "in template"
+
+fn m_in_template(b: *mut Tree) -> AllocError!u32 {
+    let kind: u32 = token_stream.stream_kind((*b).stream)
+    if kind == tokens.TB_COMMENT || kind == tokens.TB_DOCTYPE {
+        return try m_in_body(b)
+    }
+    let n: u32 = (*b).tname
+    if kind == tokens.TB_START {
+        if n == tag.M_BASE || n == tag.M_BASEFONT || n == tag.M_BGSOUND ||
+        n == tag.M_LINK || n == tag.M_META || n == tag.M_NOFRAMES ||
+        n == tag.M_SCRIPT || n == tag.M_STYLE || n == tag.M_TEMPLATE ||
+        n == tag.M_TITLE {
+            return try m_in_head(b)
+        }
+        var target: u32 = EM_IN_BODY
+        if n == tag.M_CAPTION || n == tag.M_COLGROUP || n == tag.M_TBODY ||
+        n == tag.M_TFOOT || n == tag.M_THEAD {
+            target = EM_IN_TABLE
+        } else if n == tag.M_COL {
+            target = EM_IN_COLGROUP
+        } else if n == tag.M_TR {
+            target = EM_IN_TABLE_BODY
+        } else if n == tag.M_TD || n == tag.M_TH {
+            target = EM_IN_ROW
+        }
+        template_mode_pop(b)
+        template_mode_push(b, target)
+        (*b).mode = target
+        return A_ERNEUT
+    }
+    if kind == tokens.TB_END {
+        if n == tag.M_TEMPLATE {
+            return try m_in_head(b)
+        }
+        parse_error(b)
+        return A_DONE
+    }
+    return A_DONE
+}
+
 // ----------------------------------------------- "after body" and the rest
 
 fn m_after_body(b: *mut Tree) -> AllocError!u32 {
@@ -3573,6 +3781,9 @@ fn mark_html(b: *mut Tree) -> AllocError!u32 {
     if m == EM_IN_SELECT_IN_TABLE {
         return try m_in_select_in_table(b)
     }
+    if m == EM_IN_TEMPLATE {
+        return try m_in_template(b)
+    }
     if m == EM_AFTER_BODY {
         return try m_after_body(b)
     }
@@ -3635,6 +3846,18 @@ fn eof_mode(b: *mut Tree) -> AllocError!u32 {
     }
     if m == EM_IN_TABLE_TEXT {
         let ok: bool = try tt_flush(b)
+        return A_ERNEUT
+    }
+    if m == EM_IN_TEMPLATE {
+        // WHATWG: without a template on the stack this is "stop parsing".
+        if !template_on_stack(b) {
+            return A_DONE
+        }
+        parse_error(b)
+        stack_pop_to_name(b, tag.M_TEMPLATE)
+        active_to_mark_clear(b)
+        template_mode_pop(b)
+        insert_mode_reset(b)
         return A_ERNEUT
     }
     if m == EM_IN_CAPTION || m == EM_IN_CELL {
