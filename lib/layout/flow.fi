@@ -112,11 +112,20 @@ fn clamp_height(b: Gc[Box], value: f64, cb_h: f64, cb_valid: bool) -> f64 {
 fn clamp_axis(b: Gc[Box], value: f64, reference: f64, ref_valid: bool,
     extra: f64, min_slot: usize, max_slot: usize) -> f64 {
     let s: Gc[Style] = b.style
+    let vertical: bool = min_slot == cascade.S_MIN_HEIGHT
+    var avail: f64 = reference - extra
+    if !vertical {
+        avail = avail - b.ml - b.mr
+    }
     var v: f64 = value
     var limit: f64 = 0.0
     let mu: u32 = cascade.style_unit(s, max_slot)
     if mu != cascade.U_NONE && (mu != cascade.U_PERCENT || ref_valid) {
-        if box.resolve(s, max_slot, reference, &limit) {
+        if keyword_size_axis(b, max_slot, avail, vertical, &limit) {
+            if v > limit {
+                v = limit
+            }
+        } else if box.resolve(s, max_slot, reference, &limit) {
             let top: f64 = content_from_specified(b, limit, extra)
             if v > top {
                 v = top
@@ -125,7 +134,11 @@ fn clamp_axis(b: Gc[Box], value: f64, reference: f64, ref_valid: bool,
     }
     let nu: u32 = cascade.style_unit(s, min_slot)
     if nu != cascade.U_AUTO && (nu != cascade.U_PERCENT || ref_valid) {
-        if box.resolve(s, min_slot, reference, &limit) {
+        if keyword_size_axis(b, min_slot, avail, vertical, &limit) {
+            if v < limit {
+                v = limit
+            }
+        } else if box.resolve(s, min_slot, reference, &limit) {
             let bottom: f64 = content_from_specified(b, limit, extra)
             if v < bottom {
                 v = bottom
@@ -363,6 +376,54 @@ fn max_content_width(b: Gc[Box]) -> f64 {
 
 // The shrink-to-fit width of CSS 2.1, 10.3.5:
 //     min(max(preferred minimum, available), preferred)
+// THE KEYWORD SIZES (css-sizing-3, 5.1). `avail` is the space the box has
+// for its CONTENT -- the containing block minus this box's own margins,
+// border and padding. Answers `false` when the slot holds no keyword.
+//
+// In the BLOCK axis only `stretch` is answered: `min-content` and
+// `max-content` for a height are the content height, which is what `auto`
+// already computes, and letting them through here would only replace a
+// correct number with a worse one.
+fn keyword_size_axis(b: Gc[Box], slot: usize, avail: f64, vertical: bool,
+    out: *mut f64) -> bool {
+    let u: u32 = cascade.style_unit(b.style, slot)
+    if u < cascade.U_MIN_CONTENT {
+        return false
+    }
+    if u == cascade.U_STRETCH {
+        var v: f64 = avail
+        if v < 0.0 {
+            v = 0.0
+        }
+        *out = v
+        return true
+    }
+    if vertical {
+        return false
+    }
+    if u == cascade.U_MIN_CONTENT {
+        *out = min_content_width(b)
+        return true
+    }
+    if u == cascade.U_MAX_CONTENT {
+        *out = max_content_width(b)
+        return true
+    }
+    *out = shrink_to_fit(b, avail)
+    return true
+}
+
+// `auto` in a shrink-to-fit context -- a float, an inline-block, an
+// absolutely positioned box: the keyword sizes stand in for it where they
+// are given.
+fn auto_or_keyword_width(b: Gc[Box], avail: f64) -> f64 {
+    var v: f64 = 0.0
+    if keyword_size_axis(b, cascade.S_WIDTH, avail, false, &v) {
+        return v
+    }
+    return shrink_to_fit(b, avail)
+}
+
 fn shrink_to_fit(b: Gc[Box], available: f64) -> f64 {
     var mn: f64 = 0.0
     var mx: f64 = 0.0
@@ -466,7 +527,7 @@ fn layout_atomic(c: Gc[Box], available: f64) -> AllocError!bool {
     if box.resolve(c.style, cascade.S_WIDTH, available, &w) {
         w = content_from_specified(c, w, h_extra(c))
     } else {
-        w = shrink_to_fit(c, available - c.ml - c.mr - h_extra(c))
+        w = auto_or_keyword_width(c, available - c.ml - c.mr - h_extra(c))
     }
     w = clamp_width(c, w, available, true)
     resolve_relative(c, available, 0.0, false)
@@ -1081,7 +1142,7 @@ fn place_float(c: Gc[Box], parent_w: f64, y_min: f64,
     if box.resolve(c.style, cascade.S_WIDTH, parent_w, &w) {
         w = content_from_specified(c, w, h_extra(c))
     } else {
-        w = shrink_to_fit(c, parent_w - c.ml - c.mr - h_extra(c))
+        w = auto_or_keyword_width(c, parent_w - c.ml - c.mr - h_extra(c))
     }
     w = clamp_width(c, w, parent_w, true)
     var own: box.FloatCtx = box.floatctx_new()
@@ -1483,10 +1544,16 @@ fn layout_block(b: Gc[Box], cb_w: f64, cb_h: f64, cb_h_ok: bool,
         if content_w < 0.0 {
             content_w = 0.0
         }
-        let cl: f64 = clamp_width(b, content_w, cb_w, true)
-        if cl != content_w {
-            content_w = cl
+        var kw: f64 = 0.0
+        if keyword_size_axis(b, cascade.S_WIDTH, content_w, false, &kw) {
+            content_w = clamp_width(b, kw, cb_w, true)
             solve_margins(b, cb_w, content_w, extra, ml_auto, mr_auto)
+        } else {
+            let cl: f64 = clamp_width(b, content_w, cb_w, true)
+            if cl != content_w {
+                content_w = cl
+                solve_margins(b, cb_w, content_w, extra, ml_auto, mr_auto)
+            }
         }
     } else {
         content_w = content_from_specified(b, w_given, extra)
@@ -1861,7 +1928,7 @@ fn flex_initial_cross(b: Gc[Box], it: Gc[FlexItem], column: bool,
     !end_auto {
         return clamp_width(c, avail, cb_w, true)
     }
-    return clamp_width(c, shrink_to_fit(c, avail), cb_w, true)
+    return clamp_width(c, auto_or_keyword_width(c, avail), cb_w, true)
 }
 
 // The MAX-CONTENT main size of an item. In a row that is the maximum
@@ -2834,7 +2901,7 @@ fn layout_absolute(c: Gc[Box], cb_x: f64, cb_y: f64, cb_w: f64,
         // `static_to_viewport`), so the corner of the containing block
         // comes off it again here.
         if !has_w {
-            w = shrink_to_fit(c, cb_w - c.ml - c.mr - extra)
+            w = auto_or_keyword_width(c, cb_w - c.ml - c.mr - extra)
         }
         left = c.static_x - cb_x - c.ml
     } else if has_left && has_right {
@@ -2855,11 +2922,11 @@ fn layout_absolute(c: Gc[Box], cb_x: f64, cb_y: f64, cb_w: f64,
         }
     } else if has_left {
         if !has_w {
-            w = shrink_to_fit(c, cb_w - left - c.ml - c.mr - extra)
+            w = auto_or_keyword_width(c, cb_w - left - c.ml - c.mr - extra)
         }
     } else {
         if !has_w {
-            w = shrink_to_fit(c, cb_w - right - c.ml - c.mr - extra)
+            w = auto_or_keyword_width(c, cb_w - right - c.ml - c.mr - extra)
         }
         left = cb_w - right - w - c.ml - c.mr - extra
     }
