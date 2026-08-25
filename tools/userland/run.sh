@@ -279,6 +279,7 @@ WANT
 # ---- case 3: the shell as a shell.
 cat > "$TMPD/t3.sh" <<'SCRIPT'
 echo ==BEGIN==
+pwd
 cd /d
 pwd
 ls
@@ -310,6 +311,7 @@ cd /
 echo ==END==
 SCRIPT
 cat > "$TMPD/t3.want" <<'WANT'
+/
 /d
 ./ ../ three.txt dup.txt nums.txt empty.txt 
 /
