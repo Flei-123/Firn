@@ -46,7 +46,7 @@
 import html.mem
 import std.num
 import std.math
-import js.unicode_id
+import str.ucd
 
 export {
     Names, names_init, names_free, names_intern, names_intern_ascii,
@@ -507,8 +507,10 @@ struct Lexer {
     errline: u32,
     errpos: usize,
     pool: mem.CpBuf,
-    idstart: mem.CpBuf,
-    idcont: mem.CpBuf,
+    // The generated Unicode table (generated/unicode_tables.fi, round 95).
+    // Stage 0 has no global variables, so the pointer lives here -- the way
+    // the two range buffers used to.
+    ucdtab: u64,
     nm: *mut Names,
     scratch: mem.Buf,
 }
@@ -516,11 +518,8 @@ struct Lexer {
 fn lex_init(l: *mut Lexer, nm: *mut Names) {
     mem.cp_init(&(*l).src)
     mem.cp_init(&(*l).pool)
-    mem.cp_init(&(*l).idstart)
-    mem.cp_init(&(*l).idcont)
     mem.buf_init(&(*l).scratch)
-    unicode_id.id_start_fill(&(*l).idstart)
-    unicode_id.id_continue_fill(&(*l).idcont)
+    (*l).ucdtab = ucd.ucd_map()
     (*l).nm = nm
     (*l).n = 0
     (*l).pos = 0
@@ -546,8 +545,8 @@ fn lex_init(l: *mut Lexer, nm: *mut Names) {
 fn lex_free(l: *mut Lexer) {
     mem.cp_free(&(*l).src)
     mem.cp_free(&(*l).pool)
-    mem.cp_free(&(*l).idstart)
-    mem.cp_free(&(*l).idcont)
+    ucd.ucd_free((*l).ucdtab)
+    (*l).ucdtab = 0
     mem.buf_free(&(*l).scratch)
 }
 
@@ -571,7 +570,7 @@ fn lex_new() -> Lexer {
         kind: T_EOF, code: 0, start: 0, end: 0, tline: 1, nl: false,
         name: 0, numbits: 0, soff: 0, slen: 0, roff: 0, rlen: 0,
         flags: 0, err: E_NONE, errline: 0, errpos: 0,
-        pool: mem.cp_new(), idstart: mem.cp_new(), idcont: mem.cp_new(),
+        pool: mem.cp_new(), ucdtab: 0,
         nm: 0 as *mut Names, scratch: mem.buf_new(),
     }
 }
@@ -658,45 +657,23 @@ fn lex_fail(l: *mut Lexer, code: u32, pos: usize) {
 
 // ------------------------------------------------------ Character classes
 
-fn in_ranges(tab: *mut mem.CpBuf, count: usize, c: u32) -> bool {
-    var lo: usize = 0
-    var hi: usize = count
-    while lo < hi {
-        let mid: usize = (lo + hi) / 2
-        let a: u32 = mem.cp_at(tab, mid * 2)
-        let b: u32 = mem.cp_at(tab, mid * 2 + 1)
-        if c < a {
-            hi = mid
-        } else if c > b {
-            lo = mid + 1
-        } else {
-            return true
-        }
-    }
-    return false
-}
-
 fn is_line_terminator(c: u32) -> bool {
     return c == 10 as u32 || c == 13 as u32 || c == 0x2028 as u32 || c == 0x2029 as u32
 }
 
-fn is_space(c: u32) -> bool {
+fn is_space(l: *mut Lexer, c: u32) -> bool {
     if c == 9 as u32 || c == 11 as u32 || c == 12 as u32 || c == 32 as u32 {
         return true
     }
-    if c == 0xA0 as u32 || c == 0xFEFF as u32 {
+    if c == 0xFEFF as u32 {
         return true
     }
-    if c == 0x1680 as u32 {
-        return true
+    if c < 0x80 as u32 {
+        return false
     }
-    if c >= 0x2000 as u32 && c <= 0x200A as u32 {
-        return true
-    }
-    if c == 0x202F as u32 || c == 0x205F as u32 || c == 0x3000 as u32 {
-        return true
-    }
-    return false
+    // ECMA-262 12.2: <USP> is the general category Zs, and since round 95
+    // that comes out of the generated table instead of a hand written list.
+    return ucd.ucd_category((*l).ucdtab, c) == ucd.CAT_ZS
 }
 
 fn is_digit(c: u32) -> bool {
@@ -736,7 +713,7 @@ fn lex_id_start(l: *mut Lexer, c: u32) -> bool {
     if c < 0x80 as u32 {
         return false
     }
-    return in_ranges(&(*l).idstart, unicode_id.ID_START_RANGES, c)
+    return ucd.ucd_is_id_start((*l).ucdtab, c)
 }
 
 fn lex_id_cont(l: *mut Lexer, c: u32) -> bool {
@@ -755,7 +732,12 @@ fn lex_id_cont(l: *mut Lexer, c: u32) -> bool {
     if c < 0x80 as u32 {
         return false
     }
-    return in_ranges(&(*l).idcont, unicode_id.ID_CONTINUE_RANGES, c)
+    // ECMA-262 12.7.1 adds ZWNJ and ZWJ to ID_Continue; the Unicode
+    // property does not have them, and the table stays pure Unicode.
+    if c == 0x200C as u32 || c == 0x200D as u32 {
+        return true
+    }
+    return ucd.ucd_is_id_continue((*l).ucdtab, c)
 }
 
 // ------------------------------------------------- White space and comments
@@ -775,7 +757,7 @@ fn lex_skip_trivia(l: *mut Lexer) -> bool {
             }
             (*l).pos = (*l).pos + 1
             (*l).line = (*l).line + 1 as u32
-        } else if is_space(c) {
+        } else if is_space(l, c) {
             (*l).pos = (*l).pos + 1
         } else if c == 47 as u32 && lex_at(l, (*l).pos + 1) == 47 as u32 {
             (*l).pos = (*l).pos + 2
