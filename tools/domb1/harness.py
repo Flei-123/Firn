@@ -36,7 +36,10 @@ DATA = os.path.join(ROOT, "tests", "data", "html5lib")
 def load_dat(path):
     """Reads a .dat file: a list of (data, document, fragment_context)."""
     cases = []
-    with open(path, encoding="utf-8", errors="surrogateescape") as fh:
+    # newline="" switches Python's universal newline translation OFF: a
+    # `\r` in the data or in an expected text is a DELIBERATE byte
+    # (`FOO&#x000D;ZOO`), not a line ending.
+    with open(path, encoding="utf-8", errors="surrogateescape", newline="") as fh:
         text = fh.read()
     for block in text.split("\n#data\n"):
         block = block.lstrip("\n")
