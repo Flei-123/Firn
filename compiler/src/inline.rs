@@ -166,8 +166,11 @@ fn find_site(m: &Module, ci: usize, self_rec: &[bool]) -> Option<(usize, usize, 
 /// Embeds exactly one call site.
 fn inline_one(m: &mut Module, ci: usize, bi: usize, mut ii: usize, gi: usize) {
     let callee = m.funcs[gi].clone();
-    let (args, dst, ret_ty) = match &m.funcs[ci].blocks[bi].insts[ii] {
-        Inst { dst, ty, op: Op::Call { args, .. } } => (args.clone(), *dst, *ty),
+    let (args, dst, ret_ty, call_loc) = match &m.funcs[ci].blocks[bi].insts[ii] {
+        // ROUND 94: the position of the CALL. Everything that belongs to the
+        // call itself (the result travelling back) keeps it; everything that
+        // belongs to the callee's body keeps the callee's own position.
+        Inst { dst, ty, op: Op::Call { args, .. }, loc } => (args.clone(), *dst, *ty, *loc),
         _ => return,
     };
 
@@ -261,10 +264,13 @@ fn inline_one(m: &mut Module, ci: usize, bi: usize, mut ii: usize, gi: usize) {
     }
 
     // 5. Define the result value at the start of the continuation.
+    // ROUND 94: the detour load belongs to the CALL, not to the callee -- it
+    // is the value arriving back at the call site.
     if let (Some(d), Some(slot)) = (dst, result_slot) {
-        f.blocks[cont as usize]
-            .insts
-            .insert(0, Inst { dst: Some(d), ty: ret_ty, op: Op::Load { addr: slot } });
+        f.blocks[cont as usize].insts.insert(
+            0,
+            Inst::like(Some(d), ret_ty, Op::Load { addr: slot }, call_loc),
+        );
     }
 
     // 6. Copy the body.
@@ -275,7 +281,12 @@ fn inline_one(m: &mut Module, ci: usize, bi: usize, mut ii: usize, gi: usize) {
                 continue; // stands at the entry block already
             }
             let op = remap_op(&i.op, &mv, Some(&blockmap));
-            f.blocks[nb].insts.push(Inst { dst: i.dst.map(&mv), ty: i.ty, op });
+            // ROUND 94 -- THE POINT OF THE ROUND. The copied instruction keeps
+            // the position it has in the CALLEE. Without this line the
+            // debugger reports the caller's line for code that stands
+            // somewhere else entirely, which is exactly the lie that started
+            // this round (`fir::Loc`).
+            f.blocks[nb].insts.push(Inst::like(i.dst.map(&mv), i.ty, op, i.loc));
         }
         f.blocks[nb].term = match &b.term {
             Term::Br(t) => Term::Br(blockmap[t]),
@@ -292,11 +303,14 @@ fn inline_one(m: &mut Module, ci: usize, bi: usize, mut ii: usize, gi: usize) {
             },
             Term::Ret(v) => {
                 if let (Some(v), Some(slot)) = (v, result_slot) {
-                    f.blocks[nb].insts.push(Inst {
-                        dst: None,
-                        ty: ret_ty,
-                        op: Op::Store { addr: slot, val: mv(*v) },
-                    });
+                    // The `ret` of the callee: its own position, not the
+                    // caller's.
+                    f.blocks[nb].insts.push(Inst::like(
+                        None,
+                        ret_ty,
+                        Op::Store { addr: slot, val: mv(*v) },
+                        b.insts.last().map(|x| x.loc).unwrap_or(call_loc),
+                    ));
                 }
                 Term::Br(cont)
             }

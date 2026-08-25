@@ -609,16 +609,19 @@ fn emit_check_branch(
         site_label
     ));
     e.cold_raw(&format!("{}:", site_label));
+    // ROUND 94: the panic arm is the code of the same source line as the
+    // operation it belongs to -- it only stands behind the `ret`.
+    e.cold_loc_here();
     let mut cold = std::mem::take(&mut e.cold);
     // The failure arm reloads the two originals instead of finding them on
     // the stack. `restore` writes into `e.out`, so it is caught and moved
     // over -- that keeps every caller's loading code (and only its loading
     // code) usable here without a second implementation of it.
-    let mut tmp = Emitter { out: String::new(), cold: String::new(), xmm: Default::default(), debug_funcs: Vec::new() };
+    let mut tmp = Emitter::default();
     restore(&mut tmp);
     cold.push_str(&tmp.out);
     e.cold = cold;
-    let mut arm = Emitter { out: String::new(), cold: String::new(), xmm: Default::default(), debug_funcs: Vec::new() };
+    let mut arm = Emitter::default();
     emit_trampoline_jump(&mut arm, panic_code_of(op), &label, msg, "rdx", "rcx", !ty.signed());
     e.cold.push_str(&arm.out);
 }
@@ -649,7 +652,8 @@ pub(crate) fn emit_checked_div(
     let cold_arm = |e: &mut Emitter, lbl: &str, code: u64, msg: &str, unsigned: bool| {
         let label = intern(msg);
         e.cold_raw(&format!("{}:", lbl));
-        let mut tmp = Emitter { out: String::new(), cold: String::new(), xmm: Default::default(), debug_funcs: Vec::new() };
+        e.cold_loc_here();
+        let mut tmp = Emitter::default();
         restore(&mut tmp);
         emit_trampoline_jump(&mut tmp, code, &label, msg, "rdx", "rcx", unsigned);
         let arm = tmp.out;
@@ -774,7 +778,10 @@ pub(crate) fn emit_checked_cast(
     }
     let label = intern(msg);
     e.cold_raw(&format!("{}:", site_label));
-    let mut tmp = Emitter { out: String::new(), cold: String::new(), xmm: Default::default(), debug_funcs: Vec::new() };
+    // ROUND 94: the panic arm is the code of the same source line as the
+    // operation it belongs to -- it only stands behind the `ret`.
+    e.cold_loc_here();
+    let mut tmp = Emitter::default();
     restore(&mut tmp);
     // A cast has ONE value; the message never prints "b=" for it, the
     // repeated number is a harmless redundancy (see the module note).

@@ -182,6 +182,16 @@
 #      neither an entry point nor a collector, and both spellings of the
 #      text type pull in the same runtime and name the same canonical type
 #      in an error message.
+#  53. THE TEST RUNNER AND THE LINE TABLE (round 94,
+#      tools/testrunner/run.sh): `#[test]` functions found by the compiler,
+#      run one process per case, reported as JSON and as TAP with name,
+#      outcome, duration and file:line:column. Counter-checks: the case
+#      after a crashing one is still in the report (without isolation it
+#      would not be), a file without a test case is refused, a file with a
+#      `main` of its own is refused, a wrong signature is refused, and the
+#      same file is core language for BOTH compilers. Section 25
+#      (tools/dwarf/run.sh) grew the second half of the round: the line
+#      table is held against the panic message the program prints itself.
 #  10. DOM soak run (tools/dom_soak/run.sh): the DOM prototype in Firn builds
 #      real cycles continuously (parent/child, listener, JS wrapper) and must
 #      not grow while doing so; the deliberately leaking counter-check with
@@ -1205,6 +1215,26 @@ if [ "$PHRC" -eq 0 ]; then
 else
     bad "tools/phi/run.sh failed (see .test-work/phi.log)"
     grep -E '^  FAIL|^phi:' "$WORK/phi.log" | head -12 | sed 's/^/   /'
+fi
+
+echo "== 53. the test runner and the line table (ROUND 94) =="
+# Two things of item 4 of ACCEPTANCE.md, both measured and not claimed:
+#   * `firnc --test` finds `#[test]` functions, runs each of them in a
+#     process of its own and reports JSON/TAP with name, outcome, duration
+#     and file:line:column. A case that crashes does not take the runner
+#     with it -- the case after it is in the report.
+#   * the LINE TABLE agrees with the program's own panic message, at every
+#     build level, even for a function the optimizer embedded in its caller.
+#     Before this round an optimized build attributed everything to the line
+#     of the `fn` (tools/dwarf/run.sh sections 7 and 8).
+bash tools/testrunner/run.sh > "$WORK/testrunner.log" 2>&1 && TRRC=0 || TRRC=$?
+if [ "$TRRC" -eq 0 ]; then
+    ok
+    grep -E '^   (case |total|the case after|firnc1|tools/testrunner)' "$WORK/testrunner.log" | head -8 | sed 's/^/   /'
+    tail -1 "$WORK/testrunner.log" | sed 's/^/   /'
+else
+    bad "tools/testrunner/run.sh failed (see .test-work/testrunner.log)"
+    grep FAIL "$WORK/testrunner.log" | head -10 | sed 's/^/   /'
 fi
 
 # ROUND K3. Sections 53 and 54 belong to the rounds running in parallel;

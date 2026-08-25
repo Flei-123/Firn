@@ -124,7 +124,6 @@ pub(crate) struct Lower<'a> {
     /// over 8 bytes (see `abi.rs`).
     pub(crate) sret: Option<Val>,
     /// Source line assigned to the next instruction produced.
-    pub(crate) pending_line: Option<(u32, u32)>,
     /// Round 64: are the parameters through? Everything declared after that
     /// is a local variable and gets `DW_TAG_variable` instead of
     /// `DW_TAG_formal_parameter`.
@@ -194,34 +193,33 @@ impl<'a> Lower<'a> {
     }
 
     pub(crate) fn push(&mut self, ty: FTy, op: Op) -> Val {
-        self.note_here();
         self.f.push(self.cur, ty, op)
     }
 
     pub(crate) fn push_void(&mut self, ty: FTy, op: Op) {
-        self.note_here();
         self.f.push_void(self.cur, ty, op)
     }
 
-    /// Assigns the source line of the running statement to the next
-    /// instruction (for `.debug_line`, see `dwarf.rs`).
-    fn note_here(&mut self) {
-        if let Some((file, line)) = self.pending_line.take() {
-            let idx = self.f.blocks[self.cur as usize].insts.len() as u32;
-            dwarf::note(&self.fname, self.cur, idx, file, line);
+    /// ROUND 94 -- the source position every instruction pushed from here on
+    /// carries (`fir::Loc`). Set per statement and per expression; the
+    /// instruction takes it along wherever the optimizer later moves it.
+    pub(crate) fn set_loc(&mut self, sp: Span) {
+        if !sp.is_none() {
+            self.f.loc_stamp = crate::fir::Loc { file: sp.file, line: sp.line, col: sp.col };
         }
     }
 
-    /// `alloca` in the entry block. The insertion place shifts the notes of the
-    /// line table, which is why every alloca runs through this wrapper.
+    /// `alloca` in the entry block.
+    ///
+    /// ROUND 94: an `alloca` is bookkeeping of the frame, not a statement of
+    /// the program. It gets NO position -- otherwise the whole prologue would
+    /// claim the line of whatever statement happened to need a slot, and a
+    /// breakpoint on that line would stop in the prologue.
     pub(crate) fn alloca(&mut self, size: u64, align: u64) -> Val {
-        let at = self.f.blocks[0]
-            .insts
-            .iter()
-            .take_while(|i| matches!(i.op, Op::Alloca { .. }))
-            .count() as u32;
+        let keep = self.f.loc_stamp;
+        self.f.loc_stamp = crate::fir::Loc::NONE;
         let v = self.f.alloca(size, align);
-        dwarf::shift_after_insert(&self.fname, 0, at);
+        self.f.loc_stamp = keep;
         v
     }
 
@@ -644,7 +642,14 @@ impl<'a> Lower<'a> {
             return self.err(e.span, "expression nested too deeply");
         }
         self.depth += 1;
+        // ROUND 94: the position of the EXPRESSION, not only of the
+        // statement. That is what makes the line table agree with the panic
+        // messages, which have carried file:line:column since round 72 --
+        // `tools/dwarf/run.sh` measures exactly that agreement.
+        let keep = self.f.loc_stamp;
+        self.set_loc(e.span);
         let r = self.lower_expr_inner(e);
+        self.f.loc_stamp = keep;
         self.depth -= 1;
         // ROUND 71 — the counterpart to the widening in `sema::expr`. The
         // type checker has noted THAT it happens, here it really happens:
@@ -1517,10 +1522,10 @@ impl<'a> Lower<'a> {
     fn lower_stmt(&mut self, s: &Stmt) -> Option<()> {
         let sp = s.span();
         if !sp.is_none() {
-            self.pending_line = Some((sp.file, sp.line));
-            // ROUND 64: `pending_line` is CONSUMED by the first instruction
-            // of the statement; `declare_ty` runs after it and would find
-            // nothing. `decl_line` stays.
+            // ROUND 94: the stamp stays until the next statement sets it --
+            // every instruction of this statement carries it, not only the
+            // first one (`fir::Loc`).
+            self.set_loc(sp);
             self.decl_line = Some((sp.file, sp.line));
         }
         match s {
@@ -1976,7 +1981,7 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
         loops: Vec::new(),
             defers: Vec::new(),
         sret: None,
-        pending_line: None,
+
         params_done: false,
         decl_line: None,
     };

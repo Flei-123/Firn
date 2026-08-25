@@ -10,6 +10,7 @@ mod ast_canon;
 mod layout_canon;
 mod atomic;
 mod thread;
+mod testrun;
 mod attrs;
 mod codegen_a64;
 mod codegen_switch;
@@ -112,6 +113,15 @@ struct Options {
     only_object: bool,
     /// **ROUND 82** — `--timings`: wall clock per phase to stderr.
     timings: bool,
+    /// **ROUND 94** — `--test`: the entry point of the binary is the test
+    /// runner, not the program's own `main` (`testrun.rs`).
+    test_mode: bool,
+    /// Output format of the runner: JSON (default) or TAP.
+    test_format: testrun::Format,
+    /// Time limit per case in seconds; 0 = none.
+    test_limit: u32,
+    /// `--no-run`: build the test binary, do not start it.
+    no_run: bool,
 }
 
 /// **ROUND 82** — the wall clock per compiler phase (`--timings`).
@@ -202,6 +212,10 @@ fn usage() -> String {
          --strlit=<lit>     decode a string literal (\"..\", b\"..\", u\"..\")\n  \
          --stats            print the size of the FIR (instructions/blocks)\n  \
          --timings          wall clock per compiler phase (ROUND 82)\n  \
+         --test             build and RUN the test cases (#[test], ROUND 94)\n  \
+         --format=json|tap  report of --test (default: json)\n  \
+         --test-limit=<s>   time limit per case in seconds (default 30, 0 = none)\n  \
+         --no-run           with --test: only build, do not run\n  \
          --keep-asm         keep the generated .s file\n  \
          --version          print the version\n  \
          -h, --help         this help\n",
@@ -227,6 +241,10 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut optcfg = opt::OptConfig::default();
     let mut only_object = false;
     let mut timings = false;
+    let mut test_mode = false;
+    let mut test_format = testrun::Format::Json;
+    let mut test_limit: u32 = 30;
+    let mut no_run = false;
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -307,6 +325,22 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             "--keep-asm" => keep_asm = true,
             "--stats" => stats = true,
             "--timings" => timings = true,
+            "--test" => test_mode = true,
+            "--no-run" => no_run = true,
+            _ if a.starts_with("--format=") => {
+                let v = &a["--format=".len()..];
+                match testrun::Format::from_str(v) {
+                    Some(fm) => test_format = fm,
+                    None => return Err(format!("unknown format '{}' (json, tap)", v)),
+                }
+            }
+            _ if a.starts_with("--test-limit=") => {
+                let v = &a["--test-limit=".len()..];
+                match v.parse::<u32>() {
+                    Ok(n) => test_limit = n,
+                    Err(_) => return Err(format!("'--test-limit={}' is no number", v)),
+                }
+            }
             "-o" => {
                 i += 1;
                 match args.get(i) {
@@ -383,6 +417,10 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         optcfg,
         only_object,
         timings,
+        test_mode,
+        test_format,
+        test_limit,
+        no_run,
     })
 }
 
@@ -677,6 +715,66 @@ fn run(opts: &Options) -> i32 {
         }
     }
 
+    // --- ROUND 94: `--test` -- the runner becomes the entry point --------
+    //
+    // The same shape as the `comptime` injection above, and for the same
+    // reason: source text that arises DURING the compilation is lexed,
+    // parsed and appended, after which the type checker sees no difference
+    // to hand written text. What is generated here is the runtime half
+    // (`lib/test/runner.fi`, embedded) plus one `main` that names every
+    // `#[test]` function with its position.
+    if opts.test_mode && !dg.has_errors() {
+        let found = testrun::tests_of(&prog);
+        if found.is_empty() {
+            eprintln!(
+                "error: no '#[test]' function in '{}' -- nothing to run",
+                path.display()
+            );
+            return 2;
+        }
+        // Only cases with the right signature; a wrong one is reported by
+        // the type checker below, and generating a call to it would produce a
+        // SECOND error about generated text the programmer never wrote.
+        let cases: Vec<&crate::ast::FnDecl> = found
+            .into_iter()
+            .filter(|f| f.params.is_empty() && f.ret.is_none() && f.extern_info.is_none())
+            .collect();
+        if let Some(m) = prog.funcs.iter().find(|f| f.name == "main") {
+            // The runner IS the entry point. Two of them would be a linker
+            // error a hundred lines further down, with no mention of --test.
+            dg.error(
+                m.span,
+                "with '--test' the entry point is the test runner -- this file must not declare 'main' itself",
+            );
+            return report(&dg);
+        }
+        let names: Vec<String> = cases
+            .iter()
+            .map(|c| dg.file_name(c.span.file).to_string())
+            .collect();
+        let src = testrun::harness(&cases, &names, opts.test_format, opts.test_limit);
+        let count = cases.len();
+        let file = dg.add_file("<test runner>", &src);
+        dwarf::add_file("<test runner>");
+        let toks = lexer::lex_file(&src, file, &mut dg);
+        let mut extra = parser::parse(&toks, &mut dg);
+        let mut next = prog.expr_count;
+        for f in extra.funcs.iter_mut() {
+            crate::mono::renumber_block(&mut f.body, &mut next);
+        }
+        for c in extra.consts.iter_mut() {
+            crate::mono::renumber_expr(&mut c.value, &mut next);
+        }
+        prog.expr_count = next;
+        prog.funcs.extend(extra.funcs);
+        prog.structs.extend(extra.structs);
+        prog.consts.extend(extra.consts);
+        prog.statics.extend(extra.statics);
+        if opts.stats {
+            eprintln!("test: {} cases", count);
+        }
+    }
+
     tm.mark("comptime");
     // --- Monomorphization of generic templates (module types) ---
     mono::expand(&mut prog, &mut dg);
@@ -828,7 +926,16 @@ fn run(opts: &Options) -> i32 {
         .output
         .clone()
         .or_else(|| target_out_manifest.clone())
-        .unwrap_or_else(|| default_output(path));
+        .unwrap_or_else(|| {
+            // ROUND 94: a test binary is not the program, so it does not take
+            // the program's name -- `x.fi` becomes `x.test`.
+            let d = default_output(path);
+            if opts.test_mode {
+                d.with_extension("test")
+            } else {
+                d
+            }
+        });
     if opts.emit == Emit::Asm {
         if let Err(e) = std::fs::write(&out, asm.as_bytes()) {
             eprintln!("error: cannot write '{}': {}", out.display(), e);
@@ -874,6 +981,23 @@ fn run(opts: &Options) -> i32 {
         let _ = std::fs::remove_file(&asm_path);
     }
     tm.print();
+    // ROUND 94: `firnc --test x.fi` builds AND runs, like every other test
+    // runner. The exit code is the runner's own (0 = everything passed), so
+    // a build server needs nothing but this one command.
+    if opts.test_mode && !opts.no_run {
+        let exe = if out.is_absolute() {
+            out.clone()
+        } else {
+            std::path::PathBuf::from(".").join(&out)
+        };
+        match Command::new(&exe).status() {
+            Ok(s) => return s.code().unwrap_or(70),
+            Err(e) => {
+                eprintln!("error: cannot start '{}': {}", exe.display(), e);
+                return 2;
+            }
+        }
+    }
     0
 }
 
