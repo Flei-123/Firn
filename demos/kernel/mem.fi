@@ -23,6 +23,8 @@
 
 import serial
 import kstate
+import atomic
+import cpu
 
 export {
     scan, frame_alloc, frame_free, frame_run, frames_free,
@@ -162,8 +164,42 @@ fn frames_free(state: u64) -> u64 {
     return kstate.get(state, kstate.FRAMES_FREE)
 }
 
+// ------------------------------------------------------------ round K5
+//
+// THE ALLOCATOR IS SHARED AND THEREFORE LOCKED. `frame_alloc` is three
+// steps -- find a free bit, set it, count the free frames down -- and two
+// cores that run them at the same time both find the SAME bit and both
+// come back with the same frame. Nothing reports it; two parts of the
+// kernel simply write into one page from then on. `tools/kernel/run.sh`
+// measures exactly this: every core takes sixteen frames, and with
+// `nolock` the same frame comes back twice.
+//
+// Interrupts are turned off around the lock, not for the other cores --
+// that is what the lock is for -- but for this core's own handlers: a
+// timer interrupt that landed inside the critical section and asked for
+// the same lock would wait for a lock its own core holds.
+fn lock(state: u64) -> u64 {
+    let flags: u64 = asm("pushfq\npop rax\ncli", out("rax"))
+    atomic.lock_take(state, atomic.L_FRAME, cpu.here(state))
+    return flags
+}
+
+fn unlock(state: u64, flags: u64) {
+    atomic.lock_give(state, atomic.L_FRAME)
+    if (flags & 0x200) != 0 {
+        asm("sti")
+    }
+}
+
 // One frame. 0 = nothing free any more.
 fn frame_alloc(state: u64) -> u64 {
+    let flags: u64 = lock(state)
+    let r: u64 = frame_alloc_inner(state)
+    unlock(state, flags)
+    return r
+}
+
+fn frame_alloc_inner(state: u64) -> u64 {
     let bitmap: u64 = kstate.get(state, kstate.BITMAP)
     let frames: u64 = kstate.get(state, kstate.BITMAP_FRAMES)
     var f: u64 = 0
@@ -185,6 +221,12 @@ fn frame_alloc(state: u64) -> u64 {
 }
 
 fn frame_free(state: u64, addr: u64) {
+    let flags: u64 = lock(state)
+    frame_free_inner(state, addr)
+    unlock(state, flags)
+}
+
+fn frame_free_inner(state: u64, addr: u64) {
     let bitmap: u64 = kstate.get(state, kstate.BITMAP)
     let f: u64 = addr / FRAME_SIZE
     if f >= kstate.get(state, kstate.BITMAP_FRAMES) {
@@ -198,6 +240,13 @@ fn frame_free(state: u64, addr: u64) {
 
 // `n` frames in a row -- the heap wants a contiguous region.
 fn frame_run(state: u64, n: u64) -> u64 {
+    let flags: u64 = lock(state)
+    let r: u64 = frame_run_inner(state, n)
+    unlock(state, flags)
+    return r
+}
+
+fn frame_run_inner(state: u64, n: u64) -> u64 {
     let bitmap: u64 = kstate.get(state, kstate.BITMAP)
     let frames: u64 = kstate.get(state, kstate.BITMAP_FRAMES)
     var start: u64 = 0
@@ -251,6 +300,13 @@ fn heap_init(state: u64, base: u64, size: u64) {
 
 // First fit. Returns the address of the payload, 0 when nothing fits.
 fn kalloc(state: u64, want: u64) -> u64 {
+    let flags: u64 = lock(state)
+    let r: u64 = kalloc_inner(state, want)
+    unlock(state, flags)
+    return r
+}
+
+fn kalloc_inner(state: u64, want: u64) -> u64 {
     let base: u64 = kstate.get(state, kstate.HEAP_BASE)
     let end: u64 = kstate.get(state, kstate.HEAP_END)
     var need: u64 = (want + 15) / 16 * 16 + HEADER
@@ -281,6 +337,12 @@ fn kalloc(state: u64, want: u64) -> u64 {
 // forwards is enough as long as `kfree` walks the whole chain -- and it
 // costs no back pointer per block.
 fn kfree(state: u64, p: u64) {
+    let flags: u64 = lock(state)
+    kfree_inner(state, p)
+    unlock(state, flags)
+}
+
+fn kfree_inner(state: u64, p: u64) {
     if p == 0 {
         return
     }

@@ -1,0 +1,242 @@
+// demos/kernel/atomic.fi -- round K5: the instructions a SECOND processor
+// makes necessary, and the lock built out of them.
+//
+// Everything this kernel did up to round K2 rested on one sentence that
+// stands in `kstate.fi` in as many words: "NOT atomic -- it does not have
+// to be: the kernel runs on one processor". From this round on that
+// sentence is false. Two processors execute `read - add - write` at the
+// same time, both read the same old value, both write the same new one,
+// and one of the two increments is gone. Nothing reports it; the counter
+// is simply too small afterwards. That is the bug this file exists
+// against, and `tools/kernel/run.sh` section "smp" MEASURES it: the same
+// stress test runs once with the lock and once without, and without it
+// the number has to come out wrong.
+//
+// WHAT FIRN ALREADY HAD. Two primitives, both from the rounds that
+// brought the collector and the threads, both a single instruction:
+//
+//     __atomic_add(p, delta)          -> old value   `lock xadd`
+//     __atomic_swap(p, expect, want)  -> old value   `lock cmpxchg`
+//
+// Round 47 wrote about the first one: "Firn has no threads at stage 0, so
+// the difference is NOT measurable today by a two-thread run; it is
+// provable at the emitted instruction." This round is the two-thread run.
+// Nothing had to be added to the language for it -- which is the honest
+// answer to "does Firn need new building blocks for SMP": no, it needed
+// the two it already has, and a file that uses them correctly.
+//
+// WHAT AN ATOMIC LOAD AND STORE ARE HERE. On x86-64 an ALIGNED 64-bit
+// read or write is atomic in the hardware (SDM volume 3, 8.1.1) -- it
+// cannot be seen half done. What it is not is safe from the COMPILER,
+// which may hoist it out of a loop or drop it entirely. That is exactly
+// what the MMIO forms of round 52 are for: one memory access per source
+// line, never moved, never merged, never removed. So `load` and `store`
+// below are `__mmio_read64`/`__mmio_write64` and nothing else, and the
+// pair is a correct atomic load/store on this architecture. On a machine
+// with a weaker memory model it would not be, and then this file is the
+// one place that has to change.
+//
+// THE LOCK. A test-and-set spin lock: `lock cmpxchg` from 0 to the owner,
+// a plain store back to 0. The store is enough because x86-64 does not
+// move a store ahead of an older store (TSO) -- everything the holder
+// wrote is visible before the lock reads as free. `pause` in the waiting
+// loop is not decoration either: it tells the processor that this is a
+// spin loop, which saves the pipeline flush on leaving it and costs a
+// hyper-thread sibling much less.
+
+import serial
+import kstate
+
+export {
+    cas, fetch_add, fetch_sub, load, store, pause, barrier,
+    lock_init, lock_take, lock_give, lock_try, lock_owner,
+    lock_takes, lock_spins, lock_total_spins,
+    off, mask, set_off,
+    L_SCHED, L_FRAME, L_FS, L_CONSOLE, L_STRESS, L_BOOT
+}
+
+// ------------------------------------------------------- the primitives
+
+// Compare and swap. Writes `want` if the word holds `expect`, and returns
+// what the word held BEFORE -- so `cas(p, a, b) == a` means it worked.
+fn cas(p: u64, expect: u64, want: u64) -> u64 {
+    return __atomic_swap(p as *mut u64, expect, want)
+}
+
+// Add and return the OLD value.
+fn fetch_add(p: u64, delta: u64) -> u64 {
+    return __atomic_add(p as *mut u64, delta)
+}
+
+// Subtraction is the addition of the two's complement -- `-%` is the
+// wrapping form of round 72, and it is meant here.
+fn fetch_sub(p: u64, delta: u64) -> u64 {
+    return __atomic_add(p as *mut u64, 0 -% delta)
+}
+
+// See the head of the file: aligned, single, unmovable.
+fn load(p: u64) -> u64 {
+    return __mmio_read64(p as *mut u64)
+}
+
+fn store(p: u64, v: u64) {
+    __mmio_write64(p as *mut u64, v)
+}
+
+fn pause() {
+    asm("pause")
+}
+
+// A full fence. Needed in exactly one place -- between "I am online" and
+// the first read of shared state on a processor that has just come up --
+// and named here so that the place is findable.
+fn barrier() {
+    asm("mfence")
+}
+
+// ------------------------------------------------------------ the locks
+
+// Which lock is which. Every one of them protects a NAMED data structure,
+// and the order in this list is the order in which they may be taken --
+// a processor that holds L_SCHED may take L_FRAME, never the other way
+// round. That rule is what keeps two processors from waiting on each
+// other for ever.
+const L_SCHED: u64 = 0 // the task table and the run queue
+const L_FRAME: u64 = 1 // the frame bitmap and the heap
+const L_FS: u64 = 2 // the file system and the block layer
+const L_CONSOLE: u64 = 3 // a line of serial output stays a line
+const L_STRESS: u64 = 4 // the counter of the stress test
+const L_BOOT: u64 = 5 // bringing one application processor up
+
+// Fields of a lock. It gets 64 octets of its own -- one cache line --
+// because two locks in one line would make every processor that takes
+// the first one steal the line from the holder of the second.
+const OWNER: u64 = 0 // 0 = free, otherwise processor index + 1
+const TAKES: u64 = 8 // how often it was taken
+const SPINS: u64 = 16 // turns of the waiting loop spent on it
+
+// A processor that waits this long is not waiting any more, it is stuck.
+// Saying so beats a run that dies at the time limit with no output.
+const STUCK: u64 = 60000000
+
+fn slot(state: u64, id: u64) -> u64 {
+    return state + kstate.LOCK_OFF + id * kstate.LOCK_BYTES
+}
+
+fn lock_init(state: u64, id: u64) {
+    store(slot(state, id) + OWNER, 0)
+    store(slot(state, id) + TAKES, 0)
+    store(slot(state, id) + SPINS, 0)
+}
+
+// THE SWITCH FOR THE COUNTER-CHECK. One BIT PER LOCK, not one flag for
+// all of them, and the reason is worth writing down: switching every lock
+// off at once does not produce a measurement, it produces a kernel that
+// dies somewhere before it can print one. `nolock` on the command line
+// therefore switches off exactly the two locks whose absence is being
+// measured -- the frame allocator and the counter of the stress test --
+// and leaves the run queue lock alone, so that the machine survives long
+// enough to say what went wrong. `nolockall` switches off that one too,
+// and THAT run is not supposed to survive; its counter-check is the exit
+// code.
+fn off(state: u64, id: u64) -> bool {
+    return (kstate.get(state, kstate.SMP_OFF + kstate.SMP_NOLOCK)
+        &(1 << id)) != 0
+}
+
+fn mask(state: u64) -> u64 {
+    return kstate.get(state, kstate.SMP_OFF + kstate.SMP_NOLOCK)
+}
+
+fn set_off(state: u64, v: u64) {
+    kstate.set(state, kstate.SMP_OFF + kstate.SMP_NOLOCK, v)
+}
+
+// `who` is the index of the processor, counted from zero; what goes into
+// the word is one more, so that zero can keep meaning "free".
+fn lock_take(state: u64, id: u64, who: u64) {
+    if off(state, id) {
+        return
+    }
+    let a: u64 = slot(state, id)
+    var spins: u64 = 0
+    while cas(a + OWNER, 0, who + 1) != 0 {
+        pause()
+        spins = spins + 1
+        if spins > STUCK {
+            stuck(state, id)
+        }
+    }
+    fetch_add(a + TAKES, 1)
+    if spins > 0 {
+        fetch_add(a + SPINS, spins)
+    }
+}
+
+// One attempt, no waiting. True when the lock is now held by `who`.
+fn lock_try(state: u64, id: u64, who: u64) -> bool {
+    if off(state, id) {
+        return true
+    }
+    let a: u64 = slot(state, id)
+    if cas(a + OWNER, 0, who + 1) != 0 {
+        return false
+    }
+    fetch_add(a + TAKES, 1)
+    return true
+}
+
+fn lock_give(state: u64, id: u64) {
+    if off(state, id) {
+        return
+    }
+    store(slot(state, id) + OWNER, 0)
+}
+
+fn lock_owner(state: u64, id: u64) -> u64 {
+    return load(slot(state, id) + OWNER)
+}
+
+fn lock_takes(state: u64, id: u64) -> u64 {
+    return load(slot(state, id) + TAKES)
+}
+
+fn lock_spins(state: u64, id: u64) -> u64 {
+    return load(slot(state, id) + SPINS)
+}
+
+fn lock_total_spins(state: u64) -> u64 {
+    var i: u64 = 0
+    var n: u64 = 0
+    while i < kstate.LOCK_COUNT {
+        n = n + lock_spins(state, i)
+        i = i + 1
+    }
+    return n
+}
+
+// A lock nobody gives back. The machine is finished either way; the
+// difference is whether the log says why.
+fn stuck(state: u64, id: u64) {
+    var s_head: [u8; 16] = "lock: stuck id=\0"
+    var s_owner: [u8; 9] = "  owner=\0"
+    var s_all: [u8; 3] = "  \0"
+    var s_eq: [u8; 2] = "=\0"
+    serial.puts((&s_head[0]) as u64)
+    serial.dec(id)
+    serial.puts((&s_owner[0]) as u64)
+    serial.dec(lock_owner(state, id))
+    var i: u64 = 0
+    while i < kstate.LOCK_COUNT {
+        serial.puts((&s_all[0]) as u64)
+        serial.dec(i)
+        serial.puts((&s_eq[0]) as u64)
+        serial.dec(lock_owner(state, i))
+        i = i + 1
+    }
+    serial.nl()
+    while true {
+        asm("cli")
+        asm("hlt")
+    }
+}
