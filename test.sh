@@ -13,6 +13,14 @@
 #   4. Every program in tests/neg/ has to stop with an exit code != 0 and print
 #      the expected message with a line:column (// expect_error: L:C TEXT).
 #      A Rust panic counts as a failure.
+#  60. THE SAME LIST, ASKED OF BOTH COMPILERS (tools/reject/run.sh, round 96):
+#      every program in tests/neg/ has to be refused by `firnc1` as well, and
+#      where `firnc1` says something it has to say exactly what `firnc0` says
+#      -- compared with `cmp`, the marker included. Until round 96 nothing
+#      compared what the two compilers REFUSE; `firnc1` translated
+#      `const A` declared twice without a word and took the first of the two
+#      values, which is how a kernel came to write its tables outside its
+#      data area (docs/ROUND96.md).
 #   5. Proof of the optimiser (test_opt.sh: FIR before/after).
 #   6. Proof of the result-location guarantee (tools/result_location/run.sh:
 #      frame sizes in the emitted assembly).
@@ -1348,6 +1356,18 @@ if [ "$B1RC" -eq 0 ]; then
 else
     bad "tools/domb1/run.sh failed (see .test-work/domb1.log)"
     grep -E '^   (ERROR|FAILED)|^ *>>' "$WORK/domb1.log" | head -12 | sed 's/^/   /'
+fi
+
+echo "== 60. what the two compilers REFUSE, compared (tools/reject/run.sh, ROUND 96) =="
+# The number 60 is fixed for this round. Sections 53 to 59 belong to the
+# rounds that were running next to it.
+bash tools/reject/run.sh > "$WORK/reject.log" 2>&1 && RJRC=0 || RJRC=$?
+grep -E '^(CORPUS|SAME|SILENT|NOT CORE|SWALLOWED|WORDING|REFUSED BY BOTH):' "$WORK/reject.log" | sed 's/^/   /'
+if [ "$RJRC" -eq 0 ]; then
+    ok
+else
+    bad "tools/reject/run.sh failed (see .test-work/reject.log)"
+    grep -E '^FAIL' "$WORK/reject.log" | head -12 | sed 's/^/   /'
 fi
 
 TOTAL=$((PASS + FAIL))
