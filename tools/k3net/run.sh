@@ -90,6 +90,8 @@ trap cleanup EXIT
 
 pass=0
 fail=0
+STEP=$SECONDS
+lap() { local d=$((SECONDS - STEP)); STEP=$SECONDS; printf '%s' "$d"; }
 ok()  { pass=$((pass+1)); printf '  OK    %s\n' "$1"; }
 bad() { fail=$((fail+1)); printf '  FAIL  %s\n' "$1"; }
 num() { printf '        %s\n' "$1"; }
@@ -330,21 +332,27 @@ PYEOF
 
     # --- 3f. tc netem, both directions --------------------------------
     #
-    # `netem` gets read back rather than trusted: the number of frames it
-    # threw away is its own counter, and a run in which it dropped nothing
-    # proves nothing about retransmission. Ten per cent over ~190 frames
-    # makes "it dropped none" a one-in-a-billion event; the counter is
-    # printed either way, so a reader can see which it was.
+    # A NOTE ON netem's OWN COUNTER, because it is a trap: the `dropped`
+    # number in `tc -s qdisc show` does NOT count the frames the loss
+    # model threw away -- it counts the ones the queue could not hold. At
+    # `loss 20 %` over 185 frames it reads 2. So it is printed for
+    # information and NOT used as the gate. What is used as the gate is
+    # what the loss actually causes and what this round is about: holes in
+    # the receive stream that had to be reassembled, and retransmissions
+    # that had to go out. Both are counters inside lib/net/, both are zero
+    # on a clean wire, and the runs above prove they are (out_of_order 0,
+    # rexmit 0 without netem).
     netem_drops() { # namespace interface
         ip netns exec "$1" tc -s qdisc show dev "$2" 2>/dev/null \
             | tr ',()' '   ' | awk '/dropped/{for(i=1;i<=NF;i++) if($i=="dropped"){print $(i+1)+0; exit}}'
     }
     head -c $((LOSSKB * 1024)) "$W/in.bin" > "$W/small.bin"
 
-    if ! L tc qdisc add dev "$LIF" root netem loss 10% 2>"$W/tc1.err"; then
+    if ! L tc qdisc add dev "$LIF" root netem loss 20% 2>"$W/tc1.err"; then
         echo "  (tc netem is not available: $(head -1 "$W/tc1.err") -- the loss measurement is skipped)"
     else
-        F sink 4711 $((LOSSKB * 1024)) 60 > "$W/lossin.out" 2>&1 &
+        STEP=$SECONDS
+        F sink 4711 $((LOSSKB * 1024)) 25 > "$W/lossin.out" 2>&1 &
         DRV=$!
         sleep 0.7
         L timeout 60 nc -q 3 "$FIP" 4711 < "$W/small.bin" > /dev/null 2>&1
@@ -354,19 +362,20 @@ PYEOF
         L tc qdisc del dev "$LIF" root >/dev/null 2>&1
         n=$(val "$W/lossin.out" octets)
         ooo=$(val "$W/lossin.out" out_of_order)
-        if [ "$LRC" -eq 0 ] && [ "${n:-0}" = "$((LOSSKB * 1024))" ] && [ "${DIN:-0}" -gt 0 ] && [ "${ooo:-0}" -gt 0 ]; then
-            ok "10 % of the frames from Linux dropped: all $LOSSKB KiB arrive, in order"
-            num "netem threw away ${DIN:-0} frames, out-of-order segments reassembled: $ooo"
+        if [ "$LRC" -eq 0 ] && [ "${n:-0}" = "$((LOSSKB * 1024))" ] && [ "${ooo:-0}" -gt 0 ]; then
+            ok "20 % of the frames from Linux dropped: all $LOSSKB KiB arrive, in order"
+            num "out-of-order segments reassembled: $ooo, throughput $(val "$W/lossin.out" kb_per_s) KB/s against $(val "$W/sink.out" kb_per_s) KB/s on a clean wire, $(lap) s"
         else
-            bad "netem in: ${n:-0} of $((LOSSKB * 1024)) octets, netem dropped ${DIN:-0}, out of order ${ooo:-0}"
+            bad "netem in: ${n:-0} of $((LOSSKB * 1024)) octets, out of order ${ooo:-0} (netem queue drops ${DIN:-0})"
             sed 's/^/        /' "$W/lossin.out"
         fi
 
-        ip netns exec "$FNS" tc qdisc add dev "$FIF" root netem loss 10% >/dev/null 2>&1
+        ip netns exec "$FNS" tc qdisc add dev "$FIF" root netem loss 20% >/dev/null 2>&1
         L python3 "$W/echo_srv.py" "$LIP" 9001 tcp > "$W/py2.out" 2>&1 &
         PY=$!
         sleep 0.9
-        F send "$LIP" 9001 $((LOSSKB * 1024)) 50 > "$W/lossout.out" 2>&1
+        STEP=$SECONDS
+        F send "$LIP" 9001 $((LOSSKB * 1024)) 25 > "$W/lossout.out" 2>&1
         ORC=$?
         wait $PY 2>/dev/null
         DOUT=$(netem_drops "$FNS" "$FIF")
@@ -376,10 +385,10 @@ PYEOF
         frex=$(val "$W/lossout.out" fast_rexmit)
         tot=$(( ${rex:-0} + ${frex:-0} ))
         if [ "$ORC" -eq 0 ] && [ "${wr:-1}" = 0 ] && [ "${b:-0}" = "$((LOSSKB * 1024))" ] && [ "$tot" -gt 0 ]; then
-            ok "10 % of OUR frames dropped: the stack sends them again and everything arrives"
-            num "netem threw away ${DOUT:-0} frames; retransmissions: $rex on the timer, $frex on three duplicate acknowledgements"
+            ok "20 % of OUR frames dropped: the stack sends them again and everything arrives"
+            num "retransmissions: $rex on the timer, $frex on three duplicate acknowledgements, $(lap) s"
         else
-            bad "netem out: back ${b:-0} of $((LOSSKB * 1024)), wrong ${wr:-?}, netem dropped ${DOUT:-0}, retransmissions $tot"
+            bad "netem out: back ${b:-0} of $((LOSSKB * 1024)), wrong ${wr:-?}, retransmissions $tot (netem queue drops ${DOUT:-0})"
             sed 's/^/        /' "$W/lossout.out" "$W/py2.out" 2>/dev/null | head -12
         fi
 

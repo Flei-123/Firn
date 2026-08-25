@@ -27,7 +27,7 @@ throwing frames away.
 |---|---|
 | library | `lib/net/wire.fi` 492, `lib/net/tcp.fi` 1,555, `lib/net/stack.fi` 599 |
 | measurement | `tools/k3net/` — `unit.fi` 1,197, `drv.fi` 544, `link.fi` 154, `kprobe.fi` 70, `run.sh` 437 |
-| guard | `tools/k3net/run.sh`, 20 proofs, section 55 of `test.sh` |
+| guard | `tools/k3net/run.sh`, 20 proofs, 54 seconds, section 55 of `test.sh` |
 | profile | `kernel` — no allocator, no `syscall`, no runtime, checked by the compiler |
 
 ---
@@ -120,8 +120,8 @@ kernel hands out frames whose checksum it never computed and a stack that
 | `nc` through the echo | **1,048,576 octets there and back, md5 identical**, ~21 MB/s |
 | `curl http://10.7.0.2:8080/` | status line, headers and `Content-Length: 40` accepted by curl itself |
 | the stack connects **actively** to a python server | 1 MiB out, 1 MiB back, **0 wrong octets**, closed cleanly |
-| `tc netem loss 10 %` Linux → stack | all 256 KiB arrive **in order**, out-of-order segments reassembled |
-| `tc netem loss 10 %` stack → Linux | all 256 KiB arrive, recovered by fast retransmit and the timer |
+| `tc netem loss 20 %` Linux → stack | all 256 KiB arrive **in order**, 6 holes reassembled, 257 KB/s against 55,900 KB/s on a clean wire |
+| `tc netem loss 20 %` stack → Linux | all 256 KiB arrive, **7 retransmissions on the timer, 22 on three duplicate acknowledgements** |
 | UDP, 1400 octets there and back | returned reversed, checksums intact |
 
 The two throughput numbers differ for a reason worth naming: the first is
@@ -149,9 +149,10 @@ that has to collapse:
   connection stays in ESTABLISHED — and the same segment with an honest
   acknowledgement is **not** counted as a forgery.
 * **Without retransmission the transfer has to stay incomplete.** The
-  same run against the same python server under the same 10 % loss, with
-  retransmission switched off: it does not finish. Measured against the
-  Linux kernel, not simulated.
+  same run against the same python server under the same 20 % loss, with
+  retransmission switched off: **0 of 262,144 octets** come back and the
+  connection never closes. Measured against the Linux kernel, not
+  simulated.
 * **A port nobody listens on has to refuse.** `nc` to a closed port on
   the Firn stack fails; the stack sent a reset.
 * **A broken ICMP echo stays unanswered**, while the intact one is
@@ -262,6 +263,21 @@ Both ends were fixed: the driver never hands over a stale clock, and the
 library throws away a sample from a clock that went backwards instead of
 believing it. Round 72's checked arithmetic turned what would have been a
 quietly absurd round-trip estimate into a stack trace with a line number.
+
+**One trap worth writing down**, because it cost a green run: the
+`dropped` number in `tc -s qdisc show` does **not** count what netem's
+loss model threw away — it counts what the queue could not hold. At
+`loss 20 %` over 185 frames it reads 2. A test that gates on that number
+is measuring the wrong thing. What this script gates on instead are two
+counters inside `lib/net/` that are demonstrably **zero on a clean wire**
+in the very same run: holes in the receive stream that had to be
+reassembled, and retransmissions that had to go out.
+
+And one that cost five minutes per run rather than a green: three of the
+five modes of `tools/k3net/drv.fi` ended their loop by writing
+`now = t0 + limit_us`, and the last line of the same loop read the clock
+again and threw it away. Every case therefore sat out its full time limit
+after it was finished. A flag instead of a clock: **307 seconds → 54**.
 
 ---
 
