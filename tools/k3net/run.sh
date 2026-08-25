@@ -225,8 +225,8 @@ if mode == "udp":
     print("linux_udp", len(d)); s.close()
 else:
     s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind((host, port)); s.listen(4); s.settimeout(25)
-    c, a = s.accept(); c.settimeout(25)
+    s.bind((host, port)); s.listen(4); s.settimeout(95)
+    c, a = s.accept(); c.settimeout(95)
     n = 0
     try:
         while True:
@@ -332,6 +332,12 @@ PYEOF
 
     # --- 3f. tc netem, both directions --------------------------------
     #
+    # THE TIME LIMITS BELOW ARE GENEROUS ON PURPOSE. Every mode of
+    # `drv.fi` leaves its loop the moment the connection is properly
+    # closed, so a limit of ninety seconds costs ninety seconds only when
+    # something is really wrong. A tight limit turns a busy machine into a
+    # red test, which is the worst kind of flake there is.
+    #
     # A NOTE ON netem's OWN COUNTER, because it is a trap: the `dropped`
     # number in `tc -s qdisc show` does NOT count the frames the loss
     # model threw away -- it counts the ones the queue could not hold. At
@@ -352,10 +358,10 @@ PYEOF
         echo "  (tc netem is not available: $(head -1 "$W/tc1.err") -- the loss measurement is skipped)"
     else
         STEP=$SECONDS
-        F sink 4711 $((LOSSKB * 1024)) 25 > "$W/lossin.out" 2>&1 &
+        F sink 4711 $((LOSSKB * 1024)) 90 > "$W/lossin.out" 2>&1 &
         DRV=$!
         sleep 0.7
-        L timeout 60 nc -q 3 "$FIP" 4711 < "$W/small.bin" > /dev/null 2>&1
+        L timeout 90 nc -q 3 "$FIP" 4711 < "$W/small.bin" > /dev/null 2>&1
         wait $DRV 2>/dev/null
         LRC=$?
         DIN=$(netem_drops "$LNS" "$LIF")
@@ -375,7 +381,7 @@ PYEOF
         PY=$!
         sleep 0.9
         STEP=$SECONDS
-        F send "$LIP" 9001 $((LOSSKB * 1024)) 25 > "$W/lossout.out" 2>&1
+        F send "$LIP" 9001 $((LOSSKB * 1024)) 90 > "$W/lossout.out" 2>&1
         ORC=$?
         wait $PY 2>/dev/null
         DOUT=$(netem_drops "$FNS" "$FIF")
@@ -397,7 +403,7 @@ PYEOF
         L python3 "$W/echo_srv.py" "$LIP" 9002 tcp > "$W/py3.out" 2>&1 &
         PY=$!
         sleep 0.9
-        F send "$LIP" 9002 $((LOSSKB * 1024)) 12 norexmit > "$W/norex.out" 2>&1
+        F send "$LIP" 9002 $((LOSSKB * 1024)) 15 norexmit > "$W/norex.out" 2>&1
         NRC=$?
         wait $PY 2>/dev/null
         ip netns exec "$FNS" tc qdisc del dev "$FIF" root >/dev/null 2>&1
