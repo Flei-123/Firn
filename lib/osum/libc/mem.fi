@@ -1,0 +1,246 @@
+// lib/osum/libc/mem.fi -- round K4: memory a program asks for itself.
+//
+// Until this round a program on the disk had exactly what its image
+// brought: its `.data`, its `.bss` and 32 KiB of stack. Anything of a size
+// it only learns at run time -- a line of input, a file it reads in, a
+// list of entries of a directory -- had to be a fixed array, and a fixed
+// array is either too small or wasted.
+//
+// The kernel now has the two calls Unix has for this, and they do
+// different things on purpose:
+//
+//   * `brk` moves ONE line upwards, and everything below it belongs to the
+//     process. It is the cheap one: growing costs no call at all as long
+//     as the line has already been moved far enough.
+//   * `mmap` hands out a piece with rights of its own, and it grows
+//     downwards from the top of the private region. It is what a big,
+//     short-lived block should be -- and the only one that can ever give
+//     memory back to the system (`unmap`).
+//
+// On top of that sits this allocator, and it is the classic one out of
+// K&R: a single list of blocks, first fit, coalescing with the next block
+// when one is given back. No size classes, no arenas -- a system whose
+// biggest program is 40 KiB does not need them, and what it does need is
+// that the code fits in one screen and is right.
+//
+//     [ size | used ][ ...size octets... ][ size | used ][ ... ]
+//
+// The header is 16 octets and every block is a multiple of 16, so every
+// address this hands out is 16-aligned -- which is what the calling
+// convention wants for anything that could hold a wider value later.
+
+import osum.libc.syscall
+import osum.libc.errno
+
+export {
+    alloc, release, resize, fill, copy, compare, brk, sbrk, map_pages,
+    unmap_pages, heap_size, blocks
+}
+
+const HEAD: u64 = 16
+const H_SIZE: u64 = 0
+const H_USED: u64 = 8
+
+// Where the heap begins and where it ends. Both are addresses, both are
+// zero before the first request -- and `.bss` is zeroed by the loader, so
+// "zero" really means "never asked".
+static mut heap_low: u64 = 0
+static mut heap_high: u64 = 0
+
+fn get64(p: u64) -> u64 {
+    return __mmio_read64(p as *mut u64)
+}
+
+fn put64(p: u64, v: u64) {
+    __mmio_write64(p as *mut u64, v)
+}
+
+// ---------------------------------------------------------- the calls
+
+// `brk(0)` asks where the line stands.
+fn brk(addr: u64) -> u64 {
+    return syscall.sys1(syscall.SYS_BRK, addr)
+}
+
+// `sbrk`: n octets more, and the address of the first of them. -1 when
+// the kernel refuses -- it answers a refusal with the OLD line, the way
+// Linux does, so the comparison below is what says no.
+fn sbrk(n: u64) -> u64 {
+    let cur: u64 = brk(0)
+    if errno.is_error(cur) {
+        return errno.check(cur)
+    }
+    if n == 0 {
+        return cur
+    }
+    let want: u64 = cur + n
+    let got: u64 = brk(want)
+    if got != want {
+        errno.check(0 -% errno.E_NOMEM)
+        return 0 -% 1
+    }
+    return cur
+}
+
+// Anonymous pages, straight from the kernel. For a block that is big and
+// short lived: this is the only memory a program can really give back.
+fn map_pages(len: u64) -> u64 {
+    let prot: u64 = syscall.PROT_READ | syscall.PROT_WRITE
+    let flags: u64 = syscall.MAP_PRIVATE | syscall.MAP_ANONYMOUS
+    return errno.check(syscall.map_anon(len, prot, flags))
+}
+
+fn unmap_pages(addr: u64, len: u64) -> u64 {
+    return errno.check(syscall.sys2(syscall.SYS_MUNMAP, addr, len))
+}
+
+// ------------------------------------------------------ the allocator
+
+fn round_up(n: u64) -> u64 {
+    return (n + 15) & 0xFFFFFFFFFFFFFFF0
+}
+
+// One more block at the upper end of the heap, `size` octets of payload.
+fn grow(size: u64) -> u64 {
+    let want: u64 = HEAD + size
+    let at: u64 = sbrk(want)
+    if errno.failed(at) {
+        return 0
+    }
+    if heap_low == 0 {
+        heap_low = at
+    }
+    heap_high = at + want
+    put64(at + H_SIZE, size)
+    put64(at + H_USED, 1)
+    return at + HEAD
+}
+
+// `malloc`, under a name that does not pretend to be the C one (see the
+// head of `text.fi` for why that matters here).
+fn alloc(want: u64) -> u64 {
+    if want == 0 {
+        return 0
+    }
+    let size: u64 = round_up(want)
+    var at: u64 = heap_low
+    while at != 0 && at < heap_high {
+        let block: u64 = get64(at + H_SIZE)
+        if get64(at + H_USED) == 0 {
+            if block >= size {
+                // Big enough: split it when what is left over could hold a
+                // block of its own, otherwise hand it over whole.
+                if block >= size + HEAD + 16 {
+                    let rest: u64 = at + HEAD + size
+                    put64(rest + H_SIZE, block - size - HEAD)
+                    put64(rest + H_USED, 0)
+                    put64(at + H_SIZE, size)
+                }
+                put64(at + H_USED, 1)
+                return at + HEAD
+            }
+        }
+        at = at + HEAD + block
+    }
+    return grow(size)
+}
+
+// `free`. The block is marked free and swallows its right hand neighbour
+// if that one is free as well -- which is what keeps a program that
+// allocates and releases in a loop from walking up the heap for ever.
+fn release(p: u64) {
+    if p == 0 {
+        return
+    }
+    let head: u64 = p - HEAD
+    if head < heap_low {
+        return
+    }
+    if head >= heap_high {
+        return
+    }
+    put64(head + H_USED, 0)
+    var at: u64 = heap_low
+    while at != 0 && at < heap_high {
+        let size: u64 = get64(at + H_SIZE)
+        let next: u64 = at + HEAD + size
+        if get64(at + H_USED) == 0 && next < heap_high {
+            if get64(next + H_USED) == 0 {
+                put64(at + H_SIZE, size + HEAD + get64(next + H_SIZE))
+            } else {
+                at = next
+            }
+        } else {
+            at = next
+        }
+    }
+}
+
+// `realloc`: a bigger block, the old contents in it, the old block gone.
+fn resize(p: u64, want: u64) -> u64 {
+    if p == 0 {
+        return alloc(want)
+    }
+    let head: u64 = p - HEAD
+    let have: u64 = get64(head + H_SIZE)
+    if have >= want {
+        return p
+    }
+    let fresh: u64 = alloc(want)
+    if fresh == 0 {
+        return 0
+    }
+    copy(fresh, p, have)
+    release(p)
+    return fresh
+}
+
+// How far the heap reaches, and how many blocks are in it. Not part of any
+// C library -- they are here because a test that cannot see the state of
+// an allocator can only measure that it did not crash.
+fn heap_size() -> u64 {
+    if heap_low == 0 {
+        return 0
+    }
+    return heap_high - heap_low
+}
+
+fn blocks() -> u64 {
+    var n: u64 = 0
+    var at: u64 = heap_low
+    while at != 0 && at < heap_high {
+        n = n + 1
+        at = at + HEAD + get64(at + H_SIZE)
+    }
+    return n
+}
+
+// ---------------------------------------------------------- the octets
+
+// `memset`, `memcpy`, `memcmp` -- again under names of their own.
+fn fill(p: u64, value: u64, n: u64) {
+    var i: u64 = 0
+    while i < n {
+        __mmio_write8((p + i) as *mut u8, value as u8)
+        i = i + 1
+    }
+}
+
+fn copy(dst: u64, src: u64, n: u64) {
+    var i: u64 = 0
+    while i < n {
+        __mmio_write8((dst + i) as *mut u8, *((src + i) as *mut u8))
+        i = i + 1
+    }
+}
+
+fn compare(a: u64, b: u64, n: u64) -> bool {
+    var i: u64 = 0
+    while i < n {
+        if *((a + i) as *mut u8) != *((b + i) as *mut u8) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
