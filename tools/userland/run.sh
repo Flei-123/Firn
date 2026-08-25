@@ -423,6 +423,49 @@ hi
 ./ ../ nums.txt 
 WANT
 
+# ---- case 8: everything a line can be that is not a command. A shell
+# that a line of two hundred octets or a missing file name can knock over
+# is not one -- and every one of these is a WORD from the shell and a
+# process that went on living, not a fault.
+cat > "$TMPD/t8.sh" <<'SCRIPT'
+echo ==BEGIN==
+# a comment and nothing else
+;
+echo a;;echo b
+>
+echo x >
+echo ok1
+cd
+pwd
+echo one two three four five six seven eight nine
+echo ok2
+SCRIPT
+printf 'echo ' >> "$TMPD/t8.sh"
+for i in $(seq 1 40); do printf 'AAAAA' >> "$TMPD/t8.sh"; done
+printf '\n' >> "$TMPD/t8.sh"
+cat >> "$TMPD/t8.sh" <<'SCRIPT'
+echo a | cat | cat | cat | cat
+sh /nope
+echo code=$?
+echo end
+echo ==END==
+SCRIPT
+cat > "$TMPD/t8.want" <<'WANT'
+a
+b
+sh: missing file name
+sh: missing file name
+ok1
+/
+sh: too many arguments
+ok2
+sh: cannot run echo -> -36
+sh: too many stages
+sh: cannot read /nope
+code=127
+end
+WANT
+
 # ---- case 7: the programs whose output nobody can write down in advance.
 cat > "$TMPD/t7.sh" <<'SCRIPT'
 echo ==BEGIN==
@@ -447,7 +490,7 @@ for p in $PROGS; do SPEC="$SPEC /bin/$p=$TMPD/${p}0.elf"; done
 DATA="/d/ /d/three.txt=$TMPD/three.txt /d/dup.txt=$TMPD/dup.txt
       /d/nums.txt=$TMPD/nums.txt /d/empty.txt=$TMPD/empty.txt"
 CASES="/t/"
-for c in t1 t2 t3 t4 t5 t6 t7; do CASES="$CASES /t/$c.sh=$TMPD/$c.sh"; done
+for c in t1 t2 t3 t4 t5 t6 t7 t8; do CASES="$CASES /t/$c.sh=$TMPD/$c.sh"; done
 python3 tools/osum/mkfs.py build "$TMPD/disk0.img" $BLOCKS $SPEC $DATA $CASES \
     > "$TMPD/mkfs.txt" 2>&1 \
     && ok "mkfs.py built an image of $BLOCKS blocks with the whole userland on it" \
@@ -458,7 +501,7 @@ num "programs in /bin according to the host" "$n" eq "$(echo $PROGS | wc -w)"
 # ------------------------------------------------------- 3. the cases
 
 echo "== 3. the transcripts: what the shell really said =="
-for c in t1 t2 t3 t4 t5 t6; do
+for c in t1 t2 t3 t4 t5 t6 t8; do
     run_case "$TMPD/k0.mb" "$TMPD/disk0.img" "$c" "sh /t/$c.sh;exit"
     rc=$?
     if [ "$rc" -ne 21 ]; then
