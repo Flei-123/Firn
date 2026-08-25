@@ -177,19 +177,30 @@ printf '        four cores: %s cycles, %s ms\n' "${t4:-?}" "${m4:-?}"
 if [ -n "$t1" ] && [ -n "$t4" ] && [ "$t4" -gt 0 ]; then
     permil=$((t1 * 1000 / t4))
     printf '        speed-up:   %s.%03d\n' "$((permil / 1000))" "$((permil % 1000))"
-    # Four cores that are really four cores are far past 2.0 on an idle
-    # machine. The bar is deliberately below that: this runs on build
-    # machines that have other work on them, and a threshold that fails
-    # under load is a threshold that gets switched off.
-    num "four cores against one, in thousandths" "$permil" ge 1800
+    # On an idle machine this is between 3.0 and 3.9 (docs/ROUNDK5.md 8).
+    # The bar is deliberately far below that: this runs on build machines
+    # that have other work on them -- the series in the documentation was
+    # measured at a load average of ten on twelve cores and its worst pair
+    # was 1.88 -- and a threshold that fails under load is a threshold
+    # that gets switched off. What separates a pass from a failure is not
+    # this number alone but the distance to the counter-check in section
+    # 5, which stays at 1.0.
+    num "four cores against one, in thousandths" "$permil" ge 1600
 else
     bad "no benchmark numbers"
 fi
-# And every core has to have done its share -- a "speed-up" in which one
-# core did all the work and the rest slept would show up here.
-busy=$(grep -oE 'smp: percore.*' "$TMPD/c4.txt" | grep -oE 'c[0-9]+=[0-9]+' \
-    | cut -d= -f2 | awk '$1 > 1000' | wc -l)
-num "cores that really ground away in the four-core run" "$busy" eq 4
+# The same twelve units in both runs -- the work is CLAIMED out of one
+# counter, not dealt out, so the split differs from run to run and the
+# total must not.
+s1=$(grep -oE 'smp: shares .*c/[0-9]+' "$TMPD/nosmp.txt" | grep -oE '[0-9]+$')
+s4=$(grep -oE 'smp: shares .*c/[0-9]+' "$TMPD/c4.txt" | grep -oE '[0-9]+$')
+num "one core: units of work done in total" "$s1" eq 12
+num "four cores: units of work done in total" "$s4" eq 12
+# And every core has to have taken some of them -- a "speed-up" in which
+# one core did all the work and the rest slept would show up here.
+busy=$(grep -oE 'smp: shares.*' "$TMPD/c4.txt" | grep -oE 'c[0-9]+=[0-9]+' \
+    | cut -d= -f2 | awk '$1 > 0' | wc -l)
+num "cores that took a share of the work" "$busy" eq 4
 
 echo "== 5. counter-check for the measurement: one QEMU thread cannot be faster =="
 # Same kernel, same four guest cores, but QEMU emulates them in ONE host
@@ -202,9 +213,24 @@ if [ "$rc" -eq 21 ] && [ -n "$ts" ] && [ -n "$t1" ] && [ "$ts" -gt 0 ]; then
     permil=$((t1 * 1000 / ts))
     printf '        one host thread, four guest cores: %s cycles (%s.%03d against one core)\n' \
         "$ts" "$((permil / 1000))" "$((permil % 1000))"
-    num "single-threaded emulation stays near 1.0, in thousandths" "$permil" lt 1500
+    num "single-threaded emulation stays near 1.0, in thousandths" "$permil" lt 1300
 else
     bad "the single-thread counter-check did not run (exit $rc)"
+fi
+
+echo "== 5b. the second measurement: the same work THROUGH THE SCHEDULER =="
+# Eight kernel tasks of arithmetic in one run queue. Nothing hands them
+# out; every core takes what is ready. This is the number that says the
+# SCHEDULER distributes work, not just that four cores exist.
+q1=$(grep -oE 'smp: sched .*ms=[0-9]+' "$TMPD/nosmp.txt" | grep -oE '[0-9]+$')
+q4=$(grep -oE 'smp: sched .*ms=[0-9]+' "$TMPD/c4.txt" | grep -oE '[0-9]+$')
+printf '        eight tasks on one core: %s ms   on four: %s ms\n' "${q1:-?}" "${q4:-?}"
+if [ -n "$q1" ] && [ -n "$q4" ] && [ "$q4" -gt 0 ]; then
+    permil=$((q1 * 1000 / q4))
+    printf '        speed-up:   %s.%03d\n' "$((permil / 1000))" "$((permil % 1000))"
+    num "eight tasks on four cores against one, in thousandths" "$permil" ge 1500
+else
+    bad "no scheduler numbers"
 fi
 
 echo "== 6. the lock, and the run in which it is not there =="
