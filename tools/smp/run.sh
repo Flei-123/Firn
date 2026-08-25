@@ -192,8 +192,8 @@ fi
 # The same twelve units in both runs -- the work is CLAIMED out of one
 # counter, not dealt out, so the split differs from run to run and the
 # total must not.
-s1=$(grep -oE 'smp: shares .*c/[0-9]+' "$TMPD/nosmp.txt" | grep -oE '[0-9]+$')
-s4=$(grep -oE 'smp: shares .*c/[0-9]+' "$TMPD/c4.txt" | grep -oE '[0-9]+$')
+s1=$(grep -oE 'smp: shares .*sum=[0-9]+' "$TMPD/nosmp.txt" | grep -oE '[0-9]+$')
+s4=$(grep -oE 'smp: shares .*sum=[0-9]+' "$TMPD/c4.txt" | grep -oE '[0-9]+$')
 num "one core: units of work done in total" "$s1" eq 12
 num "four cores: units of work done in total" "$s4" eq 12
 # And every core has to have taken some of them -- a "speed-up" in which
