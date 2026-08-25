@@ -24,7 +24,14 @@ os.chdir(ROOT)
 # oder 'primitiv', die in ENGLISCHEN Testnamen stehen und dort richtig sind.
 # RUNDE 74: dasselbe gilt fuer `.test-work/` -- der Arbeitsordner von
 # test.sh, in den die Abschnitte ihre Logs und entpackte fremde Daten legen.
-AUS = ('testdata/', 'tools/english/', '.js-work/', '.test-work/')
+# RUNDE B1: `tests/data/` ist die offizielle html5lib-Sammlung
+# (tree-construction, aus web-platform-tests). FREMDE DATEN wie `testdata/`,
+# nur an der Stelle abgelegt, die der Auftrag der Runde nennt. Ihre
+# Dateinamen (main-element.dat, menuitem-element.dat, search-element.dat)
+# sind die Namen der Original-Suite und duerfen nicht umbenannt werden --
+# sonst laeuft der Vergleich gegen die Quelle nicht mehr.
+AUS = ('testdata/', 'tests/data/', 'tools/english/', '.js-work/',
+       '.test-work/')
 # Ein angehaengter Zaehler versteckt das deutsche Wort: 'pfad2', 'teil1'.
 ZIFFERNSCHWANZ = re.compile(r'[0-9]+$')
 TEIL = re.compile(r'[a-z0-9]+|[A-Z]+(?![a-z])|[A-Z][a-z0-9]*')

@@ -70,3 +70,17 @@ different start state at `<title>`, `<style>`, `<script>`, `<textarea>` and
 `<plaintext>` (the WHATWG "generic raw text element parsing algorithm"). How
 that is done -- and what it costs -- is written in the head of
 `lib/browser/driver.fi`.
+
+## Round B1 — one case of this suite was rewritten
+
+`06_selection_frames.dat`, the case `<select><div>x</div></select>`, used to
+expect `<select>"x"` — the div was dropped. WHATWG has since removed the
+insertion modes "in select" and "in select in table" (relaxed select
+parsing): a `select` takes arbitrary content, so the expectation is now
+`<select><div>"x"`. The same case stands with the same expectation in
+`tests/data/html5lib/webkit02.dat`. The note lives here and not in the
+`.dat` file, because the `.dat` format has no comment lines — a `#` line
+outside a section starts a new case.
+
+The three gaps of `tools/html/gaps/` (foreign content, `<template>`,
+fragment parsing) are closed in round B1; see `docs/ROUNDB1.md`.
