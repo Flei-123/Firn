@@ -16,7 +16,13 @@
 # GCTEXT_ALL (with the collections).
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# ROUND B1: an optional target path. `tools/fixpoint.sh` needs to compare the
+# CONTENT of lib/firnc1/gctext.fi with what the script would produce today,
+# and it must not write into the tree to find that out.
+export GCTEXT_TARGET="${1:-lib/firnc1/gctext.fi}"
 python3 - <<'PYEOF'
+import os
+target = os.environ.get('GCTEXT_TARGET', 'lib/firnc1/gctext.fi')
 kern = open('lib/gc/gc.fi','rb').read()
 samml = open('lib/gc/gcvec.fi','rb').read() + open('lib/gc/gcmap.fi','rb').read()
 src = kern + samml
@@ -71,6 +77,6 @@ out.append('        }')
 out.append('        i = i + 1')
 out.append('    }')
 out.append('}')
-open('lib/firnc1/gctext.fi','w').write('\n'.join(out) + '\n')
-print('lib/firnc1/gctext.fi:', alle, 'bytes (core', n, ') as', len(words), 'words')
+open(target,'w').write('\n'.join(out) + '\n')
+print(target + ':', alle, 'bytes (core', n, ') as', len(words), 'words')
 PYEOF
