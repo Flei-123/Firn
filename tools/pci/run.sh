@@ -102,6 +102,8 @@ as --64 -o "$TMPD/isr.o" demos/kernel/isr.s 2>/dev/null \
     && ok "isr.s assembles" || bad "isr.s"
 as --64 -o "$TMPD/switch.o" demos/kernel/switch.s 2>/dev/null \
     && ok "switch.s assembles" || bad "switch.s"
+as --64 -o "$TMPD/smp.o" demos/kernel/smp.s 2>/dev/null \
+    && ok "smp.s assembles" || bad "smp.s"
 
 for s in 0 1; do
     if [ "$s" = 0 ]; then C="$FIRNC"; else C="$FC1"; fi
@@ -115,8 +117,9 @@ for s in 0 1; do
           --defsym=KERNEL_SYSCALL="_F$s.sys__entry" \
           --defsym=KERNEL_TASK_MAIN="_F$s.tasks__main" \
           --defsym=KERNEL_USER_START="_F$s.proc__user_start" \
+        --defsym=KERNEL_AP_MAIN="_F$s.smp__ap_main" \
           --defsym=USER_MAIN="_F$s.u_enter" \
-          -o "$TMPD/k$s.elf" "$TMPD/boot.o" "$TMPD/isr.o" "$TMPD/switch.o" \
+          -o "$TMPD/k$s.elf" "$TMPD/boot.o" "$TMPD/isr.o" "$TMPD/switch.o" "$TMPD/smp.o" \
           "$TMPD/k$s.o" "$TMPD/uprog$s.o" 2>"$TMPD/ld$s.err"; then
         objcopy -O elf32-i386 "$TMPD/k$s.elf" "$TMPD/k$s.mb" 2>/dev/null
         ok "firnc$s: kernel with pci.fi, apic.fi, nvme.fi linked"

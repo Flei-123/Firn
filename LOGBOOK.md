@@ -1,3 +1,47 @@
+## Round K5 (2026-08-25) -- four processors in Osum; branch k5-smp
+The kernel of rounds 59/62/K1/K2 was an operating system on ONE core, and said so in
+kstate.fi: "NOT atomic -- it does not have to be: the kernel runs on one processor". It now
+reads the ACPI MADT, starts the application processors with INIT/SIPI over a 182-octet
+real-mode trampoline copied to 0x8000, gives each one a stack, a GDT, a TSS and a local APIC
+of its own, and puts spin locks around the run queue, the frame allocator and the file system.
+NOTHING HAD TO BE ADDED TO THE LANGUAGE. `__atomic_add` (round 47, `lock xadd`) and
+`__atomic_swap` (round 49, `lock cmpxchg`) were already there; round 47 wrote that the
+difference "is NOT measurable today by a two-thread run" -- this is that run. An atomic load
+and store are the MMIO forms of round 52, which is correct on x86-64 and is the one thing that
+would have to change on a weaker memory model.
+MEASUREMENTS (shared build host, load average ~10 on 12 cores, five sequential pairs): twelve
+units of arithmetic 966/799/819/957/877 ms on one core against 321/322/435/272/373 ms on four,
+median speed-up 2.48x, best 3.52x, earlier quiet run 4.24x. Eight kernel tasks through the
+SCHEDULER: 656/560/555/655/556 ms against 158/200/218/176/204 ms, median 2.80x, all four cores
+taking tasks. COUNTER-CHECKS: the same guest with `-accel tcg,thread=single` gets 1.04x -- four
+cores in one host thread are not parallel and the number collapses. `nolock`: the shared
+counter comes out 1630 of 6000 instead of 6000, and the frame allocator hands the SAME frame to
+two cores five times out of 64. `nosmp`: four processors found, one online.
+THE BENCHMARK HAD TO BE REWRITTEN ONCE: dealing every core a fixed share makes the total the
+time of the SLOWEST core, and on a loaded host one emulated core out of four is regularly
+starved. The units are CLAIMED out of one counter with `lock xadd` now; same total work, and the
+number stops measuring the host. The eight scheduler tasks likewise: they used to spin on
+`pause`, and QEMU's translator leaves the emulation loop at every `pause` -- that measured the
+emulator, not the machine.
+THREE BUGS, ALL FOUND BY MEASURING: (1) the per-core records were put at kdata+0x12000, which is
+where pci.fi keeps the counters of round K2 -- the running task index landed on the address of
+the local APIC and the machine died after EXACTLY ONE timer interrupt with no message, because
+the end-of-interrupt went to address zero. The offset list at the head of kstate.fi stopped at
+0x0F000 and did not mention that pci.fi and nvme.fi own 0x10000..0x1B000; it does now. (2) Task 0
+is kernel_main itself and the scheduler migrated it, correctly and fatally: ring 3, KSTACK_CUR
+and the syscall MSRs all belong to the boot processor. One run in six died. That is why affinity
+exists in this round. (3) The file system lock deadlocked against itself at "fs: format " --
+format -> dir_init -> write_at, and write_at is one of the six locked entry points; it is
+re-entrant on the same core now.
+THE RULE THAT KEEPS IT ALIVE: no lock is ever held while another is taken, every lock is taken
+with interrupts already off, and the run queue lock is held ACROSS the context switch and given
+back by whoever the processor switched TO -- releasing it earlier lets a second core pick up a
+task whose registers are not saved yet.
+NOT DONE, NAMED: ring 3 stays on the boot processor (one KSTACK_CUR for the machine), no IPIs
+beyond INIT/STARTUP, no TLB shootdown, no load balancing beyond "whoever is free takes the next".
+MEASUREMENTS: tools/smp/run.sh 58/58 (test.sh section 57), tools/kernel/run.sh 175/175,
+english 0 0 0 0 0, firnfmt -c clean.
+
 ## Round 47 (2026-08-19) -- finalizers, Arc[T], weak references; branch r47-arc
 The three memory-management items open since round 4 are done: S4 finalizers, Arc[T] with an
 ATOMIC counter (new FIR primitive Op::AtomicAdd -> `lock xadd`, in BOTH compilers, FIR

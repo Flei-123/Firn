@@ -88,6 +88,12 @@
 #      `profile kernel`, inline assembly, MMIO, `#[interrupt]` -- the
 #      kernel example becomes an ELF object file WITHOUT undefined
 #      symbols, in BOTH compilers, and is linked against a linker script.
+#  57. Four processors (tools/smp/run.sh, ROUND K5): the kernel reads the
+#      ACPI MADT, starts the application processors with INIT/SIPI, gives
+#      each one a stack, descriptor table and local APIC of its own, and
+#      locks the run queue, the frame allocator and the file system. The
+#      same work is measured on one core and on four; the counter-checks
+#      are `nosmp`, `nolock` and QEMU's single-threaded emulation.
 #  22. The kernel (tools/kernel/run.sh, round 59): `demos/kernel/kmain.fi`
 #      boots in QEMU and is checked over its serial output -- IDT and
 #      exception reports (#DE, #PF, #GP, #DF), PIC/PIT with a tick counter
@@ -1315,6 +1321,23 @@ if [ "$PXRC" -eq 0 ]; then
 else
     bad "tools/posix/run.sh failed (see .test-work/posix.log)"
     grep -aE '^  FAIL' "$WORK/posix.log" | head -12 | sed 's/^/   /'
+echo "== 57. four processors, and the lock that makes them one kernel (tools/smp/run.sh, ROUND K5) =="
+# The kernel starts the other cores out of the ACPI MADT, gives each one a
+# stack, a descriptor table and a local APIC of its own, and puts a spin
+# lock around the three things they share -- the run queue, the frame
+# allocator, the file system. Every number in that log has a run in which
+# it collapses: `nosmp` (same machine, cores not started), `nolock` (same
+# kernel, locks switched off) and `thread=single` (same guest, one host
+# thread). See docs/ROUNDK5.md.
+bash tools/smp/run.sh > "$WORK/smp.log" 2>&1 && SMPRC=0 || SMPRC=$?
+grep -E '^        (one core|four cores|speed-up|one host thread|with the lock)' \
+    "$WORK/smp.log" | sed 's/^ */ /'
+grep -E '^SMP: ' "$WORK/smp.log" | sed 's/^/ /'
+if [ "$SMPRC" -eq 0 ]; then
+    ok
+else
+    bad "tools/smp/run.sh failed (see .test-work/smp.log)"
+    grep -E '^  FAIL' "$WORK/smp.log" | head -12 | sed 's/^/   /'
 fi
 
 TOTAL=$((PASS + FAIL))

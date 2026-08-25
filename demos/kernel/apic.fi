@@ -58,9 +58,10 @@ import pci
 
 export {
     present, init, active, hz, id,
-    eoi, timer_stop, map_device, window_slots, lapic_phys,
+    eoi, timer_start, timer_stop, map_device, window_slots, lapic_phys,
     route, mask_gsi, ioapic_entries, pic_off,
-    spurious, spurious_hit, tsc, tsc_hz, VEC_SPURIOUS
+    spurious, spurious_hit, tsc, tsc_hz, VEC_SPURIOUS,
+    window, core_init, ipi
 }
 
 // ------------------------------------------------ the K2 scalar page
@@ -90,6 +91,8 @@ const R_LDR: u64 = 0x0D0
 const R_DFR: u64 = 0x0E0
 const R_SVR: u64 = 0x0F0
 const R_ESR: u64 = 0x280
+const R_ICR_LOW: u64 = 0x300
+const R_ICR_HIGH: u64 = 0x310
 const R_LVT_TIMER: u64 = 0x320
 const R_LVT_LINT0: u64 = 0x350
 const R_LVT_LINT1: u64 = 0x360
@@ -438,6 +441,65 @@ fn timer_stop(state: u64) {
 // slave -- the 8259 needed all three.
 fn eoi(state: u64) {
     lwrite(lapic(state), R_EOI, 0)
+}
+
+// ------------------------------------------------------------ round K5
+
+// The address the KERNEL uses to reach the local APIC. Every core reads
+// its OWN chip through it: the page is a window onto the APIC that sits
+// in the processor executing the access, so one address serves all of
+// them. `cpu.fi` needs it to answer "which core am I".
+fn window(state: u64) -> u64 {
+    return lapic(state)
+}
+
+// The half of `init` that is PER CORE. Mapping the window and measuring
+// the timer frequency happened once, on the boot processor, and holds for
+// the machine; everything below sits in the core's own chip and is at its
+// reset value on a core that has just been started.
+//
+// The logical id gets a bit of its own per core (flat model, one bit per
+// processor). It is not used for delivery in this round -- every message
+// this kernel sends names its target by physical id -- but a table in
+// which four cores all call themselves logical 1 is a trap laid for the
+// round that does use it.
+fn core_init(state: u64, index: u64) {
+    var base_msr: u64 = rdmsr(MSR_APIC_BASE)
+    if (base_msr & APIC_BASE_ENABLE) == 0 {
+        wrmsr(MSR_APIC_BASE, base_msr | APIC_BASE_ENABLE)
+    }
+    let base: u64 = lapic(state)
+    lwrite(base, R_TPR, 0)
+    lwrite(base, R_DFR, 0xFFFFFFFF)
+    if index < 8 {
+        lwrite(base, R_LDR, 1 << (24 + index))
+    }
+    lwrite(base, R_LVT_TIMER, LVT_MASKED)
+    lwrite(base, R_LVT_LINT0, LVT_MASKED)
+    lwrite(base, R_LVT_LINT1, LVT_MASKED)
+    lwrite(base, R_LVT_ERROR, LVT_MASKED)
+    lwrite(base, R_ESR, 0)
+    lwrite(base, R_ESR, 0)
+    lwrite(base, R_SVR, 0x100 | VEC_SPURIOUS)
+}
+
+// An interrupt from one processor to another. The two halves of the
+// command register have to be written in this order: the high word names
+// the target, the low word is what SENDS the message. Bit 12 of the low
+// word stays set while the message is on its way -- a second write before
+// it clears would overwrite a message in flight.
+fn ipi(state: u64, dest: u64, low: u64) {
+    let base: u64 = lapic(state)
+    lwrite(base, R_ESR, 0)
+    lwrite(base, R_ICR_HIGH, (dest & 0xFF) << 24)
+    lwrite(base, R_ICR_LOW, low & 0xFFFFF)
+    var guard: u64 = 0
+    while guard < 1000000 {
+        if (lread(base, R_ICR_LOW) & 0x1000) == 0 {
+            return
+        }
+        guard = guard + 1
+    }
 }
 
 // ---------------------------------------------------------- the I/O APIC

@@ -362,6 +362,9 @@ vectors:
     .quad KERNEL_USER_START         /* 63: proc.fi, the way into ring 3 */
     /* Round K4: back into ring 3 with a context the kernel wrote itself. */
     .quad user_resume               /* 64: fork and execve */
+    /* Round K5: the other processors (demos/kernel/smp.s, smp.fi). */
+    .quad smp_vectors               /* 65: the table of the trampoline */
+    .quad KERNEL_AP_MAIN            /* 66: where a started core lands */
 
     .section .bss, "aw", @nobits
     .align 8
