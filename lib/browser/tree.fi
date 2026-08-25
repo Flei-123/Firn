@@ -54,6 +54,7 @@ import browser.names
 import browser.tag
 import browser.token_stream
 import browser.foreign
+import browser.quirks_data
 
 export {
     Tree,
@@ -1928,36 +1929,91 @@ fn tt_flush(b: *mut Tree) -> AllocError!bool {
 
 // ----------------------------------------------- "initial" / "before html"
 
-// The quirks detection from the DOCTYPE (WHATWG 13.2.6.4.1).
-// AN HONEST LIMIT: the complete list of the public identifiers of the
-// standard (about 55 prefixes from the time before HTML5) is NOT built in.
-// Implemented are: the "force quirks" flag of the tokenizer, a name != html,
-// a system literal present together with HTML 4.01, and the four
-// prefixes that still turn up today. Everything else counts as "no quirks".
+// Walks a `|` separated list and asks `equal` (an exact match) or a
+// prefix match for every entry.
+fn list_hit(raw: *mut mem.Buf, k: Gc[Chain], exact: bool) -> bool {
+    let total: usize = mem.buf_len(raw)
+    let base: *mut u8 = mem.buf_ptr(raw)
+    var i: usize = 0
+    while i <= total {
+        var j: usize = i
+        while j < total && *((base as u64 + j as u64) as *mut u8) != 124 as u8 {
+            j = j + 1
+        }
+        if j > i {
+            let p: *mut u8 = (base as u64 + i as u64) as *mut u8
+            if exact {
+                if node.chain_equal_ascii_small(k, p, j - i) {
+                    return true
+                }
+            } else {
+                if node.chain_starts_ascii_small(k, p, j - i) {
+                    return true
+                }
+            }
+        }
+        if j >= total {
+            return false
+        }
+        i = j + 1
+    }
+    return false
+}
+
+// The quirks detection from the DOCTYPE (WHATWG 13.2.6.4.1). ROUND B1: the
+// list is COMPLETE -- the 55 public identifier prefixes, the three exact
+// public identifiers, the system identifier of the IBM DTD and the two
+// prefixes whose answer depends on whether a system identifier is there.
+// The lists stand in the generated lib/browser/quirks_data.fi.
 fn doctype_mode(b: *mut Tree, name: Gc[Chain], pubid: Gc[Chain], sysid: Gc[Chain],
     force: bool, has_pubid: bool, has_sysid: bool) -> u32 {
     var lit_html: [u8; 4] = "html"
     if force || !node.chain_equal_ascii(name, &lit_html[0], 4) {
         return node.MODE_QUIRKS
     }
-    var p_x_frame: [u8; 32] = "-//W3C//DTD XHTML 1.0 Frameset//"
-    var p_x_trans: [u8; 36] = "-//W3C//DTD XHTML 1.0 Transitional//"
-    var p_h_frame: [u8; 32] = "-//W3C//DTD HTML 4.01 Frameset//"
-    var p_h_trans: [u8; 36] = "-//W3C//DTD HTML 4.01 Transitional//"
+    var raw: mem.Buf = mem.buf_new()
+    mem.buf_init(&raw)
+    var answer: u32 = node.MODE_NO_QUIRKS
     if has_pubid {
-        if node.chain_starts_ascii_small(pubid, &p_h_frame[0], 32) ||
-        node.chain_starts_ascii_small(pubid, &p_h_trans[0], 36) {
-            if has_sysid {
-                return node.MODE_LIMITED
-            }
-            return node.MODE_QUIRKS
-        }
-        if node.chain_starts_ascii_small(pubid, &p_x_frame[0], 32) ||
-        node.chain_starts_ascii_small(pubid, &p_x_trans[0], 36) {
-            return node.MODE_LIMITED
+        quirks_data.quirks_exact_bytes(&raw)
+        if list_hit(&raw, pubid, true) {
+            answer = node.MODE_QUIRKS
         }
     }
-    return node.MODE_NO_QUIRKS
+    if answer == node.MODE_NO_QUIRKS && has_sysid {
+        mem.buf_clear(&raw)
+        quirks_data.quirks_system_bytes(&raw)
+        if list_hit(&raw, sysid, true) {
+            answer = node.MODE_QUIRKS
+        }
+    }
+    if answer == node.MODE_NO_QUIRKS && has_pubid {
+        mem.buf_clear(&raw)
+        quirks_data.quirks_prefix_bytes(&raw)
+        if list_hit(&raw, pubid, false) {
+            answer = node.MODE_QUIRKS
+        }
+    }
+    if answer == node.MODE_NO_QUIRKS && has_pubid {
+        mem.buf_clear(&raw)
+        quirks_data.both_prefix_bytes(&raw)
+        if list_hit(&raw, pubid, false) {
+            if has_sysid {
+                answer = node.MODE_LIMITED
+            } else {
+                answer = node.MODE_QUIRKS
+            }
+        }
+    }
+    if answer == node.MODE_NO_QUIRKS && has_pubid {
+        mem.buf_clear(&raw)
+        quirks_data.limited_prefix_bytes(&raw)
+        if list_hit(&raw, pubid, false) {
+            answer = node.MODE_LIMITED
+        }
+    }
+    mem.buf_free(&raw)
+    return answer
 }
 
 fn chain_out_stream(b: *mut Tree, off: usize) -> AllocError!Gc[Chain] {
@@ -3265,6 +3321,13 @@ fn m_after_body(b: *mut Tree) -> AllocError!u32 {
         return try m_in_body(b)
     }
     if kind == tokens.TB_END && n == tag.M_HTML {
+        // The fragment case: there is no document after the root element,
+        // so the token is dropped and the mode stays "after body". Without
+        // this a trailing comment would land outside the fragment.
+        if (*b).fragment {
+            parse_error(b)
+            return A_DONE
+        }
         (*b).mode = EM_AFTER_AFTER_BODY
         return A_DONE
     }
@@ -3619,6 +3682,13 @@ fn mark_foreign(b: *mut Tree) -> AllocError!u32 {
         return A_DONE
     }
     let n: u32 = (*b).tname
+    // WHATWG puts the END tags `br` and `p` in the same entry as the
+    // breakout start tags -- `<svg></p><foo>` closes the svg.
+    if kind == tokens.TB_END && (n == tag.M_BR || n == tag.M_P) {
+        parse_error(b)
+        foreign_unwind(b)
+        return try mark_html(b)
+    }
     if kind == tokens.TB_START {
         if breakout_name(b, n) || (n == tag.M_FONT && font_breaks_out(b)) {
             parse_error(b)
@@ -3832,11 +3902,13 @@ fn eof_mode(b: *mut Tree) -> AllocError!u32 {
         insert_mode_reset(b)
         return A_ERNEUT
     }
-    if m == EM_IN_BODY || m == EM_IN_CAPTION || m == EM_IN_CELL {
-        // WHATWG "in body", end-of-file: with a non empty stack of template
-        // insertion modes the token goes to "in template" -- that is what
-        // makes the missing `body` appear after `<template><div>`.
-        if m == EM_IN_BODY && (*b).n_tmpl > 0 {
+    // WHATWG: "in table", "in table body", "in row", "in cell" and
+    // "in caption" all send the end-of-file token on to "in body", and
+    // "in body" asks the stack of template insertion modes. That is what
+    // makes the missing `body` appear after `<template><template><table>`.
+    if m == EM_IN_BODY || m == EM_IN_CAPTION || m == EM_IN_CELL ||
+    m == EM_IN_TABLE || m == EM_IN_TABLE_BODY || m == EM_IN_ROW {
+        if (*b).n_tmpl > 0 {
             (*b).mode = EM_IN_TEMPLATE
             return A_ERNEUT
         }
