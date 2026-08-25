@@ -262,6 +262,17 @@ fn intrinsic_widths_in(b: Gc[Box], min_out: *mut f64, max_out: *mut f64,
             if !is_abs(c) {
                 var cmin: f64 = 0.0
                 var cmax: f64 = 0.0
+                // THE EDGES OF THE CHILD HAVE TO BE THERE. Intrinsic
+                // widths are asked BEFORE the subtree is laid out -- from
+                // the flex base size, from shrink-to-fit -- and until the
+                // layout runs, `ml`, `pl` and the rest of the child are
+                // still zero. Reading them then means an item whose child
+                // carries a margin comes out too narrow by exactly that
+                // margin. Percentages resolve against zero here, which is
+                // what css-sizing-3 asks for in an intrinsic contribution.
+                if c.kind != box.BK_TEXT {
+                    resolve_edges(c, 0.0)
+                }
                 intrinsic_widths_in(c, &cmin, &cmax, true)
                 let edges: f64 = c.ml + c.mr + h_extra(c)
                 if cmin + edges > kid_min {
@@ -290,7 +301,22 @@ fn intrinsic_widths_in(b: Gc[Box], min_out: *mut f64, max_out: *mut f64,
             if !is_abs(c) && !is_float(c) {
                 var cmin: f64 = 0.0
                 var cmax: f64 = 0.0
+                if c.kind != box.BK_TEXT {
+                    resolve_edges(c, 0.0)
+                }
                 intrinsic_widths_in(c, &cmin, &cmax, true)
+                // An atomic inline contributes its BORDER box plus its
+                // margins; an inline box has its padding and border
+                // already inside `cmin`/`cmax` (see the tail of this
+                // function) and adds only the margins.
+                var iedges: f64 = 0.0
+                if c.kind == box.BK_ATOMIC {
+                    iedges = c.ml + c.mr + h_extra(c)
+                } else if c.kind == box.BK_INLINE {
+                    iedges = c.ml + c.mr
+                }
+                cmin = cmin + iedges
+                cmax = cmax + iedges
                 if c.kind == box.BK_TEXT {
                     // The pieces of a text run join with what stands next
                     // to them only across a space, and text_widths has
@@ -2448,6 +2474,84 @@ fn flex_align_main(b: Gc[Box], items: Gc[GcVec], line: Gc[FlexLine],
     }
 }
 
+// THE STATIC POSITION OF AN ABSOLUTELY POSITIONED CHILD OF A FLEX
+// CONTAINER (css-flexbox-1, 4.1). It is NOT the content corner: the child
+// is placed as if it were the SOLE flex item of the container --
+// `justify-content` decides in the main axis, its own `align-self` in the
+// cross axis, inside the container's content box. Without this rule every
+// abspos child of a centred flex container sits in the top left corner,
+// and the eighteen `flex-abspos-staticpos-*` tests of the WPT suite say so.
+//
+// The fallbacks for a single item are the ones of css-align-3:
+// `space-between` behaves as `flex-start`, `space-around` and
+// `space-evenly` as `center`; `stretch` and `baseline` behave as the
+// start edge.
+fn flex_static_align(value: u32, free: f64, main_axis: bool) -> f64 {
+    if value == cascade.AL_FLEX_END {
+        return free
+    }
+    if value == cascade.AL_CENTER {
+        return free / 2.0
+    }
+    if main_axis && (value == cascade.AL_SPACE_AROUND ||
+    value == cascade.AL_SPACE_EVENLY) {
+        return free / 2.0
+    }
+    return 0.0
+}
+
+fn flex_abspos_static(b: Gc[Box], content_w: f64, inner_main: f64,
+    inner_cross: f64, column: bool, main_reverse: bool, wrap_reverse: bool) {
+    let s: Gc[Style] = b.style
+    let jc: u32 = cascade.style_justify_content(s)
+    var i: u64 = 0
+    let n: u64 = box.box_kids(b)
+    while i < n {
+        let c: Gc[Box] = box.box_kid(b, i)
+        if is_abs(c) {
+            resolve_edges(c, content_w)
+            let cs: Gc[Style] = c.style
+            var wv: f64 = 0.0
+            var hv: f64 = 0.0
+            let has_w: bool = box.resolve(cs, cascade.S_WIDTH, content_w, &wv)
+            let has_h: bool = box.resolve(cs, cascade.S_HEIGHT, inner_cross, &hv)
+            var outer_w: f64 = c.ml + c.mr
+            if has_w {
+                outer_w = outer_w + specified_to_border(c, wv, h_extra(c))
+            }
+            var outer_h: f64 = c.mt + c.mb
+            if has_h {
+                outer_h = outer_h + specified_to_border(c, hv, v_extra(c))
+            }
+            var main_size: f64 = outer_w
+            var cross_size: f64 = outer_h
+            if column {
+                main_size = outer_h
+                cross_size = outer_w
+            }
+            let free_main: f64 = inner_main - main_size
+            let free_cross: f64 = inner_cross - cross_size
+            var mp: f64 = flex_static_align(jc, free_main, true)
+            if main_reverse {
+                mp = free_main - mp
+            }
+            let al: u32 = flex_align_self(s, cs)
+            var cp: f64 = flex_static_align(al, free_cross, false)
+            if wrap_reverse {
+                cp = free_cross - cp
+            }
+            if column {
+                c.static_x = box.snap(cp)
+                c.static_y = box.snap(mp)
+            } else {
+                c.static_x = box.snap(mp)
+                c.static_y = box.snap(cp)
+            }
+        }
+        i = i + 1
+    }
+}
+
 // THE FLEX CONTAINER. `content_w` is its content width, `height` its
 // content height if `height_given`. Writes the content height into
 // `out_height`.
@@ -2483,6 +2587,22 @@ fn layout_flex(b: Gc[Box], content_w: f64, height_given: bool,
     let items = try flex_collect(b)
     let n: u64 = gcvec_length(items)
     if n == 0 {
+        // No in-flow item, but the abspos children still need their
+        // static position, and the container's content box is what they
+        // are aligned in.
+        var empty_main: f64 = 0.0
+        if main_definite {
+            empty_main = inner_main
+        }
+        var empty_cross: f64 = content_w
+        if !column {
+            empty_cross = 0.0
+            if cross_definite {
+                empty_cross = inner_cross
+            }
+        }
+        flex_abspos_static(b, content_w, empty_main, empty_cross, column,
+            main_reverse, wrap_reverse)
         return true
     }
 
@@ -2640,6 +2760,15 @@ fn layout_flex(b: Gc[Box], content_w: f64, height_given: bool,
         }
         *out_height = low
     }
+    var static_cross: f64 = content_w
+    if !column {
+        static_cross = *out_height
+        if cross_definite {
+            static_cross = inner_cross
+        }
+    }
+    flex_abspos_static(b, content_w, inner_main, static_cross, column,
+        main_reverse, wrap_reverse)
     return true
 }
 
