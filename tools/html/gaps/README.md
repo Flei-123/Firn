@@ -28,3 +28,22 @@ nothing about what is missing -- this file is the counter-calculation.
 The four `<template>` cases carry `#oracle-deviation`: html5lib 1.1 does not
 put the template content into a content tree of its own and can therefore not
 confirm the expectation. It is written by hand from the standard.
+
+## Round B1 — nine of the ten gaps are closed
+
+Foreign content (1..5) and `<template>` (6..9) work; `docs/ROUNDB1.md` has
+the numbers. Two entries were corrected while doing it:
+
+* Case 9, `<template><td>x</td></template>`, carried `#oracle-deviation`
+  and the hand written expectation `content "x"` -- the `td` was supposed
+  to be dropped. It is not: the official suite
+  (`tests/data/html5lib/template.dat`) keeps the `td` inside the template
+  contents in every comparable case, because "in template" switches to
+  "in row" and "clear the stack back to a table row context" stops at the
+  template. The expectation was corrected to the one of the suite.
+* Case 10, fragment parsing with a context element, stays a failure HERE
+  and only here: `lib/browser/parse_main.fi` (the driver of round 54) has
+  no field for the context element in its job format. Fragment parsing
+  itself is implemented; `lib/browser/b1_main.fi` takes the context, and
+  the 66 + 81 + 9 fragment cases of the official suite pass
+  (`tools/domb1/run.sh`).

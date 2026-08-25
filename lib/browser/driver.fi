@@ -32,6 +32,7 @@ import html.tokenizer
 import browser.node
 import browser.names
 import browser.tree
+import browser.tag
 import browser.token_stream
 
 export {
@@ -39,7 +40,7 @@ export {
     run_new, run_init, run_free,
     run_text_out_bytes, run_text, run_tree, run_document, run_names,
     run_tree_release,
-    run_document_build,
+    run_document_build, run_context_out_bytes, run_root, run_scripting_set,
 }
 
 struct Run {
@@ -50,6 +51,13 @@ struct Run {
     text: mem.CpBuf,
     rest: mem.CpBuf,
     lasttag: mem.CpBuf,
+    // ROUND B1: the context element of the fragment parsing algorithm, as
+    // it stands in the `.dat` files: `td`, `svg path`, `math ms`, `template`.
+    // Empty = a whole document.
+    ctx: mem.Buf,
+    ctx_name: u32,
+    ctx_ns: u32,
+    scripting: bool,
 }
 
 #[no_gc]
@@ -62,6 +70,10 @@ fn run_new() -> Run {
         text: mem.cp_new(),
         rest: mem.cp_new(),
         lasttag: mem.cp_new(),
+        ctx: mem.buf_new(),
+        ctx_name: 0,
+        ctx_ns: 0,
+        scripting: false,
     }
 }
 
@@ -77,6 +89,9 @@ fn run_init(l: *mut Run) -> bool {
     mem.cp_init(&(*l).text)
     mem.cp_init(&(*l).rest)
     mem.cp_init(&(*l).lasttag)
+    mem.buf_init(&(*l).ctx)
+    (*l).ctx_name = 0
+    (*l).ctx_ns = 0
     return true
 }
 
@@ -88,6 +103,7 @@ fn run_free(l: *mut Run) {
     mem.cp_free(&(*l).text)
     mem.cp_free(&(*l).rest)
     mem.cp_free(&(*l).lasttag)
+    mem.buf_free(&(*l).ctx)
 }
 
 #[no_gc]
@@ -107,6 +123,88 @@ fn run_tree(l: *mut Run) -> *mut tree.Tree {
 
 fn run_document(l: *mut Run) -> Gc[Document] {
     return tree.tree_document(&(*l).b)
+}
+
+// The node whose children are the result: the document, or in the fragment
+// case the root element the fragment was built under.
+// The scripting flag for the NEXT document (WHATWG 13.2). It executes
+// nothing -- it only decides whether `noscript` holds raw text.
+#[no_gc]
+fn run_scripting_set(l: *mut Run, on: bool) {
+    (*l).scripting = on
+}
+
+fn run_root(l: *mut Run) -> Gc[Node] {
+    return tree.tree_root(&(*l).b)
+}
+
+// Sets the context element for the NEXT `run_document_build`. An empty
+// name switches fragment parsing off again.
+//
+// The notation is the one of the html5lib `.dat` files: `svg path` and
+// `math ms` carry the namespace in front of the name, everything else is
+// HTML.
+#[no_gc]
+fn run_context_out_bytes(l: *mut Run, p: *mut u8, len: usize) {
+    mem.buf_clear(&(*l).ctx)
+    (*l).ctx_name = 0
+    (*l).ctx_ns = 0
+    if len == 0 {
+        return
+    }
+    var start: usize = 0
+    var ns: u32 = node.NS_HTML
+    var space: usize = len
+    var i: usize = 0
+    while i < len {
+        if *((p as u64 + i as u64) as *mut u8) == 32 as u8 {
+            space = i
+            break
+        }
+        i = i + 1
+    }
+    if space < len {
+        if space == 3 && *(p) == 115 as u8 {
+            ns = node.NS_SVG // "svg "
+        } else if space == 4 && *(p) == 109 as u8 {
+            ns = node.NS_MATHML // "math "
+        }
+        start = space + 1
+    }
+    var k: usize = start
+    while k < len {
+        mem.buf_push(&(*l).ctx, *((p as u64 + k as u64) as *mut u8))
+        k = k + 1
+    }
+    (*l).ctx_ns = ns
+    (*l).ctx_name = names.names_of_bytes(&(*l).nm, mem.buf_ptr(&(*l).ctx),
+        mem.buf_len(&(*l).ctx))
+}
+
+// The tokenizer start state a fragment context asks for
+// (WHATWG 13.2.5, step 4 of the fragment parsing algorithm).
+#[no_gc]
+fn context_state(name: u32, ns: u32, scripting: bool) -> u32 {
+    if ns != node.NS_HTML {
+        return 0
+    }
+    if name == tag.M_NOSCRIPT && scripting {
+        return 3 // RAWTEXT
+    }
+    if name == tag.M_TITLE || name == tag.M_TEXTAREA {
+        return 2 // RCDATA
+    }
+    if name == tag.M_STYLE || name == tag.M_XMP || name == tag.M_IFRAME ||
+    name == tag.M_NOEMBED || name == tag.M_NOFRAMES {
+        return 3 // RAWTEXT
+    }
+    if name == tag.M_SCRIPT {
+        return 4 // script data
+    }
+    if name == tag.M_PLAINTEXT {
+        return 1 // PLAINTEXT
+    }
+    return 0
 }
 
 // Lets go of the tree built last. Without that the state keeps holding it
@@ -195,12 +293,27 @@ fn run_document_build(l: *mut Run) -> u32 {
     let b: *mut tree.Tree = &(*l).b
     let s: *mut tokens.Sink = &(*l).s
     let st: *mut token_stream.Stream = &(*l).st
-    if !tree.tree_init(b, &(*l).nm, st) {
-        return 9
+    let frag: bool = (*l).ctx_name != 0 as u32
+    if frag {
+        if !tree.tree_fragment_init(b, &(*l).nm, st, (*l).ctx_name, (*l).ctx_ns) {
+            return 9
+        }
+    } else {
+        if !tree.tree_init(b, &(*l).nm, st) {
+            return 9
+        }
     }
+    tree.tree_scripting_set(b, (*l).scripting)
     var base: usize = 0
     var state: u32 = 0
     mem.cp_clear(&(*l).lasttag)
+    if frag {
+        // WHATWG 13.2.5 step 4 sets ONLY the tokenizer state. There is no
+        // last start tag in a fragment, so no end tag is an "appropriate
+        // end tag" -- `<!-- inside </script> -->` in a `script` context
+        // stays text down to the last character.
+        state = context_state((*l).ctx_name, (*l).ctx_ns, (*l).scripting)
+    }
     rest_set(&(*l).text, 0, &(*l).rest)
     var rounds: u32 = 0
     while rounds < 4096 as u32 {
@@ -208,6 +321,7 @@ fn run_document_build(l: *mut Run) -> u32 {
         tokens.sink_out_clear(s)
         tokens.sink_set_last_start_tag_cp(s, &(*l).lasttag)
         tokens.sink_begin(s)
+        tree.tree_input_set(b, &(*l).rest)
         if !tokenizer.tokenize(&(*l).rest, state, s) {
             tokens.sink_abort(s)
             return 1
