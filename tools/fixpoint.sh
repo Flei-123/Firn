@@ -48,10 +48,20 @@ fi
 # collector runtimes and 28 test programs disagreed for a reason that had
 # nothing to do with the round. A missing regeneration is now an error
 # here, where it costs one `find`, instead of a puzzle later.
-if [ -n "$(find lib/gc -name '*.fi' -newer lib/firnc1/gctext.fi -print -quit)" ]; then
-    echo "lib/firnc1/gctext.fi is older than lib/gc/*.fi -- run tools/gen_gctext.sh"
+# ROUND B1: the check used to compare MODIFICATION TIMES, and that gave a
+# false alarm on every fresh `git worktree add`: git writes the files in one
+# go, and lib/gc/*.fi can land microseconds after lib/firnc1/gctext.fi
+# without a single byte differing. A time stamp says nothing about content.
+# Now the script generates into a temporary file and COMPARES -- exact, and
+# it does not touch the tree.
+GCTMP=$(mktemp)
+bash tools/gen_gctext.sh "$GCTMP" >/dev/null
+if ! cmp -s "$GCTMP" lib/firnc1/gctext.fi; then
+    rm -f "$GCTMP"
+    echo "lib/firnc1/gctext.fi does not match lib/gc/*.fi -- run tools/gen_gctext.sh"
     exit 1
 fi
+rm -f "$GCTMP"
 
 # --- stage 1 ---------------------------------------------------------------
 # Rebuild when .firnc1 is missing OR a source file is younger -- an

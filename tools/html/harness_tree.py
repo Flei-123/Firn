@@ -98,6 +98,9 @@ def main():
         elif args[i] == "--gaps":
             dirname = GAPS
             i += 1
+        elif args[i] == "--dir":
+            dirname = args[i + 1]
+            i += 2
         else:
             print("unknown option: %s" % args[i])
             return 2

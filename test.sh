@@ -1338,6 +1338,16 @@ if [ "$SMPRC" -eq 0 ]; then
 else
     bad "tools/smp/run.sh failed (see .test-work/smp.log)"
     grep -E '^  FAIL' "$WORK/smp.log" | head -12 | sed 's/^/   /'
+echo "== 59. the official html5lib tests, the DOM and the style tree (tools/domb1/run.sh, ROUND B1) =="
+# The number 59 is fixed for this round; 53 to 58 belong to the rounds that
+# were running next to it.
+bash tools/domb1/run.sh > "$WORK/domb1.log" 2>&1 && B1RC=0 || B1RC=$?
+grep -E '^   (tree construction|DOM and style)|^B1: ' "$WORK/domb1.log" | sed 's/^/ /'
+if [ "$B1RC" -eq 0 ]; then
+    ok
+else
+    bad "tools/domb1/run.sh failed (see .test-work/domb1.log)"
+    grep -E '^   (ERROR|FAILED)|^ *>>' "$WORK/domb1.log" | head -12 | sed 's/^/   /'
 fi
 
 TOTAL=$((PASS + FAIL))

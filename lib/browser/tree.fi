@@ -53,17 +53,22 @@ import browser.node
 import browser.names
 import browser.tag
 import browser.token_stream
+import browser.foreign
+import browser.quirks_data
 
 export {
     Tree,
     EM_INITIAL, EM_BEFORE_HTML, EM_BEFORE_HEAD, EM_IN_HEAD, EM_IN_HEAD_NOSCRIPT,
     EM_AFTER_HEAD, EM_IN_BODY, EM_TEXT, EM_IN_TABLE, EM_IN_TABLE_TEXT,
     EM_IN_CAPTION, EM_IN_COLGROUP, EM_IN_TABLE_BODY, EM_IN_ROW, EM_IN_CELL,
-    EM_IN_SELECT, EM_IN_SELECT_IN_TABLE, EM_AFTER_BODY, EM_IN_FRAMESET,
+    EM_AFTER_BODY, EM_IN_FRAMESET,
     EM_AFTER_FRAMESET, EM_AFTER_AFTER_BODY, EM_AFTER_AFTER_FRAMESET,
-    tree_new, tree_buffer_init, tree_init, tree_free,
-    tree_token, tree_eof, tree_document, tree_error, tree_broken, tree_release,
-    tree_switching, tree_sw_pos, tree_sw_tag, tree_sw_delete,
+    EM_IN_TEMPLATE,
+    tree_new, tree_buffer_init, tree_init, tree_fragment_init, tree_free,
+    tree_token, tree_eof, tree_document, tree_root,
+    tree_error, tree_broken, tree_release,
+    tree_switching, tree_sw_pos, tree_sw_tag, tree_sw_delete, tree_input_set,
+    tree_scripting_set, tree_scripting,
     tree_mode, tree_open_number,
 }
 
@@ -84,20 +89,21 @@ const EM_IN_COLGROUP: u32 = 12
 const EM_IN_TABLE_BODY: u32 = 13
 const EM_IN_ROW: u32 = 14
 const EM_IN_CELL: u32 = 15
-const EM_IN_SELECT: u32 = 16
-const EM_IN_SELECT_IN_TABLE: u32 = 17
+// 16 and 17 were "in select" and "in select in table". WHATWG dropped both
+// insertion modes; the numbers stay free so the rest keeps its value.
 const EM_AFTER_BODY: u32 = 18
 const EM_IN_FRAMESET: u32 = 19
 const EM_AFTER_FRAMESET: u32 = 20
 const EM_AFTER_AFTER_BODY: u32 = 21
 const EM_AFTER_AFTER_FRAMESET: u32 = 22
+// ROUND B1: the 23rd insertion mode.
+const EM_IN_TEMPLATE: u32 = 23
 
 // The scopes of the stack (WHATWG 13.2.4.2).
 const SC_NORMAL: u32 = 0
 const SC_LIST: u32 = 1
 const SC_BUTTON: u32 = 2
 const SC_TABLE: u32 = 3
-const SC_SELECT: u32 = 4
 
 const MAX_OPEN: usize = 512
 const MAX_ACTIVE: usize = 128
@@ -108,6 +114,7 @@ const ZST_PLAINTEXT: u32 = 1
 const ZST_RCDATA: u32 = 2
 const ZST_RAWTEXT: u32 = 3
 const ZST_SCRIPT: u32 = 4
+const ZST_CDATA: u32 = 5
 
 // --------------------------------------------------------------- The state
 
@@ -141,11 +148,27 @@ struct Tree {
     tt_only_space: bool,
 
     // the feedback onto the tokenizer
+    input: *mut mem.CpBuf, // the text of the current tokenizer run (for CDATA)
     switching: u32, // 0 = none, otherwise ZST_*
     sw_pos: usize, // the source position (relative to the current run)
     sw_tag: mem.CpBuf, // the lastStartTag for the restart
     help: mem.CpBuf, // the work buffer (names from the protocol)
     nl_skip: bool, // discard the next U+000A (pre/textarea)
+
+    // ROUND B1: foreign content (SVG/MathML) and fragment parsing.
+    // The stack of template insertion modes (WHATWG 13.2.4.4). A template
+    // has to remember in which mode its CONTENT is parsed -- nesting is
+    // allowed, hence a stack and not a single value.
+    tmpl: [u32; 64],
+    n_tmpl: usize,
+
+    adj: foreign.Adjust, // the name correction tables of WHATWG 13.2.6.5
+    context: Gc[Elem], // the context element of a fragment (else null)
+    fragment: bool, // is this the fragment parsing algorithm?
+    // The SCRIPTING FLAG (WHATWG 13.2). It does NOT execute scripts -- it
+    // only decides how `noscript` is parsed: with scripting its content is
+    // raw text, without it, it is markup.
+    scripting: bool,
 
     // the bookkeeping
     tname: u32, // the atom of the current tag name
@@ -171,6 +194,13 @@ fn tree_new() -> Tree {
         foster: false,
         tt: gc_null[Chain](),
         tt_only_space: true,
+        input: 0 as *mut mem.CpBuf,
+        tmpl: [0; 64],
+        n_tmpl: 0,
+        adj: foreign.adjust_new(),
+        context: gc_null[Elem](),
+        fragment: false,
+        scripting: false,
         switching: 0,
         sw_pos: 0,
         sw_tag: mem.cp_new(),
@@ -195,6 +225,14 @@ fn tree_buffer_init(b: *mut Tree) {
 // Creates a fresh document and resets the state.
 // `false` = out of memory; the caller MUST then fail visibly.
 fn tree_init(b: *mut Tree, nm: *mut names.Names, st: *mut token_stream.Stream) -> bool {
+    // The correction tables are resolved into atoms ONCE and then stand for
+    // every further document (`adjust_init` returns at once when ready).
+    if !foreign.adjust_init(&(*b).adj, nm) {
+        return false
+    }
+    (*b).context = gc_null[Elem]()
+    (*b).fragment = false
+    (*b).n_tmpl = 0
     mem.cp_clear(&(*b).sw_tag)
     mem.cp_clear(&(*b).help)
     (*b).nl_skip = false
@@ -230,6 +268,52 @@ fn tree_init(b: *mut Tree, nm: *mut names.Names, st: *mut token_stream.Stream) -
     (*b).err = 0
     (*b).broken = 0
     return true
+}
+
+// WHATWG 13.2.5 "HTML fragment parsing algorithm", steps 3 to 8. The
+// document and the state come from `tree_init`; on top of that comes an
+// `html` root element (the fragment case of "the topmost element"), the
+// context element and the insertion mode that fits it.
+//
+// The RESULT of a fragment parse is not the document but the children of
+// that root element -- `tree_root` hands it out.
+fn tree_fragment_init(b: *mut Tree, nm: *mut names.Names,
+    st: *mut token_stream.Stream, name: u32, ns: u32) -> bool {
+    if !tree_init(b, nm, st) {
+        return false
+    }
+    let ctx: Gc[Elem] = node.elem_new(name, ns) catch gc_null[Elem]()
+    if ctx == gc_null[Elem]() {
+        return false
+    }
+    let root: Gc[Elem] = node.elem_new(tag.M_HTML, node.NS_HTML) catch gc_null[Elem]()
+    if root == gc_null[Elem]() {
+        return false
+    }
+    node.append_child((*b).doc, root)
+    stack_push(b, root)
+    (*b).fragment = true
+    (*b).context = ctx
+    // `template` as a context: the fragment is parsed straight in "in
+    // template", so the template insertion mode stack starts filled.
+    if ns == node.NS_HTML && name == tag.M_TEMPLATE {
+        template_mode_push(b, EM_IN_TEMPLATE)
+    }
+    insert_mode_reset(b)
+    // The form element pointer would point at the nearest `form` ancestor of
+    // the context element. A fragment out of a .dat file has no ancestors,
+    // so it stays empty -- that is the same case as `innerHTML` on a
+    // free standing element.
+    return true
+}
+
+// The node whose children are the result: the root element in the fragment
+// case, otherwise the document itself.
+fn tree_root(b: *mut Tree) -> Gc[Node] {
+    if (*b).fragment && (*b).n_open > 0 {
+        return (*b).open[0]
+    }
+    return (*b).doc
 }
 
 // Lets go of the tree built last: every Gc field of the state is nulled.
@@ -276,6 +360,27 @@ fn tree_broken(b: *mut Tree) -> u32 {
 }
 
 #[no_gc]
+// The driver hands the text of the CURRENT tokenizer run in. The tree
+// construction needs it for exactly one question: a `<![CDATA[` inside
+// foreign content is a bogus comment for the tokenizer, and to restart it
+// as a CDATA section the tree has to know whether the comment ended at a
+// `>` or at the end of the input -- one character difference in the
+// restart position.
+#[no_gc]
+fn tree_scripting_set(b: *mut Tree, on: bool) {
+    (*b).scripting = on
+}
+
+#[no_gc]
+fn tree_scripting(b: *mut Tree) -> bool {
+    return (*b).scripting
+}
+
+#[no_gc]
+fn tree_input_set(b: *mut Tree, t: *mut mem.CpBuf) {
+    (*b).input = t
+}
+
 fn tree_mode(b: *mut Tree) -> u32 {
     return (*b).mode
 }
@@ -439,15 +544,56 @@ fn stack_pop_to_name(b: *mut Tree, name: u32) {
     }
 }
 
+// ------------------------------------------ The template insertion modes
+
+const MAX_TMPL: usize = 64
+
+fn template_mode_push(b: *mut Tree, m: u32) {
+    if (*b).n_tmpl >= MAX_TMPL {
+        (*b).broken = 5
+        return
+    }
+    (*b).tmpl[(*b).n_tmpl] = m
+    (*b).n_tmpl = (*b).n_tmpl + 1
+}
+
+fn template_mode_pop(b: *mut Tree) {
+    if (*b).n_tmpl > 0 {
+        (*b).n_tmpl = (*b).n_tmpl - 1
+    }
+}
+
+fn template_mode_top(b: *mut Tree) -> u32 {
+    if (*b).n_tmpl == 0 {
+        return EM_IN_BODY
+    }
+    return (*b).tmpl[(*b).n_tmpl - 1]
+}
+
+fn template_on_stack(b: *mut Tree) -> bool {
+    var i: usize = (*b).n_open
+    while i > 0 {
+        i = i - 1
+        if node.elem_is((*b).open[i], tag.M_TEMPLATE) {
+            return true
+        }
+    }
+    return false
+}
+
 // -------------------------------------------------------------- The scopes
 
 // The base list of the scope (WHATWG 13.2.4.2 "has an element in
 // scope"). Everything except the three foreign content groups is HTML.
 fn scope_base_list(name: u32, ns: u32) -> bool {
     if ns == node.NS_HTML {
+        // ROUND B1: `select` stands in this list since the standard dropped
+        // the insertion mode "in select" -- it is what keeps an end tag
+        // from reaching out of a select (webkit02 #48).
         return name == tag.M_APPLET || name == tag.M_CAPTION || name == tag.M_HTML ||
         name == tag.M_TABLE || name == tag.M_TD || name == tag.M_TH ||
-        name == tag.M_MARQUEE || name == tag.M_OBJECT || name == tag.M_TEMPLATE
+        name == tag.M_MARQUEE || name == tag.M_OBJECT || name == tag.M_TEMPLATE ||
+        name == tag.M_SELECT
     }
     if ns == node.NS_MATHML {
         return name == tag.M_MI || name == tag.M_MO || name == tag.M_MN ||
@@ -465,14 +611,6 @@ fn scope_end(name: u32, ns: u32, kind: u32) -> bool {
             return false
         }
         return name == tag.M_HTML || name == tag.M_TABLE || name == tag.M_TEMPLATE
-    }
-    if kind == SC_SELECT {
-        // "has an element in select scope" is phrased the other way round:
-        // everything EXCEPT optgroup/option ends the search.
-        if ns != node.NS_HTML {
-            return true
-        }
-        return !(name == tag.M_OPTGROUP || name == tag.M_OPTION)
     }
     if scope_base_list(name, ns) {
         return true
@@ -618,7 +756,7 @@ fn end_block_group(name: u32) -> bool {
         return false
     }
     return is_block_group(name) || name == tag.M_BUTTON ||
-    name == tag.M_LISTING || name == tag.M_PRE
+    name == tag.M_LISTING || name == tag.M_PRE || name == tag.M_SELECT
 }
 
 fn is_whitespace(c: u32) -> bool {
@@ -632,6 +770,21 @@ fn is_whitespace(c: u32) -> bool {
 // including "foster parenting". The result is TWO values (the parent node
 // and the node the insertion happens BEFORE; a null pointer = append) --
 // Firn has no tuples, so they go out through pointers.
+// ROUND B1: the last step of the algorithm -- a `template` element never
+// takes children itself, they go into its template contents.
+fn site_through_template(parent_out: *mut Gc[Node], ref_out: *mut Gc[Node]) {
+    let e: Gc[Elem] = node.node_as_elem(*parent_out)
+    if e == gc_null[Elem]() || e.ns != node.NS_HTML || e.name != tag.M_TEMPLATE {
+        return
+    }
+    let f: Gc[Fragment] = node.elem_content_read(e)
+    if f == gc_null[Fragment]() {
+        return
+    }
+    *parent_out = f
+    *ref_out = gc_null[Node]()
+}
+
 fn matching_site(b: *mut Tree, overriding: Gc[Node],
     parent_out: *mut Gc[Node], ref_out: *mut Gc[Node]) {
     var target: Gc[Node] = overriding
@@ -641,33 +794,49 @@ fn matching_site(b: *mut Tree, overriding: Gc[Node],
     *parent_out = target
     *ref_out = gc_null[Node]()
     if !(*b).foster {
+        site_through_template(parent_out, ref_out)
         return
     }
     let e: Gc[Elem] = node.node_as_elem(target)
     if e == gc_null[Elem]() || e.ns != node.NS_HTML {
+        site_through_template(parent_out, ref_out)
         return
     }
     if !(e.name == tag.M_TABLE || e.name == tag.M_TBODY || e.name == tag.M_TFOOT ||
         e.name == tag.M_THEAD || e.name == tag.M_TR) {
+        site_through_template(parent_out, ref_out)
         return
     }
-    // Look for the last `table` in the stack.
+    // Look for the last `table` and the last `template` in the stack.
     var i: usize = (*b).n_open
     var table: Gc[Node] = gc_null[Node]()
     var tidx: usize = 0
+    var tmpl: Gc[Node] = gc_null[Node]()
+    var midx: usize = 0
     while i > 0 {
         i = i - 1
-        if node.elem_is((*b).open[i], tag.M_TABLE) {
+        if table == gc_null[Node]() && node.elem_is((*b).open[i], tag.M_TABLE) {
             table = (*b).open[i]
             tidx = i
-            break
         }
+        if tmpl == gc_null[Node]() && node.elem_is((*b).open[i], tag.M_TEMPLATE) {
+            tmpl = (*b).open[i]
+            midx = i
+        }
+    }
+    // A `template` LOWER in the stack than the last table swallows the
+    // foster parented node -- it never leaves the template contents.
+    if tmpl != gc_null[Node]() && (table == gc_null[Node]() || midx > tidx) {
+        *parent_out = tmpl
+        site_through_template(parent_out, ref_out)
+        return
     }
     if table == gc_null[Node]() {
         // The fragment case: into the lowest element of the stack.
         if (*b).n_open > 0 {
             *parent_out = (*b).open[0]
         }
+        site_through_template(parent_out, ref_out)
         return
     }
     if table.parent != gc_null[Node]() {
@@ -678,10 +847,19 @@ fn matching_site(b: *mut Tree, overriding: Gc[Node],
     if tidx > 0 {
         *parent_out = (*b).open[tidx - 1]
     }
+    site_through_template(parent_out, ref_out)
 }
 
-// Sets the attributes of the current start tag token on `e`.
-fn attribute_take(b: *mut Tree, e: Gc[Elem]) -> AllocError!bool {
+// The three adjustment modes of WHATWG 13.2.6.5.
+const ADJ_NONE: u32 = 0
+const ADJ_SVG: u32 = 1
+const ADJ_MATH: u32 = 2
+
+// Sets the attributes of the current start tag token on `e`. `mode` says
+// which correction table applies: inside SVG `attributename` becomes
+// `attributeName`, inside MathML `definitionurl` becomes `definitionURL`,
+// and in both `xlink:href` is split into prefix, local name and namespace.
+fn attribute_take(b: *mut Tree, e: Gc[Elem], mode: u32) -> AllocError!bool {
     let st: *mut token_stream.Stream = (*b).stream
     let n: u32 = token_stream.stream_nattr(st)
     var off: usize = token_stream.stream_attr_first(st)
@@ -696,7 +874,7 @@ fn attribute_take(b: *mut Tree, e: Gc[Elem]) -> AllocError!bool {
             mem.cp_push(buffer, token_stream.chain_cp(st, off, j))
             j = j + 1
         }
-        let aname: u32 = names.names_of_cp((*b).names, buffer)
+        var aname: u32 = names.names_of_cp((*b).names, buffer)
         off = token_stream.chain_end(st, off)
         // the value
         let value = try node.chain_new()
@@ -713,7 +891,22 @@ fn attribute_take(b: *mut Tree, e: Gc[Elem]) -> AllocError!bool {
         if aname == 0 as u32 {
             return false
         }
-        let set: bool = try node.attr_set(e, aname, 0, value)
+        var ans: u32 = 0
+        var aprefix: u32 = 0
+        if mode == ADJ_SVG {
+            aname = foreign.svg_attr_fix(&(*b).adj, aname)
+        } else if mode == ADJ_MATH {
+            aname = foreign.math_attr_fix(&(*b).adj, aname)
+        }
+        if mode != ADJ_NONE {
+            let fi: i64 = foreign.foreign_attr_find(&(*b).adj, aname)
+            if fi >= 0 {
+                aprefix = foreign.foreign_attr_prefix(&(*b).adj, fi)
+                ans = foreign.foreign_attr_ns(&(*b).adj, fi)
+                aname = foreign.foreign_attr_local(&(*b).adj, fi)
+            }
+        }
+        let set: bool = try node.attr_set_full(e, aname, ans, aprefix, value)
         if !set {
             // Duplicate attributes are discarded by the tokenizer already; here it
             // would only be a second guard.
@@ -724,16 +917,23 @@ fn attribute_take(b: *mut Tree, e: Gc[Elem]) -> AllocError!bool {
     return true
 }
 
-// "create an element for a token" -- without inserting.
-fn elem_for_token(b: *mut Tree, ns: u32) -> AllocError!Gc[Elem] {
-    let e = try node.elem_new((*b).tname, ns)
+// "create an element for a token" -- without inserting. `name` may differ
+// from the name in the token: inside SVG the tokenizer delivers `clippath`
+// and the DOM has to carry `clipPath`.
+fn elem_named_for_token(b: *mut Tree, ns: u32, name: u32,
+    mode: u32) -> AllocError!Gc[Elem] {
+    let e = try node.elem_new(name, ns)
     if token_stream.stream_kind((*b).stream) == tokens.TB_START {
-        let ok: bool = try attribute_take(b, e)
+        let ok: bool = try attribute_take(b, e, mode)
         if !ok {
             return gc_null[Elem]()
         }
     }
     return e
+}
+
+fn elem_for_token(b: *mut Tree, ns: u32) -> AllocError!Gc[Elem] {
+    return try elem_named_for_token(b, ns, (*b).tname, ADJ_NONE)
 }
 
 // Copies an element together with its attributes. The adoption agency
@@ -765,6 +965,19 @@ fn node_insert(b: *mut Tree, k: Gc[Node]) {
 // the stack.
 fn elem_insert_for_token(b: *mut Tree, ns: u32) -> AllocError!Gc[Elem] {
     let e = try elem_for_token(b, ns)
+    if e == gc_null[Elem]() {
+        return e
+    }
+    node_insert(b, e)
+    stack_push(b, e)
+    return e
+}
+
+// The same for a foreign element: a namespace, a corrected name and the
+// matching attribute correction.
+fn elem_insert_named(b: *mut Tree, ns: u32, name: u32,
+    mode: u32) -> AllocError!Gc[Elem] {
+    let e = try elem_named_for_token(b, ns, name, mode)
     if e == gc_null[Elem]() {
         return e
     }
@@ -1122,7 +1335,12 @@ fn insert_mode_reset(b: *mut Tree) {
         i = i - 1
         let k: Gc[Node] = (*b).open[i]
         let last: bool = i == 0
-        let e: Gc[Elem] = node.node_as_elem(k)
+        // The fragment case: for the topmost entry the standard asks the
+        // CONTEXT element, not the `html` root that only carries the tree.
+        var e: Gc[Elem] = node.node_as_elem(k)
+        if last && (*b).fragment {
+            e = (*b).context
+        }
         if e == gc_null[Elem]() || e.ns != node.NS_HTML {
             if last {
                 (*b).mode = EM_IN_BODY
@@ -1131,23 +1349,6 @@ fn insert_mode_reset(b: *mut Tree) {
             continue
         }
         let n: u32 = e.name
-        if n == tag.M_SELECT {
-            // Here the standard looks for a surrounding table.
-            var j: usize = i
-            while j > 0 {
-                j = j - 1
-                let a: Gc[Node] = (*b).open[j]
-                if node.elem_is(a, tag.M_TEMPLATE) {
-                    break
-                }
-                if node.elem_is(a, tag.M_TABLE) {
-                    (*b).mode = EM_IN_SELECT_IN_TABLE
-                    return
-                }
-            }
-            (*b).mode = EM_IN_SELECT
-            return
-        }
         if (n == tag.M_TD || n == tag.M_TH) && !last {
             (*b).mode = EM_IN_CELL
             return
@@ -1170,6 +1371,10 @@ fn insert_mode_reset(b: *mut Tree) {
         }
         if n == tag.M_TABLE {
             (*b).mode = EM_IN_TABLE
+            return
+        }
+        if n == tag.M_TEMPLATE {
+            (*b).mode = template_mode_top(b)
             return
         }
         if n == tag.M_HEAD && !last {
@@ -1557,7 +1762,7 @@ fn char_in_body(b: *mut Tree, cp: u32) -> AllocError!u32 {
     return A_DONE
 }
 
-fn char_mode(b: *mut Tree, cp: u32) -> AllocError!u32 {
+fn char_html(b: *mut Tree, cp: u32) -> AllocError!u32 {
     let m: u32 = (*b).mode
     if m == EM_INITIAL {
         if is_whitespace(cp) {
@@ -1615,7 +1820,8 @@ fn char_mode(b: *mut Tree, cp: u32) -> AllocError!u32 {
         (*b).mode = EM_IN_BODY
         return A_ERNEUT
     }
-    if m == EM_IN_BODY || m == EM_IN_CAPTION || m == EM_IN_CELL {
+    if m == EM_IN_BODY || m == EM_IN_CAPTION || m == EM_IN_CELL ||
+    m == EM_IN_TEMPLATE {
         return try char_in_body(b, cp)
     }
     if m == EM_TEXT {
@@ -1668,14 +1874,6 @@ fn char_mode(b: *mut Tree, cp: u32) -> AllocError!u32 {
         stack_pop(b)
         (*b).mode = EM_IN_TABLE
         return A_ERNEUT
-    }
-    if m == EM_IN_SELECT || m == EM_IN_SELECT_IN_TABLE {
-        if cp == 0 as u32 {
-            parse_error(b)
-            return A_DONE
-        }
-        let ok: bool = try char_insert(b, cp)
-        return A_DONE
     }
     if m == EM_AFTER_BODY || m == EM_AFTER_AFTER_BODY {
         if is_whitespace(cp) {
@@ -1731,36 +1929,91 @@ fn tt_flush(b: *mut Tree) -> AllocError!bool {
 
 // ----------------------------------------------- "initial" / "before html"
 
-// The quirks detection from the DOCTYPE (WHATWG 13.2.6.4.1).
-// AN HONEST LIMIT: the complete list of the public identifiers of the
-// standard (about 55 prefixes from the time before HTML5) is NOT built in.
-// Implemented are: the "force quirks" flag of the tokenizer, a name != html,
-// a system literal present together with HTML 4.01, and the four
-// prefixes that still turn up today. Everything else counts as "no quirks".
+// Walks a `|` separated list and asks `equal` (an exact match) or a
+// prefix match for every entry.
+fn list_hit(raw: *mut mem.Buf, k: Gc[Chain], exact: bool) -> bool {
+    let total: usize = mem.buf_len(raw)
+    let base: *mut u8 = mem.buf_ptr(raw)
+    var i: usize = 0
+    while i <= total {
+        var j: usize = i
+        while j < total && *((base as u64 + j as u64) as *mut u8) != 124 as u8 {
+            j = j + 1
+        }
+        if j > i {
+            let p: *mut u8 = (base as u64 + i as u64) as *mut u8
+            if exact {
+                if node.chain_equal_ascii_small(k, p, j - i) {
+                    return true
+                }
+            } else {
+                if node.chain_starts_ascii_small(k, p, j - i) {
+                    return true
+                }
+            }
+        }
+        if j >= total {
+            return false
+        }
+        i = j + 1
+    }
+    return false
+}
+
+// The quirks detection from the DOCTYPE (WHATWG 13.2.6.4.1). ROUND B1: the
+// list is COMPLETE -- the 55 public identifier prefixes, the three exact
+// public identifiers, the system identifier of the IBM DTD and the two
+// prefixes whose answer depends on whether a system identifier is there.
+// The lists stand in the generated lib/browser/quirks_data.fi.
 fn doctype_mode(b: *mut Tree, name: Gc[Chain], pubid: Gc[Chain], sysid: Gc[Chain],
     force: bool, has_pubid: bool, has_sysid: bool) -> u32 {
     var lit_html: [u8; 4] = "html"
     if force || !node.chain_equal_ascii(name, &lit_html[0], 4) {
         return node.MODE_QUIRKS
     }
-    var p_x_frame: [u8; 32] = "-//W3C//DTD XHTML 1.0 Frameset//"
-    var p_x_trans: [u8; 36] = "-//W3C//DTD XHTML 1.0 Transitional//"
-    var p_h_frame: [u8; 32] = "-//W3C//DTD HTML 4.01 Frameset//"
-    var p_h_trans: [u8; 36] = "-//W3C//DTD HTML 4.01 Transitional//"
+    var raw: mem.Buf = mem.buf_new()
+    mem.buf_init(&raw)
+    var answer: u32 = node.MODE_NO_QUIRKS
     if has_pubid {
-        if node.chain_starts_ascii_small(pubid, &p_h_frame[0], 32) ||
-        node.chain_starts_ascii_small(pubid, &p_h_trans[0], 36) {
-            if has_sysid {
-                return node.MODE_LIMITED
-            }
-            return node.MODE_QUIRKS
-        }
-        if node.chain_starts_ascii_small(pubid, &p_x_frame[0], 32) ||
-        node.chain_starts_ascii_small(pubid, &p_x_trans[0], 36) {
-            return node.MODE_LIMITED
+        quirks_data.quirks_exact_bytes(&raw)
+        if list_hit(&raw, pubid, true) {
+            answer = node.MODE_QUIRKS
         }
     }
-    return node.MODE_NO_QUIRKS
+    if answer == node.MODE_NO_QUIRKS && has_sysid {
+        mem.buf_clear(&raw)
+        quirks_data.quirks_system_bytes(&raw)
+        if list_hit(&raw, sysid, true) {
+            answer = node.MODE_QUIRKS
+        }
+    }
+    if answer == node.MODE_NO_QUIRKS && has_pubid {
+        mem.buf_clear(&raw)
+        quirks_data.quirks_prefix_bytes(&raw)
+        if list_hit(&raw, pubid, false) {
+            answer = node.MODE_QUIRKS
+        }
+    }
+    if answer == node.MODE_NO_QUIRKS && has_pubid {
+        mem.buf_clear(&raw)
+        quirks_data.both_prefix_bytes(&raw)
+        if list_hit(&raw, pubid, false) {
+            if has_sysid {
+                answer = node.MODE_LIMITED
+            } else {
+                answer = node.MODE_QUIRKS
+            }
+        }
+    }
+    if answer == node.MODE_NO_QUIRKS && has_pubid {
+        mem.buf_clear(&raw)
+        quirks_data.limited_prefix_bytes(&raw)
+        if list_hit(&raw, pubid, false) {
+            answer = node.MODE_LIMITED
+        }
+    }
+    mem.buf_free(&raw)
+    return answer
 }
 
 fn chain_out_stream(b: *mut Tree, off: usize) -> AllocError!Gc[Chain] {
@@ -1897,7 +2150,10 @@ fn m_in_head(b: *mut Tree) -> AllocError!u32 {
             return A_DONE
         }
         if n == tag.M_NOSCRIPT {
-            // The scripting flag is OFF (no scripting, see the top of the file).
+            if (*b).scripting {
+                let ok: bool = try raw_text_elem(b, ZST_RAWTEXT)
+                return A_DONE
+            }
             let e = try elem_insert_for_token(b, node.NS_HTML)
             (*b).mode = EM_IN_HEAD_NOSCRIPT
             return A_DONE
@@ -1906,12 +2162,41 @@ fn m_in_head(b: *mut Tree) -> AllocError!u32 {
             let ok: bool = try raw_text_elem(b, ZST_SCRIPT)
             return A_DONE
         }
+        if n == tag.M_TEMPLATE {
+            let e = try elem_insert_for_token(b, node.NS_HTML)
+            if e == gc_null[Elem]() {
+                return A_OUT
+            }
+            // The content fragment is created RIGHT AWAY: the insertion
+            // point algorithm has to find it, and it must not allocate.
+            let f = try node.elem_content(e)
+            active_push_mark(b)
+            (*b).frameset_ok = false
+            (*b).mode = EM_IN_TEMPLATE
+            template_mode_push(b, EM_IN_TEMPLATE)
+            return A_DONE
+        }
         if n == tag.M_HEAD {
             parse_error(b)
             return A_DONE
         }
     }
     if kind == tokens.TB_END {
+        if n == tag.M_TEMPLATE {
+            if !template_on_stack(b) {
+                parse_error(b)
+                return A_DONE
+            }
+            implicit_close_thorough(b)
+            if !node.elem_is(current(b), tag.M_TEMPLATE) {
+                parse_error(b)
+            }
+            stack_pop_to_name(b, tag.M_TEMPLATE)
+            active_to_mark_clear(b)
+            template_mode_pop(b)
+            insert_mode_reset(b)
+            return A_DONE
+        }
         if n == tag.M_HEAD {
             stack_pop(b)
             (*b).mode = EM_AFTER_HEAD
@@ -2048,6 +2333,11 @@ fn in_body_start(b: *mut Tree) -> AllocError!u32 {
     let n: u32 = (*b).tname
     if n == tag.M_HTML {
         parse_error(b)
+        // Inside a `template` the token is dropped: the attributes must not
+        // reach the `html` element outside it.
+        if template_on_stack(b) {
+            return A_DONE
+        }
         if (*b).n_open > 0 {
             let ok: bool = try attribute_amend(b, node.node_as_elem((*b).open[0]))
         }
@@ -2061,7 +2351,8 @@ fn in_body_start(b: *mut Tree) -> AllocError!u32 {
     }
     if n == tag.M_BODY {
         parse_error(b)
-        if (*b).n_open < 2 || !node.elem_is((*b).open[1], tag.M_BODY) {
+        if (*b).n_open < 2 || !node.elem_is((*b).open[1], tag.M_BODY) ||
+        template_on_stack(b) {
             return A_DONE
         }
         (*b).frameset_ok = false
@@ -2262,6 +2553,14 @@ fn in_body_start(b: *mut Tree) -> AllocError!u32 {
         return A_DONE
     }
     if n == tag.M_INPUT {
+        if context_is(b, tag.M_SELECT) {
+            parse_error(b)
+            return A_DONE
+        }
+        if in_scope(b, tag.M_SELECT, SC_NORMAL) {
+            parse_error(b)
+            stack_pop_to_name(b, tag.M_SELECT)
+        }
         let ok: bool = try active_restore(b)
         var lit_hidden: [u8; 6] = "hidden"
         let hidden: bool = tok_type_is(b, &lit_hidden[0], 6)
@@ -2278,6 +2577,13 @@ fn in_body_start(b: *mut Tree) -> AllocError!u32 {
     if n == tag.M_HR {
         if in_scope(b, tag.M_P, SC_BUTTON) {
             p_close(b)
+        }
+        if in_scope(b, tag.M_SELECT, SC_NORMAL) {
+            implicit_close(b, 0)
+            if in_scope(b, tag.M_OPTION, SC_NORMAL) ||
+            in_scope(b, tag.M_OPTGROUP, SC_NORMAL) {
+                parse_error(b)
+            }
         }
         let ok: bool = try empty_elem(b)
         (*b).frameset_ok = false
@@ -2315,25 +2621,50 @@ fn in_body_start(b: *mut Tree) -> AllocError!u32 {
         let ok: bool = try raw_text_elem(b, ZST_RAWTEXT)
         return A_DONE
     }
-    if n == tag.M_NOEMBED {
+    if n == tag.M_NOEMBED || (n == tag.M_NOSCRIPT && (*b).scripting) {
         let ok: bool = try raw_text_elem(b, ZST_RAWTEXT)
         return A_DONE
     }
+    // ROUND B1: `select` no longer has an insertion mode of its own. The
+    // WHATWG standard dropped "in select" and "in select in table"
+    // ("relaxed select parsing"); everything now happens in "in body", and
+    // a `select` takes arbitrary content.
     if n == tag.M_SELECT {
+        if context_is(b, tag.M_SELECT) {
+            parse_error(b)
+            return A_DONE
+        }
+        if in_scope(b, tag.M_SELECT, SC_NORMAL) {
+            parse_error(b)
+            stack_pop_to_name(b, tag.M_SELECT)
+            return A_DONE
+        }
         let ok: bool = try active_restore(b)
         let e = try elem_insert_for_token(b, node.NS_HTML)
         (*b).frameset_ok = false
-        let m: u32 = (*b).mode
-        if m == EM_IN_TABLE || m == EM_IN_CAPTION || m == EM_IN_TABLE_BODY ||
-        m == EM_IN_ROW || m == EM_IN_CELL {
-            (*b).mode = EM_IN_SELECT_IN_TABLE
-        } else {
-            (*b).mode = EM_IN_SELECT
-        }
         return A_DONE
     }
-    if n == tag.M_OPTGROUP || n == tag.M_OPTION {
-        if node.elem_is(current(b), tag.M_OPTION) {
+    if n == tag.M_OPTION {
+        if in_scope(b, tag.M_SELECT, SC_NORMAL) {
+            implicit_close(b, tag.M_OPTGROUP)
+            if in_scope(b, tag.M_OPTION, SC_NORMAL) {
+                parse_error(b)
+            }
+        } else if node.elem_is(current(b), tag.M_OPTION) {
+            stack_pop(b)
+        }
+        let ok: bool = try active_restore(b)
+        let e = try elem_insert_for_token(b, node.NS_HTML)
+        return A_DONE
+    }
+    if n == tag.M_OPTGROUP {
+        if in_scope(b, tag.M_SELECT, SC_NORMAL) {
+            implicit_close(b, 0)
+            if in_scope(b, tag.M_OPTION, SC_NORMAL) ||
+            in_scope(b, tag.M_OPTGROUP, SC_NORMAL) {
+                parse_error(b)
+            }
+        } else if node.elem_is(current(b), tag.M_OPTION) {
             stack_pop(b)
         }
         let ok: bool = try active_restore(b)
@@ -2353,14 +2684,17 @@ fn in_body_start(b: *mut Tree) -> AllocError!u32 {
         return A_DONE
     }
     if n == tag.M_MATH || n == tag.M_SVG {
-        // Round 54: ONLY the namespace, not the rule set for foreign content
-        // (see the top of this file).
         let ok: bool = try active_restore(b)
         var ns: u32 = node.NS_MATHML
+        var amode: u32 = ADJ_MATH
         if n == tag.M_SVG {
             ns = node.NS_SVG
+            amode = ADJ_SVG
         }
-        let e = try elem_insert_for_token(b, ns)
+        let e = try elem_insert_named(b, ns, n, amode)
+        if e == gc_null[Elem]() {
+            return A_OUT
+        }
         if tok_self_closing(b) {
             stack_pop(b)
         }
@@ -2925,132 +3259,45 @@ fn m_in_cell(b: *mut Tree) -> AllocError!u32 {
     return try m_in_body(b)
 }
 
-// ------------------------------------------------------------- "in select"
+// ------------------------------------------------------------ "in template"
 
-fn m_in_select(b: *mut Tree) -> AllocError!u32 {
+fn m_in_template(b: *mut Tree) -> AllocError!u32 {
     let kind: u32 = token_stream.stream_kind((*b).stream)
+    if kind == tokens.TB_COMMENT || kind == tokens.TB_DOCTYPE {
+        return try m_in_body(b)
+    }
     let n: u32 = (*b).tname
-    if kind == tokens.TB_COMMENT {
-        let ok: bool = try comment_insert(b, gc_null[Node]())
-        return A_DONE
-    }
-    if kind == tokens.TB_DOCTYPE {
-        parse_error(b)
-        return A_DONE
-    }
     if kind == tokens.TB_START {
-        if n == tag.M_HTML {
-            return try m_in_body(b)
-        }
-        if n == tag.M_OPTION {
-            if node.elem_is(current(b), tag.M_OPTION) {
-                stack_pop(b)
-            }
-            let e = try elem_insert_for_token(b, node.NS_HTML)
-            return A_DONE
-        }
-        if n == tag.M_OPTGROUP {
-            if node.elem_is(current(b), tag.M_OPTION) {
-                stack_pop(b)
-            }
-            if node.elem_is(current(b), tag.M_OPTGROUP) {
-                stack_pop(b)
-            }
-            let e = try elem_insert_for_token(b, node.NS_HTML)
-            return A_DONE
-        }
-        if n == tag.M_HR {
-            if node.elem_is(current(b), tag.M_OPTION) {
-                stack_pop(b)
-            }
-            if node.elem_is(current(b), tag.M_OPTGROUP) {
-                stack_pop(b)
-            }
-            let ok: bool = try empty_elem(b)
-            return A_DONE
-        }
-        if n == tag.M_SELECT {
-            parse_error(b)
-            if !in_scope(b, tag.M_SELECT, SC_SELECT) {
-                return A_DONE
-            }
-            stack_pop_to_name(b, tag.M_SELECT)
-            insert_mode_reset(b)
-            return A_DONE
-        }
-        if n == tag.M_INPUT || n == tag.M_KEYGEN || n == tag.M_TEXTAREA {
-            parse_error(b)
-            if !in_scope(b, tag.M_SELECT, SC_SELECT) {
-                return A_DONE
-            }
-            stack_pop_to_name(b, tag.M_SELECT)
-            insert_mode_reset(b)
-            return A_ERNEUT
-        }
-        if n == tag.M_SCRIPT || n == tag.M_TEMPLATE {
+        if n == tag.M_BASE || n == tag.M_BASEFONT || n == tag.M_BGSOUND ||
+        n == tag.M_LINK || n == tag.M_META || n == tag.M_NOFRAMES ||
+        n == tag.M_SCRIPT || n == tag.M_STYLE || n == tag.M_TEMPLATE ||
+        n == tag.M_TITLE {
             return try m_in_head(b)
         }
+        var target: u32 = EM_IN_BODY
+        if n == tag.M_CAPTION || n == tag.M_COLGROUP || n == tag.M_TBODY ||
+        n == tag.M_TFOOT || n == tag.M_THEAD {
+            target = EM_IN_TABLE
+        } else if n == tag.M_COL {
+            target = EM_IN_COLGROUP
+        } else if n == tag.M_TR {
+            target = EM_IN_TABLE_BODY
+        } else if n == tag.M_TD || n == tag.M_TH {
+            target = EM_IN_ROW
+        }
+        template_mode_pop(b)
+        template_mode_push(b, target)
+        (*b).mode = target
+        return A_ERNEUT
     }
     if kind == tokens.TB_END {
-        if n == tag.M_OPTGROUP {
-            if node.elem_is(current(b), tag.M_OPTION) && (*b).n_open >= 2 &&
-            node.elem_is((*b).open[(*b).n_open - 2], tag.M_OPTGROUP) {
-                stack_pop(b)
-            }
-            if node.elem_is(current(b), tag.M_OPTGROUP) {
-                stack_pop(b)
-            } else {
-                parse_error(b)
-            }
-            return A_DONE
-        }
-        if n == tag.M_OPTION {
-            if node.elem_is(current(b), tag.M_OPTION) {
-                stack_pop(b)
-            } else {
-                parse_error(b)
-            }
-            return A_DONE
-        }
-        if n == tag.M_SELECT {
-            if !in_scope(b, tag.M_SELECT, SC_SELECT) {
-                parse_error(b)
-                return A_DONE
-            }
-            stack_pop_to_name(b, tag.M_SELECT)
-            insert_mode_reset(b)
-            return A_DONE
-        }
         if n == tag.M_TEMPLATE {
             return try m_in_head(b)
         }
+        parse_error(b)
+        return A_DONE
     }
-    parse_error(b)
     return A_DONE
-}
-
-fn m_in_select_in_table(b: *mut Tree) -> AllocError!u32 {
-    let kind: u32 = token_stream.stream_kind((*b).stream)
-    let n: u32 = (*b).tname
-    let affected: bool = n == tag.M_CAPTION || n == tag.M_TABLE || n == tag.M_TBODY ||
-    n == tag.M_TFOOT || n == tag.M_THEAD || n == tag.M_TR || n == tag.M_TD ||
-    n == tag.M_TH
-    if kind == tokens.TB_START && affected {
-        parse_error(b)
-        stack_pop_to_name(b, tag.M_SELECT)
-        insert_mode_reset(b)
-        return A_ERNEUT
-    }
-    if kind == tokens.TB_END && affected {
-        parse_error(b)
-        if !in_scope(b, n, SC_TABLE) {
-            return A_DONE
-        }
-        stack_pop_to_name(b, tag.M_SELECT)
-        insert_mode_reset(b)
-        return A_ERNEUT
-    }
-    return try m_in_select(b)
 }
 
 // ----------------------------------------------- "after body" and the rest
@@ -3074,6 +3321,13 @@ fn m_after_body(b: *mut Tree) -> AllocError!u32 {
         return try m_in_body(b)
     }
     if kind == tokens.TB_END && n == tag.M_HTML {
+        // The fragment case: there is no document after the root element,
+        // so the token is dropped and the mode stays "after body". Without
+        // this a trailing comment would land outside the fragment.
+        if (*b).fragment {
+            parse_error(b)
+            return A_DONE
+        }
         (*b).mode = EM_AFTER_AFTER_BODY
         return A_DONE
     }
@@ -3187,9 +3441,341 @@ fn m_after_after_frameset(b: *mut Tree) -> AllocError!u32 {
     return A_DONE
 }
 
+// -------------------------------------------------------- Foreign content
+//
+// WHATWG 13.2.6.5 ("The rules for parsing tokens in foreign content") plus
+// the tree construction DISPATCHER of 13.2.6. Everything the round 54
+// comment at the top of this file listed as missing stands here: the
+// integration points, the name and attribute corrections and the breakout
+// tags.
+
+// "adjusted current node": in a fragment with exactly one element on the
+// stack it is the CONTEXT element, otherwise the current node. Without that
+// `<svg path>` as a fragment context would never reach the foreign rules.
+// "the parser was created as part of the fragment parsing algorithm and the
+// context element is a ... element".
+fn context_is(b: *mut Tree, name: u32) -> bool {
+    if !(*b).fragment || (*b).context == gc_null[Elem]() {
+        return false
+    }
+    return (*b).context.ns == node.NS_HTML && (*b).context.name == name
+}
+
+fn adjusted_current(b: *mut Tree) -> Gc[Node] {
+    if (*b).fragment && (*b).n_open == 1 {
+        return (*b).context
+    }
+    return current(b)
+}
+
+fn mathml_text_point(e: Gc[Elem]) -> bool {
+    if e == gc_null[Elem]() || e.ns != node.NS_MATHML {
+        return false
+    }
+    return e.name == tag.M_MI || e.name == tag.M_MO || e.name == tag.M_MN ||
+    e.name == tag.M_MS || e.name == tag.M_MTEXT
+}
+
+fn value_equal_name(b: *mut Tree, v: Gc[Chain], id: u32) -> bool {
+    if v == gc_null[Chain]() {
+        return false
+    }
+    return node.chain_equal_ascii_small(v, names.names_ptr((*b).names, id),
+        names.names_length((*b).names, id))
+}
+
+// "HTML integration point": `foreignObject`, `desc` and `title` in SVG, and
+// `annotation-xml` in MathML whose `encoding` says HTML.
+fn html_point(b: *mut Tree, e: Gc[Elem]) -> bool {
+    if e == gc_null[Elem]() {
+        return false
+    }
+    if e.ns == node.NS_SVG {
+        return e.name == tag.M_FOREIGNOBJECT || e.name == tag.M_DESC ||
+        e.name == tag.M_TITLE
+    }
+    if e.ns != node.NS_MATHML || e.name != tag.M_ANNOTATION_XML {
+        return false
+    }
+    let v: Gc[Chain] = node.attr_value(e, foreign.a_encoding(&(*b).adj), 0)
+    return value_equal_name(b, v, foreign.a_text_html(&(*b).adj)) ||
+    value_equal_name(b, v, foreign.a_xhtml_xml(&(*b).adj))
+}
+
+// The tree construction dispatcher, WHATWG 13.2.6. `true` = the token is
+// handled by the rules of the current insertion mode.
+fn in_html_content(b: *mut Tree, kind: u32) -> bool {
+    if (*b).n_open == 0 {
+        return true
+    }
+    let e: Gc[Elem] = node.node_as_elem(adjusted_current(b))
+    if e == gc_null[Elem]() {
+        return true
+    }
+    if e.ns == node.NS_HTML {
+        return true
+    }
+    if kind == tokens.TB_CHARACTER {
+        return mathml_text_point(e) || html_point(b, e)
+    }
+    if kind == tokens.TB_START {
+        if mathml_text_point(e) && (*b).tname != foreign.a_mglyph(&(*b).adj) &&
+        (*b).tname != foreign.a_malignmark(&(*b).adj) {
+            return true
+        }
+        if e.ns == node.NS_MATHML && e.name == tag.M_ANNOTATION_XML &&
+        (*b).tname == tag.M_SVG {
+            return true
+        }
+        if html_point(b, e) {
+            return true
+        }
+    }
+    return false
+}
+
+// The name of an open element as the standard compares it: "converted to
+// ASCII lowercase". Only SVG carries names that are not lower case.
+fn foreign_low_name(b: *mut Tree, k: Gc[Node]) -> u32 {
+    let e: Gc[Elem] = node.node_as_elem(k)
+    if e == gc_null[Elem]() {
+        return 0
+    }
+    if e.ns == node.NS_SVG {
+        return foreign.svg_tag_low(&(*b).adj, e.name)
+    }
+    return e.name
+}
+
+// The start tags that END foreign content ("breakout tags").
+fn breakout_name(b: *mut Tree, n: u32) -> bool {
+    if n == tag.M_B || n == tag.M_BIG || n == tag.M_BLOCKQUOTE ||
+    n == tag.M_BODY || n == tag.M_BR || n == tag.M_CENTER || n == tag.M_CODE ||
+    n == tag.M_DD || n == tag.M_DIV || n == tag.M_DL || n == tag.M_DT ||
+    n == tag.M_EM || n == tag.M_EMBED || n == tag.M_H1 || n == tag.M_H2 {
+        return true
+    }
+    if n == tag.M_H3 || n == tag.M_H4 || n == tag.M_H5 || n == tag.M_H6 ||
+    n == tag.M_HEAD || n == tag.M_HR || n == tag.M_I || n == tag.M_IMG ||
+    n == tag.M_LI || n == tag.M_LISTING || n == tag.M_MENU || n == tag.M_META ||
+    n == tag.M_NOBR || n == tag.M_OL || n == tag.M_P || n == tag.M_PRE {
+        return true
+    }
+    if n == tag.M_RUBY || n == tag.M_S || n == tag.M_SMALL || n == tag.M_STRONG ||
+    n == tag.M_STRIKE || n == tag.M_TABLE || n == tag.M_TT || n == tag.M_U ||
+    n == tag.M_UL {
+        return true
+    }
+    return n == foreign.a_span(&(*b).adj) || n == foreign.a_sub(&(*b).adj) ||
+    n == foreign.a_sup(&(*b).adj) || n == foreign.a_var(&(*b).adj)
+}
+
+// `<font>` only breaks out when it carries `color`, `face` or `size`.
+fn font_breaks_out(b: *mut Tree) -> bool {
+    let st: *mut token_stream.Stream = (*b).stream
+    let n: u32 = token_stream.stream_nattr(st)
+    var off: usize = token_stream.stream_attr_first(st)
+    var k: u32 = 0
+    while k < n {
+        mem.cp_clear(&(*b).help)
+        let nl: usize = token_stream.chain_length(st, off)
+        var j: usize = 0
+        while j < nl {
+            mem.cp_push(&(*b).help, token_stream.chain_cp(st, off, j))
+            j = j + 1
+        }
+        let id: u32 = names.names_of_cp((*b).names, &(*b).help)
+        if id == foreign.a_color(&(*b).adj) || id == foreign.a_face(&(*b).adj) ||
+        id == foreign.a_size(&(*b).adj) {
+            return true
+        }
+        off = token_stream.chain_end(st, off)
+        off = token_stream.chain_end(st, off)
+        k = k + 1
+    }
+    return false
+}
+
+fn char_foreign(b: *mut Tree, cp: u32) -> AllocError!u32 {
+    if cp == 0 as u32 {
+        parse_error(b)
+        let bad: bool = try char_insert(b, 0xFFFD as u32)
+        return A_DONE
+    }
+    let ok: bool = try char_insert(b, cp)
+    if !ok {
+        return A_OUT
+    }
+    if !is_whitespace(cp) {
+        (*b).frameset_ok = false
+    }
+    return A_DONE
+}
+
+// Pops until the current node may take HTML content again.
+fn foreign_unwind(b: *mut Tree) {
+    while (*b).n_open > 0 {
+        let e: Gc[Elem] = node.node_as_elem(current(b))
+        if e == gc_null[Elem]() || e.ns == node.NS_HTML ||
+        mathml_text_point(e) || html_point(b, e) {
+            return
+        }
+        stack_pop(b)
+    }
+}
+
+// A `<![CDATA[` in foreign content. The tokenizer knows no tree and
+// therefore made a bogus comment `[CDATA[...` out of it. Here it is turned
+// back: the tokenizer is restarted at the first character of the CDATA
+// CONTENT with the start state `CDATA section`, and the comment is dropped.
+//
+// The restart position is computed, not guessed. A bogus comment covers
+// `<!` + data + `>`, so the `<` lies `data + 3` characters before the end
+// position of the token -- and `data + 2` before it when the input ended
+// without a `>`. Nine characters further (`<![CDATA[`) the content begins.
+fn cdata_restart(b: *mut Tree) -> bool {
+    let st: *mut token_stream.Stream = (*b).stream
+    let off: usize = token_stream.stream_data(st)
+    let n: usize = token_stream.chain_length(st, off)
+    if n < 7 {
+        return false
+    }
+    if token_stream.chain_cp(st, off, 0) != 91 as u32 ||
+    token_stream.chain_cp(st, off, 1) != 67 as u32 ||
+    token_stream.chain_cp(st, off, 2) != 68 as u32 ||
+    token_stream.chain_cp(st, off, 3) != 65 as u32 ||
+    token_stream.chain_cp(st, off, 4) != 84 as u32 ||
+    token_stream.chain_cp(st, off, 5) != 65 as u32 ||
+    token_stream.chain_cp(st, off, 6) != 91 as u32 {
+        return false
+    }
+    let stop: usize = token_stream.stream_pos(st)
+    var before: usize = 3
+    if (*b).input == 0 as *mut mem.CpBuf || stop == 0 ||
+    mem.cp_at((*b).input, stop - 1) != 62 as u32 {
+        before = 2
+    }
+    if stop + 9 < n + before {
+        return false
+    }
+    (*b).switching = ZST_CDATA
+    (*b).sw_pos = stop + 9 - n - before
+    mem.cp_clear(&(*b).sw_tag)
+    return true
+}
+
+fn mark_foreign(b: *mut Tree) -> AllocError!u32 {
+    let st: *mut token_stream.Stream = (*b).stream
+    let kind: u32 = token_stream.stream_kind(st)
+    if kind == tokens.TB_COMMENT {
+        if cdata_restart(b) {
+            return A_DONE
+        }
+        let ok: bool = try comment_insert(b, gc_null[Node]())
+        if !ok {
+            return A_OUT
+        }
+        return A_DONE
+    }
+    if kind == tokens.TB_DOCTYPE {
+        parse_error(b)
+        return A_DONE
+    }
+    let n: u32 = (*b).tname
+    // WHATWG puts the END tags `br` and `p` in the same entry as the
+    // breakout start tags -- `<svg></p><foo>` closes the svg.
+    if kind == tokens.TB_END && (n == tag.M_BR || n == tag.M_P) {
+        parse_error(b)
+        foreign_unwind(b)
+        return try mark_html(b)
+    }
+    if kind == tokens.TB_START {
+        if breakout_name(b, n) || (n == tag.M_FONT && font_breaks_out(b)) {
+            parse_error(b)
+            foreign_unwind(b)
+            // The standard says "reprocess the token according to the rules
+            // in HTML content" -- NOT "run the dispatcher again". In a
+            // fragment with a foreign context element the dispatcher would
+            // still answer "foreign" (the adjusted current node stays the
+            // context element) and the token would circle for ever.
+            return try mark_html(b)
+        }
+        let host: Gc[Elem] = node.node_as_elem(adjusted_current(b))
+        var ns: u32 = node.NS_HTML
+        if host != gc_null[Elem]() {
+            ns = host.ns
+        }
+        var name: u32 = n
+        var amode: u32 = ADJ_NONE
+        if ns == node.NS_SVG {
+            name = foreign.svg_tag_fix(&(*b).adj, n)
+            amode = ADJ_SVG
+        } else if ns == node.NS_MATHML {
+            amode = ADJ_MATH
+        }
+        let e = try elem_insert_named(b, ns, name, amode)
+        if e == gc_null[Elem]() {
+            return A_OUT
+        }
+        if tok_self_closing(b) {
+            stack_pop(b)
+        }
+        return A_DONE
+    }
+    // An end tag. `script` in the SVG namespace has a rule of its own -- and
+    // without a script engine it is exactly "pop".
+    if n == tag.M_SCRIPT {
+        let e: Gc[Elem] = node.node_as_elem(current(b))
+        if e != gc_null[Elem]() && e.ns == node.NS_SVG && e.name == tag.M_SCRIPT {
+            stack_pop(b)
+            return A_DONE
+        }
+    }
+    if (*b).n_open == 0 {
+        return A_DONE
+    }
+    var i: usize = (*b).n_open - 1
+    if foreign_low_name(b, (*b).open[i]) != n {
+        parse_error(b)
+    }
+    var round: u32 = 0
+    while round < 1024 as u32 {
+        round = round + 1
+        if i == 0 {
+            return A_DONE
+        }
+        if foreign_low_name(b, (*b).open[i]) == n {
+            while (*b).n_open > i {
+                stack_pop(b)
+            }
+            return A_DONE
+        }
+        i = i - 1
+        let e: Gc[Elem] = node.node_as_elem((*b).open[i])
+        if e != gc_null[Elem]() && e.ns == node.NS_HTML {
+            return try mark_html(b)
+        }
+    }
+    return A_DONE
+}
+
 // ---------------------------------------------------------- The dispatcher
 
+fn char_mode(b: *mut Tree, cp: u32) -> AllocError!u32 {
+    if in_html_content(b, tokens.TB_CHARACTER) {
+        return try char_html(b, cp)
+    }
+    return try char_foreign(b, cp)
+}
+
 fn mark_mode(b: *mut Tree) -> AllocError!u32 {
+    if in_html_content(b, token_stream.stream_kind((*b).stream)) {
+        return try mark_html(b)
+    }
+    return try mark_foreign(b)
+}
+
+fn mark_html(b: *mut Tree) -> AllocError!u32 {
     let m: u32 = (*b).mode
     if m == EM_INITIAL {
         return try m_initial(b)
@@ -3237,11 +3823,8 @@ fn mark_mode(b: *mut Tree) -> AllocError!u32 {
     if m == EM_IN_CELL {
         return try m_in_cell(b)
     }
-    if m == EM_IN_SELECT {
-        return try m_in_select(b)
-    }
-    if m == EM_IN_SELECT_IN_TABLE {
-        return try m_in_select_in_table(b)
+    if m == EM_IN_TEMPLATE {
+        return try m_in_template(b)
     }
     if m == EM_AFTER_BODY {
         return try m_after_body(b)
@@ -3307,10 +3890,37 @@ fn eof_mode(b: *mut Tree) -> AllocError!u32 {
         let ok: bool = try tt_flush(b)
         return A_ERNEUT
     }
-    if m == EM_IN_CAPTION || m == EM_IN_CELL {
+    if m == EM_IN_TEMPLATE {
+        // WHATWG: without a template on the stack this is "stop parsing".
+        if !template_on_stack(b) {
+            return A_DONE
+        }
+        parse_error(b)
+        stack_pop_to_name(b, tag.M_TEMPLATE)
+        active_to_mark_clear(b)
+        template_mode_pop(b)
+        insert_mode_reset(b)
+        return A_ERNEUT
+    }
+    // WHATWG: "in table", "in table body", "in row", "in cell" and
+    // "in caption" all send the end-of-file token on to "in body", and
+    // "in body" asks the stack of template insertion modes. That is what
+    // makes the missing `body` appear after `<template><template><table>`.
+    if m == EM_IN_BODY || m == EM_IN_CAPTION || m == EM_IN_CELL ||
+    m == EM_IN_TABLE || m == EM_IN_TABLE_BODY || m == EM_IN_ROW {
+        if (*b).n_tmpl > 0 {
+            (*b).mode = EM_IN_TEMPLATE
+            return A_ERNEUT
+        }
         return A_DONE
     }
     if m == EM_IN_COLGROUP {
+        // WHATWG: the end-of-file token goes to "in body" -- and there the
+        // stack of template insertion modes is asked.
+        if (*b).n_tmpl > 0 {
+            (*b).mode = EM_IN_TEMPLATE
+            return A_ERNEUT
+        }
         if !node.elem_is(current(b), tag.M_COLGROUP) {
             return A_DONE
         }
