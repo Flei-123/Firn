@@ -123,7 +123,7 @@ pub const ATTRS: &[AttrInfo] = &[
         name: "constant_time",
         target: Target::Func,
         args: 0,
-        implemented: false,
+        implemented: true,
         what: "no jump on secret data, checked in the code generator (SPEC 9.2)",
     },
     AttrInfo {
@@ -277,6 +277,9 @@ mod tests {
         // every run time abort (SPEC 13, panic_rt.rs, docs/ROUND89.md).
         // Round 94: plus #[test] -- the test runner finds its cases by it
         // (testrun.rs, lib/test/runner.fi, docs/ROUND94.md).
+        // Round 96: plus #[constant_time] -- with `secret[T]` there are
+        // secret values at last, so the check in the code generator has
+        // something to check (SPEC 9.2, ct.rs, docs/ROUND96.md).
         let u: Vec<&str> = ATTRS.iter().filter(|a| a.implemented).map(|a| a.name).collect();
         assert_eq!(
             u,
@@ -289,7 +292,8 @@ mod tests {
                 "export_c",
                 "allow_escape",
                 "panic_handler",
-                "allow_fp"
+                "allow_fp",
+                "constant_time"
             ]
         );
     }
@@ -298,7 +302,7 @@ mod tests {
     fn not_implemented_attribute_report_next_a_error() {
         // Counter-check to tests/neg/attr_not_implemented.fi: the remaining
         // attributes stay rejected, nothing is silently ignored.
-        for name in ["constant_time", "unwinds", "packed", "align", "layout", "no_move", "hot"] {
+        for name in ["unwinds", "packed", "align", "layout", "no_move", "hot"] {
             let a = search(name).expect(name);
             assert!(!a.implemented, "{} unexpectedly counts as implemented", name);
         }

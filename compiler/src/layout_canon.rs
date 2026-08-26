@@ -123,6 +123,8 @@ fn resolve(t: &TypeExpr, idx: &HashMap<String, usize>) -> Type {
     match t {
         TypeExpr::Ptr { mutable, inner, .. } => Type::ptr(resolve(inner, idx), *mutable),
         TypeExpr::Array { elem, len, .. } => Type::Array(Box::new(resolve(elem, idx)), *len),
+        // ROUND 96: the marking changes no offset and no size (SPEC §9.1).
+        TypeExpr::Secret { inner, .. } => Type::Secret(Box::new(resolve(inner, idx))),
         TypeExpr::Fn { params, ret, .. } => Type::Fn {
             params: params.iter().map(|x| resolve(x, idx)).collect(),
             ret: Box::new(match ret {
@@ -172,6 +174,7 @@ fn tyname(t: &Type, tcx: &TypeCtx) -> String {
         Type::Void => "void".into(),
         Type::UntypedInt => "untyped".into(),
         Type::Error => "?".into(),
+        Type::Secret(inner) => format!("secret[{}]", tyname(inner, tcx)),
         Type::Ptr { mutable, inner } => format!(
             "(ptr {} {})",
             if *mutable { "mut" } else { "const" },

@@ -251,6 +251,7 @@ fn names_self(te: &TypeExpr) -> bool {
         TypeExpr::Named(n, _) => n == "Self",
         TypeExpr::Ptr { inner, .. } => names_self(inner),
         TypeExpr::Array { elem, .. } => names_self(elem),
+        TypeExpr::Secret { inner, .. } => names_self(inner),
         // Round 58: `Self` may hide in the signature of a function value.
         TypeExpr::Fn { params, ret, .. } => {
             params.iter().any(names_self) || ret.as_ref().is_some_and(|t| names_self(t))
@@ -278,6 +279,7 @@ fn te_text(te: &TypeExpr) -> String {
             format!("*{}{}", if *mutable { "mut " } else { "" }, te_text(inner))
         }
         TypeExpr::Array { elem, len, .. } => format!("[{}; {}]", te_text(elem), len),
+        TypeExpr::Secret { inner, .. } => format!("secret[{}]", te_text(inner)),
         TypeExpr::Fn { params, ret, .. } => {
             let ps: Vec<String> = params.iter().map(te_text).collect();
             match ret {

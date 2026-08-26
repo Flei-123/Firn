@@ -55,6 +55,10 @@ fn scalar_fty(t: &Type) -> Option<FTy> {
         // Round 58: a function value is the pointer to its function record.
         Type::Fn { .. } => FTy::Ptr,
         Type::Void => FTy::Void,
+        // ROUND 96: `secret[T]` is the marking, not a machine type —
+        // in FIR it is the very `T` behind it (SPEC §9.1). What the marking
+        // changes lives in `Func::secret`, not in `FTy`.
+        Type::Secret(inner) => return scalar_fty(inner),
         Type::Array(..) | Type::Struct(_) | Type::UntypedInt | Type::Error => return None,
     })
 }
@@ -654,12 +658,25 @@ impl<'a> Lower<'a> {
         // ROUND 71 — the counterpart to the widening in `sema::expr`. The
         // type checker has noted THAT it happens, here it really happens:
         // `cvtss2sd`. One place for it, so that no context can lose it.
-        match r {
+        let r = match r {
             Some(v) if self.info.widen_f32.contains(&e.id) => {
                 Some(self.push(FTy::F64, Op::Cast { src: v, from: FTy::F32 }))
             }
             other => other,
+        };
+        // HOOK ct (ROUND 96, SPEC §9.2) — the marking travels from the type
+        // check INTO the IR. Every value whose type is `secret[T]` lands in
+        // `f.secret`, and from there every pass reads it: `mem2reg` does not
+        // promote it, `opt` does not fold it, `licm` does not move it, the
+        // register allocator leaves it in memory and the code generator
+        // refuses a conditional jump on it. ONE place, so that no kind of
+        // expression can forget it.
+        if let Some(v) = r {
+            if self.ty_of(e).is_secret() {
+                self.f.secret.insert(v);
+            }
         }
+        r
     }
 
     fn lower_expr_inner(&mut self, e: &Expr) -> Option<Val> {
@@ -1968,6 +1985,11 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
     // HOOK kern: `#[interrupt]` — its own calling convention in the code
     // generator (core.rs/codegen_x86.rs, round 52).
     f.interrupt = crate::core::has_interrupt(d);
+    // HOOK ct (ROUND 96, SPEC §9.2): `#[constant_time]` switches the check in
+    // the code generator on. It is the second line of defence — the type
+    // check refuses a branch on a secret long before this — and it is the
+    // one that also holds for a branch that only some later pass invents.
+    f.constant_time = crate::ct::has_constant_time(d);
     dwarf::set_fn(&d.name, d.span.file, d.span.line);
     let mut lo = Lower {
         pinned: HashMap::new(),
@@ -2006,6 +2028,12 @@ fn lower_fn(d: &ast::FnDecl, info: &TypeInfo, dg: &mut Diags) -> Option<Func> {
                 let ft = *ft;
                 let slot = lo.alloca(ft.bytes().max(1), ft.bytes().max(1));
                 let pv = lo.f.param_val(next);
+                // ROUND 96: a parameter of type `secret[T]` arrives marked —
+                // `lower_expr` can only mark what it builds itself, and the
+                // incoming register value is built by the calling convention.
+                if ty.is_secret() {
+                    lo.f.secret.insert(pv);
+                }
                 next += 1;
                 lo.store(ft, slot, pv);
                 lo.declare_ty(&p.name, slot, ty.clone());

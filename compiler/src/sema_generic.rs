@@ -223,6 +223,7 @@ pub(crate) fn type_tag(te: &TypeExpr) -> String {
             format!("{}{}", if *mutable { "ptrmut_" } else { "ptr_" }, type_tag(inner))
         }
         TypeExpr::Array { elem, len, .. } => format!("arr{}_{}", len, type_tag(elem)),
+        TypeExpr::Secret { inner, .. } => format!("secret_{}", type_tag(inner)),
         // Round 58: a function type in the naming scheme. Round brackets and
         // arrows are no identifier characters, so the shape gets spelled out:
         // `fn2_i32_i32_to_bool`.

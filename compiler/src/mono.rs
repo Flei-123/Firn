@@ -225,6 +225,14 @@ fn satisfies(te: &TypeExpr, b: &Bound) -> bool {
             TypeExpr::Array { .. } => false,
             // Round 58: a function value is one word wide, so it is a scalar.
             TypeExpr::Fn { .. } => true,
+            // ROUND 96: a secret is one word wide too, and it is REFUSED
+            // here all the same. A generic function is written once and
+            // instantiated for whatever comes; not one of its lines has been
+            // read against SPEC §9, and `Vec[secret[u8]]` would quietly get
+            // an `if` on a secret through a `sort`. Fail closed: a container
+            // over secrets needs its own review, and until then a plain
+            // `[secret[u8]; N]` is the way (docs/ROUND96.md §7).
+            TypeExpr::Secret { .. } => false,
         },
         // Interfaces are decided by `iface.rs`, not by the type shape.
         Bound::Iface(_) => false,
@@ -256,6 +264,11 @@ fn subst_ty(
         TypeExpr::Array { elem, len, span } => TypeExpr::Array {
             elem: Box::new(subst_ty(elem, map, queue)),
             len: *len,
+            span: *span,
+        },
+        // ROUND 96: `secret[T]` with a type parameter inside it.
+        TypeExpr::Secret { inner, span } => TypeExpr::Secret {
+            inner: Box::new(subst_ty(inner, map, queue)),
             span: *span,
         },
         TypeExpr::Fn { params, ret, span } => TypeExpr::Fn {
@@ -319,6 +332,10 @@ fn subst_name(
 fn with_span(t: &TypeExpr, sp: Span) -> TypeExpr {
     match t {
         TypeExpr::Named(n, _) => TypeExpr::Named(n.clone(), sp),
+        TypeExpr::Secret { inner, .. } => TypeExpr::Secret {
+            inner: inner.clone(),
+            span: sp,
+        },
         TypeExpr::Ptr { mutable, inner, .. } => TypeExpr::Ptr {
             mutable: *mutable,
             inner: inner.clone(),
@@ -589,6 +606,7 @@ fn check_bare_ty(te: &TypeExpr, out: &mut Vec<(Span, String)>) {
             }
         }
         TypeExpr::Ptr { inner, .. } => check_bare_ty(inner, out),
+        TypeExpr::Secret { inner, .. } => check_bare_ty(inner, out),
         TypeExpr::Fn { params, ret, .. } => {
             for p in params {
                 check_bare_ty(p, out);

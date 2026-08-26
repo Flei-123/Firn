@@ -25,6 +25,9 @@ pub enum TypeExpr {
     /// **Round 58** — `fn(T1, T2) -> R`, a function as a value.
     /// `ret == None` is the function without a result (`fn(i32)`).
     Fn { params: Vec<TypeExpr>, ret: Option<Box<TypeExpr>>, span: Span },
+    /// **ROUND 96** — `secret[T]` (SPEC §9.1). Parsed in `ct.rs::hook_type`,
+    /// resolved in `ct.rs::check_secret_ty`.
+    Secret { inner: Box<TypeExpr>, span: Span },
 }
 
 impl TypeExpr {
@@ -34,6 +37,7 @@ impl TypeExpr {
             TypeExpr::Ptr { span, .. } => *span,
             TypeExpr::Array { span, .. } => *span,
             TypeExpr::Fn { span, .. } => *span,
+            TypeExpr::Secret { span, .. } => *span,
         }
     }
 }

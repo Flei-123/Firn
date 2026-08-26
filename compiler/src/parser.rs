@@ -473,6 +473,10 @@ impl<'a> Parser<'a> {
                 if let Some(t) = crate::iface::hook_type(self, &name, sp) {
                     return Some(t);
                 }
+                // HOOK ct: `secret[T]` — the marking on a type (ct.rs, §9.1)
+                if let Some(t) = crate::ct::hook_type(self, &name, sp) {
+                    return Some(t);
+                }
                 if self.kind() == &TokKind::LBracket
                     && !crate::sema_generic::is_generic_struct(&name)
                 {
@@ -2486,7 +2490,6 @@ mod tests {
 /// `SPEC.md` §14 lists them under "not contained".
 fn not_implemented_ty(name: &str) -> Option<&'static str> {
     match name {
-        "secret" => Some("secret[T] and the constant-time primitives (SPEC §9) are not implemented; see ACCEPTANCE.md"),
         "Rc" | "Arc" | "Weak" => Some("Rc/Arc/Weak (SPEC §3.4) are not implemented; see ACCEPTANCE.md"),
         _ => None,
     }

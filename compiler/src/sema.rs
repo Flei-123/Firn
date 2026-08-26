@@ -1390,6 +1390,10 @@ compile time)"
 
     fn check_cond(&mut self, e: &Expr, kw: &str) {
         let t = self.expr(e, Some(&Type::Bool));
+        // HOOK ct (ROUND 96, SPEC §9.1): a secret must not decide a branch.
+        if crate::ct::forbid_branch(self, &t, e.span, kw) {
+            return;
+        }
         if !t.is_error() && t != Type::Bool {
             self.dg.error_note(
                 e.span,
@@ -1570,6 +1574,11 @@ compile time)"
 
     fn index_type(&mut self, base: &Type, idx: &Expr, bspan: Span) -> Type {
         let it = self.expr(idx, Some(&Type::Usize));
+        // HOOK ct (ROUND 96, SPEC §9.1, `C4`): a secret index would put the
+        // secret into the address, and the address into the cache.
+        if crate::ct::forbid_index(self, &it, idx.span) {
+            return Type::Error;
+        }
         if !it.is_error() && it != Type::Usize {
             self.dg.error_note(
                 idx.span,
@@ -1656,7 +1665,21 @@ compile time)"
             return Type::Error;
         }
         self.depth += 1;
+        // HOOK ct (ROUND 96, SPEC §9.1) — CLASSIFICATION, and it sits at the
+        // ONE funnel every context passes through (declaration, assignment,
+        // argument, `return`, struct field, array element). A PUBLIC value
+        // may be used where a secret one is wanted: that direction leaks
+        // nothing. So the wish travels down WITHOUT the marking, and what
+        // comes back public gets the marking here. The other direction does
+        // not exist in a context at all — `declassify(x)` is a call and
+        // stands out in the source text, which is the whole point of it.
+        let want_secret = matches!(hint, Some(Type::Secret(_)));
+        let hint = match hint {
+            Some(Type::Secret(inner)) => Some(&**inner),
+            other => other,
+        };
         let t = self.expr_inner(e, hint);
+        let t = t.like_secret(want_secret);
         self.depth -= 1;
         // ROUND 71 — THE ONE IMPLICIT CONVERSION.
         //
@@ -1828,11 +1851,15 @@ compile time)"
             }
             ExprKind::Cast(inner, te) => {
                 let dst = self.resolve_ty(te);
-                let inner_hint = if dst.is_concrete_int() {
-                    Some(dst.clone())
-                } else if dst == Type::Bool {
+                // ROUND 96: what the source side is told comes from the
+                // PUBLIC type behind the marking — `x as secret[u32]` wants
+                // to hear `u32` down there, nothing else.
+                let dp = dst.public().clone();
+                let inner_hint = if dp.is_concrete_int() {
+                    Some(dp.clone())
+                } else if dp == Type::Bool {
                     Some(Type::I64)
-                } else if dst.is_ptr() {
+                } else if dp.is_ptr() {
                     Some(Type::Usize)
                 } else {
                     None
@@ -1877,6 +1904,12 @@ compile time)"
                         "only a directly named function ('name as *T') may be cast to a raw pointer, for use as a C callback (SPEC §14.5) — a value merely of a function type may be a closure with captures and has no bare code address",
                     );
                     return Type::Error;
+                }
+                // HOOK ct (ROUND 96, SPEC §9.1): `as` may put the marking ON
+                // and may widen a secret into a wider secret; it may never
+                // take the marking off. `declassify(x)` is the only way out.
+                if let Some(t) = crate::ct::cast(self, &src, &dst, e.span) {
+                    return t;
                 }
                 let ok = cast_kind(&src) && cast_kind(&dst);
                 if !ok {
@@ -2007,7 +2040,9 @@ compile time)"
                 if t.is_error() {
                     return Type::Error;
                 }
-                if !(t.is_concrete_int() || t.is_float()) {
+                // ROUND 96: `-x` on a secret is data independent (`neg` is
+                // one instruction, no jump) and keeps the marking.
+                if !(t.public().is_concrete_int() || t.is_float()) {
                     self.dg.error(
                         e.span,
                         format!(
@@ -2027,7 +2062,7 @@ compile time)"
                 if t.is_error() {
                     return Type::Error;
                 }
-                if !t.is_concrete_int() {
+                if !t.public().is_concrete_int() {
                     self.dg.error_note(
                         e.span,
                         format!(
@@ -2045,7 +2080,7 @@ compile time)"
                 if t.is_error() {
                     return Type::Error;
                 }
-                if t != Type::Bool {
+                if *t.public() != Type::Bool {
                     self.dg.error_note(
                         e.span,
                         format!(
@@ -2056,7 +2091,9 @@ compile time)"
                     );
                     return Type::Error;
                 }
-                Type::Bool
+                // ROUND 96: `!secret[bool]` is a `secret[bool]` — one `xor`,
+                // no jump, and the marking must not fall off on the way.
+                Type::Bool.like_secret(t.is_secret())
             }
             UnOp::AddrOf => {
                 let (t, _m) = match self.lvalue(inner) {
@@ -2096,6 +2133,13 @@ compile time)"
         if op.is_logic() {
             let lt = self.expr(l, Some(&Type::Bool));
             let rt = self.expr(r, Some(&Type::Bool));
+            // HOOK ct (ROUND 96, SPEC §9.1): `&&` and `||` SKIP the right
+            // hand side — that is a branch, written without the word `if`.
+            for (t, sp) in [(&lt, l.span), (&rt, r.span)] {
+                if crate::ct::forbid_branch(self, t, sp, op.text()) {
+                    return Type::Error;
+                }
+            }
             for (t, sp) in [(lt, l.span), (rt, r.span)] {
                 if !t.is_error() && t != Type::Bool {
                     self.dg.error(
@@ -2118,6 +2162,14 @@ compile time)"
             if lt.is_error() || rt.is_error() {
                 return Type::Bool;
             }
+            // HOOK ct (ROUND 96, SPEC §9.1): comparing two secrets is
+            // ALLOWED and yields a `secret[bool]` — `ct_eq` is built out of
+            // exactly that. What is forbidden is BRANCHING on the answer,
+            // and that is refused where the branch stands. From here on the
+            // public types decide, and the marking is put back at the end.
+            let secret = lt.is_secret() || rt.is_secret();
+            let lt = lt.public().clone();
+            let rt = rt.public().clone();
             // HOOK gc: identity comparison of two related Gc pointers (gc.rs)
             let same = compatible(&lt, &rt) || crate::gc::is_related(&lt, &rt);
             if !same {
@@ -2129,7 +2181,7 @@ compile time)"
                         self.tcx.name_of(&rt)
                     ),
                 );
-                return Type::Bool;
+                return Type::Bool.like_secret(secret);
             }
             let eq_only = matches!(op, BinOp::Eq | BinOp::Ne);
             // `f64` compares with all six operators. NaN follows IEEE-754
@@ -2154,7 +2206,7 @@ compile time)"
                     ),
                 );
             }
-            return Type::Bool;
+            return Type::Bool.like_secret(secret);
         }
         if matches!(op, BinOp::Shl | BinOp::Shr) {
             let h = self
@@ -2200,6 +2252,25 @@ compile time)"
     /// `x = x + e`, down to the wording of the message - and it does,
     /// because there is only ONE place where the rules stand.
     pub(crate) fn binop_type(&mut self, op: BinOp, lt: &Type, rt: &Type, span: Span) -> Type {
+        // HOOK ct (ROUND 96, SPEC §9.1): as soon as ONE side is secret the
+        // rules of §9 hold — they are stricter than these here and they
+        // decide first (`ct.rs::binop_type`). Whatever survives them lands
+        // back in `binop_type_public` below with the markings taken off.
+        if lt.is_secret() || rt.is_secret() {
+            return crate::ct::binop_type(self, op, lt, rt, span);
+        }
+        self.binop_type_public(op, lt, rt, span)
+    }
+
+    /// The rules above, for PUBLIC operands. Split off in round 96 so that
+    /// the constant-time rules have exactly one door to walk through.
+    pub(crate) fn binop_type_public(
+        &mut self,
+        op: BinOp,
+        lt: &Type,
+        rt: &Type,
+        span: Span,
+    ) -> Type {
         let lt = lt.clone();
         let rt = rt.clone();
         if matches!(op, BinOp::Shl | BinOp::Shr) {
@@ -2766,6 +2837,11 @@ compile time)"
                 }
                 Type::Array(Box::new(t), *len)
             }
+            // HOOK ct (ROUND 96): `secret[T]` — the marking (ct.rs, §9.1)
+            TypeExpr::Secret { inner, span } => {
+                let t = self.resolve_ty_d(inner, d + 1);
+                crate::ct::check_secret_ty(self, t, *span)
+            }
             // Round 58: `fn(T1, T2) -> R` — a function as a value.
             TypeExpr::Fn { params, ret, .. } => {
                 let mut ps = Vec::new();
@@ -2806,6 +2882,13 @@ compile time)"
             TypeExpr::Array { elem, len, .. } => self
                 .resolve_ty_quiet(elem)
                 .map(|t| Type::Array(Box::new(t), *len)),
+            TypeExpr::Secret { inner, .. } => {
+                let t = self.resolve_ty_quiet(inner)?;
+                if t.is_secret() || !(t.is_concrete_int() || t == Type::Bool) {
+                    return None;
+                }
+                Some(Type::Secret(Box::new(t)))
+            }
             TypeExpr::Fn { params, ret, .. } => {
                 let mut ps = Vec::new();
                 for p in params {
@@ -3079,7 +3162,7 @@ fn lit_fits(v: i128, t: &Type) -> bool {
 }
 
 /// May this type take part in an `as` conversion?
-fn cast_kind(t: &Type) -> bool {
+pub(crate) fn cast_kind(t: &Type) -> bool {
     t.is_concrete_int() || *t == Type::Bool || t.is_ptr() || t.is_float()
 }
 
@@ -3105,6 +3188,15 @@ fn float_want(pl: Option<Type>, pr: Option<Type>) -> Option<Type> {
 fn assignable(got: &Type, want: &Type) -> bool {
     if got.is_error() || want.is_error() {
         return true;
+    }
+    // HOOK ct (ROUND 96, SPEC §9.1): a public value may go INTO a secret
+    // place (classification, leaks nothing); a secret never comes out of one
+    // without `declassify`.
+    if let Type::Secret(want_inner) = want {
+        return compatible(got.public(), want_inner);
+    }
+    if got.is_secret() {
+        return false;
     }
     // HOOK gc: free upcast `Gc[Derived]` -> `Gc[Base]`
     // (gc.rs, SPEC 4.4). ONLY in that direction; downwards goes exclusively

@@ -297,6 +297,7 @@ impl Guard<'_> {
             }
             TypeExpr::Ptr { inner, .. } => self.ty(inner),
             TypeExpr::Array { elem, .. } => self.ty(elem),
+            TypeExpr::Secret { inner, .. } => self.ty(inner),
             TypeExpr::Fn { params, ret, .. } => {
                 for p in params {
                     self.ty(p);

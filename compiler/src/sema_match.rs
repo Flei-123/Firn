@@ -734,6 +734,8 @@ fn value_named(te: &TypeExpr) -> Option<String> {
         TypeExpr::Ptr { .. } => None,
         // Round 58: a function value is one word, not a struct by value.
         TypeExpr::Fn { .. } => None,
+        // ROUND 96: a secret is an integer or a bool, never a struct.
+        TypeExpr::Secret { .. } => None,
     }
 }
 
