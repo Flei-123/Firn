@@ -24,9 +24,10 @@ import html.mem
 import std.math
 import browser.node
 import css.cascade
+import font.metrics
 
 export {
-    Box, Item, Frag, FloatCtx, MarginSet,
+    Box, Item, Frag, FloatCtx, MarginSet, TextRun,
     BK_BLOCK, BK_INLINE, BK_TEXT, BK_ATOMIC, BK_ANON, BK_FLEX, BK_LINE,
     F_ABS, F_FLOAT, F_BFC, F_REPLACED, F_HAS_BLOCKS, F_COLLAPSE_THROUGH,
     F_PLACED, F_FROZEN, F_FLEX_ITEM, F_STATIC_ABS, F_FLEX_BOX, F_H_DEPENDS,
@@ -35,6 +36,8 @@ export {
     box_add, box_kid, box_kids,
     margin_empty, margin_add, margin_value, margin_join,
     font_ascent, font_descent, font_advance, font_xheight, used_line_height,
+    font_ascent_fm, font_descent_fm, font_advance_fm, font_xheight_fm,
+    font_kern_fm, used_line_height_fm, textrun_new, box_stamp_font,
     length_px, length_is_auto, length_is_none, resolve, resolve_or_zero,
     clamp_size, sum_h_edges, sum_v_edges, snap,
     is_block_level, is_inline_level, is_bfc_root, establishes_ifc,
@@ -133,6 +136,15 @@ gc class Box {
     thr_neg: f64, // box that collapses through comes to stand
     bot_pos: f64,
     bot_neg: f64,
+    // ROUND B3. `fm` is the address of a `font.metrics.FontSet`, or 0 for
+    // the made-up font of round B2 -- see lib/font/metrics.fi for why it
+    // is a raw address and not a managed pointer. `runs` are the pieces of
+    // TEXT this box put on its lines, and they exist for exactly one
+    // reason: up to round B2 the item list was working material and was
+    // thrown away after the last line, so nothing anywhere knew WHICH
+    // characters stood WHERE. A painter cannot be built on top of that.
+    fm: u64,
+    runs: Gc[GcVec],
     kind: u32,
     flags: u32,
     int_ok: u32,
@@ -158,9 +170,52 @@ fn box_new(kind: u32, s: Gc[Style], e: Gc[Node]) -> AllocError!Gc[Box] {
         rel_x: 0.0, rel_y: 0.0, flex_target: 0.0,
         top_pos: 0.0, top_neg: 0.0, thr_pos: 0.0, thr_neg: 0.0,
         bot_pos: 0.0, bot_neg: 0.0,
+        fm: 0,
+        runs: gc_null[GcVec](),
         kind: kind,
         flags: 0,
         int_ok: 0,
+    }
+}
+
+// One run of text on one line: which characters, where, in what style.
+// The x is the left edge and the y the BASELINE, both in the coordinates
+// the box tree is placed in, so a painter needs nothing but this.
+gc class TextRun {
+    src: Gc[Box], // the BK_TEXT box the characters come from
+    style: Gc[Style],
+    x: f64,
+    y: f64, // the baseline
+    w: f64,
+    first: u32, // index of the first character in the text node
+    n: u32,
+}
+
+fn textrun_new(src: Gc[Box], s: Gc[Style]) -> AllocError!Gc[TextRun] {
+    return try gc TextRun {
+        src: src,
+        style: s,
+        x: 0.0,
+        y: 0.0,
+        w: 0.0,
+        first: 0,
+        n: 0,
+    }
+}
+
+// Hand the same font to every box of a tree. Done in one walk AFTER the
+// tree is built rather than in `box_new`, so that nothing in round B1 or
+// B2 has to grow a parameter it does not use.
+fn box_stamp_font(b: Gc[Box], fm: u64) {
+    if b == gc_null[Box]() {
+        return
+    }
+    b.fm = fm
+    var i: u64 = 0
+    let n: u64 = box_kids(b)
+    while i < n {
+        box_stamp_font(box_kid(b, i), fm)
+        i = i + 1
     }
 }
 
@@ -339,6 +394,41 @@ fn round_px(v: f64) -> f64 {
 
 fn font_ascent(font_size: f64) -> f64 {
     return round_px(font_size * 0.8)
+}
+
+// ROUND B3: the same four numbers, but out of the font that will really
+// be drawn with. `fm == 0` gives the four above, bit for bit -- that is
+// what keeps the corpus of round B2 comparable.
+fn font_ascent_fm(fm: u64, font_size: f64) -> f64 {
+    return metrics.fm_ascent(fm, font_size)
+}
+
+fn font_descent_fm(fm: u64, font_size: f64) -> f64 {
+    return metrics.fm_descent(fm, font_size)
+}
+
+fn font_xheight_fm(fm: u64, font_size: f64) -> f64 {
+    return metrics.fm_xheight(fm, font_size)
+}
+
+fn font_advance_fm(fm: u64, font_size: f64, cp: u32) -> f64 {
+    return metrics.fm_advance(fm, font_size, cp)
+}
+
+fn font_kern_fm(fm: u64, font_size: f64, a: u32, b: u32) -> f64 {
+    return metrics.fm_kern(fm, font_size, a, b)
+}
+
+fn used_line_height_fm(s: Gc[Style], fm: u64) -> f64 {
+    let u: u32 = cascade.style_unit(s, cascade.S_LINE_HEIGHT)
+    let fs: f64 = cascade.style_font_size(s)
+    if u == cascade.U_NORMAL {
+        return font_ascent_fm(fm, fs) + font_descent_fm(fm, fs)
+    }
+    if u == cascade.U_NUMBER {
+        return cascade.style_length(s, cascade.S_LINE_HEIGHT) * fs
+    }
+    return cascade.style_length(s, cascade.S_LINE_HEIGHT)
 }
 
 fn font_descent(font_size: f64) -> f64 {

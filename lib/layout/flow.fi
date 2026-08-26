@@ -190,18 +190,26 @@ fn positioned(b: Gc[Box]) -> bool {
 // be without a word sticking out. Needed wherever a width is decided by
 // the CONTENT and not by the containing block: floats, inline-blocks and
 // flex items with `flex-basis: auto`.
+// ROUND B3: the advance comes from the FONT, one character at a time.
+// Up to round B2 it was one number for the whole run -- correct for Ahem,
+// where every glyph is one em wide, and wrong for every real font, where
+// an `i` is a third of an `m`. `b.fm == 0` still gives the old number, so
+// the corpus of round B2 is measured against the same arithmetic it was.
 fn text_widths(b: Gc[Box], min_out: *mut f64, max_out: *mut f64) {
     let t: Gc[Text] = b.elem as Gc[Text]
-    let adv: f64 = box.font_advance(cascade.style_font_size(b.style))
+    let fs: f64 = cascade.style_font_size(b.style)
+    let fm: u64 = b.fm
     var run: f64 = 0.0
     var total: f64 = 0.0
     var widest: f64 = 0.0
+    var prev: u32 = 0
     var s: Gc[Strand] = t.data.first
     while s != gc_null[Strand]() {
         var i: usize = 0
         let n: usize = s.len as usize
         while i < n {
             let c: u32 = s.chars[i]
+            let adv: f64 = box.font_advance_fm(fm, fs, c)
             if c == 32 as u32 || c == 9 as u32 || c == 10 as u32 ||
             c == 13 as u32 || c == 12 as u32 {
                 if run > widest {
@@ -209,9 +217,15 @@ fn text_widths(b: Gc[Box], min_out: *mut f64, max_out: *mut f64) {
                 }
                 run = 0.0
                 total = total + adv
+                prev = 0
             } else {
-                run = run + adv
-                total = total + adv
+                var k: f64 = 0.0
+                if prev != 0 as u32 {
+                    k = box.font_kern_fm(fm, fs, prev, c)
+                }
+                run = run + adv + k
+                total = total + adv + k
+                prev = c
             }
             i = i + 1
         }
@@ -454,11 +468,12 @@ fn shrink_to_fit(b: Gc[Box], available: f64) -> f64 {
 
 // ---------------------------------------------------------- The inline flow
 
-fn item_style_metrics(s: Gc[Style], above: *mut f64, below: *mut f64) {
+fn item_style_metrics(s: Gc[Style], fm: u64, above: *mut f64,
+    below: *mut f64) {
     let fs: f64 = cascade.style_font_size(s)
-    let a: f64 = box.font_ascent(fs)
-    let d: f64 = box.font_descent(fs)
-    let lh: f64 = box.used_line_height(s)
+    let a: f64 = box.font_ascent_fm(fm, fs)
+    let d: f64 = box.font_descent_fm(fm, fs)
+    let lh: f64 = box.used_line_height_fm(s, fm)
     let half: f64 = (lh - (a + d)) / 2.0
     *above = a + half
     *below = d + half
@@ -561,8 +576,14 @@ fn text_items(c: Gc[Box], items: Gc[GcVec], pending_space: *mut bool,
     let ws: u32 = cascade.style_white_space(s)
     let keep: bool = ws == cascade.WS_PRE || ws == cascade.WS_PRE_WRAP
     let keep_newline: bool = keep || ws == cascade.WS_PRE_LINE
-    let adv: f64 = box.font_advance(cascade.style_font_size(s))
+    let fs: f64 = cascade.style_font_size(s)
+    let fm: u64 = c.fm
+    let space_adv: f64 = box.font_advance_fm(fm, fs, 32 as u32)
     var word: u32 = 0
+    var word_w: f64 = 0.0
+    var word_at: u32 = 0
+    var pos: u32 = 0
+    var prev: u32 = 0
     var strand: Gc[Strand] = t.data.first
     while strand != gc_null[Strand]() {
         var i: usize = 0
@@ -574,12 +595,25 @@ fn text_items(c: Gc[Box], items: Gc[GcVec], pending_space: *mut bool,
             is_nl || ch == 13 as u32 || ch == 12 as u32
             if !is_space {
                 *pending_space = false
+                if word == 0 as u32 {
+                    word_at = pos
+                    word_w = 0.0
+                    prev = 0
+                }
+                var kk: f64 = 0.0
+                if prev != 0 as u32 {
+                    kk = box.font_kern_fm(fm, fs, prev, ch)
+                }
+                word_w = word_w + box.font_advance_fm(fm, fs, ch) + kk
+                prev = ch
                 word = word + 1 as u32
             } else {
+                prev = 0
                 if word > 0 as u32 {
-                    let w = try box.item_new(box.IT_WORD, s, gc_null[Box]())
+                    let w = try box.item_new(box.IT_WORD, s, c)
                     w.chars = word
-                    w.width = adv * (word as f64)
+                    w.first_char = word_at
+                    w.width = word_w
                     let ok2: bool = try gcvec_append[Item](items, w)
                     *any_content = true
                     word = 0
@@ -590,7 +624,7 @@ fn text_items(c: Gc[Box], items: Gc[GcVec], pending_space: *mut bool,
                     *pending_space = false
                 } else if keep {
                     let sp2 = try box.item_new(box.IT_SPACE, s, gc_null[Box]())
-                    sp2.width = adv
+                    sp2.width = box.font_advance_fm(fm, fs, ch)
                     let ok4: bool = try gcvec_append[Item](items, sp2)
                     *any_content = true
                     *pending_space = false
@@ -600,19 +634,21 @@ fn text_items(c: Gc[Box], items: Gc[GcVec], pending_space: *mut bool,
                     // in: `<span>A </span><span> B</span>` puts it in the
                     // first span, and its rectangle is 40 px wide, not 20.
                     let sp3 = try box.item_new(box.IT_SPACE, s, gc_null[Box]())
-                    sp3.width = adv
+                    sp3.width = space_adv
                     let ok5: bool = try gcvec_append[Item](items, sp3)
                     *pending_space = true
                 }
             }
             i = i + 1
+            pos = pos + 1 as u32
         }
         strand = strand.next
     }
     if word > 0 as u32 {
-        let w2 = try box.item_new(box.IT_WORD, s, gc_null[Box]())
+        let w2 = try box.item_new(box.IT_WORD, s, c)
         w2.chars = word
-        w2.width = adv * (word as f64)
+        w2.first_char = word_at
+        w2.width = word_w
         let ok5: bool = try gcvec_append[Item](items, w2)
         *any_content = true
     }
@@ -647,7 +683,7 @@ fn line_extent(b: Gc[Box], items: Gc[GcVec], from: u64, to: u64,
     open: Gc[GcVec], above_out: *mut f64, below_out: *mut f64) {
     var strut_above: f64 = 0.0
     var strut_below: f64 = 0.0
-    item_style_metrics(b.style, &strut_above, &strut_below)
+    item_style_metrics(b.style, b.fm, &strut_above, &strut_below)
     var above: f64 = strut_above
     var below: f64 = strut_below
     // The inline boxes that were opened on an EARLIER line keep counting.
@@ -655,7 +691,7 @@ fn line_extent(b: Gc[Box], items: Gc[GcVec], from: u64, to: u64,
     while oi0 < gcvec_length(open) {
         var oa: f64 = 0.0
         var ob: f64 = 0.0
-        item_style_metrics(gcvec_read[Box](open, oi0).style, &oa, &ob)
+        item_style_metrics(gcvec_read[Box](open, oi0).style, b.fm, &oa, &ob)
         if oa > above {
             above = oa
         }
@@ -680,7 +716,7 @@ fn line_extent(b: Gc[Box], items: Gc[GcVec], from: u64, to: u64,
                     below = h - bl
                 }
             } else if va == cascade.VA_MIDDLE {
-                let half: f64 = box.font_xheight(cascade.style_font_size(b.style)) / 2.0
+                let half: f64 = box.font_xheight_fm(b.fm, cascade.style_font_size(b.style)) / 2.0
                 let top_off: f64 = half + h / 2.0
                 if top_off > above {
                     above = top_off
@@ -689,7 +725,7 @@ fn line_extent(b: Gc[Box], items: Gc[GcVec], from: u64, to: u64,
                     below = h - top_off
                 }
             } else if va == cascade.VA_TEXT_TOP {
-                let a2: f64 = box.font_ascent(cascade.style_font_size(b.style))
+                let a2: f64 = box.font_ascent_fm(b.fm, cascade.style_font_size(b.style))
                 if a2 > above {
                     above = a2
                 }
@@ -697,7 +733,7 @@ fn line_extent(b: Gc[Box], items: Gc[GcVec], from: u64, to: u64,
                     below = h - a2
                 }
             } else if va == cascade.VA_TEXT_BOTTOM {
-                let d2: f64 = box.font_descent(cascade.style_font_size(b.style))
+                let d2: f64 = box.font_descent_fm(b.fm, cascade.style_font_size(b.style))
                 if h - d2 > above {
                     above = h - d2
                 }
@@ -708,7 +744,7 @@ fn line_extent(b: Gc[Box], items: Gc[GcVec], from: u64, to: u64,
         } else if it.kind != box.IT_CLOSE {
             var a: f64 = 0.0
             var d: f64 = 0.0
-            item_style_metrics(it.style, &a, &d)
+            item_style_metrics(it.style, b.fm, &a, &d)
             if a > above {
                 above = a
             }
@@ -825,17 +861,33 @@ fn place_line(b: Gc[Box], items: Gc[GcVec], from: u64, to: u64,
                 } else if va3 == cascade.VA_BOTTOM {
                     top = line_top + height - h3
                 } else if va3 == cascade.VA_MIDDLE {
-                    let half2: f64 = box.font_xheight(cascade.style_font_size(b.style)) / 2.0
+                    let half2: f64 = box.font_xheight_fm(b.fm, cascade.style_font_size(b.style)) / 2.0
                     top = baseline - half2 - h3 / 2.0
                 } else if va3 == cascade.VA_TEXT_TOP {
-                    top = baseline - box.font_ascent(cascade.style_font_size(b.style))
+                    top = baseline - box.font_ascent_fm(b.fm, cascade.style_font_size(b.style))
                 } else if va3 == cascade.VA_TEXT_BOTTOM {
-                    top = baseline + box.font_descent(cascade.style_font_size(b.style)) - h3
+                    top = baseline + box.font_descent_fm(b.fm, cascade.style_font_size(b.style)) - h3
                 }
                 c5.x = x + c5.ml
                 c5.y = top + c5.mt
                 x = x + it4.width
             }
+        } else if it4.kind == box.IT_WORD {
+            // ROUND B3: WHERE this word stands. Without this line the
+            // engine knows the line box and not one letter in it.
+            if it4.holder != gc_null[Box]() {
+                if b.runs == gc_null[GcVec]() {
+                    b.runs = try gcvec_new()
+                }
+                let tr = try box.textrun_new(it4.holder, it4.style)
+                tr.x = x
+                tr.y = baseline
+                tr.w = it4.width
+                tr.first = it4.first_char
+                tr.n = it4.chars
+                let okt: bool = try gcvec_append[TextRun](b.runs, tr)
+            }
+            x = x + it4.width
         } else if it4.kind == box.IT_BREAK && it4.holder != gc_null[Box]() {
             // A `<br>` is an elem and a browser answers
             // `getBoundingClientRect()` for it: zero wide, as tall as the
@@ -893,8 +945,8 @@ fn open_fragment(c: Gc[Box], x: f64, baseline: f64) -> AllocError!bool {
     let fr = try box.frag_new(c)
     fr.x = x
     let fs: f64 = cascade.style_font_size(c.style)
-    let a: f64 = box.font_ascent(fs)
-    let d: f64 = box.font_descent(fs)
+    let a: f64 = box.font_ascent_fm(c.fm, fs)
+    let d: f64 = box.font_descent_fm(c.fm, fs)
     // The CONTENT area of an inline box is ascent plus descent -- not the
     // line height. Padding and border grow it outwards.
     fr.y = baseline - a - c.pt - c.bt
@@ -947,7 +999,7 @@ fn layout_inline(b: Gc[Box], content_w: f64, fc: *mut box.FloatCtx,
     var y: f64 = 0.0
     var last_baseline: f64 = 0.0
     var i: u64 = 0
-    let strut: f64 = box.used_line_height(b.style)
+    let strut: f64 = box.used_line_height_fm(b.style, b.fm)
     let ws: u32 = cascade.style_white_space(b.style)
     let wrap: bool = ws != cascade.WS_NOWRAP && ws != cascade.WS_PRE
     var saw_line: bool = false
@@ -3084,6 +3136,16 @@ fn place_tree(b: Gc[Box], px: f64, py: f64) {
             l.x = cx + l.x
             l.y = cy + l.y
             li = li + 1
+        }
+    }
+    if b.runs != gc_null[GcVec]() {
+        var ri: u64 = 0
+        let rn: u64 = gcvec_length(b.runs)
+        while ri < rn {
+            let tr: Gc[TextRun] = gcvec_read[TextRun](b.runs, ri)
+            tr.x = cx + tr.x
+            tr.y = cy + tr.y
+            ri = ri + 1
         }
     }
     var i2: u64 = 0
