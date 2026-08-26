@@ -1302,6 +1302,45 @@ else
     tail -5 "$WORK/layoutb2.log" | sed 's/^/   /'
 fi
 
+echo "== 62. PAINTING against the official reference tests (tools/paintb3/run.sh, ROUND B3) =="
+# The number 62 is fixed for this round; 60 belongs to round R96 and 61 to
+# round B2, both of which were running next to it.
+#
+# Round B2 turned the tree of styles into a tree of RECTANGLES and could
+# say where every box stands. It still had no picture, and it said so:
+# most of the css/ area of the Web Platform Tests are REFERENCE TESTS,
+# two documents that are rendered and whose PIXELS are compared, and
+# nothing but a rasteriser can run them. This round is that rasteriser.
+#
+# What runs here: a display list in the order of CSS 2.1, Appendix E; a
+# scanline rasteriser with exact, analytic anti-aliasing; round corners,
+# eight border styles, linear and radial gradients, box and text shadows
+# with a real blur, transparency, the separable blend modes and clipping;
+# a TrueType reader with composite glyphs and kerning, whose advance
+# widths flow BACK into the layout so that the line breaks where the
+# letters end; and PNG in both directions. 541 reference pairs lie in
+# tests/data/wpt-ref (PROVENANCE.md there), the method and the numbers are
+# in docs/ROUNDB3.md.
+#
+# THE GUARD, and it is the point of the section: an engine that draws
+# NOTHING passes every reference test in the world -- both sides come out
+# white and white equals white. So a pair counts only if the picture is
+# also not empty, the empty matches are printed separately as `vacuous`,
+# and every own case carries the number of pixels its glyphs really set.
+# That is the lesson of round K7B in the kernel, where a screen was 87 per
+# cent correct and every single letter was missing.
+bash tools/paintb3/run.sh > "$WORK/paintb3.log" 2>&1 && B3RC=0 || B3RC=$?
+grep -E '^   (font |metrics |glyphs drawn|encoder |decoder |corpus |passed |vacuous |failed |reference tests|glyphs: |time/page|1\. ink|2\. shrink|the same with)' \
+    "$WORK/paintb3.log" | sed 's/^/ /'
+grep -E '^(B3 OK|CASES|PNG|TEXTFIT): ' "$WORK/paintb3.log" | sed 's/^/ /'
+if [ "$B3RC" -eq 0 ]; then
+    ok
+else
+    bad "tools/paintb3/run.sh failed (see .test-work/paintb3.log)"
+    grep -E 'FAILED|Traceback|Error' "$WORK/paintb3.log" | head -12 | sed 's/^/   /'
+    tail -5 "$WORK/paintb3.log" | sed 's/^/   /'
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then
