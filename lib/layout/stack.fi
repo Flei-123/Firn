@@ -45,6 +45,30 @@ import layout.box
 
 export {
     paint_order, forms_stacking_context, hit_test,
+    PaintOp, paint_order_ops, PH_BOX, PH_TEXT,
+}
+
+// ROUND B3 -- WHY THE ORDER HAD TO GROW A SECOND HALF.
+//
+// `paint_order` answers "which box lies over which", and round 67 proved
+// that against Chromium at 5171 probe points. For a PICTURE that is not
+// enough, because a box is not painted in one go: its background and its
+// border belong to step 3 or 4 of Appendix E, and the TEXT inside it
+// belongs to step 5 -- after the floats. A float therefore lies over the
+// background of the paragraph beside it and UNDER its letters, and an
+// order with one entry per box cannot say that.
+//
+// So `paint_order_ops` returns the same walk with a PHASE on every entry:
+// `PH_BOX` where the box's own background and border go, `PH_TEXT` where
+// its inline content goes. `paint_order` is untouched and still returns
+// exactly what it returned before -- the proof of round 67 has to keep
+// meaning what it meant.
+const PH_BOX: u32 = 0
+const PH_TEXT: u32 = 1
+
+gc class PaintOp {
+    b: Gc[Box],
+    phase: u32,
 }
 
 // The six lists of one stacking context. They are collected in ONE walk
@@ -56,6 +80,10 @@ gc class PaintCtx {
     inlines: Gc[GcVec], // step 5
     zero: Gc[GcVec], // step 6: positioned, z-index auto or 0
     pos: Gc[GcVec], // step 7: child contexts with z-index > 0
+    // ROUND B3, step 5 as well: every box in this piece that put TEXT on a
+    // line. An anonymous block has no elem and never appears in
+    // `blocks`, but it is where most of the text of a page sits.
+    texts: Gc[GcVec],
 }
 
 fn paintctx_new() -> AllocError!Gc[PaintCtx] {
@@ -65,6 +93,7 @@ fn paintctx_new() -> AllocError!Gc[PaintCtx] {
     let d = try gcvec_new()
     let e = try gcvec_new()
     let f = try gcvec_new()
+    let g = try gcvec_new()
     return try gc PaintCtx {
         neg: a,
         blocks: b,
@@ -72,6 +101,7 @@ fn paintctx_new() -> AllocError!Gc[PaintCtx] {
         inlines: d,
         zero: e,
         pos: f,
+        texts: g,
     }
 }
 
@@ -221,6 +251,9 @@ fn collect(b: Gc[Box], ctx: Gc[PaintCtx]) -> AllocError!bool {
             } else if paints(c) {
                 let ok7: bool = try gcvec_append[Box](ctx.blocks, c)
             }
+            if c.runs != gc_null[GcVec]() {
+                let okt: bool = try gcvec_append[Box](ctx.texts, c)
+            }
             let ok8: bool = try collect(c, ctx)
         }
         i = i + 1
@@ -305,6 +338,110 @@ fn paint_context(b: Gc[Box], out: Gc[GcVec]) -> AllocError!bool {
         i = i + 1
     }
     return true
+}
+
+// ---------------------------------------------------- ROUND B3: the phases
+//
+// The same two functions again, with a phase. They are written out rather
+// than folded into the ones above on purpose: `paint_order` is the thing
+// round 67 measured against a real browser, and a rewrite of it to serve
+// a second caller would make that measurement mean something else.
+
+fn emit_op(out: Gc[GcVec], b: Gc[Box], phase: u32) -> AllocError!bool {
+    if phase == PH_BOX && !paints(b) {
+        return true
+    }
+    let op = try gc PaintOp { b: b, phase: phase }
+    return try gcvec_append[PaintOp](out, op)
+}
+
+fn ops_piece(b: Gc[Box], out: Gc[GcVec]) -> AllocError!bool {
+    let ok: bool = try emit_op(out, b, PH_BOX)
+    let ctx = try paintctx_new()
+    let ok2: bool = try collect(b, ctx)
+    var i: u64 = 0
+    while i < gcvec_length(ctx.blocks) {
+        let ok3: bool = try emit_op(out, gcvec_read[Box](ctx.blocks, i), PH_BOX)
+        i = i + 1
+    }
+    i = 0
+    while i < gcvec_length(ctx.floats) {
+        let ok4: bool = try ops_piece(gcvec_read[Box](ctx.floats, i), out)
+        i = i + 1
+    }
+    i = 0
+    while i < gcvec_length(ctx.inlines) {
+        let ok5: bool = try emit_op(out, gcvec_read[Box](ctx.inlines, i), PH_BOX)
+        i = i + 1
+    }
+    let ok6: bool = try emit_texts(b, ctx, out)
+    return true
+}
+
+fn emit_texts(b: Gc[Box], ctx: Gc[PaintCtx], out: Gc[GcVec]) -> AllocError!bool {
+    if b.runs != gc_null[GcVec]() {
+        let ok: bool = try emit_op(out, b, PH_TEXT)
+    }
+    var i: u64 = 0
+    while i < gcvec_length(ctx.texts) {
+        let ok2: bool = try emit_op(out, gcvec_read[Box](ctx.texts, i), PH_TEXT)
+        i = i + 1
+    }
+    return true
+}
+
+fn ops_context(b: Gc[Box], out: Gc[GcVec]) -> AllocError!bool {
+    let ok: bool = try emit_op(out, b, PH_BOX)
+    let ctx = try paintctx_new()
+    let ok2: bool = try collect(b, ctx)
+    sort_by_z(ctx.neg)
+    sort_by_z(ctx.pos)
+    var i: u64 = 0
+    while i < gcvec_length(ctx.neg) {
+        let ok3: bool = try ops_context(gcvec_read[Box](ctx.neg, i), out)
+        i = i + 1
+    }
+    i = 0
+    while i < gcvec_length(ctx.blocks) {
+        let ok4: bool = try emit_op(out, gcvec_read[Box](ctx.blocks, i), PH_BOX)
+        i = i + 1
+    }
+    i = 0
+    while i < gcvec_length(ctx.floats) {
+        let ok5: bool = try ops_piece(gcvec_read[Box](ctx.floats, i), out)
+        i = i + 1
+    }
+    i = 0
+    while i < gcvec_length(ctx.inlines) {
+        let ok6: bool = try emit_op(out, gcvec_read[Box](ctx.inlines, i), PH_BOX)
+        i = i + 1
+    }
+    let okt: bool = try emit_texts(b, ctx, out)
+    i = 0
+    while i < gcvec_length(ctx.zero) {
+        let c: Gc[Box] = gcvec_read[Box](ctx.zero, i)
+        if forms_stacking_context(c, false) {
+            let ok7: bool = try ops_context(c, out)
+        } else {
+            let ok8: bool = try ops_piece(c, out)
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < gcvec_length(ctx.pos) {
+        let ok9: bool = try ops_context(gcvec_read[Box](ctx.pos, i), out)
+        i = i + 1
+    }
+    return true
+}
+
+fn paint_order_ops(root: Gc[Box]) -> AllocError!Gc[GcVec] {
+    let out = try gcvec_new()
+    if root == gc_null[Box]() {
+        return out
+    }
+    let ok: bool = try ops_context(root, out)
+    return out
 }
 
 // The whole document: one vector of boxes, back to front.
