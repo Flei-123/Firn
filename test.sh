@@ -1255,3 +1255,13 @@ else
     bad "tools/domb1/run.sh failed (see .test-work/domb1.log)"
     grep -E '^   (ERROR|FAILED)|^ *>>' "$WORK/domb1.log" | head -12 | sed 's/^/   /'
 fi
+TOTAL=$((PASS + FAIL))
+echo
+if [ "$FAIL" -eq 0 ]; then
+    echo "PASS $PASS/$TOTAL"
+    exit 0
+else
+    echo "FAIL $FAIL/$TOTAL failed:"
+    printf "%b\n" "$FAILED"
+    exit 1
+fi
