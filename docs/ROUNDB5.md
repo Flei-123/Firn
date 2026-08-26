@@ -186,7 +186,21 @@ auch für einen Browser gelten, der Rauschen malt.
 | html5lib Baumbau (Runde B1) | 1837 / 1936 | **1837 / 1936** (94,89 %) |
 | WPT-Layout, Korpus B2 | 59 / 186 | **59 / 186**, Reflow 471 / 471 |
 | WPT-Referenzbilder, Korpus B3 | 202 / 541 | **202 / 541** (37,34 %), **32 leere abgezogen** |
+| WPT-DOM, Korpus B4 | 380 / 1429 | **380 / 1429** (26,59 %), 170 konnten nicht laufen |
+| ganze Dateien darin (Runde B4) | 15 (Untergrenze) | **16 / 313** |
 | HTTP-Regeln (Runde B4) | 28 / 28 | **28 / 28** |
+| eingegrenzte Neuberechnung (Runde B4) | 20x (Untergrenze) | **103x**, 0 falsche Rechtecke |
+
+Zur DOM-Zeile eine Anmerkung, die dazugehört: `docs/ROUNDB4.md` schreibt
+390 / 1714, die Untergrenze in `tools/liveb4/minquota.txt` steht auf 380.
+Der Lauf hier trifft die **Untergrenze** genau — 380 / 1429, mit 170 statt
+169 Dateien, deren Prüfstand nicht bis zum Ende kam. Die Zahl im Nenner
+ändert sich mit dieser einen Datei, weil ihre Untertests dann gar nicht
+gezählt werden (dieselbe Regel, die B4 sich gegeben hat). Ich habe den
+Unterschied **nicht** auf diese Runde zurückverfolgen können und behaupte
+deshalb auch nicht, dass er von ihr kommt; was ich sagen kann, ist, dass
+der Abnahmelauf von B4 vollständig durchgeht und keine seiner Grenzen
+gefallen ist.
 
 **Die 32 sind der Punkt.** Runde B3 hat gefunden, dass 32 Referenztests
 nur deshalb bestanden, weil **beide Seiten leer waren**, und sie
