@@ -204,3 +204,60 @@ document.write, 4 need the selectedcontent element, 1 is an adoption agency case
 MEASUREMENTS: tools/domb1/run.sh 1837/1936 (94.89 %), same in all three build stages, 17/17 DOM and
 style cases. Section 9b 150/150 own cases, 8 real pages byte-identical across build stages, GC soak
 20000 rounds at +4 KiB. Section 9c 305/305 + 109/109 + 840/840. english 0 0 0 0 0. firnfmt -c clean.
+
+## Round B2 (2026-08-25, branch b2-layout) -- layout, measured against a suite nobody here wrote
+Round B1 left a tree with a computed style on every element and said plainly what was missing: nobody
+knew WHERE anything stood. The layout code itself was not new -- rounds 61 and 67 had built the box
+model, the flow, floats, positioning and a flexbox and measured all of it against Chromium ON CASES
+WRITTEN HERE. That proves the engine does what its author thought, not that the author was right. This
+round brings the foreign measuring stick.
+THE MEASURING STICK, and why it works without a rasteriser: most of the WPT css/ area are reftests
+(pixels), but a large part is SELF-DESCRIBING through resources/check-layout-th.js -- the expectation
+stands in the markup as `data-expected-width`, `data-offset-y` and their kin, and what is compared are
+the CSSOM VIEW accessors: offsetWidth/Left/Top/Height, clientWidth/Height/Left/Top, scrollWidth/Height,
+getBoundingClientRect, the computed display, the used margins and paddings. That is position and size
+instead of pixels. 471 such files from css/css-flexbox, css/CSS2, css/css-box, css/css-sizing,
+css/css-position and css/css-align lie in tests/data/wpt-css (PROVENANCE.md there), harvested by ONE
+mechanical rule: every file in those directories that includes check-layout-th.js. Three groups are set
+aside mechanically and counted separately: `script` (the test builds its own DOM in JavaScript, 92),
+`grid` (next round, 22), `vertical` (writing modes and rtl, 171). The rest, 186 tests, is corpus B2.
+The harness applies the tolerance of check-layout-th.js itself: a difference below one pixel passes,
+because a browser reports these accessors rounded and a layout engine computes in sixty-fourths.
+THE NUMBERS, same harness against three engines: main (rounds 61+67) 42/186 = 22.58 %, after this round
+59/186 = 31.72 % (3535 of 4867 single checks), and CHROMIUM 141 through the same harness 138/186 =
+74.19 %. The third number is what keeps the second honest -- 26 of the 186 are margin-trim tests that
+Chromium fails too, 12 more need an image or a video decoded. tools/layout/run.sh (rounds 61/67) stays
+1087/1087 against the frozen Chromium reference, unchanged, in all three build stages.
+FIVE REAL DEFECTS, all invisible to the 146 own cases of rounds 61/67:
+(1) THE ANONYMOUS BLOCK CARRIED THE PARENT'S STYLE. A box with padding, border or margin holding BOTH
+text and a block gave the anonymous box the parent's edges a SECOND time -- 36 px too low in the case
+that found it. cascade.style_anonymous: initial box properties, inherited properties from the parent.
+(2) A FLEX CONTAINER WITHOUT A DEFINITE MAIN SIZE SHRANK ITS ITEMS TO NOTHING. `flex-direction: column`
+without a height -- the most ordinary flex container on the web -- measured ZERO, because the missing
+height arrived as 0 and 9.7 then found negative free space. Its used main size IS the sum of the
+hypothetical item sizes (9.3.1), so the free space is exactly zero.
+(3) INTRINSIC WIDTHS DID NOT SEE THE MARGINS OF THEIR CHILDREN: they are asked before the subtree is
+laid out, when ml/pl are still zero.
+(4) `start` IS NOT `flex-start`: under row-reverse the physical pair and the flex-relative pair are
+mirror images. Round 67 folded them together; eighteen WPT tests ask exactly that.
+(5) A WRAPPING CONTAINER WITH ONE LINE IS NOT A SINGLE-LINE CONTAINER -- the rule "definite cross size
+goes to the line" removed all free space and made align-content do nothing.
+NEW FEATURES the corpus demanded: the static position of abspos children of a flex container
+(css-flexbox-1 4.1, aligned as the sole item, with the single-item fallbacks of css-align-3), and the
+keyword sizes min-content / max-content / fit-content / stretch (css-sizing-3/4).
+THE SPLIT FOR B3 AND FOR EVERY RESIZE: viewport-INDEPENDENT are the box tree, the styles and the
+intrinsic contribution int_min/int_max of every box (style and text decide it, percentages count as
+zero) -- they survive. Viewport-DEPENDENT is every used value, the line boxes, the fragments, the
+collapsed margins and four flags -- box.reset_box_geometry throws them away and
+flow.relayout_document computes them again. THE PROOF: 471 of 471 documents give, after 800 -> 400 ->
+800, the same output as a single layout at 800. THE COUNTER-CHECK: calling layout_document twice
+WITHOUT the reset, as main does, leaves only 269 of 471 unchanged -- line boxes appended twice, offsets
+added a second time. A browser built on that drifts with every resize.
+WHAT IS MISSING, named: replaced elements have no intrinsic size (canvas/video/svg/object 300x150 and
+the HTML attributes are not read, an image is not decoded -- 24 tests), aspect-ratio (10), gap (6),
+margin-trim (26, nobody passes them), writing modes and rtl (the whole 171-test group, reported at 0),
+grid (next round), tables as a formatting context, form controls, scrollWidth without a scrolling box.
+MEASUREMENTS: test.sh section 61 = tools/layoutb2/run.sh: three build stages reach the SAME 59, reflow
+471/471, limits in tools/layoutb2/minquota.txt. tests/1185..1188 new (anonymous edges, flex base size,
+reflow, keyword sizes), numbers computed by hand and held against Chromium 141 afterwards. english
+0 0 0 0 0.

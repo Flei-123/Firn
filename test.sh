@@ -1255,6 +1255,53 @@ else
     bad "tools/domb1/run.sh failed (see .test-work/domb1.log)"
     grep -E '^   (ERROR|FAILED)|^ *>>' "$WORK/domb1.log" | head -12 | sed 's/^/   /'
 fi
+
+# ROUND K6. 53 to 57 belong to the rounds that were running beside this
+# one; this section is 58 and stays 58.
+echo "== 58. a userland: a shell, twenty-three tools, pipes and redirection (tools/userland/run.sh, ROUND K6) =="
+bash tools/userland/run.sh > "$WORK/userland.log" 2>&1 && ULRC=0 || ULRC=$?
+grep -E '^USERLAND:|the whole userland in octets|the biggest program|programs loaded off the disk' \
+    "$WORK/userland.log" | sed 's/^ */ /'
+if [ "$ULRC" -eq 0 ]; then
+    ok
+else
+    bad "tools/userland/run.sh failed (see .test-work/userland.log)"
+    grep -E '^  FAIL' "$WORK/userland.log" | head -12 | sed 's/^/   /'
+fi
+
+echo "== 61. LAYOUT against the official Web Platform Tests (tools/layoutb2/run.sh, ROUND B2) =="
+# The number 61 is fixed for this round; 60 belongs to round R96, which was
+# running next to it.
+#
+# Round B1 made a tree with a computed style on every element. This round
+# turns that into a tree of RECTANGLES -- and measures it against a suite
+# nobody here wrote. The css/ area of the Web Platform Tests is mostly
+# reftests, which need a rasteriser this round does not have; but a large
+# part of it is SELF-DESCRIBING through `resources/check-layout-th.js`:
+# the expected `offsetWidth`, `offsetLeft`, `clientHeight` and their kin
+# stand in the markup as `data-expected-*` attributes. That is position
+# and size instead of pixels, which is exactly what a layout engine
+# produces. 471 such tests lie in tests/data/wpt-css (PROVENANCE.md there);
+# the corpus, the three groups counted separately and the method are in
+# docs/ROUNDB2.md.
+#
+# The section also proves the SPLIT that a browser lives on: laying the
+# same tree out at 800, then at 400, then at 800 again has to give the
+# first layout back, box for box, for every one of the 471 documents.
+# Only the intrinsic widths survive a reflow -- they are the one thing the
+# window width cannot change.
+bash tools/layoutb2/run.sh > "$WORK/layoutb2.log" 2>&1 && B2RC=0 || B2RC=$?
+grep -E '^   (b2|vertical|grid|script|all but script|corpus B2|reflow) ' \
+    "$WORK/layoutb2.log" | sed 's/^/ /'
+grep -E '^REFLOW: |^B2 OK: ' "$WORK/layoutb2.log" | sed 's/^/ /'
+if [ "$B2RC" -eq 0 ]; then
+    ok
+else
+    bad "tools/layoutb2/run.sh failed (see .test-work/layoutb2.log)"
+    grep -E 'FAILED|Traceback|Error' "$WORK/layoutb2.log" | head -12 | sed 's/^/   /'
+    tail -5 "$WORK/layoutb2.log" | sed 's/^/   /'
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then
