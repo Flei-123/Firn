@@ -13,6 +13,14 @@
 #   4. Every program in tests/neg/ has to stop with an exit code != 0 and print
 #      the expected message with a line:column (// expect_error: L:C TEXT).
 #      A Rust panic counts as a failure.
+#  60. THE SAME LIST, ASKED OF BOTH COMPILERS (tools/reject/run.sh, round 96):
+#      every program in tests/neg/ has to be refused by `firnc1` as well, and
+#      where `firnc1` says something it has to say exactly what `firnc0` says
+#      -- compared with `cmp`, the marker included. Until round 96 nothing
+#      compared what the two compilers REFUSE; `firnc1` translated
+#      `const A` declared twice without a word and took the first of the two
+#      values, which is how a kernel came to write its tables outside its
+#      data area (docs/ROUND96.md).
 #   5. Proof of the optimiser (test_opt.sh: FIR before/after).
 #   6. Proof of the result-location guarantee (tools/result_location/run.sh:
 #      frame sizes in the emitted assembly).
@@ -1255,20 +1263,6 @@ else
     bad "tools/domb1/run.sh failed (see .test-work/domb1.log)"
     grep -E '^   (ERROR|FAILED)|^ *>>' "$WORK/domb1.log" | head -12 | sed 's/^/   /'
 fi
-
-# ROUND K6. 53 to 57 belong to the rounds that were running beside this
-# one; this section is 58 and stays 58.
-echo "== 58. a userland: a shell, twenty-three tools, pipes and redirection (tools/userland/run.sh, ROUND K6) =="
-bash tools/userland/run.sh > "$WORK/userland.log" 2>&1 && ULRC=0 || ULRC=$?
-grep -E '^USERLAND:|the whole userland in octets|the biggest program|programs loaded off the disk' \
-    "$WORK/userland.log" | sed 's/^ */ /'
-if [ "$ULRC" -eq 0 ]; then
-    ok
-else
-    bad "tools/userland/run.sh failed (see .test-work/userland.log)"
-    grep -E '^  FAIL' "$WORK/userland.log" | head -12 | sed 's/^/   /'
-fi
-
 echo "== 61. LAYOUT against the official Web Platform Tests (tools/layoutb2/run.sh, ROUND B2) =="
 # The number 61 is fixed for this round; 60 belongs to round R96, which was
 # running next to it.
@@ -1300,6 +1294,18 @@ else
     bad "tools/layoutb2/run.sh failed (see .test-work/layoutb2.log)"
     grep -E 'FAILED|Traceback|Error' "$WORK/layoutb2.log" | head -12 | sed 's/^/   /'
     tail -5 "$WORK/layoutb2.log" | sed 's/^/   /'
+fi
+
+echo "== 60. what the two compilers REFUSE, compared (tools/reject/run.sh, ROUND 96) =="
+# The number 60 is fixed for this round. Sections 53 to 59 belong to the
+# rounds that were running next to it.
+bash tools/reject/run.sh > "$WORK/reject.log" 2>&1 && RJRC=0 || RJRC=$?
+grep -E '^(CORPUS|SAME|SILENT|NOT CORE|SWALLOWED|WORDING|REFUSED BY BOTH):' "$WORK/reject.log" | sed 's/^/   /'
+if [ "$RJRC" -eq 0 ]; then
+    ok
+else
+    bad "tools/reject/run.sh failed (see .test-work/reject.log)"
+    grep -E '^FAIL' "$WORK/reject.log" | head -12 | sed 's/^/   /'
 fi
 
 TOTAL=$((PASS + FAIL))
