@@ -1,0 +1,535 @@
+// lib/firnc1/decl.fi -- THE DUPLICATE DECLARATION CHECK, WRITTEN IN FIRN.
+//
+// ROUND 96. Twin of the checks that stand SCATTERED over `firnc0`:
+// `sema.rs::collect_structs` (struct, field), `collect_fns` (parameter,
+// function), `collect_consts` (constant), the `static` pass (`'x' is
+// already declared`), `declare_var` (`in this block`) and
+// `sema_match.rs::types_enum_decl` (enum, variant).
+//
+// WHY IT EXISTS. Until this round `firnc1` INSERTED a name into its tables
+// without ever asking whether it was already there. A program with
+//
+//     const A: u64 = 1
+//     const A: u64 = 2
+//
+// was refused by `firnc0` and translated by `firnc1` -- quietly, taking the
+// FIRST declaration and dropping the second. That is not a cosmetic
+// difference: the merge of rounds K4 and K5 left `const KDATA_SIZE` twice
+// in `demos/kernel/kstate.fi`, once 0x20000 and once 0x30000. `firnc0`
+// stopped the build; `firnc1` built it with the SMALLER value, and the
+// kernel wrote its file, descriptor, context and pipe tables into memory
+// that was no longer part of the data area. It ran. It corrupted foreign
+// memory while running.
+//
+// The rule the round takes away: a table that a NAME goes into is never
+// written with `push`, always with `push if not there, complain if there`.
+//
+// THE MESSAGES ARE BINDING, character for character, including the line,
+// the column and the width of the marker -- `tools/reject/run.sh` compares
+// the output of the two compilers with `cmp` over the whole of `tests/neg`.
+// That is why this module PRINTS (through `diag.fi`, the twin of
+// `compiler/src/diag.rs`) instead of only counting, and why the findings
+// are collected in the ORDER `firnc0` produces them: enums and their
+// variants first (`firnc0` finds them while parsing), then the struct
+// names, then the fields, then per function its parameters and its name,
+// then the constants, then the global variables, and last -- from
+// `sema.fi`, while the bodies are walked -- the locals.
+
+import rt
+import vec
+import intern
+import ast
+import types
+import pattern
+import diag
+
+export { Decl, decl_new, decl_free, decl_check, decl_local, decl_impl,
+    decl_count, decl_report }
+
+const NONE: u32 = 4294967295
+
+// Which sentence. The numbers have no meaning outside this file.
+const D_ENUM: u32 = 0
+const D_VARIANT: u32 = 1
+const D_STRUCT: u32 = 2
+const D_FIELD: u32 = 3
+const D_PARAM: u32 = 4
+const D_FN: u32 = 5
+const D_CONST: u32 = 6
+const D_STATIC: u32 = 7
+const D_BLOCK: u32 = 8
+const D_IMPL: u32 = 9
+const D_IMPORT: u32 = 10
+
+struct Decl {
+    f_kind: Vec[u32],
+    f_pos: Vec[u64], // packed position (ast.pos_pack)
+    f_len: Vec[u32], // width of the marker in characters
+    f_a: Vec[u32], // the name that is declared twice
+    f_b: Vec[u32], // the struct/enum it stands in, NONE where there is none
+}
+
+fn decl_new() -> Decl {
+    return Decl {
+        f_kind: vec_new[u32](), f_pos: vec_new[u64](), f_len: vec_new[u32](),
+        f_a: vec_new[u32](), f_b: vec_new[u32](),
+    }
+}
+
+fn decl_free(d: *mut Decl) {
+    vec_free[u32](&(*d).f_kind)
+    vec_free[u64](&(*d).f_pos)
+    vec_free[u32](&(*d).f_len)
+    vec_free[u32](&(*d).f_a)
+    vec_free[u32](&(*d).f_b)
+}
+
+fn decl_count(d: *mut Decl) -> usize { return vec_len[u32](&(*d).f_kind) }
+
+fn note(d: *mut Decl, kind: u32, pos: u64, len: u32, a: u32, b: u32) {
+    vec_push[u32](&(*d).f_kind, kind)
+    vec_push[u64](&(*d).f_pos, pos)
+    vec_push[u32](&(*d).f_len, len)
+    vec_push[u32](&(*d).f_a, a)
+    vec_push[u32](&(*d).f_b, b)
+}
+
+// `__closure#N` -- the function a closure literal turns into (fnval.rs).
+// The `#` is no identifier character, so no source text can write this name.
+fn generated(b: *mut ast.Tree, it: *mut intern.Interner, fi: usize) -> bool {
+    var w: [u8; 10] = "__closure#"
+    return intern.intern_prefix(it, ast.fn_name(b, fi), (&w[0]) as u64, 10)
+}
+
+// The width of an identifier, for the marker under it.
+fn name_width(it: *mut intern.Interner, name: u32) -> u32 {
+    let n: usize = intern.intern_length(it, name)
+    if n == 0 {
+        return 1
+    }
+    return n as u32
+}
+
+// A local (a `let`, a `var`, a parameter, a pattern binding) whose name is
+// already taken IN THE SAME SCOPE. `sema.fi` calls this from `var_create`,
+// where the scopes live -- the rule is `declare_var` in `sema.rs`: only the
+// INNERMOST scope is looked at, so shadowing in a nested block stays legal.
+fn decl_local(d: *mut Decl, name: u32, pos: u64, len: u32) {
+    note(d, D_BLOCK, pos, len, name, NONE)
+}
+
+// `impl I for T` written twice for the same carrier (iface.fi::check_impl,
+// the twin of `iface.rs`). It arrives from there and not from `decl_check`,
+// because only the interface registry knows which method prefix a carrier
+// resolves to -- `impl I for T` and `impl I for module.T` are one and the
+// same implementation.
+fn decl_impl(d: *mut Decl, ty: u32, iname: u32, pos: u64, len: u32) {
+    note(d, D_IMPL, pos, len, ty, iname)
+}
+
+// -------------------------------------------------------------- the check
+//
+// Runs ONCE, from `sema_run`, at the point where the enums, error sets, gc
+// classes and interfaces are registered in the type table and the structs
+// of the tree are NOT yet -- the same window `firnc0` checks in
+// (`collect_structs` asks `tcx.lookup` before it declares).
+
+fn decl_check(d: *mut Decl, b: *mut ast.Tree, it: *mut intern.Interner,
+    t: *mut types.Types, mu: u64) {
+    // --- 0. the same module imported twice ---------------------------
+    // The parser marked it while reading (`imp_twice`); it is reported
+    // here so that all the sentences come out of one place. Stage 0 finds
+    // it while parsing too, which is why it stands first.
+    var ii: usize = 0
+    while ii < ast.imp_count(b) {
+        if ast.imp_twice(b, ii) {
+            note(d, D_IMPORT, ast.imp_pos(b, ii), 6, ast.imp_alias(b, ii), NONE)
+        }
+        ii = ii + 1
+    }
+    // --- 1. enums and their variants ---------------------------------
+    // `firnc0` finds both while PARSING (`types_enum_decl`), the variant
+    // inside the loop and the name after the closing brace -- so a variant
+    // of an enum is reported before the name of that same enum.
+    if mu != 0 {
+        let m: *mut pattern.Pat = mu as *mut pattern.Pat
+        var ei: usize = 0
+        while ei < pattern.pat_enum_count(m) {
+            let ename: u32 = pattern.pat_e_name(m, ei as u32)
+            let voff: u32 = pattern.pat_e_voff(m, ei as u32)
+            let vlen: u32 = pattern.pat_e_vlen(m, ei as u32)
+            var k: u32 = 0
+            while k < vlen {
+                let vname: u32 = pattern.pat_v_name(m, voff + k)
+                var j: u32 = 0
+                var twice: bool = false
+                while j < k {
+                    if pattern.pat_v_name(m, voff + j) == vname {
+                        twice = true
+                    }
+                    j = j + 1
+                }
+                if twice {
+                    note(d, D_VARIANT, pattern.pat_v_pos(m, voff + k),
+                        name_width(it, vname), vname, ename)
+                }
+                k = k + 1
+            }
+            var q: usize = 0
+            var seen: bool = false
+            while q < ei {
+                if pattern.pat_e_name(m, q as u32) == ename {
+                    seen = true
+                }
+                q = q + 1
+            }
+            if seen {
+                note(d, D_ENUM, pattern.pat_e_pos(m, ei as u32),
+                    name_width(it, ename), ename, NONE)
+            }
+            ei = ei + 1
+        }
+    }
+
+    // --- 2. the struct NAMES ------------------------------------------
+    // Against everything the type table already holds -- the enums, the
+    // error sets, `dyn I`, `str` -- and against the structs already seen.
+    // `firnc0` runs the same two loops one after the other
+    // (`collect_structs`), so ALL name errors come before ALL field ones.
+    var si: usize = 0
+    while si < ast.structure_count(b) {
+        let sname: u32 = ast.structure_name(b, si)
+        var taken: bool = types.struct_index(t, sname) >= 0
+        var q2: usize = 0
+        while q2 < si {
+            if ast.structure_name(b, q2) == sname {
+                taken = true
+            }
+            q2 = q2 + 1
+        }
+        if taken {
+            note(d, D_STRUCT, ast.structure_pos(b, si), 6, sname, NONE)
+        }
+        si = si + 1
+    }
+
+    // --- 3. the struct FIELDS -----------------------------------------
+    si = 0
+    while si < ast.structure_count(b) {
+        let sname2: u32 = ast.structure_name(b, si)
+        let off: u32 = ast.structure_foff(b, si)
+        let len: u32 = ast.structure_flen(b, si)
+        var k2: u32 = 0
+        while k2 < len {
+            let fname: u32 = ast.field_name(b, off + k2)
+            var j2: u32 = 0
+            var twice2: bool = false
+            while j2 < k2 {
+                if ast.field_name(b, off + j2) == fname {
+                    twice2 = true
+                }
+                j2 = j2 + 1
+            }
+            if twice2 {
+                note(d, D_FIELD, ast.field_pos(b, off + k2),
+                    name_width(it, fname), fname, sname2)
+            }
+            k2 = k2 + 1
+        }
+        si = si + 1
+    }
+
+    // --- 4. functions: first the parameters, then the name -------------
+    // The order inside `collect_fns`: the parameter list of a function is
+    // walked before its own name is looked up, and both happen before the
+    // next function is looked at.
+    var fi: usize = 0
+    while fi < ast.fn_count(b) {
+        // A CLOSURE is not in `prog.funcs` in stage 0 -- `fnval.rs` builds
+        // its function after the type check and declares its parameters
+        // with `declare_var` alone. So `collect_fns` never sees it, and
+        // neither does this loop: a closure with two parameters of one name
+        // is reported ONCE, by the scope check in `sema.fi`, and not twice.
+        if generated(b, it, fi) {
+            fi = fi + 1
+            continue
+        }
+        let poff: u32 = ast.fn_poff(b, fi)
+        let plen: u32 = ast.fn_plen(b, fi)
+        var k3: u32 = 0
+        while k3 < plen {
+            let pname: u32 = ast.param_name(b, poff + k3)
+            var j3: u32 = 0
+            var twice3: bool = false
+            while j3 < k3 {
+                if ast.param_name(b, poff + j3) == pname {
+                    twice3 = true
+                }
+                j3 = j3 + 1
+            }
+            if twice3 {
+                note(d, D_PARAM, ast.param_pos(b, poff + k3),
+                    name_width(it, pname), pname, NONE)
+            }
+            k3 = k3 + 1
+        }
+        let fname2: u32 = ast.fn_name(b, fi)
+        var q3: usize = 0
+        var seen3: bool = false
+        while q3 < fi {
+            if ast.fn_name(b, q3) == fname2 {
+                seen3 = true
+            }
+            q3 = q3 + 1
+        }
+        if seen3 {
+            // `extern fn` starts one keyword earlier, and the marker is as
+            // wide as that keyword (`parser.rs::fn_decl` takes `start`
+            // before the `extern` check).
+            var w: u32 = 2
+            if ast.fn_extern(b, fi) != 0 {
+                w = 6
+            }
+            note(d, D_FN, ast.fn_pos(b, fi), w, fname2, NONE)
+        }
+        fi = fi + 1
+    }
+
+    // --- 5. constants --------------------------------------------------
+    var ci: usize = 0
+    while ci < ast.const_count(b) {
+        let cname: u32 = ast.const_name(b, ci)
+        var q4: usize = 0
+        var seen4: bool = false
+        while q4 < ci {
+            if ast.const_name(b, q4) == cname {
+                seen4 = true
+            }
+            q4 = q4 + 1
+        }
+        if seen4 {
+            note(d, D_CONST, ast.const_pos(b, ci), 5, cname, NONE)
+        }
+        ci = ci + 1
+    }
+
+    // --- 6. global variables -------------------------------------------
+    // A `static` collides with another `static` AND with a `const`: both
+    // are names at the top level, and the constants were collected first
+    // (SPEC 14.1.statics).
+    var gi: usize = 0
+    while gi < ast.static_count(b) {
+        let gname: u32 = ast.static_name(b, gi)
+        var seen5: bool = false
+        var q5: usize = 0
+        while q5 < gi {
+            if ast.static_name(b, q5) == gname {
+                seen5 = true
+            }
+            q5 = q5 + 1
+        }
+        q5 = 0
+        while q5 < ast.const_count(b) {
+            if ast.const_name(b, q5) == gname {
+                seen5 = true
+            }
+            q5 = q5 + 1
+        }
+        if seen5 {
+            note(d, D_STATIC, ast.static_pos(b, gi), 6, gname, NONE)
+        }
+        gi = gi + 1
+    }
+}
+
+// ----------------------------------------------------------- the sentences
+
+fn say_name(it: *mut intern.Interner, out: *mut rt.Buf, name: u32) {
+    rt.buf_push_bytes(out, intern.intern_ptr(it, name), intern.intern_length(it, name))
+}
+
+fn say_tail(out: *mut rt.Buf) {
+    var s: [u8; 21] = "' is already declared"
+    rt.buf_push_bytes(out, (&s[0]) as u64, 21)
+}
+
+fn build_msg(d: *mut Decl, it: *mut intern.Interner, out: *mut rt.Buf, i: usize) {
+    let kind: u32 = vec_at[u32](&(*d).f_kind, i)
+    let a: u32 = vec_at[u32](&(*d).f_a, i)
+    let b2: u32 = vec_at[u32](&(*d).f_b, i)
+    if kind == D_ENUM {
+        var w1: [u8; 6] = "enum '"
+        rt.buf_push_bytes(out, (&w1[0]) as u64, 6)
+        say_name(it, out, a)
+        say_tail(out)
+        return
+    }
+    if kind == D_VARIANT {
+        var w2: [u8; 9] = "variant '"
+        rt.buf_push_bytes(out, (&w2[0]) as u64, 9)
+        say_name(it, out, a)
+        var w3: [u8; 31] = "' is already declared in enum '"
+        rt.buf_push_bytes(out, (&w3[0]) as u64, 31)
+        say_name(it, out, b2)
+        rt.buf_push(out, 39 as u8)
+        return
+    }
+    if kind == D_STRUCT {
+        var w4: [u8; 8] = "struct '"
+        rt.buf_push_bytes(out, (&w4[0]) as u64, 8)
+        say_name(it, out, a)
+        say_tail(out)
+        return
+    }
+    if kind == D_FIELD {
+        var w5: [u8; 7] = "field '"
+        rt.buf_push_bytes(out, (&w5[0]) as u64, 7)
+        say_name(it, out, a)
+        var w6: [u8; 33] = "' is already declared in struct '"
+        rt.buf_push_bytes(out, (&w6[0]) as u64, 33)
+        say_name(it, out, b2)
+        rt.buf_push(out, 39 as u8)
+        return
+    }
+    if kind == D_PARAM {
+        var w7: [u8; 11] = "parameter '"
+        rt.buf_push_bytes(out, (&w7[0]) as u64, 11)
+        say_name(it, out, a)
+        say_tail(out)
+        return
+    }
+    if kind == D_FN {
+        var w8: [u8; 10] = "function '"
+        rt.buf_push_bytes(out, (&w8[0]) as u64, 10)
+        say_name(it, out, a)
+        say_tail(out)
+        return
+    }
+    if kind == D_CONST {
+        var w9: [u8; 10] = "constant '"
+        rt.buf_push_bytes(out, (&w9[0]) as u64, 10)
+        say_name(it, out, a)
+        say_tail(out)
+        return
+    }
+    if kind == D_STATIC {
+        rt.buf_push(out, 39 as u8)
+        say_name(it, out, a)
+        say_tail(out)
+        return
+    }
+    if kind == D_IMPORT {
+        var wc: [u8; 8] = "module '"
+        rt.buf_push_bytes(out, (&wc[0]) as u64, 8)
+        say_name(it, out, a)
+        var wd: [u8; 28] = "' is imported more than once"
+        rt.buf_push_bytes(out, (&wd[0]) as u64, 28)
+        return
+    }
+    if kind == D_IMPL {
+        rt.buf_push(out, 39 as u8)
+        say_name(it, out, a)
+        var wb: [u8; 36] = "' already implements the interface '"
+        rt.buf_push_bytes(out, (&wb[0]) as u64, 36)
+        say_name(it, out, b2)
+        rt.buf_push(out, 39 as u8)
+        return
+    }
+    rt.buf_push(out, 39 as u8)
+    say_name(it, out, a)
+    var wa: [u8; 35] = "' is already declared in this block"
+    rt.buf_push_bytes(out, (&wa[0]) as u64, 35)
+}
+
+// ------------------------------------------------------------- the output
+//
+// The same way out as `escape.fi`: the findings go through `diag.fi`, so
+// the block with the arrow, the source line and the marker comes out of the
+// SAME renderer that `firnc0` uses (`compiler/src/diag.rs`).
+
+fn decl_report(d: *mut Decl, b: *mut ast.Tree, it: *mut intern.Interner) -> usize {
+    let n: usize = decl_count(d)
+    if n == 0 {
+        return 0
+    }
+    var dg: diag.Diags = diag.diag_new()
+    // One heap block per source file -- a `Vec` of buffers would move its
+    // contents on growth and `diag.fi` keeps the POINTER.
+    var src_ptr: Vec[u64] = vec_new[u64]()
+    var src_len: Vec[u64] = vec_new[u64]()
+    var src_file: Vec[u32] = vec_new[u32]()
+    var src_nr: Vec[u32] = vec_new[u32]()
+    var msg: rt.Buf = rt.buf_new()
+    var path: rt.Buf = rt.buf_new()
+    var text: rt.Buf = rt.buf_new()
+
+    var i: usize = 0
+    while i < n {
+        let pos: u64 = vec_at[u64](&(*d).f_pos, i)
+        let file: u32 = ast.pos_file(pos)
+        var nr: u32 = NONE
+        var k: usize = 0
+        while k < vec_len[u32](&src_file) {
+            if vec_at[u32](&src_file, k) == file {
+                nr = vec_at[u32](&src_nr, k)
+            }
+            k = k + 1
+        }
+        if nr == NONE {
+            var fp: u64 = 0
+            var name_n: usize = 0
+            if (file as usize) < ast.file_count(b) {
+                fp = ast.file_ptr(b, file)
+                name_n = ast.file_length(b, file)
+            }
+            rt.buf_clear(&path)
+            rt.buf_push_bytes(&path, fp, name_n)
+            rt.buf_push(&path, 0 as u8)
+            rt.buf_clear(&text)
+            var sp: u64 = 0
+            var sn: usize = 0
+            if rt.read_file(rt.buf_ptr(&path), &text) {
+                sn = rt.buf_len(&text)
+                sp = rt.heap_alloc(sn + 1)
+                if sp != 0 {
+                    rt.mem_copy(sp, rt.buf_ptr(&text), sn)
+                } else {
+                    sn = 0
+                }
+            }
+            nr = diag.diag_file(&dg, fp, name_n, sp, sn)
+            vec_push[u64](&src_ptr, sp)
+            vec_push[u64](&src_len, sn as u64)
+            vec_push[u32](&src_file, file)
+            vec_push[u32](&src_nr, nr)
+        }
+        rt.buf_clear(&msg)
+        build_msg(d, it, &msg, i)
+        diag.diag_error(&dg, nr, ast.pos_line(pos), ast.pos_col(pos),
+            vec_at[u32](&(*d).f_len, i), rt.buf_ptr(&msg), rt.buf_len(&msg))
+        i = i + 1
+    }
+
+    var out: rt.Buf = rt.buf_new()
+    diag.diag_render(&dg, &out)
+    rt.write_everything(2, rt.buf_ptr(&out), rt.buf_len(&out))
+    rt.buf_free(&out)
+
+    i = 0
+    while i < vec_len[u64](&src_ptr) {
+        let sp2: u64 = vec_at[u64](&src_ptr, i)
+        if sp2 != 0 {
+            rt.heap_free(sp2, vec_at[u64](&src_len, i) as usize + 1)
+        }
+        i = i + 1
+    }
+    vec_free[u64](&src_ptr)
+    vec_free[u64](&src_len)
+    vec_free[u32](&src_file)
+    vec_free[u32](&src_nr)
+    rt.buf_free(&msg)
+    rt.buf_free(&path)
+    rt.buf_free(&text)
+    diag.diag_free(&dg)
+    return n
+}
