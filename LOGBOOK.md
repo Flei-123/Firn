@@ -261,3 +261,67 @@ MEASUREMENTS: test.sh section 61 = tools/layoutb2/run.sh: three build stages rea
 471/471, limits in tools/layoutb2/minquota.txt. tests/1185..1188 new (anonymous edges, flex base size,
 reflow, keyword sizes), numbers computed by hand and held against Chromium 141 afterwards. english
 0 0 0 0 0.
+
+
+## Round B3 -- painting: the browser becomes visible
+
+THE STEP: out of the tree of rectangles of round B2 comes a PICTURE. Display list in the order of CSS
+2.1 Appendix E, own scanline rasteriser, a TrueType reader, PPM and PNG.
+
+THE NUMBER, against a suite nobody here wrote: 202 of 541 official WPT REFERENCE TESTS (37.34 %) --
+`css/css-backgrounds` and `css/css-color`, every file with `<link rel=match>` plus its reference, taken
+mechanically (tests/data/wpt-ref/PROVENANCE.md). A reference test compares PICTURES, which is what a
+rasteriser is for and what round B2 could not do.
+
+THE GUARD, and it is the whole reason that number can be believed: AN ENGINE THAT DRAWS NOTHING PASSES
+EVERY REFERENCE TEST -- both sides come out white and white equals white. 32 pairs match here that way,
+they are counted separately as `vacuous` and are NOT in the quota. With them the round would be
+reporting 43.25 %.
+
+TEXT WAS NOT CHECKED AGAINST AN AREA (the warning out of kernel round K7B, where a screen was 87 per
+cent right and every letter was missing -- the 87 per cent were the background). Three checks instead:
+(1) per GLYPH against a second rasteriser written with a different algorithm, on outlines fontTools
+decoded -- 393 of 393 glyphs, mean coverage deviation 0.001, worst single pixel 0.049, 0 wrongly empty,
+and 0 metric deviations over 408 characters and 469 kerning pairs; (2) per PAGE, every own case carries
+the number of glyph pixels it set, so a regression to an empty page cannot be re-frozen away; (3) per
+CORPUS, the vacuous guard.
+
+THE YARDSTICK ITSELF WAS WRONG ONCE, and that is the finding worth keeping: the first reference
+rasteriser used matplotlib's `Path.contains_points`, which unions the subpaths of a compound path.
+It reported `O`, `D`, `Q`, `©` and `®` as broken at 0.45 overlap. The engine was right about all five.
+A measurement has to be measured.
+
+THE METRICS FLOW BACK, and it is proven with a counter-check that fails: the shrink-to-fit width the
+LAYOUT computes for a text is within 2 px of the ink the PAINTER draws; with round B2's
+one-em-per-character font behind the same painter it is 63 px too wide. 0 px of ink outside a fixed
+width box, over 4 texts x 4 widths.
+
+THE BUG THAT ONLY A PICTURE FINDS: `winner_clear` in the cascade cleared 53 property slots and round B3
+has 65. A `linear-gradient` on one `div` therefore painted itself on the NEXT element as well. Every
+layout test stayed green -- a gradient moves no box.
+
+TIMES at 800x600, over 1082 renderings: layout 5.0 ms, display list 0.02 ms, raster 31 ms. The list is
+a thousand times cheaper than drawing it, which is the argument for having one.
+
+NOTHING GOT WORSE: html5lib 1837/1936, WPT layout 59/186, reflow 471/471, Chromium 1087/1087 boxes and
+5171/5171 probe points -- all unchanged. The font metrics hang on a handle on the box tree that round
+B2's programme does not pass, so its arithmetic is bit-identical.
+
+THE DOUBLING WITH OSUM K10 IS REAL and is addressed rather than mentioned: `lib/font/raster.fi`,
+`lib/font/ttf.fi` and `lib/font/metrics.fi` have NO imports beyond each other, are `#[no_gc]` throughout
+and allocate nothing -- the caller hands them memory. They compile under `profile kernel` as they stand,
+and K10 should import them instead of writing them a second time. docs/ROUNDB3.md section 5 has the
+four steps. `lib/paint/` stays on the browser side; the boundary is one function call.
+
+WHAT IS MISSING, named with the count of reference pairs each costs: bitmaps on the page (98 --
+decode_png works and is checked against Pillow, but `<img>` is not a replaced element and JPEG is not
+decoded at all), the modern colour spaces lab/lch/oklab/color() (78), background-repeat (55),
+background-size (50), border-image (34), scripted reftests (29), table layout (24),
+background-attachment (18), plus opacity as a multiplier instead of a layer, one shadow per property,
+one font per page, no transform/filter/clip-path, no hinting, no CFF outlines. Eleven items, B3-1 to
+B3-11 in docs/ROUNDB3.md section 4.
+
+MEASUREMENTS: test.sh section 62 = tools/paintb3/run.sh -- three build stages of three root files, the
+font against fontTools and against the second rasteriser, PNG both ways against Pillow, seven own cases
+byte-identical in all three stages against a frozen picture, the text-fit check with its counter-check,
+the 541 reference pairs, limits in tools/paintb3/minquota.txt. english 0 0 0 0 0.
