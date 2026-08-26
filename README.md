@@ -61,7 +61,7 @@ the numbers are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 | **Garbage collector** | opt-in, incremental mark-sweep, **longest pause 0.45 ms** at 120,000 live nodes; weak refs, finalizers, `GcVec`/`GcMap` | `tools/dom_soak/run.sh` |
 | **Tooling** | formatter, DWARF line info + `gdb`, language server (`firnc --lsp`), package/project system, test runner with JSON output | `tools/fmt`, `tools/dwarf`, `tools/lsp`, `tools/packages` |
 | **HTML** | tokenizer written in Firn, **6,810 / 6,810 html5lib cases (100.00 %)**; against html5ever **1.18x** on real pages and **0.80x** (ahead) on the pathological corpus | `tools/tokenizer/run.sh`, `throughput.sh` |
-| **CSS + layout** | against Chromium: **1,087 / 1,087 boxes, deviation 0.00 %**, paint order 5,171 / 5,171 probe points | `tools/layout/run.sh` |
+| **CSS + layout** | against Chromium: **1,087 / 1,087 boxes, deviation 0.00 %**, paint order 5,171 / 5,171 probe points; against the **official Web Platform Tests** (`css/`, self-describing layout tests): **59 / 186** — Chromium 141 reaches 138 / 186 on the same corpus through the same harness | `tools/layout/run.sh`, `tools/layoutb2/run.sh` |
 | **JavaScript** | test262, **63,364 cases, nothing filtered**: parser **91.94 %**, engine **76.00 %** | `tools/js/run.sh` |
 | **Cryptography, compression** | SHA-256, AES, DEFLATE — written in Firn, held against OpenSSL/zlib and the NIST vectors; behind by 1.38x–1.88x | `tools/stdlib81/run.sh`, `tools/bench82/run.sh` |
 | **An operating system** | `profile kernel` produces a freestanding object file; `demos/kernel` boots in QEMU with tasks, address spaces, system calls and files | `tools/kernel/run.sh`, `tools/freestanding/run.sh` |
