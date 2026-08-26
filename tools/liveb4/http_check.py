@@ -11,8 +11,13 @@ Every case names the RULE it checks. The counter-checks are in the list
 and marked; without them "the client fetched a page" would prove almost
 nothing:
 
-  * an `https://` URL must be REFUSED with `Tls` -- not downgraded, not
-    silently failed. Reached twice: typed in, and through a redirect.
+  * ROUND B5 MOVED THIS ONE. In round B4 an `https://` URL was refused
+    outright and the two cases below demanded exactly that. The client can
+    now speak TLS, so what they demand instead is the property that
+    survives: a client whose TRUST STORE IS EMPTY fetches nothing over
+    `https://`. The refusal still comes back as `Tls`, still twice, typed
+    in and through a redirect -- and `tools/tlsb5/https_check.py` is where
+    the successful case is measured.
   * a chunked body whose last chunk never comes must NOT be reported as
     a successful fetch.
   * with the cache switched OFF the second fetch of the same URL must
@@ -110,12 +115,12 @@ def main():
         get("/notrailer", "COUNTER-CHECK: a chunked body whose last chunk "
             "never comes is not a successful fetch", ERR_ANY=True)
         get("/status/404", "a status code that is not 200", STATUS="404")
-        get("/tohttps", "COUNTER-CHECK: the TLS boundary reached through "
-            "a REDIRECT, not typed in", ERR="Tls")
-        jobs.append("G https://example.com/")
-        checks.append((len(jobs) - 1, "https://example.com/",
-                       "COUNTER-CHECK: the TLS boundary, typed in",
-                       {"ERR": "Tls"}))
+        get("/tohttps", "COUNTER-CHECK: an https URL reached through a "
+            "REDIRECT, with no roots loaded", ERR="Tls")
+        jobs.append("G " + base.replace("http://", "https://") + "/plain")
+        checks.append((len(jobs) - 1, "https://<the test server>/plain",
+                       "COUNTER-CHECK: an https URL typed in, with no "
+                       "roots loaded", {"ERR": "Tls"}))
 
         # POST and the method rules of a redirect
         jobs.append("P %s/echo text/plain name=firn" % base)
