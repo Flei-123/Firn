@@ -2670,6 +2670,14 @@ fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
             Loc::Reg(dst) => e.line(&format!("mov {}, qword ptr [rbp+{}]", dst, of)),
         }
     }
+    // ROUND 96: the prologue ends here -- the frame stands, the parameters
+    // are in their homes, and a breakpoint on the function belongs at the
+    // first instruction after this point.
+    let decl = match crate::dwarf::fn_line(&f.name) {
+        Some((file, line)) => crate::fir::Loc { file, line, col: 0 },
+        None => crate::fir::Loc::NONE,
+    };
+    e.prologue_end_at(f, decl);
     // Round 51: the blocks are no longer printed in their FIR order but
     // along traces (see `emit_order`).
     let order = emit_order(f);

@@ -168,6 +168,8 @@ pub(crate) struct Emitter {
     /// into an immediate, fused into a comparison); a location list pointing
     /// at a label that does not exist would not even assemble.
     pub(crate) dbg_seen: std::collections::HashSet<crate::fir::Val>,
+    /// **ROUND 96** — the next `.loc` gets ` prologue_end` (see `loc_at`).
+    pub(crate) prologue_end: bool,
 }
 
 impl Emitter {
@@ -187,11 +189,91 @@ impl Emitter {
             return;
         }
         self.here = l;
-        if self.last_loc == Some(l) {
+        if self.last_loc == Some(l) && !self.prologue_end {
             return;
         }
         self.last_loc = Some(l);
-        let _ = writeln!(self.out, "    .loc {} {} {}", l.file + 1, l.line, l.col);
+        // ROUND 96 — `prologue_end`. WHERE A BREAKPOINT ON A FUNCTION LANDS.
+        //
+        // `break <function>` does not stop at the first instruction: the
+        // frame is not set up there yet and the parameters are not where the
+        // debug information says. So the debugger looks for the end of the
+        // prologue — and if the line table does not SAY where that is, gdb
+        // guesses: it takes the second line entry of the function. That
+        // guess is right without the optimizer and wrong with it. Found with
+        // gdb in round 96 (docs/ROUND96.md §7): in `val.fi:realm_bool`, at
+        // `dev-fast`, the breakpoint landed on line 741 — INSIDE the `if on`
+        // branch — so it was hit only for the calls with `on == true` and
+        // the other half of them ran past it.
+        //
+        // DWARF has a flag for it and GNU `as` writes it. One word per
+        // function, at the first instruction that is no longer bookkeeping.
+        let tail = if self.prologue_end {
+            self.prologue_end = false;
+            " prologue_end"
+        } else {
+            ""
+        };
+        let _ = writeln!(
+            self.out,
+            "    .loc {} {} {}{}",
+            l.file + 1,
+            l.line,
+            l.col,
+            tail
+        );
+    }
+
+    /// **ROUND 96** — THE END OF THE PROLOGUE, written down instead of
+    /// guessed.
+    ///
+    /// `l` is the position a reader would call the first line of the body:
+    /// the first instruction of the entry block that HAS a position, and the
+    /// `fn` line where there is none (which happens as soon as the optimizer
+    /// has taken the loads of the parameters away — `fir::Term` carries no
+    /// position, so a function whose body begins with a branch announces
+    /// nothing at all).
+    pub(crate) fn prologue_end_at(&mut self, f: &Func, fallback: crate::fir::Loc) {
+        // The usual case: the body has a position of its own. The marker
+        // belongs at the ADDRESS of that first instruction and not here --
+        // between the two lie the stores that put the parameters into the
+        // places the debug information names, and a breakpoint in front of
+        // them reads a parameter that has not arrived yet (measured: `n = 0`
+        // instead of `n = 10` in `docs/gdb_example.fi`).
+        if !Emitter::body_start(f, crate::fir::Loc::NONE).is_none() {
+            self.prologue_end = true;
+            return;
+        }
+        // And the case this whole thing is about: the entry block has NO
+        // position at all, because the optimizer took the loads of the
+        // parameters away and `fir::Term` carries no position. Then nothing
+        // would ever announce the end of the prologue, gdb would guess, and
+        // its guess lands behind the first branch.
+        if fallback.is_none() {
+            return;
+        }
+        self.here = fallback;
+        self.last_loc = Some(fallback);
+        let _ = writeln!(
+            self.out,
+            "    .loc {} {} {} prologue_end",
+            fallback.file + 1,
+            fallback.line,
+            fallback.col
+        );
+    }
+
+    /// **ROUND 96** — the position for `prologue_end_at`: the first
+    /// instruction of the entry block that carries one.
+    pub(crate) fn body_start(f: &Func, fallback: crate::fir::Loc) -> crate::fir::Loc {
+        for b in f.blocks.iter().take(1) {
+            for i in &b.insts {
+                if !i.loc.is_none() {
+                    return i.loc;
+                }
+            }
+        }
+        fallback
     }
     /// **ROUND 94** — the same for the cold half. The cold buffer is flushed
     /// behind the function, so its `.loc` has to be written out in full: the
@@ -278,6 +360,7 @@ pub fn emit(m: &Module) -> Result<String, String> {
         debug_funcs: Vec::new(),
         dbg_vals: std::collections::HashSet::new(),
         dbg_seen: std::collections::HashSet::new(),
+        prologue_end: false,
         xmm: Default::default(),
         last_loc: None,
         here: crate::fir::Loc::NONE,
@@ -513,6 +596,14 @@ fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
     // ROUND 72: one label counter per function, so every checked site in
     // it gets its own label pair (`panic_rt.rs::SiteCounter`).
     let mut site = crate::panic_rt::SiteCounter::new(&f.name);
+    // ROUND 96: from here on the frame stands and the parameters are where
+    // the debug information says they are -- that is where a breakpoint on
+    // the function belongs (`Emitter::prologue_end_at`).
+    let decl = match dwarf::fn_line(&f.name) {
+        Some((file, line)) => crate::fir::Loc { file, line, col: 0 },
+        None => crate::fir::Loc::NONE,
+    };
+    e.prologue_end_at(f, decl);
     // ROUND 96: which values carry a variable whose storage is gone.
     e.dbg_vals = dbg_tracked(f);
     for b in &f.blocks {
