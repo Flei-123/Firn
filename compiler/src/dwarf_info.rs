@@ -32,7 +32,7 @@
 
 use std::collections::HashMap;
 
-use crate::dwarf::{DType, VarNote};
+use crate::dwarf::{DType, VarNote, VarPlace};
 
 // ---------------------------------------------------------------- DWARF 4
 const DW_TAG_ARRAY_TYPE: u8 = 0x01;
@@ -87,6 +87,64 @@ const DW_LANG_C99: u16 = 0x000c;
 
 const DW_OP_FBREG: u8 = 0x91;
 const DW_OP_REG6: u8 = 0x56; // rbp
+/// `DW_OP_reg0`; the register number is added to it (DWARF 4, 2.6.1.1.3).
+const DW_OP_REG0: u8 = 0x50;
+/// `DW_OP_consts` (a signed constant) and `DW_OP_stack_value`: together they
+/// say "the VALUE is this", not "the value lies at this address".
+const DW_OP_CONSTS: u8 = 0x11;
+const DW_OP_STACK_VALUE: u8 = 0x9f;
+
+/// **ROUND 96** — the register numbers of the System V AMD64 ABI
+/// (table 3.36, "DWARF Register Number Mapping"). They are NOT the encoding
+/// order of the instruction set, which is why the table is written out
+/// rather than computed: `rdx` is 1 and `rcx` is 2, the other way round from
+/// what the machine encoding suggests, and that mix-up would put the
+/// debugger on the wrong register without anything failing loudly.
+fn dwarf_reg(name: &str) -> Option<u8> {
+    Some(match name {
+        "rax" => 0,
+        "rdx" => 1,
+        "rcx" => 2,
+        "rbx" => 3,
+        "rsi" => 4,
+        "rdi" => 5,
+        "rbp" => 6,
+        "rsp" => 7,
+        "r8" => 8,
+        "r9" => 9,
+        "r10" => 10,
+        "r11" => 11,
+        "r12" => 12,
+        "r13" => 13,
+        "r14" => 14,
+        "r15" => 15,
+        _ => return None,
+    })
+}
+
+/// **ROUND 96** — the DWARF expression for a place, as octets.
+fn place_expr(p: &VarPlace) -> Option<Vec<u8>> {
+    match p {
+        VarPlace::Frame(off) => {
+            let mut s = Section::new();
+            s.u8(DW_OP_FBREG);
+            s.sleb(-(*off as i64));
+            s.flat()
+        }
+        VarPlace::Reg(r) => {
+            let n = dwarf_reg(r)?;
+            Some(vec![DW_OP_REG0 + n])
+        }
+        VarPlace::ListFrom(_, inner) => place_expr(inner),
+        VarPlace::Const(v) => {
+            let mut s = Section::new();
+            s.u8(DW_OP_CONSTS);
+            s.sleb(*v);
+            s.u8(DW_OP_STACK_VALUE);
+            s.flat()
+        }
+    }
+}
 
 /// Abbreviation numbers, fixed, so that `.debug_abbrev` stays a constant.
 const AB_CU: u64 = 1;
@@ -101,6 +159,10 @@ const AB_SUBPROGRAM_VOID: u64 = 9;
 const AB_PARAM: u64 = 10;
 const AB_VAR: u64 = 11;
 const AB_OPAQUE: u64 = 12;
+/// **ROUND 96** — parameter and variable whose location is a LIST
+/// (`.debug_loc`) instead of one expression.
+const AB_PARAM_LOC: u64 = 13;
+const AB_VAR_LOC: u64 = 14;
 
 // ------------------------------------------------------------ the pieces
 
@@ -171,6 +233,20 @@ impl Section {
     fn addr(&mut self, label: &str) {
         self.len += 8;
         self.pieces.push(Piece::Addr(label.to_string()));
+    }
+
+    /// **ROUND 96** — the octets of this section, as long as it holds no
+    /// address. `None` means: there is a relocation in it, so it cannot be
+    /// an expression inside another section.
+    fn flat(&self) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        for p in &self.pieces {
+            match p {
+                Piece::Raw(b) => out.extend_from_slice(b),
+                Piece::Addr(_) => return None,
+            }
+        }
+        Some(out)
     }
 
     /// The section as assembly text.
@@ -335,6 +411,34 @@ fn abbrev_section() -> Section {
             (DW_AT_LOCATION, DW_FORM_EXPRLOC),
         ],
     );
+    // ROUND 96: the same two, but with the location as an OFFSET into
+    // `.debug_loc` -- a location LIST instead of one expression.
+    abbrev(
+        &mut s,
+        AB_PARAM_LOC,
+        DW_TAG_FORMAL_PARAMETER,
+        DW_CHILDREN_NO,
+        &[
+            (DW_AT_NAME, DW_FORM_STRING),
+            (DW_AT_DECL_FILE, DW_FORM_DATA4),
+            (DW_AT_DECL_LINE, DW_FORM_DATA4),
+            (DW_AT_TYPE, DW_FORM_REF4),
+            (DW_AT_LOCATION, DW_FORM_SEC_OFFSET),
+        ],
+    );
+    abbrev(
+        &mut s,
+        AB_VAR_LOC,
+        DW_TAG_VARIABLE,
+        DW_CHILDREN_NO,
+        &[
+            (DW_AT_NAME, DW_FORM_STRING),
+            (DW_AT_DECL_FILE, DW_FORM_DATA4),
+            (DW_AT_DECL_LINE, DW_FORM_DATA4),
+            (DW_AT_TYPE, DW_FORM_REF4),
+            (DW_AT_LOCATION, DW_FORM_SEC_OFFSET),
+        ],
+    );
     abbrev(
         &mut s,
         AB_OPAQUE,
@@ -361,8 +465,10 @@ pub struct FnInfo {
     pub file: u32,
     pub line: u32,
     pub ret: DType,
-    /// The declared names WITH their frame offset (address = rbp - off).
-    pub vars: Vec<(VarNote, u64)>,
+    /// **ROUND 96** — the declared names WITH the place they lie in. Up to
+    /// round 94 that was always a frame offset, and that is exactly why
+    /// variables were only ever emitted without the optimizer.
+    pub vars: Vec<(VarNote, VarPlace)>,
 }
 
 /// Collects the types and hands out their offsets in `.debug_info`.
@@ -434,8 +540,11 @@ pub fn build(
     text_start: &str,
     text_end: &str,
     funcs: &[FnInfo],
-) -> (String, String) {
+) -> (String, String, String) {
     // --- collect the types -------------------------------------------------
+    // ROUND 96: `.debug_loc` grows alongside `.debug_info`; a variable that
+    // needs a list writes its entries here and keeps the offset.
+    let mut loc = Section::new();
     let mut types = Types::new();
     for f in funcs {
         types.collect(&f.ret);
@@ -499,21 +608,47 @@ pub fn build(
         // DW_AT_frame_base: one octet of expression, DW_OP_reg6 = rbp
         s.uleb(1);
         s.u8(DW_OP_REG6);
-        for (v, off) in &f.vars {
-            s.uleb(if v.param { AB_PARAM } else { AB_VAR });
-            s.text(&v.name);
-            s.u32(v.file + 1);
-            s.u32(v.line);
-            s.u32(types.offset(&v.ty));
-            // location: DW_OP_fbreg <sleb>. The frame base is rbp, the
-            // storage lies at rbp - off, so the offset is negative.
-            let mut expr = Section::new();
-            expr.u8(DW_OP_FBREG);
-            expr.sleb(-(*off as i64));
-            s.uleb(expr.len as u64);
-            for p in expr.pieces {
-                if let Piece::Raw(b) = p {
-                    s.raw(&b);
+        for (v, place) in &f.vars {
+            let expr = match place_expr(place) {
+                Some(x) => x,
+                // A place this compiler cannot express is left out entirely.
+                // `gdb` then says "optimized out" -- the truth.
+                None => continue,
+            };
+            match place {
+                // ROUND 96 -- A LOCATION LIST. The value only comes into
+                // being at `start`; before that its register holds something
+                // else, and a debugger that read it there would print a
+                // number that was never this variable's.
+                VarPlace::ListFrom(start, _) => {
+                    s.uleb(if v.param { AB_PARAM_LOC } else { AB_VAR_LOC });
+                    s.text(&v.name);
+                    s.u32(v.file + 1);
+                    s.u32(v.line);
+                    s.u32(types.offset(&v.ty));
+                    s.u32(loc.len as u32);
+                    // A base address selection entry (DWARF 4, 2.6.2) sets
+                    // the base to 0, so the two addresses below are absolute
+                    // and the assembler can fill them in as relocations. The
+                    // alternative would be to subtract the unit's low_pc,
+                    // and a difference of two labels is not something a
+                    // relocation can express.
+                    loc.raw(&[0xff; 8]);
+                    loc.raw(&[0u8; 8]);
+                    loc.addr(start);
+                    loc.addr(&f.end_label);
+                    loc.u16(expr.len() as u16);
+                    loc.raw(&expr);
+                    loc.raw(&[0u8; 16]); // end of the list
+                }
+                _ => {
+                    s.uleb(if v.param { AB_PARAM } else { AB_VAR });
+                    s.text(&v.name);
+                    s.u32(v.file + 1);
+                    s.u32(v.line);
+                    s.u32(types.offset(&v.ty));
+                    s.uleb(expr.len() as u64);
+                    s.raw(&expr);
                 }
             }
         }
@@ -530,6 +665,11 @@ pub fn build(
     (
         abbrev_section().render(".debug_abbrev"),
         s.render(".debug_info"),
+        if loc.len == 0 {
+            String::new()
+        } else {
+            loc.render(".debug_loc")
+        },
     )
 }
 
@@ -711,14 +851,71 @@ mod tests {
                     line: 2,
                     param: true,
                 },
-                16,
+                VarPlace::Frame(16),
             )],
         };
-        let (abbrev, info) = build("firnc", "a.fi", "/tmp", "__start", ".Ltext_end", &[f]);
+        let (abbrev, info, loc) =
+            build("firnc", "a.fi", "/tmp", "__start", ".Ltext_end", &[f]);
         assert!(abbrev.contains(".debug_abbrev"));
         assert!(info.contains(".debug_info"));
         assert!(info.contains(".quad f"));
         assert!(info.contains(".quad .Lend_f"));
+        // A frame offset needs no list.
+        assert!(loc.is_empty(), "{}", loc);
+    }
+
+    /// **ROUND 96** — a variable whose storage the optimizer took away gets
+    /// a LOCATION LIST: a base address entry, the range from its own label
+    /// to the end of the function, and the expression for the place.
+    #[test]
+    fn a_promoted_variable_becomes_a_location_list() {
+        let i32t = DType::Base("i32".into(), 4, ATE_SIGNED);
+        let f = FnInfo {
+            name: "f".into(),
+            start_label: "f".into(),
+            end_label: ".Lend_f".into(),
+            file: 0,
+            line: 1,
+            ret: i32t.clone(),
+            vars: vec![
+                (
+                    VarNote {
+                        name: "x".into(),
+                        val: 0,
+                        ty: i32t.clone(),
+                        file: 0,
+                        line: 2,
+                        param: false,
+                    },
+                    VarPlace::ListFrom(
+                        ".Ldbgv_f_7".into(),
+                        Box::new(VarPlace::Reg("r12")),
+                    ),
+                ),
+                (
+                    VarNote {
+                        name: "k".into(),
+                        val: 1,
+                        ty: i32t.clone(),
+                        file: 0,
+                        line: 3,
+                        param: false,
+                    },
+                    VarPlace::Const(42),
+                ),
+            ],
+        };
+        let (_, info, loc) = build("firnc", "a.fi", "/tmp", "__start", ".Ltext_end", &[f]);
+        assert!(loc.contains(".debug_loc"), "{}", loc);
+        assert!(loc.contains(".quad .Ldbgv_f_7"), "{}", loc);
+        assert!(loc.contains(".quad .Lend_f"), "{}", loc);
+        // DW_OP_reg12 = 0x50 + 12 = 92, and `r12` really is register 12 in
+        // the System V mapping. The section writes its octets in decimal.
+        assert!(loc.contains(",92,"), "{}", loc);
+        // The list ends with two zero addresses (DWARF 4, 2.6.2).
+        assert!(loc.trim_end().ends_with("0,0,0"), "{}", loc);
+        // The constant needs no list at all -- it stands in `.debug_info`.
+        assert!(info.contains(".debug_info"));
     }
 }
 

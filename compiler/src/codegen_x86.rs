@@ -159,6 +159,15 @@ pub(crate) struct Emitter {
     /// panic arms of the cold half (`panic_rt.rs`) read it: they are the code
     /// of exactly that source line, only moved behind the `ret`.
     pub(crate) here: crate::fir::Loc,
+    /// **ROUND 96** — values a location list needs a label for. Filled per
+    /// function before the blocks are emitted; empty as soon as no variable
+    /// information is produced, and then this costs nothing.
+    pub(crate) dbg_vals: std::collections::HashSet<crate::fir::Val>,
+    /// **ROUND 96** — the labels of `dbg_vals` that were really written. A
+    /// value can disappear between the decision and the emission (folded
+    /// into an immediate, fused into a comparison); a location list pointing
+    /// at a label that does not exist would not even assemble.
+    pub(crate) dbg_seen: std::collections::HashSet<crate::fir::Val>,
 }
 
 impl Emitter {
@@ -267,6 +276,8 @@ pub fn emit(m: &Module) -> Result<String, String> {
         out: String::new(),
         cold: String::new(),
         debug_funcs: Vec::new(),
+        dbg_vals: std::collections::HashSet::new(),
+        dbg_seen: std::collections::HashSet::new(),
         xmm: Default::default(),
         last_loc: None,
         here: crate::fir::Loc::NONE,
@@ -398,10 +409,15 @@ pub fn emit(m: &Module) -> Result<String, String> {
             "_start".to_string()
         };
         let funcs = std::mem::take(&mut e.debug_funcs);
-        let (abbrev, info) =
+        let (abbrev, info, loclist) =
             crate::dwarf_info::build(&producer, &unit, &dir, &start, ".Ltext_end", &funcs);
         e.raw(&abbrev);
         e.raw(&info);
+        // ROUND 96: `.debug_loc` -- only there when a variable really needs a
+        // list. An empty section would be a section nobody reads.
+        if !loclist.is_empty() {
+            e.raw(&loclist);
+        }
         e.raw(".text");
     }
     e.raw(".section .note.GNU-stack,\"\",@progbits");
@@ -497,25 +513,34 @@ fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
     // ROUND 72: one label counter per function, so every checked site in
     // it gets its own label pair (`panic_rt.rs::SiteCounter`).
     let mut site = crate::panic_rt::SiteCounter::new(&f.name);
+    // ROUND 96: which values carry a variable whose storage is gone.
+    e.dbg_vals = dbg_tracked(f);
     for b in &f.blocks {
         e.raw(&format!("{}:", block_label(&f.name, b.id)));
         emit_block(e, f, &fr, b, &mut site)?;
     }
+    e.dbg_vals.clear();
     // ROUND 64: `DW_AT_high_pc` needs an address at the end of the function,
     // and the frame offsets of the declared names are only known HERE --
     // `layout` runs per function.
     if dwarf::with_variables() {
         let end = format!(".Lfunc_end_{}", label(&f.name));
         e.raw(&format!("{}:", end));
-        let vars: Vec<(dwarf::VarNote, u64)> = dwarf::vars_of(&f.name)
-            .into_iter()
-            .filter_map(|v| {
+        // ROUND 96: the storage if it is still there, otherwise the slot of
+        // the value the variable was promoted into. The base path has no
+        // register allocation — everything that is not in the frame is in
+        // the frame.
+        let vars = dbg_vars(
+            f,
+            &|v| {
                 fr.alloca_off
-                    .get(v.val as usize)
+                    .get(v as usize)
                     .and_then(|o| *o)
-                    .map(|o| (v, o))
-            })
-            .collect();
+                    .map(dwarf::VarPlace::Frame)
+            },
+            &|v| fr.slot.get(v as usize).map(|o| dwarf::VarPlace::Frame(*o)),
+            &|v| e.dbg_seen.contains(&v),
+        );
         let (file, line) = dwarf::fn_line(&f.name).unwrap_or((0, 0));
         e.debug_funcs.push(crate::dwarf_info::FnInfo {
             name: f.name.clone(),
@@ -527,9 +552,90 @@ fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
             vars,
         });
     }
+    e.dbg_vals.clear();
+    e.dbg_seen.clear();
     // ROUND 90: the panic arms of this function's checked operations.
     e.flush_cold();
     Ok(())
+}
+
+/// **ROUND 96** — the label at which a value comes into being. The location
+/// list of a variable that the optimizer moved into a value starts here.
+pub(crate) fn dbg_label(fname: &str, v: crate::fir::Val) -> String {
+    format!(".Ldbgv_{}_{}", label(fname), v)
+}
+
+/// **ROUND 96** — emit that label, if this value carries a variable.
+pub(crate) fn dbg_mark(e: &mut Emitter, fname: &str, dst: Option<crate::fir::Val>) {
+    if e.dbg_vals.is_empty() {
+        return;
+    }
+    if let Some(d) = dst {
+        if e.dbg_vals.contains(&d) {
+            let l = dbg_label(fname, d);
+            e.raw(&format!("{}:", l));
+            e.dbg_seen.insert(d);
+        }
+    }
+}
+
+/// **ROUND 96** — which values does this function need a label for?
+///
+/// Exactly those that a named variable was promoted into (`mem2reg`) and
+/// that are not parameters — a parameter exists from the first instruction
+/// of the function, so the function's own start label is its beginning.
+pub(crate) fn dbg_tracked(f: &Func) -> std::collections::HashSet<crate::fir::Val> {
+    let mut out = std::collections::HashSet::new();
+    if !dwarf::with_variables() {
+        return out;
+    }
+    for v in dwarf::vars_of(&f.name) {
+        if let Some(nv) = dwarf::promoted_of(&f.name, v.val) {
+            if (nv as usize) >= f.params.len() {
+                out.insert(nv);
+            }
+        }
+    }
+    out
+}
+
+/// **ROUND 96** — the place of every named variable of this function, as far
+/// as it can be told TRUTHFULLY. `place_of` is handed the two answers the
+/// caller has: the frame offset of the storage (if it still exists) and the
+/// place of the value it was promoted into.
+pub(crate) fn dbg_vars(
+    f: &Func,
+    storage: &dyn Fn(crate::fir::Val) -> Option<dwarf::VarPlace>,
+    value_place: &dyn Fn(crate::fir::Val) -> Option<dwarf::VarPlace>,
+    has_label: &dyn Fn(crate::fir::Val) -> bool,
+) -> Vec<(dwarf::VarNote, dwarf::VarPlace)> {
+    let mut out = Vec::new();
+    for v in dwarf::vars_of(&f.name) {
+        if let Some(pl) = storage(v.val) {
+            out.push((v, pl));
+            continue;
+        }
+        // The storage is gone: follow the trail of mem2reg.
+        let nv = match dwarf::promoted_of(&f.name, v.val) {
+            Some(x) => x,
+            None => continue,
+        };
+        let place = match value_place(nv) {
+            Some(x) => x,
+            None => continue,
+        };
+        if (nv as usize) < f.params.len() || matches!(place, dwarf::VarPlace::Const(_)) {
+            // A parameter is there from the first instruction on, and a
+            // constant is the same everywhere -- neither needs a list.
+            out.push((v, place));
+        } else if has_label(nv) {
+            out.push((
+                v,
+                dwarf::VarPlace::ListFrom(dbg_label(&f.name, nv), Box::new(place)),
+            ));
+        }
+    }
+    out
 }
 
 fn emit_block(
@@ -548,6 +654,9 @@ fn emit_block(
         // it is right no matter which pass moved the instruction here.
         e.loc_at(i.loc);
         emit_inst(e, f, fr, i, site)?;
+        // ROUND 96: from here on the value exists — that is where the
+        // location list of a variable promoted into it begins.
+        dbg_mark(e, &f.name, i.dst);
         crate::simd::xretire(e, b.id, idx as u32);
     }
     // ROUND 82: everything the xmm cache still holds goes into its home slot

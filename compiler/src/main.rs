@@ -122,6 +122,16 @@ struct Options {
     test_limit: u32,
     /// `--no-run`: build the test binary, do not start it.
     no_run: bool,
+    /// **ROUND 96** — `--debug-vars`: names, types and PLACES of the
+    /// variables even at an optimized build level (`dwarf_info.rs`,
+    /// `.debug_loc`).
+    ///
+    /// Off by default, and that is deliberate: debug information carries the
+    /// working directory (`DW_AT_comp_dir`), so a build with it is not
+    /// reproducible octet for octet (round 93 wrote that down as a known
+    /// gap). Whoever wants to debug an optimized program asks for it; whoever
+    /// wants the same artifact on two machines does not.
+    debug_vars: bool,
 }
 
 /// **ROUND 82** — the wall clock per compiler phase (`--timings`).
@@ -204,6 +214,7 @@ fn usage() -> String {
          --profile=<name>   kernel | app (SPEC 2), forces the profile\n  \
          --target=<name>    x86_64-linux (default) | aarch64-linux (round 80)\n  \
          --no-opt           switch off the optimizer (= --opt-level=dev)\n  \
+         -g, --debug-vars   variables in the debugger at every build level\n  \
          --opt-level=<lvl>  dev | dev-fast | release-safe | release-fast\n  \
                               (\'dev-fast\' = only debug preserving passes)\n  \
          --no-pass=<name>   switch off a single optimization pass\n  \
@@ -236,6 +247,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut lock_check = false;
     let mut emit = Emit::Exe;
     let mut optimize = true;
+    let mut debug_vars = false;
     let mut keep_asm = false;
     let mut stats = false;
     let mut optcfg = opt::OptConfig::default();
@@ -260,6 +272,10 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             "--no-opt" => {
                 optimize = false;
                 optcfg.level = opt::Level::Dev;
+            }
+            // ROUND 96: variables in an OPTIMIZED build (docs/ROUND96.md).
+            "--debug-vars" | "-g" => {
+                debug_vars = true;
             }
             "--list-passes" => {
                 print!("{}", opt::passes_text());
@@ -412,6 +428,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         package_info,
         emit,
         optimize,
+        debug_vars,
         keep_asm,
         stats,
         optcfg,
@@ -597,9 +614,13 @@ fn run(opts: &Options) -> i32 {
     // already relative to the working directory
     // (`package_world::build_path`) — the artifact must not name the
     // machine it was built on.
+    // ROUND 96: variable information no longer hangs on the optimizer alone.
+    // `--debug-vars` asks for it at every build level; what cannot be told
+    // truthfully about a place is left out rather than guessed
+    // (`dwarf::VarPlace`).
     dwarf::reset(
         files.iter().map(|f| f.path.display().to_string()).collect(),
-        !opts.optimize,
+        !opts.optimize || opts.debug_vars,
     );
 
     if opts.emit == Emit::TypesCanon {
