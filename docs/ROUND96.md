@@ -39,11 +39,11 @@ rounds out of date** — see section 8.
 | the values gdb reads there | **4 of 4 right at `dev-fast`, 0 wrong at any level** — a variable that cannot be answered for says `<optimized out>` |
 | `.debug_loc` | **3 location lists** at `dev-fast`, 1 at the release levels; a list starts where the value comes into being, not at the function |
 | `tools/dwarf/run.sh` | **63 → 73 checks**, 0 failed |
-| the debugger used as a test of the optimizer | `tools/dwarf/diff_levels.sh`: DIFFRESULT |
-| a real bug found with the debugger | **no** — see section 7, and it is written down as not done |
+| the debugger used as a test of the optimizer | `tools/dwarf/diff_levels.sh` over the whole corpus reported **exactly one** difference between the two build levels — and that one was the bug above |
+| a real bug found with the debugger | **yes**, and fixed: a breakpoint on a function landed BEHIND the first conditional branch at every optimized level, so it was hit for only half the calls (section 7) |
 | item 5, re-measured in person | `tools/packages/run.sh` **39 of 39**, `tools/repro/two_machines.sh` **PASS** — lock file and two-machine proof were built in round 93; the **registry is still missing** |
-| the fixpoint | FIXPOINT |
-| the whole suite | TESTSH |
+| the fixpoint | **stage 2 == stage 3, character-identical**, 781,717 lines of assembly, 4,657,448 octets each (`tools/fixpoint.sh`, run inside the full suite AFTER every change of this round) |
+| the whole suite | `bash test.sh`, sections 1-17 of 63 measured green while this was written, **0 failures**: 333 programs x 4 build levels = **1,332 checks**, **211 negative tests**, the proofs of the optimizer, the result location, the architecture guards, the symbol scheme, the atomic primitive, the interface bounds and the function values, the HTML5 tokenizer **6,810/6,810**, the four comparisons against `firnc1` (lexer, parser, layout/ABI, type checker), `self_compare` **332 same / 0 differing / 0 faulty**, and the fixpoint above. The remaining sections (18-64: test262, the browser rounds, the Minecraft client, aarch64) were still running -- this machine shares its cores with another acceptance run and the stage 2 compiler needs minutes per JavaScript file |
 
 ---
 
@@ -294,18 +294,15 @@ entry per range — that is the next step and it is named, not pretended.
 allocator, and the second machine has its own (section 43 of `test.sh`
 measures it separately).
 
-## 7. The debugger as a test of the optimizer — and no bug found
+## 7. The debugger as a test of the optimizer — and the bug it found
 
-Criterion B of item 4 asks for more than a working debugger: *"a real bug
-was found with it"*. This round tried, with a method the new variable
-information makes possible for the first time
-(`tools/dwarf/diff_levels.sh`): build the same file twice, `--no-opt -g` and
-`--opt-level=dev-fast -g`, stop at the same function in both, and hold the
-PARAMETERS against each other. A parameter has an exactly defined value at a
-function entry — the one the caller passed — so two builds owe each other
-the same one.
-
-DIFFSECTION
+Criterion B of item 4 asks for more than a working debugger: *"a real bug was
+found with it"*. The variable information of this round makes a method
+possible that could not be run before (`tools/dwarf/diff_levels.sh`): build
+the same file twice, `--no-opt -g` and `--opt-level=dev-fast -g`, stop at the
+same function in both, and hold the PARAMETERS against each other. A
+parameter has an exactly defined value at a function entry — the one the
+caller passed — so two builds owe each other the same one.
 
 **Two things the round learned about its own method**, and both cost a run:
 
@@ -315,16 +312,110 @@ DIFFSECTION
   legitimately different garbage in two builds whose frames look nothing
   alike. Comparing them reported three "differences" in `examples/tour.fi`
   that were nothing of the sort.
-* an ADDRESS is not a value. A pointer to a local names a frame offset, and
-  the frames differ. Four further "differences" were exactly that. Both
-  kinds are counted separately now instead of being compared.
+* an ADDRESS is not a value. A pointer to a local names a frame offset, the
+  frames differ, and a `u64` holding the address of a static differs as well
+  (`__gc_alloc_in(st = 4831632)` against `4647520` is the state block of the
+  collector). Both kinds are counted separately now instead of compared.
 
-**So: no bug was found with the debugger, and the criterion stays open.**
-What this round *did* find — the conditional jump inside a checked `+`
-(section 3) and a pass table that calls `mem2reg` debug-preserving while it
-takes the variables away (section 9) — was found by reading and by
-measuring, not with gdb. Writing "found a bug" for either of them would be
-the sort of claim `ACCEPTANCE.md` exists to prevent.
+**And then the method found something.**
+
+```
+DIFFERENT  tests/1002_js_interp.fi  val__realm_bool  on:
+           --no-opt='false'  dev-fast='true'
+```
+
+`val.fi:739` is four lines long:
+
+```firn
+fn realm_bool(r: Gc[Realm], on: bool) -> Gc[JsVal] {
+    if on {
+        return r.yes
+    }
+    return r.no
+}
+```
+
+Neither value was wrong. The BREAKPOINT was in a different place — the
+backtraces say it plainly:
+
+```
+--no-opt   #1 builtin__install_number   (builtin.fi:3561)   on = false
+dev-fast   #1 builtin2__install2_array  (builtin2.fi:3851)  on = true
+```
+
+Two builds of the same deterministic program stopped at two different CALLS.
+The reason is that `break <function>` does not stop at the first instruction
+— the frame is not set up there and the parameters are not where the debug
+information says. The debugger has to find the end of the prologue, and if
+the line table does not SAY where it is, gdb guesses: it takes the second
+line entry of the function. That guess is right without the optimizer and
+wrong with it. Here it landed **behind the conditional jump**, inside one arm
+of the `if`, so the breakpoint was hit only for the calls that took that arm
+and the other half ran straight past it.
+
+A debugger that silently misses half the calls to a function is worth less
+than none, and nothing about it looks broken while it happens.
+
+**The cause, exactly.** Round 94 put the source position ON THE INSTRUCTIONS
+(`fir::Inst.loc`) and that is why the line table is right at every build
+level. A TERMINATOR is not an instruction and carries no position. As long as
+the body begins with something else, that does not show: the load of `on`
+carries line 740 and the branch inherits it. After `mem2reg` the load is
+gone, the entry block of `realm_bool` consists of nothing but the branch, and
+not one `.loc` announces the body — the whole block still counts as line 739,
+the `fn` line. Minimal reproduction, six lines, at `--opt-level=dev-fast`:
+
+```
+_F0.pick:
+    .loc 1 1 0          <- the fn line, and the only entry in the function
+    push rbp
+    …
+.Lpick__bb0:
+    test r8b, r8b       <- `if on`, line 2, announced by nobody
+    jnz .Lpick__bb1
+```
+
+**The fix** is the flag DWARF has for exactly this and GNU `as` writes:
+`.loc <file> <line> <col> prologue_end`. Where the body has a position of its
+own the marker goes ON that instruction and not one line earlier — between
+the prologue and it lie the stores that put the parameters into the places
+the debug information names, and a breakpoint in front of them reads a
+parameter that has not arrived yet. That is the second trap and it was
+measured too: with the marker at the frame setup, `docs/gdb_example.fi`
+answered `n = 0` where the caller had passed 10. Where the entry block has no
+position at all — the case that started all this — the marker goes right
+after the frame setup, with the `fn` line.
+
+**After the fix**, in the `dev-fast` build:
+
+```
+Breakpoint 1, val__realm_bool (r=0x7ffff7d81e70, on=false) at lib/js/val.fi:739
+#1  0x51cb25 in builtin__install_number (…) at lib/js/builtin.fi:3561
+```
+
+The same call, the same value as at `--no-opt`. `tools/dwarf/run.sh` stays at
+**73 of 73** — the sessions of round 64 and round 94 are unchanged by it,
+which is what had to be checked: the marker must not move a breakpoint that
+was already right.
+
+**What this does NOT claim.** The underlying gap is still there: a terminator
+carries no source position. The fix answers the question a breakpoint asks
+("where does the prologue end") and does not give the branch its line back.
+Stepping through a condition at an optimized level still shows the `fn` line.
+Putting a position on `fir::Term` is the next step and is named here rather
+than pretended.
+
+**The run this came out of**: `tools/dwarf/diff_levels.sh` over
+`tests/*.fi`, `examples/*.fi` and `tools/dwarf/probe.fi` — 319 files, each
+built twice and walked function by function. It reported **exactly one**
+difference, `val__realm_bool`, and that one was the bug of this section. Two
+earlier runs of the same script reported seven more, and every one of them
+was the method's own fault (locals at a function entry, addresses); they are
+what the two rules above are made of.
+
+That is the honest shape of the result: the method is worth having, it found
+one real thing, and most of the work of building it went into learning what
+it must NOT compare.
 
 ## 8. Item 5: the summary table was out of date
 
