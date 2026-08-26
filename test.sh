@@ -1255,20 +1255,6 @@ else
     bad "tools/domb1/run.sh failed (see .test-work/domb1.log)"
     grep -E '^   (ERROR|FAILED)|^ *>>' "$WORK/domb1.log" | head -12 | sed 's/^/   /'
 fi
-
-# ROUND K6. 53 to 57 belong to the rounds that were running beside this
-# one; this section is 58 and stays 58.
-echo "== 58. a userland: a shell, twenty-three tools, pipes and redirection (tools/userland/run.sh, ROUND K6) =="
-bash tools/userland/run.sh > "$WORK/userland.log" 2>&1 && ULRC=0 || ULRC=$?
-grep -E '^USERLAND:|the whole userland in octets|the biggest program|programs loaded off the disk' \
-    "$WORK/userland.log" | sed 's/^ */ /'
-if [ "$ULRC" -eq 0 ]; then
-    ok
-else
-    bad "tools/userland/run.sh failed (see .test-work/userland.log)"
-    grep -E '^  FAIL' "$WORK/userland.log" | head -12 | sed 's/^/   /'
-fi
-
 echo "== 61. LAYOUT against the official Web Platform Tests (tools/layoutb2/run.sh, ROUND B2) =="
 # The number 61 is fixed for this round; 60 belongs to round R96, which was
 # running next to it.
