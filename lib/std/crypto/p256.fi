@@ -1,0 +1,499 @@
+// lib/std/crypto/p256.fi -- NIST P-256 and ECDSA VERIFICATION, round B5.
+//
+// The other half of "can this certificate be trusted". RSA is in
+// `rsa.fi`; this is the curve that Let's Encrypt, Google and most modern
+// leaf certificates use, and it is also what a TLS 1.3 server signs its
+// CertificateVerify with when its key is an EC key
+// (`ecdsa_secp256r1_sha256`, RFC 8446 4.2.3).
+//
+// Verification only. A verifier works on public data -- the public key,
+// the signature, the hash -- so nothing here has to hide anything, and the
+// square-and-multiply of `std.crypto.big` with its branch on the exponent
+// bit is exactly right. SIGNING on this curve would need a constant-time
+// scalar multiplication and a nonce that is never reused; neither is here,
+// and neither is needed by a browser.
+//
+// ============================================================ THE GEOMETRY
+//
+// The points are carried in JACOBIAN coordinates: (X, Y, Z) stands for the
+// affine point (X/Z^2, Y/Z^3). The reason is that a point addition in
+// affine coordinates needs a modular INVERSION, which costs about as much
+// as 80 multiplications; in Jacobian coordinates addition and doubling
+// need none, and the single inversion is paid once at the end. A scalar
+// multiplication therefore costs 256 doublings and up to 256 additions of
+// a dozen multiplications each, plus one inversion -- instead of 512
+// inversions.
+//
+// The doubling formula uses a = -3, which P-256 was chosen to have: it
+// turns `3*(X^2 - Z^4)` into `3*(X - Z^2)*(X + Z^2)` and saves two
+// squarings per bit.
+//
+// Z = 0 is the point at infinity. It has no affine form and every
+// operation below checks for it -- an addition that returns infinity
+// without saying so is how a verifier ends up accepting the signature
+// (r, s) = (0, 0).
+//
+// ============================================================== THE CHECKS
+//
+// ECDSA verification (SEC 1, 4.1.4) is four conditions and ALL FOUR are
+// here, because each of them alone is a forgery:
+//
+//   1. r and s must lie in [1, n-1]. s = 0 makes the inversion undefined
+//      and r = 0 makes the answer independent of the message.
+//   2. the public key must be a point ON the curve, and not the point at
+//      infinity. A "public key" off the curve lies in a group where the
+//      discrete logarithm is easy.
+//   3. R = u1*G + u2*Q must not be the point at infinity.
+//   4. R.x mod n must equal r.
+//
+// ==================================================================== HONEST
+//
+// P1 P-256 ONLY. Not P-384, not P-521, not any of the Brainpool curves.
+//    A chain that needs one of those comes back "unsupported algorithm"
+//    from `lib/tls/x509.fi` and is refused, not accepted.
+// P2 UNCOMPRESSED POINTS ONLY (the 0x04 form, SEC 1 2.3.3). A compressed
+//    public key needs a square root modulo p; certificates in the wild are
+//    uncompressed and a compressed one is refused rather than guessed at.
+// P3 NOT CONSTANT TIME, on purpose -- see above. This file must never be
+//    used to sign.
+// P4 THE TWO SCALAR MULTIPLICATIONS ARE SEPARATE. Shamir's trick (one
+//    ladder over both scalars) is about 30 % faster and is not here; the
+//    measured cost of a verification is in docs/ROUNDB5.md.
+import std.rt
+import std.crypto.big
+
+export { ecdsa_verify, ecdsa_verify_hash, p256_point_valid, P256_LEN }
+
+const P256_LEN: usize = 32
+
+// p = 2^256 - 2^224 + 2^192 + 2^96 - 1, the field prime.
+fn p256_p(a: *mut big.Big) {
+    big.big_zero(a)
+    (*a).d[0] = 4294967295 as u32
+    (*a).d[1] = 4294967295 as u32
+    (*a).d[2] = 4294967295 as u32
+    (*a).d[3] = 0 as u32
+    (*a).d[4] = 0 as u32
+    (*a).d[5] = 0 as u32
+    (*a).d[6] = 1 as u32
+    (*a).d[7] = 4294967295 as u32
+    (*a).n = 8
+}
+
+// n, the order of the base point -- prime, so s^-1 is s^(n-2).
+fn p256_n(a: *mut big.Big) {
+    big.big_zero(a)
+    (*a).d[0] = 4234356049 as u32
+    (*a).d[1] = 4089039554 as u32
+    (*a).d[2] = 2803342980 as u32
+    (*a).d[3] = 3169254061 as u32
+    (*a).d[4] = 4294967295 as u32
+    (*a).d[5] = 4294967295 as u32
+    (*a).d[6] = 0 as u32
+    (*a).d[7] = 4294967295 as u32
+    (*a).n = 8
+}
+
+// n - 2, the exponent of the inversion modulo n.
+fn p256_n_minus_2(a: *mut big.Big) {
+    big.big_zero(a)
+    (*a).d[0] = 4234356047 as u32
+    (*a).d[1] = 4089039554 as u32
+    (*a).d[2] = 2803342980 as u32
+    (*a).d[3] = 3169254061 as u32
+    (*a).d[4] = 4294967295 as u32
+    (*a).d[5] = 4294967295 as u32
+    (*a).d[6] = 0 as u32
+    (*a).d[7] = 4294967295 as u32
+    (*a).n = 8
+}
+
+// The x coordinate of the base point G.
+fn p256_gx(a: *mut big.Big) {
+    big.big_zero(a)
+    (*a).d[0] = 3633889942 as u32
+    (*a).d[1] = 4104206661 as u32
+    (*a).d[2] = 770388896 as u32
+    (*a).d[3] = 1996717441 as u32
+    (*a).d[4] = 1671708914 as u32
+    (*a).d[5] = 4173129445 as u32
+    (*a).d[6] = 3777774151 as u32
+    (*a).d[7] = 1796723186 as u32
+    (*a).n = 8
+}
+
+// The y coordinate of the base point G.
+fn p256_gy(a: *mut big.Big) {
+    big.big_zero(a)
+    (*a).d[0] = 935285237 as u32
+    (*a).d[1] = 3417718888 as u32
+    (*a).d[2] = 1798397646 as u32
+    (*a).d[3] = 734933847 as u32
+    (*a).d[4] = 2081398294 as u32
+    (*a).d[5] = 2397563722 as u32
+    (*a).d[6] = 4263149467 as u32
+    (*a).d[7] = 1340293858 as u32
+    (*a).n = 8
+}
+
+// The curve constant b of y^2 = x^3 - 3x + b.
+fn p256_b(a: *mut big.Big) {
+    big.big_zero(a)
+    (*a).d[0] = 668098635 as u32
+    (*a).d[1] = 1003371582 as u32
+    (*a).d[2] = 3428036854 as u32
+    (*a).d[3] = 1696401072 as u32
+    (*a).d[4] = 1989707452 as u32
+    (*a).d[5] = 3018571093 as u32
+    (*a).d[6] = 2855965671 as u32
+    (*a).d[7] = 1522939352 as u32
+    (*a).n = 8
+}
+
+// A point in Jacobian coordinates, every value in the Montgomery domain
+// of the field modulus.
+struct Pt {
+    x: big.Big,
+    y: big.Big,
+    z: big.Big,
+}
+
+fn pt_new() -> Pt {
+    return Pt { x: big.big_new(), y: big.big_new(), z: big.big_new() }
+}
+
+fn pt_is_inf(a: *mut Pt) -> bool {
+    return big.big_is_zero(&(*a).z)
+}
+
+fn pt_copy(dst: *mut Pt, src: *mut Pt) {
+    big.big_copy(&(*dst).x, &(*src).x)
+    big.big_copy(&(*dst).y, &(*src).y)
+    big.big_copy(&(*dst).z, &(*src).z)
+}
+
+// r = 2*a, the a = -3 doubling (Bernstein/Lange "dbl-2001-b").
+fn pt_double(mc: *mut big.Mont, m: *mut big.Big, r: *mut Pt, a: *mut Pt) {
+    if pt_is_inf(a) {
+        pt_copy(r, a)
+        return
+    }
+    var delta: big.Big = big.big_new()
+    big.mont_mul(mc, &delta, &(*a).z, &(*a).z)
+    var gamma: big.Big = big.big_new()
+    big.mont_mul(mc, &gamma, &(*a).y, &(*a).y)
+    var beta: big.Big = big.big_new()
+    big.mont_mul(mc, &beta, &(*a).x, &gamma)
+    var t1: big.Big = big.big_new()
+    var t2: big.Big = big.big_new()
+    big.big_sub_mod(&t1, &(*a).x, &delta, m)
+    big.big_add_mod(&t2, &(*a).x, &delta, m)
+    var t3: big.Big = big.big_new()
+    big.mont_mul(mc, &t3, &t1, &t2)
+    var alpha: big.Big = big.big_new()
+    big.big_add_mod(&alpha, &t3, &t3, m)
+    big.big_add_mod(&alpha, &alpha, &t3, m) // 3*(X-delta)*(X+delta)
+    var a2: big.Big = big.big_new()
+    big.mont_mul(mc, &a2, &alpha, &alpha)
+    var b4: big.Big = big.big_new()
+    big.big_add_mod(&b4, &beta, &beta, m)
+    big.big_add_mod(&b4, &b4, &b4, m) // 4*beta
+    var b8: big.Big = big.big_new()
+    big.big_add_mod(&b8, &b4, &b4, m) // 8*beta
+    var x3: big.Big = big.big_new()
+    big.big_sub_mod(&x3, &a2, &b8, m)
+    // Z3 = (Y+Z)^2 - gamma - delta
+    var yz: big.Big = big.big_new()
+    big.big_add_mod(&yz, &(*a).y, &(*a).z, m)
+    var yz2: big.Big = big.big_new()
+    big.mont_mul(mc, &yz2, &yz, &yz)
+    var z3: big.Big = big.big_new()
+    big.big_sub_mod(&z3, &yz2, &gamma, m)
+    big.big_sub_mod(&z3, &z3, &delta, m)
+    // Y3 = alpha*(4*beta - X3) - 8*gamma^2
+    var t4: big.Big = big.big_new()
+    big.big_sub_mod(&t4, &b4, &x3, m)
+    var t5: big.Big = big.big_new()
+    big.mont_mul(mc, &t5, &alpha, &t4)
+    var g2: big.Big = big.big_new()
+    big.mont_mul(mc, &g2, &gamma, &gamma)
+    var g8: big.Big = big.big_new()
+    big.big_add_mod(&g8, &g2, &g2, m)
+    big.big_add_mod(&g8, &g8, &g8, m)
+    big.big_add_mod(&g8, &g8, &g8, m) // 8*gamma^2
+    var y3: big.Big = big.big_new()
+    big.big_sub_mod(&y3, &t5, &g8, m)
+    big.big_copy(&(*r).x, &x3)
+    big.big_copy(&(*r).y, &y3)
+    big.big_copy(&(*r).z, &z3)
+}
+
+// r = a + b ("add-2007-bl"), with the two degenerate cases handled.
+fn pt_add(mc: *mut big.Mont, m: *mut big.Big, r: *mut Pt, a: *mut Pt,
+    b: *mut Pt) {
+    if pt_is_inf(a) {
+        pt_copy(r, b)
+        return
+    }
+    if pt_is_inf(b) {
+        pt_copy(r, a)
+        return
+    }
+    var z1z1: big.Big = big.big_new()
+    big.mont_mul(mc, &z1z1, &(*a).z, &(*a).z)
+    var z2z2: big.Big = big.big_new()
+    big.mont_mul(mc, &z2z2, &(*b).z, &(*b).z)
+    var u1: big.Big = big.big_new()
+    big.mont_mul(mc, &u1, &(*a).x, &z2z2)
+    var u2: big.Big = big.big_new()
+    big.mont_mul(mc, &u2, &(*b).x, &z1z1)
+    var t: big.Big = big.big_new()
+    big.mont_mul(mc, &t, &(*b).z, &z2z2)
+    var s1: big.Big = big.big_new()
+    big.mont_mul(mc, &s1, &(*a).y, &t)
+    big.mont_mul(mc, &t, &(*a).z, &z1z1)
+    var s2: big.Big = big.big_new()
+    big.mont_mul(mc, &s2, &(*b).y, &t)
+    var h: big.Big = big.big_new()
+    big.big_sub_mod(&h, &u2, &u1, m)
+    var rr: big.Big = big.big_new()
+    big.big_sub_mod(&rr, &s2, &s1, m)
+    if big.big_is_zero(&h) {
+        if big.big_is_zero(&rr) {
+            pt_double(mc, m, r, a)
+            return
+        }
+        // opposite points: the sum is the point at infinity
+        big.big_set_u32(&(*r).x, 1 as u32)
+        big.big_set_u32(&(*r).y, 1 as u32)
+        big.big_zero(&(*r).z)
+        let okz: bool = big.big_set_len(&(*r).z, 8)
+        return
+    }
+    var h2: big.Big = big.big_new()
+    big.big_add_mod(&h2, &h, &h, m)
+    var i: big.Big = big.big_new()
+    big.mont_mul(mc, &i, &h2, &h2)
+    var j: big.Big = big.big_new()
+    big.mont_mul(mc, &j, &h, &i)
+    var r2: big.Big = big.big_new()
+    big.big_add_mod(&r2, &rr, &rr, m)
+    var v: big.Big = big.big_new()
+    big.mont_mul(mc, &v, &u1, &i)
+    var x3: big.Big = big.big_new()
+    big.mont_mul(mc, &x3, &r2, &r2)
+    big.big_sub_mod(&x3, &x3, &j, m)
+    var v2: big.Big = big.big_new()
+    big.big_add_mod(&v2, &v, &v, m)
+    big.big_sub_mod(&x3, &x3, &v2, m)
+    var t2: big.Big = big.big_new()
+    big.big_sub_mod(&t2, &v, &x3, m)
+    var y3: big.Big = big.big_new()
+    big.mont_mul(mc, &y3, &r2, &t2)
+    var sj: big.Big = big.big_new()
+    big.mont_mul(mc, &sj, &s1, &j)
+    var sj2: big.Big = big.big_new()
+    big.big_add_mod(&sj2, &sj, &sj, m)
+    big.big_sub_mod(&y3, &y3, &sj2, m)
+    var zs: big.Big = big.big_new()
+    big.big_add_mod(&zs, &(*a).z, &(*b).z, m)
+    var zs2: big.Big = big.big_new()
+    big.mont_mul(mc, &zs2, &zs, &zs)
+    big.big_sub_mod(&zs2, &zs2, &z1z1, m)
+    big.big_sub_mod(&zs2, &zs2, &z2z2, m)
+    var z3: big.Big = big.big_new()
+    big.mont_mul(mc, &z3, &zs2, &h)
+    big.big_copy(&(*r).x, &x3)
+    big.big_copy(&(*r).y, &y3)
+    big.big_copy(&(*r).z, &z3)
+}
+
+// r = k * a, double and add from the top bit. See P3: the scalar is
+// public in a verification.
+fn pt_mul(mc: *mut big.Mont, m: *mut big.Big, r: *mut Pt, k: *mut big.Big,
+    a: *mut Pt) {
+    var acc: Pt = pt_new()
+    big.big_set_u32(&acc.x, 1 as u32)
+    big.big_set_u32(&acc.y, 1 as u32)
+    let okz: bool = big.big_set_len(&acc.z, 8)
+    var tmp: Pt = pt_new()
+    var i: usize = big.big_bitlen(k)
+    while i > 0 {
+        i = i - 1
+        pt_double(mc, m, &tmp, &acc)
+        pt_copy(&acc, &tmp)
+        if big.big_bit(k, i) != 0 as u32 {
+            pt_add(mc, m, &tmp, &acc, a)
+            pt_copy(&acc, &tmp)
+        }
+    }
+    pt_copy(r, &acc)
+}
+
+// Is (x, y) a point on y^2 = x^3 - 3x + b, and not the point at infinity?
+// Both coordinates are 32 big-endian octets.
+fn p256_point_valid(qx: u64, qy: u64) -> bool {
+    var p: big.Big = big.big_new()
+    p256_p(&p)
+    var mc: big.Mont = big.mont_new()
+    if !big.mont_init(&mc, &p) {
+        return false
+    }
+    var x: big.Big = big.big_new()
+    var y: big.Big = big.big_new()
+    if !big.big_from_be(&x, qx, 32) || !big.big_from_be(&y, qy, 32) {
+        return false
+    }
+    if big.big_cmp(&x, &p) >= 0 || big.big_cmp(&y, &p) >= 0 {
+        return false
+    }
+    if big.big_is_zero(&x) && big.big_is_zero(&y) {
+        return false
+    }
+    var xm: big.Big = big.big_new()
+    var ym: big.Big = big.big_new()
+    big.mont_to(&mc, &xm, &x)
+    big.mont_to(&mc, &ym, &y)
+    var lhs: big.Big = big.big_new()
+    big.mont_mul(&mc, &lhs, &ym, &ym)
+    var x2: big.Big = big.big_new()
+    big.mont_mul(&mc, &x2, &xm, &xm)
+    var x3: big.Big = big.big_new()
+    big.mont_mul(&mc, &x3, &x2, &xm)
+    var three_x: big.Big = big.big_new()
+    big.big_add_mod(&three_x, &xm, &xm, &p)
+    big.big_add_mod(&three_x, &three_x, &xm, &p)
+    var bb: big.Big = big.big_new()
+    p256_b(&bb)
+    var bm: big.Big = big.big_new()
+    big.mont_to(&mc, &bm, &bb)
+    var rhs: big.Big = big.big_new()
+    big.big_sub_mod(&rhs, &x3, &three_x, &p)
+    big.big_add_mod(&rhs, &rhs, &bm, &p)
+    return big.big_cmp(&lhs, &rhs) == 0
+}
+
+// SEC 1, 4.1.4. `qx`, `qy`, `r`, `s` are 32 big-endian octets each;
+// `hash` is the message digest, `hlen` its length -- it is taken modulo
+// the group order after being truncated to the bit length of n, which is
+// what the standard prescribes for a hash that is longer than the curve.
+fn ecdsa_verify_hash(qx: u64, qy: u64, rsig: u64, ssig: u64,
+    hash: u64, hlen: usize) -> bool {
+    var n: big.Big = big.big_new()
+    p256_n(&n)
+    var r: big.Big = big.big_new()
+    var s: big.Big = big.big_new()
+    if !big.big_from_be(&r, rsig, 32) || !big.big_from_be(&s, ssig, 32) {
+        return false
+    }
+    // check 1
+    if big.big_is_zero(&r) || big.big_is_zero(&s) {
+        return false
+    }
+    if big.big_cmp(&r, &n) >= 0 || big.big_cmp(&s, &n) >= 0 {
+        return false
+    }
+    // check 2
+    if !p256_point_valid(qx, qy) {
+        return false
+    }
+    // e: the leftmost 256 bits of the hash, then reduced mod n
+    var use_len: usize = hlen
+    if use_len > 32 {
+        use_len = 32
+    }
+    var e0: big.Big = big.big_new()
+    if !big.big_from_be(&e0, hash, use_len) {
+        return false
+    }
+    var e: big.Big = big.big_new()
+    if !big.big_mod(&e, &e0, &n) {
+        return false
+    }
+    var nc: big.Mont = big.mont_new()
+    if !big.mont_init(&nc, &n) {
+        return false
+    }
+    // w = s^-1 mod n, by Fermat: n is prime.
+    var nm2: big.Big = big.big_new()
+    p256_n_minus_2(&nm2)
+    var sm: big.Big = big.big_new()
+    big.mont_to(&nc, &sm, &s)
+    var wm: big.Big = big.big_new()
+    big.mont_pow(&nc, &wm, &sm, &nm2)
+    var em: big.Big = big.big_new()
+    big.mont_to(&nc, &em, &e)
+    var u1m: big.Big = big.big_new()
+    big.mont_mul(&nc, &u1m, &em, &wm)
+    var u1: big.Big = big.big_new()
+    big.mont_from(&nc, &u1, &u1m)
+    var rm: big.Big = big.big_new()
+    big.mont_to(&nc, &rm, &r)
+    var u2m: big.Big = big.big_new()
+    big.mont_mul(&nc, &u2m, &rm, &wm)
+    var u2: big.Big = big.big_new()
+    big.mont_from(&nc, &u2, &u2m)
+
+    var p: big.Big = big.big_new()
+    p256_p(&p)
+    var mc: big.Mont = big.mont_new()
+    if !big.mont_init(&mc, &p) {
+        return false
+    }
+    var g: Pt = pt_new()
+    var gx: big.Big = big.big_new()
+    var gy: big.Big = big.big_new()
+    p256_gx(&gx)
+    p256_gy(&gy)
+    big.mont_to(&mc, &g.x, &gx)
+    big.mont_to(&mc, &g.y, &gy)
+    var one: big.Big = big.big_new()
+    big.big_set_u32(&one, 1 as u32)
+    big.mont_to(&mc, &g.z, &one)
+    var q: Pt = pt_new()
+    var qxb: big.Big = big.big_new()
+    var qyb: big.Big = big.big_new()
+    let o1: bool = big.big_from_be(&qxb, qx, 32)
+    let o2: bool = big.big_from_be(&qyb, qy, 32)
+    big.mont_to(&mc, &q.x, &qxb)
+    big.mont_to(&mc, &q.y, &qyb)
+    big.mont_to(&mc, &q.z, &one)
+
+    var p1: Pt = pt_new()
+    pt_mul(&mc, &p, &p1, &u1, &g)
+    var p2: Pt = pt_new()
+    pt_mul(&mc, &p, &p2, &u2, &q)
+    var sum: Pt = pt_new()
+    pt_add(&mc, &p, &sum, &p1, &p2)
+    // check 3
+    if pt_is_inf(&sum) {
+        return false
+    }
+    // x = X / Z^2, back out of the Montgomery domain
+    var pm2: big.Big = big.big_new()
+    big.big_copy(&pm2, &p)
+    pm2.d[0] = (pm2.d[0] as u64 - 2 as u64) as u32
+    var zi: big.Big = big.big_new()
+    big.mont_pow(&mc, &zi, &sum.z, &pm2)
+    var zi2: big.Big = big.big_new()
+    big.mont_mul(&mc, &zi2, &zi, &zi)
+    var xm: big.Big = big.big_new()
+    big.mont_mul(&mc, &xm, &sum.x, &zi2)
+    var xaff: big.Big = big.big_new()
+    big.mont_from(&mc, &xaff, &xm)
+    var xn: big.Big = big.big_new()
+    if !big.big_mod(&xn, &xaff, &n) {
+        return false
+    }
+    // check 4
+    return big.big_cmp(&xn, &r) == 0
+}
+
+// The same with a message that still has to be hashed with SHA-256 --
+// which is what `ecdsa_with_SHA256` means. The hash is passed in already
+// computed by the caller here, because a certificate hashes a SUBSTRING of
+// its own octets and only the caller knows which.
+fn ecdsa_verify(qx: u64, qy: u64, rsig: u64, ssig: u64, hash: u64,
+    hlen: usize) -> bool {
+    return ecdsa_verify_hash(qx, qy, rsig, ssig, hash, hlen)
+}
