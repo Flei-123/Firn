@@ -673,6 +673,26 @@ pub(crate) fn promote_allocas(f: &mut Func) -> usize {
         if ty == FTy::Void || ty == FTy::V128 {
             continue;
         }
+        // HOOK dwarf (ROUND 96) -- THE TRAIL. The storage of this cell is
+        // about to disappear, and with it the frame offset the debugger was
+        // told about. Written down here is only the case that has ONE
+        // answer: a cell written exactly once carries that one value from
+        // its store to the end of the function, no phi, no ambiguity. That
+        // is every parameter and every `let`, which is most of what a
+        // reader asks a debugger about.
+        //
+        // A cell written in a loop (`sum`, `k`) has a DIFFERENT value per
+        // block, and the honest answer for it is none at all -- `gdb` then
+        // says "optimized out". Writing one of the values down would be the
+        // sort of lie docs/DEBUGGER.md exists to prevent.
+        if u.stores.len() == 1 {
+            let (sb, si) = u.stores[0];
+            if let Op::Store { val, .. } = f.blocks[sb].insts[si].op {
+                if val != cell {
+                    crate::dwarf::note_promoted(&f.name, cell, val);
+                }
+            }
+        }
         for &(bi, ii) in &u.loads {
             if let Some(d) = f.blocks[bi].insts[ii].dst {
                 if locked(f, d) || untouchable.contains(&d) {

@@ -194,6 +194,14 @@
 #      neither an entry point nor a collector, and both spellings of the
 #      text type pull in the same runtime and name the same canonical type
 #      in an error message.
+#  64. CONSTANT TIME (round 96, tools/ct/run.sh): `secret[T]` is a type
+#      now. A program that puts a secret into a branch, into an index, into
+#      a division or through `as` back to a public type is REFUSED with line
+#      and column; the assembly of a comparison of two secrets carries no
+#      conditional jump at any of the four build levels, and the public
+#      twins of the same functions do carry one. Our own AES is asked the
+#      same question and answers it: the S-box lookup is refused at exactly
+#      the line its own note A3 named.
 #  53. THE TEST RUNNER AND THE LINE TABLE (round 94,
 #      tools/testrunner/run.sh): `#[test]` functions found by the compiler,
 #      run one process per case, reported as JSON and as TAP with name,
@@ -1381,6 +1389,28 @@ else
     bad "tools/liveb4/run.sh failed (see .test-work/liveb4.log)"
     grep -E 'FAIL|Traceback|Error' "$WORK/liveb4.log" | head -12 | sed 's/^/   /'
     tail -5 "$WORK/liveb4.log" | sed 's/^/   /'
+fi
+
+echo "== 64. constant time: secret[T] and #[constant_time] (tools/ct/run.sh, ROUND 96) =="
+# ACCEPTANCE item 6. Two claims, both measured on things and not on
+# intentions:
+#   * a program that puts a secret value into a conditional jump or into an
+#     index is REFUSED, with line and column (20 negative tests, and a
+#     counter-check with a wrong expectation that has to strike)
+#   * the ASSEMBLY of a comparison of two secrets carries no conditional
+#     jump -- at all four build levels, held against public twins of the
+#     same functions which do carry one
+# Plus our own AES: `tools/ct/aes_probe.fi` is the S-box step of
+# `lib/std/crypto/aes.fi` with the state declared as key material, and it has
+# to be refused at exactly the two lines note A3 of that file predicted.
+bash tools/ct/run.sh > "$WORK/ct.log" 2>&1 && CTRC=0 || CTRC=$?
+grep -E '^(  cost |  firnc1 over|CT: )' "$WORK/ct.log" | sed 's/^/ /'
+if [ "$CTRC" -eq 0 ]; then
+    ok
+    grep -E '^  ok    (dev/ct_eq4|release-fast/ct_eq:)' "$WORK/ct.log" | sed 's/^/   /'
+else
+    bad "tools/ct/run.sh failed (see .test-work/ct.log)"
+    grep -E 'FAIL' "$WORK/ct.log" | head -12 | sed 's/^/   /'
 fi
 
 TOTAL=$((PASS + FAIL))

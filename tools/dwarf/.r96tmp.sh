@@ -48,7 +48,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 ROOT=$(pwd)
-FIRNC="$ROOT/compiler/target/release/firnc"
+FIRNC=/tmp/firnc_r96
 export FIRNLIB="$ROOT/lib"
 
 TMPD=$(mktemp -d)

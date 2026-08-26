@@ -2621,6 +2621,8 @@ fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
     let ra = Ra { f, a, read, offset, skipped, preloader };
     // ROUND 72: one label counter per function (panic_rt.rs::SiteCounter).
     let mut site = crate::panic_rt::SiteCounter::new(&f.name);
+    // ROUND 96: the values a location list needs a label for.
+    e.dbg_vals = crate::codegen_x86::dbg_tracked(f);
     e.raw("");
     // Linker symbol through the one spot (codegen_x86::label -> modules::symbol)
     e.raw(&format!(".globl {}", label(&f.name)));
@@ -2679,6 +2681,60 @@ fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
         let next = order.get(k + 1).map(|&j| f.blocks[j].id);
         emit_block(e, &ra, b, next, &mut site)?;
     }
+    // ROUND 96 — WHERE THE VARIABLES OF THIS FUNCTION LIE, with the register
+    // allocation taken into account. Three answers are possible and each of
+    // them is exact:
+    //   * the `alloca` still has a frame address        -> rbp - off
+    //   * the allocator holds the cell in a REGISTER    -> that register
+    //     (`promotable_cells`: one register for the whole function, and the
+    //     address of the cell never escapes -- otherwise it would not be a
+    //     cell)
+    //   * the storage is gone, `mem2reg` left a trail   -> the place of the
+    //     value, as a location LIST from its definition on
+    // Everything else gets no entry: `gdb` then says "optimized out", which
+    // is the truth (docs/DEBUGGER.md).
+    if crate::dwarf::with_variables() {
+        let end = format!(".Lfunc_end_{}", label(&f.name));
+        e.raw(&format!("{}:", end));
+        let place = |v: Val| -> Option<crate::dwarf::VarPlace> {
+            // A value the code generator folds into its use sites as an
+            // immediate has no place -- and it does not need one: the
+            // constant itself IS the answer.
+            if let Some(c) = a.imm(v) {
+                return Some(crate::dwarf::VarPlace::Const(c));
+            }
+            match a.place(v) {
+                Loc::Reg(r) => Some(crate::dwarf::VarPlace::Reg(r)),
+                Loc::Slot(off) => Some(crate::dwarf::VarPlace::Frame(off)),
+            }
+        };
+        let storage = |v: Val| -> Option<crate::dwarf::VarPlace> {
+            if let Some(off) = a.frame_addr.get(&v) {
+                return Some(crate::dwarf::VarPlace::Frame(*off));
+            }
+            if let Some(r) = a.cells.get(&v) {
+                return Some(crate::dwarf::VarPlace::Reg(r));
+            }
+            a.frame
+                .alloca_off
+                .get(v as usize)
+                .and_then(|o| *o)
+                .map(crate::dwarf::VarPlace::Frame)
+        };
+        let vars = crate::codegen_x86::dbg_vars(f, &storage, &place, &|v| e.dbg_seen.contains(&v));
+        let (file, line) = crate::dwarf::fn_line(&f.name).unwrap_or((0, 0));
+        e.debug_funcs.push(crate::dwarf_info::FnInfo {
+            name: f.name.clone(),
+            start_label: label(&f.name),
+            end_label: end,
+            file,
+            line,
+            ret: crate::dwarf::ret_of(&f.name).unwrap_or(crate::dwarf::DType::Void),
+            vars,
+        });
+    }
+    e.dbg_vals.clear();
+    e.dbg_seen.clear();
     Ok(())
 }
 
@@ -2855,6 +2911,8 @@ fn emit_block(
         // body (measured: `inl.fi:7` for code out of `inl.fi:3`).
         e.loc_at(i.loc);
         emit_inst(e, ra, i, site)?;
+        // ROUND 96: the beginning of a location list (codegen_x86::dbg_mark).
+        crate::codegen_x86::dbg_mark(e, &ra.f.name, i.dst);
     }
     if mergeable {
         if let Some(last) = b.insts.last() {

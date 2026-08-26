@@ -64,6 +64,33 @@ pub const ATE_FLOAT: u8 = 0x04;
 pub const ATE_SIGNED: u8 = 0x05;
 pub const ATE_UNSIGNED: u8 = 0x07;
 
+/// **ROUND 96** — WHERE a variable lies once the optimizer has had it.
+///
+/// Round 64 knew exactly one answer, `rbp - off`, and it was only ever true
+/// without the optimizer — which is why variable information was tied to
+/// `--no-opt` at all. The three answers here are the ones that can be GIVEN
+/// TRUTHFULLY, and everything that cannot be answered truthfully gets no
+/// entry at all: a wrong value in a debugger is worse than none
+/// (`docs/DEBUGGER.md`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VarPlace {
+    /// `rbp - off`, for the whole function: the storage is still there.
+    Frame(u64),
+    /// A machine register, for the whole function: the register allocator
+    /// keeps this cell there and never moves it (`regalloc::Alloc::cells`).
+    Reg(&'static str),
+    /// A LOCATION LIST (`.debug_loc`): the value comes into being at the
+    /// label and lives from there to the end of the function. Before the
+    /// label the debugger says "optimized out" instead of reading a register
+    /// that still holds something else.
+    ListFrom(String, Box<VarPlace>),
+    /// The value is a CONSTANT that the code generator folded into the
+    /// instructions that use it. It has no place at all, and yet the
+    /// debugger can print it: `DW_OP_consts <n> DW_OP_stack_value` says
+    /// "this is the value, not the address of the value".
+    Const(i64),
+}
+
 /// One declared name inside a function.
 #[derive(Clone, Debug)]
 pub struct VarNote {
@@ -84,6 +111,10 @@ struct FuncLines {
     vars: Vec<VarNote>,
     /// Round 64: the result type of the function.
     ret: Option<DType>,
+    /// **ROUND 96**: `alloca` value -> the value it was promoted to
+    /// (`mem2reg`). Without this trail a variable whose storage the
+    /// optimizer removed cannot be found again at all.
+    promoted: HashMap<u32, u32>,
 }
 
 #[derive(Default)]
@@ -187,6 +218,28 @@ pub fn set_fn_type(name: &str, ret: DType) {
 }
 
 /// Round 64: the declared names of a function, in declaration order.
+/// **ROUND 96** — `// HOOK dwarf` in `mem2reg`: the storage of this
+/// `alloca` is gone, the value now sits in `val`.
+///
+/// Only ever called where the promotion is UNAMBIGUOUS (one store, or a
+/// load that reads exactly one store). Where mem2reg cannot say which value
+/// carries the variable, nothing is written down and the variable stays
+/// invisible — which is the honest of the two answers.
+pub fn note_promoted(func: &str, alloca: u32, val: u32) {
+    if !with_variables() {
+        return;
+    }
+    with(|t| {
+        let e = t.funcs.entry(func.to_string()).or_default();
+        e.promoted.insert(alloca, val);
+    });
+}
+
+/// **ROUND 96** — the trail of `note_promoted`.
+pub fn promoted_of(func: &str, alloca: u32) -> Option<u32> {
+    with(|t| t.funcs.get(func).and_then(|f| f.promoted.get(&alloca).copied()))
+}
+
 pub fn vars_of(name: &str) -> Vec<VarNote> {
     with(|t| t.funcs.get(name).map(|f| f.vars.clone()).unwrap_or_default())
 }
