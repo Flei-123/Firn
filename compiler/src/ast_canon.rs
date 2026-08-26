@@ -95,6 +95,9 @@ fn ty(t: &TypeExpr) -> String {
             format!("(ptr {} {})", if *mutable { "mut" } else { "const" }, ty(inner))
         }
         TypeExpr::Array { elem, len, .. } => format!("(arr {} {})", len, ty(elem)),
+        // ROUND 96: `secret[T]` is a shape of its own in the canonical tree —
+        // `firnfmt` must not be able to lose the marking silently.
+        TypeExpr::Secret { inner, .. } => format!("(secret {})", ty(inner)),
         // Round 58: a function type. `(fnty (arguments) result)`.
         TypeExpr::Fn { params, ret, .. } => {
             let ps: Vec<String> = params.iter().map(ty).collect();

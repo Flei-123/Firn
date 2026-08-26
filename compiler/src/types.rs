@@ -58,6 +58,21 @@ pub enum Type {
     /// function has a record of exactly one word in `.rodata`; only a
     /// closure that captures something needs the GC heap.
     Fn { params: Vec<Type>, ret: Box<Type> },
+    /// **ROUND 96** — `secret[T]` (SPEC §9.1): the marking that says a value
+    /// is key material.
+    ///
+    /// It is a QUALIFIER, not a machine type of its own: `secret[u8]` is one
+    /// octet and travels in the same register as a `u8`. What changes is
+    /// what the type checker allows on it — no branch, no index, no
+    /// division, and no way back to a public type other than `declassify`.
+    ///
+    /// WHY A VARIANT AND NOT A FLAG: every `matches!` in this compiler that
+    /// asks `is_concrete_int()` now says NO to a secret value. That is
+    /// deliberate and it is the safe direction — a place that has not been
+    /// taught about secrets REFUSES them instead of quietly treating them
+    /// like public data. The places where a secret really is allowed are
+    /// listed in `ct.rs` and nowhere else.
+    Secret(Box<Type>),
 }
 
 impl Type {
@@ -80,6 +95,27 @@ impl Type {
     }
     pub fn is_ptr(&self) -> bool {
         matches!(self, Type::Ptr { .. })
+    }
+    /// **ROUND 96** — is this a `secret[T]` (SPEC §9.1)?
+    pub fn is_secret(&self) -> bool {
+        matches!(self, Type::Secret(_))
+    }
+    /// **ROUND 96** — the type behind the marking. Every other type is its
+    /// own, so a caller can ask without knowing whether a secret is involved.
+    pub fn public(&self) -> &Type {
+        match self {
+            Type::Secret(inner) => inner,
+            other => other,
+        }
+    }
+    /// **ROUND 96** — put the marking on, if `yes` and if the type can carry
+    /// one at all. `secret[secret[T]]` cannot come about this way.
+    pub fn like_secret(self, yes: bool) -> Type {
+        if yes && (self.is_concrete_int() || self == Type::Bool) {
+            Type::Secret(Box::new(self))
+        } else {
+            self
+        }
     }
     /// **ROUND 71** — one of the two floating point types.
     pub fn is_float(&self) -> bool {
@@ -110,6 +146,7 @@ impl Type {
             Type::Bool => 8,
             Type::Ptr { .. } => 64,
             Type::Fn { .. } => 64,
+            Type::Secret(inner) => inner.bits(),
             _ => 0,
         }
     }
@@ -205,6 +242,9 @@ impl TypeCtx {
             Type::Fn { .. } => 8,
             Type::Array(e, n) => self.size_of(e) * *n,
             Type::Struct(i) => self.structs.get(*i).map(|s| s.size).unwrap_or(0),
+            // ROUND 96: the marking costs nothing — `secret[u8]` is one
+            // octet, exactly like the `u8` behind it (SPEC §9.1).
+            Type::Secret(inner) => self.size_of(inner),
             Type::Void | Type::Error => 0,
         }
     }
@@ -274,6 +314,7 @@ impl TypeCtx {
                     _ => format!("fn({}) -> {}", ps.join(", "), self.name_of(ret)),
                 }
             }
+            Type::Secret(inner) => format!("secret[{}]", self.name_of(inner)),
             Type::UntypedInt => "{integer}".into(),
             Type::Void => "()".into(),
             Type::Error => "<error>".into(),

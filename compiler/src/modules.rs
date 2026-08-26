@@ -745,6 +745,9 @@ impl<'a, 'b> Renamer<'a, 'b> {
 
     fn ty(&mut self, t: &mut TypeExpr) {
         match t {
+            // ROUND 96: `secret[T]` — the marking carries no name of its own,
+            // the type INSIDE it has to be qualified like every other.
+            TypeExpr::Secret { inner, .. } => self.ty(inner),
             TypeExpr::Named(name, span) => {
                 // HOOK fehlerunionen (round 76): `E!T` leaves only the
                 // placeholder `__eu#<n>` in the tree, the success type `T`
