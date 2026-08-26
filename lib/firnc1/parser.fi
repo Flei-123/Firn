@@ -330,6 +330,34 @@ fn at_pos(p: *mut Parser, k: usize) -> u64 {
     return ast.pos_pack((*p).file, lexer.lex_line(lx(p), i), lexer.lex_col(lx(p), i))
 }
 
+// ROUND 96 -- how WIDE a declaration or statement is, in characters: the
+// column just after its last token minus the column of its first. `from` is
+// the index of the first token, the current token is the one AFTER the
+// last. `kw` is the fallback -- the width of the keyword alone.
+//
+// `firnc0` builds the same number with `Parser::join` (parser.rs), and
+// `join` gives up as soon as the two ends are on DIFFERENT LINES; so does
+// this. That is why the fallback exists and why a `let` whose initializer
+// runs over a line break is marked only under its keyword.
+fn span_width(p: *mut Parser, from: usize, kw: u32) -> u32 {
+    if (*p).pos <= from || from >= (*p).n {
+        return kw
+    }
+    let last: usize = (*p).pos - 1
+    if last >= (*p).n {
+        return kw
+    }
+    if lexer.lex_line(lx(p), last) != lexer.lex_line(lx(p), from) {
+        return kw
+    }
+    let a: u32 = lexer.lex_col(lx(p), from)
+    let e: u32 = lexer.lex_col(lx(p), last) + lexer.lex_length(lx(p), last)
+    if e <= a {
+        return kw
+    }
+    return e - a
+}
+
 // Register the store for the generic templates. MUST happen before `par_run`.
 fn par_gen_set(p: *mut Parser, g: u64) { (*p).gen = g }
 
@@ -2273,6 +2301,12 @@ fn let_stmt(p: *mut Parser) -> u32 {
     if actual(p, A_KWVAR) {
         kind_s = ast.S_VAR
     }
+    // ROUND 96: `'x' is already declared in this block` points at the WHOLE
+    // statement, `let` up to the last character of the initializer
+    // (sema.rs::declare_var, called with the joined statement span). The
+    // first token is the keyword; the width is taken once the initializer
+    // has been read, BEFORE `end_stmt` swallows a ';' that is not part of it.
+    let kw_at: usize = (*p).pos
     next_bump(p)
     if !actual(p, A_IDENT) {
         complain(p)
@@ -2294,6 +2328,7 @@ fn let_stmt(p: *mut Parser) -> u32 {
         return ast.stmt_new(par_tree(p), ast.S_BREAK, 0, 0, 0, 0)
     }
     let init: u32 = expr(p)
+    let width: u32 = span_width(p, kw_at, 3)
     end_stmt(p)
     // ROUND 79: `[T; _]` -- now that the initializer has been read, the
     // length is known. Only the OUTERMOST one; `[[u8; _]; 3]` stays an error.
@@ -2310,7 +2345,9 @@ fn let_stmt(p: *mut Parser) -> u32 {
     }
     // Visible ONLY FROM NOW ON: `let x = x + 1` means the outer `x` on the right.
     loc_add(p, name)
-    return ast.stmt_new(par_tree(p), kind_s, name, t, init, 0)
+    let si: u32 = ast.stmt_new(par_tree(p), kind_s, name, t, init, 0)
+    ast.stmt_len_set(par_tree(p), si, width)
+    return si
 }
 
 // ROUND 79: how many elements does this initializer have? `LEN_INFER` means
@@ -2506,6 +2543,10 @@ fn stmt_inner(p: *mut Parser) -> u32 {
 // works out from that what is captured.
 fn lambda(p: *mut Parser, heap: bool) -> u32 {
     let b: *mut ast.Tree = par_tree(p)
+    // ROUND 96 (decl.fi): the generated function gets a position too. Its
+    // name (`__closure#N`) can never collide, but a position of 0 would
+    // print a message without a line if it ever did.
+    let at: u64 = at_pos(p, 0)
     // The name: `__closure#<number>`. The `#` is no identifier character,
     // so no source text can ever write it.
     rt.buf_clear(&(*p).scratch)
@@ -2559,6 +2600,7 @@ fn lambda(p: *mut Parser, heap: bool) -> u32 {
     (*p).no_slit = saved
     loc_off(p)
     ast.fn_add(b, cname, poff, plen + 1, ret, body, 0, 0, 0, 0, 0, 0, 0)
+    ast.fn_pos_set(b, ast.fn_count(b) - 1, at)
     var packed: u64 = 0
     if ret != ast.NOTHING {
         packed = (ret as u64 + 1) << 1
@@ -2669,6 +2711,8 @@ fn struct_template(p: *mut Parser, name: u32) {
             break
         }
         let fname: u32 = tok_nr(p, 0)
+        // ROUND 96 (decl.fi): a field is blamed under its NAME.
+        let fat: u64 = at_pos(p, 0)
         next_bump(p)
         if !expect(p, A_COLON) {
             break
@@ -2677,7 +2721,8 @@ fn struct_template(p: *mut Parser, name: u32) {
         if t == ast.NOTHING {
             break
         }
-        ast.field_add(par_tree(p), fname, t)
+        let fidx: u32 = ast.field_add(par_tree(p), fname, t)
+        ast.field_pos_set(par_tree(p), fidx, fat)
         if (*p).pos == before {
             next_bump(p)
         }
@@ -2689,6 +2734,11 @@ fn struct_template(p: *mut Parser, name: u32) {
 }
 
 fn fn_decl(p: *mut Parser) {
+    // ROUND 96 (decl.fi): `function 'f' is already declared` is written
+    // under the FIRST token of the declaration -- `extern` where there is
+    // one, otherwise `fn` (parser.rs::fn_decl takes `start` before the
+    // `extern` check as well).
+    let at: u64 = at_pos(p, 0)
     // ROUND 75 (SPEC 14.5): 'extern fn' -- a declaration WITHOUT a body,
     // closed with ';' instead of a block.
     let is_extern: bool = actual(p, A_KWEXTERN)
@@ -2746,6 +2796,7 @@ fn fn_decl(p: *mut Parser) {
         if (*p).link_pending_set { ls = 1 }
         ast.fn_add(par_tree(p), name, poff, plen, ret, empty_body, 0, 0, 0,
             1, (*p).link_pending, ls, 0)
+        ast.fn_pos_set(par_tree(p), ast.fn_count(par_tree(p)) - 1, at)
         (*p).link_pending = 0
         (*p).link_pending_set = false
         (*p).nogc_pending = 0
@@ -2769,6 +2820,7 @@ fn fn_decl(p: *mut Parser) {
     }
     // ROUND 79 (escape.fi): the way out and the place the frame dies.
     let fi: usize = ast.fn_count(par_tree(p)) - 1
+    ast.fn_pos_set(par_tree(p), fi, at)
     ast.fn_esc_set(par_tree(p), fi, (*p).esc_pending)
     ast.fn_end_set(par_tree(p), fi, ast.block_end(par_tree(p), body))
     (*p).esc_pending = 0
@@ -2787,6 +2839,7 @@ fn fn_decl(p: *mut Parser) {
 }
 
 fn struct_decl(p: *mut Parser) {
+    let at: u64 = at_pos(p, 0)
     next_bump(p)
     if !actual(p, A_IDENT) {
         complain(p)
@@ -2819,6 +2872,8 @@ fn struct_decl(p: *mut Parser) {
             break
         }
         let fname: u32 = tok_nr(p, 0)
+        // ROUND 96 (decl.fi): a field is blamed under its NAME.
+        let fat: u64 = at_pos(p, 0)
         next_bump(p)
         if !expect(p, A_COLON) {
             break
@@ -2827,7 +2882,8 @@ fn struct_decl(p: *mut Parser) {
         if t == ast.NOTHING {
             break
         }
-        ast.field_add(par_tree(p), fname, t)
+        let fidx: u32 = ast.field_add(par_tree(p), fname, t)
+        ast.field_pos_set(par_tree(p), fidx, fat)
         if (*p).pos == before {
             next_bump(p)
         }
@@ -2835,10 +2891,14 @@ fn struct_decl(p: *mut Parser) {
     expect(p, A_RBRACE)
     let len: u32 = vec_len[u32](&(*par_tree(p)).fd_name) as u32 - off
     ast.structure_add(par_tree(p), name, off, len, (*p).mc_pending)
+    ast.structure_pos_set(par_tree(p), ast.structure_count(par_tree(p)) - 1, at)
     (*p).mc_pending = 0
 }
 
 fn const_decl(p: *mut Parser) {
+    // ROUND 96 (decl.fi): `constant 'A' is already declared` is written
+    // under the `const` keyword, exactly as in `sema.rs::collect_consts`.
+    let at: u64 = at_pos(p, 0)
     next_bump(p)
     if !actual(p, A_IDENT) {
         complain(p)
@@ -2859,6 +2919,7 @@ fn const_decl(p: *mut Parser) {
     let w: u32 = expr(p)
     end_stmt(p)
     ast.const_add(par_tree(p), name, t, w)
+    ast.const_pos_set(par_tree(p), ast.const_count(par_tree(p)) - 1, at)
 }
 
 // ROUND 89 -- `static NAME: T = value` / `static mut NAME: T = value`
@@ -2866,6 +2927,7 @@ fn const_decl(p: *mut Parser) {
 // one extra token; what differs is what the back end does with it, not the
 // syntax.
 fn static_decl(p: *mut Parser) {
+    let at: u64 = at_pos(p, 0)
     next_bump(p)
     let m: bool = eat(p, A_KWMUT)
     if !actual(p, A_IDENT) {
@@ -2887,9 +2949,13 @@ fn static_decl(p: *mut Parser) {
     let w: u32 = expr(p)
     end_stmt(p)
     ast.static_add(par_tree(p), name, t, w, m)
+    ast.static_pos_set(par_tree(p), ast.static_count(par_tree(p)) - 1, at)
 }
 
 fn import_decl(p: *mut Parser) {
+    // ROUND 96 (decl.fi): `module 'm' is imported more than once` is
+    // written under the `import` keyword (parser.rs::import_decl).
+    let at: u64 = at_pos(p, 0)
     next_bump(p)
     if !actual(p, A_IDENT) {
         complain(p)
@@ -2908,7 +2974,28 @@ fn import_decl(p: *mut Parser) {
         next_bump(p)
     }
     let path: u32 = intern.intern_number(it, rt.buf_ptr(&(*p).scratch), rt.buf_len(&(*p).scratch)) as u32
+    // Twice in THIS FILE? The tree holds the imports of the whole program,
+    // and `std.io` in two different modules is perfectly ordinary -- so the
+    // comparison runs over the imports whose position carries THIS file
+    // number. (`(*p).module` cannot be asked: `module_upfront` fills it
+    // with every alias of the file before a single line is parsed, so that
+    // `module.x` is recognised from the first line onwards.)
+    var twice: bool = false
+    var q: usize = 0
+    while q < ast.imp_count(par_tree(p)) {
+        if ast.pos_file(ast.imp_pos(par_tree(p), q)) == (*p).file {
+            if ast.imp_alias(par_tree(p), q) == last {
+                twice = true
+            }
+        }
+        q = q + 1
+    }
     ast.imp_add(par_tree(p), path, last)
+    let ii: usize = ast.imp_count(par_tree(p)) - 1
+    ast.imp_pos_set(par_tree(p), ii, at)
+    if twice {
+        ast.imp_twice_set(par_tree(p), ii)
+    }
     vec_push[u32](&(*p).module, last)
     end_stmt(p)
 }
@@ -2966,11 +3053,14 @@ fn enum_decl(p: *mut Parser) {
     }
     // NO renaming: enum names are visible program wide (SPEC 14.1).
     let name: u32 = tok_nr(p, 0)
+    // ROUND 96 (decl.fi): the name, not the keyword -- that is where
+    // `sema_match.rs` puts `enum 'E' is already declared`.
+    let nat: u64 = at_pos(p, 0)
     next_bump(p)
     if !expect(p, A_LBRACE) {
         return
     }
-    let ei: u32 = pattern.pat_enum_add(mn(p), name)
+    let ei: u32 = pattern.pat_enum_add(mn(p), name, nat)
     while true {
         while eat(p, A_COMMA) {}
         if actual(p, A_RBRACE) || at_end(p) {
@@ -2982,6 +3072,7 @@ fn enum_decl(p: *mut Parser) {
             break
         }
         let vname: u32 = tok_nr(p, 0)
+        let vat: u64 = at_pos(p, 0)
         next_bump(p)
         let toff: u32 = pattern.pat_vt_start(mn(p))
         var tlen: u32 = 0
@@ -3006,7 +3097,7 @@ fn enum_decl(p: *mut Parser) {
             }
             expect(p, A_RPAREN)
         }
-        pattern.pat_variant_add(mn(p), ei, vname, toff, tlen)
+        pattern.pat_variant_add(mn(p), ei, vname, toff, tlen, vat)
         if (*p).pos == before {
             next_bump(p)
         }
@@ -3137,6 +3228,8 @@ fn pattern(p: *mut Parser, depth: u32) -> u32 {
     }
     if a == A_IDENT {
         let nr: u32 = tok_nr(p, 0)
+        // ROUND 96 (decl.fi): a binding is blamed under its name.
+        let nat: u64 = at_pos(p, 0)
         next_bump(p)
         let it: *mut intern.Interner = lexer.lex_names(lx(p))
         var us: [u8; 1] = "_"
@@ -3150,7 +3243,9 @@ fn pattern(p: *mut Parser, depth: u32) -> u32 {
         }
         // binding of the whole value
         loc_add(p, nr)
-        return pattern.pat_mu_add(mn(p), pattern.MU_BIND, nr, 0, 0, 0, 0, 0)
+        let bi: u32 = pattern.pat_mu_add(mn(p), pattern.MU_BIND, nr, 0, 0, 0, 0, 0)
+        pattern.pat_mu_pos_set(mn(p), bi, nat)
+        return bi
     }
     if colon(p, 0) {
         // `::Variant` -- the enum part is missing and is taken from the
@@ -3827,6 +3922,9 @@ fn self_param(p: *mut Parser, tname0: u32) -> bool {
 // A method becomes the ordinary function `Type__method`. After that it is
 // nothing special any more -- the same type check, the same lowering.
 fn methods_decl(p: *mut Parser, tname: u32) {
+    // ROUND 96 (decl.fi): a method is a function, and a function declared
+    // twice is blamed under its `fn`.
+    let at: u64 = at_pos(p, 0)
     next_bump(p)
     if !actual(p, A_IDENT) {
         complain(p)
@@ -3865,6 +3963,7 @@ fn methods_decl(p: *mut Parser, tname: u32) {
     let body: u32 = block(p)
     loc_off(p)
     ast.fn_add(par_tree(p), name, poff, plen, ret, body, 0, 0, 0, 0, 0, 0, 0)
+    ast.fn_pos_set(par_tree(p), ast.fn_count(par_tree(p)) - 1, at)
 }
 
 // ROUND 46 (iface.rs::interface_decl): `interface I { fn m(*self) -> T ... }`.
@@ -4091,6 +4190,9 @@ fn canon_at(it: *mut intern.Interner, k: i32) -> u32 {
 fn impl_decl(p: *mut Parser) {
     next_bump(p)
     let first: u32 = tok_nr(p, 0)
+    // ROUND 96 (decl.fi): `'T' already implements the interface 'I'` is
+    // written under the INTERFACE name (iface.rs::check_impl).
+    let iat: u64 = at_pos(p, 0)
     next_bump(p)
     // ROUND 46 (iface.rs): `impl Interface for Type`. The block creates
     // THE SAME functions as `impl Type` -- the interface merely states
@@ -4113,7 +4215,7 @@ fn impl_decl(p: *mut Parser) {
     raw = canon_alias(p, raw)
     let tname: u32 = renamed(p, raw)
     if is_for && has_if(p) {
-        iface.if_impl_add(ifr(p), first, raw)
+        iface.if_impl_add(ifr(p), first, raw, iat)
     }
     if !expect(p, A_LBRACE) {
         return

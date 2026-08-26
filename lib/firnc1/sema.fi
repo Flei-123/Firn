@@ -38,6 +38,7 @@ import iface
 import core
 import nogc
 import escape
+import decl
 
 export { Sema, sema_new, sema_free, sema_run, sema_error, sema_ty, sema_widen32,
     sema_types, sema_ty_count, sema_needs_comptime, sema_const_value,
@@ -116,6 +117,10 @@ struct Sema {
     // ROUND 70: the arguments of an interpolation that may be widened
     // (`f"{x}"` with an i32 into `io.fmt_number(... i64)`).
     widen: Vec[u32],
+    // ROUND 96 -- the duplicate declaration check (decl.fi). It lives HERE
+    // and not next to the caller because the locals are found while the
+    // bodies are walked, and the walk is this file's.
+    dcl: decl.Decl,
 }
 
 fn sema_new(b: u64, it: u64) -> Sema {
@@ -140,10 +145,12 @@ fn sema_new(b: u64, it: u64) -> Sema {
         cg_name: vec_new[u32](), cg_ty: vec_new[u32](), cg_frame: vec_new[u32](),
         scratch2: rt.buf_new(),
         widen: vec_new[u32](),
+        dcl: decl.decl_new(),
     }
 }
 
 fn sema_free(s: *mut Sema) {
+    decl.decl_free(&(*s).dcl)
     vec_free[u32](&(*s).widen)
     types.types_free(&(*s).ty)
     vec_free[u32](&(*s).etyp)
@@ -295,7 +302,9 @@ fn lambda_check(s: *mut Sema, e: u32) -> u32 {
     range_on(s)
     k = 0
     while k < plen {
-        var_create(s, ast.param_name(b, poff + k), vec_at[u32](&par, k as usize))
+        let cpn: u32 = ast.param_name(b, poff + k)
+        var_create(s, cpn, vec_at[u32](&par, k as usize),
+            ast.param_pos(b, poff + k), name_len(s, cpn))
         k = k + 1
     }
     vec_free[u32](&par)
@@ -457,9 +466,52 @@ fn range_off(s: *mut Sema) {
     }
 }
 
-fn var_create(s: *mut Sema, name: u32, t: u32) {
+// ROUND 96: a name that is already taken IN THE INNERMOST SCOPE is an
+// error -- `sema.rs::declare_var`. `pos`/`len` say where the marker goes:
+// under the WHOLE statement for a `let`/`var`, under the NAME for a
+// parameter, a pattern binding or a loop variable. The entry is written
+// anyway, exactly as stage 0 overwrites its map entry, so that a use
+// further down does not report a second, misleading error.
+fn var_create(s: *mut Sema, name: u32, t: u32, pos: u64, len: u32) {
+    let floor: usize = scope_floor(s)
+    var i: usize = floor
+    while i < vec_len[u32](&(*s).v_name) {
+        if vec_at[u32](&(*s).v_name, i) == name {
+            decl.decl_local(&(*s).dcl, name, pos, len)
+            i = vec_len[u32](&(*s).v_name)
+        }
+        i = i + 1
+    }
     vec_push[u32](&(*s).v_name, name)
     vec_push[u32](&(*s).v_ty, t)
+}
+
+// The width of an identifier, for the marker under it.
+fn name_len(s: *mut Sema, name: u32) -> u32 {
+    let n: usize = intern.intern_length(names(s), name)
+    if n == 0 {
+        return 1
+    }
+    return n as u32
+}
+
+// The width of a `let`/`var` statement. 0 means the parser could not join
+// the span (an initializer over several lines) -- then the keyword alone
+// carries the marker, exactly as `Parser::join` leaves it in stage 0.
+fn stmt_width(b: *mut ast.Tree, i: u32) -> u32 {
+    let w: u32 = ast.stmt_len(b, i)
+    if w == 0 {
+        return 3
+    }
+    return w
+}
+
+// Where the innermost scope starts in `v_name`.
+fn scope_floor(s: *mut Sema) -> usize {
+    if vec_len[u32](&(*s).b_limit) == 0 {
+        return 0
+    }
+    return vec_last[u32](&(*s).b_limit) as usize
 }
 
 // Search from the back: the innermost scope wins.
@@ -3036,7 +3088,8 @@ fn pattern_check(s: *mut Sema, pat: u32, ty: u32, sj_kind: u32, sj_ei: u32,
         return
     }
     if a == pattern.MU_BIND {
-        var_create(s, pattern.pat_mu_a(m, pat), ty)
+        let bn: u32 = pattern.pat_mu_a(m, pat)
+        var_create(s, bn, ty, pattern.pat_mu_pos(m, pat), name_len(s, bn))
         return
     }
     if a == pattern.MU_BOOL {
@@ -3319,7 +3372,7 @@ fn catch_check(s: *mut Sema, e: u32) -> u32 {
         range_on(s)
         let st: u32 = err.error_set_ty(fe(s), table(s),
             err.error_u_set(fe(s), u))
-        var_create(s, bind, st)
+        var_create(s, bind, st, ast.expr_pos(tree(s), rhs), name_len(s, bind))
     }
     let rt: u32 = expr(s, rhs, want)
     if bind != NONE {
@@ -3451,7 +3504,7 @@ fn stmt(s: *mut Sema, i: u32) {
                 t = got
             }
         }
-        var_create(s, ast.s_a(b, i), t)
+        var_create(s, ast.s_a(b, i), t, ast.stmt_pos(b, i), stmt_width(b, i))
         return
     }
     if a == ast.S_ZUW {
@@ -3537,7 +3590,7 @@ fn stmt(s: *mut Sema, i: u32) {
             t = st
         }
         range_on(s)
-        var_create(s, ast.s_a(b, i), t)
+        var_create(s, ast.s_a(b, i), t, ast.stmt_pos(b, i), name_len(s, ast.s_a(b, i)))
         block(s, ast.s_d(b, i), true)
         range_off(s)
         return
@@ -3567,6 +3620,16 @@ fn stmt(s: *mut Sema, i: u32) {
         return
     }
     if a == ast.S_DEFER || a == ast.S_ERRDEFER {
+        // ROUND 96: a jump that LEAVES the deferred body is refused
+        // (`sema.rs`, SPEC 5.1) -- otherwise it would be undefined what
+        // happens to the deferred statements still waiting. Until this
+        // round stage 1 let it through and the LOWERING then walked off the
+        // end: `defer { return 1 }` did not produce a message, it produced
+        // a segmentation fault in the compiler (tests/neg/defer_return.fi).
+        if defer_jump(s, ast.s_a(b, i), false) {
+            complain(s)
+            return
+        }
         stmt(s, ast.s_a(b, i))
         return
     }
@@ -3611,6 +3674,58 @@ fn stmt(s: *mut Sema, i: u32) {
         return
     }
     // break / continue: the parser has already checked the position.
+}
+
+// ROUND 96 -- twin of `sema.rs::defer_jump`. Does a jump lead OUT of this
+// deferred body? A `break`/`continue` inside a loop that BEGINS within the
+// body belongs to that loop and stays inside; a `return` never does, which
+// is why the walk switches to `only_return` when it enters one.
+fn defer_jump(s: *mut Sema, i: u32, only_return: bool) -> bool {
+    let b: *mut ast.Tree = tree(s)
+    let a: u32 = ast.s_kind(b, i)
+    if a == ast.S_RET {
+        return true
+    }
+    if !only_return {
+        if a == ast.S_BREAK || a == ast.S_CONT {
+            return true
+        }
+    }
+    if a == ast.S_BLOCK {
+        return defer_jump_block(s, ast.s_a(b, i), only_return)
+    }
+    if a == ast.S_DEFER || a == ast.S_ERRDEFER {
+        return defer_jump(s, ast.s_a(b, i), only_return)
+    }
+    if a == ast.S_IF {
+        if defer_jump_block(s, ast.s_b(b, i), only_return) {
+            return true
+        }
+        let els: u32 = ast.s_c(b, i)
+        if els != ast.NOTHING {
+            return defer_jump(s, els, only_return)
+        }
+        return false
+    }
+    if a == ast.S_WHILE {
+        return defer_jump_block(s, ast.s_b(b, i), true)
+    }
+    if a == ast.S_FOR {
+        return defer_jump_block(s, ast.s_d(b, i), true)
+    }
+    return false
+}
+
+fn defer_jump_block(s: *mut Sema, bi: u32, only_return: bool) -> bool {
+    let b: *mut ast.Tree = tree(s)
+    var k: u32 = 0
+    while k < ast.b_len(b, bi) {
+        if defer_jump(s, ast.slist_at(b, ast.b_off(b, bi) + k), only_return) {
+            return true
+        }
+        k = k + 1
+    }
+    return false
 }
 
 fn block(s: *mut Sema, bi: u32, range_already_open: bool) {
@@ -3845,6 +3960,14 @@ fn sema_run(s: *mut Sema) {
     if has_if(s) {
         iface.if_register((*s).ifr, table(s), names(s))
     }
+    // 0e. ROUND 96 -- THE DUPLICATE DECLARATIONS (decl.fi). Exactly HERE,
+    //    because this is the window stage 0 checks in: the enums, error
+    //    sets, gc classes and interfaces are in the type table, the structs
+    //    of the tree are not yet -- `collect_structs` asks `tcx.lookup`
+    //    before it declares. The findings are only collected; they are
+    //    printed at the end of the run, after the bodies have added the
+    //    local ones, so that the order is stage 0's order.
+    decl.decl_check(&(*s).dcl, b, names(s), table(s), (*s).mu)
     // 1. Struct layout and function signatures -- the same computation as
     //    in `types.fi`, here once for everything.
     types.types_resolve(table(s), b, names(s))
@@ -3856,6 +3979,16 @@ fn sema_run(s: *mut Sema) {
         while if_so_far < ij {
             complain(s)
             if_so_far = if_so_far + 1
+        }
+        // ROUND 96: `impl I for T` written twice. The registry found it,
+        // `decl.fi` says it -- with the interface name under the marker,
+        // exactly as in `iface.rs::check_impl`.
+        var di: usize = 0
+        while di < iface.if_dup_count(ifp(s)) {
+            decl.decl_impl(&(*s).dcl, iface.if_dup_ty(ifp(s), di),
+                iface.if_dup_if(ifp(s), di), iface.if_dup_pos(ifp(s), di),
+                name_len(s, iface.if_dup_if(ifp(s), di)))
+            di = di + 1
         }
     }
     // 1b. Collect `#[must_consume]` (sema.rs::check_attrs, round 36):
@@ -4033,8 +4166,9 @@ fn sema_run(s: *mut Sema) {
         range_on(s)
         var k: u32 = 0
         while k < ast.fn_plen(b, i) {
-            var_create(s, ast.param_name(b, ast.fn_poff(b, i) + k),
-                types.param_ty_resolved(table(s), i, k))
+            let pn: u32 = ast.param_name(b, ast.fn_poff(b, i) + k)
+            var_create(s, pn, types.param_ty_resolved(table(s), i, k),
+                ast.param_pos(b, ast.fn_poff(b, i) + k), name_len(s, pn))
             k = k + 1
         }
         block(s, ast.fn_body(b, i), true)
@@ -4072,6 +4206,15 @@ fn sema_run(s: *mut Sema) {
             complain(s)
             nk = nk + 1
         }
+    }
+    // 6b. ROUND 96: print what the duplicate check found. BEFORE the
+    //    escape analysis, because stage 0 reports everything the type
+    //    check found before it starts looking at addresses.
+    let dupes: usize = decl.decl_report(&(*s).dcl, b, names(s))
+    var dk: usize = 0
+    while dk < dupes {
+        complain(s)
+        dk = dk + 1
     }
     // 7. ROUND 79: the escape analysis (escape.fi, twin of
     //    compiler/src/escape.rs). Runs AFTER the type check as well: it has
