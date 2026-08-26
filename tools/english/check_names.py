@@ -42,8 +42,12 @@ TEIL = re.compile(r'[a-z0-9]+|[A-Z]+(?![a-z])|[A-Z][a-z0-9]*')
 # tools/layout/cases/br_flex_basis_percent.expected seither als deutschen
 # Pfad gemeldet und check.sh gab 0 0 0 1 0 statt fuenf Nullen. Derselbe
 # Grund, dieselbe Antwort: das englische Wort der Spezifikation.
+# RUNDE B5: 'der' ist DISTINGUISHED ENCODING RULES (X.690), der
+# Kodierungsregeln-Satz, in dem jedes Zertifikat steht -- das Fachwort der
+# Norm und kein deutscher Artikel. `lib/tls/der.fi` darf nicht anders
+# heissen, sonst findet niemand die Datei, der die Norm kennt.
 ERLAUBT = {'kernel', 'start', 'core', 'min', 'max', 'lib', 'bin', 'src',
-           'demos', 'app', 'pause', 'linker', 'mess', 'basis'}
+           'demos', 'app', 'pause', 'linker', 'mess', 'basis', 'der'}
 # Runde 65: englische GANZE Woerter, in denen ein deutsches Morphem als
 # Zeichenfolge steckt ('absolute' enthaelt 'absolut'). Die Suche im
 # Wortinneren darf hier nicht anschlagen; als ganzes Teil geprueft, nicht
