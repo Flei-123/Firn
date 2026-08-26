@@ -43,6 +43,16 @@
 #      (lib/js/, in Firn) against the official suite test262, against node
 #      as a second engine, and in an endurance run with a counter check
 #      (tools/js/run.sh, docs/ROUND63.md).
+#  63. THE PAGE COMES ALIVE (tools/liveb4/run.sh, round B4): the DOM
+#      bound into the JavaScript engine, `<script>` really executed with
+#      the ordering rules of `async` and `defer`, a per-node dirty mark
+#      that narrows the recomputation after a change -- checked against a
+#      FULL layout box for box -- and an HTTP/1.1 client in Firn measured
+#      against Python's own `http.server` over a real socket. Measured
+#      with the OFFICIAL Web Platform Tests of the dom/ area through the
+#      unmodified `testharness.js`; files whose harness never finished are
+#      counted separately and never as passes. TLS is refused by name.
+#      Numbers and limits in docs/ROUNDB4.md.
 #  55. A TCP/IP STACK OF ITS OWN (tools/k3net/run.sh, round K3): Ethernet,
 #      ARP, IPv4 with checksum and fragment refusal, ICMP, UDP and TCP with
 #      all eleven states -- written in Firn, without an allocator, and
@@ -1325,6 +1335,52 @@ else
     bad "tools/paintb3/run.sh failed (see .test-work/paintb3.log)"
     grep -E 'FAILED|Traceback|Error' "$WORK/paintb3.log" | head -12 | sed 's/^/   /'
     tail -5 "$WORK/paintb3.log" | sed 's/^/   /'
+fi
+
+echo "== 63. THE PAGE COMES ALIVE: scripts, invalidation and HTTP (ROUND B4) =="
+# The number 63 is fixed for this round. 62 belongs to round B3.
+#
+# What rounds B1 to B3 built was a pipeline that ran ONCE: markup in,
+# picture out. Two things were missing, and they are the two things that
+# make a page a page: a script could not touch the tree, and nothing could
+# fetch a document out of the network. This round is both.
+#
+# What runs here: the DOM as JavaScript sees it (`document`,
+# `getElementById`, `querySelector`, `createElement`, `appendChild`,
+# `textContent`, `innerHTML` through the FRAGMENT PARSING ALGORITHM,
+# `setAttribute`, `classList`, `style`, `addEventListener` with the three
+# phases of the event flow, `window`, `location`, `setTimeout`); the
+# ordering of `<script>`, `<script async>` and `<script defer>`, with the
+# external ones really fetched over a socket; a per-node DIRTY MARK that
+# narrows the recomputation after a change; and an HTTP/1.1 client in Firn
+# with chunked transfer, gzip, redirects, a cache and cookies.
+#
+# THE GUARDS, and they are the point of the section:
+#   * the official `testharness.js` is used UNMODIFIED, and a file counts
+#     only if its harness really finished AND produced at least one
+#     subtest. A test that reports nothing passes nothing -- that is the
+#     lesson of the 32 empty reference pictures of round B3, and the files
+#     that could not run are printed as their own number.
+#   * the narrowed recomputation is checked against a FULL layout after
+#     EVERY single mutation, box for box, x, y, w and h as bit patterns.
+#     A narrowing that is fast and wrong is worth less than none. It found
+#     two real bugs while it was being built (docs/ROUNDB4.md 4.3).
+#   * the HTTP client talks to Python's own `http.server`, started and
+#     killed by the runner. Both ends being this repository is exactly the
+#     situation in which a shared misunderstanding stays invisible.
+#   * `https://` is REFUSED, by name, twice -- typed in and reached
+#     through a redirect. TLS is not in this round and is not faked.
+bash tools/liveb4/run.sh > "$WORK/liveb4.log" 2>&1 && B4RC=0 || B4RC=$?
+grep -E '^   (url |http dates|Set-Cookie|Cookie header|http rules|persistent|jar / cache|keep-alive|script order|counter-check|own cases|document:|elements styled|nodes visited|boxes laid|microseconds|layout walls|boxes whose|files |subtests|wpt_|own_|http_|narrow_|layout after)' \
+    "$WORK/liveb4.log" | sed 's/^/ /'
+grep -E '^(B4 OK|B4-WPT|URL OK|COOKIE OK|HTTP OK|SCRIPTS OK|CASES OK|INVALIDATE OK): ' \
+    "$WORK/liveb4.log" | sed 's/^/ /'
+if [ "$B4RC" -eq 0 ]; then
+    ok
+else
+    bad "tools/liveb4/run.sh failed (see .test-work/liveb4.log)"
+    grep -E 'FAIL|Traceback|Error' "$WORK/liveb4.log" | head -12 | sed 's/^/   /'
+    tail -5 "$WORK/liveb4.log" | sed 's/^/   /'
 fi
 
 TOTAL=$((PASS + FAIL))
