@@ -47,7 +47,12 @@ TEIL = re.compile(r'[a-z0-9]+|[A-Z]+(?![a-z])|[A-Z][a-z0-9]*')
 # Norm und kein deutscher Artikel. `lib/tls/der.fi` darf nicht anders
 # heissen, sonst findet niemand die Datei, der die Norm kennt.
 ERLAUBT = {'kernel', 'start', 'core', 'min', 'max', 'lib', 'bin', 'src',
-           'demos', 'app', 'pause', 'linker', 'mess', 'basis', 'der'}
+           'demos', 'app', 'pause', 'linker', 'mess', 'basis', 'der',
+           # ROUND SPEED: `.gitattributes` is a file name git prescribes, and
+           # the English word "attributes" contains the German morpheme
+           # "attribut". The checker cannot tell them apart, and renaming the
+           # file is not on the table -- so it is named here.
+           'gitattributes'}
 # Runde 65: englische GANZE Woerter, in denen ein deutsches Morphem als
 # Zeichenfolge steckt ('absolute' enthaelt 'absolut'). Die Suche im
 # Wortinneren darf hier nicht anschlagen; als ganzes Teil geprueft, nicht
