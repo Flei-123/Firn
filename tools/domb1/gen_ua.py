@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """Produces lib/dom/ua_data.fi out of lib/dom/ua.css.
 
 A WORKBENCH, NOT A PRODUCT: the default stylesheet is CSS and is kept as

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! **Round 80 — system call numbers per machine.**
 //!
 //! A `syscall` in Firn source carries a NUMBER, not a name:

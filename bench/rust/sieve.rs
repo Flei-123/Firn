@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Gegenstueck zu bench/firn/sieve.fi.
 use std::hint::black_box;
 

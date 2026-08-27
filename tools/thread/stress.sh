@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/thread/stress.sh -- soak run with several threads and a running collector.
 #
 # What is measured is the REAL memory consumption of the process (RSS from

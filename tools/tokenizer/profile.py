@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """Callgrind profile of a Firn binary with RESOLVED function names.
 
 WHY: Firn binaries are static and have no dynamic section; callgrind

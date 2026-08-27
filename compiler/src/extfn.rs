@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! `extern fn` and `#[export_c]` — the C ABI boundary (SPEC §14.5, round 75).
 //!
 //! Up to round 74 `extern fn` was recognized syntactically and rejected

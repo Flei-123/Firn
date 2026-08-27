@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Monomorphization of generic templates (`L5`, module `types`).
 //!
 //! Runs between parser and type checker: for every type combination used by

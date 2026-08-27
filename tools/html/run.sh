@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/html/run.sh -- HTML tree construction + DOM core (round 54).
 #
 #   1. compile lib/browser/parse_main.fi in THREE build stages

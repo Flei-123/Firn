@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # Benchmark suite: Firn against Rust (rustc -O), same machine, median.
 # Usage:  bash bench/run.sh          (5 runs per program)
 #          BENCH_RUNS=9 bash bench/run.sh

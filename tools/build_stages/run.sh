@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # Measures the BUILD STAGES against each other (DESIGN_GOALS.md 5).
 #
 # Question: is '--opt-level=dev-fast' (only debug-preserving passes) close

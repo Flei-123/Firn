@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-only
 import os,re,struct,subprocess,collections,sys
 DATA=os.environ.get('T262','.js-work/t262')
 SUB=sys.argv[2] if len(sys.argv)>2 else 'test/language'

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/stdlib81/run.sh -- the proof for round 81: hash/map, DEFLATE, JSON,
 # crypto.
 #

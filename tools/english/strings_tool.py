@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/english/strings_tool.py — ersetzt Zeichenkettenliterale, deren
 # INHALT genau ein Eintrag aus strings.tsv ist (mit oder ohne abschliessendes
 # "\0"). Prosa bleibt unberuehrt; dafuer gibt es messages.tsv.

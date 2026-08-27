@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Constant-time primitives (SPEC §9.2/§9.3) — `select`, `barrier`,
 //! `secure_zero`.
 //!

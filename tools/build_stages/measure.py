@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """Measures dev / dev-fast / release-fast on the benchmark suite (median)."""
 import glob, os, statistics, subprocess, sys, time
 

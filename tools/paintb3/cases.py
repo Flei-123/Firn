@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """tools/paintb3/cases.py -- the OWN cases of round B3.
 
 Seven pages that between them touch every drawing command the engine has:

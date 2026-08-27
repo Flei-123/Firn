@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """The test bench of round 61: OWN cases, OWN expectation, FOREIGN witness.
 
 A case is a plain HTML file in `tools/layout/cases/`. It is run twice:

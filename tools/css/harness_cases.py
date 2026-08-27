@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """Runner for the OWN cases of the CSS path (tools/css/cases/*.txt).
 
 What cssselect2 cannot check is checked here: `:hover`, the cascade over

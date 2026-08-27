@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/layoutb2/run.sh -- ROUND B2: the layout engine against the OFFICIAL
 # Web Platform Tests, and the proof that a second layout of the same tree
 # gives the same answer.

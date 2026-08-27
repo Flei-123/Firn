@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 // tools/aarch64/impl.s -- the A64 twin of tools/extfn/impl.s: a
 // hand-written `strlen`, AAPCS64 (x0 = the pointer, x0 = the length up to
 // but not including the first zero byte). Deliberately NOT libc, so

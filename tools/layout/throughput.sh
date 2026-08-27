@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/layout/throughput.sh -- the cost of the LAYOUT in INSTRUCTIONS.
 #
 # NOT with the wall clock. On this machine the run time of one and the

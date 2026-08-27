@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """tools/js/gen_unicode_id.py -- generate lib/js/unicode_id.fi.
 
 ECMA-262 12.7.1 builds identifiers on the Unicode properties ID_Start and

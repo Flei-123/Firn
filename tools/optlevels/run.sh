@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/optlevels/run.sh -- THE FOUR BUILD LEVELS HAVE TO AGREE (round 90).
 #
 # WHY THIS EXISTS.
