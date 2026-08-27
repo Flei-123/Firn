@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/extfn/run.sh -- 'extern fn' MEASURED IN BOTH DIRECTIONS, IN BOTH
 # COMPILERS (round 75, SPEC 14.1 item 7).
 #

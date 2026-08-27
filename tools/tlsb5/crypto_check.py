@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """tools/tlsb5/crypto_check.py -- the primitives of round B5 against
 somebody else's implementation.
 

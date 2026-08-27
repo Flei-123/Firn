@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """Cross-check of the SELECTOR ENGINE from lib/css/sel.fi against cssselect2.
 
 WHAT IS COMPARED, and what is deliberately not: the matcher, ON THE SAME

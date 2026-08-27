@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """tools/tlsb5/cert_check.py -- the certificate check, and above all the
 REFUSALS.
 

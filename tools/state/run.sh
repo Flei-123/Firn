@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/state/run.sh -- THE PROOF FOR GLOBAL VARIABLES (round 89,
 # SPEC 14.1.statics), in BOTH compilers and on BOTH machines.
 #

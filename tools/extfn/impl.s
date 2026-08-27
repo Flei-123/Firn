@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
 // tools/extfn/impl.s -- a hand-written 'strlen', System V AMD64: rdi = the
 // pointer, returns rax = the length up to (not including) the first zero
 // byte. Deliberately NOT libc, so direction 1 does not secretly depend on

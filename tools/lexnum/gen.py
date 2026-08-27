@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """tools/lexnum/gen.py -- the literals for the differential test of the two
 lexers (round 65).
 

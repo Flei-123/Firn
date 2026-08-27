@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/lsp/run.sh -- THE PROOF FOR THE LANGUAGE SERVER (round 64, point 4).
 #
 # `firnc --lsp` speaks the Language Server Protocol over standard

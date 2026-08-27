@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """tools/js/fixlen.py -- the two lengths of a text literal, kept in step.
 
 Round 63 wrote down gap 10 of the language: `var m: [u8; 40] = "..."` is an

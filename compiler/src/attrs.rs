@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! **Attribute register** — the single truth about which attributes exist,
 //! where they may stand and which of them really do something at stage 0.
 //!

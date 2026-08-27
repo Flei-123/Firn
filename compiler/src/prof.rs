@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! **Profiles `kernel` and `app` (SPEC.md §2) — round 52.**
 //!
 //! Up to round 51 `profile` was a declaration that was parsed, checked for

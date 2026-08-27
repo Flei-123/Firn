@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """tools/paintb3/reftest.py -- ROUND B3 against the official REFERENCE
 TESTS of the Web Platform Tests.
 

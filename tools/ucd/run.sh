@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/ucd/run.sh -- ACCEPTANCE ITEM 6 against the REAL Unicode Character
 # Database (round 85).
 #

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Type representation and memory layout (SPEC §11).
 //!
 //! Struct layout: declaration order, natural alignment, no reordering of

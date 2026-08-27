@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """The PAINT ORDER of round 67, held against a real browser.
 
 A layout can be proven with rectangles.  A paint order cannot: there is no

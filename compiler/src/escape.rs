@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! **Round 79 — the escape analysis.** A raw pointer into a LOCAL must not
 //! outlive the frame that local lives in (gap 9 of `docs/ROUND66.md`).
 //!

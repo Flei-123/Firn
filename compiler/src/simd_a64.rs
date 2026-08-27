@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! **ROUND 91** — the 42 vector and crypto intrinsics of round 82 on the
 //! SECOND machine.
 //!
