@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/gen_gctext.sh -- produces lib/firnc1/gctext.fi from lib/gc/gc.fi.
 #
 # WHY: `firnc0` embeds the collector runtime with `include_str!`

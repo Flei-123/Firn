@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/aarch64/machine.sh -- IS IT REALLY AARCH64, AND IS IT REALLY THE ABI?
 #
 # tools/aarch64/run.sh compares behaviour. That is the important half, but

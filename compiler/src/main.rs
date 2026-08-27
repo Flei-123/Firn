@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Driver of the stage 0 compiler: command line, pipeline, assembling/linking.
 //!
 //! Pipeline: source -> lexer -> parser -> AST -> type checker -> FIR -> optimizer

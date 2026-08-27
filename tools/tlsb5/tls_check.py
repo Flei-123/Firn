@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """tools/tlsb5/tls_check.py -- the TLS 1.3 client against a REAL server.
 
 The rule of this round is that the counterpart must not be this

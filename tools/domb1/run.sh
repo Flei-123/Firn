@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/domb1/run.sh -- HTML tree construction against the OFFICIAL html5lib
 # tests, plus the DOM and the style tree (ROUND B1).
 #

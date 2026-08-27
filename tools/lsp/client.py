@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """tools/lsp/client.py — ein echter LSP-Klient fuer die Gegenprobe.
 
 Er spricht mit `firnc --lsp` ueber Standardein- und -ausgabe, genau so wie ein

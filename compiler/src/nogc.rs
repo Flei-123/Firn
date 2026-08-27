@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! `#[no_gc]` — the guarantee for hot paths, SPEC §3.5.4.
 //!
 //! In a `#[no_gc]` function these are forbidden:

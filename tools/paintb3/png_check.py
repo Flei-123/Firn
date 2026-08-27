@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """tools/paintb3/png_check.py -- the two directions of PNG, each checked
 against somebody else.
 

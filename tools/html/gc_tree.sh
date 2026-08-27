@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/html/gc_tree.sh -- soak run: real DOM trees, no growth.
 #
 # A DOM tree is the kind of cycle a reference count fails at (every

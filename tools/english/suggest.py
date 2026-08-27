@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/english/suggest.py — baut aus der Morphemtabelle und den
 # Handentscheidungen die VOLLSTAENDIGE Bezeichner-Abbildung `names.tsv`.
 #

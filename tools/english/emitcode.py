@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """tools/english/emitcode.py — Bezeichner in EMITTIERTEM Quelltext.
 
 `comptime { emit_raw("fn tab_gross(c: i64) ...") }` erzeugt Firn-Quelltext

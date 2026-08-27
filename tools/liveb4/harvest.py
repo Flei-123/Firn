@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """tools/liveb4/harvest.py -- fetch the DOM and EVENT tests of round B4 out
 of the Web Platform Tests.
 

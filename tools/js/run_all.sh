@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/js/run_all.sh -- the engine over the whole test262 subset, DIRECTORY
 # BY DIRECTORY and several directories at a time.
 #

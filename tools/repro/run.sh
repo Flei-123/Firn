@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/repro/run.sh -- ACCEPTANCE ITEM 5, the part that CAN be shown today:
 # from the same source state, the same artifact, octet for octet.
 #

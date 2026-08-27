@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/js/run.sh -- the JavaScript path of round 63: lexer, parser,
 # interpreter, built in objects.
 #

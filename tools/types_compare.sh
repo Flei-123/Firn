@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/types_compare.sh -- memory layout and calling convention:
 # `lib/firnc1/types.fi` against `compiler/src/types.rs` + `abi.rs`.
 #

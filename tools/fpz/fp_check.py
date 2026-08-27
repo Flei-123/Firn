@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """Round B6, chapter Z: does the defence against fingerprinting do what it
 claims, and can it be SEEN to do it?
 

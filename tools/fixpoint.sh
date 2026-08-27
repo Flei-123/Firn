@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/fixpoint.sh -- THE FIXPOINT: Firn carries itself.
 #
 # Three stages, the same source:

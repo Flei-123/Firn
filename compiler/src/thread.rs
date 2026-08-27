@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! **Round 49 — threads.** The three primitives that make concurrency
 //! possible at all. Everything else (stack, join, mutex, channel, the thread
 //! safety of the collector) stands as readable Firn at `lib/gc/gc.fi`.
