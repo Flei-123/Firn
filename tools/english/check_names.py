@@ -43,7 +43,12 @@ TEIL = re.compile(r'[a-z0-9]+|[A-Z]+(?![a-z])|[A-Z][a-z0-9]*')
 # Pfad gemeldet und check.sh gab 0 0 0 1 0 statt fuenf Nullen. Derselbe
 # Grund, dieselbe Antwort: das englische Wort der Spezifikation.
 ERLAUBT = {'kernel', 'start', 'core', 'min', 'max', 'lib', 'bin', 'src',
-           'demos', 'app', 'pause', 'linker', 'mess', 'basis'}
+           'demos', 'app', 'pause', 'linker', 'mess', 'basis',
+           # ROUND SPEED: `.gitattributes` is a file name git prescribes, and
+           # the English word "attributes" contains the German morpheme
+           # "attribut". The checker cannot tell them apart, and renaming the
+           # file is not on the table -- so it is named here.
+           'gitattributes'}
 # Runde 65: englische GANZE Woerter, in denen ein deutsches Morphem als
 # Zeichenfolge steckt ('absolute' enthaelt 'absolut'). Die Suche im
 # Wortinneren darf hier nicht anschlagen; als ganzes Teil geprueft, nicht
