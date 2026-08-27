@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # Proof of STATIC DISPATCH with interface bounds (round 50).
 #
 # The promise is: `fn f[T: I](x: *T)` calls `x.m()` DIRECTLY as soon as the

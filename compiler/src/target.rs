@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! **Round 80 — the target machine.**
 //!
 //! Up to round 79 there was exactly ONE machine: x86-64. It was not written

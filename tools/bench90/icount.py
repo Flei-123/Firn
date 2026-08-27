@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """tools/bench90/icount.py -- INSTRUCTIONS, not seconds.
 
 The machine this project is measured on is shared, and a wall clock median

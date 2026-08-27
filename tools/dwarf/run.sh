@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/dwarf/run.sh -- THE PROOF FOR THE DEBUG INFORMATION (round 64, point 3).
 #
 # It drives `gdb` in batch mode over two translated Firn programs and holds

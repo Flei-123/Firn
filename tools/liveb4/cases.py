@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """tools/liveb4/cases.py -- the OWN cases of round B4.
 
 The official suite (tools/liveb4/wpt.py) measures how much of the DOM is

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! **`size_of[T]()`** — the size of a type as bytes, at compile time.
 //!
 //! INTERFACE (fixed):

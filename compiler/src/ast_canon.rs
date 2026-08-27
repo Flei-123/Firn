@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Canonical text form of the AST — the **yardstick** for the parser
 //! that is written using Firn itself (`lib/firnc1/parser.fi`).
 //!

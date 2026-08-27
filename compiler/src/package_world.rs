@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The package world: the root manifest, every package reachable through
 //! `needs` and the graph between them.
 //!

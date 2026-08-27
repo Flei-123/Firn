@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """Test bench for lib/html/entities.fi (character references) -- a workbench.
 
 This script contains NO tokenizer logic. Out of the official html5lib test

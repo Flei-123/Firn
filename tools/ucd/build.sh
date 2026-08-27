@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/ucd/build.sh -- THE BUILD STEP OF ACCEPTANCE ITEM 6 (round 95).
 #
 # The criterion reads: "a build script reads the Unicode Character Database

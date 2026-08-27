@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """Produces lib/browser/quirks_data.fi -- the DOCTYPE lists of the quirks mode.
 
 A WORKBENCH, NOT A PRODUCT: the lists are the ones of WHATWG 13.2.6.4.1

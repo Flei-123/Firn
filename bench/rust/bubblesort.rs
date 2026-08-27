@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Gegenstueck zu bench/firn/bubblesort.fi.
 use std::hint::black_box;
 

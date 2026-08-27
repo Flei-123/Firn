@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # Proof of the RESULT-LOCATION GUARANTEE (SPEC.md 13.1, DESIGN_GOALS.md 6).
 #
 # Claim: with `let g = build(...)` and an aggregate return type the

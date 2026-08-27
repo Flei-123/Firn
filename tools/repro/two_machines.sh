@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/repro/two_machines.sh -- ACCEPTANCE ITEM 5, the whole sentence:
 # "package management builds reproducibly on two machines".
 #

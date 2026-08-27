@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! **LICM** — pull loop invariant computations out of the loop.
 //!
 //! INTERFACE (fixed):

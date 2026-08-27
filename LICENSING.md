@@ -239,3 +239,56 @@ change.**
 | ship a changed Certus | no, not closed. GPL-2.0-only |
 | ship a device that runs OrientOS and only boots signed firmware | **yes.** That is the entire reason for GPLv2 instead of GPLv3 |
 | take Apache-2.0 code into the compiler or Certus | **no.** Incompatible. Look for an MIT, BSD or ISC alternative |
+
+
+---
+
+## 7. The SPDX headers -- what got one, and what could not
+
+Applied as one separate commit, deliberately, so a rebase can treat it in one
+go (it touches almost every file).
+
+| | files |
+|---|---:|
+| `SPDX-License-Identifier: MIT` written into the file | **52** |
+| `SPDX-License-Identifier: GPL-2.0-only` written into the file | **497** |
+| **together** | **549** |
+
+By kind: 260 `.fi`, 79 `.rs`, 106 `.py`, 91 `.sh`, 6 `.c`, 3 `.s`, 3 `.toml`,
+1 `.ld`.
+
+**Files that deliberately did NOT get a header, and why.** Every one of them
+still has a licence -- assigned by path in `.reuse/dep5`, which is the
+machine-readable fallback and is not breakable by a generator.
+
+| what | count | why a header would break it |
+|---|---:|---|
+| everything under `tests/` except `tests/modules/rc.fi` | 2,297 | **line 1 is the test expectation.** `tools/testrunner/src/main.rs:14-19`: "The expectations stand in line 1 of the test program" -- `// expect_exit:`, `// expect_out:`, `// expect_error: L:C`. A header in line 1 fails every one of them |
+| `examples/*.fi`, `demos/**`, `bench/firn/*.fi`, `tools/escape/**`, `tools/dwarf/*.fi`, `tools/core/soak.fi`, `tools/lsp/sample.fi`, `tools/phi/loops.fi`, `docs/gdb_example.fi` | 59 | same reason. `test.sh:319` runs `examples/*.fi` through the same runner. **This was found by a scan for "line 2 now starts with `expect_`" after the headers had been written, and reverted** |
+| generated files | 20 | `lib/std/{core,math,num,str}.fi`, `lib/generated/unicode_tables.fi`, `lib/html/entities_data.fi`, `lib/html/error_codes.fi`, `lib/browser/{tag,quirks_data,foreign_data}.fi`, `lib/css/encoding_data.fi`, `lib/dom/ua_data.fi`, `lib/firnc1/gctext.fi`, `tools/strlib/src/std_*.fi`, `tools/dtoa_vectors/dtoa_stream.fi`, `tools/ucd/{gen_ucd,ucd_real}.fi`. Their generator would have to emit the line too |
+| `lib/str/**`, `lib/num/**`, `lib/math/**`, `lib/mem/**` | 24 | **inlined verbatim** into the generated `lib/std/*.fi` by `tools/strlib/expand.py` (`//#include`). A header here makes `expand.py --check` report 16 files out of date -- measured, then reverted |
+| `lib/rc/parts/**`, `lib/rc/arc.fi` | 15 | `lib/rc/gen_tests.sh` copies them into `tests/5xx`, `tests/8xx` and `tests/neg/` and takes **line 1 of the part file as line 1 of the generated test** |
+| symbolic links | 43 | no content of their own (`bin/*.fi` -> `lib/firnc1/*.fi`, `lib/std/{rt,vec,map,intern}.fi` -> `lib/rt/*`, `lib/rc/rc.fi` -> `tests/modules/rc.fi`) |
+| `testdata/**`, `tests/data/**`, `tools/ucd/*.txt`, `tools/mcserver/node_modules/**` | 1,796+ | foreign material. Not ours to mark |
+
+**One generated file WAS regenerated on purpose:** `lib/firnc1/gctext.fi`.
+It is `lib/gc/gc.fi` + `gcvec.fi` + `gcmap.fi` packed into u64 words, and
+`tools/fixpoint.sh` compares it against what `tools/gen_gctext.sh` produces
+today. Since `lib/gc/*.fi` now carry MIT headers, the packed copy was rebuilt
+with `bash tools/gen_gctext.sh` so the invariant stays green.
+
+### What was verified after the headers were written
+
+| check | result |
+|---|---|
+| `cargo check` / `cargo build --release` on `compiler/` | **passes**, only the pre-existing dead-code warnings |
+| `python3 tools/strlib/expand.py --check` | **0 files out of date** |
+| `python3 tools/ucd/expand_tables.py --check` | up to date, sha256 `00e7741c7ecede89` |
+| `python3 tools/ucd/expand.py --check` | up to date, sha256 `85598afb75cb4ae0` |
+| `firnc examples/hello.fi` and run | prints "Hallo Welt aus Firn!", exit 0 |
+| `firnc examples/{tour,structs,fib}.fi` and run | exit 0 / 42 / 89 -- their declared `expect_exit` |
+| a program importing `std.io` and `std.core` (MIT headers) | compiles and runs |
+| scan: any file whose line 2 now starts with `expect_` | **0** |
+
+**Not run**, because it needs the full suite and a long wall clock:
+`./test.sh`. Run it before merging this branch anywhere.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Optimizer on FIR: constant folding and removal of dead code.
 //!
 //! INTERFACE (fixed):

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/abi/run.sh -- THE CALLING CONVENTION, MEASURED AGAINST GCC (round 71).
 #
 # WHY THIS EXISTS: up to round 70 an `f64` travelled in an INTEGER register.

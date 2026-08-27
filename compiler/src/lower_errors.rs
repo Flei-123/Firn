@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Lowering of the error unions `E!T` to FIR (module `fehlerunionen`, SPEC §5.1).
 //!
 //! An error union is a plain struct (`errors.rs`):

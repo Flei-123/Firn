@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """tools/english/check_names.py — GEGENPROBE fuer DATEI- und ORDNERNAMEN.
 
 check.py sieht nur in die Bezeichner INNERHALB der Quellen; die drei
