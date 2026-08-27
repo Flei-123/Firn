@@ -163,7 +163,7 @@ pub const PASSES: &[PassInfo] = &[
         name: "bce",
         scope: Scope::Func,
         debug_preserving: true,
-        what: "remove provably always satisfied range and index checks",
+        what: "remove provably always satisfied range, index and arithmetic checks",
     },
     PassInfo {
         name: "thread-bool",
@@ -501,7 +501,14 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut Pas
         }
         if cfg.runs("bce") && fx.due(6) {
             let t = std::time::Instant::now();
-            let r = remove_redundant_checks(f) + remove_provable_index_checks(f);
+            // ROUND SPEED -- the third question in the same slot: an
+            // ARITHMETIC check whose operands cannot leave the type.
+            // `rangecheck.rs`, and it belongs here because the register
+            // this pass already describes itself as "range and index
+            // checks".
+            let r = remove_redundant_checks(f)
+                + remove_provable_index_checks(f)
+                + crate::rangecheck::remove_provable_arith_checks(f);
             st.removed_checks += r;
             clk.add2("bce", t, r > 0);
             fx.note(6, r > 0);
