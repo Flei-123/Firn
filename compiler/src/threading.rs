@@ -171,6 +171,180 @@ pub(crate) fn fork_at(f: &Func, bi: usize) -> Option<(Val, BlockId, BlockId)> {
     Some((addr, then, els))
 }
 
+/// **ROUND SPEED** — the same threading, one step later: through a **phi**.
+///
+/// Round 9 of the speed round unblocked `mem2reg` for the bool cells of
+/// `&&` / `||`, so a cell that `thread_bool_cells` cannot take (because the
+/// arms carry phis, or because the shape is not exactly its shape) becomes a
+/// phi instead of staying in memory. That is much better than memory and it
+/// is still not what the machine wants:
+///
+/// ```text
+/// cmp r15b, 32 / sete al / movzx r14d, al / test r14b, r14b / jnz ...
+/// ```
+///
+/// five instructions where `cmp` + `jcc` is two. The phi is a bool, its
+/// incoming values are the comparisons themselves, and the block does
+/// nothing but branch on it — so every predecessor already knows the answer
+/// on its own edge and can jump past the join.
+///
+/// ```text
+/// bbA: %1 = cmp ...       ; brcond %1, bbJ, bbB
+/// bbB: %2 = cmp ...       ; br bbJ
+/// bbJ: %3 = phi [bbA %1, bbB %2] ; brcond %3, T, E
+/// ```
+///
+/// becomes `bbA: brcond %1, T, bbB` and `bbB: brcond %2, T, E`.
+///
+/// The three rules are the ones round 51 wrote down for the cell, with the
+/// value read out of the phi entry instead of out of the last `store`:
+///
+/// * predecessor ends `br J`             -> `brcond v, T, E`
+/// * predecessor ends `brcond v, J, X`   -> `brcond v, T, X`
+///   (on the J edge `v` is true, so the join would go to T)
+/// * predecessor ends `brcond v, X, J`   -> `brcond v, X, E`   (mirror image)
+///
+/// and only when the phi's entry for that edge IS that same `v` — otherwise
+/// the predecessor does not know the answer.
+///
+/// **Why the new edges are safe.** `T` and `E` must carry no phi: an edge
+/// arriving there would need an entry, and no pass may invent the value that
+/// travels along an edge that did not exist (round 92). The entry of the
+/// redirected predecessor is struck from the join's phi in the same step, so
+/// the entry list and the predecessor list stay in step -- `f.verify_phis()`
+/// is what would notice, and it runs before every phi elimination.
+///
+/// The live range of `v` is not extended: it was already an operand of the
+/// terminator of its own block, or it becomes one in the same block it was
+/// defined in.
+pub(crate) fn thread_bool_phis(f: &mut Func) -> usize {
+    if f.constant_time || !f.has_phi() {
+        return 0;
+    }
+    let n = f.blocks.len();
+    if f.blocks.iter().enumerate().any(|(i, b)| b.id as usize != i) {
+        return 0;
+    }
+    // 1. The joins: exactly one instruction, and it is a bool phi the
+    //    terminator branches on.
+    let mut joins: Vec<(usize, BlockId, BlockId, Vec<(BlockId, Val)>)> = Vec::new();
+    for bi in 0..n {
+        let b = &f.blocks[bi];
+        if bi == 0 || b.insts.len() != 1 {
+            continue;
+        }
+        let i = &b.insts[0];
+        let (d, inc) = match (i.dst, &i.op) {
+            (Some(d), Op::Phi { incoming }) => (d, incoming.clone()),
+            _ => continue,
+        };
+        if i.ty != FTy::Bool || f.is_secret(d) {
+            continue;
+        }
+        let (cond, th, el) = match &b.term {
+            Term::BrCond { cond, then_bb, else_bb } => (*cond, *then_bb, *else_bb),
+            _ => continue,
+        };
+        if cond != d || th as usize >= n || el as usize >= n {
+            continue;
+        }
+        if th as usize == bi || el as usize == bi {
+            continue; // branches to itself: leave it alone
+        }
+        if f.blocks[th as usize].has_phi() || f.blocks[el as usize].has_phi() {
+            continue;
+        }
+        joins.push((bi, th, el, inc));
+    }
+    if joins.is_empty() {
+        return 0;
+    }
+    // 2. Rewrite the predecessors. Collected first, applied afterwards --
+    //    one predecessor may feed two joins, and a walk that changes what it
+    //    reads is how one loses an edge.
+    let mut changes: Vec<(usize, Term)> = Vec::new();
+    let mut drop_entry: Vec<(usize, BlockId)> = Vec::new();
+    for (j, th, el, inc) in &joins {
+        for (pred, v) in inc {
+            let pi = *pred as usize;
+            if pi >= n || pi == *j || f.is_secret(*v) || f.val_ty(*v) != FTy::Bool {
+                continue;
+            }
+            if changes.iter().any(|(k, _)| *k == pi) {
+                continue; // already rewritten for another join
+            }
+            let new = match &f.blocks[pi].term {
+                Term::Br(t) if *t as usize == *j => {
+                    Some(Term::BrCond { cond: *v, then_bb: *th, else_bb: *el })
+                }
+                Term::BrCond { cond, then_bb, else_bb }
+                    if cond == v && *then_bb as usize == *j && *else_bb as usize != *j =>
+                {
+                    Some(Term::BrCond { cond: *v, then_bb: *th, else_bb: *else_bb })
+                }
+                Term::BrCond { cond, then_bb, else_bb }
+                    if cond == v && *else_bb as usize == *j && *then_bb as usize != *j =>
+                {
+                    Some(Term::BrCond { cond: *v, then_bb: *then_bb, else_bb: *el })
+                }
+                _ => None,
+            };
+            if let Some(t) = new {
+                changes.push((pi, t));
+                drop_entry.push((*j, *pred));
+            }
+        }
+    }
+    if changes.is_empty() {
+        return 0;
+    }
+    let count = changes.len();
+    for (pi, t) in changes {
+        f.blocks[pi].term = t;
+    }
+    for (j, pred) in drop_entry {
+        let np = f.blocks[j].phi_count();
+        for i in f.blocks[j].insts[..np].iter_mut() {
+            if let Op::Phi { incoming } = &mut i.op {
+                incoming.retain(|(b, _)| *b != pred);
+            }
+        }
+    }
+    // A join whose LAST predecessor was rewritten is dead, and what is left
+    // standing there is `%x = phi.bool []` -- a phi with no entries at all.
+    // No later pass is prepared for that shape, and it does not stay local:
+    // `dce` will not take a block apart while it still sees the block's
+    // values read (two dead joins referring to each other are exactly that
+    // case), so the corpse travels on into `regalloc`, which finds a block
+    // it cannot lay out.
+    //
+    // The first attempt was to leave the corpse `merge_blocks` leaves --
+    // no instructions, `Term::Unset`. THAT IS WRONG, and the way it is
+    // wrong is worth the paragraph: it deletes the DEFINITION of `%x`
+    // while a (likewise dead) `brcond %x` still names it. Inside the
+    // function nobody minds. But `inline.rs` copies a callee value by
+    // value, and a value with no defining instruction gets no entry in the
+    // remap table -- so the old id travels into the CALLER unchanged and
+    // lands on whatever value happens to carry that number there. In
+    // `tests/860_thread_basic.fi` that was `%68`, a `u64`, and the
+    // verifier caught it as `condition %68 is u64, expected bool`.
+    //
+    // So the definition stays and only the phi goes. An unreachable block
+    // may compute anything at all; `false` is as good an answer as any,
+    // and it is one `dce` can then remove in the ordinary way.
+    for (j, _, _, _) in &joins {
+        let jb = *j;
+        for i in f.blocks[jb].insts.iter_mut() {
+            let empty = matches!(&i.op, Op::Phi { incoming } if incoming.is_empty());
+            if empty {
+                i.op = Op::Const(0);
+            }
+        }
+    }
+    count
+}
+
+
 pub(crate) fn thread_bool_cells(f: &mut Func) -> usize {
     // SPEC §9.2: in constant-time functions no jump ever comes about here.
     if f.constant_time {
