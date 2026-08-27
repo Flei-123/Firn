@@ -85,6 +85,13 @@ pub const ATTRS: &[AttrInfo] = &[
         what: "interrupt entry point: save all registers, iretq (SPEC 2)",
     },
     AttrInfo {
+        name: "arch",
+        target: Target::Func,
+        args: 1,
+        implemented: true,
+        what: "this definition belongs to one machine: #[arch(x86_64)] / #[arch(aarch64)] (archsel.rs)",
+    },
+    AttrInfo {
         name: "link_name",
         target: Target::Func,
         args: 1,
@@ -277,6 +284,9 @@ mod tests {
         // every run time abort (SPEC 13, panic_rt.rs, docs/ROUND89.md).
         // Round 94: plus #[test] -- the test runner finds its cases by it
         // (testrun.rs, lib/test/runner.fi, docs/ROUND94.md).
+        // Round ARM-FREESTANDING: plus #[arch(...)] -- this definition
+        // belongs to one machine, and the others are thrown away before the
+        // type checker runs (archsel.rs, docs/ROUND-ARM-FREESTANDING.md 5).
         let u: Vec<&str> = ATTRS.iter().filter(|a| a.implemented).map(|a| a.name).collect();
         assert_eq!(
             u,
@@ -285,6 +295,7 @@ mod tests {
                 "no_gc",
                 "test",
                 "interrupt",
+                "arch",
                 "link_name",
                 "export_c",
                 "allow_escape",

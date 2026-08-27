@@ -325,3 +325,59 @@ MEASUREMENTS: test.sh section 62 = tools/paintb3/run.sh -- three build stages of
 font against fontTools and against the second rasteriser, PNG both ways against Pillow, seven own cases
 byte-identical in all three stages against a frozen picture, the text-fit check with its counter-check,
 the 541 reference pairs, limits in tools/paintb3/minquota.txt. english 0 0 0 0 0.
+
+## Round ARM-FREESTANDING -- a machine with nothing underneath it
+
+THE ROUND IN ONE LINE: `--target=aarch64-none` exists, and a Firn program built with it BOOTS in
+`qemu-system-aarch64 -M virt` and prints over the serial line. Round 80 built the second instruction
+set; this one built the second SITUATION -- no operating system.
+
+`target.rs` got a second axis. Arch (x86_64 / aarch64) was round 80's question; Os (linux / none) is
+this one's, and the two do not fold into each other. Four names, and `none` is the word the GNU and
+LLVM triples already use for bare metal. A `-none` target TURNS ON the kernel profile of round 52
+rather than duplicating it -- which is why the x86 claim can be made to the octet:
+`--target=x86_64-none` and the plain build of a `profile kernel` source produce the same 24,138
+octets, and 305 of 305 programs in tests/ produce character-identical x86 assembly before and after.
+
+INLINE ASSEMBLER ON A64, which is where round 80 stopped (4 NOT SUPPORTED, all of them this). The
+first thing that had to move was not in the code generator: register names are checked in the TYPE
+CHECKER, so `core.rs::stem` had to become target-dependent, or an A64 build would have swallowed
+`out("rax")`. Operands do not travel on the stack here -- `sp` is set once in the prologue and every
+slot is addressed relative to it -- so an asm block parks its operands in the outgoing argument area,
+which is what makes a template that names x12 or x13 (this backend's own scratch) safe. MRS/MSR need
+no form of their own and that was checked before it was written down: the system register name is
+assembler TEXT and GNU as owns that table.
+
+`#[interrupt]` on A64: x0-x18 and x30 saved by hand (A64 saves NOTHING by itself; the return address
+is in ELR_EL1, a system register, not on the stack) and `eret` instead of `ret`.
+
+NEW IN THE LANGUAGE: `#[arch(x86_64)]` / `#[arch(aarch64)]` in front of a function. An x86 assembler
+template is not a Firn expression that has not been ported, it is a line for another assembler, and
+the language had no way to say which machine a definition belongs to. One attribute, one `retain`,
+run BEFORE the type checker. On the function and not on the statement, because two definitions of one
+name then resolve themselves and a block has no value. firnc1 learned it too.
+
+MEASURED: tools/aarch64/run.sh 304 of 304 comparable cases identical on both machines, 0 DIFFERENT,
+0 NOT SUPPORTED, in both build stages (before: 300 SAME, 4 NOT SUPPORTED). machine.sh 16/16.
+tools/freestanding/none.sh 27/27 (new, test.sh section 65). tools/aarch64/syscall_table.sh 6/6 (new,
+section 66). tools/freestanding/run.sh 41/41. cargo test 262/262. The fixpoint holds: stage 2 ==
+stage 3, character-identical, 23,278,384 octets. Compilation time -1.4 % on two workloads, i.e. no
+measurable change.
+
+NOT MEASURED, and said out loud: the full 66-section test.sh could not be run to completion, before
+or after. Four to eight other rounds were running their own suites on the same twelve cores and the
+long sections (16 self_compare, 17 fixpoint) were killed twice. Sections 1-15 ran green with 0 FAIL,
+and the fixpoint was re-run on its own and holds.
+
+WHAT IS STILL MISSING: firnc1 cannot generate aarch64 and says so instead of quietly producing x86.
+Its share of this round is real but partial -- `#[arch]`, `lib/firnc1/syscalls.fi` (compared entry for
+entry against the Rust table on every run, read out of a RUNNING program built by both compilers) and
+`--target=` on its command line, including `x86_64-none`, so one flag builds a freestanding object
+with either compiler. The A64 code generator in Firn is a round of its own.
+
+TRAPS worth the next reader's time: `.align 2048` for a vector table is not an error on AArch64 but a
+WARNING ("alignment too large: 63 assumed") and the table is then misaligned -- the silent form of
+round 80's `.align` trap. A64 has no move-64-bit-immediate and no store-immediate-to-memory, both of
+which bite inside asm templates where the compiler cannot help. And the freestanding check "contains
+no syscall instruction" does not translate literally: `svc` is also how a kernel is ENTERED, so the
+A64 check counts them instead of forbidding them.
