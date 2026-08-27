@@ -225,6 +225,22 @@ fn layout(f: &Func) -> Frame {
                     consts.insert(d, i.ty.truncate(*c));
                 }
             }
+            // ROUND ARM-FREESTANDING -- the inline assembler stages its
+            // operands in the SAME area. `sp` never moves in this backend
+            // (that is what keeps every slot access one instruction), so an
+            // `asm` block cannot push and pop the way the x86 path does; it
+            // parks its operands at the bottom of the frame instead. That
+            // area is free at an `asm` block by construction: it belongs to
+            // the arguments of an outgoing CALL, and an `asm` block is not
+            // one. Reserved is the wider of the two needs -- one word per
+            // input, and one per output plus one for the value form.
+            if let Op::Asm { in_regs, out_regs, out, .. } = &i.op {
+                let need = in_regs
+                    .len()
+                    .max(out_regs.len() + usize::from(out.is_some()));
+                outgoing = outgoing.max(8 * need as u64);
+                continue;
+            }
             let args = match &i.op {
                 Op::Call { args, .. } | Op::CallIndirect { args, .. } => args.as_slice(),
                 _ => continue,
@@ -489,12 +505,12 @@ fn load_args(e: &mut Emitter, f: &Func, fr: &Frame, args: &[Val], spot: &[Option
 // ------------------------------------------------------------------ the module
 
 pub fn emit(m: &Module) -> Result<String, String> {
-    if crate::prof::is_kernel() {
-        return Err(format!(
-            "--target={} does not support the kernel profile yet (round 80)",
-            crate::target::Target::Aarch64.name()
-        ));
-    }
+    // ROUND ARM-FREESTANDING: round 80 refused the kernel profile here. It
+    // does not any more -- see `emit_start` below and `emit_func`'s
+    // `#[interrupt]` arm. What a freestanding object file must NOT have is
+    // exactly what the x86 path has not had since round 52: no `_start`, no
+    // collector start, no `svc`.
+    let freestanding = crate::prof::is_kernel();
     // ROUND 83: `Emitter` is the x86 file's struct and grew an xmm value
     // cache in round 82. This backend never touches it -- an empty cache is
     // the honest initial value, not a special case.
@@ -514,6 +530,13 @@ pub fn emit(m: &Module) -> Result<String, String> {
     // and `__cpu_features()` answers it.
     e.raw(".arch armv8-a+crypto+crc");
     e.raw(".text");
+    // ROUND 91's auxiliary vector pointer is asked for OUTSIDE the start
+    // block: `_start` is what saves it, and the data word that holds it is
+    // emitted at the very bottom of this function. A freestanding object
+    // file has neither -- there is no process start to read an auxiliary
+    // vector from.
+    let auxv = !freestanding && crate::simd_a64::needs_auxv(m);
+    if !freestanding {
     e.raw(".globl _start");
     e.raw("_start:");
     // At process start `sp` points at [argc][argv0]...[0][envp...]. That
@@ -526,7 +549,6 @@ pub fn emit(m: &Module) -> Result<String, String> {
     // ROUND 91: the auxiliary vector, BEFORE anything else. `sp` still
     // points at it here; four instructions keep the pointer so that
     // `__cpu_features()` can read AT_HWCAP later (simd_a64.rs).
-    let auxv = crate::simd_a64::needs_auxv(m);
     if auxv {
         crate::simd_a64::emit_auxv_save(&mut e);
     }
@@ -543,8 +565,13 @@ pub fn emit(m: &Module) -> Result<String, String> {
     e.line("mov x8, #93"); // exit(2) — 60 on x86-64, 93 here
     e.line("svc #0");
     e.line("brk #0");
+    }
 
-    if !m.funcs.iter().any(|f| f.name == "main") {
+    // ROUND ARM-FREESTANDING: a freestanding object file has no entry point
+    // at all -- the kernel's own assembler file has it, and the linker
+    // script says which symbol that is. Demanding `main` here would refuse
+    // every kernel. Same rule, same reason, same wording as the x86 side.
+    if !freestanding && !m.funcs.iter().any(|f| f.name == "main") {
         return Err("no entry point: 'fn main() -> i32' is missing".to_string());
     }
     for f in &m.funcs {
@@ -584,17 +611,55 @@ pub fn emit(m: &Module) -> Result<String, String> {
     Ok(e.out)
 }
 
+/// **ROUND ARM-FREESTANDING — the A64 exception entry.**
+///
+/// The registers an `#[interrupt]` function has to carry there and back.
+/// On x86 that list is a matter of taste within the caller-saved set; here
+/// it is not, and for a reason worth writing down: **A64 saves NOTHING by
+/// itself.** Where the x86 processor has already pushed `ss:rsp`, `rflags`
+/// and `cs:rip` before the first instruction of the handler runs, an A64
+/// exception writes the return address into `ELR_EL1` and the flags into
+/// `SPSR_EL1` — two SYSTEM registers, not the stack — and jumps into the
+/// vector table. Not one general purpose register is touched, which means
+/// not one of them may be touched here either until it is safe.
+///
+/// x0-x18 plus x30 is the whole corruptible set of AAPCS64 (§`REGISTER_A64`
+/// in `core.rs`), and x30 is in it because the body of the handler will
+/// `bl` somewhere. x19-x28 are callee-saved and this backend never hands
+/// them out, so an interrupted thread finds them the way it left them. The
+/// floating point and vector registers are NOT saved — the same decision
+/// the x86 side made (SPEC §2: in the kernel the FPU state belongs to the
+/// interrupted thread, and `#[allow_fp]` is what says somebody thought
+/// about it).
+const INT_SAVE_A64: [(&str, &str); 10] = [
+    ("x0", "x1"),
+    ("x2", "x3"),
+    ("x4", "x5"),
+    ("x6", "x7"),
+    ("x8", "x9"),
+    ("x10", "x11"),
+    ("x12", "x13"),
+    ("x14", "x15"),
+    ("x16", "x17"),
+    ("x18", "x30"),
+];
+/// 10 pairs of 8 octets each — and already a multiple of sixteen, so `sp`
+/// keeps the alignment AAPCS64 demands of it.
+const INT_SAVE_A64_BYTES: u64 = 160;
+
 fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
-    if f.interrupt {
-        return Err(format!(
-            "#[interrupt] ('{}') is not supported on aarch64 (round 80)",
-            f.name
-        ));
-    }
     let fr = layout(f);
     e.raw("");
     e.raw(&format!(".globl {}", label(&f.name)));
     e.raw(&format!("{}:", label(&f.name)));
+    if f.interrupt {
+        e.raw("    // interrupt: A64 saves nothing by itself — every");
+        e.raw("    // corruptible register belongs to the interrupted thread.");
+        e.line(&format!("sub sp, sp, #{}", INT_SAVE_A64_BYTES));
+        for (k, (a, b)) in INT_SAVE_A64.iter().enumerate() {
+            e.line(&format!("stp {}, {}, [sp, #{}]", a, b, 16 * k));
+        }
+    }
     e.line("stp x29, x30, [sp, #-16]!");
     e.line("mov x29, sp");
     if fr.size > 0 {
@@ -643,7 +708,7 @@ fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
     Ok(())
 }
 
-fn emit_epilogue(e: &mut Emitter, fr: &Frame) {
+fn emit_epilogue(e: &mut Emitter, fr: &Frame, interrupt: bool) {
     if fr.size > 0 {
         if fr.size <= 4095 {
             e.line(&format!("add sp, sp, #{}", fr.size));
@@ -653,6 +718,19 @@ fn emit_epilogue(e: &mut Emitter, fr: &Frame) {
         }
     }
     e.line("ldp x29, x30, [sp], #16");
+    if interrupt {
+        // ROUND ARM-FREESTANDING: backwards, then `eret`. That one
+        // instruction restores the program counter out of `ELR_EL1` and the
+        // flags out of `SPSR_EL1` at the same time — a `ret` would jump to
+        // whatever x30 happens to hold and leave the exception level where
+        // it is, which is not a return but a second fault waiting.
+        for (k, (a, b)) in INT_SAVE_A64.iter().enumerate() {
+            e.line(&format!("ldp {}, {}, [sp, #{}]", a, b, 16 * k));
+        }
+        e.line(&format!("add sp, sp, #{}", INT_SAVE_A64_BYTES));
+        e.line("eret");
+        return;
+    }
     e.line("ret");
 }
 
@@ -702,7 +780,7 @@ fn emit_block(
                     load_full(e, fr, "x0", *v);
                 }
             }
-            emit_epilogue(e, fr);
+            emit_epilogue(e, fr, f.interrupt);
         }
         Term::Unset => {
             return Err(format!(
@@ -1195,10 +1273,78 @@ fn emit_inst(
             e.line(&format!("subs {}, {}, #1", C, C));
             e.line(&format!("b.ne {}", top));
         }
-        Op::Asm { .. } => {
-            return Err(
-                "inline assembler is x86 text and has no meaning on aarch64 (round 80)".to_string(),
-            )
+        // ROUND ARM-FREESTANDING (round 80 refused this) -- inline
+        // assembler on A64. ALWAYS volatile: the lines stand exactly once
+        // and exactly here.
+        //
+        // The one real difference to the x86 path is where the operands
+        // wait. `codegen_x86` writes `push`/`pop` around the result
+        // registers; this backend cannot, because `sp` is set once in the
+        // prologue and every frame slot is addressed relative to it (moving
+        // `sp` would move all of them). So the operands are parked in the
+        // OUTGOING ARGUMENT AREA at the bottom of the frame, which `layout`
+        // has widened for exactly this and which is free at an `asm` block
+        // because an `asm` block is not a call.
+        //
+        // Parking is what makes the whole thing safe against the user
+        // naming one of this backend's own scratch registers: x12 (address
+        // building) and x13 (helper) are both allowed operand names, so
+        // every register that still carries a value is written to memory
+        // BEFORE any address is computed with them.
+        Op::Asm { template, out, in_regs, ins, out_regs, outs, clobber } => {
+            e.raw("    // asm (volatile): must be neither removed nor moved");
+            // 1. Every input value into the parking area first, ...
+            for (k, v) in ins.iter().enumerate() {
+                load_full(e, fr, T1, *v);
+                e.line(&format!("str {}, [sp, #{}]", T1, 8 * k));
+            }
+            // ... and only then into the registers the template names. Two
+            // passes, because reading a frame slot may build its address in
+            // x12 -- which may itself be one of those registers.
+            for (k, r) in in_regs.iter().enumerate() {
+                let stem = crate::core::stem(r)
+                    .ok_or_else(|| format!("unknown asm register '{}'", r))?;
+                e.line(&format!("ldr {}, [sp, #{}]", stem, 8 * k));
+            }
+            for line in template.split('\n') {
+                e.line(line);
+            }
+            // 2. Everything the template produced out of the registers and
+            // into the parking area, before a single address is built.
+            for (k, r) in out_regs.iter().enumerate() {
+                let stem = crate::core::stem(r)
+                    .ok_or_else(|| format!("unknown asm register '{}'", r))?;
+                e.line(&format!("str {}, [sp, #{}]", stem, 8 * k));
+            }
+            if let Some(r) = out {
+                let stem = crate::core::stem(r)
+                    .ok_or_else(|| format!("unknown asm register '{}'", r))?;
+                e.line(&format!("str {}, [sp, #{}]", stem, 8 * outs.len()));
+            }
+            // 3. The value form into its slot.
+            if let Some(_) = out {
+                let d = i.dst.ok_or("internal error: asm with out but without target")?;
+                e.line(&format!("ldr {}, [sp, #{}]", T1, 8 * outs.len()));
+                store_dst(e, fr, d, T1);
+            }
+            // 4. ROUND 68's memory outputs: the register goes into `*p`.
+            // The parked VALUE is read first and the ADDRESS built second --
+            // the address building is the step that may use x12.
+            for k in 0..outs.len() {
+                e.line(&format!("ldr {}, [sp, #{}]", T1, 8 * k));
+                load_full(e, fr, ADDR, outs[k]);
+                e.line(&format!("str {}, [{}]", T1, ADDR));
+            }
+            // The clobber list costs nothing on this path and is written
+            // down all the same: on the base path no FIR value survives in a
+            // register across an instruction, so there is nothing to rescue.
+            // `regalloc.rs` -- the one pass for which the list would matter
+            // -- refuses a function with an `asm` block outright
+            // (`regalloc.rs`, "Inline-Assembler"), and it is an x86 pass
+            // besides.
+            if !clobber.is_empty() {
+                e.raw(&format!("    // asm clobber: {}", clobber.join(", ")));
+            }
         }
         // ROUND 83 -- the checked arithmetic of round 72 on this machine
         // (docs/ROUND80.md section 7, panic_rt_a64.rs). Both operands are
