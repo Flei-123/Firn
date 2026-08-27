@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # Nachweis, dass der Optimierer (compiler/src/opt.rs) wirklich wirkt.
 #
 # Fuer jedes Programm in tests/opt/ wird die FIR VOR (--emit=fir-raw) und NACH

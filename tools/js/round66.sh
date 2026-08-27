@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/js/round66.sh -- the FEATURES OF ROUND 66 against test262, per
 # feature, plus the endurance run for the objects the round adds.
 #

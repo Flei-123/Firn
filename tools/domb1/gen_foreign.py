@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """Produces lib/browser/foreign_data.fi -- the correction tables of foreign content.
 
 A WORKBENCH, NOT A PRODUCT: there is no parser logic here. The three tables

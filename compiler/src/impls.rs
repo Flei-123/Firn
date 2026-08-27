@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! `impl T { fn method(*mut self, …) }` — methods on struct types
 //! (round 45).
 //!

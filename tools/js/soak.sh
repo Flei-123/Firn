@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/js/soak.sh -- the ENDURANCE RUN with the counter check.
 #
 # THE MEASUREMENT. A JavaScript program builds cycles that no reference

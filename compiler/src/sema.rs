@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Type checker (SPEC §12).
 //!
 //! INTERFACE (fixed):

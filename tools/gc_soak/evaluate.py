@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """tools/gc_soak/evaluate.py -- reads the TSV of tools/gc_soak/soak.fi.
 
 Three modes:

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """tools/nbt/check.py -- the SECOND NBT parser (round 76).
 
 The Firn side (`tools/nbt/dump.fi`) turns an NBT file into a canonical text.

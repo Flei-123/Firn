@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/english/filenames.py — benennt Dateien und Verzeichnisse mit
 # deutschen Namensbestandteilen um (git mv) und zieht ALLE Verweise auf den
 # alten Pfad im ganzen Baum nach.

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """Builds `tools/layout/FirnMetric.ttf` -- the measuring font of round 61.
 
 A layout engine cannot be compared against a browser as long as the width

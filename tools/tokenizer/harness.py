@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """Harness for the HTML5 tokenizer from lib/html/ against html5lib-tests.
 
 A WORKBENCH, NOT A PRODUCT: this script contains NO tokenizer logic. It

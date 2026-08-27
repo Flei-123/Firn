@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """tools/liveb4/wpt.py -- the official DOM tests of the Web Platform Tests,
 through the browser of round B4.
 

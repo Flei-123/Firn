@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # Builds the HTML5 tokenizer from lib/html/ (in Firn), drives it against the
 # official html5lib test suite and prints the balance.
 #

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/bench82/ra_baseline.sh -- the register allocation over the three
 # workloads of docs/BENCHMARKS.md §4, in one go. Round 87.
 #

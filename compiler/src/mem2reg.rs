@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Memory -> value: resolving `alloca`/`store`/`load`, copy propagation
 //! and block merging.
 //!

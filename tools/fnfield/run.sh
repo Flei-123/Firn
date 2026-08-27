@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # ROUND 68 -- PROOF IN THE ASSEMBLY: `c.hook(a, b)` costs exactly one
 # indirect call, and nothing else gets more expensive.
 #

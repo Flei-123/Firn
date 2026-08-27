@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/fpz/run.sh -- ROUND B6, CHAPTER Z: the defence against
 # fingerprinting, measured.
 #

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! Intermediate layer between **field access** and **storage location**
 //! (`DESIGN_GOALS.md` §8, foundation point from §10.4).
 //!

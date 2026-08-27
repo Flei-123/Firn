@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/css/throughput.sh -- the throughput of the CSS path in INSTRUCTIONS.
 #
 # NOT with the wall clock. On this machine the run time of the very same

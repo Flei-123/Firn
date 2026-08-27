@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """tools/bench90/bench.py -- Firn against Rust, WITH THE BUILD LEVEL NAMED.
 
 WHY THIS EXISTS NEXT TO bench/bench.py

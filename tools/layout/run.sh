@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/layout/run.sh -- the layout path of rounds 61 and 67: box model,
 # block flow, inline flow, floats, positioning with `fixed` and `sticky`,
 # the paint order with `z-index`, and the full flexbox.

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # tools/fir_compare.sh -- the lowering in FIRN against the one in RUST.
 #
 # The YARDSTICK is `firnc0 --emit=fir-raw`: the intermediate representation DIRECTLY after

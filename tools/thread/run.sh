@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # Proof of the THREAD PRIMITIVES (round 49, compiler/src/thread.rs,
 # lib/firnc1/{fir,sema,lower,codegen}.fi).
 #

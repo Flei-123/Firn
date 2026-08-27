@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-only
 import os,re,struct,subprocess,collections,sys,random
 DATA=os.environ.get('T262','.js-work/t262')
 SUB=sys.argv[2]; WANT=sys.argv[3] if len(sys.argv)>3 else '1'

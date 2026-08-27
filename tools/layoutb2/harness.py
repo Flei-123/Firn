@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """Round B2: the layout engine against the OFFICIAL Web Platform Tests.
 
 THE MEASURING STICK, AND WHY IT CAN BE READ WITHOUT A RASTERISER
