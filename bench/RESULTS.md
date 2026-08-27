@@ -1,7 +1,6 @@
 # Benchmark results (really measured)
 
-Produced by `bench/run.sh` (`bench/bench.py`), **median** of the runs per
-program (`BENCH_RUNS=9` for the round 86 table below).
+Produced by `bench/run.sh` (`bench/bench.py`), 9 runs per program, **median**.
 Every benchmark exists twice -- `bench/firn/<name>.fi` and `bench/rust/<name>.rs` -- and both print their result; the outputs have to match, otherwise the measurement stops.
 The Rust side uses `std::hint::black_box` and the same unchecked pointer accesses as the Firn side, so that the same work is measured.
 
@@ -10,101 +9,81 @@ The Rust side uses `std::hint::black_box` and the same unchecked pointer accesse
 * rustc 1.99.0-nightly (c98d0cb27 2026-08-12)
 * Firn: its own code generator, no external crates
 
-## Round 86 (23.08.2026), 9 runs per program, two independent passes
+| benchmark | Firn `release-fast` | Firn `release-safe` | Firn `dev-fast` (default) | `rustc -O` | factor fast | factor safe | factor devf | result |
+|---|---|---|---|---|---|---|---|
+| fib | 0.053 s | 0.051 s | 0.051 s | 0.033 s | **1.64x** | **1.56x** | **1.57x** | 4356618 |
+| sieve | 0.033 s | 0.048 s | 0.139 s | 0.033 s | **1.01x** | **1.47x** | **4.24x** | 697026 |
+| matmul | 0.044 s | 0.095 s | 0.253 s | 0.022 s | **2.01x** | **4.30x** | **11.42x** | 8291727 |
+| bytecount | 0.268 s | 0.230 s | 0.860 s | 0.205 s | **1.30x** | **1.12x** | **4.18x** | 1604208 |
+| bubblesort | 0.076 s | 0.106 s | 0.190 s | 0.041 s | **1.84x** | **2.57x** | **4.62x** | 12021846167 |
+| statemachine | 0.162 s | 0.138 s | 0.235 s | 0.095 s | **1.71x** | **1.46x** | **2.48x** | 6710880 |
 
-Re-measured after the optimiser work of rounds 51 and 82 and the register
-allocation. Both passes are printed, because the Rust side scatters (see the
-note further down); the honest statement is the pair, not one of them.
+Median Firn `release-fast` against `rustc -O`: **1.67x** (range 1.01x - 2.01x).
+Median Firn `release-safe` against `rustc -O`: **1.52x** (range 1.12x - 4.30x).
+Median Firn `dev-fast` (default) against `rustc -O`: **4.21x** (range 1.57x - 11.42x).
 
-| benchmark | Firn (pass 1) | Firn (pass 2) | Rust `-O` (1 / 2) | factor Firn/Rust (1 / 2) | gain through the optimiser (1) | result |
-|---|---:|---:|---:|---:|---:|---:|
-| fib | 0.044 s | 0.047 s | 0.029 / 0.032 s | **1.52x / 1.47x** | 2.99x | 4356618 |
-| sieve | 0.125 s | 0.118 s | 0.030 / 0.031 s | **4.16x / 3.76x** | 10.78x | 697026 |
-| matmul | 0.067 s | 0.070 s | 0.023 / 0.026 s | **2.90x / 2.74x** | 30.29x | 8291727 |
-| bytecount | 0.296 s | 0.334 s | 0.207 / 0.177 s | **1.43x / 1.89x** | 18.94x | 1604208 |
-| bubblesort | 0.090 s | 0.093 s | 0.041 / 0.037 s | **2.17x / 2.50x** | 16.88x | 12021846167 |
-| statemachine | 0.189 s | 0.158 s | 0.095 / 0.091 s | **1.99x / 1.74x** | 7.47x | 6710880 |
+`release-fast` is the like-for-like comparison: all passes, and integer arithmetic unchecked exactly as `rustc -O` leaves it. `release-safe` runs the same passes and CHECKS every integer operation, so it is Firn doing strictly more work than Rust. `dev-fast` is what a plain `firnc` gives you: checked, and without the one pass that would make the call stack unreadable.
 
-Median over all benchmarks: **2.08x** (pass 1) and **2.19x** (pass 2) slower
-than Rust `-O`; range over both passes **1.43x - 4.16x**. The target of
-`<= 2x` is therefore **still missed, but only just** -- three of the six
-programs are inside it, `sieve` is the outlier that carries the median.
-The optimiser brings **13.8x** in the median compared with `--no-opt`.
+## Round SPEED (27.08.2026) — the two passes, and what changed
 
-## Round 5 (14.08.2026), 5 runs per program -- the state this replaced
+The table above is pass 2. The machine is shared, so a second pass is
+printed next to it; the honest statement is the pair, not one of them.
 
-| benchmark | Firn | Firn `--no-opt` | Rust `-O` | factor Firn/Rust | gain through the optimiser | result |
-|---|---:|---:|---:|---:|---:|---:|
-| fib | 0.056 s | 0.143 s | 0.032 s | **1.75x** | 2.54x | 4356618 |
-| sieve | 0.119 s | 1.444 s | 0.032 s | **3.68x** | 12.10x | 697026 |
-| matmul | 0.111 s | 2.168 s | 0.025 s | **4.48x** | 19.55x | 8291727 |
-| bytecount | 0.507 s | 5.605 s | 0.193 s | **2.63x** | 11.05x | 1604208 |
-| bubblesort | 0.103 s | 1.344 s | 0.039 s | **2.63x** | 13.10x | 12021846167 |
-| statemachine | 0.253 s | 1.286 s | 0.085 s | **3.00x** | 5.08x | 6710880 |
-
-Median over all benchmarks: **2.82x** slower than Rust `-O` (range 1.75x - 4.48x).
-
----
-
-## A/B measurement of the optimiser round (14.08.2026)
-
-The factors above scatter with the **Rust** time: on this machine the same
-binary gives up to **40 % difference** between two runs. A codegen change of
-5 % cannot be judged with that -- on the first attempt the very same
-improvement showed up once as -18 % and once as +6 %.
-
-That is why progress on the compiler has been measured over the
-**executed instructions** since this round (`bench/instr.sh`, `valgrind
---tool=callgrind`). The number is reproducible down to the single instruction.
-
-**State `e517942` (before the round) against `26861e3`+ (LICM, `lea`, inline limit):**
-
-| program | instructions before | after | change |
-|---|---:|---:|---:|
-| matmul | 1,668,312,681 | 1,376,734,921 | **-17.48 %** |
-| bubblesort | 811,682,925 | 667,321,089 | **-17.79 %** |
-| bytecount | 2,579,216,109 | 2,148,310,351 | **-16.71 %** |
-| sieve | 825,458,961 | 708,292,727 | **-14.19 %** |
-| statemachine | 1,847,172,267 | 1,721,343,055 | **-6.81 %** |
-| fib | 338,351,740 | 338,353,992 | +-0.00 % |
-
-`fib` is pure recursion without loops and without field accesses -- there is
-nothing to gain there for LICM and `lea`. The result is no error but the
-proof of the point: the passes bite exactly where they are supposed to.
-
-**An honest limit of the metric:** instructions are not run time. A `lea`
-and a `div` both count as one. For the question "does the compiler emit
-less work?" it is right, for the question "how fast is it?" it is not.
-
-## Why the tokenizer does not get faster from it
-
-Measured on the corpus `realweb` (4,931,819 bytes), both sides with callgrind:
-
-| | instructions | per byte |
+| benchmark | factor `release-fast` pass 1 | pass 2 |
 |---|---:|---:|
-| Firn tokenizer | 4,033,688,605 | **818** |
-| html5ever | 540,567,170 | **110** |
+| fib | 1.91x | 1.64x |
+| sieve | **0.85x** | **1.01x** |
+| matmul | 2.15x | 2.01x |
+| bytecount | 1.30x | 1.30x |
+| bubblesort | 1.82x | 1.84x |
+| statemachine | 1.71x | 1.71x |
+| **median** | **1.76x** | **1.67x** |
 
-The ratio **7.46x** matches the measured time factor (**7.04x**) almost
-exactly. That proves what the distance is NOT caused by: not by the quality
-of the emitted code. Firn **executes seven and a half times as much work**.
-A perfect code generator would change nothing about that.
+`release-safe`: **1.55x** / **1.52x** median. `dev-fast`: 4.14x / 4.21x.
 
-The causes lie in the tokenizer and in the measuring setup, not in the compiler:
+### Against the state this round started from
 
-1. **Firn first decodes the input completely to UTF-32** (`mem.CpBuf`,
-   4 bytes per character) and then tokenizes that buffer. html5ever works
-   directly on the bytes. That is a complete additional pass over the
-   input plus four times the memory traffic.
-2. **No bulk path for runs of text.** html5ever looks for the next `<`, `&` or
-   `\0` and emits everything in between as one block. Firn puts every character
-   through the full state machine one by one -- which is exactly why the
-   distance on `realweb` (long texts) is much larger at 7.0x than on
-   `html5lib` (almost only edge cases) at 2.8x.
-3. **The Firn run additionally writes the html5lib JSON**, html5ever only
-   counts tokens. That work sits entirely in the 818 instructions per byte.
+`bench/RESULTS.md` said 2.08x median and `sieve` 4.16x, and
+`orientos/ROADMAP.md` point 4.9 quoted those numbers. **Round 1 of
+`docs/ROUNDSPEED.md` found that they were measured at `dev-fast`** — the
+default level since round 72, which checks every integer operation and does
+not inline — while the Rust side was `rustc -O`. The comparison Rust does
+with Rust is `release-fast`, and this file now names the level in every
+column.
 
-**Consequence for the roadmap:** the acceptance goal "<= 2x the reference"
-cannot be reached with compiler work alone. The next step belongs to the
-tokenizer (a byte path instead of a code point buffer, block processing for
-runs of text) and to a fair measuring setup (the same output on both sides).
+| benchmark | old table (`dev-fast`, called "Firn") | now `release-fast` |
+|---|---:|---:|
+| fib | 1.52x | 1.64x |
+| bytecount | 1.43x | 1.30x |
+| statemachine | 1.99x | 1.71x |
+| bubblesort | 2.17x | 1.84x |
+| matmul | 2.90x | 2.01x |
+| **sieve** | **4.16x** | **1.01x** |
+| **median** | **2.08x** | **1.67x** |
+
+Two things did the work, and they are separate. The **naming** of the build
+level is what moves `sieve` from 4.16x to about 1x — that number was never a
+codegen result, it was a checked, uninlined build measured against an
+unchecked, inlined one. The **optimiser rounds 2 to 11** are what moved the
+rest: block layout, exact loop depth, loops laid out in one piece, division
+by a constant without `div`, the range analysis that removes checks which
+provably cannot fire, `lea` for scaling, the bool cells of `&&` / `||` that
+had been stuck in memory since round 92, and the same threading through a
+bool phi. Every one of them is in `docs/ROUNDSPEED.md` with its own before
+and after.
+
+**The target of this round was median under 1.5x and `sieve` under 2.5x.**
+`sieve` is at **1.01x**, so that one is met with room to spare. The median
+is **1.67x** at `release-fast` and **1.52x** at `release-safe` — close, and
+not there. `matmul` at 2.01x is the one that now carries it, and its cause
+is named and not guessed: no vector instructions are emitted, and the
+register allocation is linear rather than colouring.
+
+**A note on the conditions.** These two passes were measured on a machine
+that was doing other work at the same time (load average 14 to 17 on
+12 cores) and with the root file system at 98 %. That widens the scatter of
+BOTH sides — `fib` at `release-safe` came out faster than at `release-fast`
+in pass 1, which cannot be true of the code and is the clearest available
+statement about what this wall clock can resolve. For differences under
+about 5 %, `tools/bench90/icount.py` (executed instructions, exact) is the
+instrument, not this table.
