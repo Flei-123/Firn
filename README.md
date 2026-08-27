@@ -56,7 +56,8 @@ the numbers are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 | | state | proof |
 |---|---|---|
 | **Self-hosting** | `firnc1` is written in Firn, compiles itself, **stage 2 == stage 3 character-identical** | `tools/fixpoint.sh`, `tools/self_compare.sh` |
-| **Two machines** | x86-64 and aarch64, same source, **296 of 301 programs byte-identical output**; 1 differs, and it is named below | `tools/aarch64/run.sh` |
+| **Two machines** | x86-64 and aarch64, same source, **304 of 304 comparable programs byte-identical output, 0 differing, 0 unsupported** (both build stages) | `tools/aarch64/run.sh` |
+| **Freestanding** | `--target=x86_64-none` and `--target=aarch64-none`: no operating system underneath. Both images **boot in QEMU and print over the serial line**; the x86 build is octet-identical to the plain `profile kernel` build | `tools/freestanding/none.sh` |
 | **Language** | structs, arrays, `enum` + `match` with exhaustiveness check, generics, interfaces, closures and function values, error unions `E!T`, `defer`/`errdefer`, `comptime` + `emit`, `f32`/`f64`, `str` with `f"…"` interpolation, threads, `extern fn` in both directions | `tests/` (three build levels each) |
 | **Garbage collector** | opt-in, incremental mark-sweep, **longest pause 0.45 ms** at 120,000 live nodes; weak refs, finalizers, `GcVec`/`GcMap` | `tools/dom_soak/run.sh` |
 | **Tooling** | formatter, DWARF line info + `gdb`, language server (`firnc --lsp`), package/project system, test runner with JSON output | `tools/fmt`, `tools/dwarf`, `tools/lsp`, `tools/packages` |
@@ -214,19 +215,26 @@ and a `line:column` — it does not crash and it does not pretend.
 ### Not in the toolchain
 
 * **No WASM.** `--target=wasm32` answers *"unknown target 'wasm32' (allowed:
-  x86_64-linux, aarch64-linux)"*.
+  x86_64-linux, aarch64-linux, x86_64-none, aarch64-none)"*.
 * **No LLVM backend, and there will not be one** — that is the point of the
   project, not a gap. It is listed here because people ask.
-* **No vector instructions on aarch64 — and this currently makes `test.sh`
-  red.** AES-NI, SHA-NI and SSE are emitted for x86-64 behind a `cpuid`
-  check (`compiler/src/codegen_a64.rs`, the comment at the `Simd` arm). One
-  program in the corpus, `tests/1613_crypto.fi`, therefore does not compile for
-  the second machine at all: *"--target=aarch64-linux cannot emit the vector
-  instruction CpuFeatures yet"*. `bash tools/aarch64/run.sh` reports
-  **296 of 301 identical, 1 differing** and fails, in both build stages. The
-  scalar path computes the same results everywhere, only slowly (35x–147x
-  slower for the cryptography, docs/BENCHMARKS.md §1); what is missing is the
-  aarch64 form of the instruction, not the algorithm.
+* **No self-hosting on ARM.** `firnc0` (the Rust bootstrap) generates
+  aarch64; `firnc1` (the compiler written in Firn) does not, and says so:
+  *"error: firnc1 cannot generate aarch64 yet"*. What is missing is the A64
+  code generator in Firn -- `lib/firnc1/codegen.fi` writes Intel-syntax
+  strings. The system call table already exists on both sides and is
+  compared entry for entry on every run (`tools/aarch64/syscall_table.sh`).
+  docs/ROUND-ARM-FREESTANDING.md section 8.
+* **No debug information and no register allocation on aarch64.** `.loc` and
+  `.debug_info` are emitted for x86-64 only, and `regalloc.rs` is an x86
+  pass -- the A64 backend uses the base path, so its code is correct and
+  slow.
+* **Aggregates across `extern fn` on aarch64 are untested and should be
+  assumed wrong.** `abi.rs` classifies by the System V rules; AAPCS64
+  classifies composites differently (homogeneous float aggregates, anything
+  above 16 octets by reference). Scalars and up to ten integer / nine
+  floating point words are proven against `aarch64-linux-gnu-gcc`
+  (`tools/aarch64/machine.sh`).
 * **No package registry, no lock file, no reproducible two-machine build.**
   There is a module system and a project manifest (`firn.package`,
   `firnc --package <dir>`), but `compiler/src/package.rs` and
@@ -335,9 +343,9 @@ Not one of the six comes from anything this round changed (`git diff main`
 touches `README.md`, `bench/RESULTS.md`, `docs/`, `examples/tour.fi` and two
 checker scripts — no compiler, no library, no test program):
 
-* **two are real and reproducible** — `tools/aarch64/run.sh` in both build
-  stages, on `tests/1613_crypto.fi`, for the reason given in the "can not"
-  list above;
+* **two were real and reproducible** — `tools/aarch64/run.sh` in both build
+  stages, on `tests/1613_crypto.fi`. Round 91 built the vector instructions
+  for the second machine and both are green again (`simd_a64.rs`);
 * **four are load flakes** on a machine that was running five copies of this
   suite at once, and every one of them was re-run on its own and passed:
   `tools/thread/run.sh` (the deliberate counter-check "the unlocked counter
@@ -363,6 +371,8 @@ firnc [OPTIONS] file.fi
   --package <dir>      compile the project from <dir>/firn.package
   --emit=exe|asm|fir|fir-raw|fir-opt|comptime|tokens|ast|ast-canon|layout|types
   --target=<name>      x86_64-linux (default) | aarch64-linux
+                       | x86_64-none | aarch64-none  (freestanding: no
+                         operating system, ELF object, no syscall)
   --profile=<name>     kernel | app (SPEC 2)
   --opt-level=<lvl>    dev | dev-fast | release-safe | release-fast
   --no-opt             switch off the optimizer (= --opt-level=dev)
