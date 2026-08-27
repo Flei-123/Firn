@@ -173,7 +173,13 @@ else
     else
         ok "regalloc: Schleifenrumpf ohne einen einzigen Stackzugriff"
     fi
-    if echo "$BODY" | grep -qE '\b(rbx|r8|r9|r10|r11|r12|r13|r14|r15)\b'; then
+    # ROUND SPEED: the 32 bit spellings count too. Until the layout round
+    # the loop body was emitted BEHIND .Lsum__bb3, so the awk above ran to
+    # the end of the file and this pattern was matching `mov rax, r8` out of
+    # `main` -- not the loop body at all. Now the body really is the three
+    # lines between head and exit, and an `i32` counter is `add r9d, r10d`:
+    # the right register, spelled 32 bits wide.
+    if echo "$BODY" | grep -qE '\b(rbx|ebx|bx|bl|r(8|9|1[0-5])[dwb]?)\b'; then
         ok "regalloc: Schleifenrumpf rechnet in Registern"
     else
         bad "regalloc: keine zugeteilten Register im Schleifenrumpf"

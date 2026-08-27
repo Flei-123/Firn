@@ -163,13 +163,13 @@ pub const PASSES: &[PassInfo] = &[
         name: "bce",
         scope: Scope::Func,
         debug_preserving: true,
-        what: "remove provably always satisfied range and index checks",
+        what: "remove provably always satisfied range, index and arithmetic checks",
     },
     PassInfo {
         name: "thread-bool",
         scope: Scope::Func,
         debug_preserving: true,
-        what: "jump threading through bool cells (short circuit && / ||)",
+        what: "jump threading through bool cells and bool phis (short circuit && / ||)",
     },
     PassInfo {
         name: "simplify-term",
@@ -501,7 +501,14 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut Pas
         }
         if cfg.runs("bce") && fx.due(6) {
             let t = std::time::Instant::now();
-            let r = remove_redundant_checks(f) + remove_provable_index_checks(f);
+            // ROUND SPEED -- the third question in the same slot: an
+            // ARITHMETIC check whose operands cannot leave the type.
+            // `rangecheck.rs`, and it belongs here because the register
+            // this pass already describes itself as "range and index
+            // checks".
+            let r = remove_redundant_checks(f)
+                + remove_provable_index_checks(f)
+                + crate::rangecheck::remove_provable_arith_checks(f);
             st.removed_checks += r;
             clk.add2("bce", t, r > 0);
             fx.note(6, r > 0);
@@ -509,7 +516,8 @@ fn optimize_func(f: &mut Func, st: &mut OptStats, cfg: &OptConfig, clk: &mut Pas
         }
         if cfg.runs("thread-bool") && fx.due(7) {
             let clock = std::time::Instant::now();
-            let t = crate::threading::thread_bool_cells(f);
+            let t = crate::threading::thread_bool_cells(f)
+                + crate::threading::thread_bool_phis(f);
             st.threaded += t;
             clk.add2("thread-bool", clock, t > 0);
             fx.note(7, t > 0);
@@ -1424,17 +1432,49 @@ fn remove_unreachable_blocks(f: &mut Func, st: &mut OptStats) -> bool {
     let used = collect_uses_filtered(f, &live_idx, &|p| {
         index_of.get(&p).map(|&i| reach_of[i]).unwrap_or(false)
     });
-    for (i, b) in f.blocks.iter().enumerate() {
+    let mut blocked = false;
+    'net: for (i, b) in f.blocks.iter().enumerate() {
         if reachable[i] {
             continue;
         }
         for inst in &b.insts {
             if let Some(d) = inst.dst {
                 if used.contains(&d) {
-                    return false;
+                    blocked = true;
+                    break 'net;
                 }
             }
         }
+    }
+    if blocked {
+        // **ROUND SPEED** — the safety net holds, and it must not leave the
+        // function in a state the back end cannot lay out.
+        //
+        // `merge_blocks` leaves its corpses as an EMPTY block with
+        // `Term::Unset`, and counts on this pass to remove them. When the
+        // net above says "remove nothing", they stay -- and `regalloc`
+        // then reports `block bbN has no terminator` and the compilation
+        // fails on a block that is never entered. Round 10 of this round
+        // made that combination reachable (it turns joins unreachable, and
+        // a value of a now dead block can still be named by another dead
+        // block, which is exactly what trips the net).
+        //
+        // So an EMPTY unreachable block without a terminator is closed with
+        // a jump to itself. It is unreachable, so the jump is never taken;
+        // it names no value, so it changes no live range; and it is a block
+        // every back end can emit. Blocks with instructions are left
+        // untouched -- deleting a definition another instruction still
+        // names is what round 10 already paid for once (`inline.rs` copies
+        // dead code too).
+        for i in 0..f.blocks.len() {
+            if !reachable[i] && f.blocks[i].insts.is_empty()
+                && matches!(f.blocks[i].term, Term::Unset)
+            {
+                let id = f.blocks[i].id;
+                f.blocks[i].term = Term::Br(id);
+            }
+        }
+        return false;
     }
 
     let removed_insts: usize =
