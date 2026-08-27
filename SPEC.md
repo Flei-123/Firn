@@ -114,6 +114,23 @@ profile app      // standard library, allocator, optional GC heap
 Without an entry, `app` applies. The compiler switch `--profile=kernel` forces
 the profile for the whole compilation unit.
 
+**A TARGET WITHOUT AN OPERATING SYSTEM DOES THE SAME** (round
+ARM-FREESTANDING). `--target=x86_64-none` and `--target=aarch64-none` name a
+machine with nothing under it -- `none` is the word the GNU and LLVM triples
+use for that -- and every property in the table below follows from the
+absence rather than from a word in line 1. Such a target therefore TURNS THE
+KERNEL PROFILE ON, and it is the weakest of the three sources: `--profile=`
+wins over it, and a `profile` declaration in the source wins over it, so
+nothing is silently reinterpreted. `profile app` together with a `-none`
+target is a contradiction and is reported at the declaration.
+
+Two consequences are worth stating, because they are what make the target
+worth having: a freestanding source no longer has to say `profile kernel` at
+all (the command line decides, so the same source can be built for a machine
+WITH an operating system), and the x86-64 output is provably unchanged --
+`--target=x86_64-none` and the plain build of a `profile kernel` source
+produce the same octets (`tools/freestanding/none.sh`).
+
 | Property | `kernel` | `app` |
 |---|---|---|
 | Heap allocation | only through an explicitly passed `Allocator` (built in round 73, `lib/mem/core_alloc.fi`) | a global allocator is available |
@@ -1372,6 +1389,23 @@ thicket, the following applies:
 front of `fn`, no arguments, implemented in both compilers. It switches the
 escape analysis off for that function's body and empties its summary, so a
 vouched-for function does not send its callers red instead.
+
+**`#[arch(x86_64)]` / `#[arch(aarch64)]`** (round ARM-FREESTANDING): in front
+of `fn`, exactly one argument, implemented in both compilers. It says which
+MACHINE a definition belongs to; every definition for another machine is
+thrown away before the type checker runs, so several definitions of one name
+may stand in the same source as long as at most one of them survives. The
+argument is one of the words the `--target` names are built from; an unknown
+one is an error and not a silent removal, and a name whose every definition
+belongs to another machine is reported at the definition rather than at the
+call site.
+
+It exists because of the inline assembler (2, 14.5): an assembler template is
+not a Firn expression that has not been ported, it is a line for a particular
+assembler, and a language that offers one owes its user a way to say which
+machine a piece of source belongs to. It is deliberately NOT conditional
+compilation in general -- no `#[arch]` on a type or a constant, no negation,
+no nesting.
 
 Exactly one is implemented in stage 0: **`#[must_consume]`**, in front of `fn`
 and in front of `struct`. What is checked is the subset decidable without a move
