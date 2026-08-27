@@ -39,8 +39,8 @@ FAILS = []
 COUNTER_OK = 0
 COUNTER_TOTAL = 0
 
-PAGE = """<!doctype html><html><head><title>firn</title></head><body>
-<h1>Firn Browser</h1>
+PAGE = """<!doctype html><html><head><title>Certus</title></head><body>
+<h1>Certus Browser</h1>
 <p>Round B5: TLS, pictures and a window.</p>
 <div style="background:#0033aa;width:300px;height:80px"></div>
 <div style="background:#cc0000;width:200px;height:40px"></div>
@@ -171,7 +171,7 @@ def main():
                                     stderr=subprocess.DEVNULL)
             time.sleep(3.0)
             xwdf = os.path.join(d, "server-%s.xwd" % page)
-            r = subprocess.run(["xwd", "-name", "firn", "-out", xwdf],
+            r = subprocess.run(["xwd", "-name", "Certus", "-out", xwdf],
                                env=env, capture_output=True)
             got_window = r.returncode == 0 and os.path.exists(xwdf)
             note("%s: the window is there and xwd can photograph it"
