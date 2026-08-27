@@ -31,9 +31,25 @@
 use std::cell::Cell;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Arch {
+    X86_64,
+    Aarch64,
+    Wasm32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Os {
+    Linux,
+    None,
+    Browser,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Target {
     X86_64,
     Aarch64,
+    X86_64None,
+    Aarch64None,
     /// ROUND WASM: WebAssembly 1.0 (plus sign extension, non-trapping
     /// float-to-int and bulk memory), 32-bit linear memory, a browser host.
     Wasm32Browser,
@@ -47,7 +63,26 @@ impl Target {
             Target::X86_64 => "x86_64-linux",
             Target::Aarch64 => "aarch64-linux",
             Target::Wasm32Browser => "wasm32-browser",
+            Target::X86_64None => "x86_64-none",
+            Target::Aarch64None => "aarch64-none",
         }
+    }
+    pub fn arch(self) -> Arch {
+        match self {
+            Target::X86_64 | Target::X86_64None => Arch::X86_64,
+            Target::Aarch64 | Target::Aarch64None => Arch::Aarch64,
+            Target::Wasm32Browser => Arch::Wasm32,
+        }
+    }
+    pub fn os(self) -> Os {
+        match self {
+            Target::X86_64 | Target::Aarch64 => Os::Linux,
+            Target::X86_64None | Target::Aarch64None => Os::None,
+            Target::Wasm32Browser => Os::Browser,
+        }
+    }
+    pub fn is_freestanding(self) -> bool {
+        self.os() == Os::None
     }
     /// Does this target produce a WebAssembly module instead of machine
     /// code through `as`/`ld`?
@@ -61,8 +96,8 @@ impl Target {
             // and a PE image cannot be built out of ELF objects -- the COFF
             // port of the same binutils does the job (compiler/src/win.rs).
             Target::X86_64 if windows() => "x86_64-w64-mingw32-as",
-            Target::X86_64 => "as",
-            Target::Aarch64 => "aarch64-linux-gnu-as",
+            Target::X86_64 | Target::X86_64None => "as",
+            Target::Aarch64 | Target::Aarch64None => "aarch64-linux-gnu-as",
             Target::Wasm32Browser => "",
         }
     }
@@ -70,16 +105,16 @@ impl Target {
     pub fn as_flags(self) -> &'static [&'static str] {
         match self {
             Target::X86_64 if windows() => &[],
-            Target::X86_64 => &["--64"],
-            Target::Aarch64 | Target::Wasm32Browser => &[],
+            Target::X86_64 | Target::X86_64None => &["--64"],
+            Target::Aarch64 | Target::Aarch64None | Target::Wasm32Browser => &[],
         }
     }
     /// The linker for this machine.
     pub fn linker(self) -> &'static str {
         match self {
             Target::X86_64 if windows() => "x86_64-w64-mingw32-ld",
-            Target::X86_64 => "ld",
-            Target::Aarch64 => "aarch64-linux-gnu-ld",
+            Target::X86_64 | Target::X86_64None => "ld",
+            Target::Aarch64 | Target::Aarch64None => "aarch64-linux-gnu-ld",
             Target::Wasm32Browser => "",
         }
     }
@@ -89,10 +124,12 @@ impl Target {
     /// round 80 promised not to. So the directive is asked for, not written.
     pub fn align_directive(self, bytes: u64) -> String {
         match self {
-            Target::X86_64 => format!(".align {}", bytes),
+            Target::X86_64 | Target::X86_64None => format!(".align {}", bytes),
             // The data texts of gc.rs, iface.rs and fnval.rs are READ by
             // codegen_wasm.rs; `.balign` says bytes without ambiguity.
-            Target::Aarch64 | Target::Wasm32Browser => format!(".balign {}", bytes),
+            Target::Aarch64 | Target::Aarch64None | Target::Wasm32Browser => {
+                format!(".balign {}", bytes)
+            }
         }
     }
 }
@@ -236,6 +273,12 @@ pub fn flag_set(name: &str) -> Result<(), String> {
             Target::Aarch64
         }
         "wasm32-browser" | "wasm32" => Target::Wasm32Browser,
+        "x86_64-none" | "x86-64-none" | "x86_64-unknown-none" | "x86_64-none-elf" => {
+            Target::X86_64None
+        }
+        "aarch64-none" | "arm64-none" | "aarch64-unknown-none" | "aarch64-none-elf" => {
+            Target::Aarch64None
+        }
         // ROUND WINDOWS (r33): x86-64 with Windows underneath (see `windows`).
         "x86_64-windows" | "x86_64-pc-windows" | "x86_64-w64-mingw32" => {
             on_windows = true;
@@ -243,7 +286,7 @@ pub fn flag_set(name: &str) -> Result<(), String> {
         }
         other => {
             return Err(format!(
-                "unknown target '{}' (allowed: x86_64-linux, aarch64-linux, wasm32-browser, x86_64-android, aarch64-android, x86_64-windows)",
+                "unknown target '{}' (allowed: x86_64-linux, aarch64-linux, wasm32-browser, x86_64-android, aarch64-android, x86_64-windows, x86_64-none, aarch64-none)",
                 other
             ))
         }
@@ -282,6 +325,14 @@ pub fn platform_dir() -> &'static str {
 /// The machine of this compilation unit.
 pub fn active() -> Target {
     ACTIVE.with(|a| a.get())
+}
+
+pub fn arch() -> Arch {
+    active().arch()
+}
+
+pub fn freestanding() -> bool {
+    active().is_freestanding()
 }
 
 /// `.align`/`.balign` of the active machine (see `Target::align_directive`).
@@ -379,5 +430,59 @@ mod tests {
         assert_eq!(align(8), ".balign 8");
         reset();
         assert!(!active().is_wasm());
+    }
+
+    #[test]
+    fn the_two_axes_are_really_independent() {
+        reset();
+        for (name, arch, os) in [
+            ("x86_64-linux", Arch::X86_64, Os::Linux),
+            ("x86_64-none", Arch::X86_64, Os::None),
+            ("aarch64-linux", Arch::Aarch64, Os::Linux),
+            ("aarch64-none", Arch::Aarch64, Os::None),
+        ] {
+            flag_set(name).unwrap();
+            assert_eq!(active().arch(), arch, "{}", name);
+            assert_eq!(active().os(), os, "{}", name);
+            assert_eq!(active().name(), name, "{}", name);
+        }
+        reset();
+    }
+
+    #[test]
+    fn a_freestanding_target_uses_the_same_binutils_as_its_arch() {
+        reset();
+        flag_set("x86_64-none").unwrap();
+        assert_eq!(active().assembler(), "as");
+        assert_eq!(active().as_flags(), &["--64"]);
+        assert_eq!(align(8), ".align 8");
+        flag_set("aarch64-none").unwrap();
+        assert_eq!(active().assembler(), "aarch64-linux-gnu-as");
+        assert!(active().as_flags().is_empty());
+        assert_eq!(align(8), ".balign 8");
+        reset();
+    }
+
+    #[test]
+    fn the_long_triple_names_mean_the_same_thing() {
+        reset();
+        for n in ["aarch64-none", "aarch64-none-elf", "aarch64-unknown-none", "arm64-none"] {
+            flag_set(n).unwrap();
+            assert_eq!(active(), Target::Aarch64None, "{}", n);
+        }
+        reset();
+    }
+
+    #[test]
+    fn only_the_none_targets_are_freestanding() {
+        reset();
+        assert!(!freestanding());
+        flag_set("aarch64-linux").unwrap();
+        assert!(!freestanding());
+        flag_set("x86_64-none").unwrap();
+        assert!(freestanding());
+        flag_set("aarch64-none").unwrap();
+        assert!(freestanding());
+        reset();
     }
 }

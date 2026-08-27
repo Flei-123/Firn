@@ -332,6 +332,8 @@ fn usage() -> String {
          --target=<name>    x86_64-linux (default) | aarch64-linux (round 80)\n  \
                               | wasm32-browser (a .wasm module, round WASM)\n  \
                               | x86_64-windows (a PE/COFF .exe, round WINDOWS)\n  \
+                              | x86_64-none | aarch64-none (freestanding:\n  \
+                              no operating system, ELF object, no syscall)\n  \
                               | x86_64-android | aarch64-android (with --pic -c,\n  \
                                 packed by tools/android/build.sh)\n  \
          --win-subsystem=<s> console (default) | windows (no console window)\n  \
@@ -1167,6 +1169,9 @@ fn run(opts: &Options) -> i32 {
     // --- #[arch(...)]: keep the definitions of the active machine only.
     // Before anything looks at a type or a register name (archsel.rs).
     archsel::select(&mut prog, &mut dg);
+    if dg.has_errors() {
+        return report(&dg);
+    }
     // --- Monomorphization of generic templates (module types) ---
     mono::expand(&mut prog, &mut dg);
     // r664: default + named arguments -> plain positional calls (dargs.rs)
@@ -1257,7 +1262,8 @@ fn run(opts: &Options) -> i32 {
     tm.mark("lower");
     if opts.stats {
         eprintln!(
-            "profile:    {}{}",
+            "target:     {}\nprofile:    {}{}",
+            target::active().name(),
             prof::name(),
             if core::block_count() > 0 {
                 format!("  ({} asm blocks)", core::block_count())
@@ -1382,13 +1388,13 @@ fn run(opts: &Options) -> i32 {
         return emit_wasm(opts, &module, path, target_out_manifest, &mut tm, store, manifest);
     }
     pgo::instrument::plan(&module);
-    let emitted = match target::active() {
-        target::Target::X86_64 => {
+    let emitted = match target::arch() {
+        target::Arch::X86_64 => {
             codegen_x86::set_object_only(opts.only_object);
             codegen_x86::emit(&module)
         }
-        target::Target::Aarch64 => codegen_a64::emit(&module),
-        target::Target::Wasm32Browser => unreachable!("handled above"),
+        target::Arch::Aarch64 => codegen_a64::emit(&module),
+        target::Arch::Wasm32 => unreachable!("handled above"),
     };
     let asm = match emitted {
         Ok(a) => a,
@@ -1834,10 +1840,10 @@ fn assemble_intern(text: &str, obj: &Path) -> Result<(), i32> {
             "the integrated assembler writes ELF objects; x86_64-windows needs PE/COFF and uses `as`",
         ))
     } else {
-        match t {
-            target::Target::X86_64 => asm_x86::assemble_to_object(text),
-            target::Target::Aarch64 => asm_a64::assemble_to_object(text),
-            target::Target::Wasm32Browser => {
+        match t.arch() {
+            target::Arch::X86_64 => asm_x86::assemble_to_object(text),
+            target::Arch::Aarch64 => asm_a64::assemble_to_object(text),
+            target::Arch::Wasm32 => {
                 Err(String::from("the integrated assembler has no WebAssembly target"))
             }
         }

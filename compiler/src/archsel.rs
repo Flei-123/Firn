@@ -74,24 +74,10 @@
 
 use crate::ast::{FnDecl, Program};
 use crate::diag::Diags;
-use crate::target::Target;
-
-/// The machine as `#[arch(...)]` names it. `main` has no freestanding
-/// targets, so this is the whole mapping; a WebAssembly build is no
-/// machine at all and keeps only the functions without the attribute.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Arch {
-    X86_64,
-    Aarch64,
-    Wasm32,
-}
+use crate::target::Arch;
 
 fn current() -> Arch {
-    match crate::target::active() {
-        Target::X86_64 => Arch::X86_64,
-        Target::Aarch64 => Arch::Aarch64,
-        Target::Wasm32Browser => Arch::Wasm32,
-    }
+    crate::target::arch()
 }
 
 /// The attribute's name, in one place.
@@ -249,5 +235,14 @@ mod tests {
             "#[arch(aarch64)]\nfn f() -> i32 { return 1 }\nfn main() -> i32 { return f() }\n",
         );
         assert!(err.contains("no implementation for the machine 'x86_64'"), "{}", err);
+    }
+
+    #[test]
+    fn a_freestanding_target_is_still_its_arch() {
+        crate::target::flag_set("aarch64-none").unwrap();
+        assert_eq!(active_name(), "aarch64");
+        crate::target::flag_set("x86_64-none").unwrap();
+        assert_eq!(active_name(), "x86_64");
+        crate::target::reset();
     }
 }
