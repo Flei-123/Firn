@@ -129,13 +129,87 @@ and every line of it is a different claim:
 new `lib/firnc1/syscalls.fi` entry for entry — the Firn table read out of a
 running program (`bin/sysdump.fi`) built by **both** compilers.
 
-### 1.5 The x86-64 suite
+### 1.5 The x86-64 suite — and what could not be measured
 
-FILL_SUITE
+This is the one place where the round has to be careful, because the machine
+it ran on was not its own. Four to eight other rounds of this project were
+running their own `test.sh` at the same time (load average 8-18 on twelve
+cores), and long-running sections did not survive it: two attempts at the
+full suite were killed during section 16 (`self_compare.sh`, which compiles
+the whole corpus twice) and section 17 (`fixpoint.sh`), and a standalone run
+of `self_compare.sh` was killed after ten minutes as well — with no output
+written and no OOM entry in the kernel log. **The full 66-section suite could
+not be run to completion, before or after.** Saying so is the honest thing;
+quoting a number from a run that was killed would not be.
 
-### 1.6 Compilation time
+What WAS measured, and every one of these ran to completion:
 
-FILL_TIME
+| | |
+|---|---|
+| `test.sh` section 3 — the positive corpus, **329 programs × 4 build levels** (release-fast / no-opt / dev-fast / release-safe) | **0 FAIL** |
+| `test.sh` sections 1-15 (module tests, negative tests, optimiser proof 45/45, result location, symbol scheme, atomics, bounds, html5lib tokenizer 6,810 cases, lexer / parser / layout / type checker / lowering of firnc1 against firnc0) | **0 FAIL** |
+| compiler module tests (`cargo test`) | **262 passed, 0 failed** |
+| the fixpoint, run on its own: firnc0 → stage 1 → stage 2 → stage 3 | **stage 2 == stage 3, character-identical** (23,278,384 octets, 786,249 lines of assembly) |
+| `tools/freestanding/run.sh` (round 52, the x86 kernel object) | **41 passed, 0 failed** |
+| `tools/aarch64/machine.sh` | **16 passed, 0 failed** |
+| `tools/aarch64/run.sh`, both build stages | **304 of 304, 0 differing** |
+| `tools/freestanding/none.sh` (new) | **27 passed, 0 failed** |
+| `tools/aarch64/syscall_table.sh` (new) | **6 passed, 0 failed** |
+
+Two things about the load are worth recording because they are exactly the
+kind of noise that gets mistaken for a regression:
+
+* In the runs that were killed, a handful of cases reported *"compilation
+  failed"* with the compiler's error file MISSING — 11 in one run, 1 in
+  another. Every one of them was recompiled on its own afterwards and every
+  one of them built: `tests/1404_core_unbroken.fi`,
+  `tests/140_symbolschema.fi`, `tests/1450_f32_basics.fi`,
+  `tests/1130_js_generators.fi`. A missing error file is the signature of a
+  compiler process that was killed, not of a program that does not compile.
+* The four cases in the `x86 already failing` column of §1.1 are a different
+  thing and are NOT load: they fail reproducibly, on the base commit as
+  well, and they are counted rather than hidden.
+
+For the claim this round actually has to make — *"x86-64 did not get worse"*
+— the suite is in any case the weaker instrument. §1.6 is the stronger one.
+
+### 1.6 The x86-64 assembler text, program by program
+
+The octet comparison of §1.3 covers one program. It is worth doing over the
+whole corpus, because it is the cheapest possible way to answer "did this
+round change x86-64":
+
+> **305 of 305** programs in `tests/` produce **character-identical**
+> `--emit=asm` output from the compiler before this round and from the
+> compiler after it. **0 differ.** The four inline-assembler cases are
+> excluded because their SOURCE changed (§5); every other file in the
+> directory is compared as it stands.
+
+### 1.7 Compilation time
+
+Measured as CPU time (`RUSAGE_CHILDREN`, user + system), because this
+machine was running four other rounds' test suites at the same time and wall
+clock says more about them than about the compiler.
+
+| | before | after | |
+|---|---|---|---|
+| `bin/firnc1.fi` (55,000 octets, the biggest program in the repository), best of 11 | 2.578 s | 2.542 s | −1.4 % |
+| `tests/1500_js_builtins2.fi`, compiler phases only (total minus `as`+`ld`), best of 7 | 1,667.8 ms | 1,644.4 ms | −1.4 % |
+
+Both differences are negative and both are inside this machine's noise; the
+honest summary is **no measurable change**. The one number that is not noise
+is where the difference in the naive measurement came from: the same
+`js_builtins2` run spent 1,062.9 ms in `as`+`ld` before and 1,232.7 ms after
+— the external assembler and linker, on a machine at load 13. `--timings`
+shows the optimiser at 643.5 ms on both sides, to the tenth of a
+millisecond.
+
+The new pass costs what it looks like it costs: `archsel::select` is three
+walks over the function list and one `retain`, and it runs once per
+compilation unit before monomorphization.
+
+A freestanding kernel object, for scale: `demos/freestanding/a64/core.fi`
+with `--target=aarch64-none` takes **12 ms** of CPU.
 
 ---
 
@@ -417,6 +491,26 @@ definition, not at the call site a hundred lines away.
 `lib/firnc1/parser.fi` learned the same attribute, so the self-hosted
 compiler compiles the rewritten tests too — measured, not assumed: all four
 of them build with `firnc1` and yield 42, 7, 3 and 0.
+
+**One cost, and it is a real one.** `tools/parser_compare.sh` compares the
+canonical AST of both compilers over the whole corpus, and it puts a file in
+the NOT CORE bucket when it uses something the comparison harness does not
+carry — attributes are on that list and always have been. The four rewritten
+cases now carry an attribute, so they moved out of the compared set and into
+NOT CORE: **SAME 445 → 443, NOT CORE 182 → 186**. Nothing broke; four files'
+worth of parser comparison was traded for four files' worth of two-machine
+comparison. It is written down here because a number that moves for a reason
+nobody recorded is how a suite starts lying.
+
+There is also a genuine asymmetry underneath it, and it is worth knowing
+before somebody trips on it: **firnc0 drops the other machine's definition
+in a PASS after parsing, firnc1 drops it IN the parser.** So the two
+compilers' `--emit=ast-canon` for a file with `#[arch]` would not agree —
+firnc0's tree still contains both definitions at that point. That is not
+laziness on either side: firnc0 keeps the tree complete because `firnfmt`
+round-trips through it and a formatter that deleted the other machine's code
+would be a catastrophe, while firnc1 has no formatter and no separate pass
+list to hang one on.
 
 ---
 
