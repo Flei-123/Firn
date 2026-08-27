@@ -48,6 +48,7 @@ export {
     P_FLEX_DIRECTION, P_FLEX_WRAP, P_FLEX_GROW, P_FLEX_SHRINK,
     P_Z_INDEX, P_ORDER, P_JUSTIFY_CONTENT, P_ALIGN_ITEMS, P_ALIGN_SELF,
     P_ALIGN_CONTENT,
+    P_ASPECT_RATIO, P_MARGIN_TRIM,
     P_COUNT, LENGTH_SLOTS,
     S_MARGIN_TOP, S_MARGIN_RIGHT, S_MARGIN_BOTTOM, S_MARGIN_LEFT,
     S_PADDING_TOP, S_PADDING_RIGHT, S_PADDING_BOTTOM, S_PADDING_LEFT,
@@ -71,7 +72,7 @@ export {
     FD_ROW, FD_ROW_REVERSE, FD_COLUMN, FD_COLUMN_REVERSE,
     FW_NOWRAP, FW_WRAP, FW_WRAP_REVERSE,
     AL_AUTO, AL_FLEX_START, AL_FLEX_END, AL_CENTER, AL_SPACE_BETWEEN,
-    AL_START, AL_END,
+    AL_START, AL_END, AL_LEFT, AL_RIGHT,
     AL_SPACE_AROUND, AL_SPACE_EVENLY, AL_STRETCH, AL_BASELINE,
     Z_AUTO_YES, Z_AUTO_NO,
     ORIGIN_UA, ORIGIN_USER, ORIGIN_AUTHOR,
@@ -108,6 +109,8 @@ export {
     style_box_shadow, style_box_shadow_color, style_has_box_shadow,
     style_box_shadow_inset,
     style_text_shadow, style_text_shadow_color, style_has_text_shadow,
+    style_aspect_ratio, style_ar_auto, style_margin_trim,
+    MT_NONE, MT_BLOCK_START, MT_BLOCK_END, MT_INLINE_START, MT_INLINE_END,
 }
 
 // ------------------------------------------------------------- Properties
@@ -188,8 +191,22 @@ const P_BACKGROUND_IMAGE: u32 = 61
 const P_MIX_BLEND_MODE: u32 = 62
 const P_VISIBILITY: u32 = 63
 const P_BACKGROUND_CLIP: u32 = 64
-const P_COUNT: u32 = 65
+// ---- ROUND B6: two properties the official suite asks for and round B2
+// did not have. `aspect-ratio` is css-sizing-4, 4; `margin-trim` is
+// css-box-4, 6. Both ARE length-relevant, but neither is a length slot.
+const P_ASPECT_RATIO: u32 = 65
+const P_MARGIN_TRIM: u32 = 66
+const P_COUNT: u32 = 67
 const P_NONE: u32 = 99
+
+// `margin-trim` (css-box-4, 6) as a bit set. `block` is the two block
+// bits together, `inline` the two inline ones; that is exactly what the
+// shorthand values mean, so the parser has nothing to remember.
+const MT_NONE: u32 = 0
+const MT_BLOCK_START: u32 = 1
+const MT_BLOCK_END: u32 = 2
+const MT_INLINE_START: u32 = 4
+const MT_INLINE_END: u32 = 8
 
 // The slots of `Style.length` / `Style.unit`, spelled out so that no
 // caller has to compute `P_x - P_MARGIN_TOP`.
@@ -345,6 +362,13 @@ const AL_BASELINE: u32 = 8
 // exactly that question, container by container.
 const AL_START: u32 = 9
 const AL_END: u32 = 10
+// ROUND B6 -- `left` and `right`. css-align-3, 4.2: they are only
+// meaningful when the axis they are used on IS the inline axis; on the
+// block axis they behave as `start`. That decision needs the axis, which
+// the cascade does not have -- so they are kept apart here and resolved
+// in `flow.align_phys`.
+const AL_LEFT: u32 = 11
+const AL_RIGHT: u32 = 12
 
 // `z-index: auto` is not the number zero, and the difference is not
 // cosmetic: `auto` does NOT make a stacking context, `0` does.
@@ -453,6 +477,14 @@ gc class Style {
     visibility: u32,
     bgclip: u32,
     font_size: f64,
+    // ROUND B6 -- `aspect-ratio`. The RATIO width/height as one number,
+    // 0.0 meaning "none". `ar_auto` is 1 when the keyword `auto` stood in
+    // the value: `auto 2 / 1` prefers a natural ratio where there is one
+    // and falls back to 2/1, a bare `2 / 1` always wins (css-sizing-4, 4).
+    aspect_ratio: f64,
+    ar_auto: u32,
+    // ROUND B6 -- `margin-trim` as the bit set above.
+    margin_trim: u32,
     flex_grow: f64,
     flex_shrink: f64,
     // `z-index` and `order` are INTEGERS in the standard. They are kept
@@ -504,6 +536,9 @@ fn style_new() -> AllocError!Gc[Style] {
         visibility: 0,
         bgclip: 0,
         font_size: 16.0,
+        aspect_ratio: 0.0,
+        ar_auto: 0,
+        margin_trim: MT_NONE,
         flex_grow: 0.0,
         flex_shrink: 1.0,
         z_index: 0.0,
@@ -586,6 +621,9 @@ fn style_initial() -> AllocError!Gc[Style] {
         b = b + 1
     }
     s.font_size = 16.0
+    s.aspect_ratio = 0.0
+    s.ar_auto = 0
+    s.margin_trim = MT_NONE
     s.flex_grow = 0.0
     s.flex_shrink = 1.0
     s.z_index = 0.0
@@ -766,6 +804,20 @@ fn style_radius_unit(s: Gc[Style], slot: usize) -> u32 {
 
 fn style_opacity(s: Gc[Style]) -> f64 {
     return s.opacity
+}
+
+// ROUND B6. The ratio is width/height; 0.0 means the property said
+// nothing. `style_ar_auto` says whether `auto` stood beside it.
+fn style_aspect_ratio(s: Gc[Style]) -> f64 {
+    return s.aspect_ratio
+}
+
+fn style_ar_auto(s: Gc[Style]) -> bool {
+    return s.ar_auto == 1 as u32
+}
+
+fn style_margin_trim(s: Gc[Style]) -> u32 {
+    return s.margin_trim
 }
 
 fn style_blend(s: Gc[Style]) -> u32 {
@@ -961,7 +1013,132 @@ fn property_id(name: Gc[Chain]) -> u32 {
     if node.chain_equal_ascii_small(name, &p64[0], 10) { return P_VISIBILITY }
     var p65: [u8; 15] = "background-clip"
     if node.chain_equal_ascii_small(name, &p65[0], 15) { return P_BACKGROUND_CLIP }
+    let lg: u32 = logical_property_id(name)
+    if lg != P_NONE {
+        return lg
+    }
+    var p66: [u8; 12] = "aspect-ratio"
+    if node.chain_equal_ascii_small(name, &p66[0], 12) { return P_ASPECT_RATIO }
+    var p67: [u8; 11] = "margin-trim"
+    if node.chain_equal_ascii_small(name, &p67[0], 11) { return P_MARGIN_TRIM }
     return P_NONE
+}
+
+// ------------------------------------------------ ROUND B6: the LOGICAL
+// properties
+//
+// `margin-block-start`, `inline-size`, `inset-inline-end` and their kin
+// are the same properties as `margin-top`, `width` and `right` -- in a
+// horizontal, left-to-right document. This engine has no writing modes
+// (round B2 said so and put every test that needs one into a group of its
+// own), so the mapping here is the identity of that one case and NOT a
+// writing-mode implementation.
+//
+// THAT IS A LIMIT AND IT IS NAMED: in `writing-mode: vertical-rl` or in
+// `direction: rtl` these names mean OTHER sides, and this table would then
+// be wrong. It is honest here only because the corpus this is measured
+// against excludes both -- `tools/layoutb2/harness.py` puts 171 such
+// tests into the `vertical` group and reports them separately.
+//
+// The mapping is done in `property_id`, so a logical longhand IS the
+// physical one from that moment on: it takes part in the cascade in the
+// same slot, and `margin-inline-start: 5px; margin-left: 9px` comes out
+// as 9 because the later declaration wins. That is what the standard says
+// for the same origin and the same specificity.
+fn logical_property_id(name: Gc[Chain]) -> u32 {
+    var l1: [u8; 18] = "margin-block-start"
+    if node.chain_equal_ascii_small(name, &l1[0], 18) { return P_MARGIN_TOP }
+    var l2: [u8; 16] = "margin-block-end"
+    if node.chain_equal_ascii_small(name, &l2[0], 16) { return P_MARGIN_BOTTOM }
+    var l3: [u8; 19] = "margin-inline-start"
+    if node.chain_equal_ascii_small(name, &l3[0], 19) { return P_MARGIN_LEFT }
+    var l4: [u8; 17] = "margin-inline-end"
+    if node.chain_equal_ascii_small(name, &l4[0], 17) { return P_MARGIN_RIGHT }
+    var l5: [u8; 19] = "padding-block-start"
+    if node.chain_equal_ascii_small(name, &l5[0], 19) { return P_PADDING_TOP }
+    var l6: [u8; 17] = "padding-block-end"
+    if node.chain_equal_ascii_small(name, &l6[0], 17) { return P_PADDING_BOTTOM }
+    var l7: [u8; 20] = "padding-inline-start"
+    if node.chain_equal_ascii_small(name, &l7[0], 20) { return P_PADDING_LEFT }
+    var l8: [u8; 18] = "padding-inline-end"
+    if node.chain_equal_ascii_small(name, &l8[0], 18) { return P_PADDING_RIGHT }
+    var l9: [u8; 11] = "inline-size"
+    if node.chain_equal_ascii_small(name, &l9[0], 11) { return P_WIDTH }
+    var l10: [u8; 10] = "block-size"
+    if node.chain_equal_ascii_small(name, &l10[0], 10) { return P_HEIGHT }
+    var l11: [u8; 15] = "min-inline-size"
+    if node.chain_equal_ascii_small(name, &l11[0], 15) { return P_MIN_WIDTH }
+    var l12: [u8; 14] = "min-block-size"
+    if node.chain_equal_ascii_small(name, &l12[0], 14) { return P_MIN_HEIGHT }
+    var l13: [u8; 15] = "max-inline-size"
+    if node.chain_equal_ascii_small(name, &l13[0], 15) { return P_MAX_WIDTH }
+    var l14: [u8; 14] = "max-block-size"
+    if node.chain_equal_ascii_small(name, &l14[0], 14) { return P_MAX_HEIGHT }
+    var l15: [u8; 17] = "inset-block-start"
+    if node.chain_equal_ascii_small(name, &l15[0], 17) { return P_TOP }
+    var l16: [u8; 15] = "inset-block-end"
+    if node.chain_equal_ascii_small(name, &l16[0], 15) { return P_BOTTOM }
+    var l17: [u8; 18] = "inset-inline-start"
+    if node.chain_equal_ascii_small(name, &l17[0], 18) { return P_LEFT }
+    var l18: [u8; 16] = "inset-inline-end"
+    if node.chain_equal_ascii_small(name, &l18[0], 16) { return P_RIGHT }
+    var l19: [u8; 24] = "border-block-start-width"
+    if node.chain_equal_ascii_small(name, &l19[0], 24) { return P_BORDER_TOP_WIDTH }
+    var l20: [u8; 22] = "border-block-end-width"
+    if node.chain_equal_ascii_small(name, &l20[0], 22) { return P_BORDER_BOTTOM_WIDTH }
+    var l21: [u8; 25] = "border-inline-start-width"
+    if node.chain_equal_ascii_small(name, &l21[0], 25) { return P_BORDER_LEFT_WIDTH }
+    var l22: [u8; 23] = "border-inline-end-width"
+    if node.chain_equal_ascii_small(name, &l22[0], 23) { return P_BORDER_RIGHT_WIDTH }
+    return P_NONE
+}
+
+// The logical box shorthands: `margin-block: A B` is block-start and
+// block-end, `inset: A B C D` is the 1-to-4 rule over top/right/bottom/
+// left. Returns the two (or four) physical slots through `out`.
+fn logical_pair(name: Gc[Chain], first: *mut u32, second: *mut u32) -> bool {
+    var s1: [u8; 12] = "margin-block"
+    if node.chain_equal_ascii_small(name, &s1[0], 12) {
+        *first = P_MARGIN_TOP
+        *second = P_MARGIN_BOTTOM
+        return true
+    }
+    var s2: [u8; 13] = "margin-inline"
+    if node.chain_equal_ascii_small(name, &s2[0], 13) {
+        *first = P_MARGIN_LEFT
+        *second = P_MARGIN_RIGHT
+        return true
+    }
+    var s3: [u8; 13] = "padding-block"
+    if node.chain_equal_ascii_small(name, &s3[0], 13) {
+        *first = P_PADDING_TOP
+        *second = P_PADDING_BOTTOM
+        return true
+    }
+    var s4: [u8; 14] = "padding-inline"
+    if node.chain_equal_ascii_small(name, &s4[0], 14) {
+        *first = P_PADDING_LEFT
+        *second = P_PADDING_RIGHT
+        return true
+    }
+    var s5: [u8; 11] = "inset-block"
+    if node.chain_equal_ascii_small(name, &s5[0], 11) {
+        *first = P_TOP
+        *second = P_BOTTOM
+        return true
+    }
+    var s6: [u8; 12] = "inset-inline"
+    if node.chain_equal_ascii_small(name, &s6[0], 12) {
+        *first = P_LEFT
+        *second = P_RIGHT
+        return true
+    }
+    return false
+}
+
+fn is_inset_shorthand(name: Gc[Chain]) -> bool {
+    var w: [u8; 5] = "inset"
+    return node.chain_equal_ascii_small(name, &w[0], 5)
 }
 
 // The shorthands. Returns the number of longhands (0 = not a shorthand)
@@ -1239,6 +1416,43 @@ fn append_declaration(name: Gc[Chain], value: Gc[Cv], important: bool,
                     try decl_new(P_BACKGROUND_COLOR, one, flags))
             }
             i2 = i2 + 1
+        }
+        return true
+    }
+    // ROUND B6: the logical box shorthands. `inset` is the 1-to-4 rule
+    // over top, right, bottom and left -- the same order as `margin`, and
+    // the four slots are NOT contiguous in the property table, so it gets
+    // its own loop instead of `group + side`.
+    var lg1: u32 = 0
+    var lg2: u32 = 0
+    if logical_pair(name, &lg1, &lg2) {
+        let count2: u64 = non_ws_count(value)
+        if count2 < 1 || count2 > 2 {
+            return false
+        }
+        let va = try single_value(non_ws_at(value, 0))
+        let okl1: bool = try decls_append(out, try decl_new(lg1, va, flags))
+        var second_i: u64 = 0
+        if count2 == 2 {
+            second_i = 1
+        }
+        let vb = try single_value(non_ws_at(value, second_i))
+        let okl2: bool = try decls_append(out, try decl_new(lg2, vb, flags))
+        return true
+    }
+    if is_inset_shorthand(name) {
+        let count3: u64 = non_ws_count(value)
+        if count3 < 1 || count3 > 4 {
+            return false
+        }
+        var sides: [u32; 4] = [P_TOP, P_RIGHT, P_BOTTOM, P_LEFT]
+        var si: u64 = 0
+        while si < 4 {
+            let v3: Gc[Cv] = non_ws_at(value, box_index(count3, si))
+            let one3 = try single_value(v3)
+            let ok3: bool = try decls_append(out,
+                try decl_new(sides[si as usize], one3, flags))
+            si = si + 1
         }
         return true
     }
@@ -1576,20 +1790,20 @@ fn origin_level(origin: u32, important: bool) -> u32 {
 
 // The winners per property for ONE element.
 struct Winner {
-    best: [Gc[Decl]; 65],
-    level: [u32; 65],
-    spec: [u32; 65],
-    order: [u32; 65],
-    taken: [u32; 65],
+    best: [Gc[Decl]; 67],
+    level: [u32; 67],
+    spec: [u32; 67],
+    order: [u32; 67],
+    taken: [u32; 67],
 }
 
 fn winner_new() -> Winner {
     return Winner {
-        best: [gc_null[Decl](); 65],
-        level: [0; 65],
-        spec: [0; 65],
-        order: [0; 65],
-        taken: [0; 65],
+        best: [gc_null[Decl](); 67],
+        level: [0; 67],
+        spec: [0; 67],
+        order: [0; 67],
+        taken: [0; 67],
     }
 }
 
@@ -1703,6 +1917,15 @@ fn is_ident_word(c: Gc[Cv], p: *mut u8, n: usize) -> bool {
         return false
     }
     return node.chain_equal_ascii_small(c.text, p, n)
+}
+
+// The `/` of `aspect-ratio: 2 / 1` -- a DELIM token, not an identifier.
+fn is_solidus(c: Gc[Cv]) -> bool {
+    if c == gc_null[Cv]() || c.kind != tok.T_DELIM {
+        return false
+    }
+    var w: [u8; 1] = "/"
+    return node.chain_equal_ascii_small(c.text, &w[0], 1)
 }
 
 fn is_ident_none(c: Gc[Cv]) -> bool {
@@ -2095,6 +2318,51 @@ fn value_flex_wrap(c: Gc[Cv], out: *mut u32) -> bool {
 // `flex-start`/`flex-end` fall together here: they differ only under a
 // writing mode other than left-to-right top-to-bottom, and only that one
 // is implemented (docs/ROUND67.md).
+// ROUND B6 -- the TWO-WORD alignment values of css-align-3.
+//
+//   `first baseline` / `last baseline`   (4.1)
+//   `safe center` / `unsafe center`      (4.4, the overflow alignment)
+//
+// Until this round only the FIRST component value of the declaration was
+// looked at, so `align-self: last baseline` was read as the identifier
+// `last`, matched nothing, and silently stayed at `auto`. Eight files of
+// `css/css-flexbox/abspos` measure exactly that value.
+//
+// `last baseline` is mapped to `end`. In the static position of an
+// absolutely positioned child -- which is what those files measure -- the
+// two are the same thing. For an in-flow item they are NOT: a real last
+// baseline aligns the LAST line of each item. That is named as a limit in
+// docs/ROUNDB6.md rather than pretended away.
+fn value_align_pair(d: Gc[Decl], out: *mut u32) -> bool {
+    let v0: Gc[Cv] = non_ws_at(d.value, 0)
+    let v1: Gc[Cv] = non_ws_at(d.value, 1)
+    if v1 == gc_null[Cv]() {
+        return false
+    }
+    var wfirst: [u8; 5] = "first"
+    var wlast: [u8; 4] = "last"
+    var wbase: [u8; 8] = "baseline"
+    var wsafe: [u8; 4] = "safe"
+    var wunsafe: [u8; 6] = "unsafe"
+    if is_ident_word(v1, &wbase[0], 8) {
+        if is_ident_word(v0, &wfirst[0], 5) {
+            *out = AL_BASELINE
+            return true
+        }
+        if is_ident_word(v0, &wlast[0], 4) {
+            // FLEX-relative, not absolute: it turns round with
+            // `flex-wrap: wrap-reverse`, and `end` does not.
+            *out = AL_FLEX_END
+            return true
+        }
+        return false
+    }
+    if is_ident_word(v0, &wsafe[0], 4) || is_ident_word(v0, &wunsafe[0], 6) {
+        return value_align_content(v1, out)
+    }
+    return false
+}
+
 fn value_align_common(c: Gc[Cv], out: *mut u32) -> bool {
     var w1: [u8; 10] = "flex-start"
     if is_ident_word(c, &w1[0], 10) { *out = AL_FLEX_START; return true }
@@ -2107,9 +2375,9 @@ fn value_align_common(c: Gc[Cv], out: *mut u32) -> bool {
     var w5: [u8; 3] = "end"
     if is_ident_word(c, &w5[0], 3) { *out = AL_END; return true }
     var w6: [u8; 4] = "left"
-    if is_ident_word(c, &w6[0], 4) { *out = AL_START; return true }
+    if is_ident_word(c, &w6[0], 4) { *out = AL_LEFT; return true }
     var w7: [u8; 5] = "right"
-    if is_ident_word(c, &w7[0], 5) { *out = AL_END; return true }
+    if is_ident_word(c, &w7[0], 5) { *out = AL_RIGHT; return true }
     var w8: [u8; 10] = "self-start"
     if is_ident_word(c, &w8[0], 10) { *out = AL_START; return true }
     var w9: [u8; 8] = "self-end"
@@ -3428,6 +3696,128 @@ fn compute_style(w: *mut Winner, parent: Gc[Style]) -> AllocError!Gc[Style] {
         }
     }
 
+    // 8b. ROUND B6 -- `aspect-ratio` (css-sizing-4, 4). The grammar is
+    // `auto || <ratio>`, and `<ratio>` is `<number> [ / <number> ]?`. A
+    // zero or negative number in either place makes the ratio DEGENERATE:
+    // the standard says such a value is accepted and behaves as none, and
+    // that is safer than dividing by it later.
+    let ar_d: Gc[Decl] = (*w).best[P_ASPECT_RATIO as usize]
+    if ar_d != gc_null[Decl]() {
+        let v0: Gc[Cv] = first_value(ar_d)
+        let kw: u32 = keyword_kind(v0)
+        if kw == V_INHERIT {
+            s.aspect_ratio = parent.aspect_ratio
+            s.ar_auto = parent.ar_auto
+        } else if kw == V_INITIAL {
+            s.aspect_ratio = 0.0
+            s.ar_auto = 0
+        } else {
+            var auto_seen: u32 = 0
+            var num1: f64 = 0.0
+            var num2: f64 = 0.0
+            var have1: bool = false
+            var have2: bool = false
+            var bad: bool = false
+            var i: u64 = 0
+            var aw: [u8; 4] = "auto"
+            while i < 8 {
+                let c: Gc[Cv] = non_ws_at(ar_d.value, i)
+                if c == gc_null[Cv]() {
+                    break
+                }
+                if is_ident_word(c, &aw[0], 4) {
+                    auto_seen = 1
+                } else if c.kind == tok.T_NUMBER {
+                    if !have1 {
+                        num1 = number_of(c)
+                        have1 = true
+                    } else if !have2 {
+                        num2 = number_of(c)
+                        have2 = true
+                    } else {
+                        bad = true
+                    }
+                } else if is_solidus(c) {
+                    if !have1 || have2 {
+                        bad = true
+                    }
+                } else {
+                    bad = true
+                }
+                i = i + 1
+            }
+            if !bad {
+                s.ar_auto = auto_seen
+                if have1 && have2 {
+                    if num1 > 0.0 && num2 > 0.0 {
+                        s.aspect_ratio = num1 / num2
+                    } else {
+                        s.aspect_ratio = 0.0
+                    }
+                } else if have1 {
+                    if num1 > 0.0 {
+                        s.aspect_ratio = num1
+                    } else {
+                        s.aspect_ratio = 0.0
+                    }
+                } else {
+                    s.aspect_ratio = 0.0
+                }
+            }
+        }
+    }
+
+    // 8c. ROUND B6 -- `margin-trim` (css-box-4, 6). A space separated set
+    // of sides; `block` and `inline` each stand for two of them.
+    let mt_d: Gc[Decl] = (*w).best[P_MARGIN_TRIM as usize]
+    if mt_d != gc_null[Decl]() {
+        let v0: Gc[Cv] = first_value(mt_d)
+        let kw: u32 = keyword_kind(v0)
+        if kw == V_INHERIT {
+            s.margin_trim = parent.margin_trim
+        } else if kw == V_INITIAL {
+            s.margin_trim = MT_NONE
+        } else {
+            var bits: u32 = 0
+            var bad2: bool = false
+            var j: u64 = 0
+            var mw1: [u8; 5] = "block"
+            var mw2: [u8; 6] = "inline"
+            var mw3: [u8; 11] = "block-start"
+            var mw4: [u8; 9] = "block-end"
+            var mw5: [u8; 12] = "inline-start"
+            var mw6: [u8; 10] = "inline-end"
+            var mw7: [u8; 4] = "none"
+            while j < 6 {
+                let c: Gc[Cv] = non_ws_at(mt_d.value, j)
+                if c == gc_null[Cv]() {
+                    break
+                }
+                if is_ident_word(c, &mw1[0], 5) {
+                    bits = bits | MT_BLOCK_START | MT_BLOCK_END
+                } else if is_ident_word(c, &mw2[0], 6) {
+                    bits = bits | MT_INLINE_START | MT_INLINE_END
+                } else if is_ident_word(c, &mw3[0], 11) {
+                    bits = bits | MT_BLOCK_START
+                } else if is_ident_word(c, &mw4[0], 9) {
+                    bits = bits | MT_BLOCK_END
+                } else if is_ident_word(c, &mw5[0], 12) {
+                    bits = bits | MT_INLINE_START
+                } else if is_ident_word(c, &mw6[0], 10) {
+                    bits = bits | MT_INLINE_END
+                } else if is_ident_word(c, &mw7[0], 4) {
+                    bits = MT_NONE
+                } else {
+                    bad2 = true
+                }
+                j = j + 1
+            }
+            if !bad2 {
+                s.margin_trim = bits
+            }
+        }
+    }
+
     // 9. `z-index` and `order` -- two integers, and `z-index` also has
     // the keyword `auto`, which is NOT the number zero.
     let zi_d: Gc[Decl] = (*w).best[P_Z_INDEX as usize]
@@ -3470,7 +3860,9 @@ fn compute_style(w: *mut Winner, parent: Gc[Style]) -> AllocError!Gc[Style] {
             s.justify_content = AL_FLEX_START
         } else {
             var x: u32 = 0
-            if value_justify_content(v, &x) {
+            if value_align_pair(jc_d, &x) {
+                s.justify_content = x
+            } else if value_justify_content(v, &x) {
                 s.justify_content = x
             }
         }
@@ -3485,7 +3877,9 @@ fn compute_style(w: *mut Winner, parent: Gc[Style]) -> AllocError!Gc[Style] {
             s.align_items = AL_STRETCH
         } else {
             var x: u32 = 0
-            if value_align_items(v, &x) {
+            if value_align_pair(ai_d, &x) {
+                s.align_items = x
+            } else if value_align_items(v, &x) {
                 s.align_items = x
             }
         }
@@ -3500,7 +3894,9 @@ fn compute_style(w: *mut Winner, parent: Gc[Style]) -> AllocError!Gc[Style] {
             s.align_self = AL_AUTO
         } else {
             var x: u32 = 0
-            if value_align_self(v, &x) {
+            if value_align_pair(as_d, &x) {
+                s.align_self = x
+            } else if value_align_self(v, &x) {
                 s.align_self = x
             }
         }
@@ -3515,7 +3911,9 @@ fn compute_style(w: *mut Winner, parent: Gc[Style]) -> AllocError!Gc[Style] {
             s.align_content = AL_STRETCH
         } else {
             var x: u32 = 0
-            if value_align_content(v, &x) {
+            if value_align_pair(ac_d, &x) {
+                s.align_content = x
+            } else if value_align_content(v, &x) {
                 s.align_content = x
             }
         }

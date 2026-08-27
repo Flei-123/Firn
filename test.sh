@@ -1383,6 +1383,46 @@ else
     tail -5 "$WORK/liveb4.log" | sed 's/^/   /'
 fi
 
+echo "== 64. CHAPTER Z: the defence against fingerprinting (ROUND B6) =="
+# The number 64 is fixed for this round. 63 belongs to round B4.
+#
+# The occasion was a page on AliExpress on 24 August 2026: a WebAudio graph
+# with a sawtooth oscillator and an `AnalyserNode` AT VOLUME ZERO, out of
+# which a device fingerprint was read. Muting the tab did not help, because
+# there was no media element to mute -- the measurement was never meant to
+# be heard.
+#
+# What runs here is the part of chapter Z whose building blocks exist: the
+# canvas readback (`toDataURL`, `getImageData`) and the `navigator` fields,
+# noised PER ORIGIN AND PER SESSION after Brave's method, on by default and
+# with no switch (Z3, Z4, Z6). WebAudio is not built yet; Z1 stands in
+# REQUIREMENTS.md as a condition on ITS construction, not as a repair
+# afterwards.
+#
+# THE GUARDS, and they are the point of the section:
+#   * the same session and the same origin give BYTE-IDENTICAL answers over
+#     twenty reads. A reading that differs from itself can be averaged away
+#     and tells the script it is being lied to.
+#   * THE COUNTER-CHECK: the same path with the farbling taken out has to
+#     give exactly ONE answer over 500 origins. "500 origins, 500 different
+#     canvases" is also true of a program that returns pure noise.
+#   * the largest deviation of any colour channel is reported, not a mean,
+#     and the alpha channel is checked separately -- a flipped alpha bit is
+#     visible where a pixel is fully transparent.
+#   * all three build stages have to give the SAME numbers. A key stream
+#     that depends on the optimiser depends on the machine.
+bash tools/fpz/run.sh > "$WORK/fpz.log" 2>&1 && ZRC=0 || ZRC=$?
+grep -E '^   (stable|[0-9]+ origins|the same path|[0-9]+ sessions|largest|alpha|share|16 x 16|navigator|clock|checks)' \
+    "$WORK/fpz.log" | sed 's/^/ /'
+grep -E '^FPZ OK: ' "$WORK/fpz.log" | tail -1 | sed 's/^/ /'
+if [ "$ZRC" -eq 0 ]; then
+    ok
+else
+    bad "tools/fpz/run.sh failed (see .test-work/fpz.log)"
+    grep -E 'FAIL|Traceback|Error' "$WORK/fpz.log" | head -12 | sed 's/^/   /'
+    tail -5 "$WORK/fpz.log" | sed 's/^/   /'
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then
