@@ -66,6 +66,7 @@ mod peephole;
 mod strings;
 mod strtype;
 mod syscalls;
+mod archsel;
 mod target;
 mod types;
 
@@ -203,6 +204,8 @@ fn usage() -> String {
          -c, --object       only assemble: ELF object file, no ld\n  \
          --profile=<name>   kernel | app (SPEC 2), forces the profile\n  \
          --target=<name>    x86_64-linux (default) | aarch64-linux (round 80)\n  \
+                              | x86_64-none | aarch64-none (freestanding:\n  \
+                              no operating system, ELF object, no syscall)\n  \
          --no-opt           switch off the optimizer (= --opt-level=dev)\n  \
          --opt-level=<lvl>  dev | dev-fast | release-safe | release-fast\n  \
                               (\'dev-fast\' = only debug preserving passes)\n  \
@@ -776,6 +779,13 @@ fn run(opts: &Options) -> i32 {
     }
 
     tm.mark("comptime");
+    // ROUND ARM-FREESTANDING: `#[arch(...)]` -- throw away every function
+    // that belongs to another machine, BEFORE anything has looked at a type
+    // or at a register name (archsel.rs explains why the order matters).
+    archsel::select(&mut prog, &mut dg);
+    if dg.has_errors() {
+        return report(&dg);
+    }
     // --- Monomorphization of generic templates (module types) ---
     mono::expand(&mut prog, &mut dg);
     tm.mark("mono");
@@ -829,7 +839,8 @@ fn run(opts: &Options) -> i32 {
     tm.mark("lower");
     if opts.stats {
         eprintln!(
-            "profile:    {}{}",
+            "target:     {}\nprofile:    {}{}",
+            target::active().name(),
             prof::name(),
             if core::block_count() > 0 {
                 format!("  ({} asm blocks)", core::block_count())
@@ -909,9 +920,13 @@ fn run(opts: &Options) -> i32 {
         eprintln!("error: {}", e);
         return 1;
     }
-    let emitted = match target::active() {
-        target::Target::X86_64 => codegen_x86::emit(&module),
-        target::Target::Aarch64 => codegen_a64::emit(&module),
+    // ROUND ARM-FREESTANDING: the code generator is chosen by the
+    // INSTRUCTION SET alone. Whether an operating system lies underneath is
+    // the other axis of `target.rs`, and it is answered inside the two
+    // generators (no `_start`, no system calls), not by picking a third one.
+    let emitted = match target::arch() {
+        target::Arch::X86_64 => codegen_x86::emit(&module),
+        target::Arch::Aarch64 => codegen_a64::emit(&module),
     };
     let asm = match emitted {
         Ok(a) => a,
