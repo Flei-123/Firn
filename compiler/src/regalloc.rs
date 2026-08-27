@@ -4139,6 +4139,45 @@ fn emit_bin(
                 (Loc::Reg(r), _) => r,
                 (Loc::Slot(_), _) => "rax",
             };
+            // ROUND SPEED -- `lea` instead of `mov` + `shl`.
+            //
+            // Scaling an index is the most frequent multiplication there
+            // is, and `lea` does it in ONE instruction with a free target:
+            // `[x*4]` for four, `[x+x*2]` for three, `[x+x*4]` for five,
+            // `[x+x*8]` for nine. It needs the source in a register (an
+            // immediate has been folded long before) and 64 bit operands --
+            // a 32 bit `lea` would have to be written `[eax*4]`, which
+            // assembles but computes with a 32 bit address size, and that
+            // is a different question from a 32 bit result.
+            //
+            // Where it bites: `bench/firn/matmul.fi` at `release-safe`. The
+            // checked pointer addition blocks the address folding, so the
+            // `* 4` of every index really is emitted, twice per iteration
+            // of the innermost loop, as `mov rdx, rsi` + `shl rdx, 2`.
+            let src_reg = match (ra.a.imm(a), ra.a.place(a)) {
+                (None, Loc::Reg(r)) => Some(r),
+                _ => None,
+            };
+            if wide {
+                if let Some(x) = src_reg {
+                    let form = match k {
+                        2 => Some(format!("[{}+{}]", x, x)),
+                        3 => Some(format!("[{}+{}*2]", x, x)),
+                        4 => Some(format!("[{}*4]", x)),
+                        5 => Some(format!("[{}+{}*4]", x, x)),
+                        8 => Some(format!("[{}*8]", x)),
+                        9 => Some(format!("[{}+{}*8]", x, x)),
+                        _ => None,
+                    };
+                    if let Some(f) = form {
+                        e.line(&format!("lea {}, {}", dst_reg, f));
+                        if dst_reg == "rax" {
+                            ra.store_dst(e, d, "rax");
+                        }
+                        return Ok(());
+                    }
+                }
+            }
             let shift = if k > 1 && (k & (k - 1)) == 0 { Some(k.trailing_zeros()) } else { None };
             match shift {
                 Some(sh) => {
