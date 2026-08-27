@@ -884,10 +884,18 @@ fn immediate_consts(f: &Func) -> HashMap<Val, i64> {
     for b in &f.blocks {
         for i in &b.insts {
             match &i.op {
-                // Operand `a` goes through `load_ext` (movsx/movzx) -> no immediate
-                Op::Bin(BinOp::Div, a, b2) | Op::Bin(BinOp::Rem, a, b2) => {
+                // Operand `a` goes through `load_ext` (movsx/movzx) -> no immediate.
+                //
+                // ROUND SPEED -- THE DIVISOR STAYS AN IMMEDIATE. It used to
+                // be struck out here too, and that is what kept
+                // `emit_div_const` from ever seeing a constant divisor:
+                // `bench/firn/bytecount.fi` put its 251 in `r8` and divided
+                // by the register, 16.7 million times. Nothing needs it
+                // struck: the only place that reads the divisor is
+                // `load_ext`, which turns an immediate into `mov rcx, 251`
+                // exactly as it turns a register into `mov rcx, r8`.
+                Op::Bin(BinOp::Div, a, _) | Op::Bin(BinOp::Rem, a, _) => {
                     kill(*a, &mut bad);
-                    kill(*b2, &mut bad);
                 }
                 Op::Bin(BinOp::Shl, a, _) | Op::Bin(BinOp::Shr, a, _) => kill(*a, &mut bad),
                 Op::Cast { src, .. } => kill(*src, &mut bad),
@@ -2671,8 +2679,25 @@ fn emit_with(e: &mut Emitter, f: &Func, a: &Alloc) -> Result<(), String> {
     // Round 51: the blocks are no longer printed in their FIR order but
     // along traces (see `emit_order`).
     let order = emit_order(f);
+    // ROUND SPEED -- a loop head starts at a 16 byte boundary.
+    //
+    // Round 3 moved blocks around, and two benchmarks whose emitted
+    // instructions did not change by a single byte moved with them --
+    // `sieve` and `bubblesort` got SLOWER although their hot loops got one
+    // taken branch cheaper. What changed was the ADDRESS: a loop whose body
+    // straddles a fetch window costs an extra window every iteration, and
+    // where it straddles is decided by how much code stands in front of it.
+    //
+    // `rustc` writes `.p2align 4` in front of every hot loop for exactly
+    // this reason. The third argument caps the padding: if reaching the
+    // boundary would cost more than ten bytes, the alignment is skipped
+    // rather than pushing ten nops into the instruction cache.
+    let aligned = loop_entry_flags(f);
     for (k, &bi) in order.iter().enumerate() {
         let b = &f.blocks[bi];
+        if aligned[bi] {
+            e.raw("    .p2align 4, 0x90");
+        }
         e.raw(&format!("{}:", block_label(&f.name, b.id)));
         // Fallthrough: if the jump target sits right behind it, the jump
         // disappears (saves one `jmp` per BrCond with else==next block).
@@ -2716,6 +2741,32 @@ fn emit_order(f: &Func) -> Vec<usize> {
     if std::env::var_os("FIRN_NO_LAYOUT").is_some() {
         return (0..n).collect();
     }
+    // ROUND SPEED -- THE LOOP BODY IS THE HOT SIDE, NOT THE EXIT.
+    //
+    // The trace used to prefer `else_bb` unconditionally. At a loop head
+    // `brcond i < n, body, exit` the `else` side is the EXIT -- the one edge
+    // of the whole loop that is taken exactly once. So the exit fell through
+    // and the body was placed somewhere else, which cost the loop TWO taken
+    // jumps per iteration:
+    //
+    //     head: cmp r12, 240
+    //           jb   body        <- taken, every pass
+    //     exit: ...              <- fallthrough, reached once
+    //     body: ...
+    //           jmp  head        <- taken, every pass
+    //
+    // With the loop depth as the tiebreaker the body falls through and the
+    // conditional jump becomes the not-taken one:
+    //
+    //     head: cmp r12, 240
+    //           jae  exit        <- NOT taken, every pass
+    //     body: ...
+    //           jmp  head        <- taken
+    //
+    // `emit_block` inverts the condition itself when `then` is the next
+    // block, so no case is lost. Layout only -- liveness, intervals and
+    // register choice all keep working on the FIR order.
+    let depth = layout_depth(f);
     let mut placed = vec![false; n];
     let mut out: Vec<usize> = Vec::with_capacity(n);
     let mut free = 0usize;
@@ -2729,10 +2780,21 @@ fn emit_order(f: &Func) -> Vec<usize> {
                 Term::Br(t) => Some(*t as usize),
                 Term::BrCond { then_bb, else_bb, .. } => {
                     let el = *else_bb as usize;
-                    if el < n && !placed[el] {
+                    let th = *then_bb as usize;
+                    let el_free = el < n && !placed[el];
+                    let th_free = th < n && !placed[th];
+                    // The deeper nested successor wins; on a tie the old
+                    // preference for `else` stands.
+                    let take_then = th_free
+                        && (!el_free
+                            || depth.get(th).copied().unwrap_or(0)
+                                > depth.get(el).copied().unwrap_or(0));
+                    if take_then {
+                        Some(th)
+                    } else if el_free {
                         Some(el)
                     } else {
-                        Some(*then_bb as usize)
+                        Some(th)
                     }
                 }
                 Term::Switch { default, .. } => Some(*default as usize),
@@ -2743,15 +2805,361 @@ fn emit_order(f: &Func) -> Vec<usize> {
                 _ => break,
             }
         }
+        // ROUND SPEED -- A LOOP IS LAID OUT IN ONE PIECE.
+        //
+        // When the trace breaks, the old rule carried on at the lowest
+        // block not yet placed. That interleaves regions that have nothing
+        // to do with each other. `bench/firn/bubblesort.fi`: the `if x > y`
+        // arm of the innermost loop ended up 0xa1 octets past the loop,
+        // BEHIND the whole final summing loop, and the conditional jump to
+        // it grew from a two octet `jg rel8` to a six octet `jg rel32` --
+        // inside the hot loop, and the swap it jumps to is taken on a good
+        // half of the comparisons.
+        //
+        // Carrying on with the DEEPEST unplaced block instead keeps the
+        // rest of the loop next to the loop. Ties go to the lowest number,
+        // so sibling loops of the same depth stay in their old order.
         while free < n && placed[free] {
             free += 1;
         }
         if free >= n {
             break;
         }
-        b = free;
+        let mut best = free;
+        for i in (free + 1)..n {
+            if !placed[i] && depth[i] > depth[best] {
+                best = i;
+            }
+        }
+        b = best;
     }
     out
+}
+
+/// ROUND SPEED -- loop depth per block, over the NATURAL LOOPS.
+///
+/// `loop_depth` above answers the same question with an approximation: a
+/// back edge `u -> v` with `v <= u` counts the block NUMBERS `v..=u` one
+/// deeper. That is right whenever a loop body is numbered contiguously and
+/// wrong the moment it is not -- and `lower.rs` numbers an `if` inside a
+/// loop AFTER the block that follows the loop. `bench/firn/bytecount.fi`:
+///
+///     bb7:  brcond k < n, bb15, bb8      <- the loop head
+///     bb8:  ...                          <- the EXIT, but inside the outer loop
+///     bb14: br bb7                       <- the latch
+///     bb15: ...                          <- the body, numbered past the latch
+///
+/// The back edge is `bb14 -> bb7`, so the approximation counts `bb7..=bb14`
+/// and gives the body `bb15` depth 0 while the exit `bb8` gets 2 (it lies
+/// inside the outer pass loop as well). The layout of round 2 then picked
+/// the EXIT as the fallthrough -- exactly the case it was written to avoid,
+/// on the hottest loop of that benchmark.
+///
+/// This one asks the definition instead: a back edge is an edge `b -> h`
+/// whose target dominates its source, and the natural loop belonging to it
+/// is `h` plus everything that reaches `b` without passing `h`
+/// (`licm.rs` uses the same one). Every block of that body counts one
+/// deeper.
+///
+/// It is used by the block layout alone -- a wrong number here can cost a
+/// jump, never correctness. The existing `loop_depth` stays untouched: the
+/// register allocator reads it, and changing what the allocator sees is a
+/// different round from changing where the blocks are printed.
+fn layout_depth(f: &Func) -> Vec<u32> {
+    let n = f.blocks.len();
+    let mut d = vec![0u32; n];
+    if n < 2 || n > 1024 {
+        return d;
+    }
+    // The same cheap pre-check `licm.rs` uses: if every edge goes strictly
+    // forward the graph is acyclic and there is no natural loop to find.
+    let any_backward = f
+        .blocks
+        .iter()
+        .enumerate()
+        .any(|(b, blk)| blk.term.successors().into_iter().any(|s| (s as usize) <= b));
+    if !any_backward {
+        return d;
+    }
+    if f.blocks.iter().enumerate().any(|(i, b)| b.id as usize != i) {
+        return d;
+    }
+    let preds = crate::mem2reg::preds(f);
+    let dom = crate::mem2reg::dominators(f);
+    let mut body = vec![false; n];
+    let mut stack: Vec<usize> = Vec::new();
+    for b in 0..n {
+        for s in f.blocks[b].term.successors() {
+            let h = s as usize;
+            if h >= n || !dom[b][h] {
+                continue;
+            }
+            body.iter_mut().for_each(|x| *x = false);
+            body[h] = true;
+            stack.clear();
+            if b != h {
+                body[b] = true;
+                stack.push(b);
+            }
+            while let Some(x) = stack.pop() {
+                for &p in &preds[x] {
+                    if !body[p] {
+                        body[p] = true;
+                        stack.push(p);
+                    }
+                }
+            }
+            for (i, inside) in body.iter().enumerate() {
+                if *inside {
+                    d[i] += 1;
+                }
+            }
+        }
+    }
+    d
+}
+
+/// ROUND SPEED -- which blocks get a `.p2align 4` in front of them.
+///
+/// The target of a BACKWARD edge in the block numbering. That is a superset
+/// of the real loop heads (a numbering that is not in reverse post order can
+/// have a backward edge without a loop), and a superset is exactly right
+/// here: aligning a block that is not a loop head wastes at most ten bytes,
+/// missing one costs a fetch window per iteration. No dominator matrix
+/// needed for that.
+///
+/// On with `FIRN_ALIGN_LOOPS=1` -- see `docs/ROUNDSPEED.md`, round 4:
+/// measured, it wins on one benchmark and loses on another.
+fn loop_entry_flags(f: &Func) -> Vec<bool> {
+    let n = f.blocks.len();
+    let mut out = vec![false; n];
+    if std::env::var_os("FIRN_ALIGN_LOOPS").is_none() {
+        return out;
+    }
+    for (b, blk) in f.blocks.iter().enumerate() {
+        for s in blk.term.successors() {
+            let h = s as usize;
+            if h < n && h <= b {
+                out[h] = true;
+            }
+        }
+    }
+    out
+}
+
+/// ROUND SPEED -- the magic number for an UNSIGNED division by `d`.
+///
+/// Hacker's Delight figure 10-3, written for `n` bits instead of 32.
+/// Yields `(m, add, s)`, to be used as
+///
+/// ```text
+///   q = mulhi(x, m) >> s                       (add == false)
+///   q = (((x - mulhi(x, m)) >> 1) + mulhi) >> (s - 1)   (add == true)
+/// ```
+///
+/// The `add` case exists because the exact magic number needs `n + 1` bits
+/// for some divisors; `m` is then the low `n` bits of it and the fixup adds
+/// the missing power of two back without ever overflowing.
+///
+/// Checked against Python's integer division for both widths over every
+/// divisor from 2 to 300 plus the edges, and for `d = 251` at 64 bits it
+/// yields 367465021388636487 -- the same constant `rustc` puts into
+/// `bench/rust/bytecount.rs`.
+fn magic_u(d: u128, n: u32) -> (u128, bool, u32) {
+    debug_assert!(n >= 8 && n <= 64 && d >= 2 && d < (1u128 << n));
+    let mask: u128 = (1u128 << n) - 1;
+    let half: u128 = 1u128 << (n - 1);
+    let mut a = false;
+    let neg_d = ((1u128 << n) - d) & mask;
+    let nc = mask - (neg_d % d);
+    let mut p = n - 1;
+    let two_p = 1u128 << p;
+    let mut q1 = two_p / nc;
+    let mut r1 = two_p - q1 * nc;
+    let mut q2 = (two_p - 1) / d;
+    let mut r2 = (two_p - 1) - q2 * d;
+    loop {
+        p += 1;
+        if r1 >= nc - r1 {
+            q1 = 2 * q1 + 1;
+            r1 = 2 * r1 - nc;
+        } else {
+            q1 *= 2;
+            r1 *= 2;
+        }
+        if r2 + 1 >= d - r2 {
+            if q2 >= half - 1 {
+                a = true;
+            }
+            q2 = 2 * q2 + 1;
+            r2 = 2 * r2 + 1 - d;
+        } else {
+            if q2 >= half {
+                a = true;
+            }
+            q2 *= 2;
+            r2 = 2 * r2 + 1;
+        }
+        let delta = d - 1 - r2;
+        if !(p < 2 * n && (q1 < delta || (q1 == delta && r1 == 0))) {
+            break;
+        }
+    }
+    ((q2 + 1) & mask, a, p - n)
+}
+
+/// ROUND SPEED -- the magic number for a SIGNED division by `d`
+/// (Hacker's Delight figure 10-1, generalised to `n` bits). Yields
+/// `(m, s)`; `m` is the two's complement bit pattern of an `n` bit signed
+/// number. Requires `|d| >= 2` and `|d| < 2^(n-1)`.
+fn magic_s(d: i128, n: u32) -> (u128, u32) {
+    debug_assert!(n >= 8 && n <= 64);
+    let mask: u128 = (1u128 << n) - 1;
+    let two: i128 = 1i128 << (n - 1);
+    let ad: i128 = d.abs();
+    let t: i128 = two + i128::from(d < 0);
+    let anc = t - 1 - t % ad;
+    let mut p = n - 1;
+    let mut q1 = two / anc;
+    let mut r1 = two - q1 * anc;
+    let mut q2 = two / ad;
+    let mut r2 = two - q2 * ad;
+    loop {
+        p += 1;
+        q1 *= 2;
+        r1 *= 2;
+        if r1 >= anc {
+            q1 += 1;
+            r1 -= anc;
+        }
+        q2 *= 2;
+        r2 *= 2;
+        if r2 >= ad {
+            q2 += 1;
+            r2 -= ad;
+        }
+        let delta = ad - r2;
+        if !(q1 < delta || (q1 == delta && r1 == 0)) {
+            break;
+        }
+    }
+    let m = if d < 0 { -(q2 + 1) } else { q2 + 1 };
+    ((m as u128) & mask, p - n)
+}
+
+/// `n` bit two's complement read as a signed number.
+fn as_signed(v: u128, n: u32) -> i128 {
+    let m = 1u128 << (n - 1);
+    if v & m != 0 {
+        (v as i128) - (1i128 << n)
+    } else {
+        v as i128
+    }
+}
+
+/// ROUND SPEED -- `a / k` and `a % k` for a CONSTANT `k`, without `div`.
+///
+/// `div r64` costs some 14 to 47 cycles on this processor and blocks the
+/// divider while it runs; a multiplication costs three. `bench/firn/
+/// bytecount.fi` fills its 16 MiB buffer with `i % 251` -- 16.7 million
+/// divisions in one loop, and `rustc` does not emit a single `div` for it.
+///
+/// Yields `false` when this path does not apply; the caller then emits the
+/// `div` it always did. Refused: `k == 0` (the program is supposed to trap),
+/// `k == 1` / `k == -1` (nothing to compute, and `-1` is the `MIN / -1`
+/// special case) and anything wider than 64 bits.
+///
+/// Registers: `rax`, `rcx` and `rdx` only, exactly like the `div` path, so
+/// `inst_clobbers` (which says `M_RDX` for both `Bin(Div|Rem)` and
+/// `CheckedDiv`) stays right. The dividend is fetched into `rcx` ONCE, at
+/// the top, and `mul`/`imul` leave `rcx` alone -- so nothing is ever read
+/// from its home again after `rdx` has been overwritten.
+fn emit_div_const(
+    e: &mut Emitter,
+    ra: &Ra,
+    op: BinOp,
+    ty: FTy,
+    a: Val,
+    k: i64,
+    d: Val,
+) -> bool {
+    if ty.is_float() || ty.bits() > 64 {
+        return false;
+    }
+    let bits = if ty.bits() > 32 { 64 } else { 32 };
+    let rem = op == BinOp::Rem;
+    let ra_w = |r: &str| rn(r, bits);
+    if ty.signed() {
+        let k = k as i128;
+        if k == 0 || k == 1 || k == -1 || k.abs() >= (1i128 << (bits - 1)) {
+            return false;
+        }
+        let (m, sh) = magic_s(k, bits);
+        let ms = as_signed(m, bits);
+        ra.load_ext(e, "rcx", a, ty, bits);
+        e.line(&format!("mov {}, {}", ra_w("rax"), m));
+        e.line(&format!("imul {}", ra_w("rcx")));
+        if k > 0 && ms < 0 {
+            e.line(&format!("add {}, {}", ra_w("rdx"), ra_w("rcx")));
+        } else if k < 0 && ms > 0 {
+            e.line(&format!("sub {}, {}", ra_w("rdx"), ra_w("rcx")));
+        }
+        if sh > 0 {
+            e.line(&format!("sar {}, {}", ra_w("rdx"), sh));
+        }
+        // + 1 if the quotient came out negative (round towards zero)
+        e.line(&format!("mov {}, {}", ra_w("rax"), ra_w("rdx")));
+        e.line(&format!("shr {}, {}", ra_w("rax"), bits - 1));
+        e.line(&format!("add {}, {}", ra_w("rdx"), ra_w("rax")));
+        if rem {
+            e.line(&format!("mov {}, {}", ra_w("rax"), ra_w("rcx")));
+            e.line(&format!("imul {}, {}, {}", ra_w("rdx"), ra_w("rdx"), k as i64));
+            e.line(&format!("sub {}, {}", ra_w("rax"), ra_w("rdx")));
+            ra.store_dst(e, d, "rax");
+        } else {
+            ra.store_dst(e, d, "rdx");
+        }
+        return true;
+    }
+    // unsigned
+    let ku = (k as u64) as u128 & ((1u128 << bits) - 1);
+    if ku < 2 {
+        return false;
+    }
+    let (m, add, sh) = magic_u(ku, bits);
+    ra.load_ext(e, "rcx", a, ty, bits);
+    e.line(&format!("mov {}, {}", ra_w("rax"), m));
+    e.line(&format!("mul {}", ra_w("rcx")));
+    // rdx = high word, rcx = the dividend, still untouched
+    if rem {
+        e.line(&format!("mov {}, {}", ra_w("rax"), ra_w("rcx")));
+    }
+    let q = if add {
+        e.line(&format!("sub {}, {}", ra_w("rcx"), ra_w("rdx")));
+        e.line(&format!("shr {}, 1", ra_w("rcx")));
+        e.line(&format!("add {}, {}", ra_w("rcx"), ra_w("rdx")));
+        if sh > 1 {
+            e.line(&format!("shr {}, {}", ra_w("rcx"), sh - 1));
+        }
+        "rcx"
+    } else {
+        if sh > 0 {
+            e.line(&format!("shr {}, {}", ra_w("rdx"), sh));
+        }
+        "rdx"
+    };
+    if rem {
+        if q != "rcx" {
+            e.line(&format!("mov {}, {}", ra_w("rcx"), ra_w(q)));
+        }
+        let imm = if bits == 32 { (ku as u32 as i32) as i64 } else { ku as i64 };
+        e.line(&format!("imul {}, {}, {}", ra_w("rcx"), ra_w("rcx"), imm));
+        e.line(&format!("sub {}, {}", ra_w("rax"), ra_w("rcx")));
+        ra.store_dst(e, d, "rax");
+    } else {
+        ra.store_dst(e, d, q);
+    }
+    true
 }
 
 /// Is `s` a 64-bit machine register name (and therefore an operand whose
@@ -3108,6 +3516,16 @@ fn emit_inst(
         }
         Op::CheckedDiv { op, a, b, msg_zero, msg_range } => {
             let d = i.dst.ok_or("internal error: checked division without target")?;
+            // ROUND SPEED -- a CONSTANT divisor makes both checks dead.
+            // `b == 0` is decided at compile time, and the signed special
+            // case `MIN / -1` needs `b == -1`; `emit_div_const` refuses both
+            // constants, so reaching it means neither check can ever fire.
+            // What is left is the division, and it does not need `div`.
+            if let Some(k) = ra.a.imm(*b) {
+                if emit_div_const(e, ra, *op, ty, *a, k, d) {
+                    return Ok(());
+                }
+            }
             ra.load_ext(e, "rax", *a, ty, 64);
             ra.load_ext(e, "rcx", *b, ty, 64);
             crate::panic_rt::emit_checked_div(e, *op, ty, msg_zero, msg_range, site, &|e: &mut Emitter| {
@@ -3201,6 +3619,24 @@ fn emit_inst(
                 e.line(&format!("cmp {}, 0", o));
                 e.line("setne al");
                 e.line("movzx eax, al");
+            } else if let Loc::Reg(dr) = ra.a.loc(d) {
+                // ROUND SPEED -- straight into the target register.
+                //
+                // Every conversion used to go `mov rax, <src>` and then
+                // `mov <dst>, rax`, two instructions for what is one move
+                // or one `movzx`. `Op::Load` has taken the direct route
+                // since round 51; the conversion right next to it did not.
+                // `bench/firn/bytecount.fi`, the fill loop, had
+                // `mov r10, rax / mov rax, r10 / mov r11, rax` in it --
+                // three moves where one belongs.
+                //
+                // Reading the source and writing the target in one
+                // instruction is safe even when they are the same register:
+                // x86 reads the operands before it writes the result, and
+                // `load_ext` emits nothing at all when source and target
+                // already agree.
+                ra.load_ext(e, dr, *src, *from, 64);
+                return Ok(());
             } else {
                 ra.load_ext(e, "rax", *src, *from, 64);
             }
@@ -3795,6 +4231,12 @@ fn emit_bin(
             ra.store_dst(e, d, "rax");
         }
         BinOp::Div | BinOp::Rem => {
+            // ROUND SPEED -- dividing by a CONSTANT without `div`.
+            if let Some(k) = ra.a.imm(b) {
+                if emit_div_const(e, ra, op, ty, a, k, d) {
+                    return Ok(());
+                }
+            }
             ra.load_ext(e, "rax", a, ty, bits);
             ra.load_ext(e, "rcx", b, ty, bits);
             if ty.signed() {
