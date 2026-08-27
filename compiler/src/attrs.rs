@@ -85,6 +85,13 @@ pub const ATTRS: &[AttrInfo] = &[
         what: "interrupt entry point: save all registers, iretq (SPEC 2)",
     },
     AttrInfo {
+        name: "arch",
+        target: Target::Func,
+        args: 1,
+        implemented: true,
+        what: "this definition belongs to one machine: #[arch(x86_64)] / #[arch(aarch64)] (archsel.rs)",
+    },
+    AttrInfo {
         name: "link_name",
         target: Target::Func,
         args: 1,

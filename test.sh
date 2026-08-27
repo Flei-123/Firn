@@ -165,6 +165,15 @@
 #      aarch64-linux-gnu-gcc in both directions past the end of the
 #      register file (tools/aarch64/machine.sh). What aarch64 cannot do is
 #      counted and named, not filtered out.
+#  65. FREESTANDING TARGETS (tools/freestanding/none.sh, round
+#      ARM-FREESTANDING): `--target=x86_64-none` and `--target=aarch64-none`
+#      -- no operating system underneath. The x86 build has to stay OCTET
+#      IDENTICAL to the plain `profile kernel` build, and both images have
+#      to BOOT in QEMU and say something over the serial line.
+#  66. The two system call tables (tools/aarch64/syscall_table.sh, round
+#      ARM-FREESTANDING): `compiler/src/syscalls.rs` against
+#      `lib/firnc1/syscalls.fi`, the latter read out of a running program
+#      built by both compilers.
 #  44. Checked integer arithmetic (tools/checked/run.sh, round 72): a
 #      program that goes out of range ABORTS in dev/dev-fast/release-safe
 #      and WRAPS in release-fast -- in BOTH compilers, with the same
@@ -1074,6 +1083,41 @@ for stage in "" "--no-opt"; do
         grep -E '^  DIFF |^FAIL' "$WORK/a64_run.$tag.log" | head -10 | sed 's/^/   /'
     fi
 done
+
+echo "== 65. FREESTANDING TARGETS: no operating system underneath (ROUND ARM-FREESTANDING) =="
+# `--target=x86_64-none` and `--target=aarch64-none`. The two sharp claims
+# are checked and not asserted:
+#   * the x86 path does not change -- `--target=x86_64-none` and the plain
+#     build of a `profile kernel` source produce the SAME OCTETS;
+#   * both images BOOT. qemu-system-x86_64 -kernel and
+#     qemu-system-aarch64 -M virt, and the serial output is compared.
+# In between: the object file is ET_REL with no undefined name except the
+# two the kernel author owes it, `syscall` and `profile app` are refused
+# with a message that names the target, and `eret`/`mrs`/`msr` plus the
+# interrupt register save are really in the machine code (round 80 could
+# produce none of them).
+bash tools/freestanding/none.sh > "$WORK/none.log" 2>&1 && NRC=0 || NRC=$?
+if [ "$NRC" -eq 0 ]; then
+    ok
+    grep -E '^(FREESTANDING TARGETS|SKIP)' "$WORK/none.log" | sed 's/^/ /'
+else
+    bad "tools/freestanding/none.sh failed (see .test-work/none.log)"
+    grep -E '^  FAIL' "$WORK/none.log" | head -10 | sed 's/^/   /'
+fi
+
+echo "== 66. the two system call tables agree (ROUND ARM-FREESTANDING) =="
+# `compiler/src/syscalls.rs` (in use since round 80) and
+# `lib/firnc1/syscalls.fi` (new, and without a caller until firnc1 can
+# generate A64). The Firn one is read out of a RUNNING program built by both
+# compilers, so a table that drifts is caught the day it drifts.
+bash tools/aarch64/syscall_table.sh > "$WORK/systab.log" 2>&1 && SRC0=0 || SRC0=$?
+if [ "$SRC0" -eq 0 ]; then
+    ok
+    grep -E '^(SYSCALL TABLES|  \(firnc1)' "$WORK/systab.log" | sed 's/^/ /'
+else
+    bad "tools/aarch64/syscall_table.sh failed (see .test-work/systab.log)"
+    grep -E '^  FAIL' "$WORK/systab.log" | head -10 | sed 's/^/   /'
+fi
 
 echo "== 44. checked integer arithmetic (tools/checked/run.sh, ROUND 72) =="
 # SPEC section 13, item L9. The number 44 and not 40: round 72 took 40 while
