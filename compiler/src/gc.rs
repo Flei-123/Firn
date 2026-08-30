@@ -1279,7 +1279,7 @@ pub(crate) fn ty_table_asm() -> String {
     let mut out = String::new();
     REG.with(|r| {
         let reg = r.borrow();
-        let _ = writeln!(out, ".section .rodata");
+        let _ = writeln!(out, "{}", crate::target::rodata_section());
         let _ = writeln!(out, "{}", crate::target::align(8));
         let _ = writeln!(out, "{}:", TABLE_LABEL);
         let _ = writeln!(out, "    .quad {}", reg.classes.len());

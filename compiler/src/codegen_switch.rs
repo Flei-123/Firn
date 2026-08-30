@@ -161,7 +161,10 @@ fn emit_table(
     e.line("jmp qword ptr [rdx + rax*8]");
 
     // table in .rodata; missing labels point to the default branch.
-    e.raw(".section .rodata");
+    // ROUND ANDROID: a jump table is a list of ADDRESSES, so on a
+    // position independent target it may not stay in `.rodata`
+    // (`target::rodata_section`).
+    e.raw(crate::target::rodata_section());
     e.raw(".align 8");
     e.raw(&format!("{}:", label));
     let mut i = 0usize;

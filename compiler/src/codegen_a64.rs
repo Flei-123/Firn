@@ -93,6 +93,35 @@ pub(crate) const B: &str = "x10";
 const C: &str = "x11";
 /// addresses only — never a value
 const ADDR: &str = "x12";
+
+/// **ROUND ANDROID — where the thread control block lives on Android.**
+///
+/// Firn keeps the pointer to its thread control block in the THREAD
+/// POINTER: `arch_prctl(ARCH_SET_FS, p)` on x86-64, `msr tpidr_el0, p`
+/// here (`syscalls.rs`, `SetThreadPointer`). The collector reads it back
+/// with `__thread_tcb` (lib/gc/gc.fi), so every garbage collected program
+/// writes that register once at start-up.
+///
+/// On Android that register is not free. `tpidr_el0` points at Bionic's
+/// own thread structure, and `errno`, the stack protector cookie
+/// `__stack_chk_guard` and every thread local of the C library are read
+/// through it. A Firn program that overwrote it would work for as long as
+/// it called nothing of Bionic's -- and would take an app down the moment
+/// it did, because a `.so` runs inside somebody else's thread.
+///
+/// So on Android the block is kept in a word of its own instead. That is
+/// exact and not a compromise: threads are refused on this target
+/// (`Op::ThreadSpawn`), one process has one thread control block, and a
+/// global word says the same thing as a per-thread register when there is
+/// one thread. Bionic's register stays untouched.
+const ANDROID_TCB: &str = "__firn_android_tcb";
+
+/// The label and the text of the run time refusal of `Op::ThreadSpawn` on
+/// Android (see there). A newline at the end, because it goes to the
+/// standard error output as it is.
+const ANDROID_NOTHREAD_MSG: &str = ".L__firn_android_nothreads";
+const ANDROID_NOTHREAD_TEXT: &str =
+    "firn: threads are not supported on aarch64-linux-android (the thread pointer belongs to Bionic) -- see docs/ZIEL-ANDROID.md\n";
 /// helper (large immediates, loop counters)
 const T1: &str = "x13";
 /// second helper (store status of the atomic loops)
@@ -492,7 +521,7 @@ pub fn emit(m: &Module) -> Result<String, String> {
     if crate::prof::is_kernel() {
         return Err(format!(
             "--target={} does not support the kernel profile yet (round 80)",
-            crate::target::Target::Aarch64.name()
+            crate::target::active().name()
         ));
     }
     // ROUND 83: `Emitter` is the x86 file's struct and grew an xmm value
@@ -514,6 +543,38 @@ pub fn emit(m: &Module) -> Result<String, String> {
     // and `__cpu_features()` answers it.
     e.raw(".arch armv8-a+crypto+crc");
     e.raw(".text");
+    // ROUND ANDROID. Three forms come out of this one code generator, and
+    // they differ ONLY here, in the twenty instructions around `main`:
+    //
+    //   * `aarch64-linux`          -- own `_start`, own `exit` system call,
+    //                                 no C library at all (rounds 80-91).
+    //   * `aarch64-linux-android`  -- NO `_start`. Bionic's
+    //                                 `crtbegin_dynamic.o` brings it, sets
+    //                                 the C library up and calls `main`.
+    //   * `aarch64-linux-android --shared`
+    //                             -- no entry point whatsoever. A library
+    //                                 is entered through its exported
+    //                                 functions, and that is the form an
+    //                                 Android app loads (`System.loadLibrary`).
+    //
+    // Everything below this block — every function body, every
+    // instruction selection, every register — is the same text for all
+    // three. That is the claim of the round: Android is a linking target,
+    // not a machine.
+    let android = crate::target::active().is_android();
+    let shared = crate::target::shared();
+    // ROUND 91: the auxiliary vector. `_start` keeps the initial `sp` so
+    // that `__cpu_features()` can read AT_HWCAP out of it. On Android
+    // there is no own `_start` to keep it in — and there is no need
+    // either: Bionic has `getauxval(3)`, and `simd_a64.rs` calls it there.
+    let auxv = !android && crate::simd_a64::needs_auxv(m);
+    if shared {
+        // Nothing. A `.so` has no entry point; `crtbegin_so.o` carries
+        // the `.note.android.ident` and the `__dso_handle` the loader
+        // wants, and the exported functions are the entry points.
+    } else if android {
+        emit_android_entry(&mut e, m)?;
+    } else {
     e.raw(".globl _start");
     e.raw("_start:");
     // At process start `sp` points at [argc][argv0]...[0][envp...]. That
@@ -526,7 +587,6 @@ pub fn emit(m: &Module) -> Result<String, String> {
     // ROUND 91: the auxiliary vector, BEFORE anything else. `sp` still
     // points at it here; four instructions keep the pointer so that
     // `__cpu_features()` can read AT_HWCAP later (simd_a64.rs).
-    let auxv = crate::simd_a64::needs_auxv(m);
     if auxv {
         crate::simd_a64::emit_auxv_save(&mut e);
     }
@@ -543,8 +603,10 @@ pub fn emit(m: &Module) -> Result<String, String> {
     e.line("mov x8, #93"); // exit(2) — 60 on x86-64, 93 here
     e.line("svc #0");
     e.line("brk #0");
+    }
 
-    if !m.funcs.iter().any(|f| f.name == "main") {
+    // A library needs no entry point; a program does, on every target.
+    if !shared && !m.funcs.iter().any(|f| f.name == "main") {
         return Err("no entry point: 'fn main() -> i32' is missing".to_string());
     }
     for f in &m.funcs {
@@ -580,8 +642,76 @@ pub fn emit(m: &Module) -> Result<String, String> {
     if auxv {
         e.raw(&crate::simd_a64::auxv_data_asm());
     }
+    // ROUND ANDROID: the word that holds the thread control block on this
+    // target (see `ANDROID_TCB`). Eight octets in `.bss`, so it costs a
+    // program that never allocates nothing but a line in the file.
+    if android {
+        e.raw(&format!(
+            ".section .bss,\"aw\",@nobits\n{}\n{}:\n    .zero 8\n.text\n",
+            crate::target::align(8),
+            ANDROID_TCB
+        ));
+        e.raw(&format!(
+            "{}\n{}:\n    .ascii \"{}\"\n.text\n",
+            crate::target::rodata_section(),
+            ANDROID_NOTHREAD_MSG,
+            ANDROID_NOTHREAD_TEXT.replace('\n', "\\n")
+        ));
+    }
     e.raw(".section .note.GNU-stack,\"\",%progbits");
     Ok(e.out)
+}
+
+/// **ROUND ANDROID — the adapter between Bionic's `main` and Firn's.**
+///
+/// On the two Linux targets Firn's entry point IS the symbol `main` and it
+/// is called by Firn's own `_start` with ONE argument: the pointer to the
+/// initial stack block `[argc][argv...][0][envp...]`. `fn main(start: u64)`
+/// reads its command line out of it, and `modules::ENTRY_SYMBOL` says so.
+///
+/// On Android the symbol `main` belongs to somebody else. Bionic's
+/// `crtbegin_dynamic.o` defines `_start`, hands the stack block to
+/// `__libc_init`, which sets the C library up and then calls
+///
+/// ```text
+/// int main(int argc, char** argv, char** envp)
+/// ```
+///
+/// with the C signature — argc in `x0`, argv in `x1`. That is not what a
+/// Firn `main` expects, so on this target `modules::symbol` gives the Firn
+/// entry point the name `__firn_main` and the symbol `main` becomes the
+/// four instructions below.
+///
+/// The conversion is exact and not an approximation: `argv` points at the
+/// FIRST element of the argument vector inside the very stack block the
+/// kernel wrote, and `argc` sits one word below it. `argv - 8` is therefore
+/// literally the pointer `_start` would have passed on. A Firn program
+/// reads its command line on Android out of the same place as on Linux.
+fn emit_android_entry(e: &mut Emitter, _m: &Module) -> Result<(), String> {
+    e.raw("// ROUND ANDROID: Bionic calls main(argc, argv, envp); Firn's");
+    e.raw("// entry point wants the stack block, and argv-8 IS that block.");
+    e.raw(".globl main");
+    e.raw(".type main, %function");
+    e.raw("main:");
+    e.line("stp x29, x30, [sp, #-32]!");
+    e.line("mov x29, sp");
+    // x19 is callee saved, so it survives the collector's start-up call.
+    e.line("str x19, [sp, #16]");
+    e.line("sub x19, x1, #8");
+    // HOOK gc (ROUND 88): the collector starts itself here too.
+    if crate::gc::runtime_active() {
+        e.line(&format!("bl {}", label(crate::gc::FN_INIT)));
+    }
+    e.line("mov x0, x19");
+    e.line(&format!("bl {}", label("main")));
+    // The exit code is 32 bit; Bionic passes it on to `exit(2)`.
+    e.line("mov w0, w0");
+    e.line("ldr x19, [sp, #16]");
+    e.line("ldp x29, x30, [sp], #32");
+    e.line("ret");
+    e.raw(".size main, .-main");
+    e.raw("");
+    Ok(())
 }
 
 fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
@@ -594,6 +724,16 @@ fn emit_func(e: &mut Emitter, f: &Func) -> Result<(), String> {
     let fr = layout(f);
     e.raw("");
     e.raw(&format!(".globl {}", label(&f.name)));
+    // ROUND ANDROID: a function in a shared library has to SAY that it is
+    // a function. Without `%function` the entry lands in `.dynsym` as
+    // NOTYPE; `dlsym` still finds it, but every Android tool that reads the
+    // table -- and the loader's own branch-target checks on newer devices
+    // -- expects STT_FUNC. It is written only on this target, because on
+    // the other two the emitted text is compared octet for octet against
+    // its predecessor (`tools/repro`).
+    if crate::target::active().is_android() {
+        e.raw(&format!(".type {}, %function", label(&f.name)));
+    }
     e.raw(&format!("{}:", label(&f.name)));
     e.line("stp x29, x30, [sp, #-16]!");
     e.line("mov x29, sp");
@@ -776,7 +916,7 @@ fn emit_switch(e: &mut Emitter, f: &Func, fr: &Frame, term: &Term) -> Result<(),
     e.line(&format!("add {}, {}, :lo12:{}", ADDR, ADDR, lbl));
     e.line(&format!("ldr {}, [{}, {}, lsl #3]", B, ADDR, A));
     e.line(&format!("br {}", B));
-    e.raw(".section .rodata");
+    e.raw(crate::target::rodata_section());
     e.raw(&crate::target::align(8));
     e.raw(&format!("{}:", lbl));
     let mut i = 0usize;
@@ -1155,7 +1295,74 @@ fn emit_inst(
             store_dst(e, fr, d, A);
         }
         Op::ThreadSpawn { arg, stack, ctid } => {
+            // ROUND ANDROID -- and this is a REFUSAL, not an oversight.
+            //
+            // A Firn thread is a raw `clone(2)` plus one instruction:
+            // `msr tpidr_el0, p` puts the thread control block into the
+            // thread pointer register (`thread.rs`, `syscalls.rs`
+            // `SetThreadPointer`). On the two Linux targets that register
+            // belongs to Firn, because nobody else is in the process.
+            //
+            // On Android it belongs to BIONIC. `tpidr_el0` points at
+            // Bionic's own `pthread_internal_t`; `errno`, the stack
+            // protector cookie `__stack_chk_guard` and every thread local
+            // of the C library are read through it. Writing our own block
+            // there does not merely lose Bionic's -- it makes the next
+            // libc code in that thread read a Firn structure as if it were
+            // Bionic's, and the process dies with a segmentation fault.
+            // That is measured, not feared: tests/860, /861, /862 and
+            // /1600 die with signal 11 when this branch emits code.
+            //
+            // The way out is not a trick with the register. It is calling
+            // `pthread_create` through `extern fn`, and that is a round of
+            // its own (docs/ZIEL-ANDROID.md, "what is missing"). Until
+            // then the compiler says so and emits nothing.
             let d = i.dst.ok_or("internal error: spawn without target")?;
+            // ROUND ANDROID -- and this is a REFUSAL, not an oversight.
+            //
+            // A Firn thread is a raw `clone(2)` plus one instruction: the
+            // child puts its own thread control block into the thread
+            // pointer (`thread.rs`, `syscalls.rs` `SetThreadPointer`). On
+            // the two Linux targets that register belongs to Firn, because
+            // nobody else is in the process.
+            //
+            // On Android it belongs to BIONIC. `tpidr_el0` points at
+            // Bionic's `pthread_internal_t`; `errno`, the stack protector
+            // cookie `__stack_chk_guard` and every thread local of the C
+            // library are read through it. A child that overwrites it dies
+            // in the first libc call, and it does so far from the cause --
+            // measured: tests/860, /861, /862 and /1600 took signal 11.
+            //
+            // The refusal cannot be made at COMPILE time, and that is worth
+            // saying out loud: `Op::ThreadSpawn` is in the module of every
+            // garbage collected program, because the collector's runtime
+            // (lib/gc/gc.fi) carries `thread_start` whether the program
+            // calls it or not. Refusing the instruction would refuse
+            // two thirds of the corpus for code none of it runs. So the
+            // refusal stands where the program REALLY starts a thread: at
+            // run time, loudly, on the standard error output, with an exit
+            // code -- never a thread that half exists.
+            //
+            // The way out is not a trick with the register. It is
+            // `pthread_create` through `extern fn`, and that is a round of
+            // its own (docs/ZIEL-ANDROID.md, "what is missing").
+            if crate::target::active().is_android() {
+                e.raw("    // ROUND ANDROID: a Firn thread would take Bionic's thread");
+                e.raw("    // pointer away from it. Say so and stop.");
+                e.line(&format!("adrp {}, {}", A, ANDROID_NOTHREAD_MSG));
+                e.line(&format!("add {}, {}, :lo12:{}", A, A, ANDROID_NOTHREAD_MSG));
+                e.line("mov x0, #2"); // the standard error output
+                e.line(&format!("mov x1, {}", A));
+                e.line(&format!("mov x2, #{}", ANDROID_NOTHREAD_TEXT.len()));
+                e.line("mov x8, #64"); // write(2)
+                e.line("svc #0");
+                e.line("mov x0, #70");
+                e.line("mov x8, #94"); // exit_group(2)
+                e.line("svc #0");
+                e.line(&format!("mov {}, xzr", A));
+                store_dst(e, fr, d, A);
+                return Ok(());
+            }
             load_full(e, fr, "x0", *arg);
             load_full(e, fr, "x1", *stack);
             load_full(e, fr, "x2", *ctid);
@@ -1170,7 +1377,17 @@ fn emit_inst(
             // the register is 0 — the same starting value `fs` has, which is
             // what `__thread_tcb` in lib/gc/gc.fi checks for.
             let d = i.dst.ok_or("internal error: threadself without target")?;
-            e.line(&format!("mrs {}, tpidr_el0", A));
+            if crate::target::active().is_android() {
+                // ROUND ANDROID: out of our own word, not out of Bionic's
+                // thread pointer (see `ANDROID_TCB`). Zero before anything
+                // set it -- the same starting value the register has, which
+                // is what `__thread_tcb` in lib/gc/gc.fi checks for.
+                e.line(&format!("adrp {}, {}", A, ANDROID_TCB));
+                e.line(&format!("add {}, {}, :lo12:{}", A, A, ANDROID_TCB));
+                e.line(&format!("ldr {}, [{}]", A, A));
+            } else {
+                e.line(&format!("mrs {}, tpidr_el0", A));
+            }
             store_dst(e, fr, d, A);
         }
         Op::CopyMem { dst, src, size } => {
@@ -1310,7 +1527,14 @@ fn emit_syscall(e: &mut Emitter, fr: &Frame, i: &Inst, args: &[Val]) -> Result<(
             }
         }
         load_full(e, fr, A, given[1]);
-        e.line(&format!("msr tpidr_el0, {}", A));
+        if crate::target::active().is_android() {
+            load_full(e, fr, B, given[1]);
+            e.line(&format!("adrp {}, {}", A, ANDROID_TCB));
+            e.line(&format!("add {}, {}, :lo12:{}", A, A, ANDROID_TCB));
+            e.line(&format!("str {}, [{}]", B, A));
+        } else {
+            e.line(&format!("msr tpidr_el0, {}", A));
+        }
         if let Some(d) = i.dst {
             e.line(&format!("mov {}, xzr", A));
             store_dst(e, fr, d, A);

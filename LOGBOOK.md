@@ -325,3 +325,65 @@ MEASUREMENTS: test.sh section 62 = tools/paintb3/run.sh -- three build stages of
 font against fontTools and against the second rasteriser, PNG both ways against Pillow, seven own cases
 byte-identical in all three stages against a frozen picture, the text-fit check with its counter-check,
 the 541 reference pairs, limits in tools/paintb3/minquota.txt. english 0 0 0 0 0.
+
+## ROUND ANDROID -- `aarch64-linux-android`, the third target
+
+THE THIRD TARGET IS NOT A THIRD MACHINE. `aarch64-linux-android` shares the whole code generator, the
+whole calling convention and every instruction with `aarch64-linux`; `Target::arch()` is the line that
+says so, and the instruction selection in `codegen_a64.rs` did not grow by one case. What is different
+is what a LINKER decides: Bionic instead of glibc, `crtbegin_dynamic.o` instead of nothing,
+`/system/bin/linker64` instead of the kernel, PIE instead of a fixed address, an API level that has to
+be chosen -- and, for an app, a SHARED LIBRARY instead of a program. `compiler/src/android.rs` (473
+lines) holds all of it and contains no assembly.
+
+THE BUG THAT ONLY A REAL LOADER FINDS: 105 of 309 cases died with `CANNOT LINK EXECUTABLE: text
+relocations (DT_TEXTREL)`. Firn puts jump tables, the collector's type table, the interface method
+tables and the function records into `.rodata`, and some of those words are ADDRESSES. In a fixed
+address executable the linker writes them down; in a position independent one the loader has to add the
+load address, and a read-only section cannot take that. glibc's loader shrugs and does it anyway.
+Android's REFUSES. `target::rodata_section()` sends those blocks to `.data.rel.ro` on Android -- writable
+while relocating, read-only after (`-z relro`), so the promise of an immutable `static` is kept. The
+number went from SAME 191 / DIFFERENT 109 to SAME 295 / DIFFERENT 0.
+
+`main` BELONGS TO BIONIC. `crtbegin_dynamic.o` defines `_start`, sets the C library up and calls a `main`
+with the C signature. Firn's entry point wants the stack block instead, so on this target it is named
+`__firn_main` and the symbol `main` becomes four instructions -- `argv - 8` IS the block the kernel
+wrote, exactly, not approximately.
+
+THE THREAD POINTER BELONGS TO BIONIC TOO, and that one could not be fixed, only told the truth about.
+`tpidr_el0` carries Bionic's `pthread_internal_t`; `errno` and `__stack_chk_guard` are read through it.
+Firn's own thread control block therefore lives in a word of its own on Android and Bionic's register is
+never touched -- which is exact, because threads are refused on this target. The refusal could NOT be
+made while compiling: `Op::ThreadSpawn` is in the module of every garbage collected program, because
+the collector's runtime carries `thread_start` whether the program calls it or not. So it stands where a
+thread would really start, at run time, on the standard error output, with exit code 70. Four cases
+reach it and say so; none of them dies with signal 11 any more.
+
+RUN, NOT BELIEVED. The emulator on this server holds one image and it is x86-64, so it cannot run an
+aarch64 artifact. Instead `qemu-aarch64` runs the programs against a REAL Bionic -- `linker64`,
+`libc.so`, `libm.so`, `libdl.so`, `liblog.so` pulled out of the `arm64-v8a` API 24 system image with
+`debugfs`, 3 MB kept out of a 306 MB download. And the point of the round: a Firn `.so`, a second Firn
+program linked against it, and ANDROID'S OWN LOADER putting the two together at run time.
+
+THE NDK COSTS 17 MB, not 2.6 GB. `tools/android/ndk_sysroot.py` reads the zip's central directory over
+HTTP range requests and fetches only the aarch64 Bionic sysroot of the wanted API levels. The disk had
+3.6 GB free and eleven other builds on it; an `sdkmanager` unpack was not an option and would not have
+been needed anyway -- Firn brings its own code generator and links with binutils.
+
+NOTHING THAT WAS GREEN MOVED, and that is checked in the sharp sense: `tools/android/unchanged.sh`
+compiles all 309 cases with the compiler from before the round and with the one from after, for
+`x86_64-linux` and for `aarch64-linux`, and compares the EMITTED ASSEMBLY octet for octet. 614 identical,
+0 changed, 0 changed acceptance. That is why `.type ... %function` and `.data.rel.ro` are written on the
+Android target only. Module tests 262 -> 275.
+
+`firnc1` DOES NOT COME ALONG, measured and not guessed: zero occurrences of `aarch64` in its 34,033
+lines, no `--target`, and `lib/firnc1/codegen.fi` says "FROM THE FIR TO x86-64" in its first line.
+Everything on this page is `firnc0`. The estimate for the second compiler is 3,000-3,500 lines of Firn
+(docs/ZIEL-ANDROID.md section 8) and it is only worth it when Firn is meant to compile itself ON a phone
+rather than FOR one.
+
+MEASUREMENTS: `tools/android/run.sh` -- 309 cases, SAME 295, NOT SUPPORTED 9 (4 inline assembler,
+5 threads), X86 ALREADY 4, AARCH64 ALREADY 1 (proven in the same run by building and running the gnu
+target), DIFFERENT 0; the shared library 3 of 3. `tools/android/unchanged.sh` -- 614 / 0 / 0. The same
+program: x86 6,648 octets, aarch64-linux 7,920, Android PIE 16,464, Android `.so` 16,096; a library with
+two exported functions 7,800.
