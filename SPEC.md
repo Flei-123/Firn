@@ -1491,15 +1491,17 @@ specification and the code do not drift apart.
     separate namespaces* (names of non-root modules are called `module__name`
     internally), **not** separate object files with interface files.
     **Round 48 -- the project system.** Added to that is the manifest
-    `firn.paket` (`paket`, `version`, `start`, `quelle`, `oeffentlich`,
-    `brauche`), a fixed search order (the importing file -> the root file ->
-    the project sources -> `brauche` dependencies -> `$FIRNLIB` ->
-    `<exe>/../lib`), **visibility at module level** through the `oeffentlich`
+    `firn.pkg` (`package`, `version`, `main`, `source`, `public`,
+    `needs`), a fixed search order (the importing file -> the root file ->
+    the project sources -> `needs` dependencies -> `$FIRNLIB` ->
+    `<exe>/../lib`), **visibility at module level** through the `public`
     list, detection of package cycles and of module name clashes, and the build
-    driver `firnc --paket <dir>`. Without a manifest **nothing** changes. It
-    stays with whole-program compilation: no separate object files, no network,
-    no lock file, no version resolution -- `W1` and ACCEPTANCE item 5 therefore
-    stay open (`docs/ROUND48.md`).
+    driver `firnc --package <dir>`. Without a manifest **nothing** changes. It
+    stays with whole-program compilation: no separate object files, no version
+    resolution beyond one rule -- `W1` therefore stays open
+    (`docs/ROUND48.md`). Round 93 added the lock file `firn.lock`; round
+    FIRNHUB added remote sources in `needs`, a content addressed cache and
+    the fetcher `firnpkg` (`docs/ROUND-FIRNHUB.md`).
 16. **Line numbers for the debugger (round 2, module `kern`).** The compiler
     writes `.file`/`.loc` directives; `as` produces `.debug_line` from them.
     Instruction-accurate lines exist **only without the optimizer**

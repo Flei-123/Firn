@@ -4,7 +4,7 @@
 In Firn stehen Zeichenketten als `var w: [u8; N] = "…"`. Die Laenge wird an
 der Aufrufstelle NOCH EINMAL als Zahl mitgegeben:
 
-    var mn: [u8; 13] = "firn.package\\0"
+    var mn: [u8; 9] = "firn.pkg\\0"
     join(out, wp, wn, (&mn[0]) as u64, 12)
 
 Beim Uebersetzen ins Englische aendert sich die Textlaenge — bleibt eine

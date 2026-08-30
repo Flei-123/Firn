@@ -173,7 +173,7 @@ fn usage() -> String {
          \n\
          Options:\n  \
          -o <path>          output file (default: input name without extension)\n  \
-         --package <dir>      compile the project from <dir>/firn.package\n  \
+         --package <dir>      compile the project from <dir>/firn.pkg\n  \
          --package-info <dir> read the manifest of <dir> and report\n  \
          --lock             write <dir>/firn.lock (only with --package)\n  \
          --locked           build only if firn.lock fits (only with --package)\n  \
@@ -461,14 +461,14 @@ fn run(opts: &Options) -> i32 {
                 }
             };
             let m = &w.packages[0].manifest;
-            if m.start.is_empty() {
+            if m.main.is_empty() {
                 eprintln!(
-                    "error: {}: the manifest has no entry point ('start <path>')",
+                    "error: {}: the manifest has no entry point ('main <path>')",
                     w.packages[0].manifestpfad
                 );
                 return 2;
             }
-            let start = PathBuf::from(package::join(dir, &m.start));
+            let start = PathBuf::from(package::join(dir, &m.main));
             let target = PathBuf::from(package::join(dir, &m.name));
             (w, start, Some(target))
         }

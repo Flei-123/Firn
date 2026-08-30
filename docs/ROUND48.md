@@ -5,10 +5,10 @@ and the environment variable `FIRNLIB`. Nothing more — no project manifest,
 no dependencies, no build tool. `ACCEPTANCE.md` item 5 (`W1`,
 „package management builds reproducibly") therefore stood at `[~]`.
 
-**What is there now:** a project manifest `firn.paket`, a fixed and
+**What is there now:** a project manifest `firn.pkg`, a fixed and
 deterministic module search order with error messages for cycles,
 missing packages and name conflicts, visibility at **module level** as
-a real package interface, and the build driver `--paket`. All of it in
+a real package interface, and the build driver `--package`. All of it in
 **both** compilers — `firnc0` (Rust) and `firnc1` (Firn) — with
 character-identical messages.
 
@@ -18,7 +18,7 @@ character-identical messages.
 
 The choice was between `firn.toml` and a format of our own. The decision
 went to a format of our own, deliberately tiny, a line format called
-**`firn.paket`**. The reasons, in order:
+**`firn.pkg`**. The reasons, in order:
 
 1. **Everything has to exist twice.** Firn hosts itself. Every line of
    manifest logic exists in `compiler/src/package.rs` (Rust) *and* in
@@ -39,7 +39,7 @@ went to a format of our own, deliberately tiny, a line format called
    anything else happens. It must not have surprising semantics.
 
 The price has to be named honestly: **there are no ready-made tools** for
-`firn.paket` (no editor highlighting, no library in other
+`firn.pkg` (no editor highlighting, no library in other
 languages). For a format of six keywords that is readable with `awk`,
 that is acceptable.
 
@@ -53,7 +53,7 @@ escapes** -- a value therefore contains neither spaces nor `#`.
 ```text
 package  demo            # mandatory, exactly once
 version  0.1.0           # mandatory, exactly once, number.number.number
-start    src/main.fi     # at most once; a library does not have one
+main     src/main.fi     # at most once; a library does not have one
 source   src             # 0..n; without one the manifest directory counts
 public   geo dot         # 0..n; without one everything is public
 needs    geo ../geo      # 0..n; name + local path
@@ -65,14 +65,14 @@ Rules that are really checked:
 |---|---|
 | `package` | identifier: letter or `_` first, then letters, digits, `_` |
 | `version` | exactly `number.number.number` |
-| `start`, `source` | relative, without `..`, not empty (a package stays in its directory) |
+| `main`, `source` | relative, without `..`, not empty (a package stays in its directory) |
 | `needs` | name like `package`; the path **may** lead outside (`../geo`) |
 | duplicate entries | error -- duplicate `source`, duplicate `public` names and duplicate dependency names included |
 | dependency has the same name as the package itself | error |
 | unknown key | **error**, not silently skipped -- a mistyped `publci` would otherwise open an interface nobody wanted to open |
 | name of the dependency != `package` line of the target | error |
 
-`start` is **not** mandatory: a library package has no
+`main` is **not** mandatory: a library package has no
 entry point. Only `--package` demands one.
 
 ## 3. Search order
@@ -100,7 +100,7 @@ directory of another one. Files outside all package roots (typically:
 everything from `$FIRNLIB`) belong to no package; for them steps 3 and 4
 and the visibility check are skipped.
 
-**The manifest itself** is, without `--paket`, looked for **upwards** from
+**The manifest itself** is, without `--package`, looked for **upwards** from
 the directory of the source file, at most 64 levels. If none is found, the
 „package world" is empty, steps 3 and 4 are skipped, and the resolution is
 character for character the one from round 47. **Without a manifest nothing
@@ -114,7 +114,7 @@ machine-dependent.
 
 ## 4. Visibility at module level
 
-`public a b c` in `firn.package` is the **interface of the package**.
+`public a b c` in `firn.pkg` is the **interface of the package**.
 If an import leads into a *different* package, the following applies:
 
 * The target package must be a registered dependency
@@ -163,8 +163,8 @@ firnc1 --package <directory> [-o target]      # the same, in Firn
 firnc1 --package-info <directory>
 ```
 
-`--package` reads `<directory>/firn.package`, loads all dependencies,
-checks the graph for cycles and compiles `start`. Without `-o` the
+`--package` reads `<directory>/firn.pkg`, loads all dependencies,
+checks the graph for cycles and compiles `main`. Without `-o` the
 result is named like the package:
 
 ```
@@ -183,7 +183,7 @@ $ firnc --package-info demos/packages/app
 package app
 version 0.1.0
 root demos/packages/app
-start demos/packages/app/src/main.fi
+main demos/packages/app/src/main.fi
 source demos/packages/app/src
 needs geo demos/packages/geo
 needs text demos/packages/text
@@ -200,14 +200,14 @@ this trap has hit this project three times already, in rounds 35, 45 and
 `demos/packages/` -- one program and two libraries:
 
 ```
-app/         firn.package  needs geo, needs text; source src
+app/         firn.pkg  needs geo, needs text; source src
              src/main.fi   import geo * import geo.dot * import text * import help
              src/help.fi   own module out of 'source src'
-geo/         firn.package  public geo dot   (NO start: a library)
+geo/         firn.pkg  public geo dot   (NO start: a library)
              src/geo.fi    public, uses 'inner' internally
              src/dot.fi    public
              src/inner.fi  PRIVATE -- cannot be imported from outside
-text/        firn.package  without 'public' -> everything is public
+text/        firn.pkg  without 'public' -> everything is public
              src/text.fi
 ```
 
@@ -216,30 +216,30 @@ text/        firn.package  without 'public' -> everything is public
 `tools/packages/run.sh` (new, in `test.sh` as step 18): **21 cases**,
 each through **both** compilers, error messages compared octet by
 octet. Positive: build of the example project (firnc0 and firnc1), output
-`12 14 3`, naming after the manifest, `--paket-info` equality, private
+`12 14 3`, naming after the manifest, `--package-info` equality, private
 module in the own package, precedence of the project source, manifest
-search upwards, second `quelle` directory, regression without a manifest.
-Negative: private module of a dependency, package without `brauche`,
+search upwards, second `source` directory, regression without a manifest.
+Negative: private module of a dependency, package without `needs`,
 package cycle, dependency without a manifest, wrong package name, invalid
-version, unknown key, missing `paket` line, name conflict, library without
-`start`, directory without a manifest, `--paket` together with a source
+version, unknown key, missing `package` line, name conflict, library without
+`main`, directory without a manifest, `--package` together with a source
 file.
 
 Plus **13 new Rust module tests** in `compiler/src/package.rs` (11) and
 `compiler/src/package_world.rs` (2): format, mandatory entries, duplicate
-entries, arity, path arithmetic, package membership, `--paket-info` text
+entries, arity, path arithmetic, package membership, `--package-info` text
 and the fixed error texts.
 
 ## 9. Migration notes
 
-* **Existing projects have to do nothing.** Without `firn.paket`
+* **Existing projects have to do nothing.** Without `firn.pkg`
   everything is as before; `FIRNLIB` applies unchanged and is still
   searched as step 5. `test.sh`, `tools/self_compare.sh` and
   `tools/fixpoint.sh` set `FIRNLIB` themselves and run unchanged.
-* **Converting a project:** put `firn.paket` into the root directory
-  (`paket`, `version`, `start`, `quelle`), register dependencies with
-  `brauche`, and write `oeffentlich` in every library. After that
-  `firnc --paket <verzeichnis>` builds.
+* **Converting a project:** put `firn.pkg` into the root directory
+  (`package`, `version`, `main`, `source`), register dependencies with
+  `needs`, and write `public` in every library. After that
+  `firnc --package <verzeichnis>` builds.
 * **Careful when converting:** as soon as a manifest exists, the name
   conflict and visibility checks take effect as well. Two modules of the
   same name in one compilation are then an error instead of a silent
@@ -251,7 +251,7 @@ and the fixed error texts.
 
 ## 10. Open (honestly)
 
-* **No network, no registry, no lock file.** `brauche` knows only
+* **No network, no registry, no lock file.** `needs` knows only
   local paths. Reproducibility across two machines (`ACCEPTANCE.md` item 5)
   is therefore **not yet** fulfilled; checksums and a
   `firn.sperre` are missing.

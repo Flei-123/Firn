@@ -602,7 +602,7 @@ else
 fi
 
 echo "== 18. package and project system (tools/packages/run.sh) =="
-# The manifest `firn.package`, the search order, visibility at module level and the
+# The manifest `firn.pkg`, the search order, visibility at module level and the
 # build driver `--package` -- every case through BOTH compilers, messages
 # compared octet for octet.
 bash tools/packages/run.sh > "$WORK/packages.log" 2>&1 && PKRC=0 || PKRC=$?

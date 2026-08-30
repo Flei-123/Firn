@@ -88,7 +88,7 @@ MIRROR="$TMPD/tree"
 mkdir -p "$MIRROR"
 # `.fi` plus the package manifests -- without them the module search in the
 # copy would not find the packages in demos/packages/.
-tar -chf - $(all_sources) $(find . -name 'firn.package' -not -path './.git/*' | sed 's|^\./||') \
+tar -chf - $(all_sources) $(find . -name 'firn.pkg' -not -path './.git/*' | sed 's|^\./||') \
     | tar -xf - -C "$MIRROR"
 ( cd "$MIRROR" && "$FMT" -w $(find . -name '*.fi') 2>/dev/null )
 mrc=$?
