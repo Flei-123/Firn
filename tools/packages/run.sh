@@ -433,8 +433,8 @@ if [ ! -f "$WORK/lock.0" ] || [ ! -f "$WORK/lock.1" ]; then
     bad "no lock file was written" "$(head -3 "$WORK/l0.log")" "$(head -3 "$WORK/l1.log")"
 elif ! cmp -s "$WORK/lock.0" "$WORK/lock.1"; then
     bad "the two lock files differ" "$(diff "$WORK/lock.0" "$WORK/lock.1" | head -4)"
-elif [ "$(head -1 "$WORK/lock.0")" != "lock 1" ]; then
-    bad "the first line is '$(head -1 "$WORK/lock.0")', expected 'lock 1'"
+elif [ "$(head -1 "$WORK/lock.0")" != "lock 2" ]; then
+    bad "the first line is '$(head -1 "$WORK/lock.0")', expected 'lock 2'"
 else
     good
 fi
@@ -624,7 +624,7 @@ check "a fifth word in 'needs' is reported"
 PA=$(kopie l_wish_extra)
 sed -i 's|^needs    geo   ../geo$|needs    geo   ../geo 0.3.0 x|' "$PA/app/firn.pkg"
 beide wishextra --package "$PA/app" -o "$WORK/wishextra.bin"
-expect_error wishextra "'needs' expects at most one version behind the path"
+expect_error wishextra "'needs' expects at most one version behind the source"
 
 # --- 35: the lock file that lies in the repository still fits ------------
 #

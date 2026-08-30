@@ -38,6 +38,10 @@ export {
     relative, build_path, str_less,
     world_version_ptr, world_root_ptr, world_mpath_ptr,
     world_dep_count, world_dep_target,
+    // ROUND FIRNHUB (remote sources, the cache, firn.have)
+    world_set_cache,
+    world_has_origin, world_origin_source_ptr, world_origin_res_ptr,
+    world_origin_content_ptr,
 }
 
 // "no entry" -- offsets into the string store would otherwise be valid.
@@ -529,6 +533,17 @@ struct World {
     last_name: u32,
     last_ver: u32,
     last_main: u32,
+
+    // ROUND FIRNHUB: the content addressed cache and what `firnpkg fetch`
+    // resolved (`firn.have`). `p_origin` points, per package, at the entry
+    // it came out of -- NONE means: a directory on this machine.
+    cache: rt.Buf,
+    h_name: Vec[u32],
+    h_source: Vec[u32],
+    h_res: Vec[u32],
+    h_content: Vec[u32],
+    p_origin: Vec[u32],
+    last_origin: u32,
 }
 
 fn world_new() -> World {
@@ -544,6 +559,10 @@ fn world_new() -> World {
         a_want: vec_new[u32](), a_target: vec_new[u32](), win: vec_new[u32](),
         color: vec_new[u32](), away: vec_new[u32](),
         last_name: NONE, last_ver: NONE, last_main: NONE,
+        cache: rt.buf_new(),
+        h_name: vec_new[u32](), h_source: vec_new[u32](),
+        h_res: vec_new[u32](), h_content: vec_new[u32](),
+        p_origin: vec_new[u32](), last_origin: NONE,
     }
 }
 
@@ -567,6 +586,12 @@ fn world_free(w: *mut World) {
     vec_free[u32](&(*w).a_name)
     vec_free[u32](&(*w).a_path)
     vec_free[u32](&(*w).a_line)
+    rt.buf_free(&(*w).cache)
+    vec_free[u32](&(*w).h_name)
+    vec_free[u32](&(*w).h_source)
+    vec_free[u32](&(*w).h_res)
+    vec_free[u32](&(*w).h_content)
+    vec_free[u32](&(*w).p_origin)
     vec_free[u32](&(*w).a_want)
     vec_free[u32](&(*w).a_target)
     vec_free[u32](&(*w).win)
@@ -651,6 +676,94 @@ fn fail_value(w: *mut World, mp: u64, mpn: usize, line: u32, front: u64, back: u
 fn value_set(w: *mut World, p: u64, n: usize) {
     rt.buf_clear(&(*w).value)
     rt.buf_push_bytes(&(*w).value, p, n)
+}
+
+// ROUND FIRNHUB ------------------------------- where a dependency comes from
+//
+// The twin of `package::origin_of`. FOUR kinds, decided purely lexically out
+// of the source word of a `needs` line -- no file system, no network, so
+// both compilers classify the same text the same way.
+//
+// Plain numbers instead of an enum: the value travels through `Vec[u32]`
+// and through `lock.fi`, and a u32 does that without a conversion.
+
+const ORIGIN_PATH: u32 = 0
+const ORIGIN_GIT: u32 = 1
+const ORIGIN_ARCHIVE: u32 = 2
+const ORIGIN_REGISTRY: u32 = 3
+
+fn starts_with_b(p: u64, n: usize, lit: u64) -> bool {
+    let m: usize = rt.c_length(lit)
+    if n < m {
+        return false
+    }
+    return rt.mem_eq(p, lit, m)
+}
+
+fn origin_of_b(p: u64, n: usize) -> u32 {
+    var g: [u8; 5] = "git+\0"
+    var hs: [u8; 9] = "https://\0"
+    var ht: [u8; 8] = "http://\0"
+    if starts_with_b(p, n, (&g[0]) as u64) {
+        return ORIGIN_GIT
+    }
+    if starts_with_b(p, n, (&hs[0]) as u64) {
+        return ORIGIN_ARCHIVE
+    }
+    if starts_with_b(p, n, (&ht[0]) as u64) {
+        return ORIGIN_ARCHIVE
+    }
+    if is_version_b(p, n) {
+        return ORIGIN_REGISTRY
+    }
+    return ORIGIN_PATH
+}
+
+fn is_hex_digit(c: u8) -> bool {
+    if is_digit(c) {
+        return true
+    }
+    return c >= 97 as u8 && c <= 102 as u8
+}
+
+// Exactly 64 lower case hex digits -- the shape of every checksum here.
+fn is_hex64_b(p: u64, n: usize) -> bool {
+    if n != 64 {
+        return false
+    }
+    var i: usize = 0
+    while i < 64 {
+        if !is_hex_digit(rt.ld8(p, i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Offset of the first `#`, or `n` when there is none.
+fn hash_at(p: u64, n: usize) -> usize {
+    var i: usize = 0
+    while i < n {
+        if rt.ld8(p, i) == 35 as u8 {
+            return i
+        }
+        i = i + 1
+    }
+    return n
+}
+
+// Offset of `#sha256=`, or `n` when it is not there.
+fn sha_at(p: u64, n: usize) -> usize {
+    var f: [u8; 9] = "#sha256=\0"
+    var i: usize = 0
+    while i + 8 <= n {
+        if rt.mem_eq(p + i as u64, (&f[0]) as u64, 8) {
+            return i
+        }
+        i = i + 1
+    }
+    return n
 }
 
 // -------------------------------------------------------------- manifest
@@ -833,8 +946,13 @@ fn manifest_read(w: *mut World, txt: u64, tn: usize, mp: u64, mpn: usize) -> boo
     var m_main2: [u8; 46] = "'main' appears more than once in the manifest\0"
     var m_source1: [u8; 34] = "'source' expects exactly one path\0"
     var m_open1: [u8; 42] = "'public' expects at least one module name\0"
-    var m_need1: [u8; 34] = "'needs' expects a name and a path\0"
-    var m_need2: [u8; 52] = "'needs' expects at most one version behind the path\0"
+    var m_need1: [u8; 36] = "'needs' expects a name and a source\0"
+    var m_need2: [u8; 54] = "'needs' expects at most one version behind the source\0"
+    var v_git: [u8; 12] = "git source \0"
+    var h_git1: [u8; 16] = " has no address\0"
+    var h_git2: [u8; 63] = " has no fixed reference (expected 'git+<url>#<commit-or-tag>')\0"
+    var v_arc: [u8; 16] = "archive source \0"
+    var h_arc: [u8; 59] = " has no checksum (expected '<url>#sha256=<64 hex digits>')\0"
     var v_name: [u8; 14] = "invalid name \0"
     var h_name: [u8; 50] = " (letter first, then letters, digits, underscore)\0"
     var v_ver: [u8; 17] = "invalid version \0"
@@ -874,10 +992,21 @@ fn manifest_read(w: *mut World, txt: u64, tn: usize, mp: u64, mpn: usize) -> boo
                 e = e - 1
             }
         }
+        // ROUND FIRNHUB: a `#` opens a comment only where a WORD BEGINS --
+        // at the start of the line or behind a separator. Round 48 cut at
+        // every `#`, and that made `git+https://host/repo#v1.2.0`
+        // impossible: the reference is part of the source and not a
+        // remark. The rule stays as short as it was: a comment is a word
+        // that starts with `#`, a `#` inside a word belongs to it.
         var c: usize = zs
         while c < e {
             if rt.ld8(txt, c) == 35 as u8 {
-                break
+                if c == zs {
+                    break
+                }
+                if is_sep(rt.ld8(txt, c - 1)) {
+                    break
+                }
             }
             c = c + 1
         }
@@ -1009,6 +1138,36 @@ fn manifest_read(w: *mut World, txt: u64, tn: usize, mp: u64, mpn: usize) -> boo
                                         value_set(w, txt + vo as u64, vn)
                                         return fail_value(w, mp, mpn, line, (&v_name[0]) as u64, (&h_name[0]) as u64)
                                     }
+                                    // ROUND FIRNHUB: WHERE the dependency
+                                    // comes from. The remote forms are
+                                    // checked here, on the TEXT: a source
+                                    // that cannot be fetched is a mistake in
+                                    // the manifest, not a failure of the
+                                    // network. Same order as `package.rs`.
+                                    let ok2: u64 = txt + vo2 as u64
+                                    let kind: u32 = origin_of_b(ok2, vn2)
+                                    if kind == ORIGIN_GIT {
+                                        let hp: usize = hash_at(ok2, vn2)
+                                        if hp <= 4 {
+                                            value_set(w, ok2, vn2)
+                                            return fail_value(w, mp, mpn, line, (&v_git[0]) as u64, (&h_git1[0]) as u64)
+                                        }
+                                        if hp + 1 >= vn2 {
+                                            value_set(w, ok2, vn2)
+                                            return fail_value(w, mp, mpn, line, (&v_git[0]) as u64, (&h_git2[0]) as u64)
+                                        }
+                                    }
+                                    if kind == ORIGIN_ARCHIVE {
+                                        let sp: usize = sha_at(ok2, vn2)
+                                        var good: bool = false
+                                        if sp < vn2 {
+                                            good = is_hex64_b(ok2 + (sp + 8) as u64, vn2 - sp - 8)
+                                        }
+                                        if !good {
+                                            value_set(w, ok2, vn2)
+                                            return fail_value(w, mp, mpn, line, (&v_arc[0]) as u64, (&h_arc[0]) as u64)
+                                        }
+                                    }
                                     if already_da(w, 2, a0, txt + vo as u64, vn) {
                                         value_set(w, txt + vo as u64, vn)
                                         return fail_value(w, mp, mpn, line, (&v_pkt[0]) as u64, (&h_dep_dup[0]) as u64)
@@ -1132,9 +1291,222 @@ fn world_load(w: *mut World, wp: u64, wn: usize) -> bool {
     vec_push[u32](&(*w).p_o1, vec_len[u32](&(*w).o) as u32)
     vec_push[u32](&(*w).p_a0, a0)
     vec_push[u32](&(*w).p_a1, vec_len[u32](&(*w).a_name) as u32)
+    // ROUND FIRNHUB: where this package came from. `world_build` sets
+    // `last_origin` before it loads a fetched dependency; the root package
+    // and every local one keep NONE.
+    vec_push[u32](&(*w).p_origin, (*w).last_origin)
+    (*w).last_origin = NONE
     rt.buf_free(&source)
     rt.buf_free(&mpb)
     return true
+}
+
+// ROUND FIRNHUB ------------------------------------ firn.have and the cache
+//
+// Twin of `package::read_have` and `package_world::cache_root`. The reasons
+// stand in `compiler/src/package.rs`; the short version is that the
+// COMPILER NEVER SPEAKS TO THE NETWORK. `firnpkg fetch` writes down what a
+// remote source resolved to, and from here on a dependency is a local
+// directory again -- which is also why an offline build needs no switch.
+
+// The cache root, computed by the caller out of $FIRN_CACHE / $HOME
+// (`bin/firnc1.fi` -- only the start block has the environment).
+fn world_set_cache(w: *mut World, p: u64, n: usize) {
+    rt.buf_clear(&(*w).cache)
+    rt.buf_push_bytes(&(*w).cache, p, n)
+}
+
+// `<cache>/pkg/<content hash>`; empty when there is no cache.
+fn cache_place(w: *mut World, cp: u64, out: *mut rt.Buf) {
+    rt.buf_clear(out)
+    if rt.buf_len(&(*w).cache) == 0 {
+        return
+    }
+    var pk: [u8; 4] = "pkg\0"
+    var mid: rt.Buf = rt.buf_new()
+    join(&mid, rt.buf_ptr(&(*w).cache), rt.buf_len(&(*w).cache), (&pk[0]) as u64, 3)
+    join(out, rt.buf_ptr(&mid), rt.buf_len(&mid), cp, rt.c_length(cp))
+    rt.buf_free(&mid)
+}
+
+// Read `<root>/firn.have`, if it is there. A missing file is NOT an error --
+// it only becomes one when a remote source actually asks for it.
+fn have_load(w: *mut World, rp: u64, rn: usize) -> bool {
+    var hn: [u8; 10] = "firn.have\0"
+    var hp: rt.Buf = rt.buf_new()
+    join(&hp, rp, rn, (&hn[0]) as u64, 9)
+    if !is_file(rt.buf_ptr(&hp)) {
+        rt.buf_free(&hp)
+        return true
+    }
+    var text: rt.Buf = rt.buf_new()
+    if !rt.read_file(rt.buf_ptr(&hp), &text) {
+        rt.buf_free(&text)
+        rt.buf_free(&hp)
+        return true
+    }
+    let ok: bool = have_read(w, rt.buf_ptr(&text), rt.buf_len(&text),
+        rt.buf_ptr(&hp), rt.buf_len(&hp))
+    rt.buf_free(&text)
+    rt.buf_free(&hp)
+    return ok
+}
+
+fn have_read(w: *mut World, txt: u64, tn: usize, mp: u64, mpn: usize) -> bool {
+    var k_have: [u8; 5] = "have\0"
+    var k_need: [u8; 5] = "need\0"
+    var one: [u8; 2] = "1\0"
+    var m_head: [u8; 36] = "expected 'have 1' as the first line\0"
+    var m_nohead: [u8; 37] = "the file needs a first line 'have 1'\0"
+    var m_arity: [u8; 73] = "'need' expects a name, a source, a resolved reference and a content hash\0"
+    var v_key: [u8; 13] = "unknown key \0"
+    var h_key: [u8; 17] = " (allowed: need)\0"
+    var v_hash: [u8; 22] = "invalid content hash \0"
+    var h_empty: [u8; 1] = "\0"
+    var v_dup: [u8; 9] = "package \0"
+    var h_dup: [u8; 24] = " appears more than once\0"
+    var head: bool = false
+    var line: u32 = 0
+    var i: usize = 0
+    while true {
+        var line_end: usize = i
+        while line_end < tn {
+            if rt.ld8(txt, line_end) == 10 as u8 {
+                break
+            }
+            line_end = line_end + 1
+        }
+        let next: usize = line_end + 1
+        line = line + 1
+        var end: usize = line_end
+        if end > i {
+            if rt.ld8(txt, end - 1) == 13 as u8 {
+                end = end - 1
+            }
+        }
+        // A `#` opens a comment only at the START of a line: a source word
+        // carries `#` in the middle of it and must stay intact.
+        var empty: bool = false
+        if end > i {
+            if rt.ld8(txt, i) == 35 as u8 {
+                empty = true
+            }
+        }
+        var pos: usize = i
+        var w1o: usize = 0
+        var w1n: usize = 0
+        if !empty {
+            if word(txt, end, &pos, &w1o, &w1n) {
+                if !head {
+                    var right: bool = false
+                    if is_word(txt, w1o, w1n, (&k_have[0]) as u64) {
+                        var w2o: usize = 0
+                        var w2n: usize = 0
+                        if word(txt, end, &pos, &w2o, &w2n) {
+                            if is_word(txt, w2o, w2n, (&one[0]) as u64) {
+                                var w3o: usize = 0
+                                var w3n: usize = 0
+                                if !word(txt, end, &pos, &w3o, &w3n) {
+                                    right = true
+                                }
+                            }
+                        }
+                    }
+                    if !right {
+                        return fail(w, mp, mpn, line, (&m_head[0]) as u64)
+                    }
+                    head = true
+                } else {
+                    if !is_word(txt, w1o, w1n, (&k_need[0]) as u64) {
+                        value_set(w, txt + w1o as u64, w1n)
+                        return fail_value(w, mp, mpn, line, (&v_key[0]) as u64, (&h_key[0]) as u64)
+                    }
+                    var no: usize = 0
+                    var nn: usize = 0
+                    var so: usize = 0
+                    var sn: usize = 0
+                    var ro: usize = 0
+                    var rn2: usize = 0
+                    var co: usize = 0
+                    var cn: usize = 0
+                    var xo: usize = 0
+                    var xn: usize = 0
+                    var full: bool = word(txt, end, &pos, &no, &nn)
+                    if full {
+                        full = word(txt, end, &pos, &so, &sn)
+                    }
+                    if full {
+                        full = word(txt, end, &pos, &ro, &rn2)
+                    }
+                    if full {
+                        full = word(txt, end, &pos, &co, &cn)
+                    }
+                    if full {
+                        if word(txt, end, &pos, &xo, &xn) {
+                            full = false
+                        }
+                    }
+                    if !full {
+                        return fail(w, mp, mpn, line, (&m_arity[0]) as u64)
+                    }
+                    if !is_hex64_b(txt + co as u64, cn) {
+                        value_set(w, txt + co as u64, cn)
+                        return fail_value(w, mp, mpn, line, (&v_hash[0]) as u64, (&h_empty[0]) as u64)
+                    }
+                    if have_by_name(w, txt + no as u64, nn) >= 0 {
+                        value_set(w, txt + no as u64, nn)
+                        return fail_value(w, mp, mpn, line, (&v_dup[0]) as u64, (&h_dup[0]) as u64)
+                    }
+                    vec_push[u32](&(*w).h_name, s_add(w, txt + no as u64, nn))
+                    vec_push[u32](&(*w).h_source, s_add(w, txt + so as u64, sn))
+                    vec_push[u32](&(*w).h_res, s_add(w, txt + ro as u64, rn2))
+                    vec_push[u32](&(*w).h_content, s_add(w, txt + co as u64, cn))
+                }
+            }
+        }
+        if line_end >= tn {
+            break
+        }
+        i = next
+    }
+    if !head {
+        return fail(w, mp, mpn, 0, (&m_nohead[0]) as u64)
+    }
+    return true
+}
+
+fn have_by_name(w: *mut World, p: u64, n: usize) -> i64 {
+    var i: usize = 0
+    while i < vec_len[u32](&(*w).h_name) {
+        let z: u64 = s_ptr(w, vec_at[u32](&(*w).h_name, i))
+        if rt.c_length(z) == n {
+            if rt.mem_eq(z, p, n) {
+                return i as i64
+            }
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// The entry for this NAME and this SOURCE. Both have to fit: a `firn.have`
+// that answers for `json` but was written for another source is stale, and
+// a build must not quietly use it.
+fn have_find(w: *mut World, p: usize, k: usize) -> i64 {
+    let np: u64 = s_ptr(w, vec_at[u32](&(*w).a_name, k))
+    let i: i64 = have_by_name(w, np, rt.c_length(np))
+    if i < 0 {
+        return i
+    }
+    let sp: u64 = s_ptr(w, vec_at[u32](&(*w).h_source, i as usize))
+    let ap: u64 = s_ptr(w, vec_at[u32](&(*w).a_path, k))
+    if rt.c_length(sp) != rt.c_length(ap) {
+        return 0 - 1
+    }
+    if !rt.mem_eq(sp, ap, rt.c_length(sp)) {
+        return 0 - 1
+    }
+    return i
 }
 
 // Absolute root of dependency `k` (global index) as seen from `p`.
@@ -1148,6 +1520,147 @@ fn dep_root(w: *mut World, p: usize, k: usize, out: *mut rt.Buf) {
     join(out, rt.buf_ptr(&wz), rt.buf_len(&wz), rt.buf_ptr(&pf), rt.buf_len(&pf))
     rt.buf_free(&wz)
     rt.buf_free(&pf)
+}
+
+// ROUND FIRNHUB: WHERE dependency `k` of package `p` really lies. A local
+// path is joined onto the package that names it (round 48); a remote source
+// is looked up in `firn.have` and becomes a directory of the cache. The
+// network is never asked -- which is why a build without one works.
+//
+// On success `(*w).last_origin` holds the entry the package came out of
+// (NONE for a local one); `world_load` picks it up.
+fn dep_place(w: *mut World, p: usize, k: usize, out: *mut rt.Buf) -> bool {
+    let ap: u64 = s_ptr(w, vec_at[u32](&(*w).a_path, k))
+    let an: usize = rt.c_length(ap)
+    (*w).last_origin = NONE
+    if origin_of_b(ap, an) == ORIGIN_PATH {
+        dep_root(w, p, k, out)
+        return true
+    }
+    let hi: i64 = have_find(w, p, k)
+    if hi < 0 {
+        return text_not_fetched(w, p, k)
+    }
+    if rt.buf_len(&(*w).cache) == 0 {
+        return text_no_cache(w, k)
+    }
+    cache_place(w, s_ptr(w, vec_at[u32](&(*w).h_content, hi as usize)), out)
+    var mpb: rt.Buf = rt.buf_new()
+    manifestpfad(&mpb, rt.buf_ptr(out), rt.buf_len(out))
+    if !is_file(rt.buf_ptr(&mpb)) {
+        rt.buf_free(&mpb)
+        return text_cache_missing(w, k, hi as usize, out)
+    }
+    rt.buf_free(&mpb)
+    (*w).last_origin = hi as u32
+    return true
+}
+
+fn text_not_fetched(w: *mut World, p: usize, k: usize) -> bool {
+    var t1: [u8; 9] = "package \0"
+    var t2: [u8; 22] = " has not been fetched\0"
+    var t3: [u8; 8] = "source \0"
+    var t4: [u8; 15] = "firnpkg fetch \0"
+    var t5: [u8; 9] = " writes \0"
+    var hn: [u8; 10] = "firn.have\0"
+    error_begin(w)
+    let mp: u64 = s_ptr(w, vec_at[u32](&(*w).p_mpath, p))
+    error_place(w, mp, rt.c_length(mp), vec_at[u32](&(*w).a_line, k))
+    ptext(&(*w).err, (&t1[0]) as u64)
+    rt.buf_push(&(*w).err, 39 as u8)
+    ptext(&(*w).err, s_ptr(w, vec_at[u32](&(*w).a_name, k)))
+    rt.buf_push(&(*w).err, 39 as u8)
+    ptext(&(*w).err, (&t2[0]) as u64)
+    error_final(w)
+    error_note(w)
+    ptext(&(*w).err, (&t3[0]) as u64)
+    rt.buf_push(&(*w).err, 39 as u8)
+    ptext(&(*w).err, s_ptr(w, vec_at[u32](&(*w).a_path, k)))
+    rt.buf_push(&(*w).err, 39 as u8)
+    error_final(w)
+    // The project directory under the spelling that does not name this
+    // machine (round 93, `build_path`): relative when it lies inside the
+    // working directory, unchanged otherwise.
+    var cwd: rt.Buf = rt.buf_new()
+    work_dir(&cwd)
+    var rel: rt.Buf = rt.buf_new()
+    let rp: u64 = s_ptr(w, vec_at[u32](&(*w).p_root, 0))
+    build_path(&rel, rp, rt.c_length(rp), rt.buf_ptr(&cwd), rt.buf_len(&cwd))
+    var hp: rt.Buf = rt.buf_new()
+    join(&hp, rt.buf_ptr(&rel), rt.buf_len(&rel), (&hn[0]) as u64, 9)
+    error_note(w)
+    rt.buf_push(&(*w).err, 39 as u8)
+    ptext(&(*w).err, (&t4[0]) as u64)
+    rt.buf_push_bytes(&(*w).err, rt.buf_ptr(&rel), rt.buf_len(&rel))
+    rt.buf_push(&(*w).err, 39 as u8)
+    ptext(&(*w).err, (&t5[0]) as u64)
+    rt.buf_push(&(*w).err, 39 as u8)
+    rt.buf_push_bytes(&(*w).err, rt.buf_ptr(&hp), rt.buf_len(&hp))
+    rt.buf_push(&(*w).err, 39 as u8)
+    error_final(w)
+    rt.buf_free(&hp)
+    rt.buf_free(&rel)
+    rt.buf_free(&cwd)
+    return false
+}
+
+fn text_no_cache(w: *mut World, k: usize) -> bool {
+    var t1: [u8; 9] = "package \0"
+    var t2: [u8; 50] = " comes from a remote source and there is no cache\0"
+    var t3: [u8; 25] = "set $FIRN_CACHE or $HOME\0"
+    error_begin(w)
+    ptext(&(*w).err, (&t1[0]) as u64)
+    rt.buf_push(&(*w).err, 39 as u8)
+    ptext(&(*w).err, s_ptr(w, vec_at[u32](&(*w).a_name, k)))
+    rt.buf_push(&(*w).err, 39 as u8)
+    ptext(&(*w).err, (&t2[0]) as u64)
+    error_final(w)
+    error_note(w)
+    ptext(&(*w).err, (&t3[0]) as u64)
+    error_final(w)
+    return false
+}
+
+fn text_cache_missing(w: *mut World, k: usize, hi: usize, place: *mut rt.Buf) -> bool {
+    var t1: [u8; 9] = "package \0"
+    var t2: [u8; 21] = " is not in the cache\0"
+    var t3: [u8; 13] = " is expected\0"
+    var t4: [u8; 9] = "content \0"
+    error_begin(w)
+    ptext(&(*w).err, (&t1[0]) as u64)
+    rt.buf_push(&(*w).err, 39 as u8)
+    ptext(&(*w).err, s_ptr(w, vec_at[u32](&(*w).a_name, k)))
+    rt.buf_push(&(*w).err, 39 as u8)
+    ptext(&(*w).err, (&t2[0]) as u64)
+    error_final(w)
+    error_note(w)
+    rt.buf_push(&(*w).err, 39 as u8)
+    rt.buf_push_bytes(&(*w).err, rt.buf_ptr(place), rt.buf_len(place))
+    rt.buf_push(&(*w).err, 39 as u8)
+    ptext(&(*w).err, (&t3[0]) as u64)
+    error_final(w)
+    error_note(w)
+    ptext(&(*w).err, (&t4[0]) as u64)
+    ptext(&(*w).err, s_ptr(w, vec_at[u32](&(*w).h_content, hi)))
+    error_final(w)
+    return false
+}
+
+// Accessors for `lock.fi`: was this package fetched, and out of what?
+fn world_has_origin(w: *mut World, p: usize) -> bool {
+    return vec_at[u32](&(*w).p_origin, p) != NONE
+}
+
+fn world_origin_source_ptr(w: *mut World, p: usize) -> u64 {
+    return s_ptr(w, vec_at[u32](&(*w).h_source, vec_at[u32](&(*w).p_origin, p) as usize))
+}
+
+fn world_origin_res_ptr(w: *mut World, p: usize) -> u64 {
+    return s_ptr(w, vec_at[u32](&(*w).h_res, vec_at[u32](&(*w).p_origin, p) as usize))
+}
+
+fn world_origin_content_ptr(w: *mut World, p: usize) -> u64 {
+    return s_ptr(w, vec_at[u32](&(*w).h_content, vec_at[u32](&(*w).p_origin, p) as usize))
 }
 
 // ROUND 93: write down, for every `needs` entry, WHICH package it means.
@@ -1166,12 +1679,19 @@ fn targets_fill(w: *mut World) {
         let to: usize = vec_at[u32](&(*w).p_a1, i) as usize
         while j < to {
             var dw: rt.Buf = rt.buf_new()
-            dep_root(w, i, j, &dw)
-            let z: i64 = world_find_root(w, rt.buf_ptr(&dw), rt.buf_len(&dw))
-            rt.buf_free(&dw)
-            if z >= 0 {
-                vec_set[u32](&(*w).a_target, j, z as u32)
+            // ROUND FIRNHUB: `dep_place`, not `dep_root` -- a fetched
+            // dependency lies in the cache and its path is nowhere near the
+            // package that names it. `world_build` has already checked every
+            // entry, so this call cannot fail here; `last_origin` is set back
+            // afterwards because nothing is loaded any more.
+            if dep_place(w, i, j, &dw) {
+                let z: i64 = world_find_root(w, rt.buf_ptr(&dw), rt.buf_len(&dw))
+                if z >= 0 {
+                    vec_set[u32](&(*w).a_target, j, z as u32)
+                }
             }
+            (*w).last_origin = NONE
+            rt.buf_free(&dw)
             j = j + 1
         }
         i = i + 1
@@ -1400,13 +1920,22 @@ fn world_build(w: *mut World, wp: u64, wn: usize) -> bool {
     if !world_load(w, wp, wn) {
         return false
     }
+    // ROUND FIRNHUB: what `firnpkg fetch` resolved. ONE file, next to the
+    // ROOT manifest, for the whole graph -- the same decision the lock file
+    // makes, so a fetched package stays a pure content tree.
+    if !have_load(w, wp, wn) {
+        return false
+    }
     var i: usize = 0
     while i < world_count(w) {
         var k: usize = vec_at[u32](&(*w).p_a0, i) as usize
         let to: usize = vec_at[u32](&(*w).p_a1, i) as usize
         while k < to {
             var dw: rt.Buf = rt.buf_new()
-            dep_root(w, i, k, &dw)
+            if !dep_place(w, i, k, &dw) {
+                rt.buf_free(&dw)
+                return false
+            }
             if world_find_root(w, rt.buf_ptr(&dw), rt.buf_len(&dw)) < 0 {
                 var mpb: rt.Buf = rt.buf_new()
                 manifestpfad(&mpb, rt.buf_ptr(&dw), rt.buf_len(&dw))
@@ -1476,6 +2005,9 @@ fn world_build(w: *mut World, wp: u64, wn: usize) -> bool {
                     return false
                 }
             }
+            // The package was already there: the origin belongs to the
+            // load that really happened, not to this second mention of it.
+            (*w).last_origin = NONE
             rt.buf_free(&dw)
             k = k + 1
         }
@@ -1853,7 +2385,18 @@ fn world_info(w: *mut World, vp: u64, vn: usize, out: *mut rt.Buf) {
         var ps: rt.Buf = rt.buf_new()
         let y: u64 = s_ptr(w, vec_at[u32](&(*w).a_path, i))
         rt.buf_push_bytes(&ps, y, rt.c_length(y))
-        join(&t, rt.buf_ptr(&wz), rt.buf_len(&wz), rt.buf_ptr(&ps), rt.buf_len(&ps))
+        // ROUND FIRNHUB: a LOCAL path is reported the way this build will
+        // read it, joined onto the package root. A REMOTE source is
+        // reported VERBATIM -- joining it would produce nonsense
+        // (`/p/app/git+https://...`), and the spelling in the manifest is
+        // exactly what identifies it in `firn.have`.
+        if origin_of_b(rt.buf_ptr(&ps), rt.buf_len(&ps)) == ORIGIN_PATH {
+            join(&t, rt.buf_ptr(&wz), rt.buf_len(&wz), rt.buf_ptr(&ps), rt.buf_len(&ps))
+        } else {
+            rt.buf_clear(&t)
+            rt.buf_push_bytes(&t, rt.buf_ptr(&ps), rt.buf_len(&ps))
+            null_behind(&t)
+        }
         ptext(out, (&k_need[0]) as u64)
         rt.buf_push(out, 32 as u8)
         ptext(out, s_ptr(w, vec_at[u32](&(*w).a_name, i)))
