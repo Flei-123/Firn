@@ -221,7 +221,7 @@ and a `line:column` — it does not crash and it does not pretend.
   slower for the cryptography, docs/BENCHMARKS.md §1); what is missing is the
   aarch64 form of the instruction, not the algorithm.
 * **No package registry, no lock file, no reproducible two-machine build.**
-  There is a module system and a project manifest (`firn.package`,
+  There is a module system and a project manifest (`firn.pkg`,
   `firnc --package <dir>`), but `compiler/src/package.rs` and
   `package_world.rs` contain not one occurrence of "lock", "registry", "http"
   or "download": everything is resolved from the local file system, and it
@@ -353,7 +353,7 @@ cargo build --release --manifest-path tools/testrunner/Cargo.toml
 ```
 firnc [OPTIONS] file.fi
   -o <path>            output file
-  --package <dir>      compile the project from <dir>/firn.package
+  --package <dir>      compile the project from <dir>/firn.pkg
   --emit=exe|asm|fir|fir-raw|fir-opt|comptime|tokens|ast|ast-canon|layout|types
   --target=<name>      x86_64-linux (default) | aarch64-linux
   --profile=<name>     kernel | app (SPEC 2)

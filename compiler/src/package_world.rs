@@ -6,8 +6,8 @@
 //! after it, spot cycles.
 //!
 //! SEARCH FOR THE MANIFEST: from the directory of the root file UPWARDS,
-//! until `firn.package` shows up or the file system ends
-//! (`package::SUCHTIEFE` as the emergency brake). Without a find the world
+//! until `firn.pkg` shows up or the file system ends
+//! (`package::SEARCH_DEPTH` as the emergency brake). Without a find the world
 //! is EMPTY — the compiler then behaves exactly as before round 48. That is
 //! deliberate: everything new hangs off the manifest, nothing changes without.
 
@@ -88,11 +88,11 @@ fn is_file(p: &str) -> bool {
     std::path::Path::new(p).is_file()
 }
 
-/// Searches `firn.package` from `dirname` upwards. Yields the directory
+/// Searches `firn.pkg` from `dirname` upwards. Yields the directory
 /// that holds it.
 pub fn search_manifest(dirname: &str) -> Option<String> {
     let mut d = package::normalize(dirname);
-    for _ in 0..package::SUCHTIEFE {
+    for _ in 0..package::SEARCH_DEPTH {
         if is_file(&package::join(&d, package::MANIFEST)) {
             return Some(d);
         }
@@ -501,8 +501,8 @@ mod tests {
     #[test]
     fn the_new_texts_of_round_93_are_fixed() {
         assert_eq!(
-            text_version_wish("/p/app/firn.package", 7, "geo", "0.1.0", "0.2.0"),
-            "error: /p/app/firn.package:7: dependency 'geo' is version 0.1.0, \
+            text_version_wish("/p/app/firn.pkg", 7, "geo", "0.1.0", "0.2.0"),
+            "error: /p/app/firn.pkg:7: dependency 'geo' is version 0.1.0, \
              needed is 0.2.0 or higher with the same first number\n"
         );
         assert_eq!(
@@ -515,14 +515,14 @@ mod tests {
     #[test]
     fn error_texts_are_fixed() {
         assert_eq!(
-            text_not_public("inner", "geo", "/p/geo/firn.package"),
+            text_not_public("inner", "geo", "/p/geo/firn.pkg"),
             "error: module 'inner' is not public in package 'geo'\n\
-             note: add 'public inner' in '/p/geo/firn.package'\n"
+             note: add 'public inner' in '/p/geo/firn.pkg'\n"
         );
         assert_eq!(
-            text_no_dependency("geo", "app", "/p/app/firn.package"),
+            text_no_dependency("geo", "app", "/p/app/firn.pkg"),
             "error: package 'geo' is not a dependency of package 'app'\n\
-             note: add 'needs geo <path>' in '/p/app/firn.package'\n"
+             note: add 'needs geo <path>' in '/p/app/firn.pkg'\n"
         );
         assert_eq!(
             text_name_clash("util", "/a/util.fi", "/b/util.fi"),

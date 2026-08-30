@@ -1992,16 +1992,16 @@ become worse but are around 2 % better. Callgrind was unsuitable here: it
 shifts the stack, which is why the round now reads the stack bottom from
 `/proc/self/maps` instead of guessing it.
 
-## 39. Round 48: packages — manifest, visibility, `--paket`
+## 39. Round 48: packages — manifest, visibility, `--package`
 
 Up to here there was only `import a.b` and the environment variable
-`FIRNLIB`. Round 48 brings a manifest `firn.paket` — **deliberately no
+`FIRNLIB`. Round 48 brings a manifest `firn.pkg` — **deliberately no
 TOML**: the format has six keywords, is line-based and can be read without
 a foreign parser in both compilers (`compiler/src/package_world.rs` and
 `lib/firnc1/package.fi`). Plus a deterministic search order
 (project sources → dependencies → `FIRNLIB` → compiler directory) with
 clear errors for cycles, missing packages and name conflicts, as well as
-public/private at module level. `--paket` compiles a project on the basis
+public/private at module level. `--package` compiles a project on the basis
 of the manifest; together with a source file it is rejected identically in
 **both** compilers. A new section 18 in `test.sh`:
 `tools/packages/run.sh`, **21 cases through both compilers**.

@@ -1,4 +1,4 @@
-//! Project manifest `firn.package` — name, version, entry point,
+//! Project manifest `firn.pkg` — name, version, entry point,
 //! source directories, public modules, dependencies.
 //!
 //! WHY NO TOML (round 48, decision with its reasoning)
@@ -23,7 +23,7 @@
 //! ```text
 //! package      demo            # required, exactly once
 //! version      0.1.0           # required, exactly once, num.num.num
-//! start        src/main.fi     # at most once, relative to the manifest;
+//! main         src/main.fi     # at most once, relative to the manifest;
 //!                              #      a library has none
 //! source       src             # 0..n, relative; without it the
 //!                              #      manifest directory itself counts
@@ -37,10 +37,10 @@
 //! open.
 
 /// File name of the manifest. Stands exclusively here.
-pub const MANIFEST: &str = "firn.package";
+pub const MANIFEST: &str = "firn.pkg";
 
 /// How many directory levels the upward search covers at most.
-pub const SUCHTIEFE: usize = 64;
+pub const SEARCH_DEPTH: usize = 64;
 
 /// One dependency: name (becomes the import prefix), local path and the
 /// version WISH. `want` empty means: any version will do.
@@ -62,7 +62,7 @@ pub struct Manifest {
     pub version: String,
     /// Entry point. EMPTY means: the package is a library and cannot be built
     /// with `--package`.
-    pub start: String,
+    pub main: String,
     /// Source directories, relative to the manifest. Never empty (default: `.`).
     pub sources: Vec<String>,
     /// Public modules. EMPTY means: everything is public — the same rule as
@@ -310,7 +310,7 @@ pub fn read(text: &str) -> Result<Manifest, Error> {
     let mut m = Manifest::default();
     let mut has_name = false;
     let mut has_version = false;
-    let mut has_start = false;
+    let mut has_main = false;
     let mut nr = 0u32;
     for raw in text.split('\n') {
         nr += 1;
@@ -357,12 +357,12 @@ pub fn read(text: &str) -> Result<Manifest, Error> {
                 m.version = w[1].to_string();
                 has_version = true;
             }
-            "start" => {
+            "main" => {
                 if w.len() != 2 {
-                    return Err(err("'start' expects exactly one path"));
+                    return Err(err("'main' expects exactly one path"));
                 }
-                if has_start {
-                    return Err(err("'start' appears more than once in the manifest"));
+                if has_main {
+                    return Err(err("'main' appears more than once in the manifest"));
                 }
                 if !is_inner_path(w[1]) {
                     return Err(err(&format!(
@@ -370,8 +370,8 @@ pub fn read(text: &str) -> Result<Manifest, Error> {
                         w[1]
                     )));
                 }
-                m.start = w[1].to_string();
-                has_start = true;
+                m.main = w[1].to_string();
+                has_main = true;
             }
             "source" => {
                 if w.len() != 2 {
@@ -449,7 +449,7 @@ pub fn read(text: &str) -> Result<Manifest, Error> {
             }
             other => {
                 return Err(err(&format!(
-                    "unknown key '{}' (allowed: package, version, start, source, public, needs)",
+                    "unknown key '{}' (allowed: package, version, main, source, public, needs)",
                     other
                 )));
             }
@@ -485,8 +485,8 @@ pub fn info_text(m: &Manifest, root: &str) -> String {
     s.push_str(&format!("package {}\n", m.name));
     s.push_str(&format!("version {}\n", m.version));
     s.push_str(&format!("root {}\n", w));
-    if !m.start.is_empty() {
-        s.push_str(&format!("start {}\n", join(&w, &m.start)));
+    if !m.main.is_empty() {
+        s.push_str(&format!("main {}\n", join(&w, &m.main)));
     }
     for q in &m.sources {
         s.push_str(&format!("source {}\n", join(&w, q)));
@@ -516,10 +516,10 @@ mod tests {
 
     #[test]
     fn smallest_valid_manifest() {
-        let x = m("package demo\nversion 0.1.0\nstart src/main.fi\n");
+        let x = m("package demo\nversion 0.1.0\nmain src/main.fi\n");
         assert_eq!(x.name, "demo");
         assert_eq!(x.version, "0.1.0");
-        assert_eq!(x.start, "src/main.fi");
+        assert_eq!(x.main, "src/main.fi");
         // Without 'source' the manifest directory itself counts.
         assert_eq!(x.sources, vec![".".to_string()]);
         assert!(x.public.is_empty());
@@ -530,14 +530,14 @@ mod tests {
 
     #[test]
     fn comments_blank_lines_tabs() {
-        let x = m("# head\n\n\tpackage\tdemo\t# name\nversion 1.2.3\nstart a.fi\n   \n");
+        let x = m("# head\n\n\tpackage\tdemo\t# name\nversion 1.2.3\nmain a.fi\n   \n");
         assert_eq!(x.name, "demo");
         assert_eq!(x.version, "1.2.3");
     }
 
     #[test]
     fn sources_public_and_dependencies() {
-        let x = m("package app\nversion 0.0.1\nstart src/main.fi\nsource src\nsource extra\n\
+        let x = m("package app\nversion 0.0.1\nmain src/main.fi\nsource src\nsource extra\n\
                    public a b\npublic c\nneeds geo ../geo\nneeds txt /opt/txt\n");
         assert_eq!(x.sources, vec!["src".to_string(), "extra".to_string()]);
         assert_eq!(x.public, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
@@ -552,27 +552,27 @@ mod tests {
 
     #[test]
     fn missing_required() {
-        assert_eq!(read("version 1.0.0\nstart a.fi\n").unwrap_err().msg,
+        assert_eq!(read("version 1.0.0\nmain a.fi\n").unwrap_err().msg,
                    "the manifest needs a line 'package <name>'");
-        assert_eq!(read("package a\nstart a.fi\n").unwrap_err().msg,
+        assert_eq!(read("package a\nmain a.fi\n").unwrap_err().msg,
                    "the manifest needs a line 'version <number.number.number>'");
-        // 'start' is NOT required: a library has no entry point.
-        assert_eq!(read("package a\nversion 1.0.0\n").unwrap().start, "");
+        // 'main' is NOT required: a library has no entry point.
+        assert_eq!(read("package a\nversion 1.0.0\n").unwrap().main, "");
     }
 
     #[test]
     fn unknown_key_is_in_error() {
-        let e = read("package a\nversion 1.0.0\nstart a.fi\npubli b\n").unwrap_err();
+        let e = read("package a\nversion 1.0.0\nmain a.fi\npubli b\n").unwrap_err();
         assert_eq!(e.line, 4);
         assert!(e.msg.starts_with("unknown key 'publi'"), "{}", e.msg);
     }
 
     #[test]
     fn checked_become_name_version_path() {
-        assert!(read("package 1a\nversion 1.0.0\nstart a.fi\n").unwrap_err().msg.contains("invalid name '1a'"));
-        assert!(read("package a\nversion 1.0\nstart a.fi\n").unwrap_err().msg.contains("invalid version '1.0'"));
-        assert!(read("package a\nversion 1.0.0\nstart ../x.fi\n").unwrap_err().msg.contains("invalid path '../x.fi'"));
-        assert!(read("package a\nversion 1.0.0\nstart /x.fi\n").unwrap_err().msg.contains("invalid path '/x.fi'"));
+        assert!(read("package 1a\nversion 1.0.0\nmain a.fi\n").unwrap_err().msg.contains("invalid name '1a'"));
+        assert!(read("package a\nversion 1.0\nmain a.fi\n").unwrap_err().msg.contains("invalid version '1.0'"));
+        assert!(read("package a\nversion 1.0.0\nmain ../x.fi\n").unwrap_err().msg.contains("invalid path '../x.fi'"));
+        assert!(read("package a\nversion 1.0.0\nmain /x.fi\n").unwrap_err().msg.contains("invalid path '/x.fi'"));
         assert!(is_name("a_1"));
         assert!(!is_name(""));
         assert!(!is_name("a-b"));
@@ -583,19 +583,19 @@ mod tests {
 
     #[test]
     fn duplicate_entries_become_reported() {
-        assert!(read("package a\npackage b\nversion 1.0.0\nstart a.fi\n").unwrap_err().msg.contains("'package' appears more than once"));
-        assert!(read("package a\nversion 1.0.0\nversion 1.0.1\nstart a.fi\n").unwrap_err().msg.contains("'version' appears more than once"));
-        assert!(read("package a\nversion 1.0.0\nstart a.fi\nsource s\nsource s\n").unwrap_err().msg.contains("source 's' appears more than once"));
-        assert!(read("package a\nversion 1.0.0\nstart a.fi\npublic m m\n").unwrap_err().msg.contains("module 'm' appears more than once"));
-        assert!(read("package a\nversion 1.0.0\nstart a.fi\nneeds g ../g\nneeds g ../h\n").unwrap_err().msg.contains("appears more than once as a dependency"));
-        assert!(read("package a\nversion 1.0.0\nstart a.fi\nneeds a ../a\n").unwrap_err().msg.contains("has the same name as the package itself"));
+        assert!(read("package a\npackage b\nversion 1.0.0\nmain a.fi\n").unwrap_err().msg.contains("'package' appears more than once"));
+        assert!(read("package a\nversion 1.0.0\nversion 1.0.1\nmain a.fi\n").unwrap_err().msg.contains("'version' appears more than once"));
+        assert!(read("package a\nversion 1.0.0\nmain a.fi\nsource s\nsource s\n").unwrap_err().msg.contains("source 's' appears more than once"));
+        assert!(read("package a\nversion 1.0.0\nmain a.fi\npublic m m\n").unwrap_err().msg.contains("module 'm' appears more than once"));
+        assert!(read("package a\nversion 1.0.0\nmain a.fi\nneeds g ../g\nneeds g ../h\n").unwrap_err().msg.contains("appears more than once as a dependency"));
+        assert!(read("package a\nversion 1.0.0\nmain a.fi\nneeds a ../a\n").unwrap_err().msg.contains("has the same name as the package itself"));
     }
 
     #[test]
     fn wrong_arity() {
-        assert!(read("package a b\nversion 1.0.0\nstart a.fi\n").unwrap_err().msg.contains("'package' expects exactly one name"));
-        assert!(read("package a\nversion 1.0.0\nstart a.fi\nneeds g\n").unwrap_err().msg.contains("'needs' expects a name and a path"));
-        assert!(read("package a\nversion 1.0.0\nstart a.fi\npublic\n").unwrap_err().msg.contains("'public' expects at least one module name"));
+        assert!(read("package a b\nversion 1.0.0\nmain a.fi\n").unwrap_err().msg.contains("'package' expects exactly one name"));
+        assert!(read("package a\nversion 1.0.0\nmain a.fi\nneeds g\n").unwrap_err().msg.contains("'needs' expects a name and a path"));
+        assert!(read("package a\nversion 1.0.0\nmain a.fi\npublic\n").unwrap_err().msg.contains("'public' expects at least one module name"));
     }
 
     #[test]
@@ -660,7 +660,7 @@ mod tests {
     /// The fourth word of `needs`, and the two ways to get it wrong.
     #[test]
     fn the_version_wish_of_a_dependency() {
-        let x = m("package app\nversion 0.1.0\nstart s.fi\nneeds geo ../geo 0.2.0\nneeds t ../t\n");
+        let x = m("package app\nversion 0.1.0\nmain s.fi\nneeds geo ../geo 0.2.0\nneeds t ../t\n");
         assert_eq!(x.dependent[0].want, "0.2.0");
         assert_eq!(x.dependent[1].want, "");
         assert!(read("package a\nversion 1.0.0\nneeds g ../g 0.2\n")
@@ -678,7 +678,7 @@ mod tests {
             .contains("'needs' expects a name and a path"));
         assert_eq!(
             info_text(&x, "/p/app"),
-            "package app\nversion 0.1.0\nroot /p/app\nstart /p/app/s.fi\nsource /p/app\n\
+            "package app\nversion 0.1.0\nroot /p/app\nmain /p/app/s.fi\nsource /p/app\n\
              needs geo /p/geo 0.2.0\nneeds t /p/t\n"
         );
     }
@@ -694,11 +694,11 @@ mod tests {
 
     #[test]
     fn infotext_is_pure_lexical() {
-        let x = m("package app\nversion 0.2.0\nstart src/main.fi\nsource src\n\
+        let x = m("package app\nversion 0.2.0\nmain src/main.fi\nsource src\n\
                    public app\nneeds geo ../geo\n");
         assert_eq!(
             info_text(&x, "./example/app/"),
-            "package app\nversion 0.2.0\nroot example/app\nstart example/app/src/main.fi\n\
+            "package app\nversion 0.2.0\nroot example/app\nmain example/app/src/main.fi\n\
              source example/app/src\npublic app\nneeds geo example/geo\n"
         );
     }

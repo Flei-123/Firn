@@ -1,7 +1,7 @@
 # Round 93 — the lock file, one version per name, and the three places where a build carried the name of its machine
 
 **State before this round:** round 48 built the project system — the manifest
-`firn.package`, a fixed search order, visibility at module level, package
+`firn.pkg`, a fixed search order, visibility at module level, package
 cycles, module name clashes, the build driver `--package`, all of it in both
 compilers. Its own closing section said what was missing: *„No network, no
 registry, no lock file. […] Reproducibility across two machines
@@ -200,7 +200,7 @@ Two conflicts have their own message:
 error: package 'geo' comes from two directories with version 0.2.0
 note: '/p/geo' and '/p/geo2'
 
-error: /p/text/firn.package:7: dependency 'geo' is version 0.3.0, needed is 1.0.0 or higher with the same first number
+error: /p/text/firn.pkg:7: dependency 'geo' is version 0.3.0, needed is 1.0.0 or higher with the same first number
 ```
 
 The first one refuses to guess: same name, same version, two places, no
@@ -427,7 +427,7 @@ green only when nobody else is working is worth knowing about.
   enough for the criterion of item 5 — and it is the reason the resolution
   above is a decision and not a search.
 * **A library package cannot be locked.** `--lock` hangs off `--package`,
-  and `--package` needs a `start`. Locking a library on its own would need a
+  and `--package` needs a `main`. Locking a library on its own would need a
   build that produces nothing, which does not exist yet (there are no
   separate object files).
 * **The lock file does not pin the COMPILER.** Two machines with different
