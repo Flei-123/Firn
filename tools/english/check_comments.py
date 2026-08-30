@@ -40,11 +40,22 @@ BEREICHE = [('compiler/src', ('.rs',)), ('lib', ('.fi',)), ('bin', ('.fi',)),
             ('tools', ('.sh', '.py', '.fi')), ('docs', ('.md',))]
 AUS = ('testdata/', 'tools/english/')
 
+# RUNDE FIRNHUB -- WAS AUSDRUECKLICH DEUTSCH BLEIBEN DARF.
+#
+# Etappe B hat die Kommentare des Uebersetzers und der Bibliothek englisch
+# gemacht, und das bleibt so. Der Projekteigner hat fuer diese Runde aber
+# zwei Dinge ausdruecklich auf Deutsch bestellt: den Rundenbericht und die
+# Kommentare der neuen Beispielpakete. Eine Ausnahme, die HIER steht, ist
+# ehrlicher als ein Massstab, der still auf 16 Zeilen faellt -- und sie ist
+# kurz genug, dass man sofort sieht, was sie deckt.
+DEUTSCH_ERLAUBT = ('docs/ROUND-FIRNHUB.md', 'demos/hub/')
+
 
 def dateien():
     aus = subprocess.run(['git', 'ls-files'], capture_output=True, text=True,
                          check=True).stdout.split('\n')
-    return [p for p in aus if p and not p.startswith(AUS)]
+    return [p for p in aus
+            if p and not p.startswith(AUS) and not p.startswith(DEUTSCH_ERLAUBT)]
 
 
 def kommentarzeilen(pfad):
