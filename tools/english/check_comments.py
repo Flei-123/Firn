@@ -48,7 +48,7 @@ AUS = ('testdata/', 'tools/english/')
 # Kommentare der neuen Beispielpakete. Eine Ausnahme, die HIER steht, ist
 # ehrlicher als ein Massstab, der still auf 16 Zeilen faellt -- und sie ist
 # kurz genug, dass man sofort sieht, was sie deckt.
-DEUTSCH_ERLAUBT = ('docs/ROUND-FIRNHUB.md', 'demos/hub/')
+DEUTSCH_ERLAUBT = ('docs/ROUND-FIRNHUB.md', 'demos/hub/', 'tools/hub/')
 
 
 def dateien():
