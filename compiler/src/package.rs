@@ -50,7 +50,7 @@
 //! * `git+` MUST carry `#<reference>` — a commit or a tag. A branch name
 //!   is accepted as text but is a bad idea and the report says so; what is
 //!   refused is the FLOATING form without any `#` at all.
-//! * `http(s)://` MUST carry `#sha256=<64 lower case hex>`. An archive
+//! * `http(s)://` and `file://` MUST carry `#sha256=<64 lower case hex>`. An archive
 //!   without a checksum is not a dependency, it is a wish.
 //! * The registry short form is the one that LOOKS LIKE A VERSION
 //!   (`number.number.number`). A local directory literally named `1.2.0`
@@ -90,7 +90,12 @@ pub fn origin_of(s: &str) -> Origin {
     if s.starts_with(GIT) {
         return Origin::Git;
     }
-    if s.starts_with("https://") || s.starts_with("http://") {
+    if s.starts_with("https://") || s.starts_with("http://") || s.starts_with("file://") {
+        // `file://` is in there so that the archive path can be MEASURED
+        // without a network (`tools/hub/run.sh`): `curl` reads it like any
+        // other address, and the checksum decides exactly as it would over
+        // the wire. `git+file://` is already a git source — the `git+`
+        // prefix is looked at first.
         return Origin::Archive;
     }
     if is_version(s) {
