@@ -16,9 +16,10 @@
 //! FORMAT
 //! ---------------------------------------------------------------------
 //! One statement per line: `key value [value ...]`. Separators are space and
-//! tab, `#` opens a comment up to the end of the line, empty lines do not
-//! count. There are no quotes and no escapes — a value therefore contains
-//! neither spaces nor `#`.
+//! tab, a `#` AT THE START OF A WORD opens a comment up to the end of the
+//! line, empty lines do not count. There are no quotes and no escapes — a
+//! value therefore contains no space, and it may not begin with `#`, but
+//! it may carry one inside it (round FIRNHUB: `git+<url>#<ref>`).
 //!
 //! ```text
 //! package      demo            # required, exactly once
@@ -29,12 +30,116 @@
 //!                              #      manifest directory itself counts
 //! public       geo point       # 0..n, module interface of the package;
 //!                              #      without it everything is public
-//! needs        geo ../geo      # 0..n, label + local path
+//! needs        geo ../geo      # 0..n, label + source [+ version wish]
 //! ```
+//!
+//! ROUND FIRNHUB — WHERE A DEPENDENCY MAY COME FROM
+//! ---------------------------------------------------------------------
+//! The source of a `needs` line is ONE word (the format has no quotes, so
+//! a value never contains a space) and its kind is decided PURELY
+//! LEXICALLY, so that both compilers agree without asking the file system:
+//!
+//! ```text
+//! needs json ../json                                    local path
+//! needs json ../json 0.2.0                              …with a version wish
+//! needs json git+https://host/firn-json#v1.2.0          git, fixed reference
+//! needs json https://host/json-1.2.0.tar#sha256=<64>    archive with checksum
+//! needs json 1.2.0                                      registry short form
+//! ```
+//!
+//! * `git+` MUST carry `#<reference>` — a commit or a tag. A branch name
+//!   is accepted as text but is a bad idea and the report says so; what is
+//!   refused is the FLOATING form without any `#` at all.
+//! * `http(s)://` MUST carry `#sha256=<64 lower case hex>`. An archive
+//!   without a checksum is not a dependency, it is a wish.
+//! * The registry short form is the one that LOOKS LIKE A VERSION
+//!   (`number.number.number`). A local directory literally named `1.2.0`
+//!   is therefore out of reach — a price of exactly one pathological name,
+//!   paid so that `needs json 1.2.0` can mean what everybody reads into it.
+//!
+//! The COMPILER NEVER SPEAKS TO THE NETWORK. A remote source is resolved
+//! through `firn.have` (written by `firnpkg fetch`) into a directory of
+//! the content addressed cache; from there on everything is a local path
+//! again. See `read_have` below and `package_world::cache_root`.
 //!
 //! Unknown keys are ERRORS, no silent skipping: a mistyped `publi` would
 //! otherwise open up an interface that nobody ever wanted to
 //! open.
+
+/// Where a dependency comes from. Decided purely lexically out of the
+/// source word of a `needs` line, so both compilers classify alike.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// A directory on this machine, relative to the manifest (round 48).
+    Path,
+    /// `git+<url>#<reference>`.
+    Git,
+    /// `http(s)://<url>#sha256=<64 hex>`.
+    Archive,
+    /// `<number.number.number>` — resolved through the index.
+    Registry,
+}
+
+/// The prefix that marks a git source.
+pub const GIT: &str = "git+";
+/// The fragment that carries the checksum of an archive.
+pub const SHA_FRAGMENT: &str = "#sha256=";
+
+/// Classify the source word of a `needs` line.
+pub fn origin_of(s: &str) -> Origin {
+    if s.starts_with(GIT) {
+        return Origin::Git;
+    }
+    if s.starts_with("https://") || s.starts_with("http://") {
+        return Origin::Archive;
+    }
+    if is_version(s) {
+        return Origin::Registry;
+    }
+    Origin::Path
+}
+
+/// Is `s` exactly 64 lower case hex digits? The shape of every checksum in
+/// this project — `firn.lock` writes them, `firn.have` carries them and a
+/// `needs` line may name one.
+pub fn is_hex64(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+}
+
+/// `git+<url>#<ref>` -> the url. Only ever called on `Origin::Git`.
+pub fn git_url(s: &str) -> &str {
+    let rest = &s[GIT.len()..];
+    match rest.find('#') {
+        Some(i) => &rest[..i],
+        None => rest,
+    }
+}
+
+/// `git+<url>#<ref>` -> the reference.
+pub fn git_ref(s: &str) -> &str {
+    let rest = &s[GIT.len()..];
+    match rest.find('#') {
+        Some(i) => &rest[i + 1..],
+        None => "",
+    }
+}
+
+/// `<url>#sha256=<hex>` -> the url.
+pub fn archive_url(s: &str) -> &str {
+    match s.find('#') {
+        Some(i) => &s[..i],
+        None => s,
+    }
+}
+
+/// `<url>#sha256=<hex>` -> the checksum.
+pub fn archive_hash(s: &str) -> &str {
+    match s.find(SHA_FRAGMENT) {
+        Some(i) => &s[i + SHA_FRAGMENT.len()..],
+        None => "",
+    }
+}
 
 /// File name of the manifest. Stands exclusively here.
 pub const MANIFEST: &str = "firn.pkg";
@@ -42,8 +147,10 @@ pub const MANIFEST: &str = "firn.pkg";
 /// How many directory levels the upward search covers at most.
 pub const SEARCH_DEPTH: usize = 64;
 
-/// One dependency: name (becomes the import prefix), local path and the
-/// version WISH. `want` empty means: any version will do.
+/// One dependency: name (becomes the import prefix), the SOURCE as it
+/// stands in the manifest (a local path or one of the remote forms of
+/// round FIRNHUB) and the version WISH. `want` empty means: any version
+/// will do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dependency {
     pub name: String,
@@ -297,6 +404,24 @@ pub fn is_outer_path(s: &str) -> bool {
 
 // ------------------------------------------------------------------ Reading
 
+/// Where the comment of this line starts (its length when there is none).
+///
+/// ROUND FIRNHUB: a `#` opens a comment only where a WORD BEGINS — at the
+/// start of the line or behind a separator. Round 48 cut at every `#`, and
+/// that made `git+https://host/repo#v1.2.0` impossible: the reference is
+/// part of the source, not a remark. The rule stays as short as it was —
+/// a comment is a word that starts with `#`; a `#` inside a word belongs
+/// to the word.
+pub fn comment_at(line: &str) -> usize {
+    let b = line.as_bytes();
+    for i in 0..b.len() {
+        if b[i] == b'#' && (i == 0 || b[i - 1] == b' ' || b[i - 1] == b'\t') {
+            return i;
+        }
+    }
+    b.len()
+}
+
 fn words(line: &str) -> Vec<&str> {
     line
         .split(|c| c == ' ' || c == '\t')
@@ -315,10 +440,7 @@ pub fn read(text: &str) -> Result<Manifest, Error> {
     for raw in text.split('\n') {
         nr += 1;
         let without_cr = raw.strip_suffix('\r').unwrap_or(raw);
-        let line = match without_cr.find('#') {
-            Some(i) => &without_cr[..i],
-            None => without_cr,
-        };
+        let line = &without_cr[..comment_at(without_cr)];
         let w = words(line);
         if w.is_empty() {
             continue;
@@ -411,10 +533,10 @@ pub fn read(text: &str) -> Result<Manifest, Error> {
             }
             "needs" => {
                 if w.len() < 3 {
-                    return Err(err("'needs' expects a name and a path"));
+                    return Err(err("'needs' expects a name and a source"));
                 }
                 if w.len() > 4 {
-                    return Err(err("'needs' expects at most one version behind the path"));
+                    return Err(err("'needs' expects at most one version behind the source"));
                 }
                 // ROUND 93: the fourth word is the version wish. It is
                 // checked HERE for its shape, and in `package_world` against
@@ -431,8 +553,36 @@ pub fn read(text: &str) -> Result<Manifest, Error> {
                         w[1]
                     )));
                 }
-                if !is_outer_path(w[2]) {
-                    return Err(err("'needs' expects a name and a path"));
+                // ROUND FIRNHUB: where the dependency comes from. The
+                // remote forms are checked HERE, on the text, because a
+                // source that cannot be fetched is a mistake in the
+                // manifest and not a failure of the network.
+                match origin_of(w[2]) {
+                    Origin::Path => {
+                        if !is_outer_path(w[2]) {
+                            return Err(err("'needs' expects a name and a source"));
+                        }
+                    }
+                    Origin::Git => {
+                        if git_url(w[2]).is_empty() {
+                            return Err(err(&format!("git source '{}' has no address", w[2])));
+                        }
+                        if git_ref(w[2]).is_empty() {
+                            return Err(err(&format!(
+                                "git source '{}' has no fixed reference (expected 'git+<url>#<commit-or-tag>')",
+                                w[2]
+                            )));
+                        }
+                    }
+                    Origin::Archive => {
+                        if !is_hex64(archive_hash(w[2])) {
+                            return Err(err(&format!(
+                                "archive source '{}' has no checksum (expected '<url>#sha256=<64 hex digits>')",
+                                w[2]
+                            )));
+                        }
+                    }
+                    Origin::Registry => {}
                 }
                 if m.dependent.iter().any(|a| a.name == w[1]) {
                     return Err(err(&format!(
@@ -474,6 +624,116 @@ pub fn read(text: &str) -> Result<Manifest, Error> {
     Ok(m)
 }
 
+// -------------------------------------------------------------- firn.have
+//
+// WHAT THIS FILE IS FOR, and why it is not `firn.lock` (round FIRNHUB)
+// ---------------------------------------------------------------------
+// `firn.lock` is written AFTER a build and says what went in. `firn.have`
+// is written BEFORE one, by `firnpkg fetch`, and says which octets a
+// remote `needs` line was resolved to. Two producers, two moments, two
+// files — a fetcher that wrote into `firn.lock` would have to invent the
+// checksums of a build that has not happened yet.
+//
+// It sits next to the ROOT manifest and covers the WHOLE graph, including
+// the remote dependencies of dependencies. That is the same decision the
+// lock file makes: one file per project, not one per package, so a
+// fetched package stays a pure content tree and does not have to be
+// republished when something below it moves.
+//
+//     have 1
+//     need json git+https://host/firn-json#v1.2.0 4f3c…(40) 9c1e…(64)
+//     need date https://host/date-1.0.tar#sha256=aa…  aa…(64)  bb…(64)
+//
+// Fields: name · the source EXACTLY as it stands in the manifest · what
+// the source resolved to (a commit, or the checksum of the archive
+// octets) · the CONTENT HASH of the unpacked tree. The last one is the
+// address in the cache and the only one the compiler needs to find the
+// files; the first three are there so that a mismatch between manifest
+// and fetched state is an error and not a surprise.
+
+/// Name of the file that records what was fetched. Stands exclusively here.
+pub const HAVEFILE: &str = "firn.have";
+/// Format number of its first line.
+pub const HAVE_FORMAT: u32 = 1;
+
+/// One resolved remote dependency.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fetched {
+    pub name: String,
+    pub source: String,
+    pub resolved: String,
+    pub content: String,
+    pub line: u32,
+}
+
+/// Reads `firn.have`. A pure function on the text, like `read`.
+pub fn read_have(text: &str) -> Result<Vec<Fetched>, Error> {
+    let mut out: Vec<Fetched> = Vec::new();
+    let mut head = false;
+    let mut nr = 0u32;
+    for raw in text.split('\n') {
+        nr += 1;
+        let without_cr = raw.strip_suffix('\r').unwrap_or(raw);
+        let line = match without_cr.find('#') {
+            // A `#` inside a source word is part of it; a comment only
+            // starts a line here. The manifest allows a trailing comment,
+            // this file does not — it is written by a program.
+            Some(0) => "",
+            _ => without_cr,
+        };
+        let w = words(line);
+        if w.is_empty() {
+            continue;
+        }
+        let err = |msg: &str| Error { line: nr, msg: msg.to_string() };
+        if !head {
+            if w[0] != "have" || w.len() != 2 || w[1] != HAVE_FORMAT.to_string() {
+                return Err(err(&format!(
+                    "expected 'have {}' as the first line",
+                    HAVE_FORMAT
+                )));
+            }
+            head = true;
+            continue;
+        }
+        if w[0] != "need" {
+            return Err(err(&format!("unknown key '{}' (allowed: need)", w[0])));
+        }
+        if w.len() != 5 {
+            return Err(err(
+                "'need' expects a name, a source, a resolved reference and a content hash",
+            ));
+        }
+        if !is_hex64(w[4]) {
+            return Err(err(&format!("invalid content hash '{}'", w[4])));
+        }
+        if out.iter().any(|f: &Fetched| f.name == w[1]) {
+            return Err(err(&format!("package '{}' appears more than once", w[1])));
+        }
+        out.push(Fetched {
+            name: w[1].to_string(),
+            source: w[2].to_string(),
+            resolved: w[3].to_string(),
+            content: w[4].to_string(),
+            line: nr,
+        });
+    }
+    if !head {
+        return Err(Error {
+            line: 0,
+            msg: format!("the file needs a first line 'have {}'", HAVE_FORMAT),
+        });
+    }
+    Ok(out)
+}
+
+/// The entry for this name AND this source. Both have to fit: a
+/// `firn.have` that answers for `json` but was written for another source
+/// is a stale file, and a build must not quietly use it.
+pub fn have_find<'a>(have: &'a [Fetched], name: &str, source: &str) -> Option<&'a Fetched> {
+    have.iter().find(|f| f.name == name && f.source == source)
+}
+
 // ------------------------------------------------------------------- Output
 
 /// The report of `--package-info`. Character for character alike on both
@@ -495,12 +755,22 @@ pub fn info_text(m: &Manifest, root: &str) -> String {
         s.push_str(&format!("public {}\n", o));
     }
     for a in &m.dependent {
+        // A LOCAL path is reported the way this build will read it, i.e.
+        // joined onto the package root. A REMOTE source is reported
+        // VERBATIM: joining it would produce nonsense
+        // (`/p/app/git+https://…`), and the spelling in the manifest is
+        // exactly what identifies it later in `firn.have`.
+        let place = if origin_of(&a.path) == Origin::Path {
+            join(&w, &a.path)
+        } else {
+            a.path.clone()
+        };
         if a.want.is_empty() {
-            s.push_str(&format!("needs {} {}\n", a.name, join(&w, &a.path)));
+            s.push_str(&format!("needs {} {}\n", a.name, place));
         } else {
             // A report that hid the version wish would be a lie about the
             // manifest — `firnc1` writes the same line (`world_info`).
-            s.push_str(&format!("needs {} {} {}\n", a.name, join(&w, &a.path), a.want));
+            s.push_str(&format!("needs {} {} {}\n", a.name, place, a.want));
         }
     }
     s
@@ -594,7 +864,7 @@ mod tests {
     #[test]
     fn wrong_arity() {
         assert!(read("package a b\nversion 1.0.0\nmain a.fi\n").unwrap_err().msg.contains("'package' expects exactly one name"));
-        assert!(read("package a\nversion 1.0.0\nmain a.fi\nneeds g\n").unwrap_err().msg.contains("'needs' expects a name and a path"));
+        assert!(read("package a\nversion 1.0.0\nmain a.fi\nneeds g\n").unwrap_err().msg.contains("'needs' expects a name and a source"));
         assert!(read("package a\nversion 1.0.0\nmain a.fi\npublic\n").unwrap_err().msg.contains("'public' expects at least one module name"));
     }
 
@@ -670,12 +940,12 @@ mod tests {
         assert!(read("package a\nversion 1.0.0\nneeds g ../g 0.2.0 x\n")
             .unwrap_err()
             .msg
-            .contains("'needs' expects at most one version behind the path"));
+            .contains("'needs' expects at most one version behind the source"));
         // And the old message for a line that is too short stays what it was.
         assert!(read("package a\nversion 1.0.0\nneeds g\n")
             .unwrap_err()
             .msg
-            .contains("'needs' expects a name and a path"));
+            .contains("'needs' expects a name and a source"));
         assert_eq!(
             info_text(&x, "/p/app"),
             "package app\nversion 0.1.0\nroot /p/app\nmain /p/app/s.fi\nsource /p/app\n\

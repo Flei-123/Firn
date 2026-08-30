@@ -12,14 +12,36 @@
 //! FORMAT (line based, like the manifest, deliberately tiny)
 //! ---------------------------------------------------------------------
 //! ```text
-//! lock 1                                   format, exactly once, first line
+//! lock 2                                   format, exactly once, first line
 //! root app                                 name of the package that was built
 //! package app 0.1.0 . <sha256>             one line per package, SORTED BY NAME
 //! package geo 0.2.0 ../geo <sha256>
-//! package text 0.1.0 ../text <sha256>
+//! package json 1.2.0 cache:<content> <sha256>
+//! origin json git+https://h/j#v1.2.0 <commit> <content>
 //! outside 0 <sha256>                       files that belong to no package
 //! total <sha256>                           over every line above
 //! ```
+//!
+//! ROUND FIRNHUB — TWO ADDITIONS, AND THE FORMAT NUMBER FOR THEM
+//! ---------------------------------------------------------------------
+//! * A package that was FETCHED has no path on this machine that would
+//!   mean anything on another one. Its place is therefore
+//!   `cache:<content hash>` — the address in the content addressed cache,
+//!   the same on every machine that fetched the same octets.
+//! * One `origin` line per fetched package, sorted by name, after the
+//!   `package` block: the source EXACTLY as the manifest spelled it, what
+//!   it resolved to (a commit, or the checksum of the archive octets) and
+//!   the content hash of the unpacked tree.
+//!
+//! Both of them make the file say something it could not say before:
+//! **where** the sources came from, not only what they contained. A later
+//! build whose cache holds different octets under the same name produces
+//! a different `package` checksum AND a different `origin` line, and
+//! `--locked` stops at the first of them with a place and both texts.
+//!
+//! The format number goes from 1 to 2. A reader that finds a number it
+//! does not know stops instead of guessing — so an old `firn.lock` is
+//! REFUSED and not silently reinterpreted.
 //!
 //! Everything in it is MACHINE INDEPENDENT, and each piece for a reason:
 //!
@@ -56,7 +78,7 @@ use crate::package_world::{self, World};
 pub const LOCKFILE: &str = "firn.lock";
 /// Format number of the first line. A reader that finds a different one
 /// stops instead of guessing.
-pub const FORMAT: u32 = 1;
+pub const FORMAT: u32 = 2;
 
 // ------------------------------------------------------------------ SHA-256
 //
@@ -293,13 +315,29 @@ pub fn text(world: &World, files: &[SourceFile], cwd: &str) -> Result<String, St
         for x in per[i].drain(..) {
             pieces.push(x);
         }
+        // ROUND FIRNHUB: a fetched package is addressed by its CONTENT,
+        // a local one by its path relative to the root package.
+        let place = match &p.origin {
+            Some(f) => format!("cache:{}", f.content),
+            None => package::relative(&root, &p.root),
+        };
         lines.push(format!(
             "package {} {} {} {}",
             p.manifest.name,
             p.manifest.version,
-            package::relative(&root, &p.root),
+            place,
             sum_over(&mut pieces)
         ));
+    }
+    // ROUND FIRNHUB: where the fetched packages came from. Same order as
+    // the block above, so the two can be read side by side.
+    for &i in &order {
+        if let Some(f) = &world.packages[i].origin {
+            lines.push(format!(
+                "origin {} {} {} {}",
+                world.packages[i].manifest.name, f.source, f.resolved, f.content
+            ));
+        }
     }
     lines.push(format!(
         "outside {} {}",

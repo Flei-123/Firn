@@ -22,6 +22,11 @@ pub struct Package {
     pub manifestpfad: String,
     /// Index into `World::packages` per entry of `manifest.dependent`.
     pub edges: Vec<usize>,
+    /// ROUND FIRNHUB: where this package came from. `None` = a directory
+    /// on this machine (round 48). `Some` = out of the cache, with the
+    /// source as it stood in the manifest, what it resolved to and the
+    /// content hash that IS its address.
+    pub origin: Option<package::Fetched>,
 }
 
 /// All packages of this compilation. `packages[0]` is the root package.
@@ -82,6 +87,99 @@ pub fn build_path(path: &str, cwd: &str) -> String {
     } else {
         path.to_string()
     }
+}
+
+/// The content addressed cache (round FIRNHUB).
+///
+/// `$FIRN_CACHE` wins; without it `$HOME/.firn/cache`; without a `$HOME`
+/// the empty text, and then every remote dependency is an error with a
+/// sentence that says so. NO silent fallback into the working directory:
+/// a cache that lands somewhere else than the user thinks is worse than
+/// none at all.
+///
+/// The layout is the one `pkg/opk.py` of OrientOS uses, minus its one
+/// concession to a file system with 24 octet names:
+///
+/// ```text
+/// <cache>/pkg/<64 hex>/     the unpacked package, immutable
+/// <cache>/dl/<64 hex>       the octets of a downloaded archive
+/// <cache>/index.txt         what the fetcher already knows
+/// ```
+///
+/// opk shortens the directory name to twenty hex digits because an OFS
+/// directory entry has room for 24 octets; there is no such limit here,
+/// so the name is the WHOLE hash and a collision cannot be traded for
+/// convenience.
+pub fn cache_root() -> String {
+    if let Ok(v) = std::env::var("FIRN_CACHE") {
+        if !v.is_empty() {
+            return package::normalize(&v);
+        }
+    }
+    if let Ok(h) = std::env::var("HOME") {
+        if !h.is_empty() {
+            return package::join(&package::normalize(&h), ".firn/cache");
+        }
+    }
+    String::new()
+}
+
+/// Directory of one cached package: `<cache>/pkg/<content hash>`.
+pub fn cache_place(content: &str) -> String {
+    let c = cache_root();
+    if c.is_empty() {
+        return String::new();
+    }
+    package::join(&c, &format!("pkg/{}", content))
+}
+
+/// Reads `<root>/firn.have`, if it is there. `Ok(None)` = no such file,
+/// which is not an error until a remote source actually asks for it.
+fn load_have(root: &str) -> Result<Option<Vec<package::Fetched>>, String> {
+    let hp = package::join(root, package::HAVEFILE);
+    let text = match std::fs::read_to_string(&hp) {
+        Ok(t) => t,
+        Err(_) => return Ok(None),
+    };
+    match package::read_have(&text) {
+        Ok(v) => Ok(Some(v)),
+        Err(f) => {
+            if f.line == 0 {
+                Err(err(format!("{}: {}", hp, f.msg)))
+            } else {
+                Err(err(format!("{}:{}: {}", hp, f.line, f.msg)))
+            }
+        }
+    }
+}
+
+/// A remote source was not fetched (or was fetched for another source).
+pub fn text_not_fetched(mpath: &str, line: u32, name: &str, source: &str, root: &str) -> String {
+    format!(
+        "error: {}:{}: package '{}' has not been fetched\nnote: source '{}'\nnote: 'firnpkg fetch {}' writes '{}'\n",
+        mpath,
+        line,
+        name,
+        source,
+        root,
+        package::join(root, package::HAVEFILE)
+    )
+}
+
+/// `firn.have` names a content hash whose directory is not in the cache.
+pub fn text_cache_missing(name: &str, content: &str, place: &str) -> String {
+    format!(
+        "error: package '{}' is not in the cache\nnote: '{}' is expected\nnote: content {}\n",
+        name, place, content
+    )
+}
+
+/// There is no cache directory to look in at all.
+pub fn text_no_cache(name: &str) -> String {
+    format!(
+        "error: package '{}' comes from a remote source and there is no cache\nnote: set $FIRN_CACHE or $HOME\n",
+        name
+    )
 }
 
 fn is_file(p: &str) -> bool {
@@ -168,10 +266,16 @@ impl World {
             root: root.to_string(),
             manifestpfad: mp,
             edges: Vec::new(),
+            origin: None,
         });
         // BREADTH-FIRST SEARCH over `needs`. A package already loaded is
         // recognized by its root directory — the same place is the same package,
         // even when two manifests spell it differently.
+        // ROUND FIRNHUB: everything a remote source was resolved to. It
+        // is read ONCE, out of the ROOT package, and covers the whole
+        // graph — see the comment above `read_have` for why it is not one
+        // file per package.
+        let have = load_have(root)?;
         let mut i = 0usize;
         while i < packages.len() {
             let own_root = packages[i].root.clone();
@@ -179,7 +283,36 @@ impl World {
             let mpath = packages[i].manifestpfad.clone();
             let mut edges = Vec::new();
             for a in &deps {
-                let dw = absolute(&package::join(&own_root, &a.path), &own_root);
+                // WHERE the dependency lies. A local path is joined onto
+                // the package that names it (round 48). A remote source
+                // never touches the network here: it is looked up in
+                // `firn.have` and turns into a directory of the cache.
+                let mut from: Option<package::Fetched> = None;
+                let dw = if package::origin_of(&a.path) == package::Origin::Path {
+                    absolute(&package::join(&own_root, &a.path), &own_root)
+                } else {
+                    let entry = match have.as_ref().and_then(|h| package::have_find(h, &a.name, &a.path)) {
+                        Some(f) => f.clone(),
+                        None => {
+                            return Err(text_not_fetched(
+                                &mpath,
+                                a.line,
+                                &a.name,
+                                &a.path,
+                                &build_path(root, &cwd()),
+                            ))
+                        }
+                    };
+                    let place = cache_place(&entry.content);
+                    if place.is_empty() {
+                        return Err(text_no_cache(&a.name));
+                    }
+                    if !is_file(&package::join(&place, package::MANIFEST)) {
+                        return Err(text_cache_missing(&a.name, &entry.content, &place));
+                    }
+                    from = Some(entry);
+                    place
+                };
                 let present = packages.iter().position(|p| p.root == dw);
                 let idx = match present {
                     Some(k) => k,
@@ -208,6 +341,7 @@ impl World {
                             root: dw,
                             manifestpfad: dmp,
                             edges: Vec::new(),
+                            origin: from,
                         });
                         packages.len() - 1
                     }
