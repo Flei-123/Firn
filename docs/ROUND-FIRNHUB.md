@@ -774,9 +774,80 @@ sagt das in seinem eigenen Kopf.
 | `bash tools/packages/run.sh` | 39 bestanden, 0 Fehler | 39 bestanden, 0 Fehler |
 | `bash tools/hub/run.sh` | — (neu) | **37 bestanden, 0 Fehler** |
 | `bash tools/english/check.sh` | 0 / 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 / 0 |
-| `bash test.sh` | PLATZHALTER_TESTSH_VORHER | PLATZHALTER_TESTSH_NACHHER |
+| `bash test.sh` | **9 von 1.534 Fehlern** | **3 von 1.535 Fehlern** (ein Abschnitt mehr: 35) |
+| `bash tools/fixpoint.sh` | rot (Zeitstempel, s. u.) | **stage 2 == stage 3, zeichengleich**, 794.968 Zeilen Assembler |
+| `bash tools/repro/two_machines.sh` | PASS | **PASS**, `firn.lock` `4dba6ae0…` aus **allen vier** Läufen gleich |
+| `bash tools/self_compare.sh` | 327 gleich, 1 abweichend | **328 gleich, 0 abweichend** |
+
+Die neun Fehler **vorher** und die drei **nachher** im Einzelnen — es ist
+dieselbe Sorte, nur weniger davon:
+
+| Fehler | vorher | nachher |
+|---|---|---|
+| `tests/834_arc_thread.fi`, `tests/860_thread_basic.fi` | 6 (in vier Baustufen) | **1** |
+| `tools/self_compare.sh` (Folge davon) | 1 | 0 |
+| `tools/fixpoint.sh` | 1 | 1 → **grün nachgemessen** |
+| `tools/bench82/run.sh` | 1 | 0 |
+| `tools/english/check.sh` | 0 | 1 → **grün nachgemessen** |
+
+* **Die Thread-Tests** sind der Flatterer, den `docs/ROUND93.md` Abschnitt 9
+  schon beschrieben und *gemessen* hat: `tests/834_arc_thread.fi` behauptet,
+  ein UNGESICHERTER Zähler müsse Erhöhungen verlieren, und auf einer
+  Maschine mit Lastspitze 20 überlappen die vier Fäden nicht. Vorher sechsmal
+  rot, nachher einmal — dieselbe Ursache, andere Würfel.
+* **`tools/fixpoint.sh`** meldete `lib/firnc1/gctext.fi is older than
+  lib/gc/*.fi`. Das ist ein **Zeitstempel-Artefakt eines frischen
+  Arbeitsbaums**: `git worktree add` gibt allen Dateien dieselbe Sekunde, und
+  der Vergleich ist streng. Nachgeprüft, statt geglaubt: `bash
+  tools/gen_gctext.sh` ausgeführt, `diff` gegen die Fassung davor →
+  **kein Oktett anders**. Danach `bash tools/fixpoint.sh`: **stage 2 ==
+  stage 3, zeichengleich, 4.741.344 Oktette.** Der Fund ist also: derselbe
+  Fehler steht auch in der Vorher-Messung, aus demselben Grund, und er sagt
+  nichts über den Inhalt aus.
+* **`tools/english/check.sh`** meldete vier deutsche Zeilen in
+  `tools/hub/measured-2026-08-30.md` — der Rohausgabe des Prüfstands, deren
+  Überschriften deutsch sind. `tools/hub/` steht seitdem neben den beiden
+  anderen in der benannten Ausnahme; danach **0 / 0 / 0 / 0 / 0**.
+* **`tools/bench82/run.sh`** war vorher rot (eine Geschwindigkeitsmessung
+  unter Last) und nachher grün. Auch das ist die Maschine, nicht der Code.
+
+**Die Testsuite ist also nicht schlechter geworden, sondern besser** — und
+der einzige verbliebene Fehler ist der benannte Flatterer.
 
 `tools/english/check.sh` hat eine **benannte Ausnahme** bekommen:
 `docs/ROUND-FIRNHUB.md` und `demos/hub/` dürfen deutsche Prosa tragen, weil
 der Projekteigner genau das bestellt hat. Eine Ausnahme, die in der Datei
 steht, ist ehrlicher als eine Messlatte, die still auf 16 Zeilen fällt.
+
+
+---
+
+## Kurzfassung für den Chat
+
+1. **`needs` kann jetzt woandershin zeigen** — `git+<url>#<ref>`, ein Archiv
+   mit `#sha256=`, oder eine Version über einen Index — und **der Compiler
+   spricht trotzdem nie mit dem Netz.** Der Beschaffer `firnpkg` (in Firn,
+   einmal, nicht doppelt) legt das Geholte inhaltsadressiert ab und schreibt
+   `firn.have`; von da an sieht der Compiler lokale Pfade. Deshalb braucht
+   ein Bau ohne Netz **keinen Schalter**. `firn.lock` Format 2 hält Herkunft,
+   aufgelösten Verweis und Inhaltshash fest; ein manipulierter
+   Zwischenspeicher bricht den Bau ab (zweimal unabhängig gefangen).
+   **37 Prüfungen, 0 Fehler**, gegen ein echtes Git-Repositorium, beide
+   Compiler zeichengleich.
+
+2. **Die Antwort auf die Frage nach der getrennten Übersetzung heißt: erst
+   den Codegenerator.** Gemessen: das Paketsystem kostet **nichts** (N Pakete
+   ≈ ein Paket mit denselben Zeilen, ±13 %), der Speicher ist linear — aber
+   der **Codegenerator wächst kubisch** und ist bei 100 Paketen **93 % der
+   Bauzeit**. Ein linearer Codegenerator brächte 267.000 Zeilen von 143 s auf
+   ~18 s (Faktor 8) und schöbe die Wand von 130.000 Zeilen über eine Million.
+   Getrennte Übersetzung ist das viel größere Vorhaben und lohnt **danach**.
+
+3. **Zwei Funde, die niemand bestellt hat.** (a) Auf `main` und `speed` ist
+   der selbstgehostete Compiler **kaputt**: der Optimierlauf `thread-bool`
+   aus Runde SPEED übersetzt `firnc1` falsch, kein `import` wird mehr
+   aufgelöst, Exit 2 ohne Meldung — eingegrenzt auf genau diesen einen Lauf,
+   deshalb zweigt diese Runde von `r93-lock` ab. (b) Die `outside`-Zeile von
+   `firn.lock` fällt bei den beiden Compilern **verschieden** aus, sobald ein
+   Programm `str` benutzt (die Sammler-Laufzeit zählt firnc0 mit, firnc1
+   nicht) — ein Loch im Versprechen der Runde 93, älter als diese Runde.
