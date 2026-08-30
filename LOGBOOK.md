@@ -384,6 +384,6 @@ rather than FOR one.
 
 MEASUREMENTS: `tools/android/run.sh` -- 309 cases, SAME 295, NOT SUPPORTED 9 (4 inline assembler,
 5 threads), X86 ALREADY 4, AARCH64 ALREADY 1 (proven in the same run by building and running the gnu
-target), DIFFERENT 0; the shared library 3 of 3. `tools/android/unchanged.sh` -- 614 / 0 / 0. The same
+target), DIFFERENT 0; the shared library 3 of 3. `--no-opt` gives the same five numbers. `tools/android/unchanged.sh` -- 614 / 0 / 0. The same
 program: x86 6,648 octets, aarch64-linux 7,920, Android PIE 16,464, Android `.so` 16,096; a library with
 two exported functions 7,800.

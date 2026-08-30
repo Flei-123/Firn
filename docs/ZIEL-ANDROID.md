@@ -439,6 +439,10 @@ and the two compared, output character for character and exit code:
   DIFFERENT         0
 ```
 
+`tools/android/run.sh --no-opt` — the same corpus with the optimiser off —
+gives the same five numbers, so the agreement is not an artefact of one
+build level.
+
 Before `target::rodata_section()` (5.2) that same run said `SAME 191,
 DIFFERENT 109` — 105 of them the loader refusing `DT_TEXTREL`. The number is
 in here because a test that cannot go red proves nothing, and this one did.
