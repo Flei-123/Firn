@@ -263,6 +263,54 @@ else
     bad "$(head -4 "$WORK/tofu.err")"
 fi
 
+echo "== an archive with a checksum =="
+
+# The archive path measured, not only described. `curl` reads a `file://`
+# address exactly like an `https://` one, and the checksum decides the same
+# way -- so this needs no server and no network, and it still walks every
+# step: download, weigh the octets, unpack, hash the tree, address it.
+mkdir -p "$WORK/tarsrc"
+cp -r demos/hub/date "$WORK/tarsrc/date-1.1.0"
+( cd "$WORK/tarsrc" && tar -cf "$WORK/date-1.1.0.tar" date-1.1.0 )
+TARSUM=$(sha256sum "$WORK/date-1.1.0.tar" | cut -d' ' -f1)
+
+PROJ3="$WORK/proj3"
+mkdir -p "$PROJ3"
+cp -r demos/hub/app "$PROJ3/app"
+cp -r demos/hub/json "$PROJ3/json"
+sed -i "s|^needs    date  ../date  1.1.0\$|needs    date  file://$WORK/date-1.1.0.tar#sha256=$TARSUM  1.1.0|" \
+    "$PROJ3/app/firn.pkg"
+
+check "an archive is fetched, weighed and unpacked"
+if "$PKG" fetch --quiet "$PROJ3/app" > /dev/null 2> "$WORK/tar.err" \
+   && grep -q "^need date file://$WORK/date-1.1.0.tar#sha256=$TARSUM $TARSUM [0-9a-f]\{64\}\$" \
+        "$PROJ3/app/firn.have"; then
+    good
+else
+    bad "$(head -3 "$WORK/tar.err")" "$(cat "$PROJ3/app/firn.have" 2>/dev/null)"
+fi
+
+check "the wrapping directory of the archive is peeled off"
+TC=$(awk '/^need date /{print $5}' "$PROJ3/app/firn.have" 2>/dev/null)
+if [ -n "$TC" ] && [ -f "$FIRN_CACHE/pkg/$TC/firn.pkg" ]; then good; else bad "no firn.pkg in $FIRN_CACHE/pkg/$TC"; fi
+
+check "and the project builds out of it, in both compilers"
+if "$FIRNC" --package "$PROJ3/app" -o "$WORK/t0" > "$WORK/t0.log" 2>&1 \
+   && [ "$("$WORK/t0")" = "firn 2026-08-30 Sunday" ] \
+   && "$FC1" --package "$PROJ3/app" -o "$WORK/t1" >> "$WORK/t0.log" 2>&1 \
+   && [ "$("$WORK/t1")" = "firn 2026-08-30 Sunday" ]; then
+    good
+else
+    bad "$(tail -3 "$WORK/t0.log")"
+fi
+
+check "an archive whose octets do not match the checksum is refused"
+WRONG=$(printf 'x' | sha256sum | cut -d' ' -f1)
+sed -i "s|#sha256=$TARSUM|#sha256=$WRONG|" "$PROJ3/app/firn.pkg"
+rm -f "$PROJ3/app/firn.have"
+"$PKG" fetch --quiet "$PROJ3/app" > /dev/null 2> "$WORK/tar2.err"
+if [ $? = 2 ] && grep -q "wrong checksum" "$WORK/tar2.err"; then good; else bad "$(head -3 "$WORK/tar2.err")"; fi
+
 echo "== the new manifest forms, in both compilers =="
 
 mkdir -p "$WORK/bad/src"
