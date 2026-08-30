@@ -55,7 +55,7 @@ the numbers are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 | | state | proof |
 |---|---|---|
-| **Self-hosting** | `firnc1` is written in Firn, compiles itself, **stage 2 == stage 3 character-identical** | `tools/fixpoint.sh`, `tools/self_compare.sh` |
+| **Self-hosting** | `firnc1` is written in Firn, compiles itself, **stage 2 == stage 3 byte-identical**, and the everyday build needs **no Rust** any more: `bootstrap/` carries a seed that only wants `as` and `ld`. Where the two compilers still disagree is counted rather than claimed -- of 208 programs that have to be REFUSED, `firnc1` still accepts **10**, and it names a position for every refusal but not yet a sentence | `tools/fixpoint.sh`, `tools/self_compare.sh`, `tools/bootstrap_gaps.sh`, `tools/no_rust.sh`, `docs/BOOTSTRAP-LUECKEN.md` |
 | **Two machines** | x86-64 and aarch64, same source, **296 of 301 programs byte-identical output**; 1 differs, and it is named below | `tools/aarch64/run.sh` |
 | **Language** | structs, arrays, `enum` + `match` with exhaustiveness check, generics, interfaces, closures and function values, error unions `E!T`, `defer`/`errdefer`, `comptime` + `emit`, `f32`/`f64`, `str` with `f"…"` interpolation, threads, `extern fn` in both directions | `tests/` (three build levels each) |
 | **Garbage collector** | opt-in, incremental mark-sweep, **longest pause 0.45 ms** at 120,000 live nodes; weak refs, finalizers, `GcVec`/`GcMap` | `tools/dom_soak/run.sh` |

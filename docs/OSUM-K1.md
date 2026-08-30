@@ -338,6 +338,22 @@ above `say_reason`. (Measured 2026-08-24 against `.firnc1`. The silent
 exit is itself worth a look: a compiler that refuses something should say
 what.)
 
+**CLOSED, round BOOTSTRAP (2026-08-30).** The cause was in
+`lib/firnc1/sema.fi`: one function decided in one place whether an
+expression is a PLACE and whether it may be WRITTEN TO, and a `static`
+without `mut` may not be written to -- so `&MSG` counted as an attempt to
+write. `firnc0` has always kept the two apart. All four rows of the table
+above are `ok` in both compilers now; the proof is
+`tests/1620_static_address.fi`, the counter-proof (writing to an immutable
+`static` stays an error) is `tests/neg/static_write_without_mut.fi`. The
+twenty-two texts of the kernel can become `static`s.
+
+The remark about the silent exit was the more valuable half of this note.
+`firnc1` said nothing for **178 of 188** refusals; since round BOOTSTRAP it
+names a file, a line and a column for every one of them, and lexer errors
+come out byte-identical to `firnc0`'s. The whole measurement is in
+`docs/BOOTSTRAP-LUECKEN.md`.
+
 ---
 
 ## 10. The keyboard, and how a run ends

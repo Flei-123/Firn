@@ -46,7 +46,8 @@ import gc
 import iface
 import core
 
-export { Lower, low_new, low_free, low_run, low_error, low_fir, low_unsuitable,
+export { Lower, low_new, low_free, low_run, low_error, low_error_pos,
+    low_fir, low_unsuitable,
     low_mu_set, low_fe_set, low_gc_set, low_if_set, low_checked_set }
 
 const NONE: u32 = 4294967295
@@ -80,7 +81,11 @@ struct Lower {
     feh: u64 // registry of error sets/unions (0 = none)
     gcr: u64 // registry of the gc classes (round 34; 0 = none)
     ifr: u64 // registry of the interfaces (round 46; 0 = none)
-    err: usize
+    err: usize,
+    // ROUND BOOTSTRAP: position of the first error and the node the
+    // lowering is standing on (see sema.fi).
+    err_pos: u64,
+    err_at: u64
     unsuitable: bool // aggregate or `defer` found
     // ROUND 72 (checkmode.rs, SPEC 13 item L9): does THIS build level check
     // `+ - * / %` and a narrowing `as`? `dev`, `dev-fast` and
@@ -102,7 +107,7 @@ fn low_new(b: u64, it: u64, sm: u64) -> Lower {
         b_limit: vec_new[u32](),
         l_break: vec_new[u32](), l_cont: vec_new[u32](), l_depth: vec_new[u32](),
         d_stmt: vec_new[u32](), d_err: vec_new[u32](), d_limit: vec_new[u32](),
-        sret: NONE, mu: 0, feh: 0, gcr: 0, ifr: 0, err: 0, unsuitable: false,
+        sret: NONE, mu: 0, feh: 0, gcr: 0, ifr: 0, err: 0, err_pos: 0, err_at: 0, unsuitable: false,
         pin_node: NONE, pin_addr: 0,
         checked: true, msg: rt.buf_new(),
     }
@@ -162,6 +167,17 @@ fn names(l: *mut Lower) -> *mut intern.Interner { return (*l).it as *mut intern.
 fn give_up(l: *mut Lower) {
     (*l).unsuitable = true
 }
+
+// ROUND BOOTSTRAP: one error, with the place it was found at.
+fn oops(l: *mut Lower) {
+    if (*l).err == 0 {
+        (*l).err_pos = (*l).err_at
+    }
+    (*l).err = (*l).err + 1
+}
+
+// The packed position (`ast.pos_pack`) of the FIRST error, 0 = none.
+fn low_error_pos(l: *mut Lower) -> u64 { return (*l).err_pos }
 
 // ------------------------------------------------- types: source -> FIR
 
@@ -1017,7 +1033,13 @@ fn copymem(l: *mut Lower, target: u32, source: u32, size: u64) {
 // ------------------------------------------------------------ expressions
 
 fn value(l: *mut Lower, e: u32) -> u32 {
+    let saved: u64 = (*l).err_at
+    let here: u64 = ast.expr_pos(tree(l), e)
+    if here != 0 {
+        (*l).err_at = here
+    }
     let v: u32 = value_inner(l, e)
+    (*l).err_at = saved
     // ROUND 71 -- the counterpart to the widening in `sema::expr`. The type
     // checker has noted THAT it happens, here it really happens:
     // `cvtss2sd`. One place for it, so that no context can lose it.
@@ -2303,6 +2325,10 @@ fn stmt(l: *mut Lower, i: u32) {
     }
     let b: *mut ast.Tree = tree(l)
     let a: u32 = ast.s_kind(b, i)
+    let sp: u64 = ast.stmt_pos(b, i)
+    if sp != 0 {
+        (*l).err_at = sp
+    }
 
     if a == ast.S_LET || a == ast.S_VAR {
         let init: u32 = ast.s_c(b, i)
@@ -2485,7 +2511,7 @@ fn stmt(l: *mut Lower, i: u32) {
             if has_fe(l) && has_errdefer(l) {
                 let rt0: u32 = sema.sema_ty(sm(l), wv)
                 if err.error_union_of_ty(fel(l), tf(l), rt0) != NONE {
-                    (*l).err = (*l).err + 1
+                    oops(l)
                     return
                 }
             }
@@ -2685,12 +2711,12 @@ fn ctor_write(l: *mut Lower, e: u32, addr: u32) {
     let m: *mut pattern.Pat = mul(l)
     let t: u32 = sema.sema_ty(sm(l), e)
     if types.ty_kind(tf(l), t) != types.K_STRUCT {
-        (*l).err = (*l).err + 1
+        oops(l)
         return
     }
     let ei: u32 = pattern.pat_enum_at_struct(m, types.ty_a(tf(l), t))
     if ei == NONE {
-        (*l).err = (*l).err + 1
+        oops(l)
         return
     }
     // The variant name from the callee (after the first `::`).
@@ -2708,7 +2734,7 @@ fn ctor_write(l: *mut Lower, e: u32, addr: u32) {
     }
     let vi: u32 = pattern.pat_variant_find(m, ei, vname)
     if vi == NONE {
-        (*l).err = (*l).err + 1
+        oops(l)
         return
     }
     // First the variant number, then the payload fields.
@@ -2882,17 +2908,17 @@ fn under_test(l: *mut Lower, addr: u32, pat: u32, ty: u32, fail: u32) {
     }
     // MU_VARIANT: first the variant number, then the subpatterns.
     if types.ty_kind(tf(l), ty) != types.K_STRUCT {
-        (*l).err = (*l).err + 1
+        oops(l)
         return
     }
     let ei: u32 = pattern.pat_enum_at_struct(m, types.ty_a(tf(l), ty))
     if ei == NONE {
-        (*l).err = (*l).err + 1
+        oops(l)
         return
     }
     let vi: u32 = pattern.pat_variant_find(m, ei, pattern.pat_mu_b(m, pat))
     if vi == NONE {
-        (*l).err = (*l).err + 1
+        oops(l)
         return
     }
     let av: u32 = load(l, fir.T_U32, addr)
@@ -2950,7 +2976,7 @@ fn pattern_tests(l: *mut Lower, base: u32, pat: u32, sj_ei: u32,
     // here only the subpatterns that are refutable.
     let vi: u32 = pattern.pat_variant_find(m, sj_ei, pattern.pat_mu_b(m, pat))
     if vi == NONE {
-        (*l).err = (*l).err + 1
+        oops(l)
         return
     }
     let soff: u32 = pattern.pat_mu_soff(m, pat)
@@ -3039,7 +3065,7 @@ fn match_lower(l: *mut Lower, mi: u32) {
     let m: *mut pattern.Pat = mul(l)
     let b: *mut ast.Tree = tree(l)
     if mi as usize >= pattern.pat_match_count(m) {
-        (*l).err = (*l).err + 1
+        oops(l)
         return
     }
     let subj: u32 = pattern.pat_m_subj(m, mi)

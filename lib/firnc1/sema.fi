@@ -39,7 +39,8 @@ import core
 import nogc
 import escape
 
-export { Sema, sema_new, sema_free, sema_run, sema_error, sema_ty, sema_widen32,
+export { Sema, sema_new, sema_free, sema_run, sema_error, sema_error_pos,
+    sema_ty, sema_widen32,
     sema_types, sema_ty_count, sema_needs_comptime, sema_const_value,
     sema_mu_set, sema_fe_set, sema_gc_set, sema_if_set,
     sema_kernel_set,
@@ -65,6 +66,14 @@ struct Sema {
     w32: Vec[u8],
     v_name: Vec[u32], // scopes: names, types and bounds
     v_ty: Vec[u32],
+    // ROUND BOOTSTRAP: 1 = declared with `var` and therefore writable.
+    // `firnc0` has carried this bit since always (`VarInfo::mutable`);
+    // `firnc1` did not, and so it silently accepted `x = 2` after
+    // `let x = 1` -- three programs out of `tests/neg/` that have to be
+    // refused (docs/BOOTSTRAP-LUECKEN.md). Everything that is not a `var`
+    // is fixed: parameters, `for` variables, `match` bindings, the binding
+    // of a `catch` -- exactly the list `sema.rs` passes `false` for.
+    v_mut: Vec[u32],
     b_limit: Vec[u32],
     k_name: Vec[u32], // constants
     k_ty: Vec[u32],
@@ -96,6 +105,14 @@ struct Sema {
     mc_fname: Vec[u32],
     mc_si: Vec[u32],
     err: usize,
+    // ROUND BOOTSTRAP: WHERE the first error was found. `firnc0` carries a
+    // whole `Diags` with a text per error; `firnc1` carries the position of
+    // the first one and the phase that found it. That is much less, but it
+    // is the difference between "exit 1" and a place a reader can go to.
+    // `cur` is the node the checker is standing on -- `expr` and `stmt` set
+    // it, `complain` reads it.
+    err_pos: u64,
+    cur: u64,
     // ROUND 52 (SPEC 2): the kernel profile. It is resolved in
     // `bin/firnc1.fi` (from the declaration or `--profile=`); here it is
     // only enforced.
@@ -123,7 +140,8 @@ fn sema_new(b: u64, it: u64) -> Sema {
         b: b, it: it,
         ty: types.types_new(),
         etyp: vec_new[u32](), w32: vec_new[u8](),
-        v_name: vec_new[u32](), v_ty: vec_new[u32](), b_limit: vec_new[u32](),
+        v_name: vec_new[u32](), v_ty: vec_new[u32](), v_mut: vec_new[u32](),
+        b_limit: vec_new[u32](),
         k_name: vec_new[u32](), k_ty: vec_new[u32](), k_value: vec_new[u64](),
         g_name: vec_new[u32](), g_ty: vec_new[u32](), g_mut: vec_new[u32](),
         g_off: vec_new[u32](), g_len: vec_new[u32](), g_align: vec_new[u32](),
@@ -132,7 +150,7 @@ fn sema_new(b: u64, it: u64) -> Sema {
         t_f32: 0,
         t_i32: 0,
         ret: 0, mu: 0, feh: 0, gc: 0, ifr: 0, mc_fname: vec_new[u32](), mc_si: vec_new[u32](),
-        err: 0, kernel: false, ct_needed: false,
+        err: 0, err_pos: 0, cur: 0, kernel: false, ct_needed: false,
         cl_name: vec_new[u32](), cl_tid: vec_new[u64](), cl_size: vec_new[u64](),
         cl_coff: vec_new[u32](), cl_clen: vec_new[u32](),
         cc_name: vec_new[u32](), cc_ty: vec_new[u32](),
@@ -150,6 +168,7 @@ fn sema_free(s: *mut Sema) {
     vec_free[u8](&(*s).w32)
     vec_free[u32](&(*s).v_name)
     vec_free[u32](&(*s).v_ty)
+    vec_free[u32](&(*s).v_mut)
     vec_free[u32](&(*s).b_limit)
     vec_free[u32](&(*s).g_name)
     vec_free[u32](&(*s).g_ty)
@@ -295,7 +314,8 @@ fn lambda_check(s: *mut Sema, e: u32) -> u32 {
     range_on(s)
     k = 0
     while k < plen {
-        var_create(s, ast.param_name(b, poff + k), vec_at[u32](&par, k as usize))
+        var_create(s, ast.param_name(b, poff + k), vec_at[u32](&par, k as usize),
+            false)
         k = k + 1
     }
     vec_free[u32](&par)
@@ -389,6 +409,10 @@ fn lambda_check(s: *mut Sema, e: u32) -> u32 {
 
 fn sema_error(s: *mut Sema) -> usize { return (*s).err }
 
+// ROUND BOOTSTRAP: the packed position (`ast.pos_pack`) of the FIRST error,
+// 0 when there is none or when no node was under the checker at the time.
+fn sema_error_pos(s: *mut Sema) -> u64 { return (*s).err_pos }
+
 // Register the pattern registry. MUST happen before `sema_run`.
 fn sema_mu_set(s: *mut Sema, m: u64) { (*s).mu = m }
 
@@ -436,7 +460,12 @@ fn tree(s: *mut Sema) -> *mut ast.Tree { return (*s).b as *mut ast.Tree }
 fn table(s: *mut Sema) -> *mut types.Types { return &(*s).ty }
 fn names(s: *mut Sema) -> *mut intern.Interner { return (*s).it as *mut intern.Interner }
 
-fn complain(s: *mut Sema) { (*s).err = (*s).err + 1 }
+fn complain(s: *mut Sema) {
+    if (*s).err == 0 {
+        (*s).err_pos = (*s).cur
+    }
+    (*s).err = (*s).err + 1
+}
 
 fn remember(s: *mut Sema, e: u32, t: u32) {
     vec_set[u32](&(*s).etyp, e as usize, t)
@@ -454,12 +483,31 @@ fn range_off(s: *mut Sema) {
     while vec_len[u32](&(*s).v_name) > g as usize {
         vec_pop[u32](&(*s).v_name)
         vec_pop[u32](&(*s).v_ty)
+        vec_pop[u32](&(*s).v_mut)
     }
 }
 
-fn var_create(s: *mut Sema, name: u32, t: u32) {
+fn var_create(s: *mut Sema, name: u32, t: u32, writable: bool) {
     vec_push[u32](&(*s).v_name, name)
     vec_push[u32](&(*s).v_ty, t)
+    var m: u32 = 0
+    if writable {
+        m = 1
+    }
+    vec_push[u32](&(*s).v_mut, m)
+}
+
+// May this name be written to? Searched exactly like `var_search`, so that
+// an inner `let x` shadows an outer `var x` here too.
+fn var_writable(s: *mut Sema, name: u32) -> bool {
+    var i: usize = vec_len[u32](&(*s).v_name)
+    while i > 0 {
+        i = i - 1
+        if vec_at[u32](&(*s).v_name, i) == name {
+            return vec_at[u32](&(*s).v_mut, i) == 1
+        }
+    }
+    return true
 }
 
 // Search from the back: the innermost scope wins.
@@ -577,6 +625,31 @@ fn fn_search(s: *mut Sema, name: u32) -> u32 {
 
 fn is_int(s: *mut Sema, t: u32) -> bool { return types.is_int(table(s), t) }
 fn is_error(s: *mut Sema, t: u32) -> bool { return types.ty_kind(table(s), t) == types.K_ERROR }
+
+// ROUND BOOTSTRAP (sema.rs::lit_fits): does this literal fit into that type?
+// The rule is `firnc0`'s, sign for sign: at 64 bits everything fits (the
+// value is a `u64` and cannot be bigger), below that the value has to stay
+// under `1 << bits`. Signedness is deliberately NOT looked at -- `firnc0`
+// does not look at it either, and the two compilers have to agree.
+fn lit_fits(s: *mut Sema, v: u64, t: u32) -> bool {
+    let bits: u32 = types.bits_of(table(s), t)
+    if bits == 0 {
+        return true
+    }
+    if bits >= 64 {
+        return true
+    }
+    return v < (1 as u64) << (bits as u64)
+}
+
+// ROUND BOOTSTRAP (atomic.rs::is_u64_ptr): a pointer to exactly one 64-bit
+// word -- what the atomic instructions operate on.
+fn is_u64_ptr(s: *mut Sema, t: u32) -> bool {
+    if !types.is_ptr(table(s), t) {
+        return false
+    }
+    return types.ty_kind(table(s), types.ty_a(table(s), t)) == types.K_U64
+}
 fn is_bool(s: *mut Sema, t: u32) -> bool { return types.ty_kind(table(s), t) == types.K_BOOL }
 fn is_f64(s: *mut Sema, t: u32) -> bool { return types.ty_kind(table(s), t) == types.K_F64 }
 fn is_f32(s: *mut Sema, t: u32) -> bool { return types.ty_kind(table(s), t) == types.K_F32 }
@@ -1203,7 +1276,18 @@ fn const_eval(s: *mut Sema, e: u32, good: *mut bool) -> i64 {
 // type; on error, the error type.
 
 fn expr(s: *mut Sema, e: u32, note: u32) -> u32 {
+    // ROUND BOOTSTRAP: where the checker is standing. Every `complain`
+    // below picks this up. It is the position of the innermost node that
+    // was ENTERED, not necessarily of the exact subexpression that is
+    // wrong -- an approximation, and an honest one: a line and a column
+    // beat an empty exit code.
+    let saved: u64 = (*s).cur
+    let here: u64 = ast.expr_pos(tree(s), e)
+    if here != 0 {
+        (*s).cur = here
+    }
     let t: u32 = expr_inner(s, e, note)
+    (*s).cur = saved
     // ROUND 71 -- THE ONE IMPLICIT CONVERSION (sema.rs::expr).
     //
     // `f32` -> `f64` loses nothing: every binary32 is exactly representable
@@ -1324,17 +1408,42 @@ fn literal_index(s: *mut Sema, e: u32, out: *mut i64) -> bool {
 }
 
 // Assignable expression: yields the type or NONE.
+//
+// ROUND BOOTSTRAP: this used to be ONE function that also complained about
+// writability. That made `(&MSG)` on an immutable `static` an error --
+// taking an ADDRESS is not writing (docs/OSUM-K1.md section 9). `firnc0`
+// keeps the two apart: `sema.rs::lvalue` yields the place AND its
+// mutability, and only the three assigning statements look at the
+// mutability. Same here now: `lvalue_m` finds the place and reports through
+// `fixed` that it may not be written to; `lvalue` is the caller that turns
+// that into an error.
 fn lvalue(s: *mut Sema, e: u32) -> u32 {
+    var fixed: bool = false
+    let t: u32 = lvalue_m(s, e, &fixed)
+    if fixed {
+        complain(s)
+    }
+    return t
+}
+
+fn lvalue_m(s: *mut Sema, e: u32, fixed: *mut bool) -> u32 {
     let b: *mut ast.Tree = tree(s)
     let a: u32 = ast.e_kind(b, e)
     if a == ast.E_ID {
         let v: u32 = var_search(s, ast.e_a(b, e))
         if v != NONE {
+            // ROUND BOOTSTRAP: `let` binds, `var` binds and allows writing.
+            if !var_writable(s, ast.e_a(b, e)) {
+                *fixed = true
+            }
             remember(s, e, v)
             return v
         }
         let k: u32 = const_search(s, ast.e_a(b, e))
         if k != NONE {
+            // A `const` is a NUMBER, not a place -- `sema.rs` answers
+            // `Mutability::Fixed` here too.
+            *fixed = true
             remember(s, e, k)
             return k
         }
@@ -1343,7 +1452,7 @@ fn lvalue(s: *mut Sema, e: u32) -> u32 {
         let g: u32 = static_search(s, ast.e_a(b, e))
         if g != NONE {
             if !static_writable(s, ast.e_a(b, e)) {
-                complain(s)
+                *fixed = true
             }
             remember(s, e, g)
             return g
@@ -1353,7 +1462,24 @@ fn lvalue(s: *mut Sema, e: u32) -> u32 {
         return (*s).t_error
     }
     if a == ast.E_FIELD {
-        let bt: u32 = lvalue(s, ast.e_a(b, e))
+        // HOOK gc (sema.rs, `ExprKind::Field`): writing THROUGH a `Gc[T]`.
+        // `let a: Gc[Node]` binds the HANDLE immutably -- the object at the
+        // other end stays writable, exactly as with `let p: *mut T` and
+        // `(*p).field = ...`. Without this the fixed-check of ROUND
+        // BOOTSTRAP would refuse 45 programs that `firnc0` accepts, among
+        // them every `r.field = x` on a `Gc` parameter.
+        if has_gc(s) {
+            let pb: u32 = probe(s, ast.e_a(b, e))
+            if pb != NONE {
+                if gc.gc_field_base(gcp(s), table(s), pb) != NONE {
+                    let bt0: u32 = expr(s, ast.e_a(b, e), NONE)
+                    let t0: u32 = field_ty(s, bt0, ast.e_b(b, e))
+                    remember(s, e, t0)
+                    return t0
+                }
+            }
+        }
+        let bt: u32 = lvalue_m(s, ast.e_a(b, e), fixed)
         if bt == NONE {
             return NONE
         }
@@ -1362,7 +1488,7 @@ fn lvalue(s: *mut Sema, e: u32) -> u32 {
         return t
     }
     if a == ast.E_IDX {
-        let bt: u32 = lvalue(s, ast.e_a(b, e))
+        let bt: u32 = lvalue_m(s, ast.e_a(b, e), fixed)
         if bt == NONE {
             return NONE
         }
@@ -1432,7 +1558,11 @@ fn unary(s: *mut Sema, e: u32, note: u32) -> u32 {
         return (*s).t_bool
     }
     if op == 2 {
-        let t: u32 = lvalue(s, inner)
+        // ROUND BOOTSTRAP: `&x` wants a PLACE, not a writable one --
+        // `sema.rs` reads `let (t, _m) = self.lvalue(inner)` and throws the
+        // mutability away. `&MSG` on `static MSG: [u8; 13]` is legal.
+        var fixed: bool = false
+        let t: u32 = lvalue_m(s, inner, &fixed)
         if t == NONE || is_error(s, t) {
             return (*s).t_error
         }
@@ -2431,7 +2561,11 @@ fn call(s: *mut Sema, e: u32) -> u32 {
         let tp2: u32 = expr(s, ast.child_at(b, off), pu64t)
         let te2: u32 = expr(s, ast.child_at(b, off + 1), u64t3)
         let tn2: u32 = expr(s, ast.child_at(b, off + 2), u64t3)
-        if !is_error(s, tp2) && !types.is_ptr(table(s), tp2) {
+        // ROUND BOOTSTRAP (atomic.rs::is_u64_ptr): ANY pointer was accepted
+        // here. Exactly one 64-bit word is exchanged atomically -- a
+        // `*mut u32` would have the instruction write over the four octets
+        // next to it. `firnc0` has always insisted on the width.
+        if !is_error(s, tp2) && !is_u64_ptr(s, tp2) {
             complain(s)
             return (*s).t_error
         }
@@ -2466,7 +2600,8 @@ fn call(s: *mut Sema, e: u32) -> u32 {
         }
         let tp: u32 = expr(s, ast.child_at(b, off), pu64)
         let td: u32 = expr(s, ast.child_at(b, off + 1), u64t)
-        if !is_error(s, tp) && !types.is_ptr(table(s), tp) {
+        // ROUND BOOTSTRAP: see `__atomic_swap` above -- the width counts.
+        if !is_error(s, tp) && !is_u64_ptr(s, tp) {
             complain(s)
             return (*s).t_error
         }
@@ -2717,6 +2852,14 @@ fn expr_inner(s: *mut Sema, e: u32, note: u32) -> u32 {
         // An integer literal carries NO type of its own -- it comes from outside.
         if note != NONE {
             if is_int(s, note) {
+                // ROUND BOOTSTRAP (sema.rs::lit_fits): a literal that is too
+                // wide for its type used to be TRUNCATED here without a
+                // word -- `let x: i32 = 5000000000` became 705032704 and the
+                // program ran on with a number nobody wrote down.
+                if !lit_fits(s, ast.e_number(b, e), note) {
+                    complain(s)
+                    return (*s).t_error
+                }
                 return note
             }
             if is_error(s, note) {
@@ -2728,6 +2871,14 @@ fn expr_inner(s: *mut Sema, e: u32, note: u32) -> u32 {
         // ROUND 70 -- THE DEFAULT TYPE. Nothing outside says anything, so
         // `i32` holds (sema.rs, the `None` branch at the integer literal).
         // The context keeps precedence: the branch above runs FIRST.
+        //
+        // ROUND BOOTSTRAP: the overflow check does not soften here either --
+        // `i32` is the default, and a literal that does not fit into it has
+        // to say so instead of silently losing its upper half.
+        if !lit_fits(s, ast.e_number(b, e), (*s).t_i32) {
+            complain(s)
+            return (*s).t_error
+        }
         return (*s).t_i32
     }
     if a == ast.E_BOOL {
@@ -3036,7 +3187,7 @@ fn pattern_check(s: *mut Sema, pat: u32, ty: u32, sj_kind: u32, sj_ei: u32,
         return
     }
     if a == pattern.MU_BIND {
-        var_create(s, pattern.pat_mu_a(m, pat), ty)
+        var_create(s, pattern.pat_mu_a(m, pat), ty, false)
         return
     }
     if a == pattern.MU_BOOL {
@@ -3319,7 +3470,7 @@ fn catch_check(s: *mut Sema, e: u32) -> u32 {
         range_on(s)
         let st: u32 = err.error_set_ty(fe(s), table(s),
             err.error_u_set(fe(s), u))
-        var_create(s, bind, st)
+        var_create(s, bind, st, false)
     }
     let rt: u32 = expr(s, rhs, want)
     if bind != NONE {
@@ -3424,6 +3575,11 @@ fn cond(s: *mut Sema, e: u32) {
 fn stmt(s: *mut Sema, i: u32) {
     let b: *mut ast.Tree = tree(s)
     let a: u32 = ast.s_kind(b, i)
+    // ROUND BOOTSTRAP: see `expr` -- a statement is a position too.
+    let sp: u64 = ast.stmt_pos(b, i)
+    if sp != 0 {
+        (*s).cur = sp
+    }
 
     if a == ast.S_LET || a == ast.S_VAR {
         let te: u32 = ast.s_b(b, i)
@@ -3451,7 +3607,7 @@ fn stmt(s: *mut Sema, i: u32) {
                 t = got
             }
         }
-        var_create(s, ast.s_a(b, i), t)
+        var_create(s, ast.s_a(b, i), t, a == ast.S_VAR)
         return
     }
     if a == ast.S_ZUW {
@@ -3537,7 +3693,7 @@ fn stmt(s: *mut Sema, i: u32) {
             t = st
         }
         range_on(s)
-        var_create(s, ast.s_a(b, i), t)
+        var_create(s, ast.s_a(b, i), t, false)
         block(s, ast.s_d(b, i), true)
         range_off(s)
         return
@@ -3567,6 +3723,15 @@ fn stmt(s: *mut Sema, i: u32) {
         return
     }
     if a == ast.S_DEFER || a == ast.S_ERRDEFER {
+        // ROUND BOOTSTRAP (sema.rs::defer_jump): a jump OUT of the deferred
+        // body tears the order of the deferred statements apart, so
+        // `firnc0` refuses it. `firnc1` did not, and the lowering then ran
+        // into a segmentation fault on `tests/neg/defer_return.fi` -- the
+        // one program in the whole corpus that made the self hosted
+        // compiler crash instead of answering.
+        if defer_jump(s, ast.s_a(b, i), false) {
+            complain(s)
+        }
         stmt(s, ast.s_a(b, i))
         return
     }
@@ -3611,6 +3776,155 @@ fn stmt(s: *mut Sema, i: u32) {
         return
     }
     // break / continue: the parser has already checked the position.
+}
+
+// ROUND BOOTSTRAP (sema.rs::defer_jump / defer_return_only): is there a
+// `return`, `break` or `continue` in here that LEAVES the deferred body?
+// `only_return` means: we are inside a loop that begins within the body
+// itself -- there `break` and `continue` belong to that loop and stay.
+fn defer_jump(s: *mut Sema, i: u32, only_return: bool) -> bool {
+    let b: *mut ast.Tree = tree(s)
+    let a: u32 = ast.s_kind(b, i)
+    if a == ast.S_RET {
+        return true
+    }
+    if a == ast.S_BREAK || a == ast.S_CONT {
+        return !only_return
+    }
+    if a == ast.S_BLOCK {
+        return defer_jump_block(s, ast.s_a(b, i), only_return)
+    }
+    if a == ast.S_DEFER || a == ast.S_ERRDEFER {
+        return defer_jump(s, ast.s_a(b, i), only_return)
+    }
+    if a == ast.S_IF {
+        if defer_jump_block(s, ast.s_b(b, i), only_return) {
+            return true
+        }
+        if ast.s_c(b, i) != ast.NOTHING {
+            return defer_jump(s, ast.s_c(b, i), only_return)
+        }
+        return false
+    }
+    if a == ast.S_WHILE {
+        return defer_jump_block(s, ast.s_b(b, i), true)
+    }
+    if a == ast.S_FOR {
+        return defer_jump_block(s, ast.s_d(b, i), true)
+    }
+    return false
+}
+
+fn defer_jump_block(s: *mut Sema, bi: u32, only_return: bool) -> bool {
+    let b: *mut ast.Tree = tree(s)
+    var k: u32 = 0
+    while k < ast.b_len(b, bi) {
+        if defer_jump(s, ast.slist_at(b, ast.b_off(b, bi) + k), only_return) {
+            return true
+        }
+        k = k + 1
+    }
+    return false
+}
+
+// ROUND BOOTSTRAP (sema.rs::block_returns): does every path of this block
+// end in a `return`? A function with a result type that reaches its end
+// without one falls THROUGH in the generated code and hands back whatever
+// happens to be in the return register -- silent wrong code, and
+// `tests/neg/no_return.fi` is exactly that program.
+//
+// The answer here is DELIBERATELY conservative wherever `firnc1` knows
+// less than `firnc0`: a `match` as a statement counts as returning without
+// looking whether all of its arms really do (`sema_match.rs::match_returns`
+// does look). Conservative means: this check never refuses a program that
+// `firnc0` accepts -- it only catches fewer of the broken ones.
+fn block_returns(s: *mut Sema, bi: u32) -> bool {
+    let b: *mut ast.Tree = tree(s)
+    var k: u32 = 0
+    while k < ast.b_len(b, bi) {
+        if stmt_returns(s, ast.slist_at(b, ast.b_off(b, bi) + k)) {
+            return true
+        }
+        k = k + 1
+    }
+    return false
+}
+
+fn stmt_returns(s: *mut Sema, i: u32) -> bool {
+    let b: *mut ast.Tree = tree(s)
+    let a: u32 = ast.s_kind(b, i)
+    if a == ast.S_RET {
+        return true
+    }
+    if a == ast.S_BLOCK {
+        return block_returns(s, ast.s_a(b, i))
+    }
+    if a == ast.S_IF {
+        if ast.s_c(b, i) == ast.NOTHING {
+            return false
+        }
+        if !block_returns(s, ast.s_b(b, i)) {
+            return false
+        }
+        return stmt_returns(s, ast.s_c(b, i))
+    }
+    if a == ast.S_WHILE {
+        // `while true` without a `break` never leaves its body.
+        let c: u32 = ast.s_a(b, i)
+        if ast.e_kind(b, c) != ast.E_BOOL {
+            return false
+        }
+        if ast.e_a(b, c) != 1 {
+            return false
+        }
+        return !block_breaks(s, ast.s_b(b, i))
+    }
+    if a == ast.S_EXPR {
+        // The `match` of round 44 is a call to `__match#N`; whether all of
+        // its arms return is not decided here (see above).
+        let e: u32 = ast.s_a(b, i)
+        if ast.e_kind(b, e) == ast.E_CALL {
+            if has_mu(s) {
+                return pattern.pat_is_matchname(names(s), ast.e_a(b, e))
+            }
+        }
+        return false
+    }
+    return false
+}
+
+// A `break` that leaves THIS loop -- one in an inner loop leaves only that.
+fn block_breaks(s: *mut Sema, bi: u32) -> bool {
+    let b: *mut ast.Tree = tree(s)
+    var k: u32 = 0
+    while k < ast.b_len(b, bi) {
+        if stmt_breaks(s, ast.slist_at(b, ast.b_off(b, bi) + k)) {
+            return true
+        }
+        k = k + 1
+    }
+    return false
+}
+
+fn stmt_breaks(s: *mut Sema, i: u32) -> bool {
+    let b: *mut ast.Tree = tree(s)
+    let a: u32 = ast.s_kind(b, i)
+    if a == ast.S_BREAK {
+        return true
+    }
+    if a == ast.S_BLOCK {
+        return block_breaks(s, ast.s_a(b, i))
+    }
+    if a == ast.S_IF {
+        if block_breaks(s, ast.s_b(b, i)) {
+            return true
+        }
+        if ast.s_c(b, i) != ast.NOTHING {
+            return stmt_breaks(s, ast.s_c(b, i))
+        }
+        return false
+    }
+    return false
 }
 
 fn block(s: *mut Sema, bi: u32, range_already_open: bool) {
@@ -4034,11 +4348,26 @@ fn sema_run(s: *mut Sema) {
         var k: u32 = 0
         while k < ast.fn_plen(b, i) {
             var_create(s, ast.param_name(b, ast.fn_poff(b, i) + k),
-                types.param_ty_resolved(table(s), i, k))
+                types.param_ty_resolved(table(s), i, k), false)
             k = k + 1
         }
         block(s, ast.fn_body(b, i), true)
         range_off(s)
+        // ROUND BOOTSTRAP (sema.rs::check_fn): a function with a result has
+        // to REACH a `return` on every path.
+        let rty: u32 = (*s).ret
+        if types.ty_kind(table(s), rty) != types.K_VOID {
+            if !is_error(s, rty) {
+                if !block_returns(s, ast.fn_body(b, i)) {
+                    // The closing brace of the function -- `fn_end` (round
+                    // 79). `fn_body` is a BLOCK number, not a statement
+                    // number; reading `stmt_pos` with it would name a place
+                    // out of a different table.
+                    (*s).cur = ast.fn_end(b, i)
+                    complain(s)
+                }
+            }
+        }
         i = i + 1
     }
     range_off(s)
