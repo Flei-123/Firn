@@ -394,13 +394,18 @@ Zwischenspeicher** an, und der Fehler wird **zweimal unabhängig** gefangen —
 $ firnpkg verify proj/app
 error: package 'date' in the cache is not what it says
 note: wanted 766a039e2a38e0cb2ba73127cdb97e60693b163852ed6ddccd813d7cfe4ec4cf
-note: got    1e0c…
+note: got e4cc1c39acf26b09f4a92047fa66cda901a712b07bec52d0a076bb5947175541
 
 $ firnc --package proj/app --locked -o app
 error: proj/app/firn.lock: the lock file does not match the sources
 note: line 4 of the file:  'package date 1.1.0 cache:766a039e… 50efa016…'
-note: line 4 of the build: 'package date 1.1.0 cache:766a039e… a91b77c3…'
+note: line 4 of the build: 'package date 1.1.0 cache:766a039e… 6a2a16fd…'
 ```
+
+(Beide Sätze oben sind wörtlich abgeschrieben, nur die Hexziffern in der
+Sperrdatei sind gekürzt. Zwei unabhängige Wege zum selben Fund: `verify`
+mißt den Baum gegen seine Adresse, `--locked` mißt den Bau gegen die
+Sperrdatei.)
 
 — und beide Compiler sagen denselben Satz, Oktett für Oktett.
 
@@ -412,8 +417,8 @@ Quelle je mit **anderen** Oktetten zurück, wird sie laut refüsiert:
 ```
 error: the source changed under a fixed reference
 note: source 'git+file:///p/firn-date#v1.1.0'
-note: was    766a039e…
-note: is now 4f31c8a1…
+note: was 766a039e2a38e0cb2ba73127cdb97e60693b163852ed6ddccd813d7cfe4ec4cf
+note: is now 1af7682971303b6676e2fcead8a8b47aed4533d087099ae1615eb27ff99be63a
 ```
 
 Das fängt einen **umgehängten Git-Tag** — ein echter Angriffsweg, und in
