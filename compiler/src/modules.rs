@@ -399,6 +399,9 @@ pub const SYMBOL_PREFIX: &str = "_F";
 /// The entry point keeps its bare name: `_start` calls it, and that is an
 /// agreement with the linker, no Firn matter.
 pub const ENTRY_SYMBOL: &str = "main";
+/// ROUND ANDROID: the name the Firn entry point carries on Android, where
+/// `main` belongs to Bionic's start file. See `symbol`.
+pub const ANDROID_ENTRY_SYMBOL: &str = "__firn_main";
 
 /// Linker name of an item, derived from its **internal** name.
 ///
@@ -422,6 +425,19 @@ pub const ENTRY_SYMBOL: &str = "main";
 /// showing the source name.
 pub fn symbol(interner_name: &str, abi_version: Option<u32>) -> String {
     if interner_name == ENTRY_SYMBOL {
+        // ROUND ANDROID: on Android the symbol `main` is NOT free. Bionic's
+        // start file `crtbegin_dynamic.o` defines `_start`, sets the C
+        // library up and then calls a `main` with the C signature
+        // `(int argc, char** argv, char** envp)`. A Firn `main` takes the
+        // stack block instead, so the two cannot be the same symbol: the
+        // Firn entry point moves aside and `codegen_a64::emit_android_entry`
+        // writes the four instructions that convert one into the other.
+        //
+        // On every other target this answers exactly what it answered
+        // before — `main`, character for character.
+        if crate::target::active().is_android() {
+            return ANDROID_ENTRY_SYMBOL.to_string();
+        }
         return interner_name.to_string();
     }
     // ROUND 58: the generated functions of the closures carry a `#` in their

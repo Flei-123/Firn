@@ -67,6 +67,7 @@ mod rangecheck;
 mod strings;
 mod strtype;
 mod syscalls;
+mod android;
 mod target;
 mod types;
 
@@ -204,6 +205,11 @@ fn usage() -> String {
          -c, --object       only assemble: ELF object file, no ld\n  \
          --profile=<name>   kernel | app (SPEC 2), forces the profile\n  \
          --target=<name>    x86_64-linux (default) | aarch64-linux (round 80)\n  \
+                              | aarch64-linux-android (round ANDROID)\n  \
+         --shared           shared library (.so) instead of an executable\n  \
+                              (only aarch64-linux-android)\n  \
+         --android-api=<n>  Android API level (default 24)\n  \
+         --print-ndk-lib    print the NDK sysroot directory and end\n  \
          --no-opt           switch off the optimizer (= --opt-level=dev)\n  \
          --opt-level=<lvl>  dev | dev-fast | release-safe | release-fast\n  \
                               (\'dev-fast\' = only debug preserving passes)\n  \
@@ -320,6 +326,34 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             // path below is the one that has always been walked.
             _ if a.starts_with("--target=") => {
                 if let Err(e) = target::flag_set(&a["--target=".len()..]) {
+                    return Err(e);
+                }
+            }
+            // ROUND ANDROID: the FORM of the result. An Android app does
+            // not load an executable, it loads a shared library --
+            // `System.loadLibrary("firn")` opens `libfirn.so`. Out of the
+            // same object file, linked differently.
+            "--shared" => target::form_set(target::Form::Shared),
+            // ROUND ANDROID: where the Bionic stub libraries and the start
+            // files of the chosen API level are. A build system that wants
+            // to link something of its own (an app's `.so` next to Firn's)
+            // needs that path, and guessing it is exactly what this option
+            // exists to stop. Prints one line and ends -- like `--strlit=`.
+            "--print-ndk-lib" => match android::find() {
+                Ok(n) => {
+                    println!("{}", n.lib_dir.display());
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    std::process::exit(1);
+                }
+            },
+            // ROUND ANDROID: which Bionic. The stub library the artifact is
+            // linked against carries exactly the symbols the chosen release
+            // had, so this number is a promise about the oldest device.
+            _ if a.starts_with("--android-api=") => {
+                if let Err(e) = android::api_set(&a["--android-api=".len()..]) {
                     return Err(e);
                 }
             }
@@ -445,6 +479,18 @@ fn main() {
             std::process::exit(2);
         }
     };
+    // ROUND ANDROID: `--shared` is not a general option. On the two Linux
+    // targets a Firn program brings its own `_start` and calls the kernel
+    // directly; a shared library there would need a position independent
+    // link the two of them have never been asked for. Saying so is better
+    // than producing something that looks like a library.
+    if target::shared() && !target::active().is_android() {
+        eprintln!(
+            "error: --shared is only supported for --target=aarch64-linux-android (this is --target={})",
+            target::active().name()
+        );
+        std::process::exit(2);
+    }
     std::process::exit(run(&opts));
 }
 
@@ -910,9 +956,13 @@ fn run(opts: &Options) -> i32 {
         eprintln!("error: {}", e);
         return 1;
     }
-    let emitted = match target::active() {
-        target::Target::X86_64 => codegen_x86::emit(&module),
-        target::Target::Aarch64 => codegen_a64::emit(&module),
+    // ROUND ANDROID: the question here is the INSTRUCTION SET, not the
+    // target. `aarch64-linux` and `aarch64-linux-android` are two targets
+    // and one machine, and `Target::arch()` is what says so -- the third
+    // target did not cost this backend a single line.
+    let emitted = match target::active().arch() {
+        target::Arch::X86_64 => codegen_x86::emit(&module),
+        target::Arch::Aarch64 => codegen_a64::emit(&module),
     };
     let asm = match emitted {
         Ok(a) => a,
@@ -923,10 +973,21 @@ fn run(opts: &Options) -> i32 {
     };
 
     tm.mark("codegen");
+    // ROUND ANDROID: `x.fi --shared` produces `libx.so`, because that is
+    // the name `System.loadLibrary("x")` looks for. With `-o` exactly what
+    // is written there.
     let out = opts
         .output
         .clone()
         .or_else(|| target_out_manifest.clone())
+        .or_else(|| {
+            if target::shared() {
+                let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("firn");
+                Some(path.with_file_name(format!("lib{}.so", stem)))
+            } else {
+                None
+            }
+        })
         .unwrap_or_else(|| {
             // ROUND 94: a test binary is not the program, so it does not take
             // the program's name -- `x.fi` becomes `x.test`.
@@ -1064,6 +1125,42 @@ fn assemble(asm: &Path, obj: &Path) -> Result<(), i32> {
 fn assemble_and_link(asm: &Path, obj: &Path, out: &Path) -> Result<(), i32> {
     let t = target::active();
     assemble(asm, obj)?;
+    // ROUND ANDROID: a completely different linker command. Not `ld` with
+    // two arguments but Bionic's start files, Bionic's stub libraries,
+    // `/system/bin/linker64` and PIE -- `android.rs` builds it and says
+    // clearly what is missing when the NDK is not there.
+    if t.is_android() {
+        let ndk = match android::find() {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                return Err(3);
+            }
+        };
+        let args = android::link_args(&ndk, obj, out, target::shared());
+        let st = Command::new(t.linker()).args(&args).status();
+        return match st {
+            Ok(s) if s.success() => Ok(()),
+            Ok(s) => {
+                eprintln!(
+                    "error: '{}' failed ({}) — NDK '{}', api {}",
+                    t.linker(),
+                    s,
+                    ndk.root.display(),
+                    ndk.api
+                );
+                Err(3)
+            }
+            Err(e) => {
+                eprintln!(
+                    "error: cannot run '{}': {} (binutils-aarch64-linux-gnu installed?)",
+                    t.linker(),
+                    e
+                );
+                Err(3)
+            }
+        };
+    }
     // `-n` (`--nmagic`) switches OFF the page alignment of the sections and
     // puts everything into ONE loadable segment. That was free as long as
     // a Firn program had nothing but `.text` and `.rodata`: one segment,

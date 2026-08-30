@@ -688,6 +688,21 @@ fn emit_cpu_features(e: &mut Emitter) {
     let env = format!("{}_env", base);
     let aux = format!("{}_aux", base);
     let done = format!("{}_done", base);
+    // ROUND ANDROID: Bionic HAS the libc function the comment above calls
+    // "the usual answer" — `getauxval(3)`, since API 18 — and on Android
+    // this compiler links against Bionic anyway. There is no own `_start`
+    // on that target to keep the initial `sp` in, so the walk is not
+    // possible and not needed: three instructions ask the C library. The
+    // bit mapping below is the same for both ways.
+    if crate::target::active().is_android() {
+        e.raw("    // __cpu_features(): AT_HWCAP through Bionic's getauxval(3)");
+        e.line("mov x0, #16"); // AT_HWCAP
+        e.line("bl getauxval");
+        e.line("mov x13, x0");
+        e.raw(&format!("{}:", done));
+        emit_hwcap_bits(e);
+        return;
+    }
     e.raw("    // __cpu_features(): AT_HWCAP from the auxiliary vector");
     e.line(&format!("adrp {}, {}", A, AUXV_LABEL));
     e.line(&format!("add {}, {}, :lo12:{}", A, A, AUXV_LABEL));
@@ -710,6 +725,14 @@ fn emit_cpu_features(e: &mut Emitter) {
     e.line(&format!("b.ne {}", aux));
     e.line("mov x13, x11");
     e.raw(&format!("{}:", done));
+    emit_hwcap_bits(e);
+}
+
+/// The MAPPING of AT_HWCAP (in `x13`) onto the answer of
+/// `__cpu_features()` (in `A`). Shared by both ways of getting the word —
+/// the walk over the auxiliary vector and Bionic's `getauxval`. The table
+/// in the documentation of `emit_cpu_features` is this loop.
+fn emit_hwcap_bits(e: &mut Emitter) {
     e.line(&format!("mov {}, xzr", A));
     // (HWCAP bit, bit in the answer)
     for (hw, out) in [(1u32, 0u32), (1, 1), (1, 8), (3, 3), (4, 4), (6, 5), (7, 2)] {

@@ -623,6 +623,16 @@ impl<'a> Checker<'a> {
                 if crate::prof::is_kernel() {
                     return;
                 }
+                // ROUND ANDROID: `--shared` produces a SHARED LIBRARY. A
+                // library has no entry point either -- it is entered
+                // through its exported functions, and that is exactly the
+                // form an Android app loads
+                // (`System.loadLibrary` -> `dlopen` -> `libfoo.so`).
+                // Demanding a `main` here would have forced every Firn
+                // library to carry a dead function.
+                if crate::target::shared() {
+                    return;
+                }
                 self.dg.error_note(
                     Span::none(),
                     "the program has no function 'main'",
