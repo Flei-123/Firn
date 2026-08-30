@@ -64,6 +64,12 @@
 #      gzip and the gunzip binary, JSON against JSONTestSuite and
 #      python3 -m json.tool, and lib/std/crypto against 1,919 NIST CAVP
 #      vectors, the openssl binary and python3 hashlib. Three build stages.
+#  35. Remote sources, the content addressed cache and the fetcher
+#      (tools/hub/run.sh, round FIRNHUB): `needs` with a git source, an
+#      archive with a checksum or a version out of an index; `firnpkg
+#      fetch` resolves them into the cache and writes `firn.have`, the
+#      compiler reads local paths only. Measured against a real git
+#      repository, in both compilers, with the tamper case.
 #  18. Package and project system (tools/packages/run.sh): manifest, search
 #      order, visibility, build driver -- in BOTH compilers.
 #  19. Freestanding compilation (tools/freestanding/run.sh, round 52):
@@ -612,6 +618,27 @@ if [ "$PKRC" -eq 0 ]; then
 else
     bad "tools/packages/run.sh failed (see .test-work/packages.log)"
     tail -20 "$WORK/packages.log" | sed 's/^/   /'
+fi
+
+echo "== 35. remote sources, cache and fetcher (tools/hub/run.sh, round FIRNHUB) =="
+# Round FIRNHUB. `needs` may name a git source with a fixed reference, an
+# archive with a checksum or a version out of an index; the compiler
+# resolves all three through `firn.have` into the content addressed cache
+# and NEVER speaks to the network itself. Checked on real projects with a
+# real git repository: the two libraries of the round pass their own tests
+# in both compilers, the content hash agrees with coreutils' `sha256sum`
+# over the same stream, both compilers write a character identical
+# `firn.lock` with `cache:<hash>` and an `origin` line, the whole thing
+# runs offline, a file edited inside the cache is caught twice (by
+# `firnpkg verify` and by `--locked`), and a git tag moved under a fetched
+# package is refused.
+bash tools/hub/run.sh > "$WORK/hub.log" 2>&1 && HBRC=0 || HBRC=$?
+if [ "$HBRC" -eq 0 ]; then
+    ok
+    grep -E '^HUB' "$WORK/hub.log" | sed 's/^/   /'
+else
+    bad "tools/hub/run.sh failed (see .test-work/hub.log)"
+    grep -B1 -A3 ERROR "$WORK/hub.log" | head -20 | sed 's/^/   /'
 fi
 
 echo "== 8d. functions as values: direct stays direct (tools/fnval/run.sh) =="
