@@ -21,6 +21,7 @@ import vec
 import intern
 import lexer
 import ast
+import diag
 import mono
 import pattern
 import err
@@ -511,6 +512,10 @@ fn imports_collect(l: *mut lexer.Lexer, s: *mut SearchSpace, w: *mut package.Wor
             }
         }
         if !found {
+            // ROUND BOOTSTRAP: an import that resolves to nothing used to
+            // end in a bare exit code 2. Now the searched-for path is
+            // named -- that is the one thing a reader needs here.
+            say_no_file(rt.buf_ptr(&path), rt.buf_len(&path) - 1)
             return 2
         }
         // ROUND 93: from here on the module is known under the spelling
@@ -572,6 +577,99 @@ fn imports_collect(l: *mut lexer.Lexer, s: *mut SearchSpace, w: *mut package.Wor
         i = j
     }
     return 0
+}
+
+
+// ---------------------------------------------------- ROUND BOOTSTRAP
+//
+// A COMPILER THAT REFUSES SOMETHING HAS TO SAY WHAT.
+//
+// Until this round every refusal by the parser, the type check or the
+// lowering left `firnc1` with a bare `exit 1` and not one octet of output.
+// `docs/OSUM-K1.md` section 9 noted it in passing ("the silent exit is
+// itself worth a look"); the measurement in `docs/BOOTSTRAP-LUECKEN.md`
+// turned it into a number: 178 of 188 refusals over `tests/neg/` said
+// nothing at all.
+//
+// `firnc0` carries a sentence per error. `firnc1` does not -- yet. What it
+// carries since this round is the POSITION of the first error and the
+// phase that found it, and that is the whole difference between a program
+// one can look at and an exit code one can only guess about. The lexer is
+// the exception: its diagnostics were complete all along (`diag.fi`,
+// checked octet for octet by `tools/lex_compare.sh`), they were merely
+// never printed. Now they are.
+fn say_error(what: u64, what_n: usize, file: u64, file_n: usize,
+    line: u32, col: u32) {
+    var b: rt.Buf = rt.buf_new()
+    var m1: [u8; 8] = "error: \0"
+    rt.buf_push_bytes(&b, (&m1[0]) as u64, 7)
+    rt.buf_push_bytes(&b, what, what_n)
+    rt.buf_push(&b, 10 as u8)
+    if file_n > 0 {
+        var m2: [u8; 7] = "  --> \0"
+        rt.buf_push_bytes(&b, (&m2[0]) as u64, 6)
+        rt.buf_push_bytes(&b, file, file_n)
+        rt.buf_push(&b, 58 as u8)
+        rt.buf_push_dec_u64(&b, line as u64)
+        rt.buf_push(&b, 58 as u8)
+        rt.buf_push_dec_u64(&b, col as u64)
+        rt.buf_push(&b, 10 as u8)
+    }
+    rt.write_everything(2, rt.buf_ptr(&b), rt.buf_len(&b))
+    rt.buf_free(&b)
+}
+
+// The same, with the position taken apart: the file number in `pos` indexes
+// the tree's file table, so a message names the MODULE it happened in.
+fn say_at(b: *mut ast.Tree, pos: u64, what: u64, what_n: usize) {
+    if pos == 0 {
+        say_error(what, what_n, 0, 0, 0, 0)
+        return
+    }
+    let fnr: u32 = ast.pos_file(pos)
+    var fp: u64 = 0
+    var fl: usize = 0
+    if (fnr as usize) < ast.file_count(b) {
+        fp = ast.file_ptr(b, fnr)
+        fl = ast.file_length(b, fnr)
+    }
+    say_error(what, what_n, fp, fl, ast.pos_line(pos), ast.pos_col(pos))
+}
+
+// The lexer's own diagnostics -- the full rendering of `diag.fi`, the same
+// text `firnc0` prints.
+fn say_lex(lx: *mut lexer.Lexer) {
+    var b: rt.Buf = rt.buf_new()
+    diag.diag_render(lexer.lex_diags(lx), &b)
+    rt.write_everything(2, rt.buf_ptr(&b), rt.buf_len(&b))
+    rt.buf_free(&b)
+}
+
+// A refusal by the parser, with the file it happened in (the tree's file
+// table is not consulted here: the parser knows its own file name).
+// The four HONEST LIMITS of `firnc1`. They are not errors in the program
+// -- `firnc0` compiles it -- they are the places where the self hosted
+// compiler is not as far along yet. They used to be silent as well, and a
+// silent exit code 3 is indistinguishable from a crash.
+fn say_no_file(path: u64, path_n: usize) {
+    var b: rt.Buf = rt.buf_new()
+    var m1: [u8; 28] = "error: cannot read module '\0"
+    rt.buf_push_bytes(&b, (&m1[0]) as u64, 27)
+    rt.buf_push_bytes(&b, path, path_n)
+    rt.buf_push(&b, 39 as u8)
+    rt.buf_push(&b, 10 as u8)
+    rt.write_everything(2, rt.buf_ptr(&b), rt.buf_len(&b))
+    rt.buf_free(&b)
+}
+
+fn say_limit(what: u64) {
+    say_error(what, rt.c_length(what), 0, 0, 0, 0)
+}
+
+fn say_parser(pos: u64, file: u64, file_n: usize) {
+    var m: [u8; 32] = "the parser refused this program\0"
+    say_error((&m[0]) as u64, rt.c_length((&m[0]) as u64), file, file_n,
+        ast.pos_line(pos), ast.pos_col(pos))
 }
 
 fn main(start: u64) -> i32 {
@@ -798,6 +896,7 @@ fn main(start: u64) -> i32 {
     defer lexer.lex_free(&l)
     lexer.lex_run(&l)
     if lexer.lex_error(&l) > 0 {
+        say_lex(&l)
         return 1
     }
     let it: *mut intern.Interner = lexer.lex_names(&l)
@@ -927,6 +1026,7 @@ fn main(start: u64) -> i32 {
         rt.buf_push(&mpath, 0 as u8)
         rt.buf_clear(&msource)
         if !rt.read_file(rt.buf_ptr(&mpath), &msource) {
+            say_no_file(rt.buf_ptr(&mpath), rt.buf_len(&mpath) - 1)
             return 2
         }
         var vl: lexer.Lexer = lexer.lex_new(rt.buf_ptr(&msource), rt.buf_len(&msource),
@@ -935,6 +1035,7 @@ fn main(start: u64) -> i32 {
         lexer.lex_names_set(&vl, it as u64)
         lexer.lex_run(&vl)
         if lexer.lex_error(&vl) > 0 {
+            say_lex(&vl)
             lexer.lex_free(&vl)
             return 1
         }
@@ -1045,6 +1146,7 @@ fn main(start: u64) -> i32 {
         lexer.lex_names_set(&cmp, it as u64)
         lexer.lex_run(&cmp)
         if lexer.lex_error(&cmp) > 0 {
+            say_lex(&cmp)
             lexer.lex_free(&cmp)
             rt.buf_free(&vq)
             return 1
@@ -1063,6 +1165,7 @@ fn main(start: u64) -> i32 {
         let alias: u32 = ml_alias(&ml, mi)
         rt.buf_clear(&msource)
         if !rt.read_file(rt.buf_ptr(&mpath), &msource) {
+            say_no_file(rt.buf_ptr(&mpath), rt.buf_len(&mpath) - 1)
             return 2
         }
         var mlx: lexer.Lexer = lexer.lex_new(rt.buf_ptr(&msource), rt.buf_len(&msource),
@@ -1071,6 +1174,7 @@ fn main(start: u64) -> i32 {
         lexer.lex_names_set(&mlx, it as u64)
         lexer.lex_run(&mlx)
         if lexer.lex_error(&mlx) > 0 {
+            say_lex(&mlx)
             lexer.lex_free(&mlx)
             return 1
         }
@@ -1088,12 +1192,16 @@ fn main(start: u64) -> i32 {
         parser.par_run(&mp)
         let bad: bool = parser.par_not_core(&mp)
         let fail: usize = parser.par_error(&mp)
+        let fpos: u64 = parser.par_error_pos(&mp)
         parser.par_free(&mp)
         lexer.lex_free(&mlx)
         if bad {
+            var m_l1a: [u8; 55] = "not the core language of firnc1 (firnc0 compiles this)\0"
+            say_limit((&m_l1a[0]) as u64)
             return 3
         }
         if fail > 0 {
+            say_parser(fpos, rt.buf_ptr(&mpath), rt.buf_len(&mpath) - 1)
             return 1
         }
         mi = mi + 1
@@ -1113,9 +1221,12 @@ fn main(start: u64) -> i32 {
     parser.par_time_set(&p)
     parser.par_run(&p)
     if parser.par_not_core(&p) {
+        var m_l1b: [u8; 55] = "not the core language of firnc1 (firnc0 compiles this)\0"
+        say_limit((&m_l1b[0]) as u64)
         return 3
     }
     if parser.par_error(&p) > 0 {
+        say_parser(parser.par_error_pos(&p), name, name_n)
         return 1
     }
 
@@ -1156,6 +1267,7 @@ fn main(start: u64) -> i32 {
         lexer.lex_names_set(&gl, it as u64)
         lexer.lex_run(&gl)
         if lexer.lex_error(&gl) > 0 {
+            say_lex(&gl)
             lexer.lex_free(&gl)
             return 1
         }
@@ -1169,12 +1281,16 @@ fn main(start: u64) -> i32 {
         parser.par_run(&gp)
         let gschlecht: bool = parser.par_not_core(&gp)
         let gerr: usize = parser.par_error(&gp)
+        let gpos: u64 = parser.par_error_pos(&gp)
         parser.par_free(&gp)
         lexer.lex_free(&gl)
         if gschlecht {
+            var m_l1c: [u8; 55] = "not the core language of firnc1 (firnc0 compiles this)\0"
+            say_limit((&m_l1c[0]) as u64)
             return 3
         }
         if gerr > 0 {
+            say_parser(gpos, (&gpn[0]) as u64, 12)
             return 1
         }
     }
@@ -1189,6 +1305,8 @@ fn main(start: u64) -> i32 {
             rt.buf_ptr(&dir), rt.buf_len(&dir))
         time.time_run(&zt)
         if time.time_error(&zt) > 0 {
+            var m_ct: [u8; 31] = "a 'comptime' block did not run\0"
+            say_error((&m_ct[0]) as u64, rt.c_length((&m_ct[0]) as u64), 0, 0, 0, 0)
             time.time_free(&zt)
             return 1
         }
@@ -1201,6 +1319,7 @@ fn main(start: u64) -> i32 {
             lexer.lex_names_set(&ctl, it as u64)
             lexer.lex_run(&ctl)
             if lexer.lex_error(&ctl) > 0 {
+                say_lex(&ctl)
                 lexer.lex_free(&ctl)
                 time.time_free(&zt)
                 return 1
@@ -1215,13 +1334,17 @@ fn main(start: u64) -> i32 {
             parser.par_run(&ctp)
             let ctbad: bool = parser.par_not_core(&ctp)
             let cterr: usize = parser.par_error(&ctp)
+            let ctpos: u64 = parser.par_error_pos(&ctp)
             parser.par_free(&ctp)
             lexer.lex_free(&ctl)
             time.time_free(&zt)
             if ctbad {
+                var m_l1d: [u8; 55] = "not the core language of firnc1 (firnc0 compiles this)\0"
+                say_limit((&m_l1d[0]) as u64)
                 return 3
             }
             if cterr > 0 {
+                say_parser(ctpos, (&ctname[0]) as u64, 10)
                 return 1
             }
         } else {
@@ -1234,6 +1357,8 @@ fn main(start: u64) -> i32 {
     // checker sees only ordinary code.
     mono.gen_run(&g)
     if mono.gen_error(&g) > 0 {
+        var m_mo: [u8; 41] = "a generic instantiation was not possible\0"
+        say_error((&m_mo[0]) as u64, rt.c_length((&m_mo[0]) as u64), 0, 0, 0, 0)
         return 1
     }
 
@@ -1263,9 +1388,13 @@ fn main(start: u64) -> i32 {
     sema.sema_if_set(&sm, (&ifreg) as u64)
     sema.sema_run(&sm)
     if sema.sema_needs_comptime(&sm) {
+        var m_l2: [u8; 47] = "this needs comptime, which firnc1 does not run\0"
+        say_limit((&m_l2[0]) as u64)
         return 4
     }
     if sema.sema_error(&sm) > 0 {
+        var m_se: [u8; 36] = "the type check refused this program\0"
+        say_at(tree, sema.sema_error_pos(&sm), (&m_se[0]) as u64, rt.c_length((&m_se[0]) as u64))
         return 1
     }
 
@@ -1278,9 +1407,13 @@ fn main(start: u64) -> i32 {
     lower.low_checked_set(&lo, checked)
     lower.low_run(&lo)
     if lower.low_unsuitable(&lo) {
+        var m_l3: [u8; 53] = "the lowering of firnc1 does not carry this construct\0"
+        say_limit((&m_l3[0]) as u64)
         return 5
     }
     if lower.low_error(&lo) > 0 {
+        var m_lo: [u8; 34] = "the lowering refused this program\0"
+        say_at(tree, lower.low_error_pos(&lo), (&m_lo[0]) as u64, rt.c_length((&m_lo[0]) as u64))
         return 1
     }
 
@@ -1297,6 +1430,8 @@ fn main(start: u64) -> i32 {
     codegen.cg_sema_set(&cg, (&sm) as u64)
     codegen.cg_run(&cg)
     if codegen.cg_unsuitable(&cg) {
+        var m_l4: [u8; 95] = "the code generator of firnc1 does not carry this FIR (floating point, more than six arguments)\0"
+        say_limit((&m_l4[0]) as u64)
         return 6
     }
     let out: *mut rt.Buf = codegen.cg_text(&cg)

@@ -175,9 +175,22 @@ The numbers and commands are in `ACCEPTANCE.md`, the reproduction in `RUN.md`.
 
 ## Phase 4 -- v0.4/0.5: self-hosting
 
-* `firnc1` compiles `firnc2`, `firnc2` compiles itself, the result is
-  bit-identical (fixpoint) -> `L1` and `ACCEPTANCE.md` item 1 satisfied
-* Rust becomes a bootstrap archive, `firnc0` is frozen
+* **DONE (round BOOTSTRAP, 2026-08-30)** -- `firnc1` compiles `firnc2`,
+  `firnc2` compiles itself, and stage 2 and stage 3 are byte-identical
+  (`tools/fixpoint.sh`) -> `L1` and `ACCEPTANCE.md` item 1 satisfied
+* **DONE (round BOOTSTRAP)** -- Rust is a bootstrap archive: `bootstrap/`
+  carries the frozen seed (the assembly text of `bin/firnc1.fi`), and
+  `bootstrap/build.sh` gets from there to a working compiler with `as` and
+  `ld` alone. `tools/no_rust.sh` proves it in an environment without
+  `cargo` and without `rustc`. `compiler/` stays where it is -- as the
+  archive and as the second opinion, not as a dependency of the build.
+* **OPEN, and measured** -- `firnc0` and `firnc1` are not the same compiler
+  yet. `docs/BOOTSTRAP-LUECKEN.md` counts it file by file: of 360 programs
+  that have to be compiled, 338 behave identically and 0 differ; of 208
+  programs that have to be REFUSED, `firnc1` still accepts **10** (kernel
+  profile, closures, module boundary). And `firnc1` says WHERE an error is,
+  not yet WHAT it is -- the error texts of `firnc0` are the next big piece
+  of work in `firnc1`.
 * **Unwinding/`throw`** (`L8`) with tables in two phases
 * Incremental GC with tri-colour marking (`S5`), pause times measurable (`S6`)
 * Profiler with flame graphs (`W4`), fuzzing hookup (`W5`)
