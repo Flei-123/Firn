@@ -107,3 +107,64 @@ with the frozen reference: 1087/1087. Round 79 touches nothing in lib/layout.
 SIDE FINDING, worth knowing: section 34 (the JS promise soak of round 66) is NOT deterministic --
 `jobs rc=-11` in 2 of 4 runs on main and 2 of 3 here, same binary. A real bug in lib/js/gen.fi waiting
 for a round of its own.
+
+## Round FIRNHUB -- where a package comes from, whom you believe, and what whole-program compilation really costs
+Branch `firnhub`, off `r93-lock`. WHY NOT MAIN, and it is a measurement, not a taste: `bin/package.fi`
+and `bin/lock.fi` are THE SAME COMMIT on every branch that has them, so "newest state" decides nothing.
+What decides is where the yardstick is green -- `tools/packages/run.sh` is 39/0 on r93-lock and 22/17 on
+main. THE REASON, bisected: the `thread-bool` pass of round SPEED miscompiles `firnc1`; the self-hosted
+compiler resolves no `import` any more and exits 2 WITHOUT a message. Eleven builds with one pass off
+each: only `--no-pass=thread-bool` (and its two feeders mem2reg/strength) make it work again. Not fixed
+here -- that is a round of its own; the reproduction and the one guilty pass are in docs/ROUND-FIRNHUB.md.
+PART 0, the rename: rounds 55/57 had already done most of it. Left were `firn.package` -> `firn.pkg`,
+the key `start` -> `main`, and `SUCHTIEFE` -> `SEARCH_DEPTH`. No aliases; the old names are refused.
+The switch stays `--package` (the owner allowed it, and a second spelling is the alias this round was
+told not to carry). Every fixed `[u8; N]` recounted, check_lengths 0.
+PART 1: `needs` takes `git+<url>#<ref>`, `<url>#sha256=<64 hex>` and a bare version resolved through an
+index, next to the local path of round 48. The kind is decided PURELY LEXICALLY so both compilers
+classify the same text alike. THE COMMENT RULE HAD TO GIVE: round 48 cut a line at every `#`, which
+makes `git+https://h/r#v1.2.0` impossible -- since this round a `#` opens a comment only WHERE A WORD
+BEGINS. Every existing manifest reads unchanged.
+PART 2, and this is the design decision of the round: THE COMPILER NEVER SPEAKS TO THE NETWORK. The
+doubling rule (everything in firnc exists twice, Rust and Firn, octet identical) is worth its price for
+a manifest format and a checksum. It is NOT worth it for `git clone`. So the fetcher is a SEPARATE
+program, in Firn, ONCE: `bin/firnpkg.fi`. It resolves, verifies, and writes `firn.have` next to the root
+manifest; the compiler reads that and sees `<cache>/pkg/<content hash>` -- a local path. Which is why an
+offline build needs no switch: there is nothing there that could go online. `git`, `curl`, `tar` are
+called as PROGRAMS, exactly like `as` and `ld`; an archive is weighed against its checksum BEFORE tar
+sees it. Cache layout after OrientOS' pkg/opk.py, minus its 20-hex truncation -- that was an OFS limit
+(NAME_LEN 24), and there is none here, so the name is the whole hash.
+THE ONE BUG THE DIRECTORY WALK COST: `rt.ld16(p, i)` indexes in UNITS OF TWO OCTETS. `d_reclen` sits at
+octet 16, so the call is `ld16(p, 8)`. With `ld16(p, 16)` the record length was a random number, the
+loop walked out of the block, and every recursion ended after the first entry -- `firnpkg hash` saw one
+file of four. Found by printing the paths and holding them against `find | sort`.
+PART 3: `firn.lock` FORMAT 2 -- a fetched package is `cache:<content hash>` (a path means nothing on the
+second machine) plus one `origin <name> <source> <resolved> <content>` line. Trust on first use over
+`<cache>/index.txt`: a fixed reference that ever comes back with other octets is refused loudly, which
+catches a re-pointed git tag (nachgestellt in tools/hub/run.sh). ED25519 NOT BUILT, and the reason is
+not laziness: it does not exist in Firn (x25519.fi says so in its own header X3, x509.fi calls it
+UNSUPPORTED), the only implementation in the project world is Python in opk.py, and writing it means
+Edwards point arithmetic + decompression + reduction mod L on top of the SHA-512 and the field
+arithmetic that DO exist -- about 400 lines, and twice if verification ever moves into the compiler.
+Every fetch says `unsigned source, trusted on first use` out loud instead.
+PART 4, THE MEASUREMENT, and it changed the recommendation: artificial trees of 1/5/10/25/50/100
+packages of 2000 lines, each also as ONE package with the same total. THE PACKAGE SYSTEM COSTS NOTHING
+-- N packages and one package with the same lines are within 13 % over the whole range. Memory is
+linear, 2 MiB per 1000 lines. TIME IS NOT: 0.12 s -> 115 s while lines go 2674 -> 266806, and
+`--timings` says where: the CODE GENERATOR grows 69x when the lines grow 4x (exponent 2.9, cubic) and
+is 93 % of the build at 100 packages. It is NOT the inliner -- with `--no-pass=inline` codegen is
+absolutely cheaper and relatively worse. SO THE ANSWER IS: separate compilation is NOT what has to come
+first. A linear code generator would take 266806 lines from 143 s to about 18 s -- factor 8, and the
+wall moves from 130000 lines past a million. Separate compilation is the far larger project (it fights
+monomorphised generics and cross-module inlining) and is worth doing AFTER that, for the rebuild cost --
+which today is the full build, every single time, at 2 minutes per changed line at 100 packages.
+PART 5: two real libraries as the proof. demos/hub/json 1.0.0 allocates NOTHING (every answer is an
+offset into the caller's text), refuses leading zeros and `\u`; demos/hub/date 1.1.0 is Hinnant's
+shifted year with a round trip over EVERY day from 1600 to 2400. Both carry their tests as their `main`
+-- a package with a `main` can be built and RUN, so a library's tests live in the library.
+SECOND FIND, older than this round: the `outside` line of firn.lock depends on WHICH compiler builds,
+for any program that uses `str`. firnc0 embeds lib/gc/gc.fi and COUNTS it as a file outside every
+package; firnc1 has the same text built in as gctext.fi and does not. Round 93's demos use no `str`, so
+it never showed. Named, not fixed; demos/hub/app avoids `str` and says why in its own head.
+MEASUREMENTS: tools/hub/run.sh 37/0 (new), tools/packages/run.sh 39/0 (unchanged), cargo test 247/0
+(unchanged), english 0 0 0 0 0, firnfmt -c clean on every new file.

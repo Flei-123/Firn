@@ -220,13 +220,18 @@ and a `line:column` — it does not crash and it does not pretend.
   scalar path computes the same results everywhere, only slowly (35x–147x
   slower for the cryptography, docs/BENCHMARKS.md §1); what is missing is the
   aarch64 form of the instruction, not the algorithm.
-* **No package registry, no lock file, no reproducible two-machine build.**
-  There is a module system and a project manifest (`firn.pkg`,
-  `firnc --package <dir>`), but `compiler/src/package.rs` and
-  `package_world.rs` contain not one occurrence of "lock", "registry", "http"
-  or "download": everything is resolved from the local file system, and it
-  stays whole-program compilation — no separate object files, no version
-  resolution. (`W1`, SPEC 14.1 item 15.)
+* **No package registry with signatures — and no separate compilation.**
+  A project manifest (`firn.pkg`, `firnc --package <dir>`), a lock file
+  (`firn.lock`, round 93) and remote sources (round FIRNHUB: `needs json
+  git+https://host/r#v1.2.0`, an archive with a `#sha256=`, or a version out
+  of an index) are there; `firnpkg fetch` resolves them into a content
+  addressed cache and the compiler itself still speaks to nothing but the
+  file system. What is missing is a **signature** — nothing is signed, and
+  `firnpkg` says so on every fetch — and a **service that hands out names**.
+  It also stays whole-program compilation: no separate object files. Round
+  FIRNHUB measured what that costs (`docs/ROUND-FIRNHUB.md`): at 267,000
+  lines a one-line change costs **two minutes**, and **93 % of it is the
+  code generator**, which grows cubically. (`W1`, SPEC 14.1 item 15.)
 * **No stack probing and no upper bound on the frame.** The prologue reserves
   the frame without a check; a function with very many live values can step
   past the guard page without a diagnostic. There is no `probe` and no guard
@@ -354,6 +359,8 @@ cargo build --release --manifest-path tools/testrunner/Cargo.toml
 firnc [OPTIONS] file.fi
   -o <path>            output file
   --package <dir>      compile the project from <dir>/firn.pkg
+  --package-info <dir> read the manifest and report
+  --lock  --locked     write / insist on <dir>/firn.lock
   --emit=exe|asm|fir|fir-raw|fir-opt|comptime|tokens|ast|ast-canon|layout|types
   --target=<name>      x86_64-linux (default) | aarch64-linux
   --profile=<name>     kernel | app (SPEC 2)
@@ -374,6 +381,7 @@ firnc [OPTIONS] file.fi
 | `lib/firnc1/` | the same compiler **in Firn** — the one that reaches the fixpoint |
 | `lib/std/`, `lib/str/`, `lib/num/`, `lib/rt/`, `lib/gc/` | the standard library, written in Firn |
 | `lib/html/`, `lib/css/`, `lib/dom/`, `lib/layout/`, `lib/js/` | the browser stack: tokenizer, CSS, DOM, layout, JavaScript |
+| `bin/firnpkg.fi` | the fetcher: git / archive / index -> content addressed cache |
 | `tests/`, `tests/opt/`, `tests/neg/` | the test programs (positive, optimizer, negative) |
 | `examples/`, `demos/` | small programs; `demos/kernel` boots in QEMU, `demos/mcserver` |
 | `bench/`, `tools/` | the benchmarks (Firn + Rust in duplicate) and every proof script |

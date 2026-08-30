@@ -44,6 +44,37 @@ compiler/target/release/firnc -o /tmp/mod tests/110_module.fi
 /tmp/mod ; echo "exit=$?"     # exit=60, as stated in line 1 of the file
 ```
 
+## 2b. A project with dependencies (round 48, 93, FIRNHUB)
+
+```sh
+firnc --package demos/hub/json -o /tmp/json && /tmp/json    # a library, running its own tests
+firnc --package demos/hub/app  -o /tmp/app  && /tmp/app     # firn 2026-08-30 Sunday
+```
+
+A dependency may lie somewhere else entirely:
+
+```text
+needs  json  ../json                                       a local path
+needs  json  git+https://host/firn-json#v1.2.0             git, fixed reference
+needs  json  https://host/json-1.2.0.tar#sha256=<64 hex>   archive with checksum
+needs  json  1.2.0                                         through $FIRN_INDEX
+```
+
+The compiler never fetches anything. The fetcher does, once:
+
+```sh
+firnc bin/firnpkg.fi -o firnpkg
+export FIRN_CACHE=$HOME/.firn/cache        # this is also the default
+./firnpkg fetch myproject                  # writes myproject/firn.have
+./firnpkg fetch --offline myproject        # cache only, refuses to reach out
+./firnpkg verify myproject                 # re-hash what firn.have names
+firnc --package myproject --lock -o app    # writes firn.lock (format 2)
+firnc --package myproject --locked -o app  # builds ONLY if it still fits
+```
+
+Measured proof of all of it: `bash tools/hub/run.sh` (37 checks, both
+compilers, a real git repository).
+
 ## 3. The whole test suite
 
 ```sh
