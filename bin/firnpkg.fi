@@ -1,0 +1,1587 @@
+// bin/firnpkg.fi -- the fetcher (round FIRNHUB), written in Firn.
+//
+// WHY THIS IS NOT PART OF THE COMPILER
+// ---------------------------------------------------------------------
+// Everything inside `firnc` has to exist TWICE -- once in Rust
+// (`compiler/src/`) and once in Firn (`lib/firnc1/`) -- and both have to
+// produce the same octets and the same sentences. That rule is worth its
+// price for the format of a manifest and for a checksum. It is NOT worth
+// its price for `git clone`: the network part would then be two
+// implementations of the same subprocess call, twice the surface, twice
+// the chance of a difference, and not one line of it would end up in a
+// binary.
+//
+// So the split is by DUTY, not by convenience:
+//
+//   * the COMPILER reads text and hashes files. It never opens a socket.
+//     A remote dependency reaches it as a local directory of the cache,
+//     found through `firn.have`. That is why an offline build needs no
+//     switch: there is nothing there that could go online.
+//   * this FETCHER speaks to the outside. It resolves a source, verifies
+//     what came back, puts it into the content addressed cache and writes
+//     `firn.have`. It exists ONCE, in Firn, and it is compiled by `firnc`
+//     like any other program.
+//
+// WHAT COUNTS AS "NO FOREIGN CODE"
+// ---------------------------------------------------------------------
+// `git`, `curl` and `tar` are called as PROGRAMS, the same way `firnc`
+// already calls `as` and `ld`. No foreign library is linked, no foreign
+// source is compiled into anything. What a transport program hands back
+// is treated as hostile: an archive is measured against the checksum
+// from the manifest BEFORE it is unpacked, and every tree is measured
+// against its own content hash before it becomes an address.
+//
+//     firnpkg fetch [--offline] <dir>   resolve <dir>/firn.pkg, write firn.have
+//     firnpkg hash <dir>                the content hash of a tree
+//     firnpkg verify <dir>              re-hash everything <dir>/firn.have names
+//
+// Exit codes: 0 fine, 1 usage, 2 an error with a message.
+
+import rt
+import vec
+import package
+import lock
+
+// ------------------------------------------------------------- system calls
+//
+// `rt.fi` has reading, writing and `fork`/`execve`. A fetcher needs three
+// more: making a directory, renaming one (that is how a finished tree
+// becomes an address, in one indivisible step) and reading a directory.
+
+const SYS_OPEN: i64 = 2
+const SYS_CLOSE: i64 = 3
+const SYS_MKDIR: i64 = 83
+const SYS_RENAME: i64 = 82
+const SYS_GETDENTS64: i64 = 217
+const O_DIRECTORY: i64 = 65536
+const MODE_DIR: i64 = 493
+
+const EEXIST: i64 = 0 - 17
+
+// One directory. `true` also when it was already there.
+fn mkdir_one(p: u64) -> bool {
+    let r: i64 = syscall(SYS_MKDIR, p as i64, MODE_DIR, 0, 0, 0, 0)
+    if r == 0 {
+        return true
+    }
+    return r == EEXIST
+}
+
+// `a/b/c`, every level in turn. A leading slash stays.
+fn mkdir_p(p: u64, n: usize) -> bool {
+    var t: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&t)
+    var i: usize = 0
+    while i < n {
+        rt.buf_push(&t, rt.ld8(p, i))
+        if rt.ld8(p, i) == 47 as u8 {
+            if rt.buf_len(&t) > 1 {
+                rt.buf_push(&t, 0 as u8)
+                let ok: bool = mkdir_one(rt.buf_ptr(&t))
+                rt.buf_set_len(&t, rt.buf_len(&t) - 1)
+                if !ok {
+                    return false
+                }
+            }
+        }
+        i = i + 1
+    }
+    rt.buf_push(&t, 0 as u8)
+    return mkdir_one(rt.buf_ptr(&t))
+}
+
+fn rename_to(a: u64, b: u64) -> bool {
+    return syscall(SYS_RENAME, a as i64, b as i64, 0, 0, 0, 0) == 0
+}
+
+// ------------------------------------------------------------- text helpers
+
+fn ptext(b: *mut rt.Buf, p: u64) {
+    rt.buf_push_bytes(b, p, rt.c_length(p))
+}
+
+// A buffer that a system call may see: the content plus a closing zero,
+// which does NOT count towards the length.
+fn null_behind(b: *mut rt.Buf) {
+    rt.buf_push(b, 0 as u8)
+    rt.buf_set_len(b, rt.buf_len(b) - 1)
+}
+
+fn set_text(b: *mut rt.Buf, p: u64, n: usize) {
+    rt.buf_clear(b)
+    rt.buf_push_bytes(b, p, n)
+    null_behind(b)
+}
+
+fn say(p: u64) {
+    rt.write_everything(2, p, rt.c_length(p))
+}
+
+fn say_bytes(p: u64, n: usize) {
+    rt.write_everything(2, p, n)
+}
+
+fn say_line() {
+    var nl: [u8; 2] = "\n\0"
+    rt.write_everything(2, (&nl[0]) as u64, 1)
+}
+
+fn out_text(p: u64, n: usize) {
+    rt.write_everything(1, p, n)
+}
+
+// --------------------------------------------------------- reading a tree
+//
+// A list of names, kept as one buffer of null terminated texts plus the
+// offset of each. No pointers are handed out across a push -- the buffer
+// may move.
+
+struct Names {
+    txt: rt.Buf,
+    off: Vec[u32],
+}
+
+fn names_new() -> Names {
+    return Names { txt: rt.buf_new(), off: vec_new[u32]() }
+}
+
+fn names_free(nl: *mut Names) {
+    rt.buf_free(&(*nl).txt)
+    vec_free[u32](&(*nl).off)
+}
+
+fn names_add(nl: *mut Names, p: u64, n: usize) {
+    vec_push[u32](&(*nl).off, rt.buf_len(&(*nl).txt) as u32)
+    rt.buf_push_bytes(&(*nl).txt, p, n)
+    rt.buf_push(&(*nl).txt, 0 as u8)
+}
+
+fn names_count(nl: *mut Names) -> usize {
+    return vec_len[u32](&(*nl).off)
+}
+
+fn names_ptr(nl: *mut Names, i: usize) -> u64 {
+    return rt.buf_ptr(&(*nl).txt) + vec_at[u32](&(*nl).off, i) as u64
+}
+
+// Insertion sort over the OFFSETS, comparing the texts. The order has to be
+// the same as the one `sort` and `lock.rs` use: octet for octet.
+fn names_sort(nl: *mut Names) {
+    var i: usize = 1
+    while i < names_count(nl) {
+        var j: usize = i
+        while j > 0 {
+            let a: u64 = names_ptr(nl, j - 1)
+            let b: u64 = names_ptr(nl, j)
+            if package.str_less(b, rt.c_length(b), a, rt.c_length(a)) {
+                let t: u32 = vec_at[u32](&(*nl).off, j - 1)
+                vec_set[u32](&(*nl).off, j - 1, vec_at[u32](&(*nl).off, j))
+                vec_set[u32](&(*nl).off, j, t)
+            } else {
+                break
+            }
+            j = j - 1
+        }
+        i = i + 1
+    }
+}
+
+// linux_dirent64: d_ino u64, d_off i64, d_reclen u16, d_type u8, name...
+const DT_DIR: u8 = 4
+const DT_REG: u8 = 8
+
+// Every REGULAR file under `base`, as a path relative to `base`. `.git` is
+// skipped: it is the machinery of a transport, not a part of a package, and
+// it is not reproducible either.
+fn walk(base: *mut rt.Buf, rel: *mut rt.Buf, out: *mut Names) -> bool {
+    var dir: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&dir)
+    if rt.buf_len(rel) == 0 {
+        set_text(&dir, rt.buf_ptr(base), rt.buf_len(base))
+    } else {
+        package.join(&dir, rt.buf_ptr(base), rt.buf_len(base),
+            rt.buf_ptr(rel), rt.buf_len(rel))
+        null_behind(&dir)
+    }
+    let fd: i64 = syscall(SYS_OPEN, rt.buf_ptr(&dir) as i64, O_DIRECTORY, 0, 0, 0, 0)
+    if fd < 0 {
+        return false
+    }
+    var block: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&block)
+    rt.buf_reserve(&block, 32768)
+    var git: [u8; 5] = ".git\0"
+    var ok: bool = true
+    while true {
+        let got: i64 = syscall(SYS_GETDENTS64, fd, rt.buf_ptr(&block) as i64,
+            32768, 0, 0, 0)
+        if got <= 0 {
+            break
+        }
+        var at: usize = 0
+        while at < got as usize {
+            let base_p: u64 = rt.buf_ptr(&block) + at as u64
+            // `ld16` indexes in UNITS OF TWO OCTETS: d_reclen sits at octet 16.
+            let reclen: usize = rt.ld16(base_p, 8) as usize
+            let kind: u8 = rt.ld8(base_p, 18)
+            let name: u64 = base_p + 19
+            let nn: usize = rt.c_length(name)
+            var skip: bool = false
+            if nn == 1 {
+                if rt.ld8(name, 0) == 46 as u8 {
+                    skip = true
+                }
+            }
+            if nn == 2 {
+                if rt.ld8(name, 0) == 46 as u8 {
+                    if rt.ld8(name, 1) == 46 as u8 {
+                        skip = true
+                    }
+                }
+            }
+            if nn == 4 {
+                if rt.mem_eq(name, (&git[0]) as u64, 4) {
+                    skip = true
+                }
+            }
+            if !skip {
+                var sub: rt.Buf = rt.buf_new()
+                if rt.buf_len(rel) == 0 {
+                    rt.buf_push_bytes(&sub, name, nn)
+                } else {
+                    package.join(&sub, rt.buf_ptr(rel), rt.buf_len(rel), name, nn)
+                }
+                null_behind(&sub)
+                if kind == DT_REG {
+                    names_add(out, rt.buf_ptr(&sub), rt.buf_len(&sub))
+                }
+                if kind == DT_DIR {
+                    if !walk(base, &sub, out) {
+                        ok = false
+                    }
+                }
+                rt.buf_free(&sub)
+            }
+            at = at + reclen
+        }
+    }
+    syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+    return ok
+}
+
+// THE CONTENT HASH OF A TREE.
+//
+// The same stream `lock.rs` hashes for one package: per file
+// `relative path \n length in octets \n content \n`, sorted by that path.
+// The path is in it so that renaming a file is a change; the length is in
+// it so that no two different file sets can be glued into the same octet
+// stream.
+//
+// It runs over EVERY regular file of the tree, not only over the ones a
+// build happens to read: the address of a package must not depend on who
+// looks at it. For a package whose every file takes part in a build, this
+// hash and the `package` line of `firn.lock` therefore come out equal --
+// the same stream, measured twice.
+fn tree_hash(root: u64, rn: usize, out: *mut rt.Buf) -> bool {
+    var base: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&base)
+    set_text(&base, root, rn)
+    var nl: Names = names_new()
+    defer names_free(&nl)
+    var empty: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&empty)
+    if !walk(&base, &empty, &nl) {
+        return false
+    }
+    names_sort(&nl)
+    var stream: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&stream)
+    var full: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&full)
+    var content: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&content)
+    var i: usize = 0
+    while i < names_count(&nl) {
+        let np: u64 = names_ptr(&nl, i)
+        let nn: usize = rt.c_length(np)
+        package.join(&full, rt.buf_ptr(&base), rt.buf_len(&base), np, nn)
+        null_behind(&full)
+        rt.buf_clear(&content)
+        if !rt.read_file(rt.buf_ptr(&full), &content) {
+            return false
+        }
+        rt.buf_push_bytes(&stream, np, nn)
+        rt.buf_push(&stream, 10 as u8)
+        rt.buf_push_dec_u64(&stream, rt.buf_len(&content) as u64)
+        rt.buf_push(&stream, 10 as u8)
+        rt.buf_push_bytes(&stream, rt.buf_ptr(&content), rt.buf_len(&content))
+        rt.buf_push(&stream, 10 as u8)
+        i = i + 1
+    }
+    rt.buf_clear(out)
+    lock.sha256_hex(out, rt.buf_ptr(&stream), rt.buf_len(&stream))
+    return true
+}
+
+// ------------------------------------------------------- starting a program
+//
+// `rt.run3` stops at three arguments; `git clone` needs more. The array is
+// built here and handed over unchanged -- no shell, so nothing in a URL out
+// of a manifest can be read as a command.
+
+struct Argv {
+    field: [u64; 12],
+    n: usize,
+}
+
+fn argv_new(prog: u64) -> Argv {
+    var a: Argv = Argv { field: [0; 12], n: 0 }
+    a.field[0] = prog
+    a.n = 1
+    return a
+}
+
+fn argv_add(a: *mut Argv, p: u64) {
+    if (*a).n < 11 {
+        (*a).field[(*a).n] = p
+        (*a).n = (*a).n + 1
+    }
+}
+
+fn argv_run(a: *mut Argv) -> i64 {
+    (*a).field[(*a).n] = 0
+    return rt.run((*a).field[0], (&(*a).field[0]) as u64)
+}
+
+// ------------------------------------------------------------- the manifest
+//
+// Only the `needs` lines are read here, and only their first two words. The
+// fetcher is a DOWNLOADER, not a second manifest reader: everything else --
+// arity, names, versions, visibility, cycles -- is checked by the compiler
+// afterwards, in both of its implementations. A third full reader of the
+// format would be a third place for it to drift.
+
+struct Wish {
+    name: rt.Buf,
+    source: rt.Buf,
+}
+
+// Reads `<dir>/firn.pkg` and appends every `needs` entry to `names`/`sources`.
+fn needs_read(dir: u64, dn: usize, names: *mut Names, sources: *mut Names) -> bool {
+    var mp: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&mp)
+    var mn: [u8; 9] = "firn.pkg\0"
+    package.join(&mp, dir, dn, (&mn[0]) as u64, 8)
+    null_behind(&mp)
+    var text: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&text)
+    if !rt.read_file(rt.buf_ptr(&mp), &text) {
+        return false
+    }
+    var key: [u8; 6] = "needs\0"
+    let txt: u64 = rt.buf_ptr(&text)
+    let tn: usize = rt.buf_len(&text)
+    var i: usize = 0
+    while i <= tn {
+        var e: usize = i
+        while e < tn {
+            if rt.ld8(txt, e) == 10 as u8 {
+                break
+            }
+            e = e + 1
+        }
+        // The comment rule of round FIRNHUB: a `#` opens a comment only
+        // where a word begins.
+        var c: usize = i
+        while c < e {
+            if rt.ld8(txt, c) == 35 as u8 {
+                if c == i {
+                    break
+                }
+                if rt.ld8(txt, c - 1) == 32 as u8 {
+                    break
+                }
+                if rt.ld8(txt, c - 1) == 9 as u8 {
+                    break
+                }
+            }
+            c = c + 1
+        }
+        var pos: usize = i
+        var w1o: usize = 0
+        var w1n: usize = 0
+        var w2o: usize = 0
+        var w2n: usize = 0
+        var w3o: usize = 0
+        var w3n: usize = 0
+        if word_at(txt, c, &pos, &w1o, &w1n) {
+            if w1n == 5 {
+                if rt.mem_eq(txt + w1o as u64, (&key[0]) as u64, 5) {
+                    if word_at(txt, c, &pos, &w2o, &w2n) {
+                        if word_at(txt, c, &pos, &w3o, &w3n) {
+                            names_add(names, txt + w2o as u64, w2n)
+                            names_add(sources, txt + w3o as u64, w3n)
+                        }
+                    }
+                }
+            }
+        }
+        if e >= tn {
+            break
+        }
+        i = e + 1
+    }
+    return true
+}
+
+fn word_at(txt: u64, end: usize, i: *mut usize, wo: *mut usize, wn: *mut usize) -> bool {
+    var k: usize = *i
+    while k < end {
+        let c: u8 = rt.ld8(txt, k)
+        if c != 32 as u8 {
+            if c != 9 as u8 {
+                break
+            }
+        }
+        k = k + 1
+    }
+    if k >= end {
+        *i = k
+        return false
+    }
+    let s: usize = k
+    while k < end {
+        let c: u8 = rt.ld8(txt, k)
+        if c == 32 as u8 {
+            break
+        }
+        if c == 9 as u8 {
+            break
+        }
+        k = k + 1
+    }
+    *wo = s
+    *wn = k - s
+    *i = k
+    return true
+}
+
+// -------------------------------------------------------- the environment
+//
+// Only the start block carries the environment: [argc][argv..][0][envp..].
+
+fn env(start: u64, name: u64, n: usize) -> u64 {
+    var i: usize = 1 + rt.arg_count(start) + 1
+    while true {
+        let e: u64 = rt.ld64(start, i)
+        if e == 0 {
+            return 0
+        }
+        if rt.c_length(e) > n {
+            if rt.ld8(e, n) == 61 as u8 {
+                if rt.mem_eq(e, name, n) {
+                    return e + (n + 1) as u64
+                }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// The cache root, in the same order as `package_world::cache_root` and
+// `bin/firnc1.fi`: $FIRN_CACHE, else $HOME/.firn/cache, else empty.
+fn cache_root(start: u64, out: *mut rt.Buf) {
+    var c_name: [u8; 11] = "FIRN_CACHE\0"
+    var h_name: [u8; 5] = "HOME\0"
+    var sub: [u8; 12] = ".firn/cache\0"
+    rt.buf_clear(out)
+    let c: u64 = env(start, (&c_name[0]) as u64, 10)
+    if c != 0 {
+        if rt.c_length(c) > 0 {
+            package.normalize(out, c, rt.c_length(c))
+            null_behind(out)
+            return
+        }
+    }
+    let h: u64 = env(start, (&h_name[0]) as u64, 4)
+    if h != 0 {
+        if rt.c_length(h) > 0 {
+            var hn: rt.Buf = rt.buf_new()
+            package.normalize(&hn, h, rt.c_length(h))
+            package.join(out, rt.buf_ptr(&hn), rt.buf_len(&hn), (&sub[0]) as u64, 11)
+            null_behind(out)
+            rt.buf_free(&hn)
+        }
+    }
+}
+
+// --------------------------------------------------------- outside programs
+//
+// `git`, `curl` and `tar` are looked for where they usually are. `execve`
+// wants a path, not a name -- and a fetcher that searched $PATH would let
+// the environment decide which `git` runs.
+
+fn find_program(name: u64, out: *mut rt.Buf) -> bool {
+    var d1: [u8; 10] = "/usr/bin/\0"
+    var d2: [u8; 6] = "/bin/\0"
+    var d3: [u8; 16] = "/usr/local/bin/\0"
+    var i: usize = 0
+    while i < 3 {
+        var d: u64 = (&d1[0]) as u64
+        if i == 1 {
+            d = (&d2[0]) as u64
+        }
+        if i == 2 {
+            d = (&d3[0]) as u64
+        }
+        rt.buf_clear(out)
+        ptext(out, d)
+        ptext(out, name)
+        null_behind(out)
+        if package.is_file(rt.buf_ptr(out)) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// `rm -rf <path>`, for a temporary tree that is being given up.
+fn remove_tree(path: u64) {
+    var rm: [u8; 3] = "rm\0"
+    var opt: [u8; 4] = "-rf\0"
+    var p: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&p)
+    if !find_program((&rm[0]) as u64, &p) {
+        return
+    }
+    rt.run3(rt.buf_ptr(&p), (&opt[0]) as u64, path, 0)
+}
+
+// ------------------------------------------------------------- the messages
+
+fn err_head() {
+    var t: [u8; 8] = "error: \0"
+    say((&t[0]) as u64)
+}
+
+fn note_head() {
+    var t: [u8; 7] = "note: \0"
+    say((&t[0]) as u64)
+}
+
+fn quoted(p: u64) {
+    var q: [u8; 2] = "'\0"
+    say((&q[0]) as u64)
+    say(p)
+    say((&q[0]) as u64)
+}
+
+// ------------------------------------------------------------ the cache index
+//
+// `<cache>/index.txt`: one line `<source> <resolved> <content>` per source
+// that was ever fetched. It is the ONLY reason a second project does not
+// download the same package again -- and it is also the trust anchor:
+//
+// TRUST ON FIRST USE, AND WHAT IT REALLY BUYS. A fixed reference is
+// supposed to name fixed octets. If the same source ever comes back with a
+// DIFFERENT content hash, then either the reference was moved (a git tag
+// can be re-pointed) or the answer was tampered with. Both are refused
+// here, loudly. What that does NOT do is tell a first fetch from a lie:
+// nothing is signed. See docs/ROUND-FIRNHUB.md.
+
+fn index_path(cache: *mut rt.Buf, out: *mut rt.Buf) {
+    var n: [u8; 10] = "index.txt\0"
+    package.join(out, rt.buf_ptr(cache), rt.buf_len(cache), (&n[0]) as u64, 9)
+    null_behind(out)
+}
+
+// Look for `source`. `true` = found; `res`/`content` are then filled.
+fn index_find(cache: *mut rt.Buf, source: u64, res: *mut rt.Buf, content: *mut rt.Buf) -> bool {
+    var ip: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&ip)
+    index_path(cache, &ip)
+    var text: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&text)
+    if !rt.read_file(rt.buf_ptr(&ip), &text) {
+        return false
+    }
+    let txt: u64 = rt.buf_ptr(&text)
+    let tn: usize = rt.buf_len(&text)
+    let sn: usize = rt.c_length(source)
+    var i: usize = 0
+    while i <= tn {
+        var e: usize = i
+        while e < tn {
+            if rt.ld8(txt, e) == 10 as u8 {
+                break
+            }
+            e = e + 1
+        }
+        var pos: usize = i
+        var ao: usize = 0
+        var an: usize = 0
+        var bo: usize = 0
+        var bn: usize = 0
+        var co: usize = 0
+        var cn: usize = 0
+        if word_at(txt, e, &pos, &ao, &an) {
+            if word_at(txt, e, &pos, &bo, &bn) {
+                if word_at(txt, e, &pos, &co, &cn) {
+                    if an == sn {
+                        if rt.mem_eq(txt + ao as u64, source, sn) {
+                            set_text(res, txt + bo as u64, bn)
+                            set_text(content, txt + co as u64, cn)
+                            return true
+                        }
+                    }
+                }
+            }
+        }
+        if e >= tn {
+            break
+        }
+        i = e + 1
+    }
+    return false
+}
+
+fn index_append(cache: *mut rt.Buf, source: u64, res: u64, content: u64) {
+    var ip: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&ip)
+    index_path(cache, &ip)
+    var old: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&old)
+    rt.read_file(rt.buf_ptr(&ip), &old)
+    ptext(&old, source)
+    rt.buf_push(&old, 32 as u8)
+    ptext(&old, res)
+    rt.buf_push(&old, 32 as u8)
+    ptext(&old, content)
+    rt.buf_push(&old, 10 as u8)
+    rt.write_file(rt.buf_ptr(&ip), rt.buf_ptr(&old), rt.buf_len(&old))
+}
+
+// ----------------------------------------------------------------- fetching
+
+// `<cache>/pkg/<hash>`
+fn pkg_place(cache: *mut rt.Buf, hash: u64, out: *mut rt.Buf) {
+    var sub: [u8; 4] = "pkg\0"
+    var mid: rt.Buf = rt.buf_new()
+    package.join(&mid, rt.buf_ptr(cache), rt.buf_len(cache), (&sub[0]) as u64, 3)
+    package.join(out, rt.buf_ptr(&mid), rt.buf_len(&mid), hash, rt.c_length(hash))
+    null_behind(out)
+    rt.buf_free(&mid)
+}
+
+// `<cache>/tmp/work`
+fn tmp_place(cache: *mut rt.Buf, out: *mut rt.Buf) {
+    var sub: [u8; 9] = "tmp/work\0"
+    package.join(out, rt.buf_ptr(cache), rt.buf_len(cache), (&sub[0]) as u64, 8)
+    null_behind(out)
+}
+
+// A piece of a source between two offsets, as its own null terminated text.
+fn slice_of(p: u64, from: usize, to: usize, out: *mut rt.Buf) {
+    rt.buf_clear(out)
+    rt.buf_push_bytes(out, p + from as u64, to - from)
+    null_behind(out)
+}
+
+// `git clone` + `checkout --detach`. The resolved commit is read out of
+// `.git/HEAD` -- a detached HEAD holds the raw commit, so no pipe and no
+// shell are needed to learn it. Afterwards `.git` goes away: it is the
+// machinery of a transport and not a part of the package.
+fn fetch_git(source: u64, dest: *mut rt.Buf, res: *mut rt.Buf) -> bool {
+    var g: [u8; 4] = "git\0"
+    var c_clone: [u8; 6] = "clone\0"
+    var c_quiet: [u8; 8] = "--quiet\0"
+    var c_c: [u8; 3] = "-C\0"
+    var c_checkout: [u8; 9] = "checkout\0"
+    var c_detach: [u8; 9] = "--detach\0"
+    var c_nocheck: [u8; 3] = "-n\0"
+    var headf: [u8; 10] = ".git/HEAD\0"
+    var git: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&git)
+    if !find_program((&g[0]) as u64, &git) {
+        err_head()
+        var m: [u8; 24] = "'git' is not installed\n\0"
+        say((&m[0]) as u64)
+        return false
+    }
+    let n: usize = rt.c_length(source)
+    let hp: usize = package.hash_at(source, n)
+    var url: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&url)
+    var reference: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&reference)
+    slice_of(source, 4, hp, &url)
+    slice_of(source, hp + 1, n, &reference)
+    var a: Argv = argv_new(rt.buf_ptr(&git))
+    argv_add(&a, (&c_clone[0]) as u64)
+    argv_add(&a, (&c_quiet[0]) as u64)
+    argv_add(&a, (&c_nocheck[0]) as u64)
+    argv_add(&a, rt.buf_ptr(&url))
+    argv_add(&a, rt.buf_ptr(dest))
+    if argv_run(&a) != 0 {
+        err_head()
+        var m2: [u8; 19] = "git clone failed: \0"
+        say((&m2[0]) as u64)
+        say(rt.buf_ptr(&url))
+        say_line()
+        return false
+    }
+    var b: Argv = argv_new(rt.buf_ptr(&git))
+    argv_add(&b, (&c_c[0]) as u64)
+    argv_add(&b, rt.buf_ptr(dest))
+    argv_add(&b, (&c_checkout[0]) as u64)
+    argv_add(&b, (&c_quiet[0]) as u64)
+    argv_add(&b, (&c_detach[0]) as u64)
+    argv_add(&b, rt.buf_ptr(&reference))
+    if argv_run(&b) != 0 {
+        err_head()
+        var m3: [u8; 24] = "no such git reference: \0"
+        say((&m3[0]) as u64)
+        say(rt.buf_ptr(&reference))
+        say_line()
+        return false
+    }
+    var hf: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&hf)
+    package.join(&hf, rt.buf_ptr(dest), rt.buf_len(dest), (&headf[0]) as u64, 9)
+    null_behind(&hf)
+    var head: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&head)
+    if !rt.read_file(rt.buf_ptr(&hf), &head) {
+        return false
+    }
+    var m: usize = rt.buf_len(&head)
+    while m > 0 {
+        if rt.buf_at(&head, m - 1) > 32 as u8 {
+            break
+        }
+        m = m - 1
+    }
+    set_text(res, rt.buf_ptr(&head), m)
+    var dotgit: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&dotgit)
+    var dg: [u8; 5] = ".git\0"
+    package.join(&dotgit, rt.buf_ptr(dest), rt.buf_len(dest), (&dg[0]) as u64, 4)
+    null_behind(&dotgit)
+    remove_tree(rt.buf_ptr(&dotgit))
+    return true
+}
+
+// `curl` + the checksum out of the manifest + `tar`. The checksum is
+// measured BEFORE anything is unpacked: `tar` is a program that reads an
+// untrusted file, and it should read one whose octets have been agreed on.
+fn fetch_archive(source: u64, cache: *mut rt.Buf, dest: *mut rt.Buf, res: *mut rt.Buf) -> bool {
+    var c: [u8; 5] = "curl\0"
+    var t: [u8; 4] = "tar\0"
+    var o_silent: [u8; 6] = "-sSfL\0"
+    var o_out: [u8; 3] = "-o\0"
+    var o_x: [u8; 4] = "-xf\0"
+    var o_C: [u8; 3] = "-C\0"
+    var dlname: [u8; 12] = "tmp/archive\0"
+    var curl: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&curl)
+    var tar: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&tar)
+    if !find_program((&c[0]) as u64, &curl) {
+        err_head()
+        var m: [u8; 25] = "'curl' is not installed\n\0"
+        say((&m[0]) as u64)
+        return false
+    }
+    if !find_program((&t[0]) as u64, &tar) {
+        err_head()
+        var m2: [u8; 24] = "'tar' is not installed\n\0"
+        say((&m2[0]) as u64)
+        return false
+    }
+    let n: usize = rt.c_length(source)
+    let sp: usize = package.sha_at(source, n)
+    var url: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&url)
+    var want: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&want)
+    slice_of(source, 0, sp, &url)
+    slice_of(source, sp + 8, n, &want)
+    var dl: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&dl)
+    package.join(&dl, rt.buf_ptr(cache), rt.buf_len(cache), (&dlname[0]) as u64, 11)
+    null_behind(&dl)
+    var a: Argv = argv_new(rt.buf_ptr(&curl))
+    argv_add(&a, (&o_silent[0]) as u64)
+    argv_add(&a, (&o_out[0]) as u64)
+    argv_add(&a, rt.buf_ptr(&dl))
+    argv_add(&a, rt.buf_ptr(&url))
+    if argv_run(&a) != 0 {
+        err_head()
+        var m3: [u8; 18] = "download failed: \0"
+        say((&m3[0]) as u64)
+        say(rt.buf_ptr(&url))
+        say_line()
+        return false
+    }
+    var octets: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&octets)
+    if !rt.read_file(rt.buf_ptr(&dl), &octets) {
+        return false
+    }
+    var got: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&got)
+    lock.sha256_hex(&got, rt.buf_ptr(&octets), rt.buf_len(&octets))
+    null_behind(&got)
+    var same: bool = false
+    if rt.buf_len(&got) == rt.buf_len(&want) {
+        same = rt.mem_eq(rt.buf_ptr(&got), rt.buf_ptr(&want), rt.buf_len(&got))
+    }
+    if !same {
+        err_head()
+        var m4: [u8; 36] = "the archive has the wrong checksum\n\0"
+        say((&m4[0]) as u64)
+        note_head()
+        var m5: [u8; 8] = "wanted \0"
+        var m6: [u8; 5] = "got \0"
+        say((&m5[0]) as u64)
+        say(rt.buf_ptr(&want))
+        say_line()
+        note_head()
+        say((&m6[0]) as u64)
+        say(rt.buf_ptr(&got))
+        say_line()
+        return false
+    }
+    if !mkdir_p(rt.buf_ptr(dest), rt.buf_len(dest)) {
+        return false
+    }
+    var b: Argv = argv_new(rt.buf_ptr(&tar))
+    argv_add(&b, (&o_x[0]) as u64)
+    argv_add(&b, rt.buf_ptr(&dl))
+    argv_add(&b, (&o_C[0]) as u64)
+    argv_add(&b, rt.buf_ptr(dest))
+    if argv_run(&b) != 0 {
+        err_head()
+        var m7: [u8; 28] = "the archive cannot be read\n\0"
+        say((&m7[0]) as u64)
+        return false
+    }
+    set_text(res, rt.buf_ptr(&want), rt.buf_len(&want))
+    return true
+}
+
+// The single directory of a freshly unpacked archive, if that is what it
+// holds. `foo-1.2.0.tar` usually carries everything under `foo-1.2.0/`, and
+// the package is what is INSIDE that, not the wrapper.
+fn single_child(path: *mut rt.Buf, out: *mut rt.Buf) -> bool {
+    let fd: i64 = syscall(SYS_OPEN, rt.buf_ptr(path) as i64, O_DIRECTORY, 0, 0, 0, 0)
+    if fd < 0 {
+        return false
+    }
+    var block: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&block)
+    rt.buf_reserve(&block, 32768)
+    var count: usize = 0
+    var only: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&only)
+    var kind_of_only: u8 = 0
+    while true {
+        let got: i64 = syscall(SYS_GETDENTS64, fd, rt.buf_ptr(&block) as i64,
+            32768, 0, 0, 0)
+        if got <= 0 {
+            break
+        }
+        var at: usize = 0
+        while at < got as usize {
+            let bp: u64 = rt.buf_ptr(&block) + at as u64
+            let reclen: usize = rt.ld16(bp, 8) as usize
+            let kind: u8 = rt.ld8(bp, 18)
+            let name: u64 = bp + 19
+            let nn: usize = rt.c_length(name)
+            var skip: bool = false
+            if nn == 1 {
+                if rt.ld8(name, 0) == 46 as u8 {
+                    skip = true
+                }
+            }
+            if nn == 2 {
+                if rt.ld8(name, 0) == 46 as u8 {
+                    if rt.ld8(name, 1) == 46 as u8 {
+                        skip = true
+                    }
+                }
+            }
+            if !skip {
+                count = count + 1
+                set_text(&only, name, nn)
+                kind_of_only = kind
+            }
+            at = at + reclen
+        }
+    }
+    syscall(SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+    if count != 1 {
+        return false
+    }
+    if kind_of_only != DT_DIR {
+        return false
+    }
+    package.join(out, rt.buf_ptr(path), rt.buf_len(path),
+        rt.buf_ptr(&only), rt.buf_len(&only))
+    null_behind(out)
+    return true
+}
+
+// ------------------------------------------------------------- the registry
+//
+// The short form `needs json 1.2.0` is resolved through an INDEX -- a text
+// file, one line per release:
+//
+//     pkg json 1.2.0 git+https://host/firn-json#v1.2.0 <content hash>
+//
+// `$FIRN_INDEX` says where it lies; without it there is no registry and the
+// short form is an error that says so. An `https://` index is fetched with
+// `curl` once per run and then read out of the cache.
+//
+// The index is deliberately the ONLY thing that knows names: a package is
+// identified by its content everywhere else. That is why a registry can go
+// away without any project stopping to build.
+
+struct Ctx {
+    cache: rt.Buf,
+    registry: rt.Buf,
+    offline: bool,
+    quiet: bool,
+}
+
+fn registry_find(cx: *mut Ctx, name: u64, version: u64, out: *mut rt.Buf) -> bool {
+    var key: [u8; 4] = "pkg\0"
+    if rt.buf_len(&(*cx).registry) == 0 {
+        return false
+    }
+    var text: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&text)
+    if !rt.read_file(rt.buf_ptr(&(*cx).registry), &text) {
+        return false
+    }
+    let txt: u64 = rt.buf_ptr(&text)
+    let tn: usize = rt.buf_len(&text)
+    let nn: usize = rt.c_length(name)
+    let vn: usize = rt.c_length(version)
+    var i: usize = 0
+    while i <= tn {
+        var e: usize = i
+        while e < tn {
+            if rt.ld8(txt, e) == 10 as u8 {
+                break
+            }
+            e = e + 1
+        }
+        var pos: usize = i
+        var ko: usize = 0
+        var kn: usize = 0
+        var no: usize = 0
+        var no_n: usize = 0
+        var vo: usize = 0
+        var vo_n: usize = 0
+        var so: usize = 0
+        var so_n: usize = 0
+        if word_at(txt, e, &pos, &ko, &kn) {
+            if kn == 3 {
+                if rt.mem_eq(txt + ko as u64, (&key[0]) as u64, 3) {
+                    if word_at(txt, e, &pos, &no, &no_n) {
+                        if word_at(txt, e, &pos, &vo, &vo_n) {
+                            if word_at(txt, e, &pos, &so, &so_n) {
+                                if no_n == nn {
+                                    if rt.mem_eq(txt + no as u64, name, nn) {
+                                        if vo_n == vn {
+                                            if rt.mem_eq(txt + vo as u64, version, vn) {
+                                                set_text(out, txt + so as u64, so_n)
+                                                return true
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if e >= tn {
+            break
+        }
+        i = e + 1
+    }
+    return false
+}
+
+// ------------------------------------------------------------ resolving one
+//
+// Answers: which content hash does this source stand for? Everything that
+// touches the network happens here and nowhere else.
+
+fn resolve(cx: *mut Ctx, name: u64, source: u64, res: *mut rt.Buf, content: *mut rt.Buf) -> bool {
+    // 1. Do we have it already? Then NOTHING happens -- this is the branch
+    //    an offline build lives in, and it is the reason no switch is
+    //    needed for one.
+    var place: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&place)
+    var mf: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&mf)
+    var mn: [u8; 9] = "firn.pkg\0"
+    var known: bool = index_find(&(*cx).cache, source, res, content)
+    if known {
+        pkg_place(&(*cx).cache, rt.buf_ptr(content), &place)
+        package.join(&mf, rt.buf_ptr(&place), rt.buf_len(&place), (&mn[0]) as u64, 8)
+        null_behind(&mf)
+        if package.is_file(rt.buf_ptr(&mf)) {
+            return true
+        }
+    }
+    if (*cx).offline {
+        err_head()
+        var m1: [u8; 33] = "not in the cache, and --offline\n\0"
+        say((&m1[0]) as u64)
+        note_head()
+        var m2: [u8; 8] = "source \0"
+        say((&m2[0]) as u64)
+        quoted(source)
+        say_line()
+        return false
+    }
+    // 2. A registry short form turns into a real source first.
+    var real: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&real)
+    if package.origin_is_registry(source, rt.c_length(source)) {
+        if !registry_find(cx, name, source, &real) {
+            err_head()
+            var m3: [u8; 9] = "package \0"
+            var m4: [u8; 31] = " is not in the index, version \0"
+            say((&m3[0]) as u64)
+            quoted(name)
+            say((&m4[0]) as u64)
+            say(source)
+            say_line()
+            note_head()
+            var m5: [u8; 45] = "$FIRN_INDEX names the file to look it up in\n\0"
+            say((&m5[0]) as u64)
+            return false
+        }
+    } else {
+        set_text(&real, source, rt.c_length(source))
+    }
+    // 3. Fetch into a temporary tree.
+    var tmp: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&tmp)
+    tmp_place(&(*cx).cache, &tmp)
+    remove_tree(rt.buf_ptr(&tmp))
+    var ok: bool = false
+    if package.origin_is_git(rt.buf_ptr(&real), rt.buf_len(&real)) {
+        ok = fetch_git(rt.buf_ptr(&real), &tmp, res)
+    } else {
+        ok = fetch_archive(rt.buf_ptr(&real), &(*cx).cache, &tmp, res)
+    }
+    if !ok {
+        return false
+    }
+    // An archive that wraps the package in one directory: take the inside.
+    var inner: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&inner)
+    package.join(&mf, rt.buf_ptr(&tmp), rt.buf_len(&tmp), (&mn[0]) as u64, 8)
+    null_behind(&mf)
+    var tree: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&tree)
+    set_text(&tree, rt.buf_ptr(&tmp), rt.buf_len(&tmp))
+    if !package.is_file(rt.buf_ptr(&mf)) {
+        if single_child(&tmp, &inner) {
+            set_text(&tree, rt.buf_ptr(&inner), rt.buf_len(&inner))
+        }
+    }
+    package.join(&mf, rt.buf_ptr(&tree), rt.buf_len(&tree), (&mn[0]) as u64, 8)
+    null_behind(&mf)
+    if !package.is_file(rt.buf_ptr(&mf)) {
+        err_head()
+        var m6: [u8; 32] = "what was fetched is no package\n\0"
+        say((&m6[0]) as u64)
+        note_head()
+        var m7: [u8; 30] = "there is no 'firn.pkg' in it\n\0"
+        say((&m7[0]) as u64)
+        remove_tree(rt.buf_ptr(&tmp))
+        return false
+    }
+    // 4. The content decides the address, not the name it came under.
+    var got: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&got)
+    if !tree_hash(rt.buf_ptr(&tree), rt.buf_len(&tree), &got) {
+        remove_tree(rt.buf_ptr(&tmp))
+        return false
+    }
+    null_behind(&got)
+    // TRUST ON FIRST USE: a fixed reference that comes back with other
+    // octets is refused, not quietly accepted.
+    if known {
+        var same: bool = false
+        if rt.buf_len(&got) == rt.buf_len(content) {
+            same = rt.mem_eq(rt.buf_ptr(&got), rt.buf_ptr(content), rt.buf_len(&got))
+        }
+        if !same {
+            err_head()
+            var m8: [u8; 44] = "the source changed under a fixed reference\n\0"
+            say((&m8[0]) as u64)
+            note_head()
+            var m9: [u8; 8] = "source \0"
+            say((&m9[0]) as u64)
+            quoted(source)
+            say_line()
+            note_head()
+            var m10: [u8; 5] = "was \0"
+            var m11: [u8; 8] = "is now \0"
+            say((&m10[0]) as u64)
+            say(rt.buf_ptr(content))
+            say_line()
+            note_head()
+            say((&m11[0]) as u64)
+            say(rt.buf_ptr(&got))
+            say_line()
+            remove_tree(rt.buf_ptr(&tmp))
+            return false
+        }
+    }
+    rt.buf_clear(content)
+    rt.buf_push_bytes(content, rt.buf_ptr(&got), rt.buf_len(&got))
+    null_behind(content)
+    pkg_place(&(*cx).cache, rt.buf_ptr(content), &place)
+    package.join(&mf, rt.buf_ptr(&place), rt.buf_len(&place), (&mn[0]) as u64, 8)
+    null_behind(&mf)
+    if package.is_file(rt.buf_ptr(&mf)) {
+        // Somebody else already put these very octets there. That is what
+        // content addressing is FOR: two names, one tree.
+        remove_tree(rt.buf_ptr(&tmp))
+    } else {
+        var up: rt.Buf = rt.buf_new()
+        package.dir_of(&up, rt.buf_ptr(&place), rt.buf_len(&place))
+        mkdir_p(rt.buf_ptr(&up), rt.buf_len(&up))
+        rt.buf_free(&up)
+        if !rename_to(rt.buf_ptr(&tree), rt.buf_ptr(&place)) {
+            err_head()
+            var m12: [u8; 33] = "cannot move the tree into place\n\0"
+            say((&m12[0]) as u64)
+            return false
+        }
+        remove_tree(rt.buf_ptr(&tmp))
+    }
+    if !known {
+        index_append(&(*cx).cache, source, rt.buf_ptr(res), rt.buf_ptr(content))
+    }
+    if !(*cx).quiet {
+        var f1: [u8; 9] = "fetched \0"
+        var f2: [u8; 3] = "  \0"
+        say((&f1[0]) as u64)
+        say(name)
+        say((&f2[0]) as u64)
+        say(source)
+        say_line()
+        note_head()
+        var f3: [u8; 59] = "unsigned source, trusted on first use (no signatures yet)\n\0"
+        say((&f3[0]) as u64)
+    }
+    return true
+}
+
+// -------------------------------------------------------------- the driver
+//
+// Breadth first over the whole graph: every manifest that is reached
+// contributes its `needs` lines. A LOCAL dependency is followed as a
+// directory, a REMOTE one is resolved and then followed inside the cache --
+// so a package fetched from git may itself depend on something else, and
+// that is fetched too. The whole result lands in ONE `firn.have` next to
+// the root manifest, which is the same decision `firn.lock` makes.
+
+// The first word of a `firn.have` line is the package name.
+fn first_word_is(line: u64, name: u64) -> bool {
+    let n: usize = rt.c_length(name)
+    if rt.c_length(line) <= n {
+        return false
+    }
+    if rt.ld8(line, n) != 32 as u8 {
+        return false
+    }
+    return rt.mem_eq(line, name, n)
+}
+
+fn have_index_of(lines: *mut Names, name: u64) -> i64 {
+    var i: usize = 0
+    while i < names_count(lines) {
+        if first_word_is(names_ptr(lines, i), name) {
+            return i as i64
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn fetch_all(cx: *mut Ctx, dir: u64, dn: usize) -> i32 {
+    var mn: [u8; 9] = "firn.pkg\0"
+    var scan: Names = names_new()
+    defer names_free(&scan)
+    var lines: Names = names_new()
+    defer names_free(&lines)
+    var root: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&root)
+    package.normalize(&root, dir, dn)
+    null_behind(&root)
+    names_add(&scan, rt.buf_ptr(&root), rt.buf_len(&root))
+    var i: usize = 0
+    while i < names_count(&scan) {
+        var here: rt.Buf = rt.buf_new()
+        set_text(&here, names_ptr(&scan, i), rt.c_length(names_ptr(&scan, i)))
+        var names: Names = names_new()
+        var sources: Names = names_new()
+        if !needs_read(rt.buf_ptr(&here), rt.buf_len(&here), &names, &sources) {
+            err_head()
+            var m1: [u8; 19] = "no manifest under \0"
+            say((&m1[0]) as u64)
+            quoted(rt.buf_ptr(&here))
+            say_line()
+            names_free(&names)
+            names_free(&sources)
+            rt.buf_free(&here)
+            return 2
+        }
+        var k: usize = 0
+        while k < names_count(&names) {
+            let np: u64 = names_ptr(&names, k)
+            let sp: u64 = names_ptr(&sources, k)
+            if !package.origin_is_remote(sp, rt.c_length(sp)) {
+                // A local dependency: follow the directory, so that its own
+                // remote needs are fetched as well.
+                var sub: rt.Buf = rt.buf_new()
+                package.join(&sub, rt.buf_ptr(&here), rt.buf_len(&here), sp, rt.c_length(sp))
+                null_behind(&sub)
+                var mf: rt.Buf = rt.buf_new()
+                package.join(&mf, rt.buf_ptr(&sub), rt.buf_len(&sub), (&mn[0]) as u64, 8)
+                null_behind(&mf)
+                if package.is_file(rt.buf_ptr(&mf)) {
+                    names_add(&scan, rt.buf_ptr(&sub), rt.buf_len(&sub))
+                }
+                rt.buf_free(&mf)
+                rt.buf_free(&sub)
+            } else {
+                let seen: i64 = have_index_of(&lines, np)
+                if seen < 0 {
+                    var res: rt.Buf = rt.buf_new()
+                    var content: rt.Buf = rt.buf_new()
+                    if !resolve(cx, np, sp, &res, &content) {
+                        rt.buf_free(&res)
+                        rt.buf_free(&content)
+                        names_free(&names)
+                        names_free(&sources)
+                        rt.buf_free(&here)
+                        return 2
+                    }
+                    var line: rt.Buf = rt.buf_new()
+                    ptext(&line, np)
+                    rt.buf_push(&line, 32 as u8)
+                    ptext(&line, sp)
+                    rt.buf_push(&line, 32 as u8)
+                    ptext(&line, rt.buf_ptr(&res))
+                    rt.buf_push(&line, 32 as u8)
+                    ptext(&line, rt.buf_ptr(&content))
+                    names_add(&lines, rt.buf_ptr(&line), rt.buf_len(&line))
+                    var place: rt.Buf = rt.buf_new()
+                    pkg_place(&(*cx).cache, rt.buf_ptr(&content), &place)
+                    names_add(&scan, rt.buf_ptr(&place), rt.buf_len(&place))
+                    rt.buf_free(&place)
+                    rt.buf_free(&line)
+                    rt.buf_free(&res)
+                    rt.buf_free(&content)
+                }
+            }
+            k = k + 1
+        }
+        names_free(&names)
+        names_free(&sources)
+        rt.buf_free(&here)
+        i = i + 1
+    }
+    // Sorted by name, so that two runs write the same file.
+    names_sort(&lines)
+    var text: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&text)
+    var head: [u8; 8] = "have 1\n\0"
+    var key: [u8; 6] = "need \0"
+    ptext(&text, (&head[0]) as u64)
+    var t: usize = 0
+    while t < names_count(&lines) {
+        ptext(&text, (&key[0]) as u64)
+        ptext(&text, names_ptr(&lines, t))
+        rt.buf_push(&text, 10 as u8)
+        t = t + 1
+    }
+    var hp: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&hp)
+    var hn: [u8; 10] = "firn.have\0"
+    package.join(&hp, rt.buf_ptr(&root), rt.buf_len(&root), (&hn[0]) as u64, 9)
+    null_behind(&hp)
+    if !rt.write_file(rt.buf_ptr(&hp), rt.buf_ptr(&text), rt.buf_len(&text)) {
+        err_head()
+        var m2: [u8; 14] = "cannot write \0"
+        say((&m2[0]) as u64)
+        quoted(rt.buf_ptr(&hp))
+        say_line()
+        return 2
+    }
+    if !(*cx).quiet {
+        var m3: [u8; 7] = "wrote \0"
+        say((&m3[0]) as u64)
+        say(rt.buf_ptr(&hp))
+        say_line()
+    }
+    return 0
+}
+
+// ------------------------------------------------------------------ verify
+//
+// Re-hash every tree that `firn.have` names. This is the counter-check for
+// the one thing content addressing cannot notice by itself: somebody
+// editing a file INSIDE the cache after it was put there.
+
+fn verify_all(cx: *mut Ctx, dir: u64, dn: usize) -> i32 {
+    var hn: [u8; 10] = "firn.have\0"
+    var hp: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&hp)
+    package.join(&hp, dir, dn, (&hn[0]) as u64, 9)
+    null_behind(&hp)
+    var text: rt.Buf = rt.buf_new()
+    defer rt.buf_free(&text)
+    if !rt.read_file(rt.buf_ptr(&hp), &text) {
+        err_head()
+        var m1: [u8; 13] = "cannot read \0"
+        say((&m1[0]) as u64)
+        quoted(rt.buf_ptr(&hp))
+        say_line()
+        return 2
+    }
+    let txt: u64 = rt.buf_ptr(&text)
+    let tn: usize = rt.buf_len(&text)
+    var bad: usize = 0
+    var seen: usize = 0
+    var i: usize = 0
+    while i <= tn {
+        var e: usize = i
+        while e < tn {
+            if rt.ld8(txt, e) == 10 as u8 {
+                break
+            }
+            e = e + 1
+        }
+        var pos: usize = i
+        var ko: usize = 0
+        var kn: usize = 0
+        var no: usize = 0
+        var nn: usize = 0
+        var so: usize = 0
+        var sn: usize = 0
+        var ro: usize = 0
+        var rn: usize = 0
+        var co: usize = 0
+        var cn: usize = 0
+        var key: [u8; 5] = "need\0"
+        if word_at(txt, e, &pos, &ko, &kn) {
+            if kn == 4 {
+                if rt.mem_eq(txt + ko as u64, (&key[0]) as u64, 4) {
+                    if word_at(txt, e, &pos, &no, &nn) {
+                        if word_at(txt, e, &pos, &so, &sn) {
+                            if word_at(txt, e, &pos, &ro, &rn) {
+                                if word_at(txt, e, &pos, &co, &cn) {
+                                    seen = seen + 1
+                                    var want: rt.Buf = rt.buf_new()
+                                    set_text(&want, txt + co as u64, cn)
+                                    var place: rt.Buf = rt.buf_new()
+                                    pkg_place(&(*cx).cache, rt.buf_ptr(&want), &place)
+                                    var got: rt.Buf = rt.buf_new()
+                                    var ok: bool = tree_hash(rt.buf_ptr(&place),
+                                        rt.buf_len(&place), &got)
+                                    null_behind(&got)
+                                    var same: bool = false
+                                    if ok {
+                                        if rt.buf_len(&got) == rt.buf_len(&want) {
+                                            same = rt.mem_eq(rt.buf_ptr(&got),
+                                                rt.buf_ptr(&want), rt.buf_len(&got))
+                                        }
+                                    }
+                                    if !same {
+                                        bad = bad + 1
+                                        err_head()
+                                        var m2: [u8; 9] = "package \0"
+                                        var m3: [u8; 35] = " in the cache is not what it says\n\0"
+                                        say((&m2[0]) as u64)
+                                        var nb: rt.Buf = rt.buf_new()
+                                        set_text(&nb, txt + no as u64, nn)
+                                        quoted(rt.buf_ptr(&nb))
+                                        rt.buf_free(&nb)
+                                        say((&m3[0]) as u64)
+                                        note_head()
+                                        var m4: [u8; 8] = "wanted \0"
+                                        say((&m4[0]) as u64)
+                                        say(rt.buf_ptr(&want))
+                                        say_line()
+                                        note_head()
+                                        var m5: [u8; 5] = "got \0"
+                                        say((&m5[0]) as u64)
+                                        if ok {
+                                            say(rt.buf_ptr(&got))
+                                        } else {
+                                            var m6: [u8; 16] = "nothing to read\0"
+                                            say((&m6[0]) as u64)
+                                        }
+                                        say_line()
+                                    }
+                                    rt.buf_free(&got)
+                                    rt.buf_free(&place)
+                                    rt.buf_free(&want)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if e >= tn {
+            break
+        }
+        i = e + 1
+    }
+    if bad > 0 {
+        return 2
+    }
+    if !(*cx).quiet {
+        var m7: [u8; 10] = "verified \0"
+        var m8: [u8; 12] = " package(s)\0"
+        say((&m7[0]) as u64)
+        var num: rt.Buf = rt.buf_new()
+        rt.buf_push_dec_u64(&num, seen as u64)
+        null_behind(&num)
+        say(rt.buf_ptr(&num))
+        rt.buf_free(&num)
+        say((&m8[0]) as u64)
+        say_line()
+    }
+    return 0
+}
+
+// ------------------------------------------------------------------ main
+
+fn arg_is(a: u64, lit: u64) -> bool {
+    let n: usize = rt.c_length(a)
+    if n != rt.c_length(lit) {
+        return false
+    }
+    return rt.mem_eq(a, lit, n)
+}
+
+fn main(start: u64) -> i32 {
+    var c_hash: [u8; 5] = "hash\0"
+    var c_list: [u8; 5] = "list\0"
+    var c_fetch: [u8; 6] = "fetch\0"
+    var c_verify: [u8; 7] = "verify\0"
+    var o_offline: [u8; 10] = "--offline\0"
+    var o_quiet: [u8; 8] = "--quiet\0"
+    var i_name: [u8; 11] = "FIRN_INDEX\0"
+    var m_usage: [u8; 240] = "usage:\n  firnpkg fetch [--offline] [--quiet] <dir>   resolve <dir>/firn.pkg, write firn.have\n  firnpkg verify <dir>                       re-hash what firn.have names\n  firnpkg hash <dir>                         the content hash of a tree\n\0"
+    if rt.arg_count(start) < 3 {
+        say((&m_usage[0]) as u64)
+        return 1
+    }
+    let cmd: u64 = rt.arg_ptr(start, 1)
+    let dir: u64 = rt.arg_ptr(start, rt.arg_count(start) - 1)
+
+    if arg_is(cmd, (&c_hash[0]) as u64) {
+        var h: rt.Buf = rt.buf_new()
+        defer rt.buf_free(&h)
+        if !tree_hash(dir, rt.c_length(dir), &h) {
+            err_head()
+            var m_bad: [u8; 22] = "cannot read the tree\n\0"
+            say((&m_bad[0]) as u64)
+            return 2
+        }
+        rt.buf_push(&h, 10 as u8)
+        out_text(rt.buf_ptr(&h), rt.buf_len(&h))
+        return 0
+    }
+
+    if arg_is(cmd, (&c_list[0]) as u64) {
+        var base: rt.Buf = rt.buf_new()
+        defer rt.buf_free(&base)
+        set_text(&base, dir, rt.c_length(dir))
+        var nl: Names = names_new()
+        defer names_free(&nl)
+        var empty: rt.Buf = rt.buf_new()
+        defer rt.buf_free(&empty)
+        walk(&base, &empty, &nl)
+        names_sort(&nl)
+        var nl2: [u8; 2] = "\n\0"
+        var i: usize = 0
+        while i < names_count(&nl) {
+            let np: u64 = names_ptr(&nl, i)
+            out_text(np, rt.c_length(np))
+            out_text((&nl2[0]) as u64, 1)
+            i = i + 1
+        }
+        return 0
+    }
+
+    var cx: Ctx = Ctx {
+        cache: rt.buf_new(), registry: rt.buf_new(),
+        offline: false, quiet: false,
+    }
+    defer rt.buf_free(&cx.cache)
+    defer rt.buf_free(&cx.registry)
+    var a: usize = 2
+    while a + 1 < rt.arg_count(start) {
+        let x: u64 = rt.arg_ptr(start, a)
+        if arg_is(x, (&o_offline[0]) as u64) {
+            cx.offline = true
+        }
+        if arg_is(x, (&o_quiet[0]) as u64) {
+            cx.quiet = true
+        }
+        a = a + 1
+    }
+    cache_root(start, &cx.cache)
+    if rt.buf_len(&cx.cache) == 0 {
+        err_head()
+        var m_nc: [u8; 45] = "there is no cache: set $FIRN_CACHE or $HOME\n\0"
+        say((&m_nc[0]) as u64)
+        return 2
+    }
+    let ip: u64 = env(start, (&i_name[0]) as u64, 10)
+    if ip != 0 {
+        set_text(&cx.registry, ip, rt.c_length(ip))
+    }
+
+    if arg_is(cmd, (&c_fetch[0]) as u64) {
+        var sub: [u8; 5] = "tmp\0\0"
+        var d: rt.Buf = rt.buf_new()
+        defer rt.buf_free(&d)
+        package.join(&d, rt.buf_ptr(&cx.cache), rt.buf_len(&cx.cache), (&sub[0]) as u64, 3)
+        null_behind(&d)
+        if !mkdir_p(rt.buf_ptr(&d), rt.buf_len(&d)) {
+            err_head()
+            var m_md: [u8; 26] = "cannot make the cache in \0"
+            say((&m_md[0]) as u64)
+            quoted(rt.buf_ptr(&cx.cache))
+            say_line()
+            return 2
+        }
+        return fetch_all(&cx, dir, rt.c_length(dir))
+    }
+    if arg_is(cmd, (&c_verify[0]) as u64) {
+        return verify_all(&cx, dir, rt.c_length(dir))
+    }
+    say((&m_usage[0]) as u64)
+    return 1
+}

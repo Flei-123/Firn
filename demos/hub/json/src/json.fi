@@ -1,0 +1,446 @@
+// SPDX-License-Identifier: MIT
+// demos/hub/json -- a JSON reader in Firn, round FIRNHUB.
+//
+// This package exists to be a REAL dependency: it has an interface, tests of
+// its own, a version, and it is pulled into another project both over a
+// local path and over a git source. It is small on purpose, but it is not a
+// toy -- it decides the same questions a real reader decides.
+//
+// WHAT IT DOES NOT DO, and why that is written down here rather than found
+// out later:
+//   * it ALLOCATES NOTHING. Every answer is an offset into the text the
+//     caller already has. A reader that builds a tree needs a heap, and a
+//     heap needs the standard library -- this package has no dependency at
+//     all, which is what makes it usable as a first test of the fetcher.
+//   * numbers are read as whole numbers only (`json_int`). A double needs
+//     the dtoa/strtod pair of `lib/std`, and that is a dependency.
+//   * `\u` escapes are recognised and refused in `json_string_copy`, not
+//     decoded. Refusing loudly beats decoding half of UTF-16 surrogates.
+
+export {
+    json_valid, json_value_end, json_member, json_int, json_string_copy,
+    json_skip_space, JSON_BAD,
+}
+
+// The answer of every function that returns an offset and can fail.
+const JSON_BAD: i64 = 0 - 1
+
+fn is_space(c: u8) -> bool {
+    if c == 32 as u8 {
+        return true
+    }
+    if c == 9 as u8 {
+        return true
+    }
+    if c == 10 as u8 {
+        return true
+    }
+    return c == 13 as u8
+}
+
+fn is_digit(c: u8) -> bool {
+    return c >= 48 as u8 && c <= 57 as u8
+}
+
+fn at(p: u64, i: usize) -> u8 {
+    return *((p + i as u64) as *mut u8)
+}
+
+// The first offset from `i` on that is not white space.
+fn json_skip_space(p: u64, n: usize, i: usize) -> usize {
+    var k: usize = i
+    while k < n {
+        if !is_space(at(p, k)) {
+            return k
+        }
+        k = k + 1
+    }
+    return n
+}
+
+// The offset BEHIND the string that starts at `i` (which must be a quote),
+// or JSON_BAD.
+fn string_end(p: u64, n: usize, i: usize) -> i64 {
+    if i >= n {
+        return JSON_BAD
+    }
+    if at(p, i) != 34 as u8 {
+        return JSON_BAD
+    }
+    var k: usize = i + 1
+    while k < n {
+        let c: u8 = at(p, k)
+        if c == 92 as u8 {
+            // An escape swallows the next character, so a `\"` does not end
+            // the string. Whether the escape is a legal one is decided in
+            // `json_string_copy`, where it matters.
+            if k + 1 >= n {
+                return JSON_BAD
+            }
+            k = k + 2
+            continue
+        }
+        if c == 34 as u8 {
+            return (k + 1) as i64
+        }
+        // A raw control character is not allowed inside a string (RFC 8259).
+        if c < 32 as u8 {
+            return JSON_BAD
+        }
+        k = k + 1
+    }
+    return JSON_BAD
+}
+
+fn number_end(p: u64, n: usize, i: usize) -> i64 {
+    var k: usize = i
+    if k < n {
+        if at(p, k) == 45 as u8 {
+            k = k + 1
+        }
+    }
+    let d0: usize = k
+    while k < n {
+        if !is_digit(at(p, k)) {
+            break
+        }
+        k = k + 1
+    }
+    if k == d0 {
+        return JSON_BAD
+    }
+    // RFC 8259: no leading zero. `01` is two values glued together, and a
+    // reader that accepts it disagrees with every other one about `[01]`.
+    if k - d0 > 1 {
+        if at(p, d0) == 48 as u8 {
+            return JSON_BAD
+        }
+    }
+    if k < n {
+        if at(p, k) == 46 as u8 {
+            k = k + 1
+            let f0: usize = k
+            while k < n {
+                if !is_digit(at(p, k)) {
+                    break
+                }
+                k = k + 1
+            }
+            if k == f0 {
+                return JSON_BAD
+            }
+        }
+    }
+    if k < n {
+        if at(p, k) == 101 as u8 || at(p, k) == 69 as u8 {
+            k = k + 1
+            if k < n {
+                if at(p, k) == 43 as u8 || at(p, k) == 45 as u8 {
+                    k = k + 1
+                }
+            }
+            let e0: usize = k
+            while k < n {
+                if !is_digit(at(p, k)) {
+                    break
+                }
+                k = k + 1
+            }
+            if k == e0 {
+                return JSON_BAD
+            }
+        }
+    }
+    return k as i64
+}
+
+fn word_is(p: u64, n: usize, i: usize, lit: u64, ln: usize) -> bool {
+    if i + ln > n {
+        return false
+    }
+    var k: usize = 0
+    while k < ln {
+        if at(p, i + k) != at(lit, k) {
+            return false
+        }
+        k = k + 1
+    }
+    return true
+}
+
+// The offset BEHIND the value that begins at `i`, or JSON_BAD. This is the
+// whole reader: everything else asks it.
+fn json_value_end(p: u64, n: usize, i: usize) -> i64 {
+    var t: [u8; 5] = "true\0"
+    var f: [u8; 6] = "false\0"
+    var nu: [u8; 5] = "null\0"
+    let s: usize = json_skip_space(p, n, i)
+    if s >= n {
+        return JSON_BAD
+    }
+    let c: u8 = at(p, s)
+    if c == 34 as u8 {
+        return string_end(p, n, s)
+    }
+    if c == 123 as u8 {
+        return object_end(p, n, s)
+    }
+    if c == 91 as u8 {
+        return array_end(p, n, s)
+    }
+    if word_is(p, n, s, (&t[0]) as u64, 4) {
+        return (s + 4) as i64
+    }
+    if word_is(p, n, s, (&nu[0]) as u64, 4) {
+        return (s + 4) as i64
+    }
+    if word_is(p, n, s, (&f[0]) as u64, 5) {
+        return (s + 5) as i64
+    }
+    return number_end(p, n, s)
+}
+
+fn object_end(p: u64, n: usize, i: usize) -> i64 {
+    var k: usize = json_skip_space(p, n, i + 1)
+    if k < n {
+        if at(p, k) == 125 as u8 {
+            return (k + 1) as i64
+        }
+    }
+    while true {
+        let ke: i64 = string_end(p, n, json_skip_space(p, n, k))
+        if ke == JSON_BAD {
+            return JSON_BAD
+        }
+        k = json_skip_space(p, n, ke as usize)
+        if k >= n {
+            return JSON_BAD
+        }
+        if at(p, k) != 58 as u8 {
+            return JSON_BAD
+        }
+        let ve: i64 = json_value_end(p, n, k + 1)
+        if ve == JSON_BAD {
+            return JSON_BAD
+        }
+        k = json_skip_space(p, n, ve as usize)
+        if k >= n {
+            return JSON_BAD
+        }
+        if at(p, k) == 125 as u8 {
+            return (k + 1) as i64
+        }
+        if at(p, k) != 44 as u8 {
+            return JSON_BAD
+        }
+        k = k + 1
+    }
+    return JSON_BAD
+}
+
+fn array_end(p: u64, n: usize, i: usize) -> i64 {
+    var k: usize = json_skip_space(p, n, i + 1)
+    if k < n {
+        if at(p, k) == 93 as u8 {
+            return (k + 1) as i64
+        }
+    }
+    while true {
+        let ve: i64 = json_value_end(p, n, k)
+        if ve == JSON_BAD {
+            return JSON_BAD
+        }
+        k = json_skip_space(p, n, ve as usize)
+        if k >= n {
+            return JSON_BAD
+        }
+        if at(p, k) == 93 as u8 {
+            return (k + 1) as i64
+        }
+        if at(p, k) != 44 as u8 {
+            return JSON_BAD
+        }
+        k = k + 1
+    }
+    return JSON_BAD
+}
+
+// Is the whole text ONE value and nothing behind it but white space?
+fn json_valid(p: u64, n: usize) -> bool {
+    let e: i64 = json_value_end(p, n, 0)
+    if e == JSON_BAD {
+        return false
+    }
+    return json_skip_space(p, n, e as usize) == n
+}
+
+// Find `key` in the object the text begins with. On success `start` is the
+// offset of its value and the answer is the offset behind it.
+fn json_member(p: u64, n: usize, key: u64, kn: usize, start: *mut usize) -> i64 {
+    var k: usize = json_skip_space(p, n, 0)
+    if k >= n {
+        return JSON_BAD
+    }
+    if at(p, k) != 123 as u8 {
+        return JSON_BAD
+    }
+    k = json_skip_space(p, n, k + 1)
+    if k < n {
+        if at(p, k) == 125 as u8 {
+            return JSON_BAD
+        }
+    }
+    while true {
+        let ks: usize = json_skip_space(p, n, k)
+        let ke: i64 = string_end(p, n, ks)
+        if ke == JSON_BAD {
+            return JSON_BAD
+        }
+        // The name WITHOUT its quotes. Escapes in a name are not compared
+        // here -- a key that needs one is out of reach, and saying so is
+        // better than comparing the raw octets and being right by luck.
+        var same: bool = false
+        if (ke as usize) - ks == kn + 2 {
+            same = true
+            var t: usize = 0
+            while t < kn {
+                if at(p, ks + 1 + t) != at(key, t) {
+                    same = false
+                    break
+                }
+                t = t + 1
+            }
+        }
+        k = json_skip_space(p, n, ke as usize)
+        if k >= n {
+            return JSON_BAD
+        }
+        if at(p, k) != 58 as u8 {
+            return JSON_BAD
+        }
+        let vs: usize = json_skip_space(p, n, k + 1)
+        let ve: i64 = json_value_end(p, n, vs)
+        if ve == JSON_BAD {
+            return JSON_BAD
+        }
+        if same {
+            *start = vs
+            return ve
+        }
+        k = json_skip_space(p, n, ve as usize)
+        if k >= n {
+            return JSON_BAD
+        }
+        if at(p, k) == 125 as u8 {
+            return JSON_BAD
+        }
+        if at(p, k) != 44 as u8 {
+            return JSON_BAD
+        }
+        k = k + 1
+    }
+    return JSON_BAD
+}
+
+// A whole number at `i`. `false` when there is none, or when it does not
+// fit -- a reader that wraps around silently is worse than one that says no.
+fn json_int(p: u64, n: usize, i: usize, out: *mut i64) -> bool {
+    let s: usize = json_skip_space(p, n, i)
+    let e: i64 = number_end(p, n, s)
+    if e == JSON_BAD {
+        return false
+    }
+    var k: usize = s
+    var negative: bool = false
+    if at(p, k) == 45 as u8 {
+        negative = true
+        k = k + 1
+    }
+    var v: i64 = 0
+    while k < e as usize {
+        let c: u8 = at(p, k)
+        if !is_digit(c) {
+            // A fraction or an exponent: not a whole number.
+            return false
+        }
+        if v > 922337203685477580 {
+            return false
+        }
+        v = v * 10 + ((c - 48 as u8) as i64)
+        if v < 0 {
+            return false
+        }
+        k = k + 1
+    }
+    if negative {
+        v = 0 - v
+    }
+    *out = v
+    return true
+}
+
+// The content of the string at `i`, unescaped, into `dst`. The answer is the
+// number of octets written, or JSON_BAD. `\u` is REFUSED (see the head of
+// this file).
+fn json_string_copy(p: u64, n: usize, i: usize, dst: u64) -> i64 {
+    let s: usize = json_skip_space(p, n, i)
+    let e: i64 = string_end(p, n, s)
+    if e == JSON_BAD {
+        return JSON_BAD
+    }
+    var k: usize = s + 1
+    let stop: usize = (e as usize) - 1
+    var w: usize = 0
+    while k < stop {
+        let c: u8 = at(p, k)
+        if c != 92 as u8 {
+            *((dst + w as u64) as *mut u8) = c
+            w = w + 1
+            k = k + 1
+            continue
+        }
+        k = k + 1
+        if k >= stop {
+            return JSON_BAD
+        }
+        let x: u8 = at(p, k)
+        var y: u8 = 0
+        if x == 34 as u8 {
+            y = 34 as u8
+        } else {
+            if x == 92 as u8 {
+                y = 92 as u8
+            } else {
+                if x == 47 as u8 {
+                    y = 47 as u8
+                } else {
+                    if x == 110 as u8 {
+                        y = 10 as u8
+                    } else {
+                        if x == 116 as u8 {
+                            y = 9 as u8
+                        } else {
+                            if x == 114 as u8 {
+                                y = 13 as u8
+                            } else {
+                                if x == 98 as u8 {
+                                    y = 8 as u8
+                                } else {
+                                    if x == 102 as u8 {
+                                        y = 12 as u8
+                                    } else {
+                                        return JSON_BAD
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        *((dst + w as u64) as *mut u8) = y
+        w = w + 1
+        k = k + 1
+    }
+    return w as i64
+}
