@@ -72,6 +72,40 @@ impl Target {
 
 thread_local! {
     static ACTIVE: Cell<Target> = const { Cell::new(Target::X86_64) };
+    /// ROUND MOBIL (Certus): position independent code for a shared
+    /// library (`.so`). Default OFF — the path for programmes and for
+    /// Osum stays character for character the one it was.
+    static PIC: Cell<bool> = const { Cell::new(false) };
+}
+
+/// `--pic`. Moves the tables that hold ABSOLUTE addresses out of the
+/// read-only `.rodata` into `.data.rel.ro`, which is writable while the
+/// loader relocates and read-only afterwards.
+///
+/// WHY THIS IS NEEDED, measured and not guessed: a `.so` in which a
+/// relocation points into a read-only section carries `TEXTREL` in its
+/// dynamic section. Android's loader refuses such a library outright
+/// from API 23 on. Measured on `lib/paint/b3_main.fi` for aarch64: 135
+/// `R_AARCH64_ABS64` in `.rodata`, all of them jump tables of dense
+/// `switch` expressions, plus the tables of the collector, of the
+/// interfaces and of the function values.
+pub fn pic_set(on: bool) {
+    PIC.with(|p| p.set(on));
+}
+
+/// Is this compilation position independent?
+pub fn pic() -> bool {
+    PIC.with(|p| p.get())
+}
+
+/// The section for a table that holds addresses. Without `--pic`
+/// exactly what stood there before.
+pub fn reloc_rodata() -> &'static str {
+    if pic() {
+        ".section .data.rel.ro"
+    } else {
+        ".section .rodata"
+    }
 }
 
 /// `--target=<name>`. `Err` = unknown name.
@@ -105,6 +139,7 @@ pub fn align(bytes: u64) -> String {
 #[cfg(test)]
 pub fn reset() {
     ACTIVE.with(|a| a.set(Target::X86_64));
+    PIC.with(|p| p.set(false));
 }
 
 #[cfg(test)]

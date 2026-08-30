@@ -776,7 +776,7 @@ fn emit_switch(e: &mut Emitter, f: &Func, fr: &Frame, term: &Term) -> Result<(),
     e.line(&format!("add {}, {}, :lo12:{}", ADDR, ADDR, lbl));
     e.line(&format!("ldr {}, [{}, {}, lsl #3]", B, ADDR, A));
     e.line(&format!("br {}", B));
-    e.raw(".section .rodata");
+    e.raw(crate::target::reloc_rodata());
     e.raw(&crate::target::align(8));
     e.raw(&format!("{}:", lbl));
     let mut i = 0usize;
