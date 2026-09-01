@@ -61,6 +61,11 @@ pub const PREFIX: &str = "_Fwin.";
 /// The stack probe. Called with the frame size in `rax`.
 pub const CHKSTK: &str = "_Fwin.chkstk";
 
+/// The stub that takes the LINUX system call register convention and hands
+/// it to the seam. Everything that emits a `syscall` instruction as HAND
+/// WRITTEN assembler (`panic_rt.rs`) writes a `call` to this instead.
+pub const SYSSTUB: &str = "_Fwin.syscall";
+
 /// From this frame size on a function has to probe the stack. One page.
 pub const PAGE: u64 = 4096;
 
@@ -133,12 +138,15 @@ thread_local! {
     static USED: RefCell<BTreeSet<String>> = RefCell::new(BTreeSet::new());
     /// Did any function need a stack probe?
     static PROBED: RefCell<bool> = const { RefCell::new(false) };
+    /// Did the hand written runtime need the system call stub?
+    static SYSSTUB_USED: RefCell<bool> = const { RefCell::new(false) };
 }
 
 /// Only for the module tests, which compile several programs in one process.
 pub fn reset() {
     USED.with(|u| u.borrow_mut().clear());
     PROBED.with(|p| *p.borrow_mut() = false);
+    SYSSTUB_USED.with(|p| *p.borrow_mut() = false);
 }
 
 /// Registers `name` as an import and yields the symbol a System V caller
@@ -162,6 +170,55 @@ fn imp(name: &str) -> String {
 /// Records that a stack probe was emitted.
 pub fn note_probe() {
     PROBED.with(|p| *p.borrow_mut() = true);
+}
+
+/// Records that the hand written runtime needs the system call stub.
+pub fn note_sysstub() {
+    SYSSTUB_USED.with(|p| *p.borrow_mut() = true);
+}
+
+/// Is the system call stub needed?
+pub fn sysstub_used() -> bool {
+    SYSSTUB_USED.with(|p| *p.borrow())
+}
+
+/// **The stub for hand written runtime assembler.**
+///
+/// `panic_rt.rs` writes its two `write(2, …)` calls and its
+/// `exit_group(101)` as instructions, not as Firn — it has to, because it
+/// runs with a stack frame it built itself and with the panic arguments in
+/// registers of its own choosing. On Windows those `syscall` instructions
+/// would be a crash (there is no Linux kernel below), so the same lines
+/// call THIS instead, and it forwards to the seam.
+///
+/// In: `rax` = the canonical (x86-64 Linux) call number, `rdi, rsi, rdx,
+/// r10, r8, r9` = the arguments — exactly the register set the instruction
+/// itself reads. Out: `rax`, exactly as the instruction leaves it.
+fn sysstub_asm() -> String {
+    let mut s = String::new();
+    s.push_str(&format!("\n.globl {}\n{}:\n", SYSSTUB, SYSSTUB));
+    s.push_str("    # the Linux syscall register set -> the seam\n");
+    s.push_str("    push rbp\n    mov rbp, rsp\n");
+    // THE ALIGNMENT, and it is not decoration. This stub is jumped to out
+    // of hand written runtime code whose `rsp` is whatever its own pushes
+    // left behind; a Win32 function entered one word off dies inside the
+    // first aligned SSE move of some system DLL, far away from the cause.
+    // `leave` puts the stack back exactly, so forcing it here is free.
+    s.push_str("    and rsp, -16\n");
+    s.push_str("    sub rsp, 16\n");
+    s.push_str("    mov qword ptr [rsp], r9\n"); // a6
+    s.push_str("    mov r9, r8\n");              // a5
+    s.push_str("    mov r8, r10\n");             // a4
+    s.push_str("    mov rcx, rdx\n");            // a3
+    s.push_str("    mov rdx, rsi\n");            // a2
+    s.push_str("    mov rsi, rdi\n");            // a1
+    s.push_str("    mov rdi, rax\n");            // the number
+    s.push_str(&format!(
+        "    call {}\n",
+        crate::codegen_x86::label(crate::win_seam::SYSCALL_FN)
+    ));
+    s.push_str("    leave\n    ret\n");
+    s
 }
 
 /// Was a stack probe emitted anywhere?
@@ -385,7 +442,7 @@ pub fn start_asm(gc_init: Option<&str>, seam_init: &str, argv_sym: &str, main_sy
 pub fn runtime_asm() -> String {
     let used: Vec<String> = USED.with(|u| u.borrow().iter().cloned().collect());
     let mut s = String::new();
-    if used.is_empty() && !probed() {
+    if used.is_empty() && !probed() && !sysstub_used() {
         return s;
     }
     s.push_str("\n# ==== round WINDOWS: the boundary to Win32 ====\n");
@@ -396,6 +453,9 @@ pub fn runtime_asm() -> String {
     }
     if probed() {
         s.push_str(&chkstk_asm());
+    }
+    if sysstub_used() {
+        s.push_str(&sysstub_asm());
     }
     if !used.is_empty() {
         s.push_str(&idata_asm(&used));

@@ -1331,6 +1331,17 @@ fn emit_inst(
             store_dst(e, fr, d, "rax");
         }
         Op::ThreadSpawn { arg, stack, ctid } => {
+            // ROUND WINDOWS: `clone(2)` has no Win32 equivalent that this
+            // round can honour -- `CreateThread` hands the child a stack of
+            // its own and a different entry convention, and the collector's
+            // thread table (lib/gc/gc.fi) is built on the Linux shape. A
+            // refusal with the reason beats an image with a `syscall`
+            // instruction in it that dies at the first spawn.
+            if crate::target::windows() {
+                return Err("threads are not supported on windows yet \
+                            (clone(2) has no equivalent; see docs/ROUND-WINDOWS.md)"
+                    .to_string());
+            }
             crate::simd::xflush(e, fr);
             let d = i.dst.ok_or("internal error: spawn without target")?;
             load_full(e, fr, "rdi", *arg);

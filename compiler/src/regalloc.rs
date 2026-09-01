@@ -4064,6 +4064,14 @@ fn emit_inst(
             ra.store_dst(e, d, "rax");
         }
         Op::ThreadSpawn { arg, stack, ctid } => {
+            // ROUND WINDOWS: see codegen_x86.rs -- `clone(2)` has no Win32
+            // equivalent this round can honour, and the register aware path
+            // must refuse it just as clearly as the base path does.
+            if crate::target::windows() {
+                return Err("threads are not supported on windows yet \
+                            (clone(2) has no equivalent; see docs/ROUND-WINDOWS.md)"
+                    .to_string());
+            }
             let d = i.dst.ok_or("internal error: spawn without target")?;
             ra.load_full(e, "rdi", *arg);
             ra.load_full(e, "rsi", *stack);
