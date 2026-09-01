@@ -983,12 +983,32 @@ fn __win_syscall(nr: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64) 
         }
         var lvl: i64 = a2
         var opt: i64 = a3
+        var val: u64 = a4 as u64
+        var len: i64 = a5
         if lvl == 1 {
             lvl = 65535
             if opt == 2 { opt = 4 }
             if opt == 9 { opt = 8 }
+            // SO_RCVTIMEO / SO_SNDTIMEO are the one option where the VALUE
+            // differs and not just its number: Linux takes a `struct
+            // timeval` of two words, Windows takes a single DWORD of
+            // milliseconds. Passing the timeval through would set a
+            // timeout of whatever the seconds field happens to be in
+            // milliseconds -- silently wrong, which is the worst kind.
+            if opt == 20 || opt == 21 {
+                let sec: i64 = __win_ld64(val, 0)
+                let usec: i64 = __win_ld64(val, 1)
+                let ms: u64 = __win_tmp + 184
+                __win_st64(ms, 0, 0)
+                let q: *mut u32 = ms as *mut u32
+                *q = (sec * 1000 + usec / 1000) as u32
+                val = ms
+                len = 4
+                if opt == 20 { opt = 4102 }
+                if opt == 21 { opt = 4101 }
+            }
         }
-        if setsockopt(__win_handle(a1), lvl, opt, a4 as u64, a5) != 0 {
+        if setsockopt(__win_handle(a1), lvl, opt, val, len) != 0 {
             return __win_sockerrno()
         }
         return 0
