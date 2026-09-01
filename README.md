@@ -215,7 +215,7 @@ and a `line:column` — it does not crash and it does not pretend.
 ### Not in the toolchain
 
 * **No WASM.** `--target=wasm32` answers *"unknown target 'wasm32' (allowed:
-  x86_64-linux, aarch64-linux, x86_64-none, aarch64-none)"*.
+  x86_64-linux, aarch64-linux, x86_64-none, aarch64-none, x86_64-windows)"*.
 * **No LLVM backend, and there will not be one** — that is the point of the
   project, not a gap. It is listed here because people ask.
 * **No self-hosting on ARM.** `firnc0` (the Rust bootstrap) generates
@@ -373,6 +373,8 @@ firnc [OPTIONS] file.fi
   --target=<name>      x86_64-linux (default) | aarch64-linux
                        | x86_64-none | aarch64-none  (freestanding: no
                          operating system, ELF object, no syscall)
+                       | x86_64-windows  (PE/COFF .exe, Win64 at the
+                         boundary, syscall answered over Win32)
   --profile=<name>     kernel | app (SPEC 2)
   --opt-level=<lvl>    dev | dev-fast | release-safe | release-fast
   --no-opt             switch off the optimizer (= --opt-level=dev)

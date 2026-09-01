@@ -4064,13 +4064,24 @@ fn emit_inst(
             ra.store_dst(e, d, "rax");
         }
         Op::ThreadSpawn { arg, stack, ctid } => {
-            // ROUND WINDOWS: see codegen_x86.rs -- `clone(2)` has no Win32
-            // equivalent this round can honour, and the register aware path
-            // must refuse it just as clearly as the base path does.
+            // ROUND WINDOWS: `clone(2)` has no Win32 equivalent this round
+            // can honour -- `CreateThread` hands the child a stack of its
+            // own and a different entry convention, and the collector's
+            // thread table (lib/gc/gc.fi) is built on the Linux shape.
+            //
+            // A COMPILE ERROR would be the wrong answer, and the round
+            // measured why: `lib/gc/gc.fi` CONTAINS a spawn, so every
+            // program that links the collector would be refused -- 93 of
+            // 309 cases, almost none of which ever start a thread. So the
+            // instruction becomes what the seam does with a system call it
+            // cannot serve: `-38` (ENOSYS), the value `thread_spawn`
+            // already knows as a failure.
             if crate::target::windows() {
-                return Err("threads are not supported on windows yet \
-                            (clone(2) has no equivalent; see docs/ROUND-WINDOWS.md)"
-                    .to_string());
+                crate::thread::spawn_unsupported(e);
+                if let Some(d) = i.dst {
+                    ra.store_dst(e, d, "rax");
+                }
+                return Ok(());
             }
             let d = i.dst.ok_or("internal error: spawn without target")?;
             ra.load_full(e, "rdi", *arg);
