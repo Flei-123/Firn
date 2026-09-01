@@ -810,10 +810,22 @@ mod tests {
         assert!(s.contains(&format!("fn {}(", ARGV_FN)));
     }
 
-    /// Nothing here may say `syscall` — that is the whole point.
+    /// Nothing here may use the built-in `syscall` — that is the whole
+    /// point, and it would be an endless loop besides. The dispatcher is
+    /// CALLED `__win_syscall`, so the name alone is not the test: what is
+    /// looked for is the built-in, which is `syscall(` with no identifier
+    /// character in front of it.
     #[test]
     fn the_seam_makes_no_system_call_itself() {
-        assert!(!source().contains("syscall("));
+        let s = source();
+        for (i, _) in s.match_indices("syscall(") {
+            let before = s[..i].chars().next_back().unwrap_or(' ');
+            assert!(
+                before == '_' || before.is_alphanumeric(),
+                "the seam uses the built-in syscall at offset {}",
+                i
+            );
+        }
     }
 
     /// The seam runs before the collector and must not need it.
