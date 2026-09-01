@@ -799,7 +799,12 @@ fn run(opts: &Options) -> i32 {
         let file = dg.add_file("<windows seam>", &src);
         dwarf::add_file("<windows seam>");
         let toks = lexer::lex_file(&src, file, &mut dg);
-        let mut extra = parser::parse(&toks, &mut dg);
+        // `parser::parse` would call `reset_hooks` and thereby throw away
+        // everything the MAIN parse registered -- the `gc class`es, the
+        // interfaces, the error sets, the builtin `str` of round 70. The
+        // seam declares none of those, so it is parsed as a further MODULE
+        // of the same compilation, which is what it is.
+        let mut extra = parser::parse_module(&toks, &mut dg, file, 0);
         let mut next = prog.expr_count;
         for f in extra.funcs.iter_mut() {
             crate::mono::renumber_block(&mut f.body, &mut next);
