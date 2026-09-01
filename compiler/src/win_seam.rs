@@ -68,6 +68,9 @@ pub const BASELINE: &[&str] = &[
     "GetCurrentDirectoryW",
     "GetCurrentProcessId",
     "GetCurrentThreadId",
+    "GetCurrentThreadStackLimits",
+    "GetCurrentProcess",
+    "DuplicateHandle",
     "WSAStartup",
     "WSAGetLastError",
     "socket",
@@ -80,6 +83,7 @@ pub const BASELINE: &[&str] = &[
     "listen",
     "accept",
     "setsockopt",
+    "getsockname",
     "SystemFunction036",
 ];
 
@@ -130,6 +134,9 @@ extern fn GetCommandLineW() -> u64;
 extern fn GetCurrentDirectoryW(n: i64, buf: u64) -> i32;
 extern fn GetCurrentProcessId() -> i32;
 extern fn GetCurrentThreadId() -> i32;
+extern fn GetCurrentThreadStackLimits(lo: u64, hi: u64);
+extern fn GetCurrentProcess() -> i64;
+extern fn DuplicateHandle(sp: i64, sh: i64, tp: i64, th: u64, acc: i64, inh: i64, opt: i64) -> i32;
 extern fn WSAStartup(ver: i64, data: u64) -> i32;
 extern fn WSAGetLastError() -> i32;
 extern fn socket(af: i64, ty: i64, pr: i64) -> i64;
@@ -142,11 +149,15 @@ extern fn bind(s: i64, a: u64, n: i64) -> i32;
 extern fn listen(s: i64, back: i64) -> i32;
 extern fn accept(s: i64, a: u64, n: u64) -> i64;
 extern fn setsockopt(s: i64, lvl: i64, opt: i64, v: u64, n: i64) -> i32;
+extern fn getsockname(s: i64, a: u64, n: u64) -> i32;
 extern fn SystemFunction036(buf: u64, n: i64) -> i32;
 
-// 0 = free, 1 = file handle, 2 = socket
+// 0 = free, 1 = file handle, 2 = socket, 3 = a file that only exists here
 static mut __win_kind: [i64; 256] = [0; 256]
 static mut __win_hnd: [i64; 256] = [0; 256]
+// only for kind 3: how far it has been read and how long it is
+static mut __win_pos: [i64; 256] = [0; 256]
+static mut __win_len: [i64; 256] = [0; 256]
 // scratch pages, allocated once at start-up
 static mut __win_path: u64 = 0
 static mut __win_blk: u64 = 0
@@ -320,6 +331,118 @@ fn __win_u16_to_u8(src: u64, n: i64, dst: u64, cap: i64) -> i64 {
     return o
 }
 
+// ------------------------------------------------------------- /proc
+// THE COLLECTOR NEEDS THE STACK BOUNDS, and on Linux it reads them out of
+// `/proc/self/maps` (lib/gc/gc.fi, `__gc_stack_bottom_maps`). Windows has
+// no `/proc`, and this is the one place where "just refuse it" would be
+// the wrong answer: `gc_init` then returns false and every program with a
+// `gc class` in it stops working.
+//
+// Worse, under Wine the refusal does not even happen. Wine maps the drive
+// `Z:` onto the host's root directory, so `\proc\self\maps` really opens
+// the LINUX file -- and the collector then scans from the Windows stack
+// pointer up to the end of a LINUX mapping, walks off the committed part
+// of the Windows stack and the process dies with a page fault. That is
+// not a theory; it is what round WINDOWS measured before this function
+// existed (35 of 46 failing cases).
+//
+// So the seam answers the file itself, out of `GetCurrentThreadStackLimits`
+// -- one line in exactly the shape the collector parses.
+fn __win_hexdigit(v: i64) -> i64 {
+    if v < 10 {
+        return 48 + v
+    }
+    return 87 + v
+}
+
+fn __win_puthex(dst: u64, off: i64, v: i64) -> i64 {
+    if v == 0 {
+        __win_st8(dst, off, 48)
+        return off + 1
+    }
+    // The highest nibble first: find it, then walk down.
+    var sh: i64 = 60
+    while sh > 0 {
+        if (v / __win_pow16(sh / 4)) % 16 != 0 {
+            break
+        }
+        sh = sh - 4
+    }
+    var o: i64 = off
+    while sh >= 0 {
+        __win_st8(dst, o, __win_hexdigit((v / __win_pow16(sh / 4)) % 16))
+        o = o + 1
+        sh = sh - 4
+    }
+    return o
+}
+
+fn __win_pow16(n: i64) -> i64 {
+    var r: i64 = 1
+    var i: i64 = 0
+    while i < n {
+        r = r * 16
+        i = i + 1
+    }
+    return r
+}
+
+// Is `p` the NUL terminated text `/proc/self/maps`?
+fn __win_is_maps(p: u64) -> i64 {
+    var lit: [u8; 16] = "/proc/self/maps\0"
+    let q: u64 = (&lit[0]) as u64
+    var i: i64 = 0
+    while i < 16 {
+        if __win_ld8(p, i) != __win_ld8(q, i) {
+            return 0
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+// Does `p` begin with `/proc/`?
+fn __win_is_proc(p: u64) -> i64 {
+    var lit: [u8; 7] = "/proc/\0"
+    let q: u64 = (&lit[0]) as u64
+    var i: i64 = 0
+    while i < 6 {
+        if __win_ld8(p, i) != __win_ld8(q, i) {
+            return 0
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+// "<lo>-<hi> rw-p 00000000 00:00 0 [stack]\n" -- the one line the
+// collector is looking for. Returns the length.
+fn __win_make_maps(dst: u64) -> i64 {
+    let lo: u64 = __win_tmp + 160
+    let hi: u64 = __win_tmp + 168
+    __win_st64(lo, 0, 0)
+    __win_st64(hi, 0, 0)
+    GetCurrentThreadStackLimits(lo, hi)
+    let a: i64 = __win_ld64(lo, 0)
+    let b: i64 = __win_ld64(hi, 0)
+    if a == 0 || b == 0 || b <= a {
+        return 0
+    }
+    var o: i64 = __win_puthex(dst, 0, a)
+    __win_st8(dst, o, 45)
+    o = o + 1
+    o = __win_puthex(dst, o, b)
+    var tail: [u8; 32] = " rw-p 00000000 00:00 0 [stack]\n\0"
+    let t: u64 = (&tail[0]) as u64
+    var i: i64 = 0
+    while i < 30 {
+        __win_st8(dst, o, __win_ld8(t, i))
+        o = o + 1
+        i = i + 1
+    }
+    return o
+}
+
 // ------------------------------------------------------ descriptor table
 fn __win_slot(kind: i64, h: i64) -> i64 {
     var i: i64 = 3
@@ -427,7 +550,7 @@ fn __win_argv() -> u64 {
 // ------------------------------------------------------------ the calls
 fn __win_write(fd: i64, buf: u64, n: i64) -> i64 {
     let k: i64 = __win_kind_of(fd)
-    if k == 0 {
+    if k == 0 || k == 3 {
         return 0 - 9
     }
     if k == 2 {
@@ -451,6 +574,23 @@ fn __win_read(fd: i64, buf: u64, n: i64) -> i64 {
     if k == 0 {
         return 0 - 9
     }
+    if k == 3 {
+        let src: u64 = __win_handle(fd) as u64
+        var left: i64 = __win_len[fd as usize] - __win_pos[fd as usize]
+        if left > n {
+            left = n
+        }
+        if left <= 0 {
+            return 0
+        }
+        var i: i64 = 0
+        while i < left {
+            __win_st8(buf, i, __win_ld8(src, __win_pos[fd as usize] + i))
+            i = i + 1
+        }
+        __win_pos[fd as usize] = __win_pos[fd as usize] + left
+        return left
+    }
     if k == 2 {
         let r: i64 = recv(__win_handle(fd), buf, n, 0) as i64
         if r < 0 {
@@ -473,6 +613,26 @@ fn __win_read(fd: i64, buf: u64, n: i64) -> i64 {
 }
 
 fn __win_open(path: u64, flags: i64, mode: i64) -> i64 {
+    // `/proc` does not exist here. `/proc/self/maps` is answered out of
+    // the thread's own stack bounds; every other name under `/proc` is a
+    // clean ENOENT rather than whatever Wine's drive Z: would find.
+    if __win_is_proc(path) == 1 {
+        if __win_is_maps(path) == 0 {
+            return 0 - 2
+        }
+        let buf: u64 = __win_tmp + 1024
+        let n: i64 = __win_make_maps(buf)
+        if n == 0 {
+            return 0 - 2
+        }
+        let fd: i64 = __win_slot(3, buf as i64)
+        if fd < 0 {
+            return fd
+        }
+        __win_pos[fd as usize] = 0
+        __win_len[fd as usize] = n
+        return fd
+    }
     let w: u64 = __win_path
     if __win_u8_to_u16(path, w, 16384) < 0 {
         return 0 - 36
@@ -520,6 +680,9 @@ fn __win_close(fd: i64) -> i64 {
     }
     if fd >= 3 {
         __win_kind[fd as usize] = 0
+    }
+    if k == 3 {
+        return 0
     }
     if k == 2 {
         closesocket(__win_handle(fd))
@@ -581,6 +744,43 @@ fn __win_getcwd(buf: u64, size: i64) -> i64 {
         i = i + 1
     }
     return m + 1
+}
+
+// `dup`/`dup2`. Linux hands out a second name for the same open file; the
+// Windows equivalent is a second HANDLE for the same object, which is what
+// `DuplicateHandle` makes. `into` < 0 means "the lowest free slot" (that is
+// `dup`), otherwise it is `dup2` and the slot is closed first.
+//
+// Only file handles. A SOCKET would need `WSADuplicateSocket` and a second
+// `socket` call in the target, which is a different thing and is refused
+// rather than faked.
+fn __win_dup(fd: i64, into: i64) -> i64 {
+    if __win_kind_of(fd) != 1 {
+        return 0 - 9
+    }
+    if into == fd {
+        return fd
+    }
+    let me: i64 = GetCurrentProcess()
+    let out: u64 = __win_tmp + 176
+    __win_st64(out, 0, 0)
+    // DUPLICATE_SAME_ACCESS = 2
+    if DuplicateHandle(me, __win_handle(fd), me, out, 0, 0, 2) == 0 {
+        return __win_errno()
+    }
+    let h: i64 = __win_ld64(out, 0)
+    if into < 0 {
+        return __win_slot(1, h)
+    }
+    if into >= 256 {
+        return 0 - 9
+    }
+    if __win_kind[into as usize] != 0 {
+        __win_close(into)
+    }
+    __win_kind[into as usize] = 1
+    __win_hnd[into as usize] = h
+    return into
 }
 
 // --------------------------------------------------------- the dispatcher
@@ -759,6 +959,21 @@ fn __win_syscall(nr: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64) 
             return __win_sockerrno()
         }
         return __win_slot(2, s)
+    }
+    if nr == 32 {
+        return __win_dup(a1, 0 - 1)
+    }
+    if nr == 33 {
+        return __win_dup(a1, a2)
+    }
+    if nr == 51 {
+        if __win_kind_of(a1) != 2 {
+            return 0 - 88
+        }
+        if getsockname(__win_handle(a1), a2 as u64, a3 as u64) != 0 {
+            return __win_sockerrno()
+        }
+        return 0
     }
     if nr == 54 {
         // setsockopt: SOL_SOCKET is 1 on Linux and 65535 on Windows,
