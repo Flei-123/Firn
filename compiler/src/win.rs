@@ -95,6 +95,11 @@ const KNOWN: &[(&str, &str, u32)] = &[
     ("GetCurrentDirectoryW", "KERNEL32.dll", 2),
     ("GetCurrentProcessId", "KERNEL32.dll", 0),
     ("GetCurrentThreadId", "KERNEL32.dll", 0),
+    // The stack bounds of this thread. Windows 8 and later; the
+    // collector needs them, because there is no /proc to read.
+    ("GetCurrentThreadStackLimits", "KERNEL32.dll", 2),
+    ("GetCurrentProcess", "KERNEL32.dll", 0),
+    ("DuplicateHandle", "KERNEL32.dll", 7),
     ("GetEnvironmentStringsW", "KERNEL32.dll", 0),
     // --- ws2_32: the sockets ------------------------------------------
     ("WSAStartup", "WS2_32.dll", 2),
@@ -109,6 +114,7 @@ const KNOWN: &[(&str, &str, u32)] = &[
     ("listen", "WS2_32.dll", 2),
     ("accept", "WS2_32.dll", 3),
     ("setsockopt", "WS2_32.dll", 5),
+    ("getsockname", "WS2_32.dll", 3),
     ("ioctlsocket", "WS2_32.dll", 3),
     // --- advapi32: the random source ----------------------------------
     // `SystemFunction036` IS `RtlGenRandom`; that is the name it is

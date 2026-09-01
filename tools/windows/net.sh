@@ -34,7 +34,6 @@ cat > "$WORK/server.py" <<'PY'
 import socket, sys, threading
 port = int(sys.argv[1])
 body = b"FIRN-OK\n" + b"A" * 1024
-head = b"HTTP/1.0 200 OK\r\n\r\n"          # 19 octets
 srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 srv.bind(("127.0.0.1", port))
