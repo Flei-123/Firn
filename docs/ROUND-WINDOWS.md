@@ -242,8 +242,8 @@ liegen.
 Alles andere antwortet **`-38` (`ENOSYS`)** — sichtbar falsch statt leise
 falsch.
 
-**Die Naht ist in Firn geschrieben** (`compiler/src/win_seam.rs`, 1 053
-Zeilen, davon etwa 600 Zeilen Firn-Quelltext) und wird in die
+**Die Naht ist in Firn geschrieben** (`compiler/src/win_seam.rs`, 1 073
+Zeilen, davon etwa 620 Zeilen Firn-Quelltext) und wird in die
 Uebersetzungseinheit eingespeist wie der Quelltext von `comptime` (Runde 35)
 und dem Testlaeufer (Runde 94): gelext, zerteilt, angehaengt, danach vom
 Typpruefer nicht mehr von Handgeschriebenem zu unterscheiden. Das ist eine
@@ -438,7 +438,7 @@ den Linux auf den Stapel legt (der Port kommt aus `argv[1]`).
 
 ### 3.4 Das Bild, nicht das Verhalten (`tools/windows/machine.sh`)
 
-24 Pruefungen, alle bestanden. Sie fragen, was die DATEI ist — jede davon
+25 Pruefungen, alle bestanden. Sie fragen, was die DATEI ist — jede davon
 kann falsch sein, waehrend unter Wine alles laeuft, und jede waere dann ein
 Absturz auf einem echten Windows: PE32+, `.idata` vorhanden, Bindung an
 `KERNEL32.dll`, kein CRT-Symbol, eigener `_start`; die Reihenfolge der
@@ -727,11 +727,11 @@ Windows, und beide sind der Groesse nach eine Runde, keine drei.
 | Datei | Zeilen | was |
 |---|---:|---|
 | `compiler/src/win.rs` | 539 | Importtabelle, Zwischenstuecke, Sondierung, Einsprungpunkt, Systemaufruf-Stummel |
-| `compiler/src/win_seam.rs` | 1 053 | die Naht (Firn-Quelltext) und ihre Selbstpruefungen |
-| `tools/windows/run.sh` | 212 | der Kreuzvergleich mit den Ursachengruppen |
-| `tools/windows/machine.sh` | 156 | das Bild statt des Verhaltens, 24 Pruefungen |
+| `compiler/src/win_seam.rs` | 1 073 | die Naht (Firn-Quelltext) und ihre Selbstpruefungen |
+| `tools/windows/run.sh` | 214 | der Kreuzvergleich mit den Ursachengruppen |
+| `tools/windows/machine.sh` | 156 | das Bild statt des Verhaltens, 25 Pruefungen |
 | `tools/windows/net.sh` + `net.fi` | 237 | der Netzbeweis |
-| `tools/windows/causes.txt`, `minquota.txt` | 24 | die Ursachenliste und der Boden der Quote |
+| `tools/windows/causes.txt`, `minquota.txt` | 25 | die Ursachenliste und der Boden der Quote |
 
 Geaendert: `target.rs` (dritter Wert auf der zweiten Achse), `main.rs`
 (Einspeisung der Naht, Binderaufruf, `.exe`-Endung), `codegen_x86.rs`
