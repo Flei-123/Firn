@@ -83,7 +83,9 @@ mkdir -p "$WORK"
 # `DIFF ... :: <why>` gets a cause out of tools/windows/causes.txt. The file
 # holds `<glob> <cause>` lines; the first match wins. Anything unmatched is
 # reported as UNGROUPED, which is exactly what one wants to see.
-cause_of() { # $1 = why
+cause_of() { # $1 = "<file> <why>" -- the file name is part of the match,
+             #      because some causes are known by the case and some by
+             #      the message.
     local why="$1" pat rest
     while read -r pat rest; do
         case "$pat" in ''|'#'*) continue ;; esac
@@ -178,7 +180,7 @@ LINBAD=$(grep -c '^LINUXBAD ' "$WORK/result.$LABEL.txt" || true)
 while IFS= read -r line; do
     f=$(echo "$line" | awk '{print $2}')
     why=${line#*:: }
-    printf '%s\t%s\t%s\n' "$(cause_of "$why")" "$f" "$why" >> "$WORK/causes.$LABEL.txt"
+    printf '%s\t%s\t%s\n' "$(cause_of "$f $why")" "$f" "$why" >> "$WORK/causes.$LABEL.txt"
 done < <(grep '^DIFF ' "$WORK/result.$LABEL.txt")
 
 echo
