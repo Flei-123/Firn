@@ -210,6 +210,8 @@ fn usage() -> String {
          --target=<name>    x86_64-linux (default) | aarch64-linux (round 80)\n  \
                               | x86_64-none | aarch64-none (freestanding:\n  \
                               no operating system, ELF object, no syscall)\n  \
+                              | x86_64-windows (round WINDOWS: PE/COFF .exe,\n  \
+                              Win64 at the boundary, syscall over Win32)\n  \
          --no-opt           switch off the optimizer (= --opt-level=dev)\n  \
          --opt-level=<lvl>  dev | dev-fast | release-safe | release-fast\n  \
                               (\'dev-fast\' = only debug preserving passes)\n  \
