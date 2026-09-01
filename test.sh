@@ -1468,6 +1468,40 @@ else
     tail -5 "$WORK/fpz.log" | sed 's/^/   /'
 fi
 
+echo "== 65. WINDOWS: the same program on two operating systems (ROUND WINDOWS) =="
+# `--target=x86_64-windows` builds a PE/COFF `.exe`. THREE tools, and each
+# asks a different question:
+#
+#   machine.sh  what the FILE is -- PE32+, an import table of our own, no C
+#               runtime symbol in the image, the Win64 thunk in the right
+#               order, 32 octets of shadow space, the stack probe with its
+#               counter-check, and a scan of the whole corpus that must find
+#               NO `syscall` instruction left anywhere.
+#   run.sh      what the program DOES -- every case of tests/ built twice and
+#               run twice (natively and under Wine), standard output compared
+#               character for character and the exit code compared. Whatever
+#               differs is grouped by CAUSE (tools/windows/causes.txt); the
+#               floor is tools/windows/minquota.txt.
+#   net.sh      that the seam carries more than printf -- a TCP client over
+#               `ws2_32.dll`, against a server with a fixed reply, with the
+#               port coming out of argv so the start block is measured too.
+#
+# All three SKIP cleanly (exit 0) where the mingw binutils or Wine are not
+# installed: a machine that never had them must not turn the suite red.
+bash tools/windows/machine.sh > "$WORK/win_machine.log" 2>&1 && WMRC=0 || WMRC=$?
+grep -E '^  (passed|SKIP)' "$WORK/win_machine.log" | sed 's/^/ /'
+bash tools/windows/net.sh > "$WORK/win_net.log" 2>&1 && WNRC=0 || WNRC=$?
+grep -E '^  (passed|SKIP|OK    (linux|windows under))' "$WORK/win_net.log" | sed 's/^/ /'
+bash tools/windows/run.sh > "$WORK/win_run.log" 2>&1 && WRRC=0 || WRRC=$?
+grep -E '^  (SAME|DIFFERENT|NOT SUPPORTED|RESULT|SKIP)' "$WORK/win_run.log" | sed 's/^/ /'
+grep -E '^  -- what does not work' -A6 "$WORK/win_run.log" | sed 's/^/ /'
+if [ "$WMRC" -eq 0 ] && [ "$WNRC" -eq 0 ] && [ "$WRRC" -eq 0 ]; then
+    ok
+else
+    bad "the windows target failed (see .test-work/win_*.log)"
+    grep -E 'FAIL' "$WORK/win_machine.log" "$WORK/win_net.log" "$WORK/win_run.log" | head -12 | sed 's/^/        /'
+fi
+
 TOTAL=$((PASS + FAIL))
 echo
 if [ "$FAIL" -eq 0 ]; then
